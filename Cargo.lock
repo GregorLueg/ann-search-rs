@@ -12,7 +12,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "ann-search"
+name = "ann-search-rs"
 version = "0.1.0"
 dependencies = [
  "approx",

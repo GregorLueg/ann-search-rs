@@ -622,14 +622,14 @@ impl UpdateNeighbours<f32> for NNDescent<f32> {
                     if heap.len() < k {
                         heap.push(Reverse((OrderedFloat(dist), pid, true)));
                         pid_set[pid] = true;
-                    } else if let Some(&Reverse((OrderedFloat(worst_dist), _, _))) = heap.peek()
-                        && dist < worst_dist
-                    {
-                        if let Some(Reverse((_, old_pid, _))) = heap.pop() {
-                            pid_set[old_pid] = false;
+                    } else if let Some(&Reverse((OrderedFloat(worst_dist), _, _))) = heap.peek() {
+                        if dist < worst_dist {
+                            if let Some(Reverse((_, old_pid, _))) = heap.pop() {
+                                pid_set[old_pid] = false;
+                            }
+                            heap.push(Reverse((OrderedFloat(dist), pid, true)));
+                            pid_set[pid] = true;
                         }
-                        heap.push(Reverse((OrderedFloat(dist), pid, true)));
-                        pid_set[pid] = true;
                     }
                 }
 
@@ -710,14 +710,14 @@ impl UpdateNeighbours<f64> for NNDescent<f64> {
                     if heap.len() < k {
                         heap.push(Reverse((OrderedFloat(dist), pid, true)));
                         pid_set[pid] = true;
-                    } else if let Some(&Reverse((OrderedFloat(worst_dist), _, _))) = heap.peek()
-                        && dist < worst_dist
-                    {
-                        if let Some(Reverse((_, old_pid, _))) = heap.pop() {
-                            pid_set[old_pid] = false;
+                    } else if let Some(&Reverse((OrderedFloat(worst_dist), _, _))) = heap.peek() {
+                        if dist < worst_dist {
+                            if let Some(Reverse((_, old_pid, _))) = heap.pop() {
+                                pid_set[old_pid] = false;
+                            }
+                            heap.push(Reverse((OrderedFloat(dist), pid, true)));
+                            pid_set[pid] = true;
                         }
-                        heap.push(Reverse((OrderedFloat(dist), pid, true)));
-                        pid_set[pid] = true;
                     }
                 }
 

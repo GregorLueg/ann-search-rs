@@ -1,7 +1,15 @@
 [package]
-name = "ann-search"
+name = "ann-search-rs"
 version = "0.1.0"
-edition = "2024"
+edition = "2021"
+authors = ["Gregor Lueg <gregorlueg@me.com>"]
+license = "MIT"
+repository = "https://github.com/GregorLueg/node2vec-rs"
+description = "Various approximate nearest neighbour searches in Rust."
+
+[lib]
+name = "ann_search_rs"
+path = "src/lib.rs"
 
 [dependencies]
 approx = "0.5.1"
