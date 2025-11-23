@@ -320,7 +320,7 @@ where
 }
 
 #[cfg(test)]
-mod integration_tests {
+mod full_library_tests {
     use super::*;
     use faer::Mat;
     use std::collections::HashSet;
