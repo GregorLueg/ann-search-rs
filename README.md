@@ -1,6 +1,7 @@
 # ann-search-rs
 
-Various approximate nearest neighbour searches implemented in Rust.
+Various approximate nearest neighbour searches implemented in Rust. Helper
+library to be used in other libraries.
 
 ## Features
 
@@ -25,23 +26,33 @@ ann-search-rs = "0.1.0"
 ```
 
 ## Usage
+
+Below shows an example on how to use for example the HNSW index and query it.
+
 ```rust
 use ann_search_rs::{build_hnsw_index, query_hnsw_index, Dist, parse_ann_dist};
 use faer::Mat;
 
 // Build index
 let data = Mat::from_fn(1000, 128, |_, _| rand::random::<f32>());
-let index = build_hnsw_index(data.as_ref(), "euclidean", 42);
+let hnsw_idx = build_hnsw_index(
+  mat.as_ref(), 
+  16,             // m
+  200,            // ef_construction
+  "euclidean",    // distance metric
+  42,             // seed
+  false           // verbosity
+);
 
 // Query index
 let query = Mat::from_fn(10, 128, |_, _| rand::random::<f32>());
-let (indices, distances) = query_hnsw_index(
-    query.as_ref(),
-    &index,
-    "euclidean",
-    10,  // k neighbours
-    true,  // return distances
-    false  // verbose
+let (hnsw_indices, hnsw_dists) = query_hnsw_index(
+  mat.as_ref(), 
+  &hnsw_idx, 
+  15,             // k
+  400,            // ef_search
+  true,           // return distances
+  false.          // verbosity
 );
 ```
 

@@ -359,7 +359,7 @@ mod full_library_tests {
     #[test]
     fn test_hnsw_entry_point_reach() {
         let mat = create_clustered_data::<f64>();
-        let hnsw_idx = build_hnsw_index(mat.as_ref(), 16, 400, "euclidean", 42, false);
+        let hnsw_idx = build_hnsw_index(mat.as_ref(), 16, 200, "euclidean", 42, false);
         
         // Check what entry point connects to at layer 0
         let entry = hnsw_idx.entry_point as usize;
