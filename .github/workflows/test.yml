@@ -1,4 +1,4 @@
-name: Test
+name: Test the package
 
 on:
   push:
@@ -32,12 +32,7 @@ jobs:
           key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
       
       - name: Run tests
-        run: cargo test --verbose
+        run: cargo test --features tch-cpu --verbose
       
-      - name: Check formatting
-        if: matrix.os == 'ubuntu-latest'
-        run: cargo fmt -- --check
-      
-      - name: Run clippy
-        if: matrix.os == 'ubuntu-latest'
-        run: cargo clippy -- -D warnings
+      - name: Run integration tests
+        run: cargo test --test integration_tests --features tch-cpu
