@@ -22,7 +22,7 @@ library to be used in other libraries.
 Add this to your `Cargo.toml`:
 ```toml
 [dependencies]
-ann-search-rs = "0.1.0"
+ann-search-rs = "*" # always get the latest version
 ```
 
 ## Usage
