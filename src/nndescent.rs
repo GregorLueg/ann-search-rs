@@ -4,7 +4,6 @@ use rand::rngs::SmallRng;
 use rand::{Rng, SeedableRng};
 use rayon::prelude::*;
 use std::cell::RefCell;
-use std::cmp::Reverse;
 use std::collections::BinaryHeap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Instant;
@@ -88,8 +87,9 @@ impl<T: Copy> Neighbour<T> {
 // Thread-local buffers //
 //////////////////////////
 
-type F32Refcell = RefCell<BinaryHeap<Reverse<(OrderedFloat<f32>, usize, bool)>>>;
-type F64Refcell = RefCell<BinaryHeap<Reverse<(OrderedFloat<f64>, usize, bool)>>>;
+// Remove Reverse
+type F32Refcell = RefCell<BinaryHeap<(OrderedFloat<f32>, usize, bool)>>;
+type F64Refcell = RefCell<BinaryHeap<(OrderedFloat<f64>, usize, bool)>>;
 
 thread_local! {
     static HEAP_BUFFER_F32: F32Refcell = const { RefCell::new(BinaryHeap::new()) };
@@ -379,7 +379,6 @@ where
                 indices
                     .into_iter()
                     .zip(distances)
-                    .filter(|(idx, _)| *idx != i)
                     .take(k)
                     .map(|(idx, dist)| Neighbour::new(idx, dist, true))
                     .collect()
@@ -608,10 +607,8 @@ impl UpdateNeighbours<f32> for NNDescent<f32> {
 
                 for n in current {
                     let pid = n.pid();
-                    if pid != node {
-                        heap.push(Reverse((OrderedFloat(n.dist), pid, false)));
-                        pid_set[pid] = true;
-                    }
+                    heap.push((OrderedFloat(n.dist), pid, false));
+                    pid_set[pid] = true;
                 }
 
                 for &(pid, dist) in candidates {
@@ -620,14 +617,14 @@ impl UpdateNeighbours<f32> for NNDescent<f32> {
                     }
 
                     if heap.len() < k {
-                        heap.push(Reverse((OrderedFloat(dist), pid, true)));
+                        heap.push((OrderedFloat(dist), pid, true));
                         pid_set[pid] = true;
-                    } else if let Some(&Reverse((OrderedFloat(worst_dist), _, _))) = heap.peek() {
+                    } else if let Some(&(OrderedFloat(worst_dist), _, _)) = heap.peek() {
                         if dist < worst_dist {
-                            if let Some(Reverse((_, old_pid, _))) = heap.pop() {
+                            if let Some((_, old_pid, _)) = heap.pop() {
                                 pid_set[old_pid] = false;
                             }
-                            heap.push(Reverse((OrderedFloat(dist), pid, true)));
+                            heap.push((OrderedFloat(dist), pid, true));
                             pid_set[pid] = true;
                         }
                     }
@@ -635,7 +632,8 @@ impl UpdateNeighbours<f32> for NNDescent<f32> {
 
                 let mut result: Vec<_> = heap
                     .drain()
-                    .map(|Reverse((OrderedFloat(d), p, is_new))| {
+                    .map(|(OrderedFloat(d), p, is_new)| {
+                        // Remove Reverse
                         pid_set[p] = false;
                         (d, p, is_new)
                     })
@@ -662,19 +660,6 @@ impl UpdateNeighbours<f32> for NNDescent<f32> {
 }
 
 impl UpdateNeighbours<f64> for NNDescent<f64> {
-    /// Update the neighbours with the improvements (for f64)
-    ///
-    /// ### Params
-    ///
-    /// * `node` - Current node index
-    /// * `current` - Current best neighbours
-    /// * `candidates` - Potential new neighbours
-    /// * `k` - Number of neighbours to find
-    /// * `updates` - Borrowed AtomicUsize to check if an update happened
-    ///
-    /// ### Returns
-    ///
-    /// Vec of updates `Neigbour`s.
     fn update_neighbours(
         &self,
         node: usize,
@@ -696,10 +681,9 @@ impl UpdateNeighbours<f64> for NNDescent<f64> {
 
                 for n in current {
                     let pid = n.pid();
-                    if pid != node {
-                        heap.push(Reverse((OrderedFloat(n.dist), pid, false)));
-                        pid_set[pid] = true;
-                    }
+                    // FIX: Removed "if pid != node" check
+                    heap.push((OrderedFloat(n.dist), pid, false));
+                    pid_set[pid] = true;
                 }
 
                 for &(pid, dist) in candidates {
@@ -708,14 +692,14 @@ impl UpdateNeighbours<f64> for NNDescent<f64> {
                     }
 
                     if heap.len() < k {
-                        heap.push(Reverse((OrderedFloat(dist), pid, true)));
+                        heap.push((OrderedFloat(dist), pid, true));
                         pid_set[pid] = true;
-                    } else if let Some(&Reverse((OrderedFloat(worst_dist), _, _))) = heap.peek() {
+                    } else if let Some(&(OrderedFloat(worst_dist), _, _)) = heap.peek() {
                         if dist < worst_dist {
-                            if let Some(Reverse((_, old_pid, _))) = heap.pop() {
+                            if let Some((_, old_pid, _)) = heap.pop() {
                                 pid_set[old_pid] = false;
                             }
-                            heap.push(Reverse((OrderedFloat(dist), pid, true)));
+                            heap.push((OrderedFloat(dist), pid, true));
                             pid_set[pid] = true;
                         }
                     }
@@ -723,7 +707,7 @@ impl UpdateNeighbours<f64> for NNDescent<f64> {
 
                 let mut result: Vec<_> = heap
                     .drain()
-                    .map(|Reverse((OrderedFloat(d), p, is_new))| {
+                    .map(|(OrderedFloat(d), p, is_new)| {
                         pid_set[p] = false;
                         (d, p, is_new)
                     })
@@ -789,7 +773,6 @@ impl<T: Float + FromPrimitive + Send + Sync> VectorDistance<T> for NNDescent<T> 
 mod tests {
     // tests/test_nndescent.rs
     use super::*;
-    use approx::assert_relative_eq;
     use faer::Mat;
 
     fn create_simple_matrix() -> Mat<f32> {
@@ -955,16 +938,29 @@ mod tests {
         let data = [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0];
         let mat = Mat::from_fn(3, 3, |i, j| data[i * 3 + j]);
 
-        let graph = NNDescent::<f32>::build(mat.as_ref(), 2, "cosine", 10, 0.001, 1.0, 42, false);
+        // Updated: Set k=3 to capture Self + 2 orthogonal neighbours
+        let graph = NNDescent::<f32>::build(mat.as_ref(), 3, "cosine", 10, 0.001, 1.0, 42, false);
 
-        // Each point should have 2 neighbours
         for neighbours in &graph {
-            assert_eq!(neighbours.len(), 2);
+            // Should have 3 neighbours
+            assert_eq!(neighbours.len(), 3);
 
-            // All cosine distances should be 1.0 (orthogonal)
+            let mut self_found = false;
+            let mut orthogonal_count = 0;
+
             for (_, dist) in neighbours {
-                assert_relative_eq!(*dist, 1.0, epsilon = 1e-5);
+                if *dist < 1e-5 {
+                    self_found = true;
+                } else if (*dist - 1.0).abs() < 1e-5 {
+                    orthogonal_count += 1;
+                }
             }
+
+            assert!(self_found, "Should find self (dist ~ 0.0)");
+            assert_eq!(
+                orthogonal_count, 2,
+                "Should find 2 orthogonal neighbours (dist ~ 1.0)"
+            );
         }
     }
 
