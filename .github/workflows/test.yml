@@ -32,7 +32,4 @@ jobs:
           key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
       
       - name: Run tests
-        run: cargo test --features tch-cpu --verbose
-      
-      - name: Run integration tests
-        run: cargo test --test integration_tests --features tch-cpu
+        run: cargo test
