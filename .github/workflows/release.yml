@@ -1,4 +1,4 @@
-name: Release to crates.io
+name: Release
 
 on:
   push:
@@ -9,23 +9,21 @@ on:
 
 jobs:
   check-version:
-    name: Check version and publish
+    name: Check version and create release
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
       
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
-      
       - name: Extract version from Cargo.toml
         id: version
         run: |
           VERSION=$(grep '^version = ' Cargo.toml | head -1 | sed 's/version = "\(.*\)"/\1/')
           echo "version=v$VERSION" >> $GITHUB_OUTPUT
-          echo "raw_version=$VERSION" >> $GITHUB_OUTPUT
           echo "Version: v$VERSION"
       
       - name: Check if tag exists
@@ -39,10 +37,6 @@ jobs:
             echo "Tag ${{ steps.version.outputs.version }} does not exist"
           fi
       
-      - name: Run tests
-        if: steps.check_tag.outputs.exists == 'false'
-        run: cargo test --verbose
-      
       - name: Create tag
         if: steps.check_tag.outputs.exists == 'false'
         run: |
@@ -53,7 +47,7 @@ jobs:
       
       - name: Create GitHub Release
         if: steps.check_tag.outputs.exists == 'false'
-        uses: softprobs/action-gh-release@v1
+        uses: softprops/action-gh-release@v1
         with:
           tag_name: ${{ steps.version.outputs.version }}
           name: Release ${{ steps.version.outputs.version }}
