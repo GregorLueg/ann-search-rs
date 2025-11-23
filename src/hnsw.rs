@@ -569,17 +569,35 @@ where
         self.select_heuristic(node, &candidates, insert_layer, state)
     }
 
-    /// Prune and connect with concurrent access
+    /// Prune and connect with concurrent access (race-condition free)
     ///
-    /// Uses RwLock to safely update a neighbour's connections while other
-    /// threads may be doing the same.
+    /// Atomically updates a neighbour's connection list by adding a new node,
+    /// then pruning using the heuristic selection algorithm. The entire
+    /// read-modify-write sequence is protected by a single write lock to
+    /// prevent lost updates.
+    ///
+    /// ### Thread Safety
+    ///
+    /// Multiple threads may call this concurrently on different neighbours.
+    /// If multiple threads target the same neighbour, the write lock serialises
+    /// access, ensuring each update is applied atomically.
+    ///
+    /// ### Algorithm
+    ///
+    /// 1. Acquire exclusive write lock on neighbour's connection list
+    /// 2. Read current connections (while holding lock)
+    /// 3. Compute distances to all current connections + new node
+    /// 4. Sort candidates by distance
+    /// 5. Apply heuristic selection (using thread-local state, no locks)
+    /// 6. Write final selection back (still holding lock)
+    /// 7. Release lock
     ///
     /// ### Params
     ///
     /// * `neighbour_id` - Existing neighbour to update
-    /// * `new_node` - New node to add
-    /// * `layer` - Current layer
-    /// * `graph` - Construction graph
+    /// * `new_node` - New node to add as a potential neighbour
+    /// * `layer` - Current layer (determines max connections: M or M*2)
+    /// * `graph` - Construction graph with RwLock-protected connection lists
     fn prune_and_connect_concurrent(
         &self,
         neighbour_id: usize,
@@ -587,27 +605,36 @@ where
         layer: u8,
         graph: &ConstructionGraph<T>,
     ) {
-        // CRITICAL: Read current state BEFORE acquiring write lock
-        let current = graph.get_neighbours(neighbour_id);
+        // CRITICAL: Acquire write lock FIRST and hold throughout entire operation
+        // This prevents race conditions where another thread updates the same neighbour
+        let mut guard = graph.nodes[neighbour_id].write();
 
-        // Build candidate list
-        let mut candidates: Vec<(OrderedFloat<T>, usize)> = current
-            .iter()
-            .take_while(|&&n| n != u32::MAX)
-            .filter(|&&n| n != u32::MAX)
-            .map(|&n| {
-                let n_id = n as usize;
-                let dist = unsafe {
-                    OrderedFloat(match self.metric {
-                        Dist::Euclidean => self.euclidean_distance(neighbour_id, n_id),
-                        Dist::Cosine => self.cosine_distance(neighbour_id, n_id),
-                    })
-                };
-                (dist, n_id)
-            })
-            .collect();
+        // Read current neighbours (safe - we hold the write lock)
+        let current = guard.clone();
 
-        // Add new node
+        // Build candidate list: existing neighbours + new node
+        let mut candidates: Vec<(OrderedFloat<T>, usize)> = Vec::with_capacity(current.len() + 1);
+
+        // Add all valid existing neighbours with their distances
+        for &neighbour in current.iter() {
+            if neighbour == u32::MAX {
+                break; // Hit padding, stop
+            }
+
+            let neighbour_node_id = neighbour as usize;
+
+            // Compute distance from neighbour_id to this existing connection
+            let dist = unsafe {
+                OrderedFloat(match self.metric {
+                    Dist::Euclidean => self.euclidean_distance(neighbour_id, neighbour_node_id),
+                    Dist::Cosine => self.cosine_distance(neighbour_id, neighbour_node_id),
+                })
+            };
+
+            candidates.push((dist, neighbour_node_id));
+        }
+
+        // Add the new node as a candidate (if it's not self-connection)
         if new_node != neighbour_id {
             let dist = unsafe {
                 OrderedFloat(match self.metric {
@@ -615,19 +642,36 @@ where
                     Dist::Cosine => self.cosine_distance(neighbour_id, new_node),
                 })
             };
+
             candidates.push((dist, new_node));
         }
 
+        // Sort candidates by distance (nearest first)
         candidates.sort_unstable_by(|a, b| a.0.cmp(&b.0));
 
-        // Select using heuristic (thread-local state, no locks)
+        // Apply heuristic selection to choose best subset of candidates
+        // Uses thread-local state (no locks acquired here - critical!)
         let selected = Self::with_build_state(|state_cell| {
             let mut state = state_cell.borrow_mut();
             self.select_heuristic(neighbour_id, &candidates, layer, &mut state)
         });
 
-        // NOW acquire write lock and update
-        graph.set_neighbours(neighbour_id, &selected);
+        // Write back the final selection (still holding write lock)
+        let max_neighbours = graph.max_neighbours[neighbour_id];
+        guard.clear();
+
+        for &(_, node_id) in selected.iter().take(max_neighbours) {
+            if node_id != neighbour_id {
+                guard.push(node_id as u32);
+            }
+        }
+
+        // Pad with INVALID markers to fixed size
+        while guard.len() < max_neighbours {
+            guard.push(u32::MAX);
+        }
+
+        // Write lock automatically released when guard drops here
     }
 
     /// Search layer using construction graph
