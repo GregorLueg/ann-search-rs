@@ -7,6 +7,7 @@ use std::cell::RefCell;
 use std::collections::BinaryHeap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Instant;
+use thousands::*;
 
 use crate::annoy::*;
 use crate::dist::*;
@@ -247,7 +248,11 @@ where
         verbose: bool,
     ) -> Vec<Vec<(usize, T)>> {
         if verbose {
-            println!("Initialising NN-Descent with {} cells - k={}", self.n, k);
+            println!(
+                "Initialising NN-Descent with {} samples - k = {}",
+                self.n.separate_with_underscores(),
+                k
+            );
         }
 
         let start_total = Instant::now();
@@ -322,7 +327,7 @@ where
                 println!(
                     "Iteration {}: {} updates ({:.2}% of nodes), rho={:.3}",
                     iter + 1,
-                    update_count,
+                    update_count.separate_with_underscores(),
                     update_rate.to_f64().unwrap() * 100.0,
                     current_rho.to_f64().unwrap()
                 );

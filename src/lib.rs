@@ -12,6 +12,7 @@ use rayon::prelude::*;
 use std::default::Default;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use thousands::*;
 
 use crate::annoy::*;
 use crate::hnsw::*;
@@ -81,7 +82,7 @@ where
                 if verbose {
                     let count = counter.fetch_add(1, Ordering::Relaxed) + 1;
                     if count.is_multiple_of(100_000) {
-                        println!(" Processed {} / {} cells.", count, n_samples);
+                        println!(" Processed {} / {} samples.", count.separate_with_underscores(), n_samples.separate_with_underscores());
                     }
                 }
                 (neighbors, dists)
@@ -97,7 +98,7 @@ where
                 if verbose {
                     let count = counter.fetch_add(1, Ordering::Relaxed) + 1;
                     if count.is_multiple_of(100_000) {
-                        println!(" Processed {} / {} cells.", count, n_samples);
+                        println!(" Processed {} / {} samples.", count.separate_with_underscores(), n_samples.separate_with_underscores());
                     }
                 }
                 neighbors
@@ -187,7 +188,7 @@ where
                 if verbose {
                     let count = counter.fetch_add(1, Ordering::Relaxed) + 1;
                     if count.is_multiple_of(100_000) {
-                        println!("  Processed {} / {} cells.", count, n_samples);
+                        println!("  Processed {} / {} samples.", count.separate_with_underscores(), n_samples.separate_with_underscores());
                     }
                 }
 
@@ -207,7 +208,7 @@ where
                 if verbose {
                     let count = counter.fetch_add(1, Ordering::Relaxed) + 1;
                     if count.is_multiple_of(100_000) {
-                        println!("  Processed {} / {} cells.", count, n_samples);
+                        println!("  Processed {} / {} samples.", count.separate_with_underscores(), n_samples.separate_with_underscores());
                     }
                 }
 
