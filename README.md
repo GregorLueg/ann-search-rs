@@ -1,7 +1,15 @@
 # ann-search-rs
 
 Various approximate nearest neighbour searches implemented in Rust. Helper
-library to be used in other libraries.
+library to be used in other libraries. 
+
+## Description
+
+Extracted function for approximate nearest neighbour searches specifically
+with single cell in mind from [bixverse](https://github.com/GregorLueg/bixverse),
+a R/Rust package designed for computational biology, that has a ton of 
+functionality for single cell. Within all of the single cell functions, kNN 
+generations are ubiqituos, thus, I want to expose the APIs to other packages.
 
 ## Features
 
@@ -13,9 +21,10 @@ library to be used in other libraries.
 - **Distance metrics**:
   - Euclidean
   - Cosine
-  - (more to come maybe ... ?)
+  - More to come maybe...
 
-- **High performance**: Optimised implementations with SIMD-friendly code
+- **High performance**: Optimised implementations with SIMD-friendly code,
+heavy threading were possible and optimised structures for memory access.
 
 ## Installation
 
@@ -33,7 +42,7 @@ Below shows an example on how to use for example the HNSW index and query it.
 use ann_search_rs::{build_hnsw_index, query_hnsw_index, Dist, parse_ann_dist};
 use faer::Mat;
 
-// Build index
+// Build the HNSW index
 let data = Mat::from_fn(1000, 128, |_, _| rand::random::<f32>());
 let hnsw_idx = build_hnsw_index(
   mat.as_ref(), 
@@ -44,7 +53,7 @@ let hnsw_idx = build_hnsw_index(
   false           // verbosity
 );
 
-// Query index
+// Query the HNSW index
 let query = Mat::from_fn(10, 128, |_, _| rand::random::<f32>());
 let (hnsw_indices, hnsw_dists) = query_hnsw_index(
   mat.as_ref(), 
