@@ -278,6 +278,7 @@ where
         max_iter,
         delta,
         rho,
+        None,
         seed,
         verbose,
     );

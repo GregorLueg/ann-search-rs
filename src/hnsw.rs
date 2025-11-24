@@ -7,6 +7,7 @@ use rayon::prelude::*;
 use std::cell::RefCell;
 use std::cmp::Reverse;
 use std::collections::BinaryHeap;
+use std::marker::PhantomData;
 use std::time::Instant;
 use thousands::*;
 
@@ -27,11 +28,12 @@ pub type NeighbourUpdates<T> = Vec<(usize, Vec<(OrderedFloat<T>, usize)>)>;
 /// ### Fields
 ///
 /// * `visited` - Stores the "visit epoch" ID for each node.
-/// * `visit_id` - The current epoch ID. Incrementing this effectively "clears" `visited` in O(1).
+/// * `visit_id` - The current epoch ID. Incrementing this effectively "clears"
+///   `visited` in O(1).
 /// * `candidates` - Min-heap for candidates.
 /// * `working` - Working set for distance calculations.
-/// * `scratch_working` - Reuse buffer for heuristic selection (avoids internal allocation).
-/// * `scratch_discarded` - Reuse buffer for heuristic selection (avoids internal allocation).
+/// * `scratch_working` - Reuse buffer for heuristic selection.
+/// * `scratch_discarded` - Reuse buffer for heuristic selection.
 pub struct SearchState<T> {
     visited: Vec<usize>,
     visit_id: usize,
@@ -53,7 +55,7 @@ where
     ///
     /// ### Returns
     ///
-    /// Self
+    /// Returns `Self`.
     fn new(capacity: usize) -> Self {
         Self {
             visited: vec![0; capacity],
@@ -69,7 +71,7 @@ where
     ///
     /// This increments the `visit_id` (Epoch), avoiding the O(N) memory
     /// clearing cost associated with standard boolean vectors (prior
-    /// implementation)
+    /// implementation was based on this).
     ///
     /// ### Params
     ///
@@ -115,15 +117,15 @@ where
 /// Construction-time neighbour storage with concurrent write support
 ///
 /// During construction, each node's neighbours are stored in a separate
-/// RwLock<Vec>, enabling true parallel insertions without batching or
-/// synchronisation barriers.
+/// RwLock<Vec>, enabling parallel insertions without batching or synch
+/// barriers.
 struct ConstructionGraph<T> {
     /// Each node's neighbours stored separately for concurrent access
     nodes: Vec<RwLock<Vec<u32>>>,
     /// Maximum neighbours per node (M or M*2 depending on layer)
     max_neighbours: Vec<usize>,
-    /// Phantom data to tie the lifetime to T
-    _phantom: std::marker::PhantomData<T>,
+    /// Phantom data to tie the lifetime to T - new one...
+    _phantom: PhantomData<T>,
 }
 
 impl<T> ConstructionGraph<T>
@@ -152,12 +154,24 @@ where
         }
     }
 
-    /// Get current neighbours for a node (read lock)
+    /// Get current neighbours for a node
+    ///
+    /// Initialises the read lock.
+    ///
+    /// ### Params
+    ///
+    /// * `node_id` - The node idx.
     fn get_neighbours(&self, node_id: usize) -> Vec<u32> {
         self.nodes[node_id].read().clone()
     }
 
     /// Write new neighbours for a node (write lock)
+    ///
+    /// ### Params
+    ///
+    /// * `node_id` - The node idx.
+    /// * `neighbours` - Slice of tuples of OrderedFloat and indices of the
+    ///   neighbours.
     fn set_neighbours(&self, node_id: usize, neighbours: &[(OrderedFloat<T>, usize)]) {
         let mut guard = self.nodes[node_id].write();
         guard.clear();
@@ -168,7 +182,7 @@ where
             }
         }
 
-        // Pad with INVALID
+        // Pad with INVALID (u32: MAX)
         while guard.len() < self.max_neighbours[node_id] {
             guard.push(u32::MAX);
         }
@@ -177,7 +191,7 @@ where
     /// Finalise construction and convert to flat layout
     ///
     /// Consumes the construction graph and produces the flat representation
-    /// optimised for query performance.
+    /// optimised for subsequent query performance.
     ///
     /// ### Returns
     ///
@@ -277,6 +291,7 @@ impl HnswState<f64> for HnswIndex<f64> {
 /// ### Algorithm Overview
 ///
 /// HNSW builds a hierarchical graph where:
+///
 /// 1. Each node is randomly assigned to layers (exponential distribution)
 /// 2. Higher layers are sparser and enable fast coarse search
 /// 3. Lower layers are denser and provide precise results
@@ -443,7 +458,7 @@ where
             keep_pruned: true,
         };
 
-        index.build_graph_parallel(&construction_graph, verbose);
+        index.build_graph(&construction_graph, verbose);
 
         // Convert construction graph to flat layout
         let (neighbours_flat, neighbour_offsets) = construction_graph.into_flat();
@@ -458,13 +473,17 @@ where
         index
     }
 
-    /// Build the graph structure layer by layer with true parallelism
+    /// Build the graph structure layer by layer
+    ///
+    /// This function uses parallelism under the hood via the
+    /// `ConstructionGraph` structure that has RwLocks to avoid race conditions
+    /// (which were a bane while writing this...).
     ///
     /// ### Params
     ///
     /// * `graph` - Construction graph with RwLock support
     /// * `verbose` - Print progress information
-    fn build_graph_parallel(&self, graph: &ConstructionGraph<T>, verbose: bool) {
+    fn build_graph(&self, graph: &ConstructionGraph<T>, verbose: bool) {
         let nodes_by_layer: Vec<Vec<usize>> = (0..=self.max_layer)
             .map(|layer| {
                 (0..self.n)
@@ -485,7 +504,7 @@ where
                 );
             }
 
-            self.build_layer_parallel_rwlock(layer, layer_nodes, graph);
+            self.build_layer_parallel(layer, layer_nodes, graph);
 
             if verbose {
                 println!("  Layer {} built in {:.2?}", layer, start.elapsed());
@@ -503,17 +522,12 @@ where
     /// * `layer` - Layer to build
     /// * `nodes` - Nodes to insert at this layer
     /// * `graph` - Construction graph with concurrent write support
-    fn build_layer_parallel_rwlock(
-        &self,
-        layer: u8,
-        nodes: &[usize],
-        graph: &ConstructionGraph<T>,
-    ) {
+    fn build_layer_parallel(&self, layer: u8, nodes: &[usize], graph: &ConstructionGraph<T>) {
         nodes.par_iter().for_each(|&node| {
             // Compute outgoing connections (thread-local state)
             let connections = Self::with_build_state(|state_cell| {
                 let mut state = state_cell.borrow_mut();
-                self.compute_node_connections_rwlock(node, layer, graph, &mut state)
+                self.compute_node_connections(node, layer, graph, &mut state)
             });
 
             // Write node -> neighbours (exclusive access to this node)
@@ -538,7 +552,7 @@ where
     /// ### Returns
     ///
     /// Selected connections for this node
-    fn compute_node_connections_rwlock(
+    fn compute_node_connections(
         &self,
         node: usize,
         insert_layer: u8,
@@ -549,13 +563,13 @@ where
 
         let mut entry_points = vec![(OrderedFloat(T::zero()), self.entry_point as usize)];
 
-        // Descend through upper layers
+        // descend through upper layers
         for layer in (insert_layer + 1..=self.max_layer).rev() {
             state.reset(self.n);
-            entry_points = self.search_layer_rwlock(node, layer, &entry_points, 1, graph, state);
+            entry_points = self.search_layer(node, layer, &entry_points, 1, graph, state);
         }
 
-        // Search at insert layer
+        // search at insert layer
         state.reset(self.n);
         let ef = if insert_layer == 0 {
             self.ef_construction / 2 // Lower ef for dense layer 0
@@ -563,8 +577,7 @@ where
             self.ef_construction
         };
 
-        let candidates =
-            self.search_layer_rwlock(node, insert_layer, &entry_points, ef, graph, state);
+        let candidates = self.search_layer(node, insert_layer, &entry_points, ef, graph, state);
 
         self.select_heuristic(node, &candidates, insert_layer, state)
     }
@@ -605,17 +618,16 @@ where
         layer: u8,
         graph: &ConstructionGraph<T>,
     ) {
-        // CRITICAL: Acquire write lock FIRST and hold throughout entire operation
-        // This prevents race conditions where another thread updates the same neighbour
+        // CRITICAL: acquire write lock FIRST and hold throughout entire ops.
+        // this prevents race conditions where another thread updates the same
+        // neighbour. Windows otherwise runs into issues...
         let mut guard = graph.nodes[neighbour_id].write();
 
-        // Read current neighbours (safe - we hold the write lock)
         let current = guard.clone();
 
-        // Build candidate list: existing neighbours + new node
         let mut candidates: Vec<(OrderedFloat<T>, usize)> = Vec::with_capacity(current.len() + 1);
 
-        // Add all valid existing neighbours with their distances
+        // add all valid existing neighbours with their distances
         for &neighbour in current.iter() {
             if neighbour == u32::MAX {
                 break; // Hit padding, stop
@@ -623,7 +635,7 @@ where
 
             let neighbour_node_id = neighbour as usize;
 
-            // Compute distance from neighbour_id to this existing connection
+            // compute distance from neighbour_id to this existing connection
             let dist = unsafe {
                 OrderedFloat(match self.metric {
                     Dist::Euclidean => self.euclidean_distance(neighbour_id, neighbour_node_id),
@@ -634,7 +646,7 @@ where
             candidates.push((dist, neighbour_node_id));
         }
 
-        // Add the new node as a candidate (if it's not self-connection)
+        // add the new node as a candidate (if it's not self-connection)
         if new_node != neighbour_id {
             let dist = unsafe {
                 OrderedFloat(match self.metric {
@@ -646,17 +658,17 @@ where
             candidates.push((dist, new_node));
         }
 
-        // Sort candidates by distance (nearest first)
+        // sort candidates by distance (nearest first)
         candidates.sort_unstable_by(|a, b| a.0.cmp(&b.0));
 
-        // Apply heuristic selection to choose best subset of candidates
-        // Uses thread-local state (no locks acquired here - critical!)
+        // apply heuristic selection to choose best subset of candidates
+        // sses thread-local state (no locks acquired here - critical!)
         let selected = Self::with_build_state(|state_cell| {
             let mut state = state_cell.borrow_mut();
             self.select_heuristic(neighbour_id, &candidates, layer, &mut state)
         });
 
-        // Write back the final selection (still holding write lock)
+        // write back the final selection (still holding write lock)
         let max_neighbours = graph.max_neighbours[neighbour_id];
         guard.clear();
 
@@ -666,12 +678,12 @@ where
             }
         }
 
-        // Pad with INVALID markers to fixed size
+        // pad with INVALID markers to fixed size
         while guard.len() < max_neighbours {
             guard.push(u32::MAX);
         }
 
-        // Write lock automatically released when guard drops here
+        // write lock automatically released when guard drops here <<<---
     }
 
     /// Search layer using construction graph
@@ -688,7 +700,7 @@ where
     /// ### Returns
     ///
     /// Sorted list of nearest neighbours
-    fn search_layer_rwlock(
+    fn search_layer(
         &self,
         query_node: usize,
         layer: u8,
@@ -726,7 +738,7 @@ where
 
             let max_neighbours = if layer == 0 { self.m * 2 } else { self.m };
 
-            // Read neighbours from construction graph
+            // read neighbours from construction graph
             let neighbours = graph.get_neighbours(current_id);
 
             for i in 0..max_neighbours {
@@ -783,10 +795,8 @@ where
     /// candidate is selected if it's closer to the query node than to any
     /// already-selected neighbour.
     ///
-    /// **Optimization**: Uses `SearchState` scratch buffers to avoid
+    /// **Optimisation**: Uses `SearchState` scratch buffers to avoid
     /// allocation.
-    ///
-    /// [Image of voronoi diagram clustering]
     ///
     /// ### Params
     ///
@@ -805,18 +815,19 @@ where
         layer: u8,
         state: &mut SearchState<T>,
     ) -> Vec<(OrderedFloat<T>, usize)> {
-        // Reuse the scratch buffers from the state
+        // reuse the scratch buffers from the state
         state.scratch_working.clear();
         state.scratch_discarded.clear();
 
-        // Increment visit generation effectively resetting "visited" for this local op
+        // increment visit generation effectively resetting "visited" for this
+        // local op
         state.visit_id = state.visit_id.wrapping_add(1);
         if state.visit_id == 0 {
             state.visited.fill(0);
             state.visit_id = 1;
         }
 
-        // 1. Filter candidates and mark them as visited
+        // 1. filter candidates and mark them as visited
         for &candidate in candidates {
             if candidate.1 != node && !state.is_visited(candidate.1) {
                 state.scratch_working.push(candidate);
@@ -824,7 +835,7 @@ where
             }
         }
 
-        // 2. Extend candidates (if enabled)
+        // 2. extend candidates (if enabled)
         if self.extend_candidates {
             let max_check = if layer == 0 { self.m * 2 } else { self.m };
 
@@ -862,7 +873,7 @@ where
             state.scratch_working.sort_unstable_by(|a, b| a.0.cmp(&b.0));
         }
 
-        // 3. Heuristic Selection
+        // 3. heuristic Selection
         let max_neighbours = if layer == 0 { self.m * 2 } else { self.m };
         let mut result = Vec::with_capacity(max_neighbours);
 
@@ -899,7 +910,7 @@ where
             }
         }
 
-        // 4. Add back pruned connections if we have space
+        // 4. add back pruned connections if we have space
         if self.keep_pruned {
             for &candidate in state.scratch_discarded.iter() {
                 if result.len() >= max_neighbours {
@@ -1005,8 +1016,6 @@ where
             }
         }
 
-        // same fix as search_layer. initialise furthest_dist to Infinity if
-        // working set < ef.
         let mut furthest_dist = if state.working.len() >= ef {
             state
                 .working

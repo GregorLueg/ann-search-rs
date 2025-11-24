@@ -84,6 +84,96 @@ impl<T: Copy> Neighbour<T> {
     }
 }
 
+/// Enum with sensible standard parameters for various graph sizes
+///
+/// Core idea is to provide (more or less) sensible standard parameters for the
+/// the NNDescent algorithm based on the number of samples. This affects
+/// parameters like the initial Annoy index and search of new neighbours of
+/// neighbours.
+#[derive(Clone, Copy, Debug)]
+pub enum GraphSize {
+    /// Less than 100k
+    Small,
+    /// Between 100k - 1M
+    Medium,
+    /// More than 1M
+    Large,
+}
+
+impl GraphSize {
+    /// Helper function to return the `GraphSize`
+    fn from_n(n: usize) -> Self {
+        match n {
+            ..100_000 => Self::Small,
+            100_000..1_000_000 => Self::Medium,
+            _ => Self::Large,
+        }
+    }
+
+    /// Get the number of trees to use pending graph/sample size
+    fn annoy_trees(&self) -> usize {
+        match self {
+            Self::Small => 32,
+            Self::Medium => 48,
+            Self::Large => 64,
+        }
+    }
+
+    /// Get the k multiplier pending graph/sample size
+    fn search_k_multiplier(&self) -> usize {
+        match self {
+            Self::Small => 3,
+            Self::Medium => 5,
+            Self::Large => 10,
+        }
+    }
+
+    /// Get the maximum search budget
+    fn max_search_k(&self, n: usize) -> usize {
+        match self {
+            Self::Small => 100,
+            Self::Medium => 500,
+            Self::Large => (n / 1000).max(1000),
+        }
+    }
+
+    /// Get the maximum search budget
+    fn max_candidates_factor(&self) -> usize {
+        match self {
+            Self::Small => 4,
+            Self::Medium => 6,
+            Self::Large => 8,
+        }
+    }
+
+    /// Get the maximum number of neighbours
+    fn max_per_neighbour(&self, k: usize) -> usize {
+        match self {
+            Self::Small => k.min(10),
+            Self::Medium => k.min(15),
+            Self::Large => k.min(25),
+        }
+    }
+
+    /// Get the Rho decay for exploring old/new neighbours
+    fn rho_decay(&self) -> f64 {
+        match self {
+            Self::Small => 0.8,
+            Self::Medium => 0.85,
+            Self::Large => 0.9,
+        }
+    }
+
+    /// Minimum rho pending the graph size
+    fn rho_min(&self) -> f64 {
+        match self {
+            Self::Small => 0.3,
+            Self::Medium => 0.4,
+            Self::Large => 0.5,
+        }
+    }
+}
+
 //////////////////////////
 // Thread-local buffers //
 //////////////////////////
@@ -131,6 +221,7 @@ pub struct NNDescent<T> {
     n: usize,
     metric: Dist,
     norms: Vec<T>,
+    graph_params: GraphSize,
 }
 
 impl<T> NNDescent<T>
@@ -162,12 +253,15 @@ where
         max_iter: usize,
         delta: T,
         rho: T,
+        graph_size: Option<GraphSize>,
         seed: usize,
         verbose: bool,
     ) -> Vec<Vec<(usize, T)>> {
         let metric = parse_ann_dist(dist_metric).unwrap_or(Dist::Cosine);
         let n = mat.nrows();
         let n_features = mat.ncols();
+
+        let graph_params = graph_size.unwrap_or_else(|| GraphSize::from_n(n));
 
         let mut vectors_flat = Vec::with_capacity(n * n_features);
         for i in 0..n {
@@ -196,10 +290,11 @@ where
             n,
             metric,
             norms,
+            graph_params,
         };
 
         let start_initial_index = Instant::now();
-        let annoy_index = AnnoyIndex::new(mat, 32, seed);
+        let annoy_index = AnnoyIndex::new(mat, graph_params.annoy_trees(), seed);
         let end_initial_index = start_initial_index.elapsed();
 
         if verbose {
@@ -217,6 +312,8 @@ where
     /// * `max_iter` - Maximum number of iterations for the algorithm.
     /// * `annoy_index` - Annoy index for the initial fast initialisation of
     ///   the graph.
+    /// * `graph_params` - Enum storing various parameters for initialisation
+    ///   based on graph size
     /// * `delta` - Tolerance parameter. Should the proportion of changes in a
     ///   given iteration fall below that value, the algorithm stops.
     /// * `rho` - Sampling rate. Will be adaptively reduced in each iteration.
@@ -264,8 +361,10 @@ where
             let current_rho = if iter == 0 {
                 rho
             } else {
-                let decay = T::from_f64(0.8).unwrap().powi(iter as i32 - 1);
-                (rho * decay).max(T::from_f64(0.3).unwrap())
+                let decay = T::from_f64(self.graph_params.rho_decay())
+                    .unwrap()
+                    .powi(iter as i32 - 1);
+                (rho * decay).max(T::from_f64(self.graph_params.rho_min()).unwrap())
             };
 
             let all_candidates: Vec<(usize, Vec<(usize, T)>)> = (0..self.n)
@@ -364,6 +463,8 @@ where
     ///
     /// * `k` - Number of neighbours to sample
     /// * `annoy_index` - The Annoy index.
+    /// * `graph_params` - Enum storing various parameters for initialisation
+    ///   based on graph size
     ///
     /// ### Return
     ///
@@ -377,7 +478,8 @@ where
             .into_par_iter()
             .map(|i| {
                 let query_vec = &self.vectors_flat[i * self.dim..(i + 1) * self.dim];
-                let search_k = ((k + 1) * 3).min(100);
+                let search_k = ((k + 1) * self.graph_params.search_k_multiplier())
+                    .min(self.graph_params.max_search_k(self.n));
                 let (indices, distances) =
                     annoy_index.query(query_vec, &self.metric, k + 1, Some(search_k));
 
@@ -450,9 +552,9 @@ where
             old_neighbours.truncate(n_old_sample);
         }
 
-        let max_per_neighbour = k.min(10);
+        let max_per_neighbour = k.min(self.graph_params.max_per_neighbour(k));
         let max_per_old = (k / 2).min(5);
-        let max_candidates = k * 4;
+        let max_candidates = k * self.graph_params.max_candidates_factor();
 
         CANDIDATE_SET.with(|set_cell| {
             SAMPLE_INDICES.with(|indices_cell| {
@@ -801,6 +903,7 @@ mod tests {
             10,    // max_iter
             0.001, // delta
             1.0,   // rho
+            None,
             42,
             false,
         );
@@ -817,7 +920,8 @@ mod tests {
     #[test]
     fn test_nndescent_build_cosine() {
         let mat = create_simple_matrix();
-        let graph = NNDescent::<f32>::build(mat.as_ref(), 3, "cosine", 10, 0.001, 1.0, 42, false);
+        let graph =
+            NNDescent::<f32>::build(mat.as_ref(), 3, "cosine", 10, 0.001, 1.0, None, 42, false);
 
         assert_eq!(graph.len(), 5);
     }
@@ -825,8 +929,17 @@ mod tests {
     #[test]
     fn test_nndescent_graph_structure() {
         let mat = create_simple_matrix();
-        let graph =
-            NNDescent::<f32>::build(mat.as_ref(), 3, "euclidean", 10, 0.001, 1.0, 42, false);
+        let graph = NNDescent::<f32>::build(
+            mat.as_ref(),
+            3,
+            "euclidean",
+            10,
+            0.001,
+            1.0,
+            None,
+            42,
+            false,
+        );
 
         // each node should have neighbours
         for neighbours in graph.iter() {
@@ -854,6 +967,7 @@ mod tests {
             100, // Many iterations allowed
             0.5, // High delta for quick convergence
             1.0,
+            None,
             42,
             false,
         );
@@ -865,11 +979,29 @@ mod tests {
     fn test_nndescent_reproducibility() {
         let mat = create_simple_matrix();
 
-        let graph1 =
-            NNDescent::<f32>::build(mat.as_ref(), 3, "euclidean", 10, 0.001, 1.0, 42, false);
+        let graph1 = NNDescent::<f32>::build(
+            mat.as_ref(),
+            3,
+            "euclidean",
+            10,
+            0.001,
+            1.0,
+            None,
+            42,
+            false,
+        );
 
-        let graph2 =
-            NNDescent::<f32>::build(mat.as_ref(), 3, "euclidean", 10, 0.001, 1.0, 42, false);
+        let graph2 = NNDescent::<f32>::build(
+            mat.as_ref(),
+            3,
+            "euclidean",
+            10,
+            0.001,
+            1.0,
+            None,
+            42,
+            false,
+        );
 
         // Same seed should give similar results
         // Note: Due to parallel execution, exact match might not be guaranteed
@@ -881,11 +1013,29 @@ mod tests {
     fn test_nndescent_k_parameter() {
         let mat = create_simple_matrix();
 
-        let graph_k2 =
-            NNDescent::<f32>::build(mat.as_ref(), 2, "euclidean", 10, 0.001, 1.0, 42, false);
+        let graph_k2 = NNDescent::<f32>::build(
+            mat.as_ref(),
+            2,
+            "euclidean",
+            10,
+            0.001,
+            1.0,
+            None,
+            42,
+            false,
+        );
 
-        let graph_k4 =
-            NNDescent::<f32>::build(mat.as_ref(), 4, "euclidean", 10, 0.001, 1.0, 42, false);
+        let graph_k4 = NNDescent::<f32>::build(
+            mat.as_ref(),
+            4,
+            "euclidean",
+            10,
+            0.001,
+            1.0,
+            None,
+            42,
+            false,
+        );
 
         // Verify k constraint is respected
         for neighbours in &graph_k2 {
@@ -902,12 +1052,30 @@ mod tests {
         let mat = create_simple_matrix();
 
         // High rho (sample more old neighbours)
-        let graph_high_rho =
-            NNDescent::<f32>::build(mat.as_ref(), 3, "euclidean", 10, 0.001, 1.0, 42, false);
+        let graph_high_rho = NNDescent::<f32>::build(
+            mat.as_ref(),
+            3,
+            "euclidean",
+            10,
+            0.001,
+            1.0,
+            None,
+            42,
+            false,
+        );
 
         // Low rho (sample fewer old neighbours)
-        let graph_low_rho =
-            NNDescent::<f32>::build(mat.as_ref(), 3, "euclidean", 10, 0.001, 0.3, 42, false);
+        let graph_low_rho = NNDescent::<f32>::build(
+            mat.as_ref(),
+            3,
+            "euclidean",
+            10,
+            0.001,
+            0.3,
+            None,
+            42,
+            false,
+        );
 
         assert_eq!(graph_high_rho.len(), 5);
         assert_eq!(graph_low_rho.len(), 5);
@@ -926,8 +1094,17 @@ mod tests {
         }
 
         let mat = Mat::from_fn(n, dim, |i, j| data[i * dim + j]);
-        let graph =
-            NNDescent::<f32>::build(mat.as_ref(), 10, "euclidean", 15, 0.001, 1.0, 42, false);
+        let graph = NNDescent::<f32>::build(
+            mat.as_ref(),
+            10,
+            "euclidean",
+            15,
+            0.001,
+            1.0,
+            None,
+            42,
+            false,
+        );
 
         assert_eq!(graph.len(), n);
 
@@ -944,7 +1121,8 @@ mod tests {
         let mat = Mat::from_fn(3, 3, |i, j| data[i * 3 + j]);
 
         // Updated: Set k=3 to capture Self + 2 orthogonal neighbours
-        let graph = NNDescent::<f32>::build(mat.as_ref(), 3, "cosine", 10, 0.001, 1.0, 42, false);
+        let graph =
+            NNDescent::<f32>::build(mat.as_ref(), 3, "cosine", 10, 0.001, 1.0, None, 42, false);
 
         for neighbours in &graph {
             // Should have 3 neighbours
@@ -984,6 +1162,7 @@ mod tests {
             10,
             0.001,
             1.0,
+            None,
             42,
             false,
         );
@@ -1003,6 +1182,7 @@ mod tests {
             1,   // Only 1 iteration
             0.0, // Delta = 0 means never converge by delta
             1.0,
+            None,
             42,
             false,
         );
@@ -1014,8 +1194,17 @@ mod tests {
     #[test]
     fn test_nndescent_distance_ordering() {
         let mat = create_simple_matrix();
-        let graph =
-            NNDescent::<f32>::build(mat.as_ref(), 3, "euclidean", 10, 0.001, 1.0, 42, false);
+        let graph = NNDescent::<f32>::build(
+            mat.as_ref(),
+            3,
+            "euclidean",
+            10,
+            0.001,
+            1.0,
+            None,
+            42,
+            false,
+        );
 
         // Neighbours should be sorted by distance
         for neighbours in &graph {
@@ -1030,8 +1219,17 @@ mod tests {
         let data = [1.0_f64, 0.0, 0.0, 0.0, 1.0, 0.0, 1.0, 1.0, 0.0];
         let mat = Mat::from_fn(3, 3, |i, j| data[i * 3 + j]);
 
-        let graph =
-            NNDescent::<f64>::build(mat.as_ref(), 2, "euclidean", 10, 0.001, 1.0, 42, false);
+        let graph = NNDescent::<f64>::build(
+            mat.as_ref(),
+            2,
+            "euclidean",
+            10,
+            0.001,
+            1.0,
+            None,
+            42,
+            false,
+        );
 
         assert_eq!(graph.len(), 3);
     }
@@ -1054,8 +1252,17 @@ mod tests {
         }
 
         let mat = Mat::from_fn(n, dim, |i, j| data[i * dim + j]);
-        let graph =
-            NNDescent::<f32>::build(mat.as_ref(), 5, "euclidean", 20, 0.001, 1.0, 42, false);
+        let graph = NNDescent::<f32>::build(
+            mat.as_ref(),
+            5,
+            "euclidean",
+            20,
+            0.001,
+            1.0,
+            None,
+            42,
+            false,
+        );
 
         // Point 0 should have neighbours mostly from 0-9 range
         let neighbours_0 = &graph[0];
@@ -1076,8 +1283,17 @@ mod tests {
         let mat = create_simple_matrix();
 
         // Should fall back to Cosine for invalid metric
-        let graph =
-            NNDescent::<f32>::build(mat.as_ref(), 3, "invalid_metric", 10, 0.001, 1.0, 42, false);
+        let graph = NNDescent::<f32>::build(
+            mat.as_ref(),
+            3,
+            "invalid_metric",
+            10,
+            0.001,
+            1.0,
+            None,
+            42,
+            false,
+        );
 
         assert_eq!(graph.len(), 5);
     }
@@ -1094,6 +1310,7 @@ mod tests {
             10,
             0.001,
             1.0,
+            None,
             42,
             false,
         );
