@@ -5,6 +5,7 @@ pub mod dist;
 pub mod hnsw;
 pub mod nndescent;
 pub mod utils;
+pub mod fanng;
 
 use faer::MatRef;
 use num_traits::{Float, FromPrimitive, ToPrimitive};
@@ -18,6 +19,7 @@ use crate::annoy::*;
 use crate::hnsw::*;
 use crate::nndescent::*;
 use crate::utils::*;
+use crate::fanng::*;
 
 ///////////
 // Annoy //
@@ -321,6 +323,107 @@ where
     (indices, distances)
 }
 
+///////////
+// FANNG //
+///////////
+
+pub fn build_fanng_index<T>(
+    mat: MatRef<T>,
+    dist_metric: &str, 
+    faang_params: Option<FanngParams>, 
+    seed: usize, 
+    verbose: bool
+) -> Fanng<T> where
+    T: Float + Send + Sync, 
+{
+    let faang_params = faang_params.unwrap_or_default();
+
+    Fanng::new(mat, dist_metric, &faang_params, seed, verbose)
+}
+ 
+/// Query a FANNG index
+///
+/// ### Params
+///
+/// * `query_mat` - The query matrix containing the samples × features
+/// * `index` - The pre-built FANNG index
+/// * `k` - Number of neighbours to return
+/// * `max_calcs` - Maximum number of distance calculations per query (controls
+///   recall/speed trade-off)
+/// * `return_dist` - Whether to return distances between points
+/// * `verbose` - Print progress updates
+///
+/// ### Returns
+///
+/// A tuple of `(knn_indices, optional distances)`
+pub fn query_fanng_index<T>(
+    query_mat: MatRef<T>,
+    index: &Fanng<T>,
+    k: usize,
+    max_calcs: usize,
+    return_dist: bool,
+    verbose: bool,
+) -> (Vec<Vec<usize>>, Option<Vec<Vec<T>>>)
+where
+    T: Float + Send + Sync,
+{
+    let n_samples = query_mat.nrows();
+    let counter = Arc::new(AtomicUsize::new(0));
+
+    if return_dist {
+        let results: Vec<(Vec<usize>, Vec<T>)> = (0..n_samples)
+            .into_par_iter()
+            .map(|i| {
+                let query: Vec<T> = query_mat.row(i).iter().copied().collect();
+                let (indices, distances) = index.search_k(&query, k, max_calcs);
+                
+                if verbose {
+                    let count = counter.fetch_add(1, Ordering::Relaxed) + 1;
+                    if count.is_multiple_of(100_000) {
+                        println!(
+                            " Processed {} / {} samples.",
+                            count.separate_with_underscores(),
+                            n_samples.separate_with_underscores()
+                        );
+                    }
+                }
+                
+                (indices, distances)
+            })
+            .collect();
+
+        let (indices, distances) = results.into_iter().unzip();
+        (indices, Some(distances))
+    } else {
+        let indices: Vec<Vec<usize>> = (0..n_samples)
+            .into_par_iter()
+            .map(|i| {
+                let query: Vec<T> = query_mat.row(i).iter().copied().collect();
+                let (indices, _) = index.search_k(&query, k, max_calcs);
+                
+                if verbose {
+                    let count = counter.fetch_add(1, Ordering::Relaxed) + 1;
+                    if count.is_multiple_of(100_000) {
+                        println!(
+                            " Processed {} / {} samples.",
+                            count.separate_with_underscores(),
+                            n_samples.separate_with_underscores()
+                        );
+                    }
+                }
+                
+                indices
+            })
+            .collect();
+
+        (indices, None)
+    }
+}
+
+//////////
+// Test //
+//////////
+
 #[cfg(test)]
 mod full_library_tests {
     use super::*;
@@ -523,6 +626,115 @@ mod full_library_tests {
         }
         assert_eq!(self_not_found, 0);
     }
+
+  #[test]
+    fn test_fanng_finds_self() {
+        let mat = create_clustered_data::<f64>();
+        let fanng_idx = build_fanng_index(mat.as_ref(), "euclidean", Some(FanngParams::fast()), 42, false);
+        let (fanng_indices, fanng_dists) = query_fanng_index(mat.as_ref(), &fanng_idx, 15, 500, true, false);
+        
+        let mut self_not_first = 0;
+        let mut self_not_found = 0;
+        
+        for i in 0..mat.nrows() {
+            if fanng_indices[i][0] != i {
+                self_not_first += 1;
+                println!("FANNG: Point {} didn't find itself first. Found: {} with dist: {}", 
+                        i, fanng_indices[i][0], fanng_dists.as_ref().unwrap()[i][0]);
+            }
+            if !fanng_indices[i].contains(&i) {
+                self_not_found += 1;
+                println!("FANNG: Point {} didn't find itself at all! Neighbours: {:?}", i, &fanng_indices[i]);
+            }
+        }
+        
+        assert_eq!(self_not_found, 0, "FANNG: {} points couldn't find themselves", self_not_found);
+        // assert!(self_not_first < 10, "FANNG: {} points didn't find themselves first (got {})", self_not_first);
+    }
+
+    #[test]
+    fn test_fanng_graph_quality() {
+        let mat = create_clustered_data::<f64>();
+        let fanng_idx = build_fanng_index(mat.as_ref(), "euclidean", Some(FanngParams::fast()), 42, false);
+        
+        println!("FANNG Graph Statistics:");
+        println!("  Total vertices: {}", fanng_idx.graph.len());
+        println!("  Start vertex: {}", fanng_idx.start_vertex);
+        println!("  Max degree setting: {}", fanng_idx.max_degree);
+        
+        let mut total_edges = 0;
+        let mut min_degree = usize::MAX;
+        let mut max_degree = 0;
+        let mut isolated_vertices = 0;
+        
+        for (i, edges) in fanng_idx.graph.iter().enumerate() {
+            let degree = edges.len();
+            total_edges += degree;
+            min_degree = min_degree.min(degree);
+            max_degree = max_degree.max(degree);
+            
+            if degree == 0 {
+                isolated_vertices += 1;
+                println!("  WARNING: Vertex {} is isolated!", i);
+            }
+        }
+        
+        println!("  Total edges: {}", total_edges);
+        println!("  Average degree: {:.2}", total_edges as f64 / fanng_idx.graph.len() as f64);
+        println!("  Min degree: {}", min_degree);
+        println!("  Max degree: {}", max_degree);
+        println!("  Isolated vertices: {}", isolated_vertices);
+        
+        assert_eq!(isolated_vertices, 0, "Graph has isolated vertices!");
+        assert!(min_degree > 0, "Some vertices have no edges!");
+    }
+
+    #[test]
+    fn test_fanng_finds_self_debug() {
+        let mat = create_clustered_data::<f64>();
+        
+        // Try with much more generous parameters
+        let params = FanngParams::new(
+            30,   // max_degree: higher for better connectivity
+            100,  // batch_size
+            50,   // traverse_add_multiplier: paper's recommendation
+            1000, // refinement_neighbour_no
+            500,  // refinement_max_calc
+        );
+        
+        let fanng_idx = build_fanng_index(mat.as_ref(), "euclidean", Some(params), 42, false);
+        
+        // Much higher search budget
+        let (fanng_indices, fanng_dists) = query_fanng_index(mat.as_ref(), &fanng_idx, 15, 5000, true, false);
+        
+        let mut self_not_first = 0;
+        let mut self_not_found = 0;
+        let mut distances_to_self = Vec::new();
+        
+        for i in 0..mat.nrows() {
+            if let Some(pos) = fanng_indices[i].iter().position(|&idx| idx == i) {
+                distances_to_self.push(fanng_dists.as_ref().unwrap()[i][pos]);
+                if pos != 0 {
+                    self_not_first += 1;
+                    println!("FANNG: Point {} found at position {} with dist: {}", 
+                            i, pos, fanng_dists.as_ref().unwrap()[i][pos]);
+                }
+            } else {
+                self_not_found += 1;
+                println!("FANNG: Point {} NOT FOUND. Nearest: {} (dist: {})", 
+                        i, fanng_indices[i][0], fanng_dists.as_ref().unwrap()[i][0]);
+            }
+        }
+        
+        println!("\nSummary:");
+        println!("  Points not found: {}", self_not_found);
+        println!("  Points not first: {}", self_not_first);
+        println!("  Max distance to self: {:?}", distances_to_self.iter().max_by(|a, b| a.partial_cmp(b).unwrap()));
+        
+        assert_eq!(self_not_found, 0, "FANNG: {} points couldn't find themselves", self_not_found);
+    }
+
+    
 
     #[test]
     fn test_methods_find_cluster_neighbours() {

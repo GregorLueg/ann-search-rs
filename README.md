@@ -14,9 +14,12 @@ generations are ubiqituos, thus, I want to expose the APIs to other packages.
 ## Features
 
 - **Multiple ANN algorithms**:
-  - Annoy (Approximate Nearest Neighbours Oh Yeah)
-  - HNSW (Hierarchical Navigable Small World)
-  - NNDescent (Nearest Neighbour Descent)
+  - [**Annoy (Approximate Nearest Neighbours Oh Yeah)**](https://github.com/spotify/annoy).
+  A version is implemented here with some modifications.
+  - [**HNSW (Hierarchical Navigable Small World)**](https://arxiv.org/abs/1603.09320). 
+  A version with some slight modifications has been implemented in this package.
+  - [**NNDescent (Nearest Neighbour Descent)** 
+  (heavily inspired by [PyNNDescent](https://github.com/lmcinnes/pynndescent))].
 
 - **Distance metrics**:
   - Euclidean

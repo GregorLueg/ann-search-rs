@@ -840,7 +840,6 @@ impl UpdateNeighbours<f64> for NNDescent<f64> {
     }
 }
 
-// In NNDescent:
 impl<T: Float + FromPrimitive + Send + Sync> VectorDistance<T> for NNDescent<T> {
     /// Get the flat vectors
     ///
