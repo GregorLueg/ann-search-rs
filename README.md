@@ -10,6 +10,8 @@ with single cell in mind from [bixverse](https://github.com/GregorLueg/bixverse)
 a R/Rust package designed for computational biology, that has a ton of 
 functionality for single cell. Within all of the single cell functions, kNN 
 generations are ubiqituos, thus, I want to expose the APIs to other packages.
+Feel free to use these implementations where you might need approximate nearest
+neighbour searches.
 
 ## Features
 
@@ -20,6 +22,9 @@ generations are ubiqituos, thus, I want to expose the APIs to other packages.
   A version with some slight modifications has been implemented in this package.
   - [**NNDescent (Nearest Neighbour Descent)** 
   (heavily inspired by [PyNNDescent](https://github.com/lmcinnes/pynndescent))].
+  - [**FANNG**](https://openaccess.thecvf.com/content_cvpr_2016/papers/Harwood_FANNG_Fast_Approximate_CVPR_2016_paper.pdf).
+  A version with some modifications in terms of starting node generation and
+  some parallel operations in the index generation for speed.
 
 - **Distance metrics**:
   - Euclidean
@@ -27,7 +32,7 @@ generations are ubiqituos, thus, I want to expose the APIs to other packages.
   - More to come maybe...
 
 - **High performance**: Optimised implementations with SIMD-friendly code,
-heavy threading were possible and optimised structures for memory access.
+heavy multi-threading were possible and optimised structures for memory access.
 
 ## Installation
 

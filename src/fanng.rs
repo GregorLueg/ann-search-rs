@@ -6,6 +6,7 @@ use rayon::prelude::*;
 use rustc_hash::FxHashSet;
 use std::cmp::Reverse;
 use std::collections::BinaryHeap;
+use std::time::Instant;
 
 use crate::dist::VectorDistance;
 use crate::utils::*;
@@ -30,6 +31,8 @@ use crate::utils::*;
 ///   refinement neighbour search. Higher values find better neighbours but
 ///   increase construction time. Should be roughly half of
 ///   `refinement_neighbour_no`.
+/// * `num_shortcut_pool` - Number of random initialised short cuts to deal with
+///   disconnected graphs.
 #[derive(Clone, Debug)]
 pub struct FanngParams {
     pub max_degree: usize,
@@ -37,6 +40,7 @@ pub struct FanngParams {
     pub traverse_add_multiplier: usize,
     pub refinement_neighbour_no: usize,
     pub refinement_max_calc: usize,
+    pub num_shortcut_pool: usize,
 }
 
 impl FanngParams {
@@ -53,12 +57,15 @@ impl FanngParams {
     ///   during parallel refinement. Higher -> better recall.
     /// * `refinement_max_calc` - Distance calculation budget per vertex during
     ///   refinement neighbour search.
+    /// * `num_shortcut_pool` - Number of random initialised short cuts to deal
+    ///   with disconnected graphs.
     pub fn new(
         max_degree: usize,
         batch_size: usize,
         traverse_add_multiplier: usize,
         refinement_neighbour_no: usize,
         refinement_max_calc: usize,
+        num_shortcut_pool: usize,
     ) -> Self {
         Self {
             max_degree,
@@ -66,6 +73,7 @@ impl FanngParams {
             traverse_add_multiplier,
             refinement_neighbour_no,
             refinement_max_calc,
+            num_shortcut_pool,
         }
     }
 
@@ -76,9 +84,10 @@ impl FanngParams {
         Self {
             max_degree: 15,
             batch_size: 20,
-            traverse_add_multiplier: 5,
+            traverse_add_multiplier: 10,
             refinement_neighbour_no: 100,
             refinement_max_calc: 50,
+            num_shortcut_pool: 25,
         }
     }
 
@@ -92,6 +101,7 @@ impl FanngParams {
             traverse_add_multiplier: 25,
             refinement_neighbour_no: 500,
             refinement_max_calc: 250,
+            num_shortcut_pool: 50,
         }
     }
 }
@@ -100,23 +110,38 @@ impl Default for FanngParams {
     /// Production-quality parameters as recommended in the paper
     ///
     /// Based on Harwood & Drummond (2016):
-    /// - max_degree: 30 (optimal for SIFT, section 3.7)
-    /// - traverse_add_multiplier: 50 (50N iterations, section 3.6)
-    /// - refinement_neighbour_no: 1000 (section 3.6)
-    /// - refinement_max_calc: 500 (maintains 2:1 ratio)
-    /// - batch_size: 100 (efficient parallelism)
+    ///
+    /// - `max_degree`: 30 (optimal for SIFT, section 3.7)
+    /// - `traverse_add_multiplier`: 50 (50N iterations, section 3.6)
+    /// - `refinement_neighbour_no`: 1000 (section 3.6)
+    /// - `refinement_max_calc`: 500 (maintains 2:1 ratio)
+    /// - `batch_size`: 100 (efficient parallelism)
+    /// - `num_shortcut_pool`: 50 (additional parameter to deal with
+    ///   potentially disconnected graphs).
     fn default() -> Self {
         Self {
             max_degree: 30,
-            batch_size: 100,
             traverse_add_multiplier: 50,
             refinement_neighbour_no: 1000,
             refinement_max_calc: 500,
+            batch_size: 100,
+            num_shortcut_pool: 50,
         }
     }
 }
 
-/// Structure fo the FANNG algorithm
+/// FANNG (Fast Approximate Nearest Neighbour Graphs) index structure
+///
+/// ### Fields
+///
+/// * `vectors_flat` - Flattened embedding vectors for cache locality
+/// * `dim` - Dimensionality of each vector
+/// * `norms` - Precomputed norms for cosine distance (empty for Euclidean)
+/// * `dist` - Distance metric (Euclidean or Cosine)
+/// * `graph` - Adjacency list representation of the proximity graph
+/// * `start_vertex` - Centroid vertex for query initialisation
+/// * `shortcut_pool` - Random vertices for handling disconnected components
+/// * `max_degree` - Maximum edges per vertex after truncation
 pub struct Fanng<T>
 where
     T: Float,
@@ -126,7 +151,8 @@ where
     pub norms: Vec<T>,
     pub dist: Dist,
     pub graph: Vec<Vec<usize>>,
-    pub start_vertices: Vec<usize>,
+    pub start_vertex: usize,
+    pub shortcut_pool: Vec<usize>,
     pub max_degree: usize,
 }
 
@@ -208,6 +234,8 @@ where
         seed: usize,
         verbose: bool,
     ) -> Self {
+        let start_index_gen = Instant::now();
+
         let metric = parse_ann_dist(dist_metric).unwrap_or(Dist::Cosine);
         let n = mat.nrows();
         let dim = mat.ncols();
@@ -241,50 +269,88 @@ where
             norms,
             dist: metric,
             graph: vec![Vec::new(); n],
-            start_vertices: Vec::new(),
+            start_vertex: 0,
+            shortcut_pool: Vec::new(),
             max_degree: fanng_params.max_degree,
         };
 
         if verbose {
-            println!("1.) Initialising a first set of random edges.")
+            println!("1.) Initialising a first set of random edges...")
         }
 
+        let start_random_init = Instant::now();
         fanng.random_init(8, seed);
+        let end_random_init = start_random_init.elapsed();
 
         if verbose {
             println!(
-                "2.) Using the TraverseAdd algorithm in batches of {}",
+                "... finished the random initialisation in {:.2?}",
+                end_random_init
+            );
+            println!(
+                "2.) Using the TraverseAdd algorithm in batches of {} ...",
                 fanng_params.batch_size
             )
         }
 
+        let start_traverse_add = Instant::now();
         fanng.batch_traverse_add(
             n * fanng_params.traverse_add_multiplier,
             fanng_params.batch_size,
             seed,
         );
+        let end_traverse_add = start_traverse_add.elapsed();
 
+        if verbose {
+            println!("... finished the TraverseAdd in {:.2?}", end_traverse_add);
+            println!("3.) Running the parallel refinement of the graph...",)
+        }
+
+        let start_refinement = Instant::now();
         fanng.parallel_refinement(
             fanng_params.refinement_neighbour_no,
             fanng_params.refinement_max_calc,
         );
+        let end_refinement = start_refinement.elapsed();
 
+        if verbose {
+            println!("... finished the refinement in {:.2?}", end_refinement);
+            println!("4.) Truncating the graph...",)
+        }
+
+        let start_truncation = Instant::now();
         fanng.truncate_graph();
+        let end_truncation = start_truncation.elapsed();
 
-        fanng.find_start_vertex();
+        if verbose {
+            println!("... finishes the truncation in {:.2?}", end_truncation);
+            println!("5.) Identifying start vertices.",)
+        }
+
+        fanng.find_start_vertices(fanng_params.num_shortcut_pool, seed);
+
+        let end_index_gene = start_index_gen.elapsed();
+
+        if verbose {
+            println!("Generated the FANNG index in {:.2?}...", end_index_gene);
+        }
 
         fanng
     }
 
-    /// K-NN search
+    /// K-NN search with shotgun initialization
     ///
-    /// Search the generated index
+    /// Searches from centroid vertex plus sampled shortcuts to handle
+    /// disconnected graph components robustly.
     ///
     /// ### Params
     ///
     /// * `query` - Query vector slice
     /// * `k` - Number of nearest neighbours to return
-    /// * `max_calcs` - Maximum number of distance calculations before terminating
+    /// * `max_calcs` - Maximum number of distance calculations before
+    ///   terminating
+    /// * `num_shortcuts` - Number of shortcuts to sample from pool (0 to
+    ///   disable)
     ///
     /// ### Returns
     ///
@@ -292,46 +358,27 @@ where
     ///
     /// ### Algorithm Details
     ///
-    /// Uses a priority queue to explore vertices in order of distance to query:
+    /// 1. Initialise search from centroid vertex
+    /// 2. Add `num_shortcuts` evenly-spaced samples from shortcut pool
+    /// 3. Priority queue naturally explores most promising paths first
+    /// 4. Distant shortcuts get pruned automatically - minimal waste
     ///
-    /// 1. Start at centroid vertex
-    /// 2. Pop closest unexplored vertex from queue
-    /// 3. Explore its edges, computing distances to neighbours
-    /// 4. Add neighbours to queue with their distances as priority
-    /// 5. Track k nearest neighbours seen so far
-    /// 6. Continue until max_calcs budget exhausted
-    ///
-    /// The backtracking behaviour comes from re-adding vertices to the queue
-    /// with their remaining unexplored edges, using the vertex's distance as
-    /// priority. This ensures closer vertices are explored more thoroughly.
-    /// K-NN search with multiple start vertices
-    ///
-    /// Searches from multiple entry points to handle disconnected graph components.
-    ///
-    /// ### Params
-    ///
-    /// * `query` - Query vector slice
-    /// * `k` - Number of nearest neighbours to return
-    /// * `max_calcs` - Maximum number of distance calculations before terminating
-    ///
-    /// ### Returns
-    ///
-    /// Tuple of (indices, distances) of k nearest neighbours
-    ///
-    /// ### Algorithm Details
-    ///
-    /// 1. Initializes search from all start vertices simultaneously
-    /// 2. Uses priority queue to explore vertices in order of distance
-    /// 3. Tracks k nearest neighbours across all search paths
-    /// 4. Continues until budget exhausted
-    pub fn search_k(&self, query: &[T], k: usize, max_calcs: usize) -> (Vec<usize>, Vec<T>) {
+    /// Using shortcuts adds ~1-3% to distance calculations but significantly
+    /// improves recall on clustered or disconnected data.
+    #[inline]
+    pub fn search_k(
+        &self,
+        query: &[T],
+        k: usize,
+        max_calcs: usize,
+        num_shortcuts: usize,
+    ) -> (Vec<usize>, Vec<T>) {
         let mut visited = FxHashSet::default();
         let mut calcs = 0;
 
-        // Candidates: min-heap (explore closest first)
+        // candidates: min-heap (explore closest first)
         let mut candidates = BinaryHeap::new();
 
-        // Result: MAX-heap (so we can pop the FARTHEST when > k)
         let mut result = BinaryHeap::new();
 
         let query_norm = if self.dist == Dist::Cosine {
@@ -344,20 +391,41 @@ where
             T::one()
         };
 
-        // Initialize from ALL start vertices
-        for &start_vertex in &self.start_vertices {
-            if visited.contains(&start_vertex) {
-                continue;
-            }
+        // initialise from centroid start vertex
+        let start_dist = self.compute_query_distance(query, self.start_vertex, query_norm);
+        candidates.push(Reverse((OrderedFloat(start_dist), self.start_vertex)));
+        result.push((OrderedFloat(start_dist), self.start_vertex));
+        visited.insert(self.start_vertex);
+        calcs += 1;
 
-            let start_dist = self.compute_query_distance(query, start_vertex, query_norm);
-            candidates.push(Reverse((OrderedFloat(start_dist), start_vertex)));
-            result.push((OrderedFloat(start_dist), start_vertex));
-            visited.insert(start_vertex);
-            calcs += 1;
+        // add shortcuts from pool (evenly spaced for determinism)
+        if num_shortcuts > 0 && !self.shortcut_pool.is_empty() {
+            let step = if num_shortcuts >= self.shortcut_pool.len() {
+                1
+            } else {
+                self.shortcut_pool.len() / num_shortcuts
+            };
 
-            if calcs >= max_calcs {
-                break;
+            for shortcut_idx in (0..self.shortcut_pool.len())
+                .step_by(step)
+                .take(num_shortcuts)
+            {
+                let vertex = self.shortcut_pool[shortcut_idx];
+
+                if visited.contains(&vertex) || calcs >= max_calcs {
+                    continue;
+                }
+
+                visited.insert(vertex);
+                calcs += 1;
+
+                let dist = self.compute_query_distance(query, vertex, query_norm);
+                candidates.push(Reverse((OrderedFloat(dist), vertex)));
+                result.push((OrderedFloat(dist), vertex));
+
+                if result.len() > k {
+                    result.pop();
+                }
             }
         }
 
@@ -373,12 +441,12 @@ where
                 break;
             }
 
-            // Prune: if candidate is farther than worst k-th result, skip
+            // prune: if candidate is farther than worst k-th result, skip
             if result.len() >= k && cand_dist > worst_dist.0 {
                 continue;
             }
 
-            // Explore ALL neighbours
+            // explore ALL neighbours
             for &neighbour in &self.graph[current] {
                 if visited.contains(&neighbour) {
                     continue;
@@ -410,7 +478,7 @@ where
             }
         }
 
-        // Convert to sorted vector
+        // convert to sorted vector
         let sorted_result: Vec<_> = result.into_sorted_vec();
 
         let (indices, distances): (Vec<_>, Vec<_>) = sorted_result
@@ -435,6 +503,7 @@ where
     /// ### Implementation Details
     ///
     /// Uses parallel iteration with per-vertex RNG seeding to ensure:
+    ///
     /// * Reproducibility across runs
     /// * Thread-safe parallel execution
     /// * No duplicate edges from same vertex
@@ -573,18 +642,27 @@ where
     fn truncate_graph(&mut self) {
         for i in 0..self.graph.len() {
             if self.graph[i].len() > self.max_degree {
-                let vertex_idx = i;
-                // index shenanigans to avoid borrow checker unhappiness...
-                let mut edges_with_dist: Vec<_> = self.graph[i]
+                // collect edges with distances - needed for borrow checker
+                let mut edge_dists: Vec<(usize, T)> = self.graph[i]
                     .iter()
-                    .map(|&to| (to, unsafe { self.distance(vertex_idx, to) }))
+                    .map(|&to| {
+                        let dist = unsafe { self.distance(i, to) };
+                        (to, dist)
+                    })
                     .collect();
-                edges_with_dist.sort_by_key(|&(_, dist)| OrderedFloat(dist));
-                self.graph[i] = edges_with_dist
-                    .into_iter()
-                    .take(self.max_degree)
-                    .map(|(to, _)| to)
-                    .collect();
+
+                // partial sort - only ensures first max_degree are smallest (O(n) average)
+                edge_dists
+                    .select_nth_unstable_by_key(self.max_degree, |(_, dist)| OrderedFloat(*dist));
+
+                // rebuild with truncated edges
+                self.graph[i].clear();
+                self.graph[i].extend(
+                    edge_dists
+                        .into_iter()
+                        .take(self.max_degree)
+                        .map(|(to, _)| to),
+                );
             }
         }
     }
@@ -595,16 +673,15 @@ where
     /// components or clustered data. Uses a k-means++ style initialisation:
     ///
     /// 1. First vertex is nearest to centroid
-    /// 2. Subsequent vertices are chosen to be far from already-selected
-    ///    vertices
+    /// 2. A set of random vertices is generated for query time shortcuts
     ///
     /// ### Algorithm Details
     ///
     /// Having multiple start vertices significantly improves recall on
     /// clustered data where the graph may have weak inter-cluster connectivity.
-    fn find_start_vertex(&mut self, num_starts: usize) {
+    fn find_start_vertices(&mut self, pool_size: usize, seed: usize) {
         let n = self.graph.len();
-        let num_starts = num_starts.min(n);
+        let pool_size = pool_size.min(n);
 
         // Compute centroid
         let mut centroid = vec![T::zero(); self.dim];
@@ -618,7 +695,7 @@ where
             *c = *c / n_float;
         }
 
-        // Find first start vertex (nearest to centroid)
+        // find vertex nearest to centroid
         let mut best = 0;
         let mut best_dist = T::infinity();
         for i in 0..n {
@@ -633,38 +710,20 @@ where
             }
         }
 
-        self.start_vertices = vec![best];
+        self.start_vertex = best;
 
-        // Find additional start vertices using farthest-first traversal
-        // (similar to k-means++ initialization)
-        for _ in 1..num_starts {
-            let mut best_vertex = 0;
-            let mut best_min_dist = T::zero();
+        // cache random vertices for query-time shortcuts
+        let mut rng = SmallRng::seed_from_u64(seed as u64);
+        let mut shortcuts = Vec::new();
 
-            // For each candidate vertex, find its distance to nearest start vertex
-            for i in 0..n {
-                if self.start_vertices.contains(&i) {
-                    continue;
-                }
-
-                // Find minimum distance to any existing start vertex
-                let mut min_dist = T::infinity();
-                for &start in &self.start_vertices {
-                    let dist = unsafe { self.distance(i, start) };
-                    if dist < min_dist {
-                        min_dist = dist;
-                    }
-                }
-
-                // Keep the vertex that is farthest from its nearest start vertex
-                if min_dist > best_min_dist {
-                    best_min_dist = min_dist;
-                    best_vertex = i;
-                }
+        while shortcuts.len() < pool_size {
+            let v = rng.random_range(0..n);
+            if v != best && !shortcuts.contains(&v) {
+                shortcuts.push(v);
             }
-
-            self.start_vertices.push(best_vertex);
         }
+
+        self.shortcut_pool = shortcuts;
     }
 
     /// Naive downhill search
@@ -741,40 +800,31 @@ where
     fn add_edge_with_occlusion(&mut self, from: usize, to: usize) {
         let dist_from_to = unsafe { self.distance(from, to) };
 
-        // Check if new edge is occluded by existing edges
-        for &existing_to in &self.graph[from] {
-            let dist_from_existing = unsafe { self.distance(from, existing_to) };
-            let dist_existing_to = unsafe { self.distance(existing_to, to) };
-
-            if dist_from_existing < dist_from_to && dist_existing_to < dist_from_to {
-                return; // Occluded
-            }
-        }
-
-        // calculate temporary the distances and store them to avoid
-        // the borrow checker...
-        let temp_distances: Vec<(usize, T, T)> = self.graph[from]
+        // compute all distances once
+        let edge_distances: Vec<(usize, T, T)> = self.graph[from]
             .iter()
             .map(|&existing_to| {
                 let dist_from_existing = unsafe { self.distance(from, existing_to) };
-                let dist_to_existing = unsafe { self.distance(to, existing_to) };
-                (existing_to, dist_from_existing, dist_to_existing)
+                let dist_existing_to = unsafe { self.distance(existing_to, to) };
+                (existing_to, dist_from_existing, dist_existing_to)
             })
             .collect();
 
-        // clear the vector
-        self.graph[from].clear();
-
-        // rebuild the edges and keep only edges that are not occluded by the
-        // new edges
-        for (existing_to, dist_from_existing, dist_to_existing) in temp_distances {
-            let is_occluded_by_new_edge =
-                dist_from_to < dist_from_existing && dist_to_existing < dist_from_existing;
-
-            if !is_occluded_by_new_edge {
-                self.graph[from].push(existing_to);
+        // check if new edge is occluded
+        for &(_, dist_from_existing, dist_existing_to) in &edge_distances {
+            if dist_from_existing < dist_from_to && dist_existing_to < dist_from_to {
+                return;
             }
         }
+
+        // filter out edges occluded by new edge
+        self.graph[from] = edge_distances
+            .into_iter()
+            .filter(|(_, dist_from_existing, dist_to_existing)| {
+                !(dist_from_to < *dist_from_existing && *dist_to_existing < *dist_from_existing)
+            })
+            .map(|(existing_to, _, _)| existing_to)
+            .collect();
 
         self.graph[from].push(to);
     }
@@ -1013,9 +1063,10 @@ mod tests {
         FanngParams::new(
             15,  // max_degree
             20,  // batch_size
-            5,   // traverse_add_multiplier (was 50)
-            100, // refinement_neighbour_no (was 1000)
-            50,  // refinement_max_calc (was 500)
+            5,   // traverse_add_multiplier
+            100, // refinement_neighbour_no
+            50,  // refinement_max_calc
+            25,  // num shortcut pool
         )
     }
 
@@ -1024,9 +1075,10 @@ mod tests {
         FanngParams::new(
             15,  // max_degree
             25,  // batch_size
-            10,  // traverse_add_multiplier (was 50)
-            100, // refinement_neighbour_no (was 1000)
-            50,  // refinement_max_calc (was 500)
+            10,  // traverse_add_multiplier
+            100, // refinement_neighbour_no
+            50,  // refinement_max_calc
+            50,  // number shortcut pool
         )
     }
 
@@ -1071,7 +1123,7 @@ mod tests {
         );
 
         let query = mat.row(0).iter().cloned().collect::<Vec<f32>>();
-        let (indices, distances) = index.search_k(&query, 1, 200);
+        let (indices, distances) = index.search_k(&query, 1, 200, 10);
 
         assert!(
             distances[0] < 0.1,
@@ -1087,7 +1139,7 @@ mod tests {
         let index = Fanng::new(mat.as_ref(), "cosine", &test_params(), 42, false);
 
         let query: Vec<f32> = (0..20).map(|j| mat[(0, j)]).collect();
-        let (indices, distances) = index.search_k(&query, 5, 200);
+        let (indices, distances) = index.search_k(&query, 5, 200, 10);
 
         assert_eq!(indices.len(), 5);
         assert_eq!(indices[0], 0, "Should find itself first");
@@ -1101,8 +1153,8 @@ mod tests {
 
         let query: Vec<f32> = mat.row(10).iter().cloned().collect();
 
-        let (indices1, _) = index.search_k(&query, 5, 50);
-        let (indices2, _) = index.search_k(&query, 5, 500);
+        let (indices1, _) = index.search_k(&query, 5, 50, 10);
+        let (indices2, _) = index.search_k(&query, 5, 500, 10);
 
         assert_eq!(indices1.len(), 5);
         assert_eq!(indices2.len(), 5);
@@ -1121,8 +1173,8 @@ mod tests {
         let index2 = Fanng::new(mat.as_ref(), "euclidean", &test_params(), 42, false);
 
         let query: Vec<f32> = mat.row(5).iter().cloned().collect();
-        let (indices1, _) = index1.search_k(&query, 5, 200);
-        let (indices2, _) = index2.search_k(&query, 5, 200);
+        let (indices1, _) = index1.search_k(&query, 5, 200, 10);
+        let (indices2, _) = index2.search_k(&query, 5, 200, 10);
 
         assert_eq!(indices1, indices2);
     }
@@ -1135,8 +1187,8 @@ mod tests {
         let index2 = Fanng::new(mat.as_ref(), "euclidean", &test_params(), 123, false);
 
         let query: Vec<f32> = mat.row(7).iter().cloned().collect();
-        let (indices1, _) = index1.search_k(&query, 5, 200);
-        let (indices2, _) = index2.search_k(&query, 5, 200);
+        let (indices1, _) = index1.search_k(&query, 5, 200, 10);
+        let (indices2, _) = index2.search_k(&query, 5, 200, 10);
 
         assert_eq!(indices1.len(), 5);
         assert_eq!(indices2.len(), 5);
@@ -1151,7 +1203,7 @@ mod tests {
         let index = Fanng::new(mat.as_ref(), "euclidean", &test_params(), 42, false);
 
         let query: Vec<f32> = mat.row(15).iter().cloned().collect();
-        let (indices, distances) = index.search_k(&query, 5, 300);
+        let (indices, distances) = index.search_k(&query, 5, 300, 10);
 
         assert_eq!(indices.len(), distances.len());
         assert_eq!(indices.len(), 5);
@@ -1190,7 +1242,7 @@ mod tests {
         let index = Fanng::new(mat.as_ref(), "euclidean", &test_params(), 42, false);
 
         let query: Vec<f32> = (0..dim).map(|_| 0.0).collect();
-        let (indices, distances) = index.search_k(&query, 10, 500);
+        let (indices, distances) = index.search_k(&query, 10, 500, 10);
 
         assert_eq!(indices.len(), 10);
 
@@ -1213,7 +1265,7 @@ mod tests {
         let index = Fanng::new(mat.as_ref(), "euclidean", &test_params(), 42, false);
 
         let query: Vec<f32> = mat.row(20).iter().cloned().collect();
-        let (indices, _) = index.search_k(&query, 10, 500);
+        let (indices, _) = index.search_k(&query, 10, 500, 10);
 
         assert_eq!(indices.len(), 10);
         assert!(indices.contains(&20), "Should find query point");
@@ -1225,7 +1277,7 @@ mod tests {
         let index = Fanng::new(mat.as_ref(), "euclidean", &test_params(), 42, false);
 
         let query: Vec<f32> = mat.row(0).iter().cloned().collect();
-        let (indices, _) = index.search_k(&query, 300, 1000);
+        let (indices, _) = index.search_k(&query, 300, 1000, 25);
 
         assert!(indices.len() <= 200);
         assert!(indices.len() >= 50);
@@ -1235,15 +1287,15 @@ mod tests {
     fn test_fanng_batch_size_variation() {
         let mat = create_distributed_data();
 
-        let params1 = FanngParams::new(15, 5, 5, 100, 50);
-        let params2 = FanngParams::new(15, 20, 5, 100, 50);
+        let params1 = FanngParams::new(15, 5, 5, 100, 50, 25);
+        let params2 = FanngParams::new(15, 20, 5, 100, 50, 25);
 
         let index1 = Fanng::new(mat.as_ref(), "euclidean", &params1, 42, false);
         let index2 = Fanng::new(mat.as_ref(), "euclidean", &params2, 42, false);
 
         let query: Vec<f32> = mat.row(12).iter().cloned().collect();
-        let (indices1, _) = index1.search_k(&query, 5, 300);
-        let (indices2, _) = index2.search_k(&query, 5, 300);
+        let (indices1, _) = index1.search_k(&query, 5, 300, 10);
+        let (indices2, _) = index2.search_k(&query, 5, 300, 10);
 
         assert_eq!(indices1.len(), 5);
         assert_eq!(indices2.len(), 5);
@@ -1256,7 +1308,7 @@ mod tests {
     fn test_fanng_max_degree_respected() {
         let mat = create_distributed_data::<f32>();
         let max_degree = 12;
-        let params = FanngParams::new(max_degree, 20, 5, 100, 50);
+        let params = FanngParams::new(max_degree, 20, 5, 100, 50, 25);
         let index = Fanng::new(mat.as_ref(), "euclidean", &params, 42, false);
 
         for edges in &index.graph {
