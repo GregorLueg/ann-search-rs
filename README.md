@@ -19,12 +19,13 @@ neighbour searches.
   - [**Annoy (Approximate Nearest Neighbours Oh Yeah)**](https://github.com/spotify/annoy).
   A version is implemented here with some modifications.
   - [**HNSW (Hierarchical Navigable Small World)**](https://arxiv.org/abs/1603.09320). 
-  A version with some slight modifications has been implemented in this package.
-  - [**NNDescent (Nearest Neighbour Descent)** 
-  (heavily inspired by [PyNNDescent](https://github.com/lmcinnes/pynndescent))].
+  A version with some slight modifications has been implemented in this package,
+  attempting rapid index generation.
+  - **NNDescent (Nearest Neighbour Descent)** 
+  (heavily inspired by [PyNNDescent](https://github.com/lmcinnes/pynndescent)).
   - [**FANNG**](https://openaccess.thecvf.com/content_cvpr_2016/papers/Harwood_FANNG_Fast_Approximate_CVPR_2016_paper.pdf).
   A version with some modifications in terms of starting node generation and
-  some parallel operations in the index generation for speed.
+  some parallel operations in the index generation for speed purposes.
 
 - **Distance metrics**:
   - Euclidean
