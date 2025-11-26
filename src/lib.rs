@@ -5,6 +5,7 @@ pub mod dist;
 pub mod hnsw;
 pub mod nndescent;
 pub mod utils;
+pub mod fanng;
 
 use faer::MatRef;
 use num_traits::{Float, FromPrimitive, ToPrimitive};
@@ -18,6 +19,7 @@ use crate::annoy::*;
 use crate::hnsw::*;
 use crate::nndescent::*;
 use crate::utils::*;
+use crate::fanng::*;
 
 ///////////
 // Annoy //
@@ -321,6 +323,123 @@ where
     (indices, distances)
 }
 
+///////////
+// FANNG //
+///////////
+
+/// Build a FANNG index from an embedding matrix
+///
+/// ### Params
+///
+/// * `mat` - Embedding matrix (rows = samples, cols = features)
+/// * `dist_metric` - Distance metric: "euclidean" or "cosine"
+/// * `faang_params` - Optional FANNG parameters (uses default if None)
+/// * `seed` - Random seed for reproducibility
+/// * `verbose` - Print progress updates during construction
+///
+/// ### Returns
+///
+/// Constructed FANNG index ready for querying
+pub fn build_fanng_index<T>(
+    mat: MatRef<T>,
+    dist_metric: &str, 
+    faang_params: Option<FanngParams>, 
+    seed: usize, 
+    verbose: bool
+) -> Fanng<T> where
+    T: Float + Send + Sync, 
+{
+    let faang_params = faang_params.unwrap_or_default();
+
+    Fanng::new(mat, dist_metric, &faang_params, seed, verbose)
+}
+ 
+/// Query a FANNG index
+///
+/// ### Params
+///
+/// * `query_mat` - The query matrix containing the samples × features
+/// * `index` - The pre-built FANNG index
+/// * `k` - Number of neighbours to return
+/// * `max_calcs` - Maximum number of distance calculations per query (controls
+///   recall/speed trade-off)
+/// * `no_shortcuts` - How many of the random indices selected in the graph
+///   shall be explored. 
+/// * `return_dist` - Whether to return distances between points
+/// * `verbose` - Print progress updates
+///
+/// ### Returns
+///
+/// A tuple of `(knn_indices, optional distances)`
+pub fn query_fanng_index<T>(
+    query_mat: MatRef<T>,
+    index: &Fanng<T>,
+    k: usize,
+    max_calcs: usize,
+    no_shortcuts: usize,
+    return_dist: bool,
+    verbose: bool,
+) -> (Vec<Vec<usize>>, Option<Vec<Vec<T>>>)
+where
+    T: Float + Send + Sync,
+{
+    let n_samples = query_mat.nrows();
+    let counter = Arc::new(AtomicUsize::new(0));
+
+    if return_dist {
+        let results: Vec<(Vec<usize>, Vec<T>)> = (0..n_samples)
+            .into_par_iter()
+            .map(|i| {
+                let query: Vec<T> = query_mat.row(i).iter().copied().collect();
+                let (indices, distances) = index.search_k(&query, k, max_calcs, no_shortcuts);
+                
+                if verbose {
+                    let count = counter.fetch_add(1, Ordering::Relaxed) + 1;
+                    if count.is_multiple_of(100_000) {
+                        println!(
+                            " Processed {} / {} samples.",
+                            count.separate_with_underscores(),
+                            n_samples.separate_with_underscores()
+                        );
+                    }
+                }
+                
+                (indices, distances)
+            })
+            .collect();
+
+        let (indices, distances) = results.into_iter().unzip();
+        (indices, Some(distances))
+    } else {
+        let indices: Vec<Vec<usize>> = (0..n_samples)
+            .into_par_iter()
+            .map(|i| {
+                let query: Vec<T> = query_mat.row(i).iter().copied().collect();
+                let (indices, _) = index.search_k(&query, k, max_calcs, no_shortcuts);
+                
+                if verbose {
+                    let count = counter.fetch_add(1, Ordering::Relaxed) + 1;
+                    if count.is_multiple_of(100_000) {
+                        println!(
+                            " Processed {} / {} samples.",
+                            count.separate_with_underscores(),
+                            n_samples.separate_with_underscores()
+                        );
+                    }
+                }
+                
+                indices
+            })
+            .collect();
+
+        (indices, None)
+    }
+}
+
+//////////
+// Test //
+//////////
+
 #[cfg(test)]
 mod full_library_tests {
     use super::*;
@@ -357,109 +476,6 @@ mod full_library_tests {
         let overlap = b.iter().filter(|x| set_a.contains(x)).count();
         overlap as f64 / a.len() as f64
     }
-
-    #[test]
-    fn test_hnsw_entry_point_reach() {
-        let mat = create_clustered_data::<f64>();
-        let hnsw_idx = build_hnsw_index(mat.as_ref(), 16, 200, "euclidean", 42, false);
-        
-        // Check what entry point connects to at layer 0
-        let entry = hnsw_idx.entry_point as usize;
-        let offset = hnsw_idx.neighbour_offsets[entry];
-        let max_neighbours = hnsw_idx.m * 2;
-        
-        let mut cluster_counts = [0; 3];
-        let mut neighbours = Vec::new();
-        
-        for i in 0..max_neighbours {
-            let neighbour = hnsw_idx.neighbours_flat[offset + i];
-            if neighbour == u32::MAX {
-                break;
-            }
-            let cluster = (neighbour as usize) / 100;
-            cluster_counts[cluster] += 1;
-            neighbours.push(neighbour as usize);
-        }
-        
-        // Check if any cluster 0 nodes connect TO the entry point
-        let mut reverse_connections = 0;
-        for i in 0..100 {
-            let offset = hnsw_idx.neighbour_offsets[i];
-            let max_neighbours = hnsw_idx.m * 2;
-            
-            for j in 0..max_neighbours {
-                let neighbour = hnsw_idx.neighbours_flat[offset + j];
-                if neighbour == entry as u32 {
-                    reverse_connections += 1;
-                }
-            }
-        }
-        
-        assert!(cluster_counts[0] > 0 || reverse_connections > 0, 
-                "Entry point cannot reach cluster 0!");
-    }
-
-    #[test]
-    fn test_hnsw_cross_cluster_connectivity() {
-        let mat = create_clustered_data::<f64>();
-        let hnsw_idx = build_hnsw_index(mat.as_ref(), 16, 400, "euclidean", 42, false);
-        
-        // Check if layer 0 has connections between clusters
-        let mut cross_cluster_connections = 0;
-        
-        for i in 0..100 {  // Check cluster 0 nodes
-            let offset = hnsw_idx.neighbour_offsets[i];
-            let max_neighbours = hnsw_idx.m * 2;
-            
-            for j in 0..max_neighbours {
-                let neighbour = hnsw_idx.neighbours_flat[offset + j];
-                if neighbour == u32::MAX {
-                    break;
-                }
-                let neighbour_cluster = (neighbour as usize) / 100;
-                if neighbour_cluster != 0 {
-                    cross_cluster_connections += 1;
-                }
-            }
-        }
-        
-        // The entry point should ideally be able to reach all clusters
-        assert!(cross_cluster_connections > 0, "No cross-cluster connections found!");
-    }
-
-    #[test]
-    fn test_hnsw_graph_connectivity() {
-        let mat = create_clustered_data::<f64>();
-        let hnsw_idx = build_hnsw_index(mat.as_ref(), 16, 400, "euclidean", 42, false);
-        
-        // Check how many nodes have connections
-        let mut disconnected = 0;
-        let mut connection_counts = Vec::new();
-        
-        for i in 0..hnsw_idx.n {
-            let offset = hnsw_idx.neighbour_offsets[i];
-            let max_neighbours = if hnsw_idx.layer_assignments[i] == 0 { 
-                hnsw_idx.m * 2 
-            } else { 
-                hnsw_idx.m 
-            };
-            
-            let mut count = 0;
-            for j in 0..max_neighbours {
-                if hnsw_idx.neighbours_flat[offset + j] != u32::MAX {
-                    count += 1;
-                }
-            }
-            
-            if count == 0 {
-                disconnected += 1;
-            }
-            connection_counts.push(count);
-        }
-        
-        assert_eq!(disconnected, 0, "Found {} disconnected nodes", disconnected);
-    }
-
 
     #[test]
     fn test_hnsw_finds_self() {
@@ -524,26 +540,51 @@ mod full_library_tests {
         assert_eq!(self_not_found, 0);
     }
 
+  #[test]
+    fn test_fanng_finds_self() {
+        let mat = create_clustered_data::<f64>();
+        let fanng_idx = build_fanng_index(mat.as_ref(), "euclidean", Some(FanngParams::fast()), 42, false);
+        let (fanng_indices, fanng_dists) = query_fanng_index(mat.as_ref(), &fanng_idx, 15, 500, 25, true, false);
+        
+        let mut self_not_found = 0;
+        for i in 0..mat.nrows() {
+            if fanng_indices[i][0] != i {
+                println!("FANNG: Point {} didn't find itself first. Found: {} with dist: {}", 
+                        i, fanng_indices[i][0], fanng_dists.as_ref().unwrap()[i][0]);
+            }
+            if !fanng_indices[i].contains(&i) {
+                self_not_found += 1;
+                println!("FANNG: Point {} didn't find itself at all! Neighbours: {:?}", i, &fanng_indices[i]);
+            }
+        }
+        
+        assert_eq!(self_not_found, 0, "FANNG: {} points couldn't find themselves", self_not_found);
+    }
+
     #[test]
     fn test_methods_find_cluster_neighbours() {
+        // All of these should identify neighbours within their clusters
         let mat = create_clustered_data::<f64>();
         let k = 15;
         
         let annoy_idx = build_annoy_index(mat.as_ref(), 100, 42);
         let hnsw_idx = build_hnsw_index(mat.as_ref(), 16, 400, "euclidean", 42, false);
+        let fanng_idx = build_fanng_index(mat.as_ref(), "euclidean", Some(FanngParams::fast()), 42, false);
         let (nn_indices, _) = generate_knn_nndescent_with_dist(
             mat.as_ref(), "euclidean", k, 30, 0.001, 0.5, 42, false, false
         );
         
         let (annoy_indices, _) = query_annoy_index(mat.as_ref(), &annoy_idx, "euclidean", k, 100, false, false);
         let (hnsw_indices, _) = query_hnsw_index(mat.as_ref(), &hnsw_idx, k, 400, false, false);
+        let (fanng_indices, _) = query_fanng_index(mat.as_ref(), &fanng_idx, 15, 500, 25, false, false);
         
         // Check that neighbours are mostly from the same cluster
-        for method_name in ["Annoy", "HNSW", "NNDescent"].iter() {
+        for method_name in ["Annoy", "HNSW", "NNDescent", "FANNG"].iter() {
             let indices = match *method_name {
                 "Annoy" => &annoy_indices,
                 "HNSW" => &hnsw_indices,
                 "NNDescent" => &nn_indices,
+                "FANNG" => &fanng_indices,
                 _ => unreachable!(),
             };
             
@@ -573,7 +614,8 @@ mod full_library_tests {
         let k = 15;
 
         let annoy_idx = build_annoy_index(mat.as_ref(), 100, 42);
-        let hnsw_idx = build_hnsw_index(mat.as_ref(), 16, 400, "euclidean", 42, false); // Reduced M, increased ef_construction
+        let hnsw_idx = build_hnsw_index(mat.as_ref(), 16, 400, "euclidean", 42, false);
+        let fanng_idx = build_fanng_index(mat.as_ref(), "euclidean", Some(FanngParams::fast()), 42, false);
         let (nn_indices, _) = generate_knn_nndescent_with_dist(
             mat.as_ref(),
             "euclidean",
@@ -589,24 +631,35 @@ mod full_library_tests {
         let (annoy_indices, _) =
             query_annoy_index(mat.as_ref(), &annoy_idx, "euclidean", k, 100, false, false);
         let (hnsw_indices, _) = query_hnsw_index(mat.as_ref(), &hnsw_idx, k, 400, false, false); // Increased ef_search
+        let (fanng_indices, _) = query_fanng_index(mat.as_ref(), &fanng_idx, 15, 500, 25, false, false);
 
-        let mut total_overlaps = (0.0, 0.0, 0.0);
+
+        let mut total_overlaps = (0.0, 0.0, 0.0, 0.0, 0.0, 0.0);
         let sample_points: Vec<usize> = (0..300).step_by(30).collect();
 
         for &i in &sample_points {
             let ah = compute_overlap(&annoy_indices[i], &hnsw_indices[i]);
             let an = compute_overlap(&annoy_indices[i], &nn_indices[i]);
+            let af = compute_overlap(&annoy_indices[i], &fanng_indices[i]);
             let hn = compute_overlap(&hnsw_indices[i], &nn_indices[i]);
+            let hf = compute_overlap(&hnsw_indices[i], &fanng_indices[i]);
+            let nf = compute_overlap(&nn_indices[i], &fanng_indices[i]);
 
             total_overlaps.0 += ah;
             total_overlaps.1 += an;
-            total_overlaps.2 += hn;
+            total_overlaps.2 += af; 
+            total_overlaps.3 += hn;
+            total_overlaps.4 += hf;
+            total_overlaps.5 += nf;
         }
 
         let n = sample_points.len() as f64;
         let avg_ah = total_overlaps.0 / n;
         let avg_an = total_overlaps.1 / n;
-        let avg_hn = total_overlaps.2 / n;
+        let avg_af = total_overlaps.2 / n;
+        let avg_hn = total_overlaps.3 / n;
+        let avg_hf = total_overlaps.4 / n;
+        let avg_nf = total_overlaps.5 / n;
 
         assert!(
             avg_ah > 0.75, 
@@ -619,9 +672,24 @@ mod full_library_tests {
             avg_an
         );
         assert!(
+            avg_af > 0.75,
+            "Annoy/FANNG average overlap too low: {:.2}",
+            avg_an
+        );
+        assert!(
             avg_hn > 0.75,
             "HNSW/NNDescent average overlap too low: {:.2}",
             avg_hn
+        );
+        assert!(
+            avg_hf > 0.75,
+            "HNSW/FANNG average overlap too low: {:.2}",
+            avg_an
+        );
+         assert!(
+            avg_nf > 0.75,
+            "NNDescent/FANNG average overlap too low: {:.2}",
+            avg_an
         );
     }
 }

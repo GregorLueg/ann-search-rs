@@ -10,13 +10,22 @@ with single cell in mind from [bixverse](https://github.com/GregorLueg/bixverse)
 a R/Rust package designed for computational biology, that has a ton of 
 functionality for single cell. Within all of the single cell functions, kNN 
 generations are ubiqituos, thus, I want to expose the APIs to other packages.
+Feel free to use these implementations where you might need approximate nearest
+neighbour searches.
 
 ## Features
 
 - **Multiple ANN algorithms**:
-  - Annoy (Approximate Nearest Neighbours Oh Yeah)
-  - HNSW (Hierarchical Navigable Small World)
-  - NNDescent (Nearest Neighbour Descent)
+  - [**Annoy (Approximate Nearest Neighbours Oh Yeah)**](https://github.com/spotify/annoy).
+  A version is implemented here with some modifications.
+  - [**HNSW (Hierarchical Navigable Small World)**](https://arxiv.org/abs/1603.09320). 
+  A version with some slight modifications has been implemented in this package,
+  attempting rapid index generation.
+  - **NNDescent (Nearest Neighbour Descent)** 
+  (heavily inspired by [PyNNDescent](https://github.com/lmcinnes/pynndescent)).
+  - [**FANNG**](https://openaccess.thecvf.com/content_cvpr_2016/papers/Harwood_FANNG_Fast_Approximate_CVPR_2016_paper.pdf).
+  A version with some modifications in terms of starting node generation and
+  some parallel operations in the index generation for speed purposes.
 
 - **Distance metrics**:
   - Euclidean
@@ -24,7 +33,7 @@ generations are ubiqituos, thus, I want to expose the APIs to other packages.
   - More to come maybe...
 
 - **High performance**: Optimised implementations with SIMD-friendly code,
-heavy threading were possible and optimised structures for memory access.
+heavy multi-threading were possible and optimised structures for memory access.
 
 ## Installation
 
