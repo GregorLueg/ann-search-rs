@@ -420,7 +420,8 @@ where
                 let margin = (dot - *threshold).abs();
                 let half = T::from_f64(0.5).unwrap();
 
-                if margin < half && *remaining_budget > 20 {
+                // more sensible threshold now
+                if margin < half && *remaining_budget > 2 {
                     let half_budget = *remaining_budget / 2;
 
                     let (first, second) = if dot <= *threshold {

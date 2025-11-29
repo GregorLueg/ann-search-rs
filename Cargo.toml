@@ -1,10 +1,10 @@
 [package]
 name = "ann-search-rs"
-version = "0.1.4"
+version = "0.1.5"
 edition = "2021"
 authors = ["Gregor Lueg <gregorlueg@me.com>"]
 license = "MIT"
-repository = "https://github.com/GregorLueg/node2vec-rs"
+repository = "https://github.com/GregorLueg/ann-search-rs"
 description = "Various approximate nearest neighbour searches in Rust."
 
 [lib]

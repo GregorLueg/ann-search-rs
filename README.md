@@ -11,7 +11,9 @@ a R/Rust package designed for computational biology, that has a ton of
 functionality for single cell. Within all of the single cell functions, kNN 
 generations are ubiqituos, thus, I want to expose the APIs to other packages.
 Feel free to use these implementations where you might need approximate nearest
-neighbour searches.
+neighbour searches. This work is based on the great work from others who
+figured out how to design these algorithms and is just an implementation into
+Rust of some of these.
 
 ## Features
 
@@ -30,7 +32,7 @@ neighbour searches.
 - **Distance metrics**:
   - Euclidean
   - Cosine
-  - More to come maybe...
+  - More to come maybe... ?
 
 - **High performance**: Optimised implementations with SIMD-friendly code,
 heavy multi-threading were possible and optimised structures for memory access.
@@ -38,6 +40,7 @@ heavy multi-threading were possible and optimised structures for memory access.
 ## Installation
 
 Add this to your `Cargo.toml`:
+
 ```toml
 [dependencies]
 ann-search-rs = "*" # always get the latest version
@@ -46,6 +49,8 @@ ann-search-rs = "*" # always get the latest version
 ## Usage
 
 Below shows an example on how to use for example the HNSW index and query it.
+
+### HNSW
 
 ```rust
 use ann_search_rs::{build_hnsw_index, query_hnsw_index, Dist, parse_ann_dist};
@@ -69,6 +74,40 @@ let (hnsw_indices, hnsw_dists) = query_hnsw_index(
   &hnsw_idx, 
   15,             // k
   400,            // ef_search
+  true,           // return distances
+  false.          // verbosity
+);
+```
+
+### Annoy
+
+`ann-search-rs` also offers other versions of approximate nearest neighbour
+searches, such as a more custom implementation of Annoy. The principle remains
+the same:
+- Generation of random trees splitting the data on a hyperplane (tree 
+  generation is executed in parallel).
+- A difference is that the search allows to look at different branches in case
+  of close boundaries. 
+
+```rust
+use ann_search_rs::{build_annoy_index, query_annoy_index, Dist, parse_ann_dist};
+use faer::Mat;
+
+// Build the Annoy index
+let data = Mat::from_fn(1000, 128, |_, _| rand::random::<f32>());
+let annoy_idx = build_annoy_index(
+  mat.as_ref(), 
+  100,            // number of trees to generate
+  42,             // seed
+);
+
+// Query the Annoy index
+let query = Mat::from_fn(10, 128, |_, _| rand::random::<f32>());
+let (annoy_indices, annoy_dists) = query_annoy_index(
+  mat.as_ref(), 
+  15,             // k
+  "euclidean",    // distance metric
+  100,            // search budget
   true,           // return distances
   false.          // verbosity
 );
