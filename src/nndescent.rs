@@ -486,6 +486,7 @@ where
                 indices
                     .into_iter()
                     .zip(distances)
+                    .filter(|&(idx, _)| idx != i) // ← Add this
                     .take(k)
                     .map(|(idx, dist)| Neighbour::new(idx, dist, true))
                     .collect()
@@ -714,8 +715,10 @@ impl UpdateNeighbours<f32> for NNDescent<f32> {
 
                 for n in current {
                     let pid = n.pid();
-                    heap.push((OrderedFloat(n.dist), pid, false));
-                    pid_set[pid] = true;
+                    if pid != node {
+                        heap.push((OrderedFloat(n.dist), pid, false));
+                        pid_set[pid] = true;
+                    }
                 }
 
                 for &(pid, dist) in candidates {
@@ -767,6 +770,19 @@ impl UpdateNeighbours<f32> for NNDescent<f32> {
 }
 
 impl UpdateNeighbours<f64> for NNDescent<f64> {
+    /// Update the neighbours with the improvements (for f64)
+    ///
+    /// ### Params
+    ///
+    /// * `node` - Current node index
+    /// * `current` - Current best neighbours
+    /// * `candidates` - Potential new neighbours
+    /// * `k` - Number of neighbours to find
+    /// * `updates` - Borrowed AtomicUsize to check if an update happened
+    ///
+    /// ### Returns
+    ///
+    /// Vec of updates `Neigbour`s.
     fn update_neighbours(
         &self,
         node: usize,
@@ -788,9 +804,10 @@ impl UpdateNeighbours<f64> for NNDescent<f64> {
 
                 for n in current {
                     let pid = n.pid();
-                    // FIX: Removed "if pid != node" check
-                    heap.push((OrderedFloat(n.dist), pid, false));
-                    pid_set[pid] = true;
+                    if pid != node {
+                        heap.push((OrderedFloat(n.dist), pid, false));
+                        pid_set[pid] = true;
+                    }
                 }
 
                 for &(pid, dist) in candidates {

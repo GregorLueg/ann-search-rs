@@ -366,6 +366,7 @@ where
     /// * `query_vec` - Query vector for similarity matching
     /// * `candidates` - Accumulating list of potential neighbor indices
     /// * `budget` - Maximum candidates to collect from this tree
+    #[inline]
     fn query_tree_enhanced(
         &self,
         tree: &[AnnoyNode<T>],
@@ -421,7 +422,7 @@ where
                 let half = T::from_f64(0.5).unwrap();
 
                 // more sensible threshold now
-                if margin < half && *remaining_budget > 2 {
+                if margin < half && *remaining_budget > 5 {
                     let half_budget = *remaining_budget / 2;
 
                     let (first, second) = if dot <= *threshold {

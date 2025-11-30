@@ -1,6 +1,5 @@
 use faer::{MatRef, RowRef};
 use num_traits::{Float, FromPrimitive, ToPrimitive};
-use std::cmp::Reverse;
 use std::collections::BinaryHeap;
 
 use crate::utils::*;
@@ -96,8 +95,7 @@ where
         let n_vectors = self.vectors_flat.len() / self.dim;
         let k = k.min(n_vectors);
 
-        let mut heap: BinaryHeap<(Reverse<OrderedFloat<T>>, usize)> =
-            BinaryHeap::with_capacity(k + 1);
+        let mut heap: BinaryHeap<(OrderedFloat<T>, usize)> = BinaryHeap::with_capacity(k + 1);
 
         match self.dist {
             Dist::Euclidean => {
@@ -124,10 +122,10 @@ where
                     }
 
                     if heap.len() < k {
-                        heap.push((Reverse(OrderedFloat(sum)), idx));
-                    } else if sum < heap.peek().unwrap().0 .0 .0 {
+                        heap.push((OrderedFloat(sum), idx));
+                    } else if sum < heap.peek().unwrap().0 .0 {
                         heap.pop();
-                        heap.push((Reverse(OrderedFloat(sum)), idx));
+                        heap.push((OrderedFloat(sum), idx));
                     }
                 }
             }
@@ -163,10 +161,10 @@ where
                         T::one() - (dot / (norm_query * unsafe { *self.norms.get_unchecked(idx) }));
 
                     if heap.len() < k {
-                        heap.push((Reverse(OrderedFloat(dist)), idx));
-                    } else if dist < heap.peek().unwrap().0 .0 .0 {
+                        heap.push((OrderedFloat(dist), idx));
+                    } else if dist < heap.peek().unwrap().0 .0 {
                         heap.pop();
-                        heap.push((Reverse(OrderedFloat(dist)), idx));
+                        heap.push((OrderedFloat(dist), idx));
                     }
                 }
             }
@@ -177,7 +175,7 @@ where
 
         let (distances, indices): (Vec<_>, Vec<_>) = results
             .into_iter()
-            .map(|(Reverse(OrderedFloat(dist)), idx)| (dist, idx))
+            .map(|(OrderedFloat(dist), idx)| (dist, idx))
             .unzip();
 
         (indices, distances)
@@ -202,6 +200,7 @@ where
     ///
     /// The function uses under the hood unsafe Rust with optimised layout for
     /// SIMD instructions. Be wary of this.
+    #[inline]
     pub fn query_row(&self, query_row: RowRef<T>, k: usize) -> (Vec<usize>, Vec<T>) {
         assert!(
             query_row.ncols() == self.dim,

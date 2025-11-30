@@ -934,6 +934,7 @@ where
     /// ### Returns
     ///
     /// Tuple of (indices, distances)
+    #[inline]
     pub fn query(&self, query: &[T], k: usize, ef_search: usize) -> (Vec<usize>, Vec<T>) {
         assert_eq!(query.len(), self.dim);
 
@@ -996,6 +997,7 @@ where
     /// ### Returns
     ///
     /// List of (distance, node_id) pairs, sorted by distance
+    #[inline]
     fn search_layer_query(
         &self,
         query: &[T],

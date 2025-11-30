@@ -7,6 +7,7 @@ pub mod nndescent;
 pub mod utils;
 pub mod fanng;
 pub mod exhaustive;
+pub mod synthetic;
 
 use faer::MatRef;
 use num_traits::{Float, FromPrimitive, ToPrimitive};
@@ -467,6 +468,19 @@ where
     ExhaustiveIndex::new(mat, metric)
 }
 
+/// Query the exhaustive index
+/// 
+/// ### Params
+/// 
+/// * `query_mat` - The query matrix containing the samples × features
+/// * `index` - The exhaustive index
+/// * `k` - Number of neighbours to return
+/// * `return_dist` - Shall the distances be returned
+/// * `verbose` - Controls verbosity of the function
+/// 
+/// ### Returns
+/// 
+/// A tuple of `(knn_indices, optional distances)`
 pub fn query_exhaustive_index<T>(
     query_mat: MatRef<T>,
     index: &ExhaustiveIndex<T>,
