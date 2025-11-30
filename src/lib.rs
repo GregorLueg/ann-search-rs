@@ -6,6 +6,7 @@ pub mod hnsw;
 pub mod nndescent;
 pub mod utils;
 pub mod fanng;
+pub mod exhaustive;
 
 use faer::MatRef;
 use num_traits::{Float, FromPrimitive, ToPrimitive};
@@ -20,6 +21,7 @@ use crate::hnsw::*;
 use crate::nndescent::*;
 use crate::utils::*;
 use crate::fanng::*;
+use crate::exhaustive::*;
 
 ///////////
 // Annoy //
@@ -439,6 +441,75 @@ where
             })
             .collect();
 
+        (indices, None)
+    }
+}
+
+////////////////
+// Exhaustive //
+////////////////
+
+/// Build an exhaustive index
+/// 
+/// ### Params
+/// 
+/// * `mat` - The initial matrix with samples x features
+/// * `dist_metric` - Distance metric: "euclidean" or "cosine"
+/// 
+/// ### Returns
+/// 
+/// The initialised `ExhausiveIndex`
+pub fn build_exhaustive_index<T>(mat: MatRef<T>, dist_metric: &str) -> ExhaustiveIndex<T>
+where
+    T: Float + FromPrimitive + ToPrimitive + Send + Sync,
+{
+    let metric = parse_ann_dist(dist_metric).unwrap_or(Dist::Cosine);
+    ExhaustiveIndex::new(mat, metric)
+}
+
+pub fn query_exhaustive_index<T>(
+    query_mat: MatRef<T>,
+    index: &ExhaustiveIndex<T>,
+    k: usize,
+    return_dist: bool,
+    verbose: bool,
+) -> (Vec<Vec<usize>>, Option<Vec<Vec<T>>>)
+where
+    T: Float + FromPrimitive + ToPrimitive + Send + Sync,
+{
+    let n_samples = query_mat.nrows();
+    let counter = Arc::new(AtomicUsize::new(0));
+
+    if return_dist {
+        let results: Vec<(Vec<usize>, Vec<T>)> = (0..n_samples)
+            .into_par_iter()
+            .map(|i| {
+                let result = index.query_row(query_mat.row(i), k);
+                if verbose {
+                    let count = counter.fetch_add(1, Ordering::Relaxed) + 1;
+                    if count.is_multiple_of(100_000) {
+                        println!(" Processed {} / {} samples.", count.separate_with_underscores(), n_samples.separate_with_underscores());
+                    }
+                }
+                result
+            })
+            .collect();
+        let (indices, distances) = results.into_iter().unzip();
+        (indices, Some(distances))
+    } else {
+        let indices: Vec<Vec<usize>> = (0..n_samples)
+            .into_par_iter()
+            .map(|i| {
+                let (neighbors, _) = index.query_row(query_mat.row(i), k);
+                if verbose {
+                    let count = counter.fetch_add(1, Ordering::Relaxed) + 1;
+                    if count.is_multiple_of(100_000) {
+                        println!(" Processed {} / {} samples.", count.separate_with_underscores(), n_samples.separate_with_underscores());
+                    }
+                }
+                neighbors
+            })
+            .collect();
         (indices, None)
     }
 }
