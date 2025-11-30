@@ -486,7 +486,6 @@ where
                 indices
                     .into_iter()
                     .zip(distances)
-                    .filter(|&(idx, _)| idx != i) // ← Add this
                     .take(k)
                     .map(|(idx, dist)| Neighbour::new(idx, dist, true))
                     .collect()
@@ -715,10 +714,8 @@ impl UpdateNeighbours<f32> for NNDescent<f32> {
 
                 for n in current {
                     let pid = n.pid();
-                    if pid != node {
-                        heap.push((OrderedFloat(n.dist), pid, false));
-                        pid_set[pid] = true;
-                    }
+                    heap.push((OrderedFloat(n.dist), pid, false));
+                    pid_set[pid] = true;
                 }
 
                 for &(pid, dist) in candidates {
@@ -804,10 +801,8 @@ impl UpdateNeighbours<f64> for NNDescent<f64> {
 
                 for n in current {
                     let pid = n.pid();
-                    if pid != node {
-                        heap.push((OrderedFloat(n.dist), pid, false));
-                        pid_set[pid] = true;
-                    }
+                    heap.push((OrderedFloat(n.dist), pid, false));
+                    pid_set[pid] = true;
                 }
 
                 for &(pid, dist) in candidates {

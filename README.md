@@ -130,90 +130,148 @@ exhaustive search serves as baseline.
 ### 10k samples, 20 distinct clusters, 8 dimensions
 
 This could represent a smaller, low complexity single cell result. For Annoy
-the search budget is set to `n_tree * 2`. The number of random entry points
+the search budget is set to `n_tree * 3`. The number of random entry points
 in FANNG is set to `25`.
 
-| Method | Build (ms) | Query (ms) | Recall@k | Dist Error |
-|--------|------------|------------|----------|------------|
-| Exhaustive | 0.10 | 65.15 | 1.0000 | 0.000000 |
-| Annoy-5 | 3.42 | 7.92 | 0.6439 | 0.360428 |
-| Annoy-10 | 5.17 | 16.45 | 0.8462 | 0.095916 |
-| Annoy-25 | 11.69 | 43.87 | 0.9835 | 0.005743 |
-| Annoy-50 | 18.88 | 85.08 | 0.9993 | 0.000164 |
-| Annoy-100 | 36.05 | 215.27 | 1.0000 | 0.000001 |
-| HNSW-M16-ef100-s50 | 132.56 | 26.57 | 1.0000 | 0.000000 |
-| HNSW-M16-ef100-s100 | 121.33 | 78.81 | 1.0000 | 0.000000 |
-| HNSW-M16-ef200-s100 | 190.20 | 74.99 | 1.0000 | 0.000000 |
-| HNSW-M16-ef200-s200 | 189.60 | 229.11 | 1.0000 | 0.000000 |
-| HNSW-M32-ef200-s100 | 416.97 | 71.33 | 1.0000 | 0.000000 |
-| HNSW-M32-ef200-s200 | 418.46 | 238.91 | 1.0000 | 0.000000 |
-| NNDescent-i10-r0.5 | 153.64 | 0.00 | 0.9981 | 0.000457 |
-| NNDescent-i25-r0.5 | 187.17 | 0.00 | 0.9984 | 0.000378 |
-| NNDescent-i25-r1 | 146.04 | 0.00 | 0.9984 | 0.000369 |
-| FANNG-c100-s10 | 1364.58 | 9.41 | 0.6962 | 0.731422 |
-| FANNG-c200-s20 | 1380.16 | 14.65 | 0.9991 | 0.001719 |
-| FANNG-c500-s20 | 1363.54 | 20.83 | 0.9999 | 0.000394 |
-| FANNG-c1000-s20 | 1356.45 | 21.50 | 0.9999 | 0.000394 |
+```
+================================================================================
+Benchmark: 10k cells, 8D
+================================================================================
+Method            Build (ms)   Query (ms)   Total (ms)     Recall@k   Dist Error
+--------------------------------------------------------------------------------
+Exhaustive              0.09        53.42        53.53       1.0000     0.000000
+Annoy-5                 3.25         8.51        13.99       0.7230     0.238923
+Annoy-10                4.59        17.62        24.32       0.9037     0.052017
+Annoy-25                9.81        47.60        59.40       0.9940     0.001923
+Annoy-50               18.92       114.09       135.10       0.9999     0.000017
+Annoy-100              35.72       268.06       305.79       1.0000     0.000000
+HNSW-M16-ef100-s50       122.31        24.54       148.98       1.0000     0.000000
+HNSW-M16-ef100-s100       117.80        68.23       188.05       1.0000     0.000000
+HNSW-M16-ef200-s100       181.14        68.31       251.52       1.0000     0.000000
+HNSW-M16-ef200-s200       173.91       212.09       387.99       1.0000     0.000000
+HNSW-M32-ef200-s100       380.94        64.86       447.84       1.0000     0.000000
+HNSW-M32-ef200-s200       366.49       226.16       594.59       1.0000     0.000000
+NNDescent-i10-r0.5       135.29         0.00       137.22       0.9981     0.000457
+NNDescent-i25-r0.5       195.74         0.00       197.68       0.9984     0.000378
+NNDescent-i25-r1       130.51         0.00       132.49       0.9984     0.000369
+FANNG-c100-s20       1604.84         7.94      1614.96       0.6883     0.691898
+FANNG-c200-s20       1565.52        13.29      1580.85       0.9992     0.001605
+FANNG-c500-s20       1553.77        19.69      1575.40       0.9999     0.000327
+FANNG-c1000-s20      1538.00        19.24      1559.24       0.9999     0.000327
+--------------------------------------------------------------------------------
+```
+
+With low amounts of samples, the exhaustive search is actually the fastest.
 
 ### 100k samples, 20 distinct clusters, 16 dimensions
 
-Medium complexity data set with more dimensions needed. For Annoy
-the search budget is set to `n_tree * 2`. The number of random entry points
+This could represent a smaller, low complexity single cell result. For Annoy
+the search budget is set to `n_tree * 4`. The number of random entry points
 in FANNG is set to `25`.
 
-| Method | Build (ms) | Query (ms) | Recall@k | Dist Error |
-|--------|------------|------------|----------|------------|
-| Exhaustive | 1.56 | 7862.67 | 1.0000 | 0.000000 |
-| Annoy-5 | 51.25 | 157.99 | 0.2583 | 3.234698 |
-| Annoy-10 | 64.84 | 382.32 | 0.4042 | 1.675017 |
-| Annoy-25 | 155.14 | 1034.79 | 0.6772 | 0.502793 |
-| Annoy-50 | 296.94 | 2368.09 | 0.8704 | 0.131538 |
-| Annoy-100 | 549.23 | 5326.01 | 0.9738 | 0.017791 |
-| HNSW-M16-ef100-s50 | 2106.30 | 578.04 | 0.9967 | 0.002410 |
-| HNSW-M16-ef100-s100 | 2100.62 | 1696.65 | 0.9994 | 0.000439 |
-| HNSW-M16-ef200-s100 | 3715.10 | 1667.15 | 0.9999 | 0.000071 |
-| HNSW-M16-ef200-s200 | 3740.89 | 5359.63 | 1.0000 | 0.000005 |
-| HNSW-M32-ef200-s100 | 7750.63 | 1719.12 | 1.0000 | 0.000004 |
-| HNSW-M32-ef200-s200 | 7745.72 | 5650.26 | 1.0000 | 0.000000 |
-| NNDescent-i10-r0.5 | 3331.30 | 0.00 | 0.9557 | 0.032429 |
-| NNDescent-i25-r0.5 | 4757.38 | 0.00 | 0.9601 | 0.028696 |
-| NNDescent-i25-r1 | 4769.00 | 0.00 | 0.9603 | 0.028480 |
-| FANNG-c100-s20 | 24872.01 | 98.24 | 0.1399 | 6.873163 |
-| FANNG-c200-s20 | 25332.87 | 195.48 | 0.7667 | 0.812314 |
-| FANNG-c500-s20 | 24517.77 | 342.27 | 0.9534 | 0.044355 |
-| FANNG-c1000-s20 | 24468.93 | 333.81 | 0.9545 | 0.042144 |
+```
+================================================================================
+Benchmark: 100k cells, 16D
+================================================================================
+Method            Build (ms)   Query (ms)   Total (ms)     Recall@k   Dist Error
+--------------------------------------------------------------------------------
+Exhaustive              1.33      7010.78      7012.11       1.0000     0.000000
+Annoy-5                42.89       195.91       261.75       0.3022     2.624925
+Annoy-10               61.31       381.19       463.83       0.4702     1.282308
+Annoy-25              142.47      1204.25      1367.55       0.7540     0.332057
+Annoy-50              269.79      2758.16      3048.73       0.9212     0.070282
+Annoy-100             514.36      6866.85      7403.22       0.9894     0.006388
+HNSW-M16-ef100-s50      2093.57       554.63      2668.53       0.9966     0.002426
+HNSW-M16-ef100-s100      1905.30      1518.20      3442.69       0.9995     0.000385
+HNSW-M16-ef200-s100      3352.79      1738.16      5110.83       0.9999     0.000077
+HNSW-M16-ef200-s200      3416.25      5103.71      8539.54       1.0000     0.000008
+HNSW-M32-ef200-s100      7034.83      1585.24      8639.85       1.0000     0.000006
+HNSW-M32-ef200-s200      7408.99      5056.07     12484.40       1.0000     0.000000
+NNDescent-i10-r0.5      3015.45         0.00      3036.29       0.9557     0.032429
+NNDescent-i25-r0.5      4648.03         0.00      4668.06       0.9601     0.028696
+NNDescent-i25-r1      4634.53         0.00      4654.76       0.9603     0.028480
+FANNG-c100-s20      26482.05        84.44     26589.99       0.1472     6.694286
+FANNG-c200-s20      25840.38       145.22     26006.08       0.8138     0.691738
+FANNG-c500-s20      25766.17       289.82     26075.90       0.9740     0.022659
+FANNG-c1000-s20     25544.78       297.60     25863.04       0.9746     0.021176
+--------------------------------------------------------------------------------
+```
+
+This is the point where we can observe the non-exhausive searches being faster
+than the exhaustive search. There is a clear trade-off between index building
+and querying time (usually you do both in one go in single cell). Especially
+interesting here is FANNG. It has the longest index building time, but the 
+query time is incredibly rapid. This can be useful in situations in which you
+query the same data set again and again. HNSW is an obvious winner here with an
+overall low combined index building time and query time. 
 
 ### 100k samples, 20 distinct clusters, 32 dimensions
 
 Medium complexity data set with more dimensions needed. For Annoy
-the search budget is set to `n_tree * 4`! The number of random entry points
-in FANNG is set to `50`!
+the search budget is set to `n_tree * 5`! The number of random entry points
+in FANNG is set to `50`! The number of max iterations for NNDescent was 
+increased to `50`.
 
-| Method | Build (ms) | Query (ms) | Recall@k | Dist Error |
-|--------|------------|------------|----------|------------|
-| Exhaustive | 2.58 | 17273.71 | 1.0000 | 0.000000 |
-| Annoy-5 | 65.31 | 193.86 | 0.1260 | 13.152898 |
-| Annoy-10 | 87.23 | 419.44 | 0.1809 | 8.786201 |
-| Annoy-25 | 200.44 | 1247.87 | 0.3234 | 2.278832 |
-| Annoy-50 | 359.95 | 2723.41 | 0.5010 | 0.874434 |
-| Annoy-100 | 719.03 | 6332.21 | 0.7186 | 1.084700 |
-| HNSW-M16-ef100-s50 | 3810.34 | 1075.20 | 0.9169 | 0.211469 |
-| HNSW-M16-ef100-s100 | 3785.46 | 2876.53 | 0.9610 | 0.089046 |
-| HNSW-M16-ef200-s100 | 6179.53 | 2871.37 | 0.9829 | 0.033648 |
-| HNSW-M16-ef200-s200 | 6179.46 | 9565.31 | 0.9952 | 0.009195 |
-| HNSW-M32-ef200-s100 | 18107.29 | 3361.91 | 0.9985 | 0.002412 |
-| HNSW-M32-ef200-s200 | 19025.60 | 10221.43 | 0.9998 | 0.000352 |
-| NNDescent-i10-r0.5 | 4157.08 | 0.00 | 0.7353 | 0.824006 |
-| NNDescent-i25-r0.5 | 5806.16 | 0.00 | 0.7536 | 0.743641 |
-| NNDescent-i25-r1 | 5979.18 | 0.00 | 0.7551 | 0.737854 |
-| FANNG-c100-s20 | 50952.05 | 118.75 | 0.0648 | 18.678117 |
-| FANNG-c200-s20 | 49876.50 | 191.53 | 0.3402 | 7.189320 |
-| FANNG-c500-s20 | 49441.04 | 434.05 | 0.6655 | 1.470630 |
-| FANNG-c1000-s20 | 48231.39 | 461.61 | 0.7007 | 1.134575 |
+```
+================================================================================
+Benchmark: 100k cells, 32D
+================================================================================
+Method            Build (ms)   Query (ms)   Total (ms)     Recall@k   Dist Error
+--------------------------------------------------------------------------------
+Exhaustive              2.76     14942.45     14945.22       1.0000     0.000000
+Annoy-5                57.78       191.70       273.54       0.1272    13.014309
+Annoy-10               71.35       426.70       520.05       0.1830     8.676938
+Annoy-25              180.53      1257.21      1459.98       0.3276     4.440112
+Annoy-50              349.63      2748.94      3121.66       0.5069     2.227598
+Annoy-100             687.98      6353.03      7063.21       0.7249     0.846346
+HNSW-M16-ef100-s50      3360.45      1005.46      4387.96       0.9172     0.212242
+HNSW-M16-ef100-s100      3447.88      2595.75      6063.95       0.9610     0.089048
+HNSW-M16-ef200-s100      5417.60      2553.00      7990.68       0.9829     0.033547
+HNSW-M16-ef200-s200      5361.82      7728.92     13110.63       0.9952     0.009089
+HNSW-M32-ef200-s100     15842.33      3120.11     18982.22       0.9985     0.002481
+HNSW-M32-ef200-s200     15690.35      8830.62     24541.25       0.9998     0.000319
+NNDescent-i10-r0.5      3839.63         0.00      3861.47       0.7353     0.824006
+NNDescent-i25-r0.5      4901.87         0.00      4923.42       0.7536     0.743641
+NNDescent-i25-r1      5001.44         0.00      5022.89       0.7551     0.737854
+NNDescent-i50-r1      6850.52         0.00      6871.68       0.7574     0.728158
+FANNG-c100-s20      55213.18        97.61     55333.11       0.0836    17.789756
+FANNG-c200-s20      55087.03       205.13     55315.21       0.4968     5.433169
+FANNG-c500-s20      57164.34       386.95     57572.76       0.8209     0.636383
+FANNG-c1000-s20     58639.96       456.36     59118.27       0.8431     0.462000
+--------------------------------------------------------------------------------
+```
+
+### 500k samples, 20 distinct clusters, 16 dimensions
+
+This is a larger data set where exhaustive search clearly becomes prohibitively
+expensive and the approximate methods shine. For Annoy the search budget is set 
+to `n_tree * 5`! The number of random entry points in FANNG is set to `50`! The 
+number of max iterations for NNDescent was increased to `50`.
+
+```
+```
+
+### 500k samples, 20 distinct clusters, 32 dimensions
+
+This is a larger data set where exhaustive search clearly becomes prohibitively
+expensive and the approximate methods shine. For Annoy the search budget is set 
+to `n_tree * 5`! The number of random entry points in FANNG is set to `50`! The 
+number of max iterations for NNDescent was increased to `50`.
+
+```
+
+```
 
 ### Observations
 
-
+The main focus of this library is to support single cell analysis. `HNSW` shines
+here very clearly and has been established as the new default in
+[bixverse](https://github.com/GregorLueg/bixverse). An interesting special case
+is FANNG. The index generation is by far the longest; however, the query speed
+is absurdly high compared to the other methods (particularly with more samples
+and higher dimensionality). This indicates that this method could be particularly
+interesting in cases where an index is generated ONCE and then it is queried
+repeatedly.
 
 ## Licence
 
