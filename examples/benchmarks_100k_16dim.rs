@@ -71,7 +71,7 @@ fn main() {
             &annoy_idx,
             K,
             "euclidean",
-            Some(10000),
+            Some(K * n_trees * 10),
             true,
             false,
         );
@@ -95,95 +95,95 @@ fn main() {
         });
     }
 
-    println!("-----------------------------");
+    // println!("-----------------------------");
 
-    // HNSW
-    // HNSW with different parameter combinations
-    for (m, ef_construction, ef_search) in [
-        (16, 100, 50),
-        (16, 100, 100),
-        (16, 200, 100),
-        (16, 200, 200),
-        (32, 200, 100),
-        (32, 200, 200),
-    ] {
-        println!(
-            "Building HNSW index (M={}, ef_construction={})...",
-            m, ef_construction
-        );
-        let start_total = Instant::now();
-        let start = std::time::Instant::now();
-        let hnsw_idx = build_hnsw_index(
-            data.as_ref(),
-            m,
-            ef_construction,
-            "euclidean",
-            SEED as usize,
-            false,
-        );
-        let build_time = start.elapsed().as_secs_f64() * 1000.0;
+    // // HNSW
+    // // HNSW with different parameter combinations
+    // for (m, ef_construction, ef_search) in [
+    //     (16, 100, 50),
+    //     (16, 100, 100),
+    //     (16, 200, 100),
+    //     (16, 200, 200),
+    //     (32, 200, 100),
+    //     (32, 200, 200),
+    // ] {
+    //     println!(
+    //         "Building HNSW index (M={}, ef_construction={})...",
+    //         m, ef_construction
+    //     );
+    //     let start_total = Instant::now();
+    //     let start = std::time::Instant::now();
+    //     let hnsw_idx = build_hnsw_index(
+    //         data.as_ref(),
+    //         m,
+    //         ef_construction,
+    //         "euclidean",
+    //         SEED as usize,
+    //         false,
+    //     );
+    //     let build_time = start.elapsed().as_secs_f64() * 1000.0;
 
-        println!("Querying HNSW index (ef_search={})...", ef_search);
-        let start = std::time::Instant::now();
-        let (approx_neighbors, approx_distances) =
-            query_hnsw_index(query_data, &hnsw_idx, K, ef_search, true, false);
-        let query_time = start.elapsed().as_secs_f64() * 1000.0;
+    //     println!("Querying HNSW index (ef_search={})...", ef_search);
+    //     let start = std::time::Instant::now();
+    //     let (approx_neighbors, approx_distances) =
+    //         query_hnsw_index(query_data, &hnsw_idx, K, ef_search, true, false);
+    //     let query_time = start.elapsed().as_secs_f64() * 1000.0;
 
-        let recall = calculate_recall::<f32>(&true_neighbors, &approx_neighbors, K);
-        let dist_error = calculate_distance_error(
-            true_distances.as_ref().unwrap(),
-            approx_distances.as_ref().unwrap(),
-            K,
-        );
-        let end_total = start_total.elapsed().as_secs_f64() * 1000.0;
+    //     let recall = calculate_recall::<f32>(&true_neighbors, &approx_neighbors, K);
+    //     let dist_error = calculate_distance_error(
+    //         true_distances.as_ref().unwrap(),
+    //         approx_distances.as_ref().unwrap(),
+    //         K,
+    //     );
+    //     let end_total = start_total.elapsed().as_secs_f64() * 1000.0;
 
-        results.push(BenchmarkResult {
-            method: format!("HNSW-M{}-ef{}-s{}", m, ef_construction, ef_search),
-            build_time_ms: build_time,
-            query_time_ms: query_time,
-            total_time_ms: end_total,
-            recall_at_k: recall,
-            mean_distance_error: dist_error,
-        });
-    }
+    //     results.push(BenchmarkResult {
+    //         method: format!("HNSW-M{}-ef{}-s{}", m, ef_construction, ef_search),
+    //         build_time_ms: build_time,
+    //         query_time_ms: query_time,
+    //         total_time_ms: end_total,
+    //         recall_at_k: recall,
+    //         mean_distance_error: dist_error,
+    //     });
+    // }
 
-    println!("-----------------------------");
+    // println!("-----------------------------");
 
-    // NNDescent with different parameters
-    for (max_iter, rho) in [(10, 0.5), (25, 0.5), (25, 1.0)] {
-        println!("Running NNDescent (max_iter={}, rho={})...", max_iter, rho);
-        let start_total = Instant::now();
-        let start = std::time::Instant::now();
-        let (approx_neighbors, approx_distances) = generate_knn_nndescent_with_dist(
-            query_data,
-            "euclidean",
-            K,
-            max_iter,
-            0.001,
-            rho,
-            SEED as usize,
-            false,
-            true,
-        );
-        let total_time = start.elapsed().as_secs_f64() * 1000.0;
+    // // NNDescent with different parameters
+    // for (max_iter, rho) in [(10, 0.5), (10, 1.0), (25, 0.5), (25, 1.0)] {
+    //     println!("Running NNDescent (max_iter={}, rho={})...", max_iter, rho);
+    //     let start_total = Instant::now();
+    //     let start = std::time::Instant::now();
+    //     let (approx_neighbors, approx_distances) = generate_knn_nndescent_with_dist(
+    //         query_data,
+    //         "euclidean",
+    //         K,
+    //         max_iter,
+    //         0.001,
+    //         rho,
+    //         SEED as usize,
+    //         false,
+    //         true,
+    //     );
+    //     let total_time = start.elapsed().as_secs_f64() * 1000.0;
 
-        let recall = calculate_recall::<f32>(&true_neighbors, &approx_neighbors, K);
-        let dist_error = calculate_distance_error(
-            true_distances.as_ref().unwrap(),
-            approx_distances.as_ref().unwrap(),
-            K,
-        );
-        let end_total = start_total.elapsed().as_secs_f64() * 1000.0;
+    //     let recall = calculate_recall::<f32>(&true_neighbors, &approx_neighbors, K);
+    //     let dist_error = calculate_distance_error(
+    //         true_distances.as_ref().unwrap(),
+    //         approx_distances.as_ref().unwrap(),
+    //         K,
+    //     );
+    //     let end_total = start_total.elapsed().as_secs_f64() * 1000.0;
 
-        results.push(BenchmarkResult {
-            method: format!("NNDescent-i{}-r{}", max_iter, rho),
-            build_time_ms: total_time,
-            query_time_ms: 0.0,
-            total_time_ms: end_total,
-            recall_at_k: recall,
-            mean_distance_error: dist_error,
-        });
-    }
+    //     results.push(BenchmarkResult {
+    //         method: format!("NNDescent-i{}-r{}", max_iter, rho),
+    //         build_time_ms: total_time,
+    //         query_time_ms: 0.0,
+    //         total_time_ms: end_total,
+    //         recall_at_k: recall,
+    //         mean_distance_error: dist_error,
+    //     });
+    // }
 
     print_results(&format!("{}k cells, {}D", N_CELLS / 1000, DIM), &results);
 }

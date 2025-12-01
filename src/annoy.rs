@@ -146,31 +146,11 @@ impl VisitedSet {
     }
 }
 
-/// Calculate search budget for Annoy queries
-///
-/// Uses sub-linear scaling with n_trees to balance recall and speed.
-/// More trees = better space coverage, so don't need proportionally deeper
-/// search.
-///
-/// ### Params
-///
-/// * `k` - Number of neighbours requested
-/// * `n_trees` - Number of trees in index
-///
-/// ### Returns
-///
-/// Recommended search_k value
-pub fn calculate_search_budget(k: usize, n_trees: usize) -> usize {
-    match n_trees {
-        1..=5 => k * n_trees * 5,
-        6..=20 => k * (15 + n_trees),
-        _ => k * (25 + (n_trees as f64).sqrt() as usize),
-    }
-}
-
 ////////////////
 // Main index //
 ////////////////
+
+const MIN_MEMBERS: usize = 64;
 
 /// Annoy (Approximate Nearest Neighbours Oh Yeah) index for similarity search
 ///
@@ -188,12 +168,13 @@ pub fn calculate_search_budget(k: usize, n_trees: usize) -> usize {
 /// * `dim` - Embedding dimensions
 /// * `n_trees` - Number of trees in the forest
 pub struct AnnoyIndex<T> {
+    pub vectors_flat: Vec<T>,
+    pub dim: usize,
+    pub n: usize,
     nodes: Vec<FlatNode>,
     roots: Vec<u32>,
     split_data: Vec<T>,
     leaf_indices: Vec<usize>,
-    vectors_flat: Vec<T>,
-    pub dim: usize,
     pub n_trees: usize,
 }
 
@@ -295,6 +276,7 @@ where
             vectors_flat,
             dim,
             n_trees,
+            n: n_vectors,
         }
     }
 
@@ -322,9 +304,9 @@ where
         k: usize,
         search_k: Option<usize>,
     ) -> (Vec<usize>, Vec<T>) {
-        // Defaults: search_k is the limit on ITEMS inspected.
-        // Typically n_trees * k for a balanced trade-off.
-        let limit = search_k.unwrap_or(calculate_search_budget(k, self.n_trees));
+        // if no search budget is provided, it will default to quite a decent
+        // search budget
+        let limit = search_k.unwrap_or(k * self.n_trees * 20);
         let mut visited_count = 0;
 
         let n_vectors = self.vectors_flat.len() / self.dim;
@@ -333,7 +315,7 @@ where
         let mut candidates = Vec::with_capacity(limit);
         let mut pq = BinaryHeap::with_capacity(self.n_trees * 2);
 
-        // 1. Initialize PQ with all roots
+        // 1. Initialise PQ with all roots
         for &root in &self.roots {
             pq.push(BacktrackEntry {
                 margin: f64::MAX,
@@ -355,7 +337,6 @@ where
                     let start = node.child_a as usize;
                     let len = node.child_b as usize;
 
-                    // CRITICAL FIX: Count items towards the budget, not just the node visit
                     visited_count += len;
 
                     let leaf_items = unsafe { self.leaf_indices.get_unchecked(start..start + len) };
@@ -365,7 +346,8 @@ where
                             candidates.push(item);
                         }
                     }
-                    break; // Done with this path, go back to PQ
+                    // Done with this path, go back to PQ
+                    break;
                 } else {
                     // SPLIT NODE
                     let split_offset = node.split_idx as usize * (self.dim + 1);
@@ -384,19 +366,19 @@ where
                         (node.child_b, node.child_a)
                     };
 
-                    // Push the "bad" side to PQ for later
+                    // push the "far" side to PQ for later
                     pq.push(BacktrackEntry {
                         margin: -margin.abs(),
                         node_idx: farther,
                     });
 
-                    // Continue down the "good" side immediately (avoids heap overhead)
+                    // continue down the "close" side immediately
                     current_idx = closer;
                 }
             }
         }
 
-        // 3. Compute Distances & Sort
+        // 3. compute dist
         let mut scored: Vec<(usize, T)> = Vec::with_capacity(candidates.len());
 
         match dist_metric {
@@ -515,7 +497,6 @@ where
         nodes: &mut Vec<BuildNode<T>>,
         rng: &mut StdRng,
     ) -> usize {
-        const MIN_MEMBERS: usize = 64; // Re-declaring for self-contained snippet
         if items.len() <= MIN_MEMBERS {
             let node_idx = nodes.len();
             nodes.push(BuildNode::Leaf { items });
@@ -617,7 +598,6 @@ where
     /// Signed margin (distance to hyperplane along normal direction)
     #[inline(always)]
     fn get_margin(v1: &[T], v2: &[T], dim: usize) -> T {
-        // Explicit zip/map is friendlier to auto-vectorization than pointer offset arithmetic
         v1.iter()
             .zip(v2.iter())
             .map(|(&a, &b)| a * b)

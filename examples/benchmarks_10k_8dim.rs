@@ -18,13 +18,11 @@ fn main() {
     const SEED: u64 = 42;
 
     println!("-----------------------------");
-
     println!(
         "Generating synthetic data: {} cells, {} dimensions",
         N_CELLS.separate_with_underscores(),
         DIM
     );
-
     println!("-----------------------------");
 
     let data: Mat<f32> = generate_clustered_data(N_CELLS, DIM, N_CLUSTERS, 2.0, SEED);
@@ -145,7 +143,7 @@ fn main() {
     println!("-----------------------------");
 
     // NNDescent with different parameters
-    for (max_iter, rho) in [(10, 0.5), (25, 0.5), (25, 1.0)] {
+    for (max_iter, rho) in [(10, 0.5), (10, 1.0), (25, 0.5), (25, 1.0)] {
         println!("Running NNDescent (max_iter={}, rho={})...", max_iter, rho);
         let start_total = Instant::now();
         let start = std::time::Instant::now();

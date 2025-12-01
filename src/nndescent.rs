@@ -123,9 +123,9 @@ impl GraphSize {
     /// Get the maximum search budget
     fn max_candidates_factor(&self) -> usize {
         match self {
-            Self::Small => 4,
-            Self::Medium => 6,
-            Self::Large => 8,
+            Self::Small => 6,
+            Self::Medium => 8,
+            Self::Large => 10,
         }
     }
 
@@ -133,17 +133,17 @@ impl GraphSize {
     fn max_per_neighbour(&self, k: usize) -> usize {
         match self {
             Self::Small => k.min(10),
-            Self::Medium => k.min(15),
-            Self::Large => k.min(25),
+            Self::Medium => k.min(25),
+            Self::Large => k.min(35),
         }
     }
 
     /// Get the Rho decay for exploring old/new neighbours
     fn rho_decay(&self) -> f64 {
         match self {
-            Self::Small => 0.8,
-            Self::Medium => 0.85,
-            Self::Large => 0.9,
+            Self::Small => 0.85,
+            Self::Medium => 0.9,
+            Self::Large => 0.92,
         }
     }
 
@@ -199,9 +199,9 @@ thread_local! {
 /// 4. Mark updated neighbours as "new" to guide next iteration
 /// 5. Repeat until convergence
 pub struct NNDescent<T> {
-    vectors_flat: Vec<T>,
-    dim: usize,
-    n: usize,
+    pub vectors_flat: Vec<T>,
+    pub dim: usize,
+    pub n: usize,
     metric: Dist,
     norms: Vec<T>,
     graph_params: GraphSize,

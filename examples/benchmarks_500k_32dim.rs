@@ -56,7 +56,6 @@ fn main() {
     });
 
     // Annoy index
-
     for n_trees in [5, 10, 15, 25, 50, 100] {
         println!("Building Annoy index ({} trees)...", n_trees);
         let start_total = Instant::now();
@@ -71,7 +70,7 @@ fn main() {
             &annoy_idx,
             K,
             "euclidean",
-            Some(10000),
+            Some(25000),
             true,
             false,
         );
@@ -150,7 +149,7 @@ fn main() {
     println!("-----------------------------");
 
     // NNDescent with different parameters
-    for (max_iter, rho) in [(10, 0.5), (25, 0.5), (25, 1.0)] {
+    for (max_iter, rho) in [(10, 0.5), (10, 1.0), (25, 0.5), (25, 1.0)] {
         println!("Running NNDescent (max_iter={}, rho={})...", max_iter, rho);
         let start_total = Instant::now();
         let start = std::time::Instant::now();

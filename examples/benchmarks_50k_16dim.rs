@@ -15,7 +15,7 @@ fn main() {
     const DIM: usize = 16;
     const N_CLUSTERS: usize = 20;
     const K: usize = 15;
-    const SEED: u64 = 42;
+    const SEED: u64 = 123;
 
     println!("-----------------------------");
     println!(
@@ -66,15 +66,8 @@ fn main() {
 
         println!("Querying Annoy index ({} trees)...", n_trees,);
         let start = std::time::Instant::now();
-        let (approx_neighbors, approx_distances) = query_annoy_index(
-            query_data,
-            &annoy_idx,
-            K,
-            "euclidean",
-            Some(2500),
-            true,
-            false,
-        );
+        let (approx_neighbors, approx_distances) =
+            query_annoy_index(query_data, &annoy_idx, K, "euclidean", None, true, false);
         let query_time = start.elapsed().as_secs_f64() * 1000.0;
 
         let recall = calculate_recall::<f32>(&true_neighbors, &approx_neighbors, K);
@@ -150,7 +143,7 @@ fn main() {
     println!("-----------------------------");
 
     // NNDescent with different parameters
-    for (max_iter, rho) in [(10, 0.5), (25, 0.5), (25, 1.0)] {
+    for (max_iter, rho) in [(10, 0.5), (10, 1.0), (25, 0.5), (25, 1.0)] {
         println!("Running NNDescent (max_iter={}, rho={})...", max_iter, rho);
         let start_total = Instant::now();
         let start = std::time::Instant::now();

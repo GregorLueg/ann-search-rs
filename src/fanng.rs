@@ -149,12 +149,13 @@ where
 {
     pub vectors_flat: Vec<T>,
     pub dim: usize,
-    pub norms: Vec<T>,
-    pub dist: Dist,
-    pub graph: Vec<Vec<usize>>,
-    pub start_vertex: usize,
-    pub shortcut_pool: Vec<usize>,
-    pub max_degree: usize,
+    pub n: usize,
+    norms: Vec<T>,
+    dist: Dist,
+    graph: Vec<Vec<usize>>,
+    start_vertex: usize,
+    shortcut_pool: Vec<usize>,
+    max_degree: usize,
 }
 
 impl<T: Float> VectorDistance<T> for Fanng<T> {
@@ -267,6 +268,7 @@ where
         let mut fanng = Self {
             vectors_flat,
             dim,
+            n,
             norms,
             dist: metric,
             graph: vec![Vec::new(); n],

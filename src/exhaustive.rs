@@ -15,9 +15,10 @@ use crate::utils::*;
 /// * `dim` - Embedding dimensions
 /// * `dist` - The type of distance the index is designed for
 pub struct ExhaustiveIndex<T> {
-    vectors_flat: Vec<T>,
+    pub vectors_flat: Vec<T>,
+    pub dim: usize,
+    pub n: usize,
     norms: Vec<T>,
-    dim: usize,
     dist: Dist,
 }
 
@@ -63,6 +64,7 @@ where
             norms,
             dim,
             dist,
+            n: n_vectors,
         }
     }
 
