@@ -1081,58 +1081,8 @@ where
     #[inline(always)]
     fn compute_query_distance(&self, query: &[T], idx: usize, query_norm: T) -> T {
         match self.metric {
-            Dist::Euclidean => {
-                let ptr_idx = unsafe { self.vectors_flat.as_ptr().add(idx * self.dim) };
-                let ptr_query = query.as_ptr();
-
-                let mut sum = T::zero();
-                let mut k = 0;
-
-                unsafe {
-                    while k + 4 <= self.dim {
-                        let d0 = *ptr_idx.add(k) - *ptr_query.add(k);
-                        let d1 = *ptr_idx.add(k + 1) - *ptr_query.add(k + 1);
-                        let d2 = *ptr_idx.add(k + 2) - *ptr_query.add(k + 2);
-                        let d3 = *ptr_idx.add(k + 3) - *ptr_query.add(k + 3);
-
-                        sum = sum + d0 * d0 + d1 * d1 + d2 * d2 + d3 * d3;
-                        k += 4;
-                    }
-
-                    while k < self.dim {
-                        let diff = *ptr_idx.add(k) - *ptr_query.add(k);
-                        sum = sum + diff * diff;
-                        k += 1;
-                    }
-                }
-
-                sum
-            }
-            Dist::Cosine => {
-                let ptr_idx = unsafe { self.vectors_flat.as_ptr().add(idx * self.dim) };
-                let ptr_query = query.as_ptr();
-
-                let mut dot = T::zero();
-                let mut k = 0;
-
-                unsafe {
-                    while k + 4 <= self.dim {
-                        dot = dot
-                            + *ptr_idx.add(k) * *ptr_query.add(k)
-                            + *ptr_idx.add(k + 1) * *ptr_query.add(k + 1)
-                            + *ptr_idx.add(k + 2) * *ptr_query.add(k + 2)
-                            + *ptr_idx.add(k + 3) * *ptr_query.add(k + 3);
-                        k += 4;
-                    }
-
-                    while k < self.dim {
-                        dot = dot + *ptr_idx.add(k) * *ptr_query.add(k);
-                        k += 1;
-                    }
-
-                    T::one() - (dot / (query_norm * self.norms[idx]))
-                }
-            }
+            Dist::Euclidean => self.euclidean_distance_to_query(idx, query),
+            Dist::Cosine => self.cosine_distance_to_query(idx, query, query_norm),
         }
     }
 }
