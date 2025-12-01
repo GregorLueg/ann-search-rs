@@ -306,7 +306,7 @@ where
     pub vectors_flat: Vec<T>,
     pub dim: usize,
     pub n: usize,
-    norms: Vec<T>,
+    pub norms: Vec<T>,
     metric: Dist,
     layer_assignments: Vec<u8>,
     neighbours_flat: Vec<u32>,
@@ -636,24 +636,20 @@ where
             let neighbour_node_id = neighbour as usize;
 
             // compute distance from neighbour_id to this existing connection
-            let dist = unsafe {
-                OrderedFloat(match self.metric {
-                    Dist::Euclidean => self.euclidean_distance(neighbour_id, neighbour_node_id),
-                    Dist::Cosine => self.cosine_distance(neighbour_id, neighbour_node_id),
-                })
-            };
+            let dist = OrderedFloat(match self.metric {
+                Dist::Euclidean => self.euclidean_distance(neighbour_id, neighbour_node_id),
+                Dist::Cosine => self.cosine_distance(neighbour_id, neighbour_node_id),
+            });
 
             candidates.push((dist, neighbour_node_id));
         }
 
         // add the new node as a candidate (if it's not self-connection)
         if new_node != neighbour_id {
-            let dist = unsafe {
-                OrderedFloat(match self.metric {
-                    Dist::Euclidean => self.euclidean_distance(neighbour_id, new_node),
-                    Dist::Cosine => self.cosine_distance(neighbour_id, new_node),
-                })
-            };
+            let dist = OrderedFloat(match self.metric {
+                Dist::Euclidean => self.euclidean_distance(neighbour_id, new_node),
+                Dist::Cosine => self.cosine_distance(neighbour_id, new_node),
+            });
 
             candidates.push((dist, new_node));
         }
@@ -758,12 +754,10 @@ where
 
                 state.mark_visited(neighbour_id);
 
-                let dist = unsafe {
-                    OrderedFloat(match self.metric {
-                        Dist::Euclidean => self.euclidean_distance(query_node, neighbour_id),
-                        Dist::Cosine => self.cosine_distance(query_node, neighbour_id),
-                    })
-                };
+                let dist = OrderedFloat(match self.metric {
+                    Dist::Euclidean => self.euclidean_distance(query_node, neighbour_id),
+                    Dist::Cosine => self.cosine_distance(query_node, neighbour_id),
+                });
 
                 if dist < furthest_dist || state.working.len() < ef {
                     state.candidates.push(Reverse((dist, neighbour_id)));
@@ -859,12 +853,10 @@ where
 
                     state.mark_visited(neighbour_id);
 
-                    let dist = unsafe {
-                        OrderedFloat(match self.metric {
-                            Dist::Euclidean => self.euclidean_distance(node, neighbour_id),
-                            Dist::Cosine => self.cosine_distance(node, neighbour_id),
-                        })
-                    };
+                    let dist = OrderedFloat(match self.metric {
+                        Dist::Euclidean => self.euclidean_distance(node, neighbour_id),
+                        Dist::Cosine => self.cosine_distance(node, neighbour_id),
+                    });
 
                     state.scratch_working.push((dist, neighbour_id));
                 }
@@ -890,12 +882,10 @@ where
 
             let mut closer_to_query = true;
             for &(_, result_id) in &result {
-                let dist_to_result = unsafe {
-                    OrderedFloat(match self.metric {
-                        Dist::Euclidean => self.euclidean_distance(cand_id, result_id),
-                        Dist::Cosine => self.cosine_distance(cand_id, result_id),
-                    })
-                };
+                let dist_to_result = OrderedFloat(match self.metric {
+                    Dist::Euclidean => self.euclidean_distance(cand_id, result_id),
+                    Dist::Cosine => self.cosine_distance(cand_id, result_id),
+                });
 
                 if dist_to_result < cand_dist {
                     closer_to_query = false;

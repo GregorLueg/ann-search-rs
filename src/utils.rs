@@ -70,11 +70,11 @@ impl<T: Float> Ord for OrderedFloat<T> {
 // Validation //
 ////////////////
 
-trait KnnValidation<T: Float> {
-    fn vectors_flat(&self) -> &[T];
-    fn dim(&self) -> usize;
-    fn n(&self) -> usize;
-}
+// trait KnnValidation<T: Float> {
+//     fn vectors_flat(&self) -> &[T];
+//     fn dim(&self) -> usize;
+//     fn n(&self) -> usize;
+// }
 
 ///////////
 // Tests //

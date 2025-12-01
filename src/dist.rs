@@ -6,14 +6,13 @@ pub trait VectorDistance<T: Float> {
     fn dim(&self) -> usize;
     fn norms(&self) -> &[T];
 
-    /// Fast distance calculation with unsafe pointer arithmetic (Euclidean)
+    /// Euclidean distance between two internal vectors (squared)
     ///
     /// ### Implementation note
     ///
-    /// Manual loop unrolling (processing 4 elements at a time) helps the
-    /// compiler generate better SIMD instructions. Modern CPUs can compute
-    /// 4 float operations in parallel, so this can be ~4x faster than a
-    /// naive loop.
+    /// Uses iterator-based approach which allows LLVM to auto-vectorise
+    /// optimally for the target CPU. Returns squared distance to avoid
+    /// expensive sqrt - sufficient for comparison purposes.
     ///
     /// ### Params
     ///
@@ -22,41 +21,49 @@ pub trait VectorDistance<T: Float> {
     ///
     /// ### Returns
     ///
-    /// The Euclidean distance between the two samples
-    ///
-    /// ### Safety
-    ///
-    /// This function will assume that you laid out the vectors correctly. It
-    /// uses an unsafe implementation to reduce bound checks and encourage
-    /// SIMD instructions.
+    /// The squared Euclidean distance between the two samples
     #[inline(always)]
-    unsafe fn euclidean_distance(&self, i: usize, j: usize) -> T {
-        let ptr_i = unsafe { self.vectors_flat().as_ptr().add(i * self.dim()) };
-        let ptr_j = unsafe { self.vectors_flat().as_ptr().add(j * self.dim()) };
+    fn euclidean_distance(&self, i: usize, j: usize) -> T {
+        let start_i = i * self.dim();
+        let start_j = j * self.dim();
+        let vec_i = &self.vectors_flat()[start_i..start_i + self.dim()];
+        let vec_j = &self.vectors_flat()[start_j..start_j + self.dim()];
 
-        let mut sum = T::zero();
-        let mut k = 0;
-
-        while k + 4 <= self.dim() {
-            let d0 = unsafe { *ptr_i.add(k) - *ptr_j.add(k) };
-            let d1 = unsafe { *ptr_i.add(k + 1) - *ptr_j.add(k + 1) };
-            let d2 = unsafe { *ptr_i.add(k + 2) - *ptr_j.add(k + 2) };
-            let d3 = unsafe { *ptr_i.add(k + 3) - *ptr_j.add(k + 3) };
-
-            sum = sum + d0 * d0 + d1 * d1 + d2 * d2 + d3 * d3;
-            k += 4;
-        }
-
-        while k < self.dim() {
-            let diff = unsafe { *ptr_i.add(k) - *ptr_j.add(k) };
-            sum = sum + diff * diff;
-            k += 1;
-        }
-
-        sum
+        vec_i
+            .iter()
+            .zip(vec_j.iter())
+            .map(|(&a, &b)| {
+                let diff = a - b;
+                diff * diff
+            })
+            .fold(T::zero(), |acc, x| acc + x)
     }
 
-    /// Fast distance calculation with unsafe pointer arithmetic (Cosine)
+    /// Euclidean distance between query vector and internal vector (squared)
+    ///
+    /// ### Params
+    ///
+    /// * `internal_idx` - Index of internal vector
+    /// * `query` - Query vector slice
+    ///
+    /// ### Returns
+    ///
+    /// The squared Euclidean distance
+    #[inline(always)]
+    fn euclidean_distance_to_query(&self, internal_idx: usize, query: &[T]) -> T {
+        let start = internal_idx * self.dim();
+        let vec = &self.vectors_flat()[start..start + self.dim()];
+
+        vec.iter()
+            .zip(query.iter())
+            .map(|(&a, &b)| {
+                let diff = a - b;
+                diff * diff
+            })
+            .fold(T::zero(), |acc, x| acc + x)
+    }
+
+    /// Cosine distance between two internal vectors
     ///
     /// ### Cosine Distance
     ///
@@ -71,38 +78,45 @@ pub trait VectorDistance<T: Float> {
     /// ### Returns
     ///
     /// The Cosine distance between the two samples
-    ///
-    /// ### Safety
-    ///
-    /// This function will assume that you laid out the vectors correctly. It
-    /// uses an unsafe implementation to reduce bound checks and encourage
-    /// SIMD instructions.
     #[inline(always)]
-    unsafe fn cosine_distance(&self, i: usize, j: usize) -> T {
-        let ptr_i = unsafe { self.vectors_flat().as_ptr().add(i * self.dim()) };
-        let ptr_j = unsafe { self.vectors_flat().as_ptr().add(j * self.dim()) };
+    fn cosine_distance(&self, i: usize, j: usize) -> T {
+        let start_i = i * self.dim();
+        let start_j = j * self.dim();
+        let vec_i = &self.vectors_flat()[start_i..start_i + self.dim()];
+        let vec_j = &self.vectors_flat()[start_j..start_j + self.dim()];
 
-        let mut dot = T::zero();
-        let mut k = 0;
+        let dot = vec_i
+            .iter()
+            .zip(vec_j.iter())
+            .map(|(&a, &b)| a * b)
+            .fold(T::zero(), |acc, x| acc + x);
 
-        while k + 4 <= self.dim() {
-            dot = dot
-                + unsafe { *ptr_i.add(k) * *ptr_j.add(k) }
-                + unsafe { *ptr_i.add(k + 1) * *ptr_j.add(k + 1) }
-                + unsafe { *ptr_i.add(k + 2) * *ptr_j.add(k + 2) }
-                + unsafe { *ptr_i.add(k + 3) * *ptr_j.add(k + 3) };
-            k += 4;
-        }
+        T::one() - (dot / (self.norms()[i] * self.norms()[j]))
+    }
 
-        while k < self.dim() {
-            dot = dot + unsafe { *ptr_i.add(k) * *ptr_j.add(k) };
-            k += 1;
-        }
+    /// Cosine distance between query vector and internal vector
+    ///
+    /// ### Params
+    ///
+    /// * `internal_idx` - Index of internal vector
+    /// * `query` - Query vector slice
+    /// * `query_norm` - Pre-computed norm of query vector
+    ///
+    /// ### Returns
+    ///
+    /// The Cosine distance
+    #[inline(always)]
+    fn cosine_distance_to_query(&self, internal_idx: usize, query: &[T], query_norm: T) -> T {
+        let start = internal_idx * self.dim();
+        let vec = &self.vectors_flat()[start..start + self.dim()];
 
-        T::one()
-            - (dot
-                / (unsafe { *self.norms().get_unchecked(i) }
-                    * unsafe { *self.norms().get_unchecked(j) }))
+        let dot = vec
+            .iter()
+            .zip(query.iter())
+            .map(|(&a, &b)| a * b)
+            .fold(T::zero(), |acc, x| acc + x);
+
+        T::one() - (dot / (query_norm * self.norms()[internal_idx]))
     }
 }
 
@@ -150,15 +164,15 @@ mod tests {
         };
 
         // Distance between [1,0,0] and [0,1,0] should be sqrt(2) squared = 2
-        let dist_01 = unsafe { vecs.euclidean_distance(0, 1) };
+        let dist_01 = vecs.euclidean_distance(0, 1);
         assert_relative_eq!(dist_01, 2.0, epsilon = 1e-6);
 
         // Distance between [1,0,0] and [1,1,0] should be 1
-        let dist_02 = unsafe { vecs.euclidean_distance(0, 2) };
+        let dist_02 = vecs.euclidean_distance(0, 2);
         assert_relative_eq!(dist_02, 1.0, epsilon = 1e-6);
 
         // Distance to itself should be 0
-        let dist_00 = unsafe { vecs.euclidean_distance(0, 0) };
+        let dist_00 = vecs.euclidean_distance(0, 0);
         assert_relative_eq!(dist_00, 0.0, epsilon = 1e-6);
     }
 
@@ -172,8 +186,8 @@ mod tests {
             norms: vec![],
         };
 
-        let dist_01 = unsafe { vecs.euclidean_distance(0, 1) };
-        let dist_10 = unsafe { vecs.euclidean_distance(1, 0) };
+        let dist_01 = vecs.euclidean_distance(0, 1);
+        let dist_10 = vecs.euclidean_distance(1, 0);
 
         assert_relative_eq!(dist_01, dist_10, epsilon = 1e-6);
     }
@@ -192,7 +206,7 @@ mod tests {
             norms: vec![],
         };
 
-        let dist = unsafe { vecs.euclidean_distance(0, 1) };
+        let dist = vecs.euclidean_distance(0, 1);
         // Expected: (1-5)^2 + (2-4)^2 + (3-3)^2 + (4-2)^2 + (5-1)^2 = 16 + 4 + 0 + 4 + 16 = 40
         assert_relative_eq!(dist, 40.0, epsilon = 1e-6);
     }
@@ -217,15 +231,15 @@ mod tests {
         };
 
         // Orthogonal vectors: cosine similarity = 0, distance = 1
-        let dist_01 = unsafe { vecs.cosine_distance(0, 1) };
+        let dist_01 = vecs.cosine_distance(0, 1);
         assert_relative_eq!(dist_01, 1.0, epsilon = 1e-6);
 
         // 45 degree angle: cosine similarity = 1/sqrt(2), distance = 1 - 1/sqrt(2)
-        let dist_02 = unsafe { vecs.cosine_distance(0, 2) };
+        let dist_02 = vecs.cosine_distance(0, 2);
         assert_relative_eq!(dist_02, 1.0 - 1.0 / 2.0_f32.sqrt(), epsilon = 1e-5);
 
         // Same vector: cosine similarity = 1, distance = 0
-        let dist_00 = unsafe { vecs.cosine_distance(0, 0) };
+        let dist_00 = vecs.cosine_distance(0, 0);
         assert_relative_eq!(dist_00, 0.0, epsilon = 1e-6);
     }
 
@@ -242,8 +256,8 @@ mod tests {
             norms: vec![norm0, norm1],
         };
 
-        let dist_01 = unsafe { vecs.cosine_distance(0, 1) };
-        let dist_10 = unsafe { vecs.cosine_distance(1, 0) };
+        let dist_01 = vecs.cosine_distance(0, 1);
+        let dist_10 = vecs.cosine_distance(1, 0);
 
         assert_relative_eq!(dist_01, dist_10, epsilon = 1e-6);
     }
@@ -264,7 +278,7 @@ mod tests {
 
         // Dot product: 1*5 + 2*4 + 3*3 + 4*2 + 5*1 = 5 + 8 + 9 + 8 + 5 = 35
         // Cosine similarity: 35 / (norm0 * norm1)
-        let dist = unsafe { vecs.cosine_distance(0, 1) };
+        let dist = vecs.cosine_distance(0, 1);
         let expected = 1.0 - (35.0 / (norm0 * norm1));
         assert_relative_eq!(dist, expected, epsilon = 1e-5);
     }
@@ -285,7 +299,7 @@ mod tests {
         };
 
         // Parallel vectors should have cosine distance ≈ 0
-        let dist = unsafe { vecs.cosine_distance(0, 1) };
+        let dist = vecs.cosine_distance(0, 1);
         assert_relative_eq!(dist, 0.0, epsilon = 1e-5);
     }
 
@@ -305,7 +319,7 @@ mod tests {
         };
 
         // Opposite vectors should have cosine distance ≈ 2
-        let dist = unsafe { vecs.cosine_distance(0, 1) };
+        let dist = vecs.cosine_distance(0, 1);
         assert_relative_eq!(dist, 2.0, epsilon = 1e-5);
     }
 
@@ -332,12 +346,12 @@ mod tests {
         };
 
         // Just verify it computes without crashing and is symmetric
-        let dist_01 = unsafe { vecs.euclidean_distance(0, 1) };
-        let dist_10 = unsafe { vecs.euclidean_distance(1, 0) };
+        let dist_01 = vecs.euclidean_distance(0, 1);
+        let dist_10 = vecs.euclidean_distance(1, 0);
         assert_relative_eq!(dist_01, dist_10, epsilon = 1e-3);
 
-        let cos_01 = unsafe { vecs.cosine_distance(0, 1) };
-        let cos_10 = unsafe { vecs.cosine_distance(1, 0) };
+        let cos_01 = vecs.cosine_distance(0, 1);
+        let cos_10 = vecs.cosine_distance(1, 0);
         assert_relative_eq!(cos_01, cos_10, epsilon = 1e-5);
     }
 }

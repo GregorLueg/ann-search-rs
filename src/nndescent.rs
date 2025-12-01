@@ -631,7 +631,7 @@ where
                     Dist::Euclidean => candidate_ids
                         .iter()
                         .filter_map(|&c| {
-                            let dist = unsafe { self.euclidean_distance(node, c) };
+                            let dist = self.euclidean_distance(node, c);
                             if dist < worst_current_dist {
                                 Some((c, dist))
                             } else {
@@ -642,7 +642,7 @@ where
                     Dist::Cosine => candidate_ids
                         .iter()
                         .filter_map(|&c| {
-                            let dist = unsafe { self.cosine_distance(node, c) };
+                            let dist = self.cosine_distance(node, c);
                             if dist < worst_current_dist {
                                 Some((c, dist))
                             } else {
