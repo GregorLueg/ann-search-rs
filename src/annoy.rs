@@ -7,6 +7,7 @@ use std::cmp::Ordering;
 use std::collections::BinaryHeap;
 use std::iter::Sum;
 
+use crate::dist::VectorDistance;
 use crate::utils::Dist;
 
 /////////////
@@ -166,16 +167,38 @@ const MIN_MEMBERS: usize = 64;
 /// * `leaf_indices` - Actual data indices stored in leaf nodes
 /// * `vectors_flat` - Original vector data, flattened for cache locality
 /// * `dim` - Embedding dimensions
+/// * `n` - Number of vectors
+/// * `norms` - Pre-computed norms for Cosine distance (empty for Euclidean)
+/// * `metric` - Distance metric (Euclidean or Cosine)
 /// * `n_trees` - Number of trees in the forest
 pub struct AnnoyIndex<T> {
     pub vectors_flat: Vec<T>,
     pub dim: usize,
     pub n: usize,
+    norms: Vec<T>,
+    metric: Dist,
     nodes: Vec<FlatNode>,
     roots: Vec<u32>,
     split_data: Vec<T>,
     leaf_indices: Vec<usize>,
     pub n_trees: usize,
+}
+
+impl<T> VectorDistance<T> for AnnoyIndex<T>
+where
+    T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum,
+{
+    fn vectors_flat(&self) -> &[T] {
+        &self.vectors_flat
+    }
+
+    fn dim(&self) -> usize {
+        self.dim
+    }
+
+    fn norms(&self) -> &[T] {
+        &self.norms
+    }
 }
 
 impl<T> AnnoyIndex<T>
@@ -193,12 +216,13 @@ where
     /// * `mat` - Data matrix (rows = samples, columns = dimensions)
     /// * `n_trees` - Number of trees to build (more trees = better recall,
     ///   slower build)
+    /// * `metric` - Distance metric (Euclidean or Cosine)
     /// * `seed` - Random seed for reproducibility
     ///
     /// ### Returns
     ///
     /// Constructed index ready for querying
-    pub fn new(mat: MatRef<T>, n_trees: usize, seed: usize) -> Self {
+    pub fn new(mat: MatRef<T>, n_trees: usize, metric: Dist, seed: usize) -> Self {
         let mut rng = StdRng::seed_from_u64(seed as u64);
         let n_vectors = mat.nrows();
         let dim = mat.ncols();
@@ -207,6 +231,23 @@ where
         for i in 0..n_vectors {
             vectors_flat.extend(mat.row(i).iter().cloned());
         }
+
+        // Compute norms for Cosine distance
+        let norms = if metric == Dist::Cosine {
+            (0..n_vectors)
+                .map(|i| {
+                    let start = i * dim;
+                    let end = start + dim;
+                    vectors_flat[start..end]
+                        .iter()
+                        .map(|x| *x * *x)
+                        .fold(T::zero(), |a, b| a + b)
+                        .sqrt()
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
 
         let seeds: Vec<u64> = (0..n_trees).map(|_| rng.random()).collect();
 
@@ -277,6 +318,8 @@ where
             dim,
             n_trees,
             n: n_vectors,
+            norms,
+            metric,
         }
     }
 
@@ -289,7 +332,6 @@ where
     /// ### Params
     ///
     /// * `query_vec` - Query vector (must match index dimensionality)
-    /// * `dist_metric` - Distance metric (Euclidean or Cosine)
     /// * `k` - Number of neighbours to return
     /// * `search_k` - Budget of items to examine (higher = better recall, slower)
     ///   Defaults to `k * n_trees` if None
@@ -300,7 +342,6 @@ where
     pub fn query(
         &self,
         query_vec: &[T],
-        dist_metric: &Dist,
         k: usize,
         search_k: Option<usize>,
     ) -> (Vec<usize>, Vec<T>) {
@@ -378,18 +419,13 @@ where
             }
         }
 
-        // 3. compute dist
+        // 3. compute dist using VectorDistance trait
         let mut scored: Vec<(usize, T)> = Vec::with_capacity(candidates.len());
 
-        match dist_metric {
+        match self.metric {
             Dist::Euclidean => {
                 for &idx in &candidates {
-                    let vec_start = idx * self.dim;
-                    let vec = unsafe {
-                        self.vectors_flat
-                            .get_unchecked(vec_start..vec_start + self.dim)
-                    };
-                    let dist = Self::euclidean_dist_sq(query_vec, vec);
+                    let dist = self.euclidean_distance_to_query(idx, query_vec);
                     scored.push((idx, dist));
                 }
             }
@@ -401,12 +437,7 @@ where
                     .sqrt();
 
                 for &idx in &candidates {
-                    let vec_start = idx * self.dim;
-                    let vec = unsafe {
-                        self.vectors_flat
-                            .get_unchecked(vec_start..vec_start + self.dim)
-                    };
-                    let dist = Self::cosine_dist(query_vec, vec, query_norm);
+                    let dist = self.cosine_distance_to_query(idx, query_vec, query_norm);
                     scored.push((idx, dist));
                 }
             }
@@ -432,18 +463,17 @@ where
     pub fn query_row(
         &self,
         query_row: RowRef<T>,
-        dist_metric: &Dist,
         k: usize,
         search_k: Option<usize>,
     ) -> (Vec<usize>, Vec<T>) {
         if query_row.col_stride() == 1 {
             let slice =
                 unsafe { std::slice::from_raw_parts(query_row.as_ptr(), query_row.ncols()) };
-            return self.query(slice, dist_metric, k, search_k);
+            return self.query(slice, k, search_k);
         }
 
         let query_vec: Vec<T> = query_row.iter().cloned().collect();
-        self.query(&query_vec, dist_metric, k, search_k)
+        self.query(&query_vec, k, search_k)
     }
 
     /// Build a single tree recursively
@@ -604,64 +634,6 @@ where
             .fold(T::zero(), |acc, x| acc + x)
             - v2[dim]
     }
-
-    /// Calculate squared Euclidean distance between vectors
-    ///
-    /// Computes sum((v1[i] - v2[i])^2). Returns squared distance to avoid
-    /// expensive sqrt - sufficient for comparison purposes.
-    ///
-    /// ### Params
-    ///
-    /// * `v1` - First vector
-    /// * `v2` - Second vector
-    ///
-    /// ### Returns
-    ///
-    /// Squared Euclidean distance
-    #[inline(always)]
-    fn euclidean_dist_sq(v1: &[T], v2: &[T]) -> T {
-        v1.iter()
-            .zip(v2.iter())
-            .map(|(&a, &b)| (a - b) * (a - b))
-            .fold(T::zero(), |acc, x| acc + x)
-    }
-
-    /// Calculate cosine distance between vectors
-    ///
-    /// Computes 1 - cos(θ) where θ is the angle between vectors.
-    /// Handles zero-norm vectors by returning 1.0 (maximum distance).
-    /// Clamps similarity to [0, 1] to prevent NaN from floating-point errors.
-    ///
-    /// ### Params
-    ///
-    /// * `v1` - First vector
-    /// * `v2` - Second vector
-    /// * `v1_norm` - Pre-computed L2 norm of v1 (for efficiency)
-    ///
-    /// ### Returns
-    ///
-    /// Cosine distance in range [0, 1]
-    #[inline(always)]
-    fn cosine_dist(v1: &[T], v2: &[T], v1_norm: T) -> T {
-        let (dot, v2_norm_sq) = v1
-            .iter()
-            .zip(v2.iter())
-            .fold((T::zero(), T::zero()), |(d, n), (&a, &b)| {
-                (d + a * b, n + b * b)
-            });
-
-        let v2_norm = v2_norm_sq.sqrt();
-        if v1_norm.is_zero() || v2_norm.is_zero() {
-            return T::one();
-        }
-        // Clamp to prevent NaN due to precision errors
-        let sim = dot / (v1_norm * v2_norm);
-        if sim > T::one() {
-            T::zero()
-        } else {
-            T::one() - sim
-        }
-    }
 }
 
 ///////////
@@ -690,7 +662,7 @@ mod tests {
     #[test]
     fn test_annoy_index_creation() {
         let mat = create_simple_matrix();
-        let _ = AnnoyIndex::new(mat.as_ref(), 4, 42);
+        let _ = AnnoyIndex::new(mat.as_ref(), 4, Dist::Euclidean, 42);
 
         // just verify it doesn't panic
     }
@@ -698,11 +670,11 @@ mod tests {
     #[test]
     fn test_annoy_query_finds_self() {
         let mat = create_simple_matrix();
-        let index = AnnoyIndex::new(mat.as_ref(), 4, 42);
+        let index = AnnoyIndex::new(mat.as_ref(), 4, Dist::Euclidean, 42);
 
         // Query with point 0, should find itself first
         let query = vec![1.0, 0.0, 0.0];
-        let (indices, distances) = index.query(&query, &Dist::Euclidean, 1, None);
+        let (indices, distances) = index.query(&query, 1, None);
 
         assert_eq!(indices.len(), 1);
         assert_eq!(indices[0], 0);
@@ -712,10 +684,10 @@ mod tests {
     #[test]
     fn test_annoy_query_euclidean() {
         let mat = create_simple_matrix();
-        let index = AnnoyIndex::new(mat.as_ref(), 8, 42);
+        let index = AnnoyIndex::new(mat.as_ref(), 8, Dist::Euclidean, 42);
 
         let query = vec![1.0, 0.0, 0.0];
-        let (indices, distances) = index.query(&query, &Dist::Euclidean, 3, None);
+        let (indices, distances) = index.query(&query, 3, None);
 
         // Should find point 0 first (exact match)
         assert_eq!(indices[0], 0);
@@ -732,10 +704,10 @@ mod tests {
         use crate::utils::Dist;
 
         let mat = create_simple_matrix();
-        let index = AnnoyIndex::new(mat.as_ref(), 8, 42);
+        let index = AnnoyIndex::new(mat.as_ref(), 8, Dist::Cosine, 42);
 
         let query = vec![1.0, 0.0, 0.0];
-        let (indices, distances) = index.query(&query, &Dist::Cosine, 3, None);
+        let (indices, distances) = index.query(&query, 3, None);
 
         // Should find point 0 first (identical direction)
         assert_eq!(indices[0], 0);
@@ -747,11 +719,11 @@ mod tests {
         use crate::utils::Dist;
 
         let mat = create_simple_matrix();
-        let index = AnnoyIndex::new(mat.as_ref(), 4, 42);
+        let index = AnnoyIndex::new(mat.as_ref(), 4, Dist::Euclidean, 42);
 
         let query = vec![1.0, 0.0, 0.0];
         // ask for 10 neighbours but only 5 points exist
-        let (indices, _) = index.query(&query, &Dist::Euclidean, 10, None);
+        let (indices, _) = index.query(&query, 10, None);
 
         // Should return at most 5 results
         assert!(indices.len() <= 5);
@@ -762,13 +734,13 @@ mod tests {
         use crate::utils::Dist;
 
         let mat = create_simple_matrix();
-        let index = AnnoyIndex::new(mat.as_ref(), 4, 42);
+        let index = AnnoyIndex::new(mat.as_ref(), 4, Dist::Euclidean, 42);
 
         let query = vec![1.0, 0.0, 0.0];
 
         // With higher search_k, should get same or better results
-        let (indices1, _) = index.query(&query, &Dist::Euclidean, 3, Some(10));
-        let (indices2, _) = index.query(&query, &Dist::Euclidean, 3, Some(50));
+        let (indices1, _) = index.query(&query, 3, Some(10));
+        let (indices2, _) = index.query(&query, 3, Some(50));
 
         assert_eq!(indices1.len(), 3);
         assert_eq!(indices2.len(), 3);
@@ -779,12 +751,12 @@ mod tests {
         let mat = create_simple_matrix();
 
         // More trees should give better recall
-        let index_few = AnnoyIndex::new(mat.as_ref(), 2, 42);
-        let index_many = AnnoyIndex::new(mat.as_ref(), 16, 42);
+        let index_few = AnnoyIndex::new(mat.as_ref(), 2, Dist::Euclidean, 42);
+        let index_many = AnnoyIndex::new(mat.as_ref(), 16, Dist::Euclidean, 42);
 
         let query = vec![0.9, 0.1, 0.0];
-        let (indices1, _) = index_few.query(&query, &Dist::Euclidean, 3, None);
-        let (indices2, _) = index_many.query(&query, &Dist::Euclidean, 3, None);
+        let (indices1, _) = index_few.query(&query, 3, None);
+        let (indices2, _) = index_many.query(&query, 3, None);
 
         assert_eq!(indices1.len(), 3);
         assert_eq!(indices2.len(), 3);
@@ -793,10 +765,10 @@ mod tests {
     #[test]
     fn test_annoy_query_row() {
         let mat = create_simple_matrix();
-        let index = AnnoyIndex::new(mat.as_ref(), 8, 42);
+        let index = AnnoyIndex::new(mat.as_ref(), 8, Dist::Euclidean, 42);
 
         // Query using a row from the matrix
-        let (indices, distances) = index.query_row(mat.row(0), &Dist::Euclidean, 1, None);
+        let (indices, distances) = index.query_row(mat.row(0), 1, None);
 
         assert_eq!(indices[0], 0);
         assert_relative_eq!(distances[0], 0.0, epsilon = 1e-5);
@@ -807,12 +779,12 @@ mod tests {
         let mat = create_simple_matrix();
 
         // Same seed should give same results
-        let index1 = AnnoyIndex::new(mat.as_ref(), 8, 42);
-        let index2 = AnnoyIndex::new(mat.as_ref(), 8, 42);
+        let index1 = AnnoyIndex::new(mat.as_ref(), 8, Dist::Euclidean, 42);
+        let index2 = AnnoyIndex::new(mat.as_ref(), 8, Dist::Euclidean, 42);
 
         let query = vec![0.5, 0.5, 0.0];
-        let (indices1, _) = index1.query(&query, &Dist::Euclidean, 3, None);
-        let (indices2, _) = index2.query(&query, &Dist::Euclidean, 3, None);
+        let (indices1, _) = index1.query(&query, 3, None);
+        let (indices2, _) = index2.query(&query, 3, None);
 
         assert_eq!(indices1, indices2);
     }
@@ -822,14 +794,14 @@ mod tests {
         let mat = create_simple_matrix();
 
         // Different seeds might give different tree structures
-        let index1 = AnnoyIndex::new(mat.as_ref(), 8, 42);
-        let index2 = AnnoyIndex::new(mat.as_ref(), 8, 123);
+        let index1 = AnnoyIndex::new(mat.as_ref(), 8, Dist::Euclidean, 42);
+        let index2 = AnnoyIndex::new(mat.as_ref(), 8, Dist::Euclidean, 123);
 
         let query = vec![0.5, 0.5, 0.0];
 
         // Both should still find reasonable neighbours (though order might differ)
-        let (indices1, _) = index1.query(&query, &Dist::Euclidean, 3, None);
-        let (indices2, _) = index2.query(&query, &Dist::Euclidean, 3, None);
+        let (indices1, _) = index1.query(&query, 3, None);
+        let (indices2, _) = index2.query(&query, 3, None);
 
         assert_eq!(indices1.len(), 3);
         assert_eq!(indices2.len(), 3);
@@ -849,11 +821,11 @@ mod tests {
         }
 
         let mat = Mat::from_fn(n, dim, |i, j| data[i * dim + j]);
-        let index = AnnoyIndex::new(mat.as_ref(), 16, 42);
+        let index = AnnoyIndex::new(mat.as_ref(), 16, Dist::Euclidean, 42);
 
         // Query for point 0
         let query: Vec<f32> = (0..dim).map(|_| 0.0).collect();
-        let (indices, _) = index.query(&query, &Dist::Euclidean, 5, None);
+        let (indices, _) = index.query(&query, 5, None);
 
         assert_eq!(indices.len(), 5);
         assert_eq!(indices[0], 0); // Should find exact match
@@ -864,10 +836,10 @@ mod tests {
         use crate::utils::Dist;
         let data = [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0];
         let mat = Mat::from_fn(3, 3, |i, j| data[i * 3 + j]);
-        let index = AnnoyIndex::new(mat.as_ref(), 4, 42);
+        let index = AnnoyIndex::new(mat.as_ref(), 4, Dist::Cosine, 42);
 
         let query = vec![1.0, 0.0, 0.0];
-        let (indices, distances) = index.query(&query, &Dist::Cosine, 3, None);
+        let (indices, distances) = index.query(&query, 3, None);
 
         // First result should be the parallel vector
         assert_eq!(indices[0], 0);
@@ -885,10 +857,10 @@ mod tests {
         let data: Vec<f32> = (0..n * dim).map(|i| i as f32).collect();
         let mat = Mat::from_fn(n, dim, |i, j| data[i * dim + j]);
 
-        let index = AnnoyIndex::new(mat.as_ref(), 32, 42);
+        let index = AnnoyIndex::new(mat.as_ref(), 32, Dist::Euclidean, 42);
 
         let query: Vec<f32> = (0..dim).map(|_| 0.0).collect();
-        let (indices, _) = index.query(&query, &Dist::Euclidean, 3, None);
+        let (indices, _) = index.query(&query, 3, None);
 
         assert_eq!(indices.len(), 3);
     }

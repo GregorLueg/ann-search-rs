@@ -61,13 +61,14 @@ fn main() {
         println!("Building Annoy index ({} trees)...", n_trees);
         let start_total = Instant::now();
         let start = std::time::Instant::now();
-        let annoy_idx = build_annoy_index(data.as_ref(), n_trees, SEED as usize);
+        let annoy_idx =
+            build_annoy_index(data.as_ref(), "euclidean".into(), n_trees, SEED as usize);
         let build_time = start.elapsed().as_secs_f64() * 1000.0;
 
         println!("Querying Annoy index ({} trees)...", n_trees,);
         let start = std::time::Instant::now();
         let (approx_neighbors, approx_distances) =
-            query_annoy_index(query_data, &annoy_idx, K, "euclidean", None, true, false);
+            query_annoy_index(query_data, &annoy_idx, K, None, true, false);
         let query_time = start.elapsed().as_secs_f64() * 1000.0;
 
         let recall = calculate_recall::<f32>(&true_neighbors, &approx_neighbors, K);

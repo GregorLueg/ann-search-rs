@@ -240,7 +240,7 @@ where
         seed: usize,
         verbose: bool,
     ) -> Vec<Vec<(usize, T)>> {
-        let metric = parse_ann_dist(dist_metric).unwrap_or(Dist::Cosine);
+        let metric = parse_ann_dist(dist_metric).unwrap_or_default();
         let n = mat.nrows();
         let n_features = mat.ncols();
 
@@ -277,7 +277,7 @@ where
         };
 
         let start_initial_index = Instant::now();
-        let annoy_index = AnnoyIndex::new(mat, graph_params.annoy_trees(), seed);
+        let annoy_index = AnnoyIndex::new(mat, graph_params.annoy_trees(), metric, seed);
         let end_initial_index = start_initial_index.elapsed();
 
         if verbose {
@@ -463,8 +463,7 @@ where
                 let query_vec = &self.vectors_flat[i * self.dim..(i + 1) * self.dim];
                 // search budget for Annoy -> 5% of all data points
                 let search_k = self.n / 20;
-                let (indices, distances) =
-                    annoy_index.query(query_vec, &self.metric, k + 1, Some(search_k));
+                let (indices, distances) = annoy_index.query(query_vec, k + 1, Some(search_k));
 
                 indices
                     .into_iter()

@@ -5,9 +5,10 @@ use num_traits::Float;
 ///////////////
 
 /// Enum for the approximate nearest neighbour search
-#[derive(Clone, Debug, Copy, PartialEq)]
+#[derive(Clone, Debug, Copy, PartialEq, Default)]
 pub enum Dist {
     /// Euclidean distance
+    #[default]
     Euclidean,
     /// Cosine distance
     Cosine,
