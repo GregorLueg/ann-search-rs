@@ -5,6 +5,7 @@ use rand::{Rng, SeedableRng};
 use rayon::prelude::*;
 use std::cell::RefCell;
 use std::collections::BinaryHeap;
+use std::iter::Sum;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Instant;
 use thousands::*;
@@ -113,27 +114,9 @@ impl GraphSize {
     /// Get the number of trees to use pending graph/sample size
     fn annoy_trees(&self) -> usize {
         match self {
-            Self::Small => 32,
-            Self::Medium => 48,
-            Self::Large => 64,
-        }
-    }
-
-    /// Get the k multiplier pending graph/sample size
-    fn search_k_multiplier(&self) -> usize {
-        match self {
-            Self::Small => 3,
-            Self::Medium => 5,
-            Self::Large => 10,
-        }
-    }
-
-    /// Get the maximum search budget
-    fn max_search_k(&self, n: usize) -> usize {
-        match self {
-            Self::Small => 100,
-            Self::Medium => 500,
-            Self::Large => (n / 1000).max(1000),
+            Self::Small => 24,
+            Self::Medium => 32,
+            Self::Large => 40,
         }
     }
 
@@ -226,7 +209,7 @@ pub struct NNDescent<T> {
 
 impl<T> NNDescent<T>
 where
-    T: Float + FromPrimitive + Send + Sync,
+    T: Float + FromPrimitive + Send + Sync + Sum,
     Self: UpdateNeighbours<T>,
 {
     /// Build the kNN graph with NN-Descent
@@ -478,8 +461,8 @@ where
             .into_par_iter()
             .map(|i| {
                 let query_vec = &self.vectors_flat[i * self.dim..(i + 1) * self.dim];
-                let search_k = ((k + 1) * self.graph_params.search_k_multiplier())
-                    .min(self.graph_params.max_search_k(self.n));
+                // search budget for Annoy -> 5% of all data points
+                let search_k = self.n / 20;
                 let (indices, distances) =
                     annoy_index.query(query_vec, &self.metric, k + 1, Some(search_k));
 

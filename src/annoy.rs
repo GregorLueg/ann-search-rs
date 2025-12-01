@@ -3,102 +3,222 @@ use num_traits::{Float, FromPrimitive, ToPrimitive};
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 use rayon::prelude::*;
+use std::cmp::Ordering;
+use std::collections::BinaryHeap;
+use std::iter::Sum;
 
 use crate::utils::Dist;
 
-//////////////////
-// Annoy search //
-//////////////////
+/////////////
+// Helpers //
+/////////////
 
-/// Tree node representation for binary space partitioning
+/// Node representation in the flattened tree structure
 ///
-/// Each node is either a split (with hyperplane and child pointers) or leaf
-/// (with vector indices)
+/// Uses tagged union pattern: `n_descendants == 1` indicates leaf node,
+/// otherwise it's a split node.
+///
+/// ### Fields
+///
+/// * `n_descendants` - 1 for leaf, 2 for split node
+/// * `child_a` - For split: left child index; For leaf: start index in
+///   leaf_indices
+/// * `child_b` - For split: right child index; For leaf: count of items
+/// * `split_idx` - Index into split_data (only used for split nodes)
+#[derive(Clone, Copy, Debug)]
+#[repr(C)]
+struct FlatNode {
+    n_descendants: u32,
+    child_a: u32,
+    child_b: u32,
+    split_idx: u32,
+}
+
+/// Build-time node representation
+///
+/// Temporary structure used during tree construction, later flattened into
+/// FlatNode format for better cache performance during queries.
 #[derive(Clone)]
-enum AnnoyNode<T> {
-    /// Internal node that splits space using a hyperplane
+enum BuildNode<T> {
     Split {
-        /// Random hyperplane normal vector for splitting
+        /// Hyperplane normal vector
         hyperplane: Vec<T>,
-        /// Threshold for hyperplane decision (median of projections)
-        threshold: T,
-        /// Index of left child node
+        /// Dot product threshold for split decision
+        offset: T,
+        /// Index of left child in build tree
         left: usize,
-        /// Index of right child node
+        /// Index of right child in build tree
         right: usize,
     },
-    /// Terminal node containing actual vector indices
     Leaf {
-        /// Indices of vectors that ended up in this partition
+        /// Original data indices in this leaf
         items: Vec<usize>,
     },
 }
 
-/// Approximate Nearest Neighbors index using random binary trees
+/// Priority queue entry for backtracking during search
 ///
-/// Partitions vector space using multiple random hyperplanes to enable fast
-/// approximate neighbour search. Trade-off between accuracy and speed
-/// controlled by number of trees. (Reminds me of Random Forests...)
+/// Stores nodes to revisit, ordered by distance to query (further = lower
+/// priority)
 ///
 /// ### Fields
 ///
-/// * `trees` - Collection of binary trees, each with different random
-///   partitioning.
-/// * `vectors_flat` - Original vector data for distance calculations. Flattened
-///   for better cache locality
-/// * `dim` - Number of dimensions in the vector
-/// * `n_trees` - Number of trees built (more trees = better accuracy, slower
-///   queries)
+/// * `margin` - Negative absolute margin to hyperplane (for max-heap ->
+///   min-distance)
+/// * `node_idx` - Index of node to explore
+struct BacktrackEntry {
+    margin: f64,
+    node_idx: u32,
+}
+
+impl PartialEq for BacktrackEntry {
+    fn eq(&self, other: &Self) -> bool {
+        self.margin == other.margin
+    }
+}
+impl Eq for BacktrackEntry {}
+impl PartialOrd for BacktrackEntry {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+impl Ord for BacktrackEntry {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.margin
+            .partial_cmp(&other.margin)
+            .unwrap_or(Ordering::Equal)
+    }
+}
+
+/// Bitset for tracking visited items during search
+///
+/// Uses one bit per item, packed into u64 chunks for cache efficiency
+struct VisitedSet {
+    data: Vec<u64>,
+}
+
+impl VisitedSet {
+    /// Create a new bitset with capacity for n items
+    ///
+    /// Allocates enough u64 chunks to store one bit per item, rounding up
+    /// to the nearest 64-item boundary.
+    ///
+    /// ### Params
+    ///
+    /// * `capacity` - Number of items to track
+    ///
+    /// ### Returns
+    ///
+    /// Initialised bitset with all bits set to 0 (unvisited)
+    fn new(capacity: usize) -> Self {
+        // Round up to nearest u64
+        let size = capacity.div_ceil(64);
+        Self {
+            data: vec![0; size],
+        }
+    }
+
+    /// Mark an item as visited
+    ///
+    /// Sets the bit corresponding to `index` to 1. Uses unsafe unchecked
+    /// access for performance - caller must ensure index < capacity.
+    ///
+    /// ### Params
+    ///
+    /// * `index` - Item index to mark
+    ///
+    /// ### Returns
+    ///
+    /// `true` if item was already visited, `false` if newly marked
+    #[inline]
+    fn mark(&mut self, index: usize) -> bool {
+        let chunk = index / 64;
+        let bit = 1 << (index % 64);
+        // Use get_unchecked for speed, safe if capacity is correct
+        unsafe {
+            let slot = self.data.get_unchecked_mut(chunk);
+            if (*slot & bit) != 0 {
+                return true;
+            }
+            *slot |= bit;
+            false
+        }
+    }
+}
+
+/// Calculate search budget for Annoy queries
+///
+/// Uses sub-linear scaling with n_trees to balance recall and speed.
+/// More trees = better space coverage, so don't need proportionally deeper
+/// search.
+///
+/// ### Params
+///
+/// * `k` - Number of neighbours requested
+/// * `n_trees` - Number of trees in index
+///
+/// ### Returns
+///
+/// Recommended search_k value
+pub fn calculate_search_budget(k: usize, n_trees: usize) -> usize {
+    match n_trees {
+        1..=5 => k * n_trees * 5,
+        6..=20 => k * (15 + n_trees),
+        _ => k * (25 + (n_trees as f64).sqrt() as usize),
+    }
+}
+
+////////////////
+// Main index //
+////////////////
+
+/// Annoy (Approximate Nearest Neighbours Oh Yeah) index for similarity search
+///
+/// Uses a forest of random projection trees to partition the space. Each tree
+/// recursively splits the data using random hyperplanes until reaching leaves
+/// of size ≤ 64 items.
+///
+/// ### Fields
+///
+/// * `nodes` - Flattened tree structure containing all split and leaf nodes
+/// * `roots` - Starting indices for each tree in the forest
+/// * `split_data` - Hyperplane coefficients and offsets for split nodes
+/// * `leaf_indices` - Actual data indices stored in leaf nodes
+/// * `vectors_flat` - Original vector data, flattened for cache locality
+/// * `dim` - Embedding dimensions
+/// * `n_trees` - Number of trees in the forest
 pub struct AnnoyIndex<T> {
-    trees: Vec<Vec<AnnoyNode<T>>>,
+    nodes: Vec<FlatNode>,
+    roots: Vec<u32>,
+    split_data: Vec<T>,
+    leaf_indices: Vec<usize>,
     vectors_flat: Vec<T>,
-    dim: usize,
-    n_trees: usize,
+    pub dim: usize,
+    pub n_trees: usize,
 }
 
 impl<T> AnnoyIndex<T>
 where
-    T: Float + FromPrimitive + ToPrimitive + Send + Sync,
+    T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum,
 {
-    /// Creates a new Annoy index from an embedding-type matrix
+    /// Construct a new Annoy index
+    ///
+    /// Builds a forest of random projection trees in parallel. Each tree
+    /// recursively partitions the space using random hyperplanes chosen
+    /// between random pairs of points.
     ///
     /// ### Params
     ///
-    /// * `mat` - Matrix with rows = samples and columns = features.
-    /// * `n_trees` - Number of random trees to build (50-100 recommended).
-    /// * `seed` - Random seed for reproducible results.
+    /// * `mat` - Data matrix (rows = samples, columns = dimensions)
+    /// * `n_trees` - Number of trees to build (more trees = better recall,
+    ///   slower build)
+    /// * `seed` - Random seed for reproducibility
     ///
     /// ### Returns
     ///
-    /// Initialised AnnoyIndex ready for querying
-    ///
-    /// ### Algorithm Details
-    ///
-    /// **Tree Building Phase:**
-    ///
-    /// 1. For each tree, generate a random hyperplane (vector of uniform random
-    ///    values in [-1,1]).
-    /// 2. Project all vectors onto the hyperplane using dot products.
-    /// 3. Sort projections and split at median: vectors ≤ median go left,
-    ///    others go right.
-    /// 4. Recursively apply steps 1-3 to each partition until ≤10 vectors
-    ///    remain (leaf nodes).
-    /// 5. Repeat process for n_trees independent trees using different random
-    ///    seeds
-    ///
-    /// **Query Phase:**
-    ///
-    /// 1. For each tree, traverse from root following hyperplane decisions: if
-    ///    query·hyperplane ≤ threshold go left, else right.
-    /// 2. At boundary decisions (|query·hyperplane - threshold| < 0.5), explore
-    ///    both subtrees if search budget allows.
-    /// 3. Collect all vector indices from reached leaf nodes across all trees
-    /// 4. Remove duplicates and compute exact Euclidean distances to all
-    ///    candidates
-    /// 5. Return k vectors with smallest distances
+    /// Constructed index ready for querying
     pub fn new(mat: MatRef<T>, n_trees: usize, seed: usize) -> Self {
         let mut rng = StdRng::seed_from_u64(seed as u64);
-
         let n_vectors = mat.nrows();
         let dim = mat.ncols();
 
@@ -109,153 +229,92 @@ where
 
         let seeds: Vec<u64> = (0..n_trees).map(|_| rng.random()).collect();
 
-        let trees: Vec<Vec<AnnoyNode<T>>> = seeds
+        let forest: Vec<Vec<BuildNode<T>>> = seeds
             .into_par_iter()
             .map(|tree_seed| {
                 let mut tree_rng = StdRng::seed_from_u64(tree_seed);
-                Self::build_tree(&vectors_flat, dim, (0..n_vectors).collect(), &mut tree_rng)
+                Self::build_tree_recursive(
+                    &vectors_flat,
+                    dim,
+                    (0..n_vectors).collect(),
+                    &mut tree_rng,
+                )
             })
             .collect();
 
+        let total_nodes: usize = forest.iter().map(|t| t.len()).sum();
+        let mut nodes = Vec::with_capacity(total_nodes);
+        let mut roots = Vec::with_capacity(n_trees);
+        let mut split_data = Vec::new();
+        let mut leaf_indices = Vec::new();
+
+        for tree in forest {
+            let root_offset = nodes.len() as u32;
+            roots.push(root_offset);
+
+            for node in tree {
+                match node {
+                    BuildNode::Split {
+                        hyperplane,
+                        offset,
+                        left,
+                        right,
+                    } => {
+                        let split_idx = (split_data.len() / (dim + 1)) as u32;
+                        split_data.extend(hyperplane);
+                        split_data.push(offset);
+
+                        nodes.push(FlatNode {
+                            n_descendants: 2,
+                            child_a: root_offset + left as u32,
+                            child_b: root_offset + right as u32,
+                            split_idx,
+                        });
+                    }
+                    BuildNode::Leaf { items } => {
+                        let start = leaf_indices.len() as u32;
+                        let len = items.len() as u32;
+                        leaf_indices.extend(items);
+
+                        nodes.push(FlatNode {
+                            n_descendants: 1,
+                            child_a: start,
+                            child_b: len,
+                            split_idx: 0,
+                        });
+                    }
+                }
+            }
+        }
+
         AnnoyIndex {
-            trees,
+            nodes,
+            roots,
+            split_data,
+            leaf_indices,
             vectors_flat,
             dim,
             n_trees,
         }
     }
 
-    /// Builds a single random tree from the given items
+    /// Query the index for approximate nearest neighbours
+    ///
+    /// Performs best-first search across all trees, greedily descending to
+    /// leaves and backtracking to promising unexplored branches. Stops when
+    /// the search budget is exhausted.
     ///
     /// ### Params
     ///
-    /// * `vectors_flat` - All vectors in the dataset. (As a flattened
-    ///   structure.)
-    /// * `dim` - The original dimensions (row numbers).
-    /// * `items` - Subset of vector indices to include in this tree.
-    /// * `rng` - Random number generator for this tree.
+    /// * `query_vec` - Query vector (must match index dimensionality)
+    /// * `dist_metric` - Distance metric (Euclidean or Cosine)
+    /// * `k` - Number of neighbours to return
+    /// * `search_k` - Budget of items to examine (higher = better recall, slower)
+    ///   Defaults to `k * n_trees` if None
     ///
     /// ### Returns
     ///
-    /// Vector of AnnoyNodes representing the tree structure (index 0 = root)
-    fn build_tree(
-        vectors_flat: &[T],
-        dim: usize,
-        items: Vec<usize>,
-        rng: &mut StdRng,
-    ) -> Vec<AnnoyNode<T>> {
-        let mut nodes = Vec::with_capacity(items.len() * 2);
-        Self::build_node(vectors_flat, dim, items, &mut nodes, rng);
-        nodes
-    }
-
-    /// Recursively builds tree nodes using random hyperplanes
-    ///
-    /// ### Params
-    ///  
-    /// * `vectors` - All vectors in the dataset
-    /// * `items` - Items to split at this node
-    /// * `nodes` - Growing list of tree nodes
-    /// * `rng` - Random number generator
-    ///
-    /// ### Returns
-    ///
-    /// Index of the created node in the nodes vector.
-    ///
-    /// ### Implementation Details
-    ///
-    /// - Creates leaf if ≤10 items remain (prevents over-partitioning)
-    /// - Hyperplane: random vector with components element [-1,1]  
-    /// - Threshold: median of dot products (balanced split)
-    /// - Fallback: creates leaf if split fails (empty partitions)
-    fn build_node(
-        vectors_flat: &[T],
-        dim: usize,
-        items: Vec<usize>,
-        nodes: &mut Vec<AnnoyNode<T>>,
-        rng: &mut StdRng,
-    ) -> usize {
-        if items.len() <= 10 {
-            let node_idx = nodes.len();
-            nodes.push(AnnoyNode::Leaf { items });
-            return node_idx;
-        }
-
-        let hyperplane: Vec<T> = (0..dim)
-            .map(|_| T::from_f64(rng.random_range(-1.0..1.0)).unwrap())
-            .collect();
-
-        let mut item_dots: Vec<(usize, T)> = items
-            .iter()
-            .map(|&item| {
-                let vec_start = item * dim;
-                let vec_slice = &vectors_flat[vec_start..vec_start + dim];
-                let dot = vec_slice
-                    .iter()
-                    .zip(&hyperplane)
-                    .fold(T::zero(), |acc, (v, h)| acc + *v * *h);
-                (item, dot)
-            })
-            .collect();
-
-        item_dots.sort_unstable_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
-        let threshold = item_dots[item_dots.len() / 2].1;
-
-        let mut left_items = Vec::new();
-        let mut right_items = Vec::new();
-
-        for (item, dot) in item_dots {
-            if dot <= threshold {
-                left_items.push(item);
-            } else {
-                right_items.push(item);
-            }
-        }
-
-        if left_items.is_empty() || right_items.is_empty() {
-            let node_idx = nodes.len();
-            nodes.push(AnnoyNode::Leaf { items });
-            return node_idx;
-        }
-
-        let node_idx = nodes.len();
-        nodes.push(AnnoyNode::Split {
-            hyperplane: hyperplane.clone(),
-            threshold,
-            left: 0,
-            right: 0,
-        });
-
-        let left_idx = Self::build_node(vectors_flat, dim, left_items, nodes, rng);
-        let right_idx = Self::build_node(vectors_flat, dim, right_items, nodes, rng);
-
-        if let AnnoyNode::Split {
-            ref mut left,
-            ref mut right,
-            ..
-        } = nodes[node_idx]
-        {
-            *left = left_idx;
-            *right = right_idx;
-        }
-
-        node_idx
-    }
-
-    /// Queries the index for k nearest neighbors with enhanced search
-    ///
-    /// ### Params
-    ///
-    /// * `query_vec` - Vector to find neighbors for.
-    /// * `dist_metric` - Which distance metric to use.
-    /// * `k` - Number of neighbors to return
-    /// * `search_k` - Search budget (None = k * n_trees, higher = better
-    ///   recall)
-    ///
-    /// ### Returns
-    ///
-    /// Tuple of `(nearest neighbour indices, distances)`
-    #[inline]
+    /// Tuple of `(indices, distances)` sorted by distance (nearest first)
     pub fn query(
         &self,
         query_vec: &[T],
@@ -263,83 +322,130 @@ where
         k: usize,
         search_k: Option<usize>,
     ) -> (Vec<usize>, Vec<T>) {
-        let search_k = search_k.unwrap_or(k * self.n_trees);
-        let mut candidates = Vec::with_capacity(search_k * 2);
-        let budget_per_tree = (search_k / self.n_trees).max(k);
+        // Defaults: search_k is the limit on ITEMS inspected.
+        // Typically n_trees * k for a balanced trade-off.
+        let limit = search_k.unwrap_or(calculate_search_budget(k, self.n_trees));
+        let mut visited_count = 0;
 
-        for tree in &self.trees {
-            self.query_tree_enhanced(tree, query_vec, &mut candidates, budget_per_tree);
+        let n_vectors = self.vectors_flat.len() / self.dim;
+        let mut visited = VisitedSet::new(n_vectors);
+
+        let mut candidates = Vec::with_capacity(limit);
+        let mut pq = BinaryHeap::with_capacity(self.n_trees * 2);
+
+        // 1. Initialize PQ with all roots
+        for &root in &self.roots {
+            pq.push(BacktrackEntry {
+                margin: f64::MAX,
+                node_idx: root,
+            });
         }
 
-        candidates.sort_unstable();
-        candidates.dedup();
+        // 2. Tree Traversal
+        while visited_count < limit {
+            let Some(entry) = pq.pop() else { break };
+            let mut current_idx = entry.node_idx;
 
-        let mut scored = Vec::with_capacity(candidates.len());
+            // Inner loop: Greedy descent to leaf
+            loop {
+                let node = unsafe { self.nodes.get_unchecked(current_idx as usize) };
+
+                if node.n_descendants == 1 {
+                    // LEAF NODE found
+                    let start = node.child_a as usize;
+                    let len = node.child_b as usize;
+
+                    // CRITICAL FIX: Count items towards the budget, not just the node visit
+                    visited_count += len;
+
+                    let leaf_items = unsafe { self.leaf_indices.get_unchecked(start..start + len) };
+
+                    for &item in leaf_items {
+                        if !visited.mark(item) {
+                            candidates.push(item);
+                        }
+                    }
+                    break; // Done with this path, go back to PQ
+                } else {
+                    // SPLIT NODE
+                    let split_offset = node.split_idx as usize * (self.dim + 1);
+                    let plane = unsafe {
+                        self.split_data
+                            .get_unchecked(split_offset..split_offset + self.dim + 1)
+                    };
+
+                    let margin = Self::get_margin(query_vec, plane, self.dim)
+                        .to_f64()
+                        .unwrap();
+
+                    let (closer, farther) = if margin > 0.0 {
+                        (node.child_a, node.child_b)
+                    } else {
+                        (node.child_b, node.child_a)
+                    };
+
+                    // Push the "bad" side to PQ for later
+                    pq.push(BacktrackEntry {
+                        margin: -margin.abs(),
+                        node_idx: farther,
+                    });
+
+                    // Continue down the "good" side immediately (avoids heap overhead)
+                    current_idx = closer;
+                }
+            }
+        }
+
+        // 3. Compute Distances & Sort
+        let mut scored: Vec<(usize, T)> = Vec::with_capacity(candidates.len());
 
         match dist_metric {
             Dist::Euclidean => {
-                for idx in candidates {
+                for &idx in &candidates {
                     let vec_start = idx * self.dim;
-                    let dist: T = unsafe {
-                        let vec_ptr = self.vectors_flat.as_ptr().add(vec_start);
-                        let query_ptr = query_vec.as_ptr();
-                        (0..self.dim).fold(T::zero(), |acc, i| {
-                            let diff = *vec_ptr.add(i) - *query_ptr.add(i);
-                            acc + diff * diff
-                        })
+                    let vec = unsafe {
+                        self.vectors_flat
+                            .get_unchecked(vec_start..vec_start + self.dim)
                     };
+                    let dist = Self::euclidean_dist_sq(query_vec, vec);
                     scored.push((idx, dist));
                 }
             }
             Dist::Cosine => {
-                let norm_query: T = query_vec
+                let query_norm = query_vec
                     .iter()
-                    .map(|v| *v * *v)
-                    .fold(T::zero(), |a, b| a + b)
+                    .map(|&x| x * x)
+                    .fold(T::zero(), |acc, x| acc + x)
                     .sqrt();
 
-                for idx in candidates {
+                for &idx in &candidates {
                     let vec_start = idx * self.dim;
-                    let (dot, norm_vec): (T, T) = unsafe {
-                        let vec_ptr = self.vectors_flat.as_ptr().add(vec_start);
-                        let query_ptr = query_vec.as_ptr();
-                        (0..self.dim).fold((T::zero(), T::zero()), |(d, n), i| {
-                            let v = *vec_ptr.add(i);
-                            let q = *query_ptr.add(i);
-                            (d + v * q, n + v * v)
-                        })
+                    let vec = unsafe {
+                        self.vectors_flat
+                            .get_unchecked(vec_start..vec_start + self.dim)
                     };
-                    let dist = T::one() - (dot / (norm_query * norm_vec.sqrt()));
+                    let dist = Self::cosine_dist(query_vec, vec, query_norm);
                     scored.push((idx, dist));
                 }
             }
         }
 
-        let k = k.min(scored.len());
         if k < scored.len() {
-            scored.select_nth_unstable_by(k - 1, |a, b| a.1.partial_cmp(&b.1).unwrap());
+            scored
+                .select_nth_unstable_by(k, |a, b| a.1.partial_cmp(&b.1).unwrap_or(Ordering::Equal));
             scored.truncate(k);
         }
-        scored.sort_unstable_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
+        scored.sort_unstable_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(Ordering::Equal));
 
-        let (indices, distances): (Vec<_>, Vec<_>) = scored.into_iter().unzip();
-        (indices, distances)
+        scored.into_iter().unzip()
     }
 
-    /// Queries the index for k nearest neighbors with enhanced search
+    /// Query using a matrix row reference
+    ///
+    /// Optimised path for contiguous memory (stride == 1), otherwise copies
+    /// to a temporary vector.
     ///
     /// ### Params
-    ///
-    /// * `query_row` - RowRef from a matrix in which rows = samples and columns
-    ///   features.
-    /// * `dist_metric` - Which distance metric to use.
-    /// * `k` - Number of neighbors to return
-    /// * `search_k` - Search budget (None = k * n_trees, higher = better
-    ///   recall)
-    ///
-    /// ### Returns
-    ///
-    /// Vector of k nearest neighbor indices, sorted by distance
     #[inline]
     pub fn query_row(
         &self,
@@ -358,109 +464,222 @@ where
         self.query(&query_vec, dist_metric, k, search_k)
     }
 
-    /// Enhanced tree query with multi-path traversal and search budget
+    /// Build a single tree recursively
+    ///
+    /// Wrapper that initialises the node vector and starts the recursive
+    /// splitting process.
     ///
     /// ### Params
     ///
-    /// * `tree` - Array of tree nodes (index 0 = root)  
-    /// * `query_vec` - Query vector for similarity matching
-    /// * `candidates` - Accumulating list of potential neighbor indices
-    /// * `budget` - Maximum candidates to collect from this tree
-    #[inline]
-    fn query_tree_enhanced(
-        &self,
-        tree: &[AnnoyNode<T>],
-        query_vec: &[T],
-        candidates: &mut Vec<usize>,
-        budget: usize,
-    ) {
-        let mut remaining_budget = budget;
-        Self::traverse_node_enhanced(tree, 0, query_vec, candidates, &mut remaining_budget);
+    /// * `vectors_flat` - Flattened vector data
+    /// * `dim` - Dimensionality of vectors
+    /// * `items` - Indices of items to partition
+    /// * `rng` - Random number generator for this tree
+    ///
+    /// ### Returns
+    ///
+    /// Vector of BuildNodes representing the complete tree
+    fn build_tree_recursive(
+        vectors_flat: &[T],
+        dim: usize,
+        items: Vec<usize>,
+        rng: &mut StdRng,
+    ) -> Vec<BuildNode<T>> {
+        let mut nodes = Vec::with_capacity(items.len());
+        Self::build_node(vectors_flat, dim, items, &mut nodes, rng);
+        nodes
     }
 
-    /// Multi-path tree traversal with budget-controlled exploration
+    /// Recursively build a node (split or leaf)
     ///
-    /// Explores both sides of splits when query point is near the boundary,
-    /// improving recall at the cost of some performance.
+    /// Attempts up to 5 random hyperplane splits. For each split, picks two
+    /// random points and uses their difference as the hyperplane normal.
+    /// Accepts splits where both sides contain 5-95% of items. Falls back
+    /// to a leaf if no good split is found or if items ≤ 64.
     ///
     /// ### Params
     ///
-    /// * `tree` - Tree nodes
-    /// * `node_idx` - Current node index
-    /// * `query_vec` - Query vector
-    /// * `candidates` - Growing candidate list
-    /// * `remaining_budget` - Candidates left to collect
-    fn traverse_node_enhanced(
-        tree: &[AnnoyNode<T>],
-        node_idx: usize,
-        query_vec: &[T],
-        candidates: &mut Vec<usize>,
-        remaining_budget: &mut usize,
-    ) {
-        if *remaining_budget == 0 {
-            return;
+    /// * `vectors_flat` - Flattened vector data
+    /// * `dim` - Dimensionality of vectors
+    /// * `items` - Indices to partition in this node
+    /// * `nodes` - Accumulator for built nodes
+    /// * `rng` - Random number generator
+    ///
+    /// ### Returns
+    ///
+    /// Index of the created node in `nodes`
+    fn build_node(
+        vectors_flat: &[T],
+        dim: usize,
+        items: Vec<usize>,
+        nodes: &mut Vec<BuildNode<T>>,
+        rng: &mut StdRng,
+    ) -> usize {
+        const MIN_MEMBERS: usize = 64; // Re-declaring for self-contained snippet
+        if items.len() <= MIN_MEMBERS {
+            let node_idx = nodes.len();
+            nodes.push(BuildNode::Leaf { items });
+            return node_idx;
         }
 
-        match &tree[node_idx] {
-            AnnoyNode::Leaf { items } => {
-                let items_to_add = items.len().min(*remaining_budget);
-                candidates.extend(&items[..items_to_add]);
-                *remaining_budget = remaining_budget.saturating_sub(items_to_add);
+        for _ in 0..5 {
+            let idx1 = items[rng.random_range(0..items.len())];
+            let idx2 = items[rng.random_range(0..items.len())];
+            if idx1 == idx2 {
+                continue;
             }
-            AnnoyNode::Split {
-                hyperplane,
-                threshold,
-                left,
-                right,
-            } => {
-                let dot = query_vec
-                    .iter()
-                    .zip(hyperplane)
-                    .fold(T::zero(), |acc, (q, h)| acc + *q * *h);
 
-                let margin = (dot - *threshold).abs();
-                let half = T::from_f64(0.5).unwrap();
+            let v1_start = idx1 * dim;
+            let v2_start = idx2 * dim;
+            let v1 = &vectors_flat[v1_start..v1_start + dim];
+            let v2 = &vectors_flat[v2_start..v2_start + dim];
 
-                // more sensible threshold now
-                if margin < half && *remaining_budget > 5 {
-                    let half_budget = *remaining_budget / 2;
+            let mut hyperplane = Vec::with_capacity(dim);
+            let mut dot_v1 = T::zero();
+            let mut dot_v2 = T::zero();
 
-                    let (first, second) = if dot <= *threshold {
-                        (*left, *right)
-                    } else {
-                        (*right, *left)
-                    };
+            for k in 0..dim {
+                let val1 = v1[k];
+                let val2 = v2[k];
+                hyperplane.push(val1 - val2);
+                dot_v1 = dot_v1 + val1 * val1;
+                dot_v2 = dot_v2 + val2 * val2;
+            }
 
-                    let mut first_budget = half_budget + (*remaining_budget % 2);
-                    Self::traverse_node_enhanced(
-                        tree,
-                        first,
-                        query_vec,
-                        candidates,
-                        &mut first_budget,
-                    );
+            let threshold = (dot_v1 - dot_v2) / T::from_f64(2.0).unwrap();
 
-                    let mut second_budget = half_budget;
-                    Self::traverse_node_enhanced(
-                        tree,
-                        second,
-                        query_vec,
-                        candidates,
-                        &mut second_budget,
-                    );
+            let mut left_items = Vec::new();
+            let mut right_items = Vec::new();
 
-                    *remaining_budget = 0;
+            for &item in &items {
+                let vec_start = item * dim;
+                let vec = &vectors_flat[vec_start..vec_start + dim];
+                let mut dot = T::zero();
+                for k in 0..dim {
+                    dot = dot + vec[k] * hyperplane[k];
+                }
+
+                if dot > threshold {
+                    left_items.push(item);
                 } else {
-                    let next = if dot <= *threshold { *left } else { *right };
-                    Self::traverse_node_enhanced(
-                        tree,
-                        next,
-                        query_vec,
-                        candidates,
-                        remaining_budget,
-                    );
+                    right_items.push(item);
                 }
             }
+
+            if left_items.is_empty() || right_items.is_empty() {
+                continue;
+            }
+
+            let ratio = left_items.len() as f64 / items.len() as f64;
+            if (0.05..=0.95).contains(&ratio) {
+                let node_idx = nodes.len();
+                nodes.push(BuildNode::Split {
+                    hyperplane,
+                    offset: threshold,
+                    left: 0,
+                    right: 0,
+                });
+
+                let left_idx = Self::build_node(vectors_flat, dim, left_items, nodes, rng);
+                let right_idx = Self::build_node(vectors_flat, dim, right_items, nodes, rng);
+
+                if let BuildNode::Split {
+                    ref mut left,
+                    ref mut right,
+                    ..
+                } = nodes[node_idx]
+                {
+                    *left = left_idx;
+                    *right = right_idx;
+                }
+                return node_idx;
+            }
+        }
+
+        let node_idx = nodes.len();
+        nodes.push(BuildNode::Leaf { items });
+        node_idx
+    }
+
+    /// Calculate signed distance (margin) from query to hyperplane
+    ///
+    /// Computes dot(query, normal) - offset. Positive means query is on
+    /// the "left" side of the split, negative means "right".
+    ///
+    /// ### Params
+    ///
+    /// * `v1` - Query vector
+    /// * `v2` - Hyperplane data (first dim elements = normal, last = offset)
+    /// * `dim` - Dimensionality
+    ///
+    /// ### Returns
+    ///
+    /// Signed margin (distance to hyperplane along normal direction)
+    #[inline(always)]
+    fn get_margin(v1: &[T], v2: &[T], dim: usize) -> T {
+        // Explicit zip/map is friendlier to auto-vectorization than pointer offset arithmetic
+        v1.iter()
+            .zip(v2.iter())
+            .map(|(&a, &b)| a * b)
+            .fold(T::zero(), |acc, x| acc + x)
+            - v2[dim]
+    }
+
+    /// Calculate squared Euclidean distance between vectors
+    ///
+    /// Computes sum((v1[i] - v2[i])^2). Returns squared distance to avoid
+    /// expensive sqrt - sufficient for comparison purposes.
+    ///
+    /// ### Params
+    ///
+    /// * `v1` - First vector
+    /// * `v2` - Second vector
+    ///
+    /// ### Returns
+    ///
+    /// Squared Euclidean distance
+    #[inline(always)]
+    fn euclidean_dist_sq(v1: &[T], v2: &[T]) -> T {
+        v1.iter()
+            .zip(v2.iter())
+            .map(|(&a, &b)| (a - b) * (a - b))
+            .fold(T::zero(), |acc, x| acc + x)
+    }
+
+    /// Calculate cosine distance between vectors
+    ///
+    /// Computes 1 - cos(θ) where θ is the angle between vectors.
+    /// Handles zero-norm vectors by returning 1.0 (maximum distance).
+    /// Clamps similarity to [0, 1] to prevent NaN from floating-point errors.
+    ///
+    /// ### Params
+    ///
+    /// * `v1` - First vector
+    /// * `v2` - Second vector
+    /// * `v1_norm` - Pre-computed L2 norm of v1 (for efficiency)
+    ///
+    /// ### Returns
+    ///
+    /// Cosine distance in range [0, 1]
+    #[inline(always)]
+    fn cosine_dist(v1: &[T], v2: &[T], v1_norm: T) -> T {
+        let (dot, v2_norm_sq) = v1
+            .iter()
+            .zip(v2.iter())
+            .fold((T::zero(), T::zero()), |(d, n), (&a, &b)| {
+                (d + a * b, n + b * b)
+            });
+
+        let v2_norm = v2_norm_sq.sqrt();
+        if v1_norm.is_zero() || v2_norm.is_zero() {
+            return T::one();
+        }
+        // Clamp to prevent NaN due to precision errors
+        let sim = dot / (v1_norm * v2_norm);
+        if sim > T::one() {
+            T::zero()
+        } else {
+            T::one() - sim
         }
     }
 }

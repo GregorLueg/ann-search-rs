@@ -16,6 +16,7 @@ use std::default::Default;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use thousands::*;
+use std::iter::Sum;
 
 use crate::annoy::*;
 use crate::hnsw::*;
@@ -42,7 +43,7 @@ use crate::exhaustive::*;
 /// The `AnnoyIndex`.
 pub fn build_annoy_index<T>(mat: MatRef<T>, n_trees: usize, seed: usize) -> AnnoyIndex<T>
 where
-    T: Float + FromPrimitive + ToPrimitive + Send + Sync,
+    T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum,
 {
     AnnoyIndex::new(mat, n_trees, seed)
 }
@@ -70,23 +71,22 @@ pub fn query_annoy_index<T>(
     index: &AnnoyIndex<T>,
     k: usize,
     dist_metric: &str,
-    search_budget: usize,
+    search_budget: Option<usize>,
     return_dist: bool,
     verbose: bool,
 ) -> (Vec<Vec<usize>>, Option<Vec<Vec<T>>>)
 where
-    T: Float + FromPrimitive + ToPrimitive + Send + Sync,
+    T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum,
 {
     let n_samples = query_mat.nrows();
     let ann_dist = parse_ann_dist(dist_metric).unwrap();
-    let search_k = Some(k * search_budget);
     let counter = Arc::new(AtomicUsize::new(0));
 
     if return_dist {
         let results: Vec<(Vec<usize>, Vec<T>)> = (0..n_samples)
             .into_par_iter()
             .map(|i| {
-                let (neighbors, dists) = index.query_row(query_mat.row(i), &ann_dist, k, search_k);
+                let (neighbors, dists) = index.query_row(query_mat.row(i), &ann_dist, k, search_budget);
 
                 if verbose {
                     let count = counter.fetch_add(1, Ordering::Relaxed) + 1;
@@ -104,7 +104,7 @@ where
         let indices: Vec<Vec<usize>> = (0..n_samples)
             .into_par_iter()
             .map(|i| {
-                let (neighbors, _) = index.query_row(query_mat.row(i), &ann_dist, k, search_k);
+                let (neighbors, _) = index.query_row(query_mat.row(i), &ann_dist, k, search_budget);
 
                 if verbose {
                     let count = counter.fetch_add(1, Ordering::Relaxed) + 1;
@@ -280,7 +280,7 @@ pub fn generate_knn_nndescent_with_dist<T>(
     return_distances: bool,
 ) -> (Vec<Vec<usize>>, Option<Vec<Vec<T>>>)
 where
-    T: Float + FromPrimitive + Send + Sync + Default,
+    T: Float + FromPrimitive + Send + Sync + Default + Sum,
     NNDescent<T>: UpdateNeighbours<T>,
 {
     let graph: Vec<Vec<(usize, T)>> = NNDescent::build(
@@ -619,7 +619,7 @@ mod full_library_tests {
     fn test_annoy_finds_self() {
         let mat = create_clustered_data::<f64>();
         let annoy_idx = build_annoy_index(mat.as_ref(), 100, 42);
-        let (annoy_indices, annoy_dists) = query_annoy_index(mat.as_ref(), &annoy_idx, 15, "euclidean" , 100, true, false);
+        let (annoy_indices, annoy_dists) = query_annoy_index(mat.as_ref(), &annoy_idx, 15, "euclidean" , Some(100), true, false);
         
         let mut self_not_found = 0;
         for i in 0..mat.nrows() {
@@ -666,7 +666,7 @@ mod full_library_tests {
             mat.as_ref(), "euclidean", k, 30, 0.001, 0.5, 42, false, false
         );
         
-        let (annoy_indices, _) = query_annoy_index(mat.as_ref(), &annoy_idx, 15, "euclidean", 100, false, false);
+        let (annoy_indices, _) = query_annoy_index(mat.as_ref(), &annoy_idx, 15, "euclidean", Some(100), false, false);
         let (hnsw_indices, _) = query_hnsw_index(mat.as_ref(), &hnsw_idx, k, 400, false, false);
         let (fanng_indices, _) = query_fanng_index(mat.as_ref(), &fanng_idx, 15, 500, 25, false, false);
         
@@ -721,7 +721,7 @@ mod full_library_tests {
         );
 
         let (annoy_indices, _) =
-            query_annoy_index(mat.as_ref(), &annoy_idx, k,"euclidean", 100, false, false);
+            query_annoy_index(mat.as_ref(), &annoy_idx, k,"euclidean", Some(100), false, false);
         let (hnsw_indices, _) = query_hnsw_index(mat.as_ref(), &hnsw_idx, k, 400, false, false); // Increased ef_search
         let (fanng_indices, _) = query_fanng_index(mat.as_ref(), &fanng_idx, 15, 500, 25, false, false);
 
