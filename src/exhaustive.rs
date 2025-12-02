@@ -2,7 +2,7 @@ use faer::{MatRef, RowRef};
 use num_traits::{Float, FromPrimitive, ToPrimitive};
 use std::collections::BinaryHeap;
 
-use crate::dist::VectorDistance;
+use crate::dist::*;
 use crate::utils::*;
 
 /// Exhaustive (brute-force) nearest neighbour index

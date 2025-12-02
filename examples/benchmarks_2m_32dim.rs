@@ -11,8 +11,8 @@ use commons::*;
 
 fn main() {
     // test parameters
-    const N_CELLS: usize = 500_000;
-    const DIM: usize = 16;
+    const N_CELLS: usize = 2_000_000;
+    const DIM: usize = 32;
     const N_CLUSTERS: usize = 20;
     const K: usize = 10;
     const SEED: u64 = 42;

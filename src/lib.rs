@@ -59,11 +59,8 @@ where
 /// ### Params
 ///
 /// * `query_mat` - The query matrix containing the samples x features
-///
 /// * `k` - Number of neighbours to return
 /// * `index` - The AnnoyIndex to query.
-/// * `dist_metric` - The distance metric to use. One of `"euclidean"` or
-///   `"cosine"`.
 /// * `search_budget` - Search budget per tree
 /// * `return_dist` - Shall the distances between the different points be
 ///   returned
@@ -292,6 +289,7 @@ pub fn build_nndescent_index<T>(
 where
     T: Float + FromPrimitive + Send + Sync + Sum,
     NNDescent<T>: UpdateNeighbours<T>,
+    NNDescent<T>: NNDescentQuery<T>,
 {
     let metric = parse_ann_dist(dist_metric).unwrap_or(Dist::Cosine);
     NNDescent::new(
@@ -315,6 +313,7 @@ where
 /// * `query_mat` - The query matrix containing the samples x features
 /// * `index` - Reference to the built NNDescent index
 /// * `k` - Number of neighbours to return
+/// * `ef_search` -
 /// * `return_dist` - Shall the distances between the different points be
 ///   returned
 /// * `verbose` - Print progress information
@@ -332,13 +331,13 @@ pub fn query_nndescent_index<T>(
     index: &NNDescent<T>,
     k: usize,
     ef_search: Option<usize>,
-    epsilon: Option<T>,
     return_dist: bool,
     verbose: bool,
 ) -> (Vec<Vec<usize>>, Option<Vec<Vec<T>>>)
 where
     T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum,
     NNDescent<T>: UpdateNeighbours<T>,
+    NNDescent<T>: NNDescentQuery<T>,
 {
     let n_samples = query_mat.nrows();
     let counter = Arc::new(AtomicUsize::new(0));
@@ -348,7 +347,7 @@ where
             .into_par_iter()
             .map(|i| {
                 let query_vec: Vec<T> = query_mat.row(i).iter().copied().collect();
-                let result = index.query(&query_vec, k, ef_search, epsilon);
+                let result = index.query(&query_vec, k, ef_search);
 
                 if verbose {
                     let count = counter.fetch_add(1, Ordering::Relaxed) + 1;
@@ -371,7 +370,7 @@ where
             .into_par_iter()
             .map(|i| {
                 let query_vec: Vec<T> = query_mat.row(i).iter().copied().collect();
-                let (indices, _) = index.query(&query_vec, k, ef_search, epsilon);
+                let (indices, _) = index.query(&query_vec, k, ef_search);
 
                 if verbose {
                     let count = counter.fetch_add(1, Ordering::Relaxed) + 1;

@@ -151,30 +151,26 @@ fn main() {
 
     println!("-----------------------------");
 
-    for (max_iter, max_cand, diversify_prob, ef_search) in [
-        // default with different diversifications
-        (None, None, 0.0, 100),
-        (None, None, 0.0, 150), // higher ef search
-        (None, None, 0.5, 100),
-        (None, None, 1.0, 100),
-        // manual max_iter
-        (Some(5), None, 0.0, 100),
-        (Some(10), None, 0.0, 100),
-        // Test with diversification (use lower prob)
-        (None, Some(40), 0.0, 100),
-        (None, Some(80), 0.0, 100),
+    for (n_trees, ef_search, diversify_prob) in [
+        (Some(12), None, 0.0),
+        (Some(24), None, 0.0),
+        (None, Some(50), 0.0),
+        (None, Some(100), 0.0),
+        (None, None, 0.0),
+        (None, None, 0.5),
+        (None, None, 1.0),
     ] {
-        let iter_str = max_iter
+        let n_trees_str = n_trees
             .map(|i| i.to_string())
-            .unwrap_or_else(|| "auto".to_string());
+            .unwrap_or_else(|| ":auto".to_string());
 
-        let max_cand_str = max_cand
+        let ef_search_str = ef_search
             .map(|i| i.to_string())
-            .unwrap_or_else(|| "auto".to_string());
+            .unwrap_or_else(|| ":auto".to_string());
 
         println!(
-            "Building NNDescent index (max_iter={}, max_cand={:?}, diversify={})...",
-            iter_str, max_cand_str, diversify_prob
+            "Building NNDescent index (n_trees={}, ef_search={:?}, diversify={})...",
+            n_trees_str, ef_search_str, diversify_prob
         );
         let start_total = Instant::now();
         let start = std::time::Instant::now();
@@ -184,18 +180,18 @@ fn main() {
             0.001,
             diversify_prob,
             None,
-            max_iter,
-            max_cand,
             None,
+            None,
+            n_trees,
             SEED as usize,
             false,
         );
         let build_time = start.elapsed().as_secs_f64() * 1000.0;
 
-        println!("Querying NNDescent index (ef_search={})...", ef_search);
+        println!("Querying NNDescent index (ef_search={})...", ef_search_str);
         let start = std::time::Instant::now();
         let (approx_neighbors, approx_distances) =
-            query_nndescent_index(query_data, &nndescent_idx, K, None, None, true, false);
+            query_nndescent_index(query_data, &nndescent_idx, K, ef_search, true, false);
         let query_time = start.elapsed().as_secs_f64() * 1000.0;
 
         let recall = calculate_recall::<f32>(&true_neighbors, &approx_neighbors, K);
@@ -208,17 +204,16 @@ fn main() {
 
         results.push(BenchmarkResult {
             method: format!(
-                "NNDescent-i{}-c{}-d{}-ef{}",
-                iter_str,
-                max_cand_str,
+                "NNDescent-nt{}-s{}-dp{}",
+                n_trees_str,
+                ef_search_str,
                 if diversify_prob > 0.5 {
                     1
                 } else if diversify_prob > 0.0 {
                     5
                 } else {
                     0
-                },
-                ef_search
+                }
             ),
             build_time_ms: build_time,
             query_time_ms: query_time,

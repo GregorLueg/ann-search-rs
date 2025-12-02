@@ -81,6 +81,41 @@ pub trait UpdateNeighbours<T> {
     );
 }
 
+pub trait NNDescentQuery<T> {
+    fn query_internal(
+        &self,
+        query_vec: &[T],
+        query_norm: T,
+        k: usize,
+        ef: usize,
+    ) -> (Vec<usize>, Vec<T>);
+
+    fn query_euclidean(
+        &self,
+        query_vec: &[T],
+        k: usize,
+        ef: usize,
+        visited: &mut FixedBitSet,
+        candidates: &mut BinaryHeap<Reverse<(OrderedFloat<T>, usize)>>,
+        results: &mut BinaryHeap<(OrderedFloat<T>, usize)>,
+    ) -> (Vec<usize>, Vec<T>);
+
+    #[allow(clippy::too_many_arguments)]
+    fn query_cosine(
+        &self,
+        query_vec: &[T],
+        query_norm: T,
+        k: usize,
+        ef: usize,
+        visited: &mut FixedBitSet,
+        candidates: &mut BinaryHeap<Reverse<(OrderedFloat<T>, usize)>>,
+        results: &mut BinaryHeap<(OrderedFloat<T>, usize)>,
+    ) -> (Vec<usize>, Vec<T>);
+}
+
+pub type QueryCandF32 = RefCell<BinaryHeap<Reverse<(OrderedFloat<f32>, usize)>>>;
+pub type QueryCandF64 = RefCell<BinaryHeap<Reverse<(OrderedFloat<f64>, usize)>>>;
+
 thread_local! {
     /// Heap for f32
     static HEAP_F32: RefCell<BinaryHeap<(OrderedFloat<f32>, usize, bool)>> =
@@ -90,6 +125,20 @@ thread_local! {
         const { RefCell::new(BinaryHeap::new()) };
     /// Heap for PID
     static PID_SET: RefCell<Vec<bool>> = const { RefCell::new(Vec::new()) };
+    /// Thread-local storage for which nodes were visited - for querying
+    static QUERY_VISITED: RefCell<FixedBitSet> = const{ RefCell::new(FixedBitSet::new()) };
+    /// Store the candidates (f32) - for querying
+    static QUERY_CANDIDATES_F32: QueryCandF32 =
+        const {RefCell::new(BinaryHeap::new())};
+    /// Store the candidates (f64) - for querying
+    static QUERY_CANDIDATES_F64: QueryCandF64 =
+        const {RefCell::new(BinaryHeap::new())};
+    /// Results (f32) - for querying
+    static QUERY_RESULTS_F32: RefCell<BinaryHeap<(OrderedFloat<f32>, usize)>> =
+        const{RefCell::new(BinaryHeap::new())};
+    /// Results (f64) - for querying
+    static QUERY_RESULTS_F64: RefCell<BinaryHeap<(OrderedFloat<f64>, usize)>> =
+        const{RefCell::new(BinaryHeap::new())};
 }
 
 /// NN-Descent index for approximate nearest neighbour search
@@ -141,6 +190,7 @@ impl<T> NNDescent<T>
 where
     T: Float + FromPrimitive + Send + Sync + Sum,
     Self: UpdateNeighbours<T>,
+    Self: NNDescentQuery<T>,
 {
     /// Build a new NN-Descent index
     ///
@@ -262,109 +312,19 @@ where
         query_vec: &[T],
         k: usize,
         ef_search: Option<usize>,
-        epsilon: Option<T>,
     ) -> (Vec<usize>, Vec<T>) {
         let k = k.min(self.n);
-        let ef = ef_search.unwrap_or_else(|| (k * 2).clamp(30, 100)).max(k);
-        let _epsilon = epsilon.unwrap_or_else(|| T::from_f32(0.1).unwrap());
+        let ef = ef_search.unwrap_or_else(|| (k * 2).clamp(20, 100)).max(k);
 
-        // 1. Optimize Distance Calculation (Move match out of closure if possible,
-        // or rely on Monomorphization if metric was a generic const)
-        let compute_dist = |idx: usize| -> T {
-            // In a real optimized version, 'metric' should be a Generic Trait,
-            // not a runtime enum, to force inlining.
-            match self.metric {
-                Dist::Euclidean => self.euclidean_distance_to_query(idx, query_vec),
-                Dist::Cosine => {
-                    // pre-calculating query_norm is correct, keep that
-                    let query_norm = T::one(); // simplified for snippet
-                    self.cosine_distance_to_query(idx, query_vec, query_norm)
-                }
-            }
-        };
-
-        // 2. Fix Allocation: Use FixedBitSet.
-        // NOTE: In production, pass this buffer in as an argument to avoid alloc entirely!
-        let mut visited = FixedBitSet::with_capacity(self.n);
-
-        // 3. Fix Data Structure: MinHeap for candidates, MaxHeap for results
-        // Candidates: MinHeap stores (dist, idx) - we want smallest dist first
-        let mut candidates = BinaryHeap::new();
-
-        // Results: MaxHeap stores (dist, idx) - we want to pop the worst element when size > ef
-        let mut results = BinaryHeap::new();
-
-        // --- Initialization ---
-        let init_candidates = (ef + k).min(self.n);
-        let search_k = (self.n / 20).max(init_candidates * 2);
-
-        // We assume forest query is fast enough
-        let (init_indices, _) = self
-            .forest
-            .query(query_vec, init_candidates, Some(search_k));
-
-        for &entry_idx in &init_indices {
-            if entry_idx >= self.n || visited.contains(entry_idx) {
-                continue;
-            }
-
-            visited.insert(entry_idx);
-            let dist = compute_dist(entry_idx);
-
-            // Reverse for MinHeap behavior
-            candidates.push(Reverse((OrderedFloat(dist), entry_idx)));
-            results.push((OrderedFloat(dist), entry_idx));
-
-            if results.len() > ef {
-                results.pop(); // Remove worst
-            }
-        }
-
-        // --- Search Loop ---
-        // Bound is the distance of the furthest element in our current 'ef' results
-        let mut lower_bound = if results.len() == ef {
-            results.peek().unwrap().0
+        // Pre-compute query norm once if using cosine
+        let query_norm = if self.metric == Dist::Cosine {
+            query_vec.iter().map(|x| *x * *x).sum::<T>().sqrt()
         } else {
-            OrderedFloat(T::max_value())
+            T::one()
         };
 
-        while let Some(Reverse((OrderedFloat(curr_dist), curr_idx))) = candidates.pop() {
-            // If the closest candidate is worse than our worst result, we can stop
-            // (Standard HNSW logic)
-            if curr_dist > lower_bound.0 {
-                break;
-            }
-
-            for &(nbr_idx, _) in &self.graph[curr_idx] {
-                if visited.contains(nbr_idx) {
-                    continue;
-                }
-                visited.insert(nbr_idx);
-
-                let dist = compute_dist(nbr_idx);
-
-                if dist < lower_bound.0 || results.len() < ef {
-                    candidates.push(Reverse((OrderedFloat(dist), nbr_idx)));
-                    results.push((OrderedFloat(dist), nbr_idx));
-
-                    if results.len() > ef {
-                        results.pop();
-                        // Update bound to the new worst element
-                        lower_bound = results.peek().unwrap().0;
-                    }
-                }
-            }
-        }
-
-        // --- Formatting Output ---
-        let mut final_results: Vec<_> = results.into_sorted_vec();
-        // into_sorted_vec returns generic sorting (min to max), which is what we want
-        final_results.truncate(k);
-
-        final_results
-            .into_iter()
-            .map(|(OrderedFloat(d), i)| (i, d))
-            .unzip()
+        // Use thread-local storage to avoid allocations
+        self.query_internal(query_vec, query_norm, k, ef)
     }
 
     /// Check if algorithm has
@@ -386,7 +346,9 @@ where
             .into_par_iter()
             .map(|i| {
                 let query = &self.vectors_flat[i * self.dim..(i + 1) * self.dim];
-                let search_k = self.n / 20;
+                // do not spend too much time on annoy...
+                // fast initial querying with okay budget to get some decent starting point
+                let search_k = k * self.forest.n_trees * 2;
                 let (indices, distances) = self.forest.query(query, k + 1, Some(search_k));
 
                 indices
@@ -443,17 +405,30 @@ where
         let start = Instant::now();
         let mut graph = self.init_with_annoy(k);
 
+        if verbose {
+            println!("Queried Annoy index: {:.2?}", start.elapsed());
+        }
+
         for iter in 0..max_iter {
             let updates = AtomicUsize::new(0);
 
             let mut rng = SmallRng::seed_from_u64((seed as u64).wrapping_add(iter as u64));
 
+            if verbose {
+                println!(" Preparing candidates for iter {}", iter + 1);
+            }
             let (new_cands, old_cands) = self.build_candidates(&graph, max_candidates, &mut rng);
 
             self.mark_as_old(&mut graph, &new_cands);
 
+            if verbose {
+                println!(" Generating updates for iter {}", iter + 1);
+            }
             let all_updates = self.generate_updates(&new_cands, &old_cands, &graph);
 
+            if verbose {
+                println!(" Applying updates for iter {}", iter + 1);
+            }
             self.update_neighbours(&all_updates.concat(), &mut graph, &updates);
 
             let update_count = updates.load(Ordering::Relaxed);
@@ -508,148 +483,88 @@ where
         max_candidates: usize,
         rng: &mut SmallRng,
     ) -> (Vec<Vec<usize>>, Vec<Vec<usize>>) {
-        let mut new_priorities: Vec<Vec<f64>> = vec![vec![f64::INFINITY; max_candidates]; self.n];
-        let mut new_indices: Vec<Vec<i32>> = vec![vec![-1; max_candidates]; self.n];
+        // Pre-allocate with capacity to avoid reallocations
+        let mut new_cands: Vec<Vec<usize>> = vec![Vec::with_capacity(max_candidates); self.n];
+        let mut old_cands: Vec<Vec<usize>> = vec![Vec::with_capacity(max_candidates); self.n];
 
-        let mut old_priorities: Vec<Vec<f64>> = vec![vec![f64::INFINITY; max_candidates]; self.n];
-        let mut old_indices: Vec<Vec<i32>> = vec![vec![-1; max_candidates]; self.n];
+        // Temporary storage for sorting (reusable per node)
+        let mut new_temp: Vec<(f64, usize)> = Vec::with_capacity(max_candidates * 2);
+        let mut old_temp: Vec<(f64, usize)> = Vec::with_capacity(max_candidates * 2);
 
         for i in 0..self.n {
+            new_temp.clear();
+            old_temp.clear();
+
+            // Collect candidates from neighbours
             for neighbour in &graph[i] {
                 let j = neighbour.pid();
                 if j >= self.n {
                     continue;
                 }
 
-                // negative for max-heap semantics
-                let priority = -rng.random::<f64>();
+                let priority = rng.random::<f64>();
 
                 if neighbour.is_new() {
-                    // add j to i's new candidates
-                    Self::checked_heap_push(
-                        &mut new_priorities[i],
-                        &mut new_indices[i],
-                        priority,
-                        j as i32,
-                    );
-
-                    // add i to j's new candidates (symmetric)
-                    Self::checked_heap_push(
-                        &mut new_priorities[j],
-                        &mut new_indices[j],
-                        priority,
-                        i as i32,
-                    );
+                    new_temp.push((priority, j));
                 } else {
-                    // add j to i's old candidates
-                    Self::checked_heap_push(
-                        &mut old_priorities[i],
-                        &mut old_indices[i],
-                        priority,
-                        j as i32,
-                    );
+                    old_temp.push((priority, j));
+                }
+            }
 
-                    // add i to j's old candidates (symmetric)
-                    Self::checked_heap_push(
-                        &mut old_priorities[j],
-                        &mut old_indices[j],
-                        priority,
-                        i as i32,
-                    );
+            // Process new candidates: sort, truncate, deduplicate
+            if !new_temp.is_empty() {
+                new_temp.sort_unstable_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+                new_temp.truncate(max_candidates);
+
+                // Deduplicate while building final list
+                let mut last_seen = usize::MAX;
+                for &(_, idx) in &new_temp {
+                    if idx != last_seen {
+                        new_cands[i].push(idx);
+                        last_seen = idx;
+                    }
+                }
+            }
+
+            // Process old candidates: sort, truncate, deduplicate
+            if !old_temp.is_empty() {
+                old_temp.sort_unstable_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+                old_temp.truncate(max_candidates);
+
+                let mut last_seen = usize::MAX;
+                for &(_, idx) in &old_temp {
+                    if idx != last_seen {
+                        old_cands[i].push(idx);
+                        last_seen = idx;
+                    }
                 }
             }
         }
 
-        // convert to final format, filtering out -1 indices
-        let new_cands: Vec<Vec<usize>> = new_indices
-            .into_iter()
-            .map(|indices| {
-                indices
-                    .into_iter()
-                    .filter(|&idx| idx >= 0)
-                    .map(|idx| idx as usize)
-                    .collect()
-            })
-            .collect();
+        // Build symmetric candidate lists
+        let mut new_cands_sym: Vec<Vec<usize>> = vec![Vec::new(); self.n];
+        let mut old_cands_sym: Vec<Vec<usize>> = vec![Vec::new(); self.n];
 
-        let old_cands: Vec<Vec<usize>> = old_indices
-            .into_iter()
-            .map(|indices| {
-                indices
-                    .into_iter()
-                    .filter(|&idx| idx >= 0)
-                    .map(|idx| idx as usize)
-                    .collect()
-            })
-            .collect();
+        for i in 0..self.n {
+            for &j in &new_cands[i] {
+                if j < self.n && !new_cands_sym[j].contains(&i) {
+                    new_cands_sym[j].push(i);
+                }
+            }
+            for &j in &old_cands[i] {
+                if j < self.n && !old_cands_sym[j].contains(&i) {
+                    old_cands_sym[j].push(i);
+                }
+            }
+        }
+
+        // Merge symmetric candidates back
+        for i in 0..self.n {
+            new_cands[i].extend(&new_cands_sym[i]);
+            old_cands[i].extend(&old_cands_sym[i]);
+        }
 
         (new_cands, old_cands)
-    }
-
-    /// Deduplicate the heap and deal with max
-    ///
-    /// Python's checked_heap_push implementation that does linear scan
-    /// deduplication + max-heap maintenance.
-    ///
-    #[inline]
-    fn checked_heap_push(priorities: &mut [f64], indices: &mut [i32], priority: f64, idx: i32) {
-        let size = priorities.len();
-
-        // early exit if priority is worse than worst in heap
-        if priority >= priorities[0] {
-            return;
-        }
-
-        // check for duplicates with linear scan (fast for small heaps)
-        for &existing_idx in indices.iter() {
-            if existing_idx == idx {
-                return;
-            }
-        }
-
-        // insert at root and sift down
-        priorities[0] = priority;
-        indices[0] = idx;
-
-        // sift down to maintain max-heap property
-        let mut i = 0;
-        loop {
-            let left_child = 2 * i + 1;
-            let right_child = left_child + 1;
-
-            if left_child >= size {
-                break;
-            }
-
-            let swap_idx = if right_child >= size {
-                // only left child exists
-                if priorities[left_child] > priority {
-                    left_child
-                } else {
-                    break;
-                }
-            } else {
-                // both children exist
-                if priorities[left_child] >= priorities[right_child] {
-                    if priority < priorities[left_child] {
-                        left_child
-                    } else {
-                        break;
-                    }
-                } else if priority < priorities[right_child] {
-                    right_child
-                } else {
-                    break;
-                }
-            };
-
-            priorities[i] = priorities[swap_idx];
-            indices[i] = indices[swap_idx];
-            i = swap_idx;
-        }
-
-        priorities[i] = priority;
-        indices[i] = idx;
     }
 
     /// Mark neighbours as old (matches Python's flag updating in new_build_candidates)
@@ -659,11 +574,14 @@ where
                 continue;
             }
 
-            let cand_set: std::collections::HashSet<usize> = new_cands[i].iter().copied().collect();
-
+            // For small candidate lists, linear search is faster than HashSet
             for neighbour in &mut graph[i] {
-                if cand_set.contains(&neighbour.pid()) && neighbour.is_new() {
-                    *neighbour = Neighbour::new(neighbour.pid(), neighbour.dist, false);
+                if neighbour.is_new() {
+                    let pid = neighbour.pid();
+                    // Check if this pid is in new_cands[i]
+                    if new_cands[i].contains(&pid) {
+                        *neighbour = Neighbour::new(pid, neighbour.dist, false);
+                    }
                 }
             }
         }
@@ -681,8 +599,6 @@ where
             .map(|i| {
                 let mut updates = Vec::new();
 
-                // Compare new-new pairs
-                // CRITICAL FIX: Start at j, not j+1 to match Python
                 for j in 0..new_cands[i].len() {
                     let p = new_cands[i][j];
                     if p >= self.n {
@@ -690,7 +606,6 @@ where
                     }
 
                     for k in j..new_cands[i].len() {
-                        // ← Changed from j+1
                         let q = new_cands[i][k];
                         if q >= self.n {
                             continue;
@@ -706,7 +621,6 @@ where
                     }
                 }
 
-                // Compare new-old pairs
                 for &p in &new_cands[i] {
                     if p >= self.n {
                         continue;
@@ -1014,6 +928,426 @@ impl UpdateNeighbours<f64> for NNDescent<f64> {
         }
 
         updates_count.fetch_add(total_edge_updates, Ordering::Relaxed);
+    }
+}
+
+impl NNDescentQuery<f32> for NNDescent<f32> {
+    fn query_internal(
+        &self,
+        query_vec: &[f32],
+        query_norm: f32,
+        k: usize,
+        ef: usize,
+    ) -> (Vec<usize>, Vec<f32>) {
+        QUERY_VISITED.with(|visited_cell| {
+            QUERY_CANDIDATES_F32.with(|cand_cell| {
+                QUERY_RESULTS_F32.with(|res_cell| {
+                    let mut visited = visited_cell.borrow_mut();
+                    let mut candidates = cand_cell.borrow_mut();
+                    let mut results = res_cell.borrow_mut();
+
+                    visited.clear();
+                    visited.grow(self.n);
+                    candidates.clear();
+                    results.clear();
+
+                    // CRITICAL: Hoist match outside the loop by splitting into separate paths
+                    let (indices, dists) = match self.metric {
+                        Dist::Euclidean => self.query_euclidean(
+                            query_vec,
+                            k,
+                            ef,
+                            &mut visited,
+                            &mut candidates,
+                            &mut results,
+                        ),
+                        Dist::Cosine => self.query_cosine(
+                            query_vec,
+                            query_norm,
+                            k,
+                            ef,
+                            &mut visited,
+                            &mut candidates,
+                            &mut results,
+                        ),
+                    };
+
+                    (indices, dists)
+                })
+            })
+        })
+    }
+
+    #[inline(always)]
+    fn query_euclidean(
+        &self,
+        query_vec: &[f32],
+        k: usize,
+        ef: usize,
+        visited: &mut FixedBitSet,
+        candidates: &mut BinaryHeap<Reverse<(OrderedFloat<f32>, usize)>>,
+        results: &mut BinaryHeap<(OrderedFloat<f32>, usize)>,
+    ) -> (Vec<usize>, Vec<f32>) {
+        // get entry points
+        let init_candidates = (ef / 2).max(2 * k).min(self.n);
+        let search_k = init_candidates * 3;
+        let (init_indices, _) = self
+            .forest
+            .query(query_vec, init_candidates, Some(search_k));
+
+        // initialize
+        for &entry_idx in &init_indices {
+            if entry_idx >= self.n || visited.contains(entry_idx) {
+                continue;
+            }
+
+            visited.insert(entry_idx);
+            let dist = self.euclidean_distance_to_query(entry_idx, query_vec);
+
+            candidates.push(Reverse((OrderedFloat(dist), entry_idx)));
+            results.push((OrderedFloat(dist), entry_idx));
+        }
+
+        // prune results to ef
+        while results.len() > ef {
+            results.pop();
+        }
+
+        let mut lower_bound = if results.len() >= ef {
+            results.peek().unwrap().0 .0
+        } else {
+            f32::MAX
+        };
+
+        // beam search
+        while let Some(Reverse((OrderedFloat(curr_dist), curr_idx))) = candidates.pop() {
+            if curr_dist > lower_bound {
+                break;
+            }
+
+            for &(nbr_idx, _) in &self.graph[curr_idx] {
+                if visited.contains(nbr_idx) {
+                    continue;
+                }
+                visited.insert(nbr_idx);
+
+                let dist = self.euclidean_distance_to_query(nbr_idx, query_vec);
+
+                // CRITICAL: only add to candidates if it's promising
+                if dist < lower_bound || results.len() < ef {
+                    candidates.push(Reverse((OrderedFloat(dist), nbr_idx)));
+
+                    if results.len() < ef {
+                        results.push((OrderedFloat(dist), nbr_idx));
+                        if results.len() == ef {
+                            lower_bound = results.peek().unwrap().0 .0;
+                        }
+                    } else if dist < lower_bound {
+                        results.pop();
+                        results.push((OrderedFloat(dist), nbr_idx));
+                        lower_bound = results.peek().unwrap().0 .0;
+                    }
+                }
+            }
+        }
+
+        // extract final k results
+        let mut final_results: Vec<_> = results.drain().collect();
+        final_results.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+        final_results.truncate(k);
+
+        final_results
+            .into_iter()
+            .map(|(OrderedFloat(d), i)| (i, d))
+            .unzip()
+    }
+
+    #[inline(always)]
+    fn query_cosine(
+        &self,
+        query_vec: &[f32],
+        query_norm: f32,
+        k: usize,
+        ef: usize,
+        visited: &mut FixedBitSet,
+        candidates: &mut BinaryHeap<Reverse<(OrderedFloat<f32>, usize)>>,
+        results: &mut BinaryHeap<(OrderedFloat<f32>, usize)>,
+    ) -> (Vec<usize>, Vec<f32>) {
+        let init_candidates = (ef / 2).max(k).min(self.n);
+        let search_k = init_candidates * 3;
+        let (init_indices, _) = self
+            .forest
+            .query(query_vec, init_candidates, Some(search_k));
+
+        for &entry_idx in &init_indices {
+            if entry_idx >= self.n || visited.contains(entry_idx) {
+                continue;
+            }
+
+            visited.insert(entry_idx);
+            let dist = self.cosine_distance_to_query(entry_idx, query_vec, query_norm);
+
+            candidates.push(Reverse((OrderedFloat(dist), entry_idx)));
+            results.push((OrderedFloat(dist), entry_idx));
+        }
+
+        while results.len() > ef {
+            results.pop();
+        }
+
+        let mut lower_bound = if results.len() >= ef {
+            results.peek().unwrap().0 .0
+        } else {
+            f32::MAX
+        };
+
+        while let Some(Reverse((OrderedFloat(curr_dist), curr_idx))) = candidates.pop() {
+            if curr_dist > lower_bound {
+                break;
+            }
+
+            for &(nbr_idx, _) in &self.graph[curr_idx] {
+                if visited.contains(nbr_idx) {
+                    continue;
+                }
+                visited.insert(nbr_idx);
+
+                let dist = self.cosine_distance_to_query(nbr_idx, query_vec, query_norm);
+
+                if dist < lower_bound || results.len() < ef {
+                    candidates.push(Reverse((OrderedFloat(dist), nbr_idx)));
+
+                    if results.len() < ef {
+                        results.push((OrderedFloat(dist), nbr_idx));
+                        if results.len() == ef {
+                            lower_bound = results.peek().unwrap().0 .0;
+                        }
+                    } else if dist < lower_bound {
+                        results.pop();
+                        results.push((OrderedFloat(dist), nbr_idx));
+                        lower_bound = results.peek().unwrap().0 .0;
+                    }
+                }
+            }
+        }
+
+        let mut final_results: Vec<_> = results.drain().collect();
+        final_results.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+        final_results.truncate(k);
+
+        final_results
+            .into_iter()
+            .map(|(OrderedFloat(d), i)| (i, d))
+            .unzip()
+    }
+}
+
+impl NNDescentQuery<f64> for NNDescent<f64> {
+    fn query_internal(
+        &self,
+        query_vec: &[f64],
+        query_norm: f64,
+        k: usize,
+        ef: usize,
+    ) -> (Vec<usize>, Vec<f64>) {
+        QUERY_VISITED.with(|visited_cell| {
+            QUERY_CANDIDATES_F64.with(|cand_cell| {
+                QUERY_RESULTS_F64.with(|res_cell| {
+                    let mut visited = visited_cell.borrow_mut();
+                    let mut candidates = cand_cell.borrow_mut();
+                    let mut results = res_cell.borrow_mut();
+
+                    visited.clear();
+                    visited.grow(self.n);
+                    candidates.clear();
+                    results.clear();
+
+                    let (indices, dists) = match self.metric {
+                        Dist::Euclidean => self.query_euclidean(
+                            query_vec,
+                            k,
+                            ef,
+                            &mut visited,
+                            &mut candidates,
+                            &mut results,
+                        ),
+                        Dist::Cosine => self.query_cosine(
+                            query_vec,
+                            query_norm,
+                            k,
+                            ef,
+                            &mut visited,
+                            &mut candidates,
+                            &mut results,
+                        ),
+                    };
+
+                    (indices, dists)
+                })
+            })
+        })
+    }
+
+    #[inline(always)]
+    fn query_euclidean(
+        &self,
+        query_vec: &[f64],
+        k: usize,
+        ef: usize,
+        visited: &mut FixedBitSet,
+        candidates: &mut BinaryHeap<Reverse<(OrderedFloat<f64>, usize)>>,
+        results: &mut BinaryHeap<(OrderedFloat<f64>, usize)>,
+    ) -> (Vec<usize>, Vec<f64>) {
+        let init_candidates = (ef / 2).max(k).min(self.n);
+        let search_k = init_candidates * 3;
+        let (init_indices, _) = self
+            .forest
+            .query(query_vec, init_candidates, Some(search_k));
+
+        // initialize
+        for &entry_idx in &init_indices {
+            if entry_idx >= self.n || visited.contains(entry_idx) {
+                continue;
+            }
+
+            visited.insert(entry_idx);
+            let dist = self.euclidean_distance_to_query(entry_idx, query_vec);
+
+            candidates.push(Reverse((OrderedFloat(dist), entry_idx)));
+            results.push((OrderedFloat(dist), entry_idx));
+        }
+
+        // prune results to ef
+        while results.len() > ef {
+            results.pop();
+        }
+
+        let mut lower_bound = if results.len() >= ef {
+            results.peek().unwrap().0 .0
+        } else {
+            f64::MAX
+        };
+
+        // beam search
+        while let Some(Reverse((OrderedFloat(curr_dist), curr_idx))) = candidates.pop() {
+            if curr_dist > lower_bound {
+                break;
+            }
+
+            for &(nbr_idx, _) in &self.graph[curr_idx] {
+                if visited.contains(nbr_idx) {
+                    continue;
+                }
+                visited.insert(nbr_idx);
+
+                let dist = self.euclidean_distance_to_query(nbr_idx, query_vec);
+
+                // CRTIICAL AGAIN: Only add to candidates if it's promising
+                if dist < lower_bound || results.len() < ef {
+                    candidates.push(Reverse((OrderedFloat(dist), nbr_idx)));
+
+                    if results.len() < ef {
+                        results.push((OrderedFloat(dist), nbr_idx));
+                        if results.len() == ef {
+                            lower_bound = results.peek().unwrap().0 .0;
+                        }
+                    } else if dist < lower_bound {
+                        results.pop();
+                        results.push((OrderedFloat(dist), nbr_idx));
+                        lower_bound = results.peek().unwrap().0 .0;
+                    }
+                }
+            }
+        }
+
+        // extract final k results
+        let mut final_results: Vec<_> = results.drain().collect();
+        final_results.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+        final_results.truncate(k);
+
+        final_results
+            .into_iter()
+            .map(|(OrderedFloat(d), i)| (i, d))
+            .unzip()
+    }
+
+    #[inline(always)]
+    fn query_cosine(
+        &self,
+        query_vec: &[f64],
+        query_norm: f64,
+        k: usize,
+        ef: usize,
+        visited: &mut FixedBitSet,
+        candidates: &mut BinaryHeap<Reverse<(OrderedFloat<f64>, usize)>>,
+        results: &mut BinaryHeap<(OrderedFloat<f64>, usize)>,
+    ) -> (Vec<usize>, Vec<f64>) {
+        let init_candidates = (ef / 2).max(k).min(self.n);
+        let search_k = init_candidates * 3;
+        let (init_indices, _) = self
+            .forest
+            .query(query_vec, init_candidates, Some(search_k));
+
+        for &entry_idx in &init_indices {
+            if entry_idx >= self.n || visited.contains(entry_idx) {
+                continue;
+            }
+
+            visited.insert(entry_idx);
+            let dist = self.cosine_distance_to_query(entry_idx, query_vec, query_norm);
+
+            candidates.push(Reverse((OrderedFloat(dist), entry_idx)));
+            results.push((OrderedFloat(dist), entry_idx));
+        }
+
+        while results.len() > ef {
+            results.pop();
+        }
+
+        let mut lower_bound = if results.len() >= ef {
+            results.peek().unwrap().0 .0
+        } else {
+            f64::MAX
+        };
+
+        while let Some(Reverse((OrderedFloat(curr_dist), curr_idx))) = candidates.pop() {
+            if curr_dist > lower_bound {
+                break;
+            }
+
+            for &(nbr_idx, _) in &self.graph[curr_idx] {
+                if visited.contains(nbr_idx) {
+                    continue;
+                }
+                visited.insert(nbr_idx);
+
+                let dist = self.cosine_distance_to_query(nbr_idx, query_vec, query_norm);
+
+                if dist < lower_bound || results.len() < ef {
+                    candidates.push(Reverse((OrderedFloat(dist), nbr_idx)));
+
+                    if results.len() < ef {
+                        results.push((OrderedFloat(dist), nbr_idx));
+                        if results.len() == ef {
+                            lower_bound = results.peek().unwrap().0 .0;
+                        }
+                    } else if dist < lower_bound {
+                        results.pop();
+                        results.push((OrderedFloat(dist), nbr_idx));
+                        lower_bound = results.peek().unwrap().0 .0;
+                    }
+                }
+            }
+        }
+
+        let mut final_results: Vec<_> = results.drain().collect();
+        final_results.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+        final_results.truncate(k);
+
+        final_results
+            .into_iter()
+            .map(|(OrderedFloat(d), i)| (i, d))
+            .unzip()
     }
 }
 
