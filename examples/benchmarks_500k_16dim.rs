@@ -195,7 +195,7 @@ fn main() {
         println!("Querying NNDescent index (ef_search={})...", ef_search);
         let start = std::time::Instant::now();
         let (approx_neighbors, approx_distances) =
-            query_nndescent_index(query_data, &nndescent_idx, K, ef_search, true, false);
+            query_nndescent_index(query_data, &nndescent_idx, K, None, None, true, false);
         let query_time = start.elapsed().as_secs_f64() * 1000.0;
 
         let recall = calculate_recall::<f32>(&true_neighbors, &approx_neighbors, K);

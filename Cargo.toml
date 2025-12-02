@@ -11,9 +11,16 @@ description = "Various approximate nearest neighbour searches in Rust."
 name = "ann_search_rs"
 path = "src/lib.rs"
 
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+strip = true
+
 [dependencies]
 approx = "0.5.1"
 faer = "0.23.2"
+fixedbitset = "0.5.7"
 num-traits = "0.2.19"
 parking_lot = "0.12.5"
 rand = "0.9.2"

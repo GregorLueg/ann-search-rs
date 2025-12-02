@@ -331,7 +331,8 @@ pub fn query_nndescent_index<T>(
     query_mat: MatRef<T>,
     index: &NNDescent<T>,
     k: usize,
-    ef_search: usize,
+    ef_search: Option<usize>,
+    epsilon: Option<T>,
     return_dist: bool,
     verbose: bool,
 ) -> (Vec<Vec<usize>>, Option<Vec<Vec<T>>>)
@@ -347,7 +348,7 @@ where
             .into_par_iter()
             .map(|i| {
                 let query_vec: Vec<T> = query_mat.row(i).iter().copied().collect();
-                let result = index.query(&query_vec, k, ef_search);
+                let result = index.query(&query_vec, k, ef_search, epsilon);
 
                 if verbose {
                     let count = counter.fetch_add(1, Ordering::Relaxed) + 1;
@@ -370,7 +371,7 @@ where
             .into_par_iter()
             .map(|i| {
                 let query_vec: Vec<T> = query_mat.row(i).iter().copied().collect();
-                let (indices, _) = index.query(&query_vec, k, ef_search);
+                let (indices, _) = index.query(&query_vec, k, ef_search, epsilon);
 
                 if verbose {
                     let count = counter.fetch_add(1, Ordering::Relaxed) + 1;

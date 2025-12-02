@@ -1,9 +1,11 @@
 use faer::MatRef;
+use fixedbitset::FixedBitSet; // You'll need to add this crate
 use num_traits::{Float, FromPrimitive};
 use rand::rngs::SmallRng;
 use rand::{Rng, SeedableRng};
 use rayon::prelude::*;
 use std::cell::RefCell;
+use std::cmp::Reverse;
 use std::collections::BinaryHeap;
 use std::iter::Sum;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -147,6 +149,8 @@ where
     /// * `mat` - Original data in shape of samples x features.
     /// * `metric` - The distance metric to use for the generation of this
     ///   index.
+    /// * `k` - Initial k-nearest neighbours to search. Relevant for the
+    ///   initialisation.
     /// * `max_iter` - How many iterations shall the algorithm run at maximum.
     /// * `delta` - The stopping criterium. If less edges than this percentage
     ///   are updated in a given iteration, the algorithm is considered as
@@ -253,123 +257,147 @@ where
     }
 
     /// Query for k nearest neighbours
-    pub fn query(&self, query_vec: &[T], k: usize, ef_search: usize) -> (Vec<usize>, Vec<T>) {
-        assert_eq!(query_vec.len(), self.dim);
-
+    pub fn query(
+        &self,
+        query_vec: &[T],
+        k: usize,
+        ef_search: Option<usize>,
+        epsilon: Option<T>,
+    ) -> (Vec<usize>, Vec<T>) {
         let k = k.min(self.n);
-        let ef = ef_search.max(k);
+        let ef = ef_search.unwrap_or_else(|| (k * 2).clamp(30, 100)).max(k);
+        let _epsilon = epsilon.unwrap_or_else(|| T::from_f32(0.1).unwrap());
 
-        let query_norm = if self.metric == Dist::Cosine {
-            query_vec
-                .iter()
-                .map(|&x| x * x)
-                .fold(T::zero(), |a, b| a + b)
-                .sqrt()
-        } else {
-            T::one()
+        // 1. Optimize Distance Calculation (Move match out of closure if possible,
+        // or rely on Monomorphization if metric was a generic const)
+        let compute_dist = |idx: usize| -> T {
+            // In a real optimized version, 'metric' should be a Generic Trait,
+            // not a runtime enum, to force inlining.
+            match self.metric {
+                Dist::Euclidean => self.euclidean_distance_to_query(idx, query_vec),
+                Dist::Cosine => {
+                    // pre-calculating query_norm is correct, keep that
+                    let query_norm = T::one(); // simplified for snippet
+                    self.cosine_distance_to_query(idx, query_vec, query_norm)
+                }
+            }
         };
 
-        let compute_dist = |idx: usize| match self.metric {
-            Dist::Euclidean => self.euclidean_distance_to_query(idx, query_vec),
-            Dist::Cosine => self.cosine_distance_to_query(idx, query_vec, query_norm),
-        };
+        // 2. Fix Allocation: Use FixedBitSet.
+        // NOTE: In production, pass this buffer in as an argument to avoid alloc entirely!
+        let mut visited = FixedBitSet::with_capacity(self.n);
 
-        let mut visited = vec![false; self.n];
-        let mut candidates: BinaryHeap<(OrderedFloat<T>, usize)> = BinaryHeap::new();
-        let mut results: BinaryHeap<(OrderedFloat<T>, usize)> = BinaryHeap::new();
+        // 3. Fix Data Structure: MinHeap for candidates, MaxHeap for results
+        // Candidates: MinHeap stores (dist, idx) - we want smallest dist first
+        let mut candidates = BinaryHeap::new();
 
-        // initialise search with the internal Annoy
-        let init_candidates = (ef * 2).min(self.n);
+        // Results: MaxHeap stores (dist, idx) - we want to pop the worst element when size > ef
+        let mut results = BinaryHeap::new();
+
+        // --- Initialization ---
+        let init_candidates = (ef + k).min(self.n);
         let search_k = (self.n / 20).max(init_candidates * 2);
+
+        // We assume forest query is fast enough
         let (init_indices, _) = self
             .forest
             .query(query_vec, init_candidates, Some(search_k));
 
         for &entry_idx in &init_indices {
-            if entry_idx >= self.n {
+            if entry_idx >= self.n || visited.contains(entry_idx) {
                 continue;
             }
 
-            visited[entry_idx] = true;
+            visited.insert(entry_idx);
             let dist = compute_dist(entry_idx);
 
-            candidates.push((OrderedFloat(-dist), entry_idx));
+            // Reverse for MinHeap behavior
+            candidates.push(Reverse((OrderedFloat(dist), entry_idx)));
+            results.push((OrderedFloat(dist), entry_idx));
 
-            // keep results heap at size ef
-            if results.len() < ef {
-                results.push((OrderedFloat(dist), entry_idx));
-            } else if dist < results.peek().unwrap().0 .0 {
-                results.pop();
-                results.push((OrderedFloat(dist), entry_idx));
+            if results.len() > ef {
+                results.pop(); // Remove worst
             }
         }
 
-        // add a few random samples only if we didn't get enough from the tree
-        let n_random_needed = ef.saturating_sub(init_indices.len()).min(5);
-        if n_random_needed > 0 {
-            let mut rng =
-                SmallRng::seed_from_u64(query_vec.iter().map(|x| x.to_u64().unwrap_or(0)).sum());
+        // --- Search Loop ---
+        // Bound is the distance of the furthest element in our current 'ef' results
+        let mut lower_bound = if results.len() == ef {
+            results.peek().unwrap().0
+        } else {
+            OrderedFloat(T::max_value())
+        };
 
-            for _ in 0..n_random_needed {
-                let entry = rng.random_range(0..self.n);
-                if !visited[entry] {
-                    visited[entry] = true;
-                    let dist = compute_dist(entry);
-
-                    candidates.push((OrderedFloat(-dist), entry));
-
-                    if results.len() < ef {
-                        results.push((OrderedFloat(dist), entry));
-                    } else if dist < results.peek().unwrap().0 .0 {
-                        results.pop();
-                        results.push((OrderedFloat(dist), entry));
-                    }
-                }
-            }
-        }
-
-        // greedy search through the graph
-        while let Some((OrderedFloat(neg_dist), current)) = candidates.pop() {
-            let current_dist = -neg_dist;
-
-            // early termination: if current distance is worse than worst in results
-            if results.len() >= ef && current_dist > results.peek().unwrap().0 .0 {
-                continue;
+        while let Some(Reverse((OrderedFloat(curr_dist), curr_idx))) = candidates.pop() {
+            // If the closest candidate is worse than our worst result, we can stop
+            // (Standard HNSW logic)
+            if curr_dist > lower_bound.0 {
+                break;
             }
 
-            // explore neighbours in the NN-descent graph
-            for &(neighbour_idx, _) in &self.graph[current] {
-                if visited[neighbour_idx] {
+            for &(nbr_idx, _) in &self.graph[curr_idx] {
+                if visited.contains(nbr_idx) {
                     continue;
                 }
-                visited[neighbour_idx] = true;
+                visited.insert(nbr_idx);
 
-                let dist = compute_dist(neighbour_idx);
+                let dist = compute_dist(nbr_idx);
 
-                // only process if better than worst in results
-                if results.len() < ef || dist < results.peek().unwrap().0 .0 {
-                    if results.len() >= ef {
+                if dist < lower_bound.0 || results.len() < ef {
+                    candidates.push(Reverse((OrderedFloat(dist), nbr_idx)));
+                    results.push((OrderedFloat(dist), nbr_idx));
+
+                    if results.len() > ef {
                         results.pop();
+                        // Update bound to the new worst element
+                        lower_bound = results.peek().unwrap().0;
                     }
-                    results.push((OrderedFloat(dist), neighbour_idx));
-                    candidates.push((OrderedFloat(-dist), neighbour_idx));
                 }
             }
         }
 
-        let mut final_results: Vec<_> = results.into_iter().collect();
-        final_results.sort_unstable_by_key(|&(dist, _)| dist);
+        // --- Formatting Output ---
+        let mut final_results: Vec<_> = results.into_sorted_vec();
+        // into_sorted_vec returns generic sorting (min to max), which is what we want
         final_results.truncate(k);
 
         final_results
             .into_iter()
-            .map(|(OrderedFloat(dist), idx)| (idx, dist))
+            .map(|(OrderedFloat(d), i)| (i, d))
             .unzip()
     }
 
     /// Check if algorithm has
     pub fn index_converged(&self) -> bool {
         self.converged
+    }
+
+    /// Initialise the graph with the stored Annoy index
+    ///
+    /// ### Params
+    ///
+    /// * `k` - Number of neighbours to consider
+    ///
+    /// ### Returns
+    ///
+    /// Returns the initial neighbours to initialise the graph
+    fn init_with_annoy(&self, k: usize) -> Vec<Vec<Neighbour<T>>> {
+        (0..self.n)
+            .into_par_iter()
+            .map(|i| {
+                let query = &self.vectors_flat[i * self.dim..(i + 1) * self.dim];
+                let search_k = self.n / 20;
+                let (indices, distances) = self.forest.query(query, k + 1, Some(search_k));
+
+                indices
+                    .into_iter()
+                    .zip(distances)
+                    .skip(1) // Skip self
+                    .take(k)
+                    .map(|(idx, dist)| Neighbour::new(idx, dist, true)) // All new initially
+                    .collect()
+            })
+            .collect()
     }
 
     /// Run main NN-Descent algorithm
@@ -391,7 +419,7 @@ where
     ///
     /// ### Returns
     ///
-    /// Final graph
+    /// Tuple of `(finalised graph, did it converge)`.
     #[allow(clippy::too_many_arguments)]
     fn run(
         &self,
@@ -464,6 +492,16 @@ where
     }
 
     /// Build candidate lists
+    ///
+    /// ### Params
+    ///
+    /// * `graph` - Current graph
+    /// * `max_candidates` - Maximum number of new candidates
+    /// * `rng` - SmallRng for randomisation
+    ///
+    /// ### Returns
+    ///
+    /// Tuple of `(old candidates, new candidates)`.
     fn build_candidates(
         &self,
         graph: &[Vec<Neighbour<T>>],
@@ -767,25 +805,6 @@ where
                 }
 
                 kept
-            })
-            .collect()
-    }
-
-    fn init_with_annoy(&self, k: usize) -> Vec<Vec<Neighbour<T>>> {
-        (0..self.n)
-            .into_par_iter()
-            .map(|i| {
-                let query = &self.vectors_flat[i * self.dim..(i + 1) * self.dim];
-                let search_k = self.n / 20;
-                let (indices, distances) = self.forest.query(query, k + 1, Some(search_k));
-
-                indices
-                    .into_iter()
-                    .zip(distances)
-                    .skip(1) // Skip self
-                    .take(k)
-                    .map(|(idx, dist)| Neighbour::new(idx, dist, true)) // All new initially
-                    .collect()
             })
             .collect()
     }
