@@ -11,7 +11,7 @@ use commons::*;
 
 fn main() {
     // test parameters
-    const N_CELLS: usize = 60_000;
+    const N_CELLS: usize = 50_000;
     const DIM: usize = 32;
     const N_CLUSTERS: usize = 20;
     const K: usize = 10;
@@ -152,34 +152,43 @@ fn main() {
     println!("-----------------------------");
 
     for (max_iter, max_cand, diversify_prob, ef_search) in [
-        // Try higher max_candidates for better graph quality
-        // (10, Some(80), 0.0, 100),
-        // (10, Some(100), 0.0, 100),
-        // (15, Some(100), 0.0, 150),
-        // (20, Some(120), 0.0, 200),
-        // // Test with diversification (use lower prob)
-        // (15, Some(100), 0.5, 150),
-        (20, Some(120), 0.5, 200),
-        // // Auto-tune (None = use defaults)
-        (15, None, 0.0, 150),
-        (20, None, 0.0, 200),
+        // default with different diversifications
+        (None, None, 0.0, 100),
+        (None, None, 0.0, 150), // higher ef search
+        (None, None, 0.5, 100),
+        (None, None, 1.0, 100),
+        // manual max_iter
+        (Some(5), None, 0.0, 100),
+        (Some(10), None, 0.0, 100),
+        // Test with diversification (use lower prob)
+        (None, Some(40), 0.0, 100),
+        (None, Some(80), 0.0, 100),
     ] {
+        let iter_str = max_iter
+            .map(|i| i.to_string())
+            .unwrap_or_else(|| "auto".to_string());
+
+        let max_cand_str = max_cand
+            .map(|i| i.to_string())
+            .unwrap_or_else(|| "auto".to_string());
+
         println!(
             "Building NNDescent index (max_iter={}, max_cand={:?}, diversify={})...",
-            max_iter, max_cand, diversify_prob
+            iter_str, max_cand_str, diversify_prob
         );
         let start_total = Instant::now();
         let start = std::time::Instant::now();
         let nndescent_idx = build_nndescent_index(
             data.as_ref(),
-            K,
             "euclidean",
-            max_iter,
             0.001,
-            max_cand, // ← Pass max_candidates
             diversify_prob,
+            None,
+            max_iter,
+            max_cand,
+            None,
             SEED as usize,
-            true,
+            false,
         );
         let build_time = start.elapsed().as_secs_f64() * 1000.0;
 
@@ -197,14 +206,11 @@ fn main() {
         );
         let end_total = start_total.elapsed().as_secs_f64() * 1000.0;
 
-        let cand_str = max_cand
-            .map(|c| c.to_string())
-            .unwrap_or_else(|| "auto".to_string());
         results.push(BenchmarkResult {
             method: format!(
-                "NNDescent-i{}-c{}-d{}-ef{}-conv:{}",
-                max_iter,
-                cand_str,
+                "NNDescent-i{}-c{}-d{}-ef{}",
+                iter_str,
+                max_cand_str,
                 if diversify_prob > 0.5 {
                     1
                 } else if diversify_prob > 0.0 {
@@ -212,8 +218,7 @@ fn main() {
                 } else {
                     0
                 },
-                ef_search,
-                nndescent_idx.index_converged()
+                ef_search
             ),
             build_time_ms: build_time,
             query_time_ms: query_time,

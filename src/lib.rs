@@ -279,12 +279,13 @@ where
 #[allow(clippy::too_many_arguments)]
 pub fn build_nndescent_index<T>(
     mat: MatRef<T>,
-    k: usize,
     dist_metric: &str,
-    max_iter: usize,
     delta: T,
-    max_candidates: Option<usize>, // ← New parameter
     diversify_prob: T,
+    k: Option<usize>,
+    max_iter: Option<usize>,
+    max_candidates: Option<usize>,
+    n_tree: Option<usize>,
     seed: usize,
     verbose: bool,
 ) -> NNDescent<T>
@@ -295,12 +296,12 @@ where
     let metric = parse_ann_dist(dist_metric).unwrap_or(Dist::Cosine);
     NNDescent::new(
         mat,
-        k,
         metric,
-        max_iter,
-        delta,
+        k,
         max_candidates,
-        None, // Auto-determine graph size
+        max_iter,
+        n_tree,
+        delta,
         diversify_prob,
         seed,
         verbose,

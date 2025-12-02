@@ -161,15 +161,15 @@ const MIN_MEMBERS: usize = 64;
 ///
 /// ### Fields
 ///
-/// * `nodes` - Flattened tree structure containing all split and leaf nodes
-/// * `roots` - Starting indices for each tree in the forest
-/// * `split_data` - Hyperplane coefficients and offsets for split nodes
-/// * `leaf_indices` - Actual data indices stored in leaf nodes
 /// * `vectors_flat` - Original vector data, flattened for cache locality
 /// * `dim` - Embedding dimensions
 /// * `n` - Number of vectors
 /// * `norms` - Pre-computed norms for Cosine distance (empty for Euclidean)
 /// * `metric` - Distance metric (Euclidean or Cosine)
+/// * `nodes` - Flattened tree structure containing all split and leaf nodes
+/// * `roots` - Starting indices for each tree in the forest
+/// * `split_data` - Hyperplane coefficients and offsets for split nodes
+/// * `leaf_indices` - Actual data indices stored in leaf nodes
 /// * `n_trees` - Number of trees in the forest
 pub struct AnnoyIndex<T> {
     pub vectors_flat: Vec<T>,
