@@ -11,10 +11,10 @@ use commons::*;
 
 fn main() {
     // test parameters
-    const N_CELLS: usize = 10_000;
-    const DIM: usize = 8;
+    const N_CELLS: usize = 60_000;
+    const DIM: usize = 32;
     const N_CLUSTERS: usize = 20;
-    const K: usize = 15;
+    const K: usize = 10;
     const SEED: u64 = 42;
 
     println!("-----------------------------");
@@ -44,8 +44,6 @@ fn main() {
     let query_time = start.elapsed().as_secs_f64() * 1000.0;
     let end_total = start_total.elapsed().as_secs_f64() * 1000.0;
 
-    println!("-----------------------------");
-
     results.push(BenchmarkResult {
         method: "Exhaustive".to_string(),
         build_time_ms: build_time,
@@ -55,72 +53,140 @@ fn main() {
         mean_distance_error: 0.0,
     });
 
-    // Annoy index
+    // /////////////////
+    // // Annoy index //
+    // /////////////////
 
-    for n_trees in [5, 10, 15, 25, 50, 100] {
-        println!("Building Annoy index ({} trees)...", n_trees);
-        let start_total = Instant::now();
-        let start = std::time::Instant::now();
-        let annoy_idx =
-            build_annoy_index(data.as_ref(), "euclidean".into(), n_trees, SEED as usize);
-        let build_time = start.elapsed().as_secs_f64() * 1000.0;
+    // println!("-----------------------------");
 
-        println!("Querying Annoy index ({} trees)...", n_trees,);
-        let start = std::time::Instant::now();
-        let (approx_neighbors, approx_distances) =
-            query_annoy_index(query_data, &annoy_idx, K, None, true, false);
-        let query_time = start.elapsed().as_secs_f64() * 1000.0;
+    // for n_trees in [5, 10, 15, 25, 50, 100] {
+    //     println!("Building Annoy index ({} trees)...", n_trees);
+    //     let start_total = Instant::now();
+    //     let start = std::time::Instant::now();
+    //     let annoy_idx =
+    //         build_annoy_index(data.as_ref(), "euclidean".into(), n_trees, SEED as usize);
+    //     let build_time = start.elapsed().as_secs_f64() * 1000.0;
 
-        let recall = calculate_recall::<f32>(&true_neighbors, &approx_neighbors, K);
-        let dist_error = calculate_distance_error(
-            true_distances.as_ref().unwrap(),
-            approx_distances.as_ref().unwrap(),
-            K,
-        );
-        let end_total = start_total.elapsed().as_secs_f64() * 1000.0;
+    //     println!("Querying Annoy index ({} trees)...", n_trees,);
+    //     let start = std::time::Instant::now();
+    //     let (approx_neighbors, approx_distances) =
+    //         query_annoy_index(query_data, &annoy_idx, K, None, true, false);
+    //     let query_time = start.elapsed().as_secs_f64() * 1000.0;
 
-        results.push(BenchmarkResult {
-            method: format!("Annoy-nt{}", n_trees),
-            build_time_ms: build_time,
-            query_time_ms: query_time,
-            total_time_ms: end_total,
-            recall_at_k: recall,
-            mean_distance_error: dist_error,
-        });
-    }
+    //     let recall = calculate_recall::<f32>(&true_neighbors, &approx_neighbors, K);
+    //     let dist_error = calculate_distance_error(
+    //         true_distances.as_ref().unwrap(),
+    //         approx_distances.as_ref().unwrap(),
+    //         K,
+    //     );
+    //     let end_total = start_total.elapsed().as_secs_f64() * 1000.0;
+
+    //     results.push(BenchmarkResult {
+    //         method: format!("Annoy-nt{}", n_trees),
+    //         build_time_ms: build_time,
+    //         query_time_ms: query_time,
+    //         total_time_ms: end_total,
+    //         recall_at_k: recall,
+    //         mean_distance_error: dist_error,
+    //     });
+    // }
+
+    // ////////////////
+    // // HNSW index //
+    // ////////////////
+
+    // println!("-----------------------------");
+
+    // for (m, ef_construction, ef_search) in [
+    //     (16, 100, 50),
+    //     (16, 100, 100),
+    //     (16, 200, 100),
+    //     (16, 200, 200),
+    //     (32, 200, 100),
+    //     (32, 200, 200),
+    // ] {
+    //     println!(
+    //         "Building HNSW index (M={}, ef_construction={})...",
+    //         m, ef_construction
+    //     );
+    //     let start_total = Instant::now();
+    //     let start = std::time::Instant::now();
+    //     let hnsw_idx = build_hnsw_index(
+    //         data.as_ref(),
+    //         m,
+    //         ef_construction,
+    //         "euclidean",
+    //         SEED as usize,
+    //         false,
+    //     );
+    //     let build_time = start.elapsed().as_secs_f64() * 1000.0;
+
+    //     println!("Querying HNSW index (ef_search={})...", ef_search);
+    //     let start = std::time::Instant::now();
+    //     let (approx_neighbors, approx_distances) =
+    //         query_hnsw_index(query_data, &hnsw_idx, K, ef_search, true, false);
+    //     let query_time = start.elapsed().as_secs_f64() * 1000.0;
+
+    //     let recall = calculate_recall::<f32>(&true_neighbors, &approx_neighbors, K);
+    //     let dist_error = calculate_distance_error(
+    //         true_distances.as_ref().unwrap(),
+    //         approx_distances.as_ref().unwrap(),
+    //         K,
+    //     );
+    //     let end_total = start_total.elapsed().as_secs_f64() * 1000.0;
+
+    //     results.push(BenchmarkResult {
+    //         method: format!("HNSW-M{}-ef{}-s{}", m, ef_construction, ef_search),
+    //         build_time_ms: build_time,
+    //         query_time_ms: query_time,
+    //         total_time_ms: end_total,
+    //         recall_at_k: recall,
+    //         mean_distance_error: dist_error,
+    //     });
+    // }
+
+    /////////////////////////
+    // (Py)NNDescent index //
+    /////////////////////////
 
     println!("-----------------------------");
 
-    // HNSW
-    // HNSW with different parameter combinations
-    for (m, ef_construction, ef_search) in [
-        (16, 100, 50),
-        (16, 100, 100),
-        (16, 200, 100),
-        (16, 200, 200),
-        (32, 200, 100),
-        (32, 200, 200),
+    for (max_iter, max_cand, diversify_prob, ef_search) in [
+        // Try higher max_candidates for better graph quality
+        // (10, Some(80), 0.0, 100),
+        // (10, Some(100), 0.0, 100),
+        // (15, Some(100), 0.0, 150),
+        // (20, Some(120), 0.0, 200),
+        // // Test with diversification (use lower prob)
+        // (15, Some(100), 0.5, 150),
+        (20, Some(120), 0.5, 200),
+        // // Auto-tune (None = use defaults)
+        (15, None, 0.0, 150),
+        (20, None, 0.0, 200),
     ] {
         println!(
-            "Building HNSW index (M={}, ef_construction={})...",
-            m, ef_construction
+            "Building NNDescent index (max_iter={}, max_cand={:?}, diversify={})...",
+            max_iter, max_cand, diversify_prob
         );
         let start_total = Instant::now();
         let start = std::time::Instant::now();
-        let hnsw_idx = build_hnsw_index(
+        let nndescent_idx = build_nndescent_index(
             data.as_ref(),
-            m,
-            ef_construction,
+            K,
             "euclidean",
+            max_iter,
+            0.001,
+            max_cand, // ← Pass max_candidates
+            diversify_prob,
             SEED as usize,
-            false,
+            true,
         );
         let build_time = start.elapsed().as_secs_f64() * 1000.0;
 
-        println!("Querying HNSW index (ef_search={})...", ef_search);
+        println!("Querying NNDescent index (ef_search={})...", ef_search);
         let start = std::time::Instant::now();
         let (approx_neighbors, approx_distances) =
-            query_hnsw_index(query_data, &hnsw_idx, K, ef_search, true, false);
+            query_nndescent_index(query_data, &nndescent_idx, K, ef_search, true, false);
         let query_time = start.elapsed().as_secs_f64() * 1000.0;
 
         let recall = calculate_recall::<f32>(&true_neighbors, &approx_neighbors, K);
@@ -131,48 +197,26 @@ fn main() {
         );
         let end_total = start_total.elapsed().as_secs_f64() * 1000.0;
 
+        let cand_str = max_cand
+            .map(|c| c.to_string())
+            .unwrap_or_else(|| "auto".to_string());
         results.push(BenchmarkResult {
-            method: format!("HNSW-M{}-ef{}-s{}", m, ef_construction, ef_search),
+            method: format!(
+                "NNDescent-i{}-c{}-d{}-ef{}-conv:{}",
+                max_iter,
+                cand_str,
+                if diversify_prob > 0.5 {
+                    1
+                } else if diversify_prob > 0.0 {
+                    5
+                } else {
+                    0
+                },
+                ef_search,
+                nndescent_idx.index_converged()
+            ),
             build_time_ms: build_time,
             query_time_ms: query_time,
-            total_time_ms: end_total,
-            recall_at_k: recall,
-            mean_distance_error: dist_error,
-        });
-    }
-
-    println!("-----------------------------");
-
-    // NNDescent with different parameters
-    for (max_iter, rho) in [(10, 0.5), (10, 1.0), (25, 0.5), (25, 1.0)] {
-        println!("Running NNDescent (max_iter={}, rho={})...", max_iter, rho);
-        let start_total = Instant::now();
-        let start = std::time::Instant::now();
-        let (approx_neighbors, approx_distances) = generate_knn_nndescent_with_dist(
-            query_data,
-            "euclidean",
-            K,
-            max_iter,
-            0.001,
-            rho,
-            SEED as usize,
-            false,
-            true,
-        );
-        let total_time = start.elapsed().as_secs_f64() * 1000.0;
-
-        let recall = calculate_recall::<f32>(&true_neighbors, &approx_neighbors, K);
-        let dist_error = calculate_distance_error(
-            true_distances.as_ref().unwrap(),
-            approx_distances.as_ref().unwrap(),
-            K,
-        );
-        let end_total = start_total.elapsed().as_secs_f64() * 1000.0;
-
-        results.push(BenchmarkResult {
-            method: format!("NNDescent-i{}-r{}", max_iter, rho),
-            build_time_ms: total_time,
-            query_time_ms: 0.0,
             total_time_ms: end_total,
             recall_at_k: recall,
             mean_distance_error: dist_error,

@@ -12,7 +12,6 @@ pub mod utils;
 use faer::MatRef;
 use num_traits::{Float, FromPrimitive, ToPrimitive};
 use rayon::prelude::*;
-use std::default::Default;
 use std::iter::Sum;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -257,101 +256,137 @@ where
 // NNDescent //
 ///////////////
 
-/// Get the kNN graph based on NN-Descent (with optional distance)
-///
-/// This function generates the kNN graph based via an approximate nearest
-/// neighbour search based on the NN-Descent. The algorithm will use a
-/// neighbours of neighbours logic to identify the approximate nearest
-/// neighbours.
+/// Build an NNDescent index
 ///
 /// ### Params
 ///
-/// * `mat` - Matrix in which rows represent the samples and columns the
-///   respective embeddings for that sample
+/// * `mat` - The data matrix. Rows represent the samples, columns represent
+///   the embedding dimensions.
+/// * `k` - Number of neighbours for the k-NN graph.
 /// * `dist_metric` - The distance metric to use. One of `"euclidean"` or
 ///   `"cosine"`.
-/// * `no_neighbours` - Number of neighbours for the KNN graph.
 /// * `max_iter` - Maximum iterations for the algorithm.
 /// * `delta` - Early stop criterium for the algorithm.
 /// * `rho` - Sampling rate for the old neighbours. Will adaptively decrease
 ///   over time.
-/// * `seed` - Seed for the NN Descent algorithm
+/// * `diversify_prob` - Probability of pruning redundant edges (1.0 = always prune)
+/// * `seed` - Random seed for reproducibility
 /// * `verbose` - Controls verbosity of the algorithm
-/// * `return_distances` - Shall the distances be returned.
+///
+/// ### Return
+///
+/// The `NNDescent` index.
+#[allow(clippy::too_many_arguments)]
+pub fn build_nndescent_index<T>(
+    mat: MatRef<T>,
+    k: usize,
+    dist_metric: &str,
+    max_iter: usize,
+    delta: T,
+    max_candidates: Option<usize>, // ← New parameter
+    diversify_prob: T,
+    seed: usize,
+    verbose: bool,
+) -> NNDescent<T>
+where
+    T: Float + FromPrimitive + Send + Sync + Sum,
+    NNDescent<T>: UpdateNeighbours<T>,
+{
+    let metric = parse_ann_dist(dist_metric).unwrap_or(Dist::Cosine);
+    NNDescent::new(
+        mat,
+        k,
+        metric,
+        max_iter,
+        delta,
+        max_candidates,
+        None, // Auto-determine graph size
+        diversify_prob,
+        seed,
+        verbose,
+    )
+}
+
+/// Helper function to query a given NNDescent index
+///
+/// ### Params
+///
+/// * `query_mat` - The query matrix containing the samples x features
+/// * `index` - Reference to the built NNDescent index
+/// * `k` - Number of neighbours to return
+/// * `return_dist` - Shall the distances between the different points be
+///   returned
+/// * `verbose` - Print progress information
 ///
 /// ### Returns
 ///
-/// The k-nearest neighbours based on the NN Desccent algorithm
+/// A tuple of `(knn_indices, optional distances)`
 ///
-/// ### Implementation details
+/// ### Note
 ///
-/// In case of contrived synthetic data the algorithm sometimes does not
-/// return enough neighbours. If that happens, the neighbours and distances will
-/// be just padded.
-#[allow(clippy::too_many_arguments)]
-pub fn generate_knn_nndescent_with_dist<T>(
-    mat: MatRef<T>,
-    dist_metric: &str,
-    no_neighbours: usize,
-    max_iter: usize,
-    delta: T,
-    rho: T,
-    seed: usize,
+/// The distance metric is determined at index build time and cannot be changed
+/// during querying.
+pub fn query_nndescent_index<T>(
+    query_mat: MatRef<T>,
+    index: &NNDescent<T>,
+    k: usize,
+    ef_search: usize,
+    return_dist: bool,
     verbose: bool,
-    return_distances: bool,
 ) -> (Vec<Vec<usize>>, Option<Vec<Vec<T>>>)
 where
-    T: Float + FromPrimitive + Send + Sync + Default + Sum,
+    T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum,
     NNDescent<T>: UpdateNeighbours<T>,
 {
-    let graph: Vec<Vec<(usize, T)>> = NNDescent::build(
-        mat,
-        no_neighbours,
-        dist_metric,
-        max_iter,
-        delta,
-        rho,
-        None,
-        seed,
-        verbose,
-    );
+    let n_samples = query_mat.nrows();
+    let counter = Arc::new(AtomicUsize::new(0));
 
-    let mut indices = Vec::with_capacity(graph.len());
-    let mut distances = if return_distances {
-        Some(Vec::with_capacity(graph.len()))
-    } else {
-        None
-    };
+    if return_dist {
+        let results: Vec<(Vec<usize>, Vec<T>)> = (0..n_samples)
+            .into_par_iter()
+            .map(|i| {
+                let query_vec: Vec<T> = query_mat.row(i).iter().copied().collect();
+                let result = index.query(&query_vec, k, ef_search);
 
-    for (i, neighbours) in graph.into_iter().enumerate() {
-        let mut ids: Vec<usize> = Vec::with_capacity(no_neighbours);
-        let mut dists: Vec<T> = Vec::with_capacity(no_neighbours);
-
-        for (pid, dist) in neighbours {
-            ids.push(pid);
-            dists.push(dist);
-        }
-
-        if ids.len() < no_neighbours {
-            let padding_needed = no_neighbours - ids.len();
-            if ids.is_empty() {
-                ids.resize(no_neighbours, i);
-                dists.resize(no_neighbours, T::default());
-            } else {
-                for j in 0..padding_needed {
-                    ids.push(ids[j % ids.len()]);
-                    dists.push(dists[j % dists.len()]);
+                if verbose {
+                    let count = counter.fetch_add(1, Ordering::Relaxed) + 1;
+                    if count.is_multiple_of(100_000) {
+                        println!(
+                            "  Processed {} / {} samples",
+                            count.separate_with_underscores(),
+                            n_samples.separate_with_underscores()
+                        );
+                    }
                 }
-            }
-        }
+                result
+            })
+            .collect();
 
-        indices.push(ids);
-        if let Some(ref mut d) = distances {
-            d.push(dists);
-        }
+        let (indices, distances) = results.into_iter().unzip();
+        (indices, Some(distances))
+    } else {
+        let indices: Vec<Vec<usize>> = (0..n_samples)
+            .into_par_iter()
+            .map(|i| {
+                let query_vec: Vec<T> = query_mat.row(i).iter().copied().collect();
+                let (indices, _) = index.query(&query_vec, k, ef_search);
+
+                if verbose {
+                    let count = counter.fetch_add(1, Ordering::Relaxed) + 1;
+                    if count.is_multiple_of(100_000) {
+                        println!(
+                            "  Processed {} / {} samples",
+                            count.separate_with_underscores(),
+                            n_samples.separate_with_underscores()
+                        );
+                    }
+                }
+                indices
+            })
+            .collect();
+
+        (indices, None)
     }
-
-    (indices, distances)
 }
 
 ///////////
