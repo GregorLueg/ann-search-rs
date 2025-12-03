@@ -249,8 +249,8 @@ fn main() {
     ] {
         let max_cand = max_cand_multiplier.map(|m| m * K);
         let max_cand_str = max_cand_multiplier
-            .map(|i| format!("{}*k", i))
-            .unwrap_or_else(|| "auto".to_string());
+            .map(|i| format!(":{}*k", i))
+            .unwrap_or_else(|| ":auto".to_string());
 
         println!(
             "Building LSH index (num_tab={}, bits={}, cand={})...",
