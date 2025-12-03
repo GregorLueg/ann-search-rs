@@ -120,48 +120,6 @@ pub trait VectorDistance<T: Float> {
     }
 }
 
-// Specialised implementations //
-
-#[inline(always)]
-pub fn euclidean_dist_f32(vec_i: &[f32], vec_j: &[f32]) -> f32 {
-    vec_i
-        .iter()
-        .zip(vec_j.iter())
-        .map(|(&a, &b)| (a - b) * (a - b))
-        .sum()
-}
-
-#[inline(always)]
-pub fn euclidean_dist_f64(vec_i: &[f64], vec_j: &[f64]) -> f64 {
-    vec_i
-        .iter()
-        .zip(vec_j.iter())
-        .map(|(&a, &b)| (a - b) * (a - b))
-        .sum()
-}
-
-#[inline(always)]
-pub fn cosine_dist_f32(vec_i: &[f32], vec_j: &[f32], norm_i: f32, norm_j: f32) -> f32 {
-    let dot: f32 = vec_i.iter().zip(vec_j.iter()).map(|(&a, &b)| a * b).sum();
-    1.0 - (dot / (norm_i * norm_j))
-}
-
-#[inline(always)]
-pub fn cosine_dist_f64(vec_i: &[f64], vec_j: &[f64], norm_i: f64, norm_j: f64) -> f64 {
-    let dot: f64 = vec_i.iter().zip(vec_j.iter()).map(|(&a, &b)| a * b).sum();
-    1.0 - (dot / (norm_i * norm_j))
-}
-
-#[inline(always)]
-pub fn norm_f32(vec: &[f32]) -> f32 {
-    vec.iter().map(|&v| v * v).sum::<f32>().sqrt()
-}
-
-#[inline(always)]
-pub fn norm_f64(vec: &[f64]) -> f64 {
-    vec.iter().map(|&v| v * v).sum::<f64>().sqrt()
-}
-
 ///////////
 // Tests //
 ///////////

@@ -5,6 +5,7 @@ pub mod dist;
 pub mod exhaustive;
 pub mod fanng;
 pub mod hnsw;
+pub mod lsh;
 pub mod nndescent;
 pub mod synthetic;
 pub mod utils;
@@ -21,6 +22,7 @@ use crate::annoy::*;
 use crate::exhaustive::*;
 use crate::fanng::*;
 use crate::hnsw::*;
+use crate::lsh::*;
 use crate::nndescent::*;
 use crate::utils::*;
 
@@ -522,7 +524,7 @@ pub fn build_exhaustive_index<T>(mat: MatRef<T>, dist_metric: &str) -> Exhaustiv
 where
     T: Float + FromPrimitive + ToPrimitive + Send + Sync,
 {
-    let metric = parse_ann_dist(dist_metric).unwrap_or(Dist::Cosine);
+    let metric = parse_ann_dist(dist_metric).unwrap_or_default();
     ExhaustiveIndex::new(mat, metric)
 }
 
@@ -590,6 +592,111 @@ where
                 neighbors
             })
             .collect();
+        (indices, None)
+    }
+}
+
+/////////
+// LSH //
+/////////
+
+pub fn build_lsh_index<T>(
+    mat: MatRef<T>,
+    dist_metric: &str,
+    num_tables: usize,
+    bits_per_hash: usize,
+    seed: usize,
+) -> LSHIndex<T>
+where
+    T: Float + FromPrimitive + ToPrimitive + Send + Sync,
+    LSHIndex<T>: LSHQuery<T>,
+{
+    let metric = parse_ann_dist(dist_metric).unwrap_or_default();
+    LSHIndex::new(mat, metric, num_tables, bits_per_hash, seed)
+}
+
+pub fn query_lsh_index<T>(
+    query_mat: MatRef<T>,
+    index: &LSHIndex<T>,
+    k: usize,
+    max_candidates: Option<usize>,
+    return_dist: bool,
+    verbose: bool,
+) -> (Vec<Vec<usize>>, Option<Vec<Vec<T>>>)
+where
+    T: Float + FromPrimitive + ToPrimitive + Send + Sync,
+    LSHIndex<T>: LSHQuery<T>,
+{
+    let n_samples = query_mat.nrows();
+    let counter = Arc::new(AtomicUsize::new(0));
+
+    if return_dist {
+        let results: Vec<(Vec<usize>, Vec<T>, bool)> = (0..n_samples)
+            .into_par_iter()
+            .map(|i| {
+                let result = index.query_row(query_mat.row(i), k, max_candidates);
+                if verbose {
+                    let count = counter.fetch_add(1, Ordering::Relaxed) + 1;
+                    if count.is_multiple_of(100_000) {
+                        println!(
+                            " Processed {} / {} samples.",
+                            count.separate_with_underscores(),
+                            n_samples.separate_with_underscores()
+                        );
+                    }
+                }
+                result
+            })
+            .collect();
+
+        let mut random: usize = 0;
+        let mut indices: Vec<Vec<usize>> = Vec::with_capacity(results.len());
+        let mut distances: Vec<Vec<T>> = Vec::with_capacity(results.len());
+        for (idx, dist, rnd) in results {
+            if rnd {
+                random += 1;
+            };
+            indices.push(idx);
+            distances.push(dist);
+        }
+
+        if (random as f32) / (n_samples as f32) >= 0.01 {
+            println!("More than 1% of samples were not represented in the buckets.");
+            println!("Please verify underlying data");
+        }
+        (indices, Some(distances))
+    } else {
+        let results: Vec<(Vec<usize>, _, bool)> = (0..n_samples)
+            .into_par_iter()
+            .map(|i| {
+                let result = index.query_row(query_mat.row(i), k, max_candidates);
+                if verbose {
+                    let count = counter.fetch_add(1, Ordering::Relaxed) + 1;
+                    if count.is_multiple_of(100_000) {
+                        println!(
+                            " Processed {} / {} samples.",
+                            count.separate_with_underscores(),
+                            n_samples.separate_with_underscores()
+                        );
+                    }
+                }
+                result
+            })
+            .collect();
+
+        let mut random: usize = 0;
+        let mut indices: Vec<Vec<usize>> = Vec::with_capacity(results.len());
+        for (idx, _, rnd) in results {
+            if rnd {
+                random += 1;
+            };
+            indices.push(idx);
+        }
+
+        if (random as f32) / (n_samples as f32) >= 0.01 {
+            println!("More than 1% of samples were not represented in the buckets.");
+            println!("Please verify underlying data");
+        }
         (indices, None)
     }
 }

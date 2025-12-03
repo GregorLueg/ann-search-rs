@@ -1,5 +1,5 @@
 use faer::MatRef;
-use fixedbitset::FixedBitSet; // You'll need to add this crate
+use fixedbitset::FixedBitSet;
 use num_traits::{Float, FromPrimitive};
 use rand::rngs::SmallRng;
 use rand::{Rng, SeedableRng};
@@ -73,6 +73,13 @@ impl<T: Copy> Neighbour<T> {
 
 /// Trait for applying neighbour updates (different implementations for f32/f64)
 pub trait UpdateNeighbours<T> {
+    /// Update neighbour lists with new candidate edges
+    ///
+    /// ### Params
+    ///
+    /// * `updates` - List of (source, target, distance) tuples
+    /// * `graph` - Current k-NN graph to update
+    /// * `updates_count` - Atomic counter for tracking edge updates
     fn update_neighbours(
         &self,
         updates: &[(usize, usize, T)],
@@ -81,7 +88,9 @@ pub trait UpdateNeighbours<T> {
     );
 }
 
+/// Trait for querying the NN-Descent index
 pub trait NNDescentQuery<T> {
+    /// Internal query method that delegates to metric-specific implementations
     fn query_internal(
         &self,
         query_vec: &[T],
@@ -90,6 +99,7 @@ pub trait NNDescentQuery<T> {
         ef: usize,
     ) -> (Vec<usize>, Vec<T>);
 
+    /// Query using Euclidean distance
     fn query_euclidean(
         &self,
         query_vec: &[T],
@@ -100,6 +110,7 @@ pub trait NNDescentQuery<T> {
         results: &mut BinaryHeap<(OrderedFloat<T>, usize)>,
     ) -> (Vec<usize>, Vec<T>);
 
+    /// Query using Cosine distance
     #[allow(clippy::too_many_arguments)]
     fn query_cosine(
         &self,
@@ -143,18 +154,19 @@ thread_local! {
 
 /// NN-Descent index for approximate nearest neighbour search
 ///
+/// Implements the NN-Descent algorithm for efficient k-NN graph construction.
+/// Uses an Annoy index for initialisation and beam search for querying.
+///
 /// ### Fields
 ///
-/// * `vectors_flat` - Original vector data, flattened for cache locality
+/// * `vectors_flat` - Flattened vector data for cache locality
 /// * `dim` - Embedding dimensions
 /// * `n` - Number of vectors
 /// * `norms` - Pre-computed norms for Cosine distance (empty for Euclidean)
 /// * `metric` - Distance metric (Euclidean or Cosine)
-/// * `forest` - The initial Annoy index for initialisation and starting points
-///   of queries.
-/// * `graph` - Finalised graph
-/// * `converged` - Boolean indicating if the index hit the convergence
-///   criterium during build.
+/// * `forest` - Annoy index for initialisation and query entry points
+/// * `graph` - Final k-NN graph
+/// * `converged` - Whether the index converged during construction
 pub struct NNDescent<T> {
     pub vectors_flat: Vec<T>,
     pub dim: usize,
@@ -307,6 +319,16 @@ where
     }
 
     /// Query for k nearest neighbours
+    ///
+    /// ### Params
+    ///
+    /// * `query_vec` - Query vector
+    /// * `k` - Number of neighbours to return
+    /// * `ef_search` - Search beam width (default: clamp(k*2, 20, 100))
+    ///
+    /// ### Returns
+    ///
+    /// Tuple of (indices, distances)
     pub fn query(
         &self,
         query_vec: &[T],
@@ -327,7 +349,11 @@ where
         self.query_internal(query_vec, query_norm, k, ef)
     }
 
-    /// Check if algorithm has
+    /// Check if algorithm converged during construction
+    ///
+    /// ### Returns
+    ///
+    /// True if convergence criterion was met
     pub fn index_converged(&self) -> bool {
         self.converged
     }
@@ -340,7 +366,7 @@ where
     ///
     /// ### Returns
     ///
-    /// Returns the initial neighbours to initialise the graph
+    /// Initial neighbour lists for each node
     fn init_with_annoy(&self, k: usize) -> Vec<Vec<Neighbour<T>>> {
         (0..self.n)
             .into_par_iter()
@@ -364,24 +390,20 @@ where
 
     /// Run main NN-Descent algorithm
     ///
-    /// This implements the low memory version of (Py)NNDescent or a version
-    /// thereof.
+    /// Implements the low-memory version of NN-Descent.
     ///
     /// ### Params
     ///
-    /// * `k` - Number of neighbours for initial graph generation.
-    /// * `max_iter` - How many iterations shall the algorithm run at maximum.
-    /// * `annoy_index` - The Annoy index for initialisation
-    /// * `delta` - The stopping criterium. If less edges than this percentage
-    ///   are updated in a given iteration, the algorithm is considered as
-    ///   converged.
-    /// * `max_candidates` - Maximum number of candidates to explore.
-    /// * `seed` - Seed for reproducibility.
-    /// * `verbose` - Controls verbosity of the function
+    /// * `k` - Number of neighbours for initial graph
+    /// * `max_iter` - Maximum iterations
+    /// * `delta` - Convergence threshold
+    /// * `max_candidates` - Maximum candidates to explore
+    /// * `seed` - Random seed
+    /// * `verbose` - Print progress
     ///
     /// ### Returns
     ///
-    /// Tuple of `(finalised graph, did it converge)`.
+    /// Tuple of (final graph, did converge)
     #[allow(clippy::too_many_arguments)]
     fn run(
         &self,
@@ -466,17 +488,17 @@ where
         (res, converged)
     }
 
-    /// Build candidate lists
+    /// Build candidate lists for local join
     ///
     /// ### Params
     ///
     /// * `graph` - Current graph
-    /// * `max_candidates` - Maximum number of new candidates
-    /// * `rng` - SmallRng for randomisation
+    /// * `max_candidates` - Maximum candidates per node
+    /// * `rng` - Random number generator
     ///
     /// ### Returns
     ///
-    /// Tuple of `(old candidates, new candidates)`.
+    /// Tuple of (new candidates, old candidates)
     fn build_candidates(
         &self,
         graph: &[Vec<Neighbour<T>>],
@@ -567,7 +589,12 @@ where
         (new_cands, old_cands)
     }
 
-    /// Mark neighbours as old (matches Python's flag updating in new_build_candidates)
+    /// Mark neighbours as old
+    ///
+    /// ### Params
+    ///
+    /// * `graph` - Current graph to update
+    /// * `new_cands` - New candidate lists
     fn mark_as_old(&self, graph: &mut [Vec<Neighbour<T>>], new_cands: &[Vec<usize>]) {
         for i in 0..self.n {
             if new_cands[i].is_empty() {
@@ -587,7 +614,17 @@ where
         }
     }
 
-    /// Generate distance updates (matches Python's generate_graph_updates)
+    /// Generate distance updates from candidate pairs
+    ///
+    /// ### Params
+    ///
+    /// * `new_cands` - New candidate lists
+    /// * `old_cands` - Old candidate lists
+    /// * `graph` - Current graph
+    ///
+    /// ### Returns
+    ///
+    /// List of updates per node
     fn generate_updates(
         &self,
         new_cands: &[Vec<usize>],
@@ -642,16 +679,16 @@ where
             .collect()
     }
 
-    /// Distance function between two points
+    /// Calculate distance between two points
     ///
     /// ### Params
     ///
-    /// * `i` - Index of sample i
-    /// * `j` - Index of sample j
+    /// * `i` - First point index
+    /// * `j` - Second point index
     ///
     /// ### Returns
     ///
-    /// Returns the desired distance between the two points
+    /// Distance between points
     #[inline]
     fn distance(&self, i: usize, j: usize) -> T {
         match self.metric {
@@ -660,6 +697,18 @@ where
         }
     }
 
+    /// Check if an edge should be added to the graph
+    ///
+    /// ### Params
+    ///
+    /// * `p` - Source node
+    /// * `q` - Target node
+    /// * `dist` - Distance between nodes
+    /// * `graph` - Current graph
+    ///
+    /// ### Returns
+    ///
+    /// True if edge should be added
     #[inline]
     fn should_add_edge(&self, p: usize, q: usize, dist: T, graph: &[Vec<Neighbour<T>>]) -> bool {
         let p_threshold = if graph[p].is_empty() {
@@ -677,9 +726,20 @@ where
         dist <= p_threshold || dist <= q_threshold
     }
 
-    /// Diversify graph
+    /// Diversify graph by pruning redundant edges
     ///
-    /// This matches Python's diversify function.
+    /// Removes neighbours that are closer to other kept neighbours
+    /// than to the query node, reducing clustering.
+    ///
+    /// ### Params
+    ///
+    /// * `graph` - Current graph
+    /// * `prune_prob` - Probability of pruning redundant neighbours
+    /// * `seed` - Random seed
+    ///
+    /// ### Returns
+    ///
+    /// Diversified graph
     fn diversify_graph(
         &self,
         graph: &[Vec<(usize, T)>],
@@ -724,8 +784,18 @@ where
     }
 }
 
-// Update implementations for f32 and f64 (matches apply_graph_updates_low_memory)
+// Update implementations for f32 and f64
 impl UpdateNeighbours<f32> for NNDescent<f32> {
+    /// Update neighbour lists with new candidate edges
+    ///
+    /// Groups updates by node, then processes each node in parallel using
+    /// thread-local heaps to maintain the k-nearest neighbours efficiently.
+    ///
+    /// ### Params
+    ///
+    /// * `updates` - List of (source, target, distance) tuples
+    /// * `graph` - Current k-NN graph to update
+    /// * `updates_count` - Atomic counter for tracking edge updates
     fn update_neighbours(
         &self,
         updates: &[(usize, usize, f32)],
@@ -829,6 +899,16 @@ impl UpdateNeighbours<f32> for NNDescent<f32> {
 }
 
 impl UpdateNeighbours<f64> for NNDescent<f64> {
+    /// Update neighbour lists with new candidate edges
+    ///
+    /// Groups updates by node, then processes each node in parallel using
+    /// thread-local heaps to maintain the k-nearest neighbours efficiently.
+    ///
+    /// ### Params
+    ///
+    /// * `updates` - List of (source, target, distance) tuples
+    /// * `graph` - Current k-NN graph to update
+    /// * `updates_count` - Atomic counter for tracking edge updates
     fn update_neighbours(
         &self,
         updates: &[(usize, usize, f64)],
@@ -932,6 +1012,21 @@ impl UpdateNeighbours<f64> for NNDescent<f64> {
 }
 
 impl NNDescentQuery<f32> for NNDescent<f32> {
+    /// Internal query dispatch method
+    ///
+    /// Delegates to metric-specific query implementation using thread-local
+    /// storage to avoid allocations.
+    ///
+    /// ### Params
+    ///
+    /// * `query_vec` - Query vector
+    /// * `query_norm` - Pre-computed norm (used for Cosine only)
+    /// * `k` - Number of neighbours to return
+    /// * `ef` - Beam width for search
+    ///
+    /// ### Returns
+    ///
+    /// Tuple of (indices, distances)
     fn query_internal(
         &self,
         query_vec: &[f32],
@@ -978,6 +1073,23 @@ impl NNDescentQuery<f32> for NNDescent<f32> {
         })
     }
 
+    /// Query using Euclidean distance with beam search
+    ///
+    /// Uses the Annoy forest for entry points, then performs beam search
+    /// on the k-NN graph to find approximate nearest neighbours.
+    ///
+    /// ### Params
+    ///
+    /// * `query_vec` - Query vector
+    /// * `k` - Number of neighbours to return
+    /// * `ef` - Beam width for search
+    /// * `visited` - Bitset to track visited nodes
+    /// * `candidates` - Min-heap of candidate nodes to explore
+    /// * `results` - Max-heap of current best results
+    ///
+    /// ### Returns
+    ///
+    /// Tuple of (indices, distances)
     #[inline(always)]
     fn query_euclidean(
         &self,
@@ -1062,6 +1174,24 @@ impl NNDescentQuery<f32> for NNDescent<f32> {
             .unzip()
     }
 
+    /// Query using Cosine distance with beam search
+    ///
+    /// Uses the Annoy forest for entry points, then performs beam search
+    /// on the k-NN graph to find approximate nearest neighbours.
+    ///
+    /// ### Params
+    ///
+    /// * `query_vec` - Query vector
+    /// * `query_norm` - Pre-computed norm of query vector
+    /// * `k` - Number of neighbours to return
+    /// * `ef` - Beam width for search
+    /// * `visited` - Bitset to track visited nodes
+    /// * `candidates` - Min-heap of candidate nodes to explore
+    /// * `results` - Max-heap of current best results
+    ///
+    /// ### Returns
+    ///
+    /// Tuple of (indices, distances)
     #[inline(always)]
     fn query_cosine(
         &self,
@@ -1143,6 +1273,21 @@ impl NNDescentQuery<f32> for NNDescent<f32> {
 }
 
 impl NNDescentQuery<f64> for NNDescent<f64> {
+    /// Internal query dispatch method
+    ///
+    /// Delegates to metric-specific query implementation using thread-local
+    /// storage to avoid allocations.
+    ///
+    /// ### Params
+    ///
+    /// * `query_vec` - Query vector
+    /// * `query_norm` - Pre-computed norm (used for Cosine only)
+    /// * `k` - Number of neighbours to return
+    /// * `ef` - Beam width for search
+    ///
+    /// ### Returns
+    ///
+    /// Tuple of (indices, distances)
     fn query_internal(
         &self,
         query_vec: &[f64],
@@ -1188,6 +1333,23 @@ impl NNDescentQuery<f64> for NNDescent<f64> {
         })
     }
 
+    /// Query using Euclidean distance with beam search
+    ///
+    /// Uses the Annoy forest for entry points, then performs beam search
+    /// on the k-NN graph to find approximate nearest neighbours.
+    ///
+    /// ### Params
+    ///
+    /// * `query_vec` - Query vector
+    /// * `k` - Number of neighbours to return
+    /// * `ef` - Beam width for search
+    /// * `visited` - Bitset to track visited nodes
+    /// * `candidates` - Min-heap of candidate nodes to explore
+    /// * `results` - Max-heap of current best results
+    ///
+    /// ### Returns
+    ///
+    /// Tuple of (indices, distances)
     #[inline(always)]
     fn query_euclidean(
         &self,
@@ -1271,6 +1433,24 @@ impl NNDescentQuery<f64> for NNDescent<f64> {
             .unzip()
     }
 
+    /// Query using Cosine distance with beam search
+    ///
+    /// Uses the Annoy forest for entry points, then performs beam search
+    /// on the k-NN graph to find approximate nearest neighbours.
+    ///
+    /// ### Params
+    ///
+    /// * `query_vec` - Query vector
+    /// * `query_norm` - Pre-computed norm of query vector
+    /// * `k` - Number of neighbours to return
+    /// * `ef` - Beam width for search
+    /// * `visited` - Bitset to track visited nodes
+    /// * `candidates` - Min-heap of candidate nodes to explore
+    /// * `results` - Max-heap of current best results
+    ///
+    /// ### Returns
+    ///
+    /// Tuple of (indices, distances)
     #[inline(always)]
     fn query_cosine(
         &self,
@@ -1355,292 +1535,323 @@ impl NNDescentQuery<f64> for NNDescent<f64> {
 // Tests //
 ///////////
 
-// #[cfg(test)]
-// mod tests {
-//     use super::*;
-//     use faer::Mat;
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use faer::Mat;
 
-//     fn create_simple_matrix() -> Mat<f32> {
-//         let data = [
-//             1.0, 0.0, 0.0, // Point 0
-//             0.0, 1.0, 0.0, // Point 1
-//             0.0, 0.0, 1.0, // Point 2
-//             1.0, 1.0, 0.0, // Point 3
-//             1.0, 0.0, 1.0, // Point 4
-//         ];
-//         Mat::from_fn(5, 3, |i, j| data[i * 3 + j])
-//     }
+    fn create_simple_matrix() -> Mat<f32> {
+        let data = [
+            1.0, 0.0, 0.0, // Point 0
+            0.0, 1.0, 0.0, // Point 1
+            0.0, 0.0, 1.0, // Point 2
+            1.0, 1.0, 0.0, // Point 3
+            1.0, 0.0, 1.0, // Point 4
+        ];
+        Mat::from_fn(5, 3, |i, j| data[i * 3 + j])
+    }
 
-//     #[test]
-//     fn test_nndescent_build_euclidean() {
-//         let mat = create_simple_matrix();
-//         let index = NNDescent::<f32>::new(
-//             mat.as_ref(),
-//             3,
-//             Dist::Euclidean,
-//             10,
-//             0.001,
-//             1.0,
-//             None,
-//             1.0,
-//             42,
-//             false,
-//         );
+    #[test]
+    fn test_nndescent_build_euclidean() {
+        let mat = create_simple_matrix();
+        let index = NNDescent::<f32>::new(
+            mat.as_ref(),
+            Dist::Euclidean,
+            Some(3),
+            None,
+            Some(10),
+            None,
+            0.001,
+            0.0,
+            42,
+            false,
+        );
 
-//         assert_eq!(index.graph.len(), 5);
-//         for neighbours in &index.graph {
-//             assert!(neighbours.len() <= 3);
-//         }
-//     }
+        assert_eq!(index.graph.len(), 5);
+        for neighbours in &index.graph {
+            assert!(neighbours.len() <= 3);
+        }
+    }
 
-//     #[test]
-//     fn test_nndescent_build_cosine() {
-//         let mat = create_simple_matrix();
-//         let index = NNDescent::<f32>::new(
-//             mat.as_ref(),
-//             3,
-//             Dist::Cosine,
-//             10,
-//             0.001,
-//             1.0,
-//             None,
-//             1.0,
-//             42,
-//             false,
-//         );
+    #[test]
+    fn test_nndescent_build_cosine() {
+        let mat = create_simple_matrix();
+        let index = NNDescent::<f32>::new(
+            mat.as_ref(),
+            Dist::Cosine,
+            Some(3),
+            None,
+            Some(10),
+            None,
+            0.001,
+            0.0,
+            42,
+            false,
+        );
 
-//         assert_eq!(index.graph.len(), 5);
-//     }
+        assert_eq!(index.graph.len(), 5);
+        assert!(!index.norms.is_empty());
+    }
 
-//     #[test]
-//     fn test_nndescent_query() {
-//         let mat = create_simple_matrix();
-//         let index = NNDescent::<f32>::new(
-//             mat.as_ref(),
-//             3,
-//             Dist::Euclidean,
-//             10,
-//             0.001,
-//             1.0,
-//             None,
-//             1.0,
-//             42,
-//             false,
-//         );
+    #[test]
+    fn test_nndescent_query() {
+        let mat = create_simple_matrix();
+        let index = NNDescent::<f32>::new(
+            mat.as_ref(),
+            Dist::Euclidean,
+            Some(3),
+            None,
+            Some(10),
+            None,
+            0.001,
+            0.0,
+            42,
+            false,
+        );
 
-//         let query = vec![1.0, 0.0, 0.0];
-//         let (indices, distances) = index.query(&query, 3, 50);
+        let query = vec![1.0, 0.0, 0.0];
+        let (indices, distances) = index.query(&query, 3, Some(50));
 
-//         assert_eq!(indices.len(), 3);
-//         assert_eq!(distances.len(), 3);
-//         assert!(indices.contains(&0));
-//     }
+        assert_eq!(indices.len(), 3);
+        assert_eq!(distances.len(), 3);
+        assert!(indices.contains(&0));
+    }
 
-//     #[test]
-//     fn test_nndescent_convergence() {
-//         let mat = create_simple_matrix();
+    #[test]
+    fn test_nndescent_convergence() {
+        let mat = create_simple_matrix();
 
-//         let index = NNDescent::<f32>::new(
-//             mat.as_ref(),
-//             3,
-//             Dist::Euclidean,
-//             100,
-//             0.5,
-//             1.0,
-//             None,
-//             1.0,
-//             42,
-//             false,
-//         );
+        let index = NNDescent::<f32>::new(
+            mat.as_ref(),
+            Dist::Euclidean,
+            Some(3),
+            None,
+            Some(100),
+            None,
+            0.5,
+            0.0,
+            42,
+            false,
+        );
 
-//         assert_eq!(index.graph.len(), 5);
-//     }
+        assert_eq!(index.graph.len(), 5);
+    }
 
-//     #[test]
-//     fn test_nndescent_reproducibility() {
-//         let mat = create_simple_matrix();
+    #[test]
+    fn test_nndescent_reproducibility() {
+        let mat = create_simple_matrix();
 
-//         let graph1 = NNDescent::<f32>::new(
-//             mat.as_ref(),
-//             3,
-//             Dist::Euclidean,
-//             10,
-//             0.001,
-//             1.0,
-//             None,
-//             1.0,
-//             42,
-//             false,
-//         );
+        let graph1 = NNDescent::<f32>::new(
+            mat.as_ref(),
+            Dist::Euclidean,
+            Some(3),
+            None,
+            Some(10),
+            None,
+            0.001,
+            0.0,
+            42,
+            false,
+        );
 
-//         let graph2 = NNDescent::<f32>::new(
-//             mat.as_ref(),
-//             3,
-//             Dist::Euclidean,
-//             10,
-//             0.001,
-//             1.0,
-//             None,
-//             1.0,
-//             42,
-//             false,
-//         );
+        let graph2 = NNDescent::<f32>::new(
+            mat.as_ref(),
+            Dist::Euclidean,
+            Some(3),
+            None,
+            Some(10),
+            None,
+            0.001,
+            0.0,
+            42,
+            false,
+        );
 
-//         assert_eq!(graph1.graph.len(), graph2.graph.len());
-//     }
+        assert_eq!(graph1.graph.len(), graph2.graph.len());
 
-//     #[test]
-//     fn test_nndescent_k_parameter() {
-//         let mat = create_simple_matrix();
+        // Check that graphs are identical
+        for i in 0..graph1.graph.len() {
+            assert_eq!(graph1.graph[i].len(), graph2.graph[i].len());
+        }
+    }
 
-//         let graph_k2 = NNDescent::<f32>::new(
-//             mat.as_ref(),
-//             2,
-//             Dist::Euclidean,
-//             10,
-//             0.001,
-//             1.0,
-//             None,
-//             1.0,
-//             42,
-//             false,
-//         );
+    #[test]
+    fn test_nndescent_k_parameter() {
+        let mat = create_simple_matrix();
 
-//         let graph_k4 = NNDescent::<f32>::new(
-//             mat.as_ref(),
-//             4,
-//             Dist::Euclidean,
-//             10,
-//             0.001,
-//             1.0,
-//             None,
-//             1.0,
-//             42,
-//             false,
-//         );
+        let graph_k2 = NNDescent::<f32>::new(
+            mat.as_ref(),
+            Dist::Euclidean,
+            Some(2),
+            None,
+            Some(10),
+            None,
+            0.001,
+            0.0,
+            42,
+            false,
+        );
 
-//         for neighbours in &graph_k2.graph {
-//             assert!(neighbours.len() <= 2);
-//         }
+        let graph_k4 = NNDescent::<f32>::new(
+            mat.as_ref(),
+            Dist::Euclidean,
+            Some(4),
+            None,
+            Some(10),
+            None,
+            0.001,
+            0.0,
+            42,
+            false,
+        );
 
-//         for neighbours in &graph_k4.graph {
-//             assert!(neighbours.len() <= 4);
-//         }
-//     }
+        for neighbours in &graph_k2.graph {
+            assert!(neighbours.len() <= 2);
+        }
 
-//     #[test]
-//     fn test_nndescent_larger_dataset() {
-//         let n = 50;
-//         let dim = 10;
-//         let mut data = Vec::with_capacity(n * dim);
+        for neighbours in &graph_k4.graph {
+            assert!(neighbours.len() <= 4);
+        }
+    }
 
-//         for i in 0..n {
-//             for j in 0..dim {
-//                 data.push((i * j) as f32 / 10.0);
-//             }
-//         }
+    #[test]
+    fn test_nndescent_larger_dataset() {
+        let n = 50;
+        let dim = 10;
+        let mut data = Vec::with_capacity(n * dim);
 
-//         let mat = Mat::from_fn(n, dim, |i, j| data[i * dim + j]);
-//         let index = NNDescent::<f32>::new(
-//             mat.as_ref(),
-//             10,
-//             Dist::Euclidean,
-//             15,
-//             0.001,
-//             1.0,
-//             None,
-//             1.0,
-//             42,
-//             false,
-//         );
+        for i in 0..n {
+            for j in 0..dim {
+                data.push((i * j) as f32 / 10.0);
+            }
+        }
 
-//         assert_eq!(index.graph.len(), n);
+        let mat = Mat::from_fn(n, dim, |i, j| data[i * dim + j]);
+        let index = NNDescent::<f32>::new(
+            mat.as_ref(),
+            Dist::Euclidean,
+            Some(10),
+            None,
+            Some(15),
+            None,
+            0.001,
+            0.0,
+            42,
+            false,
+        );
 
-//         for neighbours in &index.graph {
-//             assert!(neighbours.len() <= 10);
-//             assert!(!neighbours.is_empty());
-//         }
-//     }
+        assert_eq!(index.graph.len(), n);
 
-//     #[test]
-//     fn test_nndescent_distance_ordering() {
-//         let mat = create_simple_matrix();
-//         let index = NNDescent::<f32>::new(
-//             mat.as_ref(),
-//             3,
-//             Dist::Euclidean,
-//             10,
-//             0.001,
-//             1.0,
-//             None,
-//             1.0,
-//             42,
-//             false,
-//         );
+        for neighbours in &index.graph {
+            assert!(neighbours.len() <= 10);
+            assert!(!neighbours.is_empty());
+        }
+    }
 
-//         for neighbours in &index.graph {
-//             for i in 1..neighbours.len() {
-//                 assert!(neighbours[i].1 >= neighbours[i - 1].1);
-//             }
-//         }
-//     }
+    #[test]
+    fn test_nndescent_distance_ordering() {
+        let mat = create_simple_matrix();
+        let index = NNDescent::<f32>::new(
+            mat.as_ref(),
+            Dist::Euclidean,
+            Some(3),
+            None,
+            Some(10),
+            None,
+            0.001,
+            0.0,
+            42,
+            false,
+        );
 
-//     #[test]
-//     fn test_nndescent_with_f64() {
-//         let data = [1.0_f64, 0.0, 0.0, 0.0, 1.0, 0.0, 1.0, 1.0, 0.0];
-//         let mat = Mat::from_fn(3, 3, |i, j| data[i * 3 + j]);
+        for neighbours in &index.graph {
+            for i in 1..neighbours.len() {
+                assert!(neighbours[i].1 >= neighbours[i - 1].1);
+            }
+        }
+    }
 
-//         let index = NNDescent::<f64>::new(
-//             mat.as_ref(),
-//             2,
-//             Dist::Euclidean,
-//             10,
-//             0.001,
-//             1.0,
-//             None,
-//             1.0,
-//             42,
-//             false,
-//         );
+    #[test]
+    fn test_nndescent_with_f64() {
+        let data = [1.0_f64, 0.0, 0.0, 0.0, 1.0, 0.0, 1.0, 1.0, 0.0];
+        let mat = Mat::from_fn(3, 3, |i, j| data[i * 3 + j]);
 
-//         assert_eq!(index.graph.len(), 3);
-//     }
+        let index = NNDescent::<f64>::new(
+            mat.as_ref(),
+            Dist::Euclidean,
+            Some(2),
+            None,
+            Some(10),
+            None,
+            0.001,
+            0.0,
+            42,
+            false,
+        );
 
-//     #[test]
-//     fn test_nndescent_quality() {
-//         let n = 20;
-//         let dim = 3;
-//         let mut data = Vec::with_capacity(n * dim);
+        assert_eq!(index.graph.len(), 3);
+    }
 
-//         for i in 0..10 {
-//             let offset = i as f32 * 0.1;
-//             data.extend_from_slice(&[offset, 0.0, 0.0]);
-//         }
-//         for i in 0..10 {
-//             let offset = 10.0 + i as f32 * 0.1;
-//             data.extend_from_slice(&[offset, 0.0, 0.0]);
-//         }
+    #[test]
+    fn test_nndescent_quality() {
+        let n = 20;
+        let dim = 3;
+        let mut data = Vec::with_capacity(n * dim);
 
-//         let mat = Mat::from_fn(n, dim, |i, j| data[i * dim + j]);
-//         let index = NNDescent::<f32>::new(
-//             mat.as_ref(),
-//             5,
-//             Dist::Euclidean,
-//             20,
-//             0.001,
-//             1.0,
-//             None,
-//             1.0,
-//             42,
-//             false,
-//         );
+        // First cluster at x=0
+        for i in 0..10 {
+            let offset = i as f32 * 0.1;
+            data.extend_from_slice(&[offset, 0.0, 0.0]);
+        }
+        // Second cluster at x=10
+        for i in 0..10 {
+            let offset = 10.0 + i as f32 * 0.1;
+            data.extend_from_slice(&[offset, 0.0, 0.0]);
+        }
 
-//         let neighbours_0 = &index.graph[0];
-//         let in_cluster = neighbours_0.iter().filter(|(idx, _)| *idx < 10).count();
-//         assert!(in_cluster >= 3);
+        let mat = Mat::from_fn(n, dim, |i, j| data[i * dim + j]);
+        let index = NNDescent::<f32>::new(
+            mat.as_ref(),
+            Dist::Euclidean,
+            Some(5),
+            None,
+            Some(20),
+            None,
+            0.001,
+            0.0,
+            42,
+            false,
+        );
 
-//         let neighbours_10 = &index.graph[10];
-//         let in_cluster_2 = neighbours_10.iter().filter(|(idx, _)| *idx >= 10).count();
-//         assert!(in_cluster_2 >= 3);
-//     }
-// }
+        // Check that neighbours tend to be in the same cluster
+        let neighbours_0 = &index.graph[0];
+        let in_cluster = neighbours_0.iter().filter(|(idx, _)| *idx < 10).count();
+        assert!(in_cluster >= 3);
+
+        let neighbours_10 = &index.graph[10];
+        let in_cluster_2 = neighbours_10.iter().filter(|(idx, _)| *idx >= 10).count();
+        assert!(in_cluster_2 >= 3);
+    }
+
+    #[test]
+    fn test_nndescent_diversify() {
+        let mat = create_simple_matrix();
+        let index = NNDescent::<f32>::new(
+            mat.as_ref(),
+            Dist::Euclidean,
+            Some(3),
+            None,
+            Some(10),
+            None,
+            0.001,
+            0.5, // Enable diversification
+            42,
+            false,
+        );
+
+        assert_eq!(index.graph.len(), 5);
+        for neighbours in &index.graph {
+            assert!(!neighbours.is_empty());
+        }
+    }
+}

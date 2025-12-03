@@ -223,5 +223,75 @@ fn main() {
         });
     }
 
+    /////////
+    // LSH //
+    /////////
+
+    println!("-----------------------------");
+
+    for (num_tables, bits_per_hash, max_cand_multiplier) in [
+        (20, 8, None),
+        (50, 8, None),
+        (100, 8, None),
+        (100, 8, Some(500)),
+        (20, 10, None),
+        (50, 10, None),
+        (100, 10, None),
+        (100, 10, Some(500)),
+        (20, 12, None),
+        (50, 12, None),
+        (100, 12, None),
+        (100, 12, Some(500)),
+        (20, 16, None),
+        (50, 16, None),
+        (100, 16, None),
+        (100, 12, Some(500)),
+    ] {
+        let max_cand = max_cand_multiplier.map(|m| m * K);
+        let max_cand_str = max_cand_multiplier
+            .map(|i| format!("{}*k", i))
+            .unwrap_or_else(|| "auto".to_string());
+
+        println!(
+            "Building LSH index (num_tab={}, bits={}, cand={})...",
+            num_tables, bits_per_hash, max_cand_str
+        );
+        let start_total = Instant::now();
+        let start = std::time::Instant::now();
+
+        let lsh_index = build_lsh_index(
+            data.as_ref(),
+            "euclidean",
+            num_tables,
+            bits_per_hash,
+            SEED as usize,
+        );
+        let build_time = start.elapsed().as_secs_f64() * 1000.0;
+        println!("Querying LSH index...");
+        let (approx_neighbors, approx_distances) =
+            query_lsh_index(query_data, &lsh_index, K, max_cand, true, false);
+        let query_time = start.elapsed().as_secs_f64() * 1000.0;
+
+        let recall = calculate_recall::<f32>(&true_neighbors, &approx_neighbors, K);
+        let dist_error = calculate_distance_error(
+            true_distances.as_ref().unwrap(),
+            approx_distances.as_ref().unwrap(),
+            K,
+        );
+        let end_total = start_total.elapsed().as_secs_f64() * 1000.0;
+
+        results.push(BenchmarkResult {
+            method: format!(
+                "LSH-nt{}-bits{}-cand{}",
+                num_tables, bits_per_hash, max_cand_str
+            ),
+            build_time_ms: build_time,
+            query_time_ms: query_time,
+            total_time_ms: end_total,
+            recall_at_k: recall,
+            mean_distance_error: dist_error,
+        });
+    }
+
     print_results(&format!("{}k cells, {}D", N_CELLS / 1000, DIM), &results);
 }

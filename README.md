@@ -137,7 +137,8 @@ for example with only few cell types present). The search budget for Annoy was
 set to `k * n_trees * 20` which is the default in this library. You can control 
 this also directly during querying. As one can appreciated, the exhaustive seach 
 in this case actually fast and the overhead introduced by some of the indices do 
-not warrant (yet) the approximate searches.
+not warrant (yet) the approximate searches. LSH being an exception here with
+faster total time and decent enough `Recall@K`. 
 
 ```
 ========================================================================================================================
@@ -145,26 +146,42 @@ Benchmark: 50k cells, 16D
 ========================================================================================================================
 Method                                        Build (ms)      Query (ms)      Total (ms)        Recall@k      Dist Error
 ------------------------------------------------------------------------------------------------------------------------
-Exhaustive                                          0.73         1196.43         1197.17          1.0000        0.000000
-Annoy-nt5                                          14.80           84.43          106.29          0.6910        0.529103
-Annoy-nt10                                         20.25          165.49          192.40          0.8808        0.140608
-Annoy-nt15                                         31.51          256.02          293.95          0.9512        0.047128
-Annoy-nt25                                         47.29          489.69          543.17          0.9903        0.007390
-Annoy-nt50                                         89.31         1101.35         1196.90          0.9997        0.000174
-Annoy-nt100                                       174.65         2609.51         2790.27          1.0000        0.000001
-HNSW-M16-ef100-s50                                748.79          193.54          948.53          0.9987        0.001052
-HNSW-M16-ef100-s100                               749.06          638.18         1393.34          0.9998        0.000128
-HNSW-M16-ef200-s100                              1376.03          637.79         2019.91          1.0000        0.000023
-HNSW-M16-ef200-s200                              1378.82         2086.84         3471.96          1.0000        0.000000
-HNSW-M32-ef200-s100                              2769.95          646.31         3422.37          1.0000        0.000002
-HNSW-M32-ef200-s200                              2773.41         2123.01         4902.48          1.0000        0.000000
-NNDescent-nt12-s:auto-dp0                        1534.15           76.78         1617.13          0.9999        0.000075
-NNDescent-nt24-s:auto-dp0                        1396.74           70.69         1473.69          0.9999        0.000036
-NNDescent-nt:auto-s50-dp0                        1382.57          160.90         1549.85          0.9999        0.000022
-NNDescent-nt:auto-s100-dp0                       1374.75          345.23         1726.29          1.0000        0.000004
-NNDescent-nt:auto-s:auto-dp0                     1390.87           70.41         1467.49          0.9999        0.000043
-NNDescent-nt:auto-s:auto-dp5                     1428.78           63.93         1498.85          0.9935        0.003909
-NNDescent-nt:auto-s:auto-dp1                     1387.62           58.51         1452.46          0.9802        0.013460
+Exhaustive                                          1.08         1384.30         1385.38          1.0000        0.000000
+Annoy-nt5                                          17.04           96.38          121.89          0.6910        0.529103
+Annoy-nt10                                         22.86          188.24          219.02          0.8808        0.140608
+Annoy-nt15                                         35.02          290.72          333.18          0.9512        0.047128
+Annoy-nt25                                         53.14          554.12          614.66          0.9903        0.007390
+Annoy-nt50                                        101.60         1254.64         1363.37          0.9997        0.000174
+Annoy-nt100                                       196.92         2919.86         3123.92          1.0000        0.000001
+HNSW-M16-ef100-s50                                843.82          222.33         1073.30          0.9987        0.000971
+HNSW-M16-ef100-s100                               843.01          716.63         1566.80          0.9998        0.000161
+HNSW-M16-ef200-s100                              1579.17          713.00         2299.37          1.0000        0.000028
+HNSW-M16-ef200-s200                              1535.44         2371.54         3914.20          1.0000        0.000004
+HNSW-M32-ef200-s100                              3088.59          703.10         3798.82          1.0000        0.000000
+HNSW-M32-ef200-s200                              3132.10         2430.59         5570.06          1.0000        0.000000
+NNDescent-nt12-s:auto-dp0                        1834.40           79.46         1921.36          0.9999        0.000075
+NNDescent-nt24-s:auto-dp0                        1556.86           95.08         1659.59          0.9999        0.000036
+NNDescent-nt:auto-s50-dp0                        1579.94          183.88         1771.16          0.9999        0.000022
+NNDescent-nt:auto-s100-dp0                       1546.71          369.79         1923.72          1.0000        0.000004
+NNDescent-nt:auto-s:auto-dp0                     1542.67           79.58         1629.61          0.9999        0.000043
+NNDescent-nt:auto-s:auto-dp5                     1553.46           69.61         1630.31          0.9935        0.003909
+NNDescent-nt:auto-s:auto-dp1                     1577.18           65.98         1650.61          0.9802        0.013460
+LSH-nt20-bits8-candauto                            26.28          396.01          403.90          0.9023        0.114650
+LSH-nt50-bits8-candauto                            53.47         1073.57         1080.83          0.9935        0.004933
+LSH-nt100-bits8-candauto                          109.85         2118.77         2126.04          0.9998        0.000101
+LSH-nt100-bits8-cand500*k                         104.14          699.85          707.43          0.9702        0.027213
+LSH-nt20-bits10-candauto                           33.23          183.84          191.87          0.7511        0.386876
+LSH-nt50-bits10-candauto                           72.11          449.22          456.75          0.9502        0.047295
+LSH-nt100-bits10-candauto                         136.97          894.39          901.62          0.9936        0.004388
+LSH-nt100-bits10-cand500*k                        134.38          839.36          846.59          0.9927        0.005078
+LSH-nt20-bits12-candauto                           44.71          138.02          146.37          0.5737        0.936820
+LSH-nt50-bits12-candauto                          112.53          340.06          348.06          0.8325        0.212174
+LSH-nt100-bits12-candauto                         169.86          626.63          634.03          0.9540        0.040353
+LSH-nt100-bits12-cand500*k                        176.61          635.10          642.59          0.9540        0.040353
+LSH-nt20-bits16-candauto                           55.43          130.17          138.58          0.3030        3.530929
+LSH-nt50-bits16-candauto                          118.12          299.11          307.28          0.5033        1.313877
+LSH-nt100-bits16-candauto                         224.31          589.36          597.41          0.6993        0.502600
+LSH-nt100-bits12-cand500*k                        173.70          642.93          650.38          0.9540        0.040353
 ------------------------------------------------------------------------------------------------------------------------
 ```
 
@@ -248,7 +265,7 @@ with only 25 trees yields a recall of ≥0.95 while being nearly 8 times faster.
 HNSW with m = 16, construction budget of 100 and search budget yields recalls of 
 ≥0.99 while being 6 times faster. The NNDescent index can query 500k cells in
 1.3 seconds which makes with a Recall of ≥0.99 making it perfect for repeat 
-query situations.
+query situations (the fastest of all of them...).
 
 ```
 ========================================================================================================================
@@ -281,28 +298,46 @@ NNDescent-nt:auto-s:auto-dp1                    22749.89         1241.97        
 
 ### 500k samples, 20 distinct clusters, 32 dimensions
 
-```
+With 32 dimensions, the observe (similar to the 150k sample case) a lower Recall
+for most of the approximate methods; however, we observe way faster total times.
 
+```
+========================================================================================================================
+Benchmark: 500k cells, 32D
+========================================================================================================================
+Method                                        Build (ms)      Query (ms)      Total (ms)        Recall@k      Dist Error
+------------------------------------------------------------------------------------------------------------------------
+Exhaustive                                         11.35       265557.34       265568.70          1.0000        0.000000
+Annoy-nt5                                         294.68         3374.96         3751.03          0.2719        4.671276
+Annoy-nt10                                        363.38         6880.77         7323.21          0.4032        2.748679
+Annoy-nt15                                        632.57        11549.71        12260.28          0.5087        1.847431
+Annoy-nt25                                        972.74        24784.11        25834.80          0.6611        0.985923
+Annoy-nt50                                       1811.55        47893.26        49782.18          0.8561        0.298757
+Annoy-nt100                                      3506.50        92872.64        96454.35          0.9678        0.048905
+HNSW-M16-ef100-s50                              15398.46         6665.89        22138.81          0.8519        0.380373
+HNSW-M16-ef100-s100                             15389.71        16653.15        32116.07          0.9134        0.194674
+HNSW-M16-ef200-s100                             28183.15        16521.26        44776.38          0.9586        0.080924
+HNSW-M16-ef200-s200                             28545.96        47679.65        76298.81          0.9830        0.031352
+HNSW-M32-ef200-s100                             74946.94        22880.52        97898.26          0.9952        0.006908
+HNSW-M32-ef200-s200                             75326.57        60464.15       135865.04          0.9990        0.001403
+NNDescent-nt12-s:auto-dp0                       38998.73         2338.85        41420.46          0.9768        0.037383
+NNDescent-nt24-s:auto-dp0                       37500.62         2346.83        39933.30          0.9793        0.032350
+NNDescent-nt:auto-s50-dp0                       38157.88         4934.82        43176.62          0.9844        0.023504
+NNDescent-nt:auto-s100-dp0                      36913.02         9528.57        46524.05          0.9910        0.013109
+NNDescent-nt:auto-s:auto-dp0                    37277.52         2255.89        39616.89          0.9807        0.029912
+NNDescent-nt:auto-s:auto-dp5                    38301.42         2105.58        40488.98          0.9668        0.046885
+NNDescent-nt:auto-s:auto-dp1                    39716.33         2047.37        41847.42          0.9496        0.072063
+------------------------------------------------------------------------------------------------------------------------
 ```
 
 ### 2m samples, 20 distinct clusters, 32 dimensions
 
 This would be a case of a very large single cell data set. In this case, the
 exhaustive search is becoming VERY slow and not recommended anymore. The 
+approximate nearest neighbour searches are truly shining here.
 
 ```
 ```
-
-### Observations
-
-The main focus of this library is to support single cell analysis. `HNSW` shines
-here very clearly and has been established as the new default in
-[bixverse](https://github.com/GregorLueg/bixverse). An interesting special case
-is FANNG. The index generation is by far the longest; however, the query speed
-is absurdly high compared to the other methods (particularly with more samples
-and higher dimensionality). This indicates that this method could be particularly
-interesting in cases where an index is generated ONCE and then it is queried
-repeatedly.
 
 ## Licence
 
