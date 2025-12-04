@@ -600,6 +600,21 @@ where
 // LSH //
 /////////
 
+/// Build the LSH index
+///
+/// ### Params
+///
+/// * `mat` - The initial matrix with samples x features
+/// * `dist_metric` - Distance metric: "euclidean" or "cosine"
+/// * `num_tables` - Number of HashMaps to use (usually something 20 to 100)
+/// * `bits_per_hash` - How many bits per hash. Lower values (8) usually yield
+///   better Recall with higher query time; higher values (16) have worse Recall
+///   but faster query time
+/// * `seed` - Random seed for reproducibility
+///
+/// ### Returns
+///
+/// The ready LSH index for querying
 pub fn build_lsh_index<T>(
     mat: MatRef<T>,
     dist_metric: &str,
@@ -615,6 +630,19 @@ where
     LSHIndex::new(mat, metric, num_tables, bits_per_hash, seed)
 }
 
+/// Query the exhaustive index
+///
+/// ### Params
+///
+/// * `query_mat` - The query matrix containing the samples × features
+/// * `index` - The exhaustive index
+/// * `k` - Number of neighbours to return
+/// * `return_dist` - Shall the distances be returned
+/// * `verbose` - Controls verbosity of the function
+///
+/// ### Returns
+///
+/// A tuple of `(knn_indices, optional distances)`
 pub fn query_lsh_index<T>(
     query_mat: MatRef<T>,
     index: &LSHIndex<T>,

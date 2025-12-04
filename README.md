@@ -29,6 +29,10 @@ Rust of some of these.
   A version with some modifications in terms of starting node generation and
   some parallel operations in the index generation for speed purposes. This
   version is still being actively developed and optimised.
+  - [**LSH**](https://en.wikipedia.org/wiki/Locality-sensitive_hashing) An
+  approximate nearest neighbour search that can be very fast at the cost of
+  precision. Useful for 
+    
 
 - **Distance metrics**:
   - Euclidean
@@ -46,6 +50,13 @@ Add this to your `Cargo.toml`:
 [dependencies]
 ann-search-rs = "*" # always get the latest version
 ```
+
+## Roadmap
+
+Longer term, I am considering GPU-acceleration (yet to be figured out how,
+likely via the [Burn framework](https://burn.dev)). I am also considering some
+further inspiration from the [Faiss library](https://faiss.ai) and combine 
+quantisation methods with IVF vor REALLY large data sets. Let's see.
 
 ## Usage
 
@@ -334,9 +345,40 @@ NNDescent-nt:auto-s:auto-dp1                    39716.33         2047.37        
 
 This would be a case of a very large single cell data set. In this case, the
 exhaustive search is becoming VERY slow and not recommended anymore. The 
-approximate nearest neighbour searches are truly shining here.
+approximate nearest neighbour searches are truly shining here. The exhaustive
+search takes on my system (MBP M1 Max) a total of 70 minutes. Annoy with 100
+trees reaching a Recall of ≥0.9 does the same in 8 minutes, HNSW reaches a 
+Recall of >0.95 in ca. 6 minutes and NNDescent does this in 3 minutes. With
+large data sets we can REALLY appreciate the speed-up that the approximate
+searches give us.
 
 ```
+========================================================================================================================
+Benchmark: 2000k cells, 32D
+========================================================================================================================
+Method                                        Build (ms)      Query (ms)      Total (ms)        Recall@k      Dist Error
+------------------------------------------------------------------------------------------------------------------------
+Exhaustive                                         45.89      4158999.05      4159044.95          1.0000        0.000000
+Annoy-nt5                                        1533.86        20403.79        22390.28          0.2212        5.255618
+Annoy-nt10                                       1933.93        40286.60        42562.58          0.3206        3.332066
+Annoy-nt15                                       3372.47        77916.00        81632.23          0.4055        2.390390
+Annoy-nt25                                       5304.72       113153.03       118802.86          0.5407        1.426791
+Annoy-nt50                                       9479.39       235739.91       245574.94          0.7490        0.548184
+Annoy-nt100                                     19146.26       487235.17       506723.48          0.9148        0.133224
+HNSW-M16-ef100-s50                              77752.30        35525.54       113611.94          0.7630        0.634190
+HNSW-M16-ef100-s100                             73756.03        83870.73       157948.97          0.8404        0.364256
+HNSW-M16-ef200-s100                            139175.60        83579.29       223069.43          0.9143        0.169257
+HNSW-M16-ef200-s200                            137470.11       232114.38       369899.05          0.9564        0.078777
+HNSW-M32-ef200-s100                            345297.17       115940.06       461539.07          0.9866        0.018437
+HNSW-M32-ef200-s200                            345638.27       292548.75       638490.58          0.9962        0.004743
+NNDescent-nt12-s:auto-dp0                      200592.13        13236.17       214247.20          0.9566        0.067381
+NNDescent-nt24-s:auto-dp0                      183900.09        12019.52       196238.08          0.9600        0.060250
+NNDescent-nt:auto-s50-dp0                      192503.23        27131.13       219950.46          0.9680        0.046335
+NNDescent-nt:auto-s100-dp0                     191547.36        49858.73       241722.41          0.9792        0.028783
+NNDescent-nt:auto-s:auto-dp0                   190827.88        12021.72       203159.39          0.9621        0.056092
+NNDescent-nt:auto-s:auto-dp5                   195403.64        10821.67       206531.97          0.9500        0.070181
+NNDescent-nt:auto-s:auto-dp1                   193863.26        10159.06       204331.66          0.9351        0.090622
+------------------------------------------------------------------------------------------------------------------------
 ```
 
 ## Licence
