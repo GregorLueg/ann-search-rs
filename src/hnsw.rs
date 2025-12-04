@@ -748,6 +748,11 @@ where
                 }
 
                 let neighbour_id = neighbour as usize;
+
+                if self.layer_assignments[neighbour_id] < layer {
+                    continue;
+                }
+
                 if state.is_visited(neighbour_id) {
                     continue;
                 }
@@ -1034,6 +1039,11 @@ where
                 }
 
                 let neighbour_id = neighbour as usize;
+
+                if self.layer_assignments[neighbour_id] < layer {
+                    continue;
+                }
+
                 if state.is_visited(neighbour_id) {
                     continue;
                 }
