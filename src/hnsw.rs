@@ -1327,39 +1327,40 @@ mod tests {
         }
     }
 
-    #[test]
-    #[should_panic(expected = "index out of bounds")]
-    fn test_hnsw_query_layer_bug() {
-        // Exact reproduction of R failure case
-        let n = 929;
-        let dim = 15;
-        let m = 16;
-        let ef_construction = 200;
+    // This was needed to reproduce the nasty bug
+    // #[test]
+    // #[should_panic(expected = "index out of bounds")]
+    // fn test_hnsw_query_layer_bug() {
+    //     // Exact reproduction of R failure case
+    //     let n = 929;
+    //     let dim = 15;
+    //     let m = 16;
+    //     let ef_construction = 200;
 
-        // Create data matching PCA output
-        let mut data = Vec::with_capacity(n * dim);
-        for i in 0..n {
-            for j in 0..dim {
-                data.push(((i * 37 + j * 13) as f32).sin() * 0.5);
-            }
-        }
-        let mat = Mat::from_fn(n, dim, |i, j| data[i * dim + j]);
+    //     // Create data matching PCA output
+    //     let mut data = Vec::with_capacity(n * dim);
+    //     for i in 0..n {
+    //         for j in 0..dim {
+    //             data.push(((i * 37 + j * 13) as f32).sin() * 0.5);
+    //         }
+    //     }
+    //     let mat = Mat::from_fn(n, dim, |i, j| data[i * dim + j]);
 
-        // Build with EXACT parameters from failing R call
-        let index = HnswIndex::<f32>::build(
-            mat.as_ref(),
-            m,
-            ef_construction,
-            "cosine", // Default from R
-            42,
-            false,
-        );
+    //     // Build with EXACT parameters from failing R call
+    //     let index = HnswIndex::<f32>::build(
+    //         mat.as_ref(),
+    //         m,
+    //         ef_construction,
+    //         "cosine", // Default from R
+    //         42,
+    //         false,
+    //     );
 
-        // Query ALL nodes with k=16 (k=15 + 1 for self-removal)
-        // This ensures we traverse all parts of the graph
-        for i in 0..n {
-            let query: Vec<f32> = mat.row(i).iter().copied().collect();
-            let _ = index.query(&query, 16, 100);
-        }
-    }
+    //     // Query ALL nodes with k=16 (k=15 + 1 for self-removal)
+    //     // This ensures we traverse all parts of the graph
+    //     for i in 0..n {
+    //         let query: Vec<f32> = mat.row(i).iter().copied().collect();
+    //         let _ = index.query(&query, 16, 100);
+    //     }
+    // }
 }
