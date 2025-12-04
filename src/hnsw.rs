@@ -1029,7 +1029,9 @@ where
                 break;
             }
 
-            let max_neighbours = if layer == 0 { self.m * 2 } else { self.m };
+            // FIX: Use node's assigned layer, not search layer
+            let node_layer = self.layer_assignments[current_id];
+            let max_neighbours = if node_layer == 0 { self.m * 2 } else { self.m };
             let offset = self.neighbour_offsets[current_id];
 
             for i in 0..max_neighbours {
@@ -1040,6 +1042,7 @@ where
 
                 let neighbour_id = neighbour as usize;
 
+                // FIX: Only visit nodes that exist at this layer
                 if self.layer_assignments[neighbour_id] < layer {
                     continue;
                 }
@@ -1259,4 +1262,110 @@ mod tests {
 
         assert!(found_correct >= 4);
     }
+
+    #[test]
+    fn test_hnsw_small_m_layer_bug() {
+        // This test catches a bug where nodes assigned to higher layers have
+        // fewer neighbours stored (m) but layer 0 search incorrectly tries to
+        // read 2*m neighbours, causing an index out of bounds panic.
+        //
+        // The bug occurs when:
+        // 1. Node is assigned to layer > 0, so stores m neighbours
+        // 2. During layer 0 search, code calculates max_neighbours = m * 2
+        // 3. Attempts to read beyond actual storage
+
+        let n = 929; // Exact size that triggered the bug
+        let dim = 15;
+        let m = 16; // Small m that makes the bug more likely
+        let ef_construction = 200;
+
+        // Create dataset similar to PCA embeddings
+        let mut data = Vec::with_capacity(n * dim);
+        for i in 0..n {
+            for j in 0..dim {
+                data.push(((i * dim + j) as f32).sin() * 0.1);
+            }
+        }
+        let mat = Mat::from_fn(n, dim, |i, j| data[i * dim + j]);
+
+        // Build with parameters that triggered the original bug
+        let index = HnswIndex::<f32>::build(mat.as_ref(), m, ef_construction, "cosine", 42, false);
+
+        // Query with ef_search = 100 (also from original failing case)
+        let query: Vec<f32> = (0..dim).map(|i| i as f32 * 0.1).collect();
+        let (indices, distances) = index.query(&query, 15, 100);
+
+        assert_eq!(indices.len(), 15);
+        assert_eq!(distances.len(), 15);
+
+        // Verify results are valid
+        for i in 1..distances.len() {
+            assert!(distances[i] >= distances[i - 1], "Distances not sorted");
+        }
+
+        for &idx in &indices {
+            assert!(idx < n, "Invalid index returned");
+        }
+    }
+
+    #[test]
+    fn test_hnsw_varying_m_values() {
+        // Test multiple small m values to ensure robustness
+        let n = 500;
+        let dim = 10;
+
+        let data: Vec<f32> = (0..n * dim).map(|i| (i as f32) * 0.01).collect();
+        let mat = Mat::from_fn(n, dim, |i, j| data[i * dim + j]);
+
+        for m in [8, 12, 16, 20] {
+            let index = HnswIndex::<f32>::build(mat.as_ref(), m, 200, "euclidean", 42, false);
+
+            let query: Vec<f32> = (0..dim).map(|_| 0.5).collect();
+            let (indices, _) = index.query(&query, 10, 50);
+
+            assert_eq!(indices.len(), 10, "Failed with m = {}", m);
+        }
+    }
+
+    // #[test]
+    // #[should_panic(expected = "index out of bounds")]
+    // fn test_hnsw_layer_crossing_bug() {
+    //     // Create a scenario that FORCES layer 0 search to visit a layer 1+ node
+    //     // We'll create data where:
+    //     // 1. Some nodes will be assigned to layer 1+ (they store only m neighbours)
+    //     // 2. A layer 0 query will traverse through these nodes
+    //     // 3. The code incorrectly tries to read m*2 neighbours from them
+
+    //     let n = 1000; // Large enough to guarantee multi-layer structure
+    //     let dim = 15;
+    //     let m = 16; // Small m to make bug more likely
+
+    //     // Create clustered data so nodes are connected across layers
+    //     let mut data = Vec::with_capacity(n * dim);
+    //     for i in 0..n {
+    //         for j in 0..dim {
+    //             // Create tight clusters that will force cross-layer connections
+    //             let cluster = (i / 100) as f32;
+    //             data.push(cluster + (i as f32) * 0.0001);
+    //         }
+    //     }
+    //     let mat = Mat::from_fn(n, dim, |i, j| data[i * dim + j]);
+
+    //     // Build with seed 42 (same as failing R code)
+    //     let index = HnswIndex::<f32>::build(
+    //         mat.as_ref(),
+    //         m,
+    //         200,
+    //         "cosine", // Same as failing case
+    //         42,
+    //         true,
+    //     );
+
+    //     // Query all points (same as R code does)
+    //     // This ensures we hit the problematic node
+    //     for i in 0..n {
+    //         let query: Vec<f32> = mat.row(i).iter().copied().collect();
+    //         let _ = index.query(&query, 15, 100);
+    //     }
+    // }
 }
