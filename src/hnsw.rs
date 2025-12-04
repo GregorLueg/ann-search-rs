@@ -306,17 +306,17 @@ where
     pub vectors_flat: Vec<T>,
     pub dim: usize,
     pub n: usize,
-    pub metric: Dist,
     pub norms: Vec<T>,
-    pub layer_assignments: Vec<u8>,
-    pub neighbours_flat: Vec<u32>,
-    pub neighbour_offsets: Vec<usize>,
-    pub entry_point: u32,
-    pub max_layer: u8,
-    pub m: usize,
-    pub ef_construction: usize,
-    pub extend_candidates: bool,
-    pub keep_pruned: bool,
+    metric: Dist,
+    layer_assignments: Vec<u8>,
+    neighbours_flat: Vec<u32>,
+    neighbour_offsets: Vec<usize>,
+    entry_point: u32,
+    max_layer: u8,
+    m: usize,
+    ef_construction: usize,
+    extend_candidates: bool,
+    keep_pruned: bool,
 }
 
 /// Implement the needed function for VectorDistance for HnswIndex
@@ -636,24 +636,20 @@ where
             let neighbour_node_id = neighbour as usize;
 
             // compute distance from neighbour_id to this existing connection
-            let dist = unsafe {
-                OrderedFloat(match self.metric {
-                    Dist::Euclidean => self.euclidean_distance(neighbour_id, neighbour_node_id),
-                    Dist::Cosine => self.cosine_distance(neighbour_id, neighbour_node_id),
-                })
-            };
+            let dist = OrderedFloat(match self.metric {
+                Dist::Euclidean => self.euclidean_distance(neighbour_id, neighbour_node_id),
+                Dist::Cosine => self.cosine_distance(neighbour_id, neighbour_node_id),
+            });
 
             candidates.push((dist, neighbour_node_id));
         }
 
         // add the new node as a candidate (if it's not self-connection)
         if new_node != neighbour_id {
-            let dist = unsafe {
-                OrderedFloat(match self.metric {
-                    Dist::Euclidean => self.euclidean_distance(neighbour_id, new_node),
-                    Dist::Cosine => self.cosine_distance(neighbour_id, new_node),
-                })
-            };
+            let dist = OrderedFloat(match self.metric {
+                Dist::Euclidean => self.euclidean_distance(neighbour_id, new_node),
+                Dist::Cosine => self.cosine_distance(neighbour_id, new_node),
+            });
 
             candidates.push((dist, new_node));
         }
@@ -758,12 +754,10 @@ where
 
                 state.mark_visited(neighbour_id);
 
-                let dist = unsafe {
-                    OrderedFloat(match self.metric {
-                        Dist::Euclidean => self.euclidean_distance(query_node, neighbour_id),
-                        Dist::Cosine => self.cosine_distance(query_node, neighbour_id),
-                    })
-                };
+                let dist = OrderedFloat(match self.metric {
+                    Dist::Euclidean => self.euclidean_distance(query_node, neighbour_id),
+                    Dist::Cosine => self.cosine_distance(query_node, neighbour_id),
+                });
 
                 if dist < furthest_dist || state.working.len() < ef {
                     state.candidates.push(Reverse((dist, neighbour_id)));
@@ -859,12 +853,10 @@ where
 
                     state.mark_visited(neighbour_id);
 
-                    let dist = unsafe {
-                        OrderedFloat(match self.metric {
-                            Dist::Euclidean => self.euclidean_distance(node, neighbour_id),
-                            Dist::Cosine => self.cosine_distance(node, neighbour_id),
-                        })
-                    };
+                    let dist = OrderedFloat(match self.metric {
+                        Dist::Euclidean => self.euclidean_distance(node, neighbour_id),
+                        Dist::Cosine => self.cosine_distance(node, neighbour_id),
+                    });
 
                     state.scratch_working.push((dist, neighbour_id));
                 }
@@ -890,12 +882,10 @@ where
 
             let mut closer_to_query = true;
             for &(_, result_id) in &result {
-                let dist_to_result = unsafe {
-                    OrderedFloat(match self.metric {
-                        Dist::Euclidean => self.euclidean_distance(cand_id, result_id),
-                        Dist::Cosine => self.cosine_distance(cand_id, result_id),
-                    })
-                };
+                let dist_to_result = OrderedFloat(match self.metric {
+                    Dist::Euclidean => self.euclidean_distance(cand_id, result_id),
+                    Dist::Cosine => self.cosine_distance(cand_id, result_id),
+                });
 
                 if dist_to_result < cand_dist {
                     closer_to_query = false;
@@ -934,6 +924,7 @@ where
     /// ### Returns
     ///
     /// Tuple of (indices, distances)
+    #[inline]
     pub fn query(&self, query: &[T], k: usize, ef_search: usize) -> (Vec<usize>, Vec<T>) {
         assert_eq!(query.len(), self.dim);
 
@@ -996,6 +987,7 @@ where
     /// ### Returns
     ///
     /// List of (distance, node_id) pairs, sorted by distance
+    #[inline]
     fn search_layer_query(
         &self,
         query: &[T],
@@ -1089,58 +1081,8 @@ where
     #[inline(always)]
     fn compute_query_distance(&self, query: &[T], idx: usize, query_norm: T) -> T {
         match self.metric {
-            Dist::Euclidean => {
-                let ptr_idx = unsafe { self.vectors_flat.as_ptr().add(idx * self.dim) };
-                let ptr_query = query.as_ptr();
-
-                let mut sum = T::zero();
-                let mut k = 0;
-
-                unsafe {
-                    while k + 4 <= self.dim {
-                        let d0 = *ptr_idx.add(k) - *ptr_query.add(k);
-                        let d1 = *ptr_idx.add(k + 1) - *ptr_query.add(k + 1);
-                        let d2 = *ptr_idx.add(k + 2) - *ptr_query.add(k + 2);
-                        let d3 = *ptr_idx.add(k + 3) - *ptr_query.add(k + 3);
-
-                        sum = sum + d0 * d0 + d1 * d1 + d2 * d2 + d3 * d3;
-                        k += 4;
-                    }
-
-                    while k < self.dim {
-                        let diff = *ptr_idx.add(k) - *ptr_query.add(k);
-                        sum = sum + diff * diff;
-                        k += 1;
-                    }
-                }
-
-                sum
-            }
-            Dist::Cosine => {
-                let ptr_idx = unsafe { self.vectors_flat.as_ptr().add(idx * self.dim) };
-                let ptr_query = query.as_ptr();
-
-                let mut dot = T::zero();
-                let mut k = 0;
-
-                unsafe {
-                    while k + 4 <= self.dim {
-                        dot = dot
-                            + *ptr_idx.add(k) * *ptr_query.add(k)
-                            + *ptr_idx.add(k + 1) * *ptr_query.add(k + 1)
-                            + *ptr_idx.add(k + 2) * *ptr_query.add(k + 2)
-                            + *ptr_idx.add(k + 3) * *ptr_query.add(k + 3);
-                        k += 4;
-                    }
-
-                    while k < self.dim {
-                        dot = dot + *ptr_idx.add(k) * *ptr_query.add(k);
-                        k += 1;
-                    }
-
-                    T::one() - (dot / (query_norm * self.norms[idx]))
-                }
-            }
+            Dist::Euclidean => self.euclidean_distance_to_query(idx, query),
+            Dist::Cosine => self.cosine_distance_to_query(idx, query, query_norm),
         }
     }
 }

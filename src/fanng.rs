@@ -112,7 +112,8 @@ impl Default for FanngParams {
     /// Based on Harwood & Drummond (2016):
     ///
     /// - `max_degree`: 30 (optimal for SIFT, section 3.7)
-    /// - `traverse_add_multiplier`: 50 (50N iterations, section 3.6)
+    /// - `traverse_add_multiplier`: 100 (50N iterations, section 3.6, but
+    ///   doublet it).
     /// - `refinement_neighbour_no`: 1000 (section 3.6)
     /// - `refinement_max_calc`: 500 (maintains 2:1 ratio)
     /// - `batch_size`: 100 (efficient parallelism)
@@ -121,7 +122,7 @@ impl Default for FanngParams {
     fn default() -> Self {
         Self {
             max_degree: 30,
-            traverse_add_multiplier: 50,
+            traverse_add_multiplier: 100,
             refinement_neighbour_no: 1000,
             refinement_max_calc: 500,
             batch_size: 100,
@@ -148,12 +149,13 @@ where
 {
     pub vectors_flat: Vec<T>,
     pub dim: usize,
-    pub norms: Vec<T>,
-    pub dist: Dist,
-    pub graph: Vec<Vec<usize>>,
-    pub start_vertex: usize,
-    pub shortcut_pool: Vec<usize>,
-    pub max_degree: usize,
+    pub n: usize,
+    norms: Vec<T>,
+    dist: Dist,
+    graph: Vec<Vec<usize>>,
+    start_vertex: usize,
+    shortcut_pool: Vec<usize>,
+    max_degree: usize,
 }
 
 impl<T: Float> VectorDistance<T> for Fanng<T> {
@@ -266,6 +268,7 @@ where
         let mut fanng = Self {
             vectors_flat,
             dim,
+            n,
             norms,
             dist: metric,
             graph: vec![Vec::new(); n],

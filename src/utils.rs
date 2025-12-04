@@ -5,9 +5,10 @@ use num_traits::Float;
 ///////////////
 
 /// Enum for the approximate nearest neighbour search
-#[derive(Clone, Debug, Copy, PartialEq)]
+#[derive(Clone, Debug, Copy, PartialEq, Default)]
 pub enum Dist {
     /// Euclidean distance
+    #[default]
     Euclidean,
     /// Cosine distance
     Cosine,
@@ -44,20 +45,24 @@ pub fn parse_ann_dist(s: &str) -> Option<Dist> {
 #[derive(Clone, Copy, Debug)]
 pub struct OrderedFloat<T>(pub T);
 
+/// Partial equality trait
 impl<T: Float> PartialEq for OrderedFloat<T> {
     fn eq(&self, other: &Self) -> bool {
         self.0 == other.0
     }
 }
 
+/// Equality trait
 impl<T: Float> Eq for OrderedFloat<T> {}
 
+/// Partial ordering trait
 impl<T: Float> PartialOrd for OrderedFloat<T> {
     fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
         Some(self.cmp(other))
     }
 }
 
+/// Comparing one to the other
 impl<T: Float> Ord for OrderedFloat<T> {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
         self.0
@@ -65,6 +70,16 @@ impl<T: Float> Ord for OrderedFloat<T> {
             .unwrap_or(std::cmp::Ordering::Equal)
     }
 }
+
+////////////////
+// Validation //
+////////////////
+
+// trait KnnValidation<T: Float> {
+//     fn vectors_flat(&self) -> &[T];
+//     fn dim(&self) -> usize;
+//     fn n(&self) -> usize;
+// }
 
 ///////////
 // Tests //
