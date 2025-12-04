@@ -1327,45 +1327,39 @@ mod tests {
         }
     }
 
-    // #[test]
-    // #[should_panic(expected = "index out of bounds")]
-    // fn test_hnsw_layer_crossing_bug() {
-    //     // Create a scenario that FORCES layer 0 search to visit a layer 1+ node
-    //     // We'll create data where:
-    //     // 1. Some nodes will be assigned to layer 1+ (they store only m neighbours)
-    //     // 2. A layer 0 query will traverse through these nodes
-    //     // 3. The code incorrectly tries to read m*2 neighbours from them
+    #[test]
+    #[should_panic(expected = "index out of bounds")]
+    fn test_hnsw_query_layer_bug() {
+        // Exact reproduction of R failure case
+        let n = 929;
+        let dim = 15;
+        let m = 16;
+        let ef_construction = 200;
 
-    //     let n = 1000; // Large enough to guarantee multi-layer structure
-    //     let dim = 15;
-    //     let m = 16; // Small m to make bug more likely
+        // Create data matching PCA output
+        let mut data = Vec::with_capacity(n * dim);
+        for i in 0..n {
+            for j in 0..dim {
+                data.push(((i * 37 + j * 13) as f32).sin() * 0.5);
+            }
+        }
+        let mat = Mat::from_fn(n, dim, |i, j| data[i * dim + j]);
 
-    //     // Create clustered data so nodes are connected across layers
-    //     let mut data = Vec::with_capacity(n * dim);
-    //     for i in 0..n {
-    //         for j in 0..dim {
-    //             // Create tight clusters that will force cross-layer connections
-    //             let cluster = (i / 100) as f32;
-    //             data.push(cluster + (i as f32) * 0.0001);
-    //         }
-    //     }
-    //     let mat = Mat::from_fn(n, dim, |i, j| data[i * dim + j]);
+        // Build with EXACT parameters from failing R call
+        let index = HnswIndex::<f32>::build(
+            mat.as_ref(),
+            m,
+            ef_construction,
+            "cosine", // Default from R
+            42,
+            false,
+        );
 
-    //     // Build with seed 42 (same as failing R code)
-    //     let index = HnswIndex::<f32>::build(
-    //         mat.as_ref(),
-    //         m,
-    //         200,
-    //         "cosine", // Same as failing case
-    //         42,
-    //         true,
-    //     );
-
-    //     // Query all points (same as R code does)
-    //     // This ensures we hit the problematic node
-    //     for i in 0..n {
-    //         let query: Vec<f32> = mat.row(i).iter().copied().collect();
-    //         let _ = index.query(&query, 15, 100);
-    //     }
-    // }
+        // Query ALL nodes with k=16 (k=15 + 1 for self-removal)
+        // This ensures we traverse all parts of the graph
+        for i in 0..n {
+            let query: Vec<f32> = mat.row(i).iter().copied().collect();
+            let _ = index.query(&query, 16, 100);
+        }
+    }
 }
