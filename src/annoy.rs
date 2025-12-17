@@ -349,18 +349,26 @@ where
         k: usize,
         search_k: Option<usize>,
     ) -> (Vec<usize>, Vec<T>) {
-        // if no search budget is provided, it will default to quite a decent
-        // search budget
         let limit = search_k.unwrap_or(k * self.n_trees * 20);
         let mut visited_count = 0;
 
         let n_vectors = self.vectors_flat.len() / self.dim;
         let mut visited = VisitedSet::new(n_vectors);
 
-        let mut candidates = Vec::with_capacity(limit);
+        let query_norm = if self.metric == Dist::Cosine {
+            query_vec
+                .iter()
+                .map(|&x| x * x)
+                .fold(T::zero(), |acc, x| acc + x)
+                .sqrt()
+        } else {
+            T::one()
+        };
+
+        let mut top_k: BinaryHeap<(OrderedFloat<T>, usize)> = BinaryHeap::with_capacity(k + 1);
+        let mut kth_dist = T::infinity();
         let mut pq = BinaryHeap::with_capacity(self.n_trees * 2);
 
-        // 1. Initialise PQ with all roots
         for &root in &self.roots {
             pq.push(BacktrackEntry {
                 margin: f64::MAX,
@@ -368,33 +376,72 @@ where
             });
         }
 
-        // 2. Tree Traversal
         while visited_count < limit {
             let Some(entry) = pq.pop() else { break };
+
+            if top_k.len() == k && -entry.margin > kth_dist.to_f64().unwrap() {
+                break;
+            }
+
             let mut current_idx = entry.node_idx;
 
-            // Inner loop: Greedy descent to leaf
             loop {
                 let node = unsafe { self.nodes.get_unchecked(current_idx as usize) };
 
                 if node.n_descendants == 1 {
-                    // LEAF NODE found
                     let start = node.child_a as usize;
                     let len = node.child_b as usize;
-
                     visited_count += len;
 
                     let leaf_items = unsafe { self.leaf_indices.get_unchecked(start..start + len) };
 
                     for &item in leaf_items {
-                        if !visited.mark(item) {
-                            candidates.push(item);
+                        if visited.mark(item) {
+                            continue;
+                        }
+
+                        let vec_start = item * self.dim;
+                        let vec = unsafe {
+                            self.vectors_flat
+                                .get_unchecked(vec_start..vec_start + self.dim)
+                        };
+
+                        let dist = match self.metric {
+                            Dist::Euclidean => {
+                                let mut dist_sq = T::zero();
+                                for i in 0..self.dim {
+                                    let diff = unsafe {
+                                        *query_vec.get_unchecked(i) - *vec.get_unchecked(i)
+                                    };
+                                    dist_sq = dist_sq + diff * diff;
+                                }
+                                dist_sq.sqrt()
+                            }
+                            Dist::Cosine => {
+                                let mut dot = T::zero();
+                                for i in 0..self.dim {
+                                    dot = dot
+                                        + unsafe {
+                                            *query_vec.get_unchecked(i) * *vec.get_unchecked(i)
+                                        };
+                                }
+                                let norm = unsafe { *self.norms.get_unchecked(item) };
+                                T::one() - dot / (query_norm * norm)
+                            }
+                        };
+
+                        if dist < kth_dist || top_k.len() < k {
+                            top_k.push((OrderedFloat(dist), item));
+                            if top_k.len() > k {
+                                top_k.pop();
+                            }
+                            if top_k.len() == k {
+                                kth_dist = top_k.peek().unwrap().0 .0;
+                            }
                         }
                     }
-                    // Done with this path, go back to PQ
                     break;
                 } else {
-                    // SPLIT NODE
                     let split_offset = node.split_idx as usize * (self.dim + 1);
                     let plane = unsafe {
                         self.split_data
@@ -411,50 +458,23 @@ where
                         (node.child_b, node.child_a)
                     };
 
-                    // push the "far" side to PQ for later
                     pq.push(BacktrackEntry {
                         margin: -margin.abs(),
                         node_idx: farther,
                     });
 
-                    // continue down the "close" side immediately
                     current_idx = closer;
                 }
             }
         }
 
-        // 3. compute dist using VectorDistance trait
-        let mut scored: Vec<(usize, T)> = Vec::with_capacity(candidates.len());
+        let mut results: Vec<(usize, T)> = top_k
+            .into_iter()
+            .map(|(OrderedFloat(dist), idx)| (idx, dist))
+            .collect();
 
-        match self.metric {
-            Dist::Euclidean => {
-                for &idx in &candidates {
-                    let dist = self.euclidean_distance_to_query(idx, query_vec);
-                    scored.push((idx, dist));
-                }
-            }
-            Dist::Cosine => {
-                let query_norm = query_vec
-                    .iter()
-                    .map(|&x| x * x)
-                    .fold(T::zero(), |acc, x| acc + x)
-                    .sqrt();
-
-                for &idx in &candidates {
-                    let dist = self.cosine_distance_to_query(idx, query_vec, query_norm);
-                    scored.push((idx, dist));
-                }
-            }
-        }
-
-        if k < scored.len() {
-            scored
-                .select_nth_unstable_by(k, |a, b| a.1.partial_cmp(&b.1).unwrap_or(Ordering::Equal));
-            scored.truncate(k);
-        }
-        scored.sort_unstable_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(Ordering::Equal));
-
-        scored.into_iter().unzip()
+        results.sort_unstable_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(Ordering::Equal));
+        results.into_iter().unzip()
     }
 
     /// Query using a matrix row reference
