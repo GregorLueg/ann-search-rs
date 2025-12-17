@@ -832,9 +832,21 @@ fn find_target_boundaries<T>(updates: &[(usize, usize, T)]) -> Vec<usize> {
     boundaries
 }
 
-// ============================================================================
-// ApplySortedUpdates implementations for f32 and f64
-// ============================================================================
+///////////////////////////
+// Trait implementations //
+///////////////////////////
+
+////////////////////////
+// ApplySortedUpdates //
+////////////////////////
+
+/////////
+// f32 //
+/////////
+
+type SegmentF32<'a> = Vec<(usize, &'a [(usize, usize, f32)])>;
+
+type SegmentResultsF32 = Vec<(usize, Option<(Vec<Neighbour<f32>>, usize)>)>;
 
 impl ApplySortedUpdates<f32> for NNDescent<f32> {
     /// Apply sorted updates to the graph (f32 version)
@@ -883,7 +895,7 @@ impl ApplySortedUpdates<f32> for NNDescent<f32> {
 
         // CHANGE: Build (target_node, update_slice) pairs
         // Each slice contains all updates for one target node
-        let segments: Vec<(usize, &[(usize, usize, f32)])> = boundaries
+        let segments: SegmentF32 = boundaries
             .windows(2)
             .filter_map(|w| {
                 let start = w[0];
@@ -898,7 +910,7 @@ impl ApplySortedUpdates<f32> for NNDescent<f32> {
 
         // CHANGE: Process segments in parallel
         // Each segment updates a different node, so no synchronisation needed
-        let results: Vec<(usize, Option<(Vec<Neighbour<f32>>, usize)>)> = segments
+        let results: SegmentResultsF32 = segments
             .par_iter()
             .map(|&(target, segment)| {
                 // Use thread-local heap to avoid allocations
@@ -995,6 +1007,14 @@ impl ApplySortedUpdates<f32> for NNDescent<f32> {
     }
 }
 
+/////////
+// f64 //
+/////////
+
+type SegmentF64<'a> = Vec<(usize, &'a [(usize, usize, f64)])>;
+
+type SegmentResultsF64 = Vec<(usize, Option<(Vec<Neighbour<f64>>, usize)>)>;
+
 impl ApplySortedUpdates<f64> for NNDescent<f64> {
     /// Apply sorted updates to the graph (f64 version)
     ///
@@ -1012,7 +1032,7 @@ impl ApplySortedUpdates<f64> for NNDescent<f64> {
 
         let boundaries = find_target_boundaries(updates);
 
-        let segments: Vec<(usize, &[(usize, usize, f64)])> = boundaries
+        let segments: SegmentF64 = boundaries
             .windows(2)
             .filter_map(|w| {
                 let start = w[0];
@@ -1025,7 +1045,7 @@ impl ApplySortedUpdates<f64> for NNDescent<f64> {
             })
             .collect();
 
-        let results: Vec<(usize, Option<(Vec<Neighbour<f64>>, usize)>)> = segments
+        let results: SegmentResultsF64 = segments
             .par_iter()
             .map(|&(target, segment)| {
                 HEAP_F64.with(|heap_cell| {
@@ -1116,9 +1136,13 @@ impl ApplySortedUpdates<f64> for NNDescent<f64> {
     }
 }
 
-/////////////////////////////////
-// Query trait implementations //
-/////////////////////////////////
+////////////////////
+// NNDescentQuery //
+////////////////////
+
+/////////
+// f32 //
+/////////
 
 impl NNDescentQuery<f32> for NNDescent<f32> {
     /// Internal query dispatch method
@@ -1381,6 +1405,10 @@ impl NNDescentQuery<f32> for NNDescent<f32> {
     }
 }
 
+/////////
+// f64 //
+/////////
+
 impl NNDescentQuery<f64> for NNDescent<f64> {
     /// Internal query dispatch method
     ///
@@ -1640,9 +1668,9 @@ impl NNDescentQuery<f64> for NNDescent<f64> {
     }
 }
 
-//////////////////////
-// Validation trait //
-//////////////////////
+///////////////////
+// KnnValidation //
+///////////////////
 
 impl<T> KnnValidation<T> for NNDescent<T>
 where
