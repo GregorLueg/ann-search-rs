@@ -327,22 +327,16 @@ where
     ///
     /// Number of source nodes to process per chunk
     fn compute_chunk_size(&self, max_candidates: usize) -> usize {
-        // Each update tuple: (usize, usize, T) ≈ 24 bytes
-        // We emit both directions, so 2× multiplier
-        // Estimate: each source node generates ~max_candidates updates (conservative)
-        // Target: ~200MB per chunk
         const TARGET_BYTES: usize = 200 * 1024 * 1024;
         const BYTES_PER_UPDATE: usize = 24;
 
-        let updates_per_source = max_candidates * 2; // both directions
+        let updates_per_source = max_candidates * 2;
         let bytes_per_source = updates_per_source * BYTES_PER_UPDATE;
 
         let chunk_size = TARGET_BYTES / bytes_per_source.max(1);
 
-        // Clamp to reasonable bounds
-        // - Minimum 10k to avoid excessive iteration overhead
-        // - Maximum n to handle small datasets
-        chunk_size.clamp(10_000, self.n)
+        let min_chunk = 10_000.min(self.n);
+        chunk_size.clamp(min_chunk, self.n)
     }
 
     /// Initialise the graph with the stored Annoy index
