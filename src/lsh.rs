@@ -570,6 +570,38 @@ impl LSHQuery<f64> for LSHIndex<f64> {
         })
     }
 }
+
+//////////////////////
+// Validation trait //
+//////////////////////
+
+impl<T> KnnValidation<T> for LSHIndex<T>
+where
+    T: Float + FromPrimitive + ToPrimitive + Send + Sync,
+    Self: LSHQuery<T>,
+{
+    /// Internal querying function
+    fn query_for_validation(&self, query_vec: &[T], k: usize) -> (Vec<usize>, Vec<T>) {
+        // No maximum candidates here...
+        let (indices, dist, _) = self.query(query_vec, k, None);
+        (indices, dist)
+    }
+
+    /// Returns n
+    fn n(&self) -> usize {
+        self.n
+    }
+
+    /// Returns the distance metric
+    fn metric(&self) -> Dist {
+        self.metric
+    }
+}
+
+///////////
+// Tests //
+///////////
+
 #[cfg(test)]
 mod tests {
     use super::*;

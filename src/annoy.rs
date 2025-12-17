@@ -8,7 +8,7 @@ use std::collections::BinaryHeap;
 use std::iter::Sum;
 
 use crate::dist::VectorDistance;
-use crate::utils::Dist;
+use crate::utils::*;
 
 /////////////
 // Helpers //
@@ -636,6 +636,31 @@ where
             .map(|(&a, &b)| a * b)
             .fold(T::zero(), |acc, x| acc + x)
             - v2[dim]
+    }
+}
+
+//////////////////////
+// Validation trait //
+//////////////////////
+
+impl<T> KnnValidation<T> for AnnoyIndex<T>
+where
+    T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum,
+{
+    /// Internal querying function
+    fn query_for_validation(&self, query_vec: &[T], k: usize) -> (Vec<usize>, Vec<T>) {
+        // Use the default here
+        self.query(query_vec, k, None)
+    }
+
+    /// Returns n
+    fn n(&self) -> usize {
+        self.n
+    }
+
+    /// Returns the distance metric
+    fn metric(&self) -> Dist {
+        self.metric
     }
 }
 

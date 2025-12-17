@@ -1,6 +1,6 @@
 use faer::MatRef;
 use fixedbitset::FixedBitSet;
-use num_traits::{Float, FromPrimitive};
+use num_traits::{Float, FromPrimitive, ToPrimitive};
 use rand::rngs::SmallRng;
 use rand::{Rng, SeedableRng};
 use rayon::prelude::*;
@@ -297,7 +297,7 @@ where
             forest: annoy_index,
         };
 
-        let build_graph = builder.run(k, max_iter, delta, max_candidates, seed, verbose);
+        let build_graph = builder.generate_index(k, max_iter, delta, max_candidates, seed, verbose);
 
         // Diversify if requested
         let graph = if diversify_prob > T::zero() {
@@ -405,7 +405,7 @@ where
     ///
     /// Tuple of (final graph, did converge)
     #[allow(clippy::too_many_arguments)]
-    fn run(
+    fn generate_index(
         &self,
         k: usize,
         max_iter: usize,
@@ -451,7 +451,7 @@ where
             if verbose {
                 println!(" Applying updates for iter {}", iter + 1);
             }
-            self.update_neighbours(&all_updates.concat(), &mut graph, &updates);
+            self.update_neighbours(&all_updates, &mut graph, &updates);
 
             let update_count = updates.load(Ordering::Relaxed);
 
@@ -630,12 +630,15 @@ where
         new_cands: &[Vec<usize>],
         old_cands: &[Vec<usize>],
         graph: &[Vec<Neighbour<T>>],
-    ) -> Vec<Vec<(usize, usize, T)>> {
+    ) -> Vec<(usize, usize, T)> {
         (0..self.n)
             .into_par_iter()
-            .map(|i| {
+            .flat_map(|i| {
+                // UNCHANGED: Same logic as before, just returns Vec directly
+                // instead of being collected into Vec<Vec<>>
                 let mut updates = Vec::new();
 
+                // Check new-new pairs
                 for j in 0..new_cands[i].len() {
                     let p = new_cands[i][j];
                     if p >= self.n {
@@ -658,6 +661,7 @@ where
                     }
                 }
 
+                // Check new-old pairs
                 for &p in &new_cands[i] {
                     if p >= self.n {
                         continue;
@@ -802,7 +806,28 @@ impl UpdateNeighbours<f32> for NNDescent<f32> {
         graph: &mut [Vec<Neighbour<f32>>],
         updates_count: &AtomicUsize,
     ) {
+        // Pre-allocate with estimated capacity to reduce reallocations
+        // This thing EXPLODES otherwise on larger data sets.
         let mut per_node: Vec<Vec<(usize, f32)>> = vec![Vec::new(); self.n];
+
+        // Pre-count updates per node to pre-allocate capacity
+        // This reduces reallocation overhead during the loop
+        // Another key update here
+        let mut counts = vec![0usize; self.n];
+        for &(p, q, _) in updates {
+            if p < self.n && q < self.n {
+                counts[p] += 1;
+                counts[q] += 1;
+            }
+        }
+
+        for i in 0..self.n {
+            if counts[i] > 0 {
+                per_node[i].reserve(counts[i]);
+            }
+        }
+
+        // Build the per-node update lists
         for &(p, q, d) in updates {
             if p < self.n && q < self.n {
                 per_node[p].push((q, d));
@@ -830,12 +855,14 @@ impl UpdateNeighbours<f32> for NNDescent<f32> {
                         let k = graph[i].len();
                         let mut edge_updates = 0usize;
 
+                        // Add existing neighbours to heap
                         for n in &graph[i] {
                             let pid = n.pid();
                             heap.push((OrderedFloat(n.dist), pid, n.is_new()));
                             pid_set[pid] = true;
                         }
 
+                        // Process new candidates
                         for &(cand, dist) in &per_node[i] {
                             if pid_set[cand] {
                                 continue;
@@ -886,6 +913,7 @@ impl UpdateNeighbours<f32> for NNDescent<f32> {
             })
             .collect();
 
+        // Apply updates
         let mut total_edge_updates = 0;
         for (i, new_graph) in new_graphs.into_iter().enumerate() {
             if let Some((new_neighbours, edge_count)) = new_graph {
@@ -915,7 +943,28 @@ impl UpdateNeighbours<f64> for NNDescent<f64> {
         graph: &mut [Vec<Neighbour<f64>>],
         updates_count: &AtomicUsize,
     ) {
+        // Pre-allocate with estimated capacity to reduce reallocations
+        // This thing EXPLODES otherwise on larger data sets.
         let mut per_node: Vec<Vec<(usize, f64)>> = vec![Vec::new(); self.n];
+
+        // Pre-count updates per node to pre-allocate capacity
+        // This reduces reallocation overhead during the loop
+        // Another key update here
+        let mut counts = vec![0usize; self.n];
+        for &(p, q, _) in updates {
+            if p < self.n && q < self.n {
+                counts[p] += 1;
+                counts[q] += 1;
+            }
+        }
+
+        for i in 0..self.n {
+            if counts[i] > 0 {
+                per_node[i].reserve(counts[i]);
+            }
+        }
+
+        // Build the per-node update lists
         for &(p, q, d) in updates {
             if p < self.n && q < self.n {
                 per_node[p].push((q, d));
@@ -943,12 +992,14 @@ impl UpdateNeighbours<f64> for NNDescent<f64> {
                         let k = graph[i].len();
                         let mut edge_updates = 0usize;
 
+                        // Add existing neighbours to heap
                         for n in &graph[i] {
                             let pid = n.pid();
                             heap.push((OrderedFloat(n.dist), pid, n.is_new()));
                             pid_set[pid] = true;
                         }
 
+                        // Process new candidates
                         for &(cand, dist) in &per_node[i] {
                             if pid_set[cand] {
                                 continue;
@@ -999,6 +1050,7 @@ impl UpdateNeighbours<f64> for NNDescent<f64> {
             })
             .collect();
 
+        // Apply updates
         let mut total_edge_updates = 0;
         for (i, new_graph) in new_graphs.into_iter().enumerate() {
             if let Some((new_neighbours, edge_count)) = new_graph {
@@ -1528,6 +1580,33 @@ impl NNDescentQuery<f64> for NNDescent<f64> {
             .into_iter()
             .map(|(OrderedFloat(d), i)| (i, d))
             .unzip()
+    }
+}
+
+//////////////////////
+// Validation trait //
+//////////////////////
+
+impl<T> KnnValidation<T> for NNDescent<T>
+where
+    T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum,
+    Self: UpdateNeighbours<T>,
+    Self: NNDescentQuery<T>,
+{
+    /// Internal querying function
+    fn query_for_validation(&self, query_vec: &[T], k: usize) -> (Vec<usize>, Vec<T>) {
+        // Default budget
+        self.query(query_vec, k, None)
+    }
+
+    /// Returns n
+    fn n(&self) -> usize {
+        self.n
+    }
+
+    /// Returns the distance metric
+    fn metric(&self) -> Dist {
+        self.metric
     }
 }
 

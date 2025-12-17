@@ -461,7 +461,7 @@ where
             .into_par_iter()
             .map(|i| {
                 let query: Vec<T> = query_mat.row(i).iter().copied().collect();
-                let (indices, distances) = index.search_k(&query, k, max_calcs, no_shortcuts);
+                let (indices, distances) = index.query(&query, k, max_calcs, no_shortcuts);
 
                 if verbose {
                     let count = counter.fetch_add(1, Ordering::Relaxed) + 1;
@@ -485,7 +485,7 @@ where
             .into_par_iter()
             .map(|i| {
                 let query: Vec<T> = query_mat.row(i).iter().copied().collect();
-                let (indices, _) = index.search_k(&query, k, max_calcs, no_shortcuts);
+                let (indices, _) = index.query(&query, k, max_calcs, no_shortcuts);
 
                 if verbose {
                     let count = counter.fetch_add(1, Ordering::Relaxed) + 1;

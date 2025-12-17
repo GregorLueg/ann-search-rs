@@ -1,5 +1,5 @@
 use faer::MatRef;
-use num_traits::{Float, FromPrimitive};
+use num_traits::{Float, FromPrimitive, ToPrimitive};
 use parking_lot::RwLock;
 use rand::rngs::SmallRng;
 use rand::{Rng, SeedableRng};
@@ -1097,6 +1097,32 @@ where
             Dist::Euclidean => self.euclidean_distance_to_query(idx, query),
             Dist::Cosine => self.cosine_distance_to_query(idx, query, query_norm),
         }
+    }
+}
+
+//////////////////////
+// Validation trait //
+//////////////////////
+
+impl<T> KnnValidation<T> for HnswIndex<T>
+where
+    T: Float + FromPrimitive + ToPrimitive + Send + Sync,
+    Self: HnswState<T>,
+{
+    /// Internal querying function
+    fn query_for_validation(&self, query_vec: &[T], k: usize) -> (Vec<usize>, Vec<T>) {
+        // Use the default here
+        self.query(query_vec, k, 200)
+    }
+
+    /// Returns n
+    fn n(&self) -> usize {
+        self.n
+    }
+
+    /// Returns the distance metric
+    fn metric(&self) -> Dist {
+        self.metric
     }
 }
 
