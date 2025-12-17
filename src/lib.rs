@@ -290,7 +290,7 @@ pub fn build_nndescent_index<T>(
 ) -> NNDescent<T>
 where
     T: Float + FromPrimitive + Send + Sync + Sum,
-    NNDescent<T>: UpdateNeighbours<T>,
+    NNDescent<T>: ApplySortedUpdates<T>,
     NNDescent<T>: NNDescentQuery<T>,
 {
     let metric = parse_ann_dist(dist_metric).unwrap_or(Dist::Cosine);
@@ -338,7 +338,7 @@ pub fn query_nndescent_index<T>(
 ) -> (Vec<Vec<usize>>, Option<Vec<Vec<T>>>)
 where
     T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum,
-    NNDescent<T>: UpdateNeighbours<T>,
+    NNDescent<T>: ApplySortedUpdates<T>,
     NNDescent<T>: NNDescentQuery<T>,
 {
     let n_samples = query_mat.nrows();
