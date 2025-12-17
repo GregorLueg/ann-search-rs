@@ -8,7 +8,7 @@ use std::collections::BinaryHeap;
 use std::iter::Sum;
 
 use crate::dist::VectorDistance;
-use crate::utils::Dist;
+use crate::utils::*;
 
 /////////////
 // Helpers //
@@ -263,6 +263,7 @@ where
                     dim,
                     (0..n_vectors).collect(),
                     &mut tree_rng,
+                    metric,
                 )
             })
             .collect();
@@ -499,9 +500,10 @@ where
         dim: usize,
         items: Vec<usize>,
         rng: &mut StdRng,
+        metric: Dist,
     ) -> Vec<BuildNode<T>> {
         let mut nodes = Vec::with_capacity(items.len());
-        Self::build_node(vectors_flat, dim, items, &mut nodes, rng);
+        Self::build_node(vectors_flat, dim, items, &mut nodes, rng, metric);
         nodes
     }
 
@@ -529,6 +531,7 @@ where
         items: Vec<usize>,
         nodes: &mut Vec<BuildNode<T>>,
         rng: &mut StdRng,
+        metric: Dist,
     ) -> usize {
         if items.len() <= MIN_MEMBERS {
             let node_idx = nodes.len();
@@ -536,7 +539,7 @@ where
             return node_idx;
         }
 
-        for _ in 0..5 {
+        for _ in 0..10 {
             let idx1 = items[rng.random_range(0..items.len())];
             let idx2 = items[rng.random_range(0..items.len())];
             if idx1 == idx2 {
@@ -548,19 +551,44 @@ where
             let v1 = &vectors_flat[v1_start..v1_start + dim];
             let v2 = &vectors_flat[v2_start..v2_start + dim];
 
-            let mut hyperplane = Vec::with_capacity(dim);
-            let mut dot_v1 = T::zero();
-            let mut dot_v2 = T::zero();
+            let (hyperplane, threshold) = match metric {
+                Dist::Cosine => {
+                    let norm1 = v1
+                        .iter()
+                        .map(|&x| x * x)
+                        .fold(T::zero(), |a, b| a + b)
+                        .sqrt();
+                    let norm2 = v2
+                        .iter()
+                        .map(|&x| x * x)
+                        .fold(T::zero(), |a, b| a + b)
+                        .sqrt();
 
-            for k in 0..dim {
-                let val1 = v1[k];
-                let val2 = v2[k];
-                hyperplane.push(val1 - val2);
-                dot_v1 = dot_v1 + val1 * val1;
-                dot_v2 = dot_v2 + val2 * val2;
-            }
+                    if norm1 == T::zero() || norm2 == T::zero() {
+                        continue;
+                    }
 
-            let threshold = (dot_v1 - dot_v2) / T::from_f64(2.0).unwrap();
+                    let hp: Vec<T> = (0..dim).map(|k| v1[k] / norm1 - v2[k] / norm2).collect();
+
+                    (hp, T::zero())
+                }
+                Dist::Euclidean => {
+                    let mut hp = Vec::with_capacity(dim);
+                    let mut dot_v1 = T::zero();
+                    let mut dot_v2 = T::zero();
+
+                    for k in 0..dim {
+                        let val1 = v1[k];
+                        let val2 = v2[k];
+                        hp.push(val1 - val2);
+                        dot_v1 = dot_v1 + val1 * val1;
+                        dot_v2 = dot_v2 + val2 * val2;
+                    }
+
+                    let thresh = (dot_v1 - dot_v2) / T::from_f64(2.0).unwrap();
+                    (hp, thresh)
+                }
+            };
 
             let mut left_items = Vec::new();
             let mut right_items = Vec::new();
@@ -594,8 +622,9 @@ where
                     right: 0,
                 });
 
-                let left_idx = Self::build_node(vectors_flat, dim, left_items, nodes, rng);
-                let right_idx = Self::build_node(vectors_flat, dim, right_items, nodes, rng);
+                let left_idx = Self::build_node(vectors_flat, dim, left_items, nodes, rng, metric);
+                let right_idx =
+                    Self::build_node(vectors_flat, dim, right_items, nodes, rng, metric);
 
                 if let BuildNode::Split {
                     ref mut left,
@@ -636,6 +665,31 @@ where
             .map(|(&a, &b)| a * b)
             .fold(T::zero(), |acc, x| acc + x)
             - v2[dim]
+    }
+}
+
+//////////////////////
+// Validation trait //
+//////////////////////
+
+impl<T> KnnValidation<T> for AnnoyIndex<T>
+where
+    T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum,
+{
+    /// Internal querying function
+    fn query_for_validation(&self, query_vec: &[T], k: usize) -> (Vec<usize>, Vec<T>) {
+        // Use the default here
+        self.query(query_vec, k, None)
+    }
+
+    /// Returns n
+    fn n(&self) -> usize {
+        self.n
+    }
+
+    /// Returns the distance metric
+    fn metric(&self) -> Dist {
+        self.metric
     }
 }
 

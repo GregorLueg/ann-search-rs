@@ -1,9 +1,9 @@
 use faer::MatRef;
-use num_traits::Float;
+use num_traits::{Float, FromPrimitive, ToPrimitive};
 use rand::rngs::{SmallRng, StdRng};
 use rand::{Rng, SeedableRng};
 use rayon::prelude::*;
-use rustc_hash::FxHashSet;
+use rustc_hash::{FxBuildHasher, FxHashSet};
 use std::cmp::Reverse;
 use std::collections::BinaryHeap;
 use std::time::Instant;
@@ -111,10 +111,10 @@ impl Default for FanngParams {
     ///
     /// Based on Harwood & Drummond (2016):
     ///
-    /// - `max_degree`: 30 (optimal for SIFT, section 3.7)
-    /// - `traverse_add_multiplier`: 100 (50N iterations, section 3.6, but
-    ///   doublet it).
-    /// - `refinement_neighbour_no`: 1000 (section 3.6)
+    /// - `max_degree`: 30 (optimal for SIFT, section 3.7 in the paper)
+    /// - `traverse_add_multiplier`: 100 (50 iterations, section 3.6 in the
+    ///   paper, but doubling it).
+    /// - `refinement_neighbour_no`: 1000 (section 3.6 in the paper)
     /// - `refinement_max_calc`: 500 (maintains 2:1 ratio)
     /// - `batch_size`: 100 (efficient parallelism)
     /// - `num_shortcut_pool`: 50 (additional parameter to deal with
@@ -138,7 +138,7 @@ impl Default for FanngParams {
 /// * `vectors_flat` - Flattened embedding vectors for cache locality
 /// * `dim` - Dimensionality of each vector
 /// * `norms` - Precomputed norms for cosine distance (empty for Euclidean)
-/// * `dist` - Distance metric (Euclidean or Cosine)
+/// * `metric` - Distance metric (Euclidean or Cosine)
 /// * `graph` - Adjacency list representation of the proximity graph
 /// * `start_vertex` - Centroid vertex for query initialisation
 /// * `shortcut_pool` - Random vertices for handling disconnected components
@@ -151,7 +151,7 @@ where
     pub dim: usize,
     pub n: usize,
     norms: Vec<T>,
-    dist: Dist,
+    metric: Dist,
     graph: Vec<Vec<usize>>,
     start_vertex: usize,
     shortcut_pool: Vec<usize>,
@@ -211,23 +211,29 @@ where
     ///
     /// ### Implementation Details
     ///
-    /// **Phase 1: Random Initialisation**
+    /// **Phase 1: Random Initialisation:**
+    ///
     /// - Each vertex gets 8 random outgoing edges
     ///
-    /// **Phase 2: Traverse-Add (50N iterations)**
+    /// **Phase 2: Traverse-Add (50N iterations):**
+    ///
     /// - Randomly select vertex pairs (v1, v2)
     /// - Attempt downhill search from v1 to v2
-    /// - If search fails, add edge from last reached vertex to v2 (with occlusion)
+    /// - If search fails, add edge from last reached vertex to v2 (with
+    ///   occlusion)
     /// - Continues until 90% success rate
     ///
-    /// **Phase 3: Parallel Refinement**
+    /// **Phase 3: Parallel Refinement:**
+    ///
     /// - For each vertex, find ~1000 approximate neighbours
     /// - Rebuild edges using occlusion rule on neighbour list
     ///
-    /// **Phase 4: Truncation**
+    /// **Phase 4: Truncation:**
+    ///
     /// - Limit each vertex to max_degree edges (keeping nearest)
     ///
-    /// **Phase 5: Find Start Vertex**
+    /// **Phase 5: Find Start Vertex:**
+    ///
     /// - Select vertex nearest to dataset centroid
     pub fn new(
         mat: MatRef<T>,
@@ -242,13 +248,13 @@ where
         let n = mat.nrows();
         let dim = mat.ncols();
 
-        // Flatten matrix for cache locality
+        // flatten matrix for cache locality
         let mut vectors_flat = Vec::with_capacity(n * dim);
         for i in 0..n {
             vectors_flat.extend(mat.row(i).iter().copied());
         }
 
-        // Compute norms for cosine distance
+        // compute norms for cosine distance
         let norms = if metric == Dist::Cosine {
             (0..n)
                 .map(|i| {
@@ -270,7 +276,7 @@ where
             dim,
             n,
             norms,
-            dist: metric,
+            metric,
             graph: vec![Vec::new(); n],
             start_vertex: 0,
             shortcut_pool: Vec::new(),
@@ -369,7 +375,7 @@ where
     /// Using shortcuts adds ~1-3% to distance calculations but significantly
     /// improves recall on clustered or disconnected data.
     #[inline]
-    pub fn search_k(
+    pub fn query(
         &self,
         query: &[T],
         k: usize,
@@ -379,12 +385,11 @@ where
         let mut visited = FxHashSet::default();
         let mut calcs = 0;
 
-        // candidates: min-heap (explore closest first)
         let mut candidates = BinaryHeap::new();
 
         let mut result = BinaryHeap::new();
 
-        let query_norm = if self.dist == Dist::Cosine {
+        let query_norm = if self.metric == Dist::Cosine {
             query
                 .iter()
                 .map(|x| *x * *x)
@@ -518,7 +523,7 @@ where
             .enumerate()
             .for_each(|(i, edges)| {
                 let mut local_rng = SmallRng::seed_from_u64((seed + 2 * i) as u64);
-                let mut targets = FxHashSet::default();
+                let mut targets = FxHashSet::with_capacity_and_hasher(k.min(n - 1), FxBuildHasher);
 
                 while targets.len() < k.min(n - 1) {
                     let j = local_rng.random_range(0..n);
@@ -649,7 +654,7 @@ where
                 let mut edge_dists: Vec<(usize, T)> = self.graph[i]
                     .iter()
                     .map(|&to| {
-                        let dist = unsafe { self.distance(i, to) };
+                        let dist = self.distance(i, to);
                         (to, dist)
                     })
                     .collect();
@@ -758,10 +763,10 @@ where
 
         loop {
             let mut best = current;
-            let mut best_dist = unsafe { self.distance(current, target) };
+            let mut best_dist = self.distance(current, target);
 
             for &neighbor in &self.graph[current] {
-                let dist = unsafe { self.distance(neighbor, target) };
+                let dist = self.distance(neighbor, target);
                 if dist < best_dist {
                     best = neighbor;
                     best_dist = dist;
@@ -801,14 +806,14 @@ where
     /// 3. Rebuild edge list, keeping only edges not occluded by new edge
     /// 4. Add new edge
     fn add_edge_with_occlusion(&mut self, from: usize, to: usize) {
-        let dist_from_to = unsafe { self.distance(from, to) };
+        let dist_from_to = self.distance(from, to);
 
         // compute all distances once
         let edge_distances: Vec<(usize, T, T)> = self.graph[from]
             .iter()
             .map(|&existing_to| {
-                let dist_from_existing = unsafe { self.distance(from, existing_to) };
-                let dist_existing_to = unsafe { self.distance(existing_to, to) };
+                let dist_from_existing = self.distance(from, existing_to);
+                let dist_existing_to = self.distance(existing_to, to);
                 (existing_to, dist_from_existing, dist_existing_to)
             })
             .collect();
@@ -872,7 +877,7 @@ where
                     visited.insert(neighbour);
                     calcs += 1;
 
-                    let dist = unsafe { self.distance(vertex, neighbour) };
+                    let dist = self.distance(vertex, neighbour);
                     nearest.push(Reverse((OrderedFloat(dist), neighbour)));
 
                     if nearest.len() > k {
@@ -928,13 +933,13 @@ where
                 continue;
             }
 
-            let dist_v_n = unsafe { self.distance(vertex, neighbour) };
+            let dist_v_n = self.distance(vertex, neighbour);
             let mut occluded = false;
 
             // Check if occluded by existing edges
             for &existing in &edges {
-                let dist_v_e = unsafe { self.distance(vertex, existing) };
-                let dist_e_n = unsafe { self.distance(existing, neighbour) };
+                let dist_v_e = self.distance(vertex, existing);
+                let dist_e_n = self.distance(existing, neighbour);
 
                 if dist_v_e < dist_v_n && dist_e_n < dist_v_n {
                     occluded = true;
@@ -967,8 +972,8 @@ where
     ///
     /// Does not do bound checks for performance
     #[inline(always)]
-    unsafe fn distance(&self, i: usize, j: usize) -> T {
-        match self.dist {
+    fn distance(&self, i: usize, j: usize) -> T {
+        match self.metric {
             Dist::Euclidean => self.euclidean_distance(i, j),
             Dist::Cosine => self.cosine_distance(i, j),
         }
@@ -994,7 +999,7 @@ where
     /// SIMD-friendly code. The compiler can often vectorise these patterns.
     #[inline(always)]
     fn compute_query_distance(&self, query: &[T], idx: usize, query_norm: T) -> T {
-        match self.dist {
+        match self.metric {
             Dist::Euclidean => {
                 let ptr_idx = unsafe { self.vectors_flat.as_ptr().add(idx * self.dim) };
                 let ptr_query = query.as_ptr();
@@ -1048,6 +1053,31 @@ where
                 }
             }
         }
+    }
+}
+
+//////////////////////
+// Validation trait //
+//////////////////////
+
+impl<T> KnnValidation<T> for Fanng<T>
+where
+    T: Float + Send + Sync + FromPrimitive + ToPrimitive,
+{
+    /// Internal querying function
+    fn query_for_validation(&self, query_vec: &[T], k: usize) -> (Vec<usize>, Vec<T>) {
+        // Use the default here
+        self.query(query_vec, k, 1000, 10)
+    }
+
+    /// Returns n
+    fn n(&self) -> usize {
+        self.n
+    }
+
+    /// Returns the distance metric
+    fn metric(&self) -> Dist {
+        self.metric
     }
 }
 
@@ -1126,7 +1156,7 @@ mod tests {
         );
 
         let query = mat.row(0).iter().cloned().collect::<Vec<f32>>();
-        let (indices, distances) = index.search_k(&query, 1, 200, 10);
+        let (indices, distances) = index.query(&query, 1, 200, 10);
 
         assert!(
             distances[0] < 0.1,
@@ -1142,7 +1172,7 @@ mod tests {
         let index = Fanng::new(mat.as_ref(), "cosine", &test_params(), 42, false);
 
         let query: Vec<f32> = (0..20).map(|j| mat[(0, j)]).collect();
-        let (indices, distances) = index.search_k(&query, 5, 200, 10);
+        let (indices, distances) = index.query(&query, 5, 200, 10);
 
         assert_eq!(indices.len(), 5);
         assert_eq!(indices[0], 0, "Should find itself first");
@@ -1156,8 +1186,8 @@ mod tests {
 
         let query: Vec<f32> = mat.row(10).iter().cloned().collect();
 
-        let (indices1, _) = index.search_k(&query, 5, 50, 10);
-        let (indices2, _) = index.search_k(&query, 5, 500, 10);
+        let (indices1, _) = index.query(&query, 5, 50, 10);
+        let (indices2, _) = index.query(&query, 5, 500, 10);
 
         assert_eq!(indices1.len(), 5);
         assert_eq!(indices2.len(), 5);
@@ -1176,8 +1206,8 @@ mod tests {
         let index2 = Fanng::new(mat.as_ref(), "euclidean", &test_params(), 42, false);
 
         let query: Vec<f32> = mat.row(5).iter().cloned().collect();
-        let (indices1, _) = index1.search_k(&query, 5, 200, 10);
-        let (indices2, _) = index2.search_k(&query, 5, 200, 10);
+        let (indices1, _) = index1.query(&query, 5, 200, 10);
+        let (indices2, _) = index2.query(&query, 5, 200, 10);
 
         assert_eq!(indices1, indices2);
     }
@@ -1190,8 +1220,8 @@ mod tests {
         let index2 = Fanng::new(mat.as_ref(), "euclidean", &test_params(), 123, false);
 
         let query: Vec<f32> = mat.row(7).iter().cloned().collect();
-        let (indices1, _) = index1.search_k(&query, 5, 200, 10);
-        let (indices2, _) = index2.search_k(&query, 5, 200, 10);
+        let (indices1, _) = index1.query(&query, 5, 200, 10);
+        let (indices2, _) = index2.query(&query, 5, 200, 10);
 
         assert_eq!(indices1.len(), 5);
         assert_eq!(indices2.len(), 5);
@@ -1206,7 +1236,7 @@ mod tests {
         let index = Fanng::new(mat.as_ref(), "euclidean", &test_params(), 42, false);
 
         let query: Vec<f32> = mat.row(15).iter().cloned().collect();
-        let (indices, distances) = index.search_k(&query, 5, 300, 10);
+        let (indices, distances) = index.query(&query, 5, 300, 10);
 
         assert_eq!(indices.len(), distances.len());
         assert_eq!(indices.len(), 5);
@@ -1245,7 +1275,7 @@ mod tests {
         let index = Fanng::new(mat.as_ref(), "euclidean", &test_params(), 42, false);
 
         let query: Vec<f32> = (0..dim).map(|_| 0.0).collect();
-        let (indices, distances) = index.search_k(&query, 10, 500, 10);
+        let (indices, distances) = index.query(&query, 10, 500, 10);
 
         assert_eq!(indices.len(), 10);
 
@@ -1268,7 +1298,7 @@ mod tests {
         let index = Fanng::new(mat.as_ref(), "euclidean", &test_params(), 42, false);
 
         let query: Vec<f32> = mat.row(20).iter().cloned().collect();
-        let (indices, _) = index.search_k(&query, 10, 500, 10);
+        let (indices, _) = index.query(&query, 10, 500, 10);
 
         assert_eq!(indices.len(), 10);
         assert!(indices.contains(&20), "Should find query point");
@@ -1280,7 +1310,7 @@ mod tests {
         let index = Fanng::new(mat.as_ref(), "euclidean", &test_params(), 42, false);
 
         let query: Vec<f32> = mat.row(0).iter().cloned().collect();
-        let (indices, _) = index.search_k(&query, 300, 1000, 25);
+        let (indices, _) = index.query(&query, 300, 1000, 25);
 
         assert!(indices.len() <= 200);
         assert!(indices.len() >= 50);
@@ -1297,8 +1327,8 @@ mod tests {
         let index2 = Fanng::new(mat.as_ref(), "euclidean", &params2, 42, false);
 
         let query: Vec<f32> = mat.row(12).iter().cloned().collect();
-        let (indices1, _) = index1.search_k(&query, 5, 300, 10);
-        let (indices2, _) = index2.search_k(&query, 5, 300, 10);
+        let (indices1, _) = index1.query(&query, 5, 300, 10);
+        let (indices2, _) = index2.query(&query, 5, 300, 10);
 
         assert_eq!(indices1.len(), 5);
         assert_eq!(indices2.len(), 5);
