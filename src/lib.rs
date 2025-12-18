@@ -840,8 +840,7 @@ where
         let results: Vec<(Vec<usize>, Vec<T>)> = (0..n_samples)
             .into_par_iter()
             .map(|i| {
-                let query_vec: Vec<T> = query_mat.row(i).iter().copied().collect();
-                let (neighbours, dists) = index.query(&query_vec, k, nprobe);
+                let (neighbours, dists) = index.query_row(query_mat.row(i), k, nprobe);
 
                 if verbose {
                     let count = counter.fetch_add(1, Ordering::Relaxed) + 1;
@@ -885,5 +884,3 @@ where
         (indices, None)
     }
 }
-
-

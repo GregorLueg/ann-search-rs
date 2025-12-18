@@ -8,7 +8,7 @@ use std::time::Instant;
 use thousands::*;
 
 fn main() {
-    const N_CELLS: usize = 50_000;
+    const N_CELLS: usize = 100_000;
     const DIM: usize = 32;
     const N_CLUSTERS: usize = 25;
     const K: usize = 10;
@@ -48,8 +48,13 @@ fn main() {
 
     println!("-----------------------------");
 
-    let sqrt_n = (N_CELLS as f64).sqrt() as usize;
-    let nlist_values = [sqrt_n, sqrt_n * 3 / 2, sqrt_n * 2];
+    let sqrt_n = (N_CELLS as f64).sqrt();
+    let nlist_values = [
+        (sqrt_n * 0.5) as usize,
+        sqrt_n as usize,
+        (sqrt_n * 1.5) as usize,
+        (sqrt_n * 2.0) as usize,
+    ];
 
     for nlist in nlist_values {
         println!("Building IVF index (nlist={})...", nlist);
@@ -64,8 +69,12 @@ fn main() {
         );
         let build_time = start.elapsed().as_secs_f64() * 1000.0;
 
-        let sqrt_nlist = (nlist as f64).sqrt() as usize;
-        let nprobe_values = [sqrt_nlist / 2, sqrt_nlist, sqrt_nlist * 2];
+        let nprobe_values = [
+            (0.05 * nlist as f64) as usize,
+            (0.1 * nlist as f64) as usize,
+            (0.15 * nlist as f64) as usize,
+            (0.2 * nlist as f64) as usize,
+        ];
 
         for nprobe in nprobe_values {
             if nprobe > nlist || nprobe == 0 {
