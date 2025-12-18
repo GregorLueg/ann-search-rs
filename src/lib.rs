@@ -5,6 +5,7 @@ pub mod dist;
 pub mod exhaustive;
 pub mod fanng;
 pub mod hnsw;
+pub mod ivf;
 pub mod lsh;
 pub mod nndescent;
 pub mod synthetic;
@@ -22,6 +23,7 @@ use crate::annoy::*;
 use crate::exhaustive::*;
 use crate::fanng::*;
 use crate::hnsw::*;
+use crate::ivf::*;
 use crate::lsh::*;
 use crate::nndescent::*;
 use crate::utils::*;
@@ -728,3 +730,160 @@ where
         (indices, None)
     }
 }
+
+/////////
+// IVF //
+/////////
+
+/// Build an IVF index
+///
+/// ### Params
+///
+/// * `mat` - The data matrix. Rows represent the samples, columns represent
+///   the embedding dimensions
+/// * `nlist` - Number of clusters to create
+/// * `max_iters` - Maximum k-means iterations (defaults to 30 if None)
+/// * `dist_metric` - The distance metric to use. One of `"euclidean"` or
+///   `"cosine"`
+/// * `seed` - Random seed for reproducibility
+/// * `verbose` - Print progress information during index construction
+///
+/// ### Return
+///
+/// The `IvfIndex`.
+pub fn build_ivf_index<T>(
+    mat: MatRef<T>,
+    nlist: usize,
+    max_iters: Option<usize>,
+    dist_metric: &str,
+    seed: usize,
+    verbose: bool,
+) -> IvfIndex<T>
+where
+    T: Float + FromPrimitive + ToPrimitive + Send + Sync,
+{
+    let n = mat.nrows();
+    let dim = mat.ncols();
+
+    let mut vectors_flat = Vec::with_capacity(n * dim);
+    for i in 0..n {
+        vectors_flat.extend(mat.row(i).iter().cloned());
+    }
+
+    let ann_dist = parse_ann_dist(dist_metric).unwrap_or_default();
+
+    let norms = if ann_dist == Dist::Cosine {
+        (0..n)
+            .map(|i| {
+                let start = i * dim;
+                let end = start + dim;
+                vectors_flat[start..end]
+                    .iter()
+                    .map(|x| *x * *x)
+                    .fold(T::zero(), |a, b| a + b)
+                    .sqrt()
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
+
+    IvfIndex::build(
+        vectors_flat,
+        dim,
+        n,
+        norms,
+        ann_dist,
+        nlist,
+        max_iters,
+        seed,
+        verbose,
+    )
+}
+
+/// Helper function to query a given IVF index
+///
+/// ### Params
+///
+/// * `query_mat` - The query matrix containing the samples x features
+/// * `index` - Reference to the built IVF index
+/// * `k` - Number of neighbours to return
+/// * `nprobe` - Number of clusters to search (defaults to min(nlist/10, 10))
+///   Higher values improve recall at the cost of speed
+/// * `return_dist` - Shall the distances between the different points be
+///   returned
+/// * `verbose` - Print progress information
+///
+/// ### Returns
+///
+/// A tuple of `(knn_indices, optional distances)`
+///
+/// ### Note
+///
+/// The distance metric is determined at index build time and cannot be changed
+/// during querying.
+pub fn query_ivf_index<T>(
+    query_mat: MatRef<T>,
+    index: &IvfIndex<T>,
+    k: usize,
+    nprobe: Option<usize>,
+    return_dist: bool,
+    verbose: bool,
+) -> (Vec<Vec<usize>>, Option<Vec<Vec<T>>>)
+where
+    T: Float + FromPrimitive + ToPrimitive + Send + Sync,
+{
+    let n_samples = query_mat.nrows();
+    let counter = Arc::new(AtomicUsize::new(0));
+
+    if return_dist {
+        let results: Vec<(Vec<usize>, Vec<T>)> = (0..n_samples)
+            .into_par_iter()
+            .map(|i| {
+                let query_vec: Vec<T> = query_mat.row(i).iter().copied().collect();
+                let (neighbours, dists) = index.query(&query_vec, k, nprobe);
+
+                if verbose {
+                    let count = counter.fetch_add(1, Ordering::Relaxed) + 1;
+                    if count.is_multiple_of(100_000) {
+                        println!(
+                            "  Processed {} / {} samples.",
+                            count.separate_with_underscores(),
+                            n_samples.separate_with_underscores()
+                        );
+                    }
+                }
+
+                (neighbours, dists)
+            })
+            .collect();
+
+        let (indices, distances) = results.into_iter().unzip();
+        (indices, Some(distances))
+    } else {
+        let indices: Vec<Vec<usize>> = (0..n_samples)
+            .into_par_iter()
+            .map(|i| {
+                let query_vec: Vec<T> = query_mat.row(i).iter().copied().collect();
+                let (neighbours, _) = index.query(&query_vec, k, nprobe);
+
+                if verbose {
+                    let count = counter.fetch_add(1, Ordering::Relaxed) + 1;
+                    if count.is_multiple_of(100_000) {
+                        println!(
+                            "  Processed {} / {} samples.",
+                            count.separate_with_underscores(),
+                            n_samples.separate_with_underscores()
+                        );
+                    }
+                }
+
+                neighbours
+            })
+            .collect();
+
+        (indices, None)
+    }
+}
+
+
