@@ -1,3 +1,4 @@
+use faer::RowRef;
 use num_traits::{Float, FromPrimitive, ToPrimitive};
 use rand::rngs::StdRng;
 use rand::seq::SliceRandom;
@@ -33,7 +34,8 @@ pub struct IvfIndex<T> {
     pub norms: Vec<T>,
     pub metric: Dist,
     pub centroids: Vec<T>,
-    pub inverted_lists: Vec<Vec<usize>>,
+    pub all_indices: Vec<usize>,
+    pub offsets: Vec<usize>,
     pub nlist: usize,
 }
 
@@ -65,28 +67,14 @@ impl<T> IvfIndex<T>
 where
     T: Float + FromPrimitive + ToPrimitive + Send + Sync,
 {
-    /// Build an IVF index using k-means clustering
+    /// Build an IVF index with optimized memory layout and parallel training.
     ///
-    /// Constructs an inverted file index by clustering vectors into nlist
-    /// partitions using k-means. For large datasets (>500k), trains k-means
-    /// on a random sample then assigns all vectors. Uses k-means|| for
-    /// initialisation and Hamerly's algorithm for efficient Lloyd's iterations.
-    ///
-    /// ### Params
-    ///
-    /// * `vectors_flat` - Flattened vector data (n * dim elements)
-    /// * `dim` - Embedding dimensions
-    /// * `n` - Number of vectors
-    /// * `norms` - Pre-computed norms for Cosine distance (empty for Euclidean)
-    /// * `metric` - Distance metric (Euclidean or Cosine)
-    /// * `nlist` - Number of clusters to create. Typically set to sqrt(n).
-    /// * `max_iters` - Maximum Lloyd's iterations (defaults to 30 if None)
-    /// * `seed` - Random seed for reproducibility
-    /// * `verbose` - Print progress information
-    ///
-    /// ### Returns
-    ///
-    /// Constructed IVF index ready for querying
+    /// ### Workflow:
+    /// 1. **Subsampling**: Samples training data if the dataset is > 500k points.
+    /// 2. **Fast Init**: Uses random selection for large cluster counts (nlist) to avoid
+    ///    the $O(N \cdot k)$ bottleneck of k-means||.
+    /// 3. **Parallel Lloyd's**: Recomputes centroids using a parallel reduction pattern.
+    /// 4. **CSR Finalization**: Flattens assignments into a contiguous memory block.
     #[allow(clippy::too_many_arguments)]
     pub fn build(
         vectors_flat: Vec<T>,
@@ -101,33 +89,37 @@ where
     ) -> Self {
         let max_iters = max_iters.unwrap_or(30);
 
-        if verbose {
-            println!("Building IVF index with {} clusters", nlist);
-        }
-
-        // subsample for speed here
-        let (training_data, training_indices) = if n > 500_000 {
+        // 1. Subsample training data
+        let (training_data, n_train) = if n > 500_000 {
             if verbose {
-                println!("  Sampling 250k vectors for k-means training");
+                println!("  Sampling 250k vectors for training");
             }
-            Self::sample_vectors(&vectors_flat, dim, n, 250_000, seed)
+            let (data, _) = Self::sample_vectors(&vectors_flat, dim, n, 250_000, seed);
+            (data, 250_000)
         } else {
-            let indices: Vec<usize> = (0..n).collect();
-            (vectors_flat.clone(), indices)
+            (vectors_flat.clone(), n)
         };
 
-        let n_train = training_indices.len();
+        // 2. Fast Initialisation
+        // If nlist is high (> 200), k-means|| becomes extremely slow.
+        // We use random unique selection as a fast-start heuristic.
+        let mut centroids = if nlist > 200 {
+            if verbose {
+                println!("  Initialising centroids via fast random selection");
+            }
+            Self::fast_random_init(&training_data, dim, n_train, nlist, seed)
+        } else {
+            if verbose {
+                println!("  Initialising centroids via k-means||");
+            }
+            Self::kmeans_parallel_init(&training_data, dim, n_train, nlist, &metric, seed)
+        };
 
+        // 3. Parallel Lloyd's Iterations
         if verbose {
-            println!("  Initialising centroids with k-means||");
+            println!("  Running parallel Lloyd's iterations");
         }
-        let mut centroids =
-            Self::kmeans_parallel_init(&training_data, dim, n_train, nlist, &metric, seed);
-
-        if verbose {
-            println!("  Running Lloyd's iterations with Hamerly pruning");
-        }
-        Self::hamerly_lloyd(
+        Self::parallel_lloyd(
             &training_data,
             dim,
             n_train,
@@ -138,22 +130,13 @@ where
             verbose,
         );
 
+        // 4. Final Assignment & CSR Conversion
         if verbose {
-            println!("  Assigning all vectors to clusters");
+            println!("  Finalising CSR inverted lists");
         }
-        let inverted_lists =
-            Self::assign_to_clusters(&vectors_flat, dim, n, &centroids, nlist, &metric);
-
-        if verbose {
-            let list_sizes: Vec<usize> = inverted_lists.iter().map(|l| l.len()).collect();
-            let avg_size = list_sizes.iter().sum::<usize>() as f64 / nlist as f64;
-            let max_size = list_sizes.iter().max().unwrap_or(&0);
-            let min_size = list_sizes.iter().min().unwrap_or(&0);
-            println!(
-                "  Cluster sizes - avg: {:.1}, min: {}, max: {}",
-                avg_size, min_size, max_size
-            );
-        }
+        let assignments =
+            Self::assign_all_parallel(&vectors_flat, dim, n, &centroids, nlist, &metric);
+        let (all_indices, offsets) = Self::build_csr_layout(assignments, n, nlist);
 
         Self {
             vectors_flat,
@@ -162,7 +145,8 @@ where
             norms,
             metric,
             centroids,
-            inverted_lists,
+            all_indices,
+            offsets,
             nlist,
         }
     }
@@ -183,20 +167,12 @@ where
     /// ### Returns
     ///
     /// Tuple of `(indices, distances)` sorted by distance (nearest first)
+    #[inline]
     pub fn query(&self, query_vec: &[T], k: usize, nprobe: Option<usize>) -> (Vec<usize>, Vec<T>) {
-        let nprobe = nprobe.unwrap_or_else(|| ((self.nlist as f64).sqrt() as usize).max(1));
+        let nprobe = nprobe.unwrap_or_else(|| (((self.nlist as f64) * 0.2) as usize).max(1));
         let k = k.min(self.n);
 
-        let query_norm = if matches!(self.metric, Dist::Cosine) {
-            query_vec
-                .iter()
-                .map(|&v| v * v)
-                .fold(T::zero(), |a, b| a + b)
-                .sqrt()
-        } else {
-            T::one()
-        };
-
+        // 1. Find the top `nprobe` centroids
         let mut cluster_dists: Vec<(T, usize)> = (0..self.nlist)
             .map(|c| {
                 let cent = &self.centroids[c * self.dim..(c + 1) * self.dim];
@@ -208,12 +184,25 @@ where
             })
             .collect();
 
-        cluster_dists.sort_unstable_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+        cluster_dists.select_nth_unstable_by(nprobe, |a, b| a.0.partial_cmp(&b.0).unwrap());
 
+        // 2. Search only those clusters in the CSR layout
         let mut heap: BinaryHeap<(OrderedFloat<T>, usize)> = BinaryHeap::with_capacity(k + 1);
+        let query_norm = if matches!(self.metric, Dist::Cosine) {
+            query_vec
+                .iter()
+                .map(|&v| v * v)
+                .fold(T::zero(), |a, b| a + b)
+                .sqrt()
+        } else {
+            T::one()
+        };
 
         for &(_, cluster_idx) in cluster_dists.iter().take(nprobe) {
-            for &vec_idx in &self.inverted_lists[cluster_idx] {
+            let start = self.offsets[cluster_idx];
+            let end = self.offsets[cluster_idx + 1];
+
+            for &vec_idx in &self.all_indices[start..end] {
                 let dist = match self.metric {
                     Dist::Euclidean => self.euclidean_distance_to_query(vec_idx, query_vec),
                     Dist::Cosine => self.cosine_distance_to_query(vec_idx, query_vec, query_norm),
@@ -230,13 +219,42 @@ where
 
         let mut results: Vec<_> = heap.into_iter().collect();
         results.sort_unstable_by_key(|&(dist, _)| dist);
-
-        let (distances, indices): (Vec<_>, Vec<_>) = results
-            .into_iter()
-            .map(|(OrderedFloat(dist), idx)| (dist, idx))
-            .unzip();
-
+        let (distances, indices) = results.into_iter().map(|(d, i)| (d.0, i)).unzip();
         (indices, distances)
+    }
+
+    /// Query the index for approximate nearest neighbours
+    ///
+    /// Performs two-stage search: first finds nprobe nearest centroids to the
+    /// query, then exhaustively searches all vectors in those clusters. Uses
+    /// a max-heap to track top-k candidates.
+    ///
+    /// ### Params
+    ///
+    /// * `query_vec` - Query vector (must match index dimensionality)
+    /// * `k` - Number of neighbours to return
+    /// * `nprobe` - Number of clusters to search. A good default here is
+    ///   `sqrt(nlist)`.
+    ///
+    /// ### Returns
+    ///
+    /// Tuple of `(indices, distances)` sorted by distance (nearest first)
+    #[inline]
+    pub fn query_row(
+        &self,
+        query_row: RowRef<T>,
+        k: usize,
+        nprobe: Option<usize>,
+    ) -> (Vec<usize>, Vec<T>) {
+        if query_row.col_stride() == 1 {
+            let slice =
+                unsafe { std::slice::from_raw_parts(query_row.as_ptr(), query_row.ncols()) };
+            return self.query(slice, k, nprobe);
+        }
+
+        // fallback
+        let query_vec: Vec<T> = query_row.iter().cloned().collect();
+        self.query(&query_vec, k, nprobe)
     }
 
     /// Sample random vectors from dataset
@@ -446,33 +464,53 @@ where
         min_dist
     }
 
-    /// Lloyd's algorithm with Hamerly pruning
+    /// Fast centroid initialisation via random unique selection
     ///
-    /// Refines k-means centroids using Lloyd's iterations with Hamerly's
-    /// acceleration. For each point, tracks upper bound to assigned centroid
-    /// and lower bound to nearest other centroid. Skips distance computations
-    /// when bounds prove reassignment is impossible.
-    ///
-    /// ### Algorithm
-    ///
-    /// For each iteration:
-    /// 1. Update bounds based on how far centroids moved
-    /// 2. Skip points where upper < lower (definitely stay assigned)
-    /// 3. Recompute exact distances only when necessary
-    /// 4. Update centroids and check for convergence (<0.1% changed)
+    /// Randomly selects k unique vectors as initial centroids. Trades
+    /// initialisation quality for speed when nlist is large (>200).
     ///
     /// ### Params
     ///
     /// * `data` - Training vectors (flattened)
     /// * `dim` - Embedding dimensions
     /// * `n` - Number of training vectors
-    /// * `centroids` - Initial centroids (updated in-place)
+    /// * `k` - Number of clusters to create
+    /// * `seed` - Random seed
+    ///
+    /// ### Returns
+    ///
+    /// Initial centroids (k * dim elements)
+    fn fast_random_init(data: &[T], dim: usize, n: usize, k: usize, seed: usize) -> Vec<T> {
+        let mut rng = StdRng::seed_from_u64(seed as u64);
+        let mut indices: Vec<usize> = (0..n).collect();
+        indices.shuffle(&mut rng);
+
+        let mut centroids = Vec::with_capacity(k * dim);
+        for i in 0..k {
+            let start = indices[i] * dim;
+            centroids.extend_from_slice(&data[start..start + dim]);
+        }
+        centroids
+    }
+
+    /// Parallel Lloyd's k-means iterations
+    ///
+    /// Iteratively assigns vectors to nearest centroids and recomputes
+    /// centroid positions. Uses Rayon for parallel assignment and
+    /// fold-reduce for centroid updates.
+    ///
+    /// ### Params
+    ///
+    /// * `data` - Training vectors (flattened)
+    /// * `dim` - Embedding dimensions
+    /// * `n` - Number of training vectors
+    /// * `centroids` - Current centroids (modified in-place)
     /// * `k` - Number of clusters
     /// * `metric` - Distance metric
     /// * `max_iters` - Maximum iterations
-    /// * `verbose` - Print progress
+    /// * `verbose` - Print iteration progress
     #[allow(clippy::too_many_arguments)]
-    fn hamerly_lloyd(
+    fn parallel_lloyd(
         data: &[T],
         dim: usize,
         n: usize,
@@ -482,206 +520,79 @@ where
         max_iters: usize,
         verbose: bool,
     ) {
-        let mut assignments = vec![0usize; n];
-        let mut upper_bounds = vec![T::infinity(); n];
-        let mut lower_bounds = vec![T::zero(); n];
-
         for iter in 0..max_iters {
-            let centroids_moved = if iter > 0 {
-                Self::compute_centroid_distances(centroids, dim, k, metric)
-            } else {
-                vec![T::infinity(); k]
-            };
+            let assignments = Self::assign_all_parallel(data, dim, n, centroids, k, metric);
 
-            let mut changed = 0;
+            let (new_sums, counts) = (0..n)
+                .into_par_iter()
+                .fold(
+                    || (vec![T::zero(); k * dim], vec![0usize; k]),
+                    |(mut sums, mut counts), i| {
+                        let cluster = assignments[i];
+                        counts[cluster] += 1;
+                        let vec = &data[i * dim..(i + 1) * dim];
+                        for d in 0..dim {
+                            sums[cluster * dim + d] = sums[cluster * dim + d] + vec[d];
+                        }
+                        (sums, counts)
+                    },
+                )
+                .reduce(
+                    || (vec![T::zero(); k * dim], vec![0usize; k]),
+                    |(mut sums1, mut counts1), (sums2, counts2)| {
+                        for i in 0..sums1.len() {
+                            sums1[i] = sums1[i] + sums2[i];
+                        }
+                        for i in 0..counts1.len() {
+                            counts1[i] += counts2[i];
+                        }
+                        (sums1, counts1)
+                    },
+                );
 
-            for i in 0..n {
-                let vec = &data[i * dim..(i + 1) * dim];
-                let assigned = assignments[i];
-
-                let max_move = centroids_moved[assigned];
-                upper_bounds[i] = upper_bounds[i] + max_move;
-                lower_bounds[i] = (lower_bounds[i] - max_move).max(T::zero());
-
-                if upper_bounds[i] <= lower_bounds[i] {
-                    continue;
-                }
-
-                let assigned_cent = &centroids[assigned * dim..(assigned + 1) * dim];
-                let exact_dist = match metric {
-                    Dist::Euclidean => Self::euclidean_distance_static(vec, assigned_cent),
-                    Dist::Cosine => Self::cosine_distance_static(vec, assigned_cent),
-                };
-                upper_bounds[i] = exact_dist;
-
-                if upper_bounds[i] <= lower_bounds[i] {
-                    continue;
-                }
-
-                let mut best_cluster = assigned;
-                let mut best_dist = exact_dist;
-
-                for c in 0..k {
-                    if c == assigned {
-                        continue;
+            for c in 0..k {
+                if counts[c] > 0 {
+                    let count_t = T::from(counts[c]).unwrap();
+                    for d in 0..dim {
+                        centroids[c * dim + d] = new_sums[c * dim + d] / count_t;
                     }
-
-                    let cent = &centroids[c * dim..(c + 1) * dim];
-                    let dist = match metric {
-                        Dist::Euclidean => Self::euclidean_distance_static(vec, cent),
-                        Dist::Cosine => Self::cosine_distance_static(vec, cent),
-                    };
-
-                    if dist < best_dist {
-                        best_dist = dist;
-                        best_cluster = c;
-                    }
-                }
-
-                if best_cluster != assigned {
-                    assignments[i] = best_cluster;
-                    upper_bounds[i] = best_dist;
-                    lower_bounds[i] = T::zero();
-                    changed += 1;
-                } else {
-                    lower_bounds[i] = best_dist;
                 }
             }
-
-            Self::recompute_centroids(data, dim, n, centroids, k, &assignments);
 
             if verbose {
-                println!("    Iteration {}: {} points changed", iter + 1, changed);
-            }
-
-            if changed < n / 1000 {
-                if verbose {
-                    println!("    Converged (< 0.1% changed)");
-                }
-                break;
+                println!("    Iteration {} complete", iter + 1);
             }
         }
     }
 
-    /// Compute half-distances between centroids
-    ///
-    /// For Hamerly pruning, computes distance from each centroid to its
-    /// nearest neighbour, then returns half that distance (maximum possible
-    /// movement per Lloyd iteration).
+    /// Assign all vectors to their nearest centroids in parallel
     ///
     /// ### Params
     ///
-    /// * `centroids` - Current centroids (flattened)
-    /// * `dim` - Embedding dimensions
-    /// * `k` - Number of clusters
-    /// * `metric` - Distance metric
-    ///
-    /// ### Returns
-    ///
-    /// Vector of half-distances to nearest centroid for each cluster
-    fn compute_centroid_distances(centroids: &[T], dim: usize, k: usize, metric: &Dist) -> Vec<T> {
-        let mut max_moves = vec![T::zero(); k];
-
-        for c in 0..k {
-            let cent = &centroids[c * dim..(c + 1) * dim];
-            let mut min_dist = T::infinity();
-
-            for other in 0..k {
-                if other == c {
-                    continue;
-                }
-                let other_cent = &centroids[other * dim..(other + 1) * dim];
-                let dist = match metric {
-                    Dist::Euclidean => Self::euclidean_distance_static(cent, other_cent),
-                    Dist::Cosine => Self::cosine_distance_static(cent, other_cent),
-                };
-                if dist < min_dist {
-                    min_dist = dist;
-                }
-            }
-
-            max_moves[c] = min_dist / T::from(2.0).unwrap();
-        }
-
-        max_moves
-    }
-
-    /// Recompute centroids from current assignments
-    ///
-    /// Updates each centroid to be the mean of all vectors assigned to it.
-    /// Standard Lloyd's algorithm centroid update step.
-    ///
-    /// ### Params
-    ///
-    /// * `data` - Training vectors (flattened)
-    /// * `dim` - Embedding dimensions
-    /// * `n` - Number of training vectors
-    /// * `centroids` - Centroids to update (in-place)
-    /// * `k` - Number of clusters
-    /// * `assignments` - Current cluster assignment for each vector
-    fn recompute_centroids(
-        data: &[T],
-        dim: usize,
-        n: usize,
-        centroids: &mut [T],
-        k: usize,
-        assignments: &[usize],
-    ) {
-        let mut counts = vec![0usize; k];
-        let mut sums = vec![T::zero(); k * dim];
-
-        for i in 0..n {
-            let cluster = assignments[i];
-            counts[cluster] += 1;
-            let vec = &data[i * dim..(i + 1) * dim];
-            let sum_start = cluster * dim;
-            for d in 0..dim {
-                sums[sum_start + d] = sums[sum_start + d] + vec[d];
-            }
-        }
-
-        for c in 0..k {
-            if counts[c] > 0 {
-                let count = T::from(counts[c]).unwrap();
-                for d in 0..dim {
-                    centroids[c * dim + d] = sums[c * dim + d] / count;
-                }
-            }
-        }
-    }
-
-    /// Assign all vectors to their nearest centroid
-    ///
-    /// Final step of index building. Assigns each vector to its closest
-    /// centroid in parallel, then collects assignments into inverted lists.
-    ///
-    /// ### Params
-    ///
-    /// * `data` - All vectors (flattened)
+    /// * `data` - Vectors to assign (flattened)
     /// * `dim` - Embedding dimensions
     /// * `n` - Number of vectors
-    /// * `centroids` - Final centroids
+    /// * `centroids` - Current centroids
     /// * `k` - Number of clusters
     /// * `metric` - Distance metric
     ///
     /// ### Returns
     ///
-    /// Inverted lists (vector of k lists, each containing vector indices)
-    fn assign_to_clusters(
+    /// Vector of cluster assignments (one per input vector)
+    fn assign_all_parallel(
         data: &[T],
         dim: usize,
         n: usize,
         centroids: &[T],
         k: usize,
         metric: &Dist,
-    ) -> Vec<Vec<usize>> {
-        let assignments: Vec<usize> = (0..n)
+    ) -> Vec<usize> {
+        (0..n)
             .into_par_iter()
             .map(|i| {
                 let vec = &data[i * dim..(i + 1) * dim];
                 let mut best_cluster = 0;
                 let mut best_dist = T::infinity();
-
                 for c in 0..k {
                     let cent = &centroids[c * dim..(c + 1) * dim];
                     let dist = match metric {
@@ -693,17 +604,51 @@ where
                         best_cluster = c;
                     }
                 }
-
                 best_cluster
             })
-            .collect();
+            .collect()
+    }
 
-        let mut inverted_lists = vec![Vec::new(); k];
-        for (idx, &cluster) in assignments.iter().enumerate() {
-            inverted_lists[cluster].push(idx);
+    /// Convert flat assignments to CSR (Compressed Sparse Row) layout
+    ///
+    /// Transforms a vector of cluster assignments into an inverted index
+    /// structure with contiguous storage. The CSR format uses two arrays:
+    /// `all_indices` (vector IDs) and `offsets` (cluster boundaries).
+    ///
+    /// ### Params
+    ///
+    /// * `assignments` - Cluster ID for each vector
+    /// * `n` - Number of vectors
+    /// * `nlist` - Number of clusters
+    ///
+    /// ### Returns
+    ///
+    /// Tuple of (all_indices, offsets) for CSR access
+    fn build_csr_layout(
+        assignments: Vec<usize>,
+        n: usize,
+        nlist: usize,
+    ) -> (Vec<usize>, Vec<usize>) {
+        let mut offsets = vec![0usize; nlist + 1];
+        for &cluster in &assignments {
+            offsets[cluster + 1] += 1;
         }
 
-        inverted_lists
+        // Prefix sum to find starting positions
+        for i in 1..=nlist {
+            offsets[i] += offsets[i - 1];
+        }
+
+        let mut all_indices = vec![0usize; n];
+        let mut current_pos = offsets.clone();
+
+        for (vec_idx, &cluster) in assignments.iter().enumerate() {
+            let pos = current_pos[cluster];
+            all_indices[pos] = vec_idx;
+            current_pos[cluster] += 1;
+        }
+
+        (all_indices, offsets)
     }
 }
 
@@ -715,15 +660,368 @@ impl<T> KnnValidation<T> for IvfIndex<T>
 where
     T: Float + FromPrimitive + ToPrimitive + Send + Sync,
 {
+    /// Internal querying function
     fn query_for_validation(&self, query_vec: &[T], k: usize) -> (Vec<usize>, Vec<T>) {
         self.query(query_vec, k, None)
     }
 
+    /// Returns n
     fn n(&self) -> usize {
         self.n
     }
 
+    /// Returns the distance metric
     fn metric(&self) -> Dist {
         self.metric
+    }
+}
+
+///////////
+// Tests //
+///////////
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::utils::Dist;
+    use approx::assert_relative_eq;
+
+    fn create_simple_vectors() -> (Vec<f32>, usize, usize, Vec<f32>) {
+        // 5 points in 3D space
+        let vectors_flat = vec![
+            1.0, 0.0, 0.0, // Point 0
+            0.0, 1.0, 0.0, // Point 1
+            0.0, 0.0, 1.0, // Point 2
+            1.0, 1.0, 0.0, // Point 3
+            1.0, 0.0, 1.0, // Point 4
+        ];
+        let dim = 3;
+        let n = 5;
+        let norms = vec![]; // Empty for Euclidean
+        (vectors_flat, dim, n, norms)
+    }
+
+    #[test]
+    fn test_ivf_index_creation() {
+        let (vectors_flat, dim, n, norms) = create_simple_vectors();
+        let _ = IvfIndex::build(
+            vectors_flat,
+            dim,
+            n,
+            norms,
+            Dist::Euclidean,
+            2, // nlist
+            None,
+            42,
+            false,
+        );
+    }
+
+    #[test]
+    fn test_ivf_query_finds_self() {
+        let (vectors_flat, dim, n, norms) = create_simple_vectors();
+        let index = IvfIndex::build(
+            vectors_flat,
+            dim,
+            n,
+            norms,
+            Dist::Euclidean,
+            2,
+            None,
+            42,
+            false,
+        );
+
+        let query = vec![1.0, 0.0, 0.0];
+        let (indices, distances) = index.query(&query, 1, None);
+
+        assert_eq!(indices.len(), 1);
+        assert_eq!(indices[0], 0);
+        assert_relative_eq!(distances[0], 0.0, epsilon = 1e-5);
+    }
+
+    #[test]
+    fn test_ivf_query_euclidean() {
+        let (vectors_flat, dim, n, norms) = create_simple_vectors();
+        let index = IvfIndex::build(
+            vectors_flat,
+            dim,
+            n,
+            norms,
+            Dist::Euclidean,
+            2,
+            None,
+            42,
+            false,
+        );
+
+        let query = vec![1.0, 0.0, 0.0];
+        let (indices, distances) = index.query(&query, 3, None);
+
+        assert_eq!(indices[0], 0);
+        assert_relative_eq!(distances[0], 0.0, epsilon = 1e-5);
+
+        for i in 1..distances.len() {
+            assert!(distances[i] >= distances[i - 1]);
+        }
+    }
+
+    #[test]
+    fn test_ivf_query_cosine() {
+        let (vectors_flat, dim, n, _) = create_simple_vectors();
+
+        // Compute norms for cosine
+        let norms: Vec<f32> = (0..n)
+            .map(|i| {
+                let start = i * dim;
+                vectors_flat[start..start + dim]
+                    .iter()
+                    .map(|&x| x * x)
+                    .sum::<f32>()
+                    .sqrt()
+            })
+            .collect();
+
+        let index = IvfIndex::build(
+            vectors_flat,
+            dim,
+            n,
+            norms,
+            Dist::Cosine,
+            2,
+            None,
+            42,
+            false,
+        );
+
+        let query = vec![1.0, 0.0, 0.0];
+        let (indices, distances) = index.query(&query, 3, None);
+
+        assert_eq!(indices[0], 0);
+        assert_relative_eq!(distances[0], 0.0, epsilon = 1e-5);
+    }
+
+    #[test]
+    fn test_ivf_query_k_larger_than_dataset() {
+        let (vectors_flat, dim, n, norms) = create_simple_vectors();
+        let index = IvfIndex::build(
+            vectors_flat,
+            dim,
+            n,
+            norms,
+            Dist::Euclidean,
+            2,
+            None,
+            42,
+            false,
+        );
+
+        let query = vec![1.0, 0.0, 0.0];
+        let (indices, _) = index.query(&query, 10, None);
+
+        assert!(indices.len() <= 5);
+    }
+
+    #[test]
+    fn test_ivf_query_nprobe() {
+        let (vectors_flat, dim, n, norms) = create_simple_vectors();
+        let index = IvfIndex::build(
+            vectors_flat,
+            dim,
+            n,
+            norms,
+            Dist::Euclidean,
+            2,
+            None,
+            42,
+            false,
+        );
+
+        let query = vec![1.0, 0.0, 0.0];
+
+        let (indices1, _) = index.query(&query, 3, Some(1));
+        let (indices2, _) = index.query(&query, 3, Some(2));
+
+        assert_eq!(indices1.len(), 3);
+        assert_eq!(indices2.len(), 3);
+    }
+
+    #[test]
+    fn test_ivf_reproducibility() {
+        let (vectors_flat, dim, n, norms) = create_simple_vectors();
+
+        let index1 = IvfIndex::build(
+            vectors_flat.clone(),
+            dim,
+            n,
+            norms.clone(),
+            Dist::Euclidean,
+            2,
+            None,
+            42,
+            false,
+        );
+        let index2 = IvfIndex::build(
+            vectors_flat,
+            dim,
+            n,
+            norms,
+            Dist::Euclidean,
+            2,
+            None,
+            42,
+            false,
+        );
+
+        let query = vec![0.5, 0.5, 0.0];
+        let (indices1, _) = index1.query(&query, 3, None);
+        let (indices2, _) = index2.query(&query, 3, None);
+
+        assert_eq!(indices1, indices2);
+    }
+
+    #[test]
+    fn test_ivf_different_seeds() {
+        let (vectors_flat, dim, n, norms) = create_simple_vectors();
+
+        let index1 = IvfIndex::build(
+            vectors_flat.clone(),
+            dim,
+            n,
+            norms.clone(),
+            Dist::Euclidean,
+            2,
+            None,
+            42,
+            false,
+        );
+        let index2 = IvfIndex::build(
+            vectors_flat,
+            dim,
+            n,
+            norms,
+            Dist::Euclidean,
+            2,
+            None,
+            123,
+            false,
+        );
+
+        let query = vec![0.5, 0.5, 0.0];
+        let (indices1, _) = index1.query(&query, 3, Some(2));
+        let (indices2, _) = index2.query(&query, 3, Some(2));
+
+        assert!(!indices1.is_empty());
+        assert!(!indices2.is_empty());
+    }
+
+    #[test]
+    fn test_ivf_larger_dataset() {
+        let n = 100;
+        let dim = 10;
+        let mut vectors_flat = Vec::with_capacity(n * dim);
+
+        for i in 0..n {
+            for j in 0..dim {
+                vectors_flat.push((i * j) as f32 / 10.0);
+            }
+        }
+
+        let index = IvfIndex::build(
+            vectors_flat,
+            dim,
+            n,
+            vec![],
+            Dist::Euclidean,
+            10, // sqrt(100)
+            None,
+            42,
+            false,
+        );
+
+        let query: Vec<f32> = (0..dim).map(|_| 0.0).collect();
+        let (indices, _) = index.query(&query, 5, None);
+
+        assert_eq!(indices.len(), 5);
+        assert_eq!(indices[0], 0);
+    }
+
+    #[test]
+    fn test_ivf_orthogonal_vectors() {
+        let vectors_flat = vec![1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0];
+        let dim = 3;
+        let n = 3;
+
+        let norms: Vec<f32> = (0..n)
+            .map(|i| {
+                let start = i * dim;
+                vectors_flat[start..start + dim]
+                    .iter()
+                    .map(|&x| x * x)
+                    .sum::<f32>()
+                    .sqrt()
+            })
+            .collect();
+
+        let index = IvfIndex::build(
+            vectors_flat,
+            dim,
+            n,
+            norms,
+            Dist::Cosine,
+            2,
+            None,
+            42,
+            false,
+        );
+
+        let query = vec![1.0, 0.0, 0.0];
+        let (indices, distances) = index.query(&query, 3, Some(2)); // Search all clusters
+
+        assert_eq!(indices[0], 0);
+        assert_relative_eq!(distances[0], 0.0, epsilon = 1e-5);
+
+        // Check remaining results if found
+        if indices.len() >= 2 {
+            assert_relative_eq!(distances[1], 1.0, epsilon = 1e-5);
+        }
+        if indices.len() >= 3 {
+            assert_relative_eq!(distances[2], 1.0, epsilon = 1e-5);
+        }
+    }
+
+    #[test]
+    fn test_ivf_more_clusters() {
+        let (vectors_flat, dim, n, norms) = create_simple_vectors();
+
+        let index_few = IvfIndex::build(
+            vectors_flat.clone(),
+            dim,
+            n,
+            norms.clone(),
+            Dist::Euclidean,
+            2,
+            None,
+            42,
+            false,
+        );
+        let index_many = IvfIndex::build(
+            vectors_flat,
+            dim,
+            n,
+            norms,
+            Dist::Euclidean,
+            4,
+            None,
+            42,
+            false,
+        );
+
+        let query = vec![0.9, 0.1, 0.0];
+        let (indices1, _) = index_few.query(&query, 3, None);
+        let (indices2, _) = index_many.query(&query, 3, None);
+
+        assert_eq!(indices1.len(), 3);
+        assert_eq!(indices2.len(), 3);
     }
 }
