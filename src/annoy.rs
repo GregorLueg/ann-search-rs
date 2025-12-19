@@ -7,7 +7,7 @@ use std::cmp::Ordering;
 use std::collections::BinaryHeap;
 use std::iter::Sum;
 
-use crate::dist::VectorDistance;
+use crate::dist::*;
 use crate::utils::*;
 
 /////////////
@@ -730,7 +730,6 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::utils::Dist;
     use approx::assert_relative_eq;
     use faer::Mat;
 
@@ -788,7 +787,7 @@ mod tests {
 
     #[test]
     fn test_annoy_query_cosine() {
-        use crate::utils::Dist;
+        use crate::dist::*;
 
         let mat = create_simple_matrix();
         let index = AnnoyIndex::new(mat.as_ref(), 8, Dist::Cosine, 42);
@@ -803,7 +802,7 @@ mod tests {
 
     #[test]
     fn test_annoy_query_k_larger_than_dataset() {
-        use crate::utils::Dist;
+        use crate::dist::*;
 
         let mat = create_simple_matrix();
         let index = AnnoyIndex::new(mat.as_ref(), 4, Dist::Euclidean, 42);
@@ -818,7 +817,7 @@ mod tests {
 
     #[test]
     fn test_annoy_query_search_k() {
-        use crate::utils::Dist;
+        use crate::dist::*;
 
         let mat = create_simple_matrix();
         let index = AnnoyIndex::new(mat.as_ref(), 4, Dist::Euclidean, 42);
@@ -920,7 +919,7 @@ mod tests {
 
     #[test]
     fn test_annoy_orthogonal_vectors() {
-        use crate::utils::Dist;
+        use crate::dist::*;
         let data = [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0];
         let mat = Mat::from_fn(3, 3, |i, j| data[i * 3 + j]);
         let index = AnnoyIndex::new(mat.as_ref(), 4, Dist::Cosine, 42);

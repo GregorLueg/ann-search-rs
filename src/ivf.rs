@@ -683,7 +683,6 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::utils::Dist;
     use approx::assert_relative_eq;
 
     fn create_simple_vectors() -> (Vec<f32>, usize, usize, Vec<f32>) {

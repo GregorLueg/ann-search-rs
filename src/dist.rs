@@ -1,5 +1,44 @@
 use num_traits::Float;
 
+////////////
+// Helper //
+////////////
+
+/// Enum for the approximate nearest neighbour search
+#[derive(Clone, Debug, Copy, PartialEq, Default)]
+pub enum Dist {
+    /// Euclidean distance
+    #[default]
+    Euclidean,
+    /// Cosine distance
+    Cosine,
+}
+
+/// Parsing the approximate nearest neighbour distance
+///
+/// Currently, only Cosine and Euclidean are supported. Longer term, others
+/// shall be implemented.
+///
+/// ### Params
+///
+/// * `s` - The string that defines the tied summarisation type
+///
+/// ### Results
+///
+/// The `Dist` defining the distance metric to use for the approximate
+/// neighbour search.
+pub fn parse_ann_dist(s: &str) -> Option<Dist> {
+    match s.to_lowercase().as_str() {
+        "euclidean" => Some(Dist::Euclidean),
+        "cosine" => Some(Dist::Cosine),
+        _ => None,
+    }
+}
+
+///////////
+// Trait //
+///////////
+
 /// Trait for types that can compute distances between vectors
 pub trait VectorDistance<T: Float> {
     fn vectors_flat(&self) -> &[T];
