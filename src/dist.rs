@@ -246,6 +246,68 @@ pub trait VectorDistance<T: Float> {
     }
 }
 
+/// Static Euclidean distance between two arbitrary vectors (squared)
+///
+/// ### Params
+///
+/// * `a` - Slice of vector one
+/// * `b` - Slice of vector two
+///
+/// ### Returns
+///
+/// Squared euclidean distance
+#[inline(always)]
+pub fn euclidean_distance_static<T>(a: &[T], b: &[T]) -> T
+where
+    T: Float,
+{
+    a.iter()
+        .zip(b.iter())
+        .map(|(&x, &y)| {
+            let diff = x - y;
+            diff * diff
+        })
+        .fold(T::zero(), |acc, x| acc + x)
+}
+
+/// Static Cosine distance between two arbitrary vectors
+///
+/// Computes norms on the fly
+///
+/// ### Params
+///
+/// * `a` - Slice of vector one
+/// * `b` - Slice of vector two
+///
+/// ### Returns
+///
+/// Squared cosine distance
+#[inline(always)]
+pub fn cosine_distance_static<T>(a: &[T], b: &[T]) -> T
+where
+    T: Float,
+{
+    let dot: T = a
+        .iter()
+        .zip(b.iter())
+        .map(|(&x, &y)| x * y)
+        .fold(T::zero(), |acc, x| acc + x);
+
+    let norm_a = a
+        .iter()
+        .map(|&x| x * x)
+        .fold(T::zero(), |acc, x| acc + x)
+        .sqrt();
+
+    let norm_b = b
+        .iter()
+        .map(|&x| x * x)
+        .fold(T::zero(), |acc, x| acc + x)
+        .sqrt();
+
+    T::one() - (dot / (norm_a * norm_b))
+}
+
 ///////////
 // Tests //
 ///////////
@@ -273,6 +335,28 @@ mod tests {
         fn norms(&self) -> &[f32] {
             &self.norms
         }
+    }
+
+    #[test]
+    fn test_parse_ann_dist_euclidean() {
+        assert_eq!(parse_ann_dist("euclidean"), Some(Dist::Euclidean));
+        assert_eq!(parse_ann_dist("Euclidean"), Some(Dist::Euclidean));
+        assert_eq!(parse_ann_dist("EUCLIDEAN"), Some(Dist::Euclidean));
+    }
+
+    #[test]
+    fn test_parse_ann_dist_cosine() {
+        assert_eq!(parse_ann_dist("cosine"), Some(Dist::Cosine));
+        assert_eq!(parse_ann_dist("Cosine"), Some(Dist::Cosine));
+        assert_eq!(parse_ann_dist("COSINE"), Some(Dist::Cosine));
+    }
+
+    #[test]
+    fn test_parse_ann_dist_invalid() {
+        assert_eq!(parse_ann_dist("manhattan"), None);
+        assert_eq!(parse_ann_dist(""), None);
+        assert_eq!(parse_ann_dist("cosine "), None); // Trailing space
+        assert_eq!(parse_ann_dist(" euclidean"), None); // Leading space
     }
 
     #[test]

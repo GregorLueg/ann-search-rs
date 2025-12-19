@@ -76,3 +76,25 @@ pub fn print_results(config: &str, results: &[BenchmarkResult]) {
     }
     println!("{:->95}\n", "");
 }
+
+pub fn print_results_recall_only(config: &str, results: &[BenchmarkResult]) {
+    println!("\n{:=>83}", "");
+    println!("Benchmark: {}", config);
+    println!("{:=>83}", "");
+    println!(
+        "{:<30} {:>12} {:>12} {:>12} {:>12}",
+        "Method", "Build (ms)", "Query (ms)", "Total (ms)", "Recall@k"
+    );
+    println!("{:->83}", "");
+    for result in results {
+        println!(
+            "{:<30} {:>12.2} {:>12.2} {:>12.2} {:>12.4}",
+            result.method,
+            result.build_time_ms,
+            result.query_time_ms,
+            result.total_time_ms,
+            result.recall_at_k
+        );
+    }
+    println!("{:->83}\n", "");
+}
