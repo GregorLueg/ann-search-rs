@@ -572,7 +572,7 @@ where
         // search at insert layer
         state.reset(self.n);
         let ef = if insert_layer == 0 {
-            self.ef_construction / 2 // Lower ef for dense layer 0
+            self.ef_construction / 2
         } else {
             self.ef_construction
         };

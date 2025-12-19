@@ -1,4 +1,5 @@
 mod commons;
+
 use ann_search_rs::synthetic::generate_clustered_data;
 use ann_search_rs::utils::KnnValidation;
 use ann_search_rs::*;
@@ -8,22 +9,26 @@ use std::time::Instant;
 use thousands::*;
 
 fn main() {
-    const N_CELLS: usize = 100_000;
-    const DIM: usize = 32;
-    const N_CLUSTERS: usize = 25;
-    const K: usize = 10;
+     // test parameters
+    const N_CELLS: usize = 250_000;
+    const DIM: usize = 24;
+    const N_CLUSTERS: usize = 20;
+    const K: usize = 15;
     const SEED: u64 = 42;
+    const CLUSTER_SD: f64 = 0.8;
 
     println!("-----------------------------");
     println!(
-        "Generating synthetic data: {} cells, {} dimensions",
+        "Generating synthetic data: {} cells, {} dimensions, {} clusters.",
         N_CELLS.separate_with_underscores(),
-        DIM
+        DIM,
+        N_CLUSTERS,
     );
     println!("-----------------------------");
 
-    let data: Mat<f32> = generate_clustered_data(N_CELLS, DIM, N_CLUSTERS, 2.0, SEED);
+    let data: Mat<f32> = generate_clustered_data(N_CELLS, DIM, N_CLUSTERS, CLUSTER_SD, SEED);
     let query_data = data.as_ref();
+
     let mut results = Vec::new();
 
     println!("Building exhaustive index...");
@@ -48,43 +53,47 @@ fn main() {
 
     println!("-----------------------------");
 
-    let sqrt_n = (N_CELLS as f64).sqrt();
-    let nlist_values = [
-        (sqrt_n * 0.5) as usize,
-        sqrt_n as usize,
-        (sqrt_n * 1.5) as usize,
-        (sqrt_n * 2.0) as usize,
+    let build_params = [
+        (10, 8),
+        (20, 8),
+        (50, 8),
+        (10, 10),
+        (20, 10),
+        (50, 10),
+        (10, 12),
+        (20, 12),
+        (50, 12),
+        (10, 16),
+        (20, 16),
+        (50, 16),
     ];
 
-    for nlist in nlist_values {
-        println!("Building IVF index (nlist={})...", nlist);
+    for (num_tables, bits_per_hash) in build_params {
+        println!(
+            "Building LSH index (num_tab={}, bits={})...",
+            num_tables, bits_per_hash
+        );
         let start = Instant::now();
-        let ivf_idx = build_ivf_index(
+        let lsh_index = build_lsh_index(
             data.as_ref(),
-            nlist,
-            None,
             "euclidean",
+            num_tables,
+            bits_per_hash,
             SEED as usize,
-            false,
         );
         let build_time = start.elapsed().as_secs_f64() * 1000.0;
 
-        let nprobe_values = [
-            (0.05 * nlist as f64) as usize,
-            (0.1 * nlist as f64) as usize,
-            (0.15 * nlist as f64) as usize,
-            (0.2 * nlist as f64) as usize,
+        let search_budgets = [
+            (None, "auto"),
+            (Some(1000), "1k_cand"),
+            (Some(5000), "5k_cand"),
         ];
 
-        for nprobe in nprobe_values {
-            if nprobe > nlist || nprobe == 0 {
-                continue;
-            }
-
-            println!("Querying IVF index (nlist={}, nprobe={})...", nlist, nprobe);
+        for (max_cand, cand_label) in search_budgets {
+            println!("Querying LSH index (cand={})...", cand_label);
             let start = Instant::now();
             let (approx_neighbors, approx_distances) =
-                query_ivf_index(query_data, &ivf_idx, K, Some(nprobe), true, false);
+                query_lsh_index(query_data, &lsh_index, K, max_cand, true, false);
             let query_time = start.elapsed().as_secs_f64() * 1000.0;
 
             let recall = calculate_recall::<f32>(&true_neighbors, &approx_neighbors, K);
@@ -94,11 +103,11 @@ fn main() {
                 K,
             );
 
-            let internal_recall = ivf_idx.validate_index(K, SEED as usize, None);
+            let internal_recall = lsh_index.validate_index(K, SEED as usize, None);
             println!("  Internal validation: {:.3}", internal_recall);
 
             results.push(BenchmarkResult {
-                method: format!("IVF-nl{}-np{}", nlist, nprobe),
+                method: format!("LSH-nt{}-bits{}:{}", num_tables, bits_per_hash, cand_label),
                 build_time_ms: build_time,
                 query_time_ms: query_time,
                 total_time_ms: build_time + query_time,
