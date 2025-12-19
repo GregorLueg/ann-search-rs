@@ -152,11 +152,13 @@ thread_local! {
 /// This bounds memory to O(chunk_size × max_candidates) rather than
 /// O(n × max_candidates), reducing peak memory by 10-50× on large datasets.
 pub struct NNDescent<T> {
+    // shared ones
     pub vectors_flat: Vec<T>,
     pub dim: usize,
     pub n: usize,
-    norms: Vec<T>,
+    pub norms: Vec<T>,
     metric: Dist,
+    // index specific ones
     forest: AnnoyIndex<T>,
     graph: Vec<Vec<(usize, T)>>,
     converged: bool,

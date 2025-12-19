@@ -28,15 +28,17 @@ use crate::utils::*;
 /// * `inverted_lists` - Vector indices for each cluster (nlist lists)
 /// * `nlist` - Number of clusters in the index
 pub struct IvfIndex<T> {
+    /// shared ones
     pub vectors_flat: Vec<T>,
     pub dim: usize,
     pub n: usize,
     pub norms: Vec<T>,
-    pub metric: Dist,
-    pub centroids: Vec<T>,
-    pub all_indices: Vec<usize>,
-    pub offsets: Vec<usize>,
-    pub nlist: usize,
+    metric: Dist,
+    // index specific ones
+    centroids: Vec<T>,
+    all_indices: Vec<usize>,
+    offsets: Vec<usize>,
+    nlist: usize,
 }
 
 ////////////////////

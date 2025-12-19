@@ -10,6 +10,7 @@ pub mod lsh;
 pub mod nndescent;
 pub mod synthetic;
 pub mod utils;
+pub mod quantised;
 
 use faer::MatRef;
 use num_traits::{Float, FromPrimitive, ToPrimitive};

@@ -14,7 +14,6 @@ fn main() {
     const N_CLUSTERS: usize = 20;
     const K: usize = 15;
     const SEED: u64 = 42;
-    const CLUSTER_SD: f64 = 0.8;
 
     println!("-----------------------------");
     println!(
@@ -25,7 +24,7 @@ fn main() {
     );
     println!("-----------------------------");
 
-    let data: Mat<f32> = generate_clustered_data(N_CELLS, DIM, N_CLUSTERS, CLUSTER_SD, SEED);
+    let data: Mat<f32> = generate_clustered_data(N_CELLS, DIM, N_CLUSTERS, SEED);
     let query_data = data.as_ref();
     let mut results = Vec::new();
 
@@ -51,7 +50,16 @@ fn main() {
 
     println!("-----------------------------");
 
-    let build_params = [(16, 50), (16, 100), (16, 200), (24, 100), (24, 200)];
+    let build_params = [
+        (16, 50),
+        (16, 100),
+        (16, 200),
+        (24, 100),
+        (24, 200),
+        (24, 300),
+        (32, 200),
+        (32, 300),
+    ];
 
     for (m, ef_construction) in build_params {
         println!(

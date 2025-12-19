@@ -172,11 +172,13 @@ const MIN_MEMBERS: usize = 64;
 /// * `leaf_indices` - Actual data indices stored in leaf nodes
 /// * `n_trees` - Number of trees in the forest
 pub struct AnnoyIndex<T> {
+    // shared ones
     pub vectors_flat: Vec<T>,
     pub dim: usize,
     pub n: usize,
     norms: Vec<T>,
     metric: Dist,
+    // index specific
     nodes: Vec<FlatNode>,
     roots: Vec<u32>,
     split_data: Vec<T>,

@@ -8,13 +8,12 @@ use std::time::Instant;
 use thousands::*;
 
 fn main() {
-     // test parameters
+    // test parameters
     const N_CELLS: usize = 250_000;
     const DIM: usize = 24;
     const N_CLUSTERS: usize = 20;
     const K: usize = 15;
     const SEED: u64 = 42;
-    const CLUSTER_SD: f64 = 0.8;
 
     println!("-----------------------------");
     println!(
@@ -25,7 +24,7 @@ fn main() {
     );
     println!("-----------------------------");
 
-    let data: Mat<f32> = generate_clustered_data(N_CELLS, DIM, N_CLUSTERS, CLUSTER_SD, SEED);
+    let data: Mat<f32> = generate_clustered_data(N_CELLS, DIM, N_CLUSTERS, SEED);
     let query_data = data.as_ref();
     let mut results = Vec::new();
 
