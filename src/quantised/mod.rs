@@ -1,2 +1,2 @@
-pub mod ivfsq8;
+pub mod ivf_sq8;
 pub mod quantisers;

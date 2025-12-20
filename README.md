@@ -25,10 +25,6 @@ Rust of some of these.
   attempting rapid index generation.
   - **NNDescent (Nearest Neighbour Descent)** 
   (heavily inspired by [PyNNDescent](https://github.com/lmcinnes/pynndescent)).
-  - [**FANNG (Fast Approximate Nearest Neighbour Graphs)**](https://openaccess.thecvf.com/content_cvpr_2016/papers/Harwood_FANNG_Fast_Approximate_CVPR_2016_paper.pdf).
-  A version with some modifications in terms of starting node generation and
-  some parallel operations in the index generation for speed purposes. This
-  version is still being actively developed and optimised.
   - [**LSH (Locality Sensitive Hashing)**](https://en.wikipedia.org/wiki/Locality-sensitive_hashing) An
   approximate nearest neighbour search that can be very fast at the cost of
   precision. 

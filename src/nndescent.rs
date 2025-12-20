@@ -13,7 +13,8 @@ use std::time::Instant;
 use thousands::*;
 
 use crate::annoy::*;
-use crate::dist::*;
+use crate::utils::dist::*;
+use crate::utils::heap_structs::*;
 use crate::utils::*;
 
 /// Neighbour entry in k-NN graph

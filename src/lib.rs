@@ -1,9 +1,7 @@
 #![allow(clippy::needless_range_loop)] // I want these loops!
 
 pub mod annoy;
-pub mod dist;
 pub mod exhaustive;
-pub mod fanng;
 pub mod hnsw;
 pub mod ivf;
 pub mod lsh;
@@ -21,14 +19,13 @@ use std::sync::Arc;
 use thousands::*;
 
 use crate::annoy::*;
-use crate::dist::*;
 use crate::exhaustive::*;
-use crate::fanng::*;
 use crate::hnsw::*;
 use crate::ivf::*;
 use crate::lsh::*;
 use crate::nndescent::*;
-use crate::quantised::ivfsq8::*;
+use crate::quantised::ivf_sq8::*;
+use crate::utils::dist::*;
 
 ///////////
 // Annoy //
@@ -388,120 +385,6 @@ where
                         );
                     }
                 }
-                indices
-            })
-            .collect();
-
-        (indices, None)
-    }
-}
-
-///////////
-// FANNG //
-///////////
-
-/// Build a FANNG index from an embedding matrix
-///
-/// ### Params
-///
-/// * `mat` - Embedding matrix (rows = samples, cols = features)
-/// * `dist_metric` - Distance metric: "euclidean" or "cosine"
-/// * `faang_params` - Optional FANNG parameters (uses default if None)
-/// * `seed` - Random seed for reproducibility
-/// * `verbose` - Print progress updates during construction
-///
-/// ### Returns
-///
-/// Constructed FANNG index ready for querying
-pub fn build_fanng_index<T>(
-    mat: MatRef<T>,
-    dist_metric: &str,
-    faang_params: Option<FanngParams>,
-    seed: usize,
-    verbose: bool,
-) -> Fanng<T>
-where
-    T: Float + Send + Sync,
-{
-    let faang_params = faang_params.unwrap_or_default();
-
-    Fanng::new(mat, dist_metric, &faang_params, seed, verbose)
-}
-
-/// Query a FANNG index
-///
-/// ### Params
-///
-/// * `query_mat` - The query matrix containing the samples × features
-/// * `index` - The pre-built FANNG index
-/// * `k` - Number of neighbours to return
-/// * `max_calcs` - Maximum number of distance calculations per query (controls
-///   recall/speed trade-off)
-/// * `no_shortcuts` - How many of the random indices selected in the graph
-///   shall be explored.
-/// * `return_dist` - Whether to return distances between points
-/// * `verbose` - Print progress updates
-///
-/// ### Returns
-///
-/// A tuple of `(knn_indices, optional distances)`
-pub fn query_fanng_index<T>(
-    query_mat: MatRef<T>,
-    index: &Fanng<T>,
-    k: usize,
-    max_calcs: usize,
-    no_shortcuts: usize,
-    return_dist: bool,
-    verbose: bool,
-) -> (Vec<Vec<usize>>, Option<Vec<Vec<T>>>)
-where
-    T: Float + Send + Sync,
-{
-    let n_samples = query_mat.nrows();
-    let counter = Arc::new(AtomicUsize::new(0));
-
-    if return_dist {
-        let results: Vec<(Vec<usize>, Vec<T>)> = (0..n_samples)
-            .into_par_iter()
-            .map(|i| {
-                let query: Vec<T> = query_mat.row(i).iter().copied().collect();
-                let (indices, distances) = index.query(&query, k, max_calcs, no_shortcuts);
-
-                if verbose {
-                    let count = counter.fetch_add(1, Ordering::Relaxed) + 1;
-                    if count.is_multiple_of(100_000) {
-                        println!(
-                            " Processed {} / {} samples.",
-                            count.separate_with_underscores(),
-                            n_samples.separate_with_underscores()
-                        );
-                    }
-                }
-
-                (indices, distances)
-            })
-            .collect();
-
-        let (indices, distances) = results.into_iter().unzip();
-        (indices, Some(distances))
-    } else {
-        let indices: Vec<Vec<usize>> = (0..n_samples)
-            .into_par_iter()
-            .map(|i| {
-                let query: Vec<T> = query_mat.row(i).iter().copied().collect();
-                let (indices, _) = index.query(&query, k, max_calcs, no_shortcuts);
-
-                if verbose {
-                    let count = counter.fetch_add(1, Ordering::Relaxed) + 1;
-                    if count.is_multiple_of(100_000) {
-                        println!(
-                            " Processed {} / {} samples.",
-                            count.separate_with_underscores(),
-                            n_samples.separate_with_underscores()
-                        );
-                    }
-                }
-
                 indices
             })
             .collect();
@@ -912,6 +795,7 @@ pub fn build_ivf_sq8_index<T>(
     mat: MatRef<T>,
     nlist: usize,
     max_iters: Option<usize>,
+    dist_metric: &str,
     seed: usize,
     verbose: bool,
 ) -> IvfSq8Index<T>
@@ -920,13 +804,23 @@ where
 {
     let n = mat.nrows();
     let dim = mat.ncols();
+    let ann_dist = parse_ann_dist(dist_metric).unwrap_or_default();
 
     let mut vectors_flat = Vec::with_capacity(n * dim);
     for i in 0..n {
         vectors_flat.extend(mat.row(i).iter().cloned());
     }
 
-    IvfSq8Index::build(vectors_flat, dim, n, nlist, max_iters, seed, verbose)
+    IvfSq8Index::build(
+        vectors_flat,
+        dim,
+        n,
+        nlist,
+        ann_dist,
+        max_iters,
+        seed,
+        verbose,
+    )
 }
 
 /// Helper function to query a given IVF-SQ8 index
@@ -962,7 +856,7 @@ where
         let results: Vec<(Vec<usize>, Vec<T>)> = (0..n_samples)
             .into_par_iter()
             .map(|i| {
-                let (neighbours, scores) = index.query_row_symmetric(query_mat.row(i), k, nprobe);
+                let (neighbours, scores) = index.query_row(query_mat.row(i), k, nprobe);
                 if verbose {
                     let count = counter.fetch_add(1, Ordering::Relaxed) + 1;
                     if count.is_multiple_of(100_000) {
@@ -982,7 +876,7 @@ where
         let indices: Vec<Vec<usize>> = (0..n_samples)
             .into_par_iter()
             .map(|i| {
-                let (neighbours, _) = index.query_row_symmetric(query_mat.row(i), k, nprobe);
+                let (neighbours, _) = index.query_row(query_mat.row(i), k, nprobe);
                 if verbose {
                     let count = counter.fetch_add(1, Ordering::Relaxed) + 1;
                     if count.is_multiple_of(100_000) {

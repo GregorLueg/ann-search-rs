@@ -45,7 +45,7 @@ fn main() {
         query_time_ms: query_time,
         total_time_ms: build_time + query_time,
         recall_at_k: 1.0,
-        mean_distance_error: 0.0,
+        mean_dist_err: 0.0,
     });
 
     println!("-----------------------------");
@@ -86,7 +86,7 @@ fn main() {
                 query_hnsw_index(query_data, &hnsw_idx, K, ef_search, true, false);
             let query_time = start.elapsed().as_secs_f64() * 1000.0;
 
-            let recall = calculate_recall::<f32>(&true_neighbors, &approx_neighbors, K);
+            let recall = calculate_recall(&true_neighbors, &approx_neighbors, K);
             let dist_error = calculate_distance_error(
                 true_distances.as_ref().unwrap(),
                 approx_distances.as_ref().unwrap(),
@@ -102,7 +102,7 @@ fn main() {
                 query_time_ms: query_time,
                 total_time_ms: build_time + query_time,
                 recall_at_k: recall,
-                mean_distance_error: dist_error,
+                mean_dist_err: dist_error,
             });
         }
     }

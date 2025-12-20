@@ -2,7 +2,9 @@ use faer::RowRef;
 use num_traits::{Float, FromPrimitive, ToPrimitive};
 use std::collections::BinaryHeap;
 
-use crate::dist::*;
+use crate::utils::dist::*;
+use crate::utils::heap_structs::*;
+use crate::utils::k_means::*;
 use crate::utils::*;
 
 /// IVF (Inverted File) index for similarity search
@@ -20,7 +22,8 @@ use crate::utils::*;
 /// * `norms` - Pre-computed norms for Cosine distance (empty for Euclidean)
 /// * `metric` - Distance metric (Euclidean or Cosine)
 /// * `centroids` - Cluster centres (nlist * dim elements)
-/// * `inverted_lists` - Vector indices for each cluster (nlist lists)
+/// * `all_indices` - Vector indices for each cluster (in a flat structure)
+/// * `offsets` - Offsets of the elements of each inverted list.
 /// * `nlist` - Number of clusters in the index
 pub struct IvfIndex<T> {
     /// shared ones
@@ -64,14 +67,34 @@ impl<T> IvfIndex<T>
 where
     T: Float + FromPrimitive + ToPrimitive + Send + Sync,
 {
-    /// Build an IVF index with optimized memory layout and parallel training.
+    /// Build an IVF index with optimised memory layout and parallel training.
     ///
-    /// ### Workflow:
-    /// 1. **Subsampling**: Samples training data if the dataset is > 500k points.
-    /// 2. **Fast Init**: Uses random selection for large cluster counts (nlist) to avoid
-    ///    the $O(N \cdot k)$ bottleneck of k-means||.
-    /// 3. **Parallel Lloyd's**: Recomputes centroids using a parallel reduction pattern.
-    /// 4. **CSR Finalization**: Flattens assignments into a contiguous memory block.
+    /// Constructs an inverted file index by clustering vectors with k-means,
+    /// then assigns each vector to its nearest centroid. Uses a CSR (Compressed
+    /// Sparse Row) layout for cache-efficient cluster traversal during search.
+    ///
+    /// ### Workflow
+    ///
+    /// 1. Subsamples 250k vectors for training if dataset exceeds 500k
+    /// 2. Runs k-means clustering to find nlist centroids
+    /// 3. Assigns all vectors to their nearest centroid in parallel
+    /// 4. Builds CSR layout grouping vectors by cluster for locality
+    ///
+    /// ### Params
+    ///
+    /// * `vectors_flat` - Flattened vector data (length = n * dim)
+    /// * `dim` - Embedding dimensions
+    /// * `n` - Number of vectors
+    /// * `norms` - Pre-computed norms for Cosine distance (empty for Euclidean)
+    /// * `metric` - Distance metric (Euclidean or Cosine)
+    /// * `nlist` - Number of clusters (more = faster search, lower recall)
+    /// * `max_iters` - Maximum k-means iterations (defaults to 30)
+    /// * `seed` - Random seed for reproducibility
+    /// * `verbose` - Print training progress
+    ///
+    /// ### Returns
+    ///
+    /// Constructed index ready for querying
     #[allow(clippy::too_many_arguments)]
     pub fn build(
         vectors_flat: Vec<T>,
@@ -154,8 +177,8 @@ where
             .map(|c| {
                 let cent = &self.centroids[c * self.dim..(c + 1) * self.dim];
                 let dist = match self.metric {
-                    Dist::Euclidean => Self::euclidean_distance_static(query_vec, cent),
-                    Dist::Cosine => Self::cosine_distance_static(query_vec, cent),
+                    Dist::Euclidean => euclidean_distance_static(query_vec, cent),
+                    Dist::Cosine => cosine_distance_static(query_vec, cent),
                 };
                 (dist, c)
             })

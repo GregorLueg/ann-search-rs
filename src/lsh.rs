@@ -10,7 +10,8 @@ use std::cell::RefCell;
 use std::cmp::Ord;
 use std::collections::BinaryHeap;
 
-use crate::dist::*;
+use crate::utils::dist::*;
+use crate::utils::heap_structs::*;
 use crate::utils::*;
 
 thread_local! {

@@ -4,10 +4,8 @@ use num_traits::{Float, FromPrimitive, ToPrimitive};
 // Scalar quantisation //
 /////////////////////////
 
-/// ScalarQuantiser
 pub struct ScalarQuantiser<T> {
-    pub min: Vec<T>,
-    pub max: Vec<T>,
+    pub scales: Vec<T>,
 }
 
 impl<T> ScalarQuantiser<T>
@@ -25,17 +23,23 @@ where
     ///
     /// Initialised self
     pub fn train(vec: &[T], dim: usize) -> Self {
-        let mut min = vec![T::infinity(); dim];
-        let mut max = vec![T::neg_infinity(); dim];
+        let mut scales = vec![T::zero(); dim];
 
         for chunk in vec.chunks_exact(dim) {
             for (d, &val) in chunk.iter().enumerate() {
-                min[d] = min[d].min(val);
-                max[d] = max[d].max(val);
+                scales[d] = scales[d].max(val.abs());
             }
         }
 
-        Self { min, max }
+        for scale in &mut scales {
+            if *scale <= T::zero() {
+                *scale = T::one();
+            } else {
+                *scale = *scale / T::from_i8(127).unwrap();
+            }
+        }
+
+        Self { scales }
     }
 
     /// Encode a vector
@@ -47,16 +51,15 @@ where
     /// ### Returns
     ///
     /// The quantised vector
-    pub fn encode(&self, vec: &[T]) -> Vec<u8> {
+    pub fn encode(&self, vec: &[T]) -> Vec<i8> {
         vec.iter()
             .enumerate()
             .map(|(d, &val)| {
-                let norm = (val - self.min[d]) / (self.max[d] - self.min[d]);
-                let scaled = norm * T::from_f64(255.0).unwrap();
+                let scaled = val / self.scales[d];
                 let clamped = scaled
-                    .min(T::from_f64(255.0).unwrap())
-                    .max(T::from_f64(0.0).unwrap());
-                clamped.to_u8().unwrap()
+                    .min(T::from_i8(127).unwrap())
+                    .max(T::from_i8(-127).unwrap());
+                clamped.to_i8().unwrap_or(0)
             })
             .collect()
     }
@@ -70,14 +73,15 @@ where
     /// ### Returns
     ///
     /// Original decompressed vector
-    pub fn decode(&self, quantised: &[u8]) -> Vec<T> {
+    pub fn decode(&self, quantised: &[i8]) -> Vec<T> {
         quantised
             .iter()
             .enumerate()
-            .map(|(d, &val)| {
-                let norm = T::from_u8(val).unwrap() / T::from_f64(255.0).unwrap();
-                norm * (self.max[d] - self.min[d]) + self.min[d]
-            })
+            .map(|(d, &val)| T::from_i8(val).unwrap() * self.scales[d])
             .collect()
     }
 }
+
+/////////
+// F16 //
+/////////
