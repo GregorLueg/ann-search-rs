@@ -9,6 +9,7 @@ use rustc_hash::FxHashSet;
 use std::cell::RefCell;
 use std::cmp::Ord;
 use std::collections::BinaryHeap;
+use std::iter::Sum;
 
 use crate::utils::dist::*;
 use crate::utils::heap_structs::*;
@@ -59,7 +60,7 @@ pub struct LSHIndex<T> {
 /// VectorDistance trait
 impl<T> VectorDistance<T> for LSHIndex<T>
 where
-    T: Float + FromPrimitive + ToPrimitive + Send + Sync,
+    T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum,
 {
     /// Return the flat vectors
     fn vectors_flat(&self) -> &[T] {
@@ -79,7 +80,7 @@ where
 
 impl<T> LSHIndex<T>
 where
-    T: Float + FromPrimitive + ToPrimitive + Send + Sync,
+    T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum,
     Self: LSHQuery<T>,
 {
     /// Construct a new LSH index
@@ -403,6 +404,9 @@ impl LSHQuery<f32> for LSHIndex<f32> {
                     heap.clear();
                     seen.clear();
 
+                    // pre-reserve
+                    cand.reserve(10000);
+
                     for table_idx in 0..self.num_tables {
                         let hash = Self::compute_hash(
                             query_vec,
@@ -506,6 +510,9 @@ impl LSHQuery<f64> for LSHIndex<f64> {
                     heap.clear();
                     seen.clear();
 
+                    // pre-reserve
+                    cand.reserve(10000);
+
                     for table_idx in 0..self.num_tables {
                         let hash = Self::compute_hash(
                             query_vec,
@@ -589,7 +596,7 @@ impl LSHQuery<f64> for LSHIndex<f64> {
 
 impl<T> KnnValidation<T> for LSHIndex<T>
 where
-    T: Float + FromPrimitive + ToPrimitive + Send + Sync,
+    T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum,
     Self: LSHQuery<T>,
 {
     /// Internal querying function
@@ -613,8 +620,6 @@ where
 //////////////////////////
 // HierarchicalLSHIndex //
 //////////////////////////
-
-
 
 ///////////
 // Tests //

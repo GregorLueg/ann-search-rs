@@ -1,4 +1,5 @@
 mod commons;
+
 use ann_search_rs::synthetic::generate_clustered_data;
 use ann_search_rs::utils::KnnValidation;
 use ann_search_rs::*;
@@ -10,11 +11,11 @@ use thousands::*;
 
 fn main() {
     // test parameters
-    const N_CELLS: usize = 150_000;
+    const N_CELLS: usize = 250_000;
     const DIM: usize = 24;
     const N_CLUSTERS: usize = 20;
     const K: usize = 15;
-    const SEED: u64 = 42;
+    const SEED: u64 = 10101;
     const DISTANCE: &str = "euclidean";
 
     println!("-----------------------------");
@@ -65,7 +66,6 @@ fn main() {
             (0.05 * nlist as f64) as usize,
             (0.1 * nlist as f64) as usize,
             (0.15 * nlist as f64) as usize,
-            (0.2 * nlist as f64) as usize,
         ];
 
         let mut nprobe_values: Vec<_> = nprobe_values

@@ -10,12 +10,12 @@ use thousands::*;
 
 fn main() {
     // test parameters
-    const N_CELLS: usize = 500_000;
+    const N_CELLS: usize = 250_000;
     const DIM: usize = 24;
     const N_CLUSTERS: usize = 20;
     const K: usize = 15;
-    const SEED: u64 = 42;
-    const DISTANCE: &str = "euclidean";
+    const SEED: u64 = 10101;
+    const DISTANCE: &str = "cosine";
 
     println!("-----------------------------");
     println!(
@@ -56,15 +56,16 @@ fn main() {
     let build_params = [
         (10, 8),
         (20, 8),
-        (50, 8),
+        (25, 8),
         (10, 10),
         (20, 10),
-        (50, 10),
+        (25, 10),
         (10, 12),
         (20, 12),
-        (50, 12),
+        (25, 12),
         (10, 16),
         (20, 16),
+        (25, 16),
         (50, 16),
     ];
 
@@ -83,11 +84,7 @@ fn main() {
         );
         let build_time = start.elapsed().as_secs_f64() * 1000.0;
 
-        let search_budgets = [
-            (None, "auto"),
-            (Some(1000), "1k_cand"),
-            (Some(5000), "5k_cand"),
-        ];
+        let search_budgets = [(None, "auto"), (Some(5000), "5k_cand")];
 
         for (max_cand, cand_label) in search_budgets {
             println!("Querying LSH index (cand={})...", cand_label);

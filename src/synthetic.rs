@@ -58,6 +58,7 @@ where
         cluster_assignments.push(rng.random_range(0..n_clusters));
     }
     cluster_assignments.shuffle(&mut rng);
+    cluster_assignments.truncate(n_samples);
 
     // Generate with variable noise
     for (i, &cluster_idx) in cluster_assignments.iter().enumerate() {

@@ -41,7 +41,10 @@ pub fn parse_ann_dist(s: &str) -> Option<Dist> {
 ////////////////////
 
 /// Trait for computing distances between Floats
-pub trait VectorDistance<T: Float> {
+pub trait VectorDistance<T>
+where
+    T: Float + Sum,
+{
     /// Get the internal flat vector representation
     fn vectors_flat(&self) -> &[T];
 
@@ -75,17 +78,22 @@ pub trait VectorDistance<T: Float> {
     fn euclidean_distance(&self, i: usize, j: usize) -> T {
         let start_i = i * self.dim();
         let start_j = j * self.dim();
-        let vec_i = &self.vectors_flat()[start_i..start_i + self.dim()];
-        let vec_j = &self.vectors_flat()[start_j..start_j + self.dim()];
-
-        vec_i
-            .iter()
-            .zip(vec_j.iter())
-            .map(|(&a, &b)| {
-                let diff = a - b;
-                diff * diff
-            })
-            .fold(T::zero(), |acc, x| acc + x)
+        unsafe {
+            let vec_i = self
+                .vectors_flat()
+                .get_unchecked(start_i..start_i + self.dim());
+            let vec_j = self
+                .vectors_flat()
+                .get_unchecked(start_j..start_j + self.dim());
+            vec_i
+                .iter()
+                .zip(vec_j.iter())
+                .map(|(&a, &b)| {
+                    let diff = a - b;
+                    diff * diff
+                })
+                .fold(T::zero(), |acc, x| acc + x)
+        }
     }
 
     /// Euclidean distance between query vector and internal vector (squared)
@@ -101,15 +109,17 @@ pub trait VectorDistance<T: Float> {
     #[inline(always)]
     fn euclidean_distance_to_query(&self, internal_idx: usize, query: &[T]) -> T {
         let start = internal_idx * self.dim();
-        let vec = &self.vectors_flat()[start..start + self.dim()];
 
-        vec.iter()
-            .zip(query.iter())
-            .map(|(&a, &b)| {
-                let diff = a - b;
-                diff * diff
-            })
-            .fold(T::zero(), |acc, x| acc + x)
+        unsafe {
+            let vec = &self.vectors_flat().get_unchecked(start..start + self.dim());
+            vec.iter()
+                .zip(query.iter())
+                .map(|(&a, &b)| {
+                    let diff = a - b;
+                    diff * diff
+                })
+                .fold(T::zero(), |acc, x| acc + x)
+        }
     }
 
     ////////////
@@ -135,16 +145,22 @@ pub trait VectorDistance<T: Float> {
     fn cosine_distance(&self, i: usize, j: usize) -> T {
         let start_i = i * self.dim();
         let start_j = j * self.dim();
-        let vec_i = &self.vectors_flat()[start_i..start_i + self.dim()];
-        let vec_j = &self.vectors_flat()[start_j..start_j + self.dim()];
+        unsafe {
+            let vec_i = &self
+                .vectors_flat()
+                .get_unchecked(start_i..start_i + self.dim());
+            let vec_j = &self
+                .vectors_flat()
+                .get_unchecked(start_j..start_j + self.dim());
 
-        let dot = vec_i
-            .iter()
-            .zip(vec_j.iter())
-            .map(|(&a, &b)| a * b)
-            .fold(T::zero(), |acc, x| acc + x);
+            let dot = vec_i
+                .iter()
+                .zip(vec_j.iter())
+                .map(|(&a, &b)| a * b)
+                .fold(T::zero(), |acc, x| acc + x);
 
-        T::one() - (dot / (self.norms()[i] * self.norms()[j]))
+            T::one() - (dot / (self.norms()[i] * self.norms()[j]))
+        }
     }
 
     /// Cosine distance between query vector and internal vector
@@ -161,15 +177,18 @@ pub trait VectorDistance<T: Float> {
     #[inline(always)]
     fn cosine_distance_to_query(&self, internal_idx: usize, query: &[T], query_norm: T) -> T {
         let start = internal_idx * self.dim();
-        let vec = &self.vectors_flat()[start..start + self.dim()];
 
-        let dot = vec
-            .iter()
-            .zip(query.iter())
-            .map(|(&a, &b)| a * b)
-            .fold(T::zero(), |acc, x| acc + x);
+        unsafe {
+            let vec = &self.vectors_flat().get_unchecked(start..start + self.dim());
 
-        T::one() - (dot / (query_norm * self.norms()[internal_idx]))
+            let dot = vec
+                .iter()
+                .zip(query.iter())
+                .map(|(&a, &b)| a * b)
+                .fold(T::zero(), |acc, x| acc + x);
+
+            T::one() - (dot / (query_norm * self.norms()[internal_idx]))
+        }
     }
 }
 
@@ -330,7 +349,11 @@ where
 /// * `vec` - The vector to normalise
 #[inline]
 pub fn normalise_vector<T: Float + Sum>(vec: &mut [T]) {
-    let norm = vec.iter().map(|&v| v * v).sum::<T>().sqrt();
+    let norm = vec
+        .iter()
+        .map(|&v| v * v)
+        .fold(T::zero(), |acc, x| acc + x)
+        .sqrt();
     if norm > T::zero() {
         vec.iter_mut().for_each(|v| *v = *v / norm);
     }

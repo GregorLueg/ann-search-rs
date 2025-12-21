@@ -1,6 +1,7 @@
 use faer::RowRef;
 use num_traits::{Float, FromPrimitive, ToPrimitive};
 use std::collections::BinaryHeap;
+use std::iter::Sum;
 
 use crate::utils::dist::*;
 use crate::utils::heap_structs::*;
@@ -45,7 +46,7 @@ pub struct IvfIndex<T> {
 
 impl<T> VectorDistance<T> for IvfIndex<T>
 where
-    T: Float + FromPrimitive + ToPrimitive + Send + Sync,
+    T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum,
 {
     /// Return the flat vectors
     fn vectors_flat(&self) -> &[T] {
@@ -65,7 +66,7 @@ where
 
 impl<T> IvfIndex<T>
 where
-    T: Float + FromPrimitive + ToPrimitive + Send + Sync,
+    T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum,
 {
     /// Build an IVF index with optimised memory layout and parallel training.
     ///
@@ -169,7 +170,7 @@ where
     /// Tuple of `(indices, distances)` sorted by distance (nearest first)
     #[inline]
     pub fn query(&self, query_vec: &[T], k: usize, nprobe: Option<usize>) -> (Vec<usize>, Vec<T>) {
-        let nprobe = nprobe.unwrap_or_else(|| (((self.nlist as f64) * 0.2) as usize).max(1));
+        let nprobe = nprobe.unwrap_or_else(|| (((self.nlist as f64) * 0.15) as usize).max(1));
         let k = k.min(self.n);
 
         // 1. Find the top `nprobe` centroids
@@ -264,7 +265,7 @@ where
 
 impl<T> KnnValidation<T> for IvfIndex<T>
 where
-    T: Float + FromPrimitive + ToPrimitive + Send + Sync,
+    T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum,
 {
     /// Internal querying function
     fn query_for_validation(&self, query_vec: &[T], k: usize) -> (Vec<usize>, Vec<T>) {

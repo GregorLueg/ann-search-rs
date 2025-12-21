@@ -1,4 +1,5 @@
 mod commons;
+
 use ann_search_rs::synthetic::generate_clustered_data;
 use ann_search_rs::utils::KnnValidation;
 use ann_search_rs::*;
@@ -13,8 +14,8 @@ fn main() {
     const DIM: usize = 24;
     const N_CLUSTERS: usize = 20;
     const K: usize = 15;
-    const SEED: u64 = 42;
-    const DISTANCE: &str = "euclidean";
+    const SEED: u64 = 10101;
+    const DISTANCE: &str = "cosine";
 
     println!("-----------------------------");
     println!(

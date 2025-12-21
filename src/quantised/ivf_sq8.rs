@@ -228,7 +228,7 @@ where
             normalise_vector(&mut query_vec);
         }
 
-        let nprobe = nprobe.unwrap_or_else(|| (((self.nlist as f64) * 0.2) as usize).max(1));
+        let nprobe = nprobe.unwrap_or_else(|| (((self.nlist as f64) * 0.15) as usize).max(1));
         let k = k.min(self.n);
 
         // Find top nprobe centroids

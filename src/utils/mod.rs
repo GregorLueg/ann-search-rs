@@ -8,6 +8,7 @@ use rand::Rng;
 use rand::SeedableRng;
 use rustc_hash::FxHashSet;
 use std::collections::BinaryHeap;
+use std::iter::Sum;
 
 use crate::utils::dist::*;
 use crate::utils::heap_structs::*;
@@ -18,7 +19,7 @@ use crate::utils::heap_structs::*;
 
 pub trait KnnValidation<T>: VectorDistance<T>
 where
-    T: Float + FromPrimitive + ToPrimitive + Send + Sync,
+    T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum,
 {
     /// Query for validation purposes
     ///

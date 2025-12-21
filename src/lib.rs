@@ -160,7 +160,7 @@ pub fn build_hnsw_index<T>(
     verbose: bool,
 ) -> HnswIndex<T>
 where
-    T: Float + FromPrimitive + ToPrimitive + Send + Sync,
+    T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum,
     HnswIndex<T>: HnswState<T>,
 {
     HnswIndex::build(mat, m, ef_construction, dist_metric, seed, verbose)
@@ -196,7 +196,7 @@ pub fn query_hnsw_index<T>(
     verbose: bool,
 ) -> (Vec<Vec<usize>>, Option<Vec<Vec<T>>>)
 where
-    T: Float + FromPrimitive + ToPrimitive + Send + Sync,
+    T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum,
     HnswIndex<T>: HnswState<T>,
 {
     let n_samples = query_mat.nrows();
@@ -409,7 +409,7 @@ where
 /// The initialised `ExhausiveIndex`
 pub fn build_exhaustive_index<T>(mat: MatRef<T>, dist_metric: &str) -> ExhaustiveIndex<T>
 where
-    T: Float + FromPrimitive + ToPrimitive + Send + Sync,
+    T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum,
 {
     let metric = parse_ann_dist(dist_metric).unwrap_or_default();
     ExhaustiveIndex::new(mat, metric)
@@ -436,7 +436,7 @@ pub fn query_exhaustive_index<T>(
     verbose: bool,
 ) -> (Vec<Vec<usize>>, Option<Vec<Vec<T>>>)
 where
-    T: Float + FromPrimitive + ToPrimitive + Send + Sync,
+    T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum,
 {
     let n_samples = query_mat.nrows();
     let counter = Arc::new(AtomicUsize::new(0));
@@ -510,7 +510,7 @@ pub fn build_lsh_index<T>(
     seed: usize,
 ) -> LSHIndex<T>
 where
-    T: Float + FromPrimitive + ToPrimitive + Send + Sync,
+    T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum,
     LSHIndex<T>: LSHQuery<T>,
 {
     let metric = parse_ann_dist(dist_metric).unwrap_or_default();
@@ -539,7 +539,7 @@ pub fn query_lsh_index<T>(
     verbose: bool,
 ) -> (Vec<Vec<usize>>, Option<Vec<Vec<T>>>)
 where
-    T: Float + FromPrimitive + ToPrimitive + Send + Sync,
+    T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum,
     LSHIndex<T>: LSHQuery<T>,
 {
     let n_samples = query_mat.nrows();
@@ -645,7 +645,7 @@ pub fn build_ivf_index<T>(
     verbose: bool,
 ) -> IvfIndex<T>
 where
-    T: Float + FromPrimitive + ToPrimitive + Send + Sync,
+    T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum,
 {
     let n = mat.nrows();
     let dim = mat.ncols();
@@ -716,7 +716,7 @@ pub fn query_ivf_index<T>(
     verbose: bool,
 ) -> (Vec<Vec<usize>>, Option<Vec<Vec<T>>>)
 where
-    T: Float + FromPrimitive + ToPrimitive + Send + Sync,
+    T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum,
 {
     let n_samples = query_mat.nrows();
     let counter = Arc::new(AtomicUsize::new(0));
