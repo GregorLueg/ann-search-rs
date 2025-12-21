@@ -10,18 +10,20 @@ use thousands::*;
 
 fn main() {
     // test parameters
-    const N_CELLS: usize = 50_000;
+    const N_CELLS: usize = 500_000;
     const DIM: usize = 24;
     const N_CLUSTERS: usize = 20;
     const K: usize = 15;
     const SEED: u64 = 42;
+    const DISTANCE: &str = "euclidean";
 
     println!("-----------------------------");
     println!(
-        "Generating synthetic data: {} cells, {} dimensions, {} clusters.",
+        "Generating synthetic data: {} cells, {} dimensions, {} clusters, {} dist.",
         N_CELLS.separate_with_underscores(),
         DIM,
         N_CLUSTERS,
+        DISTANCE
     );
     println!("-----------------------------");
 
@@ -31,7 +33,7 @@ fn main() {
 
     println!("Building exhaustive index...");
     let start = Instant::now();
-    let exhaustive_idx = build_exhaustive_index(data.as_ref(), "euclidean");
+    let exhaustive_idx = build_exhaustive_index(data.as_ref(), DISTANCE);
     let build_time = start.elapsed().as_secs_f64() * 1000.0;
 
     println!("Querying exhaustive index...");
@@ -74,7 +76,7 @@ fn main() {
         let start = Instant::now();
         let lsh_index = build_lsh_index(
             data.as_ref(),
-            "euclidean",
+            DISTANCE,
             num_tables,
             bits_per_hash,
             SEED as usize,

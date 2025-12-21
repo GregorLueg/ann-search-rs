@@ -4,23 +4,26 @@ use ann_search_rs::utils::KnnValidation;
 use ann_search_rs::*;
 use commons::*;
 use faer::Mat;
+use std::collections::HashSet;
 use std::time::Instant;
 use thousands::*;
 
 fn main() {
     // test parameters
-    const N_CELLS: usize = 250_000;
+    const N_CELLS: usize = 150_000;
     const DIM: usize = 24;
     const N_CLUSTERS: usize = 20;
     const K: usize = 15;
     const SEED: u64 = 42;
+    const DISTANCE: &str = "euclidean";
 
     println!("-----------------------------");
     println!(
-        "Generating synthetic data: {} cells, {} dimensions, {} clusters.",
+        "Generating synthetic data: {} cells, {} dimensions, {} clusters, {} dist.",
         N_CELLS.separate_with_underscores(),
         DIM,
         N_CLUSTERS,
+        DISTANCE
     );
     println!("-----------------------------");
 
@@ -30,7 +33,7 @@ fn main() {
 
     println!("Building exhaustive index...");
     let start = Instant::now();
-    let exhaustive_idx = build_exhaustive_index(data.as_ref(), "euclidean");
+    let exhaustive_idx = build_exhaustive_index(data.as_ref(), DISTANCE);
     let build_time = start.elapsed().as_secs_f64() * 1000.0;
 
     println!("Querying exhaustive index...");
@@ -50,24 +53,12 @@ fn main() {
 
     println!("-----------------------------");
 
-    let sqrt_n = (N_CELLS as f64).sqrt();
-    let nlist_values = [
-        (sqrt_n * 0.25) as usize,
-        (sqrt_n * 0.5) as usize,
-        sqrt_n as usize,
-    ];
+    let nlist_values = [10, 20, 25, 50, 100];
 
     for nlist in nlist_values {
         println!("Building IVF index (nlist={})...", nlist);
         let start = Instant::now();
-        let ivf_idx = build_ivf_index(
-            data.as_ref(),
-            nlist,
-            None,
-            "euclidean",
-            SEED as usize,
-            false,
-        );
+        let ivf_idx = build_ivf_index(data.as_ref(), nlist, None, DISTANCE, SEED as usize, false);
         let build_time = start.elapsed().as_secs_f64() * 1000.0;
 
         let nprobe_values = [
@@ -76,6 +67,13 @@ fn main() {
             (0.15 * nlist as f64) as usize,
             (0.2 * nlist as f64) as usize,
         ];
+
+        let mut nprobe_values: Vec<_> = nprobe_values
+            .into_iter()
+            .collect::<HashSet<_>>()
+            .into_iter()
+            .collect();
+        nprobe_values.sort();
 
         for nprobe in nprobe_values {
             if nprobe > nlist || nprobe == 0 {

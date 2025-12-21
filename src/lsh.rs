@@ -14,40 +14,9 @@ use crate::utils::dist::*;
 use crate::utils::heap_structs::*;
 use crate::utils::*;
 
-thread_local! {
-    /// Candidates in a RefCell
-    static LSH_CANDIDATES: RefCell<Vec<usize>> = const { RefCell::new(Vec::new()) };
-    /// HashSet per thread
-    static LSH_SEEN_SET: RefCell<FxHashSet<usize>> = RefCell::new(FxHashSet::default());
-    /// Heap for f32
-    static LSH_HEAP_F32: RefCell<BinaryHeap<(OrderedFloat<f32>, usize)>> = const { RefCell::new(BinaryHeap::new()) };
-    /// Heap for f64
-    static LSH_HEAP_F64: RefCell<BinaryHeap<(OrderedFloat<f64>, usize)>> = const { RefCell::new(BinaryHeap::new()) };
-}
-
-/// Query interface for LSH using thread-local storage
-///
-/// Implemented separately for f32 and f64 to use type-specific thread locals
-pub trait LSHQuery<T> {
-    /// Execute a query using thread-local buffers
-    ///
-    /// ### Params
-    ///
-    /// * `query_vec` - Query vector
-    /// * `k` - Number of neighbours to return
-    /// * `max_cand` - Optional limit on candidates examined
-    ///
-    /// ### Returns
-    ///
-    /// Tuple of `(indices, distances, fallback_triggered)`. The fallback flag
-    /// indicates whether random sampling was used due to empty buckets.
-    fn query_internal(
-        &self,
-        query_vec: &[T],
-        k: usize,
-        max_cand: Option<usize>,
-    ) -> (Vec<usize>, Vec<T>, bool);
-}
+////////////////
+// Main index //
+////////////////
 
 /// LSH index for approximate nearest neighbour search
 ///
@@ -373,6 +342,41 @@ where
 // LSHQuery //
 //////////////
 
+thread_local! {
+    /// Candidates in a RefCell
+    static LSH_CANDIDATES: RefCell<Vec<usize>> = const { RefCell::new(Vec::new()) };
+    /// HashSet per thread
+    static LSH_SEEN_SET: RefCell<FxHashSet<usize>> = RefCell::new(FxHashSet::default());
+    /// Heap for f32
+    static LSH_HEAP_F32: RefCell<BinaryHeap<(OrderedFloat<f32>, usize)>> = const { RefCell::new(BinaryHeap::new()) };
+    /// Heap for f64
+    static LSH_HEAP_F64: RefCell<BinaryHeap<(OrderedFloat<f64>, usize)>> = const { RefCell::new(BinaryHeap::new()) };
+}
+
+/// Query interface for LSH using thread-local storage
+///
+/// Implemented separately for f32 and f64 to use type-specific thread locals
+pub trait LSHQuery<T> {
+    /// Execute a query using thread-local buffers
+    ///
+    /// ### Params
+    ///
+    /// * `query_vec` - Query vector
+    /// * `k` - Number of neighbours to return
+    /// * `max_cand` - Optional limit on candidates examined
+    ///
+    /// ### Returns
+    ///
+    /// Tuple of `(indices, distances, fallback_triggered)`. The fallback flag
+    /// indicates whether random sampling was used due to empty buckets.
+    fn query_internal(
+        &self,
+        query_vec: &[T],
+        k: usize,
+        max_cand: Option<usize>,
+    ) -> (Vec<usize>, Vec<T>, bool);
+}
+
 /////////
 // f32 //
 /////////
@@ -427,6 +431,7 @@ impl LSHQuery<f32> for LSHIndex<f32> {
                         cand.extend((0..self.n).choose_multiple(&mut rng, sample_size));
                     }
 
+                    // Deduplicate during distance computation
                     match self.metric {
                         Dist::Euclidean => {
                             for &idx in cand.iter() {
@@ -529,6 +534,7 @@ impl LSHQuery<f64> for LSHIndex<f64> {
                         cand.extend((0..self.n).choose_multiple(&mut rng, sample_size));
                     }
 
+                    // Deduplicate during distance computation
                     match self.metric {
                         Dist::Euclidean => {
                             for &idx in cand.iter() {
@@ -603,6 +609,12 @@ where
         self.metric
     }
 }
+
+//////////////////////////
+// HierarchicalLSHIndex //
+//////////////////////////
+
+
 
 ///////////
 // Tests //

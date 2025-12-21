@@ -9,18 +9,20 @@ use thousands::*;
 
 fn main() {
     // test parameters
-    const N_CELLS: usize = 50_000;
+    const N_CELLS: usize = 500_000;
     const DIM: usize = 24;
     const N_CLUSTERS: usize = 20;
     const K: usize = 15;
     const SEED: u64 = 42;
+    const DISTANCE: &str = "euclidean";
 
     println!("-----------------------------");
     println!(
-        "Generating synthetic data: {} cells, {} dimensions, {} clusters.",
+        "Generating synthetic data: {} cells, {} dimensions, {} clusters, {} dist.",
         N_CELLS.separate_with_underscores(),
         DIM,
         N_CLUSTERS,
+        DISTANCE
     );
     println!("-----------------------------");
 
@@ -30,7 +32,7 @@ fn main() {
 
     println!("Building exhaustive index...");
     let start = Instant::now();
-    let exhaustive_idx = build_exhaustive_index(data.as_ref(), "euclidean");
+    let exhaustive_idx = build_exhaustive_index(data.as_ref(), DISTANCE);
     let build_time = start.elapsed().as_secs_f64() * 1000.0;
 
     println!("Querying exhaustive index...");
@@ -55,8 +57,7 @@ fn main() {
     for n_trees in n_trees_values {
         println!("Building Annoy index ({} trees)...", n_trees);
         let start = Instant::now();
-        let annoy_idx =
-            build_annoy_index(data.as_ref(), "euclidean".into(), n_trees, SEED as usize);
+        let annoy_idx = build_annoy_index(data.as_ref(), DISTANCE.into(), n_trees, SEED as usize);
         let build_time = start.elapsed().as_secs_f64() * 1000.0;
 
         let search_budgets = [

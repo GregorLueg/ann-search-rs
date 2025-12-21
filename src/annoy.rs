@@ -78,12 +78,15 @@ impl PartialEq for BacktrackEntry {
         self.margin == other.margin
     }
 }
+
 impl Eq for BacktrackEntry {}
+
 impl PartialOrd for BacktrackEntry {
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
         Some(self.cmp(other))
     }
 }
+
 impl Ord for BacktrackEntry {
     fn cmp(&self, other: &Self) -> Ordering {
         self.margin

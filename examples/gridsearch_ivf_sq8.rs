@@ -4,23 +4,28 @@ use ann_search_rs::synthetic::generate_clustered_data;
 use ann_search_rs::*;
 use commons::*;
 use faer::Mat;
+use std::collections::HashSet;
 use std::time::Instant;
+use thousands::*;
 
 fn main() {
-    const N_CELLS: usize = 50_000;
+    // test parameters
+    const N_CELLS: usize = 150_000;
     const DIM: usize = 24;
     const N_CLUSTERS: usize = 20;
     const K: usize = 15;
     const SEED: u64 = 42;
-    const DISTANCE: &str = "cosine";
+    const DISTANCE: &str = "euclidean";
 
-    println!("===============================================================================================");
+    println!("-----------------------------");
     println!(
-        "Benchmark: {}k cells, {}D - IVF-SQ8 (symmetric distance calculations)",
-        N_CELLS / 1000,
-        DIM
+        "Generating synthetic data: {} cells, {} dimensions, {} clusters, {} dist.",
+        N_CELLS.separate_with_underscores(),
+        DIM,
+        N_CLUSTERS,
+        DISTANCE
     );
-    println!("===============================================================================================");
+    println!("-----------------------------");
 
     let data: Mat<f32> = generate_clustered_data(N_CELLS, DIM, N_CLUSTERS, SEED);
     let query_data = data.as_ref();
@@ -48,12 +53,7 @@ fn main() {
 
     println!("-----------------------------------------------------------------------------------------------");
 
-    let sqrt_n = (N_CELLS as f64).sqrt();
-    let nlist_values = [
-        (sqrt_n * 0.25) as usize,
-        (sqrt_n * 0.5) as usize,
-        sqrt_n as usize,
-    ];
+    let nlist_values = [10, 20, 25, 50, 100];
 
     for nlist in nlist_values {
         println!("Building IVF-SQ8 index (nlist={})...", nlist);
@@ -68,6 +68,13 @@ fn main() {
             (0.15 * nlist as f64) as usize,
             (0.2 * nlist as f64) as usize,
         ];
+
+        let mut nprobe_values: Vec<_> = nprobe_values
+            .into_iter()
+            .collect::<HashSet<_>>()
+            .into_iter()
+            .collect();
+        nprobe_values.sort();
 
         for nprobe in nprobe_values {
             if nprobe > nlist || nprobe == 0 {
