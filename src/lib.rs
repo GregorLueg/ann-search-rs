@@ -10,6 +10,7 @@ pub mod lsh;
 pub mod nndescent;
 pub mod synthetic;
 pub mod utils;
+pub mod quantised;
 
 use faer::MatRef;
 use num_traits::{Float, FromPrimitive, ToPrimitive};
@@ -20,13 +21,13 @@ use std::sync::Arc;
 use thousands::*;
 
 use crate::annoy::*;
+use crate::dist::*;
 use crate::exhaustive::*;
 use crate::fanng::*;
 use crate::hnsw::*;
 use crate::ivf::*;
 use crate::lsh::*;
 use crate::nndescent::*;
-use crate::utils::*;
 
 ///////////
 // Annoy //

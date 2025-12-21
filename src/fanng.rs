@@ -8,7 +8,7 @@ use std::cmp::Reverse;
 use std::collections::BinaryHeap;
 use std::time::Instant;
 
-use crate::dist::VectorDistance;
+use crate::dist::*;
 use crate::utils::*;
 
 /// Structure to contain FANNG parameters

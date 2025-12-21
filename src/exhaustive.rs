@@ -17,6 +17,7 @@ use crate::utils::*;
 /// * `n` - Number of samples
 /// * `metric` - The type of distance the index is designed for
 pub struct ExhaustiveIndex<T> {
+    // shared ones
     pub vectors_flat: Vec<T>,
     pub dim: usize,
     pub n: usize,
