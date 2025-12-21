@@ -858,45 +858,63 @@ where
     /// itself as both start point and query target. This efficiently explores
     /// the local neighbourhood around the vertex.
     fn find_approx_neighbour(&self, vertex: usize, k: usize, max_calcs: usize) -> Vec<usize> {
-        let mut pq = BinaryHeap::new();
+        let mut candidates = BinaryHeap::new();
+        let mut result = BinaryHeap::new();
         let mut visited = FxHashSet::default();
         let mut calcs = 0;
 
-        pq.push((Reverse(OrderedFloat(T::zero())), vertex, 0));
         visited.insert(vertex);
 
-        let mut nearest = BinaryHeap::new();
-
-        while !pq.is_empty() && calcs < max_calcs {
-            let (Reverse(OrderedFloat(_)), current, edge_idx) = pq.pop().unwrap();
-
-            if edge_idx < self.graph[current].len() {
-                let neighbour = self.graph[current][edge_idx];
-
-                if !visited.contains(&neighbour) {
-                    visited.insert(neighbour);
-                    calcs += 1;
-
-                    let dist = self.distance(vertex, neighbour);
-                    nearest.push(Reverse((OrderedFloat(dist), neighbour)));
-
-                    if nearest.len() > k {
-                        nearest.pop();
-                    }
-
-                    // add neighbor's edges to explore
-                    pq.push((Reverse(OrderedFloat(dist)), neighbour, 0));
+        // Explore all neighbours of starting vertex
+        for &neighbour in &self.graph[vertex] {
+            if visited.insert(neighbour) {
+                let dist = self.distance(vertex, neighbour);
+                calcs += 1;
+                candidates.push(Reverse((OrderedFloat(dist), neighbour)));
+                result.push((OrderedFloat(dist), neighbour));
+                if result.len() > k {
+                    result.pop();
                 }
-
-                // re-add current vertex with next edge
-                pq.push((Reverse(OrderedFloat(T::zero())), current, edge_idx + 1));
             }
         }
 
-        nearest
+        while !candidates.is_empty() && calcs < max_calcs {
+            let Reverse((OrderedFloat(current_dist), current)) = candidates.pop().unwrap();
+
+            // Prune if worse than k-th result
+            if result.len() >= k {
+                if let Some(&(OrderedFloat(worst), _)) = result.peek() {
+                    if current_dist > worst {
+                        continue;
+                    }
+                }
+            }
+
+            // Explore neighbours
+            for &neighbour in &self.graph[current] {
+                if visited.insert(neighbour) {
+                    calcs += 1;
+                    let dist = self.distance(vertex, neighbour);
+
+                    if result.len() < k || dist < result.peek().unwrap().0 .0 {
+                        candidates.push(Reverse((OrderedFloat(dist), neighbour)));
+                        result.push((OrderedFloat(dist), neighbour));
+                        if result.len() > k {
+                            result.pop();
+                        }
+                    }
+
+                    if calcs >= max_calcs {
+                        break;
+                    }
+                }
+            }
+        }
+
+        result
             .into_sorted_vec()
             .into_iter()
-            .map(|Reverse((_, idx))| idx)
+            .map(|(_, idx)| idx)
             .collect()
     }
 

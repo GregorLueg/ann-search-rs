@@ -5,6 +5,7 @@ use rand::rng;
 use rand_distr::StandardNormal;
 use rayon::prelude::*;
 use rustc_hash::FxHashMap;
+use rustc_hash::FxHashSet;
 use std::cell::RefCell;
 use std::cmp::Ord;
 use std::collections::BinaryHeap;
@@ -15,10 +16,8 @@ use crate::utils::*;
 thread_local! {
     /// Candidates in a RefCell
     static LSH_CANDIDATES: RefCell<Vec<usize>> = const { RefCell::new(Vec::new()) };
-    /// Distances for the candidates in f32
-    static LSH_DISTANCES_F32: RefCell<Vec<(usize, f32)>> = const { RefCell::new(Vec::new()) };
-    /// Distances for the candidates in f64
-    static LSH_DISTANCES_F64: RefCell<Vec<(usize, f64)>> = const { RefCell::new(Vec::new()) };
+    /// HashSet per thread
+    static LSH_SEEN_SET: RefCell<FxHashSet<usize>> = RefCell::new(FxHashSet::default());
     /// Heap for f32
     static LSH_HEAP_F32: RefCell<BinaryHeap<(OrderedFloat<f32>, usize)>> = const { RefCell::new(BinaryHeap::new()) };
     /// Heap for f64
@@ -369,6 +368,14 @@ where
     }
 }
 
+//////////////
+// LSHQuery //
+//////////////
+
+/////////
+// f32 //
+/////////
+
 impl LSHQuery<f32> for LSHIndex<f32> {
     fn query_internal(
         &self,
@@ -377,20 +384,19 @@ impl LSHQuery<f32> for LSHIndex<f32> {
         max_cand: Option<usize>,
     ) -> (Vec<usize>, Vec<f32>, bool) {
         LSH_CANDIDATES.with(|cand_cell| {
-            LSH_DISTANCES_F32.with(|dist_cell| {
-                LSH_HEAP_F32.with(|heap_cell| {
+            LSH_HEAP_F32.with(|heap_cell| {
+                LSH_SEEN_SET.with(|seen_cell| {
                     let mut cand = cand_cell.borrow_mut();
-                    let mut dist = dist_cell.borrow_mut();
                     let mut heap = heap_cell.borrow_mut();
+                    let mut seen = seen_cell.borrow_mut();
 
-                    // special case k = 0
                     if k == 0 {
                         return (Vec::new(), Vec::new(), false);
                     }
 
                     cand.clear();
-                    dist.clear();
                     heap.clear();
+                    seen.clear();
 
                     for table_idx in 0..self.num_tables {
                         let hash = Self::compute_hash(
@@ -405,7 +411,6 @@ impl LSHQuery<f32> for LSHIndex<f32> {
                         if let Some(bucket) = self.hash_tables[table_idx].get(&hash) {
                             cand.extend_from_slice(bucket);
 
-                            // Early stopping with budget
                             if let Some(max) = max_cand {
                                 if cand.len() >= max {
                                     break;
@@ -421,47 +426,46 @@ impl LSHQuery<f32> for LSHIndex<f32> {
                         cand.extend((0..self.n).choose_multiple(&mut rng, sample_size));
                     }
 
-                    cand.sort_unstable();
-                    cand.dedup();
-
-                    // Only compute query_norm for Cosine
                     match self.metric {
                         Dist::Euclidean => {
                             for &idx in cand.iter() {
-                                let d = self.euclidean_distance_to_query(idx, query_vec);
-                                dist.push((idx, d));
+                                if seen.insert(idx) {
+                                    let d = self.euclidean_distance_to_query(idx, query_vec);
+                                    let item = (OrderedFloat(d), idx);
+
+                                    if heap.len() < k {
+                                        heap.push(item);
+                                    } else if item.0 < heap.peek().unwrap().0 {
+                                        heap.pop();
+                                        heap.push(item);
+                                    }
+                                }
                             }
                         }
                         Dist::Cosine => {
                             let query_norm = query_vec.iter().map(|v| v * v).sum::<f32>().sqrt();
                             for &idx in cand.iter() {
-                                let d = self.cosine_distance_to_query(idx, query_vec, query_norm);
-                                dist.push((idx, d));
+                                if seen.insert(idx) {
+                                    let d =
+                                        self.cosine_distance_to_query(idx, query_vec, query_norm);
+                                    let item = (OrderedFloat(d), idx);
+
+                                    if heap.len() < k {
+                                        heap.push(item);
+                                    } else if item.0 < heap.peek().unwrap().0 {
+                                        heap.pop();
+                                        heap.push(item);
+                                    }
+                                }
                             }
                         }
                     }
 
-                    // Heap-based top-k
-                    if dist.len() > k {
-                        for &(idx, d) in dist.iter() {
-                            let item = (OrderedFloat(d), idx);
-                            if heap.len() < k {
-                                heap.push(item);
-                            } else if item.0 < heap.peek().unwrap().0 {
-                                heap.pop();
-                                heap.push(item);
-                            }
-                        }
+                    let mut results: Vec<_> = heap.drain().collect();
+                    results.sort_unstable_by(|a, b| a.0.cmp(&b.0));
 
-                        dist.clear();
-                        dist.extend(heap.drain().map(|(OrderedFloat(d), idx)| (idx, d)));
-                        dist.sort_unstable_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
-                    } else {
-                        dist.sort_unstable_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
-                    }
-
-                    let indices = dist.iter().map(|&(idx, _)| idx).collect();
-                    let dists = dist.iter().map(|&(_, d)| d).collect();
+                    let indices = results.iter().map(|&(_, idx)| idx).collect();
+                    let dists = results.iter().map(|&(OrderedFloat(d), _)| d).collect();
 
                     (indices, dists, fallback_triggered)
                 })
@@ -469,6 +473,10 @@ impl LSHQuery<f32> for LSHIndex<f32> {
         })
     }
 }
+
+/////////
+// f64 //
+/////////
 
 impl LSHQuery<f64> for LSHIndex<f64> {
     fn query_internal(
@@ -478,20 +486,19 @@ impl LSHQuery<f64> for LSHIndex<f64> {
         max_cand: Option<usize>,
     ) -> (Vec<usize>, Vec<f64>, bool) {
         LSH_CANDIDATES.with(|cand_cell| {
-            LSH_DISTANCES_F64.with(|dist_cell| {
-                LSH_HEAP_F64.with(|heap_cell| {
+            LSH_HEAP_F64.with(|heap_cell| {
+                LSH_SEEN_SET.with(|seen_cell| {
                     let mut cand = cand_cell.borrow_mut();
-                    let mut dist = dist_cell.borrow_mut();
                     let mut heap = heap_cell.borrow_mut();
+                    let mut seen = seen_cell.borrow_mut();
 
-                    // special case k = 0
                     if k == 0 {
                         return (Vec::new(), Vec::new(), false);
                     }
 
                     cand.clear();
-                    dist.clear();
                     heap.clear();
+                    seen.clear();
 
                     for table_idx in 0..self.num_tables {
                         let hash = Self::compute_hash(
@@ -506,7 +513,6 @@ impl LSHQuery<f64> for LSHIndex<f64> {
                         if let Some(bucket) = self.hash_tables[table_idx].get(&hash) {
                             cand.extend_from_slice(bucket);
 
-                            // Early stopping with budget
                             if let Some(max) = max_cand {
                                 if cand.len() >= max {
                                     break;
@@ -522,47 +528,46 @@ impl LSHQuery<f64> for LSHIndex<f64> {
                         cand.extend((0..self.n).choose_multiple(&mut rng, sample_size));
                     }
 
-                    cand.sort_unstable();
-                    cand.dedup();
-
-                    // Only compute query_norm for Cosine
                     match self.metric {
                         Dist::Euclidean => {
                             for &idx in cand.iter() {
-                                let d = self.euclidean_distance_to_query(idx, query_vec);
-                                dist.push((idx, d));
+                                if seen.insert(idx) {
+                                    let d = self.euclidean_distance_to_query(idx, query_vec);
+                                    let item = (OrderedFloat(d), idx);
+
+                                    if heap.len() < k {
+                                        heap.push(item);
+                                    } else if item.0 < heap.peek().unwrap().0 {
+                                        heap.pop();
+                                        heap.push(item);
+                                    }
+                                }
                             }
                         }
                         Dist::Cosine => {
                             let query_norm = query_vec.iter().map(|v| v * v).sum::<f64>().sqrt();
                             for &idx in cand.iter() {
-                                let d = self.cosine_distance_to_query(idx, query_vec, query_norm);
-                                dist.push((idx, d));
+                                if seen.insert(idx) {
+                                    let d =
+                                        self.cosine_distance_to_query(idx, query_vec, query_norm);
+                                    let item = (OrderedFloat(d), idx);
+
+                                    if heap.len() < k {
+                                        heap.push(item);
+                                    } else if item.0 < heap.peek().unwrap().0 {
+                                        heap.pop();
+                                        heap.push(item);
+                                    }
+                                }
                             }
                         }
                     }
 
-                    // Heap-based top-k
-                    if dist.len() > k {
-                        for &(idx, d) in dist.iter() {
-                            let item = (OrderedFloat(d), idx);
-                            if heap.len() < k {
-                                heap.push(item);
-                            } else if item.0 < heap.peek().unwrap().0 {
-                                heap.pop();
-                                heap.push(item);
-                            }
-                        }
+                    let mut results: Vec<_> = heap.drain().collect();
+                    results.sort_unstable_by(|a, b| a.0.cmp(&b.0));
 
-                        dist.clear();
-                        dist.extend(heap.drain().map(|(OrderedFloat(d), idx)| (idx, d)));
-                        dist.sort_unstable_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
-                    } else {
-                        dist.sort_unstable_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
-                    }
-
-                    let indices = dist.iter().map(|&(idx, _)| idx).collect();
-                    let dists = dist.iter().map(|&(_, d)| d).collect();
+                    let indices = results.iter().map(|&(_, idx)| idx).collect();
+                    let dists = results.iter().map(|&(OrderedFloat(d), _)| d).collect();
 
                     (indices, dists, fallback_triggered)
                 })

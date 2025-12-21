@@ -6,6 +6,10 @@ pub trait VectorDistance<T: Float> {
     fn dim(&self) -> usize;
     fn norms(&self) -> &[T];
 
+    ///////////////
+    // Euclidean //
+    ///////////////
+
     /// Euclidean distance between two internal vectors (squared)
     ///
     /// ### Implementation note
@@ -63,6 +67,31 @@ pub trait VectorDistance<T: Float> {
             .fold(T::zero(), |acc, x| acc + x)
     }
 
+    /// Static Euclidean distance between two arbitrary vectors (squared)
+    ///
+    /// ### Params
+    ///
+    /// * `a` - Slice of vector one
+    /// * `b` - Slice of vector two
+    ///
+    /// ### Returns
+    ///
+    /// Squared euclidean distance
+    #[inline(always)]
+    fn euclidean_distance_static(a: &[T], b: &[T]) -> T {
+        a.iter()
+            .zip(b.iter())
+            .map(|(&x, &y)| {
+                let diff = x - y;
+                diff * diff
+            })
+            .fold(T::zero(), |acc, x| acc + x)
+    }
+
+    ////////////
+    // Cosine //
+    ////////////
+
     /// Cosine distance between two internal vectors
     ///
     /// ### Cosine Distance
@@ -117,6 +146,64 @@ pub trait VectorDistance<T: Float> {
             .fold(T::zero(), |acc, x| acc + x);
 
         T::one() - (dot / (query_norm * self.norms()[internal_idx]))
+    }
+
+    /// Static Cosine distance between two arbitrary vectors
+    ///
+    /// Computes norms on the fly
+    ///
+    /// ### Params
+    ///
+    /// * `a` - Slice of vector one
+    /// * `b` - Slice of vector two
+    ///
+    /// ### Returns
+    ///
+    /// Squared cosine distance
+    #[inline(always)]
+    fn cosine_distance_static(a: &[T], b: &[T]) -> T {
+        let dot: T = a
+            .iter()
+            .zip(b.iter())
+            .map(|(&x, &y)| x * y)
+            .fold(T::zero(), |acc, x| acc + x);
+
+        let norm_a = a
+            .iter()
+            .map(|&x| x * x)
+            .fold(T::zero(), |acc, x| acc + x)
+            .sqrt();
+
+        let norm_b = b
+            .iter()
+            .map(|&x| x * x)
+            .fold(T::zero(), |acc, x| acc + x)
+            .sqrt();
+
+        T::one() - (dot / (norm_a * norm_b))
+    }
+
+    /// Static Cosine distance between two arbitrary vectors
+    ///
+    /// Uses pre-computed norms
+    ///
+    /// ### Params
+    ///
+    /// * `a` - Slice of vector one
+    /// * `b` - Slice of vector two
+    ///
+    /// ### Returns
+    ///
+    /// Squared cosine distance
+    #[inline(always)]
+    fn cosine_distance_static_with_norms(a: &[T], b: &[T], norm_a: T, norm_b: T) -> T {
+        let dot: T = a
+            .iter()
+            .zip(b.iter())
+            .map(|(&x, &y)| x * y)
+            .fold(T::zero(), |acc, x| acc + x);
+
+        T::one() - (dot / (norm_a * norm_b))
     }
 }
 

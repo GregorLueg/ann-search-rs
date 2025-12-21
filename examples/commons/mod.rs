@@ -55,17 +55,17 @@ where
 }
 
 pub fn print_results(config: &str, results: &[BenchmarkResult]) {
-    println!("\n{:=>120}", "");
+    println!("\n{:=>95}", "");
     println!("Benchmark: {}", config);
-    println!("{:=>120}", "");
+    println!("{:=>95}", "");
     println!(
-        "{:<40} {:>15} {:>15} {:>15} {:>15} {:>15}",
+        "{:<30} {:>12} {:>12} {:>12} {:>12} {:>12}",
         "Method", "Build (ms)", "Query (ms)", "Total (ms)", "Recall@k", "Dist Error"
     );
-    println!("{:->120}", "");
+    println!("{:->95}", "");
     for result in results {
         println!(
-            "{:<40} {:>15.2} {:>15.2} {:>15.2} {:>15.4} {:>15.6}",
+            "{:<30} {:>12.2} {:>12.2} {:>12.2} {:>12.4} {:>12.6}",
             result.method,
             result.build_time_ms,
             result.query_time_ms,
@@ -74,5 +74,5 @@ pub fn print_results(config: &str, results: &[BenchmarkResult]) {
             result.mean_distance_error
         );
     }
-    println!("{:->120}\n", "");
+    println!("{:->95}\n", "");
 }

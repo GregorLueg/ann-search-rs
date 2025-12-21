@@ -1,6 +1,6 @@
 [package]
 name = "ann-search-rs"
-version = "0.1.9"
+version = "0.1.10"
 edition = "2021"
 authors = ["Gregor Lueg <gregorlueg@me.com>"]
 license = "MIT"
@@ -12,10 +12,8 @@ name = "ann_search_rs"
 path = "src/lib.rs"
 
 [profile.release]
-opt-level = 3
 lto = true
 codegen-units = 1
-strip = true
 
 [dependencies]
 approx = "0.5.1"

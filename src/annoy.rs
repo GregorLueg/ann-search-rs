@@ -343,6 +343,7 @@ where
     /// ### Returns
     ///
     /// Tuple of `(indices, distances)` sorted by distance (nearest first)
+    #[inline]
     pub fn query(
         &self,
         query_vec: &[T],
@@ -480,9 +481,18 @@ where
     /// Query using a matrix row reference
     ///
     /// Optimised path for contiguous memory (stride == 1), otherwise copies
-    /// to a temporary vector.
+    /// to a temporary vector. Uses `self.query()` under the hood.
     ///
     /// ### Params
+    ///
+    /// * `query_row` - Row reference
+    /// * `k` - Number of neighbours to search
+    /// * `search_k` - Budget of items to examine (higher = better recall, slower)
+    ///   Defaults to `k * n_trees` if None
+    ///
+    /// ### Returns
+    ///
+    /// Tuple of `(indices, distances)` sorted by distance (nearest first)
     #[inline]
     pub fn query_row(
         &self,
