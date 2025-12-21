@@ -1,8 +1,7 @@
 use faer::RowRef;
 use num_traits::{Float, FromPrimitive, ToPrimitive};
 use rayon::prelude::*;
-use std::collections::BinaryHeap;
-use std::iter::Sum;
+use std::{collections::BinaryHeap, iter::Sum};
 
 use crate::quantised::quantisers::*;
 use crate::utils::dist::*;

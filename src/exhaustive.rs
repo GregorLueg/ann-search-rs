@@ -1,7 +1,6 @@
 use faer::{MatRef, RowRef};
 use num_traits::{Float, FromPrimitive, ToPrimitive};
-use std::collections::BinaryHeap;
-use std::iter::Sum;
+use std::{collections::BinaryHeap, iter::Sum};
 
 use crate::utils::dist::*;
 use crate::utils::heap_structs::*;

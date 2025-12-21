@@ -1,9 +1,7 @@
 use faer::traits::ComplexField;
 use faer::Mat;
 use num_traits::{Float, FromPrimitive};
-use rand::rngs::StdRng;
-use rand::seq::SliceRandom;
-use rand::{Rng, SeedableRng};
+use rand::{rngs::StdRng, seq::SliceRandom, Rng, SeedableRng};
 
 /// Generate synthetic single-cell-like data with cluster structure
 ///

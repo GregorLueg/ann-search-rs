@@ -28,7 +28,10 @@ Rust of some of these.
   - [**LSH (Locality Sensitive Hashing)**](https://en.wikipedia.org/wiki/Locality-sensitive_hashing) An
   approximate nearest neighbour search that can be very fast at the cost of
   precision. 
-  - [**IVF (Inverted File index)**]
+  - [**IVF (Inverted File index)**] This one leverages k-mean clustering to only
+  search a subspace of the original index. There is also a scalar quantised
+  version of this index for even higher speed/reduced memory fingerprint at the
+  cost of Recall@k_neighbours.
     
 
 - **Distance metrics**:
@@ -103,10 +106,9 @@ scripts available. These can be run via
 cargo run --example gridsearch_annoy --release
 ```
 
-For every index, 250k cells with 24 dimensions, Cosine distance and 20 distinct 
-clusters in the synthetic data has been run. The results for the different 
-indices are show below. For details on the synthetic data function, see 
-`/src/synthetic.rs`.
+For every index, 250k cells with 24 dimensions distance and 20 distinct clusters 
+in the synthetic data has been run. The results for the different  indices are
+show below. For details on the synthetic data function, see `/src/synthetic.rs`.
 
 ### Annoy
 
@@ -120,6 +122,8 @@ trees). The more trees you use the more you can reduce the search budget per
 given tree. It depends on your use case. Good allrounder. 
 
 **Euclidean:**
+
+Below are the results for the Euclidean distance measure for Annoy.
 
 ```
 ===============================================================================================
@@ -150,6 +154,8 @@ Annoy-nt75:5x                       1059.01      8098.23      9157.23       0.99
 ```
 
 **Cosine:**
+
+Below are the results for the Cosine distance measure for Annoy.
 
 ```
 ===============================================================================================
@@ -187,6 +193,8 @@ high with great recalls (if you took the time to generate the index).
 
 **Euclidean:**
 
+Below are the results for the Euclidean distance measure for HSNW.
+
 ```
 ===============================================================================================
 Benchmark: 250k cells, 24D
@@ -222,6 +230,8 @@ HNSW-M32-ef300-s100                19730.27      6958.42     26688.69       0.99
 ```
 
 **Cosine:**
+
+Below are the results for the Cosine distance measure for HSNW.
 
 ```
 ===============================================================================================
@@ -262,11 +272,13 @@ HNSW-M32-ef300-s100                19777.36      6757.88     26535.24       0.99
 Inverted file index (powering for example some of the FAISS indices) is very
 powerful. Quick index build, quite fast querying times. The number of lists
 (especially with this synthetic data) does not need to be particularly high and
-you reach quite quickly 5x better speeds over an exhaustive search. Larger
+you reach quite quickly better speeds over an exhaustive search. Larger
 number of lists or points to search do not really make sense (at least not
 in this data).
 
 **Euclidean:**
+
+Below are the results for the Euclidean distance measure for IVF.
 
 ```
 ===============================================================================================
@@ -292,6 +304,8 @@ IVF-nl100-np15                      1125.33     27450.31     28575.64       1.00
 ```
 
 **Cosine:**
+
+Below are the results for the Cosine distance measure for IVF.
 
 ```
 ===============================================================================================
@@ -327,6 +341,8 @@ idea on the influence of the parameters. You also have the option to limit the
 number of candidates to explore during querying at cost of Recall. 
 
 **Euclidean:**
+
+Below are the results for the Euclidean distance measure for LSH.
 
 ```
 ===============================================================================================
@@ -365,6 +381,8 @@ LSH-nt50-bits16:5k_cand              678.97      5197.62      5876.59       0.86
 ```
 
 **Cosine:**
+
+Below are the results for the Cosine distance measure for LSH.
 
 ```
 ===============================================================================================
@@ -414,6 +432,9 @@ exhaustive search)!
 
 **Euclidean:**
 
+Below are the results for the Euclidean distance measure for NNDescent
+implementation in this `crate`.
+
 ```
 ===============================================================================================
 Benchmark: 250k cells, 24D
@@ -432,6 +453,9 @@ NNDescent-nt:auto-s:auto-dp1        4287.96      1181.62      5469.58       0.98
 ```
 
 **Cosine:**
+
+Below are the results for the Cosine distance measure for NNDescent
+implementation in this `crate`.
 
 ```
 ===============================================================================================
@@ -454,11 +478,18 @@ NNDescent-nt:auto-s:auto-dp1        9997.64       799.59     10797.23       0.93
 
 The crate also provides some quantised approximate nearest neighbour searches, 
 designed for very large data sets where memory and time both start becoming 
-incredibly constraining. 
+incredibly constraining. At the moment due to the focus on single cell, 
+the only quantisation is SQ8 which transforms a given vector into `i8` and does
+symmetric distance calculations (query also transformed to `i8` to leverage
+fast integer computations on modern CPUs).
 
 ### IVF (with scalar quantisation)
 
 **Euclidean:**
+
+Below are the results for the Euclidean distance measure for IVF with SQ8
+quantisation. To note, the mean distance error is not calculated, as the index
+does not store the original vectors anymore to reduce memory fingerprint. 
 
 ```
 ===================================================================================
@@ -484,6 +515,10 @@ IVF-SQ8-nl100-np15                  1072.23      5743.33      6815.56       0.85
 ```
 
 **Cosine:**
+
+Below are the results for the Cosine distance measure for IVF with SQ8
+quantisation. To note, the mean distance error is not calculated, as the index
+does not store the original vectors anymore to reduce memory fingerprint. 
 
 ```
 ===================================================================================

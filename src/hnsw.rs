@@ -1,15 +1,16 @@
 use faer::MatRef;
 use num_traits::{Float, FromPrimitive, ToPrimitive};
-use rand::rngs::SmallRng;
-use rand::{Rng, SeedableRng};
+use rand::{rngs::SmallRng, Rng, SeedableRng};
 use rayon::prelude::*;
-use std::cell::UnsafeCell;
-use std::cmp::Reverse;
-use std::collections::BinaryHeap;
-use std::iter::Sum;
-use std::marker::PhantomData;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Instant;
+use std::{
+    cell::UnsafeCell,
+    cmp::Reverse,
+    collections::BinaryHeap,
+    iter::Sum,
+    marker::PhantomData,
+    sync::atomic::{AtomicU64, Ordering},
+    time::Instant,
+};
 use thousands::*;
 
 use crate::utils::dist::*;

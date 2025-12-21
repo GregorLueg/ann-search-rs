@@ -1,14 +1,10 @@
 use faer::{MatRef, RowRef};
 use num_traits::{Float, FromPrimitive, ToPrimitive};
-use rand::prelude::*;
-use rand::rng;
+use rand::{prelude::*, rng};
 use rand_distr::StandardNormal;
 use rayon::prelude::*;
 use rustc_hash::{FxHashMap, FxHashSet};
-use std::cell::RefCell;
-use std::cmp::Ord;
-use std::collections::BinaryHeap;
-use std::iter::Sum;
+use std::{cell::RefCell, cmp::Ord, collections::BinaryHeap, iter::Sum};
 
 use crate::utils::dist::*;
 use crate::utils::heap_structs::*;
@@ -339,12 +335,12 @@ where
 }
 
 /// Orthogonalise random projections
-/// 
+///
 /// Helper function that orthogonalises the random projections, yielding better
 /// buckets and faster query speeds
-/// 
+///
 /// ### Params
-/// 
+///
 /// * `vecs` - The random projection vectors to orthogonalise
 /// * `num_tables` - Number of tables for the LSH index
 /// * `bits_per_hash` - Bits per hash to use
