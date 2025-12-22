@@ -96,7 +96,7 @@ searches. The overall design is very similar and if you wish details on usage,
 please refer to the `examples/*.rs` section which shows you the grid searches
 across various parameters per given index.
 
-## Performance and recommendations
+## Performance across various parameters
 
 To identify good basic thresholds, there are a set of different gridsearch
 scripts available. These can be run via
@@ -560,7 +560,7 @@ IVF-SQ8-nl100-np15                  2538.72      1624.15      4162.86       0.86
 
 ```
 
-These indices shine 
+#### More cells and dimensions
 
 ## Licence
 

@@ -27,7 +27,8 @@ use crate::hnsw::*;
 use crate::ivf::*;
 use crate::lsh::*;
 use crate::nndescent::*;
-use crate::quantised::ivf_sq8::*;
+use crate::quantised::{ivf_pq::*, ivf_sq8::*};
+
 use crate::utils::dist::*;
 
 ///////////
@@ -893,6 +894,133 @@ where
                 neighbours
             })
             .collect();
+        (indices, None)
+    }
+}
+
+/////////////
+// IVF-PQ  //
+/////////////
+
+/// Build an IVF-PQ index
+///
+/// ### Params
+///
+/// * `mat` - The data matrix. Rows represent the samples, columns represent
+///   the embedding dimensions
+/// * `nlist` - Number of IVF clusters to create
+/// * `m` - Number of subspaces for product quantisation (dim must be divisible by m)
+/// * `max_iters` - Maximum k-means iterations (defaults to 30 if None)
+/// * `dist_metric` - Distance metric ("euclidean" or "cosine")
+/// * `seed` - Random seed for reproducibility
+/// * `verbose` - Print progress information during index construction
+///
+/// ### Return
+///
+/// The `IvfPqIndex`.
+pub fn build_ivf_pq_index<T>(
+    mat: MatRef<T>,
+    nlist: usize,
+    m: usize,
+    max_iters: Option<usize>,
+    dist_metric: &str,
+    seed: usize,
+    verbose: bool,
+) -> IvfPqIndex<T>
+where
+    T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum,
+{
+    let n = mat.nrows();
+    let dim = mat.ncols();
+    let ann_dist = parse_ann_dist(dist_metric).unwrap_or_default();
+
+    let mut vectors_flat = Vec::with_capacity(n * dim);
+    for i in 0..n {
+        vectors_flat.extend(mat.row(i).iter().cloned());
+    }
+
+    IvfPqIndex::build(
+        vectors_flat,
+        dim,
+        n,
+        nlist,
+        m,
+        ann_dist,
+        max_iters,
+        seed,
+        verbose,
+    )
+}
+
+/// Helper function to query a given IVF-PQ index
+///
+/// ### Params
+///
+/// * `query_mat` - The query matrix containing the samples x features
+/// * `index` - Reference to the built IVF-PQ index
+/// * `k` - Number of neighbours to return
+/// * `nprobe` - Number of clusters to search (defaults to 15% of nlist)
+///   Higher values improve recall at the cost of speed
+/// * `return_dist` - Shall the distances be returned
+/// * `verbose` - Print progress information
+///
+/// ### Returns
+///
+/// A tuple of `(knn_indices, optional distances)`
+pub fn query_ivf_pq_index<T>(
+    query_mat: MatRef<T>,
+    index: &IvfPqIndex<T>,
+    k: usize,
+    nprobe: Option<usize>,
+    return_dist: bool,
+    verbose: bool,
+) -> (Vec<Vec<usize>>, Option<Vec<Vec<T>>>)
+where
+    T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum,
+{
+    let n_samples = query_mat.nrows();
+    let counter = Arc::new(AtomicUsize::new(0));
+
+    if return_dist {
+        let results: Vec<(Vec<usize>, Vec<T>)> = (0..n_samples)
+            .into_par_iter()
+            .map(|i| {
+                let (neighbours, scores) = index.query_row(query_mat.row(i), k, nprobe);
+                if verbose {
+                    let count = counter.fetch_add(1, Ordering::Relaxed) + 1;
+                    if count.is_multiple_of(100_000) {
+                        println!(
+                            "  Processed {} / {} samples.",
+                            count.separate_with_underscores(),
+                            n_samples.separate_with_underscores()
+                        );
+                    }
+                }
+                (neighbours, scores)
+            })
+            .collect();
+
+        let (indices, scores) = results.into_iter().unzip();
+        (indices, Some(scores))
+    } else {
+        let indices: Vec<Vec<usize>> = (0..n_samples)
+            .into_par_iter()
+            .map(|i| {
+                let (neighbours, _) = index.query_row(query_mat.row(i), k, nprobe);
+                if verbose {
+                    let count = counter.fetch_add(1, Ordering::Relaxed) + 1;
+                    if count.is_multiple_of(100_000) {
+                        println!(
+                            "  Processed {} / {} samples.",
+                            count.separate_with_underscores(),
+                            n_samples.separate_with_underscores()
+                        );
+                    }
+                }
+                neighbours
+            })
+            .collect();
+
         (indices, None)
     }
 }
