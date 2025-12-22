@@ -1,45 +1,55 @@
 mod commons;
 
-use ann_search_rs::synthetic::generate_clustered_data;
 use ann_search_rs::*;
+use clap::Parser;
 use commons::*;
 use faer::Mat;
 use std::collections::HashSet;
 use std::time::Instant;
 use thousands::*;
 
+#[derive(Parser)]
+struct Cli {
+    #[arg(long, default_value_t = DEFAULT_N_CELLS)]
+    n_cells: usize,
+    #[arg(long, default_value_t = DEFAULT_DIM)]
+    dim: usize,
+    #[arg(long, default_value_t = DEFAULT_N_CLUSTERS)]
+    n_clusters: usize,
+    #[arg(long, default_value_t = DEFAULT_K)]
+    k: usize,
+    #[arg(long, default_value_t = DEFAULT_SEED)]
+    seed: u64,
+    #[arg(long, default_value = DEFAULT_DISTANCE)]
+    distance: String,
+}
+
 fn main() {
-    // test parameters
-    const N_CELLS: usize = 250_000;
-    const DIM: usize = 24;
-    const N_CLUSTERS: usize = 20;
-    const K: usize = 15;
-    const SEED: u64 = 10101;
-    const DISTANCE: &str = "cosine";
+    let cli = Cli::parse();
 
     println!("-----------------------------");
     println!(
         "Generating synthetic data: {} cells, {} dimensions, {} clusters, {} dist.",
-        N_CELLS.separate_with_underscores(),
-        DIM,
-        N_CLUSTERS,
-        DISTANCE
+        cli.n_cells.separate_with_underscores(),
+        cli.dim,
+        cli.n_clusters,
+        cli.distance
     );
     println!("-----------------------------");
 
-    let data: Mat<f32> = generate_clustered_data(N_CELLS, DIM, N_CLUSTERS, SEED);
+    let data: Mat<f32> = generate_clustered_data(cli.n_cells, cli.dim, cli.n_clusters, cli.seed);
     let query_data = data.as_ref();
     let mut results = Vec::new();
 
-    // Exhaustive with inner product
     println!("Building exhaustive index...");
     let start = Instant::now();
-    let exhaustive_idx = build_exhaustive_index(data.as_ref(), DISTANCE);
+    let exhaustive_idx = build_exhaustive_index(data.as_ref(), &cli.distance);
     let build_time = start.elapsed().as_secs_f64() * 1000.0;
 
     println!("Querying exhaustive index...");
     let start = Instant::now();
-    let (true_neighbors, _) = query_exhaustive_index(query_data, &exhaustive_idx, K, false, false);
+    let (true_neighbors, _) =
+        query_exhaustive_index(query_data, &exhaustive_idx, cli.k, false, false);
     let query_time = start.elapsed().as_secs_f64() * 1000.0;
 
     results.push(BenchmarkResult {
@@ -54,12 +64,17 @@ fn main() {
     println!("-----------------------------------------------------------------------------------------------");
 
     let nlist_values = [10, 20, 25, 50, 100];
-
     for nlist in nlist_values {
         println!("Building IVF-SQ8 index (nlist={})...", nlist);
         let start = Instant::now();
-        let ivf_sq8_idx =
-            build_ivf_sq8_index(data.as_ref(), nlist, None, DISTANCE, SEED as usize, false);
+        let ivf_sq8_idx = build_ivf_sq8_index(
+            data.as_ref(),
+            nlist,
+            None,
+            &cli.distance,
+            cli.seed as usize,
+            false,
+        );
         let build_time = start.elapsed().as_secs_f64() * 1000.0;
 
         let nprobe_values = [
@@ -67,7 +82,6 @@ fn main() {
             (0.1 * nlist as f64) as usize,
             (0.15 * nlist as f64) as usize,
         ];
-
         let mut nprobe_values: Vec<_> = nprobe_values
             .into_iter()
             .collect::<HashSet<_>>()
@@ -83,10 +97,10 @@ fn main() {
             println!("Querying IVF-SQ8 (nlist={}, nprobe={})...", nlist, nprobe);
             let start = Instant::now();
             let (approx_neighbors, _) =
-                query_ivf_sq8_index(query_data, &ivf_sq8_idx, K, Some(nprobe), true, false);
+                query_ivf_sq8_index(query_data, &ivf_sq8_idx, cli.k, Some(nprobe), true, false);
             let query_time = start.elapsed().as_secs_f64() * 1000.0;
 
-            let recall = calculate_recall(&true_neighbors, &approx_neighbors, K);
+            let recall = calculate_recall(&true_neighbors, &approx_neighbors, cli.k);
 
             results.push(BenchmarkResult {
                 method: format!("IVF-SQ8-nl{}-np{}", nlist, nprobe),
@@ -99,5 +113,8 @@ fn main() {
         }
     }
 
-    print_results_recall_only(&format!("{}k cells, {}D", N_CELLS / 1000, DIM), &results);
+    print_results_recall_only(
+        &format!("{}k cells, {}D", cli.n_cells / 1000, cli.dim),
+        &results,
+    );
 }

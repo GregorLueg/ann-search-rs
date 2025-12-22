@@ -4,6 +4,12 @@ use num_traits::{Float, FromPrimitive, ToPrimitive};
 // Scalar quantisation //
 /////////////////////////
 
+/// ScalarQuantiser
+/// 
+/// ### Fields
+/// 
+/// * `scales` - The maximum absolute values across each dimensions for
+///   renormalisation.
 pub struct ScalarQuantiser<T> {
     pub scales: Vec<T>,
 }
@@ -82,6 +88,4 @@ where
     }
 }
 
-/////////
-// F16 //
-/////////
+

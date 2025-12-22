@@ -1,7 +1,95 @@
 #![allow(dead_code)]
 
-use num_traits::{Float, ToPrimitive};
+use faer::traits::ComplexField;
+use faer::Mat;
+use num_traits::{Float, FromPrimitive, ToPrimitive};
+use rand::{rngs::StdRng, seq::SliceRandom, Rng, SeedableRng};
 use rustc_hash::FxHashSet;
+
+////////////
+// Consts //
+////////////
+
+pub const DEFAULT_N_CELLS: usize = 150_000;
+pub const DEFAULT_DIM: usize = 32;
+pub const DEFAULT_N_CLUSTERS: usize = 20;
+pub const DEFAULT_K: usize = 15;
+pub const DEFAULT_SEED: u64 = 10101;
+pub const DEFAULT_DISTANCE: &str = "euclidean";
+
+/////////////
+// Helpers //
+/////////////
+
+/// Generate synthetic single-cell-like data with cluster structure
+///
+/// Creates data with multiple Gaussian clusters to simulate clusters, cell
+/// types in the data
+///
+/// ### Params
+///
+/// * `n_samples` - Number of cells (samples)
+/// * `dim` - Embedding dimensionality
+/// * `n_clusters` - Number of distinct clusters
+/// * `cluster_std` - Standard deviation within clusters
+/// * `seed` - Random seed for reproducibility
+///
+/// ### Returns
+///
+/// Matrix of shape (n_samples, dim)
+pub fn generate_clustered_data<T>(
+    n_samples: usize,
+    dim: usize,
+    n_clusters: usize,
+    seed: u64,
+) -> Mat<T>
+where
+    T: Float + FromPrimitive + ComplexField,
+{
+    let mut rng = StdRng::seed_from_u64(seed);
+    let mut data = Mat::<T>::zeros(n_samples, dim);
+
+    // variable cluster sizes and std deviations
+    let mut centres = Vec::with_capacity(n_clusters);
+    let mut cluster_stds = Vec::new();
+
+    for _ in 0..n_clusters {
+        let centre: Vec<f64> = (0..dim).map(|_| rng.random_range(-7.5..7.5)).collect();
+        centres.push(centre);
+        cluster_stds.push(rng.random_range(0.5..2.5));
+    }
+
+    // assign samples with variable cluster sizes
+    // with some clusters bigger than others
+    let mut cluster_assignments = Vec::new();
+    for cluster_idx in 0..n_clusters {
+        let weight = rng.random_range(0.5..2.5);
+        let n_in_cluster = ((n_samples as f64 * weight) / (n_clusters as f64 * 1.25)) as usize;
+        cluster_assignments.extend(vec![cluster_idx; n_in_cluster]);
+    }
+
+    // fill remaining
+    while cluster_assignments.len() < n_samples {
+        cluster_assignments.push(rng.random_range(0..n_clusters));
+    }
+    cluster_assignments.shuffle(&mut rng);
+    cluster_assignments.truncate(n_samples);
+
+    // generate with variable noise
+    for (i, &cluster_idx) in cluster_assignments.iter().enumerate() {
+        let centre = &centres[cluster_idx];
+        let std = cluster_stds[cluster_idx];
+
+        for j in 0..dim {
+            let u1: f64 = rng.random();
+            let u2: f64 = rng.random();
+            let noise = (-2.0 * u1.ln()).sqrt() * (2.0 * std::f64::consts::PI * u2).cos();
+            data[(i, j)] = T::from_f64(centre[j] + noise * std).unwrap();
+        }
+    }
+
+    data
+}
 
 /// BenchmarkResult
 ///
@@ -87,17 +175,17 @@ where
 /// * `config` - Benchmark configuration
 /// * `results` - Benchmark results to print
 pub fn print_results(config: &str, results: &[BenchmarkResult]) {
-    println!("\n{:=>95}", "");
+    println!("\n{:=>100}", "");
     println!("Benchmark: {}", config);
-    println!("{:=>95}", "");
+    println!("{:=>100}", "");
     println!(
-        "{:<30} {:>12} {:>12} {:>12} {:>12} {:>12}",
+        "{:<35} {:>12} {:>12} {:>12} {:>12} {:>12}",
         "Method", "Build (ms)", "Query (ms)", "Total (ms)", "Recall@k", "Dist Error"
     );
-    println!("{:->95}", "");
+    println!("{:->100}", "");
     for result in results {
         println!(
-            "{:<30} {:>12.2} {:>12.2} {:>12.2} {:>12.4} {:>12.6}",
+            "{:<35} {:>12.2} {:>12.2} {:>12.2} {:>12.4} {:>12.6}",
             result.method,
             result.build_time_ms,
             result.query_time_ms,
@@ -106,7 +194,7 @@ pub fn print_results(config: &str, results: &[BenchmarkResult]) {
             result.mean_dist_err
         );
     }
-    println!("{:->95}\n", "");
+    println!("{:->100}\n", "");
 }
 
 /// Helper to print results to console (Recall only)

@@ -7,7 +7,6 @@ pub mod ivf;
 pub mod lsh;
 pub mod nndescent;
 pub mod quantised;
-pub mod synthetic;
 pub mod utils;
 
 use faer::MatRef;

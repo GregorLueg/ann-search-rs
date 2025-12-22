@@ -1,44 +1,54 @@
 mod commons;
 
-use ann_search_rs::synthetic::generate_clustered_data;
 use ann_search_rs::*;
+use clap::Parser;
 use commons::*;
 use faer::Mat;
 use std::time::Instant;
 use thousands::*;
 
+#[derive(Parser)]
+struct Cli {
+    #[arg(long, default_value_t = DEFAULT_N_CELLS)]
+    n_cells: usize,
+    #[arg(long, default_value_t = DEFAULT_DIM)]
+    dim: usize,
+    #[arg(long, default_value_t = DEFAULT_N_CLUSTERS)]
+    n_clusters: usize,
+    #[arg(long, default_value_t = DEFAULT_K)]
+    k: usize,
+    #[arg(long, default_value_t = DEFAULT_SEED)]
+    seed: u64,
+    #[arg(long, default_value = DEFAULT_DISTANCE)]
+    distance: String,
+}
+
 fn main() {
-    // test parameters
-    const N_CELLS: usize = 250_000;
-    const DIM: usize = 24;
-    const N_CLUSTERS: usize = 20;
-    const K: usize = 15;
-    const SEED: u64 = 10101;
-    const DISTANCE: &str = "cosine";
+    let cli = Cli::parse();
 
     println!("-----------------------------");
     println!(
         "Generating synthetic data: {} cells, {} dimensions, {} clusters, {} dist.",
-        N_CELLS.separate_with_underscores(),
-        DIM,
-        N_CLUSTERS,
-        DISTANCE
+        cli.n_cells.separate_with_underscores(),
+        cli.dim,
+        cli.n_clusters,
+        cli.distance
     );
     println!("-----------------------------");
 
-    let data: Mat<f32> = generate_clustered_data(N_CELLS, DIM, N_CLUSTERS, SEED);
+    let data: Mat<f32> = generate_clustered_data(cli.n_cells, cli.dim, cli.n_clusters, cli.seed);
     let query_data = data.as_ref();
     let mut results = Vec::new();
 
     println!("Building exhaustive index...");
     let start = Instant::now();
-    let exhaustive_idx = build_exhaustive_index(data.as_ref(), DISTANCE);
+    let exhaustive_idx = build_exhaustive_index(data.as_ref(), &cli.distance);
     let build_time = start.elapsed().as_secs_f64() * 1000.0;
 
     println!("Querying exhaustive index...");
     let start = Instant::now();
     let (true_neighbors, true_distances) =
-        query_exhaustive_index(query_data, &exhaustive_idx, K, true, false);
+        query_exhaustive_index(query_data, &exhaustive_idx, cli.k, true, false);
     let query_time = start.elapsed().as_secs_f64() * 1000.0;
 
     results.push(BenchmarkResult {
@@ -55,7 +65,8 @@ fn main() {
     let build_params = [
         (Some(12), 0.0, vec![None]),
         (Some(24), 0.0, vec![None]),
-        (None, 0.0, vec![Some(50), Some(100), None]),
+        (None, 0.0, vec![Some(75), Some(100), None]),
+        (None, 0.25, vec![None]),
         (None, 0.5, vec![None]),
         (None, 1.0, vec![None]),
     ];
@@ -72,14 +83,14 @@ fn main() {
         let start = Instant::now();
         let nndescent_idx = build_nndescent_index(
             data.as_ref(),
-            DISTANCE,
+            &cli.distance,
             0.001,
             diversify_prob,
             None,
             None,
             None,
             n_trees,
-            SEED as usize,
+            cli.seed as usize,
             false,
         );
         let build_time = start.elapsed().as_secs_f64() * 1000.0;
@@ -92,28 +103,20 @@ fn main() {
             println!("Querying NNDescent index (ef_search={})...", ef_search_str);
             let start = Instant::now();
             let (approx_neighbors, approx_distances) =
-                query_nndescent_index(query_data, &nndescent_idx, K, ef_search, true, false);
+                query_nndescent_index(query_data, &nndescent_idx, cli.k, ef_search, true, false);
             let query_time = start.elapsed().as_secs_f64() * 1000.0;
 
-            let recall = calculate_recall(&true_neighbors, &approx_neighbors, K);
+            let recall = calculate_recall(&true_neighbors, &approx_neighbors, cli.k);
             let dist_error = calculate_distance_error(
                 true_distances.as_ref().unwrap(),
                 approx_distances.as_ref().unwrap(),
-                K,
+                cli.k,
             );
 
             results.push(BenchmarkResult {
                 method: format!(
                     "NNDescent-nt{}-s{}-dp{}",
-                    n_trees_str,
-                    ef_search_str,
-                    if diversify_prob > 0.5 {
-                        1
-                    } else if diversify_prob > 0.0 {
-                        5
-                    } else {
-                        0
-                    }
+                    n_trees_str, ef_search_str, diversify_prob
                 ),
                 build_time_ms: build_time,
                 query_time_ms: query_time,
@@ -124,5 +127,8 @@ fn main() {
         }
     }
 
-    print_results(&format!("{}k cells, {}D", N_CELLS / 1000, DIM), &results);
+    print_results(
+        &format!("{}k cells, {}D", cli.n_cells / 1000, cli.dim),
+        &results,
+    );
 }

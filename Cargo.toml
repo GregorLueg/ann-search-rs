@@ -18,6 +18,7 @@ codegen-units = 1
 
 [dependencies]
 approx = "0.5.1"
+clap = { version = "4.5.53", features = ["derive"] }
 faer = "0.23.2"
 fixedbitset = "0.5.7"
 num-traits = "0.2.19"
