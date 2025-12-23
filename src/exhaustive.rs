@@ -1,9 +1,13 @@
 use faer::{MatRef, RowRef};
 use num_traits::{Float, FromPrimitive, ToPrimitive};
-use std::collections::BinaryHeap;
+use std::{collections::BinaryHeap, iter::Sum};
 
-use crate::dist::*;
-use crate::utils::*;
+use crate::utils::dist::*;
+use crate::utils::heap_structs::*;
+
+/////////////////////
+// Index structure //
+/////////////////////
 
 /// Exhaustive (brute-force) nearest neighbour index
 ///
@@ -15,36 +19,54 @@ use crate::utils::*;
 ///   Cosine
 /// * `dim` - Embedding dimensions
 /// * `n` - Number of samples
-/// * `metric` - The type of distance the index is designed for
+/// * `dist_metric` - The type of distance the index is designed for
+/// * `dist` - Is the index set up for distance (= true) or similarities
+///   (= false)
 pub struct ExhaustiveIndex<T> {
+    // shared ones
     pub vectors_flat: Vec<T>,
     pub dim: usize,
     pub n: usize,
     norms: Vec<T>,
-    metric: Dist,
+    dist_metric: Dist,
 }
+
+////////////////////
+// VectorDistance //
+////////////////////
 
 impl<T> VectorDistance<T> for ExhaustiveIndex<T>
 where
-    T: Float + FromPrimitive + ToPrimitive + Send + Sync,
+    T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum,
 {
+    /// Return the flat vectors
     fn vectors_flat(&self) -> &[T] {
         &self.vectors_flat
     }
 
+    /// Return the original dimensions
     fn dim(&self) -> usize {
         self.dim
     }
 
+    /// Return the normalised values for the Cosine calculation
     fn norms(&self) -> &[T] {
         &self.norms
     }
 }
 
+/////////////////////
+// ExhaustiveIndex //
+/////////////////////
+
 impl<T> ExhaustiveIndex<T>
 where
-    T: Float + FromPrimitive + ToPrimitive + Send + Sync,
+    T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum,
 {
+    //////////////////////
+    // Index generation //
+    //////////////////////
+
     /// Generate a new exhaustive index
     ///
     /// ### Params
@@ -82,10 +104,14 @@ where
             vectors_flat,
             norms,
             dim,
-            metric,
+            dist_metric: metric,
             n: n_vectors,
         }
     }
+
+    //////////////////
+    // Query (dist) //
+    //////////////////
 
     /// Query function
     ///
@@ -113,7 +139,7 @@ where
 
         let mut heap: BinaryHeap<(OrderedFloat<T>, usize)> = BinaryHeap::with_capacity(k + 1);
 
-        match self.metric {
+        match self.dist_metric {
             Dist::Euclidean => {
                 for idx in 0..n_vectors {
                     let dist = self.euclidean_distance_to_query(idx, query_vec);

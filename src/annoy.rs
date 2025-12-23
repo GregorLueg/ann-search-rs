@@ -1,13 +1,11 @@
 use faer::{MatRef, RowRef};
 use num_traits::{Float, FromPrimitive, ToPrimitive};
-use rand::rngs::StdRng;
-use rand::{Rng, SeedableRng};
+use rand::{rngs::StdRng, Rng, SeedableRng};
 use rayon::prelude::*;
-use std::cmp::Ordering;
-use std::collections::BinaryHeap;
-use std::iter::Sum;
+use std::{cmp::Ordering, collections::BinaryHeap, iter::Sum};
 
-use crate::dist::VectorDistance;
+use crate::utils::dist::*;
+use crate::utils::heap_structs::*;
 use crate::utils::*;
 
 /////////////
@@ -77,12 +75,15 @@ impl PartialEq for BacktrackEntry {
         self.margin == other.margin
     }
 }
+
 impl Eq for BacktrackEntry {}
+
 impl PartialOrd for BacktrackEntry {
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
         Some(self.cmp(other))
     }
 }
+
 impl Ord for BacktrackEntry {
     fn cmp(&self, other: &Self) -> Ordering {
         self.margin
@@ -172,11 +173,13 @@ const MIN_MEMBERS: usize = 64;
 /// * `leaf_indices` - Actual data indices stored in leaf nodes
 /// * `n_trees` - Number of trees in the forest
 pub struct AnnoyIndex<T> {
+    // shared ones
     pub vectors_flat: Vec<T>,
     pub dim: usize,
     pub n: usize,
     norms: Vec<T>,
     metric: Dist,
+    // index specific
     nodes: Vec<FlatNode>,
     roots: Vec<u32>,
     split_data: Vec<T>,
@@ -343,6 +346,7 @@ where
     /// ### Returns
     ///
     /// Tuple of `(indices, distances)` sorted by distance (nearest first)
+    #[inline]
     pub fn query(
         &self,
         query_vec: &[T],
@@ -480,9 +484,18 @@ where
     /// Query using a matrix row reference
     ///
     /// Optimised path for contiguous memory (stride == 1), otherwise copies
-    /// to a temporary vector.
+    /// to a temporary vector. Uses `self.query()` under the hood.
     ///
     /// ### Params
+    ///
+    /// * `query_row` - Row reference
+    /// * `k` - Number of neighbours to search
+    /// * `search_k` - Budget of items to examine (higher = better recall, slower)
+    ///   Defaults to `k * n_trees` if None
+    ///
+    /// ### Returns
+    ///
+    /// Tuple of `(indices, distances)` sorted by distance (nearest first)
     #[inline]
     pub fn query_row(
         &self,
@@ -720,7 +733,6 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::utils::Dist;
     use approx::assert_relative_eq;
     use faer::Mat;
 
@@ -778,7 +790,7 @@ mod tests {
 
     #[test]
     fn test_annoy_query_cosine() {
-        use crate::utils::Dist;
+        use crate::utils::dist::*;
 
         let mat = create_simple_matrix();
         let index = AnnoyIndex::new(mat.as_ref(), 8, Dist::Cosine, 42);
@@ -793,7 +805,7 @@ mod tests {
 
     #[test]
     fn test_annoy_query_k_larger_than_dataset() {
-        use crate::utils::Dist;
+        use crate::utils::dist::*;
 
         let mat = create_simple_matrix();
         let index = AnnoyIndex::new(mat.as_ref(), 4, Dist::Euclidean, 42);
@@ -808,7 +820,7 @@ mod tests {
 
     #[test]
     fn test_annoy_query_search_k() {
-        use crate::utils::Dist;
+        use crate::utils::dist::*;
 
         let mat = create_simple_matrix();
         let index = AnnoyIndex::new(mat.as_ref(), 4, Dist::Euclidean, 42);
@@ -910,7 +922,7 @@ mod tests {
 
     #[test]
     fn test_annoy_orthogonal_vectors() {
-        use crate::utils::Dist;
+        use crate::utils::dist::*;
         let data = [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0];
         let mat = Mat::from_fn(3, 3, |i, j| data[i * 3 + j]);
         let index = AnnoyIndex::new(mat.as_ref(), 4, Dist::Cosine, 42);
