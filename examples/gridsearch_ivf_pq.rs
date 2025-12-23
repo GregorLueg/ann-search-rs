@@ -1,5 +1,4 @@
 mod commons;
-
 use ann_search_rs::*;
 use clap::Parser;
 use commons::*;
@@ -54,14 +53,14 @@ fn main() {
         SyntheticData::Correlated => {
             println!("Using data for high dimensional ANN searches...\n");
             generate_clustered_data_high_dim(
-                cli.n_cells,
-                cli.dim,
-                cli.n_clusters,
-                DEFAULT_COR_STRENGTH,
-                cli.seed,
-            )
-        }
+            cli.n_cells,
+            cli.dim,
+            cli.n_clusters,
+            DEFAULT_COR_STRENGTH,
+            cli.seed,
+        )},
     };
+
     let query_data = data.as_ref();
     let mut results = Vec::new();
 
@@ -88,52 +87,72 @@ fn main() {
     println!("-----------------------------------------------------------------------------------------------");
 
     let nlist_values = [10, 20, 25, 50, 100];
+
+    // IVF-PQ benchmarks
+    let m_values: Vec<usize> = if cli.dim >= 128 {
+        vec![16, 32, 48]
+    } else {
+        vec![8, 16]
+    };
+
     for nlist in nlist_values {
-        println!("Building IVF-SQ8 index (nlist={})...", nlist);
-        let start = Instant::now();
-        let ivf_sq8_idx = build_ivf_sq8_index(
-            data.as_ref(),
-            nlist,
-            None,
-            &cli.distance,
-            cli.seed as usize,
-            false,
-        );
-        let build_time = start.elapsed().as_secs_f64() * 1000.0;
-
-        let nprobe_values = [
-            (0.05 * nlist as f64) as usize,
-            (0.1 * nlist as f64) as usize,
-            (0.15 * nlist as f64) as usize,
-        ];
-        let mut nprobe_values: Vec<_> = nprobe_values
-            .into_iter()
-            .collect::<HashSet<_>>()
-            .into_iter()
-            .collect();
-        nprobe_values.sort();
-
-        for nprobe in nprobe_values {
-            if nprobe > nlist || nprobe == 0 {
+        for m in &m_values {
+            if cli.dim % m != 0 {
                 continue;
             }
 
-            println!("Querying IVF-SQ8 (nlist={}, nprobe={})...", nlist, nprobe);
+            println!("Building IVF-PQ index (nlist={}, m={})...", nlist, m);
             let start = Instant::now();
-            let (approx_neighbors, _) =
-                query_ivf_sq8_index(query_data, &ivf_sq8_idx, cli.k, Some(nprobe), true, false);
-            let query_time = start.elapsed().as_secs_f64() * 1000.0;
+            let ivf_pq_idx = build_ivf_pq_index(
+                data.as_ref(),
+                nlist,
+                *m,
+                None,
+                None,
+                &cli.distance,
+                cli.seed as usize,
+                false,
+            );
+            let build_time = start.elapsed().as_secs_f64() * 1000.0;
 
-            let recall = calculate_recall(&true_neighbors, &approx_neighbors, cli.k);
+            let nprobe_values = [
+                (0.05 * nlist as f64) as usize,
+                (0.1 * nlist as f64) as usize,
+                (0.15 * nlist as f64) as usize,
+            ];
 
-            results.push(BenchmarkResult {
-                method: format!("IVF-SQ8-nl{}-np{}", nlist, nprobe),
-                build_time_ms: build_time,
-                query_time_ms: query_time,
-                total_time_ms: build_time + query_time,
-                recall_at_k: recall,
-                mean_dist_err: 0.0,
-            });
+            let mut nprobe_values: Vec<_> = nprobe_values
+                .into_iter()
+                .collect::<HashSet<_>>()
+                .into_iter()
+                .collect();
+            nprobe_values.sort();
+
+            for nprobe in nprobe_values {
+                if nprobe > nlist || nprobe == 0 {
+                    continue;
+                }
+
+                println!(
+                    "Querying IVF-PQ (nlist={}, m={}, np={})...",
+                    nlist, m, nprobe
+                );
+                let start = Instant::now();
+                let (approx_neighbors, _) =
+                    query_ivf_pq_index(query_data, &ivf_pq_idx, cli.k, Some(nprobe), true, false);
+                let query_time = start.elapsed().as_secs_f64() * 1000.0;
+
+                let recall = calculate_recall(&true_neighbors, &approx_neighbors, cli.k);
+
+                results.push(BenchmarkResult {
+                    method: format!("IVF-PQ-nl{}-m{}-np{}", nlist, m, nprobe),
+                    build_time_ms: build_time,
+                    query_time_ms: query_time,
+                    total_time_ms: build_time + query_time,
+                    recall_at_k: recall,
+                    mean_dist_err: 0.0,
+                });
+            }
         }
     }
 

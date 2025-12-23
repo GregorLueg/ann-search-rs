@@ -302,7 +302,7 @@ where
         ef_search: Option<usize>,
     ) -> (Vec<usize>, Vec<T>) {
         let k = k.min(self.n);
-        let ef = ef_search.unwrap_or_else(|| (k * 2).clamp(20, 100)).max(k);
+        let ef = ef_search.unwrap_or_else(|| (k * 2).clamp(50, 200)).max(k);
 
         let query_norm = if self.metric == Dist::Cosine {
             query_vec.iter().map(|x| *x * *x).sum::<T>().sqrt()

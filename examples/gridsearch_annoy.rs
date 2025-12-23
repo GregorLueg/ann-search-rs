@@ -1,45 +1,60 @@
 mod commons;
 
-use ann_search_rs::synthetic::generate_clustered_data;
 use ann_search_rs::utils::KnnValidation;
 use ann_search_rs::*;
+use clap::Parser;
 use commons::*;
 use faer::Mat;
 use std::time::Instant;
 use thousands::*;
 
+#[derive(Parser)]
+struct Cli {
+    #[arg(long, default_value_t = DEFAULT_N_CELLS)]
+    n_cells: usize,
+
+    #[arg(long, default_value_t = DEFAULT_DIM)]
+    dim: usize,
+
+    #[arg(long, default_value_t = DEFAULT_N_CLUSTERS)]
+    n_clusters: usize,
+
+    #[arg(long, default_value_t = DEFAULT_K)]
+    k: usize,
+
+    #[arg(long, default_value_t = DEFAULT_SEED)]
+    seed: u64,
+
+    #[arg(long, default_value = DEFAULT_DISTANCE)]
+    distance: String,
+}
+
 fn main() {
-    // test parameters
-    const N_CELLS: usize = 250_000;
-    const DIM: usize = 24;
-    const N_CLUSTERS: usize = 20;
-    const K: usize = 15;
-    const SEED: u64 = 10101;
-    const DISTANCE: &str = "cosine";
+    let cli = Cli::parse();
 
     println!("-----------------------------");
     println!(
         "Generating synthetic data: {} cells, {} dimensions, {} clusters, {} dist.",
-        N_CELLS.separate_with_underscores(),
-        DIM,
-        N_CLUSTERS,
-        DISTANCE
+        cli.n_cells.separate_with_underscores(),
+        cli.dim,
+        cli.n_clusters,
+        cli.distance
     );
     println!("-----------------------------");
 
-    let data: Mat<f32> = generate_clustered_data(N_CELLS, DIM, N_CLUSTERS, SEED);
+    let data: Mat<f32> = generate_clustered_data(cli.n_cells, cli.dim, cli.n_clusters, cli.seed);
     let query_data = data.as_ref();
     let mut results = Vec::new();
 
     println!("Building exhaustive index...");
     let start = Instant::now();
-    let exhaustive_idx = build_exhaustive_index(data.as_ref(), DISTANCE);
+    let exhaustive_idx = build_exhaustive_index(data.as_ref(), &cli.distance);
     let build_time = start.elapsed().as_secs_f64() * 1000.0;
 
     println!("Querying exhaustive index...");
     let start = Instant::now();
     let (true_neighbors, true_distances) =
-        query_exhaustive_index(query_data, &exhaustive_idx, K, true, false);
+        query_exhaustive_index(query_data, &exhaustive_idx, cli.k, true, false);
     let query_time = start.elapsed().as_secs_f64() * 1000.0;
 
     results.push(BenchmarkResult {
@@ -52,40 +67,43 @@ fn main() {
     });
 
     println!("-----------------------------");
-
     let n_trees_values = [5, 10, 15, 25, 50, 75];
-
     for n_trees in n_trees_values {
         println!("Building Annoy index ({} trees)...", n_trees);
         let start = Instant::now();
-        let annoy_idx = build_annoy_index(data.as_ref(), DISTANCE.into(), n_trees, SEED as usize);
+        let annoy_idx = build_annoy_index(
+            data.as_ref(),
+            cli.distance.as_str().into(),
+            n_trees,
+            cli.seed as usize,
+        );
         let build_time = start.elapsed().as_secs_f64() * 1000.0;
 
         let search_budgets = [
             (None, "auto"),
-            (Some(K * n_trees * 10), "10x"),
-            (Some(K * n_trees * 5), "5x"),
+            (Some(cli.k * n_trees * 10), "10x"),
+            (Some(cli.k * n_trees * 5), "5x"),
         ];
 
         for (search_budget, budget_label) in search_budgets {
             println!("Querying Annoy index (search_budget={})...", budget_label);
             let start = Instant::now();
             let (approx_neighbors, approx_distances) =
-                query_annoy_index(query_data, &annoy_idx, K, search_budget, true, false);
+                query_annoy_index(query_data, &annoy_idx, cli.k, search_budget, true, false);
             let query_time = start.elapsed().as_secs_f64() * 1000.0;
 
-            let recall = calculate_recall(&true_neighbors, &approx_neighbors, K);
+            let recall = calculate_recall(&true_neighbors, &approx_neighbors, cli.k);
             let dist_error = calculate_distance_error(
                 true_distances.as_ref().unwrap(),
                 approx_distances.as_ref().unwrap(),
-                K,
+                cli.k,
             );
 
-            let internal_recall = annoy_idx.validate_index(K, SEED as usize, None);
+            let internal_recall = annoy_idx.validate_index(cli.k, cli.seed as usize, None);
             println!("  Internal validation: {:.3}", internal_recall);
 
             results.push(BenchmarkResult {
-                method: format!("Annoy-nt{}:{}", n_trees, budget_label),
+                method: format!("Annoy-nt{}-s:{}", n_trees, budget_label),
                 build_time_ms: build_time,
                 query_time_ms: query_time,
                 total_time_ms: build_time + query_time,
@@ -95,5 +113,8 @@ fn main() {
         }
     }
 
-    print_results(&format!("{}k cells, {}D", N_CELLS / 1000, DIM), &results);
+    print_results(
+        &format!("{}k cells, {}D", cli.n_cells / 1000, cli.dim),
+        &results,
+    );
 }
