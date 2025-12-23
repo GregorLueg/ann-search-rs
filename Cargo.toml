@@ -1,11 +1,11 @@
 [package]
 name = "ann-search-rs"
-version = "0.1.10"
+version = "0.2.0"
 edition = "2021"
 authors = ["Gregor Lueg <gregorlueg@me.com>"]
 license = "MIT"
 repository = "https://github.com/GregorLueg/ann-search-rs"
-description = "Various approximate nearest neighbour searches in Rust."
+description = "Various approximate nearest neighbour searches in Rust with emphasis for single cell applications."
 
 [lib]
 name = "ann_search_rs"
@@ -14,6 +14,7 @@ path = "src/lib.rs"
 [profile.release]
 lto = true
 codegen-units = 1
+
 
 [dependencies]
 approx = "0.5.1"

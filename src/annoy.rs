@@ -1,13 +1,11 @@
 use faer::{MatRef, RowRef};
 use num_traits::{Float, FromPrimitive, ToPrimitive};
-use rand::rngs::StdRng;
-use rand::{Rng, SeedableRng};
+use rand::{rngs::StdRng, Rng, SeedableRng};
 use rayon::prelude::*;
-use std::cmp::Ordering;
-use std::collections::BinaryHeap;
-use std::iter::Sum;
+use std::{cmp::Ordering, collections::BinaryHeap, iter::Sum};
 
-use crate::dist::*;
+use crate::utils::dist::*;
+use crate::utils::heap_structs::*;
 use crate::utils::*;
 
 /////////////
@@ -77,12 +75,15 @@ impl PartialEq for BacktrackEntry {
         self.margin == other.margin
     }
 }
+
 impl Eq for BacktrackEntry {}
+
 impl PartialOrd for BacktrackEntry {
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
         Some(self.cmp(other))
     }
 }
+
 impl Ord for BacktrackEntry {
     fn cmp(&self, other: &Self) -> Ordering {
         self.margin
@@ -789,7 +790,7 @@ mod tests {
 
     #[test]
     fn test_annoy_query_cosine() {
-        use crate::dist::*;
+        use crate::utils::dist::*;
 
         let mat = create_simple_matrix();
         let index = AnnoyIndex::new(mat.as_ref(), 8, Dist::Cosine, 42);
@@ -804,7 +805,7 @@ mod tests {
 
     #[test]
     fn test_annoy_query_k_larger_than_dataset() {
-        use crate::dist::*;
+        use crate::utils::dist::*;
 
         let mat = create_simple_matrix();
         let index = AnnoyIndex::new(mat.as_ref(), 4, Dist::Euclidean, 42);
@@ -819,7 +820,7 @@ mod tests {
 
     #[test]
     fn test_annoy_query_search_k() {
-        use crate::dist::*;
+        use crate::utils::dist::*;
 
         let mat = create_simple_matrix();
         let index = AnnoyIndex::new(mat.as_ref(), 4, Dist::Euclidean, 42);
@@ -921,7 +922,7 @@ mod tests {
 
     #[test]
     fn test_annoy_orthogonal_vectors() {
-        use crate::dist::*;
+        use crate::utils::dist::*;
         let data = [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0];
         let mat = Mat::from_fn(3, 3, |i, j| data[i * 3 + j]);
         let index = AnnoyIndex::new(mat.as_ref(), 4, Dist::Cosine, 42);

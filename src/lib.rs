@@ -1,33 +1,35 @@
 #![allow(clippy::needless_range_loop)] // I want these loops!
 
 pub mod annoy;
-pub mod dist;
 pub mod exhaustive;
-pub mod fanng;
 pub mod hnsw;
 pub mod ivf;
 pub mod lsh;
 pub mod nndescent;
+pub mod quantised;
 pub mod synthetic;
 pub mod utils;
-pub mod quantised;
 
 use faer::MatRef;
 use num_traits::{Float, FromPrimitive, ToPrimitive};
 use rayon::prelude::*;
-use std::iter::Sum;
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::{
+    iter::Sum,
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    },
+};
 use thousands::*;
 
 use crate::annoy::*;
-use crate::dist::*;
 use crate::exhaustive::*;
-use crate::fanng::*;
 use crate::hnsw::*;
 use crate::ivf::*;
 use crate::lsh::*;
 use crate::nndescent::*;
+use crate::quantised::ivf_sq8::*;
+use crate::utils::dist::*;
 
 ///////////
 // Annoy //
@@ -162,7 +164,7 @@ pub fn build_hnsw_index<T>(
     verbose: bool,
 ) -> HnswIndex<T>
 where
-    T: Float + FromPrimitive + ToPrimitive + Send + Sync,
+    T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum,
     HnswIndex<T>: HnswState<T>,
 {
     HnswIndex::build(mat, m, ef_construction, dist_metric, seed, verbose)
@@ -198,7 +200,7 @@ pub fn query_hnsw_index<T>(
     verbose: bool,
 ) -> (Vec<Vec<usize>>, Option<Vec<Vec<T>>>)
 where
-    T: Float + FromPrimitive + ToPrimitive + Send + Sync,
+    T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum,
     HnswIndex<T>: HnswState<T>,
 {
     let n_samples = query_mat.nrows();
@@ -395,120 +397,6 @@ where
     }
 }
 
-///////////
-// FANNG //
-///////////
-
-/// Build a FANNG index from an embedding matrix
-///
-/// ### Params
-///
-/// * `mat` - Embedding matrix (rows = samples, cols = features)
-/// * `dist_metric` - Distance metric: "euclidean" or "cosine"
-/// * `faang_params` - Optional FANNG parameters (uses default if None)
-/// * `seed` - Random seed for reproducibility
-/// * `verbose` - Print progress updates during construction
-///
-/// ### Returns
-///
-/// Constructed FANNG index ready for querying
-pub fn build_fanng_index<T>(
-    mat: MatRef<T>,
-    dist_metric: &str,
-    faang_params: Option<FanngParams>,
-    seed: usize,
-    verbose: bool,
-) -> Fanng<T>
-where
-    T: Float + Send + Sync,
-{
-    let faang_params = faang_params.unwrap_or_default();
-
-    Fanng::new(mat, dist_metric, &faang_params, seed, verbose)
-}
-
-/// Query a FANNG index
-///
-/// ### Params
-///
-/// * `query_mat` - The query matrix containing the samples × features
-/// * `index` - The pre-built FANNG index
-/// * `k` - Number of neighbours to return
-/// * `max_calcs` - Maximum number of distance calculations per query (controls
-///   recall/speed trade-off)
-/// * `no_shortcuts` - How many of the random indices selected in the graph
-///   shall be explored.
-/// * `return_dist` - Whether to return distances between points
-/// * `verbose` - Print progress updates
-///
-/// ### Returns
-///
-/// A tuple of `(knn_indices, optional distances)`
-pub fn query_fanng_index<T>(
-    query_mat: MatRef<T>,
-    index: &Fanng<T>,
-    k: usize,
-    max_calcs: usize,
-    no_shortcuts: usize,
-    return_dist: bool,
-    verbose: bool,
-) -> (Vec<Vec<usize>>, Option<Vec<Vec<T>>>)
-where
-    T: Float + Send + Sync,
-{
-    let n_samples = query_mat.nrows();
-    let counter = Arc::new(AtomicUsize::new(0));
-
-    if return_dist {
-        let results: Vec<(Vec<usize>, Vec<T>)> = (0..n_samples)
-            .into_par_iter()
-            .map(|i| {
-                let query: Vec<T> = query_mat.row(i).iter().copied().collect();
-                let (indices, distances) = index.query(&query, k, max_calcs, no_shortcuts);
-
-                if verbose {
-                    let count = counter.fetch_add(1, Ordering::Relaxed) + 1;
-                    if count.is_multiple_of(100_000) {
-                        println!(
-                            " Processed {} / {} samples.",
-                            count.separate_with_underscores(),
-                            n_samples.separate_with_underscores()
-                        );
-                    }
-                }
-
-                (indices, distances)
-            })
-            .collect();
-
-        let (indices, distances) = results.into_iter().unzip();
-        (indices, Some(distances))
-    } else {
-        let indices: Vec<Vec<usize>> = (0..n_samples)
-            .into_par_iter()
-            .map(|i| {
-                let query: Vec<T> = query_mat.row(i).iter().copied().collect();
-                let (indices, _) = index.query(&query, k, max_calcs, no_shortcuts);
-
-                if verbose {
-                    let count = counter.fetch_add(1, Ordering::Relaxed) + 1;
-                    if count.is_multiple_of(100_000) {
-                        println!(
-                            " Processed {} / {} samples.",
-                            count.separate_with_underscores(),
-                            n_samples.separate_with_underscores()
-                        );
-                    }
-                }
-
-                indices
-            })
-            .collect();
-
-        (indices, None)
-    }
-}
-
 ////////////////
 // Exhaustive //
 ////////////////
@@ -525,7 +413,7 @@ where
 /// The initialised `ExhausiveIndex`
 pub fn build_exhaustive_index<T>(mat: MatRef<T>, dist_metric: &str) -> ExhaustiveIndex<T>
 where
-    T: Float + FromPrimitive + ToPrimitive + Send + Sync,
+    T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum,
 {
     let metric = parse_ann_dist(dist_metric).unwrap_or_default();
     ExhaustiveIndex::new(mat, metric)
@@ -552,7 +440,7 @@ pub fn query_exhaustive_index<T>(
     verbose: bool,
 ) -> (Vec<Vec<usize>>, Option<Vec<Vec<T>>>)
 where
-    T: Float + FromPrimitive + ToPrimitive + Send + Sync,
+    T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum,
 {
     let n_samples = query_mat.nrows();
     let counter = Arc::new(AtomicUsize::new(0));
@@ -626,7 +514,7 @@ pub fn build_lsh_index<T>(
     seed: usize,
 ) -> LSHIndex<T>
 where
-    T: Float + FromPrimitive + ToPrimitive + Send + Sync,
+    T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum,
     LSHIndex<T>: LSHQuery<T>,
 {
     let metric = parse_ann_dist(dist_metric).unwrap_or_default();
@@ -655,7 +543,7 @@ pub fn query_lsh_index<T>(
     verbose: bool,
 ) -> (Vec<Vec<usize>>, Option<Vec<Vec<T>>>)
 where
-    T: Float + FromPrimitive + ToPrimitive + Send + Sync,
+    T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum,
     LSHIndex<T>: LSHQuery<T>,
 {
     let n_samples = query_mat.nrows();
@@ -761,7 +649,7 @@ pub fn build_ivf_index<T>(
     verbose: bool,
 ) -> IvfIndex<T>
 where
-    T: Float + FromPrimitive + ToPrimitive + Send + Sync,
+    T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum,
 {
     let n = mat.nrows();
     let dim = mat.ncols();
@@ -832,7 +720,7 @@ pub fn query_ivf_index<T>(
     verbose: bool,
 ) -> (Vec<Vec<usize>>, Option<Vec<Vec<T>>>)
 where
-    T: Float + FromPrimitive + ToPrimitive + Send + Sync,
+    T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum,
 {
     let n_samples = query_mat.nrows();
     let counter = Arc::new(AtomicUsize::new(0));
@@ -881,6 +769,131 @@ where
             })
             .collect();
 
+        (indices, None)
+    }
+}
+
+/////////////
+// IVF-SQ8 //
+/////////////
+
+/// Build an IVF-SQ8 index
+///
+/// ### Params
+///
+/// * `mat` - The data matrix. Rows represent the samples, columns represent
+///   the embedding dimensions
+/// * `nlist` - Number of clusters to create
+/// * `max_iters` - Maximum k-means iterations (defaults to 30 if None)
+/// * `seed` - Random seed for reproducibility
+/// * `verbose` - Print progress information during index construction
+///
+/// ### Return
+///
+/// The `IvfSq8Index`.
+///
+/// ### Note
+///
+/// Currently only supports Euclidean distance.
+pub fn build_ivf_sq8_index<T>(
+    mat: MatRef<T>,
+    nlist: usize,
+    max_iters: Option<usize>,
+    dist_metric: &str,
+    seed: usize,
+    verbose: bool,
+) -> IvfSq8Index<T>
+where
+    T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum,
+{
+    let n = mat.nrows();
+    let dim = mat.ncols();
+    let ann_dist = parse_ann_dist(dist_metric).unwrap_or_default();
+
+    let mut vectors_flat = Vec::with_capacity(n * dim);
+    for i in 0..n {
+        vectors_flat.extend(mat.row(i).iter().cloned());
+    }
+
+    IvfSq8Index::build(
+        vectors_flat,
+        dim,
+        n,
+        nlist,
+        ann_dist,
+        max_iters,
+        seed,
+        verbose,
+    )
+}
+
+/// Helper function to query a given IVF-SQ8 index
+///
+/// ### Params
+///
+/// * `query_mat` - The query matrix containing the samples x features
+/// * `index` - Reference to the built IVF-SQ8 index
+/// * `k` - Number of neighbours to return
+/// * `nprobe` - Number of clusters to search (defaults to 20% of nlist)
+///   Higher values improve recall at the cost of speed
+/// * `return_dist` - Shall the inner product scores be returned
+/// * `verbose` - Print progress information
+///
+/// ### Returns
+///
+/// A tuple of `(knn_indices, optional inner_product_scores)`
+pub fn query_ivf_sq8_index<T>(
+    query_mat: MatRef<T>,
+    index: &IvfSq8Index<T>,
+    k: usize,
+    nprobe: Option<usize>,
+    return_dist: bool,
+    verbose: bool,
+) -> (Vec<Vec<usize>>, Option<Vec<Vec<T>>>)
+where
+    T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum,
+{
+    let n_samples = query_mat.nrows();
+    let counter = Arc::new(AtomicUsize::new(0));
+
+    if return_dist {
+        let results: Vec<(Vec<usize>, Vec<T>)> = (0..n_samples)
+            .into_par_iter()
+            .map(|i| {
+                let (neighbours, scores) = index.query_row(query_mat.row(i), k, nprobe);
+                if verbose {
+                    let count = counter.fetch_add(1, Ordering::Relaxed) + 1;
+                    if count.is_multiple_of(100_000) {
+                        println!(
+                            "  Processed {} / {} samples.",
+                            count.separate_with_underscores(),
+                            n_samples.separate_with_underscores()
+                        );
+                    }
+                }
+                (neighbours, scores)
+            })
+            .collect();
+        let (indices, scores) = results.into_iter().unzip();
+        (indices, Some(scores))
+    } else {
+        let indices: Vec<Vec<usize>> = (0..n_samples)
+            .into_par_iter()
+            .map(|i| {
+                let (neighbours, _) = index.query_row(query_mat.row(i), k, nprobe);
+                if verbose {
+                    let count = counter.fetch_add(1, Ordering::Relaxed) + 1;
+                    if count.is_multiple_of(100_000) {
+                        println!(
+                            "  Processed {} / {} samples.",
+                            count.separate_with_underscores(),
+                            n_samples.separate_with_underscores()
+                        );
+                    }
+                }
+                neighbours
+            })
+            .collect();
         (indices, None)
     }
 }

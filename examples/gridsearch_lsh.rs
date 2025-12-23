@@ -14,14 +14,16 @@ fn main() {
     const DIM: usize = 24;
     const N_CLUSTERS: usize = 20;
     const K: usize = 15;
-    const SEED: u64 = 42;
+    const SEED: u64 = 10101;
+    const DISTANCE: &str = "cosine";
 
     println!("-----------------------------");
     println!(
-        "Generating synthetic data: {} cells, {} dimensions, {} clusters.",
+        "Generating synthetic data: {} cells, {} dimensions, {} clusters, {} dist.",
         N_CELLS.separate_with_underscores(),
         DIM,
         N_CLUSTERS,
+        DISTANCE
     );
     println!("-----------------------------");
 
@@ -31,7 +33,7 @@ fn main() {
 
     println!("Building exhaustive index...");
     let start = Instant::now();
-    let exhaustive_idx = build_exhaustive_index(data.as_ref(), "euclidean");
+    let exhaustive_idx = build_exhaustive_index(data.as_ref(), DISTANCE);
     let build_time = start.elapsed().as_secs_f64() * 1000.0;
 
     println!("Querying exhaustive index...");
@@ -46,7 +48,7 @@ fn main() {
         query_time_ms: query_time,
         total_time_ms: build_time + query_time,
         recall_at_k: 1.0,
-        mean_distance_error: 0.0,
+        mean_dist_err: 0.0,
     });
 
     println!("-----------------------------");
@@ -54,15 +56,16 @@ fn main() {
     let build_params = [
         (10, 8),
         (20, 8),
-        (50, 8),
+        (25, 8),
         (10, 10),
         (20, 10),
-        (50, 10),
+        (25, 10),
         (10, 12),
         (20, 12),
-        (50, 12),
+        (25, 12),
         (10, 16),
         (20, 16),
+        (25, 16),
         (50, 16),
     ];
 
@@ -74,18 +77,14 @@ fn main() {
         let start = Instant::now();
         let lsh_index = build_lsh_index(
             data.as_ref(),
-            "euclidean",
+            DISTANCE,
             num_tables,
             bits_per_hash,
             SEED as usize,
         );
         let build_time = start.elapsed().as_secs_f64() * 1000.0;
 
-        let search_budgets = [
-            (None, "auto"),
-            (Some(1000), "1k_cand"),
-            (Some(5000), "5k_cand"),
-        ];
+        let search_budgets = [(None, "auto"), (Some(5000), "5k_cand")];
 
         for (max_cand, cand_label) in search_budgets {
             println!("Querying LSH index (cand={})...", cand_label);
@@ -94,7 +93,7 @@ fn main() {
                 query_lsh_index(query_data, &lsh_index, K, max_cand, true, false);
             let query_time = start.elapsed().as_secs_f64() * 1000.0;
 
-            let recall = calculate_recall::<f32>(&true_neighbors, &approx_neighbors, K);
+            let recall = calculate_recall(&true_neighbors, &approx_neighbors, K);
             let dist_error = calculate_distance_error(
                 true_distances.as_ref().unwrap(),
                 approx_distances.as_ref().unwrap(),
@@ -110,7 +109,7 @@ fn main() {
                 query_time_ms: query_time,
                 total_time_ms: build_time + query_time,
                 recall_at_k: recall,
-                mean_distance_error: dist_error,
+                mean_dist_err: dist_error,
             });
         }
     }

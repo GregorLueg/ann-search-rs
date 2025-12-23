@@ -1,9 +1,7 @@
 use faer::traits::ComplexField;
 use faer::Mat;
 use num_traits::{Float, FromPrimitive};
-use rand::rngs::StdRng;
-use rand::seq::SliceRandom;
-use rand::{Rng, SeedableRng};
+use rand::{rngs::StdRng, seq::SliceRandom, Rng, SeedableRng};
 
 /// Generate synthetic single-cell-like data with cluster structure
 ///
@@ -58,6 +56,7 @@ where
         cluster_assignments.push(rng.random_range(0..n_clusters));
     }
     cluster_assignments.shuffle(&mut rng);
+    cluster_assignments.truncate(n_samples);
 
     // Generate with variable noise
     for (i, &cluster_idx) in cluster_assignments.iter().enumerate() {

@@ -13,14 +13,16 @@ fn main() {
     const DIM: usize = 24;
     const N_CLUSTERS: usize = 20;
     const K: usize = 15;
-    const SEED: u64 = 42;
+    const SEED: u64 = 10101;
+    const DISTANCE: &str = "cosine";
 
     println!("-----------------------------");
     println!(
-        "Generating synthetic data: {} cells, {} dimensions, {} clusters.",
+        "Generating synthetic data: {} cells, {} dimensions, {} clusters, {} dist.",
         N_CELLS.separate_with_underscores(),
         DIM,
         N_CLUSTERS,
+        DISTANCE
     );
     println!("-----------------------------");
 
@@ -30,7 +32,7 @@ fn main() {
 
     println!("Building exhaustive index...");
     let start = Instant::now();
-    let exhaustive_idx = build_exhaustive_index(data.as_ref(), "euclidean");
+    let exhaustive_idx = build_exhaustive_index(data.as_ref(), DISTANCE);
     let build_time = start.elapsed().as_secs_f64() * 1000.0;
 
     println!("Querying exhaustive index...");
@@ -45,7 +47,7 @@ fn main() {
         query_time_ms: query_time,
         total_time_ms: build_time + query_time,
         recall_at_k: 1.0,
-        mean_distance_error: 0.0,
+        mean_dist_err: 0.0,
     });
 
     println!("-----------------------------");
@@ -70,7 +72,7 @@ fn main() {
         let start = Instant::now();
         let nndescent_idx = build_nndescent_index(
             data.as_ref(),
-            "euclidean",
+            DISTANCE,
             0.001,
             diversify_prob,
             None,
@@ -93,7 +95,7 @@ fn main() {
                 query_nndescent_index(query_data, &nndescent_idx, K, ef_search, true, false);
             let query_time = start.elapsed().as_secs_f64() * 1000.0;
 
-            let recall = calculate_recall::<f32>(&true_neighbors, &approx_neighbors, K);
+            let recall = calculate_recall(&true_neighbors, &approx_neighbors, K);
             let dist_error = calculate_distance_error(
                 true_distances.as_ref().unwrap(),
                 approx_distances.as_ref().unwrap(),
@@ -117,7 +119,7 @@ fn main() {
                 query_time_ms: query_time,
                 total_time_ms: build_time + query_time,
                 recall_at_k: recall,
-                mean_distance_error: dist_error,
+                mean_dist_err: dist_error,
             });
         }
     }

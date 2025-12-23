@@ -1,52 +1,18 @@
 use faer::{MatRef, RowRef};
 use num_traits::{Float, FromPrimitive, ToPrimitive};
-use rand::prelude::*;
-use rand::rng;
+use rand::{prelude::*, rng};
 use rand_distr::StandardNormal;
 use rayon::prelude::*;
-use rustc_hash::FxHashMap;
-use rustc_hash::FxHashSet;
-use std::cell::RefCell;
-use std::cmp::Ord;
-use std::collections::BinaryHeap;
+use rustc_hash::{FxHashMap, FxHashSet};
+use std::{cell::RefCell, cmp::Ord, collections::BinaryHeap, iter::Sum};
 
-use crate::dist::*;
+use crate::utils::dist::*;
+use crate::utils::heap_structs::*;
 use crate::utils::*;
 
-thread_local! {
-    /// Candidates in a RefCell
-    static LSH_CANDIDATES: RefCell<Vec<usize>> = const { RefCell::new(Vec::new()) };
-    /// HashSet per thread
-    static LSH_SEEN_SET: RefCell<FxHashSet<usize>> = RefCell::new(FxHashSet::default());
-    /// Heap for f32
-    static LSH_HEAP_F32: RefCell<BinaryHeap<(OrderedFloat<f32>, usize)>> = const { RefCell::new(BinaryHeap::new()) };
-    /// Heap for f64
-    static LSH_HEAP_F64: RefCell<BinaryHeap<(OrderedFloat<f64>, usize)>> = const { RefCell::new(BinaryHeap::new()) };
-}
-
-/// Query interface for LSH using thread-local storage
-///
-/// Implemented separately for f32 and f64 to use type-specific thread locals
-pub trait LSHQuery<T> {
-    /// Execute a query using thread-local buffers
-    ///
-    /// ### Params
-    ///
-    /// * `query_vec` - Query vector
-    /// * `k` - Number of neighbours to return
-    /// * `max_cand` - Optional limit on candidates examined
-    ///
-    /// ### Returns
-    ///
-    /// Tuple of `(indices, distances, fallback_triggered)`. The fallback flag
-    /// indicates whether random sampling was used due to empty buckets.
-    fn query_internal(
-        &self,
-        query_vec: &[T],
-        k: usize,
-        max_cand: Option<usize>,
-    ) -> (Vec<usize>, Vec<T>, bool);
-}
+////////////////
+// Main index //
+////////////////
 
 /// LSH index for approximate nearest neighbour search
 ///
@@ -89,7 +55,7 @@ pub struct LSHIndex<T> {
 /// VectorDistance trait
 impl<T> VectorDistance<T> for LSHIndex<T>
 where
-    T: Float + FromPrimitive + ToPrimitive + Send + Sync,
+    T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum,
 {
     /// Return the flat vectors
     fn vectors_flat(&self) -> &[T] {
@@ -109,7 +75,7 @@ where
 
 impl<T> LSHIndex<T>
 where
-    T: Float + FromPrimitive + ToPrimitive + Send + Sync,
+    T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum,
     Self: LSHQuery<T>,
 {
     /// Construct a new LSH index
@@ -163,12 +129,14 @@ where
         // Euclidean: random projections
         let mut rng = StdRng::seed_from_u64(seed as u64);
         let total_random_vecs = num_tables * bits_per_hash * dim;
-        let random_vecs: Vec<T> = (0..total_random_vecs)
+        let mut random_vecs: Vec<T> = (0..total_random_vecs)
             .map(|_| {
                 let val: f64 = rng.sample(StandardNormal);
                 T::from_f64(val).unwrap()
             })
             .collect();
+
+        orthogonalise_table_projections(&mut random_vecs, num_tables, bits_per_hash, dim);
 
         let hash_tables: Vec<_> = (0..num_tables)
             .into_par_iter()
@@ -179,14 +147,8 @@ where
                     let vec_start = vec_idx * dim;
                     let vec = &vectors_flat[vec_start..vec_start + dim];
 
-                    let hash = Self::compute_hash(
-                        vec,
-                        table_idx,
-                        bits_per_hash,
-                        dim,
-                        &random_vecs,
-                        &metric,
-                    );
+                    let hash =
+                        compute_hash(vec, table_idx, bits_per_hash, dim, &random_vecs, &metric);
 
                     table.entry(hash).or_insert_with(Vec::new).push(vec_idx);
                 }
@@ -273,104 +235,195 @@ where
         let query_vec: Vec<T> = query_row.iter().cloned().collect();
         self.query(&query_vec, k, max_cand)
     }
+}
 
-    /// Compute hash code for a vector
-    ///
-    /// Uses different schemes depending on metric:
-    /// - **Cosine**: SimHash - each bit is sign of random hyperplane projection
-    /// - **Euclidean**: Modified E2LSH - encodes which projection has maximum
-    ///   magnitude and its sign
-    ///
-    /// ### Params
-    ///
-    /// * `vec` - Vector to hash
-    /// * `table_idx` - Which hash table (selects random projections)
-    /// * `bits_per_hash` - Number of bits in output hash
-    /// * `dim` - Dimensionality
-    /// * `random_vecs` - Pool of random projection vectors
-    /// * `metric` - Distance metric
-    ///
-    /// ### Returns
-    ///
-    /// Hash code as u64 (only lower `bits_per_hash` bits used)
-    #[inline]
-    fn compute_hash(
-        vec: &[T],
-        table_idx: usize,
-        bits_per_hash: usize,
-        dim: usize,
-        random_vecs: &[T],
-        metric: &Dist,
-    ) -> u64 {
-        let mut hash: u64 = 0;
-        let random_base = table_idx * bits_per_hash * dim;
+/////////////
+// Helpers //
+/////////////
 
-        match metric {
-            // SimHash
-            Dist::Cosine => {
-                for bit_idx in 0..bits_per_hash {
-                    let offset = random_base + bit_idx * dim;
+/// Compute hash code for a vector
+///
+/// Uses different schemes depending on metric:
+/// - **Cosine**: SimHash - each bit is sign of random hyperplane projection
+/// - **Euclidean**: Random Max-Pooling Hash - a weird function that does a good
+///   job for small dimensions.
+///
+/// ### Params
+///
+/// * `vec` - Vector to hash
+/// * `table_idx` - Which hash table (selects random projections)
+/// * `bits_per_hash` - Number of bits in output hash
+/// * `dim` - Dimensionality
+/// * `random_vecs` - Pool of random projection vectors
+/// * `metric` - Distance metric
+///
+/// ### Returns
+///
+/// Hash code as u64 (only lower `bits_per_hash` bits used)
+#[inline]
+fn compute_hash<T>(
+    vec: &[T],
+    table_idx: usize,
+    bits_per_hash: usize,
+    dim: usize,
+    random_vecs: &[T],
+    metric: &Dist,
+) -> u64
+where
+    T: Float,
+{
+    let mut hash: u64 = 0;
+    let random_base = table_idx * bits_per_hash * dim;
 
-                    let mut dot = T::zero();
-                    for d in 0..dim {
-                        dot = dot + vec[d] * random_vecs[offset + d];
-                    }
+    match metric {
+        // SimHash
+        Dist::Cosine => {
+            for bit_idx in 0..bits_per_hash {
+                let offset = random_base + bit_idx * dim;
 
-                    // interesting syntax to do bit manipulations!
-                    if dot >= T::zero() {
-                        hash |= 1u64 << bit_idx;
-                    }
+                let mut dot = T::zero();
+                for d in 0..dim {
+                    dot = dot + vec[d] * random_vecs[offset + d];
                 }
-            }
-            // E2LSH: hash = floor((a * x + b) / w) for each projection
-            // Combine multiple projections with XOR for distribution
-            Dist::Euclidean => {
-                // For each group of dimensions, find the projection with max absolute value
-                let group_size = bits_per_hash.div_ceil(2); // bits needed: index + sign
 
-                for group_idx in 0..group_size {
-                    let offset = random_base + group_idx * dim;
-
-                    let mut max_idx = 0;
-                    let mut max_abs_val = T::zero();
-                    let mut max_sign_positive = true;
-
-                    // Check a small set of random projections (e.g., 3-4)
-                    for proj_idx in 0..3.min(bits_per_hash - group_idx * 2) {
-                        let proj_offset = offset + proj_idx * dim / 3;
-
-                        let mut dot = T::zero();
-                        for d in 0..dim {
-                            dot = dot
-                                + vec[d]
-                                    * random_vecs
-                                        [(proj_offset + d) % (random_base + bits_per_hash * dim)];
-                        }
-
-                        let abs_val = dot.abs();
-                        if abs_val > max_abs_val {
-                            max_abs_val = abs_val;
-                            max_idx = proj_idx;
-                            max_sign_positive = dot >= T::zero();
-                        }
-                    }
-
-                    // Encode: which projection was max (2 bits) + sign (1 bit)
-                    hash |= (max_idx as u64) << (group_idx * 3);
-                    if max_sign_positive {
-                        hash |= 1u64 << (group_idx * 3 + 2);
-                    }
+                // interesting syntax to do bit manipulations!
+                if dot >= T::zero() {
+                    hash |= 1u64 << bit_idx;
                 }
             }
         }
+        Dist::Euclidean => {
+            let group_size = bits_per_hash.div_ceil(2);
 
-        hash
+            for group_idx in 0..group_size {
+                let offset = random_base + group_idx * dim;
+
+                let mut max_idx = 0;
+                let mut max_abs_val = T::zero();
+                let mut max_sign_positive = true;
+
+                // Check a small set of random projections (e.g., 3-4)
+                for proj_idx in 0..3.min(bits_per_hash - group_idx * 2) {
+                    let proj_offset = offset + proj_idx * dim / 3;
+
+                    let mut dot = T::zero();
+                    for d in 0..dim {
+                        dot = dot
+                            + vec[d]
+                                * random_vecs
+                                    [(proj_offset + d) % (random_base + bits_per_hash * dim)];
+                    }
+
+                    let abs_val = dot.abs();
+                    if abs_val > max_abs_val {
+                        max_abs_val = abs_val;
+                        max_idx = proj_idx;
+                        max_sign_positive = dot >= T::zero();
+                    }
+                }
+
+                // Encode: which projection was max (2 bits) + sign (1 bit)
+                hash |= (max_idx as u64) << (group_idx * 3);
+                if max_sign_positive {
+                    hash |= 1u64 << (group_idx * 3 + 2);
+                }
+            }
+        }
+    }
+
+    hash
+}
+
+/// Orthogonalise random projections
+///
+/// Helper function that orthogonalises the random projections, yielding better
+/// buckets and faster query speeds
+///
+/// ### Params
+///
+/// * `vecs` - The random projection vectors to orthogonalise
+/// * `num_tables` - Number of tables for the LSH index
+/// * `bits_per_hash` - Bits per hash to use
+/// * `dim` - Number of dimensions to use
+fn orthogonalise_table_projections<T>(
+    vecs: &mut [T],
+    num_tables: usize,
+    bits_per_hash: usize,
+    dim: usize,
+) where
+    T: Float,
+{
+    for table_idx in 0..num_tables {
+        let base = table_idx * bits_per_hash * dim;
+
+        for i in 0..bits_per_hash {
+            let i_base = base + i * dim;
+
+            // Orthogonalise against previous
+            for j in 0..i {
+                let j_base = base + j * dim;
+                let mut dot = T::zero();
+                for d in 0..dim {
+                    dot = dot + vecs[i_base + d] * vecs[j_base + d];
+                }
+                for d in 0..dim {
+                    vecs[i_base + d] = vecs[i_base + d] - dot * vecs[j_base + d];
+                }
+            }
+
+            // Normalise
+            let mut norm_sq = T::zero();
+            for d in 0..dim {
+                norm_sq = norm_sq + vecs[i_base + d] * vecs[i_base + d];
+            }
+            let norm = norm_sq.sqrt();
+            if norm > T::epsilon() {
+                for d in 0..dim {
+                    vecs[i_base + d] = vecs[i_base + d] / norm;
+                }
+            }
+        }
     }
 }
 
 //////////////
 // LSHQuery //
 //////////////
+
+thread_local! {
+    /// Candidates in a RefCell
+    static LSH_CANDIDATES: RefCell<Vec<usize>> = const { RefCell::new(Vec::new()) };
+    /// HashSet per thread
+    static LSH_SEEN_SET: RefCell<FxHashSet<usize>> = RefCell::new(FxHashSet::default());
+    /// Heap for f32
+    static LSH_HEAP_F32: RefCell<BinaryHeap<(OrderedFloat<f32>, usize)>> = const { RefCell::new(BinaryHeap::new()) };
+    /// Heap for f64
+    static LSH_HEAP_F64: RefCell<BinaryHeap<(OrderedFloat<f64>, usize)>> = const { RefCell::new(BinaryHeap::new()) };
+}
+
+/// Query interface for LSH using thread-local storage
+///
+/// Implemented separately for f32 and f64 to use type-specific thread locals
+pub trait LSHQuery<T> {
+    /// Execute a query using thread-local buffers
+    ///
+    /// ### Params
+    ///
+    /// * `query_vec` - Query vector
+    /// * `k` - Number of neighbours to return
+    /// * `max_cand` - Optional limit on candidates examined
+    ///
+    /// ### Returns
+    ///
+    /// Tuple of `(indices, distances, fallback_triggered)`. The fallback flag
+    /// indicates whether random sampling was used due to empty buckets.
+    fn query_internal(
+        &self,
+        query_vec: &[T],
+        k: usize,
+        max_cand: Option<usize>,
+    ) -> (Vec<usize>, Vec<T>, bool);
+}
 
 /////////
 // f32 //
@@ -398,8 +451,11 @@ impl LSHQuery<f32> for LSHIndex<f32> {
                     heap.clear();
                     seen.clear();
 
+                    // pre-reserve
+                    cand.reserve(10000);
+
                     for table_idx in 0..self.num_tables {
-                        let hash = Self::compute_hash(
+                        let hash = compute_hash(
                             query_vec,
                             table_idx,
                             self.bits_per_hash,
@@ -426,6 +482,7 @@ impl LSHQuery<f32> for LSHIndex<f32> {
                         cand.extend((0..self.n).choose_multiple(&mut rng, sample_size));
                     }
 
+                    // Deduplicate during distance computation
                     match self.metric {
                         Dist::Euclidean => {
                             for &idx in cand.iter() {
@@ -500,8 +557,11 @@ impl LSHQuery<f64> for LSHIndex<f64> {
                     heap.clear();
                     seen.clear();
 
+                    // pre-reserve
+                    cand.reserve(10000);
+
                     for table_idx in 0..self.num_tables {
-                        let hash = Self::compute_hash(
+                        let hash = compute_hash(
                             query_vec,
                             table_idx,
                             self.bits_per_hash,
@@ -528,6 +588,7 @@ impl LSHQuery<f64> for LSHIndex<f64> {
                         cand.extend((0..self.n).choose_multiple(&mut rng, sample_size));
                     }
 
+                    // Deduplicate during distance computation
                     match self.metric {
                         Dist::Euclidean => {
                             for &idx in cand.iter() {
@@ -582,7 +643,7 @@ impl LSHQuery<f64> for LSHIndex<f64> {
 
 impl<T> KnnValidation<T> for LSHIndex<T>
 where
-    T: Float + FromPrimitive + ToPrimitive + Send + Sync,
+    T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum,
     Self: LSHQuery<T>,
 {
     /// Internal querying function
@@ -602,6 +663,10 @@ where
         self.metric
     }
 }
+
+//////////////////////////
+// HierarchicalLSHIndex //
+//////////////////////////
 
 ///////////
 // Tests //

@@ -1,10 +1,11 @@
-use num_traits::Float;
+use num_traits::{Float, FromPrimitive, ToPrimitive};
+use std::iter::Sum;
 
 ////////////
 // Helper //
 ////////////
 
-/// Enum for the approximate nearest neighbour search
+/// Enum for the Distance metric to use
 #[derive(Clone, Debug, Copy, PartialEq, Default)]
 pub enum Dist {
     /// Euclidean distance
@@ -35,14 +36,22 @@ pub fn parse_ann_dist(s: &str) -> Option<Dist> {
     }
 }
 
-///////////
-// Trait //
-///////////
+////////////////////
+// VectorDistance //
+////////////////////
 
-/// Trait for types that can compute distances between vectors
-pub trait VectorDistance<T: Float> {
+/// Trait for computing distances between Floats
+pub trait VectorDistance<T>
+where
+    T: Float + Sum,
+{
+    /// Get the internal flat vector representation
     fn vectors_flat(&self) -> &[T];
+
+    /// Get the internal dimensions
     fn dim(&self) -> usize;
+
+    /// Get the normalised values
     fn norms(&self) -> &[T];
 
     ///////////////
@@ -69,17 +78,22 @@ pub trait VectorDistance<T: Float> {
     fn euclidean_distance(&self, i: usize, j: usize) -> T {
         let start_i = i * self.dim();
         let start_j = j * self.dim();
-        let vec_i = &self.vectors_flat()[start_i..start_i + self.dim()];
-        let vec_j = &self.vectors_flat()[start_j..start_j + self.dim()];
-
-        vec_i
-            .iter()
-            .zip(vec_j.iter())
-            .map(|(&a, &b)| {
-                let diff = a - b;
-                diff * diff
-            })
-            .fold(T::zero(), |acc, x| acc + x)
+        unsafe {
+            let vec_i = self
+                .vectors_flat()
+                .get_unchecked(start_i..start_i + self.dim());
+            let vec_j = self
+                .vectors_flat()
+                .get_unchecked(start_j..start_j + self.dim());
+            vec_i
+                .iter()
+                .zip(vec_j.iter())
+                .map(|(&a, &b)| {
+                    let diff = a - b;
+                    diff * diff
+                })
+                .fold(T::zero(), |acc, x| acc + x)
+        }
     }
 
     /// Euclidean distance between query vector and internal vector (squared)
@@ -95,36 +109,17 @@ pub trait VectorDistance<T: Float> {
     #[inline(always)]
     fn euclidean_distance_to_query(&self, internal_idx: usize, query: &[T]) -> T {
         let start = internal_idx * self.dim();
-        let vec = &self.vectors_flat()[start..start + self.dim()];
 
-        vec.iter()
-            .zip(query.iter())
-            .map(|(&a, &b)| {
-                let diff = a - b;
-                diff * diff
-            })
-            .fold(T::zero(), |acc, x| acc + x)
-    }
-
-    /// Static Euclidean distance between two arbitrary vectors (squared)
-    ///
-    /// ### Params
-    ///
-    /// * `a` - Slice of vector one
-    /// * `b` - Slice of vector two
-    ///
-    /// ### Returns
-    ///
-    /// Squared euclidean distance
-    #[inline(always)]
-    fn euclidean_distance_static(a: &[T], b: &[T]) -> T {
-        a.iter()
-            .zip(b.iter())
-            .map(|(&x, &y)| {
-                let diff = x - y;
-                diff * diff
-            })
-            .fold(T::zero(), |acc, x| acc + x)
+        unsafe {
+            let vec = &self.vectors_flat().get_unchecked(start..start + self.dim());
+            vec.iter()
+                .zip(query.iter())
+                .map(|(&a, &b)| {
+                    let diff = a - b;
+                    diff * diff
+                })
+                .fold(T::zero(), |acc, x| acc + x)
+        }
     }
 
     ////////////
@@ -150,16 +145,22 @@ pub trait VectorDistance<T: Float> {
     fn cosine_distance(&self, i: usize, j: usize) -> T {
         let start_i = i * self.dim();
         let start_j = j * self.dim();
-        let vec_i = &self.vectors_flat()[start_i..start_i + self.dim()];
-        let vec_j = &self.vectors_flat()[start_j..start_j + self.dim()];
+        unsafe {
+            let vec_i = &self
+                .vectors_flat()
+                .get_unchecked(start_i..start_i + self.dim());
+            let vec_j = &self
+                .vectors_flat()
+                .get_unchecked(start_j..start_j + self.dim());
 
-        let dot = vec_i
-            .iter()
-            .zip(vec_j.iter())
-            .map(|(&a, &b)| a * b)
-            .fold(T::zero(), |acc, x| acc + x);
+            let dot = vec_i
+                .iter()
+                .zip(vec_j.iter())
+                .map(|(&a, &b)| a * b)
+                .fold(T::zero(), |acc, x| acc + x);
 
-        T::one() - (dot / (self.norms()[i] * self.norms()[j]))
+            T::one() - (dot / (self.norms()[i] * self.norms()[j]))
+        }
     }
 
     /// Cosine distance between query vector and internal vector
@@ -176,73 +177,185 @@ pub trait VectorDistance<T: Float> {
     #[inline(always)]
     fn cosine_distance_to_query(&self, internal_idx: usize, query: &[T], query_norm: T) -> T {
         let start = internal_idx * self.dim();
-        let vec = &self.vectors_flat()[start..start + self.dim()];
 
-        let dot = vec
-            .iter()
-            .zip(query.iter())
-            .map(|(&a, &b)| a * b)
-            .fold(T::zero(), |acc, x| acc + x);
+        unsafe {
+            let vec = &self.vectors_flat().get_unchecked(start..start + self.dim());
 
-        T::one() - (dot / (query_norm * self.norms()[internal_idx]))
+            let dot = vec
+                .iter()
+                .zip(query.iter())
+                .map(|(&a, &b)| a * b)
+                .fold(T::zero(), |acc, x| acc + x);
+
+            T::one() - (dot / (query_norm * self.norms()[internal_idx]))
+        }
     }
+}
 
-    /// Static Cosine distance between two arbitrary vectors
-    ///
-    /// Computes norms on the fly
+///////////////////////
+// VectorDistanceSq8 //
+///////////////////////
+
+/// Trait for computing distances between Floats
+pub trait VectorDistanceSq8<T>
+where
+    T: Float + FromPrimitive + ToPrimitive,
+{
+    /// Get the internal flat vector representation (quantised to i8)
+    fn vectors_flat_quantised(&self) -> &[i8];
+
+    /// Get the internal norms of the quantised vectors
+    fn norms_quantised(&self) -> &[i32];
+
+    /// Get the internal dimensions
+    fn dim(&self) -> usize;
+
+    ///////////////
+    // Euclidean //
+    ///////////////
+
+    /// Calculate euclidean distance against quantised query
     ///
     /// ### Params
     ///
-    /// * `a` - Slice of vector one
-    /// * `b` - Slice of vector two
+    /// * `internal_idx` - Index of internal vector
+    /// * `query_i8` - Query vector slice quantised to i8
     ///
     /// ### Returns
     ///
-    /// Squared cosine distance
+    /// The squared Euclidean distance
     #[inline(always)]
-    fn cosine_distance_static(a: &[T], b: &[T]) -> T {
-        let dot: T = a
-            .iter()
-            .zip(b.iter())
-            .map(|(&x, &y)| x * y)
-            .fold(T::zero(), |acc, x| acc + x);
+    fn euclidean_distance_i8(&self, internal_idx: usize, query_i8: &[i8]) -> T {
+        let start = internal_idx * self.dim();
+        let db_vec = &self.vectors_flat_quantised()[start..start + self.dim()];
 
-        let norm_a = a
+        let sum: i32 = query_i8
             .iter()
-            .map(|&x| x * x)
-            .fold(T::zero(), |acc, x| acc + x)
-            .sqrt();
+            .zip(db_vec.iter())
+            .map(|(&q, &d)| {
+                let diff = q as i32 - d as i32;
+                diff * diff
+            })
+            .sum();
 
-        let norm_b = b
-            .iter()
-            .map(|&x| x * x)
-            .fold(T::zero(), |acc, x| acc + x)
-            .sqrt();
-
-        T::one() - (dot / (norm_a * norm_b))
+        T::from_i32(sum).unwrap()
     }
 
-    /// Static Cosine distance between two arbitrary vectors
-    ///
-    /// Uses pre-computed norms
+    /// Calculate cosine distance against quantised query
     ///
     /// ### Params
     ///
-    /// * `a` - Slice of vector one
-    /// * `b` - Slice of vector two
+    /// * `internal_idx` - Index of internal vector
+    /// * `query_i8` - Query vector slice quantised to i8
+    /// * `query_norm_sq` - Squared norm of the query vector
     ///
     /// ### Returns
     ///
-    /// Squared cosine distance
+    /// The squared Euclidean distance
     #[inline(always)]
-    fn cosine_distance_static_with_norms(a: &[T], b: &[T], norm_a: T, norm_b: T) -> T {
-        let dot: T = a
-            .iter()
-            .zip(b.iter())
-            .map(|(&x, &y)| x * y)
-            .fold(T::zero(), |acc, x| acc + x);
+    fn cosine_distance_i8(&self, vec_idx: usize, query_i8: &[i8], query_norm_sq: i32) -> T {
+        let start = vec_idx * self.dim();
+        let db_vec = &self.vectors_flat_quantised()[start..start + self.dim()];
 
-        T::one() - (dot / (norm_a * norm_b))
+        let dot: i32 = query_i8
+            .iter()
+            .zip(db_vec.iter())
+            .map(|(&q, &d)| q as i32 * d as i32)
+            .sum();
+
+        let db_norm_sq: i32 = self.norms_quantised()[vec_idx];
+
+        let query_norm = T::from_i32(query_norm_sq).unwrap().sqrt();
+        let db_norm = T::from_i32(db_norm_sq).unwrap().sqrt();
+
+        if query_norm > T::zero() && db_norm > T::zero() {
+            T::one() - T::from_i32(dot).unwrap() / (query_norm * db_norm)
+        } else {
+            T::one()
+        }
+    }
+}
+
+///////////////
+// Functions //
+///////////////
+
+/// Static Euclidean distance between two arbitrary vectors (squared)
+///
+/// ### Params
+///
+/// * `a` - Slice of vector one
+/// * `b` - Slice of vector two
+///
+/// ### Returns
+///
+/// Squared euclidean distance
+#[inline(always)]
+pub fn euclidean_distance_static<T>(a: &[T], b: &[T]) -> T
+where
+    T: Float,
+{
+    a.iter()
+        .zip(b.iter())
+        .map(|(&x, &y)| {
+            let diff = x - y;
+            diff * diff
+        })
+        .fold(T::zero(), |acc, x| acc + x)
+}
+
+/// Static Cosine distance between two arbitrary vectors
+///
+/// Computes norms on the fly
+///
+/// ### Params
+///
+/// * `a` - Slice of vector one
+/// * `b` - Slice of vector two
+///
+/// ### Returns
+///
+/// Squared cosine distance
+#[inline(always)]
+pub fn cosine_distance_static<T>(a: &[T], b: &[T]) -> T
+where
+    T: Float,
+{
+    let dot: T = a
+        .iter()
+        .zip(b.iter())
+        .map(|(&x, &y)| x * y)
+        .fold(T::zero(), |acc, x| acc + x);
+
+    let norm_a = a
+        .iter()
+        .map(|&x| x * x)
+        .fold(T::zero(), |acc, x| acc + x)
+        .sqrt();
+
+    let norm_b = b
+        .iter()
+        .map(|&x| x * x)
+        .fold(T::zero(), |acc, x| acc + x)
+        .sqrt();
+
+    T::one() - (dot / (norm_a * norm_b))
+}
+
+/// Helper to normalise vector in place
+///
+/// ### Params
+///
+/// * `vec` - The vector to normalise
+#[inline]
+pub fn normalise_vector<T: Float + Sum>(vec: &mut [T]) {
+    let norm = vec
+        .iter()
+        .map(|&v| v * v)
+        .fold(T::zero(), |acc, x| acc + x)
+        .sqrt();
+    if norm > T::zero() {
+        vec.iter_mut().for_each(|v| *v = *v / norm);
     }
 }
 
@@ -273,6 +386,28 @@ mod tests {
         fn norms(&self) -> &[f32] {
             &self.norms
         }
+    }
+
+    #[test]
+    fn test_parse_ann_dist_euclidean() {
+        assert_eq!(parse_ann_dist("euclidean"), Some(Dist::Euclidean));
+        assert_eq!(parse_ann_dist("Euclidean"), Some(Dist::Euclidean));
+        assert_eq!(parse_ann_dist("EUCLIDEAN"), Some(Dist::Euclidean));
+    }
+
+    #[test]
+    fn test_parse_ann_dist_cosine() {
+        assert_eq!(parse_ann_dist("cosine"), Some(Dist::Cosine));
+        assert_eq!(parse_ann_dist("Cosine"), Some(Dist::Cosine));
+        assert_eq!(parse_ann_dist("COSINE"), Some(Dist::Cosine));
+    }
+
+    #[test]
+    fn test_parse_ann_dist_invalid() {
+        assert_eq!(parse_ann_dist("manhattan"), None);
+        assert_eq!(parse_ann_dist(""), None);
+        assert_eq!(parse_ann_dist("cosine "), None); // Trailing space
+        assert_eq!(parse_ann_dist(" euclidean"), None); // Leading space
     }
 
     #[test]

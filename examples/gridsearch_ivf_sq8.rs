@@ -1,7 +1,6 @@
 mod commons;
 
 use ann_search_rs::synthetic::generate_clustered_data;
-use ann_search_rs::utils::KnnValidation;
 use ann_search_rs::*;
 use commons::*;
 use faer::Mat;
@@ -16,7 +15,7 @@ fn main() {
     const N_CLUSTERS: usize = 20;
     const K: usize = 15;
     const SEED: u64 = 10101;
-    const DISTANCE: &str = "euclidean";
+    const DISTANCE: &str = "cosine";
 
     println!("-----------------------------");
     println!(
@@ -32,6 +31,7 @@ fn main() {
     let query_data = data.as_ref();
     let mut results = Vec::new();
 
+    // Exhaustive with inner product
     println!("Building exhaustive index...");
     let start = Instant::now();
     let exhaustive_idx = build_exhaustive_index(data.as_ref(), DISTANCE);
@@ -39,12 +39,11 @@ fn main() {
 
     println!("Querying exhaustive index...");
     let start = Instant::now();
-    let (true_neighbors, true_distances) =
-        query_exhaustive_index(query_data, &exhaustive_idx, K, true, false);
+    let (true_neighbors, _) = query_exhaustive_index(query_data, &exhaustive_idx, K, false, false);
     let query_time = start.elapsed().as_secs_f64() * 1000.0;
 
     results.push(BenchmarkResult {
-        method: "Exhaustive".to_string(),
+        method: "Exhaustive-IP".to_string(),
         build_time_ms: build_time,
         query_time_ms: query_time,
         total_time_ms: build_time + query_time,
@@ -52,14 +51,15 @@ fn main() {
         mean_dist_err: 0.0,
     });
 
-    println!("-----------------------------");
+    println!("-----------------------------------------------------------------------------------------------");
 
     let nlist_values = [10, 20, 25, 50, 100];
 
     for nlist in nlist_values {
-        println!("Building IVF index (nlist={})...", nlist);
+        println!("Building IVF-SQ8 index (nlist={})...", nlist);
         let start = Instant::now();
-        let ivf_idx = build_ivf_index(data.as_ref(), nlist, None, DISTANCE, SEED as usize, false);
+        let ivf_sq8_idx =
+            build_ivf_sq8_index(data.as_ref(), nlist, None, DISTANCE, SEED as usize, false);
         let build_time = start.elapsed().as_secs_f64() * 1000.0;
 
         let nprobe_values = [
@@ -80,32 +80,24 @@ fn main() {
                 continue;
             }
 
-            println!("Querying IVF index (nlist={}, nprobe={})...", nlist, nprobe);
+            println!("Querying IVF-SQ8 (nlist={}, nprobe={})...", nlist, nprobe);
             let start = Instant::now();
-            let (approx_neighbors, approx_distances) =
-                query_ivf_index(query_data, &ivf_idx, K, Some(nprobe), true, false);
+            let (approx_neighbors, _) =
+                query_ivf_sq8_index(query_data, &ivf_sq8_idx, K, Some(nprobe), true, false);
             let query_time = start.elapsed().as_secs_f64() * 1000.0;
 
             let recall = calculate_recall(&true_neighbors, &approx_neighbors, K);
-            let dist_error = calculate_distance_error(
-                true_distances.as_ref().unwrap(),
-                approx_distances.as_ref().unwrap(),
-                K,
-            );
-
-            let internal_recall = ivf_idx.validate_index(K, SEED as usize, None);
-            println!("  Internal validation: {:.3}", internal_recall);
 
             results.push(BenchmarkResult {
-                method: format!("IVF-nl{}-np{}", nlist, nprobe),
+                method: format!("IVF-SQ8-nl{}-np{}", nlist, nprobe),
                 build_time_ms: build_time,
                 query_time_ms: query_time,
                 total_time_ms: build_time + query_time,
                 recall_at_k: recall,
-                mean_dist_err: dist_error,
+                mean_dist_err: 0.0,
             });
         }
     }
 
-    print_results(&format!("{}k cells, {}D", N_CELLS / 1000, DIM), &results);
+    print_results_recall_only(&format!("{}k cells, {}D", N_CELLS / 1000, DIM), &results);
 }

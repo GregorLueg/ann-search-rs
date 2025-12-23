@@ -1,17 +1,20 @@
 use faer::MatRef;
 use num_traits::{Float, FromPrimitive, ToPrimitive};
-use rand::rngs::SmallRng;
-use rand::{Rng, SeedableRng};
+use rand::{rngs::SmallRng, Rng, SeedableRng};
 use rayon::prelude::*;
-use std::cell::UnsafeCell;
-use std::cmp::Reverse;
-use std::collections::BinaryHeap;
-use std::marker::PhantomData;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Instant;
+use std::{
+    cell::UnsafeCell,
+    cmp::Reverse,
+    collections::BinaryHeap,
+    iter::Sum,
+    marker::PhantomData,
+    sync::atomic::{AtomicU64, Ordering},
+    time::Instant,
+};
 use thousands::*;
 
-use crate::dist::*;
+use crate::utils::dist::*;
+use crate::utils::heap_structs::*;
 use crate::utils::*;
 
 /////////////
@@ -269,7 +272,7 @@ pub struct SearchState<T> {
 
 impl<T> SearchState<T>
 where
-    T: Float,
+    T: Float + Sum,
 {
     /// Generate a new search state
     ///
@@ -368,7 +371,7 @@ unsafe impl<T> Sync for ConstructionGraph<T> {}
 
 impl<T> ConstructionGraph<T>
 where
-    T: Float + FromPrimitive + Send + Sync,
+    T: Float + FromPrimitive + Send + Sync + Sum,
 {
     /// Create a new construction graph
     ///
@@ -549,7 +552,7 @@ impl HnswState<f64> for HnswIndex<f64> {
 /// * `keep_pruned` - Whether to keep pruned connections if space available
 pub struct HnswIndex<T>
 where
-    T: Float + FromPrimitive + Send + Sync,
+    T: Float + FromPrimitive + Send + Sync + Sum,
 {
     // shared ones
     pub vectors_flat: Vec<T>,
@@ -569,7 +572,10 @@ where
     keep_pruned: bool,
 }
 
-impl<T: Float + FromPrimitive + Send + Sync> VectorDistance<T> for HnswIndex<T> {
+impl<T> VectorDistance<T> for HnswIndex<T>
+where
+    T: Float + FromPrimitive + Send + Sync + Sum,
+{
     /// Get the flat vectors
     fn vectors_flat(&self) -> &[T] {
         &self.vectors_flat
@@ -588,7 +594,7 @@ impl<T: Float + FromPrimitive + Send + Sync> VectorDistance<T> for HnswIndex<T> 
 
 impl<T> HnswIndex<T>
 where
-    T: Float + FromPrimitive + Send + Sync,
+    T: Float + FromPrimitive + Send + Sync + Sum,
     Self: HnswState<T>,
 {
     /// Build HNSW index
@@ -1305,7 +1311,7 @@ where
 
 impl<T> KnnValidation<T> for HnswIndex<T>
 where
-    T: Float + FromPrimitive + ToPrimitive + Send + Sync,
+    T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum,
     Self: HnswState<T>,
 {
     /// Internal querying function

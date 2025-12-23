@@ -1,19 +1,21 @@
 use faer::MatRef;
 use fixedbitset::FixedBitSet;
 use num_traits::{Float, FromPrimitive, ToPrimitive};
-use rand::rngs::SmallRng;
-use rand::{Rng, SeedableRng};
+use rand::{rngs::SmallRng, Rng, SeedableRng};
 use rayon::prelude::*;
-use std::cell::RefCell;
-use std::cmp::Reverse;
-use std::collections::BinaryHeap;
-use std::iter::Sum;
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::time::Instant;
+use std::{
+    cell::RefCell,
+    cmp::Reverse,
+    collections::BinaryHeap,
+    iter::Sum,
+    sync::atomic::{AtomicUsize, Ordering},
+    time::Instant,
+};
 use thousands::*;
 
 use crate::annoy::*;
-use crate::dist::*;
+use crate::utils::dist::*;
+use crate::utils::heap_structs::*;
 use crate::utils::*;
 
 /// Neighbour entry in k-NN graph

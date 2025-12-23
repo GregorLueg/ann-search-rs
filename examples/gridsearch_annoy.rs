@@ -1,4 +1,5 @@
 mod commons;
+
 use ann_search_rs::synthetic::generate_clustered_data;
 use ann_search_rs::utils::KnnValidation;
 use ann_search_rs::*;
@@ -13,14 +14,16 @@ fn main() {
     const DIM: usize = 24;
     const N_CLUSTERS: usize = 20;
     const K: usize = 15;
-    const SEED: u64 = 42;
+    const SEED: u64 = 10101;
+    const DISTANCE: &str = "cosine";
 
     println!("-----------------------------");
     println!(
-        "Generating synthetic data: {} cells, {} dimensions, {} clusters.",
+        "Generating synthetic data: {} cells, {} dimensions, {} clusters, {} dist.",
         N_CELLS.separate_with_underscores(),
         DIM,
         N_CLUSTERS,
+        DISTANCE
     );
     println!("-----------------------------");
 
@@ -30,7 +33,7 @@ fn main() {
 
     println!("Building exhaustive index...");
     let start = Instant::now();
-    let exhaustive_idx = build_exhaustive_index(data.as_ref(), "euclidean");
+    let exhaustive_idx = build_exhaustive_index(data.as_ref(), DISTANCE);
     let build_time = start.elapsed().as_secs_f64() * 1000.0;
 
     println!("Querying exhaustive index...");
@@ -45,7 +48,7 @@ fn main() {
         query_time_ms: query_time,
         total_time_ms: build_time + query_time,
         recall_at_k: 1.0,
-        mean_distance_error: 0.0,
+        mean_dist_err: 0.0,
     });
 
     println!("-----------------------------");
@@ -55,8 +58,7 @@ fn main() {
     for n_trees in n_trees_values {
         println!("Building Annoy index ({} trees)...", n_trees);
         let start = Instant::now();
-        let annoy_idx =
-            build_annoy_index(data.as_ref(), "euclidean".into(), n_trees, SEED as usize);
+        let annoy_idx = build_annoy_index(data.as_ref(), DISTANCE.into(), n_trees, SEED as usize);
         let build_time = start.elapsed().as_secs_f64() * 1000.0;
 
         let search_budgets = [
@@ -72,7 +74,7 @@ fn main() {
                 query_annoy_index(query_data, &annoy_idx, K, search_budget, true, false);
             let query_time = start.elapsed().as_secs_f64() * 1000.0;
 
-            let recall = calculate_recall::<f32>(&true_neighbors, &approx_neighbors, K);
+            let recall = calculate_recall(&true_neighbors, &approx_neighbors, K);
             let dist_error = calculate_distance_error(
                 true_distances.as_ref().unwrap(),
                 approx_distances.as_ref().unwrap(),
@@ -88,7 +90,7 @@ fn main() {
                 query_time_ms: query_time,
                 total_time_ms: build_time + query_time,
                 recall_at_k: recall,
-                mean_distance_error: dist_error,
+                mean_dist_err: dist_error,
             });
         }
     }
