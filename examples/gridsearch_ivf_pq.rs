@@ -51,7 +51,7 @@ fn main() {
             generate_clustered_data(cli.n_cells, cli.dim, cli.n_clusters, cli.seed)
         }
         SyntheticData::Correlated => {
-            println!("Using data for high dimensional ANN searches.\n");
+            println!("Using data for high dimensional ANN searches...\n");
             generate_clustered_data_high_dim(
             cli.n_cells,
             cli.dim,

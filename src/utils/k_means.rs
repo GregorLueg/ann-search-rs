@@ -491,3 +491,190 @@ where
 
     (sampled, indices)
 }
+
+///////////
+// Tests //
+///////////
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use approx::assert_relative_eq;
+
+    #[test]
+    fn test_build_csr_layout() {
+        let assignments = vec![0, 1, 0, 2, 1, 0];
+        let (indices, offsets) = build_csr_layout(assignments, 6, 3);
+
+        // Cluster 0: vectors 0, 2, 5
+        // Cluster 1: vectors 1, 4
+        // Cluster 2: vector 3
+        assert_eq!(offsets, vec![0, 3, 5, 6]);
+
+        let cluster_0: Vec<_> = indices[offsets[0]..offsets[1]].to_vec();
+        let cluster_1: Vec<_> = indices[offsets[1]..offsets[2]].to_vec();
+        let cluster_2: Vec<_> = indices[offsets[2]..offsets[3]].to_vec();
+
+        assert_eq!(cluster_0.len(), 3);
+        assert!(cluster_0.contains(&0) && cluster_0.contains(&2) && cluster_0.contains(&5));
+        assert_eq!(cluster_1.len(), 2);
+        assert!(cluster_1.contains(&1) && cluster_1.contains(&4));
+        assert_eq!(cluster_2, vec![3]);
+    }
+
+    #[test]
+    fn test_build_csr_layout_single_cluster() {
+        let assignments = vec![0, 0, 0];
+        let (indices, offsets) = build_csr_layout(assignments, 3, 1);
+
+        assert_eq!(offsets, vec![0, 3]);
+        assert_eq!(indices.len(), 3);
+    }
+
+    #[test]
+    fn test_build_csr_layout_empty_clusters() {
+        let assignments = vec![0, 2, 0];
+        let (_, offsets) = build_csr_layout(assignments, 3, 3);
+
+        assert_eq!(offsets, vec![0, 2, 2, 3]);
+        // Cluster 1 is empty
+        assert_eq!(offsets[2] - offsets[1], 0);
+    }
+
+    #[test]
+    fn test_assign_all_parallel_euclidean() {
+        let data = vec![
+            0.0, 0.0, // Near centroid 0
+            0.1, 0.1, // Near centroid 0
+            10.0, 10.0, // Near centroid 1
+            9.9, 10.1, // Near centroid 1
+        ];
+
+        let centroids = vec![0.0, 0.0, 10.0, 10.0];
+
+        let assignments = assign_all_parallel(&data, 2, 4, &centroids, 2, &Dist::Euclidean);
+
+        assert_eq!(assignments, vec![0, 0, 1, 1]);
+    }
+
+    #[test]
+    fn test_assign_all_parallel_cosine() {
+        let data = vec![
+            1.0, 0.0, // Aligned with centroid 0
+            0.0, 1.0, // Aligned with centroid 1
+            0.7, 0.1, // Closer to centroid 0
+        ];
+
+        let centroids = vec![1.0, 0.0, 0.0, 1.0];
+
+        let assignments = assign_all_parallel(&data, 2, 3, &centroids, 2, &Dist::Cosine);
+
+        assert_eq!(assignments[0], 0);
+        assert_eq!(assignments[1], 1);
+        assert_eq!(assignments[2], 0);
+    }
+
+    #[test]
+    fn test_sample_vectors() {
+        let data = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0];
+
+        let (sampled, indices) = sample_vectors(&data, 2, 4, 2, 42);
+
+        assert_eq!(sampled.len(), 4); // 2 samples * 2 dims
+        assert_eq!(indices.len(), 2);
+
+        // Verify sampled data matches indices
+        for (i, &idx) in indices.iter().enumerate() {
+            assert_eq!(sampled[i * 2], data[idx * 2]);
+            assert_eq!(sampled[i * 2 + 1], data[idx * 2 + 1]);
+        }
+    }
+
+    #[test]
+    fn test_sample_vectors_deterministic() {
+        let data = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0];
+
+        let (sample1, indices1) = sample_vectors(&data, 2, 3, 2, 42);
+        let (sample2, indices2) = sample_vectors(&data, 2, 3, 2, 42);
+
+        assert_eq!(indices1, indices2);
+        assert_eq!(sample1, sample2);
+    }
+
+    #[test]
+    fn test_fast_random_init() {
+        let data = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0];
+
+        let centroids = fast_random_init(&data, 2, 4, 2, 42);
+
+        assert_eq!(centroids.len(), 4); // 2 centroids * 2 dims
+
+        // Check centroids are from original data
+        let mut found = 0;
+        for i in 0..2 {
+            let cent = &centroids[i * 2..(i + 1) * 2];
+            for j in 0..4 {
+                let vec = &data[j * 2..(j + 1) * 2];
+                if cent[0] == vec[0] && cent[1] == vec[1] {
+                    found += 1;
+                    break;
+                }
+            }
+        }
+        assert_eq!(found, 2);
+    }
+
+    #[test]
+    fn test_train_centroids_small() {
+        let data = vec![0.0, 0.0, 0.1, 0.1, 10.0, 10.0, 10.1, 10.1];
+
+        let centroids = train_centroids(&data, 2, 4, 2, &Dist::Euclidean, 10, 42, false);
+
+        assert_eq!(centroids.len(), 4);
+
+        // Check centroids are roughly at the two clusters
+        let cent0 = (centroids[0], centroids[1]);
+        let cent1 = (centroids[2], centroids[3]);
+
+        let dist_00 = (cent0.0 - 0.05).powi(2) + (cent0.1 - 0.05).powi(2);
+        let dist_01 = (cent0.0 - 10.05).powi(2) + (cent0.1 - 10.05).powi(2);
+        let dist_10 = (cent1.0 - 0.05).powi(2) + (cent1.1 - 0.05).powi(2);
+        let dist_11 = (cent1.0 - 10.05).powi(2) + (cent1.1 - 10.05).powi(2);
+
+        // One centroid near (0,0), one near (10,10)
+        assert!(
+            (dist_00 < dist_01 && dist_11 < dist_10) || (dist_01 < dist_00 && dist_10 < dist_11)
+        );
+    }
+
+    #[test]
+    fn test_min_distance_to_centroids() {
+        let vec = vec![5.0, 5.0];
+        let centroids = vec![0.0, 0.0, 10.0, 10.0];
+
+        let dist = min_distance_to_centroids(&vec, &centroids, 2, 2, &Dist::Euclidean);
+
+        // Distance to (0,0) is 50, to (10,10) is 50, so min is 50
+        assert_relative_eq!(dist, 50.0, epsilon = 1e-5);
+    }
+
+    #[test]
+    fn test_weighted_kmeans_plus_plus() {
+        let data = vec![0.0, 0.0, 0.1, 0.1, 0.2, 0.2, 10.0, 10.0, 10.1, 10.1];
+
+        let centroids = weighted_kmeans_plus_plus(&data, 2, 2, &Dist::Euclidean, 42);
+
+        assert_eq!(centroids.len(), 4);
+
+        // Should pick one from each cluster
+        let cent0 = (centroids[0], centroids[1]);
+        let cent1 = (centroids[2], centroids[3]);
+
+        let near_zero_0 = cent0.0.abs() < 1.0 && cent0.1.abs() < 1.0;
+        let near_ten_0 = (cent0.0 - 10.0).abs() < 1.0 && (cent0.1 - 10.0).abs() < 1.0;
+        let near_zero_1 = cent1.0.abs() < 1.0 && cent1.1.abs() < 1.0;
+        let near_ten_1 = (cent1.0 - 10.0).abs() < 1.0 && (cent1.1 - 10.0).abs() < 1.0;
+
+        assert!((near_zero_0 && near_ten_1) || (near_ten_0 && near_zero_1));
+    }
+}

@@ -435,3 +435,314 @@ where
         self.query(&query_vec, k, nprobe)
     }
 }
+
+///////////
+// Tests //
+///////////
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use approx::assert_relative_eq;
+    use faer::Mat;
+
+    fn create_simple_dataset() -> Vec<f32> {
+        vec![
+            0.0, 0.0, 0.0, 0.0, 0.1, 0.1, 0.0, 0.0, 0.2, 0.2, 0.0, 0.0, 10.0, 10.0, 0.0, 0.0, 10.1,
+            10.1, 0.0, 0.0, 10.2, 10.2, 0.0, 0.0,
+        ]
+    }
+
+    #[test]
+    fn test_build_euclidean() {
+        let data = create_simple_dataset();
+        let index = IvfPqIndex::build(
+            data,
+            4,
+            6,
+            2,
+            2,
+            Dist::Euclidean,
+            Some(10),
+            Some(4),
+            42,
+            false,
+        );
+
+        assert_eq!(index.dim, 4);
+        assert_eq!(index.n, 6);
+        assert_eq!(index.nlist, 2);
+        assert_eq!(index.metric, Dist::Euclidean);
+        assert_eq!(index.quantised_codes.len(), 12); // 6 vectors * 2 subspaces
+        assert_eq!(index.centroids.len(), 8);
+        assert_eq!(index.offsets.len(), 3);
+    }
+
+    #[test]
+    fn test_build_cosine() {
+        let data = create_simple_dataset();
+        let index = IvfPqIndex::build(data, 4, 6, 2, 2, Dist::Cosine, Some(10), Some(4), 42, false);
+
+        assert_eq!(index.metric, Dist::Cosine);
+    }
+
+    #[test]
+    fn test_query_returns_k_results() {
+        let data = create_simple_dataset();
+        let index = IvfPqIndex::build(
+            data,
+            4,
+            6,
+            2,
+            2,
+            Dist::Euclidean,
+            Some(10),
+            Some(4),
+            42,
+            false,
+        );
+
+        let query = vec![0.0, 0.0, 0.0, 0.0];
+        let (indices, distances) = index.query(&query, 3, None);
+
+        assert_eq!(indices.len(), 3);
+        assert_eq!(distances.len(), 3);
+    }
+
+    #[test]
+    fn test_query_k_exceeds_n() {
+        let data = create_simple_dataset();
+        let index = IvfPqIndex::build(
+            data,
+            4,
+            6,
+            2,
+            2,
+            Dist::Euclidean,
+            Some(10),
+            Some(4),
+            42,
+            false,
+        );
+
+        let query = vec![0.0, 0.0, 0.0, 0.0];
+        let (indices, _) = index.query(&query, 100, None);
+
+        assert_eq!(indices.len(), 6);
+    }
+
+    #[test]
+    fn test_query_distances_sorted() {
+        let data = create_simple_dataset();
+        let index = IvfPqIndex::build(
+            data,
+            4,
+            6,
+            2,
+            2,
+            Dist::Euclidean,
+            Some(10),
+            Some(4),
+            42,
+            false,
+        );
+
+        let query = vec![0.0, 0.0, 0.0, 0.0];
+        let (_, distances) = index.query(&query, 3, Some(2));
+
+        for i in 1..distances.len() {
+            assert!(distances[i] >= distances[i - 1]);
+        }
+    }
+
+    #[test]
+    fn test_query_cosine() {
+        let data = create_simple_dataset();
+        let index = IvfPqIndex::build(data, 4, 6, 2, 2, Dist::Cosine, Some(10), Some(4), 42, false);
+
+        let query = vec![1.0, 1.0, 0.0, 0.0];
+        let (indices, distances) = index.query(&query, 3, None);
+
+        assert_eq!(indices.len(), 3);
+        assert_eq!(distances.len(), 3);
+    }
+
+    #[test]
+    fn test_query_different_nprobe() {
+        let data = create_simple_dataset();
+        let index = IvfPqIndex::build(
+            data,
+            4,
+            6,
+            2,
+            2,
+            Dist::Euclidean,
+            Some(10),
+            Some(4),
+            42,
+            false,
+        );
+
+        let query = vec![5.0, 5.0, 0.0, 0.0];
+
+        let (indices1, _) = index.query(&query, 3, Some(1));
+        let (indices2, _) = index.query(&query, 3, Some(2));
+
+        assert_eq!(indices1.len(), 3);
+        assert_eq!(indices2.len(), 3);
+    }
+
+    #[test]
+    fn test_query_deterministic() {
+        let data = create_simple_dataset();
+        let index = IvfPqIndex::build(
+            data,
+            4,
+            6,
+            2,
+            2,
+            Dist::Euclidean,
+            Some(10),
+            Some(4),
+            42,
+            false,
+        );
+
+        let query = vec![0.5, 0.5, 0.0, 0.0];
+
+        let (indices1, distances1) = index.query(&query, 3, Some(2));
+        let (indices2, distances2) = index.query(&query, 3, Some(2));
+
+        assert_eq!(indices1, indices2);
+        assert_eq!(distances1, distances2);
+    }
+
+    #[test]
+    fn test_query_row() {
+        let data = create_simple_dataset();
+        let index = IvfPqIndex::build(
+            data,
+            4,
+            6,
+            2,
+            2,
+            Dist::Euclidean,
+            Some(10),
+            Some(4),
+            42,
+            false,
+        );
+
+        let query_mat = Mat::<f32>::from_fn(1, 4, |_, j| if j < 2 { 0.5 } else { 0.0 });
+        let row = query_mat.row(0);
+
+        let (indices, distances) = index.query_row(row, 3, None);
+
+        assert_eq!(indices.len(), 3);
+        assert_eq!(distances.len(), 3);
+    }
+
+    #[test]
+    fn test_build_different_m() {
+        let mut data = Vec::new();
+        for i in 0..20 {
+            for j in 0..32 {
+                data.push((i + j) as f32);
+            }
+        }
+
+        let index = IvfPqIndex::build(
+            data,
+            32,
+            20,
+            2,
+            8,
+            Dist::Euclidean,
+            Some(5),
+            Some(4),
+            42,
+            false,
+        );
+
+        assert_eq!(index.codebook.m(), 8);
+        assert_eq!(index.codebook.subvec_dim(), 4);
+        assert_eq!(index.quantised_codes.len(), 160); // 20 vectors * 8 subspaces
+    }
+
+    #[test]
+    fn test_build_lookup_tables() {
+        let data = create_simple_dataset();
+        let index = IvfPqIndex::build(
+            data,
+            4,
+            6,
+            2,
+            2,
+            Dist::Euclidean,
+            Some(10),
+            Some(4),
+            42,
+            false,
+        );
+
+        let query = vec![0.0, 0.0, 0.0, 0.0];
+        let table = index.build_lookup_tables(&query, 0);
+
+        // M * n_centroids
+        assert_eq!(table.len(), 2 * 4);
+    }
+
+    #[test]
+    fn test_compute_distance_adc() {
+        let data = create_simple_dataset();
+        let index = IvfPqIndex::build(
+            data,
+            4,
+            6,
+            2,
+            2,
+            Dist::Euclidean,
+            Some(10),
+            Some(4),
+            42,
+            false,
+        );
+
+        let query = vec![0.0, 0.0, 0.0, 0.0];
+        let table = index.build_lookup_tables(&query, 0);
+
+        let dist = index.compute_distance_adc(0, &table);
+
+        assert!(dist >= 0.0);
+    }
+
+    #[test]
+    fn test_residual_encoding() {
+        let mut data = Vec::new();
+        for i in 0..50 {
+            for j in 0..32 {
+                data.push((i + j) as f32);
+            }
+        }
+
+        let index = IvfPqIndex::build(
+            data.clone(),
+            32,
+            50,
+            5,
+            8,
+            Dist::Euclidean,
+            Some(5),
+            Some(4),
+            42,
+            false,
+        );
+
+        // Query with vector from dataset
+        let query: Vec<f32> = (0..32).map(|x| x as f32).collect();
+        let (indices, _) = index.query(&query, 1, Some(5));
+
+        // Should find exact or very close match
+        assert_eq!(indices[0], 0);
+    }
+}

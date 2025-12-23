@@ -1,5 +1,6 @@
 use faer::Mat;
 use num_traits::{Float, FromPrimitive, ToPrimitive};
+use rayon::prelude::*;
 use std::iter::Sum;
 use std::ops::AddAssign;
 
@@ -99,7 +100,7 @@ where
 //////////////////////
 
 pub const N_CLUSTERS_PQ: usize = 256;
-pub const PQ_ITER: usize = 10;
+pub const OPQ_ITER: usize = 3;
 
 /// ProductQuantiser
 ///
@@ -319,6 +320,7 @@ where
         dim: usize,
         m: usize,
         n_centroids: Option<usize>,
+        n_iter: Option<usize>,
         max_iters: usize,
         seed: usize,
         verbose: bool,
@@ -331,9 +333,18 @@ where
             rotation_matrix[i * dim + i] = T::one();
         }
 
+        // reduced version to train for speed
+        // should capture the majority of structure
+        let (training_vecs, n_train) = if n > 50_000 {
+            let (data, _) = sample_vectors(vectors_flat, dim, n, 50_000, seed);
+            (data, 50_000)
+        } else {
+            (vectors_flat.to_vec(), n)
+        };
+
         #[allow(unused_assignments)] // clippy being stupid here
         let mut pq = ProductQuantiser::train(
-            vectors_flat,
+            &training_vecs,
             dim,
             m,
             n_centroids,
@@ -343,13 +354,15 @@ where
             false,
         );
 
-        for iter in 0..PQ_ITER {
+        let rotation_iter = n_iter.unwrap_or(OPQ_ITER);
+
+        for iter in 0..rotation_iter {
             if verbose {
-                println!("  OPQ iteration {} / {}", iter + 1, PQ_ITER);
+                println!("  OPQ iteration {} / {}", iter + 1, rotation_iter);
             }
 
             // rotate vectors
-            let rotated = Self::apply_rotation(vectors_flat, &rotation_matrix, dim, n);
+            let rotated = Self::apply_rotation(&training_vecs, &rotation_matrix, dim, n_train);
 
             // train PQ
             pq = ProductQuantiser::train(
@@ -364,16 +377,17 @@ where
             );
 
             // encode and reconstruct
-            let mut reconstructed = vec![T::zero(); n * dim];
-            for vec_idx in 0..n {
-                let vec_start = vec_idx * dim;
-                let codes = pq.encode(&rotated[vec_start..vec_start + dim]);
-                let decoded = Self::decode_pq(&codes, &pq);
-                reconstructed[vec_start..vec_start + dim].copy_from_slice(&decoded);
-            }
+            let reconstructed: Vec<T> = (0..n_train)
+                .into_par_iter()
+                .flat_map(|vec_idx| {
+                    let vec_start = vec_idx * dim;
+                    let codes = pq.encode(&rotated[vec_start..vec_start + dim]);
+                    Self::decode_pq(&codes, &pq)
+                })
+                .collect();
 
             // update rotation via SVD
-            rotation_matrix = Self::compute_rotation(vectors_flat, &reconstructed, dim, n);
+            rotation_matrix = Self::compute_rotation(&training_vecs, &reconstructed, dim, n_train);
         }
 
         // final training
@@ -497,12 +511,15 @@ where
     /// Flat rotated vectors (length = n * dim)
     fn apply_rotation(vectors: &[T], rotation: &[T], dim: usize, n: usize) -> Vec<T> {
         let mut rotated = vec![T::zero(); n * dim];
-        for vec_idx in 0..n {
-            let vec_start = vec_idx * dim;
-            let rotated_vec =
-                Self::rotate_vector(&vectors[vec_start..vec_start + dim], rotation, dim);
-            rotated[vec_start..vec_start + dim].copy_from_slice(&rotated_vec);
-        }
+        rotated
+            .par_chunks_mut(dim)
+            .enumerate()
+            .for_each(|(vec_idx, chunk)| {
+                let vec_start = vec_idx * dim;
+                let rotated_vec =
+                    Self::rotate_vector(&vectors[vec_start..vec_start + dim], rotation, dim);
+                chunk.copy_from_slice(&rotated_vec);
+            });
 
         rotated
     }
@@ -524,33 +541,40 @@ where
     ///
     /// Updated rotation matrix (dim × dim, row-major)
     fn compute_rotation(x_rotated: &[T], x_recon: &[T], dim: usize, n: usize) -> Vec<T> {
-        let mut c = Mat::<f32>::zeros(dim, dim);
+        let c_elements: Vec<f32> = (0..dim * dim)
+            .into_par_iter()
+            .map(|idx| {
+                let i = idx / dim;
+                let j = idx % dim;
+                (0..n)
+                    .map(|vec_idx| {
+                        let vec_start = vec_idx * dim;
+                        x_rotated[vec_start + i].to_f32().unwrap()
+                            * x_recon[vec_start + j].to_f32().unwrap()
+                    })
+                    .sum()
+            })
+            .collect();
 
-        for vec_idx in 0..n {
-            let vec_start = vec_idx * dim;
-            for i in 0..dim {
-                for j in 0..dim {
-                    let val = x_rotated[vec_start + i].to_f32().unwrap()
-                        * x_recon[vec_start + j].to_f32().unwrap();
-                    c[(i, j)] += val;
-                }
+        let mut c = Mat::<f32>::zeros(dim, dim);
+        for i in 0..dim {
+            for j in 0..dim {
+                c[(i, j)] = c_elements[i * dim + j];
             }
         }
 
+        // rest stays the same
         let svd = c.thin_svd().unwrap();
-
         let u = svd.U();
         let v = svd.V();
-
         let r = v * u.transpose();
-        let mut rotation = vec![T::zero(); dim * dim];
 
+        let mut rotation = vec![T::zero(); dim * dim];
         for i in 0..dim {
             for j in 0..dim {
                 rotation[i * dim + j] = T::from_f32(r[(i, j)]).unwrap();
             }
         }
-
         rotation
     }
 
@@ -575,5 +599,189 @@ where
     /// Get codebooks (for building lookup tables)
     pub fn codebooks(&self) -> &[Vec<T>] {
         self.pq.codebooks()
+    }
+}
+
+///////////
+// Tests //
+///////////
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use approx::assert_relative_eq;
+
+    #[test]
+    fn test_scalar_quantiser_train() {
+        let data = vec![100.0, -50.0, 200.0, 150.0, 30.0, -180.0];
+
+        let sq = ScalarQuantiser::train(&data, 3);
+
+        assert_eq!(sq.scales.len(), 3);
+        assert_relative_eq!(sq.scales[0], 150.0 / 127.0, epsilon = 1e-5);
+        assert_relative_eq!(sq.scales[1], 50.0 / 127.0, epsilon = 1e-5);
+        assert_relative_eq!(sq.scales[2], 200.0 / 127.0, epsilon = 1e-5);
+    }
+
+    #[test]
+    fn test_scalar_quantiser_encode_decode() {
+        let data = vec![127.0, 0.0, -127.0, 63.5, 0.0, -63.5];
+        let sq = ScalarQuantiser::train(&data, 3);
+
+        let vec = vec![100.0, -25.0, 50.0];
+        let encoded = sq.encode(&vec);
+        let decoded = sq.decode(&encoded);
+
+        assert_eq!(encoded.len(), 3);
+        assert_eq!(decoded.len(), 3);
+
+        // Check values are reasonably close
+        for (orig, dec) in vec.iter().zip(decoded.iter()) {
+            assert!((orig - dec).abs() < orig.abs() * 0.02);
+        }
+    }
+
+    #[test]
+    fn test_scalar_quantiser_clamping() {
+        let data = vec![1.0, 1.0];
+        let sq = ScalarQuantiser::train(&data, 2);
+
+        let vec = vec![200.0, -200.0];
+        let encoded = sq.encode(&vec);
+
+        assert_eq!(encoded[0], 127);
+        assert_eq!(encoded[1], -127);
+    }
+
+    #[test]
+    fn test_scalar_quantiser_zero_scale() {
+        let data = vec![0.0, 10.0, 0.0, 20.0];
+        let sq = ScalarQuantiser::train(&data, 2);
+
+        // First dimension is all zeros, should default to 1.0
+        assert_relative_eq!(sq.scales[0], 1.0, epsilon = 1e-5);
+    }
+
+    #[test]
+    fn test_product_quantiser_train() {
+        let data = vec![
+            1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0, 13.0, 14.0, 15.0, 16.0,
+        ];
+
+        let pq = ProductQuantiser::train(&data, 4, 2, Some(2), &Dist::Euclidean, 5, 42, false);
+
+        assert_eq!(pq.m(), 2);
+        assert_eq!(pq.subvec_dim(), 2);
+        assert_eq!(pq.n_centroids(), 2);
+        assert_eq!(pq.codebooks().len(), 2);
+        assert_eq!(pq.codebooks()[0].len(), 4); // 2 centroids * 2 dims
+        assert_eq!(pq.codebooks()[1].len(), 4);
+    }
+
+    #[test]
+    fn test_product_quantiser_encode() {
+        let data = vec![
+            0.0, 0.0, 10.0, 10.0, 0.1, 0.1, 10.1, 10.1, 5.0, 5.0, 15.0, 15.0, 5.1, 5.1, 15.1, 15.1,
+        ];
+
+        let pq = ProductQuantiser::train(&data, 4, 2, Some(2), &Dist::Euclidean, 10, 42, false);
+
+        let vec = vec![0.0, 0.0, 10.0, 10.0];
+        let codes = pq.encode(&vec);
+
+        assert_eq!(codes.len(), 2); // M = 2 subspaces
+        assert!(codes[0] < 2);
+        assert!(codes[1] < 2);
+    }
+
+    #[test]
+    fn test_product_quantiser_deterministic() {
+        let data = vec![
+            1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0,
+        ];
+
+        let pq1 = ProductQuantiser::train(&data, 4, 2, Some(2), &Dist::Euclidean, 5, 42, false);
+
+        let pq2 = ProductQuantiser::train(&data, 4, 2, Some(2), &Dist::Euclidean, 5, 42, false);
+
+        let vec = vec![5.0, 6.0, 7.0, 8.0];
+        let codes1 = pq1.encode(&vec);
+        let codes2 = pq2.encode(&vec);
+
+        assert_eq!(codes1, codes2);
+    }
+
+    #[test]
+    #[should_panic(expected = "Dimension must be divisible by m")]
+    fn test_product_quantiser_invalid_m() {
+        let data = vec![1.0, 2.0, 3.0, 4.0, 5.0];
+        ProductQuantiser::train(&data, 5, 2, Some(2), &Dist::Euclidean, 5, 42, false);
+    }
+
+    #[test]
+    #[should_panic(expected = "Dimension too small")]
+    fn test_product_quantiser_dim_too_small() {
+        let data = vec![1.0, 2.0, 3.0, 4.0];
+        ProductQuantiser::train(&data, 16, 2, Some(2), &Dist::Euclidean, 5, 42, false);
+    }
+
+    #[test]
+    fn test_opq_train() {
+        let mut data = Vec::new();
+        for i in 0..100 {
+            for j in 0..32 {
+                data.push((i + j) as f32);
+            }
+        }
+
+        let opq = OptimisedProductQuantiser::train(&data, 32, 4, Some(4), Some(1), 5, 42, false);
+
+        assert_eq!(opq.m(), 4);
+        assert_eq!(opq.subvec_dim(), 8);
+        assert_eq!(opq.n_centroids(), 4);
+    }
+
+    #[test]
+    fn test_opq_encode() {
+        let mut data = Vec::new();
+        for i in 0..50 {
+            for j in 0..32 {
+                data.push((i + j) as f32);
+            }
+        }
+
+        let opq = OptimisedProductQuantiser::train(&data, 32, 4, Some(4), Some(1), 5, 42, false);
+
+        let vec: Vec<f32> = (0..32).map(|x| x as f32).collect();
+        let codes = opq.encode(&vec);
+
+        assert_eq!(codes.len(), 4);
+    }
+
+    #[test]
+    fn test_opq_rotate() {
+        let data: Vec<f32> = (0..320).map(|x| x as f32).collect();
+
+        let opq = OptimisedProductQuantiser::train(&data, 32, 4, Some(4), Some(1), 5, 42, false);
+
+        let vec: Vec<f32> = (0..32).map(|x| x as f32).collect();
+        let rotated = opq.rotate(&vec);
+
+        assert_eq!(rotated.len(), 32);
+    }
+
+    #[test]
+    fn test_opq_deterministic() {
+        let data: Vec<f32> = (0..320).map(|x| x as f32).collect();
+
+        let opq1 = OptimisedProductQuantiser::train(&data, 32, 4, Some(4), Some(1), 5, 42, false);
+
+        let opq2 = OptimisedProductQuantiser::train(&data, 32, 4, Some(4), Some(1), 5, 42, false);
+
+        let vec: Vec<f32> = (0..32).map(|x| x as f32).collect();
+        let codes1 = opq1.encode(&vec);
+        let codes2 = opq2.encode(&vec);
+
+        assert_eq!(codes1, codes2);
     }
 }

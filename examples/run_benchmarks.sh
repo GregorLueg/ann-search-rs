@@ -8,22 +8,24 @@ run_benchmark() {
     cargo run --example "gridsearch_${name,,}" --release -- "$@"
 }
 
-# # Basic algorithms with cosine and euclidean
-# for algo in annoy hnsw ivf lsh nndescent; do
-#     run_benchmark "${algo^^}" --distance cosine
-#     run_benchmark "${algo^^}" --distance euclidean
-# done
+# Basic algorithms with cosine and euclidean
+for algo in annoy hnsw ivf lsh nndescent; do
+    run_benchmark "${algo^^}" --distance cosine
+    run_benchmark "${algo^^}" --distance euclidean
+done
 
-# IVF-SQ8
-# echo "Running IVF-SQ8 benchmarks..."
-# cargo run --example gridsearch_ivf_sq8 --release -- --distance euclidean
-# cargo run --example gridsearch_ivf_sq8 --release -- --distance euclidean --dim 96
-# cargo run --example gridsearch_ivf_sq8 --release -- --distance euclidean --dim 128 --data correlated
+# Algorithms with quantisations
 
-# # IVF-PQ
-# echo "Running IVF-PQ benchmarks..."
-# cargo run --example gridsearch_ivf_pq --release -- --distance euclidean --dim 128 --data correlated
-# cargo run --example gridsearch_ivf_pq --release -- --distance euclidean --dim 192 --data correlated
+IVF-SQ8
+echo "Running IVF-SQ8 benchmarks..."
+cargo run --example gridsearch_ivf_sq8 --release -- --distance euclidean
+cargo run --example gridsearch_ivf_sq8 --release -- --distance euclidean --dim 96
+cargo run --example gridsearch_ivf_sq8 --release -- --distance euclidean --dim 128 --data correlated
+
+# IVF-PQ
+echo "Running IVF-PQ benchmarks..."
+cargo run --example gridsearch_ivf_pq --release -- --distance euclidean --dim 128 --data correlated
+cargo run --example gridsearch_ivf_pq --release -- --distance euclidean --dim 192 --data correlated
 
 # IVF-OPQ
 echo "Running IVF-OPQ benchmarks..."
