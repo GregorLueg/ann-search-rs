@@ -18,21 +18,12 @@ Rust of some of these.
 ## Features
 
 - **Multiple ANN algorithms**:
-  - [**Annoy (Approximate Nearest Neighbours Oh Yeah)**](https://github.com/spotify/annoy).
-  A version is implemented here with some modifications.
-  - [**HNSW (Hierarchical Navigable Small World)**](https://arxiv.org/abs/1603.09320). 
-  A version with some slight modifications has been implemented in this package,
-  attempting rapid index generation.
-  - **NNDescent (Nearest Neighbour Descent)** 
+  - *Annoy (Approximate Nearest Neighbours Oh Yeah)*
+  - *HNSW (Hierarchical Navigable Small World)*
+  - *NNDescent (Nearest Neighbour Descent)*
   (heavily inspired by [PyNNDescent](https://github.com/lmcinnes/pynndescent)).
-  - [**LSH (Locality Sensitive Hashing)**](https://en.wikipedia.org/wiki/Locality-sensitive_hashing) An
-  approximate nearest neighbour search that can be very fast at the cost of
-  precision. 
-  - [**IVF (Inverted File index)**] This one leverages k-mean clustering to only
-  search a subspace of the original index. There is also a scalar quantised
-  version of this index for even higher speed/reduced memory fingerprint at the
-  cost of Recall@k_neighbours.
-    
+  - *LSH (Locality Sensitive Hashing)*
+  - *IVF (Inverted File index)*
 
 - **Distance metrics**:
   - Euclidean
@@ -41,6 +32,11 @@ Rust of some of these.
 
 - **High performance**: Optimised implementations with SIMD-friendly code,
 heavy multi-threading were possible and optimised structures for memory access.
+
+- **Quantised indices**:
+  - IVF-SQ8 (with scalar quantisation)
+  - IVF-PQ (with product quantisation)
+  - IVF-OPQ (with optimised product quantisation)
 
 ## Installation
 
@@ -53,10 +49,9 @@ ann-search-rs = "*" # always get the latest version
 
 ## Roadmap
 
-Longer term, I am considering GPU-acceleration (yet to be figured out how,
-likely via the [Burn framework](https://burn.dev)). I am also considering some
-further inspiration from the [Faiss library](https://faiss.ai) and combine 
-quantisation methods with IVF vor REALLY large data sets. Let's see.
+- Longer term, I am considering GPU-acceleration (yet to be figured out how,
+likely via the [Burn framework](https://burn.dev)).
+- Option to save indices on-disk and do on-disk querying.
 
 ## Example Usage
 
@@ -96,7 +91,7 @@ searches. The overall design is very similar and if you wish details on usage,
 please refer to the `examples/*.rs` section which shows you the grid searches
 across various parameters per given index.
 
-## Performance across various parameters
+## Examples
 
 To identify good basic thresholds, there are a set of different gridsearch
 scripts available. These can be run via
@@ -124,14 +119,14 @@ function, see `./examples/commons/mod.rs`.
 
 ### Annoy
 
-50 to 75 trees are already sufficient to achieve very high Recalls@k, while
-being substantially faster than an exhaustive search. The search_budget is 
-set as default to `k * n_trees * 20` which is quite a large one. This is 
-reflected in `:auto`. Smaller multipliers with `5x` and `10x` are also shown.
-Overall, index generation is very fast (highly parallelisable), but the search
-budget needs to be quite decent to get good Recall@k (especially with few 
-trees). The more trees you use the more you can reduce the search budget per 
-given tree. It depends on your use case. Good allrounder. 
+Approximate nearest neighbours Oh Yeah. A tree-based method for vector searches.
+Fast index building and good query speed.
+
+**Key parameters:**
+
+- *Number of trees (nt)*: The number of trees to generate in the forest
+- *Search budget (s)*: The search budget per tree. If set to auto it uses
+  `k * n_trees * 20`; versions with a `10x` or `5x` (i.e., less) are also shown.
 
 **Euclidean:**
 
@@ -199,11 +194,15 @@ Annoy-nt75:5x                             689.00      4001.34      4690.34      
 
 ### HNSW
 
-HNSW has a trade off between `m` (connections between layers) and the 
-`ef_construction` (the budget to generate good connections during construction).
-One can appreciate, that higher `m` warrants bigger construction budgets. 
-Overall, index generation takes a bit longer, but the query speed is (very) 
-high with great recalls (if you took the time to generate the index).
+Hierarchical navigatable small worlds. A graph-based index that needs more time
+to build the index. However, fast query speed.
+
+**Key parameters:**
+
+- *M (m)*: The number of connections between layers
+- *EF construction (ef)*: The budget to generate good connections during 
+  construction of the index.
+- *EF search (s)*: The budget for the search queries. 
 
 **Euclidean:**
 
@@ -283,12 +282,14 @@ HNSW-M32-ef300-s100                     13576.83      3858.22     17435.05      
 
 ### IVF
 
-Inverted file index (powering for example some of the FAISS indices) is very
-powerful. Quick index build, quite fast querying times. The number of lists
-(especially with this synthetic data) does not need to be particularly high and
-you reach quite quickly better speeds over an exhaustive search. Larger
-number of lists or points to search do not really make sense (at least not
-in this data).
+Inverted file index. Uses Voronoi cells to sub-partition the original data.
+
+**Key parameters:**
+
+- *Number of lists (nl)*: The number of independent k-means cluster to generate.
+  If the structure of the data is unknown, people use `sqrt(n)` as a heuristic.
+- *Number of points (np)*: The number of clusters to search for. Usually 
+  scanning 15 to 20% of the number of lists yields good results.
 
 **Euclidean:**
 
@@ -346,13 +347,13 @@ IVF-nl100-np15                           2520.65      9818.66     12339.30      
 
 ### LSH
 
-Locality sensitive hashing is also provided in this crate. Under the hood it
-uses locality-sensitive hash functions that compared to normal hash functions
-encourage collisions of similar elements. The two key parameters are the
-number of bits you wish to use (the more, the faster the querying at cost of 
-recall) and the number of HashMaps to use in the index. The table below gives an 
-idea on the influence of the parameters. You also have the option to limit the 
-number of candidates to explore during querying at cost of Recall. 
+Locality sensitive hashing.
+
+**Key parameters:**
+
+- *Number of tables (nt)*: ...
+- *Number of bits (bits)*: ...
+- *Max candidates*: ...
 
 **Euclidean:**
 
@@ -444,6 +445,12 @@ heavily short cut the initialisation of the index with only 12 trees (instead
 of 32) and get in 4 seconds to a recall ≥0.9 (compared to 48 seconds for 
 exhaustive search)!
 
+**Key parameters:**
+
+- *Number of tables (nt)*: ...
+- *Search budget (s)*: ...
+- *Diversify probability*: ...
+
 **Euclidean:**
 
 Below are the results for the Euclidean distance measure for NNDescent
@@ -494,12 +501,28 @@ NNDescent-nt:auto-s:auto-dp1             5963.72       705.95      6669.67      
 
 The crate also provides some quantised approximate nearest neighbour searches, 
 designed for very large data sets where memory and time both start becoming 
-incredibly constraining. At the moment due to the focus on single cell, 
-the only quantisation is SQ8 which transforms a given vector into `i8` and does
-symmetric distance calculations (query also transformed to `i8` to leverage
-fast integer computations on modern CPUs).
+incredibly constraining. There are a total of three different quantisation
+methods available:
 
-### IVF (with scalar quantisation)
+- *IVF-SQ8*: Uses a scalar quantisation and transforms the different feature
+  dimensions to `i8` and leverages very fast integer math to compute the nearest
+  neighbours (at a loss of precision).
+- *IVF-PQ*: Uses product quantisation. Useful when the dimensions of the vectors
+  are incredibly large and one needs to compress the index in memory. However,
+  as you can see below, this comes at a cost of Recall.
+- *IVF-OPQ*: Uses optimised product quantisation. Tries to de-correlate the
+  residuals 
+
+### IVF-SQ8
+
+This index uses scalar quantisation to 8-bits.
+
+**Key parameters:**
+
+- *Number of lists (nl)*: The number of independent k-means cluster to generate.
+  If the structure of the data is unknown, people use `sqrt(n)` as a heuristic.
+- *Number of points (np)*: The number of clusters to search for. Usually 
+  scanning 15 to 20% of the number of lists.
 
 **Euclidean:**
 
@@ -530,37 +553,72 @@ IVF-SQ8-nl100-np15                   995.34      1554.03      2549.38       0.85
 -----------------------------------------------------------------------------------
 ```
 
-**Cosine:**
-
-Below are the results for the Cosine distance measure for IVF with SQ8
-quantisation. To note, the mean distance error is not calculated, as the index
-does not store the original vectors anymore to reduce memory fingerprint. 
+**With more dimensions**
 
 ```
-===================================================================================
-Benchmark: 150k cells, 32D
-===================================================================================
-Method                           Build (ms)   Query (ms)   Total (ms)     Recall@k
------------------------------------------------------------------------------------
-Exhaustive-IP                          4.45     24035.16     24039.61       1.0000
-IVF-SQ8-nl10-np1                     205.73      1224.28      1430.01       0.8594
-IVF-SQ8-nl20-np1                     373.75       659.22      1032.97       0.8294
-IVF-SQ8-nl20-np2                     373.75      1125.76      1499.51       0.8623
-IVF-SQ8-nl20-np3                     373.75      1598.88      1972.63       0.8623
-IVF-SQ8-nl25-np1                     555.26       585.04      1140.30       0.8067
-IVF-SQ8-nl25-np2                     555.26      1004.46      1559.72       0.8623
-IVF-SQ8-nl25-np3                     555.26      1396.99      1952.25       0.8623
-IVF-SQ8-nl50-np2                    1051.30       627.63      1678.93       0.8130
-IVF-SQ8-nl50-np5                    1051.30      1165.45      2216.75       0.8608
-IVF-SQ8-nl50-np7                    1051.30      1492.41      2543.71       0.8623
-IVF-SQ8-nl100-np5                   2538.72       723.46      3262.18       0.8447
-IVF-SQ8-nl100-np10                  2538.72      1154.77      3693.49       0.8614
-IVF-SQ8-nl100-np15                  2538.72      1624.15      4162.86       0.8623
------------------------------------------------------------------------------------
-
 ```
 
-#### More cells and dimensions
+### IVF-PQ
+
+This index uses product quantisation. To note, the quantisation is quite harsh 
+and hence, reduces the Recall quite substantially. Each vector gets reduced to
+from *192 x 32 bits (192 x f32) = 768 bytes* to for 
+*m = 32 (32 sub vectors) to 32 x u8 = 32 bytes*, a 
+**24x reduction in memory usage** (of course with overhead from the cook book). 
+However, it can still be useful in situation where good enough works and you 
+have VERY large scale data.</br></br>
+
+This version is run on a special version of the synthetic data that is less
+affected by the curse of dimensionality.
+
+**Key parameters:**
+
+- *Number of lists (nl)*: The number of independent k-means cluster to generate.
+  If the structure of the data is unknown, people use `sqrt(n)` as a heuristic.
+- *Number of points (np)*: The number of clusters to search for. Usually 
+  scanning 15 to 20% of the number of lists.
+- *Number of subvectors (m)*: In how many subvectors to divide the given main
+  vector. The initial dimensionality needs to be divisable by m.
+
+**Euclidean:**
+
+```
+```
+
+**With more dimensions**
+
+```
+```
+
+### IVF-OPQ
+
+This index uses optimised product quantisation - this substantially increases
+the build time. Similar to IVF-PQ, the quantisation is quite harsh and hence, 
+reduces the recall quite substantially compared to exhaustive search. Each 
+vector gets reduced to from *192 x 32 bits (192 x f32) = 768 bytes* to for 
+*m = 32 (32 sub vectors) to 32 x u8 = 32 bytes*, a 
+**24x reduction in memory usage** (of course with overhead from the cook book). 
+However, it can still be useful in situation where good enough works and you 
+have VERY large scale data.
+
+**Key parameters:**
+
+- *Number of lists (nl)*: The number of independent k-means cluster to generate.
+  If the structure of the data is unknown, people use `sqrt(n)` as a heuristic.
+- *Number of points (np)*: The number of clusters to search for. Usually 
+  scanning 15 to 20% of the number of lists.
+- *Number of subvectors (m)*: In how many subvectors to divide the given main
+  vector. The initial dimensionality needs to be divisable by m.
+
+**Euclidean:**
+
+```
+```
+
+**With more dimensions**
+
+```
+```
 
 ## Licence
 

@@ -68,7 +68,9 @@ where
     ///
     /// Constructs an inverted file index with all vectors quantised to i8 using
     /// a global codebook. Reduces memory by 4x (for f32) whilst maintaining
-    /// reasonable recall through learned quantisation bounds.
+    /// reasonable recall through learned quantisation bounds. Also, enables
+    /// fast querying via `i8` symmetric transformations (at the cost of
+    /// Recall).
     ///
     /// ### Workflow
     ///
@@ -105,9 +107,10 @@ where
         seed: usize,
         verbose: bool,
     ) -> Self {
+        // max iters for k-means
         let max_iters = max_iters.unwrap_or(30);
 
-        // Normalise for cosine distance
+        // normalise for cosine distance
         if metric == Dist::Cosine {
             if verbose {
                 println!("  Normalising vectors for cosine distance");
@@ -117,7 +120,7 @@ where
                 .for_each(|chunk| normalise_vector(chunk));
         }
 
-        // 1. Subsample training data
+        // 1. subsample training data
         let (training_data, n_train) = if n > 500_000 {
             if verbose {
                 println!("  Sampling 250k vectors for training");
@@ -128,7 +131,7 @@ where
             (vectors_flat.clone(), n)
         };
 
-        // 2. Train centroids
+        // 2. train centroids
         let mut centroids = train_centroids(
             &training_data,
             dim,
@@ -140,7 +143,7 @@ where
             verbose,
         );
 
-        // Normalise centroids for cosine
+        // normalise centroids for cosine
         if metric == Dist::Cosine {
             if verbose {
                 println!("  Normalising centroids");
@@ -150,17 +153,17 @@ where
                 .for_each(|chunk| normalise_vector(chunk));
         }
 
-        // 3. Train global codebook
+        // 3. train global codebook
         if verbose {
             println!("  Training global codebook");
         }
         let codebook = ScalarQuantiser::train(&training_data, dim);
 
-        // 4. Assign vectors to clusters
+        // 4. assign vectors to clusters
         let assignments = assign_all_parallel(&vectors_flat, dim, n, &centroids, nlist, &metric);
         let (all_indices, offsets) = build_csr_layout(assignments, n, nlist);
 
-        // 5. Quantise all vectors with global codebook
+        // 5. quantise all vectors with global codebook
         if verbose {
             println!("  Quantising vectors");
         }
@@ -206,7 +209,7 @@ where
     /// Query the index for approximate nearest neighbours.
     ///
     /// Performs two-stage search using quantised vectors: first finds nprobe
-    /// nearest centroids, then computes distances in quantised space (i8
+    /// nearest centroids, then computes distances in quantised space (`i8`
     /// arithmetic) for all vectors in those clusters. Normalises query if
     /// using Cosine distance.
     ///

@@ -1,6 +1,7 @@
 use faer::RowRef;
 use num_traits::{Float, FromPrimitive, ToPrimitive};
 use rayon::prelude::*;
+use std::ops::AddAssign;
 use std::{collections::BinaryHeap, iter::Sum};
 
 use crate::quantised::quantisers::*;
@@ -12,7 +13,7 @@ use crate::utils::k_means::*;
 // Main index //
 ////////////////
 
-/// IVF index with product quantisation
+/// IVF index with optimised product quantisation
 ///
 /// ### Fields
 ///
@@ -25,7 +26,7 @@ use crate::utils::k_means::*;
 /// * `offsets` - Offsets for each inverted list
 /// * `codebook` - Product quantiser with M codebooks
 /// * `nlist` - Number of k-means clusters
-pub struct IvfPqIndex<T> {
+pub struct IvfOpqIndex<T> {
     quantised_codes: Vec<u8>,
     dim: usize,
     n: usize,
@@ -33,15 +34,15 @@ pub struct IvfPqIndex<T> {
     centroids: Vec<T>,
     all_indices: Vec<usize>,
     offsets: Vec<usize>,
-    codebook: ProductQuantiser<T>,
+    codebook: OptimisedProductQuantiser<T>,
     nlist: usize,
 }
 
-impl<T> IvfPqIndex<T>
+impl<T> IvfOpqIndex<T>
 where
-    T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum,
+    T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum + AddAssign,
 {
-    /// Build an IVF index with product quantisation
+    /// Build an IVF index with optimised product quantisation
     ///
     /// ### Params
     ///
@@ -120,7 +121,7 @@ where
 
         // 3. Compute residuals for training data
         if verbose {
-            println!("  Computing residuals for PQ training");
+            println!("  Computing residuals for OPQ training");
         }
         let training_assignments =
             assign_all_parallel(&training_data, dim, n_train, &centroids, nlist, &metric);
@@ -138,16 +139,15 @@ where
             }
         }
 
-        // 4. Train PQ on residuals
+        // 4. Train OPQ on residuals
         if verbose {
-            println!("  Training product quantiser with m={}", m);
+            println!("  Training optimised product quantiser with m={}", m);
         }
-        let codebook = ProductQuantiser::train(
+        let codebook = OptimisedProductQuantiser::train(
             &training_residuals,
             dim,
             m,
             n_pq_centroids,
-            &Dist::Euclidean, // IMPORTANT!
             max_iters,
             seed + 1000,
             verbose,
@@ -183,7 +183,7 @@ where
             });
 
         if verbose {
-            println!("  Quantisation complete");
+            println!("  (Optimised) Quantisation complete");
         }
 
         Self {
@@ -318,10 +318,12 @@ where
             .map(|(&q, &c)| q - c)
             .collect();
 
+        let rotated_residual = self.codebook.rotate(&query_residual);
+
         let mut table = vec![T::zero(); m * n_cents];
 
         for subspace in 0..m {
-            let query_sub = &query_residual[subspace * subvec_dim..(subspace + 1) * subvec_dim];
+            let query_sub = &rotated_residual[subspace * subvec_dim..(subspace + 1) * subvec_dim];
             let table_offset = subspace * n_cents;
 
             for centroid_idx in 0..n_cents {
@@ -372,7 +374,7 @@ where
                 for i in 0..8 {
                     let code = unsafe { *codes.get_unchecked(i) } as usize;
                     let offset = i * n_cents + code;
-                    sum = sum + unsafe { *lookup_table.get_unchecked(offset) };
+                    sum += unsafe { *lookup_table.get_unchecked(offset) };
                 }
                 sum
             }
@@ -381,7 +383,7 @@ where
                 for i in 0..16 {
                     let code = unsafe { *codes.get_unchecked(i) } as usize;
                     let offset = i * n_cents + code;
-                    sum = sum + unsafe { *lookup_table.get_unchecked(offset) };
+                    sum += unsafe { *lookup_table.get_unchecked(offset) };
                 }
                 sum
             }
@@ -390,7 +392,7 @@ where
                 for i in 0..32 {
                     let code = unsafe { *codes.get_unchecked(i) } as usize;
                     let offset = i * n_cents + code;
-                    sum = sum + unsafe { *lookup_table.get_unchecked(offset) };
+                    sum += unsafe { *lookup_table.get_unchecked(offset) };
                 }
                 sum
             }

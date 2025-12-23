@@ -53,7 +53,7 @@ fn main() {
     let query_time = start.elapsed().as_secs_f64() * 1000.0;
 
     results.push(BenchmarkResult {
-        method: "Exhaustive-IP".to_string(),
+        method: "Exhaustive".to_string(),
         build_time_ms: build_time,
         query_time_ms: query_time,
         total_time_ms: build_time + query_time,

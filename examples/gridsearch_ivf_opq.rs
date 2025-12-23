@@ -70,7 +70,7 @@ fn main() {
 
     let nlist_values = [10, 20, 25, 50, 100];
 
-    // IVF-PQ benchmarks
+    // IVF-OPQ benchmarks
     let m_values: Vec<usize> = if cli.dim >= 128 {
         vec![16, 32, 48]
     } else {
@@ -83,9 +83,9 @@ fn main() {
                 continue;
             }
 
-            println!("Building IVF-PQ index (nlist={}, m={})...", nlist, m);
+            println!("Building IVF-OPQ index (nlist={}, m={})...", nlist, m);
             let start = Instant::now();
-            let ivf_pq_idx = build_ivf_pq_index(
+            let ivf_opq_idx = build_ivf_opq_index(
                 data.as_ref(),
                 nlist,
                 *m,
@@ -116,18 +116,18 @@ fn main() {
                 }
 
                 println!(
-                    "Querying IVF-PQ (nlist={}, m={}, np={})...",
+                    "Querying IVF-OPQ (nlist={}, m={}, np={})...",
                     nlist, m, nprobe
                 );
                 let start = Instant::now();
                 let (approx_neighbors, _) =
-                    query_ivf_pq_index(query_data, &ivf_pq_idx, cli.k, Some(nprobe), true, false);
+                    query_ivf_opq_index(query_data, &ivf_opq_idx, cli.k, Some(nprobe), true, false);
                 let query_time = start.elapsed().as_secs_f64() * 1000.0;
 
                 let recall = calculate_recall(&true_neighbors, &approx_neighbors, cli.k);
 
                 results.push(BenchmarkResult {
-                    method: format!("IVF-PQ-nl{}-m{}-np{}", nlist, m, nprobe),
+                    method: format!("IVF-OPQ-nl{}-m{}-np{}", nlist, m, nprobe),
                     build_time_ms: build_time,
                     query_time_ms: query_time,
                     total_time_ms: build_time + query_time,

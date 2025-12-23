@@ -103,7 +103,7 @@ fn main() {
             println!("  Internal validation: {:.3}", internal_recall);
 
             results.push(BenchmarkResult {
-                method: format!("Annoy-nt{}:{}", n_trees, budget_label),
+                method: format!("Annoy-nt{}-s:{}", n_trees, budget_label),
                 build_time_ms: build_time,
                 query_time_ms: query_time,
                 total_time_ms: build_time + query_time,

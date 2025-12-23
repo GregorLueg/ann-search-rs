@@ -1,14 +1,10 @@
+use faer::Mat;
 use num_traits::{Float, FromPrimitive, ToPrimitive};
 use std::iter::Sum;
+use std::ops::AddAssign;
 
 use crate::utils::dist::*;
 use crate::utils::k_means::*;
-
-////////////
-// Consts //
-////////////
-
-pub const N_CLUSTERS_PQ: usize = 256;
 
 /////////////////////////
 // Scalar quantisation //
@@ -102,18 +98,23 @@ where
 // ProductQuantiser //
 //////////////////////
 
+pub const N_CLUSTERS_PQ: usize = 256;
+pub const PQ_ITER: usize = 10;
+
 /// ProductQuantiser
 ///
 /// ### Fields
 ///
-/// * `codebooks` - M codebooks, each containing 256 centroids of dimension
+/// * `codebooks` - M codebooks, each containing n centroids of dimension
 ///   subvec_dim
 /// * `m` - Number of subspaces
 /// * `subvec_dim` - Dimension of each subvector (dim / m)
+/// * `n_centroids` - Number of centroids that were used to train the quantiser.
 pub struct ProductQuantiser<T> {
     codebooks: Vec<Vec<T>>,
     m: usize,
     subvec_dim: usize,
+    n_centroids: usize,
 }
 
 impl<T> ProductQuantiser<T>
@@ -122,7 +123,7 @@ where
 {
     /// Train the product quantiser
     ///
-    /// Splits vectors into M subspaces and trains a 256-centroid codebook
+    /// Splits vectors into M subspaces and trains a n-centroid codebook
     /// for each subspace using k-means.
     ///
     /// ### Params
@@ -130,6 +131,8 @@ where
     /// * `vectors_flat` - Flat slice of training vectors
     /// * `dim` - Dimension of each vector
     /// * `m` - Number of subspaces
+    /// * `n_centroids` - Optional number of centroids to use per given
+    ///   subspace. If not provided, it will default to `256`.
     /// * `metric` - Distance metric (for k-means clustering)
     /// * `max_iters` - Maximum k-means iterations
     /// * `seed` - Random seed
@@ -138,18 +141,26 @@ where
     /// ### Returns
     ///
     /// Trained ProductQuantiser
+    #[allow(clippy::too_many_arguments)]
     pub fn train(
         vectors_flat: &[T],
         dim: usize,
         m: usize,
+        n_centroids: Option<usize>,
         metric: &Dist,
         max_iters: usize,
         seed: usize,
         verbose: bool,
     ) -> Self {
+        let n_centroids = n_centroids.unwrap_or(N_CLUSTERS_PQ);
+
         // checks
         assert!(dim.is_multiple_of(m), "Dimension must be divisible by m");
         assert!(dim >= 32, "Dimension too small for product quantisation");
+        assert!(
+            n_centroids <= 256,
+            "The number of centroids for PQ is limited to 256."
+        );
 
         // function body
         let subvec_dim = dim / m;
@@ -169,12 +180,12 @@ where
                 subvectors.extend_from_slice(&vectors_flat[vec_start..vec_start + subvec_dim]);
             }
 
-            // Train k-means with 256 clusters
+            // train k-means with n clusters
             let centroids = train_centroids(
                 &subvectors,
                 subvec_dim,
                 n,
-                N_CLUSTERS_PQ,
+                n_centroids,
                 metric,
                 max_iters,
                 seed + subspace,
@@ -192,6 +203,7 @@ where
             codebooks,
             m,
             subvec_dim,
+            n_centroids,
         }
     }
 
@@ -205,26 +217,22 @@ where
     /// ### Returns
     ///
     /// Vector of M indices (u8), one per subspace
-    pub fn encode(&self, vec: &[T], metric: &Dist) -> Vec<u8> {
+    pub fn encode(&self, vec: &[T]) -> Vec<u8> {
         let mut codes: Vec<u8> = Vec::with_capacity(self.m);
 
         for subspace in 0..self.m {
             let subvec_start = subspace * self.subvec_dim;
             let subvec = &vec[subvec_start..subvec_start + self.subvec_dim];
 
-            // find nearest centroid in this subspace
             let mut best_idx = 0;
             let mut best_dist = T::infinity();
 
-            for centroid_idx in 0..256 {
+            for centroid_idx in 0..self.n_centroids {
                 let centroid_start = centroid_idx * self.subvec_dim;
                 let centroid =
                     &self.codebooks[subspace][centroid_start..centroid_start + self.subvec_dim];
 
-                let dist = match metric {
-                    Dist::Euclidean => euclidean_distance_static(subvec, centroid),
-                    Dist::Cosine => cosine_distance_static(subvec, centroid),
-                };
+                let dist = euclidean_distance_static(subvec, centroid);
 
                 if dist < best_dist {
                     best_dist = dist;
@@ -239,17 +247,333 @@ where
     }
 
     /// Get number of subspaces
+    #[inline(always)]
     pub fn m(&self) -> usize {
         self.m
     }
 
     /// Get subvector dimension
+    #[inline(always)]
     pub fn subvec_dim(&self) -> usize {
         self.subvec_dim
+    }
+
+    /// Return the number of centroids used for training
+    #[inline(always)]
+    pub fn n_centroids(&self) -> usize {
+        self.n_centroids
     }
 
     /// Get codebooks (for building lookup tables)
     pub fn codebooks(&self) -> &[Vec<T>] {
         &self.codebooks
+    }
+}
+
+///////////////////////////////
+// OptimisedProductQuantiser //
+///////////////////////////////
+
+/// OptimisedProductQuantiser
+///
+/// Product quantiser with learned rotation matrix to decorrelate dimensions
+/// before quantisation, reducing quantisation error compared to standard PQ.
+///
+/// ### Fields
+///
+/// * `rotation_matrix` - Orthogonal rotation matrix (dim × dim, row-major)
+/// * `pq` - Standard product quantiser applied after rotation
+/// * `dim` - Dimension of vectors
+pub struct OptimisedProductQuantiser<T> {
+    rotation_matrix: Vec<T>,
+    pq: ProductQuantiser<T>,
+    dim: usize,
+}
+
+impl<T> OptimisedProductQuantiser<T>
+where
+    T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum + AddAssign,
+{
+    /// Train the optimised product quantiser
+    ///
+    /// Learns a rotation matrix via iterative refinement: alternates between
+    /// training PQ codebooks on rotated vectors and updating the rotation
+    /// matrix via SVD to minimise reconstruction error.
+    ///
+    /// ### Params
+    ///
+    /// * `vectors_flat` - Flat slice of training vectors
+    /// * `dim` - Dimension of each vector
+    /// * `m` - Number of subspaces
+    /// * `n_centroids` - Optional number of centroids per subspace (defaults to 256)
+    /// * `max_iters` - Maximum k-means iterations
+    /// * `seed` - Random seed
+    /// * `verbose` - Print progress
+    ///
+    /// ### Returns
+    ///
+    /// Trained OptimisedProductQuantiser
+    #[allow(clippy::too_many_arguments)]
+    pub fn train(
+        vectors_flat: &[T],
+        dim: usize,
+        m: usize,
+        n_centroids: Option<usize>,
+        max_iters: usize,
+        seed: usize,
+        verbose: bool,
+    ) -> Self {
+        let n = vectors_flat.len() / dim;
+
+        // identity rotation
+        let mut rotation_matrix = vec![T::zero(); dim * dim];
+        for i in 0..dim {
+            rotation_matrix[i * dim + i] = T::one();
+        }
+
+        #[allow(unused_assignments)] // clippy being stupid here
+        let mut pq = ProductQuantiser::train(
+            vectors_flat,
+            dim,
+            m,
+            n_centroids,
+            &Dist::Euclidean,
+            max_iters,
+            seed,
+            false,
+        );
+
+        for iter in 0..PQ_ITER {
+            if verbose {
+                println!("  OPQ iteration {} / {}", iter + 1, PQ_ITER);
+            }
+
+            // rotate vectors
+            let rotated = Self::apply_rotation(vectors_flat, &rotation_matrix, dim, n);
+
+            // train PQ
+            pq = ProductQuantiser::train(
+                &rotated,
+                dim,
+                m,
+                n_centroids,
+                &Dist::Euclidean,
+                max_iters,
+                seed + iter,
+                false,
+            );
+
+            // encode and reconstruct
+            let mut reconstructed = vec![T::zero(); n * dim];
+            for vec_idx in 0..n {
+                let vec_start = vec_idx * dim;
+                let codes = pq.encode(&rotated[vec_start..vec_start + dim]);
+                let decoded = Self::decode_pq(&codes, &pq);
+                reconstructed[vec_start..vec_start + dim].copy_from_slice(&decoded);
+            }
+
+            // update rotation via SVD
+            rotation_matrix = Self::compute_rotation(vectors_flat, &reconstructed, dim, n);
+        }
+
+        // final training
+        let rotated = Self::apply_rotation(vectors_flat, &rotation_matrix, dim, n);
+        pq = ProductQuantiser::train(
+            &rotated,
+            dim,
+            m,
+            n_centroids,
+            &Dist::Euclidean,
+            max_iters,
+            seed,
+            verbose,
+        );
+
+        Self {
+            rotation_matrix,
+            pq,
+            dim,
+        }
+    }
+
+    /// Encode a vector to M indices
+    ///
+    /// Applies rotation matrix then encodes with standard PQ.
+    ///
+    /// ### Params
+    ///
+    /// * `vec` - Vector to encode
+    ///
+    /// ### Returns
+    ///
+    /// Vector of M indices (u8), one per subspace
+    pub fn encode(&self, vec: &[T]) -> Vec<u8> {
+        let rotated = Self::rotate_vector(vec, &self.rotation_matrix, self.dim);
+        self.pq.encode(&rotated)
+    }
+
+    /// Rotate a given vector
+    ///
+    /// ### Params
+    ///
+    /// * `vec` - Vector to rotate
+    ///
+    /// ### Returns
+    ///
+    /// The returned vector
+    pub fn rotate(&self, vec: &[T]) -> Vec<T> {
+        Self::rotate_vector(vec, &self.rotation_matrix, self.dim)
+    }
+
+    /// Decode PQ codes to reconstructed vector
+    ///
+    /// Reconstructs a vector from its PQ codes by concatenating the appropriate
+    /// centroids from each subspace codebook.
+    ///
+    /// ### Params
+    ///
+    /// * `codes` - M PQ codes (u8)
+    /// * `pq` - Product quantiser containing codebooks
+    ///
+    /// ### Returns
+    ///
+    /// Reconstructed vector
+    fn decode_pq(codes: &[u8], pq: &ProductQuantiser<T>) -> Vec<T> {
+        let m = pq.m();
+        let subvec_dim = pq.subvec_dim();
+        let mut reconstructed = vec![T::zero(); m * subvec_dim];
+
+        for subspace in 0..m {
+            let code = codes[subspace] as usize;
+            let centroid_start = code * subvec_dim;
+            let centroid = &pq.codebooks()[subspace][centroid_start..centroid_start + subvec_dim];
+            reconstructed[subspace * subvec_dim..(subspace + 1) * subvec_dim]
+                .copy_from_slice(centroid);
+        }
+
+        reconstructed
+    }
+
+    /// Apply rotation matrix to a single vector
+    ///
+    /// Computes matrix-vector product: out = R * vec
+    ///
+    /// ### Params
+    ///
+    /// * `vec` - Input vector
+    /// * `rotation` - Rotation matrix (row-major)
+    /// * `dim` - Vector dimension
+    ///
+    /// ### Returns
+    ///
+    /// Rotated vector
+    fn rotate_vector(vec: &[T], rotation: &[T], dim: usize) -> Vec<T> {
+        let mut out = vec![T::zero(); dim];
+        for i in 0..dim {
+            let mut sum = T::zero();
+            for j in 0..dim {
+                sum += rotation[i * dim + j] * vec[j];
+            }
+            out[i] = sum;
+        }
+
+        out
+    }
+
+    /// Apply rotation matrix to multiple vectors
+    ///
+    /// Rotates all vectors in the dataset by applying the rotation matrix to
+    /// each vector individually.
+    ///
+    /// ### Params
+    ///
+    /// * `vectors` - Flat vector data (length = n * dim)
+    /// * `rotation` - Rotation matrix (row-major)
+    /// * `dim` - Vector dimension
+    /// * `n` - Number of vectors
+    ///
+    /// ### Returns
+    ///
+    /// Flat rotated vectors (length = n * dim)
+    fn apply_rotation(vectors: &[T], rotation: &[T], dim: usize, n: usize) -> Vec<T> {
+        let mut rotated = vec![T::zero(); n * dim];
+        for vec_idx in 0..n {
+            let vec_start = vec_idx * dim;
+            let rotated_vec =
+                Self::rotate_vector(&vectors[vec_start..vec_start + dim], rotation, dim);
+            rotated[vec_start..vec_start + dim].copy_from_slice(&rotated_vec);
+        }
+
+        rotated
+    }
+
+    /// Compute optimal rotation matrix via SVD
+    ///
+    /// Finds the orthogonal matrix R that minimises reconstruction error by
+    /// computing `R = V * U^T` where `C = U * Σ * V^T`is the SVD of the cross-
+    /// covariance matrix `X_rotated^T * X_reconstructed`.
+    ///
+    /// ### Params
+    ///
+    /// * `x_rotated` - Rotated training vectors (flat)
+    /// * `x_recon` - PQ-reconstructed vectors (flat)
+    /// * `dim` - Vector dimension
+    /// * `n` - Number of vectors
+    ///
+    /// ### Returns
+    ///
+    /// Updated rotation matrix (dim × dim, row-major)
+    fn compute_rotation(x_rotated: &[T], x_recon: &[T], dim: usize, n: usize) -> Vec<T> {
+        let mut c = Mat::<f32>::zeros(dim, dim);
+
+        for vec_idx in 0..n {
+            let vec_start = vec_idx * dim;
+            for i in 0..dim {
+                for j in 0..dim {
+                    let val = x_rotated[vec_start + i].to_f32().unwrap()
+                        * x_recon[vec_start + j].to_f32().unwrap();
+                    c[(i, j)] += val;
+                }
+            }
+        }
+
+        let svd = c.thin_svd().unwrap();
+
+        let u = svd.U();
+        let v = svd.V();
+
+        let r = v * u.transpose();
+        let mut rotation = vec![T::zero(); dim * dim];
+
+        for i in 0..dim {
+            for j in 0..dim {
+                rotation[i * dim + j] = T::from_f32(r[(i, j)]).unwrap();
+            }
+        }
+
+        rotation
+    }
+
+    /// Get number of subspaces
+    #[inline(always)]
+    pub fn m(&self) -> usize {
+        self.pq.m()
+    }
+
+    /// Get subvector dimension
+    #[inline(always)]
+    pub fn subvec_dim(&self) -> usize {
+        self.pq.subvec_dim()
+    }
+
+    /// Return the number of centroids used for training
+    #[inline(always)]
+    pub fn n_centroids(&self) -> usize {
+        self.pq.n_centroids()
+    }
+
+    /// Get codebooks (for building lookup tables)
+    pub fn codebooks(&self) -> &[Vec<T>] {
+        self.pq.codebooks()
     }
 }

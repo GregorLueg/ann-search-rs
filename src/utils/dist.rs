@@ -71,6 +71,11 @@ where
     /// * `i` - Sample index i
     /// * `j` - Sample index j
     ///
+    /// ### Safety
+    ///
+    /// Uses unsafe to retrieve the data in an unchecked manner for maximum
+    /// performance.
+    ///
     /// ### Returns
     ///
     /// The squared Euclidean distance between the two samples
@@ -103,6 +108,11 @@ where
     /// * `internal_idx` - Index of internal vector
     /// * `query` - Query vector slice
     ///
+    /// ### Safety
+    ///
+    /// Uses unsafe to retrieve the data in an unchecked manner for maximum
+    /// performance.
+    ///
     /// ### Returns
     ///
     /// The squared Euclidean distance
@@ -128,15 +138,17 @@ where
 
     /// Cosine distance between two internal vectors
     ///
-    /// ### Cosine Distance
-    ///
-    /// cosine_dist(u, v) = 1 - (u·v) / (||u|| ||v||)
-    /// We pre-compute norms during initialisation to avoid repeated sqrt calls.
+    /// Uses pre-computed norms.
     ///
     /// ### Params
     ///
     /// * `i` - Sample index i
     /// * `j` - Sample index j
+    ///
+    /// ### Safety
+    ///
+    /// Uses unsafe to retrieve the data in an unchecked manner for maximum
+    /// performance.
     ///
     /// ### Returns
     ///
@@ -171,6 +183,11 @@ where
     /// * `query` - Query vector slice
     /// * `query_norm` - Pre-computed norm of query vector
     ///
+    /// ### Safety
+    ///
+    /// Uses unsafe to retrieve the data in an unchecked manner for maximum
+    /// performance.
+    ///
     /// ### Returns
     ///
     /// The Cosine distance
@@ -196,7 +213,7 @@ where
 // VectorDistanceSq8 //
 ///////////////////////
 
-/// Trait for computing distances between Floats
+/// Trait for computing distances between `i8`
 pub trait VectorDistanceSq8<T>
 where
     T: Float + FromPrimitive + ToPrimitive,
@@ -221,24 +238,33 @@ where
     /// * `internal_idx` - Index of internal vector
     /// * `query_i8` - Query vector slice quantised to i8
     ///
+    /// ### Safety
+    ///
+    /// Uses unsafe to retrieve the data in an unchecked manner for maximum
+    /// performance.
+    ///
     /// ### Returns
     ///
     /// The squared Euclidean distance
     #[inline(always)]
     fn euclidean_distance_i8(&self, internal_idx: usize, query_i8: &[i8]) -> T {
         let start = internal_idx * self.dim();
-        let db_vec = &self.vectors_flat_quantised()[start..start + self.dim()];
+        unsafe {
+            let db_vec = &self
+                .vectors_flat_quantised()
+                .get_unchecked(start..start + self.dim());
 
-        let sum: i32 = query_i8
-            .iter()
-            .zip(db_vec.iter())
-            .map(|(&q, &d)| {
-                let diff = q as i32 - d as i32;
-                diff * diff
-            })
-            .sum();
+            let sum: i32 = query_i8
+                .iter()
+                .zip(db_vec.iter())
+                .map(|(&q, &d)| {
+                    let diff = q as i32 - d as i32;
+                    diff * diff
+                })
+                .sum();
 
-        T::from_i32(sum).unwrap()
+            T::from_i32(sum).unwrap()
+        }
     }
 
     /// Calculate cosine distance against quantised query
@@ -249,29 +275,39 @@ where
     /// * `query_i8` - Query vector slice quantised to i8
     /// * `query_norm_sq` - Squared norm of the query vector
     ///
+    /// ### Safety
+    ///
+    /// Uses unsafe to retrieve the data in an unchecked manner for maximum
+    /// performance.
+    ///
     /// ### Returns
     ///
     /// The squared Euclidean distance
     #[inline(always)]
     fn cosine_distance_i8(&self, vec_idx: usize, query_i8: &[i8], query_norm_sq: i32) -> T {
         let start = vec_idx * self.dim();
-        let db_vec = &self.vectors_flat_quantised()[start..start + self.dim()];
 
-        let dot: i32 = query_i8
-            .iter()
-            .zip(db_vec.iter())
-            .map(|(&q, &d)| q as i32 * d as i32)
-            .sum();
+        unsafe {
+            let db_vec = &self
+                .vectors_flat_quantised()
+                .get_unchecked(start..start + self.dim());
 
-        let db_norm_sq: i32 = self.norms_quantised()[vec_idx];
+            let dot: i32 = query_i8
+                .iter()
+                .zip(db_vec.iter())
+                .map(|(&q, &d)| q as i32 * d as i32)
+                .sum();
 
-        let query_norm = T::from_i32(query_norm_sq).unwrap().sqrt();
-        let db_norm = T::from_i32(db_norm_sq).unwrap().sqrt();
+            let db_norm_sq: i32 = self.norms_quantised()[vec_idx];
 
-        if query_norm > T::zero() && db_norm > T::zero() {
-            T::one() - T::from_i32(dot).unwrap() / (query_norm * db_norm)
-        } else {
-            T::one()
+            let query_norm = T::from_i32(query_norm_sq).unwrap().sqrt();
+            let db_norm = T::from_i32(db_norm_sq).unwrap().sqrt();
+
+            if query_norm > T::zero() && db_norm > T::zero() {
+                T::one() - T::from_i32(dot).unwrap() / (query_norm * db_norm)
+            } else {
+                T::one()
+            }
         }
     }
 }
@@ -295,6 +331,8 @@ pub fn euclidean_distance_static<T>(a: &[T], b: &[T]) -> T
 where
     T: Float,
 {
+    assert!(a.len() == b.len(), "Vectors a and b need to have same len!");
+
     a.iter()
         .zip(b.iter())
         .map(|(&x, &y)| {
@@ -321,6 +359,8 @@ pub fn cosine_distance_static<T>(a: &[T], b: &[T]) -> T
 where
     T: Float,
 {
+    assert!(a.len() == b.len(), "Vectors a and b need to have same len!");
+
     let dot: T = a
         .iter()
         .zip(b.iter())

@@ -305,12 +305,27 @@ fn parallel_lloyd<T>(
 //////////
 
 /// Train k-means centroids
+///
+/// ### Params
+///
+/// * `data` - The original data flattened
+/// * `dim` - The dimensions of the data
+/// * `n` - Number of samples in the data
+/// * `n_centroids` - Number of centroids to identify
+/// * `metric` - Distance metric to use
+/// * `max_iters` - Maximum iterations for the k-means clustering.
+/// * `seed` - Seed for reproducibility
+/// * `verbose` - Controls verbosity of the function
+///
+/// ### Returns
+///
+/// Centroid assignment
 #[allow(clippy::too_many_arguments)]
 pub fn train_centroids<T>(
     data: &[T],
     dim: usize,
     n: usize,
-    nlist: usize,
+    n_centroids: usize,
     metric: &Dist,
     max_iters: usize,
     seed: usize,
@@ -319,16 +334,16 @@ pub fn train_centroids<T>(
 where
     T: Float + FromPrimitive + ToPrimitive + Send + Sync,
 {
-    let mut centroids = if nlist > 200 {
+    let mut centroids = if n_centroids > 200 {
         if verbose {
             println!("  Initialising centroids via fast random selection");
         }
-        fast_random_init(data, dim, n, nlist, seed)
+        fast_random_init(data, dim, n, n_centroids, seed)
     } else {
         if verbose {
             println!("  Initialising centroids via k-means||");
         }
-        kmeans_parallel_init(data, dim, n, nlist, metric, seed)
+        kmeans_parallel_init(data, dim, n, n_centroids, metric, seed)
     };
 
     if verbose {
@@ -339,7 +354,7 @@ where
         dim,
         n,
         &mut centroids,
-        nlist,
+        n_centroids,
         metric,
         max_iters,
         verbose,

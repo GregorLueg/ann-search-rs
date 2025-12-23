@@ -94,7 +94,7 @@ fn main() {
         );
         let build_time = start.elapsed().as_secs_f64() * 1000.0;
 
-        let search_budgets = [(None, "auto"), (Some(5000), "5k_cand")];
+        let search_budgets = [(None, "auto"), (Some(5000), "5k")];
         for (max_cand, cand_label) in search_budgets {
             println!("Querying LSH index (cand={})...", cand_label);
             let start = Instant::now();
@@ -113,7 +113,7 @@ fn main() {
             println!("  Internal validation: {:.3}", internal_recall);
 
             results.push(BenchmarkResult {
-                method: format!("LSH-nt{}-bits{}:{}", num_tables, bits_per_hash, cand_label),
+                method: format!("LSH-nt{}-nb{}:-s:{}", num_tables, bits_per_hash, cand_label),
                 build_time_ms: build_time,
                 query_time_ms: query_time,
                 total_time_ms: build_time + query_time,

@@ -91,6 +91,115 @@ where
     data
 }
 
+/// Generate synthetic single-cell-like data with cluster structure
+///
+/// Designed to generate synthetic data for higher dimensionality
+///
+/// ### Params
+///
+/// * `n_samples` - Number of cells (samples)
+/// * `dim` - Embedding dimensionality
+/// * `n_clusters` - Number of distinct clusters
+/// * `cluster_std` - Standard deviation within clusters
+/// * `seed` - Random seed for reproducibility
+///
+/// ### Returns
+///
+/// Matrix of shape (n_samples, dim)
+pub fn generate_clustered_data_high_dim<T>(
+    n_samples: usize,
+    dim: usize,
+    n_clusters: usize,
+    seed: u64,
+) -> Mat<T>
+where
+    T: Float + FromPrimitive + ComplexField,
+{
+    let mut rng = StdRng::seed_from_u64(seed);
+    let mut data = Mat::<T>::zeros(n_samples, dim);
+
+    // scale centre range with dimension to maintain separation
+    let scale = (dim as f64).sqrt() * 2.0;
+
+    // generate well-separated centres
+    let mut centres = Vec::with_capacity(n_clusters);
+    let min_separation = scale * 0.8;
+
+    for _ in 0..n_clusters {
+        let centre = loop {
+            let candidate: Vec<f64> = (0..dim).map(|_| rng.random_range(-scale..scale)).collect();
+
+            // ensure minimum distance from existing centres
+            let too_close = centres.iter().any(|existing: &Vec<f64>| {
+                let dist_sq: f64 = candidate
+                    .iter()
+                    .zip(existing.iter())
+                    .map(|(a, b)| (a - b).powi(2))
+                    .sum();
+                dist_sq < min_separation.powi(2)
+            });
+
+            if !too_close {
+                break candidate;
+            }
+        };
+        centres.push(centre);
+    }
+
+    // subspace structure: each cluster varies mainly in a subset of dimensions
+    let active_dims_per_cluster = (dim / 2).max(3);
+    let cluster_active_dims: Vec<Vec<usize>> = centres
+        .iter()
+        .map(|_| {
+            let mut dims: Vec<usize> = (0..dim).collect();
+            dims.shuffle(&mut rng);
+            dims.truncate(active_dims_per_cluster);
+            dims
+        })
+        .collect();
+
+    let mut cluster_stds = Vec::new();
+    for _ in 0..n_clusters {
+        cluster_stds.push(rng.random_range(0.3..1.0) * scale / 10.0);
+    }
+
+    // assign samples
+    let mut cluster_assignments = Vec::new();
+    for cluster_idx in 0..n_clusters {
+        let weight = rng.random_range(0.5..2.5);
+        let n_in_cluster = ((n_samples as f64 * weight) / (n_clusters as f64 * 1.25)) as usize;
+        cluster_assignments.extend(vec![cluster_idx; n_in_cluster]);
+    }
+
+    while cluster_assignments.len() < n_samples {
+        cluster_assignments.push(rng.random_range(0..n_clusters));
+    }
+    cluster_assignments.shuffle(&mut rng);
+    cluster_assignments.truncate(n_samples);
+
+    // generate samples with subspace structure
+    for (i, &cluster_idx) in cluster_assignments.iter().enumerate() {
+        let centre = &centres[cluster_idx];
+        let std = cluster_stds[cluster_idx];
+        let active_dims = &cluster_active_dims[cluster_idx];
+
+        for j in 0..dim {
+            let noise_scale = if active_dims.contains(&j) {
+                std
+            } else {
+                std * 0.1
+            };
+
+            let u1: f64 = rng.random();
+            let u2: f64 = rng.random();
+            let noise = (-2.0 * u1.ln()).sqrt() * (2.0 * std::f64::consts::PI * u2).cos();
+            data[(i, j)] = T::from_f64(centre[j] + noise * noise_scale).unwrap();
+        }
+    }
+
+    data
+}
+
 /// BenchmarkResult
 ///
 /// ### Fields
