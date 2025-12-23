@@ -12,14 +12,42 @@ use rustc_hash::FxHashSet;
 
 pub const DEFAULT_N_CELLS: usize = 150_000;
 pub const DEFAULT_DIM: usize = 32;
-pub const DEFAULT_N_CLUSTERS: usize = 20;
+pub const DEFAULT_N_CLUSTERS: usize = 25;
 pub const DEFAULT_K: usize = 15;
 pub const DEFAULT_SEED: u64 = 10101;
 pub const DEFAULT_DISTANCE: &str = "euclidean";
+pub const DEFAULT_COR_STRENGTH: f64 = 0.5;
+pub const DEFAULT_DATA: &str = "gaussian";
 
 /////////////
 // Helpers //
 /////////////
+
+#[derive(Clone, Debug, Copy, PartialEq, Default)]
+pub enum SyntheticData {
+    /// Default synthetic data
+    #[default]
+    GaussianNoise,
+    /// Synthetic data designed to work with high dimensionality
+    Correlated,
+}
+
+/// Helper function to parse the data type
+///
+/// ### Params
+///
+/// * `s` - The string to parse
+///
+/// ### Returns
+///
+/// `Option<SyntheticData>`
+pub fn parse_data(s: &str) -> Option<SyntheticData> {
+    match s.to_lowercase().as_str() {
+        "gaussian" => Some(SyntheticData::GaussianNoise),
+        "correlated" => Some(SyntheticData::Correlated),
+        _ => None,
+    }
+}
 
 /// Generate synthetic single-cell-like data with cluster structure
 ///
@@ -91,16 +119,17 @@ where
     data
 }
 
-/// Generate synthetic single-cell-like data with cluster structure
+/// Generate synthetic single-cell-like data with cluster structure and correlated dimensions
 ///
-/// Designed to generate synthetic data for higher dimensionality
+/// Creates well-separated clusters with subspace structure plus inter-dimension
+/// correlations that OPQ can exploit.
 ///
 /// ### Params
 ///
 /// * `n_samples` - Number of cells (samples)
 /// * `dim` - Embedding dimensionality
 /// * `n_clusters` - Number of distinct clusters
-/// * `cluster_std` - Standard deviation within clusters
+/// * `correlation_strength` - How strongly correlated dims depend on source dims (0.0-1.0)
 /// * `seed` - Random seed for reproducibility
 ///
 /// ### Returns
@@ -110,6 +139,7 @@ pub fn generate_clustered_data_high_dim<T>(
     n_samples: usize,
     dim: usize,
     n_clusters: usize,
+    correlation_strength: f64,
     seed: u64,
 ) -> Mat<T>
 where
@@ -118,7 +148,6 @@ where
     let mut rng = StdRng::seed_from_u64(seed);
     let mut data = Mat::<T>::zeros(n_samples, dim);
 
-    // scale centre range with dimension to maintain separation
     let scale = (dim as f64).sqrt() * 2.0;
 
     // generate well-separated centres
@@ -128,8 +157,6 @@ where
     for _ in 0..n_clusters {
         let centre = loop {
             let candidate: Vec<f64> = (0..dim).map(|_| rng.random_range(-scale..scale)).collect();
-
-            // ensure minimum distance from existing centres
             let too_close = centres.iter().any(|existing: &Vec<f64>| {
                 let dist_sq: f64 = candidate
                     .iter()
@@ -138,7 +165,6 @@ where
                     .sum();
                 dist_sq < min_separation.powi(2)
             });
-
             if !too_close {
                 break candidate;
             }
@@ -146,7 +172,7 @@ where
         centres.push(centre);
     }
 
-    // subspace structure: each cluster varies mainly in a subset of dimensions
+    // subspace structure
     let active_dims_per_cluster = (dim / 2).max(3);
     let cluster_active_dims: Vec<Vec<usize>> = centres
         .iter()
@@ -170,14 +196,13 @@ where
         let n_in_cluster = ((n_samples as f64 * weight) / (n_clusters as f64 * 1.25)) as usize;
         cluster_assignments.extend(vec![cluster_idx; n_in_cluster]);
     }
-
     while cluster_assignments.len() < n_samples {
         cluster_assignments.push(rng.random_range(0..n_clusters));
     }
     cluster_assignments.shuffle(&mut rng);
     cluster_assignments.truncate(n_samples);
 
-    // generate samples with subspace structure
+    // generate base samples
     for (i, &cluster_idx) in cluster_assignments.iter().enumerate() {
         let centre = &centres[cluster_idx];
         let std = cluster_stds[cluster_idx];
@@ -189,11 +214,46 @@ where
             } else {
                 std * 0.1
             };
-
             let u1: f64 = rng.random();
             let u2: f64 = rng.random();
             let noise = (-2.0 * u1.ln()).sqrt() * (2.0 * std::f64::consts::PI * u2).cos();
             data[(i, j)] = T::from_f64(centre[j] + noise * noise_scale).unwrap();
+        }
+    }
+
+    // add correlation structure: groups of dimensions that are linear combinations
+    // of "source" dimensions plus noise
+    let n_correlation_groups = dim / 8;
+    let dims_per_group = 4;
+    let noise_weight = 1.0 - correlation_strength;
+
+    for group in 0..n_correlation_groups {
+        let source_dim = group * 8;
+        if source_dim >= dim {
+            break;
+        }
+
+        // generate random mixing coefficients for this group
+        let coeffs: Vec<f64> = (0..dims_per_group)
+            .map(|_| rng.random_range(-2.0..2.0))
+            .collect();
+
+        for target_offset in 1..=dims_per_group {
+            let target_dim = source_dim + target_offset;
+            if target_dim >= dim {
+                break;
+            }
+
+            for i in 0..n_samples {
+                let source_val = data[(i, source_dim)].to_f64().unwrap();
+                let original_val = data[(i, target_dim)].to_f64().unwrap();
+
+                // correlated value = weighted sum of source + original noise
+                let correlated = source_val * coeffs[target_offset - 1] * correlation_strength
+                    + original_val * noise_weight;
+
+                data[(i, target_dim)] = T::from_f64(correlated).unwrap();
+            }
         }
     }
 
