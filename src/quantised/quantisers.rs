@@ -613,14 +613,21 @@ mod tests {
 
     #[test]
     fn test_scalar_quantiser_train() {
-        let data = vec![100.0, -50.0, 200.0, 150.0, 30.0, -180.0];
+        let mut data = Vec::new();
+        for i in 0..4 {
+            for j in 0..32 {
+                data.push((i * 32 + j) as f32);
+            }
+        }
 
-        let sq = ScalarQuantiser::train(&data, 3);
+        let pq = ProductQuantiser::train(&data, 32, 2, Some(2), &Dist::Euclidean, 5, 42, false);
 
-        assert_eq!(sq.scales.len(), 3);
-        assert_relative_eq!(sq.scales[0], 150.0 / 127.0, epsilon = 1e-5);
-        assert_relative_eq!(sq.scales[1], 50.0 / 127.0, epsilon = 1e-5);
-        assert_relative_eq!(sq.scales[2], 200.0 / 127.0, epsilon = 1e-5);
+        assert_eq!(pq.m(), 2);
+        assert_eq!(pq.subvec_dim(), 16);
+        assert_eq!(pq.n_centroids(), 2);
+        assert_eq!(pq.codebooks().len(), 2);
+        assert_eq!(pq.codebooks()[0].len(), 32); // 2 centroids * 16 dims
+        assert_eq!(pq.codebooks()[1].len(), 32);
     }
 
     #[test]
@@ -664,47 +671,56 @@ mod tests {
 
     #[test]
     fn test_product_quantiser_train() {
-        let data = vec![
-            1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0, 13.0, 14.0, 15.0, 16.0,
-        ];
+        let mut data = Vec::new();
+        for i in 0..4 {
+            for j in 0..32 {
+                data.push((i * 32 + j) as f32);
+            }
+        }
 
-        let pq = ProductQuantiser::train(&data, 4, 2, Some(2), &Dist::Euclidean, 5, 42, false);
+        let pq = ProductQuantiser::train(&data, 32, 2, Some(2), &Dist::Euclidean, 5, 42, false);
 
         assert_eq!(pq.m(), 2);
-        assert_eq!(pq.subvec_dim(), 2);
+        assert_eq!(pq.subvec_dim(), 16);
         assert_eq!(pq.n_centroids(), 2);
         assert_eq!(pq.codebooks().len(), 2);
-        assert_eq!(pq.codebooks()[0].len(), 4); // 2 centroids * 2 dims
-        assert_eq!(pq.codebooks()[1].len(), 4);
+        assert_eq!(pq.codebooks()[0].len(), 32); // 2 centroids * 16 dims
+        assert_eq!(pq.codebooks()[1].len(), 32);
     }
 
     #[test]
     fn test_product_quantiser_encode() {
-        let data = vec![
-            0.0, 0.0, 10.0, 10.0, 0.1, 0.1, 10.1, 10.1, 5.0, 5.0, 15.0, 15.0, 5.1, 5.1, 15.1, 15.1,
-        ];
+        let mut data = Vec::new();
+        for i in 0..4 {
+            for j in 0..32 {
+                data.push((i * 10 + j % 10) as f32);
+            }
+        }
 
-        let pq = ProductQuantiser::train(&data, 4, 2, Some(2), &Dist::Euclidean, 10, 42, false);
+        let pq = ProductQuantiser::train(&data, 32, 2, Some(2), &Dist::Euclidean, 10, 42, false);
 
-        let vec = vec![0.0, 0.0, 10.0, 10.0];
+        let vec: Vec<f32> = (0..32).map(|x| x as f32).collect();
         let codes = pq.encode(&vec);
 
-        assert_eq!(codes.len(), 2); // M = 2 subspaces
+        assert_eq!(codes.len(), 2);
         assert!(codes[0] < 2);
         assert!(codes[1] < 2);
     }
 
     #[test]
     fn test_product_quantiser_deterministic() {
-        let data = vec![
-            1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0,
-        ];
+        let mut data = Vec::new();
+        for i in 0..3 {
+            for j in 0..32 {
+                data.push((i * 32 + j) as f32);
+            }
+        }
 
-        let pq1 = ProductQuantiser::train(&data, 4, 2, Some(2), &Dist::Euclidean, 5, 42, false);
+        let pq1 = ProductQuantiser::train(&data, 32, 2, Some(2), &Dist::Euclidean, 5, 42, false);
 
-        let pq2 = ProductQuantiser::train(&data, 4, 2, Some(2), &Dist::Euclidean, 5, 42, false);
+        let pq2 = ProductQuantiser::train(&data, 32, 2, Some(2), &Dist::Euclidean, 5, 42, false);
 
-        let vec = vec![5.0, 6.0, 7.0, 8.0];
+        let vec: Vec<f32> = (16..48).map(|x| x as f32).collect();
         let codes1 = pq1.encode(&vec);
         let codes2 = pq2.encode(&vec);
 

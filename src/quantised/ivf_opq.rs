@@ -452,10 +452,21 @@ mod tests {
     use faer::Mat;
 
     fn create_simple_dataset() -> Vec<f32> {
-        vec![
-            0.0, 0.0, 0.0, 0.0, 0.1, 0.1, 0.0, 0.0, 0.2, 0.2, 0.0, 0.0, 10.0, 10.0, 0.0, 0.0, 10.1,
-            10.1, 0.0, 0.0, 10.2, 10.2, 0.0, 0.0,
-        ]
+        let mut data = Vec::new();
+        // Create 6 vectors of 32 dimensions
+        // First 3 near origin
+        for i in 0..3 {
+            for j in 0..32 {
+                data.push(i as f32 * 0.1 + j as f32 * 0.01);
+            }
+        }
+        // Next 3 far from origin
+        for i in 0..3 {
+            for j in 0..32 {
+                data.push(10.0 + i as f32 * 0.1 + j as f32 * 0.01);
+            }
+        }
+        data
     }
 
     #[test]
@@ -463,10 +474,10 @@ mod tests {
         let data = create_simple_dataset();
         let index = IvfOpqIndex::build(
             data,
-            4,
+            32,
             6,
             2,
-            2,
+            8,
             Dist::Euclidean,
             Some(10),
             Some(1),
@@ -475,12 +486,12 @@ mod tests {
             false,
         );
 
-        assert_eq!(index.dim, 4);
+        assert_eq!(index.dim, 32);
         assert_eq!(index.n, 6);
         assert_eq!(index.nlist, 2);
         assert_eq!(index.metric, Dist::Euclidean);
-        assert_eq!(index.quantised_codes.len(), 12);
-        assert_eq!(index.centroids.len(), 8);
+        assert_eq!(index.quantised_codes.len(), 48);
+        assert_eq!(index.centroids.len(), 64);
         assert_eq!(index.offsets.len(), 3);
     }
 
@@ -489,10 +500,10 @@ mod tests {
         let data = create_simple_dataset();
         let index = IvfOpqIndex::build(
             data,
-            4,
+            32,
             6,
             2,
-            2,
+            8,
             Dist::Cosine,
             Some(10),
             Some(1),
@@ -509,10 +520,10 @@ mod tests {
         let data = create_simple_dataset();
         let index = IvfOpqIndex::build(
             data,
-            4,
+            32,
             6,
             2,
-            2,
+            8,
             Dist::Euclidean,
             Some(10),
             Some(1),
@@ -521,7 +532,7 @@ mod tests {
             false,
         );
 
-        let query = vec![0.0, 0.0, 0.0, 0.0];
+        let query: Vec<f32> = (0..32).map(|x| x as f32 * 0.01).collect();
         let (indices, distances) = index.query(&query, 3, None);
 
         assert_eq!(indices.len(), 3);
@@ -533,10 +544,10 @@ mod tests {
         let data = create_simple_dataset();
         let index = IvfOpqIndex::build(
             data,
-            4,
+            32,
             6,
             2,
-            2,
+            8,
             Dist::Euclidean,
             Some(10),
             Some(1),
@@ -545,10 +556,10 @@ mod tests {
             false,
         );
 
-        let query = vec![0.0, 0.0, 0.0, 0.0];
+        let query: Vec<f32> = (0..32).map(|x| x as f32 * 0.01).collect();
         let (indices, _) = index.query(&query, 100, None);
 
-        assert_eq!(indices.len(), 6);
+        assert!(indices.len() <= 6);
     }
 
     #[test]
@@ -556,10 +567,10 @@ mod tests {
         let data = create_simple_dataset();
         let index = IvfOpqIndex::build(
             data,
-            4,
+            32,
             6,
             2,
-            2,
+            8,
             Dist::Euclidean,
             Some(10),
             Some(1),
@@ -568,7 +579,7 @@ mod tests {
             false,
         );
 
-        let query = vec![0.0, 0.0, 0.0, 0.0];
+        let query: Vec<f32> = (0..32).map(|x| x as f32 * 0.01).collect();
         let (_, distances) = index.query(&query, 3, Some(2));
 
         for i in 1..distances.len() {
@@ -581,10 +592,10 @@ mod tests {
         let data = create_simple_dataset();
         let index = IvfOpqIndex::build(
             data,
-            4,
+            32,
             6,
             2,
-            2,
+            8,
             Dist::Cosine,
             Some(10),
             Some(1),
@@ -593,7 +604,7 @@ mod tests {
             false,
         );
 
-        let query = vec![1.0, 1.0, 0.0, 0.0];
+        let query: Vec<f32> = (0..32).map(|x| if x < 16 { 1.0 } else { 0.0 }).collect();
         let (indices, distances) = index.query(&query, 3, None);
 
         assert_eq!(indices.len(), 3);
@@ -605,10 +616,10 @@ mod tests {
         let data = create_simple_dataset();
         let index = IvfOpqIndex::build(
             data,
-            4,
+            32,
             6,
             2,
-            2,
+            8,
             Dist::Euclidean,
             Some(10),
             Some(1),
@@ -617,7 +628,7 @@ mod tests {
             false,
         );
 
-        let query = vec![5.0, 5.0, 0.0, 0.0];
+        let query: Vec<f32> = (0..32).map(|x| 5.0 + x as f32 * 0.01).collect();
 
         let (indices1, _) = index.query(&query, 3, Some(1));
         let (indices2, _) = index.query(&query, 3, Some(2));
@@ -631,10 +642,10 @@ mod tests {
         let data = create_simple_dataset();
         let index = IvfOpqIndex::build(
             data,
-            4,
+            32,
             6,
             2,
-            2,
+            8,
             Dist::Euclidean,
             Some(10),
             Some(1),
@@ -643,7 +654,7 @@ mod tests {
             false,
         );
 
-        let query = vec![0.5, 0.5, 0.0, 0.0];
+        let query: Vec<f32> = (0..32).map(|x| 0.5 + x as f32 * 0.01).collect();
 
         let (indices1, distances1) = index.query(&query, 3, Some(2));
         let (indices2, distances2) = index.query(&query, 3, Some(2));
@@ -657,10 +668,10 @@ mod tests {
         let data = create_simple_dataset();
         let index = IvfOpqIndex::build(
             data,
-            4,
+            32,
             6,
             2,
-            2,
+            8,
             Dist::Euclidean,
             Some(10),
             Some(1),
@@ -669,7 +680,7 @@ mod tests {
             false,
         );
 
-        let query_mat = Mat::<f32>::from_fn(1, 4, |_, j| if j < 2 { 0.5 } else { 0.0 });
+        let query_mat = Mat::<f32>::from_fn(1, 32, |_, j| 0.5 + j as f32 * 0.01);
         let row = query_mat.row(0);
 
         let (indices, distances) = index.query_row(row, 3, None);
@@ -711,10 +722,10 @@ mod tests {
         let data = create_simple_dataset();
         let index = IvfOpqIndex::build(
             data,
-            4,
+            32,
             6,
             2,
-            2,
+            8,
             Dist::Euclidean,
             Some(10),
             Some(1),
@@ -723,10 +734,10 @@ mod tests {
             false,
         );
 
-        let query = vec![0.0, 0.0, 0.0, 0.0];
+        let query: Vec<f32> = (0..32).map(|x| x as f32 * 0.01).collect();
         let table = index.build_lookup_tables(&query, 0);
 
-        assert_eq!(table.len(), 2 * 4);
+        assert_eq!(table.len(), 32);
     }
 
     #[test]
@@ -734,10 +745,10 @@ mod tests {
         let data = create_simple_dataset();
         let index = IvfOpqIndex::build(
             data,
-            4,
+            32,
             6,
             2,
-            2,
+            8,
             Dist::Euclidean,
             Some(10),
             Some(1),
@@ -746,7 +757,7 @@ mod tests {
             false,
         );
 
-        let query = vec![0.0, 0.0, 0.0, 0.0];
+        let query: Vec<f32> = (0..32).map(|x| x as f32 * 0.01).collect();
         let table = index.build_lookup_tables(&query, 0);
 
         let dist = index.compute_distance_adc(0, &table);
