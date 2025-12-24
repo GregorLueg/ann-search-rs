@@ -1,7 +1,15 @@
 use faer::RowRef;
 use num_traits::{Float, FromPrimitive, ToPrimitive};
 use rayon::prelude::*;
-use std::{collections::BinaryHeap, iter::Sum};
+use std::{
+    collections::BinaryHeap,
+    iter::Sum,
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    },
+};
+use thousands::*;
 
 use crate::quantised::quantisers::*;
 use crate::utils::dist::*;
@@ -235,8 +243,9 @@ where
             normalise_vector(&mut query_vec);
         }
 
-        let nprobe = nprobe.unwrap_or_else(|| (((self.nlist as f64) * 0.15) as usize).max(1));
-        let nprobe = nprobe.min(self.nlist);
+        let nprobe = nprobe
+            .unwrap_or_else(|| ((self.nlist as f64).sqrt() as usize).max(1))
+            .min(self.nlist);
         let k = k.min(self.n);
 
         // Find top nprobe centroids
@@ -325,6 +334,143 @@ where
 
         let query_vec: Vec<T> = query_row.iter().cloned().collect();
         self.query(&query_vec, k, nprobe)
+    }
+
+    /// Build a kNN graph directly from the quantised vectors
+    ///
+    /// More efficient than query_row for self-querying since vectors are
+    /// already quantised. Uses the inverted index structure to limit search
+    /// space.
+    ///
+    /// ### Params
+    ///
+    /// * `k` - Number of neighbours per vector
+    /// * `nprobe` - Number of clusters to search per vector (defaults to
+    ///   `sqrt(n_list)`).
+    /// * `verbose` - Controls verbosity
+    ///
+    /// ### Returns
+    ///
+    /// Vector of k nearest neighbour indices for each vector (excluding self)
+    pub fn build_knn_graph(
+        &self,
+        k: usize,
+        nprobe: Option<usize>,
+        verbose: bool,
+    ) -> Vec<Vec<usize>> {
+        let nprobe = nprobe
+            .unwrap_or_else(|| ((self.nlist as f64).sqrt() as usize).max(1))
+            .min(self.nlist);
+        let k = k.min(self.n);
+
+        // find cluster assignment for each vector
+        let cluster_assignments: Vec<usize> = self.all_indices.iter().enumerate().fold(
+            vec![0; self.n],
+            |mut acc, (pos, &vec_idx)| {
+                let cluster = self.offsets.partition_point(|&offset| offset <= pos) - 1;
+                acc[vec_idx] = cluster;
+                acc
+            },
+        );
+
+        let counter = Arc::new(AtomicUsize::new(0));
+
+        (0..self.n)
+            .into_par_iter()
+            .map(|vec_idx| {
+                let my_cluster = cluster_assignments[vec_idx];
+
+                // Find nprobe nearest clusters to this vector's centroid
+                let my_centroid =
+                    &self.centroids[my_cluster * self.dim..(my_cluster + 1) * self.dim];
+
+                let mut cluster_dists: Vec<(T, usize)> = (0..self.nlist)
+                    .filter(|&c| c != my_cluster)
+                    .map(|c| {
+                        let cent = &self.centroids[c * self.dim..(c + 1) * self.dim];
+                        let dist = match self.metric {
+                            Dist::Cosine => {
+                                let ip: T = my_centroid
+                                    .iter()
+                                    .zip(cent.iter())
+                                    .map(|(&a, &b)| a * b)
+                                    .sum();
+                                T::one() - ip
+                            }
+                            Dist::Euclidean => my_centroid
+                                .iter()
+                                .zip(cent.iter())
+                                .map(|(&a, &b)| (a - b) * (a - b))
+                                .sum(),
+                        };
+                        (dist, c)
+                    })
+                    .collect();
+
+                cluster_dists.push((T::zero(), my_cluster));
+
+                if nprobe < cluster_dists.len() {
+                    cluster_dists
+                        .select_nth_unstable_by(nprobe, |a, b| a.0.partial_cmp(&b.0).unwrap());
+                }
+
+                let query_quantised =
+                    &self.quantised_vectors[vec_idx * self.dim..(vec_idx + 1) * self.dim];
+                let query_norm_sq = if self.metric == Dist::Cosine {
+                    self.quantised_norms[vec_idx]
+                } else {
+                    0
+                };
+
+                let mut heap: BinaryHeap<(OrderedFloat<T>, usize)> =
+                    BinaryHeap::with_capacity(k + 2);
+
+                for &(_, cluster_idx) in cluster_dists.iter().take(nprobe) {
+                    let start = self.offsets[cluster_idx];
+                    let end = self.offsets[cluster_idx + 1];
+
+                    for &candidate_idx in &self.all_indices[start..end] {
+                        if candidate_idx == vec_idx {
+                            continue;
+                        }
+
+                        let dist = match self.metric {
+                            Dist::Cosine => self.cosine_distance_i8(
+                                candidate_idx,
+                                query_quantised,
+                                query_norm_sq,
+                            ),
+                            Dist::Euclidean => {
+                                self.euclidean_distance_i8(candidate_idx, query_quantised)
+                            }
+                        };
+
+                        if heap.len() < k {
+                            heap.push((OrderedFloat(dist), candidate_idx));
+                        } else if dist < heap.peek().unwrap().0 .0 {
+                            heap.pop();
+                            heap.push((OrderedFloat(dist), candidate_idx));
+                        }
+                    }
+                }
+
+                let mut results: Vec<_> = heap.into_iter().collect();
+                results.sort_unstable_by_key(|&(dist, _)| dist);
+
+                if verbose {
+                    let count = counter.fetch_add(1, Ordering::Relaxed) + 1;
+                    if count.is_multiple_of(100_000) {
+                        println!(
+                            " Processed {} / {} samples.",
+                            count.separate_with_underscores(),
+                            self.n.separate_with_underscores()
+                        );
+                    }
+                }
+
+                results.into_iter().map(|(_, idx)| idx).collect()
+            })
+            .collect()
     }
 }
 
