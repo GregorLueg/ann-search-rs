@@ -42,8 +42,9 @@ impl<T: Float> Ord for OrderedFloat<T> {
 
 /// Sorted buffer optimised for small result sets
 ///
-/// Maintains elements in ascending order. For typical HNSW queries
-/// with ef=50-200, this is 20-30% faster than BinaryHeap due to:
+/// Maintains elements in ascending order. For smaller data sets, this can
+/// be faster than using heap.
+/// 
 /// - Better cache locality (sequential access)
 /// - Fewer comparisons (binary search vs heap operations)
 /// - No heap maintenance overhead

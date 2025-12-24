@@ -361,9 +361,41 @@ where
         let nprobe = nprobe
             .unwrap_or_else(|| ((self.nlist as f64).sqrt() as usize).max(1))
             .min(self.nlist);
-        let k = k.min(self.n);
 
-        // find cluster assignment for each vector
+        // pre-compute centroid neighbours once
+        let centroid_neighbours: Vec<Vec<usize>> = (0..self.nlist)
+            .into_par_iter()
+            .map(|c| {
+                let cent = &self.centroids[c * self.dim..(c + 1) * self.dim];
+                let mut dists: Vec<(T, usize)> = (0..self.nlist)
+                    .filter(|&other| other != c)
+                    .map(|other| {
+                        let other_cent = &self.centroids[other * self.dim..(other + 1) * self.dim];
+                        let dist = match self.metric {
+                            Dist::Cosine => {
+                                T::one()
+                                    - cent
+                                        .iter()
+                                        .zip(other_cent.iter())
+                                        .map(|(&a, &b)| a * b)
+                                        .sum::<T>()
+                            }
+                            Dist::Euclidean => cent
+                                .iter()
+                                .zip(other_cent.iter())
+                                .map(|(&a, &b)| (a - b) * (a - b))
+                                .sum::<T>(),
+                        };
+                        (dist, other)
+                    })
+                    .collect();
+
+                dists.sort_unstable_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+                dists.into_iter().take(nprobe).map(|(_, idx)| idx).collect()
+            })
+            .collect();
+
+        // find cluster assignments
         let cluster_assignments: Vec<usize> = self.all_indices.iter().enumerate().fold(
             vec![0; self.n],
             |mut acc, (pos, &vec_idx)| {
@@ -380,39 +412,11 @@ where
             .map(|vec_idx| {
                 let my_cluster = cluster_assignments[vec_idx];
 
-                // Find nprobe nearest clusters to this vector's centroid
-                let my_centroid =
-                    &self.centroids[my_cluster * self.dim..(my_cluster + 1) * self.dim];
-
-                let mut cluster_dists: Vec<(T, usize)> = (0..self.nlist)
-                    .filter(|&c| c != my_cluster)
-                    .map(|c| {
-                        let cent = &self.centroids[c * self.dim..(c + 1) * self.dim];
-                        let dist = match self.metric {
-                            Dist::Cosine => {
-                                let ip: T = my_centroid
-                                    .iter()
-                                    .zip(cent.iter())
-                                    .map(|(&a, &b)| a * b)
-                                    .sum();
-                                T::one() - ip
-                            }
-                            Dist::Euclidean => my_centroid
-                                .iter()
-                                .zip(cent.iter())
-                                .map(|(&a, &b)| (a - b) * (a - b))
-                                .sum(),
-                        };
-                        (dist, c)
-                    })
+                // use pre-computed neighbours instead of recalculating
+                let clusters_to_search: Vec<usize> = std::iter::once(my_cluster)
+                    .chain(centroid_neighbours[my_cluster].iter().copied())
+                    .take(nprobe)
                     .collect();
-
-                cluster_dists.push((T::zero(), my_cluster));
-
-                if nprobe < cluster_dists.len() {
-                    cluster_dists
-                        .select_nth_unstable_by(nprobe, |a, b| a.0.partial_cmp(&b.0).unwrap());
-                }
 
                 let query_quantised =
                     &self.quantised_vectors[vec_idx * self.dim..(vec_idx + 1) * self.dim];
@@ -425,7 +429,7 @@ where
                 let mut heap: BinaryHeap<(OrderedFloat<T>, usize)> =
                     BinaryHeap::with_capacity(k + 2);
 
-                for &(_, cluster_idx) in cluster_dists.iter().take(nprobe) {
+                for cluster_idx in clusters_to_search {
                     let start = self.offsets[cluster_idx];
                     let end = self.offsets[cluster_idx + 1];
 
