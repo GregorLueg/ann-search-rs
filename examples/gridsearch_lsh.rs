@@ -113,7 +113,7 @@ fn main() {
             println!("  Internal validation: {:.3}", internal_recall);
 
             results.push(BenchmarkResult {
-                method: format!("LSH-nt{}-nb{}:-s:{}", num_tables, bits_per_hash, cand_label),
+                method: format!("LSH-nt{}-nb{}-s:{}", num_tables, bits_per_hash, cand_label),
                 build_time_ms: build_time,
                 query_time_ms: query_time,
                 total_time_ms: build_time + query_time,

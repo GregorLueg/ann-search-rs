@@ -1,6 +1,6 @@
 use faer::RowRef;
 use num_traits::{Float, FromPrimitive, ToPrimitive};
-use std::{collections::BinaryHeap, iter::Sum};
+use std::iter::Sum;
 
 use crate::utils::dist::*;
 use crate::utils::heap_structs::*;
@@ -87,8 +87,8 @@ where
     /// * `n` - Number of vectors
     /// * `norms` - Pre-computed norms for Cosine distance (empty for Euclidean)
     /// * `metric` - Distance metric (Euclidean or Cosine)
-    /// * `nlist` - Number of clusters (more = faster search, lower recall)
-    /// * `max_iters` - Maximum k-means iterations (defaults to 30)
+    /// * `nlist` - Optional number of clusters. Defaults to `sqrt(n)`.
+    /// * `max_iters` - Maximum k-means iterations (defaults to `30`)
     /// * `seed` - Random seed for reproducibility
     /// * `verbose` - Print training progress
     ///
@@ -102,12 +102,13 @@ where
         n: usize,
         norms: Vec<T>,
         metric: Dist,
-        nlist: usize,
+        nlist: Option<usize>,
         max_iters: Option<usize>,
         seed: usize,
         verbose: bool,
     ) -> Self {
         let max_iters = max_iters.unwrap_or(30);
+        let nlist = nlist.unwrap_or((n as f32).sqrt() as usize).max(1);
 
         // 1. Subsample training data
         let (training_data, n_train) = if n > 500_000 {
@@ -119,6 +120,10 @@ where
         } else {
             (vectors_flat.clone(), n)
         };
+
+        if verbose {
+            println!("  Generating IVF index with {} Voronoi cells.", nlist);
+        }
 
         // 2. Train the centroids
         let centroids = train_centroids(
@@ -170,7 +175,7 @@ where
     #[inline]
     pub fn query(&self, query_vec: &[T], k: usize, nprobe: Option<usize>) -> (Vec<usize>, Vec<T>) {
         let nprobe = nprobe
-            .unwrap_or_else(|| (((self.nlist as f64) * 0.15) as usize).max(1))
+            .unwrap_or_else(|| ((self.nlist as f64).sqrt() as usize).max(1))
             .min(self.nlist);
         let k = k.min(self.n);
 
@@ -191,7 +196,7 @@ where
         }
 
         // 2. Search only those clusters in the CSR layout
-        let mut heap: BinaryHeap<(OrderedFloat<T>, usize)> = BinaryHeap::with_capacity(k + 1);
+        let mut buffer = SortedBuffer::with_capacity(k);
         let query_norm = if matches!(self.metric, Dist::Cosine) {
             query_vec
                 .iter()
@@ -212,18 +217,11 @@ where
                     Dist::Cosine => self.cosine_distance_to_query(vec_idx, query_vec, query_norm),
                 };
 
-                if heap.len() < k {
-                    heap.push((OrderedFloat(dist), vec_idx));
-                } else if dist < heap.peek().unwrap().0 .0 {
-                    heap.pop();
-                    heap.push((OrderedFloat(dist), vec_idx));
-                }
+                buffer.insert((OrderedFloat(dist), vec_idx), k);
             }
         }
 
-        let mut results: Vec<_> = heap.into_iter().collect();
-        results.sort_unstable_by_key(|&(dist, _)| dist);
-        let (distances, indices) = results.into_iter().map(|(d, i)| (d.0, i)).unzip();
+        let (distances, indices) = buffer.data().iter().map(|(d, i)| (d.0, *i)).unzip();
         (indices, distances)
     }
 
@@ -319,7 +317,7 @@ mod tests {
             n,
             norms,
             Dist::Euclidean,
-            2, // nlist
+            Some(2), // nlist
             None,
             42,
             false,
@@ -335,7 +333,7 @@ mod tests {
             n,
             norms,
             Dist::Euclidean,
-            2,
+            Some(2),
             None,
             42,
             false,
@@ -358,7 +356,7 @@ mod tests {
             n,
             norms,
             Dist::Euclidean,
-            2,
+            Some(2),
             None,
             42,
             false,
@@ -397,7 +395,7 @@ mod tests {
             n,
             norms,
             Dist::Cosine,
-            2,
+            Some(2),
             None,
             42,
             false,
@@ -419,7 +417,7 @@ mod tests {
             n,
             norms,
             Dist::Euclidean,
-            2,
+            Some(2),
             None,
             42,
             false,
@@ -440,7 +438,7 @@ mod tests {
             n,
             norms,
             Dist::Euclidean,
-            3,
+            Some(3),
             None,
             42,
             false,
@@ -464,7 +462,7 @@ mod tests {
             n,
             norms.clone(),
             Dist::Euclidean,
-            2,
+            Some(2),
             None,
             42,
             false,
@@ -475,7 +473,7 @@ mod tests {
             n,
             norms,
             Dist::Euclidean,
-            2,
+            Some(2),
             None,
             42,
             false,
@@ -498,7 +496,7 @@ mod tests {
             n,
             norms.clone(),
             Dist::Euclidean,
-            2,
+            Some(2),
             None,
             42,
             false,
@@ -509,7 +507,7 @@ mod tests {
             n,
             norms,
             Dist::Euclidean,
-            2,
+            Some(2),
             None,
             123,
             false,
@@ -541,7 +539,7 @@ mod tests {
             n,
             vec![],
             Dist::Euclidean,
-            10, // sqrt(100)
+            Some(10), // sqrt(100)
             None,
             42,
             false,
@@ -577,7 +575,7 @@ mod tests {
             n,
             norms,
             Dist::Cosine,
-            3,
+            Some(3),
             None,
             42,
             false,
@@ -608,7 +606,7 @@ mod tests {
             n,
             norms.clone(),
             Dist::Euclidean,
-            2,
+            Some(2),
             None,
             42,
             false,
@@ -619,7 +617,7 @@ mod tests {
             n,
             norms,
             Dist::Euclidean,
-            4,
+            Some(4),
             None,
             42,
             false,

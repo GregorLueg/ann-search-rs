@@ -643,7 +643,7 @@ where
 /// The `IvfIndex`.
 pub fn build_ivf_index<T>(
     mat: MatRef<T>,
-    nlist: usize,
+    nlist: Option<usize>,
     max_iters: Option<usize>,
     dist_metric: &str,
     seed: usize,
@@ -784,7 +784,8 @@ where
 ///
 /// * `mat` - The data matrix. Rows represent the samples, columns represent
 ///   the embedding dimensions
-/// * `nlist` - Number of clusters to create
+/// * `nlist` - Optional number of cells to create. If not provided, defaults
+///   to `sqrt(n)`.
 /// * `max_iters` - Maximum k-means iterations (defaults to 30 if None)
 /// * `seed` - Random seed for reproducibility
 /// * `verbose` - Print progress information during index construction
@@ -798,7 +799,7 @@ where
 /// Currently only supports Euclidean distance.
 pub fn build_ivf_sq8_index<T>(
     mat: MatRef<T>,
-    nlist: usize,
+    nlist: Option<usize>,
     max_iters: Option<usize>,
     dist_metric: &str,
     seed: usize,
@@ -923,7 +924,7 @@ where
 #[allow(clippy::too_many_arguments)]
 pub fn build_ivf_pq_index<T>(
     mat: MatRef<T>,
-    nlist: usize,
+    nlist: Option<usize>,
     m: usize,
     max_iters: Option<usize>,
     n_pq_centroids: Option<usize>,
@@ -1054,7 +1055,7 @@ where
 #[allow(clippy::too_many_arguments)]
 pub fn build_ivf_opq_index<T>(
     mat: MatRef<T>,
-    nlist: usize,
+    nlist: Option<usize>,
     m: usize,
     max_iters: Option<usize>,
     n_opq_centroids: Option<usize>,

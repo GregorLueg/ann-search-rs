@@ -65,7 +65,7 @@ where
         mut vectors_flat: Vec<T>,
         dim: usize,
         n: usize,
-        nlist: usize,
+        nlist: Option<usize>,
         m: usize,
         metric: Dist,
         max_iters: Option<usize>,
@@ -74,6 +74,7 @@ where
         verbose: bool,
     ) -> Self {
         let max_iters = max_iters.unwrap_or(30);
+        let nlist = nlist.unwrap_or((n as f32).sqrt() as usize).max(1);
 
         // normalise for cosine distance
         if metric == Dist::Cosine {
@@ -95,6 +96,10 @@ where
         } else {
             (vectors_flat.clone(), n)
         };
+
+        if verbose {
+            println!("  Generating IVF-PQ index with {} Voronoi cells.", nlist);
+        }
 
         // 2. Train IVF centroids
         let mut centroids = train_centroids(
@@ -470,7 +475,7 @@ mod tests {
             data,
             32,
             6,
-            2,
+            Some(2),
             8,
             Dist::Euclidean,
             Some(10),
@@ -495,7 +500,7 @@ mod tests {
             data,
             32,
             6,
-            2,
+            Some(2),
             8,
             Dist::Cosine,
             Some(10),
@@ -514,7 +519,7 @@ mod tests {
             data,
             32,
             6,
-            2,
+            Some(2),
             8,
             Dist::Euclidean,
             Some(10),
@@ -537,7 +542,7 @@ mod tests {
             data,
             32,
             6,
-            2,
+            Some(2),
             8,
             Dist::Euclidean,
             Some(10),
@@ -559,7 +564,7 @@ mod tests {
             data,
             32,
             6,
-            2,
+            Some(2),
             8,
             Dist::Euclidean,
             Some(10),
@@ -583,7 +588,7 @@ mod tests {
             data,
             32,
             6,
-            2,
+            Some(2),
             8,
             Dist::Cosine,
             Some(10),
@@ -606,7 +611,7 @@ mod tests {
             data,
             32,
             6,
-            2,
+            Some(2),
             8,
             Dist::Euclidean,
             Some(10),
@@ -631,7 +636,7 @@ mod tests {
             data,
             32,
             6,
-            2,
+            Some(2),
             8,
             Dist::Euclidean,
             Some(10),
@@ -656,7 +661,7 @@ mod tests {
             data,
             32,
             6,
-            2,
+            Some(2),
             8,
             Dist::Euclidean,
             Some(10),
@@ -687,7 +692,7 @@ mod tests {
             data,
             32,
             20,
-            2,
+            Some(2),
             8,
             Dist::Euclidean,
             Some(5),
@@ -708,7 +713,7 @@ mod tests {
             data,
             32,
             6,
-            2,
+            Some(2),
             8,
             Dist::Euclidean,
             Some(10),
@@ -731,7 +736,7 @@ mod tests {
             data,
             32,
             6,
-            2,
+            Some(2),
             8,
             Dist::Euclidean,
             Some(10),
@@ -761,7 +766,7 @@ mod tests {
             data.clone(),
             32,
             50,
-            5,
+            Some(5),
             8,
             Dist::Euclidean,
             Some(5),

@@ -294,7 +294,7 @@ fn parallel_lloyd<T>(
             }
         }
 
-        if verbose {
+        if verbose && (iter + 1) % 10 == 0 {
             println!("    Iteration {} complete", iter + 1);
         }
     }

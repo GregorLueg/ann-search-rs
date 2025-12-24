@@ -101,7 +101,7 @@ where
         mut vectors_flat: Vec<T>,
         dim: usize,
         n: usize,
-        nlist: usize,
+        nlist: Option<usize>,
         metric: Dist,
         max_iters: Option<usize>,
         seed: usize,
@@ -109,6 +109,7 @@ where
     ) -> Self {
         // max iters for k-means
         let max_iters = max_iters.unwrap_or(30);
+        let nlist = nlist.unwrap_or((n as f32).sqrt() as usize).max(1);
 
         // normalise for cosine distance
         if metric == Dist::Cosine {
@@ -130,6 +131,10 @@ where
         } else {
             (vectors_flat.clone(), n)
         };
+
+        if verbose {
+            println!("  Generating IVF-SQ8 index with {} Voronoi cells.", nlist);
+        }
 
         // 2. train centroids
         let mut centroids = train_centroids(
@@ -342,7 +347,7 @@ mod tests {
     #[test]
     fn test_build_euclidean() {
         let data = create_simple_dataset();
-        let index = IvfSq8Index::build(data, 4, 6, 2, Dist::Euclidean, Some(10), 42, false);
+        let index = IvfSq8Index::build(data, 4, 6, Some(2), Dist::Euclidean, Some(10), 42, false);
 
         assert_eq!(index.dim, 4);
         assert_eq!(index.n, 6);
@@ -356,7 +361,7 @@ mod tests {
     #[test]
     fn test_build_cosine() {
         let data = create_simple_dataset();
-        let index = IvfSq8Index::build(data, 4, 6, 2, Dist::Cosine, Some(10), 42, false);
+        let index = IvfSq8Index::build(data, 4, 6, Some(2), Dist::Cosine, Some(10), 42, false);
 
         assert_eq!(index.metric, Dist::Cosine);
         assert_eq!(index.quantised_norms.len(), 6);
@@ -365,7 +370,7 @@ mod tests {
     #[test]
     fn test_query_returns_k_results() {
         let data = create_simple_dataset();
-        let index = IvfSq8Index::build(data, 4, 6, 2, Dist::Euclidean, Some(10), 42, false);
+        let index = IvfSq8Index::build(data, 4, 6, Some(2), Dist::Euclidean, Some(10), 42, false);
 
         let query = vec![0.0, 0.0, 0.0, 0.0];
         let (indices, distances) = index.query(&query, 3, Some(1));
@@ -377,7 +382,7 @@ mod tests {
     #[test]
     fn test_query_k_exceeds_n() {
         let data = create_simple_dataset();
-        let index = IvfSq8Index::build(data, 4, 6, 2, Dist::Euclidean, Some(10), 42, false);
+        let index = IvfSq8Index::build(data, 4, 6, Some(2), Dist::Euclidean, Some(10), 42, false);
 
         let query = vec![0.0, 0.0, 0.0, 0.0];
         let (indices, _) = index.query(&query, 100, None);
@@ -388,7 +393,7 @@ mod tests {
     #[test]
     fn test_query_finds_nearest() {
         let data = create_simple_dataset();
-        let index = IvfSq8Index::build(data, 4, 6, 2, Dist::Euclidean, Some(10), 42, false);
+        let index = IvfSq8Index::build(data, 4, 6, Some(2), Dist::Euclidean, Some(10), 42, false);
 
         let query = vec![0.0, 0.0, 0.0, 0.0];
         let (indices, distances) = index.query(&query, 3, Some(1));
@@ -403,7 +408,7 @@ mod tests {
     #[test]
     fn test_query_cosine() {
         let data = create_simple_dataset();
-        let index = IvfSq8Index::build(data, 4, 6, 2, Dist::Cosine, Some(10), 42, false);
+        let index = IvfSq8Index::build(data, 4, 6, Some(2), Dist::Cosine, Some(10), 42, false);
 
         let query = vec![1.0, 1.0, 0.0, 0.0];
         let (indices, distances) = index.query(&query, 3, Some(1));
@@ -415,7 +420,7 @@ mod tests {
     #[test]
     fn test_query_different_nprobe() {
         let data = create_simple_dataset();
-        let index = IvfSq8Index::build(data, 4, 6, 2, Dist::Euclidean, Some(10), 42, false);
+        let index = IvfSq8Index::build(data, 4, 6, Some(2), Dist::Euclidean, Some(10), 42, false);
 
         let query = vec![5.0, 5.0, 0.0, 0.0];
 
@@ -429,7 +434,7 @@ mod tests {
     #[test]
     fn test_query_deterministic() {
         let data = create_simple_dataset();
-        let index = IvfSq8Index::build(data, 4, 6, 2, Dist::Euclidean, Some(10), 42, false);
+        let index = IvfSq8Index::build(data, 4, 6, Some(2), Dist::Euclidean, Some(10), 42, false);
 
         let query = vec![0.5, 0.5, 0.0, 0.0];
 
@@ -443,7 +448,7 @@ mod tests {
     #[test]
     fn test_query_row() {
         let data = create_simple_dataset();
-        let index = IvfSq8Index::build(data, 4, 6, 2, Dist::Euclidean, Some(10), 42, false);
+        let index = IvfSq8Index::build(data, 4, 6, Some(2), Dist::Euclidean, Some(10), 42, false);
 
         let query_mat = Mat::<f32>::from_fn(1, 4, |_, j| if j < 2 { 0.5 } else { 0.0 });
         let row = query_mat.row(0);
@@ -463,7 +468,7 @@ mod tests {
             }
         }
 
-        let index = IvfSq8Index::build(data, 8, 100, 10, Dist::Euclidean, Some(5), 42, false);
+        let index = IvfSq8Index::build(data, 8, 100, Some(10), Dist::Euclidean, Some(5), 42, false);
 
         assert_eq!(index.nlist, 10);
         assert_eq!(index.offsets.len(), 11);
@@ -472,7 +477,16 @@ mod tests {
     #[test]
     fn test_quantisation_preserves_structure() {
         let data = create_simple_dataset();
-        let index = IvfSq8Index::build(data.clone(), 4, 6, 2, Dist::Euclidean, Some(10), 42, false);
+        let index = IvfSq8Index::build(
+            data.clone(),
+            4,
+            6,
+            Some(2),
+            Dist::Euclidean,
+            Some(10),
+            42,
+            false,
+        );
 
         let query = vec![0.1, 0.1, 0.0, 0.0];
         let (indices, _) = index.query(&query, 1, Some(1));

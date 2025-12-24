@@ -64,13 +64,17 @@ fn main() {
 
     println!("-----------------------------");
 
-    let nlist_values = [10, 20, 25, 50, 100];
+    let nlist_values = [
+        (cli.n_cells as f32 * 0.5).sqrt() as usize,
+        (cli.n_cells as f32).sqrt() as usize,
+        (cli.n_cells as f32 * 2.0).sqrt() as usize,
+    ];
     for nlist in nlist_values {
         println!("Building IVF index (nlist={})...", nlist);
         let start = Instant::now();
         let ivf_idx = build_ivf_index(
             data.as_ref(),
-            nlist,
+            Some(nlist),
             None,
             &cli.distance,
             cli.seed as usize,
@@ -79,9 +83,9 @@ fn main() {
         let build_time = start.elapsed().as_secs_f64() * 1000.0;
 
         let nprobe_values = [
-            (0.05 * nlist as f64) as usize,
-            (0.1 * nlist as f64) as usize,
-            (0.15 * nlist as f64) as usize,
+            (nlist as f32).sqrt() as usize,
+            (nlist as f32 * 2.0).sqrt() as usize,
+            (0.05 * nlist as f32) as usize,
         ];
         let mut nprobe_values: Vec<_> = nprobe_values
             .into_iter()
