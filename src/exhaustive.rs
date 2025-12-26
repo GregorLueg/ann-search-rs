@@ -20,8 +20,6 @@ use crate::utils::heap_structs::*;
 /// * `dim` - Embedding dimensions
 /// * `n` - Number of samples
 /// * `dist_metric` - The type of distance the index is designed for
-/// * `dist` - Is the index set up for distance (= true) or similarities
-///   (= false)
 pub struct ExhaustiveIndex<T> {
     // shared ones
     pub vectors_flat: Vec<T>,
