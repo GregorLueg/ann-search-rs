@@ -970,7 +970,7 @@ pub fn build_exhaustive_index_gpu<T, R>(
     device: R::Device,
 ) -> ExhaustiveIndexGpu<T, R>
 where
-    T: Float + Sum + cubecl::frontend::Float + cubecl::CubeElement,
+    T: Float + Sum + cubecl::frontend::Float + cubecl::CubeElement + FromPrimitive,
     R: Runtime,
 {
     let metric = parse_ann_dist(dist_metric).unwrap_or_default();
@@ -994,9 +994,9 @@ pub fn query_exhaustive_index_gpu<T, R>(
     index: &ExhaustiveIndexGpu<T, R>,
     k: usize,
     return_dist: bool,
-) -> (Vec<Vec<usize>>, Option<Vec<Vec<f32>>>)
+) -> (Vec<Vec<usize>>, Option<Vec<Vec<T>>>)
 where
-    T: Float + Sum + cubecl::frontend::Float + cubecl::CubeElement,
+    T: Float + Sum + cubecl::frontend::Float + cubecl::CubeElement + FromPrimitive,
     R: Runtime,
 {
     let (indices, distances) = index.query_batch(query_mat, k);
@@ -1016,23 +1016,18 @@ where
 // IVF GPU //
 //////////////
 
-/// Build an IVF GPU index
+/// Build an IVF index with batched GPU acceleration
 ///
 /// ### Params
 ///
-/// * `mat` - The initial matrix with samples x features
-/// * `nlist` - Number of clusters (defaults to sqrt(n))
-/// * `max_iters` - Maximum k-means iterations (defaults to 30)
-/// * `dist_metric` - Distance metric: "euclidean" or "cosine"
-/// * `seed` - Random seed for reproducibility
-/// * `verbose` - Print training progress
-/// * `device` - The GPU device to use
-///
-/// ### Returns
-///
-/// The initialised `IvfIndexGpu`
-#[allow(clippy::too_many_arguments)]
-pub fn build_ivf_index_gpu<T, R>(
+/// * `mat` - Data matrix [samples, features]
+/// * `nlist` - Number of clusters (defaults to √n)
+/// * `max_iters` - K-means iterations (defaults to 30)
+/// * `dist_metric` - "euclidean" or "cosine"
+/// * `seed` - Random seed
+/// * `verbose` - Print progress
+/// * `device` - GPU device
+pub fn build_ivf_index_gpu_batched<T, R>(
     mat: MatRef<T>,
     nlist: Option<usize>,
     max_iters: Option<usize>,
@@ -1042,134 +1037,40 @@ pub fn build_ivf_index_gpu<T, R>(
     device: R::Device,
 ) -> IvfIndexGpu<T, R>
 where
-    T: Float
-        + FromPrimitive
-        + ToPrimitive
-        + Send
-        + Sync
-        + Sum
-        + cubecl::frontend::Float
-        + cubecl::CubeElement,
     R: Runtime,
+    T: Float + Sum + cubecl::frontend::Float + cubecl::CubeElement + FromPrimitive + Send + Sync,
 {
-    let metric = parse_ann_dist(dist_metric).unwrap_or_default();
-    let n = mat.nrows();
-    let dim = mat.ncols();
-
-    let mut vectors_flat = Vec::with_capacity(n * dim);
-    for i in 0..n {
-        vectors_flat.extend(mat.row(i).iter().copied());
-    }
-
-    let norms = if metric == Dist::Cosine {
-        (0..n)
-            .map(|i| {
-                let start = i * dim;
-                vectors_flat[start..start + dim]
-                    .iter()
-                    .map(|&x| x * x)
-                    .sum::<T>()
-                    .sqrt()
-            })
-            .collect()
-    } else {
-        Vec::new()
-    };
-
-    IvfIndexGpu::build(
-        vectors_flat,
-        dim,
-        n,
-        norms,
-        metric,
-        nlist,
-        max_iters,
-        seed,
-        verbose,
-        device,
-    )
+    let ann_dist = parse_ann_dist(dist_metric).unwrap_or_default();
+    IvfIndexGpu::build(mat, ann_dist, nlist, max_iters, seed, verbose, device)
 }
 
-/// Query the IVF GPU index
+/// Query an IVF batched index
 ///
 /// ### Params
 ///
-/// * `query_mat` - The query matrix containing the samples × features
-/// * `index` - The IVF GPU index
-/// * `k` - Number of neighbours to return
-/// * `nprobe` - Number of clusters to search (defaults to sqrt(nlist))
-/// * `return_dist` - Shall the distances be returned
+/// * `query_mat` - Query matrix [samples, features]
+/// * `index` - Reference to built index
+/// * `k` - Number of neighbours
+/// * `nprobe` - Clusters to search (defaults to √nlist)
+/// * `return_dist` - Return distances
+/// * `_verbose` - Unused
 ///
 /// ### Returns
 ///
-/// A tuple of `(knn_indices, optional distances)`
-pub fn query_ivf_index_gpu<T, R>(
+/// Tuple of (indices, optional distances)
+pub fn query_ivf_index_gpu_batched<T, R>(
     query_mat: MatRef<T>,
     index: &IvfIndexGpu<T, R>,
     k: usize,
     nprobe: Option<usize>,
     return_dist: bool,
-) -> (Vec<Vec<usize>>, Option<Vec<Vec<f32>>>)
+    _verbose: bool,
+) -> (Vec<Vec<usize>>, Option<Vec<Vec<T>>>)
 where
-    T: Float
-        + FromPrimitive
-        + ToPrimitive
-        + Send
-        + Sync
-        + Sum
-        + cubecl::frontend::Float
-        + cubecl::CubeElement,
     R: Runtime,
+    T: Float + Sum + cubecl::frontend::Float + cubecl::CubeElement + FromPrimitive + Send + Sync,
 {
-    let n_queries = query_mat.nrows();
-    let dim = query_mat.ncols();
-
-    let mut query_vectors_flat = Vec::with_capacity(n_queries * dim);
-    for i in 0..n_queries {
-        query_vectors_flat.extend(query_mat.row(i).iter().copied());
-    }
-
-    let (indices, distances) = index.query_batch(&query_vectors_flat, n_queries, k, nprobe);
-
-    if return_dist {
-        (indices, Some(distances))
-    } else {
-        (indices, None)
-    }
-}
-
-/// Build a kNN graph using the IVF GPU index
-///
-/// ### Params
-///
-/// * `index` - The IVF GPU index
-/// * `k` - Number of neighbours per vector
-/// * `nprobe` - Number of clusters to search (defaults to sqrt(nlist))
-/// * `verbose` - Print progress
-/// * `return_dist` - Shall the distances be returned
-///
-/// ### Returns
-///
-/// A tuple of `(knn_indices, optional distances)`
-pub fn build_knn_graph_ivf_gpu<T, R>(
-    index: &IvfIndexGpu<T, R>,
-    k: usize,
-    nprobe: Option<usize>,
-    verbose: bool,
-    return_dist: bool,
-) -> (Vec<Vec<usize>>, Option<Vec<Vec<f32>>>)
-where
-    T: Float
-        + FromPrimitive
-        + ToPrimitive
-        + Send
-        + Sync
-        + Sum
-        + cubecl::frontend::Float
-        + cubecl::CubeElement,
-    R: Runtime,
-{
-    let (indices, distances) = index.build_knn_graph(k, nprobe, verbose);
+    let (indices, distances) = index.query_batch(query_mat, k, nprobe);
 
     if return_dist {
         (indices, Some(distances))

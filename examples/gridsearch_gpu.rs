@@ -12,16 +12,24 @@ use thousands::*;
 struct Cli {
     #[arg(long, default_value_t = DEFAULT_N_CELLS)]
     n_cells: usize,
+
     #[arg(long, default_value_t = DEFAULT_DIM)]
     dim: usize,
+
     #[arg(long, default_value_t = DEFAULT_N_CLUSTERS)]
     n_clusters: usize,
+
     #[arg(long, default_value_t = DEFAULT_K)]
     k: usize,
+
     #[arg(long, default_value_t = DEFAULT_SEED)]
     seed: u64,
+
     #[arg(long, default_value = DEFAULT_DISTANCE)]
     distance: String,
+
+    #[arg(long, default_value = DEFAULT_DATA)]
+    data: String,
 }
 
 fn main() {
@@ -37,7 +45,23 @@ fn main() {
     );
     println!("-----------------------------");
 
-    let data: Mat<f32> = generate_clustered_data(cli.n_cells, cli.dim, cli.n_clusters, cli.seed);
+    let data_type = parse_data(&cli.data).unwrap_or_default();
+
+    let data: Mat<f32> = match data_type {
+        SyntheticData::GaussianNoise => {
+            generate_clustered_data(cli.n_cells, cli.dim, cli.n_clusters, cli.seed)
+        }
+        SyntheticData::Correlated => {
+            println!("Using data for high dimensional ANN searches...\n");
+            generate_clustered_data_high_dim(
+                cli.n_cells,
+                cli.dim,
+                cli.n_clusters,
+                DEFAULT_COR_STRENGTH,
+                cli.seed,
+            )
+        }
+    };
     let query_data = data.as_ref();
     let mut results = Vec::new();
 
@@ -110,7 +134,7 @@ fn main() {
     for nlist in nlist_values {
         println!("Building IVF-GPU index (nlist={})...", nlist);
         let start = Instant::now();
-        let ivf_gpu_idx = build_ivf_index_gpu::<f32, cubecl::wgpu::WgpuRuntime>(
+        let ivf_gpu_idx = build_ivf_index_gpu_batched::<f32, cubecl::wgpu::WgpuRuntime>(
             data.as_ref(),
             Some(nlist),
             None,
@@ -145,8 +169,14 @@ fn main() {
                 nlist, nprobe
             );
             let start = Instant::now();
-            let (knn_neighbors, knn_distances) =
-                build_knn_graph_ivf_gpu(&ivf_gpu_idx, cli.k, Some(nprobe), false, true);
+            let (knn_neighbors, knn_distances) = query_ivf_index_gpu_batched(
+                data.as_ref(),
+                &ivf_gpu_idx,
+                cli.k,
+                Some(nprobe),
+                true,
+                false,
+            );
             let knn_time = start.elapsed().as_secs_f64() * 1000.0;
 
             let recall = calculate_recall(&true_neighbors, &knn_neighbors, cli.k);

@@ -8,19 +8,19 @@ run_benchmark() {
     cargo run --example "gridsearch_${name,,}" --release -- "$@"
 }
 
-# Basic algorithms with cosine and euclidean
-for algo in annoy hnsw ivf lsh nndescent; do
-    run_benchmark "${algo^^}" --distance cosine
-    run_benchmark "${algo^^}" --distance euclidean
-done
+# # Basic algorithms with cosine and euclidean
+# for algo in annoy hnsw ivf lsh nndescent; do
+#     run_benchmark "${algo^^}" --distance euclidean
+#     run_benchmark "${algo^^}" --distance cosine
+# done
 
 # Algorithms with quantisations
 
-IVF-SQ8
-echo "Running IVF-SQ8 benchmarks..."
-cargo run --example gridsearch_ivf_sq8 --release -- --distance euclidean
-cargo run --example gridsearch_ivf_sq8 --release -- --distance euclidean --dim 96
-cargo run --example gridsearch_ivf_sq8 --release -- --distance euclidean --dim 128 --data correlated
+# IVF-SQ8
+# echo "Running IVF-SQ8 benchmarks..."
+# cargo run --example gridsearch_ivf_sq8 --release -- --distance euclidean
+# cargo run --example gridsearch_ivf_sq8 --release -- --distance euclidean --dim 96
+# cargo run --example gridsearch_ivf_sq8 --release -- --distance euclidean --dim 128 --data correlated
 
 # IVF-PQ
 echo "Running IVF-PQ benchmarks..."
@@ -31,5 +31,16 @@ cargo run --example gridsearch_ivf_pq --release -- --distance euclidean --dim 19
 echo "Running IVF-OPQ benchmarks..."
 cargo run --example gridsearch_ivf_opq --release -- --distance euclidean --dim 128 --data correlated
 cargo run --example gridsearch_ivf_opq --release -- --distance euclidean --dim 192 --data correlated
+
+# Algorithms with GPU acceleration
+cargo run --example gridsearch_ivf_gpu --release -- --distance euclidean
+cargo run --example gridsearch_ivf_gpu --release -- --distance cosine
+
+# Comparison with larger datasets
+cargo run --example gridsearch_ivf --release -- --distance euclidean --n-cells 500000
+cargo run --example gridsearch_ivf_gpu --release -- --distance euclidean --n-cells 500000
+
+# More dimensions
+cargo run --example gridsearch_ivf_gpu --release -- --distance euclidean --dim 128 --data correlated
 
 echo "All benchmarks complete."

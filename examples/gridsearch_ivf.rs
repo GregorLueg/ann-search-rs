@@ -13,16 +13,24 @@ use thousands::*;
 struct Cli {
     #[arg(long, default_value_t = DEFAULT_N_CELLS)]
     n_cells: usize,
+
     #[arg(long, default_value_t = DEFAULT_DIM)]
     dim: usize,
+
     #[arg(long, default_value_t = DEFAULT_N_CLUSTERS)]
     n_clusters: usize,
+
     #[arg(long, default_value_t = DEFAULT_K)]
     k: usize,
+
     #[arg(long, default_value_t = DEFAULT_SEED)]
     seed: u64,
+
     #[arg(long, default_value = DEFAULT_DISTANCE)]
     distance: String,
+
+    #[arg(long, default_value = DEFAULT_DATA)]
+    data: String,
 }
 
 fn main() {
@@ -38,7 +46,23 @@ fn main() {
     );
     println!("-----------------------------");
 
-    let data: Mat<f32> = generate_clustered_data(cli.n_cells, cli.dim, cli.n_clusters, cli.seed);
+    let data_type = parse_data(&cli.data).unwrap_or_default();
+
+    let data: Mat<f32> = match data_type {
+        SyntheticData::GaussianNoise => {
+            generate_clustered_data(cli.n_cells, cli.dim, cli.n_clusters, cli.seed)
+        }
+        SyntheticData::Correlated => {
+            println!("Using data for high dimensional ANN searches...\n");
+            generate_clustered_data_high_dim(
+                cli.n_cells,
+                cli.dim,
+                cli.n_clusters,
+                DEFAULT_COR_STRENGTH,
+                cli.seed,
+            )
+        }
+    };
     let query_data = data.as_ref();
     let mut results = Vec::new();
 
