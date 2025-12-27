@@ -49,22 +49,18 @@ impl<T> CentroidDistance<T> for IvfOpqIndex<T>
 where
     T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum,
 {
-    /// Get the centroids
     fn centroids(&self) -> &[T] {
         &self.centroids
     }
 
-    /// Get the dimensions
     fn dim(&self) -> usize {
         self.dim
     }
 
-    /// Get the distance metric
     fn metric(&self) -> Dist {
         self.metric
     }
 
-    /// Get the number of lists
     fn nlist(&self) -> usize {
         self.nlist
     }
@@ -110,6 +106,10 @@ where
         self.codebook.codebooks()
     }
 }
+
+////////////////
+// Main index //
+////////////////
 
 impl<T> IvfOpqIndex<T>
 where

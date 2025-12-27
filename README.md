@@ -42,6 +42,10 @@ heavy multi-threading were possible and optimised structures for memory access.
   - *IVF-PQ* (with product quantisation)
   - *IVF-OPQ* (with optimised product quantisation)
 
+- **GPU-accelerated indices**:
+  - *Exhaustive flat index with GPU acceleration*
+  - *IVF (Inverted File index) with GPU acceleration*
+
 ## Installation
 
 Add this to your `Cargo.toml`:
@@ -51,11 +55,14 @@ Add this to your `Cargo.toml`:
 ann-search-rs = "*" # always get the latest version
 ```
 
+To note, I have changed some of the interfaces between versions.
+
 ## Roadmap
 
-- Longer term, I am considering GPU-acceleration (yet to be figured out how,
-likely via the [Burn framework](https://burn.dev)).
-- Option to save indices on-disk and do on-disk querying.
+- ~~First GPU support~~ (Implemented with version `0.2.1` of the crate).
+- Option to save indices on-disk and maybe do on-disk querying ... ? 
+- More GPU support for other indices. TBD, needs to warrant the time investment.
+  For the use cases of the author this crate suffices atm more than enough.
 
 ## Example Usage
 
@@ -121,7 +128,8 @@ cargo run --example gridsearch_annoy --release -- --n-cells 500000 --dim 32 --di
 For every index, 150k cells with 32 dimensions distance and 25 distinct clusters 
 (of different sizes each) in the synthetic data has been run. The results for 
 the different indices are show below. For details on the synthetic data 
-function, see `./examples/commons/mod.rs`.
+function, see `./examples/commons/mod.rs`. This was run on an M1 Max MacBoo Pro
+with 64 GB of unified memory.
 
 ### Annoy
 
@@ -680,31 +688,31 @@ Benchmark: 150k cells, 192D
 ===================================================================================
 Method                           Build (ms)   Query (ms)   Total (ms)     Recall@k
 -----------------------------------------------------------------------------------
-Exhaustive                            21.96    281221.35    281243.31       1.0000
-IVF-PQ-nl273-m16-np13              24488.83      5443.33     29932.16       0.4527
-IVF-PQ-nl273-m16-np16              24488.83      6542.74     31031.57       0.4535
-IVF-PQ-nl273-m16-np23              24488.83      9131.09     33619.92       0.4536
-IVF-PQ-nl273-m32-np13              28722.05      8774.19     37496.24       0.6282
-IVF-PQ-nl273-m32-np16              28722.05     10595.15     39317.19       0.6299
-IVF-PQ-nl273-m32-np23              28722.05     14986.27     43708.32       0.6303
-IVF-PQ-nl273-m48-np13              31976.68     11904.17     43880.85       0.7322
-IVF-PQ-nl273-m48-np16              31976.68     14196.67     46173.36       0.7347
-IVF-PQ-nl273-m48-np23              31976.68     20012.38     51989.06       0.7353
-IVF-PQ-nl387-m16-np19              33356.45      7406.45     40762.89       0.4553
-IVF-PQ-nl387-m16-np27              33356.45      9955.48     43311.92       0.4559
-IVF-PQ-nl387-m32-np19              36626.31     12218.78     48845.08       0.6299
-IVF-PQ-nl387-m32-np27              36626.31     17126.69     53753.00       0.6314
-IVF-PQ-nl387-m48-np19              39547.78     15379.39     54927.17       0.7346
-IVF-PQ-nl387-m48-np27              39547.78     20666.57     60214.35       0.7367
-IVF-PQ-nl547-m16-np23              43651.44      8927.40     52578.83       0.4573
-IVF-PQ-nl547-m16-np27              43651.44      9973.12     53624.56       0.4580
-IVF-PQ-nl547-m16-np33              43651.44     11486.57     55138.01       0.4583
-IVF-PQ-nl547-m32-np23              45723.64     13173.52     58897.16       0.6301
-IVF-PQ-nl547-m32-np27              45723.64     15256.44     60980.08       0.6318
-IVF-PQ-nl547-m32-np33              45723.64     18450.01     64173.65       0.6326
-IVF-PQ-nl547-m48-np23              49481.77     15667.24     65149.01       0.7331
-IVF-PQ-nl547-m48-np27              49481.77     18009.05     67490.82       0.7354
-IVF-PQ-nl547-m48-np33              49481.77     21678.35     71160.13       0.7368
+Exhaustive                            23.37    308023.77    308047.14       1.0000
+IVF-PQ-nl273-m16-np13              25713.83      5433.23     31147.06       0.4529
+IVF-PQ-nl273-m16-np16              25713.83      7264.61     32978.44       0.4536
+IVF-PQ-nl273-m16-np23              25713.83      9574.54     35288.37       0.4537
+IVF-PQ-nl273-m32-np13              31793.39     10472.38     42265.77       0.6285
+IVF-PQ-nl273-m32-np16              31793.39     12255.97     44049.36       0.6301
+IVF-PQ-nl273-m32-np23              31793.39     17548.37     49341.77       0.6305
+IVF-PQ-nl273-m48-np13              32853.65     11373.11     44226.76       0.7318
+IVF-PQ-nl273-m48-np16              32853.65     14238.54     47092.19       0.7343
+IVF-PQ-nl273-m48-np23              32853.65     20256.78     53110.43       0.7349
+IVF-PQ-nl387-m16-np19              34085.74      7788.76     41874.50       0.4550
+IVF-PQ-nl387-m16-np27              34085.74     10108.84     44194.58       0.4557
+IVF-PQ-nl387-m32-np19              38396.24     13675.44     52071.68       0.6303
+IVF-PQ-nl387-m32-np27              38396.24     17223.62     55619.86       0.6317
+IVF-PQ-nl387-m48-np19              41160.11     17149.93     58310.05       0.7347
+IVF-PQ-nl387-m48-np27              41160.11     21030.83     62190.94       0.7368
+IVF-PQ-nl547-m16-np23              44462.83      8506.78     52969.61       0.4570
+IVF-PQ-nl547-m16-np27              44462.83      9607.35     54070.17       0.4577
+IVF-PQ-nl547-m16-np33              44462.83     11342.21     55805.04       0.4581
+IVF-PQ-nl547-m32-np23              46745.07     13209.96     59955.03       0.6305
+IVF-PQ-nl547-m32-np27              46745.07     16297.98     63043.05       0.6321
+IVF-PQ-nl547-m32-np33              46745.07     20421.76     67166.82       0.6330
+IVF-PQ-nl547-m48-np23              48715.88     15664.02     64379.90       0.7331
+IVF-PQ-nl547-m48-np27              48715.88     18333.34     67049.22       0.7355
+IVF-PQ-nl547-m48-np33              48715.88     23769.50     72485.38       0.7368
 -----------------------------------------------------------------------------------
 ```
 
@@ -720,7 +728,7 @@ However, it can still be useful in situation where good enough works and you
 have VERY large scale data. The theoretical benefits at least in this
 synthetic data do not translate very well. IVF-PQ is usually more than enough, 
 outside of cases in which a specific correlation structure can be exploited
-by the optimised PQ. In doubt, use the IVF-PQ index.
+by the optimised PQ. If in doubt, use the IVF-PQ index.
 
 **Key parameters:**
 
@@ -741,33 +749,23 @@ Benchmark: 150k cells, 128D
 ===================================================================================
 Method                           Build (ms)   Query (ms)   Total (ms)     Recall@k
 -----------------------------------------------------------------------------------
-Exhaustive                            15.76    177863.96    177879.72       1.0000
-IVF-OPQ-nl10-m16-np1               21317.79      3154.91     24472.70       0.3633
-IVF-OPQ-nl10-m32-np1               30600.10      6740.79     37340.89       0.5043
-IVF-OPQ-nl20-m16-np1               22766.92      2022.24     24789.16       0.4617
-IVF-OPQ-nl20-m16-np2               22766.92      4363.23     27130.15       0.4617
-IVF-OPQ-nl20-m16-np3               22766.92      6055.66     28822.58       0.4617
-IVF-OPQ-nl20-m32-np1               30677.18      3853.00     34530.19       0.6218
-IVF-OPQ-nl20-m32-np2               30677.18      9125.19     39802.37       0.6218
-IVF-OPQ-nl20-m32-np3               30677.18     12918.39     43595.57       0.6218
-IVF-OPQ-nl25-m16-np1               22034.21      1844.14     23878.34       0.4833
-IVF-OPQ-nl25-m16-np2               22034.21      3787.78     25821.99       0.4882
-IVF-OPQ-nl25-m16-np3               22034.21      5185.69     27219.90       0.4882
-IVF-OPQ-nl25-m32-np1               30806.12      3333.21     34139.33       0.6424
-IVF-OPQ-nl25-m32-np2               30806.12      7045.58     37851.70       0.6503
-IVF-OPQ-nl25-m32-np3               30806.12     10349.99     41156.11       0.6503
-IVF-OPQ-nl50-m16-np2               22326.73      2202.78     24529.51       0.5410
-IVF-OPQ-nl50-m16-np5               22326.73      4827.33     27154.06       0.5483
-IVF-OPQ-nl50-m16-np7               22326.73      6174.45     28501.17       0.5483
-IVF-OPQ-nl50-m32-np2               30681.98      3776.73     34458.71       0.7100
-IVF-OPQ-nl50-m32-np5               30681.98      8549.89     39231.87       0.7221
-IVF-OPQ-nl50-m32-np7               30681.98     10622.56     41304.53       0.7221
-IVF-OPQ-nl100-m16-np5              27011.31      3575.80     30587.11       0.5502
-IVF-OPQ-nl100-m16-np10             27011.31      6730.96     33742.27       0.5518
-IVF-OPQ-nl100-m16-np15             27011.31     10129.60     37140.91       0.5518
-IVF-OPQ-nl100-m32-np5              38038.66      5366.80     43405.46       0.7227
-IVF-OPQ-nl100-m32-np10             38038.66     10211.27     48249.93       0.7255
-IVF-OPQ-nl100-m32-np15             38038.66     15222.34     53261.00       0.7255
+Exhaustive                            14.60    181852.46    181867.06       1.0000
+IVF-OPQ-nl273-m16-np13             29770.87      4444.53     34215.40       0.5572
+IVF-OPQ-nl273-m16-np16             29770.87      5332.95     35103.82       0.5576
+IVF-OPQ-nl273-m16-np23             29770.87      7733.49     37504.36       0.5576
+IVF-OPQ-nl273-m32-np13             40200.77      7213.76     47414.53       0.7253
+IVF-OPQ-nl273-m32-np16             40200.77      9369.07     49569.84       0.7263
+IVF-OPQ-nl273-m32-np23             40200.77     12113.81     52314.58       0.7264
+IVF-OPQ-nl387-m16-np19             35565.86      6149.77     41715.63       0.5595
+IVF-OPQ-nl387-m16-np27             35565.86      8551.83     44117.68       0.5597
+IVF-OPQ-nl387-m32-np19             44867.67     12729.91     57597.58       0.7275
+IVF-OPQ-nl387-m32-np27             44867.67     14298.33     59166.00       0.7280
+IVF-OPQ-nl547-m16-np23             42874.72      8035.92     50910.64       0.5616
+IVF-OPQ-nl547-m16-np27             42874.72      8576.86     51451.59       0.5619
+IVF-OPQ-nl547-m16-np33             42874.72      9583.35     52458.07       0.5619
+IVF-OPQ-nl547-m32-np23             49953.24     10573.52     60526.75       0.7286
+IVF-OPQ-nl547-m32-np27             49953.24     11856.71     61809.95       0.7294
+IVF-OPQ-nl547-m32-np33             49953.24     15153.34     65106.57       0.7296
 -----------------------------------------------------------------------------------
 ```
 
@@ -781,61 +779,150 @@ Benchmark: 150k cells, 192D
 ===================================================================================
 Method                           Build (ms)   Query (ms)   Total (ms)     Recall@k
 -----------------------------------------------------------------------------------
-Exhaustive                            22.11    288034.83    288056.95       1.0000
-IVF-OPQ-nl10-m16-np1               32560.65      4548.94     37109.59       0.3006
-IVF-OPQ-nl10-m32-np1               47350.48      9463.97     56814.45       0.4344
-IVF-OPQ-nl10-m48-np1               54169.73     15906.22     70075.95       0.5312
-IVF-OPQ-nl20-m16-np1               36119.53      2170.81     38290.34       0.3858
-IVF-OPQ-nl20-m16-np2               36119.53      4227.81     40347.34       0.3858
-IVF-OPQ-nl20-m16-np3               36119.53      6678.64     42798.17       0.3858
-IVF-OPQ-nl20-m32-np1               48895.84      3927.72     52823.56       0.5409
-IVF-OPQ-nl20-m32-np2               48895.84      7812.14     56707.98       0.5409
-IVF-OPQ-nl20-m32-np3               48895.84     12285.07     61180.91       0.5409
-IVF-OPQ-nl20-m48-np1               55470.98      5823.48     61294.46       0.6482
-IVF-OPQ-nl20-m48-np2               55470.98     13150.84     68621.82       0.6482
-IVF-OPQ-nl20-m48-np3               55470.98     21764.46     77235.44       0.6482
-IVF-OPQ-nl25-m16-np1               37834.49      1933.77     39768.26       0.4276
-IVF-OPQ-nl25-m16-np2               37834.49      4025.42     41859.91       0.4301
-IVF-OPQ-nl25-m16-np3               37834.49      5763.66     43598.15       0.4301
-IVF-OPQ-nl25-m32-np1               47822.25      3493.76     51316.00       0.5954
-IVF-OPQ-nl25-m32-np2               47822.25      7706.54     55528.79       0.5999
-IVF-OPQ-nl25-m32-np3               47822.25     11739.57     59561.82       0.5999
-IVF-OPQ-nl25-m48-np1               51640.50      5674.73     57315.24       0.7033
-IVF-OPQ-nl25-m48-np2               51640.50     11638.28     63278.78       0.7094
-IVF-OPQ-nl25-m48-np3               51640.50     16903.51     68544.01       0.7094
-IVF-OPQ-nl50-m16-np2               37334.01      2935.00     40269.01       0.4415
-IVF-OPQ-nl50-m16-np5               37334.01      6892.96     44226.97       0.4506
-IVF-OPQ-nl50-m16-np7               37334.01      9405.37     46739.38       0.4506
-IVF-OPQ-nl50-m32-np2               50719.80      4147.20     54867.01       0.6094
-IVF-OPQ-nl50-m32-np5               50719.80      9577.93     60297.74       0.6258
-IVF-OPQ-nl50-m32-np7               50719.80     13890.93     64610.74       0.6258
-IVF-OPQ-nl50-m48-np2               54736.82      5700.03     60436.84       0.7125
-IVF-OPQ-nl50-m48-np5               54736.82     13270.29     68007.11       0.7347
-IVF-OPQ-nl50-m48-np7               54736.82     18383.74     73120.56       0.7347
-IVF-OPQ-nl100-m16-np5              42506.66      4788.26     47294.92       0.4498
-IVF-OPQ-nl100-m16-np10             42506.66      9006.51     51513.17       0.4537
-IVF-OPQ-nl100-m16-np15             42506.66     13459.61     55966.27       0.4537
-IVF-OPQ-nl100-m32-np5              50852.20      6860.73     57712.93       0.6212
-IVF-OPQ-nl100-m32-np10             50852.20     13261.77     64113.97       0.6288
-IVF-OPQ-nl100-m32-np15             50852.20     20121.47     70973.67       0.6289
-IVF-OPQ-nl100-m48-np5              66072.49      9583.98     75656.48       0.7256
-IVF-OPQ-nl100-m48-np10             66072.49     17642.62     83715.12       0.7362
-IVF-OPQ-nl100-m48-np15             66072.49     27090.41     93162.91       0.7363
+Exhaustive                            23.94    300669.42    300693.36       1.0000
+IVF-OPQ-nl273-m16-np13             48538.75      5168.65     53707.39       0.4567
+IVF-OPQ-nl273-m16-np16             48538.75      6243.53     54782.27       0.4575
+IVF-OPQ-nl273-m16-np23             48538.75      8749.50     57288.24       0.4576
+IVF-OPQ-nl273-m32-np13             56733.12      8602.57     65335.69       0.6295
+IVF-OPQ-nl273-m32-np16             56733.12     10411.57     67144.69       0.6312
+IVF-OPQ-nl273-m32-np23             56733.12     14800.91     71534.03       0.6316
+IVF-OPQ-nl273-m48-np13             68469.74     10826.48     79296.23       0.7334
+IVF-OPQ-nl273-m48-np16             68469.74     13173.62     81643.36       0.7360
+IVF-OPQ-nl273-m48-np23             68469.74     18713.54     87183.29       0.7365
+IVF-OPQ-nl387-m16-np19             58510.78      7467.02     65977.80       0.4579
+IVF-OPQ-nl387-m16-np27             58510.78      9919.46     68430.24       0.4585
+IVF-OPQ-nl387-m32-np19             74880.54     11942.58     86823.12       0.6319
+IVF-OPQ-nl387-m32-np27             74880.54     16289.07     91169.61       0.6334
+IVF-OPQ-nl387-m48-np19             73287.48     13815.35     87102.83       0.7356
+IVF-OPQ-nl387-m48-np27             73287.48     19191.27     92478.75       0.7377
+IVF-OPQ-nl547-m16-np23             66317.33      8294.84     74612.17       0.4603
+IVF-OPQ-nl547-m16-np27             66317.33      9636.94     75954.27       0.4610
+IVF-OPQ-nl547-m16-np33             66317.33     11443.52     77760.85       0.4614
+IVF-OPQ-nl547-m32-np23             78328.35     13391.88     91720.23       0.6308
+IVF-OPQ-nl547-m32-np27             78328.35     15424.57     93752.92       0.6324
+IVF-OPQ-nl547-m32-np33             78328.35     18499.00     96827.35       0.6333
+IVF-OPQ-nl547-m48-np23             84417.78     15267.71     99685.49       0.7349
+IVF-OPQ-nl547-m48-np27             84417.78     17701.44    102119.22       0.7372
+IVF-OPQ-nl547-m48-np33             84417.78     21675.29    106093.07       0.7386
 -----------------------------------------------------------------------------------
 ```
 
 ## GPU
 
 Two indices are also implemented in GPU-accelerated versions. The exhaustive
-search and the IVF index. Under the hood, this uses [cubecl]() with 
-wgpu backend (system agnostic, for details please check [here]()). Let's first
-look at the indices compared against exhaustive (CPU).
+search and the IVF index. Under the hood, this uses 
+[cubecl](https://github.com/tracel-ai/cubecl) with wgpu backend (system agnostic, 
+for details please check [here](https://burn.dev/books/cubecl/getting-started/installation.html)). 
+Let's first look at the indices compared against exhaustive (CPU). You can
+of course provide other backends.
 
 ### Comparison against CPU exhaustive
 
+The GPU acceleration is notable already in the exhaustive index. The IVF-GPU
+reaches very fast speeds here.
+
+**Euclidean:**
+
+```
+====================================================================================================
+Benchmark: 150k cells, 32D (CPU vs GPU Exhaustive vs IVF-GPU)
+====================================================================================================
+Method                                Build (ms)   Query (ms)   Total (ms)     Recall@k   Dist Error
+----------------------------------------------------------------------------------------------------
+CPU-Exhaustive                              3.41     23351.89     23355.30       1.0000     0.000000
+GPU-Exhaustive                              4.69     14489.47     14494.16       1.0000     0.000003
+IVF-GPU-kNN-nl273-np13                   1335.93      3047.53      4383.46       0.9954     0.036068
+IVF-GPU-kNN-nl273-np16                   1335.93      3421.05      4756.98       0.9998     0.001564
+IVF-GPU-kNN-nl273-np23                   1335.93      4549.04      5884.97       1.0000     0.000003
+IVF-GPU-kNN-nl273-np27                   1335.93      5251.19      6587.12       1.0000     0.000003
+IVF-GPU-kNN-nl387-np19                   1874.16      3398.09      5272.26       0.9962     0.020323
+IVF-GPU-kNN-nl387-np27                   1874.16      4177.51      6051.67       1.0000     0.000003
+IVF-GPU-kNN-nl387-np38                   1874.16      5570.25      7444.42       1.0000     0.000003
+IVF-GPU-kNN-nl547-np23                   2666.30      3514.38      6180.69       0.9905     0.043296
+IVF-GPU-kNN-nl547-np27                   2666.30      3644.23      6310.54       0.9971     0.009404
+IVF-GPU-kNN-nl547-np33                   2666.30      4212.87      6879.17       0.9997     0.000619
+IVF-GPU-kNN-nl547-np54                   2666.30      5952.71      8619.01       1.0000     0.000003
+----------------------------------------------------------------------------------------------------
+```
+
+**Cosine:**
+
+```
+====================================================================================================
+Benchmark: 150k cells, 32D (CPU vs GPU Exhaustive vs IVF-GPU)
+====================================================================================================
+Method                                Build (ms)   Query (ms)   Total (ms)     Recall@k   Dist Error
+----------------------------------------------------------------------------------------------------
+CPU-Exhaustive                              5.38     23923.51     23928.89       1.0000     0.000000
+GPU-Exhaustive                              4.59     14661.81     14666.40       1.0000     0.000000
+IVF-GPU-kNN-nl273-np13                   3911.37      3105.11      7016.47       0.9956     0.000021
+IVF-GPU-kNN-nl273-np16                   3911.37      3485.04      7396.40       0.9998     0.000001
+IVF-GPU-kNN-nl273-np23                   3911.37      4644.56      8555.93       1.0000     0.000000
+IVF-GPU-kNN-nl273-np27                   3911.37      5304.09      9215.46       1.0000     0.000000
+IVF-GPU-kNN-nl387-np19                   5494.76      3276.61      8771.36       0.9965     0.000012
+IVF-GPU-kNN-nl387-np27                   5494.76      4256.59      9751.34       1.0000     0.000000
+IVF-GPU-kNN-nl387-np38                   5494.76      5410.46     10905.22       1.0000     0.000000
+IVF-GPU-kNN-nl547-np23                   7799.18      3458.07     11257.26       0.9913     0.000026
+IVF-GPU-kNN-nl547-np27                   7799.18      3670.37     11469.55       0.9973     0.000006
+IVF-GPU-kNN-nl547-np33                   7799.18      4144.41     11943.59       0.9997     0.000000
+IVF-GPU-kNN-nl547-np54                   7799.18      5778.40     13577.59       1.0000     0.000000
+----------------------------------------------------------------------------------------------------
+```
+
 ### Comparison against IVF CPU
 
+In this case, the IVF CPU implementation is being compared against the GPU 
+version. GPU acceleration shines with larger data sets, hence, the number of
+samples was increased to 500_000 for these benchmarks.
+
+**IVF CPU:**
+
+```
+====================================================================================================
+Benchmark: 500k cells, 32D
+====================================================================================================
+Method                                Build (ms)   Query (ms)   Total (ms)     Recall@k   Dist Error
+----------------------------------------------------------------------------------------------------
+Exhaustive                                 11.83    258458.26    258470.09       1.0000     0.000000
+IVF-nl500-np22                           8518.95     47041.19     55560.14       0.9938     0.017566
+IVF-nl500-np25                           8518.95     52879.84     61398.78       0.9978     0.004195
+IVF-nl500-np31                           8518.95     65425.15     73944.10       0.9998     0.000204
+IVF-nl707-np26                          11304.72     37316.38     48621.10       0.9861     0.055255
+IVF-nl707-np35                          11304.72     48435.29     59740.01       0.9981     0.005750
+IVF-nl707-np37                          11304.72     50956.66     62261.38       0.9989     0.002849
+IVF-nl1000-np31                         15980.61     31357.65     47338.26       0.9787     0.093676
+IVF-nl1000-np44                         15980.61     43634.73     59615.34       0.9972     0.008673
+IVF-nl1000-np50                         15980.61     50370.27     66350.89       0.9992     0.001971
+----------------------------------------------------------------------------------------------------
+```
+
+**IVF GPU:**
+
+```
+====================================================================================================
+Benchmark: 500k cells, 32D (CPU vs GPU Exhaustive vs IVF-GPU)
+====================================================================================================
+Method                                Build (ms)   Query (ms)   Total (ms)     Recall@k   Dist Error
+----------------------------------------------------------------------------------------------------
+CPU-Exhaustive                             11.21    261010.65    261021.87       1.0000     0.000000
+GPU-Exhaustive                             20.81    175500.07    175520.88       1.0000     0.000002
+IVF-GPU-kNN-nl500-np22                   7979.49     24180.63     32160.12       0.9938     0.017569
+IVF-GPU-kNN-nl500-np25                   7979.49     26730.53     34710.02       0.9978     0.004182
+IVF-GPU-kNN-nl500-np31                   7979.49     30677.90     38657.39       0.9998     0.000206
+IVF-GPU-kNN-nl500-np50                   7979.49     47844.94     55824.44       1.0000     0.000002
+IVF-GPU-kNN-nl707-np26                  11900.13     22641.16     34541.29       0.9861     0.055257
+IVF-GPU-kNN-nl707-np35                  11900.13     27722.34     39622.47       0.9981     0.005752
+IVF-GPU-kNN-nl707-np37                  11900.13     29293.64     41193.77       0.9989     0.002852
+IVF-GPU-kNN-nl707-np70                  11900.13     51075.16     62975.29       1.0000     0.000002
+IVF-GPU-kNN-nl1000-np31                 16655.31     20986.76     37642.07       0.9787     0.093678
+IVF-GPU-kNN-nl1000-np44                 16655.31     26519.50     43174.81       0.9972     0.008676
+IVF-GPU-kNN-nl1000-np50                 16655.31     30444.66     47099.97       0.9992     0.001973
+IVF-GPU-kNN-nl1000-np100                16655.31     52896.22     69551.53       1.0000     0.000002
+```
+
 ### Higher dimensionality
+
+Similar to the quantised indices, this shows 
 
 ## Licence
 

@@ -512,10 +512,6 @@ where
 // IVF //
 /////////
 
-/////////
-// IVF //
-/////////
-
 /// Build an IVF index
 ///
 /// ### Params
@@ -654,49 +650,9 @@ pub fn query_ivf_sq8_index<T>(
 where
     T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum,
 {
-    let n_samples = query_mat.nrows();
-    let counter = Arc::new(AtomicUsize::new(0));
-
-    if return_dist {
-        let results: Vec<(Vec<usize>, Vec<T>)> = (0..n_samples)
-            .into_par_iter()
-            .map(|i| {
-                let (neighbours, scores) = index.query_row(query_mat.row(i), k, nprobe);
-                if verbose {
-                    let count = counter.fetch_add(1, Ordering::Relaxed) + 1;
-                    if count.is_multiple_of(100_000) {
-                        println!(
-                            "  Processed {} / {} samples.",
-                            count.separate_with_underscores(),
-                            n_samples.separate_with_underscores()
-                        );
-                    }
-                }
-                (neighbours, scores)
-            })
-            .collect();
-        let (indices, scores) = results.into_iter().unzip();
-        (indices, Some(scores))
-    } else {
-        let indices: Vec<Vec<usize>> = (0..n_samples)
-            .into_par_iter()
-            .map(|i| {
-                let (neighbours, _) = index.query_row(query_mat.row(i), k, nprobe);
-                if verbose {
-                    let count = counter.fetch_add(1, Ordering::Relaxed) + 1;
-                    if count.is_multiple_of(100_000) {
-                        println!(
-                            "  Processed {} / {} samples.",
-                            count.separate_with_underscores(),
-                            n_samples.separate_with_underscores()
-                        );
-                    }
-                }
-                neighbours
-            })
-            .collect();
-        (indices, None)
-    }
+    query_parallel(query_mat.nrows(), return_dist, verbose, |i| {
+        index.query_row(query_mat.row(i), k, nprobe)
+    })
 }
 
 ////////////
@@ -774,51 +730,9 @@ pub fn query_ivf_pq_index<T>(
 where
     T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum,
 {
-    let n_samples = query_mat.nrows();
-    let counter = Arc::new(AtomicUsize::new(0));
-
-    if return_dist {
-        let results: Vec<(Vec<usize>, Vec<T>)> = (0..n_samples)
-            .into_par_iter()
-            .map(|i| {
-                let (neighbours, scores) = index.query_row(query_mat.row(i), k, nprobe);
-                if verbose {
-                    let count = counter.fetch_add(1, Ordering::Relaxed) + 1;
-                    if count.is_multiple_of(100_000) {
-                        println!(
-                            "  Processed {} / {} samples.",
-                            count.separate_with_underscores(),
-                            n_samples.separate_with_underscores()
-                        );
-                    }
-                }
-                (neighbours, scores)
-            })
-            .collect();
-
-        let (indices, scores) = results.into_iter().unzip();
-        (indices, Some(scores))
-    } else {
-        let indices: Vec<Vec<usize>> = (0..n_samples)
-            .into_par_iter()
-            .map(|i| {
-                let (neighbours, _) = index.query_row(query_mat.row(i), k, nprobe);
-                if verbose {
-                    let count = counter.fetch_add(1, Ordering::Relaxed) + 1;
-                    if count.is_multiple_of(100_000) {
-                        println!(
-                            "  Processed {} / {} samples.",
-                            count.separate_with_underscores(),
-                            n_samples.separate_with_underscores()
-                        );
-                    }
-                }
-                neighbours
-            })
-            .collect();
-
-        (indices, None)
-    }
+    query_parallel(query_mat.nrows(), return_dist, verbose, |i| {
+        index.query_row(query_mat.row(i), k, nprobe)
+    })
 }
 
 /////////////
@@ -898,51 +812,9 @@ pub fn query_ivf_opq_index<T>(
 where
     T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum + AddAssign,
 {
-    let n_samples = query_mat.nrows();
-    let counter = Arc::new(AtomicUsize::new(0));
-
-    if return_dist {
-        let results: Vec<(Vec<usize>, Vec<T>)> = (0..n_samples)
-            .into_par_iter()
-            .map(|i| {
-                let (neighbours, scores) = index.query_row(query_mat.row(i), k, nprobe);
-                if verbose {
-                    let count = counter.fetch_add(1, Ordering::Relaxed) + 1;
-                    if count.is_multiple_of(100_000) {
-                        println!(
-                            "  Processed {} / {} samples.",
-                            count.separate_with_underscores(),
-                            n_samples.separate_with_underscores()
-                        );
-                    }
-                }
-                (neighbours, scores)
-            })
-            .collect();
-
-        let (indices, scores) = results.into_iter().unzip();
-        (indices, Some(scores))
-    } else {
-        let indices: Vec<Vec<usize>> = (0..n_samples)
-            .into_par_iter()
-            .map(|i| {
-                let (neighbours, _) = index.query_row(query_mat.row(i), k, nprobe);
-                if verbose {
-                    let count = counter.fetch_add(1, Ordering::Relaxed) + 1;
-                    if count.is_multiple_of(100_000) {
-                        println!(
-                            "  Processed {} / {} samples.",
-                            count.separate_with_underscores(),
-                            n_samples.separate_with_underscores()
-                        );
-                    }
-                }
-                neighbours
-            })
-            .collect();
-
-        (indices, None)
-    }
+    query_parallel(query_mat.nrows(), return_dist, verbose, |i| {
+        index.query_row(query_mat.row(i), k, nprobe)
+    })
 }
 
 /////////
@@ -1008,10 +880,6 @@ where
     }
 }
 
-/////////////
-// IVF GPU //
-/////////////
-
 //////////////
 // IVF GPU //
 //////////////
@@ -1027,7 +895,7 @@ where
 /// * `seed` - Random seed
 /// * `verbose` - Print progress
 /// * `device` - GPU device
-pub fn build_ivf_index_gpu_batched<T, R>(
+pub fn build_ivf_index_gpu<T, R>(
     mat: MatRef<T>,
     nlist: Option<usize>,
     max_iters: Option<usize>,
@@ -1058,7 +926,7 @@ where
 /// ### Returns
 ///
 /// Tuple of (indices, optional distances)
-pub fn query_ivf_index_gpu_batched<T, R>(
+pub fn query_ivf_index_gpu<T, R>(
     query_mat: MatRef<T>,
     index: &IvfIndexGpu<T, R>,
     k: usize,

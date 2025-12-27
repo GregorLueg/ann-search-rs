@@ -134,7 +134,7 @@ fn main() {
     for nlist in nlist_values {
         println!("Building IVF-GPU index (nlist={})...", nlist);
         let start = Instant::now();
-        let ivf_gpu_idx = build_ivf_index_gpu_batched::<f32, cubecl::wgpu::WgpuRuntime>(
+        let ivf_gpu_idx = build_ivf_index_gpu::<f32, cubecl::wgpu::WgpuRuntime>(
             data.as_ref(),
             Some(nlist),
             None,
@@ -169,7 +169,7 @@ fn main() {
                 nlist, nprobe
             );
             let start = Instant::now();
-            let (knn_neighbors, knn_distances) = query_ivf_index_gpu_batched(
+            let (knn_neighbors, knn_distances) = query_ivf_index_gpu(
                 data.as_ref(),
                 &ivf_gpu_idx,
                 cli.k,

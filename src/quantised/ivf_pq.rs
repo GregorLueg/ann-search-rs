@@ -106,6 +106,10 @@ where
     }
 }
 
+////////////////
+// Main index //
+////////////////
+
 impl<T> IvfPqIndex<T>
 where
     T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum,

@@ -4,8 +4,6 @@ use num_traits::Float;
 // Float on heap //
 ///////////////////
 
-/// Wrapper for f32 that implements Ord for use in BinaryHeap
-///
 /// Faster than the sorts on full vectors and allows to keep data on heap
 #[derive(Clone, Copy, Debug)]
 pub struct OrderedFloat<T>(pub T);
@@ -44,7 +42,7 @@ impl<T: Float> Ord for OrderedFloat<T> {
 ///
 /// Maintains elements in ascending order. For smaller data sets, this can
 /// be faster than using heap.
-/// 
+///
 /// - Better cache locality (sequential access)
 /// - Fewer comparisons (binary search vs heap operations)
 /// - No heap maintenance overhead
