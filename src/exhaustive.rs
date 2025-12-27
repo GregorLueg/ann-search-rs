@@ -40,17 +40,14 @@ impl<T> VectorDistance<T> for ExhaustiveIndex<T>
 where
     T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum,
 {
-    /// Return the flat vectors
     fn vectors_flat(&self) -> &[T] {
         &self.vectors_flat
     }
 
-    /// Return the original dimensions
     fn dim(&self) -> usize {
         self.dim
     }
 
-    /// Return the normalised values for the Cosine calculation
     fn norms(&self) -> &[T] {
         &self.norms
     }

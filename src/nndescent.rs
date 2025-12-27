@@ -62,17 +62,23 @@ impl<T: Copy> Neighbour<T> {
 /// The sorted application approach allows lock-free processing since updates
 /// are grouped by target node.
 pub trait ApplySortedUpdates<T> {
-    /// Apply pre-sorted updates to the graph
+    /// Apply sorted updates to the graph
     ///
-    /// Updates must be sorted by target node (first element of tuple).
-    /// This allows lock-free, cache-friendly processing where each target
-    /// node's updates are processed as a contiguous batch.
+    /// ## Algorithm
+    ///
+    /// 1. Find boundaries between different target nodes in the sorted updates
+    /// 2. Extract each target's update batch as a contiguous slice
+    /// 3. Process batches in parallel - no locks needed since each batch
+    ///    updates a different node
+    /// 4. For each batch, merge new candidates with existing neighbours,
+    ///    keeping only the k-best
+    /// 5. Apply results back to the graph
     ///
     /// ### Params
     ///
-    /// * `updates` - Sorted list of (target, source, distance) tuples
-    /// * `graph` - Current k-NN graph to update
-    /// * `updates_count` - Atomic counter for tracking edge updates
+    /// * `updates` - MUST be sorted by target (first element)
+    /// * `graph` - Graph to update
+    /// * `updates_count` - Atomic counter for edge updates
     fn apply_sorted_updates(
         &self,
         updates: &[(usize, usize, T)],
@@ -83,6 +89,21 @@ pub trait ApplySortedUpdates<T> {
 
 /// Trait for querying the NN-Descent index
 pub trait NNDescentQuery<T> {
+    /// Internal query dispatch method
+    ///
+    /// Delegates to metric-specific query implementation using thread-local
+    /// storage to avoid allocations.
+    ///
+    /// ### Params
+    ///
+    /// * `query_vec` - Query vector
+    /// * `query_norm` - Pre-computed norm (used for Cosine only)
+    /// * `k` - Number of neighbours to return
+    /// * `ef` - Beam width for search
+    ///
+    /// ### Returns
+    ///
+    /// Tuple of (indices, distances)
     fn query_internal(
         &self,
         query_vec: &[T],
@@ -91,6 +112,23 @@ pub trait NNDescentQuery<T> {
         ef: usize,
     ) -> (Vec<usize>, Vec<T>);
 
+    /// Query using Euclidean distance with beam search
+    ///
+    /// Uses the Annoy forest for entry points, then performs beam search
+    /// on the k-NN graph to find approximate nearest neighbours.
+    ///
+    /// ### Params
+    ///
+    /// * `query_vec` - Query vector
+    /// * `k` - Number of neighbours to return
+    /// * `ef` - Beam width for search
+    /// * `visited` - Bitset to track visited nodes
+    /// * `candidates` - Min-heap of candidate nodes to explore
+    /// * `results` - Max-heap of current best results
+    ///
+    /// ### Returns
+    ///
+    /// Tuple of (indices, distances)
     fn query_euclidean(
         &self,
         query_vec: &[T],
@@ -101,6 +139,24 @@ pub trait NNDescentQuery<T> {
         results: &mut BinaryHeap<(OrderedFloat<T>, usize)>,
     ) -> (Vec<usize>, Vec<T>);
 
+    /// Query using Cosine distance with beam search
+    ///
+    /// Uses the Annoy forest for entry points, then performs beam search
+    /// on the k-NN graph to find approximate nearest neighbours.
+    ///
+    /// ### Params
+    ///
+    /// * `query_vec` - Query vector
+    /// * `query_norm` - Pre-computed norm of query vector
+    /// * `k` - Number of neighbours to return
+    /// * `ef` - Beam width for search
+    /// * `visited` - Bitset to track visited nodes
+    /// * `candidates` - Min-heap of candidate nodes to explore
+    /// * `results` - Max-heap of current best results
+    ///
+    /// ### Returns
+    ///
+    /// Tuple of (indices, distances)
     #[allow(clippy::too_many_arguments)]
     fn query_cosine(
         &self,
@@ -170,17 +226,14 @@ impl<T> VectorDistance<T> for NNDescent<T>
 where
     T: Float + FromPrimitive + Send + Sync + Sum,
 {
-    /// Return the flat vectors
     fn vectors_flat(&self) -> &[T] {
         &self.vectors_flat
     }
 
-    /// Return the original dimensions
     fn dim(&self) -> usize {
         self.dim
     }
 
-    /// Return the normalised values for the Cosine calculation
     fn norms(&self) -> &[T] {
         &self.norms
     }
@@ -1035,36 +1088,6 @@ type SegmentF32<'a> = Vec<(usize, &'a [(usize, usize, f32)])>;
 type SegmentResultsF32 = Vec<(usize, Option<(Vec<Neighbour<f32>>, usize)>)>;
 
 impl ApplySortedUpdates<f32> for NNDescent<f32> {
-    /// Apply sorted updates to the graph (f32 version)
-    ///
-    /// ## Algorithm
-    ///
-    /// 1. Find boundaries between different target nodes in the sorted updates
-    /// 2. Extract each target's update batch as a contiguous slice
-    /// 3. Process batches in parallel - no locks needed since each batch
-    ///    updates a different node
-    /// 4. For each batch, merge new candidates with existing neighbours,
-    ///    keeping only the k-best
-    /// 5. Apply results back to the graph
-    ///
-    /// ## Why this is faster than the old approach
-    ///
-    /// Old approach:
-    /// - Build per_node[i] vectors by iterating all updates twice
-    /// - Process nodes in parallel with thread-local heaps
-    /// - Lots of small allocations and cache misses
-    ///
-    /// New approach:
-    /// - Single sort (parallel, cache-friendly)
-    /// - Each node's updates are contiguous in memory
-    /// - No intermediate per_node vectors needed
-    /// - Still parallel over nodes
-    ///
-    /// ### Params
-    ///
-    /// * `updates` - MUST be sorted by target (first element)
-    /// * `graph` - Graph to update
-    /// * `updates_count` - Atomic counter for edge updates
     fn apply_sorted_updates(
         &self,
         updates: &[(usize, usize, f32)],
@@ -1075,12 +1098,8 @@ impl ApplySortedUpdates<f32> for NNDescent<f32> {
             return;
         }
 
-        // CHANGE: Find where target node changes in the sorted array
-        // This gives us independent batches that can be processed in parallel
         let boundaries = find_target_boundaries(updates);
 
-        // CHANGE: Build (target_node, update_slice) pairs
-        // Each slice contains all updates for one target node
         let segments: SegmentF32 = boundaries
             .windows(2)
             .filter_map(|w| {
@@ -1094,8 +1113,6 @@ impl ApplySortedUpdates<f32> for NNDescent<f32> {
             })
             .collect();
 
-        // CHANGE: Process segments in parallel
-        // Each segment updates a different node, so no synchronisation needed
         let results: SegmentResultsF32 = segments
             .par_iter()
             .map(|&(target, segment)| {
@@ -1117,15 +1134,12 @@ impl ApplySortedUpdates<f32> for NNDescent<f32> {
 
                         let mut edge_updates = 0usize;
 
-                        // Add existing neighbours to heap
                         for n in &graph[target] {
                             let pid = n.pid();
                             heap.push((OrderedFloat(n.dist), pid, n.is_new()));
                             pid_set[pid] = true;
                         }
 
-                        // CHANGE: Process candidates directly from sorted slice
-                        // No need to build intermediate per_node vectors
                         for &(_, source, dist) in segment {
                             if pid_set[source] {
                                 continue;
@@ -1169,7 +1183,6 @@ impl ApplySortedUpdates<f32> for NNDescent<f32> {
                                 )),
                             )
                         } else {
-                            // Clean up pid_set
                             for (_, pid, _) in heap.iter() {
                                 pid_set[*pid] = false;
                             }
@@ -1180,7 +1193,6 @@ impl ApplySortedUpdates<f32> for NNDescent<f32> {
             })
             .collect();
 
-        // Apply results back to graph
         let mut total_updates = 0;
         for (target, result) in results {
             if let Some((new_neighbours, count)) = result {
@@ -1201,10 +1213,6 @@ type SegmentF64<'a> = Vec<(usize, &'a [(usize, usize, f64)])>;
 type SegmentResultsF64 = Vec<(usize, Option<(Vec<Neighbour<f64>>, usize)>)>;
 
 impl ApplySortedUpdates<f64> for NNDescent<f64> {
-    /// Apply sorted updates to the graph (f64 version)
-    ///
-    /// Identical logic to f32 version, using HEAP_F64 thread-local storage.
-    /// See f32 implementation for detailed documentation.
     fn apply_sorted_updates(
         &self,
         updates: &[(usize, usize, f64)],
@@ -1330,21 +1338,6 @@ impl ApplySortedUpdates<f64> for NNDescent<f64> {
 /////////
 
 impl NNDescentQuery<f32> for NNDescent<f32> {
-    /// Internal query dispatch method
-    ///
-    /// Delegates to metric-specific query implementation using thread-local
-    /// storage to avoid allocations.
-    ///
-    /// ### Params
-    ///
-    /// * `query_vec` - Query vector
-    /// * `query_norm` - Pre-computed norm (used for Cosine only)
-    /// * `k` - Number of neighbours to return
-    /// * `ef` - Beam width for search
-    ///
-    /// ### Returns
-    ///
-    /// Tuple of (indices, distances)
     fn query_internal(
         &self,
         query_vec: &[f32],
@@ -1391,23 +1384,6 @@ impl NNDescentQuery<f32> for NNDescent<f32> {
         })
     }
 
-    /// Query using Euclidean distance with beam search
-    ///
-    /// Uses the Annoy forest for entry points, then performs beam search
-    /// on the k-NN graph to find approximate nearest neighbours.
-    ///
-    /// ### Params
-    ///
-    /// * `query_vec` - Query vector
-    /// * `k` - Number of neighbours to return
-    /// * `ef` - Beam width for search
-    /// * `visited` - Bitset to track visited nodes
-    /// * `candidates` - Min-heap of candidate nodes to explore
-    /// * `results` - Max-heap of current best results
-    ///
-    /// ### Returns
-    ///
-    /// Tuple of (indices, distances)
     #[inline(always)]
     fn query_euclidean(
         &self,
@@ -1492,24 +1468,6 @@ impl NNDescentQuery<f32> for NNDescent<f32> {
             .unzip()
     }
 
-    /// Query using Cosine distance with beam search
-    ///
-    /// Uses the Annoy forest for entry points, then performs beam search
-    /// on the k-NN graph to find approximate nearest neighbours.
-    ///
-    /// ### Params
-    ///
-    /// * `query_vec` - Query vector
-    /// * `query_norm` - Pre-computed norm of query vector
-    /// * `k` - Number of neighbours to return
-    /// * `ef` - Beam width for search
-    /// * `visited` - Bitset to track visited nodes
-    /// * `candidates` - Min-heap of candidate nodes to explore
-    /// * `results` - Max-heap of current best results
-    ///
-    /// ### Returns
-    ///
-    /// Tuple of (indices, distances)
     #[inline(always)]
     fn query_cosine(
         &self,
@@ -1595,21 +1553,6 @@ impl NNDescentQuery<f32> for NNDescent<f32> {
 /////////
 
 impl NNDescentQuery<f64> for NNDescent<f64> {
-    /// Internal query dispatch method
-    ///
-    /// Delegates to metric-specific query implementation using thread-local
-    /// storage to avoid allocations.
-    ///
-    /// ### Params
-    ///
-    /// * `query_vec` - Query vector
-    /// * `query_norm` - Pre-computed norm (used for Cosine only)
-    /// * `k` - Number of neighbours to return
-    /// * `ef` - Beam width for search
-    ///
-    /// ### Returns
-    ///
-    /// Tuple of (indices, distances)
     fn query_internal(
         &self,
         query_vec: &[f64],
@@ -1655,23 +1598,6 @@ impl NNDescentQuery<f64> for NNDescent<f64> {
         })
     }
 
-    /// Query using Euclidean distance with beam search
-    ///
-    /// Uses the Annoy forest for entry points, then performs beam search
-    /// on the k-NN graph to find approximate nearest neighbours.
-    ///
-    /// ### Params
-    ///
-    /// * `query_vec` - Query vector
-    /// * `k` - Number of neighbours to return
-    /// * `ef` - Beam width for search
-    /// * `visited` - Bitset to track visited nodes
-    /// * `candidates` - Min-heap of candidate nodes to explore
-    /// * `results` - Max-heap of current best results
-    ///
-    /// ### Returns
-    ///
-    /// Tuple of (indices, distances)
     #[inline(always)]
     fn query_euclidean(
         &self,
@@ -1755,24 +1681,6 @@ impl NNDescentQuery<f64> for NNDescent<f64> {
             .unzip()
     }
 
-    /// Query using Cosine distance with beam search
-    ///
-    /// Uses the Annoy forest for entry points, then performs beam search
-    /// on the k-NN graph to find approximate nearest neighbours.
-    ///
-    /// ### Params
-    ///
-    /// * `query_vec` - Query vector
-    /// * `query_norm` - Pre-computed norm of query vector
-    /// * `k` - Number of neighbours to return
-    /// * `ef` - Beam width for search
-    /// * `visited` - Bitset to track visited nodes
-    /// * `candidates` - Min-heap of candidate nodes to explore
-    /// * `results` - Max-heap of current best results
-    ///
-    /// ### Returns
-    ///
-    /// Tuple of (indices, distances)
     #[inline(always)]
     fn query_cosine(
         &self,
@@ -1863,18 +1771,15 @@ where
     Self: ApplySortedUpdates<T>,
     Self: NNDescentQuery<T>,
 {
-    /// Internal querying function
     fn query_for_validation(&self, query_vec: &[T], k: usize) -> (Vec<usize>, Vec<T>) {
         // Default budget
         self.query(query_vec, k, None)
     }
 
-    /// Returns n
     fn n(&self) -> usize {
         self.n
     }
 
-    /// Returns the distance metric
     fn metric(&self) -> Dist {
         self.metric
     }

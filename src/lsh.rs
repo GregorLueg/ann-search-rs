@@ -58,17 +58,14 @@ impl<T> VectorDistance<T> for LSHIndex<T>
 where
     T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum,
 {
-    /// Return the flat vectors
     fn vectors_flat(&self) -> &[T] {
         &self.vectors_flat
     }
 
-    /// Return the original dimensions
     fn dim(&self) -> usize {
         self.dim
     }
 
-    /// Return the normalised values for the Cosine calculation
     fn norms(&self) -> &[T] {
         &self.norms
     }
@@ -729,19 +726,16 @@ where
     T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum,
     Self: LSHQuery<T>,
 {
-    /// Internal querying function
     fn query_for_validation(&self, query_vec: &[T], k: usize) -> (Vec<usize>, Vec<T>) {
         // No maximum candidates here...
         let (indices, dist, _) = self.query(query_vec, k, None);
         (indices, dist)
     }
 
-    /// Returns n
     fn n(&self) -> usize {
         self.n
     }
 
-    /// Returns the distance metric
     fn metric(&self) -> Dist {
         self.metric
     }

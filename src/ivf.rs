@@ -47,17 +47,14 @@ impl<T> VectorDistance<T> for IvfIndex<T>
 where
     T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum,
 {
-    /// Return the flat vectors
     fn vectors_flat(&self) -> &[T] {
         &self.vectors_flat
     }
 
-    /// Return the original dimensions
     fn dim(&self) -> usize {
         self.dim
     }
 
-    /// Return the normalised values for the Cosine calculation
     fn norms(&self) -> &[T] {
         &self.norms
     }
@@ -71,22 +68,18 @@ impl<T> CentroidDistance<T> for IvfIndex<T>
 where
     T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum,
 {
-    /// Get the centroids
     fn centroids(&self) -> &[T] {
         &self.centroids
     }
 
-    /// Get the dimensions
     fn dim(&self) -> usize {
         self.dim
     }
 
-    /// Get the distance metric
     fn metric(&self) -> Dist {
         self.metric
     }
 
-    /// Get the number of lists
     fn nlist(&self) -> usize {
         self.nlist
     }
@@ -307,17 +300,14 @@ impl<T> KnnValidation<T> for IvfIndex<T>
 where
     T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum,
 {
-    /// Internal querying function
     fn query_for_validation(&self, query_vec: &[T], k: usize) -> (Vec<usize>, Vec<T>) {
         self.query(query_vec, k, None)
     }
 
-    /// Returns n
     fn n(&self) -> usize {
         self.n
     }
 
-    /// Returns the distance metric
     fn metric(&self) -> Dist {
         self.metric
     }

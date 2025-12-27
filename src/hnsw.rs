@@ -462,17 +462,14 @@ impl<T> VectorDistance<T> for HnswIndex<T>
 where
     T: Float + FromPrimitive + Send + Sync + Sum,
 {
-    /// Get the flat vectors
     fn vectors_flat(&self) -> &[T] {
         &self.vectors_flat
     }
 
-    /// Get the dimensions
     fn dim(&self) -> usize {
         self.dim
     }
 
-    /// The the norms for Cosine distance calculations
     fn norms(&self) -> &[T] {
         &self.norms
     }
@@ -1294,17 +1291,14 @@ where
     T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum,
     Self: HnswState<T>,
 {
-    /// Internal querying function
     fn query_for_validation(&self, query_vec: &[T], k: usize) -> (Vec<usize>, Vec<T>) {
         self.query(query_vec, k, 200)
     }
 
-    /// Returns n
     fn n(&self) -> usize {
         self.n
     }
 
-    /// Returns the distance metric
     fn metric(&self) -> Dist {
         self.metric
     }

@@ -312,6 +312,149 @@ where
     }
 }
 
+///////////////////////
+// VectorDistanceAdc //
+///////////////////////
+
+pub trait VectorDistanceAdc<T>
+where
+    T: Float + FromPrimitive + ToPrimitive + Sum,
+{
+    /// Get the m value from the codebook
+    fn codebook_m(&self) -> usize;
+
+    /// Get the number of centroids from the codebook
+    fn codebook_n_centroids(&self) -> usize;
+
+    /// Get the subvector dimensions from the codebook
+    fn codebook_subvec_dim(&self) -> usize;
+
+    /// Get the internal flat centroids representation
+    fn centroids(&self) -> &[T];
+
+    /// Get the internal dimensions
+    fn dim(&self) -> usize;
+
+    /// Return the codebooks data
+    fn codebooks(&self) -> &[Vec<T>];
+
+    /// Get the quantised codes
+    fn quantised_codes(&self) -> &[u8];
+
+    /// Build ADC lookup tables for a specific cluster
+    ///
+    /// ### Params
+    ///
+    /// * `query` - The query vector
+    /// * `cluster_idx`
+    ///
+    /// ### Returns
+    ///
+    /// Lookup table as flat Vec<T> of size M * n_centroids
+    fn build_lookup_tables(&self, query_vec: &[T], cluster_idx: usize) -> Vec<T> {
+        let m = self.codebook_m();
+        let subvec_dim = self.codebook_subvec_dim();
+        let n_cents = self.codebook_n_centroids();
+
+        let centroid = &self.centroids()[cluster_idx * self.dim()..(cluster_idx + 1) * self.dim()];
+
+        let query_residual: Vec<T> = query_vec
+            .iter()
+            .zip(centroid.iter())
+            .map(|(&q, &c)| q - c)
+            .collect();
+
+        let mut table = vec![T::zero(); m * n_cents];
+
+        for subspace in 0..m {
+            let query_sub = &query_residual[subspace * subvec_dim..(subspace + 1) * subvec_dim];
+            let table_offset = subspace * n_cents;
+
+            for centroid_idx in 0..n_cents {
+                let centroid_start = centroid_idx * subvec_dim;
+                let pq_centroid =
+                    &self.codebooks()[subspace][centroid_start..centroid_start + subvec_dim];
+
+                // squared Euclidean distance for ADC
+                let dist: T = query_sub
+                    .iter()
+                    .zip(pq_centroid.iter())
+                    .map(|(&q, &c)| {
+                        let diff = q - c;
+                        diff * diff
+                    })
+                    .sum();
+
+                table[table_offset + centroid_idx] = dist;
+            }
+        }
+
+        table
+    }
+
+    /// Compute distance using ADC lookup tables
+    ///
+    /// Optimised with manual unrolling and unsafe indexing for small m
+    ///
+    /// ### Params
+    ///
+    /// * `vec_idx` - Index of database vector
+    /// * `lookup_tables` - Precomputed distance table (flat layout)
+    ///
+    /// ### Returns
+    ///
+    /// Approximate distance
+    #[inline(always)]
+    fn compute_distance_adc(&self, vec_idx: usize, lookup_table: &[T]) -> T {
+        let m = self.codebook_m();
+        let n_cents = self.codebook_n_centroids();
+        let codes_start = vec_idx * m;
+        let codes = &self.quantised_codes()[codes_start..codes_start + m];
+
+        // manual unrolling for common small m values with unsafe indexing
+        match m {
+            8 => {
+                let mut sum = T::zero();
+                for i in 0..8 {
+                    let code = unsafe { *codes.get_unchecked(i) } as usize;
+                    let offset = i * n_cents + code;
+                    sum = sum + unsafe { *lookup_table.get_unchecked(offset) };
+                }
+                sum
+            }
+            16 => {
+                let mut sum = T::zero();
+                for i in 0..16 {
+                    let code = unsafe { *codes.get_unchecked(i) } as usize;
+                    let offset = i * n_cents + code;
+                    sum = sum + unsafe { *lookup_table.get_unchecked(offset) };
+                }
+                sum
+            }
+            32 => {
+                let mut sum = T::zero();
+                for i in 0..32 {
+                    let code = unsafe { *codes.get_unchecked(i) } as usize;
+                    let offset = i * n_cents + code;
+                    sum = sum + unsafe { *lookup_table.get_unchecked(offset) };
+                }
+                sum
+            }
+            _ => {
+                // Generic fallback for other m values
+                codes
+                    .iter()
+                    .enumerate()
+                    .map(|(subspace, &code)| {
+                        let offset = subspace * n_cents + (code as usize);
+                        lookup_table[offset]
+                    })
+                    .fold(T::zero(), |acc, x| acc + x)
+            }
+        }
+    }
+}
+
 ///////////////
 // Functions //
 ///////////////
