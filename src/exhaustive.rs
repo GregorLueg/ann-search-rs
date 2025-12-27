@@ -1,6 +1,8 @@
 use faer::{MatRef, RowRef};
 use num_traits::{Float, FromPrimitive, ToPrimitive};
+use rayon::prelude::*;
 use std::{collections::BinaryHeap, iter::Sum};
+use thousands::*;
 
 use crate::utils::dist::*;
 use crate::utils::heap_structs::*;
@@ -16,8 +18,8 @@ use crate::utils::matrix_to_flat;
 ///
 /// * `vectors_flat` - Original vector data for distance calculations. Flattened
 ///   for better cache locality
-/// * `norms` - Normalised pre-calculated values per sample if distance is set to
-///   Cosine
+/// * `norms` - Normalised pre-calculated values per sample if distance is set
+///   to Cosine
 /// * `dim` - Embedding dimensions
 /// * `n` - Number of samples
 /// * `dist_metric` - The type of distance the index is designed for
@@ -205,6 +207,64 @@ where
 
         let query_vec: Vec<T> = query_row.iter().cloned().collect();
         self.query(&query_vec, k)
+    }
+
+    /// Generate kNN graph from vectors stored in the index
+    ///
+    /// Queries each vector in the index against itself to build a complete
+    /// kNN graph.
+    ///
+    /// ### Params
+    ///
+    /// * `k` - Number of neighbours per vector
+    /// * `return_dist` - Whether to return distances
+    ///
+    /// ### Returns
+    ///
+    /// Tuple of `(knn_indices, optional distances)` where each row corresponds
+    /// to a vector in the index
+    pub fn generate_knn(
+        &self,
+        k: usize,
+        return_dist: bool,
+        verbose: bool,
+    ) -> (Vec<Vec<usize>>, Option<Vec<Vec<T>>>) {
+        use std::sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        };
+
+        let counter = Arc::new(AtomicUsize::new(0));
+
+        let results: Vec<(Vec<usize>, Vec<T>)> = (0..self.n)
+            .into_par_iter()
+            .map(|i| {
+                let start = i * self.dim;
+                let end = start + self.dim;
+                let vec = &self.vectors_flat[start..end];
+
+                if verbose {
+                    let count = counter.fetch_add(1, Ordering::Relaxed) + 1;
+                    if count.is_multiple_of(100_000) {
+                        println!(
+                            "  Processed {} / {} samples.",
+                            count.separate_with_underscores(),
+                            self.n.separate_with_underscores()
+                        );
+                    }
+                }
+
+                self.query(vec, k)
+            })
+            .collect();
+
+        if return_dist {
+            let (indices, distances) = results.into_iter().unzip();
+            (indices, Some(distances))
+        } else {
+            let indices: Vec<Vec<usize>> = results.into_iter().map(|(idx, _)| idx).collect();
+            (indices, None)
+        }
     }
 }
 

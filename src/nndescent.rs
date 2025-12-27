@@ -1,4 +1,4 @@
-use faer::MatRef;
+use faer::{MatRef, RowRef};
 use fixedbitset::FixedBitSet;
 use num_traits::{Float, FromPrimitive, ToPrimitive};
 use rand::{rngs::SmallRng, Rng, SeedableRng};
@@ -192,6 +192,10 @@ where
     Self: ApplySortedUpdates<T>,
     Self: NNDescentQuery<T>,
 {
+    //////////////////////
+    // Index generation //
+    //////////////////////
+
     /// Build a new NN-Descent index
     ///
     /// ### Params
@@ -289,40 +293,6 @@ where
             converged: build_graph.1,
             forest: builder.forest,
         }
-    }
-
-    /// Query for k nearest neighbours using beam search
-    ///
-    /// Performs beam search over the k-NN graph, starting from candidates
-    /// provided by the Annoy index. The search expands outward through the
-    /// graph, maintaining a priority queue of the best candidates found.
-    ///
-    /// ### Params
-    ///
-    /// * `query_vec` - Query vector (must match index dimensionality)
-    /// * `k` - Number of neighbours to return
-    /// * `ef_search` - Search beam width. Higher values improve recall but
-    ///   increase query time. Defaults to `max(2×k, 50)` clamped to 200.
-    ///
-    /// ### Returns
-    ///
-    /// Tuple of `(indices, distances)` sorted by distance (nearest first)
-    pub fn query(
-        &self,
-        query_vec: &[T],
-        k: usize,
-        ef_search: Option<usize>,
-    ) -> (Vec<usize>, Vec<T>) {
-        let k = k.min(self.n);
-        let ef = ef_search.unwrap_or_else(|| (k * 2).clamp(50, 200)).max(k);
-
-        let query_norm = if self.metric == Dist::Cosine {
-            query_vec.iter().map(|x| *x * *x).sum::<T>().sqrt()
-        } else {
-            T::one()
-        };
-
-        self.query_internal(query_vec, query_norm, k, ef)
     }
 
     /// Check if algorithm converged during construction
@@ -886,6 +856,138 @@ where
             })
             .collect()
     }
+
+    ///////////
+    // Query //
+    ///////////
+
+    /// Query for k nearest neighbours using beam search
+    ///
+    /// Performs beam search over the k-NN graph, starting from candidates
+    /// provided by the Annoy index. The search expands outward through the
+    /// graph, maintaining a priority queue of the best candidates found.
+    ///
+    /// ### Params
+    ///
+    /// * `query_vec` - Query vector (must match index dimensionality)
+    /// * `k` - Number of neighbours to return
+    /// * `ef_search` - Search beam width. Higher values improve recall but
+    ///   increase query time. Defaults to `max(2×k, 50)` clamped to 200.
+    ///
+    /// ### Returns
+    ///
+    /// Tuple of `(indices, distances)` sorted by distance (nearest first)
+    pub fn query(
+        &self,
+        query_vec: &[T],
+        k: usize,
+        ef_search: Option<usize>,
+    ) -> (Vec<usize>, Vec<T>) {
+        let k = k.min(self.n);
+        let ef = ef_search.unwrap_or_else(|| (k * 2).clamp(50, 200)).max(k);
+
+        let query_norm = if self.metric == Dist::Cosine {
+            query_vec.iter().map(|x| *x * *x).sum::<T>().sqrt()
+        } else {
+            T::one()
+        };
+
+        self.query_internal(query_vec, query_norm, k, ef)
+    }
+
+    /// Query using a matrix row reference
+    ///
+    /// Optimised path for contiguous memory (stride == 1), otherwise copies
+    /// to a temporary vector. Uses `self.query()` under the hood.
+    ///
+    /// ### Params
+    ///
+    /// * `query_row` - Row reference
+    /// * `k` - Number of neighbours to search
+    /// * `ef_search` - Search beam width. Higher values improve recall but
+    ///   increase query time. Defaults to `max(2×k, 50)` clamped to 200.
+    ///
+    /// ### Returns
+    ///
+    /// Tuple of `(indices, distances)` sorted by distance (nearest first)
+    #[inline]
+    pub fn query_row(
+        &self,
+        query_row: RowRef<T>,
+        k: usize,
+        ef_search: Option<usize>,
+    ) -> (Vec<usize>, Vec<T>) {
+        if query_row.col_stride() == 1 {
+            let slice =
+                unsafe { std::slice::from_raw_parts(query_row.as_ptr(), query_row.ncols()) };
+            return self.query(slice, k, ef_search);
+        }
+
+        let query_vec: Vec<T> = query_row.iter().cloned().collect();
+        self.query(&query_vec, k, ef_search)
+    }
+
+    /// Generate kNN graph from vectors stored in the index
+    ///
+    /// Queries each vector in the index against itself to build a complete
+    /// kNN graph.
+    ///
+    /// ### Params
+    ///
+    /// * `k` - Number of neighbours per vector
+    /// * `ef_search` - Search beam width. Higher values improve recall but
+    ///   increase query time. Defaults to `max(2×k, 50)` clamped to 200.
+    /// * `return_dist` - Whether to return distances
+    /// * `verbose` - Controls verbosity
+    ///
+    /// ### Returns
+    ///
+    /// Tuple of `(knn_indices, optional distances)` where each row corresponds
+    /// to a vector in the index
+    pub fn generate_knn(
+        &self,
+        k: usize,
+        ef_search: Option<usize>,
+        return_dist: bool,
+        verbose: bool,
+    ) -> (Vec<Vec<usize>>, Option<Vec<Vec<T>>>) {
+        use std::sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        };
+
+        let counter = Arc::new(AtomicUsize::new(0));
+
+        let results: Vec<(Vec<usize>, Vec<T>)> = (0..self.n)
+            .into_par_iter()
+            .map(|i| {
+                let start = i * self.dim;
+                let end = start + self.dim;
+                let vec = &self.vectors_flat[start..end];
+
+                if verbose {
+                    let count = counter.fetch_add(1, Ordering::Relaxed) + 1;
+                    if count.is_multiple_of(100_000) {
+                        println!(
+                            "  Processed {} / {} samples.",
+                            count.separate_with_underscores(),
+                            self.n.separate_with_underscores()
+                        );
+                    }
+                }
+
+                self.query(vec, k, ef_search)
+            })
+            .collect();
+
+        if return_dist {
+            let (indices, distances) = results.into_iter().unzip();
+            (indices, Some(distances))
+        } else {
+            let indices: Vec<Vec<usize>> = results.into_iter().map(|(idx, _)| idx).collect();
+            (indices, None)
+        }
+    }
 }
 
 /// Helper to find boundaries between different target nodes in sorted updates
@@ -930,7 +1032,6 @@ fn find_target_boundaries<T>(updates: &[(usize, usize, T)]) -> Vec<usize> {
 /////////
 
 type SegmentF32<'a> = Vec<(usize, &'a [(usize, usize, f32)])>;
-
 type SegmentResultsF32 = Vec<(usize, Option<(Vec<Neighbour<f32>>, usize)>)>;
 
 impl ApplySortedUpdates<f32> for NNDescent<f32> {
@@ -1097,7 +1198,6 @@ impl ApplySortedUpdates<f32> for NNDescent<f32> {
 /////////
 
 type SegmentF64<'a> = Vec<(usize, &'a [(usize, usize, f64)])>;
-
 type SegmentResultsF64 = Vec<(usize, Option<(Vec<Neighbour<f64>>, usize)>)>;
 
 impl ApplySortedUpdates<f64> for NNDescent<f64> {

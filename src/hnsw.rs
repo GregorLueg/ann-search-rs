@@ -1,4 +1,4 @@
-use faer::MatRef;
+use faer::{MatRef, RowRef};
 use num_traits::{Float, FromPrimitive, ToPrimitive};
 use rand::{rngs::SmallRng, Rng, SeedableRng};
 use rayon::prelude::*;
@@ -483,6 +483,10 @@ where
     T: Float + FromPrimitive + Send + Sync + Sum,
     Self: HnswState<T>,
 {
+    //////////////////////
+    // Index generation //
+    //////////////////////
+
     /// Build HNSW index
     ///
     /// ### Params
@@ -1011,6 +1015,10 @@ where
         result
     }
 
+    ///////////
+    // Query //
+    ///////////
+
     /// Query the index for k nearest neighbours
     ///
     /// ### Params
@@ -1069,6 +1077,98 @@ where
 
             (indices, distances)
         })
+    }
+
+    /// Query using a matrix row reference
+    ///
+    /// Optimised path for contiguous memory (stride == 1), otherwise copies
+    /// to a temporary vector. Uses `self.query()` under the hood.
+    ///
+    /// ### Params
+    ///
+    /// * `query_row` - Row reference
+    /// * `k` - Number of neighbours to search
+    /// * `ef_search` - Size of candidate list (higher = better recall, slower)
+    ///
+    /// ### Returns
+    ///
+    /// Tuple of `(indices, distances)` sorted by distance (nearest first)
+    #[inline]
+    pub fn query_row(
+        &self,
+        query_row: RowRef<T>,
+        k: usize,
+        ef_search: usize,
+    ) -> (Vec<usize>, Vec<T>) {
+        if query_row.col_stride() == 1 {
+            let slice =
+                unsafe { std::slice::from_raw_parts(query_row.as_ptr(), query_row.ncols()) };
+            return self.query(slice, k, ef_search);
+        }
+
+        let query_vec: Vec<T> = query_row.iter().cloned().collect();
+        self.query(&query_vec, k, ef_search)
+    }
+
+    /// Generate kNN graph from vectors stored in the index
+    ///
+    /// Queries each vector in the index against itself to build a complete
+    /// kNN graph.
+    ///
+    /// ### Params
+    ///
+    /// * `k` - Number of neighbours per vector
+    /// * `ef_search` - Size of candidate list (higher = better recall, slower)
+    /// * `return_dist` - Whether to return distances
+    /// * `verbose` - Controls verbosity
+    ///
+    /// ### Returns
+    ///
+    /// Tuple of `(knn_indices, optional distances)` where each row corresponds
+    /// to a vector in the index
+    pub fn generate_knn(
+        &self,
+        k: usize,
+        ef_search: usize,
+        return_dist: bool,
+        verbose: bool,
+    ) -> (Vec<Vec<usize>>, Option<Vec<Vec<T>>>) {
+        use std::sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        };
+
+        let counter = Arc::new(AtomicUsize::new(0));
+
+        let results: Vec<(Vec<usize>, Vec<T>)> = (0..self.n)
+            .into_par_iter()
+            .map(|i| {
+                let start = i * self.dim;
+                let end = start + self.dim;
+                let vec = &self.vectors_flat[start..end];
+
+                if verbose {
+                    let count = counter.fetch_add(1, Ordering::Relaxed) + 1;
+                    if count.is_multiple_of(100_000) {
+                        println!(
+                            "  Processed {} / {} samples.",
+                            count.separate_with_underscores(),
+                            self.n.separate_with_underscores()
+                        );
+                    }
+                }
+
+                self.query(vec, k, ef_search)
+            })
+            .collect();
+
+        if return_dist {
+            let (indices, distances) = results.into_iter().unzip();
+            (indices, Some(distances))
+        } else {
+            let indices: Vec<Vec<usize>> = results.into_iter().map(|(idx, _)| idx).collect();
+            (indices, None)
+        }
     }
 
     /// Search layer for query vector

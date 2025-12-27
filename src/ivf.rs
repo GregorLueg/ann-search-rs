@@ -4,7 +4,7 @@ use std::iter::Sum;
 
 use crate::utils::dist::*;
 use crate::utils::heap_structs::*;
-use crate::utils::k_means::*;
+use crate::utils::ivf_utils::*;
 use crate::utils::*;
 
 /// IVF (Inverted File) index for similarity search
@@ -63,10 +63,47 @@ where
     }
 }
 
+//////////////////////
+// CentroidDistance //
+//////////////////////
+
+impl<T> CentroidDistance<T> for IvfIndex<T>
+where
+    T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum,
+{
+    /// Get the centroids
+    fn centroids(&self) -> &[T] {
+        &self.centroids
+    }
+
+    /// Get the dimensions
+    fn dim(&self) -> usize {
+        self.dim
+    }
+
+    /// Get the distance metric
+    fn metric(&self) -> Dist {
+        self.metric
+    }
+
+    /// Get the number of lists
+    fn nlist(&self) -> usize {
+        self.nlist
+    }
+}
+
+////////////////
+// Main index //
+////////////////
+
 impl<T> IvfIndex<T>
 where
     T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum,
 {
+    //////////////////////
+    // Index generation //
+    //////////////////////
+
     /// Build an IVF index with optimised memory layout and parallel training.
     ///
     /// Constructs an inverted file index by clustering vectors with k-means,
@@ -122,7 +159,7 @@ where
         let max_iters = max_iters.unwrap_or(30);
         let nlist = nlist.unwrap_or((n as f32).sqrt() as usize).max(1);
 
-        // 1. Subsample training data
+        // 1. subsample training data
         let (training_data, n_train) = if n > 500_000 {
             if verbose {
                 println!("  Sampling 250k vectors for training");
@@ -137,7 +174,7 @@ where
             println!("  Generating IVF index with {} Voronoi cells.", nlist);
         }
 
-        // 2. Train the centroids
+        // 2. train the centroids
         let centroids = train_centroids(
             &training_data,
             dim,
@@ -149,10 +186,10 @@ where
             verbose,
         );
 
-        // 3. Assign the Rest
+        // 3. assign the Rest
         let assignments = assign_all_parallel(&vectors_flat, dim, n, &centroids, nlist, &metric);
 
-        // 4. Generate a flat version for better cache locality
+        // 4. generate a flat version for better cache locality
         let (all_indices, offsets) = build_csr_layout(assignments, n, nlist);
 
         Self {
@@ -167,6 +204,10 @@ where
             nlist,
         }
     }
+
+    ///////////
+    // Query //
+    ///////////
 
     /// Query the index for approximate nearest neighbours
     ///
@@ -191,23 +232,10 @@ where
             .min(self.nlist);
         let k = k.min(self.n);
 
-        // 1. Find the top `nprobe` centroids
-        let mut cluster_dists: Vec<(T, usize)> = (0..self.nlist)
-            .map(|c| {
-                let cent = &self.centroids[c * self.dim..(c + 1) * self.dim];
-                let dist = match self.metric {
-                    Dist::Euclidean => euclidean_distance_static(query_vec, cent),
-                    Dist::Cosine => cosine_distance_static(query_vec, cent),
-                };
-                (dist, c)
-            })
-            .collect();
+        // 1. find the top `nprobe` centroids
+        let cluster_dists: Vec<(T, usize)> = self.get_centroids_dist(query_vec, nprobe);
 
-        if nprobe < self.nlist {
-            cluster_dists.select_nth_unstable_by(nprobe, |a, b| a.0.partial_cmp(&b.0).unwrap());
-        }
-
-        // 2. Search only those clusters in the CSR layout
+        // 2. search only those clusters in the CSR layout
         let mut buffer = SortedBuffer::with_capacity(k);
         let query_norm = if matches!(self.metric, Dist::Cosine) {
             query_vec
@@ -239,9 +267,8 @@ where
 
     /// Query the index for approximate nearest neighbours
     ///
-    /// Performs two-stage search: first finds nprobe nearest centroids to the
-    /// query, then exhaustively searches all vectors in those clusters. Uses
-    /// a max-heap to track top-k candidates.
+    /// Optimised path for contiguous memory (stride == 1), otherwise copies
+    /// to a temporary vector. Uses `self.query()` under the hood.
     ///
     /// ### Params
     ///

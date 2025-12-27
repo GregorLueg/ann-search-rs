@@ -9,7 +9,7 @@ use crate::gpu::tensor::*;
 use crate::gpu::*;
 use crate::utils::dist::Dist;
 use crate::utils::heap_structs::OrderedFloat;
-use crate::utils::k_means::*;
+use crate::utils::ivf_utils::*;
 
 /// IVF index with GPU-accelerated search
 pub struct IvfIndexGpu<T: Float, R: Runtime> {

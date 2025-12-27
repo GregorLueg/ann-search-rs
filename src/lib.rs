@@ -295,8 +295,7 @@ where
     HnswIndex<T>: HnswState<T>,
 {
     query_parallel(query_mat.nrows(), return_dist, verbose, |i| {
-        let query_vec: Vec<T> = query_mat.row(i).iter().copied().collect();
-        index.query(&query_vec, k, ef_search)
+        index.query_row(query_mat.row(i), k, ef_search)
     })
 }
 
@@ -391,8 +390,7 @@ where
     NNDescent<T>: NNDescentQuery<T>,
 {
     query_parallel(query_mat.nrows(), return_dist, verbose, |i| {
-        let query_vec: Vec<T> = query_mat.row(i).iter().copied().collect();
-        index.query(&query_vec, k, ef_search)
+        index.query_row(query_mat.row(i), k, ef_search)
     })
 }
 
@@ -625,25 +623,9 @@ pub fn build_ivf_sq8_index<T>(
 where
     T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum,
 {
-    let n = mat.nrows();
-    let dim = mat.ncols();
     let ann_dist = parse_ann_dist(dist_metric).unwrap_or_default();
 
-    let mut vectors_flat = Vec::with_capacity(n * dim);
-    for i in 0..n {
-        vectors_flat.extend(mat.row(i).iter().cloned());
-    }
-
-    IvfSq8Index::build(
-        vectors_flat,
-        dim,
-        n,
-        nlist,
-        ann_dist,
-        max_iters,
-        seed,
-        verbose,
-    )
+    IvfSq8Index::build(mat, nlist, ann_dist, max_iters, seed, verbose)
 }
 
 /// Helper function to query a given IVF-SQ8 index
@@ -752,19 +734,10 @@ pub fn build_ivf_pq_index<T>(
 where
     T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum,
 {
-    let n = mat.nrows();
-    let dim = mat.ncols();
     let ann_dist = parse_ann_dist(dist_metric).unwrap_or_default();
 
-    let mut vectors_flat = Vec::with_capacity(n * dim);
-    for i in 0..n {
-        vectors_flat.extend(mat.row(i).iter().cloned());
-    }
-
     IvfPqIndex::build(
-        vectors_flat,
-        dim,
-        n,
+        mat,
         nlist,
         m,
         ann_dist,
@@ -884,19 +857,10 @@ pub fn build_ivf_opq_index<T>(
 where
     T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum + AddAssign,
 {
-    let n = mat.nrows();
-    let dim = mat.ncols();
     let ann_dist = parse_ann_dist(dist_metric).unwrap_or_default();
 
-    let mut vectors_flat = Vec::with_capacity(n * dim);
-    for i in 0..n {
-        vectors_flat.extend(mat.row(i).iter().cloned());
-    }
-
     IvfOpqIndex::build(
-        vectors_flat,
-        dim,
-        n,
+        mat,
         nlist,
         m,
         ann_dist,

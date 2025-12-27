@@ -1,6 +1,6 @@
 pub mod dist;
 pub mod heap_structs;
-pub mod k_means;
+pub mod ivf_utils;
 
 use faer::MatRef;
 use num_traits::{Float, FromPrimitive, ToPrimitive};

@@ -4,8 +4,103 @@ use rand::seq::SliceRandom;
 use rand::Rng;
 use rand::SeedableRng;
 use rayon::prelude::*;
+use std::iter::Sum;
 
 use crate::utils::dist::*;
+use crate::utils::Dist;
+
+//////////////////////
+// CentroidDistance //
+//////////////////////
+
+/// Trait for computing distances between Floats
+pub trait CentroidDistance<T>
+where
+    T: Float + Sum,
+{
+    /// Get the internal flat centroids representation
+    fn centroids(&self) -> &[T];
+
+    /// Get the internal dimensions
+    fn dim(&self) -> usize;
+
+    /// Get the number of internal dimensions
+    fn nlist(&self) -> usize;
+
+    /// Get the internal distance metric
+    fn metric(&self) -> Dist;
+
+    /// Calculate the distance to the centroids
+    ///
+    /// ### Params
+    ///
+    /// * `query_vec` - The slice of the query
+    /// * `nprobe` - Number of probes
+    ///
+    /// ### Returns
+    ///
+    /// The distance to the different clusters
+    fn get_centroids_dist(&self, query_vec: &[T], nprobe: usize) -> Vec<(T, usize)> {
+        let mut cluster_dists: Vec<(T, usize)> = (0..self.nlist())
+            .map(|c| {
+                let cent = &self.centroids()[c * self.dim()..(c + 1) * self.dim()];
+                let dist = match self.metric() {
+                    Dist::Euclidean => euclidean_distance_static(query_vec, cent),
+                    Dist::Cosine => cosine_distance_static(query_vec, cent),
+                };
+                (dist, c)
+            })
+            .collect();
+
+        if nprobe < self.nlist() {
+            cluster_dists.select_nth_unstable_by(nprobe, |a, b| a.0.partial_cmp(&b.0).unwrap());
+        }
+
+        cluster_dists
+    }
+
+    /// Special version that assumes pre-normalised vectors for Cosine
+    ///
+    /// ### Params
+    ///
+    /// * `query_vec` - The slice of the query
+    /// * `nprobe` - Number of probes
+    ///
+    /// ### Returns
+    ///
+    /// The distance to the different clusters
+    fn get_centroids_prenorm(&self, query_vec: &[T], nprobe: usize) -> Vec<(T, usize)> {
+        // Find top nprobe centroids
+        let mut cluster_dists: Vec<(T, usize)> = (0..self.nlist())
+            .map(|c| {
+                let cent = &self.centroids()[c * self.dim()..(c + 1) * self.dim()];
+                let dist = match self.metric() {
+                    Dist::Cosine => {
+                        let ip: T = query_vec
+                            .iter()
+                            .zip(cent.iter())
+                            .map(|(&q, &c)| q * c)
+                            .sum();
+                        T::one() - ip
+                    }
+                    Dist::Euclidean => query_vec
+                        .iter()
+                        .zip(cent.iter())
+                        .map(|(&q, &c)| (q - c) * (q - c))
+                        .sum(),
+                };
+                (dist, c)
+            })
+            .collect();
+
+        let nprobe = nprobe.min(self.nlist());
+        if nprobe < self.nlist() {
+            cluster_dists.select_nth_unstable_by(nprobe, |a, b| a.0.partial_cmp(&b.0).unwrap());
+        }
+
+        cluster_dists
+    }
+}
 
 ////////////////////////
 // k-means clustering //

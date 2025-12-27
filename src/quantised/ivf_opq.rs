@@ -1,4 +1,4 @@
-use faer::RowRef;
+use faer::{MatRef, RowRef};
 use num_traits::{Float, FromPrimitive, ToPrimitive};
 use rayon::prelude::*;
 use std::ops::AddAssign;
@@ -7,7 +7,8 @@ use std::{collections::BinaryHeap, iter::Sum};
 use crate::quantised::quantisers::*;
 use crate::utils::dist::*;
 use crate::utils::heap_structs::*;
-use crate::utils::k_means::*;
+use crate::utils::ivf_utils::*;
+use crate::utils::*;
 
 ////////////////
 // Main index //
@@ -38,6 +39,35 @@ pub struct IvfOpqIndex<T> {
     nlist: usize,
 }
 
+//////////////////////
+// CentroidDistance //
+//////////////////////
+
+impl<T> CentroidDistance<T> for IvfOpqIndex<T>
+where
+    T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum,
+{
+    /// Get the centroids
+    fn centroids(&self) -> &[T] {
+        &self.centroids
+    }
+
+    /// Get the dimensions
+    fn dim(&self) -> usize {
+        self.dim
+    }
+
+    /// Get the distance metric
+    fn metric(&self) -> Dist {
+        self.metric
+    }
+
+    /// Get the number of lists
+    fn nlist(&self) -> usize {
+        self.nlist
+    }
+}
+
 impl<T> IvfOpqIndex<T>
 where
     T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum + AddAssign,
@@ -65,9 +95,7 @@ where
     /// Index ready for querying
     #[allow(clippy::too_many_arguments)]
     pub fn build(
-        mut vectors_flat: Vec<T>,
-        dim: usize,
-        n: usize,
+        data: MatRef<T>,
         nlist: Option<usize>,
         m: usize,
         metric: Dist,
@@ -77,6 +105,8 @@ where
         seed: usize,
         verbose: bool,
     ) -> Self {
+        let (mut vectors_flat, n, dim) = matrix_to_flat(data);
+
         let max_iters = max_iters.unwrap_or(30);
         let nlist = nlist.unwrap_or((n as f32).sqrt() as usize).max(1);
 
@@ -234,32 +264,7 @@ where
         let k = k.min(self.n);
 
         // Find top nprobe centroids
-        let mut cluster_scores: Vec<(T, usize)> = (0..self.nlist)
-            .map(|c| {
-                let cent = &self.centroids[c * self.dim..(c + 1) * self.dim];
-                let dist = match self.metric {
-                    Dist::Cosine => {
-                        let ip: T = query_vec
-                            .iter()
-                            .zip(cent.iter())
-                            .map(|(&q, &c)| q * c)
-                            .sum();
-                        T::one() - ip
-                    }
-                    Dist::Euclidean => query_vec
-                        .iter()
-                        .zip(cent.iter())
-                        .map(|(&q, &c)| (q - c) * (q - c))
-                        .sum(),
-                };
-                (dist, c)
-            })
-            .collect();
-
-        let nprobe = nprobe.min(self.nlist);
-        if nprobe < self.nlist {
-            cluster_scores.select_nth_unstable_by(nprobe, |a, b| a.0.partial_cmp(&b.0).unwrap());
-        }
+        let cluster_scores: Vec<(T, usize)> = self.get_centroids_prenorm(&query_vec, nprobe);
 
         let mut heap: BinaryHeap<(OrderedFloat<T>, usize)> = BinaryHeap::with_capacity(k + 1);
 
@@ -456,7 +461,7 @@ mod tests {
     use super::*;
     use faer::Mat;
 
-    fn create_simple_dataset() -> Vec<f32> {
+    fn create_simple_dataset() -> Mat<f32> {
         let mut data = Vec::new();
         // Create 6 vectors of 32 dimensions
         // First 3 near origin
@@ -471,16 +476,14 @@ mod tests {
                 data.push(10.0 + i as f32 * 0.1 + j as f32 * 0.01);
             }
         }
-        data
+        Mat::from_fn(6, 32, |i, j| data[i * 32 + j])
     }
 
     #[test]
     fn test_build_euclidean() {
         let data = create_simple_dataset();
         let index = IvfOpqIndex::build(
-            data,
-            32,
-            6,
+            data.as_ref(),
             Some(2),
             8,
             Dist::Euclidean,
@@ -504,9 +507,7 @@ mod tests {
     fn test_build_cosine() {
         let data = create_simple_dataset();
         let index = IvfOpqIndex::build(
-            data,
-            32,
-            6,
+            data.as_ref(),
             Some(2),
             8,
             Dist::Cosine,
@@ -524,9 +525,7 @@ mod tests {
     fn test_query_returns_k_results() {
         let data = create_simple_dataset();
         let index = IvfOpqIndex::build(
-            data,
-            32,
-            6,
+            data.as_ref(),
             Some(2),
             8,
             Dist::Euclidean,
@@ -548,9 +547,7 @@ mod tests {
     fn test_query_k_exceeds_n() {
         let data = create_simple_dataset();
         let index = IvfOpqIndex::build(
-            data,
-            32,
-            6,
+            data.as_ref(),
             Some(2),
             8,
             Dist::Euclidean,
@@ -571,9 +568,7 @@ mod tests {
     fn test_query_distances_sorted() {
         let data = create_simple_dataset();
         let index = IvfOpqIndex::build(
-            data,
-            32,
-            6,
+            data.as_ref(),
             Some(2),
             8,
             Dist::Euclidean,
@@ -596,9 +591,7 @@ mod tests {
     fn test_query_cosine() {
         let data = create_simple_dataset();
         let index = IvfOpqIndex::build(
-            data,
-            32,
-            6,
+            data.as_ref(),
             Some(2),
             8,
             Dist::Cosine,
@@ -620,9 +613,7 @@ mod tests {
     fn test_query_different_nprobe() {
         let data = create_simple_dataset();
         let index = IvfOpqIndex::build(
-            data,
-            32,
-            6,
+            data.as_ref(),
             Some(2),
             8,
             Dist::Euclidean,
@@ -646,9 +637,7 @@ mod tests {
     fn test_query_deterministic() {
         let data = create_simple_dataset();
         let index = IvfOpqIndex::build(
-            data,
-            32,
-            6,
+            data.as_ref(),
             Some(2),
             8,
             Dist::Euclidean,
@@ -672,9 +661,7 @@ mod tests {
     fn test_query_row() {
         let data = create_simple_dataset();
         let index = IvfOpqIndex::build(
-            data,
-            32,
-            6,
+            data.as_ref(),
             Some(2),
             8,
             Dist::Euclidean,
@@ -696,17 +683,10 @@ mod tests {
 
     #[test]
     fn test_build_different_m() {
-        let mut data = Vec::new();
-        for i in 0..20 {
-            for j in 0..32 {
-                data.push((i + j) as f32);
-            }
-        }
+        let data = Mat::from_fn(20, 32, |i, j| (i + j) as f32);
 
         let index = IvfOpqIndex::build(
-            data,
-            32,
-            20,
+            data.as_ref(),
             Some(2),
             8,
             Dist::Euclidean,
@@ -726,9 +706,7 @@ mod tests {
     fn test_build_lookup_tables() {
         let data = create_simple_dataset();
         let index = IvfOpqIndex::build(
-            data,
-            32,
-            6,
+            data.as_ref(),
             Some(2),
             8,
             Dist::Euclidean,
@@ -749,9 +727,7 @@ mod tests {
     fn test_compute_distance_adc() {
         let data = create_simple_dataset();
         let index = IvfOpqIndex::build(
-            data,
-            32,
-            6,
+            data.as_ref(),
             Some(2),
             8,
             Dist::Euclidean,
@@ -772,17 +748,10 @@ mod tests {
 
     #[test]
     fn test_opq_iterations() {
-        let mut data = Vec::new();
-        for i in 0..50 {
-            for j in 0..32 {
-                data.push((i + j) as f32);
-            }
-        }
+        let data = Mat::from_fn(50, 32, |i, j| (i + j) as f32);
 
         let index = IvfOpqIndex::build(
-            data,
-            32,
-            50,
+            data.as_ref(),
             Some(5),
             8,
             Dist::Euclidean,
@@ -798,17 +767,10 @@ mod tests {
 
     #[test]
     fn test_residual_encoding() {
-        let mut data = Vec::new();
-        for i in 0..50 {
-            for j in 0..32 {
-                data.push((i + j) as f32);
-            }
-        }
+        let data = Mat::from_fn(50, 32, |i, j| (i + j) as f32);
 
         let index = IvfOpqIndex::build(
-            data.clone(),
-            32,
-            50,
+            data.as_ref(),
             Some(5),
             8,
             Dist::Euclidean,

@@ -5,6 +5,7 @@ use rand_distr::StandardNormal;
 use rayon::prelude::*;
 use rustc_hash::{FxHashMap, FxHashSet};
 use std::{cell::RefCell, cmp::Ord, collections::BinaryHeap, iter::Sum};
+use thousands::*;
 
 use crate::utils::dist::*;
 use crate::utils::heap_structs::*;
@@ -78,6 +79,10 @@ where
     T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum,
     Self: LSHQuery<T>,
 {
+    //////////////////////
+    // Index generation //
+    //////////////////////
+
     /// Construct a new LSH index
     ///
     /// Builds hash tables in parallel. For each table, hashes all vectors
@@ -163,6 +168,10 @@ where
         }
     }
 
+    ///////////
+    // Query //
+    ///////////
+
     /// Query the index for approximate nearest neighbours
     ///
     /// Hashes the query vector and retrieves candidates from matching buckets
@@ -227,6 +236,87 @@ where
 
         let query_vec: Vec<T> = query_row.iter().cloned().collect();
         self.query(&query_vec, k, max_cand)
+    }
+
+    /// Generate kNN graph from vectors stored in the index
+    ///
+    /// Queries each vector in the index against itself to build a complete
+    /// kNN graph.
+    ///
+    /// ### Params
+    ///
+    /// * `k` - Number of neighbours per vector
+    /// * `max_cand` - Optional candidate limit
+    /// * `return_dist` - Whether to return distances
+    /// * `verbose` - Controls verbosity
+    ///
+    /// ### Returns
+    ///
+    /// Tuple of `(knn_indices, optional distances)` where each row corresponds
+    /// to a vector in the index
+    pub fn generate_knn(
+        &self,
+        k: usize,
+        max_cand: Option<usize>,
+        return_dist: bool,
+        verbose: bool,
+    ) -> (Vec<Vec<usize>>, Option<Vec<Vec<T>>>) {
+        use std::sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        };
+
+        let counter = Arc::new(AtomicUsize::new(0));
+
+        let results: Vec<(Vec<usize>, Vec<T>, bool)> = (0..self.n)
+            .into_par_iter()
+            .map(|i| {
+                let start = i * self.dim;
+                let end = start + self.dim;
+                let vec = &self.vectors_flat[start..end];
+
+                if verbose {
+                    let count = counter.fetch_add(1, Ordering::Relaxed) + 1;
+                    if count.is_multiple_of(100_000) {
+                        println!(
+                            "  Processed {} / {} samples.",
+                            count.separate_with_underscores(),
+                            self.n.separate_with_underscores()
+                        );
+                    }
+                }
+
+                self.query(vec, k, max_cand)
+            })
+            .collect();
+
+        #[allow(unused_variables)] // clippy being stupid
+        let mut missed: usize = 0;
+
+        for (_, _, fallback) in &results {
+            if *fallback {
+                missed += 1;
+            }
+        }
+
+        if (missed as f32) / (self.n as f32) >= 0.01 {
+            println!("More than 1% of samples were not represented in the buckets.");
+            println!("Please verify underlying data");
+        }
+
+        if return_dist {
+            let mut indices = Vec::with_capacity(results.len());
+            let mut distances = Vec::with_capacity(results.len());
+
+            for (idx, dist, _) in results {
+                indices.push(idx);
+                distances.push(dist);
+            }
+            (indices, Some(distances))
+        } else {
+            let indices: Vec<Vec<usize>> = results.into_iter().map(|(idx, _, _)| idx).collect();
+            (indices, None)
+        }
     }
 }
 
