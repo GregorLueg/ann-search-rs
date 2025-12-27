@@ -127,8 +127,6 @@ impl<'a> Drop for NodeLockGuard<'a> {
     }
 }
 
-
-
 /// Search state for HNSW queries and construction
 ///
 /// Optimised for low-allocation via epoch-based visitation checks and
@@ -489,7 +487,7 @@ where
     ///
     /// ### Params
     ///
-    /// * `mat` - Embedding matrix (rows = samples, cols = features)
+    /// * `data` - Embedding matrix (rows = samples, cols = features)
     /// * `m` - Number of bidirectional connections per layer (typical: 16-32)
     /// * `ef_construction` - Size of candidate list during construction
     ///   (typical: 100-200)
@@ -501,7 +499,7 @@ where
     ///
     /// Built HnswIndex ready for querying
     pub fn build(
-        mat: MatRef<T>,
+        data: MatRef<T>,
         m: usize,
         ef_construction: usize,
         dist_metric: &str,
@@ -509,8 +507,8 @@ where
         verbose: bool,
     ) -> Self {
         let metric = parse_ann_dist(dist_metric).unwrap_or(Dist::Cosine);
-        let n = mat.nrows();
-        let dim = mat.ncols();
+
+        let (vectors_flat, n, dim) = matrix_to_flat(data);
 
         if verbose {
             println!(
@@ -521,12 +519,6 @@ where
         }
 
         let start_total = Instant::now();
-
-        // Flatten matrix for cache locality
-        let mut vectors_flat = Vec::with_capacity(n * dim);
-        for i in 0..n {
-            vectors_flat.extend(mat.row(i).iter().copied());
-        }
 
         // Compute norms for cosine distance
         let norms = if metric == Dist::Cosine {

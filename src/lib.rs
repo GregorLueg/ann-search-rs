@@ -36,6 +36,136 @@ use crate::quantised::{ivf_opq::*, ivf_pq::*, ivf_sq8::*};
 
 use crate::utils::dist::*;
 
+////////////
+// Helper //
+////////////
+
+/// Helper function to execute parallel queries across samples
+///
+/// ### Params
+///
+/// * `n_samples` - Number of samples to query
+/// * `return_dist` - Whether to return distances alongside indices
+/// * `verbose` - Print progress information every 100,000 samples
+/// * `query_fn` - Closure that takes a sample index and returns (indices,
+///   distances)
+///
+/// ### Returns
+///
+/// A tuple of `(knn_indices, optional distances)`
+fn query_parallel<T, F>(
+    n_samples: usize,
+    return_dist: bool,
+    verbose: bool,
+    query_fn: F,
+) -> (Vec<Vec<usize>>, Option<Vec<Vec<T>>>)
+where
+    T: Send,
+    F: Fn(usize) -> (Vec<usize>, Vec<T>) + Sync,
+{
+    let counter = Arc::new(AtomicUsize::new(0));
+
+    let results: Vec<(Vec<usize>, Vec<T>)> = (0..n_samples)
+        .into_par_iter()
+        .map(|i| {
+            let result = query_fn(i);
+            if verbose {
+                let count = counter.fetch_add(1, Ordering::Relaxed) + 1;
+                if count.is_multiple_of(100_000) {
+                    println!(
+                        "  Processed {} / {} samples.",
+                        count.separate_with_underscores(),
+                        n_samples.separate_with_underscores()
+                    );
+                }
+            }
+            result
+        })
+        .collect();
+
+    if return_dist {
+        let (indices, distances) = results.into_iter().unzip();
+        (indices, Some(distances))
+    } else {
+        let indices: Vec<Vec<usize>> = results.into_iter().map(|(idx, _)| idx).collect();
+        (indices, None)
+    }
+}
+
+/// Helper function to execute parallel queries with boolean flags
+///
+/// ### Params
+///
+/// * `n_samples` - Number of samples to query
+/// * `return_dist` - Whether to return distances alongside indices
+/// * `verbose` - Print progress information every 100,000 samples
+/// * `query_fn` - Closure that takes a sample index and returns (indices,
+///   distances, flag)
+///
+/// ### Returns
+///
+/// A tuple of `(knn_indices, optional distances)`
+///
+/// ### Note
+///
+/// This variant tracks boolean flags returned by the query function. If more
+/// than 1% of queries return true flags, a warning is printed. Used primarily
+/// for LSH queries where the flag indicates samples not represented in hash
+/// buckets.
+fn query_parallel_with_flags<T, F>(
+    n_samples: usize,
+    return_dist: bool,
+    verbose: bool,
+    query_fn: F,
+) -> (Vec<Vec<usize>>, Option<Vec<Vec<T>>>)
+where
+    T: Send,
+    F: Fn(usize) -> (Vec<usize>, Vec<T>, bool) + Sync,
+{
+    let counter = Arc::new(AtomicUsize::new(0));
+
+    let results: Vec<(Vec<usize>, Vec<T>, bool)> = (0..n_samples)
+        .into_par_iter()
+        .map(|i| {
+            let result = query_fn(i);
+            if verbose {
+                let count = counter.fetch_add(1, Ordering::Relaxed) + 1;
+                if count.is_multiple_of(100_000) {
+                    println!(
+                        " Processed {} / {} samples.",
+                        count.separate_with_underscores(),
+                        n_samples.separate_with_underscores()
+                    );
+                }
+            }
+            result
+        })
+        .collect();
+
+    let mut random: usize = 0;
+    let mut indices: Vec<Vec<usize>> = Vec::with_capacity(results.len());
+    let mut distances: Vec<Vec<T>> = Vec::with_capacity(results.len());
+
+    for (idx, dist, rnd) in results {
+        if rnd {
+            random += 1;
+        }
+        indices.push(idx);
+        distances.push(dist);
+    }
+
+    if (random as f32) / (n_samples as f32) >= 0.01 {
+        println!("More than 1% of samples were not represented in the buckets.");
+        println!("Please verify underlying data");
+    }
+
+    if return_dist {
+        (indices, Some(distances))
+    } else {
+        (indices, None)
+    }
+}
+
 ///////////
 // Annoy //
 ///////////
@@ -92,53 +222,9 @@ pub fn query_annoy_index<T>(
 where
     T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum,
 {
-    let n_samples = query_mat.nrows();
-    let counter = Arc::new(AtomicUsize::new(0));
-
-    if return_dist {
-        let results: Vec<(Vec<usize>, Vec<T>)> = (0..n_samples)
-            .into_par_iter()
-            .map(|i| {
-                let (neighbors, dists) = index.query_row(query_mat.row(i), k, search_budget);
-
-                if verbose {
-                    let count = counter.fetch_add(1, Ordering::Relaxed) + 1;
-                    if count.is_multiple_of(100_000) {
-                        println!(
-                            " Processed {} / {} samples.",
-                            count.separate_with_underscores(),
-                            n_samples.separate_with_underscores()
-                        );
-                    }
-                }
-
-                (neighbors, dists)
-            })
-            .collect();
-        let (indices, distances) = results.into_iter().unzip();
-        (indices, Some(distances))
-    } else {
-        let indices: Vec<Vec<usize>> = (0..n_samples)
-            .into_par_iter()
-            .map(|i| {
-                let (neighbors, _) = index.query_row(query_mat.row(i), k, search_budget);
-
-                if verbose {
-                    let count = counter.fetch_add(1, Ordering::Relaxed) + 1;
-                    if count.is_multiple_of(100_000) {
-                        println!(
-                            " Processed {} / {} samples.",
-                            count.separate_with_underscores(),
-                            n_samples.separate_with_underscores()
-                        );
-                    }
-                }
-
-                neighbors
-            })
-            .collect();
-        (indices, None)
-    }
+    query_parallel(query_mat.nrows(), return_dist, verbose, |i| {
+        index.query_row(query_mat.row(i), k, search_budget)
+    })
 }
 
 //////////
@@ -208,57 +294,10 @@ where
     T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum,
     HnswIndex<T>: HnswState<T>,
 {
-    let n_samples = query_mat.nrows();
-    let counter = Arc::new(AtomicUsize::new(0));
-
-    if return_dist {
-        let results: Vec<(Vec<usize>, Vec<T>)> = (0..n_samples)
-            .into_par_iter()
-            .map(|i| {
-                let query_vec: Vec<T> = query_mat.row(i).iter().copied().collect();
-                let (neighbours, dists) = index.query(&query_vec, k, ef_search);
-
-                if verbose {
-                    let count = counter.fetch_add(1, Ordering::Relaxed) + 1;
-                    if count.is_multiple_of(100_000) {
-                        println!(
-                            "  Processed {} / {} samples.",
-                            count.separate_with_underscores(),
-                            n_samples.separate_with_underscores()
-                        );
-                    }
-                }
-
-                (neighbours, dists)
-            })
-            .collect();
-
-        let (indices, distances) = results.into_iter().unzip();
-        (indices, Some(distances))
-    } else {
-        let indices: Vec<Vec<usize>> = (0..n_samples)
-            .into_par_iter()
-            .map(|i| {
-                let query_vec: Vec<T> = query_mat.row(i).iter().copied().collect();
-                let (neighbours, _) = index.query(&query_vec, k, ef_search);
-
-                if verbose {
-                    let count = counter.fetch_add(1, Ordering::Relaxed) + 1;
-                    if count.is_multiple_of(100_000) {
-                        println!(
-                            "  Processed {} / {} samples.",
-                            count.separate_with_underscores(),
-                            n_samples.separate_with_underscores()
-                        );
-                    }
-                }
-
-                neighbours
-            })
-            .collect();
-
-        (indices, None)
-    }
+    query_parallel(query_mat.nrows(), return_dist, verbose, |i| {
+        let query_vec: Vec<T> = query_mat.row(i).iter().copied().collect();
+        index.query(&query_vec, k, ef_search)
+    })
 }
 
 ///////////////
@@ -351,55 +390,10 @@ where
     NNDescent<T>: ApplySortedUpdates<T>,
     NNDescent<T>: NNDescentQuery<T>,
 {
-    let n_samples = query_mat.nrows();
-    let counter = Arc::new(AtomicUsize::new(0));
-
-    if return_dist {
-        let results: Vec<(Vec<usize>, Vec<T>)> = (0..n_samples)
-            .into_par_iter()
-            .map(|i| {
-                let query_vec: Vec<T> = query_mat.row(i).iter().copied().collect();
-                let result = index.query(&query_vec, k, ef_search);
-
-                if verbose {
-                    let count = counter.fetch_add(1, Ordering::Relaxed) + 1;
-                    if count.is_multiple_of(100_000) {
-                        println!(
-                            "  Processed {} / {} samples",
-                            count.separate_with_underscores(),
-                            n_samples.separate_with_underscores()
-                        );
-                    }
-                }
-                result
-            })
-            .collect();
-
-        let (indices, distances) = results.into_iter().unzip();
-        (indices, Some(distances))
-    } else {
-        let indices: Vec<Vec<usize>> = (0..n_samples)
-            .into_par_iter()
-            .map(|i| {
-                let query_vec: Vec<T> = query_mat.row(i).iter().copied().collect();
-                let (indices, _) = index.query(&query_vec, k, ef_search);
-
-                if verbose {
-                    let count = counter.fetch_add(1, Ordering::Relaxed) + 1;
-                    if count.is_multiple_of(100_000) {
-                        println!(
-                            "  Processed {} / {} samples",
-                            count.separate_with_underscores(),
-                            n_samples.separate_with_underscores()
-                        );
-                    }
-                }
-                indices
-            })
-            .collect();
-
-        (indices, None)
-    }
+    query_parallel(query_mat.nrows(), return_dist, verbose, |i| {
+        let query_vec: Vec<T> = query_mat.row(i).iter().copied().collect();
+        index.query(&query_vec, k, ef_search)
+    })
 }
 
 ////////////////
@@ -447,49 +441,9 @@ pub fn query_exhaustive_index<T>(
 where
     T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum,
 {
-    let n_samples = query_mat.nrows();
-    let counter = Arc::new(AtomicUsize::new(0));
-
-    if return_dist {
-        let results: Vec<(Vec<usize>, Vec<T>)> = (0..n_samples)
-            .into_par_iter()
-            .map(|i| {
-                let result = index.query_row(query_mat.row(i), k);
-                if verbose {
-                    let count = counter.fetch_add(1, Ordering::Relaxed) + 1;
-                    if count.is_multiple_of(100_000) {
-                        println!(
-                            " Processed {} / {} samples.",
-                            count.separate_with_underscores(),
-                            n_samples.separate_with_underscores()
-                        );
-                    }
-                }
-                result
-            })
-            .collect();
-        let (indices, distances) = results.into_iter().unzip();
-        (indices, Some(distances))
-    } else {
-        let indices: Vec<Vec<usize>> = (0..n_samples)
-            .into_par_iter()
-            .map(|i| {
-                let (neighbors, _) = index.query_row(query_mat.row(i), k);
-                if verbose {
-                    let count = counter.fetch_add(1, Ordering::Relaxed) + 1;
-                    if count.is_multiple_of(100_000) {
-                        println!(
-                            " Processed {} / {} samples.",
-                            count.separate_with_underscores(),
-                            n_samples.separate_with_underscores()
-                        );
-                    }
-                }
-                neighbors
-            })
-            .collect();
-        (indices, None)
-    }
+    query_parallel(query_mat.nrows(), return_dist, verbose, |i| {
+        index.query_row(query_mat.row(i), k)
+    })
 }
 
 /////////
@@ -551,79 +505,14 @@ where
     T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum,
     LSHIndex<T>: LSHQuery<T>,
 {
-    let n_samples = query_mat.nrows();
-    let counter = Arc::new(AtomicUsize::new(0));
-
-    if return_dist {
-        let results: Vec<(Vec<usize>, Vec<T>, bool)> = (0..n_samples)
-            .into_par_iter()
-            .map(|i| {
-                let result = index.query_row(query_mat.row(i), k, max_candidates);
-                if verbose {
-                    let count = counter.fetch_add(1, Ordering::Relaxed) + 1;
-                    if count.is_multiple_of(100_000) {
-                        println!(
-                            " Processed {} / {} samples.",
-                            count.separate_with_underscores(),
-                            n_samples.separate_with_underscores()
-                        );
-                    }
-                }
-                result
-            })
-            .collect();
-
-        let mut random: usize = 0;
-        let mut indices: Vec<Vec<usize>> = Vec::with_capacity(results.len());
-        let mut distances: Vec<Vec<T>> = Vec::with_capacity(results.len());
-        for (idx, dist, rnd) in results {
-            if rnd {
-                random += 1;
-            };
-            indices.push(idx);
-            distances.push(dist);
-        }
-
-        if (random as f32) / (n_samples as f32) >= 0.01 {
-            println!("More than 1% of samples were not represented in the buckets.");
-            println!("Please verify underlying data");
-        }
-        (indices, Some(distances))
-    } else {
-        let results: Vec<(Vec<usize>, _, bool)> = (0..n_samples)
-            .into_par_iter()
-            .map(|i| {
-                let result = index.query_row(query_mat.row(i), k, max_candidates);
-                if verbose {
-                    let count = counter.fetch_add(1, Ordering::Relaxed) + 1;
-                    if count.is_multiple_of(100_000) {
-                        println!(
-                            " Processed {} / {} samples.",
-                            count.separate_with_underscores(),
-                            n_samples.separate_with_underscores()
-                        );
-                    }
-                }
-                result
-            })
-            .collect();
-
-        let mut random: usize = 0;
-        let mut indices: Vec<Vec<usize>> = Vec::with_capacity(results.len());
-        for (idx, _, rnd) in results {
-            if rnd {
-                random += 1;
-            };
-            indices.push(idx);
-        }
-
-        if (random as f32) / (n_samples as f32) >= 0.01 {
-            println!("More than 1% of samples were not represented in the buckets.");
-            println!("Please verify underlying data");
-        }
-        (indices, None)
-    }
+    query_parallel_with_flags(query_mat.nrows(), return_dist, verbose, |i| {
+        index.query_row(query_mat.row(i), k, max_candidates)
+    })
 }
+
+/////////
+// IVF //
+/////////
 
 /////////
 // IVF //
@@ -656,43 +545,9 @@ pub fn build_ivf_index<T>(
 where
     T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum,
 {
-    let n = mat.nrows();
-    let dim = mat.ncols();
-
-    let mut vectors_flat = Vec::with_capacity(n * dim);
-    for i in 0..n {
-        vectors_flat.extend(mat.row(i).iter().cloned());
-    }
-
     let ann_dist = parse_ann_dist(dist_metric).unwrap_or_default();
 
-    let norms = if ann_dist == Dist::Cosine {
-        (0..n)
-            .map(|i| {
-                let start = i * dim;
-                let end = start + dim;
-                vectors_flat[start..end]
-                    .iter()
-                    .map(|x| *x * *x)
-                    .fold(T::zero(), |a, b| a + b)
-                    .sqrt()
-            })
-            .collect()
-    } else {
-        Vec::new()
-    };
-
-    IvfIndex::build(
-        vectors_flat,
-        dim,
-        n,
-        norms,
-        ann_dist,
-        nlist,
-        max_iters,
-        seed,
-        verbose,
-    )
+    IvfIndex::build(mat, ann_dist, nlist, max_iters, seed, verbose)
 }
 
 /// Helper function to query a given IVF index
@@ -727,55 +582,9 @@ pub fn query_ivf_index<T>(
 where
     T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum,
 {
-    let n_samples = query_mat.nrows();
-    let counter = Arc::new(AtomicUsize::new(0));
-
-    if return_dist {
-        let results: Vec<(Vec<usize>, Vec<T>)> = (0..n_samples)
-            .into_par_iter()
-            .map(|i| {
-                let (neighbours, dists) = index.query_row(query_mat.row(i), k, nprobe);
-
-                if verbose {
-                    let count = counter.fetch_add(1, Ordering::Relaxed) + 1;
-                    if count.is_multiple_of(100_000) {
-                        println!(
-                            "  Processed {} / {} samples.",
-                            count.separate_with_underscores(),
-                            n_samples.separate_with_underscores()
-                        );
-                    }
-                }
-
-                (neighbours, dists)
-            })
-            .collect();
-
-        let (indices, distances) = results.into_iter().unzip();
-        (indices, Some(distances))
-    } else {
-        let indices: Vec<Vec<usize>> = (0..n_samples)
-            .into_par_iter()
-            .map(|i| {
-                let (neighbours, _) = index.query_row(query_mat.row(i), k, nprobe);
-
-                if verbose {
-                    let count = counter.fetch_add(1, Ordering::Relaxed) + 1;
-                    if count.is_multiple_of(100_000) {
-                        println!(
-                            "  Processed {} / {} samples.",
-                            count.separate_with_underscores(),
-                            n_samples.separate_with_underscores()
-                        );
-                    }
-                }
-
-                neighbours
-            })
-            .collect();
-
-        (indices, None)
-    }
+    query_parallel(query_mat.nrows(), return_dist, verbose, |i| {
+        index.query_row(query_mat.row(i), k, nprobe)
+    })
 }
 
 ///////////////

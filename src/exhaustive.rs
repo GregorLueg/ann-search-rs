@@ -4,6 +4,7 @@ use std::{collections::BinaryHeap, iter::Sum};
 
 use crate::utils::dist::*;
 use crate::utils::heap_structs::*;
+use crate::utils::matrix_to_flat;
 
 /////////////////////
 // Index structure //
@@ -76,16 +77,10 @@ where
     ///
     /// Initialised exhaustive index
     pub fn new(data: MatRef<T>, metric: Dist) -> Self {
-        let n_vectors = data.nrows();
-        let dim = data.ncols();
-
-        let mut vectors_flat = Vec::with_capacity(n_vectors * dim);
-        for i in 0..n_vectors {
-            vectors_flat.extend(data.row(i).iter().cloned());
-        }
+        let (vectors_flat, n, dim) = matrix_to_flat(data);
 
         let norms = match metric {
-            Dist::Cosine => (0..n_vectors)
+            Dist::Cosine => (0..n)
                 .map(|i| {
                     let vec_start = i * dim;
                     vectors_flat[vec_start..vec_start + dim]
@@ -103,7 +98,7 @@ where
             norms,
             dim,
             dist_metric: metric,
-            n: n_vectors,
+            n,
         }
     }
 

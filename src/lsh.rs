@@ -101,14 +101,7 @@ where
         bits_per_hash: usize,
         seed: usize,
     ) -> Self {
-        let n = data.nrows();
-        let dim = data.ncols();
-
-        // Flatten vectors for cache-friendly distance calculations
-        let mut vectors_flat = Vec::with_capacity(n * dim);
-        for i in 0..n {
-            vectors_flat.extend(data.row(i).iter().cloned());
-        }
+        let (vectors_flat, n, dim) = matrix_to_flat(data);
 
         let norms = match metric {
             Dist::Cosine => (0..n)

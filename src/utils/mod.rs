@@ -2,6 +2,7 @@ pub mod dist;
 pub mod heap_structs;
 pub mod k_means;
 
+use faer::MatRef;
 use num_traits::{Float, FromPrimitive, ToPrimitive};
 use rand::rngs::StdRng;
 use rand::Rng;
@@ -12,6 +13,36 @@ use std::iter::Sum;
 
 use crate::utils::dist::*;
 use crate::utils::heap_structs::*;
+
+/////////////
+// Helpers //
+/////////////
+
+pub type FlattenData<T> = (Vec<T>, usize, usize);
+
+/// Flatten a matrix to a vector
+///
+/// ### Params
+///
+/// * `mat` - Matrix reference to flatten
+///
+/// ### Returns
+///
+/// The flatten vector
+pub fn matrix_to_flat<T>(mat: MatRef<T>) -> FlattenData<T>
+where
+    T: Float,
+{
+    let n = mat.nrows();
+    let dim = mat.ncols();
+
+    let mut vectors_flat = Vec::with_capacity(n * dim);
+    for i in 0..n {
+        vectors_flat.extend(mat.row(i).iter().cloned());
+    }
+
+    (vectors_flat, n, dim)
+}
 
 ////////////////
 // Validation //

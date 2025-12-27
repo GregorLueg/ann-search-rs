@@ -219,7 +219,7 @@ where
     ///
     /// ### Params
     ///
-    /// * `mat` - Data matrix (rows = samples, columns = dimensions)
+    /// * `data` - Data matrix (rows = samples, columns = dimensions)
     /// * `n_trees` - Number of trees to build (more trees = better recall,
     ///   slower build)
     /// * `metric` - Distance metric (Euclidean or Cosine)
@@ -228,19 +228,14 @@ where
     /// ### Returns
     ///
     /// Constructed index ready for querying
-    pub fn new(mat: MatRef<T>, n_trees: usize, metric: Dist, seed: usize) -> Self {
+    pub fn new(data: MatRef<T>, n_trees: usize, metric: Dist, seed: usize) -> Self {
         let mut rng = StdRng::seed_from_u64(seed as u64);
-        let n_vectors = mat.nrows();
-        let dim = mat.ncols();
 
-        let mut vectors_flat = Vec::with_capacity(n_vectors * dim);
-        for i in 0..n_vectors {
-            vectors_flat.extend(mat.row(i).iter().cloned());
-        }
+        let (vectors_flat, n, dim) = matrix_to_flat(data);
 
         // Compute norms for Cosine distance
         let norms = if metric == Dist::Cosine {
-            (0..n_vectors)
+            (0..n)
                 .map(|i| {
                     let start = i * dim;
                     let end = start + dim;
@@ -264,7 +259,7 @@ where
                 Self::build_tree_recursive(
                     &vectors_flat,
                     dim,
-                    (0..n_vectors).collect(),
+                    (0..n).collect(),
                     &mut tree_rng,
                     metric,
                 )
@@ -324,7 +319,7 @@ where
             vectors_flat,
             dim,
             n_trees,
-            n: n_vectors,
+            n,
             norms,
             metric,
         }

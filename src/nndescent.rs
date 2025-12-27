@@ -170,14 +170,17 @@ impl<T> VectorDistance<T> for NNDescent<T>
 where
     T: Float + FromPrimitive + Send + Sync + Sum,
 {
+    /// Return the flat vectors
     fn vectors_flat(&self) -> &[T] {
         &self.vectors_flat
     }
 
+    /// Return the original dimensions
     fn dim(&self) -> usize {
         self.dim
     }
 
+    /// Return the normalised values for the Cosine calculation
     fn norms(&self) -> &[T] {
         &self.norms
     }
@@ -193,7 +196,7 @@ where
     ///
     /// ### Params
     ///
-    /// * `mat` - Original data in shape of samples x features
+    /// * `data` - Original data in shape of samples x features
     /// * `metric` - The distance metric to use
     /// * `k` - Initial k-nearest neighbours to search
     /// * `max_iter` - Maximum iterations for the algorithm
@@ -209,7 +212,7 @@ where
     /// Initialised NN-Descent index
     #[allow(clippy::too_many_arguments)]
     pub fn new(
-        mat: MatRef<T>,
+        data: MatRef<T>,
         metric: Dist,
         k: Option<usize>,
         max_candidates: Option<usize>,
@@ -220,8 +223,23 @@ where
         seed: usize,
         verbose: bool,
     ) -> Self {
-        let n = mat.nrows();
-        let n_features = mat.ncols();
+        let (vectors_flat, n, dim) = matrix_to_flat(data);
+
+        let norms = if metric == Dist::Cosine {
+            (0..n)
+                .map(|i| {
+                    let start = i * dim;
+                    let end = start + dim;
+                    vectors_flat[start..end]
+                        .iter()
+                        .map(|x| *x * *x)
+                        .fold(T::zero(), |a, b| a + b)
+                        .sqrt()
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
 
         let n_trees = n_trees.unwrap_or_else(|| {
             let calculated = 5 + ((n as f64).powf(0.25)).round() as usize;
@@ -236,36 +254,15 @@ where
         let k = k.unwrap_or(30);
         let max_candidates = max_candidates.unwrap_or(k.min(60));
 
-        let mut vectors_flat = Vec::with_capacity(n * n_features);
-        for i in 0..n {
-            vectors_flat.extend(mat.row(i).iter().copied());
-        }
-
-        let norms = if metric == Dist::Cosine {
-            (0..n)
-                .map(|i| {
-                    let start = i * n_features;
-                    let end = start + n_features;
-                    vectors_flat[start..end]
-                        .iter()
-                        .map(|x| *x * *x)
-                        .fold(T::zero(), |a, b| a + b)
-                        .sqrt()
-                })
-                .collect()
-        } else {
-            Vec::new()
-        };
-
         let start = Instant::now();
-        let annoy_index = AnnoyIndex::new(mat, n_trees, metric, seed);
+        let annoy_index = AnnoyIndex::new(data, n_trees, metric, seed);
         if verbose {
             println!("Built Annoy index: {:.2?}", start.elapsed());
         }
 
         let builder = NNDescent {
             vectors_flat,
-            dim: n_features,
+            dim,
             n,
             metric,
             norms,
@@ -294,7 +291,22 @@ where
         }
     }
 
-    /// Query for k nearest neighbours
+    /// Query for k nearest neighbours using beam search
+    ///
+    /// Performs beam search over the k-NN graph, starting from candidates
+    /// provided by the Annoy index. The search expands outward through the
+    /// graph, maintaining a priority queue of the best candidates found.
+    ///
+    /// ### Params
+    ///
+    /// * `query_vec` - Query vector (must match index dimensionality)
+    /// * `k` - Number of neighbours to return
+    /// * `ef_search` - Search beam width. Higher values improve recall but
+    ///   increase query time. Defaults to `max(2×k, 50)` clamped to 200.
+    ///
+    /// ### Returns
+    ///
+    /// Tuple of `(indices, distances)` sorted by distance (nearest first)
     pub fn query(
         &self,
         query_vec: &[T],
@@ -343,7 +355,20 @@ where
         chunk_size.clamp(min_chunk, self.n)
     }
 
-    /// Initialise the graph with the stored Annoy index
+    /// Initialise the k-NN graph using the Annoy index
+    ///
+    /// Queries the Annoy forest for each point's approximate k nearest
+    /// neighbours. These serve as the starting graph for NN-Descent
+    /// refinement. All neighbours are marked as "new" to trigger exploration
+    /// in the first iteration.
+    ///
+    /// ### Params
+    ///
+    /// * `k` - Number of neighbours per node
+    ///
+    /// ### Returns
+    ///
+    /// Initial k-NN graph with all neighbours marked as new
     fn init_with_annoy(&self, k: usize) -> Vec<Vec<Neighbour<T>>> {
         (0..self.n)
             .into_par_iter()
@@ -427,8 +452,6 @@ where
             println!("Queried Annoy index: {:.2?}", start.elapsed());
         }
 
-        // CHANGE: Compute chunk size for memory-bounded processing
-        // This replaces the old approach of generating all updates at once
         let chunk_size = self.compute_chunk_size(max_candidates);
         let n_chunks = self.n.div_ceil(chunk_size);
 
@@ -460,15 +483,15 @@ where
                 );
             }
 
-            // CHANGE: Process updates in chunks instead of all at once
-            // This is the core memory optimisation - we never hold more than
+            // CHANGE: process updates in chunks instead of all at once
+            // this is the core memory optimisation - we never hold more than
             // one chunk's worth of updates in memory
             for chunk_idx in 0..n_chunks {
                 let chunk_start = chunk_idx * chunk_size;
                 let chunk_end = (chunk_start + chunk_size).min(self.n);
 
-                // CHANGE: Generate updates only from source nodes in this chunk
-                // The method emits BOTH directions (p,q,d) and (q,p,d) so we
+                // CHANGE: generate updates only from source nodes in this chunk
+                // the method emits both directions (p,q,d) and (q,p,d) so we
                 // don't need a second pass to build symmetric updates
                 let mut chunk_updates = self.generate_updates_for_chunk(
                     &new_cands,
@@ -478,16 +501,14 @@ where
                     chunk_end,
                 );
 
-                // CHANGE: Sort by target node (first element)
-                // This enables lock-free application since each target's updates
+                // CHANGE: sort by target node (first element)
+                // this enables lock-free application since each target's updates
                 // form a contiguous slice that can be processed independently
                 chunk_updates.par_sort_unstable_by_key(|&(target, _, _)| target);
 
-                // CHANGE: Apply sorted updates - no locks needed
-                // Each target node's updates are processed as a batch
+                // CHANGE: apply sorted updates - no locks needed
+                // each target node's updates are processed as a batch
                 self.apply_sorted_updates(&chunk_updates, &mut graph, &updates_count);
-
-                // chunk_updates is dropped here, freeing memory before next chunk
             }
 
             let update_count = updates_count.load(Ordering::Relaxed);
@@ -526,6 +547,21 @@ where
     }
 
     /// Build candidate lists for local join
+    ///
+    /// Constructs new and old candidate lists for each node by sampling from
+    /// their current neighbours. Uses random prioritisation to select up to
+    /// `max_candidates` from each category, then adds symmetric candidates
+    /// to ensure graph connectivity.
+    ///
+    /// ### Params
+    ///
+    /// * `graph` - Current k-NN graph
+    /// * `max_candidates` - Maximum candidates per node
+    /// * `rng` - Random number generator for sampling
+    ///
+    /// ### Returns
+    ///
+    /// Tuple of `(new_candidates, old_candidates)` for all nodes
     fn build_candidates(
         &self,
         graph: &[Vec<Neighbour<T>>],
@@ -608,7 +644,16 @@ where
         (new_cands, old_cands)
     }
 
-    /// Mark neighbours as old
+    /// Mark neighbours as old if they appear in new candidate lists
+    ///
+    /// Transitions neighbours from "new" to "old" status once they've been
+    /// explored in the local join. This prevents redundant distance
+    /// calculations in subsequent iterations.
+    ///
+    /// ### Params
+    ///
+    /// * `graph` - Current k-NN graph (modified in-place)
+    /// * `new_cands` - New candidate lists for each node
     fn mark_as_old(&self, graph: &mut [Vec<Neighbour<T>>], new_cands: &[Vec<usize>]) {
         for i in 0..self.n {
             if new_cands[i].is_empty() {
@@ -731,6 +776,18 @@ where
     }
 
     /// Calculate distance between two points
+    ///
+    /// Delegates to the appropriate distance function based on the index's
+    /// configured metric.
+    ///
+    /// ### Params
+    ///
+    /// * `i` - Index of first point
+    /// * `j` - Index of second point
+    ///
+    /// ### Returns
+    ///
+    /// Distance between points i and j
     #[inline]
     fn distance(&self, i: usize, j: usize) -> T {
         match self.metric {
@@ -740,6 +797,21 @@ where
     }
 
     /// Check if an edge should be added to the graph
+    ///
+    /// An edge (p,q) is worth exploring if its distance is better than the
+    /// current worst neighbour for either p or q. This prunes candidates
+    /// that cannot improve either node's k-NN list.
+    ///
+    /// ### Params
+    ///
+    /// * `p` - First node index
+    /// * `q` - Second node index
+    /// * `dist` - Distance between p and q
+    /// * `graph` - Current graph (for threshold lookup)
+    ///
+    /// ### Returns
+    ///
+    /// True if edge should be added to update candidates
     #[inline]
     fn should_add_edge(&self, p: usize, q: usize, dist: T, graph: &[Vec<Neighbour<T>>]) -> bool {
         let p_threshold = if graph[p].is_empty() {
@@ -758,6 +830,21 @@ where
     }
 
     /// Diversify graph by pruning redundant edges
+    ///
+    /// Removes edges to neighbours that are already covered by closer
+    /// neighbours, reducing graph connectivity whilst maintaining search
+    /// quality. Uses probabilistic pruning controlled by `prune_prob`.
+    /// NOTE: Most of the time, this does not really help.
+    ///
+    /// ### Params
+    ///
+    /// * `graph` - Input k-NN graph
+    /// * `prune_prob` - Probability of pruning redundant edges (0.0 to 1.0)
+    /// * `seed` - Random seed for reproducibility
+    ///
+    /// ### Returns
+    ///
+    /// Pruned graph with potentially fewer edges per node
     fn diversify_graph(
         &self,
         graph: &[Vec<(usize, T)>],
