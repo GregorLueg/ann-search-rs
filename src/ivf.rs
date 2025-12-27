@@ -34,6 +34,7 @@ pub struct IvfIndex<T> {
     metric: Dist,
     // index specific ones
     centroids: Vec<T>,
+    centroids_norm: Vec<T>,
     all_indices: Vec<usize>,
     offsets: Vec<usize>,
     nlist: usize,
@@ -82,6 +83,10 @@ where
 
     fn nlist(&self) -> usize {
         self.nlist
+    }
+
+    fn centroids_norm(&self) -> &[T] {
+        &self.centroids_norm
     }
 }
 
@@ -179,6 +184,22 @@ where
             verbose,
         );
 
+        let centroids_norm = if metric == Dist::Cosine {
+            (0..n)
+                .map(|i| {
+                    let start = i * dim;
+                    let end = start + dim;
+                    centroids[start..end]
+                        .iter()
+                        .map(|x| *x * *x)
+                        .fold(T::zero(), |a, b| a + b)
+                        .sqrt()
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+
         // 3. assign the Rest
         let assignments = assign_all_parallel(&vectors_flat, dim, n, &centroids, nlist, &metric);
 
@@ -192,6 +213,7 @@ where
             norms,
             metric,
             centroids,
+            centroids_norm,
             all_indices,
             offsets,
             nlist,
@@ -223,13 +245,7 @@ where
         let nprobe = nprobe
             .unwrap_or_else(|| ((self.nlist as f64).sqrt() as usize).max(1))
             .min(self.nlist);
-        let k = k.min(self.n);
-
-        // 1. find the top `nprobe` centroids
-        let cluster_dists: Vec<(T, usize)> = self.get_centroids_dist(query_vec, nprobe);
-
-        // 2. search only those clusters in the CSR layout
-        let mut buffer = SortedBuffer::with_capacity(k);
+        let k: usize = k.min(self.n);
         let query_norm = if matches!(self.metric, Dist::Cosine) {
             query_vec
                 .iter()
@@ -239,6 +255,12 @@ where
         } else {
             T::one()
         };
+
+        // 1. find the top `nprobe` centroids
+        let cluster_dists: Vec<(T, usize)> = self.get_centroids_dist(query_vec, query_norm, nprobe);
+
+        // 2. search only those clusters in the CSR layout
+        let mut buffer = SortedBuffer::with_capacity(k);
 
         for &(_, cluster_idx) in cluster_dists.iter().take(nprobe) {
             let start = self.offsets[cluster_idx];

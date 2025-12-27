@@ -31,6 +31,7 @@ use crate::utils::*;
 /// * `n` - Number of samples in the index
 /// * `metric` - The chosen distance metric
 /// * `centroids` - The centrois of the each k-mean cluster
+/// * `centroids_norm` - Norms of the centroids - not relevant for this index.
 /// * `all_indices` - Vector indices for each cluster (in a flat structure)
 /// * `offsets` - Offsets of the elements of each inverted list.
 /// * `codebook` - The codebook that contains the information of the
@@ -43,6 +44,7 @@ pub struct IvfSq8Index<T> {
     n: usize,
     metric: Dist,
     centroids: Vec<T>,
+    centroids_norm: Vec<T>,
     all_indices: Vec<usize>,
     offsets: Vec<usize>,
     codebook: ScalarQuantiser<T>,
@@ -81,24 +83,24 @@ impl<T> CentroidDistance<T> for IvfSq8Index<T>
 where
     T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum,
 {
-    /// Get the centroids
     fn centroids(&self) -> &[T] {
         &self.centroids
     }
 
-    /// Get the dimensions
     fn dim(&self) -> usize {
         self.dim
     }
 
-    /// Get the distance metric
     fn metric(&self) -> Dist {
         self.metric
     }
 
-    /// Get the number of lists
     fn nlist(&self) -> usize {
         self.nlist
+    }
+
+    fn centroids_norm(&self) -> &[T] {
+        &self.centroids_norm
     }
 }
 
@@ -254,6 +256,7 @@ where
             n,
             nlist,
             metric,
+            centroids_norm: Vec::new(),
         }
     }
 

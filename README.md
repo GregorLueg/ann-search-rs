@@ -64,7 +64,7 @@ Below shows an example on how to use for example the HNSW index and query it.
 ### HNSW
 
 ```rust
-use ann_search_rs::{build_hnsw_index, query_hnsw_index, Dist, parse_ann_dist};
+use ann_search_rs::{build_hnsw_index, query_hnsw_index};
 use faer::Mat;
 
 // Build the HNSW index
@@ -585,11 +585,11 @@ IVF-SQ8-nl547-np33                 13144.41      3358.42     16502.83       0.83
 -----------------------------------------------------------------------------------
 ```
 
-**Data set with stronger correlation structure**
+**Data set with stronger correlation structure and more dimensions**
 
 To compare against the next two indices. This data is designed to be better 
-suited for high dimensionality. One can appreciate, that higher dimensionality
-(despite better structure in the data) the Recall starts suffering for this
+suited for high dimensionality. One can appreciate, that with higher 
+dimensionality the Recall starts suffering for this
 index.
 
 ```
@@ -609,6 +609,8 @@ IVF-SQ8-nl547-np27                 20138.92      3355.53     23494.45       0.64
 IVF-SQ8-nl547-np33                 20138.92      3960.62     24099.54       0.6422
 -----------------------------------------------------------------------------------
 ```
+
+Let's check how the two other indices deal with this.
 
 ### IVF-PQ
 
@@ -643,23 +645,23 @@ Benchmark: 150k cells, 128D
 ===================================================================================
 Method                           Build (ms)   Query (ms)   Total (ms)     Recall@k
 -----------------------------------------------------------------------------------
-Exhaustive                            15.47    173825.00    173840.46       1.0000
-IVF-PQ-nl273-m16-np13              16670.99      4532.02     21203.02       0.5571
-IVF-PQ-nl273-m16-np16              16670.99      5486.01     22157.01       0.5575
-IVF-PQ-nl273-m16-np23              16670.99      7600.38     24271.37       0.5576
-IVF-PQ-nl273-m32-np13              21723.51      7416.62     29140.13       0.7225
-IVF-PQ-nl273-m32-np16              21723.51      8811.68     30535.19       0.7235
-IVF-PQ-nl273-m32-np23              21723.51     12403.55     34127.06       0.7236
-IVF-PQ-nl387-m16-np19              20135.65      5690.88     25826.53       0.5591
-IVF-PQ-nl387-m16-np27              20135.65      8162.75     28298.40       0.5593
-IVF-PQ-nl387-m32-np19              24311.33      9409.34     33720.67       0.7249
-IVF-PQ-nl387-m32-np27              24311.33     13022.85     37334.18       0.7254
-IVF-PQ-nl547-m16-np23              26157.43      6953.97     33111.40       0.5619
-IVF-PQ-nl547-m16-np27              26157.43      7620.30     33777.73       0.5622
-IVF-PQ-nl547-m16-np33              26157.43      9091.87     35249.30       0.5623
-IVF-PQ-nl547-m32-np23              29776.05     10142.84     39918.89       0.7271
-IVF-PQ-nl547-m32-np27              29776.05     11744.12     41520.16       0.7278
-IVF-PQ-nl547-m32-np33              29776.05     14123.35     43899.39       0.7280
+Exhaustive                            16.01    180361.27    180377.28       1.0000
+IVF-PQ-nl273-m16-np13              16781.22      4450.38     21231.60       0.5571
+IVF-PQ-nl273-m16-np16              16781.22      5175.86     21957.08       0.5575
+IVF-PQ-nl273-m16-np23              16781.22      7891.47     24672.69       0.5575
+IVF-PQ-nl273-m32-np13              20016.47      7353.13     27369.60       0.7225
+IVF-PQ-nl273-m32-np16              20016.47      8984.63     29001.10       0.7235
+IVF-PQ-nl273-m32-np23              20016.47     12319.57     32336.04       0.7237
+IVF-PQ-nl387-m16-np19              20712.47      5509.88     26222.35       0.5590
+IVF-PQ-nl387-m16-np27              20712.47      7915.02     28627.49       0.5593
+IVF-PQ-nl387-m32-np19              24812.90      9081.07     33893.97       0.7250
+IVF-PQ-nl387-m32-np27              24812.90     13135.28     37948.18       0.7255
+IVF-PQ-nl547-m16-np23              27162.68      6891.43     34054.11       0.5619
+IVF-PQ-nl547-m16-np27              27162.68      7580.48     34743.15       0.5622
+IVF-PQ-nl547-m16-np33              27162.68      8951.89     36114.57       0.5623
+IVF-PQ-nl547-m32-np23              30516.85     10388.61     40905.47       0.7270
+IVF-PQ-nl547-m32-np27              30516.85     12168.79     42685.64       0.7277
+IVF-PQ-nl547-m32-np33              30516.85     14645.70     45162.56       0.7280
 -----------------------------------------------------------------------------------
 ```
 
@@ -669,7 +671,7 @@ higher. However, you also reduce the memory finger print quite substantially.
 
 **With more dimensions**
 
-With 192 dimensions. In this case, also m = 48, i.e., dividing the origina 
+With 192 dimensions. In this case, also m = 48, i.e., dividing the original 
 vectors into 48 subvectors was tested.
 
 ```
@@ -832,6 +834,8 @@ look at the indices compared against exhaustive (CPU).
 ### Comparison against CPU exhaustive
 
 ### Comparison against IVF CPU
+
+### Higher dimensionality
 
 ## Licence
 

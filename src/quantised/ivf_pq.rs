@@ -22,6 +22,7 @@ use crate::utils::*;
 /// * `n` - Number of samples in the index
 /// * `metric` - Distance metric
 /// * `centroids` - K-means cluster centroids
+/// * `centroids_norm` - Norms of the centroids - not relevant for this index.
 /// * `all_indices` - Vector indices for each cluster (CSR format)
 /// * `offsets` - Offsets for each inverted list
 /// * `codebook` - Product quantiser with M codebooks
@@ -32,6 +33,7 @@ pub struct IvfPqIndex<T> {
     n: usize,
     metric: Dist,
     centroids: Vec<T>,
+    centroids_norm: Vec<T>,
     all_indices: Vec<usize>,
     offsets: Vec<usize>,
     codebook: ProductQuantiser<T>,
@@ -46,24 +48,24 @@ impl<T> CentroidDistance<T> for IvfPqIndex<T>
 where
     T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum,
 {
-    /// Get the centroids
     fn centroids(&self) -> &[T] {
         &self.centroids
     }
 
-    /// Get the dimensions
     fn dim(&self) -> usize {
         self.dim
     }
 
-    /// Get the distance metric
     fn metric(&self) -> Dist {
         self.metric
     }
 
-    /// Get the number of lists
     fn nlist(&self) -> usize {
         self.nlist
+    }
+
+    fn centroids_norm(&self) -> &[T] {
+        &self.centroids_norm
     }
 }
 
@@ -268,6 +270,7 @@ where
             n,
             nlist,
             metric,
+            centroids_norm: Vec::new(),
         }
     }
 

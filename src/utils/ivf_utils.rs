@@ -30,23 +30,31 @@ where
     /// Get the internal distance metric
     fn metric(&self) -> Dist;
 
+    /// Get the centroids normalisation
+    fn centroids_norm(&self) -> &[T];
+
     /// Calculate the distance to the centroids
     ///
     /// ### Params
     ///
     /// * `query_vec` - The slice of the query
+    /// * `query_norm` - The norm of the query. Relevant for fast Cosine dist
+    ///   calculations.
     /// * `nprobe` - Number of probes
     ///
     /// ### Returns
     ///
     /// The distance to the different clusters
-    fn get_centroids_dist(&self, query_vec: &[T], nprobe: usize) -> Vec<(T, usize)> {
+    fn get_centroids_dist(&self, query_vec: &[T], query_norm: T, nprobe: usize) -> Vec<(T, usize)> {
         let mut cluster_dists: Vec<(T, usize)> = (0..self.nlist())
             .map(|c| {
                 let cent = &self.centroids()[c * self.dim()..(c + 1) * self.dim()];
                 let dist = match self.metric() {
                     Dist::Euclidean => euclidean_distance_static(query_vec, cent),
-                    Dist::Cosine => cosine_distance_static(query_vec, cent),
+                    Dist::Cosine => {
+                        let c_norm = &self.centroids_norm()[c];
+                        cosine_distance_static_norm(query_vec, cent, &query_norm, c_norm)
+                    }
                 };
                 (dist, c)
             })

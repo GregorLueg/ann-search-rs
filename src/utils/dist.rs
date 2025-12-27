@@ -525,6 +525,35 @@ where
     T::one() - (dot / (norm_a * norm_b))
 }
 
+/// Static Cosine distance between two arbitrary vectors
+///
+/// This version accepts pre-calculated norms
+///
+/// Computes norms on the fly
+///
+/// ### Params
+///
+/// * `a` - Slice of vector one
+/// * `b` - Slice of vector two
+///
+/// ### Returns
+///
+/// Squared cosine distance
+pub fn cosine_distance_static_norm<T>(a: &[T], b: &[T], norm_a: &T, norm_b: &T) -> T
+where
+    T: Float,
+{
+    assert!(a.len() == b.len(), "Vectors a and b need to have same len!");
+
+    let dot: T = a
+        .iter()
+        .zip(b.iter())
+        .map(|(&x, &y)| x * y)
+        .fold(T::zero(), |acc, x| acc + x);
+
+    T::one() - (dot / (*norm_a * *norm_b))
+}
+
 /// Helper to normalise vector in place
 ///
 /// ### Params
