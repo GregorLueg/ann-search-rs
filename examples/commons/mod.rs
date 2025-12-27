@@ -1,5 +1,6 @@
 #![allow(dead_code)]
 
+use clap::Parser;
 use faer::traits::ComplexField;
 use faer::Mat;
 use num_traits::{Float, FromPrimitive, ToPrimitive};
@@ -18,6 +19,41 @@ pub const DEFAULT_SEED: u64 = 10101;
 pub const DEFAULT_DISTANCE: &str = "euclidean";
 pub const DEFAULT_COR_STRENGTH: f64 = 0.5;
 pub const DEFAULT_DATA: &str = "gaussian";
+
+/// Parsing structure
+///
+/// ### Fields
+///
+/// * `n_cells` - Number of cells/samples
+/// * `dim` - Number of dimensions to use
+/// * `n_clusters` - Number of clusters in the data
+/// * `k` - Number of neighbours to search
+/// * `seed` - Random seed for reproducibility
+/// * `distance` - The distance to use. One of `"euclidean"` or `"cosine"`.
+/// * `data` - The data to use. One of `"gaussian"` or `"correlated"`.
+#[derive(Parser)]
+pub struct Cli {
+    #[arg(long, default_value_t = DEFAULT_N_CELLS)]
+    pub n_cells: usize,
+
+    #[arg(long, default_value_t = DEFAULT_DIM)]
+    pub dim: usize,
+
+    #[arg(long, default_value_t = DEFAULT_N_CLUSTERS)]
+    pub n_clusters: usize,
+
+    #[arg(long, default_value_t = DEFAULT_K)]
+    pub k: usize,
+
+    #[arg(long, default_value_t = DEFAULT_SEED)]
+    pub seed: u64,
+
+    #[arg(long, default_value = DEFAULT_DISTANCE)]
+    pub distance: String,
+
+    #[arg(long, default_value = DEFAULT_DATA)]
+    pub data: String,
+}
 
 /////////////
 // Helpers //

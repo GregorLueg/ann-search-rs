@@ -2,19 +2,23 @@
 
 pub mod annoy;
 pub mod exhaustive;
-pub mod gpu;
 pub mod hnsw;
 pub mod ivf;
 pub mod lsh;
 pub mod nndescent;
-pub mod quantised;
+
 pub mod utils;
 
-use cubecl::prelude::*;
+#[cfg(feature = "gpu")]
+pub mod gpu;
+
+#[cfg(feature = "quantised")]
+pub mod quantised;
+
 use faer::MatRef;
 use num_traits::{Float, FromPrimitive, ToPrimitive};
 use rayon::prelude::*;
-use std::ops::AddAssign;
+
 use std::{
     iter::Sum,
     sync::{
@@ -24,17 +28,25 @@ use std::{
 };
 use thousands::*;
 
+#[cfg(feature = "gpu")]
+use cubecl::prelude::*;
+#[cfg(feature = "quantised")]
+use std::ops::AddAssign;
+
 use crate::annoy::*;
 use crate::exhaustive::*;
-use crate::gpu::exhaustive_gpu::*;
-use crate::gpu::ivf_gpu::*;
 use crate::hnsw::*;
 use crate::ivf::*;
 use crate::lsh::*;
 use crate::nndescent::*;
-use crate::quantised::{ivf_opq::*, ivf_pq::*, ivf_sq8::*};
-
 use crate::utils::dist::*;
+
+#[cfg(feature = "gpu")]
+use crate::gpu::exhaustive_gpu::*;
+#[cfg(feature = "gpu")]
+use crate::gpu::ivf_gpu::*;
+#[cfg(feature = "quantised")]
+use crate::quantised::{ivf_opq::*, ivf_pq::*, ivf_sq8::*};
 
 ////////////
 // Helper //
@@ -589,6 +601,7 @@ where
 // IVF-SQ8 //
 /////////////
 
+#[cfg(feature = "quantised")]
 /// Build an IVF-SQ8 index
 ///
 /// ### Params
@@ -624,6 +637,7 @@ where
     IvfSq8Index::build(mat, nlist, ann_dist, max_iters, seed, verbose)
 }
 
+#[cfg(feature = "quantised")]
 /// Helper function to query a given IVF-SQ8 index
 ///
 /// ### Params
@@ -659,6 +673,7 @@ where
 // IVF-PQ //
 ////////////
 
+#[cfg(feature = "quantised")]
 /// Build an IVF-PQ index
 ///
 /// ### Params
@@ -704,6 +719,7 @@ where
     )
 }
 
+#[cfg(feature = "quantised")]
 /// Helper function to query a given IVF-PQ index
 ///
 /// ### Params
@@ -739,6 +755,7 @@ where
 // IVF-OPQ //
 /////////////
 
+#[cfg(feature = "quantised")]
 /// Build an IVF-OPQ index
 ///
 /// ### Params
@@ -786,6 +803,7 @@ where
     )
 }
 
+#[cfg(feature = "quantised")]
 /// Helper function to query a given IVF-OPQ index
 ///
 /// ### Params
@@ -825,6 +843,7 @@ where
 // Exhaustive GPU //
 ////////////////////
 
+#[cfg(feature = "gpu")]
 /// Build an exhaustive GPU index
 ///
 /// ### Params
@@ -849,6 +868,7 @@ where
     ExhaustiveIndexGpu::new(mat, metric, device)
 }
 
+#[cfg(feature = "gpu")]
 /// Query the exhaustive GPU index
 ///
 /// ### Params
@@ -884,6 +904,7 @@ where
 // IVF GPU //
 //////////////
 
+#[cfg(feature = "gpu")]
 /// Build an IVF index with batched GPU acceleration
 ///
 /// ### Params
@@ -912,6 +933,7 @@ where
     IvfIndexGpu::build(mat, ann_dist, nlist, max_iters, seed, verbose, device)
 }
 
+#[cfg(feature = "gpu")]
 /// Query an IVF batched index
 ///
 /// ### Params

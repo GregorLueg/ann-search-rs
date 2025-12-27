@@ -200,7 +200,8 @@ where
     ///
     /// ### Returns
     ///
-    /// Tuple of (indices, distances) where each is Vec<Vec<_>> of length n_queries
+    /// Tuple of (indices, distances) where each is Vec<Vec<_>> of length
+    /// n_queries
     pub fn query_batch(
         &self,
         query_mat: MatRef<T>,

@@ -15,9 +15,12 @@ path = "src/lib.rs"
 lto = true
 codegen-units = 1
 
+[features]
+gpu = ["cubecl"]
+quantised = []
 
 [dependencies]
-cubecl = { version = "0.8.1", features = ["wgpu"] }
+cubecl = { version = "0.8.1", features = ["wgpu"], optional = true }
 clap = { version = "4.5.53", features = ["derive"] }
 faer = "0.23.2"
 fixedbitset = "0.5.7"
@@ -29,3 +32,19 @@ rayon = "1.11.0"
 rustc-hash = "2.1.1"
 thousands = "0.2.0"
 approx = "0.5.1"
+
+[[example]]
+name = "gridsearch_gpu"
+required-features = ["gpu"]
+
+[[example]]
+name = "gridsearch_ivf_sq8"
+required-features = ["quantised"]
+
+[[example]]
+name = "gridsearch_ivf_opq"
+required-features = ["quantised"]
+
+[[example]]
+name = "gridsearch_ivf_pq"
+required-features = ["quantised"]

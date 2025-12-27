@@ -712,6 +712,7 @@ where
     /// * `k` - Number of neighbours per vector
     /// * `search_k` - Search budget (defaults to k * n_trees * 20 if None)
     /// * `return_dist` - Whether to return distances
+    /// * `verbose` - Controls verbosity of the function
     ///
     /// ### Returns
     ///

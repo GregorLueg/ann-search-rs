@@ -7,30 +7,6 @@ use faer::Mat;
 use std::time::Instant;
 use thousands::*;
 
-#[derive(Parser)]
-struct Cli {
-    #[arg(long, default_value_t = DEFAULT_N_CELLS)]
-    n_cells: usize,
-
-    #[arg(long, default_value_t = DEFAULT_DIM)]
-    dim: usize,
-
-    #[arg(long, default_value_t = DEFAULT_N_CLUSTERS)]
-    n_clusters: usize,
-
-    #[arg(long, default_value_t = DEFAULT_K)]
-    k: usize,
-
-    #[arg(long, default_value_t = DEFAULT_SEED)]
-    seed: u64,
-
-    #[arg(long, default_value = DEFAULT_DISTANCE)]
-    distance: String,
-
-    #[arg(long, default_value = DEFAULT_DATA)]
-    data: String,
-}
-
 fn main() {
     let cli = Cli::parse();
 

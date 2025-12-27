@@ -1,6 +1,11 @@
 ## GPU-accelerated indices benchmarks and parameter gridsearch
 
-Below are benchmarks shown the 
+Below are benchmarks shown for the GPU-accelerated code. If you wish to run
+the example script, please use
+
+```bash
+cargo run --example gridsearch_gpu --features gpu
+```
 
 ### Comparison against CPU exhaustive
 

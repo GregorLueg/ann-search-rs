@@ -12,11 +12,11 @@ run_quantised() {
     local variant=$1
     shift
     echo "Running IVF-${variant} benchmarks..."
-    cargo run --example "gridsearch_ivf_${variant}" --release -- "$@"
+    cargo run --example "gridsearch_ivf_${variant}" --release --features quantised -- "$@"
 }
 
 # Basic algorithms with cosine and euclidean
-for algo in annoy hnsw ivf lsh nndescent gpu; do
+for algo in annoy hnsw ivf lsh nndescent; do
     run_benchmark "${algo}" --distance euclidean
     run_benchmark "${algo}" --distance cosine
 done
@@ -34,13 +34,18 @@ run_quantised pq --distance euclidean --dim 192 --data correlated
 run_quantised opq --distance euclidean --dim 128 --data correlated
 run_quantised opq --distance euclidean --dim 192 --data correlated
 
+# GPU benchmarks
+echo "Running GPU benchmarks"
+cargo run --example gridsearch_gpu --release --features gpu -- --distance euclidean
+cargo run --example gridsearch_gpu --release --features gpu -- --distance cosine 
+
 # GPU benchmarks - larger datasets
 echo "Running GPU benchmarks (larger data set)..."
-cargo run --example gridsearch_ivf --release -- --distance euclidean --n-cells 250000 --dim 64
-cargo run --example gridsearch_gpu --release -- --distance euclidean --n-cells 250000 --dim 64
+cargo run --example gridsearch_ivf --release --features gpu -- --distance euclidean --n-cells 250000 --dim 64
+cargo run --example gridsearch_gpu --release --features gpu -- --distance euclidean --n-cells 250000 --dim 64
 
 # GPU benchmarks - more dimensions
 echo "Running GPU benchmarks (more dimensions)..."
-cargo run --example gridsearch_gpu --release -- --distance euclidean --dim 128 --data correlated
+cargo run --example gridsearch_gpu --release --features gpu -- --distance euclidean --dim 128 --data correlated
 
 echo "All benchmarks complete."
