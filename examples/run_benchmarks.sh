@@ -39,8 +39,8 @@ cargo run --example gridsearch_gpu --release -- --distance cosine
 
 # Comparison with larger datasets
 echo "Running GPU benchmarks (larger data set)..."
-cargo run --example gridsearch_ivf --release -- --distance euclidean --n-cells 500000
-cargo run --example gridsearch_gpu --release -- --distance euclidean --n-cells 500000
+cargo run --example gridsearch_ivf --release -- --distance euclidean --n-cells 250000 --dim 64
+cargo run --example gridsearch_gpu --release -- --distance euclidean --n-cells 250000 --dim 64
 
 # More dimensions
 echo "Running GPU benchmarks (more dimensions)..."

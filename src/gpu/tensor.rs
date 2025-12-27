@@ -16,7 +16,7 @@ use std::marker::PhantomData;
 /// * `strides` - Memory strides for each dimension in row-major order
 /// * `_r` - Phantom marker for the runtime type
 /// * `_f` - Phantom marker for the float element type
-pub struct GpuTensor<R: Runtime, F: Float + CubeElement> {
+pub struct GpuTensor<R: Runtime, F: CubeElement + Float> {
     data: Handle,
     shape: Vec<usize>,
     strides: Vec<usize>,
@@ -24,7 +24,7 @@ pub struct GpuTensor<R: Runtime, F: Float + CubeElement> {
     _f: PhantomData<F>,
 }
 
-impl<R: Runtime, F: Float + CubeElement> Clone for GpuTensor<R, F> {
+impl<R: Runtime, F: CubeElement + Float> Clone for GpuTensor<R, F> {
     fn clone(&self) -> Self {
         Self {
             data: self.data.clone(),

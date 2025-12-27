@@ -895,7 +895,6 @@ dependencies = [
  "cfg_aliases",
  "cubecl-common",
  "cubecl-core",
- "cubecl-cpp",
  "cubecl-runtime",
  "derive-new",
  "derive_more",

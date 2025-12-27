@@ -149,7 +149,6 @@ fn main() {
             (nlist as f32).sqrt() as usize,
             (nlist as f32 * 2.0).sqrt() as usize,
             (0.05 * nlist as f32) as usize,
-            (0.1 * nlist as f32) as usize,
         ];
         let mut nprobe_values: Vec<_> = nprobe_values
             .into_iter()
@@ -164,10 +163,7 @@ fn main() {
             }
 
             // Test build_knn_graph
-            println!(
-                "Building kNN graph IVF-GPU (nlist={}, nprobe={})...",
-                nlist, nprobe
-            );
+            println!("Querying IVF-GPU (nlist={}, nprobe={})...", nlist, nprobe);
             let start = Instant::now();
             let (knn_neighbors, knn_distances) = query_ivf_index_gpu(
                 data.as_ref(),

@@ -185,7 +185,7 @@ where
         );
 
         let centroids_norm = if metric == Dist::Cosine {
-            (0..n)
+            (0..nlist)
                 .map(|i| {
                     let start = i * dim;
                     let end = start + dim;
