@@ -42,6 +42,10 @@ heavy multi-threading were possible and optimised structures for memory access.
   - *IVF-PQ* (with product quantisation)
   - *IVF-OPQ* (with optimised product quantisation)
 
+- **GPU-accelerated indices**:
+  - *Exhaustive flat index with GPU acceleration*
+  - *IVF (Inverted File index) with GPU acceleration*
+
 ## Installation
 
 Add this to your `Cargo.toml`:
@@ -51,11 +55,16 @@ Add this to your `Cargo.toml`:
 ann-search-rs = "*" # always get the latest version
 ```
 
+To note, I have changed some of the interfaces between versions.
+
 ## Roadmap
 
-- Longer term, I am considering GPU-acceleration (yet to be figured out how,
-likely via the [Burn framework](https://burn.dev)).
-- Option to save indices on-disk and do on-disk querying.
+- ~~First GPU support~~ (Implemented with version `0.2.1` of the crate).
+- Option to save indices on-disk and maybe do on-disk querying ... ? 
+- More GPU support for other indices. TBD, needs to warrant the time investment.
+  For the use cases of the author this crate suffices atm more than enough.
+  Additionally, need to figure out better ways to do the kernel magic as the
+  CPU to GPU transfers are quite costly and costing performance.
 
 ## Example Usage
 
@@ -64,7 +73,7 @@ Below shows an example on how to use for example the HNSW index and query it.
 ### HNSW
 
 ```rust
-use ann_search_rs::{build_hnsw_index, query_hnsw_index, Dist, parse_ann_dist};
+use ann_search_rs::{build_hnsw_index, query_hnsw_index};
 use faer::Mat;
 
 // Build the HNSW index
@@ -121,22 +130,8 @@ cargo run --example gridsearch_annoy --release -- --n-cells 500000 --dim 32 --di
 For every index, 150k cells with 32 dimensions distance and 25 distinct clusters 
 (of different sizes each) in the synthetic data has been run. The results for 
 the different indices are show below. For details on the synthetic data 
-function, see `./examples/commons/mod.rs`.
-
-### Annoy
-
-Approximate nearest neighbours Oh Yeah. A tree-based method for vector searches.
-Fast index building and good query speed.
-
-**Key parameters:**
-
-- *Number of trees (nt)*: The number of trees to generate in the forest
-- *Search budget (s)*: The search budget per tree. If set to auto it uses
-  `k * n_trees * 20`; versions with a `10x` or `5x` (i.e., less) are also shown.
-
-**Euclidean:**
-
-Below are the results for the Euclidean distance measure for Annoy.
+function, see `./examples/commons/mod.rs`. This was run on an M1 Max MacBoo Pro
+with 64 GB of unified memory, see one example below:
 
 ```
 ====================================================================================================
@@ -144,373 +139,32 @@ Benchmark: 150k cells, 32D
 ====================================================================================================
 Method                                Build (ms)   Query (ms)   Total (ms)     Recall@k   Dist Error
 ----------------------------------------------------------------------------------------------------
-Exhaustive                                  3.37     23523.50     23526.87       1.0000     0.000000
-Annoy-nt5-s:auto                           72.77       809.88       882.65       0.6408    81.683927
-Annoy-nt5-s:10x                            72.77       586.92       659.69       0.5175    81.587548
-Annoy-nt5-s:5x                             72.77       362.61       435.38       0.3713    81.392453
-Annoy-nt10-s:auto                          94.91      1520.99      1615.90       0.8479    81.814313
-Annoy-nt10-s:10x                           94.91      1071.05      1165.96       0.7378    81.763178
-Annoy-nt10-s:5x                            94.91       665.56       760.47       0.5603    81.632177
-Annoy-nt15-s:auto                         151.49      2186.96      2338.45       0.9338    81.853076
-Annoy-nt15-s:10x                          151.49      1539.40      1690.89       0.8542    81.824079
-Annoy-nt15-s:5x                           151.49       969.16      1120.65       0.6898    81.734461
-Annoy-nt25-s:auto                         238.07      3383.97      3622.03       0.9854    81.872143
-Annoy-nt25-s:10x                          238.07      2447.85      2685.91       0.9512    81.862444
-Annoy-nt25-s:5x                           238.07      1557.78      1795.85       0.8394    81.818440
-Annoy-nt50-s:auto                         439.72      5871.01      6310.73       0.9994    81.876491
-Annoy-nt50-s:10x                          439.72      4437.93      4877.65       0.9959    81.875733
-Annoy-nt50-s:5x                           439.72      2940.64      3380.35       0.9647    81.867209
-Annoy-nt75-s:auto                         649.73      8241.52      8891.24       1.0000    81.876624
-Annoy-nt75-s:10x                          649.73      6361.06      7010.78       0.9995    81.876551
-Annoy-nt75-s:5x                           649.73      4338.25      4987.98       0.9909    81.874592
+Exhaustive                                  4.02     23204.51     23208.53       1.0000     0.000000
+Annoy-nt5-s:auto                           73.62       794.92       868.54       0.6408    81.683927
+Annoy-nt5-s:10x                            73.62       570.38       644.00       0.5175    81.587548
+Annoy-nt5-s:5x                             73.62       359.21       432.82       0.3713    81.392453
+Annoy-nt10-s:auto                         100.36      1519.07      1619.43       0.8479    81.814313
+Annoy-nt10-s:10x                          100.36      1061.24      1161.60       0.7378    81.763178
+Annoy-nt10-s:5x                           100.36       669.30       769.66       0.5603    81.632177
+Annoy-nt15-s:auto                         158.77      2145.18      2303.94       0.9338    81.853076
+Annoy-nt15-s:10x                          158.77      1528.20      1686.96       0.8542    81.824079
+Annoy-nt15-s:5x                           158.77       952.47      1111.24       0.6898    81.734461
+Annoy-nt25-s:auto                         234.09      3317.58      3551.68       0.9854    81.872143
+Annoy-nt25-s:10x                          234.09      2407.78      2641.87       0.9512    81.862444
+Annoy-nt25-s:5x                           234.09      1448.60      1682.69       0.8394    81.818440
+Annoy-nt50-s:auto                         450.88      5865.30      6316.18       0.9994    81.876491
+Annoy-nt50-s:10x                          450.88      4471.22      4922.10       0.9959    81.875733
+Annoy-nt50-s:5x                           450.88      2975.32      3426.20       0.9647    81.867209
+Annoy-nt75-s:auto                         687.39      8105.55      8792.94       1.0000    81.876624
+Annoy-nt75-s:10x                          687.39      6273.23      6960.62       0.9995    81.876551
+Annoy-nt75-s:5x                           687.39      4329.62      5017.01       0.9909    81.874592
+Annoy-nt100-s:auto                        900.40     10331.99     11232.39       1.0000    81.876631
+Annoy-nt100-s:10x                         900.40      8045.77      8946.17       0.9999    81.876621
+Annoy-nt100-s:5x                          900.40      5620.07      6520.48       0.9974    81.876118
 ----------------------------------------------------------------------------------------------------
 ```
 
-**Cosine:**
-
-Below are the results for the Cosine distance measure for Annoy.
-
-```
-====================================================================================================
-Benchmark: 150k cells, 32D
-====================================================================================================
-Method                                Build (ms)   Query (ms)   Total (ms)     Recall@k   Dist Error
-----------------------------------------------------------------------------------------------------
-Exhaustive                                  5.13     24048.95     24054.07       1.0000     0.000000
-Annoy-nt5-s:auto                           73.75       312.45       386.19       0.3459     0.007802
-Annoy-nt5-s:10x                            73.75       320.43       394.18       0.3459     0.007802
-Annoy-nt5-s:5x                             73.75       308.15       381.90       0.3378     0.008007
-Annoy-nt10-s:auto                          97.42       579.70       677.13       0.5300     0.003925
-Annoy-nt10-s:10x                           97.42       588.16       685.58       0.5300     0.003925
-Annoy-nt10-s:5x                            97.42       576.55       673.98       0.5241     0.004002
-Annoy-nt15-s:auto                         148.80       795.59       944.40       0.6573     0.002336
-Annoy-nt15-s:10x                          148.80       794.16       942.96       0.6573     0.002336
-Annoy-nt15-s:5x                           148.80       786.41       935.21       0.6535     0.002372
-Annoy-nt25-s:auto                         230.48      1388.85      1619.34       0.8131     0.000991
-Annoy-nt25-s:10x                          230.48      1402.02      1632.51       0.8131     0.000991
-Annoy-nt25-s:5x                           230.48      1372.65      1603.13       0.8115     0.001001
-Annoy-nt50-s:auto                         426.71      2528.20      2954.91       0.9540     0.000177
-Annoy-nt50-s:10x                          426.71      2530.38      2957.09       0.9540     0.000177
-Annoy-nt50-s:5x                           426.71      2518.79      2945.50       0.9538     0.000178
-Annoy-nt75-s:auto                         650.46      3904.17      4554.63       0.9871     0.000041
-Annoy-nt75-s:10x                          650.46      3919.21      4569.67       0.9871     0.000041
-Annoy-nt75-s:5x                           650.46      3930.34      4580.80       0.9871     0.000041
-----------------------------------------------------------------------------------------------------
-```
-
-### HNSW
-
-Hierarchical navigatable small worlds. A graph-based index that needs more time
-to build the index. However, fast query speed.
-
-**Key parameters:**
-
-- *M (m)*: The number of connections between layers
-- *EF construction (ef)*: The budget to generate good connections during 
-  construction of the index.
-- *EF search (s)*: The budget for the search queries. 
-
-**Euclidean:**
-
-Below are the results for the Euclidean distance measure for HSNW.
-
-```
-====================================================================================================
-Benchmark: 150k cells, 32D
-====================================================================================================
-Method                                Build (ms)   Query (ms)   Total (ms)     Recall@k   Dist Error
-----------------------------------------------------------------------------------------------------
-Exhaustive                                  4.61     23390.29     23394.90       1.0000     0.000000
-HNSW-M16-ef50-s50                        2104.11      1317.04      3421.15       0.9252     7.516656
-HNSW-M16-ef50-s75                        2104.11      1817.25      3921.36       0.9567     4.398063
-HNSW-M16-ef50-s100                       2104.11      2264.65      4368.76       0.9708     3.054929
-HNSW-M16-ef100-s50                       3429.25      1430.55      4859.79       0.9618     2.821499
-HNSW-M16-ef100-s75                       3429.25      1927.23      5356.47       0.9735     1.483684
-HNSW-M16-ef100-s100                      3429.25      2387.60      5816.85       0.9787     1.027704
-HNSW-M16-ef200-s50                       4127.09      1499.91      5627.01       0.9152    11.290405
-HNSW-M16-ef200-s75                       4127.09      2035.84      6162.94       0.9235     7.658499
-HNSW-M16-ef200-s100                      4127.09      2500.90      6628.00       0.9267     6.201307
-HNSW-M24-ef100-s50                       6291.58      1701.78      7993.36       0.9730     5.491844
-HNSW-M24-ef100-s75                       6291.58      2305.94      8597.52       0.9776     4.603578
-HNSW-M24-ef100-s100                      6291.58      2803.48      9095.06       0.9796     4.151941
-HNSW-M24-ef200-s50                       7286.09      1775.13      9061.23       0.9564     7.359320
-HNSW-M24-ef200-s75                       7286.09      2418.02      9704.11       0.9638     3.299870
-HNSW-M24-ef200-s100                      7286.09      2924.28     10210.37       0.9661     2.041412
-HNSW-M24-ef300-s50                       8351.74      1823.95     10175.68       0.9714    16.680926
-HNSW-M24-ef300-s75                       8351.74      2488.24     10839.97       0.9846     9.201803
-HNSW-M24-ef300-s100                      8351.74      3017.11     11368.85       0.9890     6.563623
-HNSW-M32-ef200-s50                      11285.16      2169.19     13454.35       0.9846     8.716828
-HNSW-M32-ef200-s75                      11285.16      2914.92     14200.08       0.9904     5.236196
-HNSW-M32-ef200-s100                     11285.16      3524.02     14809.18       0.9929     3.754602
-HNSW-M32-ef300-s50                      12322.42      2137.78     14460.20       0.9558     7.227940
-HNSW-M32-ef300-s75                      12322.42      2849.39     15171.82       0.9641     3.714656
-HNSW-M32-ef300-s100                     12322.42      3483.47     15805.89       0.9679     2.224845
-----------------------------------------------------------------------------------------------------
-```
-
-**Cosine:**
-
-Below are the results for the Cosine distance measure for HSNW.
-
-```
-====================================================================================================
-Benchmark: 150k cells, 32D
-====================================================================================================
-Method                                Build (ms)   Query (ms)   Total (ms)     Recall@k   Dist Error
-----------------------------------------------------------------------------------------------------
-Exhaustive                                  4.61     24075.74     24080.34       1.0000     0.000000
-HNSW-M16-ef50-s50                        2142.93      1281.87      3424.80       0.8308     0.009739
-HNSW-M16-ef50-s75                        2142.93      1763.03      3905.96       0.8606     0.007662
-HNSW-M16-ef50-s100                       2142.93      2172.93      4315.86       0.8780     0.006563
-HNSW-M16-ef100-s50                       3291.85      1427.58      4719.43       0.9288     0.005761
-HNSW-M16-ef100-s75                       3291.85      1972.21      5264.07       0.9511     0.004270
-HNSW-M16-ef100-s100                      3291.85      2427.58      5719.44       0.9640     0.003515
-HNSW-M16-ef200-s50                       4279.89      1499.46      5779.34       0.9355     0.011694
-HNSW-M16-ef200-s75                       4279.89      2085.75      6365.63       0.9525     0.003893
-HNSW-M16-ef200-s100                      4279.89      2547.11      6827.00       0.9566     0.002241
-HNSW-M24-ef100-s50                       6214.15      1807.51      8021.66       0.9392     0.009069
-HNSW-M24-ef100-s75                       6214.15      2395.13      8609.28       0.9477     0.006694
-HNSW-M24-ef100-s100                      6214.15      2950.05      9164.19       0.9519     0.005477
-HNSW-M24-ef200-s50                       7431.74      1809.10      9240.84       0.9139     0.016804
-HNSW-M24-ef200-s75                       7431.74      2445.18      9876.92       0.9245     0.011393
-HNSW-M24-ef200-s100                      7431.74      2960.93     10392.67       0.9278     0.009835
-HNSW-M24-ef300-s50                       8482.58      1897.40     10379.98       0.8821     0.058018
-HNSW-M24-ef300-s75                       8482.58      2597.45     11080.03       0.9009     0.046460
-HNSW-M24-ef300-s100                      8482.58      3169.16     11651.74       0.9108     0.040646
-HNSW-M32-ef200-s50                      11454.41      2099.81     13554.23       0.9428     0.032554
-HNSW-M32-ef200-s75                      11454.41      2829.83     14284.24       0.9517     0.026652
-HNSW-M32-ef200-s100                     11454.41      3437.36     14891.78       0.9561     0.023815
-HNSW-M32-ef300-s50                      12495.14      2134.02     14629.17       0.8914     0.058028
-HNSW-M32-ef300-s75                      12495.14      2880.84     15375.98       0.9040     0.049528
-HNSW-M32-ef300-s100                     12495.14      3512.76     16007.91       0.9108     0.045337
-----------------------------------------------------------------------------------------------------
-```
-
-### IVF
-
-Inverted file index. Uses Voronoi cells to sub-partition the original data.
-
-**Key parameters:**
-
-- *Number of lists (nl)*: The number of independent k-means cluster to generate.
-  If the structure of the data is unknown, people use `sqrt(n)` as a heuristic.
-- *Number of points (np)*: The number of clusters to probe during search. 
-  Usually scanning 15 to 20% of the number of lists yields good results.
-
-
-**Euclidean:**
-
-Below are the results for the Euclidean distance measure for IVF.
-
-```
-====================================================================================================
-Benchmark: 150k cells, 32D
-====================================================================================================
-Method                                Build (ms)   Query (ms)   Total (ms)     Recall@k   Dist Error
-----------------------------------------------------------------------------------------------------
-Exhaustive                                  3.42     24779.72     24783.15       1.0000     0.000000
-IVF-nl10-np1                               91.88      8195.27      8287.16       0.9981     0.090493
-IVF-nl20-np1                              155.00      4011.87      4166.86       0.9765     0.396602
-IVF-nl20-np2                              155.00      7450.47      7605.47       1.0000     0.004042
-IVF-nl20-np3                              155.00     11209.87     11364.86       1.0000     0.000014
-IVF-nl25-np1                              219.24      3438.27      3657.51       0.9647     0.620844
-IVF-nl25-np2                              219.24      5882.46      6101.71       1.0000     0.004386
-IVF-nl25-np3                              219.24      8471.56      8690.80       1.0000     0.000000
-IVF-nl50-np2                              403.96      3143.57      3547.52       0.9333     0.870256
-IVF-nl50-np5                              403.96      6791.70      7195.66       1.0000     0.000000
-IVF-nl50-np7                              403.96      9393.38      9797.34       1.0000     0.000000
-IVF-nl100-np5                             923.45      3969.09      4892.53       0.9713     0.378366
-IVF-nl100-np10                            923.45      6935.36      7858.81       0.9996     0.004021
-IVF-nl100-np15                            923.45     10002.61     10926.06       1.0000     0.000000
-----------------------------------------------------------------------------------------------------
-```
-
-**Cosine:**
-
-Below are the results for the Cosine distance measure for IVF.
-
-```
-====================================================================================================
-Benchmark: 150k cells, 32D
-====================================================================================================
-Method                                Build (ms)   Query (ms)   Total (ms)     Recall@k   Dist Error
-----------------------------------------------------------------------------------------------------
-Exhaustive                                  5.87     24029.04     24034.92       1.0000     0.000000
-IVF-nl10-np1                              370.40      7446.42      7816.82       0.9993     0.000106
-IVF-nl20-np1                              365.63      4147.90      4513.53       0.9923     0.000167
-IVF-nl20-np2                              365.63      7435.59      7801.22       0.9999     0.000010
-IVF-nl20-np3                              365.63     11004.87     11370.50       1.0000     0.000001
-IVF-nl25-np1                              556.05      3313.87      3869.93       0.9697     0.000209
-IVF-nl25-np2                              556.05      5901.96      6458.01       1.0000     0.000000
-IVF-nl25-np3                              556.05      8655.64      9211.69       1.0000     0.000000
-IVF-nl50-np2                             1035.42      3443.88      4479.30       0.9283     0.000624
-IVF-nl50-np5                             1035.42      7524.63      8560.05       1.0000     0.000000
-IVF-nl50-np7                             1035.42      9915.22     10950.64       1.0000     0.000000
-IVF-nl100-np5                            2545.14      4053.75      6598.89       0.9713     0.000264
-IVF-nl100-np10                           2545.14      7222.58      9767.72       0.9990     0.000008
-IVF-nl100-np15                           2545.14     10410.93     12956.07       1.0000     0.000000
-----------------------------------------------------------------------------------------------------
-```
-
-### LSH
-
-Locality sensitive hashing.
-
-**Key parameters:**
-
-- *Number of tables (nt)*: The number of independent hash tables to generate. 
-  More tables improve recall at the cost of query time and memory.
-- *Number of bits (nb)*: The bit resolution of the hash functions. Higher values 
-  create finer partitions but may reduce collision rates.
-- *Max candidates (s)*: The search budget limiting the number of candidates 
-  examined. Set to 'auto' for full search or a fixed value (e.g., 5k) for faster 
-  queries with lower recall.
-
-**Euclidean:**
-
-Below are the results for the Euclidean distance measure for LSH.
-
-```
-====================================================================================================
-Benchmark: 150k cells, 32D
-====================================================================================================
-Method                                Build (ms)   Query (ms)   Total (ms)     Recall@k   Dist Error
-----------------------------------------------------------------------------------------------------
-Exhaustive                                  5.27     23235.57     23240.84       1.0000     0.000000
-LSH-nt10-nb8:-s:auto                       57.44      5969.75      6027.19       0.9638     0.480160
-LSH-nt10-nb8:-s:5k                         57.44      3310.59      3368.04       0.8537     1.571043
-LSH-nt20-nb8:-s:auto                      111.39     10233.56     10344.96       0.9967     0.038897
-LSH-nt20-nb8:-s:5k                        111.39      3525.71      3637.11       0.8595     1.469591
-LSH-nt25-nb8:-s:auto                      136.33     12506.81     12643.14       0.9987     0.014704
-LSH-nt25-nb8:-s:5k                        136.33      3547.63      3683.96       0.8596     1.469395
-LSH-nt10-nb10:-s:auto                      74.99      3955.41      4030.41       0.9114     1.283957
-LSH-nt10-nb10:-s:5k                        74.99      2675.10      2750.10       0.8493     1.675435
-LSH-nt20-nb10:-s:auto                     135.91      5980.99      6116.90       0.9818     0.229392
-LSH-nt20-nb10:-s:5k                       135.91      3008.77      3144.68       0.8902     0.944406
-LSH-nt25-nb10:-s:auto                     169.14      6754.45      6923.59       0.9914     0.104942
-LSH-nt25-nb10:-s:5k                       169.14      3045.08      3214.22       0.8932     0.897108
-LSH-nt10-nb12:-s:auto                      93.55      2990.19      3083.74       0.8431     2.506719
-LSH-nt10-nb12:-s:5k                        93.55      2226.47      2320.02       0.8021     2.687833
-LSH-nt20-nb12:-s:auto                     165.11      4643.25      4808.36       0.9547     0.632133
-LSH-nt20-nb12:-s:5k                       165.11      2822.00      2987.11       0.8929     0.977663
-LSH-nt25-nb12:-s:auto                     208.64      5117.29      5325.93       0.9720     0.373990
-LSH-nt25-nb12:-s:5k                       208.64      2906.96      3115.60       0.9044     0.780383
-LSH-nt10-nb16:-s:auto                     109.25      1861.30      1970.54       0.6891     6.654130
-LSH-nt10-nb16:-s:5k                       109.25      1544.76      1654.00       0.6680     6.721914
-LSH-nt20-nb16:-s:auto                     218.61      2961.96      3180.58       0.8391     2.829489
-LSH-nt20-nb16:-s:5k                       218.61      2056.63      2275.24       0.8022     2.961812
-LSH-nt25-nb16:-s:auto                     286.95      3371.30      3658.25       0.8751     2.077903
-LSH-nt25-nb16:-s:5k                       286.95      2224.71      2511.66       0.8346     2.227713
-LSH-nt50-nb16:-s:auto                     516.32      5179.43      5695.75       0.9597     0.585007
-LSH-nt50-nb16:-s:5k                       516.32      2875.00      3391.33       0.9107     0.793054
-----------------------------------------------------------------------------------------------------
-```
-
-**Cosine:**
-
-Below are the results for the Cosine distance measure for LSH.
-
-```
-====================================================================================================
-Benchmark: 150k cells, 32D
-====================================================================================================
-Method                                Build (ms)   Query (ms)   Total (ms)     Recall@k   Dist Error
-----------------------------------------------------------------------------------------------------
-Exhaustive                                  4.95     24363.62     24368.57       1.0000     0.000000
-LSH-nt10-nb8:-s:auto                       34.98      8698.38      8733.36       0.9807     0.000164
-LSH-nt10-nb8:-s:5k                         34.98      3804.06      3839.04       0.8236     0.001536
-LSH-nt20-nb8:-s:auto                       60.64     15206.81     15267.45       0.9992     0.000006
-LSH-nt20-nb8:-s:5k                         60.64      3781.17      3841.81       0.8239     0.001533
-LSH-nt25-nb8:-s:auto                       69.13     18176.21     18245.35       0.9998     0.000002
-LSH-nt25-nb8:-s:5k                         69.13      3784.18      3853.31       0.8239     0.001533
-LSH-nt10-nb10:-s:auto                      41.19      5189.09      5230.28       0.9543     0.000426
-LSH-nt10-nb10:-s:5k                        41.19      3121.45      3162.64       0.8669     0.000950
-LSH-nt20-nb10:-s:auto                      69.90      7964.61      8034.51       0.9948     0.000042
-LSH-nt20-nb10:-s:5k                        69.90      3273.96      3343.86       0.8797     0.000791
-LSH-nt25-nb10:-s:auto                      85.88      9086.07      9171.95       0.9981     0.000016
-LSH-nt25-nb10:-s:5k                        85.88      3266.55      3352.44       0.8799     0.000789
-LSH-nt10-nb12:-s:auto                      50.17      3567.99      3618.16       0.9078     0.000924
-LSH-nt10-nb12:-s:5k                        50.17      2540.27      2590.44       0.8592     0.001114
-LSH-nt20-nb12:-s:auto                      87.08      5408.18      5495.27       0.9813     0.000162
-LSH-nt20-nb12:-s:5k                        87.08      2889.75      2976.83       0.9078     0.000521
-LSH-nt25-nb12:-s:auto                     103.60      5994.96      6098.56       0.9904     0.000084
-LSH-nt25-nb12:-s:5k                       103.60      2921.76      3025.36       0.9116     0.000480
-LSH-nt10-nb16:-s:auto                      63.23      2087.50      2150.72       0.7512     0.003265
-LSH-nt10-nb16:-s:5k                        63.23      1657.20      1720.43       0.7274     0.003324
-LSH-nt20-nb16:-s:auto                     113.07      3414.59      3527.66       0.9067     0.001003
-LSH-nt20-nb16:-s:5k                       113.07      2249.06      2362.13       0.8673     0.001112
-LSH-nt25-nb16:-s:auto                     143.23      3872.65      4015.89       0.9344     0.000677
-LSH-nt25-nb16:-s:5k                       143.23      2382.90      2526.13       0.8916     0.000801
-LSH-nt50-nb16:-s:auto                     260.29      5643.84      5904.12       0.9852     0.000139
-LSH-nt50-nb16:-s:5k                       260.29      2765.60      3025.89       0.9332     0.000314
-----------------------------------------------------------------------------------------------------
-```
-
-### NNDescent
-
-The NNDescent implementation in this crate, heavily inspired by the amazing
-[PyNNDescent](https://github.com/lmcinnes/pynndescent), shows a very good
-compromise between index building and fast querying. It's a great arounder
-that reaches easily performance of ≥0.98 Recalls@k neighbours. You can even
-heavily short cut the initialisation of the index with only 12 trees (instead
-of 32) and get in 4 seconds to a recall ≥0.9 (compared to 48 seconds for 
-exhaustive search)!
-
-**Key parameters:**
-
-- *Number of trees (nt)*: Number of trees to use for the initialisation. If set
-  to auto, it defaults to 32.
-- *Search budget (s)*: The search budget for the exploration of the graph during
-  querying. Here it defaults to `k * 2` (with min 60, maximum 200).
-- *Diversify probability (dp)*: This is based on the original papers leveraging
-  NNDescent and it is supposed to remove redundant edges from the graph to
-  increase query speed.
-
-**Euclidean:**
-
-Below are the results for the Euclidean distance measure for NNDescent
-implementation in this `crate`.
-
-```
-====================================================================================================
-Benchmark: 150k cells, 32D
-====================================================================================================
-Method                                Build (ms)   Query (ms)   Total (ms)     Recall@k   Dist Error
-----------------------------------------------------------------------------------------------------
-Exhaustive                                  4.99     23157.09     23162.08       1.0000     0.000000
-NNDescent-nt12-s:auto-dp0                1756.92       910.33      2667.25       0.9687     0.189218
-NNDescent-nt24-s:auto-dp0                2485.42       922.47      3407.89       0.9885     0.061129
-NNDescent-nt:auto-s75-dp0                2526.79      1248.13      3774.92       0.9939     0.031297
-NNDescent-nt:auto-s100-dp0               2526.79      1628.16      4154.94       0.9960     0.020544
-NNDescent-nt:auto-s:auto-dp0             2526.79       931.00      3457.79       0.9893     0.056484
-NNDescent-nt:auto-s:auto-dp0.25          2568.93       881.91      3450.84       0.9893     0.056484
-NNDescent-nt:auto-s:auto-dp0.5           2602.86       892.60      3495.46       0.9893     0.056484
-NNDescent-nt:auto-s:auto-dp1             2596.52       889.45      3485.97       0.9893     0.056484
-----------------------------------------------------------------------------------------------------
-```
-
-**Cosine:**
-
-Below are the results for the Cosine distance measure for NNDescent
-implementation in this `crate`.
-
-```
-====================================================================================================
-Benchmark: 150k cells, 32D
-====================================================================================================
-Method                                Build (ms)   Query (ms)   Total (ms)     Recall@k   Dist Error
-----------------------------------------------------------------------------------------------------
-Exhaustive                                  4.50     24142.07     24146.57       1.0000     0.000000
-NNDescent-nt12-s:auto-dp0                5837.83       841.81      6679.64       0.9997     0.000001
-NNDescent-nt24-s:auto-dp0                5586.89       843.60      6430.50       0.9998     0.000001
-NNDescent-nt:auto-s75-dp0                5429.10      1225.21      6654.31       0.9999     0.000000
-NNDescent-nt:auto-s100-dp0               5429.10      1593.40      7022.50       0.9999     0.000000
-NNDescent-nt:auto-s:auto-dp0             5429.10       837.02      6266.12       0.9997     0.000001
-NNDescent-nt:auto-s:auto-dp0.25          5486.43       820.87      6307.30       0.9899     0.000030
-NNDescent-nt:auto-s:auto-dp0.5           5662.70       754.05      6416.75       0.9806     0.000062
-NNDescent-nt:auto-s:auto-dp1             5528.17       717.38      6245.55       0.9613     0.000135
-----------------------------------------------------------------------------------------------------
-```
+Detailed benchmarks on the standard benchmarks can be found [here](/docs/benchmarks_general.md)
 
 ## Quantised indices
 
@@ -528,6 +182,8 @@ methods available:
 - *IVF-OPQ*: Uses optimised product quantisation. Tries to de-correlate the
   residuals 
 
+The benchmarks can be found [here]().
+
 ### IVF-SQ8
 
 This index uses scalar quantisation to 8-bits. It projects every dimensions
@@ -540,8 +196,8 @@ to *96 x 8 bits = 96 bytes per vector*, a **4x reduction in memory per vector**
 
 - *Number of lists (nl)*: The number of independent k-means cluster to generate.
   If the structure of the data is unknown, people use `sqrt(n)` as a heuristic.
-- *Number of points (np)*: The number of clusters to search for. Usually 
-  scanning 15 to 20% of the number of lists.
+- *Number of points (np)*: The number of clusters to probe during search. 
+  Numbers here tend to be `sqrt(nlist)` or up to 5% of the nlist.
 
 **Euclidean:**
 
@@ -555,20 +211,15 @@ Benchmark: 150k cells, 32D
 ===================================================================================
 Method                           Build (ms)   Query (ms)   Total (ms)     Recall@k
 -----------------------------------------------------------------------------------
-Exhaustive                             3.37     23513.19     23516.56       1.0000
-IVF-SQ8-nl10-np1                     132.87      1327.39      1460.26       0.8553
-IVF-SQ8-nl20-np1                     179.74       608.70       788.44       0.8415
-IVF-SQ8-nl20-np2                     179.74      1071.75      1251.50       0.8567
-IVF-SQ8-nl20-np3                     179.74      1561.34      1741.08       0.8567
-IVF-SQ8-nl25-np1                     217.46       540.73       758.19       0.8337
-IVF-SQ8-nl25-np2                     217.46       876.57      1094.03       0.8567
-IVF-SQ8-nl25-np3                     217.46      1210.26      1427.72       0.8567
-IVF-SQ8-nl50-np2                     387.17       516.36       903.53       0.8167
-IVF-SQ8-nl50-np5                     387.17       985.62      1372.79       0.8567
-IVF-SQ8-nl50-np7                     387.17      1327.84      1715.01       0.8567
-IVF-SQ8-nl100-np5                    907.31       660.42      1567.73       0.8412
-IVF-SQ8-nl100-np10                   907.31      1042.99      1950.29       0.8565
-IVF-SQ8-nl100-np15                   907.31      1484.96      2392.27       0.8567
+Exhaustive                             3.57     24960.24     24963.80       1.0000
+IVF-SQ8-nl273-np13                  1572.69       555.18      2127.87       0.8548
+IVF-SQ8-nl273-np16                  1572.69       699.63      2272.32       0.8566
+IVF-SQ8-nl273-np23                  1572.69       879.88      2452.57       0.8567
+IVF-SQ8-nl387-np19                  1935.02       593.86      2528.89       0.8552
+IVF-SQ8-nl387-np27                  1935.02       809.99      2745.01       0.8567
+IVF-SQ8-nl547-np23                  2752.78       689.26      3442.04       0.8529
+IVF-SQ8-nl547-np27                  2752.78       749.43      3502.21       0.8556
+IVF-SQ8-nl547-np33                  2752.78       856.76      3609.54       0.8566
 -----------------------------------------------------------------------------------
 ```
 
@@ -582,27 +233,24 @@ Benchmark: 150k cells, 96D
 ===================================================================================
 Method                           Build (ms)   Query (ms)   Total (ms)     Recall@k
 -----------------------------------------------------------------------------------
-Exhaustive                            12.41    106495.61    106508.02       1.0000
-IVF-SQ8-nl10-np1                     513.90      4518.84      5032.74       0.8342
-IVF-SQ8-nl20-np1                     621.55      2481.98      3103.53       0.8224
-IVF-SQ8-nl20-np2                     621.55      6290.28      6911.83       0.8345
-IVF-SQ8-nl20-np3                     621.55      9660.60     10282.15       0.8345
-IVF-SQ8-nl25-np1                     845.18      2010.54      2855.72       0.7701
-IVF-SQ8-nl25-np2                     845.18      4213.22      5058.40       0.8289
-IVF-SQ8-nl25-np3                     845.18      6491.24      7336.42       0.8345
-IVF-SQ8-nl50-np2                    1653.27      1604.25      3257.52       0.7744
-IVF-SQ8-nl50-np5                    1653.27      4110.53      5763.80       0.8345
-IVF-SQ8-nl50-np7                    1653.27      5745.57      7398.85       0.8345
-IVF-SQ8-nl100-np5                   4074.50      2349.44      6423.94       0.7955
-IVF-SQ8-nl100-np10                  4074.50      4152.39      8226.88       0.8293
-IVF-SQ8-nl100-np15                  4074.50      5884.22      9958.72       0.8345
+Exhaustive                            11.07    116822.76    116833.84       1.0000
+IVF-SQ8-nl273-np13                  6270.91      2197.15      8468.06       0.8224
+IVF-SQ8-nl273-np16                  6270.91      2605.84      8876.75       0.8291
+IVF-SQ8-nl273-np23                  6270.91      3616.88      9887.79       0.8345
+IVF-SQ8-nl387-np19                  8964.76      2403.18     11367.94       0.8263
+IVF-SQ8-nl387-np27                  8964.76      3102.59     12067.35       0.8340
+IVF-SQ8-nl547-np23                 13144.41      2574.42     15718.83       0.8184
+IVF-SQ8-nl547-np27                 13144.41      2728.36     15872.77       0.8277
+IVF-SQ8-nl547-np33                 13144.41      3358.42     16502.83       0.8335
 -----------------------------------------------------------------------------------
 ```
 
-**Data set with stronger correlation structure**
+**Data set with stronger correlation structure and more dimensions**
 
 To compare against the next two indices. This data is designed to be better 
-suited for high dimensionality.
+suited for high dimensionality. One can appreciate, that with higher 
+dimensionality the Recall starts suffering for this
+index.
 
 ```
 ===================================================================================
@@ -610,22 +258,19 @@ Benchmark: 150k cells, 128D
 ===================================================================================
 Method                           Build (ms)   Query (ms)   Total (ms)     Recall@k
 -----------------------------------------------------------------------------------
-Exhaustive                            16.90    170023.89    170040.79       1.0000
-IVF-SQ8-nl10-np1                     529.20      6242.15      6771.35       0.6422
-IVF-SQ8-nl20-np1                     938.95      3001.32      3940.27       0.6422
-IVF-SQ8-nl20-np2                     938.95      6546.20      7485.15       0.6422
-IVF-SQ8-nl20-np3                     938.95      9745.26     10684.21       0.6422
-IVF-SQ8-nl25-np1                    1360.90      2550.12      3911.02       0.6353
-IVF-SQ8-nl25-np2                    1360.90      5250.34      6611.24       0.6422
-IVF-SQ8-nl25-np3                    1360.90      7731.06      9091.97       0.6422
-IVF-SQ8-nl50-np2                    2633.82      2482.75      5116.57       0.6320
-IVF-SQ8-nl50-np5                    2633.82      5230.11      7863.93       0.6422
-IVF-SQ8-nl50-np7                    2633.82      6964.30      9598.12       0.6422
-IVF-SQ8-nl100-np5                   6272.42      2670.09      8942.51       0.6401
-IVF-SQ8-nl100-np10                  6272.42      4929.05     11201.47       0.6422
-IVF-SQ8-nl100-np15                  6272.42      7393.44     13665.87       0.6422
+Exhaustive                            14.95    185329.68    185344.63       1.0000
+IVF-SQ8-nl273-np13                 10181.62      3100.52     13282.14       0.6413
+IVF-SQ8-nl273-np16                 10181.62      3510.16     13691.78       0.6421
+IVF-SQ8-nl273-np23                 10181.62      5295.38     15477.00       0.6422
+IVF-SQ8-nl387-np19                 14813.81      3271.58     18085.39       0.6419
+IVF-SQ8-nl387-np27                 14813.81      4584.85     19398.67       0.6422
+IVF-SQ8-nl547-np23                 20138.92      2907.62     23046.54       0.6415
+IVF-SQ8-nl547-np27                 20138.92      3355.53     23494.45       0.6420
+IVF-SQ8-nl547-np33                 20138.92      3960.62     24099.54       0.6422
 -----------------------------------------------------------------------------------
 ```
+
+Let's check how the two other indices deal with this.
 
 ### IVF-PQ
 
@@ -645,8 +290,8 @@ product quantisation, see below.
 
 - *Number of lists (nl)*: The number of independent k-means cluster to generate.
   If the structure of the data is unknown, people use `sqrt(n)` as a heuristic.
-- *Number of points (np)*: The number of clusters to search for. Usually 
-  scanning 15 to 20% of the number of lists.
+- *Number of points (np)*: The number of clusters to probe during search. 
+  Numbers here tend to be `sqrt(nlist)` or up to 5% of the nlist.
 - *Number of subvectors (m)*: In how many subvectors to divide the given main
   vector. The initial dimensionality needs to be divisable by m.
 
@@ -656,35 +301,27 @@ With 128 dimensions.
 
 ```
 ===================================================================================
+Benchmark: 150k cells, 128D
+===================================================================================
 Method                           Build (ms)   Query (ms)   Total (ms)     Recall@k
 -----------------------------------------------------------------------------------
-Exhaustive                            15.48    171113.43    171128.91       1.0000
-IVF-PQ-nl10-m16-np1                 6966.22      3150.53     10116.75       0.3630
-IVF-PQ-nl10-m32-np1                10098.03      6682.09     16780.12       0.4879
-IVF-PQ-nl20-m16-np1                 7345.96      1821.47      9167.43       0.4615
-IVF-PQ-nl20-m16-np2                 7345.96      4171.80     11517.76       0.4615
-IVF-PQ-nl20-m16-np3                 7345.96      5930.64     13276.60       0.4615
-IVF-PQ-nl20-m32-np1                10539.48      3688.99     14228.47       0.6120
-IVF-PQ-nl20-m32-np2                10539.48      8843.03     19382.51       0.6120
-IVF-PQ-nl20-m32-np3                10539.48     12790.68     23330.16       0.6120
-IVF-PQ-nl25-m16-np1                 8148.12      1635.92      9784.04       0.4833
-IVF-PQ-nl25-m16-np2                 8148.12      3320.57     11468.69       0.4883
-IVF-PQ-nl25-m16-np3                 8148.12      4925.77     13073.89       0.4883
-IVF-PQ-nl25-m32-np1                12439.03      3275.81     15714.85       0.6343
-IVF-PQ-nl25-m32-np2                12439.03      6957.59     19396.63       0.6420
-IVF-PQ-nl25-m32-np3                12439.03     10302.13     22741.16       0.6420
-IVF-PQ-nl50-m16-np2                 9118.11      1950.65     11068.75       0.5410
-IVF-PQ-nl50-m16-np5                 9118.11      3919.13     13037.23       0.5483
-IVF-PQ-nl50-m16-np7                 9118.11      5126.94     14245.04       0.5483
-IVF-PQ-nl50-m32-np2                12408.44      3624.94     16033.38       0.7050
-IVF-PQ-nl50-m32-np5                12408.44      7324.25     19732.69       0.7171
-IVF-PQ-nl50-m32-np7                12408.44      9581.92     21990.36       0.7171
-IVF-PQ-nl100-m16-np5               12900.83      2759.08     15659.91       0.5502
-IVF-PQ-nl100-m16-np10              12900.83      5110.85     18011.68       0.5517
-IVF-PQ-nl100-m16-np15              12900.83      7603.05     20503.88       0.5517
-IVF-PQ-nl100-m32-np5               16289.65      4846.47     21136.12       0.7172
-IVF-PQ-nl100-m32-np10              16289.65      9066.28     25355.93       0.7199
-IVF-PQ-nl100-m32-np15              16289.65     13639.33     29928.98       0.7199
+Exhaustive                            16.01    180361.27    180377.28       1.0000
+IVF-PQ-nl273-m16-np13              16781.22      4450.38     21231.60       0.5571
+IVF-PQ-nl273-m16-np16              16781.22      5175.86     21957.08       0.5575
+IVF-PQ-nl273-m16-np23              16781.22      7891.47     24672.69       0.5575
+IVF-PQ-nl273-m32-np13              20016.47      7353.13     27369.60       0.7225
+IVF-PQ-nl273-m32-np16              20016.47      8984.63     29001.10       0.7235
+IVF-PQ-nl273-m32-np23              20016.47     12319.57     32336.04       0.7237
+IVF-PQ-nl387-m16-np19              20712.47      5509.88     26222.35       0.5590
+IVF-PQ-nl387-m16-np27              20712.47      7915.02     28627.49       0.5593
+IVF-PQ-nl387-m32-np19              24812.90      9081.07     33893.97       0.7250
+IVF-PQ-nl387-m32-np27              24812.90     13135.28     37948.18       0.7255
+IVF-PQ-nl547-m16-np23              27162.68      6891.43     34054.11       0.5619
+IVF-PQ-nl547-m16-np27              27162.68      7580.48     34743.15       0.5622
+IVF-PQ-nl547-m16-np33              27162.68      8951.89     36114.57       0.5623
+IVF-PQ-nl547-m32-np23              30516.85     10388.61     40905.47       0.7270
+IVF-PQ-nl547-m32-np27              30516.85     12168.79     42685.64       0.7277
+IVF-PQ-nl547-m32-np33              30516.85     14645.70     45162.56       0.7280
 -----------------------------------------------------------------------------------
 ```
 
@@ -694,7 +331,7 @@ higher. However, you also reduce the memory finger print quite substantially.
 
 **With more dimensions**
 
-With 192 dimensions. In this case, also m = 48, i.e., dividing the origina 
+With 192 dimensions. In this case, also m = 48, i.e., dividing the original 
 vectors into 48 subvectors was tested.
 
 ```
@@ -703,46 +340,31 @@ Benchmark: 150k cells, 192D
 ===================================================================================
 Method                           Build (ms)   Query (ms)   Total (ms)     Recall@k
 -----------------------------------------------------------------------------------
-Exhaustive                            23.71    288695.42    288719.13       1.0000
-IVF-PQ-nl10-m16-np1                11646.72      4534.24     16180.96       0.2940
-IVF-PQ-nl10-m32-np1                14445.56      9817.59     24263.15       0.4281
-IVF-PQ-nl10-m48-np1                16358.32     15100.48     31458.80       0.5182
-IVF-PQ-nl20-m16-np1                11274.09      1939.92     13214.01       0.3779
-IVF-PQ-nl20-m16-np2                11274.09      3672.10     14946.19       0.3779
-IVF-PQ-nl20-m16-np3                11274.09      5913.59     17187.68       0.3779
-IVF-PQ-nl20-m32-np1                14883.37      3676.42     18559.78       0.5370
-IVF-PQ-nl20-m32-np2                14883.37      7342.15     22225.52       0.5370
-IVF-PQ-nl20-m32-np3                14883.37     11666.08     26549.45       0.5370
-IVF-PQ-nl20-m48-np1                17140.87      5551.50     22692.37       0.6408
-IVF-PQ-nl20-m48-np2                17140.87     11575.37     28716.24       0.6408
-IVF-PQ-nl20-m48-np3                17140.87     18278.17     35419.04       0.6408
-IVF-PQ-nl25-m16-np1                12136.07      1683.36     13819.43       0.4202
-IVF-PQ-nl25-m16-np2                12136.07      3609.25     15745.32       0.4227
-IVF-PQ-nl25-m16-np3                12136.07      4948.15     17084.23       0.4227
-IVF-PQ-nl25-m32-np1                15753.81      3203.84     18957.65       0.5932
-IVF-PQ-nl25-m32-np2                15753.81      7110.32     22864.13       0.5976
-IVF-PQ-nl25-m32-np3                15753.81     10330.47     26084.28       0.5976
-IVF-PQ-nl25-m48-np1                17872.94      4887.58     22760.52       0.6984
-IVF-PQ-nl25-m48-np2                17872.94     11087.74     28960.67       0.7044
-IVF-PQ-nl25-m48-np3                17872.94     15145.60     33018.53       0.7044
-IVF-PQ-nl50-m16-np2                13973.30      2003.18     15976.48       0.4354
-IVF-PQ-nl50-m16-np5                13973.30      4479.03     18452.33       0.4444
-IVF-PQ-nl50-m16-np7                13973.30      6029.90     20003.20       0.4444
-IVF-PQ-nl50-m32-np2                17723.22      3539.87     21263.09       0.6070
-IVF-PQ-nl50-m32-np5                17723.22      8053.70     25776.92       0.6233
-IVF-PQ-nl50-m32-np7                17723.22     11389.42     29112.64       0.6233
-IVF-PQ-nl50-m48-np2                20224.95      5510.25     25735.20       0.7083
-IVF-PQ-nl50-m48-np5                20224.95     12060.18     32285.13       0.7303
-IVF-PQ-nl50-m48-np7                20224.95     16491.01     36715.96       0.7303
-IVF-PQ-nl100-m16-np5               19952.35      3022.39     22974.75       0.4443
-IVF-PQ-nl100-m16-np10              19952.35      5575.88     25528.23       0.4481
-IVF-PQ-nl100-m16-np15              19952.35      8297.43     28249.78       0.4481
-IVF-PQ-nl100-m32-np5               22743.64      5391.92     28135.56       0.6182
-IVF-PQ-nl100-m32-np10              22743.64     10073.69     32817.33       0.6257
-IVF-PQ-nl100-m32-np15              22743.64     15251.43     37995.07       0.6257
-IVF-PQ-nl100-m48-np5               26600.53      7496.64     34097.17       0.7216
-IVF-PQ-nl100-m48-np10              26600.53     14039.71     40640.23       0.7320
-IVF-PQ-nl100-m48-np15              26600.53     22019.12     48619.65       0.7321
+Exhaustive                            23.37    308023.77    308047.14       1.0000
+IVF-PQ-nl273-m16-np13              25713.83      5433.23     31147.06       0.4529
+IVF-PQ-nl273-m16-np16              25713.83      7264.61     32978.44       0.4536
+IVF-PQ-nl273-m16-np23              25713.83      9574.54     35288.37       0.4537
+IVF-PQ-nl273-m32-np13              31793.39     10472.38     42265.77       0.6285
+IVF-PQ-nl273-m32-np16              31793.39     12255.97     44049.36       0.6301
+IVF-PQ-nl273-m32-np23              31793.39     17548.37     49341.77       0.6305
+IVF-PQ-nl273-m48-np13              32853.65     11373.11     44226.76       0.7318
+IVF-PQ-nl273-m48-np16              32853.65     14238.54     47092.19       0.7343
+IVF-PQ-nl273-m48-np23              32853.65     20256.78     53110.43       0.7349
+IVF-PQ-nl387-m16-np19              34085.74      7788.76     41874.50       0.4550
+IVF-PQ-nl387-m16-np27              34085.74     10108.84     44194.58       0.4557
+IVF-PQ-nl387-m32-np19              38396.24     13675.44     52071.68       0.6303
+IVF-PQ-nl387-m32-np27              38396.24     17223.62     55619.86       0.6317
+IVF-PQ-nl387-m48-np19              41160.11     17149.93     58310.05       0.7347
+IVF-PQ-nl387-m48-np27              41160.11     21030.83     62190.94       0.7368
+IVF-PQ-nl547-m16-np23              44462.83      8506.78     52969.61       0.4570
+IVF-PQ-nl547-m16-np27              44462.83      9607.35     54070.17       0.4577
+IVF-PQ-nl547-m16-np33              44462.83     11342.21     55805.04       0.4581
+IVF-PQ-nl547-m32-np23              46745.07     13209.96     59955.03       0.6305
+IVF-PQ-nl547-m32-np27              46745.07     16297.98     63043.05       0.6321
+IVF-PQ-nl547-m32-np33              46745.07     20421.76     67166.82       0.6330
+IVF-PQ-nl547-m48-np23              48715.88     15664.02     64379.90       0.7331
+IVF-PQ-nl547-m48-np27              48715.88     18333.34     67049.22       0.7355
+IVF-PQ-nl547-m48-np33              48715.88     23769.50     72485.38       0.7368
 -----------------------------------------------------------------------------------
 ```
 
@@ -758,14 +380,14 @@ However, it can still be useful in situation where good enough works and you
 have VERY large scale data. The theoretical benefits at least in this
 synthetic data do not translate very well. IVF-PQ is usually more than enough, 
 outside of cases in which a specific correlation structure can be exploited
-by the optimised PQ. In doubt, use the IVF-PQ index.
+by the optimised PQ. If in doubt, use the IVF-PQ index.
 
 **Key parameters:**
 
 - *Number of lists (nl)*: The number of independent k-means cluster to generate.
   If the structure of the data is unknown, people use `sqrt(n)` as a heuristic.
-- *Number of points (np)*: The number of clusters to search for. Usually 
-  scanning 15 to 20% of the number of lists.
+- *Number of points (np)*: The number of clusters to probe during search. 
+  Numbers here tend to be `sqrt(nlist)` or up to 5% of the nlist.
 - *Number of subvectors (m)*: In how many subvectors to divide the given main
   vector. The initial dimensionality needs to be divisable by m.
 
@@ -779,33 +401,23 @@ Benchmark: 150k cells, 128D
 ===================================================================================
 Method                           Build (ms)   Query (ms)   Total (ms)     Recall@k
 -----------------------------------------------------------------------------------
-Exhaustive                            15.76    177863.96    177879.72       1.0000
-IVF-OPQ-nl10-m16-np1               21317.79      3154.91     24472.70       0.3633
-IVF-OPQ-nl10-m32-np1               30600.10      6740.79     37340.89       0.5043
-IVF-OPQ-nl20-m16-np1               22766.92      2022.24     24789.16       0.4617
-IVF-OPQ-nl20-m16-np2               22766.92      4363.23     27130.15       0.4617
-IVF-OPQ-nl20-m16-np3               22766.92      6055.66     28822.58       0.4617
-IVF-OPQ-nl20-m32-np1               30677.18      3853.00     34530.19       0.6218
-IVF-OPQ-nl20-m32-np2               30677.18      9125.19     39802.37       0.6218
-IVF-OPQ-nl20-m32-np3               30677.18     12918.39     43595.57       0.6218
-IVF-OPQ-nl25-m16-np1               22034.21      1844.14     23878.34       0.4833
-IVF-OPQ-nl25-m16-np2               22034.21      3787.78     25821.99       0.4882
-IVF-OPQ-nl25-m16-np3               22034.21      5185.69     27219.90       0.4882
-IVF-OPQ-nl25-m32-np1               30806.12      3333.21     34139.33       0.6424
-IVF-OPQ-nl25-m32-np2               30806.12      7045.58     37851.70       0.6503
-IVF-OPQ-nl25-m32-np3               30806.12     10349.99     41156.11       0.6503
-IVF-OPQ-nl50-m16-np2               22326.73      2202.78     24529.51       0.5410
-IVF-OPQ-nl50-m16-np5               22326.73      4827.33     27154.06       0.5483
-IVF-OPQ-nl50-m16-np7               22326.73      6174.45     28501.17       0.5483
-IVF-OPQ-nl50-m32-np2               30681.98      3776.73     34458.71       0.7100
-IVF-OPQ-nl50-m32-np5               30681.98      8549.89     39231.87       0.7221
-IVF-OPQ-nl50-m32-np7               30681.98     10622.56     41304.53       0.7221
-IVF-OPQ-nl100-m16-np5              27011.31      3575.80     30587.11       0.5502
-IVF-OPQ-nl100-m16-np10             27011.31      6730.96     33742.27       0.5518
-IVF-OPQ-nl100-m16-np15             27011.31     10129.60     37140.91       0.5518
-IVF-OPQ-nl100-m32-np5              38038.66      5366.80     43405.46       0.7227
-IVF-OPQ-nl100-m32-np10             38038.66     10211.27     48249.93       0.7255
-IVF-OPQ-nl100-m32-np15             38038.66     15222.34     53261.00       0.7255
+Exhaustive                            14.60    181852.46    181867.06       1.0000
+IVF-OPQ-nl273-m16-np13             29770.87      4444.53     34215.40       0.5572
+IVF-OPQ-nl273-m16-np16             29770.87      5332.95     35103.82       0.5576
+IVF-OPQ-nl273-m16-np23             29770.87      7733.49     37504.36       0.5576
+IVF-OPQ-nl273-m32-np13             40200.77      7213.76     47414.53       0.7253
+IVF-OPQ-nl273-m32-np16             40200.77      9369.07     49569.84       0.7263
+IVF-OPQ-nl273-m32-np23             40200.77     12113.81     52314.58       0.7264
+IVF-OPQ-nl387-m16-np19             35565.86      6149.77     41715.63       0.5595
+IVF-OPQ-nl387-m16-np27             35565.86      8551.83     44117.68       0.5597
+IVF-OPQ-nl387-m32-np19             44867.67     12729.91     57597.58       0.7275
+IVF-OPQ-nl387-m32-np27             44867.67     14298.33     59166.00       0.7280
+IVF-OPQ-nl547-m16-np23             42874.72      8035.92     50910.64       0.5616
+IVF-OPQ-nl547-m16-np27             42874.72      8576.86     51451.59       0.5619
+IVF-OPQ-nl547-m16-np33             42874.72      9583.35     52458.07       0.5619
+IVF-OPQ-nl547-m32-np23             49953.24     10573.52     60526.75       0.7286
+IVF-OPQ-nl547-m32-np27             49953.24     11856.71     61809.95       0.7294
+IVF-OPQ-nl547-m32-np33             49953.24     15153.34     65106.57       0.7296
 -----------------------------------------------------------------------------------
 ```
 
@@ -819,47 +431,174 @@ Benchmark: 150k cells, 192D
 ===================================================================================
 Method                           Build (ms)   Query (ms)   Total (ms)     Recall@k
 -----------------------------------------------------------------------------------
-Exhaustive                            22.11    288034.83    288056.95       1.0000
-IVF-OPQ-nl10-m16-np1               32560.65      4548.94     37109.59       0.3006
-IVF-OPQ-nl10-m32-np1               47350.48      9463.97     56814.45       0.4344
-IVF-OPQ-nl10-m48-np1               54169.73     15906.22     70075.95       0.5312
-IVF-OPQ-nl20-m16-np1               36119.53      2170.81     38290.34       0.3858
-IVF-OPQ-nl20-m16-np2               36119.53      4227.81     40347.34       0.3858
-IVF-OPQ-nl20-m16-np3               36119.53      6678.64     42798.17       0.3858
-IVF-OPQ-nl20-m32-np1               48895.84      3927.72     52823.56       0.5409
-IVF-OPQ-nl20-m32-np2               48895.84      7812.14     56707.98       0.5409
-IVF-OPQ-nl20-m32-np3               48895.84     12285.07     61180.91       0.5409
-IVF-OPQ-nl20-m48-np1               55470.98      5823.48     61294.46       0.6482
-IVF-OPQ-nl20-m48-np2               55470.98     13150.84     68621.82       0.6482
-IVF-OPQ-nl20-m48-np3               55470.98     21764.46     77235.44       0.6482
-IVF-OPQ-nl25-m16-np1               37834.49      1933.77     39768.26       0.4276
-IVF-OPQ-nl25-m16-np2               37834.49      4025.42     41859.91       0.4301
-IVF-OPQ-nl25-m16-np3               37834.49      5763.66     43598.15       0.4301
-IVF-OPQ-nl25-m32-np1               47822.25      3493.76     51316.00       0.5954
-IVF-OPQ-nl25-m32-np2               47822.25      7706.54     55528.79       0.5999
-IVF-OPQ-nl25-m32-np3               47822.25     11739.57     59561.82       0.5999
-IVF-OPQ-nl25-m48-np1               51640.50      5674.73     57315.24       0.7033
-IVF-OPQ-nl25-m48-np2               51640.50     11638.28     63278.78       0.7094
-IVF-OPQ-nl25-m48-np3               51640.50     16903.51     68544.01       0.7094
-IVF-OPQ-nl50-m16-np2               37334.01      2935.00     40269.01       0.4415
-IVF-OPQ-nl50-m16-np5               37334.01      6892.96     44226.97       0.4506
-IVF-OPQ-nl50-m16-np7               37334.01      9405.37     46739.38       0.4506
-IVF-OPQ-nl50-m32-np2               50719.80      4147.20     54867.01       0.6094
-IVF-OPQ-nl50-m32-np5               50719.80      9577.93     60297.74       0.6258
-IVF-OPQ-nl50-m32-np7               50719.80     13890.93     64610.74       0.6258
-IVF-OPQ-nl50-m48-np2               54736.82      5700.03     60436.84       0.7125
-IVF-OPQ-nl50-m48-np5               54736.82     13270.29     68007.11       0.7347
-IVF-OPQ-nl50-m48-np7               54736.82     18383.74     73120.56       0.7347
-IVF-OPQ-nl100-m16-np5              42506.66      4788.26     47294.92       0.4498
-IVF-OPQ-nl100-m16-np10             42506.66      9006.51     51513.17       0.4537
-IVF-OPQ-nl100-m16-np15             42506.66     13459.61     55966.27       0.4537
-IVF-OPQ-nl100-m32-np5              50852.20      6860.73     57712.93       0.6212
-IVF-OPQ-nl100-m32-np10             50852.20     13261.77     64113.97       0.6288
-IVF-OPQ-nl100-m32-np15             50852.20     20121.47     70973.67       0.6289
-IVF-OPQ-nl100-m48-np5              66072.49      9583.98     75656.48       0.7256
-IVF-OPQ-nl100-m48-np10             66072.49     17642.62     83715.12       0.7362
-IVF-OPQ-nl100-m48-np15             66072.49     27090.41     93162.91       0.7363
+Exhaustive                            23.94    300669.42    300693.36       1.0000
+IVF-OPQ-nl273-m16-np13             48538.75      5168.65     53707.39       0.4567
+IVF-OPQ-nl273-m16-np16             48538.75      6243.53     54782.27       0.4575
+IVF-OPQ-nl273-m16-np23             48538.75      8749.50     57288.24       0.4576
+IVF-OPQ-nl273-m32-np13             56733.12      8602.57     65335.69       0.6295
+IVF-OPQ-nl273-m32-np16             56733.12     10411.57     67144.69       0.6312
+IVF-OPQ-nl273-m32-np23             56733.12     14800.91     71534.03       0.6316
+IVF-OPQ-nl273-m48-np13             68469.74     10826.48     79296.23       0.7334
+IVF-OPQ-nl273-m48-np16             68469.74     13173.62     81643.36       0.7360
+IVF-OPQ-nl273-m48-np23             68469.74     18713.54     87183.29       0.7365
+IVF-OPQ-nl387-m16-np19             58510.78      7467.02     65977.80       0.4579
+IVF-OPQ-nl387-m16-np27             58510.78      9919.46     68430.24       0.4585
+IVF-OPQ-nl387-m32-np19             74880.54     11942.58     86823.12       0.6319
+IVF-OPQ-nl387-m32-np27             74880.54     16289.07     91169.61       0.6334
+IVF-OPQ-nl387-m48-np19             73287.48     13815.35     87102.83       0.7356
+IVF-OPQ-nl387-m48-np27             73287.48     19191.27     92478.75       0.7377
+IVF-OPQ-nl547-m16-np23             66317.33      8294.84     74612.17       0.4603
+IVF-OPQ-nl547-m16-np27             66317.33      9636.94     75954.27       0.4610
+IVF-OPQ-nl547-m16-np33             66317.33     11443.52     77760.85       0.4614
+IVF-OPQ-nl547-m32-np23             78328.35     13391.88     91720.23       0.6308
+IVF-OPQ-nl547-m32-np27             78328.35     15424.57     93752.92       0.6324
+IVF-OPQ-nl547-m32-np33             78328.35     18499.00     96827.35       0.6333
+IVF-OPQ-nl547-m48-np23             84417.78     15267.71     99685.49       0.7349
+IVF-OPQ-nl547-m48-np27             84417.78     17701.44    102119.22       0.7372
+IVF-OPQ-nl547-m48-np33             84417.78     21675.29    106093.07       0.7386
 -----------------------------------------------------------------------------------
+```
+
+## GPU
+
+Two indices are also implemented in GPU-accelerated versions. The exhaustive
+search and the IVF index. Under the hood, this uses 
+[cubecl](https://github.com/tracel-ai/cubecl) with wgpu backend (system agnostic, 
+for details please check [here](https://burn.dev/books/cubecl/getting-started/installation.html)). 
+Let's first look at the indices compared against exhaustive (CPU). You can
+of course provide other backends.
+
+### Comparison against CPU exhaustive
+
+The GPU acceleration is notable already in the exhaustive index. The IVF-GPU
+reaches very fast speeds here, but not much faster actually than the IVF-CPU
+version. Due to the current implementation, there is quite a bit of overhead
+in copying data from CPU to GPU during individual kernel launches. The 
+advantages of the GPU versions are stronger when querying more samples at
+higher dimensionality, see next section.
+
+**Euclidean:**
+
+```
+====================================================================================================
+Benchmark: 150k cells, 32D (CPU vs GPU Exhaustive vs IVF-GPU)
+====================================================================================================
+Method                                Build (ms)   Query (ms)   Total (ms)     Recall@k   Dist Error
+----------------------------------------------------------------------------------------------------
+CPU-Exhaustive                              3.48     24372.91     24376.38       1.0000     0.000000
+GPU-Exhaustive                              3.27     15536.64     15539.92       1.0000     0.000003
+IVF-GPU-kNN-nl273-np13                   1470.27      3163.37      4633.64       0.9954     0.036068
+IVF-GPU-kNN-nl273-np16                   1470.27      3668.76      5139.03       0.9998     0.001564
+IVF-GPU-kNN-nl273-np23                   1470.27      4714.30      6184.57       1.0000     0.000003
+IVF-GPU-kNN-nl387-np19                   2216.07      3473.84      5689.91       0.9962     0.020323
+IVF-GPU-kNN-nl387-np27                   2216.07      4536.40      6752.46       1.0000     0.000003
+IVF-GPU-kNN-nl547-np23                   2926.25      3489.63      6415.87       0.9905     0.043297
+IVF-GPU-kNN-nl547-np27                   2926.25      3636.37      6562.61       0.9971     0.009404
+IVF-GPU-kNN-nl547-np33                   2926.25      4077.09      7003.34       0.9997     0.000619
+----------------------------------------------------------------------------------------------------
+```
+
+**Cosine:**
+
+```
+====================================================================================================
+Benchmark: 150k cells, 32D (CPU vs GPU Exhaustive vs IVF-GPU)
+====================================================================================================
+Method                                Build (ms)   Query (ms)   Total (ms)     Recall@k   Dist Error
+----------------------------------------------------------------------------------------------------
+CPU-Exhaustive                              5.38     23923.51     23928.89       1.0000     0.000000
+GPU-Exhaustive                              4.59     14661.81     14666.40       1.0000     0.000000
+IVF-GPU-kNN-nl273-np13                   3911.37      3105.11      7016.47       0.9956     0.000021
+IVF-GPU-kNN-nl273-np16                   3911.37      3485.04      7396.40       0.9998     0.000001
+IVF-GPU-kNN-nl273-np23                   3911.37      4644.56      8555.93       1.0000     0.000000
+IVF-GPU-kNN-nl273-np27                   3911.37      5304.09      9215.46       1.0000     0.000000
+IVF-GPU-kNN-nl387-np19                   5494.76      3276.61      8771.36       0.9965     0.000012
+IVF-GPU-kNN-nl387-np27                   5494.76      4256.59      9751.34       1.0000     0.000000
+IVF-GPU-kNN-nl387-np38                   5494.76      5410.46     10905.22       1.0000     0.000000
+IVF-GPU-kNN-nl547-np23                   7799.18      3458.07     11257.26       0.9913     0.000026
+IVF-GPU-kNN-nl547-np27                   7799.18      3670.37     11469.55       0.9973     0.000006
+IVF-GPU-kNN-nl547-np33                   7799.18      4144.41     11943.59       0.9997     0.000000
+IVF-GPU-kNN-nl547-np54                   7799.18      5778.40     13577.59       1.0000     0.000000
+----------------------------------------------------------------------------------------------------
+```
+
+### Comparison against IVF CPU
+
+In this case, the IVF CPU implementation is being compared against the GPU 
+version. GPU acceleration shines with larger data sets and larger dimensions, 
+hence, the number of samples was increased to 250_000 and dimensions to 48 for 
+these benchmarks.
+
+**IVF CPU:**
+
+```
+====================================================================================================
+Benchmark: 500k cells, 32D
+====================================================================================================
+Method                                Build (ms)   Query (ms)   Total (ms)     Recall@k   Dist Error
+----------------------------------------------------------------------------------------------------
+Exhaustive                                 11.83    258458.26    258470.09       1.0000     0.000000
+IVF-nl500-np22                           8518.95     47041.19     55560.14       0.9938     0.017566
+IVF-nl500-np25                           8518.95     52879.84     61398.78       0.9978     0.004195
+IVF-nl500-np31                           8518.95     65425.15     73944.10       0.9998     0.000204
+IVF-nl707-np26                          11304.72     37316.38     48621.10       0.9861     0.055255
+IVF-nl707-np35                          11304.72     48435.29     59740.01       0.9981     0.005750
+IVF-nl707-np37                          11304.72     50956.66     62261.38       0.9989     0.002849
+IVF-nl1000-np31                         15980.61     31357.65     47338.26       0.9787     0.093676
+IVF-nl1000-np44                         15980.61     43634.73     59615.34       0.9972     0.008673
+IVF-nl1000-np50                         15980.61     50370.27     66350.89       0.9992     0.001971
+----------------------------------------------------------------------------------------------------
+```
+
+**IVF GPU:**
+
+```
+====================================================================================================
+Benchmark: 500k cells, 32D (CPU vs GPU Exhaustive vs IVF-GPU)
+====================================================================================================
+Method                                Build (ms)   Query (ms)   Total (ms)     Recall@k   Dist Error
+----------------------------------------------------------------------------------------------------
+CPU-Exhaustive                             11.21    261010.65    261021.87       1.0000     0.000000
+GPU-Exhaustive                             20.81    175500.07    175520.88       1.0000     0.000002
+IVF-GPU-kNN-nl500-np22                   7979.49     24180.63     32160.12       0.9938     0.017569
+IVF-GPU-kNN-nl500-np25                   7979.49     26730.53     34710.02       0.9978     0.004182
+IVF-GPU-kNN-nl500-np31                   7979.49     30677.90     38657.39       0.9998     0.000206
+IVF-GPU-kNN-nl500-np50                   7979.49     47844.94     55824.44       1.0000     0.000002
+IVF-GPU-kNN-nl707-np26                  11900.13     22641.16     34541.29       0.9861     0.055257
+IVF-GPU-kNN-nl707-np35                  11900.13     27722.34     39622.47       0.9981     0.005752
+IVF-GPU-kNN-nl707-np37                  11900.13     29293.64     41193.77       0.9989     0.002852
+IVF-GPU-kNN-nl707-np70                  11900.13     51075.16     62975.29       1.0000     0.000002
+IVF-GPU-kNN-nl1000-np31                 16655.31     20986.76     37642.07       0.9787     0.093678
+IVF-GPU-kNN-nl1000-np44                 16655.31     26519.50     43174.81       0.9972     0.008676
+IVF-GPU-kNN-nl1000-np50                 16655.31     30444.66     47099.97       0.9992     0.001973
+IVF-GPU-kNN-nl1000-np100                16655.31     52896.22     69551.53       1.0000     0.000002
+```
+
+### Higher dimensionality
+
+With even higher dimensionality, we can observe the advantage of the GPU-accelerated
+versions. 
+
+```
+====================================================================================================
+Benchmark: 150k cells, 128D (CPU vs GPU Exhaustive vs IVF-GPU)
+====================================================================================================
+Method                                Build (ms)   Query (ms)   Total (ms)     Recall@k   Dist Error
+----------------------------------------------------------------------------------------------------
+CPU-Exhaustive                             15.25    194745.13    194760.37       1.0000     0.000000
+GPU-Exhaustive                             17.07     26365.08     26382.14       1.0000     0.000003
+IVF-GPU-kNN-nl273-np13                   9825.64      4803.13     14628.77       0.9957     0.018317
+IVF-GPU-kNN-nl273-np16                   9825.64      5401.57     15227.21       0.9993     0.002087
+IVF-GPU-kNN-nl273-np23                   9825.64      7152.16     16977.80       1.0000     0.000003
+IVF-GPU-kNN-nl273-np27                   9825.64      7927.21     17752.85       1.0000     0.000003
+IVF-GPU-kNN-nl387-np19                  14274.27      5790.95     20065.22       0.9981     0.009822
+IVF-GPU-kNN-nl387-np27                  14274.27      7187.35     21461.62       1.0000     0.000003
+IVF-GPU-kNN-nl387-np38                  14274.27      9105.42     23379.69       1.0000     0.000003
+IVF-GPU-kNN-nl547-np23                  19754.76      5949.04     25703.80       0.9961     0.019664
+IVF-GPU-kNN-nl547-np27                  19754.76      6208.95     25963.71       0.9989     0.004980
+IVF-GPU-kNN-nl547-np33                  19754.76      7175.23     26929.99       0.9999     0.000131
+IVF-GPU-kNN-nl547-np54                  19754.76     10194.08     29948.84       1.0000     0.000003
+----------------------------------------------------------------------------------------------------
 ```
 
 ## Licence

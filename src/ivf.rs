@@ -1,10 +1,10 @@
-use faer::RowRef;
+use faer::{MatRef, RowRef};
 use num_traits::{Float, FromPrimitive, ToPrimitive};
-use std::{collections::BinaryHeap, iter::Sum};
+use std::iter::Sum;
 
 use crate::utils::dist::*;
 use crate::utils::heap_structs::*;
-use crate::utils::k_means::*;
+use crate::utils::ivf_utils::*;
 use crate::utils::*;
 
 /// IVF (Inverted File) index for similarity search
@@ -34,6 +34,7 @@ pub struct IvfIndex<T> {
     metric: Dist,
     // index specific ones
     centroids: Vec<T>,
+    centroids_norm: Vec<T>,
     all_indices: Vec<usize>,
     offsets: Vec<usize>,
     nlist: usize,
@@ -47,26 +48,60 @@ impl<T> VectorDistance<T> for IvfIndex<T>
 where
     T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum,
 {
-    /// Return the flat vectors
     fn vectors_flat(&self) -> &[T] {
         &self.vectors_flat
     }
 
-    /// Return the original dimensions
     fn dim(&self) -> usize {
         self.dim
     }
 
-    /// Return the normalised values for the Cosine calculation
     fn norms(&self) -> &[T] {
         &self.norms
     }
 }
 
+//////////////////////
+// CentroidDistance //
+//////////////////////
+
+impl<T> CentroidDistance<T> for IvfIndex<T>
+where
+    T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum,
+{
+    fn centroids(&self) -> &[T] {
+        &self.centroids
+    }
+
+    fn dim(&self) -> usize {
+        self.dim
+    }
+
+    fn metric(&self) -> Dist {
+        self.metric
+    }
+
+    fn nlist(&self) -> usize {
+        self.nlist
+    }
+
+    fn centroids_norm(&self) -> &[T] {
+        &self.centroids_norm
+    }
+}
+
+////////////////
+// Main index //
+////////////////
+
 impl<T> IvfIndex<T>
 where
     T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum,
 {
+    //////////////////////
+    // Index generation //
+    //////////////////////
+
     /// Build an IVF index with optimised memory layout and parallel training.
     ///
     /// Constructs an inverted file index by clustering vectors with k-means,
@@ -82,34 +117,47 @@ where
     ///
     /// ### Params
     ///
-    /// * `vectors_flat` - Flattened vector data (length = n * dim)
-    /// * `dim` - Embedding dimensions
-    /// * `n` - Number of vectors
-    /// * `norms` - Pre-computed norms for Cosine distance (empty for Euclidean)
+    /// * `data` - Matrix reference with vectors as rows (n × dim)
     /// * `metric` - Distance metric (Euclidean or Cosine)
-    /// * `nlist` - Number of clusters (more = faster search, lower recall)
-    /// * `max_iters` - Maximum k-means iterations (defaults to 30)
+    /// * `nlist` - Optional number of clusters. Defaults to `sqrt(n)`.
+    /// * `max_iters` - Maximum k-means iterations (defaults to `30`)
     /// * `seed` - Random seed for reproducibility
     /// * `verbose` - Print training progress
     ///
     /// ### Returns
     ///
     /// Constructed index ready for querying
-    #[allow(clippy::too_many_arguments)]
     pub fn build(
-        vectors_flat: Vec<T>,
-        dim: usize,
-        n: usize,
-        norms: Vec<T>,
+        data: MatRef<T>,
         metric: Dist,
-        nlist: usize,
+        nlist: Option<usize>,
         max_iters: Option<usize>,
         seed: usize,
         verbose: bool,
     ) -> Self {
-        let max_iters = max_iters.unwrap_or(30);
+        let (vectors_flat, n, dim) = matrix_to_flat(data);
 
-        // 1. Subsample training data
+        // Compute norms for Cosine distance
+        let norms = if metric == Dist::Cosine {
+            (0..n)
+                .map(|i| {
+                    let start = i * dim;
+                    let end = start + dim;
+                    vectors_flat[start..end]
+                        .iter()
+                        .map(|x| *x * *x)
+                        .fold(T::zero(), |a, b| a + b)
+                        .sqrt()
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+
+        let max_iters = max_iters.unwrap_or(30);
+        let nlist = nlist.unwrap_or((n as f32).sqrt() as usize).max(1);
+
+        // 1. subsample training data
         let (training_data, n_train) = if n > 500_000 {
             if verbose {
                 println!("  Sampling 250k vectors for training");
@@ -120,7 +168,11 @@ where
             (vectors_flat.clone(), n)
         };
 
-        // 2. Train the centroids
+        if verbose {
+            println!("  Generating IVF index with {} Voronoi cells.", nlist);
+        }
+
+        // 2. train the centroids
         let centroids = train_centroids(
             &training_data,
             dim,
@@ -132,10 +184,26 @@ where
             verbose,
         );
 
-        // 3. Assign the Rest
+        let centroids_norm = if metric == Dist::Cosine {
+            (0..nlist)
+                .map(|i| {
+                    let start = i * dim;
+                    let end = start + dim;
+                    centroids[start..end]
+                        .iter()
+                        .map(|x| *x * *x)
+                        .fold(T::zero(), |a, b| a + b)
+                        .sqrt()
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+
+        // 3. assign the Rest
         let assignments = assign_all_parallel(&vectors_flat, dim, n, &centroids, nlist, &metric);
 
-        // 4. Generate a flat version for better cache locality
+        // 4. generate a flat version for better cache locality
         let (all_indices, offsets) = build_csr_layout(assignments, n, nlist);
 
         Self {
@@ -145,11 +213,16 @@ where
             norms,
             metric,
             centroids,
+            centroids_norm,
             all_indices,
             offsets,
             nlist,
         }
     }
+
+    ///////////
+    // Query //
+    ///////////
 
     /// Query the index for approximate nearest neighbours
     ///
@@ -170,28 +243,9 @@ where
     #[inline]
     pub fn query(&self, query_vec: &[T], k: usize, nprobe: Option<usize>) -> (Vec<usize>, Vec<T>) {
         let nprobe = nprobe
-            .unwrap_or_else(|| (((self.nlist as f64) * 0.15) as usize).max(1))
+            .unwrap_or_else(|| ((self.nlist as f64).sqrt() as usize).max(1))
             .min(self.nlist);
-        let k = k.min(self.n);
-
-        // 1. Find the top `nprobe` centroids
-        let mut cluster_dists: Vec<(T, usize)> = (0..self.nlist)
-            .map(|c| {
-                let cent = &self.centroids[c * self.dim..(c + 1) * self.dim];
-                let dist = match self.metric {
-                    Dist::Euclidean => euclidean_distance_static(query_vec, cent),
-                    Dist::Cosine => cosine_distance_static(query_vec, cent),
-                };
-                (dist, c)
-            })
-            .collect();
-
-        if nprobe < self.nlist {
-            cluster_dists.select_nth_unstable_by(nprobe, |a, b| a.0.partial_cmp(&b.0).unwrap());
-        }
-
-        // 2. Search only those clusters in the CSR layout
-        let mut heap: BinaryHeap<(OrderedFloat<T>, usize)> = BinaryHeap::with_capacity(k + 1);
+        let k: usize = k.min(self.n);
         let query_norm = if matches!(self.metric, Dist::Cosine) {
             query_vec
                 .iter()
@@ -201,6 +255,12 @@ where
         } else {
             T::one()
         };
+
+        // 1. find the top `nprobe` centroids
+        let cluster_dists: Vec<(T, usize)> = self.get_centroids_dist(query_vec, query_norm, nprobe);
+
+        // 2. search only those clusters in the CSR layout
+        let mut buffer = SortedBuffer::with_capacity(k);
 
         for &(_, cluster_idx) in cluster_dists.iter().take(nprobe) {
             let start = self.offsets[cluster_idx];
@@ -212,26 +272,18 @@ where
                     Dist::Cosine => self.cosine_distance_to_query(vec_idx, query_vec, query_norm),
                 };
 
-                if heap.len() < k {
-                    heap.push((OrderedFloat(dist), vec_idx));
-                } else if dist < heap.peek().unwrap().0 .0 {
-                    heap.pop();
-                    heap.push((OrderedFloat(dist), vec_idx));
-                }
+                buffer.insert((OrderedFloat(dist), vec_idx), k);
             }
         }
 
-        let mut results: Vec<_> = heap.into_iter().collect();
-        results.sort_unstable_by_key(|&(dist, _)| dist);
-        let (distances, indices) = results.into_iter().map(|(d, i)| (d.0, i)).unzip();
+        let (distances, indices) = buffer.data().iter().map(|(d, i)| (d.0, *i)).unzip();
         (indices, distances)
     }
 
     /// Query the index for approximate nearest neighbours
     ///
-    /// Performs two-stage search: first finds nprobe nearest centroids to the
-    /// query, then exhaustively searches all vectors in those clusters. Uses
-    /// a max-heap to track top-k candidates.
+    /// Optimised path for contiguous memory (stride == 1), otherwise copies
+    /// to a temporary vector. Uses `self.query()` under the hood.
     ///
     /// ### Params
     ///
@@ -270,17 +322,14 @@ impl<T> KnnValidation<T> for IvfIndex<T>
 where
     T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum,
 {
-    /// Internal querying function
     fn query_for_validation(&self, query_vec: &[T], k: usize) -> (Vec<usize>, Vec<T>) {
         self.query(query_vec, k, None)
     }
 
-    /// Returns n
     fn n(&self) -> usize {
         self.n
     }
 
-    /// Returns the distance metric
     fn metric(&self) -> Dist {
         self.metric
     }
@@ -294,32 +343,27 @@ where
 mod tests {
     use super::*;
     use approx::assert_relative_eq;
+    use faer::Mat;
 
-    fn create_simple_vectors() -> (Vec<f32>, usize, usize, Vec<f32>) {
+    fn create_simple_matrix() -> Mat<f32> {
         // 5 points in 3D space
-        let vectors_flat = vec![
+        let data = [
             1.0, 0.0, 0.0, // Point 0
             0.0, 1.0, 0.0, // Point 1
             0.0, 0.0, 1.0, // Point 2
             1.0, 1.0, 0.0, // Point 3
             1.0, 0.0, 1.0, // Point 4
         ];
-        let dim = 3;
-        let n = 5;
-        let norms = vec![]; // Empty for Euclidean
-        (vectors_flat, dim, n, norms)
+        Mat::from_fn(5, 3, |i, j| data[i * 3 + j])
     }
 
     #[test]
     fn test_ivf_index_creation() {
-        let (vectors_flat, dim, n, norms) = create_simple_vectors();
+        let data = create_simple_matrix();
         let _ = IvfIndex::build(
-            vectors_flat,
-            dim,
-            n,
-            norms,
+            data.as_ref(),
             Dist::Euclidean,
-            2, // nlist
+            Some(2), // nlist
             None,
             42,
             false,
@@ -328,18 +372,8 @@ mod tests {
 
     #[test]
     fn test_ivf_query_finds_self() {
-        let (vectors_flat, dim, n, norms) = create_simple_vectors();
-        let index = IvfIndex::build(
-            vectors_flat,
-            dim,
-            n,
-            norms,
-            Dist::Euclidean,
-            2,
-            None,
-            42,
-            false,
-        );
+        let data = create_simple_matrix();
+        let index = IvfIndex::build(data.as_ref(), Dist::Euclidean, Some(2), None, 42, false);
 
         let query = vec![1.0, 0.0, 0.0];
         let (indices, distances) = index.query(&query, 1, None);
@@ -351,18 +385,8 @@ mod tests {
 
     #[test]
     fn test_ivf_query_euclidean() {
-        let (vectors_flat, dim, n, norms) = create_simple_vectors();
-        let index = IvfIndex::build(
-            vectors_flat,
-            dim,
-            n,
-            norms,
-            Dist::Euclidean,
-            2,
-            None,
-            42,
-            false,
-        );
+        let data = create_simple_matrix();
+        let index = IvfIndex::build(data.as_ref(), Dist::Euclidean, Some(2), None, 42, false);
 
         let query = vec![1.0, 0.0, 0.0];
         let (indices, distances) = index.query(&query, 3, None);
@@ -377,31 +401,9 @@ mod tests {
 
     #[test]
     fn test_ivf_query_cosine() {
-        let (vectors_flat, dim, n, _) = create_simple_vectors();
+        let data = create_simple_matrix();
 
-        // Compute norms for cosine
-        let norms: Vec<f32> = (0..n)
-            .map(|i| {
-                let start = i * dim;
-                vectors_flat[start..start + dim]
-                    .iter()
-                    .map(|&x| x * x)
-                    .sum::<f32>()
-                    .sqrt()
-            })
-            .collect();
-
-        let index = IvfIndex::build(
-            vectors_flat,
-            dim,
-            n,
-            norms,
-            Dist::Cosine,
-            2,
-            None,
-            42,
-            false,
-        );
+        let index = IvfIndex::build(data.as_ref(), Dist::Cosine, Some(2), None, 42, false);
 
         let query = vec![1.0, 0.0, 0.0];
         let (indices, distances) = index.query(&query, 3, None);
@@ -412,18 +414,8 @@ mod tests {
 
     #[test]
     fn test_ivf_query_k_larger_than_dataset() {
-        let (vectors_flat, dim, n, norms) = create_simple_vectors();
-        let index = IvfIndex::build(
-            vectors_flat,
-            dim,
-            n,
-            norms,
-            Dist::Euclidean,
-            2,
-            None,
-            42,
-            false,
-        );
+        let data = create_simple_matrix();
+        let index = IvfIndex::build(data.as_ref(), Dist::Euclidean, Some(2), None, 42, false);
 
         let query = vec![1.0, 0.0, 0.0];
         let (indices, _) = index.query(&query, 10, None);
@@ -433,18 +425,8 @@ mod tests {
 
     #[test]
     fn test_ivf_query_nprobe() {
-        let (vectors_flat, dim, n, norms) = create_simple_vectors();
-        let index = IvfIndex::build(
-            vectors_flat,
-            dim,
-            n,
-            norms,
-            Dist::Euclidean,
-            3,
-            None,
-            42,
-            false,
-        );
+        let data = create_simple_matrix();
+        let index = IvfIndex::build(data.as_ref(), Dist::Euclidean, Some(3), None, 42, false);
 
         let query = vec![1.0, 0.0, 0.0];
         let (indices1, _) = index.query(&query, 3, Some(1));
@@ -456,30 +438,10 @@ mod tests {
 
     #[test]
     fn test_ivf_reproducibility() {
-        let (vectors_flat, dim, n, norms) = create_simple_vectors();
+        let data = create_simple_matrix();
 
-        let index1 = IvfIndex::build(
-            vectors_flat.clone(),
-            dim,
-            n,
-            norms.clone(),
-            Dist::Euclidean,
-            2,
-            None,
-            42,
-            false,
-        );
-        let index2 = IvfIndex::build(
-            vectors_flat,
-            dim,
-            n,
-            norms,
-            Dist::Euclidean,
-            2,
-            None,
-            42,
-            false,
-        );
+        let index1 = IvfIndex::build(data.as_ref(), Dist::Euclidean, Some(2), None, 42, false);
+        let index2 = IvfIndex::build(data.as_ref(), Dist::Euclidean, Some(2), None, 42, false);
 
         let query = vec![0.5, 0.5, 0.0];
         let (indices1, _) = index1.query(&query, 3, None);
@@ -490,30 +452,10 @@ mod tests {
 
     #[test]
     fn test_ivf_different_seeds() {
-        let (vectors_flat, dim, n, norms) = create_simple_vectors();
+        let data = create_simple_matrix();
 
-        let index1 = IvfIndex::build(
-            vectors_flat.clone(),
-            dim,
-            n,
-            norms.clone(),
-            Dist::Euclidean,
-            2,
-            None,
-            42,
-            false,
-        );
-        let index2 = IvfIndex::build(
-            vectors_flat,
-            dim,
-            n,
-            norms,
-            Dist::Euclidean,
-            2,
-            None,
-            123,
-            false,
-        );
+        let index1 = IvfIndex::build(data.as_ref(), Dist::Euclidean, Some(2), None, 42, false);
+        let index2 = IvfIndex::build(data.as_ref(), Dist::Euclidean, Some(2), None, 123, false);
 
         let query = vec![0.5, 0.5, 0.0];
         let (indices1, _) = index1.query(&query, 3, Some(2));
@@ -527,21 +469,12 @@ mod tests {
     fn test_ivf_larger_dataset() {
         let n = 100;
         let dim = 10;
-        let mut vectors_flat = Vec::with_capacity(n * dim);
-
-        for i in 0..n {
-            for j in 0..dim {
-                vectors_flat.push((i * j) as f32 / 10.0);
-            }
-        }
+        let data = Mat::from_fn(n, dim, |i, j| (i * j) as f32 / 10.0);
 
         let index = IvfIndex::build(
-            vectors_flat,
-            dim,
-            n,
-            vec![],
+            data.as_ref(),
             Dist::Euclidean,
-            10, // sqrt(100)
+            Some(10), // sqrt(100)
             None,
             42,
             false,
@@ -556,32 +489,9 @@ mod tests {
 
     #[test]
     fn test_ivf_orthogonal_vectors() {
-        let vectors_flat = vec![1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0];
-        let dim = 3;
-        let n = 3;
+        let data = Mat::from_fn(3, 3, |i, j| if i == j { 1.0 } else { 0.0 });
 
-        let norms: Vec<f32> = (0..n)
-            .map(|i| {
-                let start = i * dim;
-                vectors_flat[start..start + dim]
-                    .iter()
-                    .map(|&x| x * x)
-                    .sum::<f32>()
-                    .sqrt()
-            })
-            .collect();
-
-        let index = IvfIndex::build(
-            vectors_flat,
-            dim,
-            n,
-            norms,
-            Dist::Cosine,
-            3,
-            None,
-            42,
-            false,
-        );
+        let index = IvfIndex::build(data.as_ref(), Dist::Cosine, Some(3), None, 42, false);
 
         let query = vec![1.0, 0.0, 0.0];
         let (indices, distances) = index.query(&query, 3, None);
@@ -589,7 +499,6 @@ mod tests {
         assert_eq!(indices[0], 0);
         assert_relative_eq!(distances[0], 0.0, epsilon = 1e-5);
 
-        // Check remaining results if found
         if indices.len() >= 2 {
             assert_relative_eq!(distances[1], 1.0, epsilon = 1e-5);
         }
@@ -600,33 +509,13 @@ mod tests {
 
     #[test]
     fn test_ivf_more_clusters() {
-        let (vectors_flat, dim, n, norms) = create_simple_vectors();
+        let data = create_simple_matrix();
 
-        let index_few = IvfIndex::build(
-            vectors_flat.clone(),
-            dim,
-            n,
-            norms.clone(),
-            Dist::Euclidean,
-            2,
-            None,
-            42,
-            false,
-        );
-        let index_many = IvfIndex::build(
-            vectors_flat,
-            dim,
-            n,
-            norms,
-            Dist::Euclidean,
-            4,
-            None,
-            42,
-            false,
-        );
+        let index_few = IvfIndex::build(data.as_ref(), Dist::Euclidean, Some(2), None, 42, false);
+        let index_many = IvfIndex::build(data.as_ref(), Dist::Euclidean, Some(4), None, 42, false);
 
         let query = vec![0.9, 0.1, 0.0];
-        let (indices1, _) = index_few.query(&query, 3, Some(2)); // Force enough clusters
+        let (indices1, _) = index_few.query(&query, 3, Some(2));
         let (indices2, _) = index_many.query(&query, 3, Some(4));
 
         assert_eq!(indices1.len(), 3);

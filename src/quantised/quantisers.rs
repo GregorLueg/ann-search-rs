@@ -5,7 +5,7 @@ use std::iter::Sum;
 use std::ops::AddAssign;
 
 use crate::utils::dist::*;
-use crate::utils::k_means::*;
+use crate::utils::ivf_utils::*;
 
 /////////////////////////
 // Scalar quantisation //
