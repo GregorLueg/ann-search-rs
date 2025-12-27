@@ -1,6 +1,5 @@
 mod commons;
 
-use ann_search_rs::utils::KnnValidation;
 use ann_search_rs::*;
 use clap::Parser;
 use commons::*;
@@ -66,19 +65,20 @@ fn main() {
     let query_data = data.as_ref();
     let mut results = Vec::new();
 
-    println!("Building exhaustive index...");
+    // CPU Exhaustive (ground truth)
+    println!("Building CPU exhaustive index...");
     let start = Instant::now();
     let exhaustive_idx = build_exhaustive_index(data.as_ref(), &cli.distance);
     let build_time = start.elapsed().as_secs_f64() * 1000.0;
 
-    println!("Querying exhaustive index...");
+    println!("Querying CPU exhaustive index...");
     let start = Instant::now();
     let (true_neighbors, true_distances) =
         query_exhaustive_index(query_data, &exhaustive_idx, cli.k, true, false);
     let query_time = start.elapsed().as_secs_f64() * 1000.0;
 
     results.push(BenchmarkResult {
-        method: "Exhaustive".to_string(),
+        method: "CPU-Exhaustive".to_string(),
         build_time_ms: build_time,
         query_time_ms: query_time,
         total_time_ms: build_time + query_time,
@@ -88,21 +88,60 @@ fn main() {
 
     println!("-----------------------------");
 
+    // GPU Exhaustive
+    println!("Building GPU exhaustive index (WGPU)...");
+    let device: cubecl::wgpu::WgpuDevice = Default::default();
+
+    let start = Instant::now();
+    let gpu_exhaustive_idx = build_exhaustive_index_gpu::<f32, cubecl::wgpu::WgpuRuntime>(
+        data.as_ref(),
+        &cli.distance,
+        device.clone(),
+    );
+    let build_time = start.elapsed().as_secs_f64() * 1000.0;
+
+    println!("Querying GPU exhaustive index (WGPU)...");
+    let start = Instant::now();
+    let (gpu_neighbors, gpu_distances) =
+        query_exhaustive_index_gpu(query_data, &gpu_exhaustive_idx, cli.k, true);
+    let query_time = start.elapsed().as_secs_f64() * 1000.0;
+
+    let recall = calculate_recall(&true_neighbors, &gpu_neighbors, cli.k);
+    let dist_error = calculate_distance_error(
+        true_distances.as_ref().unwrap(),
+        gpu_distances.as_ref().unwrap(),
+        cli.k,
+    );
+
+    results.push(BenchmarkResult {
+        method: "GPU-Exhaustive".to_string(),
+        build_time_ms: build_time,
+        query_time_ms: query_time,
+        total_time_ms: build_time + query_time,
+        recall_at_k: recall,
+        mean_dist_err: dist_error,
+    });
+
+    println!("-----------------------------");
+
+    // IVF GPU with various nlist/nprobe combinations
     let nlist_values = [
         (cli.n_cells as f32 * 0.5).sqrt() as usize,
         (cli.n_cells as f32).sqrt() as usize,
         (cli.n_cells as f32 * 2.0).sqrt() as usize,
     ];
+
     for nlist in nlist_values {
-        println!("Building IVF index (nlist={})...", nlist);
+        println!("Building IVF-GPU index (nlist={})...", nlist);
         let start = Instant::now();
-        let ivf_idx = build_ivf_index(
+        let ivf_gpu_idx = build_ivf_index_gpu::<f32, cubecl::wgpu::WgpuRuntime>(
             data.as_ref(),
             Some(nlist),
             None,
             &cli.distance,
             cli.seed as usize,
             false,
+            device.clone(),
         );
         let build_time = start.elapsed().as_secs_f64() * 1000.0;
 
@@ -123,35 +162,45 @@ fn main() {
                 continue;
             }
 
-            println!("Querying IVF index (nlist={}, nprobe={})...", nlist, nprobe);
+            // Test build_knn_graph
+            println!("Querying IVF-GPU (nlist={}, nprobe={})...", nlist, nprobe);
             let start = Instant::now();
-            let (approx_neighbors, approx_distances) =
-                query_ivf_index(query_data, &ivf_idx, cli.k, Some(nprobe), true, false);
-            let query_time = start.elapsed().as_secs_f64() * 1000.0;
+            let (knn_neighbors, knn_distances) = query_ivf_index_gpu(
+                data.as_ref(),
+                &ivf_gpu_idx,
+                cli.k,
+                Some(nprobe),
+                true,
+                false,
+            );
+            let knn_time = start.elapsed().as_secs_f64() * 1000.0;
 
-            let recall = calculate_recall(&true_neighbors, &approx_neighbors, cli.k);
+            let recall = calculate_recall(&true_neighbors, &knn_neighbors, cli.k);
             let dist_error = calculate_distance_error(
                 true_distances.as_ref().unwrap(),
-                approx_distances.as_ref().unwrap(),
+                knn_distances.as_ref().unwrap(),
                 cli.k,
             );
 
-            let internal_recall = ivf_idx.validate_index(cli.k, cli.seed as usize, None);
-            println!("  Internal validation: {:.3}", internal_recall);
-
             results.push(BenchmarkResult {
-                method: format!("IVF-nl{}-np{}", nlist, nprobe),
+                method: format!("IVF-GPU-kNN-nl{}-np{}", nlist, nprobe),
                 build_time_ms: build_time,
-                query_time_ms: query_time,
-                total_time_ms: build_time + query_time,
+                query_time_ms: knn_time,
+                total_time_ms: build_time + knn_time,
                 recall_at_k: recall,
                 mean_dist_err: dist_error,
             });
         }
+
+        println!("-----------------------------");
     }
 
     print_results(
-        &format!("{}k cells, {}D", cli.n_cells / 1000, cli.dim),
+        &format!(
+            "{}k cells, {}D (CPU vs GPU Exhaustive vs IVF-GPU)",
+            cli.n_cells / 1000,
+            cli.dim
+        ),
         &results,
     );
 }

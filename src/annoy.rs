@@ -3,6 +3,7 @@ use num_traits::{Float, FromPrimitive, ToPrimitive};
 use rand::{rngs::StdRng, Rng, SeedableRng};
 use rayon::prelude::*;
 use std::{cmp::Ordering, collections::BinaryHeap, iter::Sum};
+use thousands::*;
 
 use crate::utils::dist::*;
 use crate::utils::heap_structs::*;
@@ -191,17 +192,14 @@ impl<T> VectorDistance<T> for AnnoyIndex<T>
 where
     T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum,
 {
-    /// Return the flat vectors
     fn vectors_flat(&self) -> &[T] {
         &self.vectors_flat
     }
 
-    /// Return the original dimensions
     fn dim(&self) -> usize {
         self.dim
     }
 
-    /// Return the normalised values for the Cosine calculation
     fn norms(&self) -> &[T] {
         &self.norms
     }
@@ -211,6 +209,10 @@ impl<T> AnnoyIndex<T>
 where
     T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum,
 {
+    //////////////////////
+    // Index generation //
+    //////////////////////
+
     /// Construct a new Annoy index
     ///
     /// Builds a forest of random projection trees in parallel. Each tree
@@ -219,7 +221,7 @@ where
     ///
     /// ### Params
     ///
-    /// * `mat` - Data matrix (rows = samples, columns = dimensions)
+    /// * `data` - Data matrix (rows = samples, columns = dimensions)
     /// * `n_trees` - Number of trees to build (more trees = better recall,
     ///   slower build)
     /// * `metric` - Distance metric (Euclidean or Cosine)
@@ -228,19 +230,14 @@ where
     /// ### Returns
     ///
     /// Constructed index ready for querying
-    pub fn new(mat: MatRef<T>, n_trees: usize, metric: Dist, seed: usize) -> Self {
+    pub fn new(data: MatRef<T>, n_trees: usize, metric: Dist, seed: usize) -> Self {
         let mut rng = StdRng::seed_from_u64(seed as u64);
-        let n_vectors = mat.nrows();
-        let dim = mat.ncols();
 
-        let mut vectors_flat = Vec::with_capacity(n_vectors * dim);
-        for i in 0..n_vectors {
-            vectors_flat.extend(mat.row(i).iter().cloned());
-        }
+        let (vectors_flat, n, dim) = matrix_to_flat(data);
 
         // Compute norms for Cosine distance
         let norms = if metric == Dist::Cosine {
-            (0..n_vectors)
+            (0..n)
                 .map(|i| {
                     let start = i * dim;
                     let end = start + dim;
@@ -264,7 +261,7 @@ where
                 Self::build_tree_recursive(
                     &vectors_flat,
                     dim,
-                    (0..n_vectors).collect(),
+                    (0..n).collect(),
                     &mut tree_rng,
                     metric,
                 )
@@ -324,193 +321,10 @@ where
             vectors_flat,
             dim,
             n_trees,
-            n: n_vectors,
+            n,
             norms,
             metric,
         }
-    }
-
-    /// Query the index for approximate nearest neighbours
-    ///
-    /// Performs best-first search across all trees, greedily descending to
-    /// leaves and backtracking to promising unexplored branches. Stops when
-    /// the search budget is exhausted.
-    ///
-    /// ### Params
-    ///
-    /// * `query_vec` - Query vector (must match index dimensionality)
-    /// * `k` - Number of neighbours to return
-    /// * `search_k` - Budget of items to examine (higher = better recall, slower)
-    ///   Defaults to `k * n_trees` if None
-    ///
-    /// ### Returns
-    ///
-    /// Tuple of `(indices, distances)` sorted by distance (nearest first)
-    #[inline]
-    pub fn query(
-        &self,
-        query_vec: &[T],
-        k: usize,
-        search_k: Option<usize>,
-    ) -> (Vec<usize>, Vec<T>) {
-        let limit = search_k.unwrap_or(k * self.n_trees * 20);
-        let mut visited_count = 0;
-
-        let n_vectors = self.vectors_flat.len() / self.dim;
-        let mut visited = VisitedSet::new(n_vectors);
-
-        let query_norm = if self.metric == Dist::Cosine {
-            query_vec
-                .iter()
-                .map(|&x| x * x)
-                .fold(T::zero(), |acc, x| acc + x)
-                .sqrt()
-        } else {
-            T::one()
-        };
-
-        let mut top_k: BinaryHeap<(OrderedFloat<T>, usize)> = BinaryHeap::with_capacity(k + 1);
-        let mut kth_dist = T::infinity();
-        let mut pq = BinaryHeap::with_capacity(self.n_trees * 2);
-
-        for &root in &self.roots {
-            pq.push(BacktrackEntry {
-                margin: f64::MAX,
-                node_idx: root,
-            });
-        }
-
-        while visited_count < limit {
-            let Some(entry) = pq.pop() else { break };
-
-            if top_k.len() == k && -entry.margin > kth_dist.to_f64().unwrap() {
-                break;
-            }
-
-            let mut current_idx = entry.node_idx;
-
-            loop {
-                let node = unsafe { self.nodes.get_unchecked(current_idx as usize) };
-
-                if node.n_descendants == 1 {
-                    let start = node.child_a as usize;
-                    let len = node.child_b as usize;
-                    visited_count += len;
-
-                    let leaf_items = unsafe { self.leaf_indices.get_unchecked(start..start + len) };
-
-                    for &item in leaf_items {
-                        if visited.mark(item) {
-                            continue;
-                        }
-
-                        let vec_start = item * self.dim;
-                        let vec = unsafe {
-                            self.vectors_flat
-                                .get_unchecked(vec_start..vec_start + self.dim)
-                        };
-
-                        let dist = match self.metric {
-                            Dist::Euclidean => {
-                                let mut dist_sq = T::zero();
-                                for i in 0..self.dim {
-                                    let diff = unsafe {
-                                        *query_vec.get_unchecked(i) - *vec.get_unchecked(i)
-                                    };
-                                    dist_sq = dist_sq + diff * diff;
-                                }
-                                dist_sq.sqrt()
-                            }
-                            Dist::Cosine => {
-                                let mut dot = T::zero();
-                                for i in 0..self.dim {
-                                    dot = dot
-                                        + unsafe {
-                                            *query_vec.get_unchecked(i) * *vec.get_unchecked(i)
-                                        };
-                                }
-                                let norm = unsafe { *self.norms.get_unchecked(item) };
-                                T::one() - dot / (query_norm * norm)
-                            }
-                        };
-
-                        if dist < kth_dist || top_k.len() < k {
-                            top_k.push((OrderedFloat(dist), item));
-                            if top_k.len() > k {
-                                top_k.pop();
-                            }
-                            if top_k.len() == k {
-                                kth_dist = top_k.peek().unwrap().0 .0;
-                            }
-                        }
-                    }
-                    break;
-                } else {
-                    let split_offset = node.split_idx as usize * (self.dim + 1);
-                    let plane = unsafe {
-                        self.split_data
-                            .get_unchecked(split_offset..split_offset + self.dim + 1)
-                    };
-
-                    let margin = Self::get_margin(query_vec, plane, self.dim)
-                        .to_f64()
-                        .unwrap();
-
-                    let (closer, farther) = if margin > 0.0 {
-                        (node.child_a, node.child_b)
-                    } else {
-                        (node.child_b, node.child_a)
-                    };
-
-                    pq.push(BacktrackEntry {
-                        margin: -margin.abs(),
-                        node_idx: farther,
-                    });
-
-                    current_idx = closer;
-                }
-            }
-        }
-
-        let mut results: Vec<(usize, T)> = top_k
-            .into_iter()
-            .map(|(OrderedFloat(dist), idx)| (idx, dist))
-            .collect();
-
-        results.sort_unstable_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(Ordering::Equal));
-        results.into_iter().unzip()
-    }
-
-    /// Query using a matrix row reference
-    ///
-    /// Optimised path for contiguous memory (stride == 1), otherwise copies
-    /// to a temporary vector. Uses `self.query()` under the hood.
-    ///
-    /// ### Params
-    ///
-    /// * `query_row` - Row reference
-    /// * `k` - Number of neighbours to search
-    /// * `search_k` - Budget of items to examine (higher = better recall, slower)
-    ///   Defaults to `k * n_trees` if None
-    ///
-    /// ### Returns
-    ///
-    /// Tuple of `(indices, distances)` sorted by distance (nearest first)
-    #[inline]
-    pub fn query_row(
-        &self,
-        query_row: RowRef<T>,
-        k: usize,
-        search_k: Option<usize>,
-    ) -> (Vec<usize>, Vec<T>) {
-        if query_row.col_stride() == 1 {
-            let slice =
-                unsafe { std::slice::from_raw_parts(query_row.as_ptr(), query_row.ncols()) };
-            return self.query(slice, k, search_k);
-        }
-
-        let query_vec: Vec<T> = query_row.iter().cloned().collect();
-        self.query(&query_vec, k, search_k)
     }
 
     /// Build a single tree recursively
@@ -699,6 +513,254 @@ where
             .fold(T::zero(), |acc, x| acc + x)
             - v2[dim]
     }
+
+    ///////////
+    // Query //
+    ///////////
+
+    /// Query the index for approximate nearest neighbours
+    ///
+    /// Performs best-first search across all trees, greedily descending to
+    /// leaves and backtracking to promising unexplored branches. Stops when
+    /// the search budget is exhausted.
+    ///
+    /// ### Params
+    ///
+    /// * `query_vec` - Query vector (must match index dimensionality)
+    /// * `k` - Number of neighbours to return
+    /// * `search_k` - Budget of items to examine (higher = better recall,
+    ///   slower)
+    ///   Defaults to `k * n_trees` if None
+    ///
+    /// ### Returns
+    ///
+    /// Tuple of `(indices, distances)` sorted by distance (nearest first)
+    #[inline]
+    pub fn query(
+        &self,
+        query_vec: &[T],
+        k: usize,
+        search_k: Option<usize>,
+    ) -> (Vec<usize>, Vec<T>) {
+        let limit = search_k.unwrap_or(k * self.n_trees * 20);
+        let mut visited_count = 0;
+
+        let n_vectors = self.vectors_flat.len() / self.dim;
+        let mut visited = VisitedSet::new(n_vectors);
+
+        let query_norm = if self.metric == Dist::Cosine {
+            query_vec
+                .iter()
+                .map(|&x| x * x)
+                .fold(T::zero(), |acc, x| acc + x)
+                .sqrt()
+        } else {
+            T::one()
+        };
+
+        let mut top_k: BinaryHeap<(OrderedFloat<T>, usize)> = BinaryHeap::with_capacity(k + 1);
+        let mut kth_dist = T::infinity();
+        let mut pq = BinaryHeap::with_capacity(self.n_trees * 2);
+
+        for &root in &self.roots {
+            pq.push(BacktrackEntry {
+                margin: f64::MAX,
+                node_idx: root,
+            });
+        }
+
+        while visited_count < limit {
+            let Some(entry) = pq.pop() else { break };
+
+            if top_k.len() == k && -entry.margin > kth_dist.to_f64().unwrap() {
+                break;
+            }
+
+            let mut current_idx = entry.node_idx;
+
+            loop {
+                let node = unsafe { self.nodes.get_unchecked(current_idx as usize) };
+
+                if node.n_descendants == 1 {
+                    let start = node.child_a as usize;
+                    let len = node.child_b as usize;
+                    visited_count += len;
+
+                    let leaf_items = unsafe { self.leaf_indices.get_unchecked(start..start + len) };
+
+                    for &item in leaf_items {
+                        if visited.mark(item) {
+                            continue;
+                        }
+
+                        let vec_start = item * self.dim;
+                        let vec = unsafe {
+                            self.vectors_flat
+                                .get_unchecked(vec_start..vec_start + self.dim)
+                        };
+
+                        let dist = match self.metric {
+                            Dist::Euclidean => {
+                                let mut dist_sq = T::zero();
+                                for i in 0..self.dim {
+                                    let diff = unsafe {
+                                        *query_vec.get_unchecked(i) - *vec.get_unchecked(i)
+                                    };
+                                    dist_sq = dist_sq + diff * diff;
+                                }
+                                dist_sq.sqrt()
+                            }
+                            Dist::Cosine => {
+                                let mut dot = T::zero();
+                                for i in 0..self.dim {
+                                    dot = dot
+                                        + unsafe {
+                                            *query_vec.get_unchecked(i) * *vec.get_unchecked(i)
+                                        };
+                                }
+                                let norm = unsafe { *self.norms.get_unchecked(item) };
+                                T::one() - dot / (query_norm * norm)
+                            }
+                        };
+
+                        if dist < kth_dist || top_k.len() < k {
+                            top_k.push((OrderedFloat(dist), item));
+                            if top_k.len() > k {
+                                top_k.pop();
+                            }
+                            if top_k.len() == k {
+                                kth_dist = top_k.peek().unwrap().0 .0;
+                            }
+                        }
+                    }
+                    break;
+                } else {
+                    let split_offset = node.split_idx as usize * (self.dim + 1);
+                    let plane = unsafe {
+                        self.split_data
+                            .get_unchecked(split_offset..split_offset + self.dim + 1)
+                    };
+
+                    let margin = Self::get_margin(query_vec, plane, self.dim)
+                        .to_f64()
+                        .unwrap();
+
+                    let (closer, farther) = if margin > 0.0 {
+                        (node.child_a, node.child_b)
+                    } else {
+                        (node.child_b, node.child_a)
+                    };
+
+                    pq.push(BacktrackEntry {
+                        margin: -margin.abs(),
+                        node_idx: farther,
+                    });
+
+                    current_idx = closer;
+                }
+            }
+        }
+
+        let mut results: Vec<(usize, T)> = top_k
+            .into_iter()
+            .map(|(OrderedFloat(dist), idx)| (idx, dist))
+            .collect();
+
+        results.sort_unstable_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(Ordering::Equal));
+        results.into_iter().unzip()
+    }
+
+    /// Query using a matrix row reference
+    ///
+    /// Optimised path for contiguous memory (stride == 1), otherwise copies
+    /// to a temporary vector. Uses `self.query()` under the hood.
+    ///
+    /// ### Params
+    ///
+    /// * `query_row` - Row reference
+    /// * `k` - Number of neighbours to search
+    /// * `search_k` - Budget of items to examine (higher = better recall,
+    ///   slower) Defaults to `k * n_trees` if None
+    ///
+    /// ### Returns
+    ///
+    /// Tuple of `(indices, distances)` sorted by distance (nearest first)
+    #[inline]
+    pub fn query_row(
+        &self,
+        query_row: RowRef<T>,
+        k: usize,
+        search_k: Option<usize>,
+    ) -> (Vec<usize>, Vec<T>) {
+        if query_row.col_stride() == 1 {
+            let slice =
+                unsafe { std::slice::from_raw_parts(query_row.as_ptr(), query_row.ncols()) };
+            return self.query(slice, k, search_k);
+        }
+
+        let query_vec: Vec<T> = query_row.iter().cloned().collect();
+        self.query(&query_vec, k, search_k)
+    }
+
+    /// Generate kNN graph from vectors stored in the index
+    ///
+    /// Queries each vector in the index against itself to build a complete
+    /// kNN graph.
+    ///
+    /// ### Params
+    ///
+    /// * `k` - Number of neighbours per vector
+    /// * `search_k` - Search budget (defaults to k * n_trees * 20 if None)
+    /// * `return_dist` - Whether to return distances
+    ///
+    /// ### Returns
+    ///
+    /// Tuple of `(knn_indices, optional distances)` where each row corresponds
+    /// to a vector in the index
+    pub fn generate_knn(
+        &self,
+        k: usize,
+        search_k: Option<usize>,
+        return_dist: bool,
+        verbose: bool,
+    ) -> (Vec<Vec<usize>>, Option<Vec<Vec<T>>>) {
+        use std::sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        };
+
+        let counter = Arc::new(AtomicUsize::new(0));
+
+        let results: Vec<(Vec<usize>, Vec<T>)> = (0..self.n)
+            .into_par_iter()
+            .map(|i| {
+                let start = i * self.dim;
+                let end = start + self.dim;
+                let vec = &self.vectors_flat[start..end];
+
+                if verbose {
+                    let count = counter.fetch_add(1, Ordering::Relaxed) + 1;
+                    if count.is_multiple_of(100_000) {
+                        println!(
+                            "  Processed {} / {} samples.",
+                            count.separate_with_underscores(),
+                            self.n.separate_with_underscores()
+                        );
+                    }
+                }
+
+                self.query(vec, k, search_k)
+            })
+            .collect();
+
+        if return_dist {
+            let (indices, distances) = results.into_iter().unzip();
+            (indices, Some(distances))
+        } else {
+            let indices: Vec<Vec<usize>> = results.into_iter().map(|(idx, _)| idx).collect();
+            (indices, None)
+        }
+    }
 }
 
 //////////////////////
@@ -709,18 +771,15 @@ impl<T> KnnValidation<T> for AnnoyIndex<T>
 where
     T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum,
 {
-    /// Internal querying function
     fn query_for_validation(&self, query_vec: &[T], k: usize) -> (Vec<usize>, Vec<T>) {
         // Use the default here
         self.query(query_vec, k, None)
     }
 
-    /// Returns n
     fn n(&self) -> usize {
         self.n
     }
 
-    /// Returns the distance metric
     fn metric(&self) -> Dist {
         self.metric
     }
