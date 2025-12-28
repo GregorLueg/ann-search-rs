@@ -76,7 +76,6 @@ where
     /// * `seed` - Random seed
     /// * `verbose` - Print progress
     /// * `device` - GPU device
-    #[allow(clippy::too_many_arguments)]
     pub fn build(
         data: MatRef<T>,
         metric: Dist,
@@ -130,27 +129,48 @@ where
         );
 
         // assign vectors to clusters
-        let assignments = assign_all_parallel(&vectors_flat, dim, n, &centroids, nlist, &metric);
-
-        // reorganise vectors by cluster
-        let (vectors_by_cluster, original_indices, cluster_offsets, norms_by_cluster) =
-            reorganise_by_cluster(&vectors_flat, dim, n, &assignments, nlist, &metric);
-
-        // Compute centroid norms
-        let centroid_norms = if metric == Dist::Cosine {
-            (0..nlist)
+        let data_norms = if metric == Dist::Cosine {
+            (0..n)
                 .map(|i| {
-                    let start = i * dim;
-                    centroids[start..start + dim]
+                    vectors_flat[i * dim..(i + 1) * dim]
                         .iter()
                         .map(|&x| x * x)
                         .sum::<T>()
                         .sqrt()
                 })
-                .collect::<Vec<_>>()
+                .collect()
         } else {
-            Vec::new()
+            vec![T::one(); n]
         };
+
+        let centroid_norms = if metric == Dist::Cosine {
+            (0..nlist)
+                .map(|i| {
+                    centroids[i * dim..(i + 1) * dim]
+                        .iter()
+                        .map(|&x| x * x)
+                        .sum::<T>()
+                        .sqrt()
+                })
+                .collect()
+        } else {
+            vec![T::one(); nlist]
+        };
+
+        let assignments = assign_all_parallel(
+            &vectors_flat,
+            &data_norms,
+            dim,
+            n,
+            &centroids,
+            &centroid_norms,
+            nlist,
+            &metric,
+        );
+
+        // reorganise vectors by cluster
+        let (vectors_by_cluster, original_indices, cluster_offsets, norms_by_cluster) =
+            reorganise_by_cluster(&vectors_flat, dim, n, &assignments, nlist, &metric);
 
         if verbose {
             println!("  Uploading centroids to GPU");
@@ -540,7 +560,19 @@ fn reorganise_by_cluster<T: Float + Copy + Send + Sync + Sum>(
     (vectors_reorg, indices_reorg, offsets, norms_reorg)
 }
 
-/// Invert probe lists: for each cluster, which queries probe it?
+/// Invert probe lists to map clusters to queries
+///
+/// Transforms per-query cluster lists into per-cluster query lists.
+/// Given probe_lists[q] = [c1, c2, ...] returns result[c] = [q1, q2, ...]
+///
+/// ### Params
+///
+/// * `probe_lists` - For each query, which clusters it probes
+/// * `nlist` - Total number of clusters
+///
+/// ### Returns
+///
+/// For each cluster, which queries probe it
 fn invert_probe_lists(probe_lists: &[Vec<usize>], nlist: usize) -> Vec<Vec<usize>> {
     let mut result = vec![Vec::new(); nlist];
     for (query_idx, probes) in probe_lists.iter().enumerate() {
@@ -551,7 +583,21 @@ fn invert_probe_lists(probe_lists: &[Vec<usize>], nlist: usize) -> Vec<Vec<usize
     result
 }
 
-/// Process distances from one cluster and update heaps
+/// Process cluster search results and update per-query heaps
+///
+/// Takes distance matrix from a batched cluster search and updates the
+/// k-NN heaps for each query. Only retains the k closest neighbours seen
+/// so far across all processed clusters.
+///
+/// ### Params
+///
+/// * `distances` - Distance matrix [n_queries, cluster_size]
+/// * `query_indices` - Global query indices for this batch
+/// * `cluster_idx` - Index of the cluster being processed
+/// * `original_indices` - Maps reorganised position -> original database index
+/// * `cluster_offsets` - CSR offsets for clusters
+/// * `k` - Number of neighbours to retain
+/// * `heaps` - Per-query max-heaps storing current k-NN candidates
 fn process_cluster_results<T: Float>(
     distances: &[T],
     query_indices: &[usize],

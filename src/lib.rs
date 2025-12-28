@@ -178,6 +178,82 @@ where
     }
 }
 
+////////////////
+// Exhaustive //
+////////////////
+
+/// Build an exhaustive index
+///
+/// ### Params
+///
+/// * `mat` - The initial matrix with samples x features
+/// * `dist_metric` - Distance metric: "euclidean" or "cosine"
+///
+/// ### Returns
+///
+/// The initialised `ExhausiveIndex`
+pub fn build_exhaustive_index<T>(mat: MatRef<T>, dist_metric: &str) -> ExhaustiveIndex<T>
+where
+    T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum,
+{
+    let metric = parse_ann_dist(dist_metric).unwrap_or_default();
+    ExhaustiveIndex::new(mat, metric)
+}
+
+/// Helper function to query a given exhaustive index
+///
+/// ### Params
+///
+/// * `query_mat` - The query matrix containing the samples × features
+/// * `index` - The exhaustive index
+/// * `k` - Number of neighbours to return
+/// * `return_dist` - Shall the distances be returned
+/// * `verbose` - Controls verbosity of the function
+///
+/// ### Returns
+///
+/// A tuple of `(knn_indices, optional distances)`
+pub fn query_exhaustive_index<T>(
+    query_mat: MatRef<T>,
+    index: &ExhaustiveIndex<T>,
+    k: usize,
+    return_dist: bool,
+    verbose: bool,
+) -> (Vec<Vec<usize>>, Option<Vec<Vec<T>>>)
+where
+    T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum,
+{
+    query_parallel(query_mat.nrows(), return_dist, verbose, |i| {
+        index.query_row(query_mat.row(i), k)
+    })
+}
+
+/// Helper function to self query an exhaustive index
+///
+/// This function will generate a full kNN graph based on the internal data.
+///
+/// ### Params
+///
+/// * `index` - The exhaustive index
+/// * `k` - Number of neighbours to return
+/// * `return_dist` - Shall the distances be returned
+/// * `verbose` - Controls verbosity of the function
+///
+/// ### Returns
+///
+/// A tuple of `(knn_indices, optional distances)`
+pub fn query_exhaustive_self<T>(
+    index: &ExhaustiveIndex<T>,
+    k: usize,
+    return_dist: bool,
+    verbose: bool,
+) -> (Vec<Vec<usize>>, Option<Vec<Vec<T>>>)
+where
+    T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum,
+{
+    index.generate_knn(k, return_dist, verbose)
+}
+
 ///////////
 // Annoy //
 ///////////
@@ -237,6 +313,35 @@ where
     query_parallel(query_mat.nrows(), return_dist, verbose, |i| {
         index.query_row(query_mat.row(i), k, search_budget)
     })
+}
+
+/// Helper function to self query the Annoy index
+///
+/// This function will generate a full kNN graph based on the internal data.
+///
+/// ### Params
+///
+/// * `k` - Number of neighbours to return
+/// * `index` - The AnnoyIndex to query.
+/// * `search_budget` - Search budget per tree
+/// * `return_dist` - Shall the distances between the different points be
+///   returned
+/// * `verbose` - Controls verbosity of the function
+///
+/// ### Returns
+///
+/// A tuple of `(knn_indices, optional distances)`
+pub fn query_annoy_self<T>(
+    index: &AnnoyIndex<T>,
+    k: usize,
+    search_budget: Option<usize>,
+    return_dist: bool,
+    verbose: bool,
+) -> (Vec<Vec<usize>>, Option<Vec<Vec<T>>>)
+where
+    T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum,
+{
+    index.generate_knn(k, search_budget, return_dist, verbose)
 }
 
 //////////
@@ -309,6 +414,245 @@ where
     query_parallel(query_mat.nrows(), return_dist, verbose, |i| {
         index.query_row(query_mat.row(i), k, ef_search)
     })
+}
+
+/// Helper function to self query the HNSW index
+///
+/// This function will generate a full kNN graph based on the internal data.
+///
+/// ### Params
+///
+/// * `k` - Number of neighbours to return
+/// * `index` - Reference to the built HNSW index
+/// * `k` - Number of neighbours to return
+/// * `ef_search` - Size of candidate list during search (higher = better
+///   recall, slower)
+/// * `return_dist` - Shall the distances between the different points be
+///   returned
+/// * `verbose` - Print progress information
+///
+/// ### Returns
+///
+/// A tuple of `(knn_indices, optional distances)`
+pub fn query_hnsw_self<T>(
+    index: &HnswIndex<T>,
+    k: usize,
+    ef_search: usize,
+    return_dist: bool,
+    verbose: bool,
+) -> (Vec<Vec<usize>>, Option<Vec<Vec<T>>>)
+where
+    T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum,
+    HnswIndex<T>: HnswState<T>,
+{
+    index.generate_knn(k, ef_search, return_dist, verbose)
+}
+
+/////////
+// IVF //
+/////////
+
+/// Build an IVF index
+///
+/// ### Params
+///
+/// * `mat` - The data matrix. Rows represent the samples, columns represent
+///   the embedding dimensions
+/// * `nlist` - Number of clusters to create
+/// * `max_iters` - Maximum k-means iterations (defaults to 30 if None)
+/// * `dist_metric` - The distance metric to use. One of `"euclidean"` or
+///   `"cosine"`
+/// * `seed` - Random seed for reproducibility
+/// * `verbose` - Print progress information during index construction
+///
+/// ### Return
+///
+/// The `IvfIndex`.
+pub fn build_ivf_index<T>(
+    mat: MatRef<T>,
+    nlist: Option<usize>,
+    max_iters: Option<usize>,
+    dist_metric: &str,
+    seed: usize,
+    verbose: bool,
+) -> IvfIndex<T>
+where
+    T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum,
+{
+    let ann_dist = parse_ann_dist(dist_metric).unwrap_or_default();
+
+    IvfIndex::build(mat, ann_dist, nlist, max_iters, seed, verbose)
+}
+
+/// Helper function to query a given IVF index
+///
+/// ### Params
+///
+/// * `query_mat` - The query matrix containing the samples x features
+/// * `index` - Reference to the built IVF index
+/// * `k` - Number of neighbours to return
+/// * `nprobe` - Number of clusters to search (defaults to min(nlist/10, 10))
+///   Higher values improve recall at the cost of speed
+/// * `return_dist` - Shall the distances between the different points be
+///   returned
+/// * `verbose` - Print progress information
+///
+/// ### Returns
+///
+/// A tuple of `(knn_indices, optional distances)`
+///
+/// ### Note
+///
+/// The distance metric is determined at index build time and cannot be changed
+/// during querying.
+pub fn query_ivf_index<T>(
+    query_mat: MatRef<T>,
+    index: &IvfIndex<T>,
+    k: usize,
+    nprobe: Option<usize>,
+    return_dist: bool,
+    verbose: bool,
+) -> (Vec<Vec<usize>>, Option<Vec<Vec<T>>>)
+where
+    T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum,
+{
+    query_parallel(query_mat.nrows(), return_dist, verbose, |i| {
+        index.query_row(query_mat.row(i), k, nprobe)
+    })
+}
+
+/// Helper function to self query an IVF index
+///
+/// This function will generate a full kNN graph based on the internal data. To
+/// accelerate the process, it will leverage the information on the Voronoi
+/// cells under the hood and query nearby cells per given internal vector.
+///
+/// ### Params
+///
+/// * `query_mat` - The query matrix containing the samples x features
+/// * `index` - Reference to the built IVF index
+/// * `k` - Number of neighbours to return
+/// * `nprobe` - Number of clusters to search (defaults to min(nlist/10, 10))
+///   Higher values improve recall at the cost of speed
+/// * `return_dist` - Shall the distances between the different points be
+///   returned
+/// * `verbose` - Print progress information
+///
+/// ### Returns
+///
+/// A tuple of `(knn_indices, optional distances)`
+///
+/// ### Note
+///
+/// The distance metric is determined at index build time and cannot be changed
+/// during querying.
+pub fn query_ivf_self<T>(
+    index: &IvfIndex<T>,
+    k: usize,
+    nprobe: Option<usize>,
+    return_dist: bool,
+    verbose: bool,
+) -> (Vec<Vec<usize>>, Option<Vec<Vec<T>>>)
+where
+    T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum,
+{
+    index.generate_knn(k, nprobe, return_dist, verbose)
+}
+
+/////////
+// LSH //
+/////////
+
+/// Build the LSH index
+///
+/// ### Params
+///
+/// * `mat` - The initial matrix with samples x features
+/// * `dist_metric` - Distance metric: "euclidean" or "cosine"
+/// * `num_tables` - Number of HashMaps to use (usually something 20 to 100)
+/// * `bits_per_hash` - How many bits per hash. Lower values (8) usually yield
+///   better Recall with higher query time; higher values (16) have worse Recall
+///   but faster query time
+/// * `seed` - Random seed for reproducibility
+///
+/// ### Returns
+///
+/// The ready LSH index for querying
+pub fn build_lsh_index<T>(
+    mat: MatRef<T>,
+    dist_metric: &str,
+    num_tables: usize,
+    bits_per_hash: usize,
+    seed: usize,
+) -> LSHIndex<T>
+where
+    T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum,
+    LSHIndex<T>: LSHQuery<T>,
+{
+    let metric = parse_ann_dist(dist_metric).unwrap_or_default();
+    LSHIndex::new(mat, metric, num_tables, bits_per_hash, seed)
+}
+
+/// Helper function to query a given LSH index
+///
+/// This function will generate a full kNN graph based on the internal data.
+///
+/// ### Params
+///
+/// * `query_mat` - The query matrix containing the samples × features
+/// * `index` - The LSH index
+/// * `k` - Number of neighbours to return
+/// * `max_candidates` - Optional number to limit the candidate selection per
+///   given table. Makes the querying faster at cost of Recall.
+/// * `return_dist` - Shall the distances be returned
+/// * `verbose` - Controls verbosity of the function
+///
+/// ### Returns
+///
+/// A tuple of `(knn_indices, optional distances)`
+pub fn query_lsh_index<T>(
+    query_mat: MatRef<T>,
+    index: &LSHIndex<T>,
+    k: usize,
+    max_candidates: Option<usize>,
+    return_dist: bool,
+    verbose: bool,
+) -> (Vec<Vec<usize>>, Option<Vec<Vec<T>>>)
+where
+    T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum,
+    LSHIndex<T>: LSHQuery<T>,
+{
+    query_parallel_with_flags(query_mat.nrows(), return_dist, verbose, |i| {
+        index.query_row(query_mat.row(i), k, max_candidates)
+    })
+}
+
+/// Helper function to self query an LSH index
+///
+/// ### Params
+///
+/// * `index` - The LSH index
+/// * `k` - Number of neighbours to return
+/// * `max_candidates` - Optional number to limit the candidate selection per
+///   given table. Makes the querying faster at cost of Recall.
+/// * `return_dist` - Shall the distances be returned
+/// * `verbose` - Controls verbosity of the function
+///
+/// ### Returns
+///
+/// A tuple of `(knn_indices, optional distances)`
+pub fn query_lsh_self<T>(
+    index: &LSHIndex<T>,
+    k: usize,
+    max_candidates: Option<usize>,
+    return_dist: bool,
+    verbose: bool,
+) -> (Vec<Vec<usize>>, Option<Vec<Vec<T>>>)
+where
+    T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum,
+    LSHIndex<T>: LSHQuery<T>,
+{
+    index.generate_knn(k, max_candidates, return_dist, verbose)
 }
 
 ///////////////
@@ -406,165 +750,15 @@ where
     })
 }
 
-////////////////
-// Exhaustive //
-////////////////
-
-/// Build an exhaustive index
+/// Helper function to self query the NNDescent index
+///
+/// This function will generate a full kNN graph based on the internal data.
 ///
 /// ### Params
 ///
-/// * `mat` - The initial matrix with samples x features
-/// * `dist_metric` - Distance metric: "euclidean" or "cosine"
-///
-/// ### Returns
-///
-/// The initialised `ExhausiveIndex`
-pub fn build_exhaustive_index<T>(mat: MatRef<T>, dist_metric: &str) -> ExhaustiveIndex<T>
-where
-    T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum,
-{
-    let metric = parse_ann_dist(dist_metric).unwrap_or_default();
-    ExhaustiveIndex::new(mat, metric)
-}
-
-/// Query the exhaustive index
-///
-/// ### Params
-///
-/// * `query_mat` - The query matrix containing the samples × features
-/// * `index` - The exhaustive index
+/// * `index` - Reference to the built NNDescent index
 /// * `k` - Number of neighbours to return
-/// * `return_dist` - Shall the distances be returned
-/// * `verbose` - Controls verbosity of the function
-///
-/// ### Returns
-///
-/// A tuple of `(knn_indices, optional distances)`
-pub fn query_exhaustive_index<T>(
-    query_mat: MatRef<T>,
-    index: &ExhaustiveIndex<T>,
-    k: usize,
-    return_dist: bool,
-    verbose: bool,
-) -> (Vec<Vec<usize>>, Option<Vec<Vec<T>>>)
-where
-    T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum,
-{
-    query_parallel(query_mat.nrows(), return_dist, verbose, |i| {
-        index.query_row(query_mat.row(i), k)
-    })
-}
-
-/////////
-// LSH //
-/////////
-
-/// Build the LSH index
-///
-/// ### Params
-///
-/// * `mat` - The initial matrix with samples x features
-/// * `dist_metric` - Distance metric: "euclidean" or "cosine"
-/// * `num_tables` - Number of HashMaps to use (usually something 20 to 100)
-/// * `bits_per_hash` - How many bits per hash. Lower values (8) usually yield
-///   better Recall with higher query time; higher values (16) have worse Recall
-///   but faster query time
-/// * `seed` - Random seed for reproducibility
-///
-/// ### Returns
-///
-/// The ready LSH index for querying
-pub fn build_lsh_index<T>(
-    mat: MatRef<T>,
-    dist_metric: &str,
-    num_tables: usize,
-    bits_per_hash: usize,
-    seed: usize,
-) -> LSHIndex<T>
-where
-    T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum,
-    LSHIndex<T>: LSHQuery<T>,
-{
-    let metric = parse_ann_dist(dist_metric).unwrap_or_default();
-    LSHIndex::new(mat, metric, num_tables, bits_per_hash, seed)
-}
-
-/// Query the exhaustive index
-///
-/// ### Params
-///
-/// * `query_mat` - The query matrix containing the samples × features
-/// * `index` - The exhaustive index
-/// * `k` - Number of neighbours to return
-/// * `return_dist` - Shall the distances be returned
-/// * `verbose` - Controls verbosity of the function
-///
-/// ### Returns
-///
-/// A tuple of `(knn_indices, optional distances)`
-pub fn query_lsh_index<T>(
-    query_mat: MatRef<T>,
-    index: &LSHIndex<T>,
-    k: usize,
-    max_candidates: Option<usize>,
-    return_dist: bool,
-    verbose: bool,
-) -> (Vec<Vec<usize>>, Option<Vec<Vec<T>>>)
-where
-    T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum,
-    LSHIndex<T>: LSHQuery<T>,
-{
-    query_parallel_with_flags(query_mat.nrows(), return_dist, verbose, |i| {
-        index.query_row(query_mat.row(i), k, max_candidates)
-    })
-}
-
-/////////
-// IVF //
-/////////
-
-/// Build an IVF index
-///
-/// ### Params
-///
-/// * `mat` - The data matrix. Rows represent the samples, columns represent
-///   the embedding dimensions
-/// * `nlist` - Number of clusters to create
-/// * `max_iters` - Maximum k-means iterations (defaults to 30 if None)
-/// * `dist_metric` - The distance metric to use. One of `"euclidean"` or
-///   `"cosine"`
-/// * `seed` - Random seed for reproducibility
-/// * `verbose` - Print progress information during index construction
-///
-/// ### Return
-///
-/// The `IvfIndex`.
-pub fn build_ivf_index<T>(
-    mat: MatRef<T>,
-    nlist: Option<usize>,
-    max_iters: Option<usize>,
-    dist_metric: &str,
-    seed: usize,
-    verbose: bool,
-) -> IvfIndex<T>
-where
-    T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum,
-{
-    let ann_dist = parse_ann_dist(dist_metric).unwrap_or_default();
-
-    IvfIndex::build(mat, ann_dist, nlist, max_iters, seed, verbose)
-}
-
-/// Helper function to query a given IVF index
-///
-/// ### Params
-///
-/// * `query_mat` - The query matrix containing the samples x features
-/// * `index` - Reference to the built IVF index
-/// * `k` - Number of neighbours to return
-/// * `nprobe` - Number of clusters to search (defaults to min(nlist/10, 10))
-///   Higher values improve recall at the cost of speed
+/// * `ef_search` -
 /// * `return_dist` - Shall the distances between the different points be
 ///   returned
 /// * `verbose` - Print progress information
@@ -577,20 +771,19 @@ where
 ///
 /// The distance metric is determined at index build time and cannot be changed
 /// during querying.
-pub fn query_ivf_index<T>(
-    query_mat: MatRef<T>,
-    index: &IvfIndex<T>,
+pub fn query_nndescent_self<T>(
+    index: &NNDescent<T>,
     k: usize,
-    nprobe: Option<usize>,
+    ef_search: Option<usize>,
     return_dist: bool,
     verbose: bool,
 ) -> (Vec<Vec<usize>>, Option<Vec<Vec<T>>>)
 where
     T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum,
+    NNDescent<T>: ApplySortedUpdates<T>,
+    NNDescent<T>: NNDescentQuery<T>,
 {
-    query_parallel(query_mat.nrows(), return_dist, verbose, |i| {
-        index.query_row(query_mat.row(i), k, nprobe)
-    })
+    index.generate_knn(k, ef_search, return_dist, verbose)
 }
 
 ///////////////
@@ -667,6 +860,39 @@ where
     query_parallel(query_mat.nrows(), return_dist, verbose, |i| {
         index.query_row(query_mat.row(i), k, nprobe)
     })
+}
+
+#[cfg(feature = "quantised")]
+/// Helper function to self query a given IVF-SQ8 index
+///
+/// This function will generate a full kNN graph based on the internal data. To
+/// accelerate the process, it will leverage the internally quantised vectors
+/// and the information on the Voronoi cells under the hood and query nearby
+/// cells per given internal vector.
+///
+/// ### Params
+///
+/// * `index` - Reference to the built IVF-SQ8 index
+/// * `k` - Number of neighbours to return
+/// * `nprobe` - Number of clusters to search (defaults to 20% of nlist)
+///   Higher values improve recall at the cost of speed
+/// * `return_dist` - Shall the inner product scores be returned
+/// * `verbose` - Print progress information
+///
+/// ### Returns
+///
+/// A tuple of `(knn_indices, optional inner_product_scores)`
+pub fn query_ivf_sq8_self<T>(
+    index: &IvfSq8Index<T>,
+    k: usize,
+    nprobe: Option<usize>,
+    return_dist: bool,
+    verbose: bool,
+) -> (Vec<Vec<usize>>, Option<Vec<Vec<T>>>)
+where
+    T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum,
+{
+    index.generate_knn(k, nprobe, return_dist, verbose)
 }
 
 ////////////
@@ -751,6 +977,41 @@ where
     })
 }
 
+#[cfg(feature = "quantised")]
+/// Helper function to self query a IVF-PQ index
+///
+/// This function will generate a full kNN graph based on the internal data. To
+/// accelerate the process, it will leverage the internally quantised vectors
+/// and the information on the Voronoi cells under the hood and query nearby
+/// cells per given internal vector. It will use symmetric distance computations
+/// (SDCs) which are accurate for within cluster comparison and approximate
+/// for outside cluster calculations.
+///
+/// ### Params
+///
+/// * `index` - Reference to the built IVF-PQ index
+/// * `k` - Number of neighbours to return
+/// * `nprobe` - Number of clusters to search (defaults to 15% of nlist)
+///   Higher values improve recall at the cost of speed
+/// * `return_dist` - Shall the distances be returned
+/// * `verbose` - Print progress information
+///
+/// ### Returns
+///
+/// A tuple of `(knn_indices, optional distances)`
+pub fn query_ivf_pq_index_self<T>(
+    index: &IvfPqIndex<T>,
+    k: usize,
+    nprobe: Option<usize>,
+    return_dist: bool,
+    verbose: bool,
+) -> (Vec<Vec<usize>>, Option<Vec<Vec<T>>>)
+where
+    T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum,
+{
+    index.generate_knn(k, nprobe, return_dist, verbose)
+}
+
 /////////////
 // IVF-OPQ //
 /////////////
@@ -833,6 +1094,41 @@ where
     query_parallel(query_mat.nrows(), return_dist, verbose, |i| {
         index.query_row(query_mat.row(i), k, nprobe)
     })
+}
+
+#[cfg(feature = "quantised")]
+/// Helper function to self query a IVF-OPQ index
+///
+/// This function will generate a full kNN graph based on the internal data. To
+/// accelerate the process, it will leverage the internally quantised vectors
+/// and the information on the Voronoi cells under the hood and query nearby
+/// cells per given internal vector. It will use symmetric distance computations
+/// (SDCs) which are accurate for within cluster comparison and approximate
+/// for outside cluster calculations.
+///
+/// ### Params
+///
+/// * `index` - Reference to the built IVF-OPQ index
+/// * `k` - Number of neighbours to return
+/// * `nprobe` - Number of clusters to search (defaults to 15% of nlist)
+///   Higher values improve recall at the cost of speed
+/// * `return_dist` - Shall the distances be returned
+/// * `verbose` - Print progress information
+///
+/// ### Returns
+///
+/// A tuple of `(knn_indices, optional distances)`
+pub fn query_ivf_opq_index_self<T>(
+    index: &IvfOpqIndex<T>,
+    k: usize,
+    nprobe: Option<usize>,
+    return_dist: bool,
+    verbose: bool,
+) -> (Vec<Vec<usize>>, Option<Vec<Vec<T>>>)
+where
+    T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum + AddAssign,
+{
+    index.generate_knn(k, nprobe, return_dist, verbose)
 }
 
 /////////

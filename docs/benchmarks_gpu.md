@@ -14,7 +14,7 @@ reaches very fast speeds here, but not much faster actually than the IVF-CPU
 version. Due to the current implementation, there is quite a bit of overhead
 in copying data from CPU to GPU during individual kernel launches. The 
 advantages of the GPU versions are stronger when querying more samples at
-higher dimensionality, see next section.
+higher dimensionality and more samples, see next section.
 
 **Euclidean:**
 
@@ -65,7 +65,7 @@ IVF-GPU-kNN-nl547-np54                   7799.18      5778.40     13577.59      
 
 In this case, the IVF CPU implementation is being compared against the GPU 
 version. GPU acceleration shines with larger data sets and larger dimensions, 
-hence, the number of samples was increased to 250_000 and dimensions to 48 for 
+hence, the number of samples was increased to 250_000 and dimensions to 64 for 
 these benchmarks.
 
 **IVF CPU:**
@@ -111,11 +111,63 @@ IVF-GPU-kNN-nl707-np37                  15065.30     10617.65     25682.96      
 ----------------------------------------------------------------------------------------------------
 ```
 
+The results here are more favourable of the GPU acceleration. We go from 170
+seconds with exhaustive search on CPU to ~48 seconds on GPU; if using IVF, we
+can reduce at the fastest settings the time from ~35 seconds on CPU to ~16 
+seconds on GPU. This gives us a total acceleration of 
+**170 seconds *(exhaustive on CPU)* to 16 seconds *(IVF on GPU)***, a 10x 
+acceleration while having a Recall ≥ 0.97. Results are becoming even more 
+pronounced with more cells.
+
+**IVF CPU (more cells):**
+
+```
+====================================================================================================
+Benchmark: 500k cells, 64D
+====================================================================================================
+Method                                Build (ms)   Query (ms)   Total (ms)     Recall@k   Dist Error
+----------------------------------------------------------------------------------------------------
+Exhaustive                                 22.97    676239.91    676262.88       1.0000     0.000000
+IVF-nl500-np22                          20942.65    120145.16    141087.81       0.9747     0.211297
+IVF-nl500-np25                          20942.65    135705.63    156648.28       0.9885     0.091280
+IVF-nl500-np31                          20942.65    169026.13    189968.78       0.9994     0.005102
+IVF-nl707-np26                          29563.90    102623.66    132187.57       0.9549     0.364671
+IVF-nl707-np35                          29563.90    138084.40    167648.30       0.9902     0.069567
+IVF-nl707-np37                          29563.90    144369.77    173933.67       0.9938     0.042671
+IVF-nl1000-np31                         41588.25     87036.56    128624.81       0.9276     0.600609
+IVF-nl1000-np44                         41588.25    121261.59    162849.84       0.9811     0.135394
+IVF-nl1000-np50                         41588.25    138448.53    180036.78       0.9910     0.060453
+----------------------------------------------------------------------------------------------------
+```
+
+**IVF GPU (more cells)**
+
+```
+====================================================================================================
+Benchmark: 500k cells, 64D (CPU vs GPU Exhaustive vs IVF-GPU)
+====================================================================================================
+Method                                Build (ms)   Query (ms)   Total (ms)     Recall@k   Dist Error
+----------------------------------------------------------------------------------------------------
+CPU-Exhaustive                             23.38    675656.14    675679.52       1.0000     0.000000
+GPU-Exhaustive                             21.19    191814.09    191835.27       1.0000     0.000005
+IVF-GPU-kNN-nl500-np22                  20887.08     26795.66     47682.74       0.9747     0.211300
+IVF-GPU-kNN-nl500-np25                  20887.08     29818.20     50705.29       0.9885     0.091284
+IVF-GPU-kNN-nl500-np31                  20887.08     35783.17     56670.26       0.9994     0.005107
+IVF-GPU-kNN-nl707-np26                  29621.14     23818.10     53439.24       0.9549     0.364655
+IVF-GPU-kNN-nl707-np35                  29621.14     31119.45     60740.59       0.9902     0.069590
+IVF-GPU-kNN-nl707-np37                  29621.14     32673.51     62294.66       0.9938     0.042676
+IVF-GPU-kNN-nl1000-np31                 41618.89     22620.53     64239.42       0.9276     0.600433
+IVF-GPU-kNN-nl1000-np44                 41618.89     28410.96     70029.85       0.9811     0.135380
+IVF-GPU-kNN-nl1000-np50                 41618.89     31406.06     73024.95       0.9910     0.060457
+----------------------------------------------------------------------------------------------------
+```
+
 ### Higher dimensionality
 
 With even higher dimensionality, we can observe the advantage of the GPU-accelerated
 versions. Particularly, the difference in the exhaustive search is already very
-impressive with a 7x increase in querying speed.
+impressive with a 7x increase in querying speed. Basically, the more dimensions
+you are dealing with, the better the GPU acceleration works.
 
 ```
 ====================================================================================================
@@ -123,19 +175,16 @@ Benchmark: 150k cells, 128D (CPU vs GPU Exhaustive vs IVF-GPU)
 ====================================================================================================
 Method                                Build (ms)   Query (ms)   Total (ms)     Recall@k   Dist Error
 ----------------------------------------------------------------------------------------------------
-CPU-Exhaustive                             15.25    194745.13    194760.37       1.0000     0.000000
-GPU-Exhaustive                             17.07     26365.08     26382.14       1.0000     0.000003
-IVF-GPU-kNN-nl273-np13                   9825.64      4803.13     14628.77       0.9957     0.018317
-IVF-GPU-kNN-nl273-np16                   9825.64      5401.57     15227.21       0.9993     0.002087
-IVF-GPU-kNN-nl273-np23                   9825.64      7152.16     16977.80       1.0000     0.000003
-IVF-GPU-kNN-nl273-np27                   9825.64      7927.21     17752.85       1.0000     0.000003
-IVF-GPU-kNN-nl387-np19                  14274.27      5790.95     20065.22       0.9981     0.009822
-IVF-GPU-kNN-nl387-np27                  14274.27      7187.35     21461.62       1.0000     0.000003
-IVF-GPU-kNN-nl387-np38                  14274.27      9105.42     23379.69       1.0000     0.000003
-IVF-GPU-kNN-nl547-np23                  19754.76      5949.04     25703.80       0.9961     0.019664
-IVF-GPU-kNN-nl547-np27                  19754.76      6208.95     25963.71       0.9989     0.004980
-IVF-GPU-kNN-nl547-np33                  19754.76      7175.23     26929.99       0.9999     0.000131
-IVF-GPU-kNN-nl547-np54                  19754.76     10194.08     29948.84       1.0000     0.000003
+CPU-Exhaustive                             16.35    176066.56    176082.90       1.0000     0.000000
+GPU-Exhaustive                             15.10     25935.82     25950.93       1.0000     0.000003
+IVF-GPU-kNN-nl273-np13                   9980.38      4755.05     14735.43       0.9957     0.018309
+IVF-GPU-kNN-nl273-np16                   9980.38      5383.63     15364.00       0.9993     0.002087
+IVF-GPU-kNN-nl273-np23                   9980.38      7338.52     17318.90       1.0000     0.000003
+IVF-GPU-kNN-nl387-np19                  14234.64      5642.01     19876.65       0.9981     0.009823
+IVF-GPU-kNN-nl387-np27                  14234.64      6955.58     21190.22       1.0000     0.000003
+IVF-GPU-kNN-nl547-np23                  20161.21      5964.91     26126.12       0.9961     0.019722
+IVF-GPU-kNN-nl547-np27                  20161.21      6421.80     26583.01       0.9989     0.004981
+IVF-GPU-kNN-nl547-np33                  20161.21      7179.69     27340.90       0.9999     0.000131
 ----------------------------------------------------------------------------------------------------
 ```
 

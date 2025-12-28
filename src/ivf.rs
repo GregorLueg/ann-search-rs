@@ -124,7 +124,7 @@ where
     /// * `data` - Matrix reference with vectors as rows (n × dim)
     /// * `metric` - Distance metric (Euclidean or Cosine)
     /// * `nlist` - Optional number of clusters. Defaults to `sqrt(n)`.
-    /// * `max_iters` - Maximum k-means iterations (defaults to `30`)
+    /// * `max_iters` - Optional maximum k-means iterations (defaults to `30`).
     /// * `seed` - Random seed for reproducibility
     /// * `verbose` - Print training progress
     ///
@@ -205,7 +205,22 @@ where
         };
 
         // 3. assign the Rest
-        let assignments = assign_all_parallel(&vectors_flat, dim, n, &centroids, nlist, &metric);
+        let data_norms_for_assignment = if metric == Dist::Cosine {
+            norms.clone()
+        } else {
+            vec![T::one(); n]
+        };
+
+        let assignments = assign_all_parallel(
+            &vectors_flat,
+            &data_norms_for_assignment,
+            dim,
+            n,
+            &centroids,
+            &centroids_norm,
+            nlist,
+            &metric,
+        );
 
         // 4. generate a flat version for better cache locality
         let (all_indices, offsets) = build_csr_layout(assignments, n, nlist);
@@ -320,16 +335,14 @@ where
     /// Generate kNN graph from vectors stored in the index
     ///
     /// Queries each vector in the index against itself to build a complete
-    /// kNN graph. Leverages the information of the Voronoi cells under the hood
-    /// and queries neighbouring cells for each index element.
+    /// kNN graph.
     ///
     /// ### Params
     ///
     /// * `k` - Number of neighbours per vector
-    /// * `nprobe` - Optional number of lists to probe. If not provided,
-    ///   defaults to `sqrt(n_list)`.
-    /// * `return_dist` - Whether to return distances.
-    /// * `verbose` - Controls verbosity.
+    /// * `nprobe` - Number of clusters to search (defaults to sqrt(nlist) if None)
+    /// * `return_dist` - Whether to return distances
+    /// * `verbose` - Controls verbosity
     ///
     /// ### Returns
     ///
@@ -342,99 +355,14 @@ where
         return_dist: bool,
         verbose: bool,
     ) -> (Vec<Vec<usize>>, Option<Vec<Vec<T>>>) {
-        let nprobe = nprobe
-            .unwrap_or_else(|| ((self.nlist as f64).sqrt() as usize).max(1))
-            .min(self.nlist);
-
-        // build reverse mapping: vector_idx -> cluster_idx
-        let mut vec_to_cluster = vec![0; self.n];
-        for cluster_idx in 0..self.nlist {
-            let start = self.offsets[cluster_idx];
-            let end = self.offsets[cluster_idx + 1];
-            for &vec_idx in &self.all_indices[start..end] {
-                vec_to_cluster[vec_idx] = cluster_idx;
-            }
-        }
-
-        // pre-compute cluster neighbours: i.e., for each cluster, which other
-        // clusters to search
-        let cluster_neighbours: Vec<Vec<usize>> = (0..self.nlist)
-            .into_par_iter()
-            .map(|cluster_idx| {
-                let centroid_start = cluster_idx * self.dim;
-                let centroid = &self.centroids[centroid_start..centroid_start + self.dim];
-                let centroid_norm = if matches!(self.metric, Dist::Cosine) {
-                    self.centroids_norm[cluster_idx]
-                } else {
-                    T::one()
-                };
-
-                let mut dists: Vec<(T, usize)> = (0..self.nlist)
-                    .map(|other_idx| {
-                        let other_start = other_idx * self.dim;
-                        let other_centroid = &self.centroids[other_start..other_start + self.dim];
-                        let dist = match self.metric {
-                            Dist::Euclidean => centroid
-                                .iter()
-                                .zip(other_centroid.iter())
-                                .map(|(&a, &b)| (a - b) * (a - b))
-                                .fold(T::zero(), |acc, x| acc + x)
-                                .sqrt(),
-                            Dist::Cosine => {
-                                let dot = centroid
-                                    .iter()
-                                    .zip(other_centroid.iter())
-                                    .map(|(&a, &b)| a * b)
-                                    .fold(T::zero(), |acc, x| acc + x);
-                                T::one() - dot / (centroid_norm * self.centroids_norm[other_idx])
-                            }
-                        };
-                        (dist, other_idx)
-                    })
-                    .collect();
-
-                dists.sort_unstable_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
-                dists.into_iter().take(nprobe).map(|(_, idx)| idx).collect()
-            })
-            .collect();
-
         let counter = Arc::new(AtomicUsize::new(0));
 
         let results: Vec<(Vec<usize>, Vec<T>)> = (0..self.n)
             .into_par_iter()
             .map(|i| {
-                let vec_start = i * self.dim;
-                let query_vec = &self.vectors_flat[vec_start..vec_start + self.dim];
-                let my_cluster = vec_to_cluster[i];
-
-                let query_norm = if matches!(self.metric, Dist::Cosine) {
-                    self.norms[i]
-                } else {
-                    T::one()
-                };
-
-                let mut buffer = SortedBuffer::with_capacity(k);
-
-                // search precomputed neighbouring clusters
-                for &cluster_idx in &cluster_neighbours[my_cluster] {
-                    let start = self.offsets[cluster_idx];
-                    let end = self.offsets[cluster_idx + 1];
-
-                    for &vec_idx in &self.all_indices[start..end] {
-                        if vec_idx == i {
-                            continue; // Skip self
-                        }
-
-                        let dist = match self.metric {
-                            Dist::Euclidean => self.euclidean_distance_to_query(vec_idx, query_vec),
-                            Dist::Cosine => {
-                                self.cosine_distance_to_query(vec_idx, query_vec, query_norm)
-                            }
-                        };
-
-                        buffer.insert((OrderedFloat(dist), vec_idx), k);
-                    }
-                }
+                let start = i * self.dim;
+                let end = start + self.dim;
+                let vec = &self.vectors_flat[start..end];
 
                 if verbose {
                     let count = counter.fetch_add(1, Ordering::Relaxed) + 1;
@@ -447,8 +375,7 @@ where
                     }
                 }
 
-                let (distances, indices) = buffer.data().iter().map(|(d, idx)| (d.0, *idx)).unzip();
-                (indices, distances)
+                self.query(vec, k, nprobe)
             })
             .collect();
 
@@ -456,7 +383,7 @@ where
             let (indices, distances) = results.into_iter().unzip();
             (indices, Some(distances))
         } else {
-            let indices = results.into_iter().map(|(idx, _)| idx).collect();
+            let indices: Vec<Vec<usize>> = results.into_iter().map(|(idx, _)| idx).collect();
             (indices, None)
         }
     }

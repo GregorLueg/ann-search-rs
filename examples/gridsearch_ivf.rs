@@ -1,6 +1,5 @@
 mod commons;
 
-use ann_search_rs::utils::KnnValidation;
 use ann_search_rs::*;
 use clap::Parser;
 use commons::*;
@@ -39,9 +38,12 @@ fn main() {
             )
         }
     };
-    let query_data = data.as_ref();
+
+    let query_data = subsample_with_noise(&data, DEFAULT_N_QUERY, cli.seed + 1);
+
     let mut results = Vec::new();
 
+    // Exhaustive query benchmark
     println!("Building exhaustive index...");
     let start = Instant::now();
     let exhaustive_idx = build_exhaustive_index(data.as_ref(), &cli.distance);
@@ -50,14 +52,30 @@ fn main() {
     println!("Querying exhaustive index...");
     let start = Instant::now();
     let (true_neighbors, true_distances) =
-        query_exhaustive_index(query_data, &exhaustive_idx, cli.k, true, false);
+        query_exhaustive_index(query_data.as_ref(), &exhaustive_idx, cli.k, true, false);
     let query_time = start.elapsed().as_secs_f64() * 1000.0;
 
     results.push(BenchmarkResult {
-        method: "Exhaustive".to_string(),
+        method: "Exhaustive (query)".to_string(),
         build_time_ms: build_time,
         query_time_ms: query_time,
         total_time_ms: build_time + query_time,
+        recall_at_k: 1.0,
+        mean_dist_err: 0.0,
+    });
+
+    // Exhaustive self-query benchmark
+    println!("Self-querying exhaustive index...");
+    let start = Instant::now();
+    let (true_neighbors_self, true_distances_self) =
+        query_exhaustive_self(&exhaustive_idx, cli.k, true, false);
+    let self_query_time = start.elapsed().as_secs_f64() * 1000.0;
+
+    results.push(BenchmarkResult {
+        method: "Exhaustive (self)".to_string(),
+        build_time_ms: build_time,
+        query_time_ms: self_query_time,
+        total_time_ms: build_time + self_query_time,
         recall_at_k: 1.0,
         mean_dist_err: 0.0,
     });
@@ -69,6 +87,7 @@ fn main() {
         (cli.n_cells as f32).sqrt() as usize,
         (cli.n_cells as f32 * 2.0).sqrt() as usize,
     ];
+
     for nlist in nlist_values {
         println!("Building IVF index (nlist={})...", nlist);
         let start = Instant::now();
@@ -94,15 +113,22 @@ fn main() {
             .collect();
         nprobe_values.sort();
 
-        for nprobe in nprobe_values {
-            if nprobe > nlist || nprobe == 0 {
+        // Query benchmarks
+        for nprobe in &nprobe_values {
+            if *nprobe > nlist || *nprobe == 0 {
                 continue;
             }
 
             println!("Querying IVF index (nlist={}, nprobe={})...", nlist, nprobe);
             let start = Instant::now();
-            let (approx_neighbors, approx_distances) =
-                query_ivf_index(query_data, &ivf_idx, cli.k, Some(nprobe), true, false);
+            let (approx_neighbors, approx_distances) = query_ivf_index(
+                query_data.as_ref(),
+                &ivf_idx,
+                cli.k,
+                Some(*nprobe),
+                true,
+                false,
+            );
             let query_time = start.elapsed().as_secs_f64() * 1000.0;
 
             let recall = calculate_recall(&true_neighbors, &approx_neighbors, cli.k);
@@ -112,11 +138,8 @@ fn main() {
                 cli.k,
             );
 
-            let internal_recall = ivf_idx.validate_index(cli.k, cli.seed as usize, None);
-            println!("  Internal validation: {:.3}", internal_recall);
-
             results.push(BenchmarkResult {
-                method: format!("IVF-nl{}-np{}", nlist, nprobe),
+                method: format!("IVF-nl{}-np{} (query)", nlist, nprobe),
                 build_time_ms: build_time,
                 query_time_ms: query_time,
                 total_time_ms: build_time + query_time,
@@ -124,6 +147,30 @@ fn main() {
                 mean_dist_err: dist_error,
             });
         }
+
+        // Self-query benchmark
+        let nprobe_self = (nlist as f32 * 2.0).sqrt() as usize;
+        println!("Self-querying IVF index (nprobe={})...", nprobe_self);
+        let start = Instant::now();
+        let (approx_neighbors_self, approx_distances_self) =
+            query_ivf_self(&ivf_idx, cli.k, Some(nprobe_self), true, false);
+        let self_query_time = start.elapsed().as_secs_f64() * 1000.0;
+
+        let recall_self = calculate_recall(&true_neighbors_self, &approx_neighbors_self, cli.k);
+        let dist_error_self = calculate_distance_error(
+            true_distances_self.as_ref().unwrap(),
+            approx_distances_self.as_ref().unwrap(),
+            cli.k,
+        );
+
+        results.push(BenchmarkResult {
+            method: format!("IVF-nl{} (self)", nlist),
+            build_time_ms: build_time,
+            query_time_ms: self_query_time,
+            total_time_ms: build_time + self_query_time,
+            recall_at_k: recall_self,
+            mean_dist_err: dist_error_self,
+        });
     }
 
     print_results(

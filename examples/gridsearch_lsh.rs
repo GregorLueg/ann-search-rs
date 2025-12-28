@@ -1,6 +1,5 @@
 mod commons;
 
-use ann_search_rs::utils::KnnValidation;
 use ann_search_rs::*;
 use clap::Parser;
 use commons::*;
@@ -38,9 +37,12 @@ fn main() {
             )
         }
     };
-    let query_data = data.as_ref();
+
+    let query_data = subsample_with_noise(&data, DEFAULT_N_QUERY, cli.seed + 1);
+
     let mut results = Vec::new();
 
+    // Exhaustive query benchmark
     println!("Building exhaustive index...");
     let start = Instant::now();
     let exhaustive_idx = build_exhaustive_index(data.as_ref(), &cli.distance);
@@ -49,14 +51,30 @@ fn main() {
     println!("Querying exhaustive index...");
     let start = Instant::now();
     let (true_neighbors, true_distances) =
-        query_exhaustive_index(query_data, &exhaustive_idx, cli.k, true, false);
+        query_exhaustive_index(query_data.as_ref(), &exhaustive_idx, cli.k, true, false);
     let query_time = start.elapsed().as_secs_f64() * 1000.0;
 
     results.push(BenchmarkResult {
-        method: "Exhaustive".to_string(),
+        method: "Exhaustive (query)".to_string(),
         build_time_ms: build_time,
         query_time_ms: query_time,
         total_time_ms: build_time + query_time,
+        recall_at_k: 1.0,
+        mean_dist_err: 0.0,
+    });
+
+    // Exhaustive self-query benchmark
+    println!("Self-querying exhaustive index...");
+    let start = Instant::now();
+    let (true_neighbors_self, true_distances_self) =
+        query_exhaustive_self(&exhaustive_idx, cli.k, true, false);
+    let self_query_time = start.elapsed().as_secs_f64() * 1000.0;
+
+    results.push(BenchmarkResult {
+        method: "Exhaustive (self)".to_string(),
+        build_time_ms: build_time,
+        query_time_ms: self_query_time,
+        total_time_ms: build_time + self_query_time,
         recall_at_k: 1.0,
         mean_dist_err: 0.0,
     });
@@ -94,12 +112,19 @@ fn main() {
         );
         let build_time = start.elapsed().as_secs_f64() * 1000.0;
 
+        // Query benchmarks
         let search_budgets = [(None, "auto"), (Some(5000), "5k")];
         for (max_cand, cand_label) in search_budgets {
             println!("Querying LSH index (cand={})...", cand_label);
             let start = Instant::now();
-            let (approx_neighbors, approx_distances) =
-                query_lsh_index(query_data, &lsh_index, cli.k, max_cand, true, false);
+            let (approx_neighbors, approx_distances) = query_lsh_index(
+                query_data.as_ref(),
+                &lsh_index,
+                cli.k,
+                max_cand,
+                true,
+                false,
+            );
             let query_time = start.elapsed().as_secs_f64() * 1000.0;
 
             let recall = calculate_recall(&true_neighbors, &approx_neighbors, cli.k);
@@ -109,11 +134,11 @@ fn main() {
                 cli.k,
             );
 
-            let internal_recall = lsh_index.validate_index(cli.k, cli.seed as usize, None);
-            println!("  Internal validation: {:.3}", internal_recall);
-
             results.push(BenchmarkResult {
-                method: format!("LSH-nt{}-nb{}-s:{}", num_tables, bits_per_hash, cand_label),
+                method: format!(
+                    "LSH-nt{}-nb{}-s:{} (query)",
+                    num_tables, bits_per_hash, cand_label
+                ),
                 build_time_ms: build_time,
                 query_time_ms: query_time,
                 total_time_ms: build_time + query_time,
@@ -121,6 +146,29 @@ fn main() {
                 mean_dist_err: dist_error,
             });
         }
+
+        // Self-query benchmark
+        println!("Self-querying LSH index...");
+        let start = Instant::now();
+        let (approx_neighbors_self, approx_distances_self) =
+            query_lsh_self(&lsh_index, cli.k, None, true, false);
+        let self_query_time = start.elapsed().as_secs_f64() * 1000.0;
+
+        let recall_self = calculate_recall(&true_neighbors_self, &approx_neighbors_self, cli.k);
+        let dist_error_self = calculate_distance_error(
+            true_distances_self.as_ref().unwrap(),
+            approx_distances_self.as_ref().unwrap(),
+            cli.k,
+        );
+
+        results.push(BenchmarkResult {
+            method: format!("LSH-nt{}-nb{} (self)", num_tables, bits_per_hash),
+            build_time_ms: build_time,
+            query_time_ms: self_query_time,
+            total_time_ms: build_time + self_query_time,
+            recall_at_k: recall_self,
+            mean_dist_err: dist_error_self,
+        });
     }
 
     print_results(

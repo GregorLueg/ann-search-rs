@@ -38,9 +38,11 @@ fn main() {
         }
     };
 
-    let query_data = data.as_ref();
+    let query_data = subsample_with_noise(&data, DEFAULT_N_QUERY, cli.seed + 1);
+
     let mut results = Vec::new();
 
+    // Exhaustive query benchmark
     println!("Building exhaustive index...");
     let start = Instant::now();
     let exhaustive_idx = build_exhaustive_index(data.as_ref(), &cli.distance);
@@ -49,14 +51,29 @@ fn main() {
     println!("Querying exhaustive index...");
     let start = Instant::now();
     let (true_neighbors, _) =
-        query_exhaustive_index(query_data, &exhaustive_idx, cli.k, false, false);
+        query_exhaustive_index(query_data.as_ref(), &exhaustive_idx, cli.k, false, false);
     let query_time = start.elapsed().as_secs_f64() * 1000.0;
 
     results.push(BenchmarkResult {
-        method: "Exhaustive".to_string(),
+        method: "Exhaustive (query)".to_string(),
         build_time_ms: build_time,
         query_time_ms: query_time,
         total_time_ms: build_time + query_time,
+        recall_at_k: 1.0,
+        mean_dist_err: 0.0,
+    });
+
+    // Exhaustive self-query benchmark
+    println!("Self-querying exhaustive index...");
+    let start = Instant::now();
+    let (true_neighbors_self, _) = query_exhaustive_self(&exhaustive_idx, cli.k, false, false);
+    let self_query_time = start.elapsed().as_secs_f64() * 1000.0;
+
+    results.push(BenchmarkResult {
+        method: "Exhaustive (self)".to_string(),
+        build_time_ms: build_time,
+        query_time_ms: self_query_time,
+        total_time_ms: build_time + self_query_time,
         recall_at_k: 1.0,
         mean_dist_err: 0.0,
     });
@@ -69,7 +86,6 @@ fn main() {
         (cli.n_cells as f32 * 2.0).sqrt() as usize,
     ];
 
-    // IVF-OPQ benchmarks
     let m_values: Vec<usize> = if cli.dim >= 128 {
         vec![16, 32, 48]
     } else {
@@ -110,8 +126,9 @@ fn main() {
                 .collect();
             nprobe_values.sort();
 
-            for nprobe in nprobe_values {
-                if nprobe > nlist || nprobe == 0 {
+            // Query benchmarks
+            for nprobe in &nprobe_values {
+                if *nprobe > nlist || *nprobe == 0 {
                     continue;
                 }
 
@@ -120,14 +137,20 @@ fn main() {
                     nlist, m, nprobe
                 );
                 let start = Instant::now();
-                let (approx_neighbors, _) =
-                    query_ivf_opq_index(query_data, &ivf_opq_idx, cli.k, Some(nprobe), true, false);
+                let (approx_neighbors, _) = query_ivf_opq_index(
+                    query_data.as_ref(),
+                    &ivf_opq_idx,
+                    cli.k,
+                    Some(*nprobe),
+                    true,
+                    false,
+                );
                 let query_time = start.elapsed().as_secs_f64() * 1000.0;
 
                 let recall = calculate_recall(&true_neighbors, &approx_neighbors, cli.k);
 
                 results.push(BenchmarkResult {
-                    method: format!("IVF-OPQ-nl{}-m{}-np{}", nlist, m, nprobe),
+                    method: format!("IVF-OPQ-nl{}-m{}-np{} (query)", nlist, m, nprobe),
                     build_time_ms: build_time,
                     query_time_ms: query_time,
                     total_time_ms: build_time + query_time,
@@ -135,6 +158,25 @@ fn main() {
                     mean_dist_err: 0.0,
                 });
             }
+
+            // Self-query benchmark
+            let nprobe_self = (nlist as f32 * 2.0).sqrt() as usize;
+            println!("Self-querying IVF-OPQ index (nprobe={})...", nprobe_self);
+            let start = Instant::now();
+            let (approx_neighbors_self, _) =
+                query_ivf_opq_index_self(&ivf_opq_idx, cli.k, Some(nprobe_self), false, false);
+            let self_query_time = start.elapsed().as_secs_f64() * 1000.0;
+
+            let recall_self = calculate_recall(&true_neighbors_self, &approx_neighbors_self, cli.k);
+
+            results.push(BenchmarkResult {
+                method: format!("IVF-OPQ-nl{}-m{} (self)", nlist, m),
+                build_time_ms: build_time,
+                query_time_ms: self_query_time,
+                total_time_ms: build_time + self_query_time,
+                recall_at_k: recall_self,
+                mean_dist_err: 0.0,
+            });
         }
     }
 

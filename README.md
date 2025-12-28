@@ -1,5 +1,6 @@
 [![CI](https://github.com/GregorLueg/ann-search-rs/actions/workflows/test.yml/badge.svg)](https://github.com/GregorLueg/ann-search-rs/actions/workflows/test.yml)
 [![Crates.io](https://img.shields.io/crates/v/ann-search-rs.svg)](https://crates.io/crates/ann-search-rs)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
 # ann-search-rs
 
@@ -96,7 +97,7 @@ let (hnsw_indices, hnsw_dists) = query_hnsw_index(
   15,             // k
   200,            // ef_search
   true,           // return distances
-  false.          // verbosity
+  false           // verbosity
 );
 ```
 
@@ -122,16 +123,15 @@ cargo run --example gridsearch_annoy --release -- --n-cells 500000 --dim 32 --di
 # --dim 32
 # --n-clusters 25
 # --k 15
-# --seed 10101
+# --seed 42
 # --distance cosine
 # --data gaussian
 ```
 
-For every index, 150k cells with 32 dimensions distance and 25 distinct clusters 
-(of different sizes each) in the synthetic data has been run. The results for 
-the different indices are show below. For details on the synthetic data 
-function, see `./examples/commons/mod.rs`. This was run on an M1 Max MacBoo Pro
-with 64 GB of unified memory, see one example below:
+Every index is trained on 150k cells with 32 dimensions distance and 25 distinct 
+clusters (of different sizes each). Then the index is tested against a subset of
+10% of cells with a little Gaussian noise added and for full kNN self 
+generation. Below are the results shown for `Annoy`.
 
 ```
 ====================================================================================================
@@ -139,32 +139,41 @@ Benchmark: 150k cells, 32D
 ====================================================================================================
 Method                                Build (ms)   Query (ms)   Total (ms)     Recall@k   Dist Error
 ----------------------------------------------------------------------------------------------------
-Exhaustive                                  4.02     23204.51     23208.53       1.0000     0.000000
-Annoy-nt5-s:auto                           73.62       794.92       868.54       0.6408    81.683927
-Annoy-nt5-s:10x                            73.62       570.38       644.00       0.5175    81.587548
-Annoy-nt5-s:5x                             73.62       359.21       432.82       0.3713    81.392453
-Annoy-nt10-s:auto                         100.36      1519.07      1619.43       0.8479    81.814313
-Annoy-nt10-s:10x                          100.36      1061.24      1161.60       0.7378    81.763178
-Annoy-nt10-s:5x                           100.36       669.30       769.66       0.5603    81.632177
-Annoy-nt15-s:auto                         158.77      2145.18      2303.94       0.9338    81.853076
-Annoy-nt15-s:10x                          158.77      1528.20      1686.96       0.8542    81.824079
-Annoy-nt15-s:5x                           158.77       952.47      1111.24       0.6898    81.734461
-Annoy-nt25-s:auto                         234.09      3317.58      3551.68       0.9854    81.872143
-Annoy-nt25-s:10x                          234.09      2407.78      2641.87       0.9512    81.862444
-Annoy-nt25-s:5x                           234.09      1448.60      1682.69       0.8394    81.818440
-Annoy-nt50-s:auto                         450.88      5865.30      6316.18       0.9994    81.876491
-Annoy-nt50-s:10x                          450.88      4471.22      4922.10       0.9959    81.875733
-Annoy-nt50-s:5x                           450.88      2975.32      3426.20       0.9647    81.867209
-Annoy-nt75-s:auto                         687.39      8105.55      8792.94       1.0000    81.876624
-Annoy-nt75-s:10x                          687.39      6273.23      6960.62       0.9995    81.876551
-Annoy-nt75-s:5x                           687.39      4329.62      5017.01       0.9909    81.874592
-Annoy-nt100-s:auto                        900.40     10331.99     11232.39       1.0000    81.876631
-Annoy-nt100-s:10x                         900.40      8045.77      8946.17       0.9999    81.876621
-Annoy-nt100-s:5x                          900.40      5620.07      6520.48       0.9974    81.876118
+Exhaustive (query)                          3.22      2323.61      2326.83       1.0000     0.000000
+Exhaustive (self)                           3.22     24526.99     24530.21       1.0000     0.000000
+Annoy-nt5-s:auto (query)                   74.71        90.94       165.65       0.6392    81.632962
+Annoy-nt5-s:10x (query)                    74.71        59.54       134.25       0.5153    81.536609
+Annoy-nt5-s:5x (query)                     74.71        37.26       111.97       0.3708    81.343675
+Annoy-nt5 (self)                           74.71       830.23       904.94       0.6408    81.683927
+Annoy-nt10-s:auto (query)                 109.86       155.44       265.30       0.8471    81.764138
+Annoy-nt10-s:10x (query)                  109.86       108.39       218.25       0.7365    81.712452
+Annoy-nt10-s:5x (query)                   109.86        67.11       176.97       0.5593    81.582371
+Annoy-nt10 (self)                         109.86      1518.47      1628.33       0.8479    81.814313
+Annoy-nt15-s:auto (query)                 161.83       215.60       377.43       0.9338    81.803269
+Annoy-nt15-s:10x (query)                  161.83       153.45       315.28       0.8539    81.774152
+Annoy-nt15-s:5x (query)                   161.83        92.75       254.59       0.6896    81.684499
+Annoy-nt15 (self)                         161.83      2132.04      2293.87       0.9338    81.853076
+Annoy-nt25-s:auto (query)                 253.70       321.63       575.33       0.9853    81.822332
+Annoy-nt25-s:10x (query)                  253.70       233.69       487.39       0.9511    81.812750
+Annoy-nt25-s:5x (query)                   253.70       155.44       409.15       0.8398    81.769091
+Annoy-nt25 (self)                         253.70      3745.23      3998.93       0.9854    81.872143
+Annoy-nt50-s:auto (query)                 546.70      1187.52      1734.22       0.9995    81.826775
+Annoy-nt50-s:10x (query)                  546.70       440.92       987.62       0.9959    81.826054
+Annoy-nt50-s:5x (query)                   546.70       294.44       841.14       0.9654    81.817842
+Annoy-nt50 (self)                         546.70      5910.40      6457.10       0.9994    81.876491
+Annoy-nt75-s:auto (query)                 706.48       882.82      1589.31       1.0000    81.826905
+Annoy-nt75-s:10x (query)                  706.48       622.27      1328.75       0.9995    81.826820
+Annoy-nt75-s:5x (query)                   706.48       413.66      1120.15       0.9909    81.824865
+Annoy-nt75 (self)                         706.48      7958.33      8664.81       1.0000    81.876624
+Annoy-nt100-s:auto (query)                927.31      1051.21      1978.51       1.0000    81.826908
+Annoy-nt100-s:10x (query)                 927.31       803.39      1730.70       0.9999    81.826897
+Annoy-nt100-s:5x (query)                  927.31       552.50      1479.80       0.9974    81.826428
+Annoy-nt100 (self)                        927.31     10121.62     11048.93       1.0000    81.876631
 ----------------------------------------------------------------------------------------------------
 ```
 
-Detailed benchmarks on the standard benchmarks can be found [here](/docs/benchmarks_general.md)
+Detailed benchmarks on all the standard benchmarks can be found 
+[here](https://github.com/GregorLueg/ann-search-rs/blob/main/docs/benchmarks_general.md)
 
 ## Quantised indices
 
@@ -182,8 +191,8 @@ methods available:
 - *IVF-OPQ*: Uses optimised product quantisation. Tries to de-correlate the
   residuals 
 
-The benchmarks can be found [here](/docs/benchmarks_quantised.md). If you wish
-to use these, please add the "quantised" feature
+The benchmarks can be found [here](https://github.com/GregorLueg/ann-search-rs/blob/main/docs/benchmarks_quantised.md). 
+If you wish to use these, please add the "quantised" feature
 
 ```toml
 [dependencies]
@@ -199,8 +208,8 @@ for details please check [here](https://burn.dev/books/cubecl/getting-started/in
 Let's first look at the indices compared against exhaustive (CPU). You can
 of course provide other backends.
 
-The benchmarks can be found [here](/docs/benchmarks_gpu.md). To unlock GPU-
-acceleration, please use
+The benchmarks can be found [here](https://github.com/GregorLueg/ann-search-rs/blob/main/docs/benchmarks_gpu.md). 
+To unlock GPU-acceleration, please use
 
 ```toml
 [dependencies]

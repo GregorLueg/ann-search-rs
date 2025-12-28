@@ -159,7 +159,7 @@ fn main() {
             );
 
             results.push(BenchmarkResult {
-                method: format!("IVF-GPU-kNN-nl{}-np{}", nlist, nprobe),
+                method: format!("IVF-GPU-nl{}-np{}", nlist, nprobe),
                 build_time_ms: build_time,
                 query_time_ms: knn_time,
                 total_time_ms: build_time + knn_time,
@@ -167,8 +167,6 @@ fn main() {
                 mean_dist_err: dist_error,
             });
         }
-
-        println!("-----------------------------");
     }
 
     print_results(

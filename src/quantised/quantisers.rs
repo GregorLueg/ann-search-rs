@@ -269,6 +269,21 @@ where
     pub fn codebooks(&self) -> &[Vec<T>] {
         &self.codebooks
     }
+
+    /// Decode PQ codes back to approximate vector
+    pub fn decode(&self, codes: &[u8]) -> Vec<T> {
+        let mut result = vec![T::zero(); self.m * self.subvec_dim];
+
+        for (subspace, &code) in codes.iter().enumerate() {
+            let out_start = subspace * self.subvec_dim;
+            let centroid_start = code as usize * self.subvec_dim;
+            let codebook = &self.codebooks[subspace];
+            result[out_start..(self.subvec_dim + out_start)]
+                .copy_from_slice(&codebook[centroid_start..(self.subvec_dim + centroid_start)]);
+        }
+
+        result
+    }
 }
 
 ///////////////////////////////
@@ -576,6 +591,36 @@ where
             }
         }
         rotation
+    }
+
+    /// Decode PQ codes back to approximate original vector
+    ///
+    /// Decodes via PQ codebooks then applies inverse rotation (transpose).
+    ///
+    /// ### Params
+    ///
+    /// * `codes` - M PQ codes (u8)
+    ///
+    /// ### Returns
+    ///
+    /// Reconstructed vector in original space
+    pub fn decode(&self, codes: &[u8]) -> Vec<T> {
+        let rotated = Self::decode_pq(codes, &self.pq);
+        self.inverse_rotate(&rotated)
+    }
+
+    /// Apply inverse rotation (transpose) to a vector
+    fn inverse_rotate(&self, vec: &[T]) -> Vec<T> {
+        let mut out = vec![T::zero(); self.dim];
+        for i in 0..self.dim {
+            let mut sum = T::zero();
+            for j in 0..self.dim {
+                // Transpose: swap i,j indices
+                sum += self.rotation_matrix[j * self.dim + i] * vec[j];
+            }
+            out[i] = sum;
+        }
+        out
     }
 
     /// Get number of subspaces
