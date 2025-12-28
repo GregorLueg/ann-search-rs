@@ -468,6 +468,22 @@ where
             (indices, None)
         }
     }
+
+    /// Returns the size of the index in bytes
+    ///
+    /// ### Returns
+    ///
+    /// Number of bytes used by the index
+    pub fn memory_usage_bytes(&self) -> usize {
+        std::mem::size_of_val(self)
+            + self.quantised_vectors.capacity() * std::mem::size_of::<i8>()
+            + self.quantised_norms.capacity() * std::mem::size_of::<i32>()
+            + self.centroids.capacity() * std::mem::size_of::<T>()
+            + self.centroids_norm.capacity() * std::mem::size_of::<T>()
+            + self.all_indices.capacity() * std::mem::size_of::<usize>()
+            + self.offsets.capacity() * std::mem::size_of::<usize>()
+            + self.codebook.memory_usage_bytes()
+    }
 }
 
 ///////////

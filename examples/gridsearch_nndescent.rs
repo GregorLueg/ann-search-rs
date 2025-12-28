@@ -48,19 +48,22 @@ fn main() {
     let exhaustive_idx = build_exhaustive_index(data.as_ref(), &cli.distance);
     let build_time = start.elapsed().as_secs_f64() * 1000.0;
 
+    let index_size_mb = exhaustive_idx.memory_usage_bytes() as f64 / (1024.0 * 1024.0);
+
     println!("Querying exhaustive index...");
     let start = Instant::now();
     let (true_neighbors, true_distances) =
         query_exhaustive_index(query_data.as_ref(), &exhaustive_idx, cli.k, true, false);
     let query_time = start.elapsed().as_secs_f64() * 1000.0;
 
-    results.push(BenchmarkResult {
+    results.push(BenchmarkResultSize {
         method: "Exhaustive (query)".to_string(),
         build_time_ms: build_time,
         query_time_ms: query_time,
         total_time_ms: build_time + query_time,
         recall_at_k: 1.0,
         mean_dist_err: 0.0,
+        index_size_mb,
     });
 
     // Exhaustive self-query benchmark
@@ -70,13 +73,14 @@ fn main() {
         query_exhaustive_self(&exhaustive_idx, cli.k, true, false);
     let self_query_time = start.elapsed().as_secs_f64() * 1000.0;
 
-    results.push(BenchmarkResult {
+    results.push(BenchmarkResultSize {
         method: "Exhaustive (self)".to_string(),
         build_time_ms: build_time,
         query_time_ms: self_query_time,
         total_time_ms: build_time + self_query_time,
         recall_at_k: 1.0,
         mean_dist_err: 0.0,
+        index_size_mb,
     });
 
     println!("-----------------------------");
@@ -114,6 +118,8 @@ fn main() {
         );
         let build_time = start.elapsed().as_secs_f64() * 1000.0;
 
+        let index_size_mb = nndescent_idx.memory_usage_bytes() as f64 / (1024.0 * 1024.0);
+
         // Query benchmarks
         for ef_search in &ef_search_values {
             let ef_search_str = ef_search
@@ -139,7 +145,7 @@ fn main() {
                 cli.k,
             );
 
-            results.push(BenchmarkResult {
+            results.push(BenchmarkResultSize {
                 method: format!(
                     "NNDescent-nt{}-s{}-dp{} (query)",
                     n_trees_str, ef_search_str, diversify_prob
@@ -149,6 +155,7 @@ fn main() {
                 total_time_ms: build_time + query_time,
                 recall_at_k: recall,
                 mean_dist_err: dist_error,
+                index_size_mb,
             });
         }
 
@@ -166,17 +173,18 @@ fn main() {
             cli.k,
         );
 
-        results.push(BenchmarkResult {
+        results.push(BenchmarkResultSize {
             method: format!("NNDescent-nt{}-dp{} (self)", n_trees_str, diversify_prob),
             build_time_ms: build_time,
             query_time_ms: self_query_time,
             total_time_ms: build_time + self_query_time,
             recall_at_k: recall_self,
             mean_dist_err: dist_error_self,
+            index_size_mb,
         });
     }
 
-    print_results(
+    print_results_size(
         &format!("{}k cells, {}D", cli.n_cells / 1000, cli.dim),
         &results,
     );

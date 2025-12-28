@@ -315,6 +315,34 @@ where
             (indices, None)
         }
     }
+
+    /// Returns the size of the index in bytes
+    ///
+    /// ### Returns
+    ///
+    /// Number of bytes used by the index
+    pub fn memory_usage_bytes(&self) -> usize {
+        let mut total = std::mem::size_of_val(self);
+
+        total += self.vectors_flat.capacity() * std::mem::size_of::<T>();
+        total += self.norms.capacity() * std::mem::size_of::<T>();
+        total += self.random_vecs.capacity() * std::mem::size_of::<T>();
+
+        // hash_tables outer Vec
+        total += self.hash_tables.capacity() * std::mem::size_of::<FxHashMap<u64, Vec<usize>>>();
+
+        // each HashMap and its Vec<usize> values
+        for table in &self.hash_tables {
+            total +=
+                table.capacity() * (std::mem::size_of::<u64>() + std::mem::size_of::<Vec<usize>>());
+
+            for indices in table.values() {
+                total += indices.capacity() * std::mem::size_of::<usize>();
+            }
+        }
+
+        total
+    }
 }
 
 /////////////

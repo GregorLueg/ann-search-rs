@@ -354,6 +354,26 @@ pub struct BenchmarkResult {
     pub mean_dist_err: f64,
 }
 
+/// BenchmarkResult
+///
+/// ### Fields
+///
+/// * `method` - Name of the method
+/// * `build_time_ms` - The build time of the index in ms
+/// * `query_time_ms` - The query time of the index in ms
+/// * `total_time_ms` - Total time the index build & query takes in ms
+/// * `recall_at_k` - Recall@k neighbours against ground truth
+/// * `mean_dist_err` - Mean distance error against ground truth
+pub struct BenchmarkResultSize {
+    pub method: String,
+    pub build_time_ms: f64,
+    pub query_time_ms: f64,
+    pub total_time_ms: f64,
+    pub recall_at_k: f64,
+    pub mean_dist_err: f64,
+    pub index_size_mb: f64,
+}
+
 /// Calculate Recall@k
 ///
 /// ### Params
@@ -441,30 +461,32 @@ pub fn print_results(config: &str, results: &[BenchmarkResult]) {
     println!("{:->110}\n", "");
 }
 
-/// Helper to print results to console (Recall only)
+/// Helper to print results to console
 ///
 /// ### Params
 ///
 /// * `config` - Benchmark configuration
 /// * `results` - Benchmark results to print
-pub fn print_results_recall_only(config: &str, results: &[BenchmarkResult]) {
-    println!("\n{:=>92}", "");
+pub fn print_results_size(config: &str, results: &[BenchmarkResultSize]) {
+    println!("\n{:=>123}", "");
     println!("Benchmark: {}", config);
-    println!("{:=>92}", "");
+    println!("{:=>123}", "");
     println!(
-        "{:<40} {:>12} {:>12} {:>12} {:>12}",
-        "Method", "Build (ms)", "Query (ms)", "Total (ms)", "Recall@k"
+        "{:<45} {:>12} {:>12} {:>12} {:>12} {:>12} {:>12}",
+        "Method", "Build (ms)", "Query (ms)", "Total (ms)", "Recall@k", "Dist Error", "Size (MB)"
     );
-    println!("{:->92}", "");
+    println!("{:->123}", "");
     for result in results {
         println!(
-            "{:<40} {:>12.2} {:>12.2} {:>12.2} {:>12.4}",
+            "{:<45} {:>12.2} {:>12.2} {:>12.2} {:>12.4} {:>12.6} {:>12.2}",
             result.method,
             result.build_time_ms,
             result.query_time_ms,
             result.total_time_ms,
-            result.recall_at_k
+            result.recall_at_k,
+            result.mean_dist_err,
+            result.index_size_mb
         );
     }
-    println!("{:->92}\n", "");
+    println!("{:->123}\n", "");
 }

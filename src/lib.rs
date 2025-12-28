@@ -42,11 +42,9 @@ use crate::nndescent::*;
 use crate::utils::dist::*;
 
 #[cfg(feature = "gpu")]
-use crate::gpu::exhaustive_gpu::*;
-#[cfg(feature = "gpu")]
-use crate::gpu::ivf_gpu::*;
+use crate::gpu::{exhaustive_gpu::*, ivf_gpu::*};
 #[cfg(feature = "quantised")]
-use crate::quantised::{ivf_opq::*, ivf_pq::*, ivf_sq8::*};
+use crate::quantised::{ivf_bf16::*, ivf_opq::*, ivf_pq::*, ivf_sq8::*};
 
 ////////////
 // Helper //
@@ -790,6 +788,107 @@ where
 // Quantised //
 ///////////////
 
+//////////////
+// IVF-BF16 //
+//////////////
+
+#[cfg(feature = "quantised")]
+/// Build an IVF-BF16 index
+///
+/// ### Params
+///
+/// * `mat` - The data matrix. Rows represent the samples, columns represent
+///   the embedding dimensions
+/// * `nlist` - Optional number of cells to create. If not provided, defaults
+///   to `sqrt(n)`.
+/// * `max_iters` - Maximum k-means iterations (defaults to 30 if None)
+/// * `seed` - Random seed for reproducibility
+/// * `verbose` - Print progress information during index construction
+///
+/// ### Return
+///
+/// The `IvfIndexBf16`.
+pub fn build_ivf_bf16_index<T>(
+    mat: MatRef<T>,
+    nlist: Option<usize>,
+    max_iters: Option<usize>,
+    dist_metric: &str,
+    seed: usize,
+    verbose: bool,
+) -> IvfIndexBf16<T>
+where
+    T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum,
+{
+    let ann_dist = parse_ann_dist(dist_metric).unwrap_or_default();
+
+    IvfIndexBf16::build(mat, ann_dist, nlist, max_iters, seed, verbose)
+}
+
+#[cfg(feature = "quantised")]
+/// Helper function to query a given IVF-BF16 index
+///
+/// ### Params
+///
+/// * `query_mat` - The query matrix containing the samples x features
+/// * `index` - Reference to the built IVF-BF16 index
+/// * `k` - Number of neighbours to return
+/// * `nprobe` - Number of clusters to search (defaults to 20% of nlist)
+///   Higher values improve recall at the cost of speed
+/// * `return_dist` - Shall the inner product scores be returned
+/// * `verbose` - Print progress information
+///
+/// ### Returns
+///
+/// A tuple of `(knn_indices, optional inner_product_scores)`
+pub fn query_ivf_bf16_index<T>(
+    query_mat: MatRef<T>,
+    index: &IvfIndexBf16<T>,
+    k: usize,
+    nprobe: Option<usize>,
+    return_dist: bool,
+    verbose: bool,
+) -> (Vec<Vec<usize>>, Option<Vec<Vec<T>>>)
+where
+    T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum,
+{
+    query_parallel(query_mat.nrows(), return_dist, verbose, |i| {
+        index.query_row(query_mat.row(i), k, nprobe)
+    })
+}
+
+#[cfg(feature = "quantised")]
+/// Helper function to self query a given IVF-SQ8 index
+///
+/// This function will generate a full kNN graph based on the internal data. To
+/// accelerate the process, it will leverage the internally quantised vectors
+/// and the information on the Voronoi cells under the hood and query nearby
+/// cells per given internal vector.
+///
+/// ### Params
+///
+/// * `index` - Reference to the built IVF-SQ8 index
+/// * `k` - Number of neighbours to return
+/// * `nprobe` - Number of clusters to search (defaults to 20% of nlist)
+///   Higher values improve recall at the cost of speed
+/// * `return_dist` - Shall the inner product scores be returned
+/// * `verbose` - Print progress information
+///
+/// ### Returns
+///
+/// A tuple of `(knn_indices, optional inner_product_scores)`
+pub fn query_ivf_bf16_self<T>(
+    index: &IvfIndexBf16<T>,
+    k: usize,
+    nprobe: Option<usize>,
+    return_dist: bool,
+    verbose: bool,
+) -> (Vec<Vec<usize>>, Option<Vec<Vec<T>>>)
+where
+    T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum,
+{
+    index.generate_knn(k, nprobe, return_dist, verbose)
+}
+
 /////////////
 // IVF-SQ8 //
 /////////////
@@ -810,10 +909,6 @@ where
 /// ### Return
 ///
 /// The `IvfSq8Index`.
-///
-/// ### Note
-///
-/// Currently only supports Euclidean distance.
 pub fn build_ivf_sq8_index<T>(
     mat: MatRef<T>,
     nlist: Option<usize>,
@@ -845,7 +940,7 @@ where
 ///
 /// ### Returns
 ///
-/// A tuple of `(knn_indices, optional inner_product_scores)`
+/// A tuple of `(knn_indices, optional distances)`
 pub fn query_ivf_sq8_index<T>(
     query_mat: MatRef<T>,
     index: &IvfSq8Index<T>,
@@ -881,7 +976,7 @@ where
 ///
 /// ### Returns
 ///
-/// A tuple of `(knn_indices, optional inner_product_scores)`
+/// A tuple of `(knn_indices, optional distances)`
 pub fn query_ivf_sq8_self<T>(
     index: &IvfSq8Index<T>,
     k: usize,
@@ -981,11 +1076,8 @@ where
 /// Helper function to self query a IVF-PQ index
 ///
 /// This function will generate a full kNN graph based on the internal data. To
-/// accelerate the process, it will leverage the internally quantised vectors
-/// and the information on the Voronoi cells under the hood and query nearby
-/// cells per given internal vector. It will use symmetric distance computations
-/// (SDCs) which are accurate for within cluster comparison and approximate
-/// for outside cluster calculations.
+/// note, during quantisation information is lost, hence, the quality of the
+/// graph is reduced compared to other indices.
 ///
 /// ### Params
 ///
@@ -1100,11 +1192,8 @@ where
 /// Helper function to self query a IVF-OPQ index
 ///
 /// This function will generate a full kNN graph based on the internal data. To
-/// accelerate the process, it will leverage the internally quantised vectors
-/// and the information on the Voronoi cells under the hood and query nearby
-/// cells per given internal vector. It will use symmetric distance computations
-/// (SDCs) which are accurate for within cluster comparison and approximate
-/// for outside cluster calculations.
+/// note, during quantisation information is lost, hence, the quality of the
+/// graph is reduced compared to other indices.
 ///
 /// ### Params
 ///
@@ -1182,18 +1271,47 @@ pub fn query_exhaustive_index_gpu<T, R>(
     index: &ExhaustiveIndexGpu<T, R>,
     k: usize,
     return_dist: bool,
+    verbose: bool,
 ) -> (Vec<Vec<usize>>, Option<Vec<Vec<T>>>)
 where
     T: Float + Sum + cubecl::frontend::Float + cubecl::CubeElement + FromPrimitive,
     R: Runtime,
 {
-    let (indices, distances) = index.query_batch(query_mat, k);
+    let (indices, distances) = index.query_batch(query_mat, k, verbose);
 
     if return_dist {
         (indices, Some(distances))
     } else {
         (indices, None)
     }
+}
+
+#[cfg(feature = "gpu")]
+/// Query the exhaustive GPU index itself
+///
+/// This function will generate a full kNN graph based on the internal data.
+///
+/// ### Params
+///
+/// * `query_mat` - The query matrix containing the samples × features
+/// * `index` - The exhaustive GPU index
+/// * `k` - Number of neighbours to return
+/// * `return_dist` - Shall the distances be returned
+///
+/// ### Returns
+///
+/// A tuple of `(knn_indices, optional distances)`
+pub fn query_exhaustive_index_gpu_self<T, R>(
+    index: &ExhaustiveIndexGpu<T, R>,
+    k: usize,
+    return_dist: bool,
+    verbose: bool,
+) -> (Vec<Vec<usize>>, Option<Vec<Vec<T>>>)
+where
+    T: Float + Sum + cubecl::frontend::Float + cubecl::CubeElement + FromPrimitive,
+    R: Runtime,
+{
+    index.generate_knn(k, return_dist, verbose)
 }
 
 //////////////
@@ -1230,7 +1348,7 @@ where
 }
 
 #[cfg(feature = "gpu")]
-/// Query an IVF batched index
+/// Query an IVF GPU index
 ///
 /// ### Params
 ///
@@ -1239,7 +1357,7 @@ where
 /// * `k` - Number of neighbours
 /// * `nprobe` - Clusters to search (defaults to √nlist)
 /// * `return_dist` - Return distances
-/// * `_verbose` - Unused
+/// * `verbose` - Controls verbosity of the function
 ///
 /// ### Returns
 ///
@@ -1250,17 +1368,48 @@ pub fn query_ivf_index_gpu<T, R>(
     k: usize,
     nprobe: Option<usize>,
     return_dist: bool,
-    _verbose: bool,
+    verbose: bool,
 ) -> (Vec<Vec<usize>>, Option<Vec<Vec<T>>>)
 where
     R: Runtime,
     T: Float + Sum + cubecl::frontend::Float + cubecl::CubeElement + FromPrimitive + Send + Sync,
 {
-    let (indices, distances) = index.query_batch(query_mat, k, nprobe);
+    let (indices, distances) = index.query_batch(query_mat, k, nprobe, verbose);
 
     if return_dist {
         (indices, Some(distances))
     } else {
         (indices, None)
     }
+}
+
+#[cfg(feature = "gpu")]
+/// Query an IVF GPU index itself
+///
+/// This function will generate a full kNN graph based on the internal data.
+///
+/// ### Params
+///
+/// * `query_mat` - Query matrix [samples, features]
+/// * `index` - Reference to built index
+/// * `k` - Number of neighbours
+/// * `nprobe` - Clusters to search (defaults to √nlist)
+/// * `return_dist` - Return distances
+/// * `verbose` - Controls verbosity of the function
+///
+/// ### Returns
+///
+/// Tuple of (indices, optional distances)
+pub fn query_ivf_index_gpu_self<T, R>(
+    index: &IvfIndexGpu<T, R>,
+    k: usize,
+    nprobe: Option<usize>,
+    return_dist: bool,
+    verbose: bool,
+) -> (Vec<Vec<usize>>, Option<Vec<Vec<T>>>)
+where
+    R: Runtime,
+    T: Float + Sum + cubecl::frontend::Float + cubecl::CubeElement + FromPrimitive + Send + Sync,
+{
+    index.generate_knn(k, nprobe, return_dist, verbose)
 }

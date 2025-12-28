@@ -1280,6 +1280,20 @@ where
             Dist::Cosine => self.cosine_distance_to_query(idx, query, query_norm),
         }
     }
+
+    /// Returns the size of the index in bytes
+    ///
+    /// ### Returns
+    ///
+    /// Number of bytes used by the index
+    pub fn memory_usage_bytes(&self) -> usize {
+        std::mem::size_of_val(self)
+            + self.vectors_flat.capacity() * std::mem::size_of::<T>()
+            + self.norms.capacity() * std::mem::size_of::<T>()
+            + self.layer_assignments.capacity() * std::mem::size_of::<u8>()
+            + self.neighbours_flat.capacity() * std::mem::size_of::<u32>()
+            + self.neighbour_offsets.capacity() * std::mem::size_of::<usize>()
+    }
 }
 
 //////////////////////

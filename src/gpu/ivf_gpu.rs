@@ -210,26 +210,29 @@ where
         }
     }
 
-    /// Query the index with a batch of vectors
+    /// Internal helper for querying
     ///
     /// ### Params
     ///
-    /// * `query_mat` - Query vectors [n_queries, dim]
+    /// * `queries_flat` - The query vector flattened
+    /// * `n_queries` - The number of queries
+    /// * `dim_query` - The dimensions
     /// * `k` - Number of neighbours per query
     /// * `nprobe` - Number of clusters to search (defaults to √nlist)
+    /// * `verbose` - Controls the verbosity of the function
     ///
     /// ### Returns
     ///
-    /// Tuple of (indices, distances) where each is Vec<Vec<_>> of length
-    /// n_queries
-    pub fn query_batch(
+    /// Tuple of `(Vec<indices>, Vec<dist>)` for the queries.
+    fn query_internal(
         &self,
-        query_mat: MatRef<T>,
+        queries_flat: &[T],
+        n_queries: usize,
+        dim_query: usize,
         k: usize,
         nprobe: Option<usize>,
+        verbose: bool,
     ) -> (Vec<Vec<usize>>, Vec<Vec<T>>) {
-        let (queries_flat, n_queries, dim_query) = matrix_to_flat(query_mat);
-
         assert_eq!(
             dim_query, self.dim,
             "Query dimension {} != index dimension {}",
@@ -264,7 +267,7 @@ where
 
         // upload queries to GPU
         let queries_gpu =
-            GpuTensor::<R, T>::from_slice(&queries_flat, vec![n_queries, dim_vectorized], &client);
+            GpuTensor::<R, T>::from_slice(queries_flat, vec![n_queries, dim_vectorized], &client);
 
         let query_norms_gpu = if self.metric == Dist::Cosine {
             Some(GpuTensor::<R, T>::from_slice(
@@ -342,6 +345,10 @@ where
         let mut pending: Option<(GpuTensor<R, T>, usize, Vec<usize>)> = None;
 
         for cluster_idx in 0..self.nlist {
+            if verbose && cluster_idx % 10 == 0 {
+                println!("Processed {} clusters out of {}", cluster_idx, self.nlist);
+            }
+
             let query_indices = &cluster_to_queries[cluster_idx];
             if query_indices.is_empty() {
                 continue;
@@ -485,6 +492,82 @@ where
 
         let (all_indices, all_distances): (Vec<_>, Vec<_>) = results.into_iter().unzip();
         (all_indices, all_distances)
+    }
+
+    /// Query the index with a batch of vectors
+    ///
+    /// ### Params
+    ///
+    /// * `query_mat` - Query vectors [n_queries, dim]
+    /// * `k` - Number of neighbours per query
+    /// * `nprobe` - Number of clusters to search (defaults to √nlist)
+    ///
+    /// ### Returns
+    ///
+    /// Tuple of `(Vec<indices>, Vec<dist>)` for the queries.
+    pub fn query_batch(
+        &self,
+        query_mat: MatRef<T>,
+        k: usize,
+        nprobe: Option<usize>,
+        verbose: bool,
+    ) -> (Vec<Vec<usize>>, Vec<Vec<T>>) {
+        let (queries_flat, n_queries, dim_query) = matrix_to_flat(query_mat);
+
+        self.query_internal(&queries_flat, n_queries, dim_query, k, nprobe, verbose)
+    }
+
+    /// Generate kNN graph from vectors stored in the index
+    ///
+    /// Queries each vector in the index against itself to build a complete
+    /// kNN graph.
+    ///
+    /// ### Params
+    ///
+    /// * `k` - Number of neighbours per vector
+    /// * `return_dist` - Whether to return distances
+    /// * `verbose` - Controls verbosity
+    ///
+    /// ### Returns
+    ///
+    /// Tuple of `(knn_indices, optional distances)` where each row corresponds
+    /// to a vector in the index
+    pub fn generate_knn(
+        &self,
+        k: usize,
+        nprobe: Option<usize>,
+        return_dist: bool,
+        verbose: bool,
+    ) -> (Vec<Vec<usize>>, Option<Vec<Vec<T>>>) {
+        let (indices_reorg, dist_reorg) = self.query_internal(
+            &self.vectors_by_cluster,
+            self.n,
+            self.dim,
+            k,
+            nprobe,
+            verbose,
+        );
+
+        // reorder results to match original vector ordering
+        let mut indices = vec![Vec::new(); self.n];
+        let mut dist = if return_dist {
+            vec![Vec::new(); self.n]
+        } else {
+            Vec::new()
+        };
+
+        for (reorg_idx, orig_idx) in self.original_indices.iter().enumerate() {
+            indices[*orig_idx] = indices_reorg[reorg_idx].clone();
+            if return_dist {
+                dist[*orig_idx] = dist_reorg[reorg_idx].clone();
+            }
+        }
+
+        if return_dist {
+            (indices, Some(dist))
+        } else {
+            (indices, None)
+        }
     }
 }
 

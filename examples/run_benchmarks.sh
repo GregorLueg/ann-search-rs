@@ -25,6 +25,10 @@ run_standard() {
 
 run_quantised_benchmarks() {
     echo "=== Running quantised benchmarks ==="
+    # IVF-BF16
+    run_quantised bf16 --distance euclidean
+    run_quantised bf16 --distance cosine
+
     # IVF-SQ8
     run_quantised sq8 --distance euclidean
     run_quantised sq8 --distance euclidean --dim 96
