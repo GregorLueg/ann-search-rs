@@ -50,3 +50,7 @@ required-features = ["quantised"]
 [[example]]
 name = "gridsearch_ivf_pq"
 required-features = ["quantised"]
+
+[[example]]
+name = "gridsearch_binary"
+required-features = ["binary"]

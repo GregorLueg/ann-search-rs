@@ -44,6 +44,8 @@ use crate::lsh::*;
 use crate::nndescent::*;
 use crate::utils::dist::*;
 
+#[cfg(feature = "binary")]
+use crate::binary::{binariser::*, exhaustive_binary::*};
 #[cfg(feature = "gpu")]
 use crate::gpu::{exhaustive_gpu::*, ivf_gpu::*};
 #[cfg(feature = "quantised")]
@@ -1415,4 +1417,184 @@ where
     T: Float + Sum + cubecl::frontend::Float + cubecl::CubeElement + FromPrimitive + Send + Sync,
 {
     index.generate_knn(k, nprobe, return_dist, verbose)
+}
+
+////////////
+// Binary //
+////////////
+
+///////////////////////
+// Exhaustive Binary //
+///////////////////////
+
+#[cfg(feature = "binary")]
+/// Build an exhaustive binary index
+///
+/// This one can be only used for Cosine distance. There is no good hash
+/// function that translates Euclidean distance to Hamming distance!
+///
+/// ### Params
+///
+/// * `mat` - The initial matrix with samples x features
+/// * `hash_func` - Hash function: "euclidean" or "cosine"
+/// * `n_bits` - Number of bits per binary code (must be multiple of 8)
+/// * `bucket_width` - Bucket width for E2LSH (ignored for SimHash)
+/// * `seed` - Random seed for binariser
+///
+/// ### Returns
+///
+/// The initialised `ExhaustiveIndexBinary`
+pub fn build_exhaustive_index_binary<T>(
+    mat: MatRef<T>,
+    n_bits: usize,
+    seed: usize,
+) -> ExhaustiveIndexBinary<T>
+where
+    T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum,
+{
+    ExhaustiveIndexBinary::new(mat, n_bits, seed)
+}
+
+#[cfg(feature = "binary")]
+/// Helper function to query a given exhaustive binary index
+///
+/// ### Params
+///
+/// * `query_mat` - The query matrix containing the samples × features
+/// * `index` - The exhaustive binary index
+/// * `k` - Number of neighbours to return
+/// * `return_dist` - Shall the distances be returned
+/// * `verbose` - Controls verbosity of the function
+///
+/// ### Returns
+///
+/// A tuple of `(knn_indices, optional distances)` where distances are Hamming distances
+pub fn query_exhaustive_index_binary<T>(
+    query_mat: MatRef<T>,
+    index: &ExhaustiveIndexBinary<T>,
+    k: usize,
+    return_dist: bool,
+    verbose: bool,
+) -> (Vec<Vec<usize>>, Option<Vec<Vec<u32>>>)
+where
+    T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum,
+{
+    query_parallel(query_mat.nrows(), return_dist, verbose, |i| {
+        index.query_row(query_mat.row(i), k)
+    })
+}
+
+#[cfg(feature = "binary")]
+/// Helper function to self query an exhaustive binary index
+///
+/// This function will generate a full kNN graph based on the internal binary data.
+///
+/// ### Params
+///
+/// * `data` - Original float data (needed to binarise each query vector)
+/// * `index` - The exhaustive binary index
+/// * `k` - Number of neighbours to return
+/// * `return_dist` - Shall the distances be returned
+/// * `verbose` - Controls verbosity of the function
+///
+/// ### Returns
+///
+/// A tuple of `(knn_indices, optional distances)` where distances are Hamming distances
+pub fn query_exhaustive_self_binary<T>(
+    data: MatRef<T>,
+    index: &ExhaustiveIndexBinary<T>,
+    k: usize,
+    return_dist: bool,
+    verbose: bool,
+) -> (Vec<Vec<usize>>, Option<Vec<Vec<u32>>>)
+where
+    T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum,
+{
+    index.generate_knn(data, k, return_dist, verbose)
+}
+
+///////////////////////
+// Exhaustive 4-Bit  //
+///////////////////////
+
+#[cfg(feature = "binary")]
+/// Build an exhaustive 4-bit quantised index
+///
+/// ### Params
+///
+/// * `mat` - The initial matrix with samples x features
+/// * `metric` - Distance metric: "euclidean" or "cosine"
+/// * `n_projections` - Number of random projections (output = n_projections * 4 bits)
+/// * `seed` - Random seed for quantiser
+///
+/// ### Returns
+///
+/// The initialised `Exhaustive4BitIndex`
+pub fn build_exhaustive_index_4bit<T>(
+    mat: MatRef<T>,
+    metric: &str,
+    n_projections: usize,
+    seed: u64,
+) -> Exhaustive4BitIndex<T>
+where
+    T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum,
+{
+    let dist = parse_dist_4bit(metric).unwrap_or_default();
+    Exhaustive4BitIndex::new(mat, n_projections, dist, seed)
+}
+
+#[cfg(feature = "binary")]
+/// Helper function to query a given exhaustive 4-bit index
+///
+/// ### Params
+///
+/// * `query_mat` - The query matrix containing the samples × features
+/// * `index` - The exhaustive 4-bit index
+/// * `k` - Number of neighbours to return
+/// * `return_dist` - Shall the distances be returned
+/// * `verbose` - Controls verbosity of the function
+///
+/// ### Returns
+///
+/// A tuple of `(knn_indices, optional distances)` where distances are approximate squared distances
+pub fn query_exhaustive_index_4bit<T>(
+    query_mat: MatRef<T>,
+    index: &Exhaustive4BitIndex<T>,
+    k: usize,
+    return_dist: bool,
+    verbose: bool,
+) -> (Vec<Vec<usize>>, Option<Vec<Vec<T>>>)
+where
+    T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum,
+{
+    query_parallel(query_mat.nrows(), return_dist, verbose, |i| {
+        index.query_row(query_mat.row(i), k)
+    })
+}
+
+#[cfg(feature = "binary")]
+/// Helper function to self query an exhaustive 4-bit index
+///
+/// Generates a full kNN graph using symmetric distance on quantised vectors.
+///
+/// ### Params
+///
+/// * `index` - The exhaustive 4-bit index
+/// * `k` - Number of neighbours to return
+/// * `return_dist` - Shall the distances be returned
+/// * `verbose` - Controls verbosity of the function
+///
+/// ### Returns
+///
+/// A tuple of `(knn_indices, optional distances)` where distances are approximate squared distances
+pub fn query_exhaustive_self_4bit<T>(
+    index: &Exhaustive4BitIndex<T>,
+    k: usize,
+    return_dist: bool,
+    verbose: bool,
+) -> (Vec<Vec<usize>>, Option<Vec<Vec<T>>>)
+where
+    T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum,
+{
+    index.generate_knn(k, return_dist, verbose)
 }
