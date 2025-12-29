@@ -87,66 +87,9 @@ fn main() {
     println!("-----------------------------------------------------------------------------------------------");
 
     // =========================================================================
-    // 4-bit quantised index benchmarks
-    // =========================================================================
-    let n_projections_values = [32, 64, 128, 256];
-
-    for n_proj in n_projections_values {
-        println!("Building exhaustive 4-bit index (n_proj={})...", n_proj);
-        let start = Instant::now();
-        let index_4bit =
-            build_exhaustive_index_4bit(data.as_ref(), &cli.distance, n_proj, cli.seed);
-        let build_time = start.elapsed().as_secs_f64() * 1000.0;
-
-        let index_size_mb = index_4bit.memory_usage_bytes() as f64 / (1024.0 * 1024.0);
-
-        // Query benchmark
-        println!("Querying exhaustive 4-bit index (n_proj={})...", n_proj);
-        let start = Instant::now();
-        let (neighbors_4bit, _) =
-            query_exhaustive_index_4bit(query_data.as_ref(), &index_4bit, cli.k, false, false);
-        let query_time = start.elapsed().as_secs_f64() * 1000.0;
-
-        let recall = calculate_recall(&true_neighbors, &neighbors_4bit, cli.k);
-
-        results.push(BenchmarkResultSize {
-            method: format!("4Bit-{} (query)", n_proj),
-            build_time_ms: build_time,
-            query_time_ms: query_time,
-            total_time_ms: build_time + query_time,
-            recall_at_k: recall,
-            mean_dist_err: f64::NAN,
-            index_size_mb,
-        });
-
-        // Self-query benchmark
-        println!(
-            "Self-querying exhaustive 4-bit index (n_proj={})...",
-            n_proj
-        );
-        let start = Instant::now();
-        let (neighbors_4bit_self, _) = query_exhaustive_self_4bit(&index_4bit, cli.k, false, false);
-        let self_query_time = start.elapsed().as_secs_f64() * 1000.0;
-
-        let recall_self = calculate_recall(&true_neighbors_self, &neighbors_4bit_self, cli.k);
-
-        results.push(BenchmarkResultSize {
-            method: format!("4Bit-{} (self)", n_proj),
-            build_time_ms: build_time,
-            query_time_ms: self_query_time,
-            total_time_ms: build_time + self_query_time,
-            recall_at_k: recall_self,
-            mean_dist_err: f64::NAN,
-            index_size_mb,
-        });
-    }
-
-    println!("-----------------------------------------------------------------------------------------------");
-
-    // =========================================================================
     // Binary index benchmarks
     // =========================================================================
-    let n_bits_values = [32, 64, 128, 256, 512, 768];
+    let n_bits_values = [16, 32, 64, 128, 256, 512, 768];
 
     for n_bits in n_bits_values {
         println!("Building exhaustive binary index (n_bits={})...", n_bits);
@@ -200,7 +143,7 @@ fn main() {
 
     print_results_size(
         &format!(
-            "{}k cells, {}D (Exhaustive vs 4-Bit vs Binary)",
+            "{}k cells, {}D (Exhaustive vs Binary)",
             cli.n_cells / 1000,
             cli.dim
         ),
