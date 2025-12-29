@@ -37,6 +37,13 @@ fn main() {
                 cli.seed,
             )
         }
+        SyntheticData::LowRank => generate_low_rank_rotated_data(
+            cli.n_cells,
+            cli.dim,
+            cli.intrinsic_dim,
+            cli.n_clusters,
+            cli.seed,
+        ),
     };
 
     let query_data = subsample_with_noise(&data, DEFAULT_N_QUERY, cli.seed + 1);

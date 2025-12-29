@@ -1439,9 +1439,7 @@ where
 /// ### Params
 ///
 /// * `mat` - The initial matrix with samples x features
-/// * `hash_func` - Hash function: "euclidean" or "cosine"
 /// * `n_bits` - Number of bits per binary code (must be multiple of 8)
-/// * `bucket_width` - Bucket width for E2LSH (ignored for SimHash)
 /// * `seed` - Random seed for binariser
 ///
 /// ### Returns
@@ -1451,11 +1449,12 @@ pub fn build_exhaustive_index_binary<T>(
     mat: MatRef<T>,
     n_bits: usize,
     seed: usize,
+    binary_init: &str,
 ) -> ExhaustiveIndexBinary<T>
 where
     T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum + ComplexField,
 {
-    ExhaustiveIndexBinary::new(mat, n_bits, seed)
+    ExhaustiveIndexBinary::new(mat, binary_init, n_bits, seed)
 }
 
 #[cfg(feature = "binary")]

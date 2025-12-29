@@ -63,14 +63,19 @@ where
     /// ### Returns
     ///
     /// Initialised exhaustive binary index
-    pub fn new(data: MatRef<T>, n_bits: usize, seed: usize) -> Self {
+    pub fn new(data: MatRef<T>, binarisation_init: &str, n_bits: usize, seed: usize) -> Self {
         assert!(n_bits % 8 == 0, "n_bits must be multiple of 8");
+
+        let init = parse_binarisation_init(binarisation_init).unwrap_or_default();
 
         let n_bytes = n_bits / 8;
         let n = data.nrows();
         let dim = data.ncols();
 
-        let binariser = Binariser::new(dim, n_bits, seed);
+        let binariser = match init {
+            BinarisationInit::ITQ => Binariser::initialise_with_pca(data, dim, n_bits, seed),
+            BinarisationInit::RandomProjections => Binariser::new(dim, n_bits, seed),
+        };
 
         let mut vectors_flat_binarised: Vec<u8> = Vec::with_capacity(n * n_bytes);
 

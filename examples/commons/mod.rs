@@ -5,6 +5,7 @@ use faer::traits::ComplexField;
 use faer::Mat;
 use num_traits::{Float, FromPrimitive, ToPrimitive};
 use rand::{rngs::StdRng, seq::SliceRandom, Rng, SeedableRng};
+use rand_distr::StandardNormal;
 use rustc_hash::FxHashSet;
 
 ////////////
@@ -20,6 +21,11 @@ pub const DEFAULT_SEED: u64 = 42;
 pub const DEFAULT_DISTANCE: &str = "euclidean";
 pub const DEFAULT_COR_STRENGTH: f64 = 0.5;
 pub const DEFAULT_DATA: &str = "gaussian";
+pub const DEFAULT_INTRINSIC_DIM: usize = 16;
+
+////////////
+// Parser //
+////////////
 
 /// Parsing structure
 ///
@@ -54,19 +60,21 @@ pub struct Cli {
 
     #[arg(long, default_value = DEFAULT_DATA)]
     pub data: String,
+
+    #[arg(long, default_value_t = DEFAULT_INTRINSIC_DIM)]
+    pub intrinsic_dim: usize,
 }
 
-/////////////
-// Helpers //
-/////////////
+//////////
+// Data //
+//////////
 
-#[derive(Clone, Debug, Copy, PartialEq, Default)]
+#[derive(Default)]
 pub enum SyntheticData {
-    /// Default synthetic data
     #[default]
     GaussianNoise,
-    /// Synthetic data designed to work with high dimensionality
     Correlated,
+    LowRank, // Add this
 }
 
 /// Helper function to parse the data type
@@ -82,6 +90,7 @@ pub fn parse_data(s: &str) -> Option<SyntheticData> {
     match s.to_lowercase().as_str() {
         "gaussian" => Some(SyntheticData::GaussianNoise),
         "correlated" => Some(SyntheticData::Correlated),
+        "lowrank" => Some(SyntheticData::LowRank),
         _ => None,
     }
 }
@@ -295,6 +304,154 @@ where
     }
 
     data
+}
+
+/// Generate data specifically designed to benefit from PCA+ITQ
+///
+/// Creates high-dimensional data that actually lives in a low-dimensional
+/// subspace with rotated cluster structure. This is where ITQ should dominate
+/// random projections.
+///
+/// ### Params
+///
+/// * `n_samples` - Number of samples
+/// * `embedding_dim` - Full dimensionality (e.g., 128, 256)
+/// * `intrinsic_dim` - True dimensionality of data (e.g., 16, 32)
+/// * `n_clusters` - Number of clusters
+/// * `seed` - Random seed
+///
+/// ### Returns
+///
+/// Matrix of shape (n_samples, embedding_dim)
+pub fn generate_low_rank_rotated_data<T>(
+    n_samples: usize,
+    embedding_dim: usize,
+    intrinsic_dim: usize,
+    n_clusters: usize,
+    seed: u64,
+) -> Mat<T>
+where
+    T: Float + FromPrimitive + ComplexField,
+{
+    assert!(
+        intrinsic_dim <= embedding_dim,
+        "Intrinsic dim must be <= embedding dim"
+    );
+
+    let mut rng = StdRng::seed_from_u64(seed);
+
+    // Generate well-separated clusters in LOW-dimensional space
+    let cluster_separation = (intrinsic_dim as f64).sqrt() * 3.0;
+    let mut centres_low_dim = Vec::with_capacity(n_clusters);
+
+    for _ in 0..n_clusters {
+        let centre = loop {
+            let candidate: Vec<f64> = (0..intrinsic_dim)
+                .map(|_| rng.random_range(-cluster_separation..cluster_separation))
+                .collect();
+
+            let too_close = centres_low_dim.iter().any(|existing: &Vec<f64>| {
+                let dist_sq: f64 = candidate
+                    .iter()
+                    .zip(existing.iter())
+                    .map(|(a, b)| (a - b).powi(2))
+                    .sum();
+                dist_sq < (cluster_separation * 0.5).powi(2)
+            });
+
+            if !too_close {
+                break candidate;
+            }
+        };
+        centres_low_dim.push(centre);
+    }
+
+    // Assign samples to clusters
+    let mut cluster_assignments = Vec::new();
+    for cluster_idx in 0..n_clusters {
+        let n_in_cluster = n_samples / n_clusters;
+        cluster_assignments.extend(vec![cluster_idx; n_in_cluster]);
+    }
+    while cluster_assignments.len() < n_samples {
+        cluster_assignments.push(rng.random_range(0..n_clusters));
+    }
+    cluster_assignments.shuffle(&mut rng);
+
+    // Generate samples in low-dimensional space
+    let mut data_low_dim = Mat::<T>::zeros(n_samples, intrinsic_dim);
+    let cluster_std = 0.3;
+
+    for (i, &cluster_idx) in cluster_assignments.iter().enumerate() {
+        let centre = &centres_low_dim[cluster_idx];
+        for j in 0..intrinsic_dim {
+            let u1: f64 = rng.random();
+            let u2: f64 = rng.random();
+            let noise = (-2.0 * u1.ln()).sqrt() * (2.0 * std::f64::consts::PI * u2).cos();
+            data_low_dim[(i, j)] = T::from_f64(centre[j] + noise * cluster_std).unwrap();
+        }
+    }
+
+    // Create random rotation matrix to embed into high-dimensional space
+    let mut rotation = Mat::<T>::zeros(intrinsic_dim, embedding_dim);
+
+    // Fill with random Gaussian values
+    for i in 0..intrinsic_dim {
+        for j in 0..embedding_dim {
+            let val: f64 = rng.sample(StandardNormal);
+            rotation[(i, j)] = T::from_f64(val).unwrap();
+        }
+    }
+
+    // Orthonormalise columns via Gram-Schmidt
+    for col in 0..embedding_dim.min(intrinsic_dim) {
+        // Orthogonalise against previous columns
+        for prev_col in 0..col {
+            let mut dot = T::zero();
+            for row in 0..intrinsic_dim {
+                dot = dot + rotation[(row, col)] * rotation[(row, prev_col)];
+            }
+            for row in 0..intrinsic_dim {
+                rotation[(row, col)] = rotation[(row, col)] - dot * rotation[(row, prev_col)];
+            }
+        }
+
+        // Normalise
+        let mut norm_sq = T::zero();
+        for row in 0..intrinsic_dim {
+            norm_sq = norm_sq + rotation[(row, col)] * rotation[(row, col)];
+        }
+        let norm = norm_sq.sqrt();
+        if norm > T::epsilon() {
+            for row in 0..intrinsic_dim {
+                rotation[(row, col)] = rotation[(row, col)] / norm;
+            }
+        }
+    }
+
+    // Project to high-dimensional space: data_high = data_low * rotation
+    let mut data_high_dim = Mat::<T>::zeros(n_samples, embedding_dim);
+    for i in 0..n_samples {
+        for j in 0..embedding_dim {
+            let mut sum = T::zero();
+            for k in 0..intrinsic_dim {
+                sum = sum + data_low_dim[(i, k)] * rotation[(k, j)];
+            }
+            data_high_dim[(i, j)] = sum;
+        }
+    }
+
+    // Add small amount of isotropic noise in the full space
+    let noise_std = 0.01;
+    for i in 0..n_samples {
+        for j in 0..embedding_dim {
+            let u1: f64 = rng.random();
+            let u2: f64 = rng.random();
+            let noise = (-2.0 * u1.ln()).sqrt() * (2.0 * std::f64::consts::PI * u2).cos();
+            data_high_dim[(i, j)] = data_high_dim[(i, j)] + T::from_f64(noise * noise_std).unwrap();
+        }
+    }
+
+    data_high_dim
 }
 
 /// Randomly subsample a matrix and add Gaussian noise

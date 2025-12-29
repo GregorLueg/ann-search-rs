@@ -36,6 +36,13 @@ fn main() {
                 cli.seed,
             )
         }
+        SyntheticData::LowRank => generate_low_rank_rotated_data(
+            cli.n_cells,
+            cli.dim,
+            cli.intrinsic_dim,
+            cli.n_clusters,
+            cli.seed,
+        ),
     };
 
     let query_data = subsample_with_noise(&data, DEFAULT_N_QUERY, cli.seed + 1);
@@ -89,12 +96,22 @@ fn main() {
     // =========================================================================
     // Binary index benchmarks
     // =========================================================================
-    let n_bits_values = [16, 32, 64, 128, 256, 512, 768];
+    let n_bits_values = [
+        (64, "random"),
+        (64, "itq"),
+        (128, "random"),
+        (128, "itq"),
+        (256, "random"),
+        (256, "itq"),
+        (512, "random"),
+        (512, "itq"),
+    ];
 
-    for n_bits in n_bits_values {
+    for (n_bits, init) in n_bits_values {
         println!("Building exhaustive binary index (n_bits={})...", n_bits);
         let start = Instant::now();
-        let binary_idx = build_exhaustive_index_binary(data.as_ref(), n_bits, cli.seed as usize);
+        let binary_idx =
+            build_exhaustive_index_binary(data.as_ref(), n_bits, cli.seed as usize, init);
         let build_time = start.elapsed().as_secs_f64() * 1000.0;
 
         let index_size_mb = binary_idx.memory_usage_bytes() as f64 / (1024.0 * 1024.0);
@@ -109,7 +126,7 @@ fn main() {
         let recall = calculate_recall(&true_neighbors, &binary_neighbors, cli.k);
 
         results.push(BenchmarkResultSize {
-            method: format!("Binary-{} (query)", n_bits),
+            method: format!("Binary-{}-{} (query)", n_bits, init),
             build_time_ms: build_time,
             query_time_ms: query_time,
             total_time_ms: build_time + query_time,
@@ -120,8 +137,8 @@ fn main() {
 
         // Self-query benchmark
         println!(
-            "Self-querying exhaustive binary index (n_bits={})...",
-            n_bits
+            "Self-querying exhaustive binary index (n_bits={}, init={})...",
+            n_bits, init
         );
         let start = Instant::now();
         let (binary_neighbors_self, _) =
@@ -131,7 +148,7 @@ fn main() {
         let recall_self = calculate_recall(&true_neighbors_self, &binary_neighbors_self, cli.k);
 
         results.push(BenchmarkResultSize {
-            method: format!("Binary-{} (self)", n_bits),
+            method: format!("Binary-{}-{} (self)", n_bits, init),
             build_time_ms: build_time,
             query_time_ms: self_query_time,
             total_time_ms: build_time + self_query_time,
