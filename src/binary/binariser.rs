@@ -102,7 +102,7 @@ where
             mean: vec![T::zero(); dim],
         };
 
-        binariser.prepare_pca_with_itq(data, seed, 50);
+        binariser.prepare_pca_with_itq(data, seed, 10);
 
         binariser
     }

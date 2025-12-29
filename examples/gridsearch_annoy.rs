@@ -20,7 +20,7 @@ fn main() {
     println!("-----------------------------");
 
     let data_type = parse_data(&cli.data).unwrap_or_default();
-    let data: Mat<f32> = match data_type {
+    let (data, _): (Mat<f32>, _) = match data_type {
         SyntheticData::GaussianNoise => {
             generate_clustered_data(cli.n_cells, cli.dim, cli.n_clusters, cli.seed)
         }

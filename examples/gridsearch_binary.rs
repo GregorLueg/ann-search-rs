@@ -22,7 +22,7 @@ fn main() {
 
     let data_type = parse_data(&cli.data).unwrap_or_default();
 
-    let data: Mat<f32> = match data_type {
+    let (data, cluster_labels): (Mat<f32>, Vec<usize>) = match data_type {
         SyntheticData::GaussianNoise => {
             generate_clustered_data(cli.n_cells, cli.dim, cli.n_clusters, cli.seed)
         }
@@ -45,57 +45,37 @@ fn main() {
         ),
     };
 
-    let query_data = subsample_with_noise(&data, DEFAULT_N_QUERY, cli.seed + 1);
+    // let query_data = subsample_with_noise(&data, DEFAULT_N_QUERY, cli.seed + 1);
 
     let mut results = Vec::new();
 
-    // =========================================================================
-    // Exhaustive index (ground truth)
-    // =========================================================================
+    // Ground truth
     println!("Building exhaustive index...");
     let start = Instant::now();
     let exhaustive_idx = build_exhaustive_index(data.as_ref(), &cli.distance);
     let build_time = start.elapsed().as_secs_f64() * 1000.0;
-
     let index_size_mb = exhaustive_idx.memory_usage_bytes() as f64 / (1024.0 * 1024.0);
 
-    println!("Querying exhaustive index...");
-    let start = Instant::now();
-    let (true_neighbors, _) =
-        query_exhaustive_index(query_data.as_ref(), &exhaustive_idx, cli.k, false, false);
-    let query_time = start.elapsed().as_secs_f64() * 1000.0;
-
-    results.push(BenchmarkResultSize {
-        method: "Exhaustive (query)".to_string(),
-        build_time_ms: build_time,
-        query_time_ms: query_time,
-        total_time_ms: build_time + query_time,
-        recall_at_k: 1.0,
-        mean_dist_err: 0.0,
-        index_size_mb,
-    });
-
-    // Exhaustive self-query benchmark
     println!("Self-querying exhaustive index...");
     let start = Instant::now();
     let (true_neighbors_self, _) = query_exhaustive_self(&exhaustive_idx, cli.k, false, false);
     let self_query_time = start.elapsed().as_secs_f64() * 1000.0;
 
-    results.push(BenchmarkResultSize {
+    let exhaustive_purity = calculate_cluster_purity(&true_neighbors_self, &cluster_labels);
+
+    results.push(BenchmarkResultPurity {
         method: "Exhaustive (self)".to_string(),
         build_time_ms: build_time,
         query_time_ms: self_query_time,
         total_time_ms: build_time + self_query_time,
         recall_at_k: 1.0,
-        mean_dist_err: 0.0,
+        cluster_purity: exhaustive_purity,
         index_size_mb,
     });
 
     println!("-----------------------------------------------------------------------------------------------");
 
-    // =========================================================================
-    // Binary index benchmarks
-    // =========================================================================
+    // Binary benchmarks
     let n_bits_values = [
         (64, "random"),
         (64, "itq"),
@@ -108,36 +88,18 @@ fn main() {
     ];
 
     for (n_bits, init) in n_bits_values {
-        println!("Building exhaustive binary index (n_bits={})...", n_bits);
+        println!(
+            "Building binary index (n_bits={}, init={})...",
+            n_bits, init
+        );
         let start = Instant::now();
         let binary_idx =
             build_exhaustive_index_binary(data.as_ref(), n_bits, cli.seed as usize, init);
         let build_time = start.elapsed().as_secs_f64() * 1000.0;
-
         let index_size_mb = binary_idx.memory_usage_bytes() as f64 / (1024.0 * 1024.0);
 
-        // Query benchmark
-        println!("Querying exhaustive binary index (n_bits={})...", n_bits);
-        let start = Instant::now();
-        let (binary_neighbors, _) =
-            query_exhaustive_index_binary(query_data.as_ref(), &binary_idx, cli.k, false, false);
-        let query_time = start.elapsed().as_secs_f64() * 1000.0;
-
-        let recall = calculate_recall(&true_neighbors, &binary_neighbors, cli.k);
-
-        results.push(BenchmarkResultSize {
-            method: format!("Binary-{}-{} (query)", n_bits, init),
-            build_time_ms: build_time,
-            query_time_ms: query_time,
-            total_time_ms: build_time + query_time,
-            recall_at_k: recall,
-            mean_dist_err: f64::NAN,
-            index_size_mb,
-        });
-
-        // Self-query benchmark
         println!(
-            "Self-querying exhaustive binary index (n_bits={}, init={})...",
+            "Self-querying binary index (n_bits={}, init={})...",
             n_bits, init
         );
         let start = Instant::now();
@@ -146,21 +108,22 @@ fn main() {
         let self_query_time = start.elapsed().as_secs_f64() * 1000.0;
 
         let recall_self = calculate_recall(&true_neighbors_self, &binary_neighbors_self, cli.k);
+        let binary_purity = calculate_cluster_purity(&binary_neighbors_self, &cluster_labels);
 
-        results.push(BenchmarkResultSize {
-            method: format!("Binary-{}-{} (self)", n_bits, init),
+        results.push(BenchmarkResultPurity {
+            method: format!("Binary-{}-{}", n_bits, init),
             build_time_ms: build_time,
             query_time_ms: self_query_time,
             total_time_ms: build_time + self_query_time,
             recall_at_k: recall_self,
-            mean_dist_err: f64::NAN,
+            cluster_purity: binary_purity,
             index_size_mb,
         });
     }
 
-    print_results_size(
+    print_results_purity(
         &format!(
-            "{}k cells, {}D (Exhaustive vs Binary)",
+            "{}k cells, {}D - Cluster Structure Preservation",
             cli.n_cells / 1000,
             cli.dim
         ),
