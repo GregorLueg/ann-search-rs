@@ -18,6 +18,7 @@ codegen-units = 1
 [features]
 gpu = ["cubecl"]
 quantised = ["half"]
+binary = []
 
 [dependencies]
 approx = "0.5.1"

@@ -15,6 +15,9 @@ pub mod gpu;
 #[cfg(feature = "quantised")]
 pub mod quantised;
 
+#[cfg(feature = "binary")]
+pub mod binary;
+
 use faer::MatRef;
 use num_traits::{Float, FromPrimitive, ToPrimitive};
 use rayon::prelude::*;
