@@ -267,8 +267,8 @@ where
         }
     }
 
-    // add correlation structure: groups of dimensions that are linear combinations
-    // of "source" dimensions plus noise
+    // add correlation structure: groups of dimensions that are linear
+    // combinations of "source" dimensions plus noise
     let n_correlation_groups = dim / 8;
     let dims_per_group = 4;
     let noise_weight = 1.0 - correlation_strength;
@@ -340,7 +340,7 @@ where
 
     let mut rng = StdRng::seed_from_u64(seed);
 
-    // Generate well-separated clusters in LOW-dimensional space
+    // generate well-separated clusters in low-dimensional space
     let cluster_separation = (intrinsic_dim as f64).sqrt() * 3.0;
     let mut centres_low_dim = Vec::with_capacity(n_clusters);
 
@@ -366,7 +366,7 @@ where
         centres_low_dim.push(centre);
     }
 
-    // Assign samples to clusters
+    // assign samples to clusters
     let mut cluster_assignments = Vec::new();
     for cluster_idx in 0..n_clusters {
         let n_in_cluster = n_samples / n_clusters;
@@ -377,7 +377,7 @@ where
     }
     cluster_assignments.shuffle(&mut rng);
 
-    // Generate samples in low-dimensional space
+    // generate samples in low-dimensional space
     let mut data_low_dim = Mat::<T>::zeros(n_samples, intrinsic_dim);
     let cluster_std = 0.3;
 
@@ -391,10 +391,10 @@ where
         }
     }
 
-    // Create random rotation matrix to embed into high-dimensional space
+    // create random rotation matrix to embed into high-dimensional space
     let mut rotation = Mat::<T>::zeros(intrinsic_dim, embedding_dim);
 
-    // Fill with random Gaussian values
+    // fill with random Gaussian values
     for i in 0..intrinsic_dim {
         for j in 0..embedding_dim {
             let val: f64 = rng.sample(StandardNormal);
@@ -402,9 +402,9 @@ where
         }
     }
 
-    // Orthonormalise columns via Gram-Schmidt
+    // orthonormalise columns via Gram-Schmidt
     for col in 0..embedding_dim.min(intrinsic_dim) {
-        // Orthogonalise against previous columns
+        // orthogonalise against previous columns
         for prev_col in 0..col {
             let mut dot = T::zero();
             for row in 0..intrinsic_dim {
@@ -415,7 +415,6 @@ where
             }
         }
 
-        // Normalise
         let mut norm_sq = T::zero();
         for row in 0..intrinsic_dim {
             norm_sq = norm_sq + rotation[(row, col)] * rotation[(row, col)];
@@ -428,7 +427,7 @@ where
         }
     }
 
-    // Project to high-dimensional space: data_high = data_low * rotation
+    // project to high-dimensional space: data_high = data_low * rotation
     let mut data_high_dim = Mat::<T>::zeros(n_samples, embedding_dim);
     for i in 0..n_samples {
         for j in 0..embedding_dim {

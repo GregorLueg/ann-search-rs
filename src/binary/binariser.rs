@@ -45,7 +45,8 @@ pub fn parse_binarisation_init(s: &str) -> Option<BinarisationInit> {
 ///
 /// ### Fields
 ///
-/// * `random_projections` - Random vectors from N(0,1), flattened (n_bits * dim)
+/// * `random_projections` - Random vectors from N(0,1), flattened (n_bits *
+///   dim)
 /// * `random_offsets` - Random offsets for E2LSH (None for SimHash)
 /// * `bucket_width` - Bucket width for E2LSH (None for SimHash)
 /// * `n_bits` - Number of bits in binary code (e.g., 256, 512)

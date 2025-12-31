@@ -103,7 +103,7 @@ pub struct ScalarQuantiser<T> {
 
 impl<T> ScalarQuantiser<T>
 where
-    T: Float + FromPrimitive + ToPrimitive,
+    T: Float + FromPrimitive + ToPrimitive + Send + Sync,
 {
     /// Train the scalar quantiser on a flat vector
     ///
@@ -116,21 +116,21 @@ where
     ///
     /// Initialised self
     pub fn train(vec: &[T], dim: usize) -> Self {
-        let mut scales = vec![T::zero(); dim];
-
-        for chunk in vec.chunks_exact(dim) {
-            for (d, &val) in chunk.iter().enumerate() {
-                scales[d] = scales[d].max(val.abs());
-            }
-        }
-
-        for scale in &mut scales {
-            if *scale <= T::zero() {
-                *scale = T::one();
-            } else {
-                *scale = *scale / T::from_i8(127).unwrap();
-            }
-        }
+        let scales = (0..dim)
+            .into_par_iter()
+            .map(|d| {
+                vec.chunks_exact(dim)
+                    .map(|chunk| chunk[d].abs())
+                    .fold(T::zero(), |max, val| max.max(val))
+            })
+            .map(|scale| {
+                if scale <= T::zero() {
+                    T::one()
+                } else {
+                    scale / T::from_f32(128.0).unwrap()
+                }
+            })
+            .collect();
 
         Self { scales }
     }
@@ -149,9 +149,10 @@ where
             .enumerate()
             .map(|(d, &val)| {
                 let scaled = val / self.scales[d];
-                let clamped = scaled
+                let rounded = scaled + T::from_f32(0.5).unwrap() * scaled.signum();
+                let clamped = rounded
                     .min(T::from_i8(127).unwrap())
-                    .max(T::from_i8(-127).unwrap());
+                    .max(T::from_i8(-128).unwrap());
                 clamped.to_i8().unwrap_or(0)
             })
             .collect()

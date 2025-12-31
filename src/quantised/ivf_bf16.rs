@@ -13,12 +13,13 @@ use crate::utils::heap_structs::*;
 use crate::utils::ivf_utils::*;
 use crate::utils::*;
 
-/// IVF (Inverted File) index for similarity search
+/// IVF index with bf16 quantisation
 ///
 /// Uses k-means clustering to partition vectors into nlist clusters. Each
 /// cluster maintains an inverted list of vector indices assigned to it.
 /// Queries search only the nprobe nearest clusters, trading perfect recall
-/// for speed.
+/// for speed. This version leverages `bf16` quantisation under the hood,
+/// reducing memory fingerprint and query speed at cost of precision.
 ///
 /// ### Fields
 ///
@@ -46,9 +47,9 @@ pub struct IvfIndexBf16<T> {
     nlist: usize,
 }
 
-////////////////////
-// VectorDistance //
-////////////////////
+///////////////////////
+// VectorDistanceB16 //
+///////////////////////
 
 impl<T> VectorDistanceBf16<T> for IvfIndexBf16<T>
 where

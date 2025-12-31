@@ -22,14 +22,14 @@ use crate::utils::matrix_to_flat;
 ///   to Cosine
 /// * `dim` - Embedding dimensions
 /// * `n` - Number of samples
-/// * `dist_metric` - The type of distance the index is designed for
+/// * `metric` - The type of distance the index is designed for
 pub struct ExhaustiveIndex<T> {
     // shared ones
     pub vectors_flat: Vec<T>,
     pub dim: usize,
     pub n: usize,
     norms: Vec<T>,
-    dist_metric: Dist,
+    metric: Dist,
 }
 
 ////////////////////
@@ -96,7 +96,7 @@ where
             vectors_flat,
             norms,
             dim,
-            dist_metric: metric,
+            metric,
             n,
         }
     }
@@ -131,7 +131,7 @@ where
 
         let mut heap: BinaryHeap<(OrderedFloat<T>, usize)> = BinaryHeap::with_capacity(k + 1);
 
-        match self.dist_metric {
+        match self.metric {
             Dist::Euclidean => {
                 for idx in 0..n_vectors {
                     let dist = self.euclidean_distance_to_query(idx, query_vec);

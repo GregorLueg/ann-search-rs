@@ -8,7 +8,6 @@ use thousands::*;
 
 use crate::binary::binariser::*;
 use crate::binary::dist_binary::*;
-
 ///////////////////////////
 // ExhaustiveIndexBinary //
 ///////////////////////////
@@ -99,8 +98,8 @@ where
     /// Query function
     ///
     /// Exhaustive search over all binary codes using Hamming distance.
-    /// Binary codes are generated via the hash function specified during construction
-    /// (SimHash for cosine similarity, MaxPool for Euclidean distance).
+    /// Binary codes are generated via the trained binariser during
+    /// initialisation.
     ///
     /// ### Params
     ///

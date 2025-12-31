@@ -4,7 +4,7 @@ Below are benchmarks shown for the GPU-accelerated code. If you wish to run
 the example script, please use:
 
 ```bash
-cargo run --example gridsearch_gpu --features gpu
+cargo run --example gridsearch_gpu --features gpu --release
 ```
 
 To run all of the benchmarks, you can just run:
