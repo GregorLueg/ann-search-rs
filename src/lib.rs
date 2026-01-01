@@ -51,7 +51,7 @@ use crate::binary::{exhaustive_binary::*, ivf_binary::*};
 #[cfg(feature = "gpu")]
 use crate::gpu::{exhaustive_gpu::*, ivf_gpu::*};
 #[cfg(feature = "quantised")]
-use crate::quantised::{ivf_bf16::*, ivf_opq::*, ivf_pq::*, ivf_sq8::*};
+use crate::quantised::{exhaustive_bf16::*, ivf_bf16::*, ivf_opq::*, ivf_pq::*, ivf_sq8::*};
 
 ////////////
 // Helper //
@@ -794,6 +794,97 @@ where
 ///////////////
 // Quantised //
 ///////////////
+
+/////////////////////
+// Exhaustive-BF16 //
+/////////////////////
+
+#[cfg(feature = "quantised")]
+/// Build an Exhaustive-BF16 index
+///
+/// ### Params
+///
+/// * `mat` - The data matrix. Rows represent the samples, columns represent
+///   the embedding dimensions
+/// * `dist_metric` - Distance metric to use
+/// * `verbose` - Print progress information during index construction
+///
+/// ### Return
+///
+/// The `ExhaustiveIndexBf16`.
+pub fn build_exhaustive_bf16_index<T>(
+    mat: MatRef<T>,
+    dist_metric: &str,
+    verbose: bool,
+) -> ExhaustiveIndexBf16<T>
+where
+    T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum,
+{
+    let ann_dist = parse_ann_dist(dist_metric).unwrap_or_default();
+    if verbose {
+        println!(
+            "Building exhaustive BF16 index with {} samples",
+            mat.nrows()
+        );
+    }
+    ExhaustiveIndexBf16::new(mat, ann_dist)
+}
+
+#[cfg(feature = "quantised")]
+/// Helper function to query a given Exhaustive-BF16 index
+///
+/// ### Params
+///
+/// * `query_mat` - The query matrix containing the samples x features
+/// * `index` - Reference to the built Exhaustive-BF16 index
+/// * `k` - Number of neighbours to return
+/// * `return_dist` - Shall the distances be returned
+/// * `verbose` - Print progress information
+///
+/// ### Returns
+///
+/// A tuple of `(knn_indices, optional distances)`
+pub fn query_exhaustive_bf16_index<T>(
+    query_mat: MatRef<T>,
+    index: &ExhaustiveIndexBf16<T>,
+    k: usize,
+    return_dist: bool,
+    verbose: bool,
+) -> (Vec<Vec<usize>>, Option<Vec<Vec<T>>>)
+where
+    T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum,
+{
+    query_parallel(query_mat.nrows(), return_dist, verbose, |i| {
+        index.query_row(query_mat.row(i), k)
+    })
+}
+
+#[cfg(feature = "quantised")]
+/// Helper function to self query a given Exhaustive-BF16 index
+///
+/// This function will generate a full kNN graph based on the internal data.
+///
+/// ### Params
+///
+/// * `index` - Reference to the built Exhaustive-BF16 index
+/// * `k` - Number of neighbours to return
+/// * `return_dist` - Shall the distances be returned
+/// * `verbose` - Print progress information
+///
+/// ### Returns
+///
+/// A tuple of `(knn_indices, optional distances)`
+pub fn query_exhaustive_bf16_self<T>(
+    index: &ExhaustiveIndexBf16<T>,
+    k: usize,
+    return_dist: bool,
+    verbose: bool,
+) -> (Vec<Vec<usize>>, Option<Vec<Vec<T>>>)
+where
+    T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum,
+{
+    index.generate_knn(k, return_dist, verbose)
+}
 
 //////////////
 // IVF-BF16 //

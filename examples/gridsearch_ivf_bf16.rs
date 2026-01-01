@@ -93,6 +93,67 @@ fn main() {
 
     println!("-----------------------------");
 
+    println!("Building exhaustive index (BF16 quantised)...");
+    let start = Instant::now();
+    let exhaustive_idx_bf16 = build_exhaustive_bf16_index(data.as_ref(), &cli.distance, false);
+    let build_time = start.elapsed().as_secs_f64() * 1000.0;
+
+    let index_size_mb = exhaustive_idx_bf16.memory_usage_bytes() as f64 / (1024.0 * 1024.0);
+
+    println!("Querying exhaustive index (BF16 quantised)...");
+    let start = Instant::now();
+    let (approx_neighbors, approx_distances) = query_exhaustive_bf16_index(
+        query_data.as_ref(),
+        &exhaustive_idx_bf16,
+        cli.k,
+        true,
+        false,
+    );
+    let query_time = start.elapsed().as_secs_f64() * 1000.0;
+
+    let recall = calculate_recall(&true_neighbors, &approx_neighbors, cli.k);
+    let dist_error = calculate_distance_error(
+        true_distances.as_ref().unwrap(),
+        approx_distances.as_ref().unwrap(),
+        cli.k,
+    );
+
+    results.push(BenchmarkResultSize {
+        method: "Exhaustive-BF16 (query)".to_string(),
+        build_time_ms: build_time,
+        query_time_ms: query_time,
+        total_time_ms: build_time + query_time,
+        recall_at_k: recall,
+        mean_dist_err: dist_error,
+        index_size_mb,
+    });
+
+    // Exhaustive self-query benchmark
+    println!("Self-querying exhaustive index (BF16 quantised)...");
+    let start = Instant::now();
+    let (approx_neighbors_self, approx_distances_self) =
+        query_exhaustive_self(&exhaustive_idx, cli.k, true, false);
+    let self_query_time = start.elapsed().as_secs_f64() * 1000.0;
+
+    let recall = calculate_recall(&true_neighbors_self, &approx_neighbors_self, cli.k);
+    let dist_error = calculate_distance_error(
+        true_distances_self.as_ref().unwrap(),
+        approx_distances_self.as_ref().unwrap(),
+        cli.k,
+    );
+
+    results.push(BenchmarkResultSize {
+        method: "Exhaustive-BF16 (self)".to_string(),
+        build_time_ms: build_time,
+        query_time_ms: self_query_time,
+        total_time_ms: build_time + self_query_time,
+        recall_at_k: recall,
+        mean_dist_err: dist_error,
+        index_size_mb,
+    });
+
+    println!("-----------------------------");
+
     let nlist_values = [
         (cli.n_cells as f32 * 0.5).sqrt() as usize,
         (cli.n_cells as f32).sqrt() as usize,

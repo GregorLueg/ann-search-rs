@@ -11,14 +11,16 @@ use rand_distr::StandardNormal;
 // Binariser //
 ///////////////
 
-const MAX_SAMPLES_PCA: usize = 100000;
+const MAX_SAMPLES_PCA: usize = 100_000;
 
 /// Initialisation of the binariser
 #[derive(Default)]
 pub enum BinarisationInit {
+    /// Random projection with orthogonalisation
     #[default]
-    ITQ,
     RandomProjections,
+    /// Iterative Quantisation
+    ITQ,
 }
 
 /// Helper function to parse the Binarisation initialisation
@@ -93,6 +95,23 @@ where
         binariser
     }
 
+    /// Initialise binariser using PCA followed by ITQ rotation
+    ///
+    /// Uses Principal Component Analysis to find the directions of maximum variance,
+    /// then applies Iterative Quantisation (ITQ) to rotate these components for
+    /// optimal binary quantisation. This typically produces better quality codes
+    /// than random projections.
+    ///
+    /// ### Params
+    ///
+    /// * `data` - Training data matrix (n_samples × dim)
+    /// * `dim` - Input vector dimensionality
+    /// * `n_bits` - Number of bits in output (must be multiple of 8)
+    /// * `seed` - Random seed for reproducibility
+    ///
+    /// ### Returns
+    ///
+    /// Initialised binariser with PCA+ITQ projections
     pub fn initialise_with_pca(data: MatRef<T>, dim: usize, n_bits: usize, seed: usize) -> Self {
         assert!(n_bits % 8 == 0, "n_bits must be multiple of 8");
 
@@ -130,7 +149,7 @@ where
             let proj_base = bit_idx * self.dim;
             let mut dot = T::zero();
             for d in 0..self.dim {
-                let centered = vec[d] - self.mean[d]; // CENTER THE DATA
+                let centered = vec[d] - self.mean[d];
                 dot = dot + centered * self.projections[proj_base + d];
             }
 
@@ -221,6 +240,44 @@ where
         self.projections = random_projections;
     }
 
+    /// Prepare PCA projections with ITQ rotation for optimal binary quantisation
+    ///
+    /// Implements the algorithm from "Iterative Quantization: A Procrustean
+    /// Approach to Learning Binary Codes for Large-scale Image Retrieval"
+    /// (Gong et al., 2013).
+    ///
+    /// Steps:
+    ///
+    /// 1. Sample up to MAX_SAMPLES_PCA points if dataset is large
+    /// 2. Centre the data by subtracting the mean
+    /// 3. Compute PCA to find principal components
+    /// 4. Apply ITQ to find optimal rotation for binary quantisation
+    /// 5. If n_bits > dim, add orthogonalised random projections for remaining bits
+    ///
+    /// ### Params
+    ///
+    /// * `data` - Training data matrix (n_samples × dim)
+    /// * `seed` - Random seed for sampling and random projections
+    /// * `itq_iterations` - Number of ITQ iterations (typically 10-50)
+    ///   Prepare PCA projections with ITQ rotation for optimal binary quantisation
+    ///
+    /// Implements the algorithm from "Iterative Quantization: A Procrustean
+    /// Approach to Learning Binary Codes for Large-scale Image Retrieval"
+    /// (Gong et al., 2013).
+    ///
+    /// Steps:
+    ///
+    /// 1. Sample up to MAX_SAMPLES_PCA points if dataset is large
+    /// 2. Centre the data by subtracting the mean
+    /// 3. Compute PCA to find principal components
+    /// 4. Apply ITQ to find optimal rotation for binary quantisation
+    /// 5. If n_bits > dim, add normalised random projections for remaining bits
+    ///
+    /// ### Params
+    ///
+    /// * `data` - Training data matrix (n_samples × dim)
+    /// * `seed` - Random seed for sampling and random projections
+    /// * `itq_iterations` - Number of ITQ iterations (typically 10-50)
     fn prepare_pca_with_itq(&mut self, data: MatRef<T>, seed: usize, itq_iterations: usize) {
         let n = data.nrows();
         let dim = data.ncols();
@@ -267,7 +324,18 @@ where
         }
 
         let projected_data = &sampled_data * &v_pc;
-        let mut r_mat = Mat::<T>::identity(n_pca_bits, n_pca_bits);
+
+        // FIX 1: Initialise R as random orthogonal matrix via QR decomposition
+        let mut r_mat = Mat::<T>::zeros(n_pca_bits, n_pca_bits);
+        for i in 0..n_pca_bits {
+            for j in 0..n_pca_bits {
+                let val: f64 = rng.sample(StandardNormal);
+                r_mat[(i, j)] = T::from_f64(val).unwrap();
+            }
+        }
+        // QR decomposition to get orthogonal matrix
+        let qr = r_mat.as_ref().qr();
+        r_mat = qr.compute_Q();
 
         for _ in 0..itq_iterations {
             let rotated = &projected_data * &r_mat;
@@ -283,9 +351,9 @@ where
             }
 
             let c_mat = projected_data.transpose() * &b_mat;
-            let svd_itq = c_mat.as_ref().svd().unwrap();
+            let svd_itq = c_mat.as_ref().thin_svd().unwrap();
 
-            r_mat = svd_itq.V() * svd_itq.U().transpose();
+            r_mat = svd_itq.U() * svd_itq.V().transpose();
         }
 
         let final_projections_mat = v_pc * r_mat;
@@ -297,42 +365,213 @@ where
             }
         }
 
+        // FIX 2: Extra projections (when n_bits > dim) - just normalise, don't over-orthogonalise
+        // After dim orthogonal vectors in dim-dimensional space, there's no room left.
+        // Just use normalised random vectors for the extra bits.
         if self.n_bits > dim {
-            for bit_idx in n_pca_bits..self.n_bits {
-                let base = bit_idx * dim;
-
+            for _ in n_pca_bits..self.n_bits {
+                let mut proj = Vec::with_capacity(dim);
                 for _ in 0..dim {
                     let val: f64 = rng.sample(StandardNormal);
-                    projections.push(T::from_f64(val).unwrap());
+                    proj.push(T::from_f64(val).unwrap());
                 }
 
-                if bit_idx < dim {
-                    for prev_idx in 0..bit_idx {
-                        let prev_base = prev_idx * dim;
-                        let mut dot = T::zero();
-                        for d in 0..dim {
-                            dot = dot + projections[base + d] * projections[prev_base + d];
-                        }
-                        for d in 0..dim {
-                            projections[base + d] =
-                                projections[base + d] - dot * projections[prev_base + d];
-                        }
-                    }
-                }
-
+                // Just normalise
                 let mut norm_sq = T::zero();
                 for d in 0..dim {
-                    norm_sq = norm_sq + projections[base + d] * projections[base + d];
+                    norm_sq = norm_sq + proj[d] * proj[d];
                 }
                 let norm = norm_sq.sqrt();
                 if norm > T::epsilon() {
                     for d in 0..dim {
-                        projections[base + d] = projections[base + d] / norm;
+                        proj[d] = proj[d] / norm;
                     }
                 }
+
+                projections.extend(proj);
             }
         }
 
         self.projections = projections;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::binary::dist_binary::hamming_distance;
+    use faer::Mat;
+
+    #[test]
+    fn test_simhash_basic() {
+        let dim = 128;
+        let n_bits = 256;
+        let binariser = Binariser::<f64>::new(dim, n_bits, 42);
+
+        let vec1: Vec<f64> = (0..dim).map(|i| (i as f64) / (dim as f64)).collect();
+        let binary = binariser.encode(&vec1);
+
+        assert_eq!(binary.len(), n_bits / 8);
+    }
+
+    #[test]
+    fn test_simhash_preserves_similarity() {
+        let dim = 64;
+        let n_bits = 128;
+        let binariser = Binariser::<f64>::new(dim, n_bits, 42);
+
+        let vec1: Vec<f64> = (0..dim).map(|i| i as f64).collect();
+        let vec2: Vec<f64> = (0..dim).map(|i| i as f64 + 0.1).collect();
+        let vec3: Vec<f64> = (0..dim).map(|i| -(i as f64)).collect();
+
+        let bin1 = binariser.encode(&vec1);
+        let bin2 = binariser.encode(&vec2);
+        let bin3 = binariser.encode(&vec3);
+
+        let dist_12 = hamming_distance(&bin1, &bin2);
+        let dist_13 = hamming_distance(&bin1, &bin3);
+
+        assert!(
+            dist_12 < dist_13,
+            "Similar vectors should have smaller Hamming distance"
+        );
+    }
+
+    #[test]
+    fn test_pca_itq_basic() {
+        let n_samples = 1000;
+        let dim = 64;
+        let n_bits = 128;
+
+        let mut data = Mat::<f64>::zeros(n_samples, dim);
+        for i in 0..n_samples {
+            for j in 0..dim {
+                data[(i, j)] = ((i + j) as f64).sin();
+            }
+        }
+
+        let binariser = Binariser::<f64>::initialise_with_pca(data.as_ref(), dim, n_bits, 42);
+
+        let vec1: Vec<f64> = (0..dim).map(|i| (i as f64).sin()).collect();
+        let binary = binariser.encode(&vec1);
+
+        assert_eq!(binary.len(), n_bits / 8);
+    }
+
+    #[test]
+    fn test_pca_itq_orthogonality() {
+        let n_samples = 500;
+        let dim = 32;
+        let n_bits = 128;
+
+        let mut data = Mat::<f64>::zeros(n_samples, dim);
+        for i in 0..n_samples {
+            for j in 0..dim {
+                data[(i, j)] = ((i * j) as f64).sin();
+            }
+        }
+
+        let binariser = Binariser::<f64>::initialise_with_pca(data.as_ref(), dim, n_bits, 42);
+
+        for i in 0..n_bits.min(dim) {
+            let i_base = i * dim;
+            let mut norm_sq = 0.0;
+            for d in 0..dim {
+                norm_sq += binariser.projections[i_base + d] * binariser.projections[i_base + d];
+            }
+            let norm = norm_sq.sqrt();
+            assert!(
+                (norm - 1.0).abs() < 1e-6,
+                "Projection {} not normalised: {}",
+                i,
+                norm
+            );
+
+            for j in (i + 1)..n_bits.min(dim) {
+                let j_base = j * dim;
+                let mut dot = 0.0;
+                for d in 0..dim {
+                    dot += binariser.projections[i_base + d] * binariser.projections[j_base + d];
+                }
+                assert!(
+                    dot.abs() < 1e-6,
+                    "Projections {} and {} not orthogonal: {}",
+                    i,
+                    j,
+                    dot
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_centering() {
+        let n_samples = 100;
+        let dim = 16;
+        let n_bits = 32;
+
+        let mut data = Mat::<f64>::zeros(n_samples, dim);
+        for i in 0..n_samples {
+            for j in 0..dim {
+                data[(i, j)] = (i as f64) + 10.0;
+            }
+        }
+
+        let binariser = Binariser::<f64>::initialise_with_pca(data.as_ref(), dim, n_bits, 42);
+
+        for d in 0..dim {
+            let expected_mean = (n_samples as f64 - 1.0) / 2.0 + 10.0;
+            assert!((binariser.mean[d] - expected_mean).abs() < 1e-6);
+        }
+    }
+
+    #[test]
+    fn test_deterministic() {
+        let dim = 32;
+        let n_bits = 64;
+
+        let binariser1 = Binariser::<f64>::new(dim, n_bits, 42);
+        let binariser2 = Binariser::<f64>::new(dim, n_bits, 42);
+
+        let vec: Vec<f64> = (0..dim).map(|i| i as f64).collect();
+        let bin1 = binariser1.encode(&vec);
+        let bin2 = binariser2.encode(&vec);
+
+        assert_eq!(bin1, bin2);
+    }
+
+    #[test]
+    fn test_parse_binarisation_init() {
+        assert!(matches!(
+            parse_binarisation_init("itq"),
+            Some(BinarisationInit::ITQ)
+        ));
+        assert!(matches!(
+            parse_binarisation_init("ITQ"),
+            Some(BinarisationInit::ITQ)
+        ));
+        assert!(matches!(
+            parse_binarisation_init("random"),
+            Some(BinarisationInit::RandomProjections)
+        ));
+        assert!(matches!(
+            parse_binarisation_init("random_projections"),
+            Some(BinarisationInit::RandomProjections)
+        ));
+        assert!(parse_binarisation_init("invalid").is_none());
+    }
+
+    #[test]
+    #[should_panic(expected = "n_bits must be multiple of 8")]
+    fn test_invalid_n_bits() {
+        let _binariser = Binariser::<f64>::new(64, 123, 42);
+    }
+
+    #[test]
+    #[should_panic(expected = "Vector dimension mismatch")]
+    fn test_dimension_mismatch() {
+        let binariser = Binariser::<f64>::new(64, 128, 42);
+        let wrong_vec: Vec<f64> = vec![0.0; 32];
+        let _binary = binariser.encode(&wrong_vec);
     }
 }

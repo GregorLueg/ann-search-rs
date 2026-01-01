@@ -9,7 +9,7 @@ better structure in higher dimensions to avoid the curse of dimensionality, via
 for example this command:
 
 ```bash
-cargo run --example gridsearch_ivf_sq8 --release --features quantiser -- --distance euclidean --dim 128 --data correlated
+cargo run --example gridsearch_ivf_sq8 --release --features quantised -- --distance euclidean --dim 128 --data correlated
 ```
 
 If you wish to run all of the benchmarks, below, you can just run:

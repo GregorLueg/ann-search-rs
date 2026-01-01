@@ -473,3 +473,165 @@ where
             + self.offsets.capacity() * std::mem::size_of::<usize>()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use faer::Mat;
+    use faer_traits::ComplexField;
+
+    fn create_test_data<T: Float + FromPrimitive + ComplexField>(n: usize, dim: usize) -> Mat<T> {
+        let mut data = Mat::zeros(n, dim);
+        for i in 0..n {
+            for j in 0..dim {
+                data[(i, j)] = T::from_f64((i * dim + j) as f64 * 0.1).unwrap();
+            }
+        }
+        data
+    }
+
+    #[test]
+    fn test_ivf_bf16_construction_euclidean() {
+        let data = create_test_data::<f32>(200, 32);
+        let index = IvfIndexBf16::build(
+            data.as_ref(),
+            Dist::Euclidean,
+            Some(10),
+            Some(10),
+            42,
+            false,
+        );
+
+        assert_eq!(index.n, 200);
+        assert_eq!(index.dim, 32);
+        assert_eq!(index.nlist, 10);
+        assert_eq!(index.vectors_flat.len(), 200 * 32);
+        assert!(index.norms.is_empty());
+    }
+
+    #[test]
+    fn test_ivf_bf16_construction_cosine() {
+        let data = create_test_data::<f32>(200, 32);
+        let index = IvfIndexBf16::build(data.as_ref(), Dist::Cosine, Some(10), Some(10), 42, false);
+
+        assert_eq!(index.n, 200);
+        assert_eq!(index.dim, 32);
+        assert_eq!(index.nlist, 10);
+        assert_eq!(index.norms.len(), 200);
+    }
+
+    #[test]
+    fn test_ivf_bf16_query_returns_k_results() {
+        let data = create_test_data::<f32>(200, 32);
+        let index = IvfIndexBf16::build(
+            data.as_ref(),
+            Dist::Euclidean,
+            Some(10),
+            Some(10),
+            42,
+            false,
+        );
+
+        let query: Vec<f32> = (0..32).map(|i| i as f32 * 0.1).collect();
+        let (indices, distances) = index.query(&query, 10, Some(10));
+
+        assert_eq!(indices.len(), 10);
+        assert_eq!(distances.len(), 10);
+    }
+
+    #[test]
+    fn test_ivf_bf16_query_sorted() {
+        let data = create_test_data::<f32>(200, 32);
+        let index = IvfIndexBf16::build(
+            data.as_ref(),
+            Dist::Euclidean,
+            Some(10),
+            Some(10),
+            42,
+            false,
+        );
+
+        let query: Vec<f32> = (0..32).map(|i| i as f32 * 0.1).collect();
+        let (_, distances) = index.query(&query, 10, Some(10));
+
+        for i in 1..distances.len() {
+            assert!(distances[i] >= distances[i - 1]);
+        }
+    }
+
+    #[test]
+    fn test_ivf_bf16_query_row() {
+        let data = create_test_data::<f32>(200, 32);
+        let index = IvfIndexBf16::build(
+            data.as_ref(),
+            Dist::Euclidean,
+            Some(10),
+            Some(10),
+            42,
+            false,
+        );
+
+        let (indices, distances) = index.query_row(data.as_ref().row(0), 10, Some(10));
+
+        assert!(indices.len() <= 10);
+        assert!(distances.len() <= 10);
+        assert_eq!(indices.len(), distances.len());
+    }
+
+    #[test]
+    fn test_ivf_bf16_query_cosine() {
+        let data = create_test_data::<f32>(200, 32);
+        let index = IvfIndexBf16::build(data.as_ref(), Dist::Cosine, Some(10), Some(10), 42, false);
+
+        let query: Vec<f32> = (0..32).map(|i| i as f32 * 0.1).collect();
+        let (indices, distances) = index.query(&query, 10, Some(10));
+
+        assert_eq!(indices.len(), 10);
+        assert_eq!(distances.len(), 10);
+        for i in 1..distances.len() {
+            assert!(distances[i] >= distances[i - 1]);
+        }
+    }
+
+    #[test]
+    fn test_ivf_bf16_knn_graph() {
+        let data = create_test_data::<f32>(100, 32);
+        let index = IvfIndexBf16::build(
+            data.as_ref(),
+            Dist::Euclidean,
+            Some(10),
+            Some(10),
+            42,
+            false,
+        );
+
+        let (knn_indices, knn_distances) = index.generate_knn(5, Some(10), true, false);
+
+        assert_eq!(knn_indices.len(), 100);
+        assert!(knn_distances.is_some());
+
+        for neighbours in knn_indices.iter() {
+            assert!(neighbours.len() <= 5);
+        }
+    }
+
+    #[test]
+    fn test_ivf_bf16_nprobe_variation() {
+        let data = create_test_data::<f32>(500, 32);
+        let index = IvfIndexBf16::build(
+            data.as_ref(),
+            Dist::Euclidean,
+            Some(20),
+            Some(10),
+            42,
+            false,
+        );
+
+        let query: Vec<f32> = (0..32).map(|i| i as f32 * 0.1).collect();
+        let (indices1, _) = index.query(&query, 10, Some(2));
+        let (indices2, _) = index.query(&query, 10, Some(10));
+
+        assert!(indices1.len() <= 10);
+        assert!(indices2.len() <= 10);
+    }
+}

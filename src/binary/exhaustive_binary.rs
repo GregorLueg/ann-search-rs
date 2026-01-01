@@ -8,6 +8,7 @@ use thousands::*;
 
 use crate::binary::binariser::*;
 use crate::binary::dist_binary::*;
+
 ///////////////////////////
 // ExhaustiveIndexBinary //
 ///////////////////////////
@@ -229,5 +230,109 @@ where
         std::mem::size_of_val(self)
             + self.vectors_flat_binarised.capacity()
             + self.binariser.memory_usage_bytes()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use faer::Mat;
+
+    fn create_test_data<T: Float + FromPrimitive + ComplexField>(n: usize, dim: usize) -> Mat<T> {
+        let mut data = Mat::zeros(n, dim);
+        for i in 0..n {
+            for j in 0..dim {
+                data[(i, j)] = T::from_f64((i * dim + j) as f64 * 0.1).unwrap();
+            }
+        }
+        data
+    }
+
+    #[test]
+    fn test_exhaustive_binary_construction() {
+        let data = create_test_data::<f32>(100, 32);
+        let index = ExhaustiveIndexBinary::new(data.as_ref(), "random", 64, 42);
+
+        assert_eq!(index.n, 100);
+        assert_eq!(index.n_bytes, 8);
+        assert_eq!(index.vectors_flat_binarised.len(), 100 * 8);
+    }
+
+    #[test]
+    fn test_exhaustive_binary_query_returns_k_results() {
+        let data = create_test_data::<f32>(100, 32);
+        let index = ExhaustiveIndexBinary::new(data.as_ref(), "random", 64, 42);
+
+        let query: Vec<f32> = (0..32).map(|i| i as f32 * 0.1).collect();
+        let (indices, distances) = index.query(&query, 10);
+
+        assert_eq!(indices.len(), 10);
+        assert_eq!(distances.len(), 10);
+    }
+
+    #[test]
+    fn test_exhaustive_binary_query_sorted() {
+        let data = create_test_data::<f32>(100, 32);
+        let index = ExhaustiveIndexBinary::new(data.as_ref(), "random", 64, 42);
+
+        let query: Vec<f32> = (0..32).map(|i| i as f32 * 0.1).collect();
+        let (_, distances) = index.query(&query, 10);
+
+        for i in 1..distances.len() {
+            assert!(distances[i] >= distances[i - 1]);
+        }
+    }
+
+    #[test]
+    fn test_exhaustive_binary_query_k_exceeds_n() {
+        let data = create_test_data::<f32>(50, 32);
+        let index = ExhaustiveIndexBinary::new(data.as_ref(), "random", 64, 42);
+
+        let query: Vec<f32> = (0..32).map(|i| i as f32 * 0.1).collect();
+        let (indices, _) = index.query(&query, 100);
+
+        assert_eq!(indices.len(), 50);
+    }
+
+    #[test]
+    fn test_exhaustive_binary_query_row() {
+        let data = create_test_data::<f32>(100, 32);
+        let index = ExhaustiveIndexBinary::new(data.as_ref(), "random", 64, 42);
+
+        let (indices1, distances1) = index.query_row(data.as_ref().row(0), 10);
+
+        assert_eq!(indices1.len(), 10);
+        assert_eq!(distances1.len(), 10);
+        assert_eq!(indices1[0], 0); // Should find itself first
+    }
+
+    #[test]
+    fn test_exhaustive_binary_knn_graph() {
+        let data = create_test_data::<f32>(50, 32);
+        let index = ExhaustiveIndexBinary::new(data.as_ref(), "random", 64, 42);
+
+        let (knn_indices, knn_distances) = index.generate_knn(data.as_ref(), 5, true, false);
+
+        assert_eq!(knn_indices.len(), 50);
+        assert!(knn_distances.is_some());
+        assert_eq!(knn_distances.as_ref().unwrap().len(), 50);
+
+        for neighbours in knn_indices.iter() {
+            assert_eq!(neighbours.len(), 5);
+        }
+    }
+
+    #[test]
+    fn test_hamming_distances_in_valid_range() {
+        let data = create_test_data::<f32>(100, 32);
+        let index = ExhaustiveIndexBinary::new(data.as_ref(), "random", 64, 42);
+
+        let query: Vec<f32> = (0..32).map(|i| i as f32 * 0.1).collect();
+        let (_, distances) = index.query(&query, 20);
+
+        // Hamming distance should be between 0 and n_bits
+        for &dist in &distances {
+            assert!(dist <= 64);
+        }
     }
 }

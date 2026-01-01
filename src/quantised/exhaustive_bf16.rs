@@ -338,3 +338,120 @@ where
             + self.norms.capacity() * std::mem::size_of::<T>()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use faer::Mat;
+    use faer_traits::ComplexField;
+
+    fn create_test_data<T: Float + FromPrimitive + ComplexField>(n: usize, dim: usize) -> Mat<T> {
+        let mut data = Mat::zeros(n, dim);
+        for i in 0..n {
+            for j in 0..dim {
+                data[(i, j)] = T::from_f64((i * dim + j) as f64 * 0.1).unwrap();
+            }
+        }
+        data
+    }
+
+    #[test]
+    fn test_exhaustive_bf16_construction_euclidean() {
+        let data = create_test_data::<f32>(100, 32);
+        let index = ExhaustiveIndexBf16::new(data.as_ref(), Dist::Euclidean);
+
+        assert_eq!(index.n, 100);
+        assert_eq!(index.dim, 32);
+        assert_eq!(index.vectors_flat.len(), 100 * 32);
+        assert!(index.norms.is_empty());
+    }
+
+    #[test]
+    fn test_exhaustive_bf16_construction_cosine() {
+        let data = create_test_data::<f32>(100, 32);
+        let index = ExhaustiveIndexBf16::new(data.as_ref(), Dist::Cosine);
+
+        assert_eq!(index.n, 100);
+        assert_eq!(index.dim, 32);
+        assert_eq!(index.norms.len(), 100);
+    }
+
+    #[test]
+    fn test_exhaustive_bf16_query_returns_k_results() {
+        let data = create_test_data::<f32>(100, 32);
+        let index = ExhaustiveIndexBf16::new(data.as_ref(), Dist::Euclidean);
+
+        let query: Vec<f32> = (0..32).map(|i| i as f32 * 0.1).collect();
+        let (indices, distances) = index.query(&query, 10);
+
+        assert_eq!(indices.len(), 10);
+        assert_eq!(distances.len(), 10);
+    }
+
+    #[test]
+    fn test_exhaustive_bf16_query_sorted() {
+        let data = create_test_data::<f32>(100, 32);
+        let index = ExhaustiveIndexBf16::new(data.as_ref(), Dist::Euclidean);
+
+        let query: Vec<f32> = (0..32).map(|i| i as f32 * 0.1).collect();
+        let (_, distances) = index.query(&query, 10);
+
+        for i in 1..distances.len() {
+            assert!(distances[i] >= distances[i - 1]);
+        }
+    }
+
+    #[test]
+    fn test_exhaustive_bf16_query_k_exceeds_n() {
+        let data = create_test_data::<f32>(50, 32);
+        let index = ExhaustiveIndexBf16::new(data.as_ref(), Dist::Euclidean);
+
+        let query: Vec<f32> = (0..32).map(|i| i as f32 * 0.1).collect();
+        let (indices, _) = index.query(&query, 100);
+
+        assert_eq!(indices.len(), 50);
+    }
+
+    #[test]
+    fn test_exhaustive_bf16_query_row() {
+        let data = create_test_data::<f32>(100, 32);
+        let index = ExhaustiveIndexBf16::new(data.as_ref(), Dist::Euclidean);
+
+        let (indices, distances) = index.query_row(data.as_ref().row(0), 10);
+
+        assert_eq!(indices.len(), 10);
+        assert_eq!(distances.len(), 10);
+        assert_eq!(indices[0], 0);
+    }
+
+    #[test]
+    fn test_exhaustive_bf16_query_cosine() {
+        let data = create_test_data::<f32>(100, 32);
+        let index = ExhaustiveIndexBf16::new(data.as_ref(), Dist::Cosine);
+
+        let query: Vec<f32> = (0..32).map(|i| i as f32 * 0.1).collect();
+        let (indices, distances) = index.query(&query, 10);
+
+        assert_eq!(indices.len(), 10);
+        assert_eq!(distances.len(), 10);
+        for i in 1..distances.len() {
+            assert!(distances[i] >= distances[i - 1]);
+        }
+    }
+
+    #[test]
+    fn test_exhaustive_bf16_knn_graph() {
+        let data = create_test_data::<f32>(50, 32);
+        let index = ExhaustiveIndexBf16::new(data.as_ref(), Dist::Euclidean);
+
+        let (knn_indices, knn_distances) = index.generate_knn(5, true, false);
+
+        assert_eq!(knn_indices.len(), 50);
+        assert!(knn_distances.is_some());
+        assert_eq!(knn_distances.as_ref().unwrap().len(), 50);
+
+        for neighbours in knn_indices.iter() {
+            assert_eq!(neighbours.len(), 5);
+        }
+    }
+}

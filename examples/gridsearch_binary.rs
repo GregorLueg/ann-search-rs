@@ -75,19 +75,29 @@ fn main() {
     println!("-----------------------------");
 
     // Binary exhaustive benchmarks
-    let n_bits_values = [128, 256, 512];
+    let n_bits_values = [
+        (128, "random"),
+        (128, "itq"),
+        (256, "random"),
+        (256, "itq"),
+        (512, "random"),
+        (512, "itq"),
+    ];
 
-    for n_bits in n_bits_values {
-        println!("Building binary exhaustive index (n_bits={})...", n_bits);
+    for (n_bits, init) in n_bits_values {
+        println!(
+            "Building binary exhaustive index (n_bits={}, init={})...",
+            n_bits, init
+        );
         let start = Instant::now();
         let binary_idx =
-            build_exhaustive_index_binary(data.as_ref(), n_bits, cli.seed as usize, "random");
+            build_exhaustive_index_binary(data.as_ref(), n_bits, cli.seed as usize, init);
         let build_time = start.elapsed().as_secs_f64() * 1000.0;
         let index_size_mb = binary_idx.memory_usage_bytes() as f64 / (1024.0 * 1024.0);
 
         println!(
-            "Self-querying binary exhaustive index (n_bits={})...",
-            n_bits
+            "Self-querying binary exhaustive index (n_bits={}, init={})...",
+            n_bits, init
         );
         let start = Instant::now();
         let (binary_neighbors_self, _) =
@@ -98,7 +108,7 @@ fn main() {
         let binary_purity = calculate_cluster_purity(&binary_neighbors_self, &cluster_labels);
 
         results.push(BenchmarkResultPurity {
-            method: format!("Exhaustive-Binary-{}", n_bits),
+            method: format!("ExhaustiveBinary-{}-{}", n_bits, init),
             build_time_ms: build_time,
             query_time_ms: self_query_time,
             total_time_ms: build_time + self_query_time,
@@ -117,16 +127,16 @@ fn main() {
         (cli.n_cells as f32 * 2.0).sqrt() as usize,
     ];
 
-    for n_bits in n_bits_values {
+    for (n_bits, init) in n_bits_values {
         for nlist in nlist_values {
             println!(
-                "Building IVF binary index (n_bits={}, nlist={})...",
-                n_bits, nlist
+                "Building IVF binary index (n_bits={}, nlist={}, init={})...",
+                n_bits, nlist, init
             );
             let start = Instant::now();
             let ivf_binary_idx = build_ivf_index_binary(
                 data.as_ref(),
-                "random",
+                init,
                 n_bits,
                 Some(nlist),
                 None,
@@ -155,8 +165,8 @@ fn main() {
                 }
 
                 println!(
-                    "Self-querying IVF binary index (n_bits={}, nlist={}, nprobe={})...",
-                    n_bits, nlist, nprobe
+                    "Self-querying IVF binary index (n_bits={}, init={}, nlist={}, nprobe={})...",
+                    n_bits, init, nlist, nprobe
                 );
                 let start = Instant::now();
                 let (ivf_binary_neighbors_self, _) = query_ivf_index_binary_self(
@@ -175,7 +185,10 @@ fn main() {
                     calculate_cluster_purity(&ivf_binary_neighbors_self, &cluster_labels);
 
                 results.push(BenchmarkResultPurity {
-                    method: format!("IVF-Binary-{}-nl{}-np{}", n_bits, nlist, nprobe),
+                    method: format!(
+                        "IVF-Binary-{}-nl{}-np{}-init:{}",
+                        n_bits, nlist, nprobe, init
+                    ),
                     build_time_ms: build_time,
                     query_time_ms: self_query_time,
                     total_time_ms: build_time + self_query_time,
