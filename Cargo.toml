@@ -55,3 +55,7 @@ required-features = ["quantised"]
 [[example]]
 name = "gridsearch_binary"
 required-features = ["binary"]
+
+[[example]]
+name = "gridsearch_rabitq"
+required-features = ["binary"]

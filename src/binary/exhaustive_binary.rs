@@ -138,7 +138,8 @@ where
 
     /// Query function for row references
     ///
-    /// Exhaustive search using Hamming distance on binarised query.
+    /// Exhaustive search using Hamming distance on binarised query. Leverages
+    /// optimised unsafe paths if possible.
     ///
     /// ### Params
     ///

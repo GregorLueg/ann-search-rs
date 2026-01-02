@@ -1,3 +1,7 @@
+use num_traits::{Float, FromPrimitive};
+
+use crate::binary::binariser::*;
+
 ////////////////////
 // VectorDistance //
 ////////////////////
@@ -62,6 +66,147 @@ pub trait VectorDistanceBinary {
                 .map(|(x, y)| (x ^ y).count_ones())
                 .sum()
         }
+    }
+}
+
+//////////////////////////
+// VectorDistanceRaBitQ //
+//////////////////////////
+
+pub trait VectorDistanceRaBitQ<T>
+where
+    T: Float + FromPrimitive,
+{
+    /// Binary codes (n × n_bytes)
+    fn vectors_binary(&self) -> &[u8];
+
+    /// Distance to centroid per vector
+    fn dist_to_centroid(&self) -> &[T];
+
+    /// Dot product correction per vector (v_c · v_)
+    fn dot_corrections(&self) -> &[T];
+
+    /// Bytes per binary code
+    fn n_bytes(&self) -> usize;
+
+    /// Vector dimensionality
+    fn dim(&self) -> usize;
+
+    /// Count of 1-bits in binary code for vector idx
+    ///
+    /// ### Params
+    ///
+    /// * `idx` - Position of the vector
+    ///
+    /// ### Returns
+    ///
+    /// Pop count for that vector
+    #[inline]
+    fn popcount(&self, idx: usize) -> u32 {
+        let start = idx * self.n_bytes();
+        let bytes = &self.vectors_binary()[start..start + self.n_bytes()];
+        bytes.iter().map(|b| b.count_ones()).sum()
+    }
+
+    /// Compute sum of query int4 values where binary bit is 1
+    ///
+    /// This is q_ · r in the paper notation
+    ///
+    /// ### Params
+    ///
+    /// * `query` - The `RaBitQQuery` structure.
+    /// * `idx` - The index of the internal product
+    ///
+    /// ### Returns
+    ///
+    /// To product as u32
+    #[inline]
+    fn dot_query_binary(&self, query: &RaBitQQuery<T>, idx: usize) -> u32 {
+        let start = idx * self.n_bytes();
+        let binary = &self.vectors_binary()[start..start + self.n_bytes()];
+        let dim = self.dim();
+
+        let mut sum: u32 = 0;
+        let full_bytes = dim / 8;
+
+        for byte_idx in 0..full_bytes {
+            let bits = binary[byte_idx];
+            let base = byte_idx * 8;
+            // Unroll the 8 bits
+            if bits != 0 {
+                sum += (query.quantised[base] as u32) * ((bits & 1) as u32);
+                sum += (query.quantised[base + 1] as u32) * (((bits >> 1) & 1) as u32);
+                sum += (query.quantised[base + 2] as u32) * (((bits >> 2) & 1) as u32);
+                sum += (query.quantised[base + 3] as u32) * (((bits >> 3) & 1) as u32);
+                sum += (query.quantised[base + 4] as u32) * (((bits >> 4) & 1) as u32);
+                sum += (query.quantised[base + 5] as u32) * (((bits >> 5) & 1) as u32);
+                sum += (query.quantised[base + 6] as u32) * (((bits >> 6) & 1) as u32);
+                sum += (query.quantised[base + 7] as u32) * (((bits >> 7) & 1) as u32);
+            }
+        }
+
+        // Handle remaining bits if dim not multiple of 8
+        let remaining = dim % 8;
+        if remaining > 0 {
+            let bits = binary[full_bytes];
+            let base = full_bytes * 8;
+            for bit_pos in 0..remaining {
+                sum += (query.quantised[base + bit_pos] as u32) * (((bits >> bit_pos) & 1) as u32);
+            }
+        }
+
+        sum
+    }
+
+    /// Estimate distance using RaBitQ formula
+    ///
+    /// dist(v, q) ≈ sqrt(||v-c||² + ||q-c||² - 2·||v-c||·||q-c||·(q_c · v_c))
+    ///
+    /// ### Params
+    ///
+    /// * `query` - `RaBitQQuery` of the query.
+    /// * `idx` - Internal vector index.
+    ///
+    /// ### Returns
+    ///
+    /// Approximated distance based on RaBitQ
+    #[inline]
+    fn rabitq_dist(&self, query: &RaBitQQuery<T>, idx: usize) -> T {
+        let dim_f = self.dim() as f32;
+
+        // v_dist = ||v - c||, q_dist = ||q - c||
+        let v_dist = self.dist_to_centroid()[idx].to_f32().unwrap();
+        let q_dist = query.dist_to_centroid.to_f32().unwrap();
+
+        // dot_corr = ||Rv_c||_1 (stored in index)
+        let dot_corr = self.dot_corrections()[idx].to_f32().unwrap();
+
+        // Expansion of the Int4 Query vs Binary Index dot product
+        // This computes: q_rotated · sgn(Rv_c)
+        let qr = self.dot_query_binary(query, idx) as f32;
+        let popcount = self.popcount(idx) as f32;
+        let sum_q = query.sum_quantised as f32;
+
+        let query_width = query.width.to_f32().unwrap();
+        let query_lower = query.lower.to_f32().unwrap();
+
+        // inner_product_sgn = 2 * (width * qr + lower * popcount) - (width * sum_q + dim * lower)
+        let inner_product_sgn = 2.0 * (query_width * qr + query_lower * popcount)
+            - (query_width * sum_q + dim_f * query_lower);
+
+        // Correct the inner product estimate:
+        // The binary vector has a length related to dot_corr.
+        // We normalize the estimate to the range [-1, 1] for unit vectors.
+        let q_dot_v = if dot_corr > 1e-6 {
+            (inner_product_sgn / dot_corr).clamp(-1.0, 1.0)
+        } else {
+            0.0
+        };
+
+        // Law of Cosines: dist² = ||v-c||² + ||q-c||² - 2·||v-c||·||q-c||·(q_c · v_c)
+        let dist_sq = v_dist * v_dist + q_dist * q_dist - 2.0 * v_dist * q_dist * q_dot_v;
+
+        T::from_f32(dist_sq.max(0.0).sqrt()).unwrap()
     }
 }
 

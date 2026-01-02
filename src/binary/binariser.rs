@@ -6,6 +6,9 @@ use rand::seq::SliceRandom;
 use rand::Rng;
 use rand::SeedableRng;
 use rand_distr::StandardNormal;
+use std::iter::Sum;
+
+use crate::utils::dist::*;
 
 ///////////////
 // Binariser //
@@ -325,7 +328,6 @@ where
 
         let projected_data = &sampled_data * &v_pc;
 
-        // FIX 1: Initialise R as random orthogonal matrix via QR decomposition
         let mut r_mat = Mat::<T>::zeros(n_pca_bits, n_pca_bits);
         for i in 0..n_pca_bits {
             for j in 0..n_pca_bits {
@@ -365,9 +367,6 @@ where
             }
         }
 
-        // FIX 2: Extra projections (when n_bits > dim) - just normalise, don't over-orthogonalise
-        // After dim orthogonal vectors in dim-dimensional space, there's no room left.
-        // Just use normalised random vectors for the extra bits.
         if self.n_bits > dim {
             for _ in n_pca_bits..self.n_bits {
                 let mut proj = Vec::with_capacity(dim);
@@ -395,6 +394,312 @@ where
         self.projections = projections;
     }
 }
+
+/////////////////////
+// RaBitQQuantiser //
+/////////////////////
+
+/// Encoded query for RaBitQ distance estimation
+///
+/// ### Fields
+///
+/// * `quantised` - Int4 quantised values (one per dimension, stored as u8)
+/// * `dist_to_centroid` - Distance from query to centroid
+/// * `lower` - Lower bound used in quantisation
+/// * `width` - Bucket width used in quantisation
+/// * `sum_quantised` - Sum of all quantised values
+pub struct RaBitQQuery<T> {
+    pub quantised: Vec<u8>,
+    pub dist_to_centroid: T,
+    pub lower: T,
+    pub width: T,
+    pub sum_quantised: u32,
+}
+
+/// RaBitQ quantiser
+///
+/// Transforms vectors relative to a centroid and encodes them as binary codes
+/// with correction factors for accurate distance estimation. This version is
+/// based on findings from ElasticSearch labs in terms of number of centroids,
+/// rotations, etc.
+///
+/// ### Fields
+///
+/// * `centroid` - Centroid of the training data
+/// * `dim` - Input dimensionality
+/// * `metric` - The distance metric used
+pub struct RaBitQQuantiser<T> {
+    pub centroid: Vec<T>,
+    pub rotation: Vec<T>,
+    pub dim: usize,
+    pub metric: Dist,
+}
+
+impl<T> RaBitQQuantiser<T>
+where
+    T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum + ComplexField,
+{
+    /// Create a new RaBitQ quantiser from training data
+    ///
+    /// Computes the centroid from all vectors. For cosine distance, vectors are
+    /// normalised before computing the centroid.
+    ///
+    /// ### Params
+    ///
+    /// * `data` - Training data matrix (n_samples × dim)
+    /// * `metric` - Dist metric (Euclidean or Cosine)
+    ///
+    /// ### Returns
+    ///
+    /// Initialised quantiser
+    pub fn new(data: MatRef<T>, metric: &Dist, seed: usize) -> Self {
+        let n = data.nrows();
+        let dim = data.ncols();
+
+        let mut centroid = vec![T::zero(); dim];
+
+        for i in 0..n {
+            let row = data.row(i);
+            let (scale, vec): (T, Vec<T>) = match metric {
+                Dist::Cosine => {
+                    let norm = compute_norm_row(row);
+                    if norm > T::epsilon() {
+                        (norm, row.iter().cloned().collect())
+                    } else {
+                        (T::one(), row.iter().cloned().collect())
+                    }
+                }
+                Dist::Euclidean => (T::one(), row.iter().cloned().collect()),
+            };
+
+            for d in 0..dim {
+                centroid[d] = centroid[d] + vec[d] / scale;
+            }
+        }
+
+        let n_t = T::from_usize(n).unwrap();
+        for d in 0..dim {
+            centroid[d] = centroid[d] / n_t;
+        }
+
+        let rotation = Self::generate_random_orthogonal(dim, seed as u64);
+
+        Self {
+            centroid,
+            rotation,
+            dim,
+            metric: *metric,
+        }
+    }
+
+    /// Encode a vector for indexing
+    ///
+    /// Returns binary code and correction factors.
+    ///
+    /// ### Params
+    ///
+    /// * `vec` - Input vector
+    ///
+    /// ### Returns
+    ///
+    /// Tuple of (binary_code, dist_to_centroid, dot_correction)
+    #[inline]
+    pub fn encode_vec(&self, vec: &[T]) -> (Vec<u8>, T, T) {
+        assert_eq!(vec.len(), self.dim);
+
+        let vec_norm: Vec<T> = match self.metric {
+            Dist::Cosine => {
+                let norm = compute_norm(vec);
+                if norm > T::epsilon() {
+                    vec.iter().map(|&x| x / norm).collect()
+                } else {
+                    vec.to_vec()
+                }
+            }
+            Dist::Euclidean => vec.to_vec(),
+        };
+
+        // Compute residual relative to centroid
+        let mut res = vec![T::zero(); self.dim];
+        for d in 0..self.dim {
+            res[d] = vec_norm[d] - self.centroid[d];
+        }
+
+        let dist_to_centroid = compute_norm(&res);
+
+        // Normalise residual to unit vector v_c
+        let mut v_c = vec![T::zero(); self.dim];
+        if dist_to_centroid > T::epsilon() {
+            for d in 0..self.dim {
+                v_c[d] = res[d] / dist_to_centroid;
+            }
+        }
+
+        // Apply rotation
+        let v_c_rotated = self.rotate(&v_c);
+
+        // Binary encode: Store the sign of the rotated components
+        let n_bytes = self.dim.div_ceil(8);
+        let mut binary = vec![0u8; n_bytes];
+        for d in 0..self.dim {
+            if v_c_rotated[d] >= T::zero() {
+                binary[d / 8] |= 1u8 << (d % 8);
+            }
+        }
+
+        // Dot correction: ||v_c_rotated||_1
+        // This represents the sum of absolute values of the unit residual components.
+        // In RaBitQ, this is used to scale the binary dot product back to an inner product estimate.
+        let mut dot_correction = T::zero();
+        for d in 0..self.dim {
+            dot_correction = dot_correction + v_c_rotated[d].abs();
+        }
+
+        (binary, dist_to_centroid, dot_correction)
+    }
+
+    /// Encode a query vector
+    ///
+    /// Transforms and scalar quantises to int4.
+    ///
+    /// ### Params
+    ///
+    /// * `vec` - Query vector
+    ///
+    /// ### Returns
+    ///
+    /// Encoded query with all metadata for distance estimation
+    pub fn encode_query(&self, vec: &[T]) -> RaBitQQuery<T> {
+        assert_eq!(vec.len(), self.dim);
+
+        let vec_norm: Vec<T> = match self.metric {
+            Dist::Cosine => {
+                let norm = compute_norm(vec);
+                if norm > T::epsilon() {
+                    vec.iter().map(|&x| x / norm).collect()
+                } else {
+                    vec.to_vec()
+                }
+            }
+            Dist::Euclidean => vec.to_vec(),
+        };
+
+        // compute residual: v - c
+        let mut res = vec![T::zero(); self.dim];
+        for d in 0..self.dim {
+            res[d] = vec_norm[d] - self.centroid[d];
+        }
+
+        // compute dist to centroid: ||v - c||
+        let dist_to_centroid = compute_norm(&res);
+
+        // normalise residual: v_c = (v - c) / ||v - c||
+        let mut q_c = vec![T::zero(); self.dim];
+        if dist_to_centroid > T::epsilon() {
+            for d in 0..self.dim {
+                q_c[d] = res[d] / dist_to_centroid;
+            }
+        }
+
+        // Apply same rotation
+        let q_c_rotated = self.rotate(&q_c);
+
+        // Scalar quantise the rotated vector
+        let mut lower = q_c_rotated[0];
+        let mut upper = q_c_rotated[0];
+        for d in 1..self.dim {
+            if q_c_rotated[d] < lower {
+                lower = q_c_rotated[d];
+            }
+            if q_c_rotated[d] > upper {
+                upper = q_c_rotated[d];
+            }
+        }
+
+        let range = upper - lower;
+        let width = if range > T::epsilon() {
+            range / T::from_f32(15.0).unwrap()
+        } else {
+            T::one()
+        };
+
+        let mut quantised = vec![0u8; self.dim];
+        let mut sum_quantised: u32 = 0;
+
+        for d in 0..self.dim {
+            let val = ((q_c_rotated[d] - lower) / width)
+                .round()
+                .to_u8()
+                .unwrap_or(0)
+                .min(15);
+            quantised[d] = val;
+            sum_quantised += val as u32;
+        }
+
+        RaBitQQuery {
+            quantised,
+            dist_to_centroid,
+            lower,
+            width,
+            sum_quantised,
+        }
+    }
+
+    /// Memory usage in bytes
+    ///
+    /// ### Returns
+    ///
+    /// The memory fingerprint in bytes
+    pub fn memory_usage_bytes(&self) -> usize {
+        std::mem::size_of_val(self) + self.centroid.capacity() * std::mem::size_of::<T>()
+    }
+
+    /// Generate a random orthogonal matrix
+    fn generate_random_orthogonal(dim: usize, seed: u64) -> Vec<T> {
+        let mut rng = StdRng::seed_from_u64(seed);
+
+        // Create random matrix
+        let mut mat = Mat::<T>::zeros(dim, dim);
+        for i in 0..dim {
+            for j in 0..dim {
+                let val: f64 = rng.sample(StandardNormal);
+                mat[(i, j)] = T::from_f64(val).unwrap();
+            }
+        }
+
+        // QR decomposition gives orthogonal Q
+        let qr = mat.as_ref().qr();
+        let q = qr.compute_Q();
+
+        // Flatten row-major for fast dot products
+        let mut rotation = Vec::with_capacity(dim * dim);
+        for i in 0..dim {
+            for j in 0..dim {
+                rotation.push(q[(i, j)]);
+            }
+        }
+        rotation
+    }
+
+    /// Apply rotation to a vector
+    #[inline]
+    fn rotate(&self, vec: &[T]) -> Vec<T> {
+        let mut rotated = vec![T::zero(); self.dim];
+        for i in 0..self.dim {
+            let base = i * self.dim;
+            let mut sum = T::zero();
+            for j in 0..self.dim {
+                sum = sum + self.rotation[base + j] * vec[j];
+            }
+            rotated[i] = sum;
+        }
+        rotated
+    }
+}
+
+///////////
+// Tests //
+///////////
 
 #[cfg(test)]
 mod tests {

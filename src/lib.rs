@@ -47,7 +47,7 @@ use crate::nndescent::*;
 use crate::utils::dist::*;
 
 #[cfg(feature = "binary")]
-use crate::binary::{exhaustive_binary::*, ivf_binary::*};
+use crate::binary::{exhaustive_binary::*, exhaustive_rabitq::*, ivf_binary::*};
 #[cfg(feature = "gpu")]
 use crate::gpu::{exhaustive_gpu::*, ivf_gpu::*};
 #[cfg(feature = "quantised")]
@@ -1740,4 +1740,89 @@ where
     T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum + ComplexField,
 {
     index.generate_knn(data, k, nprobe, return_dist, verbose)
+}
+
+///////////////////////
+// Exhaustive RaBitQ //
+///////////////////////
+
+#[cfg(feature = "binary")]
+/// Build an exhaustive RaBitQ index
+///
+/// ### Params
+///
+/// * `mat` - The initial matrix with samples x features
+/// * `dist_metric` - "euclidean" or "cosine"
+///
+/// ### Returns
+///
+/// The initialised `ExhaustiveIndexRaBitQ`
+pub fn build_exhaustive_index_rabitq<T>(
+    mat: MatRef<T>,
+    dist_metric: &str,
+    seed: usize,
+) -> ExhaustiveIndexRaBitQ<T>
+where
+    T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum + ComplexField,
+{
+    let ann_dist = parse_ann_dist(dist_metric).unwrap_or_default();
+    ExhaustiveIndexRaBitQ::new(mat, &ann_dist, seed)
+}
+
+#[cfg(feature = "binary")]
+/// Helper function to query a given exhaustive RaBitQ index
+///
+/// ### Params
+///
+/// * `query_mat` - The query matrix containing the samples × features
+/// * `index` - The exhaustive RaBitQ index
+/// * `k` - Number of neighbours to return
+/// * `return_dist` - Shall the distances be returned
+/// * `verbose` - Controls verbosity of the function
+///
+/// ### Returns
+///
+/// A tuple of `(knn_indices, optional distances)`
+pub fn query_exhaustive_index_rabitq<T>(
+    query_mat: MatRef<T>,
+    index: &ExhaustiveIndexRaBitQ<T>,
+    k: usize,
+    return_dist: bool,
+    verbose: bool,
+) -> (Vec<Vec<usize>>, Option<Vec<Vec<T>>>)
+where
+    T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum + ComplexField,
+{
+    query_parallel(query_mat.nrows(), return_dist, verbose, |i| {
+        index.query_row(query_mat.row(i), k)
+    })
+}
+
+#[cfg(feature = "binary")]
+/// Query an exhaustive RaBitQ index against itself
+///
+/// Generates a full kNN graph based on the internal data.
+///
+/// ### Params
+///
+/// * `data` - Original float data matrix [samples, features]
+/// * `index` - Reference to built index
+/// * `k` - Number of neighbours
+/// * `return_dist` - Return distances
+/// * `verbose` - Controls verbosity
+///
+/// ### Returns
+///
+/// Tuple of (indices, optional distances)
+pub fn query_exhaustive_index_rabitq_self<T>(
+    data: MatRef<T>,
+    index: &ExhaustiveIndexRaBitQ<T>,
+    k: usize,
+    return_dist: bool,
+    verbose: bool,
+) -> (Vec<Vec<usize>>, Option<Vec<Vec<T>>>)
+where
+    T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum + ComplexField,
+{
+    index.generate_knn(data, k, return_dist, verbose)
 }
