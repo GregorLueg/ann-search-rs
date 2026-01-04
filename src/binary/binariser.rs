@@ -9,12 +9,16 @@ use rand_distr::StandardNormal;
 use std::iter::Sum;
 
 use crate::utils::dist::*;
+use crate::utils::ivf_utils::*;
+use crate::utils::*;
 
 ///////////////
 // Binariser //
 ///////////////
 
 const MAX_SAMPLES_PCA: usize = 100_000;
+const ITQ_ITERATIONS: usize = 10;
+const RABITQ_K_MEANS_ITER: usize = 30;
 
 /// Initialisation of the binariser
 #[derive(Default)]
@@ -125,7 +129,7 @@ where
             mean: vec![T::zero(); dim],
         };
 
-        binariser.prepare_pca_with_itq(data, seed, 10);
+        binariser.prepare_pca_with_itq(data, seed, ITQ_ITERATIONS);
 
         binariser
     }
@@ -243,11 +247,7 @@ where
         self.projections = random_projections;
     }
 
-    /// Prepare PCA projections with ITQ rotation for optimal binary quantisation
-    ///
-    /// Implements the algorithm from "Iterative Quantization: A Procrustean
-    /// Approach to Learning Binary Codes for Large-scale Image Retrieval"
-    /// (Gong et al., 2013).
+    /// Prepare PCA projections with ITQ rotation for binary quantisation
     ///
     /// Steps:
     ///
@@ -255,32 +255,14 @@ where
     /// 2. Centre the data by subtracting the mean
     /// 3. Compute PCA to find principal components
     /// 4. Apply ITQ to find optimal rotation for binary quantisation
-    /// 5. If n_bits > dim, add orthogonalised random projections for remaining bits
+    /// 5. If n_bits > dim, add orthogonalised random projections for remaining
+    ///    bits
     ///
     /// ### Params
     ///
     /// * `data` - Training data matrix (n_samples × dim)
     /// * `seed` - Random seed for sampling and random projections
-    /// * `itq_iterations` - Number of ITQ iterations (typically 10-50)
-    ///   Prepare PCA projections with ITQ rotation for optimal binary quantisation
-    ///
-    /// Implements the algorithm from "Iterative Quantization: A Procrustean
-    /// Approach to Learning Binary Codes for Large-scale Image Retrieval"
-    /// (Gong et al., 2013).
-    ///
-    /// Steps:
-    ///
-    /// 1. Sample up to MAX_SAMPLES_PCA points if dataset is large
-    /// 2. Centre the data by subtracting the mean
-    /// 3. Compute PCA to find principal components
-    /// 4. Apply ITQ to find optimal rotation for binary quantisation
-    /// 5. If n_bits > dim, add normalised random projections for remaining bits
-    ///
-    /// ### Params
-    ///
-    /// * `data` - Training data matrix (n_samples × dim)
-    /// * `seed` - Random seed for sampling and random projections
-    /// * `itq_iterations` - Number of ITQ iterations (typically 10-50)
+    /// * `itq_iterations` - Number of ITQ iterations (defaults to 10)
     fn prepare_pca_with_itq(&mut self, data: MatRef<T>, seed: usize, itq_iterations: usize) {
         let n = data.nrows();
         let dim = data.ncols();
@@ -408,6 +390,7 @@ where
 /// * `lower` - Lower bound used in quantisation
 /// * `width` - Bucket width used in quantisation
 /// * `sum_quantised` - Sum of all quantised values
+#[repr(C)]
 pub struct RaBitQQuery<T> {
     pub quantised: Vec<u8>,
     pub dist_to_centroid: T,
@@ -416,22 +399,67 @@ pub struct RaBitQQuery<T> {
     pub sum_quantised: u32,
 }
 
-/// RaBitQ quantiser
-///
-/// Transforms vectors relative to a centroid and encodes them as binary codes
-/// with correction factors for accurate distance estimation. This version is
-/// based on findings from ElasticSearch labs in terms of number of centroids,
-/// rotations, etc.
+/// Per-cluster RaBitQ data
 ///
 /// ### Fields
 ///
-/// * `centroid` - Centroid of the training data
-/// * `dim` - Input dimensionality
-/// * `metric` - The distance metric used
-pub struct RaBitQQuantiser<T> {
+/// * `centroid` - The centroid of the this cluster
+/// * `vector_indices` - The indices of this cluster
+/// * `binary_codes` - The binarised codes of this cluster
+/// * `dist_to_centroid` - The distance to the centroid
+/// * `dot_corrections` - The dot corrections of this cluster
+pub struct RaBitQCluster<T> {
     pub centroid: Vec<T>,
+    pub vector_indices: Vec<usize>,
+    pub binary_codes: Vec<u8>,
+    pub dist_to_centroid: Vec<T>,
+    pub dot_corrections: Vec<T>,
+}
+
+impl<T: Float> RaBitQCluster<T> {
+    /// Generate a new cluster
+    ///
+    /// ### Params
+    ///
+    /// * `centroid` - The centroid of this cluster
+    ///
+    /// ### Returns
+    ///
+    /// Initialised self
+    fn new(centroid: Vec<T>) -> Self {
+        Self {
+            centroid,
+            vector_indices: Vec::new(),
+            binary_codes: Vec::new(),
+            dist_to_centroid: Vec::new(),
+            dot_corrections: Vec::new(),
+        }
+    }
+
+    /// Returns the number of vectors stored
+    ///
+    /// ### Returns
+    ///
+    /// Number of vectors in this cluster
+    fn n_vectors(&self) -> usize {
+        self.vector_indices.len()
+    }
+}
+
+/// RaBitQ quantiser with multi-centroid support
+///
+/// ### Fields
+///
+/// * `clusters` - The stored RaBitQ clusters per rotation
+/// * `rotations` - The rotation matrix
+/// * `dim` - Dimensionality of the data set
+/// * `n_bytes` - Number of used bytes
+/// * `metric` - Used distance metric
+pub struct RaBitQQuantiser<T> {
+    pub clusters: Vec<RaBitQCluster<T>>,
     pub rotation: Vec<T>,
     pub dim: usize,
+    pub n_bytes: usize,
     pub metric: Dist,
 }
 
@@ -439,172 +467,282 @@ impl<T> RaBitQQuantiser<T>
 where
     T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum + ComplexField,
 {
-    /// Create a new RaBitQ quantiser from training data
-    ///
-    /// Computes the centroid from all vectors. For cosine distance, vectors are
-    /// normalised before computing the centroid.
+    /// Create a new multi-centroid RaBitQ quantiser
     ///
     /// ### Params
     ///
     /// * `data` - Training data matrix (n_samples × dim)
-    /// * `metric` - Dist metric (Euclidean or Cosine)
+    /// * `metric` - Distance metric (Euclidean or Cosine)
+    /// * `n_clusters` - Number of clusters. If None, uses 0.5 * sqrt(n)
+    /// * `seed` - Random seed
     ///
     /// ### Returns
     ///
-    /// Initialised quantiser
-    pub fn new(data: MatRef<T>, metric: &Dist, seed: usize) -> Self {
-        let n = data.nrows();
-        let dim = data.ncols();
+    /// Initialised quantiser with encoded vectors
+    pub fn new(data: MatRef<T>, metric: &Dist, n_clusters: Option<usize>, seed: usize) -> Self {
+        let (mut data_flat, n, dim) = matrix_to_flat(data);
 
-        let mut centroid = vec![T::zero(); dim];
+        let n_bytes = dim.div_ceil(8);
+
+        // determine number of clusters
+        let k = n_clusters
+            .unwrap_or_else(|| ((n as f64).sqrt() * 0.5).ceil() as usize)
+            .max(1)
+            .min(n);
+
+        let mut data_norms = Vec::with_capacity(n);
 
         for i in 0..n {
             let row = data.row(i);
-            let (scale, vec): (T, Vec<T>) = match metric {
+            let vec: Vec<T> = row.iter().cloned().collect();
+
+            let norm = compute_norm(&vec);
+            data_norms.push(norm);
+
+            // for cosine, store normalised vectors for clustering
+            match metric {
                 Dist::Cosine => {
-                    let norm = compute_norm_row(row);
                     if norm > T::epsilon() {
-                        (norm, row.iter().cloned().collect())
+                        data_flat.extend(vec.iter().map(|&x| x / norm));
                     } else {
-                        (T::one(), row.iter().cloned().collect())
+                        data_flat.extend(vec);
                     }
                 }
-                Dist::Euclidean => (T::one(), row.iter().cloned().collect()),
-            };
-
-            for d in 0..dim {
-                centroid[d] = centroid[d] + vec[d] / scale;
+                Dist::Euclidean => {
+                    data_flat.extend(vec);
+                }
             }
         }
 
-        let n_t = T::from_usize(n).unwrap();
-        for d in 0..dim {
-            centroid[d] = centroid[d] / n_t;
-        }
+        // recompute norms after normalisation for cosine (they're all ~1.0 now)
+        let cluster_norms = if matches!(metric, Dist::Cosine) {
+            vec![T::one(); n]
+        } else {
+            data_norms.clone()
+        };
 
+        // train centroids
+        let centroids_flat = train_centroids(
+            &data_flat,
+            dim,
+            n,
+            k,
+            metric,
+            RABITQ_K_MEANS_ITER,
+            seed,
+            false,
+        );
+
+        // compute centroid norms for assignment
+        let centroid_norms: Vec<T> = (0..k)
+            .map(|c| {
+                let cent = &centroids_flat[c * dim..(c + 1) * dim];
+                cent.iter()
+                    .map(|&x| x * x)
+                    .fold(T::zero(), |a, b| a + b)
+                    .sqrt()
+            })
+            .collect();
+
+        // assign vectors to clusters
+        let assignments = assign_all_parallel(
+            &data_flat,
+            &cluster_norms,
+            dim,
+            n,
+            &centroids_flat,
+            &centroid_norms,
+            k,
+            metric,
+        );
+
+        // generate shared rotation matrix
         let rotation = Self::generate_random_orthogonal(dim, seed as u64);
 
+        // build clusters
+        let mut clusters: Vec<RaBitQCluster<T>> = (0..k)
+            .map(|c| {
+                let centroid = centroids_flat[c * dim..(c + 1) * dim].to_vec();
+                RaBitQCluster::new(centroid)
+            })
+            .collect();
+
+        // Encode each vector into its assigned cluster
+        for (vec_idx, &cluster_idx) in assignments.iter().enumerate() {
+            let vec = &data_flat[vec_idx * dim..(vec_idx + 1) * dim];
+            let cluster = &mut clusters[cluster_idx];
+
+            let (binary, dist, dot_corr) =
+                Self::encode_vec_internal(vec, &cluster.centroid, &rotation, dim);
+
+            cluster.vector_indices.push(vec_idx);
+            cluster.binary_codes.extend(binary);
+            cluster.dist_to_centroid.push(dist);
+            cluster.dot_corrections.push(dot_corr);
+        }
+
         Self {
-            centroid,
+            clusters,
             rotation,
             dim,
+            n_bytes,
             metric: *metric,
         }
     }
 
-    /// Encode a vector for indexing
+    /// Encode a vector relative to a specific centroid
     ///
-    /// Returns binary code and correction factors.
+    /// Function to encode the index-internal data.
     ///
     /// ### Params
     ///
-    /// * `vec` - Input vector
+    /// * `vec` - The vector to encode.
+    /// * `centroid` - The centroid of the cluster.
+    /// * `rotation` - The rotations to apply.
+    /// * `dim` - The dimensions of the data.
     ///
     /// ### Returns
     ///
-    /// Tuple of (binary_code, dist_to_centroid, dot_correction)
+    /// The `(binarised code, dist to centroid, correction for the dot product)`
     #[inline]
-    pub fn encode_vec(&self, vec: &[T]) -> (Vec<u8>, T, T) {
-        assert_eq!(vec.len(), self.dim);
-
-        let vec_norm: Vec<T> = match self.metric {
-            Dist::Cosine => {
-                let norm = compute_norm(vec);
-                if norm > T::epsilon() {
-                    vec.iter().map(|&x| x / norm).collect()
-                } else {
-                    vec.to_vec()
-                }
-            }
-            Dist::Euclidean => vec.to_vec(),
-        };
-
-        // Compute residual relative to centroid
-        let mut res = vec![T::zero(); self.dim];
-        for d in 0..self.dim {
-            res[d] = vec_norm[d] - self.centroid[d];
-        }
+    fn encode_vec_internal(
+        vec: &[T],
+        centroid: &[T],
+        rotation: &[T],
+        dim: usize,
+    ) -> (Vec<u8>, T, T) {
+        // compute residual
+        let res: Vec<T> = vec
+            .iter()
+            .zip(centroid.iter())
+            .map(|(&v, &c)| v - c)
+            .collect();
 
         let dist_to_centroid = compute_norm(&res);
 
-        // Normalise residual to unit vector v_c
-        let mut v_c = vec![T::zero(); self.dim];
-        if dist_to_centroid > T::epsilon() {
-            for d in 0..self.dim {
-                v_c[d] = res[d] / dist_to_centroid;
-            }
-        }
+        // normalise residual to unit vector
+        let v_c: Vec<T> = if dist_to_centroid > T::epsilon() {
+            res.iter().map(|&r| r / dist_to_centroid).collect()
+        } else {
+            vec![T::zero(); dim]
+        };
 
-        // Apply rotation
-        let v_c_rotated = self.rotate(&v_c);
+        // apply rotation
+        let v_c_rotated = Self::apply_rotation(&v_c, rotation, dim);
 
-        // Binary encode: Store the sign of the rotated components
-        let n_bytes = self.dim.div_ceil(8);
+        // binary encode
+        let n_bytes = dim.div_ceil(8);
         let mut binary = vec![0u8; n_bytes];
-        for d in 0..self.dim {
+        for d in 0..dim {
             if v_c_rotated[d] >= T::zero() {
                 binary[d / 8] |= 1u8 << (d % 8);
             }
         }
 
-        // Dot correction: ||v_c_rotated||_1
-        // This represents the sum of absolute values of the unit residual components.
-        // In RaBitQ, this is used to scale the binary dot product back to an inner product estimate.
-        let mut dot_correction = T::zero();
-        for d in 0..self.dim {
-            dot_correction = dot_correction + v_c_rotated[d].abs();
-        }
+        // dot correction: L1 norm of rotated unit residual
+        let dot_correction: T = v_c_rotated
+            .iter()
+            .map(|&x| x.abs())
+            .fold(T::zero(), |a, b| a + b);
 
         (binary, dist_to_centroid, dot_correction)
     }
 
-    /// Encode a query vector
-    ///
-    /// Transforms and scalar quantises to int4.
+    /// Find nearest clusters to a query vector
     ///
     /// ### Params
     ///
-    /// * `vec` - Query vector
+    /// * `query` - Query vector
+    /// * `n_probe` - Number of clusters to return
     ///
     /// ### Returns
     ///
-    /// Encoded query with all metadata for distance estimation
-    pub fn encode_query(&self, vec: &[T]) -> RaBitQQuery<T> {
-        assert_eq!(vec.len(), self.dim);
-
-        let vec_norm: Vec<T> = match self.metric {
+    /// Indices of nearest clusters, sorted by distance
+    #[inline]
+    pub fn find_nearest_clusters(&self, query: &[T], n_probe: usize) -> Vec<usize> {
+        let query_norm: Vec<T> = match self.metric {
             Dist::Cosine => {
-                let norm = compute_norm(vec);
+                let norm = compute_norm(query);
                 if norm > T::epsilon() {
-                    vec.iter().map(|&x| x / norm).collect()
+                    query.iter().map(|&x| x / norm).collect()
                 } else {
-                    vec.to_vec()
+                    query.to_vec()
                 }
             }
-            Dist::Euclidean => vec.to_vec(),
+            Dist::Euclidean => query.to_vec(),
         };
 
-        // compute residual: v - c
-        let mut res = vec![T::zero(); self.dim];
-        for d in 0..self.dim {
-            res[d] = vec_norm[d] - self.centroid[d];
+        let mut dists: Vec<(T, usize)> = self
+            .clusters
+            .iter()
+            .enumerate()
+            .map(|(i, c)| {
+                let d: T = query_norm
+                    .iter()
+                    .zip(c.centroid.iter())
+                    .map(|(&q, &c)| (q - c) * (q - c))
+                    .fold(T::zero(), |a, b| a + b);
+                (d, i)
+            })
+            .collect();
+
+        let n_probe = n_probe.min(self.clusters.len());
+
+        if n_probe < self.clusters.len() {
+            dists.select_nth_unstable_by(n_probe - 1, |a, b| a.0.partial_cmp(&b.0).unwrap());
+            dists.truncate(n_probe);
         }
 
-        // compute dist to centroid: ||v - c||
+        dists.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+        dists.into_iter().map(|(_, i)| i).collect()
+    }
+
+    /// Encode a query vector relative to a specific cluster
+    ///
+    /// ### Params
+    ///
+    /// * `query` - Query vector
+    /// * `cluster_idx` - Which cluster's centroid to use
+    ///
+    /// ### Returns
+    ///
+    /// Encoded query for distance estimation
+    #[inline]
+    pub fn encode_query(&self, query: &[T], cluster_idx: usize) -> RaBitQQuery<T> {
+        let centroid = &self.clusters[cluster_idx].centroid;
+
+        let query_norm: Vec<T> = match self.metric {
+            Dist::Cosine => {
+                let norm = compute_norm(query);
+                if norm > T::epsilon() {
+                    query.iter().map(|&x| x / norm).collect()
+                } else {
+                    query.to_vec()
+                }
+            }
+            Dist::Euclidean => query.to_vec(),
+        };
+
+        // residual relative to cluster centroid
+        let res: Vec<T> = query_norm
+            .iter()
+            .zip(centroid.iter())
+            .map(|(&q, &c)| q - c)
+            .collect();
+
         let dist_to_centroid = compute_norm(&res);
 
-        // normalise residual: v_c = (v - c) / ||v - c||
-        let mut q_c = vec![T::zero(); self.dim];
-        if dist_to_centroid > T::epsilon() {
-            for d in 0..self.dim {
-                q_c[d] = res[d] / dist_to_centroid;
-            }
-        }
+        // normalise residual
+        let q_c: Vec<T> = if dist_to_centroid > T::epsilon() {
+            res.iter().map(|&r| r / dist_to_centroid).collect()
+        } else {
+            vec![T::zero(); self.dim]
+        };
 
-        // Apply same rotation
-        let q_c_rotated = self.rotate(&q_c);
+        // apply rotation
+        let q_c_rotated = Self::apply_rotation(&q_c, &self.rotation, self.dim);
 
-        // Scalar quantise the rotated vector
+        // scalar quantise to int4
         let mut lower = q_c_rotated[0];
         let mut upper = q_c_rotated[0];
         for d in 1..self.dim {
@@ -645,20 +783,59 @@ where
         }
     }
 
+    /// Number of clusters
+    ///
+    /// ### Returns
+    ///
+    /// The number of clusters
+    pub fn n_clusters(&self) -> usize {
+        self.clusters.len()
+    }
+
+    /// Total number of vectors across all clusters
+    ///
+    /// ### Returns
+    ///
+    /// Total number of vectors stored in the quantiser
+    pub fn n_vectors(&self) -> usize {
+        self.clusters.iter().map(|c| c.n_vectors()).sum()
+    }
+
     /// Memory usage in bytes
     ///
     /// ### Returns
     ///
-    /// The memory fingerprint in bytes
+    /// The memory usage in bytes
     pub fn memory_usage_bytes(&self) -> usize {
-        std::mem::size_of_val(self) + self.centroid.capacity() * std::mem::size_of::<T>()
+        let base = std::mem::size_of_val(self);
+        let rotation = self.rotation.capacity() * std::mem::size_of::<T>();
+        let clusters: usize = self
+            .clusters
+            .iter()
+            .map(|c| {
+                c.centroid.capacity() * std::mem::size_of::<T>()
+                    + c.vector_indices.capacity() * std::mem::size_of::<usize>()
+                    + c.binary_codes.capacity()
+                    + c.dist_to_centroid.capacity() * std::mem::size_of::<T>()
+                    + c.dot_corrections.capacity() * std::mem::size_of::<T>()
+            })
+            .sum();
+        base + rotation + clusters
     }
 
     /// Generate a random orthogonal matrix
+    ///
+    /// ### Params
+    ///
+    /// * `dim` - The dimensions of the rotation matrix
+    /// * `seed` - Seed for reproducibility
+    ///
+    /// ### Returns
+    ///
+    /// A flattened orthogonal rotation matrix
     fn generate_random_orthogonal(dim: usize, seed: u64) -> Vec<T> {
         let mut rng = StdRng::seed_from_u64(seed);
 
-        // Create random matrix
         let mut mat = Mat::<T>::zeros(dim, dim);
         for i in 0..dim {
             for j in 0..dim {
@@ -667,11 +844,9 @@ where
             }
         }
 
-        // QR decomposition gives orthogonal Q
         let qr = mat.as_ref().qr();
         let q = qr.compute_Q();
 
-        // Flatten row-major for fast dot products
         let mut rotation = Vec::with_capacity(dim * dim);
         for i in 0..dim {
             for j in 0..dim {
@@ -682,14 +857,24 @@ where
     }
 
     /// Apply rotation to a vector
+    ///
+    /// ### Params
+    ///
+    /// * `vec` - The vector to which to apply the rotation.
+    /// * `rotation` - The rotation matrix to apply to the vector
+    /// * `dim` - Dimensions of the data
+    ///
+    /// ### Returns
+    ///
+    /// The vector with rotation applied
     #[inline]
-    fn rotate(&self, vec: &[T]) -> Vec<T> {
-        let mut rotated = vec![T::zero(); self.dim];
-        for i in 0..self.dim {
-            let base = i * self.dim;
+    fn apply_rotation(vec: &[T], rotation: &[T], dim: usize) -> Vec<T> {
+        let mut rotated = vec![T::zero(); dim];
+        for i in 0..dim {
+            let base = i * dim;
             let mut sum = T::zero();
-            for j in 0..self.dim {
-                sum = sum + self.rotation[base + j] * vec[j];
+            for j in 0..dim {
+                sum = sum + rotation[base + j] * vec[j];
             }
             rotated[i] = sum;
         }

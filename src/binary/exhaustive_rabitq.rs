@@ -4,6 +4,9 @@ use num_traits::{Float, FromPrimitive, ToPrimitive};
 use rayon::prelude::*;
 use std::collections::BinaryHeap;
 use std::iter::Sum;
+use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::Ordering;
+use std::sync::Arc;
 use thousands::*;
 
 use crate::binary::binariser::*;
@@ -11,57 +14,30 @@ use crate::binary::dist_binary::*;
 use crate::utils::dist::*;
 use crate::utils::heap_structs::*;
 
-///////////////////////////
-// ExhaustiveIndexRaBitQ //
-///////////////////////////
-
-/// Exhaustive RaBitQ nearest neighbour index
+/// Exhaustive RaBitQ index with multi-centroid support
 ///
-/// ### Fields
-///
-/// * `vectors_binary` - Binary codes (n × n_bytes)
-/// * `dist_to_centroid` - Distance to centroid per vector
-/// * `dot_corrections` - Dot correction per vector (v_c · v~)
-/// * `n_bytes` - Bytes per binary code
-/// * `n` - Number of vectors
-/// * `dim` - Dimensionality
-/// * `quantiser` - RaBitQ quantiser
+/// Uses IVF-style partitioning with RaBitQ encoding per cluster.
+/// At query time, probes the nearest clusters and searches exhaustively
+/// within each.
 pub struct ExhaustiveIndexRaBitQ<T> {
-    pub vectors_binary: Vec<u8>,
-    pub dist_to_centroid: Vec<T>,
-    pub dot_corrections: Vec<T>,
-    pub n_bytes: usize,
-    pub n: usize,
-    pub dim: usize,
     quantiser: RaBitQQuantiser<T>,
+    n: usize,
 }
-
-//////////////////////////
-// VectorDistanceRaBitQ //
-//////////////////////////
 
 impl<T> VectorDistanceRaBitQ<T> for ExhaustiveIndexRaBitQ<T>
 where
     T: Float + FromPrimitive,
 {
-    fn vectors_binary(&self) -> &[u8] {
-        &self.vectors_binary
-    }
-
-    fn dist_to_centroid(&self) -> &[T] {
-        &self.dist_to_centroid
-    }
-
-    fn dot_corrections(&self) -> &[T] {
-        &self.dot_corrections
+    fn clusters(&self) -> &[RaBitQCluster<T>] {
+        &self.quantiser.clusters
     }
 
     fn n_bytes(&self) -> usize {
-        self.n_bytes
+        self.quantiser.n_bytes
     }
 
     fn dim(&self) -> usize {
-        self.dim
+        self.quantiser.dim
     }
 }
 
@@ -74,40 +50,18 @@ where
     /// ### Params
     ///
     /// * `data` - Data matrix (n_samples × dim)
-    /// * `metric` - Distance metric
+    /// * `metric` - Distance metric (Euclidean or Cosine)
+    /// * `n_clusters` - Number of clusters. If None, uses 0.5 * sqrt(n)
+    /// * `seed` - Random seed
     ///
     /// ### Returns
     ///
     /// Initialised index
-    pub fn new(data: MatRef<T>, metric: &Dist, seed: usize) -> Self {
+    pub fn new(data: MatRef<T>, metric: &Dist, n_clusters: Option<usize>, seed: usize) -> Self {
         let n = data.nrows();
-        let dim = data.ncols();
-        let n_bytes = dim.div_ceil(8);
+        let quantiser = RaBitQQuantiser::new(data, metric, n_clusters, seed);
 
-        let quantiser = RaBitQQuantiser::new(data, metric, seed);
-
-        let mut vectors_binary = Vec::with_capacity(n * n_bytes);
-        let mut dist_to_centroid = Vec::with_capacity(n);
-        let mut dot_corrections = Vec::with_capacity(n);
-
-        for i in 0..n {
-            let vec: Vec<T> = data.row(i).iter().cloned().collect();
-            let (binary, dist, dot_corr) = quantiser.encode_vec(&vec);
-
-            vectors_binary.extend(binary);
-            dist_to_centroid.push(dist);
-            dot_corrections.push(dot_corr);
-        }
-
-        Self {
-            vectors_binary,
-            dist_to_centroid,
-            dot_corrections,
-            n_bytes,
-            n,
-            dim,
-            quantiser,
-        }
+        Self { quantiser, n }
     }
 
     /// Query for k nearest neighbours
@@ -115,49 +69,74 @@ where
     /// ### Params
     ///
     /// * `query_vec` - Query vector
-    /// * `k` - Number of neighbours
+    /// * `k` - Number of neighbours to return
+    /// * `n_probe` - Number of clusters to search. If None, searches 25% of the
+    ///   centroids.
     ///
     /// ### Returns
     ///
     /// Tuple of (indices, distances)
     #[inline]
-    pub fn query(&self, query_vec: &[T], k: usize) -> (Vec<usize>, Vec<T>) {
-        let encoded_query = self.quantiser.encode_query(query_vec);
+    pub fn query(&self, query_vec: &[T], k: usize, n_probe: Option<usize>) -> (Vec<usize>, Vec<T>) {
+        let n_probe = n_probe.unwrap_or((self.quantiser.n_clusters() as f32 * 0.2) as usize);
         let k = k.min(self.n);
+
+        let cluster_indices = self.quantiser.find_nearest_clusters(query_vec, n_probe);
 
         let mut heap: BinaryHeap<(OrderedFloat<T>, usize)> = BinaryHeap::with_capacity(k + 1);
 
-        for idx in 0..self.n {
-            let dist = self.rabitq_dist(&encoded_query, idx);
+        for &c_idx in &cluster_indices {
+            let query_encoded = self.quantiser.encode_query(query_vec, c_idx);
+            let cluster_size = self.cluster_size(c_idx);
 
-            if heap.len() < k {
-                heap.push((OrderedFloat(dist), idx));
-            } else if dist < heap.peek().unwrap().0 .0 {
-                heap.pop();
-                heap.push((OrderedFloat(dist), idx));
+            for local_idx in 0..cluster_size {
+                let dist = self.rabitq_dist(&query_encoded, c_idx, local_idx);
+                let global_idx = self.cluster_vector_indices(c_idx)[local_idx];
+
+                if heap.len() < k {
+                    heap.push((OrderedFloat(dist), global_idx));
+                } else if dist < heap.peek().unwrap().0 .0 {
+                    heap.pop();
+                    heap.push((OrderedFloat(dist), global_idx));
+                }
             }
         }
 
         let mut results: Vec<_> = heap.into_iter().collect();
-        results.sort_unstable_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+        results.sort_unstable();
 
-        let indices: Vec<usize> = results.iter().map(|(_, idx)| *idx).collect();
-        let distances: Vec<T> = results.iter().map(|(d, _)| d.0).collect();
+        let (distances, indices): (Vec<T>, Vec<usize>) =
+            results.into_iter().map(|(d, i)| (d.0, i)).unzip();
 
         (indices, distances)
     }
 
     /// Query using a row reference
+    ///
+    /// ### Params
+    ///
+    /// * `query_row` - Query row reference
+    /// * `k` - Number of neighbours to return
+    /// * `n_probe` - Number of clusters to search
+    ///
+    /// ### Returns
+    ///
+    /// Tuple of (indices, distances)
     #[inline]
-    pub fn query_row(&self, query_row: RowRef<T>, k: usize) -> (Vec<usize>, Vec<T>) {
+    pub fn query_row(
+        &self,
+        query_row: RowRef<T>,
+        k: usize,
+        n_probe: Option<usize>,
+    ) -> (Vec<usize>, Vec<T>) {
         if query_row.col_stride() == 1 {
             let slice =
                 unsafe { std::slice::from_raw_parts(query_row.as_ptr(), query_row.ncols()) };
-            return self.query(slice, k);
+            return self.query(slice, k, n_probe);
         }
 
         let query_vec: Vec<T> = query_row.iter().cloned().collect();
-        self.query(&query_vec, k)
+        self.query(&query_vec, k, n_probe)
     }
 
     /// Generate kNN graph
@@ -165,7 +144,8 @@ where
     /// ### Params
     ///
     /// * `data` - Original data matrix
-    /// * `k` - Neighbours per vector
+    /// * `k` - Number of neighbours per vector
+    /// * `n_probe` - Number of clusters to search per query
     /// * `return_dist` - Whether to return distances
     /// * `verbose` - Print progress
     ///
@@ -176,14 +156,10 @@ where
         &self,
         data: MatRef<T>,
         k: usize,
+        n_probe: Option<usize>,
         return_dist: bool,
         verbose: bool,
     ) -> (Vec<Vec<usize>>, Option<Vec<Vec<T>>>) {
-        use std::sync::{
-            atomic::{AtomicUsize, Ordering},
-            Arc,
-        };
-
         assert_eq!(data.nrows(), self.n, "Data row count mismatch");
 
         let counter = Arc::new(AtomicUsize::new(0));
@@ -195,7 +171,7 @@ where
 
                 if verbose {
                     let count = counter.fetch_add(1, Ordering::Relaxed) + 1;
-                    if count.is_multiple_of(100_000) {
+                    if count % 100_000 == 0 {
                         println!(
                             "  Processed {} / {} samples.",
                             count.separate_with_underscores(),
@@ -204,12 +180,12 @@ where
                     }
                 }
 
-                self.query(&vec, k)
+                self.query(&vec, k, n_probe)
             })
             .collect();
 
         if return_dist {
-            let (indices, distances) = results.into_iter().unzip();
+            let (indices, distances): (Vec<_>, Vec<_>) = results.into_iter().unzip();
             (indices, Some(distances))
         } else {
             let indices: Vec<Vec<usize>> = results.into_iter().map(|(idx, _)| idx).collect();
@@ -217,56 +193,23 @@ where
         }
     }
 
-    /// Memory usage in bytes
-    pub fn memory_usage_bytes(&self) -> usize {
-        std::mem::size_of_val(self)
-            + self.vectors_binary.capacity()
-            + self.dist_to_centroid.capacity() * std::mem::size_of::<f32>()
-            + self.dot_corrections.capacity() * std::mem::size_of::<f32>()
-            + self.quantiser.memory_usage_bytes()
+    /// Number of vectors in the index
+    pub fn len(&self) -> usize {
+        self.n
     }
 
-    pub fn debug_distance(&self, data: MatRef<T>, query_idx: usize, target_idx: usize) {
-        let query_vec: Vec<T> = data.row(query_idx).iter().cloned().collect();
-        let target_vec: Vec<T> = data.row(target_idx).iter().cloned().collect();
+    /// Check if index is empty
+    pub fn is_empty(&self) -> bool {
+        self.n == 0
+    }
 
-        // True Euclidean distance
-        let true_dist: f64 = query_vec
-            .iter()
-            .zip(target_vec.iter())
-            .map(|(&a, &b)| {
-                let diff = a.to_f64().unwrap() - b.to_f64().unwrap();
-                diff * diff
-            })
-            .sum::<f64>()
-            .sqrt();
+    /// Number of clusters
+    pub fn n_clusters(&self) -> usize {
+        self.quantiser.n_clusters()
+    }
 
-        let encoded_query = self.quantiser.encode_query(&query_vec);
-        let est_dist = self.rabitq_dist(&encoded_query, target_idx);
-
-        // Component breakdown
-        let v_dist = self.dist_to_centroid[target_idx].to_f64().unwrap();
-        let q_dist = encoded_query.dist_to_centroid.to_f64().unwrap();
-        let dot_corr = self.dot_corrections[target_idx].to_f64().unwrap();
-        let qr = self.dot_query_binary(&encoded_query, target_idx);
-        let popcount = self.popcount(target_idx);
-
-        println!("Query {} -> Target {}", query_idx, target_idx);
-        println!("  True dist:        {:.4}", true_dist);
-        println!("  Estimated dist:   {:.4}", est_dist.to_f64().unwrap());
-        println!("  v_dist (||v-c||): {:.4}", v_dist);
-        println!("  q_dist (||q-c||): {:.4}", q_dist);
-        println!("  dot_correction:   {:.4}", dot_corr);
-        println!("  qr (q̄·r):         {}", qr);
-        println!("  popcount:         {}", popcount);
-        println!("  sum_quantised:    {}", encoded_query.sum_quantised);
-        println!(
-            "  lower:            {:.4}",
-            encoded_query.lower.to_f64().unwrap()
-        );
-        println!(
-            "  width:            {:.4}",
-            encoded_query.width.to_f64().unwrap()
-        );
+    /// Memory usage in bytes
+    pub fn memory_usage_bytes(&self) -> usize {
+        std::mem::size_of_val(self) + self.quantiser.memory_usage_bytes()
     }
 }

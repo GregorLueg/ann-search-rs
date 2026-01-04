@@ -7,6 +7,7 @@ use num_traits::{Float, FromPrimitive, ToPrimitive};
 use rand::{rngs::StdRng, seq::SliceRandom, Rng, SeedableRng};
 use rand_distr::StandardNormal;
 use rustc_hash::FxHashSet;
+use thousands::*;
 
 ////////////
 // Consts //
@@ -38,7 +39,7 @@ pub const DEFAULT_INTRINSIC_DIM: usize = 16;
 /// * `seed` - Random seed for reproducibility
 /// * `distance` - The distance to use. One of `"euclidean"` or `"cosine"`.
 /// * `data` - The data to use. One of `"gaussian"` or `"correlated"`.
-#[derive(Parser)]
+#[derive(Parser, Clone)]
 pub struct Cli {
     #[arg(long, default_value_t = DEFAULT_N_CELLS)]
     pub n_cells: usize,
@@ -453,6 +454,43 @@ where
     (data_high_dim, cluster_assignments)
 }
 
+/// Wrapper function to generate the synthetic data to use
+///
+/// ### Params
+///
+/// * `cli` - The Cli structure with the data
+///
+/// ### Returns
+///
+/// `(syn data, cluster assignments)`
+pub fn generate_data(cli: &Cli) -> (Mat<f32>, Vec<usize>) {
+    let data_type = parse_data(&cli.data).unwrap_or_default();
+    let res: (Mat<f32>, Vec<usize>) = match data_type {
+        SyntheticData::GaussianNoise => {
+            generate_clustered_data(cli.n_cells, cli.dim, cli.n_clusters, cli.seed)
+        }
+        SyntheticData::Correlated => {
+            println!("Using data for high dimensional ANN searches...\n");
+            generate_clustered_data_high_dim(
+                cli.n_cells,
+                cli.dim,
+                cli.n_clusters,
+                DEFAULT_COR_STRENGTH,
+                cli.seed,
+            )
+        }
+        SyntheticData::LowRank => generate_low_rank_rotated_data(
+            cli.n_cells,
+            cli.dim,
+            cli.intrinsic_dim,
+            cli.n_clusters,
+            cli.seed,
+        ),
+    };
+
+    res
+}
+
 /// Randomly subsample a matrix and add Gaussian noise
 ///
 /// ### Params
@@ -653,6 +691,13 @@ pub fn calculate_cluster_purity(knn_graph: &[Vec<usize>], cluster_labels: &[usiz
 // Prints //
 ////////////
 
+fn format_with_underscores(value: f64) -> String {
+    let formatted = format!("{:.2}", value);
+    let parts: Vec<&str> = formatted.split('.').collect();
+    let int_part = parts[0].parse::<i64>().unwrap().separate_with_underscores();
+    format!("{}.{}", int_part, parts[1])
+}
+
 /// Helper to print results to console
 ///
 /// ### Params
@@ -670,11 +715,11 @@ pub fn print_results(config: &str, results: &[BenchmarkResult]) {
     println!("{:->110}", "");
     for result in results {
         println!(
-            "{:<45} {:>12.2} {:>12.2} {:>12.2} {:>12.4} {:>12.6}",
+            "{:<45} {:>12} {:>12} {:>12} {:>12.4} {:>12.6}",
             result.method,
-            result.build_time_ms,
-            result.query_time_ms,
-            result.total_time_ms,
+            format_with_underscores(result.build_time_ms),
+            format_with_underscores(result.query_time_ms),
+            format_with_underscores(result.total_time_ms),
             result.recall_at_k,
             result.mean_dist_err
         );
@@ -683,6 +728,8 @@ pub fn print_results(config: &str, results: &[BenchmarkResult]) {
 }
 
 /// Helper to print results to console
+///
+/// This version also returns the size of the index
 ///
 /// ### Params
 ///
@@ -699,11 +746,11 @@ pub fn print_results_size(config: &str, results: &[BenchmarkResultSize]) {
     println!("{:->123}", "");
     for result in results {
         println!(
-            "{:<45} {:>12.2} {:>12.2} {:>12.2} {:>12.4} {:>12.6} {:>12.2}",
+            "{:<45} {:>12} {:>12} {:>12} {:>12.4} {:>12.6} {:>12.2}",
             result.method,
-            result.build_time_ms,
-            result.query_time_ms,
-            result.total_time_ms,
+            format_with_underscores(result.build_time_ms),
+            format_with_underscores(result.query_time_ms),
+            format_with_underscores(result.total_time_ms),
             result.recall_at_k,
             result.mean_dist_err,
             result.index_size_mb
@@ -712,7 +759,14 @@ pub fn print_results_size(config: &str, results: &[BenchmarkResultSize]) {
     println!("{:->123}\n", "");
 }
 
-/// Print results with cluster purity
+/// Helper to print results to console
+///
+/// This version prints the cluster purity measure
+///
+/// ### Params
+///
+/// * `config` - Benchmark configuration
+/// * `results` - Benchmark results to print
 pub fn print_results_purity(config: &str, results: &[BenchmarkResultPurity]) {
     println!("\n{:=>123}", "");
     println!("Benchmark: {}", config);
@@ -724,11 +778,11 @@ pub fn print_results_purity(config: &str, results: &[BenchmarkResultPurity]) {
     println!("{:->123}", "");
     for result in results {
         println!(
-            "{:<45} {:>12.2} {:>12.2} {:>12.2} {:>12.4} {:>12.4} {:>12.2}",
+            "{:<45} {:>12} {:>12} {:>12} {:>12.4} {:>12.4} {:>12.2}",
             result.method,
-            result.build_time_ms,
-            result.query_time_ms,
-            result.total_time_ms,
+            format_with_underscores(result.build_time_ms),
+            format_with_underscores(result.query_time_ms),
+            format_with_underscores(result.total_time_ms),
             result.recall_at_k,
             result.cluster_purity,
             result.index_size_mb

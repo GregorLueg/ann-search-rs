@@ -1759,6 +1759,7 @@ where
 /// The initialised `ExhaustiveIndexRaBitQ`
 pub fn build_exhaustive_index_rabitq<T>(
     mat: MatRef<T>,
+    n_clust_rabitq: Option<usize>,
     dist_metric: &str,
     seed: usize,
 ) -> ExhaustiveIndexRaBitQ<T>
@@ -1766,7 +1767,7 @@ where
     T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum + ComplexField,
 {
     let ann_dist = parse_ann_dist(dist_metric).unwrap_or_default();
-    ExhaustiveIndexRaBitQ::new(mat, &ann_dist, seed)
+    ExhaustiveIndexRaBitQ::new(mat, &ann_dist, n_clust_rabitq, seed)
 }
 
 #[cfg(feature = "binary")]
@@ -1787,6 +1788,7 @@ pub fn query_exhaustive_index_rabitq<T>(
     query_mat: MatRef<T>,
     index: &ExhaustiveIndexRaBitQ<T>,
     k: usize,
+    n_probe: Option<usize>,
     return_dist: bool,
     verbose: bool,
 ) -> (Vec<Vec<usize>>, Option<Vec<Vec<T>>>)
@@ -1794,7 +1796,7 @@ where
     T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum + ComplexField,
 {
     query_parallel(query_mat.nrows(), return_dist, verbose, |i| {
-        index.query_row(query_mat.row(i), k)
+        index.query_row(query_mat.row(i), k, n_probe)
     })
 }
 
@@ -1818,11 +1820,12 @@ pub fn query_exhaustive_index_rabitq_self<T>(
     data: MatRef<T>,
     index: &ExhaustiveIndexRaBitQ<T>,
     k: usize,
+    n_probe: Option<usize>,
     return_dist: bool,
     verbose: bool,
 ) -> (Vec<Vec<usize>>, Option<Vec<Vec<T>>>)
 where
     T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum + ComplexField,
 {
-    index.generate_knn(data, k, return_dist, verbose)
+    index.generate_knn(data, k, n_probe, return_dist, verbose)
 }

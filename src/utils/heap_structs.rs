@@ -4,7 +4,7 @@ use num_traits::Float;
 // Float on heap //
 ///////////////////
 
-/// Faster than the sorts on full vectors and allows to keep data on heap
+/// Faster than the sorts on full large vectors and allows to keep data on heap
 #[derive(Clone, Copy, Debug)]
 pub struct OrderedFloat<T>(pub T);
 

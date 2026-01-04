@@ -20,31 +20,7 @@ fn main() {
     );
     println!("-----------------------------");
 
-    let data_type = parse_data(&cli.data).unwrap_or_default();
-
-    let (data, cluster_labels): (Mat<f32>, Vec<usize>) = match data_type {
-        SyntheticData::GaussianNoise => {
-            generate_clustered_data(cli.n_cells, cli.dim, cli.n_clusters, cli.seed)
-        }
-        SyntheticData::Correlated => {
-            println!("Using data for high dimensional ANN searches...\n");
-            generate_clustered_data_high_dim(
-                cli.n_cells,
-                cli.dim,
-                cli.n_clusters,
-                DEFAULT_COR_STRENGTH,
-                cli.seed,
-            )
-        }
-        SyntheticData::LowRank => generate_low_rank_rotated_data(
-            cli.n_cells,
-            cli.dim,
-            cli.intrinsic_dim,
-            cli.n_clusters,
-            cli.seed,
-        ),
-    };
-
+    let (data, cluster_labels): (Mat<f32>, Vec<usize>) = generate_data(&cli);
     let mut results = Vec::new();
 
     // Ground truth
@@ -76,20 +52,15 @@ fn main() {
     // RaBitQ exhaustive benchmark
     println!("Building RaBitQ exhaustive index...");
     let start = Instant::now();
-    let rabitq_idx = build_exhaustive_index_rabitq(data.as_ref(), &cli.distance, cli.seed as usize);
+    let rabitq_idx =
+        build_exhaustive_index_rabitq(data.as_ref(), None, &cli.distance, cli.seed as usize);
     let build_time = start.elapsed().as_secs_f64() * 1000.0;
     let index_size_mb = rabitq_idx.memory_usage_bytes() as f64 / (1024.0 * 1024.0);
-
-    rabitq_idx.debug_distance(data.as_ref(), 0, 0);
-    rabitq_idx.debug_distance(data.as_ref(), 1, 1);
-    rabitq_idx.debug_distance(data.as_ref(), 2, 2);
-    rabitq_idx.debug_distance(data.as_ref(), 10, 10);
-    rabitq_idx.debug_distance(data.as_ref(), 25, 25);
 
     println!("Self-querying RaBitQ exhaustive index...");
     let start = Instant::now();
     let (rabitq_neighbors_self, _) =
-        query_exhaustive_index_rabitq_self(data.as_ref(), &rabitq_idx, cli.k, false, false);
+        query_exhaustive_index_rabitq_self(data.as_ref(), &rabitq_idx, cli.k, None, false, false);
     let self_query_time = start.elapsed().as_secs_f64() * 1000.0;
 
     let recall_self = calculate_recall(&true_neighbors_self, &rabitq_neighbors_self, cli.k);

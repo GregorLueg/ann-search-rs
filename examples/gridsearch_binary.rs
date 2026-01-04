@@ -21,31 +21,7 @@ fn main() {
     );
     println!("-----------------------------");
 
-    let data_type = parse_data(&cli.data).unwrap_or_default();
-
-    let (data, cluster_labels): (Mat<f32>, Vec<usize>) = match data_type {
-        SyntheticData::GaussianNoise => {
-            generate_clustered_data(cli.n_cells, cli.dim, cli.n_clusters, cli.seed)
-        }
-        SyntheticData::Correlated => {
-            println!("Using data for high dimensional ANN searches...\n");
-            generate_clustered_data_high_dim(
-                cli.n_cells,
-                cli.dim,
-                cli.n_clusters,
-                DEFAULT_COR_STRENGTH,
-                cli.seed,
-            )
-        }
-        SyntheticData::LowRank => generate_low_rank_rotated_data(
-            cli.n_cells,
-            cli.dim,
-            cli.intrinsic_dim,
-            cli.n_clusters,
-            cli.seed,
-        ),
-    };
-
+    let (data, cluster_labels): (Mat<f32>, Vec<usize>) = generate_data(&cli);
     let mut results = Vec::new();
 
     // Ground truth
