@@ -156,7 +156,7 @@ IVF-BF16-nl547 (self)                             2_657.27     3_156.56     5_81
 </code></pre>
 </details>
 
-### SQ8 (IVF)
+### SQ8 (IVF and exhaustive)
 
 This index uses scalar quantisation to 8-bits. It projects every dimensions
 onto an `i8`. This also causes a reduction of the memory finger print. In the

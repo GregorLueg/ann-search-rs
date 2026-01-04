@@ -10,7 +10,6 @@ use std::iter::Sum;
 
 use crate::utils::dist::*;
 use crate::utils::ivf_utils::*;
-use crate::utils::*;
 
 ///////////////
 // Binariser //
@@ -50,15 +49,12 @@ pub fn parse_binarisation_init(s: &str) -> Option<BinarisationInit> {
 /// Binariser using random hyperplane projections
 ///
 /// Converts float vectors to binary codes using locality-sensitive hashing.
-/// Supports SimHash (for Cosine similarity) and E2LSH (for Euclidean distance).
 ///
 /// ### Fields
 ///
-/// * `random_projections` - Random vectors from N(0,1), flattened (n_bits *
-///   dim)
-/// * `random_offsets` - Random offsets for E2LSH (None for SimHash)
-/// * `bucket_width` - Bucket width for E2LSH (None for SimHash)
+/// * `projections` - Random or learned projection vectors, flattened (n_bits * dim)
 /// * `n_bits` - Number of bits in binary code (e.g., 256, 512)
+/// * `mean` - Mean vector for centering (used when initialised with PCA)
 /// * `dim` - Input vector dimensionality
 pub struct Binariser<T> {
     pub projections: Vec<T>,
@@ -71,17 +67,14 @@ impl<T> Binariser<T>
 where
     T: Float + FromPrimitive + ToPrimitive + ComplexField,
 {
-    /// Create a new binariser
+    /// Create a new binariser using random projections
     ///
-    /// Generates random projections and initialises hash function parameters.
-    /// SimHash orthogonalises projections for better quality.
+    /// Generates random orthogonalised projections for binary encoding.
     ///
     /// ### Params
     ///
     /// * `dim` - Input vector dimensionality
     /// * `n_bits` - Number of bits in output (must be multiple of 8)
-    /// * `bucket_width` - Bucket width for E2LSH (ignored for SimHash, defaults to 4.0 if None)
-    /// * `hash_func` - Hash function type (SimHash or E2LSH)
     /// * `seed` - Random seed for reproducibility
     ///
     /// ### Returns
@@ -136,8 +129,8 @@ where
 
     /// Encode a vector to binary
     ///
-    /// Computes hash code by projecting onto random vectors and quantising.
-    /// Uses different schemes based on initialised hash function.
+    /// Projects the input vector onto learned or random hyperplanes and
+    /// quantises the result to a binary code.
     ///
     /// ### Params
     ///
@@ -181,7 +174,7 @@ where
         total
     }
 
-    /// Generate random projections and orthogonalise them for SimHash
+    /// Generate random projections and orthogonalise them
     ///
     /// Creates orthonormal random hyperplanes for better hash quality.
     /// Orthogonalisation via Gram-Schmidt ensures projections are independent.
@@ -426,7 +419,7 @@ impl<T: Float> RaBitQCluster<T> {
     /// ### Returns
     ///
     /// Initialised self
-    fn new(centroid: Vec<T>) -> Self {
+    pub fn new(centroid: Vec<T>) -> Self {
         Self {
             centroid,
             vector_indices: Vec::new(),
@@ -480,16 +473,17 @@ where
     ///
     /// Initialised quantiser with encoded vectors
     pub fn new(data: MatRef<T>, metric: &Dist, n_clusters: Option<usize>, seed: usize) -> Self {
-        let (mut data_flat, n, dim) = matrix_to_flat(data);
+        let n = data.nrows();
+        let dim = data.ncols();
 
-        let n_bytes = dim.div_ceil(8);
-
-        // determine number of clusters
         let k = n_clusters
             .unwrap_or_else(|| ((n as f64).sqrt() * 0.5).ceil() as usize)
             .max(1)
             .min(n);
 
+        let n_bytes = dim.div_ceil(8);
+
+        let mut data_flat = Vec::with_capacity(n * dim);
         let mut data_norms = Vec::with_capacity(n);
 
         for i in 0..n {
@@ -892,6 +886,7 @@ mod tests {
     use crate::binary::dist_binary::hamming_distance;
     use faer::Mat;
 
+    // Binariser tests
     #[test]
     fn test_simhash_basic() {
         let dim = 128;
@@ -1063,5 +1058,146 @@ mod tests {
         let binariser = Binariser::<f64>::new(64, 128, 42);
         let wrong_vec: Vec<f64> = vec![0.0; 32];
         let _binary = binariser.encode(&wrong_vec);
+    }
+
+    // RaBitQQuantiser tests
+    #[test]
+    fn test_rabitq_basic() {
+        let n = 100;
+        let dim = 16;
+        let mut data = Mat::<f64>::zeros(n, dim);
+
+        for i in 0..n {
+            for j in 0..dim {
+                data[(i, j)] = ((i + j) as f64).sin();
+            }
+        }
+
+        let quantiser = RaBitQQuantiser::new(data.as_ref(), &Dist::Euclidean, Some(5), 42);
+
+        assert_eq!(quantiser.n_clusters(), 5);
+        assert_eq!(quantiser.n_vectors(), n);
+        assert_eq!(quantiser.dim, dim);
+    }
+
+    #[test]
+    fn test_rabitq_cosine() {
+        let n = 50;
+        let dim = 8;
+        let mut data = Mat::<f64>::zeros(n, dim);
+
+        for i in 0..n {
+            for j in 0..dim {
+                data[(i, j)] = (i as f64) + (j as f64) * 0.1;
+            }
+        }
+
+        let quantiser = RaBitQQuantiser::new(data.as_ref(), &Dist::Cosine, Some(3), 42);
+
+        assert_eq!(quantiser.n_clusters(), 3);
+        assert!(matches!(quantiser.metric, Dist::Cosine));
+    }
+
+    #[test]
+    fn test_rabitq_find_nearest_clusters() {
+        let n = 200;
+        let dim = 32;
+        let mut data = Mat::<f64>::zeros(n, dim);
+
+        for i in 0..n {
+            for j in 0..dim {
+                data[(i, j)] = ((i * j) as f64).sin() * (i as f64);
+            }
+        }
+
+        let quantiser = RaBitQQuantiser::new(data.as_ref(), &Dist::Euclidean, Some(10), 42);
+
+        let query: Vec<f64> = (0..dim).map(|i| (i as f64).cos()).collect();
+        let nearest = quantiser.find_nearest_clusters(&query, 3);
+
+        assert_eq!(nearest.len(), 3);
+        assert!(nearest.iter().all(|&idx| idx < 10));
+    }
+
+    #[test]
+    fn test_rabitq_encode_query() {
+        let n = 100;
+        let dim = 16;
+        let mut data = Mat::<f64>::zeros(n, dim);
+
+        for i in 0..n {
+            for j in 0..dim {
+                data[(i, j)] = (i as f64) * (j as f64);
+            }
+        }
+
+        let quantiser = RaBitQQuantiser::new(data.as_ref(), &Dist::Euclidean, Some(5), 42);
+
+        let query: Vec<f64> = (0..dim).map(|i| i as f64).collect();
+        let encoded = quantiser.encode_query(&query, 0);
+
+        assert_eq!(encoded.quantised.len(), dim);
+        assert!(encoded.sum_quantised <= 15 * dim as u32);
+    }
+
+    #[test]
+    fn test_rabitq_auto_clusters() {
+        let n = 100;
+        let dim = 8;
+        let mut data = Mat::<f64>::zeros(n, dim);
+
+        for i in 0..n {
+            for j in 0..dim {
+                data[(i, j)] = i as f64;
+            }
+        }
+
+        let quantiser = RaBitQQuantiser::new(data.as_ref(), &Dist::Euclidean, None, 42);
+
+        let expected_clusters = ((n as f64).sqrt() * 0.5).ceil() as usize;
+        assert_eq!(quantiser.n_clusters(), expected_clusters);
+    }
+
+    #[test]
+    fn test_rabitq_deterministic() {
+        let n = 50;
+        let dim = 8;
+        let mut data = Mat::<f64>::zeros(n, dim);
+
+        for i in 0..n {
+            for j in 0..dim {
+                data[(i, j)] = ((i + j) as f64).sin();
+            }
+        }
+
+        let q1 = RaBitQQuantiser::new(data.as_ref(), &Dist::Euclidean, Some(3), 42);
+        let q2 = RaBitQQuantiser::new(data.as_ref(), &Dist::Euclidean, Some(3), 42);
+
+        assert_eq!(q1.n_clusters(), q2.n_clusters());
+
+        let query: Vec<f64> = (0..dim).map(|i| i as f64).collect();
+        let enc1 = q1.encode_query(&query, 0);
+        let enc2 = q2.encode_query(&query, 0);
+
+        assert_eq!(enc1.quantised, enc2.quantised);
+        assert_eq!(enc1.sum_quantised, enc2.sum_quantised);
+    }
+
+    #[test]
+    fn test_rabitq_memory_usage() {
+        let n = 100;
+        let dim = 16;
+        let mut data = Mat::<f64>::zeros(n, dim);
+
+        for i in 0..n {
+            for j in 0..dim {
+                data[(i, j)] = i as f64;
+            }
+        }
+
+        let quantiser = RaBitQQuantiser::new(data.as_ref(), &Dist::Euclidean, Some(5), 42);
+        let mem = quantiser.memory_usage_bytes();
+
+        assert!(mem > 0);
     }
 }

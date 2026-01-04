@@ -214,11 +214,11 @@ does NOT provide re-ranking on the full vectors (yet).
   quantisation. In this case the `f32` or `f64` are transformed during storage 
   into `bf16` floats. These keep the range of `f32`; however, they reduce 
   precision.
-- *SQ8*: A scalar quantisation to `i8`. For each dimensions in the data, the
-  min and max values are being computed and the respective data points are 
-  projected to integers between `-128` to `127`. This enables fast integer math;
-  however, this comes at cost of precision. Only IVF is available with SQ8
-  quantisation.
+- *SQ8*: A scalar quantisation to `i8`. Exhaustive and IVF indices are provided.
+  For each dimensions in the data, the min and max values are being computed and 
+  the respective data points are projected to integers between `-128` to `127`. 
+  This enables fast integer math; however, this comes at cost of precision. Only 
+  IVF is available with SQ8 quantisation.
 - *PQ*: Uses product quantisation. Useful when the dimensions of the vectors
   are incredibly large and one needs to compress the index in memory even
   further. Only useful when dim ≥ 128 in most cases and ideal for very large

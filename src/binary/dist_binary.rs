@@ -262,6 +262,10 @@ pub fn hamming_distance(a: &[u8], b: &[u8]) -> u32 {
         .sum()
 }
 
+///////////
+// Tests //
+///////////
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -289,6 +293,36 @@ mod tests {
 
         fn n_bytes(&self) -> usize {
             self.n_bytes
+        }
+    }
+
+    struct TestRaBitQVectors {
+        clusters: Vec<RaBitQCluster<f64>>,
+        n_bytes: usize,
+        dim: usize,
+    }
+
+    impl TestRaBitQVectors {
+        fn new(clusters: Vec<RaBitQCluster<f64>>, n_bytes: usize, dim: usize) -> Self {
+            TestRaBitQVectors {
+                clusters,
+                n_bytes,
+                dim,
+            }
+        }
+    }
+
+    impl VectorDistanceRaBitQ<f64> for TestRaBitQVectors {
+        fn clusters(&self) -> &[RaBitQCluster<f64>] {
+            &self.clusters
+        }
+
+        fn n_bytes(&self) -> usize {
+            self.n_bytes
+        }
+
+        fn dim(&self) -> usize {
+            self.dim
         }
     }
 
@@ -430,5 +464,224 @@ mod tests {
 
         let expected = hamming_distance(&vec1, &vec2);
         assert_eq!(storage.hamming_distance(0, 1), expected);
+    }
+
+    // RaBitQ tests
+    #[test]
+    fn test_rabitq_popcount_basic() {
+        let mut cluster = RaBitQCluster::new(vec![0.0; 8]);
+        cluster.binary_codes = vec![0b00000000, 0b11111111, 0b10101010];
+        cluster.vector_indices = vec![0, 1, 2];
+        cluster.dist_to_centroid = vec![1.0, 1.0, 1.0];
+        cluster.dot_corrections = vec![1.0, 1.0, 1.0];
+
+        let storage = TestRaBitQVectors::new(vec![cluster], 1, 8);
+
+        assert_eq!(storage.popcount(0, 0), 0);
+        assert_eq!(storage.popcount(0, 1), 8);
+        assert_eq!(storage.popcount(0, 2), 4);
+    }
+
+    #[test]
+    fn test_rabitq_popcount_multi_byte() {
+        let mut cluster = RaBitQCluster::new(vec![0.0; 16]);
+        cluster.binary_codes = vec![
+            0b11110000, 0b10101010, 0b00001111, 0b01010101, 0b11111111, 0b11111111,
+        ];
+        cluster.vector_indices = vec![0, 1, 2];
+        cluster.dist_to_centroid = vec![1.0, 1.0, 1.0];
+        cluster.dot_corrections = vec![1.0, 1.0, 1.0];
+
+        let storage = TestRaBitQVectors::new(vec![cluster], 2, 16);
+
+        assert_eq!(storage.popcount(0, 0), 8);
+        assert_eq!(storage.popcount(0, 1), 8);
+        assert_eq!(storage.popcount(0, 2), 16);
+    }
+
+    #[test]
+    fn test_rabitq_dot_query_binary() {
+        let dim = 8;
+        let mut cluster = RaBitQCluster::new(vec![0.0; dim]);
+        cluster.binary_codes = vec![0b11110000];
+        cluster.vector_indices = vec![0];
+        cluster.dist_to_centroid = vec![1.0];
+        cluster.dot_corrections = vec![1.0];
+
+        let storage = TestRaBitQVectors::new(vec![cluster], 1, dim);
+
+        let query = RaBitQQuery {
+            quantised: vec![1, 2, 3, 4, 5, 6, 7, 8],
+            dist_to_centroid: 1.0,
+            lower: 0.0,
+            width: 1.0,
+            sum_quantised: 36,
+        };
+
+        // bits set: positions 4,5,6,7
+        // sum = 5 + 6 + 7 + 8 = 26
+        let result = storage.dot_query_binary(&query, 0, 0);
+        assert_eq!(result, 26);
+    }
+
+    #[test]
+    fn test_rabitq_dot_query_all_ones() {
+        let dim = 8;
+        let mut cluster = RaBitQCluster::new(vec![0.0; dim]);
+        cluster.binary_codes = vec![0b11111111];
+        cluster.vector_indices = vec![0];
+        cluster.dist_to_centroid = vec![1.0];
+        cluster.dot_corrections = vec![1.0];
+
+        let storage = TestRaBitQVectors::new(vec![cluster], 1, dim);
+
+        let query = RaBitQQuery {
+            quantised: vec![1, 2, 3, 4, 5, 6, 7, 8],
+            dist_to_centroid: 1.0,
+            lower: 0.0,
+            width: 1.0,
+            sum_quantised: 36,
+        };
+
+        let result = storage.dot_query_binary(&query, 0, 0);
+        assert_eq!(result, 36);
+    }
+
+    #[test]
+    fn test_rabitq_dot_query_all_zeros() {
+        let dim = 8;
+        let mut cluster = RaBitQCluster::new(vec![0.0; dim]);
+        cluster.binary_codes = vec![0b00000000];
+        cluster.vector_indices = vec![0];
+        cluster.dist_to_centroid = vec![1.0];
+        cluster.dot_corrections = vec![1.0];
+
+        let storage = TestRaBitQVectors::new(vec![cluster], 1, dim);
+
+        let query = RaBitQQuery {
+            quantised: vec![1, 2, 3, 4, 5, 6, 7, 8],
+            dist_to_centroid: 1.0,
+            lower: 0.0,
+            width: 1.0,
+            sum_quantised: 36,
+        };
+
+        let result = storage.dot_query_binary(&query, 0, 0);
+        assert_eq!(result, 0);
+    }
+
+    #[test]
+    fn test_rabitq_dot_query_non_aligned_dim() {
+        let dim = 10;
+        let mut cluster = RaBitQCluster::new(vec![0.0; dim]);
+        cluster.binary_codes = vec![0b11111111, 0b00000011];
+        cluster.vector_indices = vec![0];
+        cluster.dist_to_centroid = vec![1.0];
+        cluster.dot_corrections = vec![1.0];
+
+        let storage = TestRaBitQVectors::new(vec![cluster], 2, dim);
+
+        let query = RaBitQQuery {
+            quantised: vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10],
+            dist_to_centroid: 1.0,
+            lower: 0.0,
+            width: 1.0,
+            sum_quantised: 55,
+        };
+
+        // First byte: all 8 bits set = 1+2+3+4+5+6+7+8 = 36
+        // Second byte: bits 0,1 set = 9+10 = 19
+        let result = storage.dot_query_binary(&query, 0, 0);
+        assert_eq!(result, 55);
+    }
+
+    #[test]
+    fn test_rabitq_dist_identical() {
+        let dim = 8;
+        let mut cluster = RaBitQCluster::new(vec![0.0; dim]);
+        cluster.binary_codes = vec![0b11110000];
+        cluster.vector_indices = vec![0];
+        cluster.dist_to_centroid = vec![1.0];
+        cluster.dot_corrections = vec![8.0];
+
+        let storage = TestRaBitQVectors::new(vec![cluster], 1, dim);
+
+        let query = RaBitQQuery {
+            quantised: vec![8, 8, 8, 8, 8, 8, 8, 8],
+            dist_to_centroid: 1.0,
+            lower: 0.0,
+            width: 1.0,
+            sum_quantised: 64,
+        };
+
+        let dist = storage.rabitq_dist(&query, 0, 0);
+        assert!(dist >= 0.0);
+    }
+
+    #[test]
+    fn test_rabitq_dist_zero_correction() {
+        let dim = 8;
+        let mut cluster = RaBitQCluster::new(vec![0.0; dim]);
+        cluster.binary_codes = vec![0b00000000];
+        cluster.vector_indices = vec![0];
+        cluster.dist_to_centroid = vec![2.0];
+        cluster.dot_corrections = vec![0.0];
+
+        let storage = TestRaBitQVectors::new(vec![cluster], 1, dim);
+
+        let query = RaBitQQuery {
+            quantised: vec![5; 8],
+            dist_to_centroid: 3.0,
+            lower: 0.0,
+            width: 1.0,
+            sum_quantised: 40,
+        };
+
+        let dist = storage.rabitq_dist(&query, 0, 0);
+        // With zero dot_corr, q_dot_v should be 0
+        // dist = sqrt(4 + 9 - 0) = sqrt(13)
+        assert!((dist - 13.0_f64.sqrt()).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_rabitq_cluster_accessors() {
+        let dim = 8;
+        let mut cluster = RaBitQCluster::new(vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]);
+        cluster.binary_codes = vec![0b11110000, 0b00001111];
+        cluster.vector_indices = vec![10, 20];
+        cluster.dist_to_centroid = vec![1.5, 2.5];
+        cluster.dot_corrections = vec![0.8, 0.9];
+
+        let storage = TestRaBitQVectors::new(vec![cluster], 1, dim);
+
+        assert_eq!(storage.cluster_size(0), 2);
+        assert_eq!(storage.cluster_vector_indices(0), &[10, 20]);
+        assert_eq!(storage.cluster_dist_to_centroid(0), &[1.5, 2.5]);
+        assert_eq!(storage.cluster_dot_corrections(0), &[0.8, 0.9]);
+        assert_eq!(storage.cluster_binary(0).len(), 2);
+    }
+
+    #[test]
+    fn test_rabitq_multi_cluster() {
+        let dim = 8;
+        let mut cluster1 = RaBitQCluster::new(vec![0.0; dim]);
+        cluster1.binary_codes = vec![0b11111111];
+        cluster1.vector_indices = vec![0];
+        cluster1.dist_to_centroid = vec![1.0];
+        cluster1.dot_corrections = vec![1.0];
+
+        let mut cluster2 = RaBitQCluster::new(vec![1.0; dim]);
+        cluster2.binary_codes = vec![0b00000000];
+        cluster2.vector_indices = vec![1];
+        cluster2.dist_to_centroid = vec![2.0];
+        cluster2.dot_corrections = vec![2.0];
+
+        let storage = TestRaBitQVectors::new(vec![cluster1, cluster2], 1, dim);
+
+        assert_eq!(storage.clusters().len(), 2);
+        assert_eq!(storage.cluster_size(0), 1);
+        assert_eq!(storage.cluster_size(1), 1);
+        assert_eq!(storage.popcount(0, 0), 8);
+        assert_eq!(storage.popcount(1, 0), 0);
     }
 }

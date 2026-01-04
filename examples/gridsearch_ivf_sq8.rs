@@ -66,6 +66,58 @@ fn main() {
 
     println!("-----------------------------------------------------------------------------------------------");
 
+    // Exhaustive SQ8 query benchmark
+    println!("Building exhaustive SQ8 index...");
+    let start = Instant::now();
+    let exhaustive_sq8_idx = build_exhaustive_sq8_index(data.as_ref(), &cli.distance, false);
+    let build_time_sq8 = start.elapsed().as_secs_f64() * 1000.0;
+
+    let index_size_mb_sq8 = exhaustive_sq8_idx.memory_usage_bytes() as f64 / (1024.0 * 1024.0);
+
+    println!("Querying exhaustive SQ8 index...");
+    let start = Instant::now();
+    let (sq8_neighbors, _) = query_exhaustive_sq8_index(
+        query_data.as_ref(),
+        &exhaustive_sq8_idx,
+        cli.k,
+        false,
+        false,
+    );
+    let query_time_sq8 = start.elapsed().as_secs_f64() * 1000.0;
+
+    let recall_sq8 = calculate_recall(&true_neighbors, &sq8_neighbors, cli.k);
+
+    results.push(BenchmarkResultSize {
+        method: "Exhaustive-SQ8 (query)".to_string(),
+        build_time_ms: build_time_sq8,
+        query_time_ms: query_time_sq8,
+        total_time_ms: build_time_sq8 + query_time_sq8,
+        recall_at_k: recall_sq8,
+        mean_dist_err: f64::NAN,
+        index_size_mb: index_size_mb_sq8,
+    });
+
+    // Exhaustive SQ8 self-query benchmark
+    println!("Self-querying exhaustive SQ8 index...");
+    let start = Instant::now();
+    let (sq8_neighbors_self, _) =
+        query_exhaustive_sq8_self(&exhaustive_sq8_idx, cli.k, false, false);
+    let self_query_time_sq8 = start.elapsed().as_secs_f64() * 1000.0;
+
+    let recall_sq8_self = calculate_recall(&true_neighbors_self, &sq8_neighbors_self, cli.k);
+
+    results.push(BenchmarkResultSize {
+        method: "Exhaustive-SQ8 (self)".to_string(),
+        build_time_ms: build_time_sq8,
+        query_time_ms: self_query_time_sq8,
+        total_time_ms: build_time_sq8 + self_query_time_sq8,
+        recall_at_k: recall_sq8_self,
+        mean_dist_err: f64::NAN,
+        index_size_mb: index_size_mb_sq8,
+    });
+
+    println!("-----------------------------------------------------------------------------------------------");
+
     let nlist_values = [
         (cli.n_cells as f32 * 0.5).sqrt() as usize,
         (cli.n_cells as f32).sqrt() as usize,
