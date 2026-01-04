@@ -3,7 +3,7 @@
 Below are all of the standard indices shown and their performance. These
 are run via:
 
-</code></pre>bash
+```bash
 # Run with default parameters
 cargo run --example gridsearch_<INDEX> --release -- --distance euclidean
 
@@ -18,13 +18,13 @@ cargo run --example gridsearch_<INDEX> --release -- --distance cosine
 # --seed 42
 # --distance cosine
 # --data gaussian
-</code></pre>
+```
 
 If you wish to run all of them, you can just run:
 
-</code></pre>bash
+```bash
 bash ./examples/run_benchmarks.sh --standard
-</code></pre>
+```
 
 ### Annoy
 
