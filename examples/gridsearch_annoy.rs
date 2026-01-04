@@ -102,7 +102,7 @@ fn main() {
             let query_time = start.elapsed().as_secs_f64() * 1000.0;
 
             let recall = calculate_recall(&true_neighbors, &approx_neighbors, cli.k);
-            let dist_error = calculate_distance_error(
+            let dist_error = calculate_dist_error(
                 true_distances.as_ref().unwrap(),
                 approx_distances.as_ref().unwrap(),
                 cli.k,
@@ -127,7 +127,7 @@ fn main() {
         let self_query_time = start.elapsed().as_secs_f64() * 1000.0;
 
         let recall_self = calculate_recall(&true_neighbors_self, &approx_neighbors_self, cli.k);
-        let dist_error_self = calculate_distance_error(
+        let dist_error_self = calculate_dist_error(
             true_distances_self.as_ref().unwrap(),
             approx_distances_self.as_ref().unwrap(),
             cli.k,

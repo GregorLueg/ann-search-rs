@@ -469,16 +469,13 @@ pub fn generate_data(cli: &Cli) -> (Mat<f32>, Vec<usize>) {
         SyntheticData::GaussianNoise => {
             generate_clustered_data(cli.n_cells, cli.dim, cli.n_clusters, cli.seed)
         }
-        SyntheticData::Correlated => {
-            println!("Using data for high dimensional ANN searches...\n");
-            generate_clustered_data_high_dim(
-                cli.n_cells,
-                cli.dim,
-                cli.n_clusters,
-                DEFAULT_COR_STRENGTH,
-                cli.seed,
-            )
-        }
+        SyntheticData::Correlated => generate_clustered_data_high_dim(
+            cli.n_cells,
+            cli.dim,
+            cli.n_clusters,
+            DEFAULT_COR_STRENGTH,
+            cli.seed,
+        ),
         SyntheticData::LowRank => generate_low_rank_rotated_data(
             cli.n_cells,
             cli.dim,
@@ -643,7 +640,7 @@ pub fn calculate_recall(
 /// ### Returns
 ///
 /// The mean distance error
-pub fn calculate_distance_error<T>(true_dist: &[Vec<T>], approx_dist: &[Vec<T>], k: usize) -> f64
+pub fn calculate_dist_error<T>(true_dist: &[Vec<T>], approx_dist: &[Vec<T>], k: usize) -> f64
 where
     T: Float + ToPrimitive,
 {

@@ -334,8 +334,8 @@ where
     /// Number of bytes used by the index
     pub fn memory_usage_bytes(&self) -> usize {
         std::mem::size_of_val(self)
-            + self.vectors_flat.capacity() * std::mem::size_of::<T>()
-            + self.norms.capacity() * std::mem::size_of::<T>()
+            + self.vectors_flat.capacity() * std::mem::size_of::<bf16>()
+            + self.norms.capacity() * std::mem::size_of::<bf16>()
     }
 }
 

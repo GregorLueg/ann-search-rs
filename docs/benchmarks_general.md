@@ -38,6 +38,7 @@ increases quite drastically the increased number of trees.
 - *Search budget (s)*: The search budget per tree. If set to auto it uses
   `k * n_trees * 20`; versions with a `10x` or `5x` (i.e., less) are also shown.
 
+````
 **Euclidean:**
 
 Below are the results for the Euclidean distance measure for Annoy. Self is
@@ -124,6 +125,7 @@ Annoy-nt100-s:5x (query)                            968.44       575.21      154
 Annoy-nt100 (self)                                  968.44      5700.78      6669.22       0.9964     0.000006       241.09
 ---------------------------------------------------------------------------------------------------------------------------
 ```
+````
 
 ### HNSW
 
