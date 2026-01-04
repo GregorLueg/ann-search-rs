@@ -26,6 +26,14 @@ If you wish to run all of them, you can just run:
 bash ./examples/run_benchmarks.sh --standard
 ```
 
+## Table of Contents
+
+- [Annoy](#annoy)
+- [HNSW](#hnsw)
+- [LSH](#lsh)
+- [IVF](#ivf)
+- [NNDescent](#nndescent)
+
 ### Annoy
 
 Approximate nearest neighbours Oh Yeah. A tree-based method for vector searches.
