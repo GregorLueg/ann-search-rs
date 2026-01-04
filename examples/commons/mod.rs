@@ -75,7 +75,7 @@ pub enum SyntheticData {
     #[default]
     GaussianNoise,
     Correlated,
-    LowRank, // Add this
+    LowRank,
 }
 
 /// Helper function to parse the data type
@@ -307,11 +307,10 @@ where
     (data, cluster_assignments)
 }
 
-/// Generate data specifically designed to benefit from PCA+ITQ
+/// Generate data specifically
 ///
 /// Creates high-dimensional data that actually lives in a low-dimensional
-/// subspace with rotated cluster structure. This is where ITQ should dominate
-/// random projections.
+/// subspace with rotated cluster structure.
 ///
 /// ### Params
 ///
@@ -467,22 +466,29 @@ pub fn generate_data(cli: &Cli) -> (Mat<f32>, Vec<usize>) {
     let data_type = parse_data(&cli.data).unwrap_or_default();
     let res: (Mat<f32>, Vec<usize>) = match data_type {
         SyntheticData::GaussianNoise => {
+            println!(">>> Using simple Gaussian cluster data. <<<");
             generate_clustered_data(cli.n_cells, cli.dim, cli.n_clusters, cli.seed)
         }
-        SyntheticData::Correlated => generate_clustered_data_high_dim(
-            cli.n_cells,
-            cli.dim,
-            cli.n_clusters,
-            DEFAULT_COR_STRENGTH,
-            cli.seed,
-        ),
-        SyntheticData::LowRank => generate_low_rank_rotated_data(
-            cli.n_cells,
-            cli.dim,
-            cli.intrinsic_dim,
-            cli.n_clusters,
-            cli.seed,
-        ),
+        SyntheticData::Correlated => {
+            println!(">>> Using data with subspace structure and correlated features. <<<");
+            generate_clustered_data_high_dim(
+                cli.n_cells,
+                cli.dim,
+                cli.n_clusters,
+                DEFAULT_COR_STRENGTH,
+                cli.seed,
+            )
+        }
+        SyntheticData::LowRank => {
+            println!(">>> Using data that simulating manifold hypothesis. <<<");
+            generate_low_rank_rotated_data(
+                cli.n_cells,
+                cli.dim,
+                cli.intrinsic_dim,
+                cli.n_clusters,
+                cli.seed,
+            )
+        }
     };
 
     res

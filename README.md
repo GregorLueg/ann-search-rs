@@ -108,6 +108,33 @@ across various parameters per given index.
 
 ## Performance and parameters
 
+### Synthetic data sets
+
+**GaussianNoise**
+
+Generates simple Gaussian clusters with variable sizes and standard deviations. 
+Each cluster is a blob centred in the full dimensional space. Useful for basic 
+benchmarking where clusters are well-separated and occupy the entire ambient 
+space.
+
+**Correlated**
+
+Creates clusters with subspace structure where each cluster only activates a 
+subset of dimensions. Additionally introduces explicit correlation patterns 
+where groups of dimensions are linear combinations of source dimensions. 
+Designed to test methods that exploit inter-dimensional correlations and sparse 
+activation patterns.
+
+**LowRank**
+
+Generates data that lives in a low-dimensional subspace (intrinsic_dim) and 
+embeds it via random rotation into high-dimensional space (embedding_dim). 
+Simulates the manifold hypothesis where high-dimensional data actually lies on a 
+lower-dimensional manifold. Adds minimal isotropic noise to model measurement 
+error.
+
+### Running the grid searches
+
 To identify good basic thresholds, there are a set of different gridsearch
 scripts available. These can be run via
 
@@ -179,20 +206,30 @@ Detailed benchmarks on all the standard benchmarks can be found
 
 The crate also provides some quantised approximate nearest neighbour searches, 
 designed for very large data sets where memory and time both start becoming 
-incredibly constraining. There are a total of three different quantisation
-methods available:
+incredibly constraining. There are a total of four different quantisation
+methods available (plus some binary quantisation, see further below). The crate
+does NOT provide re-ranking on the full vectors (yet).
 
-- *IVF-SQ8*: Uses a scalar quantisation and transforms the different feature
-  dimensions to `i8` and leverages very fast integer math to compute the nearest
-  neighbours (at a loss of precision).
-- *IVF-PQ*: Uses product quantisation. Useful when the dimensions of the vectors
-  are incredibly large and one needs to compress the index in memory. However,
-  as you can see below, this comes at a cost of Recall.
-- *IVF-OPQ*: Uses optimised product quantisation. Tries to de-correlate the
-  residuals 
+- *BF16*: An exhaustive search and IVF index are available with BF16 
+  quantisation. In this case the `f32` or `f64` are transformed during storage 
+  into `bf16` floats. These keep the range of `f32`; however, they reduce 
+  precision.
+- *SQ8*: A scalar quantisation to `i8`. For each dimensions in the data, the
+  min and max values are being computed and the respective data points are 
+  projected to integers between `-128` to `127`. This enables fast integer math;
+  however, this comes at cost of precision. Only IVF is available with SQ8
+  quantisation.
+- *PQ*: Uses product quantisation. Useful when the dimensions of the vectors
+  are incredibly large and one needs to compress the index in memory even
+  further. Only useful when dim ≥ 128 in most cases and ideal for very large
+  dimensions. Only IVF is available with product quantisation.
+- *OPQ*: Uses optimised product quantisation. Tries to de-correlate the
+  residuals and can in times improve the Recall. Please see the benchmarks.
+  Only IVF is available with optimised product quantisation. 
 
-The benchmarks can be found [here](https://github.com/GregorLueg/ann-search-rs/blob/main/docs/benchmarks_quantised.md). 
-If you wish to use these, please add the "quantised" feature
+The benchmarks can be found 
+[here](https://github.com/GregorLueg/ann-search-rs/blob/main/docs/benchmarks_quantised.md). 
+If you wish to use these, please add the `"quantised"` feature:
 
 ```toml
 [dependencies]
@@ -219,6 +256,8 @@ ann-search-rs = { version = "*", features = ["gpu"] }
 There is for sure room for improvement in terms of the design of the indices,
 but they do the job as is. Longer term, I will add smarter design(s) to avoid
 the CPU to GPU and back copying of data.
+
+## Binarised indices
 
 ## Licence
 

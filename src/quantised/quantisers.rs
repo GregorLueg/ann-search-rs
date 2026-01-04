@@ -144,6 +144,7 @@ where
     /// ### Returns
     ///
     /// The quantised vector
+    #[inline]
     pub fn encode(&self, vec: &[T]) -> Vec<i8> {
         vec.iter()
             .enumerate()
@@ -167,6 +168,7 @@ where
     /// ### Returns
     ///
     /// Original decompressed vector
+    #[inline]
     pub fn decode(&self, quantised: &[i8]) -> Vec<T> {
         quantised
             .iter()

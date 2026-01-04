@@ -399,6 +399,10 @@ where
     }
 
     /// Returns the size of the index in bytes
+    ///
+    /// ### Returns
+    ///
+    /// The memory finger print in bytes
     pub fn memory_usage_bytes(&self) -> usize {
         std::mem::size_of_val(self)
             + self.vectors_flat_binarised.capacity()
@@ -553,7 +557,7 @@ mod tests {
         assert!(knn_distances.is_some());
 
         for neighbours in knn_indices.iter() {
-            assert!(neighbours.len() <= 5); 
+            assert!(neighbours.len() <= 5);
         }
     }
 }
