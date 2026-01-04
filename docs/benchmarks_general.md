@@ -42,7 +42,6 @@ Self is queried with the default search budget.
 
 <details>
 <summary><b>Annoy - Euclidean (Gaussian)</b>:</summary>
-</br>
 ```
 ===========================================================================================================================
 Benchmark: 150k cells, 32D
