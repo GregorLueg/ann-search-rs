@@ -47,7 +47,8 @@ pub fn parse_binarisation_init(s: &str) -> Option<BinarisationInit> {
 ///
 /// ### Fields
 ///
-/// * `projections` - Random or learned projection vectors, flattened (n_bits * dim)
+/// * `projections` - Random or learned projection vectors, flattened (n_bits *
+///   dim)
 /// * `n_bits` - Number of bits in binary code (e.g., 256, 512)
 /// * `mean` - Mean vector for centering (used when initialised with PCA)
 /// * `dim` - Input vector dimensionality
@@ -76,7 +77,7 @@ where
     ///
     /// Initialised binariser
     pub fn new(dim: usize, n_bits: usize, seed: usize) -> Self {
-        assert!(n_bits % 8 == 0, "n_bits must be multiple of 8");
+        assert!(n_bits.is_multiple_of(8), "n_bits must be multiple of 8");
 
         let mut binariser = Binariser {
             projections: Vec::new(),
@@ -108,7 +109,7 @@ where
     ///
     /// Initialised binariser with PCA+ITQ projections
     pub fn initialise_with_pca(data: MatRef<T>, dim: usize, n_bits: usize, seed: usize) -> Self {
-        assert!(n_bits % 8 == 0, "n_bits must be multiple of 8");
+        assert!(n_bits.is_multiple_of(8), "n_bits must be multiple of 8");
 
         let mut binariser = Binariser {
             projections: Vec::new(),

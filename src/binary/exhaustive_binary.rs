@@ -26,9 +26,9 @@ use crate::utils::dist::*;
 /// * `n_bytes` - Bytes per vector (n_bits / 8)
 /// * `n` - Number of samples
 /// * `dim` - Vector dimensionality
+/// * `metric` - The distance metric
 /// * `binariser` - Binariser for encoding query vectors
-/// * `vector_store` - Optional mmap vector storage for reranking
-/// * `metric` - Distance metric for reranking
+/// * `vector_store` - Optional on-disk vector storage
 pub struct ExhaustiveIndexBinary<T> {
     pub vectors_flat_binarised: Vec<u8>,
     pub n_bytes: usize,
@@ -73,7 +73,7 @@ where
     ///
     /// Initialised exhaustive binary index
     pub fn new(data: MatRef<T>, binarisation_init: &str, n_bits: usize, seed: usize) -> Self {
-        assert!(n_bits % 8 == 0, "n_bits must be multiple of 8");
+        assert!(n_bits.is_multiple_of(8), "n_bits must be multiple of 8");
 
         let init = parse_binarisation_init(binarisation_init).unwrap_or_default();
 
@@ -128,7 +128,7 @@ where
         seed: usize,
         save_path: impl AsRef<Path>,
     ) -> std::io::Result<Self> {
-        assert!(n_bits % 8 == 0, "n_bits must be multiple of 8");
+        assert!(n_bits.is_multiple_of(8), "n_bits must be multiple of 8");
 
         let init = parse_binarisation_init(binarisation_init).unwrap_or_default();
 
@@ -252,18 +252,20 @@ where
 
     /// Query with reranking using exact distances
     ///
-    /// Two-stage search: Hamming distance to find candidates, then exact distance for final ranking.
-    /// Requires vector_store to be available.
+    /// Two-stage search: Hamming distance to find candidates, then exact
+    /// distance for final ranking. Requires vector_store to be available.
     ///
     /// ### Params
     ///
     /// * `query_vec` - Query vector
     /// * `k` - Number of nearest neighbours to return
-    /// * `rerank_factor` - Multiplier for candidate set size (searches k * rerank_factor candidates)
+    /// * `rerank_factor` - Multiplier for candidate set size (searches k *
+    ///   rerank_factor candidates)
     ///
     /// ### Returns
     ///
-    /// Tuple of `(indices, distances)` where distances are exact (Euclidean or Cosine)
+    /// Tuple of `(indices, distances)` where distances are exact (Euclidean or
+    /// Cosine)
     #[inline]
     pub fn query_reranking(
         &self,
@@ -351,7 +353,8 @@ where
     /// ### Params
     ///
     /// * `k` - Number of neighbours per vector
-    /// * `rerank_factor` - Multiplier for candidate set (only used if vector_store available)
+    /// * `rerank_factor` - Multiplier for candidate set (only used if
+    ///   vector_store available)
     /// * `return_dist` - Whether to return distances
     /// * `verbose` - Controls verbosity
     ///
@@ -380,7 +383,7 @@ where
 
                     if verbose {
                         let count = counter.fetch_add(1, Ordering::Relaxed) + 1;
-                        if count % 100_000 == 0 {
+                        if count.is_multiple_of(100_000) {
                             println!(
                                 "  Processed {} / {} samples.",
                                 count.separate_with_underscores(),
@@ -410,7 +413,7 @@ where
 
                     if verbose {
                         let count = counter.fetch_add(1, Ordering::Relaxed) + 1;
-                        if count % 100_000 == 0 {
+                        if count.is_multiple_of(100_000) {
                             println!(
                                 "  Processed {} / {} samples.",
                                 count.separate_with_underscores(),

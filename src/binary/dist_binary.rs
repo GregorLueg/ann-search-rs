@@ -9,9 +9,17 @@ use crate::binary::rabitq::*;
 /// Trait for computing distances between binarised vectors
 pub trait VectorDistanceBinary {
     /// Get the internal flat vector representation (binarised to u8)
+    ///
+    /// ### Returns
+    ///
+    /// Reference to the flat binarised vector storage
     fn vectors_flat_binarised(&self) -> &[u8];
 
     /// Get the number of bytes(!) used binarisation
+    ///
+    /// ### Returns
+    ///
+    /// Number of bytes per vector
     fn n_bytes(&self) -> usize;
 
     /// Calculates the Hamming distance between two internal vectors
@@ -78,20 +86,50 @@ pub trait VectorDistanceRaBitQ<T>
 where
     T: Float + FromPrimitive,
 {
+    /// Get the RaBitQ storage
+    ///
+    /// ### Returns
+    ///
+    /// Reference to the RaBitQ storage
     fn storage(&self) -> &RaBitQStorage<T>;
+
+    /// Get the RaBitQ encoder
+    ///
+    /// ### Returns
+    ///
+    /// Reference to the RaBitQ encoder
     fn encoder(&self) -> &RaBitQEncoder<T>;
 
+    /// Get the vector dimensionality
+    ///
+    /// ### Returns
+    ///
+    /// Number of dimensions
     #[inline]
     fn dim(&self) -> usize {
         self.storage().dim
     }
 
+    /// Get the number of bytes per vector
+    ///
+    /// ### Returns
+    ///
+    /// Number of bytes per vector
     #[inline]
     fn n_bytes(&self) -> usize {
         self.storage().n_bytes
     }
 
     /// Popcount for vector at local index within cluster
+    ///
+    /// ### Params
+    ///
+    /// * `cluster_idx` - Index of the cluster
+    /// * `local_idx` - Local index of the vector within the cluster
+    ///
+    /// ### Returns
+    ///
+    /// Number of set bits in the binary vector
     #[inline]
     fn popcount(&self, cluster_idx: usize, local_idx: usize) -> u32 {
         let binary = self.storage().vector_binary(cluster_idx, local_idx);
@@ -99,6 +137,16 @@ where
     }
 
     /// Dot product between query and binary vector
+    ///
+    /// ### Params
+    ///
+    /// * `query` - The RaBitQ query
+    /// * `cluster_idx` - Index of the cluster
+    /// * `local_idx` - Local index of the vector within the cluster
+    ///
+    /// ### Returns
+    ///
+    /// Quantised dot product result
     #[inline(always)]
     fn dot_query_binary(
         &self,
@@ -144,6 +192,16 @@ where
     }
 
     /// RaBitQ distance estimate
+    ///
+    /// ### Params
+    ///
+    /// * `query` - The RaBitQ query
+    /// * `cluster_idx` - Index of the cluster
+    /// * `local_idx` - Local index of the vector within the cluster
+    ///
+    /// ### Returns
+    ///
+    /// Estimated Euclidean distance (Cosine works due to normalisation)
     #[inline]
     fn rabitq_dist(&self, query: &RaBitQQuery<T>, cluster_idx: usize, local_idx: usize) -> T {
         let storage = self.storage();

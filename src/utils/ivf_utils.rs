@@ -340,7 +340,7 @@ where
 /// ### Returns
 ///
 /// Initial centroids (k * dim elements)
-fn fast_random_init<T>(data: &[T], dim: usize, n: usize, k: usize, seed: usize) -> Vec<T>
+pub fn fast_random_init<T>(data: &[T], dim: usize, n: usize, k: usize, seed: usize) -> Vec<T>
 where
     T: Float,
 {

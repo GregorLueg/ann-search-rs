@@ -18,24 +18,20 @@ use crate::utils::*;
 
 /// IVF index with binary quantisation
 ///
-/// Hybrid approach: uses float centroids for routing to preserve cluster structure,
-/// but stores vectors as binary codes for memory efficiency. Ideal for kNN graph
-/// generation where approximate ranking is acceptable but global structure matters.
-///
 /// ### Fields
 ///
 /// * `vectors_flat_binarised` - Binary codes, flattened (n * n_bytes)
 /// * `n_bytes` - Bytes per vector (n_bits / 8)
 /// * `n` - Number of samples
 /// * `dim` - Original vector dimensionality
+/// * `metric` - Distance metric
 /// * `binariser` - Binariser for encoding query vectors
 /// * `centroids_float` - Float centroids for routing (nlist * dim)
 /// * `centroids_norm` - Precomputed norms for Cosine distance
 /// * `all_indices` - Vector indices for each cluster (CSR format)
 /// * `offsets` - Offsets for CSR access
 /// * `nlist` - Number of clusters
-/// * `metric` - Distance metric (for centroid routing and reranking)
-/// * `vector_store` - Optional mmap vector storage for reranking
+/// * `vector_store` - Optional on-disk vector storage
 pub struct IvfIndexBinary<T> {
     pub vectors_flat_binarised: Vec<u8>,
     pub n_bytes: usize,
@@ -129,7 +125,7 @@ where
         seed: usize,
         verbose: bool,
     ) -> Self {
-        assert!(n_bits % 8 == 0, "n_bits must be multiple of 8");
+        assert!(n_bits.is_multiple_of(8), "n_bits must be multiple of 8");
 
         let n = data.nrows();
         let dim = data.ncols();
@@ -248,7 +244,8 @@ where
 
     /// Build an IVF index with binary quantisation and vector store for reranking
     ///
-    /// Creates IVF binary index and saves/loads vector store for exact distance reranking.
+    /// Creates IVF binary index and saves/loads vector store for exact distance
+    /// reranking.
     ///
     /// ### Params
     ///
@@ -277,7 +274,7 @@ where
         verbose: bool,
         save_path: impl AsRef<Path>,
     ) -> std::io::Result<Self> {
-        assert!(n_bits % 8 == 0, "n_bits must be multiple of 8");
+        assert!(n_bits.is_multiple_of(8), "n_bits must be multiple of 8");
 
         let n = data.nrows();
         let dim = data.ncols();
@@ -645,7 +642,7 @@ where
 
                     if verbose {
                         let count = counter.fetch_add(1, Ordering::Relaxed) + 1;
-                        if count % 100_000 == 0 {
+                        if count.is_multiple_of(100_000) {
                             println!(
                                 "  Processed {} / {} samples.",
                                 count.separate_with_underscores(),
@@ -675,7 +672,7 @@ where
 
                     if verbose {
                         let count = counter.fetch_add(1, Ordering::Relaxed) + 1;
-                        if count % 100_000 == 0 {
+                        if count.is_multiple_of(100_000) {
                             println!(
                                 "  Processed {} / {} samples.",
                                 count.separate_with_underscores(),

@@ -569,6 +569,29 @@ where
             (indices, None)
         }
     }
+
+    /// Returns memory usage
+    ///
+    /// Also returns the data stored on the GPU
+    ///
+    /// ### Returns
+    ///
+    /// `(RAM bytes, VRAM bytes)`
+    pub fn memory_usage_bytes(&self) -> (usize, usize) {
+        let ram = std::mem::size_of_val(self)
+            + self.vectors_by_cluster.capacity() * std::mem::size_of::<T>()
+            + self.norms_by_cluster.capacity() * std::mem::size_of::<T>()
+            + self.original_indices.capacity() * std::mem::size_of::<usize>()
+            + self.cluster_offsets.capacity() * std::mem::size_of::<usize>();
+
+        let vram = self.centroids_gpu.vram_bytes()
+            + self
+                .centroid_norms_gpu
+                .as_ref()
+                .map_or(0, |t| t.vram_bytes());
+
+        (ram, vram)
+    }
 }
 
 /// Reorganise vectors by cluster for contiguous access
@@ -709,5 +732,142 @@ fn process_cluster_results<T: Float>(
                 heap.push((OrderedFloat(dist), original_idx));
             }
         }
+    }
+}
+
+///////////
+// Tests //
+///////////
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use cubecl::cpu::CpuDevice;
+    use cubecl::cpu::CpuRuntime;
+    use faer::Mat;
+
+    #[test]
+    fn test_ivf_index_build() {
+        let device = CpuDevice;
+
+        // 100 samples, 4 dimensions
+        let data = Mat::from_fn(100, 4, |i, j| ((i + j) as f32) / 10.0);
+
+        let index = IvfIndexGpu::<f32, CpuRuntime>::build(
+            data.as_ref(),
+            Dist::Euclidean,
+            Some(10),
+            Some(5),
+            42,
+            false,
+            device,
+        );
+
+        assert_eq!(index.dim, 4);
+        assert_eq!(index.n, 100);
+        assert_eq!(index.nlist, 10);
+        assert_eq!(index.cluster_offsets.len(), 11);
+    }
+
+    #[test]
+    fn test_ivf_index_query() {
+        let device = CpuDevice;
+
+        let data = Mat::from_fn(50, 4, |i, j| if i % 10 == j { 1.0_f32 } else { 0.1_f32 });
+
+        let index = IvfIndexGpu::<f32, CpuRuntime>::build(
+            data.as_ref(),
+            Dist::Euclidean,
+            Some(5),
+            Some(10),
+            42,
+            false,
+            device,
+        );
+
+        let query = Mat::from_fn(3, 4, |i, j| if i == j { 1.0_f32 } else { 0.0_f32 });
+
+        let (indices, distances) = index.query_batch(query.as_ref(), 5, Some(3), false);
+
+        assert_eq!(indices.len(), 3);
+        assert_eq!(distances.len(), 3);
+        assert_eq!(indices[0].len(), 5);
+    }
+
+    #[test]
+    fn test_ivf_index_cosine() {
+        let device = CpuDevice;
+
+        let data = Mat::from_fn(40, 4, |i, _j| (i as f32 + 1.0) / 10.0);
+
+        let index = IvfIndexGpu::<f32, CpuRuntime>::build(
+            data.as_ref(),
+            Dist::Cosine,
+            Some(5),
+            Some(10),
+            42,
+            false,
+            device,
+        );
+
+        let query = Mat::from_fn(2, 4, |_, _| 1.0_f32);
+        let (indices, distances) = index.query_batch(query.as_ref(), 3, Some(2), false);
+
+        assert_eq!(indices.len(), 2);
+        assert_eq!(indices[0].len(), 3);
+        assert!(distances[0][0] >= 0.0);
+    }
+
+    #[test]
+    fn test_ivf_generate_knn() {
+        let device = CpuDevice;
+
+        let data = Mat::from_fn(30, 4, |i, j| ((i * 3 + j) as f32) / 20.0);
+
+        let index = IvfIndexGpu::<f32, CpuRuntime>::build(
+            data.as_ref(),
+            Dist::Euclidean,
+            Some(5),
+            Some(5),
+            42,
+            false,
+            device,
+        );
+
+        let (indices, distances) = index.generate_knn(4, Some(3), true, false);
+
+        assert_eq!(indices.len(), 30);
+        assert!(distances.is_some());
+        assert_eq!(distances.unwrap().len(), 30);
+    }
+
+    #[test]
+    fn test_reorganise_by_cluster() {
+        let vectors: Vec<f32> = vec![
+            1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0,
+        ];
+        let assignments = vec![0, 1, 0, 1];
+
+        let (reorg, indices, offsets, _) =
+            reorganise_by_cluster(&vectors, 4, 4, &assignments, 2, &Dist::Euclidean);
+
+        assert_eq!(reorg.len(), 16);
+        assert_eq!(indices.len(), 4);
+        assert_eq!(offsets.len(), 3);
+        assert_eq!(offsets[0], 0);
+        assert_eq!(offsets[2], 4);
+    }
+
+    #[test]
+    fn test_invert_probe_lists() {
+        let probe_lists = vec![vec![0, 1, 2], vec![1, 2], vec![0, 3]];
+
+        let inverted = invert_probe_lists(&probe_lists, 4);
+
+        assert_eq!(inverted.len(), 4);
+        assert_eq!(inverted[0], vec![0, 2]);
+        assert_eq!(inverted[1], vec![0, 1]);
+        assert_eq!(inverted[2], vec![0, 1]);
+        assert_eq!(inverted[3], vec![2]);
     }
 }

@@ -1839,7 +1839,7 @@ where
             .map(|i| {
                 if verbose {
                     let count = counter.fetch_add(1, Ordering::Relaxed) + 1;
-                    if count % 100_000 == 0 {
+                    if count.is_multiple_of(100_000) {
                         println!(
                             "  Processed {} / {} queries.",
                             count.separate_with_underscores(),
@@ -1865,7 +1865,7 @@ where
                 let query_vec: Vec<T> = query_mat.row(i).iter().cloned().collect();
                 if verbose {
                     let count = counter.fetch_add(1, Ordering::Relaxed) + 1;
-                    if count % 100_000 == 0 {
+                    if count.is_multiple_of(100_000) {
                         println!(
                             "  Processed {} / {} queries.",
                             count.separate_with_underscores(),

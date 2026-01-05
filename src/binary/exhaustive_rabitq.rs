@@ -23,7 +23,12 @@ use crate::utils::*;
 /// Uses IVF-style partitioning with RaBitQ encoding per cluster.
 /// At query time, probes the nearest clusters and searches exhaustively
 /// within each.
-/// Exhaustive RaBitQ index
+///
+/// ### Fields
+///
+/// * `quantiser` - The RaBitQQuantiser
+/// * `n` - Number of vectors
+/// * `vector_store` - Optional on-disk vector storage
 pub struct ExhaustiveIndexRaBitQ<T> {
     quantiser: RaBitQQuantiser<T>,
     n: usize,
@@ -335,7 +340,7 @@ where
 
                 if verbose {
                     let count = counter.fetch_add(1, Ordering::Relaxed) + 1;
-                    if count % 100_000 == 0 {
+                    if count.is_multiple_of(100_000) {
                         println!(
                             "  Processed {} / {} samples.",
                             count.separate_with_underscores(),

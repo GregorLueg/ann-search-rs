@@ -159,7 +159,7 @@ where
             norms
         };
 
-        // Subsample for training if large
+        // subsample for training if large
         let (training_data, n_train) = if n > 500_000 {
             if verbose {
                 println!("  Sampling 250k vectors for centroid training.");
@@ -170,7 +170,7 @@ where
             (vectors_flat.clone(), n)
         };
 
-        // Train centroids
+        // train centroids
         let mut centroids_flat = train_centroids(
             &training_data,
             dim,
@@ -182,7 +182,7 @@ where
             verbose,
         );
 
-        // Normalise centroids for Cosine
+        // normalise centroids for Cosine
         if metric == Dist::Cosine {
             for c in 0..nlist {
                 let start = c * dim;
@@ -216,10 +216,10 @@ where
             &metric,
         );
 
-        // Create encoder with shared rotation
+        // create encoder with shared rotation
         let encoder = RaBitQEncoder::new(dim, metric, seed as u64);
 
-        // Build CSR storage
+        // build CSR storage
         let storage = build_rabitq_storage(
             &vectors_for_storage,
             dim,
@@ -605,7 +605,7 @@ where
 
                 if verbose {
                     let count = counter.fetch_add(1, Ordering::Relaxed) + 1;
-                    if count % 100_000 == 0 {
+                    if count.is_multiple_of(100_000) {
                         println!(
                             "  Processed {} / {} samples.",
                             count.separate_with_underscores(),
