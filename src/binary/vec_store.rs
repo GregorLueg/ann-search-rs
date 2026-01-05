@@ -142,6 +142,15 @@ where
 
         Ok(())
     }
+
+    /// Helper function to return dimensions
+    ///
+    /// ### Returns
+    ///
+    /// The dimensionality
+    pub fn dim(&self) -> usize {
+        self.dim
+    }
 }
 
 impl<T> VectorStore<T> for MmapVectorStore<T>
@@ -189,5 +198,159 @@ where
 
     fn norms(&self) -> &[T] {
         unsafe { std::slice::from_raw_parts(self.mmap_norms.as_ptr() as *const T, self.n) }
+    }
+}
+
+///////////
+// Tests //
+///////////
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::NamedTempFile;
+
+    #[test]
+    fn test_save_and_load() {
+        let vectors = vec![1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0];
+        let norms = vec![3.74, 8.77, 13.93];
+        let dim = 2;
+        let n = 3;
+
+        let vec_file = NamedTempFile::new().unwrap();
+        let norm_file = NamedTempFile::new().unwrap();
+
+        MmapVectorStore::save(&vectors, &norms, dim, n, vec_file.path(), norm_file.path()).unwrap();
+
+        let store = MmapVectorStore::<f32>::new(vec_file.path(), norm_file.path(), dim, n).unwrap();
+
+        assert_eq!(store.dim(), 2);
+        assert_eq!(store.n(), 3);
+    }
+
+    #[test]
+    fn test_load_vector() {
+        let vectors = vec![1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0];
+        let norms = vec![3.74, 8.77, 13.93];
+        let dim = 2;
+        let n = 3;
+
+        let vec_file = NamedTempFile::new().unwrap();
+        let norm_file = NamedTempFile::new().unwrap();
+
+        MmapVectorStore::save(&vectors, &norms, dim, n, vec_file.path(), norm_file.path()).unwrap();
+
+        let store = MmapVectorStore::<f32>::new(vec_file.path(), norm_file.path(), dim, n).unwrap();
+
+        let v0 = store.load_vector(0);
+        assert_eq!(v0, &[1.0, 2.0]);
+
+        let v1 = store.load_vector(1);
+        assert_eq!(v1, &[3.0, 4.0]);
+
+        let v2 = store.load_vector(2);
+        assert_eq!(v2, &[5.0, 6.0]);
+    }
+
+    #[test]
+    fn test_vectors_flat() {
+        let vectors = vec![1.0f32, 2.0, 3.0, 4.0];
+        let norms = vec![2.24, 5.0];
+        let dim = 2;
+        let n = 2;
+
+        let vec_file = NamedTempFile::new().unwrap();
+        let norm_file = NamedTempFile::new().unwrap();
+
+        MmapVectorStore::save(&vectors, &norms, dim, n, vec_file.path(), norm_file.path()).unwrap();
+
+        let store = MmapVectorStore::<f32>::new(vec_file.path(), norm_file.path(), dim, n).unwrap();
+
+        let flat = store.vectors_flat();
+        assert_eq!(flat, &[1.0, 2.0, 3.0, 4.0]);
+    }
+
+    #[test]
+    fn test_norms() {
+        let vectors = vec![1.0f32, 2.0, 3.0, 4.0];
+        let norms = vec![2.24, 5.0];
+        let dim = 2;
+        let n = 2;
+
+        let vec_file = NamedTempFile::new().unwrap();
+        let norm_file = NamedTempFile::new().unwrap();
+
+        MmapVectorStore::save(&vectors, &norms, dim, n, vec_file.path(), norm_file.path()).unwrap();
+
+        let store = MmapVectorStore::<f32>::new(vec_file.path(), norm_file.path(), dim, n).unwrap();
+
+        let loaded_norms = store.norms();
+        assert_eq!(loaded_norms, &[2.24, 5.0]);
+    }
+
+    #[test]
+    #[should_panic]
+    fn test_wrong_vector_file_size() {
+        let vec_file = NamedTempFile::new().unwrap();
+        let norm_file = NamedTempFile::new().unwrap();
+
+        std::fs::write(vec_file.path(), [0u8; 100]).unwrap();
+        std::fs::write(norm_file.path(), [0u8; 16]).unwrap();
+
+        let _ = MmapVectorStore::<f32>::new(vec_file.path(), norm_file.path(), 2, 4).unwrap();
+    }
+
+    #[test]
+    #[should_panic]
+    fn test_wrong_norms_file_size() {
+        let vec_file = NamedTempFile::new().unwrap();
+        let norm_file = NamedTempFile::new().unwrap();
+
+        std::fs::write(vec_file.path(), [0u8; 32]).unwrap();
+        std::fs::write(norm_file.path(), [0u8; 100]).unwrap();
+
+        let _ = MmapVectorStore::<f32>::new(vec_file.path(), norm_file.path(), 2, 4).unwrap();
+    }
+
+    #[test]
+    #[should_panic]
+    fn test_save_vectors_length_mismatch() {
+        let vectors = vec![1.0f32, 2.0, 3.0];
+        let norms = vec![2.24, 5.0];
+
+        let vec_file = NamedTempFile::new().unwrap();
+        let norm_file = NamedTempFile::new().unwrap();
+
+        MmapVectorStore::save(&vectors, &norms, 2, 2, vec_file.path(), norm_file.path()).unwrap();
+    }
+
+    #[test]
+    #[should_panic]
+    fn test_save_norms_length_mismatch() {
+        let vectors = vec![1.0f32, 2.0, 3.0, 4.0];
+        let norms = vec![2.24];
+
+        let vec_file = NamedTempFile::new().unwrap();
+        let norm_file = NamedTempFile::new().unwrap();
+
+        MmapVectorStore::save(&vectors, &norms, 2, 2, vec_file.path(), norm_file.path()).unwrap();
+    }
+
+    #[test]
+    fn test_f64_type() {
+        let vectors = vec![1.0f64, 2.0, 3.0, 4.0];
+        let norms = vec![2.24, 5.0];
+        let dim = 2;
+        let n = 2;
+
+        let vec_file = NamedTempFile::new().unwrap();
+        let norm_file = NamedTempFile::new().unwrap();
+
+        MmapVectorStore::save(&vectors, &norms, dim, n, vec_file.path(), norm_file.path()).unwrap();
+
+        let store = MmapVectorStore::<f64>::new(vec_file.path(), norm_file.path(), dim, n).unwrap();
+
+        assert_eq!(store.load_vector(0), &[1.0, 2.0]);
+        assert_eq!(store.dim(), 2);
     }
 }
