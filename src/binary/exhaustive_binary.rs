@@ -73,7 +73,7 @@ where
     ///
     /// Initialised exhaustive binary index
     pub fn new(data: MatRef<T>, binarisation_init: &str, n_bits: usize, seed: usize) -> Self {
-        assert!(n_bits % 8 == 0, "n_bits must be multiple of 8");
+        assert!(n_bits.is_multiple_of(8), "n_bits must be multiple of 8");
 
         let init = parse_binarisation_init(binarisation_init).unwrap_or_default();
 
@@ -128,7 +128,7 @@ where
         seed: usize,
         save_path: impl AsRef<Path>,
     ) -> std::io::Result<Self> {
-        assert!(n_bits % 8 == 0, "n_bits must be multiple of 8");
+        assert!(n_bits.is_multiple_of(8), "n_bits must be multiple of 8");
 
         let init = parse_binarisation_init(binarisation_init).unwrap_or_default();
 
@@ -383,7 +383,7 @@ where
 
                     if verbose {
                         let count = counter.fetch_add(1, Ordering::Relaxed) + 1;
-                        if count % 100_000 == 0 {
+                        if count.is_multiple_of(100_000) {
                             println!(
                                 "  Processed {} / {} samples.",
                                 count.separate_with_underscores(),
@@ -413,7 +413,7 @@ where
 
                     if verbose {
                         let count = counter.fetch_add(1, Ordering::Relaxed) + 1;
-                        if count % 100_000 == 0 {
+                        if count.is_multiple_of(100_000) {
                             println!(
                                 "  Processed {} / {} samples.",
                                 count.separate_with_underscores(),

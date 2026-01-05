@@ -7,6 +7,17 @@
 Various approximate nearest neighbour searches implemented in Rust. Helper
 library to be used in other libraries. 
 
+## Table of Contents
+
+- [Description](#description)
+- [Features](#features)
+- [Installation](#installation)
+- [Roadmap](#roadmap)
+- [Gridsearches and performance](#running-the-grid-searches)
+- [FEATURE: quantisation](#quantised-indices)
+- [FEATURE: GPU acceleration](#gpu)
+- [FEATURE: Binary indices](#binarised-indices)
+
 ## Description
 
 Extracted function for approximate nearest neighbour searches specifically
@@ -285,7 +296,7 @@ can drastically improve the Recall. To enable the feature, please use:
 ann-search-rs = { version = "*", features = ["binary"] } 
 ```
 
-
+The benchmarks can be found [here](https://github.com/GregorLueg/ann-search-rs/blob/main/docs/benchmarks_binary.md). 
 
 ## Licence
 

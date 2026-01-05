@@ -77,7 +77,7 @@ where
     ///
     /// Initialised binariser
     pub fn new(dim: usize, n_bits: usize, seed: usize) -> Self {
-        assert!(n_bits % 8 == 0, "n_bits must be multiple of 8");
+        assert!(n_bits.is_multiple_of(8), "n_bits must be multiple of 8");
 
         let mut binariser = Binariser {
             projections: Vec::new(),
@@ -109,7 +109,7 @@ where
     ///
     /// Initialised binariser with PCA+ITQ projections
     pub fn initialise_with_pca(data: MatRef<T>, dim: usize, n_bits: usize, seed: usize) -> Self {
-        assert!(n_bits % 8 == 0, "n_bits must be multiple of 8");
+        assert!(n_bits.is_multiple_of(8), "n_bits must be multiple of 8");
 
         let mut binariser = Binariser {
             projections: Vec::new(),

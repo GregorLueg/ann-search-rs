@@ -111,6 +111,15 @@ impl<R: Runtime, F: Float + CubeElement> GpuTensor<R, F> {
         let bytes = client.read_one(self.data);
         F::from_bytes(&bytes).to_vec()
     }
+
+    /// Returns the size in bytes on the GPU
+    ///
+    /// ### Returns
+    ///
+    /// Size of the tensor
+    pub fn vram_bytes(&self) -> usize {
+        self.shape.iter().product::<usize>() * std::mem::size_of::<F>()
+    }
 }
 
 ///////////

@@ -569,6 +569,29 @@ where
             (indices, None)
         }
     }
+
+    /// Returns memory usage
+    ///
+    /// Also returns the data stored on the GPU
+    ///
+    /// ### Returns
+    ///
+    /// `(RAM bytes, VRAM bytes)`
+    pub fn memory_usage_bytes(&self) -> (usize, usize) {
+        let ram = std::mem::size_of_val(self)
+            + self.vectors_by_cluster.capacity() * std::mem::size_of::<T>()
+            + self.norms_by_cluster.capacity() * std::mem::size_of::<T>()
+            + self.original_indices.capacity() * std::mem::size_of::<usize>()
+            + self.cluster_offsets.capacity() * std::mem::size_of::<usize>();
+
+        let vram = self.centroids_gpu.vram_bytes()
+            + self
+                .centroid_norms_gpu
+                .as_ref()
+                .map_or(0, |t| t.vram_bytes());
+
+        (ram, vram)
+    }
 }
 
 /// Reorganise vectors by cluster for contiguous access

@@ -458,7 +458,7 @@ where
 
                 if verbose {
                     let count = counter.fetch_add(1, Ordering::Relaxed) + 1;
-                    if count % 100_000 == 0 {
+                    if count.is_multiple_of(100_000) {
                         println!(
                             "  Processed {} / {} samples.",
                             count.separate_with_underscores(),
