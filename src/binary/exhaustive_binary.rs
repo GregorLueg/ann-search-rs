@@ -26,9 +26,9 @@ use crate::utils::dist::*;
 /// * `n_bytes` - Bytes per vector (n_bits / 8)
 /// * `n` - Number of samples
 /// * `dim` - Vector dimensionality
+/// * `metric` - The distance metric
 /// * `binariser` - Binariser for encoding query vectors
-/// * `vector_store` - Optional mmap vector storage for reranking
-/// * `metric` - Distance metric for reranking
+/// * `vector_store` - Optional on-disk vector storage
 pub struct ExhaustiveIndexBinary<T> {
     pub vectors_flat_binarised: Vec<u8>,
     pub n_bytes: usize,
@@ -252,18 +252,20 @@ where
 
     /// Query with reranking using exact distances
     ///
-    /// Two-stage search: Hamming distance to find candidates, then exact distance for final ranking.
-    /// Requires vector_store to be available.
+    /// Two-stage search: Hamming distance to find candidates, then exact
+    /// distance for final ranking. Requires vector_store to be available.
     ///
     /// ### Params
     ///
     /// * `query_vec` - Query vector
     /// * `k` - Number of nearest neighbours to return
-    /// * `rerank_factor` - Multiplier for candidate set size (searches k * rerank_factor candidates)
+    /// * `rerank_factor` - Multiplier for candidate set size (searches k *
+    ///   rerank_factor candidates)
     ///
     /// ### Returns
     ///
-    /// Tuple of `(indices, distances)` where distances are exact (Euclidean or Cosine)
+    /// Tuple of `(indices, distances)` where distances are exact (Euclidean or
+    /// Cosine)
     #[inline]
     pub fn query_reranking(
         &self,
@@ -351,7 +353,8 @@ where
     /// ### Params
     ///
     /// * `k` - Number of neighbours per vector
-    /// * `rerank_factor` - Multiplier for candidate set (only used if vector_store available)
+    /// * `rerank_factor` - Multiplier for candidate set (only used if
+    ///   vector_store available)
     /// * `return_dist` - Whether to return distances
     /// * `verbose` - Controls verbosity
     ///

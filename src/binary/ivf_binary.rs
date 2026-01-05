@@ -18,24 +18,20 @@ use crate::utils::*;
 
 /// IVF index with binary quantisation
 ///
-/// Hybrid approach: uses float centroids for routing to preserve cluster structure,
-/// but stores vectors as binary codes for memory efficiency. Ideal for kNN graph
-/// generation where approximate ranking is acceptable but global structure matters.
-///
 /// ### Fields
 ///
 /// * `vectors_flat_binarised` - Binary codes, flattened (n * n_bytes)
 /// * `n_bytes` - Bytes per vector (n_bits / 8)
 /// * `n` - Number of samples
 /// * `dim` - Original vector dimensionality
+/// * `metric` - Distance metric
 /// * `binariser` - Binariser for encoding query vectors
 /// * `centroids_float` - Float centroids for routing (nlist * dim)
 /// * `centroids_norm` - Precomputed norms for Cosine distance
 /// * `all_indices` - Vector indices for each cluster (CSR format)
 /// * `offsets` - Offsets for CSR access
 /// * `nlist` - Number of clusters
-/// * `metric` - Distance metric (for centroid routing and reranking)
-/// * `vector_store` - Optional mmap vector storage for reranking
+/// * `vector_store` - Optional on-disk vector storage
 pub struct IvfIndexBinary<T> {
     pub vectors_flat_binarised: Vec<u8>,
     pub n_bytes: usize,
@@ -248,7 +244,8 @@ where
 
     /// Build an IVF index with binary quantisation and vector store for reranking
     ///
-    /// Creates IVF binary index and saves/loads vector store for exact distance reranking.
+    /// Creates IVF binary index and saves/loads vector store for exact distance
+    /// reranking.
     ///
     /// ### Params
     ///

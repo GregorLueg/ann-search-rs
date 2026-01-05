@@ -47,7 +47,8 @@ pub fn parse_binarisation_init(s: &str) -> Option<BinarisationInit> {
 ///
 /// ### Fields
 ///
-/// * `projections` - Random or learned projection vectors, flattened (n_bits * dim)
+/// * `projections` - Random or learned projection vectors, flattened (n_bits *
+///   dim)
 /// * `n_bits` - Number of bits in binary code (e.g., 256, 512)
 /// * `mean` - Mean vector for centering (used when initialised with PCA)
 /// * `dim` - Input vector dimensionality
