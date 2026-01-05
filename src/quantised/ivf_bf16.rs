@@ -37,7 +37,7 @@ pub struct IvfIndexBf16<T> {
     pub vectors_flat: Vec<bf16>,
     pub dim: usize,
     pub n: usize,
-    pub norms: Vec<bf16>,
+    pub norms: Vec<T>,
     metric: Dist,
     // index specific ones
     centroids: Vec<T>,
@@ -63,7 +63,7 @@ where
         self.dim
     }
 
-    fn norms(&self) -> &[bf16] {
+    fn norms(&self) -> &[T] {
         &self.norms
     }
 }
@@ -232,7 +232,7 @@ where
             vectors_flat: encode_bf16_quantisation(&vectors_flat),
             dim,
             n,
-            norms: encode_bf16_quantisation(&norms),
+            norms,
             metric,
             centroids,
             centroids_norm,

@@ -1,3 +1,4 @@
+use crate::utils::ivf_utils::CentroidDistance;
 use faer::{MatRef, RowRef};
 use faer_traits::ComplexField;
 use num_traits::{Float, FromPrimitive, ToPrimitive};
@@ -10,8 +11,8 @@ use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use thousands::*;
 
-use crate::binary::binariser::*;
 use crate::binary::dist_binary::*;
+use crate::binary::rabitq::*;
 use crate::binary::vec_store::*;
 use crate::utils::dist::*;
 use crate::utils::heap_structs::*;
@@ -22,6 +23,7 @@ use crate::utils::*;
 /// Uses IVF-style partitioning with RaBitQ encoding per cluster.
 /// At query time, probes the nearest clusters and searches exhaustively
 /// within each.
+/// Exhaustive RaBitQ index
 pub struct ExhaustiveIndexRaBitQ<T> {
     quantiser: RaBitQQuantiser<T>,
     n: usize,
@@ -32,16 +34,12 @@ impl<T> VectorDistanceRaBitQ<T> for ExhaustiveIndexRaBitQ<T>
 where
     T: Float + FromPrimitive,
 {
-    fn clusters(&self) -> &[RaBitQCluster<T>] {
-        &self.quantiser.clusters
+    fn storage(&self) -> &RaBitQStorage<T> {
+        &self.quantiser.storage
     }
 
-    fn n_bytes(&self) -> usize {
-        self.quantiser.n_bytes
-    }
-
-    fn dim(&self) -> usize {
-        self.quantiser.dim
+    fn encoder(&self) -> &RaBitQEncoder<T> {
+        &self.quantiser.encoder
     }
 }
 
@@ -64,7 +62,6 @@ where
     pub fn new(data: MatRef<T>, metric: &Dist, n_clusters: Option<usize>, seed: usize) -> Self {
         let n = data.nrows();
         let quantiser = RaBitQQuantiser::new(data, metric, n_clusters, seed);
-
         Self {
             quantiser,
             n,
@@ -92,26 +89,21 @@ where
         seed: usize,
         save_path: impl AsRef<Path>,
     ) -> std::io::Result<Self> {
-        let (vectors_flat, n, dim) = matrix_to_flat(data);
+        let n = data.nrows();
+        let dim = data.ncols();
         let quantiser = RaBitQQuantiser::new(data, metric, n_clusters, seed);
 
         std::fs::create_dir_all(&save_path)?;
 
+        let (vectors_flat, _, _) = matrix_to_flat(data);
         let norms: Vec<T> = (0..n)
-            .map(|i| {
-                data.row(i)
-                    .iter()
-                    .map(|&x| x * x)
-                    .fold(T::zero(), |a, b| a + b)
-                    .sqrt()
-            })
+            .map(|i| compute_norm(&vectors_flat[i * dim..(i + 1) * dim]))
             .collect();
 
         let vectors_path = save_path.as_ref().join("vectors_flat.bin");
         let norms_path = save_path.as_ref().join("norms.bin");
 
         MmapVectorStore::save(&vectors_flat, &norms, dim, n, &vectors_path, &norms_path)?;
-
         let vector_store = MmapVectorStore::new(vectors_path, norms_path, dim, n)?;
 
         Ok(Self {
@@ -135,20 +127,37 @@ where
     /// Tuple of (indices, distances)
     #[inline]
     pub fn query(&self, query_vec: &[T], k: usize, n_probe: Option<usize>) -> (Vec<usize>, Vec<T>) {
-        let n_probe = n_probe.unwrap_or((self.quantiser.n_clusters() as f32 * 0.2) as usize);
+        let n_probe = n_probe
+            .unwrap_or((self.quantiser.n_clusters() as f32 * 0.2) as usize)
+            .max(1);
         let k = k.min(self.n);
 
-        let cluster_indices = self.quantiser.find_nearest_clusters(query_vec, n_probe);
+        // Normalise for cosine
+        let query_normalised: Vec<T> = match self.quantiser.encoder.metric {
+            Dist::Cosine => {
+                let norm = compute_norm(query_vec);
+                if norm > T::epsilon() {
+                    query_vec.iter().map(|&x| x / norm).collect()
+                } else {
+                    query_vec.to_vec()
+                }
+            }
+            Dist::Euclidean => query_vec.to_vec(),
+        };
+
+        let cluster_dists = self
+            .quantiser
+            .get_centroids_prenorm(&query_normalised, n_probe);
 
         let mut heap: BinaryHeap<(OrderedFloat<T>, usize)> = BinaryHeap::with_capacity(k + 1);
 
-        for &c_idx in &cluster_indices {
-            let query_encoded = self.quantiser.encode_query(query_vec, c_idx);
-            let cluster_size = self.cluster_size(c_idx);
+        for &(_, c_idx) in cluster_dists.iter().take(n_probe) {
+            let query_encoded = self.quantiser.encode_query(&query_normalised, c_idx);
+            let cluster_size = self.storage().cluster_size(c_idx);
 
             for local_idx in 0..cluster_size {
                 let dist = self.rabitq_dist(&query_encoded, c_idx, local_idx);
-                let global_idx = self.cluster_vector_indices(c_idx)[local_idx];
+                let global_idx = self.storage().cluster_vector_indices(c_idx)[local_idx];
 
                 if heap.len() < k {
                     heap.push((OrderedFloat(dist), global_idx));
@@ -191,7 +200,6 @@ where
                 unsafe { std::slice::from_raw_parts(query_row.as_ptr(), query_row.ncols()) };
             return self.query(slice, k, n_probe);
         }
-
         let query_vec: Vec<T> = query_row.iter().cloned().collect();
         self.query(&query_vec, k, n_probe)
     }
@@ -222,23 +230,19 @@ where
         let vector_store = self
             .vector_store
             .as_ref()
-            .expect("Vector store required for reranking - use new_with_vector_store()");
+            .expect("Vector store required for reranking");
 
         let (candidates, _) = self.query(query_vec, k * rerank_factor, n_probe);
 
-        let query_norm = match self.quantiser.metric {
-            Dist::Cosine => query_vec
-                .iter()
-                .map(|&x| x * x)
-                .fold(T::zero(), |a, b| a + b)
-                .sqrt(),
+        let query_norm = match self.quantiser.encoder.metric {
+            Dist::Cosine => compute_norm(query_vec),
             Dist::Euclidean => T::one(),
         };
 
         let mut scored: Vec<_> = candidates
             .iter()
             .map(|&idx| {
-                let dist = match self.quantiser.metric {
+                let dist = match self.quantiser.encoder.metric {
                     Dist::Cosine => {
                         vector_store.cosine_distance_to_query(idx, query_vec, query_norm)
                     }
@@ -300,9 +304,9 @@ where
     ///
     /// ### Params
     ///
-    /// * `data` - Original data matrix
     /// * `k` - Number of neighbours per vector
     /// * `n_probe` - Number of clusters to search per query
+    /// * `rerank_factor` - Reranking factor for exact distances
     /// * `return_dist` - Whether to return distances
     /// * `verbose` - Print progress
     ///
@@ -317,64 +321,39 @@ where
         return_dist: bool,
         verbose: bool,
     ) -> (Vec<Vec<usize>>, Option<Vec<Vec<T>>>) {
+        let vector_store = self
+            .vector_store
+            .as_ref()
+            .expect("generate_knn requires vector_store");
+
         let counter = Arc::new(AtomicUsize::new(0));
 
-        if let Some(vector_store) = &self.vector_store {
-            let results: Vec<(Vec<usize>, Vec<T>)> = (0..self.n)
-                .into_par_iter()
-                .map(|i| {
-                    let vec = vector_store.load_vector(i);
+        let results: Vec<(Vec<usize>, Vec<T>)> = (0..self.n)
+            .into_par_iter()
+            .map(|i| {
+                let vec = vector_store.load_vector(i);
 
-                    if verbose {
-                        let count = counter.fetch_add(1, Ordering::Relaxed) + 1;
-                        if count % 100_000 == 0 {
-                            println!(
-                                "  Processed {} / {} samples.",
-                                count.separate_with_underscores(),
-                                self.n.separate_with_underscores()
-                            );
-                        }
+                if verbose {
+                    let count = counter.fetch_add(1, Ordering::Relaxed) + 1;
+                    if count % 100_000 == 0 {
+                        println!(
+                            "  Processed {} / {} samples.",
+                            count.separate_with_underscores(),
+                            self.n.separate_with_underscores()
+                        );
                     }
+                }
 
-                    self.query_reranking(vec, k, n_probe, rerank_factor)
-                })
-                .collect();
+                self.query_reranking(vec, k, n_probe, rerank_factor)
+            })
+            .collect();
 
-            if return_dist {
-                let (indices, distances): (Vec<_>, Vec<_>) = results.into_iter().unzip();
-                (indices, Some(distances))
-            } else {
-                let indices: Vec<Vec<usize>> = results.into_iter().map(|(idx, _)| idx).collect();
-                (indices, None)
-            }
+        if return_dist {
+            let (indices, distances) = results.into_iter().unzip();
+            (indices, Some(distances))
         } else {
-            let results: Vec<(Vec<usize>, Vec<T>)> = (0..self.n)
-                .into_par_iter()
-                .map(|_i| {
-                    if verbose {
-                        let count = counter.fetch_add(1, Ordering::Relaxed) + 1;
-                        if count % 100_000 == 0 {
-                            println!(
-                                "  Processed {} / {} samples.",
-                                count.separate_with_underscores(),
-                                self.n.separate_with_underscores()
-                            );
-                        }
-                    }
-
-                    // Can't query ourselves without original vectors
-                    // This is a limitation - needs the vector store
-                    panic!("generate_knn requires vector_store - use new_with_vector_store()");
-                })
-                .collect();
-
-            if return_dist {
-                let (indices, distances): (Vec<_>, Vec<_>) = results.into_iter().unzip();
-                (indices, Some(distances))
-            } else {
-                let indices: Vec<Vec<usize>> = results.into_iter().map(|(idx, _)| idx).collect();
-                (indices, None)
-            }
+            let indices = results.into_iter().map(|(idx, _)| idx).collect();
+            (indices, None)
         }
     }
 

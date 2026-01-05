@@ -49,7 +49,7 @@ use crate::nndescent::*;
 use crate::utils::dist::*;
 
 #[cfg(feature = "binary")]
-use crate::binary::{exhaustive_binary::*, exhaustive_rabitq::*, ivf_binary::*};
+use crate::binary::{exhaustive_binary::*, exhaustive_rabitq::*, ivf_binary::*, ivf_rabitq::*};
 #[cfg(feature = "gpu")]
 use crate::gpu::{exhaustive_gpu::*, ivf_gpu::*};
 #[cfg(feature = "quantised")]
@@ -1937,7 +1937,8 @@ where
 /// * `dist_metric` - "euclidean" or "cosine"
 /// * `seed` - Random seed
 /// * `save_store` - Whether to save vector store for reranking
-/// * `save_path` - Path to save vector store files (required if save_store is true)
+/// * `save_path` - Path to save vector store files (required if save_store is
+///   true)
 ///
 /// ### Returns
 ///
@@ -2039,4 +2040,127 @@ where
     T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum + ComplexField,
 {
     index.generate_knn(k, n_probe, rerank_factor, return_dist, verbose)
+}
+
+/////////////////
+// IVF-RaBitQ  //
+/////////////////
+
+#[cfg(feature = "binary")]
+/// Build an IVF-RaBitQ index
+///
+/// ### Params
+///
+/// * `mat` - The initial matrix with samples x features
+/// * `nlist` - Number of IVF cells (None for sqrt(n))
+/// * `max_iters` - K-means iterations (None for 30)
+/// * `dist_metric` - "euclidean" or "cosine"
+/// * `seed` - Random seed
+/// * `save_store` - Whether to save vector store for reranking
+/// * `save_path` - Path to save vector store files (required if save_store is
+///   true)
+/// * `verbose` - Print progress during build
+///
+/// ### Returns
+///
+/// The initialised `IvfIndexRaBitQ`
+#[allow(clippy::too_many_arguments)]
+pub fn build_ivf_index_rabitq<T>(
+    mat: MatRef<T>,
+    nlist: Option<usize>,
+    max_iters: Option<usize>,
+    dist_metric: &str,
+    seed: usize,
+    save_store: bool,
+    save_path: Option<impl AsRef<Path>>,
+    verbose: bool,
+) -> std::io::Result<IvfIndexRaBitQ<T>>
+where
+    T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum + ComplexField,
+{
+    let ann_dist = parse_ann_dist(dist_metric).unwrap_or_default();
+    if save_store {
+        let path = save_path.expect("save_path required when save_store is true");
+        IvfIndexRaBitQ::build_with_vector_store(
+            mat, ann_dist, nlist, max_iters, seed, verbose, path,
+        )
+    } else {
+        Ok(IvfIndexRaBitQ::build(
+            mat, ann_dist, nlist, max_iters, seed, verbose,
+        ))
+    }
+}
+
+#[cfg(feature = "binary")]
+/// Helper function to query a given IVF-RaBitQ index
+///
+/// ### Params
+///
+/// * `query_mat` - The query matrix containing the samples × features
+/// * `index` - The IVF-RaBitQ index
+/// * `k` - Number of neighbours to return
+/// * `nprobe` - Number of IVF cells to probe (None for sqrt(nlist))
+/// * `rerank` - Whether to use exact distance reranking (requires vector store)
+/// * `rerank_factor` - Multiplier for candidate set size (only used if rerank is true)
+/// * `return_dist` - Shall the distances be returned
+/// * `verbose` - Controls verbosity of the function
+///
+/// ### Returns
+///
+/// A tuple of `(knn_indices, optional distances)`
+#[allow(clippy::too_many_arguments)]
+pub fn query_ivf_index_rabitq<T>(
+    query_mat: MatRef<T>,
+    index: &IvfIndexRaBitQ<T>,
+    k: usize,
+    nprobe: Option<usize>,
+    rerank: bool,
+    rerank_factor: Option<usize>,
+    return_dist: bool,
+    verbose: bool,
+) -> (Vec<Vec<usize>>, Option<Vec<Vec<T>>>)
+where
+    T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum + ComplexField,
+{
+    if rerank {
+        query_parallel(query_mat.nrows(), return_dist, verbose, |i| {
+            index.query_row_reranking(query_mat.row(i), k, nprobe, rerank_factor)
+        })
+    } else {
+        query_parallel(query_mat.nrows(), return_dist, verbose, |i| {
+            index.query_row(query_mat.row(i), k, nprobe)
+        })
+    }
+}
+
+#[cfg(feature = "binary")]
+/// Query an IVF-RaBitQ index against itself
+///
+/// Generates a full kNN graph based on the internal data.
+/// Requires vector store to be available (use save_store=true when building).
+///
+/// ### Params
+///
+/// * `index` - Reference to built index
+/// * `k` - Number of neighbours
+/// * `nprobe` - Number of IVF cells to probe (None for sqrt(nlist))
+/// * `rerank_factor` - Multiplier for candidate set size
+/// * `return_dist` - Return distances
+/// * `verbose` - Controls verbosity
+///
+/// ### Returns
+///
+/// Tuple of (indices, optional distances)
+pub fn query_ivf_index_rabitq_self<T>(
+    index: &IvfIndexRaBitQ<T>,
+    k: usize,
+    nprobe: Option<usize>,
+    rerank_factor: Option<usize>,
+    return_dist: bool,
+    verbose: bool,
+) -> (Vec<Vec<usize>>, Option<Vec<Vec<T>>>)
+where
+    T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum + ComplexField,
+{
+    index.generate_knn(k, nprobe, rerank_factor, return_dist, verbose)
 }

@@ -34,7 +34,7 @@ pub struct ExhaustiveIndexBf16<T> {
     pub vectors_flat: Vec<bf16>,
     pub dim: usize,
     pub n: usize,
-    norms: Vec<bf16>,
+    norms: Vec<T>,
     metric: Dist,
     _phantom: PhantomData<T>,
 }
@@ -55,7 +55,7 @@ where
         self.dim
     }
 
-    fn norms(&self) -> &[bf16] {
+    fn norms(&self) -> &[T] {
         &self.norms
     }
 }
@@ -101,7 +101,7 @@ where
 
         Self {
             vectors_flat: encode_bf16_quantisation(&vectors_flat),
-            norms: encode_bf16_quantisation(&norms),
+            norms,
             dim,
             metric,
             n,

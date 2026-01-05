@@ -330,7 +330,7 @@ where
     fn dim(&self) -> usize;
 
     /// Get the normalised values
-    fn norms(&self) -> &[bf16];
+    fn norms(&self) -> &[T];
 
     ///////////////
     // Euclidean //
@@ -484,7 +484,8 @@ where
                 .map(|(&a, &b)| a.to_f32() * b.to_f32())
                 .fold(0.0, |acc, x| acc + x);
 
-            let dist = 1.0 - (dot / (self.norms()[i].to_f32() * self.norms()[j].to_f32()));
+            let dist = 1.0
+                - (dot / (self.norms()[i].to_f32().unwrap() * self.norms()[j].to_f32().unwrap()));
 
             T::from_f32(dist).unwrap()
         }
@@ -519,8 +520,10 @@ where
                 .map(|(&a, &b)| a.to_f32() * b.to_f32().unwrap())
                 .fold(0.0, |acc, x| acc + x);
 
-            let dist =
-                1.0 - (dot / (query_norm.to_f32().unwrap() * self.norms()[internal_idx].to_f32()));
+            let dist = 1.0
+                - (dot
+                    / (query_norm.to_f32().unwrap()
+                        * self.norms()[internal_idx].to_f32().unwrap()));
 
             T::from_f32(dist).unwrap()
         }
@@ -560,7 +563,8 @@ where
                 .map(|(&a, &b)| a.to_f32() * b.to_f32())
                 .fold(0.0, |acc, x| acc + x);
 
-            let dist = 1.0 - (dot / (query_norm.to_f32() * self.norms()[internal_idx].to_f32()));
+            let dist =
+                1.0 - (dot / (query_norm.to_f32() * self.norms()[internal_idx].to_f32().unwrap()));
 
             T::from_f32(dist).unwrap()
         }
