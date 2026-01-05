@@ -633,3 +633,268 @@ where
             + self.storage.memory_usage_bytes()
     }
 }
+
+///////////
+// Tests //
+///////////
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use faer::Mat;
+    use tempfile::TempDir;
+
+    fn create_test_data<T: Float + FromPrimitive + ComplexField>(n: usize, dim: usize) -> Mat<T> {
+        let mut data = Mat::zeros(n, dim);
+        for i in 0..n {
+            for j in 0..dim {
+                data[(i, j)] = T::from_f64((i * dim + j) as f64 * 0.1).unwrap();
+            }
+        }
+        data
+    }
+
+    #[test]
+    fn test_ivf_rabitq_construction() {
+        let data = create_test_data::<f32>(100, 32);
+        let index = IvfIndexRaBitQ::build(
+            data.as_ref(),
+            Dist::Euclidean,
+            Some(10),
+            Some(10),
+            42,
+            false,
+        );
+
+        assert_eq!(index.n, 100);
+        assert_eq!(index.storage.nlist, 10);
+        assert_eq!(index.storage.n_vectors(), 100);
+    }
+
+    #[test]
+    fn test_ivf_rabitq_query_returns_k_results() {
+        let data = create_test_data::<f32>(100, 32);
+        let index = IvfIndexRaBitQ::build(
+            data.as_ref(),
+            Dist::Euclidean,
+            Some(10),
+            Some(10),
+            42,
+            false,
+        );
+
+        let query: Vec<f32> = (0..32).map(|i| i as f32 * 0.1).collect();
+        let (indices, distances) = index.query(&query, 10, Some(10));
+
+        assert_eq!(indices.len(), 10);
+        assert_eq!(distances.len(), 10);
+    }
+
+    #[test]
+    fn test_ivf_rabitq_query_sorted() {
+        let data = create_test_data::<f32>(100, 32);
+        let index = IvfIndexRaBitQ::build(
+            data.as_ref(),
+            Dist::Euclidean,
+            Some(10),
+            Some(10),
+            42,
+            false,
+        );
+
+        let query: Vec<f32> = (0..32).map(|i| i as f32 * 0.1).collect();
+        let (_, distances) = index.query(&query, 10, Some(10));
+
+        for i in 1..distances.len() {
+            assert!(distances[i] >= distances[i - 1]);
+        }
+    }
+
+    #[test]
+    fn test_ivf_rabitq_query_k_exceeds_n() {
+        let data = create_test_data::<f32>(50, 32);
+        let index =
+            IvfIndexRaBitQ::build(data.as_ref(), Dist::Euclidean, Some(5), Some(10), 42, false);
+
+        let query: Vec<f32> = (0..32).map(|i| i as f32 * 0.1).collect();
+        let (indices, _) = index.query(&query, 100, Some(5));
+
+        assert_eq!(indices.len(), 50);
+    }
+
+    #[test]
+    fn test_ivf_rabitq_query_row() {
+        let data = create_test_data::<f32>(100, 32);
+        let index = IvfIndexRaBitQ::build(
+            data.as_ref(),
+            Dist::Euclidean,
+            Some(10),
+            Some(10),
+            42,
+            false,
+        );
+
+        let (indices, distances) = index.query_row(data.as_ref().row(0), 10, Some(10));
+
+        assert_eq!(indices.len(), 10);
+        assert_eq!(distances.len(), 10);
+    }
+
+    #[test]
+    fn test_ivf_rabitq_cosine() {
+        let data = create_test_data::<f32>(100, 32);
+        let index =
+            IvfIndexRaBitQ::build(data.as_ref(), Dist::Cosine, Some(10), Some(10), 42, false);
+
+        let query: Vec<f32> = (0..32).map(|i| i as f32 * 0.1).collect();
+        let (indices, distances) = index.query(&query, 10, Some(10));
+
+        assert_eq!(indices.len(), 10);
+        assert_eq!(distances.len(), 10);
+    }
+
+    #[test]
+    fn test_ivf_rabitq_default_nprobe() {
+        let data = create_test_data::<f32>(100, 32);
+        let index = IvfIndexRaBitQ::build(
+            data.as_ref(),
+            Dist::Euclidean,
+            Some(10),
+            Some(10),
+            42,
+            false,
+        );
+
+        let query: Vec<f32> = (0..32).map(|i| i as f32 * 0.1).collect();
+        let (indices, _) = index.query(&query, 5, None);
+
+        assert!(indices.len() <= 5);
+    }
+
+    #[test]
+    fn test_build_with_vector_store() {
+        let data = create_test_data::<f32>(50, 32);
+        let temp_dir = TempDir::new().unwrap();
+
+        let index = IvfIndexRaBitQ::build_with_vector_store(
+            data.as_ref(),
+            Dist::Euclidean,
+            Some(5),
+            Some(10),
+            42,
+            false,
+            temp_dir.path(),
+        )
+        .unwrap();
+
+        assert_eq!(index.n, 50);
+        assert!(index.vector_store.is_some());
+    }
+
+    #[test]
+    fn test_query_reranking() {
+        let data = create_test_data::<f32>(100, 32);
+        let temp_dir = TempDir::new().unwrap();
+
+        let index = IvfIndexRaBitQ::build_with_vector_store(
+            data.as_ref(),
+            Dist::Cosine,
+            Some(10),
+            Some(10),
+            42,
+            false,
+            temp_dir.path(),
+        )
+        .unwrap();
+
+        let query: Vec<f32> = (0..32).map(|i| i as f32 * 0.1).collect();
+        let (indices, distances) = index.query_reranking(&query, 10, Some(10), Some(5));
+
+        assert_eq!(indices.len(), 10);
+        assert_eq!(distances.len(), 10);
+
+        for i in 1..distances.len() {
+            assert!(distances[i] >= distances[i - 1]);
+        }
+    }
+
+    #[test]
+    fn test_query_row_reranking() {
+        let data = create_test_data::<f32>(100, 32);
+        let temp_dir = TempDir::new().unwrap();
+
+        let index = IvfIndexRaBitQ::build_with_vector_store(
+            data.as_ref(),
+            Dist::Euclidean,
+            Some(10),
+            Some(10),
+            42,
+            false,
+            temp_dir.path(),
+        )
+        .unwrap();
+
+        let (indices, distances) =
+            index.query_row_reranking(data.as_ref().row(0), 10, Some(10), Some(5));
+
+        assert_eq!(indices.len(), 10);
+        assert_eq!(distances.len(), 10);
+    }
+
+    #[test]
+    fn test_knn_graph_with_vector_store() {
+        let data = create_test_data::<f32>(50, 32);
+        let temp_dir = TempDir::new().unwrap();
+
+        let index = IvfIndexRaBitQ::build_with_vector_store(
+            data.as_ref(),
+            Dist::Cosine,
+            Some(5),
+            Some(10),
+            42,
+            false,
+            temp_dir.path(),
+        )
+        .unwrap();
+
+        let (knn_indices, knn_distances) = index.generate_knn(5, Some(5), Some(10), true, false);
+
+        assert_eq!(knn_indices.len(), 50);
+        assert!(knn_distances.is_some());
+        assert_eq!(knn_distances.as_ref().unwrap().len(), 50);
+
+        for neighbours in knn_indices.iter() {
+            assert_eq!(neighbours.len(), 5);
+        }
+    }
+
+    #[test]
+    #[should_panic]
+    fn test_knn_without_vector_store_panics() {
+        let data = create_test_data::<f32>(50, 32);
+        let index =
+            IvfIndexRaBitQ::build(data.as_ref(), Dist::Euclidean, Some(5), Some(10), 42, false);
+
+        let _ = index.generate_knn(5, Some(5), Some(10), false, false);
+    }
+
+    #[test]
+    #[should_panic]
+    fn test_query_reranking_without_vector_store_panics() {
+        let data = create_test_data::<f32>(50, 32);
+        let index =
+            IvfIndexRaBitQ::build(data.as_ref(), Dist::Euclidean, Some(5), Some(10), 42, false);
+
+        let query: Vec<f32> = (0..32).map(|i| i as f32 * 0.1).collect();
+        let _ = index.query_reranking(&query, 10, Some(5), Some(5));
+    }
+
+    #[test]
+    fn test_default_nlist() {
+        let data = create_test_data::<f32>(100, 32);
+        let index =
+            IvfIndexRaBitQ::build(data.as_ref(), Dist::Euclidean, None, Some(10), 42, false);
+
+        assert_eq!(index.storage.nlist, 10);
+    }
+}

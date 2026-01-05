@@ -25,7 +25,7 @@ use crate::utils::matrix_to_flat;
 /// * `vectors_flat` - Original vector data for distance calculations. Flattened
 ///   for better cache locality
 /// * `norms` - Normalised pre-calculated values per sample if distance is set
-///   to Cosine
+///   to Cosine. Keep `T` here to avoid massive precision loss for Cosine.
 /// * `dim` - Embedding dimensions
 /// * `n` - Number of samples
 /// * `dist_metric` - The type of distance the index is designed for

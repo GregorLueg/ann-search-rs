@@ -26,7 +26,8 @@ use crate::utils::*;
 /// * `vectors_flat` - Original vector data, flattened for cache locality
 /// * `dim` - Embedding dimensions
 /// * `n` - Number of vectors
-/// * `norms` - Pre-computed norms for Cosine distance (empty for Euclidean)
+/// * `norms` - Pre-computed norms for Cosine distance (empty for Euclidean).
+///   Keep `T` here to avoid massive precision loss for Cosine.
 /// * `metric` - Distance metric (Euclidean or Cosine)
 /// * `centroids` - Cluster centres (nlist * dim elements)
 /// * `all_indices` - Vector indices for each cluster (in a flat structure)
