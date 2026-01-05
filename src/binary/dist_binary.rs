@@ -209,6 +209,20 @@ pub fn hamming_distance(a: &[u8], b: &[u8]) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::binary::rabitq::RaBitQQuantiser;
+    use crate::utils::dist::Dist;
+    use faer::Mat;
+    use faer_traits::ComplexField;
+
+    fn create_test_data<T: Float + FromPrimitive + ComplexField>(n: usize, dim: usize) -> Mat<T> {
+        let mut data = Mat::zeros(n, dim);
+        for i in 0..n {
+            for j in 0..dim {
+                data[(i, j)] = T::from_f64((i * dim + j) as f64 * 0.1).unwrap();
+            }
+        }
+        data
+    }
 
     struct TestBinaryVectors {
         data: Vec<u8>,
@@ -374,5 +388,115 @@ mod tests {
 
         let expected = hamming_distance(&vec1, &vec2);
         assert_eq!(storage.hamming_distance(0, 1), expected);
+    }
+
+    #[test]
+    fn test_rabitq_trait_dim() {
+        let data = create_test_data::<f32>(50, 32);
+        let quantiser = RaBitQQuantiser::new(data.as_ref(), &Dist::Euclidean, Some(5), 42);
+
+        assert_eq!(quantiser.dim(), 32);
+    }
+
+    #[test]
+    fn test_rabitq_trait_n_bytes() {
+        let data = create_test_data::<f32>(50, 32);
+        let quantiser = RaBitQQuantiser::new(data.as_ref(), &Dist::Euclidean, Some(5), 42);
+
+        assert_eq!(quantiser.n_bytes(), 4);
+    }
+
+    #[test]
+    fn test_rabitq_popcount() {
+        let data = create_test_data::<f32>(50, 32);
+        let quantiser = RaBitQQuantiser::new(data.as_ref(), &Dist::Euclidean, Some(5), 42);
+
+        let popcount = quantiser.popcount(0, 0);
+        assert!(popcount <= 32);
+    }
+
+    #[test]
+    fn test_rabitq_dot_query_binary() {
+        let data = create_test_data::<f32>(50, 32);
+        let quantiser = RaBitQQuantiser::new(data.as_ref(), &Dist::Euclidean, Some(5), 42);
+
+        let query = vec![1.0f32; 32];
+        let encoded_query = quantiser.encode_query(&query, 0);
+
+        let dot = quantiser.dot_query_binary(&encoded_query, 0, 0);
+        assert!(dot <= 15 * 32);
+    }
+
+    #[test]
+    fn test_rabitq_dist_positive() {
+        let data = create_test_data::<f32>(50, 32);
+        let quantiser = RaBitQQuantiser::new(data.as_ref(), &Dist::Euclidean, Some(5), 42);
+
+        let query = vec![1.0f32; 32];
+        let encoded_query = quantiser.encode_query(&query, 0);
+
+        let dist = quantiser.rabitq_dist(&encoded_query, 0, 0);
+        assert!(dist >= 0.0);
+    }
+
+    #[test]
+    fn test_rabitq_dist_consistency() {
+        let data = create_test_data::<f32>(50, 32);
+        let quantiser = RaBitQQuantiser::new(data.as_ref(), &Dist::Euclidean, Some(5), 42);
+
+        let query = vec![1.0f32; 32];
+        let encoded_query = quantiser.encode_query(&query, 0);
+
+        let dist1 = quantiser.rabitq_dist(&encoded_query, 0, 0);
+        let dist2 = quantiser.rabitq_dist(&encoded_query, 0, 0);
+
+        assert_eq!(dist1, dist2);
+    }
+
+    #[test]
+    fn test_rabitq_dist_different_vectors() {
+        let data = create_test_data::<f32>(50, 32);
+        let quantiser = RaBitQQuantiser::new(data.as_ref(), &Dist::Euclidean, Some(5), 42);
+
+        let query = vec![1.0f32; 32];
+        let encoded_query = quantiser.encode_query(&query, 0);
+
+        let cluster_size = quantiser.storage().cluster_size(0);
+        if cluster_size > 1 {
+            let dist0 = quantiser.rabitq_dist(&encoded_query, 0, 0);
+            let dist1 = quantiser.rabitq_dist(&encoded_query, 0, 1);
+
+            assert!(dist0 >= 0.0 && dist1 >= 0.0);
+        }
+    }
+
+    #[test]
+    fn test_rabitq_dist_cosine() {
+        let data = create_test_data::<f32>(50, 32);
+        let quantiser = RaBitQQuantiser::new(data.as_ref(), &Dist::Cosine, Some(5), 42);
+
+        let query = vec![1.0f32; 32];
+        let encoded_query = quantiser.encode_query(&query, 0);
+
+        let dist = quantiser.rabitq_dist(&encoded_query, 0, 0);
+        assert!(dist >= 0.0);
+    }
+
+    #[test]
+    fn test_rabitq_multiple_clusters() {
+        let data = create_test_data::<f32>(100, 32);
+        let quantiser = RaBitQQuantiser::new(data.as_ref(), &Dist::Euclidean, Some(10), 42);
+
+        let query = vec![1.0f32; 32];
+
+        for cluster_idx in 0..quantiser.storage().nlist {
+            let encoded_query = quantiser.encode_query(&query, cluster_idx);
+            let cluster_size = quantiser.storage().cluster_size(cluster_idx);
+
+            for local_idx in 0..cluster_size {
+                let dist = quantiser.rabitq_dist(&encoded_query, cluster_idx, local_idx);
+                assert!(dist >= 0.0);
+            }
+        }
     }
 }
