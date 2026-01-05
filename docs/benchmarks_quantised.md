@@ -29,8 +29,7 @@ The BF16 quantisation reduces the floats to `bf16` which keeps the range of
 `f32`, but loses precision in the digits from ~3 onwards. The actual distance
 calculations in the index happen in `f32`; however, due to lossy compression
 to `bf16` there is some Recall loss. This is compensated with drastically
-reduced memory fingerprint (nearly halved for f32). The performance for Cosine
-distances however is way, way worse–compared to Euclidean.
+reduced memory fingerprint (nearly halved for f32).
 
 **Key parameters:**
 

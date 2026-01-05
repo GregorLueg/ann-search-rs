@@ -77,8 +77,16 @@ run_gpu_benchmarks() {
 run_binary_benchmarks() {
     echo "=== Running binary benchmarks ===" 
     
-    for variant in binary rabitq; do
+    # for variant in binary rabitq; do
+    for variant in rabitq; do
         run_common_patterns "cargo run --example gridsearch_${variant} --release --features binary --" "$(echo ${variant} | tr '[:lower:]' '[:upper:]')"
+    done
+
+    echo "Running binary benchmarks (more dimensions)..."
+    for dim in 128; do
+        cargo run --example gridsearch_binary --release --features binary -- --distance euclidean --dim ${dim}
+        cargo run --example gridsearch_binary --release --features binary -- --distance euclidean --dim ${dim} --data correlated
+        cargo run --example gridsearch_binary --release --features binary -- --distance euclidean --dim ${dim} --data lowrank
     done
 
     echo "Running RaBitQ benchmarks (more dimensions)..."

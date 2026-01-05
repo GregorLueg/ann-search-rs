@@ -92,10 +92,10 @@ where
 
     /// Initialise binariser using PCA followed by ITQ rotation
     ///
-    /// Uses Principal Component Analysis to find the directions of maximum variance,
-    /// then applies Iterative Quantisation (ITQ) to rotate these components for
-    /// optimal binary quantisation. This typically produces better quality codes
-    /// than random projections.
+    /// Uses Principal Component Analysis to find the directions of maximum
+    /// variance, then applies Iterative Quantisation (ITQ) to rotate these
+    /// components for optimal binary quantisation. This typically produces
+    /// better quality codes than random projections.
     ///
     /// ### Params
     ///

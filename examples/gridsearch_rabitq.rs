@@ -85,6 +85,37 @@ fn main() {
     let build_time = start.elapsed().as_secs_f64() * 1000.0;
     let index_size_mb = rabitq_idx.memory_usage_bytes() as f64 / (1024.0 * 1024.0);
 
+    println!("Querying RaBitQ exhaustive index (without reranking)...");
+    let start = Instant::now();
+    let (rabitq_neighbors, rabitq_distances) = query_exhaustive_index_rabitq(
+        query_data.as_ref(),
+        &rabitq_idx,
+        cli.k,
+        None,
+        false,
+        None,
+        true,
+        false,
+    );
+    let query_time = start.elapsed().as_secs_f64() * 1000.0;
+
+    let recall = calculate_recall(&true_neighbors, &rabitq_neighbors, cli.k);
+    let dist_error = calculate_dist_error(
+        true_distances.as_ref().unwrap(),
+        rabitq_distances.as_ref().unwrap(),
+        cli.k,
+    );
+
+    results.push(BenchmarkResultSize {
+        method: "ExhaustiveRaBitQ-rf0 (query)".into(),
+        build_time_ms: build_time,
+        query_time_ms: query_time,
+        total_time_ms: build_time + query_time,
+        recall_at_k: recall,
+        mean_dist_err: dist_error,
+        index_size_mb,
+    });
+
     for &rerank_factor in &rerank_factors {
         println!(
             "Querying RaBitQ exhaustive index (rerank_factor={})...",
