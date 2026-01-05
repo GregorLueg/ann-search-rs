@@ -1,5 +1,10 @@
-use num_traits::{Float, FromPrimitive, ToPrimitive};
+use num_traits::Float;
 use std::iter::Sum;
+
+#[cfg(feature = "quantised")]
+use half::*;
+#[cfg(feature = "quantised")]
+use num_traits::{FromPrimitive, ToPrimitive};
 
 ////////////
 // Helper //
@@ -59,12 +64,6 @@ where
     ///////////////
 
     /// Euclidean distance between two internal vectors (squared)
-    ///
-    /// ### Implementation note
-    ///
-    /// Uses iterator-based approach which allows LLVM to auto-vectorise
-    /// optimally for the target CPU. Returns squared distance to avoid
-    /// expensive sqrt - sufficient for comparison purposes.
     ///
     /// ### Params
     ///
@@ -213,6 +212,7 @@ where
 // VectorDistanceSq8 //
 ///////////////////////
 
+#[cfg(feature = "quantised")]
 /// Trait for computing distances between `i8`
 pub trait VectorDistanceSq8<T>
 where
@@ -312,10 +312,265 @@ where
     }
 }
 
+////////////////////////
+// VectorDistanceBf16 //
+////////////////////////
+
+#[cfg(feature = "quantised")]
+/// Trait for computing distances between Floats
+pub trait VectorDistanceBf16<T>
+where
+    T: Float + Sum + FromPrimitive + ToPrimitive,
+{
+    /// Get the internal flat vector representation
+    fn vectors_flat(&self) -> &[bf16];
+
+    /// Get the internal dimensions
+    fn dim(&self) -> usize;
+
+    /// Get the normalised values
+    fn norms(&self) -> &[bf16];
+
+    ///////////////
+    // Euclidean //
+    ///////////////
+
+    /// Euclidean distance between two internal vectors (squared; bf16)
+    ///
+    /// ### Params
+    ///
+    /// * `i` - Sample index i
+    /// * `j` - Sample index j
+    ///
+    /// ### Safety
+    ///
+    /// Uses unsafe to retrieve the data in an unchecked manner for maximum
+    /// performance.
+    ///
+    /// ### Returns
+    ///
+    /// The squared Euclidean distance between the two samples
+    #[inline(always)]
+    fn euclidean_distance_bf16(&self, i: usize, j: usize) -> T {
+        let start_i = i * self.dim();
+        let start_j = j * self.dim();
+        unsafe {
+            let vec_i = self
+                .vectors_flat()
+                .get_unchecked(start_i..start_i + self.dim());
+            let vec_j = self
+                .vectors_flat()
+                .get_unchecked(start_j..start_j + self.dim());
+            let dist = vec_i
+                .iter()
+                .zip(vec_j.iter())
+                .map(|(&a, &b)| {
+                    let diff = a.to_f32() - b.to_f32();
+                    diff * diff
+                })
+                .fold(0.0, |acc, x| acc + x);
+
+            T::from_f32(dist).unwrap()
+        }
+    }
+
+    /// Euclidean distance between query vector and internal vector
+    /// (squared; bf16)
+    ///
+    /// ### Params
+    ///
+    /// * `internal_idx` - Index of internal vector
+    /// * `query` - Query vector slice
+    ///
+    /// ### Safety
+    ///
+    /// Uses unsafe to retrieve the data in an unchecked manner for maximum
+    /// performance.
+    ///
+    /// ### Returns
+    ///
+    /// The squared Euclidean distance
+    #[inline(always)]
+    fn euclidean_distance_to_query_bf16(&self, internal_idx: usize, query: &[T]) -> T {
+        let start = internal_idx * self.dim();
+
+        unsafe {
+            let vec = &self.vectors_flat().get_unchecked(start..start + self.dim());
+            let dist = vec
+                .iter()
+                .zip(query.iter())
+                .map(|(&a, &b)| {
+                    let diff = a.to_f32() - b.to_f32().unwrap();
+                    diff * diff
+                })
+                .fold(0.0, |acc, x| acc + x);
+
+            T::from_f32(dist).unwrap()
+        }
+    }
+
+    /// Euclidean distance between query vector and internal vector
+    /// (squared; bf16)
+    ///
+    /// ### Params
+    ///
+    /// * `internal_idx` - Index of internal vector
+    /// * `query` - Query vector slice
+    ///
+    /// ### Safety
+    ///
+    /// Uses unsafe to retrieve the data in an unchecked manner for maximum
+    /// performance.
+    ///
+    /// ### Returns
+    ///
+    /// The squared Euclidean distance
+    #[inline(always)]
+    fn euclidean_distance_to_query_dual_bf16(&self, internal_idx: usize, query: &[bf16]) -> T {
+        let start = internal_idx * self.dim();
+
+        unsafe {
+            let vec = &self.vectors_flat().get_unchecked(start..start + self.dim());
+            let dist = vec
+                .iter()
+                .zip(query.iter())
+                .map(|(&a, &b)| {
+                    let diff = a.to_f32() - b.to_f32();
+                    diff * diff
+                })
+                .fold(0.0, |acc, x| acc + x);
+
+            T::from_f32(dist).unwrap()
+        }
+    }
+
+    ////////////
+    // Cosine //
+    ////////////
+
+    /// Cosine distance between two internal vectors
+    ///
+    /// Uses pre-computed norms.
+    ///
+    /// ### Params
+    ///
+    /// * `i` - Sample index i
+    /// * `j` - Sample index j
+    ///
+    /// ### Safety
+    ///
+    /// Uses unsafe to retrieve the data in an unchecked manner for maximum
+    /// performance.
+    ///
+    /// ### Returns
+    ///
+    /// The Cosine distance between the two samples
+    #[inline(always)]
+    fn cosine_distance_bf16(&self, i: usize, j: usize) -> T {
+        let start_i = i * self.dim();
+        let start_j = j * self.dim();
+        unsafe {
+            let vec_i = &self
+                .vectors_flat()
+                .get_unchecked(start_i..start_i + self.dim());
+            let vec_j = &self
+                .vectors_flat()
+                .get_unchecked(start_j..start_j + self.dim());
+
+            let dot = vec_i
+                .iter()
+                .zip(vec_j.iter())
+                .map(|(&a, &b)| a.to_f32() * b.to_f32())
+                .fold(0.0, |acc, x| acc + x);
+
+            let dist = 1.0 - (dot / (self.norms()[i].to_f32() * self.norms()[j].to_f32()));
+
+            T::from_f32(dist).unwrap()
+        }
+    }
+
+    /// Cosine distance between query vector and internal vector
+    ///
+    /// ### Params
+    ///
+    /// * `internal_idx` - Index of internal vector
+    /// * `query` - Query vector slice
+    /// * `query_norm` - Pre-computed norm of query vector
+    ///
+    /// ### Safety
+    ///
+    /// Uses unsafe to retrieve the data in an unchecked manner for maximum
+    /// performance.
+    ///
+    /// ### Returns
+    ///
+    /// The Cosine distance
+    #[inline(always)]
+    fn cosine_distance_to_query_bf16(&self, internal_idx: usize, query: &[T], query_norm: T) -> T {
+        let start = internal_idx * self.dim();
+
+        unsafe {
+            let vec = &self.vectors_flat().get_unchecked(start..start + self.dim());
+
+            let dot = vec
+                .iter()
+                .zip(query.iter())
+                .map(|(&a, &b)| a.to_f32() * b.to_f32().unwrap())
+                .fold(0.0, |acc, x| acc + x);
+
+            let dist =
+                1.0 - (dot / (query_norm.to_f32().unwrap() * self.norms()[internal_idx].to_f32()));
+
+            T::from_f32(dist).unwrap()
+        }
+    }
+
+    /// Cosine distance between query vector and internal vector
+    ///
+    /// ### Params
+    ///
+    /// * `internal_idx` - Index of internal vector
+    /// * `query` - Query vector slice
+    /// * `query_norm` - Pre-computed norm of query vector
+    ///
+    /// ### Safety
+    ///
+    /// Uses unsafe to retrieve the data in an unchecked manner for maximum
+    /// performance.
+    ///
+    /// ### Returns
+    ///
+    /// The Cosine distance
+    #[inline(always)]
+    fn cosine_distance_to_query_dual_bf16(
+        &self,
+        internal_idx: usize,
+        query: &[bf16],
+        query_norm: bf16,
+    ) -> T {
+        let start = internal_idx * self.dim();
+
+        unsafe {
+            let vec = &self.vectors_flat().get_unchecked(start..start + self.dim());
+
+            let dot = vec
+                .iter()
+                .zip(query.iter())
+                .map(|(&a, &b)| a.to_f32() * b.to_f32())
+                .fold(0.0, |acc, x| acc + x);
+
+            let dist = 1.0 - (dot / (query_norm.to_f32() * self.norms()[internal_idx].to_f32()));
+
+            T::from_f32(dist).unwrap()
+        }
+    }
+}
+
 ///////////////////////
 // VectorDistanceAdc //
 ///////////////////////
 
+#[cfg(feature = "quantised")]
 pub trait VectorDistanceAdc<T>
 where
     T: Float + FromPrimitive + ToPrimitive + Sum,
@@ -875,69 +1130,6 @@ mod tests {
         assert_relative_eq!(dist_2, 0.0, epsilon = 1e-6);
     }
 
-    struct TestVectorsSq8 {
-        data: Vec<i8>,
-        norms: Vec<i32>,
-        dim: usize,
-    }
-
-    impl VectorDistanceSq8<f32> for TestVectorsSq8 {
-        fn vectors_flat_quantised(&self) -> &[i8] {
-            &self.data
-        }
-
-        fn norms_quantised(&self) -> &[i32] {
-            &self.norms
-        }
-
-        fn dim(&self) -> usize {
-            self.dim
-        }
-    }
-
-    #[test]
-    fn test_euclidean_distance_i8() {
-        let data = vec![127, 0, 0, 0, 127, 0];
-
-        let vecs = TestVectorsSq8 {
-            data,
-            norms: vec![],
-            dim: 3,
-        };
-
-        let query = vec![127, 127, 0];
-
-        // Distance from [127,0,0] to [127,127,0] should be 127^2
-        let dist = vecs.euclidean_distance_i8(0, &query);
-        assert_relative_eq!(dist, 16129.0, epsilon = 1e-3);
-    }
-
-    #[test]
-    fn test_cosine_distance_i8() {
-        let data = vec![127, 0, 0, 0, 127, 0, 127, 127, 0];
-
-        let norm0 = 127 * 127;
-        let norm1 = 127 * 127;
-        let norm2 = 127 * 127 + 127 * 127;
-
-        let vecs = TestVectorsSq8 {
-            data,
-            norms: vec![norm0, norm1, norm2],
-            dim: 3,
-        };
-
-        let query = vec![127, 127, 0];
-        let query_norm_sq = 127 * 127 + 127 * 127;
-
-        // Orthogonal vectors
-        let dist_0 = vecs.cosine_distance_i8(0, &query, query_norm_sq);
-        assert_relative_eq!(dist_0, 1.0 - 1.0 / 2.0_f32.sqrt(), epsilon = 1e-5);
-
-        // Same direction
-        let dist_2 = vecs.cosine_distance_i8(2, &query, query_norm_sq);
-        assert_relative_eq!(dist_2, 0.0, epsilon = 1e-5);
-    }
-
     #[test]
     fn test_euclidean_distance_static() {
         let a = vec![1.0, 2.0, 3.0];
@@ -991,5 +1183,73 @@ mod tests {
         assert_relative_eq!(vec[0], 0.0, epsilon = 1e-6);
         assert_relative_eq!(vec[1], 0.0, epsilon = 1e-6);
         assert_relative_eq!(vec[2], 0.0, epsilon = 1e-6);
+    }
+
+    #[cfg(feature = "quantised")]
+    mod quantised_tests {
+        use super::*;
+
+        struct TestVectorsSq8 {
+            data: Vec<i8>,
+            norms: Vec<i32>,
+            dim: usize,
+        }
+
+        impl VectorDistanceSq8<f32> for TestVectorsSq8 {
+            fn vectors_flat_quantised(&self) -> &[i8] {
+                &self.data
+            }
+
+            fn norms_quantised(&self) -> &[i32] {
+                &self.norms
+            }
+
+            fn dim(&self) -> usize {
+                self.dim
+            }
+        }
+
+        #[test]
+        fn test_euclidean_distance_i8() {
+            let data = vec![127, 0, 0, 0, 127, 0];
+
+            let vecs = TestVectorsSq8 {
+                data,
+                norms: vec![],
+                dim: 3,
+            };
+
+            let query = vec![127, 127, 0];
+
+            // Distance from [127,0,0] to [127,127,0] should be 127^2
+            let dist = vecs.euclidean_distance_i8(0, &query);
+            assert_relative_eq!(dist, 16129.0, epsilon = 1e-3);
+        }
+
+        #[test]
+        fn test_cosine_distance_i8() {
+            let data = vec![127, 0, 0, 0, 127, 0, 127, 127, 0];
+
+            let norm0 = 127 * 127;
+            let norm1 = 127 * 127;
+            let norm2 = 127 * 127 + 127 * 127;
+
+            let vecs = TestVectorsSq8 {
+                data,
+                norms: vec![norm0, norm1, norm2],
+                dim: 3,
+            };
+
+            let query = vec![127, 127, 0];
+            let query_norm_sq = 127 * 127 + 127 * 127;
+
+            // Orthogonal vectors
+            let dist_0 = vecs.cosine_distance_i8(0, &query, query_norm_sq);
+            assert_relative_eq!(dist_0, 1.0 - 1.0 / 2.0_f32.sqrt(), epsilon = 1e-5);
+
+            // Same direction
+            let dist_2 = vecs.cosine_distance_i8(2, &query, query_norm_sq);
+            assert_relative_eq!(dist_2, 0.0, epsilon = 1e-5);
+        }
     }
 }

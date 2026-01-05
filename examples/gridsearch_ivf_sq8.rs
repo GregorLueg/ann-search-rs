@@ -1,5 +1,4 @@
 mod commons;
-
 use ann_search_rs::*;
 use clap::Parser;
 use commons::*;
@@ -7,30 +6,6 @@ use faer::Mat;
 use std::collections::HashSet;
 use std::time::Instant;
 use thousands::*;
-
-#[derive(Parser)]
-struct Cli {
-    #[arg(long, default_value_t = DEFAULT_N_CELLS)]
-    n_cells: usize,
-
-    #[arg(long, default_value_t = DEFAULT_DIM)]
-    dim: usize,
-
-    #[arg(long, default_value_t = DEFAULT_N_CLUSTERS)]
-    n_clusters: usize,
-
-    #[arg(long, default_value_t = DEFAULT_K)]
-    k: usize,
-
-    #[arg(long, default_value_t = DEFAULT_SEED)]
-    seed: u64,
-
-    #[arg(long, default_value = DEFAULT_DISTANCE)]
-    distance: String,
-
-    #[arg(long, default_value = DEFAULT_DATA)]
-    data: String,
-}
 
 fn main() {
     let cli = Cli::parse();
@@ -62,27 +37,49 @@ fn main() {
             )
         }
     };
-    let query_data = data.as_ref();
+
+    let query_data = subsample_with_noise(&data, DEFAULT_N_QUERY, cli.seed + 1);
+
     let mut results = Vec::new();
 
+    // Exhaustive query benchmark
     println!("Building exhaustive index...");
     let start = Instant::now();
     let exhaustive_idx = build_exhaustive_index(data.as_ref(), &cli.distance);
     let build_time = start.elapsed().as_secs_f64() * 1000.0;
 
+    let index_size_mb = exhaustive_idx.memory_usage_bytes() as f64 / (1024.0 * 1024.0);
+
     println!("Querying exhaustive index...");
     let start = Instant::now();
     let (true_neighbors, _) =
-        query_exhaustive_index(query_data, &exhaustive_idx, cli.k, false, false);
+        query_exhaustive_index(query_data.as_ref(), &exhaustive_idx, cli.k, false, false);
     let query_time = start.elapsed().as_secs_f64() * 1000.0;
 
-    results.push(BenchmarkResult {
-        method: "Exhaustive".to_string(),
+    results.push(BenchmarkResultSize {
+        method: "Exhaustive (query)".to_string(),
         build_time_ms: build_time,
         query_time_ms: query_time,
         total_time_ms: build_time + query_time,
         recall_at_k: 1.0,
         mean_dist_err: 0.0,
+        index_size_mb,
+    });
+
+    // Exhaustive self-query benchmark
+    println!("Self-querying exhaustive index...");
+    let start = Instant::now();
+    let (true_neighbors_self, _) = query_exhaustive_self(&exhaustive_idx, cli.k, false, false);
+    let self_query_time = start.elapsed().as_secs_f64() * 1000.0;
+
+    results.push(BenchmarkResultSize {
+        method: "Exhaustive (self)".to_string(),
+        build_time_ms: build_time,
+        query_time_ms: self_query_time,
+        total_time_ms: build_time + self_query_time,
+        recall_at_k: 1.0,
+        mean_dist_err: 0.0,
+        index_size_mb,
     });
 
     println!("-----------------------------------------------------------------------------------------------");
@@ -92,6 +89,7 @@ fn main() {
         (cli.n_cells as f32).sqrt() as usize,
         (cli.n_cells as f32 * 2.0).sqrt() as usize,
     ];
+
     for nlist in nlist_values {
         println!("Building IVF-SQ8 index (nlist={})...", nlist);
         let start = Instant::now();
@@ -105,6 +103,8 @@ fn main() {
         );
         let build_time = start.elapsed().as_secs_f64() * 1000.0;
 
+        let index_size_mb = ivf_sq8_idx.memory_usage_bytes() as f64 / (1024.0 * 1024.0);
+
         let nprobe_values = [
             (nlist as f32).sqrt() as usize,
             (nlist as f32 * 2.0).sqrt() as usize,
@@ -117,31 +117,59 @@ fn main() {
             .collect();
         nprobe_values.sort();
 
-        for nprobe in nprobe_values {
-            if nprobe > nlist || nprobe == 0 {
+        // Query benchmarks
+        for nprobe in &nprobe_values {
+            if *nprobe > nlist || *nprobe == 0 {
                 continue;
             }
 
             println!("Querying IVF-SQ8 (nlist={}, nprobe={})...", nlist, nprobe);
             let start = Instant::now();
-            let (approx_neighbors, _) =
-                query_ivf_sq8_index(query_data, &ivf_sq8_idx, cli.k, Some(nprobe), true, false);
+            let (approx_neighbors, _) = query_ivf_sq8_index(
+                query_data.as_ref(),
+                &ivf_sq8_idx,
+                cli.k,
+                Some(*nprobe),
+                false,
+                false,
+            );
             let query_time = start.elapsed().as_secs_f64() * 1000.0;
 
             let recall = calculate_recall(&true_neighbors, &approx_neighbors, cli.k);
 
-            results.push(BenchmarkResult {
-                method: format!("IVF-SQ8-nl{}-np{}", nlist, nprobe),
+            results.push(BenchmarkResultSize {
+                method: format!("IVF-SQ8-nl{}-np{} (query)", nlist, nprobe),
                 build_time_ms: build_time,
                 query_time_ms: query_time,
                 total_time_ms: build_time + query_time,
                 recall_at_k: recall,
-                mean_dist_err: 0.0,
+                mean_dist_err: f64::NAN,
+                index_size_mb,
             });
         }
+
+        // Self-query benchmark
+        let nprobe_self = (nlist as f32 * 2.0).sqrt() as usize;
+        println!("Self-querying IVF-SQ8 index (nprobe={})...", nprobe_self);
+        let start = Instant::now();
+        let (approx_neighbors_self, _) =
+            query_ivf_sq8_self(&ivf_sq8_idx, cli.k, Some(nprobe_self), false, false);
+        let self_query_time = start.elapsed().as_secs_f64() * 1000.0;
+
+        let recall_self = calculate_recall(&true_neighbors_self, &approx_neighbors_self, cli.k);
+
+        results.push(BenchmarkResultSize {
+            method: format!("IVF-SQ8-nl{} (self)", nlist),
+            build_time_ms: build_time,
+            query_time_ms: self_query_time,
+            total_time_ms: build_time + self_query_time,
+            recall_at_k: recall_self,
+            mean_dist_err: f64::NAN,
+            index_size_mb,
+        });
     }
 
-    print_results_recall_only(
+    print_results_size(
         &format!("{}k cells, {}D", cli.n_cells / 1000, cli.dim),
         &results,
     );

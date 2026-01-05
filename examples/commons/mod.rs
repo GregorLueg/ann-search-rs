@@ -1,5 +1,6 @@
 #![allow(dead_code)]
 
+use clap::Parser;
 use faer::traits::ComplexField;
 use faer::Mat;
 use num_traits::{Float, FromPrimitive, ToPrimitive};
@@ -11,13 +12,49 @@ use rustc_hash::FxHashSet;
 ////////////
 
 pub const DEFAULT_N_CELLS: usize = 150_000;
+pub const DEFAULT_N_QUERY: usize = DEFAULT_N_CELLS / 10;
 pub const DEFAULT_DIM: usize = 32;
 pub const DEFAULT_N_CLUSTERS: usize = 25;
 pub const DEFAULT_K: usize = 15;
-pub const DEFAULT_SEED: u64 = 10101;
+pub const DEFAULT_SEED: u64 = 42;
 pub const DEFAULT_DISTANCE: &str = "euclidean";
 pub const DEFAULT_COR_STRENGTH: f64 = 0.5;
 pub const DEFAULT_DATA: &str = "gaussian";
+
+/// Parsing structure
+///
+/// ### Fields
+///
+/// * `n_cells` - Number of cells/samples
+/// * `dim` - Number of dimensions to use
+/// * `n_clusters` - Number of clusters in the data
+/// * `k` - Number of neighbours to search
+/// * `seed` - Random seed for reproducibility
+/// * `distance` - The distance to use. One of `"euclidean"` or `"cosine"`.
+/// * `data` - The data to use. One of `"gaussian"` or `"correlated"`.
+#[derive(Parser)]
+pub struct Cli {
+    #[arg(long, default_value_t = DEFAULT_N_CELLS)]
+    pub n_cells: usize,
+
+    #[arg(long, default_value_t = DEFAULT_DIM)]
+    pub dim: usize,
+
+    #[arg(long, default_value_t = DEFAULT_N_CLUSTERS)]
+    pub n_clusters: usize,
+
+    #[arg(long, default_value_t = DEFAULT_K)]
+    pub k: usize,
+
+    #[arg(long, default_value_t = DEFAULT_SEED)]
+    pub seed: u64,
+
+    #[arg(long, default_value = DEFAULT_DISTANCE)]
+    pub distance: String,
+
+    #[arg(long, default_value = DEFAULT_DATA)]
+    pub data: String,
+}
 
 /////////////
 // Helpers //
@@ -260,6 +297,44 @@ where
     data
 }
 
+/// Randomly subsample a matrix and add Gaussian noise
+///
+/// ### Params
+///
+/// * `data` - The input matrix to subsample
+/// * `n_samples` - Number of samples to draw
+/// * `noise_scale` - Standard deviation of noise to add
+/// * `seed` - Random seed for reproducibility
+///
+/// ### Returns
+///
+/// Matrix of shape (n_samples, dim) with noise added
+pub fn subsample_with_noise<T>(data: &Mat<T>, n_samples: usize, seed: u64) -> Mat<T>
+where
+    T: Float + FromPrimitive + ComplexField,
+{
+    let mut rng = StdRng::seed_from_u64(seed + 1000);
+    let (n_rows, n_cols) = data.shape();
+
+    let mut indices: Vec<usize> = (0..n_rows).collect();
+    indices.shuffle(&mut rng);
+    indices.truncate(n_samples.min(n_rows));
+
+    let mut result = Mat::<T>::zeros(n_samples.min(n_rows), n_cols);
+
+    for (i, &row_idx) in indices.iter().enumerate() {
+        for j in 0..n_cols {
+            let u1: f64 = rng.random();
+            let u2: f64 = rng.random();
+            let noise = (-2.0 * u1.ln()).sqrt() * (2.0 * std::f64::consts::PI * u2).cos();
+            let noised_value = data[(row_idx, j)].to_f64().unwrap() + noise * 0.05;
+            result[(i, j)] = T::from_f64(noised_value).unwrap();
+        }
+    }
+
+    result
+}
+
 /// BenchmarkResult
 ///
 /// ### Fields
@@ -277,6 +352,26 @@ pub struct BenchmarkResult {
     pub total_time_ms: f64,
     pub recall_at_k: f64,
     pub mean_dist_err: f64,
+}
+
+/// BenchmarkResult
+///
+/// ### Fields
+///
+/// * `method` - Name of the method
+/// * `build_time_ms` - The build time of the index in ms
+/// * `query_time_ms` - The query time of the index in ms
+/// * `total_time_ms` - Total time the index build & query takes in ms
+/// * `recall_at_k` - Recall@k neighbours against ground truth
+/// * `mean_dist_err` - Mean distance error against ground truth
+pub struct BenchmarkResultSize {
+    pub method: String,
+    pub build_time_ms: f64,
+    pub query_time_ms: f64,
+    pub total_time_ms: f64,
+    pub recall_at_k: f64,
+    pub mean_dist_err: f64,
+    pub index_size_mb: f64,
 }
 
 /// Calculate Recall@k
@@ -344,17 +439,17 @@ where
 /// * `config` - Benchmark configuration
 /// * `results` - Benchmark results to print
 pub fn print_results(config: &str, results: &[BenchmarkResult]) {
-    println!("\n{:=>100}", "");
+    println!("\n{:=>110}", "");
     println!("Benchmark: {}", config);
-    println!("{:=>100}", "");
+    println!("{:=>110}", "");
     println!(
-        "{:<35} {:>12} {:>12} {:>12} {:>12} {:>12}",
+        "{:<45} {:>12} {:>12} {:>12} {:>12} {:>12}",
         "Method", "Build (ms)", "Query (ms)", "Total (ms)", "Recall@k", "Dist Error"
     );
-    println!("{:->100}", "");
+    println!("{:->110}", "");
     for result in results {
         println!(
-            "{:<35} {:>12.2} {:>12.2} {:>12.2} {:>12.4} {:>12.6}",
+            "{:<45} {:>12.2} {:>12.2} {:>12.2} {:>12.4} {:>12.6}",
             result.method,
             result.build_time_ms,
             result.query_time_ms,
@@ -363,33 +458,35 @@ pub fn print_results(config: &str, results: &[BenchmarkResult]) {
             result.mean_dist_err
         );
     }
-    println!("{:->100}\n", "");
+    println!("{:->110}\n", "");
 }
 
-/// Helper to print results to console (Recall only)
+/// Helper to print results to console
 ///
 /// ### Params
 ///
 /// * `config` - Benchmark configuration
 /// * `results` - Benchmark results to print
-pub fn print_results_recall_only(config: &str, results: &[BenchmarkResult]) {
-    println!("\n{:=>83}", "");
+pub fn print_results_size(config: &str, results: &[BenchmarkResultSize]) {
+    println!("\n{:=>123}", "");
     println!("Benchmark: {}", config);
-    println!("{:=>83}", "");
+    println!("{:=>123}", "");
     println!(
-        "{:<30} {:>12} {:>12} {:>12} {:>12}",
-        "Method", "Build (ms)", "Query (ms)", "Total (ms)", "Recall@k"
+        "{:<45} {:>12} {:>12} {:>12} {:>12} {:>12} {:>12}",
+        "Method", "Build (ms)", "Query (ms)", "Total (ms)", "Recall@k", "Dist Error", "Size (MB)"
     );
-    println!("{:->83}", "");
+    println!("{:->123}", "");
     for result in results {
         println!(
-            "{:<30} {:>12.2} {:>12.2} {:>12.2} {:>12.4}",
+            "{:<45} {:>12.2} {:>12.2} {:>12.2} {:>12.4} {:>12.6} {:>12.2}",
             result.method,
             result.build_time_ms,
             result.query_time_ms,
             result.total_time_ms,
-            result.recall_at_k
+            result.recall_at_k,
+            result.mean_dist_err,
+            result.index_size_mb
         );
     }
-    println!("{:->83}\n", "");
+    println!("{:->123}\n", "");
 }

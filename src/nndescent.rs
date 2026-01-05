@@ -1041,6 +1041,29 @@ where
             (indices, None)
         }
     }
+
+    /// Returns the size of the index in bytes
+    ///
+    /// ### Returns
+    ///
+    /// Number of bytes used by the index
+    pub fn memory_usage_bytes(&self) -> usize {
+        let mut total = std::mem::size_of_val(self);
+
+        total += self.vectors_flat.capacity() * std::mem::size_of::<T>();
+        total += self.norms.capacity() * std::mem::size_of::<T>();
+        total += self.forest.memory_usage_bytes();
+
+        // graph outer Vec
+        total += self.graph.capacity() * std::mem::size_of::<Vec<(usize, T)>>();
+
+        // each inner Vec
+        for neighbours in &self.graph {
+            total += neighbours.capacity() * std::mem::size_of::<(usize, T)>();
+        }
+
+        total
+    }
 }
 
 /// Helper to find boundaries between different target nodes in sorted updates

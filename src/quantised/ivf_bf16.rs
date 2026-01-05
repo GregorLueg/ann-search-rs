@@ -1,4 +1,5 @@
 use faer::{MatRef, RowRef};
+use half::*;
 use num_traits::{Float, FromPrimitive, ToPrimitive};
 use rayon::prelude::*;
 use std::iter::Sum;
@@ -6,6 +7,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use thousands::Separable;
 
+use crate::quantised::quantisers::*;
 use crate::utils::dist::*;
 use crate::utils::heap_structs::*;
 use crate::utils::ivf_utils::*;
@@ -29,12 +31,12 @@ use crate::utils::*;
 /// * `all_indices` - Vector indices for each cluster (in a flat structure)
 /// * `offsets` - Offsets of the elements of each inverted list.
 /// * `nlist` - Number of clusters in the index
-pub struct IvfIndex<T> {
+pub struct IvfIndexBf16<T> {
     /// shared ones
-    pub vectors_flat: Vec<T>,
+    pub vectors_flat: Vec<bf16>,
     pub dim: usize,
     pub n: usize,
-    pub norms: Vec<T>,
+    pub norms: Vec<bf16>,
     metric: Dist,
     // index specific ones
     centroids: Vec<T>,
@@ -48,11 +50,11 @@ pub struct IvfIndex<T> {
 // VectorDistance //
 ////////////////////
 
-impl<T> VectorDistance<T> for IvfIndex<T>
+impl<T> VectorDistanceBf16<T> for IvfIndexBf16<T>
 where
     T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum,
 {
-    fn vectors_flat(&self) -> &[T] {
+    fn vectors_flat(&self) -> &[bf16] {
         &self.vectors_flat
     }
 
@@ -60,7 +62,7 @@ where
         self.dim
     }
 
-    fn norms(&self) -> &[T] {
+    fn norms(&self) -> &[bf16] {
         &self.norms
     }
 }
@@ -69,7 +71,7 @@ where
 // CentroidDistance //
 //////////////////////
 
-impl<T> CentroidDistance<T> for IvfIndex<T>
+impl<T> CentroidDistance<T> for IvfIndexBf16<T>
 where
     T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum,
 {
@@ -98,7 +100,7 @@ where
 // Main index //
 ////////////////
 
-impl<T> IvfIndex<T>
+impl<T> IvfIndexBf16<T>
 where
     T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum,
 {
@@ -226,10 +228,10 @@ where
         let (all_indices, offsets) = build_csr_layout(assignments, n, nlist);
 
         Self {
-            vectors_flat,
+            vectors_flat: encode_bf16_quantisation(&vectors_flat),
             dim,
             n,
-            norms,
+            norms: encode_bf16_quantisation(&norms),
             metric,
             centroids,
             centroids_norm,
@@ -287,8 +289,10 @@ where
 
             for &vec_idx in &self.all_indices[start..end] {
                 let dist = match self.metric {
-                    Dist::Euclidean => self.euclidean_distance_to_query(vec_idx, query_vec),
-                    Dist::Cosine => self.cosine_distance_to_query(vec_idx, query_vec, query_norm),
+                    Dist::Euclidean => self.euclidean_distance_to_query_bf16(vec_idx, query_vec),
+                    Dist::Cosine => {
+                        self.cosine_distance_to_query_bf16(vec_idx, query_vec, query_norm)
+                    }
                 };
 
                 buffer.insert((OrderedFloat(dist), vec_idx), k);
@@ -375,7 +379,7 @@ where
                     }
                 }
 
-                self.query(vec, k, nprobe)
+                self.query_bf16(vec, k, nprobe)
             })
             .collect();
 
@@ -388,6 +392,71 @@ where
         }
     }
 
+    /// Query the index for approximate nearest neighbours
+    ///
+    /// Performs two-stage search: first finds nprobe nearest centroids to the
+    /// query, then exhaustively searches all vectors in those clusters. Uses
+    /// a max-heap to track top-k candidates.
+    ///
+    /// ### Params
+    ///
+    /// * `query_vec` - Query vector (must match index dimensionality)
+    /// * `k` - Number of neighbours to return
+    /// * `nprobe` - Number of clusters to search. A good default here is
+    ///   `sqrt(nlist)`.
+    ///
+    /// ### Returns
+    ///
+    /// Tuple of `(indices, distances)` sorted by distance (nearest first)
+    #[inline]
+    pub fn query_bf16(
+        &self,
+        query_vec: &[bf16],
+        k: usize,
+        nprobe: Option<usize>,
+    ) -> (Vec<usize>, Vec<T>) {
+        let query_vec_t: Vec<T> = decode_bf16_quantisation(query_vec);
+        let nprobe = nprobe
+            .unwrap_or_else(|| ((self.nlist as f64).sqrt() as usize).max(1))
+            .min(self.nlist);
+        let k: usize = k.min(self.n);
+        let query_norm: T = if matches!(self.metric, Dist::Cosine) {
+            bf16_norm(query_vec)
+        } else {
+            T::from_f32(1.0).unwrap()
+        };
+
+        // 1. find the top `nprobe` centroids
+        let cluster_dists: Vec<(_, usize)> =
+            self.get_centroids_dist(&query_vec_t, query_norm, nprobe);
+
+        // 2. search only those clusters in the CSR layout
+        let mut buffer = SortedBuffer::with_capacity(k);
+
+        for &(_, cluster_idx) in cluster_dists.iter().take(nprobe) {
+            let start = self.offsets[cluster_idx];
+            let end = self.offsets[cluster_idx + 1];
+
+            for &vec_idx in &self.all_indices[start..end] {
+                let dist = match self.metric {
+                    Dist::Euclidean => {
+                        self.euclidean_distance_to_query_dual_bf16(vec_idx, query_vec)
+                    }
+                    Dist::Cosine => self.cosine_distance_to_query_dual_bf16(
+                        vec_idx,
+                        query_vec,
+                        bf16::from_f32(query_norm.to_f32().unwrap()),
+                    ),
+                };
+
+                buffer.insert((OrderedFloat(dist), vec_idx), k);
+            }
+        }
+
+        let (distances, indices) = buffer.data().iter().map(|(d, i)| (d.0, *i)).unzip();
+        (indices, distances)
+    }
+
     /// Returns the size of the index in bytes
     ///
     /// ### Returns
@@ -395,220 +464,11 @@ where
     /// Number of bytes used by the index
     pub fn memory_usage_bytes(&self) -> usize {
         std::mem::size_of_val(self)
-            + self.vectors_flat.capacity() * std::mem::size_of::<T>()
-            + self.norms.capacity() * std::mem::size_of::<T>()
+            + self.vectors_flat.capacity() * std::mem::size_of::<bf16>()
+            + self.norms.capacity() * std::mem::size_of::<bf16>()
             + self.centroids.capacity() * std::mem::size_of::<T>()
             + self.centroids_norm.capacity() * std::mem::size_of::<T>()
             + self.all_indices.capacity() * std::mem::size_of::<usize>()
             + self.offsets.capacity() * std::mem::size_of::<usize>()
-    }
-}
-
-///////////////////
-// KnnValidation //
-///////////////////
-
-impl<T> KnnValidation<T> for IvfIndex<T>
-where
-    T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum,
-{
-    fn query_for_validation(&self, query_vec: &[T], k: usize) -> (Vec<usize>, Vec<T>) {
-        self.query(query_vec, k, None)
-    }
-
-    fn n(&self) -> usize {
-        self.n
-    }
-
-    fn metric(&self) -> Dist {
-        self.metric
-    }
-}
-
-///////////
-// Tests //
-///////////
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use approx::assert_relative_eq;
-    use faer::Mat;
-
-    fn create_simple_matrix() -> Mat<f32> {
-        // 5 points in 3D space
-        let data = [
-            1.0, 0.0, 0.0, // Point 0
-            0.0, 1.0, 0.0, // Point 1
-            0.0, 0.0, 1.0, // Point 2
-            1.0, 1.0, 0.0, // Point 3
-            1.0, 0.0, 1.0, // Point 4
-        ];
-        Mat::from_fn(5, 3, |i, j| data[i * 3 + j])
-    }
-
-    #[test]
-    fn test_ivf_index_creation() {
-        let data = create_simple_matrix();
-        let _ = IvfIndex::build(
-            data.as_ref(),
-            Dist::Euclidean,
-            Some(2), // nlist
-            None,
-            42,
-            false,
-        );
-    }
-
-    #[test]
-    fn test_ivf_query_finds_self() {
-        let data = create_simple_matrix();
-        let index = IvfIndex::build(data.as_ref(), Dist::Euclidean, Some(2), None, 42, false);
-
-        let query = vec![1.0, 0.0, 0.0];
-        let (indices, distances) = index.query(&query, 1, None);
-
-        assert_eq!(indices.len(), 1);
-        assert_eq!(indices[0], 0);
-        assert_relative_eq!(distances[0], 0.0, epsilon = 1e-5);
-    }
-
-    #[test]
-    fn test_ivf_query_euclidean() {
-        let data = create_simple_matrix();
-        let index = IvfIndex::build(data.as_ref(), Dist::Euclidean, Some(2), None, 42, false);
-
-        let query = vec![1.0, 0.0, 0.0];
-        let (indices, distances) = index.query(&query, 3, None);
-
-        assert_eq!(indices[0], 0);
-        assert_relative_eq!(distances[0], 0.0, epsilon = 1e-5);
-
-        for i in 1..distances.len() {
-            assert!(distances[i] >= distances[i - 1]);
-        }
-    }
-
-    #[test]
-    fn test_ivf_query_cosine() {
-        let data = create_simple_matrix();
-
-        let index = IvfIndex::build(data.as_ref(), Dist::Cosine, Some(2), None, 42, false);
-
-        let query = vec![1.0, 0.0, 0.0];
-        let (indices, distances) = index.query(&query, 3, None);
-
-        assert_eq!(indices[0], 0);
-        assert_relative_eq!(distances[0], 0.0, epsilon = 1e-5);
-    }
-
-    #[test]
-    fn test_ivf_query_k_larger_than_dataset() {
-        let data = create_simple_matrix();
-        let index = IvfIndex::build(data.as_ref(), Dist::Euclidean, Some(2), None, 42, false);
-
-        let query = vec![1.0, 0.0, 0.0];
-        let (indices, _) = index.query(&query, 10, None);
-
-        assert!(indices.len() <= 5);
-    }
-
-    #[test]
-    fn test_ivf_query_nprobe() {
-        let data = create_simple_matrix();
-        let index = IvfIndex::build(data.as_ref(), Dist::Euclidean, Some(3), None, 42, false);
-
-        let query = vec![1.0, 0.0, 0.0];
-        let (indices1, _) = index.query(&query, 3, Some(1));
-        let (indices2, _) = index.query(&query, 3, Some(2));
-
-        assert!(!indices1.is_empty());
-        assert!(!indices2.is_empty());
-    }
-
-    #[test]
-    fn test_ivf_reproducibility() {
-        let data = create_simple_matrix();
-
-        let index1 = IvfIndex::build(data.as_ref(), Dist::Euclidean, Some(2), None, 42, false);
-        let index2 = IvfIndex::build(data.as_ref(), Dist::Euclidean, Some(2), None, 42, false);
-
-        let query = vec![0.5, 0.5, 0.0];
-        let (indices1, _) = index1.query(&query, 3, None);
-        let (indices2, _) = index2.query(&query, 3, None);
-
-        assert_eq!(indices1, indices2);
-    }
-
-    #[test]
-    fn test_ivf_different_seeds() {
-        let data = create_simple_matrix();
-
-        let index1 = IvfIndex::build(data.as_ref(), Dist::Euclidean, Some(2), None, 42, false);
-        let index2 = IvfIndex::build(data.as_ref(), Dist::Euclidean, Some(2), None, 123, false);
-
-        let query = vec![0.5, 0.5, 0.0];
-        let (indices1, _) = index1.query(&query, 3, Some(2));
-        let (indices2, _) = index2.query(&query, 3, Some(2));
-
-        assert!(!indices1.is_empty());
-        assert!(!indices2.is_empty());
-    }
-
-    #[test]
-    fn test_ivf_larger_dataset() {
-        let n = 100;
-        let dim = 10;
-        let data = Mat::from_fn(n, dim, |i, j| (i * j) as f32 / 10.0);
-
-        let index = IvfIndex::build(
-            data.as_ref(),
-            Dist::Euclidean,
-            Some(10), // sqrt(100)
-            None,
-            42,
-            false,
-        );
-
-        let query: Vec<f32> = (0..dim).map(|_| 0.0).collect();
-        let (indices, _) = index.query(&query, 5, None);
-
-        assert_eq!(indices.len(), 5);
-        assert_eq!(indices[0], 0);
-    }
-
-    #[test]
-    fn test_ivf_orthogonal_vectors() {
-        let data = Mat::from_fn(3, 3, |i, j| if i == j { 1.0 } else { 0.0 });
-
-        let index = IvfIndex::build(data.as_ref(), Dist::Cosine, Some(3), None, 42, false);
-
-        let query = vec![1.0, 0.0, 0.0];
-        let (indices, distances) = index.query(&query, 3, None);
-
-        assert_eq!(indices[0], 0);
-        assert_relative_eq!(distances[0], 0.0, epsilon = 1e-5);
-
-        if indices.len() >= 2 {
-            assert_relative_eq!(distances[1], 1.0, epsilon = 1e-5);
-        }
-        if indices.len() >= 3 {
-            assert_relative_eq!(distances[2], 1.0, epsilon = 1e-5);
-        }
-    }
-
-    #[test]
-    fn test_ivf_more_clusters() {
-        let data = create_simple_matrix();
-
-        let index_few = IvfIndex::build(data.as_ref(), Dist::Euclidean, Some(2), None, 42, false);
-        let index_many = IvfIndex::build(data.as_ref(), Dist::Euclidean, Some(4), None, 42, false);
-
-        let query = vec![0.9, 0.1, 0.0];
-        let (indices1, _) = index_few.query(&query, 3, Some(2));
-        let (indices2, _) = index_many.query(&query, 3, Some(4));
-
-        assert_eq!(indices1.len(), 3);
-        assert_eq!(indices2.len(), 3);
     }
 }

@@ -93,11 +93,17 @@ where
     /// * `query_mat` - The samples x features matrix to query. n(features)
     ///   needs to be divisible by 4!
     /// * `k` - Number of neighbours to return
+    /// * `verbose` - Controls verbosity of the function
     ///
     /// ### Returns
     ///
     /// A tuple of `(Vec<indices>, Vec<distances>)`
-    pub fn query_batch(&self, query_mat: MatRef<T>, k: usize) -> (Vec<Vec<usize>>, Vec<Vec<T>>) {
+    pub fn query_batch(
+        &self,
+        query_mat: MatRef<T>,
+        k: usize,
+        verbose: bool,
+    ) -> (Vec<Vec<usize>>, Vec<Vec<T>>) {
         assert!(
             self.dim.is_multiple_of(LINE_SIZE as usize),
             "Dimension {} must be divisible by LINE_SIZE {}",
@@ -138,6 +144,48 @@ where
             self.dim,
             &self.metric,
             self.device.clone(),
+            verbose,
         )
+    }
+
+    /// Generate kNN graph from vectors stored in the index
+    ///
+    /// Queries each vector in the index against itself to build a complete
+    /// kNN graph.
+    ///
+    /// ### Params
+    ///
+    /// * `k` - Number of neighbours per vector
+    /// * `return_dist` - Whether to return distances
+    /// * `verbose` - Controls verbosity
+    ///
+    /// ### Returns
+    ///
+    /// Tuple of `(knn_indices, optional distances)` where each row corresponds
+    /// to a vector in the index
+    pub fn generate_knn(
+        &self,
+        k: usize,
+        return_dist: bool,
+        verbose: bool,
+    ) -> (Vec<Vec<usize>>, Option<Vec<Vec<T>>>) {
+        let query_data = BatchData::new(&self.vectors_flat, &self.norms, self.n);
+        let db_data = BatchData::new(&self.vectors_flat, &self.norms, self.n);
+
+        let (indices, distances) = query_batch_gpu::<T, R>(
+            k,
+            &query_data,
+            &db_data,
+            self.dim,
+            &self.metric,
+            self.device.clone(),
+            verbose,
+        );
+
+        if return_dist {
+            (indices, Some(distances))
+        } else {
+            (indices, None)
+        }
     }
 }

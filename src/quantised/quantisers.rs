@@ -1,4 +1,5 @@
 use faer::Mat;
+use half::*;
 use num_traits::{Float, FromPrimitive, ToPrimitive};
 use rayon::prelude::*;
 use std::iter::Sum;
@@ -6,6 +7,85 @@ use std::ops::AddAssign;
 
 use crate::utils::dist::*;
 use crate::utils::ivf_utils::*;
+
+///////////////////////
+// Bf16 quantisation //
+///////////////////////
+
+/// Encode a vector of floats to BF16 quantisation
+///
+/// Converts each element to f32 then to bf16, providing 2x memory compression
+/// with minimal precision loss. BF16 preserves the dynamic range of f32
+/// (8 exponent bits) whilst reducing mantissa precision (7 bits vs 23).
+///
+/// ### Params
+///
+/// * `vec` - Input vector of any float type
+///
+/// ### Returns
+///
+/// Vector quantised to bf16 format
+pub fn encode_bf16_quantisation<T>(vec: &[T]) -> Vec<bf16>
+where
+    T: Float + ToPrimitive,
+{
+    vec.iter()
+        .map(|x| bf16::from_f32(x.to_f32().unwrap()))
+        .collect()
+}
+
+/// Decode a BF16 quantised vector back to float precision
+///
+/// Converts bf16 elements to f32 then to the target float type. This is
+/// a lossless operation (bf16 → f32), but the original quantisation
+/// (f32 → bf16) introduced ~3 decimal digits of precision loss.
+///
+/// ### Params
+///
+/// * `vec` - BF16 quantised vector
+///
+/// ### Returns
+///
+/// Vector decoded to target float type
+pub fn decode_bf16_quantisation<T>(vec: &[bf16]) -> Vec<T>
+where
+    T: Float + FromPrimitive,
+{
+    let res: Vec<T> = vec
+        .iter()
+        .map(|x| {
+            let x_f32 = x.to_f32_const();
+            T::from_f32(x_f32).unwrap()
+        })
+        .collect();
+
+    res
+}
+
+/// Compute L2 norm of a BF16 quantised vector
+///
+/// Converts elements to f32 for computation to avoid bf16 accumulation
+/// errors. Returns the norm in the target float type.
+///
+/// ### Params
+///
+/// * `vec` - BF16 quantised vector
+///
+/// ### Returns
+///
+/// L2 norm as target float type
+pub fn bf16_norm<T>(vec: &[bf16]) -> T
+where
+    T: Float + FromPrimitive,
+{
+    let res = vec
+        .iter()
+        .map(|&v| v.to_f32() * v.to_f32())
+        .fold(0_f32, |a, b| a + b)
+        .sqrt();
+
+    T::from_f32(res).unwrap()
+}
 
 /////////////////////////
 // Scalar quantisation //
@@ -92,6 +172,15 @@ where
             .enumerate()
             .map(|(d, &val)| T::from_i8(val).unwrap() * self.scales[d])
             .collect()
+    }
+
+    /// Returns the size of the quantiser
+    ///
+    /// ### Returns
+    ///
+    /// Number of bytes used by the index
+    pub fn memory_usage_bytes(&self) -> usize {
+        std::mem::size_of_val(self) + self.scales.capacity() * std::mem::size_of::<T>()
     }
 }
 
@@ -268,6 +357,36 @@ where
     /// Get codebooks (for building lookup tables)
     pub fn codebooks(&self) -> &[Vec<T>] {
         &self.codebooks
+    }
+
+    /// Decode PQ codes back to approximate vector
+    pub fn decode(&self, codes: &[u8]) -> Vec<T> {
+        let mut result = vec![T::zero(); self.m * self.subvec_dim];
+
+        for (subspace, &code) in codes.iter().enumerate() {
+            let out_start = subspace * self.subvec_dim;
+            let centroid_start = code as usize * self.subvec_dim;
+            let codebook = &self.codebooks[subspace];
+            result[out_start..(self.subvec_dim + out_start)]
+                .copy_from_slice(&codebook[centroid_start..(self.subvec_dim + centroid_start)]);
+        }
+
+        result
+    }
+
+    /// Returns the size of the quantiser
+    ///
+    /// ### Returns
+    ///
+    /// Number of bytes used by the index
+    pub fn memory_usage_bytes(&self) -> usize {
+        let mut total = std::mem::size_of_val(self);
+        total += self.codebooks.capacity() * std::mem::size_of::<Vec<T>>();
+        for codebook in &self.codebooks {
+            total += codebook.capacity() * std::mem::size_of::<T>();
+        }
+
+        total
     }
 }
 
@@ -578,6 +697,44 @@ where
         rotation
     }
 
+    /// Decode PQ codes back to approximate original vector
+    ///
+    /// Decodes via PQ codebooks then applies inverse rotation (transpose).
+    ///
+    /// ### Params
+    ///
+    /// * `codes` - M PQ codes (u8)
+    ///
+    /// ### Returns
+    ///
+    /// Reconstructed vector in original space
+    pub fn decode(&self, codes: &[u8]) -> Vec<T> {
+        let rotated = Self::decode_pq(codes, &self.pq);
+        self.inverse_rotate(&rotated)
+    }
+
+    /// Apply inverse rotation (transpose) to a vector
+    ///
+    /// ### Params
+    ///
+    /// * `vec` - The vector on which to inverse the rotation
+    ///
+    /// ### Returns
+    ///
+    /// Vector with inverted rotation
+    fn inverse_rotate(&self, vec: &[T]) -> Vec<T> {
+        let mut out = vec![T::zero(); self.dim];
+        for i in 0..self.dim {
+            let mut sum = T::zero();
+            for j in 0..self.dim {
+                // Transpose: swap i,j indices
+                sum += self.rotation_matrix[j * self.dim + i] * vec[j];
+            }
+            out[i] = sum;
+        }
+        out
+    }
+
     /// Get number of subspaces
     #[inline(always)]
     pub fn m(&self) -> usize {
@@ -599,6 +756,17 @@ where
     /// Get codebooks (for building lookup tables)
     pub fn codebooks(&self) -> &[Vec<T>] {
         self.pq.codebooks()
+    }
+
+    /// Returns the size of the quantiser
+    ///
+    /// ### Returns
+    ///
+    /// Number of bytes used by the index
+    pub fn memory_usage_bytes(&self) -> usize {
+        std::mem::size_of_val(self)
+            + self.rotation_matrix.capacity() * std::mem::size_of::<T>()
+            + self.pq.memory_usage_bytes()
     }
 }
 

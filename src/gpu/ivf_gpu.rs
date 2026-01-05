@@ -76,7 +76,6 @@ where
     /// * `seed` - Random seed
     /// * `verbose` - Print progress
     /// * `device` - GPU device
-    #[allow(clippy::too_many_arguments)]
     pub fn build(
         data: MatRef<T>,
         metric: Dist,
@@ -130,27 +129,48 @@ where
         );
 
         // assign vectors to clusters
-        let assignments = assign_all_parallel(&vectors_flat, dim, n, &centroids, nlist, &metric);
-
-        // reorganise vectors by cluster
-        let (vectors_by_cluster, original_indices, cluster_offsets, norms_by_cluster) =
-            reorganise_by_cluster(&vectors_flat, dim, n, &assignments, nlist, &metric);
-
-        // Compute centroid norms
-        let centroid_norms = if metric == Dist::Cosine {
-            (0..nlist)
+        let data_norms = if metric == Dist::Cosine {
+            (0..n)
                 .map(|i| {
-                    let start = i * dim;
-                    centroids[start..start + dim]
+                    vectors_flat[i * dim..(i + 1) * dim]
                         .iter()
                         .map(|&x| x * x)
                         .sum::<T>()
                         .sqrt()
                 })
-                .collect::<Vec<_>>()
+                .collect()
         } else {
-            Vec::new()
+            vec![T::one(); n]
         };
+
+        let centroid_norms = if metric == Dist::Cosine {
+            (0..nlist)
+                .map(|i| {
+                    centroids[i * dim..(i + 1) * dim]
+                        .iter()
+                        .map(|&x| x * x)
+                        .sum::<T>()
+                        .sqrt()
+                })
+                .collect()
+        } else {
+            vec![T::one(); nlist]
+        };
+
+        let assignments = assign_all_parallel(
+            &vectors_flat,
+            &data_norms,
+            dim,
+            n,
+            &centroids,
+            &centroid_norms,
+            nlist,
+            &metric,
+        );
+
+        // reorganise vectors by cluster
+        let (vectors_by_cluster, original_indices, cluster_offsets, norms_by_cluster) =
+            reorganise_by_cluster(&vectors_flat, dim, n, &assignments, nlist, &metric);
 
         if verbose {
             println!("  Uploading centroids to GPU");
@@ -190,25 +210,29 @@ where
         }
     }
 
-    /// Query the index with a batch of vectors
+    /// Internal helper for querying
     ///
     /// ### Params
     ///
-    /// * `query_mat` - Query vectors [n_queries, dim]
+    /// * `queries_flat` - The query vector flattened
+    /// * `n_queries` - The number of queries
+    /// * `dim_query` - The dimensions
     /// * `k` - Number of neighbours per query
     /// * `nprobe` - Number of clusters to search (defaults to √nlist)
+    /// * `verbose` - Controls the verbosity of the function
     ///
     /// ### Returns
     ///
-    /// Tuple of (indices, distances) where each is Vec<Vec<_>> of length n_queries
-    pub fn query_batch(
+    /// Tuple of `(Vec<indices>, Vec<dist>)` for the queries.
+    fn query_internal(
         &self,
-        query_mat: MatRef<T>,
+        queries_flat: &[T],
+        n_queries: usize,
+        dim_query: usize,
         k: usize,
         nprobe: Option<usize>,
+        verbose: bool,
     ) -> (Vec<Vec<usize>>, Vec<Vec<T>>) {
-        let (queries_flat, n_queries, dim_query) = matrix_to_flat(query_mat);
-
         assert_eq!(
             dim_query, self.dim,
             "Query dimension {} != index dimension {}",
@@ -243,7 +267,7 @@ where
 
         // upload queries to GPU
         let queries_gpu =
-            GpuTensor::<R, T>::from_slice(&queries_flat, vec![n_queries, dim_vectorized], &client);
+            GpuTensor::<R, T>::from_slice(queries_flat, vec![n_queries, dim_vectorized], &client);
 
         let query_norms_gpu = if self.metric == Dist::Cosine {
             Some(GpuTensor::<R, T>::from_slice(
@@ -321,6 +345,10 @@ where
         let mut pending: Option<(GpuTensor<R, T>, usize, Vec<usize>)> = None;
 
         for cluster_idx in 0..self.nlist {
+            if verbose && cluster_idx % 10 == 0 {
+                println!("Processed {} clusters out of {}", cluster_idx, self.nlist);
+            }
+
             let query_indices = &cluster_to_queries[cluster_idx];
             if query_indices.is_empty() {
                 continue;
@@ -465,6 +493,82 @@ where
         let (all_indices, all_distances): (Vec<_>, Vec<_>) = results.into_iter().unzip();
         (all_indices, all_distances)
     }
+
+    /// Query the index with a batch of vectors
+    ///
+    /// ### Params
+    ///
+    /// * `query_mat` - Query vectors [n_queries, dim]
+    /// * `k` - Number of neighbours per query
+    /// * `nprobe` - Number of clusters to search (defaults to √nlist)
+    ///
+    /// ### Returns
+    ///
+    /// Tuple of `(Vec<indices>, Vec<dist>)` for the queries.
+    pub fn query_batch(
+        &self,
+        query_mat: MatRef<T>,
+        k: usize,
+        nprobe: Option<usize>,
+        verbose: bool,
+    ) -> (Vec<Vec<usize>>, Vec<Vec<T>>) {
+        let (queries_flat, n_queries, dim_query) = matrix_to_flat(query_mat);
+
+        self.query_internal(&queries_flat, n_queries, dim_query, k, nprobe, verbose)
+    }
+
+    /// Generate kNN graph from vectors stored in the index
+    ///
+    /// Queries each vector in the index against itself to build a complete
+    /// kNN graph.
+    ///
+    /// ### Params
+    ///
+    /// * `k` - Number of neighbours per vector
+    /// * `return_dist` - Whether to return distances
+    /// * `verbose` - Controls verbosity
+    ///
+    /// ### Returns
+    ///
+    /// Tuple of `(knn_indices, optional distances)` where each row corresponds
+    /// to a vector in the index
+    pub fn generate_knn(
+        &self,
+        k: usize,
+        nprobe: Option<usize>,
+        return_dist: bool,
+        verbose: bool,
+    ) -> (Vec<Vec<usize>>, Option<Vec<Vec<T>>>) {
+        let (indices_reorg, dist_reorg) = self.query_internal(
+            &self.vectors_by_cluster,
+            self.n,
+            self.dim,
+            k,
+            nprobe,
+            verbose,
+        );
+
+        // reorder results to match original vector ordering
+        let mut indices = vec![Vec::new(); self.n];
+        let mut dist = if return_dist {
+            vec![Vec::new(); self.n]
+        } else {
+            Vec::new()
+        };
+
+        for (reorg_idx, orig_idx) in self.original_indices.iter().enumerate() {
+            indices[*orig_idx] = indices_reorg[reorg_idx].clone();
+            if return_dist {
+                dist[*orig_idx] = dist_reorg[reorg_idx].clone();
+            }
+        }
+
+        if return_dist {
+            (indices, Some(dist))
+        } else {
+            (indices, None)
+        }
+    }
 }
 
 /// Reorganise vectors by cluster for contiguous access
@@ -539,7 +643,19 @@ fn reorganise_by_cluster<T: Float + Copy + Send + Sync + Sum>(
     (vectors_reorg, indices_reorg, offsets, norms_reorg)
 }
 
-/// Invert probe lists: for each cluster, which queries probe it?
+/// Invert probe lists to map clusters to queries
+///
+/// Transforms per-query cluster lists into per-cluster query lists.
+/// Given probe_lists[q] = [c1, c2, ...] returns result[c] = [q1, q2, ...]
+///
+/// ### Params
+///
+/// * `probe_lists` - For each query, which clusters it probes
+/// * `nlist` - Total number of clusters
+///
+/// ### Returns
+///
+/// For each cluster, which queries probe it
 fn invert_probe_lists(probe_lists: &[Vec<usize>], nlist: usize) -> Vec<Vec<usize>> {
     let mut result = vec![Vec::new(); nlist];
     for (query_idx, probes) in probe_lists.iter().enumerate() {
@@ -550,7 +666,21 @@ fn invert_probe_lists(probe_lists: &[Vec<usize>], nlist: usize) -> Vec<Vec<usize
     result
 }
 
-/// Process distances from one cluster and update heaps
+/// Process cluster search results and update per-query heaps
+///
+/// Takes distance matrix from a batched cluster search and updates the
+/// k-NN heaps for each query. Only retains the k closest neighbours seen
+/// so far across all processed clusters.
+///
+/// ### Params
+///
+/// * `distances` - Distance matrix [n_queries, cluster_size]
+/// * `query_indices` - Global query indices for this batch
+/// * `cluster_idx` - Index of the cluster being processed
+/// * `original_indices` - Maps reorganised position -> original database index
+/// * `cluster_offsets` - CSR offsets for clusters
+/// * `k` - Number of neighbours to retain
+/// * `heaps` - Per-query max-heaps storing current k-NN candidates
 fn process_cluster_results<T: Float>(
     distances: &[T],
     query_indices: &[usize],

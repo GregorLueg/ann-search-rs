@@ -1,10 +1,102 @@
 ## Quantised indices benchmarks and parameter gridsearch
 
-Some of these indices were run on synthetic data with better structure in higher
-dimensions to avoid the curse of dimensionality, via for example this command.
+Quantised indices compress the data stored in the index structure itself via
+quantisation. This can also in some cases accelerated substantially the query
+speed. The core idea is to trade in Recall for reduction in memory finger print.
+</br>
+In the benchmarks below, some of these indices were run on synthetic data with 
+better structure in higher dimensions to avoid the curse of dimensionality, via 
+for example this command:
 
 ```bash
-cargo run --example gridsearch_ivf_sq8 --release -- --distance euclidean --dim 128 --data correlated
+cargo run --example gridsearch_ivf_sq8 --release --features quantiser -- --distance euclidean --dim 128 --data correlated
+```
+
+If you wish to run all of the benchmarks, below, you can just run:
+
+```bash
+bash examples/run_benchmarks.sh --quantised
+```
+
+### IVF-BF16
+
+The BF16 quantisation reduces the floats to `bf16` which keeps the range of 
+`f32`, but loses precision in the digits from ~3 onwards. The actual distance
+calculations in the index happen in `f32`; however, due to lossy compression
+to `bf16` there is some Recall loss. This is compensated with drastically
+reduced memory fingerprint (nearly halved for f32) and increased query speed.
+
+**Key parameters:**
+
+- *Number of lists (nl)*: The number of independent k-means cluster to generate.
+  If the structure of the data is unknown, people use `sqrt(n)` as a heuristic.
+- *Number of points (np)*: The number of clusters to probe during search. 
+  Numbers here tend to be `sqrt(nlist)` or up to 5% of the nlist.
+
+**Euclidean:**
+
+```
+===========================================================================================================================
+Benchmark: 150k cells, 32D
+===========================================================================================================================
+Method                                          Build (ms)   Query (ms)   Total (ms)     Recall@k   Dist Error    Size (MB)
+---------------------------------------------------------------------------------------------------------------------------
+Exhaustive (query)                                    3.11      2359.09      2362.20       1.0000     0.000000        18.31
+Exhaustive (self)                                     3.11     23332.19     23335.30       1.0000     0.000000        18.31
+IVF-BF16-nl273-np13 (query)                        1343.66       229.81      1573.47       0.9771     0.096213        10.34
+IVF-BF16-nl273-np16 (query)                        1343.66       275.15      1618.81       0.9840     0.070989        10.34
+IVF-BF16-nl273-np23 (query)                        1343.66       379.34      1723.00       0.9867     0.065388        10.34
+IVF-BF16-nl273 (self)                              1343.66      4329.59      5673.25       0.9830     0.094689        10.34
+IVF-BF16-nl387-np19 (query)                        1842.80       233.43      2076.23       0.9804     0.093392        10.35
+IVF-BF16-nl387-np27 (query)                        1842.80       319.17      2161.96       0.9865     0.065987        10.35
+IVF-BF16-nl387 (self)                              1842.80      3599.21      5442.01       0.9828     0.095265        10.35
+IVF-BF16-nl547-np23 (query)                        2602.57       204.71      2807.28       0.9767     0.102772        10.37
+IVF-BF16-nl547-np27 (query)                        2602.57       236.60      2839.17       0.9833     0.078352        10.37
+IVF-BF16-nl547-np33 (query)                        2602.57       280.14      2882.71       0.9865     0.066298        10.37
+IVF-BF16-nl547 (self)                              2602.57      3154.54      5757.12       0.9827     0.095506        10.37
+---------------------------------------------------------------------------------------------------------------------------
+```
+
+Direct comparison with IVF at nl-273 configuration
+
+```
+===========================================================================================================================
+Benchmark: 150k cells, 32D
+===========================================================================================================================
+Method                                          Build (ms)   Query (ms)   Total (ms)     Recall@k   Dist Error    Size (MB)
+---------------------------------------------------------------------------------------------------------------------------
+IVF-nl273-np13 (query)                             1456.09       349.83      1805.92       0.9889     0.034523        19.49
+IVF-nl273-np16 (query)                             1456.09       406.19      1862.28       0.9967     0.006608        19.49
+IVF-nl273-np23 (query)                             1456.09       666.53      2122.62       1.0000     0.000000        19.49
+IVF-nl273 (self)                                   1456.09      6145.20      7601.29       1.0000     0.000000        19.49
+---------------------------------------------------------------------------------------------------------------------------
+```
+
+Query speed is improved compared to IVF (run on `f32`), the size in memory is
+nearly halved; however, the Recall@k does suffer a bit.
+
+**Cosine**
+
+```
+===========================================================================================================================
+Benchmark: 150k cells, 32D
+===========================================================================================================================
+Method                                          Build (ms)   Query (ms)   Total (ms)     Recall@k   Dist Error    Size (MB)
+---------------------------------------------------------------------------------------------------------------------------
+Exhaustive (query)                                    4.40      2423.44      2427.84       1.0000     0.000000        18.88
+Exhaustive (self)                                     4.40     23963.03     23967.43       1.0000     0.000000        18.88
+IVF-BF16-nl273-np13 (query)                        1358.62       234.47      1593.09       0.7400     0.000825        10.62
+IVF-BF16-nl273-np16 (query)                        1358.62       281.52      1640.14       0.7428     0.000825        10.62
+IVF-BF16-nl273-np23 (query)                        1358.62       399.44      1758.06       0.7437     0.000827        10.62
+IVF-BF16-nl273 (self)                              1358.62      4376.11      5734.73       0.7414     0.001477        10.62
+IVF-BF16-nl387-np19 (query)                        1911.42       242.13      2153.55       0.7412     0.000828        10.64
+IVF-BF16-nl387-np27 (query)                        1911.42       335.04      2246.46       0.7437     0.000827        10.64
+IVF-BF16-nl387 (self)                              1911.42      3657.19      5568.61       0.7413     0.001477        10.64
+IVF-BF16-nl547-np23 (query)                        2690.04       211.46      2901.50       0.7399     0.000826        10.66
+IVF-BF16-nl547-np27 (query)                        2690.04       240.14      2930.19       0.7425     0.000826        10.66
+IVF-BF16-nl547-np33 (query)                        2690.04       285.24      2975.28       0.7436     0.000827        10.66
+IVF-BF16-nl547 (self)                              2690.04      3157.21      5847.25       0.7413     0.001478        10.66
+---------------------------------------------------------------------------------------------------------------------------
 ```
 
 ### IVF-SQ8
@@ -26,71 +118,93 @@ to *96 x 8 bits = 96 bytes per vector*, a **4x reduction in memory per vector**
 
 Below are the results for the Euclidean distance measure for IVF with SQ8
 quantisation. To note, the mean distance error is not calculated, as the index
-does not store the original vectors anymore to reduce memory fingerprint. 
+does not store the original vectors anymore to reduce memory fingerprint. While
+distances can be reported in the `i8` space, they are not very comparable to the
+other indices anymore. They are useful for ranking, less for direct comparison
+against non-quantised indices.
 
 ```
-===================================================================================
+===========================================================================================================================
 Benchmark: 150k cells, 32D
-===================================================================================
-Method                           Build (ms)   Query (ms)   Total (ms)     Recall@k
------------------------------------------------------------------------------------
-Exhaustive                             3.57     24960.24     24963.80       1.0000
-IVF-SQ8-nl273-np13                  1572.69       555.18      2127.87       0.8548
-IVF-SQ8-nl273-np16                  1572.69       699.63      2272.32       0.8566
-IVF-SQ8-nl273-np23                  1572.69       879.88      2452.57       0.8567
-IVF-SQ8-nl387-np19                  1935.02       593.86      2528.89       0.8552
-IVF-SQ8-nl387-np27                  1935.02       809.99      2745.01       0.8567
-IVF-SQ8-nl547-np23                  2752.78       689.26      3442.04       0.8529
-IVF-SQ8-nl547-np27                  2752.78       749.43      3502.21       0.8556
-IVF-SQ8-nl547-np33                  2752.78       856.76      3609.54       0.8566
------------------------------------------------------------------------------------
+===========================================================================================================================
+Method                                          Build (ms)   Query (ms)   Total (ms)     Recall@k   Dist Error    Size (MB)
+---------------------------------------------------------------------------------------------------------------------------
+Exhaustive (query)                                    3.15      2323.63      2326.78       1.0000     0.000000        18.31
+Exhaustive (self)                                     3.15     23257.97     23261.13       1.0000     0.000000        18.31
+IVF-SQ8-nl273-np13 (query)                         1317.10        60.17      1377.27       0.7906          NaN         5.76
+IVF-SQ8-nl273-np16 (query)                         1317.10        65.88      1382.98       0.7936          NaN         5.76
+IVF-SQ8-nl273-np23 (query)                         1317.10        98.18      1415.27       0.7947          NaN         5.76
+IVF-SQ8-nl273 (self)                               1317.10       897.31      2214.41       0.7953          NaN         5.76
+IVF-SQ8-nl387-np19 (query)                         1847.52        59.21      1906.73       0.7921          NaN         5.77
+IVF-SQ8-nl387-np27 (query)                         1847.52        77.29      1924.81       0.7947          NaN         5.77
+IVF-SQ8-nl387 (self)                               1847.52       767.79      2615.31       0.7953          NaN         5.77
+IVF-SQ8-nl547-np23 (query)                         2596.54        56.71      2653.24       0.7907          NaN         5.79
+IVF-SQ8-nl547-np27 (query)                         2596.54        61.54      2658.08       0.7933          NaN         5.79
+IVF-SQ8-nl547-np33 (query)                         2596.54        72.19      2668.73       0.7946          NaN         5.79
+IVF-SQ8-nl547 (self)                               2596.54       716.23      3312.77       0.7952          NaN         5.79
+---------------------------------------------------------------------------------------------------------------------------
 ```
+
+We can observe quite a loss of Recall (reducing to ca 0.8); but we gain incredible
+query speed. A given query can go from ***~2 seconds to 60 to 80 ms***, a nearly
+30x improvement in query speed.
 
 **With more dimensions**
 
 In this case, we increase the dimensions from 32 to 96.
 
 ```
-===================================================================================
+===========================================================================================================================
 Benchmark: 150k cells, 96D
-===================================================================================
-Method                           Build (ms)   Query (ms)   Total (ms)     Recall@k
------------------------------------------------------------------------------------
-Exhaustive                            11.07    116822.76    116833.84       1.0000
-IVF-SQ8-nl273-np13                  6270.91      2197.15      8468.06       0.8224
-IVF-SQ8-nl273-np16                  6270.91      2605.84      8876.75       0.8291
-IVF-SQ8-nl273-np23                  6270.91      3616.88      9887.79       0.8345
-IVF-SQ8-nl387-np19                  8964.76      2403.18     11367.94       0.8263
-IVF-SQ8-nl387-np27                  8964.76      3102.59     12067.35       0.8340
-IVF-SQ8-nl547-np23                 13144.41      2574.42     15718.83       0.8184
-IVF-SQ8-nl547-np27                 13144.41      2728.36     15872.77       0.8277
-IVF-SQ8-nl547-np33                 13144.41      3358.42     16502.83       0.8335
------------------------------------------------------------------------------------
+===========================================================================================================================
+Method                                          Build (ms)   Query (ms)   Total (ms)     Recall@k   Dist Error    Size (MB)
+---------------------------------------------------------------------------------------------------------------------------
+Exhaustive (query)                                   10.38     10496.40     10506.78       1.0000     0.000000        54.93
+Exhaustive (self)                                    10.38    106818.01    106828.39       1.0000     0.000000        54.93
+IVF-SQ8-nl273-np13 (query)                         6155.53       198.79      6354.32       0.8174          NaN        14.98
+IVF-SQ8-nl273-np16 (query)                         6155.53       253.81      6409.35       0.8276          NaN        14.98
+IVF-SQ8-nl273-np23 (query)                         6155.53       329.67      6485.20       0.8318          NaN        14.98
+IVF-SQ8-nl273 (self)                               6155.53      3346.18      9501.71       0.8325          NaN        14.98
+IVF-SQ8-nl387-np19 (query)                         8980.64       209.83      9190.47       0.8224          NaN        15.02
+IVF-SQ8-nl387-np27 (query)                         8980.64       331.50      9312.13       0.8318          NaN        15.02
+IVF-SQ8-nl387 (self)                               8980.64      2779.45     11760.09       0.8325          NaN        15.02
+IVF-SQ8-nl547-np23 (query)                        12433.70       220.39     12654.09       0.8169          NaN        15.08
+IVF-SQ8-nl547-np27 (query)                        12433.70       244.53     12678.23       0.8258          NaN        15.08
+IVF-SQ8-nl547-np33 (query)                        12433.70       265.32     12699.02       0.8307          NaN        15.08
+IVF-SQ8-nl547 (self)                              12433.70      2835.38     15269.08       0.8312          NaN        15.08
+---------------------------------------------------------------------------------------------------------------------------
 ```
+
+The improvements in (querying) speed are even more substantial here (40-fold
+increase in speed) and we can appreciate a slight improvement in Recall. 
 
 **Data set with stronger correlation structure and more dimensions**
 
 To compare against the next two indices. This data is designed to be better 
-suited for high dimensionality. One can appreciate, that with higher 
-dimensionality the Recall starts suffering for this
-index.
+suited for high dimensionality with correlation structure between dimensions.
+The SQ8 quantisation starts failing here. The next two indices can deal much
+better with data that has strong correlations between dimensions.
 
 ```
-===================================================================================
+===========================================================================================================================
 Benchmark: 150k cells, 128D
-===================================================================================
-Method                           Build (ms)   Query (ms)   Total (ms)     Recall@k
------------------------------------------------------------------------------------
-Exhaustive                            14.95    185329.68    185344.63       1.0000
-IVF-SQ8-nl273-np13                 10181.62      3100.52     13282.14       0.6413
-IVF-SQ8-nl273-np16                 10181.62      3510.16     13691.78       0.6421
-IVF-SQ8-nl273-np23                 10181.62      5295.38     15477.00       0.6422
-IVF-SQ8-nl387-np19                 14813.81      3271.58     18085.39       0.6419
-IVF-SQ8-nl387-np27                 14813.81      4584.85     19398.67       0.6422
-IVF-SQ8-nl547-np23                 20138.92      2907.62     23046.54       0.6415
-IVF-SQ8-nl547-np27                 20138.92      3355.53     23494.45       0.6420
-IVF-SQ8-nl547-np33                 20138.92      3960.62     24099.54       0.6422
------------------------------------------------------------------------------------
+===========================================================================================================================
+Method                                          Build (ms)   Query (ms)   Total (ms)     Recall@k   Dist Error    Size (MB)
+---------------------------------------------------------------------------------------------------------------------------
+Exhaustive (query)                                   15.10     17780.50     17795.60       1.0000     0.000000        73.24
+Exhaustive (self)                                    15.10    178991.04    179006.14       1.0000     0.000000        73.24
+IVF-SQ8-nl273-np13 (query)                         9936.22       313.35     10249.57       0.6108          NaN        19.59
+IVF-SQ8-nl273-np16 (query)                         9936.22       348.11     10284.33       0.6116          NaN        19.59
+IVF-SQ8-nl273-np23 (query)                         9936.22       466.00     10402.22       0.6117          NaN        19.59
+IVF-SQ8-nl273 (self)                               9936.22      4749.27     14685.49       0.6128          NaN        19.59
+IVF-SQ8-nl387-np19 (query)                        14266.19       330.13     14596.32       0.6111          NaN        19.65
+IVF-SQ8-nl387-np27 (query)                        14266.19       437.82     14704.01       0.6117          NaN        19.65
+IVF-SQ8-nl387 (self)                              14266.19      4278.07     18544.26       0.6128          NaN        19.65
+IVF-SQ8-nl547-np23 (query)                        20159.47       424.42     20583.90       0.6107          NaN        19.73
+IVF-SQ8-nl547-np27 (query)                        20159.47       391.48     20550.95       0.6113          NaN        19.73
+IVF-SQ8-nl547-np33 (query)                        20159.47       444.56     20604.03       0.6117          NaN        19.73
+IVF-SQ8-nl547 (self)                              20159.47      4050.60     24210.07       0.6128          NaN        19.73
+---------------------------------------------------------------------------------------------------------------------------
 ```
 
 Let's check how the two other indices deal with this.
@@ -118,39 +232,53 @@ product quantisation, see below.
 - *Number of subvectors (m)*: In how many subvectors to divide the given main
   vector. The initial dimensionality needs to be divisable by m.
 
+The self queries here run on the compressed indices stored in the structure
+itself. We can appreciate that the lossy compression affects the recall here. If
+you wish to get great kNN graphs from these indices, you need to re-supply the
+non-compressed data (at cost of memory!). Again, similar to `IVF-SQ8` the 
+distances are difficult to interpret/compare against original vectors due to 
+the heavy quantisation, thus, are not reported.
+
 **Euclidean:**
 
 With 128 dimensions.
 
 ```
-===================================================================================
+===========================================================================================================================
 Benchmark: 150k cells, 128D
-===================================================================================
-Method                           Build (ms)   Query (ms)   Total (ms)     Recall@k
------------------------------------------------------------------------------------
-Exhaustive                            16.01    180361.27    180377.28       1.0000
-IVF-PQ-nl273-m16-np13              16781.22      4450.38     21231.60       0.5571
-IVF-PQ-nl273-m16-np16              16781.22      5175.86     21957.08       0.5575
-IVF-PQ-nl273-m16-np23              16781.22      7891.47     24672.69       0.5575
-IVF-PQ-nl273-m32-np13              20016.47      7353.13     27369.60       0.7225
-IVF-PQ-nl273-m32-np16              20016.47      8984.63     29001.10       0.7235
-IVF-PQ-nl273-m32-np23              20016.47     12319.57     32336.04       0.7237
-IVF-PQ-nl387-m16-np19              20712.47      5509.88     26222.35       0.5590
-IVF-PQ-nl387-m16-np27              20712.47      7915.02     28627.49       0.5593
-IVF-PQ-nl387-m32-np19              24812.90      9081.07     33893.97       0.7250
-IVF-PQ-nl387-m32-np27              24812.90     13135.28     37948.18       0.7255
-IVF-PQ-nl547-m16-np23              27162.68      6891.43     34054.11       0.5619
-IVF-PQ-nl547-m16-np27              27162.68      7580.48     34743.15       0.5622
-IVF-PQ-nl547-m16-np33              27162.68      8951.89     36114.57       0.5623
-IVF-PQ-nl547-m32-np23              30516.85     10388.61     40905.47       0.7270
-IVF-PQ-nl547-m32-np27              30516.85     12168.79     42685.64       0.7277
-IVF-PQ-nl547-m32-np33              30516.85     14645.70     45162.56       0.7280
------------------------------------------------------------------------------------
+===========================================================================================================================
+Method                                          Build (ms)   Query (ms)   Total (ms)     Recall@k   Dist Error    Size (MB)
+---------------------------------------------------------------------------------------------------------------------------
+Exhaustive (query)                                   15.02     18288.27     18303.29       1.0000     0.000000        73.24
+Exhaustive (self)                                    15.02    174754.84    174769.86       1.0000     0.000000        73.24
+IVF-PQ-nl273-m16-np13 (query)                     17232.81       453.24     17686.06       0.5578          NaN         3.69
+IVF-PQ-nl273-m16-np16 (query)                     17232.81       543.61     17776.42       0.5584          NaN         3.69
+IVF-PQ-nl273-m16-np23 (query)                     17232.81       748.60     17981.42       0.5585          NaN         3.69
+IVF-PQ-nl273-m16 (self)                           17232.81      7809.20     25042.01       0.4607          NaN         3.69
+IVF-PQ-nl273-m32-np13 (query)                     19319.67       700.87     20020.53       0.7273          NaN         5.98
+IVF-PQ-nl273-m32-np16 (query)                     19319.67       838.40     20158.07       0.7287          NaN         5.98
+IVF-PQ-nl273-m32-np23 (query)                     19319.67      1202.35     20522.02       0.7291          NaN         5.98
+IVF-PQ-nl273-m32 (self)                           19319.67     12045.04     31364.71       0.6608          NaN         5.98
+IVF-PQ-nl387-m16-np19 (query)                     20417.56       541.78     20959.34       0.5580          NaN         3.75
+IVF-PQ-nl387-m16-np27 (query)                     20417.56       750.22     21167.79       0.5585          NaN         3.75
+IVF-PQ-nl387-m16 (self)                           20417.56      7585.76     28003.32       0.4624          NaN         3.75
+IVF-PQ-nl387-m32-np19 (query)                     23508.80       891.40     24400.20       0.7302          NaN         6.04
+IVF-PQ-nl387-m32-np27 (query)                     23508.80      1234.14     24742.94       0.7312          NaN         6.04
+IVF-PQ-nl387-m32 (self)                           23508.80     12621.52     36130.32       0.6633          NaN         6.04
+IVF-PQ-nl547-m16-np23 (query)                     26843.28       645.61     27488.89       0.5610          NaN         3.83
+IVF-PQ-nl547-m16-np27 (query)                     26843.28       789.26     27632.54       0.5614          NaN         3.83
+IVF-PQ-nl547-m16-np33 (query)                     26843.28       949.42     27792.70       0.5617          NaN         3.83
+IVF-PQ-nl547-m16 (self)                           26843.28      9089.45     35932.72       0.4652          NaN         3.83
+IVF-PQ-nl547-m32-np23 (query)                     29472.25       988.81     30461.06       0.7310          NaN         6.12
+IVF-PQ-nl547-m32-np27 (query)                     29472.25      1289.50     30761.75       0.7322          NaN         6.12
+IVF-PQ-nl547-m32-np33 (query)                     29472.25      1525.52     30997.77       0.7328          NaN         6.12
+IVF-PQ-nl547-m32 (self)                           29472.25     13438.71     42910.97       0.6656          NaN         6.12
+---------------------------------------------------------------------------------------------------------------------------
 ```
 
 One can appreciate that PQ in this case can yield higher Recalls than just
-SQ8 going from ca. 0.64 to 0.72. However, index building and query time are both
-higher. However, you also reduce the memory finger print quite substantially.
+SQ8 going from ca. 0.62 to 0.72. However, index building and query time are both
+higher but at massive reduction of the memory finger print.
 
 **With more dimensions**
 
@@ -158,37 +286,36 @@ With 192 dimensions. In this case, also m = 48, i.e., dividing the original
 vectors into 48 subvectors was tested.
 
 ```
-===================================================================================
-Benchmark: 150k cells, 192D
-===================================================================================
-Method                           Build (ms)   Query (ms)   Total (ms)     Recall@k
------------------------------------------------------------------------------------
-Exhaustive                            23.37    308023.77    308047.14       1.0000
-IVF-PQ-nl273-m16-np13              25713.83      5433.23     31147.06       0.4529
-IVF-PQ-nl273-m16-np16              25713.83      7264.61     32978.44       0.4536
-IVF-PQ-nl273-m16-np23              25713.83      9574.54     35288.37       0.4537
-IVF-PQ-nl273-m32-np13              31793.39     10472.38     42265.77       0.6285
-IVF-PQ-nl273-m32-np16              31793.39     12255.97     44049.36       0.6301
-IVF-PQ-nl273-m32-np23              31793.39     17548.37     49341.77       0.6305
-IVF-PQ-nl273-m48-np13              32853.65     11373.11     44226.76       0.7318
-IVF-PQ-nl273-m48-np16              32853.65     14238.54     47092.19       0.7343
-IVF-PQ-nl273-m48-np23              32853.65     20256.78     53110.43       0.7349
-IVF-PQ-nl387-m16-np19              34085.74      7788.76     41874.50       0.4550
-IVF-PQ-nl387-m16-np27              34085.74     10108.84     44194.58       0.4557
-IVF-PQ-nl387-m32-np19              38396.24     13675.44     52071.68       0.6303
-IVF-PQ-nl387-m32-np27              38396.24     17223.62     55619.86       0.6317
-IVF-PQ-nl387-m48-np19              41160.11     17149.93     58310.05       0.7347
-IVF-PQ-nl387-m48-np27              41160.11     21030.83     62190.94       0.7368
-IVF-PQ-nl547-m16-np23              44462.83      8506.78     52969.61       0.4570
-IVF-PQ-nl547-m16-np27              44462.83      9607.35     54070.17       0.4577
-IVF-PQ-nl547-m16-np33              44462.83     11342.21     55805.04       0.4581
-IVF-PQ-nl547-m32-np23              46745.07     13209.96     59955.03       0.6305
-IVF-PQ-nl547-m32-np27              46745.07     16297.98     63043.05       0.6321
-IVF-PQ-nl547-m32-np33              46745.07     20421.76     67166.82       0.6330
-IVF-PQ-nl547-m48-np23              48715.88     15664.02     64379.90       0.7331
-IVF-PQ-nl547-m48-np27              48715.88     18333.34     67049.22       0.7355
-IVF-PQ-nl547-m48-np33              48715.88     23769.50     72485.38       0.7368
------------------------------------------------------------------------------------
+===========================================================================================================================
+Benchmark: 150k cells, 128D
+===========================================================================================================================
+Method                                          Build (ms)   Query (ms)   Total (ms)     Recall@k   Dist Error    Size (MB)
+---------------------------------------------------------------------------------------------------------------------------
+Exhaustive (query)                                   15.02     18288.27     18303.29       1.0000     0.000000        73.24
+Exhaustive (self)                                    15.02    174754.84    174769.86       1.0000     0.000000        73.24
+IVF-PQ-nl273-m16-np13 (query)                     17232.81       453.24     17686.06       0.5578          NaN         3.69
+IVF-PQ-nl273-m16-np16 (query)                     17232.81       543.61     17776.42       0.5584          NaN         3.69
+IVF-PQ-nl273-m16-np23 (query)                     17232.81       748.60     17981.42       0.5585          NaN         3.69
+IVF-PQ-nl273-m16 (self)                           17232.81      7809.20     25042.01       0.4607          NaN         3.69
+IVF-PQ-nl273-m32-np13 (query)                     19319.67       700.87     20020.53       0.7273          NaN         5.98
+IVF-PQ-nl273-m32-np16 (query)                     19319.67       838.40     20158.07       0.7287          NaN         5.98
+IVF-PQ-nl273-m32-np23 (query)                     19319.67      1202.35     20522.02       0.7291          NaN         5.98
+IVF-PQ-nl273-m32 (self)                           19319.67     12045.04     31364.71       0.6608          NaN         5.98
+IVF-PQ-nl387-m16-np19 (query)                     20417.56       541.78     20959.34       0.5580          NaN         3.75
+IVF-PQ-nl387-m16-np27 (query)                     20417.56       750.22     21167.79       0.5585          NaN         3.75
+IVF-PQ-nl387-m16 (self)                           20417.56      7585.76     28003.32       0.4624          NaN         3.75
+IVF-PQ-nl387-m32-np19 (query)                     23508.80       891.40     24400.20       0.7302          NaN         6.04
+IVF-PQ-nl387-m32-np27 (query)                     23508.80      1234.14     24742.94       0.7312          NaN         6.04
+IVF-PQ-nl387-m32 (self)                           23508.80     12621.52     36130.32       0.6633          NaN         6.04
+IVF-PQ-nl547-m16-np23 (query)                     26843.28       645.61     27488.89       0.5610          NaN         3.83
+IVF-PQ-nl547-m16-np27 (query)                     26843.28       789.26     27632.54       0.5614          NaN         3.83
+IVF-PQ-nl547-m16-np33 (query)                     26843.28       949.42     27792.70       0.5617          NaN         3.83
+IVF-PQ-nl547-m16 (self)                           26843.28      9089.45     35932.72       0.4652          NaN         3.83
+IVF-PQ-nl547-m32-np23 (query)                     29472.25       988.81     30461.06       0.7310          NaN         6.12
+IVF-PQ-nl547-m32-np27 (query)                     29472.25      1289.50     30761.75       0.7322          NaN         6.12
+IVF-PQ-nl547-m32-np33 (query)                     29472.25      1525.52     30997.77       0.7328          NaN         6.12
+IVF-PQ-nl547-m32 (self)                           29472.25     13438.71     42910.97       0.6656          NaN         6.12
+---------------------------------------------------------------------------------------------------------------------------
 ```
 
 ### IVF-OPQ
@@ -203,7 +330,7 @@ However, it can still be useful in situation where good enough works and you
 have VERY large scale data. The theoretical benefits at least in this
 synthetic data do not translate very well. IVF-PQ is usually more than enough, 
 outside of cases in which a specific correlation structure can be exploited
-by the optimised PQ. If in doubt, use the IVF-PQ index.
+by the optimised PQ. If in doubt, use the IVF-PQ index. 
 
 **Key parameters:**
 
@@ -214,34 +341,46 @@ by the optimised PQ. If in doubt, use the IVF-PQ index.
 - *Number of subvectors (m)*: In how many subvectors to divide the given main
   vector. The initial dimensionality needs to be divisable by m.
 
+Similar to IVF-OP, the self kNN generation is run on the compressed indices,
+with the same loss of Recall due to the severe compression. Again, similar to 
+`IVF-SQ8` the distances are difficult to interpret/compare against original 
+vectors due to the heavy quantisation (plus rotation), thus, are not reported.
+
 **Euclidean:**
 
 With 128 dimensions.
 
 ```
-===================================================================================
+============================================================================================
 Benchmark: 150k cells, 128D
-===================================================================================
-Method                           Build (ms)   Query (ms)   Total (ms)     Recall@k
------------------------------------------------------------------------------------
-Exhaustive                            14.60    181852.46    181867.06       1.0000
-IVF-OPQ-nl273-m16-np13             29770.87      4444.53     34215.40       0.5572
-IVF-OPQ-nl273-m16-np16             29770.87      5332.95     35103.82       0.5576
-IVF-OPQ-nl273-m16-np23             29770.87      7733.49     37504.36       0.5576
-IVF-OPQ-nl273-m32-np13             40200.77      7213.76     47414.53       0.7253
-IVF-OPQ-nl273-m32-np16             40200.77      9369.07     49569.84       0.7263
-IVF-OPQ-nl273-m32-np23             40200.77     12113.81     52314.58       0.7264
-IVF-OPQ-nl387-m16-np19             35565.86      6149.77     41715.63       0.5595
-IVF-OPQ-nl387-m16-np27             35565.86      8551.83     44117.68       0.5597
-IVF-OPQ-nl387-m32-np19             44867.67     12729.91     57597.58       0.7275
-IVF-OPQ-nl387-m32-np27             44867.67     14298.33     59166.00       0.7280
-IVF-OPQ-nl547-m16-np23             42874.72      8035.92     50910.64       0.5616
-IVF-OPQ-nl547-m16-np27             42874.72      8576.86     51451.59       0.5619
-IVF-OPQ-nl547-m16-np33             42874.72      9583.35     52458.07       0.5619
-IVF-OPQ-nl547-m32-np23             49953.24     10573.52     60526.75       0.7286
-IVF-OPQ-nl547-m32-np27             49953.24     11856.71     61809.95       0.7294
-IVF-OPQ-nl547-m32-np33             49953.24     15153.34     65106.57       0.7296
------------------------------------------------------------------------------------
+============================================================================================
+Method                                     Build (ms)   Query (ms)   Total (ms)     Recall@k
+--------------------------------------------------------------------------------------------
+Exhaustive (query)                              14.53     17349.43     17363.96       1.0000
+Exhaustive (self)                               14.53    175437.33    175451.86       1.0000
+IVF-OPQ-nl273-m16-np13 (query)               29891.15       436.46     30327.61       0.5563
+IVF-OPQ-nl273-m16-np16 (query)               29891.15       520.67     30411.82       0.5569
+IVF-OPQ-nl273-m16-np23 (query)               29891.15       721.99     30613.14       0.5571
+IVF-OPQ-nl273-m16 (self)                     29891.15      7471.33     37362.48       0.4608
+IVF-OPQ-nl273-m32-np13 (query)               36851.12       690.14     37541.26       0.7290
+IVF-OPQ-nl273-m32-np16 (query)               36851.12       834.66     37685.78       0.7305
+IVF-OPQ-nl273-m32-np23 (query)               36851.12      1174.46     38025.58       0.7308
+IVF-OPQ-nl273-m32 (self)                     36851.12     12003.31     48854.43       0.6653
+IVF-OPQ-nl387-m16-np19 (query)               33631.55       540.88     34172.43       0.5581
+IVF-OPQ-nl387-m16-np27 (query)               33631.55       755.04     34386.60       0.5586
+IVF-OPQ-nl387-m16 (self)                     33631.55      7792.71     41424.26       0.4628
+IVF-OPQ-nl387-m32-np19 (query)               41130.64       896.34     42026.98       0.7322
+IVF-OPQ-nl387-m32-np27 (query)               41130.64      1237.63     42368.27       0.7332
+IVF-OPQ-nl387-m32 (self)                     41130.64     12807.23     53937.87       0.6669
+IVF-OPQ-nl547-m16-np23 (query)               39396.87       611.54     40008.41       0.5615
+IVF-OPQ-nl547-m16-np27 (query)               39396.87       714.49     40111.36       0.5620
+IVF-OPQ-nl547-m16-np33 (query)               39396.87       862.31     40259.18       0.5622
+IVF-OPQ-nl547-m16 (self)                     39396.87      8836.52     48233.39       0.4657
+IVF-OPQ-nl547-m32-np23 (query)               46883.00       980.48     47863.49       0.7328
+IVF-OPQ-nl547-m32-np27 (query)               46883.00      1136.66     48019.66       0.7340
+IVF-OPQ-nl547-m32-np33 (query)               46883.00      1360.99     48244.00       0.7345
+IVF-OPQ-nl547-m32 (self)                     46883.00     14238.80     61121.80       0.6692
+--------------------------------------------------------------------------------------------
 ```
 
 **With more dimensions**
@@ -249,37 +388,47 @@ IVF-OPQ-nl547-m32-np33             49953.24     15153.34     65106.57       0.72
 With 192 dimensions.
 
 ```
-===================================================================================
+============================================================================================
 Benchmark: 150k cells, 192D
-===================================================================================
-Method                           Build (ms)   Query (ms)   Total (ms)     Recall@k
------------------------------------------------------------------------------------
-Exhaustive                            23.94    300669.42    300693.36       1.0000
-IVF-OPQ-nl273-m16-np13             48538.75      5168.65     53707.39       0.4567
-IVF-OPQ-nl273-m16-np16             48538.75      6243.53     54782.27       0.4575
-IVF-OPQ-nl273-m16-np23             48538.75      8749.50     57288.24       0.4576
-IVF-OPQ-nl273-m32-np13             56733.12      8602.57     65335.69       0.6295
-IVF-OPQ-nl273-m32-np16             56733.12     10411.57     67144.69       0.6312
-IVF-OPQ-nl273-m32-np23             56733.12     14800.91     71534.03       0.6316
-IVF-OPQ-nl273-m48-np13             68469.74     10826.48     79296.23       0.7334
-IVF-OPQ-nl273-m48-np16             68469.74     13173.62     81643.36       0.7360
-IVF-OPQ-nl273-m48-np23             68469.74     18713.54     87183.29       0.7365
-IVF-OPQ-nl387-m16-np19             58510.78      7467.02     65977.80       0.4579
-IVF-OPQ-nl387-m16-np27             58510.78      9919.46     68430.24       0.4585
-IVF-OPQ-nl387-m32-np19             74880.54     11942.58     86823.12       0.6319
-IVF-OPQ-nl387-m32-np27             74880.54     16289.07     91169.61       0.6334
-IVF-OPQ-nl387-m48-np19             73287.48     13815.35     87102.83       0.7356
-IVF-OPQ-nl387-m48-np27             73287.48     19191.27     92478.75       0.7377
-IVF-OPQ-nl547-m16-np23             66317.33      8294.84     74612.17       0.4603
-IVF-OPQ-nl547-m16-np27             66317.33      9636.94     75954.27       0.4610
-IVF-OPQ-nl547-m16-np33             66317.33     11443.52     77760.85       0.4614
-IVF-OPQ-nl547-m32-np23             78328.35     13391.88     91720.23       0.6308
-IVF-OPQ-nl547-m32-np27             78328.35     15424.57     93752.92       0.6324
-IVF-OPQ-nl547-m32-np33             78328.35     18499.00     96827.35       0.6333
-IVF-OPQ-nl547-m48-np23             84417.78     15267.71     99685.49       0.7349
-IVF-OPQ-nl547-m48-np27             84417.78     17701.44    102119.22       0.7372
-IVF-OPQ-nl547-m48-np33             84417.78     21675.29    106093.07       0.7386
------------------------------------------------------------------------------------
+============================================================================================
+Method                                     Build (ms)   Query (ms)   Total (ms)     Recall@k
+--------------------------------------------------------------------------------------------
+Exhaustive (query)                              22.41     28448.17     28470.58       1.0000
+Exhaustive (self)                               22.41    283657.88    283680.30       1.0000
+IVF-OPQ-nl273-m16-np13 (query)               50293.57       533.11     50826.67       0.4613
+IVF-OPQ-nl273-m16-np16 (query)               50293.57       643.56     50937.12       0.4618
+IVF-OPQ-nl273-m16-np23 (query)               50293.57       908.28     51201.84       0.4619
+IVF-OPQ-nl273-m16 (self)                     50293.57      9534.01     59827.58       0.3651
+IVF-OPQ-nl273-m32-np13 (query)               58646.60       883.23     59529.83       0.6347
+IVF-OPQ-nl273-m32-np16 (query)               58646.60      1053.27     59699.87       0.6359
+IVF-OPQ-nl273-m32-np23 (query)               58646.60      1481.17     60127.77       0.6361
+IVF-OPQ-nl273-m32 (self)                     58646.60     15211.51     73858.11       0.5544
+IVF-OPQ-nl273-m48-np13 (query)               63756.75      1033.02     64789.76       0.7352
+IVF-OPQ-nl273-m48-np16 (query)               63756.75      1250.81     65007.56       0.7370
+IVF-OPQ-nl273-m48-np23 (query)               63756.75      1755.07     65511.81       0.7372
+IVF-OPQ-nl273-m48 (self)                     63756.75     18089.40     81846.15       0.6757
+IVF-OPQ-nl387-m16-np19 (query)               56530.62       711.53     57242.16       0.4650
+IVF-OPQ-nl387-m16-np27 (query)               56530.62       968.79     57499.42       0.4652
+IVF-OPQ-nl387-m16 (self)                     56530.62     10452.18     66982.81       0.3679
+IVF-OPQ-nl387-m32-np19 (query)               66098.35      1163.20     67261.55       0.6376
+IVF-OPQ-nl387-m32-np27 (query)               66098.35      1585.60     67683.94       0.6383
+IVF-OPQ-nl387-m32 (self)                     66098.35     16320.14     82418.49       0.5574
+IVF-OPQ-nl387-m48-np19 (query)               70394.53      1317.40     71711.93       0.7372
+IVF-OPQ-nl387-m48-np27 (query)               70394.53      1836.00     72230.53       0.7383
+IVF-OPQ-nl387-m48 (self)                     70394.53     18938.40     89332.93       0.6774
+IVF-OPQ-nl547-m16-np23 (query)               65962.12       819.98     66782.10       0.4662
+IVF-OPQ-nl547-m16-np27 (query)               65962.12       964.90     66927.02       0.4665
+IVF-OPQ-nl547-m16-np33 (query)               65962.12      1158.44     67120.56       0.4666
+IVF-OPQ-nl547-m16 (self)                     65962.12     12014.58     77976.69       0.3698
+IVF-OPQ-nl547-m32-np23 (query)               75614.05      1281.38     76895.43       0.6377
+IVF-OPQ-nl547-m32-np27 (query)               75614.05      1496.12     77110.17       0.6385
+IVF-OPQ-nl547-m32-np33 (query)               75614.05      1822.78     77436.82       0.6388
+IVF-OPQ-nl547-m32 (self)                     75614.05     18387.25     94001.29       0.5579
+IVF-OPQ-nl547-m48-np23 (query)               79678.03      1482.07     81160.09       0.7378
+IVF-OPQ-nl547-m48-np27 (query)               79678.03      1724.69     81402.72       0.7391
+IVF-OPQ-nl547-m48-np33 (query)               79678.03      2105.26     81783.28       0.7395
+IVF-OPQ-nl547-m48 (self)                     79678.03     21495.91    101173.94       0.6786
+--------------------------------------------------------------------------------------------
 ```
 
 All benchmarks were run on M1 Max MacBook Pro with 64 GB unified memory.

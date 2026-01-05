@@ -2,7 +2,11 @@ use faer::{MatRef, RowRef};
 use num_traits::{Float, FromPrimitive, ToPrimitive};
 use rayon::prelude::*;
 use std::ops::AddAssign;
+use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::Ordering;
+use std::sync::Arc;
 use std::{collections::BinaryHeap, iter::Sum};
+use thousands::*;
 
 use crate::quantised::quantisers::*;
 use crate::utils::dist::*;
@@ -119,13 +123,11 @@ where
     ///
     /// ### Params
     ///
-    /// * `vectors_flat` - Flattened vector data (length = n * dim)
-    /// * `dim` - Embedding dimensions
-    /// * `n` - Number of vectors
-    /// * `nlist` - Number of IVF clusters
+    /// * `data` - Matrix reference with vectors as rows (n × dim)
+    /// * `nlist` - Optional number of clusters. Defaults to `sqrt(n)`.
     /// * `m` - Number of subspaces for PQ (dim must be divisible by m)
     /// * `metric` - Distance metric (Euclidean or Cosine)
-    /// * `max_iters` - Optional maximum k-means iterations. Defaults to `30`.
+    /// * `max_iters` - Optional maximum k-means iterations (defaults to `30`).
     /// * `opq_iter` - Optional number of iterations to get the rotation matrix.
     ///   Defaults to `3`.
     /// * `n_opq_centroids` - Number of centroids to use for the product
@@ -178,7 +180,7 @@ where
             println!("  Generating IVF-OPQ index with {} Voronoi cells.", nlist);
         }
 
-        // 2. Train IVF centroids
+        // 2. train IVF centroids
         let mut centroids = train_centroids(
             &training_data,
             dim,
@@ -190,7 +192,7 @@ where
             verbose,
         );
 
-        // Normalise centroids for cosine
+        // normalise centroids for cosine
         if metric == Dist::Cosine {
             if verbose {
                 println!("  Normalising centroids");
@@ -200,12 +202,22 @@ where
                 .for_each(|chunk| normalise_vector(chunk));
         }
 
-        // 3. Compute residuals for training data
+        // 3. compute residuals for training data
         if verbose {
             println!("  Computing residuals for OPQ training");
         }
-        let training_assignments =
-            assign_all_parallel(&training_data, dim, n_train, &centroids, nlist, &metric);
+        let training_norms = vec![T::one(); n_train];
+        let centroid_norms = vec![T::one(); nlist];
+        let training_assignments = assign_all_parallel(
+            &training_data,
+            &training_norms,
+            dim,
+            n_train,
+            &centroids,
+            &centroid_norms,
+            nlist,
+            &metric,
+        );
 
         // For normalised vectors (cosine), ||q-v||² = 2(1 - <q,v>) so Euclidean distance
         // on residuals correctly approximates cosine distance
@@ -220,7 +232,7 @@ where
             }
         }
 
-        // 4. Train OPQ on residuals
+        // 4. train OPQ on residuals
         if verbose {
             println!("  Training optimised product quantiser with m={}", m);
         }
@@ -235,11 +247,21 @@ where
             verbose,
         );
 
-        // 5. Assign all vectors to IVF clusters
-        let assignments = assign_all_parallel(&vectors_flat, dim, n, &centroids, nlist, &metric);
+        // 5. assign all vectors to IVF clusters
+        let data_norms = vec![T::one(); n];
+        let assignments = assign_all_parallel(
+            &vectors_flat,
+            &data_norms,
+            dim,
+            n,
+            &centroids,
+            &centroid_norms,
+            nlist,
+            &metric,
+        );
         let (all_indices, offsets) = build_csr_layout(assignments.clone(), n, nlist);
 
-        // 6. Encode all vectors with product quantiser
+        // 6. encode all vectors with product quantiser
         if verbose {
             println!("  Encoding residuals");
         }
@@ -304,7 +326,9 @@ where
             normalise_vector(&mut query_vec);
         }
 
-        let nprobe = nprobe.unwrap_or_else(|| (((self.nlist as f64) * 0.15) as usize).max(1));
+        let nprobe = nprobe
+            .unwrap_or_else(|| ((self.nlist as f64).sqrt() as usize).max(1))
+            .min(self.nlist);
         let k = k.min(self.n);
 
         // Find top nprobe centroids
@@ -378,6 +402,97 @@ where
 
         let query_vec: Vec<T> = query_row.iter().cloned().collect();
         self.query(&query_vec, k, nprobe)
+    }
+
+    /// Generate kNN graph from vectors stored in the index
+    ///
+    /// Reconstructs each vector (centroid + decoded residual) and uses ADC
+    /// for accurate distance computation across clusters.
+    ///
+    /// ### Params
+    ///
+    /// * `k` - Number of neighbours per vector
+    /// * `nprobe` - Number of clusters to search (defaults to sqrt(nlist) if None)
+    /// * `return_dist` - Whether to return distances
+    /// * `verbose` - Controls verbosity
+    ///
+    /// ### Returns
+    ///
+    /// Tuple of `(knn_indices, optional distances)` where each row corresponds
+    /// to a vector in the index
+    pub fn generate_knn(
+        &self,
+        k: usize,
+        nprobe: Option<usize>,
+        return_dist: bool,
+        verbose: bool,
+    ) -> (Vec<Vec<usize>>, Option<Vec<Vec<T>>>) {
+        let m = self.codebook.m();
+        let counter = Arc::new(AtomicUsize::new(0));
+
+        // Build cluster assignments
+        let mut cluster_assignments = vec![0usize; self.n];
+        for cluster_idx in 0..self.nlist {
+            let start = self.offsets[cluster_idx];
+            let end = self.offsets[cluster_idx + 1];
+            for &vec_idx in &self.all_indices[start..end] {
+                cluster_assignments[vec_idx] = cluster_idx;
+            }
+        }
+
+        let results: Vec<(Vec<usize>, Vec<T>)> = (0..self.n)
+            .into_par_iter()
+            .map(|i| {
+                let my_cluster = cluster_assignments[i];
+                let codes = &self.quantised_codes[i * m..(i + 1) * m];
+
+                // Reconstruct: centroid + decoded residual
+                let my_centroid =
+                    &self.centroids[my_cluster * self.dim..(my_cluster + 1) * self.dim];
+                let residual = self.codebook.decode(codes);
+                let reconstructed: Vec<T> = my_centroid
+                    .iter()
+                    .zip(residual.iter())
+                    .map(|(&c, &r)| c + r)
+                    .collect();
+
+                if verbose {
+                    let count = counter.fetch_add(1, Ordering::Relaxed) + 1;
+                    if count % 100_000 == 0 {
+                        println!(
+                            "  Processed {} / {} samples.",
+                            count.separate_with_underscores(),
+                            self.n.separate_with_underscores()
+                        );
+                    }
+                }
+
+                self.query(&reconstructed, k, nprobe)
+            })
+            .collect();
+
+        if return_dist {
+            let (indices, distances) = results.into_iter().unzip();
+            (indices, Some(distances))
+        } else {
+            let indices = results.into_iter().map(|(idx, _)| idx).collect();
+            (indices, None)
+        }
+    }
+
+    /// Returns the size of the index in bytes
+    ///
+    /// ### Returns
+    ///
+    /// Number of bytes used by the index
+    pub fn memory_usage_bytes(&self) -> usize {
+        std::mem::size_of_val(self)
+            + self.quantised_codes.capacity() * std::mem::size_of::<u8>()
+            + self.centroids.capacity() * std::mem::size_of::<T>()
+            + self.centroids_norm.capacity() * std::mem::size_of::<T>()
+            + self.all_indices.capacity() * std::mem::size_of::<usize>()
+            + self.offsets.capacity() * std::mem::size_of::<usize>()
+            + self.codebook.memory_usage_bytes()
     }
 }
 

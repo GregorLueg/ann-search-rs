@@ -712,6 +712,7 @@ where
     /// * `k` - Number of neighbours per vector
     /// * `search_k` - Search budget (defaults to k * n_trees * 20 if None)
     /// * `return_dist` - Whether to return distances
+    /// * `verbose` - Controls verbosity of the function
     ///
     /// ### Returns
     ///
@@ -760,6 +761,21 @@ where
             let indices: Vec<Vec<usize>> = results.into_iter().map(|(idx, _)| idx).collect();
             (indices, None)
         }
+    }
+
+    /// Returns the size of the index in bytes
+    ///
+    /// ### Returns
+    ///
+    /// Number of bytes used by the index
+    pub fn memory_usage_bytes(&self) -> usize {
+        std::mem::size_of_val(self)
+            + self.vectors_flat.capacity() * std::mem::size_of::<T>()
+            + self.norms.capacity() * std::mem::size_of::<T>()
+            + self.nodes.capacity() * std::mem::size_of::<FlatNode>()
+            + self.roots.capacity() * std::mem::size_of::<u32>()
+            + self.split_data.capacity() * std::mem::size_of::<T>()
+            + self.leaf_indices.capacity() * std::mem::size_of::<usize>()
     }
 }
 

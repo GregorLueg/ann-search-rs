@@ -4,6 +4,7 @@ use ann_search_rs::*;
 use clap::Parser;
 use commons::*;
 use faer::Mat;
+use std::collections::HashSet;
 use std::time::Instant;
 use thousands::*;
 
@@ -85,45 +86,55 @@ fn main() {
 
     println!("-----------------------------");
 
-    let build_params = [
-        (16, 50),
-        (16, 100),
-        (16, 200),
-        (24, 100),
-        (24, 200),
-        (24, 300),
-        (32, 200),
-        (32, 300),
+    let nlist_values = [
+        (cli.n_cells as f32 * 0.5).sqrt() as usize,
+        (cli.n_cells as f32).sqrt() as usize,
+        (cli.n_cells as f32 * 2.0).sqrt() as usize,
     ];
 
-    for (m, ef_construction) in build_params {
-        println!(
-            "Building HNSW index (M={}, ef_construction={})...",
-            m, ef_construction
-        );
+    for nlist in nlist_values {
+        println!("Building IVF-BF16 index (nlist={})...", nlist);
         let start = Instant::now();
-        let hnsw_idx = build_hnsw_index(
+        let ivf_bf16_idx = build_ivf_bf16_index(
             data.as_ref(),
-            m,
-            ef_construction,
+            Some(nlist),
+            None,
             &cli.distance,
             cli.seed as usize,
             false,
         );
         let build_time = start.elapsed().as_secs_f64() * 1000.0;
 
-        let index_size_mb = hnsw_idx.memory_usage_bytes() as f64 / (1024.0 * 1024.0);
+        let index_size_mb = ivf_bf16_idx.memory_usage_bytes() as f64 / (1024.0 * 1024.0);
+
+        let nprobe_values = [
+            (nlist as f32).sqrt() as usize,
+            (nlist as f32 * 2.0).sqrt() as usize,
+            (0.05 * nlist as f32) as usize,
+        ];
+        let mut nprobe_values: Vec<_> = nprobe_values
+            .into_iter()
+            .collect::<HashSet<_>>()
+            .into_iter()
+            .collect();
+        nprobe_values.sort();
 
         // Query benchmarks
-        let ef_search_values = vec![50, 75, 100];
-        for ef_search in ef_search_values {
-            println!("Querying HNSW index (ef_search={})...", ef_search);
+        for nprobe in &nprobe_values {
+            if *nprobe > nlist || *nprobe == 0 {
+                continue;
+            }
+
+            println!(
+                "Querying IVF-BF16 index (nlist={}, nprobe={})...",
+                nlist, nprobe
+            );
             let start = Instant::now();
-            let (approx_neighbors, approx_distances) = query_hnsw_index(
+            let (approx_neighbors, approx_distances) = query_ivf_bf16_index(
                 query_data.as_ref(),
-                &hnsw_idx,
+                &ivf_bf16_idx,
                 cli.k,
-                ef_search,
+                Some(*nprobe),
                 true,
                 false,
             );
@@ -137,7 +148,7 @@ fn main() {
             );
 
             results.push(BenchmarkResultSize {
-                method: format!("HNSW-M{}-ef{}-s{} (query)", m, ef_construction, ef_search),
+                method: format!("IVF-BF16-nl{}-np{} (query)", nlist, nprobe),
                 build_time_ms: build_time,
                 query_time_ms: query_time,
                 total_time_ms: build_time + query_time,
@@ -148,10 +159,11 @@ fn main() {
         }
 
         // Self-query benchmark
-        println!("Self-querying HNSW index...");
+        let nprobe_self = (nlist as f32 * 2.0).sqrt() as usize;
+        println!("Self-querying IVF-BF16 index (nprobe={})...", nprobe_self);
         let start = Instant::now();
         let (approx_neighbors_self, approx_distances_self) =
-            query_hnsw_self(&hnsw_idx, cli.k, 100, true, false);
+            query_ivf_bf16_self(&ivf_bf16_idx, cli.k, Some(nprobe_self), true, false);
         let self_query_time = start.elapsed().as_secs_f64() * 1000.0;
 
         let recall_self = calculate_recall(&true_neighbors_self, &approx_neighbors_self, cli.k);
@@ -162,7 +174,7 @@ fn main() {
         );
 
         results.push(BenchmarkResultSize {
-            method: format!("HNSW-M{}-ef{} (self)", m, ef_construction),
+            method: format!("IVF-BF16-nl{} (self)", nlist),
             build_time_ms: build_time,
             query_time_ms: self_query_time,
             total_time_ms: build_time + self_query_time,

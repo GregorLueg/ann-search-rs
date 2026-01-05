@@ -132,19 +132,16 @@ where
     ///
     /// ### Params
     ///
-    /// * `vectors_flat` - Flattened vector data (length = n * dim)
-    /// * `dim` - Embedding dimensions
-    /// * `n` - Number of vectors
-    /// * `nlist` - Number of clusters (more = faster search, lower recall)
+    /// * `data` - Matrix reference with vectors as rows (n × dim)
+    /// * `nlist` - Optional number of clusters. Defaults to `sqrt(n)`.
     /// * `metric` - Distance metric (Euclidean or Cosine)
-    /// * `max_iters` - Maximum k-means iterations (defaults to 30)
+    /// * `max_iters` - Optional maximum k-means iterations (defaults to `30`).
     /// * `seed` - Random seed for reproducibility
     /// * `verbose` - Print training progress
     ///
     /// ### Returns
     ///
     /// Constructed quantised index ready for querying
-    #[allow(clippy::too_many_arguments)]
     pub fn build(
         data: MatRef<T>,
         nlist: Option<usize>,
@@ -155,7 +152,6 @@ where
     ) -> Self {
         let (mut vectors_flat, n, dim) = matrix_to_flat(data);
 
-        // max iters for k-means
         let max_iters = max_iters.unwrap_or(30);
         let nlist = nlist.unwrap_or((n as f32).sqrt() as usize).max(1);
 
@@ -213,7 +209,18 @@ where
         let codebook = ScalarQuantiser::train(&training_data, dim);
 
         // 4. assign vectors to clusters
-        let assignments = assign_all_parallel(&vectors_flat, dim, n, &centroids, nlist, &metric);
+        let data_norms = vec![T::one(); n];
+        let centroid_norms = vec![T::one(); nlist];
+        let assignments = assign_all_parallel(
+            &vectors_flat,
+            &data_norms,
+            dim,
+            n,
+            &centroids,
+            &centroid_norms,
+            nlist,
+            &metric,
+        );
         let (all_indices, offsets) = build_csr_layout(assignments, n, nlist);
 
         // 5. quantise all vectors with global codebook
@@ -353,145 +360,129 @@ where
         self.query(&query_vec, k, nprobe)
     }
 
-    /// Build a kNN graph directly from the quantised vectors
+    /// Query using an already-quantised internal vector
     ///
-    /// More efficient than query_row for self-querying since vectors are
-    /// already quantised. Uses the inverted index structure to limit search
-    /// space.
+    /// Skips the encode step since the vector is already in i8 format.
+    /// Only decodes for centroid search (which is O(nlist), small).
+    #[inline]
+    fn query_quantised(
+        &self,
+        query_i8: &[i8],
+        query_norm_sq: i32,
+        k: usize,
+        nprobe: Option<usize>,
+    ) -> (Vec<usize>, Vec<T>) {
+        let nprobe = nprobe
+            .unwrap_or_else(|| ((self.nlist as f64).sqrt() as usize).max(1))
+            .min(self.nlist);
+        let k = k.min(self.n);
+
+        // Decode only for centroid search (O(nlist) - cheap)
+        let query_float = self.codebook.decode(query_i8);
+        let cluster_scores: Vec<(T, usize)> = self.get_centroids_prenorm(&query_float, nprobe);
+
+        let mut heap: BinaryHeap<(OrderedFloat<T>, usize)> = BinaryHeap::with_capacity(k + 1);
+
+        for &(_, cluster_idx) in cluster_scores.iter().take(nprobe) {
+            let start = self.offsets[cluster_idx];
+            let end = self.offsets[cluster_idx + 1];
+
+            for &vec_idx in &self.all_indices[start..end] {
+                let dist = match self.metric {
+                    Dist::Cosine => self.cosine_distance_i8(vec_idx, query_i8, query_norm_sq),
+                    Dist::Euclidean => self.euclidean_distance_i8(vec_idx, query_i8),
+                };
+
+                if heap.len() < k {
+                    heap.push((OrderedFloat(dist), vec_idx));
+                } else if dist < heap.peek().unwrap().0 .0 {
+                    heap.pop();
+                    heap.push((OrderedFloat(dist), vec_idx));
+                }
+            }
+        }
+
+        let mut results: Vec<_> = heap.into_iter().collect();
+        results.sort_unstable_by_key(|&(dist, _)| dist);
+        let (distances, indices) = results.into_iter().map(|(d, i)| (d.0, i)).unzip();
+        (indices, distances)
+    }
+
+    /// Generate kNN graph from vectors stored in the index
+    ///
+    /// Queries each vector in the index against itself to build a complete
+    /// kNN graph. Uses pre-quantised vectors directly, avoiding encode overhead.
     ///
     /// ### Params
     ///
     /// * `k` - Number of neighbours per vector
-    /// * `nprobe` - Number of clusters to search per vector (defaults to
-    ///   `sqrt(n_list)`).
+    /// * `nprobe` - Number of clusters to search (defaults to sqrt(nlist) if None)
+    /// * `return_dist` - Whether to return distances
     /// * `verbose` - Controls verbosity
     ///
     /// ### Returns
     ///
-    /// Vector of k nearest neighbour indices for each vector (excluding self)
-    pub fn build_knn_graph(
+    /// Tuple of `(knn_indices, optional distances)` where each row corresponds
+    /// to a vector in the index
+    pub fn generate_knn(
         &self,
         k: usize,
         nprobe: Option<usize>,
+        return_dist: bool,
         verbose: bool,
-    ) -> Vec<Vec<usize>> {
-        let nprobe = nprobe
-            .unwrap_or_else(|| ((self.nlist as f64).sqrt() as usize).max(1))
-            .min(self.nlist);
-
-        // pre-compute centroid neighbours once
-        let centroid_neighbours: Vec<Vec<usize>> = (0..self.nlist)
-            .into_par_iter()
-            .map(|c| {
-                let cent = &self.centroids[c * self.dim..(c + 1) * self.dim];
-                let mut dists: Vec<(T, usize)> = (0..self.nlist)
-                    .filter(|&other| other != c)
-                    .map(|other| {
-                        let other_cent = &self.centroids[other * self.dim..(other + 1) * self.dim];
-                        let dist = match self.metric {
-                            Dist::Cosine => {
-                                T::one()
-                                    - cent
-                                        .iter()
-                                        .zip(other_cent.iter())
-                                        .map(|(&a, &b)| a * b)
-                                        .sum::<T>()
-                            }
-                            Dist::Euclidean => cent
-                                .iter()
-                                .zip(other_cent.iter())
-                                .map(|(&a, &b)| (a - b) * (a - b))
-                                .sum::<T>(),
-                        };
-                        (dist, other)
-                    })
-                    .collect();
-
-                dists.sort_unstable_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
-                dists.into_iter().take(nprobe).map(|(_, idx)| idx).collect()
-            })
-            .collect();
-
-        // find cluster assignments
-        let cluster_assignments: Vec<usize> = self.all_indices.iter().enumerate().fold(
-            vec![0; self.n],
-            |mut acc, (pos, &vec_idx)| {
-                let cluster = self.offsets.partition_point(|&offset| offset <= pos) - 1;
-                acc[vec_idx] = cluster;
-                acc
-            },
-        );
-
+    ) -> (Vec<Vec<usize>>, Option<Vec<Vec<T>>>) {
         let counter = Arc::new(AtomicUsize::new(0));
 
-        (0..self.n)
+        let results: Vec<(Vec<usize>, Vec<T>)> = (0..self.n)
             .into_par_iter()
-            .map(|vec_idx| {
-                let my_cluster = cluster_assignments[vec_idx];
-
-                // use pre-computed neighbours instead of recalculating
-                let clusters_to_search: Vec<usize> = std::iter::once(my_cluster)
-                    .chain(centroid_neighbours[my_cluster].iter().copied())
-                    .take(nprobe)
-                    .collect();
-
-                let query_quantised =
-                    &self.quantised_vectors[vec_idx * self.dim..(vec_idx + 1) * self.dim];
+            .map(|i| {
+                let start = i * self.dim;
+                let end = start + self.dim;
+                let query_i8 = &self.quantised_vectors[start..end];
                 let query_norm_sq = if self.metric == Dist::Cosine {
-                    self.quantised_norms[vec_idx]
+                    self.quantised_norms[i]
                 } else {
                     0
                 };
 
-                let mut heap: BinaryHeap<(OrderedFloat<T>, usize)> =
-                    BinaryHeap::with_capacity(k + 2);
-
-                for cluster_idx in clusters_to_search {
-                    let start = self.offsets[cluster_idx];
-                    let end = self.offsets[cluster_idx + 1];
-
-                    for &candidate_idx in &self.all_indices[start..end] {
-                        if candidate_idx == vec_idx {
-                            continue;
-                        }
-
-                        let dist = match self.metric {
-                            Dist::Cosine => self.cosine_distance_i8(
-                                candidate_idx,
-                                query_quantised,
-                                query_norm_sq,
-                            ),
-                            Dist::Euclidean => {
-                                self.euclidean_distance_i8(candidate_idx, query_quantised)
-                            }
-                        };
-
-                        if heap.len() < k {
-                            heap.push((OrderedFloat(dist), candidate_idx));
-                        } else if dist < heap.peek().unwrap().0 .0 {
-                            heap.pop();
-                            heap.push((OrderedFloat(dist), candidate_idx));
-                        }
-                    }
-                }
-
-                let mut results: Vec<_> = heap.into_iter().collect();
-                results.sort_unstable_by_key(|&(dist, _)| dist);
-
                 if verbose {
                     let count = counter.fetch_add(1, Ordering::Relaxed) + 1;
-                    if count.is_multiple_of(100_000) {
+                    if count % 100_000 == 0 {
                         println!(
-                            " Processed {} / {} samples.",
+                            "  Processed {} / {} samples.",
                             count.separate_with_underscores(),
                             self.n.separate_with_underscores()
                         );
                     }
                 }
 
-                results.into_iter().map(|(_, idx)| idx).collect()
+                self.query_quantised(query_i8, query_norm_sq, k, nprobe)
             })
-            .collect()
+            .collect();
+
+        if return_dist {
+            let (indices, distances) = results.into_iter().unzip();
+            (indices, Some(distances))
+        } else {
+            let indices = results.into_iter().map(|(idx, _)| idx).collect();
+            (indices, None)
+        }
+    }
+
+    /// Returns the size of the index in bytes
+    ///
+    /// ### Returns
+    ///
+    /// Number of bytes used by the index
+    pub fn memory_usage_bytes(&self) -> usize {
+        std::mem::size_of_val(self)
+            + self.quantised_vectors.capacity() * std::mem::size_of::<i8>()
+            + self.quantised_norms.capacity() * std::mem::size_of::<i32>()
+            + self.centroids.capacity() * std::mem::size_of::<T>()
+            + self.centroids_norm.capacity() * std::mem::size_of::<T>()
+            + self.all_indices.capacity() * std::mem::size_of::<usize>()
+            + self.offsets.capacity() * std::mem::size_of::<usize>()
+            + self.codebook.memory_usage_bytes()
     }
 }
 
