@@ -14,8 +14,25 @@ pub trait VectorStore<T>
 where
     T: Float + Sum,
 {
+    /// Load in a given vector based on idx position
+    ///
+    /// ### Params
+    ///
+    /// * `idx` - Index of the vector to load
     fn load_vector(&self, idx: usize) -> &[T];
+
+    /// Returns the dimensionality
+    ///
+    /// ### Returns
+    ///
+    /// Dimensions
     fn dim(&self) -> usize;
+
+    /// Returns the number of vectors
+    ///
+    /// ### Returns
+    ///
+    /// N vectors
     fn n(&self) -> usize;
 }
 
@@ -26,7 +43,6 @@ where
 /// Memory-mapped vector storage
 ///
 /// Stores vectors and norms in binary files and memory-maps them.
-/// The OS handles paging - only accessed data gets loaded into RAM.
 pub struct MmapVectorStore<T> {
     mmap_vectors: Mmap,
     mmap_norms: Mmap,

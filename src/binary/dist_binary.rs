@@ -151,7 +151,7 @@ where
     /// ### Returns
     ///
     /// Dot product as u32
-    #[inline]
+    #[inline(always)]
     fn dot_query_binary(
         &self,
         query: &RaBitQQuery<T>,
@@ -162,30 +162,39 @@ where
         let binary = &self.cluster_binary(cluster_idx)[start..start + self.n_bytes()];
         let dim = self.dim();
 
-        let mut sum: u32 = 0;
+        let mut sum = 0u32;
         let full_bytes = dim / 8;
 
+        // Process full bytes - no branching, compiler can auto-vectorize
         for byte_idx in 0..full_bytes {
-            let bits = binary[byte_idx];
+            let bits = unsafe { *binary.get_unchecked(byte_idx) };
             let base = byte_idx * 8;
-            if bits != 0 {
-                sum += (query.quantised[base] as u32) * ((bits & 1) as u32);
-                sum += (query.quantised[base + 1] as u32) * (((bits >> 1) & 1) as u32);
-                sum += (query.quantised[base + 2] as u32) * (((bits >> 2) & 1) as u32);
-                sum += (query.quantised[base + 3] as u32) * (((bits >> 3) & 1) as u32);
-                sum += (query.quantised[base + 4] as u32) * (((bits >> 4) & 1) as u32);
-                sum += (query.quantised[base + 5] as u32) * (((bits >> 5) & 1) as u32);
-                sum += (query.quantised[base + 6] as u32) * (((bits >> 6) & 1) as u32);
-                sum += (query.quantised[base + 7] as u32) * (((bits >> 7) & 1) as u32);
+
+            // Branchless: multiply by bit mask (0 or 1)
+            // Compiler should vectorize this loop
+            unsafe {
+                sum += *query.quantised.get_unchecked(base) as u32 * (bits & 1) as u32;
+                sum += *query.quantised.get_unchecked(base + 1) as u32 * ((bits >> 1) & 1) as u32;
+                sum += *query.quantised.get_unchecked(base + 2) as u32 * ((bits >> 2) & 1) as u32;
+                sum += *query.quantised.get_unchecked(base + 3) as u32 * ((bits >> 3) & 1) as u32;
+                sum += *query.quantised.get_unchecked(base + 4) as u32 * ((bits >> 4) & 1) as u32;
+                sum += *query.quantised.get_unchecked(base + 5) as u32 * ((bits >> 5) & 1) as u32;
+                sum += *query.quantised.get_unchecked(base + 6) as u32 * ((bits >> 6) & 1) as u32;
+                sum += *query.quantised.get_unchecked(base + 7) as u32 * ((bits >> 7) & 1) as u32;
             }
         }
 
+        // Handle remaining bits (if dim % 8 != 0)
         let remaining = dim % 8;
         if remaining > 0 {
-            let bits = binary[full_bytes];
+            let bits = unsafe { *binary.get_unchecked(full_bytes) };
             let base = full_bytes * 8;
-            for bit_pos in 0..remaining {
-                sum += (query.quantised[base + bit_pos] as u32) * (((bits >> bit_pos) & 1) as u32);
+
+            unsafe {
+                for bit_pos in 0..remaining {
+                    sum += *query.quantised.get_unchecked(base + bit_pos) as u32
+                        * ((bits >> bit_pos) & 1) as u32;
+                }
             }
         }
 

@@ -1834,7 +1834,6 @@ where
     let n_queries = query_mat.nrows();
 
     if rerank {
-        let factor = rerank_factor.unwrap_or(10);
         let results: Vec<(Vec<usize>, Vec<T>)> = (0..n_queries)
             .into_par_iter()
             .map(|i| {
@@ -1848,7 +1847,7 @@ where
                         );
                     }
                 }
-                index.query_row_reranking(query_mat.row(i), k, nprobe, factor)
+                index.query_row_reranking(query_mat.row(i), k, nprobe, rerank_factor)
             })
             .collect();
 
@@ -1934,7 +1933,11 @@ where
 /// ### Params
 ///
 /// * `mat` - The initial matrix with samples x features
+/// * `n_clust_rabitq` - Number of clusters (None for automatic)
 /// * `dist_metric` - "euclidean" or "cosine"
+/// * `seed` - Random seed
+/// * `save_store` - Whether to save vector store for reranking
+/// * `save_path` - Path to save vector store files (required if save_store is true)
 ///
 /// ### Returns
 ///
@@ -1944,12 +1947,24 @@ pub fn build_exhaustive_index_rabitq<T>(
     n_clust_rabitq: Option<usize>,
     dist_metric: &str,
     seed: usize,
-) -> ExhaustiveIndexRaBitQ<T>
+    save_store: bool,
+    save_path: Option<impl AsRef<Path>>,
+) -> std::io::Result<ExhaustiveIndexRaBitQ<T>>
 where
     T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum + ComplexField,
 {
     let ann_dist = parse_ann_dist(dist_metric).unwrap_or_default();
-    ExhaustiveIndexRaBitQ::new(mat, &ann_dist, n_clust_rabitq, seed)
+    if save_store {
+        let path = save_path.expect("save_path required when save_store is true");
+        ExhaustiveIndexRaBitQ::new_with_vector_store(mat, &ann_dist, n_clust_rabitq, seed, path)
+    } else {
+        Ok(ExhaustiveIndexRaBitQ::new(
+            mat,
+            &ann_dist,
+            n_clust_rabitq,
+            seed,
+        ))
+    }
 }
 
 #[cfg(feature = "binary")]
@@ -1960,38 +1975,52 @@ where
 /// * `query_mat` - The query matrix containing the samples × features
 /// * `index` - The exhaustive RaBitQ index
 /// * `k` - Number of neighbours to return
+/// * `n_probe` - Number of clusters to search (None for default 20%)
+/// * `rerank` - Whether to use exact distance reranking (requires vector store)
+/// * `rerank_factor` - Multiplier for candidate set size (only used if rerank is true)
 /// * `return_dist` - Shall the distances be returned
 /// * `verbose` - Controls verbosity of the function
 ///
 /// ### Returns
 ///
 /// A tuple of `(knn_indices, optional distances)`
+#[allow(clippy::too_many_arguments)]
 pub fn query_exhaustive_index_rabitq<T>(
     query_mat: MatRef<T>,
     index: &ExhaustiveIndexRaBitQ<T>,
     k: usize,
     n_probe: Option<usize>,
+    rerank: bool,
+    rerank_factor: Option<usize>,
     return_dist: bool,
     verbose: bool,
 ) -> (Vec<Vec<usize>>, Option<Vec<Vec<T>>>)
 where
     T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum + ComplexField,
 {
-    query_parallel(query_mat.nrows(), return_dist, verbose, |i| {
-        index.query_row(query_mat.row(i), k, n_probe)
-    })
+    if rerank {
+        query_parallel(query_mat.nrows(), return_dist, verbose, |i| {
+            index.query_row_reranking(query_mat.row(i), k, n_probe, rerank_factor)
+        })
+    } else {
+        query_parallel(query_mat.nrows(), return_dist, verbose, |i| {
+            index.query_row(query_mat.row(i), k, n_probe)
+        })
+    }
 }
 
 #[cfg(feature = "binary")]
 /// Query an exhaustive RaBitQ index against itself
 ///
 /// Generates a full kNN graph based on the internal data.
+/// Requires vector store to be available (use save_store=true when building).
 ///
 /// ### Params
 ///
-/// * `data` - Original float data matrix [samples, features]
 /// * `index` - Reference to built index
 /// * `k` - Number of neighbours
+/// * `n_probe` - Number of clusters to search (None for default 20%)
+/// * `rerank_factor` - Multiplier for candidate set size
 /// * `return_dist` - Return distances
 /// * `verbose` - Controls verbosity
 ///
@@ -1999,15 +2028,15 @@ where
 ///
 /// Tuple of (indices, optional distances)
 pub fn query_exhaustive_index_rabitq_self<T>(
-    data: MatRef<T>,
     index: &ExhaustiveIndexRaBitQ<T>,
     k: usize,
     n_probe: Option<usize>,
+    rerank_factor: Option<usize>,
     return_dist: bool,
     verbose: bool,
 ) -> (Vec<Vec<usize>>, Option<Vec<Vec<T>>>)
 where
     T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum + ComplexField,
 {
-    index.generate_knn(data, k, n_probe, return_dist, verbose)
+    index.generate_knn(k, n_probe, rerank_factor, return_dist, verbose)
 }

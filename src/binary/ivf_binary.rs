@@ -41,10 +41,10 @@ pub struct IvfIndexBinary<T> {
     pub n_bytes: usize,
     pub n: usize,
     pub dim: usize,
+    metric: Dist,
     binariser: Binariser<T>,
     centroids_float: Vec<T>,
     centroids_norm: Vec<T>,
-    metric: Dist,
     all_indices: Vec<usize>,
     offsets: Vec<usize>,
     nlist: usize,
@@ -535,12 +535,13 @@ where
         query_vec: &[T],
         k: usize,
         nprobe: Option<usize>,
-        rerank_factor: usize,
+        rerank_factor: Option<usize>,
     ) -> (Vec<usize>, Vec<T>) {
         let vector_store = self
             .vector_store
             .as_ref()
             .expect("Vector store required for reranking - use build_with_vector_store()");
+        let rerank_factor = rerank_factor.unwrap_or(20);
 
         let (candidates, _) = self.query(query_vec, k * rerank_factor, nprobe);
 
@@ -560,9 +561,7 @@ where
                     Dist::Cosine => {
                         vector_store.cosine_distance_to_query(idx, query_vec, query_norm)
                     }
-                    Dist::Euclidean => vector_store
-                        .euclidean_distance_to_query(idx, query_vec)
-                        .sqrt(),
+                    Dist::Euclidean => vector_store.euclidean_distance_to_query(idx, query_vec),
                 };
                 (dist, idx)
             })
@@ -600,7 +599,7 @@ where
         query_row: RowRef<T>,
         k: usize,
         nprobe: Option<usize>,
-        rerank_factor: usize,
+        rerank_factor: Option<usize>,
     ) -> (Vec<usize>, Vec<T>) {
         if query_row.col_stride() == 1 {
             let slice =
@@ -639,8 +638,6 @@ where
         let counter = Arc::new(AtomicUsize::new(0));
 
         if let Some(vector_store) = &self.vector_store {
-            let rerank_factor = rerank_factor.unwrap_or(10);
-
             let results: Vec<(Vec<usize>, Vec<T>)> = (0..self.n)
                 .into_par_iter()
                 .map(|i| {
@@ -947,7 +944,7 @@ mod tests {
         .unwrap();
 
         let query: Vec<f32> = (0..32).map(|i| i as f32 * 0.1).collect();
-        let (indices, distances) = index.query_reranking(&query, 10, Some(10), 5);
+        let (indices, distances) = index.query_reranking(&query, 10, Some(10), Some(5));
 
         assert_eq!(indices.len(), 10);
         assert_eq!(distances.len(), 10);
@@ -975,7 +972,8 @@ mod tests {
         )
         .unwrap();
 
-        let (indices, distances) = index.query_row_reranking(data.as_ref().row(0), 10, Some(10), 5);
+        let (indices, distances) =
+            index.query_row_reranking(data.as_ref().row(0), 10, Some(10), Some(5));
 
         assert_eq!(indices.len(), 10);
         assert_eq!(distances.len(), 10);
@@ -1026,7 +1024,7 @@ mod tests {
         );
 
         let query: Vec<f32> = (0..32).map(|i| i as f32 * 0.1).collect();
-        let _ = index.query_reranking(&query, 10, Some(10), 5);
+        let _ = index.query_reranking(&query, 10, Some(10), Some(5));
     }
 
     #[test]

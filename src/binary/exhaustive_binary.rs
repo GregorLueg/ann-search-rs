@@ -34,9 +34,9 @@ pub struct ExhaustiveIndexBinary<T> {
     pub n_bytes: usize,
     pub n: usize,
     pub dim: usize,
+    metric: Dist,
     binariser: Binariser<T>,
     vector_store: Option<MmapVectorStore<T>>,
-    metric: Dist,
 }
 
 //////////////////////////
@@ -295,9 +295,7 @@ where
                     Dist::Cosine => {
                         vector_store.cosine_distance_to_query(idx, query_vec, query_norm)
                     }
-                    Dist::Euclidean => vector_store
-                        .euclidean_distance_to_query(idx, query_vec)
-                        .sqrt(),
+                    Dist::Euclidean => vector_store.euclidean_distance_to_query(idx, query_vec),
                 };
                 (dist, idx)
             })
