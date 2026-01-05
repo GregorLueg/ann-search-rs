@@ -771,3 +771,215 @@ where
         &self.storage.centroids_norm
     }
 }
+
+///////////
+// Tests //
+///////////
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use approx::assert_abs_diff_eq;
+
+    fn sample_data_2d() -> Vec<f32> {
+        vec![
+            1.0, 0.0, 0.0, 1.0, -1.0, 0.0, 0.0, -1.0, 0.5, 0.5, -0.5, 0.5,
+        ]
+    }
+
+    #[test]
+    fn test_encoder_creation() {
+        let encoder = RaBitQEncoder::<f32>::new(4, Dist::Euclidean, 42);
+        assert_eq!(encoder.dim, 4);
+        assert_eq!(encoder.n_bytes, 1);
+        assert_eq!(encoder.rotation.len(), 16);
+    }
+
+    #[test]
+    fn test_rotation_orthogonality() {
+        let dim = 8;
+        let encoder = RaBitQEncoder::<f32>::new(dim, Dist::Euclidean, 42);
+
+        // Check R^T * R = I
+        for i in 0..dim {
+            for j in 0..dim {
+                let mut dot = 0.0;
+                for k in 0..dim {
+                    dot += encoder.rotation[i * dim + k] * encoder.rotation[j * dim + k];
+                }
+                let expected = if i == j { 1.0 } else { 0.0 };
+                assert_abs_diff_eq!(dot, expected, epsilon = 1e-5);
+            }
+        }
+    }
+
+    #[test]
+    fn test_encode_vector_basic() {
+        let encoder = RaBitQEncoder::<f32>::new(4, Dist::Euclidean, 42);
+        let vec = vec![1.0, 0.0, 0.0, 0.0];
+        let centroid = vec![0.0, 0.0, 0.0, 0.0];
+
+        let (binary, dist, correction) = encoder.encode_vector(&vec, &centroid);
+
+        assert_eq!(binary.len(), 1); // 4 dims = 1 byte
+        assert_abs_diff_eq!(dist, 1.0, epsilon = 1e-5);
+        assert!(correction > 0.0);
+    }
+
+    #[test]
+    fn test_encode_vector_with_centroid() {
+        let encoder = RaBitQEncoder::<f32>::new(4, Dist::Euclidean, 42);
+        let vec = vec![2.0, 2.0, 0.0, 0.0];
+        let centroid = vec![1.0, 1.0, 0.0, 0.0];
+
+        let (_, dist, _) = encoder.encode_vector(&vec, &centroid);
+
+        let expected_dist = (1.0f32 + 1.0f32).sqrt();
+        assert_abs_diff_eq!(dist, expected_dist, epsilon = 1e-5);
+    }
+
+    #[test]
+    fn test_encode_query_int4_range() {
+        let encoder = RaBitQEncoder::<f32>::new(8, Dist::Euclidean, 42);
+        let query = vec![1.0; 8];
+        let centroid = vec![0.0; 8];
+
+        let encoded = encoder.encode_query(&query, &centroid);
+
+        assert_eq!(encoded.quantised.len(), 8);
+        for &val in &encoded.quantised {
+            assert!(val <= 15); // int4 max value
+        }
+        assert_eq!(
+            encoded.sum_quantised,
+            encoded.quantised.iter().map(|&x| x as u32).sum::<u32>()
+        );
+    }
+
+    #[test]
+    fn test_encode_query_cosine_normalises() {
+        let encoder = RaBitQEncoder::<f32>::new(4, Dist::Cosine, 42);
+        let query = vec![2.0, 0.0, 0.0, 0.0]; // Will be normalised
+        let centroid = vec![0.0; 4];
+
+        let encoded = encoder.encode_query(&query, &centroid);
+
+        // Distance should be 1.0 since normalised query - centroid has norm 1
+        assert_abs_diff_eq!(encoded.dist_to_centroid, 1.0, epsilon = 1e-5);
+    }
+
+    #[test]
+    fn test_storage_creation() {
+        let storage = RaBitQStorage::<f32>::with_capacity(10, 100, 8);
+        assert_eq!(storage.nlist, 10);
+        assert_eq!(storage.dim, 8);
+        assert_eq!(storage.n_bytes, 1);
+        assert_eq!(storage.offsets.len(), 11);
+    }
+
+    #[test]
+    fn test_build_rabitq_storage() {
+        let data = sample_data_2d();
+        let dim = 2;
+        let n = 6;
+        let nlist = 2;
+
+        let centroids = vec![0.5, 0.0, -0.5, 0.0]; // 2 centroids
+        let assignments = vec![0, 0, 1, 1, 0, 1]; // 3 vectors per cluster
+        let encoder = RaBitQEncoder::new(dim, Dist::Euclidean, 42);
+
+        let storage =
+            build_rabitq_storage(&data, dim, n, &centroids, nlist, &assignments, &encoder);
+
+        assert_eq!(storage.nlist, 2);
+        assert_eq!(storage.n_vectors(), 6);
+        assert_eq!(storage.cluster_size(0), 3);
+        assert_eq!(storage.cluster_size(1), 3);
+        assert_eq!(storage.centroids.len(), 4); // 2 * dim
+        assert_eq!(storage.centroids_norm.len(), 2);
+    }
+
+    #[test]
+    fn test_storage_accessors() {
+        let data = sample_data_2d();
+        let dim = 2;
+        let n = 6;
+        let nlist = 2;
+
+        let centroids = vec![0.5, 0.0, -0.5, 0.0];
+        let assignments = vec![0, 0, 1, 1, 0, 1];
+        let encoder = RaBitQEncoder::new(dim, Dist::Euclidean, 42);
+
+        let storage =
+            build_rabitq_storage(&data, dim, n, &centroids, nlist, &assignments, &encoder);
+
+        let centroid_0 = storage.centroid(0);
+        assert_eq!(centroid_0.len(), dim);
+        assert_abs_diff_eq!(centroid_0[0], 0.5, epsilon = 1e-5);
+
+        let indices_0 = storage.cluster_vector_indices(0);
+        assert_eq!(indices_0.len(), 3);
+
+        let binary_0 = storage.cluster_binary_codes(0);
+        assert_eq!(binary_0.len(), 3); // 3 vectors * 1 byte
+    }
+
+    #[test]
+    fn test_quantiser_creation_euclidean() {
+        let data = sample_data_2d();
+        let mat = Mat::from_fn(6, 2, |i, j| data[i * 2 + j]);
+
+        let quantiser = RaBitQQuantiser::new(mat.as_ref(), &Dist::Euclidean, Some(2), 42);
+
+        assert_eq!(quantiser.n_clusters(), 2);
+        assert_eq!(quantiser.n_vectors(), 6);
+        assert_eq!(quantiser.encoder.dim, 2);
+    }
+
+    #[test]
+    fn test_quantiser_creation_cosine() {
+        let data = sample_data_2d();
+        let mat = Mat::from_fn(6, 2, |i, j| data[i * 2 + j]);
+
+        let quantiser = RaBitQQuantiser::new(mat.as_ref(), &Dist::Cosine, Some(2), 42);
+
+        assert_eq!(quantiser.n_clusters(), 2);
+        assert_eq!(quantiser.encoder.metric, Dist::Cosine);
+    }
+
+    #[test]
+    fn test_quantiser_encode_query() {
+        let data = sample_data_2d();
+        let mat = Mat::from_fn(6, 2, |i, j| data[i * 2 + j]);
+        let quantiser = RaBitQQuantiser::new(mat.as_ref(), &Dist::Euclidean, Some(2), 42);
+
+        let query = vec![0.8, 0.2];
+        let encoded = quantiser.encode_query(&query, 0);
+
+        assert_eq!(encoded.quantised.len(), 2);
+        assert!(encoded.dist_to_centroid >= 0.0);
+        assert!(encoded.sum_quantised <= 30); // 2 dims * 15 max
+    }
+
+    #[test]
+    fn test_quantiser_default_nlist() {
+        let data = sample_data_2d();
+        let mat = Mat::from_fn(6, 2, |i, j| data[i * 2 + j]);
+
+        let quantiser = RaBitQQuantiser::new(mat.as_ref(), &Dist::Euclidean, None, 42);
+
+        // Should default to 0.5 * sqrt(6) ≈ 1.22, ceiled and clamped
+        assert!(quantiser.n_clusters() >= 1);
+    }
+
+    #[test]
+    fn test_encode_zero_residual() {
+        let encoder = RaBitQEncoder::<f32>::new(4, Dist::Euclidean, 42);
+        let vec = vec![1.0, 2.0, 3.0, 4.0];
+        let centroid = vec.clone();
+
+        let (_, dist, _) = encoder.encode_vector(&vec, &centroid);
+
+        assert_abs_diff_eq!(dist, 0.0, epsilon = 1e-5);
+    }
+}
