@@ -4,6 +4,7 @@ use ann_search_rs::*;
 use clap::Parser;
 use commons::*;
 use faer::Mat;
+use std::collections::HashSet;
 use std::time::Instant;
 use tempfile::TempDir;
 use thousands::*;
@@ -66,7 +67,7 @@ fn main() {
 
     println!("-----------------------------");
 
-    // Binary exhaustive benchmarks with reranking
+    // Binary exhaustive benchmarks
     let n_bits_values = [(256, "random"), (256, "itq"), (512, "random"), (512, "itq")];
     let rerank_factors = [5, 10, 20];
 
@@ -74,7 +75,7 @@ fn main() {
         let temp_dir = TempDir::new().unwrap();
 
         println!(
-            "Building binary exhaustive index with reranking (n_bits={}, init={})...",
+            "Building binary exhaustive index (n_bits={}, init={})...",
             n_bits, init
         );
         let start = Instant::now();
@@ -91,6 +92,36 @@ fn main() {
         let build_time = start.elapsed().as_secs_f64() * 1000.0;
         let index_size_mb = binary_idx.memory_usage_bytes() as f64 / (1024.0 * 1024.0);
 
+        // Query without reranking
+        println!(
+            "Querying binary exhaustive index (n_bits={}, init={}, no rerank)...",
+            n_bits, init
+        );
+        let start = Instant::now();
+        let (binary_neighbors, _) = query_exhaustive_index_binary(
+            query_data.as_ref(),
+            &binary_idx,
+            cli.k,
+            false,
+            None,
+            false,
+            false,
+        );
+        let query_time = start.elapsed().as_secs_f64() * 1000.0;
+
+        let recall = calculate_recall(&true_neighbors, &binary_neighbors, cli.k);
+
+        results.push(BenchmarkResultSize {
+            method: format!("ExhaustiveBinary-{}-{}_no_rr (query)", n_bits, init),
+            build_time_ms: build_time,
+            query_time_ms: query_time,
+            total_time_ms: build_time + query_time,
+            recall_at_k: recall,
+            mean_dist_err: f64::NAN,
+            index_size_mb,
+        });
+
+        // Query with reranking
         for &rerank_factor in &rerank_factors {
             println!(
                 "Querying binary exhaustive index (n_bits={}, init={}, rerank_factor={})...",
@@ -158,7 +189,7 @@ fn main() {
 
     println!("-----------------------------");
 
-    // IVF binary benchmarks with reranking
+    // IVF binary benchmarks
     let nlist_values = [
         (cli.n_cells as f32 * 0.5).sqrt() as usize,
         (cli.n_cells as f32).sqrt() as usize,
@@ -170,7 +201,7 @@ fn main() {
             let temp_dir = TempDir::new().unwrap();
 
             println!(
-                "Building IVF binary index with reranking (n_bits={}, nlist={}, init={})...",
+                "Building IVF binary index (n_bits={}, nlist={}, init={})...",
                 n_bits, nlist, init
             );
             let start = Instant::now();
@@ -193,14 +224,61 @@ fn main() {
             let nprobe_values = [
                 (nlist as f32).sqrt() as usize,
                 (nlist as f32 * 2.0).sqrt() as usize,
+                (0.05 * nlist as f32) as usize,
             ];
+            let mut nprobe_values: Vec<_> = nprobe_values
+                .into_iter()
+                .collect::<HashSet<_>>()
+                .into_iter()
+                .collect();
+            nprobe_values.sort();
 
-            for nprobe in nprobe_values {
-                if nprobe > nlist || nprobe == 0 {
+            // Query without reranking
+            for nprobe in &nprobe_values {
+                if *nprobe > nlist || *nprobe == 0 {
                     continue;
                 }
 
-                for &rerank_factor in &[5, 10, 20] {
+                println!(
+                    "Querying IVF binary index (n_bits={}, init={}, nlist={}, nprobe={}, no rerank)...",
+                    n_bits, init, nlist, nprobe
+                );
+                let start = Instant::now();
+                let (ivf_binary_neighbors, _) = query_ivf_index_binary(
+                    query_data.as_ref(),
+                    &ivf_binary_idx,
+                    cli.k,
+                    Some(*nprobe),
+                    false,
+                    None,
+                    false,
+                    false,
+                );
+                let query_time = start.elapsed().as_secs_f64() * 1000.0;
+
+                let recall = calculate_recall(&true_neighbors, &ivf_binary_neighbors, cli.k);
+
+                results.push(BenchmarkResultSize {
+                    method: format!(
+                        "IVF-Binary-{}-nl{}-np{}-rf0-{} (query)",
+                        n_bits, nlist, nprobe, init
+                    ),
+                    build_time_ms: build_time,
+                    query_time_ms: query_time,
+                    total_time_ms: build_time + query_time,
+                    recall_at_k: recall,
+                    mean_dist_err: f64::NAN,
+                    index_size_mb,
+                });
+            }
+
+            // Query with reranking
+            for nprobe in &nprobe_values {
+                if *nprobe > nlist || *nprobe == 0 {
+                    continue;
+                }
+
+                for &rerank_factor in &rerank_factors {
                     println!(
                         "Querying IVF binary index (n_bits={}, init={}, nlist={}, nprobe={}, rerank_factor={})...",
                         n_bits, init, nlist, nprobe, rerank_factor
@@ -210,7 +288,7 @@ fn main() {
                         query_data.as_ref(),
                         &ivf_binary_idx,
                         cli.k,
-                        Some(nprobe),
+                        Some(*nprobe),
                         true,
                         Some(rerank_factor),
                         true,
@@ -280,7 +358,7 @@ fn main() {
 
     print_results_size(
         &format!(
-            "{}k cells, {}D - Binary Quantisation with Reranking",
+            "{}k cells, {}D - Binary Quantisation",
             cli.n_cells / 1000,
             cli.dim
         ),

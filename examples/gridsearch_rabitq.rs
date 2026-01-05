@@ -217,7 +217,7 @@ fn main() {
             );
 
             results.push(BenchmarkResultSize {
-                method: format!("IVF-RaBitQ-nl{}-np{}_no_rr (query)", nlist, nprobe),
+                method: format!("IVF-RaBitQ-nl{}-np{}-rf0 (query)", nlist, nprobe),
                 build_time_ms: build_time,
                 query_time_ms: query_time,
                 total_time_ms: build_time + query_time,
