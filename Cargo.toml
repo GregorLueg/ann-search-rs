@@ -18,12 +18,14 @@ codegen-units = 1
 [features]
 gpu = ["cubecl"]
 quantised = ["half"]
+binary = []
 
 [dependencies]
 approx = "0.5.1"
 clap = { version = "4.5.53", features = ["derive"] }
 cubecl = { version = "0.8.1", features = ["wgpu"], optional = true }
 faer = "0.23.2"
+faer-traits = "0.23.2"
 fixedbitset = "0.5.7"
 half = { version = "2.7.1", optional = true }
 num-traits = "0.2.19"
@@ -49,3 +51,7 @@ required-features = ["quantised"]
 [[example]]
 name = "gridsearch_ivf_pq"
 required-features = ["quantised"]
+
+[[example]]
+name = "gridsearch_binary"
+required-features = ["binary"]

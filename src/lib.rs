@@ -6,7 +6,6 @@ pub mod hnsw;
 pub mod ivf;
 pub mod lsh;
 pub mod nndescent;
-
 pub mod utils;
 
 #[cfg(feature = "gpu")]
@@ -14,6 +13,9 @@ pub mod gpu;
 
 #[cfg(feature = "quantised")]
 pub mod quantised;
+
+#[cfg(feature = "binary")]
+pub mod binary;
 
 use faer::MatRef;
 use num_traits::{Float, FromPrimitive, ToPrimitive};
@@ -33,6 +35,9 @@ use cubecl::prelude::*;
 #[cfg(feature = "quantised")]
 use std::ops::AddAssign;
 
+#[cfg(feature = "binary")]
+use faer_traits::ComplexField;
+
 use crate::annoy::*;
 use crate::exhaustive::*;
 use crate::hnsw::*;
@@ -41,10 +46,12 @@ use crate::lsh::*;
 use crate::nndescent::*;
 use crate::utils::dist::*;
 
+#[cfg(feature = "binary")]
+use crate::binary::{exhaustive_binary::*, ivf_binary::*};
 #[cfg(feature = "gpu")]
 use crate::gpu::{exhaustive_gpu::*, ivf_gpu::*};
 #[cfg(feature = "quantised")]
-use crate::quantised::{ivf_bf16::*, ivf_opq::*, ivf_pq::*, ivf_sq8::*};
+use crate::quantised::{exhaustive_bf16::*, ivf_bf16::*, ivf_opq::*, ivf_pq::*, ivf_sq8::*};
 
 ////////////
 // Helper //
@@ -788,6 +795,97 @@ where
 // Quantised //
 ///////////////
 
+/////////////////////
+// Exhaustive-BF16 //
+/////////////////////
+
+#[cfg(feature = "quantised")]
+/// Build an Exhaustive-BF16 index
+///
+/// ### Params
+///
+/// * `mat` - The data matrix. Rows represent the samples, columns represent
+///   the embedding dimensions
+/// * `dist_metric` - Distance metric to use
+/// * `verbose` - Print progress information during index construction
+///
+/// ### Return
+///
+/// The `ExhaustiveIndexBf16`.
+pub fn build_exhaustive_bf16_index<T>(
+    mat: MatRef<T>,
+    dist_metric: &str,
+    verbose: bool,
+) -> ExhaustiveIndexBf16<T>
+where
+    T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum,
+{
+    let ann_dist = parse_ann_dist(dist_metric).unwrap_or_default();
+    if verbose {
+        println!(
+            "Building exhaustive BF16 index with {} samples",
+            mat.nrows()
+        );
+    }
+    ExhaustiveIndexBf16::new(mat, ann_dist)
+}
+
+#[cfg(feature = "quantised")]
+/// Helper function to query a given Exhaustive-BF16 index
+///
+/// ### Params
+///
+/// * `query_mat` - The query matrix containing the samples x features
+/// * `index` - Reference to the built Exhaustive-BF16 index
+/// * `k` - Number of neighbours to return
+/// * `return_dist` - Shall the distances be returned
+/// * `verbose` - Print progress information
+///
+/// ### Returns
+///
+/// A tuple of `(knn_indices, optional distances)`
+pub fn query_exhaustive_bf16_index<T>(
+    query_mat: MatRef<T>,
+    index: &ExhaustiveIndexBf16<T>,
+    k: usize,
+    return_dist: bool,
+    verbose: bool,
+) -> (Vec<Vec<usize>>, Option<Vec<Vec<T>>>)
+where
+    T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum,
+{
+    query_parallel(query_mat.nrows(), return_dist, verbose, |i| {
+        index.query_row(query_mat.row(i), k)
+    })
+}
+
+#[cfg(feature = "quantised")]
+/// Helper function to self query a given Exhaustive-BF16 index
+///
+/// This function will generate a full kNN graph based on the internal data.
+///
+/// ### Params
+///
+/// * `index` - Reference to the built Exhaustive-BF16 index
+/// * `k` - Number of neighbours to return
+/// * `return_dist` - Shall the distances be returned
+/// * `verbose` - Print progress information
+///
+/// ### Returns
+///
+/// A tuple of `(knn_indices, optional distances)`
+pub fn query_exhaustive_bf16_self<T>(
+    index: &ExhaustiveIndexBf16<T>,
+    k: usize,
+    return_dist: bool,
+    verbose: bool,
+) -> (Vec<Vec<usize>>, Option<Vec<Vec<T>>>)
+where
+    T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum,
+{
+    index.generate_knn(k, return_dist, verbose)
+}
+
 //////////////
 // IVF-BF16 //
 //////////////
@@ -1412,4 +1510,234 @@ where
     T: Float + Sum + cubecl::frontend::Float + cubecl::CubeElement + FromPrimitive + Send + Sync,
 {
     index.generate_knn(k, nprobe, return_dist, verbose)
+}
+
+////////////
+// Binary //
+////////////
+
+///////////////////////
+// Exhaustive Binary //
+///////////////////////
+
+#[cfg(feature = "binary")]
+/// Build an exhaustive binary index
+///
+/// This one can be only used for Cosine distance. There is no good hash
+/// function that translates Euclidean distance to Hamming distance!
+///
+/// ### Params
+///
+/// * `mat` - The initial matrix with samples x features
+/// * `n_bits` - Number of bits per binary code (must be multiple of 8)
+/// * `seed` - Random seed for binariser
+///
+/// ### Returns
+///
+/// The initialised `ExhaustiveIndexBinary`
+pub fn build_exhaustive_index_binary<T>(
+    mat: MatRef<T>,
+    n_bits: usize,
+    seed: usize,
+    binary_init: &str,
+) -> ExhaustiveIndexBinary<T>
+where
+    T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum + ComplexField,
+{
+    ExhaustiveIndexBinary::new(mat, binary_init, n_bits, seed)
+}
+
+#[cfg(feature = "binary")]
+/// Helper function to query a given exhaustive binary index
+///
+/// ### Params
+///
+/// * `query_mat` - The query matrix containing the samples × features
+/// * `index` - The exhaustive binary index
+/// * `k` - Number of neighbours to return
+/// * `return_dist` - Shall the distances be returned
+/// * `verbose` - Controls verbosity of the function
+///
+/// ### Returns
+///
+/// A tuple of `(knn_indices, optional distances)` where distances are Hamming distances
+pub fn query_exhaustive_index_binary<T>(
+    query_mat: MatRef<T>,
+    index: &ExhaustiveIndexBinary<T>,
+    k: usize,
+    return_dist: bool,
+    verbose: bool,
+) -> (Vec<Vec<usize>>, Option<Vec<Vec<u32>>>)
+where
+    T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum + ComplexField,
+{
+    query_parallel(query_mat.nrows(), return_dist, verbose, |i| {
+        index.query_row(query_mat.row(i), k)
+    })
+}
+
+#[cfg(feature = "binary")]
+/// Query an exhaustive binary index against itself
+///
+/// Generates a full kNN graph based on the internal data.
+///
+/// ### Params
+///
+/// * `data` - Original float data matrix [samples, features]
+/// * `index` - Reference to built index
+/// * `k` - Number of neighbours
+/// * `return_dist` - Return Hamming distances
+/// * `verbose` - Controls verbosity
+///
+/// ### Returns
+///
+/// Tuple of (indices, optional Hamming distances)
+pub fn query_exhaustive_index_binary_self<T>(
+    data: MatRef<T>,
+    index: &ExhaustiveIndexBinary<T>,
+    k: usize,
+    return_dist: bool,
+    verbose: bool,
+) -> (Vec<Vec<usize>>, Option<Vec<Vec<u32>>>)
+where
+    T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum + ComplexField,
+{
+    index.generate_knn(data, k, return_dist, verbose)
+}
+
+////////////////
+// IVF Binary //
+////////////////
+
+#[cfg(feature = "binary")]
+/// Build an IVF index with binary quantisation
+///
+/// ### Params
+///
+/// * `mat` - Data matrix [samples, features]
+/// * `binarisation_init` - "itq" or "random"
+/// * `n_bits` - Number of bits per code (multiple of 8)
+/// * `nlist` - Number of clusters (defaults to √n)
+/// * `max_iters` - K-means iterations (defaults to 30)
+/// * `dist_metric` - "euclidean" or "cosine"
+/// * `seed` - Random seed
+/// * `verbose` - Print progress
+///
+/// ### Returns
+///
+/// Built IVF binary index
+#[allow(clippy::too_many_arguments)]
+pub fn build_ivf_index_binary<T>(
+    mat: MatRef<T>,
+    binarisation_init: &str,
+    n_bits: usize,
+    nlist: Option<usize>,
+    max_iters: Option<usize>,
+    dist_metric: &str,
+    seed: usize,
+    verbose: bool,
+) -> IvfIndexBinary<T>
+where
+    T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum + ComplexField,
+{
+    let ann_dist = parse_ann_dist(dist_metric).unwrap_or_default();
+    IvfIndexBinary::build(
+        mat,
+        binarisation_init,
+        n_bits,
+        ann_dist,
+        nlist,
+        max_iters,
+        seed,
+        verbose,
+    )
+}
+
+#[cfg(feature = "binary")]
+/// Query an IVF binary index
+///
+/// ### Params
+///
+/// * `query_mat` - Query matrix [samples, features]
+/// * `index` - Reference to built index
+/// * `k` - Number of neighbours
+/// * `nprobe` - Clusters to search (defaults to √nlist)
+/// * `return_dist` - Return Hamming distances
+/// * `verbose` - Controls verbosity
+///
+/// ### Returns
+///
+/// Tuple of (indices, optional Hamming distances)
+pub fn query_ivf_index_binary<T>(
+    query_mat: MatRef<T>,
+    index: &IvfIndexBinary<T>,
+    k: usize,
+    nprobe: Option<usize>,
+    return_dist: bool,
+    verbose: bool,
+) -> (Vec<Vec<usize>>, Option<Vec<Vec<u32>>>)
+where
+    T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum + ComplexField,
+{
+    let counter = Arc::new(AtomicUsize::new(0));
+    let n_queries = query_mat.nrows();
+
+    let results: Vec<(Vec<usize>, Vec<u32>)> = (0..n_queries)
+        .into_par_iter()
+        .map(|i| {
+            let query_vec: Vec<T> = query_mat.row(i).iter().cloned().collect();
+
+            if verbose {
+                let count = counter.fetch_add(1, Ordering::Relaxed) + 1;
+                if count % 100_000 == 0 {
+                    println!(
+                        "  Processed {} / {} queries.",
+                        count.separate_with_underscores(),
+                        n_queries.separate_with_underscores()
+                    );
+                }
+            }
+
+            index.query(&query_vec, k, nprobe)
+        })
+        .collect();
+
+    if return_dist {
+        let (indices, distances) = results.into_iter().unzip();
+        (indices, Some(distances))
+    } else {
+        let indices: Vec<Vec<usize>> = results.into_iter().map(|(idx, _)| idx).collect();
+        (indices, None)
+    }
+}
+
+#[cfg(feature = "binary")]
+/// Query an IVF binary index against itself
+///
+/// Generates a full kNN graph based on the internal data.
+///
+/// ### Params
+///
+/// * `data` - Original float data matrix [samples, features]
+/// * `index` - Reference to built index
+/// * `k` - Number of neighbours
+/// * `nprobe` - Clusters to search (defaults to √nlist)
+/// * `return_dist` - Return Hamming distances
+/// * `verbose` - Controls verbosity
+///
+/// ### Returns
+///
+/// Tuple of (indices, optional Hamming distances)
+pub fn query_ivf_index_binary_self<T>(
+    data: MatRef<T>,
+    index: &IvfIndexBinary<T>,
+    k: usize,
+    nprobe: Option<usize>,
+    return_dist: bool,
+    verbose: bool,
+) -> (Vec<Vec<usize>>, Option<Vec<Vec<u32>>>)
+where
+    T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum + ComplexField,
+{
+    index.generate_knn(data, k, nprobe, return_dist, verbose)
 }

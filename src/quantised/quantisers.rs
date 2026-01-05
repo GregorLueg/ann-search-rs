@@ -103,7 +103,7 @@ pub struct ScalarQuantiser<T> {
 
 impl<T> ScalarQuantiser<T>
 where
-    T: Float + FromPrimitive + ToPrimitive,
+    T: Float + FromPrimitive + ToPrimitive + Send + Sync,
 {
     /// Train the scalar quantiser on a flat vector
     ///
@@ -116,21 +116,21 @@ where
     ///
     /// Initialised self
     pub fn train(vec: &[T], dim: usize) -> Self {
-        let mut scales = vec![T::zero(); dim];
-
-        for chunk in vec.chunks_exact(dim) {
-            for (d, &val) in chunk.iter().enumerate() {
-                scales[d] = scales[d].max(val.abs());
-            }
-        }
-
-        for scale in &mut scales {
-            if *scale <= T::zero() {
-                *scale = T::one();
-            } else {
-                *scale = *scale / T::from_i8(127).unwrap();
-            }
-        }
+        let scales = (0..dim)
+            .into_par_iter()
+            .map(|d| {
+                vec.chunks_exact(dim)
+                    .map(|chunk| chunk[d].abs())
+                    .fold(T::zero(), |max, val| max.max(val))
+            })
+            .map(|scale| {
+                if scale <= T::zero() {
+                    T::one()
+                } else {
+                    scale / T::from_f32(128.0).unwrap()
+                }
+            })
+            .collect();
 
         Self { scales }
     }
@@ -149,9 +149,10 @@ where
             .enumerate()
             .map(|(d, &val)| {
                 let scaled = val / self.scales[d];
-                let clamped = scaled
+                let rounded = scaled + T::from_f32(0.5).unwrap() * scaled.signum();
+                let clamped = rounded
                     .min(T::from_i8(127).unwrap())
-                    .max(T::from_i8(-127).unwrap());
+                    .max(T::from_i8(-128).unwrap());
                 clamped.to_i8().unwrap_or(0)
             })
             .collect()
@@ -780,6 +781,106 @@ mod tests {
     use approx::assert_relative_eq;
 
     #[test]
+    fn test_encode_bf16_empty() {
+        let data: Vec<f32> = vec![];
+        let encoded = encode_bf16_quantisation(&data);
+        assert!(encoded.is_empty());
+    }
+
+    #[test]
+    fn test_encode_bf16_single_value() {
+        let data = vec![1.5_f32];
+        let encoded = encode_bf16_quantisation(&data);
+        assert_eq!(encoded.len(), 1);
+        assert!((encoded[0].to_f32() - 1.5).abs() < 0.01);
+    }
+
+    #[test]
+    fn test_encode_bf16_multiple_values() {
+        let data = vec![1.0_f32, 2.0, 3.0, 4.0];
+        let encoded = encode_bf16_quantisation(&data);
+        assert_eq!(encoded.len(), 4);
+
+        for (i, &val) in data.iter().enumerate() {
+            assert!((encoded[i].to_f32() - val).abs() < 0.01);
+        }
+    }
+
+    #[test]
+    fn test_decode_bf16_empty() {
+        let data: Vec<bf16> = vec![];
+        let decoded = decode_bf16_quantisation::<f32>(&data);
+        assert!(decoded.is_empty());
+    }
+
+    #[test]
+    fn test_decode_bf16_single_value() {
+        let data = vec![bf16::from_f32(1.5)];
+        let decoded = decode_bf16_quantisation::<f32>(&data);
+        assert_eq!(decoded.len(), 1);
+        assert!((decoded[0] - 1.5).abs() < 0.01);
+    }
+
+    #[test]
+    fn test_encode_decode_roundtrip() {
+        let original = vec![1.0_f32, -2.5, 3.7, 0.0, 100.5];
+        let encoded = encode_bf16_quantisation(&original);
+        let decoded = decode_bf16_quantisation::<f32>(&encoded);
+
+        assert_eq!(original.len(), decoded.len());
+        for (orig, dec) in original.iter().zip(decoded.iter()) {
+            assert!((orig - dec).abs() < 0.1);
+        }
+    }
+
+    #[test]
+    fn test_bf16_norm_empty() {
+        let data: Vec<bf16> = vec![];
+        let norm = bf16_norm::<f32>(&data);
+        assert_eq!(norm, 0.0);
+    }
+
+    #[test]
+    fn test_bf16_norm_single_value() {
+        let data = vec![bf16::from_f32(3.0)];
+        let norm = bf16_norm::<f32>(&data);
+        assert!((norm - 3.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn test_bf16_norm_vector() {
+        let data = vec![bf16::from_f32(3.0), bf16::from_f32(4.0)];
+        let norm = bf16_norm::<f32>(&data);
+        assert!((norm - 5.0).abs() < 0.1);
+    }
+
+    #[test]
+    fn test_bf16_norm_larger_vector() {
+        let values = [1.0, 2.0, 2.0];
+        let data: Vec<bf16> = values.iter().map(|&v| bf16::from_f32(v)).collect();
+        let norm = bf16_norm::<f32>(&data);
+        let expected = (1.0_f32 + 4.0 + 4.0).sqrt();
+        assert!((norm - expected).abs() < 0.1);
+    }
+
+    #[test]
+    fn test_bf16_quantisation_preserves_sign() {
+        let data = vec![-1.0_f32, -2.0, -3.0];
+        let encoded = encode_bf16_quantisation(&data);
+
+        for enc in encoded.iter() {
+            assert!(enc.to_f32().unwrap() < 0.0);
+        }
+    }
+
+    #[test]
+    fn test_bf16_quantisation_zero() {
+        let data = vec![0.0_f32];
+        let encoded = encode_bf16_quantisation(&data);
+        assert_eq!(encoded[0].to_f32(), 0.0);
+    }
+
+    #[test]
     fn test_scalar_quantiser_train() {
         let mut data = Vec::new();
         for i in 0..4 {
@@ -825,7 +926,7 @@ mod tests {
         let encoded = sq.encode(&vec);
 
         assert_eq!(encoded[0], 127);
-        assert_eq!(encoded[1], -127);
+        assert_eq!(encoded[1], -128);
     }
 
     #[test]
