@@ -112,3 +112,40 @@ impl<R: Runtime, F: Float + CubeElement> GpuTensor<R, F> {
         F::from_bytes(&bytes).to_vec()
     }
 }
+
+///////////
+// Tests //
+///////////
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use cubecl::cpu::CpuDevice;
+    use cubecl::cpu::CpuRuntime;
+
+    #[test]
+    fn test_tensor_from_slice_and_read() {
+        let device = CpuDevice;
+        let client = CpuRuntime::client(&device);
+
+        let data: Vec<f32> = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0];
+        let shape = vec![2, 3];
+
+        let tensor = GpuTensor::<CpuRuntime, f32>::from_slice(&data, shape, &client);
+        let result = tensor.read(&client);
+
+        assert_eq!(result, data);
+    }
+
+    #[test]
+    fn test_tensor_empty() {
+        let device = CpuDevice;
+        let client = CpuRuntime::client(&device);
+
+        let shape = vec![3, 4];
+        let tensor = GpuTensor::<CpuRuntime, f32>::empty(shape.clone(), &client);
+
+        assert_eq!(tensor.shape, shape);
+        assert_eq!(tensor.strides, vec![4, 1]);
+    }
+}

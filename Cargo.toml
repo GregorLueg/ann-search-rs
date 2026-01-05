@@ -23,7 +23,7 @@ quantised = ["half"]
 [dependencies]
 approx = "0.5.1"
 clap = { version = "4.5.53", features = ["derive"] }
-cubecl = { version = "0.8.1", features = ["wgpu"], optional = true }
+cubecl = { version = "0.8.1", features = ["wgpu", "cpu"], optional = true }
 faer = "0.23.2"
 faer-traits = "0.23.2"
 fixedbitset = "0.5.7"

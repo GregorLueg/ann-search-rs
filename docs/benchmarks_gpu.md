@@ -232,4 +232,4 @@ IVF-GPU-nl547 (self)                              19279.11      6307.14     2558
 --------------------------------------------------------------------------------------------------------------
 ```
 
-All benchmarks were run on M1 Max MacBook Pro with 64 GB unified memory.
+*All benchmarks were run on M1 Max MacBook Pro with 64 GB unified memory.*
