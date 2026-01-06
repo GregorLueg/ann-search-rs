@@ -678,6 +678,38 @@ where
     (sampled, indices)
 }
 
+/// Print summary statistics of cluster assignments
+///
+/// ### Params
+///
+/// * `assignments` - Cluster assignment for each vector
+/// * `nlist` - Number of clusters
+pub fn print_cluster_summary(assignments: &[usize], nlist: usize) {
+    let mut counts = vec![0usize; nlist];
+    for &cluster in assignments {
+        counts[cluster] += 1;
+    }
+
+    counts.sort_unstable();
+
+    let n = assignments.len();
+    let min = counts[0];
+    let max = counts[nlist - 1];
+    let p25 = counts[nlist / 4];
+    let p50 = counts[nlist / 2];
+    let p75 = counts[3 * nlist / 4];
+    let mean = n / nlist;
+
+    println!("Cluster size distribution:");
+    println!("  Min:    {}", min);
+    println!("  P25:    {}", p25);
+    println!("  Median: {}", p50);
+    println!("  P75:    {}", p75);
+    println!("  Max:    {}", max);
+    println!("  Mean:   {}", mean);
+    println!("  Imbalance ratio: {:.2}", max as f64 / mean as f64);
+}
+
 ///////////
 // Tests //
 ///////////

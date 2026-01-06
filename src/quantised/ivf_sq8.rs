@@ -221,6 +221,11 @@ where
             nlist,
             &metric,
         );
+
+        if verbose {
+            print_cluster_summary(&assignments, nlist);
+        }
+
         let (all_indices, offsets) = build_csr_layout(assignments, n, nlist);
 
         // 5. quantise all vectors with global codebook

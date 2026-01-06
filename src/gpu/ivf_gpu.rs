@@ -14,7 +14,7 @@ use crate::utils::ivf_utils::*;
 use crate::utils::*;
 
 /// To not explode memory VRAM memory
-const IVF_GPU_QUERY_BATCH_SIZE: usize = 250_000;
+const IVF_GPU_QUERY_BATCH_SIZE: usize = 100_000;
 
 /// Batched IVF index with GPU acceleration
 ///
@@ -171,6 +171,10 @@ where
             &metric,
         );
 
+        if verbose {
+            print_cluster_summary(&assignments, nlist);
+        }
+
         // reorganise vectors by cluster
         let (vectors_by_cluster, original_indices, cluster_offsets, norms_by_cluster) =
             reorganise_by_cluster(&vectors_flat, dim, n, &assignments, nlist, &metric);
@@ -222,11 +226,14 @@ where
     /// * `dim_query` - The dimensions
     /// * `k` - Number of neighbours per query
     /// * `nprobe` - Number of clusters to search (defaults to √nlist)
+    /// * `nquery` - Number of vectors to load in one go into the GPU. If not
+    ///   provided, it will default to `100_000`.
     /// * `verbose` - Controls the verbosity of the function
     ///
     /// ### Returns
     ///
     /// Tuple of `(Vec<indices>, Vec<dist>)` for the queries.
+    #[allow(clippy::too_many_arguments)]
     fn query_internal(
         &self,
         queries_flat: &[T],
@@ -234,6 +241,7 @@ where
         dim_query: usize,
         k: usize,
         nprobe: Option<usize>,
+        nquery: Option<usize>,
         verbose: bool,
     ) -> (Vec<Vec<usize>>, Vec<Vec<T>>) {
         assert_eq!(
@@ -245,9 +253,10 @@ where
         let nprobe = nprobe
             .unwrap_or_else(|| ((self.nlist as f64).sqrt() as usize).max(1))
             .min(self.nlist);
+        let nquery = nquery.unwrap_or(IVF_GPU_QUERY_BATCH_SIZE);
         let k = k.min(self.n);
 
-        let n_batches = n_queries.div_ceil(IVF_GPU_QUERY_BATCH_SIZE);
+        let n_batches = n_queries.div_ceil(nquery);
 
         if n_batches == 1 {
             // Small enough to process in one go
@@ -263,12 +272,12 @@ where
                     "Processing query batch {}/{} ({} queries per batch)",
                     batch_idx + 1,
                     n_batches,
-                    IVF_GPU_QUERY_BATCH_SIZE
+                    nquery
                 );
             }
 
-            let batch_start = batch_idx * IVF_GPU_QUERY_BATCH_SIZE;
-            let batch_end = (batch_start + IVF_GPU_QUERY_BATCH_SIZE).min(n_queries);
+            let batch_start = batch_idx * nquery;
+            let batch_end = (batch_start + nquery).min(n_queries);
             let batch_size = batch_end - batch_start;
 
             let batch_queries = &queries_flat[batch_start * self.dim..batch_end * self.dim];
@@ -290,6 +299,9 @@ where
     /// * `query_mat` - Query vectors [n_queries, dim]
     /// * `k` - Number of neighbours per query
     /// * `nprobe` - Number of clusters to search (defaults to √nlist)
+    /// * `nquery` - Number of vectors to load in one go into the GPU. If not
+    ///   provided, it will default to `100_000`.
+    /// * `verbose` - Controls verbosity of the function.
     ///
     /// ### Returns
     ///
@@ -299,11 +311,20 @@ where
         query_mat: MatRef<T>,
         k: usize,
         nprobe: Option<usize>,
+        nquery: Option<usize>,
         verbose: bool,
     ) -> (Vec<Vec<usize>>, Vec<Vec<T>>) {
         let (queries_flat, n_queries, dim_query) = matrix_to_flat(query_mat);
 
-        self.query_internal(&queries_flat, n_queries, dim_query, k, nprobe, verbose)
+        self.query_internal(
+            &queries_flat,
+            n_queries,
+            dim_query,
+            k,
+            nprobe,
+            nquery,
+            verbose,
+        )
     }
 
     /// Generate kNN graph from vectors stored in the index
@@ -315,6 +336,8 @@ where
     ///
     /// * `k` - Number of neighbours per vector
     /// * `return_dist` - Whether to return distances
+    /// * `nprobe` - Number of centroids to check.
+    /// * `nquery` - Number of queries to load into the GPU.
     /// * `verbose` - Controls verbosity
     ///
     /// ### Returns
@@ -325,6 +348,7 @@ where
         &self,
         k: usize,
         nprobe: Option<usize>,
+        nquery: Option<usize>,
         return_dist: bool,
         verbose: bool,
     ) -> (Vec<Vec<usize>>, Option<Vec<Vec<T>>>) {
@@ -334,6 +358,7 @@ where
             self.dim,
             k,
             nprobe,
+            nquery,
             verbose,
         );
 
@@ -846,7 +871,7 @@ mod tests {
 
         let query = Mat::from_fn(3, 4, |i, j| if i == j { 1.0_f32 } else { 0.0_f32 });
 
-        let (indices, distances) = index.query_batch(query.as_ref(), 5, Some(3), false);
+        let (indices, distances) = index.query_batch(query.as_ref(), 5, Some(3), None, false);
 
         assert_eq!(indices.len(), 3);
         assert_eq!(distances.len(), 3);
@@ -870,7 +895,7 @@ mod tests {
         );
 
         let query = Mat::from_fn(2, 4, |_, _| 1.0_f32);
-        let (indices, distances) = index.query_batch(query.as_ref(), 3, Some(2), false);
+        let (indices, distances) = index.query_batch(query.as_ref(), 3, Some(2), None, false);
 
         assert_eq!(indices.len(), 2);
         assert_eq!(indices[0].len(), 3);
@@ -893,7 +918,7 @@ mod tests {
             device,
         );
 
-        let (indices, distances) = index.generate_knn(4, Some(3), true, false);
+        let (indices, distances) = index.generate_knn(4, Some(3), None, true, false);
 
         assert_eq!(indices.len(), 30);
         assert!(distances.is_some());

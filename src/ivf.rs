@@ -222,6 +222,10 @@ where
             &metric,
         );
 
+        if verbose {
+            print_cluster_summary(&assignments, nlist);
+        }
+
         // 4. generate a flat version for better cache locality
         let (all_indices, offsets) = build_csr_layout(assignments, n, nlist);
 

@@ -259,6 +259,11 @@ where
             nlist,
             &metric,
         );
+
+        if verbose {
+            print_cluster_summary(&assignments, nlist);
+        }
+
         let (all_indices, offsets) = build_csr_layout(assignments.clone(), n, nlist);
 
         // 6. encode all vectors with product quantiser

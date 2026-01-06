@@ -1546,6 +1546,7 @@ where
 /// * `index` - Reference to built index
 /// * `k` - Number of neighbours
 /// * `nprobe` - Clusters to search (defaults to √nlist)
+/// * `nquery` - Number of queries to load into the GPU.
 /// * `return_dist` - Return distances
 /// * `verbose` - Controls verbosity of the function
 ///
@@ -1557,6 +1558,7 @@ pub fn query_ivf_index_gpu<T, R>(
     index: &IvfIndexGpu<T, R>,
     k: usize,
     nprobe: Option<usize>,
+    nquery: Option<usize>,
     return_dist: bool,
     verbose: bool,
 ) -> (Vec<Vec<usize>>, Option<Vec<Vec<T>>>)
@@ -1564,7 +1566,7 @@ where
     R: Runtime,
     T: Float + Sum + cubecl::frontend::Float + cubecl::CubeElement + FromPrimitive + Send + Sync,
 {
-    let (indices, distances) = index.query_batch(query_mat, k, nprobe, verbose);
+    let (indices, distances) = index.query_batch(query_mat, k, nprobe, nquery, verbose);
 
     if return_dist {
         (indices, Some(distances))
@@ -1584,6 +1586,7 @@ where
 /// * `index` - Reference to built index
 /// * `k` - Number of neighbours
 /// * `nprobe` - Clusters to search (defaults to √nlist)
+/// * `nquery` - Number of queries to load into the GPU.
 /// * `return_dist` - Return distances
 /// * `verbose` - Controls verbosity of the function
 ///
@@ -1594,6 +1597,7 @@ pub fn query_ivf_index_gpu_self<T, R>(
     index: &IvfIndexGpu<T, R>,
     k: usize,
     nprobe: Option<usize>,
+    nquery: Option<usize>,
     return_dist: bool,
     verbose: bool,
 ) -> (Vec<Vec<usize>>, Option<Vec<Vec<T>>>)
@@ -1601,7 +1605,7 @@ where
     R: Runtime,
     T: Float + Sum + cubecl::frontend::Float + cubecl::CubeElement + FromPrimitive + Send + Sync,
 {
-    index.generate_knn(k, nprobe, return_dist, verbose)
+    index.generate_knn(k, nprobe, nquery, return_dist, verbose)
 }
 
 ////////////
