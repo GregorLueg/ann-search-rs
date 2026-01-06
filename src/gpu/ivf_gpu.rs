@@ -2,7 +2,6 @@ use cubecl::prelude::*;
 use faer::MatRef;
 use num_traits::{Float, FromPrimitive};
 use rayon::prelude::*;
-use std::collections::BinaryHeap;
 use std::iter::Sum;
 use thousands::*;
 
@@ -440,15 +439,15 @@ where
         let vec_size = LINE_SIZE as u8;
         let client = R::client(&self.device);
 
-        // Compute query norms for cosine
+        // Compute query norms for cosine (SIMD-friendly chunking)
         let query_norms = if self.metric == Dist::Cosine {
             (0..n_queries)
                 .into_par_iter()
                 .map(|i| {
                     let start = i * self.dim;
                     queries_flat[start..start + self.dim]
-                        .iter()
-                        .map(|&x| x * x)
+                        .chunks(8)
+                        .map(|chunk| chunk.iter().map(|&x| x * x).sum::<T>())
                         .sum::<T>()
                         .sqrt()
                 })
@@ -508,7 +507,7 @@ where
 
         let centroid_dists = centroid_dists_gpu.read(&client);
 
-        // Phase 2: select top nprobe clusters per query (CPU, parallel)
+        // Point 1: Partial sort - O(n) vs O(n log n)
         let probe_lists: Vec<Vec<usize>> = (0..n_queries)
             .into_par_iter()
             .map(|q| {
@@ -516,23 +515,35 @@ where
                 let mut cluster_dists: Vec<(T, usize)> = (0..self.nlist)
                     .map(|c| (centroid_dists[row_start + c], c))
                     .collect();
-                cluster_dists.sort_unstable_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
-                cluster_dists
-                    .into_iter()
-                    .take(nprobe)
-                    .map(|(_, c)| c)
-                    .collect()
+
+                if nprobe < self.nlist {
+                    cluster_dists
+                        .select_nth_unstable_by(nprobe - 1, |a, b| a.0.partial_cmp(&b.0).unwrap());
+                    cluster_dists.truncate(nprobe);
+                }
+
+                cluster_dists.into_iter().map(|(_, c)| c).collect()
             })
             .collect();
 
         // Invert: for each cluster, which queries probe it?
         let cluster_to_queries = invert_probe_lists(&probe_lists, self.nlist);
 
-        // Phase 3: per-cluster batched search with double buffering
-        let mut heaps: Vec<BinaryHeap<(OrderedFloat<T>, usize)>> =
-            vec![BinaryHeap::with_capacity(k + 1); n_queries];
+        // Point 5: Use SortedBuffer instead of BinaryHeap
+        let mut buffers: Vec<SortedBuffer<(OrderedFloat<T>, usize)>> = (0..n_queries)
+            .map(|_| SortedBuffer::with_capacity(k + 1))
+            .collect();
 
-        // Pending work: (distances_gpu, cluster_idx, query_indices)
+        // Point 2: Pre-allocate gather buffers outside the loop
+        let max_probing = cluster_to_queries
+            .iter()
+            .map(|v| v.len())
+            .max()
+            .unwrap_or(0);
+        let mut gathered_queries = Vec::with_capacity(max_probing * self.dim);
+        let mut gathered_norms = Vec::with_capacity(max_probing);
+
+        // Pending work for double buffering
         let mut pending: Option<(GpuTensor<R, T>, usize, Vec<usize>)> = None;
 
         for cluster_idx in 0..self.nlist {
@@ -555,9 +566,9 @@ where
 
             let n_probing = query_indices.len();
 
-            // Gather queries that probe this cluster
-            let mut gathered_queries = Vec::with_capacity(n_probing * self.dim);
-            let mut gathered_norms = Vec::with_capacity(n_probing);
+            // Point 2: Clear and reuse pre-allocated buffers
+            gathered_queries.clear();
+            gathered_norms.clear();
 
             for &q_idx in query_indices {
                 let start = q_idx * self.dim;
@@ -637,14 +648,14 @@ where
             // Process previous cluster's results while GPU computes current
             if let Some((prev_dists_gpu, prev_cluster_idx, prev_query_indices)) = pending.take() {
                 let dists = prev_dists_gpu.read(&client);
-                process_cluster_results(
+                process_cluster_results_sorted(
                     &dists,
                     &prev_query_indices,
                     prev_cluster_idx,
                     &self.original_indices,
                     &self.cluster_offsets,
                     k,
-                    &mut heaps,
+                    &mut buffers,
                 );
             }
 
@@ -654,29 +665,24 @@ where
         // Process final cluster
         if let Some((prev_dists_gpu, prev_cluster_idx, prev_query_indices)) = pending {
             let dists = prev_dists_gpu.read(&client);
-            process_cluster_results(
+            process_cluster_results_sorted(
                 &dists,
                 &prev_query_indices,
                 prev_cluster_idx,
                 &self.original_indices,
                 &self.cluster_offsets,
                 k,
-                &mut heaps,
+                &mut buffers,
             );
         }
 
-        // Extract results from heaps (parallel)
-        let results: Vec<_> = heaps
+        // Extract results from sorted buffers
+        let results: Vec<_> = buffers
             .into_par_iter()
-            .map(|heap| {
-                let mut sorted: Vec<_> = heap.into_iter().collect();
-                sorted.sort_unstable_by_key(|&(d, _)| d);
-
-                let (distances, indices): (Vec<_>, Vec<_>) = sorted
-                    .into_iter()
-                    .map(|(OrderedFloat(d), idx)| (d, idx))
-                    .unzip();
-
+            .map(|buffer| {
+                let data = buffer.data();
+                let indices: Vec<usize> = data.iter().map(|(_, idx)| *idx).collect();
+                let distances: Vec<T> = data.iter().map(|(OrderedFloat(d), _)| *d).collect();
                 (indices, distances)
             })
             .collect();
@@ -781,48 +787,29 @@ fn invert_probe_lists(probe_lists: &[Vec<usize>], nlist: usize) -> Vec<Vec<usize
     result
 }
 
-/// Process cluster search results and update per-query heaps
-///
-/// Takes distance matrix from a batched cluster search and updates the
-/// k-NN heaps for each query. Only retains the k closest neighbours seen
-/// so far across all processed clusters.
-///
-/// ### Params
-///
-/// * `distances` - Distance matrix [n_queries, cluster_size]
-/// * `query_indices` - Global query indices for this batch
-/// * `cluster_idx` - Index of the cluster being processed
-/// * `original_indices` - Maps reorganised position -> original database index
-/// * `cluster_offsets` - CSR offsets for clusters
-/// * `k` - Number of neighbours to retain
-/// * `heaps` - Per-query max-heaps storing current k-NN candidates
-fn process_cluster_results<T: Float>(
+/// Process cluster search results and update per-query sorted buffers
+fn process_cluster_results_sorted<T: Float>(
     distances: &[T],
     query_indices: &[usize],
     cluster_idx: usize,
     original_indices: &[usize],
     cluster_offsets: &[usize],
     k: usize,
-    heaps: &mut [BinaryHeap<(OrderedFloat<T>, usize)>],
+    buffers: &mut [SortedBuffer<(OrderedFloat<T>, usize)>],
 ) {
     let cluster_start = cluster_offsets[cluster_idx];
     let cluster_end = cluster_offsets[cluster_idx + 1];
     let cluster_size = cluster_end - cluster_start;
 
     for (local_q, &global_q) in query_indices.iter().enumerate() {
-        let heap = &mut heaps[global_q];
+        let buffer = &mut buffers[global_q];
         let row_start = local_q * cluster_size;
 
         for i in 0..cluster_size {
             let dist = distances[row_start + i];
             let original_idx = original_indices[cluster_start + i];
 
-            if heap.len() < k {
-                heap.push((OrderedFloat(dist), original_idx));
-            } else if dist < heap.peek().unwrap().0 .0 {
-                heap.pop();
-                heap.push((OrderedFloat(dist), original_idx));
-            }
+            buffer.insert((OrderedFloat(dist), original_idx), k);
         }
     }
 }
