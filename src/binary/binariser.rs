@@ -12,6 +12,7 @@ use rand_distr::StandardNormal;
 ///////////////
 
 const MAX_SAMPLES_PCA: usize = 100_000;
+const ITQ_ITERATIONS: usize = 10;
 
 /// Initialisation of the binariser
 #[derive(Default)]
@@ -43,15 +44,13 @@ pub fn parse_binarisation_init(s: &str) -> Option<BinarisationInit> {
 /// Binariser using random hyperplane projections
 ///
 /// Converts float vectors to binary codes using locality-sensitive hashing.
-/// Supports SimHash (for Cosine similarity) and E2LSH (for Euclidean distance).
 ///
 /// ### Fields
 ///
-/// * `random_projections` - Random vectors from N(0,1), flattened (n_bits *
+/// * `projections` - Random or learned projection vectors, flattened (n_bits *
 ///   dim)
-/// * `random_offsets` - Random offsets for E2LSH (None for SimHash)
-/// * `bucket_width` - Bucket width for E2LSH (None for SimHash)
 /// * `n_bits` - Number of bits in binary code (e.g., 256, 512)
+/// * `mean` - Mean vector for centering (used when initialised with PCA)
 /// * `dim` - Input vector dimensionality
 pub struct Binariser<T> {
     pub projections: Vec<T>,
@@ -64,24 +63,21 @@ impl<T> Binariser<T>
 where
     T: Float + FromPrimitive + ToPrimitive + ComplexField,
 {
-    /// Create a new binariser
+    /// Create a new binariser using random projections
     ///
-    /// Generates random projections and initialises hash function parameters.
-    /// SimHash orthogonalises projections for better quality.
+    /// Generates random orthogonalised projections for binary encoding.
     ///
     /// ### Params
     ///
     /// * `dim` - Input vector dimensionality
     /// * `n_bits` - Number of bits in output (must be multiple of 8)
-    /// * `bucket_width` - Bucket width for E2LSH (ignored for SimHash, defaults to 4.0 if None)
-    /// * `hash_func` - Hash function type (SimHash or E2LSH)
     /// * `seed` - Random seed for reproducibility
     ///
     /// ### Returns
     ///
     /// Initialised binariser
     pub fn new(dim: usize, n_bits: usize, seed: usize) -> Self {
-        assert!(n_bits % 8 == 0, "n_bits must be multiple of 8");
+        assert!(n_bits.is_multiple_of(8), "n_bits must be multiple of 8");
 
         let mut binariser = Binariser {
             projections: Vec::new(),
@@ -97,10 +93,10 @@ where
 
     /// Initialise binariser using PCA followed by ITQ rotation
     ///
-    /// Uses Principal Component Analysis to find the directions of maximum variance,
-    /// then applies Iterative Quantisation (ITQ) to rotate these components for
-    /// optimal binary quantisation. This typically produces better quality codes
-    /// than random projections.
+    /// Uses Principal Component Analysis to find the directions of maximum
+    /// variance, then applies Iterative Quantisation (ITQ) to rotate these
+    /// components for optimal binary quantisation. This typically produces
+    /// better quality codes than random projections.
     ///
     /// ### Params
     ///
@@ -113,7 +109,7 @@ where
     ///
     /// Initialised binariser with PCA+ITQ projections
     pub fn initialise_with_pca(data: MatRef<T>, dim: usize, n_bits: usize, seed: usize) -> Self {
-        assert!(n_bits % 8 == 0, "n_bits must be multiple of 8");
+        assert!(n_bits.is_multiple_of(8), "n_bits must be multiple of 8");
 
         let mut binariser = Binariser {
             projections: Vec::new(),
@@ -122,15 +118,15 @@ where
             mean: vec![T::zero(); dim],
         };
 
-        binariser.prepare_pca_with_itq(data, seed, 10);
+        binariser.prepare_pca_with_itq(data, seed, ITQ_ITERATIONS);
 
         binariser
     }
 
     /// Encode a vector to binary
     ///
-    /// Computes hash code by projecting onto random vectors and quantising.
-    /// Uses different schemes based on initialised hash function.
+    /// Projects the input vector onto learned or random hyperplanes and
+    /// quantises the result to a binary code.
     ///
     /// ### Params
     ///
@@ -174,7 +170,7 @@ where
         total
     }
 
-    /// Generate random projections and orthogonalise them for SimHash
+    /// Generate random projections and orthogonalise them
     ///
     /// Creates orthonormal random hyperplanes for better hash quality.
     /// Orthogonalisation via Gram-Schmidt ensures projections are independent.
@@ -240,49 +236,32 @@ where
         self.projections = random_projections;
     }
 
-    /// Prepare PCA projections with ITQ rotation for optimal binary quantisation
+    /// Initialise binariser using PCA followed by optimised Tiled-ITQ
     ///
-    /// Implements the algorithm from "Iterative Quantization: A Procrustean
-    /// Approach to Learning Binary Codes for Large-scale Image Retrieval"
-    /// (Gong et al., 2013).
+    /// This variant is significantly more robust than standard ITQ for high-bit
+    /// counts. It extracts the full PCA basis and applies different orthogonal
+    /// rotations to chunks of bits to maximise information density.
     ///
-    /// Steps:
+    /// ### Training Steps:
     ///
-    /// 1. Sample up to MAX_SAMPLES_PCA points if dataset is large
-    /// 2. Centre the data by subtracting the mean
-    /// 3. Compute PCA to find principal components
-    /// 4. Apply ITQ to find optimal rotation for binary quantisation
-    /// 5. If n_bits > dim, add orthogonalised random projections for remaining bits
-    ///
-    /// ### Params
-    ///
-    /// * `data` - Training data matrix (n_samples × dim)
-    /// * `seed` - Random seed for sampling and random projections
-    /// * `itq_iterations` - Number of ITQ iterations (typically 10-50)
-    ///   Prepare PCA projections with ITQ rotation for optimal binary quantisation
-    ///
-    /// Implements the algorithm from "Iterative Quantization: A Procrustean
-    /// Approach to Learning Binary Codes for Large-scale Image Retrieval"
-    /// (Gong et al., 2013).
-    ///
-    /// Steps:
-    ///
-    /// 1. Sample up to MAX_SAMPLES_PCA points if dataset is large
-    /// 2. Centre the data by subtracting the mean
-    /// 3. Compute PCA to find principal components
-    /// 4. Apply ITQ to find optimal rotation for binary quantisation
-    /// 5. If n_bits > dim, add normalised random projections for remaining bits
+    /// 1. Sample and center training data.
+    /// 2. Compute full-basis PCA (dim x dim).
+    /// 3. For the first 'dim' bits: Run ITQ optimisation iterations.
+    /// 4. For remaining bits: Apply unique random orthogonal rotations to PCA
+    ///    tiles.
     ///
     /// ### Params
     ///
-    /// * `data` - Training data matrix (n_samples × dim)
-    /// * `seed` - Random seed for sampling and random projections
-    /// * `itq_iterations` - Number of ITQ iterations (typically 10-50)
+    /// * `data` - Trainings data of samples x dim. Data will be downsampled
+    ///   if n ≥ 100_000
+    /// * `seed` - Random seed for reproducibility
+    /// * `itq_iterations` - Number of ITQ iterations. Defaults to 10.
     fn prepare_pca_with_itq(&mut self, data: MatRef<T>, seed: usize, itq_iterations: usize) {
         let n = data.nrows();
         let dim = data.ncols();
         let mut rng = StdRng::seed_from_u64(seed as u64);
 
+        // 1. Data Sampling (Same as your original)
         let sample_indices: Vec<usize> = if n > MAX_SAMPLES_PCA {
             let mut idx: Vec<usize> = (0..n).collect();
             idx.shuffle(&mut rng);
@@ -312,89 +291,82 @@ where
         }
         self.mean = mean;
 
+        // 2. Full PCA to get the maximum possible orthogonal components (up to dim)
         let svd = sampled_data.as_ref().svd().unwrap();
-        let full_v = svd.V();
+        let full_v = svd.V(); // This is dim x dim
 
-        let n_pca_bits = self.n_bits.min(dim);
-        let mut v_pc = Mat::<T>::zeros(dim, n_pca_bits);
-        for j in 0..n_pca_bits {
-            for i in 0..dim {
-                v_pc[(i, j)] = full_v[(i, j)];
-            }
-        }
+        // 3. Repeat and Rotate Logic
+        let mut final_projections = Vec::with_capacity(self.n_bits * dim);
+        let mut bits_remaining = self.n_bits;
 
-        let projected_data = &sampled_data * &v_pc;
+        // We will work in chunks of size 'dim' (the max number of orthogonal components)
+        while bits_remaining > 0 {
+            let current_chunk_size = bits_remaining.min(dim);
 
-        // FIX 1: Initialise R as random orthogonal matrix via QR decomposition
-        let mut r_mat = Mat::<T>::zeros(n_pca_bits, n_pca_bits);
-        for i in 0..n_pca_bits {
-            for j in 0..n_pca_bits {
-                let val: f64 = rng.sample(StandardNormal);
-                r_mat[(i, j)] = T::from_f64(val).unwrap();
-            }
-        }
-        // QR decomposition to get orthogonal matrix
-        let qr = r_mat.as_ref().qr();
-        r_mat = qr.compute_Q();
-
-        for _ in 0..itq_iterations {
-            let rotated = &projected_data * &r_mat;
-            let mut b_mat = Mat::<T>::zeros(n_samples, n_pca_bits);
-            for i in 0..n_samples {
-                for j in 0..n_pca_bits {
-                    b_mat[(i, j)] = if rotated[(i, j)] >= T::zero() {
-                        T::one()
-                    } else {
-                        -T::one()
-                    };
+            // Extract the top components for this chunk
+            let mut v_chunk = Mat::<T>::zeros(dim, current_chunk_size);
+            for j in 0..current_chunk_size {
+                for i in 0..dim {
+                    v_chunk[(i, j)] = full_v[(i, j)];
                 }
             }
 
-            let c_mat = projected_data.transpose() * &b_mat;
-            let svd_itq = c_mat.as_ref().thin_svd().unwrap();
-
-            r_mat = svd_itq.U() * svd_itq.V().transpose();
-        }
-
-        let final_projections_mat = v_pc * r_mat;
-        let mut projections = Vec::with_capacity(self.n_bits * dim);
-
-        for j in 0..n_pca_bits {
-            for i in 0..dim {
-                projections.push(final_projections_mat[(i, j)]);
-            }
-        }
-
-        // FIX 2: Extra projections (when n_bits > dim) - just normalise, don't over-orthogonalise
-        // After dim orthogonal vectors in dim-dimensional space, there's no room left.
-        // Just use normalised random vectors for the extra bits.
-        if self.n_bits > dim {
-            for _ in n_pca_bits..self.n_bits {
-                let mut proj = Vec::with_capacity(dim);
-                for _ in 0..dim {
+            // Generate a random rotation matrix for this specific tile
+            let mut r_mat = Mat::<T>::zeros(current_chunk_size, current_chunk_size);
+            for i in 0..current_chunk_size {
+                for j in 0..current_chunk_size {
                     let val: f64 = rng.sample(StandardNormal);
-                    proj.push(T::from_f64(val).unwrap());
+                    r_mat[(i, j)] = T::from_f64(val).unwrap();
                 }
-
-                // Just normalise
-                let mut norm_sq = T::zero();
-                for d in 0..dim {
-                    norm_sq = norm_sq + proj[d] * proj[d];
-                }
-                let norm = norm_sq.sqrt();
-                if norm > T::epsilon() {
-                    for d in 0..dim {
-                        proj[d] = proj[d] / norm;
-                    }
-                }
-
-                projections.extend(proj);
             }
+
+            // Orthogonalize rotation via QR
+            let qr = r_mat.as_ref().qr();
+            let mut r_ortho = qr.compute_Q();
+
+            // Only run the iterative ITQ optimization on the FIRST chunk
+            // to save training time. Subsequent chunks are randomized
+            // rotations of the PCA space.
+            if bits_remaining == self.n_bits {
+                let projected_data = &sampled_data * &v_chunk;
+                for _ in 0..itq_iterations {
+                    let rotated = &projected_data * &r_ortho;
+                    let mut b_mat = Mat::<T>::zeros(n_samples, current_chunk_size);
+                    for i in 0..n_samples {
+                        for j in 0..current_chunk_size {
+                            b_mat[(i, j)] = if rotated[(i, j)] >= T::zero() {
+                                T::one()
+                            } else {
+                                -T::one()
+                            };
+                        }
+                    }
+                    let c_mat = projected_data.transpose() * &b_mat;
+                    let svd_itq = c_mat.as_ref().thin_svd().unwrap();
+                    r_ortho = svd_itq.U() * svd_itq.V().transpose();
+                }
+            }
+
+            // Apply the (optionally optimized) rotation to the PCA components
+            let rotated_projections = v_chunk * r_ortho;
+
+            // Flatten into our projections vector
+            for j in 0..current_chunk_size {
+                for i in 0..dim {
+                    final_projections.push(rotated_projections[(i, j)]);
+                }
+            }
+
+            bits_remaining -= current_chunk_size;
         }
 
-        self.projections = projections;
+        self.projections = final_projections;
     }
 }
+
+///////////
+// Tests //
+///////////
 
 #[cfg(test)]
 mod tests {
@@ -402,6 +374,7 @@ mod tests {
     use crate::binary::dist_binary::hamming_distance;
     use faer::Mat;
 
+    // Binariser tests
     #[test]
     fn test_simhash_basic() {
         let dim = 128;

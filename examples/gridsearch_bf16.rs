@@ -1,4 +1,5 @@
 mod commons;
+
 use ann_search_rs::*;
 use clap::Parser;
 use commons::*;
@@ -20,33 +21,8 @@ fn main() {
     );
     println!("-----------------------------");
 
-    let data_type = parse_data(&cli.data).unwrap_or_default();
-
-    let (data, _): (Mat<f32>, _) = match data_type {
-        SyntheticData::GaussianNoise => {
-            generate_clustered_data(cli.n_cells, cli.dim, cli.n_clusters, cli.seed)
-        }
-        SyntheticData::Correlated => {
-            println!("Using data for high dimensional ANN searches...\n");
-            generate_clustered_data_high_dim(
-                cli.n_cells,
-                cli.dim,
-                cli.n_clusters,
-                DEFAULT_COR_STRENGTH,
-                cli.seed,
-            )
-        }
-        SyntheticData::LowRank => generate_low_rank_rotated_data(
-            cli.n_cells,
-            cli.dim,
-            cli.intrinsic_dim,
-            cli.n_clusters,
-            cli.seed,
-        ),
-    };
-
+    let (data, _): (Mat<f32>, _) = generate_data(&cli);
     let query_data = subsample_with_noise(&data, DEFAULT_N_QUERY, cli.seed + 1);
-
     let mut results = Vec::new();
 
     // Exhaustive query benchmark
@@ -59,8 +35,8 @@ fn main() {
 
     println!("Querying exhaustive index...");
     let start = Instant::now();
-    let (true_neighbors, _) =
-        query_exhaustive_index(query_data.as_ref(), &exhaustive_idx, cli.k, false, false);
+    let (true_neighbors, true_distances) =
+        query_exhaustive_index(query_data.as_ref(), &exhaustive_idx, cli.k, true, false);
     let query_time = start.elapsed().as_secs_f64() * 1000.0;
 
     results.push(BenchmarkResultSize {
@@ -76,7 +52,8 @@ fn main() {
     // Exhaustive self-query benchmark
     println!("Self-querying exhaustive index...");
     let start = Instant::now();
-    let (true_neighbors_self, _) = query_exhaustive_self(&exhaustive_idx, cli.k, false, false);
+    let (true_neighbors_self, true_distances_self) =
+        query_exhaustive_self(&exhaustive_idx, cli.k, true, false);
     let self_query_time = start.elapsed().as_secs_f64() * 1000.0;
 
     results.push(BenchmarkResultSize {
@@ -89,7 +66,68 @@ fn main() {
         index_size_mb,
     });
 
-    println!("-----------------------------------------------------------------------------------------------");
+    println!("-----------------------------");
+
+    println!("Building exhaustive index (BF16 quantised)...");
+    let start = Instant::now();
+    let exhaustive_idx_bf16 = build_exhaustive_bf16_index(data.as_ref(), &cli.distance, false);
+    let build_time = start.elapsed().as_secs_f64() * 1000.0;
+
+    let index_size_mb = exhaustive_idx_bf16.memory_usage_bytes() as f64 / (1024.0 * 1024.0);
+
+    println!("Querying exhaustive index (BF16 quantised)...");
+    let start = Instant::now();
+    let (approx_neighbors, approx_distances) = query_exhaustive_bf16_index(
+        query_data.as_ref(),
+        &exhaustive_idx_bf16,
+        cli.k,
+        true,
+        false,
+    );
+    let query_time = start.elapsed().as_secs_f64() * 1000.0;
+
+    let recall = calculate_recall(&true_neighbors, &approx_neighbors, cli.k);
+    let dist_error = calculate_dist_error(
+        true_distances.as_ref().unwrap(),
+        approx_distances.as_ref().unwrap(),
+        cli.k,
+    );
+
+    results.push(BenchmarkResultSize {
+        method: "Exhaustive-BF16 (query)".to_string(),
+        build_time_ms: build_time,
+        query_time_ms: query_time,
+        total_time_ms: build_time + query_time,
+        recall_at_k: recall,
+        mean_dist_err: dist_error,
+        index_size_mb,
+    });
+
+    // Exhaustive self-query benchmark
+    println!("Self-querying exhaustive index (BF16 quantised)...");
+    let start = Instant::now();
+    let (approx_neighbors_self, approx_distances_self) =
+        query_exhaustive_self(&exhaustive_idx, cli.k, true, false);
+    let self_query_time = start.elapsed().as_secs_f64() * 1000.0;
+
+    let recall = calculate_recall(&true_neighbors_self, &approx_neighbors_self, cli.k);
+    let dist_error = calculate_dist_error(
+        true_distances_self.as_ref().unwrap(),
+        approx_distances_self.as_ref().unwrap(),
+        cli.k,
+    );
+
+    results.push(BenchmarkResultSize {
+        method: "Exhaustive-BF16 (self)".to_string(),
+        build_time_ms: build_time,
+        query_time_ms: self_query_time,
+        total_time_ms: build_time + self_query_time,
+        recall_at_k: recall,
+        mean_dist_err: dist_error,
+        index_size_mb,
+    });
+
+    println!("-----------------------------");
 
     let nlist_values = [
         (cli.n_cells as f32 * 0.5).sqrt() as usize,
@@ -98,9 +136,9 @@ fn main() {
     ];
 
     for nlist in nlist_values {
-        println!("Building IVF-SQ8 index (nlist={})...", nlist);
+        println!("Building IVF-BF16 index (nlist={})...", nlist);
         let start = Instant::now();
-        let ivf_sq8_idx = build_ivf_sq8_index(
+        let ivf_bf16_idx = build_ivf_bf16_index(
             data.as_ref(),
             Some(nlist),
             None,
@@ -110,7 +148,7 @@ fn main() {
         );
         let build_time = start.elapsed().as_secs_f64() * 1000.0;
 
-        let index_size_mb = ivf_sq8_idx.memory_usage_bytes() as f64 / (1024.0 * 1024.0);
+        let index_size_mb = ivf_bf16_idx.memory_usage_bytes() as f64 / (1024.0 * 1024.0);
 
         let nprobe_values = [
             (nlist as f32).sqrt() as usize,
@@ -130,48 +168,61 @@ fn main() {
                 continue;
             }
 
-            println!("Querying IVF-SQ8 (nlist={}, nprobe={})...", nlist, nprobe);
+            println!(
+                "Querying IVF-BF16 index (nlist={}, nprobe={})...",
+                nlist, nprobe
+            );
             let start = Instant::now();
-            let (approx_neighbors, _) = query_ivf_sq8_index(
+            let (approx_neighbors, approx_distances) = query_ivf_bf16_index(
                 query_data.as_ref(),
-                &ivf_sq8_idx,
+                &ivf_bf16_idx,
                 cli.k,
                 Some(*nprobe),
-                false,
+                true,
                 false,
             );
             let query_time = start.elapsed().as_secs_f64() * 1000.0;
 
             let recall = calculate_recall(&true_neighbors, &approx_neighbors, cli.k);
+            let dist_error = calculate_dist_error(
+                true_distances.as_ref().unwrap(),
+                approx_distances.as_ref().unwrap(),
+                cli.k,
+            );
 
             results.push(BenchmarkResultSize {
-                method: format!("IVF-SQ8-nl{}-np{} (query)", nlist, nprobe),
+                method: format!("IVF-BF16-nl{}-np{} (query)", nlist, nprobe),
                 build_time_ms: build_time,
                 query_time_ms: query_time,
                 total_time_ms: build_time + query_time,
                 recall_at_k: recall,
-                mean_dist_err: f64::NAN,
+                mean_dist_err: dist_error,
                 index_size_mb,
             });
         }
 
         // Self-query benchmark
         let nprobe_self = (nlist as f32 * 2.0).sqrt() as usize;
-        println!("Self-querying IVF-SQ8 index (nprobe={})...", nprobe_self);
+        println!("Self-querying IVF-BF16 index (nprobe={})...", nprobe_self);
         let start = Instant::now();
-        let (approx_neighbors_self, _) =
-            query_ivf_sq8_self(&ivf_sq8_idx, cli.k, Some(nprobe_self), false, false);
+        let (approx_neighbors_self, approx_distances_self) =
+            query_ivf_bf16_self(&ivf_bf16_idx, cli.k, Some(nprobe_self), true, false);
         let self_query_time = start.elapsed().as_secs_f64() * 1000.0;
 
         let recall_self = calculate_recall(&true_neighbors_self, &approx_neighbors_self, cli.k);
+        let dist_error_self = calculate_dist_error(
+            true_distances_self.as_ref().unwrap(),
+            approx_distances_self.as_ref().unwrap(),
+            cli.k,
+        );
 
         results.push(BenchmarkResultSize {
-            method: format!("IVF-SQ8-nl{} (self)", nlist),
+            method: format!("IVF-BF16-nl{} (self)", nlist),
             build_time_ms: build_time,
             query_time_ms: self_query_time,
             total_time_ms: build_time + self_query_time,
             recall_at_k: recall_self,
-            mean_dist_err: f64::NAN,
+            mean_dist_err: dist_error_self,
             index_size_mb,
         });
     }

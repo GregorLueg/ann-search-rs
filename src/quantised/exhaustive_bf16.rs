@@ -25,7 +25,7 @@ use crate::utils::matrix_to_flat;
 /// * `vectors_flat` - Original vector data for distance calculations. Flattened
 ///   for better cache locality
 /// * `norms` - Normalised pre-calculated values per sample if distance is set
-///   to Cosine
+///   to Cosine. Keep `T` here to avoid massive precision loss for Cosine.
 /// * `dim` - Embedding dimensions
 /// * `n` - Number of samples
 /// * `dist_metric` - The type of distance the index is designed for
@@ -34,7 +34,7 @@ pub struct ExhaustiveIndexBf16<T> {
     pub vectors_flat: Vec<bf16>,
     pub dim: usize,
     pub n: usize,
-    norms: Vec<bf16>,
+    norms: Vec<T>,
     metric: Dist,
     _phantom: PhantomData<T>,
 }
@@ -55,7 +55,7 @@ where
         self.dim
     }
 
-    fn norms(&self) -> &[bf16] {
+    fn norms(&self) -> &[T] {
         &self.norms
     }
 }
@@ -101,7 +101,7 @@ where
 
         Self {
             vectors_flat: encode_bf16_quantisation(&vectors_flat),
-            norms: encode_bf16_quantisation(&norms),
+            norms,
             dim,
             metric,
             n,
@@ -334,8 +334,8 @@ where
     /// Number of bytes used by the index
     pub fn memory_usage_bytes(&self) -> usize {
         std::mem::size_of_val(self)
-            + self.vectors_flat.capacity() * std::mem::size_of::<T>()
-            + self.norms.capacity() * std::mem::size_of::<T>()
+            + self.vectors_flat.capacity() * std::mem::size_of::<bf16>()
+            + self.norms.capacity() * std::mem::size_of::<bf16>()
     }
 }
 

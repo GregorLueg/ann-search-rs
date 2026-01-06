@@ -26,7 +26,8 @@ use crate::utils::*;
 /// * `vectors_flat` - Original vector data, flattened for cache locality
 /// * `dim` - Embedding dimensions
 /// * `n` - Number of vectors
-/// * `norms` - Pre-computed norms for Cosine distance (empty for Euclidean)
+/// * `norms` - Pre-computed norms for Cosine distance (empty for Euclidean).
+///   Keep `T` here to avoid massive precision loss for Cosine.
 /// * `metric` - Distance metric (Euclidean or Cosine)
 /// * `centroids` - Cluster centres (nlist * dim elements)
 /// * `all_indices` - Vector indices for each cluster (in a flat structure)
@@ -37,7 +38,7 @@ pub struct IvfIndexBf16<T> {
     pub vectors_flat: Vec<bf16>,
     pub dim: usize,
     pub n: usize,
-    pub norms: Vec<bf16>,
+    pub norms: Vec<T>,
     metric: Dist,
     // index specific ones
     centroids: Vec<T>,
@@ -63,7 +64,7 @@ where
         self.dim
     }
 
-    fn norms(&self) -> &[bf16] {
+    fn norms(&self) -> &[T] {
         &self.norms
     }
 }
@@ -232,7 +233,7 @@ where
             vectors_flat: encode_bf16_quantisation(&vectors_flat),
             dim,
             n,
-            norms: encode_bf16_quantisation(&norms),
+            norms,
             metric,
             centroids,
             centroids_norm,
@@ -371,7 +372,7 @@ where
 
                 if verbose {
                     let count = counter.fetch_add(1, Ordering::Relaxed) + 1;
-                    if count % 100_000 == 0 {
+                    if count.is_multiple_of(100_000) {
                         println!(
                             "  Processed {} / {} samples.",
                             count.separate_with_underscores(),

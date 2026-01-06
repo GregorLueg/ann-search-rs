@@ -188,4 +188,82 @@ where
             (indices, None)
         }
     }
+
+    /// Returns the size of the index in bytes
+    ///
+    /// ### Returns
+    ///
+    /// Number of bytes used by the index
+    pub fn memory_usage_bytes(&self) -> usize {
+        std::mem::size_of_val(self)
+            + self.vectors_flat.capacity() * std::mem::size_of::<T>()
+            + self.norms.capacity() * std::mem::size_of::<T>()
+    }
+}
+
+///////////
+// Tests //
+///////////
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use cubecl::cpu::CpuDevice;
+    use cubecl::cpu::CpuRuntime;
+    use faer::Mat;
+
+    #[test]
+    fn test_exhaustive_index_query() {
+        let device = CpuDevice;
+
+        // 8 samples, 4 dimensions
+        let data = Mat::from_fn(8, 4, |i, j| if i == j { 1.0_f32 } else { 0.0_f32 });
+
+        let index =
+            ExhaustiveIndexGpu::<f32, CpuRuntime>::new(data.as_ref(), Dist::Euclidean, device);
+
+        let query = Mat::from_fn(2, 4, |i, j| if i == j { 1.0_f32 } else { 0.0_f32 });
+
+        let (indices, distances) = index.query_batch(query.as_ref(), 3, false);
+
+        assert_eq!(indices.len(), 2);
+        assert_eq!(distances.len(), 2);
+        assert_eq!(indices[0].len(), 3);
+
+        // First query [1,0,0,0] should match first db vector perfectly
+        assert_eq!(indices[0][0], 0);
+        assert!(distances[0][0] < 0.01);
+    }
+
+    #[test]
+    fn test_exhaustive_index_cosine() {
+        let device = CpuDevice;
+
+        let data = Mat::from_fn(4, 4, |i, _j| i as f32 + 1.0);
+
+        let index = ExhaustiveIndexGpu::<f32, CpuRuntime>::new(data.as_ref(), Dist::Cosine, device);
+
+        let query = Mat::from_fn(1, 4, |_, _| 1.0_f32);
+        let (indices, distances) = index.query_batch(query.as_ref(), 2, false);
+
+        assert_eq!(indices.len(), 1);
+        assert_eq!(indices[0].len(), 2);
+        assert!(distances[0][0] >= 0.0 && distances[0][0] <= 2.0);
+    }
+
+    #[test]
+    fn test_generate_knn() {
+        let device = CpuDevice;
+
+        let data = Mat::from_fn(6, 4, |i, j| if i == j { 1.0_f32 } else { 0.1_f32 });
+
+        let index =
+            ExhaustiveIndexGpu::<f32, CpuRuntime>::new(data.as_ref(), Dist::Euclidean, device);
+
+        let (indices, distances) = index.generate_knn(3, true, false);
+
+        assert_eq!(indices.len(), 6);
+        assert!(distances.is_some());
+        assert_eq!(distances.unwrap().len(), 6);
+    }
 }

@@ -36,6 +36,13 @@ pub struct Neighbour<T> {
 }
 
 impl<T: Copy> Neighbour<T> {
+    /// Generate a new neighbour
+    ///
+    /// ### Params
+    ///
+    /// * `pid` - Point id of the neighbour
+    /// * `dist` - Distance to that neighbour
+    /// * `is_new` - Flag if it is a new neighbour
     #[inline(always)]
     fn new(pid: usize, dist: T, is_new: bool) -> Self {
         Self {
@@ -45,11 +52,21 @@ impl<T: Copy> Neighbour<T> {
         }
     }
 
+    /// Is the neighbour new
+    ///
+    /// ### Returns
+    ///
+    /// Boolean indicating if it is an old or new neighbour
     #[inline(always)]
     fn is_new(&self) -> bool {
         self.is_new != 0
     }
 
+    /// Get the PID
+    ///
+    /// ### Returns
+    ///
+    /// The index
     #[inline(always)]
     fn pid(&self) -> usize {
         self.pid as usize
@@ -195,7 +212,7 @@ thread_local! {
 /// Implements the NN-Descent algorithm for efficient k-NN graph construction.
 /// Uses an Annoy index for initialisation and beam search for querying.
 ///
-/// ## Memory-Efficient Update Strategy
+/// ### Memory-Efficient Update Strategy
 ///
 /// The index construction uses a chunked processing approach to bound memory
 /// usage during the update phase. Instead of generating all candidate updates
@@ -209,6 +226,18 @@ thread_local! {
 ///
 /// This bounds memory to O(chunk_size × max_candidates) rather than
 /// O(n × max_candidates), reducing peak memory by 10-50× on large datasets.
+///
+/// ### Fields
+///
+/// * `vectors_flat` - Original vector data, flattened for cache locality
+/// * `dim` - Embedding dimensions
+/// * `n` - Number of vectors
+/// * `norms` - Pre-computed norms for Cosine distance (empty for Euclidean)
+/// * `metric` - Distance metric (Euclidean or Cosine)
+/// * `forest` - The initial Annoy index for initialisation and entry points
+///   into the graph.
+/// * `graph` - The NNDescent generated graph
+/// * `converged` - Boolean indicating if the build phase converged.
 pub struct NNDescent<T> {
     // shared ones
     pub vectors_flat: Vec<T>,
@@ -222,6 +251,11 @@ pub struct NNDescent<T> {
     converged: bool,
 }
 
+////////////////////
+// VectorDistance //
+////////////////////
+
+// Implementation of the vector distance trait for NNDescent
 impl<T> VectorDistance<T> for NNDescent<T>
 where
     T: Float + FromPrimitive + Send + Sync + Sum,
@@ -349,6 +383,10 @@ where
     }
 
     /// Check if algorithm converged during construction
+    ///
+    /// ### Returns
+    ///
+    /// Boolean flag to show that algorithm has converged
     pub fn index_converged(&self) -> bool {
         self.converged
     }
@@ -506,16 +544,12 @@ where
                 );
             }
 
-            // CHANGE: process updates in chunks instead of all at once
-            // this is the core memory optimisation - we never hold more than
-            // one chunk's worth of updates in memory
+            // process the data in chunks to reduce the memory pressure
+            // this exploded on larger data sets
             for chunk_idx in 0..n_chunks {
                 let chunk_start = chunk_idx * chunk_size;
                 let chunk_end = (chunk_start + chunk_size).min(self.n);
 
-                // CHANGE: generate updates only from source nodes in this chunk
-                // the method emits both directions (p,q,d) and (q,p,d) so we
-                // don't need a second pass to build symmetric updates
                 let mut chunk_updates = self.generate_updates_for_chunk(
                     &new_cands,
                     &old_cands,
@@ -524,13 +558,8 @@ where
                     chunk_end,
                 );
 
-                // CHANGE: sort by target node (first element)
-                // this enables lock-free application since each target's updates
-                // form a contiguous slice that can be processed independently
                 chunk_updates.par_sort_unstable_by_key(|&(target, _, _)| target);
 
-                // CHANGE: apply sorted updates - no locks needed
-                // each target node's updates are processed as a batch
                 self.apply_sorted_updates(&chunk_updates, &mut graph, &updates_count);
             }
 
@@ -696,34 +725,6 @@ where
 
     /// Generate distance updates from a chunk of source nodes
     ///
-    /// This is the memory-optimised replacement for `generate_updates`.
-    /// Key differences from the original:
-    ///
-    /// 1. Only processes source nodes in range [chunk_start, chunk_end)
-    /// 2. Emits BOTH directions for each edge: (p,q,d) AND (q,p,d)
-    ///    This eliminates the need for a separate symmetrisation pass
-    /// 3. Output is formatted as (target, source, distance) to enable
-    ///    sorting by target for cache-friendly application
-    ///
-    /// ## Why emit both directions here?
-    ///
-    /// The old approach:
-    /// 1. Generate (p, q, d) tuples
-    /// 2. In update_neighbours, add to per_node[p] AND per_node[q]
-    ///
-    /// This required holding all updates in memory twice. By emitting both
-    /// directions during generation, we can sort once and apply directly.
-    ///
-    /// ## Duplicate edge handling
-    ///
-    /// The same edge (p,q) might be generated from different source chunks
-    /// if both p and q appear as candidates in nodes belonging to different
-    /// chunks. This causes redundant distance calculations and duplicate
-    /// insertion attempts. We accept this minor inefficiency because:
-    /// - The insertion logic handles duplicates (checks if candidate exists)
-    /// - Tracking seen pairs would require additional memory/synchronisation
-    /// - The duplicate rate is low in practice
-    ///
     /// ### Params
     ///
     /// * `new_cands` - New candidate lists for all nodes
@@ -743,8 +744,6 @@ where
         chunk_start: usize,
         chunk_end: usize,
     ) -> Vec<(usize, usize, T)> {
-        // CHANGE: Only iterate over source nodes in this chunk
-        // This bounds the number of updates generated per call
         (chunk_start..chunk_end)
             .into_par_iter()
             .flat_map(|i| {
@@ -765,16 +764,12 @@ where
 
                         let d = self.distance(p, q);
                         if self.should_add_edge(p, q, d, graph) {
-                            // CHANGE: Emit both directions immediately
-                            // Format: (target, source, distance)
-                            // This eliminates the need for per_node duplication
                             updates.push((p, q, d));
                             updates.push((q, p, d));
                         }
                     }
                 }
 
-                // Check new-old pairs (same as before)
                 for &p in &new_cands[i] {
                     if p >= self.n {
                         continue;

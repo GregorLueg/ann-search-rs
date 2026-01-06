@@ -1,3 +1,4 @@
+use faer::RowRef;
 use num_traits::Float;
 use std::iter::Sum;
 
@@ -329,7 +330,7 @@ where
     fn dim(&self) -> usize;
 
     /// Get the normalised values
-    fn norms(&self) -> &[bf16];
+    fn norms(&self) -> &[T];
 
     ///////////////
     // Euclidean //
@@ -483,7 +484,8 @@ where
                 .map(|(&a, &b)| a.to_f32() * b.to_f32())
                 .fold(0.0, |acc, x| acc + x);
 
-            let dist = 1.0 - (dot / (self.norms()[i].to_f32() * self.norms()[j].to_f32()));
+            let dist = 1.0
+                - (dot / (self.norms()[i].to_f32().unwrap() * self.norms()[j].to_f32().unwrap()));
 
             T::from_f32(dist).unwrap()
         }
@@ -518,8 +520,10 @@ where
                 .map(|(&a, &b)| a.to_f32() * b.to_f32().unwrap())
                 .fold(0.0, |acc, x| acc + x);
 
-            let dist =
-                1.0 - (dot / (query_norm.to_f32().unwrap() * self.norms()[internal_idx].to_f32()));
+            let dist = 1.0
+                - (dot
+                    / (query_norm.to_f32().unwrap()
+                        * self.norms()[internal_idx].to_f32().unwrap()));
 
             T::from_f32(dist).unwrap()
         }
@@ -559,7 +563,8 @@ where
                 .map(|(&a, &b)| a.to_f32() * b.to_f32())
                 .fold(0.0, |acc, x| acc + x);
 
-            let dist = 1.0 - (dot / (query_norm.to_f32() * self.norms()[internal_idx].to_f32()));
+            let dist =
+                1.0 - (dot / (query_norm.to_f32() * self.norms()[internal_idx].to_f32().unwrap()));
 
             T::from_f32(dist).unwrap()
         }
@@ -814,16 +819,54 @@ where
 /// ### Params
 ///
 /// * `vec` - The vector to normalise
-#[inline]
+#[inline(always)]
 pub fn normalise_vector<T: Float + Sum>(vec: &mut [T]) {
-    let norm = vec
-        .iter()
-        .map(|&v| v * v)
-        .fold(T::zero(), |acc, x| acc + x)
-        .sqrt();
+    let norm = compute_norm(vec);
     if norm > T::zero() {
         vec.iter_mut().for_each(|v| *v = *v / norm);
     }
+}
+
+/// Compute the L2 norm of a slice
+///
+/// ### Params
+///
+/// * `vec` - Slice for which to calculate L2 norm
+///
+/// ### Returns
+///
+/// L2 norm
+#[inline(always)]
+pub fn compute_norm<T>(vec: &[T]) -> T
+where
+    T: Float,
+{
+    let mut sum = T::zero();
+    for &x in vec {
+        sum = sum + x * x;
+    }
+    sum.sqrt()
+}
+
+/// Compute the L2 norm of a row reference
+///
+/// ### Params
+///
+/// * `row` - Row for which to calculate L2 norm
+///
+/// ### Returns
+///
+/// L2 norm
+#[inline(always)]
+pub fn compute_norm_row<T>(row: RowRef<T>) -> T
+where
+    T: Float,
+{
+    let mut sum = T::zero();
+    for i in 0..row.ncols() {
+        sum = sum + row[i] * row[i];
+    }
+    sum.sqrt()
 }
 
 ///////////

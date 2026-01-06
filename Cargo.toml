@@ -16,24 +16,26 @@ lto = true
 codegen-units = 1
 
 [features]
+binary = ["memmap2", "tempfile"]
 gpu = ["cubecl"]
 quantised = ["half"]
-binary = []
 
 [dependencies]
 approx = "0.5.1"
 clap = { version = "4.5.53", features = ["derive"] }
-cubecl = { version = "0.8.1", features = ["wgpu"], optional = true }
+cubecl = { version = "0.8.1", features = ["wgpu", "cpu"], optional = true }
 faer = "0.23.2"
 faer-traits = "0.23.2"
 fixedbitset = "0.5.7"
 half = { version = "2.7.1", optional = true }
+memmap2 = { version = "0.9.9", optional = true }
 num-traits = "0.2.19"
 parking_lot = "0.12.5"
 rand = "0.9.2"
 rand_distr = "0.5.1"
 rayon = "1.11.0"
 rustc-hash = "2.1.1"
+tempfile = { version = "3.24.0", optional = true }
 thousands = "0.2.0"
 
 [[example]]
@@ -41,7 +43,11 @@ name = "gridsearch_gpu"
 required-features = ["gpu"]
 
 [[example]]
-name = "gridsearch_ivf_sq8"
+name = "gridsearch_sq8"
+required-features = ["quantised"]
+
+[[example]]
+name = "gridsearch_bf16"
 required-features = ["quantised"]
 
 [[example]]
@@ -54,4 +60,8 @@ required-features = ["quantised"]
 
 [[example]]
 name = "gridsearch_binary"
+required-features = ["binary"]
+
+[[example]]
+name = "gridsearch_rabitq"
 required-features = ["binary"]

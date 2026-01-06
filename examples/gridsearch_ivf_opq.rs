@@ -20,33 +20,8 @@ fn main() {
     );
     println!("-----------------------------");
 
-    let data_type = parse_data(&cli.data).unwrap_or_default();
-
-    let (data, _): (Mat<f32>, _) = match data_type {
-        SyntheticData::GaussianNoise => {
-            generate_clustered_data(cli.n_cells, cli.dim, cli.n_clusters, cli.seed)
-        }
-        SyntheticData::Correlated => {
-            println!("Using data for high dimensional ANN searches...\n");
-            generate_clustered_data_high_dim(
-                cli.n_cells,
-                cli.dim,
-                cli.n_clusters,
-                DEFAULT_COR_STRENGTH,
-                cli.seed,
-            )
-        }
-        SyntheticData::LowRank => generate_low_rank_rotated_data(
-            cli.n_cells,
-            cli.dim,
-            cli.intrinsic_dim,
-            cli.n_clusters,
-            cli.seed,
-        ),
-    };
-
+    let (data, _): (Mat<f32>, _) = generate_data(&cli);
     let query_data = subsample_with_noise(&data, DEFAULT_N_QUERY, cli.seed + 1);
-
     let mut results = Vec::new();
 
     // Exhaustive query benchmark

@@ -354,3 +354,89 @@ where
 
     (all_indices, all_distances)
 }
+
+///////////
+// Tests //
+///////////
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use cubecl::cpu::CpuDevice;
+    use cubecl::cpu::CpuRuntime;
+
+    #[test]
+    fn test_euclidean_batch_query() {
+        let device = CpuDevice;
+
+        // 4 query vectors, 8 db vectors, 4 dimensions (divisible by LINE_SIZE=4)
+        let query_data: Vec<f32> = vec![
+            1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0,
+        ];
+
+        let db_data: Vec<f32> = vec![
+            1.0, 0.0, 0.0, 0.0, // matches query 0
+            0.0, 1.0, 0.0, 0.0, // matches query 1
+            0.0, 0.0, 1.0, 0.0, // matches query 2
+            0.0, 0.0, 0.0, 1.0, // matches query 3
+            0.5, 0.5, 0.0, 0.0, 0.0, 0.5, 0.5, 0.0, 0.0, 0.0, 0.5, 0.5, 0.5, 0.0, 0.0, 0.5,
+        ];
+
+        let query_batch = BatchData::new(&query_data, &[], 4);
+        let db_batch = BatchData::new(&db_data, &[], 8);
+
+        let (indices, distances) = query_batch_gpu::<f32, CpuRuntime>(
+            3,
+            &query_batch,
+            &db_batch,
+            4,
+            &Dist::Euclidean,
+            device,
+            false,
+        );
+
+        assert_eq!(indices.len(), 4);
+        assert_eq!(distances.len(), 4);
+
+        // First query should find perfect match at index 0
+        assert_eq!(indices[0][0], 0);
+        assert!(distances[0][0] < 0.01);
+    }
+
+    #[test]
+    fn test_cosine_batch_query() {
+        let device = CpuDevice;
+
+        let query_data: Vec<f32> = vec![1.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 1.0];
+
+        let db_data: Vec<f32> = vec![
+            2.0, 2.0, 0.0, 0.0, // parallel to query 0
+            0.0, 0.0, 3.0, 3.0, // parallel to query 1
+            1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0,
+        ];
+
+        // Pre-compute norms
+        let query_norms: Vec<f32> = vec![(2.0_f32).sqrt(), (2.0_f32).sqrt()];
+
+        let db_norms: Vec<f32> = vec![(8.0_f32).sqrt(), (18.0_f32).sqrt(), 1.0, 1.0];
+
+        let query_batch = BatchData::new(&query_data, &query_norms, 2);
+        let db_batch = BatchData::new(&db_data, &db_norms, 4);
+
+        let (indices, distances) = query_batch_gpu::<f32, CpuRuntime>(
+            2,
+            &query_batch,
+            &db_batch,
+            4,
+            &Dist::Cosine,
+            device,
+            false,
+        );
+
+        assert_eq!(indices.len(), 2);
+
+        // First query should find parallel vector at index 0 as closest
+        assert_eq!(indices[0][0], 0);
+        assert!(distances[0][0] < 0.01); // cosine distance ≈ 0 for parallel vectors
+    }
+}

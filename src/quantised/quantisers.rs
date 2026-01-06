@@ -1,10 +1,11 @@
-use faer::Mat;
+use faer::{Mat, Scale};
 use half::*;
 use num_traits::{Float, FromPrimitive, ToPrimitive};
 use rayon::prelude::*;
 use std::iter::Sum;
 use std::ops::AddAssign;
 
+use crate::quantised::k_means::*;
 use crate::utils::dist::*;
 use crate::utils::ivf_utils::*;
 
@@ -144,6 +145,7 @@ where
     /// ### Returns
     ///
     /// The quantised vector
+    #[inline]
     pub fn encode(&self, vec: &[T]) -> Vec<i8> {
         vec.iter()
             .enumerate()
@@ -167,6 +169,7 @@ where
     /// ### Returns
     ///
     /// Original decompressed vector
+    #[inline]
     pub fn decode(&self, quantised: &[i8]) -> Vec<T> {
         quantised
             .iter()
@@ -238,7 +241,7 @@ where
         dim: usize,
         m: usize,
         n_centroids: Option<usize>,
-        metric: &Dist,
+        _metric: &Dist,
         max_iters: usize,
         seed: usize,
         verbose: bool,
@@ -272,15 +275,13 @@ where
             }
 
             // train k-means with n clusters
-            let centroids = train_centroids(
+            let centroids = train_centroids_pq(
                 &subvectors,
                 subvec_dim,
                 n,
                 n_centroids,
-                metric,
                 max_iters,
                 seed + subspace,
-                false,
             );
 
             codebooks.push(centroids);
@@ -388,6 +389,79 @@ where
         }
 
         total
+    }
+
+    /// Batch encode multiple vectors - computes distances via matrix ops
+    ///
+    /// ### Params
+    ///
+    /// * `vectors` - The vectors
+    /// * `n` - Size of the data set
+    ///
+    /// ### Returns
+    ///
+    /// Returns the assignments
+    pub fn encode_batch(&self, vectors: &[T], n: usize) -> Vec<u8> {
+        let dim = self.m() * self.subvec_dim();
+        let mut all_codes = vec![0u8; n * self.m()];
+
+        for subspace in 0..self.m() {
+            let subvec_start = subspace * self.subvec_dim();
+
+            // extract all subvectors for this subspace (n x subvec_dim)
+            let mut subvecs = Mat::<f32>::zeros(n, self.subvec_dim());
+            for i in 0..n {
+                for j in 0..self.subvec_dim() {
+                    subvecs[(i, j)] = vectors[i * dim + subvec_start + j].to_f32().unwrap();
+                }
+            }
+
+            // centroids matrix (n_centroids x subvec_dim)
+            let mut centroids = Mat::<f32>::zeros(self.n_centroids(), self.subvec_dim());
+            for i in 0..self.n_centroids() {
+                for j in 0..self.subvec_dim() {
+                    centroids[(i, j)] = self.codebooks()[subspace][i * self.subvec_dim() + j]
+                        .to_f32()
+                        .unwrap();
+                }
+            }
+
+            // Compute squared distances: ||x - c||^2 = ||x||^2 + ||c||^2 - 2*x@c^T
+            // Precompute ||c||^2 for all centroids
+            let centroid_norms: Vec<f32> = (0..self.n_centroids())
+                .map(|i| {
+                    (0..self.subvec_dim())
+                        .map(|j| centroids[(i, j)].powi(2))
+                        .sum()
+                })
+                .collect();
+
+            let dot_products = Scale(-2.0) * &subvecs * centroids.transpose();
+
+            all_codes
+                .par_chunks_mut(self.m())
+                .enumerate()
+                .for_each(|(vec_idx, codes)| {
+                    let x_norm: f32 = (0..self.subvec_dim())
+                        .map(|j| subvecs[(vec_idx, j)].powi(2))
+                        .sum();
+
+                    let mut best_idx = 0;
+                    let mut best_dist = f32::INFINITY;
+
+                    for c in 0..self.n_centroids() {
+                        let dist = x_norm + centroid_norms[c] + dot_products[(vec_idx, c)];
+                        if dist < best_dist {
+                            best_dist = dist;
+                            best_idx = c;
+                        }
+                    }
+
+                    codes[subspace] = best_idx as u8;
+                });
+        }
+
+        all_codes
     }
 }
 
@@ -497,12 +571,12 @@ where
             );
 
             // encode and reconstruct
+            let codes = pq.encode_batch(&rotated, n_train);
             let reconstructed: Vec<T> = (0..n_train)
                 .into_par_iter()
                 .flat_map(|vec_idx| {
-                    let vec_start = vec_idx * dim;
-                    let codes = pq.encode(&rotated[vec_start..vec_start + dim]);
-                    Self::decode_pq(&codes, &pq)
+                    let vec_codes = &codes[vec_idx * pq.m()..(vec_idx + 1) * pq.m()];
+                    pq.decode(vec_codes)
                 })
                 .collect();
 
@@ -630,18 +704,33 @@ where
     ///
     /// Flat rotated vectors (length = n * dim)
     fn apply_rotation(vectors: &[T], rotation: &[T], dim: usize, n: usize) -> Vec<T> {
-        let mut rotated = vec![T::zero(); n * dim];
-        rotated
-            .par_chunks_mut(dim)
-            .enumerate()
-            .for_each(|(vec_idx, chunk)| {
-                let vec_start = vec_idx * dim;
-                let rotated_vec =
-                    Self::rotate_vector(&vectors[vec_start..vec_start + dim], rotation, dim);
-                chunk.copy_from_slice(&rotated_vec);
-            });
+        // Build faer matrices
+        let mut x = Mat::<f32>::zeros(n, dim);
+        let mut r = Mat::<f32>::zeros(dim, dim);
 
-        rotated
+        for i in 0..n {
+            for j in 0..dim {
+                x[(i, j)] = vectors[i * dim + j].to_f32().unwrap();
+            }
+        }
+
+        for i in 0..dim {
+            for j in 0..dim {
+                r[(i, j)] = rotation[i * dim + j].to_f32().unwrap();
+            }
+        }
+
+        let x_r = x * r.transpose();
+
+        // Convert back
+        let mut out = vec![T::zero(); n * dim];
+        for i in 0..n {
+            for j in 0..dim {
+                out[i * dim + j] = T::from_f32(x_r[(i, j)]).unwrap();
+            }
+        }
+
+        out
     }
 
     /// Compute optimal rotation matrix via SVD
@@ -660,28 +749,19 @@ where
     /// ### Returns
     ///
     /// Updated rotation matrix (dim × dim, row-major)
-    fn compute_rotation(x_rotated: &[T], x_recon: &[T], dim: usize, n: usize) -> Vec<T> {
-        let c_elements: Vec<f32> = (0..dim * dim)
-            .into_par_iter()
-            .map(|idx| {
-                let i = idx / dim;
-                let j = idx % dim;
-                (0..n)
-                    .map(|vec_idx| {
-                        let vec_start = vec_idx * dim;
-                        x_rotated[vec_start + i].to_f32().unwrap()
-                            * x_recon[vec_start + j].to_f32().unwrap()
-                    })
-                    .sum()
-            })
-            .collect();
+    fn compute_rotation(x_original: &[T], x_recon: &[T], dim: usize, n: usize) -> Vec<T> {
+        // Build matrices
+        let mut x = Mat::<f32>::zeros(n, dim);
+        let mut y = Mat::<f32>::zeros(n, dim);
 
-        let mut c = Mat::<f32>::zeros(dim, dim);
-        for i in 0..dim {
+        for i in 0..n {
             for j in 0..dim {
-                c[(i, j)] = c_elements[i * dim + j];
+                x[(i, j)] = x_original[i * dim + j].to_f32().unwrap();
+                y[(i, j)] = x_recon[i * dim + j].to_f32().unwrap();
             }
         }
+
+        let c = x.transpose() * y;
 
         // rest stays the same
         let svd = c.thin_svd().unwrap();
