@@ -4,8 +4,111 @@ use rand::seq::SliceRandom;
 use rand::Rng;
 use rand::SeedableRng;
 use rayon::prelude::*;
+use std::iter::Sum;
 
 use crate::utils::dist::*;
+use crate::utils::Dist;
+
+//////////////////////
+// CentroidDistance //
+//////////////////////
+
+/// Trait for computing distances between Floats
+pub trait CentroidDistance<T>
+where
+    T: Float + Sum,
+{
+    /// Get the internal flat centroids representation
+    fn centroids(&self) -> &[T];
+
+    /// Get the internal dimensions
+    fn dim(&self) -> usize;
+
+    /// Get the number of internal dimensions
+    fn nlist(&self) -> usize;
+
+    /// Get the internal distance metric
+    fn metric(&self) -> Dist;
+
+    /// Get the centroids normalisation
+    fn centroids_norm(&self) -> &[T];
+
+    /// Calculate the distance to the centroids
+    ///
+    /// ### Params
+    ///
+    /// * `query_vec` - The slice of the query
+    /// * `query_norm` - The norm of the query. Relevant for fast Cosine dist
+    ///   calculations.
+    /// * `nprobe` - Number of probes
+    ///
+    /// ### Returns
+    ///
+    /// The distance to the different clusters
+    fn get_centroids_dist(&self, query_vec: &[T], query_norm: T, nprobe: usize) -> Vec<(T, usize)> {
+        let mut cluster_dists: Vec<(T, usize)> = (0..self.nlist())
+            .map(|c| {
+                let cent = &self.centroids()[c * self.dim()..(c + 1) * self.dim()];
+                let dist = match self.metric() {
+                    Dist::Euclidean => euclidean_distance_static(query_vec, cent),
+                    Dist::Cosine => {
+                        let c_norm = &self.centroids_norm()[c];
+                        cosine_distance_static_norm(query_vec, cent, &query_norm, c_norm)
+                    }
+                };
+                (dist, c)
+            })
+            .collect();
+
+        if nprobe < self.nlist() {
+            cluster_dists.select_nth_unstable_by(nprobe, |a, b| a.0.partial_cmp(&b.0).unwrap());
+        }
+
+        cluster_dists
+    }
+
+    /// Special version that assumes pre-normalised vectors for Cosine
+    ///
+    /// ### Params
+    ///
+    /// * `query_vec` - The slice of the query
+    /// * `nprobe` - Number of probes
+    ///
+    /// ### Returns
+    ///
+    /// The distance to the different clusters
+    fn get_centroids_prenorm(&self, query_vec: &[T], nprobe: usize) -> Vec<(T, usize)> {
+        // Find top nprobe centroids
+        let mut cluster_dists: Vec<(T, usize)> = (0..self.nlist())
+            .map(|c| {
+                let cent = &self.centroids()[c * self.dim()..(c + 1) * self.dim()];
+                let dist = match self.metric() {
+                    Dist::Cosine => {
+                        let ip: T = query_vec
+                            .iter()
+                            .zip(cent.iter())
+                            .map(|(&q, &c)| q * c)
+                            .sum();
+                        T::one() - ip
+                    }
+                    Dist::Euclidean => query_vec
+                        .iter()
+                        .zip(cent.iter())
+                        .map(|(&q, &c)| (q - c) * (q - c))
+                        .sum(),
+                };
+                (dist, c)
+            })
+            .collect();
+
+        let nprobe = nprobe.min(self.nlist());
+        if nprobe < self.nlist() {
+            cluster_dists.select_nth_unstable_by(nprobe, |a, b| a.0.partial_cmp(&b.0).unwrap());
+        }
+
+        cluster_dists
+    }
+}
 
 ////////////////////////
 // k-means clustering //
@@ -23,7 +126,9 @@ use crate::utils::dist::*;
 /// ### Params
 ///
 /// * `vec` - Query vector
+/// * `vec_norm` - The norm of the vector
 /// * `centroids` - Current centroids (flattened)
+/// * `centroid_norms` - The norms of the centroids
 /// * `dim` - Embedding dimensions
 /// * `n_centroids` - Number of centroids
 /// * `metric` - Distance metric
@@ -33,7 +138,9 @@ use crate::utils::dist::*;
 /// Minimum distance to any centroid
 fn min_distance_to_centroids<T>(
     vec: &[T],
+    vec_norm: T,
     centroids: &[T],
+    centroid_norms: &[T],
     dim: usize,
     n_centroids: usize,
     metric: &Dist,
@@ -47,7 +154,7 @@ where
         let cent = &centroids[c * dim..(c + 1) * dim];
         let dist = match metric {
             Dist::Euclidean => euclidean_distance_static(vec, cent),
-            Dist::Cosine => cosine_distance_static(vec, cent),
+            Dist::Cosine => cosine_distance_static_norm(vec, cent, &vec_norm, &centroid_norms[c]),
         };
         if dist < min_dist {
             min_dist = dist;
@@ -65,6 +172,7 @@ where
 /// ### Params
 ///
 /// * `data` - Candidate centres (flattened)
+/// * `data_norms` - The precomputed norms of the candidates.
 /// * `dim` - Embedding dimensions
 /// * `k` - Target number of clusters
 /// * `metric` - Distance metric
@@ -75,6 +183,7 @@ where
 /// Final k centroids (k * dim elements)
 fn weighted_kmeans_plus_plus<T>(
     data: &[T],
+    data_norms: &[T],
     dim: usize,
     k: usize,
     metric: &Dist,
@@ -91,17 +200,25 @@ where
     }
 
     let mut centroids = Vec::with_capacity(k * dim);
+    let mut centroid_norms = Vec::with_capacity(k);
 
     let first = rng.random_range(0..n);
     centroids.extend_from_slice(&data[first * dim..(first + 1) * dim]);
+    centroid_norms.push(data_norms[first]);
 
     for _ in 1..k {
-        let n_cents = centroids.len() / dim;
-
         let distances: Vec<T> = (0..n)
             .map(|i| {
                 let vec = &data[i * dim..(i + 1) * dim];
-                min_distance_to_centroids(vec, &centroids, dim, n_cents, metric)
+                min_distance_to_centroids(
+                    vec,
+                    data_norms[i],
+                    &centroids,
+                    &centroid_norms,
+                    dim,
+                    centroid_norms.len(),
+                    metric,
+                )
             })
             .collect();
 
@@ -113,6 +230,7 @@ where
             cumsum += dist.to_f64().unwrap();
             if cumsum >= threshold {
                 centroids.extend_from_slice(&data[idx * dim..(idx + 1) * dim]);
+                centroid_norms.push(data_norms[idx]);
                 break;
             }
         }
@@ -136,6 +254,7 @@ where
 /// ### Params
 ///
 /// * `data` - Training vectors (flattened)
+/// * `data_norms` - The norms of the trainint vectors.
 /// * `dim` - Embedding dimensions
 /// * `n` - Number of training vectors
 /// * `k` - Number of clusters to create
@@ -147,6 +266,7 @@ where
 /// Initial centroids (k * dim elements)
 fn kmeans_parallel_init<T>(
     data: &[T],
+    data_norms: &[T],
     dim: usize,
     n: usize,
     k: usize,
@@ -162,16 +282,25 @@ where
 
     let first_idx = rng.random_range(0..n);
     let mut candidates = Vec::with_capacity(k * oversampling_factor * dim);
+    let mut candidate_norms = Vec::with_capacity(k * oversampling_factor);
+
     candidates.extend_from_slice(&data[first_idx * dim..(first_idx + 1) * dim]);
+    candidate_norms.push(data_norms[first_idx]);
 
     for _ in 0..n_rounds {
-        let n_candidates = candidates.len() / dim;
-
         let distances: Vec<T> = (0..n)
             .into_par_iter()
             .map(|i| {
                 let vec = &data[i * dim..(i + 1) * dim];
-                min_distance_to_centroids(vec, &candidates, dim, n_candidates, metric)
+                min_distance_to_centroids(
+                    vec,
+                    data_norms[i],
+                    &candidates,
+                    &candidate_norms,
+                    dim,
+                    candidate_norms.len(),
+                    metric,
+                )
             })
             .collect();
 
@@ -185,13 +314,14 @@ where
                 cumsum += dist.to_f64().unwrap();
                 if cumsum >= threshold {
                     candidates.extend_from_slice(&data[idx * dim..(idx + 1) * dim]);
+                    candidate_norms.push(data_norms[idx]);
                     break;
                 }
             }
         }
     }
 
-    weighted_kmeans_plus_plus(&candidates, dim, k, metric, seed + 1)
+    weighted_kmeans_plus_plus(&candidates, &candidate_norms, dim, k, metric, seed + 1)
 }
 
 /// Fast centroid initialisation via random unique selection
@@ -210,7 +340,7 @@ where
 /// ### Returns
 ///
 /// Initial centroids (k * dim elements)
-fn fast_random_init<T>(data: &[T], dim: usize, n: usize, k: usize, seed: usize) -> Vec<T>
+pub fn fast_random_init<T>(data: &[T], dim: usize, n: usize, k: usize, seed: usize) -> Vec<T>
 where
     T: Float,
 {
@@ -235,9 +365,11 @@ where
 /// ### Params
 ///
 /// * `data` - Training vectors (flattened)
+/// * `data_norms` - The precomputed norms of the data
 /// * `dim` - Embedding dimensions
 /// * `n` - Number of training vectors
 /// * `centroids` - Current centroids (modified in-place)
+/// * `centroid_norms` - Current centroid norms (modified in-place)
 /// * `k` - Number of clusters
 /// * `metric` - Distance metric
 /// * `max_iters` - Maximum iterations
@@ -245,9 +377,11 @@ where
 #[allow(clippy::too_many_arguments)]
 fn parallel_lloyd<T>(
     data: &[T],
+    data_norms: &[T],
     dim: usize,
     n: usize,
     centroids: &mut [T],
+    centroid_norms: &mut [T],
     k: usize,
     metric: &Dist,
     max_iters: usize,
@@ -256,7 +390,16 @@ fn parallel_lloyd<T>(
     T: Float + Send + Sync,
 {
     for iter in 0..max_iters {
-        let assignments = assign_all_parallel(data, dim, n, centroids, k, metric);
+        let assignments = assign_all_parallel(
+            data,
+            data_norms,
+            dim,
+            n,
+            centroids,
+            centroid_norms,
+            k,
+            metric,
+        );
 
         let (new_sums, counts) = (0..n)
             .into_par_iter()
@@ -291,10 +434,18 @@ fn parallel_lloyd<T>(
                 for d in 0..dim {
                     centroids[c * dim + d] = new_sums[c * dim + d] / count_t;
                 }
+
+                if matches!(metric, Dist::Cosine) {
+                    centroid_norms[c] = centroids[c * dim..(c + 1) * dim]
+                        .iter()
+                        .map(|&x| x * x)
+                        .fold(T::zero(), |a, b| a + b)
+                        .sqrt();
+                }
             }
         }
 
-        if verbose {
+        if verbose && (iter + 1) % 10 == 0 {
             println!("    Iteration {} complete", iter + 1);
         }
     }
@@ -334,6 +485,20 @@ pub fn train_centroids<T>(
 where
     T: Float + FromPrimitive + ToPrimitive + Send + Sync,
 {
+    let data_norms = if matches!(metric, Dist::Cosine) {
+        (0..n)
+            .map(|i| {
+                data[i * dim..(i + 1) * dim]
+                    .iter()
+                    .map(|&x| x * x)
+                    .fold(T::zero(), |a, b| a + b)
+                    .sqrt()
+            })
+            .collect()
+    } else {
+        vec![T::one(); n]
+    };
+
     let mut centroids = if n_centroids > 200 {
         if verbose {
             println!("  Initialising centroids via fast random selection");
@@ -343,7 +508,21 @@ where
         if verbose {
             println!("  Initialising centroids via k-means||");
         }
-        kmeans_parallel_init(data, dim, n, n_centroids, metric, seed)
+        kmeans_parallel_init(data, &data_norms, dim, n, n_centroids, metric, seed)
+    };
+
+    let mut centroid_norms = if matches!(metric, Dist::Cosine) {
+        (0..n_centroids)
+            .map(|i| {
+                centroids[i * dim..(i + 1) * dim]
+                    .iter()
+                    .map(|&x| x * x)
+                    .fold(T::zero(), |a, b| a + b)
+                    .sqrt()
+            })
+            .collect()
+    } else {
+        vec![T::one(); n_centroids]
     };
 
     if verbose {
@@ -351,9 +530,11 @@ where
     }
     parallel_lloyd(
         data,
+        &data_norms,
         dim,
         n,
         &mut centroids,
+        &mut centroid_norms,
         n_centroids,
         metric,
         max_iters,
@@ -419,11 +600,14 @@ pub fn build_csr_layout(
 /// ### Returns
 ///
 /// Vector of cluster assignments (one per input vector)
+#[allow(clippy::too_many_arguments)]
 pub fn assign_all_parallel<T>(
     data: &[T],
+    data_norms: &[T],
     dim: usize,
     n: usize,
     centroids: &[T],
+    centroid_norms: &[T],
     k: usize,
     metric: &Dist,
 ) -> Vec<usize>
@@ -440,7 +624,9 @@ where
                 let cent = &centroids[c * dim..(c + 1) * dim];
                 let dist = match metric {
                     Dist::Euclidean => euclidean_distance_static(vec, cent),
-                    Dist::Cosine => cosine_distance_static(vec, cent),
+                    Dist::Cosine => {
+                        cosine_distance_static_norm(vec, cent, &data_norms[i], &centroid_norms[c])
+                    }
                 };
                 if dist < best_dist {
                     best_dist = dist;
@@ -552,7 +738,19 @@ mod tests {
 
         let centroids = vec![0.0, 0.0, 10.0, 10.0];
 
-        let assignments = assign_all_parallel(&data, 2, 4, &centroids, 2, &Dist::Euclidean);
+        let data_norms = vec![1.0; 4];
+        let centroid_norms = vec![1.0; 2];
+
+        let assignments = assign_all_parallel(
+            &data,
+            &data_norms,
+            2,
+            4,
+            &centroids,
+            &centroid_norms,
+            2,
+            &Dist::Euclidean,
+        );
 
         assert_eq!(assignments, vec![0, 0, 1, 1]);
     }
@@ -567,7 +765,36 @@ mod tests {
 
         let centroids = vec![1.0, 0.0, 0.0, 1.0];
 
-        let assignments = assign_all_parallel(&data, 2, 3, &centroids, 2, &Dist::Cosine);
+        let data_norms: Vec<f64> = (0..3)
+            .map(|i| {
+                data[i * 2..(i + 1) * 2]
+                    .iter()
+                    .map(|&x| x * x)
+                    .sum::<f64>()
+                    .sqrt()
+            })
+            .collect();
+
+        let centroid_norms: Vec<f64> = (0..2)
+            .map(|i| {
+                centroids[i * 2..(i + 1) * 2]
+                    .iter()
+                    .map(|&x| x * x)
+                    .sum::<f64>()
+                    .sqrt()
+            })
+            .collect();
+
+        let assignments = assign_all_parallel(
+            &data,
+            &data_norms,
+            2,
+            3,
+            &centroids,
+            &centroid_norms,
+            2,
+            &Dist::Cosine,
+        );
 
         assert_eq!(assignments[0], 0);
         assert_eq!(assignments[1], 1);
@@ -650,9 +877,19 @@ mod tests {
     #[test]
     fn test_min_distance_to_centroids() {
         let vec = vec![5.0, 5.0];
+        let vec_norm = (vec[0] * vec[0] + vec[1] * vec[1]).sqrt();
         let centroids = vec![0.0, 0.0, 10.0, 10.0];
+        let centroid_norms = vec![0.0, (10.0f64 * 10.0 + 10.0 * 10.0).sqrt()];
 
-        let dist = min_distance_to_centroids(&vec, &centroids, 2, 2, &Dist::Euclidean);
+        let dist = min_distance_to_centroids(
+            &vec,
+            vec_norm,
+            &centroids,
+            &centroid_norms,
+            2,
+            2,
+            &Dist::Euclidean,
+        );
 
         // Distance to (0,0) is 50, to (10,10) is 50, so min is 50
         assert_relative_eq!(dist, 50.0, epsilon = 1e-5);
@@ -661,8 +898,17 @@ mod tests {
     #[test]
     fn test_weighted_kmeans_plus_plus() {
         let data = vec![0.0, 0.0, 0.1, 0.1, 0.2, 0.2, 10.0, 10.0, 10.1, 10.1];
+        let data_norms: Vec<f64> = (0..5)
+            .map(|i| {
+                data[i * 2..(i + 1) * 2]
+                    .iter()
+                    .map(|&x| x * x)
+                    .sum::<f64>()
+                    .sqrt()
+            })
+            .collect();
 
-        let centroids = weighted_kmeans_plus_plus(&data, 2, 2, &Dist::Euclidean, 42);
+        let centroids = weighted_kmeans_plus_plus(&data, &data_norms, 2, 2, &Dist::Euclidean, 42);
 
         assert_eq!(centroids.len(), 4);
 

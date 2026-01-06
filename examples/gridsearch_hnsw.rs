@@ -1,28 +1,11 @@
 mod commons;
 
-use ann_search_rs::utils::KnnValidation;
 use ann_search_rs::*;
 use clap::Parser;
 use commons::*;
 use faer::Mat;
 use std::time::Instant;
 use thousands::*;
-
-#[derive(Parser)]
-struct Cli {
-    #[arg(long, default_value_t = DEFAULT_N_CELLS)]
-    n_cells: usize,
-    #[arg(long, default_value_t = DEFAULT_DIM)]
-    dim: usize,
-    #[arg(long, default_value_t = DEFAULT_N_CLUSTERS)]
-    n_clusters: usize,
-    #[arg(long, default_value_t = DEFAULT_K)]
-    k: usize,
-    #[arg(long, default_value_t = DEFAULT_SEED)]
-    seed: u64,
-    #[arg(long, default_value = DEFAULT_DISTANCE)]
-    distance: String,
-}
 
 fn main() {
     let cli = Cli::parse();
@@ -37,28 +20,49 @@ fn main() {
     );
     println!("-----------------------------");
 
-    let data: Mat<f32> = generate_clustered_data(cli.n_cells, cli.dim, cli.n_clusters, cli.seed);
-    let query_data = data.as_ref();
+    let (data, _): (Mat<f32>, _) = generate_data(&cli);
+    let query_data = subsample_with_noise(&data, DEFAULT_N_QUERY, cli.seed + 1);
     let mut results = Vec::new();
 
+    // Exhaustive query benchmark
     println!("Building exhaustive index...");
     let start = Instant::now();
     let exhaustive_idx = build_exhaustive_index(data.as_ref(), &cli.distance);
     let build_time = start.elapsed().as_secs_f64() * 1000.0;
 
+    let index_size_mb = exhaustive_idx.memory_usage_bytes() as f64 / (1024.0 * 1024.0);
+
     println!("Querying exhaustive index...");
     let start = Instant::now();
     let (true_neighbors, true_distances) =
-        query_exhaustive_index(query_data, &exhaustive_idx, cli.k, true, false);
+        query_exhaustive_index(query_data.as_ref(), &exhaustive_idx, cli.k, true, false);
     let query_time = start.elapsed().as_secs_f64() * 1000.0;
 
-    results.push(BenchmarkResult {
-        method: "Exhaustive".to_string(),
+    results.push(BenchmarkResultSize {
+        method: "Exhaustive (query)".to_string(),
         build_time_ms: build_time,
         query_time_ms: query_time,
         total_time_ms: build_time + query_time,
         recall_at_k: 1.0,
         mean_dist_err: 0.0,
+        index_size_mb,
+    });
+
+    // Exhaustive self-query benchmark
+    println!("Self-querying exhaustive index...");
+    let start = Instant::now();
+    let (true_neighbors_self, true_distances_self) =
+        query_exhaustive_self(&exhaustive_idx, cli.k, true, false);
+    let self_query_time = start.elapsed().as_secs_f64() * 1000.0;
+
+    results.push(BenchmarkResultSize {
+        method: "Exhaustive (self)".to_string(),
+        build_time_ms: build_time,
+        query_time_ms: self_query_time,
+        total_time_ms: build_time + self_query_time,
+        recall_at_k: 1.0,
+        mean_dist_err: 0.0,
+        index_size_mb,
     });
 
     println!("-----------------------------");
@@ -90,36 +94,67 @@ fn main() {
         );
         let build_time = start.elapsed().as_secs_f64() * 1000.0;
 
+        let index_size_mb = hnsw_idx.memory_usage_bytes() as f64 / (1024.0 * 1024.0);
+
+        // Query benchmarks
         let ef_search_values = vec![50, 75, 100];
         for ef_search in ef_search_values {
             println!("Querying HNSW index (ef_search={})...", ef_search);
             let start = Instant::now();
-            let (approx_neighbors, approx_distances) =
-                query_hnsw_index(query_data, &hnsw_idx, cli.k, ef_search, true, false);
+            let (approx_neighbors, approx_distances) = query_hnsw_index(
+                query_data.as_ref(),
+                &hnsw_idx,
+                cli.k,
+                ef_search,
+                true,
+                false,
+            );
             let query_time = start.elapsed().as_secs_f64() * 1000.0;
 
             let recall = calculate_recall(&true_neighbors, &approx_neighbors, cli.k);
-            let dist_error = calculate_distance_error(
+            let dist_error = calculate_dist_error(
                 true_distances.as_ref().unwrap(),
                 approx_distances.as_ref().unwrap(),
                 cli.k,
             );
 
-            let internal_recall = hnsw_idx.validate_index(cli.k, cli.seed as usize, None);
-            println!("  Internal validation: {:.3}", internal_recall);
-
-            results.push(BenchmarkResult {
-                method: format!("HNSW-M{}-ef{}-s{}", m, ef_construction, ef_search),
+            results.push(BenchmarkResultSize {
+                method: format!("HNSW-M{}-ef{}-s{} (query)", m, ef_construction, ef_search),
                 build_time_ms: build_time,
                 query_time_ms: query_time,
                 total_time_ms: build_time + query_time,
                 recall_at_k: recall,
                 mean_dist_err: dist_error,
+                index_size_mb,
             });
         }
+
+        // Self-query benchmark
+        println!("Self-querying HNSW index...");
+        let start = Instant::now();
+        let (approx_neighbors_self, approx_distances_self) =
+            query_hnsw_self(&hnsw_idx, cli.k, 100, true, false);
+        let self_query_time = start.elapsed().as_secs_f64() * 1000.0;
+
+        let recall_self = calculate_recall(&true_neighbors_self, &approx_neighbors_self, cli.k);
+        let dist_error_self = calculate_dist_error(
+            true_distances_self.as_ref().unwrap(),
+            approx_distances_self.as_ref().unwrap(),
+            cli.k,
+        );
+
+        results.push(BenchmarkResultSize {
+            method: format!("HNSW-M{}-ef{} (self)", m, ef_construction),
+            build_time_ms: build_time,
+            query_time_ms: self_query_time,
+            total_time_ms: build_time + self_query_time,
+            recall_at_k: recall_self,
+            mean_dist_err: dist_error_self,
+            index_size_mb,
+        });
     }
 
-    print_results(
+    print_results_size(
         &format!("{}k cells, {}D", cli.n_cells / 1000, cli.dim),
         &results,
     );

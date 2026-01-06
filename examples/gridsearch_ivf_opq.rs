@@ -7,30 +7,6 @@ use std::collections::HashSet;
 use std::time::Instant;
 use thousands::*;
 
-#[derive(Parser)]
-struct Cli {
-    #[arg(long, default_value_t = DEFAULT_N_CELLS)]
-    n_cells: usize,
-
-    #[arg(long, default_value_t = DEFAULT_DIM)]
-    dim: usize,
-
-    #[arg(long, default_value_t = DEFAULT_N_CLUSTERS)]
-    n_clusters: usize,
-
-    #[arg(long, default_value_t = DEFAULT_K)]
-    k: usize,
-
-    #[arg(long, default_value_t = DEFAULT_SEED)]
-    seed: u64,
-
-    #[arg(long, default_value = DEFAULT_DISTANCE)]
-    distance: String,
-
-    #[arg(long, default_value = DEFAULT_DATA)]
-    data: String,
-}
-
 fn main() {
     let cli = Cli::parse();
 
@@ -44,52 +20,58 @@ fn main() {
     );
     println!("-----------------------------");
 
-    let data_type = parse_data(&cli.data).unwrap_or_default();
-
-    let data: Mat<f32> = match data_type {
-        SyntheticData::GaussianNoise => {
-            generate_clustered_data(cli.n_cells, cli.dim, cli.n_clusters, cli.seed)
-        }
-        SyntheticData::Correlated => {
-            println!("Using data for high dimensional ANN searches...\n");
-            generate_clustered_data_high_dim(
-                cli.n_cells,
-                cli.dim,
-                cli.n_clusters,
-                DEFAULT_COR_STRENGTH,
-                cli.seed,
-            )
-        }
-    };
-
-    let query_data = data.as_ref();
+    let (data, _): (Mat<f32>, _) = generate_data(&cli);
+    let query_data = subsample_with_noise(&data, DEFAULT_N_QUERY, cli.seed + 1);
     let mut results = Vec::new();
 
+    // Exhaustive query benchmark
     println!("Building exhaustive index...");
     let start = Instant::now();
     let exhaustive_idx = build_exhaustive_index(data.as_ref(), &cli.distance);
     let build_time = start.elapsed().as_secs_f64() * 1000.0;
 
+    let index_size_mb = exhaustive_idx.memory_usage_bytes() as f64 / (1024.0 * 1024.0);
+
     println!("Querying exhaustive index...");
     let start = Instant::now();
-    let (true_neighbors, _) =
-        query_exhaustive_index(query_data, &exhaustive_idx, cli.k, false, false);
+    let (true_neighbours, _) =
+        query_exhaustive_index(query_data.as_ref(), &exhaustive_idx, cli.k, false, false);
     let query_time = start.elapsed().as_secs_f64() * 1000.0;
 
-    results.push(BenchmarkResult {
-        method: "Exhaustive".to_string(),
+    results.push(BenchmarkResultSize {
+        method: "Exhaustive (query)".to_string(),
         build_time_ms: build_time,
         query_time_ms: query_time,
         total_time_ms: build_time + query_time,
         recall_at_k: 1.0,
         mean_dist_err: 0.0,
+        index_size_mb,
+    });
+
+    // Exhaustive self-query benchmark
+    println!("Self-querying exhaustive index...");
+    let start = Instant::now();
+    let (true_neighbours_self, _) = query_exhaustive_self(&exhaustive_idx, cli.k, false, false);
+    let self_query_time = start.elapsed().as_secs_f64() * 1000.0;
+
+    results.push(BenchmarkResultSize {
+        method: "Exhaustive (self)".to_string(),
+        build_time_ms: build_time,
+        query_time_ms: self_query_time,
+        total_time_ms: build_time + self_query_time,
+        recall_at_k: 1.0,
+        mean_dist_err: 0.0,
+        index_size_mb,
     });
 
     println!("-----------------------------------------------------------------------------------------------");
 
-    let nlist_values = [10, 20, 25, 50, 100];
+    let nlist_values = [
+        (cli.n_cells as f32 * 0.5).sqrt() as usize,
+        (cli.n_cells as f32).sqrt() as usize,
+        (cli.n_cells as f32 * 2.0).sqrt() as usize,
+    ];
 
-    // IVF-OPQ benchmarks
     let m_values: Vec<usize> = if cli.dim >= 128 {
         vec![16, 32, 48]
     } else {
@@ -106,7 +88,7 @@ fn main() {
             let start = Instant::now();
             let ivf_opq_idx = build_ivf_opq_index(
                 data.as_ref(),
-                nlist,
+                Some(nlist),
                 *m,
                 None,
                 None,
@@ -117,10 +99,12 @@ fn main() {
             );
             let build_time = start.elapsed().as_secs_f64() * 1000.0;
 
+            let index_size_mb = ivf_opq_idx.memory_usage_bytes() as f64 / (1024.0 * 1024.0);
+
             let nprobe_values = [
-                (0.05 * nlist as f64) as usize,
-                (0.1 * nlist as f64) as usize,
-                (0.15 * nlist as f64) as usize,
+                (nlist as f32).sqrt() as usize,
+                (nlist as f32 * 2.0).sqrt() as usize,
+                (0.05 * nlist as f32) as usize,
             ];
 
             let mut nprobe_values: Vec<_> = nprobe_values
@@ -130,8 +114,9 @@ fn main() {
                 .collect();
             nprobe_values.sort();
 
-            for nprobe in nprobe_values {
-                if nprobe > nlist || nprobe == 0 {
+            // Query benchmarks
+            for nprobe in &nprobe_values {
+                if *nprobe > nlist || *nprobe == 0 {
                     continue;
                 }
 
@@ -140,25 +125,53 @@ fn main() {
                     nlist, m, nprobe
                 );
                 let start = Instant::now();
-                let (approx_neighbors, _) =
-                    query_ivf_opq_index(query_data, &ivf_opq_idx, cli.k, Some(nprobe), true, false);
+                let (approx_neighbours, _) = query_ivf_opq_index(
+                    query_data.as_ref(),
+                    &ivf_opq_idx,
+                    cli.k,
+                    Some(*nprobe),
+                    false,
+                    false,
+                );
                 let query_time = start.elapsed().as_secs_f64() * 1000.0;
 
-                let recall = calculate_recall(&true_neighbors, &approx_neighbors, cli.k);
+                let recall = calculate_recall(&true_neighbours, &approx_neighbours, cli.k);
 
-                results.push(BenchmarkResult {
-                    method: format!("IVF-OPQ-nl{}-m{}-np{}", nlist, m, nprobe),
+                results.push(BenchmarkResultSize {
+                    method: format!("IVF-OPQ-nl{}-m{}-np{} (query)", nlist, m, nprobe),
                     build_time_ms: build_time,
                     query_time_ms: query_time,
                     total_time_ms: build_time + query_time,
                     recall_at_k: recall,
-                    mean_dist_err: 0.0,
+                    mean_dist_err: f64::NAN,
+                    index_size_mb,
                 });
             }
+
+            // Self-query benchmark
+            let nprobe_self = (nlist as f32 * 2.0).sqrt() as usize;
+            println!("Self-querying IVF-OPQ index (nprobe={})...", nprobe_self);
+            let start = Instant::now();
+            let (approx_neighbours_self, _) =
+                query_ivf_opq_index_self(&ivf_opq_idx, cli.k, Some(nprobe_self), false, false);
+            let self_query_time = start.elapsed().as_secs_f64() * 1000.0;
+
+            let recall_self =
+                calculate_recall(&true_neighbours_self, &approx_neighbours_self, cli.k);
+
+            results.push(BenchmarkResultSize {
+                method: format!("IVF-OPQ-nl{}-m{} (self)", nlist, m),
+                build_time_ms: build_time,
+                query_time_ms: self_query_time,
+                total_time_ms: build_time + self_query_time,
+                recall_at_k: recall_self,
+                mean_dist_err: f64::NAN,
+                index_size_mb,
+            });
         }
     }
 
-    print_results_recall_only(
+    print_results_size(
         &format!("{}k cells, {}D", cli.n_cells / 1000, cli.dim),
         &results,
     );

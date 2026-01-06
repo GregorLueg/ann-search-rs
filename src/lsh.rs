@@ -5,6 +5,7 @@ use rand_distr::StandardNormal;
 use rayon::prelude::*;
 use rustc_hash::{FxHashMap, FxHashSet};
 use std::{cell::RefCell, cmp::Ord, collections::BinaryHeap, iter::Sum};
+use thousands::*;
 
 use crate::utils::dist::*;
 use crate::utils::heap_structs::*;
@@ -57,17 +58,14 @@ impl<T> VectorDistance<T> for LSHIndex<T>
 where
     T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum,
 {
-    /// Return the flat vectors
     fn vectors_flat(&self) -> &[T] {
         &self.vectors_flat
     }
 
-    /// Return the original dimensions
     fn dim(&self) -> usize {
         self.dim
     }
 
-    /// Return the normalised values for the Cosine calculation
     fn norms(&self) -> &[T] {
         &self.norms
     }
@@ -78,6 +76,10 @@ where
     T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum,
     Self: LSHQuery<T>,
 {
+    //////////////////////
+    // Index generation //
+    //////////////////////
+
     /// Construct a new LSH index
     ///
     /// Builds hash tables in parallel. For each table, hashes all vectors
@@ -101,14 +103,7 @@ where
         bits_per_hash: usize,
         seed: usize,
     ) -> Self {
-        let n = data.nrows();
-        let dim = data.ncols();
-
-        // Flatten vectors for cache-friendly distance calculations
-        let mut vectors_flat = Vec::with_capacity(n * dim);
-        for i in 0..n {
-            vectors_flat.extend(data.row(i).iter().cloned());
-        }
+        let (vectors_flat, n, dim) = matrix_to_flat(data);
 
         let norms = match metric {
             Dist::Cosine => (0..n)
@@ -169,6 +164,10 @@ where
             bits_per_hash,
         }
     }
+
+    ///////////
+    // Query //
+    ///////////
 
     /// Query the index for approximate nearest neighbours
     ///
@@ -234,6 +233,115 @@ where
 
         let query_vec: Vec<T> = query_row.iter().cloned().collect();
         self.query(&query_vec, k, max_cand)
+    }
+
+    /// Generate kNN graph from vectors stored in the index
+    ///
+    /// Queries each vector in the index against itself to build a complete
+    /// kNN graph.
+    ///
+    /// ### Params
+    ///
+    /// * `k` - Number of neighbours per vector
+    /// * `max_cand` - Optional candidate limit
+    /// * `return_dist` - Whether to return distances
+    /// * `verbose` - Controls verbosity
+    ///
+    /// ### Returns
+    ///
+    /// Tuple of `(knn_indices, optional distances)` where each row corresponds
+    /// to a vector in the index
+    pub fn generate_knn(
+        &self,
+        k: usize,
+        max_cand: Option<usize>,
+        return_dist: bool,
+        verbose: bool,
+    ) -> (Vec<Vec<usize>>, Option<Vec<Vec<T>>>) {
+        use std::sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        };
+
+        let counter = Arc::new(AtomicUsize::new(0));
+
+        let results: Vec<(Vec<usize>, Vec<T>, bool)> = (0..self.n)
+            .into_par_iter()
+            .map(|i| {
+                let start = i * self.dim;
+                let end = start + self.dim;
+                let vec = &self.vectors_flat[start..end];
+
+                if verbose {
+                    let count = counter.fetch_add(1, Ordering::Relaxed) + 1;
+                    if count.is_multiple_of(100_000) {
+                        println!(
+                            "  Processed {} / {} samples.",
+                            count.separate_with_underscores(),
+                            self.n.separate_with_underscores()
+                        );
+                    }
+                }
+
+                self.query(vec, k, max_cand)
+            })
+            .collect();
+
+        #[allow(unused_variables)] // clippy being stupid
+        let mut missed: usize = 0;
+
+        for (_, _, fallback) in &results {
+            if *fallback {
+                missed += 1;
+            }
+        }
+
+        if (missed as f32) / (self.n as f32) >= 0.01 {
+            println!("More than 1% of samples were not represented in the buckets.");
+            println!("Please verify underlying data");
+        }
+
+        if return_dist {
+            let mut indices = Vec::with_capacity(results.len());
+            let mut distances = Vec::with_capacity(results.len());
+
+            for (idx, dist, _) in results {
+                indices.push(idx);
+                distances.push(dist);
+            }
+            (indices, Some(distances))
+        } else {
+            let indices: Vec<Vec<usize>> = results.into_iter().map(|(idx, _, _)| idx).collect();
+            (indices, None)
+        }
+    }
+
+    /// Returns the size of the index in bytes
+    ///
+    /// ### Returns
+    ///
+    /// Number of bytes used by the index
+    pub fn memory_usage_bytes(&self) -> usize {
+        let mut total = std::mem::size_of_val(self);
+
+        total += self.vectors_flat.capacity() * std::mem::size_of::<T>();
+        total += self.norms.capacity() * std::mem::size_of::<T>();
+        total += self.random_vecs.capacity() * std::mem::size_of::<T>();
+
+        // hash_tables outer Vec
+        total += self.hash_tables.capacity() * std::mem::size_of::<FxHashMap<u64, Vec<usize>>>();
+
+        // each HashMap and its Vec<usize> values
+        for table in &self.hash_tables {
+            total +=
+                table.capacity() * (std::mem::size_of::<u64>() + std::mem::size_of::<Vec<usize>>());
+
+            for indices in table.values() {
+                total += indices.capacity() * std::mem::size_of::<usize>();
+            }
+        }
+
+        total
     }
 }
 
@@ -646,27 +754,20 @@ where
     T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum,
     Self: LSHQuery<T>,
 {
-    /// Internal querying function
     fn query_for_validation(&self, query_vec: &[T], k: usize) -> (Vec<usize>, Vec<T>) {
         // No maximum candidates here...
         let (indices, dist, _) = self.query(query_vec, k, None);
         (indices, dist)
     }
 
-    /// Returns n
     fn n(&self) -> usize {
         self.n
     }
 
-    /// Returns the distance metric
     fn metric(&self) -> Dist {
         self.metric
     }
 }
-
-//////////////////////////
-// HierarchicalLSHIndex //
-//////////////////////////
 
 ///////////
 // Tests //

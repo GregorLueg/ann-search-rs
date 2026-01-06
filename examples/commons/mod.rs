@@ -1,35 +1,81 @@
 #![allow(dead_code)]
 
+use clap::Parser;
 use faer::traits::ComplexField;
 use faer::Mat;
 use num_traits::{Float, FromPrimitive, ToPrimitive};
 use rand::{rngs::StdRng, seq::SliceRandom, Rng, SeedableRng};
+use rand_distr::StandardNormal;
 use rustc_hash::FxHashSet;
+use thousands::*;
 
 ////////////
 // Consts //
 ////////////
 
 pub const DEFAULT_N_CELLS: usize = 150_000;
+pub const DEFAULT_N_QUERY: usize = DEFAULT_N_CELLS / 10;
 pub const DEFAULT_DIM: usize = 32;
 pub const DEFAULT_N_CLUSTERS: usize = 25;
 pub const DEFAULT_K: usize = 15;
-pub const DEFAULT_SEED: u64 = 10101;
+pub const DEFAULT_SEED: u64 = 42;
 pub const DEFAULT_DISTANCE: &str = "euclidean";
 pub const DEFAULT_COR_STRENGTH: f64 = 0.5;
 pub const DEFAULT_DATA: &str = "gaussian";
+pub const DEFAULT_INTRINSIC_DIM: usize = 16;
 
-/////////////
-// Helpers //
-/////////////
+////////////
+// Parser //
+////////////
 
-#[derive(Clone, Debug, Copy, PartialEq, Default)]
+/// Parsing structure
+///
+/// ### Fields
+///
+/// * `n_cells` - Number of cells/samples
+/// * `dim` - Number of dimensions to use
+/// * `n_clusters` - Number of clusters in the data
+/// * `k` - Number of neighbours to search
+/// * `seed` - Random seed for reproducibility
+/// * `distance` - The distance to use. One of `"euclidean"` or `"cosine"`.
+/// * `data` - The data to use. One of `"gaussian"` or `"correlated"`.
+#[derive(Parser, Clone)]
+pub struct Cli {
+    #[arg(long, default_value_t = DEFAULT_N_CELLS)]
+    pub n_cells: usize,
+
+    #[arg(long, default_value_t = DEFAULT_DIM)]
+    pub dim: usize,
+
+    #[arg(long, default_value_t = DEFAULT_N_CLUSTERS)]
+    pub n_clusters: usize,
+
+    #[arg(long, default_value_t = DEFAULT_K)]
+    pub k: usize,
+
+    #[arg(long, default_value_t = DEFAULT_SEED)]
+    pub seed: u64,
+
+    #[arg(long, default_value = DEFAULT_DISTANCE)]
+    pub distance: String,
+
+    #[arg(long, default_value = DEFAULT_DATA)]
+    pub data: String,
+
+    #[arg(long, default_value_t = DEFAULT_INTRINSIC_DIM)]
+    pub intrinsic_dim: usize,
+}
+
+//////////
+// Data //
+//////////
+
+#[derive(Default)]
 pub enum SyntheticData {
-    /// Default synthetic data
     #[default]
     GaussianNoise,
-    /// Synthetic data designed to work with high dimensionality
     Correlated,
+    LowRank,
 }
 
 /// Helper function to parse the data type
@@ -45,6 +91,7 @@ pub fn parse_data(s: &str) -> Option<SyntheticData> {
     match s.to_lowercase().as_str() {
         "gaussian" => Some(SyntheticData::GaussianNoise),
         "correlated" => Some(SyntheticData::Correlated),
+        "lowrank" => Some(SyntheticData::LowRank),
         _ => None,
     }
 }
@@ -70,7 +117,7 @@ pub fn generate_clustered_data<T>(
     dim: usize,
     n_clusters: usize,
     seed: u64,
-) -> Mat<T>
+) -> (Mat<T>, Vec<usize>)
 where
     T: Float + FromPrimitive + ComplexField,
 {
@@ -116,7 +163,7 @@ where
         }
     }
 
-    data
+    (data, cluster_assignments)
 }
 
 /// Generate synthetic single-cell-like data with cluster structure and correlated dimensions
@@ -141,7 +188,7 @@ pub fn generate_clustered_data_high_dim<T>(
     n_clusters: usize,
     correlation_strength: f64,
     seed: u64,
-) -> Mat<T>
+) -> (Mat<T>, Vec<usize>)
 where
     T: Float + FromPrimitive + ComplexField,
 {
@@ -221,8 +268,8 @@ where
         }
     }
 
-    // add correlation structure: groups of dimensions that are linear combinations
-    // of "source" dimensions plus noise
+    // add correlation structure: groups of dimensions that are linear
+    // combinations of "source" dimensions plus noise
     let n_correlation_groups = dim / 8;
     let dims_per_group = 4;
     let noise_weight = 1.0 - correlation_strength;
@@ -257,8 +304,241 @@ where
         }
     }
 
-    data
+    (data, cluster_assignments)
 }
+
+/// Generate data specifically
+///
+/// Creates high-dimensional data that actually lives in a low-dimensional
+/// subspace with rotated cluster structure.
+///
+/// ### Params
+///
+/// * `n_samples` - Number of samples
+/// * `embedding_dim` - Full dimensionality (e.g., 128, 256)
+/// * `intrinsic_dim` - True dimensionality of data (e.g., 16, 32)
+/// * `n_clusters` - Number of clusters
+/// * `seed` - Random seed
+///
+/// ### Returns
+///
+/// Matrix of shape (n_samples, embedding_dim)
+pub fn generate_low_rank_rotated_data<T>(
+    n_samples: usize,
+    embedding_dim: usize,
+    intrinsic_dim: usize,
+    n_clusters: usize,
+    seed: u64,
+) -> (Mat<T>, Vec<usize>)
+where
+    T: Float + FromPrimitive + ComplexField,
+{
+    assert!(
+        intrinsic_dim <= embedding_dim,
+        "Intrinsic dim must be <= embedding dim"
+    );
+
+    let mut rng = StdRng::seed_from_u64(seed);
+
+    // generate well-separated clusters in low-dimensional space
+    let cluster_separation = (intrinsic_dim as f64).sqrt() * 3.0;
+    let mut centres_low_dim = Vec::with_capacity(n_clusters);
+
+    for _ in 0..n_clusters {
+        let centre = loop {
+            let candidate: Vec<f64> = (0..intrinsic_dim)
+                .map(|_| rng.random_range(-cluster_separation..cluster_separation))
+                .collect();
+
+            let too_close = centres_low_dim.iter().any(|existing: &Vec<f64>| {
+                let dist_sq: f64 = candidate
+                    .iter()
+                    .zip(existing.iter())
+                    .map(|(a, b)| (a - b).powi(2))
+                    .sum();
+                dist_sq < (cluster_separation * 0.5).powi(2)
+            });
+
+            if !too_close {
+                break candidate;
+            }
+        };
+        centres_low_dim.push(centre);
+    }
+
+    // assign samples to clusters
+    let mut cluster_assignments = Vec::new();
+    for cluster_idx in 0..n_clusters {
+        let n_in_cluster = n_samples / n_clusters;
+        cluster_assignments.extend(vec![cluster_idx; n_in_cluster]);
+    }
+    while cluster_assignments.len() < n_samples {
+        cluster_assignments.push(rng.random_range(0..n_clusters));
+    }
+    cluster_assignments.shuffle(&mut rng);
+
+    // generate samples in low-dimensional space
+    let mut data_low_dim = Mat::<T>::zeros(n_samples, intrinsic_dim);
+    let cluster_std = 0.3;
+
+    for (i, &cluster_idx) in cluster_assignments.iter().enumerate() {
+        let centre = &centres_low_dim[cluster_idx];
+        for j in 0..intrinsic_dim {
+            let u1: f64 = rng.random();
+            let u2: f64 = rng.random();
+            let noise = (-2.0 * u1.ln()).sqrt() * (2.0 * std::f64::consts::PI * u2).cos();
+            data_low_dim[(i, j)] = T::from_f64(centre[j] + noise * cluster_std).unwrap();
+        }
+    }
+
+    // create random rotation matrix to embed into high-dimensional space
+    let mut rotation = Mat::<T>::zeros(intrinsic_dim, embedding_dim);
+
+    // fill with random Gaussian values
+    for i in 0..intrinsic_dim {
+        for j in 0..embedding_dim {
+            let val: f64 = rng.sample(StandardNormal);
+            rotation[(i, j)] = T::from_f64(val).unwrap();
+        }
+    }
+
+    // orthonormalise columns via Gram-Schmidt
+    for col in 0..embedding_dim.min(intrinsic_dim) {
+        // orthogonalise against previous columns
+        for prev_col in 0..col {
+            let mut dot = T::zero();
+            for row in 0..intrinsic_dim {
+                dot = dot + rotation[(row, col)] * rotation[(row, prev_col)];
+            }
+            for row in 0..intrinsic_dim {
+                rotation[(row, col)] = rotation[(row, col)] - dot * rotation[(row, prev_col)];
+            }
+        }
+
+        let mut norm_sq = T::zero();
+        for row in 0..intrinsic_dim {
+            norm_sq = norm_sq + rotation[(row, col)] * rotation[(row, col)];
+        }
+        let norm = norm_sq.sqrt();
+        if norm > T::epsilon() {
+            for row in 0..intrinsic_dim {
+                rotation[(row, col)] = rotation[(row, col)] / norm;
+            }
+        }
+    }
+
+    // project to high-dimensional space: data_high = data_low * rotation
+    let mut data_high_dim = Mat::<T>::zeros(n_samples, embedding_dim);
+    for i in 0..n_samples {
+        for j in 0..embedding_dim {
+            let mut sum = T::zero();
+            for k in 0..intrinsic_dim {
+                sum = sum + data_low_dim[(i, k)] * rotation[(k, j)];
+            }
+            data_high_dim[(i, j)] = sum;
+        }
+    }
+
+    // Add small amount of isotropic noise in the full space
+    let noise_std = 0.01;
+    for i in 0..n_samples {
+        for j in 0..embedding_dim {
+            let u1: f64 = rng.random();
+            let u2: f64 = rng.random();
+            let noise = (-2.0 * u1.ln()).sqrt() * (2.0 * std::f64::consts::PI * u2).cos();
+            data_high_dim[(i, j)] = data_high_dim[(i, j)] + T::from_f64(noise * noise_std).unwrap();
+        }
+    }
+
+    (data_high_dim, cluster_assignments)
+}
+
+/// Wrapper function to generate the synthetic data to use
+///
+/// ### Params
+///
+/// * `cli` - The Cli structure with the data
+///
+/// ### Returns
+///
+/// `(syn data, cluster assignments)`
+pub fn generate_data(cli: &Cli) -> (Mat<f32>, Vec<usize>) {
+    let data_type = parse_data(&cli.data).unwrap_or_default();
+    let res: (Mat<f32>, Vec<usize>) = match data_type {
+        SyntheticData::GaussianNoise => {
+            println!(">>> Using simple Gaussian cluster data. <<<");
+            generate_clustered_data(cli.n_cells, cli.dim, cli.n_clusters, cli.seed)
+        }
+        SyntheticData::Correlated => {
+            println!(">>> Using data with subspace structure and correlated features. <<<");
+            generate_clustered_data_high_dim(
+                cli.n_cells,
+                cli.dim,
+                cli.n_clusters,
+                DEFAULT_COR_STRENGTH,
+                cli.seed,
+            )
+        }
+        SyntheticData::LowRank => {
+            println!(">>> Using data that simulating manifold hypothesis. <<<");
+            generate_low_rank_rotated_data(
+                cli.n_cells,
+                cli.dim,
+                cli.intrinsic_dim,
+                cli.n_clusters,
+                cli.seed,
+            )
+        }
+    };
+
+    res
+}
+
+/// Randomly subsample a matrix and add Gaussian noise
+///
+/// ### Params
+///
+/// * `data` - The input matrix to subsample
+/// * `n_samples` - Number of samples to draw
+/// * `noise_scale` - Standard deviation of noise to add
+/// * `seed` - Random seed for reproducibility
+///
+/// ### Returns
+///
+/// Matrix of shape (n_samples, dim) with noise added
+pub fn subsample_with_noise<T>(data: &Mat<T>, n_samples: usize, seed: u64) -> Mat<T>
+where
+    T: Float + FromPrimitive + ComplexField,
+{
+    let mut rng = StdRng::seed_from_u64(seed + 1000);
+    let (n_rows, n_cols) = data.shape();
+
+    let mut indices: Vec<usize> = (0..n_rows).collect();
+    indices.shuffle(&mut rng);
+    indices.truncate(n_samples.min(n_rows));
+
+    let mut result = Mat::<T>::zeros(n_samples.min(n_rows), n_cols);
+
+    for (i, &row_idx) in indices.iter().enumerate() {
+        for j in 0..n_cols {
+            let u1: f64 = rng.random();
+            let u2: f64 = rng.random();
+            let noise = (-2.0 * u1.ln()).sqrt() * (2.0 * std::f64::consts::PI * u2).cos();
+            let noised_value = data[(row_idx, j)].to_f64().unwrap() + noise * 0.05;
+            result[(i, j)] = T::from_f64(noised_value).unwrap();
+        }
+    }
+
+    result
+}
+
+////////////////
+// Benchmarks //
+////////////////
+
+////////////////
+// Structures //
+////////////////
 
 /// BenchmarkResult
 ///
@@ -270,14 +550,41 @@ where
 /// * `total_time_ms` - Total time the index build & query takes in ms
 /// * `recall_at_k` - Recall@k neighbours against ground truth
 /// * `mean_dist_err` - Mean distance error against ground truth
-pub struct BenchmarkResult {
+/// * `index_size_mb` - Size of the index
+pub struct BenchmarkResultSize {
     pub method: String,
     pub build_time_ms: f64,
     pub query_time_ms: f64,
     pub total_time_ms: f64,
     pub recall_at_k: f64,
     pub mean_dist_err: f64,
+    pub index_size_mb: f64,
 }
+
+/// BenchmarkResultPurity - includes cluster purity metric
+///
+/// ### Fields
+///
+/// * `method` - Name of the method
+/// * `build_time_ms` - The build time of the index in ms
+/// * `query_time_ms` - The query time of the index in ms
+/// * `total_time_ms` - Total time the index build & query takes in ms
+/// * `recall_at_k` - Recall@k neighbours against ground truth
+/// * `cluster_purity` - Fraction of neighbors from same cluster
+/// * `index_size_mb` - Index size in MB
+pub struct BenchmarkResultPurity {
+    pub method: String,
+    pub build_time_ms: f64,
+    pub query_time_ms: f64,
+    pub total_time_ms: f64,
+    pub recall_at_k: f64,
+    pub cluster_purity: f64,
+    pub index_size_mb: f64,
+}
+
+/////////////
+// Helpers //
+/////////////
 
 /// Calculate Recall@k
 ///
@@ -321,7 +628,7 @@ pub fn calculate_recall(
 /// ### Returns
 ///
 /// The mean distance error
-pub fn calculate_distance_error<T>(true_dist: &[Vec<T>], approx_dist: &[Vec<T>], k: usize) -> f64
+pub fn calculate_dist_error<T>(true_dist: &[Vec<T>], approx_dist: &[Vec<T>], k: usize) -> f64
 where
     T: Float + ToPrimitive,
 {
@@ -337,59 +644,105 @@ where
     total_error / (true_dist.len() * k) as f64
 }
 
-/// Helper to print results to console
+/// Calculate cluster purity of kNN graph
+///
+/// Measures what fraction of each point's neighbors belong to the same cluster.
+/// High purity (>0.8) means the method preserves cluster structure well.
 ///
 /// ### Params
 ///
-/// * `config` - Benchmark configuration
-/// * `results` - Benchmark results to print
-pub fn print_results(config: &str, results: &[BenchmarkResult]) {
-    println!("\n{:=>100}", "");
-    println!("Benchmark: {}", config);
-    println!("{:=>100}", "");
-    println!(
-        "{:<35} {:>12} {:>12} {:>12} {:>12} {:>12}",
-        "Method", "Build (ms)", "Query (ms)", "Total (ms)", "Recall@k", "Dist Error"
-    );
-    println!("{:->100}", "");
-    for result in results {
-        println!(
-            "{:<35} {:>12.2} {:>12.2} {:>12.2} {:>12.4} {:>12.6}",
-            result.method,
-            result.build_time_ms,
-            result.query_time_ms,
-            result.total_time_ms,
-            result.recall_at_k,
-            result.mean_dist_err
-        );
+/// * `knn_graph` - Neighbor indices for each point
+/// * `cluster_labels` - Ground truth cluster assignment for each point
+///
+/// ### Returns
+///
+/// Average fraction of same-cluster neighbors
+pub fn calculate_cluster_purity(knn_graph: &[Vec<usize>], cluster_labels: &[usize]) -> f64 {
+    let mut total_purity = 0.0;
+
+    for (i, neighbors) in knn_graph.iter().enumerate() {
+        let my_cluster = cluster_labels[i];
+        let same_cluster = neighbors
+            .iter()
+            .filter(|&&idx| cluster_labels[idx] == my_cluster)
+            .count();
+        total_purity += same_cluster as f64 / neighbors.len() as f64;
     }
-    println!("{:->100}\n", "");
+
+    total_purity / knn_graph.len() as f64
 }
 
-/// Helper to print results to console (Recall only)
+////////////
+// Prints //
+////////////
+
+fn format_with_underscores(value: f64) -> String {
+    let formatted = format!("{:.2}", value);
+    let parts: Vec<&str> = formatted.split('.').collect();
+    let int_part = parts[0].parse::<i64>().unwrap().separate_with_underscores();
+    format!("{}.{}", int_part, parts[1])
+}
+
+/// Helper to print results to console
+///
+/// This version also returns the size of the index
 ///
 /// ### Params
 ///
 /// * `config` - Benchmark configuration
 /// * `results` - Benchmark results to print
-pub fn print_results_recall_only(config: &str, results: &[BenchmarkResult]) {
-    println!("\n{:=>83}", "");
+pub fn print_results_size(config: &str, results: &[BenchmarkResultSize]) {
+    println!("\n{:=>128}", "");
     println!("Benchmark: {}", config);
-    println!("{:=>83}", "");
+    println!("{:=>128}", "");
     println!(
-        "{:<30} {:>12} {:>12} {:>12} {:>12}",
-        "Method", "Build (ms)", "Query (ms)", "Total (ms)", "Recall@k"
+        "{:<50} {:>12} {:>12} {:>12} {:>12} {:>12} {:>12}",
+        "Method", "Build (ms)", "Query (ms)", "Total (ms)", "Recall@k", "Dist Error", "Size (MB)"
     );
-    println!("{:->83}", "");
+    println!("{:->128}", "");
     for result in results {
         println!(
-            "{:<30} {:>12.2} {:>12.2} {:>12.2} {:>12.4}",
+            "{:<50} {:>12} {:>12} {:>12} {:>12.4} {:>12.6} {:>12.2}",
             result.method,
-            result.build_time_ms,
-            result.query_time_ms,
-            result.total_time_ms,
-            result.recall_at_k
+            format_with_underscores(result.build_time_ms),
+            format_with_underscores(result.query_time_ms),
+            format_with_underscores(result.total_time_ms),
+            result.recall_at_k,
+            result.mean_dist_err,
+            result.index_size_mb
         );
     }
-    println!("{:->83}\n", "");
+    println!("{:->128}\n", "");
+}
+
+/// Helper to print results to console
+///
+/// This version prints the cluster purity measure
+///
+/// ### Params
+///
+/// * `config` - Benchmark configuration
+/// * `results` - Benchmark results to print
+pub fn print_results_purity(config: &str, results: &[BenchmarkResultPurity]) {
+    println!("\n{:=>128}", "");
+    println!("Benchmark: {}", config);
+    println!("{:=>128}", "");
+    println!(
+        "{:<50} {:>12} {:>12} {:>12} {:>12} {:>12} {:>12}",
+        "Method", "Build (ms)", "Query (ms)", "Total (ms)", "Recall@k", "Purity", "Size (MB)"
+    );
+    println!("{:->128}", "");
+    for result in results {
+        println!(
+            "{:<50} {:>12} {:>12} {:>12} {:>12.4} {:>12.4} {:>12.2}",
+            result.method,
+            format_with_underscores(result.build_time_ms),
+            format_with_underscores(result.query_time_ms),
+            format_with_underscores(result.total_time_ms),
+            result.recall_at_k,
+            result.cluster_purity,
+            result.index_size_mb
+        );
+    }
+    println!("{:->128}\n", "");
 }

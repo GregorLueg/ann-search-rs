@@ -1,8 +1,10 @@
 mod commons;
+
 use ann_search_rs::*;
 use clap::Parser;
 use commons::*;
 use faer::Mat;
+use std::collections::HashSet;
 use std::time::Instant;
 use thousands::*;
 
@@ -27,9 +29,9 @@ fn main() {
     println!("Building exhaustive index...");
     let start = Instant::now();
     let exhaustive_idx = build_exhaustive_index(data.as_ref(), &cli.distance);
-    let index_size_mb = exhaustive_idx.memory_usage_bytes() as f64 / (1024.0 * 1024.0);
-
     let build_time = start.elapsed().as_secs_f64() * 1000.0;
+
+    let index_size_mb = exhaustive_idx.memory_usage_bytes() as f64 / (1024.0 * 1024.0);
 
     println!("Querying exhaustive index...");
     let start = Instant::now();
@@ -66,36 +68,116 @@ fn main() {
 
     println!("-----------------------------");
 
-    let n_trees_values = [5, 10, 15, 25, 50, 75, 100];
+    println!("Building exhaustive index (BF16 quantised)...");
+    let start = Instant::now();
+    let exhaustive_idx_bf16 = build_exhaustive_bf16_index(data.as_ref(), &cli.distance, false);
+    let build_time = start.elapsed().as_secs_f64() * 1000.0;
 
-    for n_trees in n_trees_values {
-        println!("Building Annoy index ({} trees)...", n_trees);
+    let index_size_mb = exhaustive_idx_bf16.memory_usage_bytes() as f64 / (1024.0 * 1024.0);
+
+    println!("Querying exhaustive index (BF16 quantised)...");
+    let start = Instant::now();
+    let (approx_neighbors, approx_distances) = query_exhaustive_bf16_index(
+        query_data.as_ref(),
+        &exhaustive_idx_bf16,
+        cli.k,
+        true,
+        false,
+    );
+    let query_time = start.elapsed().as_secs_f64() * 1000.0;
+
+    let recall = calculate_recall(&true_neighbors, &approx_neighbors, cli.k);
+    let dist_error = calculate_dist_error(
+        true_distances.as_ref().unwrap(),
+        approx_distances.as_ref().unwrap(),
+        cli.k,
+    );
+
+    results.push(BenchmarkResultSize {
+        method: "Exhaustive-BF16 (query)".to_string(),
+        build_time_ms: build_time,
+        query_time_ms: query_time,
+        total_time_ms: build_time + query_time,
+        recall_at_k: recall,
+        mean_dist_err: dist_error,
+        index_size_mb,
+    });
+
+    // Exhaustive self-query benchmark
+    println!("Self-querying exhaustive index (BF16 quantised)...");
+    let start = Instant::now();
+    let (approx_neighbors_self, approx_distances_self) =
+        query_exhaustive_self(&exhaustive_idx, cli.k, true, false);
+    let self_query_time = start.elapsed().as_secs_f64() * 1000.0;
+
+    let recall = calculate_recall(&true_neighbors_self, &approx_neighbors_self, cli.k);
+    let dist_error = calculate_dist_error(
+        true_distances_self.as_ref().unwrap(),
+        approx_distances_self.as_ref().unwrap(),
+        cli.k,
+    );
+
+    results.push(BenchmarkResultSize {
+        method: "Exhaustive-BF16 (self)".to_string(),
+        build_time_ms: build_time,
+        query_time_ms: self_query_time,
+        total_time_ms: build_time + self_query_time,
+        recall_at_k: recall,
+        mean_dist_err: dist_error,
+        index_size_mb,
+    });
+
+    println!("-----------------------------");
+
+    let nlist_values = [
+        (cli.n_cells as f32 * 0.5).sqrt() as usize,
+        (cli.n_cells as f32).sqrt() as usize,
+        (cli.n_cells as f32 * 2.0).sqrt() as usize,
+    ];
+
+    for nlist in nlist_values {
+        println!("Building IVF-BF16 index (nlist={})...", nlist);
         let start = Instant::now();
-        let annoy_idx = build_annoy_index(
+        let ivf_bf16_idx = build_ivf_bf16_index(
             data.as_ref(),
-            cli.distance.as_str().into(),
-            n_trees,
+            Some(nlist),
+            None,
+            &cli.distance,
             cli.seed as usize,
+            false,
         );
         let build_time = start.elapsed().as_secs_f64() * 1000.0;
 
-        let index_size_mb = annoy_idx.memory_usage_bytes() as f64 / (1024.0 * 1024.0);
+        let index_size_mb = ivf_bf16_idx.memory_usage_bytes() as f64 / (1024.0 * 1024.0);
 
-        let search_budgets = [
-            (None, "auto"),
-            (Some(cli.k * n_trees * 10), "10x"),
-            (Some(cli.k * n_trees * 5), "5x"),
+        let nprobe_values = [
+            (nlist as f32).sqrt() as usize,
+            (nlist as f32 * 2.0).sqrt() as usize,
+            (0.05 * nlist as f32) as usize,
         ];
+        let mut nprobe_values: Vec<_> = nprobe_values
+            .into_iter()
+            .collect::<HashSet<_>>()
+            .into_iter()
+            .collect();
+        nprobe_values.sort();
 
         // Query benchmarks
-        for (search_budget, budget_label) in search_budgets {
-            println!("Querying Annoy index (search_budget={})...", budget_label);
+        for nprobe in &nprobe_values {
+            if *nprobe > nlist || *nprobe == 0 {
+                continue;
+            }
+
+            println!(
+                "Querying IVF-BF16 index (nlist={}, nprobe={})...",
+                nlist, nprobe
+            );
             let start = Instant::now();
-            let (approx_neighbors, approx_distances) = query_annoy_index(
+            let (approx_neighbors, approx_distances) = query_ivf_bf16_index(
                 query_data.as_ref(),
-                &annoy_idx,
+                &ivf_bf16_idx,
                 cli.k,
-                search_budget,
+                Some(*nprobe),
                 true,
                 false,
             );
@@ -109,7 +191,7 @@ fn main() {
             );
 
             results.push(BenchmarkResultSize {
-                method: format!("Annoy-nt{}-s:{} (query)", n_trees, budget_label),
+                method: format!("IVF-BF16-nl{}-np{} (query)", nlist, nprobe),
                 build_time_ms: build_time,
                 query_time_ms: query_time,
                 total_time_ms: build_time + query_time,
@@ -120,10 +202,11 @@ fn main() {
         }
 
         // Self-query benchmark
-        println!("Self-querying Annoy index...");
+        let nprobe_self = (nlist as f32 * 2.0).sqrt() as usize;
+        println!("Self-querying IVF-BF16 index (nprobe={})...", nprobe_self);
         let start = Instant::now();
         let (approx_neighbors_self, approx_distances_self) =
-            query_annoy_self(&annoy_idx, cli.k, None, true, false);
+            query_ivf_bf16_self(&ivf_bf16_idx, cli.k, Some(nprobe_self), true, false);
         let self_query_time = start.elapsed().as_secs_f64() * 1000.0;
 
         let recall_self = calculate_recall(&true_neighbors_self, &approx_neighbors_self, cli.k);
@@ -134,7 +217,7 @@ fn main() {
         );
 
         results.push(BenchmarkResultSize {
-            method: format!("Annoy-nt{} (self)", n_trees),
+            method: format!("IVF-BF16-nl{} (self)", nlist),
             build_time_ms: build_time,
             query_time_ms: self_query_time,
             total_time_ms: build_time + self_query_time,

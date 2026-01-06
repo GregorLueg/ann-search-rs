@@ -1,4 +1,4 @@
-use faer::MatRef;
+use faer::{MatRef, RowRef};
 use num_traits::{Float, FromPrimitive, ToPrimitive};
 use rand::{rngs::SmallRng, Rng, SeedableRng};
 use rayon::prelude::*;
@@ -25,28 +25,30 @@ pub type NeighbourUpdates<T> = Vec<(usize, Vec<(OrderedFloat<T>, usize)>)>;
 
 /// Lock-free bitset for node-level locking during construction
 ///
-/// Uses atomic bit operations instead of heavyweight RwLock. Each bit
-/// represents the lock state of one node.
+/// Uses atomic u64 chunks to allow concurrent lock operations without blocking.
+/// Each bit represents one node's lock state.
 ///
-/// ### Performance
+/// ### Fields
 ///
-/// - Lock acquisition: ~5ns vs ~50ns for RwLock
-/// - No kernel involvement (user-space only)
-/// - Better cache locality (64 locks per cache line)
-///
-/// This is based on what Usearch does in their C++ code and with help of
-/// Claude
+/// * `bits` - Vector of atomic u64 chunks, each storing 64 lock bits
 #[derive(Debug)]
 pub struct AtomicNodeLocks {
     bits: Vec<AtomicU64>,
 }
 
 impl AtomicNodeLocks {
-    /// Create a new lock set for the given capacity
+    /// Create a new lock bitset with capacity for n nodes
+    ///
+    /// Allocates enough u64 chunks to store one bit per node, rounding up
+    /// to the nearest 64-node boundary.
     ///
     /// ### Params
     ///
-    /// * `capacity` - Maximum number of nodes that can be locked
+    /// * `capacity` - Number of nodes to support
+    ///
+    /// ### Returns
+    ///
+    /// Initialised lock bitset with all locks released
     pub fn new(capacity: usize) -> Self {
         let num_slots = capacity.div_ceil(64);
         Self {
@@ -54,7 +56,10 @@ impl AtomicNodeLocks {
         }
     }
 
-    /// Attempt to acquire lock without blocking
+    /// Attempt to acquire a lock on a node
+    ///
+    /// Returns immediately without blocking. Uses compare-and-swap to
+    /// atomically check and set the lock bit.
     ///
     /// ### Params
     ///
@@ -62,8 +67,7 @@ impl AtomicNodeLocks {
     ///
     /// ### Returns
     ///
-    /// `true` if lock was already held (failed to acquire)
-    /// `false` if lock was acquired successfully
+    /// `true` if lock was already held, `false` if successfully acquired
     #[inline(always)]
     pub fn try_lock(&self, idx: usize) -> bool {
         let slot = idx / 64;
@@ -72,7 +76,10 @@ impl AtomicNodeLocks {
         (prev & bit) != 0
     }
 
-    /// Spin-lock until acquired
+    /// Acquire a lock on a node, spinning until successful
+    ///
+    /// Repeatedly calls try_lock until the lock is acquired. Uses spin_loop
+    /// hint to reduce CPU contention.
     ///
     /// ### Params
     ///
@@ -84,7 +91,9 @@ impl AtomicNodeLocks {
         }
     }
 
-    /// Release lock
+    /// Release a lock on a node
+    ///
+    /// Atomically clears the lock bit, making it available for other threads.
     ///
     /// ### Params
     ///
@@ -96,7 +105,9 @@ impl AtomicNodeLocks {
         self.bits[slot].fetch_and(bit, Ordering::Release);
     }
 
-    /// Acquire lock with RAII guard
+    /// Acquire a lock and return an RAII guard
+    ///
+    /// The lock is automatically released when the guard is dropped.
     ///
     /// ### Params
     ///
@@ -104,7 +115,7 @@ impl AtomicNodeLocks {
     ///
     /// ### Returns
     ///
-    /// Guard that automatically releases lock on drop
+    /// Guard that releases the lock on drop
     #[inline(always)]
     pub fn lock_guard(&self, idx: usize) -> NodeLockGuard<'_> {
         self.lock(idx);
@@ -112,155 +123,40 @@ impl AtomicNodeLocks {
     }
 }
 
-/// RAII guard for atomic lock
+/// RAII guard for automatic lock release
 ///
-/// Automatically releases lock when dropped.
+/// Holds a reference to the lock bitset and the locked node index.
+/// Automatically releases the lock when dropped.
+///
+/// ### Fields
+///
+/// * `locks` - Reference to the parent lock bitset
+/// * `idx` - Index of the locked node
 pub struct NodeLockGuard<'a> {
     locks: &'a AtomicNodeLocks,
     idx: usize,
 }
 
 impl<'a> Drop for NodeLockGuard<'a> {
-    /// Drop the Lock
+    /// Drop method
     fn drop(&mut self) {
         self.locks.unlock(self.idx);
     }
 }
 
-/// Sorted buffer optimised for small result sets
-///
-/// Maintains elements in ascending order. For typical HNSW queries
-/// with ef=50-200, this is 20-30% faster than BinaryHeap due to:
-/// - Better cache locality (sequential access)
-/// - Fewer comparisons (binary search vs heap operations)
-/// - No heap maintenance overhead
-///
-/// ### Type Parameters
-///
-/// * `T` - Element type, must implement `Ord`
-pub struct SortedBuffer<T> {
-    data: Vec<T>,
-}
-
-impl<T: Ord> SortedBuffer<T> {
-    /// Create empty sorted buffer
-    pub fn new() -> Self {
-        Self { data: Vec::new() }
-    }
-
-    /// Create sorted buffer with pre-allocated capacity
-    ///
-    /// ### Params
-    ///
-    /// * `capacity` - Initial capacity
-    pub fn with_capacity(capacity: usize) -> Self {
-        Self {
-            data: Vec::with_capacity(capacity),
-        }
-    }
-
-    /// Clear all elements
-    pub fn clear(&mut self) {
-        self.data.clear();
-    }
-
-    /// Number of elements
-    pub fn len(&self) -> usize {
-        self.data.len()
-    }
-
-    /// Number of elements
-    pub fn is_empty(&self) -> bool {
-        self.data.is_empty()
-    }
-
-    /// Reserve additional capacity
-    ///
-    /// ### Params
-    ///
-    /// * `additional` - Additional capacity to reserve
-    pub fn reserve(&mut self, additional: usize) {
-        self.data.reserve(additional);
-    }
-
-    /// Insert element maintaining sorted order
-    ///
-    /// If buffer is at capacity, only inserts if element is smaller
-    /// than the largest element (and removes largest).
-    ///
-    /// ### Params
-    ///
-    /// * `item` - Element to insert
-    /// * `limit` - Maximum capacity
-    ///
-    /// ### Returns
-    ///
-    /// `true` if inserted, `false` if rejected
-    #[inline]
-    pub fn insert(&mut self, item: T, limit: usize) -> bool {
-        if self.data.len() < limit {
-            let pos = self.data.binary_search(&item).unwrap_or_else(|e| e);
-            self.data.insert(pos, item);
-            true
-        } else if let Some(last) = self.data.last() {
-            if &item < last {
-                let pos = self.data.binary_search(&item).unwrap_or_else(|e| e);
-                self.data.pop();
-                self.data.insert(pos, item);
-                true
-            } else {
-                false
-            }
-        } else {
-            false
-        }
-    }
-
-    /// Get largest element (last in sorted order)
-    #[inline]
-    pub fn top(&self) -> Option<&T> {
-        self.data.last()
-    }
-
-    /// Get all elements as slice
-    pub fn data(&self) -> &[T] {
-        &self.data
-    }
-
-    /// Ensure ascending sort order
-    ///
-    /// No-op since buffer is always sorted.
-    #[inline]
-    pub fn sort_ascending(&mut self) {
-        // Already sorted, no work needed
-    }
-
-    /// Number of elements
-    pub fn size(&self) -> usize {
-        self.data.len()
-    }
-}
-
 /// Search state for HNSW queries and construction
 ///
-/// Optimised for low-allocation via epoch-based visitation checks and
-/// pre-allocated scratch buffers.
-///
-/// ### Key Optimizations
-///
-/// 1. **Epoch-based visits**: O(1) reset instead of clearing HashSet
-/// 2. **Sorted working set**: Maintains sorted order incrementally for top-K
-///    results
-/// 3. **Pre-allocated buffers**: Reused across calls to avoid allocations
+/// Maintains visited tracking and candidate management for graph traversal.
+/// Reused across queries to amortise allocation costs.
 ///
 /// ### Fields
 ///
-/// * `visited` - Stores the "visit epoch" ID for each node
-/// * `visit_id` - The current epoch ID
-/// * `candidates` - Min-heap for graph traversal (always heap, most efficient)
-/// * `working_sorted` - Sorted buffer for top-K results (small ef optimization)
-/// * `scratch_working` - Reuse buffer for heuristic selection
-/// * `scratch_discarded` - Reuse buffer for heuristic selection
+/// * `visited` - Per-node visit tracking using incrementing IDs
+/// * `visit_id` - Current visit epoch (wraps around, triggers reset)
+/// * `candidates` - Min-heap of nodes to explore, ordered by distance
+/// * `working_sorted` - Sorted buffer of current best candidates
+/// * `scratch_working` - Temporary storage for heuristic selection
+/// * `scratch_discarded` - Temporary storage for pruned candidates
 pub struct SearchState<T> {
     visited: Vec<usize>,
     visit_id: usize,
@@ -274,11 +170,18 @@ impl<T> SearchState<T>
 where
     T: Float + Sum,
 {
-    /// Generate a new search state
+    /// Create a new search state with initial capacity
+    ///
+    /// Allocates buffers sized for the given capacity to avoid reallocations
+    /// during typical queries.
     ///
     /// ### Params
     ///
-    /// * `capacity` - The pre-allocated capacity of the search state
+    /// * `capacity` - Initial capacity for internal buffers
+    ///
+    /// ### Returns
+    ///
+    /// Initialised search state ready for use
     fn new(capacity: usize) -> Self {
         Self {
             visited: vec![0; capacity],
@@ -290,11 +193,14 @@ where
         }
     }
 
-    /// Reset the search state for a new query
+    /// Reset state for a new query
+    ///
+    /// Clears all buffers and advances the visit epoch. If the epoch wraps
+    /// around to zero, performs a full reset of the visited array.
     ///
     /// ### Params
     ///
-    /// * `n` - New length for resizing
+    /// * `n` - Number of nodes in the graph (for capacity adjustment)
     fn reset(&mut self, n: usize) {
         if self.visited.len() < n {
             self.visited.resize(n, 0);
@@ -312,17 +218,25 @@ where
         self.scratch_discarded.clear();
     }
 
-    /// Has node been visited
+    /// Check if a node has been visited in the current query
+    ///
+    /// ### Params
+    ///
+    /// * `node` - Node index to check
     ///
     /// ### Returns
     ///
-    /// Boolean
+    /// `true` if node was already visited, `false` otherwise
     #[inline(always)]
     fn is_visited(&self, node: usize) -> bool {
         self.visited[node] == self.visit_id
     }
 
-    /// Marks node as visisted
+    /// Mark a node as visited in the current query
+    ///
+    /// ### Params
+    ///
+    /// * `node` - Node index to mark
     #[inline(always)]
     fn mark_visited(&mut self, node: usize) {
         self.visited[node] = self.visit_id;
@@ -330,139 +244,291 @@ where
 }
 
 impl<T: Ord> Default for SortedBuffer<T> {
-    /// Default implementation
     fn default() -> Self {
         Self::new()
     }
 }
 
-/// Construction-time neighbour storage with concurrent write support
+/// Construction-time neighbour storage
 ///
-/// During construction, each node's neighbours are stored in a separate
-/// Vec wrapped in UnsafeCell, with atomic bitset locks enabling parallel
-/// insertions without batching or synchronisation barriers.
+/// ### Fields
 ///
-/// ### Safety
-///
-/// Uses UnsafeCell for interior mutability. Safe because:
-/// - Atomic locks ensure exclusive access during mutations
-/// - No aliases exist while holding lock
-/// - Lock guard ensures proper unlock on panic
-///
-/// This was ported from the Usearch C++ code and written with Claude.
-///
-/// Fields
-///
-/// * `nodes` - Each node's neighbours wrapped in UnsafeCell for interior
-///   mutability
-/// * `locks` - Lock-free atomic bitset for node locking
-/// * `max_neighbours` - Maximum neighbours per node (M or M*2 depending on
-///   layer)
-/// * `_phantom` - Phantom data to tie the lifetime to T
+/// * `nodes` - For each node, vector of neighbour lists (one per layer)
+/// * `locks` - Lock bitset for thread-safe updates
+/// * `node_levels` - Maximum layer each node appears in
+/// * `m` - Base connectivity parameter
+/// * `_phantom` - Phantom data for type parameter
 struct ConstructionGraph<T> {
-    nodes: Vec<UnsafeCell<Vec<u32>>>,
+    nodes: Vec<UnsafeCell<Vec<Vec<u32>>>>,
     locks: AtomicNodeLocks,
-    max_neighbours: Vec<usize>,
+    node_levels: Vec<u8>,
+    m: usize,
     _phantom: PhantomData<T>,
 }
 
-// SAFETY: We ensure thread-safety via atomic locks
 unsafe impl<T> Sync for ConstructionGraph<T> {}
 
 impl<T> ConstructionGraph<T>
 where
     T: Float + FromPrimitive + Send + Sync + Sum,
 {
-    /// Create a new construction graph
+    /// Create a new construction graph with proper per-layer storage
+    ///
+    /// Pre-allocates neighbour vectors for each layer each node appears in,
+    /// with layer 0 having 2*M capacity and upper layers having M capacity.
     ///
     /// ### Params
     ///
     /// * `n` - Number of nodes
-    /// * `layer_assignments` - Layer for each node
-    /// * `m` - M parameter
+    /// * `layer_assignments` - Maximum layer for each node
+    /// * `m` - Base connectivity parameter
+    ///
+    /// ### Returns
+    ///
+    /// Initialised construction graph with empty neighbour lists
     fn new(n: usize, layer_assignments: &[u8], m: usize) -> Self {
-        let nodes = (0..n).map(|_| UnsafeCell::new(Vec::new())).collect();
-        let max_neighbours = layer_assignments
-            .iter()
-            .map(|&layer| if layer == 0 { m * 2 } else { m })
+        let nodes = (0..n)
+            .map(|i| {
+                let level = layer_assignments[i] as usize;
+                // pre-allocate vectors for each layer this node appears in
+                // layer 0 gets M*2, layers 1+ get M
+                let mut layers = Vec::with_capacity(level + 1);
+                for l in 0..=level {
+                    let capacity = if l == 0 { m * 2 } else { m };
+                    layers.push(Vec::with_capacity(capacity));
+                }
+                UnsafeCell::new(layers)
+            })
             .collect();
 
         Self {
             nodes,
             locks: AtomicNodeLocks::new(n),
-            max_neighbours,
-            _phantom: std::marker::PhantomData,
+            node_levels: layer_assignments.to_vec(),
+            m,
+            _phantom: PhantomData,
         }
     }
 
-    /// Get current neighbours for a node
-    ///
-    /// ### Safety
-    ///
-    /// Safe to read without lock as we only clone the data.
-    /// This is called during search when we need to traverse neighbours.
+    /// Get the maximum layer a node appears in
     ///
     /// ### Params
     ///
-    /// * `node_id` - The node idx
-    fn get_neighbours(&self, node_id: usize) -> Vec<u32> {
-        // SAFETY: We're only reading and cloning, no mutation
-        unsafe { (*self.nodes[node_id].get()).clone() }
-    }
-
-    /// Write new neighbours for a node
-    ///
-    /// ### Safety
-    ///
-    /// Lock guard ensures exclusive access. Safe because:
-    /// - Lock is held for entire duration
-    /// - No other thread can access this node's data
-    /// - Lock guard ensures unlock on panic
-    ///
-    /// ### Params
-    ///
-    /// * `node_id` - The node idx
-    /// * `neighbours` - Slice of tuples of OrderedFloat and indices of
-    ///   neighbours
-    fn set_neighbours(&self, node_id: usize, neighbours: &[(OrderedFloat<T>, usize)]) {
-        let _guard = self.locks.lock_guard(node_id);
-
-        // SAFETY: Lock guard ensures exclusive access
-        let node = unsafe { &mut *self.nodes[node_id].get() };
-        node.clear();
-
-        for &(_, neighbour_id) in neighbours.iter().take(self.max_neighbours[node_id]) {
-            if neighbour_id != node_id {
-                node.push(neighbour_id as u32);
-            }
-        }
-
-        // Pad with INVALID (u32::MAX)
-        while node.len() < self.max_neighbours[node_id] {
-            node.push(u32::MAX);
-        }
-    }
-
-    /// Finalise construction and convert to flat layout
-    ///
-    /// Consumes the construction graph and produces the flat representation
-    /// optimised for subsequent query performance.
+    /// * `node_id` - Node index
     ///
     /// ### Returns
     ///
-    /// Tuple of (neighbours_flat, neighbour_offsets)
-    fn into_flat(self) -> (Vec<u32>, Vec<usize>) {
-        let mut neighbours_flat = Vec::new();
-        let mut neighbour_offsets = Vec::new();
+    /// Highest layer this node exists in (0 = base layer only)
+    #[inline]
+    fn node_level(&self, node_id: usize) -> u8 {
+        self.node_levels[node_id]
+    }
 
-        for node in self.nodes {
-            neighbour_offsets.push(neighbours_flat.len());
-            // SAFETY: We own the graph, no concurrent access possible
-            let neighbours = node.into_inner();
-            neighbours_flat.extend(neighbours);
+    /// Get neighbours for a node at a specific layer
+    ///
+    /// Returns empty vector if the node doesn't exist at the requested layer.
+    ///
+    /// ### Params
+    ///
+    /// * `node_id` - Node index
+    /// * `layer` - Layer to query
+    ///
+    /// ### Returns
+    ///
+    /// Vector of neighbour indices at this layer
+    fn get_neighbours(&self, node_id: usize, layer: u8) -> Vec<u32> {
+        let node_level = self.node_levels[node_id];
+        if layer > node_level {
+            return Vec::new();
+        }
+        // SAFETY: We're only reading and cloning
+        unsafe {
+            let layers = &*self.nodes[node_id].get();
+            layers[layer as usize].clone()
+        }
+    }
+
+    /// Set neighbours for a node at a specific layer
+    ///
+    /// Replaces the entire neighbour list for this layer, respecting the
+    /// maximum neighbour count (2*M for layer 0, M for upper layers).
+    ///
+    /// ### Params
+    ///
+    /// * `node_id` - Node to update
+    /// * `layer` - Layer to update
+    /// * `neighbours` - New neighbour list (distance, id) pairs
+    fn set_neighbours(&self, node_id: usize, layer: u8, neighbours: &[(OrderedFloat<T>, usize)]) {
+        let node_level = self.node_levels[node_id];
+        if layer > node_level {
+            return;
         }
 
-        (neighbours_flat, neighbour_offsets)
+        let _guard = self.locks.lock_guard(node_id);
+
+        let max_neighbours = if layer == 0 { self.m * 2 } else { self.m };
+
+        // SAFETY: Lock guard ensures exclusive access
+        let layers = unsafe { &mut *self.nodes[node_id].get() };
+        let layer_neighbours = &mut layers[layer as usize];
+        layer_neighbours.clear();
+
+        for &(_, neighbour_id) in neighbours.iter().take(max_neighbours) {
+            if neighbour_id != node_id {
+                layer_neighbours.push(neighbour_id as u32);
+            }
+        }
+    }
+
+    /// Add a single neighbour with pruning if needed
+    ///
+    /// If the neighbour list is full, applies the heuristic pruning strategy
+    /// to maintain diversity whilst respecting the maximum neighbour count.
+    ///
+    /// ### Params
+    ///
+    /// * `node_id` - Node to update
+    /// * `layer` - Layer to update
+    /// * `new_neighbour` - Neighbour to add
+    /// * `distance_fn` - Function to compute distances between nodes
+    fn add_neighbour_with_pruning<F>(
+        &self,
+        node_id: usize,
+        layer: u8,
+        new_neighbour: usize,
+        distance_fn: F,
+    ) where
+        F: Fn(usize, usize) -> T,
+    {
+        let node_level = self.node_levels[node_id];
+        if layer > node_level {
+            return;
+        }
+
+        let _guard = self.locks.lock_guard(node_id);
+
+        let max_neighbours = if layer == 0 { self.m * 2 } else { self.m };
+
+        // SAFETY: Lock guard ensures exclusive access
+        let layers = unsafe { &mut *self.nodes[node_id].get() };
+        let layer_neighbours = &mut layers[layer as usize];
+
+        // Check if already present
+        if layer_neighbours
+            .iter()
+            .any(|&n| n as usize == new_neighbour)
+        {
+            return;
+        }
+
+        // If there's room, just add
+        if layer_neighbours.len() < max_neighbours {
+            layer_neighbours.push(new_neighbour as u32);
+            return;
+        }
+
+        // Need to prune - collect all candidates with distances
+        let mut candidates: Vec<(OrderedFloat<T>, usize)> = layer_neighbours
+            .iter()
+            .map(|&n| {
+                let n = n as usize;
+                (OrderedFloat(distance_fn(node_id, n)), n)
+            })
+            .collect();
+
+        candidates.push((
+            OrderedFloat(distance_fn(node_id, new_neighbour)),
+            new_neighbour,
+        ));
+
+        // Sort by distance
+        candidates.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+
+        // Apply simple heuristic: keep closest, but prefer diversity
+        let mut selected = Vec::with_capacity(max_neighbours);
+
+        for (dist, cand_id) in &candidates {
+            if selected.len() >= max_neighbours {
+                break;
+            }
+
+            // Check if this candidate is closer to query than to any selected
+            let dominated = selected.iter().any(|&sel_id| {
+                let dist_to_selected = OrderedFloat(distance_fn(*cand_id, sel_id));
+                dist_to_selected < *dist
+            });
+
+            if !dominated || selected.len() < max_neighbours / 2 {
+                selected.push(*cand_id);
+            }
+        }
+
+        // Ensure we have at least some neighbours
+        if selected.len() < max_neighbours && candidates.len() > selected.len() {
+            for (_, cand_id) in &candidates {
+                if selected.len() >= max_neighbours {
+                    break;
+                }
+                if !selected.contains(cand_id) {
+                    selected.push(*cand_id);
+                }
+            }
+        }
+
+        layer_neighbours.clear();
+        for id in selected {
+            layer_neighbours.push(id as u32);
+        }
+    }
+
+    /// Convert to flat layout for queries
+    ///
+    /// Transforms the per-layer storage into a flattened array for better
+    /// cache performance during queries. Each node's layers are stored
+    /// contiguously with padding. Layout:
+    /// [node0_layer0(M*2), node0_layer1(M), ..., node1_layer0(M*2), ...]
+    ///
+    /// ### Params
+    ///
+    /// * `m` - Connectivity parameter for size calculation
+    ///
+    /// ### Returns
+    ///
+    /// Tuple of (flat neighbours, offsets, level assignments)
+    fn into_flat(self, m: usize) -> (Vec<u32>, Vec<usize>, Vec<u8>) {
+        let n = self.nodes.len();
+        let mut neighbours_flat = Vec::new();
+        let mut neighbour_offsets = Vec::with_capacity(n);
+        let node_levels = self.node_levels.clone();
+
+        for (node_id, node_cell) in self.nodes.into_iter().enumerate() {
+            neighbour_offsets.push(neighbours_flat.len());
+
+            let layers = node_cell.into_inner();
+            let node_level = node_levels[node_id];
+
+            // Write each layer's neighbours with padding
+            for layer in 0..=node_level {
+                let max_neighbours = if layer == 0 { m * 2 } else { m };
+                let layer_neighbours = if (layer as usize) < layers.len() {
+                    &layers[layer as usize]
+                } else {
+                    &Vec::new()
+                };
+
+                // Write actual neighbours
+                for &n in layer_neighbours {
+                    neighbours_flat.push(n);
+                }
+
+                // Pad with INVALID
+                for _ in layer_neighbours.len()..max_neighbours {
+                    neighbours_flat.push(u32::MAX);
+                }
+            }
+        }
+
+        (neighbours_flat, neighbour_offsets, node_levels)
     }
 }
 
@@ -477,7 +543,6 @@ thread_local! {
     static BUILD_STATE_F64: std::cell::RefCell<SearchState<f64>> = std::cell::RefCell::new(SearchState::new(1000));
 }
 
-/// Trait for accessing type-specific thread-local search state
 pub trait HnswState<T> {
     fn with_search_state<F, R>(f: F) -> R
     where
@@ -526,41 +591,37 @@ impl HnswState<f64> for HnswIndex<f64> {
 
 /// HNSW (Hierarchical Navigable Small World) graph index
 ///
-/// Key optimisations borrowed from the Usearch implementation of HNSW.
-///
-/// 1. **Atomic Bitset Locks**: Lock-free node locking during construction
-/// 2. **Hybrid Priority Queues**: Sorted buffer for small queries, heap for
-///    large ones.
-/// 3. **Optimised Search**: No repeated sorting, incremental maintenance
+/// Implements the HNSW algorithm with multi-layer neighbour storage. Each node
+/// maintains separate neighbour lists for each layer it appears in, enabling
+/// efficient hierarchical search.
 ///
 /// ### Fields
 ///
-/// * `vectors_flat` - Flat structure of vectors for cache locality
-/// * `dim` - Feature dimensions
-/// * `n` - Number of samples
+/// * `vectors_flat` - Flattened vector data for cache locality
+/// * `dim` - Dimensionality of vectors
+/// * `n` - Number of vectors
+/// * `norms` - Pre-computed norms for Cosine distance (empty for Euclidean)
 /// * `metric` - Distance metric (Euclidean or Cosine)
-/// * `norms` - Precomputed norms for Cosine distance
-/// * `layer_assignments` - Which layer each node belongs to (0 = base layer)
-/// * `neighbours_flat` - All neighbour PIDs in flat array
-/// * `neighbour_offsets` - Starting index of each node's neighbours
-/// * `entry_point` - Node ID with highest layer
+/// * `layer_assignments` - Maximum layer each node appears in
+/// * `neighbours_flat` - Flattened neighbour storage across all layers
+/// * `neighbour_offsets` - Starting offset for each node's neighbours
+/// * `entry_point` - Starting node for queries (highest-layer node)
 /// * `max_layer` - Highest layer in the graph
-/// * `m` - Number of connections per layer (M parameter)
+/// * `m` - Base connectivity parameter
 /// * `ef_construction` - Size of dynamic candidate list during construction
-/// * `extend_candidates` - Whether to extend candidate set in heuristic
-///   (Algorithm 4)
-/// * `keep_pruned` - Whether to keep pruned connections if space available
+/// * `extend_candidates` - Whether to extend candidate pool (unused)
+/// * `keep_pruned` - Whether to keep pruned candidates
 pub struct HnswIndex<T>
 where
     T: Float + FromPrimitive + Send + Sync + Sum,
 {
-    // shared ones
+    // Vector data
     pub vectors_flat: Vec<T>,
     pub dim: usize,
     pub n: usize,
     pub norms: Vec<T>,
     metric: Dist,
-    // index-specific ones
+    // HNSW
     layer_assignments: Vec<u8>,
     neighbours_flat: Vec<u32>,
     neighbour_offsets: Vec<usize>,
@@ -576,17 +637,14 @@ impl<T> VectorDistance<T> for HnswIndex<T>
 where
     T: Float + FromPrimitive + Send + Sync + Sum,
 {
-    /// Get the flat vectors
     fn vectors_flat(&self) -> &[T] {
         &self.vectors_flat
     }
 
-    /// Get the dimensions
     fn dim(&self) -> usize {
         self.dim
     }
 
-    /// The the norms for Cosine distance calculations
     fn norms(&self) -> &[T] {
         &self.norms
     }
@@ -597,23 +655,98 @@ where
     T: Float + FromPrimitive + Send + Sync + Sum,
     Self: HnswState<T>,
 {
-    /// Build HNSW index
+    /// Compute the offset in neighbours_flat for a specific node and layer
+    ///
+    /// Calculates where in the flat array this node's layer begins, accounting
+    /// for layer 0 having 2*M slots and upper layers having M slots each.
     ///
     /// ### Params
     ///
-    /// * `mat` - Embedding matrix (rows = samples, cols = features)
-    /// * `m` - Number of bidirectional connections per layer (typical: 16-32)
-    /// * `ef_construction` - Size of candidate list during construction
-    ///   (typical: 100-200)
-    /// * `dist_metric` - "euclidean" or "cosine"
-    /// * `seed` - Random seed
-    /// * `verbose` - Print progress
+    /// * `node_id` - Node index
+    /// * `layer` - Layer number
     ///
     /// ### Returns
     ///
-    /// Built HnswIndex ready for querying
+    /// Offset into neighbours_flat
+    #[inline]
+    fn neighbours_offset(&self, node_id: usize, layer: u8) -> usize {
+        let base = self.neighbour_offsets[node_id];
+        if layer == 0 {
+            base
+        } else {
+            // Skip layer 0 (M*2) plus previous upper layers (M each)
+            base + self.m * 2 + self.m * (layer as usize - 1)
+        }
+    }
+
+    /// Get the maximum number of neighbours for a layer
+    ///
+    /// ### Params
+    ///
+    /// * `layer` - Layer number
+    ///
+    /// ### Returns
+    ///
+    /// 2*M for layer 0, M for upper layers
+    #[inline]
+    fn max_neighbours_for_layer(&self, layer: u8) -> usize {
+        if layer == 0 {
+            self.m * 2
+        } else {
+            self.m
+        }
+    }
+
+    /// Get neighbours for a node at a specific layer (for queries)
+    ///
+    /// Returns empty slice if the node doesn't exist at this layer.
+    ///
+    /// ### Params
+    ///
+    /// * `node_id` - Node index
+    /// * `layer` - Layer to query
+    ///
+    /// ### Returns
+    ///
+    /// Slice of neighbour indices (may contain u32::MAX padding)
+    #[inline]
+    fn get_neighbours_at_layer(&self, node_id: usize, layer: u8) -> &[u32] {
+        let node_level = self.layer_assignments[node_id];
+        if layer > node_level {
+            return &[];
+        }
+
+        let offset = self.neighbours_offset(node_id, layer);
+        let count = self.max_neighbours_for_layer(layer);
+
+        // Safety: bounds are guaranteed by construction
+        &self.neighbours_flat[offset..offset + count]
+    }
+
+    //////////////////////
+    // Index generation //
+    //////////////////////
+
+    /// Construct a new HNSW index
+    ///
+    /// Builds the hierarchical graph structure layer by layer from top to
+    /// bottom. Assigns layers using exponential distribution, then constructs
+    /// connections using greedy search and heuristic pruning.
+    ///
+    /// ### Params
+    ///
+    /// * `data` - Data matrix (rows = samples, columns = dimensions)
+    /// * `m` - Base connectivity parameter (neighbours per layer)
+    /// * `ef_construction` - Size of dynamic candidate list during construction
+    /// * `dist_metric` - Distance metric ("euclidean" or "cosine")
+    /// * `seed` - Random seed for layer assignment
+    /// * `verbose` - Whether to print progress information
+    ///
+    /// ### Returns
+    ///
+    /// Constructed index ready for querying
     pub fn build(
-        mat: MatRef<T>,
+        data: MatRef<T>,
         m: usize,
         ef_construction: usize,
         dist_metric: &str,
@@ -621,8 +754,7 @@ where
         verbose: bool,
     ) -> Self {
         let metric = parse_ann_dist(dist_metric).unwrap_or(Dist::Cosine);
-        let n = mat.nrows();
-        let dim = mat.ncols();
+        let (vectors_flat, n, dim) = matrix_to_flat(data);
 
         if verbose {
             println!(
@@ -633,12 +765,6 @@ where
         }
 
         let start_total = Instant::now();
-
-        // Flatten matrix for cache locality
-        let mut vectors_flat = Vec::with_capacity(n * dim);
-        for i in 0..n {
-            vectors_flat.extend(mat.row(i).iter().copied());
-        }
 
         // Compute norms for cosine distance
         let norms = if metric == Dist::Cosine {
@@ -677,9 +803,13 @@ where
 
         if verbose {
             println!("Max layer: {}, Entry point: {}", max_layer, entry_point);
+            for l in 0..=max_layer {
+                let count = layer_assignments.iter().filter(|&&x| x >= l).count();
+                println!("  Layer {}: {} nodes", l, count.separate_with_underscores());
+            }
         }
 
-        // Create construction graph with atomic locks
+        // Create construction graph with proper per-layer storage
         let construction_graph = ConstructionGraph::new(n, &layer_assignments, m);
 
         let mut index = HnswIndex {
@@ -688,7 +818,7 @@ where
             n,
             metric,
             norms,
-            layer_assignments,
+            layer_assignments: layer_assignments.clone(),
             neighbours_flat: Vec::new(),
             neighbour_offsets: Vec::new(),
             entry_point,
@@ -699,43 +829,37 @@ where
             keep_pruned: true,
         };
 
+        // Build the graph layer by layer, from TOP to BOTTOM
         index.build_graph(&construction_graph, verbose);
 
         // Convert construction graph to flat layout
-        let (neighbours_flat, neighbour_offsets) = construction_graph.into_flat();
+        let (neighbours_flat, neighbour_offsets, _) = construction_graph.into_flat(m);
         index.neighbours_flat = neighbours_flat;
         index.neighbour_offsets = neighbour_offsets;
 
-        let end_total = start_total.elapsed();
         if verbose {
-            println!("Total HNSW build time: {:.2?}", end_total);
+            println!("Total HNSW build time: {:.2?}", start_total.elapsed());
         }
 
         index
     }
 
-    /// Build the graph structure layer by layer
+    /// Build the graph structure layer by layer (top to bottom)
     ///
-    /// This function uses parallelism under the hood via the
-    /// `ConstructionGraph` structure that has atomic locks to avoid race
-    /// conditions.
+    /// Constructs upper layers first to create "highways" that lower layers
+    /// can use during their construction, improving connectivity.
     ///
     /// ### Params
     ///
-    /// * `graph` - Construction graph with atomic lock support
-    /// * `verbose` - Print progress information
+    /// * `graph` - Construction graph to populate
+    /// * `verbose` - Whether to print progress
     fn build_graph(&self, graph: &ConstructionGraph<T>, verbose: bool) {
-        let nodes_by_layer: Vec<Vec<usize>> = (0..=self.max_layer)
-            .map(|layer| {
-                (0..self.n)
-                    .filter(|&i| self.layer_assignments[i] >= layer)
-                    .collect()
-            })
-            .collect();
-
         for layer in (0..=self.max_layer).rev() {
             let start = Instant::now();
-            let layer_nodes = &nodes_by_layer[layer as usize];
+
+            let layer_nodes: Vec<usize> = (0..self.n)
+                .filter(|&i| self.layer_assignments[i] >= layer)
+                .collect();
 
             if verbose {
                 println!(
@@ -745,7 +869,7 @@ where
                 );
             }
 
-            self.build_layer_parallel(layer, layer_nodes, graph);
+            self.build_layer_parallel(layer, &layer_nodes, graph);
 
             if verbose {
                 println!("  Layer {} built in {:.2?}", layer, start.elapsed());
@@ -753,176 +877,137 @@ where
         }
     }
 
-    /// Build a layer with true parallel construction (no batching)
+    /// Build a single layer with parallel processing
     ///
-    /// All nodes are processed in parallel with concurrent writes to the
-    /// construction graph. No synchronisation barriers needed.
+    /// Processes all nodes at a layer in parallel, computing their connections
+    /// and forming bidirectional links with pruning.
     ///
     /// ### Params
     ///
     /// * `layer` - Layer to build
-    /// * `nodes` - Nodes to insert at this layer
-    /// * `graph` - Construction graph with concurrent write support
+    /// * `nodes` - Nodes present at this layer
+    /// * `graph` - Construction graph to update
     fn build_layer_parallel(&self, layer: u8, nodes: &[usize], graph: &ConstructionGraph<T>) {
         nodes.par_iter().for_each(|&node| {
-            // compute outgoing connections (thread-local state)
             let connections = Self::with_build_state(|state_cell| {
                 let mut state = state_cell.borrow_mut();
-                self.compute_node_connections(node, layer, graph, &mut state)
+                self.compute_node_connections_for_layer(node, layer, graph, &mut state)
             });
 
-            // write node -> neighbours (exclusive access to this node)
-            graph.set_neighbours(node, &connections);
+            graph.set_neighbours(node, layer, &connections);
 
-            // update neighbours -> node (concurrent, each thread may write to different neighbours)
+            let distance_fn = |a: usize, b: usize| -> T {
+                match self.metric {
+                    Dist::Euclidean => self.euclidean_distance(a, b),
+                    Dist::Cosine => self.cosine_distance(a, b),
+                }
+            };
+
             for &(_, neighbour_id) in &connections {
-                self.prune_and_connect_concurrent(neighbour_id, node, layer, graph);
+                if neighbour_id != node && graph.node_level(neighbour_id) >= layer {
+                    graph.add_neighbour_with_pruning(neighbour_id, layer, node, &distance_fn);
+                }
             }
         });
     }
 
-    /// Compute connections for a node (reads from construction graph)
+    /// Compute connections for a node at a specific layer
+    ///
+    /// Performs greedy descent through upper layers, then ef_construction
+    /// search at the target layer, followed by heuristic pruning.
     ///
     /// ### Params
     ///
-    /// * `node` - Node being inserted
-    /// * `insert_layer` - Layer to insert at
+    /// * `node` - Node to connect
+    /// * `target_layer` - Layer to compute connections for
     /// * `graph` - Construction graph
-    /// * `state` - Thread-local search state
+    /// * `state` - Search state for traversal
     ///
     /// ### Returns
     ///
-    /// Selected connections for this node
-    fn compute_node_connections(
+    /// Selected neighbours as (distance, id) pairs
+    fn compute_node_connections_for_layer(
         &self,
         node: usize,
-        insert_layer: u8,
+        target_layer: u8,
         graph: &ConstructionGraph<T>,
         state: &mut SearchState<T>,
     ) -> Vec<(OrderedFloat<T>, usize)> {
         state.reset(self.n);
 
-        let mut entry_points = vec![(OrderedFloat(T::zero()), self.entry_point as usize)];
+        let mut current_node = self.entry_point as usize;
+        let mut current_dist = OrderedFloat(match self.metric {
+            Dist::Euclidean => self.euclidean_distance(node, current_node),
+            Dist::Cosine => self.cosine_distance(node, current_node),
+        });
 
-        // Descend through upper layers
-        for layer in (insert_layer + 1..=self.max_layer).rev() {
-            state.reset(self.n);
-            entry_points = self.search_layer(node, layer, &entry_points, 1, graph, state);
+        for layer in (target_layer + 1..=self.max_layer).rev() {
+            let mut changed = true;
+            while changed {
+                changed = false;
+                let neighbours = graph.get_neighbours(current_node, layer);
+                for &neighbour in &neighbours {
+                    if neighbour == u32::MAX {
+                        continue;
+                    }
+                    let neighbour = neighbour as usize;
+
+                    if graph.node_level(neighbour) < layer {
+                        continue;
+                    }
+
+                    let dist = OrderedFloat(match self.metric {
+                        Dist::Euclidean => self.euclidean_distance(node, neighbour),
+                        Dist::Cosine => self.cosine_distance(node, neighbour),
+                    });
+
+                    if dist < current_dist {
+                        current_node = neighbour;
+                        current_dist = dist;
+                        changed = true;
+                    }
+                }
+            }
         }
 
-        state.reset(self.n);
-        // The /2 is needed to avoid aggressive pruning of the base layer
-        let ef = if insert_layer == 0 {
+        // At target layer, do full ef_construction search
+        // Use reduced ef for base layer to avoid aggressive pruning
+        let ef = if target_layer == 0 {
             self.ef_construction / 2
         } else {
             self.ef_construction
         };
 
-        let candidates = self.search_layer(node, insert_layer, &entry_points, ef, graph, state);
+        state.reset(self.n);
+        let candidates =
+            self.search_layer_construction(node, target_layer, current_node, ef, graph, state);
 
-        self.select_heuristic(node, &candidates, insert_layer, state)
+        self.select_neighbours_heuristic(node, &candidates, target_layer, state)
     }
 
-    /// Prune and connect with concurrent access (race-condition free)
+    /// Search layer during construction
     ///
-    /// Atomically updates a neighbour's connection list by adding a new node,
-    /// then pruning using the heuristic selection algorithm.
+    /// Returns ef closest nodes at the target layer. During construction,
+    /// traverses all available connections but only considers nodes that
+    /// exist at the target layer or higher.
     ///
     /// ### Params
     ///
-    /// * `neighbour_id` - Existing neighbour to update
-    /// * `new_node` - New node to add as potential neighbour
-    /// * `layer` - Current layer
-    /// * `graph` - Construction graph with atomic locks
-    fn prune_and_connect_concurrent(
-        &self,
-        neighbour_id: usize,
-        new_node: usize,
-        layer: u8,
-        graph: &ConstructionGraph<T>,
-    ) {
-        // acquire atomic lock for exclusive access
-        let _guard = graph.locks.lock_guard(neighbour_id);
-
-        // SAFETY: Lock guard ensures exclusive access to this node
-        // unsafe does feel unsafe...
-        let node = unsafe { &mut *graph.nodes[neighbour_id].get() };
-        let current = node.clone();
-
-        let mut candidates: Vec<(OrderedFloat<T>, usize)> = Vec::with_capacity(current.len() + 1);
-
-        // add all valid existing neighbours with their distances
-        for &neighbour in current.iter() {
-            if neighbour == u32::MAX {
-                break;
-            }
-
-            let neighbour_node_id = neighbour as usize;
-            let dist = OrderedFloat(match self.metric {
-                Dist::Euclidean => self.euclidean_distance(neighbour_id, neighbour_node_id),
-                Dist::Cosine => self.cosine_distance(neighbour_id, neighbour_node_id),
-            });
-
-            candidates.push((dist, neighbour_node_id));
-        }
-
-        // add the new node as candidate
-        if new_node != neighbour_id {
-            let dist = OrderedFloat(match self.metric {
-                Dist::Euclidean => self.euclidean_distance(neighbour_id, new_node),
-                Dist::Cosine => self.cosine_distance(neighbour_id, new_node),
-            });
-
-            candidates.push((dist, new_node));
-        }
-
-        // sort candidates by distance
-        candidates.sort_unstable_by(|a, b| a.0.cmp(&b.0));
-
-        // apply heuristic selection
-        let selected = Self::with_build_state(|state_cell| {
-            let mut state = state_cell.borrow_mut();
-            self.select_heuristic(neighbour_id, &candidates, layer, &mut state)
-        });
-
-        // write back final selection
-        // SAFETY: Still holding lock guard
-        let max_neighbours = graph.max_neighbours[neighbour_id];
-        node.clear();
-
-        for &(_, node_id) in selected.iter().take(max_neighbours) {
-            if node_id != neighbour_id {
-                node.push(node_id as u32);
-            }
-        }
-
-        // Pad with INVALID markers
-        while node.len() < max_neighbours {
-            node.push(u32::MAX);
-        }
-
-        // Lock automatically released when _guard drops at this point
-    }
-
-    /// Search layer using construction graph
-    ///
-    /// ### Params
-    ///
-    /// * `query_node` - Node we're searching from
-    /// * `layer` - Current layer
-    /// * `entry_points` - Starting points
-    /// * `ef` - Candidate list size
+    /// * `query_node` - Node to find neighbours for
+    /// * `target_layer` - Layer to search
+    /// * `entry_node` - Starting point for search
+    /// * `ef` - Size of candidate list
     /// * `graph` - Construction graph
     /// * `state` - Search state
     ///
     /// ### Returns
     ///
-    /// Sorted list of nearest neighbours
-    fn search_layer(
+    /// Vector of (distance, id) pairs for closest candidates
+    fn search_layer_construction(
         &self,
         query_node: usize,
-        layer: u8,
-        entry_points: &[(OrderedFloat<T>, usize)],
+        target_layer: u8,
+        entry_node: usize,
         ef: usize,
         graph: &ConstructionGraph<T>,
         state: &mut SearchState<T>,
@@ -930,70 +1015,59 @@ where
         state.working_sorted.clear();
         state.candidates.clear();
 
-        // initialise with entry points
-        for &(dist, pid) in entry_points {
-            if !state.is_visited(pid) {
-                state.mark_visited(pid);
-                state.candidates.push(Reverse((dist, pid)));
-                state.working_sorted.insert((dist, pid), ef);
-            }
-        }
+        let entry_dist = OrderedFloat(match self.metric {
+            Dist::Euclidean => self.euclidean_distance(query_node, entry_node),
+            Dist::Cosine => self.cosine_distance(query_node, entry_node),
+        });
 
-        // track furthest distance in working set
-        let mut furthest_dist = if state.working_sorted.len() >= ef {
-            state
-                .working_sorted
-                .top()
-                .map(|(d, _)| *d)
-                .unwrap_or(OrderedFloat(T::infinity()))
-        } else {
-            OrderedFloat(T::infinity())
-        };
+        state.mark_visited(entry_node);
+        state.candidates.push(Reverse((entry_dist, entry_node)));
+        state.working_sorted.insert((entry_dist, entry_node), ef);
 
-        // Main traversal loop
+        let mut furthest_dist = entry_dist;
+
         while let Some(Reverse((current_dist, current_id))) = state.candidates.pop() {
-            // Early termination
-            if current_dist > furthest_dist {
+            if current_dist > furthest_dist && state.working_sorted.len() >= ef {
                 break;
             }
 
-            let max_neighbours = if layer == 0 { self.m * 2 } else { self.m };
-            let neighbours = graph.get_neighbours(current_id);
+            let current_level = graph.node_level(current_id);
 
-            for i in 0..max_neighbours.min(neighbours.len()) {
-                let neighbour = neighbours[i];
-                if neighbour == u32::MAX {
-                    break;
-                }
+            for layer in 0..=current_level {
+                let neighbours = graph.get_neighbours(current_id, layer);
 
-                let neighbour_id = neighbour as usize;
+                for &neighbour in &neighbours {
+                    if neighbour == u32::MAX {
+                        continue;
+                    }
+                    let neighbour_id = neighbour as usize;
 
-                if self.layer_assignments[neighbour_id] < layer {
-                    continue;
-                }
+                    if graph.node_level(neighbour_id) < target_layer {
+                        continue;
+                    }
 
-                if state.is_visited(neighbour_id) {
-                    continue;
-                }
+                    if state.is_visited(neighbour_id) {
+                        continue;
+                    }
+                    state.mark_visited(neighbour_id);
 
-                state.mark_visited(neighbour_id);
+                    let dist = OrderedFloat(match self.metric {
+                        Dist::Euclidean => self.euclidean_distance(query_node, neighbour_id),
+                        Dist::Cosine => self.cosine_distance(query_node, neighbour_id),
+                    });
 
-                let dist = OrderedFloat(match self.metric {
-                    Dist::Euclidean => self.euclidean_distance(query_node, neighbour_id),
-                    Dist::Cosine => self.cosine_distance(query_node, neighbour_id),
-                });
+                    if dist < furthest_dist || state.working_sorted.len() < ef {
+                        state.candidates.push(Reverse((dist, neighbour_id)));
 
-                if dist < furthest_dist || state.working_sorted.len() < ef {
-                    state.candidates.push(Reverse((dist, neighbour_id)));
-
-                    if state.working_sorted.insert((dist, neighbour_id), ef)
-                        && state.working_sorted.len() >= ef
-                    {
-                        furthest_dist = state
-                            .working_sorted
-                            .top()
-                            .map(|(d, _)| *d)
-                            .unwrap_or(OrderedFloat(T::infinity()));
+                        if state.working_sorted.insert((dist, neighbour_id), ef)
+                            && state.working_sorted.len() >= ef
+                        {
+                            furthest_dist = state
+                                .working_sorted
+                                .top()
+                                .map(|(d, _)| *d)
+                                .unwrap_or(OrderedFloat(T::infinity()));
+                        }
                     }
                 }
             }
@@ -1002,125 +1076,75 @@ where
         state.working_sorted.data().to_vec()
     }
 
-    /// Select neighbours using heuristic (Algorithm 4 from paper)
+    /// Select neighbours using the heuristic from the HNSW paper (Algorithm 4)
     ///
-    /// The heuristic filters candidates to avoid clustered connections. A
-    /// candidate is selected if it's closer to the query node than to any
-    /// already-selected neighbour.
+    /// Applies the "keep closest and diverse" strategy: iteratively adds
+    /// candidates that are closer to the query than to already-selected
+    /// neighbours, promoting diversity whilst maintaining proximity.
     ///
     /// ### Params
     ///
-    /// * `node` - Node being inserted
-    /// * `candidates` - Initial candidate neighbours (sorted by distance)
-    /// * `layer` - Current layer
-    /// * `state` - SearchState providing scratch buffers
+    /// * `node` - Query node
+    /// * `candidates` - Candidate neighbours with distances
+    /// * `layer` - Layer being constructed
+    /// * `state` - Search state with scratch buffers
     ///
     /// ### Returns
     ///
-    /// Filtered list of neighbours (at most M or M*2)
-    fn select_heuristic(
+    /// Pruned neighbour list respecting max_neighbours constraint
+    fn select_neighbours_heuristic(
         &self,
         node: usize,
         candidates: &[(OrderedFloat<T>, usize)],
         layer: u8,
         state: &mut SearchState<T>,
     ) -> Vec<(OrderedFloat<T>, usize)> {
+        let max_neighbours = if layer == 0 { self.m * 2 } else { self.m };
+
         state.scratch_working.clear();
         state.scratch_discarded.clear();
 
-        // Increment visit generation for local operation
-        state.visit_id = state.visit_id.wrapping_add(1);
-        if state.visit_id == 0 {
-            state.visited.fill(0);
-            state.visit_id = 1;
-        }
-
-        // Filter candidates
-        for &candidate in candidates {
-            if candidate.1 != node && !state.is_visited(candidate.1) {
-                state.scratch_working.push(candidate);
-                state.mark_visited(candidate.1);
+        for &(dist, id) in candidates {
+            if id != node {
+                state.scratch_working.push((dist, id));
             }
         }
 
-        // Extend candidates if enabled
-        if self.extend_candidates {
-            let max_check = if layer == 0 { self.m * 2 } else { self.m };
+        state.scratch_working.sort_unstable_by(|a, b| a.0.cmp(&b.0));
 
-            for &(_, cand_id) in candidates {
-                if cand_id == node {
-                    continue;
-                }
-
-                let offset = self.neighbour_offsets[cand_id];
-
-                for i in 0..max_check {
-                    let neighbour = self.neighbours_flat[offset + i];
-                    if neighbour == u32::MAX {
-                        break;
-                    }
-
-                    let neighbour_id = neighbour as usize;
-                    if neighbour_id == node || state.is_visited(neighbour_id) {
-                        continue;
-                    }
-
-                    state.mark_visited(neighbour_id);
-
-                    let dist = OrderedFloat(match self.metric {
-                        Dist::Euclidean => self.euclidean_distance(node, neighbour_id),
-                        Dist::Cosine => self.cosine_distance(node, neighbour_id),
-                    });
-
-                    state.scratch_working.push((dist, neighbour_id));
-                }
-            }
-
-            state.scratch_working.sort_unstable_by(|a, b| a.0.cmp(&b.0));
-        }
-
-        // Heuristic selection
-        let max_neighbours = if layer == 0 { self.m * 2 } else { self.m };
         let mut result = Vec::with_capacity(max_neighbours);
 
-        for candidate in state.scratch_working.iter() {
+        for &(cand_dist, cand_id) in &state.scratch_working {
             if result.len() >= max_neighbours {
                 break;
             }
 
-            let (cand_dist, cand_id) = *candidate;
-
-            if cand_id == node {
-                continue;
-            }
-
-            let mut closer_to_query = true;
-            for &(_, result_id) in &result {
-                let dist_to_result = OrderedFloat(match self.metric {
-                    Dist::Euclidean => self.euclidean_distance(cand_id, result_id),
-                    Dist::Cosine => self.cosine_distance(cand_id, result_id),
+            let mut is_good = true;
+            for &(_, selected_id) in &result {
+                let dist_to_selected = OrderedFloat(match self.metric {
+                    Dist::Euclidean => self.euclidean_distance(cand_id, selected_id),
+                    Dist::Cosine => self.cosine_distance(cand_id, selected_id),
                 });
 
-                if dist_to_result < cand_dist {
-                    closer_to_query = false;
+                if dist_to_selected < cand_dist {
+                    is_good = false;
                     break;
                 }
             }
 
-            if closer_to_query {
+            if is_good {
                 result.push((cand_dist, cand_id));
             } else if self.keep_pruned {
                 state.scratch_discarded.push((cand_dist, cand_id));
             }
         }
 
-        // Add back closest pruned connections if space available
-        if self.keep_pruned && !state.scratch_discarded.is_empty() {
+        if self.keep_pruned {
             state
                 .scratch_discarded
                 .sort_unstable_by(|a, b| a.0.cmp(&b.0));
 
-            for &candidate in state.scratch_discarded.iter() {
+            for &candidate in &state.scratch_discarded {
                 if result.len() >= max_neighbours {
                     break;
                 }
@@ -1131,17 +1155,25 @@ where
         result
     }
 
+    ///////////
+    // Query //
+    ///////////
+
     /// Query the index for k nearest neighbours
+    ///
+    /// Performs hierarchical search starting from the entry point, greedily
+    /// descending through upper layers, then conducting full search at base
+    /// layer.
     ///
     /// ### Params
     ///
-    /// * `query` - Query vector
+    /// * `query` - Query vector (must match index dimensionality)
     /// * `k` - Number of neighbours to return
     /// * `ef_search` - Size of candidate list (higher = better recall, slower)
     ///
     /// ### Returns
     ///
-    /// Tuple of (indices, distances)
+    /// Tuple of `(indices, distances)` sorted by distance (nearest first)
     #[inline]
     pub fn query(&self, query: &[T], k: usize, ef_search: usize) -> (Vec<usize>, Vec<T>) {
         assert_eq!(query.len(), self.dim);
@@ -1160,22 +1192,22 @@ where
                 T::one()
             };
 
-            let entry_dist =
-                self.compute_query_distance(query, self.entry_point as usize, query_norm);
-            let mut entry_points = vec![(OrderedFloat(entry_dist), self.entry_point as usize)];
+            // start from entry point, descend through upper layers
+            let mut current_node = self.entry_point as usize;
 
+            // greedy search through upper layers (max_layer down to 1)
             for layer in (1..=self.max_layer).rev() {
-                state.reset(self.n);
-                entry_points =
-                    self.search_layer_query(query, query_norm, layer, &entry_points, 1, &mut state);
+                current_node =
+                    self.greedy_search_layer_query(query, query_norm, current_node, layer);
             }
 
+            // full search at base layer
             state.reset(self.n);
             let mut candidates = self.search_layer_query(
                 query,
                 query_norm,
                 0,
-                &entry_points,
+                current_node,
                 ef_search.max(k),
                 &mut state,
             );
@@ -1191,76 +1223,121 @@ where
         })
     }
 
-    /// Search layer for query vector
+    /// Greedy search for query vector at a specific layer
+    ///
+    /// Performs hill-climbing to find the local minimum (closest node) at a
+    /// given layer, used for descending through upper layers.
     ///
     /// ### Params
     ///
-    /// * `query` - Query vector slice
-    /// * `query_norm` - Precomputed norm of query (for cosine)
-    /// * `layer` - Current layer
-    /// * `entry_points` - Starting points for search
-    /// * `ef` - Size of candidate list
-    /// * `state` - Mutable search state
+    /// * `query` - Query vector
+    /// * `query_norm` - Pre-computed query norm (for Cosine)
+    /// * `start_node` - Starting point
+    /// * `layer` - Layer to search
     ///
     /// ### Returns
     ///
-    /// List of (distance, node_id) pairs, sorted by distance
-    #[inline]
+    /// Index of closest node found at this layer
+    fn greedy_search_layer_query(
+        &self,
+        query: &[T],
+        query_norm: T,
+        start_node: usize,
+        layer: u8,
+    ) -> usize {
+        let mut current = start_node;
+        let mut current_dist = self.compute_query_distance(query, current, query_norm);
+
+        loop {
+            let mut changed = false;
+
+            let neighbours = self.get_neighbours_at_layer(current, layer);
+
+            for &neighbour in neighbours {
+                if neighbour == u32::MAX {
+                    break;
+                }
+                let neighbour = neighbour as usize;
+
+                // Check if this neighbour exists at this layer
+                if self.layer_assignments[neighbour] < layer {
+                    continue;
+                }
+
+                let dist = self.compute_query_distance(query, neighbour, query_norm);
+
+                if dist < current_dist {
+                    current = neighbour;
+                    current_dist = dist;
+                    changed = true;
+                }
+            }
+
+            if !changed {
+                break;
+            }
+        }
+
+        current
+    }
+
+    /// Full search at a layer for query
+    ///
+    /// Performs best-first search maintaining ef candidates, used for the
+    /// final search at layer 0.
+    ///
+    /// ### Params
+    ///
+    /// * `query` - Query vector
+    /// * `query_norm` - Pre-computed query norm (for Cosine)
+    /// * `layer` - Layer to search
+    /// * `entry_node` - Starting point
+    /// * `ef` - Size of candidate list
+    /// * `state` - Search state
+    ///
+    /// ### Returns
+    ///
+    /// Vector of (distance, id) pairs for closest candidates
     fn search_layer_query(
         &self,
         query: &[T],
         query_norm: T,
         layer: u8,
-        entry_points: &[(OrderedFloat<T>, usize)],
+        entry_node: usize,
         ef: usize,
         state: &mut SearchState<T>,
     ) -> Vec<(OrderedFloat<T>, usize)> {
         state.working_sorted.clear();
         state.candidates.clear();
 
-        for &(dist, pid) in entry_points {
-            if !state.is_visited(pid) {
-                state.mark_visited(pid);
-                state.candidates.push(Reverse((dist, pid)));
-                state.working_sorted.insert((dist, pid), ef);
-            }
-        }
+        let entry_dist = OrderedFloat(self.compute_query_distance(query, entry_node, query_norm));
 
-        let mut furthest_dist = if state.working_sorted.len() >= ef {
-            state
-                .working_sorted
-                .top()
-                .map(|(d, _)| *d)
-                .unwrap_or(OrderedFloat(T::infinity()))
-        } else {
-            OrderedFloat(T::infinity())
-        };
+        state.mark_visited(entry_node);
+        state.candidates.push(Reverse((entry_dist, entry_node)));
+        state.working_sorted.insert((entry_dist, entry_node), ef);
+
+        let mut furthest_dist = entry_dist;
 
         while let Some(Reverse((current_dist, current_id))) = state.candidates.pop() {
-            if current_dist > furthest_dist {
+            if current_dist > furthest_dist && state.working_sorted.len() >= ef {
                 break;
             }
 
-            let node_layer = self.layer_assignments[current_id];
-            let max_neighbours = if node_layer == 0 { self.m * 2 } else { self.m };
-            let offset = self.neighbour_offsets[current_id];
+            let neighbours = self.get_neighbours_at_layer(current_id, layer);
 
-            for i in 0..max_neighbours {
-                let neighbour = self.neighbours_flat[offset + i];
+            for &neighbour in neighbours {
                 if neighbour == u32::MAX {
                     break;
                 }
-
                 let neighbour_id = neighbour as usize;
 
-                if self.layer_assignments[neighbour_id] < layer {
+                if layer > 0 && self.layer_assignments[neighbour_id] < layer {
                     continue;
                 }
 
                 if state.is_visited(neighbour_id) {
                     continue;
                 }
-
                 state.mark_visited(neighbour_id);
 
                 let dist =
@@ -1285,23 +1362,140 @@ where
         state.working_sorted.data().to_vec()
     }
 
+    /// Query using a matrix row reference
+    ///
+    /// Optimised path for contiguous memory (stride == 1), otherwise copies
+    /// to a temporary vector.
+    ///
+    /// ### Params
+    ///
+    /// * `query_row` - Row reference from a matrix
+    /// * `k` - Number of neighbours to return
+    /// * `ef_search` - Size of candidate list
+    ///
+    /// ### Returns
+    ///
+    /// Tuple of `(indices, distances)` sorted by distance (nearest first)
+    #[inline]
+    pub fn query_row(
+        &self,
+        query_row: RowRef<T>,
+        k: usize,
+        ef_search: usize,
+    ) -> (Vec<usize>, Vec<T>) {
+        if query_row.col_stride() == 1 {
+            let slice =
+                unsafe { std::slice::from_raw_parts(query_row.as_ptr(), query_row.ncols()) };
+            return self.query(slice, k, ef_search);
+        }
+
+        let query_vec: Vec<T> = query_row.iter().cloned().collect();
+        self.query(&query_vec, k, ef_search)
+    }
+
+    /// Generate kNN graph from vectors stored in the index
+    ///
+    /// Queries each vector in the index against itself to build a complete
+    /// kNN graph in parallel.
+    ///
+    /// ### Params
+    ///
+    /// * `k` - Number of neighbours per vector
+    /// * `ef_search` - Search budget
+    /// * `return_dist` - Whether to return distances
+    /// * `verbose` - Whether to print progress
+    ///
+    /// ### Returns
+    ///
+    /// Tuple of `(knn_indices, optional distances)` where each row corresponds
+    /// to a vector in the index
+    pub fn generate_knn(
+        &self,
+        k: usize,
+        ef_search: usize,
+        return_dist: bool,
+        verbose: bool,
+    ) -> (Vec<Vec<usize>>, Option<Vec<Vec<T>>>) {
+        use std::sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        };
+
+        let counter = Arc::new(AtomicUsize::new(0));
+
+        let results: Vec<(Vec<usize>, Vec<T>)> = (0..self.n)
+            .into_par_iter()
+            .map(|i| {
+                let start = i * self.dim;
+                let end = start + self.dim;
+                let vec = &self.vectors_flat[start..end];
+
+                if verbose {
+                    let count = counter.fetch_add(1, Ordering::Relaxed) + 1;
+                    if count.is_multiple_of(100_000) {
+                        println!(
+                            "  Processed {} / {} samples.",
+                            count.separate_with_underscores(),
+                            self.n.separate_with_underscores()
+                        );
+                    }
+                }
+
+                self.query(vec, k, ef_search)
+            })
+            .collect();
+
+        if return_dist {
+            let (indices, distances) = results.into_iter().unzip();
+            (indices, Some(distances))
+        } else {
+            let indices: Vec<Vec<usize>> = results.into_iter().map(|(idx, _)| idx).collect();
+            (indices, None)
+        }
+    }
+
     /// Compute distance between query and database vector
     ///
     /// ### Params
     ///
-    /// * `query` - Query vector slice
+    /// * `query` - Query vector
     /// * `idx` - Database vector index
-    /// * `query_norm` - Precomputed norm of query (for cosine)
+    /// * `query_norm` - Pre-computed query norm (for Cosine)
     ///
     /// ### Returns
     ///
-    /// Distance value (Euclidean squared or Cosine distance)
+    /// Distance according to the index's metric
     #[inline(always)]
     fn compute_query_distance(&self, query: &[T], idx: usize, query_norm: T) -> T {
         match self.metric {
             Dist::Euclidean => self.euclidean_distance_to_query(idx, query),
             Dist::Cosine => self.cosine_distance_to_query(idx, query, query_norm),
         }
+    }
+
+    /// Was extend candidates set to `true`
+    ///
+    /// ### Returns
+    ///
+    /// Boolean
+    pub fn extend_candidates(&self) -> bool {
+        self.extend_candidates
+    }
+
+    /// Returns the size of the index in bytes
+    ///
+    /// Accounts for all heap-allocated data structures.
+    ///
+    /// ### Returns
+    ///
+    /// Total memory usage in bytes
+    pub fn memory_usage_bytes(&self) -> usize {
+        std::mem::size_of_val(self)
+            + self.vectors_flat.capacity() * std::mem::size_of::<T>()
+            + self.norms.capacity() * std::mem::size_of::<T>()
+            + self.layer_assignments.capacity() * std::mem::size_of::<u8>()
+            + self.neighbours_flat.capacity() * std::mem::size_of::<u32>()
+            + self.neighbour_offsets.capacity() * std::mem::size_of::<usize>()
     }
 }
 
@@ -1314,17 +1508,14 @@ where
     T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum,
     Self: HnswState<T>,
 {
-    /// Internal querying function
     fn query_for_validation(&self, query_vec: &[T], k: usize) -> (Vec<usize>, Vec<T>) {
         self.query(query_vec, k, 200)
     }
 
-    /// Returns n
     fn n(&self) -> usize {
         self.n
     }
 
-    /// Returns the distance metric
     fn metric(&self) -> Dist {
         self.metric
     }
@@ -1494,53 +1685,45 @@ mod tests {
     }
 
     #[test]
-    fn test_hnsw_small_m_layer_bug() {
-        // This test catches a bug where nodes assigned to higher layers have
-        // fewer neighbours stored (m) but layer 0 search incorrectly tries to
-        // read 2*m neighbours, causing an index out of bounds panic.
-        //
-        // The bug occurs when:
-        // 1. Node is assigned to layer > 0, so stores m neighbours
-        // 2. During layer 0 search, code calculates max_neighbours = m * 2
-        // 3. Attempts to read beyond actual storage
+    fn test_hnsw_multi_layer_storage() {
+        // Verify that multi-layer storage is working correctly
+        let n = 500;
+        let dim = 10;
 
-        let n = 929; // Exact size that triggered the bug
-        let dim = 15;
-        let m = 16; // Small m that makes the bug more likely
-        let ef_construction = 200;
-
-        // Create dataset similar to PCA embeddings
-        let mut data = Vec::with_capacity(n * dim);
-        for i in 0..n {
-            for j in 0..dim {
-                data.push(((i * dim + j) as f32).sin() * 0.1);
-            }
-        }
+        let data: Vec<f32> = (0..n * dim).map(|i| (i as f32) * 0.01).collect();
         let mat = Mat::from_fn(n, dim, |i, j| data[i * dim + j]);
 
-        // Build with parameters that triggered the original bug
-        let index = HnswIndex::<f32>::build(mat.as_ref(), m, ef_construction, "cosine", 42, false);
+        let index = HnswIndex::<f32>::build(mat.as_ref(), 8, 100, "euclidean", 42, true);
 
-        // Query with ef_search = 100 (also from original failing case)
-        let query: Vec<f32> = (0..dim).map(|i| i as f32 * 0.1).collect();
-        let (indices, distances) = index.query(&query, 15, 100);
-
-        assert_eq!(indices.len(), 15);
-        assert_eq!(distances.len(), 15);
-
-        // Verify results are valid
-        for i in 1..distances.len() {
-            assert!(distances[i] >= distances[i - 1], "Distances not sorted");
+        // Count nodes at each layer
+        let mut layer_counts = vec![0usize; (index.max_layer + 1) as usize];
+        for &level in &index.layer_assignments {
+            for l in 0..=level {
+                layer_counts[l as usize] += 1;
+            }
         }
 
-        for &idx in &indices {
-            assert!(idx < n, "Invalid index returned");
+        // Layer 0 should have all nodes
+        assert_eq!(layer_counts[0], n);
+
+        // Higher layers should have fewer nodes (exponential decay)
+        for l in 1..layer_counts.len() {
+            assert!(
+                layer_counts[l] < layer_counts[l - 1],
+                "Layer {} should have fewer nodes than layer {}",
+                l,
+                l - 1
+            );
         }
+
+        // Verify queries work
+        let query: Vec<f32> = (0..dim).map(|_| 0.5).collect();
+        let (indices, _) = index.query(&query, 10, 50);
+        assert_eq!(indices.len(), 10);
     }
 
     #[test]
     fn test_hnsw_varying_m_values() {
-        // Test multiple small m values to ensure robustness
         let n = 500;
         let dim = 10;
 
@@ -1556,41 +1739,4 @@ mod tests {
             assert_eq!(indices.len(), 10, "Failed with m = {}", m);
         }
     }
-
-    // This was needed to reproduce the nasty bug
-    // #[test]
-    // #[should_panic(expected = "index out of bounds")]
-    // fn test_hnsw_query_layer_bug() {
-    //     // Exact reproduction of R failure case
-    //     let n = 929;
-    //     let dim = 15;
-    //     let m = 16;
-    //     let ef_construction = 200;
-
-    //     // Create data matching PCA output
-    //     let mut data = Vec::with_capacity(n * dim);
-    //     for i in 0..n {
-    //         for j in 0..dim {
-    //             data.push(((i * 37 + j * 13) as f32).sin() * 0.5);
-    //         }
-    //     }
-    //     let mat = Mat::from_fn(n, dim, |i, j| data[i * dim + j]);
-
-    //     // Build with EXACT parameters from failing R call
-    //     let index = HnswIndex::<f32>::build(
-    //         mat.as_ref(),
-    //         m,
-    //         ef_construction,
-    //         "cosine", // Default from R
-    //         42,
-    //         false,
-    //     );
-
-    //     // Query ALL nodes with k=16 (k=15 + 1 for self-removal)
-    //     // This ensures we traverse all parts of the graph
-    //     for i in 0..n {
-    //         let query: Vec<f32> = mat.row(i).iter().copied().collect();
-    //         let _ = index.query(&query, 16, 100);
-    //     }
-    // }
 }

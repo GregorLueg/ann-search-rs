@@ -1,12 +1,17 @@
-use faer::RowRef;
+use faer::{MatRef, RowRef};
 use num_traits::{Float, FromPrimitive, ToPrimitive};
 use rayon::prelude::*;
+use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::Ordering;
+use std::sync::Arc;
 use std::{collections::BinaryHeap, iter::Sum};
+use thousands::*;
 
 use crate::quantised::quantisers::*;
 use crate::utils::dist::*;
 use crate::utils::heap_structs::*;
-use crate::utils::k_means::*;
+use crate::utils::ivf_utils::*;
+use crate::utils::*;
 
 ////////////////
 // Main index //
@@ -21,6 +26,7 @@ use crate::utils::k_means::*;
 /// * `n` - Number of samples in the index
 /// * `metric` - Distance metric
 /// * `centroids` - K-means cluster centroids
+/// * `centroids_norm` - Norms of the centroids - not relevant for this index.
 /// * `all_indices` - Vector indices for each cluster (CSR format)
 /// * `offsets` - Offsets for each inverted list
 /// * `codebook` - Product quantiser with M codebooks
@@ -31,11 +37,82 @@ pub struct IvfPqIndex<T> {
     n: usize,
     metric: Dist,
     centroids: Vec<T>,
+    centroids_norm: Vec<T>,
     all_indices: Vec<usize>,
     offsets: Vec<usize>,
     codebook: ProductQuantiser<T>,
     nlist: usize,
 }
+
+//////////////////////
+// CentroidDistance //
+//////////////////////
+
+impl<T> CentroidDistance<T> for IvfPqIndex<T>
+where
+    T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum,
+{
+    fn centroids(&self) -> &[T] {
+        &self.centroids
+    }
+
+    fn dim(&self) -> usize {
+        self.dim
+    }
+
+    fn metric(&self) -> Dist {
+        self.metric
+    }
+
+    fn nlist(&self) -> usize {
+        self.nlist
+    }
+
+    fn centroids_norm(&self) -> &[T] {
+        &self.centroids_norm
+    }
+}
+
+///////////////////////
+// VectorDistanceAdc //
+///////////////////////
+
+impl<T> VectorDistanceAdc<T> for IvfPqIndex<T>
+where
+    T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum,
+{
+    fn codebook_m(&self) -> usize {
+        self.codebook.m()
+    }
+
+    fn codebook_n_centroids(&self) -> usize {
+        self.codebook.n_centroids()
+    }
+
+    fn codebook_subvec_dim(&self) -> usize {
+        self.codebook.subvec_dim()
+    }
+
+    fn centroids(&self) -> &[T] {
+        &self.centroids
+    }
+
+    fn dim(&self) -> usize {
+        self.dim
+    }
+
+    fn quantised_codes(&self) -> &[u8] {
+        &self.quantised_codes
+    }
+
+    fn codebooks(&self) -> &[Vec<T>] {
+        self.codebook.codebooks()
+    }
+}
+
+////////////////
+// Main index //
+////////////////
 
 impl<T> IvfPqIndex<T>
 where
@@ -45,13 +122,11 @@ where
     ///
     /// ### Params
     ///
-    /// * `vectors_flat` - Flattened vector data (length = n * dim)
-    /// * `dim` - Embedding dimensions
-    /// * `n` - Number of vectors
-    /// * `nlist` - Number of IVF clusters
+    /// * `data` - Matrix reference with vectors as rows (n × dim)
+    /// * `nlist` - Optional number of clusters. Defaults to `sqrt(n)`.
     /// * `m` - Number of subspaces for PQ (dim must be divisible by m)
     /// * `metric` - Distance metric (Euclidean or Cosine)
-    /// * `max_iters` - Maximum k-means iterations
+    /// * `max_iters` - Optional maximum k-means iterations (defaults to `30`).
     /// * `n_pq_centroids` - Number of centroids to use for the product
     ///   quantisation. If not provided, it uses the default `256`.
     /// * `seed` - Random seed
@@ -62,10 +137,8 @@ where
     /// Index ready for querying
     #[allow(clippy::too_many_arguments)]
     pub fn build(
-        mut vectors_flat: Vec<T>,
-        dim: usize,
-        n: usize,
-        nlist: usize,
+        data: MatRef<T>,
+        nlist: Option<usize>,
         m: usize,
         metric: Dist,
         max_iters: Option<usize>,
@@ -73,7 +146,10 @@ where
         seed: usize,
         verbose: bool,
     ) -> Self {
+        let (mut vectors_flat, n, dim) = matrix_to_flat(data);
+
         let max_iters = max_iters.unwrap_or(30);
+        let nlist = nlist.unwrap_or((n as f32).sqrt() as usize).max(1);
 
         // normalise for cosine distance
         if metric == Dist::Cosine {
@@ -85,7 +161,7 @@ where
                 .for_each(|chunk| normalise_vector(chunk));
         }
 
-        // 1. Subsample training data
+        // 1. subsample training data
         let (training_data, n_train) = if n > 500_000 {
             if verbose {
                 println!("  Sampling 250k vectors for training");
@@ -96,7 +172,11 @@ where
             (vectors_flat.clone(), n)
         };
 
-        // 2. Train IVF centroids
+        if verbose {
+            println!("  Generating IVF-PQ index with {} Voronoi cells.", nlist);
+        }
+
+        // 2. train IVF centroids
         let mut centroids = train_centroids(
             &training_data,
             dim,
@@ -108,7 +188,7 @@ where
             verbose,
         );
 
-        // Normalise centroids for cosine
+        // normalise centroids for cosine
         if metric == Dist::Cosine {
             if verbose {
                 println!("  Normalising centroids");
@@ -118,12 +198,22 @@ where
                 .for_each(|chunk| normalise_vector(chunk));
         }
 
-        // 3. Compute residuals for training data
+        // 3. compute residuals for training data
         if verbose {
             println!("  Computing residuals for PQ training");
         }
-        let training_assignments =
-            assign_all_parallel(&training_data, dim, n_train, &centroids, nlist, &metric);
+        let training_norms = vec![T::one(); n_train];
+        let centroid_norms = vec![T::one(); nlist];
+        let training_assignments = assign_all_parallel(
+            &training_data,
+            &training_norms,
+            dim,
+            n_train,
+            &centroids,
+            &centroid_norms,
+            nlist,
+            &metric,
+        );
 
         // For normalised vectors (cosine), ||q-v||² = 2(1 - <q,v>) so Euclidean distance
         // on residuals correctly approximates cosine distance
@@ -138,7 +228,7 @@ where
             }
         }
 
-        // 4. Train PQ on residuals
+        // 4. train PQ on residuals
         if verbose {
             println!("  Training product quantiser with m={}", m);
         }
@@ -147,17 +237,27 @@ where
             dim,
             m,
             n_pq_centroids,
-            &Dist::Euclidean, // IMPORTANT!
+            &Dist::Euclidean,
             max_iters,
             seed + 1000,
             verbose,
         );
 
-        // 5. Assign all vectors to IVF clusters
-        let assignments = assign_all_parallel(&vectors_flat, dim, n, &centroids, nlist, &metric);
+        // 5. assign all vectors to IVF clusters
+        let data_norms = vec![T::one(); n];
+        let assignments = assign_all_parallel(
+            &vectors_flat,
+            &data_norms,
+            dim,
+            n,
+            &centroids,
+            &centroid_norms,
+            nlist,
+            &metric,
+        );
         let (all_indices, offsets) = build_csr_layout(assignments.clone(), n, nlist);
 
-        // 6. Encode all vectors with product quantiser
+        // 6. encode all vectors with product quantiser
         if verbose {
             println!("  Encoding residuals");
         }
@@ -196,6 +296,7 @@ where
             n,
             nlist,
             metric,
+            centroids_norm: Vec::new(),
         }
     }
 
@@ -221,36 +322,13 @@ where
             normalise_vector(&mut query_vec);
         }
 
-        let nprobe = nprobe.unwrap_or_else(|| (((self.nlist as f64) * 0.15) as usize).max(1));
+        let nprobe = nprobe
+            .unwrap_or_else(|| ((self.nlist as f64).sqrt() as usize).max(1))
+            .min(self.nlist);
         let k = k.min(self.n);
 
         // Find top nprobe centroids
-        let mut cluster_scores: Vec<(T, usize)> = (0..self.nlist)
-            .map(|c| {
-                let cent = &self.centroids[c * self.dim..(c + 1) * self.dim];
-                let dist = match self.metric {
-                    Dist::Cosine => {
-                        let ip: T = query_vec
-                            .iter()
-                            .zip(cent.iter())
-                            .map(|(&q, &c)| q * c)
-                            .sum();
-                        T::one() - ip
-                    }
-                    Dist::Euclidean => query_vec
-                        .iter()
-                        .zip(cent.iter())
-                        .map(|(&q, &c)| (q - c) * (q - c))
-                        .sum(),
-                };
-                (dist, c)
-            })
-            .collect();
-
-        let nprobe = nprobe.min(self.nlist);
-        if nprobe < self.nlist {
-            cluster_scores.select_nth_unstable_by(nprobe, |a, b| a.0.partial_cmp(&b.0).unwrap());
-        }
+        let cluster_scores: Vec<(T, usize)> = self.get_centroids_prenorm(&query_vec, nprobe);
 
         let mut heap: BinaryHeap<(OrderedFloat<T>, usize)> = BinaryHeap::with_capacity(k + 1);
 
@@ -295,119 +373,6 @@ where
         (indices, distances)
     }
 
-    /// Build ADC lookup tables for a specific cluster
-    ///
-    /// ### Params
-    ///
-    /// * `query` - The query vector
-    /// * `cluster_idx`
-    ///
-    /// ### Returns
-    ///
-    /// Lookup table as flat Vec<T> of size M * n_centroids
-    fn build_lookup_tables(&self, query_vec: &[T], cluster_idx: usize) -> Vec<T> {
-        let m = self.codebook.m();
-        let subvec_dim = self.codebook.subvec_dim();
-        let n_cents = self.codebook.n_centroids();
-
-        // Compute query residual
-        let centroid = &self.centroids[cluster_idx * self.dim..(cluster_idx + 1) * self.dim];
-        let query_residual: Vec<T> = query_vec
-            .iter()
-            .zip(centroid.iter())
-            .map(|(&q, &c)| q - c)
-            .collect();
-
-        let mut table = vec![T::zero(); m * n_cents];
-
-        for subspace in 0..m {
-            let query_sub = &query_residual[subspace * subvec_dim..(subspace + 1) * subvec_dim];
-            let table_offset = subspace * n_cents;
-
-            for centroid_idx in 0..n_cents {
-                let centroid_start = centroid_idx * subvec_dim;
-                let pq_centroid = &self.codebook.codebooks()[subspace]
-                    [centroid_start..centroid_start + subvec_dim];
-
-                // squared Euclidean distance for ADC
-                let dist: T = query_sub
-                    .iter()
-                    .zip(pq_centroid.iter())
-                    .map(|(&q, &c)| {
-                        let diff = q - c;
-                        diff * diff
-                    })
-                    .sum();
-
-                table[table_offset + centroid_idx] = dist;
-            }
-        }
-
-        table
-    }
-
-    /// Compute distance using ADC lookup tables
-    ///
-    /// Optimised with manual unrolling and unsafe indexing for small m
-    ///
-    /// ### Params
-    ///
-    /// * `vec_idx` - Index of database vector
-    /// * `lookup_tables` - Precomputed distance table (flat layout)
-    ///
-    /// ### Returns
-    ///
-    /// Approximate distance
-    #[inline(always)]
-    fn compute_distance_adc(&self, vec_idx: usize, lookup_table: &[T]) -> T {
-        let m = self.codebook.m();
-        let n_cents = self.codebook.n_centroids();
-        let codes_start = vec_idx * m;
-        let codes = &self.quantised_codes[codes_start..codes_start + m];
-
-        // manual unrolling for common small m values with unsafe indexing
-        match m {
-            8 => {
-                let mut sum = T::zero();
-                for i in 0..8 {
-                    let code = unsafe { *codes.get_unchecked(i) } as usize;
-                    let offset = i * n_cents + code;
-                    sum = sum + unsafe { *lookup_table.get_unchecked(offset) };
-                }
-                sum
-            }
-            16 => {
-                let mut sum = T::zero();
-                for i in 0..16 {
-                    let code = unsafe { *codes.get_unchecked(i) } as usize;
-                    let offset = i * n_cents + code;
-                    sum = sum + unsafe { *lookup_table.get_unchecked(offset) };
-                }
-                sum
-            }
-            32 => {
-                let mut sum = T::zero();
-                for i in 0..32 {
-                    let code = unsafe { *codes.get_unchecked(i) } as usize;
-                    let offset = i * n_cents + code;
-                    sum = sum + unsafe { *lookup_table.get_unchecked(offset) };
-                }
-                sum
-            }
-            _ => {
-                // Generic fallback for other m values
-                codes
-                    .iter()
-                    .enumerate()
-                    .map(|(subspace, &code)| {
-                        let offset = subspace * n_cents + (code as usize);
-                        lookup_table[offset]
-                    })
-                    .fold(T::zero(), |acc, x| acc + x)
-            }
-        }
-    }
-
     /// Query using a matrix row reference
     ///
     /// ### Params
@@ -434,6 +399,97 @@ where
         let query_vec: Vec<T> = query_row.iter().cloned().collect();
         self.query(&query_vec, k, nprobe)
     }
+
+    /// Generate kNN graph from vectors stored in the index
+    ///
+    /// Reconstructs each vector (centroid + decoded residual) and uses ADC
+    /// for accurate distance computation across clusters.
+    ///
+    /// ### Params
+    ///
+    /// * `k` - Number of neighbours per vector
+    /// * `nprobe` - Number of clusters to search (defaults to sqrt(nlist) if None)
+    /// * `return_dist` - Whether to return distances
+    /// * `verbose` - Controls verbosity
+    ///
+    /// ### Returns
+    ///
+    /// Tuple of `(knn_indices, optional distances)` where each row corresponds
+    /// to a vector in the index
+    pub fn generate_knn(
+        &self,
+        k: usize,
+        nprobe: Option<usize>,
+        return_dist: bool,
+        verbose: bool,
+    ) -> (Vec<Vec<usize>>, Option<Vec<Vec<T>>>) {
+        let m = self.codebook.m();
+        let counter = Arc::new(AtomicUsize::new(0));
+
+        // Build cluster assignments
+        let mut cluster_assignments = vec![0usize; self.n];
+        for cluster_idx in 0..self.nlist {
+            let start = self.offsets[cluster_idx];
+            let end = self.offsets[cluster_idx + 1];
+            for &vec_idx in &self.all_indices[start..end] {
+                cluster_assignments[vec_idx] = cluster_idx;
+            }
+        }
+
+        let results: Vec<(Vec<usize>, Vec<T>)> = (0..self.n)
+            .into_par_iter()
+            .map(|i| {
+                let my_cluster = cluster_assignments[i];
+                let codes = &self.quantised_codes[i * m..(i + 1) * m];
+
+                // Reconstruct: centroid + decoded residual
+                let my_centroid =
+                    &self.centroids[my_cluster * self.dim..(my_cluster + 1) * self.dim];
+                let residual = self.codebook.decode(codes);
+                let reconstructed: Vec<T> = my_centroid
+                    .iter()
+                    .zip(residual.iter())
+                    .map(|(&c, &r)| c + r)
+                    .collect();
+
+                if verbose {
+                    let count = counter.fetch_add(1, Ordering::Relaxed) + 1;
+                    if count.is_multiple_of(100_000) {
+                        println!(
+                            "  Processed {} / {} samples.",
+                            count.separate_with_underscores(),
+                            self.n.separate_with_underscores()
+                        );
+                    }
+                }
+
+                self.query(&reconstructed, k, nprobe)
+            })
+            .collect();
+
+        if return_dist {
+            let (indices, distances) = results.into_iter().unzip();
+            (indices, Some(distances))
+        } else {
+            let indices = results.into_iter().map(|(idx, _)| idx).collect();
+            (indices, None)
+        }
+    }
+
+    /// Returns the size of the index in bytes
+    ///
+    /// ### Returns
+    ///
+    /// Number of bytes used by the index
+    pub fn memory_usage_bytes(&self) -> usize {
+        std::mem::size_of_val(self)
+            + self.quantised_codes.capacity() * std::mem::size_of::<u8>()
+            + self.centroids.capacity() * std::mem::size_of::<T>()
+            + self.centroids_norm.capacity() * std::mem::size_of::<T>()
+            + self.all_indices.capacity() * std::mem::size_of::<usize>()
+            + self.offsets.capacity() * std::mem::size_of::<usize>()
+            + self.codebook.memory_usage_bytes()
+    }
 }
 
 ///////////
@@ -445,7 +501,7 @@ mod tests {
     use super::*;
     use faer::Mat;
 
-    fn create_simple_dataset() -> Vec<f32> {
+    fn create_simple_dataset() -> Mat<f32> {
         let mut data = Vec::new();
         // Create 6 vectors of 32 dimensions
         // First 3 near origin
@@ -460,17 +516,15 @@ mod tests {
                 data.push(10.0 + i as f32 * 0.1 + j as f32 * 0.01);
             }
         }
-        data
+        Mat::from_fn(6, 32, |i, j| data[i * 32 + j])
     }
 
     #[test]
     fn test_build_euclidean() {
         let data = create_simple_dataset();
         let index = IvfPqIndex::build(
-            data,
-            32,
-            6,
-            2,
+            data.as_ref(),
+            Some(2),
             8,
             Dist::Euclidean,
             Some(10),
@@ -492,10 +546,8 @@ mod tests {
     fn test_build_cosine() {
         let data = create_simple_dataset();
         let index = IvfPqIndex::build(
-            data,
-            32,
-            6,
-            2,
+            data.as_ref(),
+            Some(2),
             8,
             Dist::Cosine,
             Some(10),
@@ -511,10 +563,8 @@ mod tests {
     fn test_query_returns_k_results() {
         let data = create_simple_dataset();
         let index = IvfPqIndex::build(
-            data,
-            32,
-            6,
-            2,
+            data.as_ref(),
+            Some(2),
             8,
             Dist::Euclidean,
             Some(10),
@@ -534,10 +584,8 @@ mod tests {
     fn test_query_k_exceeds_n() {
         let data = create_simple_dataset();
         let index = IvfPqIndex::build(
-            data,
-            32,
-            6,
-            2,
+            data.as_ref(),
+            Some(2),
             8,
             Dist::Euclidean,
             Some(10),
@@ -556,10 +604,8 @@ mod tests {
     fn test_query_distances_sorted() {
         let data = create_simple_dataset();
         let index = IvfPqIndex::build(
-            data,
-            32,
-            6,
-            2,
+            data.as_ref(),
+            Some(2),
             8,
             Dist::Euclidean,
             Some(10),
@@ -580,10 +626,8 @@ mod tests {
     fn test_query_cosine() {
         let data = create_simple_dataset();
         let index = IvfPqIndex::build(
-            data,
-            32,
-            6,
-            2,
+            data.as_ref(),
+            Some(2),
             8,
             Dist::Cosine,
             Some(10),
@@ -603,10 +647,8 @@ mod tests {
     fn test_query_different_nprobe() {
         let data = create_simple_dataset();
         let index = IvfPqIndex::build(
-            data,
-            32,
-            6,
-            2,
+            data.as_ref(),
+            Some(2),
             8,
             Dist::Euclidean,
             Some(10),
@@ -628,10 +670,8 @@ mod tests {
     fn test_query_deterministic() {
         let data = create_simple_dataset();
         let index = IvfPqIndex::build(
-            data,
-            32,
-            6,
-            2,
+            data.as_ref(),
+            Some(2),
             8,
             Dist::Euclidean,
             Some(10),
@@ -653,10 +693,8 @@ mod tests {
     fn test_query_row() {
         let data = create_simple_dataset();
         let index = IvfPqIndex::build(
-            data,
-            32,
-            6,
-            2,
+            data.as_ref(),
+            Some(2),
             8,
             Dist::Euclidean,
             Some(10),
@@ -676,18 +714,11 @@ mod tests {
 
     #[test]
     fn test_build_different_m() {
-        let mut data = Vec::new();
-        for i in 0..20 {
-            for j in 0..32 {
-                data.push((i + j) as f32);
-            }
-        }
+        let data = Mat::from_fn(20, 32, |i, j| (i + j) as f32);
 
         let index = IvfPqIndex::build(
-            data,
-            32,
-            20,
-            2,
+            data.as_ref(),
+            Some(2),
             8,
             Dist::Euclidean,
             Some(5),
@@ -705,10 +736,8 @@ mod tests {
     fn test_build_lookup_tables() {
         let data = create_simple_dataset();
         let index = IvfPqIndex::build(
-            data,
-            32,
-            6,
-            2,
+            data.as_ref(),
+            Some(2),
             8,
             Dist::Euclidean,
             Some(10),
@@ -728,10 +757,8 @@ mod tests {
     fn test_compute_distance_adc() {
         let data = create_simple_dataset();
         let index = IvfPqIndex::build(
-            data,
-            32,
-            6,
-            2,
+            data.as_ref(),
+            Some(2),
             8,
             Dist::Euclidean,
             Some(10),
@@ -750,18 +777,11 @@ mod tests {
 
     #[test]
     fn test_residual_encoding() {
-        let mut data = Vec::new();
-        for i in 0..50 {
-            for j in 0..32 {
-                data.push((i + j) as f32);
-            }
-        }
+        let data = Mat::from_fn(50, 32, |i, j| (i + j) as f32);
 
         let index = IvfPqIndex::build(
-            data.clone(),
-            32,
-            50,
-            5,
+            data.as_ref(),
+            Some(5),
             8,
             Dist::Euclidean,
             Some(5),
