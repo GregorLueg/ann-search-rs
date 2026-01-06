@@ -4,6 +4,7 @@ use num_traits::{Float, FromPrimitive};
 use rayon::prelude::*;
 use std::collections::BinaryHeap;
 use std::iter::Sum;
+use thousands::*;
 
 use crate::gpu::dist_gpu::*;
 use crate::gpu::tensor::*;
@@ -115,7 +116,8 @@ where
         if verbose {
             println!(
                 "  Building IVF-GPU-Batched index with {} clusters for {} vectors",
-                nlist, n
+                nlist,
+                n.separate_with_underscores()
             );
         }
 
@@ -254,6 +256,9 @@ where
             .unwrap_or_else(|| ((self.nlist as f64).sqrt() as usize).max(1))
             .min(self.nlist);
         let nquery = nquery.unwrap_or(IVF_GPU_QUERY_BATCH_SIZE);
+        if verbose {
+            println!("Using nquery batch size: {}", nquery);
+        }
         let k = k.min(self.n);
 
         let n_batches = n_queries.div_ceil(nquery);
@@ -272,7 +277,7 @@ where
                     "Processing query batch {}/{} ({} queries per batch)",
                     batch_idx + 1,
                     n_batches,
-                    nquery
+                    nquery.separate_with_underscores()
                 );
             }
 
