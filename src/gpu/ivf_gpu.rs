@@ -257,7 +257,10 @@ where
             .min(self.nlist);
         let nquery = nquery.unwrap_or(IVF_GPU_QUERY_BATCH_SIZE);
         if verbose {
-            println!("Using nquery batch size: {}", nquery);
+            println!(
+                "Using nquery batch size: {}",
+                nquery.separate_with_underscores()
+            );
         }
         let k = k.min(self.n);
 
