@@ -67,11 +67,23 @@ fn main() {
 
     println!("-----------------------------");
 
-    // Binary exhaustive benchmarks
-    let n_bits_values = [(256, "random"), (256, "itq"), (512, "random"), (512, "itq")];
+    // Binary exhaustive benchmarks - increase bits if higher dimensionality
+    // is used
+    let n_bits_values = if cli.dim <= 64 {
+        vec![(256, "random"), (256, "itq"), (512, "random"), (512, "itq")]
+    } else {
+        vec![
+            (256, "random"),
+            (256, "itq"),
+            (512, "random"),
+            (512, "itq"),
+            (1024, "random"),
+            (1024, "itq"),
+        ]
+    };
     let rerank_factors = [5, 10, 20];
 
-    for (n_bits, init) in n_bits_values {
+    for (n_bits, init) in &n_bits_values {
         let temp_dir = TempDir::new().unwrap();
 
         println!(
@@ -81,7 +93,7 @@ fn main() {
         let start = Instant::now();
         let binary_idx = build_exhaustive_index_binary(
             data.as_ref(),
-            n_bits,
+            *n_bits,
             cli.seed as usize,
             init,
             &cli.distance,
@@ -196,7 +208,7 @@ fn main() {
         (cli.n_cells as f32 * 2.0).sqrt() as usize,
     ];
 
-    for (n_bits, init) in [(256, "random"), (256, "itq"), (512, "random"), (512, "itq")] {
+    for (n_bits, init) in n_bits_values {
         for nlist in nlist_values {
             let temp_dir = TempDir::new().unwrap();
 

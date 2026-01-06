@@ -78,7 +78,7 @@ run_binary_benchmarks() {
     echo "=== Running binary benchmarks ===" 
     
     # for variant in binary rabitq; do
-    for variant in rabitq; do
+    for variant in binary rabitq; do
         run_common_patterns "cargo run --example gridsearch_${variant} --release --features binary --" "$(echo ${variant} | tr '[:lower:]' '[:upper:]')"
     done
 
@@ -99,7 +99,10 @@ run_binary_benchmarks() {
 
 [ $# -eq 0 ] && { echo "Usage: $0 [--standard] [--quantised] [--gpu] [--binary] [--all]"; exit 1; }
 
-RUN_STANDARD=false RUN_QUANTISED=false RUN_GPU=false RUN_BINARY=false
+RUN_STANDARD=false 
+RUN_QUANTISED=false 
+RUN_GPU=false 
+RUN_BINARY=false
 
 for arg in "$@"; do
     case $arg in

@@ -30,6 +30,7 @@ fn main() {
     let start = Instant::now();
     let exhaustive_idx = build_exhaustive_index(data.as_ref(), &cli.distance);
     let build_time = start.elapsed().as_secs_f64() * 1000.0;
+    let index_size_mb = exhaustive_idx.memory_usage_bytes() as f64 / (1024.0 * 1024.0);
 
     println!("Querying CPU exhaustive index...");
     let start = Instant::now();
@@ -37,13 +38,14 @@ fn main() {
         query_exhaustive_index(query_data.as_ref(), &exhaustive_idx, cli.k, true, false);
     let query_time = start.elapsed().as_secs_f64() * 1000.0;
 
-    results.push(BenchmarkResult {
+    results.push(BenchmarkResultSize {
         method: "Exhaustive (query)".to_string(),
         build_time_ms: build_time,
         query_time_ms: query_time,
         total_time_ms: build_time + query_time,
         recall_at_k: 1.0,
         mean_dist_err: 0.0,
+        index_size_mb,
     });
 
     // CPU Exhaustive (ground truth for self-query)
@@ -53,13 +55,14 @@ fn main() {
         query_exhaustive_self(&exhaustive_idx, cli.k, true, false);
     let self_query_time = start.elapsed().as_secs_f64() * 1000.0;
 
-    results.push(BenchmarkResult {
+    results.push(BenchmarkResultSize {
         method: "Exhaustive (self)".to_string(),
         build_time_ms: build_time,
         query_time_ms: self_query_time,
         total_time_ms: build_time + self_query_time,
         recall_at_k: 1.0,
         mean_dist_err: 0.0,
+        index_size_mb,
     });
 
     println!("-----------------------------");
@@ -75,6 +78,7 @@ fn main() {
         device.clone(),
     );
     let build_time = start.elapsed().as_secs_f64() * 1000.0;
+    let index_size_mb = gpu_exhaustive_idx.memory_usage_bytes() as f64 / (1024.0 * 1024.0);
 
     println!("Querying GPU exhaustive index (WGPU)...");
     let start = Instant::now();
@@ -89,13 +93,14 @@ fn main() {
         cli.k,
     );
 
-    results.push(BenchmarkResult {
+    results.push(BenchmarkResultSize {
         method: "GPU-Exhaustive (query)".to_string(),
         build_time_ms: build_time,
         query_time_ms: query_time,
         total_time_ms: build_time + query_time,
         recall_at_k: recall,
         mean_dist_err: dist_error,
+        index_size_mb,
     });
 
     println!("Self-querying GPU exhaustive index (WGPU)...");
@@ -111,13 +116,14 @@ fn main() {
         cli.k,
     );
 
-    results.push(BenchmarkResult {
+    results.push(BenchmarkResultSize {
         method: "GPU-Exhaustive (self)".to_string(),
         build_time_ms: build_time,
         query_time_ms: self_query_time,
         total_time_ms: build_time + self_query_time,
         recall_at_k: recall_self,
         mean_dist_err: dist_error_self,
+        index_size_mb,
     });
 
     println!("-----------------------------");
@@ -142,6 +148,9 @@ fn main() {
             device.clone(),
         );
         let build_time = start.elapsed().as_secs_f64() * 1000.0;
+
+        let (index_size_ram, _) = ivf_gpu_idx.memory_usage_bytes();
+        let index_size_mb = index_size_ram as f64 / (1024.0 * 1024.0);
 
         let nprobe_values = [
             (nlist as f32).sqrt() as usize,
@@ -180,13 +189,14 @@ fn main() {
                 cli.k,
             );
 
-            results.push(BenchmarkResult {
+            results.push(BenchmarkResultSize {
                 method: format!("IVF-GPU-nl{}-np{} (query)", nlist, nprobe),
                 build_time_ms: build_time,
                 query_time_ms: query_time,
                 total_time_ms: build_time + query_time,
                 recall_at_k: recall,
                 mean_dist_err: dist_error,
+                index_size_mb,
             });
         }
 
@@ -206,17 +216,18 @@ fn main() {
             cli.k,
         );
 
-        results.push(BenchmarkResult {
+        results.push(BenchmarkResultSize {
             method: format!("IVF-GPU-nl{} (self)", nlist),
             build_time_ms: build_time,
             query_time_ms: self_query_time,
             total_time_ms: build_time + self_query_time,
             recall_at_k: recall_self,
             mean_dist_err: dist_error_self,
+            index_size_mb,
         });
     }
 
-    print_results(
+    print_results_size(
         &format!(
             "{}k cells, {}D (CPU vs GPU Exhaustive vs IVF-GPU)",
             cli.n_cells / 1000,

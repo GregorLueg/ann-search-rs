@@ -4,8 +4,8 @@
 
 # ann-search-rs
 
-Various approximate nearest neighbour searches implemented in Rust. Helper
-library to be used in other libraries. 
+Various approximate nearest neighbour/vector searches implemented in Rust. 
+Helper library to be used in other libraries.
 
 ## Table of Contents
 
@@ -29,7 +29,8 @@ Feel free to use these implementations where you might need approximate nearest
 neighbour searches. This work is based on the great work from others who
 figured out how to design these algorithms and is just an implementation into
 Rust of some of these. Over time, I started getting interested into vector
-searches and implement WAY more indices and new stuff into this.
+searches and implement WAY more indices and new stuff into this than initially
+anticipated.
 
 ## Features
 
@@ -79,11 +80,10 @@ To note, I have changed some of the interfaces between versions.
 ## Roadmap
 
 - ~~First GPU support~~ (Implemented with version `0.2.1` of the crate).
-- Option to save indices on-disk and maybe do on-disk querying ... ? 
+- ~~Binary indices~~ (Also implemented with version `0.2.1`).
+- Option to save indices on-disk and maybe do on-disk querying ... ? The binary
+  indices already use some aspects of on-disk storage.
 - More GPU support for other indices. TBD, needs to warrant the time investment.
-  For the use cases of the author this crate suffices atm more than enough.
-  Additionally, need to figure out better ways to do the kernel magic as the
-  CPU to GPU transfers are quite costly and costing performance.
 
 ## Example Usage
 
@@ -122,7 +122,8 @@ let (hnsw_indices, hnsw_dists) = query_hnsw_index(
 The package provides a number of different approximate nearest neighbour
 searches. The overall design is very similar and if you wish details on usage,
 please refer to the `examples/*.rs` section which shows you the grid searches
-across various parameters per given index.
+across various parameters per given index. This and the documentation is a 
+good starting point to understand how the crate works.
 
 ## Performance and parameters
 
