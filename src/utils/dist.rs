@@ -1102,7 +1102,7 @@ fn compute_norm_f32_avx2(vec: &[f32]) -> f32 {
 fn compute_norm_f32_avx512(vec: &[f32]) -> f32 {
     use std::arch::x86_64::*;
 
-    let len = a.len();
+    let len = vec.len();
     let chunks = len / 16;
 
     unsafe {
@@ -1179,7 +1179,7 @@ fn compute_norm_f64_sse(vec: &[f64]) -> f64 {
     if len % 2 == 1 {
         sum += vec[len - 1] * vec[len - 1];
     }
-    sum
+    sum.sqrt()
 }
 
 /// Norm - f64, AVX2
