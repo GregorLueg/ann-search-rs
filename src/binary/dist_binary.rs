@@ -132,8 +132,7 @@ where
     /// Number of set bits in the binary vector
     #[inline]
     fn popcount(&self, cluster_idx: usize, local_idx: usize) -> u32 {
-        let binary = self.storage().vector_binary(cluster_idx, local_idx);
-        binary.iter().map(|b| b.count_ones()).sum()
+        self.storage().cluster_popcounts(cluster_idx)[local_idx]
     }
 
     /// Dot product between query and binary vector

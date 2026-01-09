@@ -31,7 +31,7 @@ benchmarked. Index size in memory is also provided.
 ## Table of Contents
 
 - [Binarisation](#binary-ivf-and-exhaustive)
-- [RaBitQ](#sq8-ivf)
+- [RaBitQ](#rabitq-ivf-and-exhaustive)
 
 ### <u>Binary (IVF and exhaustive)</u>
 
