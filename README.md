@@ -48,8 +48,8 @@ anticipated.
   - Cosine
   - More to come maybe... ?
 
-- **High performance**: Optimised implementations with SIMD-friendly code,
-heavy multi-threading were possible and optimised structures for memory access.
+- **High performance**: Optimised implementations with SIMD, heavy 
+  multi-threading were possible and optimised structures for memory access.
 
 - **Quantised indices** (optional feature):
   - *BF16* (brain floating point 16 quantisation for exhaustive and IVF)
