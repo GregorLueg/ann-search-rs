@@ -1,3 +1,4 @@
+use bytemuck::Pod;
 use faer::{MatRef, RowRef};
 use faer_traits::ComplexField;
 use num_traits::{Float, FromPrimitive, ToPrimitive};
@@ -86,7 +87,7 @@ where
 
 impl<T> IvfIndexRaBitQ<T>
 where
-    T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum + ComplexField + SimdDistance,
+    T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum + ComplexField + SimdDistance + Pod,
 {
     /// Build IVF-RaBitQ index
     ///
