@@ -3823,6 +3823,21 @@ mod tests {
     }
 
     #[test]
+    fn test_cosine_norm() {
+        let data_1 = vec![1.5, 2.5, 2.0];
+        let data_2 = vec![2.5, 0.5, 1.0];
+        let data_3 = vec![1.0, 0.0, 1.0];
+
+        let norm_1 = &data_1.iter().map(|x| *x * *x).sum::<f64>().sqrt();
+        let norm_2 = &data_2.iter().map(|x| *x * *x).sum::<f64>().sqrt();
+        let norm_3 = &data_3.iter().map(|x| *x * *x).sum::<f64>().sqrt();
+
+        assert_relative_eq!(*norm_1, compute_norm(&data_1), epsilon = 1e-5);
+        assert_relative_eq!(*norm_2, compute_norm(&data_2), epsilon = 1e-5);
+        assert_relative_eq!(*norm_3, compute_norm(&data_3), epsilon = 1e-5);
+    }
+
+    #[test]
     fn test_cosine_distance_symmetry() {
         let data = vec![2.0, 3.0, 5.0, 1.0, 4.0, 2.0];
 
