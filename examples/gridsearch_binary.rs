@@ -70,12 +70,7 @@ fn main() {
     // Binary exhaustive benchmarks - increase bits if higher dimensionality
     // is used
     let n_bits_values = if cli.dim <= 64 {
-        vec![
-            (256, "random"),
-            // (256, "itq"),
-            (512, "random"),
-            // (512, "itq")
-        ]
+        vec![(256, "random"), (256, "itq"), (512, "random"), (512, "itq")]
     } else {
         vec![
             (256, "random"),
@@ -204,174 +199,174 @@ fn main() {
         });
     }
 
-    // println!("-----------------------------");
+    println!("-----------------------------");
 
-    // // IVF binary benchmarks
-    // let nlist_values = [
-    //     (cli.n_cells as f32 * 0.5).sqrt() as usize,
-    //     (cli.n_cells as f32).sqrt() as usize,
-    //     (cli.n_cells as f32 * 2.0).sqrt() as usize,
-    // ];
+    // IVF binary benchmarks
+    let nlist_values = [
+        (cli.n_cells as f32 * 0.5).sqrt() as usize,
+        (cli.n_cells as f32).sqrt() as usize,
+        (cli.n_cells as f32 * 2.0).sqrt() as usize,
+    ];
 
-    // for (n_bits, init) in n_bits_values {
-    //     for nlist in nlist_values {
-    //         let temp_dir = TempDir::new().unwrap();
+    for (n_bits, init) in n_bits_values {
+        for nlist in nlist_values {
+            let temp_dir = TempDir::new().unwrap();
 
-    //         println!(
-    //             "Building IVF binary index (n_bits={}, nlist={}, init={})...",
-    //             n_bits, nlist, init
-    //         );
-    //         let start = Instant::now();
-    //         let ivf_binary_idx = build_ivf_index_binary(
-    //             data.as_ref(),
-    //             init,
-    //             n_bits,
-    //             Some(nlist),
-    //             None,
-    //             &cli.distance,
-    //             cli.seed as usize,
-    //             true,
-    //             Some(temp_dir.path()),
-    //             false,
-    //         )
-    //         .unwrap();
-    //         let build_time = start.elapsed().as_secs_f64() * 1000.0;
-    //         let index_size_mb = ivf_binary_idx.memory_usage_bytes() as f64 / (1024.0 * 1024.0);
+            println!(
+                "Building IVF binary index (n_bits={}, nlist={}, init={})...",
+                n_bits, nlist, init
+            );
+            let start = Instant::now();
+            let ivf_binary_idx = build_ivf_index_binary(
+                data.as_ref(),
+                init,
+                n_bits,
+                Some(nlist),
+                None,
+                &cli.distance,
+                cli.seed as usize,
+                true,
+                Some(temp_dir.path()),
+                false,
+            )
+            .unwrap();
+            let build_time = start.elapsed().as_secs_f64() * 1000.0;
+            let index_size_mb = ivf_binary_idx.memory_usage_bytes() as f64 / (1024.0 * 1024.0);
 
-    //         let nprobe_values = [
-    //             (nlist as f32).sqrt() as usize,
-    //             (nlist as f32 * 2.0).sqrt() as usize,
-    //             (0.05 * nlist as f32) as usize,
-    //         ];
-    //         let mut nprobe_values: Vec<_> = nprobe_values
-    //             .into_iter()
-    //             .collect::<HashSet<_>>()
-    //             .into_iter()
-    //             .collect();
-    //         nprobe_values.sort();
+            let nprobe_values = [
+                (nlist as f32).sqrt() as usize,
+                (nlist as f32 * 2.0).sqrt() as usize,
+                (0.05 * nlist as f32) as usize,
+            ];
+            let mut nprobe_values: Vec<_> = nprobe_values
+                .into_iter()
+                .collect::<HashSet<_>>()
+                .into_iter()
+                .collect();
+            nprobe_values.sort();
 
-    //         // Query without reranking
-    //         for nprobe in &nprobe_values {
-    //             if *nprobe > nlist || *nprobe == 0 {
-    //                 continue;
-    //             }
+            // Query without reranking
+            for nprobe in &nprobe_values {
+                if *nprobe > nlist || *nprobe == 0 {
+                    continue;
+                }
 
-    //             println!(
-    //                 "Querying IVF binary index (n_bits={}, init={}, nlist={}, nprobe={}, no rerank)...",
-    //                 n_bits, init, nlist, nprobe
-    //             );
-    //             let start = Instant::now();
-    //             let (ivf_binary_neighbors, _) = query_ivf_index_binary(
-    //                 query_data.as_ref(),
-    //                 &ivf_binary_idx,
-    //                 cli.k,
-    //                 Some(*nprobe),
-    //                 false,
-    //                 None,
-    //                 false,
-    //                 false,
-    //             );
-    //             let query_time = start.elapsed().as_secs_f64() * 1000.0;
+                println!(
+                    "Querying IVF binary index (n_bits={}, init={}, nlist={}, nprobe={}, no rerank)...",
+                    n_bits, init, nlist, nprobe
+                );
+                let start = Instant::now();
+                let (ivf_binary_neighbors, _) = query_ivf_index_binary(
+                    query_data.as_ref(),
+                    &ivf_binary_idx,
+                    cli.k,
+                    Some(*nprobe),
+                    false,
+                    None,
+                    false,
+                    false,
+                );
+                let query_time = start.elapsed().as_secs_f64() * 1000.0;
 
-    //             let recall = calculate_recall(&true_neighbors, &ivf_binary_neighbors, cli.k);
+                let recall = calculate_recall(&true_neighbors, &ivf_binary_neighbors, cli.k);
 
-    //             results.push(BenchmarkResultSize {
-    //                 method: format!(
-    //                     "IVF-Binary-{}-nl{}-np{}-rf0-{} (query)",
-    //                     n_bits, nlist, nprobe, init
-    //                 ),
-    //                 build_time_ms: build_time,
-    //                 query_time_ms: query_time,
-    //                 total_time_ms: build_time + query_time,
-    //                 recall_at_k: recall,
-    //                 mean_dist_err: f64::NAN,
-    //                 index_size_mb,
-    //             });
-    //         }
+                results.push(BenchmarkResultSize {
+                    method: format!(
+                        "IVF-Binary-{}-nl{}-np{}-rf0-{} (query)",
+                        n_bits, nlist, nprobe, init
+                    ),
+                    build_time_ms: build_time,
+                    query_time_ms: query_time,
+                    total_time_ms: build_time + query_time,
+                    recall_at_k: recall,
+                    mean_dist_err: f64::NAN,
+                    index_size_mb,
+                });
+            }
 
-    //         // Query with reranking
-    //         for nprobe in &nprobe_values {
-    //             if *nprobe > nlist || *nprobe == 0 {
-    //                 continue;
-    //             }
+            // Query with reranking
+            for nprobe in &nprobe_values {
+                if *nprobe > nlist || *nprobe == 0 {
+                    continue;
+                }
 
-    //             for &rerank_factor in &rerank_factors {
-    //                 println!(
-    //                     "Querying IVF binary index (n_bits={}, init={}, nlist={}, nprobe={}, rerank_factor={})...",
-    //                     n_bits, init, nlist, nprobe, rerank_factor
-    //                 );
-    //                 let start = Instant::now();
-    //                 let (ivf_binary_neighbors, ivf_binary_distances) = query_ivf_index_binary(
-    //                     query_data.as_ref(),
-    //                     &ivf_binary_idx,
-    //                     cli.k,
-    //                     Some(*nprobe),
-    //                     true,
-    //                     Some(rerank_factor),
-    //                     true,
-    //                     false,
-    //                 );
-    //                 let query_time = start.elapsed().as_secs_f64() * 1000.0;
+                for &rerank_factor in &rerank_factors {
+                    println!(
+                        "Querying IVF binary index (n_bits={}, init={}, nlist={}, nprobe={}, rerank_factor={})...",
+                        n_bits, init, nlist, nprobe, rerank_factor
+                    );
+                    let start = Instant::now();
+                    let (ivf_binary_neighbors, ivf_binary_distances) = query_ivf_index_binary(
+                        query_data.as_ref(),
+                        &ivf_binary_idx,
+                        cli.k,
+                        Some(*nprobe),
+                        true,
+                        Some(rerank_factor),
+                        true,
+                        false,
+                    );
+                    let query_time = start.elapsed().as_secs_f64() * 1000.0;
 
-    //                 let recall = calculate_recall(&true_neighbors, &ivf_binary_neighbors, cli.k);
-    //                 let dist_error = calculate_dist_error(
-    //                     true_distances.as_ref().unwrap(),
-    //                     ivf_binary_distances.as_ref().unwrap(),
-    //                     cli.k,
-    //                 );
+                    let recall = calculate_recall(&true_neighbors, &ivf_binary_neighbors, cli.k);
+                    let dist_error = calculate_dist_error(
+                        true_distances.as_ref().unwrap(),
+                        ivf_binary_distances.as_ref().unwrap(),
+                        cli.k,
+                    );
 
-    //                 results.push(BenchmarkResultSize {
-    //                     method: format!(
-    //                         "IVF-Binary-{}-nl{}-np{}-rf{}-{} (query)",
-    //                         n_bits, nlist, nprobe, rerank_factor, init
-    //                     ),
-    //                     build_time_ms: build_time,
-    //                     query_time_ms: query_time,
-    //                     total_time_ms: build_time + query_time,
-    //                     recall_at_k: recall,
-    //                     mean_dist_err: dist_error,
-    //                     index_size_mb,
-    //                 });
-    //             }
-    //         }
+                    results.push(BenchmarkResultSize {
+                        method: format!(
+                            "IVF-Binary-{}-nl{}-np{}-rf{}-{} (query)",
+                            n_bits, nlist, nprobe, rerank_factor, init
+                        ),
+                        build_time_ms: build_time,
+                        query_time_ms: query_time,
+                        total_time_ms: build_time + query_time,
+                        recall_at_k: recall,
+                        mean_dist_err: dist_error,
+                        index_size_mb,
+                    });
+                }
+            }
 
-    //         println!(
-    //             "Self-querying IVF binary index (n_bits={}, init={}, nlist={})...",
-    //             n_bits, init, nlist
-    //         );
-    //         let start = Instant::now();
-    //         let (ivf_binary_neighbors_self, ivf_binary_distances_self) =
-    //             query_ivf_index_binary_self(
-    //                 &ivf_binary_idx,
-    //                 cli.k,
-    //                 Some((nlist as f32).sqrt() as usize),
-    //                 Some(10),
-    //                 true,
-    //                 false,
-    //             );
-    //         let self_query_time = start.elapsed().as_secs_f64() * 1000.0;
+            println!(
+                "Self-querying IVF binary index (n_bits={}, init={}, nlist={})...",
+                n_bits, init, nlist
+            );
+            let start = Instant::now();
+            let (ivf_binary_neighbors_self, ivf_binary_distances_self) =
+                query_ivf_index_binary_self(
+                    &ivf_binary_idx,
+                    cli.k,
+                    Some((nlist as f32).sqrt() as usize),
+                    Some(10),
+                    true,
+                    false,
+                );
+            let self_query_time = start.elapsed().as_secs_f64() * 1000.0;
 
-    //         let recall_self =
-    //             calculate_recall(&true_neighbors_self, &ivf_binary_neighbors_self, cli.k);
-    //         let dist_error_self = calculate_dist_error(
-    //             true_distances_self.as_ref().unwrap(),
-    //             ivf_binary_distances_self.as_ref().unwrap(),
-    //             cli.k,
-    //         );
+            let recall_self =
+                calculate_recall(&true_neighbors_self, &ivf_binary_neighbors_self, cli.k);
+            let dist_error_self = calculate_dist_error(
+                true_distances_self.as_ref().unwrap(),
+                ivf_binary_distances_self.as_ref().unwrap(),
+                cli.k,
+            );
 
-    //         results.push(BenchmarkResultSize {
-    //             method: format!("IVF-Binary-{}-nl{}-{} (self)", n_bits, nlist, init),
-    //             build_time_ms: build_time,
-    //             query_time_ms: self_query_time,
-    //             total_time_ms: build_time + self_query_time,
-    //             recall_at_k: recall_self,
-    //             mean_dist_err: dist_error_self,
-    //             index_size_mb,
-    //         });
-    //     }
-    // }
+            results.push(BenchmarkResultSize {
+                method: format!("IVF-Binary-{}-nl{}-{} (self)", n_bits, nlist, init),
+                build_time_ms: build_time,
+                query_time_ms: self_query_time,
+                total_time_ms: build_time + self_query_time,
+                recall_at_k: recall_self,
+                mean_dist_err: dist_error_self,
+                index_size_mb,
+            });
+        }
+    }
 
-    // println!("-----------------------------");
+    println!("-----------------------------");
 
     print_results_size(
         &format!(
