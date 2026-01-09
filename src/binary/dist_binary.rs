@@ -1,10 +1,163 @@
+#![allow(dead_code)]
+
 use num_traits::{Float, FromPrimitive};
 
 use crate::binary::rabitq::*;
+use crate::utils::dist::*;
+
+#[cfg(target_arch = "aarch64")]
+use std::arch::aarch64::*;
+#[cfg(target_arch = "x86_64")]
+use std::arch::x86_64::*;
 
 ////////////////////
 // VectorDistance //
 ////////////////////
+
+//////////
+// SIMD //
+//////////
+
+// AVX-512
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f", enable = "avx512bw", enable = "popcnt")]
+unsafe fn hamming_avx512(a: &[u8], b: &[u8]) -> u32 {
+    let mut count = 0u64;
+    let len = a.len();
+    let n_chunks = len / 64;
+
+    for i in 0..n_chunks {
+        let offset = i * 64;
+        let va = _mm512_loadu_si512(a.as_ptr().add(offset) as *const __m512i);
+        let vb = _mm512_loadu_si512(b.as_ptr().add(offset) as *const __m512i);
+        let xor = _mm512_xor_si512(va, vb);
+
+        let xor_words = std::mem::transmute::<__m512i, [u64; 8]>(xor);
+        for &word in &xor_words {
+            count += _popcnt64(word as i64) as u64;
+        }
+    }
+
+    for i in (n_chunks * 64)..len {
+        count += (*a.get_unchecked(i) ^ *b.get_unchecked(i)).count_ones() as u64;
+    }
+
+    count as u32
+}
+
+// AVX2
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2", enable = "popcnt")]
+unsafe fn hamming_avx2(a: &[u8], b: &[u8]) -> u32 {
+    let mut count = 0u64;
+    let len = a.len();
+    let n_chunks = len / 32;
+
+    for i in 0..n_chunks {
+        let offset = i * 32;
+        let va = _mm256_loadu_si256(a.as_ptr().add(offset) as *const __m256i);
+        let vb = _mm256_loadu_si256(b.as_ptr().add(offset) as *const __m256i);
+        let xor = _mm256_xor_si256(va, vb);
+
+        let xor_words = std::mem::transmute::<__m256i, [u64; 4]>(xor);
+        for &word in &xor_words {
+            count += _popcnt64(word as i64) as u64;
+        }
+    }
+
+    for i in (n_chunks * 32)..len {
+        count += (*a.get_unchecked(i) ^ *b.get_unchecked(i)).count_ones() as u64;
+    }
+
+    count as u32
+}
+
+// SSE2
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "sse2")]
+unsafe fn hamming_sse2(a: &[u8], b: &[u8]) -> u32 {
+    let mut count = 0u64;
+    let len = a.len();
+    let n_chunks = len / 16;
+
+    for i in 0..n_chunks {
+        let offset = i * 16;
+        let va = _mm_loadu_si128(a.as_ptr().add(offset) as *const __m128i);
+        let vb = _mm_loadu_si128(b.as_ptr().add(offset) as *const __m128i);
+        let xor = _mm_xor_si128(va, vb);
+
+        let xor_words = std::mem::transmute::<__m128i, [u64; 2]>(xor);
+        for &word in &xor_words {
+            count += _popcnt64(word as i64) as u64;
+        }
+    }
+
+    for i in (n_chunks * 16)..len {
+        count += (*a.get_unchecked(i) ^ *b.get_unchecked(i)).count_ones() as u64;
+    }
+
+    count as u32
+}
+
+// NEON
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+unsafe fn hamming_neon(a: &[u8], b: &[u8]) -> u32 {
+    let mut count = 0u32;
+    let len = a.len();
+    let n_chunks = len / 16;
+
+    let mut sum = vdupq_n_u64(0);
+
+    for i in 0..n_chunks {
+        let offset = i * 16;
+        let va = vld1q_u8(a.as_ptr().add(offset));
+        let vb = vld1q_u8(b.as_ptr().add(offset));
+        let xor = veorq_u8(va, vb);
+        let popcnt = vcntq_u8(xor);
+        sum = vpadalq_u32(sum, vpaddlq_u16(vpaddlq_u8(popcnt)));
+    }
+
+    count += vgetq_lane_u64(sum, 0) as u32;
+    count += vgetq_lane_u64(sum, 1) as u32;
+
+    for i in (n_chunks * 16)..len {
+        count += (*a.get_unchecked(i) ^ *b.get_unchecked(i)).count_ones();
+    }
+
+    count
+}
+
+// Scalar fallback
+#[inline(always)]
+unsafe fn hamming_scalar(a: &[u8], b: &[u8]) -> u32 {
+    a.iter()
+        .zip(b.iter())
+        .map(|(x, y)| (x ^ y).count_ones())
+        .sum()
+}
+
+unsafe fn hamming_simd(a: &[u8], b: &[u8]) -> u32 {
+    #[cfg(target_arch = "x86_64")]
+    {
+        match detect_simd_level() {
+            SimdLevel::Avx512 => hamming_avx512(a, b),
+            SimdLevel::Avx2 => hamming_avx2(a, b),
+            SimdLevel::Sse => hamming_sse2(a, b),
+            SimdLevel::Scalar => hamming_scalar(a, b),
+        }
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    {
+        hamming_neon(a, b)
+    }
+
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+    {
+        hamming_scalar(a, b)
+    }
+}
 
 /// Trait for computing distances between binarised vectors
 pub trait VectorDistanceBinary {
@@ -36,6 +189,7 @@ pub trait VectorDistanceBinary {
     fn hamming_distance(&self, i: usize, j: usize) -> u32 {
         let start_i = i * self.n_bytes();
         let start_j = j * self.n_bytes();
+
         unsafe {
             let vec_i = self
                 .vectors_flat_binarised()
@@ -43,11 +197,8 @@ pub trait VectorDistanceBinary {
             let vec_j = self
                 .vectors_flat_binarised()
                 .get_unchecked(start_j..start_j + self.n_bytes());
-            vec_i
-                .iter()
-                .zip(vec_j.iter())
-                .map(|(x, y)| (x ^ y).count_ones())
-                .sum()
+
+            hamming_simd(vec_i, vec_j)
         }
     }
 
@@ -64,15 +215,13 @@ pub trait VectorDistanceBinary {
     #[inline(always)]
     fn hamming_distance_query(&self, query: &[u8], i: usize) -> u32 {
         let start_i = i * self.n_bytes();
+
         unsafe {
             let vec_i = self
                 .vectors_flat_binarised()
                 .get_unchecked(start_i..start_i + self.n_bytes());
-            query
-                .iter()
-                .zip(vec_i.iter())
-                .map(|(x, y)| (x ^ y).count_ones())
-                .sum()
+
+            hamming_simd(vec_i, query)
         }
     }
 }
@@ -132,8 +281,7 @@ where
     /// Number of set bits in the binary vector
     #[inline]
     fn popcount(&self, cluster_idx: usize, local_idx: usize) -> u32 {
-        let binary = self.storage().vector_binary(cluster_idx, local_idx);
-        binary.iter().map(|b| b.count_ones()).sum()
+        self.storage().cluster_popcounts(cluster_idx)[local_idx]
     }
 
     /// Dot product between query and binary vector
