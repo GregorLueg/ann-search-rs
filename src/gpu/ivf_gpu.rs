@@ -17,6 +17,8 @@ use crate::utils::*;
 
 /// To not explode memory VRAM memory
 const IVF_GPU_QUERY_BATCH_SIZE: usize = 100_000;
+/// Target max size for the candidate buffer
+const TARGET_BUFFER_MB: usize = 1500;
 
 /// Batched IVF index with GPU acceleration
 ///
@@ -348,8 +350,11 @@ where
         verbose: bool,
     ) -> (Vec<Vec<usize>>, Vec<Vec<T>>) {
         let (queries_flat, n_queries, dim_query) = matrix_to_flat(query_mat);
-
         let client: ComputeClient<<R as Runtime>::Server> = R::client(&self.device);
+
+        let nprobe_val = nprobe.unwrap_or(((self.nlist as f32).sqrt() as usize).max(1));
+
+        let batch_size = nquery.unwrap_or_else(|| self.calculate_safe_batch_size(nprobe_val));
 
         let (indices, dist) = self.query_internal(
             &queries_flat,
@@ -357,13 +362,12 @@ where
             dim_query,
             k,
             nprobe,
-            nquery,
+            Some(batch_size),
             &client,
             verbose,
         );
 
         client.memory_cleanup();
-
         (indices, dist)
     }
 
@@ -394,24 +398,44 @@ where
     ) -> (Vec<Vec<usize>>, Option<Vec<Vec<T>>>) {
         let client: ComputeClient<<R as Runtime>::Server> = R::client(&self.device);
 
-        // We need to read vectors back from GPU for the query
-        // This is unavoidable since query_internal expects CPU data
+        // 1. Determine parameters
+        let nprobe = nprobe.unwrap_or(((self.nlist as f32).sqrt() as usize).max(1));
+
+        // 2. Auto-calculate batch size if not provided
+        // This prevents the BufferTooBig panic
+        let batch_size = nquery.unwrap_or_else(|| {
+            let safe = self.calculate_safe_batch_size(nprobe);
+            if verbose {
+                println!("  Auto-tuned batch size to {} (based on density)", safe);
+            }
+            safe
+        });
+
+        // 3. Read vectors back from GPU (Needed for query input)
+        if verbose {
+            println!("  Reading vectors from GPU for self-query...");
+        }
         let vectors_by_cluster = self.vectors_gpu.clone().read(&client);
 
+        // 4. Run batched query
         let (indices_reorg, dist_reorg) = self.query_internal(
             &vectors_by_cluster,
             self.n,
             self.dim,
             k,
-            nprobe,
-            nquery,
+            Some(nprobe),
+            Some(batch_size), // Pass the safe batch size
             &client,
             verbose,
         );
 
         client.memory_cleanup();
 
-        // reorder results to match original vector ordering
+        // 5. Reorder results
+        if verbose {
+            println!("  Reordering results...");
+        }
+
         let mut indices = vec![Vec::new(); self.n];
         let mut dist = if return_dist {
             vec![Vec::new(); self.n]
@@ -481,7 +505,6 @@ where
         let dim_vectorized = self.dim / LINE_SIZE as usize;
         let vec_size = LINE_SIZE as u8;
 
-        // Compute query norms for cosine
         let query_norms = if self.metric == Dist::Cosine {
             (0..n_queries)
                 .into_par_iter()
@@ -498,7 +521,7 @@ where
             Vec::new()
         };
 
-        // Upload queries to GPU
+        // upload ALL queries to GPU once
         let queries_gpu =
             GpuTensor::<R, T>::from_slice(queries_flat, vec![n_queries, dim_vectorized], client);
 
@@ -512,9 +535,7 @@ where
             None
         };
 
-        // Phase 1: compute query-centroid distances
         let centroid_dists_gpu = GpuTensor::<R, T>::empty(vec![n_queries, self.nlist], client);
-
         let grid_x = (self.nlist as u32).div_ceil(WORKGROUP_SIZE_X);
         let grid_y = (n_queries as u32).div_ceil(WORKGROUP_SIZE_Y);
 
@@ -547,9 +568,10 @@ where
             },
         }
 
+        // read centroid distances - one block here
         let centroid_dists = centroid_dists_gpu.read(client);
 
-        // Phase 2: select top nprobe clusters per query (CPU, parallel)
+        // select top clusters (CPU)
         let probe_lists: Vec<Vec<usize>> = (0..n_queries)
             .into_par_iter()
             .map(|q| {
@@ -557,7 +579,10 @@ where
                 let mut cluster_dists: Vec<(T, usize)> = (0..self.nlist)
                     .map(|c| (centroid_dists[row_start + c], c))
                     .collect();
-                cluster_dists.sort_unstable_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+                // Unstable sort is faster and sufficient
+                cluster_dists.sort_unstable_by(|a, b| {
+                    a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal)
+                });
                 cluster_dists
                     .into_iter()
                     .take(nprobe)
@@ -566,138 +591,213 @@ where
             })
             .collect();
 
-        // Invert: for each cluster, which queries probe it?
+        // Invert: Cluster -> [Queries that probe it]
         let cluster_to_queries = invert_probe_lists(&probe_lists, self.nlist);
 
-        // Phase 3: per-cluster batched search with pre-allocated buffers
-        let mut heaps: Vec<BinaryHeap<(OrderedFloat<T>, usize)>> =
-            vec![BinaryHeap::with_capacity(k + 1); n_queries];
+        let candidates_per_query: Vec<usize> = probe_lists
+            .iter()
+            .map(|clusters| {
+                clusters
+                    .iter()
+                    .map(|&c| self.cluster_offsets[c + 1] - self.cluster_offsets[c])
+                    .sum()
+            })
+            .collect();
+
+        let max_candidates = *candidates_per_query.iter().max().unwrap_or(&0);
+
+        if verbose {
+            println!(
+                "  Allocating candidate buffer: {} x {} floats",
+                n_queries, max_candidates
+            );
+        }
+
+        // Allocate the "Fire and Forget" buffers
+        // We allocate based on the worst-case query, but most queries will just leave the tail empty
+        let candidate_dists_gpu = GpuTensor::<R, T>::empty(vec![n_queries, max_candidates], client);
+        let candidate_indices_gpu =
+            GpuTensor::<R, u32>::empty(vec![n_queries, max_candidates], client);
+
+        // track where each query is currently writing in the buffer
+        let mut cpu_write_pointers = vec![0u32; n_queries];
 
         for cluster_idx in 0..self.nlist {
-            if verbose && cluster_idx % 100 == 0 {
-                println!("  Cluster {}/{} for current batch", cluster_idx, self.nlist);
-            }
-
-            let query_indices = &cluster_to_queries[cluster_idx];
-            if query_indices.is_empty() {
+            let active_queries = &cluster_to_queries[cluster_idx];
+            if active_queries.is_empty() {
                 continue;
             }
 
             let cluster_start = self.cluster_offsets[cluster_idx];
-            let cluster_end = self.cluster_offsets[cluster_idx + 1];
-            let cluster_size = cluster_end - cluster_start;
+            let cluster_count = self.cluster_offsets[cluster_idx + 1] - cluster_start;
 
-            if cluster_size == 0 {
+            if cluster_count == 0 {
                 continue;
             }
 
-            let n_probing = query_indices.len();
+            // Prepare the "Schedule" for this cluster
+            // We need to tell the GPU:
+            // 1. Which queries are active? (active_indices)
+            // 2. Where do they write? (write_offsets)
 
-            // Gather queries that probe this cluster into contiguous CPU buffer
-            let mut gathered_queries = Vec::with_capacity(n_probing * self.dim);
-            let mut gathered_norms_cpu = Vec::with_capacity(n_probing);
+            let n_active = active_queries.len();
+            let mut active_indices_vec = Vec::with_capacity(n_active);
+            let mut write_offsets_vec = Vec::with_capacity(n_active);
 
-            for &q_idx in query_indices {
-                let start = q_idx * self.dim;
-                gathered_queries.extend_from_slice(&queries_flat[start..start + self.dim]);
-                if self.metric == Dist::Cosine {
-                    gathered_norms_cpu.push(query_norms[q_idx]);
-                }
+            for &q_idx in active_queries {
+                active_indices_vec.push(q_idx as u32);
+                write_offsets_vec.push(cpu_write_pointers[q_idx]);
+
+                // advance the pointer for next time
+                cpu_write_pointers[q_idx] += cluster_count as u32;
             }
 
-            // Upload gathered queries
-            let gathered_gpu = GpuTensor::<R, T>::from_slice(
-                &gathered_queries,
-                vec![n_probing, dim_vectorized],
-                client,
-            );
+            // Upload the schedule
+            let active_indices_gpu =
+                GpuTensor::<R, u32>::from_slice(&active_indices_vec, vec![n_active], client);
+            let write_offsets_gpu =
+                GpuTensor::<R, u32>::from_slice(&write_offsets_vec, vec![n_active], client);
 
-            let gathered_norms_gpu = if self.metric == Dist::Cosine {
-                Some(GpuTensor::<R, T>::from_slice(
-                    &gathered_norms_cpu,
-                    vec![n_probing],
-                    client,
-                ))
-            } else {
-                None
-            };
+            let grid_x = (cluster_count as u32).div_ceil(WORKGROUP_SIZE_X);
+            let grid_y = (n_active as u32).div_ceil(WORKGROUP_SIZE_Y);
 
-            // Allocate distance buffer for this cluster's actual size
-            let dist_gpu = GpuTensor::<R, T>::empty(vec![n_probing, cluster_size], client);
-
-            let grid_x = (cluster_size as u32).div_ceil(WORKGROUP_SIZE_X);
-            let grid_y = (n_probing as u32).div_ceil(WORKGROUP_SIZE_Y);
-
-            // Use offset-based kernels
+            // Launch Kernel
             match self.metric {
                 Dist::Euclidean => unsafe {
-                    euclidean_distances_gpu_offset::launch_unchecked::<T, R>(
+                    compute_candidates_euclidean::launch_unchecked::<T, R>(
                         client,
                         CubeCount::Static(grid_x, grid_y, 1),
                         CubeDim::new(WORKGROUP_SIZE_X, WORKGROUP_SIZE_Y, 1),
-                        gathered_gpu.into_tensor_arg(vec_size),
+                        queries_gpu.clone().into_tensor_arg(vec_size),
                         self.vectors_gpu.clone().into_tensor_arg(vec_size),
-                        dist_gpu.clone().into_tensor_arg(1),
+                        active_indices_gpu.into_tensor_arg(1),
+                        write_offsets_gpu.into_tensor_arg(1),
+                        candidate_dists_gpu.clone().into_tensor_arg(1),
+                        candidate_indices_gpu.clone().into_tensor_arg(1),
                         ScalarArg {
                             elem: cluster_start as u32,
                         },
                         ScalarArg {
-                            elem: cluster_size as u32,
+                            elem: cluster_count as u32,
                         },
                     );
                 },
                 Dist::Cosine => unsafe {
-                    cosine_distances_gpu_offset::launch_unchecked::<T, R>(
+                    compute_candidates_cosine::launch_unchecked::<T, R>(
                         client,
                         CubeCount::Static(grid_x, grid_y, 1),
                         CubeDim::new(WORKGROUP_SIZE_X, WORKGROUP_SIZE_Y, 1),
-                        gathered_gpu.into_tensor_arg(vec_size),
+                        queries_gpu.clone().into_tensor_arg(vec_size),
                         self.vectors_gpu.clone().into_tensor_arg(vec_size),
-                        gathered_norms_gpu.unwrap().into_tensor_arg(1),
+                        query_norms_gpu.as_ref().unwrap().clone().into_tensor_arg(1),
                         self.norms_gpu.as_ref().unwrap().clone().into_tensor_arg(1),
-                        dist_gpu.clone().into_tensor_arg(1),
+                        active_indices_gpu.into_tensor_arg(1),
+                        write_offsets_gpu.into_tensor_arg(1),
+                        candidate_dists_gpu.clone().into_tensor_arg(1),
+                        candidate_indices_gpu.clone().into_tensor_arg(1),
                         ScalarArg {
                             elem: cluster_start as u32,
                         },
                         ScalarArg {
-                            elem: cluster_size as u32,
+                            elem: cluster_count as u32,
                         },
                     );
                 },
             }
-
-            // Read results and process
-            let dists = dist_gpu.read(client);
-            process_cluster_results(
-                &dists,
-                query_indices,
-                cluster_idx,
-                cluster_size,
-                &self.original_indices,
-                &self.cluster_offsets,
-                k,
-                &mut heaps,
-            );
         }
 
-        // extract results from heaps (parallel)
-        let results: Vec<_> = heaps
+        if verbose {
+            println!("  GPU work queued. Waiting for results...");
+        }
+
+        // ONE BLOCKING READ for all data
+        let all_dists_flat = candidate_dists_gpu.read(client);
+        let all_indices_flat = candidate_indices_gpu.read(client);
+
+        if verbose {
+            println!("  Reducing results on CPU...");
+        }
+
+        // Parallel Top-K selection on CPU
+        let results: Vec<(Vec<usize>, Vec<T>)> = (0..n_queries)
             .into_par_iter()
-            .map(|heap| {
-                let mut sorted: Vec<_> = heap.into_iter().collect();
-                sorted.sort_unstable_by_key(|&(d, _)| d);
+            .map(|q_idx| {
+                let start = q_idx * max_candidates;
+                let count = candidates_per_query[q_idx];
 
-                let (distances, indices): (Vec<_>, Vec<_>) = sorted
-                    .into_iter()
-                    .map(|(OrderedFloat(d), idx)| (d, idx))
-                    .unzip();
+                let dist_row = &all_dists_flat[start..start + count];
+                let idx_row = &all_indices_flat[start..start + count];
 
-                (indices, distances)
+                let mut heap: BinaryHeap<(OrderedFloat<T>, usize)> =
+                    BinaryHeap::with_capacity(k + 1);
+
+                for i in 0..count {
+                    let d = dist_row[i];
+                    let idx = self.original_indices[idx_row[i] as usize];
+
+                    if heap.len() == k {
+                        if let Some((max_dist, _)) = heap.peek() {
+                            if d >= max_dist.0 {
+                                continue;
+                            }
+                        }
+                    }
+
+                    heap.push((OrderedFloat(d), idx));
+
+                    if heap.len() > k {
+                        heap.pop();
+                    }
+                }
+
+                let mut final_indices = Vec::with_capacity(k);
+                let mut final_dists = Vec::with_capacity(k);
+
+                let mut items = heap.into_vec();
+                items.sort_unstable();
+
+                for (d_wrapper, idx) in items {
+                    final_indices.push(idx);
+                    final_dists.push(d_wrapper.0);
+                }
+
+                (final_indices, final_dists)
             })
             .collect();
 
-        let (all_indices, all_distances): (Vec<_>, Vec<_>) = results.into_iter().unzip();
-        (all_indices, all_distances)
+        // Unzip results
+        let (indices, dists) = results.into_iter().unzip();
+        (indices, dists)
+    }
+
+    /// Calculate a memory-safe batch size for the Candidate Buffer strategy
+    ///
+    /// The new "Fire and Forget" strategy requires allocating a buffer of size:
+    /// [batch_size * nprobe * avg_cluster_size].
+    ///
+    /// ### Params
+    ///
+    /// * `nprobe` - Number of probes to use
+    ///
+    /// ### Returns
+    ///
+    /// The batch size
+    fn calculate_safe_batch_size(&self, nprobe: usize) -> usize {
+        // f32 dist + u32 index
+        const BYTES_PER_CANDIDATE: usize = 8;
+        // To account for variable cluster sizes
+        const SAFETY_MARGIN: f32 = 1.5;
+
+        let avg_cluster_size = self.n as f32 / self.nlist as f32;
+        let candidates_per_query = nprobe as f32 * avg_cluster_size * SAFETY_MARGIN;
+
+        let bytes_per_query = candidates_per_query * BYTES_PER_CANDIDATE as f32;
+
+        // calculate how many queries fit in the target memory
+        let safe_batch = ((TARGET_BUFFER_MB * 1024 * 1024) as f32 / bytes_per_query) as usize;
+
+        // clamp between 100 (sanity min) and 20k (sanity max)
+        safe_batch.clamp(100, 20_000)
     }
 }
 
@@ -794,56 +894,6 @@ fn invert_probe_lists(probe_lists: &[Vec<usize>], nlist: usize) -> Vec<Vec<usize
         }
     }
     result
-}
-
-/// Process cluster search results and update per-query heaps
-///
-/// Takes distance matrix from a batched cluster search and updates the
-/// k-NN heaps for each query. Only retains the k closest neighbours seen
-/// so far across all processed clusters.
-///
-/// ### Params
-///
-/// * `distances` - Distance matrix [n_queries, max_cluster_size] (only first cluster_size cols valid)
-/// * `query_indices` - Global query indices for this batch
-/// * `cluster_idx` - Index of the cluster being processed
-/// * `cluster_size` - Actual size of this cluster
-/// * `original_indices` - Maps reorganised position -> original database index
-/// * `cluster_offsets` - CSR offsets for clusters
-/// * `k` - Number of neighbours to retain
-/// * `heaps` - Per-query max-heaps storing current k-NN candidates
-#[allow(clippy::too_many_arguments)]
-fn process_cluster_results<T: Float>(
-    distances: &[T],
-    query_indices: &[usize],
-    cluster_idx: usize,
-    cluster_size: usize,
-    original_indices: &[usize],
-    cluster_offsets: &[usize],
-    k: usize,
-    heaps: &mut [BinaryHeap<(OrderedFloat<T>, usize)>],
-) {
-    let cluster_start = cluster_offsets[cluster_idx];
-    // Note: distances tensor may be larger than cluster_size (pre-allocated for max)
-    // We use the max_cluster_size as stride since that's how the tensor was allocated
-    let max_cluster_size = distances.len() / query_indices.len();
-
-    for (local_q, &global_q) in query_indices.iter().enumerate() {
-        let heap = &mut heaps[global_q];
-        let row_start = local_q * max_cluster_size;
-
-        for i in 0..cluster_size {
-            let dist = distances[row_start + i];
-            let original_idx = original_indices[cluster_start + i];
-
-            if heap.len() < k {
-                heap.push((OrderedFloat(dist), original_idx));
-            } else if dist < heap.peek().unwrap().0 .0 {
-                heap.pop();
-                heap.push((OrderedFloat(dist), original_idx));
-            }
-        }
-    }
 }
 
 ///////////
