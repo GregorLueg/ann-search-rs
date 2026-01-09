@@ -1,16 +1,13 @@
 use cubecl::prelude::*;
-use rayon::prelude::*;
-use std::collections::BinaryHeap;
 use std::iter::Sum;
 
 use crate::gpu::tensor::*;
 use crate::gpu::*;
 use crate::utils::dist::Dist;
-use crate::utils::heap_structs::*;
 
-/////////////
-// Helpers //
-/////////////
+//////////////////////
+// Distance kernels //
+//////////////////////
 
 /// Compute squared Euclidean distances on GPU
 ///
@@ -113,6 +110,136 @@ pub fn cosine_distances_gpu_chunk<F: Float>(
     }
 }
 
+///////////////////
+// Top N kernels //
+///////////////////
+
+/// Extract top-k smallest distances per query from a distance chunk
+///
+/// Simple insertion-based approach - one thread per query.
+/// O(chunk_size × k) per query, but saves massive CPU transfer.
+///
+/// ### Params
+/// * `distances` - [n_queries, chunk_size] distance matrix
+/// * `out_dists` - [n_queries, k] output distances (must be pre-init to MAX)
+/// * `out_indices` - [n_queries, k] output indices
+/// * `chunk_offset` - Global index offset for this DB chunk
+#[cube(launch_unchecked)]
+pub fn extract_topk<F: Float>(
+    distances: &Tensor<F>,
+    out_dists: &mut Tensor<F>,
+    out_indices: &mut Tensor<u32>,
+    chunk_offset: u32,
+) {
+    let query_idx = ABSOLUTE_POS_X;
+
+    if query_idx >= distances.shape(0) {
+        terminate!();
+    }
+
+    let chunk_size = distances.shape(1);
+    let k = out_dists.shape(1);
+    let dist_offset = query_idx * distances.stride(0);
+    let out_offset = query_idx * out_dists.stride(0);
+
+    for i in 0..chunk_size {
+        let dist = distances[dist_offset + i];
+
+        // Only process if better than current worst
+        if dist < out_dists[out_offset + k - 1] {
+            // Find insertion point (first position where dist < current)
+            let mut insert_pos: u32 = k - 1;
+            for j in 0..k {
+                if dist < out_dists[out_offset + j] && insert_pos == k - 1 {
+                    insert_pos = j;
+                }
+            }
+
+            // Shift elements right from insert_pos to k-2
+            for j in 0..k - 1 {
+                let src = k - 2 - j;
+                let dst = k - 1 - j;
+                if src >= insert_pos {
+                    out_dists[out_offset + dst] = out_dists[out_offset + src];
+                    out_indices[out_offset + dst] = out_indices[out_offset + src];
+                }
+            }
+
+            // Insert
+            out_dists[out_offset + insert_pos] = dist;
+            out_indices[out_offset + insert_pos] = chunk_offset + i;
+        }
+    }
+}
+
+/// Merge two sorted top-k lists into one
+///
+/// Standard sorted merge, taking first k elements.
+///
+/// ### Params
+/// * `dists_a`, `indices_a` - First top-k list [n_queries, k]
+/// * `dists_b`, `indices_b` - Second top-k list [n_queries, k]
+/// * `out_dists`, `out_indices` - Merged result [n_queries, k]
+#[cube(launch_unchecked)]
+pub fn merge_topk<F: Float>(
+    dists_a: &Tensor<F>,
+    indices_a: &Tensor<u32>,
+    dists_b: &Tensor<F>,
+    indices_b: &Tensor<u32>,
+    out_dists: &mut Tensor<F>,
+    out_indices: &mut Tensor<u32>,
+) {
+    let query_idx = ABSOLUTE_POS_X;
+    let k = dists_a.shape(1);
+
+    if query_idx >= dists_a.shape(0) {
+        terminate!();
+    }
+
+    let offset_a = query_idx * dists_a.stride(0);
+    let offset_b = query_idx * dists_b.stride(0);
+    let offset_out = query_idx * out_dists.stride(0);
+
+    let mut ptr_a: u32 = 0;
+    let mut ptr_b: u32 = 0;
+
+    for out_idx in 0..k {
+        let a_valid = ptr_a < k;
+        let b_valid = ptr_b < k;
+
+        // Take from A if: A valid AND (B exhausted OR A <= B)
+        let dist_a = dists_a[offset_a + ptr_a];
+        let dist_b = dists_b[offset_b + ptr_b];
+        let take_a = a_valid && (!b_valid || dist_a <= dist_b);
+
+        if take_a {
+            out_dists[offset_out + out_idx] = dist_a;
+            out_indices[offset_out + out_idx] = indices_a[offset_a + ptr_a];
+            ptr_a += 1;
+        } else {
+            out_dists[offset_out + out_idx] = dist_b;
+            out_indices[offset_out + out_idx] = indices_b[offset_b + ptr_b];
+            ptr_b += 1;
+        }
+    }
+}
+
+/// Initialise top-k tensors with MAX distance values
+#[cube(launch_unchecked)]
+pub fn init_topk<F: Float>(dists: &mut Tensor<F>, indices: &mut Tensor<u32>) {
+    let query_idx = ABSOLUTE_POS_Y;
+    let k_idx = ABSOLUTE_POS_X;
+    let k = dists.shape(1);
+
+    if query_idx >= dists.shape(0) || k_idx >= k {
+        terminate!();
+    }
+
+    let offset = query_idx * dists.stride(0) + k_idx;
+    dists[offset] = F::new(f32::MAX);
+    indices[offset] = 0u32;
+}
+
 ////////////////////
 // Main functions //
 ////////////////////
@@ -175,7 +302,6 @@ where
     T: Float + Sum + cubecl::CubeElement + num_traits::Float + num_traits::FromPrimitive,
 {
     let client = R::client(&device);
-
     let vec_size = LINE_SIZE as u8;
     let dim_vectorized = dim / LINE_SIZE as usize;
 
@@ -188,7 +314,7 @@ where
     for query_chunk_idx in 0..n_query_chunks {
         if verbose && query_chunk_idx % 10 == 0 {
             println!(
-                "Processed {} query chunks out of {} on the GPU.",
+                "Processed {} query chunks out of {}",
                 query_chunk_idx, n_query_chunks
             );
         }
@@ -214,16 +340,41 @@ where
             None
         };
 
-        let mut heaps: Vec<BinaryHeap<(OrderedFloat<T>, usize)>> =
-            vec![BinaryHeap::with_capacity(k + 1); current_query_chunk_size];
+        // Allocate running top-k on GPU
+        let mut topk_dists = GpuTensor::<R, T>::empty(vec![current_query_chunk_size, k], &client);
+        let mut topk_indices =
+            GpuTensor::<R, u32>::empty(vec![current_query_chunk_size, k], &client);
 
-        // track pending GPU work
-        let mut pending_distances: Option<(GpuTensor<R, T>, usize, usize)> = None;
+        // Initialise to MAX
+        let init_grid_x = (k as u32).div_ceil(WORKGROUP_SIZE_X);
+        let init_grid_y = (current_query_chunk_size as u32).div_ceil(WORKGROUP_SIZE_Y);
+        unsafe {
+            init_topk::launch_unchecked::<T, R>(
+                &client,
+                CubeCount::Static(init_grid_x, init_grid_y, 1),
+                CubeDim::new(WORKGROUP_SIZE_X, WORKGROUP_SIZE_Y, 1),
+                topk_dists.clone().into_tensor_arg(1),
+                topk_indices.clone().into_tensor_arg(1),
+            );
+        }
+
+        // Pre-allocate distance buffer for largest possible chunk
+        let max_db_chunk = DB_CHUNK_SIZE.min(db_data.n);
+        let distances_gpu =
+            GpuTensor::<R, T>::empty(vec![current_query_chunk_size, max_db_chunk], &client);
+
+        // Temp buffers for merge (double-buffer pattern)
+        let chunk_topk_dists = GpuTensor::<R, T>::empty(vec![current_query_chunk_size, k], &client);
+        let chunk_topk_indices =
+            GpuTensor::<R, u32>::empty(vec![current_query_chunk_size, k], &client);
+        let merged_dists = GpuTensor::<R, T>::empty(vec![current_query_chunk_size, k], &client);
+        let merged_indices = GpuTensor::<R, u32>::empty(vec![current_query_chunk_size, k], &client);
 
         for db_chunk_idx in 0..n_db_chunks {
             let db_start = db_chunk_idx * DB_CHUNK_SIZE;
             let db_end = (db_start + DB_CHUNK_SIZE).min(db_data.n);
             let current_db_chunk_size = db_end - db_start;
+
             let grid_x = (current_db_chunk_size as u32).div_ceil(WORKGROUP_SIZE_X);
             let grid_y = (current_query_chunk_size as u32).div_ceil(WORKGROUP_SIZE_Y);
 
@@ -234,12 +385,7 @@ where
                 &client,
             );
 
-            let distances_gpu = GpuTensor::<R, T>::empty(
-                vec![current_query_chunk_size, current_db_chunk_size],
-                &client,
-            );
-
-            // launch GPU kernel
+            // 1. Compute distances
             match *metric {
                 Dist::Euclidean => unsafe {
                     euclidean_distances_gpu_chunk::launch_unchecked::<T, R>(
@@ -248,7 +394,7 @@ where
                         CubeDim::new(WORKGROUP_SIZE_X, WORKGROUP_SIZE_Y, 1),
                         query_gpu.clone().into_tensor_arg(vec_size),
                         db_gpu.into_tensor_arg(vec_size),
-                        distances_gpu.into_tensor_arg(1),
+                        distances_gpu.clone().into_tensor_arg(1),
                     );
                 },
                 Dist::Cosine => {
@@ -257,7 +403,6 @@ where
                         vec![current_db_chunk_size],
                         &client,
                     );
-
                     unsafe {
                         cosine_distances_gpu_chunk::launch_unchecked::<T, R>(
                             &client,
@@ -267,88 +412,73 @@ where
                             db_gpu.into_tensor_arg(vec_size),
                             query_norms_gpu.as_ref().unwrap().clone().into_tensor_arg(1),
                             db_norms_gpu.into_tensor_arg(1),
-                            distances_gpu.into_tensor_arg(1),
+                            distances_gpu.clone().into_tensor_arg(1),
                         );
                     }
                 }
             }
 
-            // process PREVIOUS chunk's results while GPU works on current chunk
-            if let Some((prev_distances_gpu, prev_db_start, prev_db_chunk_size)) =
-                pending_distances.take()
-            {
-                let chunk_distances = prev_distances_gpu.read(&client);
-
-                heaps = heaps
-                    .into_par_iter()
-                    .enumerate()
-                    .map(|(q, mut heap)| {
-                        let row_start = q * prev_db_chunk_size;
-
-                        for i in 0..prev_db_chunk_size {
-                            let dist = chunk_distances[row_start + i];
-                            let global_idx = prev_db_start + i;
-
-                            if heap.len() < k {
-                                heap.push((OrderedFloat(dist), global_idx));
-                            } else if dist < heap.peek().unwrap().0 .0 {
-                                heap.pop();
-                                heap.push((OrderedFloat(dist), global_idx));
-                            }
-                        }
-                        heap
-                    })
-                    .collect();
+            // 2. Init chunk top-k
+            unsafe {
+                init_topk::launch_unchecked::<T, R>(
+                    &client,
+                    CubeCount::Static(init_grid_x, init_grid_y, 1),
+                    CubeDim::new(WORKGROUP_SIZE_X, WORKGROUP_SIZE_Y, 1),
+                    chunk_topk_dists.clone().into_tensor_arg(1),
+                    chunk_topk_indices.clone().into_tensor_arg(1),
+                );
             }
 
-            // store current chunk for next iteration
-            pending_distances = Some((distances_gpu, db_start, current_db_chunk_size));
+            // 3. Extract top-k from this chunk's distances
+            let extract_grid = (current_query_chunk_size as u32).div_ceil(WORKGROUP_SIZE_X);
+            unsafe {
+                extract_topk::launch_unchecked::<T, R>(
+                    &client,
+                    CubeCount::Static(extract_grid, 1, 1),
+                    CubeDim::new(WORKGROUP_SIZE_X, 1, 1),
+                    distances_gpu.clone().into_tensor_arg(1),
+                    chunk_topk_dists.clone().into_tensor_arg(1),
+                    chunk_topk_indices.clone().into_tensor_arg(1),
+                    cubecl::frontend::ScalarArg {
+                        elem: db_start as u32,
+                    },
+                );
+            }
+
+            // 4. Merge with running top-k
+            unsafe {
+                merge_topk::launch_unchecked::<T, R>(
+                    &client,
+                    CubeCount::Static(extract_grid, 1, 1),
+                    CubeDim::new(WORKGROUP_SIZE_X, 1, 1),
+                    topk_dists.clone().into_tensor_arg(1),
+                    topk_indices.clone().into_tensor_arg(1),
+                    chunk_topk_dists.clone().into_tensor_arg(1),
+                    chunk_topk_indices.clone().into_tensor_arg(1),
+                    merged_dists.clone().into_tensor_arg(1),
+                    merged_indices.clone().into_tensor_arg(1),
+                );
+            }
+
+            // Swap: merged becomes new running top-k
+            topk_dists = merged_dists.clone();
+            topk_indices = merged_indices.clone();
         }
 
-        // process final chunk
-        if let Some((prev_distances_gpu, prev_db_start, prev_db_chunk_size)) = pending_distances {
-            let chunk_distances = prev_distances_gpu.read(&client);
+        // Read final results - only k items per query!
+        let final_dists = topk_dists.read(&client);
+        let final_indices = topk_indices.read(&client);
 
-            heaps = heaps
-                .into_par_iter()
-                .enumerate()
-                .map(|(q, mut heap)| {
-                    let row_start = q * prev_db_chunk_size;
-
-                    for i in 0..prev_db_chunk_size {
-                        let dist = chunk_distances[row_start + i];
-                        let global_idx = prev_db_start + i;
-
-                        if heap.len() < k {
-                            heap.push((OrderedFloat(dist), global_idx));
-                        } else if dist < heap.peek().unwrap().0 .0 {
-                            heap.pop();
-                            heap.push((OrderedFloat(dist), global_idx));
-                        }
-                    }
-                    heap
-                })
-                .collect();
-        }
-
-        let chunk_results: Vec<_> = heaps
-            .into_par_iter()
-            .map(|heap| {
-                let mut results: Vec<_> = heap.into_iter().collect();
-                results.sort_unstable_by_key(|&(dist, _)| dist);
-
-                let (distances, indices): (Vec<_>, Vec<_>) = results
-                    .into_iter()
-                    .map(|(OrderedFloat(dist), idx)| (dist, idx))
-                    .unzip();
-
-                (indices, distances)
-            })
-            .collect();
-
-        for (indices, distances) in chunk_results {
-            all_indices.push(indices);
-            all_distances.push(distances);
+        for q in 0..current_query_chunk_size {
+            let start = q * k;
+            let end = start + k;
+            all_distances.push(final_dists[start..end].to_vec());
+            all_indices.push(
+                final_indices[start..end]
+                    .iter()
+                    .map(|&i| i as usize)
+                    .collect(),
+            );
         }
     }
 
