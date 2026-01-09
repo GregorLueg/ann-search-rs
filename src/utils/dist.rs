@@ -2696,441 +2696,6 @@ where
 // VectorDistanceSq8 //
 ///////////////////////
 
-//////////
-// SIMD //
-//////////
-
-//////////////////
-// i8 Euclidean //
-//////////////////
-
-/// Euclidean distance of i8 vectors - scalar fallback
-///
-/// ### Params
-///
-/// * `a` - First i8 vector slice
-/// * `b` - Second i8 vector slice
-///
-/// ### Returns
-///
-/// Euclidean distance
-#[inline(always)]
-fn euclidean_i8_scalar(a: &[i8], b: &[i8]) -> i32 {
-    a.iter()
-        .zip(b.iter())
-        .map(|(&x, &y)| {
-            let diff = x as i32 - y as i32;
-            diff * diff
-        })
-        .sum()
-}
-
-/// Euclidean distance of i8 vectors - SSE (128-bit, x86_64)
-///
-/// ### Params
-///
-/// * `a` - First i8 vector slice
-/// * `b` - Second i8 vector slice
-///
-/// ### Returns
-///
-/// Euclidean distance
-#[cfg(target_arch = "x86_64")]
-#[inline(always)]
-fn euclidean_i8_sse(a: &[i8], b: &[i8]) -> i32 {
-    use std::arch::x86_64::*;
-
-    let len = a.len();
-    let chunks = len / 16;
-
-    unsafe {
-        let mut acc = _mm_setzero_si128();
-
-        for i in 0..chunks {
-            let offset = i * 16;
-            // Load 16 i8 values
-            let va = _mm_loadu_si128(a.as_ptr().add(offset) as *const __m128i);
-            let vb = _mm_loadu_si128(b.as_ptr().add(offset) as *const __m128i);
-
-            // Widen lower 8 bytes to i16
-            let va_lo = _mm_cvtepi8_epi16(va);
-            let vb_lo = _mm_cvtepi8_epi16(vb);
-            // Widen upper 8 bytes to i16
-            let va_hi = _mm_cvtepi8_epi16(_mm_srli_si128(va, 8));
-            let vb_hi = _mm_cvtepi8_epi16(_mm_srli_si128(vb, 8));
-
-            // Subtract as i16
-            let diff_lo = _mm_sub_epi16(va_lo, vb_lo);
-            let diff_hi = _mm_sub_epi16(va_hi, vb_hi);
-
-            // Square and accumulate: madd with self gives sum of squares as i32
-            // _mm_madd_epi16 multiplies pairs and adds adjacent results to i32
-            let sq_lo = _mm_madd_epi16(diff_lo, diff_lo);
-            let sq_hi = _mm_madd_epi16(diff_hi, diff_hi);
-
-            acc = _mm_add_epi32(acc, sq_lo);
-            acc = _mm_add_epi32(acc, sq_hi);
-        }
-
-        // Horizontal sum
-        let sum = horizontal_sum_i32_sse(acc);
-
-        // Remainder
-        let mut total = sum;
-        for i in (chunks * 16)..len {
-            let diff = a[i] as i32 - b[i] as i32;
-            total += diff * diff;
-        }
-        total
-    }
-}
-
-/// Euclidean distance of i8 vectors - AVX2 (256-bit, x86_64)
-///
-/// ### Params
-///
-/// * `a` - First i8 vector slice
-/// * `b` - Second i8 vector slice
-///
-/// ### Returns
-///
-/// Euclidean distance
-#[cfg(target_arch = "x86_64")]
-#[inline(always)]
-fn euclidean_i8_avx2(a: &[i8], b: &[i8]) -> i32 {
-    use std::arch::x86_64::*;
-
-    let len = a.len();
-    let chunks = len / 32;
-
-    unsafe {
-        let mut acc = _mm256_setzero_si256();
-
-        for i in 0..chunks {
-            let offset = i * 32;
-            let va = _mm256_loadu_si256(a.as_ptr().add(offset) as *const __m256i);
-            let vb = _mm256_loadu_si256(b.as_ptr().add(offset) as *const __m256i);
-
-            // Extract 128-bit halves
-            let va_128_lo = _mm256_castsi256_si128(va);
-            let va_128_hi = _mm256_extracti128_si256(va, 1);
-            let vb_128_lo = _mm256_castsi256_si128(vb);
-            let vb_128_hi = _mm256_extracti128_si256(vb, 1);
-
-            // Widen each 128-bit chunk (16 x i8) to 256-bit (16 x i16)
-            let va_lo_16 = _mm256_cvtepi8_epi16(va_128_lo);
-            let va_hi_16 = _mm256_cvtepi8_epi16(va_128_hi);
-            let vb_lo_16 = _mm256_cvtepi8_epi16(vb_128_lo);
-            let vb_hi_16 = _mm256_cvtepi8_epi16(vb_128_hi);
-
-            // Subtract
-            let diff_lo = _mm256_sub_epi16(va_lo_16, vb_lo_16);
-            let diff_hi = _mm256_sub_epi16(va_hi_16, vb_hi_16);
-
-            // Square and accumulate to i32
-            let sq_lo = _mm256_madd_epi16(diff_lo, diff_lo);
-            let sq_hi = _mm256_madd_epi16(diff_hi, diff_hi);
-
-            acc = _mm256_add_epi32(acc, sq_lo);
-            acc = _mm256_add_epi32(acc, sq_hi);
-        }
-
-        let sum = horizontal_sum_i32_avx2(acc);
-
-        // Remainder
-        let mut total = sum;
-        for i in (chunks * 32)..len {
-            let diff = a[i] as i32 - b[i] as i32;
-            total += diff * diff;
-        }
-        total
-    }
-}
-
-/// Euclidean distance of i8 vectors - Neon (128-bit, aarch64)
-///
-/// ### Params
-///
-/// * `a` - First i8 vector slice
-/// * `b` - Second i8 vector slice
-///
-/// ### Returns
-///
-/// Euclidean distance
-#[cfg(target_arch = "aarch64")]
-#[inline(always)]
-fn euclidean_i8_neon(a: &[i8], b: &[i8]) -> i32 {
-    use std::arch::aarch64::*;
-
-    let len = a.len();
-    let chunks = len / 16;
-
-    unsafe {
-        let mut acc = vdupq_n_s32(0);
-
-        for i in 0..chunks {
-            let offset = i * 16;
-            let va = vld1q_s8(a.as_ptr().add(offset));
-            let vb = vld1q_s8(b.as_ptr().add(offset));
-
-            // Widen lower 8 to i16
-            let va_lo = vmovl_s8(vget_low_s8(va));
-            let vb_lo = vmovl_s8(vget_low_s8(vb));
-            // Widen upper 8 to i16
-            let va_hi = vmovl_s8(vget_high_s8(va));
-            let vb_hi = vmovl_s8(vget_high_s8(vb));
-
-            // Subtract
-            let diff_lo = vsubq_s16(va_lo, vb_lo);
-            let diff_hi = vsubq_s16(va_hi, vb_hi);
-
-            // Square and widen to i32, accumulate
-            acc = vmlal_s16(acc, vget_low_s16(diff_lo), vget_low_s16(diff_lo));
-            acc = vmlal_s16(acc, vget_high_s16(diff_lo), vget_high_s16(diff_lo));
-            acc = vmlal_s16(acc, vget_low_s16(diff_hi), vget_low_s16(diff_hi));
-            acc = vmlal_s16(acc, vget_high_s16(diff_hi), vget_high_s16(diff_hi));
-        }
-
-        let sum = vaddvq_s32(acc);
-
-        let mut total = sum;
-        for i in (chunks * 16)..len {
-            let diff = a[i] as i32 - b[i] as i32;
-            total += diff * diff;
-        }
-        total
-    }
-}
-
-////////////////////
-// i8 Dot product //
-////////////////////
-
-#[cfg(target_arch = "x86_64")]
-#[inline(always)]
-unsafe fn horizontal_sum_i32_sse(v: __m128i) -> i32 {
-    use std::arch::x86_64::*;
-    let hi = _mm_srli_si128(v, 8);
-    let sum = _mm_add_epi32(v, hi);
-    let hi2 = _mm_srli_si128(sum, 4);
-    let sum2 = _mm_add_epi32(sum, hi2);
-    _mm_cvtsi128_si32(sum2)
-}
-
-#[cfg(target_arch = "x86_64")]
-#[inline(always)]
-unsafe fn horizontal_sum_i32_avx2(v: __m256i) -> i32 {
-    use std::arch::x86_64::*;
-    let lo = _mm256_castsi256_si128(v);
-    let hi = _mm256_extracti128_si256(v, 1);
-    let sum128 = _mm_add_epi32(lo, hi);
-    horizontal_sum_i32_sse(sum128)
-}
-
-/// Dot product of i8 vectors - scalar fallback
-///
-/// ### Params
-///
-/// * `a` - First i8 vector slice
-/// * `b` - Second i8 vector slice
-///
-/// ### Returns
-///
-/// Dot product
-#[inline(always)]
-fn dot_i8_scalar(a: &[i8], b: &[i8]) -> i32 {
-    a.iter()
-        .zip(b.iter())
-        .map(|(&x, &y)| x as i32 * y as i32)
-        .sum()
-}
-
-/// Dot product of i8 vectors - SSE (128-bit, x86_64)
-///
-/// ### Params
-///
-/// * `a` - First i8 vector slice
-/// * `b` - Second i8 vector slice
-///
-/// ### Returns
-///
-/// Dot product
-#[cfg(target_arch = "x86_64")]
-#[inline(always)]
-fn dot_i8_sse(a: &[i8], b: &[i8]) -> i32 {
-    use std::arch::x86_64::*;
-
-    let len = a.len();
-    let chunks = len / 16;
-
-    unsafe {
-        let mut acc = _mm_setzero_si128();
-
-        for i in 0..chunks {
-            let offset = i * 16;
-            let va = _mm_loadu_si128(a.as_ptr().add(offset) as *const __m128i);
-            let vb = _mm_loadu_si128(b.as_ptr().add(offset) as *const __m128i);
-
-            // Widen to i16
-            let va_lo = _mm_cvtepi8_epi16(va);
-            let vb_lo = _mm_cvtepi8_epi16(vb);
-            let va_hi = _mm_cvtepi8_epi16(_mm_srli_si128(va, 8));
-            let vb_hi = _mm_cvtepi8_epi16(_mm_srli_si128(vb, 8));
-
-            // Multiply and accumulate to i32
-            let prod_lo = _mm_madd_epi16(va_lo, vb_lo);
-            let prod_hi = _mm_madd_epi16(va_hi, vb_hi);
-
-            acc = _mm_add_epi32(acc, prod_lo);
-            acc = _mm_add_epi32(acc, prod_hi);
-        }
-
-        let sum = horizontal_sum_i32_sse(acc);
-
-        let mut total = sum;
-        for i in (chunks * 16)..len {
-            total += a[i] as i32 * b[i] as i32;
-        }
-        total
-    }
-}
-
-/// Dot product of i8 vectors - AVX2 (256-bit, x86_64)
-///
-/// ### Params
-///
-/// * `a` - First i8 vector slice
-/// * `b` - Second i8 vector slice
-///
-/// ### Returns
-///
-/// Dot product
-#[cfg(target_arch = "x86_64")]
-#[inline(always)]
-fn dot_i8_avx2(a: &[i8], b: &[i8]) -> i32 {
-    use std::arch::x86_64::*;
-
-    let len = a.len();
-    let chunks = len / 32;
-
-    unsafe {
-        let mut acc = _mm256_setzero_si256();
-
-        for i in 0..chunks {
-            let offset = i * 32;
-            let va = _mm256_loadu_si256(a.as_ptr().add(offset) as *const __m256i);
-            let vb = _mm256_loadu_si256(b.as_ptr().add(offset) as *const __m256i);
-
-            let va_128_lo = _mm256_castsi256_si128(va);
-            let va_128_hi = _mm256_extracti128_si256(va, 1);
-            let vb_128_lo = _mm256_castsi256_si128(vb);
-            let vb_128_hi = _mm256_extracti128_si256(vb, 1);
-
-            let va_lo_16 = _mm256_cvtepi8_epi16(va_128_lo);
-            let va_hi_16 = _mm256_cvtepi8_epi16(va_128_hi);
-            let vb_lo_16 = _mm256_cvtepi8_epi16(vb_128_lo);
-            let vb_hi_16 = _mm256_cvtepi8_epi16(vb_128_hi);
-
-            let prod_lo = _mm256_madd_epi16(va_lo_16, vb_lo_16);
-            let prod_hi = _mm256_madd_epi16(va_hi_16, vb_hi_16);
-
-            acc = _mm256_add_epi32(acc, prod_lo);
-            acc = _mm256_add_epi32(acc, prod_hi);
-        }
-
-        let sum = horizontal_sum_i32_avx2(acc);
-
-        let mut total = sum;
-        for i in (chunks * 32)..len {
-            total += a[i] as i32 * b[i] as i32;
-        }
-        total
-    }
-}
-
-/// Dot product of i8 vectors - NEON (128-bit, aarch64)
-///
-/// ### Params
-///
-/// * `a` - First i8 vector slice
-/// * `b` - Second i8 vector slice
-///
-/// ### Returns
-///
-/// Dot product
-#[cfg(target_arch = "aarch64")]
-#[inline(always)]
-fn dot_i8_neon(a: &[i8], b: &[i8]) -> i32 {
-    use std::arch::aarch64::*;
-
-    let len = a.len();
-    let chunks = len / 16;
-
-    unsafe {
-        let mut acc = vdupq_n_s32(0);
-
-        for i in 0..chunks {
-            let offset = i * 16;
-            let va = vld1q_s8(a.as_ptr().add(offset));
-            let vb = vld1q_s8(b.as_ptr().add(offset));
-
-            let va_lo = vmovl_s8(vget_low_s8(va));
-            let vb_lo = vmovl_s8(vget_low_s8(vb));
-            let va_hi = vmovl_s8(vget_high_s8(va));
-            let vb_hi = vmovl_s8(vget_high_s8(vb));
-
-            acc = vmlal_s16(acc, vget_low_s16(va_lo), vget_low_s16(vb_lo));
-            acc = vmlal_s16(acc, vget_high_s16(va_lo), vget_high_s16(vb_lo));
-            acc = vmlal_s16(acc, vget_low_s16(va_hi), vget_low_s16(vb_hi));
-            acc = vmlal_s16(acc, vget_high_s16(va_hi), vget_high_s16(vb_hi));
-        }
-
-        let sum = vaddvq_s32(acc);
-
-        let mut total = sum;
-        for i in (chunks * 16)..len {
-            total += a[i] as i32 * b[i] as i32;
-        }
-        total
-    }
-}
-
-////////////////
-// Dispatcher //
-////////////////
-
-#[cfg(feature = "quantised")]
-#[inline]
-fn euclidean_i8_simd(a: &[i8], b: &[i8]) -> i32 {
-    match detect_simd_level() {
-        #[cfg(target_arch = "x86_64")]
-        SimdLevel::Avx512 | SimdLevel::Avx2 => euclidean_i8_avx2(a, b),
-        #[cfg(target_arch = "x86_64")]
-        SimdLevel::Sse => euclidean_i8_sse(a, b),
-        #[cfg(target_arch = "aarch64")]
-        SimdLevel::Sse => euclidean_i8_neon(a, b),
-        _ => euclidean_i8_scalar(a, b),
-    }
-}
-
-#[cfg(feature = "quantised")]
-#[inline]
-fn dot_i8_simd(a: &[i8], b: &[i8]) -> i32 {
-    match detect_simd_level() {
-        #[cfg(target_arch = "x86_64")]
-        SimdLevel::Avx512 | SimdLevel::Avx2 => dot_i8_avx2(a, b),
-        #[cfg(target_arch = "x86_64")]
-        SimdLevel::Sse => dot_i8_sse(a, b),
-        #[cfg(target_arch = "aarch64")]
-        SimdLevel::Sse => dot_i8_neon(a, b),
-        _ => dot_i8_scalar(a, b),
-    }
-}
-
-//////////////////////////////////////
-// VectorDistanceSq8 implementation //
-//////////////////////////////////////
-
 #[cfg(feature = "quantised")]
 /// Trait for computing distances between `i8`
 pub trait VectorDistanceSq8<T>
@@ -3168,9 +2733,22 @@ where
     #[inline(always)]
     fn euclidean_distance_i8(&self, internal_idx: usize, query_i8: &[i8]) -> T {
         let start = internal_idx * self.dim();
-        let db_vec = &self.vectors_flat_quantised()[start..start + self.dim()];
-        let sum = euclidean_i8_simd(query_i8, db_vec);
-        T::from_i32(sum).unwrap()
+        unsafe {
+            let db_vec = &self
+                .vectors_flat_quantised()
+                .get_unchecked(start..start + self.dim());
+
+            let sum: i32 = query_i8
+                .iter()
+                .zip(db_vec.iter())
+                .map(|(&q, &d)| {
+                    let diff = q as i32 - d as i32;
+                    diff * diff
+                })
+                .sum();
+
+            T::from_i32(sum).unwrap()
+        }
     }
 
     /// Calculate cosine distance against quantised query
@@ -3192,17 +2770,28 @@ where
     #[inline(always)]
     fn cosine_distance_i8(&self, vec_idx: usize, query_i8: &[i8], query_norm_sq: i32) -> T {
         let start = vec_idx * self.dim();
-        let db_vec = &self.vectors_flat_quantised()[start..start + self.dim()];
-        let dot = dot_i8_simd(query_i8, db_vec);
-        let db_norm_sq = self.norms_quantised()[vec_idx];
 
-        let query_norm = T::from_i32(query_norm_sq).unwrap().sqrt();
-        let db_norm = T::from_i32(db_norm_sq).unwrap().sqrt();
+        unsafe {
+            let db_vec = &self
+                .vectors_flat_quantised()
+                .get_unchecked(start..start + self.dim());
 
-        if query_norm > T::zero() && db_norm > T::zero() {
-            T::one() - T::from_i32(dot).unwrap() / (query_norm * db_norm)
-        } else {
-            T::one()
+            let dot: i32 = query_i8
+                .iter()
+                .zip(db_vec.iter())
+                .map(|(&q, &d)| q as i32 * d as i32)
+                .sum();
+
+            let db_norm_sq: i32 = self.norms_quantised()[vec_idx];
+
+            let query_norm = T::from_i32(query_norm_sq).unwrap().sqrt();
+            let db_norm = T::from_i32(db_norm_sq).unwrap().sqrt();
+
+            if query_norm > T::zero() && db_norm > T::zero() {
+                T::one() - T::from_i32(dot).unwrap() / (query_norm * db_norm)
+            } else {
+                T::one()
+            }
         }
     }
 }
