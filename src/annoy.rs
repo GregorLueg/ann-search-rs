@@ -190,7 +190,7 @@ pub struct AnnoyIndex<T> {
 
 impl<T> VectorDistance<T> for AnnoyIndex<T>
 where
-    T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum,
+    T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum + SimdDistance,
 {
     fn vectors_flat(&self) -> &[T] {
         &self.vectors_flat
@@ -785,7 +785,7 @@ where
 
 impl<T> KnnValidation<T> for AnnoyIndex<T>
 where
-    T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum,
+    T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum + SimdDistance,
 {
     fn query_for_validation(&self, query_vec: &[T], k: usize) -> (Vec<usize>, Vec<T>) {
         // Use the default here

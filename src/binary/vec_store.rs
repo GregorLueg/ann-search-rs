@@ -184,7 +184,7 @@ where
 
 impl<T> VectorDistance<T> for MmapVectorStore<T>
 where
-    T: Float + Sum,
+    T: Float + Sum + SimdDistance,
 {
     fn vectors_flat(&self) -> &[T] {
         unsafe {

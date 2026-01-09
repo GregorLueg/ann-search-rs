@@ -1,11 +1,19 @@
+#![allow(dead_code)]
+
 use faer::RowRef;
 use num_traits::Float;
 use std::iter::Sum;
+use std::sync::OnceLock;
+use wide::{f32x4, f32x8, f64x2, f64x4};
 
 #[cfg(feature = "quantised")]
 use half::*;
 #[cfg(feature = "quantised")]
 use num_traits::{FromPrimitive, ToPrimitive};
+#[cfg(all(feature = "quantised", target_arch = "aarch64"))]
+use std::arch::aarch64::*;
+#[cfg(all(feature = "quantised", target_arch = "x86_64"))]
+use std::arch::x86_64::*;
 
 ////////////
 // Helper //
@@ -46,10 +54,688 @@ pub fn parse_ann_dist(s: &str) -> Option<Dist> {
 // VectorDistance //
 ////////////////////
 
+//////////////////////
+// SIMD for f32/f64 //
+//////////////////////
+
+// Enum for the different architectures and potential SIMD levels
+#[derive(Clone, Copy, Debug)]
+pub enum SimdLevel {
+    /// Scalar version
+    Scalar,
+    /// 128-bit (also covers NEON which is used by Apple)
+    Sse,
+    /// 256-bit
+    Avx2,
+    /// 512-bit
+    Avx512,
+}
+
+static SIMD_LEVEL: OnceLock<SimdLevel> = OnceLock::new();
+
+/// Function to detect which SIMD implementation to use
+pub fn detect_simd_level() -> SimdLevel {
+    *SIMD_LEVEL.get_or_init(|| {
+        #[cfg(target_arch = "x86_64")]
+        {
+            if is_x86_feature_detected!("avx512f") {
+                return SimdLevel::Avx512;
+            }
+            if is_x86_feature_detected!("avx2") {
+                return SimdLevel::Avx2;
+            }
+            if is_x86_feature_detected!("sse4.1") {
+                return SimdLevel::Sse;
+            }
+            return SimdLevel::Scalar;
+        }
+
+        #[cfg(target_arch = "aarch64")]
+        {
+            // NEON is always available on aarch64
+            SimdLevel::Sse
+        }
+
+        #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+        {
+            SimdLevel::Scalar
+        }
+    })
+}
+
+/// Trait for SIMD distance calculations
+pub trait SimdDistance: Sized + Copy {
+    /// Calculate Euclidean distance via SIMD
+    ///
+    /// ### Params
+    ///
+    /// * `a` - Slice of vector a
+    /// * `b` - Slice of vector b
+    ///
+    /// ### Returns
+    ///
+    /// Squared Euclidean distance
+    fn euclidean_simd(a: &[Self], b: &[Self]) -> Self;
+
+    /// Calculate dot product via SIMD
+    ///
+    /// ### Params
+    ///
+    /// * `a` - Slice of vector a
+    /// * `b` - Slice of vector b
+    ///
+    /// ### Returns
+    ///
+    /// Dot product
+    fn dot_simd(a: &[Self], b: &[Self]) -> Self;
+}
+
+///////////////////
+// f32 Euclidean //
+///////////////////
+
+/// Euclidean distance - f32, scalar
+///
+/// ### Params
+///
+/// * `a` - Slice of vector a
+/// * `b` - Slice of vector b
+///
+/// ### Returns
+///
+/// Squared euclidean distance
+#[inline(always)]
+fn euclidean_f32_scalar(a: &[f32], b: &[f32]) -> f32 {
+    a.iter()
+        .zip(b.iter())
+        .map(|(&x, &y)| {
+            let d = x - y;
+            d * d
+        })
+        .sum()
+}
+
+/// Euclidean distance - f32, optimised for 128 bits
+///
+/// ### Params
+///
+/// * `a` - Slice of vector a
+/// * `b` - Slice of vector b
+///
+/// ### Returns
+///
+/// Squared euclidean distance
+#[inline(always)]
+fn euclidean_f32_sse(a: &[f32], b: &[f32]) -> f32 {
+    let len = a.len();
+    let chunks = len / 4;
+    let mut acc = f32x4::ZERO;
+
+    unsafe {
+        let a_ptr = a.as_ptr();
+        let b_ptr = b.as_ptr();
+
+        for i in 0..chunks {
+            let offset = i * 4;
+            let va = f32x4::from(*(a_ptr.add(offset) as *const [f32; 4]));
+            let vb = f32x4::from(*(b_ptr.add(offset) as *const [f32; 4]));
+            let diff = va - vb;
+            acc += diff * diff;
+        }
+    }
+
+    let mut sum = acc.reduce_add();
+    for i in (chunks * 4)..len {
+        let diff = a[i] - b[i];
+        sum += diff * diff;
+    }
+    sum
+}
+
+/// Euclidean distance - f32, optimised for 256 bits
+///
+/// ### Params
+///
+/// * `a` - Slice of vector a
+/// * `b` - Slice of vector b
+///
+/// ### Returns
+///
+/// Squared euclidean distance
+#[inline(always)]
+fn euclidean_f32_avx2(a: &[f32], b: &[f32]) -> f32 {
+    let len = a.len();
+    let chunks = len / 8;
+    let mut acc = f32x8::ZERO;
+
+    unsafe {
+        let a_ptr = a.as_ptr();
+        let b_ptr = b.as_ptr();
+
+        for i in 0..chunks {
+            let offset = i * 8;
+            let va = f32x8::from(*(a_ptr.add(offset) as *const [f32; 8]));
+            let vb = f32x8::from(*(b_ptr.add(offset) as *const [f32; 8]));
+            let diff = va - vb;
+            acc += diff * diff;
+        }
+    }
+
+    let mut sum = acc.reduce_add();
+    for i in (chunks * 8)..len {
+        let diff = a[i] - b[i];
+        sum += diff * diff;
+    }
+    sum
+}
+
+/// Euclidean distance - f32, optimised for 512 bits
+///
+/// ### Params
+///
+/// * `a` - Slice of vector a
+/// * `b` - Slice of vector b
+///
+/// ### Returns
+///
+/// Squared euclidean distance
+#[cfg(all(target_arch = "x86_64", target_feature = "avx512f"))]
+#[inline(always)]
+fn euclidean_f32_avx512(a: &[f32], b: &[f32]) -> f32 {
+    use std::arch::x86_64::*;
+
+    let len = a.len();
+    let chunks = len / 16;
+
+    unsafe {
+        let mut acc = _mm512_setzero_ps();
+
+        for i in 0..chunks {
+            let va = _mm512_loadu_ps(a.as_ptr().add(i * 16));
+            let vb = _mm512_loadu_ps(b.as_ptr().add(i * 16));
+            let diff = _mm512_sub_ps(va, vb);
+            acc = _mm512_fmadd_ps(diff, diff, acc);
+        }
+
+        let mut sum = _mm512_reduce_add_ps(acc);
+
+        // Remainder
+        for i in (chunks * 16)..len {
+            let diff = a[i] - b[i];
+            sum += diff * diff;
+        }
+        sum
+    }
+}
+
+#[cfg(not(all(target_arch = "x86_64", target_feature = "avx512f")))]
+#[inline(always)]
+fn euclidean_f32_avx512(a: &[f32], b: &[f32]) -> f32 {
+    // Fallback - shouldn't be called but needed for compilation
+    euclidean_f32_avx2(a, b)
+}
+
+///////////////////
+// f64 Euclidean //
+///////////////////
+
+/// Euclidean distance - f64, scalar
+///
+/// ### Params
+///
+/// * `a` - Slice of vector a
+/// * `b` - Slice of vector b
+///
+/// ### Returns
+///
+/// Squared euclidean distance
+#[inline(always)]
+fn euclidean_f64_scalar(a: &[f64], b: &[f64]) -> f64 {
+    a.iter()
+        .zip(b.iter())
+        .map(|(&x, &y)| {
+            let d = x - y;
+            d * d
+        })
+        .sum()
+}
+
+/// Euclidean distance - f64, optimised for 128 bits
+///
+/// ### Params
+///
+/// * `a` - Slice of vector a
+/// * `b` - Slice of vector b
+///
+/// ### Returns
+///
+/// Squared euclidean distance
+#[inline(always)]
+fn euclidean_f64_sse(a: &[f64], b: &[f64]) -> f64 {
+    let len = a.len();
+    let chunks = len / 2;
+    let mut acc = f64x2::ZERO;
+
+    // to avoid trait bound blabla -> unsafe
+    unsafe {
+        let a_ptr = a.as_ptr();
+        let b_ptr = b.as_ptr();
+
+        for i in 0..chunks {
+            let offset = i * 2;
+            let va = f64x2::from(*(a_ptr.add(offset) as *const [f64; 2]));
+            let vb = f64x2::from(*(b_ptr.add(offset) as *const [f64; 2]));
+            let diff = va - vb;
+            acc += diff * diff;
+        }
+    }
+
+    let mut sum = acc.reduce_add();
+    if len % 2 == 1 {
+        let diff = a[len - 1] - b[len - 1];
+        sum += diff * diff;
+    }
+    sum
+}
+
+/// Euclidean distance - f64, optimised for 256 bits
+///
+/// ### Params
+///
+/// * `a` - Slice of vector a
+/// * `b` - Slice of vector b
+///
+/// ### Returns
+///
+/// Squared euclidean distance
+#[inline(always)]
+fn euclidean_f64_avx2(a: &[f64], b: &[f64]) -> f64 {
+    let len = a.len();
+    let chunks = len / 4;
+    let mut acc = f64x4::ZERO;
+
+    unsafe {
+        let a_ptr = a.as_ptr();
+        let b_ptr = b.as_ptr();
+
+        for i in 0..chunks {
+            let offset = i * 4;
+            let va = f64x4::from(*(a_ptr.add(offset) as *const [f64; 4]));
+            let vb = f64x4::from(*(b_ptr.add(offset) as *const [f64; 4]));
+            let diff = va - vb;
+            acc += diff * diff;
+        }
+    }
+
+    let mut sum = acc.reduce_add();
+    for i in (chunks * 4)..len {
+        let diff = a[i] - b[i];
+        sum += diff * diff;
+    }
+    sum
+}
+
+/// Euclidean distance - f64, optimised for 512 bits
+///
+/// ### Params
+///
+/// * `a` - Slice of vector a
+/// * `b` - Slice of vector b
+///
+/// ### Returns
+///
+/// Squared euclidean distance
+#[cfg(all(target_arch = "x86_64", target_feature = "avx512f"))]
+#[inline(always)]
+fn euclidean_f64_avx512(a: &[f64], b: &[f64]) -> f64 {
+    use std::arch::x86_64::*;
+
+    let len = a.len();
+    let chunks = len / 8;
+
+    unsafe {
+        let mut acc = _mm512_setzero_pd();
+
+        for i in 0..chunks {
+            let va = _mm512_loadu_pd(a.as_ptr().add(i * 8));
+            let vb = _mm512_loadu_pd(b.as_ptr().add(i * 8));
+            let diff = _mm512_sub_pd(va, vb);
+            acc = _mm512_fmadd_pd(diff, diff, acc);
+        }
+
+        let mut sum = _mm512_reduce_add_pd(acc);
+
+        for i in (chunks * 8)..len {
+            let diff = a[i] - b[i];
+            sum += diff * diff;
+        }
+        sum
+    }
+}
+
+#[cfg(not(all(target_arch = "x86_64", target_feature = "avx512f")))]
+#[inline(always)]
+fn euclidean_f64_avx512(a: &[f64], b: &[f64]) -> f64 {
+    euclidean_f64_avx2(a, b)
+}
+
+/////////////////////
+// f32 dot product //
+/////////////////////
+
+/// Dot product - f32, scalar
+///
+/// ### Params
+///
+/// * `a` - Slice of vector a
+/// * `b` - Slice of vector b
+///
+/// ### Returns
+///
+/// Dot product
+#[inline(always)]
+fn dot_f32_scalar(a: &[f32], b: &[f32]) -> f32 {
+    a.iter().zip(b.iter()).map(|(&x, &y)| x * y).sum()
+}
+
+/// Dot product - f32, optimised for 128-bit
+///
+/// ### Params
+///
+/// * `a` - Slice of vector a
+/// * `b` - Slice of vector b
+///
+/// ### Returns
+///
+/// Dot product
+#[inline(always)]
+fn dot_f32_sse(a: &[f32], b: &[f32]) -> f32 {
+    let len = a.len();
+    let chunks = len / 4;
+    let mut acc = f32x4::ZERO;
+
+    unsafe {
+        let a_ptr = a.as_ptr();
+        let b_ptr = b.as_ptr();
+
+        for i in 0..chunks {
+            let offset = i * 4;
+            let va = f32x4::from(*(a_ptr.add(offset) as *const [f32; 4]));
+            let vb = f32x4::from(*(b_ptr.add(offset) as *const [f32; 4]));
+            acc += va * vb;
+        }
+    }
+
+    let mut sum = acc.reduce_add();
+    for i in (chunks * 4)..len {
+        sum += a[i] * b[i];
+    }
+    sum
+}
+
+/// Dot product - f32, optimised for 256-bit
+///
+/// ### Params
+///
+/// * `a` - Slice of vector a
+/// * `b` - Slice of vector b
+///
+/// ### Returns
+///
+/// Dot product
+#[inline(always)]
+fn dot_f32_avx2(a: &[f32], b: &[f32]) -> f32 {
+    let len = a.len();
+    let chunks = len / 8;
+    let mut acc = f32x8::ZERO;
+
+    unsafe {
+        let a_ptr = a.as_ptr();
+        let b_ptr = b.as_ptr();
+
+        for i in 0..chunks {
+            let offset = i * 8;
+            let va = f32x8::from(*(a_ptr.add(offset) as *const [f32; 8]));
+            let vb = f32x8::from(*(b_ptr.add(offset) as *const [f32; 8]));
+            acc += va * vb;
+        }
+    }
+
+    let mut sum = acc.reduce_add();
+    for i in (chunks * 8)..len {
+        sum += a[i] * b[i];
+    }
+    sum
+}
+
+/// Dot product - f32, optimised for 512-bit
+///
+/// ### Params
+///
+/// * `a` - Slice of vector a
+/// * `b` - Slice of vector b
+///
+/// ### Returns
+///
+/// Dot product
+#[cfg(all(target_arch = "x86_64", target_feature = "avx512f"))]
+#[inline(always)]
+fn dot_f32_avx512(a: &[f32], b: &[f32]) -> f32 {
+    use std::arch::x86_64::*;
+
+    let len = a.len();
+    let chunks = len / 16;
+
+    unsafe {
+        let mut acc = _mm512_setzero_ps();
+
+        for i in 0..chunks {
+            let va = _mm512_loadu_ps(a.as_ptr().add(i * 16));
+            let vb = _mm512_loadu_ps(b.as_ptr().add(i * 16));
+            acc = _mm512_fmadd_ps(va, vb, acc);
+        }
+
+        let mut sum = _mm512_reduce_add_ps(acc);
+        for i in (chunks * 16)..len {
+            sum += a[i] * b[i];
+        }
+        sum
+    }
+}
+
+#[cfg(not(all(target_arch = "x86_64", target_feature = "avx512f")))]
+#[inline(always)]
+fn dot_f32_avx512(a: &[f32], b: &[f32]) -> f32 {
+    dot_f32_avx2(a, b)
+}
+
+/////////////////////
+// f64 dot product //
+/////////////////////
+
+/// Dot product - f64, scalar
+///
+/// ### Params
+///
+/// * `a` - Slice of vector a
+/// * `b` - Slice of vector b
+///
+/// ### Returns
+///
+/// Dot product
+#[inline(always)]
+fn dot_f64_scalar(a: &[f64], b: &[f64]) -> f64 {
+    a.iter().zip(b.iter()).map(|(&x, &y)| x * y).sum()
+}
+
+/// Dot product - f64, optimised for 128-bit
+///
+/// ### Params
+///
+/// * `a` - Slice of vector a
+/// * `b` - Slice of vector b
+///
+/// ### Returns
+///
+/// Dot product
+#[inline(always)]
+fn dot_f64_sse(a: &[f64], b: &[f64]) -> f64 {
+    let len = a.len();
+    let chunks = len / 2;
+    let mut acc = f64x2::ZERO;
+
+    // unsafe again to avoid trait errors
+    unsafe {
+        let a_ptr = a.as_ptr();
+        let b_ptr = b.as_ptr();
+
+        for i in 0..chunks {
+            let offset = i * 2;
+            let va = f64x2::from(*(a_ptr.add(offset) as *const [f64; 2]));
+            let vb = f64x2::from(*(b_ptr.add(offset) as *const [f64; 2]));
+            acc += va * vb;
+        }
+    }
+
+    let mut sum = acc.reduce_add();
+    if len % 2 == 1 {
+        sum += a[len - 1] * b[len - 1];
+    }
+    sum
+}
+
+/// Dot product - f64, optimised for 256-bit
+///
+/// ### Params
+///
+/// * `a` - Slice of vector a
+/// * `b` - Slice of vector b
+///
+/// ### Returns
+///
+/// Dot product
+#[inline(always)]
+fn dot_f64_avx2(a: &[f64], b: &[f64]) -> f64 {
+    let len = a.len();
+    let chunks = len / 4;
+    let mut acc = f64x4::ZERO;
+
+    unsafe {
+        let a_ptr = a.as_ptr();
+        let b_ptr = b.as_ptr();
+
+        for i in 0..chunks {
+            let offset = i * 4;
+            let va = f64x4::from(*(a_ptr.add(offset) as *const [f64; 4]));
+            let vb = f64x4::from(*(b_ptr.add(offset) as *const [f64; 4]));
+            acc += va * vb;
+        }
+    }
+
+    let mut sum = acc.reduce_add();
+    for i in (chunks * 4)..len {
+        sum += a[i] * b[i];
+    }
+    sum
+}
+
+/// Dot product - f64, optimised for 512-bit
+///
+/// ### Params
+///
+/// * `a` - Slice of vector a
+/// * `b` - Slice of vector b
+///
+/// ### Returns
+///
+/// Dot product
+#[cfg(all(target_arch = "x86_64", target_feature = "avx512f"))]
+#[inline(always)]
+fn dot_f64_avx512(a: &[f64], b: &[f64]) -> f64 {
+    use std::arch::x86_64::*;
+
+    let len = a.len();
+    let chunks = len / 8;
+
+    unsafe {
+        let mut acc = _mm512_setzero_pd();
+
+        for i in 0..chunks {
+            let va = _mm512_loadu_pd(a.as_ptr().add(i * 8));
+            let vb = _mm512_loadu_pd(b.as_ptr().add(i * 8));
+            acc = _mm512_fmadd_pd(va, vb, acc);
+        }
+
+        let mut sum = _mm512_reduce_add_pd(acc);
+        for i in (chunks * 8)..len {
+            sum += a[i] * b[i];
+        }
+        sum
+    }
+}
+
+#[cfg(not(all(target_arch = "x86_64", target_feature = "avx512f")))]
+#[inline(always)]
+fn dot_f64_avx512(a: &[f64], b: &[f64]) -> f64 {
+    dot_f64_avx2(a, b)
+}
+
+//////////////////////////////////
+// SimdDistance implementations //
+//////////////////////////////////
+
+impl SimdDistance for f32 {
+    #[inline]
+    fn euclidean_simd(a: &[f32], b: &[f32]) -> f32 {
+        match detect_simd_level() {
+            SimdLevel::Avx512 => euclidean_f32_avx512(a, b),
+            SimdLevel::Avx2 => euclidean_f32_avx2(a, b),
+            SimdLevel::Sse => euclidean_f32_sse(a, b),
+            SimdLevel::Scalar => euclidean_f32_scalar(a, b),
+        }
+    }
+
+    #[inline]
+    fn dot_simd(a: &[f32], b: &[f32]) -> f32 {
+        match detect_simd_level() {
+            SimdLevel::Avx512 => dot_f32_avx512(a, b),
+            SimdLevel::Avx2 => dot_f32_avx2(a, b),
+            SimdLevel::Sse => dot_f32_sse(a, b),
+            SimdLevel::Scalar => dot_f32_scalar(a, b),
+        }
+    }
+}
+
+impl SimdDistance for f64 {
+    #[inline]
+    fn euclidean_simd(a: &[f64], b: &[f64]) -> f64 {
+        match detect_simd_level() {
+            SimdLevel::Avx512 => euclidean_f64_avx512(a, b),
+            SimdLevel::Avx2 => euclidean_f64_avx2(a, b),
+            SimdLevel::Sse => euclidean_f64_sse(a, b),
+            SimdLevel::Scalar => euclidean_f64_scalar(a, b),
+        }
+    }
+
+    #[inline]
+    fn dot_simd(a: &[f64], b: &[f64]) -> f64 {
+        match detect_simd_level() {
+            SimdLevel::Avx512 => dot_f64_avx512(a, b),
+            SimdLevel::Avx2 => dot_f64_avx2(a, b),
+            SimdLevel::Sse => dot_f64_sse(a, b),
+            SimdLevel::Scalar => dot_f64_scalar(a, b),
+        }
+    }
+}
+
+//////////////////////////
+// VectorDistance Trait //
+//////////////////////////
+
 /// Trait for computing distances between Floats
 pub trait VectorDistance<T>
 where
-    T: Float + Sum,
+    T: Float + Sum + SimdDistance,
 {
     /// Get the internal flat vector representation
     fn vectors_flat(&self) -> &[T];
@@ -71,6 +757,1772 @@ where
     /// * `i` - Sample index i
     /// * `j` - Sample index j
     ///
+    /// ### Returns
+    ///
+    /// The squared Euclidean distance between the two samples
+    #[inline(always)]
+    fn euclidean_distance(&self, i: usize, j: usize) -> T {
+        let start_i = i * self.dim();
+        let start_j = j * self.dim();
+        let vec_i = &self.vectors_flat()[start_i..start_i + self.dim()];
+        let vec_j = &self.vectors_flat()[start_j..start_j + self.dim()];
+        T::euclidean_simd(vec_i, vec_j)
+    }
+
+    /// Euclidean distance between query vector and internal vector (squared)
+    ///
+    /// ### Params
+    ///
+    /// * `internal_idx` - Index of internal vector
+    /// * `query` - Query vector slice
+    ///
+    /// ### Returns
+    ///
+    /// The squared Euclidean distance
+    #[inline(always)]
+    fn euclidean_distance_to_query(&self, internal_idx: usize, query: &[T]) -> T {
+        let start = internal_idx * self.dim();
+        let vec = &self.vectors_flat()[start..start + self.dim()];
+        T::euclidean_simd(vec, query)
+    }
+
+    ////////////
+    // Cosine //
+    ////////////
+
+    /// Cosine distance between two internal vectors
+    ///
+    /// Uses pre-computed norms.
+    ///
+    /// ### Params
+    ///
+    /// * `i` - Sample index i
+    /// * `j` - Sample index j
+    ///
+    /// ### Returns
+    ///
+    /// The Cosine distance between the two samples
+    #[inline(always)]
+    fn cosine_distance(&self, i: usize, j: usize) -> T {
+        let start_i = i * self.dim();
+        let start_j = j * self.dim();
+        let vec_i = &self.vectors_flat()[start_i..start_i + self.dim()];
+        let vec_j = &self.vectors_flat()[start_j..start_j + self.dim()];
+        let dot = T::dot_simd(vec_i, vec_j);
+        T::one() - (dot / (self.norms()[i] * self.norms()[j]))
+    }
+
+    /// Cosine distance between query vector and internal vector
+    ///
+    /// ### Params
+    ///
+    /// * `internal_idx` - Index of internal vector
+    /// * `query` - Query vector slice
+    /// * `query_norm` - Pre-computed norm of query vector
+    ///
+    /// ### Returns
+    ///
+    /// The Cosine distance
+    #[inline(always)]
+    fn cosine_distance_to_query(&self, internal_idx: usize, query: &[T], query_norm: T) -> T {
+        let start = internal_idx * self.dim();
+        let vec = &self.vectors_flat()[start..start + self.dim()];
+        let dot = T::dot_simd(vec, query);
+        T::one() - (dot / (query_norm * self.norms()[internal_idx]))
+    }
+}
+
+////////////////////////
+// VectorDistanceBf16 //
+////////////////////////
+
+//////////
+// SIMD //
+//////////
+
+/////////////////////////
+// Bit shift functions //
+/////////////////////////
+
+/// Convert 4 bf16 values to 4 f32 values using SSE
+///
+/// bf16 is the upper 16 bits of f32, so conversion is just a left shift by 16.
+///
+/// ### Params
+///
+/// * `ptr` - Pointer to 4 consecutive bf16 values
+///
+/// ### Safety
+///
+/// Caller must ensure `ptr` points to at least 4 valid bf16 values.
+///
+/// ### Returns
+///
+/// 128-bit register containing 4 f32 values
+#[cfg(all(feature = "quantised", target_arch = "x86_64"))]
+#[inline(always)]
+unsafe fn bf16x4_to_f32x4_sse(ptr: *const bf16) -> __m128 {
+    // Load 64 bits (4 x bf16) into lower half of 128-bit register
+    let raw = _mm_loadl_epi64(ptr as *const __m128i);
+    // Zero-extend each 16-bit value to 32-bit
+    let extended = _mm_cvtepu16_epi32(raw);
+    // Shift left by 16 to place bf16 bits in correct f32 position
+    let shifted = _mm_slli_epi32(extended, 16);
+    // Reinterpret as f32
+    _mm_castsi128_ps(shifted)
+}
+
+/// Horizontal sum of 4 f32 values in SSE register
+///
+/// ### Params
+///
+/// * `v` - 128-bit register containing 4 f32 values
+///
+/// ### Safety
+///
+/// None beyond normal SSE requirements.
+///
+/// ### Returns
+///
+/// Sum of all 4 f32 values
+#[cfg(all(feature = "quantised", target_arch = "x86_64"))]
+#[inline(always)]
+unsafe fn hsum_f32_sse(v: __m128) -> f32 {
+    // [a, b, c, d] -> [b, b, d, d]
+    let shuf = _mm_movehdup_ps(v);
+    // [a+b, b+b, c+d, d+d]
+    let sums = _mm_add_ps(v, shuf);
+    // [c+d, d+d, c+d, d+d]
+    let shuf2 = _mm_movehl_ps(sums, sums);
+    // [a+b+c+d, ...]
+    let sums2 = _mm_add_ss(sums, shuf2);
+    _mm_cvtss_f32(sums2)
+}
+
+/// Convert 8 bf16 values to 8 f32 values using AVX2
+///
+/// ### Params
+///
+/// * `ptr` - Pointer to 8 consecutive bf16 values
+///
+/// ### Safety
+///
+/// Caller must ensure `ptr` points to at least 8 valid bf16 values.
+///
+/// ### Returns
+///
+/// 256-bit register containing 8 f32 values
+#[cfg(all(feature = "quantised", target_arch = "x86_64"))]
+#[inline(always)]
+unsafe fn bf16x8_to_f32x8_avx2(ptr: *const bf16) -> __m256 {
+    // Load 128 bits (8 x bf16)
+    let raw = _mm_loadu_si128(ptr as *const __m128i);
+    // Zero-extend each 16-bit value to 32-bit (produces 256-bit result)
+    let extended = _mm256_cvtepu16_epi32(raw);
+    // Shift left by 16
+    let shifted = _mm256_slli_epi32(extended, 16);
+    // Reinterpret as f32
+    _mm256_castsi256_ps(shifted)
+}
+
+/// Horizontal sum of 8 f32 values in AVX2 register
+///
+/// ### Params
+///
+/// * `v` - 256-bit register containing 8 f32 values
+///
+/// ### Safety
+///
+/// None beyond normal AVX2 requirements.
+///
+/// ### Returns
+///
+/// Sum of all 8 f32 values
+#[cfg(all(feature = "quantised", target_arch = "x86_64"))]
+#[inline(always)]
+unsafe fn hsum_f32_avx2(v: __m256) -> f32 {
+    // Extract high and low 128-bit lanes
+    let low = _mm256_castps256_ps128(v);
+    let high = _mm256_extractf128_ps(v, 1);
+    // Sum the lanes
+    let sum128 = _mm_add_ps(low, high);
+    // Use SSE horizontal sum for the rest
+    hsum_f32_sse(sum128)
+}
+
+/// Convert 16 bf16 values to 16 f32 values using AVX-512
+///
+/// ### Params
+///
+/// * `ptr` - Pointer to 16 consecutive bf16 values
+///
+/// ### Safety
+///
+/// Caller must ensure `ptr` points to at least 16 valid bf16 values.
+///
+/// ### Returns
+///
+/// 512-bit register containing 16 f32 values
+#[cfg(all(
+    feature = "quantised",
+    target_arch = "x86_64",
+    target_feature = "avx512f"
+))]
+#[inline(always)]
+unsafe fn bf16x16_to_f32x16_avx512(ptr: *const bf16) -> __m512 {
+    // Load 256 bits (16 x bf16)
+    let raw = _mm256_loadu_si256(ptr as *const __m256i);
+    // Zero-extend each 16-bit value to 32-bit (produces 512-bit result)
+    let extended = _mm512_cvtepu16_epi32(raw);
+    // Shift left by 16
+    let shifted = _mm512_slli_epi32(extended, 16);
+    // Reinterpret as f32
+    _mm512_castsi512_ps(shifted)
+}
+
+/// Convert 4 bf16 values to 4 f32 values using NEON
+///
+/// ### Params
+///
+/// * `ptr` - Pointer to 4 consecutive bf16 values
+///
+/// ### Safety
+///
+/// Caller must ensure `ptr` points to at least 4 valid bf16 values.
+///
+/// ### Returns
+///
+/// NEON register containing 4 f32 values
+#[cfg(all(feature = "quantised", target_arch = "aarch64"))]
+#[inline(always)]
+unsafe fn bf16x4_to_f32x4_neon(ptr: *const bf16) -> float32x4_t {
+    // Load 4 x bf16 as u16
+    let raw = vld1_u16(ptr as *const u16);
+    // Zero-extend to u32
+    let extended = vmovl_u16(raw);
+    // Shift left by 16
+    let shifted = vshlq_n_u32(extended, 16);
+    // Reinterpret as f32
+    vreinterpretq_f32_u32(shifted)
+}
+
+/// Horizontal sum of 4 f32 values in NEON register
+///
+/// ### Params
+///
+/// * `v` - NEON register containing 4 f32 values
+///
+/// ### Safety
+///
+/// None beyond normal NEON requirements.
+///
+/// ### Returns
+///
+/// Sum of all 4 f32 values
+#[cfg(all(feature = "quantised", target_arch = "aarch64"))]
+#[inline(always)]
+unsafe fn hsum_f32_neon(v: float32x4_t) -> f32 {
+    vaddvq_f32(v)
+}
+
+///////////////////
+// Distance func //
+///////////////////
+
+///////////////
+// Euclidean //
+///////////////
+
+/// Euclidean distance between bf16 vectors - scalar fallback
+///
+/// ### Params
+///
+/// * `a` - First bf16 vector slice
+/// * `b` - Second bf16 vector slice
+///
+/// ### Returns
+///
+/// Squared Euclidean distance
+#[cfg(feature = "quantised")]
+#[inline(always)]
+fn euclidean_bf16_scalar(a: &[bf16], b: &[bf16]) -> f32 {
+    a.iter()
+        .zip(b.iter())
+        .map(|(x, y)| {
+            // ignore rust analyser
+            let d = x.to_f32() - y.to_f32();
+            d * d
+        })
+        .sum()
+}
+
+/// Euclidean distance between bf16 vectors - SSE (128-bit)
+///
+/// ### Params
+///
+/// * `a` - First bf16 vector slice
+/// * `b` - Second bf16 vector slice
+///
+/// ### Returns
+///
+/// Squared Euclidean distance
+#[cfg(all(feature = "quantised", target_arch = "x86_64"))]
+#[inline(always)]
+fn euclidean_bf16_sse(a: &[bf16], b: &[bf16]) -> f32 {
+    let len = a.len();
+    let chunks = len / 4;
+
+    unsafe {
+        let mut acc = _mm_setzero_ps();
+
+        for i in 0..chunks {
+            let va = bf16x4_to_f32x4_sse(a.as_ptr().add(i * 4));
+            let vb = bf16x4_to_f32x4_sse(b.as_ptr().add(i * 4));
+            let diff = _mm_sub_ps(va, vb);
+            // acc += diff * diff
+            acc = _mm_add_ps(acc, _mm_mul_ps(diff, diff));
+        }
+
+        let mut sum = hsum_f32_sse(acc);
+
+        // Handle remainder
+        for i in (chunks * 4)..len {
+            let diff = a[i].to_f32() - b[i].to_f32();
+            sum += diff * diff;
+        }
+        sum
+    }
+}
+
+/// Euclidean distance between bf16 vectors - AVX2 (256-bit)
+///
+/// ### Params
+///
+/// * `a` - First bf16 vector slice
+/// * `b` - Second bf16 vector slice
+///
+/// ### Returns
+///
+/// Squared Euclidean distance
+#[cfg(all(feature = "quantised", target_arch = "x86_64"))]
+#[inline(always)]
+fn euclidean_bf16_avx2(a: &[bf16], b: &[bf16]) -> f32 {
+    let len = a.len();
+    let chunks = len / 8;
+
+    unsafe {
+        let mut acc = _mm256_setzero_ps();
+
+        for i in 0..chunks {
+            let va = bf16x8_to_f32x8_avx2(a.as_ptr().add(i * 8));
+            let vb = bf16x8_to_f32x8_avx2(b.as_ptr().add(i * 8));
+            let diff = _mm256_sub_ps(va, vb);
+            // FMA: acc = diff * diff + acc
+            acc = _mm256_fmadd_ps(diff, diff, acc);
+        }
+
+        let mut sum = hsum_f32_avx2(acc);
+
+        // Handle remainder
+        for i in (chunks * 8)..len {
+            let diff = a[i].to_f32() - b[i].to_f32();
+            sum += diff * diff;
+        }
+        sum
+    }
+}
+
+/// Euclidean distance between bf16 vectors - AVX-512 (512-bit)
+///
+/// ### Params
+///
+/// * `a` - First bf16 vector slice
+/// * `b` - Second bf16 vector slice
+///
+/// ### Returns
+///
+/// Squared Euclidean distance
+#[cfg(all(
+    feature = "quantised",
+    target_arch = "x86_64",
+    target_feature = "avx512f"
+))]
+#[inline(always)]
+fn euclidean_bf16_avx512(a: &[bf16], b: &[bf16]) -> f32 {
+    let len = a.len();
+    let chunks = len / 16;
+
+    unsafe {
+        let mut acc = _mm512_setzero_ps();
+
+        for i in 0..chunks {
+            let va = bf16x16_to_f32x16_avx512(a.as_ptr().add(i * 16));
+            let vb = bf16x16_to_f32x16_avx512(b.as_ptr().add(i * 16));
+            let diff = _mm512_sub_ps(va, vb);
+            acc = _mm512_fmadd_ps(diff, diff, acc);
+        }
+
+        let mut sum = _mm512_reduce_add_ps(acc);
+
+        // Handle remainder
+        for i in (chunks * 16)..len {
+            let diff = a[i].to_f32() - b[i].to_f32();
+            sum += diff * diff;
+        }
+        sum
+    }
+}
+
+/// Euclidean distance - AVX-512 fallback for non-AVX512 compilation
+#[cfg(all(
+    feature = "quantised",
+    target_arch = "x86_64",
+    not(target_feature = "avx512f")
+))]
+#[inline(always)]
+fn euclidean_bf16_avx512(a: &[bf16], b: &[bf16]) -> f32 {
+    euclidean_bf16_avx2(a, b)
+}
+
+/// Euclidean distance between bf16 vectors - NEON (128-bit, aarch64)
+///
+/// ### Params
+///
+/// * `a` - First bf16 vector slice
+/// * `b` - Second bf16 vector slice
+///
+/// ### Returns
+///
+/// Squared Euclidean distance
+#[cfg(all(feature = "quantised", target_arch = "aarch64"))]
+#[inline(always)]
+fn euclidean_bf16_neon(a: &[bf16], b: &[bf16]) -> f32 {
+    let len = a.len();
+    let chunks = len / 4;
+
+    unsafe {
+        let mut acc = vdupq_n_f32(0.0);
+
+        for i in 0..chunks {
+            let va = bf16x4_to_f32x4_neon(a.as_ptr().add(i * 4));
+            let vb = bf16x4_to_f32x4_neon(b.as_ptr().add(i * 4));
+            let diff = vsubq_f32(va, vb);
+            // FMA: acc = diff * diff + acc
+            acc = vfmaq_f32(acc, diff, diff);
+        }
+
+        let mut sum = hsum_f32_neon(acc);
+
+        // Handle remainder
+        for i in (chunks * 4)..len {
+            let diff = a[i].to_f32() - b[i].to_f32();
+            sum += diff * diff;
+        }
+        sum
+    }
+}
+
+/// Dispatch Euclidean distance calculation to appropriate SIMD implementation
+///
+/// ### Params
+///
+/// * `a` - First bf16 vector slice
+/// * `b` - Second bf16 vector slice
+///
+/// ### Returns
+///
+/// Squared Euclidean distance
+#[cfg(feature = "quantised")]
+#[inline]
+pub fn euclidean_bf16_simd(a: &[bf16], b: &[bf16]) -> f32 {
+    #[cfg(target_arch = "x86_64")]
+    {
+        match crate::detect_simd_level() {
+            crate::SimdLevel::Avx512 => euclidean_bf16_avx512(a, b),
+            crate::SimdLevel::Avx2 => euclidean_bf16_avx2(a, b),
+            crate::SimdLevel::Sse => euclidean_bf16_sse(a, b),
+            crate::SimdLevel::Scalar => euclidean_bf16_scalar(a, b),
+        }
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    {
+        euclidean_bf16_neon(a, b)
+    }
+
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+    {
+        euclidean_bf16_scalar(a, b)
+    }
+}
+
+//////////////////////////
+// bf16 vs f32 routines //
+//////////////////////////
+
+/// Euclidean distance: bf16 vs f32 - scalar fallback
+///
+/// ### Params
+///
+/// * `a` - bf16 vector slice
+/// * `b` - f32 vector slice
+///
+/// ### Returns
+///
+/// Squared Euclidean distance
+#[cfg(feature = "quantised")]
+#[inline(always)]
+fn euclidean_bf16_f32_scalar(a: &[bf16], b: &[f32]) -> f32 {
+    a.iter()
+        .zip(b.iter())
+        .map(|(x, y)| {
+            let d = x.to_f32() - y;
+            d * d
+        })
+        .sum()
+}
+
+/// Euclidean distance: bf16 vs f32 - SSE (128-bit, x86_64)
+///
+/// ### Params
+///
+/// * `a` - bf16 vector slice
+/// * `b` - f32 vector slice
+///
+/// ### Returns
+///
+/// Squared Euclidean distance
+#[cfg(all(feature = "quantised", target_arch = "x86_64"))]
+#[inline(always)]
+fn euclidean_bf16_f32_sse(a: &[bf16], b: &[f32]) -> f32 {
+    let len = a.len();
+    let chunks = len / 4;
+
+    unsafe {
+        let mut acc = _mm_setzero_ps();
+
+        for i in 0..chunks {
+            let va = bf16x4_to_f32x4_sse(a.as_ptr().add(i * 4));
+            let vb = _mm_loadu_ps(b.as_ptr().add(i * 4));
+            let diff = _mm_sub_ps(va, vb);
+            acc = _mm_add_ps(acc, _mm_mul_ps(diff, diff));
+        }
+
+        let mut sum = hsum_f32_sse(acc);
+        for i in (chunks * 4)..len {
+            let diff = a[i].to_f32() - b[i];
+            sum += diff * diff;
+        }
+        sum
+    }
+}
+
+/// Euclidean distance: bf16 vs f32 - AVX2 (256-bit, x86_64)
+///
+/// ### Params
+///
+/// * `a` - bf16 vector slice
+/// * `b` - f32 vector slice
+///
+/// ### Returns
+///
+/// Squared Euclidean distance
+#[cfg(all(feature = "quantised", target_arch = "x86_64"))]
+#[inline(always)]
+fn euclidean_bf16_f32_avx2(a: &[bf16], b: &[f32]) -> f32 {
+    let len = a.len();
+    let chunks = len / 8;
+
+    unsafe {
+        let mut acc = _mm256_setzero_ps();
+
+        for i in 0..chunks {
+            let va = bf16x8_to_f32x8_avx2(a.as_ptr().add(i * 8));
+            let vb = _mm256_loadu_ps(b.as_ptr().add(i * 8));
+            let diff = _mm256_sub_ps(va, vb);
+            acc = _mm256_fmadd_ps(diff, diff, acc);
+        }
+
+        let mut sum = hsum_f32_avx2(acc);
+        for i in (chunks * 8)..len {
+            let diff = a[i].to_f32() - b[i];
+            sum += diff * diff;
+        }
+        sum
+    }
+}
+
+/// Euclidean distance: bf16 vs f32 - AVX512 (512-bit, x86_64)
+///
+/// ### Params
+///
+/// * `a` - bf16 vector slice
+/// * `b` - f32 vector slice
+///
+/// ### Returns
+///
+/// Squared Euclidean distance
+#[cfg(all(
+    feature = "quantised",
+    target_arch = "x86_64",
+    target_feature = "avx512f"
+))]
+#[inline(always)]
+fn euclidean_bf16_f32_avx512(a: &[bf16], b: &[f32]) -> f32 {
+    let len = a.len();
+    let chunks = len / 16;
+
+    unsafe {
+        let mut acc = _mm512_setzero_ps();
+
+        for i in 0..chunks {
+            let va = bf16x16_to_f32x16_avx512(a.as_ptr().add(i * 16));
+            let vb = _mm512_loadu_ps(b.as_ptr().add(i * 16));
+            let diff = _mm512_sub_ps(va, vb);
+            acc = _mm512_fmadd_ps(diff, diff, acc);
+        }
+
+        let mut sum = _mm512_reduce_add_ps(acc);
+        for i in (chunks * 16)..len {
+            let diff = a[i].to_f32() - b[i];
+            sum += diff * diff;
+        }
+        sum
+    }
+}
+
+/// Euclidean distance: bf16 vs f32 - AVX512 fallback to AVX2
+///
+/// ### Params
+///
+/// * `a` - bf16 vector slice
+/// * `b` - f32 vector slice
+///
+/// ### Returns
+///
+/// Squared Euclidean distance
+#[cfg(all(
+    feature = "quantised",
+    target_arch = "x86_64",
+    not(target_feature = "avx512f")
+))]
+#[inline(always)]
+fn euclidean_bf16_f32_avx512(a: &[bf16], b: &[f32]) -> f32 {
+    euclidean_bf16_f32_avx2(a, b)
+}
+
+/// Euclidean distance: bf16 vs f32 - NEON (128-bit, aarch64)
+///
+/// ### Params
+///
+/// * `a` - bf16 vector slice
+/// * `b` - f32 vector slice
+///
+/// ### Returns
+///
+/// Squared Euclidean distance
+#[cfg(all(feature = "quantised", target_arch = "aarch64"))]
+#[inline(always)]
+fn euclidean_bf16_f32_neon(a: &[bf16], b: &[f32]) -> f32 {
+    let len = a.len();
+    let chunks = len / 4;
+
+    unsafe {
+        let mut acc = vdupq_n_f32(0.0);
+
+        for i in 0..chunks {
+            let va = bf16x4_to_f32x4_neon(a.as_ptr().add(i * 4));
+            let vb = vld1q_f32(b.as_ptr().add(i * 4));
+            let diff = vsubq_f32(va, vb);
+            acc = vfmaq_f32(acc, diff, diff);
+        }
+
+        let mut sum = hsum_f32_neon(acc);
+        for i in (chunks * 4)..len {
+            let diff = a[i].to_f32() - b[i];
+            sum += diff * diff;
+        }
+        sum
+    }
+}
+
+//////////////////////////
+// bf16 vs f64 routines //
+//////////////////////////
+
+/// Euclidean distance: bf16 vs f64 - scalar fallback
+///
+/// ### Params
+///
+/// * `a` - bf16 vector slice
+/// * `b` - f64 vector slice
+///
+/// ### Returns
+///
+/// Squared Euclidean distance (f64 converted to f32)
+#[cfg(feature = "quantised")]
+#[inline(always)]
+fn euclidean_bf16_f64_scalar(a: &[bf16], b: &[f64]) -> f32 {
+    a.iter()
+        .zip(b.iter())
+        .map(|(x, y)| {
+            let d = x.to_f32() - (*y as f32);
+            d * d
+        })
+        .sum()
+}
+
+/// Euclidean distance: bf16 vs f64 - SSE (128-bit, x86_64)
+///
+/// Processes 4 elements per iteration: bf16x4 → f32x4, f64x2+f64x2 → f32x4
+///
+/// ### Params
+///
+/// * `a` - bf16 vector slice
+/// * `b` - f64 vector slice
+///
+/// ### Returns
+///
+/// Squared Euclidean distance (f64 converted to f32)
+#[cfg(all(feature = "quantised", target_arch = "x86_64"))]
+#[inline(always)]
+fn euclidean_bf16_f64_sse(a: &[bf16], b: &[f64]) -> f32 {
+    let len = a.len();
+    let chunks = len / 4;
+
+    unsafe {
+        let mut acc = _mm_setzero_ps();
+
+        for i in 0..chunks {
+            let offset = i * 4;
+
+            // Load and convert bf16 → f32
+            let va = bf16x4_to_f32x4_sse(a.as_ptr().add(offset));
+
+            // Load f64x2 twice, convert each to f32x2, combine into f32x4
+            let b_lo = _mm_loadu_pd(b.as_ptr().add(offset)); // 2 f64
+            let b_hi = _mm_loadu_pd(b.as_ptr().add(offset + 2)); // 2 f64
+            let b_lo_f32 = _mm_cvtpd_ps(b_lo); // lower 2 floats valid
+            let b_hi_f32 = _mm_cvtpd_ps(b_hi); // lower 2 floats valid
+                                               // Combine: [lo0, lo1, hi0, hi1]
+            let vb = _mm_movelh_ps(b_lo_f32, b_hi_f32);
+
+            let diff = _mm_sub_ps(va, vb);
+            acc = _mm_add_ps(acc, _mm_mul_ps(diff, diff));
+        }
+
+        let mut sum = hsum_f32_sse(acc);
+        for i in (chunks * 4)..len {
+            let diff = a[i].to_f32() - (b[i] as f32);
+            sum += diff * diff;
+        }
+        sum
+    }
+}
+
+/// Euclidean distance: bf16 vs f64 - AVX2 (256-bit, x86_64)
+///
+/// Processes 8 elements per iteration: bf16x8 → f32x8, f64x4+f64x4 → f32x8
+///
+/// ### Params
+///
+/// * `a` - bf16 vector slice
+/// * `b` - f64 vector slice
+///
+/// ### Returns
+///
+/// Squared Euclidean distance (f64 converted to f32)
+#[cfg(all(feature = "quantised", target_arch = "x86_64"))]
+#[inline(always)]
+fn euclidean_bf16_f64_avx2(a: &[bf16], b: &[f64]) -> f32 {
+    let len = a.len();
+    let chunks = len / 8;
+
+    unsafe {
+        let mut acc = _mm256_setzero_ps();
+
+        for i in 0..chunks {
+            let offset = i * 8;
+
+            // bf16x8 → f32x8
+            let va = bf16x8_to_f32x8_avx2(a.as_ptr().add(offset));
+
+            // f64x4 → f32x4 (returns 128-bit), do twice
+            let b_lo = _mm256_loadu_pd(b.as_ptr().add(offset));
+            let b_hi = _mm256_loadu_pd(b.as_ptr().add(offset + 4));
+            let b_lo_f32 = _mm256_cvtpd_ps(b_lo); // __m128
+            let b_hi_f32 = _mm256_cvtpd_ps(b_hi); // __m128
+
+            // Combine two __m128 into __m256
+            let vb = _mm256_insertf128_ps(_mm256_castps128_ps256(b_lo_f32), b_hi_f32, 1);
+
+            let diff = _mm256_sub_ps(va, vb);
+            acc = _mm256_fmadd_ps(diff, diff, acc);
+        }
+
+        let mut sum = hsum_f32_avx2(acc);
+        for i in (chunks * 8)..len {
+            let diff = a[i].to_f32() - (b[i] as f32);
+            sum += diff * diff;
+        }
+        sum
+    }
+}
+
+/// Euclidean distance: bf16 vs f64 - AVX512 (512-bit, x86_64)
+///
+/// Processes 16 elements per iteration: bf16x16 → f32x16, f64x8+f64x8 → f32x16
+///
+/// ### Params
+///
+/// * `a` - bf16 vector slice
+/// * `b` - f64 vector slice
+///
+/// ### Returns
+///
+/// Squared Euclidean distance (f64 converted to f32)
+#[cfg(all(
+    feature = "quantised",
+    target_arch = "x86_64",
+    target_feature = "avx512f"
+))]
+#[inline(always)]
+fn euclidean_bf16_f64_avx512(a: &[bf16], b: &[f64]) -> f32 {
+    let len = a.len();
+    let chunks = len / 16;
+
+    unsafe {
+        let mut acc = _mm512_setzero_ps();
+
+        for i in 0..chunks {
+            let offset = i * 16;
+
+            // bf16x16 → f32x16
+            let va = bf16x16_to_f32x16_avx512(a.as_ptr().add(offset));
+
+            // f64x8 → f32x8 (returns __m256), do twice
+            let b_lo = _mm512_loadu_pd(b.as_ptr().add(offset));
+            let b_hi = _mm512_loadu_pd(b.as_ptr().add(offset + 8));
+            let b_lo_f32 = _mm512_cvtpd_ps(b_lo); // __m256
+            let b_hi_f32 = _mm512_cvtpd_ps(b_hi); // __m256
+
+            // Combine two __m256 into __m512
+            let vb = _mm512_insertf32x8(_mm512_castps256_ps512(b_lo_f32), b_hi_f32, 1);
+
+            let diff = _mm512_sub_ps(va, vb);
+            acc = _mm512_fmadd_ps(diff, diff, acc);
+        }
+
+        let mut sum = _mm512_reduce_add_ps(acc);
+        for i in (chunks * 16)..len {
+            let diff = a[i].to_f32() - (b[i] as f32);
+            sum += diff * diff;
+        }
+        sum
+    }
+}
+
+/// Euclidean distance: bf16 vs f64 - AVX512 fallback to AVX2
+///
+/// ### Params
+///
+/// * `a` - bf16 vector slice
+/// * `b` - f64 vector slice
+///
+/// ### Returns
+///
+/// Squared Euclidean distance (f64 converted to f32)
+#[cfg(all(
+    feature = "quantised",
+    target_arch = "x86_64",
+    not(target_feature = "avx512f")
+))]
+#[inline(always)]
+fn euclidean_bf16_f64_avx512(a: &[bf16], b: &[f64]) -> f32 {
+    euclidean_bf16_f64_avx2(a, b)
+}
+
+/// Euclidean distance: bf16 vs f64 - NEON (128-bit, aarch64)
+///
+/// Processes 4 elements per iteration: bf16x4 → f32x4, f64x2+f64x2 → f32x4
+///
+/// ### Params
+///
+/// * `a` - bf16 vector slice
+/// * `b` - f64 vector slice
+///
+/// ### Returns
+///
+/// Squared Euclidean distance (f64 converted to f32)
+#[cfg(all(feature = "quantised", target_arch = "aarch64"))]
+#[inline(always)]
+fn euclidean_bf16_f64_neon(a: &[bf16], b: &[f64]) -> f32 {
+    let len = a.len();
+    let chunks = len / 4;
+
+    unsafe {
+        let mut acc = vdupq_n_f32(0.0);
+
+        for i in 0..chunks {
+            let offset = i * 4;
+
+            // bf16x4 → f32x4
+            let va = bf16x4_to_f32x4_neon(a.as_ptr().add(offset));
+
+            // f64x2 → f32x2, twice
+            let b_lo = vld1q_f64(b.as_ptr().add(offset)); // float64x2_t
+            let b_hi = vld1q_f64(b.as_ptr().add(offset + 2)); // float64x2_t
+            let b_lo_f32 = vcvt_f32_f64(b_lo); // float32x2_t
+            let b_hi_f32 = vcvt_f32_f64(b_hi); // float32x2_t
+
+            // Combine two float32x2_t into float32x4_t
+            let vb = vcombine_f32(b_lo_f32, b_hi_f32);
+
+            let diff = vsubq_f32(va, vb);
+            acc = vfmaq_f32(acc, diff, diff);
+        }
+
+        let mut sum = hsum_f32_neon(acc);
+        for i in (chunks * 4)..len {
+            let diff = a[i].to_f32() - (b[i] as f32);
+            sum += diff * diff;
+        }
+        sum
+    }
+}
+
+/////////////////
+// Dispatchers //
+/////////////////
+
+/// Euclidean distance: bf16 storage vs f32 query - SIMD dispatcher
+///
+/// ### Params
+///
+/// * `a` - bf16 vector slice (storage)
+/// * `b` - f32 vector slice (query)
+///
+/// ### Returns
+///
+/// Squared Euclidean distance as f32
+#[cfg(feature = "quantised")]
+#[inline]
+pub fn euclidean_bf16_f32_simd(a: &[bf16], b: &[f32]) -> f32 {
+    #[cfg(target_arch = "x86_64")]
+    {
+        match detect_simd_level() {
+            SimdLevel::Avx512 => euclidean_bf16_f32_avx512(a, b),
+            SimdLevel::Avx2 => euclidean_bf16_f32_avx2(a, b),
+            SimdLevel::Sse => euclidean_bf16_f32_sse(a, b),
+            SimdLevel::Scalar => euclidean_bf16_f32_scalar(a, b),
+        }
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    {
+        euclidean_bf16_f32_neon(a, b)
+    }
+
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+    {
+        euclidean_bf16_f32_scalar(a, b)
+    }
+}
+
+/// Euclidean distance: bf16 storage vs f64 query - SIMD dispatcher
+///
+/// ### Params
+///
+/// * `a` - bf16 vector slice (storage)
+/// * `b` - f64 vector slice (query)
+///
+/// ### Returns
+///
+/// Squared Euclidean distance as f32 (f64 converted on-the-fly)
+#[cfg(feature = "quantised")]
+#[inline]
+pub fn euclidean_bf16_f64_simd(a: &[bf16], b: &[f64]) -> f32 {
+    #[cfg(target_arch = "x86_64")]
+    {
+        match detect_simd_level() {
+            SimdLevel::Avx512 => euclidean_bf16_f64_avx512(a, b),
+            SimdLevel::Avx2 => euclidean_bf16_f64_avx2(a, b),
+            SimdLevel::Sse => euclidean_bf16_f64_sse(a, b),
+            SimdLevel::Scalar => euclidean_bf16_f64_scalar(a, b),
+        }
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    {
+        euclidean_bf16_f64_neon(a, b)
+    }
+
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+    {
+        euclidean_bf16_f64_scalar(a, b)
+    }
+}
+
+////////////
+// Cosine //
+////////////
+
+/// Dot product of bf16 vectors - scalar fallback
+///
+/// ### Params
+///
+/// * `a` - First bf16 vector slice
+/// * `b` - Second bf16 vector slice
+///
+/// ### Returns
+///
+/// Dot product
+#[cfg(feature = "quantised")]
+#[inline(always)]
+fn dot_bf16_scalar(a: &[bf16], b: &[bf16]) -> f32 {
+    a.iter()
+        .zip(b.iter())
+        .map(|(x, y)| {
+            // ignore rust analyser
+            let res = x.to_f32() * y.to_f32();
+            res
+        })
+        .sum()
+}
+
+/// Dot product of bf16 vectors - SSE (128-bit)
+///
+/// ### Params
+///
+/// * `a` - First bf16 vector slice
+/// * `b` - Second bf16 vector slice
+///
+/// ### Returns
+///
+/// Dot product
+#[cfg(all(feature = "quantised", target_arch = "x86_64"))]
+#[inline(always)]
+fn dot_bf16_sse(a: &[bf16], b: &[bf16]) -> f32 {
+    let len = a.len();
+    let chunks = len / 4;
+
+    unsafe {
+        let mut acc = _mm_setzero_ps();
+
+        for i in 0..chunks {
+            let va = bf16x4_to_f32x4_sse(a.as_ptr().add(i * 4));
+            let vb = bf16x4_to_f32x4_sse(b.as_ptr().add(i * 4));
+            acc = _mm_add_ps(acc, _mm_mul_ps(va, vb));
+        }
+
+        let mut sum = hsum_f32_sse(acc);
+
+        for i in (chunks * 4)..len {
+            sum += a[i].to_f32() * b[i].to_f32();
+        }
+        sum
+    }
+}
+
+/// Dot product of bf16 vectors - AVX2 (256-bit)
+///
+/// ### Params
+///
+/// * `a` - First bf16 vector slice
+/// * `b` - Second bf16 vector slice
+///
+/// ### Returns
+///
+/// Dot product
+#[cfg(all(feature = "quantised", target_arch = "x86_64"))]
+#[inline(always)]
+fn dot_bf16_avx2(a: &[bf16], b: &[bf16]) -> f32 {
+    let len = a.len();
+    let chunks = len / 8;
+
+    unsafe {
+        let mut acc = _mm256_setzero_ps();
+
+        for i in 0..chunks {
+            let va = bf16x8_to_f32x8_avx2(a.as_ptr().add(i * 8));
+            let vb = bf16x8_to_f32x8_avx2(b.as_ptr().add(i * 8));
+            acc = _mm256_fmadd_ps(va, vb, acc);
+        }
+
+        let mut sum = hsum_f32_avx2(acc);
+
+        for i in (chunks * 8)..len {
+            sum += a[i].to_f32() * b[i].to_f32();
+        }
+        sum
+    }
+}
+
+/// Dot product of bf16 vectors - AVX-512 (512-bit)
+///
+/// ### Params
+///
+/// * `a` - First bf16 vector slice
+/// * `b` - Second bf16 vector slice
+///
+/// ### Returns
+///
+/// Dot product
+#[cfg(all(
+    feature = "quantised",
+    target_arch = "x86_64",
+    target_feature = "avx512f"
+))]
+#[inline(always)]
+fn dot_bf16_avx512(a: &[bf16], b: &[bf16]) -> f32 {
+    let len = a.len();
+    let chunks = len / 16;
+
+    unsafe {
+        let mut acc = _mm512_setzero_ps();
+
+        for i in 0..chunks {
+            let va = bf16x16_to_f32x16_avx512(a.as_ptr().add(i * 16));
+            let vb = bf16x16_to_f32x16_avx512(b.as_ptr().add(i * 16));
+            acc = _mm512_fmadd_ps(va, vb, acc);
+        }
+
+        let mut sum = _mm512_reduce_add_ps(acc);
+
+        for i in (chunks * 16)..len {
+            sum += a[i].to_f32() * b[i].to_f32();
+        }
+        sum
+    }
+}
+
+/// Dot product - AVX-512 fallback for non-AVX512 compilation
+#[cfg(all(
+    feature = "quantised",
+    target_arch = "x86_64",
+    not(target_feature = "avx512f")
+))]
+#[inline(always)]
+fn dot_bf16_avx512(a: &[bf16], b: &[bf16]) -> f32 {
+    dot_bf16_avx2(a, b)
+}
+
+/// Dot product of bf16 vectors - NEON (128-bit, aarch64)
+///
+/// ### Params
+///
+/// * `a` - First bf16 vector slice
+/// * `b` - Second bf16 vector slice
+///
+/// ### Returns
+///
+/// Dot product
+#[cfg(all(feature = "quantised", target_arch = "aarch64"))]
+#[inline(always)]
+fn dot_bf16_neon(a: &[bf16], b: &[bf16]) -> f32 {
+    let len = a.len();
+    let chunks = len / 4;
+
+    unsafe {
+        let mut acc = vdupq_n_f32(0.0);
+
+        for i in 0..chunks {
+            let va = bf16x4_to_f32x4_neon(a.as_ptr().add(i * 4));
+            let vb = bf16x4_to_f32x4_neon(b.as_ptr().add(i * 4));
+            acc = vfmaq_f32(acc, va, vb);
+        }
+
+        let mut sum = hsum_f32_neon(acc);
+
+        for i in (chunks * 4)..len {
+            sum += a[i].to_f32() * b[i].to_f32();
+        }
+        sum
+    }
+}
+
+/// Dispatch dot product calculation to appropriate SIMD implementation
+///
+/// ### Params
+///
+/// * `a` - First bf16 vector slice
+/// * `b` - Second bf16 vector slice
+///
+/// ### Returns
+///
+/// Dot product
+#[cfg(feature = "quantised")]
+#[inline]
+pub fn dot_bf16_simd(a: &[bf16], b: &[bf16]) -> f32 {
+    #[cfg(target_arch = "x86_64")]
+    {
+        match crate::detect_simd_level() {
+            crate::SimdLevel::Avx512 => dot_bf16_avx512(a, b),
+            crate::SimdLevel::Avx2 => dot_bf16_avx2(a, b),
+            crate::SimdLevel::Sse => dot_bf16_sse(a, b),
+            crate::SimdLevel::Scalar => dot_bf16_scalar(a, b),
+        }
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    {
+        dot_bf16_neon(a, b)
+    }
+
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+    {
+        dot_bf16_scalar(a, b)
+    }
+}
+
+//////////////////////////
+// bf16 vs f32 dot prod //
+//////////////////////////
+
+/// Dot product: bf16 vs f32 - scalar fallback
+///
+/// ### Params
+///
+/// * `a` - bf16 vector slice
+/// * `b` - f32 vector slice
+///
+/// ### Returns
+///
+/// Dot product
+#[cfg(feature = "quantised")]
+#[inline(always)]
+fn dot_bf16_f32_scalar(a: &[bf16], b: &[f32]) -> f32 {
+    a.iter().zip(b.iter()).map(|(x, y)| x.to_f32() * y).sum()
+}
+
+/// Dot product: bf16 vs f32 - SSE (128-bit, x86_64)
+///
+/// ### Params
+///
+/// * `a` - bf16 vector slice
+/// * `b` - f32 vector slice
+///
+/// ### Returns
+///
+/// Dot product
+#[cfg(all(feature = "quantised", target_arch = "x86_64"))]
+#[inline(always)]
+fn dot_bf16_f32_sse(a: &[bf16], b: &[f32]) -> f32 {
+    let len = a.len();
+    let chunks = len / 4;
+
+    unsafe {
+        let mut acc = _mm_setzero_ps();
+
+        for i in 0..chunks {
+            let va = bf16x4_to_f32x4_sse(a.as_ptr().add(i * 4));
+            let vb = _mm_loadu_ps(b.as_ptr().add(i * 4));
+            acc = _mm_add_ps(acc, _mm_mul_ps(va, vb));
+        }
+
+        let mut sum = hsum_f32_sse(acc);
+        for i in (chunks * 4)..len {
+            sum += a[i].to_f32() * b[i];
+        }
+        sum
+    }
+}
+
+/// Dot product: bf16 vs f32 - AVX2 (256-bit, x86_64)
+///
+/// ### Params
+///
+/// * `a` - bf16 vector slice
+/// * `b` - f32 vector slice
+///
+/// ### Returns
+///
+/// Dot product
+#[cfg(all(feature = "quantised", target_arch = "x86_64"))]
+#[inline(always)]
+fn dot_bf16_f32_avx2(a: &[bf16], b: &[f32]) -> f32 {
+    let len = a.len();
+    let chunks = len / 8;
+
+    unsafe {
+        let mut acc = _mm256_setzero_ps();
+
+        for i in 0..chunks {
+            let va = bf16x8_to_f32x8_avx2(a.as_ptr().add(i * 8));
+            let vb = _mm256_loadu_ps(b.as_ptr().add(i * 8));
+            acc = _mm256_fmadd_ps(va, vb, acc);
+        }
+
+        let mut sum = hsum_f32_avx2(acc);
+        for i in (chunks * 8)..len {
+            sum += a[i].to_f32() * b[i];
+        }
+        sum
+    }
+}
+
+/// Dot product: bf16 vs f32 - AVX512 (512-bit, x86_64)
+///
+/// ### Params
+///
+/// * `a` - bf16 vector slice
+/// * `b` - f32 vector slice
+///
+/// ### Returns
+///
+/// Dot product
+#[cfg(all(
+    feature = "quantised",
+    target_arch = "x86_64",
+    target_feature = "avx512f"
+))]
+#[inline(always)]
+fn dot_bf16_f32_avx512(a: &[bf16], b: &[f32]) -> f32 {
+    let len = a.len();
+    let chunks = len / 16;
+
+    unsafe {
+        let mut acc = _mm512_setzero_ps();
+
+        for i in 0..chunks {
+            let va = bf16x16_to_f32x16_avx512(a.as_ptr().add(i * 16));
+            let vb = _mm512_loadu_ps(b.as_ptr().add(i * 16));
+            acc = _mm512_fmadd_ps(va, vb, acc);
+        }
+
+        let mut sum = _mm512_reduce_add_ps(acc);
+        for i in (chunks * 16)..len {
+            sum += a[i].to_f32() * b[i];
+        }
+        sum
+    }
+}
+
+/// Dot product: bf16 vs f32 - AVX512 fallback to AVX2
+///
+/// ### Params
+///
+/// * `a` - bf16 vector slice
+/// * `b` - f32 vector slice
+///
+/// ### Returns
+///
+/// Dot product
+#[cfg(all(
+    feature = "quantised",
+    target_arch = "x86_64",
+    not(target_feature = "avx512f")
+))]
+#[inline(always)]
+fn dot_bf16_f32_avx512(a: &[bf16], b: &[f32]) -> f32 {
+    dot_bf16_f32_avx2(a, b)
+}
+
+/// Dot product: bf16 vs f32 - NEON (128-bit, aarch64)
+///
+/// ### Params
+///
+/// * `a` - bf16 vector slice
+/// * `b` - f32 vector slice
+///
+/// ### Returns
+///
+/// Dot product
+#[cfg(all(feature = "quantised", target_arch = "aarch64"))]
+#[inline(always)]
+fn dot_bf16_f32_neon(a: &[bf16], b: &[f32]) -> f32 {
+    let len = a.len();
+    let chunks = len / 4;
+
+    unsafe {
+        let mut acc = vdupq_n_f32(0.0);
+
+        for i in 0..chunks {
+            let va = bf16x4_to_f32x4_neon(a.as_ptr().add(i * 4));
+            let vb = vld1q_f32(b.as_ptr().add(i * 4));
+            acc = vfmaq_f32(acc, va, vb);
+        }
+
+        let mut sum = hsum_f32_neon(acc);
+        for i in (chunks * 4)..len {
+            sum += a[i].to_f32() * b[i];
+        }
+        sum
+    }
+}
+
+//////////////////////////
+// bf16 vs f64 dot prod //
+//////////////////////////
+
+/// Dot product: bf16 vs f64 - scalar fallback
+///
+/// ### Params
+///
+/// * `a` - bf16 vector slice
+/// * `b` - f64 vector slice
+///
+/// ### Returns
+///
+/// Dot product (f64 converted to f32)
+#[cfg(feature = "quantised")]
+#[inline(always)]
+fn dot_bf16_f64_scalar(a: &[bf16], b: &[f64]) -> f32 {
+    a.iter()
+        .zip(b.iter())
+        .map(|(x, y)| x.to_f32() * (*y as f32))
+        .sum()
+}
+
+/// Dot product: bf16 vs f64 - SSE (128-bit, x86_64)
+///
+/// ### Params
+///
+/// * `a` - bf16 vector slice
+/// * `b` - f64 vector slice
+///
+/// ### Returns
+///
+/// Dot product (f64 converted to f32)
+#[cfg(all(feature = "quantised", target_arch = "x86_64"))]
+#[inline(always)]
+fn dot_bf16_f64_sse(a: &[bf16], b: &[f64]) -> f32 {
+    let len = a.len();
+    let chunks = len / 4;
+
+    unsafe {
+        let mut acc = _mm_setzero_ps();
+
+        for i in 0..chunks {
+            let offset = i * 4;
+
+            let va = bf16x4_to_f32x4_sse(a.as_ptr().add(offset));
+
+            let b_lo = _mm_loadu_pd(b.as_ptr().add(offset));
+            let b_hi = _mm_loadu_pd(b.as_ptr().add(offset + 2));
+            let b_lo_f32 = _mm_cvtpd_ps(b_lo);
+            let b_hi_f32 = _mm_cvtpd_ps(b_hi);
+            let vb = _mm_movelh_ps(b_lo_f32, b_hi_f32);
+
+            acc = _mm_add_ps(acc, _mm_mul_ps(va, vb));
+        }
+
+        let mut sum = hsum_f32_sse(acc);
+        for i in (chunks * 4)..len {
+            sum += a[i].to_f32() * (b[i] as f32);
+        }
+        sum
+    }
+}
+
+/// Dot product: bf16 vs f64 - AVX2 (256-bit, x86_64)
+///
+/// ### Params
+///
+/// * `a` - bf16 vector slice
+/// * `b` - f64 vector slice
+///
+/// ### Returns
+///
+/// Dot product (f64 converted to f32)
+#[cfg(all(feature = "quantised", target_arch = "x86_64"))]
+#[inline(always)]
+fn dot_bf16_f64_avx2(a: &[bf16], b: &[f64]) -> f32 {
+    let len = a.len();
+    let chunks = len / 8;
+
+    unsafe {
+        let mut acc = _mm256_setzero_ps();
+
+        for i in 0..chunks {
+            let offset = i * 8;
+
+            let va = bf16x8_to_f32x8_avx2(a.as_ptr().add(offset));
+
+            let b_lo = _mm256_loadu_pd(b.as_ptr().add(offset));
+            let b_hi = _mm256_loadu_pd(b.as_ptr().add(offset + 4));
+            let b_lo_f32 = _mm256_cvtpd_ps(b_lo);
+            let b_hi_f32 = _mm256_cvtpd_ps(b_hi);
+            let vb = _mm256_insertf128_ps(_mm256_castps128_ps256(b_lo_f32), b_hi_f32, 1);
+
+            acc = _mm256_fmadd_ps(va, vb, acc);
+        }
+
+        let mut sum = hsum_f32_avx2(acc);
+        for i in (chunks * 8)..len {
+            sum += a[i].to_f32() * (b[i] as f32);
+        }
+        sum
+    }
+}
+
+/// Dot product: bf16 vs f64 - AVX512 (512-bit, x86_64)
+///
+/// ### Params
+///
+/// * `a` - bf16 vector slice
+/// * `b` - f64 vector slice
+///
+/// ### Returns
+///
+/// Dot product (f64 converted to f32)
+#[cfg(all(
+    feature = "quantised",
+    target_arch = "x86_64",
+    target_feature = "avx512f"
+))]
+#[inline(always)]
+fn dot_bf16_f64_avx512(a: &[bf16], b: &[f64]) -> f32 {
+    let len = a.len();
+    let chunks = len / 16;
+
+    unsafe {
+        let mut acc = _mm512_setzero_ps();
+
+        for i in 0..chunks {
+            let offset = i * 16;
+
+            let va = bf16x16_to_f32x16_avx512(a.as_ptr().add(offset));
+
+            let b_lo = _mm512_loadu_pd(b.as_ptr().add(offset));
+            let b_hi = _mm512_loadu_pd(b.as_ptr().add(offset + 8));
+            let b_lo_f32 = _mm512_cvtpd_ps(b_lo);
+            let b_hi_f32 = _mm512_cvtpd_ps(b_hi);
+            let vb = _mm512_insertf32x8(_mm512_castps256_ps512(b_lo_f32), b_hi_f32, 1);
+
+            acc = _mm512_fmadd_ps(va, vb, acc);
+        }
+
+        let mut sum = _mm512_reduce_add_ps(acc);
+        for i in (chunks * 16)..len {
+            sum += a[i].to_f32() * (b[i] as f32);
+        }
+        sum
+    }
+}
+
+/// Dot product: bf16 vs f64 - AVX512 fallback to AVX2
+///
+/// ### Params
+///
+/// * `a` - bf16 vector slice
+/// * `b` - f64 vector slice
+///
+/// ### Returns
+///
+/// Dot product (f64 converted to f32)
+#[cfg(all(
+    feature = "quantised",
+    target_arch = "x86_64",
+    not(target_feature = "avx512f")
+))]
+#[inline(always)]
+fn dot_bf16_f64_avx512(a: &[bf16], b: &[f64]) -> f32 {
+    dot_bf16_f64_avx2(a, b)
+}
+
+/// Dot product: bf16 vs f64 - NEON (128-bit, aarch64)
+///
+/// ### Params
+///
+/// * `a` - bf16 vector slice
+/// * `b` - f64 vector slice
+///
+/// ### Returns
+///
+/// Dot product (f64 converted to f32)
+#[cfg(all(feature = "quantised", target_arch = "aarch64"))]
+#[inline(always)]
+fn dot_bf16_f64_neon(a: &[bf16], b: &[f64]) -> f32 {
+    let len = a.len();
+    let chunks = len / 4;
+
+    unsafe {
+        let mut acc = vdupq_n_f32(0.0);
+
+        for i in 0..chunks {
+            let offset = i * 4;
+
+            let va = bf16x4_to_f32x4_neon(a.as_ptr().add(offset));
+
+            let b_lo = vld1q_f64(b.as_ptr().add(offset));
+            let b_hi = vld1q_f64(b.as_ptr().add(offset + 2));
+            let b_lo_f32 = vcvt_f32_f64(b_lo);
+            let b_hi_f32 = vcvt_f32_f64(b_hi);
+            let vb = vcombine_f32(b_lo_f32, b_hi_f32);
+
+            acc = vfmaq_f32(acc, va, vb);
+        }
+
+        let mut sum = hsum_f32_neon(acc);
+        for i in (chunks * 4)..len {
+            sum += a[i].to_f32() * (b[i] as f32);
+        }
+        sum
+    }
+}
+
+/////////////////
+// Dispatchers //
+/////////////////
+
+/// Dot product: bf16 storage vs f32 query - SIMD dispatcher
+///
+/// ### Params
+///
+/// * `a` - bf16 vector slice (storage)
+/// * `b` - f32 vector slice (query)
+///
+/// ### Returns
+///
+/// Dot product as f32
+#[cfg(feature = "quantised")]
+#[inline]
+pub fn dot_bf16_f32_simd(a: &[bf16], b: &[f32]) -> f32 {
+    #[cfg(target_arch = "x86_64")]
+    {
+        match detect_simd_level() {
+            SimdLevel::Avx512 => dot_bf16_f32_avx512(a, b),
+            SimdLevel::Avx2 => dot_bf16_f32_avx2(a, b),
+            SimdLevel::Sse => dot_bf16_f32_sse(a, b),
+            SimdLevel::Scalar => dot_bf16_f32_scalar(a, b),
+        }
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    {
+        dot_bf16_f32_neon(a, b)
+    }
+
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+    {
+        dot_bf16_f32_scalar(a, b)
+    }
+}
+
+/// Dot product: bf16 storage vs f64 query - SIMD dispatcher
+///
+/// ### Params
+///
+/// * `a` - bf16 vector slice (storage)
+/// * `b` - f64 vector slice (query)
+///
+/// ### Returns
+///
+/// Dot product as f32 (f64 converted on-the-fly)
+#[cfg(feature = "quantised")]
+#[inline]
+pub fn dot_bf16_f64_simd(a: &[bf16], b: &[f64]) -> f32 {
+    #[cfg(target_arch = "x86_64")]
+    {
+        match detect_simd_level() {
+            SimdLevel::Avx512 => dot_bf16_f64_avx512(a, b),
+            SimdLevel::Avx2 => dot_bf16_f64_avx2(a, b),
+            SimdLevel::Sse => dot_bf16_f64_sse(a, b),
+            SimdLevel::Scalar => dot_bf16_f64_scalar(a, b),
+        }
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    {
+        dot_bf16_f64_neon(a, b)
+    }
+
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+    {
+        dot_bf16_f64_scalar(a, b)
+    }
+}
+
+////////////////////
+// Bf16Compatible //
+////////////////////
+
+/// Marker trait for types we can dispatch bf16 distance to
+#[cfg(feature = "quantised")]
+pub trait Bf16Compatible: Float + ToPrimitive {
+    /// Calculate the Euclidean distance between BF16 and a Bf16-compatible
+    /// float
+    ///
+    /// ### Params
+    ///
+    /// * `a` - Slice representing the bf16-encoded vector
+    /// * `b` - Slice of the Bf16-compatible  float
+    ///
+    /// ### Returns
+    ///
+    /// Euclidean distance
+    fn euclidean_bf16_dispatch(a: &[bf16], b: &[Self]) -> f32;
+
+    /// Calculate the dot product between BF16 and a Bf16-compatible float
+    ///
+    /// ### Params
+    ///
+    /// * `a` - Slice representing the bf16-encoded vector
+    /// * `b` - Slice of the Bf16-compatible  float
+    ///
+    /// ### Returns
+    ///
+    /// Dot product
+    fn dot_bf16_dispatch(a: &[bf16], b: &[Self]) -> f32;
+}
+
+#[cfg(feature = "quantised")]
+impl Bf16Compatible for f32 {
+    #[inline(always)]
+    fn euclidean_bf16_dispatch(a: &[bf16], b: &[Self]) -> f32 {
+        euclidean_bf16_f32_simd(a, b)
+    }
+
+    #[inline(always)]
+    fn dot_bf16_dispatch(a: &[bf16], b: &[Self]) -> f32 {
+        dot_bf16_f32_simd(a, b)
+    }
+}
+
+#[cfg(feature = "quantised")]
+impl Bf16Compatible for f64 {
+    #[inline(always)]
+    fn euclidean_bf16_dispatch(a: &[bf16], b: &[Self]) -> f32 {
+        euclidean_bf16_f64_simd(a, b)
+    }
+
+    #[inline(always)]
+    fn dot_bf16_dispatch(a: &[bf16], b: &[Self]) -> f32 {
+        dot_bf16_f64_simd(a, b)
+    }
+}
+
+///////////
+// Trait //
+///////////
+
+#[cfg(feature = "quantised")]
+/// Trait for computing distances between Floats
+pub trait VectorDistanceBf16<T>
+where
+    T: Float + Sum + FromPrimitive + ToPrimitive + SimdDistance,
+{
+    /// Get the internal flat vector representation
+    fn vectors_flat(&self) -> &[bf16];
+
+    /// Get the internal dimensions
+    fn dim(&self) -> usize;
+
+    /// Get the normalised values
+    fn norms(&self) -> &[T];
+
+    ///////////////
+    // Euclidean //
+    ///////////////
+
+    /// Euclidean distance between two internal vectors (squared; bf16)
+    ///
+    /// ### Params
+    ///
+    /// * `i` - Sample index i
+    /// * `j` - Sample index j
+    ///
     /// ### Safety
     ///
     /// Uses unsafe to retrieve the data in an unchecked manner for maximum
@@ -80,28 +2532,18 @@ where
     ///
     /// The squared Euclidean distance between the two samples
     #[inline(always)]
-    fn euclidean_distance(&self, i: usize, j: usize) -> T {
+    fn euclidean_distance_bf16(&self, i: usize, j: usize) -> T {
         let start_i = i * self.dim();
         let start_j = j * self.dim();
-        unsafe {
-            let vec_i = self
-                .vectors_flat()
-                .get_unchecked(start_i..start_i + self.dim());
-            let vec_j = self
-                .vectors_flat()
-                .get_unchecked(start_j..start_j + self.dim());
-            vec_i
-                .iter()
-                .zip(vec_j.iter())
-                .map(|(&a, &b)| {
-                    let diff = a - b;
-                    diff * diff
-                })
-                .fold(T::zero(), |acc, x| acc + x)
-        }
+        let vec_i = &self.vectors_flat()[start_i..start_i + self.dim()];
+        let vec_j = &self.vectors_flat()[start_j..start_j + self.dim()];
+
+        let result = euclidean_bf16_simd(vec_i, vec_j);
+        T::from_f32(result).unwrap()
     }
 
-    /// Euclidean distance between query vector and internal vector (squared)
+    /// Euclidean distance between query vector and internal vector
+    /// (squared; bf16)
     ///
     /// ### Params
     ///
@@ -117,19 +2559,38 @@ where
     ///
     /// The squared Euclidean distance
     #[inline(always)]
-    fn euclidean_distance_to_query(&self, internal_idx: usize, query: &[T]) -> T {
+    fn euclidean_distance_to_query_bf16<Q>(&self, internal_idx: usize, query: &[Q]) -> T
+    where
+        Q: Bf16Compatible,
+    {
         let start = internal_idx * self.dim();
+        let vec = &self.vectors_flat()[start..start + self.dim()];
+        T::from_f32(Q::euclidean_bf16_dispatch(vec, query)).unwrap()
+    }
 
-        unsafe {
-            let vec = &self.vectors_flat().get_unchecked(start..start + self.dim());
-            vec.iter()
-                .zip(query.iter())
-                .map(|(&a, &b)| {
-                    let diff = a - b;
-                    diff * diff
-                })
-                .fold(T::zero(), |acc, x| acc + x)
-        }
+    /// Euclidean distance between query vector and internal vector
+    /// (squared; bf16)
+    ///
+    /// ### Params
+    ///
+    /// * `internal_idx` - Index of internal vector
+    /// * `query` - Query vector slice
+    ///
+    /// ### Safety
+    ///
+    /// Uses unsafe to retrieve the data in an unchecked manner for maximum
+    /// performance.
+    ///
+    /// ### Returns
+    ///
+    /// The squared Euclidean distance
+    #[inline(always)]
+    fn euclidean_distance_to_query_dual_bf16(&self, internal_idx: usize, query: &[bf16]) -> T {
+        let start = internal_idx * self.dim();
+        let vec = &self.vectors_flat()[start..start + self.dim()];
+
+        let result = euclidean_bf16_simd(vec, query);
+        T::from_f32(result).unwrap()
     }
 
     ////////////
@@ -154,25 +2615,18 @@ where
     ///
     /// The Cosine distance between the two samples
     #[inline(always)]
-    fn cosine_distance(&self, i: usize, j: usize) -> T {
+    fn cosine_distance_bf16(&self, i: usize, j: usize) -> T {
         let start_i = i * self.dim();
         let start_j = j * self.dim();
-        unsafe {
-            let vec_i = &self
-                .vectors_flat()
-                .get_unchecked(start_i..start_i + self.dim());
-            let vec_j = &self
-                .vectors_flat()
-                .get_unchecked(start_j..start_j + self.dim());
+        let vec_i = &self.vectors_flat()[start_i..start_i + self.dim()];
+        let vec_j = &self.vectors_flat()[start_j..start_j + self.dim()];
 
-            let dot = vec_i
-                .iter()
-                .zip(vec_j.iter())
-                .map(|(&a, &b)| a * b)
-                .fold(T::zero(), |acc, x| acc + x);
+        let dot = dot_bf16_simd(vec_i, vec_j);
+        let norm_i = self.norms()[i].to_f32().unwrap();
+        let norm_j = self.norms()[j].to_f32().unwrap();
 
-            T::one() - (dot / (self.norms()[i] * self.norms()[j]))
-        }
+        let dist = 1.0 - (dot / (norm_i * norm_j));
+        T::from_f32(dist).unwrap()
     }
 
     /// Cosine distance between query vector and internal vector
@@ -192,26 +2646,490 @@ where
     ///
     /// The Cosine distance
     #[inline(always)]
-    fn cosine_distance_to_query(&self, internal_idx: usize, query: &[T], query_norm: T) -> T {
+    fn cosine_distance_to_query_bf16<Q>(&self, internal_idx: usize, query: &[Q], query_norm: T) -> T
+    where
+        Q: Bf16Compatible,
+    {
         let start = internal_idx * self.dim();
+        let vec = &self.vectors_flat()[start..start + self.dim()];
+        let dot = Q::dot_bf16_dispatch(vec, query);
+        let dist = 1.0
+            - (dot / (query_norm.to_f32().unwrap() * self.norms()[internal_idx].to_f32().unwrap()));
+        T::from_f32(dist).unwrap()
+    }
 
-        unsafe {
-            let vec = &self.vectors_flat().get_unchecked(start..start + self.dim());
+    /// Cosine distance between query vector and internal vector
+    ///
+    /// ### Params
+    ///
+    /// * `internal_idx` - Index of internal vector
+    /// * `query` - Query vector slice
+    /// * `query_norm` - Pre-computed norm of query vector
+    ///
+    /// ### Safety
+    ///
+    /// Uses unsafe to retrieve the data in an unchecked manner for maximum
+    /// performance.
+    ///
+    /// ### Returns
+    ///
+    /// The Cosine distance
+    #[inline(always)]
+    fn cosine_distance_to_query_dual_bf16(
+        &self,
+        internal_idx: usize,
+        query: &[bf16],
+        query_norm: bf16,
+    ) -> T {
+        let start = internal_idx * self.dim();
+        let vec = &self.vectors_flat()[start..start + self.dim()];
 
-            let dot = vec
-                .iter()
-                .zip(query.iter())
-                .map(|(&a, &b)| a * b)
-                .fold(T::zero(), |acc, x| acc + x);
+        let dot = dot_bf16_simd(vec, query);
+        let norm_internal = self.norms()[internal_idx].to_f32().unwrap();
 
-            T::one() - (dot / (query_norm * self.norms()[internal_idx]))
-        }
+        let dist = 1.0 - (dot / (query_norm.to_f32() * norm_internal));
+        T::from_f32(dist).unwrap()
     }
 }
 
 ///////////////////////
 // VectorDistanceSq8 //
 ///////////////////////
+
+//////////
+// SIMD //
+//////////
+
+//////////////////
+// i8 Euclidean //
+//////////////////
+
+/// Euclidean distance of i8 vectors - scalar fallback
+///
+/// ### Params
+///
+/// * `a` - First i8 vector slice
+/// * `b` - Second i8 vector slice
+///
+/// ### Returns
+///
+/// Euclidean distance
+#[inline(always)]
+fn euclidean_i8_scalar(a: &[i8], b: &[i8]) -> i32 {
+    a.iter()
+        .zip(b.iter())
+        .map(|(&x, &y)| {
+            let diff = x as i32 - y as i32;
+            diff * diff
+        })
+        .sum()
+}
+
+/// Euclidean distance of i8 vectors - SSE (128-bit, x86_64)
+///
+/// ### Params
+///
+/// * `a` - First i8 vector slice
+/// * `b` - Second i8 vector slice
+///
+/// ### Returns
+///
+/// Euclidean distance
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+fn euclidean_i8_sse(a: &[i8], b: &[i8]) -> i32 {
+    use std::arch::x86_64::*;
+
+    let len = a.len();
+    let chunks = len / 16;
+
+    unsafe {
+        let mut acc = _mm_setzero_si128();
+
+        for i in 0..chunks {
+            let offset = i * 16;
+            // Load 16 i8 values
+            let va = _mm_loadu_si128(a.as_ptr().add(offset) as *const __m128i);
+            let vb = _mm_loadu_si128(b.as_ptr().add(offset) as *const __m128i);
+
+            // Widen lower 8 bytes to i16
+            let va_lo = _mm_cvtepi8_epi16(va);
+            let vb_lo = _mm_cvtepi8_epi16(vb);
+            // Widen upper 8 bytes to i16
+            let va_hi = _mm_cvtepi8_epi16(_mm_srli_si128(va, 8));
+            let vb_hi = _mm_cvtepi8_epi16(_mm_srli_si128(vb, 8));
+
+            // Subtract as i16
+            let diff_lo = _mm_sub_epi16(va_lo, vb_lo);
+            let diff_hi = _mm_sub_epi16(va_hi, vb_hi);
+
+            // Square and accumulate: madd with self gives sum of squares as i32
+            // _mm_madd_epi16 multiplies pairs and adds adjacent results to i32
+            let sq_lo = _mm_madd_epi16(diff_lo, diff_lo);
+            let sq_hi = _mm_madd_epi16(diff_hi, diff_hi);
+
+            acc = _mm_add_epi32(acc, sq_lo);
+            acc = _mm_add_epi32(acc, sq_hi);
+        }
+
+        // Horizontal sum
+        let sum = horizontal_sum_i32_sse(acc);
+
+        // Remainder
+        let mut total = sum;
+        for i in (chunks * 16)..len {
+            let diff = a[i] as i32 - b[i] as i32;
+            total += diff * diff;
+        }
+        total
+    }
+}
+
+/// Euclidean distance of i8 vectors - AVX2 (256-bit, x86_64)
+///
+/// ### Params
+///
+/// * `a` - First i8 vector slice
+/// * `b` - Second i8 vector slice
+///
+/// ### Returns
+///
+/// Euclidean distance
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+fn euclidean_i8_avx2(a: &[i8], b: &[i8]) -> i32 {
+    use std::arch::x86_64::*;
+
+    let len = a.len();
+    let chunks = len / 32;
+
+    unsafe {
+        let mut acc = _mm256_setzero_si256();
+
+        for i in 0..chunks {
+            let offset = i * 32;
+            let va = _mm256_loadu_si256(a.as_ptr().add(offset) as *const __m256i);
+            let vb = _mm256_loadu_si256(b.as_ptr().add(offset) as *const __m256i);
+
+            // Extract 128-bit halves
+            let va_128_lo = _mm256_castsi256_si128(va);
+            let va_128_hi = _mm256_extracti128_si256(va, 1);
+            let vb_128_lo = _mm256_castsi256_si128(vb);
+            let vb_128_hi = _mm256_extracti128_si256(vb, 1);
+
+            // Widen each 128-bit chunk (16 x i8) to 256-bit (16 x i16)
+            let va_lo_16 = _mm256_cvtepi8_epi16(va_128_lo);
+            let va_hi_16 = _mm256_cvtepi8_epi16(va_128_hi);
+            let vb_lo_16 = _mm256_cvtepi8_epi16(vb_128_lo);
+            let vb_hi_16 = _mm256_cvtepi8_epi16(vb_128_hi);
+
+            // Subtract
+            let diff_lo = _mm256_sub_epi16(va_lo_16, vb_lo_16);
+            let diff_hi = _mm256_sub_epi16(va_hi_16, vb_hi_16);
+
+            // Square and accumulate to i32
+            let sq_lo = _mm256_madd_epi16(diff_lo, diff_lo);
+            let sq_hi = _mm256_madd_epi16(diff_hi, diff_hi);
+
+            acc = _mm256_add_epi32(acc, sq_lo);
+            acc = _mm256_add_epi32(acc, sq_hi);
+        }
+
+        let sum = horizontal_sum_i32_avx2(acc);
+
+        // Remainder
+        let mut total = sum;
+        for i in (chunks * 32)..len {
+            let diff = a[i] as i32 - b[i] as i32;
+            total += diff * diff;
+        }
+        total
+    }
+}
+
+/// Euclidean distance of i8 vectors - Neon (128-bit, aarch64)
+///
+/// ### Params
+///
+/// * `a` - First i8 vector slice
+/// * `b` - Second i8 vector slice
+///
+/// ### Returns
+///
+/// Euclidean distance
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+fn euclidean_i8_neon(a: &[i8], b: &[i8]) -> i32 {
+    use std::arch::aarch64::*;
+
+    let len = a.len();
+    let chunks = len / 16;
+
+    unsafe {
+        let mut acc = vdupq_n_s32(0);
+
+        for i in 0..chunks {
+            let offset = i * 16;
+            let va = vld1q_s8(a.as_ptr().add(offset));
+            let vb = vld1q_s8(b.as_ptr().add(offset));
+
+            // Widen lower 8 to i16
+            let va_lo = vmovl_s8(vget_low_s8(va));
+            let vb_lo = vmovl_s8(vget_low_s8(vb));
+            // Widen upper 8 to i16
+            let va_hi = vmovl_s8(vget_high_s8(va));
+            let vb_hi = vmovl_s8(vget_high_s8(vb));
+
+            // Subtract
+            let diff_lo = vsubq_s16(va_lo, vb_lo);
+            let diff_hi = vsubq_s16(va_hi, vb_hi);
+
+            // Square and widen to i32, accumulate
+            acc = vmlal_s16(acc, vget_low_s16(diff_lo), vget_low_s16(diff_lo));
+            acc = vmlal_s16(acc, vget_high_s16(diff_lo), vget_high_s16(diff_lo));
+            acc = vmlal_s16(acc, vget_low_s16(diff_hi), vget_low_s16(diff_hi));
+            acc = vmlal_s16(acc, vget_high_s16(diff_hi), vget_high_s16(diff_hi));
+        }
+
+        let sum = vaddvq_s32(acc);
+
+        let mut total = sum;
+        for i in (chunks * 16)..len {
+            let diff = a[i] as i32 - b[i] as i32;
+            total += diff * diff;
+        }
+        total
+    }
+}
+
+////////////////////
+// i8 Dot product //
+////////////////////
+
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+unsafe fn horizontal_sum_i32_sse(v: __m128i) -> i32 {
+    use std::arch::x86_64::*;
+    let hi = _mm_srli_si128(v, 8);
+    let sum = _mm_add_epi32(v, hi);
+    let hi2 = _mm_srli_si128(sum, 4);
+    let sum2 = _mm_add_epi32(sum, hi2);
+    _mm_cvtsi128_si32(sum2)
+}
+
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+unsafe fn horizontal_sum_i32_avx2(v: __m256i) -> i32 {
+    use std::arch::x86_64::*;
+    let lo = _mm256_castsi256_si128(v);
+    let hi = _mm256_extracti128_si256(v, 1);
+    let sum128 = _mm_add_epi32(lo, hi);
+    horizontal_sum_i32_sse(sum128)
+}
+
+/// Dot product of i8 vectors - scalar fallback
+///
+/// ### Params
+///
+/// * `a` - First i8 vector slice
+/// * `b` - Second i8 vector slice
+///
+/// ### Returns
+///
+/// Dot product
+#[inline(always)]
+fn dot_i8_scalar(a: &[i8], b: &[i8]) -> i32 {
+    a.iter()
+        .zip(b.iter())
+        .map(|(&x, &y)| x as i32 * y as i32)
+        .sum()
+}
+
+/// Dot product of i8 vectors - SSE (128-bit, x86_64)
+///
+/// ### Params
+///
+/// * `a` - First i8 vector slice
+/// * `b` - Second i8 vector slice
+///
+/// ### Returns
+///
+/// Dot product
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+fn dot_i8_sse(a: &[i8], b: &[i8]) -> i32 {
+    use std::arch::x86_64::*;
+
+    let len = a.len();
+    let chunks = len / 16;
+
+    unsafe {
+        let mut acc = _mm_setzero_si128();
+
+        for i in 0..chunks {
+            let offset = i * 16;
+            let va = _mm_loadu_si128(a.as_ptr().add(offset) as *const __m128i);
+            let vb = _mm_loadu_si128(b.as_ptr().add(offset) as *const __m128i);
+
+            // Widen to i16
+            let va_lo = _mm_cvtepi8_epi16(va);
+            let vb_lo = _mm_cvtepi8_epi16(vb);
+            let va_hi = _mm_cvtepi8_epi16(_mm_srli_si128(va, 8));
+            let vb_hi = _mm_cvtepi8_epi16(_mm_srli_si128(vb, 8));
+
+            // Multiply and accumulate to i32
+            let prod_lo = _mm_madd_epi16(va_lo, vb_lo);
+            let prod_hi = _mm_madd_epi16(va_hi, vb_hi);
+
+            acc = _mm_add_epi32(acc, prod_lo);
+            acc = _mm_add_epi32(acc, prod_hi);
+        }
+
+        let sum = horizontal_sum_i32_sse(acc);
+
+        let mut total = sum;
+        for i in (chunks * 16)..len {
+            total += a[i] as i32 * b[i] as i32;
+        }
+        total
+    }
+}
+
+/// Dot product of i8 vectors - AVX2 (256-bit, x86_64)
+///
+/// ### Params
+///
+/// * `a` - First i8 vector slice
+/// * `b` - Second i8 vector slice
+///
+/// ### Returns
+///
+/// Dot product
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+fn dot_i8_avx2(a: &[i8], b: &[i8]) -> i32 {
+    use std::arch::x86_64::*;
+
+    let len = a.len();
+    let chunks = len / 32;
+
+    unsafe {
+        let mut acc = _mm256_setzero_si256();
+
+        for i in 0..chunks {
+            let offset = i * 32;
+            let va = _mm256_loadu_si256(a.as_ptr().add(offset) as *const __m256i);
+            let vb = _mm256_loadu_si256(b.as_ptr().add(offset) as *const __m256i);
+
+            let va_128_lo = _mm256_castsi256_si128(va);
+            let va_128_hi = _mm256_extracti128_si256(va, 1);
+            let vb_128_lo = _mm256_castsi256_si128(vb);
+            let vb_128_hi = _mm256_extracti128_si256(vb, 1);
+
+            let va_lo_16 = _mm256_cvtepi8_epi16(va_128_lo);
+            let va_hi_16 = _mm256_cvtepi8_epi16(va_128_hi);
+            let vb_lo_16 = _mm256_cvtepi8_epi16(vb_128_lo);
+            let vb_hi_16 = _mm256_cvtepi8_epi16(vb_128_hi);
+
+            let prod_lo = _mm256_madd_epi16(va_lo_16, vb_lo_16);
+            let prod_hi = _mm256_madd_epi16(va_hi_16, vb_hi_16);
+
+            acc = _mm256_add_epi32(acc, prod_lo);
+            acc = _mm256_add_epi32(acc, prod_hi);
+        }
+
+        let sum = horizontal_sum_i32_avx2(acc);
+
+        let mut total = sum;
+        for i in (chunks * 32)..len {
+            total += a[i] as i32 * b[i] as i32;
+        }
+        total
+    }
+}
+
+/// Dot product of i8 vectors - NEON (128-bit, aarch64)
+///
+/// ### Params
+///
+/// * `a` - First i8 vector slice
+/// * `b` - Second i8 vector slice
+///
+/// ### Returns
+///
+/// Dot product
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+fn dot_i8_neon(a: &[i8], b: &[i8]) -> i32 {
+    use std::arch::aarch64::*;
+
+    let len = a.len();
+    let chunks = len / 16;
+
+    unsafe {
+        let mut acc = vdupq_n_s32(0);
+
+        for i in 0..chunks {
+            let offset = i * 16;
+            let va = vld1q_s8(a.as_ptr().add(offset));
+            let vb = vld1q_s8(b.as_ptr().add(offset));
+
+            let va_lo = vmovl_s8(vget_low_s8(va));
+            let vb_lo = vmovl_s8(vget_low_s8(vb));
+            let va_hi = vmovl_s8(vget_high_s8(va));
+            let vb_hi = vmovl_s8(vget_high_s8(vb));
+
+            acc = vmlal_s16(acc, vget_low_s16(va_lo), vget_low_s16(vb_lo));
+            acc = vmlal_s16(acc, vget_high_s16(va_lo), vget_high_s16(vb_lo));
+            acc = vmlal_s16(acc, vget_low_s16(va_hi), vget_low_s16(vb_hi));
+            acc = vmlal_s16(acc, vget_high_s16(va_hi), vget_high_s16(vb_hi));
+        }
+
+        let sum = vaddvq_s32(acc);
+
+        let mut total = sum;
+        for i in (chunks * 16)..len {
+            total += a[i] as i32 * b[i] as i32;
+        }
+        total
+    }
+}
+
+////////////////
+// Dispatcher //
+////////////////
+
+#[cfg(feature = "quantised")]
+#[inline]
+fn euclidean_i8_simd(a: &[i8], b: &[i8]) -> i32 {
+    match detect_simd_level() {
+        #[cfg(target_arch = "x86_64")]
+        SimdLevel::Avx512 | SimdLevel::Avx2 => euclidean_i8_avx2(a, b),
+        #[cfg(target_arch = "x86_64")]
+        SimdLevel::Sse => euclidean_i8_sse(a, b),
+        #[cfg(target_arch = "aarch64")]
+        SimdLevel::Sse => euclidean_i8_neon(a, b),
+        _ => euclidean_i8_scalar(a, b),
+    }
+}
+
+#[cfg(feature = "quantised")]
+#[inline]
+fn dot_i8_simd(a: &[i8], b: &[i8]) -> i32 {
+    match detect_simd_level() {
+        #[cfg(target_arch = "x86_64")]
+        SimdLevel::Avx512 | SimdLevel::Avx2 => dot_i8_avx2(a, b),
+        #[cfg(target_arch = "x86_64")]
+        SimdLevel::Sse => dot_i8_sse(a, b),
+        #[cfg(target_arch = "aarch64")]
+        SimdLevel::Sse => dot_i8_neon(a, b),
+        _ => dot_i8_scalar(a, b),
+    }
+}
+
+//////////////////////////////////////
+// VectorDistanceSq8 implementation //
+//////////////////////////////////////
 
 #[cfg(feature = "quantised")]
 /// Trait for computing distances between `i8`
@@ -250,22 +3168,9 @@ where
     #[inline(always)]
     fn euclidean_distance_i8(&self, internal_idx: usize, query_i8: &[i8]) -> T {
         let start = internal_idx * self.dim();
-        unsafe {
-            let db_vec = &self
-                .vectors_flat_quantised()
-                .get_unchecked(start..start + self.dim());
-
-            let sum: i32 = query_i8
-                .iter()
-                .zip(db_vec.iter())
-                .map(|(&q, &d)| {
-                    let diff = q as i32 - d as i32;
-                    diff * diff
-                })
-                .sum();
-
-            T::from_i32(sum).unwrap()
-        }
+        let db_vec = &self.vectors_flat_quantised()[start..start + self.dim()];
+        let sum = euclidean_i8_simd(query_i8, db_vec);
+        T::from_i32(sum).unwrap()
     }
 
     /// Calculate cosine distance against quantised query
@@ -287,286 +3192,17 @@ where
     #[inline(always)]
     fn cosine_distance_i8(&self, vec_idx: usize, query_i8: &[i8], query_norm_sq: i32) -> T {
         let start = vec_idx * self.dim();
+        let db_vec = &self.vectors_flat_quantised()[start..start + self.dim()];
+        let dot = dot_i8_simd(query_i8, db_vec);
+        let db_norm_sq = self.norms_quantised()[vec_idx];
 
-        unsafe {
-            let db_vec = &self
-                .vectors_flat_quantised()
-                .get_unchecked(start..start + self.dim());
+        let query_norm = T::from_i32(query_norm_sq).unwrap().sqrt();
+        let db_norm = T::from_i32(db_norm_sq).unwrap().sqrt();
 
-            let dot: i32 = query_i8
-                .iter()
-                .zip(db_vec.iter())
-                .map(|(&q, &d)| q as i32 * d as i32)
-                .sum();
-
-            let db_norm_sq: i32 = self.norms_quantised()[vec_idx];
-
-            let query_norm = T::from_i32(query_norm_sq).unwrap().sqrt();
-            let db_norm = T::from_i32(db_norm_sq).unwrap().sqrt();
-
-            if query_norm > T::zero() && db_norm > T::zero() {
-                T::one() - T::from_i32(dot).unwrap() / (query_norm * db_norm)
-            } else {
-                T::one()
-            }
-        }
-    }
-}
-
-////////////////////////
-// VectorDistanceBf16 //
-////////////////////////
-
-#[cfg(feature = "quantised")]
-/// Trait for computing distances between Floats
-pub trait VectorDistanceBf16<T>
-where
-    T: Float + Sum + FromPrimitive + ToPrimitive,
-{
-    /// Get the internal flat vector representation
-    fn vectors_flat(&self) -> &[bf16];
-
-    /// Get the internal dimensions
-    fn dim(&self) -> usize;
-
-    /// Get the normalised values
-    fn norms(&self) -> &[T];
-
-    ///////////////
-    // Euclidean //
-    ///////////////
-
-    /// Euclidean distance between two internal vectors (squared; bf16)
-    ///
-    /// ### Params
-    ///
-    /// * `i` - Sample index i
-    /// * `j` - Sample index j
-    ///
-    /// ### Safety
-    ///
-    /// Uses unsafe to retrieve the data in an unchecked manner for maximum
-    /// performance.
-    ///
-    /// ### Returns
-    ///
-    /// The squared Euclidean distance between the two samples
-    #[inline(always)]
-    fn euclidean_distance_bf16(&self, i: usize, j: usize) -> T {
-        let start_i = i * self.dim();
-        let start_j = j * self.dim();
-        unsafe {
-            let vec_i = self
-                .vectors_flat()
-                .get_unchecked(start_i..start_i + self.dim());
-            let vec_j = self
-                .vectors_flat()
-                .get_unchecked(start_j..start_j + self.dim());
-            let dist = vec_i
-                .iter()
-                .zip(vec_j.iter())
-                .map(|(&a, &b)| {
-                    let diff = a.to_f32() - b.to_f32();
-                    diff * diff
-                })
-                .fold(0.0, |acc, x| acc + x);
-
-            T::from_f32(dist).unwrap()
-        }
-    }
-
-    /// Euclidean distance between query vector and internal vector
-    /// (squared; bf16)
-    ///
-    /// ### Params
-    ///
-    /// * `internal_idx` - Index of internal vector
-    /// * `query` - Query vector slice
-    ///
-    /// ### Safety
-    ///
-    /// Uses unsafe to retrieve the data in an unchecked manner for maximum
-    /// performance.
-    ///
-    /// ### Returns
-    ///
-    /// The squared Euclidean distance
-    #[inline(always)]
-    fn euclidean_distance_to_query_bf16(&self, internal_idx: usize, query: &[T]) -> T {
-        let start = internal_idx * self.dim();
-
-        unsafe {
-            let vec = &self.vectors_flat().get_unchecked(start..start + self.dim());
-            let dist = vec
-                .iter()
-                .zip(query.iter())
-                .map(|(&a, &b)| {
-                    let diff = a.to_f32() - b.to_f32().unwrap();
-                    diff * diff
-                })
-                .fold(0.0, |acc, x| acc + x);
-
-            T::from_f32(dist).unwrap()
-        }
-    }
-
-    /// Euclidean distance between query vector and internal vector
-    /// (squared; bf16)
-    ///
-    /// ### Params
-    ///
-    /// * `internal_idx` - Index of internal vector
-    /// * `query` - Query vector slice
-    ///
-    /// ### Safety
-    ///
-    /// Uses unsafe to retrieve the data in an unchecked manner for maximum
-    /// performance.
-    ///
-    /// ### Returns
-    ///
-    /// The squared Euclidean distance
-    #[inline(always)]
-    fn euclidean_distance_to_query_dual_bf16(&self, internal_idx: usize, query: &[bf16]) -> T {
-        let start = internal_idx * self.dim();
-
-        unsafe {
-            let vec = &self.vectors_flat().get_unchecked(start..start + self.dim());
-            let dist = vec
-                .iter()
-                .zip(query.iter())
-                .map(|(&a, &b)| {
-                    let diff = a.to_f32() - b.to_f32();
-                    diff * diff
-                })
-                .fold(0.0, |acc, x| acc + x);
-
-            T::from_f32(dist).unwrap()
-        }
-    }
-
-    ////////////
-    // Cosine //
-    ////////////
-
-    /// Cosine distance between two internal vectors
-    ///
-    /// Uses pre-computed norms.
-    ///
-    /// ### Params
-    ///
-    /// * `i` - Sample index i
-    /// * `j` - Sample index j
-    ///
-    /// ### Safety
-    ///
-    /// Uses unsafe to retrieve the data in an unchecked manner for maximum
-    /// performance.
-    ///
-    /// ### Returns
-    ///
-    /// The Cosine distance between the two samples
-    #[inline(always)]
-    fn cosine_distance_bf16(&self, i: usize, j: usize) -> T {
-        let start_i = i * self.dim();
-        let start_j = j * self.dim();
-        unsafe {
-            let vec_i = &self
-                .vectors_flat()
-                .get_unchecked(start_i..start_i + self.dim());
-            let vec_j = &self
-                .vectors_flat()
-                .get_unchecked(start_j..start_j + self.dim());
-
-            let dot = vec_i
-                .iter()
-                .zip(vec_j.iter())
-                .map(|(&a, &b)| a.to_f32() * b.to_f32())
-                .fold(0.0, |acc, x| acc + x);
-
-            let dist = 1.0
-                - (dot / (self.norms()[i].to_f32().unwrap() * self.norms()[j].to_f32().unwrap()));
-
-            T::from_f32(dist).unwrap()
-        }
-    }
-
-    /// Cosine distance between query vector and internal vector
-    ///
-    /// ### Params
-    ///
-    /// * `internal_idx` - Index of internal vector
-    /// * `query` - Query vector slice
-    /// * `query_norm` - Pre-computed norm of query vector
-    ///
-    /// ### Safety
-    ///
-    /// Uses unsafe to retrieve the data in an unchecked manner for maximum
-    /// performance.
-    ///
-    /// ### Returns
-    ///
-    /// The Cosine distance
-    #[inline(always)]
-    fn cosine_distance_to_query_bf16(&self, internal_idx: usize, query: &[T], query_norm: T) -> T {
-        let start = internal_idx * self.dim();
-
-        unsafe {
-            let vec = &self.vectors_flat().get_unchecked(start..start + self.dim());
-
-            let dot = vec
-                .iter()
-                .zip(query.iter())
-                .map(|(&a, &b)| a.to_f32() * b.to_f32().unwrap())
-                .fold(0.0, |acc, x| acc + x);
-
-            let dist = 1.0
-                - (dot
-                    / (query_norm.to_f32().unwrap()
-                        * self.norms()[internal_idx].to_f32().unwrap()));
-
-            T::from_f32(dist).unwrap()
-        }
-    }
-
-    /// Cosine distance between query vector and internal vector
-    ///
-    /// ### Params
-    ///
-    /// * `internal_idx` - Index of internal vector
-    /// * `query` - Query vector slice
-    /// * `query_norm` - Pre-computed norm of query vector
-    ///
-    /// ### Safety
-    ///
-    /// Uses unsafe to retrieve the data in an unchecked manner for maximum
-    /// performance.
-    ///
-    /// ### Returns
-    ///
-    /// The Cosine distance
-    #[inline(always)]
-    fn cosine_distance_to_query_dual_bf16(
-        &self,
-        internal_idx: usize,
-        query: &[bf16],
-        query_norm: bf16,
-    ) -> T {
-        let start = internal_idx * self.dim();
-
-        unsafe {
-            let vec = &self.vectors_flat().get_unchecked(start..start + self.dim());
-
-            let dot = vec
-                .iter()
-                .zip(query.iter())
-                .map(|(&a, &b)| a.to_f32() * b.to_f32())
-                .fold(0.0, |acc, x| acc + x);
-
-            let dist =
-                1.0 - (dot / (query_norm.to_f32() * self.norms()[internal_idx].to_f32().unwrap()));
-
-            T::from_f32(dist).unwrap()
+        if query_norm > T::zero() && db_norm > T::zero() {
+            T::one() - T::from_i32(dot).unwrap() / (query_norm * db_norm)
+        } else {
+            T::one()
         }
     }
 }

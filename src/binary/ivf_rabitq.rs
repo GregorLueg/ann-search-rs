@@ -86,7 +86,7 @@ where
 
 impl<T> IvfIndexRaBitQ<T>
 where
-    T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum + ComplexField,
+    T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum + ComplexField + SimdDistance,
 {
     /// Build IVF-RaBitQ index
     ///

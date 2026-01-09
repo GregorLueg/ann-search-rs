@@ -613,7 +613,7 @@ impl HnswState<f64> for HnswIndex<f64> {
 /// * `keep_pruned` - Whether to keep pruned candidates
 pub struct HnswIndex<T>
 where
-    T: Float + FromPrimitive + Send + Sync + Sum,
+    T: Float + FromPrimitive + Send + Sync + Sum + SimdDistance,
 {
     // Vector data
     pub vectors_flat: Vec<T>,
@@ -635,7 +635,7 @@ where
 
 impl<T> VectorDistance<T> for HnswIndex<T>
 where
-    T: Float + FromPrimitive + Send + Sync + Sum,
+    T: Float + FromPrimitive + Send + Sync + Sum + SimdDistance,
 {
     fn vectors_flat(&self) -> &[T] {
         &self.vectors_flat
@@ -652,7 +652,7 @@ where
 
 impl<T> HnswIndex<T>
 where
-    T: Float + FromPrimitive + Send + Sync + Sum,
+    T: Float + FromPrimitive + Send + Sync + Sum + SimdDistance,
     Self: HnswState<T>,
 {
     /// Compute the offset in neighbours_flat for a specific node and layer
@@ -1505,7 +1505,7 @@ where
 
 impl<T> KnnValidation<T> for HnswIndex<T>
 where
-    T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum,
+    T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum + SimdDistance,
     Self: HnswState<T>,
 {
     fn query_for_validation(&self, query_vec: &[T], k: usize) -> (Vec<usize>, Vec<T>) {

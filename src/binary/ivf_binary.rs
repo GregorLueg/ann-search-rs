@@ -92,7 +92,7 @@ where
 
 impl<T> IvfIndexBinary<T>
 where
-    T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum + ComplexField,
+    T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum + ComplexField + SimdDistance,
 {
     /// Build an IVF index with binary quantisation
     ///
