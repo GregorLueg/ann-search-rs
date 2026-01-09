@@ -62,7 +62,7 @@ run_quantised_benchmarks() {
 
 run_gpu_benchmarks() {
     echo "=== Running GPU benchmarks ==="
-    run_common_patterns "cargo run --example gridsearch_gpu --release --features gpu --" "GPU"
+    run_common_patterns "cargo run --example gridsearch_gpu --release --features gpu" "GPU"
     
     echo "Running GPU benchmarks (larger data sets)..."
     for n_cells in 250000 500000; do
