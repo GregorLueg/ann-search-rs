@@ -11,7 +11,7 @@ run_benchmark() {
 run_quantised() {
     local variant=$1
     shift
-    cargo run --example "gridsearch_${variant}" --release --features quantised -- "$@"
+    cargo run --example "gridsearch_${variant}" --release --features quantised "$@"
 }
 
 run_common_patterns() {
@@ -41,21 +41,21 @@ run_quantised_benchmarks() {
     #     run_common_patterns run_quantised "${variant}" "${variant}"
     # done
 
-    # # Higher dimensions for SQ8
-    # for dim in 96 128; do
-    #     echo "Running SQ8 benchmarks (dim=${dim})..."
-    #     run_quantised sq8 --distance euclidean --dim ${dim}
-    #     run_quantised sq8 --distance euclidean --dim ${dim} --data correlated
-    #     run_quantised sq8 --distance euclidean --dim ${dim} --data lowrank
-    # done
+    # Higher dimensions for SQ8
+    for dim in 96 128; do
+        echo "Running SQ8 benchmarks (dim=${dim})..."
+        run_quantised sq8 -- --distance euclidean --dim ${dim}
+        run_quantised sq8 -- --distance euclidean --dim ${dim} --data correlated
+        run_quantised sq8 -- --distance euclidean --dim ${dim} --data lowrank
+    done
     
     # IVF-PQ and IVF-OPQ
     for variant in ivf_pq ivf_opq; do
         for dim in 128 192; do
             echo "Running ${variant} benchmarks (dim=${dim})..."
-            run_quantised ${variant} --distance euclidean --dim ${dim}
-            run_quantised ${variant} --distance euclidean --dim ${dim} --data correlated
-            run_quantised ${variant} --distance euclidean --dim ${dim} --data lowrank
+            run_quantised ${variant} -- --distance euclidean --dim ${dim}
+            run_quantised ${variant} -- --distance euclidean --dim ${dim} --data correlated
+            run_quantised ${variant} -- --distance euclidean --dim ${dim} --data lowrank
         done
     done
 }
