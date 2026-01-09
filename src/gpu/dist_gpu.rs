@@ -240,115 +240,163 @@ pub fn init_topk<F: Float>(dists: &mut Tensor<F>, indices: &mut Tensor<u32>) {
     indices[offset] = 0u32;
 }
 
-/////////////////////////////////////////
-// Offset-based kernels for IVF index  //
-/////////////////////////////////////////
+//////////////////////////////////
+// Fire-and-Forget IVF Kernels  //
+//////////////////////////////////
 
-/// Compute squared Euclidean distances with DB offset
+/// Compute Euclidean distances and write to a global candidate buffer
 ///
-/// For IVF: DB tensor contains all vectors reorganised by cluster.
-/// Offset and count define the cluster slice to process.
+/// Designed for the "Fire and Forget" IVF optimization. Instead of returning
+/// a small tensor for just this cluster, this kernel writes the computed
+/// distances into a pre-allocated, global "candidate buffer" at specific
+/// offsets.
 ///
 /// ### Params
 ///
-/// * `query_vectors` - Query vectors [n_queries, dim / LINE_SIZE] as Line<F>
-/// * `db_vectors` - All DB vectors [n_total, dim / LINE_SIZE] as Line<F>
-/// * `distances` - Output matrix [n_queries, db_count] of squared distances
-/// * `db_offset` - Start index in db_vectors (cluster_offsets[cluster_idx])
-/// * `db_count` - Number of vectors in this cluster
+/// * `query_vectors` - Global tensor of all query vectors.
+///   Shape: `[n_queries, dim/LINE_SIZE]`
+/// * `db_vectors` - Global tensor of all DB vectors (reordered by cluster).
+///   Shape: `[n_total_db, dim/LINE_SIZE]`
+/// * `active_indices` - Map from local batch index to global query index.
+///   Shape: `[n_active_queries]`
+/// * `write_offsets` - Starting column index in the output buffer for this cluster's results.
+///   Shape: `[n_active_queries]`
+/// * `out_dists` - The massive global candidate buffer for distances.
+///   Shape: `[n_queries, total_candidates]`
+/// * `out_indices` - The massive global candidate buffer for DB indices.
+///   Shape: `[n_queries, total_candidates]`
+/// * `db_start` - The starting index of the current cluster in `db_vectors`.
+/// * `db_count` - The number of vectors in the current cluster.
 ///
-/// ### Grid mapping
+/// ### Grid Mapping
 ///
-/// * `ABSOLUTE_POS_X` → local database vector index (0..db_count)
-/// * `ABSOLUTE_POS_Y` → query vector index
+/// * `ABSOLUTE_POS_X` → Index of the vector within the current cluster (0..db_count)
+/// * `ABSOLUTE_POS_Y` → Index within the list of active queries (0..n_active)
 #[cube(launch_unchecked)]
-pub fn euclidean_distances_gpu_offset<F: Float>(
+pub fn compute_candidates_euclidean<F: Float>(
     query_vectors: &Tensor<Line<F>>,
     db_vectors: &Tensor<Line<F>>,
-    distances: &mut Tensor<F>,
-    db_offset: u32,
+    active_indices: &Tensor<u32>,
+    write_offsets: &Tensor<u32>,
+    out_dists: &mut Tensor<F>,
+    out_indices: &mut Tensor<u32>,
+    db_start: u32,
     db_count: u32,
 ) {
-    let query_idx = ABSOLUTE_POS_Y;
     let local_db_idx = ABSOLUTE_POS_X;
+    let active_q_idx = ABSOLUTE_POS_Y;
 
-    if query_idx < query_vectors.shape(0) && local_db_idx < db_count {
-        let db_idx = db_offset + local_db_idx;
-        let dim_lines = query_vectors.shape(1);
-
-        let mut sum = F::new(0.0);
-
-        for i in 0..dim_lines {
-            let q_line = query_vectors[query_idx * query_vectors.stride(0) + i];
-            let d_line = db_vectors[db_idx * db_vectors.stride(0) + i];
-            let diff = q_line - d_line;
-            let sq = diff * diff;
-
-            sum += sq[0];
-            sum += sq[1];
-            sum += sq[2];
-            sum += sq[3];
-        }
-
-        distances[query_idx * distances.stride(0) + local_db_idx] = sum;
+    if active_q_idx >= active_indices.len() || local_db_idx >= db_count {
+        terminate!();
     }
+
+    let real_q_idx = active_indices[active_q_idx];
+    let write_pos = write_offsets[active_q_idx] + local_db_idx;
+    let db_idx = db_start + local_db_idx;
+
+    let dim_lines = query_vectors.shape(1);
+    let mut sum = F::new(0.0);
+
+    let q_offset = real_q_idx * query_vectors.stride(0);
+    let d_offset = db_idx * db_vectors.stride(0);
+
+    for i in 0..dim_lines {
+        let q_line = query_vectors[q_offset + i];
+        let d_line = db_vectors[d_offset + i];
+        let diff = q_line - d_line;
+        let sq = diff * diff;
+
+        sum += sq[0];
+        sum += sq[1];
+        sum += sq[2];
+        sum += sq[3];
+    }
+
+    let out_offset = real_q_idx * out_dists.stride(0) + write_pos;
+
+    out_dists[out_offset] = sum;
+    out_indices[out_offset] = db_idx;
 }
 
-/// Compute cosine distances with DB offset
+/// Compute Cosine distances and write to a global candidate buffer
 ///
-/// For IVF: DB tensor and norms contain all vectors reorganised by cluster.
-/// Offset and count define the cluster slice to process.
+/// Similar to `compute_candidates_euclidean`, but computes the Cosine distance
+/// (1.0 - Cosine Similarity). Requires pre-computed norms for both query and
+/// database vectors.
 ///
 /// ### Params
 ///
-/// * `query_vectors` - Query vectors [n_queries, dim / LINE_SIZE] as Line<F>
-/// * `db_vectors` - All DB vectors [n_total, dim / LINE_SIZE] as Line<F>
-/// * `query_norms` - Pre-computed L2 norms [n_queries]
-/// * `db_norms` - All DB norms [n_total]
-/// * `distances` - Output matrix [n_queries, db_count] of cosine distances
-/// * `db_offset` - Start index in db_vectors
-/// * `db_count` - Number of vectors in this cluster
+/// * `query_vectors` - Global tensor of all query vectors.
+///   Shape: `[n_queries, dim/LINE_SIZE]`
+/// * `db_vectors` - Global tensor of all DB vectors.
+///   Shape: `[n_total_db, dim/LINE_SIZE]`
+/// * `query_norms` - Pre-computed L2 norms for queries.
+///   Shape: `[n_queries]`
+/// * `db_norms` - Pre-computed L2 norms for DB vectors.
+///   Shape: `[n_total_db]`
+/// * `active_indices` - Map from local batch index to global query index.
+///   Shape: `[n_active_queries]`
+/// * `write_offsets` - Starting column index in the output buffer.
+///   Shape: `[n_active_queries]`
+/// * `out_dists` - Global candidate buffer for distances.
+///   Shape: `[n_queries, total_candidates]`
+/// * `out_indices` - Global candidate buffer for DB indices.
+///   Shape: `[n_queries, total_candidates]`
+/// * `db_start` - The starting index of the current cluster in `db_vectors`.
+/// * `db_count` - The number of vectors in the current cluster.
 ///
-/// ### Grid mapping
+/// ### Grid Mapping
 ///
-/// * `ABSOLUTE_POS_X` → local database vector index (0..db_count)
-/// * `ABSOLUTE_POS_Y` → query vector index
+/// * `ABSOLUTE_POS_X` → Index of the vector within the current cluster (0..db_count)
+/// * `ABSOLUTE_POS_Y` → Index within the list of active queries (0..n_active)
 #[cube(launch_unchecked)]
-pub fn cosine_distances_gpu_offset<F: Float>(
+pub fn compute_candidates_cosine<F: Float>(
     query_vectors: &Tensor<Line<F>>,
     db_vectors: &Tensor<Line<F>>,
     query_norms: &Tensor<F>,
     db_norms: &Tensor<F>,
-    distances: &mut Tensor<F>,
-    db_offset: u32,
+    active_indices: &Tensor<u32>,
+    write_offsets: &Tensor<u32>,
+    out_dists: &mut Tensor<F>,
+    out_indices: &mut Tensor<u32>,
+    db_start: u32,
     db_count: u32,
 ) {
-    let query_idx = ABSOLUTE_POS_Y;
     let local_db_idx = ABSOLUTE_POS_X;
+    let active_q_idx = ABSOLUTE_POS_Y;
 
-    if query_idx < query_vectors.shape(0) && local_db_idx < db_count {
-        let db_idx = db_offset + local_db_idx;
-        let dim_lines = query_vectors.shape(1);
-
-        let mut dot = F::new(0.0);
-
-        for i in 0..dim_lines {
-            let q_line = query_vectors[query_idx * query_vectors.stride(0) + i];
-            let d_line = db_vectors[db_idx * db_vectors.stride(0) + i];
-            let prod = q_line * d_line;
-
-            dot += prod[0];
-            dot += prod[1];
-            dot += prod[2];
-            dot += prod[3];
-        }
-
-        let q_norm = query_norms[query_idx];
-        let d_norm = db_norms[db_offset + local_db_idx];
-
-        distances[query_idx * distances.stride(0) + local_db_idx] =
-            F::new(1.0) - (dot / (q_norm * d_norm));
+    if active_q_idx >= active_indices.len() || local_db_idx >= db_count {
+        terminate!();
     }
+
+    let real_q_idx = active_indices[active_q_idx];
+    let write_pos = write_offsets[active_q_idx] + local_db_idx;
+    let db_idx = db_start + local_db_idx;
+
+    let dim_lines = query_vectors.shape(1);
+    let mut dot = F::new(0.0);
+
+    let q_offset = real_q_idx * query_vectors.stride(0);
+    let d_offset = db_idx * db_vectors.stride(0);
+
+    for i in 0..dim_lines {
+        let q_line = query_vectors[q_offset + i];
+        let d_line = db_vectors[d_offset + i];
+        let prod = q_line * d_line;
+
+        dot += prod[0];
+        dot += prod[1];
+        dot += prod[2];
+        dot += prod[3];
+    }
+
+    let q_norm = query_norms[real_q_idx];
+    let d_norm = db_norms[db_idx];
+
+    let out_offset = real_q_idx * out_dists.stride(0) + write_pos;
+
+    out_dists[out_offset] = F::new(1.0) - (dot / (q_norm * d_norm));
+    out_indices[out_offset] = db_idx;
 }
 
 ////////////////////
