@@ -10,6 +10,7 @@ use crate::gpu::dist_gpu::*;
 use crate::gpu::tensor::*;
 use crate::gpu::*;
 use crate::utils::dist::Dist;
+use crate::utils::dist::*;
 use crate::utils::heap_structs::*;
 use crate::utils::ivf_utils::*;
 use crate::utils::*;
@@ -67,7 +68,14 @@ pub struct IvfIndexGpu<T: Float + cubecl::frontend::Float + cubecl::CubeElement,
 impl<T, R> IvfIndexGpu<T, R>
 where
     R: Runtime,
-    T: Float + Sum + cubecl::frontend::Float + cubecl::CubeElement + FromPrimitive + Send + Sync,
+    T: Float
+        + Sum
+        + cubecl::frontend::Float
+        + cubecl::CubeElement
+        + FromPrimitive
+        + Send
+        + Sync
+        + SimdDistance,
 {
     /// Build a batched IVF index
     ///

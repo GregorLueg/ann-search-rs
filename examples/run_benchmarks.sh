@@ -20,10 +20,10 @@ run_common_patterns() {
     shift 2
     
     echo "Running ${name} benchmarks..."
-    $run_fn "$@" --distance euclidean
-    $run_fn "$@" --distance cosine
-    $run_fn "$@" --distance euclidean --data correlated
-    $run_fn "$@" --distance euclidean --data lowrank
+    $run_fn "$@" -- --distance euclidean
+    $run_fn "$@" -- --distance cosine
+    $run_fn "$@" -- --distance euclidean --data correlated
+    $run_fn "$@" -- --distance euclidean --data lowrank
 }
 
 run_standard() {

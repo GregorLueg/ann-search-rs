@@ -55,7 +55,7 @@ impl<T> VectorDistanceBinary for ExhaustiveIndexBinary<T> {
 
 impl<T> ExhaustiveIndexBinary<T>
 where
-    T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum + ComplexField,
+    T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum + ComplexField + SimdDistance,
 {
     /// Generate a new exhaustive binary index
     ///

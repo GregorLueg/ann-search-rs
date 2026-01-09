@@ -258,7 +258,7 @@ pub struct NNDescent<T> {
 // Implementation of the vector distance trait for NNDescent
 impl<T> VectorDistance<T> for NNDescent<T>
 where
-    T: Float + FromPrimitive + Send + Sync + Sum,
+    T: Float + FromPrimitive + Send + Sync + Sum + SimdDistance,
 {
     fn vectors_flat(&self) -> &[T] {
         &self.vectors_flat
@@ -275,7 +275,7 @@ where
 
 impl<T> NNDescent<T>
 where
-    T: Float + FromPrimitive + Send + Sync + Sum,
+    T: Float + FromPrimitive + Send + Sync + Sum + SimdDistance,
     Self: ApplySortedUpdates<T>,
     Self: NNDescentQuery<T>,
 {
@@ -1785,7 +1785,7 @@ impl NNDescentQuery<f64> for NNDescent<f64> {
 
 impl<T> KnnValidation<T> for NNDescent<T>
 where
-    T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum,
+    T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum + SimdDistance,
     Self: ApplySortedUpdates<T>,
     Self: NNDescentQuery<T>,
 {

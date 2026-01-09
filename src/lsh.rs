@@ -56,7 +56,7 @@ pub struct LSHIndex<T> {
 /// VectorDistance trait
 impl<T> VectorDistance<T> for LSHIndex<T>
 where
-    T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum,
+    T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum + SimdDistance,
 {
     fn vectors_flat(&self) -> &[T] {
         &self.vectors_flat
@@ -73,7 +73,7 @@ where
 
 impl<T> LSHIndex<T>
 where
-    T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum,
+    T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum + SimdDistance,
     Self: LSHQuery<T>,
 {
     //////////////////////
@@ -751,7 +751,7 @@ impl LSHQuery<f64> for LSHIndex<f64> {
 
 impl<T> KnnValidation<T> for LSHIndex<T>
 where
-    T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum,
+    T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum + SimdDistance,
     Self: LSHQuery<T>,
 {
     fn query_for_validation(&self, query_vec: &[T], k: usize) -> (Vec<usize>, Vec<T>) {

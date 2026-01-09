@@ -50,7 +50,7 @@ where
 
 pub trait KnnValidation<T>: VectorDistance<T>
 where
-    T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum,
+    T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum + SimdDistance,
 {
     /// Query for validation purposes
     ///

@@ -54,7 +54,7 @@ pub struct IvfIndexBf16<T> {
 
 impl<T> VectorDistanceBf16<T> for IvfIndexBf16<T>
 where
-    T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum,
+    T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum + SimdDistance + Bf16Compatible,
 {
     fn vectors_flat(&self) -> &[bf16] {
         &self.vectors_flat
@@ -75,7 +75,7 @@ where
 
 impl<T> CentroidDistance<T> for IvfIndexBf16<T>
 where
-    T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum,
+    T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum + SimdDistance,
 {
     fn centroids(&self) -> &[T] {
         &self.centroids
@@ -104,7 +104,7 @@ where
 
 impl<T> IvfIndexBf16<T>
 where
-    T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum,
+    T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum + SimdDistance + Bf16Compatible,
 {
     //////////////////////
     // Index generation //
