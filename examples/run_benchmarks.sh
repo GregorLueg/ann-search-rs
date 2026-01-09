@@ -79,7 +79,7 @@ run_binary_benchmarks() {
     
     # for variant in binary rabitq; do
     for variant in binary rabitq; do
-        run_common_patterns "cargo run --example gridsearch_${variant} --release --features binary --" "$(echo ${variant} | tr '[:lower:]' '[:upper:]')"
+        run_common_patterns "cargo run --example gridsearch_${variant} --release --features binary" "$(echo ${variant} | tr '[:lower:]' '[:upper:]')"
     done
 
     echo "Running binary benchmarks (more dimensions)..."

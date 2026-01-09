@@ -3,6 +3,7 @@
 use num_traits::{Float, FromPrimitive};
 
 use crate::binary::rabitq::*;
+#[allow(unused_imports)]
 use crate::utils::dist::*;
 
 #[cfg(target_arch = "aarch64")]
@@ -18,7 +19,16 @@ use std::arch::x86_64::*;
 // SIMD //
 //////////
 
-// AVX-512
+/// Hamming distance for AVX-512
+///
+/// ### Params
+///
+/// * `a` - Slice of u8 to use
+/// * `b` - Slice of u8 to use
+///
+/// ### Returns
+///
+/// The Hamming distance between the two slices
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx512f", enable = "avx512bw", enable = "popcnt")]
 unsafe fn hamming_avx512(a: &[u8], b: &[u8]) -> u32 {
@@ -45,7 +55,16 @@ unsafe fn hamming_avx512(a: &[u8], b: &[u8]) -> u32 {
     count as u32
 }
 
-// AVX2
+/// Hamming distance for AVX-2
+///
+/// ### Params
+///
+/// * `a` - Slice of u8 to use
+/// * `b` - Slice of u8 to use
+///
+/// ### Returns
+///
+/// The Hamming distance between the two slices
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2", enable = "popcnt")]
 unsafe fn hamming_avx2(a: &[u8], b: &[u8]) -> u32 {
@@ -72,7 +91,16 @@ unsafe fn hamming_avx2(a: &[u8], b: &[u8]) -> u32 {
     count as u32
 }
 
-// SSE2
+/// Hamming distance for SSE2
+///
+/// ### Params
+///
+/// * `a` - Slice of u8 to use
+/// * `b` - Slice of u8 to use
+///
+/// ### Returns
+///
+/// The Hamming distance between the two slices
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "sse2")]
 unsafe fn hamming_sse2(a: &[u8], b: &[u8]) -> u32 {
@@ -99,7 +127,16 @@ unsafe fn hamming_sse2(a: &[u8], b: &[u8]) -> u32 {
     count as u32
 }
 
-// NEON
+/// Hamming distance for NEON
+///
+/// ### Params
+///
+/// * `a` - Slice of u8 to use
+/// * `b` - Slice of u8 to use
+///
+/// ### Returns
+///
+/// The Hamming distance between the two slices
 #[cfg(target_arch = "aarch64")]
 #[target_feature(enable = "neon")]
 unsafe fn hamming_neon(a: &[u8], b: &[u8]) -> u32 {
@@ -128,7 +165,16 @@ unsafe fn hamming_neon(a: &[u8], b: &[u8]) -> u32 {
     count
 }
 
-// Scalar fallback
+/// Hamming distance - scalar fall back
+///
+/// ### Params
+///
+/// * `a` - Slice of u8 to use
+/// * `b` - Slice of u8 to use
+///
+/// ### Returns
+///
+/// The Hamming distance between the two slices
 #[inline(always)]
 unsafe fn hamming_scalar(a: &[u8], b: &[u8]) -> u32 {
     a.iter()
@@ -137,6 +183,16 @@ unsafe fn hamming_scalar(a: &[u8], b: &[u8]) -> u32 {
         .sum()
 }
 
+/// Hamming distance - SIMD dispatcher
+///
+/// ### Params
+///
+/// * `a` - Slice of u8 to use
+/// * `b` - Slice of u8 to use
+///
+/// ### Returns
+///
+/// The Hamming distance between the two slices
 unsafe fn hamming_simd(a: &[u8], b: &[u8]) -> u32 {
     #[cfg(target_arch = "x86_64")]
     {
