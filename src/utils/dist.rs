@@ -1179,7 +1179,7 @@ fn compute_norm_f64_sse(vec: &[f64]) -> f64 {
     if len % 2 == 1 {
         sum += vec[len - 1] * vec[len - 1];
     }
-    sum
+    sum.sqrt()
 }
 
 /// Norm - f64, AVX2
@@ -3820,6 +3820,21 @@ mod tests {
         // Same vector: cosine similarity = 1, distance = 0
         let dist_00 = vecs.cosine_distance(0, 0);
         assert_relative_eq!(dist_00, 0.0, epsilon = 1e-6);
+    }
+
+    #[test]
+    fn test_cosine_norm() {
+        let data_1 = vec![1.5, 2.5, 2.0];
+        let data_2 = vec![2.5, 0.5, 1.0];
+        let data_3 = vec![1.0, 0.0, 1.0];
+
+        let norm_1 = &data_1.iter().map(|x| *x * *x).sum::<f64>().sqrt();
+        let norm_2 = &data_2.iter().map(|x| *x * *x).sum::<f64>().sqrt();
+        let norm_3 = &data_3.iter().map(|x| *x * *x).sum::<f64>().sqrt();
+
+        assert_relative_eq!(*norm_1, compute_norm(&data_1), epsilon = 1e-5);
+        assert_relative_eq!(*norm_2, compute_norm(&data_2), epsilon = 1e-5);
+        assert_relative_eq!(*norm_3, compute_norm(&data_3), epsilon = 1e-5);
     }
 
     #[test]
