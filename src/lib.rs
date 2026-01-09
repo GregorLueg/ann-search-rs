@@ -1612,6 +1612,7 @@ pub fn query_ivf_index_gpu_self<T, R>(
     k: usize,
     nprobe: Option<usize>,
     nquery: Option<usize>,
+    cluster_pairs: bool,
     return_dist: bool,
     verbose: bool,
 ) -> (Vec<Vec<usize>>, Option<Vec<Vec<T>>>)
@@ -1626,7 +1627,11 @@ where
         + Sync
         + SimdDistance,
 {
-    index.generate_knn(k, nprobe, nquery, return_dist, verbose)
+    if cluster_pairs {
+        index.generate_knn_cluster_pairs(k, nprobe, return_dist, verbose)
+    } else {
+        index.generate_knn(k, nprobe, nquery, return_dist, verbose)
+    }
 }
 
 ////////////

@@ -240,6 +240,203 @@ pub fn init_topk<F: Float>(dists: &mut Tensor<F>, indices: &mut Tensor<u32>) {
     indices[offset] = 0u32;
 }
 
+/////////////////////////////////////////
+// Offset-based kernels for IVF index  //
+/////////////////////////////////////////
+
+/// Compute squared Euclidean distances with DB offset
+///
+/// For IVF: DB tensor contains all vectors reorganised by cluster.
+/// Offset and count define the cluster slice to process.
+///
+/// ### Params
+///
+/// * `query_vectors` - Query vectors [n_queries, dim / LINE_SIZE] as Line<F>
+/// * `db_vectors` - All DB vectors [n_total, dim / LINE_SIZE] as Line<F>
+/// * `distances` - Output matrix [n_queries, db_count] of squared distances
+/// * `db_offset` - Start index in db_vectors (cluster_offsets[cluster_idx])
+/// * `db_count` - Number of vectors in this cluster
+///
+/// ### Grid mapping
+///
+/// * `ABSOLUTE_POS_X` → local database vector index (0..db_count)
+/// * `ABSOLUTE_POS_Y` → query vector index
+#[cube(launch_unchecked)]
+pub fn euclidean_distances_gpu_offset<F: Float>(
+    query_vectors: &Tensor<Line<F>>,
+    db_vectors: &Tensor<Line<F>>,
+    distances: &mut Tensor<F>,
+    db_offset: u32,
+    db_count: u32,
+) {
+    let query_idx = ABSOLUTE_POS_Y;
+    let local_db_idx = ABSOLUTE_POS_X;
+
+    if query_idx < query_vectors.shape(0) && local_db_idx < db_count {
+        let db_idx = db_offset + local_db_idx;
+        let dim_lines = query_vectors.shape(1);
+
+        let mut sum = F::new(0.0);
+
+        for i in 0..dim_lines {
+            let q_line = query_vectors[query_idx * query_vectors.stride(0) + i];
+            let d_line = db_vectors[db_idx * db_vectors.stride(0) + i];
+            let diff = q_line - d_line;
+            let sq = diff * diff;
+
+            sum += sq[0];
+            sum += sq[1];
+            sum += sq[2];
+            sum += sq[3];
+        }
+
+        distances[query_idx * distances.stride(0) + local_db_idx] = sum;
+    }
+}
+
+/// Compute cosine distances with DB offset
+///
+/// For IVF: DB tensor and norms contain all vectors reorganised by cluster.
+/// Offset and count define the cluster slice to process.
+///
+/// ### Params
+///
+/// * `query_vectors` - Query vectors [n_queries, dim / LINE_SIZE] as Line<F>
+/// * `db_vectors` - All DB vectors [n_total, dim / LINE_SIZE] as Line<F>
+/// * `query_norms` - Pre-computed L2 norms [n_queries]
+/// * `db_norms` - All DB norms [n_total]
+/// * `distances` - Output matrix [n_queries, db_count] of cosine distances
+/// * `db_offset` - Start index in db_vectors
+/// * `db_count` - Number of vectors in this cluster
+///
+/// ### Grid mapping
+///
+/// * `ABSOLUTE_POS_X` → local database vector index (0..db_count)
+/// * `ABSOLUTE_POS_Y` → query vector index
+#[cube(launch_unchecked)]
+pub fn cosine_distances_gpu_offset<F: Float>(
+    query_vectors: &Tensor<Line<F>>,
+    db_vectors: &Tensor<Line<F>>,
+    query_norms: &Tensor<F>,
+    db_norms: &Tensor<F>,
+    distances: &mut Tensor<F>,
+    db_offset: u32,
+    db_count: u32,
+) {
+    let query_idx = ABSOLUTE_POS_Y;
+    let local_db_idx = ABSOLUTE_POS_X;
+
+    if query_idx < query_vectors.shape(0) && local_db_idx < db_count {
+        let db_idx = db_offset + local_db_idx;
+        let dim_lines = query_vectors.shape(1);
+
+        let mut dot = F::new(0.0);
+
+        for i in 0..dim_lines {
+            let q_line = query_vectors[query_idx * query_vectors.stride(0) + i];
+            let d_line = db_vectors[db_idx * db_vectors.stride(0) + i];
+            let prod = q_line * d_line;
+
+            dot += prod[0];
+            dot += prod[1];
+            dot += prod[2];
+            dot += prod[3];
+        }
+
+        let q_norm = query_norms[query_idx];
+        let d_norm = db_norms[db_offset + local_db_idx];
+
+        distances[query_idx * distances.stride(0) + local_db_idx] =
+            F::new(1.0) - (dot / (q_norm * d_norm));
+    }
+}
+
+/// Compute squared Euclidean distances between two cluster regions
+///
+/// For cluster-pair self-kNN: computes distances between all vectors
+/// in cluster_i (rows) and all vectors in cluster_j (columns).
+///
+/// ### Params
+///
+/// * `vectors` - All vectors [n_total, dim / LINE_SIZE]
+/// * `distances` - Output [size_i, size_j]
+/// * `offset_i`, `size_i` - Row cluster region
+/// * `offset_j`, `size_j` - Column cluster region
+#[cube(launch_unchecked)]
+pub fn euclidean_distances_gpu_offset_pair<F: Float>(
+    vectors: &Tensor<Line<F>>,
+    distances: &mut Tensor<F>,
+    offset_i: u32,
+    size_i: u32,
+    offset_j: u32,
+    size_j: u32,
+) {
+    let local_i = ABSOLUTE_POS_Y;
+    let local_j = ABSOLUTE_POS_X;
+
+    if local_i < size_i && local_j < size_j {
+        let global_i = offset_i + local_i;
+        let global_j = offset_j + local_j;
+        let dim_lines = vectors.shape(1);
+
+        let mut sum = F::new(0.0);
+
+        for d in 0..dim_lines {
+            let v_i = vectors[global_i * vectors.stride(0) + d];
+            let v_j = vectors[global_j * vectors.stride(0) + d];
+            let diff = v_i - v_j;
+            let sq = diff * diff;
+
+            sum += sq[0];
+            sum += sq[1];
+            sum += sq[2];
+            sum += sq[3];
+        }
+
+        distances[local_i * distances.stride(0) + local_j] = sum;
+    }
+}
+
+/// Compute cosine distances between two cluster regions
+#[cube(launch_unchecked)]
+pub fn cosine_distances_gpu_offset_pair<F: Float>(
+    vectors: &Tensor<Line<F>>,
+    norms: &Tensor<F>,
+    distances: &mut Tensor<F>,
+    offset_i: u32,
+    size_i: u32,
+    offset_j: u32,
+    size_j: u32,
+) {
+    let local_i = ABSOLUTE_POS_Y;
+    let local_j = ABSOLUTE_POS_X;
+
+    if local_i < size_i && local_j < size_j {
+        let global_i = offset_i + local_i;
+        let global_j = offset_j + local_j;
+        let dim_lines = vectors.shape(1);
+
+        let mut dot = F::new(0.0);
+
+        for d in 0..dim_lines {
+            let v_i = vectors[global_i * vectors.stride(0) + d];
+            let v_j = vectors[global_j * vectors.stride(0) + d];
+            let prod = v_i * v_j;
+
+            dot += prod[0];
+            dot += prod[1];
+            dot += prod[2];
+            dot += prod[3];
+        }
+
+        let norm_i = norms[global_i];
+        let norm_j = norms[global_j];
+
+        distances[local_i * distances.stride(0) + local_j] =
+            F::new(1.0) - (dot / (norm_i * norm_j));
+    }
+}
+
 ////////////////////
 // Main functions //
 ////////////////////

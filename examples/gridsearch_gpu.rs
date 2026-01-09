@@ -206,8 +206,15 @@ fn main() {
         let nprobe_self = (nlist as f32 * 2.0).sqrt() as usize;
 
         let start = Instant::now();
-        let (knn_neighbors_self, knn_distances_self) =
-            query_ivf_index_gpu_self(&ivf_gpu_idx, cli.k, Some(nprobe_self), None, true, false);
+        let (knn_neighbors_self, knn_distances_self) = query_ivf_index_gpu_self(
+            &ivf_gpu_idx,
+            cli.k,
+            Some(nprobe_self),
+            None,
+            false,
+            true,
+            false,
+        );
         let self_query_time = start.elapsed().as_secs_f64() * 1000.0;
 
         let recall_self = calculate_recall(&true_neighbors_self, &knn_neighbors_self, cli.k);
