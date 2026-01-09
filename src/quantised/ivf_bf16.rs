@@ -75,7 +75,7 @@ where
 
 impl<T> CentroidDistance<T> for IvfIndexBf16<T>
 where
-    T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum,
+    T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum + SimdDistance,
 {
     fn centroids(&self) -> &[T] {
         &self.centroids

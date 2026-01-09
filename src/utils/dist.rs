@@ -128,6 +128,18 @@ pub trait SimdDistance: Sized + Copy {
     ///
     /// Dot product
     fn dot_simd(a: &[Self], b: &[Self]) -> Self;
+
+    /// Subtracts one vector from the other
+    ///
+    /// ### Params
+    ///
+    /// * `a` - Slice of vector a
+    /// * `b` - Slice of vector b
+    ///
+    /// ### Returns
+    ///
+    /// Subtracted vector
+    fn subtract_simd(a: &[Self], b: &[Self]) -> Vec<Self>;
 }
 
 ///////////////////
@@ -680,6 +692,304 @@ fn dot_f64_avx512(a: &[f64], b: &[f64]) -> f64 {
     dot_f64_avx2(a, b)
 }
 
+///////////////////
+// f32 Subtract  //
+///////////////////
+
+/// Vector subtraction - f32, scalar
+///
+/// ### Params
+///
+/// * `a` - Slice of vector a
+/// * `b` - Slice of vector b
+///
+/// ### Returns
+///
+/// `Vec<a - b>`
+#[inline(always)]
+fn subtract_f32_scalar(a: &[f32], b: &[f32]) -> Vec<f32> {
+    a.iter().zip(b.iter()).map(|(&x, &y)| x - y).collect()
+}
+
+/// Vector subtraction - f32, optimised for 128 bits
+///
+/// ### Params
+///
+/// * `a` - Slice of vector a
+/// * `b` - Slice of vector b
+///
+/// ### Returns
+///
+/// `Vec<a - b>`
+#[inline(always)]
+fn subtract_f32_sse(a: &[f32], b: &[f32]) -> Vec<f32> {
+    let len = a.len();
+    let chunks = len / 4;
+    let mut result = Vec::with_capacity(len);
+
+    unsafe {
+        let a_ptr = a.as_ptr();
+        let b_ptr = b.as_ptr();
+        let result_ptr: *mut f32 = result.as_mut_ptr();
+
+        for i in 0..chunks {
+            let offset = i * 4;
+            let va = f32x4::from(*(a_ptr.add(offset) as *const [f32; 4]));
+            let vb = f32x4::from(*(b_ptr.add(offset) as *const [f32; 4]));
+            let diff = va - vb;
+            *(result_ptr.add(offset) as *mut [f32; 4]) = diff.into();
+        }
+
+        for i in (chunks * 4)..len {
+            *result_ptr.add(i) = a[i] - b[i];
+        }
+
+        result.set_len(len);
+    }
+    result
+}
+
+/// Vector subtraction - f32, optimised for 256 bits
+///
+/// ### Params
+///
+/// * `a` - Slice of vector a
+/// * `b` - Slice of vector b
+///
+/// ### Returns
+///
+/// `Vec<a - b>`
+#[inline(always)]
+fn subtract_f32_avx2(a: &[f32], b: &[f32]) -> Vec<f32> {
+    let len = a.len();
+    let chunks = len / 8;
+    let mut result = Vec::with_capacity(len);
+
+    unsafe {
+        let a_ptr = a.as_ptr();
+        let b_ptr = b.as_ptr();
+        let result_ptr: *mut f32 = result.as_mut_ptr();
+
+        for i in 0..chunks {
+            let offset = i * 8;
+            let va = f32x8::from(*(a_ptr.add(offset) as *const [f32; 8]));
+            let vb = f32x8::from(*(b_ptr.add(offset) as *const [f32; 8]));
+            let diff = va - vb;
+            *(result_ptr.add(offset) as *mut [f32; 8]) = diff.into();
+        }
+
+        for i in (chunks * 8)..len {
+            *result_ptr.add(i) = a[i] - b[i];
+        }
+
+        result.set_len(len);
+    }
+    result
+}
+
+/// Vector subtraction - f32, optimised for 512 bits
+///
+/// ### Params
+///
+/// * `a` - Slice of vector a
+/// * `b` - Slice of vector b
+///
+/// ### Returns
+///
+/// `Vec<a - b>`
+#[cfg(all(target_arch = "x86_64", target_feature = "avx512f"))]
+#[inline(always)]
+fn subtract_f32_avx512(a: &[f32], b: &[f32]) -> Vec<f32> {
+    use std::arch::x86_64::*;
+
+    let len = a.len();
+    let chunks = len / 16;
+    let mut result = Vec::with_capacity(len);
+
+    unsafe {
+        let result_ptr = result.as_mut_ptr();
+
+        for i in 0..chunks {
+            let va = _mm512_loadu_ps(a.as_ptr().add(i * 16));
+            let vb = _mm512_loadu_ps(b.as_ptr().add(i * 16));
+            let diff = _mm512_sub_ps(va, vb);
+            _mm512_storeu_ps(result_ptr.add(i * 16), diff);
+        }
+
+        for i in (chunks * 16)..len {
+            *result_ptr.add(i) = a[i] - b[i];
+        }
+
+        result.set_len(len);
+    }
+    result
+}
+
+/// Vector subtraction - f32, fall back version
+///
+/// ### Params
+///
+/// * `a` - Slice of vector a
+/// * `b` - Slice of vector b
+///
+/// ### Returns
+///
+/// `Vec<a - b>`
+#[cfg(not(all(target_arch = "x86_64", target_feature = "avx512f")))]
+#[inline(always)]
+fn subtract_f32_avx512(a: &[f32], b: &[f32]) -> Vec<f32> {
+    subtract_f32_avx2(a, b)
+}
+
+///////////////////
+// f64 Subtract  //
+///////////////////
+
+/// Vector subtraction - f64, scalar
+///
+/// ### Params
+///
+/// * `a` - Slice of vector a
+/// * `b` - Slice of vector b
+///
+/// ### Returns
+///
+/// `Vec<a - b>`
+#[inline(always)]
+fn subtract_f64_scalar(a: &[f64], b: &[f64]) -> Vec<f64> {
+    a.iter().zip(b.iter()).map(|(&x, &y)| x - y).collect()
+}
+
+/// Vector subtraction - f64, optimised for 128 bits
+///
+/// ### Params
+///
+/// * `a` - Slice of vector a
+/// * `b` - Slice of vector b
+///
+/// ### Returns
+///
+/// `Vec<a - b>`
+#[inline(always)]
+fn subtract_f64_sse(a: &[f64], b: &[f64]) -> Vec<f64> {
+    let len = a.len();
+    let chunks = len / 2;
+    let mut result = Vec::with_capacity(len);
+
+    unsafe {
+        let a_ptr = a.as_ptr();
+        let b_ptr = b.as_ptr();
+        let result_ptr: *mut f64 = result.as_mut_ptr();
+
+        for i in 0..chunks {
+            let offset = i * 2;
+            let va = f64x2::from(*(a_ptr.add(offset) as *const [f64; 2]));
+            let vb = f64x2::from(*(b_ptr.add(offset) as *const [f64; 2]));
+            let diff = va - vb;
+            *(result_ptr.add(offset) as *mut [f64; 2]) = diff.into();
+        }
+
+        if len % 2 == 1 {
+            *result_ptr.add(len - 1) = a[len - 1] - b[len - 1];
+        }
+
+        result.set_len(len);
+    }
+    result
+}
+
+/// Vector subtraction - f64, optimised for 256 bits
+///
+/// ### Params
+///
+/// * `a` - Slice of vector a
+/// * `b` - Slice of vector b
+///
+/// ### Returns
+///
+/// `Vec<a - b>`
+#[inline(always)]
+fn subtract_f64_avx2(a: &[f64], b: &[f64]) -> Vec<f64> {
+    let len = a.len();
+    let chunks = len / 4;
+    let mut result = Vec::with_capacity(len);
+
+    unsafe {
+        let a_ptr = a.as_ptr();
+        let b_ptr = b.as_ptr();
+        let result_ptr: *mut f64 = result.as_mut_ptr();
+
+        for i in 0..chunks {
+            let offset = i * 4;
+            let va = f64x4::from(*(a_ptr.add(offset) as *const [f64; 4]));
+            let vb = f64x4::from(*(b_ptr.add(offset) as *const [f64; 4]));
+            let diff = va - vb;
+            *(result_ptr.add(offset) as *mut [f64; 4]) = diff.into();
+        }
+
+        for i in (chunks * 4)..len {
+            *result_ptr.add(i) = a[i] - b[i];
+        }
+
+        result.set_len(len);
+    }
+    result
+}
+
+/// Vector subtraction - f64, optimised for 512 bits
+///
+/// ### Params
+///
+/// * `a` - Slice of vector a
+/// * `b` - Slice of vector b
+///
+/// ### Returns
+///
+/// `Vec<a - b>`
+#[cfg(all(target_arch = "x86_64", target_feature = "avx512f"))]
+#[inline(always)]
+fn subtract_f64_avx512(a: &[f64], b: &[f64]) -> Vec<f64> {
+    use std::arch::x86_64::*;
+
+    let len = a.len();
+    let chunks = len / 8;
+    let mut result = Vec::with_capacity(len);
+
+    unsafe {
+        let result_ptr = result.as_mut_ptr();
+
+        for i in 0..chunks {
+            let va = _mm512_loadu_pd(a.as_ptr().add(i * 8));
+            let vb = _mm512_loadu_pd(b.as_ptr().add(i * 8));
+            let diff = _mm512_sub_pd(va, vb);
+            _mm512_storeu_pd(result_ptr.add(i * 8), diff);
+        }
+
+        for i in (chunks * 8)..len {
+            *result_ptr.add(i) = a[i] - b[i];
+        }
+
+        result.set_len(len);
+    }
+    result
+}
+
+/// Vector subtraction - f64, fall back version for AVX512
+///
+/// ### Params
+///
+/// * `a` - Slice of vector a
+/// * `b` - Slice of vector b
+///
+/// ### Returns
+///
+/// `Vec<a - b>`
+#[cfg(not(all(target_arch = "x86_64", target_feature = "avx512f")))]
+#[inline(always)]
+fn subtract_f64_avx512(a: &[f64], b: &[f64]) -> Vec<f64> {
+    subtract_f64_avx2(a, b)
+}
+
 //////////////////////////////////
 // SimdDistance implementations //
 //////////////////////////////////
@@ -704,6 +1014,16 @@ impl SimdDistance for f32 {
             SimdLevel::Scalar => dot_f32_scalar(a, b),
         }
     }
+
+    #[inline]
+    fn subtract_simd(a: &[f32], b: &[f32]) -> Vec<f32> {
+        match detect_simd_level() {
+            SimdLevel::Avx512 => subtract_f32_avx512(a, b),
+            SimdLevel::Avx2 => subtract_f32_avx2(a, b),
+            SimdLevel::Sse => subtract_f32_sse(a, b),
+            SimdLevel::Scalar => subtract_f32_scalar(a, b),
+        }
+    }
 }
 
 impl SimdDistance for f64 {
@@ -724,6 +1044,16 @@ impl SimdDistance for f64 {
             SimdLevel::Avx2 => dot_f64_avx2(a, b),
             SimdLevel::Sse => dot_f64_sse(a, b),
             SimdLevel::Scalar => dot_f64_scalar(a, b),
+        }
+    }
+
+    #[inline]
+    fn subtract_simd(a: &[f64], b: &[f64]) -> Vec<f64> {
+        match detect_simd_level() {
+            SimdLevel::Avx512 => subtract_f64_avx512(a, b),
+            SimdLevel::Avx2 => subtract_f64_avx2(a, b),
+            SimdLevel::Sse => subtract_f64_sse(a, b),
+            SimdLevel::Scalar => subtract_f64_scalar(a, b),
         }
     }
 }
@@ -1050,7 +1380,7 @@ fn euclidean_bf16_scalar(a: &[bf16], b: &[bf16]) -> f32 {
         .zip(b.iter())
         .map(|(x, y)| {
             // ignore rust analyser
-            let d = x.to_f32() - y.to_f32();
+            let d = f32::from(*x) - f32::from(*y);
             d * d
         })
         .sum()
@@ -1276,7 +1606,7 @@ fn euclidean_bf16_f32_scalar(a: &[bf16], b: &[f32]) -> f32 {
     a.iter()
         .zip(b.iter())
         .map(|(x, y)| {
-            let d = x.to_f32() - y;
+            let d = f32::from(*x) - y;
             d * d
         })
         .sum()
@@ -1466,7 +1796,7 @@ fn euclidean_bf16_f64_scalar(a: &[bf16], b: &[f64]) -> f32 {
     a.iter()
         .zip(b.iter())
         .map(|(x, y)| {
-            let d = x.to_f32() - (*y as f32);
+            let d = f32::from(*x) - (*y as f32);
             d * d
         })
         .sum()
@@ -1782,11 +2112,7 @@ pub fn euclidean_bf16_f64_simd(a: &[bf16], b: &[f64]) -> f32 {
 fn dot_bf16_scalar(a: &[bf16], b: &[bf16]) -> f32 {
     a.iter()
         .zip(b.iter())
-        .map(|(x, y)| {
-            // ignore rust analyser
-            let res = x.to_f32() * y.to_f32();
-            res
-        })
+        .map(|(x, y)| f32::from(*x) * f32::from(*y))
         .sum()
 }
 
@@ -1992,7 +2318,7 @@ pub fn dot_bf16_simd(a: &[bf16], b: &[bf16]) -> f32 {
 #[cfg(feature = "quantised")]
 #[inline(always)]
 fn dot_bf16_f32_scalar(a: &[bf16], b: &[f32]) -> f32 {
-    a.iter().zip(b.iter()).map(|(x, y)| x.to_f32() * y).sum()
+    a.iter().zip(b.iter()).map(|(x, y)| f32::from(*x) * y).sum()
 }
 
 /// Dot product: bf16 vs f32 - SSE (128-bit, x86_64)
@@ -2170,7 +2496,7 @@ fn dot_bf16_f32_neon(a: &[bf16], b: &[f32]) -> f32 {
 fn dot_bf16_f64_scalar(a: &[bf16], b: &[f64]) -> f32 {
     a.iter()
         .zip(b.iter())
-        .map(|(x, y)| x.to_f32() * (*y as f32))
+        .map(|(x, y)| f32::from(*x) * (*y as f32))
         .sum()
 }
 
@@ -2696,6 +3022,8 @@ where
 // VectorDistanceSq8 //
 ///////////////////////
 
+// Tests with SIMD have not yielded any benefit here...
+
 #[cfg(feature = "quantised")]
 /// Trait for computing distances between `i8`
 pub trait VectorDistanceSq8<T>
@@ -2803,7 +3131,7 @@ where
 #[cfg(feature = "quantised")]
 pub trait VectorDistanceAdc<T>
 where
-    T: Float + FromPrimitive + ToPrimitive + Sum,
+    T: Float + FromPrimitive + ToPrimitive + Sum + SimdDistance,
 {
     /// Get the m value from the codebook
     fn codebook_m(&self) -> usize;
@@ -2843,11 +3171,7 @@ where
 
         let centroid = &self.centroids()[cluster_idx * self.dim()..(cluster_idx + 1) * self.dim()];
 
-        let query_residual: Vec<T> = query_vec
-            .iter()
-            .zip(centroid.iter())
-            .map(|(&q, &c)| q - c)
-            .collect();
+        let query_residual = T::subtract_simd(query_vec, centroid);
 
         let mut table = vec![T::zero(); m * n_cents];
 
@@ -2861,14 +3185,7 @@ where
                     &self.codebooks()[subspace][centroid_start..centroid_start + subvec_dim];
 
                 // squared Euclidean distance for ADC
-                let dist: T = query_sub
-                    .iter()
-                    .zip(pq_centroid.iter())
-                    .map(|(&q, &c)| {
-                        let diff = q - c;
-                        diff * diff
-                    })
-                    .sum();
+                let dist = T::euclidean_simd(query_sub, pq_centroid);
 
                 table[table_offset + centroid_idx] = dist;
             }
@@ -2957,17 +3274,11 @@ where
 #[inline(always)]
 pub fn euclidean_distance_static<T>(a: &[T], b: &[T]) -> T
 where
-    T: Float,
+    T: Float + SimdDistance,
 {
     assert!(a.len() == b.len(), "Vectors a and b need to have same len!");
 
-    a.iter()
-        .zip(b.iter())
-        .map(|(&x, &y)| {
-            let diff = x - y;
-            diff * diff
-        })
-        .fold(T::zero(), |acc, x| acc + x)
+    T::euclidean_simd(a, b)
 }
 
 /// Static Cosine distance between two arbitrary vectors
@@ -2985,15 +3296,11 @@ where
 #[inline(always)]
 pub fn cosine_distance_static<T>(a: &[T], b: &[T]) -> T
 where
-    T: Float,
+    T: Float + SimdDistance,
 {
     assert!(a.len() == b.len(), "Vectors a and b need to have same len!");
 
-    let dot: T = a
-        .iter()
-        .zip(b.iter())
-        .map(|(&x, &y)| x * y)
-        .fold(T::zero(), |acc, x| acc + x);
+    let dot: T = T::dot_simd(a, b);
 
     let norm_a = a
         .iter()
@@ -3026,15 +3333,11 @@ where
 /// Squared cosine distance
 pub fn cosine_distance_static_norm<T>(a: &[T], b: &[T], norm_a: &T, norm_b: &T) -> T
 where
-    T: Float,
+    T: Float + SimdDistance,
 {
     assert!(a.len() == b.len(), "Vectors a and b need to have same len!");
 
-    let dot: T = a
-        .iter()
-        .zip(b.iter())
-        .map(|(&x, &y)| x * y)
-        .fold(T::zero(), |acc, x| acc + x);
+    let dot: T = T::dot_simd(a, b);
 
     T::one() - (dot / (*norm_a * *norm_b))
 }

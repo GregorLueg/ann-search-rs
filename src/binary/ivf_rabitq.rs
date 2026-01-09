@@ -61,7 +61,7 @@ where
 /// Trait implementation for the CentroidDistances
 impl<T> CentroidDistance<T> for IvfIndexRaBitQ<T>
 where
-    T: Float + FromPrimitive + Sum,
+    T: Float + FromPrimitive + Sum + SimdDistance,
 {
     fn centroids(&self) -> &[T] {
         &self.storage.centroids

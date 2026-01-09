@@ -213,7 +213,7 @@ pub struct ProductQuantiser<T> {
 
 impl<T> ProductQuantiser<T>
 where
-    T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum,
+    T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum + SimdDistance,
 {
     /// Train the product quantiser
     ///
@@ -487,7 +487,7 @@ pub struct OptimisedProductQuantiser<T> {
 
 impl<T> OptimisedProductQuantiser<T>
 where
-    T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum + AddAssign,
+    T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum + AddAssign + SimdDistance,
 {
     /// Train the optimised product quantiser
     ///

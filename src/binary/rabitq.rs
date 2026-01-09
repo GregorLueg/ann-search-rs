@@ -579,7 +579,7 @@ pub struct RaBitQQuantiser<T> {
 
 impl<T> RaBitQQuantiser<T>
 where
-    T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum + ComplexField,
+    T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum + ComplexField + SimdDistance,
 {
     /// Create a new RaBitQ quantiser
     ///
@@ -749,7 +749,7 @@ where
 
 impl<T> CentroidDistance<T> for RaBitQQuantiser<T>
 where
-    T: Float + FromPrimitive + Sum,
+    T: Float + FromPrimitive + Sum + SimdDistance,
 {
     fn centroids(&self) -> &[T] {
         &self.storage.centroids

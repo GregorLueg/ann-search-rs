@@ -81,7 +81,7 @@ where
 
 impl<T> CentroidDistance<T> for IvfSq8Index<T>
 where
-    T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum,
+    T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum + SimdDistance,
 {
     fn centroids(&self) -> &[T] {
         &self.centroids
@@ -110,7 +110,7 @@ where
 
 impl<T> IvfSq8Index<T>
 where
-    T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum,
+    T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum + SimdDistance,
 {
     /// Build an IVF index with scalar 8-bit quantisation.
     ///

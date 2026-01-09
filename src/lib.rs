@@ -1108,7 +1108,7 @@ pub fn build_ivf_sq8_index<T>(
     verbose: bool,
 ) -> IvfSq8Index<T>
 where
-    T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum,
+    T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum + SimdDistance,
 {
     let ann_dist = parse_ann_dist(dist_metric).unwrap_or_default();
 
@@ -1140,7 +1140,7 @@ pub fn query_ivf_sq8_index<T>(
     verbose: bool,
 ) -> (Vec<Vec<usize>>, Option<Vec<Vec<T>>>)
 where
-    T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum,
+    T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum + SimdDistance,
 {
     query_parallel(query_mat.nrows(), return_dist, verbose, |i| {
         index.query_row(query_mat.row(i), k, nprobe)
@@ -1175,7 +1175,7 @@ pub fn query_ivf_sq8_self<T>(
     verbose: bool,
 ) -> (Vec<Vec<usize>>, Option<Vec<Vec<T>>>)
 where
-    T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum,
+    T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum + SimdDistance,
 {
     index.generate_knn(k, nprobe, return_dist, verbose)
 }
@@ -1214,7 +1214,7 @@ pub fn build_ivf_pq_index<T>(
     verbose: bool,
 ) -> IvfPqIndex<T>
 where
-    T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum,
+    T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum + SimdDistance,
 {
     let ann_dist = parse_ann_dist(dist_metric).unwrap_or_default();
 
@@ -1255,7 +1255,7 @@ pub fn query_ivf_pq_index<T>(
     verbose: bool,
 ) -> (Vec<Vec<usize>>, Option<Vec<Vec<T>>>)
 where
-    T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum,
+    T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum + SimdDistance,
 {
     query_parallel(query_mat.nrows(), return_dist, verbose, |i| {
         index.query_row(query_mat.row(i), k, nprobe)
@@ -1289,7 +1289,7 @@ pub fn query_ivf_pq_index_self<T>(
     verbose: bool,
 ) -> (Vec<Vec<usize>>, Option<Vec<Vec<T>>>)
 where
-    T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum,
+    T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum + SimdDistance,
 {
     index.generate_knn(k, nprobe, return_dist, verbose)
 }
@@ -1329,7 +1329,7 @@ pub fn build_ivf_opq_index<T>(
     verbose: bool,
 ) -> IvfOpqIndex<T>
 where
-    T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum + AddAssign,
+    T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum + AddAssign + SimdDistance,
 {
     let ann_dist = parse_ann_dist(dist_metric).unwrap_or_default();
 
@@ -1371,7 +1371,7 @@ pub fn query_ivf_opq_index<T>(
     verbose: bool,
 ) -> (Vec<Vec<usize>>, Option<Vec<Vec<T>>>)
 where
-    T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum + AddAssign,
+    T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum + AddAssign + SimdDistance,
 {
     query_parallel(query_mat.nrows(), return_dist, verbose, |i| {
         index.query_row(query_mat.row(i), k, nprobe)
@@ -1405,7 +1405,7 @@ pub fn query_ivf_opq_index_self<T>(
     verbose: bool,
 ) -> (Vec<Vec<usize>>, Option<Vec<Vec<T>>>)
 where
-    T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum + AddAssign,
+    T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum + AddAssign + SimdDistance,
 {
     index.generate_knn(k, nprobe, return_dist, verbose)
 }
@@ -1531,7 +1531,14 @@ pub fn build_ivf_index_gpu<T, R>(
 ) -> IvfIndexGpu<T, R>
 where
     R: Runtime,
-    T: Float + Sum + cubecl::frontend::Float + cubecl::CubeElement + FromPrimitive + Send + Sync,
+    T: Float
+        + Sum
+        + cubecl::frontend::Float
+        + cubecl::CubeElement
+        + FromPrimitive
+        + Send
+        + Sync
+        + SimdDistance,
 {
     let ann_dist = parse_ann_dist(dist_metric).unwrap_or_default();
     IvfIndexGpu::build(mat, ann_dist, nlist, max_iters, seed, verbose, device)
@@ -1564,7 +1571,14 @@ pub fn query_ivf_index_gpu<T, R>(
 ) -> (Vec<Vec<usize>>, Option<Vec<Vec<T>>>)
 where
     R: Runtime,
-    T: Float + Sum + cubecl::frontend::Float + cubecl::CubeElement + FromPrimitive + Send + Sync,
+    T: Float
+        + Sum
+        + cubecl::frontend::Float
+        + cubecl::CubeElement
+        + FromPrimitive
+        + Send
+        + Sync
+        + SimdDistance,
 {
     let (indices, distances) = index.query_batch(query_mat, k, nprobe, nquery, verbose);
 
@@ -1603,7 +1617,14 @@ pub fn query_ivf_index_gpu_self<T, R>(
 ) -> (Vec<Vec<usize>>, Option<Vec<Vec<T>>>)
 where
     R: Runtime,
-    T: Float + Sum + cubecl::frontend::Float + cubecl::CubeElement + FromPrimitive + Send + Sync,
+    T: Float
+        + Sum
+        + cubecl::frontend::Float
+        + cubecl::CubeElement
+        + FromPrimitive
+        + Send
+        + Sync
+        + SimdDistance,
 {
     index.generate_knn(k, nprobe, nquery, return_dist, verbose)
 }

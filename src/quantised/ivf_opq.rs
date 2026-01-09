@@ -51,7 +51,7 @@ pub struct IvfOpqIndex<T> {
 
 impl<T> CentroidDistance<T> for IvfOpqIndex<T>
 where
-    T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum,
+    T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum + SimdDistance,
 {
     fn centroids(&self) -> &[T] {
         &self.centroids
@@ -80,7 +80,7 @@ where
 
 impl<T> VectorDistanceAdc<T> for IvfOpqIndex<T>
 where
-    T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum + AddAssign,
+    T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum + AddAssign + SimdDistance,
 {
     fn codebook_m(&self) -> usize {
         self.codebook.m()
@@ -117,7 +117,7 @@ where
 
 impl<T> IvfOpqIndex<T>
 where
-    T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum + AddAssign,
+    T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum + AddAssign + SimdDistance,
 {
     /// Build an IVF index with optimised product quantisation
     ///
