@@ -1,3 +1,4 @@
+use bytemuck::Pod;
 use memmap2::Mmap;
 use num_traits::Float;
 use std::fs::File;
@@ -75,6 +76,9 @@ where
         let file_norms = File::open(norms_path)?;
 
         let mmap_vectors = unsafe { Mmap::map(&file_vectors)? };
+
+        mmap_vectors.advise(memmap2::Advice::Random)?;
+
         let mmap_norms = unsafe { Mmap::map(&file_norms)? };
 
         let expected_vectors_size = n * dim * std::mem::size_of::<T>();
@@ -155,18 +159,13 @@ where
 
 impl<T> VectorStore<T> for MmapVectorStore<T>
 where
-    T: Float + Sum,
+    T: Float + Sum + Pod,
 {
     fn load_vector(&self, idx: usize) -> &[T] {
         let start = idx * self.dim;
-        unsafe {
-            std::slice::from_raw_parts(
-                self.mmap_vectors
-                    .as_ptr()
-                    .add(start * std::mem::size_of::<T>()) as *const T,
-                self.dim,
-            )
-        }
+        let end = start + self.dim;
+        let all_data: &[T] = bytemuck::cast_slice(&self.mmap_vectors);
+        &all_data[start..end]
     }
 
     fn dim(&self) -> usize {

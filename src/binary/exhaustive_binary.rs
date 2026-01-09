@@ -1,3 +1,4 @@
+use bytemuck::Pod;
 use faer::{MatRef, RowRef};
 use faer_traits::ComplexField;
 use num_traits::{Float, FromPrimitive, ToPrimitive};
@@ -55,7 +56,7 @@ impl<T> VectorDistanceBinary for ExhaustiveIndexBinary<T> {
 
 impl<T> ExhaustiveIndexBinary<T>
 where
-    T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum + ComplexField + SimdDistance,
+    T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum + ComplexField + SimdDistance + Pod,
 {
     /// Generate a new exhaustive binary index
     ///
