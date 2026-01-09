@@ -77,6 +77,7 @@ where
 
         let mmap_vectors = unsafe { Mmap::map(&file_vectors)? };
 
+        #[cfg(unix)]
         mmap_vectors.advise(memmap2::Advice::Random)?;
 
         let mmap_norms = unsafe { Mmap::map(&file_norms)? };
