@@ -38,7 +38,7 @@ pub struct ExhaustiveIndex<T> {
 
 impl<T> VectorDistance<T> for ExhaustiveIndex<T>
 where
-    T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum,
+    T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum + SimdDistance,
 {
     fn vectors_flat(&self) -> &[T] {
         &self.vectors_flat
@@ -59,7 +59,7 @@ where
 
 impl<T> ExhaustiveIndex<T>
 where
-    T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum,
+    T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum + SimdDistance,
 {
     //////////////////////
     // Index generation //
@@ -78,18 +78,16 @@ where
     pub fn new(data: MatRef<T>, metric: Dist) -> Self {
         let (vectors_flat, n, dim) = matrix_to_flat(data);
 
-        let norms = match metric {
-            Dist::Cosine => (0..n)
+        let norms = if metric == Dist::Cosine {
+            (0..n)
                 .map(|i| {
-                    let vec_start = i * dim;
-                    vectors_flat[vec_start..vec_start + dim]
-                        .iter()
-                        .map(|v| *v * *v)
-                        .fold(T::zero(), |a, b| a + b)
-                        .sqrt()
+                    let start = i * dim;
+                    let end = start + dim;
+                    T::calculate_norm(&vectors_flat[start..end])
                 })
-                .collect(),
-            Dist::Euclidean => Vec::new(),
+                .collect()
+        } else {
+            Vec::new()
         };
 
         Self {

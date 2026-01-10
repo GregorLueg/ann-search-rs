@@ -28,9 +28,10 @@ dependencies = [
 
 [[package]]
 name = "ann-search-rs"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "approx",
+ "bytemuck",
  "clap",
  "cubecl",
  "faer",
@@ -46,6 +47,7 @@ dependencies = [
  "rustc-hash 2.1.1",
  "tempfile",
  "thousands",
+ "wide",
 ]
 
 [[package]]
@@ -3234,6 +3236,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a50f4cf475b65d88e057964e0e9bb1f0aa9bbb2036dc65c64596b42932536984"
 
 [[package]]
+name = "safe_arch"
+version = "1.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1f7caad094bd561859bcd467734a720c3c1f5d1f338995351fefe2190c45efed"
+dependencies = [
+ "bytemuck",
+]
+
+[[package]]
 name = "same-file"
 version = "1.0.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4318,6 +4329,16 @@ dependencies = [
  "log",
  "thiserror 2.0.17",
  "web-sys",
+]
+
+[[package]]
+name = "wide"
+version = "1.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ac11b009ebeae802ed758530b6496784ebfee7a87b9abfbcaf3bbe25b814eb25"
+dependencies = [
+ "bytemuck",
+ "safe_arch",
 ]
 
 [[package]]

@@ -1,3 +1,4 @@
+use bytemuck::Pod;
 use faer::{MatRef, RowRef};
 use faer_traits::ComplexField;
 use num_traits::{Float, FromPrimitive, ToPrimitive};
@@ -67,7 +68,7 @@ impl<T> VectorDistanceBinary for IvfIndexBinary<T> {
 
 impl<T> CentroidDistance<T> for IvfIndexBinary<T>
 where
-    T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum,
+    T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum + SimdDistance,
 {
     fn centroids(&self) -> &[T] {
         &self.centroids_float
@@ -92,7 +93,7 @@ where
 
 impl<T> IvfIndexBinary<T>
 where
-    T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum + ComplexField,
+    T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum + ComplexField + SimdDistance + Pod,
 {
     /// Build an IVF index with binary quantisation
     ///
@@ -209,6 +210,10 @@ where
             nlist,
             &metric,
         );
+
+        if verbose {
+            print_cluster_summary(&assignments, nlist);
+        }
 
         // 4. build CSR layout
         let (all_indices, offsets) = build_csr_layout(assignments, n, nlist);
@@ -358,6 +363,10 @@ where
             nlist,
             &metric,
         );
+
+        if verbose {
+            print_cluster_summary(&assignments, nlist);
+        }
 
         // 4. build CSR layout
         let (all_indices, offsets) = build_csr_layout(assignments, n, nlist);

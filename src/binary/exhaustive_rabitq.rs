@@ -1,4 +1,5 @@
 use crate::utils::ivf_utils::CentroidDistance;
+use bytemuck::Pod;
 use faer::{MatRef, RowRef};
 use faer_traits::ComplexField;
 use num_traits::{Float, FromPrimitive, ToPrimitive};
@@ -50,7 +51,7 @@ where
 
 impl<T> ExhaustiveIndexRaBitQ<T>
 where
-    T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum + ComplexField,
+    T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum + ComplexField + SimdDistance + Pod,
 {
     /// Create a new exhaustive RaBitQ index
     ///

@@ -1,6 +1,7 @@
 pub mod dist;
 pub mod heap_structs;
 pub mod ivf_utils;
+pub mod tree_utils;
 
 use faer::MatRef;
 use num_traits::{Float, FromPrimitive, ToPrimitive};
@@ -50,7 +51,7 @@ where
 
 pub trait KnnValidation<T>: VectorDistance<T>
 where
-    T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum,
+    T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum + SimdDistance,
 {
     /// Query for validation purposes
     ///

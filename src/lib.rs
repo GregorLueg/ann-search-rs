@@ -1,6 +1,7 @@
 #![allow(clippy::needless_range_loop)] // I want these loops!
 
 pub mod annoy;
+pub mod ball_tree;
 pub mod exhaustive;
 pub mod hnsw;
 pub mod ivf;
@@ -36,11 +37,14 @@ use cubecl::prelude::*;
 use std::ops::AddAssign;
 
 #[cfg(feature = "binary")]
+use bytemuck::Pod;
+#[cfg(feature = "binary")]
 use faer_traits::ComplexField;
 #[cfg(feature = "binary")]
 use std::path::Path;
 
 use crate::annoy::*;
+use crate::ball_tree::*;
 use crate::exhaustive::*;
 use crate::hnsw::*;
 use crate::ivf::*;
@@ -203,7 +207,7 @@ where
 /// The initialised `ExhausiveIndex`
 pub fn build_exhaustive_index<T>(mat: MatRef<T>, dist_metric: &str) -> ExhaustiveIndex<T>
 where
-    T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum,
+    T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum + SimdDistance,
 {
     let metric = parse_ann_dist(dist_metric).unwrap_or_default();
     ExhaustiveIndex::new(mat, metric)
@@ -230,7 +234,7 @@ pub fn query_exhaustive_index<T>(
     verbose: bool,
 ) -> (Vec<Vec<usize>>, Option<Vec<Vec<T>>>)
 where
-    T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum,
+    T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum + SimdDistance,
 {
     query_parallel(query_mat.nrows(), return_dist, verbose, |i| {
         index.query_row(query_mat.row(i), k)
@@ -258,7 +262,7 @@ pub fn query_exhaustive_self<T>(
     verbose: bool,
 ) -> (Vec<Vec<usize>>, Option<Vec<Vec<T>>>)
 where
-    T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum,
+    T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum + SimdDistance,
 {
     index.generate_knn(k, return_dist, verbose)
 }
@@ -286,7 +290,7 @@ pub fn build_annoy_index<T>(
     seed: usize,
 ) -> AnnoyIndex<T>
 where
-    T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum,
+    T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum + SimdDistance,
 {
     let ann_dist = parse_ann_dist(&dist_metric).unwrap_or_default();
 
@@ -317,7 +321,7 @@ pub fn query_annoy_index<T>(
     verbose: bool,
 ) -> (Vec<Vec<usize>>, Option<Vec<Vec<T>>>)
 where
-    T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum,
+    T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum + SimdDistance,
 {
     query_parallel(query_mat.nrows(), return_dist, verbose, |i| {
         index.query_row(query_mat.row(i), k, search_budget)
@@ -348,7 +352,91 @@ pub fn query_annoy_self<T>(
     verbose: bool,
 ) -> (Vec<Vec<usize>>, Option<Vec<Vec<T>>>)
 where
-    T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum,
+    T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum + SimdDistance,
+{
+    index.generate_knn(k, search_budget, return_dist, verbose)
+}
+
+//////////////
+// BallTree //
+//////////////
+
+/// Build a BallTree index
+///
+/// ### Params
+///
+/// * `mat` - The data matrix. Rows represent the samples, columns represent
+///   the embedding dimensions
+/// * `dist_metric` - Distance metric to use
+/// * `seed` - Random seed for reproducibility
+///
+/// ### Return
+///
+/// The `BallTreeIndex`.
+pub fn build_balltree_index<T>(mat: MatRef<T>, dist_metric: String, seed: usize) -> BallTreeIndex<T>
+where
+    T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum + SimdDistance,
+{
+    let ann_dist = parse_ann_dist(&dist_metric).unwrap_or_default();
+    BallTreeIndex::new(mat, ann_dist, seed)
+}
+
+/// Helper function to query a given BallTree index
+///
+/// ### Params
+///
+/// * `query_mat` - The query matrix containing the samples x features
+/// * `k` - Number of neighbours to return
+/// * `index` - The BallTreeIndex to query
+/// * `search_budget` - Search budget (number of items to examine)
+/// * `return_dist` - Shall the distances between the different points be
+///   returned
+/// * `verbose` - Controls verbosity of the function
+///
+/// ### Returns
+///
+/// A tuple of `(knn_indices, optional distances)`
+pub fn query_balltree_index<T>(
+    query_mat: MatRef<T>,
+    index: &BallTreeIndex<T>,
+    k: usize,
+    search_budget: Option<usize>,
+    return_dist: bool,
+    verbose: bool,
+) -> (Vec<Vec<usize>>, Option<Vec<Vec<T>>>)
+where
+    T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum + SimdDistance,
+{
+    query_parallel(query_mat.nrows(), return_dist, verbose, |i| {
+        index.query_row(query_mat.row(i), k, search_budget)
+    })
+}
+
+/// Helper function to self query the BallTree index
+///
+/// This function will generate a full kNN graph based on the internal data.
+///
+/// ### Params
+///
+/// * `k` - Number of neighbours to return
+/// * `index` - The BallTreeIndex to query
+/// * `search_budget` - Search budget (number of items to examine)
+/// * `return_dist` - Shall the distances between the different points be
+///   returned
+/// * `verbose` - Controls verbosity of the function
+///
+/// ### Returns
+///
+/// A tuple of `(knn_indices, optional distances)`
+pub fn query_balltree_self<T>(
+    index: &BallTreeIndex<T>,
+    k: usize,
+    search_budget: Option<usize>,
+    return_dist: bool,
+    verbose: bool,
+) -> (Vec<Vec<usize>>, Option<Vec<Vec<T>>>)
+where
+    T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum + SimdDistance,
 {
     index.generate_knn(k, search_budget, return_dist, verbose)
 }
@@ -381,7 +469,7 @@ pub fn build_hnsw_index<T>(
     verbose: bool,
 ) -> HnswIndex<T>
 where
-    T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum,
+    T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum + SimdDistance,
     HnswIndex<T>: HnswState<T>,
 {
     HnswIndex::build(mat, m, ef_construction, dist_metric, seed, verbose)
@@ -417,7 +505,7 @@ pub fn query_hnsw_index<T>(
     verbose: bool,
 ) -> (Vec<Vec<usize>>, Option<Vec<Vec<T>>>)
 where
-    T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum,
+    T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum + SimdDistance,
     HnswIndex<T>: HnswState<T>,
 {
     query_parallel(query_mat.nrows(), return_dist, verbose, |i| {
@@ -451,7 +539,7 @@ pub fn query_hnsw_self<T>(
     verbose: bool,
 ) -> (Vec<Vec<usize>>, Option<Vec<Vec<T>>>)
 where
-    T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum,
+    T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum + SimdDistance,
     HnswIndex<T>: HnswState<T>,
 {
     index.generate_knn(k, ef_search, return_dist, verbose)
@@ -486,7 +574,7 @@ pub fn build_ivf_index<T>(
     verbose: bool,
 ) -> IvfIndex<T>
 where
-    T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum,
+    T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum + SimdDistance,
 {
     let ann_dist = parse_ann_dist(dist_metric).unwrap_or_default();
 
@@ -523,7 +611,7 @@ pub fn query_ivf_index<T>(
     verbose: bool,
 ) -> (Vec<Vec<usize>>, Option<Vec<Vec<T>>>)
 where
-    T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum,
+    T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum + SimdDistance,
 {
     query_parallel(query_mat.nrows(), return_dist, verbose, |i| {
         index.query_row(query_mat.row(i), k, nprobe)
@@ -563,7 +651,7 @@ pub fn query_ivf_self<T>(
     verbose: bool,
 ) -> (Vec<Vec<usize>>, Option<Vec<Vec<T>>>)
 where
-    T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum,
+    T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum + SimdDistance,
 {
     index.generate_knn(k, nprobe, return_dist, verbose)
 }
@@ -595,7 +683,7 @@ pub fn build_lsh_index<T>(
     seed: usize,
 ) -> LSHIndex<T>
 where
-    T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum,
+    T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum + SimdDistance,
     LSHIndex<T>: LSHQuery<T>,
 {
     let metric = parse_ann_dist(dist_metric).unwrap_or_default();
@@ -628,7 +716,7 @@ pub fn query_lsh_index<T>(
     verbose: bool,
 ) -> (Vec<Vec<usize>>, Option<Vec<Vec<T>>>)
 where
-    T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum,
+    T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum + SimdDistance,
     LSHIndex<T>: LSHQuery<T>,
 {
     query_parallel_with_flags(query_mat.nrows(), return_dist, verbose, |i| {
@@ -658,7 +746,7 @@ pub fn query_lsh_self<T>(
     verbose: bool,
 ) -> (Vec<Vec<usize>>, Option<Vec<Vec<T>>>)
 where
-    T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum,
+    T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum + SimdDistance,
     LSHIndex<T>: LSHQuery<T>,
 {
     index.generate_knn(k, max_candidates, return_dist, verbose)
@@ -702,7 +790,7 @@ pub fn build_nndescent_index<T>(
     verbose: bool,
 ) -> NNDescent<T>
 where
-    T: Float + FromPrimitive + Send + Sync + Sum,
+    T: Float + FromPrimitive + Send + Sync + Sum + SimdDistance,
     NNDescent<T>: ApplySortedUpdates<T>,
     NNDescent<T>: NNDescentQuery<T>,
 {
@@ -750,7 +838,7 @@ pub fn query_nndescent_index<T>(
     verbose: bool,
 ) -> (Vec<Vec<usize>>, Option<Vec<Vec<T>>>)
 where
-    T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum,
+    T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum + SimdDistance,
     NNDescent<T>: ApplySortedUpdates<T>,
     NNDescent<T>: NNDescentQuery<T>,
 {
@@ -788,7 +876,7 @@ pub fn query_nndescent_self<T>(
     verbose: bool,
 ) -> (Vec<Vec<usize>>, Option<Vec<Vec<T>>>)
 where
-    T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum,
+    T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum + SimdDistance,
     NNDescent<T>: ApplySortedUpdates<T>,
     NNDescent<T>: NNDescentQuery<T>,
 {
@@ -822,7 +910,7 @@ pub fn build_exhaustive_bf16_index<T>(
     verbose: bool,
 ) -> ExhaustiveIndexBf16<T>
 where
-    T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum,
+    T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum + SimdDistance + Bf16Compatible,
 {
     let ann_dist = parse_ann_dist(dist_metric).unwrap_or_default();
     if verbose {
@@ -856,7 +944,7 @@ pub fn query_exhaustive_bf16_index<T>(
     verbose: bool,
 ) -> (Vec<Vec<usize>>, Option<Vec<Vec<T>>>)
 where
-    T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum,
+    T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum + SimdDistance + Bf16Compatible,
 {
     query_parallel(query_mat.nrows(), return_dist, verbose, |i| {
         index.query_row(query_mat.row(i), k)
@@ -885,7 +973,7 @@ pub fn query_exhaustive_bf16_self<T>(
     verbose: bool,
 ) -> (Vec<Vec<usize>>, Option<Vec<Vec<T>>>)
 where
-    T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum,
+    T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum + SimdDistance + Bf16Compatible,
 {
     index.generate_knn(k, return_dist, verbose)
 }
@@ -913,7 +1001,7 @@ pub fn build_exhaustive_sq8_index<T>(
     verbose: bool,
 ) -> ExhaustiveSq8Index<T>
 where
-    T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum,
+    T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum + SimdDistance,
 {
     let ann_dist = parse_ann_dist(dist_metric).unwrap_or_default();
     if verbose {
@@ -944,7 +1032,7 @@ pub fn query_exhaustive_sq8_index<T>(
     verbose: bool,
 ) -> (Vec<Vec<usize>>, Option<Vec<Vec<T>>>)
 where
-    T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum,
+    T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum + SimdDistance,
 {
     query_parallel(query_mat.nrows(), return_dist, verbose, |i| {
         index.query_row(query_mat.row(i), k)
@@ -973,7 +1061,7 @@ pub fn query_exhaustive_sq8_self<T>(
     verbose: bool,
 ) -> (Vec<Vec<usize>>, Option<Vec<Vec<T>>>)
 where
-    T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum,
+    T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum + SimdDistance,
 {
     index.generate_knn(k, return_dist, verbose)
 }
@@ -1007,7 +1095,7 @@ pub fn build_ivf_bf16_index<T>(
     verbose: bool,
 ) -> IvfIndexBf16<T>
 where
-    T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum,
+    T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum + SimdDistance + Bf16Compatible,
 {
     let ann_dist = parse_ann_dist(dist_metric).unwrap_or_default();
 
@@ -1039,7 +1127,7 @@ pub fn query_ivf_bf16_index<T>(
     verbose: bool,
 ) -> (Vec<Vec<usize>>, Option<Vec<Vec<T>>>)
 where
-    T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum,
+    T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum + SimdDistance + Bf16Compatible,
 {
     query_parallel(query_mat.nrows(), return_dist, verbose, |i| {
         index.query_row(query_mat.row(i), k, nprobe)
@@ -1074,7 +1162,7 @@ pub fn query_ivf_bf16_self<T>(
     verbose: bool,
 ) -> (Vec<Vec<usize>>, Option<Vec<Vec<T>>>)
 where
-    T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum,
+    T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum + SimdDistance + Bf16Compatible,
 {
     index.generate_knn(k, nprobe, return_dist, verbose)
 }
@@ -1108,7 +1196,7 @@ pub fn build_ivf_sq8_index<T>(
     verbose: bool,
 ) -> IvfSq8Index<T>
 where
-    T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum,
+    T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum + SimdDistance,
 {
     let ann_dist = parse_ann_dist(dist_metric).unwrap_or_default();
 
@@ -1140,7 +1228,7 @@ pub fn query_ivf_sq8_index<T>(
     verbose: bool,
 ) -> (Vec<Vec<usize>>, Option<Vec<Vec<T>>>)
 where
-    T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum,
+    T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum + SimdDistance,
 {
     query_parallel(query_mat.nrows(), return_dist, verbose, |i| {
         index.query_row(query_mat.row(i), k, nprobe)
@@ -1175,7 +1263,7 @@ pub fn query_ivf_sq8_self<T>(
     verbose: bool,
 ) -> (Vec<Vec<usize>>, Option<Vec<Vec<T>>>)
 where
-    T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum,
+    T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum + SimdDistance,
 {
     index.generate_knn(k, nprobe, return_dist, verbose)
 }
@@ -1214,7 +1302,7 @@ pub fn build_ivf_pq_index<T>(
     verbose: bool,
 ) -> IvfPqIndex<T>
 where
-    T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum,
+    T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum + SimdDistance,
 {
     let ann_dist = parse_ann_dist(dist_metric).unwrap_or_default();
 
@@ -1255,7 +1343,7 @@ pub fn query_ivf_pq_index<T>(
     verbose: bool,
 ) -> (Vec<Vec<usize>>, Option<Vec<Vec<T>>>)
 where
-    T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum,
+    T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum + SimdDistance,
 {
     query_parallel(query_mat.nrows(), return_dist, verbose, |i| {
         index.query_row(query_mat.row(i), k, nprobe)
@@ -1289,7 +1377,7 @@ pub fn query_ivf_pq_index_self<T>(
     verbose: bool,
 ) -> (Vec<Vec<usize>>, Option<Vec<Vec<T>>>)
 where
-    T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum,
+    T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum + SimdDistance,
 {
     index.generate_knn(k, nprobe, return_dist, verbose)
 }
@@ -1329,7 +1417,7 @@ pub fn build_ivf_opq_index<T>(
     verbose: bool,
 ) -> IvfOpqIndex<T>
 where
-    T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum + AddAssign,
+    T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum + AddAssign + SimdDistance,
 {
     let ann_dist = parse_ann_dist(dist_metric).unwrap_or_default();
 
@@ -1371,7 +1459,7 @@ pub fn query_ivf_opq_index<T>(
     verbose: bool,
 ) -> (Vec<Vec<usize>>, Option<Vec<Vec<T>>>)
 where
-    T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum + AddAssign,
+    T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum + AddAssign + SimdDistance,
 {
     query_parallel(query_mat.nrows(), return_dist, verbose, |i| {
         index.query_row(query_mat.row(i), k, nprobe)
@@ -1405,7 +1493,7 @@ pub fn query_ivf_opq_index_self<T>(
     verbose: bool,
 ) -> (Vec<Vec<usize>>, Option<Vec<Vec<T>>>)
 where
-    T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum + AddAssign,
+    T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum + AddAssign + SimdDistance,
 {
     index.generate_knn(k, nprobe, return_dist, verbose)
 }
@@ -1436,7 +1524,7 @@ pub fn build_exhaustive_index_gpu<T, R>(
     device: R::Device,
 ) -> ExhaustiveIndexGpu<T, R>
 where
-    T: Float + Sum + cubecl::frontend::Float + cubecl::CubeElement + FromPrimitive,
+    T: Float + Sum + cubecl::frontend::Float + cubecl::CubeElement + FromPrimitive + SimdDistance,
     R: Runtime,
 {
     let metric = parse_ann_dist(dist_metric).unwrap_or_default();
@@ -1464,7 +1552,7 @@ pub fn query_exhaustive_index_gpu<T, R>(
     verbose: bool,
 ) -> (Vec<Vec<usize>>, Option<Vec<Vec<T>>>)
 where
-    T: Float + Sum + cubecl::frontend::Float + cubecl::CubeElement + FromPrimitive,
+    T: Float + Sum + cubecl::frontend::Float + cubecl::CubeElement + FromPrimitive + SimdDistance,
     R: Runtime,
 {
     let (indices, distances) = index.query_batch(query_mat, k, verbose);
@@ -1498,7 +1586,7 @@ pub fn query_exhaustive_index_gpu_self<T, R>(
     verbose: bool,
 ) -> (Vec<Vec<usize>>, Option<Vec<Vec<T>>>)
 where
-    T: Float + Sum + cubecl::frontend::Float + cubecl::CubeElement + FromPrimitive,
+    T: Float + Sum + cubecl::frontend::Float + cubecl::CubeElement + FromPrimitive + SimdDistance,
     R: Runtime,
 {
     index.generate_knn(k, return_dist, verbose)
@@ -1531,7 +1619,14 @@ pub fn build_ivf_index_gpu<T, R>(
 ) -> IvfIndexGpu<T, R>
 where
     R: Runtime,
-    T: Float + Sum + cubecl::frontend::Float + cubecl::CubeElement + FromPrimitive + Send + Sync,
+    T: Float
+        + Sum
+        + cubecl::frontend::Float
+        + cubecl::CubeElement
+        + FromPrimitive
+        + Send
+        + Sync
+        + SimdDistance,
 {
     let ann_dist = parse_ann_dist(dist_metric).unwrap_or_default();
     IvfIndexGpu::build(mat, ann_dist, nlist, max_iters, seed, verbose, device)
@@ -1546,6 +1641,7 @@ where
 /// * `index` - Reference to built index
 /// * `k` - Number of neighbours
 /// * `nprobe` - Clusters to search (defaults to √nlist)
+/// * `nquery` - Number of queries to load into the GPU.
 /// * `return_dist` - Return distances
 /// * `verbose` - Controls verbosity of the function
 ///
@@ -1557,14 +1653,22 @@ pub fn query_ivf_index_gpu<T, R>(
     index: &IvfIndexGpu<T, R>,
     k: usize,
     nprobe: Option<usize>,
+    nquery: Option<usize>,
     return_dist: bool,
     verbose: bool,
 ) -> (Vec<Vec<usize>>, Option<Vec<Vec<T>>>)
 where
     R: Runtime,
-    T: Float + Sum + cubecl::frontend::Float + cubecl::CubeElement + FromPrimitive + Send + Sync,
+    T: Float
+        + Sum
+        + cubecl::frontend::Float
+        + cubecl::CubeElement
+        + FromPrimitive
+        + Send
+        + Sync
+        + SimdDistance,
 {
-    let (indices, distances) = index.query_batch(query_mat, k, nprobe, verbose);
+    let (indices, distances) = index.query_batch(query_mat, k, nprobe, nquery, verbose);
 
     if return_dist {
         (indices, Some(distances))
@@ -1584,6 +1688,7 @@ where
 /// * `index` - Reference to built index
 /// * `k` - Number of neighbours
 /// * `nprobe` - Clusters to search (defaults to √nlist)
+/// * `nquery` - Number of queries to load into the GPU.
 /// * `return_dist` - Return distances
 /// * `verbose` - Controls verbosity of the function
 ///
@@ -1594,14 +1699,22 @@ pub fn query_ivf_index_gpu_self<T, R>(
     index: &IvfIndexGpu<T, R>,
     k: usize,
     nprobe: Option<usize>,
+    nquery: Option<usize>,
     return_dist: bool,
     verbose: bool,
 ) -> (Vec<Vec<usize>>, Option<Vec<Vec<T>>>)
 where
     R: Runtime,
-    T: Float + Sum + cubecl::frontend::Float + cubecl::CubeElement + FromPrimitive + Send + Sync,
+    T: Float
+        + Sum
+        + cubecl::frontend::Float
+        + cubecl::CubeElement
+        + FromPrimitive
+        + Send
+        + Sync
+        + SimdDistance,
 {
-    index.generate_knn(k, nprobe, return_dist, verbose)
+    index.generate_knn(k, nprobe, nquery, return_dist, verbose)
 }
 
 ////////////
@@ -1641,7 +1754,7 @@ pub fn build_exhaustive_index_binary<T>(
     save_path: Option<impl AsRef<Path>>,
 ) -> std::io::Result<ExhaustiveIndexBinary<T>>
 where
-    T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum + ComplexField,
+    T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum + ComplexField + SimdDistance + Pod,
 {
     let metric = parse_ann_dist(metric).unwrap_or_default();
 
@@ -1679,7 +1792,7 @@ pub fn query_exhaustive_index_binary<T>(
     verbose: bool,
 ) -> (Vec<Vec<usize>>, Option<Vec<Vec<T>>>)
 where
-    T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum + ComplexField,
+    T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum + ComplexField + SimdDistance + Pod,
 {
     if rerank {
         query_parallel(query_mat.nrows(), return_dist, verbose, |i| {
@@ -1726,7 +1839,7 @@ pub fn query_exhaustive_index_binary_self<T>(
     verbose: bool,
 ) -> (Vec<Vec<usize>>, Option<Vec<Vec<T>>>)
 where
-    T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum + ComplexField,
+    T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum + ComplexField + SimdDistance + Pod,
 {
     index.generate_knn(k, rerank_factor, return_dist, verbose)
 }
@@ -1768,7 +1881,7 @@ pub fn build_ivf_index_binary<T>(
     verbose: bool,
 ) -> std::io::Result<IvfIndexBinary<T>>
 where
-    T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum + ComplexField,
+    T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum + ComplexField + SimdDistance + Pod,
 {
     let ann_dist = parse_ann_dist(dist_metric).unwrap_or_default();
 
@@ -1828,7 +1941,7 @@ pub fn query_ivf_index_binary<T>(
     verbose: bool,
 ) -> (Vec<Vec<usize>>, Option<Vec<Vec<T>>>)
 where
-    T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum + ComplexField,
+    T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum + ComplexField + SimdDistance + Pod,
 {
     let counter = Arc::new(AtomicUsize::new(0));
     let n_queries = query_mat.nrows();
@@ -1918,7 +2031,7 @@ pub fn query_ivf_index_binary_self<T>(
     verbose: bool,
 ) -> (Vec<Vec<usize>>, Option<Vec<Vec<T>>>)
 where
-    T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum + ComplexField,
+    T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum + ComplexField + SimdDistance + Pod,
 {
     index.generate_knn(k, nprobe, rerank_factor, return_dist, verbose)
 }
@@ -1952,7 +2065,7 @@ pub fn build_exhaustive_index_rabitq<T>(
     save_path: Option<impl AsRef<Path>>,
 ) -> std::io::Result<ExhaustiveIndexRaBitQ<T>>
 where
-    T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum + ComplexField,
+    T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum + ComplexField + SimdDistance + Pod,
 {
     let ann_dist = parse_ann_dist(dist_metric).unwrap_or_default();
     if save_store {
@@ -1997,7 +2110,7 @@ pub fn query_exhaustive_index_rabitq<T>(
     verbose: bool,
 ) -> (Vec<Vec<usize>>, Option<Vec<Vec<T>>>)
 where
-    T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum + ComplexField,
+    T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum + ComplexField + SimdDistance + Pod,
 {
     if rerank {
         query_parallel(query_mat.nrows(), return_dist, verbose, |i| {
@@ -2037,7 +2150,7 @@ pub fn query_exhaustive_index_rabitq_self<T>(
     verbose: bool,
 ) -> (Vec<Vec<usize>>, Option<Vec<Vec<T>>>)
 where
-    T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum + ComplexField,
+    T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum + ComplexField + SimdDistance + Pod,
 {
     index.generate_knn(k, n_probe, rerank_factor, return_dist, verbose)
 }
@@ -2076,7 +2189,7 @@ pub fn build_ivf_index_rabitq<T>(
     verbose: bool,
 ) -> std::io::Result<IvfIndexRaBitQ<T>>
 where
-    T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum + ComplexField,
+    T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum + ComplexField + SimdDistance + Pod,
 {
     let ann_dist = parse_ann_dist(dist_metric).unwrap_or_default();
     if save_store {
@@ -2120,7 +2233,7 @@ pub fn query_ivf_index_rabitq<T>(
     verbose: bool,
 ) -> (Vec<Vec<usize>>, Option<Vec<Vec<T>>>)
 where
-    T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum + ComplexField,
+    T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum + ComplexField + SimdDistance + Pod,
 {
     if rerank {
         query_parallel(query_mat.nrows(), return_dist, verbose, |i| {
@@ -2160,7 +2273,7 @@ pub fn query_ivf_index_rabitq_self<T>(
     verbose: bool,
 ) -> (Vec<Vec<usize>>, Option<Vec<Vec<T>>>)
 where
-    T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum + ComplexField,
+    T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum + ComplexField + SimdDistance + Pod,
 {
     index.generate_knn(k, nprobe, rerank_factor, return_dist, verbose)
 }

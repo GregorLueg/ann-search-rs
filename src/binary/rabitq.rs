@@ -43,6 +43,9 @@ pub struct RaBitQQuery<T> {
 // RaBitQEncoder //
 ///////////////////
 
+/// Encoded vector
+pub type VecEncoding<T> = (Vec<u8>, T, T, u32);
+
 /// Pure encoding logic for RaBitQ
 ///
 /// ### Fields
@@ -60,7 +63,7 @@ pub struct RaBitQEncoder<T> {
 
 impl<T> RaBitQEncoder<T>
 where
-    T: Float + FromPrimitive + ToPrimitive + ComplexField,
+    T: Float + FromPrimitive + ToPrimitive + ComplexField + SimdDistance,
 {
     /// Create encoder with random orthogonal rotation
     ///
@@ -92,7 +95,7 @@ where
     ///
     /// The `(binarised code, dist to centroid, correction for the dot product)`
     #[inline]
-    pub fn encode_vector(&self, vec: &[T], centroid: &[T]) -> (Vec<u8>, T, T) {
+    pub fn encode_vector(&self, vec: &[T], centroid: &[T]) -> VecEncoding<T> {
         // Compute residual
         let res: Vec<T> = vec
             .iter()
@@ -114,9 +117,11 @@ where
 
         // Binary encode (sign bits)
         let mut binary = vec![0u8; self.n_bytes];
+        let mut popcount: u32 = 0;
         for d in 0..self.dim {
             if v_c_rotated[d] >= T::zero() {
                 binary[d / 8] |= 1u8 << (d % 8);
+                popcount += 1;
             }
         }
 
@@ -126,7 +131,7 @@ where
             .map(|&x| x.abs())
             .fold(T::zero(), |a, b| a + b);
 
-        (binary, dist_to_centroid, dot_correction)
+        (binary, dist_to_centroid, dot_correction, popcount)
     }
 
     /// Encode a query vector relative to a specific cluster
@@ -155,11 +160,7 @@ where
         };
 
         // Residual relative to centroid
-        let res: Vec<T> = query_norm
-            .iter()
-            .zip(centroid.iter())
-            .map(|(&q, &c)| q - c)
-            .collect();
+        let res = T::subtract_simd(&query_norm, centroid);
 
         let dist_to_centroid = compute_norm(&res);
 
@@ -225,13 +226,11 @@ where
     #[inline]
     fn apply_rotation(&self, vec: &[T]) -> Vec<T> {
         let mut rotated = vec![T::zero(); self.dim];
-        for i in 0..self.dim {
-            let base = i * self.dim;
-            let mut sum = T::zero();
-            for j in 0..self.dim {
-                sum = sum + self.rotation[base + j] * vec[j];
-            }
-            rotated[i] = sum;
+        let dim = self.dim;
+
+        for i in 0..dim {
+            let row = &self.rotation[i * dim..(i + 1) * dim];
+            rotated[i] = T::dot_simd(row, vec);
         }
         rotated
     }
@@ -303,6 +302,7 @@ pub struct RaBitQStorage<T> {
     pub binary_codes: Vec<u8>,
     pub dist_to_centroid: Vec<T>,
     pub dot_corrections: Vec<T>,
+    pub popcounts: Vec<u32>,
     pub vector_indices: Vec<usize>,
     pub offsets: Vec<usize>,
     pub nlist: usize,
@@ -330,6 +330,7 @@ impl<T: Float + FromPrimitive> RaBitQStorage<T> {
             binary_codes: Vec::with_capacity(n * n_bytes),
             dist_to_centroid: Vec::with_capacity(n),
             dot_corrections: Vec::with_capacity(n),
+            popcounts: Vec::with_capacity(n),
             vector_indices: Vec::with_capacity(n),
             offsets: vec![0; nlist + 1],
             nlist,
@@ -387,6 +388,22 @@ impl<T: Float + FromPrimitive> RaBitQStorage<T> {
         let global_pos = cluster_start + local_idx;
         let byte_start = global_pos * self.n_bytes;
         &self.binary_codes[byte_start..byte_start + self.n_bytes]
+    }
+
+    /// Get popcounts slice for cluster
+    ///
+    /// ### Params
+    ///
+    /// * `cluster_idx` Index position of the cluster
+    ///
+    /// ### Returns
+    ///
+    /// The popcounts for every vector in this cluster
+    #[inline]
+    pub fn cluster_popcounts(&self, cluster_idx: usize) -> &[u32] {
+        let start = self.offsets[cluster_idx];
+        let end = self.offsets[cluster_idx + 1];
+        &self.popcounts[start..end]
     }
 
     /// Get dist_to_centroid slice for cluster
@@ -503,7 +520,7 @@ pub fn build_rabitq_storage<T>(
     encoder: &RaBitQEncoder<T>,
 ) -> RaBitQStorage<T>
 where
-    T: Float + FromPrimitive + ToPrimitive + ComplexField + Sum,
+    T: Float + FromPrimitive + ToPrimitive + ComplexField + Sum + SimdDistance,
 {
     let n_bytes = dim.div_ceil(8);
 
@@ -531,6 +548,7 @@ where
         binary_codes: vec![0u8; n * n_bytes],
         dist_to_centroid: vec![T::zero(); n],
         dot_corrections: vec![T::zero(); n],
+        popcounts: vec![0u32; n],
         vector_indices: vec![0usize; n],
         offsets: offsets.clone(),
         nlist,
@@ -550,12 +568,13 @@ where
         let vec = &data[vec_idx * dim..(vec_idx + 1) * dim];
         let centroid = &centroids[cluster_idx * dim..(cluster_idx + 1) * dim];
 
-        let (binary, dist, dot_corr) = encoder.encode_vector(vec, centroid);
+        let (binary, dist, dot_corr, popcount) = encoder.encode_vector(vec, centroid);
 
         let byte_start = pos * n_bytes;
         storage.binary_codes[byte_start..byte_start + n_bytes].copy_from_slice(&binary);
         storage.dist_to_centroid[pos] = dist;
         storage.dot_corrections[pos] = dot_corr;
+        storage.popcounts[pos] = popcount;
         storage.vector_indices[pos] = vec_idx;
     }
 
@@ -579,7 +598,7 @@ pub struct RaBitQQuantiser<T> {
 
 impl<T> RaBitQQuantiser<T>
 where
-    T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum + ComplexField,
+    T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum + ComplexField + SimdDistance,
 {
     /// Create a new RaBitQ quantiser
     ///
@@ -749,7 +768,7 @@ where
 
 impl<T> CentroidDistance<T> for RaBitQQuantiser<T>
 where
-    T: Float + FromPrimitive + Sum,
+    T: Float + FromPrimitive + Sum + SimdDistance,
 {
     fn centroids(&self) -> &[T] {
         &self.storage.centroids
@@ -819,7 +838,7 @@ mod tests {
         let vec = vec![1.0, 0.0, 0.0, 0.0];
         let centroid = vec![0.0, 0.0, 0.0, 0.0];
 
-        let (binary, dist, correction) = encoder.encode_vector(&vec, &centroid);
+        let (binary, dist, correction, _) = encoder.encode_vector(&vec, &centroid);
 
         assert_eq!(binary.len(), 1); // 4 dims = 1 byte
         assert_abs_diff_eq!(dist, 1.0, epsilon = 1e-5);
@@ -832,7 +851,7 @@ mod tests {
         let vec = vec![2.0, 2.0, 0.0, 0.0];
         let centroid = vec![1.0, 1.0, 0.0, 0.0];
 
-        let (_, dist, _) = encoder.encode_vector(&vec, &centroid);
+        let (_, dist, _, _) = encoder.encode_vector(&vec, &centroid);
 
         let expected_dist = (1.0f32 + 1.0f32).sqrt();
         assert_abs_diff_eq!(dist, expected_dist, epsilon = 1e-5);
@@ -978,7 +997,7 @@ mod tests {
         let vec = vec![1.0, 2.0, 3.0, 4.0];
         let centroid = vec.clone();
 
-        let (_, dist, _) = encoder.encode_vector(&vec, &centroid);
+        let (_, dist, _, _) = encoder.encode_vector(&vec, &centroid);
 
         assert_abs_diff_eq!(dist, 0.0, epsilon = 1e-5);
     }

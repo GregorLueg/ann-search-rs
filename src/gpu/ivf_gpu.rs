@@ -4,14 +4,21 @@ use num_traits::{Float, FromPrimitive};
 use rayon::prelude::*;
 use std::collections::BinaryHeap;
 use std::iter::Sum;
+use thousands::*;
 
 use crate::gpu::dist_gpu::*;
 use crate::gpu::tensor::*;
 use crate::gpu::*;
 use crate::utils::dist::Dist;
+use crate::utils::dist::*;
 use crate::utils::heap_structs::*;
 use crate::utils::ivf_utils::*;
 use crate::utils::*;
+
+/// To not explode memory VRAM memory
+const IVF_GPU_QUERY_BATCH_SIZE: usize = 100_000;
+/// Target max size for the candidate buffer
+const TARGET_BUFFER_MB: usize = 1500;
 
 /// Batched IVF index with GPU acceleration
 ///
@@ -22,6 +29,7 @@ use crate::utils::*;
 /// ### Architecture
 ///
 /// - Database vectors reorganised by cluster for contiguous access
+/// - All vectors and norms kept on GPU for fast access
 /// - Centroids kept on GPU for fast probe selection
 /// - Query pipeline:
 ///   1. Compute all query-centroid distances (1 kernel)
@@ -35,8 +43,8 @@ use crate::utils::*;
 ///
 /// ### Fields
 ///
-/// * `vectors_by_cluster` - Vectors reorganised by cluster
-/// * `norms_by_cluster` - Norms reorganised by cluster
+/// * `vectors_gpu` - All vectors reorganised by cluster, resident on GPU
+/// * `norms_gpu` - All norms reorganised by cluster, resident on GPU (Cosine only)
 /// * `original_indices` - Maps reorganised position -> original index
 /// * `cluster_offsets` - CSR offsets
 /// * `centroids_gpu` - Centroids kept on the GPU
@@ -47,8 +55,8 @@ use crate::utils::*;
 /// * `metric` - Distance metric used
 /// * `device` - Device runtime for the GPU work
 pub struct IvfIndexGpu<T: Float + cubecl::frontend::Float + cubecl::CubeElement, R: Runtime> {
-    vectors_by_cluster: Vec<T>,
-    norms_by_cluster: Vec<T>,
+    vectors_gpu: GpuTensor<R, T>,
+    norms_gpu: Option<GpuTensor<R, T>>,
     original_indices: Vec<usize>,
     cluster_offsets: Vec<usize>,
     centroids_gpu: GpuTensor<R, T>,
@@ -63,7 +71,14 @@ pub struct IvfIndexGpu<T: Float + cubecl::frontend::Float + cubecl::CubeElement,
 impl<T, R> IvfIndexGpu<T, R>
 where
     R: Runtime,
-    T: Float + Sum + cubecl::frontend::Float + cubecl::CubeElement + FromPrimitive + Send + Sync,
+    T: Float
+        + Sum
+        + cubecl::frontend::Float
+        + cubecl::CubeElement
+        + FromPrimitive
+        + Send
+        + Sync
+        + SimdDistance,
 {
     /// Build a batched IVF index
     ///
@@ -112,7 +127,8 @@ where
         if verbose {
             println!(
                 "  Building IVF-GPU-Batched index with {} clusters for {} vectors",
-                nlist, n
+                nlist,
+                n.separate_with_underscores()
             );
         }
 
@@ -168,15 +184,33 @@ where
             &metric,
         );
 
+        if verbose {
+            print_cluster_summary(&assignments, nlist);
+        }
+
         // reorganise vectors by cluster
         let (vectors_by_cluster, original_indices, cluster_offsets, norms_by_cluster) =
             reorganise_by_cluster(&vectors_flat, dim, n, &assignments, nlist, &metric);
 
         if verbose {
-            println!("  Uploading centroids to GPU");
+            println!("  Uploading all vectors to GPU");
         }
 
         let client = R::client(&device);
+
+        // Upload all vectors to GPU (the key optimisation)
+        let vectors_gpu =
+            GpuTensor::<R, T>::from_slice(&vectors_by_cluster, vec![n, dim_vectorized], &client);
+
+        let norms_gpu = if metric == Dist::Cosine {
+            Some(GpuTensor::<R, T>::from_slice(
+                &norms_by_cluster,
+                vec![n],
+                &client,
+            ))
+        } else {
+            None
+        };
 
         let centroids_gpu =
             GpuTensor::<R, T>::from_slice(&centroids, vec![nlist, dim_vectorized], &client);
@@ -196,8 +230,8 @@ where
         }
 
         Self {
-            vectors_by_cluster,
-            norms_by_cluster,
+            vectors_gpu,
+            norms_gpu,
             original_indices,
             cluster_offsets,
             centroids_gpu,
@@ -219,11 +253,14 @@ where
     /// * `dim_query` - The dimensions
     /// * `k` - Number of neighbours per query
     /// * `nprobe` - Number of clusters to search (defaults to √nlist)
+    /// * `nquery` - Number of vectors to load in one go into the GPU. If not
+    ///   provided, it will default to `100_000`.
     /// * `verbose` - Controls the verbosity of the function
     ///
     /// ### Returns
     ///
     /// Tuple of `(Vec<indices>, Vec<dist>)` for the queries.
+    #[allow(clippy::too_many_arguments)]
     fn query_internal(
         &self,
         queries_flat: &[T],
@@ -231,6 +268,8 @@ where
         dim_query: usize,
         k: usize,
         nprobe: Option<usize>,
+        nquery: Option<usize>,
+        client: &ComputeClient<<R as Runtime>::Server>,
         verbose: bool,
     ) -> (Vec<Vec<usize>>, Vec<Vec<T>>) {
         assert_eq!(
@@ -242,255 +281,49 @@ where
         let nprobe = nprobe
             .unwrap_or_else(|| ((self.nlist as f64).sqrt() as usize).max(1))
             .min(self.nlist);
+        let nquery = nquery.unwrap_or(IVF_GPU_QUERY_BATCH_SIZE);
+        if verbose {
+            println!(
+                "Using nquery batch size: {}",
+                nquery.separate_with_underscores()
+            );
+        }
+
         let k = k.min(self.n);
 
-        let dim_vectorized = self.dim / LINE_SIZE as usize;
-        let vec_size = LINE_SIZE as u8;
-        let client = R::client(&self.device);
+        let n_batches = n_queries.div_ceil(nquery);
 
-        // compute query norms for cosine
-        let query_norms = if self.metric == Dist::Cosine {
-            (0..n_queries)
-                .into_par_iter()
-                .map(|i| {
-                    let start = i * self.dim;
-                    queries_flat[start..start + self.dim]
-                        .iter()
-                        .map(|&x| x * x)
-                        .sum::<T>()
-                        .sqrt()
-                })
-                .collect::<Vec<_>>()
-        } else {
-            Vec::new()
-        };
-
-        // upload queries to GPU
-        let queries_gpu =
-            GpuTensor::<R, T>::from_slice(queries_flat, vec![n_queries, dim_vectorized], &client);
-
-        let query_norms_gpu = if self.metric == Dist::Cosine {
-            Some(GpuTensor::<R, T>::from_slice(
-                &query_norms,
-                vec![n_queries],
-                &client,
-            ))
-        } else {
-            None
-        };
-
-        // phase 1: compute query-centroid distances (one kernel launch here)
-        let centroid_dists_gpu = GpuTensor::<R, T>::empty(vec![n_queries, self.nlist], &client);
-
-        let grid_x = (self.nlist as u32).div_ceil(WORKGROUP_SIZE_X);
-        let grid_y = (n_queries as u32).div_ceil(WORKGROUP_SIZE_Y);
-
-        match self.metric {
-            Dist::Euclidean => unsafe {
-                euclidean_distances_gpu_chunk::launch_unchecked::<T, R>(
-                    &client,
-                    CubeCount::Static(grid_x, grid_y, 1),
-                    CubeDim::new(WORKGROUP_SIZE_X, WORKGROUP_SIZE_Y, 1),
-                    queries_gpu.clone().into_tensor_arg(vec_size),
-                    self.centroids_gpu.clone().into_tensor_arg(vec_size),
-                    centroid_dists_gpu.into_tensor_arg(1),
-                );
-            },
-            Dist::Cosine => unsafe {
-                cosine_distances_gpu_chunk::launch_unchecked::<T, R>(
-                    &client,
-                    CubeCount::Static(grid_x, grid_y, 1),
-                    CubeDim::new(WORKGROUP_SIZE_X, WORKGROUP_SIZE_Y, 1),
-                    queries_gpu.clone().into_tensor_arg(vec_size),
-                    self.centroids_gpu.clone().into_tensor_arg(vec_size),
-                    query_norms_gpu.as_ref().unwrap().clone().into_tensor_arg(1),
-                    self.centroid_norms_gpu
-                        .as_ref()
-                        .unwrap()
-                        .clone()
-                        .into_tensor_arg(1),
-                    centroid_dists_gpu.into_tensor_arg(1),
-                );
-            },
+        if n_batches == 1 {
+            // Small enough to process in one go
+            return self.query_batch_internal(queries_flat, n_queries, k, nprobe, verbose, client);
         }
 
-        let centroid_dists = centroid_dists_gpu.read(&client);
+        let mut all_indices = Vec::with_capacity(n_queries);
+        let mut all_distances = Vec::with_capacity(n_queries);
 
-        // phase 2: select top nprobe clusters per query
-        // happens on CPU in parallel - even with larger data sets this should be fine...
-        let probe_lists: Vec<Vec<usize>> = (0..n_queries)
-            .into_par_iter()
-            .map(|q| {
-                let row_start = q * self.nlist;
-                let mut cluster_dists: Vec<(T, usize)> = (0..self.nlist)
-                    .map(|c| (centroid_dists[row_start + c], c))
-                    .collect();
-                cluster_dists.sort_unstable_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
-                cluster_dists
-                    .into_iter()
-                    .take(nprobe)
-                    .map(|(_, c)| c)
-                    .collect()
-            })
-            .collect();
-
-        // invert: for each cluster, which queries probe it?
-        let cluster_to_queries = invert_probe_lists(&probe_lists, self.nlist);
-
-        // phase 3: per-cluster batched search with double buffering
-        let mut heaps: Vec<BinaryHeap<(OrderedFloat<T>, usize)>> =
-            vec![BinaryHeap::with_capacity(k + 1); n_queries];
-
-        // pending work: (distances_gpu, cluster_idx, query_indices)
-        let mut pending: Option<(GpuTensor<R, T>, usize, Vec<usize>)> = None;
-
-        for cluster_idx in 0..self.nlist {
-            if verbose && cluster_idx % 10 == 0 {
-                println!("Processed {} clusters out of {}", cluster_idx, self.nlist);
-            }
-
-            let query_indices = &cluster_to_queries[cluster_idx];
-            if query_indices.is_empty() {
-                continue;
-            }
-
-            let cluster_start = self.cluster_offsets[cluster_idx];
-            let cluster_end = self.cluster_offsets[cluster_idx + 1];
-            let cluster_size = cluster_end - cluster_start;
-
-            if cluster_size == 0 {
-                continue;
-            }
-
-            let n_probing = query_indices.len();
-
-            // Gather queries that probe this cluster
-            let mut gathered_queries = Vec::with_capacity(n_probing * self.dim);
-            let mut gathered_norms = Vec::with_capacity(n_probing);
-
-            for &q_idx in query_indices {
-                let start = q_idx * self.dim;
-                gathered_queries.extend_from_slice(&queries_flat[start..start + self.dim]);
-                if self.metric == Dist::Cosine {
-                    gathered_norms.push(query_norms[q_idx]);
-                }
-            }
-
-            let gathered_gpu = GpuTensor::<R, T>::from_slice(
-                &gathered_queries,
-                vec![n_probing, dim_vectorized],
-                &client,
-            );
-
-            let gathered_norms_gpu = if self.metric == Dist::Cosine {
-                Some(GpuTensor::<R, T>::from_slice(
-                    &gathered_norms,
-                    vec![n_probing],
-                    &client,
-                ))
-            } else {
-                None
-            };
-
-            // get cluster vectors (contiguous in vectors_by_cluster)
-            let cluster_vec_start = cluster_start * self.dim;
-            let cluster_vec_end = cluster_end * self.dim;
-            let cluster_data = &self.vectors_by_cluster[cluster_vec_start..cluster_vec_end];
-
-            let cluster_gpu = GpuTensor::<R, T>::from_slice(
-                cluster_data,
-                vec![cluster_size, dim_vectorized],
-                &client,
-            );
-
-            let cluster_norms_gpu = if self.metric == Dist::Cosine {
-                Some(GpuTensor::<R, T>::from_slice(
-                    &self.norms_by_cluster[cluster_start..cluster_end],
-                    vec![cluster_size],
-                    &client,
-                ))
-            } else {
-                None
-            };
-
-            let dist_gpu = GpuTensor::<R, T>::empty(vec![n_probing, cluster_size], &client);
-
-            let grid_x = (cluster_size as u32).div_ceil(WORKGROUP_SIZE_X);
-            let grid_y = (n_probing as u32).div_ceil(WORKGROUP_SIZE_Y);
-
-            match self.metric {
-                Dist::Euclidean => unsafe {
-                    euclidean_distances_gpu_chunk::launch_unchecked::<T, R>(
-                        &client,
-                        CubeCount::Static(grid_x, grid_y, 1),
-                        CubeDim::new(WORKGROUP_SIZE_X, WORKGROUP_SIZE_Y, 1),
-                        gathered_gpu.into_tensor_arg(vec_size),
-                        cluster_gpu.into_tensor_arg(vec_size),
-                        dist_gpu.into_tensor_arg(1),
-                    );
-                },
-                Dist::Cosine => unsafe {
-                    cosine_distances_gpu_chunk::launch_unchecked::<T, R>(
-                        &client,
-                        CubeCount::Static(grid_x, grid_y, 1),
-                        CubeDim::new(WORKGROUP_SIZE_X, WORKGROUP_SIZE_Y, 1),
-                        gathered_gpu.into_tensor_arg(vec_size),
-                        cluster_gpu.into_tensor_arg(vec_size),
-                        gathered_norms_gpu.unwrap().into_tensor_arg(1),
-                        cluster_norms_gpu.unwrap().into_tensor_arg(1),
-                        dist_gpu.into_tensor_arg(1),
-                    );
-                },
-            }
-
-            // process previous cluster's results while GPU computes current
-            if let Some((prev_dists_gpu, prev_cluster_idx, prev_query_indices)) = pending.take() {
-                let dists = prev_dists_gpu.read(&client);
-                process_cluster_results(
-                    &dists,
-                    &prev_query_indices,
-                    prev_cluster_idx,
-                    &self.original_indices,
-                    &self.cluster_offsets,
-                    k,
-                    &mut heaps,
+        for batch_idx in 0..n_batches {
+            if verbose {
+                println!(
+                    "Processing query batch {}/{} ({} queries per batch)",
+                    batch_idx + 1,
+                    n_batches,
+                    nquery.separate_with_underscores()
                 );
             }
 
-            pending = Some((dist_gpu, cluster_idx, query_indices.clone()));
+            let batch_start = batch_idx * nquery;
+            let batch_end = (batch_start + nquery).min(n_queries);
+            let batch_size = batch_end - batch_start;
+
+            let batch_queries = &queries_flat[batch_start * self.dim..batch_end * self.dim];
+
+            let (batch_indices, batch_dists) =
+                self.query_batch_internal(batch_queries, batch_size, k, nprobe, verbose, client);
+
+            all_indices.extend(batch_indices);
+            all_distances.extend(batch_dists);
         }
 
-        // process final cluster
-        if let Some((prev_dists_gpu, prev_cluster_idx, prev_query_indices)) = pending {
-            let dists = prev_dists_gpu.read(&client);
-            process_cluster_results(
-                &dists,
-                &prev_query_indices,
-                prev_cluster_idx,
-                &self.original_indices,
-                &self.cluster_offsets,
-                k,
-                &mut heaps,
-            );
-        }
-
-        // extract results from heaps (parallel)
-        let results: Vec<_> = heaps
-            .into_par_iter()
-            .map(|heap| {
-                let mut sorted: Vec<_> = heap.into_iter().collect();
-                sorted.sort_unstable_by_key(|&(d, _)| d);
-
-                let (distances, indices): (Vec<_>, Vec<_>) = sorted
-                    .into_iter()
-                    .map(|(OrderedFloat(d), idx)| (d, idx))
-                    .unzip();
-
-                (indices, distances)
-            })
-            .collect();
-
-        let (all_indices, all_distances): (Vec<_>, Vec<_>) = results.into_iter().unzip();
         (all_indices, all_distances)
     }
 
@@ -501,6 +334,9 @@ where
     /// * `query_mat` - Query vectors [n_queries, dim]
     /// * `k` - Number of neighbours per query
     /// * `nprobe` - Number of clusters to search (defaults to √nlist)
+    /// * `nquery` - Number of vectors to load in one go into the GPU. If not
+    ///   provided, it will default to `100_000`.
+    /// * `verbose` - Controls verbosity of the function.
     ///
     /// ### Returns
     ///
@@ -510,11 +346,29 @@ where
         query_mat: MatRef<T>,
         k: usize,
         nprobe: Option<usize>,
+        nquery: Option<usize>,
         verbose: bool,
     ) -> (Vec<Vec<usize>>, Vec<Vec<T>>) {
         let (queries_flat, n_queries, dim_query) = matrix_to_flat(query_mat);
+        let client: ComputeClient<<R as Runtime>::Server> = R::client(&self.device);
 
-        self.query_internal(&queries_flat, n_queries, dim_query, k, nprobe, verbose)
+        let nprobe_val = nprobe.unwrap_or(((self.nlist as f32).sqrt() as usize).max(1));
+
+        let batch_size = nquery.unwrap_or_else(|| self.calculate_safe_batch_size(nprobe_val));
+
+        let (indices, dist) = self.query_internal(
+            &queries_flat,
+            n_queries,
+            dim_query,
+            k,
+            nprobe,
+            Some(batch_size),
+            &client,
+            verbose,
+        );
+
+        client.memory_cleanup();
+        (indices, dist)
     }
 
     /// Generate kNN graph from vectors stored in the index
@@ -526,6 +380,8 @@ where
     ///
     /// * `k` - Number of neighbours per vector
     /// * `return_dist` - Whether to return distances
+    /// * `nprobe` - Number of centroids to check.
+    /// * `nquery` - Number of queries to load into the GPU.
     /// * `verbose` - Controls verbosity
     ///
     /// ### Returns
@@ -536,19 +392,50 @@ where
         &self,
         k: usize,
         nprobe: Option<usize>,
+        nquery: Option<usize>,
         return_dist: bool,
         verbose: bool,
     ) -> (Vec<Vec<usize>>, Option<Vec<Vec<T>>>) {
+        let client: ComputeClient<<R as Runtime>::Server> = R::client(&self.device);
+
+        // 1. Determine parameters
+        let nprobe = nprobe.unwrap_or(((self.nlist as f32).sqrt() as usize).max(1));
+
+        // 2. Auto-calculate batch size if not provided
+        // This prevents the BufferTooBig panic
+        let batch_size = nquery.unwrap_or_else(|| {
+            let safe = self.calculate_safe_batch_size(nprobe);
+            if verbose {
+                println!("  Auto-tuned batch size to {} (based on density)", safe);
+            }
+            safe
+        });
+
+        // 3. Read vectors back from GPU (Needed for query input)
+        if verbose {
+            println!("  Reading vectors from GPU for self-query...");
+        }
+        let vectors_by_cluster = self.vectors_gpu.clone().read(&client);
+
+        // 4. Run batched query
         let (indices_reorg, dist_reorg) = self.query_internal(
-            &self.vectors_by_cluster,
+            &vectors_by_cluster,
             self.n,
             self.dim,
             k,
-            nprobe,
+            Some(nprobe),
+            Some(batch_size), // Pass the safe batch size
+            &client,
             verbose,
         );
 
-        // reorder results to match original vector ordering
+        client.memory_cleanup();
+
+        // 5. Reorder results
+        if verbose {
+            println!("  Reordering results...");
+        }
+
         let mut indices = vec![Vec::new(); self.n];
         let mut dist = if return_dist {
             vec![Vec::new(); self.n]
@@ -579,18 +466,338 @@ where
     /// `(RAM bytes, VRAM bytes)`
     pub fn memory_usage_bytes(&self) -> (usize, usize) {
         let ram = std::mem::size_of_val(self)
-            + self.vectors_by_cluster.capacity() * std::mem::size_of::<T>()
-            + self.norms_by_cluster.capacity() * std::mem::size_of::<T>()
             + self.original_indices.capacity() * std::mem::size_of::<usize>()
             + self.cluster_offsets.capacity() * std::mem::size_of::<usize>();
 
-        let vram = self.centroids_gpu.vram_bytes()
+        let vram = self.vectors_gpu.vram_bytes()
+            + self.norms_gpu.as_ref().map_or(0, |t| t.vram_bytes())
+            + self.centroids_gpu.vram_bytes()
             + self
                 .centroid_norms_gpu
                 .as_ref()
                 .map_or(0, |t| t.vram_bytes());
 
         (ram, vram)
+    }
+
+    /// Process a single batch of queries against the index
+    ///
+    /// ### Params
+    ///
+    /// * `queries_flat` - The query vectors for this batch (flattened)
+    /// * `n_queries` - Number of queries in this batch
+    /// * `k` - Number of neighbours per query
+    /// * `nprobe` - Number of clusters to search
+    /// * `verbose` - Controls verbosity
+    ///
+    /// ### Returns
+    ///
+    /// Tuple of `(Vec<indices>, Vec<dist>)` for this batch
+    fn query_batch_internal(
+        &self,
+        queries_flat: &[T],
+        n_queries: usize,
+        k: usize,
+        nprobe: usize,
+        verbose: bool,
+        client: &ComputeClient<<R as Runtime>::Server>,
+    ) -> (Vec<Vec<usize>>, Vec<Vec<T>>) {
+        let dim_vectorized = self.dim / LINE_SIZE as usize;
+        let vec_size = LINE_SIZE as u8;
+
+        let query_norms = if self.metric == Dist::Cosine {
+            (0..n_queries)
+                .into_par_iter()
+                .map(|i| {
+                    let start = i * self.dim;
+                    queries_flat[start..start + self.dim]
+                        .iter()
+                        .map(|&x| x * x)
+                        .sum::<T>()
+                        .sqrt()
+                })
+                .collect::<Vec<_>>()
+        } else {
+            Vec::new()
+        };
+
+        // upload ALL queries to GPU once
+        let queries_gpu =
+            GpuTensor::<R, T>::from_slice(queries_flat, vec![n_queries, dim_vectorized], client);
+
+        let query_norms_gpu = if self.metric == Dist::Cosine {
+            Some(GpuTensor::<R, T>::from_slice(
+                &query_norms,
+                vec![n_queries],
+                client,
+            ))
+        } else {
+            None
+        };
+
+        let centroid_dists_gpu = GpuTensor::<R, T>::empty(vec![n_queries, self.nlist], client);
+        let grid_x = (self.nlist as u32).div_ceil(WORKGROUP_SIZE_X);
+        let grid_y = (n_queries as u32).div_ceil(WORKGROUP_SIZE_Y);
+
+        match self.metric {
+            Dist::Euclidean => unsafe {
+                euclidean_distances_gpu_chunk::launch_unchecked::<T, R>(
+                    client,
+                    CubeCount::Static(grid_x, grid_y, 1),
+                    CubeDim::new(WORKGROUP_SIZE_X, WORKGROUP_SIZE_Y, 1),
+                    queries_gpu.clone().into_tensor_arg(vec_size),
+                    self.centroids_gpu.clone().into_tensor_arg(vec_size),
+                    centroid_dists_gpu.into_tensor_arg(1),
+                );
+            },
+            Dist::Cosine => unsafe {
+                cosine_distances_gpu_chunk::launch_unchecked::<T, R>(
+                    client,
+                    CubeCount::Static(grid_x, grid_y, 1),
+                    CubeDim::new(WORKGROUP_SIZE_X, WORKGROUP_SIZE_Y, 1),
+                    queries_gpu.clone().into_tensor_arg(vec_size),
+                    self.centroids_gpu.clone().into_tensor_arg(vec_size),
+                    query_norms_gpu.as_ref().unwrap().clone().into_tensor_arg(1),
+                    self.centroid_norms_gpu
+                        .as_ref()
+                        .unwrap()
+                        .clone()
+                        .into_tensor_arg(1),
+                    centroid_dists_gpu.into_tensor_arg(1),
+                );
+            },
+        }
+
+        // read centroid distances - one block here
+        let centroid_dists = centroid_dists_gpu.read(client);
+
+        // select top clusters (CPU)
+        let probe_lists: Vec<Vec<usize>> = (0..n_queries)
+            .into_par_iter()
+            .map(|q| {
+                let row_start = q * self.nlist;
+                let mut cluster_dists: Vec<(T, usize)> = (0..self.nlist)
+                    .map(|c| (centroid_dists[row_start + c], c))
+                    .collect();
+                // Unstable sort is faster and sufficient
+                cluster_dists.sort_unstable_by(|a, b| {
+                    a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal)
+                });
+                cluster_dists
+                    .into_iter()
+                    .take(nprobe)
+                    .map(|(_, c)| c)
+                    .collect()
+            })
+            .collect();
+
+        // Invert: Cluster -> [Queries that probe it]
+        let cluster_to_queries = invert_probe_lists(&probe_lists, self.nlist);
+
+        let candidates_per_query: Vec<usize> = probe_lists
+            .iter()
+            .map(|clusters| {
+                clusters
+                    .iter()
+                    .map(|&c| self.cluster_offsets[c + 1] - self.cluster_offsets[c])
+                    .sum()
+            })
+            .collect();
+
+        let max_candidates = *candidates_per_query.iter().max().unwrap_or(&0);
+
+        if verbose {
+            println!(
+                "  Allocating candidate buffer: {} x {} floats",
+                n_queries, max_candidates
+            );
+        }
+
+        // Allocate the "Fire and Forget" buffers
+        // We allocate based on the worst-case query, but most queries will just leave the tail empty
+        let candidate_dists_gpu = GpuTensor::<R, T>::empty(vec![n_queries, max_candidates], client);
+        let candidate_indices_gpu =
+            GpuTensor::<R, u32>::empty(vec![n_queries, max_candidates], client);
+
+        // track where each query is currently writing in the buffer
+        let mut cpu_write_pointers = vec![0u32; n_queries];
+
+        for cluster_idx in 0..self.nlist {
+            let active_queries = &cluster_to_queries[cluster_idx];
+            if active_queries.is_empty() {
+                continue;
+            }
+
+            let cluster_start = self.cluster_offsets[cluster_idx];
+            let cluster_count = self.cluster_offsets[cluster_idx + 1] - cluster_start;
+
+            if cluster_count == 0 {
+                continue;
+            }
+
+            // Prepare the "Schedule" for this cluster
+            // We need to tell the GPU:
+            // 1. Which queries are active? (active_indices)
+            // 2. Where do they write? (write_offsets)
+
+            let n_active = active_queries.len();
+            let mut active_indices_vec = Vec::with_capacity(n_active);
+            let mut write_offsets_vec = Vec::with_capacity(n_active);
+
+            for &q_idx in active_queries {
+                active_indices_vec.push(q_idx as u32);
+                write_offsets_vec.push(cpu_write_pointers[q_idx]);
+
+                // advance the pointer for next time
+                cpu_write_pointers[q_idx] += cluster_count as u32;
+            }
+
+            // Upload the schedule
+            let active_indices_gpu =
+                GpuTensor::<R, u32>::from_slice(&active_indices_vec, vec![n_active], client);
+            let write_offsets_gpu =
+                GpuTensor::<R, u32>::from_slice(&write_offsets_vec, vec![n_active], client);
+
+            let grid_x = (cluster_count as u32).div_ceil(WORKGROUP_SIZE_X);
+            let grid_y = (n_active as u32).div_ceil(WORKGROUP_SIZE_Y);
+
+            // Launch Kernel
+            match self.metric {
+                Dist::Euclidean => unsafe {
+                    compute_candidates_euclidean::launch_unchecked::<T, R>(
+                        client,
+                        CubeCount::Static(grid_x, grid_y, 1),
+                        CubeDim::new(WORKGROUP_SIZE_X, WORKGROUP_SIZE_Y, 1),
+                        queries_gpu.clone().into_tensor_arg(vec_size),
+                        self.vectors_gpu.clone().into_tensor_arg(vec_size),
+                        active_indices_gpu.into_tensor_arg(1),
+                        write_offsets_gpu.into_tensor_arg(1),
+                        candidate_dists_gpu.clone().into_tensor_arg(1),
+                        candidate_indices_gpu.clone().into_tensor_arg(1),
+                        ScalarArg {
+                            elem: cluster_start as u32,
+                        },
+                        ScalarArg {
+                            elem: cluster_count as u32,
+                        },
+                    );
+                },
+                Dist::Cosine => unsafe {
+                    compute_candidates_cosine::launch_unchecked::<T, R>(
+                        client,
+                        CubeCount::Static(grid_x, grid_y, 1),
+                        CubeDim::new(WORKGROUP_SIZE_X, WORKGROUP_SIZE_Y, 1),
+                        queries_gpu.clone().into_tensor_arg(vec_size),
+                        self.vectors_gpu.clone().into_tensor_arg(vec_size),
+                        query_norms_gpu.as_ref().unwrap().clone().into_tensor_arg(1),
+                        self.norms_gpu.as_ref().unwrap().clone().into_tensor_arg(1),
+                        active_indices_gpu.into_tensor_arg(1),
+                        write_offsets_gpu.into_tensor_arg(1),
+                        candidate_dists_gpu.clone().into_tensor_arg(1),
+                        candidate_indices_gpu.clone().into_tensor_arg(1),
+                        ScalarArg {
+                            elem: cluster_start as u32,
+                        },
+                        ScalarArg {
+                            elem: cluster_count as u32,
+                        },
+                    );
+                },
+            }
+        }
+
+        if verbose {
+            println!("  GPU work queued. Waiting for results...");
+        }
+
+        // ONE BLOCKING READ for all data
+        let all_dists_flat = candidate_dists_gpu.read(client);
+        let all_indices_flat = candidate_indices_gpu.read(client);
+
+        if verbose {
+            println!("  Reducing results on CPU...");
+        }
+
+        // Parallel Top-K selection on CPU
+        let results: Vec<(Vec<usize>, Vec<T>)> = (0..n_queries)
+            .into_par_iter()
+            .map(|q_idx| {
+                let start = q_idx * max_candidates;
+                let count = candidates_per_query[q_idx];
+
+                let dist_row = &all_dists_flat[start..start + count];
+                let idx_row = &all_indices_flat[start..start + count];
+
+                let mut heap: BinaryHeap<(OrderedFloat<T>, usize)> =
+                    BinaryHeap::with_capacity(k + 1);
+
+                for i in 0..count {
+                    let d = dist_row[i];
+                    let idx = self.original_indices[idx_row[i] as usize];
+
+                    if heap.len() == k {
+                        if let Some((max_dist, _)) = heap.peek() {
+                            if d >= max_dist.0 {
+                                continue;
+                            }
+                        }
+                    }
+
+                    heap.push((OrderedFloat(d), idx));
+
+                    if heap.len() > k {
+                        heap.pop();
+                    }
+                }
+
+                let mut final_indices = Vec::with_capacity(k);
+                let mut final_dists = Vec::with_capacity(k);
+
+                let mut items = heap.into_vec();
+                items.sort_unstable();
+
+                for (d_wrapper, idx) in items {
+                    final_indices.push(idx);
+                    final_dists.push(d_wrapper.0);
+                }
+
+                (final_indices, final_dists)
+            })
+            .collect();
+
+        // Unzip results
+        let (indices, dists) = results.into_iter().unzip();
+        (indices, dists)
+    }
+
+    /// Calculate a memory-safe batch size for the Candidate Buffer strategy
+    ///
+    /// The new "Fire and Forget" strategy requires allocating a buffer of size:
+    /// [batch_size * nprobe * avg_cluster_size].
+    ///
+    /// ### Params
+    ///
+    /// * `nprobe` - Number of probes to use
+    ///
+    /// ### Returns
+    ///
+    /// The batch size
+    fn calculate_safe_batch_size(&self, nprobe: usize) -> usize {
+        // f32 dist + u32 index
+        const BYTES_PER_CANDIDATE: usize = 8;
+        // To account for variable cluster sizes
+        const SAFETY_MARGIN: f32 = 1.5;
+
+        let avg_cluster_size = self.n as f32 / self.nlist as f32;
+        let candidates_per_query = nprobe as f32 * avg_cluster_size * SAFETY_MARGIN;
+
+        let bytes_per_query = candidates_per_query * BYTES_PER_CANDIDATE as f32;
+
+        // calculate how many queries fit in the target memory
+        let safe_batch = ((TARGET_BUFFER_MB * 1024 * 1024) as f32 / bytes_per_query) as usize;
+
+        // clamp between 100 (sanity min) and 20k (sanity max)
+        safe_batch.clamp(100, 20_000)
     }
 }
 
@@ -689,52 +896,6 @@ fn invert_probe_lists(probe_lists: &[Vec<usize>], nlist: usize) -> Vec<Vec<usize
     result
 }
 
-/// Process cluster search results and update per-query heaps
-///
-/// Takes distance matrix from a batched cluster search and updates the
-/// k-NN heaps for each query. Only retains the k closest neighbours seen
-/// so far across all processed clusters.
-///
-/// ### Params
-///
-/// * `distances` - Distance matrix [n_queries, cluster_size]
-/// * `query_indices` - Global query indices for this batch
-/// * `cluster_idx` - Index of the cluster being processed
-/// * `original_indices` - Maps reorganised position -> original database index
-/// * `cluster_offsets` - CSR offsets for clusters
-/// * `k` - Number of neighbours to retain
-/// * `heaps` - Per-query max-heaps storing current k-NN candidates
-fn process_cluster_results<T: Float>(
-    distances: &[T],
-    query_indices: &[usize],
-    cluster_idx: usize,
-    original_indices: &[usize],
-    cluster_offsets: &[usize],
-    k: usize,
-    heaps: &mut [BinaryHeap<(OrderedFloat<T>, usize)>],
-) {
-    let cluster_start = cluster_offsets[cluster_idx];
-    let cluster_end = cluster_offsets[cluster_idx + 1];
-    let cluster_size = cluster_end - cluster_start;
-
-    for (local_q, &global_q) in query_indices.iter().enumerate() {
-        let heap = &mut heaps[global_q];
-        let row_start = local_q * cluster_size;
-
-        for i in 0..cluster_size {
-            let dist = distances[row_start + i];
-            let original_idx = original_indices[cluster_start + i];
-
-            if heap.len() < k {
-                heap.push((OrderedFloat(dist), original_idx));
-            } else if dist < heap.peek().unwrap().0 .0 {
-                heap.pop();
-                heap.push((OrderedFloat(dist), original_idx));
-            }
-        }
-    }
-}
-
 ///////////
 // Tests //
 ///////////
@@ -787,7 +948,7 @@ mod tests {
 
         let query = Mat::from_fn(3, 4, |i, j| if i == j { 1.0_f32 } else { 0.0_f32 });
 
-        let (indices, distances) = index.query_batch(query.as_ref(), 5, Some(3), false);
+        let (indices, distances) = index.query_batch(query.as_ref(), 5, Some(3), None, false);
 
         assert_eq!(indices.len(), 3);
         assert_eq!(distances.len(), 3);
@@ -811,7 +972,7 @@ mod tests {
         );
 
         let query = Mat::from_fn(2, 4, |_, _| 1.0_f32);
-        let (indices, distances) = index.query_batch(query.as_ref(), 3, Some(2), false);
+        let (indices, distances) = index.query_batch(query.as_ref(), 3, Some(2), None, false);
 
         assert_eq!(indices.len(), 2);
         assert_eq!(indices[0].len(), 3);
@@ -834,7 +995,7 @@ mod tests {
             device,
         );
 
-        let (indices, distances) = index.generate_knn(4, Some(3), true, false);
+        let (indices, distances) = index.generate_knn(4, Some(3), None, true, false);
 
         assert_eq!(indices.len(), 30);
         assert!(distances.is_some());

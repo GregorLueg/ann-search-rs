@@ -1,3 +1,4 @@
+use bytemuck::Pod;
 use faer::{MatRef, RowRef};
 use faer_traits::ComplexField;
 use num_traits::{Float, FromPrimitive, ToPrimitive};
@@ -61,7 +62,7 @@ where
 /// Trait implementation for the CentroidDistances
 impl<T> CentroidDistance<T> for IvfIndexRaBitQ<T>
 where
-    T: Float + FromPrimitive + Sum,
+    T: Float + FromPrimitive + Sum + SimdDistance,
 {
     fn centroids(&self) -> &[T] {
         &self.storage.centroids
@@ -86,7 +87,7 @@ where
 
 impl<T> IvfIndexRaBitQ<T>
 where
-    T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum + ComplexField,
+    T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum + ComplexField + SimdDistance + Pod,
 {
     /// Build IVF-RaBitQ index
     ///
@@ -215,6 +216,10 @@ where
             nlist,
             &metric,
         );
+
+        if verbose {
+            print_cluster_summary(&assignments, nlist);
+        }
 
         // create encoder with shared rotation
         let encoder = RaBitQEncoder::new(dim, metric, seed as u64);
@@ -362,6 +367,10 @@ where
             nlist,
             &metric,
         );
+
+        if verbose {
+            print_cluster_summary(&assignments, nlist);
+        }
 
         let encoder = RaBitQEncoder::new(dim, metric, seed as u64);
 

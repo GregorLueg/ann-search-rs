@@ -81,7 +81,7 @@ where
 
 impl<T> CentroidDistance<T> for IvfSq8Index<T>
 where
-    T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum,
+    T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum + SimdDistance,
 {
     fn centroids(&self) -> &[T] {
         &self.centroids
@@ -110,7 +110,7 @@ where
 
 impl<T> IvfSq8Index<T>
 where
-    T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum,
+    T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum + SimdDistance,
 {
     /// Build an IVF index with scalar 8-bit quantisation.
     ///
@@ -221,6 +221,11 @@ where
             nlist,
             &metric,
         );
+
+        if verbose {
+            print_cluster_summary(&assignments, nlist);
+        }
+
         let (all_indices, offsets) = build_csr_layout(assignments, n, nlist);
 
         // 5. quantise all vectors with global codebook

@@ -16,7 +16,7 @@ use crate::utils::Dist;
 /// Trait for computing distances between Floats
 pub trait CentroidDistance<T>
 where
-    T: Float + Sum,
+    T: Float + Sum + SimdDistance,
 {
     /// Get the internal flat centroids representation
     fn centroids(&self) -> &[T];
@@ -146,7 +146,7 @@ fn min_distance_to_centroids<T>(
     metric: &Dist,
 ) -> T
 where
-    T: Float,
+    T: Float + SimdDistance,
 {
     let mut min_dist = T::infinity();
 
@@ -190,7 +190,7 @@ fn weighted_kmeans_plus_plus<T>(
     seed: usize,
 ) -> Vec<T>
 where
-    T: Float,
+    T: Float + SimdDistance,
 {
     let mut rng = StdRng::seed_from_u64(seed as u64);
     let n = data.len() / dim;
@@ -274,7 +274,7 @@ fn kmeans_parallel_init<T>(
     seed: usize,
 ) -> Vec<T>
 where
-    T: Float + Send + Sync,
+    T: Float + Send + Sync + SimdDistance,
 {
     let mut rng = StdRng::seed_from_u64(seed as u64);
     let oversampling_factor = 2;
@@ -387,7 +387,7 @@ fn parallel_lloyd<T>(
     max_iters: usize,
     verbose: bool,
 ) where
-    T: Float + Send + Sync,
+    T: Float + Send + Sync + SimdDistance,
 {
     for iter in 0..max_iters {
         let assignments = assign_all_parallel(
@@ -483,7 +483,7 @@ pub fn train_centroids<T>(
     verbose: bool,
 ) -> Vec<T>
 where
-    T: Float + FromPrimitive + ToPrimitive + Send + Sync,
+    T: Float + FromPrimitive + ToPrimitive + Send + Sync + SimdDistance,
 {
     let data_norms = if matches!(metric, Dist::Cosine) {
         (0..n)
@@ -612,7 +612,7 @@ pub fn assign_all_parallel<T>(
     metric: &Dist,
 ) -> Vec<usize>
 where
-    T: Float + Send + Sync,
+    T: Float + Send + Sync + SimdDistance,
 {
     (0..n)
         .into_par_iter()
@@ -676,6 +676,38 @@ where
     }
 
     (sampled, indices)
+}
+
+/// Print summary statistics of cluster assignments
+///
+/// ### Params
+///
+/// * `assignments` - Cluster assignment for each vector
+/// * `nlist` - Number of clusters
+pub fn print_cluster_summary(assignments: &[usize], nlist: usize) {
+    let mut counts = vec![0usize; nlist];
+    for &cluster in assignments {
+        counts[cluster] += 1;
+    }
+
+    counts.sort_unstable();
+
+    let n = assignments.len();
+    let min = counts[0];
+    let max = counts[nlist - 1];
+    let p25 = counts[nlist / 4];
+    let p50 = counts[nlist / 2];
+    let p75 = counts[3 * nlist / 4];
+    let mean = n / nlist;
+
+    println!("Cluster size distribution:");
+    println!("  Min:    {}", min);
+    println!("  P25:    {}", p25);
+    println!("  Median: {}", p50);
+    println!("  P75:    {}", p75);
+    println!("  Max:    {}", max);
+    println!("  Mean:   {}", mean);
+    println!("  Imbalance ratio: {:.2}", max as f64 / mean as f64);
 }
 
 ///////////
