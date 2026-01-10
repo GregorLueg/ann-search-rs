@@ -151,11 +151,7 @@ where
                 .map(|i| {
                     let start = i * dim;
                     let end = start + dim;
-                    vectors_flat[start..end]
-                        .iter()
-                        .map(|x| *x * *x)
-                        .fold(T::zero(), |a, b| a + b)
-                        .sqrt()
+                    T::calculate_norm(&vectors_flat[start..end])
                 })
                 .collect()
         } else {
