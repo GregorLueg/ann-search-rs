@@ -1,6 +1,7 @@
 #![allow(clippy::needless_range_loop)] // I want these loops!
 
 pub mod annoy;
+pub mod ball_tree;
 pub mod exhaustive;
 pub mod hnsw;
 pub mod ivf;
@@ -43,6 +44,7 @@ use faer_traits::ComplexField;
 use std::path::Path;
 
 use crate::annoy::*;
+use crate::ball_tree::*;
 use crate::exhaustive::*;
 use crate::hnsw::*;
 use crate::ivf::*;
@@ -344,6 +346,90 @@ where
 /// A tuple of `(knn_indices, optional distances)`
 pub fn query_annoy_self<T>(
     index: &AnnoyIndex<T>,
+    k: usize,
+    search_budget: Option<usize>,
+    return_dist: bool,
+    verbose: bool,
+) -> (Vec<Vec<usize>>, Option<Vec<Vec<T>>>)
+where
+    T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum + SimdDistance,
+{
+    index.generate_knn(k, search_budget, return_dist, verbose)
+}
+
+//////////////
+// BallTree //
+//////////////
+
+/// Build a BallTree index
+///
+/// ### Params
+///
+/// * `mat` - The data matrix. Rows represent the samples, columns represent
+///   the embedding dimensions
+/// * `dist_metric` - Distance metric to use
+/// * `seed` - Random seed for reproducibility
+///
+/// ### Return
+///
+/// The `BallTreeIndex`.
+pub fn build_balltree_index<T>(mat: MatRef<T>, dist_metric: String, seed: usize) -> BallTreeIndex<T>
+where
+    T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum + SimdDistance,
+{
+    let ann_dist = parse_ann_dist(&dist_metric).unwrap_or_default();
+    BallTreeIndex::new(mat, ann_dist, seed)
+}
+
+/// Helper function to query a given BallTree index
+///
+/// ### Params
+///
+/// * `query_mat` - The query matrix containing the samples x features
+/// * `k` - Number of neighbours to return
+/// * `index` - The BallTreeIndex to query
+/// * `search_budget` - Search budget (number of items to examine)
+/// * `return_dist` - Shall the distances between the different points be
+///   returned
+/// * `verbose` - Controls verbosity of the function
+///
+/// ### Returns
+///
+/// A tuple of `(knn_indices, optional distances)`
+pub fn query_balltree_index<T>(
+    query_mat: MatRef<T>,
+    index: &BallTreeIndex<T>,
+    k: usize,
+    search_budget: Option<usize>,
+    return_dist: bool,
+    verbose: bool,
+) -> (Vec<Vec<usize>>, Option<Vec<Vec<T>>>)
+where
+    T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum + SimdDistance,
+{
+    query_parallel(query_mat.nrows(), return_dist, verbose, |i| {
+        index.query_row(query_mat.row(i), k, search_budget)
+    })
+}
+
+/// Helper function to self query the BallTree index
+///
+/// This function will generate a full kNN graph based on the internal data.
+///
+/// ### Params
+///
+/// * `k` - Number of neighbours to return
+/// * `index` - The BallTreeIndex to query
+/// * `search_budget` - Search budget (number of items to examine)
+/// * `return_dist` - Shall the distances between the different points be
+///   returned
+/// * `verbose` - Controls verbosity of the function
+///
+/// ### Returns
+///
+/// A tuple of `(knn_indices, optional distances)`
+pub fn query_balltree_self<T>(
+    index: &BallTreeIndex<T>,
     k: usize,
     search_budget: Option<usize>,
     return_dist: bool,
@@ -1438,7 +1524,7 @@ pub fn build_exhaustive_index_gpu<T, R>(
     device: R::Device,
 ) -> ExhaustiveIndexGpu<T, R>
 where
-    T: Float + Sum + cubecl::frontend::Float + cubecl::CubeElement + FromPrimitive,
+    T: Float + Sum + cubecl::frontend::Float + cubecl::CubeElement + FromPrimitive + SimdDistance,
     R: Runtime,
 {
     let metric = parse_ann_dist(dist_metric).unwrap_or_default();
@@ -1466,7 +1552,7 @@ pub fn query_exhaustive_index_gpu<T, R>(
     verbose: bool,
 ) -> (Vec<Vec<usize>>, Option<Vec<Vec<T>>>)
 where
-    T: Float + Sum + cubecl::frontend::Float + cubecl::CubeElement + FromPrimitive,
+    T: Float + Sum + cubecl::frontend::Float + cubecl::CubeElement + FromPrimitive + SimdDistance,
     R: Runtime,
 {
     let (indices, distances) = index.query_batch(query_mat, k, verbose);
@@ -1500,7 +1586,7 @@ pub fn query_exhaustive_index_gpu_self<T, R>(
     verbose: bool,
 ) -> (Vec<Vec<usize>>, Option<Vec<Vec<T>>>)
 where
-    T: Float + Sum + cubecl::frontend::Float + cubecl::CubeElement + FromPrimitive,
+    T: Float + Sum + cubecl::frontend::Float + cubecl::CubeElement + FromPrimitive + SimdDistance,
     R: Runtime,
 {
     index.generate_knn(k, return_dist, verbose)

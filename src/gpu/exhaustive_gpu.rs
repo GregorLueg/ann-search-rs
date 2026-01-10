@@ -6,7 +6,7 @@ use std::iter::Sum;
 
 use crate::gpu::dist_gpu::*;
 use crate::gpu::*;
-use crate::utils::dist::Dist;
+use crate::utils::dist::*;
 use crate::utils::*;
 
 ////////////////////////
@@ -37,7 +37,12 @@ pub struct ExhaustiveIndexGpu<T: Float, R: Runtime> {
 impl<T, R> ExhaustiveIndexGpu<T, R>
 where
     R: Runtime,
-    T: Float + Sum + cubecl::frontend::Float + cubecl::CubeElement + num_traits::FromPrimitive,
+    T: Float
+        + Sum
+        + cubecl::frontend::Float
+        + cubecl::CubeElement
+        + num_traits::FromPrimitive
+        + SimdDistance,
 {
     /// Generate a new exhaustive index (on the GPU)
     ///
@@ -65,11 +70,8 @@ where
             (0..n)
                 .map(|i| {
                     let start = i * dim;
-                    vectors_flat[start..start + dim]
-                        .iter()
-                        .map(|&x| x * x)
-                        .sum::<T>()
-                        .sqrt()
+                    let end = start + dim;
+                    T::calculate_norm(&vectors_flat[start..end])
                 })
                 .collect()
         } else {

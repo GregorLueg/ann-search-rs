@@ -28,7 +28,7 @@ run_common_patterns() {
 
 run_standard() {
     echo "=== Running standard benchmarks ==="
-    for algo in annoy hnsw ivf lsh nndescent; do
+    for algo in annoy balltree hnsw ivf lsh nndescent; do
         run_common_patterns run_benchmark "${algo}" "${algo}"
     done
 }
@@ -36,10 +36,10 @@ run_standard() {
 run_quantised_benchmarks() {
     echo "=== Running quantised benchmarks ==="
     
-    # # IVF-BF16 and IVF-SQ8
-    # for variant in bf16 sq8; do
-    #     run_common_patterns run_quantised "${variant}" "${variant}"
-    # done
+    # IVF-BF16 and IVF-SQ8
+    for variant in bf16 sq8; do
+        run_common_patterns run_quantised "${variant}" "${variant}"
+    done
 
     # Higher dimensions for SQ8
     for dim in 96 128; do

@@ -36,6 +36,7 @@ anticipated.
 
 - **Multiple ANN algorithms**:
   - *Annoy (Approximate Nearest Neighbours Oh Yeah)*
+  - *BallTree*
   - *HNSW (Hierarchical Navigable Small World)*
   - *NNDescent (Nearest Neighbour Descent)*
   (heavily inspired by [PyNNDescent](https://github.com/lmcinnes/pynndescent)).
@@ -81,6 +82,7 @@ To note, I have changed some of the interfaces between versions.
 
 - ~~First GPU support~~ (Implemented with version `0.2.1` of the crate).
 - ~~Binary indices~~ (Also implemented with version `0.2.1`).
+- ~~Proper SIMD~~ (Implemented with `0.2.2` via the [wide crate](https://docs.rs/wide/latest/wide/)).
 - Option to save indices on-disk and maybe do on-disk querying ... ? The binary
   indices already use some aspects of on-disk storage.
 - More GPU support for other indices. TBD, needs to warrant the time investment.
