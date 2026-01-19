@@ -11,6 +11,8 @@ use std::arch::aarch64::*;
 #[cfg(target_arch = "x86_64")]
 use std::arch::x86_64::*;
 
+use wide::u8x16;
+
 ////////////////////
 // VectorDistance //
 ////////////////////
@@ -286,6 +288,143 @@ pub trait VectorDistanceBinary {
 // VectorDistanceRaBitQ //
 //////////////////////////
 
+//////////
+// SIMD //
+//////////
+
+const BIT_MASKS_16: u8x16 = u8x16::new([1, 2, 4, 8, 16, 32, 64, 128, 1, 2, 4, 8, 16, 32, 64, 128]);
+const ONE_16: u8x16 = u8x16::new([1; 16]);
+
+/// Horizontal sum of 16-bit vector
+///
+/// ### Params
+///
+/// * `v`: The vector to sum
+///
+/// ### Returns
+///
+/// The sum of the vector elements
+#[inline(always)]
+fn horizontal_sum_16(v: u8x16) -> u32 {
+    let a: [u8; 16] = v.into();
+    (a[0] as u32 + a[1] as u32 + a[2] as u32 + a[3] as u32)
+        + (a[4] as u32 + a[5] as u32 + a[6] as u32 + a[7] as u32)
+        + (a[8] as u32 + a[9] as u32 + a[10] as u32 + a[11] as u32)
+        + (a[12] as u32 + a[13] as u32 + a[14] as u32 + a[15] as u32)
+}
+
+/// Dot product - 16-lane SIMD version
+///
+/// ### Params
+///
+/// * `query` - The query vector
+/// * `binary` - The binary vector
+/// * `dim` - The dimension of the vectors
+///
+/// ### Returns
+///
+/// The dot product of the query and binary vectors
+#[inline]
+pub fn dot_query_binary_simd(query: &[u8], binary: &[u8], dim: usize) -> u32 {
+    let full_bytes = dim / 8;
+    let chunks = full_bytes / 2;
+    let mut acc = u8x16::ZERO;
+
+    for chunk_idx in 0..chunks {
+        let byte_offset = chunk_idx * 2;
+        let dim_offset = byte_offset * 8;
+
+        let query_vals =
+            u8x16::new(<[u8; 16]>::try_from(&query[dim_offset..dim_offset + 16]).unwrap());
+
+        let b0 = binary[byte_offset];
+        let b1 = binary[byte_offset + 1];
+        let binary_broadcast = u8x16::new([
+            b0, b0, b0, b0, b0, b0, b0, b0, b1, b1, b1, b1, b1, b1, b1, b1,
+        ]);
+
+        // anded is 0 or a power-of-2 (1,2,4,8,16,32,64,128)
+        let anded = binary_broadcast & BIT_MASKS_16;
+
+        // min(0, 1) = 0, min(any_power_of_2, 1) = 1
+        let zero_or_one = anded.min(ONE_16);
+
+        // 0 - 0 = 0x00, 0 - 1 = 0xFF (wrapping)
+        let mask = u8x16::ZERO - zero_or_one;
+
+        acc += query_vals & mask;
+    }
+
+    let mut sum = horizontal_sum_16(acc);
+
+    // remaining full bytes
+    for byte_idx in (chunks * 2)..full_bytes {
+        let bits = binary[byte_idx];
+        let base = byte_idx * 8;
+        sum += query[base] as u32 * (bits & 1) as u32;
+        sum += query[base + 1] as u32 * ((bits >> 1) & 1) as u32;
+        sum += query[base + 2] as u32 * ((bits >> 2) & 1) as u32;
+        sum += query[base + 3] as u32 * ((bits >> 3) & 1) as u32;
+        sum += query[base + 4] as u32 * ((bits >> 4) & 1) as u32;
+        sum += query[base + 5] as u32 * ((bits >> 5) & 1) as u32;
+        sum += query[base + 6] as u32 * ((bits >> 6) & 1) as u32;
+        sum += query[base + 7] as u32 * ((bits >> 7) & 1) as u32;
+    }
+
+    // remaining bits
+    let remaining = dim % 8;
+    if remaining > 0 {
+        let bits = binary[full_bytes];
+        let base = full_bytes * 8;
+        for bit_pos in 0..remaining {
+            sum += query[base + bit_pos] as u32 * ((bits >> bit_pos) & 1) as u32;
+        }
+    }
+
+    sum
+}
+
+/// Scalar fallback for dot product computation
+///
+/// ### Params
+///
+/// * `query` - The query vector
+/// * `binary` - The binary vector
+/// * `dim` - The dimension of the vectors
+///
+/// ### Returns
+///
+/// The dot product of the query and binary vectors
+#[inline(always)]
+pub fn dot_query_binary_scalar(query: &[u8], binary: &[u8], dim: usize) -> u32 {
+    let mut sum = 0u32;
+    let full_bytes = dim / 8;
+
+    for byte_idx in 0..full_bytes {
+        let bits = binary[byte_idx];
+        let base = byte_idx * 8;
+        sum += query[base] as u32 * (bits & 1) as u32;
+        sum += query[base + 1] as u32 * ((bits >> 1) & 1) as u32;
+        sum += query[base + 2] as u32 * ((bits >> 2) & 1) as u32;
+        sum += query[base + 3] as u32 * ((bits >> 3) & 1) as u32;
+        sum += query[base + 4] as u32 * ((bits >> 4) & 1) as u32;
+        sum += query[base + 5] as u32 * ((bits >> 5) & 1) as u32;
+        sum += query[base + 6] as u32 * ((bits >> 6) & 1) as u32;
+        sum += query[base + 7] as u32 * ((bits >> 7) & 1) as u32;
+    }
+
+    let remaining = dim % 8;
+    if remaining > 0 {
+        let bits = binary[full_bytes];
+        let base = full_bytes * 8;
+        for bit_pos in 0..remaining {
+            sum += query[base + bit_pos] as u32 * ((bits >> bit_pos) & 1) as u32;
+        }
+    }
+
+    sum
+}
+
 /// Trait for RaBitQ distance computation over CSR storage
 pub trait VectorDistanceRaBitQ<T>
 where
@@ -337,7 +476,9 @@ where
     /// Number of set bits in the binary vector
     #[inline]
     fn popcount(&self, cluster_idx: usize, local_idx: usize) -> u32 {
-        self.storage().cluster_popcounts(cluster_idx)[local_idx]
+        self.storage()
+            .get_vector_data(cluster_idx, local_idx)
+            .popcount
     }
 
     /// Dot product between query and binary vector
@@ -361,38 +502,11 @@ where
         let binary = self.storage().vector_binary(cluster_idx, local_idx);
         let dim = self.dim();
 
-        let mut sum = 0u32;
-        let full_bytes = dim / 8;
-
-        for byte_idx in 0..full_bytes {
-            let bits = unsafe { *binary.get_unchecked(byte_idx) };
-            let base = byte_idx * 8;
-
-            unsafe {
-                sum += *query.quantised.get_unchecked(base) as u32 * (bits & 1) as u32;
-                sum += *query.quantised.get_unchecked(base + 1) as u32 * ((bits >> 1) & 1) as u32;
-                sum += *query.quantised.get_unchecked(base + 2) as u32 * ((bits >> 2) & 1) as u32;
-                sum += *query.quantised.get_unchecked(base + 3) as u32 * ((bits >> 3) & 1) as u32;
-                sum += *query.quantised.get_unchecked(base + 4) as u32 * ((bits >> 4) & 1) as u32;
-                sum += *query.quantised.get_unchecked(base + 5) as u32 * ((bits >> 5) & 1) as u32;
-                sum += *query.quantised.get_unchecked(base + 6) as u32 * ((bits >> 6) & 1) as u32;
-                sum += *query.quantised.get_unchecked(base + 7) as u32 * ((bits >> 7) & 1) as u32;
-            }
+        if dim >= 16 {
+            dot_query_binary_simd(&query.quantised, binary, dim)
+        } else {
+            dot_query_binary_scalar(&query.quantised, binary, dim)
         }
-
-        let remaining = dim % 8;
-        if remaining > 0 {
-            let bits = unsafe { *binary.get_unchecked(full_bytes) };
-            let base = full_bytes * 8;
-            unsafe {
-                for bit_pos in 0..remaining {
-                    sum += *query.quantised.get_unchecked(base + bit_pos) as u32
-                        * ((bits >> bit_pos) & 1) as u32;
-                }
-            }
-        }
-
-        sum
     }
 
     /// RaBitQ distance estimate
@@ -409,36 +523,30 @@ where
     #[inline]
     fn rabitq_dist(&self, query: &RaBitQQuery<T>, cluster_idx: usize, local_idx: usize) -> T {
         let storage = self.storage();
-        let dim_f = self.dim() as f32;
+        let packed = storage.get_vector_data(cluster_idx, local_idx); // Single cache line read
 
-        let v_dist = storage.cluster_dist_to_centroid(cluster_idx)[local_idx]
-            .to_f32()
-            .unwrap();
-        let q_dist = query.dist_to_centroid.to_f32().unwrap();
+        let dim_f = T::from_usize(self.dim()).unwrap();
+        let two = T::one() + T::one();
 
-        let dot_corr = storage.cluster_dot_corrections(cluster_idx)[local_idx]
-            .to_f32()
-            .unwrap();
+        let v_dist = packed.dist_to_centroid;
+        let q_dist = query.dist_to_centroid;
+        let dot_corr = packed.dot_correction;
 
-        let qr = self.dot_query_binary(query, cluster_idx, local_idx) as f32;
-        let popcount = self.popcount(cluster_idx, local_idx) as f32;
-        let sum_q = query.sum_quantised as f32;
+        let qr = T::from_u32(self.dot_query_binary(query, cluster_idx, local_idx)).unwrap();
+        let popcount = T::from_u32(packed.popcount).unwrap();
+        let sum_q = T::from_u32(query.sum_quantised).unwrap();
 
-        let query_width = query.width.to_f32().unwrap();
-        let query_lower = query.lower.to_f32().unwrap();
+        let inner_product_sgn = two * (query.width * qr + query.lower * popcount)
+            - (query.width * sum_q + dim_f * query.lower);
 
-        let inner_product_sgn = 2.0 * (query_width * qr + query_lower * popcount)
-            - (query_width * sum_q + dim_f * query_lower);
-
-        let q_dot_v = if dot_corr > 1e-6 {
-            (inner_product_sgn / dot_corr).clamp(-1.0, 1.0)
+        let q_dot_v = if dot_corr > T::from_f32(1e-6).unwrap() {
+            (inner_product_sgn / dot_corr).clamp(T::one().neg(), T::one())
         } else {
-            0.0
+            T::zero()
         };
 
-        let dist_sq = v_dist * v_dist + q_dist * q_dist - 2.0 * v_dist * q_dist * q_dot_v;
-
-        T::from_f32(dist_sq.max(0.0).sqrt()).unwrap()
+        let dist_sq = v_dist * v_dist + q_dist * q_dist - two * v_dist * q_dist * q_dot_v;
+        dist_sq.max(T::zero()).sqrt()
     }
 }
 
@@ -458,10 +566,7 @@ where
 /// The Hamming distance between the two vectors
 #[inline(always)]
 pub fn hamming_distance(a: &[u8], b: &[u8]) -> u32 {
-    a.iter()
-        .zip(b.iter())
-        .map(|(x, y)| (x ^ y).count_ones())
-        .sum()
+    unsafe { hamming_simd(a, b) }
 }
 
 ///////////
