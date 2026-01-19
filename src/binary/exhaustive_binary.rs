@@ -83,8 +83,9 @@ where
         let dim = data.ncols();
 
         let binariser = match init {
-            BinarisationInit::ITQ => Binariser::initialise_with_pca(data, dim, n_bits, seed),
-            BinarisationInit::RandomProjections => Binariser::new(dim, n_bits, seed),
+            BinarisationInit::Itq => Binariser::new_itq(data, dim, n_bits, seed),
+            BinarisationInit::RandomProjections => Binariser::new_simhash(dim, n_bits, seed),
+            BinarisationInit::SignBased => Binariser::new_sign_based(dim),
         };
 
         let mut vectors_flat_binarised: Vec<u8> = Vec::with_capacity(n * n_bytes);
@@ -138,8 +139,9 @@ where
         let dim = data.ncols();
 
         let binariser = match init {
-            BinarisationInit::ITQ => Binariser::initialise_with_pca(data, dim, n_bits, seed),
-            BinarisationInit::RandomProjections => Binariser::new(dim, n_bits, seed),
+            BinarisationInit::Itq => Binariser::new_itq(data, dim, n_bits, seed),
+            BinarisationInit::RandomProjections => Binariser::new_simhash(dim, n_bits, seed),
+            BinarisationInit::SignBased => Binariser::new_sign_based(dim),
         };
 
         let mut vectors_flat_binarised: Vec<u8> = Vec::with_capacity(n * n_bytes);

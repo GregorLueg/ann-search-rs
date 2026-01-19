@@ -1,6 +1,7 @@
 #![allow(dead_code)]
 
 use num_traits::{Float, FromPrimitive};
+use wide::u8x16;
 
 use crate::binary::rabitq::*;
 #[allow(unused_imports)]
@@ -10,8 +11,6 @@ use crate::utils::dist::*;
 use std::arch::aarch64::*;
 #[cfg(target_arch = "x86_64")]
 use std::arch::x86_64::*;
-
-use wide::u8x16;
 
 ////////////////////
 // VectorDistance //
