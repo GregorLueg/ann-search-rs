@@ -75,14 +75,14 @@ where
     let mut left: Vec<usize> = Vec::new();
     let mut right: Vec<usize> = Vec::new();
 
-    let norm_pivot_1 = T::calculate_norm(pivot_1);
-    let norm_pivot_2 = T::calculate_norm(pivot_2);
+    let norm_pivot_1 = T::calculate_l2_norm(pivot_1);
+    let norm_pivot_2 = T::calculate_l2_norm(pivot_2);
 
     for &idx in indices {
         let vec = &data[idx * dim..(idx + 1) * dim];
         let vec_norm = match metric {
             Dist::Euclidean => T::zero(),
-            Dist::Cosine => T::calculate_norm(vec),
+            Dist::Cosine => T::calculate_l2_norm(vec),
         };
 
         let d1 = match metric {
@@ -154,14 +154,14 @@ where
     T: Float + SimdDistance,
 {
     let mut max_dist = T::zero();
-    let center_norm = T::calculate_norm(center);
+    let center_norm = T::calculate_l2_norm(center);
 
     for &idx in indices {
         let vec = &data[idx * dim..(idx + 1) * dim];
         let dist = match metric {
             Dist::Euclidean => euclidean_distance_static(center, vec),
             Dist::Cosine => {
-                let vec_norm = T::calculate_norm(vec);
+                let vec_norm = T::calculate_l2_norm(vec);
                 cosine_distance_static_norm(center, vec, &center_norm, &vec_norm)
             }
         };
@@ -304,7 +304,7 @@ where
                 .map(|i| {
                     let start = i * dim;
                     let end = start + dim;
-                    T::calculate_norm(&vectors_flat[start..end])
+                    T::calculate_l2_norm(&vectors_flat[start..end])
                 })
                 .collect()
         } else {
@@ -342,7 +342,7 @@ where
                 .map(|i| {
                     let start = i * dim;
                     let end = start + dim;
-                    T::calculate_norm(&centers_data[start..end])
+                    T::calculate_l2_norm(&centers_data[start..end])
                 })
                 .collect()
         } else {
@@ -488,8 +488,8 @@ where
 
             let centroid_norms = if metric == Dist::Cosine {
                 vec![
-                    T::calculate_norm(&centroids[0..dim]),
-                    T::calculate_norm(&centroids[dim..2 * dim]),
+                    T::calculate_l2_norm(&centroids[0..dim]),
+                    T::calculate_l2_norm(&centroids[dim..2 * dim]),
                 ]
             } else {
                 vec![T::one(); 2]
@@ -768,7 +768,7 @@ where
         let mut visited = VisitedSet::new(self.n);
 
         let query_norm = if self.metric == Dist::Cosine {
-            T::calculate_norm(query_vec)
+            T::calculate_l2_norm(query_vec)
         } else {
             T::one()
         };

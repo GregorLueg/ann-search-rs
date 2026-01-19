@@ -97,13 +97,9 @@ where
     #[inline]
     pub fn encode_vector(&self, vec: &[T], centroid: &[T]) -> VecEncoding<T> {
         // Compute residual
-        let res: Vec<T> = vec
-            .iter()
-            .zip(centroid.iter())
-            .map(|(&v, &c)| v - c)
-            .collect();
+        let res = T::subtract_simd(vec, centroid);
 
-        let dist_to_centroid = compute_norm(&res);
+        let dist_to_centroid = compute_l2_norm(&res);
 
         // Normalise residual to unit vector
         let v_c: Vec<T> = if dist_to_centroid > T::epsilon() {
@@ -126,10 +122,7 @@ where
         }
 
         // Dot correction: L1 norm of rotated unit residual
-        let dot_correction: T = v_c_rotated
-            .iter()
-            .map(|&x| x.abs())
-            .fold(T::zero(), |a, b| a + b);
+        let dot_correction: T = compute_l1_norm(&v_c_rotated);
 
         (binary, dist_to_centroid, dot_correction, popcount)
     }
@@ -149,7 +142,7 @@ where
         // Normalise for cosine if needed
         let query_norm: Vec<T> = match self.metric {
             Dist::Cosine => {
-                let norm = compute_norm(query);
+                let norm = compute_l2_norm(query);
                 if norm > T::epsilon() {
                     query.iter().map(|&x| x / norm).collect()
                 } else {
@@ -162,7 +155,7 @@ where
         // Residual relative to centroid
         let res = T::subtract_simd(&query_norm, centroid);
 
-        let dist_to_centroid = compute_norm(&res);
+        let dist_to_centroid = compute_l2_norm(&res);
 
         // Normalise residual
         let q_c: Vec<T> = if dist_to_centroid > T::epsilon() {
@@ -282,6 +275,36 @@ where
 // RaBitQStorage //
 ///////////////////
 
+/// RaBitQPackedVector
+///
+/// Packed vector representation for RaBitQ encoded vectors for better cache
+/// locality and reduced misses
+///
+/// ### Fields
+///
+/// * `dist_to_centroid` - Distance to centroid
+/// * `dot_correction` - Dot correction
+/// * `popcount` - Popcount
+#[repr(C)]
+#[derive(Clone)]
+pub struct RaBitQPackedVector<T> {
+    pub dist_to_centroid: T,
+    pub dot_correction: T,
+    pub popcount: u32,
+}
+
+impl<T> RaBitQPackedVector<T> {
+    /// Memory usage in bytes for a single packed vector
+    ///
+    /// ### Returns
+    ///
+    /// Memory usage in bytes
+    #[inline]
+    pub fn memory_usage_bytes() -> usize {
+        std::mem::size_of::<Self>()
+    }
+}
+
 /// CSR-layout storage for RaBitQ encoded vectors
 ///
 /// ### Fields
@@ -289,8 +312,8 @@ where
 /// * `centroids` - the centroids of the data, nlist * dim, flattened
 /// * `centroids_norm` - norms of the centroids
 /// * `binary_codes` - all vectors, ordered by cluster
-/// * `dist_to_centroid` - Dist to centroids per vector
-/// * `dot_corrections` - Corrections per vector
+/// * `packed_vectors` - Packed vectors of distances to centroids, dot
+///   corrections, and popcounts.
 /// * `vector_indices` - Original indices, ordered by cluster
 /// * `offsets` - cluster boundaries, len = nlist + 1
 /// * `nlist` - Number of lists
@@ -300,9 +323,7 @@ pub struct RaBitQStorage<T> {
     pub centroids: Vec<T>,
     pub centroids_norm: Vec<T>,
     pub binary_codes: Vec<u8>,
-    pub dist_to_centroid: Vec<T>,
-    pub dot_corrections: Vec<T>,
-    pub popcounts: Vec<u32>,
+    pub packed_vectors: Vec<RaBitQPackedVector<T>>,
     pub vector_indices: Vec<usize>,
     pub offsets: Vec<usize>,
     pub nlist: usize,
@@ -310,7 +331,7 @@ pub struct RaBitQStorage<T> {
     pub n_bytes: usize,
 }
 
-impl<T: Float + FromPrimitive> RaBitQStorage<T> {
+impl<T: Float + FromPrimitive + Clone> RaBitQStorage<T> {
     /// Create empty storage with given capacity
     ///
     /// ### Params
@@ -328,9 +349,7 @@ impl<T: Float + FromPrimitive> RaBitQStorage<T> {
             centroids: Vec::with_capacity(nlist * dim),
             centroids_norm: Vec::with_capacity(nlist),
             binary_codes: Vec::with_capacity(n * n_bytes),
-            dist_to_centroid: Vec::with_capacity(n),
-            dot_corrections: Vec::with_capacity(n),
-            popcounts: Vec::with_capacity(n),
+            packed_vectors: Vec::with_capacity(n),
             vector_indices: Vec::with_capacity(n),
             offsets: vec![0; nlist + 1],
             nlist,
@@ -390,6 +409,20 @@ impl<T: Float + FromPrimitive> RaBitQStorage<T> {
         &self.binary_codes[byte_start..byte_start + self.n_bytes]
     }
 
+    #[inline]
+    pub fn get_vector_data(&self, cluster_idx: usize, local_idx: usize) -> &RaBitQPackedVector<T> {
+        let global_idx = self.offsets[cluster_idx] + local_idx;
+        &self.packed_vectors[global_idx]
+    }
+
+    /// Slice access for cluster - only if you actually need to iterate
+    #[inline]
+    pub fn cluster_packed_data(&self, cluster_idx: usize) -> &[RaBitQPackedVector<T>] {
+        let start = self.offsets[cluster_idx];
+        let end = self.offsets[cluster_idx + 1];
+        &self.packed_vectors[start..end]
+    }
+
     /// Get popcounts slice for cluster
     ///
     /// ### Params
@@ -400,10 +433,10 @@ impl<T: Float + FromPrimitive> RaBitQStorage<T> {
     ///
     /// The popcounts for every vector in this cluster
     #[inline]
-    pub fn cluster_popcounts(&self, cluster_idx: usize) -> &[u32] {
-        let start = self.offsets[cluster_idx];
-        let end = self.offsets[cluster_idx + 1];
-        &self.popcounts[start..end]
+    pub fn cluster_popcounts(&self, cluster_idx: usize) -> impl Iterator<Item = u32> + '_ {
+        self.cluster_packed_data(cluster_idx)
+            .iter()
+            .map(|v| v.popcount)
     }
 
     /// Get dist_to_centroid slice for cluster
@@ -416,10 +449,10 @@ impl<T: Float + FromPrimitive> RaBitQStorage<T> {
     ///
     /// The distance to centroid slice for every vector in this cluster
     #[inline]
-    pub fn cluster_dist_to_centroid(&self, cluster_idx: usize) -> &[T] {
-        let start = self.offsets[cluster_idx];
-        let end = self.offsets[cluster_idx + 1];
-        &self.dist_to_centroid[start..end]
+    pub fn cluster_dist_to_centroid(&self, cluster_idx: usize) -> impl Iterator<Item = T> + '_ {
+        self.cluster_packed_data(cluster_idx)
+            .iter()
+            .map(|v| v.dist_to_centroid)
     }
 
     /// Get dot_corrections slice for cluster
@@ -432,10 +465,10 @@ impl<T: Float + FromPrimitive> RaBitQStorage<T> {
     ///
     /// The dot corrections for every vector in this cluster
     #[inline]
-    pub fn cluster_dot_corrections(&self, cluster_idx: usize) -> &[T] {
-        let start = self.offsets[cluster_idx];
-        let end = self.offsets[cluster_idx + 1];
-        &self.dot_corrections[start..end]
+    pub fn cluster_dot_corrections(&self, cluster_idx: usize) -> impl Iterator<Item = T> + '_ {
+        self.cluster_packed_data(cluster_idx)
+            .iter()
+            .map(|v| v.dot_correction)
     }
 
     /// Get vector indices for cluster
@@ -488,8 +521,7 @@ impl<T: Float + FromPrimitive> RaBitQStorage<T> {
             + self.centroids.capacity() * std::mem::size_of::<T>()
             + self.centroids_norm.capacity() * std::mem::size_of::<T>()
             + self.binary_codes.capacity()
-            + self.dist_to_centroid.capacity() * std::mem::size_of::<T>()
-            + self.dot_corrections.capacity() * std::mem::size_of::<T>()
+            + self.packed_vectors.capacity() * std::mem::size_of::<RaBitQPackedVector<T>>()
             + self.vector_indices.capacity() * std::mem::size_of::<usize>()
             + self.offsets.capacity() * std::mem::size_of::<usize>()
     }
@@ -520,13 +552,13 @@ pub fn build_rabitq_storage<T>(
     encoder: &RaBitQEncoder<T>,
 ) -> RaBitQStorage<T>
 where
-    T: Float + FromPrimitive + ToPrimitive + ComplexField + Sum + SimdDistance,
+    T: Float + FromPrimitive + ToPrimitive + ComplexField + Sum + SimdDistance + Clone,
 {
     let n_bytes = dim.div_ceil(8);
 
     // Compute centroid norms
     let centroids_norm: Vec<T> = (0..nlist)
-        .map(|i| compute_norm(&centroids[i * dim..(i + 1) * dim]))
+        .map(|i| compute_l2_norm(&centroids[i * dim..(i + 1) * dim]))
         .collect();
 
     // Count vectors per cluster
@@ -546,9 +578,14 @@ where
         centroids: centroids.to_vec(),
         centroids_norm,
         binary_codes: vec![0u8; n * n_bytes],
-        dist_to_centroid: vec![T::zero(); n],
-        dot_corrections: vec![T::zero(); n],
-        popcounts: vec![0u32; n],
+        packed_vectors: vec![
+            RaBitQPackedVector {
+                dist_to_centroid: T::zero(),
+                dot_correction: T::zero(),
+                popcount: 0,
+            };
+            n
+        ],
         vector_indices: vec![0usize; n],
         offsets: offsets.clone(),
         nlist,
@@ -556,10 +593,8 @@ where
         n_bytes,
     };
 
-    // Track insertion position per cluster
     let mut insert_pos = offsets[..nlist].to_vec();
 
-    // Encode and insert each vector
     for vec_idx in 0..n {
         let cluster_idx = assignments[vec_idx];
         let pos = insert_pos[cluster_idx];
@@ -572,9 +607,13 @@ where
 
         let byte_start = pos * n_bytes;
         storage.binary_codes[byte_start..byte_start + n_bytes].copy_from_slice(&binary);
-        storage.dist_to_centroid[pos] = dist;
-        storage.dot_corrections[pos] = dot_corr;
-        storage.popcounts[pos] = popcount;
+
+        storage.packed_vectors[pos] = RaBitQPackedVector {
+            dist_to_centroid: dist,
+            dot_correction: dot_corr,
+            popcount,
+        };
+
         storage.vector_indices[pos] = vec_idx;
     }
 
@@ -629,7 +668,7 @@ where
         for i in 0..n {
             let row = data.row(i);
             let vec: Vec<T> = row.iter().cloned().collect();
-            let norm = compute_norm(&vec);
+            let norm = compute_l2_norm(&vec);
             data_norms.push(norm);
 
             match metric {
@@ -667,7 +706,7 @@ where
         let centroid_norms: Vec<T> = (0..k)
             .map(|c| {
                 let cent = &centroids_flat[c * dim..(c + 1) * dim];
-                compute_norm(cent)
+                compute_l2_norm(cent)
             })
             .collect();
 

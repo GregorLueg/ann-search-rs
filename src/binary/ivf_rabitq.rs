@@ -202,7 +202,7 @@ where
         }
 
         let centroids_norm: Vec<T> = (0..nlist)
-            .map(|i| compute_norm(&centroids_flat[i * dim..(i + 1) * dim]))
+            .map(|i| compute_l2_norm(&centroids_flat[i * dim..(i + 1) * dim]))
             .collect();
 
         // Assign all vectors
@@ -354,7 +354,7 @@ where
         }
 
         let centroids_norm: Vec<T> = (0..nlist)
-            .map(|i| compute_norm(&centroids_flat[i * dim..(i + 1) * dim]))
+            .map(|i| compute_l2_norm(&centroids_flat[i * dim..(i + 1) * dim]))
             .collect();
 
         let assignments = assign_all_parallel(
@@ -422,7 +422,7 @@ where
         // Normalise query for cosine
         let (query_normalised, _): (Vec<T>, T) = match self.encoder.metric {
             Dist::Cosine => {
-                let norm = compute_norm(query_vec);
+                let norm = compute_l2_norm(query_vec);
                 if norm > T::epsilon() {
                     (query_vec.iter().map(|&x| x / norm).collect(), norm)
                 } else {
@@ -518,7 +518,7 @@ where
         let (candidates, _) = self.query(query_vec, k * rerank_factor, nprobe);
 
         let query_norm = match self.encoder.metric {
-            Dist::Cosine => compute_norm(query_vec),
+            Dist::Cosine => compute_l2_norm(query_vec),
             Dist::Euclidean => T::one(),
         };
 
