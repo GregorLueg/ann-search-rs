@@ -103,7 +103,10 @@ pub fn detect_simd_level() -> SimdLevel {
     })
 }
 
-/// Trait for SIMD distance calculations
+/// Trait for SIMD-optimised operations
+///
+/// This includes Euclidean distance, dot products, L1/2 normalisations and
+/// addition/subtraction operations.
 pub trait SimdDistance: Sized + Copy {
     /// Calculate Euclidean distance via SIMD
     ///
@@ -140,6 +143,18 @@ pub trait SimdDistance: Sized + Copy {
     ///
     /// Subtracted vector
     fn subtract_simd(a: &[Self], b: &[Self]) -> Vec<Self>;
+
+    /// Add one vector from the other
+    ///
+    /// ### Params
+    ///
+    /// * `a` - Slice of vector a
+    /// * `b` - Slice of vector b
+    ///
+    /// ### Returns
+    ///
+    /// Added vector
+    fn add_simd(a: &[Self], b: &[Self]) -> Vec<Self>;
 
     /// Calculate the L2 norm
     ///
@@ -714,6 +729,10 @@ fn dot_f64_avx512(a: &[f64], b: &[f64]) -> f64 {
     dot_f64_avx2(a, b)
 }
 
+/////////////////////////
+// Vector subtractions //
+/////////////////////////
+
 ///////////////////
 // f32 Subtract  //
 ///////////////////
@@ -1012,6 +1031,312 @@ fn subtract_f64_avx512(a: &[f64], b: &[f64]) -> Vec<f64> {
     subtract_f64_avx2(a, b)
 }
 
+//////////////////////
+// Vector additions //
+//////////////////////
+
+//////////////////
+// f32 addition //
+//////////////////
+
+/// Vector addition - f32, scalar
+///
+/// ### Params
+///
+/// * `a` - Slice of vector a
+/// * `b` - Slice of vector b
+///
+/// ### Returns
+///
+/// `Vec<a + b>`
+#[inline(always)]
+fn add_f32_scalar(a: &[f32], b: &[f32]) -> Vec<f32> {
+    a.iter().zip(b.iter()).map(|(&x, &y)| x + y).collect()
+}
+
+/// Vector addition - f32, optimised for 128 bits
+///
+/// ### Params
+///
+/// * `a` - Slice of vector a
+/// * `b` - Slice of vector b
+///
+/// ### Returns
+///
+/// `Vec<a + b>`
+#[inline(always)]
+fn add_f32_sse(a: &[f32], b: &[f32]) -> Vec<f32> {
+    let len = a.len();
+    let chunks = len / 4;
+    let mut result = Vec::with_capacity(len);
+
+    unsafe {
+        let a_ptr = a.as_ptr();
+        let b_ptr = b.as_ptr();
+        let result_ptr: *mut f32 = result.as_mut_ptr();
+
+        for i in 0..chunks {
+            let offset = i * 4;
+            let va = f32x4::from(*(a_ptr.add(offset) as *const [f32; 4]));
+            let vb = f32x4::from(*(b_ptr.add(offset) as *const [f32; 4]));
+            let diff = va + vb;
+            *(result_ptr.add(offset) as *mut [f32; 4]) = diff.into();
+        }
+
+        for i in (chunks * 4)..len {
+            *result_ptr.add(i) = a[i] + b[i];
+        }
+
+        result.set_len(len);
+    }
+    result
+}
+
+/// Vector addition - f32, optimised for 256 bits
+///
+/// ### Params
+///
+/// * `a` - Slice of vector a
+/// * `b` - Slice of vector b
+///
+/// ### Returns
+///
+/// `Vec<a + b>`
+#[inline(always)]
+fn add_f32_avx2(a: &[f32], b: &[f32]) -> Vec<f32> {
+    let len = a.len();
+    let chunks = len / 8;
+    let mut result = Vec::with_capacity(len);
+
+    unsafe {
+        let a_ptr = a.as_ptr();
+        let b_ptr = b.as_ptr();
+        let result_ptr: *mut f32 = result.as_mut_ptr();
+
+        for i in 0..chunks {
+            let offset = i * 8;
+            let va = f32x8::from(*(a_ptr.add(offset) as *const [f32; 8]));
+            let vb = f32x8::from(*(b_ptr.add(offset) as *const [f32; 8]));
+            let diff = va + vb;
+            *(result_ptr.add(offset) as *mut [f32; 8]) = diff.into();
+        }
+
+        for i in (chunks * 8)..len {
+            *result_ptr.add(i) = a[i] + b[i];
+        }
+
+        result.set_len(len);
+    }
+    result
+}
+
+/// Vector addition - f32, optimised for 512 bits
+///
+/// ### Params
+///
+/// * `a` - Slice of vector a
+/// * `b` - Slice of vector b
+///
+/// ### Returns
+///
+/// `Vec<a + b>`
+#[cfg(all(target_arch = "x86_64", target_feature = "avx512f"))]
+#[inline(always)]
+fn add_f32_avx512(a: &[f32], b: &[f32]) -> Vec<f32> {
+    use std::arch::x86_64::*;
+
+    let len = a.len();
+    let chunks = len / 16;
+    let mut result = Vec::with_capacity(len);
+
+    unsafe {
+        let result_ptr = result.as_mut_ptr();
+
+        for i in 0..chunks {
+            let va = _mm512_loadu_ps(a.as_ptr().add(i * 16));
+            let vb = _mm512_loadu_ps(b.as_ptr().add(i * 16));
+            let diff = _mm512_add_ps(va, vb);
+            _mm512_storeu_ps(result_ptr.add(i * 16), diff);
+        }
+
+        for i in (chunks * 16)..len {
+            *result_ptr.add(i) = a[i] + b[i];
+        }
+
+        result.set_len(len);
+    }
+    result
+}
+
+/// Add subtraction - f32, fall back version
+///
+/// ### Params
+///
+/// * `a` - Slice of vector a
+/// * `b` - Slice of vector b
+///
+/// ### Returns
+///
+/// `Vec<a + b>`
+#[cfg(not(all(target_arch = "x86_64", target_feature = "avx512f")))]
+#[inline(always)]
+fn add_f32_avx512(a: &[f32], b: &[f32]) -> Vec<f32> {
+    add_f32_avx2(a, b)
+}
+
+//////////////////
+// f64 addition //
+//////////////////
+
+/// Vector addition - f64, scalar
+///
+/// ### Params
+///
+/// * `a` - Slice of vector a
+/// * `b` - Slice of vector b
+///
+/// ### Returns
+///
+/// `Vec<a - b>`
+#[inline(always)]
+fn add_f64_scalar(a: &[f64], b: &[f64]) -> Vec<f64> {
+    a.iter().zip(b.iter()).map(|(&x, &y)| x + y).collect()
+}
+
+/// Vector addition - f64, optimised for 128 bits
+///
+/// ### Params
+///
+/// * `a` - Slice of vector a
+/// * `b` - Slice of vector b
+///
+/// ### Returns
+///
+/// `Vec<a + b>`
+#[inline(always)]
+fn add_f64_sse(a: &[f64], b: &[f64]) -> Vec<f64> {
+    let len = a.len();
+    let chunks = len / 2;
+    let mut result = Vec::with_capacity(len);
+
+    unsafe {
+        let a_ptr = a.as_ptr();
+        let b_ptr = b.as_ptr();
+        let result_ptr: *mut f64 = result.as_mut_ptr();
+
+        for i in 0..chunks {
+            let offset = i * 2;
+            let va = f64x2::from(*(a_ptr.add(offset) as *const [f64; 2]));
+            let vb = f64x2::from(*(b_ptr.add(offset) as *const [f64; 2]));
+            let diff = va + vb;
+            *(result_ptr.add(offset) as *mut [f64; 2]) = diff.into();
+        }
+
+        if len % 2 == 1 {
+            *result_ptr.add(len - 1) = a[len - 1] + b[len - 1];
+        }
+
+        result.set_len(len);
+    }
+    result
+}
+
+/// Vector addition - f64, optimised for 256 bits
+///
+/// ### Params
+///
+/// * `a` - Slice of vector a
+/// * `b` - Slice of vector b
+///
+/// ### Returns
+///
+/// `Vec<a + b>`
+#[inline(always)]
+fn add_f64_avx2(a: &[f64], b: &[f64]) -> Vec<f64> {
+    let len = a.len();
+    let chunks = len / 4;
+    let mut result = Vec::with_capacity(len);
+
+    unsafe {
+        let a_ptr = a.as_ptr();
+        let b_ptr = b.as_ptr();
+        let result_ptr: *mut f64 = result.as_mut_ptr();
+
+        for i in 0..chunks {
+            let offset = i * 4;
+            let va = f64x4::from(*(a_ptr.add(offset) as *const [f64; 4]));
+            let vb = f64x4::from(*(b_ptr.add(offset) as *const [f64; 4]));
+            let diff = va + vb;
+            *(result_ptr.add(offset) as *mut [f64; 4]) = diff.into();
+        }
+
+        for i in (chunks * 4)..len {
+            *result_ptr.add(i) = a[i] + b[i];
+        }
+
+        result.set_len(len);
+    }
+    result
+}
+
+/// Vector addition - f64, optimised for 512 bits
+///
+/// ### Params
+///
+/// * `a` - Slice of vector a
+/// * `b` - Slice of vector b
+///
+/// ### Returns
+///
+/// `Vec<a + b>`
+#[cfg(all(target_arch = "x86_64", target_feature = "avx512f"))]
+#[inline(always)]
+fn subtract_f64_avx512(a: &[f64], b: &[f64]) -> Vec<f64> {
+    use std::arch::x86_64::*;
+
+    let len = a.len();
+    let chunks = len / 8;
+    let mut result = Vec::with_capacity(len);
+
+    unsafe {
+        let result_ptr = result.as_mut_ptr();
+
+        for i in 0..chunks {
+            let va = _mm512_loadu_pd(a.as_ptr().add(i * 8));
+            let vb = _mm512_loadu_pd(b.as_ptr().add(i * 8));
+            let diff = _mm512_add_pd(va, vb);
+            _mm512_storeu_pd(result_ptr.add(i * 8), diff);
+        }
+
+        for i in (chunks * 8)..len {
+            *result_ptr.add(i) = a[i] + b[i];
+        }
+
+        result.set_len(len);
+    }
+    result
+}
+
+/// Vector addition - f64, fall back version for AVX512
+///
+/// ### Params
+///
+/// * `a` - Slice of vector a
+/// * `b` - Slice of vector b
+///
+/// ### Returns
+///
+/// `Vec<a + b>`
+#[cfg(not(all(target_arch = "x86_64", target_feature = "avx512f")))]
+#[inline(always)]
+fn add_f64_avx512(a: &[f64], b: &[f64]) -> Vec<f64> {
+    add_f64_avx2(a, b)
+}
+
+/////////////
+// L2 norm //
+/////////////
+
 //////////////////
 // f32, L2 Norm //
 //////////////////
@@ -1138,9 +1463,9 @@ fn compute_l2_norm_f32_avx512(vec: &[f32]) -> f32 {
     compute_l2_norm_f32_avx2(vec)
 }
 
-///////////////
-// f64, Norm //
-///////////////
+//////////////////
+// f64, L2 Norm //
+//////////////////
 
 /// L2 Norm - f32, scalar
 ///
@@ -1264,6 +1589,10 @@ fn compute_l2_norm_f64_avx512(vec: &[f64]) -> f64 {
 fn compute_l2_norm_f64_avx512(vec: &[f64]) -> f64 {
     compute_l2_norm_f64_avx2(vec)
 }
+
+/////////////
+// L1 Norm //
+/////////////
 
 /////////////////
 // f32 L1 Norm //
@@ -1515,6 +1844,10 @@ fn compute_l1_norm_f64_avx512(a: &[f64]) -> f64 {
 // SimdDistance implementations //
 //////////////////////////////////
 
+/////////
+// f32 //
+/////////
+
 impl SimdDistance for f32 {
     #[inline]
     fn euclidean_simd(a: &[f32], b: &[f32]) -> f32 {
@@ -1547,6 +1880,16 @@ impl SimdDistance for f32 {
     }
 
     #[inline]
+    fn add_simd(a: &[Self], b: &[Self]) -> Vec<Self> {
+        match detect_simd_level() {
+            SimdLevel::Avx512 => add_f32_avx512(a, b),
+            SimdLevel::Avx2 => add_f32_avx2(a, b),
+            SimdLevel::Sse => add_f32_sse(a, b),
+            SimdLevel::Scalar => add_f32_scalar(a, b),
+        }
+    }
+
+    #[inline]
     fn calculate_l2_norm(vec: &[Self]) -> Self {
         match detect_simd_level() {
             SimdLevel::Avx512 => compute_l2_norm_f32_avx512(vec),
@@ -1566,6 +1909,10 @@ impl SimdDistance for f32 {
         }
     }
 }
+
+/////////
+// f64 //
+/////////
 
 impl SimdDistance for f64 {
     #[inline]
@@ -1595,6 +1942,16 @@ impl SimdDistance for f64 {
             SimdLevel::Avx2 => subtract_f64_avx2(a, b),
             SimdLevel::Sse => subtract_f64_sse(a, b),
             SimdLevel::Scalar => subtract_f64_scalar(a, b),
+        }
+    }
+
+    #[inline]
+    fn add_simd(a: &[f64], b: &[f64]) -> Vec<f64> {
+        match detect_simd_level() {
+            SimdLevel::Avx512 => add_f64_avx512(a, b),
+            SimdLevel::Avx2 => add_f64_avx2(a, b),
+            SimdLevel::Sse => add_f64_sse(a, b),
+            SimdLevel::Scalar => add_f64_scalar(a, b),
         }
     }
 
@@ -3715,7 +4072,7 @@ where
     /// Get the quantised codes
     fn quantised_codes(&self) -> &[u8];
 
-    /// Build ADC lookup tables for a specific cluster
+    /// For IVF variants - query residual against PQ centroids
     ///
     /// ### Params
     ///
@@ -3725,19 +4082,57 @@ where
     /// ### Returns
     ///
     /// Lookup table as flat Vec<T> of size M * n_centroids
-    fn build_lookup_tables(&self, query_vec: &[T], cluster_idx: usize) -> Vec<T> {
+    fn build_lookup_tables_residual(&self, query_vec: &[T], cluster_idx: usize) -> Vec<T> {
         let m = self.codebook_m();
         let subvec_dim = self.codebook_subvec_dim();
         let n_cents = self.codebook_n_centroids();
 
         let centroid = &self.centroids()[cluster_idx * self.dim()..(cluster_idx + 1) * self.dim()];
-
         let query_residual = T::subtract_simd(query_vec, centroid);
 
+        self.build_lookup_tables_impl(&query_residual, m, subvec_dim, n_cents)
+    }
+
+    /// For Exhaustive/OPQ variants - query directly against PQ centroids
+    ///
+    /// ### Params
+    ///
+    /// * `query_vec`: The query vector to build the lookup tables for.
+    ///
+    /// ### Returns
+    ///
+    /// Lookup table as flat Vec<T> of size M * n_centroids
+    fn build_lookup_tables_direct(&self, query_vec: &[T]) -> Vec<T> {
+        let m = self.codebook_m();
+        let subvec_dim = self.codebook_subvec_dim();
+        let n_cents = self.codebook_n_centroids();
+
+        self.build_lookup_tables_impl(query_vec, m, subvec_dim, n_cents)
+    }
+
+    /// Shared implementation
+    ///
+    /// ### Params
+    ///
+    /// * `query_vec`: The query vector to build the lookup tables for.
+    /// * `m`: The number of subspaces.
+    /// * `subvec_dim`: The dimension of each subvector.
+    /// * `n_cents`: The number of centroids.
+    ///
+    /// ### Returns
+    ///
+    /// Lookup table as flat Vec<T> of size M * n_centroids
+    fn build_lookup_tables_impl(
+        &self,
+        query_vec: &[T],
+        m: usize,
+        subvec_dim: usize,
+        n_cents: usize,
+    ) -> Vec<T> {
         let mut table = vec![T::zero(); m * n_cents];
 
         for subspace in 0..m {
-            let query_sub = &query_residual[subspace * subvec_dim..(subspace + 1) * subvec_dim];
+            let query_sub = &query_vec[subspace * subvec_dim..(subspace + 1) * subvec_dim];
             let table_offset = subspace * n_cents;
 
             for centroid_idx in 0..n_cents {
@@ -3745,9 +4140,7 @@ where
                 let pq_centroid =
                     &self.codebooks()[subspace][centroid_start..centroid_start + subvec_dim];
 
-                // squared Euclidean distance for ADC
                 let dist = T::euclidean_simd(query_sub, pq_centroid);
-
                 table[table_offset + centroid_idx] = dist;
             }
         }

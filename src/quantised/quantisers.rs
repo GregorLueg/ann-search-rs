@@ -1,5 +1,5 @@
 use faer::{Mat, Scale};
-use half::*;
+use half::bf16;
 use num_traits::{Float, FromPrimitive, ToPrimitive};
 use rayon::prelude::*;
 use std::iter::Sum;
@@ -949,7 +949,7 @@ mod tests {
         let encoded = encode_bf16_quantisation(&data);
 
         for enc in encoded.iter() {
-            assert!(enc.to_f32().unwrap() < 0.0);
+            assert!(enc.to_f32_const() < 0.0);
         }
     }
 

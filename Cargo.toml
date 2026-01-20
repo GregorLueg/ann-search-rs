@@ -19,11 +19,10 @@ codegen-units = 1
 binary = ["memmap2", "tempfile", "bytemuck"]
 gpu = ["cubecl"]
 quantised = ["half"]
-bytemuck = ["dep:bytemuck"]
 
 [dependencies]
 approx = "0.5.1"
-bytemuck = { version = "1.24.0", features = ["derive"] , optional = true }
+bytemuck = { version = "1.24.0", features = ["derive"], optional = true }
 clap = { version = "4.5.53", features = ["derive"] }
 cubecl = { version = "0.8.1", features = ["wgpu", "cpu"], optional = true }
 faer = "0.23.2"
@@ -54,11 +53,11 @@ name = "gridsearch_bf16"
 required-features = ["quantised"]
 
 [[example]]
-name = "gridsearch_ivf_opq"
+name = "gridsearch_opq"
 required-features = ["quantised"]
 
 [[example]]
-name = "gridsearch_ivf_pq"
+name = "gridsearch_pq"
 required-features = ["quantised"]
 
 [[example]]
