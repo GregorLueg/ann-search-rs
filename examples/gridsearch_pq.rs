@@ -74,6 +74,9 @@ fn main() {
 
     // PQ Exhaustive query benchmark
     for m in &m_values {
+        if cli.dim % m != 0 {
+            continue;
+        }
         println!("Building exhaustive PQ index with m={}...", m);
         let start = Instant::now();
         let exhaustive_pq_idx = build_exhaustive_pq_index(

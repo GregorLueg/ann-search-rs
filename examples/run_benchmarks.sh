@@ -50,7 +50,7 @@ run_quantised_benchmarks() {
     done
 
     # IVF-PQ and IVF-OPQ
-    for variant in pq ivf_opq; do
+    for variant in pq opq; do
         for dim in 128 192; do
             echo "Running ${variant} benchmarks (dim=${dim})..."
             run_quantised ${variant} -- --distance euclidean --dim ${dim}
