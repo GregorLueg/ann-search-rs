@@ -58,7 +58,8 @@ use crate::binary::{exhaustive_binary::*, exhaustive_rabitq::*, ivf_binary::*, i
 use crate::gpu::{exhaustive_gpu::*, ivf_gpu::*};
 #[cfg(feature = "quantised")]
 use crate::quantised::{
-    exhaustive_bf16::*, exhaustive_sq8::*, ivf_bf16::*, ivf_opq::*, ivf_pq::*, ivf_sq8::*,
+    exhaustive_bf16::*, exhaustive_opq::*, exhaustive_pq::*, exhaustive_sq8::*, ivf_bf16::*,
+    ivf_opq::*, ivf_pq::*, ivf_sq8::*,
 };
 
 ////////////
@@ -1266,6 +1267,103 @@ where
     T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum + SimdDistance,
 {
     index.generate_knn(k, nprobe, return_dist, verbose)
+}
+
+////////////////////
+// Exhaustive-PQ //
+////////////////////
+
+#[cfg(feature = "quantised")]
+/// Build an Exhaustive-PQ index
+///
+/// ### Params
+///
+/// * `mat` - The data matrix. Rows represent the samples, columns represent
+///   the embedding dimensions
+/// * `m` - Number of subspaces for product quantisation (dim must be divisible
+///   by m)
+/// * `max_iters` - Maximum k-means iterations (defaults to 30 if None)
+/// * `n_pq_centroids` - Number of centroids per subspace (defaults to 256 if None)
+/// * `dist_metric` - Distance metric ("euclidean" or "cosine")
+/// * `seed` - Random seed for reproducibility
+/// * `verbose` - Print progress information during index construction
+///
+/// ### Return
+///
+/// The `ExhaustivePqIndex`.
+#[allow(clippy::too_many_arguments)]
+pub fn build_exhaustive_pq_index<T>(
+    mat: MatRef<T>,
+    m: usize,
+    max_iters: Option<usize>,
+    n_pq_centroids: Option<usize>,
+    dist_metric: &str,
+    seed: usize,
+    verbose: bool,
+) -> ExhaustivePqIndex<T>
+where
+    T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum + SimdDistance,
+{
+    let ann_dist = parse_ann_dist(dist_metric).unwrap_or_default();
+    ExhaustivePqIndex::build(mat, m, ann_dist, max_iters, n_pq_centroids, seed, verbose)
+}
+
+#[cfg(feature = "quantised")]
+/// Helper function to query a given Exhaustive-PQ index
+///
+/// ### Params
+///
+/// * `query_mat` - The query matrix containing the samples x features
+/// * `index` - Reference to the built Exhaustive-PQ index
+/// * `k` - Number of neighbours to return
+/// * `return_dist` - Shall the distances be returned
+/// * `verbose` - Print progress information
+///
+/// ### Returns
+///
+/// A tuple of `(knn_indices, optional distances)`
+pub fn query_exhaustive_pq_index<T>(
+    query_mat: MatRef<T>,
+    index: &ExhaustivePqIndex<T>,
+    k: usize,
+    return_dist: bool,
+    verbose: bool,
+) -> (Vec<Vec<usize>>, Option<Vec<Vec<T>>>)
+where
+    T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum + SimdDistance,
+{
+    query_parallel(query_mat.nrows(), return_dist, verbose, |i| {
+        index.query_row(query_mat.row(i), k)
+    })
+}
+
+#[cfg(feature = "quantised")]
+/// Helper function to self query an Exhaustive-PQ index
+///
+/// This function will generate a full kNN graph based on the internal data. To
+/// note, during quantisation information is lost, hence, the quality of the
+/// graph is reduced compared to other indices.
+///
+/// ### Params
+///
+/// * `index` - Reference to the built Exhaustive-PQ index
+/// * `k` - Number of neighbours to return
+/// * `return_dist` - Shall the distances be returned
+/// * `verbose` - Print progress information
+///
+/// ### Returns
+///
+/// A tuple of `(knn_indices, optional distances)`
+pub fn query_exhaustive_pq_index_self<T>(
+    index: &ExhaustivePqIndex<T>,
+    k: usize,
+    return_dist: bool,
+    verbose: bool,
+) -> (Vec<Vec<usize>>, Option<Vec<Vec<T>>>)
+where
+    T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum + SimdDistance,
+{
+    index.generate_knn(k, return_dist, verbose)
 }
 
 ////////////

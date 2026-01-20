@@ -2,7 +2,7 @@
 
 Quantised indices compress the data stored in the index structure itself via
 quantisation. This can also in some cases accelerated substantially the query
-speed. The core idea is to trade in Recall for reduction in memory finger 
+speed. The core idea is to trade in Recall for reduction in memory finger
 print. If you wish to run on the examples, you can do so via:
 
 ```bash
@@ -28,7 +28,7 @@ benchmarked. Index size in memory is also provided.
 
 ### BF16 (IVF and exhaustive)
 
-The BF16 quantisation reduces the floats to `bf16` which keeps the range of 
+The BF16 quantisation reduces the floats to `bf16` which keeps the range of
 `f32`, but loses precision in the digits from ~3 onwards. The actual distance
 calculations in the index happen in `f32`; however, due to lossy compression
 to `bf16` there is some Recall loss. This is compensated with drastically
@@ -39,7 +39,7 @@ higher for Cosine over Euclidean distance.
 
 - *Number of lists (nl)*: The number of independent k-means cluster to generate.
   If the structure of the data is unknown, people use `sqrt(n)` as a heuristic.
-- *Number of points (np)*: The number of clusters to probe during search. 
+- *Number of points (np)*: The number of clusters to probe during search.
   Numbers here tend to be `sqrt(nlist)` or up to 5% of the nlist.
 
 <details>
@@ -172,7 +172,7 @@ IVF-BF16-nl547 (self)                                  1_608.34     1_731.03    
 This index uses scalar quantisation to 8-bits. It projects every dimensions
 onto an `i8`. This also causes a reduction of the memory finger print. In the
 case of 96 dimensions in f32 per vector, we go from *96 x 32 bits = 384 bytes*
-to *96 x 8 bits = 96 bytes per vector*, a **4x reduction in memory per vector** 
+to *96 x 8 bits = 96 bytes per vector*, a **4x reduction in memory per vector**
 (with overhead of the codebook). Additionally, the querying becomes much faster
 due to integer math.
 
@@ -180,12 +180,12 @@ due to integer math.
 
 - *Number of lists (nl)*: The number of independent k-means cluster to generate.
   If the structure of the data is unknown, people use `sqrt(n)` as a heuristic.
-- *Number of points (np)*: The number of clusters to probe during search. 
+- *Number of points (np)*: The number of clusters to probe during search.
   Numbers here tend to be `sqrt(nlist)` or up to 5% of the nlist.
 
 #### With 32 dimensions
 
-The quantisation performs well on GaussianNoise data; however, the it loses 
+The quantisation performs well on GaussianNoise data; however, the it loses
 information for the correlated and also low rank data, indicating that complex
 structure is lost during the lossy compression.
 
@@ -502,16 +502,16 @@ IVF-SQ8-nl547 (self)                                   5_719.09     4_039.26    
 
 ### Product quantisation (IVF only)
 
-This index uses product quantisation. To note, the quantisation is quite harsh 
-and hence, reduces the Recall quite substantially. In the case of 192 
-dimensions, each vector gets reduced to 
-from *192 x 32 bits (192 x f32) = 768 bytes* to for 
-*m = 32 (32 sub vectors) to 32 x u8 = 32 bytes*, a 
-**24x reduction in memory usage** (of course with overhead from the cook book). 
-However, it can still be useful in situation where good enough works and you 
+This index uses product quantisation. To note, the quantisation is quite harsh
+and hence, reduces the Recall quite substantially. In the case of 192
+dimensions, each vector gets reduced to
+from *192 x 32 bits (192 x f32) = 768 bytes* to for
+*m = 32 (32 sub vectors) to 32 x u8 = 32 bytes*, a
+**24x reduction in memory usage** (of course with overhead from the cook book).
+However, it can still be useful in situation where good enough works and you
 have VERY large scale data.</br>
 This version is run on a special version of the synthetic data that is less
-affected by the curse of dimensionality! Also, there are some correlated 
+affected by the curse of dimensionality! Also, there are some correlated
 features in there that can be theoretically better exploited by optimised
 product quantisation, see below.
 
@@ -519,7 +519,7 @@ product quantisation, see below.
 
 - *Number of lists (nl)*: The number of independent k-means cluster to generate.
   If the structure of the data is unknown, people use `sqrt(n)` as a heuristic.
-- *Number of points (np)*: The number of clusters to probe during search. 
+- *Number of points (np)*: The number of clusters to probe during search.
   Numbers here tend to be `sqrt(nlist)` or up to 5% of the nlist.
 - *Number of subvectors (m)*: In how many subvectors to divide the given main
   vector. The initial dimensionality needs to be divisable by m.
@@ -527,8 +527,8 @@ product quantisation, see below.
 The self queries here run on the compressed indices stored in the structure
 itself. We can appreciate that the lossy compression affects the recall here. If
 you wish to get great kNN graphs from these indices, you need to re-supply the
-non-compressed data (at cost of memory!). Similar to `SQ8`-indices, the 
-distances are difficult to interpret/compare against original vectors due to 
+non-compressed data (at cost of memory!). Similar to `SQ8`-indices, the
+distances are difficult to interpret/compare against original vectors due to
 the heavy quantisation, thus, are not reported. The self queries default
 to `sqrt(nlist)`.
 
@@ -536,7 +536,7 @@ to `sqrt(nlist)`.
 
 Due to being optimised for high dimensional data, we start with 128 dimensions
 here. One can appreciate that `m16` causes a high Recall loss as it compresses
-the data too much and the more "structure" the data has (correlated features, 
+the data too much and the more "structure" the data has (correlated features,
 low rank manifolds), the better these indices perform. The PQ quantisation
 however is a bit more expensive, hence, more time is being used on index
 building. Querying on the other hand is very performant.
@@ -813,36 +813,36 @@ IVF-PQ-nl547-m48 (self)                               24_106.46    27_885.50    
 ### Optimised product quantisation (IVF only)
 
 This index uses optimised product quantisation - this substantially increases
-the build time. Similar to IVF-PQ, the quantisation is quite harsh and hence, 
-reduces the recall quite substantially compared to exhaustive search. Each 
-vector gets reduced to from *192 x 32 bits (192 x f32) = 768 bytes* to for 
-*m = 32 (32 sub vectors) to 32 x u8 = 32 bytes*, a 
-**24x reduction in memory usage** (of course with overhead from the cook book). 
-However, it can still be useful in situation where good enough works and you 
+the build time. Similar to IVF-PQ, the quantisation is quite harsh and hence,
+reduces the recall quite substantially compared to exhaustive search. Each
+vector gets reduced to from *192 x 32 bits (192 x f32) = 768 bytes* to for
+*m = 32 (32 sub vectors) to 32 x u8 = 32 bytes*, a
+**24x reduction in memory usage** (of course with overhead from the cook book).
+However, it can still be useful in situation where good enough works and you
 have VERY large scale data. The theoretical benefits at least in this
-synthetic data do not translate very well. IVF-PQ is usually more than enough, 
+synthetic data do not translate very well. IVF-PQ is usually more than enough,
 outside of cases in which a specific correlation structure can be exploited
-by the optimised PQ. If in doubt, use the IVF-PQ index. 
+by the optimised PQ. If in doubt, use the IVF-PQ index.
 
 **Key parameters:**
 
 - *Number of lists (nl)*: The number of independent k-means cluster to generate.
   If the structure of the data is unknown, people use `sqrt(n)` as a heuristic.
-- *Number of points (np)*: The number of clusters to probe during search. 
+- *Number of points (np)*: The number of clusters to probe during search.
   Numbers here tend to be `sqrt(nlist)` or up to 5% of the nlist.
 - *Number of subvectors (m)*: In how many subvectors to divide the given main
   vector. The initial dimensionality needs to be divisable by m.
 
 Similar to IVF-OP, the self kNN generation is run on the compressed indices,
-with the same loss of Recall due to the severe compression. Again, similar to 
-`IVF-SQ8` the distances are difficult to interpret/compare against original 
+with the same loss of Recall due to the severe compression. Again, similar to
+`IVF-SQ8` the distances are difficult to interpret/compare against original
 vectors due to the heavy quantisation (plus rotation), thus, are not reported.
 
 #### With 128 dimensions
 
 Due to being optimised for high dimensional data, we start with 128 dimensions
 here. One can appreciate that `m16` causes a high Recall loss as it compresses
-the data too much and the more "structure" the data has (correlated features, 
+the data too much and the more "structure" the data has (correlated features,
 low rank manifolds), the better these indices perform. The PQ quantisation
 however is a bit more expensive, hence, more time is being used on index
 building. Querying on the other hand is very performant.

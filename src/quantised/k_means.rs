@@ -1,6 +1,7 @@
 use num_traits::{Float, FromPrimitive, ToPrimitive};
 use rayon::prelude::*;
 
+use crate::utils::dist::SimdDistance;
 use crate::utils::ivf_utils::*;
 
 /// Parallel Lloyds for PQ
@@ -24,7 +25,7 @@ fn parallel_lloyd_pq<T>(
     k: usize,
     max_iters: usize,
 ) where
-    T: Float + FromPrimitive + ToPrimitive + Send + Sync,
+    T: Float + FromPrimitive + ToPrimitive + Send + Sync + SimdDistance,
 {
     for _ in 0..max_iters {
         // Parallel assignment with inline distance
@@ -36,11 +37,7 @@ fn parallel_lloyd_pq<T>(
                 let mut best_dist = T::infinity();
                 for c in 0..k {
                     let cent = &centroids[c * dim..(c + 1) * dim];
-                    let mut dist = T::zero();
-                    for d in 0..dim {
-                        let diff = vec[d] - cent[d];
-                        dist = dist + diff * diff;
-                    }
+                    let dist = T::euclidean_simd(vec, cent);
                     if dist < best_dist {
                         best_dist = dist;
                         best = c;
@@ -112,7 +109,7 @@ pub fn train_centroids_pq<T>(
     seed: usize,
 ) -> Vec<T>
 where
-    T: Float + FromPrimitive + ToPrimitive + Send + Sync,
+    T: Float + FromPrimitive + ToPrimitive + Send + Sync + SimdDistance,
 {
     // Fast init is fine for 256 centroids
     let mut centroids = fast_random_init(data, dim, n, n_centroids, seed);

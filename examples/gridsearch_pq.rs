@@ -66,17 +66,75 @@ fn main() {
 
     println!("-----------------------------------------------------------------------------------------------");
 
-    let nlist_values = [
-        (cli.n_cells as f32 * 0.5).sqrt() as usize,
-        (cli.n_cells as f32).sqrt() as usize,
-        (cli.n_cells as f32 * 2.0).sqrt() as usize,
-    ];
-
     let m_values: Vec<usize> = if cli.dim >= 128 {
         vec![16, 32, 48]
     } else {
         vec![8, 16]
     };
+
+    // PQ Exhaustive query benchmark
+    for m in &m_values {
+        println!("Building exhaustive PQ index with m={}...", m);
+        let start = Instant::now();
+        let exhaustive_pq_idx = build_exhaustive_pq_index(
+            data.as_ref(),
+            *m,
+            None,
+            None,
+            &cli.distance,
+            cli.seed as usize,
+            false,
+        );
+        let build_time = start.elapsed().as_secs_f64() * 1000.0;
+
+        let index_size_mb = exhaustive_pq_idx.memory_usage_bytes() as f64 / (1024.0 * 1024.0);
+
+        // query
+        println!("Querying exhaustive PQ index with m={}...", m);
+        let start = Instant::now();
+        let (approx_neighbours, _) =
+            query_exhaustive_pq_index(query_data.as_ref(), &exhaustive_pq_idx, cli.k, false, false);
+        let query_time = start.elapsed().as_secs_f64() * 1000.0;
+
+        let recall = calculate_recall(&true_neighbours, &approx_neighbours, cli.k);
+
+        results.push(BenchmarkResultSize {
+            method: format!("Exhaustive-PQ-m{} (query)", m),
+            build_time_ms: build_time,
+            query_time_ms: query_time,
+            total_time_ms: build_time + query_time,
+            recall_at_k: recall,
+            mean_dist_err: f64::NAN,
+            index_size_mb,
+        });
+
+        // self
+        println!("Self-querying exhaustive PQ index with m={}...", m);
+        let start = Instant::now();
+        let (approx_neighbours_self, _) =
+            query_exhaustive_pq_index_self(&exhaustive_pq_idx, cli.k, false, false);
+        let self_query_time = start.elapsed().as_secs_f64() * 1000.0;
+
+        let recall_self = calculate_recall(&true_neighbours_self, &approx_neighbours_self, cli.k);
+
+        results.push(BenchmarkResultSize {
+            method: format!("Exhaustive-PQ-m{} (self)", m),
+            build_time_ms: build_time,
+            query_time_ms: self_query_time,
+            total_time_ms: build_time + self_query_time,
+            recall_at_k: recall_self,
+            mean_dist_err: f64::NAN,
+            index_size_mb,
+        });
+    }
+
+    println!("-----------------------------------------------------------------------------------------------");
+
+    let nlist_values = [
+        (cli.n_cells as f32 * 0.5).sqrt() as usize,
+        (cli.n_cells as f32).sqrt() as usize,
+        (cli.n_cells as f32 * 2.0).sqrt() as usize,
+    ];
 
     for nlist in nlist_values {
         for m in &m_values {

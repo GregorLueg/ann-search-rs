@@ -58,7 +58,7 @@ name = "gridsearch_ivf_opq"
 required-features = ["quantised"]
 
 [[example]]
-name = "gridsearch_ivf_pq"
+name = "gridsearch_pq"
 required-features = ["quantised"]
 
 [[example]]
