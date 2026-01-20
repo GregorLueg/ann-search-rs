@@ -15,7 +15,7 @@ const MAX_SAMPLES_PCA: usize = 100_000;
 const ITQ_ITERATIONS: usize = 10;
 
 /// Initialisation of the binariser
-#[derive(Default)]
+#[derive(Default, Eq, PartialEq)]
 pub enum BinarisationInit {
     /// Random projection with orthogonalisation
     #[default]
