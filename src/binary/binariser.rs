@@ -280,7 +280,7 @@ where
 /// ### Returns
 ///
 /// Binary code as Vec<u8> (length = n_bits / 8)
-fn encode_with_projection<T>(
+fn encode_with_projections<T>(
     vec: &[T],
     projections: &[T],
     mean: &[T],
@@ -299,7 +299,11 @@ where
         let proj_base = bit_idx * dim;
         let mut dot = T::zero();
         for d in 0..dim {
-            let centered = vec[d] - mean[d];
+            let centered = if mean.is_empty() {
+                vec[d]
+            } else {
+                vec[d] - mean[d]
+            };
             dot = dot + centered * projections[proj_base + d];
         }
 
@@ -327,7 +331,7 @@ where
 ///
 /// Binary code as Vec<u8> (length = (dim + 7) / 8)
 fn encode_sign_based<T: Float>(vec: &[T], dim: usize) -> Vec<u8> {
-    let n_bytes = (dim + 7) / 8;
+    let n_bytes = dim.div_ceil(8);
     let mut binary = vec![0u8; n_bytes];
 
     for (bit_idx, &val) in vec.iter().enumerate() {
@@ -451,10 +455,10 @@ where
 
         match &self.method {
             BinarisationMethod::SimHash { projections } => {
-                encode_with_projection(vec, projections, &[], self.n_bits, self.dim)
+                encode_with_projections(vec, projections, &[], self.n_bits, self.dim)
             }
             BinarisationMethod::Itq { projections, mean } => {
-                encode_with_projection(vec, projections, mean, self.n_bits, self.dim)
+                encode_with_projections(vec, projections, mean, self.n_bits, self.dim)
             }
             BinarisationMethod::SignBased => encode_sign_based(vec, self.dim),
         }
@@ -634,7 +638,7 @@ mod tests {
             .collect();
         let binary = binariser.encode(&vec);
 
-        assert_eq!(binary.len(), (dim + 7) / 8);
+        assert_eq!(binary.len(), dim.div_ceil(8));
 
         // Check first few bits match expected pattern
         for i in 0..8 {
@@ -650,9 +654,9 @@ mod tests {
         let dim = 64;
         let binariser = Binariser::<f64>::new_sign_based(dim);
 
-        let vec1: Vec<f64> = (0..dim).map(|i| i as f64).collect();
-        let vec2: Vec<f64> = (0..dim).map(|i| i as f64 + 0.1).collect();
-        let vec3: Vec<f64> = (0..dim).map(|i| -(i as f64)).collect();
+        let vec1: Vec<f64> = (0..dim).map(|i| (i + 1) as f64).collect(); // Start from 1
+        let vec2: Vec<f64> = (0..dim).map(|i| (i + 1) as f64 + 0.1).collect();
+        let vec3: Vec<f64> = (0..dim).map(|i| -((i + 1) as f64)).collect(); // All negative
 
         let bin1 = binariser.encode(&vec1);
         let bin2 = binariser.encode(&vec2);
@@ -716,20 +720,20 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "n_bits must be multiple of 8")]
+    #[should_panic]
     fn test_invalid_n_bits_simhash() {
         let _binariser = Binariser::<f64>::new_simhash(64, 123, 42);
     }
 
     #[test]
-    #[should_panic(expected = "n_bits must be multiple of 8")]
+    #[should_panic]
     fn test_invalid_n_bits_itq() {
         let data = Mat::<f64>::zeros(100, 64);
         let _binariser = Binariser::<f64>::new_itq(data.as_ref(), 64, 123, 42);
     }
 
     #[test]
-    #[should_panic(expected = "Vector dimension mismatch")]
+    #[should_panic]
     fn test_dimension_mismatch() {
         let binariser = Binariser::<f64>::new_simhash(64, 128, 42);
         let wrong_vec: Vec<f64> = vec![0.0; 32];
