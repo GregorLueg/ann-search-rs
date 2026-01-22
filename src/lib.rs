@@ -6,6 +6,7 @@ pub mod exhaustive;
 pub mod hnsw;
 pub mod ivf;
 pub mod lsh;
+pub mod lsh_de;
 pub mod nndescent;
 pub mod utils;
 
