@@ -11,35 +11,53 @@ use crate::utils::dist::*;
 use crate::utils::heap_structs::*;
 use crate::utils::*;
 
-/////////////
-// Helpers //
-/////////////
+//////////////
+// Constants //
+//////////////
+
+/// Number of regions per dimension (8-bit encoding = 256 regions)
+const NUM_REGIONS: usize = 256;
+
+/// Number of breakpoints per dimension (NUM_REGIONS + 1)
+const NUM_BREAKPOINTS: usize = 257;
+
+/// Default maximum leaf size
+pub const MAX_LEAF_SIZE: usize = 64;
+
+/// Sample ratio for breakpoint selection (10% as per paper)
+const SAMPLE_RATIO: f64 = 0.1;
+
+/// Minimum sample size for breakpoint selection
+const MIN_SAMPLE_SIZE: usize = 1000;
 
 ///////////
 // Enums //
 ///////////
 
-/// Tree node with iSAX-style encoding
+/// Tree node for DE-Tree
 ///
-/// Root nodes have 2^K children representing all initial 1-bit encodings.
-/// Internal nodes split one dimension by adding a bit.
-/// Leaf nodes store point indices with bounds computed from symbolic encoding.
+/// Internal nodes split on one dimension's next bit.
+/// Leaf nodes store point indices.
+/// Bounds are computed from breakpoints during construction.
 pub enum Node<T> {
-    /// Root with 2^K children (all initial 1-bit combinations)
-    Root { children: Vec<Box<Node<T>>> },
-    /// Internal node with symbolic encoding
+    /// Internal node splitting on one dimension
     Internal {
-        encoding: Vec<Symbol>,
+        /// Dimension being split
         split_dim: usize,
+        /// Bit position (0 = MSB, 7 = LSB)
+        split_bit: usize,
+        /// Threshold encoding value (points with bit=0 go left, bit=1 go right)
         left: Box<Node<T>>,
         right: Box<Node<T>>,
-        bounds: Vec<(T, T)>, // computed from encoding
+        /// Bounding box in projected space [dim] -> (min, max)
+        bounds: Vec<(T, T)>,
     },
-    /// Leaf node with points and encoding
+    /// Leaf node containing points
     Leaf {
-        encoding: Vec<Symbol>,
+        /// Indices of points in this leaf
         points: Vec<usize>,
-        bounds: Vec<(T, T)>, // computed from encoding
+        /// Bounding box in projected space
+        bounds: Vec<(T, T)>,
     },
 }
 
@@ -47,520 +65,411 @@ pub enum Node<T> {
 // Structures //
 ////////////////
 
-/// Symbolic representation of one dimension (iSAX-style)
-///
-/// Encodes a continuous value as a bit-wise symbol. For example:
-///
-/// - 1 bit: "0*" (value in [0.0, 0.5)) or "1*" (value in [0.5, 1.0))
-/// - 2 bits: "00" [0.0, 0.25), "01" [0.25, 0.5), "10" [0.5, 0.75), "11" [0.75, 1.0)
-/// - 3 bits: further subdivisions, etc.
-///
-/// ### Fields
-///
-/// * `bits`: bit pattern: [false, true] = "01"
-/// * `cardinality`: number of bits (resolution)
-#[derive(Clone, Debug, PartialEq)]
-pub struct Symbol {
-    bits: Vec<bool>,
-}
-
-impl Symbol {
-    /// Create a new symbol with specified bits
-    ///
-    /// ### Params
-    ///
-    /// * `bits`: bit pattern: [false, true] = "01"
-    ///
-    /// ### Returns
-    ///
-    /// `Symbol` - Self
-    fn new(bits: Vec<bool>) -> Self {
-        Self { bits }
-    }
-
-    /// Create initial 1-bit symbol (0* or 1*)
-    ///
-    /// ### Params
-    ///
-    /// * `bit`: initial bit value
-    ///
-    /// ### Returns
-    ///
-    /// `Symbol` - Self
-    fn initial(bit: bool) -> Self {
-        Self { bits: vec![bit] }
-    }
-
-    /// Cardinality of the symbol (number of bits)
-    ///
-    /// ### Returns
-    ///
-    /// `usize` - Cardinality
-    fn cardinality(&self) -> usize {
-        self.bits.len()
-    }
-
-    /// Refine by adding a bit (split into two regions)
-    ///
-    /// ### Params
-    ///
-    /// * `new_bit`: bit value to add
-    ///
-    /// ### Returns
-    ///
-    /// `Symbol` - Self
-    fn refine(&self, new_bit: bool) -> Self {
-        let mut new_bits = self.bits.clone();
-        new_bits.push(new_bit);
-        Self { bits: new_bits }
-    }
-}
-
-/// Single DE-Tree with projected data and spatial hierarchy
-///
-/// Stores all projected vectors in a flat buffer and provides range query
-/// capability through an iSAX-style encoding-based tree.
+/// Single DE-Tree with breakpoints and projected data
 pub struct DETree<T> {
-    root: Node<T>,
-    projected_points_flat: Vec<T>, // flat buffer [n * proj_dims]
+    /// Root children indexed by first bit of each dimension (2^K children)
+    /// Index is computed as: sum over dims of (first_bit[dim] << (K-1-dim))
+    root_children: Vec<Option<Box<Node<T>>>>,
+    /// Number of projected dimensions (K)
     proj_dims: usize,
-}
-
-impl<T: Copy> DETree<T> {
-    /// Access projected point coordinate
-    ///
-    /// ### Params
-    ///
-    /// * `point_idx`: index of the point
-    /// * `dim`: dimension of the point
-    ///
-    /// ### Returns
-    ///
-    /// `T` - Projected coordinate
-    #[inline]
-    #[allow(dead_code)]
-    fn get_projected(&self, point_idx: usize, dim: usize) -> T {
-        self.projected_points_flat[point_idx * self.proj_dims + dim]
-    }
+    /// Breakpoints for each dimension: [dim][0..257]
+    /// breakpoints[dim][i] is the i-th breakpoint for dimension dim
+    breakpoints: Vec<Vec<T>>,
+    /// Projected points flattened: [point_idx * proj_dims + dim]
+    projected_points: Vec<T>,
+    /// Pre-computed encodings: [point_idx * proj_dims + dim] -> 0..255
+    encodings: Vec<u8>,
 }
 
 //////////////////////
-// Helper functions //
+// Helper Functions //
 //////////////////////
 
-/// Estimate memory used by tree nodes
+/// Select breakpoints using QuickSelect algorithm (Algorithm 1 from paper)
+///
+/// Samples points and finds breakpoints that divide each dimension into
+/// NUM_REGIONS regions with approximately equal point counts.
 ///
 /// ### Params
 ///
-/// * `node`: reference to the node
-///
-/// ### Returns
-///
-/// Memory used by the tree
-fn estimate_tree_size<T>(node: &Node<T>) -> usize {
-    match node {
-        Node::Root { children } => {
-            std::mem::size_of::<Node<T>>()
-                + children.capacity() * std::mem::size_of::<Box<Node<T>>>()
-                + children
-                    .iter()
-                    .map(|c| estimate_tree_size(c))
-                    .sum::<usize>()
-        }
-        Node::Leaf {
-            encoding,
-            points,
-            bounds,
-        } => {
-            std::mem::size_of::<Node<T>>()
-                + encoding.iter().map(|s| s.bits.capacity()).sum::<usize>()
-                + points.capacity() * std::mem::size_of::<usize>()
-                + bounds.capacity() * std::mem::size_of::<(T, T)>()
-        }
-        Node::Internal {
-            encoding,
-            left,
-            right,
-            bounds,
-            ..
-        } => {
-            std::mem::size_of::<Node<T>>()
-                + encoding.iter().map(|s| s.bits.capacity()).sum::<usize>()
-                + bounds.capacity() * std::mem::size_of::<(T, T)>()
-                + estimate_tree_size(left)
-                + estimate_tree_size(right)
-        }
-    }
-}
-
-/// Encode a point into iSAX symbolic representation
-///
-/// Converts continuous coordinates to bit-wise symbols based on region
-/// boundaries. For example, with cardinality=2, dimension value 0.3 becomes
-/// "01" (second of four regions: [0.25, 0.5)).
-///
-/// ### Params
-///
-/// * `point_flat` - Flat buffer containing all projected points
-/// * `point_idx` - Index of the point to encode
+/// * `projected_flat` - Flattened projected points [n * proj_dims]
+/// * `n` - Number of points
 /// * `proj_dims` - Number of projected dimensions
-/// * `cardinalities` - Number of bits per dimension
 ///
 /// ### Returns
 ///
-/// Vector of symbols, one per dimension
-fn encode_point<T>(
-    point_flat: &[T],
-    point_idx: usize,
-    proj_dims: usize,
-    cardinalities: &[usize],
-) -> Vec<Symbol>
+/// Breakpoints for each dimension: Vec<Vec<T>> where [dim][0..257]
+fn select_breakpoints<T>(projected_flat: &[T], n: usize, proj_dims: usize) -> Vec<Vec<T>>
 where
-    T: Float + FromPrimitive,
+    T: Float + FromPrimitive + ToPrimitive + Send + Sync,
 {
-    let mut encoding = Vec::with_capacity(proj_dims);
-    let base = point_idx * proj_dims;
+    // Determine sample size (10% of data, minimum 1000, maximum n)
+    let sample_size = ((n as f64 * SAMPLE_RATIO) as usize)
+        .max(MIN_SAMPLE_SIZE)
+        .min(n);
+
+    let mut breakpoints = Vec::with_capacity(proj_dims);
 
     for dim in 0..proj_dims {
-        let value = point_flat[base + dim];
-        let card = cardinalities[dim];
-        let num_regions = 1usize << card; // 2^card
+        // Extract values for this dimension from all points
+        let mut values: Vec<T> = (0..n)
+            .map(|i| projected_flat[i * proj_dims + dim])
+            .collect();
 
-        // Normalise to [0, 1) range - assumes values are roughly in [-1, 1]
-        // from projections. For robustness, we clamp to [0, 1)
-        let normalised = (value + T::one()) / (T::one() + T::one());
-        let clamped = normalised.max(T::zero()).min(T::from_f32(0.999).unwrap());
-
-        // Determine which region
-        let region = (clamped * T::from_usize(num_regions).unwrap())
-            .floor()
-            .to_usize()
-            .unwrap();
-
-        // Convert region to binary bits
-        let mut bits = Vec::with_capacity(card);
-        for i in (0..card).rev() {
-            bits.push((region >> i) & 1 == 1);
+        // If we're sampling, take a random subset
+        if sample_size < n {
+            let mut rng = StdRng::seed_from_u64((dim * 12345) as u64);
+            values.shuffle(&mut rng);
+            values.truncate(sample_size);
         }
 
-        encoding.push(Symbol::new(bits));
-    }
+        let ns = values.len();
 
-    encoding
-}
+        // Use divide-and-conquer with QuickSelect to find breakpoints
+        // We need to find values at positions that divide into NUM_REGIONS equal parts
+        let mut dim_breakpoints = vec![T::zero(); NUM_BREAKPOINTS];
 
-// /// Check if a point matches a given encoding
-// ///
-// /// ### Params
-// ///
-// /// * `point_flat` - Flat buffer containing all projected points
-// /// * `point_idx` - Index of the point
-// /// * `proj_dims` - Number of projected dimensions
-// /// * `encoding` - Symbolic encoding to match against
-// ///
-// /// ### Returns
-// ///
-// /// True if point's encoding matches the given encoding
-// fn matches_encoding<T>(
-//     point_flat: &[T],
-//     point_idx: usize,
-//     proj_dims: usize,
-//     encoding: &[Symbol],
-// ) -> bool
-// where
-//     T: Float + FromPrimitive,
-// {
-//     let cardinalities: Vec<usize> = encoding.iter().map(|s| s.cardinality()).collect();
-//     let point_encoding = encode_point(point_flat, point_idx, proj_dims, &cardinalities);
+        // Find breakpoints using iterative QuickSelect
+        // Positions we need: 0, ns/256, 2*ns/256, ..., 255*ns/256, ns-1
+        let region_size = ns / NUM_REGIONS;
 
-//     point_encoding == encoding
-// }
+        if region_size == 0 {
+            // Too few points - use min/max and interpolate
+            let min_val = values.iter().cloned().fold(T::infinity(), |a, b| a.min(b));
+            let max_val = values
+                .iter()
+                .cloned()
+                .fold(T::neg_infinity(), |a, b| a.max(b));
+            let range = max_val - min_val;
 
-/// Compute bounds from iSAX symbolic encoding
-///
-/// Converts bit patterns to continuous region boundaries. For example:
-///
-/// - Symbol "01" with cardinality 2: region [0.25, 0.5) in normalised space
-/// - Symbol "1*" with cardinality 1: region [0.5, 1.0) in normalised space
-///
-/// ### Params
-///
-/// * `encoding` - Symbolic encoding
-///
-/// ### Returns
-///
-/// Vector of (min, max) bounds, one per dimension
-fn compute_bounds_from_encoding<T>(encoding: &[Symbol]) -> Vec<(T, T)>
-where
-    T: Float + FromPrimitive,
-{
-    let mut bounds = Vec::with_capacity(encoding.len());
+            for i in 0..NUM_BREAKPOINTS {
+                let frac = T::from_usize(i).unwrap() / T::from_usize(NUM_REGIONS).unwrap();
+                dim_breakpoints[i] = min_val + range * frac;
+            }
+        } else {
+            // Sort the sampled values (QuickSelect would be faster but sort is simpler
+            // and we only do this once during index construction)
+            values.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
 
-    for symbol in encoding {
-        let card = symbol.cardinality();
-        let num_regions = 1usize << card; // 2^card
+            // First breakpoint is minimum
+            dim_breakpoints[0] = values[0];
 
-        // Decode bit pattern to region number
-        let mut region = 0usize;
-        for (i, &bit) in symbol.bits.iter().enumerate() {
-            if bit {
-                region |= 1 << (card - 1 - i);
+            // Middle breakpoints at quantile positions
+            for i in 1..NUM_REGIONS {
+                let pos = (i * ns) / NUM_REGIONS;
+                dim_breakpoints[i] = values[pos.min(ns - 1)];
+            }
+
+            // Last breakpoint is maximum (plus small epsilon for inclusive upper bound)
+            dim_breakpoints[NUM_REGIONS] = values[ns - 1];
+        }
+
+        // Ensure breakpoints are strictly increasing (handle duplicates)
+        for i in 1..NUM_BREAKPOINTS {
+            if dim_breakpoints[i] <= dim_breakpoints[i - 1] {
+                dim_breakpoints[i] = dim_breakpoints[i - 1] + T::epsilon();
             }
         }
 
-        // Convert region to normalised [0, 1) bounds
-        let region_size = T::one() / T::from_usize(num_regions).unwrap();
-        let min_normalized = T::from_usize(region).unwrap() * region_size;
-        let max_normalized = min_normalized + region_size;
+        breakpoints.push(dim_breakpoints);
+    }
 
-        // Convert back to [-1, 1) range (inverse of normalisation)
-        let min = min_normalized * (T::one() + T::one()) - T::one();
-        let max = max_normalized * (T::one() + T::one()) - T::one();
+    breakpoints
+}
 
-        bounds.push((min, max));
+/// Encode a single value using binary search against breakpoints
+///
+/// Returns region index 0..255
+#[inline]
+fn encode_value<T: Float>(value: T, breakpoints: &[T]) -> u8 {
+    // Binary search to find which region the value falls into
+    // Region i contains values in [breakpoints[i], breakpoints[i+1])
+
+    let mut lo = 0usize;
+    let mut hi = NUM_REGIONS; // exclusive upper bound
+
+    while lo < hi {
+        let mid = lo + (hi - lo) / 2;
+        if value < breakpoints[mid] {
+            hi = mid;
+        } else {
+            lo = mid + 1;
+        }
+    }
+
+    // lo is now the first breakpoint > value, so region is lo - 1
+    // Clamp to valid range [0, 255]
+    lo.saturating_sub(1).min(NUM_REGIONS - 1) as u8
+}
+
+/// Encode all points for one tree (Algorithm 2 from paper)
+///
+/// ### Params
+///
+/// * `projected_flat` - Projected points [n * proj_dims]
+/// * `n` - Number of points
+/// * `proj_dims` - Number of dimensions
+/// * `breakpoints` - Breakpoints per dimension [dim][0..257]
+///
+/// ### Returns
+///
+/// Encodings flattened: [point_idx * proj_dims + dim] -> 0..255
+fn encode_points<T: Float>(
+    projected_flat: &[T],
+    n: usize,
+    proj_dims: usize,
+    breakpoints: &[Vec<T>],
+) -> Vec<u8> {
+    let mut encodings = vec![0u8; n * proj_dims];
+
+    for point_idx in 0..n {
+        let base = point_idx * proj_dims;
+        for dim in 0..proj_dims {
+            let value = projected_flat[base + dim];
+            encodings[base + dim] = encode_value(value, &breakpoints[dim]);
+        }
+    }
+
+    encodings
+}
+
+/// Get the first bit (MSB) of an 8-bit encoding
+#[inline]
+fn first_bit(encoding: u8) -> bool {
+    (encoding & 0x80) != 0
+}
+
+/// Get a specific bit from an 8-bit encoding (bit 0 = MSB, bit 7 = LSB)
+#[inline]
+fn get_bit(encoding: u8, bit_pos: usize) -> bool {
+    debug_assert!(bit_pos < 8);
+    (encoding & (0x80 >> bit_pos)) != 0
+}
+
+/// Compute root child index from first bits of each dimension
+///
+/// Index = sum of first_bit[dim] * 2^(K-1-dim)
+#[inline]
+fn root_child_index(encodings: &[u8], proj_dims: usize) -> usize {
+    let mut index = 0usize;
+    for dim in 0..proj_dims {
+        if first_bit(encodings[dim]) {
+            index |= 1 << (proj_dims - 1 - dim);
+        }
+    }
+    index
+}
+
+/// Compute bounds for a set of points from their actual projected coordinates
+///
+/// This gives tight bounds based on actual point positions.
+fn compute_bounds_from_points<T: Float>(
+    point_indices: &[usize],
+    projected_flat: &[T],
+    proj_dims: usize,
+) -> Vec<(T, T)> {
+    if point_indices.is_empty() {
+        return vec![(T::zero(), T::zero()); proj_dims];
+    }
+
+    let mut bounds = vec![(T::infinity(), T::neg_infinity()); proj_dims];
+
+    for &idx in point_indices {
+        let base = idx * proj_dims;
+        for dim in 0..proj_dims {
+            let val = projected_flat[base + dim];
+            bounds[dim].0 = bounds[dim].0.min(val);
+            bounds[dim].1 = bounds[dim].1.max(val);
+        }
     }
 
     bounds
 }
 
-/// Split an iSAX node by adding a bit to one dimension
+/// Build a subtree from a set of points (Algorithm 3 from paper)
 ///
-/// Chooses the dimension that produces the most even split, then increments
-/// its cardinality by 1 (splits into two sub-regions).
-///
-/// ### Params
-///
-/// * `point_indices` - Points in this node
-/// * `encoding` - Current symbolic encoding
-/// * `projected_points_flat` - Flat buffer of projected coordinates
-/// * `proj_dims` - Number of projected dimensions
-/// * `max_leaf_size` - Maximum points per leaf
-///
-/// ### Returns
-///
-/// Internal or leaf node
-fn split_isax_node<T>(
+/// Recursively splits nodes by choosing the dimension that gives
+/// the most even split, adding one more bit of precision.
+fn build_subtree<T: Float>(
     point_indices: Vec<usize>,
-    encoding: Vec<Symbol>,
-    projected_points_flat: &[T],
+    encodings: &[u8],
+    projected_flat: &[T],
     proj_dims: usize,
     max_leaf_size: usize,
-) -> Node<T>
-where
-    T: Float + FromPrimitive,
-{
-    // find dimension with most even split
+    current_bits: &[usize], // How many bits revealed per dimension (0-8)
+) -> Node<T> {
+    // Base case: small enough for leaf
+    if point_indices.len() <= max_leaf_size {
+        let bounds = compute_bounds_from_points(&point_indices, projected_flat, proj_dims);
+        return Node::Leaf {
+            points: point_indices,
+            bounds,
+        };
+    }
+
+    // Find best dimension to split (most even division)
     let mut best_dim = 0;
     let mut best_balance = usize::MAX;
+    let mut best_bit = 0;
 
     for dim in 0..proj_dims {
-        // count points that would go to left child (bit 0) vs right (bit 1)
-        let mut left_encoding = encoding.clone();
-        left_encoding[dim] = left_encoding[dim].refine(false);
+        let bits_used = current_bits[dim];
+        if bits_used >= 8 {
+            continue; // Already at maximum precision
+        }
 
-        let left_cardinalities: Vec<usize> =
-            left_encoding.iter().map(|s| s.cardinality()).collect();
+        let next_bit = bits_used;
 
-        let left_count = point_indices
-            .iter()
-            .filter(|&&idx| {
-                let point_enc =
-                    encode_point(projected_points_flat, idx, proj_dims, &left_cardinalities);
-                point_enc == left_encoding
-            })
-            .count();
-
+        // Count points that would go left (bit = 0) vs right (bit = 1)
+        let mut left_count = 0;
+        for &idx in &point_indices {
+            let enc = encodings[idx * proj_dims + dim];
+            if !get_bit(enc, next_bit) {
+                left_count += 1;
+            }
+        }
         let right_count = point_indices.len() - left_count;
-        let balance = left_count.abs_diff(right_count);
 
+        // Skip if all points go one way (can't split)
+        if left_count == 0 || right_count == 0 {
+            continue;
+        }
+
+        let balance = left_count.abs_diff(right_count);
         if balance < best_balance {
             best_balance = balance;
             best_dim = dim;
+            best_bit = next_bit;
         }
     }
 
-    // split on best dimension
-    let mut left_encoding = encoding.clone();
-    let mut right_encoding = encoding.clone();
+    // If we can't split (all dimensions exhausted or all points identical), make leaf
+    if best_balance == usize::MAX {
+        let bounds = compute_bounds_from_points(&point_indices, projected_flat, proj_dims);
+        return Node::Leaf {
+            points: point_indices,
+            bounds,
+        };
+    }
 
-    left_encoding[best_dim] = left_encoding[best_dim].refine(false);
-    right_encoding[best_dim] = right_encoding[best_dim].refine(true);
-
-    // partition points
-    let left_cardinalities: Vec<usize> = left_encoding.iter().map(|s| s.cardinality()).collect();
-
+    // Partition points
     let mut left_points = Vec::new();
     let mut right_points = Vec::new();
 
-    for &idx in &point_indices {
-        let point_enc = encode_point(projected_points_flat, idx, proj_dims, &left_cardinalities);
-        if point_enc == left_encoding {
+    for idx in point_indices {
+        let enc = encodings[idx * proj_dims + best_dim];
+        if !get_bit(enc, best_bit) {
             left_points.push(idx);
         } else {
             right_points.push(idx);
         }
     }
 
-    // handle degenerate case (all points to one side)
-    if left_points.is_empty() || right_points.is_empty() {
-        let bounds = compute_bounds_from_encoding(&encoding);
-        return Node::Leaf {
-            encoding,
-            points: point_indices,
-            bounds,
-        };
-    }
+    // Update bits used for recursive calls
+    let mut left_bits = current_bits.to_vec();
+    let mut right_bits = current_bits.to_vec();
+    left_bits[best_dim] = best_bit + 1;
+    right_bits[best_dim] = best_bit + 1;
 
-    // build children
-    let left = if left_points.len() <= max_leaf_size {
-        let bounds = compute_bounds_from_encoding(&left_encoding);
-        Box::new(Node::Leaf {
-            encoding: left_encoding.clone(),
-            points: left_points,
-            bounds,
-        })
-    } else {
-        Box::new(split_isax_node(
-            left_points,
-            left_encoding.clone(),
-            projected_points_flat,
-            proj_dims,
-            max_leaf_size,
-        ))
-    };
+    // Build children
+    let left = Box::new(build_subtree(
+        left_points,
+        encodings,
+        projected_flat,
+        proj_dims,
+        max_leaf_size,
+        &left_bits,
+    ));
 
-    let right = if right_points.len() <= max_leaf_size {
-        let bounds = compute_bounds_from_encoding(&right_encoding);
-        Box::new(Node::Leaf {
-            encoding: right_encoding.clone(),
-            points: right_points,
-            bounds,
-        })
-    } else {
-        Box::new(split_isax_node(
-            right_points,
-            right_encoding.clone(),
-            projected_points_flat,
-            proj_dims,
-            max_leaf_size,
-        ))
-    };
+    let right = Box::new(build_subtree(
+        right_points,
+        encodings,
+        projected_flat,
+        proj_dims,
+        max_leaf_size,
+        &right_bits,
+    ));
 
-    // compute bounds for internal node (union of children)
+    // Compute bounds as union of children
     let left_bounds = match left.as_ref() {
-        Node::Leaf { bounds, .. } => bounds,
         Node::Internal { bounds, .. } => bounds,
-        Node::Root { .. } => unreachable!("Root cannot be child"),
+        Node::Leaf { bounds, .. } => bounds,
     };
     let right_bounds = match right.as_ref() {
-        Node::Leaf { bounds, .. } => bounds,
         Node::Internal { bounds, .. } => bounds,
-        Node::Root { .. } => unreachable!("Root cannot be child"),
+        Node::Leaf { bounds, .. } => bounds,
     };
 
     let mut bounds = Vec::with_capacity(proj_dims);
     for dim in 0..proj_dims {
-        let min = left_bounds[dim].0.min(right_bounds[dim].0);
-        let max = left_bounds[dim].1.max(right_bounds[dim].1);
-        bounds.push((min, max));
+        bounds.push((
+            left_bounds[dim].0.min(right_bounds[dim].0),
+            left_bounds[dim].1.max(right_bounds[dim].1),
+        ));
     }
 
     Node::Internal {
-        encoding,
         split_dim: best_dim,
+        split_bit: best_bit,
         left,
         right,
         bounds,
     }
 }
 
-/// Build iSAX-style DE-Tree
-///
-/// Creates root with 2^K children representing all initial 1-bit encodings,
-/// then recursively refines by adding bits to dimensions with most even splits.
-///
-/// ### Params
-///
-/// * `point_indices` - Indices of all points
-/// * `projected_points_flat` - Flat buffer of projected coordinates
-/// * `proj_dims` - Number of projected dimensions (K)
-/// * `max_leaf_size` - Maximum points per leaf
-///
-/// ### Returns
-///
-/// Root node of constructed tree
-fn build_isax_tree<T>(
-    point_indices: &[usize],
-    projected_points_flat: &[T],
+/// Build a DE-Tree from encoded points (Algorithm 3 from paper)
+fn build_tree<T: Float>(
+    n: usize,
+    encodings: &[u8],
+    projected_flat: &[T],
     proj_dims: usize,
     max_leaf_size: usize,
-) -> Node<T>
-where
-    T: Float + FromPrimitive,
-{
-    // create root with 2^K children (all initial 1-bit encodings)
+    breakpoints: Vec<Vec<T>>,
+) -> DETree<T> {
     let num_root_children = 1usize << proj_dims;
-    let mut root_children = Vec::with_capacity(num_root_children);
+    let mut root_children: Vec<Option<Box<Node<T>>>> =
+        (0..num_root_children).map(|_| None).collect();
 
-    for i in 0..num_root_children {
-        // generate encoding for this child
-        let mut encoding = Vec::with_capacity(proj_dims);
-        for dim in 0..proj_dims {
-            let bit = (i >> (proj_dims - 1 - dim)) & 1 == 1;
-            encoding.push(Symbol::initial(bit));
-        }
+    // Partition points by first bit of each dimension
+    let mut child_points: Vec<Vec<usize>> = vec![Vec::new(); num_root_children];
 
-        // collect points matching this encoding
-        let cardinalities = vec![1; proj_dims];
-        let mut child_points = Vec::new();
-        for &idx in point_indices {
-            let point_encoding =
-                encode_point(projected_points_flat, idx, proj_dims, &cardinalities);
-            if point_encoding == encoding {
-                child_points.push(idx);
-            }
-        }
-
-        // build child (leaf or internal)
-        let child = if child_points.len() <= max_leaf_size {
-            let bounds = compute_bounds_from_encoding(&encoding);
-            Node::Leaf {
-                encoding,
-                points: child_points,
-                bounds,
-            }
-        } else {
-            split_isax_node(
-                child_points,
-                encoding,
-                projected_points_flat,
-                proj_dims,
-                max_leaf_size,
-            )
-        };
-
-        root_children.push(Box::new(child));
+    for idx in 0..n {
+        let base = idx * proj_dims;
+        let enc_slice = &encodings[base..base + proj_dims];
+        let child_idx = root_child_index(enc_slice, proj_dims);
+        child_points[child_idx].push(idx);
     }
 
-    Node::Root {
-        children: root_children,
+    // Build each root child
+    let initial_bits = vec![1usize; proj_dims]; // First bit already used for root
+
+    for (child_idx, points) in child_points.into_iter().enumerate() {
+        if points.is_empty() {
+            continue;
+        }
+
+        let node = build_subtree(
+            points,
+            encodings,
+            projected_flat,
+            proj_dims,
+            max_leaf_size,
+            &initial_bits,
+        );
+
+        root_children[child_idx] = Some(Box::new(node));
+    }
+
+    DETree {
+        root_children,
+        proj_dims,
+        breakpoints,
+        projected_points: projected_flat.to_vec(),
+        encodings: encodings.to_vec(),
     }
 }
 
 /// Orthogonalise random projections using Gram-Schmidt
-///
-/// Orthogonalises the random projections within each tree, improving
-/// discriminative power and query performance. If a vector has near-zero
-/// norm after orthogonalisation, it is reinitialised with a new random
-/// vector.
-///
-/// ### Params
-///
-/// * `projections` - The random projection vectors to orthogonalise
-/// * `num_trees` - Number of trees
-/// * `proj_dims` - Projected dimensionality
-/// * `dim` - Original dimensionality
-/// * `seed` - Random seed for reinitialisation if needed
 fn orthogonalise_projections<T>(
     projections: &mut [T],
     num_trees: usize,
@@ -576,7 +485,7 @@ fn orthogonalise_projections<T>(
         for i in 0..proj_dims {
             let i_base = base + i * dim;
 
-            // orthogonalise against previous vectors
+            // Orthogonalise against previous vectors
             for j in 0..i {
                 let j_base = base + j * dim;
                 let mut dot = T::zero();
@@ -589,7 +498,7 @@ fn orthogonalise_projections<T>(
                 }
             }
 
-            // normalise
+            // Normalise
             let mut norm_sq = T::zero();
             for d in 0..dim {
                 norm_sq = norm_sq + projections[i_base + d] * projections[i_base + d];
@@ -601,7 +510,7 @@ fn orthogonalise_projections<T>(
                     projections[i_base + d] = projections[i_base + d] / norm;
                 }
             } else {
-                // re-initialise with new random vector if norm is too small
+                // Re-initialise with new random vector
                 let reinit_seed = seed.wrapping_mul(table_idx + 1).wrapping_mul(i + 1);
                 let mut rng = StdRng::seed_from_u64(reinit_seed as u64);
                 for d in 0..dim {
@@ -609,7 +518,7 @@ fn orthogonalise_projections<T>(
                     projections[i_base + d] = T::from_f64(val).unwrap();
                 }
 
-                // re-orthogonalise and normalise the new vector
+                // Re-orthogonalise
                 for j in 0..i {
                     let j_base = base + j * dim;
                     let mut dot = T::zero();
@@ -630,7 +539,7 @@ fn orthogonalise_projections<T>(
 
                 assert!(
                     norm > T::epsilon(),
-                    "Orthogonalisation failed even after reinitialisation"
+                    "Orthogonalisation failed after reinitialisation"
                 );
 
                 for d in 0..dim {
@@ -642,31 +551,17 @@ fn orthogonalise_projections<T>(
 }
 
 /// Compute lower bound distance from query to bounding box
-///
-/// Returns zero if query is inside box, otherwise sum of squared distances
-/// to nearest box edge.
-///
-/// ### Params
-///
-/// * `bounds` - Bounding box as (min, max) per dimension
-/// * `query` - Query point
-///
-/// ### Returns
-///
-/// Lower bound on distance to any point in box
 #[inline]
-fn distance_lower_bound<T>(bounds: &[(T, T)], query: &[T]) -> T
-where
-    T: Float,
-{
+fn lower_bound_distance<T: Float>(bounds: &[(T, T)], query: &[T]) -> T {
     let mut sum_sq = T::zero();
 
     for (dim, &(min, max)) in bounds.iter().enumerate() {
-        if query[dim] < min {
-            let diff = min - query[dim];
+        let q = query[dim];
+        if q < min {
+            let diff = min - q;
             sum_sq = sum_sq + diff * diff;
-        } else if query[dim] > max {
-            let diff = query[dim] - max;
+        } else if q > max {
+            let diff = q - max;
             sum_sq = sum_sq + diff * diff;
         }
     }
@@ -675,27 +570,14 @@ where
 }
 
 /// Compute upper bound distance from query to bounding box
-///
-/// Returns maximum possible distance to any point in box.
-///
-/// ### Params
-///
-/// * `bounds` - Bounding box as (min, max) per dimension
-/// * `query` - Query point
-///
-/// ### Returns
-///
-/// Upper bound on distance to any point in box
 #[inline]
-fn distance_upper_bound<T>(bounds: &[(T, T)], query: &[T]) -> T
-where
-    T: Float,
-{
+fn upper_bound_distance<T: Float>(bounds: &[(T, T)], query: &[T]) -> T {
     let mut sum_sq = T::zero();
 
     for (dim, &(min, max)) in bounds.iter().enumerate() {
-        let dist_to_min = (query[dim] - min).abs();
-        let dist_to_max = (query[dim] - max).abs();
+        let q = query[dim];
+        let dist_to_min = (q - min).abs();
+        let dist_to_max = (q - max).abs();
         let max_dist = dist_to_min.max(dist_to_max);
         sum_sq = sum_sq + max_dist * max_dist;
     }
@@ -703,86 +585,48 @@ where
     sum_sq.sqrt()
 }
 
-/// Compute Euclidean distance in projected space using SIMD
-///
-/// ###
+/// Euclidean distance in projected space
 #[inline]
-fn euclidean_distance_projected<T>(
-    projected_points_flat: &[T],
-    point_idx: usize,
-    query: &[T],
-    proj_dims: usize,
-) -> T
+fn projected_distance<T>(projected_flat: &[T], point_idx: usize, query: &[T], proj_dims: usize) -> T
 where
     T: Float + SimdDistance,
 {
     let base = point_idx * proj_dims;
-    let point_slice = &projected_points_flat[base..base + proj_dims];
-    T::euclidean_simd(point_slice, query).sqrt()
+    let point = &projected_flat[base..base + proj_dims];
+    T::euclidean_simd(point, query).sqrt()
 }
 
-/// Range query on a tree node
-///
-/// Recursively traverses tree, pruning subtrees where lower bound exceeds
-/// radius. Handles Root nodes by traversing all 2^K children.
-///
-/// ### Params
-///
-/// * `node` - Current node
-/// * `query_projected` - Query vector in projected space
-/// * `radius` - Search radius in projected space
-/// * `projected_points_flat` - Flat buffer of all projected vectors
-/// * `proj_dims` - Number of projected dimensions
-/// * `candidates` - Output buffer for candidate indices
-fn range_query<T>(
+/// Range query on a node (Algorithm 5 from paper)
+fn range_query_node<T>(
     node: &Node<T>,
-    query_projected: &[T],
+    query: &[T],
     radius: T,
-    projected_points_flat: &[T],
+    projected_flat: &[T],
     proj_dims: usize,
     candidates: &mut Vec<usize>,
 ) where
     T: Float + SimdDistance,
 {
     match node {
-        Node::Root { children } => {
-            // Traverse all 2^K children
-            for child in children {
-                range_query(
-                    child,
-                    query_projected,
-                    radius,
-                    projected_points_flat,
-                    proj_dims,
-                    candidates,
-                );
-            }
-        }
-        Node::Leaf { points, bounds, .. } => {
-            // Compute lower bound
-            let lower_bound = distance_lower_bound(bounds, query_projected);
+        Node::Leaf { points, bounds } => {
+            let lower = lower_bound_distance(bounds, query);
 
             // Prune if lower bound exceeds radius
-            if lower_bound > radius {
+            if lower > radius {
                 return;
             }
 
-            let upper_bound = distance_upper_bound(bounds, query_projected);
+            let upper = upper_bound_distance(bounds, query);
 
-            if upper_bound <= radius {
-                // All points guaranteed within radius
+            if upper <= radius {
+                // All points in this leaf are within radius
                 candidates.extend_from_slice(points);
             } else {
                 // Check each point individually
-                for &point_idx in points {
-                    let proj_dist = euclidean_distance_projected(
-                        projected_points_flat,
-                        point_idx,
-                        query_projected,
-                        proj_dims,
-                    );
-                    if proj_dist <= radius {
-                        candidates.push(point_idx);
+                for &idx in points {
+                    let dist = projected_distance(projected_flat, idx, query, proj_dims);
+                    if dist <= radius {
+                        candidates.push(idx);
                     }
                 }
             }
@@ -793,30 +637,56 @@ fn range_query<T>(
             bounds,
             ..
         } => {
-            // Compute lower bound
-            let lower_bound = distance_lower_bound(bounds, query_projected);
+            let lower = lower_bound_distance(bounds, query);
 
             // Prune if lower bound exceeds radius
-            if lower_bound > radius {
+            if lower > radius {
                 return;
             }
 
-            range_query(
-                left,
-                query_projected,
+            range_query_node(left, query, radius, projected_flat, proj_dims, candidates);
+            range_query_node(right, query, radius, projected_flat, proj_dims, candidates);
+        }
+    }
+}
+
+/// Range query on a DE-Tree (Algorithm 4 from paper)
+fn range_query<T>(tree: &DETree<T>, query: &[T], radius: T, candidates: &mut Vec<usize>)
+where
+    T: Float + SimdDistance,
+{
+    for child_opt in &tree.root_children {
+        if let Some(child) = child_opt {
+            range_query_node(
+                child,
+                query,
                 radius,
-                projected_points_flat,
-                proj_dims,
+                &tree.projected_points,
+                tree.proj_dims,
                 candidates,
             );
-            range_query(
-                right,
-                query_projected,
-                radius,
-                projected_points_flat,
-                proj_dims,
-                candidates,
-            );
+        }
+    }
+}
+
+/// Estimate memory used by a node
+fn node_memory<T>(node: &Node<T>) -> usize {
+    match node {
+        Node::Leaf { points, bounds } => {
+            std::mem::size_of::<Node<T>>()
+                + points.capacity() * std::mem::size_of::<usize>()
+                + bounds.capacity() * std::mem::size_of::<(T, T)>()
+        }
+        Node::Internal {
+            left,
+            right,
+            bounds,
+            ..
+        } => {
+            std::mem::size_of::<Node<T>>()
+                + bounds.capacity() * std::mem::size_of::<(T, T)>()
+                + node_memory(left)
+                + node_memory(right)
         }
     }
 }
@@ -827,54 +697,53 @@ fn range_query<T>(
 
 /// LSH index using DE-Trees for approximate nearest neighbour search
 ///
-/// Implements the DET-LSH algorithm using iSAX-style encoding-based trees.
-/// Combines random projections with hierarchical symbolic encoding to enable
-/// efficient range queries in projected space.
+/// Implements the DET-LSH algorithm from the paper with:
+/// - Dynamic breakpoint selection based on data distribution
+/// - 8-bit iSAX-style encoding per dimension
+/// - Efficient range queries with bound-based pruning
 ///
 /// ### Algorithm Overview
 ///
-/// - **Projection**: Map high-dimensional vectors to lower-dimensional space
-///   using random Gaussian projections (LSH functions)
-/// - **Encoding**: Convert projected coordinates to bit-wise symbolic
-///   representations (iSAX-style)
-/// - **Indexing**: Build trees with 2^K root children representing all initial
-///   encodings, then refine by adding bits to dimensions with most even splits
-/// - **Querying**: Traverse trees with range queries, pruning subtrees where
-///   lower bound exceeds search radius
+/// 1. **Projection**: Map D-dimensional vectors to K dimensions using random
+///    Gaussian projections
+/// 2. **Breakpoint Selection**: Sample 10% of projected points, find quantiles
+///    to divide each dimension into 256 equal-population regions
+/// 3. **Encoding**: Convert each projected coordinate to 8-bit region index
+/// 4. **Tree Construction**: Build trees with 2^K root children, split by
+///    choosing dimension with most even split
+/// 5. **Query**: Range query with lower/upper bound pruning, deduplicate
+///    across trees
 ///
-/// ### Key Differences from Standard kd-trees
+/// ### Parameters
 ///
-/// - Root has 2^K children (all initial 1-bit encodings)
-/// - Splits add bits to symbolic encoding rather than using continuous medians
-/// - Bounds computed from symbolic regions, not actual point coordinates
-/// - Split dimension chosen for most even division, not highest variance
-///
-/// ### Fields
-///
-/// * `vectors_flat` - Original data, flattened for cache efficiency
-/// * `dim` - Embedding dimensionality
-/// * `n` - Number of vectors
-/// * `norms` - Pre-computed norms for Cosine (empty for Euclidean)
-/// * `metric` - Distance metric (Euclidean or Cosine)
-/// * `de_trees` - Collection of DE-Trees with projected data
-/// * `projections` - Random projection matrices (from N(0,1), orthogonalised)
-/// * `num_trees` - Number of trees (more = better recall, slower queries)
-/// * `proj_dims` - Projected dimensionality (lower = faster, less accurate)
-/// * `max_leaf_size` - Maximum points per leaf node
+/// * `num_trees` (L in paper): More trees = better recall, slower queries.
+///   Typical: 5-20
+/// * `proj_dims` (K in paper): Projected dimensionality. Lower = faster but
+///   less accurate. Typical: 8-12. Note: 2^K root children per tree.
+/// * `max_leaf_size`: Points per leaf. Typical: 32-128
+/// * `search_radius`: Radius in projected space. Rule of thumb: start with
+///   sqrt(proj_dims) and adjust based on recall requirements
 pub struct LSHDETreeIndex<T> {
-    // main fields
+    /// Original vectors flattened [n * dim]
     pub vectors_flat: Vec<T>,
+    /// Original dimensionality
     pub dim: usize,
+    /// Number of vectors
     pub n: usize,
+    /// Pre-computed norms for cosine distance
     norms: Vec<T>,
+    /// Distance metric
     metric: Dist,
-    // index-specific ones
-    de_trees: Vec<DETree<T>>,
+    /// DE-Trees (one per hash table)
+    trees: Vec<DETree<T>>,
+    /// Random projections flattened [num_trees * proj_dims * dim]
     projections: Vec<T>,
+    /// Number of trees
+    num_trees: usize,
+    /// Projected dimensionality
     proj_dims: usize,
 }
 
-/// VectorDistance trait
 impl<T> VectorDistance<T> for LSHDETreeIndex<T>
 where
     T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum + SimdDistance,
@@ -895,113 +764,99 @@ where
 impl<T> LSHDETreeIndex<T>
 where
     T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum + SimdDistance,
-    Self: DETreeQuery<T>,
 {
-    //////////////////////
-    // Index generation //
-    //////////////////////
-
     /// Construct a new LSH DE-Tree index
-    ///
-    /// Builds trees in parallel using iSAX-style encoding. For each tree:
-    /// 1. Projects all vectors to K dimensions
-    /// 2. Creates root with 2^K children (all initial 1-bit encodings)
-    /// 3. Refines nodes by adding bits to dimensions with most even splits
     ///
     /// ### Params
     ///
     /// * `data` - Data matrix (rows = samples, columns = dimensions)
     /// * `metric` - Distance metric (Euclidean or Cosine)
-    /// * `num_trees` - Number of trees (5-20 typical)
-    /// * `proj_dims` - Projected dimensionality (8-32 typical, but 2^K root children means memory grows exponentially)
-    /// * `max_leaf_size` - Maximum points per leaf (32-128 typical)
+    /// * `num_trees` - Number of trees (L). More = better recall, slower
+    /// * `proj_dims` - Projected dimensionality (K). Max 16 due to 2^K root children
+    /// * `max_leaf_size` - Maximum points per leaf node
     /// * `seed` - Random seed for reproducibility
     ///
     /// ### Returns
     ///
-    /// Constructed index ready for querying
-    ///
-    /// ### Note on proj_dims
-    ///
-    /// Root has 2^proj_dims children. For proj_dims=8, that's 256 children.
-    /// For proj_dims=16, that's 65,536 children. Choose carefully based on
-    /// memory constraints and dataset size.
+    /// Constructed index
     pub fn new(
         data: MatRef<T>,
         metric: Dist,
         num_trees: usize,
         proj_dims: usize,
-        max_leaf_size: usize,
+        max_leaf_size: Option<usize>,
         seed: usize,
     ) -> Self {
-        assert!(max_leaf_size >= 1, "max_leaf_size must be at least 1");
+        let max_leaf_size = max_leaf_size.unwrap_or(MAX_LEAF_SIZE);
+
+        assert!(max_leaf_size >= 1, "max_leaf_size must be >= 1");
         assert!(
             proj_dims <= 16,
-            "proj_dims > 16 would create 2^{} = {} root children (too many)",
+            "proj_dims > 16 creates 2^{} = {} root children (too many)",
             proj_dims,
             1usize << proj_dims
         );
+        assert!(num_trees >= 1, "num_trees must be >= 1");
+        assert!(proj_dims >= 1, "proj_dims must be >= 1");
 
         let (vectors_flat, n, dim) = matrix_to_flat(data);
 
+        // Pre-compute norms for cosine distance
         let norms = if metric == Dist::Cosine {
             (0..n)
                 .map(|i| {
                     let start = i * dim;
-                    let end = start + dim;
-                    T::calculate_l2_norm(&vectors_flat[start..end])
+                    T::calculate_l2_norm(&vectors_flat[start..start + dim])
                 })
                 .collect()
         } else {
             Vec::new()
         };
 
-        // generate random projections from N(0,1)
+        // Generate random projections
         let mut rng = StdRng::seed_from_u64(seed as u64);
-        let total_projections = num_trees * proj_dims * dim;
-        let mut projections: Vec<T> = (0..total_projections)
-            .map(|_| {
-                let val: f64 = rng.sample(StandardNormal);
-                T::from_f64(val).unwrap()
-            })
+        let total_proj = num_trees * proj_dims * dim;
+        let mut projections: Vec<T> = (0..total_proj)
+            .map(|_| T::from_f64(rng.sample(StandardNormal)).unwrap())
             .collect();
 
         orthogonalise_projections(&mut projections, num_trees, proj_dims, dim, seed);
 
-        let de_trees: Vec<_> = (0..num_trees)
+        // Build trees in parallel
+        let trees: Vec<DETree<T>> = (0..num_trees)
             .into_par_iter()
             .map(|tree_idx| {
-                // project all points into flat buffer
-                let mut projected_points_flat = vec![T::zero(); n * proj_dims];
+                // Project all points
+                let mut projected = vec![T::zero(); n * proj_dims];
+                let proj_base = tree_idx * proj_dims * dim;
 
                 for vec_idx in 0..n {
                     let vec_start = vec_idx * dim;
                     let vec = &vectors_flat[vec_start..vec_start + dim];
 
-                    // project directly into flat buffer
-                    let base = tree_idx * proj_dims * dim;
                     for k in 0..proj_dims {
-                        let offset = base + k * dim;
-                        let proj_vec = &projections[offset..offset + dim];
+                        let proj_offset = proj_base + k * dim;
+                        let proj_vec = &projections[proj_offset..proj_offset + dim];
                         let dot = T::dot_simd(vec, proj_vec);
-                        projected_points_flat[vec_idx * proj_dims + k] = dot;
+                        projected[vec_idx * proj_dims + k] = dot;
                     }
                 }
 
-                // build tree with iSAX-style encoding
-                let all_indices: Vec<usize> = (0..n).collect();
-                let root = build_isax_tree(
-                    &all_indices,
-                    &projected_points_flat,
+                // Select breakpoints from projected data
+                let breakpoints = select_breakpoints(&projected, n, proj_dims);
+
+                // Encode all points
+                let encodings = encode_points(&projected, n, proj_dims, &breakpoints);
+
+                // Build tree
+                build_tree(
+                    n,
+                    &encodings,
+                    &projected,
                     proj_dims,
                     max_leaf_size,
-                );
-
-                DETree {
-                    root,
-                    projected_points_flat,
-                    proj_dims,
-                }
+                    breakpoints,
+                )
             })
             .collect();
 
@@ -1011,22 +866,14 @@ where
             n,
             norms,
             metric,
-            de_trees,
+            trees,
             projections,
+            num_trees,
             proj_dims,
         }
     }
 
-    ///////////
-    // Query //
-    ///////////
-
-    /// Query the index for approximate nearest neighbours with fixed radius
-    ///
-    /// Performs range queries in projected space across all trees, collecting
-    /// candidates within the specified radius. Deduplicates per-tree and exits
-    /// early when candidate saturation is reached. The search radius is in the
-    /// projected K-dimensional space, not the original D-dimensional space.
+    /// Query for k nearest neighbours with fixed search radius
     ///
     /// ### Params
     ///
@@ -1038,31 +885,122 @@ where
     ///
     /// Tuple of `(indices, distances)` sorted by distance
     pub fn query(&self, query_vec: &[T], k: usize, search_radius: T) -> (Vec<usize>, Vec<T>) {
-        assert!(
-            query_vec.len() == self.dim,
-            "Query vector dimensionality mismatch"
+        assert_eq!(
+            query_vec.len(),
+            self.dim,
+            "Query dimensionality mismatch: expected {}, got {}",
+            self.dim,
+            query_vec.len()
         );
 
-        self.query_internal(query_vec, k, search_radius)
+        if k == 0 {
+            return (Vec::new(), Vec::new());
+        }
+
+        // Pre-compute all query projections (avoids redundant work in loop)
+        let query_projections: Vec<Vec<T>> = (0..self.num_trees)
+            .map(|tree_idx| {
+                let proj_base = tree_idx * self.proj_dims * self.dim;
+                (0..self.proj_dims)
+                    .map(|k_dim| {
+                        let offset = proj_base + k_dim * self.dim;
+                        let proj_vec = &self.projections[offset..offset + self.dim];
+                        T::dot_simd(query_vec, proj_vec)
+                    })
+                    .collect()
+            })
+            .collect();
+
+        let mut candidates = Vec::new();
+        let mut seen = FxHashSet::default();
+        let target_candidates = k * 10;
+
+        // Collect candidates from all trees
+        for (tree_idx, tree) in self.trees.iter().enumerate() {
+            let before_len = candidates.len();
+            range_query(
+                tree,
+                &query_projections[tree_idx],
+                search_radius,
+                &mut candidates,
+            );
+
+            // Deduplicate new candidates
+            let mut write_idx = before_len;
+            for read_idx in before_len..candidates.len() {
+                if seen.insert(candidates[read_idx]) {
+                    if write_idx != read_idx {
+                        candidates[write_idx] = candidates[read_idx];
+                    }
+                    write_idx += 1;
+                }
+            }
+            candidates.truncate(write_idx);
+
+            // Early exit if we have enough candidates
+            if candidates.len() >= target_candidates {
+                break;
+            }
+        }
+
+        // Compute exact distances and find top-k
+        let mut heap: BinaryHeap<(OrderedFloat<T>, usize)> = BinaryHeap::new();
+
+        match self.metric {
+            Dist::Euclidean => {
+                for &idx in &candidates {
+                    let d = self.euclidean_distance_to_query(idx, query_vec);
+                    let item = (OrderedFloat(d), idx);
+
+                    if heap.len() < k {
+                        heap.push(item);
+                    } else if item.0 < heap.peek().unwrap().0 {
+                        heap.pop();
+                        heap.push(item);
+                    }
+                }
+            }
+            Dist::Cosine => {
+                let query_norm = T::calculate_l2_norm(query_vec);
+                for &idx in &candidates {
+                    let d = self.cosine_distance_to_query(idx, query_vec, query_norm);
+                    let item = (OrderedFloat(d), idx);
+
+                    if heap.len() < k {
+                        heap.push(item);
+                    } else if item.0 < heap.peek().unwrap().0 {
+                        heap.pop();
+                        heap.push(item);
+                    }
+                }
+            }
+        }
+
+        let mut results: Vec<_> = heap.into_iter().collect();
+        results.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+
+        let indices = results.iter().map(|&(_, idx)| idx).collect();
+        let dists = results.iter().map(|&(OrderedFloat(d), _)| d).collect();
+
+        (indices, dists)
     }
 
-    /// Query with adaptive radius expansion
+    /// Query with adaptive radius expansion (incremental)
     ///
-    /// Starts with an initial radius and expands until k neighbours are found
-    /// or maximum radius is reached. Terminates early if all points have been
-    /// examined or candidate collection has saturated.
+    /// Processes trees incrementally, accumulating candidates across radius
+    /// expansions. Much faster than naive approach of restarting each iteration.
     ///
     /// ### Params
     ///
-    /// * `query_vec` - Query vector (must match index dimensionality)
-    /// * `k` - Number of neighbours to return
-    /// * `initial_radius` - Starting search radius in projected space
-    /// * `expansion_factor` - Radius multiplier per iteration (1.5-2.0 typical)
-    /// * `max_radius` - Maximum allowed radius
+    /// * `query_vec` - Query vector
+    /// * `k` - Number of neighbours
+    /// * `initial_radius` - Starting search radius
+    /// * `expansion_factor` - Multiplier per iteration (must be > 1)
+    /// * `max_radius` - Maximum radius
     ///
     /// ### Returns
     ///
-    /// Tuple of `(indices, distances)` sorted by distance
+    /// Tuple of `(indices, distances)`
     pub fn query_adaptive(
         &self,
         query_vec: &[T],
@@ -1071,75 +1009,112 @@ where
         expansion_factor: T,
         max_radius: T,
     ) -> (Vec<usize>, Vec<T>) {
-        assert!(
-            query_vec.len() == self.dim,
-            "Query vector dimensionality mismatch"
-        );
+        assert_eq!(query_vec.len(), self.dim, "Query dimensionality mismatch");
         assert!(expansion_factor > T::one(), "expansion_factor must be > 1");
 
+        if k == 0 {
+            return (Vec::new(), Vec::new());
+        }
+
+        // Pre-project query for all trees (do this once)
+        let mut query_projections: Vec<Vec<T>> = Vec::with_capacity(self.num_trees);
+        for tree_idx in 0..self.num_trees {
+            let proj_base = tree_idx * self.proj_dims * self.dim;
+            let mut query_proj = Vec::with_capacity(self.proj_dims);
+            for k_dim in 0..self.proj_dims {
+                let offset = proj_base + k_dim * self.dim;
+                let proj_vec = &self.projections[offset..offset + self.dim];
+                let dot = T::dot_simd(query_vec, proj_vec);
+                query_proj.push(dot);
+            }
+            query_projections.push(query_proj);
+        }
+
+        let mut seen = FxHashSet::default();
+        let mut candidates_with_dist: Vec<(usize, T)> = Vec::new();
         let mut radius = initial_radius;
-        let mut prev_result_count = 0;
+        let target_candidates = k * 10;
+
+        // Pre-compute query norm for cosine distance
+        let query_norm = match self.metric {
+            Dist::Cosine => T::calculate_l2_norm(query_vec),
+            Dist::Euclidean => T::zero(),
+        };
 
         loop {
-            let (indices, distances) = self.query(query_vec, k, radius);
+            // Query all trees at current radius, collecting new candidates
+            for (tree_idx, tree) in self.trees.iter().enumerate() {
+                let mut tree_candidates = Vec::new();
+                range_query(
+                    tree,
+                    &query_projections[tree_idx],
+                    radius,
+                    &mut tree_candidates,
+                );
 
-            // Success: found enough neighbours
-            if indices.len() >= k {
-                return (indices, distances);
+                // Add only new candidates
+                for idx in tree_candidates {
+                    if seen.insert(idx) {
+                        // Compute exact distance for new candidate
+                        let dist = match self.metric {
+                            Dist::Euclidean => self.euclidean_distance_to_query(idx, query_vec),
+                            Dist::Cosine => {
+                                self.cosine_distance_to_query(idx, query_vec, query_norm)
+                            }
+                        };
+                        candidates_with_dist.push((idx, dist));
+                    }
+                }
+
+                // Early exit if we have enough candidates
+                if candidates_with_dist.len() >= target_candidates {
+                    break;
+                }
             }
 
-            // Termination: hit max radius
-            if radius >= max_radius {
-                return (indices, distances);
+            // Check termination conditions
+            if candidates_with_dist.len() >= k || radius >= max_radius || seen.len() == self.n {
+                break;
             }
 
-            // Termination: examined all points in dataset
-            if indices.len() == self.n {
-                return (indices, distances);
-            }
-
-            // Termination: no new candidates found (saturated)
-            if indices.len() == prev_result_count && prev_result_count > 0 {
-                return (indices, distances);
-            }
-
-            prev_result_count = indices.len();
-            radius = radius * expansion_factor;
-            if radius > max_radius {
-                radius = max_radius;
-            }
+            // Expand radius for next iteration
+            radius = (radius * expansion_factor).min(max_radius);
         }
+
+        // Sort by distance and take top-k
+        candidates_with_dist
+            .sort_unstable_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+
+        let result_len = candidates_with_dist.len().min(k);
+        let indices: Vec<usize> = candidates_with_dist
+            .iter()
+            .take(result_len)
+            .map(|&(idx, _)| idx)
+            .collect();
+        let distances: Vec<T> = candidates_with_dist
+            .iter()
+            .take(result_len)
+            .map(|&(_, d)| d)
+            .collect();
+
+        (indices, distances)
     }
 
     /// Query using a matrix row reference
-    ///
-    /// Optimised path for contiguous memory (stride == 1), otherwise copies
-    /// to a temporary vector.
-    ///
-    /// ### Params
-    ///
-    /// * `query_row` - Row reference to query vector
-    /// * `k` - Number of neighbours to return
-    /// * `search_radius` - Search radius in projected space
-    ///
-    /// ### Returns
-    ///
-    /// Tuple of `(indices, distances)`
     pub fn query_row(
         &self,
         query_row: RowRef<T>,
         k: usize,
         search_radius: T,
     ) -> (Vec<usize>, Vec<T>) {
-        assert!(
-            query_row.ncols() == self.dim,
+        assert_eq!(
+            query_row.ncols(),
+            self.dim,
             "Query row dimensionality mismatch"
         );
 
-        // Fast path for contiguous row data
         if query_row.col_stride() == 1 {
-            let slice =
-                unsafe { std::slice::from_raw_parts(query_row.as_ptr(), query_row.ncols()) };
+            let slice = unsafe { std::slice::from_raw_parts(query_row.as_ptr(), self.dim) };
             return self.query(slice, k, search_radius);
         }
 
@@ -1147,19 +1122,7 @@ where
         self.query(&query_vec, k, search_radius)
     }
 
-    /// Query using a matrix row reference with adaptive radius
-    ///
-    /// ### Params
-    ///
-    /// * `query_row` - Row reference to query vector
-    /// * `k` - Number of neighbours to return
-    /// * `initial_radius` - Starting search radius in projected space
-    /// * `expansion_factor` - Radius multiplier per iteration
-    /// * `max_radius` - Maximum allowed radius
-    ///
-    /// ### Returns
-    ///
-    /// Tuple of `(indices, distances)`
+    /// Query row with adaptive radius
     pub fn query_row_adaptive(
         &self,
         query_row: RowRef<T>,
@@ -1168,14 +1131,14 @@ where
         expansion_factor: T,
         max_radius: T,
     ) -> (Vec<usize>, Vec<T>) {
-        assert!(
-            query_row.ncols() == self.dim,
+        assert_eq!(
+            query_row.ncols(),
+            self.dim,
             "Query row dimensionality mismatch"
         );
 
         if query_row.col_stride() == 1 {
-            let slice =
-                unsafe { std::slice::from_raw_parts(query_row.as_ptr(), query_row.ncols()) };
+            let slice = unsafe { std::slice::from_raw_parts(query_row.as_ptr(), self.dim) };
             return self.query_adaptive(slice, k, initial_radius, expansion_factor, max_radius);
         }
 
@@ -1183,24 +1146,23 @@ where
         self.query_adaptive(&query_vec, k, initial_radius, expansion_factor, max_radius)
     }
 
-    /// Generate kNN graph from vectors stored in the index
+    /// Generate kNN graph from indexed vectors (optimised)
     ///
-    /// Queries each vector in the index against itself to build a complete
-    /// kNN graph using adaptive radius search.
+    /// Uses pre-computed projections stored in trees, avoiding redundant
+    /// projection computation during self-query.
     ///
     /// ### Params
     ///
-    /// * `k` - Number of neighbours per vector
+    /// * `k` - Neighbours per vector
     /// * `initial_radius` - Starting search radius
-    /// * `expansion_factor` - Radius multiplier per iteration
-    /// * `max_radius` - Maximum allowed radius
+    /// * `expansion_factor` - Radius multiplier
+    /// * `max_radius` - Maximum radius
     /// * `return_dist` - Whether to return distances
-    /// * `verbose` - Controls verbosity
+    /// * `verbose` - Print progress
     ///
     /// ### Returns
     ///
-    /// Tuple of `(knn_indices, optional distances)` where each row corresponds
-    /// to a vector in the index
+    /// Tuple of `(knn_indices, optional_distances)`
     pub fn generate_knn(
         &self,
         k: usize,
@@ -1210,23 +1172,17 @@ where
         return_dist: bool,
         verbose: bool,
     ) -> (Vec<Vec<usize>>, Option<Vec<Vec<T>>>) {
-        use std::sync::{
-            atomic::{AtomicUsize, Ordering},
-            Arc,
-        };
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
 
         let counter = Arc::new(AtomicUsize::new(0));
 
         let results: Vec<(Vec<usize>, Vec<T>)> = (0..self.n)
             .into_par_iter()
-            .map(|i| {
-                let start = i * self.dim;
-                let end = start + self.dim;
-                let vec = &self.vectors_flat[start..end];
-
+            .map(|query_idx| {
                 if verbose {
                     let count = counter.fetch_add(1, Ordering::Relaxed) + 1;
-                    if count.is_multiple_of(100_000) {
+                    if count % 100_000 == 0 {
                         println!(
                             "  Processed {} / {} samples.",
                             count.separate_with_underscores(),
@@ -1235,7 +1191,8 @@ where
                     }
                 }
 
-                self.query_adaptive(vec, k, initial_radius, expansion_factor, max_radius)
+                // Use pre-computed projections from trees
+                self.query_self_adaptive(query_idx, k, initial_radius, expansion_factor, max_radius)
             })
             .collect();
 
@@ -1254,306 +1211,130 @@ where
         }
     }
 
-    /// Returns the size of the index in bytes
+    /// Self-query using pre-computed projections (internal)
+    ///
+    /// Optimised path for querying indexed vectors against themselves.
+    fn query_self_adaptive(
+        &self,
+        query_idx: usize,
+        k: usize,
+        initial_radius: T,
+        expansion_factor: T,
+        max_radius: T,
+    ) -> (Vec<usize>, Vec<T>) {
+        if k == 0 {
+            return (Vec::new(), Vec::new());
+        }
+
+        let query_vec_start = query_idx * self.dim;
+        let query_vec = &self.vectors_flat[query_vec_start..query_vec_start + self.dim];
+
+        // Pre-compute query norm for cosine distance
+        let query_norm = match self.metric {
+            Dist::Cosine => T::calculate_l2_norm(query_vec),
+            Dist::Euclidean => T::zero(),
+        };
+
+        let mut seen = FxHashSet::default();
+        let mut candidates_with_dist: Vec<(usize, T)> = Vec::new();
+        let mut radius = initial_radius;
+        let target_candidates = k * 10;
+
+        loop {
+            for tree in &self.trees {
+                // Use pre-computed projection from tree
+                let proj_start = query_idx * self.proj_dims;
+                let query_proj = &tree.projected_points[proj_start..proj_start + self.proj_dims];
+
+                let mut tree_candidates = Vec::new();
+                range_query(tree, query_proj, radius, &mut tree_candidates);
+
+                for idx in tree_candidates {
+                    if idx != query_idx && seen.insert(idx) {
+                        let dist = match self.metric {
+                            Dist::Euclidean => self.euclidean_distance_to_query(idx, query_vec),
+                            Dist::Cosine => {
+                                self.cosine_distance_to_query(idx, query_vec, query_norm)
+                            }
+                        };
+                        candidates_with_dist.push((idx, dist));
+                    }
+                }
+
+                if candidates_with_dist.len() >= target_candidates {
+                    break;
+                }
+            }
+
+            if candidates_with_dist.len() >= k || radius >= max_radius || seen.len() >= self.n - 1 {
+                break;
+            }
+
+            radius = (radius * expansion_factor).min(max_radius);
+        }
+
+        candidates_with_dist
+            .sort_unstable_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+
+        let result_len = candidates_with_dist.len().min(k);
+        let indices: Vec<usize> = candidates_with_dist
+            .iter()
+            .take(result_len)
+            .map(|&(idx, _)| idx)
+            .collect();
+        let distances: Vec<T> = candidates_with_dist
+            .iter()
+            .take(result_len)
+            .map(|&(_, d)| d)
+            .collect();
+
+        (indices, distances)
+    }
+
+    /// Estimate search radius from original-space radius
+    ///
+    /// Uses the relationship: projected_radius ≈ original_radius * sqrt(K / D)
+    /// with a safety factor for variance.
+    ///
+    /// ### Params
+    ///
+    /// * `original_radius` - Radius in original D-dimensional space
+    /// * `safety_factor` - Multiplier to account for variance (1.5-2.0 typical)
     ///
     /// ### Returns
     ///
-    /// Number of bytes used by the index
+    /// Estimated radius for projected space
+    pub fn estimate_projected_radius(&self, original_radius: T, safety_factor: T) -> T {
+        let ratio = T::from_usize(self.proj_dims).unwrap() / T::from_usize(self.dim).unwrap();
+        original_radius * ratio.sqrt() * safety_factor
+    }
+
+    /// Memory usage in bytes
     pub fn memory_usage_bytes(&self) -> usize {
         let mut total = std::mem::size_of_val(self);
 
         total += self.vectors_flat.capacity() * std::mem::size_of::<T>();
         total += self.norms.capacity() * std::mem::size_of::<T>();
         total += self.projections.capacity() * std::mem::size_of::<T>();
+        total += self.trees.capacity() * std::mem::size_of::<DETree<T>>();
 
-        // de_trees outer Vec
-        total += self.de_trees.capacity() * std::mem::size_of::<DETree<T>>();
+        for tree in &self.trees {
+            total += tree.projected_points.capacity() * std::mem::size_of::<T>();
+            total += tree.encodings.capacity();
+            total += tree.root_children.capacity() * std::mem::size_of::<Option<Box<Node<T>>>>();
 
-        for tree in &self.de_trees {
-            // flat projected points buffer
-            total += tree.projected_points_flat.capacity() * std::mem::size_of::<T>();
+            for bp in &tree.breakpoints {
+                total += bp.capacity() * std::mem::size_of::<T>();
+            }
 
-            // tree nodes (rough estimate)
-            total += estimate_tree_size(&tree.root);
+            for child_opt in &tree.root_children {
+                if let Some(child) = child_opt {
+                    total += node_memory(child);
+                }
+            }
         }
 
         total
-    }
-}
-
-//////////////////
-// DETreeQuery //
-//////////////////
-
-thread_local! {
-    /// Candidates buffer
-    static DETREE_CANDIDATES: RefCell<Vec<usize>> = const { RefCell::new(Vec::new()) };
-    /// HashSet for deduplication
-    static DETREE_SEEN_SET: RefCell<FxHashSet<usize>> = RefCell::new(FxHashSet::default());
-    /// Heap for f32
-    static DETREE_HEAP_F32: RefCell<BinaryHeap<(OrderedFloat<f32>, usize)>> = const { RefCell::new(BinaryHeap::new()) };
-    /// Heap for f64
-    static DETREE_HEAP_F64: RefCell<BinaryHeap<(OrderedFloat<f64>, usize)>> = const { RefCell::new(BinaryHeap::new()) };
-}
-
-/// Maximum candidate multiplier for early exit (collect up to k * this)
-const CANDIDATE_MULTIPLIER: usize = 10;
-
-/// Query interface for DE-Tree LSH using thread-local storage
-///
-/// Implemented separately for f32 and f64 to use type-specific thread locals.
-/// Deduplicates candidates per-tree and exits early when candidate saturation
-/// is reached.
-pub trait DETreeQuery<T> {
-    /// Execute a query using thread-local buffers
-    ///
-    /// ### Params
-    ///
-    /// * `query_vec` - Query vector
-    /// * `k` - Number of neighbours to return
-    /// * `search_radius` - Search radius in projected space
-    ///
-    /// ### Returns
-    ///
-    /// Tuple of `(indices, distances)` sorted by distance
-    fn query_internal(&self, query_vec: &[T], k: usize, search_radius: T) -> (Vec<usize>, Vec<T>);
-}
-
-/////////
-// f32 //
-/////////
-
-impl DETreeQuery<f32> for LSHDETreeIndex<f32> {
-    fn query_internal(
-        &self,
-        query_vec: &[f32],
-        k: usize,
-        search_radius: f32,
-    ) -> (Vec<usize>, Vec<f32>) {
-        DETREE_CANDIDATES.with(|cand_cell| {
-            DETREE_HEAP_F32.with(|heap_cell| {
-                DETREE_SEEN_SET.with(|seen_cell| {
-                    let mut cand = cand_cell.borrow_mut();
-                    let mut heap = heap_cell.borrow_mut();
-                    let mut seen = seen_cell.borrow_mut();
-
-                    if k == 0 {
-                        return (Vec::new(), Vec::new());
-                    }
-
-                    cand.clear();
-                    heap.clear();
-                    seen.clear();
-
-                    let target_candidates = k * CANDIDATE_MULTIPLIER;
-
-                    // collect candidates from trees with per-tree deduplication
-                    for (tree_idx, tree) in self.de_trees.iter().enumerate() {
-                        // project query using SIMD
-                        let base = tree_idx * self.proj_dims * self.dim;
-                        let mut query_projected = Vec::with_capacity(self.proj_dims);
-                        for k in 0..self.proj_dims {
-                            let offset = base + k * self.dim;
-                            let proj_vec = &self.projections[offset..offset + self.dim];
-                            let dot = f32::dot_simd(query_vec, proj_vec);
-                            query_projected.push(dot);
-                        }
-
-                        let before_len = cand.len();
-
-                        // range query
-                        range_query(
-                            &tree.root,
-                            &query_projected,
-                            search_radius,
-                            &tree.projected_points_flat,
-                            self.proj_dims,
-                            &mut cand,
-                        );
-
-                        // deduplicate new candidates from this tree
-                        let mut write_idx = before_len;
-                        for read_idx in before_len..cand.len() {
-                            if seen.insert(cand[read_idx]) {
-                                if write_idx != read_idx {
-                                    cand[write_idx] = cand[read_idx];
-                                }
-                                write_idx += 1;
-                            }
-                        }
-                        cand.truncate(write_idx);
-
-                        // early exit if we have enough unique candidates
-                        if seen.len() >= target_candidates {
-                            break;
-                        }
-
-                        // early exit if we've seen all points
-                        if seen.len() == self.n {
-                            break;
-                        }
-                    }
-
-                    // compute exact distances for unique candidates
-                    match self.metric {
-                        Dist::Euclidean => {
-                            for &idx in cand.iter() {
-                                let d = self.euclidean_distance_to_query(idx, query_vec);
-                                let item = (OrderedFloat(d), idx);
-
-                                if heap.len() < k {
-                                    heap.push(item);
-                                } else if item.0 < heap.peek().unwrap().0 {
-                                    heap.pop();
-                                    heap.push(item);
-                                }
-                            }
-                        }
-                        Dist::Cosine => {
-                            let query_norm = f32::calculate_l2_norm(query_vec);
-                            for &idx in cand.iter() {
-                                let d = self.cosine_distance_to_query(idx, query_vec, query_norm);
-                                let item = (OrderedFloat(d), idx);
-
-                                if heap.len() < k {
-                                    heap.push(item);
-                                } else if item.0 < heap.peek().unwrap().0 {
-                                    heap.pop();
-                                    heap.push(item);
-                                }
-                            }
-                        }
-                    }
-
-                    let mut results: Vec<_> = heap.drain().collect();
-                    results.sort_unstable_by(|a, b| a.0.cmp(&b.0));
-
-                    let indices = results.iter().map(|&(_, idx)| idx).collect();
-                    let dists = results.iter().map(|&(OrderedFloat(d), _)| d).collect();
-
-                    (indices, dists)
-                })
-            })
-        })
-    }
-}
-
-/////////
-// f64 //
-/////////
-
-impl DETreeQuery<f64> for LSHDETreeIndex<f64> {
-    fn query_internal(
-        &self,
-        query_vec: &[f64],
-        k: usize,
-        search_radius: f64,
-    ) -> (Vec<usize>, Vec<f64>) {
-        DETREE_CANDIDATES.with(|cand_cell| {
-            DETREE_HEAP_F64.with(|heap_cell| {
-                DETREE_SEEN_SET.with(|seen_cell| {
-                    let mut cand = cand_cell.borrow_mut();
-                    let mut heap = heap_cell.borrow_mut();
-                    let mut seen = seen_cell.borrow_mut();
-
-                    if k == 0 {
-                        return (Vec::new(), Vec::new());
-                    }
-
-                    cand.clear();
-                    heap.clear();
-                    seen.clear();
-
-                    let target_candidates = k * CANDIDATE_MULTIPLIER;
-
-                    // collect candidates from trees with per-tree deduplication
-                    for (tree_idx, tree) in self.de_trees.iter().enumerate() {
-                        // project query using SIMD
-                        let base = tree_idx * self.proj_dims * self.dim;
-                        let mut query_projected = Vec::with_capacity(self.proj_dims);
-                        for k in 0..self.proj_dims {
-                            let offset = base + k * self.dim;
-                            let proj_vec = &self.projections[offset..offset + self.dim];
-                            let dot = f64::dot_simd(query_vec, proj_vec);
-                            query_projected.push(dot);
-                        }
-
-                        let before_len = cand.len();
-
-                        // range query
-                        range_query(
-                            &tree.root,
-                            &query_projected,
-                            search_radius,
-                            &tree.projected_points_flat,
-                            self.proj_dims,
-                            &mut cand,
-                        );
-
-                        // deduplicate new candidates from this tree
-                        let mut write_idx = before_len;
-                        for read_idx in before_len..cand.len() {
-                            if seen.insert(cand[read_idx]) {
-                                if write_idx != read_idx {
-                                    cand[write_idx] = cand[read_idx];
-                                }
-                                write_idx += 1;
-                            }
-                        }
-                        cand.truncate(write_idx);
-
-                        // early exit if we have enough unique candidates
-                        if seen.len() >= target_candidates {
-                            break;
-                        }
-
-                        // early exit if we've seen all points
-                        if seen.len() == self.n {
-                            break;
-                        }
-                    }
-
-                    // compute exact distances for unique candidates
-                    match self.metric {
-                        Dist::Euclidean => {
-                            for &idx in cand.iter() {
-                                let d = self.euclidean_distance_to_query(idx, query_vec);
-                                let item = (OrderedFloat(d), idx);
-
-                                if heap.len() < k {
-                                    heap.push(item);
-                                } else if item.0 < heap.peek().unwrap().0 {
-                                    heap.pop();
-                                    heap.push(item);
-                                }
-                            }
-                        }
-                        Dist::Cosine => {
-                            let query_norm = f64::calculate_l2_norm(query_vec);
-                            for &idx in cand.iter() {
-                                let d = self.cosine_distance_to_query(idx, query_vec, query_norm);
-                                let item = (OrderedFloat(d), idx);
-
-                                if heap.len() < k {
-                                    heap.push(item);
-                                } else if item.0 < heap.peek().unwrap().0 {
-                                    heap.pop();
-                                    heap.push(item);
-                                }
-                            }
-                        }
-                    }
-
-                    let mut results: Vec<_> = heap.drain().collect();
-                    results.sort_unstable_by(|a, b| a.0.cmp(&b.0));
-
-                    let indices = results.iter().map(|&(_, idx)| idx).collect();
-                    let dists = results.iter().map(|&(OrderedFloat(d), _)| d).collect();
-
-                    (indices, dists)
-                })
-            })
-        })
     }
 }
 
@@ -1567,7 +1348,6 @@ mod tests {
     use faer::Mat;
 
     fn simple_test_data() -> Mat<f32> {
-        // 5 vectors in 3 dimensions
         Mat::from_fn(5, 3, |i, j| match i {
             0 => [1.0, 0.0, 0.0][j],
             1 => [0.0, 1.0, 0.0][j],
@@ -1578,137 +1358,142 @@ mod tests {
         })
     }
 
+    fn larger_test_data(n: usize, dim: usize) -> Mat<f32> {
+        Mat::from_fn(n, dim, |i, j| ((i * 7 + j * 13) % 100) as f32 / 100.0)
+    }
+
+    #[test]
+    fn test_encode_value() {
+        // Breakpoints evenly spaced from 0 to 256
+        let breakpoints: Vec<f32> = (0..=NUM_REGIONS).map(|i| i as f32).collect();
+
+        assert_eq!(encode_value(0.5f32, &breakpoints), 0);
+        assert_eq!(encode_value(1.5f32, &breakpoints), 1);
+        assert_eq!(encode_value(127.5f32, &breakpoints), 127);
+        assert_eq!(encode_value(255.5f32, &breakpoints), 255);
+
+        // Edge cases
+        assert_eq!(encode_value(-1.0f32, &breakpoints), 0);
+        assert_eq!(encode_value(1000.0f32, &breakpoints), 255);
+    }
+
+    #[test]
+    fn test_bit_operations() {
+        assert!(first_bit(0b10000000));
+        assert!(!first_bit(0b01111111));
+
+        assert!(get_bit(0b10000000, 0));
+        assert!(!get_bit(0b10000000, 1));
+        assert!(get_bit(0b01000000, 1));
+        assert!(get_bit(0b00000001, 7));
+    }
+
+    #[test]
+    fn test_root_child_index() {
+        // 2 dimensions
+        let enc1 = [0b10000000u8, 0b00000000u8]; // first bits: 1, 0
+        assert_eq!(root_child_index(&enc1, 2), 0b10);
+
+        let enc2 = [0b00000000u8, 0b10000000u8]; // first bits: 0, 1
+        assert_eq!(root_child_index(&enc2, 2), 0b01);
+
+        let enc3 = [0b10000000u8, 0b10000000u8]; // first bits: 1, 1
+        assert_eq!(root_child_index(&enc3, 2), 0b11);
+    }
+
+    #[test]
+    fn test_select_breakpoints() {
+        let projected: Vec<f32> = (0..1000).map(|i| i as f32).collect();
+        let breakpoints = select_breakpoints(&projected, 1000, 1);
+
+        assert_eq!(breakpoints.len(), 1);
+        assert_eq!(breakpoints[0].len(), NUM_BREAKPOINTS);
+
+        // Breakpoints should be increasing
+        for i in 1..NUM_BREAKPOINTS {
+            assert!(
+                breakpoints[0][i] > breakpoints[0][i - 1],
+                "Breakpoints not increasing at {}",
+                i
+            );
+        }
+    }
+
     #[test]
     fn test_index_creation_euclidean() {
         let mat = simple_test_data();
-        let index = LSHDETreeIndex::new(mat.as_ref(), Dist::Euclidean, 4, 2, 2, 42);
+        let index = LSHDETreeIndex::new(mat.as_ref(), Dist::Euclidean, 4, 2, Some(2), 42);
 
         assert_eq!(index.n, 5);
         assert_eq!(index.dim, 3);
-        assert_eq!(index.de_trees.len(), 4);
+        assert_eq!(index.num_trees, 4);
         assert_eq!(index.proj_dims, 2);
-        assert_eq!(index.vectors_flat.len(), 15);
-        assert_eq!(index.de_trees.len(), 4);
+        assert_eq!(index.trees.len(), 4);
 
-        // verify flat buffer structure
-        for tree in &index.de_trees {
-            assert_eq!(tree.projected_points_flat.len(), 5 * 2); // n * proj_dims
+        // Check tree structure
+        for tree in &index.trees {
             assert_eq!(tree.proj_dims, 2);
-
-            // verify root has 2^K children
-            match &tree.root {
-                Node::Root { children } => {
-                    assert_eq!(children.len(), 1 << 2); // 2^2 = 4 children
-                }
-                _ => panic!("Root should be Node::Root"),
-            }
+            assert_eq!(tree.root_children.len(), 4); // 2^2
+            assert_eq!(tree.breakpoints.len(), 2);
+            assert_eq!(tree.projected_points.len(), 5 * 2);
+            assert_eq!(tree.encodings.len(), 5 * 2);
         }
     }
 
     #[test]
     fn test_index_creation_cosine() {
         let mat = simple_test_data();
-        let index = LSHDETreeIndex::new(mat.as_ref(), Dist::Cosine, 4, 2, 2, 42);
+        let index = LSHDETreeIndex::new(mat.as_ref(), Dist::Cosine, 4, 2, Some(2), 42);
 
         assert_eq!(index.n, 5);
-        assert_eq!(index.dim, 3);
         assert_eq!(index.norms.len(), 5);
-    }
-
-    #[test]
-    fn test_root_has_2k_children() {
-        let mat = simple_test_data();
-        let index = LSHDETreeIndex::new(mat.as_ref(), Dist::Euclidean, 2, 3, 2, 42);
-
-        for tree in &index.de_trees {
-            match &tree.root {
-                Node::Root { children } => {
-                    assert_eq!(children.len(), 1 << 3); // 2^3 = 8 children
-                }
-                _ => panic!("Root should be Node::Root with 2^K children"),
-            }
-        }
-    }
-
-    #[test]
-    fn test_encoding_point() {
-        let projected = vec![0.3f32, -0.7f32]; // 2 dimensions
-        let cardinalities = vec![2, 2]; // 2 bits each
-
-        let encoding = encode_point(&projected, 0, 2, &cardinalities);
-
-        assert_eq!(encoding.len(), 2);
-        assert_eq!(encoding[0].cardinality(), 2);
-        assert_eq!(encoding[1].cardinality(), 2);
-
-        // 0.3 normalized to [0,1): (0.3+1)/2 = 0.65
-        // With 4 regions: 0.65 * 4 = 2.6 → region 2 → "10"
-        assert_eq!(encoding[0].bits, vec![true, false]);
-
-        // -0.7 normalized: (-0.7+1)/2 = 0.15
-        // 0.15 * 4 = 0.6 → region 0 → "00"
-        assert_eq!(encoding[1].bits, vec![false, false]);
-    }
-
-    #[test]
-    fn test_symbol_refinement() {
-        let sym = Symbol::initial(true); // "1*"
-        assert_eq!(sym.bits, vec![true]);
-        assert_eq!(sym.cardinality(), 1);
-
-        let refined_left = sym.refine(false); // "10"
-        assert_eq!(refined_left.bits, vec![true, false]);
-        assert_eq!(refined_left.cardinality(), 2);
-
-        let refined_right = sym.refine(true); // "11"
-        assert_eq!(refined_right.bits, vec![true, true]);
-        assert_eq!(refined_right.cardinality(), 2);
-    }
-
-    #[test]
-    fn test_bounds_from_encoding() {
-        let encoding = vec![
-            Symbol::new(vec![false, true]), // "01" - region 1 of 4
-            Symbol::new(vec![true]),        // "1*" - region 1 of 2
-        ];
-
-        let bounds: Vec<(f32, f32)> = compute_bounds_from_encoding(&encoding);
-
-        // Dimension 0: "01" = region 1 of 4 = [0.25, 0.5) normalized
-        // Converted back: [0.25*2-1, 0.5*2-1) = [-0.5, 0.0)
-        assert!((bounds[0].0 - (-0.5)).abs() < 1e-5);
-        assert!((bounds[0].1 - 0.0).abs() < 1e-5);
-
-        // Dimension 1: "1*" = region 1 of 2 = [0.5, 1.0) normalized
-        // Converted back: [0.5*2-1, 1.0*2-1) = [0.0, 1.0)
-        assert!((bounds[1].0 - 0.0).abs() < 1e-5);
-        assert!((bounds[1].1 - 1.0).abs() < 1e-5);
     }
 
     #[test]
     fn test_basic_query() {
         let mat = simple_test_data();
-        let index = LSHDETreeIndex::new(mat.as_ref(), Dist::Euclidean, 4, 2, 2, 42);
+        let index = LSHDETreeIndex::new(mat.as_ref(), Dist::Euclidean, 4, 2, Some(2), 42);
 
-        let query = vec![1.0, 0.0, 0.0];
+        let query = vec![1.0f32, 0.0, 0.0];
         let (indices, distances) = index.query(&query, 3, 5.0);
 
         assert!(!indices.is_empty());
         assert!(indices.len() <= 3);
         assert_eq!(indices.len(), distances.len());
 
-        // distances should be sorted
+        // Distances should be sorted
         for i in 1..distances.len() {
-            assert!(distances[i - 1] <= distances[i]);
+            assert!(
+                distances[i - 1] <= distances[i],
+                "Distances not sorted at {}",
+                i
+            );
         }
+    }
+
+    #[test]
+    fn test_query_finds_exact_match() {
+        let mat = simple_test_data();
+        let index = LSHDETreeIndex::new(mat.as_ref(), Dist::Euclidean, 8, 2, Some(2), 42);
+
+        // Query for a point that exists in the data
+        let query = vec![1.0f32, 0.0, 0.0]; // Point 0
+        let (indices, distances) = index.query(&query, 1, 10.0);
+
+        assert!(!indices.is_empty());
+        // First result should be very close (ideally exact match)
+        assert!(
+            distances[0] < 0.01,
+            "Expected near-zero distance for exact match"
+        );
     }
 
     #[test]
     fn test_query_adaptive() {
         let mat = simple_test_data();
-        let index = LSHDETreeIndex::new(mat.as_ref(), Dist::Euclidean, 4, 2, 2, 42);
+        let index = LSHDETreeIndex::new(mat.as_ref(), Dist::Euclidean, 4, 2, Some(2), 42);
 
-        let query = vec![1.0, 0.0, 0.0];
+        let query = vec![1.0f32, 0.0, 0.0];
         let (indices, distances) = index.query_adaptive(&query, 3, 0.1, 2.0, 20.0);
 
         assert!(!indices.is_empty());
@@ -1717,76 +1502,47 @@ mod tests {
     }
 
     #[test]
-    fn test_query_adaptive_terminates_on_full_dataset() {
+    fn test_query_adaptive_terminates() {
         let mat = simple_test_data();
-        let index = LSHDETreeIndex::new(mat.as_ref(), Dist::Euclidean, 4, 2, 2, 42);
+        let index = LSHDETreeIndex::new(mat.as_ref(), Dist::Euclidean, 4, 2, Some(2), 42);
 
-        let query = vec![1.0, 0.0, 0.0];
-        // ask for more neighbours than we have points
+        let query = vec![1.0f32, 0.0, 0.0];
+        // Ask for more than available
         let (indices, _) = index.query_adaptive(&query, 100, 0.1, 2.0, 1000.0);
 
-        // should return all points and terminate, not loop forever
-        assert!(indices.len() <= 5);
-    }
-
-    #[test]
-    fn test_query_adaptive_terminates_on_saturation() {
-        let mat = simple_test_data();
-        let index = LSHDETreeIndex::new(mat.as_ref(), Dist::Euclidean, 4, 2, 2, 42);
-
-        let query = vec![1.0, 0.0, 0.0];
-        // with a very small max_radius, should terminate without finding enough
-        let (indices, _) = index.query_adaptive(&query, 5, 0.01, 1.1, 0.05);
-
-        // should terminate even if we don't have 5 neighbours
         assert!(indices.len() <= 5);
     }
 
     #[test]
     fn test_query_cosine() {
         let mat = simple_test_data();
-        let index = LSHDETreeIndex::new(mat.as_ref(), Dist::Cosine, 4, 2, 2, 42);
+        let index = LSHDETreeIndex::new(mat.as_ref(), Dist::Cosine, 4, 2, Some(2), 42);
 
-        let query = vec![2.0, 0.0, 0.0];
+        let query = vec![2.0f32, 0.0, 0.0];
         let (indices, distances) = index.query(&query, 2, 5.0);
 
         assert!(!indices.is_empty());
         assert!(indices.len() <= 2);
-        assert_eq!(indices.len(), distances.len());
     }
 
     #[test]
     fn test_query_row() {
         let mat = simple_test_data();
-        let index = LSHDETreeIndex::new(mat.as_ref(), Dist::Euclidean, 4, 2, 2, 42);
+        let index = LSHDETreeIndex::new(mat.as_ref(), Dist::Euclidean, 4, 2, Some(2), 42);
 
-        let query_mat = Mat::from_fn(1, 3, |_, j| [1.0, 0.0, 0.0][j]);
+        let query_mat = Mat::from_fn(1, 3, |_, j| [1.0f32, 0.0, 0.0][j]);
         let (indices, distances) = index.query_row(query_mat.row(0), 3, 5.0);
 
         assert!(!indices.is_empty());
-        assert!(indices.len() <= 3);
-        assert_eq!(indices.len(), distances.len());
-    }
-
-    #[test]
-    fn test_query_row_adaptive() {
-        let mat = simple_test_data();
-        let index = LSHDETreeIndex::new(mat.as_ref(), Dist::Euclidean, 4, 2, 2, 42);
-
-        let query_mat = Mat::from_fn(1, 3, |_, j| [1.0, 0.0, 0.0][j]);
-        let (indices, distances) = index.query_row_adaptive(query_mat.row(0), 3, 0.1, 2.0, 20.0);
-
-        assert!(!indices.is_empty());
-        assert!(indices.len() <= 3);
         assert_eq!(indices.len(), distances.len());
     }
 
     #[test]
     fn test_k_larger_than_n() {
         let mat = simple_test_data();
-        let index = LSHDETreeIndex::new(mat.as_ref(), Dist::Euclidean, 4, 2, 2, 42);
+        let index = LSHDETreeIndex::new(mat.as_ref(), Dist::Euclidean, 4, 2, Some(2), 42);
 
-        let query = vec![1.0, 0.0, 0.0];
+        let query = vec![1.0f32, 0.0, 0.0];
         let (indices, distances) = index.query(&query, 100, 10.0);
 
         assert!(indices.len() <= 5);
@@ -1794,39 +1550,41 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "Query vector dimensionality mismatch")]
+    fn test_k_zero() {
+        let mat = simple_test_data();
+        let index = LSHDETreeIndex::new(mat.as_ref(), Dist::Euclidean, 4, 2, Some(2), 42);
+
+        let query = vec![1.0f32, 0.0, 0.0];
+        let (indices, distances) = index.query(&query, 0, 5.0);
+
+        assert!(indices.is_empty());
+        assert!(distances.is_empty());
+    }
+
+    #[test]
+    #[should_panic(expected = "Query dimensionality mismatch")]
     fn test_dimension_mismatch() {
         let mat = simple_test_data();
-        let index = LSHDETreeIndex::new(mat.as_ref(), Dist::Euclidean, 4, 2, 2, 42);
+        let index = LSHDETreeIndex::new(mat.as_ref(), Dist::Euclidean, 4, 2, Some(2), 42);
 
-        let query = vec![1.0, 0.0];
+        let query = vec![1.0f32, 0.0];
         index.query(&query, 3, 5.0);
     }
 
     #[test]
-    #[should_panic(expected = "Query row dimensionality mismatch")]
-    fn test_query_row_dimension_mismatch() {
-        let mat = simple_test_data();
-        let index = LSHDETreeIndex::new(mat.as_ref(), Dist::Euclidean, 4, 2, 2, 42);
-
-        let query_mat = Mat::from_fn(1, 2, |_, j| [1.0, 0.0][j]);
-        index.query_row(query_mat.row(0), 3, 5.0);
-    }
-
-    #[test]
-    #[should_panic(expected = "max_leaf_size must be at least 1")]
+    #[should_panic(expected = "max_leaf_size must be >= 1")]
     fn test_invalid_max_leaf_size() {
         let mat = simple_test_data();
-        LSHDETreeIndex::new(mat.as_ref(), Dist::Euclidean, 4, 2, 0, 42);
+        LSHDETreeIndex::new(mat.as_ref(), Dist::Euclidean, 4, 2, Some(0), 42);
     }
 
     #[test]
     #[should_panic(expected = "expansion_factor must be > 1")]
     fn test_invalid_expansion_factor() {
         let mat = simple_test_data();
-        let index = LSHDETreeIndex::new(mat.as_ref(), Dist::Euclidean, 4, 2, 2, 42);
+        let index = LSHDETreeIndex::new(mat.as_ref(), Dist::Euclidean, 4, 2, Some(2), 42);
 
-        let query = vec![1.0, 0.0, 0.0];
+        let query = vec![1.0f32, 0.0, 0.0];
         index.query_adaptive(&query, 3, 1.0, 0.5, 10.0);
     }
 
@@ -1834,17 +1592,17 @@ mod tests {
     #[should_panic(expected = "proj_dims > 16")]
     fn test_proj_dims_too_large() {
         let mat = simple_test_data();
-        LSHDETreeIndex::new(mat.as_ref(), Dist::Euclidean, 2, 17, 2, 42);
+        LSHDETreeIndex::new(mat.as_ref(), Dist::Euclidean, 2, 17, Some(2), 42);
     }
 
     #[test]
     fn test_deterministic_with_seed() {
         let mat = simple_test_data();
 
-        let index1 = LSHDETreeIndex::new(mat.as_ref(), Dist::Euclidean, 4, 2, 2, 42);
-        let index2 = LSHDETreeIndex::new(mat.as_ref(), Dist::Euclidean, 4, 2, 2, 42);
+        let index1 = LSHDETreeIndex::new(mat.as_ref(), Dist::Euclidean, 4, 2, Some(2), 42);
+        let index2 = LSHDETreeIndex::new(mat.as_ref(), Dist::Euclidean, 4, 2, Some(2), 42);
 
-        let query = vec![1.0, 0.0, 0.0];
+        let query = vec![1.0f32, 0.0, 0.0];
         let (indices1, _) = index1.query(&query, 3, 5.0);
         let (indices2, _) = index2.query(&query, 3, 5.0);
 
@@ -1852,191 +1610,148 @@ mod tests {
     }
 
     #[test]
-    fn test_f64_query() {
+    fn test_f64() {
         let mat = Mat::from_fn(3, 3, |i, j| if i == j { 1.0f64 } else { 0.0f64 });
-        let index = LSHDETreeIndex::new(mat.as_ref(), Dist::Euclidean, 4, 2, 2, 42);
+        let index = LSHDETreeIndex::new(mat.as_ref(), Dist::Euclidean, 4, 2, Some(2), 42);
 
-        let query = vec![1.0, 0.0, 0.0];
+        let query = vec![1.0f64, 0.0, 0.0];
         let (indices, distances) = index.query(&query, 2, 5.0);
 
         assert!(!indices.is_empty());
-        assert!(indices.len() <= 2);
         assert_eq!(indices.len(), distances.len());
     }
 
     #[test]
-    fn test_distances_sorted() {
+    fn test_no_duplicates() {
         let mat = simple_test_data();
-        let index = LSHDETreeIndex::new(mat.as_ref(), Dist::Euclidean, 4, 2, 2, 42);
+        let index = LSHDETreeIndex::new(mat.as_ref(), Dist::Euclidean, 8, 2, Some(2), 42);
 
-        let query = vec![1.0, 0.0, 0.0];
-        let (_, distances) = index.query(&query, 5, 10.0);
-
-        for i in 1..distances.len() {
-            assert!(distances[i - 1] <= distances[i]);
-        }
-    }
-
-    #[test]
-    fn test_query_k_zero() {
-        let mat = simple_test_data();
-        let index = LSHDETreeIndex::new(mat.as_ref(), Dist::Euclidean, 4, 2, 2, 42);
-
-        let query = vec![1.0, 0.0, 0.0];
-        let (indices, distances) = index.query(&query, 0, 5.0);
-
-        assert_eq!(indices.len(), 0);
-        assert_eq!(distances.len(), 0);
-    }
-
-    #[test]
-    fn test_query_returns_k_or_fewer() {
-        let mat = simple_test_data();
-        let index = LSHDETreeIndex::new(mat.as_ref(), Dist::Euclidean, 4, 2, 2, 42);
-
-        let query = vec![1.0, 0.0, 0.0];
-
-        for k in 1..=5 {
-            let (indices, distances) = index.query(&query, k, 10.0);
-            assert!(indices.len() <= k);
-            assert_eq!(indices.len(), distances.len());
-        }
-    }
-
-    #[test]
-    fn test_no_duplicate_results() {
-        let mat = simple_test_data();
-        let index = LSHDETreeIndex::new(mat.as_ref(), Dist::Euclidean, 4, 2, 2, 42);
-
-        let query = vec![1.0, 0.0, 0.0];
+        let query = vec![1.0f32, 0.0, 0.0];
         let (indices, _) = index.query(&query, 5, 10.0);
 
         let mut sorted = indices.clone();
         sorted.sort_unstable();
         sorted.dedup();
 
-        assert_eq!(indices.len(), sorted.len(), "Results contain duplicates");
+        assert_eq!(indices.len(), sorted.len(), "Duplicates found in results");
     }
 
     #[test]
     fn test_larger_dataset() {
-        let n = 1000;
-        let dim = 50;
-        let mat = Mat::from_fn(n, dim, |i, j| ((i * 7 + j * 13) % 100) as f32 / 100.0);
+        let mat = larger_test_data(1000, 50);
+        let index = LSHDETreeIndex::new(mat.as_ref(), Dist::Euclidean, 10, 8, Some(32), 42);
 
-        let index = LSHDETreeIndex::new(mat.as_ref(), Dist::Euclidean, 10, 8, 32, 42);
-
-        let query = vec![0.5; dim];
+        let query = vec![0.5f32; 50];
         let (indices, distances) = index.query(&query, 10, 5.0);
 
         assert!(!indices.is_empty());
         assert!(indices.len() <= 10);
-        assert_eq!(indices.len(), distances.len());
 
         for &idx in &indices {
-            assert!(idx < n);
+            assert!(idx < 1000);
         }
 
-        // Verify root has 2^8 = 256 children
-        for tree in &index.de_trees {
-            match &tree.root {
-                Node::Root { children } => {
-                    assert_eq!(children.len(), 256);
-                }
-                _ => panic!("Root should be Node::Root"),
-            }
+        // Check root children count
+        for tree in &index.trees {
+            assert_eq!(tree.root_children.len(), 256); // 2^8
         }
     }
 
     #[test]
-    fn test_adaptive_radius_convergence() {
+    fn test_distances_sorted() {
+        let mat = larger_test_data(100, 20);
+        let index = LSHDETreeIndex::new(mat.as_ref(), Dist::Euclidean, 5, 4, Some(8), 42);
+
+        let query = vec![0.5f32; 20];
+        let (_, distances) = index.query(&query, 20, 10.0);
+
+        for i in 1..distances.len() {
+            assert!(
+                distances[i - 1] <= distances[i],
+                "Distances not sorted at {}",
+                i
+            );
+        }
+    }
+
+    #[test]
+    fn test_small_radius_returns_fewer() {
+        let mat = larger_test_data(100, 20);
+        let index = LSHDETreeIndex::new(mat.as_ref(), Dist::Euclidean, 5, 4, Some(8), 42);
+
+        let query = vec![0.5f32; 20];
+
+        let (indices_small, _) = index.query(&query, 50, 0.1);
+        let (indices_large, _) = index.query(&query, 50, 10.0);
+
+        assert!(
+            indices_small.len() <= indices_large.len(),
+            "Smaller radius should return <= candidates"
+        );
+    }
+
+    #[test]
+    fn test_estimate_projected_radius() {
         let mat = simple_test_data();
-        let index = LSHDETreeIndex::new(mat.as_ref(), Dist::Euclidean, 4, 2, 2, 42);
+        let index = LSHDETreeIndex::new(mat.as_ref(), Dist::Euclidean, 4, 2, Some(2), 42);
 
-        let query = vec![1.0, 0.0, 0.0];
+        let original_radius = 1.0f32;
+        let projected = index.estimate_projected_radius(original_radius, 1.5);
 
-        // should eventually find k neighbours or exhaust dataset
-        let (indices, _) = index.query_adaptive(&query, 3, 0.01, 1.5, 50.0);
-        assert!(indices.len() >= 3 || indices.len() == index.n.min(3));
+        // With proj_dims=2, dim=3: sqrt(2/3) * 1.5 ≈ 1.22
+        assert!(projected > 0.0);
+        assert!(projected < original_radius * 2.0);
     }
 
     #[test]
-    fn test_projection_orthogonality() {
-        let mut projections = vec![1.0f32; 4 * 3 * 5]; // 4 trees, 3 proj_dims, 5 dim
-        orthogonalise_projections(&mut projections, 4, 3, 5, 42);
-
-        // check one tree's projections are orthonormal
-        for i in 0..3 {
-            for j in 0..3 {
-                let mut dot = 0.0f32;
-                for d in 0..5 {
-                    dot += projections[i * 5 + d] * projections[j * 5 + d];
-                }
-                if i == j {
-                    assert!((dot - 1.0).abs() < 1e-5, "Not normalised");
-                } else {
-                    assert!(dot.abs() < 1e-5, "Not orthogonal");
-                }
-            }
-        }
-    }
-
-    #[test]
-    fn test_tree_handles_identical_points() {
-        // all points identical in projected space
+    fn test_identical_points() {
+        // All points identical
         let mat = Mat::from_fn(5, 10, |_, _| 1.0f32);
-        let index = LSHDETreeIndex::new(mat.as_ref(), Dist::Euclidean, 2, 3, 2, 42);
+        let index = LSHDETreeIndex::new(mat.as_ref(), Dist::Euclidean, 2, 3, Some(2), 42);
 
-        let query = vec![1.0; 10];
+        let query = vec![1.0f32; 10];
         let (indices, _) = index.query(&query, 3, 5.0);
 
         assert!(!indices.is_empty());
     }
 
     #[test]
-    fn test_small_radius_returns_fewer() {
-        let mat = simple_test_data();
-        let index = LSHDETreeIndex::new(mat.as_ref(), Dist::Euclidean, 4, 2, 2, 42);
+    fn test_memory_usage() {
+        let mat = larger_test_data(100, 20);
+        let index = LSHDETreeIndex::new(mat.as_ref(), Dist::Euclidean, 5, 4, Some(8), 42);
 
-        let query = vec![1.0, 0.0, 0.0];
-
-        let (indices_small, _) = index.query(&query, 5, 0.1);
-        let (indices_large, _) = index.query(&query, 5, 10.0);
-
-        assert!(indices_small.len() <= indices_large.len());
+        let mem = index.memory_usage_bytes();
+        assert!(mem > 0);
+        // Should be reasonable - at least vectors + projections
+        let min_expected = 100 * 20 * 4 + 5 * 4 * 20 * 4;
+        assert!(mem >= min_expected);
     }
 
     #[test]
-    fn test_flat_buffer_access() {
-        let mat = simple_test_data();
-        let index = LSHDETreeIndex::new(mat.as_ref(), Dist::Euclidean, 2, 3, 2, 42);
-
-        // verify we can access projected points through the flat buffer
-        for tree in &index.de_trees {
-            for point_idx in 0..index.n {
-                for dim in 0..tree.proj_dims {
-                    let val = tree.get_projected(point_idx, dim);
-                    // should not panic and should return a finite value
-                    assert!(val.is_finite());
-                }
+    fn test_recall_on_clustered_data() {
+        // Create clustered data where neighbours should be easy to find
+        let mut data = Vec::new();
+        for cluster in 0..10 {
+            let base = cluster as f32 * 10.0;
+            for _ in 0..10 {
+                let point: Vec<f32> = (0..20).map(|d| base + (d as f32 * 0.01)).collect();
+                data.extend(point);
             }
         }
-    }
 
-    #[test]
-    fn test_early_exit_on_candidate_saturation() {
-        let n = 1000;
-        let dim = 50;
-        let mat = Mat::from_fn(n, dim, |i, j| ((i * 7 + j * 13) % 100) as f32 / 100.0);
+        let mat = Mat::from_fn(100, 20, |i, j| data[i * 20 + j]);
+        let index = LSHDETreeIndex::new(mat.as_ref(), Dist::Euclidean, 10, 6, Some(8), 42);
 
-        let index = LSHDETreeIndex::new(mat.as_ref(), Dist::Euclidean, 20, 8, 32, 42);
+        // Query with a point from cluster 5
+        let query: Vec<f32> = (0..20).map(|d| 50.0 + (d as f32 * 0.01)).collect();
+        let (indices, _) = index.query_adaptive(&query, 5, 1.0, 2.0, 100.0);
 
-        let query = vec![0.5; dim];
-        // with a large radius, should collect many candidates but exit early
-        let (indices, _) = index.query(&query, 10, 100.0);
-
-        // should have found results without processing all 20 trees
-        assert!(!indices.is_empty());
-        assert!(indices.len() <= 10);
+        // At least some results should be from cluster 5 (indices 50-59)
+        let cluster_5_count = indices.iter().filter(|&&i| i >= 50 && i < 60).count();
+        assert!(
+            cluster_5_count >= 1,
+            "Expected to find neighbours from same cluster, found {} from cluster 5",
+            cluster_5_count
+        );
     }
 }

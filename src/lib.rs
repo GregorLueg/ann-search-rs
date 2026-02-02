@@ -50,6 +50,7 @@ use crate::exhaustive::*;
 use crate::hnsw::*;
 use crate::ivf::*;
 use crate::lsh::*;
+use crate::lsh_de::*;
 use crate::nndescent::*;
 use crate::utils::dist::*;
 
@@ -752,6 +753,176 @@ where
     LSHIndex<T>: LSHQuery<T>,
 {
     index.generate_knn(k, max_candidates, return_dist, verbose)
+}
+
+////////////
+// LSH DE //
+////////////
+
+/// Build an LSH DE-Tree index
+///
+/// ### Params
+///
+/// * `mat` - The initial matrix with samples × features
+/// * `metric` - Distance metric ("euclidean" or "cosine")
+/// * `num_trees` - Number of trees (5-20 typical)
+/// * `proj_dims` - Projected dimensionality (8-32 typical, creates 2^proj_dims
+///   root children)
+/// * `max_leaf_size` - Optional maximum points per leaf (32-128 typical).
+///   Defaults to 64 if not provided.
+/// * `seed` - Random seed for reproducibility
+///
+/// ### Returns
+///
+/// The initialised `LSHDETreeIndex`
+pub fn build_lsh_de_tree_index<T>(
+    mat: MatRef<T>,
+    metric: &str,
+    num_trees: usize,
+    proj_dims: usize,
+    max_leaf_size: Option<usize>,
+    seed: usize,
+) -> LSHDETreeIndex<T>
+where
+    T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum + SimdDistance,
+{
+    let metric = parse_ann_dist(metric).unwrap_or_default();
+    LSHDETreeIndex::new(mat, metric, num_trees, proj_dims, max_leaf_size, seed)
+}
+
+/// Query an LSH DE-Tree index
+///
+/// ### Params
+///
+/// * `query_mat` - The query matrix containing samples × features
+/// * `index` - The LSH DE-Tree index
+/// * `k` - Number of neighbours to return
+/// * `adaptive` - Use adaptive radius expansion
+/// * `search_radius` - Fixed search radius (used if adaptive is false)
+/// * `initial_radius` - Starting search radius (used if adaptive is true)
+/// * `expansion_factor` - Radius multiplier per iteration (used if adaptive is true)
+/// * `max_radius` - Maximum allowed radius (used if adaptive is true)
+/// * `return_dist` - Whether to return distances
+/// * `verbose` - Controls verbosity
+///
+/// ### Returns
+///
+/// A tuple of `(knn_indices, optional distances)`
+#[allow(clippy::too_many_arguments)]
+pub fn query_lsh_de_tree_index<T>(
+    query_mat: MatRef<T>,
+    index: &LSHDETreeIndex<T>,
+    k: usize,
+    adaptive: bool,
+    search_radius: Option<T>,
+    initial_radius: Option<T>,
+    expansion_factor: Option<T>,
+    max_radius: Option<T>,
+    return_dist: bool,
+    verbose: bool,
+) -> (Vec<Vec<usize>>, Option<Vec<Vec<T>>>)
+where
+    T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum + SimdDistance,
+{
+    if adaptive {
+        let initial_r = initial_radius.expect("initial_radius required for adaptive mode");
+        let expansion = expansion_factor.expect("expansion_factor required for adaptive mode");
+        let max_r = max_radius.expect("max_radius required for adaptive mode");
+
+        query_parallel(query_mat.nrows(), return_dist, verbose, |i| {
+            index.query_row_adaptive(query_mat.row(i), k, initial_r, expansion, max_r)
+        })
+    } else {
+        let radius = search_radius.expect("search_radius required for fixed radius mode");
+
+        query_parallel(query_mat.nrows(), return_dist, verbose, |i| {
+            index.query_row(query_mat.row(i), k, radius)
+        })
+    }
+}
+
+/// Query an LSH DE-Tree index against itself
+///
+/// Generates a full kNN graph based on the internal data.
+///
+/// ### Params
+///
+/// * `index` - Reference to built index
+/// * `k` - Number of neighbours
+/// * `adaptive` - Use adaptive radius expansion
+/// * `search_radius` - Fixed search radius (used if adaptive is false)
+/// * `initial_radius` - Starting search radius (used if adaptive is true)
+/// * `expansion_factor` - Radius multiplier per iteration (used if adaptive is true)
+/// * `max_radius` - Maximum allowed radius (used if adaptive is true)
+/// * `return_dist` - Return distances
+/// * `verbose` - Controls verbosity
+///
+/// ### Returns
+///
+/// Tuple of (indices, optional distances)
+#[allow(clippy::too_many_arguments)]
+pub fn query_lsh_de_tree_index_self<T>(
+    index: &LSHDETreeIndex<T>,
+    k: usize,
+    adaptive: bool,
+    search_radius: Option<T>,
+    initial_radius: Option<T>,
+    expansion_factor: Option<T>,
+    max_radius: Option<T>,
+    return_dist: bool,
+    verbose: bool,
+) -> (Vec<Vec<usize>>, Option<Vec<Vec<T>>>)
+where
+    T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum + SimdDistance,
+{
+    if adaptive {
+        let initial_r = initial_radius.expect("initial_radius required for adaptive mode");
+        let expansion = expansion_factor.expect("expansion_factor required for adaptive mode");
+        let max_r = max_radius.expect("max_radius required for adaptive mode");
+
+        index.generate_knn(k, initial_r, expansion, max_r, return_dist, verbose)
+    } else {
+        let radius = search_radius.expect("search_radius required for fixed radius mode");
+
+        use std::sync::{atomic::AtomicUsize, Arc};
+        let counter = Arc::new(AtomicUsize::new(0));
+
+        let results: Vec<(Vec<usize>, Vec<T>)> = (0..index.n)
+            .into_par_iter()
+            .map(|i| {
+                let start = i * index.dim;
+                let end = start + index.dim;
+                let vec = &index.vectors_flat[start..end];
+
+                if verbose {
+                    let count = counter.fetch_add(1, Ordering::Relaxed) + 1;
+                    if count.is_multiple_of(100_000) {
+                        println!(
+                            "  Processed {} / {} samples.",
+                            count.separate_with_underscores(),
+                            index.n.separate_with_underscores()
+                        );
+                    }
+                }
+
+                index.query(vec, k, radius)
+            })
+            .collect();
+
+        if return_dist {
+            let mut indices = Vec::with_capacity(results.len());
+            let mut distances = Vec::with_capacity(results.len());
+
+            for (idx, dist) in results {
+                indices.push(idx);
+                distances.push(dist);
+            }
+            (indices, Some(distances))
+        } else {
+            let indices: Vec<Vec<usize>> = results.into_iter().map(|(idx, _)| idx).collect();
+            (indices, None)
+        }
+    }
 }
 
 ///////////////
