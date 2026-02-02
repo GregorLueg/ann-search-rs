@@ -8,7 +8,7 @@ use std::iter::Sum;
 use std::marker::PhantomData;
 use std::path::Path;
 
-use crate::utils::dist::*;
+use crate::prelude::*;
 
 /// Trait for vector storage backends
 pub trait VectorStore<T>

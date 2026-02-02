@@ -133,31 +133,36 @@ where
     random_projections
 }
 
-/// Initialise binariser using PCA followed by optimised Tiled-ITQ
+/// Initialise binariser using PCA followed by Iterative Quantisation (ITQ)
 ///
-/// This variant is significantly more robust than standard ITQ for high-bit
-/// counts. It extracts the full PCA basis and applies different orthogonal
-/// rotations to chunks of bits to maximise information density.
+/// ITQ learns a rotation of the PCA subspace that minimises quantisation error
+/// when binarising. This typically produces better codes than random projections
+/// when the data has strong principal components.
 ///
-/// ### Training Steps:
+/// ### Algorithm
 ///
-/// 1. Sample and centre training data.
-/// 2. Compute full-basis PCA (dim × dim).
-/// 3. For the first 'dim' bits: Run ITQ optimisation iterations.
-/// 4. For remaining bits: Apply unique random orthogonal rotations to PCA
-///    tiles.
+/// 1. Sample and centre training data
+/// 2. Compute thin SVD to get top-k principal components
+/// 3. Iteratively refine rotation matrix via Procrustes alignment
+/// 4. Final projections = PCA directions × learned rotation
+///
+/// ### Limitations
+///
+/// ITQ can only produce `min(n_bits, dim)` meaningful bits. If `n_bits > dim`,
+/// the excess bits are filled with random orthogonal projections, as there are
+/// no additional variance directions to capture.
 ///
 /// ### Params
 ///
-/// * `data` - Training data of samples × dim. Data will be downsampled if
-///   n ≥ 100,000
+/// * `data` - Training data matrix (n_samples × dim). Automatically downsampled
+///   if n_samples exceeds MAX_SAMPLES_PCA
 /// * `n_bits` - Number of bits in output
 /// * `seed` - Random seed for reproducibility
-/// * `itq_iterations` - Number of ITQ iterations
+/// * `itq_iterations` - Number of Procrustes refinement iterations
 ///
 /// ### Returns
 ///
-/// Tuple of (projections, mean) where projections is flattened (n_bits × dim)
+/// Tuple of data means and projections
 fn prepare_itq_projections<T>(
     data: MatRef<T>,
     n_bits: usize,
@@ -169,9 +174,13 @@ where
 {
     let n = data.nrows();
     let dim = data.ncols();
+
+    // ITQ can only produce meaningful bits up to dim
+    let effective_bits = n_bits.min(dim);
+
     let mut rng = StdRng::seed_from_u64(seed as u64);
 
-    // 1. Data Sampling (Same as your original)
+    // sample data
     let sample_indices: Vec<usize> = if n > MAX_SAMPLES_PCA {
         let mut idx: Vec<usize> = (0..n).collect();
         idx.shuffle(&mut rng);
@@ -181,86 +190,92 @@ where
     };
     let n_samples = sample_indices.len();
 
-    let mut sampled_data = Mat::<T>::zeros(n_samples, dim);
+    // compute mean
     let mut mean = vec![T::zero(); dim];
-
-    for &old_idx in &sample_indices {
+    for &idx in &sample_indices {
         for d in 0..dim {
-            mean[d] = mean[d] + data[(old_idx, d)];
+            mean[d] = mean[d] + data[(idx, d)];
         }
     }
-    let n_samples_t = T::from_usize(n_samples).unwrap();
+    let n_t = T::from_usize(n_samples).unwrap();
     for d in 0..dim {
-        mean[d] = mean[d] / n_samples_t;
+        mean[d] = mean[d] / n_t;
     }
 
-    for (i, &old_idx) in sample_indices.iter().enumerate() {
+    // centre data
+    let mut centered = Mat::<T>::zeros(n_samples, dim);
+    for (i, &idx) in sample_indices.iter().enumerate() {
         for d in 0..dim {
-            sampled_data[(i, d)] = data[(old_idx, d)] - mean[d];
+            centered[(i, d)] = data[(idx, d)] - mean[d];
         }
     }
 
-    // 2. Full PCA to get the maximum possible orthogonal components (up to dim)
-    let svd = sampled_data.as_ref().svd().unwrap();
-    let full_v = svd.V();
+    // thin SVD - only computes what we need
+    let svd = centered.as_ref().thin_svd().unwrap();
+    let v_full = svd.V(); // dim × min(n_samples, dim)
 
-    // 3. Repeat and Rotate Logic
-    let mut final_projections = Vec::with_capacity(n_bits * dim);
-    let mut bits_remaining = n_bits;
-
-    while bits_remaining > 0 {
-        let current_chunk_size = bits_remaining.min(dim);
-
-        let mut v_chunk = Mat::<T>::zeros(dim, current_chunk_size);
-        for j in 0..current_chunk_size {
-            for i in 0..dim {
-                v_chunk[(i, j)] = full_v[(i, j)];
-            }
+    // extract top-k components
+    let k = effective_bits.min(v_full.ncols());
+    let mut v_k = Mat::<T>::zeros(dim, k);
+    for i in 0..dim {
+        for j in 0..k {
+            v_k[(i, j)] = v_full[(i, j)];
         }
-
-        let mut r_mat = Mat::<T>::zeros(current_chunk_size, current_chunk_size);
-        for i in 0..current_chunk_size {
-            for j in 0..current_chunk_size {
-                let val: f64 = rng.sample(StandardNormal);
-                r_mat[(i, j)] = T::from_f64(val).unwrap();
-            }
-        }
-
-        let qr = r_mat.as_ref().qr();
-        let mut r_ortho = qr.compute_Q();
-
-        if bits_remaining == n_bits {
-            let projected_data = &sampled_data * &v_chunk;
-            for _ in 0..itq_iterations {
-                let rotated = &projected_data * &r_ortho;
-                let mut b_mat = Mat::<T>::zeros(n_samples, current_chunk_size);
-                for i in 0..n_samples {
-                    for j in 0..current_chunk_size {
-                        b_mat[(i, j)] = if rotated[(i, j)] >= T::zero() {
-                            T::one()
-                        } else {
-                            -T::one()
-                        };
-                    }
-                }
-                let c_mat = projected_data.transpose() * &b_mat;
-                let svd_itq = c_mat.as_ref().thin_svd().unwrap();
-                r_ortho = svd_itq.U() * svd_itq.V().transpose();
-            }
-        }
-
-        let rotated_projections = v_chunk * r_ortho;
-
-        for j in 0..current_chunk_size {
-            for i in 0..dim {
-                final_projections.push(rotated_projections[(i, j)]);
-            }
-        }
-
-        bits_remaining -= current_chunk_size;
     }
 
-    (final_projections, mean)
+    // project data onto PCA subspace
+    let projected = &centered * &v_k; // n_samples × k
+
+    // initialise rotation matrix randomly
+    let mut r_mat = Mat::<T>::zeros(k, k);
+    for i in 0..k {
+        for j in 0..k {
+            r_mat[(i, j)] = T::from_f64(rng.sample(StandardNormal)).unwrap();
+        }
+    }
+    let qr = r_mat.as_ref().qr();
+    let mut r_ortho = qr.compute_Q();
+
+    // ITQ iterations
+    for _ in 0..itq_iterations {
+        let rotated = &projected * &r_ortho;
+
+        // Binarise
+        let mut b_mat = Mat::<T>::zeros(n_samples, k);
+        for i in 0..n_samples {
+            for j in 0..k {
+                b_mat[(i, j)] = if rotated[(i, j)] >= T::zero() {
+                    T::one()
+                } else {
+                    -T::one()
+                };
+            }
+        }
+
+        // Procrustes: find R minimising ||B - Y*R||
+        let c_mat = projected.transpose() * &b_mat;
+        let svd_c = c_mat.as_ref().thin_svd().unwrap();
+        r_ortho = svd_c.U() * svd_c.V().transpose();
+    }
+
+    // Final projection matrix: V_k * R
+    let final_proj = &v_k * &r_ortho;
+
+    // Flatten to output format
+    let mut projections = Vec::with_capacity(effective_bits * dim);
+    for j in 0..effective_bits {
+        for i in 0..dim {
+            projections.push(final_proj[(i, j)]);
+        }
+    }
+
+    // If n_bits > effective_bits, pad with random projections
+    if n_bits > effective_bits {
+        let extra = prepare_simhash_projections::<T>(dim, n_bits - effective_bits, seed + 1);
+        projections.extend(extra);
+    }
+
+    (projections, mean)
 }
 
 /// Encode a vector to binary using projection-based methods

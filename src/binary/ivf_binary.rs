@@ -13,7 +13,7 @@ use thousands::Separable;
 use crate::binary::binariser::*;
 use crate::binary::dist_binary::*;
 use crate::binary::vec_store::*;
-use crate::utils::dist::*;
+use crate::prelude::*;
 use crate::utils::ivf_utils::*;
 use crate::utils::*;
 

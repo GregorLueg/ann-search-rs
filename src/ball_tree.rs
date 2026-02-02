@@ -6,7 +6,7 @@ use std::collections::BinaryHeap;
 use std::iter::Sum;
 use thousands::*;
 
-use crate::utils::dist::*;
+use crate::prelude::*;
 use crate::utils::heap_structs::*;
 use crate::utils::ivf_utils::*;
 use crate::utils::tree_utils::*;
@@ -1089,7 +1089,7 @@ mod tests {
 
     #[test]
     fn test_ball_tree_query_cosine() {
-        use crate::utils::dist::*;
+        use crate::prelude::*;
 
         let mat = create_simple_matrix();
         let index = BallTreeIndex::new(mat.as_ref(), Dist::Cosine, 42);
@@ -1105,7 +1105,7 @@ mod tests {
 
     #[test]
     fn test_ball_tree_query_k_larger_than_dataset() {
-        use crate::utils::dist::*;
+        use crate::prelude::*;
 
         let mat = create_simple_matrix();
         let index = BallTreeIndex::new(mat.as_ref(), Dist::Euclidean, 42);
@@ -1121,7 +1121,7 @@ mod tests {
 
     #[test]
     fn test_ball_tree_query_search_k() {
-        use crate::utils::dist::*;
+        use crate::prelude::*;
 
         let mat = create_simple_matrix();
         let index = BallTreeIndex::new(mat.as_ref(), Dist::Euclidean, 42);
@@ -1208,7 +1208,7 @@ mod tests {
 
     #[test]
     fn test_ball_tree_orthogonal_vectors() {
-        use crate::utils::dist::*;
+        use crate::prelude::*;
         let data = [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0];
         let mat = Mat::from_fn(3, 3, |i, j| data[i * 3 + j]);
         let index = BallTreeIndex::new(mat.as_ref(), Dist::Cosine, 42);

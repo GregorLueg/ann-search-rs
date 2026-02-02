@@ -11,7 +11,7 @@ use thousands::*;
 use crate::binary::binariser::*;
 use crate::binary::dist_binary::*;
 use crate::binary::vec_store::*;
-use crate::utils::dist::*;
+use crate::prelude::*;
 
 ///////////////////////////
 // ExhaustiveIndexBinary //

@@ -7,6 +7,7 @@ pub mod hnsw;
 pub mod ivf;
 pub mod lsh;
 pub mod nndescent;
+pub mod prelude;
 pub mod utils;
 
 #[cfg(feature = "gpu")]
@@ -50,7 +51,7 @@ use crate::hnsw::*;
 use crate::ivf::*;
 use crate::lsh::*;
 use crate::nndescent::*;
-use crate::utils::dist::*;
+use crate::prelude::*;
 
 #[cfg(feature = "binary")]
 use crate::binary::{exhaustive_binary::*, exhaustive_rabitq::*, ivf_binary::*, ivf_rabitq::*};

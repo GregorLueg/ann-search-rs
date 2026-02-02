@@ -6,7 +6,7 @@ use rand::SeedableRng;
 use rayon::prelude::*;
 use std::iter::Sum;
 
-use crate::utils::dist::*;
+use crate::prelude::*;
 use crate::utils::Dist;
 
 //////////////////////

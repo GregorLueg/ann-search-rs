@@ -11,8 +11,8 @@ use std::{
 };
 use thousands::*;
 
+use crate::prelude::*;
 use crate::quantised::quantisers::*;
-use crate::utils::dist::*;
 use crate::utils::heap_structs::*;
 use crate::utils::matrix_to_flat;
 

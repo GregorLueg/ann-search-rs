@@ -5,7 +5,7 @@ use wide::u8x16;
 
 use crate::binary::rabitq::*;
 #[allow(unused_imports)]
-use crate::utils::dist::*;
+use crate::prelude::*;
 
 #[cfg(target_arch = "aarch64")]
 use std::arch::aarch64::*;

@@ -70,7 +70,13 @@ fn main() {
     // Binary exhaustive benchmarks - increase bits if higher dimensionality
     // is used
     let n_bits_values = if cli.dim <= 64 {
-        vec![(256, "random"), (256, "itq"), (512, "random"), (512, "itq")]
+        vec![
+            (256, "random"),
+            (256, "itq"),
+            (512, "random"),
+            (512, "itq"),
+            (cli.dim, "signed"),
+        ]
     } else {
         vec![
             (256, "random"),
@@ -79,6 +85,7 @@ fn main() {
             (512, "itq"),
             (1024, "random"),
             (1024, "itq"),
+            (cli.dim, "signed"),
         ]
     };
     let rerank_factors = [5, 10, 20];

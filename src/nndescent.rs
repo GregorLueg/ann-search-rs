@@ -14,7 +14,7 @@ use std::{
 use thousands::*;
 
 use crate::annoy::*;
-use crate::utils::dist::*;
+use crate::prelude::*;
 use crate::utils::heap_structs::*;
 use crate::utils::*;
 
