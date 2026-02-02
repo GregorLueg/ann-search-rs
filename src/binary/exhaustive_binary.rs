@@ -393,11 +393,7 @@ where
         };
 
         let query_norm = match self.metric {
-            Dist::Cosine => query_vec
-                .iter()
-                .map(|&x| x * x)
-                .fold(T::zero(), |a, b| a + b)
-                .sqrt(),
+            Dist::Cosine => T::calculate_l2_norm(query_vec),
             Dist::Euclidean => T::one(),
         };
 
