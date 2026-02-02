@@ -15,7 +15,6 @@ use thousands::*;
 
 use crate::annoy::*;
 use crate::prelude::*;
-use crate::utils::heap_structs::*;
 use crate::utils::*;
 
 /// Neighbour entry in k-NN graph

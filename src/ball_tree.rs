@@ -7,7 +7,6 @@ use std::iter::Sum;
 use thousands::*;
 
 use crate::prelude::*;
-use crate::utils::heap_structs::*;
 use crate::utils::ivf_utils::*;
 use crate::utils::tree_utils::*;
 use crate::utils::*;

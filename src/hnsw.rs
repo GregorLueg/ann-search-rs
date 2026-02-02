@@ -14,7 +14,6 @@ use std::{
 use thousands::*;
 
 use crate::prelude::*;
-use crate::utils::heap_structs::*;
 use crate::utils::*;
 
 /////////////

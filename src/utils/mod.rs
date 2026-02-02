@@ -13,7 +13,6 @@ use std::collections::BinaryHeap;
 use std::iter::Sum;
 
 use crate::prelude::*;
-use crate::utils::heap_structs::*;
 
 /////////////
 // Helpers //

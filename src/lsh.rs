@@ -8,7 +8,6 @@ use std::{cell::RefCell, cmp::Ord, collections::BinaryHeap, iter::Sum};
 use thousands::*;
 
 use crate::prelude::*;
-use crate::utils::heap_structs::*;
 use crate::utils::*;
 
 ////////////////

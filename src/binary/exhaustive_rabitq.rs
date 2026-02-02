@@ -15,7 +15,6 @@ use crate::binary::dist_binary::*;
 use crate::binary::rabitq::*;
 use crate::binary::vec_store::*;
 use crate::prelude::*;
-use crate::utils::heap_structs::*;
 use crate::utils::ivf_utils::CentroidDistance;
 use crate::utils::*;
 

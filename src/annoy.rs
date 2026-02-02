@@ -6,7 +6,6 @@ use std::{cmp::Ordering, collections::BinaryHeap, iter::Sum};
 use thousands::*;
 
 use crate::prelude::*;
-use crate::utils::heap_structs::*;
 use crate::utils::tree_utils::*;
 use crate::utils::*;
 

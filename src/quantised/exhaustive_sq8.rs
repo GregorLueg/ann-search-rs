@@ -13,7 +13,6 @@ use thousands::*;
 
 use crate::prelude::*;
 use crate::quantised::quantisers::*;
-use crate::utils::heap_structs::*;
 use crate::utils::matrix_to_flat;
 
 /////////////////////

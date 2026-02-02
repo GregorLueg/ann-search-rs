@@ -10,7 +10,6 @@ use thousands::*;
 
 use crate::prelude::*;
 use crate::quantised::quantisers::*;
-use crate::utils::heap_structs::*;
 use crate::utils::ivf_utils::sample_vectors;
 use crate::utils::*;
 

@@ -7,7 +7,6 @@ use std::sync::Arc;
 use thousands::Separable;
 
 use crate::prelude::*;
-use crate::utils::heap_structs::*;
 use crate::utils::ivf_utils::*;
 use crate::utils::*;
 
