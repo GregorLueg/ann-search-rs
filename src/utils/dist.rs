@@ -848,7 +848,7 @@ fn subtract_f32_avx512(a: &[f32], b: &[f32]) -> Vec<f32> {
     let mut result = Vec::with_capacity(len);
 
     unsafe {
-        let result_ptr = result.as_mut_ptr();
+        let result_ptr: *mut f32 = result.as_mut_ptr();
 
         for i in 0..chunks {
             let va = _mm512_loadu_ps(a.as_ptr().add(i * 16));
@@ -997,7 +997,7 @@ fn subtract_f64_avx512(a: &[f64], b: &[f64]) -> Vec<f64> {
     let mut result = Vec::with_capacity(len);
 
     unsafe {
-        let result_ptr = result.as_mut_ptr();
+        let result_ptr: *mut f64 = result.as_mut_ptr();
 
         for i in 0..chunks {
             let va = _mm512_loadu_pd(a.as_ptr().add(i * 8));
