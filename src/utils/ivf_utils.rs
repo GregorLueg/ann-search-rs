@@ -379,9 +379,10 @@ fn parallel_lloyd<T>(
     T: Float + Send + Sync + SimdDistance,
 {
     let mut prev_assignments: Vec<usize> = vec![usize::MAX; n];
+    let use_simd = dim >= 64;
 
     for iter in 0..max_iters {
-        let assignments = assign_all_parallel(
+        let mut assignments = assign_all_parallel(
             data,
             data_norms,
             dim,
@@ -405,33 +406,57 @@ fn parallel_lloyd<T>(
             break;
         }
 
-        let (new_sums, counts) = (0..n)
-            .into_par_iter()
-            .fold(
-                || (vec![T::zero(); k * dim], vec![0usize; k]),
-                |(mut sums, mut counts), i| {
-                    let cluster = assignments[i];
-                    counts[cluster] += 1;
-                    let vec = &data[i * dim..(i + 1) * dim];
-                    T::add_assign_simd(&mut sums[cluster * dim..(cluster + 1) * dim], vec);
-                    (sums, counts)
-                },
-            )
-            .reduce(
-                || (vec![T::zero(); k * dim], vec![0usize; k]),
-                |(mut sums1, mut counts1), (sums2, counts2)| {
-                    for c in 0..k {
-                        T::add_assign_simd(
-                            &mut sums1[c * dim..(c + 1) * dim],
-                            &sums2[c * dim..(c + 1) * dim],
-                        );
-                    }
-                    for i in 0..counts1.len() {
-                        counts1[i] += counts2[i];
-                    }
-                    (sums1, counts1)
-                },
-            );
+        let (new_sums, counts) = if use_simd {
+            (0..n)
+                .into_par_iter()
+                .fold(
+                    || (vec![T::zero(); k * dim], vec![0usize; k]),
+                    |(mut sums, mut counts), i| {
+                        let cluster = assignments[i];
+                        counts[cluster] += 1;
+                        let vec = &data[i * dim..(i + 1) * dim];
+                        T::add_assign_simd(&mut sums[cluster * dim..(cluster + 1) * dim], vec);
+                        (sums, counts)
+                    },
+                )
+                .reduce(
+                    || (vec![T::zero(); k * dim], vec![0usize; k]),
+                    |(mut sums1, mut counts1), (sums2, counts2)| {
+                        T::add_assign_simd(&mut sums1, &sums2);
+                        for i in 0..counts1.len() {
+                            counts1[i] += counts2[i];
+                        }
+                        (sums1, counts1)
+                    },
+                )
+        } else {
+            (0..n)
+                .into_par_iter()
+                .fold(
+                    || (vec![T::zero(); k * dim], vec![0usize; k]),
+                    |(mut sums, mut counts), i| {
+                        let cluster = assignments[i];
+                        counts[cluster] += 1;
+                        let vec = &data[i * dim..(i + 1) * dim];
+                        for d in 0..dim {
+                            sums[cluster * dim + d] = sums[cluster * dim + d] + vec[d];
+                        }
+                        (sums, counts)
+                    },
+                )
+                .reduce(
+                    || (vec![T::zero(); k * dim], vec![0usize; k]),
+                    |(mut sums1, mut counts1), (sums2, counts2)| {
+                        for i in 0..sums1.len() {
+                            sums1[i] = sums1[i] + sums2[i];
+                        }
+                        for i in 0..counts1.len() {
+                            counts1[i] += counts2[i];
+                        }
+                        (sums1, counts1)
+                    },
+                )
+        };
 
         for c in 0..k {
             if counts[c] > 0 {
@@ -445,7 +470,7 @@ fn parallel_lloyd<T>(
             }
         }
 
-        prev_assignments = assignments;
+        std::mem::swap(&mut prev_assignments, &mut assignments);
 
         if verbose && (iter + 1) % 10 == 0 {
             println!(

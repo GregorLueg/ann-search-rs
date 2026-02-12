@@ -1,6 +1,6 @@
 [package]
 name = "ann-search-rs"
-version = "0.2.3"
+version = "0.2.4"
 edition = "2021"
 authors = ["Gregor Lueg <gregorlueg@me.com>"]
 license = "MIT"
@@ -13,7 +13,7 @@ path = "src/lib.rs"
 
 [profile.release]
 lto = true
-codegen-units = 1
+codegen-units = 4
 
 [features]
 binary = ["memmap2", "tempfile", "bytemuck"]
