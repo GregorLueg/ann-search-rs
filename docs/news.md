@@ -4,7 +4,9 @@
 
 **Features:**
 
-- SIMD add and assign add added.
+- SIMD add and assign add added - slightly better k-means performance on larger
+  data sets.
+- Binary quantiser with reranking.
 
 ## 0.2.3
 
