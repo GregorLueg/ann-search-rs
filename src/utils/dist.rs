@@ -141,6 +141,26 @@ pub trait SimdDistance: Sized + Copy {
     /// Subtracted vector
     fn subtract_simd(a: &[Self], b: &[Self]) -> Vec<Self>;
 
+    /// Adds one vector to the other
+    ///
+    /// ### Params
+    ///
+    /// * `a` - Slice of vector a
+    /// * `b` - Slice of vector b
+    ///
+    /// ### Returns
+    ///
+    /// Added vector
+    fn add_simd(a: &[Self], b: &[Self]) -> Vec<Self>;
+
+    /// Adds src to dst
+    ///
+    /// ### Params
+    ///
+    /// * `a` - Mutable reference of vector a
+    /// * `b` - Slice of vector b
+    fn add_assign_simd(dst: &mut [Self], src: &[Self]);
+
     /// Calculate the norm
     ///
     /// ### Params
@@ -1001,6 +1021,558 @@ fn subtract_f64_avx512(a: &[f64], b: &[f64]) -> Vec<f64> {
     subtract_f64_avx2(a, b)
 }
 
+//////////////
+// f32 add  //
+//////////////
+
+/// Vector addition - f32, scalar
+///
+/// ### Params
+///
+/// * `a` - Slice of vector a
+/// * `b` - Slice of vector b
+///
+/// ### Returns
+///
+/// `Vec<a + b>`
+#[inline(always)]
+fn add_f32_scalar(a: &[f32], b: &[f32]) -> Vec<f32> {
+    a.iter().zip(b.iter()).map(|(&x, &y)| x + y).collect()
+}
+
+/// Vector addition - f32, optimised for 128 bits
+///
+/// ### Params
+///
+/// * `a` - Slice of vector a
+/// * `b` - Slice of vector b
+///
+/// ### Returns
+///
+/// `Vec<a + b>`
+#[inline(always)]
+fn add_f32_sse(a: &[f32], b: &[f32]) -> Vec<f32> {
+    let len = a.len();
+    let chunks = len / 4;
+    let mut result = Vec::with_capacity(len);
+
+    unsafe {
+        let a_ptr = a.as_ptr();
+        let b_ptr = b.as_ptr();
+        let result_ptr: *mut f32 = result.as_mut_ptr();
+
+        for i in 0..chunks {
+            let offset = i * 4;
+            let va = f32x4::from(*(a_ptr.add(offset) as *const [f32; 4]));
+            let vb = f32x4::from(*(b_ptr.add(offset) as *const [f32; 4]));
+            let diff = va + vb;
+            *(result_ptr.add(offset) as *mut [f32; 4]) = diff.into();
+        }
+
+        for i in (chunks * 4)..len {
+            *result_ptr.add(i) = a[i] + b[i];
+        }
+
+        result.set_len(len);
+    }
+    result
+}
+
+/// Vector addition - f32, optimised for 256 bits
+///
+/// ### Params
+///
+/// * `a` - Slice of vector a
+/// * `b` - Slice of vector b
+///
+/// ### Returns
+///
+/// `Vec<a + b>`
+#[inline(always)]
+fn add_f32_avx2(a: &[f32], b: &[f32]) -> Vec<f32> {
+    let len = a.len();
+    let chunks = len / 8;
+    let mut result = Vec::with_capacity(len);
+
+    unsafe {
+        let a_ptr = a.as_ptr();
+        let b_ptr = b.as_ptr();
+        let result_ptr: *mut f32 = result.as_mut_ptr();
+
+        for i in 0..chunks {
+            let offset = i * 8;
+            let va = f32x8::from(*(a_ptr.add(offset) as *const [f32; 8]));
+            let vb = f32x8::from(*(b_ptr.add(offset) as *const [f32; 8]));
+            let diff = va + vb;
+            *(result_ptr.add(offset) as *mut [f32; 8]) = diff.into();
+        }
+
+        for i in (chunks * 8)..len {
+            *result_ptr.add(i) = a[i] + b[i];
+        }
+
+        result.set_len(len);
+    }
+    result
+}
+
+/// Vector addition - f32, optimised for 512 bits
+///
+/// ### Params
+///
+/// * `a` - Slice of vector a
+/// * `b` - Slice of vector b
+///
+/// ### Returns
+///
+/// `Vec<a + b>`
+#[cfg(all(target_arch = "x86_64", target_feature = "avx512f"))]
+#[inline(always)]
+fn add_f32_avx512(a: &[f32], b: &[f32]) -> Vec<f32> {
+    use std::arch::x86_64::*;
+
+    let len = a.len();
+    let chunks = len / 16;
+    let mut result = Vec::with_capacity(len);
+
+    unsafe {
+        let result_ptr: *mut f32 = result.as_mut_ptr();
+
+        for i in 0..chunks {
+            let va = _mm512_loadu_ps(a.as_ptr().add(i * 16));
+            let vb = _mm512_loadu_ps(b.as_ptr().add(i * 16));
+            let diff = _mm512_add_ps(va, vb);
+            _mm512_storeu_ps(result_ptr.add(i * 16), diff);
+        }
+
+        for i in (chunks * 16)..len {
+            *result_ptr.add(i) = a[i] + b[i];
+        }
+
+        result.set_len(len);
+    }
+    result
+}
+
+/// Vector addition - f32, fall back version
+///
+/// ### Params
+///
+/// * `a` - Slice of vector a
+/// * `b` - Slice of vector b
+///
+/// ### Returns
+///
+/// `Vec<a + b>`
+#[cfg(not(all(target_arch = "x86_64", target_feature = "avx512f")))]
+#[inline(always)]
+fn add_f32_avx512(a: &[f32], b: &[f32]) -> Vec<f32> {
+    add_f32_avx2(a, b)
+}
+
+//////////////
+// f64 add  //
+//////////////
+
+/// Vector addition - f64, scalar
+///
+/// ### Params
+///
+/// * `a` - Slice of vector a
+/// * `b` - Slice of vector b
+///
+/// ### Returns
+///
+/// `Vec<a + b>`
+#[inline(always)]
+fn add_f64_scalar(a: &[f64], b: &[f64]) -> Vec<f64> {
+    a.iter().zip(b.iter()).map(|(&x, &y)| x + y).collect()
+}
+
+/// Vector addition - f64, optimised for 128 bits
+///
+/// ### Params
+///
+/// * `a` - Slice of vector a
+/// * `b` - Slice of vector b
+///
+/// ### Returns
+///
+/// `Vec<a + b>`
+#[inline(always)]
+fn add_f64_sse(a: &[f64], b: &[f64]) -> Vec<f64> {
+    let len = a.len();
+    let chunks = len / 2;
+    let mut result = Vec::with_capacity(len);
+
+    unsafe {
+        let a_ptr = a.as_ptr();
+        let b_ptr = b.as_ptr();
+        let result_ptr: *mut f64 = result.as_mut_ptr();
+
+        for i in 0..chunks {
+            let offset = i * 2;
+            let va = f64x2::from(*(a_ptr.add(offset) as *const [f64; 2]));
+            let vb = f64x2::from(*(b_ptr.add(offset) as *const [f64; 2]));
+            let diff = va + vb;
+            *(result_ptr.add(offset) as *mut [f64; 2]) = diff.into();
+        }
+
+        if len % 2 == 1 {
+            *result_ptr.add(len - 1) = a[len - 1] + b[len - 1];
+        }
+
+        result.set_len(len);
+    }
+    result
+}
+
+/// Vector addition - f64, optimised for 256 bits
+///
+/// ### Params
+///
+/// * `a` - Slice of vector a
+/// * `b` - Slice of vector b
+///
+/// ### Returns
+///
+/// `Vec<a + b>`
+#[inline(always)]
+fn add_f64_avx2(a: &[f64], b: &[f64]) -> Vec<f64> {
+    let len = a.len();
+    let chunks = len / 4;
+    let mut result = Vec::with_capacity(len);
+
+    unsafe {
+        let a_ptr = a.as_ptr();
+        let b_ptr = b.as_ptr();
+        let result_ptr: *mut f64 = result.as_mut_ptr();
+
+        for i in 0..chunks {
+            let offset = i * 4;
+            let va = f64x4::from(*(a_ptr.add(offset) as *const [f64; 4]));
+            let vb = f64x4::from(*(b_ptr.add(offset) as *const [f64; 4]));
+            let diff = va + vb;
+            *(result_ptr.add(offset) as *mut [f64; 4]) = diff.into();
+        }
+
+        for i in (chunks * 4)..len {
+            *result_ptr.add(i) = a[i] + b[i];
+        }
+
+        result.set_len(len);
+    }
+    result
+}
+
+/// Vector addition - f64, optimised for 512 bits
+///
+/// ### Params
+///
+/// * `a` - Slice of vector a
+/// * `b` - Slice of vector b
+///
+/// ### Returns
+///
+/// `Vec<a + b>`
+#[cfg(all(target_arch = "x86_64", target_feature = "avx512f"))]
+#[inline(always)]
+fn add_f64_avx512(a: &[f64], b: &[f64]) -> Vec<f64> {
+    use std::arch::x86_64::*;
+
+    let len = a.len();
+    let chunks = len / 8;
+    let mut result = Vec::with_capacity(len);
+
+    unsafe {
+        let result_ptr: *mut f64 = result.as_mut_ptr();
+
+        for i in 0..chunks {
+            let va = _mm512_loadu_pd(a.as_ptr().add(i * 8));
+            let vb = _mm512_loadu_pd(b.as_ptr().add(i * 8));
+            let diff = _mm512_add_pd(va, vb);
+            _mm512_storeu_pd(result_ptr.add(i * 8), diff);
+        }
+
+        for i in (chunks * 8)..len {
+            *result_ptr.add(i) = a[i] + b[i];
+        }
+
+        result.set_len(len);
+    }
+    result
+}
+
+/// Vector subtraction - f64, fall back version for AVX512
+///
+/// ### Params
+///
+/// * `a` - Slice of vector a
+/// * `b` - Slice of vector b
+///
+/// ### Returns
+///
+/// `Vec<a - b>`
+#[cfg(not(all(target_arch = "x86_64", target_feature = "avx512f")))]
+#[inline(always)]
+fn add_f64_avx512(a: &[f64], b: &[f64]) -> Vec<f64> {
+    add_f64_avx2(a, b)
+}
+
+//////////////////////
+// f32 add_assign   //
+//////////////////////
+
+/// In-place vector addition - f32, scalar
+///
+/// Computes `dst[i] += src[i]` for all elements.
+///
+/// ### Params
+///
+/// * `dst` - Mutable slice, updated in-place
+/// * `src` - Slice to add
+#[inline(always)]
+fn add_assign_f32_scalar(dst: &mut [f32], src: &[f32]) {
+    dst.iter_mut().zip(src.iter()).for_each(|(d, &s)| *d += s);
+}
+
+/// In-place vector addition - f32, optimised for 128 bits
+///
+/// Computes `dst[i] += src[i]` for all elements.
+///
+/// ### Params
+///
+/// * `dst` - Mutable slice, updated in-place
+/// * `src` - Slice to add
+#[inline(always)]
+fn add_assign_f32_sse(dst: &mut [f32], src: &[f32]) {
+    let len = dst.len();
+    let chunks = len / 4;
+
+    unsafe {
+        let dst_ptr = dst.as_mut_ptr();
+        let src_ptr = src.as_ptr();
+
+        for i in 0..chunks {
+            let offset = i * 4;
+            let vd = f32x4::from(*(dst_ptr.add(offset) as *const [f32; 4]));
+            let vs = f32x4::from(*(src_ptr.add(offset) as *const [f32; 4]));
+            let sum = vd + vs;
+            *(dst_ptr.add(offset) as *mut [f32; 4]) = sum.into();
+        }
+
+        for i in (chunks * 4)..len {
+            *dst_ptr.add(i) += *src_ptr.add(i);
+        }
+    }
+}
+
+/// In-place vector addition - f32, optimised for 256 bits
+///
+/// Computes `dst[i] += src[i]` for all elements.
+///
+/// ### Params
+///
+/// * `dst` - Mutable slice, updated in-place
+/// * `src` - Slice to add
+#[inline(always)]
+fn add_assign_f32_avx2(dst: &mut [f32], src: &[f32]) {
+    let len = dst.len();
+    let chunks = len / 8;
+
+    unsafe {
+        let dst_ptr = dst.as_mut_ptr();
+        let src_ptr = src.as_ptr();
+
+        for i in 0..chunks {
+            let offset = i * 8;
+            let vd = f32x8::from(*(dst_ptr.add(offset) as *const [f32; 8]));
+            let vs = f32x8::from(*(src_ptr.add(offset) as *const [f32; 8]));
+            let sum = vd + vs;
+            *(dst_ptr.add(offset) as *mut [f32; 8]) = sum.into();
+        }
+
+        for i in (chunks * 8)..len {
+            *dst_ptr.add(i) += *src_ptr.add(i);
+        }
+    }
+}
+
+/// In-place vector addition - f32, optimised for 512 bits
+///
+/// Computes `dst[i] += src[i]` for all elements.
+///
+/// ### Params
+///
+/// * `dst` - Mutable slice, updated in-place
+/// * `src` - Slice to add
+#[cfg(all(target_arch = "x86_64", target_feature = "avx512f"))]
+#[inline(always)]
+fn add_assign_f32_avx512(dst: &mut [f32], src: &[f32]) {
+    use std::arch::x86_64::*;
+
+    let len = dst.len();
+    let chunks = len / 16;
+
+    unsafe {
+        let dst_ptr = dst.as_mut_ptr();
+        let src_ptr = src.as_ptr();
+
+        for i in 0..chunks {
+            let offset = i * 16;
+            let vd = _mm512_loadu_ps(dst_ptr.add(offset));
+            let vs = _mm512_loadu_ps(src_ptr.add(offset));
+            let sum = _mm512_add_ps(vd, vs);
+            _mm512_storeu_ps(dst_ptr.add(offset), sum);
+        }
+
+        for i in (chunks * 16)..len {
+            *dst_ptr.add(i) += *src_ptr.add(i);
+        }
+    }
+}
+
+/// In-place vector addition - f32, fall back version
+///
+/// Computes `dst[i] += src[i]` for all elements.
+///
+/// ### Params
+///
+/// * `dst` - Mutable slice, updated in-place
+/// * `src` - Slice to add
+#[cfg(not(all(target_arch = "x86_64", target_feature = "avx512f")))]
+#[inline(always)]
+fn add_assign_f32_avx512(dst: &mut [f32], src: &[f32]) {
+    add_assign_f32_avx2(dst, src);
+}
+
+//////////////////////
+// f64 add_assign   //
+//////////////////////
+
+/// In-place vector addition - f64, scalar
+///
+/// Computes `dst[i] += src[i]` for all elements.
+///
+/// ### Params
+///
+/// * `dst` - Mutable slice, updated in-place
+/// * `src` - Slice to add
+#[inline(always)]
+fn add_assign_f64_scalar(dst: &mut [f64], src: &[f64]) {
+    dst.iter_mut().zip(src.iter()).for_each(|(d, &s)| *d += s);
+}
+
+/// In-place vector addition - f64, optimised for 128 bits
+///
+/// Computes `dst[i] += src[i]` for all elements.
+///
+/// ### Params
+///
+/// * `dst` - Mutable slice, updated in-place
+/// * `src` - Slice to add
+#[inline(always)]
+fn add_assign_f64_sse(dst: &mut [f64], src: &[f64]) {
+    let len = dst.len();
+    let chunks = len / 2;
+
+    unsafe {
+        let dst_ptr = dst.as_mut_ptr();
+        let src_ptr = src.as_ptr();
+
+        for i in 0..chunks {
+            let offset = i * 2;
+            let vd = f64x2::from(*(dst_ptr.add(offset) as *const [f64; 2]));
+            let vs = f64x2::from(*(src_ptr.add(offset) as *const [f64; 2]));
+            let sum = vd + vs;
+            *(dst_ptr.add(offset) as *mut [f64; 2]) = sum.into();
+        }
+
+        if len % 2 == 1 {
+            *dst_ptr.add(len - 1) += *src_ptr.add(len - 1);
+        }
+    }
+}
+
+/// In-place vector addition - f64, optimised for 256 bits
+///
+/// Computes `dst[i] += src[i]` for all elements.
+///
+/// ### Params
+///
+/// * `dst` - Mutable slice, updated in-place
+/// * `src` - Slice to add
+#[inline(always)]
+fn add_assign_f64_avx2(dst: &mut [f64], src: &[f64]) {
+    let len = dst.len();
+    let chunks = len / 4;
+
+    unsafe {
+        let dst_ptr = dst.as_mut_ptr();
+        let src_ptr = src.as_ptr();
+
+        for i in 0..chunks {
+            let offset = i * 4;
+            let vd = f64x4::from(*(dst_ptr.add(offset) as *const [f64; 4]));
+            let vs = f64x4::from(*(src_ptr.add(offset) as *const [f64; 4]));
+            let sum = vd + vs;
+            *(dst_ptr.add(offset) as *mut [f64; 4]) = sum.into();
+        }
+
+        for i in (chunks * 4)..len {
+            *dst_ptr.add(i) += *src_ptr.add(i);
+        }
+    }
+}
+
+/// In-place vector addition - f64, optimised for 512 bits
+///
+/// Computes `dst[i] += src[i]` for all elements.
+///
+/// ### Params
+///
+/// * `dst` - Mutable slice, updated in-place
+/// * `src` - Slice to add
+#[cfg(all(target_arch = "x86_64", target_feature = "avx512f"))]
+#[inline(always)]
+fn add_assign_f64_avx512(dst: &mut [f64], src: &[f64]) {
+    use std::arch::x86_64::*;
+
+    let len = dst.len();
+    let chunks = len / 8;
+
+    unsafe {
+        let dst_ptr = dst.as_mut_ptr();
+        let src_ptr = src.as_ptr();
+
+        for i in 0..chunks {
+            let offset = i * 8;
+            let vd = _mm512_loadu_pd(dst_ptr.add(offset));
+            let vs = _mm512_loadu_pd(src_ptr.add(offset));
+            let sum = _mm512_add_pd(vd, vs);
+            _mm512_storeu_pd(dst_ptr.add(offset), sum);
+        }
+
+        for i in (chunks * 8)..len {
+            *dst_ptr.add(i) += *src_ptr.add(i);
+        }
+    }
+}
+
+/// In-place vector addition - f64, fall back version
+///
+/// Computes `dst[i] += src[i]` for all elements.
+///
+/// ### Params
+///
+/// * `dst` - Mutable slice, updated in-place
+/// * `src` - Slice to add
+#[cfg(not(all(target_arch = "x86_64", target_feature = "avx512f")))]
+#[inline(always)]
+fn add_assign_f64_avx512(dst: &mut [f64], src: &[f64]) {
+    add_assign_f64_avx2(dst, src);
+}
+
 ///////////////
 // f32, Norm //
 ///////////////
@@ -1290,6 +1862,26 @@ impl SimdDistance for f32 {
     }
 
     #[inline]
+    fn add_simd(a: &[Self], b: &[Self]) -> Vec<Self> {
+        match detect_simd_level() {
+            SimdLevel::Avx512 => add_f32_avx512(a, b),
+            SimdLevel::Avx2 => add_f32_avx2(a, b),
+            SimdLevel::Sse => add_f32_sse(a, b),
+            SimdLevel::Scalar => add_f32_scalar(a, b),
+        }
+    }
+
+    #[inline]
+    fn add_assign_simd(dst: &mut [Self], src: &[Self]) {
+        match detect_simd_level() {
+            SimdLevel::Avx512 => add_assign_f32_avx512(dst, src),
+            SimdLevel::Avx2 => add_assign_f32_avx2(dst, src),
+            SimdLevel::Sse => add_assign_f32_sse(dst, src),
+            SimdLevel::Scalar => add_assign_f32_scalar(dst, src),
+        }
+    }
+
+    #[inline]
     fn calculate_norm(vec: &[Self]) -> Self {
         match detect_simd_level() {
             SimdLevel::Avx512 => compute_norm_f32_avx512(vec),
@@ -1328,6 +1920,26 @@ impl SimdDistance for f64 {
             SimdLevel::Avx2 => subtract_f64_avx2(a, b),
             SimdLevel::Sse => subtract_f64_sse(a, b),
             SimdLevel::Scalar => subtract_f64_scalar(a, b),
+        }
+    }
+
+    #[inline]
+    fn add_simd(a: &[Self], b: &[Self]) -> Vec<Self> {
+        match detect_simd_level() {
+            SimdLevel::Avx512 => add_f64_avx512(a, b),
+            SimdLevel::Avx2 => add_f64_avx2(a, b),
+            SimdLevel::Sse => add_f64_sse(a, b),
+            SimdLevel::Scalar => add_f64_scalar(a, b),
+        }
+    }
+
+    #[inline]
+    fn add_assign_simd(dst: &mut [Self], src: &[Self]) {
+        match detect_simd_level() {
+            SimdLevel::Avx512 => add_assign_f64_avx512(dst, src),
+            SimdLevel::Avx2 => add_assign_f64_avx2(dst, src),
+            SimdLevel::Sse => add_assign_f64_sse(dst, src),
+            SimdLevel::Scalar => add_assign_f64_scalar(dst, src),
         }
     }
 
@@ -4049,6 +4661,151 @@ mod tests {
         assert_relative_eq!(vec[0], 0.0, epsilon = 1e-6);
         assert_relative_eq!(vec[1], 0.0, epsilon = 1e-6);
         assert_relative_eq!(vec[2], 0.0, epsilon = 1e-6);
+    }
+
+    #[test]
+    fn test_add_simd_f32_basic() {
+        let a: Vec<f32> = vec![1.0, 2.0, 3.0, 4.0, 5.0];
+        let b: Vec<f32> = vec![5.0, 4.0, 3.0, 2.0, 1.0];
+
+        let result = f32::add_simd(&a, &b);
+
+        assert_eq!(result.len(), 5);
+        for i in 0..5 {
+            assert_relative_eq!(result[i], 6.0, epsilon = 1e-6);
+        }
+    }
+
+    #[test]
+    fn test_add_simd_f32_zeros() {
+        let a: Vec<f32> = vec![1.0, -2.0, 3.0];
+        let b: Vec<f32> = vec![0.0, 0.0, 0.0];
+
+        let result = f32::add_simd(&a, &b);
+
+        assert_relative_eq!(result[0], 1.0, epsilon = 1e-6);
+        assert_relative_eq!(result[1], -2.0, epsilon = 1e-6);
+        assert_relative_eq!(result[2], 3.0, epsilon = 1e-6);
+    }
+
+    #[test]
+    fn test_add_simd_f32_negatives() {
+        let a: Vec<f32> = vec![1.0, 2.0, 3.0];
+        let b: Vec<f32> = vec![-1.0, -2.0, -3.0];
+
+        let result = f32::add_simd(&a, &b);
+
+        for val in &result {
+            assert_relative_eq!(*val, 0.0, epsilon = 1e-6);
+        }
+    }
+
+    #[test]
+    fn test_add_simd_f32_large_dimension() {
+        let dim = 128;
+        let a: Vec<f32> = (0..dim).map(|i| i as f32).collect();
+        let b: Vec<f32> = (0..dim).map(|i| (dim - i) as f32).collect();
+
+        let result = f32::add_simd(&a, &b);
+
+        assert_eq!(result.len(), dim);
+        for val in &result {
+            assert_relative_eq!(*val, dim as f32, epsilon = 1e-6);
+        }
+    }
+
+    #[test]
+    fn test_add_simd_f64_basic() {
+        let a: Vec<f64> = vec![1.0, 2.0, 3.0, 4.0, 5.0];
+        let b: Vec<f64> = vec![5.0, 4.0, 3.0, 2.0, 1.0];
+
+        let result = f64::add_simd(&a, &b);
+
+        assert_eq!(result.len(), 5);
+        for i in 0..5 {
+            assert_relative_eq!(result[i], 6.0, epsilon = 1e-10);
+        }
+    }
+
+    #[test]
+    fn test_add_assign_simd_f32_basic() {
+        let mut dst: Vec<f32> = vec![1.0, 2.0, 3.0, 4.0, 5.0];
+        let src: Vec<f32> = vec![10.0, 20.0, 30.0, 40.0, 50.0];
+
+        f32::add_assign_simd(&mut dst, &src);
+
+        assert_relative_eq!(dst[0], 11.0, epsilon = 1e-6);
+        assert_relative_eq!(dst[1], 22.0, epsilon = 1e-6);
+        assert_relative_eq!(dst[2], 33.0, epsilon = 1e-6);
+        assert_relative_eq!(dst[3], 44.0, epsilon = 1e-6);
+        assert_relative_eq!(dst[4], 55.0, epsilon = 1e-6);
+    }
+
+    #[test]
+    fn test_add_assign_simd_f32_zeros() {
+        let mut dst: Vec<f32> = vec![1.0, 2.0, 3.0];
+        let src: Vec<f32> = vec![0.0, 0.0, 0.0];
+
+        f32::add_assign_simd(&mut dst, &src);
+
+        assert_relative_eq!(dst[0], 1.0, epsilon = 1e-6);
+        assert_relative_eq!(dst[1], 2.0, epsilon = 1e-6);
+        assert_relative_eq!(dst[2], 3.0, epsilon = 1e-6);
+    }
+
+    #[test]
+    fn test_add_assign_simd_f32_accumulate() {
+        let mut dst: Vec<f32> = vec![0.0; 8];
+        let src: Vec<f32> = vec![1.0; 8];
+
+        for _ in 0..100 {
+            f32::add_assign_simd(&mut dst, &src);
+        }
+
+        for val in &dst {
+            assert_relative_eq!(*val, 100.0, epsilon = 1e-4);
+        }
+    }
+
+    #[test]
+    fn test_add_assign_simd_f32_large_dimension() {
+        let dim = 128;
+        let mut dst: Vec<f32> = vec![1.0; dim];
+        let src: Vec<f32> = vec![2.0; dim];
+
+        f32::add_assign_simd(&mut dst, &src);
+
+        for val in &dst {
+            assert_relative_eq!(*val, 3.0, epsilon = 1e-6);
+        }
+    }
+
+    #[test]
+    fn test_add_assign_simd_f64_basic() {
+        let mut dst: Vec<f64> = vec![1.0, 2.0, 3.0, 4.0, 5.0];
+        let src: Vec<f64> = vec![10.0, 20.0, 30.0, 40.0, 50.0];
+
+        f64::add_assign_simd(&mut dst, &src);
+
+        assert_relative_eq!(dst[0], 11.0, epsilon = 1e-10);
+        assert_relative_eq!(dst[1], 22.0, epsilon = 1e-10);
+        assert_relative_eq!(dst[2], 33.0, epsilon = 1e-10);
+        assert_relative_eq!(dst[3], 44.0, epsilon = 1e-10);
+        assert_relative_eq!(dst[4], 55.0, epsilon = 1e-10);
+    }
+
+    #[test]
+    fn test_add_assign_simd_f64_accumulate() {
+        let mut dst: Vec<f64> = vec![0.0; 8];
+        let src: Vec<f64> = vec![1.0; 8];
+
+        for _ in 0..100 {
+            f64::add_assign_simd(&mut dst, &src);
+        }
+
+        for val in &dst {
+            assert_relative_eq!(*val, 100.0, epsilon = 1e-10);
+        }
     }
 
     #[cfg(feature = "quantised")]

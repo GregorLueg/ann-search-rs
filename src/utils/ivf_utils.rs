@@ -78,24 +78,13 @@ where
     ///
     /// The distance to the different clusters
     fn get_centroids_prenorm(&self, query_vec: &[T], nprobe: usize) -> Vec<(T, usize)> {
-        // Find top nprobe centroids
+        // find top nprobe centroids
         let mut cluster_dists: Vec<(T, usize)> = (0..self.nlist())
             .map(|c| {
                 let cent = &self.centroids()[c * self.dim()..(c + 1) * self.dim()];
                 let dist = match self.metric() {
-                    Dist::Cosine => {
-                        let ip: T = query_vec
-                            .iter()
-                            .zip(cent.iter())
-                            .map(|(&q, &c)| q * c)
-                            .sum();
-                        T::one() - ip
-                    }
-                    Dist::Euclidean => query_vec
-                        .iter()
-                        .zip(cent.iter())
-                        .map(|(&q, &c)| (q - c) * (q - c))
-                        .sum(),
+                    Dist::Cosine => T::one() - T::dot_simd(query_vec, cent),
+                    Dist::Euclidean => T::euclidean_simd(query_vec, cent),
                 };
                 (dist, c)
             })
@@ -389,6 +378,8 @@ fn parallel_lloyd<T>(
 ) where
     T: Float + Send + Sync + SimdDistance,
 {
+    let mut prev_assignments: Vec<usize> = vec![usize::MAX; n];
+
     for iter in 0..max_iters {
         let assignments = assign_all_parallel(
             data,
@@ -401,6 +392,19 @@ fn parallel_lloyd<T>(
             metric,
         );
 
+        let changed: usize = assignments
+            .iter()
+            .zip(prev_assignments.iter())
+            .filter(|(a, b)| a != b)
+            .count();
+
+        if changed == 0 {
+            if verbose {
+                println!("    Converged at iteration {}", iter + 1);
+            }
+            break;
+        }
+
         let (new_sums, counts) = (0..n)
             .into_par_iter()
             .fold(
@@ -409,17 +413,18 @@ fn parallel_lloyd<T>(
                     let cluster = assignments[i];
                     counts[cluster] += 1;
                     let vec = &data[i * dim..(i + 1) * dim];
-                    for d in 0..dim {
-                        sums[cluster * dim + d] = sums[cluster * dim + d] + vec[d];
-                    }
+                    T::add_assign_simd(&mut sums[cluster * dim..(cluster + 1) * dim], vec);
                     (sums, counts)
                 },
             )
             .reduce(
                 || (vec![T::zero(); k * dim], vec![0usize; k]),
                 |(mut sums1, mut counts1), (sums2, counts2)| {
-                    for i in 0..sums1.len() {
-                        sums1[i] = sums1[i] + sums2[i];
+                    for c in 0..k {
+                        T::add_assign_simd(
+                            &mut sums1[c * dim..(c + 1) * dim],
+                            &sums2[c * dim..(c + 1) * dim],
+                        );
                     }
                     for i in 0..counts1.len() {
                         counts1[i] += counts2[i];
@@ -434,19 +439,20 @@ fn parallel_lloyd<T>(
                 for d in 0..dim {
                     centroids[c * dim + d] = new_sums[c * dim + d] / count_t;
                 }
-
                 if matches!(metric, Dist::Cosine) {
-                    centroid_norms[c] = centroids[c * dim..(c + 1) * dim]
-                        .iter()
-                        .map(|&x| x * x)
-                        .fold(T::zero(), |a, b| a + b)
-                        .sqrt();
+                    centroid_norms[c] = T::calculate_norm(&centroids[c * dim..(c + 1) * dim]);
                 }
             }
         }
 
+        prev_assignments = assignments;
+
         if verbose && (iter + 1) % 10 == 0 {
-            println!("    Iteration {} complete", iter + 1);
+            println!(
+                "    Iteration {} complete ({} assignments changed)",
+                iter + 1,
+                changed
+            );
         }
     }
 }
@@ -487,13 +493,7 @@ where
 {
     let data_norms = if matches!(metric, Dist::Cosine) {
         (0..n)
-            .map(|i| {
-                data[i * dim..(i + 1) * dim]
-                    .iter()
-                    .map(|&x| x * x)
-                    .fold(T::zero(), |a, b| a + b)
-                    .sqrt()
-            })
+            .map(|i| T::calculate_norm(&data[i * dim..(i + 1) * dim]))
             .collect()
     } else {
         vec![T::one(); n]
@@ -513,13 +513,7 @@ where
 
     let mut centroid_norms = if matches!(metric, Dist::Cosine) {
         (0..n_centroids)
-            .map(|i| {
-                centroids[i * dim..(i + 1) * dim]
-                    .iter()
-                    .map(|&x| x * x)
-                    .fold(T::zero(), |a, b| a + b)
-                    .sqrt()
-            })
+            .map(|i| T::calculate_norm(&centroids[i * dim..(i + 1) * dim]))
             .collect()
     } else {
         vec![T::one(); n_centroids]
