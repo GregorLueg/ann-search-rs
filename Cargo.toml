@@ -13,7 +13,7 @@ path = "src/lib.rs"
 
 [profile.release]
 lto = true
-codegen-units = 4
+codegen-units = 1
 
 [features]
 binary = ["memmap2", "tempfile", "bytemuck"]

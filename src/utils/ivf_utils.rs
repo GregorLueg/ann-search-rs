@@ -379,6 +379,7 @@ fn parallel_lloyd<T>(
     T: Float + Send + Sync + SimdDistance,
 {
     let mut prev_assignments: Vec<usize> = vec![usize::MAX; n];
+    // on small data sets SIMD is actually slower...
     let use_simd = dim >= 64;
 
     for iter in 0..max_iters {
