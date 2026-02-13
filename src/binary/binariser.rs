@@ -293,17 +293,15 @@ where
 
         // 2. Full PCA to get the maximum possible orthogonal components (up to dim)
         let svd = sampled_data.as_ref().svd().unwrap();
-        let full_v = svd.V(); // This is dim x dim
+        let full_v = svd.V();
 
         // 3. Repeat and Rotate Logic
         let mut final_projections = Vec::with_capacity(self.n_bits * dim);
         let mut bits_remaining = self.n_bits;
 
-        // We will work in chunks of size 'dim' (the max number of orthogonal components)
         while bits_remaining > 0 {
             let current_chunk_size = bits_remaining.min(dim);
 
-            // Extract the top components for this chunk
             let mut v_chunk = Mat::<T>::zeros(dim, current_chunk_size);
             for j in 0..current_chunk_size {
                 for i in 0..dim {
@@ -311,7 +309,6 @@ where
                 }
             }
 
-            // Generate a random rotation matrix for this specific tile
             let mut r_mat = Mat::<T>::zeros(current_chunk_size, current_chunk_size);
             for i in 0..current_chunk_size {
                 for j in 0..current_chunk_size {
@@ -320,13 +317,9 @@ where
                 }
             }
 
-            // Orthogonalize rotation via QR
             let qr = r_mat.as_ref().qr();
             let mut r_ortho = qr.compute_Q();
 
-            // Only run the iterative ITQ optimization on the FIRST chunk
-            // to save training time. Subsequent chunks are randomized
-            // rotations of the PCA space.
             if bits_remaining == self.n_bits {
                 let projected_data = &sampled_data * &v_chunk;
                 for _ in 0..itq_iterations {
@@ -347,10 +340,8 @@ where
                 }
             }
 
-            // Apply the (optionally optimized) rotation to the PCA components
             let rotated_projections = v_chunk * r_ortho;
 
-            // Flatten into our projections vector
             for j in 0..current_chunk_size {
                 for i in 0..dim {
                     final_projections.push(rotated_projections[(i, j)]);

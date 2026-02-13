@@ -2,7 +2,6 @@ use faer::{MatRef, RowRef};
 use num_traits::{Float, FromPrimitive, ToPrimitive};
 use rand::{rngs::StdRng, Rng, SeedableRng};
 use rayon::prelude::*;
-use std::cmp::Ordering;
 use std::collections::BinaryHeap;
 use std::iter::Sum;
 use thousands::*;
@@ -76,14 +75,14 @@ where
     let mut left: Vec<usize> = Vec::new();
     let mut right: Vec<usize> = Vec::new();
 
-    let norm_pivot_1 = T::calculate_norm(pivot_1);
-    let norm_pivot_2 = T::calculate_norm(pivot_2);
+    let norm_pivot_1 = T::calculate_l2_norm(pivot_1);
+    let norm_pivot_2 = T::calculate_l2_norm(pivot_2);
 
     for &idx in indices {
         let vec = &data[idx * dim..(idx + 1) * dim];
         let vec_norm = match metric {
             Dist::Euclidean => T::zero(),
-            Dist::Cosine => T::calculate_norm(vec),
+            Dist::Cosine => T::calculate_l2_norm(vec),
         };
 
         let d1 = match metric {
@@ -155,14 +154,14 @@ where
     T: Float + SimdDistance,
 {
     let mut max_dist = T::zero();
-    let center_norm = T::calculate_norm(center);
+    let center_norm = T::calculate_l2_norm(center);
 
     for &idx in indices {
         let vec = &data[idx * dim..(idx + 1) * dim];
         let dist = match metric {
             Dist::Euclidean => euclidean_distance_static(center, vec),
             Dist::Cosine => {
-                let vec_norm = T::calculate_norm(vec);
+                let vec_norm = T::calculate_l2_norm(vec);
                 cosine_distance_static_norm(center, vec, &center_norm, &vec_norm)
             }
         };
@@ -192,11 +191,12 @@ where
 /// * `center_idx` - Index into split_data (only used for split nodes)
 #[derive(Clone, Copy, Debug)]
 #[repr(C)]
-struct BallNode {
+struct BallNode<T> {
     n_descendants: u32,
     child_a: u32,
     child_b: u32,
     center_idx: u32,
+    radius: T,
 }
 
 /// Build-time node representation
@@ -247,10 +247,10 @@ pub struct BallTreeIndex<T> {
     norms: Vec<T>,
     metric: Dist,
     // Index-specific data
-    nodes: Vec<BallNode>,
+    nodes: Vec<BallNode<T>>,
     root: u32,
     centers_data: Vec<T>,
-    radii_data: Vec<T>,
+    centers_data_norm: Vec<T>,
     leaf_indices: Vec<usize>,
 }
 
@@ -304,7 +304,7 @@ where
                 .map(|i| {
                     let start = i * dim;
                     let end = start + dim;
-                    T::calculate_norm(&vectors_flat[start..end])
+                    T::calculate_l2_norm(&vectors_flat[start..end])
                 })
                 .collect()
         } else {
@@ -325,25 +325,35 @@ where
 
         let mut nodes = Vec::new();
         let mut centers_data = Vec::new();
-        let mut radii_data = Vec::new();
         let mut leaf_indices = Vec::new();
 
         let root = Self::flatten_tree(
             tree,
             &mut nodes,
             &mut centers_data,
-            &mut radii_data,
             &mut leaf_indices,
             &vectors_flat,
             &metric,
             dim,
         );
 
+        let centers_data_norm = if metric == Dist::Cosine {
+            (0..centers_data.len() / dim)
+                .map(|i| {
+                    let start = i * dim;
+                    let end = start + dim;
+                    T::calculate_l2_norm(&centers_data[start..end])
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+
         BallTreeIndex {
             nodes,
             root,
             centers_data,
-            radii_data,
+            centers_data_norm,
             leaf_indices,
             vectors_flat,
             dim,
@@ -478,8 +488,8 @@ where
 
             let centroid_norms = if metric == Dist::Cosine {
                 vec![
-                    T::calculate_norm(&centroids[0..dim]),
-                    T::calculate_norm(&centroids[dim..2 * dim]),
+                    T::calculate_l2_norm(&centroids[0..dim]),
+                    T::calculate_l2_norm(&centroids[dim..2 * dim]),
                 ]
             } else {
                 vec![T::one(); 2]
@@ -664,9 +674,8 @@ where
     #[allow(clippy::too_many_arguments)]
     fn flatten_tree(
         tree: Vec<BuildNode<T>>,
-        nodes: &mut Vec<BallNode>,
+        nodes: &mut Vec<BallNode<T>>,
         centers_data: &mut Vec<T>,
-        radii_data: &mut Vec<T>,
         leaf_indices: &mut Vec<usize>,
         vectors_flat: &[T],
         metric: &Dist,
@@ -688,13 +697,13 @@ where
                 } => {
                     let center_idx = (centers_data.len() / dim) as u32;
                     centers_data.extend(center);
-                    radii_data.push(radius);
 
                     nodes.push(BallNode {
                         n_descendants: 2,
                         child_a: base_offset + left as u32,
                         child_b: base_offset + right as u32,
                         center_idx,
+                        radius,
                     });
                 }
                 BuildNode::Leaf { items } => {
@@ -702,7 +711,6 @@ where
                     let radius = ball_radius(&center, vectors_flat, &items, dim, metric); // Compute actual radius
                     let center_idx = (centers_data.len() / dim) as u32;
                     centers_data.extend(center);
-                    radii_data.push(radius);
 
                     let start = leaf_indices.len() as u32;
                     let len = items.len() as u32;
@@ -713,6 +721,7 @@ where
                         child_a: start,
                         child_b: len,
                         center_idx,
+                        radius,
                     });
                 }
             }
@@ -759,12 +768,12 @@ where
         let mut visited = VisitedSet::new(self.n);
 
         let query_norm = if self.metric == Dist::Cosine {
-            T::calculate_norm(query_vec)
+            T::calculate_l2_norm(query_vec)
         } else {
             T::one()
         };
 
-        let mut top_k: BinaryHeap<(OrderedFloat<T>, usize)> = BinaryHeap::with_capacity(k + 1);
+        let mut top_k = SortedBuffer::with_capacity(k + 1);
         let mut kth_dist = T::infinity();
         let mut pq = BinaryHeap::with_capacity(64);
 
@@ -812,21 +821,19 @@ where
                         };
 
                         if dist < kth_dist || top_k.len() < k {
-                            top_k.push((OrderedFloat(dist), item));
-                            if top_k.len() > k {
-                                top_k.pop();
-                            }
+                            top_k.insert((OrderedFloat(dist), item), k);
                             if top_k.len() == k {
-                                kth_dist = top_k.peek().unwrap().0 .0;
+                                kth_dist = top_k.top().unwrap().0 .0;
                             }
                         }
                     }
                     break;
                 } else {
-                    let left_center_offset = {
-                        let left_node = unsafe { self.nodes.get_unchecked(node.child_a as usize) };
-                        left_node.center_idx as usize * self.dim
-                    };
+                    // Cache child nodes
+                    let left_node = unsafe { self.nodes.get_unchecked(node.child_a as usize) };
+                    let right_node = unsafe { self.nodes.get_unchecked(node.child_b as usize) };
+
+                    let left_center_offset = left_node.center_idx as usize * self.dim;
                     let left_center = unsafe {
                         self.centers_data
                             .get_unchecked(left_center_offset..left_center_offset + self.dim)
@@ -835,16 +842,17 @@ where
                     let dist_to_left = match self.metric {
                         Dist::Euclidean => T::euclidean_simd(query_vec, left_center),
                         Dist::Cosine => {
-                            let left_norm = T::calculate_norm(left_center);
+                            let left_norm = unsafe {
+                                *self
+                                    .centers_data_norm
+                                    .get_unchecked(left_node.center_idx as usize)
+                            };
                             T::one()
                                 - T::dot_simd(query_vec, left_center) / (query_norm * left_norm)
                         }
                     };
 
-                    let right_center_offset = {
-                        let right_node = unsafe { self.nodes.get_unchecked(node.child_b as usize) };
-                        right_node.center_idx as usize * self.dim
-                    };
+                    let right_center_offset = right_node.center_idx as usize * self.dim;
                     let right_center = unsafe {
                         self.centers_data
                             .get_unchecked(right_center_offset..right_center_offset + self.dim)
@@ -853,24 +861,22 @@ where
                     let dist_to_right = match self.metric {
                         Dist::Euclidean => T::euclidean_simd(query_vec, right_center),
                         Dist::Cosine => {
-                            let right_norm = T::calculate_norm(right_center);
+                            let right_norm = unsafe {
+                                *self
+                                    .centers_data_norm
+                                    .get_unchecked(right_node.center_idx as usize)
+                            };
                             T::one()
                                 - T::dot_simd(query_vec, right_center) / (query_norm * right_norm)
                         }
                     };
 
-                    let (closer, farther, farther_dist) = if dist_to_left <= dist_to_right {
-                        (node.child_a, node.child_b, dist_to_right)
-                    } else {
-                        (node.child_b, node.child_a, dist_to_left)
-                    };
-
-                    let farther_radius = unsafe {
-                        let farther_node = self.nodes.get_unchecked(farther as usize);
-                        *self
-                            .radii_data
-                            .get_unchecked(farther_node.center_idx as usize)
-                    };
+                    let (closer, farther, farther_dist, farther_radius) =
+                        if dist_to_left <= dist_to_right {
+                            (node.child_a, node.child_b, dist_to_right, right_node.radius)
+                        } else {
+                            (node.child_b, node.child_a, dist_to_left, left_node.radius)
+                        };
 
                     pq.push(BacktrackEntry {
                         margin: -(farther_dist - farther_radius * T::from(1.1).unwrap())
@@ -884,12 +890,12 @@ where
             }
         }
 
-        let mut results: Vec<(usize, T)> = top_k
-            .into_iter()
-            .map(|(OrderedFloat(dist), idx)| (idx, dist))
+        let results: Vec<(usize, T)> = top_k
+            .data()
+            .iter()
+            .map(|(OrderedFloat(dist), idx)| (*idx, *dist))
             .collect();
 
-        results.sort_unstable_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(Ordering::Equal));
         results.into_iter().unzip()
     }
 
@@ -991,9 +997,8 @@ where
         std::mem::size_of_val(self)
             + self.vectors_flat.capacity() * std::mem::size_of::<T>()
             + self.norms.capacity() * std::mem::size_of::<T>()
-            + self.nodes.capacity() * std::mem::size_of::<BallNode>()
+            + self.nodes.capacity() * std::mem::size_of::<BallNode<T>>()
             + self.centers_data.capacity() * std::mem::size_of::<T>()
-            + self.radii_data.capacity() * std::mem::size_of::<T>()
             + self.leaf_indices.capacity() * std::mem::size_of::<usize>()
     }
 }
@@ -1019,10 +1024,6 @@ where
         self.metric
     }
 }
-
-///////////
-// Tests //
-///////////
 
 ///////////
 // Tests //

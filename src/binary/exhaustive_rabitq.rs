@@ -1,4 +1,3 @@
-use crate::utils::ivf_utils::CentroidDistance;
 use bytemuck::Pod;
 use faer::{MatRef, RowRef};
 use faer_traits::ComplexField;
@@ -17,6 +16,7 @@ use crate::binary::rabitq::*;
 use crate::binary::vec_store::*;
 use crate::utils::dist::*;
 use crate::utils::heap_structs::*;
+use crate::utils::ivf_utils::CentroidDistance;
 use crate::utils::*;
 
 /// Exhaustive RaBitQ index with multi-centroid support
@@ -103,7 +103,7 @@ where
 
         let (vectors_flat, _, _) = matrix_to_flat(data);
         let norms: Vec<T> = (0..n)
-            .map(|i| compute_norm(&vectors_flat[i * dim..(i + 1) * dim]))
+            .map(|i| compute_l2_norm(&vectors_flat[i * dim..(i + 1) * dim]))
             .collect();
 
         let vectors_path = save_path.as_ref().join("vectors_flat.bin");
@@ -141,7 +141,7 @@ where
         // Normalise for cosine
         let query_normalised: Vec<T> = match self.quantiser.encoder.metric {
             Dist::Cosine => {
-                let norm = compute_norm(query_vec);
+                let norm = compute_l2_norm(query_vec);
                 if norm > T::epsilon() {
                     query_vec.iter().map(|&x| x / norm).collect()
                 } else {
@@ -241,7 +241,7 @@ where
         let (candidates, _) = self.query(query_vec, k * rerank_factor, n_probe);
 
         let query_norm = match self.quantiser.encoder.metric {
-            Dist::Cosine => compute_norm(query_vec),
+            Dist::Cosine => compute_l2_norm(query_vec),
             Dist::Euclidean => T::one(),
         };
 
