@@ -6,7 +6,7 @@ use rand::SeedableRng;
 use rayon::prelude::*;
 use std::iter::Sum;
 
-use crate::prelude::*;
+use crate::utils::dist::*;
 use crate::utils::Dist;
 
 //////////////////////
@@ -78,24 +78,13 @@ where
     ///
     /// The distance to the different clusters
     fn get_centroids_prenorm(&self, query_vec: &[T], nprobe: usize) -> Vec<(T, usize)> {
-        // Find top nprobe centroids
+        // find top nprobe centroids
         let mut cluster_dists: Vec<(T, usize)> = (0..self.nlist())
             .map(|c| {
                 let cent = &self.centroids()[c * self.dim()..(c + 1) * self.dim()];
                 let dist = match self.metric() {
-                    Dist::Cosine => {
-                        let ip: T = query_vec
-                            .iter()
-                            .zip(cent.iter())
-                            .map(|(&q, &c)| q * c)
-                            .sum();
-                        T::one() - ip
-                    }
-                    Dist::Euclidean => query_vec
-                        .iter()
-                        .zip(cent.iter())
-                        .map(|(&q, &c)| (q - c) * (q - c))
-                        .sum(),
+                    Dist::Cosine => T::one() - T::dot_simd(query_vec, cent),
+                    Dist::Euclidean => T::euclidean_simd(query_vec, cent),
                 };
                 (dist, c)
             })
@@ -389,8 +378,12 @@ fn parallel_lloyd<T>(
 ) where
     T: Float + Send + Sync + SimdDistance,
 {
+    let mut prev_assignments: Vec<usize> = vec![usize::MAX; n];
+    // on small data sets SIMD is actually slower...
+    let use_simd = dim >= 64;
+
     for iter in 0..max_iters {
-        let assignments = assign_all_parallel(
+        let mut assignments = assign_all_parallel(
             data,
             data_norms,
             dim,
@@ -401,32 +394,70 @@ fn parallel_lloyd<T>(
             metric,
         );
 
-        let (new_sums, counts) = (0..n)
-            .into_par_iter()
-            .fold(
-                || (vec![T::zero(); k * dim], vec![0usize; k]),
-                |(mut sums, mut counts), i| {
-                    let cluster = assignments[i];
-                    counts[cluster] += 1;
-                    let vec = &data[i * dim..(i + 1) * dim];
-                    for d in 0..dim {
-                        sums[cluster * dim + d] = sums[cluster * dim + d] + vec[d];
-                    }
-                    (sums, counts)
-                },
-            )
-            .reduce(
-                || (vec![T::zero(); k * dim], vec![0usize; k]),
-                |(mut sums1, mut counts1), (sums2, counts2)| {
-                    for i in 0..sums1.len() {
-                        sums1[i] = sums1[i] + sums2[i];
-                    }
-                    for i in 0..counts1.len() {
-                        counts1[i] += counts2[i];
-                    }
-                    (sums1, counts1)
-                },
-            );
+        let changed: usize = assignments
+            .iter()
+            .zip(prev_assignments.iter())
+            .filter(|(a, b)| a != b)
+            .count();
+
+        if changed == 0 {
+            if verbose {
+                println!("    Converged at iteration {}", iter + 1);
+            }
+            break;
+        }
+
+        let (new_sums, counts) = if use_simd {
+            (0..n)
+                .into_par_iter()
+                .fold(
+                    || (vec![T::zero(); k * dim], vec![0usize; k]),
+                    |(mut sums, mut counts), i| {
+                        let cluster = assignments[i];
+                        counts[cluster] += 1;
+                        let vec = &data[i * dim..(i + 1) * dim];
+                        T::add_assign_simd(&mut sums[cluster * dim..(cluster + 1) * dim], vec);
+                        (sums, counts)
+                    },
+                )
+                .reduce(
+                    || (vec![T::zero(); k * dim], vec![0usize; k]),
+                    |(mut sums1, mut counts1), (sums2, counts2)| {
+                        T::add_assign_simd(&mut sums1, &sums2);
+                        for i in 0..counts1.len() {
+                            counts1[i] += counts2[i];
+                        }
+                        (sums1, counts1)
+                    },
+                )
+        } else {
+            (0..n)
+                .into_par_iter()
+                .fold(
+                    || (vec![T::zero(); k * dim], vec![0usize; k]),
+                    |(mut sums, mut counts), i| {
+                        let cluster = assignments[i];
+                        counts[cluster] += 1;
+                        let vec = &data[i * dim..(i + 1) * dim];
+                        for d in 0..dim {
+                            sums[cluster * dim + d] = sums[cluster * dim + d] + vec[d];
+                        }
+                        (sums, counts)
+                    },
+                )
+                .reduce(
+                    || (vec![T::zero(); k * dim], vec![0usize; k]),
+                    |(mut sums1, mut counts1), (sums2, counts2)| {
+                        for i in 0..sums1.len() {
+                            sums1[i] = sums1[i] + sums2[i];
+                        }
+                        for i in 0..counts1.len() {
+                            counts1[i] += counts2[i];
+                        }
+                        (sums1, counts1)
+                    },
+                )
+        };
 
         for c in 0..k {
             if counts[c] > 0 {
@@ -434,15 +465,20 @@ fn parallel_lloyd<T>(
                 for d in 0..dim {
                     centroids[c * dim + d] = new_sums[c * dim + d] / count_t;
                 }
-
                 if matches!(metric, Dist::Cosine) {
-                    centroid_norms[c] = T::calculate_l2_norm(&centroids[c * dim..(c + 1) * dim]);
+                    centroid_norms[c] = T::calculate_l1_norm(&centroids[c * dim..(c + 1) * dim]);
                 }
             }
         }
 
+        std::mem::swap(&mut prev_assignments, &mut assignments);
+
         if verbose && (iter + 1) % 10 == 0 {
-            println!("    Iteration {} complete", iter + 1);
+            println!(
+                "    Iteration {} complete ({} assignments changed)",
+                iter + 1,
+                changed
+            );
         }
     }
 }
@@ -483,13 +519,7 @@ where
 {
     let data_norms = if matches!(metric, Dist::Cosine) {
         (0..n)
-            .map(|i| {
-                data[i * dim..(i + 1) * dim]
-                    .iter()
-                    .map(|&x| x * x)
-                    .fold(T::zero(), |a, b| a + b)
-                    .sqrt()
-            })
+            .map(|i| T::calculate_l1_norm(&data[i * dim..(i + 1) * dim]))
             .collect()
     } else {
         vec![T::one(); n]
@@ -509,13 +539,7 @@ where
 
     let mut centroid_norms = if matches!(metric, Dist::Cosine) {
         (0..n_centroids)
-            .map(|i| {
-                centroids[i * dim..(i + 1) * dim]
-                    .iter()
-                    .map(|&x| x * x)
-                    .fold(T::zero(), |a, b| a + b)
-                    .sqrt()
-            })
+            .map(|i| T::calculate_l1_norm(&centroids[i * dim..(i + 1) * dim]))
             .collect()
     } else {
         vec![T::one(); n_centroids]
