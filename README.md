@@ -4,7 +4,7 @@
 
 # ann-search-rs
 
-Various approximate nearest neighbour/vector searches implemented in Rust. 
+Various approximate nearest neighbour/vector searches implemented in Rust.
 Helper library to be used in other libraries.
 
 ## Table of Contents
@@ -22,15 +22,16 @@ Helper library to be used in other libraries.
 
 Extracted function for approximate nearest neighbour searches specifically
 with single cell in mind from [bixverse](https://github.com/GregorLueg/bixverse),
-a R/Rust package designed for computational biology, that has a ton of 
-functionality for single cell. Within all of the single cell functions, kNN 
+a R/Rust package designed for computational biology, that has a ton of
+functionality for single cell. Within all of the single cell functions, kNN
 generations are ubiqituos, thus, I want to expose the APIs to other packages.
 Feel free to use these implementations where you might need approximate nearest
 neighbour searches. This work is based on the great work from others who
 figured out how to design these algorithms and is just an implementation into
 Rust of some of these. Over time, I started getting interested into vector
 searches and implement WAY more indices and new stuff into this than initially
-anticipated.
+anticipated. If you want to see what changed, please check this
+[one out](https://github.com/GregorLueg/ann-search-rs/blob/main/docs/news.md)
 
 ## Features
 
@@ -49,7 +50,7 @@ anticipated.
   - Cosine
   - More to come maybe... ?
 
-- **High performance**: Optimised implementations with SIMD, heavy 
+- **High performance**: Optimised implementations with SIMD, heavy
   multi-threading were possible and optimised structures for memory access.
 
 - **Quantised indices** (optional feature):
@@ -100,7 +101,7 @@ use faer::Mat;
 // Build the HNSW index
 let data = Mat::from_fn(1000, 128, |_, _| rand::random::<f32>());
 let hnsw_idx = build_hnsw_index(
-  mat.as_ref(), 
+  mat.as_ref(),
   16,             // m
   100,            // ef_construction
   "euclidean",    // distance metric
@@ -112,8 +113,8 @@ let hnsw_idx = build_hnsw_index(
 // In this case we are doing a full self query
 let query = Mat::from_fn(10, 128, |_, _| rand::random::<f32>());
 let (hnsw_indices, hnsw_dists) = query_hnsw_index(
-  mat.as_ref(), 
-  &hnsw_idx, 
+  mat.as_ref(),
+  &hnsw_idx,
   15,             // k
   200,            // ef_search
   true,           // return distances
@@ -124,7 +125,7 @@ let (hnsw_indices, hnsw_dists) = query_hnsw_index(
 The package provides a number of different approximate nearest neighbour
 searches. The overall design is very similar and if you wish details on usage,
 please refer to the `examples/*.rs` section which shows you the grid searches
-across various parameters per given index. This and the documentation is a 
+across various parameters per given index. This and the documentation is a
 good starting point to understand how the crate works.
 
 ## Performance and parameters
@@ -133,25 +134,25 @@ good starting point to understand how the crate works.
 
 **GaussianNoise**
 
-Generates simple Gaussian clusters with variable sizes and standard deviations. 
-Each cluster is a blob centred in the full dimensional space. Useful for basic 
-benchmarking where clusters are well-separated and occupy the entire ambient 
+Generates simple Gaussian clusters with variable sizes and standard deviations.
+Each cluster is a blob centred in the full dimensional space. Useful for basic
+benchmarking where clusters are well-separated and occupy the entire ambient
 space.
 
 **Correlated**
 
-Creates clusters with subspace structure where each cluster only activates a 
-subset of dimensions. Additionally introduces explicit correlation patterns 
-where groups of dimensions are linear combinations of source dimensions. 
-Designed to test methods that exploit inter-dimensional correlations and sparse 
+Creates clusters with subspace structure where each cluster only activates a
+subset of dimensions. Additionally introduces explicit correlation patterns
+where groups of dimensions are linear combinations of source dimensions.
+Designed to test methods that exploit inter-dimensional correlations and sparse
 activation patterns.
 
 **LowRank**
 
-Generates data that lives in a low-dimensional subspace (intrinsic_dim) and 
-embeds it via random rotation into high-dimensional space (embedding_dim). 
-Simulates the manifold hypothesis where high-dimensional data actually lies on a 
-lower-dimensional manifold. Adds minimal isotropic noise to model measurement 
+Generates data that lives in a low-dimensional subspace (intrinsic_dim) and
+embeds it via random rotation into high-dimensional space (embedding_dim).
+Simulates the manifold hypothesis where high-dimensional data actually lies on a
+lower-dimensional manifold. Adds minimal isotropic noise to model measurement
 error.
 
 ### Running the grid searches
@@ -176,9 +177,9 @@ cargo run --example gridsearch_annoy --release -- --n-cells 500000 --dim 32 --di
 # --data gaussian
 ```
 
-Every index is trained on 150k cells with 32 dimensions distance and 25 distinct 
+Every index is trained on 150k cells with 32 dimensions distance and 25 distinct
 clusters (of different sizes each). Then the index is tested against a subset of
-10% of cells with a little Gaussian noise added and for full kNN self 
+10% of cells with a little Gaussian noise added and for full kNN self
 generation. Below are the results shown for `Annoy` with the GaussianNoise
 data sets.
 
@@ -222,25 +223,25 @@ Annoy-nt100 (self)                                       878.96    11_044.74    
 --------------------------------------------------------------------------------------------------------------------------------
 ```
 
-Detailed benchmarks on all the standard benchmarks can be found 
+Detailed benchmarks on all the standard benchmarks can be found
 [here](https://github.com/GregorLueg/ann-search-rs/blob/main/docs/benchmarks_general.md).
 Every index was tested on every data set.
 
 ## Quantised indices
 
-The crate also provides some quantised approximate nearest neighbour searches, 
-designed for very large data sets where memory and time both start becoming 
+The crate also provides some quantised approximate nearest neighbour searches,
+designed for very large data sets where memory and time both start becoming
 incredibly constraining. There are a total of four different quantisation
 methods available (plus some binary quantisation, see further below). The crate
 does NOT provide re-ranking on the full vectors (yet).
 
-- *BF16*: An exhaustive search and IVF index are available with BF16 
-  quantisation. In this case the `f32` or `f64` are transformed during storage 
-  into `bf16` floats. These keep the range of `f32`; however, they reduce 
+- *BF16*: An exhaustive search and IVF index are available with BF16
+  quantisation. In this case the `f32` or `f64` are transformed during storage
+  into `bf16` floats. These keep the range of `f32`; however, they reduce
   precision.
 - *SQ8*: A scalar quantisation to `i8`. Exhaustive and IVF indices are provided.
-  For each dimensions in the data, the min and max values are being computed and 
-  the respective data points are projected to integers between `-128` to `127`. 
+  For each dimensions in the data, the min and max values are being computed and
+  the respective data points are projected to integers between `-128` to `127`.
   This enables fast integer math; however, this comes at cost of precision.
 - *PQ*: Uses product quantisation. Useful when the dimensions of the vectors
   are incredibly large and one needs to compress the index in memory even
@@ -248,32 +249,32 @@ does NOT provide re-ranking on the full vectors (yet).
   dimensions. Only IVF is available with product quantisation.
 - *OPQ*: Uses optimised product quantisation. Tries to de-correlate the
   residuals and can in times improve the Recall. Please see the benchmarks.
-  Only IVF is available with optimised product quantisation. 
+  Only IVF is available with optimised product quantisation.
 
-The benchmarks can be found 
-[here](https://github.com/GregorLueg/ann-search-rs/blob/main/docs/benchmarks_quantised.md). 
+The benchmarks can be found
+[here](https://github.com/GregorLueg/ann-search-rs/blob/main/docs/benchmarks_quantised.md).
 If you wish to use these, please add the `"quantised"` feature:
 
 ```toml
 [dependencies]
-ann-search-rs = { version = "*", features = ["quantised"] } 
+ann-search-rs = { version = "*", features = ["quantised"] }
 ```
 
 ## GPU
 
 Two indices are also implemented in GPU-accelerated versions. The exhaustive
-search and the IVF index. Under the hood, this uses 
-[cubecl](https://github.com/tracel-ai/cubecl) with wgpu backend (system agnostic, 
-for details please check [here](https://burn.dev/books/cubecl/getting-started/installation.html)). 
+search and the IVF index. Under the hood, this uses
+[cubecl](https://github.com/tracel-ai/cubecl) with wgpu backend (system agnostic,
+for details please check [here](https://burn.dev/books/cubecl/getting-started/installation.html)).
 Let's first look at the indices compared against exhaustive (CPU). You can
 of course provide other backends.
 
-The benchmarks can be found [here](https://github.com/GregorLueg/ann-search-rs/blob/main/docs/benchmarks_gpu.md). 
+The benchmarks can be found [here](https://github.com/GregorLueg/ann-search-rs/blob/main/docs/benchmarks_gpu.md).
 To unlock GPU-acceleration, please use:
 
 ```toml
 [dependencies]
-ann-search-rs = { version = "*", features = ["gpu"] } 
+ann-search-rs = { version = "*", features = ["gpu"] }
 ```
 
 There is for sure room for improvement in terms of the design of the indices,
@@ -287,7 +288,7 @@ are two approaches for binarisation
 
 - Bitwise binarisation either leveraging a SimHash random projection approach
   or ITQ via PCA.
-- [RaBitQ](https://arxiv.org/abs/2405.12497) binarisation while storing 
+- [RaBitQ](https://arxiv.org/abs/2405.12497) binarisation while storing
   additional data for approximate distance calculations.
 
 These can be used with Exhaustive or IVF indices and you have the option to
@@ -296,10 +297,10 @@ can drastically improve the Recall. To enable the feature, please use:
 
 ```toml
 [dependencies]
-ann-search-rs = { version = "*", features = ["binary"] } 
+ann-search-rs = { version = "*", features = ["binary"] }
 ```
 
-The benchmarks can be found [here](https://github.com/GregorLueg/ann-search-rs/blob/main/docs/benchmarks_binary.md). 
+The benchmarks can be found [here](https://github.com/GregorLueg/ann-search-rs/blob/main/docs/benchmarks_binary.md).
 
 ## Licence
 
