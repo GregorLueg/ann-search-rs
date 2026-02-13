@@ -14,8 +14,7 @@ use std::{
 use thousands::*;
 
 use crate::annoy::*;
-use crate::utils::dist::*;
-use crate::utils::heap_structs::*;
+use crate::prelude::*;
 use crate::utils::*;
 
 /// Neighbour entry in k-NN graph

@@ -7,6 +7,7 @@ pub mod hnsw;
 pub mod ivf;
 pub mod lsh;
 pub mod nndescent;
+pub mod prelude;
 pub mod utils;
 
 #[cfg(feature = "gpu")]
@@ -50,7 +51,7 @@ use crate::hnsw::*;
 use crate::ivf::*;
 use crate::lsh::*;
 use crate::nndescent::*;
-use crate::utils::dist::*;
+use crate::prelude::*;
 
 #[cfg(feature = "binary")]
 use crate::binary::{exhaustive_binary::*, exhaustive_rabitq::*, ivf_binary::*, ivf_rabitq::*};
@@ -1934,7 +1935,8 @@ where
 /// * `binary_init` - Initialisation method ("itq" or "random")
 /// * `metric` - Distance metric for reranking (when save_store is true)
 /// * `save_store` - Whether to save vector store for reranking
-/// * `save_path` - Path to save vector store files (required if save_store is true)
+/// * `save_path` - Path to save vector store files (required if save_store is
+///   true)
 ///
 /// ### Returns
 ///
@@ -1970,7 +1972,8 @@ where
 /// * `index` - The exhaustive binary index
 /// * `k` - Number of neighbours to return
 /// * `rerank` - Whether to use exact distance reranking (requires vector store)
-/// * `rerank_factor` - Multiplier for candidate set size (only used if rerank is true)
+/// * `rerank_factor` - Multiplier for candidate set size (only used if rerank
+///   is true)
 /// * `return_dist` - Shall the distances be returned
 /// * `verbose` - Controls verbosity of the function
 ///
@@ -1994,19 +1997,28 @@ where
             index.query_row_reranking(query_mat.row(i), k, rerank_factor)
         })
     } else {
-        let (indices, distances_u32) =
+        let (indices, dist) = if index.use_asymmetric() {
+            // path where asymmetric queries are sensible
             query_parallel(query_mat.nrows(), return_dist, verbose, |i| {
-                index.query_row(query_mat.row(i), k)
+                index.query_row_asymmetric(query_mat.row(i), k, rerank_factor)
+            })
+        } else {
+            // path where asymmetric queries are not sensible/possible
+            let (indices, distances_u32) =
+                query_parallel(query_mat.nrows(), return_dist, verbose, |i| {
+                    index.query_row(query_mat.row(i), k)
+                });
+            let distances_t = distances_u32.map(|dists| {
+                dists
+                    .into_iter()
+                    .map(|v| v.into_iter().map(|d| T::from_u32(d).unwrap()).collect())
+                    .collect()
             });
 
-        let distances_t = distances_u32.map(|dists| {
-            dists
-                .into_iter()
-                .map(|v| v.into_iter().map(|d| T::from_u32(d).unwrap()).collect())
-                .collect()
-        });
+            (indices, distances_t)
+        };
 
-        (indices, distances_t)
+        (indices, dist)
     }
 }
 
@@ -2019,7 +2031,8 @@ where
 ///
 /// * `index` - Reference to built index
 /// * `k` - Number of neighbours
-/// * `rerank_factor` - Multiplier for candidate set (only used if vector store available)
+/// * `rerank_factor` - Multiplier for candidate set (only used if vector store
+///   available)
 /// * `return_dist` - Return distances
 /// * `verbose` - Controls verbosity
 ///
@@ -2056,7 +2069,8 @@ where
 /// * `dist_metric` - "euclidean" or "cosine"
 /// * `seed` - Random seed
 /// * `save_store` - Whether to save vector store for reranking
-/// * `save_path` - Path to save vector store files (required if save_store is true)
+/// * `save_path` - Path to save vector store files (required if save_store
+///   is true)
 /// * `verbose` - Print progress
 ///
 /// ### Returns
@@ -2117,7 +2131,8 @@ where
 /// * `k` - Number of neighbours
 /// * `nprobe` - Clusters to search (defaults to √nlist)
 /// * `rerank` - Whether to use exact distance reranking (requires vector store)
-/// * `rerank_factor` - Multiplier for candidate set size (only used if rerank is true)
+/// * `rerank_factor` - Multiplier for candidate set size (only used if rerank
+///   is true)
 /// * `return_dist` - Return distances
 /// * `verbose` - Controls verbosity
 ///
@@ -2138,65 +2153,29 @@ pub fn query_ivf_index_binary<T>(
 where
     T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum + ComplexField + SimdDistance + Pod,
 {
-    let counter = Arc::new(AtomicUsize::new(0));
-    let n_queries = query_mat.nrows();
-
     if rerank {
-        let results: Vec<(Vec<usize>, Vec<T>)> = (0..n_queries)
-            .into_par_iter()
-            .map(|i| {
-                if verbose {
-                    let count = counter.fetch_add(1, Ordering::Relaxed) + 1;
-                    if count.is_multiple_of(100_000) {
-                        println!(
-                            "  Processed {} / {} queries.",
-                            count.separate_with_underscores(),
-                            n_queries.separate_with_underscores()
-                        );
-                    }
-                }
-                index.query_row_reranking(query_mat.row(i), k, nprobe, rerank_factor)
-            })
-            .collect();
-
-        if return_dist {
-            let (indices, distances) = results.into_iter().unzip();
-            (indices, Some(distances))
-        } else {
-            let indices: Vec<Vec<usize>> = results.into_iter().map(|(idx, _)| idx).collect();
-            (indices, None)
-        }
+        query_parallel(query_mat.nrows(), return_dist, verbose, |i| {
+            index.query_row_reranking(query_mat.row(i), k, nprobe, rerank_factor)
+        })
     } else {
-        let results: Vec<(Vec<usize>, Vec<u32>)> = (0..n_queries)
-            .into_par_iter()
-            .map(|i| {
-                let query_vec: Vec<T> = query_mat.row(i).iter().cloned().collect();
-                if verbose {
-                    let count = counter.fetch_add(1, Ordering::Relaxed) + 1;
-                    if count.is_multiple_of(100_000) {
-                        println!(
-                            "  Processed {} / {} queries.",
-                            count.separate_with_underscores(),
-                            n_queries.separate_with_underscores()
-                        );
-                    }
-                }
-                index.query(&query_vec, k, nprobe)
+        let (indices, dist) = if index.use_asymmetric() {
+            query_parallel(query_mat.nrows(), return_dist, verbose, |i| {
+                index.query_row_asymmetric(query_mat.row(i), k, nprobe, rerank_factor)
             })
-            .collect();
-
-        if return_dist {
-            let (indices, distances): (Vec<Vec<usize>>, Vec<Vec<u32>>) =
-                results.into_iter().unzip();
-            let distances_converted: Vec<Vec<T>> = distances
-                .into_iter()
-                .map(|v| v.into_iter().map(|d| T::from_u32(d).unwrap()).collect())
-                .collect();
-            (indices, Some(distances_converted))
         } else {
-            let indices: Vec<Vec<usize>> = results.into_iter().map(|(idx, _)| idx).collect();
-            (indices, None)
-        }
+            let (indices, distances_u32) =
+                query_parallel(query_mat.nrows(), return_dist, verbose, |i| {
+                    index.query_row(query_mat.row(i), k, nprobe)
+                });
+            let distances_t = distances_u32.map(|dists| {
+                dists
+                    .into_iter()
+                    .map(|v| v.into_iter().map(|d| T::from_u32(d).unwrap()).collect())
+                    .collect()
+            });
+            (indices, distances_t)
+        };
+        (indices, dist)
     }
 }
 

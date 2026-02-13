@@ -466,7 +466,7 @@ fn parallel_lloyd<T>(
                     centroids[c * dim + d] = new_sums[c * dim + d] / count_t;
                 }
                 if matches!(metric, Dist::Cosine) {
-                    centroid_norms[c] = T::calculate_l1_norm(&centroids[c * dim..(c + 1) * dim]);
+                    centroid_norms[c] = T::calculate_l2_norm(&centroids[c * dim..(c + 1) * dim]);
                 }
             }
         }
@@ -519,7 +519,7 @@ where
 {
     let data_norms = if matches!(metric, Dist::Cosine) {
         (0..n)
-            .map(|i| T::calculate_l1_norm(&data[i * dim..(i + 1) * dim]))
+            .map(|i| T::calculate_l2_norm(&data[i * dim..(i + 1) * dim]))
             .collect()
     } else {
         vec![T::one(); n]
@@ -539,7 +539,7 @@ where
 
     let mut centroid_norms = if matches!(metric, Dist::Cosine) {
         (0..n_centroids)
-            .map(|i| T::calculate_l1_norm(&centroids[i * dim..(i + 1) * dim]))
+            .map(|i| T::calculate_l2_norm(&centroids[i * dim..(i + 1) * dim]))
             .collect()
     } else {
         vec![T::one(); n_centroids]

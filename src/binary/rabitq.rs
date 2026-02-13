@@ -8,7 +8,7 @@ use rand_distr::StandardNormal;
 use std::iter::Sum;
 
 use crate::binary::dist_binary::*;
-use crate::utils::dist::*;
+use crate::prelude::*;
 use crate::utils::ivf_utils::*;
 
 /////////////

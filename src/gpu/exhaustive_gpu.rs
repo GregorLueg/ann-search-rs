@@ -6,7 +6,7 @@ use std::iter::Sum;
 
 use crate::gpu::dist_gpu::*;
 use crate::gpu::*;
-use crate::utils::dist::*;
+use crate::prelude::*;
 use crate::utils::*;
 
 ////////////////////////

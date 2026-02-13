@@ -13,7 +13,7 @@ use thousands::Separable;
 use crate::binary::binariser::*;
 use crate::binary::dist_binary::*;
 use crate::binary::vec_store::*;
-use crate::utils::dist::*;
+use crate::prelude::*;
 use crate::utils::ivf_utils::*;
 use crate::utils::*;
 
@@ -39,6 +39,7 @@ pub struct IvfIndexBinary<T> {
     pub n: usize,
     pub dim: usize,
     metric: Dist,
+    binarisation_type: BinarisationInit,
     binariser: Binariser<T>,
     centroids_float: Vec<T>,
     centroids_norm: Vec<T>,
@@ -172,11 +173,7 @@ where
                 .map(|i| {
                     let start = i * dim;
                     let end = start + dim;
-                    centroids_float[start..end]
-                        .iter()
-                        .map(|x| *x * *x)
-                        .fold(T::zero(), |a, b| a + b)
-                        .sqrt()
+                    T::calculate_l2_norm(&centroids_float[start..end])
                 })
                 .collect()
         } else {
@@ -189,11 +186,7 @@ where
                 .map(|i| {
                     let start = i * dim;
                     let end = start + dim;
-                    vectors_flat[start..end]
-                        .iter()
-                        .map(|x| *x * *x)
-                        .fold(T::zero(), |a, b| a + b)
-                        .sqrt()
+                    T::calculate_l2_norm(&vectors_flat[start..end])
                 })
                 .collect()
         } else {
@@ -221,8 +214,9 @@ where
         // 5. initialise binariser and encode all vectors
         let init = parse_binarisation_init(binarisation_init).unwrap_or_default();
         let binariser = match init {
-            BinarisationInit::ITQ => Binariser::initialise_with_pca(data, dim, n_bits, seed),
-            BinarisationInit::RandomProjections => Binariser::new(dim, n_bits, seed),
+            BinarisationInit::Itq => Binariser::new_itq(data, dim, n_bits, seed),
+            BinarisationInit::RandomProjections => Binariser::new_simhash(dim, n_bits, seed),
+            BinarisationInit::SignBased => Binariser::new_sign_based(dim),
         };
 
         let mut vectors_flat_binarised: Vec<u8> = Vec::with_capacity(n * n_bytes);
@@ -237,6 +231,7 @@ where
             n,
             dim,
             binariser,
+            binarisation_type: init,
             centroids_float,
             centroids_norm,
             metric,
@@ -374,8 +369,9 @@ where
         // 5. initialise binariser and encode all vectors
         let init = parse_binarisation_init(binarisation_init).unwrap_or_default();
         let binariser = match init {
-            BinarisationInit::ITQ => Binariser::initialise_with_pca(data, dim, n_bits, seed),
-            BinarisationInit::RandomProjections => Binariser::new(dim, n_bits, seed),
+            BinarisationInit::Itq => Binariser::new_itq(data, dim, n_bits, seed),
+            BinarisationInit::RandomProjections => Binariser::new_simhash(dim, n_bits, seed),
+            BinarisationInit::SignBased => Binariser::new_sign_based(dim),
         };
 
         let mut vectors_flat_binarised: Vec<u8> = Vec::with_capacity(n * n_bytes);
@@ -410,6 +406,7 @@ where
             n,
             dim,
             binariser,
+            binarisation_type: init,
             centroids_float,
             centroids_norm,
             metric,
@@ -433,7 +430,7 @@ where
     ///
     /// * `query_vec` - Query vector in float space
     /// * `k` - Number of neighbours to return
-    /// * `nprobe` - Number of clusters to search (defaults to sqrt(nlist))
+    /// * `nprobe` - Number of clusters to search (defaults to `sqrt(nlist)`)
     ///
     /// ### Returns
     ///
@@ -453,11 +450,7 @@ where
         let query_binary = self.binariser.encode(query_vec);
 
         let query_norm = if matches!(self.metric, Dist::Cosine) {
-            query_vec
-                .iter()
-                .map(|&v| v * v)
-                .fold(T::zero(), |a, b| a + b)
-                .sqrt()
+            T::calculate_l2_norm(query_vec)
         } else {
             T::one()
         };
@@ -494,11 +487,13 @@ where
 
     /// Query using row reference
     ///
+    /// Uses optimised paths if the query row is contiguous in memory.
+    ///
     /// ### Params
     ///
     /// * `query_row` - Query row reference
     /// * `k` - Number of neighbours to return
-    /// * `nprobe` - Number of clusters to search
+    /// * `nprobe` - Number of clusters to search (defaults to `sqrt(nlist)`)
     ///
     /// ### Returns
     ///
@@ -520,17 +515,118 @@ where
         self.query(&query_vec, k, nprobe)
     }
 
+    /// Query function for asymmetric querying
+    ///
+    /// This function will first calculate the Hamming distance between the
+    /// query vector and the binary codes (leveraging the Voronoi cells) and
+    /// then do an additional asymmetric dot product distance calculation
+    /// between the query vector and the binary codes of the candidates.
+    ///
+    /// ### Params
+    ///
+    /// * `query_vec` - Query vector (will be binarised internally)
+    /// * `k` - Number of nearest neighbours to return
+    /// * `nprobe` - Number of clusters to search (defaults to `sqrt(nlist)`)
+    /// * `rerank_factor` - Multiplier for candidate set size (searches k *
+    ///   rerank_factor candidates). If not supplied, defaults to `20`.
+    ///
+    /// ### Returns
+    ///
+    /// Tuple of `(indices, distances)` where distances are Hamming distances
+    ///
+    /// ### Panic
+    ///
+    /// Panics if the binarisation type is not sign-based.
+    #[inline]
+    pub fn query_asymmetric(
+        &self,
+        query_vec: &[T],
+        k: usize,
+        nprobe: Option<usize>,
+        rerank_factor: Option<usize>,
+    ) -> (Vec<usize>, Vec<T>) {
+        assert!(
+            self.use_asymmetric(),
+            "Only sign-based binarisation is supported for asymmetric queries."
+        );
+        let rerank_factor = rerank_factor.unwrap_or(20);
+
+        let (candidates, _) = self.query(query_vec, k * rerank_factor, nprobe);
+
+        let mut scored: Vec<(usize, T)> = candidates
+            .iter()
+            .map(|&idx| {
+                let start_i = idx * self.n_bytes;
+                let vec_i = unsafe {
+                    self.vectors_flat_binarised
+                        .get_unchecked(start_i..start_i + self.n_bytes)
+                };
+
+                let dist_i = asymmetric_binary_dot(query_vec, vec_i, self.dim);
+                (idx, dist_i)
+            })
+            .collect();
+
+        scored.sort_unstable_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+        scored.truncate(k);
+
+        let mut indices: Vec<usize> = Vec::with_capacity(k);
+        let mut dists: Vec<T> = Vec::with_capacity(k);
+
+        for (idx, dist) in scored {
+            indices.push(idx);
+            dists.push(dist);
+        }
+
+        (indices, dists)
+    }
+
+    /// Query using row reference (asymmetric)
+    ///
+    /// Uses optimised paths if the query row is contiguous in memory.
+    ///
+    /// ### Params
+    ///
+    /// * `query_row` - Query row reference
+    /// * `k` - Number of neighbours to return
+    /// * `nprobe` - Number of clusters to search (defaults to `sqrt(nlist)`)
+    ///
+    /// ### Returns
+    ///
+    /// Tuple of `(indices, distances)`
+    #[inline]
+    pub fn query_row_asymmetric(
+        &self,
+        query_row: RowRef<T>,
+        k: usize,
+        nprobe: Option<usize>,
+        rerank_factor: Option<usize>,
+    ) -> (Vec<usize>, Vec<T>) {
+        if query_row.col_stride() == 1 {
+            let slice =
+                unsafe { std::slice::from_raw_parts(query_row.as_ptr(), query_row.ncols()) };
+            return self.query_asymmetric(slice, k, nprobe, rerank_factor);
+        }
+
+        let query_vec: Vec<T> = query_row.iter().cloned().collect();
+        self.query_asymmetric(&query_vec, k, nprobe, rerank_factor)
+    }
+
     /// Query with reranking using exact distances
     ///
-    /// Three-stage search: IVF routing to clusters, Hamming distance to find candidates,
-    /// then exact distance for final ranking. Requires vector_store to be available.
+    /// Three-stage search: IVF routing to clusters, Hamming distance to find
+    /// candidates, then exact distance for final ranking. Requires
+    /// vector_store to be available. If the binarisation type is sign-based,
+    /// asymmetric dot product calculations are used between the Hamming
+    /// distance and the exact distance step.
     ///
     /// ### Params
     ///
     /// * `query_vec` - Query vector
     /// * `k` - Number of nearest neighbours to return
     /// * `nprobe` - Number of clusters to search (defaults to sqrt(nlist))
-    /// * `rerank_factor` - Multiplier for candidate set size (searches k * rerank_factor candidates)
+    /// * `rerank_factor` - Multiplier for candidate set size (searches k *
+    ///   rerank_factor candidates). If not supplied, defaults to `20`.
     ///
     /// ### Returns
     ///
@@ -549,14 +645,16 @@ where
             .expect("Vector store required for reranking - use build_with_vector_store()");
         let rerank_factor = rerank_factor.unwrap_or(20);
 
-        let (candidates, _) = self.query(query_vec, k * rerank_factor, nprobe);
+        let candidates = if matches!(self.binarisation_type, BinarisationInit::SignBased) {
+            let (idx, _) = self.query_asymmetric(query_vec, k, nprobe, Some(2 * rerank_factor));
+            idx
+        } else {
+            let (idx, _) = self.query(query_vec, k * rerank_factor, nprobe);
+            idx
+        };
 
         let query_norm = match self.metric {
-            Dist::Cosine => query_vec
-                .iter()
-                .map(|&x| x * x)
-                .fold(T::zero(), |a, b| a + b)
-                .sqrt(),
+            Dist::Cosine => T::calculate_l2_norm(query_vec),
             Dist::Euclidean => T::one(),
         };
 
@@ -753,6 +851,15 @@ where
             + self.centroids_norm.capacity() * std::mem::size_of::<T>()
             + self.all_indices.capacity() * std::mem::size_of::<usize>()
             + self.offsets.capacity() * std::mem::size_of::<usize>()
+    }
+
+    /// Returns whether the index supports asymmetric queries
+    ///
+    /// ### Returns
+    ///
+    /// True if yes
+    pub fn use_asymmetric(&self) -> bool {
+        matches!(self.binarisation_type, BinarisationInit::SignBased)
     }
 }
 

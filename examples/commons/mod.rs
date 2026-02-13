@@ -166,7 +166,8 @@ where
     (data, cluster_assignments)
 }
 
-/// Generate synthetic single-cell-like data with cluster structure and correlated dimensions
+/// Generate synthetic single-cell-like data with cluster structure and
+/// correlated dimensions
 ///
 /// Creates well-separated clusters with subspace structure plus inter-dimension
 /// correlations that OPQ can exploit.
@@ -176,7 +177,8 @@ where
 /// * `n_samples` - Number of cells (samples)
 /// * `dim` - Embedding dimensionality
 /// * `n_clusters` - Number of distinct clusters
-/// * `correlation_strength` - How strongly correlated dims depend on source dims (0.0-1.0)
+/// * `correlation_strength` - How strongly correlated dims depend on source
+///   dims (0.0-1.0)
 /// * `seed` - Random seed for reproducibility
 ///
 /// ### Returns

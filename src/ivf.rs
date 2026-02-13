@@ -6,8 +6,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use thousands::Separable;
 
-use crate::utils::dist::*;
-use crate::utils::heap_structs::*;
+use crate::prelude::*;
 use crate::utils::ivf_utils::*;
 use crate::utils::*;
 

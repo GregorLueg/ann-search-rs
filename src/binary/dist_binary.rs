@@ -1,17 +1,16 @@
 #![allow(dead_code)]
 
 use num_traits::{Float, FromPrimitive};
+use wide::u8x16;
 
 use crate::binary::rabitq::*;
 #[allow(unused_imports)]
-use crate::utils::dist::*;
+use crate::prelude::*;
 
 #[cfg(target_arch = "aarch64")]
 use std::arch::aarch64::*;
 #[cfg(target_arch = "x86_64")]
 use std::arch::x86_64::*;
-
-use wide::u8x16;
 
 ////////////////////
 // VectorDistance //
@@ -282,6 +281,42 @@ pub trait VectorDistanceBinary {
             hamming_simd(vec_i, query)
         }
     }
+}
+
+/// Asymmetric dot product: query (float) vs binary vector
+///
+/// Computes dot(query_float, 2*binary-1) where binary is unpacked to `{-1, +1} `
+/// from bit representation.
+///
+/// ### Params
+///
+/// * `query_vec` - Float query vector
+/// * `binary_code` - Packed binary code (bit-packed u8 array)
+/// * `dim` - Vector dimensionality (number of bits to unpack)
+///
+/// ### Returns
+///
+/// Dot product score (higher = more similar)
+#[inline]
+pub fn asymmetric_binary_dot<T>(query_vec: &[T], binary_code: &[u8], dim: usize) -> T
+where
+    T: Float + FromPrimitive + SimdDistance,
+{
+    assert_eq!(query_vec.len(), dim);
+
+    let mut unpacked = Vec::with_capacity(dim);
+
+    for bit_idx in 0..dim {
+        let byte_idx = bit_idx / 8;
+        let bit_pos = bit_idx % 8;
+        let bit = (binary_code[byte_idx] >> bit_pos) & 1;
+
+        // Transform: bit ∈ {0,1} → value ∈ {-1,+1}
+        let val = T::from_f64(2.0 * bit as f64 - 1.0).unwrap();
+        unpacked.push(val);
+    }
+
+    T::dot_simd(query_vec, &unpacked)
 }
 
 //////////////////////////
