@@ -12,8 +12,7 @@ use rustc_hash::FxHashSet;
 use std::collections::BinaryHeap;
 use std::iter::Sum;
 
-use crate::utils::dist::*;
-use crate::utils::heap_structs::*;
+use crate::prelude::*;
 
 /////////////
 // Helpers //

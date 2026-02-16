@@ -1,13 +1,13 @@
-## Binarised indices benchmarks and parameter 
+## Binarised indices benchmarks and parameter
 
 Binarised indices compress the data stored in the index structure itself via
 very aggressive quantisation to basically only bits. This has two impacts:
 
 1. Drastic reduction in memory usage.
-2. Increased query speed in most cases because the bit-wise operations are very
+2. Increased query speed in most cases as the bit-wise operations are very
 fast.
-3. When not using any re-ranking of the top candidates, dramatically lower
-Recall.
+3. However, when not using any re-ranking of the top candidates, dramatically
+lower recall (less so for RaBitQ).
 
 These indices can be nonetheless quite useful in memory-constrained scenarios.
 In both cases, there is an option to do re-ranking against the original vectors.
@@ -15,7 +15,7 @@ However, these are stored on disk and accessed via rapid access. The benchmarks
 below show scenarios with and without re-ranking.
 
 ```bash
-cargo run --example gridsearch_binary --release --features binary 
+cargo run --example gridsearch_binary --release --features binary
 ```
 
 If you wish to run all of the benchmarks, below, you can just run:
@@ -36,21 +36,22 @@ benchmarked. Index size in memory is also provided.
 ### <u>Binary (IVF and exhaustive)</u>
 
 These indices uses binarisation via either SimHash or iterative quantisation
-via PCA rotations. They both have the option to use a VecStore that saves the 
-original data on disk for fast retrieval and re-ranking. This is recommended if 
-you wish to maintain some Recall. Generally speaking, these indices shine in 
+via PCA rotations. They both have the option to use a VecStore that saves the
+original data on disk for fast retrieval and re-ranking. This is recommended if
+you wish to maintain some Recall. Generally speaking, these indices shine in
 very high-dimensional data where memory requirements becomes very constraining.
 
 **Key parameters *(general)*:**
 
-- *n_bits*: Into how many bits to encode the data. The binariser has two 
+- *n_bits*: Into how many bits to encode the data. The binariser has two
   different options here to generate the bits (more on that later). As one
   can appreciate the higher the number, the better the Recall.
-- *binarisation_init*: Two options are provided in the crate. `"random"` that
-  generates random planes that are subsequently orthogonalised or a `"itq"` that
-  leverages PCA to identify axis of maximum variation. As can seen below the
-  latter however does not perform with few dimensions. In this case, `"random"`
-  is a better choice. 
+- *binarisation_init*: Three options are provided in the crate. `"random"` that
+  generates random planes that are subsequently orthogonalised, `"itq"` that
+  leverages PCA to identify axis of maximum variation or `"signed"` that just
+  uses the sign of the respective embedding dimensions. In this case, `n_bits`
+  is set automatically to `n_dim`. Signed only really makes sense if you have
+  a lot of dimensions; otherwise, the performance is not good (at all).
 - *reranking*: The Binary indices have the option to store the original vectors
   on disk. Once Hamming distance has been leveraged to identify the most
   interesting potential neighbours, the on-disk vectors are loaded in and the
@@ -63,7 +64,7 @@ very high-dimensional data where memory requirements becomes very constraining.
 
 - *Number of lists (nl)*: The number of independent k-means cluster to generate.
   If the structure of the data is unknown, people use `sqrt(n)` as a heuristic.
-- *Number of points (np)*: The number of clusters to probe during search. 
+- *Number of points (np)*: The number of clusters to probe during search.
   Numbers here tend to be `sqrt(nlist)` or up to 5% of the nlist.
 
 The self queries (i.e., kNN generation ) are done with `reranking_factor = 10`.
@@ -1585,7 +1586,7 @@ IVF-Binary-1024-nl547-itq (self)                      37_554.65     4_953.25    
 
 ### <u>RaBitQ (IVF and exhaustive)</u>
 
-[RaBitQ](https://arxiv.org/abs/2405.12497) is an incredibly powerful 
+[RaBitQ](https://arxiv.org/abs/2405.12497) is an incredibly powerful
 quantisation that combines strong compression with excellent Recalls (even
 without re-ranking). It works better on higher dimensions. In the case of the
 `ExhaustiveRaBitQ`, the quantiser itself generates a smaller number of centroids
@@ -1598,18 +1599,18 @@ distance calculation.
 **Key parameters *(RaBitQ)*:**
 
 - *reranking*: The RaBitQ indices have the option to store the original vectors
-  on disk. Once the RaBitQ-specific approximated distance has been leveraged to 
-  identify the most interesting potential neighbours, the on-disk vectors are 
-  loaded in and the results are re-ranked. A key parameter here is the 
-  reranking_factor, i.e., how many more vectors are reranked than the desired k. 
-  For example 10 means that `10 * k vectors` are scored and then re-ranked. The 
+  on disk. Once the RaBitQ-specific approximated distance has been leveraged to
+  identify the most interesting potential neighbours, the on-disk vectors are
+  loaded in and the results are re-ranked. A key parameter here is the
+  reranking_factor, i.e., how many more vectors are reranked than the desired k.
+  For example 10 means that `10 * k vectors` are scored and then re-ranked. The
   more candidates you allow here, the better the Recall.
 
 **Key parameters *(IVF-specific)*:**
 
 - *Number of lists (nl)*: The number of independent k-means cluster to generate.
   If the structure of the data is unknown, people use `sqrt(n)` as a heuristic.
-- *Number of points (np)*: The number of clusters to probe during search. 
+- *Number of points (np)*: The number of clusters to probe during search.
   Numbers here tend to be `sqrt(nlist)` or up to 5% of the nlist.
 
 #### With 32 dimensions

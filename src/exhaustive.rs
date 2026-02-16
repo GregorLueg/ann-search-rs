@@ -4,8 +4,7 @@ use rayon::prelude::*;
 use std::{collections::BinaryHeap, iter::Sum};
 use thousands::*;
 
-use crate::utils::dist::*;
-use crate::utils::heap_structs::*;
+use crate::prelude::*;
 use crate::utils::matrix_to_flat;
 
 /////////////////////

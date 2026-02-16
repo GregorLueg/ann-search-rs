@@ -28,7 +28,7 @@ dependencies = [
 
 [[package]]
 name = "ann-search-rs"
-version = "0.2.2"
+version = "0.2.4"
 dependencies = [
  "approx",
  "bytemuck",

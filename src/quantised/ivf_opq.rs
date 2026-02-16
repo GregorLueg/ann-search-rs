@@ -8,9 +8,8 @@ use std::sync::Arc;
 use std::{collections::BinaryHeap, iter::Sum};
 use thousands::*;
 
+use crate::prelude::*;
 use crate::quantised::quantisers::*;
-use crate::utils::dist::*;
-use crate::utils::heap_structs::*;
 use crate::utils::ivf_utils::*;
 use crate::utils::*;
 

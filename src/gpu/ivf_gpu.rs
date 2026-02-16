@@ -9,9 +9,8 @@ use thousands::*;
 use crate::gpu::dist_gpu::*;
 use crate::gpu::tensor::*;
 use crate::gpu::*;
+use crate::prelude::*;
 use crate::utils::dist::Dist;
-use crate::utils::dist::*;
-use crate::utils::heap_structs::*;
 use crate::utils::ivf_utils::*;
 use crate::utils::*;
 
