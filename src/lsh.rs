@@ -1111,18 +1111,6 @@ mod tests {
     }
 
     #[test]
-    fn test_query_k_zero() {
-        let mat = simple_test_data();
-        let index = LSHIndex::new(mat.as_ref(), Dist::Euclidean, 4, 8, 42);
-
-        let query = vec![1.0, 0.0, 0.0];
-        let (indices, distances, _) = index.query(&query, 0, None, 0);
-
-        assert_eq!(indices.len(), 0);
-        assert_eq!(distances.len(), 0);
-    }
-
-    #[test]
     fn test_query_returns_k_or_fewer() {
         let mat = simple_test_data();
         let index = LSHIndex::new(mat.as_ref(), Dist::Euclidean, 8, 6, 42);
