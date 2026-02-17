@@ -1,6 +1,6 @@
 use cubecl::prelude::*;
 use faer::MatRef;
-use num_traits::Float;
+use num_traits::{Float, FromPrimitive};
 use rayon::prelude::*;
 use std::iter::Sum;
 
@@ -37,12 +37,7 @@ pub struct ExhaustiveIndexGpu<T: Float, R: Runtime> {
 impl<T, R> ExhaustiveIndexGpu<T, R>
 where
     R: Runtime,
-    T: Float
-        + Sum
-        + cubecl::frontend::Float
-        + cubecl::CubeElement
-        + num_traits::FromPrimitive
-        + SimdDistance,
+    T: Float + Sum + cubecl::frontend::Float + cubecl::CubeElement + FromPrimitive + SimdDistance,
 {
     /// Generate a new exhaustive index (on the GPU)
     ///

@@ -1,11 +1,10 @@
 use faer::{MatRef, RowRef};
-use num_traits::{Float, FromPrimitive, ToPrimitive};
 use rayon::prelude::*;
+use std::collections::BinaryHeap;
 use std::ops::AddAssign;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
-use std::{collections::BinaryHeap, iter::Sum};
 use thousands::*;
 
 use crate::prelude::*;
@@ -36,7 +35,7 @@ pub struct ExhaustiveOpqIndex<T> {
 
 impl<T> VectorDistanceAdc<T> for ExhaustiveOpqIndex<T>
 where
-    T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum + AddAssign + SimdDistance,
+    T: AnnSearchFloat + AddAssign + SimdDistance,
 {
     fn codebook_m(&self) -> usize {
         self.codebook.m()
@@ -73,7 +72,7 @@ where
 
 impl<T> ExhaustiveOpqIndex<T>
 where
-    T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum + SimdDistance + AddAssign,
+    T: AnnSearchFloat + AddAssign,
 {
     /// Build an exhaustive product quantiser index
     ///

@@ -1,10 +1,8 @@
 use bytemuck::Pod;
 use faer::{MatRef, RowRef};
 use faer_traits::ComplexField;
-use num_traits::{Float, FromPrimitive, ToPrimitive};
 use rayon::prelude::*;
 use std::collections::BinaryHeap;
-use std::iter::Sum;
 use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -69,7 +67,7 @@ impl<T> VectorDistanceBinary for IvfIndexBinary<T> {
 
 impl<T> CentroidDistance<T> for IvfIndexBinary<T>
 where
-    T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum + SimdDistance,
+    T: AnnSearchFloat,
 {
     fn centroids(&self) -> &[T] {
         &self.centroids_float
@@ -94,7 +92,7 @@ where
 
 impl<T> IvfIndexBinary<T>
 where
-    T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum + ComplexField + SimdDistance + Pod,
+    T: AnnSearchFloat + ComplexField + Pod,
 {
     /// Build an IVF index with binary quantisation
     ///
@@ -871,6 +869,7 @@ where
 mod tests {
     use super::*;
     use faer::Mat;
+    use num_traits::{Float, FromPrimitive};
     use tempfile::TempDir;
 
     fn create_test_data<T: Float + FromPrimitive + ComplexField>(n: usize, dim: usize) -> Mat<T> {

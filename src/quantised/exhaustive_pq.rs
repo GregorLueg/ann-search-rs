@@ -1,10 +1,9 @@
 use faer::{MatRef, RowRef};
-use num_traits::{Float, FromPrimitive, ToPrimitive};
 use rayon::prelude::*;
+use std::collections::BinaryHeap;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
-use std::{collections::BinaryHeap, iter::Sum};
 use thousands::*;
 
 use crate::prelude::*;
@@ -35,7 +34,7 @@ pub struct ExhaustivePqIndex<T> {
 
 impl<T> VectorDistanceAdc<T> for ExhaustivePqIndex<T>
 where
-    T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum + SimdDistance,
+    T: AnnSearchFloat,
 {
     fn codebook_m(&self) -> usize {
         self.codebook.m()
@@ -72,7 +71,7 @@ where
 
 impl<T> ExhaustivePqIndex<T>
 where
-    T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum + SimdDistance,
+    T: AnnSearchFloat,
 {
     /// Build an exhaustive product quantiser index
     ///

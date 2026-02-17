@@ -38,8 +38,8 @@ bash ./examples/run_benchmarks.sh --standard
 ### Annoy
 
 Approximate nearest neighbours Oh Yeah. A tree-based method for vector searches.
-Fast index building and good query speed. The size of the index however 
-increases quite drastically the increased number of trees. 
+Fast index building and good query speed. The size of the index however
+increases quite drastically the increased number of trees.
 
 **Key parameters:**
 
@@ -232,14 +232,14 @@ Annoy-nt100 (self)                                       869.45     8_476.23    
 
 ### BallTree
 
-A metric tree data structure that partitions data points into nested 
-hyperspheres. Unlike Annoy, which relies on random projections, BallTree uses 
-the triangle inequality to prune the search space efficiently. This means 
+A metric tree data structure that partitions data points into nested
+hyperspheres. Unlike Annoy, which relies on random projections, BallTree uses
+the triangle inequality to prune the search space efficiently. This means
 instead of a forest it can just use a single tree.
 
 **Key parameters:**
 
-* *Search budget (s)*: The percentage of the total nodes/points to inspect 
+* *Search budget (s)*: The percentage of the total nodes/points to inspect
   during the query. If not provided, it will default to `5%`.
 
 Self is queried with the default search budget.
@@ -346,9 +346,9 @@ approximate indices limited memory finger print.
 **Key parameters:**
 
 - *M (m)*: The number of connections between layers
-- *EF construction (ef)*: The budget to generate good connections during 
+- *EF construction (ef)*: The budget to generate good connections during
   construction of the index.
-- *EF search (s)*: The budget for the search queries. 
+- *EF search (s)*: The budget for the search queries.
 
 Self is queried with `s=100`.
 
@@ -559,7 +559,7 @@ Very small index size in memory.
 
 - *Number of lists (nl)*: The number of independent k-means cluster to generate.
   If the structure of the data is unknown, people use `sqrt(n)` as a heuristic.
-- *Number of points (np)*: The number of clusters to probe during search. 
+- *Number of points (np)*: The number of clusters to probe during search.
   Numbers here tend to be `sqrt(nlist)` or up to 5% of the nlist.
 
 Self query was done with `2 * sqrt(nlist)`.
@@ -685,12 +685,15 @@ tables, the memory fingerprint does increase.
 
 **Key parameters:**
 
-- *Number of tables (nt)*: The number of independent hash tables to generate. 
+- *Number of tables (nt)*: The number of independent hash tables to generate.
   More tables improve recall at the cost of query time and memory.
-- *Number of bits (nb)*: The bit resolution of the hash functions. Higher values 
+- *Number of bits (nb)*: The bit resolution of the hash functions. Higher values
   create finer partitions but may reduce collision rates.
-- *Max candidates (s)*: The search budget limiting the number of candidates 
-  examined. Set to 'auto' for full search or a fixed value (e.g., 5k) for faster 
+- *Number probes (n)*: How many additional buckets to explore per given
+  hash table. A good heuristic tends to be `number of bits / 2` to
+  `number of bits`.
+- *Max candidates (s)*: The search budget limiting the number of candidates
+  examined. Set to 'auto' for full search or a fixed value (e.g., 5k) for faster
   queries with lower recall.
 
 <details>
@@ -926,7 +929,7 @@ The NNDescent implementation in this crate, heavily inspired by the amazing
 compromise between index building and fast querying. It's a great arounder
 that reaches easily performance of ≥0.98 Recalls@k neighbours. You can even
 heavily short cut the initialisation of the index with only 12 trees (instead
-of 32) and get in 4 seconds to a recall ≥0.9 (compared to 48 seconds for 
+of 32) and get in 4 seconds to a recall ≥0.9 (compared to 48 seconds for
 exhaustive search)!
 
 **Key parameters:**

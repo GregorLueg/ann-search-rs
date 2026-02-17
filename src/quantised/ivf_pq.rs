@@ -1,10 +1,9 @@
 use faer::{MatRef, RowRef};
-use num_traits::{Float, FromPrimitive, ToPrimitive};
 use rayon::prelude::*;
+use std::collections::BinaryHeap;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
-use std::{collections::BinaryHeap, iter::Sum};
 use thousands::*;
 
 use crate::prelude::*;
@@ -49,7 +48,7 @@ pub struct IvfPqIndex<T> {
 
 impl<T> CentroidDistance<T> for IvfPqIndex<T>
 where
-    T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum + SimdDistance,
+    T: AnnSearchFloat,
 {
     fn centroids(&self) -> &[T] {
         &self.centroids
@@ -78,7 +77,7 @@ where
 
 impl<T> VectorDistanceAdc<T> for IvfPqIndex<T>
 where
-    T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum + SimdDistance,
+    T: AnnSearchFloat,
 {
     fn codebook_m(&self) -> usize {
         self.codebook.m()
@@ -115,7 +114,7 @@ where
 
 impl<T> IvfPqIndex<T>
 where
-    T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum + SimdDistance,
+    T: AnnSearchFloat,
 {
     /// Build an IVF index with product quantisation
     ///
