@@ -48,8 +48,8 @@ impl<R: Runtime, F: Numeric + CubeElement> GpuTensor<R, F> {
     /// ### Returns
     ///
     /// A new GpuTensor with data copied to GPU memory
-    pub fn from_slice(data: &[F], shape: Vec<usize>, client: &ComputeClient<R::Server>) -> Self {
-        let handle = client.create(F::as_bytes(data));
+    pub fn from_slice(data: &[F], shape: Vec<usize>, client: &ComputeClient<R>) -> Self {
+        let handle = client.create_from_slice(F::as_bytes(data));
         let strides = compact_strides(&shape);
         Self {
             data: handle,
@@ -70,7 +70,7 @@ impl<R: Runtime, F: Numeric + CubeElement> GpuTensor<R, F> {
     /// ### Returns
     ///
     /// A new GpuTensor with allocated but uninitialised GPU memory
-    pub fn empty(shape: Vec<usize>, client: &ComputeClient<R::Server>) -> Self {
+    pub fn empty(shape: Vec<usize>, client: &ComputeClient<R>) -> Self {
         let size = shape.iter().product::<usize>() * core::mem::size_of::<F>();
         let handle = client.empty(size);
         let strides = compact_strides(&shape);
@@ -92,7 +92,7 @@ impl<R: Runtime, F: Numeric + CubeElement> GpuTensor<R, F> {
     /// ### Returns
     ///
     /// A TensorArg reference suitable for passing to CubeCL kernels
-    pub fn into_tensor_arg(&self, line_size: u8) -> TensorArg<'_, R> {
+    pub fn into_tensor_arg(&self, line_size: usize) -> TensorArg<'_, R> {
         unsafe { TensorArg::from_raw_parts::<F>(&self.data, &self.strides, &self.shape, line_size) }
     }
 
@@ -107,7 +107,7 @@ impl<R: Runtime, F: Numeric + CubeElement> GpuTensor<R, F> {
     /// ### Returns
     ///
     /// Vector containing the tensor data
-    pub fn read(self, client: &ComputeClient<R::Server>) -> Vec<F> {
+    pub fn read(self, client: &ComputeClient<R>) -> Vec<F> {
         let bytes = client.read_one(self.data);
         F::from_bytes(&bytes).to_vec()
     }
