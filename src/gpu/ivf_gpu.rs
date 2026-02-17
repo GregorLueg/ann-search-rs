@@ -146,13 +146,7 @@ where
         // assign vectors to clusters
         let data_norms = if metric == Dist::Cosine {
             (0..n)
-                .map(|i| {
-                    vectors_flat[i * dim..(i + 1) * dim]
-                        .iter()
-                        .map(|&x| x * x)
-                        .sum::<T>()
-                        .sqrt()
-                })
+                .map(|i| T::calculate_l2_norm(&vectors_flat[i * dim..(i + 1) * dim]))
                 .collect()
         } else {
             vec![T::one(); n]
@@ -160,13 +154,7 @@ where
 
         let centroid_norms = if metric == Dist::Cosine {
             (0..nlist)
-                .map(|i| {
-                    centroids[i * dim..(i + 1) * dim]
-                        .iter()
-                        .map(|&x| x * x)
-                        .sum::<T>()
-                        .sqrt()
-                })
+                .map(|i| T::calculate_l2_norm(&centroids[i * dim..(i + 1) * dim]))
                 .collect()
         } else {
             vec![T::one(); nlist]
@@ -268,7 +256,7 @@ where
         k: usize,
         nprobe: Option<usize>,
         nquery: Option<usize>,
-        client: &ComputeClient<<R as Runtime>::Server>,
+        client: &ComputeClient<R>,
         verbose: bool,
     ) -> (Vec<Vec<usize>>, Vec<Vec<T>>) {
         assert_eq!(
@@ -349,7 +337,7 @@ where
         verbose: bool,
     ) -> (Vec<Vec<usize>>, Vec<Vec<T>>) {
         let (queries_flat, n_queries, dim_query) = matrix_to_flat(query_mat);
-        let client: ComputeClient<<R as Runtime>::Server> = R::client(&self.device);
+        let client: ComputeClient<R> = R::client(&self.device);
 
         let nprobe_val = nprobe.unwrap_or(((self.nlist as f32).sqrt() as usize).max(1));
 
@@ -395,7 +383,7 @@ where
         return_dist: bool,
         verbose: bool,
     ) -> (Vec<Vec<usize>>, Option<Vec<Vec<T>>>) {
-        let client: ComputeClient<<R as Runtime>::Server> = R::client(&self.device);
+        let client: ComputeClient<R> = R::client(&self.device);
 
         // 1. Determine parameters
         let nprobe = nprobe.unwrap_or(((self.nlist as f32).sqrt() as usize).max(1));
@@ -499,21 +487,17 @@ where
         k: usize,
         nprobe: usize,
         verbose: bool,
-        client: &ComputeClient<<R as Runtime>::Server>,
+        client: &ComputeClient<R>,
     ) -> (Vec<Vec<usize>>, Vec<Vec<T>>) {
         let dim_vectorized = self.dim / LINE_SIZE as usize;
-        let vec_size = LINE_SIZE as u8;
+        let vec_size = LINE_SIZE as usize;
 
         let query_norms = if self.metric == Dist::Cosine {
             (0..n_queries)
                 .into_par_iter()
                 .map(|i| {
                     let start = i * self.dim;
-                    queries_flat[start..start + self.dim]
-                        .iter()
-                        .map(|&x| x * x)
-                        .sum::<T>()
-                        .sqrt()
+                    T::calculate_l2_norm(&queries_flat[start..start + self.dim])
                 })
                 .collect::<Vec<_>>()
         } else {
@@ -540,20 +524,20 @@ where
 
         match self.metric {
             Dist::Euclidean => unsafe {
-                euclidean_distances_gpu_chunk::launch_unchecked::<T, R>(
+                let _ = euclidean_distances_gpu_chunk::launch_unchecked::<T, R>(
                     client,
                     CubeCount::Static(grid_x, grid_y, 1),
-                    CubeDim::new(WORKGROUP_SIZE_X, WORKGROUP_SIZE_Y, 1),
+                    CubeDim::new_2d(WORKGROUP_SIZE_X, WORKGROUP_SIZE_Y),
                     queries_gpu.clone().into_tensor_arg(vec_size),
                     self.centroids_gpu.clone().into_tensor_arg(vec_size),
                     centroid_dists_gpu.into_tensor_arg(1),
                 );
             },
             Dist::Cosine => unsafe {
-                cosine_distances_gpu_chunk::launch_unchecked::<T, R>(
+                let _ = cosine_distances_gpu_chunk::launch_unchecked::<T, R>(
                     client,
                     CubeCount::Static(grid_x, grid_y, 1),
-                    CubeDim::new(WORKGROUP_SIZE_X, WORKGROUP_SIZE_Y, 1),
+                    CubeDim::new_2d(WORKGROUP_SIZE_X, WORKGROUP_SIZE_Y),
                     queries_gpu.clone().into_tensor_arg(vec_size),
                     self.centroids_gpu.clone().into_tensor_arg(vec_size),
                     query_norms_gpu.as_ref().unwrap().clone().into_tensor_arg(1),
@@ -663,10 +647,10 @@ where
             // Launch Kernel
             match self.metric {
                 Dist::Euclidean => unsafe {
-                    compute_candidates_euclidean::launch_unchecked::<T, R>(
+                    let _ = compute_candidates_euclidean::launch_unchecked::<T, R>(
                         client,
                         CubeCount::Static(grid_x, grid_y, 1),
-                        CubeDim::new(WORKGROUP_SIZE_X, WORKGROUP_SIZE_Y, 1),
+                        CubeDim::new_2d(WORKGROUP_SIZE_X, WORKGROUP_SIZE_Y),
                         queries_gpu.clone().into_tensor_arg(vec_size),
                         self.vectors_gpu.clone().into_tensor_arg(vec_size),
                         active_indices_gpu.into_tensor_arg(1),
@@ -682,10 +666,10 @@ where
                     );
                 },
                 Dist::Cosine => unsafe {
-                    compute_candidates_cosine::launch_unchecked::<T, R>(
+                    let _ = compute_candidates_cosine::launch_unchecked::<T, R>(
                         client,
                         CubeCount::Static(grid_x, grid_y, 1),
-                        CubeDim::new(WORKGROUP_SIZE_X, WORKGROUP_SIZE_Y, 1),
+                        CubeDim::new_2d(WORKGROUP_SIZE_X, WORKGROUP_SIZE_Y),
                         queries_gpu.clone().into_tensor_arg(vec_size),
                         self.vectors_gpu.clone().into_tensor_arg(vec_size),
                         query_norms_gpu.as_ref().unwrap().clone().into_tensor_arg(1),

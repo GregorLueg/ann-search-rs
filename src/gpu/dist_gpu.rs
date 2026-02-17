@@ -31,27 +31,22 @@ pub fn euclidean_distances_gpu_chunk<F: Float>(
     db_chunk: &Tensor<Line<F>>,
     distances: &mut Tensor<F>,
 ) {
-    let query_idx = ABSOLUTE_POS_Y;
-    let db_idx = ABSOLUTE_POS_X;
+    let query_idx = ABSOLUTE_POS_Y as usize;
+    let db_idx = ABSOLUTE_POS_X as usize;
 
     if query_idx < query_vectors.shape(0) && db_idx < db_chunk.shape(0) {
         let dim_lines = query_vectors.shape(1);
-
         let mut sum = F::new(0.0);
-
         for i in 0..dim_lines {
             let q_line = query_vectors[query_idx * query_vectors.stride(0) + i];
             let d_line = db_chunk[db_idx * db_chunk.stride(0) + i];
             let diff = q_line - d_line;
             let sq = diff * diff;
-
-            // Manual unroll for LINE_SIZE = 4
             sum += sq[0];
             sum += sq[1];
             sum += sq[2];
             sum += sq[3];
         }
-
         distances[query_idx * distances.stride(0) + db_idx] = sum;
     }
 }
@@ -82,8 +77,8 @@ pub fn cosine_distances_gpu_chunk<F: Float>(
     db_norms: &Tensor<F>,
     distances: &mut Tensor<F>,
 ) {
-    let query_idx = ABSOLUTE_POS_Y;
-    let db_idx = ABSOLUTE_POS_X;
+    let query_idx = ABSOLUTE_POS_Y as usize;
+    let db_idx = ABSOLUTE_POS_X as usize;
 
     if query_idx < query_vectors.shape(0) && db_idx < db_chunk.shape(0) {
         let dim_lines = query_vectors.shape(1);
@@ -131,7 +126,7 @@ pub fn extract_topk<F: Float>(
     out_indices: &mut Tensor<u32>,
     chunk_offset: u32,
 ) {
-    let query_idx = ABSOLUTE_POS_X;
+    let query_idx = ABSOLUTE_POS_X as usize;
 
     if query_idx >= distances.shape(0) {
         terminate!();
@@ -148,7 +143,7 @@ pub fn extract_topk<F: Float>(
         // Only process if better than current worst
         if dist < out_dists[out_offset + k - 1] {
             // Find insertion point (first position where dist < current)
-            let mut insert_pos: u32 = k - 1;
+            let mut insert_pos: usize = k - 1;
             for j in 0..k {
                 if dist < out_dists[out_offset + j] && insert_pos == k - 1 {
                     insert_pos = j;
@@ -167,7 +162,7 @@ pub fn extract_topk<F: Float>(
 
             // Insert
             out_dists[out_offset + insert_pos] = dist;
-            out_indices[out_offset + insert_pos] = chunk_offset + i;
+            out_indices[out_offset + insert_pos] = chunk_offset + i as u32;
         }
     }
 }
@@ -189,8 +184,8 @@ pub fn merge_topk<F: Float>(
     out_dists: &mut Tensor<F>,
     out_indices: &mut Tensor<u32>,
 ) {
-    let query_idx = ABSOLUTE_POS_X;
-    let k = dists_a.shape(1);
+    let query_idx = ABSOLUTE_POS_X as usize;
+    let k = dists_a.shape(1) as usize;
 
     if query_idx >= dists_a.shape(0) {
         terminate!();
@@ -200,8 +195,8 @@ pub fn merge_topk<F: Float>(
     let offset_b = query_idx * dists_b.stride(0);
     let offset_out = query_idx * out_dists.stride(0);
 
-    let mut ptr_a: u32 = 0;
-    let mut ptr_b: u32 = 0;
+    let mut ptr_a: usize = 0;
+    let mut ptr_b: usize = 0;
 
     for out_idx in 0..k {
         let a_valid = ptr_a < k;
@@ -227,9 +222,9 @@ pub fn merge_topk<F: Float>(
 /// Initialise top-k tensors with MAX distance values
 #[cube(launch_unchecked)]
 pub fn init_topk<F: Float>(dists: &mut Tensor<F>, indices: &mut Tensor<u32>) {
-    let query_idx = ABSOLUTE_POS_Y;
-    let k_idx = ABSOLUTE_POS_X;
-    let k = dists.shape(1);
+    let query_idx = ABSOLUTE_POS_Y as usize;
+    let k_idx = ABSOLUTE_POS_X as usize;
+    let k = dists.shape(1) as usize;
 
     if query_idx >= dists.shape(0) || k_idx >= k {
         terminate!();
@@ -286,19 +281,19 @@ pub fn compute_candidates_euclidean<F: Float>(
     let local_db_idx = ABSOLUTE_POS_X;
     let active_q_idx = ABSOLUTE_POS_Y;
 
-    if active_q_idx >= active_indices.len() || local_db_idx >= db_count {
+    if active_q_idx >= active_indices.len() as u32 || local_db_idx >= db_count {
         terminate!();
     }
 
-    let real_q_idx = active_indices[active_q_idx];
-    let write_pos = write_offsets[active_q_idx] + local_db_idx;
+    let real_q_idx = active_indices[active_q_idx as usize];
+    let write_pos = write_offsets[active_q_idx as usize] + local_db_idx;
     let db_idx = db_start + local_db_idx;
 
     let dim_lines = query_vectors.shape(1);
     let mut sum = F::new(0.0);
 
-    let q_offset = real_q_idx * query_vectors.stride(0);
-    let d_offset = db_idx * db_vectors.stride(0);
+    let q_offset = real_q_idx as usize * query_vectors.stride(0);
+    let d_offset = db_idx as usize * db_vectors.stride(0);
 
     for i in 0..dim_lines {
         let q_line = query_vectors[q_offset + i];
@@ -312,7 +307,7 @@ pub fn compute_candidates_euclidean<F: Float>(
         sum += sq[3];
     }
 
-    let out_offset = real_q_idx * out_dists.stride(0) + write_pos;
+    let out_offset = real_q_idx as usize * out_dists.stride(0) + write_pos as usize;
 
     out_dists[out_offset] = sum;
     out_indices[out_offset] = db_idx;
@@ -365,19 +360,19 @@ pub fn compute_candidates_cosine<F: Float>(
     let local_db_idx = ABSOLUTE_POS_X;
     let active_q_idx = ABSOLUTE_POS_Y;
 
-    if active_q_idx >= active_indices.len() || local_db_idx >= db_count {
+    if active_q_idx >= active_indices.len() as u32 || local_db_idx >= db_count {
         terminate!();
     }
 
-    let real_q_idx = active_indices[active_q_idx];
-    let write_pos = write_offsets[active_q_idx] + local_db_idx;
+    let real_q_idx = active_indices[active_q_idx as usize];
+    let write_pos = write_offsets[active_q_idx as usize] + local_db_idx;
     let db_idx = db_start + local_db_idx;
 
     let dim_lines = query_vectors.shape(1);
     let mut dot = F::new(0.0);
 
-    let q_offset = real_q_idx * query_vectors.stride(0);
-    let d_offset = db_idx * db_vectors.stride(0);
+    let q_offset = real_q_idx as usize * query_vectors.stride(0);
+    let d_offset = db_idx as usize * db_vectors.stride(0);
 
     for i in 0..dim_lines {
         let q_line = query_vectors[q_offset + i];
@@ -390,10 +385,10 @@ pub fn compute_candidates_cosine<F: Float>(
         dot += prod[3];
     }
 
-    let q_norm = query_norms[real_q_idx];
-    let d_norm = db_norms[db_idx];
+    let q_norm = query_norms[real_q_idx as usize];
+    let d_norm = db_norms[db_idx as usize];
 
-    let out_offset = real_q_idx * out_dists.stride(0) + write_pos;
+    let out_offset = real_q_idx as usize * out_dists.stride(0) + write_pos as usize;
 
     out_dists[out_offset] = F::new(1.0) - (dot / (q_norm * d_norm));
     out_indices[out_offset] = db_idx;
@@ -461,7 +456,7 @@ where
     T: Float + Sum + cubecl::CubeElement + num_traits::Float + num_traits::FromPrimitive,
 {
     let client = R::client(&device);
-    let vec_size = LINE_SIZE as u8;
+    let vec_size = LINE_SIZE as usize;
     let dim_vectorized = dim / LINE_SIZE as usize;
 
     let n_query_chunks = query_data.n.div_ceil(QUERY_CHUNK_SIZE);
@@ -508,10 +503,10 @@ where
         let init_grid_x = (k as u32).div_ceil(WORKGROUP_SIZE_X);
         let init_grid_y = (current_query_chunk_size as u32).div_ceil(WORKGROUP_SIZE_Y);
         unsafe {
-            init_topk::launch_unchecked::<T, R>(
+            let _ = init_topk::launch_unchecked::<T, R>(
                 &client,
                 CubeCount::Static(init_grid_x, init_grid_y, 1),
-                CubeDim::new(WORKGROUP_SIZE_X, WORKGROUP_SIZE_Y, 1),
+                CubeDim::new_2d(WORKGROUP_SIZE_X, WORKGROUP_SIZE_Y),
                 topk_dists.clone().into_tensor_arg(1),
                 topk_indices.clone().into_tensor_arg(1),
             );
@@ -547,10 +542,10 @@ where
             // 1. Compute distances
             match *metric {
                 Dist::Euclidean => unsafe {
-                    euclidean_distances_gpu_chunk::launch_unchecked::<T, R>(
+                    let _ = euclidean_distances_gpu_chunk::launch_unchecked::<T, R>(
                         &client,
                         CubeCount::Static(grid_x, grid_y, 1),
-                        CubeDim::new(WORKGROUP_SIZE_X, WORKGROUP_SIZE_Y, 1),
+                        CubeDim::new_2d(WORKGROUP_SIZE_X, WORKGROUP_SIZE_Y),
                         query_gpu.clone().into_tensor_arg(vec_size),
                         db_gpu.into_tensor_arg(vec_size),
                         distances_gpu.clone().into_tensor_arg(1),
@@ -563,10 +558,10 @@ where
                         &client,
                     );
                     unsafe {
-                        cosine_distances_gpu_chunk::launch_unchecked::<T, R>(
+                        let _ = cosine_distances_gpu_chunk::launch_unchecked::<T, R>(
                             &client,
                             CubeCount::Static(grid_x, grid_y, 1),
-                            CubeDim::new(WORKGROUP_SIZE_X, WORKGROUP_SIZE_Y, 1),
+                            CubeDim::new_2d(WORKGROUP_SIZE_X, WORKGROUP_SIZE_Y),
                             query_gpu.clone().into_tensor_arg(vec_size),
                             db_gpu.into_tensor_arg(vec_size),
                             query_norms_gpu.as_ref().unwrap().clone().into_tensor_arg(1),
@@ -579,10 +574,10 @@ where
 
             // 2. Init chunk top-k
             unsafe {
-                init_topk::launch_unchecked::<T, R>(
+                let _ = init_topk::launch_unchecked::<T, R>(
                     &client,
                     CubeCount::Static(init_grid_x, init_grid_y, 1),
-                    CubeDim::new(WORKGROUP_SIZE_X, WORKGROUP_SIZE_Y, 1),
+                    CubeDim::new_2d(WORKGROUP_SIZE_X, WORKGROUP_SIZE_Y),
                     chunk_topk_dists.clone().into_tensor_arg(1),
                     chunk_topk_indices.clone().into_tensor_arg(1),
                 );
@@ -591,10 +586,10 @@ where
             // 3. Extract top-k from this chunk's distances
             let extract_grid = (current_query_chunk_size as u32).div_ceil(WORKGROUP_SIZE_X);
             unsafe {
-                extract_topk::launch_unchecked::<T, R>(
+                let _ = extract_topk::launch_unchecked::<T, R>(
                     &client,
                     CubeCount::Static(extract_grid, 1, 1),
-                    CubeDim::new(WORKGROUP_SIZE_X, 1, 1),
+                    CubeDim::new_2d(WORKGROUP_SIZE_X, 1),
                     distances_gpu.clone().into_tensor_arg(1),
                     chunk_topk_dists.clone().into_tensor_arg(1),
                     chunk_topk_indices.clone().into_tensor_arg(1),
@@ -606,10 +601,10 @@ where
 
             // 4. Merge with running top-k
             unsafe {
-                merge_topk::launch_unchecked::<T, R>(
+                let _ = merge_topk::launch_unchecked::<T, R>(
                     &client,
                     CubeCount::Static(extract_grid, 1, 1),
-                    CubeDim::new(WORKGROUP_SIZE_X, 1, 1),
+                    CubeDim::new_2d(WORKGROUP_SIZE_X, 1),
                     topk_dists.clone().into_tensor_arg(1),
                     topk_indices.clone().into_tensor_arg(1),
                     chunk_topk_dists.clone().into_tensor_arg(1),

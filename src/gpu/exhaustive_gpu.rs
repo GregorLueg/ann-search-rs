@@ -120,11 +120,7 @@ where
                 .into_par_iter()
                 .map(|i| {
                     let start = i * self.dim;
-                    vectors_query[start..start + self.dim]
-                        .iter()
-                        .map(|&x| x * x)
-                        .sum::<T>()
-                        .sqrt()
+                    T::calculate_l2_norm(&vectors_query[start..start + self.dim])
                 })
                 .collect::<Vec<_>>()
         } else {
