@@ -5,7 +5,7 @@ edition = "2021"
 authors = ["Gregor Lueg <gregorlueg@me.com>"]
 license = "MIT"
 repository = "https://github.com/GregorLueg/ann-search-rs"
-description = "Various approximate nearest neighbour searches in Rust with emphasis for single cell applications."
+description = "Various vector search algorithms in Rust."
 
 [lib]
 name = "ann_search_rs"

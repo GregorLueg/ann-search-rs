@@ -1,10 +1,9 @@
 use bytemuck::Pod;
 use faer::{MatRef, RowRef};
 use faer_traits::ComplexField;
-use num_traits::{Float, FromPrimitive, ToPrimitive};
+use num_traits::{Float, FromPrimitive};
 use rayon::prelude::*;
 use std::collections::BinaryHeap;
-use std::iter::Sum;
 use std::path::Path;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
@@ -50,7 +49,7 @@ where
 
 impl<T> ExhaustiveIndexRaBitQ<T>
 where
-    T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum + ComplexField + SimdDistance + Pod,
+    T: AnnSearchFloat + ComplexField + SimdDistance + Pod,
 {
     /// Create a new exhaustive RaBitQ index
     ///

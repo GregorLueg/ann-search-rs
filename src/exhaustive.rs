@@ -1,7 +1,7 @@
 use faer::{MatRef, RowRef};
-use num_traits::{Float, FromPrimitive, ToPrimitive};
+
 use rayon::prelude::*;
-use std::{collections::BinaryHeap, iter::Sum};
+use std::collections::BinaryHeap;
 use thousands::*;
 
 use crate::prelude::*;
@@ -37,7 +37,7 @@ pub struct ExhaustiveIndex<T> {
 
 impl<T> VectorDistance<T> for ExhaustiveIndex<T>
 where
-    T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum + SimdDistance,
+    T: AnnSearchFloat,
 {
     fn vectors_flat(&self) -> &[T] {
         &self.vectors_flat
@@ -58,7 +58,7 @@ where
 
 impl<T> ExhaustiveIndex<T>
 where
-    T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum + SimdDistance,
+    T: AnnSearchFloat,
 {
     //////////////////////
     // Index generation //

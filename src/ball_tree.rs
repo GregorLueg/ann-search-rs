@@ -259,7 +259,7 @@ pub struct BallTreeIndex<T> {
 
 impl<T> VectorDistance<T> for BallTreeIndex<T>
 where
-    T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum + SimdDistance,
+    T: AnnSearchFloat,
 {
     fn vectors_flat(&self) -> &[T] {
         &self.vectors_flat
@@ -276,7 +276,7 @@ where
 
 impl<T> BallTreeIndex<T>
 where
-    T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum + SimdDistance,
+    T: AnnSearchFloat,
 {
     //////////////////////
     // Index generation //

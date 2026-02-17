@@ -1,10 +1,8 @@
 use bytemuck::Pod;
 use faer::{MatRef, RowRef};
 use faer_traits::ComplexField;
-use num_traits::{Float, FromPrimitive, ToPrimitive};
 use rayon::prelude::*;
 use std::collections::BinaryHeap;
-use std::iter::Sum;
 use std::path::Path;
 use thousands::*;
 
@@ -57,7 +55,7 @@ impl<T> VectorDistanceBinary for ExhaustiveIndexBinary<T> {
 
 impl<T> ExhaustiveIndexBinary<T>
 where
-    T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum + ComplexField + SimdDistance + Pod,
+    T: AnnSearchFloat + ComplexField + Pod,
 {
     /// Generate a new exhaustive binary index
     ///
@@ -597,6 +595,7 @@ where
 mod tests {
     use super::*;
     use faer::Mat;
+    use num_traits::{Float, FromPrimitive};
     use tempfile::TempDir;
 
     fn create_test_data<T: Float + FromPrimitive + ComplexField>(n: usize, dim: usize) -> Mat<T> {

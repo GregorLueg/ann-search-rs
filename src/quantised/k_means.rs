@@ -1,7 +1,7 @@
-use num_traits::{Float, FromPrimitive, ToPrimitive};
+use num_traits::Float;
 use rayon::prelude::*;
 
-use crate::utils::dist::SimdDistance;
+use crate::prelude::*;
 use crate::utils::ivf_utils::*;
 
 /////////////
@@ -152,7 +152,7 @@ fn mini_batch_lloyd_pq<T>(
     max_iters: usize,
     seed: usize,
 ) where
-    T: Float + FromPrimitive + ToPrimitive + Send + Sync + SimdDistance,
+    T: AnnSearchFloat,
 {
     let batch_size = MINI_BATCH_SIZE.min(n);
     let use_scalar = dim <= SCALAR_DIM_THRESHOLD;
@@ -225,7 +225,7 @@ fn full_lloyd_pq<T>(
     k: usize,
     max_iters: usize,
 ) where
-    T: Float + FromPrimitive + ToPrimitive + Send + Sync + SimdDistance,
+    T: AnnSearchFloat,
 {
     let use_scalar = dim <= SCALAR_DIM_THRESHOLD;
     let mut prev_assignments = vec![usize::MAX; n];
@@ -317,7 +317,7 @@ pub fn train_centroids_pq<T>(
     seed: usize,
 ) -> Vec<T>
 where
-    T: Float + FromPrimitive + ToPrimitive + Send + Sync + SimdDistance,
+    T: AnnSearchFloat,
 {
     let mut centroids = fast_random_init(data, dim, n, n_centroids, seed);
 

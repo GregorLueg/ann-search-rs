@@ -1,8 +1,7 @@
 use faer::{MatRef, RowRef};
-use num_traits::{Float, FromPrimitive, ToPrimitive};
 use rand::{rngs::StdRng, Rng, SeedableRng};
 use rayon::prelude::*;
-use std::{cmp::Ordering, collections::BinaryHeap, iter::Sum};
+use std::{cmp::Ordering, collections::BinaryHeap};
 use thousands::*;
 
 use crate::prelude::*;
@@ -95,7 +94,7 @@ pub struct AnnoyIndex<T> {
 
 impl<T> VectorDistance<T> for AnnoyIndex<T>
 where
-    T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum + SimdDistance,
+    T: AnnSearchFloat,
 {
     fn vectors_flat(&self) -> &[T] {
         &self.vectors_flat
@@ -112,7 +111,7 @@ where
 
 impl<T> AnnoyIndex<T>
 where
-    T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum + SimdDistance,
+    T: AnnSearchFloat,
 {
     //////////////////////
     // Index generation //
@@ -686,7 +685,7 @@ where
 
 impl<T> KnnValidation<T> for AnnoyIndex<T>
 where
-    T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum + SimdDistance,
+    T: AnnSearchFloat,
 {
     fn query_for_validation(&self, query_vec: &[T], k: usize) -> (Vec<usize>, Vec<T>) {
         // Use the default here

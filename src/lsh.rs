@@ -1,10 +1,10 @@
 use faer::{MatRef, RowRef};
-use num_traits::{Float, FromPrimitive, ToPrimitive};
+use num_traits::Float;
 use rand::{prelude::*, rng};
 use rand_distr::StandardNormal;
 use rayon::prelude::*;
 use rustc_hash::{FxHashMap, FxHashSet};
-use std::{cell::RefCell, cmp::Ord, collections::BinaryHeap, iter::Sum};
+use std::{cell::RefCell, cmp::Ord, collections::BinaryHeap};
 use thousands::*;
 
 use crate::prelude::*;
@@ -55,7 +55,7 @@ pub struct LSHIndex<T> {
 /// VectorDistance trait
 impl<T> VectorDistance<T> for LSHIndex<T>
 where
-    T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum + SimdDistance,
+    T: AnnSearchFloat,
 {
     fn vectors_flat(&self) -> &[T] {
         &self.vectors_flat
@@ -72,7 +72,7 @@ where
 
 impl<T> LSHIndex<T>
 where
-    T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum + SimdDistance,
+    T: AnnSearchFloat,
     Self: LSHQuery<T>,
 {
     //////////////////////
@@ -748,7 +748,7 @@ impl LSHQuery<f64> for LSHIndex<f64> {
 
 impl<T> KnnValidation<T> for LSHIndex<T>
 where
-    T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum + SimdDistance,
+    T: AnnSearchFloat,
     Self: LSHQuery<T>,
 {
     fn query_for_validation(&self, query_vec: &[T], k: usize) -> (Vec<usize>, Vec<T>) {

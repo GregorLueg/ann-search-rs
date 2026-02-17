@@ -1,9 +1,8 @@
 use faer::{MatRef, RowRef};
 use half::bf16;
-use num_traits::{Float, FromPrimitive, ToPrimitive};
 use rayon::prelude::*;
+use std::collections::BinaryHeap;
 use std::marker::PhantomData;
-use std::{collections::BinaryHeap, iter::Sum};
 use thousands::*;
 
 use crate::prelude::*;
@@ -44,7 +43,7 @@ pub struct ExhaustiveIndexBf16<T> {
 
 impl<T> VectorDistanceBf16<T> for ExhaustiveIndexBf16<T>
 where
-    T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum + SimdDistance + Bf16Compatible,
+    T: AnnSearchFloat + Bf16Compatible,
 {
     fn vectors_flat(&self) -> &[bf16] {
         &self.vectors_flat
@@ -65,7 +64,7 @@ where
 
 impl<T> ExhaustiveIndexBf16<T>
 where
-    T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum + SimdDistance + Bf16Compatible,
+    T: AnnSearchFloat + Bf16Compatible,
 {
     //////////////////////
     // Index generation //
@@ -341,6 +340,7 @@ mod tests {
     use super::*;
     use faer::Mat;
     use faer_traits::ComplexField;
+    use num_traits::{Float, FromPrimitive};
 
     fn create_test_data<T: Float + FromPrimitive + ComplexField>(n: usize, dim: usize) -> Mat<T> {
         let mut data = Mat::zeros(n, dim);

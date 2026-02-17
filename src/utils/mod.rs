@@ -1,6 +1,7 @@
 pub mod dist;
 pub mod heap_structs;
 pub mod ivf_utils;
+pub mod traits;
 pub mod tree_utils;
 
 use faer::MatRef;

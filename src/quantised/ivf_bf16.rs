@@ -1,8 +1,6 @@
 use faer::{MatRef, RowRef};
 use half::*;
-use num_traits::{Float, FromPrimitive, ToPrimitive};
 use rayon::prelude::*;
-use std::iter::Sum;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use thousands::Separable;
@@ -53,7 +51,7 @@ pub struct IvfIndexBf16<T> {
 
 impl<T> VectorDistanceBf16<T> for IvfIndexBf16<T>
 where
-    T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum + SimdDistance + Bf16Compatible,
+    T: AnnSearchFloat + Bf16Compatible,
 {
     fn vectors_flat(&self) -> &[bf16] {
         &self.vectors_flat
@@ -74,7 +72,7 @@ where
 
 impl<T> CentroidDistance<T> for IvfIndexBf16<T>
 where
-    T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum + SimdDistance,
+    T: AnnSearchFloat,
 {
     fn centroids(&self) -> &[T] {
         &self.centroids
@@ -103,7 +101,7 @@ where
 
 impl<T> IvfIndexBf16<T>
 where
-    T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum + SimdDistance + Bf16Compatible,
+    T: AnnSearchFloat + Bf16Compatible,
 {
     //////////////////////
     // Index generation //
@@ -479,6 +477,7 @@ mod tests {
     use super::*;
     use faer::Mat;
     use faer_traits::ComplexField;
+    use num_traits::{Float, FromPrimitive};
 
     fn create_test_data<T: Float + FromPrimitive + ComplexField>(n: usize, dim: usize) -> Mat<T> {
         let mut data = Mat::zeros(n, dim);

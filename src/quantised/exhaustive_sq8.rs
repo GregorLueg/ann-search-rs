@@ -67,7 +67,7 @@ where
 
 impl<T> ExhaustiveSq8Index<T>
 where
-    T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum + SimdDistance,
+    T: AnnSearchFloat,
 {
     //////////////////////
     // Index generation //
