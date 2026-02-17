@@ -686,7 +686,6 @@ pub fn build_lsh_index<T>(
 ) -> LSHIndex<T>
 where
     T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum + SimdDistance,
-    LSHIndex<T>: LSHQuery<T>,
 {
     let metric = parse_ann_dist(dist_metric).unwrap_or_default();
     LSHIndex::new(mat, metric, num_tables, bits_per_hash, seed)
@@ -703,6 +702,8 @@ where
 /// * `k` - Number of neighbours to return
 /// * `max_candidates` - Optional number to limit the candidate selection per
 ///   given table. Makes the querying faster at cost of Recall.
+/// * `nprobe` - Number of additional buckets to probe per table. Will identify
+///   the closest hash tables and use bit flipping to investigate these.
 /// * `return_dist` - Shall the distances be returned
 /// * `verbose` - Controls verbosity of the function
 ///
@@ -713,16 +714,16 @@ pub fn query_lsh_index<T>(
     query_mat: MatRef<T>,
     index: &LSHIndex<T>,
     k: usize,
+    n_probe: usize,
     max_candidates: Option<usize>,
     return_dist: bool,
     verbose: bool,
 ) -> (Vec<Vec<usize>>, Option<Vec<Vec<T>>>)
 where
     T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum + SimdDistance,
-    LSHIndex<T>: LSHQuery<T>,
 {
     query_parallel_with_flags(query_mat.nrows(), return_dist, verbose, |i| {
-        index.query_row(query_mat.row(i), k, max_candidates)
+        index.query_row(query_mat.row(i), k, max_candidates, n_probe)
     })
 }
 
@@ -734,6 +735,9 @@ where
 /// * `k` - Number of neighbours to return
 /// * `max_candidates` - Optional number to limit the candidate selection per
 ///   given table. Makes the querying faster at cost of Recall.
+/// * `n_probe` - Optional number of additional buckets to probe per table. Will
+///   identify the closest hash tables and use bit flipping to investigate
+///   these. Defaults to half the number of bits.
 /// * `return_dist` - Shall the distances be returned
 /// * `verbose` - Controls verbosity of the function
 ///
@@ -743,15 +747,17 @@ where
 pub fn query_lsh_self<T>(
     index: &LSHIndex<T>,
     k: usize,
+    n_probe: Option<usize>,
     max_candidates: Option<usize>,
     return_dist: bool,
     verbose: bool,
 ) -> (Vec<Vec<usize>>, Option<Vec<Vec<T>>>)
 where
     T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum + SimdDistance,
-    LSHIndex<T>: LSHQuery<T>,
 {
-    index.generate_knn(k, max_candidates, return_dist, verbose)
+    let n_probe = n_probe.unwrap_or(index.num_bits() / 2);
+
+    index.generate_knn(k, max_candidates, n_probe, return_dist, verbose)
 }
 
 ///////////////

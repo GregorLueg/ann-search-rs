@@ -68,19 +68,22 @@ fn main() {
     println!("-----------------------------");
 
     let build_params = [
-        (10, 8),
-        (20, 8),
-        (25, 8),
-        (10, 10),
-        (20, 10),
-        (25, 10),
-        (10, 12),
-        (20, 12),
-        (25, 12),
-        (10, 16),
-        (20, 16),
-        (25, 16),
-        (50, 16),
+        (2, 8),
+        (4, 8),
+        (8, 8),
+        (2, 10),
+        (4, 10),
+        (8, 10),
+        (12, 10),
+        (2, 12),
+        (4, 12),
+        (8, 12),
+        (12, 12),
+        (2, 16),
+        (4, 16),
+        (6, 16),
+        (8, 16),
+        (12, 16),
     ];
 
     for (num_tables, bits_per_hash) in build_params {
@@ -101,14 +104,27 @@ fn main() {
         let index_size_mb = lsh_index.memory_usage_bytes() as f64 / (1024.0 * 1024.0);
 
         // Query benchmarks
-        let search_budgets = [(None, "auto"), (Some(5000), "5k")];
-        for (max_cand, cand_label) in search_budgets {
-            println!("Querying LSH index (cand={})...", cand_label);
+        let search_budgets = [
+            (None, "auto", 0),
+            (None, "auto", 2),
+            (None, "auto", 4),
+            (Some(5000), "5k", 0),
+            (Some(5000), "5k", 2),
+            (Some(5000), "5k", 4),
+        ];
+        for (max_cand, cand_label, probes) in search_budgets {
+            let n_probe = (bits_per_hash as i32 - probes) as usize;
+
+            println!(
+                "Querying LSH index (cand={}, probes={})...",
+                cand_label, n_probe
+            );
             let start = Instant::now();
             let (approx_neighbors, approx_distances) = query_lsh_index(
                 query_data.as_ref(),
                 &lsh_index,
                 cli.k,
+                n_probe,
                 max_cand,
                 true,
                 false,
@@ -124,8 +140,8 @@ fn main() {
 
             results.push(BenchmarkResultSize {
                 method: format!(
-                    "LSH-nt{}-nb{}-s:{} (query)",
-                    num_tables, bits_per_hash, cand_label
+                    "LSH-nt{}-nb{}-s:{}-n{} (query)",
+                    num_tables, bits_per_hash, cand_label, n_probe
                 ),
                 build_time_ms: build_time,
                 query_time_ms: query_time,
@@ -140,7 +156,7 @@ fn main() {
         println!("Self-querying LSH index...");
         let start = Instant::now();
         let (approx_neighbors_self, approx_distances_self) =
-            query_lsh_self(&lsh_index, cli.k, None, true, false);
+            query_lsh_self(&lsh_index, cli.k, None, None, true, false);
         let self_query_time = start.elapsed().as_secs_f64() * 1000.0;
 
         let recall_self = calculate_recall(&true_neighbors_self, &approx_neighbors_self, cli.k);
