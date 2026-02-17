@@ -7,6 +7,8 @@
 - SIMD add and assign add added - slightly better k-means performance on larger
   data sets.
 - Binary quantiser with reranking.
+- Improved LSH index with multi-probe support.
+- Updated benchmarks with 128 dimensions tested across various indices.
 
 ## 0.2.3
 

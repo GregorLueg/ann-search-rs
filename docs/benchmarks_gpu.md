@@ -30,7 +30,7 @@ reaches very fast speeds here, but not much faster actually than the IVF-CPU
 version (or exhaustive GPU index). The advantages for the IVF-GPU index become
 more apparent in larger data sets (more to that below). Also to note is that
 the data is kept on the GPU for easier access and less frequent transfer between
-CPU and GPU. 
+CPU and GPU.
 
 <details>
 <summary><b>GPU - Euclidean (Gaussian)</b>:</summary>
@@ -40,26 +40,28 @@ Benchmark: 150k cells, 32D (CPU vs GPU Exhaustive vs IVF-GPU)
 ================================================================================================================================
 Method                                               Build (ms)   Query (ms)   Total (ms)     Recall@k   Dist Error    Size (MB)
 --------------------------------------------------------------------------------------------------------------------------------
-Exhaustive (query)                                         3.36     1_584.92     1_588.27       1.0000     0.000000        18.31
-Exhaustive (self)                                          3.36    17_573.03    17_576.38       1.0000     0.000000        18.31
+Exhaustive (query)                                         3.47     1_470.65     1_474.11       1.0000     0.000000        18.31
+Exhaustive (self)                                          3.47    15_759.37    15_762.83       1.0000     0.000000        18.31
 --------------------------------------------------------------------------------------------------------------------------------
-GPU-Exhaustive (query)                                     3.64       706.01       709.64       1.0000    42.239541        18.31
-GPU-Exhaustive (self)                                      3.64     5_923.93     5_927.57       1.0000    41.895961        18.31
+GPU-Exhaustive (query)                                     4.45       821.49       825.94       1.0000    42.239541        18.31
+GPU-Exhaustive (self)                                      4.45     6_030.10     6_034.55       1.0000    41.895961        18.31
 --------------------------------------------------------------------------------------------------------------------------------
-IVF-GPU-nl273-np13 (query)                               875.23       653.53     1_528.75       0.9889     0.034509         1.15
-IVF-GPU-nl273-np16 (query)                               875.23       677.14     1_552.36       0.9967     0.006517         1.15
-IVF-GPU-nl273-np23 (query)                               875.23       642.95     1_518.18       1.0000     0.000003         1.15
-IVF-GPU-nl273 (self)                                     875.23     5_443.99     6_319.22       1.0000     0.000003         1.15
-IVF-GPU-nl387-np19 (query)                             1_293.10       521.84     1_814.94       0.9926     0.031031         1.15
-IVF-GPU-nl387-np27 (query)                             1_293.10       665.12     1_958.22       0.9998     0.000650         1.15
-IVF-GPU-nl387 (self)                                   1_293.10     3_505.50     4_798.60       0.9998     0.000681         1.15
-IVF-GPU-nl547-np23 (query)                             2_333.79       533.86     2_867.64       0.9882     0.041947         1.15
-IVF-GPU-nl547-np27 (query)                             2_333.79       532.96     2_866.75       0.9958     0.014728         1.15
-IVF-GPU-nl547-np33 (query)                             2_333.79       592.88     2_926.67       0.9997     0.001039         1.15
-IVF-GPU-nl547 (self)                                   2_333.79     3_246.57     5_580.36       0.9997     0.001006         1.15
+IVF-GPU-nl273-np13 (query)                               878.50       651.27     1_529.77       0.9889     0.034509         1.15
+IVF-GPU-nl273-np16 (query)                               878.50       608.51     1_487.01       0.9967     0.006517         1.15
+IVF-GPU-nl273-np23 (query)                               878.50       592.91     1_471.41       1.0000     0.000003         1.15
+IVF-GPU-nl273 (self)                                     878.50     5_867.92     6_746.42       1.0000     0.000003         1.15
+IVF-GPU-nl387-np19 (query)                             1_270.30       497.44     1_767.74       0.9926     0.031031         1.15
+IVF-GPU-nl387-np27 (query)                             1_270.30       630.35     1_900.66       0.9998     0.000650         1.15
+IVF-GPU-nl387 (self)                                   1_270.30     3_209.18     4_479.48       0.9998     0.000681         1.15
+IVF-GPU-nl547-np23 (query)                             1_748.72       563.04     2_311.76       0.9882     0.041947         1.15
+IVF-GPU-nl547-np27 (query)                             1_748.72       505.08     2_253.80       0.9958     0.014728         1.15
+IVF-GPU-nl547-np33 (query)                             1_748.72       569.07     2_317.80       0.9997     0.001039         1.15
+IVF-GPU-nl547 (self)                                   1_748.72     3_144.16     4_892.88       0.9997     0.001006         1.15
 --------------------------------------------------------------------------------------------------------------------------------
 </code></pre>
 </details>
+
+---
 
 <details>
 <summary><b>GPU - Cosine (Gaussian)</b>:</summary>
@@ -67,30 +69,30 @@ IVF-GPU-nl547 (self)                                   2_333.79     3_246.57    
 ================================================================================================================================
 Benchmark: 150k cells, 32D (CPU vs GPU Exhaustive vs IVF-GPU)
 ================================================================================================================================
-Benchmark: 150k cells, 32D (CPU vs GPU Exhaustive vs IVF-GPU)
-================================================================================================================================
 Method                                               Build (ms)   Query (ms)   Total (ms)     Recall@k   Dist Error    Size (MB)
 --------------------------------------------------------------------------------------------------------------------------------
-Exhaustive (query)                                         4.22     1_558.43     1_562.65       1.0000     0.000000        18.88
-Exhaustive (self)                                          4.22    17_333.38    17_337.60       1.0000     0.000000        18.88
+Exhaustive (query)                                         4.20     1_647.81     1_652.01       1.0000     0.000000        18.88
+Exhaustive (self)                                          4.20    17_334.61    17_338.81       1.0000     0.000000        18.88
 --------------------------------------------------------------------------------------------------------------------------------
-GPU-Exhaustive (query)                                     4.44       682.30       686.73       1.0000     0.030828        18.88
-GPU-Exhaustive (self)                                      4.44     5_956.40     5_960.84       1.0000     0.030637        18.88
+GPU-Exhaustive (query)                                     4.69       737.60       742.29       1.0000     0.030828        18.88
+GPU-Exhaustive (self)                                      4.69     6_045.46     6_050.16       1.0000     0.030637        18.88
 --------------------------------------------------------------------------------------------------------------------------------
-IVF-GPU-nl273-np13 (query)                               886.70       705.71     1_592.42       0.9893     0.000025         1.15
-IVF-GPU-nl273-np16 (query)                               886.70       588.77     1_475.48       0.9970     0.000005         1.15
-IVF-GPU-nl273-np23 (query)                               886.70       755.59     1_642.30       1.0000     0.000000         1.15
-IVF-GPU-nl273 (self)                                     886.70     5_198.11     6_084.81       1.0000     0.000000         1.15
-IVF-GPU-nl387-np19 (query)                             1_226.72       508.92     1_735.63       0.9929     0.000019         1.15
-IVF-GPU-nl387-np27 (query)                             1_226.72       619.54     1_846.26       0.9998     0.000000         1.15
-IVF-GPU-nl387 (self)                                   1_226.72     3_244.48     4_471.20       0.9998     0.000000         1.15
-IVF-GPU-nl547-np23 (query)                             1_696.00       518.63     2_214.63       0.9890     0.000026         1.15
-IVF-GPU-nl547-np27 (query)                             1_696.00       483.47     2_179.47       0.9963     0.000008         1.15
-IVF-GPU-nl547-np33 (query)                             1_696.00       544.46     2_240.46       0.9997     0.000001         1.15
-IVF-GPU-nl547 (self)                                   1_696.00     2_980.22     4_676.22       0.9997     0.000001         1.15
+IVF-GPU-nl273-np13 (query)                               941.41       646.73     1_588.14       0.9893     0.000025         1.15
+IVF-GPU-nl273-np16 (query)                               941.41       600.64     1_542.05       0.9967     0.000006         1.15
+IVF-GPU-nl273-np23 (query)                               941.41       683.12     1_624.54       0.9999     0.000000         1.15
+IVF-GPU-nl273 (self)                                     941.41     5_104.77     6_046.19       1.0000     0.000000         1.15
+IVF-GPU-nl387-np19 (query)                             1_278.05       512.49     1_790.54       0.9928     0.000019         1.15
+IVF-GPU-nl387-np27 (query)                             1_278.05       631.59     1_909.64       0.9998     0.000000         1.15
+IVF-GPU-nl387 (self)                                   1_278.05     3_245.92     4_523.97       0.9998     0.000000         1.15
+IVF-GPU-nl547-np23 (query)                             1_717.38       549.04     2_266.41       0.9890     0.000025         1.15
+IVF-GPU-nl547-np27 (query)                             1_717.38       494.47     2_211.84       0.9962     0.000008         1.15
+IVF-GPU-nl547-np33 (query)                             1_717.38       547.98     2_265.36       0.9997     0.000001         1.15
+IVF-GPU-nl547 (self)                                   1_717.38     2_971.90     4_689.28       0.9997     0.000001         1.15
 --------------------------------------------------------------------------------------------------------------------------------
 </code></pre>
 </details>
+
+---
 
 <details>
 <summary><b>GPU - Euclidean (Correlated)</b>:</summary>
@@ -100,26 +102,28 @@ Benchmark: 150k cells, 32D (CPU vs GPU Exhaustive vs IVF-GPU)
 ================================================================================================================================
 Method                                               Build (ms)   Query (ms)   Total (ms)     Recall@k   Dist Error    Size (MB)
 --------------------------------------------------------------------------------------------------------------------------------
-Exhaustive (query)                                         3.16     1_536.24     1_539.40       1.0000     0.000000        18.31
-Exhaustive (self)                                          3.16    16_594.43    16_597.59       1.0000     0.000000        18.31
+Exhaustive (query)                                         3.32     1_576.68     1_580.00       1.0000     0.000000        18.31
+Exhaustive (self)                                          3.32    18_346.26    18_349.57       1.0000     0.000000        18.31
 --------------------------------------------------------------------------------------------------------------------------------
-GPU-Exhaustive (query)                                     3.41       715.51       718.93       1.0000     2.406931        18.31
-GPU-Exhaustive (self)                                      3.41     5_904.92     5_908.34       1.0000     2.415342        18.31
+GPU-Exhaustive (query)                                     3.37       721.57       724.93       1.0000     2.406931        18.31
+GPU-Exhaustive (self)                                      3.37     5_946.10     5_949.47       1.0000     2.415342        18.31
 --------------------------------------------------------------------------------------------------------------------------------
-IVF-GPU-nl273-np13 (query)                               949.54       521.04     1_470.59       0.9998     0.000027         1.15
-IVF-GPU-nl273-np16 (query)                               949.54       585.13     1_534.68       1.0000     0.000006         1.15
-IVF-GPU-nl273-np23 (query)                               949.54       694.35     1_643.89       1.0000     0.000000         1.15
-IVF-GPU-nl273 (self)                                     949.54     3_716.46     4_666.00       1.0000     0.000000         1.15
-IVF-GPU-nl387-np19 (query)                             1_383.20       482.92     1_866.12       0.9999     0.000014         1.15
-IVF-GPU-nl387-np27 (query)                             1_383.20       616.95     2_000.16       1.0000     0.000000         1.15
-IVF-GPU-nl387 (self)                                   1_383.20     3_015.28     4_398.48       1.0000     0.000000         1.15
-IVF-GPU-nl547-np23 (query)                             1_734.94       355.80     2_090.75       0.9999     0.000021         1.15
-IVF-GPU-nl547-np27 (query)                             1_734.94       462.03     2_196.97       1.0000     0.000010         1.15
-IVF-GPU-nl547-np33 (query)                             1_734.94       540.85     2_275.79       1.0000     0.000000         1.15
-IVF-GPU-nl547 (self)                                   1_734.94     2_825.43     4_560.37       1.0000     0.000003         1.15
+IVF-GPU-nl273-np13 (query)                               922.78       577.07     1_499.85       0.9998     0.000027         1.15
+IVF-GPU-nl273-np16 (query)                               922.78       641.32     1_564.09       1.0000     0.000006         1.15
+IVF-GPU-nl273-np23 (query)                               922.78       719.36     1_642.14       1.0000     0.000000         1.15
+IVF-GPU-nl273 (self)                                     922.78     3_859.10     4_781.88       1.0000     0.000000         1.15
+IVF-GPU-nl387-np19 (query)                             1_275.14       491.17     1_766.31       0.9999     0.000014         1.15
+IVF-GPU-nl387-np27 (query)                             1_275.14       622.45     1_897.59       1.0000     0.000000         1.15
+IVF-GPU-nl387 (self)                                   1_275.14     3_055.67     4_330.81       1.0000     0.000000         1.15
+IVF-GPU-nl547-np23 (query)                             1_682.12       359.89     2_042.01       0.9999     0.000021         1.15
+IVF-GPU-nl547-np27 (query)                             1_682.12       480.45     2_162.56       1.0000     0.000010         1.15
+IVF-GPU-nl547-np33 (query)                             1_682.12       540.74     2_222.85       1.0000     0.000000         1.15
+IVF-GPU-nl547 (self)                                   1_682.12     2_816.87     4_498.98       1.0000     0.000003         1.15
 --------------------------------------------------------------------------------------------------------------------------------
 </code></pre>
 </details>
+
+---
 
 <details>
 <summary><b>GPU - Euclidean (LowRank)</b>:</summary>
@@ -129,32 +133,100 @@ Benchmark: 150k cells, 32D (CPU vs GPU Exhaustive vs IVF-GPU)
 ================================================================================================================================
 Method                                               Build (ms)   Query (ms)   Total (ms)     Recall@k   Dist Error    Size (MB)
 --------------------------------------------------------------------------------------------------------------------------------
-Exhaustive (query)                                         3.05     1_542.41     1_545.46       1.0000     0.000000        18.31
-Exhaustive (self)                                          3.05    16_395.20    16_398.25       1.0000     0.000000        18.31
+Exhaustive (query)                                         3.28     1_617.77     1_621.05       1.0000     0.000000        18.31
+Exhaustive (self)                                          3.28    17_977.92    17_981.20       1.0000     0.000000        18.31
 --------------------------------------------------------------------------------------------------------------------------------
-GPU-Exhaustive (query)                                     3.84       702.22       706.06       1.0000     8.879391        18.31
-GPU-Exhaustive (self)                                      3.84     5_927.00     5_930.84       1.0000     8.901199        18.31
+GPU-Exhaustive (query)                                     3.44       724.84       728.29       1.0000     8.879391        18.31
+GPU-Exhaustive (self)                                      3.44     5_939.36     5_942.81       1.0000     8.901199        18.31
 --------------------------------------------------------------------------------------------------------------------------------
-IVF-GPU-nl273-np13 (query)                               954.46       575.31     1_529.77       1.0000     0.000015         1.15
-IVF-GPU-nl273-np16 (query)                               954.46       650.02     1_604.49       1.0000     0.000001         1.15
-IVF-GPU-nl273-np23 (query)                               954.46       693.69     1_648.16       1.0000     0.000001         1.15
-IVF-GPU-nl273 (self)                                     954.46     3_452.06     4_406.52       1.0000     0.000001         1.15
-IVF-GPU-nl387-np19 (query)                             1_488.86       522.28     2_011.13       1.0000     0.000001         1.15
-IVF-GPU-nl387-np27 (query)                             1_488.86       681.30     2_170.15       1.0000     0.000001         1.15
-IVF-GPU-nl387 (self)                                   1_488.86     3_343.45     4_832.31       1.0000     0.000001         1.15
-IVF-GPU-nl547-np23 (query)                             1_888.91       388.90     2_277.81       1.0000     0.000001         1.15
-IVF-GPU-nl547-np27 (query)                             1_888.91       484.01     2_372.92       1.0000     0.000001         1.15
-IVF-GPU-nl547-np33 (query)                             1_888.91       590.99     2_479.90       1.0000     0.000001         1.15
-IVF-GPU-nl547 (self)                                   1_888.91     3_189.26     5_078.17       1.0000     0.000001         1.15
+IVF-GPU-nl273-np13 (query)                               856.37       531.77     1_388.14       1.0000     0.000015         1.15
+IVF-GPU-nl273-np16 (query)                               856.37       583.00     1_439.38       1.0000     0.000001         1.15
+IVF-GPU-nl273-np23 (query)                               856.37       657.31     1_513.69       1.0000     0.000001         1.15
+IVF-GPU-nl273 (self)                                     856.37     3_561.26     4_417.64       1.0000     0.000001         1.15
+IVF-GPU-nl387-np19 (query)                             1_196.45       483.24     1_679.69       1.0000     0.000001         1.15
+IVF-GPU-nl387-np27 (query)                             1_196.45       607.54     1_803.99       1.0000     0.000001         1.15
+IVF-GPU-nl387 (self)                                   1_196.45     3_047.14     4_243.59       1.0000     0.000001         1.15
+IVF-GPU-nl547-np23 (query)                             1_685.95       375.85     2_061.80       1.0000     0.000001         1.15
+IVF-GPU-nl547-np27 (query)                             1_685.95       490.05     2_175.99       1.0000     0.000001         1.15
+IVF-GPU-nl547-np33 (query)                             1_685.95       538.59     2_224.53       1.0000     0.000001         1.15
+IVF-GPU-nl547 (self)                                   1_685.95     2_899.27     4_585.22       1.0000     0.000001         1.15
+--------------------------------------------------------------------------------------------------------------------------------
+</code></pre>
+</details>
+
+---
+
+<details>
+<summary><b>GPU - Euclidean (LowRank)</b>:</summary>
+<pre><code>
+================================================================================================================================
+Benchmark: 150k cells, 32D (CPU vs GPU Exhaustive vs IVF-GPU)
+================================================================================================================================
+Method                                               Build (ms)   Query (ms)   Total (ms)     Recall@k   Dist Error    Size (MB)
+--------------------------------------------------------------------------------------------------------------------------------
+Exhaustive (query)                                         3.28     1_617.77     1_621.05       1.0000     0.000000        18.31
+Exhaustive (self)                                          3.28    17_977.92    17_981.20       1.0000     0.000000        18.31
+--------------------------------------------------------------------------------------------------------------------------------
+GPU-Exhaustive (query)                                     3.44       724.84       728.29       1.0000     8.879391        18.31
+GPU-Exhaustive (self)                                      3.44     5_939.36     5_942.81       1.0000     8.901199        18.31
+--------------------------------------------------------------------------------------------------------------------------------
+IVF-GPU-nl273-np13 (query)                               856.37       531.77     1_388.14       1.0000     0.000015         1.15
+IVF-GPU-nl273-np16 (query)                               856.37       583.00     1_439.38       1.0000     0.000001         1.15
+IVF-GPU-nl273-np23 (query)                               856.37       657.31     1_513.69       1.0000     0.000001         1.15
+IVF-GPU-nl273 (self)                                     856.37     3_561.26     4_417.64       1.0000     0.000001         1.15
+IVF-GPU-nl387-np19 (query)                             1_196.45       483.24     1_679.69       1.0000     0.000001         1.15
+IVF-GPU-nl387-np27 (query)                             1_196.45       607.54     1_803.99       1.0000     0.000001         1.15
+IVF-GPU-nl387 (self)                                   1_196.45     3_047.14     4_243.59       1.0000     0.000001         1.15
+IVF-GPU-nl547-np23 (query)                             1_685.95       375.85     2_061.80       1.0000     0.000001         1.15
+IVF-GPU-nl547-np27 (query)                             1_685.95       490.05     2_175.99       1.0000     0.000001         1.15
+IVF-GPU-nl547-np33 (query)                             1_685.95       538.59     2_224.53       1.0000     0.000001         1.15
+IVF-GPU-nl547 (self)                                   1_685.95     2_899.27     4_585.22       1.0000     0.000001         1.15
+--------------------------------------------------------------------------------------------------------------------------------
+</code></pre>
+</details>
+
+---
+
+With even higher dimensionality, we can observe the advantage of the
+GPU-accelerated versions. Particularly, the difference in the exhaustive search
+is already very impressive with a nearly 5x increase in querying speed.
+Basically, the more dimensions you are dealing with, the better the GPU
+acceleration works.
+
+<details>
+<summary><b>GPU - Euclidean (LowRank - 128 dimensions)</b>:</summary>
+<pre><code>
+================================================================================================================================
+Benchmark: 150k cells, 128D (CPU vs GPU Exhaustive vs IVF-GPU)
+================================================================================================================================
+Method                                               Build (ms)   Query (ms)   Total (ms)     Recall@k   Dist Error    Size (MB)
+--------------------------------------------------------------------------------------------------------------------------------
+Exhaustive (query)                                        15.14     6_546.46     6_561.60       1.0000     0.000000        73.24
+Exhaustive (self)                                         15.14    69_617.41    69_632.54       1.0000     0.000000        73.24
+--------------------------------------------------------------------------------------------------------------------------------
+GPU-Exhaustive (query)                                    20.23     1_797.77     1_818.01       1.0000    75.088674        73.24
+GPU-Exhaustive (self)                                     20.23    16_975.96    16_996.20       1.0000    75.325201        73.24
+--------------------------------------------------------------------------------------------------------------------------------
+IVF-GPU-nl273-np13 (query)                             3_057.52       689.98     3_747.50       0.9997     0.002045         1.15
+IVF-GPU-nl273-np16 (query)                             3_057.52       716.37     3_773.89       1.0000     0.000193         1.15
+IVF-GPU-nl273-np23 (query)                             3_057.52       806.00     3_863.52       1.0000     0.000011         1.15
+IVF-GPU-nl273 (self)                                   3_057.52     4_775.18     7_832.70       1.0000     0.000011         1.15
+IVF-GPU-nl387-np19 (query)                             4_171.78       603.51     4_775.29       1.0000     0.000122         1.15
+IVF-GPU-nl387-np27 (query)                             4_171.78       666.40     4_838.19       1.0000     0.000011         1.15
+IVF-GPU-nl387 (self)                                   4_171.78     4_005.20     8_176.98       1.0000     0.000011         1.15
+IVF-GPU-nl547-np23 (query)                             5_959.10       466.99     6_426.09       0.9999     0.000626         1.15
+IVF-GPU-nl547-np27 (query)                             5_959.10       634.45     6_593.55       1.0000     0.000072         1.15
+IVF-GPU-nl547-np33 (query)                             5_959.10       709.98     6_669.09       1.0000     0.000011         1.15
+IVF-GPU-nl547 (self)                                   5_959.10     3_793.50     9_752.60       1.0000     0.000011         1.15
 --------------------------------------------------------------------------------------------------------------------------------
 </code></pre>
 </details>
 
 ### Comparison against IVF CPU
 
-In this case, the IVF CPU implementation is being compared against the GPU 
-version. GPU acceleration shines with larger data sets and larger dimensions, 
-hence, the number of samples was increased to 250_000 and dimensions to 64 for 
+In this case, the IVF CPU implementation is being compared against the GPU
+version. GPU acceleration shines with larger data sets and larger dimensions,
+hence, the number of samples was increased to 250_000 and dimensions to 64 for
 these benchmarks.
 
 #### With 250k samples and 64 dimensions
@@ -218,15 +290,15 @@ IVF-GPU-nl707 (self)                                   6_202.76     7_071.86    
 
 The results here are more favourable of the GPU acceleration. We go from ~100
 seconds with exhaustive search on CPU to ~25 seconds on GPU; if using IVF, we
-can reduce at the fastest settings the time from ~25 seconds on CPU to ~12 
-seconds on GPU. This gives us a total acceleration of 
-**100 seconds *(exhaustive on CPU)* to 12 seconds *(IVF on GPU)***, a `8x` 
-acceleration while having a Recall 1.00. 
+can reduce at the fastest settings the time from ~25 seconds on CPU to ~12
+seconds on GPU. This gives us a total acceleration of
+**100 seconds *(exhaustive on CPU)* to 12 seconds *(IVF on GPU)***, a `8x`
+acceleration while having a Recall 1.00.
 
 #### With 500k samples and 64 dimensions
 
 Results are becoming even more pronounced with more cells and showing the
-advantage of the GPU acceleration. 
+advantage of the GPU acceleration.
 
 <details>
 <summary><b>CPU-IVF (larger dataset)</b>:</summary>
@@ -285,48 +357,11 @@ IVF-GPU-nl1000 (self)                                 18_452.14    20_401.10    
 </code></pre>
 </details>
 
-In this configuration, the exhaustive CPU to GPU already causes a massive 
-reduction in the generation of the full kNN. From ~7 minutes to ~1.5 minutes. 
-However, the true acceleleration comes with the IVF-GPU versions that reduces 
+In this configuration, the exhaustive CPU to GPU already causes a massive
+reduction in the generation of the full kNN. From ~7 minutes to ~1.5 minutes.
+However, the true acceleleration comes with the IVF-GPU versions that reduces
 the full kNN generation to a minute, close to 30 seconds. While the index
 building takes some time, the subsequent query speed is superb.
-
-#### High dimensionality
-
-With even higher dimensionality, we can observe the advantage of the 
-GPU-accelerated versions. Particularly, the difference in the exhaustive search 
-is already very impressive with a nearly 5x increase in querying speed. 
-Basically, the more dimensions you are dealing with, the better the GPU 
-acceleration works.
-
-<details>
-<summary><b>GPU with high dimensionality</b>:</summary>
-<pre><code>
-================================================================================================================================
-Benchmark: 150k cells, 128D (CPU vs GPU Exhaustive vs IVF-GPU)
-================================================================================================================================
-Method                                               Build (ms)   Query (ms)   Total (ms)     Recall@k   Dist Error    Size (MB)
---------------------------------------------------------------------------------------------------------------------------------
-Exhaustive (query)                                        15.26     7_073.83     7_089.08       1.0000     0.000000        73.24
-Exhaustive (self)                                         15.26    74_251.50    74_266.76       1.0000     0.000000        73.24
---------------------------------------------------------------------------------------------------------------------------------
-GPU-Exhaustive (query)                                    14.73     1_812.60     1_827.33       1.0000    87.761408        73.24
-GPU-Exhaustive (self)                                     14.73    16_606.31    16_621.03       1.0000    88.236883        73.24
---------------------------------------------------------------------------------------------------------------------------------
-IVF-GPU-nl273-np13 (query)                             3_024.29       650.18     3_674.47       0.9934     0.025293         1.15
-IVF-GPU-nl273-np16 (query)                             3_024.29       729.37     3_753.67       0.9984     0.006808         1.15
-IVF-GPU-nl273-np23 (query)                             3_024.29       765.52     3_789.81       1.0000     0.000014         1.15
-IVF-GPU-nl273 (self)                                   3_024.29     4_722.69     7_746.98       1.0000     0.000014         1.15
-IVF-GPU-nl387-np19 (query)                             4_254.49       590.82     4_845.31       0.9957     0.015586         1.15
-IVF-GPU-nl387-np27 (query)                             4_254.49       679.74     4_934.23       0.9999     0.000509         1.15
-IVF-GPU-nl387 (self)                                   4_254.49     4_266.03     8_520.52       0.9999     0.000540         1.15
-IVF-GPU-nl547-np23 (query)                             5_758.20       496.61     6_254.80       0.9925     0.024028         1.15
-IVF-GPU-nl547-np27 (query)                             5_758.20       593.51     6_351.70       0.9971     0.008616         1.15
-IVF-GPU-nl547-np33 (query)                             5_758.20       678.97     6_437.17       0.9996     0.001059         1.15
-IVF-GPU-nl547 (self)                                   5_758.20     3_866.02     9_624.22       0.9996     0.001065         1.15
---------------------------------------------------------------------------------------------------------------------------------
-</code></pre>
-</details>
 
 *All benchmarks were run on M1 Max MacBook Pro with 64 GB unified memory.*
 *The GPU backend was the wgpu backend.*
