@@ -5,7 +5,7 @@ edition = "2021"
 authors = ["Gregor Lueg <gregorlueg@me.com>"]
 license = "MIT"
 repository = "https://github.com/GregorLueg/ann-search-rs"
-description = "Various vector search algorithms in Rust. Designed specifically for single cell applications."
+description = "Various vector search algorithms in Rust. Designed specifically for single cell & computational biology applications."
 
 [lib]
 name = "ann_search_rs"

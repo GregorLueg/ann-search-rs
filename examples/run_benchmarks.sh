@@ -73,6 +73,13 @@ run_binary_benchmarks() {
     for variant in binary rabitq; do
         run_common_patterns "cargo run --example gridsearch_${variant} --release --features binary" "$(echo ${variant} | tr '[:lower:]' '[:upper:]')"
     done
+
+    echo "Running binary benchmarks higher dimensionality"
+    for variant in binary rabitq; do
+        for n_dim in 256 512; do
+            cargo run --example gridsearch_${variant} --release --features binary -- --dim ${n_dim} --data lowrank
+        done
+    done
 }
 
 [ $# -eq 0 ] && { echo "Usage: $0 [--standard] [--quantised] [--gpu] [--binary] [--all]"; exit 1; }

@@ -446,13 +446,13 @@ IVF-GPU-nl1000 (self)                                 34_555.08    27_183.09    
 </details>
 
 In these configurations, we can really appreciate the GPU acceleration. For
-64 dimensions, we go in the case of exhaustive</br>
+64 dimensions, we go in the case of</br></br>
 Exhaustive CPU: 380 seconds -> Exhaustive GPU: 90 seconds **(4x)** </br>
-IVF CPU: 90 seconds -> IVF GPU: 35 seconds **(2.5x)** </br>
+IVF CPU: 90 seconds -> IVF GPU: 35 seconds **(2.5x)** </br></br>
 The acceleration is even more significant with higher dimensions, as seen
-here for the 128 dimension case.
+here for the 128 dimension case.</br></br>
 Exhaustive CPU: 900 seconds -> Exhaustive GPU: 180 seconds **(5x)** </br>
-IVF CPU: 180 seconds -> IVF GPU: 55 seconds **(3x)** </br>
+IVF CPU: 180 seconds -> IVF GPU: 55 seconds **(3x)** </br></br></br>
 
 *All benchmarks were run on M1 Max MacBook Pro with 64 GB unified memory.*
 *The GPU backend was the wgpu backend.*
