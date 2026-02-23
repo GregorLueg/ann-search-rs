@@ -66,8 +66,8 @@ fn main() {
 
     println!("-----------------------------------------------------------------------------------------------");
 
-    let m_values: Vec<usize> = if cli.dim >= 128 {
-        vec![16, 32, 48]
+    let m_values: Vec<usize> = if cli.dim > 128 {
+        vec![16, 32, 64]
     } else {
         vec![8, 16]
     };

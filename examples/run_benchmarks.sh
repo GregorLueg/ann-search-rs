@@ -37,14 +37,14 @@ run_standard() {
 run_quantised_benchmarks() {
     echo "=== Running quantised benchmarks ==="
 
-    # IVF-BF16 and IVF-SQ8
-    for variant in bf16 sq8; do
-        run_common_patterns run_quantised "${variant}" "${variant}"
-    done
+    # # IVF-BF16 and IVF-SQ8
+    # for variant in bf16 sq8; do
+    #     run_common_patterns run_quantised "${variant}" "${variant}"
+    # done
 
     # IVF-PQ and IVF-OPQ
     for variant in pq opq; do
-        for dim in 128 192; do
+        for dim in 128 256; do
             echo "Running ${variant} benchmarks (dim=${dim})..."
             run_quantised ${variant} -- --distance euclidean --dim ${dim}
             run_quantised ${variant} -- --distance euclidean --dim ${dim} --data correlated
@@ -69,7 +69,6 @@ run_gpu_benchmarks() {
 run_binary_benchmarks() {
     echo "=== Running binary benchmarks ==="
 
-    # for variant in binary rabitq; do
     for variant in binary rabitq; do
         run_common_patterns "cargo run --example gridsearch_${variant} --release --features binary" "$(echo ${variant} | tr '[:lower:]' '[:upper:]')"
     done

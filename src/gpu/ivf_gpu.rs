@@ -1,5 +1,6 @@
 use cubecl::prelude::*;
 use faer::MatRef;
+use faer_traits::ComplexField;
 use num_traits::{Float, FromPrimitive};
 use rayon::prelude::*;
 use std::collections::BinaryHeap;
@@ -77,7 +78,8 @@ where
         + FromPrimitive
         + Send
         + Sync
-        + SimdDistance,
+        + SimdDistance
+        + ComplexField,
 {
     /// Build a batched IVF index
     ///
