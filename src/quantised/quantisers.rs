@@ -2,7 +2,7 @@ use faer::{Mat, Scale};
 use half::bf16;
 use num_traits::{Float, FromPrimitive, ToPrimitive};
 use rayon::prelude::*;
-use std::iter::Sum;
+
 use std::ops::AddAssign;
 
 use crate::prelude::*;
@@ -213,7 +213,7 @@ pub struct ProductQuantiser<T> {
 
 impl<T> ProductQuantiser<T>
 where
-    T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum + SimdDistance,
+    T: AnnSearchFloat,
 {
     /// Train the product quantiser
     ///
@@ -487,7 +487,7 @@ pub struct OptimisedProductQuantiser<T> {
 
 impl<T> OptimisedProductQuantiser<T>
 where
-    T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum + AddAssign + SimdDistance,
+    T: AnnSearchFloat + AddAssign,
 {
     /// Train the optimised product quantiser
     ///

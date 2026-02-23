@@ -1,11 +1,15 @@
-use num_traits::{Float, FromPrimitive, ToPrimitive};
+use faer::{linalg::matmul::matmul, Accum, Mat, MatRef, Par};
+use faer_traits::ComplexField;
+use num_traits::Float;
 use rand::rngs::StdRng;
 use rand::seq::SliceRandom;
 use rand::Rng;
 use rand::SeedableRng;
 use rayon::prelude::*;
 use std::iter::Sum;
+use std::num::NonZero;
 
+use crate::prelude::AnnSearchFloat;
 use crate::utils::dist::*;
 use crate::utils::Dist;
 
@@ -103,6 +107,20 @@ where
 // k-means clustering //
 ////////////////////////
 
+/// Tile size for GEMM-based assignment. Limits the intermediate dot-product
+/// matrix to TILE_SIZE * k elements. 4096 is a reasonable default; tune to
+/// your L2 cache size if needed.
+const GEMM_TILE_SIZE: usize = 4096;
+
+/// Below this number of dirty points, skip GEMM gather/scatter overhead
+/// and compute distances directly via SIMD loops.
+const GEMM_DIRTY_THRESHOLD: usize = 128;
+
+/// Minimum dimension at which GEMM assignment outperforms direct SIMD loops.
+/// Below this, the GEMM kernel setup and tile-scanning overhead exceeds the
+/// cache-blocking benefit.
+const GEMM_DIM_THRESHOLD: usize = 64;
+
 /////////////
 // Helpers //
 /////////////
@@ -139,14 +157,25 @@ where
 {
     let mut min_dist = T::infinity();
 
-    for c in 0..n_centroids {
-        let cent = &centroids[c * dim..(c + 1) * dim];
-        let dist = match metric {
-            Dist::Euclidean => euclidean_distance_static(vec, cent),
-            Dist::Cosine => cosine_distance_static_norm(vec, cent, &vec_norm, &centroid_norms[c]),
-        };
-        if dist < min_dist {
-            min_dist = dist;
+    match metric {
+        Dist::Euclidean => {
+            for cent in centroids.chunks_exact(dim).take(n_centroids) {
+                let dist = euclidean_distance_static(vec, cent);
+                if dist < min_dist {
+                    min_dist = dist;
+                }
+            }
+        }
+        Dist::Cosine => {
+            let cent_iter = centroids.chunks_exact(dim);
+            let norm_iter = centroid_norms.iter();
+
+            for (cent, &c_norm) in cent_iter.zip(norm_iter).take(n_centroids) {
+                let dist = cosine_distance_static_norm(vec, cent, &vec_norm, &c_norm);
+                if dist < min_dist {
+                    min_dist = dist;
+                }
+            }
         }
     }
 
@@ -195,21 +224,37 @@ where
     centroids.extend_from_slice(&data[first * dim..(first + 1) * dim]);
     centroid_norms.push(data_norms[first]);
 
+    let mut distances = vec![T::infinity(); n];
+
     for _ in 1..k {
-        let distances: Vec<T> = (0..n)
-            .map(|i| {
-                let vec = &data[i * dim..(i + 1) * dim];
-                min_distance_to_centroids(
-                    vec,
-                    data_norms[i],
-                    &centroids,
-                    &centroid_norms,
-                    dim,
-                    centroid_norms.len(),
-                    metric,
-                )
-            })
-            .collect();
+        let latest_centroid = &centroids[(centroids.len() - dim)..];
+        let latest_norm = *centroid_norms.last().unwrap();
+
+        match metric {
+            Dist::Euclidean => {
+                for (i, dist) in distances.iter_mut().enumerate() {
+                    let vec = &data[i * dim..(i + 1) * dim];
+                    let d = euclidean_distance_static(vec, latest_centroid);
+                    if d < *dist {
+                        *dist = d;
+                    }
+                }
+            }
+            Dist::Cosine => {
+                for (i, dist) in distances.iter_mut().enumerate() {
+                    let vec = &data[i * dim..(i + 1) * dim];
+                    let d = cosine_distance_static_norm(
+                        vec,
+                        latest_centroid,
+                        &data_norms[i],
+                        &latest_norm,
+                    );
+                    if d < *dist {
+                        *dist = d;
+                    }
+                }
+            }
+        }
 
         let total: f64 = distances.iter().map(|&d| d.to_f64().unwrap()).sum();
         let threshold = rng.random::<f64>() * total;
@@ -276,22 +321,21 @@ where
     candidates.extend_from_slice(&data[first_idx * dim..(first_idx + 1) * dim]);
     candidate_norms.push(data_norms[first_idx]);
 
+    let mut distances = vec![T::zero(); n];
+
     for _ in 0..n_rounds {
-        let distances: Vec<T> = (0..n)
-            .into_par_iter()
-            .map(|i| {
-                let vec = &data[i * dim..(i + 1) * dim];
-                min_distance_to_centroids(
-                    vec,
-                    data_norms[i],
-                    &candidates,
-                    &candidate_norms,
-                    dim,
-                    candidate_norms.len(),
-                    metric,
-                )
-            })
-            .collect();
+        distances.par_iter_mut().enumerate().for_each(|(i, dist)| {
+            let vec = &data[i * dim..(i + 1) * dim];
+            *dist = min_distance_to_centroids(
+                vec,
+                data_norms[i],
+                &candidates,
+                &candidate_norms,
+                dim,
+                candidate_norms.len(),
+                metric,
+            );
+        });
 
         let total_dist: f64 = distances.iter().map(|&d| d.to_f64().unwrap()).sum();
 
@@ -345,6 +389,765 @@ where
     centroids
 }
 
+///////////////////////////
+// GEMM-based assignment //
+///////////////////////////
+
+/// Compute dot product tile: dots[i,c] = dot(data_block[i], centroids[c])
+///
+/// Uses faer GEMM to compute dots = data_mat * centroids^T. The output
+/// matrix is reused across tiles and resized only when dimensions change.
+///
+/// ### Params
+///
+/// * `data_block` - Tile of input vectors, row-major (tile_n * dim elements)
+/// * `tile_n` - Number of vectors in this tile
+/// * `centroids` - All centroids, row-major (k * dim elements)
+/// * `dim` - Embedding dimensions
+/// * `k` - Number of centroids
+/// * `dots` - Output matrix (tile_n x k), overwritten in place
+#[inline]
+fn gemm_dot_tile<T>(
+    data_block: &[T],
+    tile_n: usize,
+    centroids: &[T],
+    dim: usize,
+    k: usize,
+    dots: &mut Mat<T>,
+) where
+    T: Float + SimdDistance + faer_traits::ComplexField,
+{
+    let data_mat = MatRef::from_row_major_slice(data_block, tile_n, dim);
+    let cent_mat = MatRef::from_row_major_slice(centroids, k, dim);
+
+    if dots.nrows() != tile_n || dots.ncols() != k {
+        *dots = Mat::<T>::zeros(tile_n, k);
+    }
+
+    // dots = 1.0 * data_mat * cent_mat^T, overwriting
+    matmul(
+        dots.as_mut(),
+        Accum::Replace,
+        data_mat,
+        cent_mat.transpose(),
+        T::one(),
+        Par::Rayon(NonZero::new(rayon::current_num_threads()).unwrap()),
+    );
+}
+
+/// Full GEMM-based nearest centroid assignment over all n vectors
+///
+/// Processes vectors in tiles of GEMM_TILE_SIZE. For each vector, finds
+/// the closest and second-closest centroid using the dot-product trick
+/// to avoid explicit distance computation.
+///
+/// For Euclidean: dist^2 = ||x||^2 - 2*dot(x,c) + ||c||^2, so maximising
+/// 2*dot - ||c||^2 minimises squared distance.
+///
+/// For Cosine: similarity = dot(x,c) / (||x|| * ||c||), so maximising
+/// dot / ||c|| (for fixed ||x||) minimises cosine distance.
+///
+/// ### Params
+///
+/// * `data` - All vectors, flattened row-major
+/// * `data_norms_sq` - Per-vector norms: ||x||^2 for Euclidean, ||x|| for
+///   Cosine
+/// * `dim` - Embedding dimensions
+/// * `n` - Number of vectors
+/// * `centroids` - All centroids, flattened row-major
+/// * `centroid_norms` - Per-centroid norms: ||c||^2 for Euclidean, ||c|| for
+///   Cosine
+/// * `k` - Number of centroids
+/// * `metric` - Distance metric
+/// * `assignments` - Output: nearest centroid index per vector
+/// * `upper_bounds` - Output: distance to nearest centroid per vector
+/// * `lower_bounds` - Output: distance to second-nearest centroid per vector
+fn gemm_assign_full<T>(
+    data: &[T],
+    data_norms_sq: &[T], // ||x||^2 for Euclidean; ||x|| for Cosine
+    dim: usize,
+    n: usize,
+    centroids: &[T],
+    centroid_norms: &[T], // ||c||^2 for Euclidean; ||c|| for Cosine
+    k: usize,
+    metric: &Dist,
+    assignments: &mut [usize],
+    upper_bounds: &mut [T],
+    lower_bounds: &mut [T],
+) where
+    T: Float + SimdDistance + faer_traits::ComplexField,
+{
+    let two = T::one() + T::one();
+    let mut dots = Mat::<T>::new();
+
+    for tile_start in (0..n).step_by(GEMM_TILE_SIZE) {
+        let tile_end = (tile_start + GEMM_TILE_SIZE).min(n);
+        let tile_n = tile_end - tile_start;
+        let data_block = &data[tile_start * dim..tile_end * dim];
+
+        gemm_dot_tile(data_block, tile_n, centroids, dim, k, &mut dots);
+
+        for local_i in 0..tile_n {
+            let global_i = tile_start + local_i;
+            let mut best_c = 0;
+            let mut best_score = T::neg_infinity();
+            let mut second_score = T::neg_infinity();
+
+            match metric {
+                Dist::Euclidean => {
+                    for c in 0..k {
+                        let score = two * dots[(local_i, c)] - centroid_norms[c];
+                        if score > best_score {
+                            second_score = best_score;
+                            best_score = score;
+                            best_c = c;
+                        } else if score > second_score {
+                            second_score = score;
+                        }
+                    }
+                    assignments[global_i] = best_c;
+                    upper_bounds[global_i] =
+                        (data_norms_sq[global_i] - best_score).max(T::zero()).sqrt();
+                    lower_bounds[global_i] = (data_norms_sq[global_i] - second_score)
+                        .max(T::zero())
+                        .sqrt();
+                }
+                Dist::Cosine => {
+                    for c in 0..k {
+                        let cn = centroid_norms[c];
+                        let inv_cn = if cn > T::zero() {
+                            T::one() / cn
+                        } else {
+                            T::zero()
+                        };
+                        let score = dots[(local_i, c)] * inv_cn;
+                        if score > best_score {
+                            second_score = best_score;
+                            best_score = score;
+                            best_c = c;
+                        } else if score > second_score {
+                            second_score = score;
+                        }
+                    }
+                    let xn = data_norms_sq[global_i];
+                    let inv_xn = if xn > T::zero() {
+                        T::one() / xn
+                    } else {
+                        T::zero()
+                    };
+                    assignments[global_i] = best_c;
+                    upper_bounds[global_i] = T::one() - best_score * inv_xn;
+                    lower_bounds[global_i] = T::one() - second_score * inv_xn;
+                }
+            }
+        }
+    }
+}
+
+/// Reassign a subset of "dirty" points whose bounds are no longer tight
+///
+/// For small dirty sets (< GEMM_DIRTY_THRESHOLD), computes distances
+/// directly via SIMD dot products to avoid gather/scatter overhead.
+/// For larger sets, gathers dirty vectors into a contiguous buffer,
+/// runs full GEMM assignment, and scatters results back.
+///
+/// ### Params
+///
+/// * `data` - All vectors, flattened row-major
+/// * `data_norms_sq` - Per-vector norms: ||x||^2 for Euclidean, ||x|| for
+///   Cosine
+/// * `dim` - Embedding dimensions
+/// * `centroids` - All centroids, flattened row-major
+/// * `centroid_norms` - Per-centroid norms: ||c||^2 for Euclidean, ||c|| for
+///   Cosine
+/// * `k` - Number of centroids
+/// * `metric` - Distance metric
+/// * `dirty` - Indices of vectors requiring reassignment
+/// * `assignments` - In/out: nearest centroid index per vector
+/// * `upper_bounds` - In/out: distance to nearest centroid per vector
+/// * `lower_bounds` - In/out: distance to second-nearest centroid per vector
+fn gemm_reassign_dirty<T>(
+    data: &[T],
+    data_norms_sq: &[T],
+    dim: usize,
+    centroids: &[T],
+    centroid_norms: &[T],
+    k: usize,
+    metric: &Dist,
+    dirty: &[usize],
+    assignments: &mut [usize],
+    upper_bounds: &mut [T],
+    lower_bounds: &mut [T],
+) where
+    T: Float + SimdDistance + faer_traits::ComplexField,
+{
+    let nd = dirty.len();
+
+    if nd < GEMM_DIRTY_THRESHOLD {
+        let two = T::one() + T::one();
+        for &i in dirty {
+            let vec = &data[i * dim..(i + 1) * dim];
+            let mut best_c = 0;
+            let mut best_score = T::neg_infinity();
+            let mut second_score = T::neg_infinity();
+
+            match metric {
+                Dist::Euclidean => {
+                    for c in 0..k {
+                        let cent = &centroids[c * dim..(c + 1) * dim];
+                        let dot = T::dot_simd(vec, cent);
+                        let score = two * dot - centroid_norms[c];
+                        if score > best_score {
+                            second_score = best_score;
+                            best_score = score;
+                            best_c = c;
+                        } else if score > second_score {
+                            second_score = score;
+                        }
+                    }
+                    assignments[i] = best_c;
+                    upper_bounds[i] = (data_norms_sq[i] - best_score).max(T::zero()).sqrt();
+                    lower_bounds[i] = (data_norms_sq[i] - second_score).max(T::zero()).sqrt();
+                }
+                Dist::Cosine => {
+                    for c in 0..k {
+                        let cent = &centroids[c * dim..(c + 1) * dim];
+                        let dot = T::dot_simd(vec, cent);
+                        let cn = centroid_norms[c];
+                        let inv_cn = if cn > T::zero() {
+                            T::one() / cn
+                        } else {
+                            T::zero()
+                        };
+                        let score = dot * inv_cn;
+                        if score > best_score {
+                            second_score = best_score;
+                            best_score = score;
+                            best_c = c;
+                        } else if score > second_score {
+                            second_score = score;
+                        }
+                    }
+                    let xn = data_norms_sq[i];
+                    let inv_xn = if xn > T::zero() {
+                        T::one() / xn
+                    } else {
+                        T::zero()
+                    };
+                    assignments[i] = best_c;
+                    upper_bounds[i] = T::one() - best_score * inv_xn;
+                    lower_bounds[i] = T::one() - second_score * inv_xn;
+                }
+            }
+        }
+        return;
+    }
+
+    // gather dirty vectors into contiguous buffer
+    let mut gathered = Vec::with_capacity(nd * dim);
+    let mut gathered_norms = Vec::with_capacity(nd);
+    for &i in dirty {
+        gathered.extend_from_slice(&data[i * dim..(i + 1) * dim]);
+        gathered_norms.push(data_norms_sq[i]);
+    }
+
+    let mut tmp_assign = vec![0usize; nd];
+    let mut tmp_upper = vec![T::zero(); nd];
+    let mut tmp_lower = vec![T::zero(); nd];
+
+    gemm_assign_full(
+        &gathered,
+        &gathered_norms,
+        dim,
+        nd,
+        centroids,
+        centroid_norms,
+        k,
+        metric,
+        &mut tmp_assign,
+        &mut tmp_upper,
+        &mut tmp_lower,
+    );
+
+    for (local, &global) in dirty.iter().enumerate() {
+        assignments[global] = tmp_assign[local];
+        upper_bounds[global] = tmp_upper[local];
+        lower_bounds[global] = tmp_lower[local];
+    }
+}
+
+///////////////////////////////
+// Centroid update utilities //
+///////////////////////////////
+
+/// Recompute centroids as the mean of their assigned vectors
+///
+/// Uses parallel reduction with per-thread accumulators to sum vectors
+/// and counts per cluster, then divides. Also recomputes centroid norms
+/// in the format expected by the GEMM assignment path.
+///
+/// ### Params
+///
+/// * `data` - All vectors, flattened row-major
+/// * `dim` - Embedding dimensions
+/// * `n` - Number of vectors
+/// * `assignments` - Cluster assignment per vector
+/// * `centroids` - In/out: centroids to update, flattened row-major
+/// * `centroid_norms` - In/out: ||c||^2 for Euclidean, ||c|| for Cosine
+/// * `k` - Number of centroids
+/// * `metric` - Distance metric
+fn update_centroids<T>(
+    data: &[T],
+    dim: usize,
+    n: usize,
+    assignments: &[usize],
+    centroids: &mut [T],
+    centroid_norms: &mut [T],
+    k: usize,
+    metric: &Dist,
+) where
+    T: Float + Send + Sync + SimdDistance,
+{
+    let num_threads = rayon::current_num_threads();
+    let chunk_size = (n + num_threads - 1) / num_threads.max(1);
+
+    let (new_sums, counts) = assignments
+        .par_chunks(chunk_size)
+        .enumerate()
+        .map(|(chunk_idx, assignment_chunk)| {
+            let mut local_sums = vec![T::zero(); k * dim];
+            let mut local_counts = vec![0usize; k];
+
+            let start_idx = chunk_idx * chunk_size;
+            let data_chunk = &data[start_idx * dim..(start_idx + assignment_chunk.len()) * dim];
+
+            for (i, &cluster) in assignment_chunk.iter().enumerate() {
+                local_counts[cluster] += 1;
+                let vec = &data_chunk[i * dim..(i + 1) * dim];
+                let offset = cluster * dim;
+                T::add_assign_simd(&mut local_sums[offset..offset + dim], vec);
+            }
+            (local_sums, local_counts)
+        })
+        .reduce(
+            || (vec![T::zero(); k * dim], vec![0usize; k]),
+            |(mut s1, mut c1), (s2, c2)| {
+                T::add_assign_simd(&mut s1, &s2);
+                for i in 0..c1.len() {
+                    c1[i] += c2[i];
+                }
+                (s1, c1)
+            },
+        );
+
+    for c in 0..k {
+        if counts[c] > 0 {
+            let count_t = T::from(counts[c]).unwrap();
+            let offset = c * dim;
+            for d in 0..dim {
+                centroids[offset + d] = new_sums[offset + d] / count_t;
+            }
+        }
+        let cent = &centroids[c * dim..(c + 1) * dim];
+        centroid_norms[c] = match metric {
+            Dist::Euclidean => T::dot_simd(cent, cent), // ||c||^2
+            Dist::Cosine => T::calculate_l2_norm(cent), // ||c||
+        };
+    }
+}
+
+/// Compute per-centroid drift after an update step
+///
+/// ### Params
+///
+/// * `old_centroids` - Centroids before the update, flattened row-major
+/// * `new_centroids` - Centroids after the update, flattened row-major
+/// * `dim` - Embedding dimensions
+/// * `k` - Number of centroids
+/// * `deltas` - Output: Euclidean distance each centroid moved
+fn compute_centroid_drift<T>(
+    old_centroids: &[T],
+    new_centroids: &[T],
+    dim: usize,
+    k: usize,
+    deltas: &mut [T],
+) where
+    T: Float + SimdDistance,
+{
+    for c in 0..k {
+        let old = &old_centroids[c * dim..(c + 1) * dim];
+        let new = &new_centroids[c * dim..(c + 1) * dim];
+        deltas[c] = euclidean_distance_static(old, new);
+    }
+}
+
+/// Compute s[c] = 0.5 * min_{c' != c} dist(c, c') for all centroids
+///
+/// Uses GEMM to compute the full centroid-centroid dot product matrix,
+/// then derives pairwise Euclidean distances. Used in Hamerly's algorithm
+/// to tighten lower bounds.
+///
+/// ### Params
+///
+/// * `centroids` - All centroids, flattened row-major
+/// * `centroid_norms_sq` - Per-centroid ||c||^2
+/// * `dim` - Embedding dimensions
+/// * `k` - Number of centroids
+///
+/// ### Returns
+///
+/// Vector of length k with half-minimum inter-centroid distances
+fn compute_half_min_centroid_dists<T>(
+    centroids: &[T],
+    centroid_norms_sq: &[T],
+    dim: usize,
+    k: usize,
+) -> Vec<T>
+where
+    T: Float + SimdDistance + faer_traits::ComplexField,
+{
+    let cent_mat = MatRef::from_row_major_slice(centroids, k, dim);
+    let mut cent_dots = Mat::<T>::zeros(k, k);
+
+    matmul(
+        cent_dots.as_mut(),
+        Accum::Replace,
+        cent_mat,
+        cent_mat.transpose(),
+        T::one(),
+        Par::Rayon(NonZero::new(rayon::current_num_threads()).unwrap()),
+    );
+
+    let half = T::one() / (T::one() + T::one());
+    let two = T::one() + T::one();
+    let mut s = vec![T::infinity(); k];
+
+    for i in 0..k {
+        for j in 0..k {
+            if i == j {
+                continue;
+            }
+            let dist_sq = centroid_norms_sq[i] - two * cent_dots[(i, j)] + centroid_norms_sq[j];
+            let dist = dist_sq.max(T::zero()).sqrt();
+            if dist < s[i] {
+                s[i] = dist;
+            }
+        }
+        s[i] = s[i] * half;
+    }
+
+    s
+}
+
+/// Find the two largest centroid drifts
+///
+/// ### Params
+///
+/// * `deltas` - Per-centroid drift values
+///
+/// ### Returns
+///
+/// Tuple of (largest drift, second largest drift, index of largest)
+fn top_two_deltas<T: Float>(deltas: &[T]) -> (T, T, usize) {
+    let mut max1 = T::neg_infinity();
+    let mut max2 = T::neg_infinity();
+    let mut max1_idx = 0;
+
+    for (c, &d) in deltas.iter().enumerate() {
+        if d > max1 {
+            max2 = max1;
+            max1 = d;
+            max1_idx = c;
+        } else if d > max2 {
+            max2 = d;
+        }
+    }
+
+    (max1, max2, max1_idx)
+}
+
+/// Compute exact Euclidean distance between a single point and a centroid
+///
+/// Uses the identity dist = sqrt(||x||^2 - 2*dot(x,c) + ||c||^2) with
+/// a SIMD dot product. Used to tighten upper bounds in Hamerly's algorithm.
+///
+/// ### Params
+///
+/// * `data` - All vectors, flattened row-major
+/// * `data_norms_sq` - Per-vector ||x||^2
+/// * `dim` - Embedding dimensions
+/// * `i` - Index of the vector
+/// * `centroids` - All centroids, flattened row-major
+/// * `centroid_norms_sq` - Per-centroid ||c||^2
+/// * `c` - Index of the centroid
+///
+/// ### Returns
+///
+/// Euclidean distance between vector i and centroid c
+#[inline]
+fn exact_point_centroid_dist<T>(
+    data: &[T],
+    data_norms_sq: &[T],
+    dim: usize,
+    i: usize,
+    centroids: &[T],
+    centroid_norms_sq: &[T],
+    c: usize,
+) -> T
+where
+    T: Float + SimdDistance,
+{
+    let vec = &data[i * dim..(i + 1) * dim];
+    let cent = &centroids[c * dim..(c + 1) * dim];
+    let dot = T::dot_simd(vec, cent);
+    let two = T::one() + T::one();
+    let dist_sq = data_norms_sq[i] - two * dot + centroid_norms_sq[c];
+    dist_sq.max(T::zero()).sqrt()
+}
+
+//////////////////////////////
+// Hamerly's Lloyd's (Eucl) //
+//////////////////////////////
+
+/// Hamerly's accelerated k-means for Euclidean distance
+///
+/// Maintains per-point upper and lower distance bounds to skip redundant
+/// distance computations. Points are only reassigned when their bounds
+/// become loose enough that a cluster change is possible. Uses GEMM for
+/// both initial full assignment and dirty-point reassignment.
+///
+/// ### Params
+///
+/// * `data` - All vectors, flattened row-major
+/// * `data_norms_sq` - Per-vector ||x||^2
+/// * `dim` - Embedding dimensions
+/// * `n` - Number of vectors
+/// * `centroids` - In/out: centroids, flattened row-major
+/// * `centroid_norms_sq` - In/out: per-centroid ||c||^2
+/// * `k` - Number of centroids
+/// * `max_iters` - Maximum number of Lloyd's iterations
+/// * `verbose` - Print convergence diagnostics
+fn hamerly_lloyd<T>(
+    data: &[T],
+    data_norms_sq: &[T],
+    dim: usize,
+    n: usize,
+    centroids: &mut [T],
+    centroid_norms_sq: &mut [T],
+    k: usize,
+    max_iters: usize,
+    verbose: bool,
+) where
+    T: Float + Send + Sync + SimdDistance + faer_traits::ComplexField,
+{
+    let mut assignments = vec![0usize; n];
+    let mut upper = vec![T::infinity(); n];
+    let mut lower = vec![T::zero(); n];
+    let mut old_centroids = vec![T::zero(); k * dim];
+    let mut deltas = vec![T::zero(); k];
+    let mut dirty = Vec::with_capacity(n);
+
+    gemm_assign_full(
+        data,
+        data_norms_sq,
+        dim,
+        n,
+        centroids,
+        centroid_norms_sq,
+        k,
+        &Dist::Euclidean,
+        &mut assignments,
+        &mut upper,
+        &mut lower,
+    );
+
+    for iter in 0..max_iters {
+        old_centroids.copy_from_slice(centroids);
+
+        update_centroids(
+            data,
+            dim,
+            n,
+            &assignments,
+            centroids,
+            centroid_norms_sq,
+            k,
+            &Dist::Euclidean,
+        );
+
+        compute_centroid_drift(&old_centroids, centroids, dim, k, &mut deltas);
+        let (max_delta, second_max_delta, max_delta_idx) = top_two_deltas(&deltas);
+
+        if max_delta == T::zero() {
+            if verbose {
+                println!("    Converged at iteration {}", iter + 1);
+            }
+            break;
+        }
+
+        for i in 0..n {
+            upper[i] = upper[i] + deltas[assignments[i]];
+            let other_max = if assignments[i] == max_delta_idx {
+                second_max_delta
+            } else {
+                max_delta
+            };
+            lower[i] = (lower[i] - other_max).max(T::zero());
+        }
+
+        let s = compute_half_min_centroid_dists(centroids, centroid_norms_sq, dim, k);
+
+        dirty.clear();
+        for i in 0..n {
+            let m = if s[assignments[i]] > lower[i] {
+                s[assignments[i]]
+            } else {
+                lower[i]
+            };
+            if upper[i] > m {
+                upper[i] = exact_point_centroid_dist(
+                    data,
+                    data_norms_sq,
+                    dim,
+                    i,
+                    centroids,
+                    centroid_norms_sq,
+                    assignments[i],
+                );
+                if upper[i] > m {
+                    dirty.push(i);
+                }
+            }
+        }
+
+        if dirty.is_empty() {
+            if verbose {
+                println!("    Converged at iteration {} (bounds tight)", iter + 1);
+            }
+            break;
+        }
+
+        gemm_reassign_dirty(
+            data,
+            data_norms_sq,
+            dim,
+            centroids,
+            centroid_norms_sq,
+            k,
+            &Dist::Euclidean,
+            &dirty,
+            &mut assignments,
+            &mut upper,
+            &mut lower,
+        );
+
+        if verbose && (iter + 1) % 10 == 0 {
+            println!(
+                "    Iteration {} ({} / {} points reassessed, {:.1}% pruned)",
+                iter + 1,
+                dirty.len(),
+                n,
+                (1.0 - dirty.len() as f64 / n as f64) * 100.0,
+            );
+        }
+    }
+}
+
+////////////////////////////////
+// GEMM-only Lloyd's (Cosine) //
+////////////////////////////////
+
+/// Plain Lloyd's k-means for cosine distance using GEMM assignment
+///
+/// Cosine distance does not satisfy the triangle inequality, so
+/// Hamerly's bound-based pruning is not applicable. Instead, runs
+/// full GEMM reassignment every iteration and converges when no
+/// assignments change.
+///
+/// ### Params
+///
+/// * `data` - All vectors, flattened row-major
+/// * `data_norms` - Per-vector ||x|| (L2 norms)
+/// * `dim` - Embedding dimensions
+/// * `n` - Number of vectors
+/// * `centroids` - In/out: centroids, flattened row-major
+/// * `centroid_norms` - In/out: per-centroid ||c|| (L2 norms)
+/// * `k` - Number of centroids
+/// * `max_iters` - Maximum number of Lloyd's iterations
+/// * `verbose` - Print convergence diagnostics
+fn gemm_lloyd_cosine<T>(
+    data: &[T],
+    data_norms: &[T],
+    dim: usize,
+    n: usize,
+    centroids: &mut [T],
+    centroid_norms: &mut [T],
+    k: usize,
+    max_iters: usize,
+    verbose: bool,
+) where
+    T: Float + Send + Sync + SimdDistance + faer_traits::ComplexField,
+{
+    let mut assignments = vec![0usize; n];
+    let mut prev_assignments = vec![usize::MAX; n];
+    let mut upper = vec![T::zero(); n];
+    let mut lower = vec![T::zero(); n];
+
+    for iter in 0..max_iters {
+        gemm_assign_full(
+            data,
+            data_norms,
+            dim,
+            n,
+            centroids,
+            centroid_norms,
+            k,
+            &Dist::Cosine,
+            &mut assignments,
+            &mut upper,
+            &mut lower,
+        );
+
+        let changed: usize = assignments
+            .par_iter()
+            .zip(prev_assignments.par_iter())
+            .filter(|(a, b)| a != b)
+            .count();
+
+        if changed == 0 {
+            if verbose {
+                println!("    Converged at iteration {}", iter + 1);
+            }
+            break;
+        }
+
+        update_centroids(
+            data,
+            dim,
+            n,
+            &assignments,
+            centroids,
+            centroid_norms,
+            k,
+            &Dist::Cosine,
+        );
+
+        std::mem::swap(&mut prev_assignments, &mut assignments);
+
+        if verbose && (iter + 1) % 10 == 0 {
+            println!(
+                "    Iteration {} complete ({} assignments changed)",
+                iter + 1,
+                changed
+            );
+        }
+    }
+}
+
+///////////////////
+// Lloyd's (SIMD //
+///////////////////
+
 /// Parallel Lloyd's k-means iterations
 ///
 /// Iteratively assigns vectors to nearest centroids and recomputes
@@ -376,11 +1179,11 @@ fn parallel_lloyd<T>(
     max_iters: usize,
     verbose: bool,
 ) where
-    T: Float + Send + Sync + SimdDistance,
+    T: Float + Send + Sync + SimdDistance + ComplexField,
 {
     let mut prev_assignments: Vec<usize> = vec![usize::MAX; n];
-    // on small data sets SIMD is actually slower...
-    let use_simd = dim >= 64;
+    let num_threads = rayon::current_num_threads();
+    let chunk_size = (n + num_threads - 1) / num_threads.max(1);
 
     for iter in 0..max_iters {
         let mut assignments = assign_all_parallel(
@@ -395,8 +1198,8 @@ fn parallel_lloyd<T>(
         );
 
         let changed: usize = assignments
-            .iter()
-            .zip(prev_assignments.iter())
+            .par_iter()
+            .zip(prev_assignments.par_iter())
             .filter(|(a, b)| a != b)
             .count();
 
@@ -407,66 +1210,49 @@ fn parallel_lloyd<T>(
             break;
         }
 
-        let (new_sums, counts) = if use_simd {
-            (0..n)
-                .into_par_iter()
-                .fold(
-                    || (vec![T::zero(); k * dim], vec![0usize; k]),
-                    |(mut sums, mut counts), i| {
-                        let cluster = assignments[i];
-                        counts[cluster] += 1;
-                        let vec = &data[i * dim..(i + 1) * dim];
-                        T::add_assign_simd(&mut sums[cluster * dim..(cluster + 1) * dim], vec);
-                        (sums, counts)
-                    },
-                )
-                .reduce(
-                    || (vec![T::zero(); k * dim], vec![0usize; k]),
-                    |(mut sums1, mut counts1), (sums2, counts2)| {
-                        T::add_assign_simd(&mut sums1, &sums2);
-                        for i in 0..counts1.len() {
-                            counts1[i] += counts2[i];
-                        }
-                        (sums1, counts1)
-                    },
-                )
-        } else {
-            (0..n)
-                .into_par_iter()
-                .fold(
-                    || (vec![T::zero(); k * dim], vec![0usize; k]),
-                    |(mut sums, mut counts), i| {
-                        let cluster = assignments[i];
-                        counts[cluster] += 1;
-                        let vec = &data[i * dim..(i + 1) * dim];
-                        for d in 0..dim {
-                            sums[cluster * dim + d] = sums[cluster * dim + d] + vec[d];
-                        }
-                        (sums, counts)
-                    },
-                )
-                .reduce(
-                    || (vec![T::zero(); k * dim], vec![0usize; k]),
-                    |(mut sums1, mut counts1), (sums2, counts2)| {
-                        for i in 0..sums1.len() {
-                            sums1[i] = sums1[i] + sums2[i];
-                        }
-                        for i in 0..counts1.len() {
-                            counts1[i] += counts2[i];
-                        }
-                        (sums1, counts1)
-                    },
-                )
-        };
+        let (new_sums, counts) = assignments
+            .par_chunks(chunk_size)
+            .enumerate()
+            .map(|(chunk_idx, assignment_chunk)| {
+                let mut local_sums = vec![T::zero(); k * dim];
+                let mut local_counts = vec![0usize; k];
 
+                let start_idx = chunk_idx * chunk_size;
+                let data_chunk = &data[start_idx * dim..(start_idx + assignment_chunk.len()) * dim];
+
+                for (i, &cluster) in assignment_chunk.iter().enumerate() {
+                    local_counts[cluster] += 1;
+                    let vec = &data_chunk[i * dim..(i + 1) * dim];
+                    let cluster_offset = cluster * dim;
+
+                    T::add_assign_simd(&mut local_sums[cluster_offset..cluster_offset + dim], vec);
+                }
+                (local_sums, local_counts)
+            })
+            .reduce(
+                || (vec![T::zero(); k * dim], vec![0usize; k]),
+                |(mut sums1, mut counts1), (sums2, counts2)| {
+                    T::add_assign_simd(&mut sums1, &sums2);
+                    for i in 0..counts1.len() {
+                        counts1[i] += counts2[i];
+                    }
+                    (sums1, counts1)
+                },
+            );
+
+        // Update centroids and compute STANDARD norms
         for c in 0..k {
             if counts[c] > 0 {
                 let count_t = T::from(counts[c]).unwrap();
+                let cluster_offset = c * dim;
+
                 for d in 0..dim {
-                    centroids[c * dim + d] = new_sums[c * dim + d] / count_t;
+                    centroids[cluster_offset + d] = new_sums[cluster_offset + d] / count_t;
                 }
+
                 if matches!(metric, Dist::Cosine) {
-                    centroid_norms[c] = T::calculate_l2_norm(&centroids[c * dim..(c + 1) * dim]);
+                    let cent = &centroids[cluster_offset..cluster_offset + dim];
+                    centroid_norms[c] = T::calculate_l2_norm(cent);
                 }
             }
         }
@@ -483,11 +1269,222 @@ fn parallel_lloyd<T>(
     }
 }
 
+////////////////
+// Assignment //
+////////////////
+
+/// Assign vectors to nearest centroids using GEMM-based distance computation
+///
+/// ### Params
+///
+/// * `data` - Vectors to assign (flattened)
+/// * `dim` - Embedding dimensions
+/// * `n` - Number of vectors
+/// * `centroids` - Current centroids
+/// * `k` - Number of clusters
+/// * `metric` - Distance metric
+///
+/// ### Returns
+///
+/// Vector of cluster assignments (one per input vector)
+fn gemm_assign<T>(
+    data: &[T],
+    dim: usize,
+    n: usize,
+    centroids: &[T],
+    k: usize,
+    metric: &Dist,
+) -> Vec<usize>
+where
+    T: Float + Send + Sync + SimdDistance + ComplexField,
+{
+    let data_norms: Vec<T> = match metric {
+        Dist::Euclidean => (0..n)
+            .map(|i| {
+                let v = &data[i * dim..(i + 1) * dim];
+                T::dot_simd(v, v)
+            })
+            .collect(),
+        Dist::Cosine => (0..n)
+            .map(|i| T::calculate_l2_norm(&data[i * dim..(i + 1) * dim]))
+            .collect(),
+    };
+    let centroid_norms: Vec<T> = match metric {
+        Dist::Euclidean => (0..k)
+            .map(|c| {
+                let cent = &centroids[c * dim..(c + 1) * dim];
+                T::dot_simd(cent, cent)
+            })
+            .collect(),
+        Dist::Cosine => (0..k)
+            .map(|c| T::calculate_l2_norm(&centroids[c * dim..(c + 1) * dim]))
+            .collect(),
+    };
+
+    let mut assignments = vec![0usize; n];
+    let mut upper = vec![T::zero(); n];
+    let mut lower = vec![T::zero(); n];
+
+    gemm_assign_full(
+        data,
+        &data_norms,
+        dim,
+        n,
+        centroids,
+        &centroid_norms,
+        k,
+        metric,
+        &mut assignments,
+        &mut upper,
+        &mut lower,
+    );
+
+    assignments
+}
+
+/// Assign vectors to nearest centroids via direct dot product comparisons
+///
+/// ### Params
+///
+/// * `data` - Vectors to assign (flattened)
+/// * `_data_norms` - Norms of the vectors (unused)
+/// * `dim` - Embedding dimensions
+/// * `n` - Number of vectors
+/// * `centroids` - Current centroids
+/// * `centroid_norms` - Norms of the centroids
+/// * `k` - Number of clusters
+/// * `metric` - Distance metric
+///
+/// ### Returns
+///
+/// Vector of cluster assignments (one per input vector)
+fn direct_assign<T>(
+    data: &[T],
+    _data_norms: &[T],
+    dim: usize,
+    n: usize,
+    centroids: &[T],
+    centroid_norms: &[T],
+    k: usize,
+    metric: &Dist,
+) -> Vec<usize>
+where
+    T: Float + Send + Sync + SimdDistance,
+{
+    let two = T::one() + T::one();
+
+    let shortcut_norms: Vec<T> = match metric {
+        Dist::Euclidean => (0..k)
+            .map(|c| {
+                let cent = &centroids[c * dim..(c + 1) * dim];
+                T::dot_simd(cent, cent)
+            })
+            .collect(),
+        Dist::Cosine => (0..k)
+            .map(|c| {
+                let norm = centroid_norms[c];
+                if norm > T::zero() {
+                    T::one() / norm
+                } else {
+                    T::zero()
+                }
+            })
+            .collect(),
+    };
+
+    match metric {
+        Dist::Euclidean => (0..n)
+            .into_par_iter()
+            .map(|i| {
+                let vec = &data[i * dim..(i + 1) * dim];
+                let mut best = 0;
+                let mut max_score = T::neg_infinity();
+                for c in 0..k {
+                    let cent = &centroids[c * dim..(c + 1) * dim];
+                    let score = two * T::dot_simd(vec, cent) - shortcut_norms[c];
+                    if score > max_score {
+                        max_score = score;
+                        best = c;
+                    }
+                }
+                best
+            })
+            .collect(),
+        Dist::Cosine => (0..n)
+            .into_par_iter()
+            .map(|i| {
+                let vec = &data[i * dim..(i + 1) * dim];
+                let mut best = 0;
+                let mut max_score = T::neg_infinity();
+                for c in 0..k {
+                    let cent = &centroids[c * dim..(c + 1) * dim];
+                    let score = T::dot_simd(vec, cent) * shortcut_norms[c];
+                    if score > max_score {
+                        max_score = score;
+                        best = c;
+                    }
+                }
+                best
+            })
+            .collect(),
+    }
+}
+
+/// Assign all vectors to their nearest centroids in parallel
+///
+/// ### Params
+///
+/// * `data` - Vectors to assign (flattened)
+/// * `data_norms` - Norms of the vector
+/// * `dim` - Embedding dimensions
+/// * `n` - Number of vectors
+/// * `centroids` - Current centroids
+/// * `centroid_norms` - Norms of the centroid
+/// * `k` - Number of clusters
+/// * `metric` - Distance metric
+///
+/// ### Returns
+///
+/// Vector of cluster assignments (one per input vector)
+#[allow(clippy::too_many_arguments)]
+pub fn assign_all_parallel<T>(
+    data: &[T],
+    data_norms: &[T],
+    dim: usize,
+    n: usize,
+    centroids: &[T],
+    centroid_norms: &[T],
+    k: usize,
+    metric: &Dist,
+) -> Vec<usize>
+where
+    T: Float + Send + Sync + SimdDistance + ComplexField,
+{
+    if dim >= GEMM_DIM_THRESHOLD {
+        gemm_assign(data, dim, n, centroids, k, metric)
+    } else {
+        direct_assign(
+            data,
+            data_norms,
+            dim,
+            n,
+            centroids,
+            centroid_norms,
+            k,
+            metric,
+        )
+    }
+}
+
 //////////
 // Main //
 //////////
 
 /// Train k-means centroids
+///
+/// Pending on the dimensionality of the data, it will use either
+/// SIMD-accelerated k-means clustering via Lloyd's (n_dim ≤ 64) or use
+/// a GEMM-accelerated version for larger data sets.
 ///
 /// ### Params
 ///
@@ -515,14 +1512,20 @@ pub fn train_centroids<T>(
     verbose: bool,
 ) -> Vec<T>
 where
-    T: Float + FromPrimitive + ToPrimitive + Send + Sync + SimdDistance,
+    T: AnnSearchFloat,
 {
-    let data_norms = if matches!(metric, Dist::Cosine) {
-        (0..n)
+    let data_norms: Vec<T> = match metric {
+        Dist::Euclidean => (0..n)
+            .into_par_iter()
+            .map(|i| {
+                let v = &data[i * dim..(i + 1) * dim];
+                T::dot_simd(v, v)
+            })
+            .collect(),
+        Dist::Cosine => (0..n)
+            .into_par_iter()
             .map(|i| T::calculate_l2_norm(&data[i * dim..(i + 1) * dim]))
-            .collect()
-    } else {
-        vec![T::one(); n]
+            .collect(),
     };
 
     let mut centroids = if n_centroids > 200 {
@@ -534,32 +1537,85 @@ where
         if verbose {
             println!("  Initialising centroids via k-means||");
         }
-        kmeans_parallel_init(data, &data_norms, dim, n, n_centroids, metric, seed)
+        let init_norms: Vec<T> = match metric {
+            Dist::Euclidean => (0..n)
+                .map(|i| T::calculate_l2_norm(&data[i * dim..(i + 1) * dim]))
+                .collect(),
+            Dist::Cosine => data_norms.clone(),
+        };
+        kmeans_parallel_init(data, &init_norms, dim, n, n_centroids, metric, seed)
     };
 
-    let mut centroid_norms = if matches!(metric, Dist::Cosine) {
-        (0..n_centroids)
+    let mut centroid_norms: Vec<T> = match metric {
+        Dist::Euclidean => (0..n_centroids)
+            .map(|i| {
+                let c = &centroids[i * dim..(i + 1) * dim];
+                T::dot_simd(c, c)
+            })
+            .collect(),
+        Dist::Cosine => (0..n_centroids)
             .map(|i| T::calculate_l2_norm(&centroids[i * dim..(i + 1) * dim]))
-            .collect()
-    } else {
-        vec![T::one(); n_centroids]
+            .collect(),
     };
 
     if verbose {
-        println!("  Running parallel Lloyd's iterations");
+        println!("  Running Lloyd's iterations");
     }
-    parallel_lloyd(
-        data,
-        &data_norms,
-        dim,
-        n,
-        &mut centroids,
-        &mut centroid_norms,
-        n_centroids,
-        metric,
-        max_iters,
-        verbose,
-    );
+
+    match metric {
+        _ if dim < GEMM_DIM_THRESHOLD => {
+            if verbose {
+                println!(
+                    "    (direct SIMD assignment, dim={} below GEMM threshold)",
+                    dim
+                );
+            }
+            parallel_lloyd(
+                data,
+                &data_norms,
+                dim,
+                n,
+                &mut centroids,
+                &mut centroid_norms,
+                n_centroids,
+                metric,
+                max_iters,
+                verbose,
+            );
+        }
+        Dist::Euclidean => {
+            if verbose {
+                println!("    (Hamerly's bounds + GEMM assignment)");
+            }
+            hamerly_lloyd(
+                data,
+                &data_norms,
+                dim,
+                n,
+                &mut centroids,
+                &mut centroid_norms,
+                n_centroids,
+                max_iters,
+                verbose,
+            );
+        }
+        Dist::Cosine => {
+            if verbose {
+                println!("    (GEMM assignment, no Hamerly -- cosine lacks triangle inequality)");
+            }
+            gemm_lloyd_cosine(
+                data,
+                &data_norms,
+                dim,
+                n,
+                &mut centroids,
+                &mut centroid_norms,
+                n_centroids,
+                max_iters,
+                verbose,
+            );
+        }
+    }
 
     centroids
 }
@@ -604,58 +1660,6 @@ pub fn build_csr_layout(
     }
 
     (all_indices, offsets)
-}
-
-/// Assign all vectors to their nearest centroids in parallel
-///
-/// ### Params
-///
-/// * `data` - Vectors to assign (flattened)
-/// * `dim` - Embedding dimensions
-/// * `n` - Number of vectors
-/// * `centroids` - Current centroids
-/// * `k` - Number of clusters
-/// * `metric` - Distance metric
-///
-/// ### Returns
-///
-/// Vector of cluster assignments (one per input vector)
-#[allow(clippy::too_many_arguments)]
-pub fn assign_all_parallel<T>(
-    data: &[T],
-    data_norms: &[T],
-    dim: usize,
-    n: usize,
-    centroids: &[T],
-    centroid_norms: &[T],
-    k: usize,
-    metric: &Dist,
-) -> Vec<usize>
-where
-    T: Float + Send + Sync + SimdDistance,
-{
-    (0..n)
-        .into_par_iter()
-        .map(|i| {
-            let vec = &data[i * dim..(i + 1) * dim];
-            let mut best_cluster = 0;
-            let mut best_dist = T::infinity();
-            for c in 0..k {
-                let cent = &centroids[c * dim..(c + 1) * dim];
-                let dist = match metric {
-                    Dist::Euclidean => euclidean_distance_static(vec, cent),
-                    Dist::Cosine => {
-                        cosine_distance_static_norm(vec, cent, &data_norms[i], &centroid_norms[c])
-                    }
-                };
-                if dist < best_dist {
-                    best_dist = dist;
-                    best_cluster = c;
-                }
-            }
-            best_cluster
-        })
-        .collect()
 }
 
 /// Sample random vectors from dataset
