@@ -185,7 +185,7 @@ pub fn merge_topk<F: Float>(
     out_indices: &mut Tensor<u32>,
 ) {
     let query_idx = ABSOLUTE_POS_X as usize;
-    let k = dists_a.shape(1) as usize;
+    let k = dists_a.shape(1);
 
     if query_idx >= dists_a.shape(0) {
         terminate!();
@@ -224,7 +224,7 @@ pub fn merge_topk<F: Float>(
 pub fn init_topk<F: Float>(dists: &mut Tensor<F>, indices: &mut Tensor<u32>) {
     let query_idx = ABSOLUTE_POS_Y as usize;
     let k_idx = ABSOLUTE_POS_X as usize;
-    let k = dists.shape(1) as usize;
+    let k = dists.shape(1);
 
     if query_idx >= dists.shape(0) || k_idx >= k {
         terminate!();

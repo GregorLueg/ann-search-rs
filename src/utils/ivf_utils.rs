@@ -462,6 +462,7 @@ fn gemm_dot_tile<T>(
 /// * `assignments` - Output: nearest centroid index per vector
 /// * `upper_bounds` - Output: distance to nearest centroid per vector
 /// * `lower_bounds` - Output: distance to second-nearest centroid per vector
+#[allow(clippy::too_many_arguments)]
 fn gemm_assign_full<T>(
     data: &[T],
     data_norms_sq: &[T], // ||x||^2 for Euclidean; ||x|| for Cosine
@@ -566,6 +567,7 @@ fn gemm_assign_full<T>(
 /// * `assignments` - In/out: nearest centroid index per vector
 /// * `upper_bounds` - In/out: distance to nearest centroid per vector
 /// * `lower_bounds` - In/out: distance to second-nearest centroid per vector
+#[allow(clippy::too_many_arguments)]
 fn gemm_reassign_dirty<T>(
     data: &[T],
     data_norms_sq: &[T],
@@ -696,6 +698,7 @@ fn gemm_reassign_dirty<T>(
 /// * `centroid_norms` - In/out: ||c||^2 for Euclidean, ||c|| for Cosine
 /// * `k` - Number of centroids
 /// * `metric` - Distance metric
+#[allow(clippy::too_many_arguments)]
 fn update_centroids<T>(
     data: &[T],
     dim: usize,
@@ -927,6 +930,7 @@ where
 /// * `k` - Number of centroids
 /// * `max_iters` - Maximum number of Lloyd's iterations
 /// * `verbose` - Print convergence diagnostics
+#[allow(clippy::too_many_arguments)]
 fn hamerly_lloyd<T>(
     data: &[T],
     data_norms_sq: &[T],
@@ -1075,6 +1079,7 @@ fn hamerly_lloyd<T>(
 /// * `k` - Number of centroids
 /// * `max_iters` - Maximum number of Lloyd's iterations
 /// * `verbose` - Print convergence diagnostics
+#[allow(clippy::too_many_arguments)]
 fn gemm_lloyd_cosine<T>(
     data: &[T],
     data_norms: &[T],
@@ -1358,6 +1363,7 @@ where
 /// ### Returns
 ///
 /// Vector of cluster assignments (one per input vector)
+#[allow(clippy::too_many_arguments)]
 fn direct_assign<T>(
     data: &[T],
     _data_norms: &[T],

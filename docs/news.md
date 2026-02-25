@@ -9,6 +9,7 @@
 - Binary quantiser with reranking.
 - Improved LSH index with multi-probe support.
 - Updated benchmarks with 128 dimensions tested across various indices.
+- Improved k-means clustering (impacting IVF) for higher dimensions.
 
 ## 0.2.3
 
