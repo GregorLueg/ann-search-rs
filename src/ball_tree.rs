@@ -257,6 +257,7 @@ pub struct BallTreeIndex<T> {
 // VectorDistance //
 ////////////////////
 
+/// VectorDistance implementation
 impl<T> VectorDistance<T> for BallTreeIndex<T>
 where
     T: AnnSearchFloat,

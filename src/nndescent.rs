@@ -17,35 +17,43 @@ use crate::utils::*;
 
 /// Neighbour entry in k-NN graph
 ///
-/// Flat structure in C representation for better cache locality
+/// Flat structure in C representation for better cache locality. We use
+/// the 32-bit of the pid_and_flag to store if is `is_new`. Reduces the number
+/// of nodes able to be stored to ca. 2 billion which is sufficient...
 ///
 /// ### Fields
 ///
-/// * `pid` - Index of the point
+/// * `pid_and_flag` - Index of the point + bit used to mark is new/old
 /// * `dist` - Distance to the neighbour
-/// * `is_new` - 1 - yes; 0 - no
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
 pub struct Neighbour<T> {
-    pid: u32,
-    dist: T,
-    is_new: u32,
+    pid_and_flag: u32,
+    pub dist: T,
 }
 
 impl<T: Copy> Neighbour<T> {
+    // 1 at the 31st bit, 0s everywhere else
+    const IS_NEW_MASK: u32 = 1 << 31;
+
+    // 0 at the 31st bit, 1s everywhere else
+    const PID_MASK: u32 = !Self::IS_NEW_MASK;
+
     /// Generate a new neighbour
     ///
     /// ### Params
     ///
-    /// * `pid` - Point id of the neighbour
-    /// * `dist` - Distance to that neighbour
-    /// * `is_new` - Flag if it is a new neighbour
+    /// * `pid` - Point id
+    /// * `dist` - The distance
+    /// * `is_new` - Flag is it's a new neighbour
     #[inline(always)]
-    fn new(pid: usize, dist: T, is_new: bool) -> Self {
+    pub fn new(pid: usize, dist: T, is_new: bool) -> Self {
+        debug_assert!(pid <= Self::PID_MASK as usize, "PID exceeds 31-bit limit");
+
+        let flag = if is_new { Self::IS_NEW_MASK } else { 0 };
         Self {
-            pid: pid as u32,
+            pid_and_flag: (pid as u32) | flag,
             dist,
-            is_new: is_new as u32,
         }
     }
 
@@ -53,20 +61,26 @@ impl<T: Copy> Neighbour<T> {
     ///
     /// ### Returns
     ///
-    /// Boolean indicating if it is an old or new neighbour
+    /// Boolean
     #[inline(always)]
-    fn is_new(&self) -> bool {
-        self.is_new != 0
+    pub fn is_new(&self) -> bool {
+        (self.pid_and_flag & Self::IS_NEW_MASK) != 0
     }
 
     /// Get the PID
     ///
     /// ### Returns
     ///
-    /// The index
+    /// The id
     #[inline(always)]
-    fn pid(&self) -> usize {
-        self.pid as usize
+    pub fn pid(&self) -> usize {
+        (self.pid_and_flag & Self::PID_MASK) as usize
+    }
+
+    /// Mutate the flag in place to mark as old
+    #[inline(always)]
+    pub fn mark_old(&mut self) {
+        self.pid_and_flag &= Self::PID_MASK;
     }
 }
 
@@ -517,6 +531,11 @@ where
             );
         }
 
+        let mut new_cands = vec![Vec::with_capacity(max_candidates * 2); self.n];
+        let mut old_cands = vec![Vec::with_capacity(max_candidates * 2); self.n];
+        let mut new_cands_sym = vec![Vec::with_capacity(max_candidates); self.n];
+        let mut old_cands_sym = vec![Vec::with_capacity(max_candidates); self.n];
+
         for iter in 0..max_iter {
             let updates_count = AtomicUsize::new(0);
 
@@ -525,7 +544,15 @@ where
             if verbose {
                 println!(" Preparing candidates for iter {}", iter + 1);
             }
-            let (new_cands, old_cands) = self.build_candidates(&graph, max_candidates, &mut rng);
+            self.build_candidates(
+                &graph,
+                max_candidates,
+                &mut rng,
+                &mut new_cands,
+                &mut old_cands,
+                &mut new_cands_sym,
+                &mut old_cands_sym,
+            );
 
             self.mark_as_old(&mut graph, &new_cands);
 
@@ -603,19 +630,30 @@ where
     /// * `graph` - Current k-NN graph
     /// * `max_candidates` - Maximum candidates per node
     /// * `rng` - Random number generator for sampling
-    ///
-    /// ### Returns
-    ///
-    /// Tuple of `(new_candidates, old_candidates)` for all nodes
+    /// * `new_cands` - Mutable slice/buffer for new candidates
+    /// * `old_cands` - Mutable slice/buffer of old candidates
+    /// * `new_cands_sym` - Mutable slice/buffer of new symmetric candidates
+    /// * `old_cands_sym` - Mutable slice/buffer of old symmetric candidates
+    #[allow(clippy::too_many_arguments)]
     fn build_candidates(
         &self,
         graph: &[Vec<Neighbour<T>>],
         max_candidates: usize,
         rng: &mut SmallRng,
-    ) -> (Vec<Vec<usize>>, Vec<Vec<usize>>) {
-        let mut new_cands: Vec<Vec<usize>> = vec![Vec::with_capacity(max_candidates); self.n];
-        let mut old_cands: Vec<Vec<usize>> = vec![Vec::with_capacity(max_candidates); self.n];
+        new_cands: &mut [Vec<usize>],
+        old_cands: &mut [Vec<usize>],
+        new_cands_sym: &mut [Vec<usize>],
+        old_cands_sym: &mut [Vec<usize>],
+    ) {
+        // clear the main buffers from the previous iteration
+        for i in 0..self.n {
+            new_cands[i].clear();
+            old_cands[i].clear();
+            new_cands_sym[i].clear();
+            old_cands_sym[i].clear();
+        }
 
+        // hoist the temporary sort buffers out of the N loop
         let mut new_temp: Vec<(f64, usize)> = Vec::with_capacity(max_candidates * 2);
         let mut old_temp: Vec<(f64, usize)> = Vec::with_capacity(max_candidates * 2);
 
@@ -630,7 +668,6 @@ where
                 }
 
                 let priority = rng.random::<f64>();
-
                 if neighbour.is_new() {
                     new_temp.push((priority, j));
                 } else {
@@ -665,9 +702,7 @@ where
             }
         }
 
-        let mut new_cands_sym: Vec<Vec<usize>> = vec![Vec::new(); self.n];
-        let mut old_cands_sym: Vec<Vec<usize>> = vec![Vec::new(); self.n];
-
+        // build symmetric candidates
         for i in 0..self.n {
             for &j in &new_cands[i] {
                 if j < self.n && !new_cands_sym[j].contains(&i) {
@@ -681,12 +716,11 @@ where
             }
         }
 
+        // merge symmetric candidates into main buffers
         for i in 0..self.n {
-            new_cands[i].extend(&new_cands_sym[i]);
-            old_cands[i].extend(&old_cands_sym[i]);
+            new_cands[i].extend_from_slice(&new_cands_sym[i]);
+            old_cands[i].extend_from_slice(&old_cands_sym[i]);
         }
-
-        (new_cands, old_cands)
     }
 
     /// Mark neighbours as old if they appear in new candidate lists
@@ -706,11 +740,9 @@ where
             }
 
             for neighbour in &mut graph[i] {
-                if neighbour.is_new() {
-                    let pid = neighbour.pid();
-                    if new_cands[i].contains(&pid) {
-                        *neighbour = Neighbour::new(pid, neighbour.dist, false);
-                    }
+                if neighbour.is_new() && new_cands[i].contains(&neighbour.pid()) {
+                    // with new approach -> no allocation needed
+                    neighbour.mark_old();
                 }
             }
         }
@@ -749,14 +781,20 @@ where
                         continue;
                     }
 
-                    for k in j..new_cands[i].len() {
+                    // move this out and hoist
+                    let p_threshold = graph[p].last().map(|n| n.dist).unwrap_or_else(T::infinity);
+
+                    for k in (j + 1)..new_cands[i].len() {
                         let q = new_cands[i][k];
-                        if q >= self.n || p == q {
+                        if q >= self.n {
                             continue;
                         }
 
+                        let q_threshold =
+                            graph[q].last().map(|n| n.dist).unwrap_or_else(T::infinity);
+
                         let d = self.distance(p, q);
-                        if self.should_add_edge(p, q, d, graph) {
+                        if d <= p_threshold || d <= q_threshold {
                             updates.push((p, q, d));
                             updates.push((q, p, d));
                         }
