@@ -12,7 +12,7 @@ use crate::binary::binariser::*;
 use crate::binary::dist_binary::*;
 use crate::binary::vec_store::*;
 use crate::prelude::*;
-use crate::utils::ivf_utils::*;
+use crate::utils::k_means_utils::*;
 use crate::utils::*;
 
 /// IVF index with binary quantisation
@@ -144,15 +144,8 @@ where
         }
 
         // 1. subsample for training if needed
-        let (training_data, n_train) = if n > 500_000 {
-            if verbose {
-                println!("  Sampling 250k vectors for training");
-            }
-            let (data, _) = sample_vectors(&vectors_flat, dim, n, 250_000, seed);
-            (data, 250_000)
-        } else {
-            (vectors_flat.clone(), n)
-        };
+        let n_train = (256 * nlist).min(250_000).min(n).max(1);
+        let (training_data, _) = sample_vectors(&vectors_flat, dim, n, n_train, seed);
 
         // 2. train float centroids
         let centroids_float = train_centroids(
