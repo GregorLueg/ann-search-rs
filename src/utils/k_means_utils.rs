@@ -550,7 +550,7 @@ fn gemm_assign_full<T>(
         );
 }
 
-/// Reassign a subset of "dirty" points whose bounds are no longer tight
+/// Reassign a subset of "dirty" points whose bounds are no longer tight.
 ///
 /// For small dirty sets (< GEMM_DIRTY_THRESHOLD), computes distances
 /// directly via SIMD dot products to avoid gather/scatter overhead.
@@ -560,18 +560,25 @@ fn gemm_assign_full<T>(
 /// ### Params
 ///
 /// * `data` - All vectors, flattened row-major
-/// * `data_norms_sq` - Per-vector norms: ||x||^2 for Euclidean, ||x|| for
+/// * `data_norms_sq` - Per-vector norms: `||x||^2` for Euclidean, `||x||` for
 ///   Cosine
-/// * `dim` - Embedding dimensions
+/// * `dim` - Embedding dimension
 /// * `centroids` - All centroids, flattened row-major
-/// * `centroid_norms` - Per-centroid norms: ||c||^2 for Euclidean, ||c|| for
-///   Cosine
+/// * `centroid_norms` - Per-centroid norms: `||c||^2` for Euclidean, `||c||`
+///   for Cosine
 /// * `k` - Number of centroids
 /// * `metric` - Distance metric
 /// * `dirty` - Indices of vectors requiring reassignment
 /// * `assignments` - In/out: nearest centroid index per vector
 /// * `upper_bounds` - In/out: distance to nearest centroid per vector
 /// * `lower_bounds` - In/out: distance to second-nearest centroid per vector
+/// * `gathered_data` - Scratch buffer for gathering dirty vectors into a
+///   contiguous block
+/// * `gathered_norms` - Scratch buffer for norms corresponding to gathered
+///   vectors
+/// * `tmp_assign` - Scratch buffer for centroid assignments of gathered vectors
+/// * `tmp_upper` - Scratch buffer for upper bounds of gathered vectors
+/// * `tmp_lower` - Scratch buffer for lower bounds of gathered vectors
 #[allow(clippy::too_many_arguments)]
 fn gemm_reassign_dirty<T>(
     data: &[T],
