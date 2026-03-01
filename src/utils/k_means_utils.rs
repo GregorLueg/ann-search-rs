@@ -115,7 +115,7 @@ const GEMM_TILE_SIZE: usize = 4096;
 
 /// Below this number of dirty points, skip GEMM gather/scatter overhead
 /// and compute distances directly via SIMD loops.
-const GEMM_DIRTY_THRESHOLD: usize = 128;
+const GEMM_DIRTY_THRESHOLD: usize = 96;
 
 /// Minimum dimension at which GEMM assignment outperforms direct SIMD loops.
 /// Below this, the GEMM kernel setup and tile-scanning overhead exceeds the
