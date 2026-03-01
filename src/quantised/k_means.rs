@@ -2,7 +2,7 @@ use num_traits::Float;
 use rayon::prelude::*;
 
 use crate::prelude::*;
-use crate::utils::ivf_utils::*;
+use crate::utils::k_means_utils::*;
 
 /////////////
 // Helpers //

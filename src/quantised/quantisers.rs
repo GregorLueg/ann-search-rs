@@ -7,7 +7,7 @@ use std::ops::AddAssign;
 
 use crate::prelude::*;
 use crate::quantised::k_means::*;
-use crate::utils::ivf_utils::*;
+use crate::utils::k_means_utils::*;
 
 ///////////////////////
 // Bf16 quantisation //
@@ -260,32 +260,26 @@ where
         let subvec_dim = dim / m;
         let n = vectors_flat.len() / dim;
 
-        let mut codebooks = Vec::with_capacity(m);
-
-        for subspace in 0..m {
-            if verbose {
-                println!("  Training codebook {} / {}", subspace + 1, m);
-            }
-
-            // get the subvectors
-            let mut subvectors = Vec::with_capacity(n * subvec_dim);
-            for vec_idx in 0..n {
-                let vec_start = vec_idx * dim + subspace * subvec_dim;
-                subvectors.extend_from_slice(&vectors_flat[vec_start..vec_start + subvec_dim]);
-            }
-
-            // train k-means with n clusters
-            let centroids = train_centroids_pq(
-                &subvectors,
-                subvec_dim,
-                n,
-                n_centroids,
-                max_iters,
-                seed + subspace,
-            );
-
-            codebooks.push(centroids);
-        }
+        let codebooks: Vec<Vec<T>> = (0..m)
+            .map(|subspace| {
+                if verbose {
+                    println!("  Training codebook {} / {}", subspace + 1, m);
+                }
+                let mut subvectors = Vec::with_capacity(n * subvec_dim);
+                for vec_idx in 0..n {
+                    let vec_start = vec_idx * dim + subspace * subvec_dim;
+                    subvectors.extend_from_slice(&vectors_flat[vec_start..vec_start + subvec_dim]);
+                }
+                train_centroids_pq(
+                    &subvectors,
+                    subvec_dim,
+                    n,
+                    n_centroids,
+                    max_iters,
+                    seed + subspace,
+                )
+            })
+            .collect();
 
         if verbose {
             println!("  Product quantiser training complete");
@@ -409,26 +403,24 @@ where
             let subvec_start = subspace * self.subvec_dim();
 
             // extract all subvectors for this subspace (n x subvec_dim)
-            let mut subvecs = Mat::<f32>::zeros(n, self.subvec_dim());
+            let mut subvecs = Mat::<T>::zeros(n, self.subvec_dim());
             for i in 0..n {
                 for j in 0..self.subvec_dim() {
-                    subvecs[(i, j)] = vectors[i * dim + subvec_start + j].to_f32().unwrap();
+                    subvecs[(i, j)] = vectors[i * dim + subvec_start + j];
                 }
             }
 
             // centroids matrix (n_centroids x subvec_dim)
-            let mut centroids = Mat::<f32>::zeros(self.n_centroids(), self.subvec_dim());
+            let mut centroids = Mat::<T>::zeros(self.n_centroids(), self.subvec_dim());
             for i in 0..self.n_centroids() {
                 for j in 0..self.subvec_dim() {
-                    centroids[(i, j)] = self.codebooks()[subspace][i * self.subvec_dim() + j]
-                        .to_f32()
-                        .unwrap();
+                    centroids[(i, j)] = self.codebooks()[subspace][i * self.subvec_dim() + j];
                 }
             }
 
             // Compute squared distances: ||x - c||^2 = ||x||^2 + ||c||^2 - 2*x@c^T
             // Precompute ||c||^2 for all centroids
-            let centroid_norms: Vec<f32> = (0..self.n_centroids())
+            let centroid_norms: Vec<T> = (0..self.n_centroids())
                 .map(|i| {
                     (0..self.subvec_dim())
                         .map(|j| centroids[(i, j)].powi(2))
@@ -436,21 +428,17 @@ where
                 })
                 .collect();
 
-            let dot_products = Scale(-2.0) * &subvecs * centroids.transpose();
+            let dot_products = Scale(-T::from_f32(2.0).unwrap()) * &subvecs * centroids.transpose();
 
             all_codes
                 .par_chunks_mut(self.m())
                 .enumerate()
                 .for_each(|(vec_idx, codes)| {
-                    let x_norm: f32 = (0..self.subvec_dim())
-                        .map(|j| subvecs[(vec_idx, j)].powi(2))
-                        .sum();
-
                     let mut best_idx = 0;
-                    let mut best_dist = f32::INFINITY;
+                    let mut best_dist = T::infinity();
 
                     for c in 0..self.n_centroids() {
-                        let dist = x_norm + centroid_norms[c] + dot_products[(vec_idx, c)];
+                        let dist = centroid_norms[c] + dot_products[(vec_idx, c)];
                         if dist < best_dist {
                             best_dist = dist;
                             best_idx = c;

@@ -9,7 +9,7 @@ use thousands::*;
 
 use crate::prelude::*;
 use crate::quantised::quantisers::*;
-use crate::utils::ivf_utils::*;
+use crate::utils::k_means_utils::*;
 use crate::utils::*;
 
 ////////////////
@@ -164,15 +164,8 @@ where
         }
 
         // 1. Subsample training data
-        let (training_data, n_train) = if n > 500_000 {
-            if verbose {
-                println!("  Sampling 250k vectors for training");
-            }
-            let (data, _) = sample_vectors(&vectors_flat, dim, n, 250_000, seed);
-            (data, 250_000)
-        } else {
-            (vectors_flat.clone(), n)
-        };
+        let n_train = (256 * nlist).min(250_000).min(n).max(1);
+        let (training_data, _) = sample_vectors(&vectors_flat, dim, n, n_train, seed);
 
         if verbose {
             println!("  Generating IVF-OPQ index with {} Voronoi cells.", nlist);

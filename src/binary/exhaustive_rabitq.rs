@@ -14,7 +14,7 @@ use crate::binary::dist_binary::*;
 use crate::binary::rabitq::*;
 use crate::binary::vec_store::*;
 use crate::prelude::*;
-use crate::utils::ivf_utils::CentroidDistance;
+use crate::utils::k_means_utils::CentroidDistance;
 use crate::utils::*;
 
 /// Exhaustive RaBitQ index with multi-centroid support

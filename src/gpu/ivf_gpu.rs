@@ -12,7 +12,7 @@ use crate::gpu::tensor::*;
 use crate::gpu::*;
 use crate::prelude::*;
 use crate::utils::dist::Dist;
-use crate::utils::ivf_utils::*;
+use crate::utils::k_means_utils::*;
 use crate::utils::*;
 
 /// To not explode memory VRAM memory
@@ -114,16 +114,9 @@ where
         let max_iters = max_iters.unwrap_or(30);
         let nlist = nlist.unwrap_or((n as f32).sqrt() as usize).max(1);
 
-        // Subsample for training if large
-        let (training_data, n_train) = if n > 500_000 {
-            if verbose {
-                println!("  Sampling 250k vectors for training");
-            }
-            let (data, _) = sample_vectors(&vectors_flat, dim, n, 250_000, seed);
-            (data, 250_000)
-        } else {
-            (vectors_flat.clone(), n)
-        };
+        // subsample for training if large
+        let n_train = (256 * nlist).min(250_000).min(n).max(1);
+        let (training_data, _) = sample_vectors(&vectors_flat, dim, n, n_train, seed);
 
         if verbose {
             println!(
@@ -589,7 +582,7 @@ where
             })
             .collect();
 
-        let max_candidates = *candidates_per_query.iter().max().unwrap_or(&0);
+        let max_candidates: usize = *candidates_per_query.iter().max().unwrap_or(&0);
 
         if verbose {
             println!(

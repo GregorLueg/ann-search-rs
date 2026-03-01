@@ -1,6 +1,7 @@
 use faer::{linalg::matmul::matmul, Accum, Mat, MatRef, Par};
 use faer_traits::ComplexField;
 use num_traits::Float;
+use num_traits::FromPrimitive;
 use rand::rngs::StdRng;
 use rand::seq::SliceRandom;
 use rand::Rng;
@@ -118,8 +119,9 @@ const GEMM_DIRTY_THRESHOLD: usize = 128;
 
 /// Minimum dimension at which GEMM assignment outperforms direct SIMD loops.
 /// Below this, the GEMM kernel setup and tile-scanning overhead exceeds the
-/// cache-blocking benefit.
-const GEMM_DIM_THRESHOLD: usize = 64;
+/// cache-blocking benefit. This needs to be quite high for GEMM to actually
+/// be better.
+const GEMM_DIM_THRESHOLD: usize = 128;
 
 /////////////
 // Helpers //
@@ -431,7 +433,7 @@ fn gemm_dot_tile<T>(
         data_mat,
         cent_mat.transpose(),
         T::one(),
-        Par::Rayon(NonZero::new(rayon::current_num_threads()).unwrap()),
+        Par::Seq,
     );
 }
 
@@ -453,7 +455,6 @@ fn gemm_dot_tile<T>(
 /// * `data_norms_sq` - Per-vector norms: ||x||^2 for Euclidean, ||x|| for
 ///   Cosine
 /// * `dim` - Embedding dimensions
-/// * `n` - Number of vectors
 /// * `centroids` - All centroids, flattened row-major
 /// * `centroid_norms` - Per-centroid norms: ||c||^2 for Euclidean, ||c|| for
 ///   Cosine
@@ -467,7 +468,6 @@ fn gemm_assign_full<T>(
     data: &[T],
     data_norms_sq: &[T], // ||x||^2 for Euclidean; ||x|| for Cosine
     dim: usize,
-    n: usize,
     centroids: &[T],
     centroid_norms: &[T], // ||c||^2 for Euclidean; ||c|| for Cosine
     k: usize,
@@ -479,70 +479,75 @@ fn gemm_assign_full<T>(
     T: Float + SimdDistance + faer_traits::ComplexField,
 {
     let two = T::one() + T::one();
-    let mut dots = Mat::<T>::new();
 
-    for tile_start in (0..n).step_by(GEMM_TILE_SIZE) {
-        let tile_end = (tile_start + GEMM_TILE_SIZE).min(n);
-        let tile_n = tile_end - tile_start;
-        let data_block = &data[tile_start * dim..tile_end * dim];
+    data.par_chunks(GEMM_TILE_SIZE * dim)
+        .zip(data_norms_sq.par_chunks(GEMM_TILE_SIZE))
+        .zip(assignments.par_chunks_mut(GEMM_TILE_SIZE))
+        .zip(upper_bounds.par_chunks_mut(GEMM_TILE_SIZE))
+        .zip(lower_bounds.par_chunks_mut(GEMM_TILE_SIZE))
+        .for_each_init(
+            || Mat::<T>::new(), // Thread-local matrix buffer
+            |dots, ((((data_block, norm_block), assign_block), upper_block), lower_block)| {
+                let tile_n = norm_block.len();
 
-        gemm_dot_tile(data_block, tile_n, centroids, dim, k, &mut dots);
+                // Compute dots sequentially *within* this Rayon thread
+                gemm_dot_tile(data_block, tile_n, centroids, dim, k, dots);
 
-        for local_i in 0..tile_n {
-            let global_i = tile_start + local_i;
-            let mut best_c = 0;
-            let mut best_score = T::neg_infinity();
-            let mut second_score = T::neg_infinity();
+                // Sequential argmax reduction over the tile
+                for local_i in 0..tile_n {
+                    let mut best_c = 0;
+                    let mut best_score = T::neg_infinity();
+                    let mut second_score = T::neg_infinity();
 
-            match metric {
-                Dist::Euclidean => {
-                    for c in 0..k {
-                        let score = two * dots[(local_i, c)] - centroid_norms[c];
-                        if score > best_score {
-                            second_score = best_score;
-                            best_score = score;
-                            best_c = c;
-                        } else if score > second_score {
-                            second_score = score;
+                    match metric {
+                        Dist::Euclidean => {
+                            for c in 0..k {
+                                let score = two * dots[(local_i, c)] - centroid_norms[c];
+                                if score > best_score {
+                                    second_score = best_score;
+                                    best_score = score;
+                                    best_c = c;
+                                } else if score > second_score {
+                                    second_score = score;
+                                }
+                            }
+                            assign_block[local_i] = best_c;
+                            upper_block[local_i] =
+                                (norm_block[local_i] - best_score).max(T::zero()).sqrt();
+                            lower_block[local_i] =
+                                (norm_block[local_i] - second_score).max(T::zero()).sqrt();
+                        }
+                        Dist::Cosine => {
+                            for c in 0..k {
+                                let cn = centroid_norms[c];
+                                let inv_cn = if cn > T::zero() {
+                                    T::one() / cn
+                                } else {
+                                    T::zero()
+                                };
+                                let score = dots[(local_i, c)] * inv_cn;
+                                if score > best_score {
+                                    second_score = best_score;
+                                    best_score = score;
+                                    best_c = c;
+                                } else if score > second_score {
+                                    second_score = score;
+                                }
+                            }
+                            let xn = norm_block[local_i];
+                            let inv_xn = if xn > T::zero() {
+                                T::one() / xn
+                            } else {
+                                T::zero()
+                            };
+                            assign_block[local_i] = best_c;
+                            upper_block[local_i] = T::one() - best_score * inv_xn;
+                            lower_block[local_i] = T::one() - second_score * inv_xn;
                         }
                     }
-                    assignments[global_i] = best_c;
-                    upper_bounds[global_i] =
-                        (data_norms_sq[global_i] - best_score).max(T::zero()).sqrt();
-                    lower_bounds[global_i] = (data_norms_sq[global_i] - second_score)
-                        .max(T::zero())
-                        .sqrt();
                 }
-                Dist::Cosine => {
-                    for c in 0..k {
-                        let cn = centroid_norms[c];
-                        let inv_cn = if cn > T::zero() {
-                            T::one() / cn
-                        } else {
-                            T::zero()
-                        };
-                        let score = dots[(local_i, c)] * inv_cn;
-                        if score > best_score {
-                            second_score = best_score;
-                            best_score = score;
-                            best_c = c;
-                        } else if score > second_score {
-                            second_score = score;
-                        }
-                    }
-                    let xn = data_norms_sq[global_i];
-                    let inv_xn = if xn > T::zero() {
-                        T::one() / xn
-                    } else {
-                        T::zero()
-                    };
-                    assignments[global_i] = best_c;
-                    upper_bounds[global_i] = T::one() - best_score * inv_xn;
-                    lower_bounds[global_i] = T::one() - second_score * inv_xn;
-                }
-            }
-        }
-    }
+            },
+        );
 }
 
 /// Reassign a subset of "dirty" points whose bounds are no longer tight
@@ -580,6 +585,12 @@ fn gemm_reassign_dirty<T>(
     assignments: &mut [usize],
     upper_bounds: &mut [T],
     lower_bounds: &mut [T],
+    // scratch spaces
+    gathered_data: &mut Vec<T>,
+    gathered_norms: &mut Vec<T>,
+    tmp_assign: &mut [usize],
+    tmp_upper: &mut [T],
+    tmp_lower: &mut [T],
 ) where
     T: Float + SimdDistance + faer_traits::ComplexField,
 {
@@ -646,29 +657,24 @@ fn gemm_reassign_dirty<T>(
     }
 
     // gather dirty vectors into contiguous buffer
-    let mut gathered = Vec::with_capacity(nd * dim);
-    let mut gathered_norms = Vec::with_capacity(nd);
+    gathered_data.clear();
+    gathered_norms.clear();
     for &i in dirty {
-        gathered.extend_from_slice(&data[i * dim..(i + 1) * dim]);
+        gathered_data.extend_from_slice(&data[i * dim..(i + 1) * dim]);
         gathered_norms.push(data_norms_sq[i]);
     }
 
-    let mut tmp_assign = vec![0usize; nd];
-    let mut tmp_upper = vec![T::zero(); nd];
-    let mut tmp_lower = vec![T::zero(); nd];
-
     gemm_assign_full(
-        &gathered,
-        &gathered_norms,
+        gathered_data,
+        gathered_norms,
         dim,
-        nd,
         centroids,
         centroid_norms,
         k,
         metric,
-        &mut tmp_assign,
-        &mut tmp_upper,
-        &mut tmp_lower,
+        &mut tmp_assign[..nd],
+        &mut tmp_upper[..nd],
+        &mut tmp_lower[..nd],
     );
 
     for (local, &global) in dirty.iter().enumerate() {
@@ -942,7 +948,7 @@ fn hamerly_lloyd<T>(
     max_iters: usize,
     verbose: bool,
 ) where
-    T: Float + Send + Sync + SimdDistance + faer_traits::ComplexField,
+    T: Float + Send + Sync + SimdDistance + faer_traits::ComplexField + FromPrimitive,
 {
     let mut assignments = vec![0usize; n];
     let mut upper = vec![T::infinity(); n];
@@ -951,11 +957,16 @@ fn hamerly_lloyd<T>(
     let mut deltas = vec![T::zero(); k];
     let mut dirty = Vec::with_capacity(n);
 
+    let mut ws_gathered_data = Vec::with_capacity(n * dim);
+    let mut ws_gathered_norms = Vec::with_capacity(n);
+    let mut ws_tmp_assign = vec![0usize; n];
+    let mut ws_tmp_upper = vec![T::zero(); n];
+    let mut ws_tmp_lower = vec![T::zero(); n];
+
     gemm_assign_full(
         data,
         data_norms_sq,
         dim,
-        n,
         centroids,
         centroid_norms_sq,
         k,
@@ -982,7 +993,7 @@ fn hamerly_lloyd<T>(
         compute_centroid_drift(&old_centroids, centroids, dim, k, &mut deltas);
         let (max_delta, second_max_delta, max_delta_idx) = top_two_deltas(&deltas);
 
-        if max_delta == T::zero() {
+        if max_delta <= T::from_f64(1e-5).unwrap() {
             if verbose {
                 println!("    Converged at iteration {}", iter + 1);
             }
@@ -1043,6 +1054,11 @@ fn hamerly_lloyd<T>(
             &mut assignments,
             &mut upper,
             &mut lower,
+            &mut ws_gathered_data,
+            &mut ws_gathered_norms,
+            &mut ws_tmp_assign,
+            &mut ws_tmp_upper,
+            &mut ws_tmp_lower,
         );
 
         if verbose && (iter + 1) % 10 == 0 {
@@ -1103,7 +1119,6 @@ fn gemm_lloyd_cosine<T>(
             data,
             data_norms,
             dim,
-            n,
             centroids,
             centroid_norms,
             k,
@@ -1334,7 +1349,6 @@ where
         data,
         &data_norms,
         dim,
-        n,
         centroids,
         &centroid_norms,
         k,

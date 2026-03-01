@@ -9,7 +9,7 @@ use std::iter::Sum;
 
 use crate::binary::dist_binary::*;
 use crate::prelude::*;
-use crate::utils::ivf_utils::*;
+use crate::utils::k_means_utils::*;
 
 /////////////
 // Helpers //

@@ -7,7 +7,7 @@ use std::collections::BinaryHeap;
 use thousands::*;
 
 use crate::prelude::*;
-use crate::utils::ivf_utils::*;
+use crate::utils::k_means_utils::*;
 use crate::utils::tree_utils::*;
 use crate::utils::*;
 

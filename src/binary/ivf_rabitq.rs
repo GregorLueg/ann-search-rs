@@ -15,7 +15,7 @@ use crate::binary::dist_binary::*;
 use crate::binary::rabitq::*;
 use crate::binary::vec_store::*;
 use crate::prelude::*;
-use crate::utils::ivf_utils::*;
+use crate::utils::k_means_utils::*;
 use crate::utils::*;
 
 /// IVF index with RaBitQ quantisation
@@ -160,15 +160,8 @@ where
         };
 
         // subsample for training if large
-        let (training_data, n_train) = if n > 500_000 {
-            if verbose {
-                println!("  Sampling 250k vectors for centroid training.");
-            }
-            let (sampled, _) = sample_vectors(&vectors_flat, dim, n, 250_000, seed);
-            (sampled, 250_000)
-        } else {
-            (vectors_flat.clone(), n)
-        };
+        let n_train = (256 * nlist).min(250_000).min(n).max(1);
+        let (training_data, _) = sample_vectors(&vectors_flat, dim, n, n_train, seed);
 
         // train centroids
         let mut centroids_flat = train_centroids(
