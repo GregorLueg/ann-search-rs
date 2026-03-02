@@ -15,15 +15,19 @@ use crate::annoy::*;
 use crate::prelude::*;
 use crate::utils::*;
 
-/// Neighbour entry in k-NN graph
+/////////////
+// Helpers //
+/////////////
+
+/// Neighbour entry in the k-NN graph (build phase only)
 ///
-/// Flat structure in C representation for better cache locality. We use
-/// the 32-bit of the pid_and_flag to store if is `is_new`. Reduces the number
-/// of nodes able to be stored to ca. 2 billion which is sufficient...
+/// Flat structure in C representation for cache locality. The high bit
+/// of `pid_and_flag` stores the is-new flag, leaving 31 bits for the
+/// point id (sufficient for ~2 billion points).
 ///
 /// ### Fields
 ///
-/// * `pid_and_flag` - Index of the point + bit used to mark is new/old
+/// * `pid_and_flag` - Point index + new/old flag in the high bit
 /// * `dist` - Distance to the neighbour
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
@@ -32,24 +36,23 @@ pub struct Neighbour<T> {
     pub dist: T,
 }
 
-impl<T: Copy> Neighbour<T> {
-    // 1 at the 31st bit, 0s everywhere else
-    const IS_NEW_MASK: u32 = 1 << 31;
+/// Sentinel PID used to mark empty slots in the flat graph.
+const SENTINEL_PID: usize = u32::MAX as usize >> 1;
 
-    // 0 at the 31st bit, 1s everywhere else
+impl<T: Copy> Neighbour<T> {
+    const IS_NEW_MASK: u32 = 1 << 31;
     const PID_MASK: u32 = !Self::IS_NEW_MASK;
 
-    /// Generate a new neighbour
+    /// Create a new neighbour entry.
     ///
     /// ### Params
     ///
-    /// * `pid` - Point id
-    /// * `dist` - The distance
-    /// * `is_new` - Flag is it's a new neighbour
+    /// * `pid` - Point id (must fit in 31 bits)
+    /// * `dist` - Distance to the neighbour
+    /// * `is_new` - Whether this neighbour has been explored yet
     #[inline(always)]
     pub fn new(pid: usize, dist: T, is_new: bool) -> Self {
         debug_assert!(pid <= Self::PID_MASK as usize, "PID exceeds 31-bit limit");
-
         let flag = if is_new { Self::IS_NEW_MASK } else { 0 };
         Self {
             pid_and_flag: (pid as u32) | flag,
@@ -57,81 +60,87 @@ impl<T: Copy> Neighbour<T> {
         }
     }
 
-    /// Is the neighbour new
-    ///
-    /// ### Returns
-    ///
-    /// Boolean
+    /// Whether this neighbour is new (not yet explored).
     #[inline(always)]
     pub fn is_new(&self) -> bool {
         (self.pid_and_flag & Self::IS_NEW_MASK) != 0
     }
 
-    /// Get the PID
-    ///
-    /// ### Returns
-    ///
-    /// The id
+    /// Return the point id.
     #[inline(always)]
     pub fn pid(&self) -> usize {
         (self.pid_and_flag & Self::PID_MASK) as usize
     }
 
-    /// Mutate the flag in place to mark as old
+    /// Whether this slot is a sentinel (empty).
+    #[inline(always)]
+    pub fn is_sentinel(&self) -> bool {
+        self.pid() == SENTINEL_PID
+    }
+
+    /// Mark this neighbour as old (already explored).
     #[inline(always)]
     pub fn mark_old(&mut self) {
         self.pid_and_flag &= Self::PID_MASK;
     }
 }
 
-/// Trait for applying sorted neighbour updates
+/// Unsafe pointer wrapper for lock-free parallel writes to the flat graph.
 ///
-/// Separated by type (f32/f64) due to thread-local heap storage requirements.
-/// The sorted application approach allows lock-free processing since updates
-/// are grouped by target node.
+/// Safety is guaranteed by the update pattern: segments are grouped by
+/// target node, so no two threads ever write to the same `target * k`
+/// block simultaneously.
+#[derive(Copy, Clone)]
+struct UnsafeGraphPtr<T>(*mut Neighbour<T>);
+
+unsafe impl<T> Send for UnsafeGraphPtr<T> {}
+unsafe impl<T> Sync for UnsafeGraphPtr<T> {}
+
+/// Apply sorted neighbour updates to the flat graph.
+///
+/// Separated by concrete type (f32/f64) because of thread-local heap
+/// storage. The sorted layout allows lock-free processing since updates
+/// targeting the same node are contiguous.
 pub trait ApplySortedUpdates<T> {
-    /// Apply sorted updates to the graph
+    /// Apply sorted updates to the flat 1D graph.
     ///
     /// ## Algorithm
     ///
-    /// 1. Find boundaries between different target nodes in the sorted updates
-    /// 2. Extract each target's update batch as a contiguous slice
-    /// 3. Process batches in parallel - no locks needed since each batch
-    ///    updates a different node
-    /// 4. For each batch, merge new candidates with existing neighbours,
-    ///    keeping only the k-best
-    /// 5. Apply results back to the graph
+    /// 1. Find boundaries between different target nodes in the sorted updates.
+    /// 2. Extract each target's update batch as a contiguous slice.
+    /// 3. Process batches in parallel.
+    /// 4. Merge new candidates with existing neighbours via thread-local heaps.
+    /// 5. Write results back to the flat graph via disjoint pointer writes.
     ///
     /// ### Params
     ///
-    /// * `updates` - MUST be sorted by target (first element)
-    /// * `graph` - Graph to update
+    /// * `updates` - Must be sorted by target (first element)
+    /// * `graph` - Flat graph of size `n * k`
+    /// * `k` - Neighbours per node
     /// * `updates_count` - Atomic counter for edge updates
     fn apply_sorted_updates(
         &self,
         updates: &[(usize, usize, T)],
-        graph: &mut [Vec<Neighbour<T>>],
+        graph: &mut [Neighbour<T>],
+        k: usize,
         updates_count: &AtomicUsize,
     );
 }
 
-/// Trait for querying the NN-Descent index
+/// Query interface for the NN-Descent index.
 pub trait NNDescentQuery<T> {
-    /// Internal query dispatch method
-    ///
-    /// Delegates to metric-specific query implementation using thread-local
-    /// storage to avoid allocations.
+    /// Internal query dispatch (delegates to metric-specific implementation).
     ///
     /// ### Params
     ///
     /// * `query_vec` - Query vector
-    /// * `query_norm` - Pre-computed norm (used for Cosine only)
+    /// * `query_norm` - Pre-computed L2 norm (Cosine only; ignored for Euclidean)
     /// * `k` - Number of neighbours to return
     /// * `ef` - Beam width for search
     ///
     /// ### Returns
     ///
-    /// Tuple of (indices, distances)
+    /// `(indices, distances)` sorted by distance ascending
     fn query_internal(
         &self,
         query_vec: &[T],
@@ -140,23 +149,7 @@ pub trait NNDescentQuery<T> {
         ef: usize,
     ) -> (Vec<usize>, Vec<T>);
 
-    /// Query using Euclidean distance with beam search
-    ///
-    /// Uses the Annoy forest for entry points, then performs beam search
-    /// on the k-NN graph to find approximate nearest neighbours.
-    ///
-    /// ### Params
-    ///
-    /// * `query_vec` - Query vector
-    /// * `k` - Number of neighbours to return
-    /// * `ef` - Beam width for search
-    /// * `visited` - Bitset to track visited nodes
-    /// * `candidates` - Min-heap of candidate nodes to explore
-    /// * `results` - Max-heap of current best results
-    ///
-    /// ### Returns
-    ///
-    /// Tuple of (indices, distances)
+    /// Beam search using Euclidean distance.
     fn query_euclidean(
         &self,
         query_vec: &[T],
@@ -167,24 +160,7 @@ pub trait NNDescentQuery<T> {
         results: &mut BinaryHeap<(OrderedFloat<T>, usize)>,
     ) -> (Vec<usize>, Vec<T>);
 
-    /// Query using Cosine distance with beam search
-    ///
-    /// Uses the Annoy forest for entry points, then performs beam search
-    /// on the k-NN graph to find approximate nearest neighbours.
-    ///
-    /// ### Params
-    ///
-    /// * `query_vec` - Query vector
-    /// * `query_norm` - Pre-computed norm of query vector
-    /// * `k` - Number of neighbours to return
-    /// * `ef` - Beam width for search
-    /// * `visited` - Bitset to track visited nodes
-    /// * `candidates` - Min-heap of candidate nodes to explore
-    /// * `results` - Max-heap of current best results
-    ///
-    /// ### Returns
-    ///
-    /// Tuple of (indices, distances)
+    /// Beam search using Cosine distance.
     #[allow(clippy::too_many_arguments)]
     fn query_cosine(
         &self,
@@ -207,58 +183,68 @@ thread_local! {
     static HEAP_F64: RefCell<BinaryHeap<(OrderedFloat<f64>, usize, bool)>> =
         const { RefCell::new(BinaryHeap::new()) };
     static PID_SET: RefCell<Vec<bool>> = const { RefCell::new(Vec::new()) };
-    static QUERY_VISITED: RefCell<FixedBitSet> = const{ RefCell::new(FixedBitSet::new()) };
+
+    static SORT_BUF_F32: RefCell<Vec<(f32, usize, bool)>> =
+        const { RefCell::new(Vec::new()) };
+    static SORT_BUF_F64: RefCell<Vec<(f64, usize, bool)>> =
+        const { RefCell::new(Vec::new()) };
+
+    static QUERY_VISITED: RefCell<FixedBitSet> = const { RefCell::new(FixedBitSet::new()) };
     static QUERY_CANDIDATES_F32: QueryCandF32 =
-        const {RefCell::new(BinaryHeap::new())};
+        const { RefCell::new(BinaryHeap::new()) };
     static QUERY_CANDIDATES_F64: QueryCandF64 =
-        const {RefCell::new(BinaryHeap::new())};
+        const { RefCell::new(BinaryHeap::new()) };
     static QUERY_RESULTS_F32: RefCell<BinaryHeap<(OrderedFloat<f32>, usize)>> =
-        const{RefCell::new(BinaryHeap::new())};
+        const { RefCell::new(BinaryHeap::new()) };
     static QUERY_RESULTS_F64: RefCell<BinaryHeap<(OrderedFloat<f64>, usize)>> =
-        const{RefCell::new(BinaryHeap::new())};
+        const { RefCell::new(BinaryHeap::new()) };
 }
 
-/// NN-Descent index for approximate nearest neighbour search
+/// NN-Descent index for approximate nearest neighbour search.
 ///
-/// Implements the NN-Descent algorithm for efficient k-NN graph construction.
-/// Uses an Annoy index for initialisation and beam search for querying.
+/// Builds a k-NN graph via the NN-Descent algorithm, using an Annoy
+/// forest for initialisation and beam search for querying.
 ///
-/// ### Memory-Efficient Update Strategy
+/// ### Flat graph layout
 ///
-/// The index construction uses a chunked processing approach to bound memory
-/// usage during the update phase. Instead of generating all candidate updates
-/// at once (which can consume 60GB+ on large datasets), we:
+/// Both the build-phase graph (`Vec<Neighbour<T>>`) and the final query
+/// graph (`Vec<(usize, T)>`) are stored as contiguous 1D arrays of size
+/// `n * k`. Node `i`'s neighbours occupy indices `[i*k .. (i+1)*k]`,
+/// sorted by distance ascending. Empty trailing slots are filled with
+/// sentinel values (`SENTINEL_PID`, `T::MAX`).
 ///
-/// 1. Partition source nodes into chunks (default ~50k nodes)
-/// 2. Generate updates only from nodes in the current chunk
-/// 3. Emit both directions (p→q and q→p) during generation
-/// 4. Sort by target node for cache-friendly access
-/// 5. Apply updates lock-free since each target is processed once per chunk
+/// This layout gives better cache locality during graph updates and
+/// queries compared to a `Vec<Vec<...>>` and eliminates per-node heap
+/// allocations entirely.
 ///
-/// This bounds memory to O(chunk_size × max_candidates) rather than
-/// O(n × max_candidates), reducing peak memory by 10-50× on large datasets.
+/// ### Memory-efficient update strategy
+///
+/// During construction, candidate updates are processed in chunks
+/// (~50k source nodes) to bound peak memory to
+/// `O(chunk_size * max_candidates)` rather than `O(n * max_candidates)`.
+/// Each chunk emits both edge directions, sorts by target, and applies
+/// updates lock-free via disjoint pointer writes.
 ///
 /// ### Fields
 ///
-/// * `vectors_flat` - Original vector data, flattened for cache locality
-/// * `dim` - Embedding dimensions
+/// * `vectors_flat` - Original vectors, flattened row-major
+/// * `dim` - Dimensionality
 /// * `n` - Number of vectors
-/// * `norms` - Pre-computed norms for Cosine distance (empty for Euclidean)
-/// * `metric` - Distance metric (Euclidean or Cosine)
-/// * `forest` - The initial Annoy index for initialisation and entry points
-///   into the graph.
-/// * `graph` - The NNDescent generated graph
-/// * `converged` - Boolean indicating if the build phase converged.
+/// * `k` - Neighbours per node in the graph
+/// * `norms` - Pre-computed L2 norms (Cosine only; empty for Euclidean)
+/// * `metric` - Distance metric
+/// * `forest` - Annoy index for entry points
+/// * `graph` - Flat k-NN graph of size `n * k`
+/// * `converged` - Whether construction converged
 pub struct NNDescent<T> {
-    // shared ones
     pub vectors_flat: Vec<T>,
     pub dim: usize,
     pub n: usize,
+    pub k: usize,
     pub norms: Vec<T>,
     metric: Dist,
-    // index specific ones
     forest: AnnoyIndex<T>,
-    graph: Vec<Vec<(usize, T)>>,
+    graph: Vec<(usize, T)>,
     converged: bool,
 }
 
@@ -266,7 +252,6 @@ pub struct NNDescent<T> {
 // VectorDistance //
 ////////////////////
 
-// Implementation of the vector distance trait for NNDescent
 impl<T> VectorDistance<T> for NNDescent<T>
 where
     T: AnnSearchFloat,
@@ -294,24 +279,20 @@ where
     // Index generation //
     //////////////////////
 
-    /// Build a new NN-Descent index
+    /// Build a new NN-Descent index.
     ///
     /// ### Params
     ///
-    /// * `data` - Original data in shape of samples x features
-    /// * `metric` - The distance metric to use
-    /// * `k` - Initial k-nearest neighbours to search
-    /// * `max_iter` - Maximum iterations for the algorithm
+    /// * `data` - Data matrix (samples x features)
+    /// * `metric` - Distance metric
+    /// * `k` - Neighbours per node (default 30)
+    /// * `max_candidates` - Max candidates per node per iteration
+    /// * `max_iter` - Maximum iterations
+    /// * `n_trees` - Annoy forest size
     /// * `delta` - Convergence threshold (fraction of edges updated)
-    /// * `max_candidates` - Maximum candidates to explore per node
-    /// * `n_trees` - Number of trees for Annoy initialisation
     /// * `diversify_prob` - Probability of pruning redundant edges (0 to disable)
-    /// * `seed` - Random seed for reproducibility
-    /// * `verbose` - Print progress information
-    ///
-    /// ### Returns
-    ///
-    /// Initialised NN-Descent index
+    /// * `seed` - Random seed
+    /// * `verbose` - Print progress
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         data: MatRef<T>,
@@ -362,6 +343,7 @@ where
             vectors_flat,
             dim,
             n,
+            k,
             metric,
             norms,
             graph: Vec::new(),
@@ -369,47 +351,36 @@ where
             forest: annoy_index,
         };
 
-        let build_graph = builder.generate_index(k, max_iter, delta, max_candidates, seed, verbose);
+        let (build_graph, converged) =
+            builder.generate_index(k, max_iter, delta, max_candidates, seed, verbose);
 
         let graph = if diversify_prob > T::zero() {
-            builder.diversify_graph(&build_graph.0, diversify_prob, seed)
+            builder.diversify_graph(&build_graph, k, diversify_prob, seed)
         } else {
-            build_graph.0
+            build_graph
         };
 
         NNDescent {
             vectors_flat: builder.vectors_flat,
             dim: builder.dim,
             n: builder.n,
+            k,
             metric: builder.metric,
             norms: builder.norms,
             graph,
-            converged: build_graph.1,
+            converged,
             forest: builder.forest,
         }
     }
 
-    /// Check if algorithm converged during construction
-    ///
-    /// ### Returns
-    ///
-    /// Boolean flag to show that algorithm has converged
+    /// Whether the algorithm converged during construction.
     pub fn index_converged(&self) -> bool {
         self.converged
     }
 
-    /// Compute optimal chunk size based on dataset and parameters
+    /// Compute chunk size for memory-bounded update processing.
     ///
-    /// Balances memory usage against overhead of multiple passes.
-    /// Targets roughly 100-500MB of update storage per chunk.
-    ///
-    /// ### Params
-    ///
-    /// * `max_candidates` - Maximum candidates per node
-    ///
-    /// ### Returns
-    ///
-    /// Number of source nodes to process per chunk
+    /// Targets roughly 200 MB of update storage per chunk.
     fn compute_chunk_size(&self, max_candidates: usize) -> usize {
         const TARGET_BYTES: usize = 200 * 1024 * 1024;
         const BYTES_PER_UPDATE: usize = 24;
@@ -418,82 +389,44 @@ where
         let bytes_per_source = updates_per_source * BYTES_PER_UPDATE;
 
         let chunk_size = TARGET_BYTES / bytes_per_source.max(1);
-
         let min_chunk = 10_000.min(self.n);
         chunk_size.clamp(min_chunk, self.n)
     }
 
-    /// Initialise the k-NN graph using the Annoy index
+    /// Initialise the flat k-NN graph using the Annoy index.
     ///
-    /// Queries the Annoy forest for each point's approximate k nearest
-    /// neighbours. These serve as the starting graph for NN-Descent
-    /// refinement. All neighbours are marked as "new" to trigger exploration
-    /// in the first iteration.
-    ///
-    /// ### Params
-    ///
-    /// * `k` - Number of neighbours per node
-    ///
-    /// ### Returns
-    ///
-    /// Initial k-NN graph with all neighbours marked as new
-    fn init_with_annoy(&self, k: usize) -> Vec<Vec<Neighbour<T>>> {
-        (0..self.n)
-            .into_par_iter()
-            .map(|i| {
-                let query = &self.vectors_flat[i * self.dim..(i + 1) * self.dim];
-                let search_k = k * self.forest.n_trees * 2;
-                let (indices, distances) = self.forest.query(query, k + 1, Some(search_k));
+    /// Returns a contiguous `Vec<Neighbour<T>>` of size `n * k`. Each
+    /// node's block is filled with Annoy results (marked new) and padded
+    /// with sentinels.
+    fn init_with_annoy(&self, k: usize) -> Vec<Neighbour<T>> {
+        let sentinel = Neighbour::new(SENTINEL_PID, T::max_value(), false);
+        let mut graph = vec![sentinel; self.n * k];
 
-                indices
-                    .into_iter()
-                    .zip(distances)
-                    .skip(1)
-                    .take(k)
-                    .map(|(idx, dist)| Neighbour::new(idx, dist, true))
-                    .collect()
-            })
-            .collect()
+        graph.par_chunks_mut(k).enumerate().for_each(|(i, slot)| {
+            let query = &self.vectors_flat[i * self.dim..(i + 1) * self.dim];
+            let search_k = k * self.forest.n_trees * 2;
+            let (indices, distances) = self.forest.query(query, k + 1, Some(search_k));
+
+            for (j, (idx, dist)) in indices
+                .into_iter()
+                .zip(distances)
+                .skip(1)
+                .take(k)
+                .enumerate()
+            {
+                slot[j] = Neighbour::new(idx, dist, true);
+            }
+        });
+
+        graph
     }
 
-    /// Run main NN-Descent algorithm with memory-efficient chunked updates
-    ///
-    /// ## Algorithm Overview
-    ///
-    /// NN-Descent iteratively improves a k-NN graph by the principle that
-    /// "a neighbour of my neighbour is likely my neighbour". Each iteration:
-    ///
-    /// 1. Build candidate lists from current neighbours (new and old)
-    /// 2. Generate distance updates from candidate pairs
-    /// 3. Apply updates to improve the graph
-    /// 4. Check convergence (few edges updated → stop)
-    ///
-    /// ## Memory Optimisation
-    ///
-    /// The naive approach generates ALL updates then applies them, causing
-    /// memory spikes of 60GB+ on 2.8M node datasets. We instead:
-    ///
-    /// - Process source nodes in chunks (e.g., 50k at a time)
-    /// - Generate updates only from the current chunk
-    /// - Emit both edge directions during generation (avoids second pass)
-    /// - Sort by target node for cache-friendly, lock-free application
-    /// - Apply immediately, then discard before next chunk
-    ///
-    /// This bounds peak memory to O(chunk_size × max_candidates) rather than
-    /// O(n × max_candidates).
-    ///
-    /// ### Params
-    ///
-    /// * `k` - Number of neighbours for initial graph
-    /// * `max_iter` - Maximum iterations
-    /// * `delta` - Convergence threshold
-    /// * `max_candidates` - Maximum candidates to explore
-    /// * `seed` - Random seed
-    /// * `verbose` - Print progress
+    /// Run the main NN-Descent algorithm with chunked updates.
     ///
     /// ### Returns
     ///
-    /// Tuple of (final graph, converged flag)
+    /// `(flat_graph, converged)` where `flat_graph` is `Vec<(usize, T)>`
+    /// of size `n * k`.
     fn generate_index(
         &self,
         k: usize,
@@ -502,7 +435,7 @@ where
         max_candidates: usize,
         seed: usize,
         verbose: bool,
-    ) -> (Vec<Vec<(usize, T)>>, bool) {
+    ) -> (Vec<(usize, T)>, bool) {
         if verbose {
             println!(
                 "Running NN-Descent: {} samples, max_candidates={}",
@@ -538,23 +471,23 @@ where
 
         for iter in 0..max_iter {
             let updates_count = AtomicUsize::new(0);
-
-            let mut rng = SmallRng::seed_from_u64((seed as u64).wrapping_add(iter as u64));
+            let iter_seed = (seed as u64).wrapping_add(iter as u64);
 
             if verbose {
                 println!(" Preparing candidates for iter {}", iter + 1);
             }
             self.build_candidates(
                 &graph,
+                k,
                 max_candidates,
-                &mut rng,
+                iter_seed,
                 &mut new_cands,
                 &mut old_cands,
                 &mut new_cands_sym,
                 &mut old_cands_sym,
             );
 
-            self.mark_as_old(&mut graph, &new_cands);
+            self.mark_as_old(&mut graph, k, &new_cands);
 
             if verbose {
                 println!(
@@ -564,8 +497,6 @@ where
                 );
             }
 
-            // process the data in chunks to reduce the memory pressure
-            // this exploded on larger data sets
             for chunk_idx in 0..n_chunks {
                 let chunk_start = chunk_idx * chunk_size;
                 let chunk_end = (chunk_start + chunk_size).min(self.n);
@@ -574,17 +505,17 @@ where
                     &new_cands,
                     &old_cands,
                     &graph,
+                    k,
                     chunk_start,
                     chunk_end,
                 );
 
                 chunk_updates.par_sort_unstable_by_key(|&(target, _, _)| target);
 
-                self.apply_sorted_updates(&chunk_updates, &mut graph, &updates_count);
+                self.apply_sorted_updates(&chunk_updates, &mut graph, k, &updates_count);
             }
 
             let update_count = updates_count.load(Ordering::Relaxed);
-
             let update_rate = T::from_usize(update_count).unwrap()
                 / T::from_usize(self.n * max_candidates).unwrap();
 
@@ -610,162 +541,157 @@ where
             println!("Total time: {:.2?}", start.elapsed());
         }
 
-        let res = graph
-            .into_iter()
-            .map(|neighbours| neighbours.into_iter().map(|n| (n.pid(), n.dist)).collect())
-            .collect();
+        let res = graph.into_iter().map(|n| (n.pid(), n.dist)).collect();
 
         (res, converged)
     }
 
-    /// Build candidate lists for local join
+    /// Build candidate lists for the local join step.
     ///
-    /// Constructs new and old candidate lists for each node by sampling from
-    /// their current neighbours. Uses random prioritisation to select up to
-    /// `max_candidates` from each category, then adds symmetric candidates
-    /// to ensure graph connectivity.
+    /// For each node, samples up to `max_candidates` new and old neighbours,
+    /// then adds symmetric reverse candidates to ensure connectivity.
     ///
     /// ### Params
     ///
-    /// * `graph` - Current k-NN graph
-    /// * `max_candidates` - Maximum candidates per node
-    /// * `rng` - Random number generator for sampling
-    /// * `new_cands` - Mutable slice/buffer for new candidates
-    /// * `old_cands` - Mutable slice/buffer of old candidates
-    /// * `new_cands_sym` - Mutable slice/buffer of new symmetric candidates
-    /// * `old_cands_sym` - Mutable slice/buffer of old symmetric candidates
+    /// * `graph` - Reference to current neighbours
+    /// * `k` - Number of neighbours to take
+    /// * `iter_seed` - Iteration seed
+    /// * `new_cands` - Mutable slice to new candidates
+    /// * `old_cands` - Mutable slice to old candidates
+    /// * `new_cands_sym` - Mutable slice to new symmetric candidates
+    /// * `old_cands_sym` - Mutable slice to old symmetric candidates
     #[allow(clippy::too_many_arguments)]
     fn build_candidates(
         &self,
-        graph: &[Vec<Neighbour<T>>],
+        graph: &[Neighbour<T>],
+        k: usize,
         max_candidates: usize,
-        rng: &mut SmallRng,
+        iter_seed: u64,
         new_cands: &mut [Vec<usize>],
         old_cands: &mut [Vec<usize>],
         new_cands_sym: &mut [Vec<usize>],
         old_cands_sym: &mut [Vec<usize>],
     ) {
-        // clear the main buffers from the previous iteration
-        for i in 0..self.n {
-            new_cands[i].clear();
-            old_cands[i].clear();
-            new_cands_sym[i].clear();
-            old_cands_sym[i].clear();
+        for v in new_cands_sym.iter_mut().chain(old_cands_sym.iter_mut()) {
+            v.clear();
         }
 
-        // hoist the temporary sort buffers out of the N loop
-        let mut new_temp: Vec<(f64, usize)> = Vec::with_capacity(max_candidates * 2);
-        let mut old_temp: Vec<(f64, usize)> = Vec::with_capacity(max_candidates * 2);
+        // Phase 1: Parallel sampling -- each thread writes only to its own node
+        let n = self.n;
+        new_cands
+            .par_iter_mut()
+            .zip(old_cands.par_iter_mut())
+            .enumerate()
+            .for_each(|(i, (new_c, old_c))| {
+                new_c.clear();
+                old_c.clear();
 
-        for i in 0..self.n {
-            new_temp.clear();
-            old_temp.clear();
+                let mut rng = SmallRng::seed_from_u64(iter_seed.wrapping_add(i as u64));
+                let base = i * k;
 
-            for neighbour in &graph[i] {
-                let j = neighbour.pid();
-                if j >= self.n {
-                    continue;
-                }
+                let mut new_temp: Vec<(f64, usize)> = Vec::new();
+                let mut old_temp: Vec<(f64, usize)> = Vec::new();
 
-                let priority = rng.random::<f64>();
-                if neighbour.is_new() {
-                    new_temp.push((priority, j));
-                } else {
-                    old_temp.push((priority, j));
-                }
-            }
+                for slot in &graph[base..base + k] {
+                    if slot.is_sentinel() {
+                        continue;
+                    }
+                    let j = slot.pid();
+                    if j >= n {
+                        continue;
+                    }
 
-            if !new_temp.is_empty() {
-                new_temp.sort_unstable_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
-                new_temp.truncate(max_candidates);
-
-                let mut last_seen = usize::MAX;
-                for &(_, idx) in &new_temp {
-                    if idx != last_seen {
-                        new_cands[i].push(idx);
-                        last_seen = idx;
+                    let priority = rng.random::<f64>();
+                    if slot.is_new() {
+                        new_temp.push((priority, j));
+                    } else {
+                        old_temp.push((priority, j));
                     }
                 }
-            }
 
-            if !old_temp.is_empty() {
-                old_temp.sort_unstable_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
-                old_temp.truncate(max_candidates);
-
-                let mut last_seen = usize::MAX;
-                for &(_, idx) in &old_temp {
-                    if idx != last_seen {
-                        old_cands[i].push(idx);
-                        last_seen = idx;
-                    }
+                // O(n) partial sort instead of O(n log n) full sort
+                if new_temp.len() > max_candidates {
+                    new_temp.select_nth_unstable_by(max_candidates - 1, |a, b| {
+                        a.0.partial_cmp(&b.0).unwrap()
+                    });
+                    new_temp.truncate(max_candidates);
                 }
-            }
-        }
+                new_c.extend(new_temp.iter().map(|&(_, idx)| idx));
 
-        // build symmetric candidates
+                if old_temp.len() > max_candidates {
+                    old_temp.select_nth_unstable_by(max_candidates - 1, |a, b| {
+                        a.0.partial_cmp(&b.0).unwrap()
+                    });
+                    old_temp.truncate(max_candidates);
+                }
+                old_c.extend(old_temp.iter().map(|&(_, idx)| idx));
+            });
+
+        // Phase 2: Symmetric candidates (sequential -- cross-node writes)
+        // No .contains() guard: duplicates are removed by sort+dedup in phase 3
         for i in 0..self.n {
             for &j in &new_cands[i] {
-                if j < self.n && !new_cands_sym[j].contains(&i) {
+                if j < self.n {
                     new_cands_sym[j].push(i);
                 }
             }
             for &j in &old_cands[i] {
-                if j < self.n && !old_cands_sym[j].contains(&i) {
+                if j < self.n {
                     old_cands_sym[j].push(i);
                 }
             }
         }
 
-        // merge symmetric candidates into main buffers
-        for i in 0..self.n {
-            new_cands[i].extend_from_slice(&new_cands_sym[i]);
-            old_cands[i].extend_from_slice(&old_cands_sym[i]);
-        }
+        // Phase 3: Merge symmetric, sort, dedup (parallel, per-node independent)
+        new_cands
+            .par_iter_mut()
+            .zip(old_cands.par_iter_mut())
+            .zip(new_cands_sym.par_iter())
+            .zip(old_cands_sym.par_iter())
+            .for_each(|(((new_c, old_c), new_sym), old_sym)| {
+                new_c.extend_from_slice(new_sym);
+                new_c.sort_unstable();
+                new_c.dedup();
+
+                old_c.extend_from_slice(old_sym);
+                old_c.sort_unstable();
+                old_c.dedup();
+            });
     }
 
-    /// Mark neighbours as old if they appear in new candidate lists
-    ///
-    /// Transitions neighbours from "new" to "old" status once they've been
-    /// explored in the local join. This prevents redundant distance
-    /// calculations in subsequent iterations.
-    ///
-    /// ### Params
-    ///
-    /// * `graph` - Current k-NN graph (modified in-place)
-    /// * `new_cands` - New candidate lists for each node
-    fn mark_as_old(&self, graph: &mut [Vec<Neighbour<T>>], new_cands: &[Vec<usize>]) {
+    /// Mark neighbours as old if they appear in the new candidate lists.
+    fn mark_as_old(&self, graph: &mut [Neighbour<T>], k: usize, new_cands: &[Vec<usize>]) {
         for i in 0..self.n {
             if new_cands[i].is_empty() {
                 continue;
             }
 
-            for neighbour in &mut graph[i] {
-                if neighbour.is_new() && new_cands[i].contains(&neighbour.pid()) {
-                    // with new approach -> no allocation needed
-                    neighbour.mark_old();
+            let base = i * k;
+            for slot in &mut graph[base..base + k] {
+                if slot.is_sentinel() {
+                    continue;
+                }
+                if slot.is_new() && new_cands[i].binary_search(&slot.pid()).is_ok() {
+                    slot.mark_old();
                 }
             }
         }
     }
 
-    /// Generate distance updates from a chunk of source nodes
+    /// Generate distance updates from a chunk of source nodes.
+    ///
+    /// Emits both edge directions `(p, q, d)` and `(q, p, d)` so that
+    /// the caller can sort by target and apply lock-free.
     ///
     /// ### Params
     ///
-    /// * `new_cands` - New candidate lists for all nodes
-    /// * `old_cands` - Old candidate lists for all nodes
-    /// * `graph` - Current graph (for threshold checking)
-    /// * `chunk_start` - First source node index to process (inclusive)
-    /// * `chunk_end` - Last source node index to process (exclusive)
     ///
-    /// ### Returns
-    ///
-    /// List of (target, source, distance) tuples for both edge directions
     fn generate_updates_for_chunk(
         &self,
         new_cands: &[Vec<usize>],
         old_cands: &[Vec<usize>],
-        graph: &[Vec<Neighbour<T>>],
+        graph: &[Neighbour<T>],
+        k: usize,
         chunk_start: usize,
         chunk_end: usize,
     ) -> Vec<(usize, usize, T)> {
@@ -774,45 +700,57 @@ where
             .flat_map(|i| {
                 let mut updates = Vec::new();
 
-                // Check new-new pairs (same as before)
+                // Threshold = worst (last non-sentinel) distance for a node
+                let get_threshold = |idx: usize| -> T {
+                    let base = idx * k;
+                    // Slots are sorted by distance; the last non-sentinel
+                    // is the worst current neighbour. Sentinels have
+                    // T::max_value so simply reading the last slot works:
+                    // if all k slots are filled it is the true threshold,
+                    // otherwise it is max_value which accepts everything.
+                    graph[base + k - 1].dist
+                };
+
+                // new-new pairs
                 for j in 0..new_cands[i].len() {
                     let p = new_cands[i][j];
                     if p >= self.n {
                         continue;
                     }
 
-                    // move this out and hoist
-                    let p_threshold = graph[p].last().map(|n| n.dist).unwrap_or_else(T::infinity);
+                    let p_threshold = get_threshold(p);
 
-                    for k in (j + 1)..new_cands[i].len() {
-                        let q = new_cands[i][k];
-                        if q >= self.n {
+                    for l in (j + 1)..new_cands[i].len() {
+                        let q = new_cands[i][l];
+                        if q >= self.n || p == q {
                             continue;
                         }
 
-                        let q_threshold =
-                            graph[q].last().map(|n| n.dist).unwrap_or_else(T::infinity);
-
                         let d = self.distance(p, q);
-                        if d <= p_threshold || d <= q_threshold {
+
+                        if d <= p_threshold || d <= get_threshold(q) {
                             updates.push((p, q, d));
                             updates.push((q, p, d));
                         }
                     }
                 }
 
+                // new-old pairs
                 for &p in &new_cands[i] {
                     if p >= self.n {
                         continue;
                     }
+
+                    let p_threshold = get_threshold(p);
+
                     for &q in &old_cands[i] {
                         if q >= self.n || p == q {
                             continue;
                         }
 
                         let d = self.distance(p, q);
-                        if self.should_add_edge(p, q, d, graph) {
-                            // CHANGE: Emit both directions
+
+                        if d <= p_threshold || d <= get_threshold(q) {
                             updates.push((p, q, d));
                             updates.push((q, p, d));
                         }
@@ -824,19 +762,7 @@ where
             .collect()
     }
 
-    /// Calculate distance between two points
-    ///
-    /// Delegates to the appropriate distance function based on the index's
-    /// configured metric.
-    ///
-    /// ### Params
-    ///
-    /// * `i` - Index of first point
-    /// * `j` - Index of second point
-    ///
-    /// ### Returns
-    ///
-    /// Distance between points i and j
+    /// Calculate distance between two indexed points.
     #[inline]
     fn distance(&self, i: usize, j: usize) -> T {
         match self.metric {
@@ -845,73 +771,41 @@ where
         }
     }
 
-    /// Check if an edge should be added to the graph
+    /// Diversify graph by pruning redundant edges.
     ///
-    /// An edge (p,q) is worth exploring if its distance is better than the
-    /// current worst neighbour for either p or q. This prunes candidates
-    /// that cannot improve either node's k-NN list.
-    ///
-    /// ### Params
-    ///
-    /// * `p` - First node index
-    /// * `q` - Second node index
-    /// * `dist` - Distance between p and q
-    /// * `graph` - Current graph (for threshold lookup)
-    ///
-    /// ### Returns
-    ///
-    /// True if edge should be added to update candidates
-    #[inline]
-    fn should_add_edge(&self, p: usize, q: usize, dist: T, graph: &[Vec<Neighbour<T>>]) -> bool {
-        let p_threshold = if graph[p].is_empty() {
-            T::infinity()
-        } else {
-            graph[p].last().unwrap().dist
-        };
-
-        let q_threshold = if graph[q].is_empty() {
-            T::infinity()
-        } else {
-            graph[q].last().unwrap().dist
-        };
-
-        dist <= p_threshold || dist <= q_threshold
-    }
-
-    /// Diversify graph by pruning redundant edges
-    ///
-    /// Removes edges to neighbours that are already covered by closer
-    /// neighbours, reducing graph connectivity whilst maintaining search
-    /// quality. Uses probabilistic pruning controlled by `prune_prob`.
-    /// NOTE: Most of the time, this does not really help.
-    ///
-    /// ### Params
-    ///
-    /// * `graph` - Input k-NN graph
-    /// * `prune_prob` - Probability of pruning redundant edges (0.0 to 1.0)
-    /// * `seed` - Random seed for reproducibility
-    ///
-    /// ### Returns
-    ///
-    /// Pruned graph with potentially fewer edges per node
+    /// Operates on the flat `(usize, T)` graph. Pruned nodes have their
+    /// remaining slots padded with sentinels.
     fn diversify_graph(
         &self,
-        graph: &[Vec<(usize, T)>],
+        graph: &[(usize, T)],
+        k: usize,
         prune_prob: T,
         seed: usize,
-    ) -> Vec<Vec<(usize, T)>> {
-        graph
-            .par_iter()
+    ) -> Vec<(usize, T)> {
+        let mut result = vec![(SENTINEL_PID, T::max_value()); self.n * k];
+
+        result
+            .par_chunks_mut(k)
             .enumerate()
-            .map(|(i, neighbours)| {
-                if neighbours.is_empty() {
-                    return Vec::new();
+            .for_each(|(i, out_slot)| {
+                let base = i * k;
+                let neighbours = &graph[base..base + k];
+
+                // Collect non-sentinel neighbours
+                let valid: Vec<(usize, T)> = neighbours
+                    .iter()
+                    .copied()
+                    .filter(|&(pid, _)| pid != SENTINEL_PID)
+                    .collect();
+
+                if valid.is_empty() {
+                    return;
                 }
 
                 let mut rng = SmallRng::seed_from_u64((seed as u64).wrapping_add(i as u64));
-                let mut kept = vec![neighbours[0]];
+                let mut kept = vec![valid[0]];
 
-                for &(cand_idx, cand_dist) in &neighbours[1..] {
+                for &(cand_idx, cand_dist) in &valid[1..] {
                     let mut should_keep = true;
 
                     for &(kept_idx, kept_dist) in &kept {
@@ -931,31 +825,36 @@ where
                     }
                 }
 
-                kept
-            })
-            .collect()
+                for (j, &entry) in kept.iter().enumerate() {
+                    out_slot[j] = entry;
+                }
+            });
+
+        result
     }
 
     ///////////
     // Query //
     ///////////
 
-    /// Query for k nearest neighbours using beam search
-    ///
-    /// Performs beam search over the k-NN graph, starting from candidates
-    /// provided by the Annoy index. The search expands outward through the
-    /// graph, maintaining a priority queue of the best candidates found.
+    /// Return the neighbours slice for node `idx` from the query graph.
+    #[inline]
+    fn graph_neighbours(&self, idx: usize) -> &[(usize, T)] {
+        &self.graph[idx * self.k..(idx + 1) * self.k]
+    }
+
+    /// Query for k nearest neighbours using beam search.
     ///
     /// ### Params
     ///
     /// * `query_vec` - Query vector (must match index dimensionality)
     /// * `k` - Number of neighbours to return
-    /// * `ef_search` - Search beam width. Higher values improve recall but
-    ///   increase query time. Defaults to `max(2×k, 50)` clamped to 200.
+    /// * `ef_search` - Beam width. Higher values improve recall at the
+    ///   cost of latency. Defaults to `max(2*k, 50)` clamped to 200.
     ///
     /// ### Returns
     ///
-    /// Tuple of `(indices, distances)` sorted by distance (nearest first)
+    /// `(indices, distances)` sorted by distance ascending
     pub fn query(
         &self,
         query_vec: &[T],
@@ -974,21 +873,10 @@ where
         self.query_internal(query_vec, query_norm, k, ef)
     }
 
-    /// Query using a matrix row reference
+    /// Query using a matrix row reference.
     ///
-    /// Optimised path for contiguous memory (stride == 1), otherwise copies
-    /// to a temporary vector. Uses `self.query()` under the hood.
-    ///
-    /// ### Params
-    ///
-    /// * `query_row` - Row reference
-    /// * `k` - Number of neighbours to search
-    /// * `ef_search` - Search beam width. Higher values improve recall but
-    ///   increase query time. Defaults to `max(2×k, 50)` clamped to 200.
-    ///
-    /// ### Returns
-    ///
-    /// Tuple of `(indices, distances)` sorted by distance (nearest first)
+    /// Uses a zero-copy path when stride is 1, otherwise copies to a
+    /// temporary vector.
     #[inline]
     pub fn query_row(
         &self,
@@ -1006,23 +894,11 @@ where
         self.query(&query_vec, k, ef_search)
     }
 
-    /// Generate kNN graph from vectors stored in the index
-    ///
-    /// Queries each vector in the index against itself to build a complete
-    /// kNN graph.
-    ///
-    /// ### Params
-    ///
-    /// * `k` - Number of neighbours per vector
-    /// * `ef_search` - Search beam width. Higher values improve recall but
-    ///   increase query time. Defaults to `max(2×k, 50)` clamped to 200.
-    /// * `return_dist` - Whether to return distances
-    /// * `verbose` - Controls verbosity
+    /// Generate a kNN graph by querying every vector in the index.
     ///
     /// ### Returns
     ///
-    /// Tuple of `(knn_indices, optional distances)` where each row corresponds
-    /// to a vector in the index
+    /// `(knn_indices, optional distances)`
     pub fn generate_knn(
         &self,
         k: usize,
@@ -1068,42 +944,22 @@ where
         }
     }
 
-    /// Returns the size of the index in bytes
-    ///
-    /// ### Returns
-    ///
-    /// Number of bytes used by the index
+    /// Total heap memory used by the index, in bytes.
     pub fn memory_usage_bytes(&self) -> usize {
         let mut total = std::mem::size_of_val(self);
 
         total += self.vectors_flat.capacity() * std::mem::size_of::<T>();
         total += self.norms.capacity() * std::mem::size_of::<T>();
         total += self.forest.memory_usage_bytes();
-
-        // graph outer Vec
-        total += self.graph.capacity() * std::mem::size_of::<Vec<(usize, T)>>();
-
-        // each inner Vec
-        for neighbours in &self.graph {
-            total += neighbours.capacity() * std::mem::size_of::<(usize, T)>();
-        }
+        total += self.graph.capacity() * std::mem::size_of::<(usize, T)>();
 
         total
     }
 }
 
-/// Helper to find boundaries between different target nodes in sorted updates
+/// Find boundaries between different target nodes in sorted updates.
 ///
-/// Returns indices where the target node changes, enabling parallel processing
-/// of independent node batches.
-///
-/// ### Params
-///
-/// * `updates` - Sorted list of (target, source, distance) tuples
-///
-/// ### Returns
-///
-/// Vector of boundary indices, including 0 and updates.len()
+/// Returns indices where the target changes, including 0 and `updates.len()`.
 fn find_target_boundaries<T>(updates: &[(usize, usize, T)]) -> Vec<usize> {
     if updates.is_empty() {
         return vec![0, 0];
@@ -1129,686 +985,347 @@ fn find_target_boundaries<T>(updates: &[(usize, usize, T)]) -> Vec<usize> {
 // ApplySortedUpdates //
 ////////////////////////
 
-/////////
-// f32 //
-/////////
-
-type SegmentF32<'a> = Vec<(usize, &'a [(usize, usize, f32)])>;
-type SegmentResultsF32 = Vec<(usize, Option<(Vec<Neighbour<f32>>, usize)>)>;
-
-impl ApplySortedUpdates<f32> for NNDescent<f32> {
-    fn apply_sorted_updates(
-        &self,
-        updates: &[(usize, usize, f32)],
-        graph: &mut [Vec<Neighbour<f32>>],
-        updates_count: &AtomicUsize,
-    ) {
-        if updates.is_empty() {
-            return;
-        }
-
-        let boundaries = find_target_boundaries(updates);
-
-        let segments: SegmentF32 = boundaries
-            .windows(2)
-            .filter_map(|w| {
-                let start = w[0];
-                let end = w[1];
-                if start < end {
-                    Some((updates[start].0, &updates[start..end]))
-                } else {
-                    None
+/// Generates the `ApplySortedUpdates` impl for a concrete float type.
+///
+/// The logic is identical for f32 and f64; only the thread-local storage
+/// keys differ.
+macro_rules! impl_apply_sorted_updates {
+    ($float:ty, $heap_tls:ident, $sort_buf_tls:ident) => {
+        impl ApplySortedUpdates<$float> for NNDescent<$float> {
+            fn apply_sorted_updates(
+                &self,
+                updates: &[(usize, usize, $float)],
+                graph: &mut [Neighbour<$float>],
+                k: usize,
+                updates_count: &AtomicUsize,
+            ) {
+                if updates.is_empty() {
+                    return;
                 }
-            })
-            .collect();
 
-        let results: SegmentResultsF32 = segments
-            .par_iter()
-            .map(|&(target, segment)| {
-                // Use thread-local heap to avoid allocations
-                HEAP_F32.with(|heap_cell| {
-                    PID_SET.with(|set_cell| {
-                        let mut heap = heap_cell.borrow_mut();
-                        let mut pid_set = set_cell.borrow_mut();
+                let boundaries = find_target_boundaries(updates);
 
-                        heap.clear();
-                        if pid_set.len() < self.n {
-                            pid_set.resize(self.n, false);
-                        }
-
-                        let k = graph[target].len();
-                        if k == 0 {
-                            return (target, None);
-                        }
-
-                        let mut edge_updates = 0usize;
-
-                        for n in &graph[target] {
-                            let pid = n.pid();
-                            heap.push((OrderedFloat(n.dist), pid, n.is_new()));
-                            pid_set[pid] = true;
-                        }
-
-                        for &(_, source, dist) in segment {
-                            if pid_set[source] {
-                                continue;
-                            }
-
-                            if heap.len() < k {
-                                heap.push((OrderedFloat(dist), source, true));
-                                pid_set[source] = true;
-                                edge_updates += 1;
-                            } else if let Some(&(OrderedFloat(worst), _, _)) = heap.peek() {
-                                if dist < worst {
-                                    if let Some((_, old_pid, _)) = heap.pop() {
-                                        pid_set[old_pid] = false;
-                                    }
-                                    heap.push((OrderedFloat(dist), source, true));
-                                    pid_set[source] = true;
-                                    edge_updates += 1;
-                                }
-                            }
-                        }
-
-                        if edge_updates > 0 {
-                            let mut result: Vec<_> = heap
-                                .drain()
-                                .map(|(OrderedFloat(d), p, is_new)| {
-                                    pid_set[p] = false;
-                                    (d, p, is_new)
-                                })
-                                .collect();
-                            result.sort_unstable_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
-                            result.truncate(k);
-
-                            (
-                                target,
-                                Some((
-                                    result
-                                        .into_iter()
-                                        .map(|(d, p, is_new)| Neighbour::new(p, d, is_new))
-                                        .collect(),
-                                    edge_updates,
-                                )),
-                            )
+                let segments: Vec<(usize, &[(usize, usize, $float)])> = boundaries
+                    .windows(2)
+                    .filter_map(|w| {
+                        let start = w[0];
+                        let end = w[1];
+                        if start < end {
+                            Some((updates[start].0, &updates[start..end]))
                         } else {
-                            for (_, pid, _) in heap.iter() {
-                                pid_set[*pid] = false;
-                            }
-                            (target, None)
+                            None
                         }
                     })
-                })
-            })
-            .collect();
+                    .collect();
 
-        let mut total_updates = 0;
-        for (target, result) in results {
-            if let Some((new_neighbours, count)) = result {
-                graph[target] = new_neighbours;
-                total_updates += count;
-            }
-        }
+                let graph_ptr = UnsafeGraphPtr(graph.as_mut_ptr());
 
-        updates_count.fetch_add(total_updates, Ordering::Relaxed);
-    }
-}
+                segments.par_iter().for_each(|&(target, segment)| {
+                    #[allow(clippy::redundant_locals)]
+                    let graph_ptr = graph_ptr;
+                    $heap_tls.with(|heap_cell| {
+                        PID_SET.with(|set_cell| {
+                            $sort_buf_tls.with(|sort_cell| {
+                                let mut heap = heap_cell.borrow_mut();
+                                let mut pid_set = set_cell.borrow_mut();
+                                let mut sort_buf = sort_cell.borrow_mut();
 
-/////////
-// f64 //
-/////////
-
-type SegmentF64<'a> = Vec<(usize, &'a [(usize, usize, f64)])>;
-type SegmentResultsF64 = Vec<(usize, Option<(Vec<Neighbour<f64>>, usize)>)>;
-
-impl ApplySortedUpdates<f64> for NNDescent<f64> {
-    fn apply_sorted_updates(
-        &self,
-        updates: &[(usize, usize, f64)],
-        graph: &mut [Vec<Neighbour<f64>>],
-        updates_count: &AtomicUsize,
-    ) {
-        if updates.is_empty() {
-            return;
-        }
-
-        let boundaries = find_target_boundaries(updates);
-
-        let segments: SegmentF64 = boundaries
-            .windows(2)
-            .filter_map(|w| {
-                let start = w[0];
-                let end = w[1];
-                if start < end {
-                    Some((updates[start].0, &updates[start..end]))
-                } else {
-                    None
-                }
-            })
-            .collect();
-
-        let results: SegmentResultsF64 = segments
-            .par_iter()
-            .map(|&(target, segment)| {
-                HEAP_F64.with(|heap_cell| {
-                    PID_SET.with(|set_cell| {
-                        let mut heap = heap_cell.borrow_mut();
-                        let mut pid_set = set_cell.borrow_mut();
-
-                        heap.clear();
-                        if pid_set.len() < self.n {
-                            pid_set.resize(self.n, false);
-                        }
-
-                        let k = graph[target].len();
-                        if k == 0 {
-                            return (target, None);
-                        }
-
-                        let mut edge_updates = 0usize;
-
-                        for n in &graph[target] {
-                            let pid = n.pid();
-                            heap.push((OrderedFloat(n.dist), pid, n.is_new()));
-                            pid_set[pid] = true;
-                        }
-
-                        for &(_, source, dist) in segment {
-                            if pid_set[source] {
-                                continue;
-                            }
-
-                            if heap.len() < k {
-                                heap.push((OrderedFloat(dist), source, true));
-                                pid_set[source] = true;
-                                edge_updates += 1;
-                            } else if let Some(&(OrderedFloat(worst), _, _)) = heap.peek() {
-                                if dist < worst {
-                                    if let Some((_, old_pid, _)) = heap.pop() {
-                                        pid_set[old_pid] = false;
-                                    }
-                                    heap.push((OrderedFloat(dist), source, true));
-                                    pid_set[source] = true;
-                                    edge_updates += 1;
+                                heap.clear();
+                                if pid_set.len() < self.n {
+                                    pid_set.resize(self.n, false);
                                 }
-                            }
-                        }
 
-                        if edge_updates > 0 {
-                            let mut result: Vec<_> = heap
-                                .drain()
-                                .map(|(OrderedFloat(d), p, is_new)| {
-                                    pid_set[p] = false;
-                                    (d, p, is_new)
-                                })
-                                .collect();
-                            result.sort_unstable_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
-                            result.truncate(k);
+                                let start_idx = target * k;
 
-                            (
-                                target,
-                                Some((
-                                    result
-                                        .into_iter()
-                                        .map(|(d, p, is_new)| Neighbour::new(p, d, is_new))
-                                        .collect(),
-                                    edge_updates,
-                                )),
-                            )
-                        } else {
-                            for (_, pid, _) in heap.iter() {
-                                pid_set[*pid] = false;
-                            }
-                            (target, None)
-                        }
+                                // SAFETY: Each thread processes a unique target.
+                                // No two threads alias the same slice.
+                                let target_slice = unsafe {
+                                    std::slice::from_raw_parts_mut(graph_ptr.0.add(start_idx), k)
+                                };
+
+                                let mut edge_updates = 0usize;
+
+                                // Load current neighbours into the heap
+                                for n in target_slice.iter() {
+                                    if n.is_sentinel() {
+                                        continue;
+                                    }
+                                    let pid = n.pid();
+                                    heap.push((OrderedFloat(n.dist), pid, n.is_new()));
+                                    pid_set[pid] = true;
+                                }
+
+                                // Merge incoming updates
+                                for &(_, source, dist) in segment {
+                                    if pid_set[source] {
+                                        continue;
+                                    }
+
+                                    if heap.len() < k {
+                                        heap.push((OrderedFloat(dist), source, true));
+                                        pid_set[source] = true;
+                                        edge_updates += 1;
+                                    } else if let Some(&(OrderedFloat(worst), _, _)) = heap.peek() {
+                                        if dist < worst {
+                                            if let Some((_, old_pid, _)) = heap.pop() {
+                                                pid_set[old_pid] = false;
+                                            }
+                                            heap.push((OrderedFloat(dist), source, true));
+                                            pid_set[source] = true;
+                                            edge_updates += 1;
+                                        }
+                                    }
+                                }
+
+                                if edge_updates > 0 {
+                                    updates_count.fetch_add(edge_updates, Ordering::Relaxed);
+
+                                    sort_buf.clear();
+                                    sort_buf.extend(heap.drain().map(
+                                        |(OrderedFloat(d), p, is_new)| {
+                                            pid_set[p] = false;
+                                            (d, p, is_new)
+                                        },
+                                    ));
+
+                                    sort_buf
+                                        .sort_unstable_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+                                    sort_buf.truncate(k);
+
+                                    for (i, &(d, p, is_new)) in sort_buf.iter().enumerate() {
+                                        target_slice[i] = Neighbour::new(p, d, is_new);
+                                    }
+
+                                    for i in sort_buf.len()..k {
+                                        target_slice[i] =
+                                            Neighbour::new(SENTINEL_PID, <$float>::MAX, false);
+                                    }
+                                } else {
+                                    for (_, pid, _) in heap.iter() {
+                                        pid_set[*pid] = false;
+                                    }
+                                }
+                            })
+                        })
                     })
-                })
-            })
-            .collect();
-
-        let mut total_updates = 0;
-        for (target, result) in results {
-            if let Some((new_neighbours, count)) = result {
-                graph[target] = new_neighbours;
-                total_updates += count;
+                });
             }
         }
-
-        updates_count.fetch_add(total_updates, Ordering::Relaxed);
-    }
+    };
 }
+
+impl_apply_sorted_updates!(f32, HEAP_F32, SORT_BUF_F32);
+impl_apply_sorted_updates!(f64, HEAP_F64, SORT_BUF_F64);
 
 ////////////////////
 // NNDescentQuery //
 ////////////////////
 
-/////////
-// f32 //
-/////////
+/// Generates the `NNDescentQuery` impl for a concrete float type.
+macro_rules! impl_nndescent_query {
+    ($float:ty, $cand_tls:ident, $res_tls:ident) => {
+        impl NNDescentQuery<$float> for NNDescent<$float> {
+            fn query_internal(
+                &self,
+                query_vec: &[$float],
+                query_norm: $float,
+                k: usize,
+                ef: usize,
+            ) -> (Vec<usize>, Vec<$float>) {
+                QUERY_VISITED.with(|visited_cell| {
+                    $cand_tls.with(|cand_cell| {
+                        $res_tls.with(|res_cell| {
+                            let mut visited = visited_cell.borrow_mut();
+                            let mut candidates = cand_cell.borrow_mut();
+                            let mut results = res_cell.borrow_mut();
 
-impl NNDescentQuery<f32> for NNDescent<f32> {
-    fn query_internal(
-        &self,
-        query_vec: &[f32],
-        query_norm: f32,
-        k: usize,
-        ef: usize,
-    ) -> (Vec<usize>, Vec<f32>) {
-        QUERY_VISITED.with(|visited_cell| {
-            QUERY_CANDIDATES_F32.with(|cand_cell| {
-                QUERY_RESULTS_F32.with(|res_cell| {
-                    let mut visited = visited_cell.borrow_mut();
-                    let mut candidates = cand_cell.borrow_mut();
-                    let mut results = res_cell.borrow_mut();
+                            visited.clear();
+                            visited.grow(self.n);
+                            candidates.clear();
+                            results.clear();
 
-                    visited.clear();
-                    visited.grow(self.n);
-                    candidates.clear();
-                    results.clear();
-
-                    // CRITICAL: Hoist match outside the loop by splitting into separate paths
-                    let (indices, dists) = match self.metric {
-                        Dist::Euclidean => self.query_euclidean(
-                            query_vec,
-                            k,
-                            ef,
-                            &mut visited,
-                            &mut candidates,
-                            &mut results,
-                        ),
-                        Dist::Cosine => self.query_cosine(
-                            query_vec,
-                            query_norm,
-                            k,
-                            ef,
-                            &mut visited,
-                            &mut candidates,
-                            &mut results,
-                        ),
-                    };
-
-                    (indices, dists)
+                            match self.metric {
+                                Dist::Euclidean => self.query_euclidean(
+                                    query_vec,
+                                    k,
+                                    ef,
+                                    &mut visited,
+                                    &mut candidates,
+                                    &mut results,
+                                ),
+                                Dist::Cosine => self.query_cosine(
+                                    query_vec,
+                                    query_norm,
+                                    k,
+                                    ef,
+                                    &mut visited,
+                                    &mut candidates,
+                                    &mut results,
+                                ),
+                            }
+                        })
+                    })
                 })
-            })
-        })
-    }
-
-    #[inline(always)]
-    fn query_euclidean(
-        &self,
-        query_vec: &[f32],
-        k: usize,
-        ef: usize,
-        visited: &mut FixedBitSet,
-        candidates: &mut BinaryHeap<Reverse<(OrderedFloat<f32>, usize)>>,
-        results: &mut BinaryHeap<(OrderedFloat<f32>, usize)>,
-    ) -> (Vec<usize>, Vec<f32>) {
-        // get entry points
-        let init_candidates = (ef / 2).max(2 * k).min(self.n);
-        let search_k = init_candidates * 3;
-        let (init_indices, _) = self
-            .forest
-            .query(query_vec, init_candidates, Some(search_k));
-
-        // initialize
-        for &entry_idx in &init_indices {
-            if entry_idx >= self.n || visited.contains(entry_idx) {
-                continue;
             }
 
-            visited.insert(entry_idx);
-            let dist = self.euclidean_distance_to_query(entry_idx, query_vec);
+            #[inline(always)]
+            fn query_euclidean(
+                &self,
+                query_vec: &[$float],
+                k: usize,
+                ef: usize,
+                visited: &mut FixedBitSet,
+                candidates: &mut BinaryHeap<Reverse<(OrderedFloat<$float>, usize)>>,
+                results: &mut BinaryHeap<(OrderedFloat<$float>, usize)>,
+            ) -> (Vec<usize>, Vec<$float>) {
+                let init_candidates = (ef / 2).max(2 * k).min(self.n);
+                let search_k = init_candidates * 3;
+                let (init_indices, _) =
+                    self.forest
+                        .query(query_vec, init_candidates, Some(search_k));
 
-            candidates.push(Reverse((OrderedFloat(dist), entry_idx)));
-            results.push((OrderedFloat(dist), entry_idx));
-        }
-
-        // prune results to ef
-        while results.len() > ef {
-            results.pop();
-        }
-
-        let mut lower_bound = if results.len() >= ef {
-            results.peek().unwrap().0 .0
-        } else {
-            f32::MAX
-        };
-
-        // beam search
-        while let Some(Reverse((OrderedFloat(curr_dist), curr_idx))) = candidates.pop() {
-            if curr_dist > lower_bound {
-                break;
-            }
-
-            for &(nbr_idx, _) in &self.graph[curr_idx] {
-                if visited.contains(nbr_idx) {
-                    continue;
+                for &entry_idx in &init_indices {
+                    if entry_idx >= self.n || visited.contains(entry_idx) {
+                        continue;
+                    }
+                    visited.insert(entry_idx);
+                    let dist = self.euclidean_distance_to_query(entry_idx, query_vec);
+                    candidates.push(Reverse((OrderedFloat(dist), entry_idx)));
+                    results.push((OrderedFloat(dist), entry_idx));
                 }
-                visited.insert(nbr_idx);
 
-                let dist = self.euclidean_distance_to_query(nbr_idx, query_vec);
+                while results.len() > ef {
+                    results.pop();
+                }
 
-                // CRITICAL: only add to candidates if it's promising
-                if dist < lower_bound || results.len() < ef {
-                    candidates.push(Reverse((OrderedFloat(dist), nbr_idx)));
+                let mut lower_bound = if results.len() >= ef {
+                    results.peek().unwrap().0 .0
+                } else {
+                    <$float>::MAX
+                };
 
-                    if results.len() < ef {
-                        results.push((OrderedFloat(dist), nbr_idx));
-                        if results.len() == ef {
-                            lower_bound = results.peek().unwrap().0 .0;
+                while let Some(Reverse((OrderedFloat(curr_dist), curr_idx))) = candidates.pop() {
+                    if curr_dist > lower_bound {
+                        break;
+                    }
+
+                    for &(nbr_idx, _) in self.graph_neighbours(curr_idx) {
+                        if nbr_idx == SENTINEL_PID || visited.contains(nbr_idx) {
+                            continue;
                         }
-                    } else if dist < lower_bound {
-                        results.pop();
-                        results.push((OrderedFloat(dist), nbr_idx));
-                        lower_bound = results.peek().unwrap().0 .0;
+                        visited.insert(nbr_idx);
+
+                        let dist = self.euclidean_distance_to_query(nbr_idx, query_vec);
+
+                        if dist < lower_bound || results.len() < ef {
+                            candidates.push(Reverse((OrderedFloat(dist), nbr_idx)));
+
+                            if results.len() < ef {
+                                results.push((OrderedFloat(dist), nbr_idx));
+                                if results.len() == ef {
+                                    lower_bound = results.peek().unwrap().0 .0;
+                                }
+                            } else if dist < lower_bound {
+                                results.pop();
+                                results.push((OrderedFloat(dist), nbr_idx));
+                                lower_bound = results.peek().unwrap().0 .0;
+                            }
+                        }
                     }
                 }
-            }
-        }
 
-        // extract final k results
-        let mut final_results: Vec<_> = results.drain().collect();
-        final_results.sort_unstable_by(|a, b| a.0.cmp(&b.0));
-        final_results.truncate(k);
+                let mut final_results: Vec<_> = results.drain().collect();
+                final_results.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+                final_results.truncate(k);
 
-        final_results
-            .into_iter()
-            .map(|(OrderedFloat(d), i)| (i, d))
-            .unzip()
-    }
-
-    #[inline(always)]
-    fn query_cosine(
-        &self,
-        query_vec: &[f32],
-        query_norm: f32,
-        k: usize,
-        ef: usize,
-        visited: &mut FixedBitSet,
-        candidates: &mut BinaryHeap<Reverse<(OrderedFloat<f32>, usize)>>,
-        results: &mut BinaryHeap<(OrderedFloat<f32>, usize)>,
-    ) -> (Vec<usize>, Vec<f32>) {
-        let init_candidates = (ef / 2).max(k).min(self.n);
-        let search_k = init_candidates * 3;
-        let (init_indices, _) = self
-            .forest
-            .query(query_vec, init_candidates, Some(search_k));
-
-        for &entry_idx in &init_indices {
-            if entry_idx >= self.n || visited.contains(entry_idx) {
-                continue;
+                final_results
+                    .into_iter()
+                    .map(|(OrderedFloat(d), i)| (i, d))
+                    .unzip()
             }
 
-            visited.insert(entry_idx);
-            let dist = self.cosine_distance_to_query(entry_idx, query_vec, query_norm);
+            #[inline(always)]
+            fn query_cosine(
+                &self,
+                query_vec: &[$float],
+                query_norm: $float,
+                k: usize,
+                ef: usize,
+                visited: &mut FixedBitSet,
+                candidates: &mut BinaryHeap<Reverse<(OrderedFloat<$float>, usize)>>,
+                results: &mut BinaryHeap<(OrderedFloat<$float>, usize)>,
+            ) -> (Vec<usize>, Vec<$float>) {
+                let init_candidates = (ef / 2).max(k).min(self.n);
+                let search_k = init_candidates * 3;
+                let (init_indices, _) =
+                    self.forest
+                        .query(query_vec, init_candidates, Some(search_k));
 
-            candidates.push(Reverse((OrderedFloat(dist), entry_idx)));
-            results.push((OrderedFloat(dist), entry_idx));
-        }
-
-        while results.len() > ef {
-            results.pop();
-        }
-
-        let mut lower_bound = if results.len() >= ef {
-            results.peek().unwrap().0 .0
-        } else {
-            f32::MAX
-        };
-
-        while let Some(Reverse((OrderedFloat(curr_dist), curr_idx))) = candidates.pop() {
-            if curr_dist > lower_bound {
-                break;
-            }
-
-            for &(nbr_idx, _) in &self.graph[curr_idx] {
-                if visited.contains(nbr_idx) {
-                    continue;
+                for &entry_idx in &init_indices {
+                    if entry_idx >= self.n || visited.contains(entry_idx) {
+                        continue;
+                    }
+                    visited.insert(entry_idx);
+                    let dist = self.cosine_distance_to_query(entry_idx, query_vec, query_norm);
+                    candidates.push(Reverse((OrderedFloat(dist), entry_idx)));
+                    results.push((OrderedFloat(dist), entry_idx));
                 }
-                visited.insert(nbr_idx);
 
-                let dist = self.cosine_distance_to_query(nbr_idx, query_vec, query_norm);
+                while results.len() > ef {
+                    results.pop();
+                }
 
-                if dist < lower_bound || results.len() < ef {
-                    candidates.push(Reverse((OrderedFloat(dist), nbr_idx)));
+                let mut lower_bound = if results.len() >= ef {
+                    results.peek().unwrap().0 .0
+                } else {
+                    <$float>::MAX
+                };
 
-                    if results.len() < ef {
-                        results.push((OrderedFloat(dist), nbr_idx));
-                        if results.len() == ef {
-                            lower_bound = results.peek().unwrap().0 .0;
+                while let Some(Reverse((OrderedFloat(curr_dist), curr_idx))) = candidates.pop() {
+                    if curr_dist > lower_bound {
+                        break;
+                    }
+
+                    for &(nbr_idx, _) in self.graph_neighbours(curr_idx) {
+                        if nbr_idx == SENTINEL_PID || visited.contains(nbr_idx) {
+                            continue;
                         }
-                    } else if dist < lower_bound {
-                        results.pop();
-                        results.push((OrderedFloat(dist), nbr_idx));
-                        lower_bound = results.peek().unwrap().0 .0;
+                        visited.insert(nbr_idx);
+
+                        let dist = self.cosine_distance_to_query(nbr_idx, query_vec, query_norm);
+
+                        if dist < lower_bound || results.len() < ef {
+                            candidates.push(Reverse((OrderedFloat(dist), nbr_idx)));
+
+                            if results.len() < ef {
+                                results.push((OrderedFloat(dist), nbr_idx));
+                                if results.len() == ef {
+                                    lower_bound = results.peek().unwrap().0 .0;
+                                }
+                            } else if dist < lower_bound {
+                                results.pop();
+                                results.push((OrderedFloat(dist), nbr_idx));
+                                lower_bound = results.peek().unwrap().0 .0;
+                            }
+                        }
                     }
                 }
+
+                let mut final_results: Vec<_> = results.drain().collect();
+                final_results.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+                final_results.truncate(k);
+
+                final_results
+                    .into_iter()
+                    .map(|(OrderedFloat(d), i)| (i, d))
+                    .unzip()
             }
         }
-
-        let mut final_results: Vec<_> = results.drain().collect();
-        final_results.sort_unstable_by(|a, b| a.0.cmp(&b.0));
-        final_results.truncate(k);
-
-        final_results
-            .into_iter()
-            .map(|(OrderedFloat(d), i)| (i, d))
-            .unzip()
-    }
+    };
 }
 
-/////////
-// f64 //
-/////////
-
-impl NNDescentQuery<f64> for NNDescent<f64> {
-    fn query_internal(
-        &self,
-        query_vec: &[f64],
-        query_norm: f64,
-        k: usize,
-        ef: usize,
-    ) -> (Vec<usize>, Vec<f64>) {
-        QUERY_VISITED.with(|visited_cell| {
-            QUERY_CANDIDATES_F64.with(|cand_cell| {
-                QUERY_RESULTS_F64.with(|res_cell| {
-                    let mut visited = visited_cell.borrow_mut();
-                    let mut candidates = cand_cell.borrow_mut();
-                    let mut results = res_cell.borrow_mut();
-
-                    visited.clear();
-                    visited.grow(self.n);
-                    candidates.clear();
-                    results.clear();
-
-                    let (indices, dists) = match self.metric {
-                        Dist::Euclidean => self.query_euclidean(
-                            query_vec,
-                            k,
-                            ef,
-                            &mut visited,
-                            &mut candidates,
-                            &mut results,
-                        ),
-                        Dist::Cosine => self.query_cosine(
-                            query_vec,
-                            query_norm,
-                            k,
-                            ef,
-                            &mut visited,
-                            &mut candidates,
-                            &mut results,
-                        ),
-                    };
-
-                    (indices, dists)
-                })
-            })
-        })
-    }
-
-    #[inline(always)]
-    fn query_euclidean(
-        &self,
-        query_vec: &[f64],
-        k: usize,
-        ef: usize,
-        visited: &mut FixedBitSet,
-        candidates: &mut BinaryHeap<Reverse<(OrderedFloat<f64>, usize)>>,
-        results: &mut BinaryHeap<(OrderedFloat<f64>, usize)>,
-    ) -> (Vec<usize>, Vec<f64>) {
-        let init_candidates = (ef / 2).max(k).min(self.n);
-        let search_k = init_candidates * 3;
-        let (init_indices, _) = self
-            .forest
-            .query(query_vec, init_candidates, Some(search_k));
-
-        // initialize
-        for &entry_idx in &init_indices {
-            if entry_idx >= self.n || visited.contains(entry_idx) {
-                continue;
-            }
-
-            visited.insert(entry_idx);
-            let dist = self.euclidean_distance_to_query(entry_idx, query_vec);
-
-            candidates.push(Reverse((OrderedFloat(dist), entry_idx)));
-            results.push((OrderedFloat(dist), entry_idx));
-        }
-
-        // prune results to ef
-        while results.len() > ef {
-            results.pop();
-        }
-
-        let mut lower_bound = if results.len() >= ef {
-            results.peek().unwrap().0 .0
-        } else {
-            f64::MAX
-        };
-
-        // beam search
-        while let Some(Reverse((OrderedFloat(curr_dist), curr_idx))) = candidates.pop() {
-            if curr_dist > lower_bound {
-                break;
-            }
-
-            for &(nbr_idx, _) in &self.graph[curr_idx] {
-                if visited.contains(nbr_idx) {
-                    continue;
-                }
-                visited.insert(nbr_idx);
-
-                let dist = self.euclidean_distance_to_query(nbr_idx, query_vec);
-
-                // CRTIICAL AGAIN: Only add to candidates if it's promising
-                if dist < lower_bound || results.len() < ef {
-                    candidates.push(Reverse((OrderedFloat(dist), nbr_idx)));
-
-                    if results.len() < ef {
-                        results.push((OrderedFloat(dist), nbr_idx));
-                        if results.len() == ef {
-                            lower_bound = results.peek().unwrap().0 .0;
-                        }
-                    } else if dist < lower_bound {
-                        results.pop();
-                        results.push((OrderedFloat(dist), nbr_idx));
-                        lower_bound = results.peek().unwrap().0 .0;
-                    }
-                }
-            }
-        }
-
-        // extract final k results
-        let mut final_results: Vec<_> = results.drain().collect();
-        final_results.sort_unstable_by(|a, b| a.0.cmp(&b.0));
-        final_results.truncate(k);
-
-        final_results
-            .into_iter()
-            .map(|(OrderedFloat(d), i)| (i, d))
-            .unzip()
-    }
-
-    #[inline(always)]
-    fn query_cosine(
-        &self,
-        query_vec: &[f64],
-        query_norm: f64,
-        k: usize,
-        ef: usize,
-        visited: &mut FixedBitSet,
-        candidates: &mut BinaryHeap<Reverse<(OrderedFloat<f64>, usize)>>,
-        results: &mut BinaryHeap<(OrderedFloat<f64>, usize)>,
-    ) -> (Vec<usize>, Vec<f64>) {
-        let init_candidates = (ef / 2).max(k).min(self.n);
-        let search_k = init_candidates * 3;
-        let (init_indices, _) = self
-            .forest
-            .query(query_vec, init_candidates, Some(search_k));
-
-        for &entry_idx in &init_indices {
-            if entry_idx >= self.n || visited.contains(entry_idx) {
-                continue;
-            }
-
-            visited.insert(entry_idx);
-            let dist = self.cosine_distance_to_query(entry_idx, query_vec, query_norm);
-
-            candidates.push(Reverse((OrderedFloat(dist), entry_idx)));
-            results.push((OrderedFloat(dist), entry_idx));
-        }
-
-        while results.len() > ef {
-            results.pop();
-        }
-
-        let mut lower_bound = if results.len() >= ef {
-            results.peek().unwrap().0 .0
-        } else {
-            f64::MAX
-        };
-
-        while let Some(Reverse((OrderedFloat(curr_dist), curr_idx))) = candidates.pop() {
-            if curr_dist > lower_bound {
-                break;
-            }
-
-            for &(nbr_idx, _) in &self.graph[curr_idx] {
-                if visited.contains(nbr_idx) {
-                    continue;
-                }
-                visited.insert(nbr_idx);
-
-                let dist = self.cosine_distance_to_query(nbr_idx, query_vec, query_norm);
-
-                if dist < lower_bound || results.len() < ef {
-                    candidates.push(Reverse((OrderedFloat(dist), nbr_idx)));
-
-                    if results.len() < ef {
-                        results.push((OrderedFloat(dist), nbr_idx));
-                        if results.len() == ef {
-                            lower_bound = results.peek().unwrap().0 .0;
-                        }
-                    } else if dist < lower_bound {
-                        results.pop();
-                        results.push((OrderedFloat(dist), nbr_idx));
-                        lower_bound = results.peek().unwrap().0 .0;
-                    }
-                }
-            }
-        }
-
-        let mut final_results: Vec<_> = results.drain().collect();
-        final_results.sort_unstable_by(|a, b| a.0.cmp(&b.0));
-        final_results.truncate(k);
-
-        final_results
-            .into_iter()
-            .map(|(OrderedFloat(d), i)| (i, d))
-            .unzip()
-    }
-}
+impl_nndescent_query!(f32, QUERY_CANDIDATES_F32, QUERY_RESULTS_F32);
+impl_nndescent_query!(f64, QUERY_CANDIDATES_F64, QUERY_RESULTS_F64);
 
 ///////////////////
 // KnnValidation //
@@ -1845,13 +1362,26 @@ mod tests {
 
     fn create_simple_matrix() -> Mat<f32> {
         let data = [
-            1.0, 0.0, 0.0, // Point 0
-            0.0, 1.0, 0.0, // Point 1
-            0.0, 0.0, 1.0, // Point 2
-            1.0, 1.0, 0.0, // Point 3
-            1.0, 0.0, 1.0, // Point 4
+            1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 1.0, 1.0, 0.0, 1.0, 0.0, 1.0,
         ];
         Mat::from_fn(5, 3, |i, j| data[i * 3 + j])
+    }
+
+    /// Return the non-sentinel neighbours for node `i`.
+    fn neighbours(index: &NNDescent<f32>, i: usize) -> Vec<(usize, f32)> {
+        index.graph[i * index.k..(i + 1) * index.k]
+            .iter()
+            .copied()
+            .filter(|&(pid, _)| pid != SENTINEL_PID)
+            .collect()
+    }
+
+    fn neighbours_f64(index: &NNDescent<f64>, i: usize) -> Vec<(usize, f64)> {
+        index.graph[i * index.k..(i + 1) * index.k]
+            .iter()
+            .copied()
+            .filter(|&(pid, _)| pid != SENTINEL_PID)
+            .collect()
     }
 
     #[test]
@@ -1870,9 +1400,9 @@ mod tests {
             false,
         );
 
-        assert_eq!(index.graph.len(), 5);
-        for neighbours in &index.graph {
-            assert!(neighbours.len() <= 3);
+        assert_eq!(index.graph.len(), 5 * 3);
+        for i in 0..5 {
+            assert!(neighbours(&index, i).len() <= 3);
         }
     }
 
@@ -1892,7 +1422,7 @@ mod tests {
             false,
         );
 
-        assert_eq!(index.graph.len(), 5);
+        assert_eq!(index.graph.len(), 5 * 3);
         assert!(!index.norms.is_empty());
     }
 
@@ -1923,7 +1453,6 @@ mod tests {
     #[test]
     fn test_nndescent_convergence() {
         let mat = create_simple_matrix();
-
         let index = NNDescent::<f32>::new(
             mat.as_ref(),
             Dist::Euclidean,
@@ -1937,14 +1466,26 @@ mod tests {
             false,
         );
 
-        assert_eq!(index.graph.len(), 5);
+        assert_eq!(index.graph.len(), 5 * 3);
     }
 
     #[test]
     fn test_nndescent_reproducibility() {
         let mat = create_simple_matrix();
 
-        let graph1 = NNDescent::<f32>::new(
+        let g1 = NNDescent::<f32>::new(
+            mat.as_ref(),
+            Dist::Euclidean,
+            Some(3),
+            None,
+            Some(10),
+            None,
+            0.001,
+            0.0,
+            42,
+            false,
+        );
+        let g2 = NNDescent::<f32>::new(
             mat.as_ref(),
             Dist::Euclidean,
             Some(3),
@@ -1957,24 +1498,9 @@ mod tests {
             false,
         );
 
-        let graph2 = NNDescent::<f32>::new(
-            mat.as_ref(),
-            Dist::Euclidean,
-            Some(3),
-            None,
-            Some(10),
-            None,
-            0.001,
-            0.0,
-            42,
-            false,
-        );
-
-        assert_eq!(graph1.graph.len(), graph2.graph.len());
-
-        // Check that graphs are identical
-        for i in 0..graph1.graph.len() {
-            assert_eq!(graph1.graph[i].len(), graph2.graph[i].len());
+        assert_eq!(g1.graph.len(), g2.graph.len());
+        for i in 0..g1.n {
+            assert_eq!(neighbours(&g1, i).len(), neighbours(&g2, i).len());
         }
     }
 
@@ -1982,7 +1508,7 @@ mod tests {
     fn test_nndescent_k_parameter() {
         let mat = create_simple_matrix();
 
-        let graph_k2 = NNDescent::<f32>::new(
+        let gk2 = NNDescent::<f32>::new(
             mat.as_ref(),
             Dist::Euclidean,
             Some(2),
@@ -1994,8 +1520,7 @@ mod tests {
             42,
             false,
         );
-
-        let graph_k4 = NNDescent::<f32>::new(
+        let gk4 = NNDescent::<f32>::new(
             mat.as_ref(),
             Dist::Euclidean,
             Some(4),
@@ -2008,12 +1533,11 @@ mod tests {
             false,
         );
 
-        for neighbours in &graph_k2.graph {
-            assert!(neighbours.len() <= 2);
+        for i in 0..5 {
+            assert!(neighbours(&gk2, i).len() <= 2);
         }
-
-        for neighbours in &graph_k4.graph {
-            assert!(neighbours.len() <= 4);
+        for i in 0..5 {
+            assert!(neighbours(&gk4, i).len() <= 4);
         }
     }
 
@@ -2022,7 +1546,6 @@ mod tests {
         let n = 50;
         let dim = 10;
         let mut data = Vec::with_capacity(n * dim);
-
         for i in 0..n {
             for j in 0..dim {
                 data.push((i * j) as f32 / 10.0);
@@ -2043,11 +1566,11 @@ mod tests {
             false,
         );
 
-        assert_eq!(index.graph.len(), n);
-
-        for neighbours in &index.graph {
-            assert!(neighbours.len() <= 10);
-            assert!(!neighbours.is_empty());
+        assert_eq!(index.graph.len(), n * 10);
+        for i in 0..n {
+            let nbrs = neighbours(&index, i);
+            assert!(nbrs.len() <= 10);
+            assert!(!nbrs.is_empty());
         }
     }
 
@@ -2067,9 +1590,10 @@ mod tests {
             false,
         );
 
-        for neighbours in &index.graph {
-            for i in 1..neighbours.len() {
-                assert!(neighbours[i].1 >= neighbours[i - 1].1);
+        for i in 0..5 {
+            let nbrs = neighbours(&index, i);
+            for w in nbrs.windows(2) {
+                assert!(w[1].1 >= w[0].1);
             }
         }
     }
@@ -2092,7 +1616,10 @@ mod tests {
             false,
         );
 
-        assert_eq!(index.graph.len(), 3);
+        assert_eq!(index.graph.len(), 3 * 2);
+        for i in 0..3 {
+            assert!(!neighbours_f64(&index, i).is_empty());
+        }
     }
 
     #[test]
@@ -2101,12 +1628,10 @@ mod tests {
         let dim = 3;
         let mut data = Vec::with_capacity(n * dim);
 
-        // First cluster at x=0
         for i in 0..10 {
             let offset = i as f32 * 0.1;
             data.extend_from_slice(&[offset, 0.0, 0.0]);
         }
-        // Second cluster at x=10
         for i in 0..10 {
             let offset = 10.0 + i as f32 * 0.1;
             data.extend_from_slice(&[offset, 0.0, 0.0]);
@@ -2126,13 +1651,12 @@ mod tests {
             false,
         );
 
-        // Check that neighbours tend to be in the same cluster
-        let neighbours_0 = &index.graph[0];
-        let in_cluster = neighbours_0.iter().filter(|(idx, _)| *idx < 10).count();
+        let nbrs_0 = neighbours(&index, 0);
+        let in_cluster = nbrs_0.iter().filter(|(idx, _)| *idx < 10).count();
         assert!(in_cluster >= 3);
 
-        let neighbours_10 = &index.graph[10];
-        let in_cluster_2 = neighbours_10.iter().filter(|(idx, _)| *idx >= 10).count();
+        let nbrs_10 = neighbours(&index, 10);
+        let in_cluster_2 = nbrs_10.iter().filter(|(idx, _)| *idx >= 10).count();
         assert!(in_cluster_2 >= 3);
     }
 
@@ -2147,14 +1671,14 @@ mod tests {
             Some(10),
             None,
             0.001,
-            0.5, // Enable diversification
+            0.5,
             42,
             false,
         );
 
-        assert_eq!(index.graph.len(), 5);
-        for neighbours in &index.graph {
-            assert!(!neighbours.is_empty());
+        assert_eq!(index.graph.len(), 5 * 3);
+        for i in 0..5 {
+            assert!(!neighbours(&index, i).is_empty());
         }
     }
 }
