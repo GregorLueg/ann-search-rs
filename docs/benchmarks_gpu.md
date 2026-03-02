@@ -266,10 +266,10 @@ IVF-GPU-nl707 (self)                                   4_252.78     7_018.68    
 </code></pre>
 </details>
 
-The results here are more favourable of the GPU acceleration. We go from ~85
-seconds with exhaustive search on CPU to ~22 seconds on GPU for full kNN
-generation; with the IVF variants, we can go from 22 seconds for the CPU based
-version to ~11 seconds on the GPU one. The effects become even more pronounced
+The results here are more favourable of the GPU acceleration. We go from ~90
+seconds with exhaustive search on CPU to ~20 seconds on GPU for full kNN
+generation; with the IVF variants, we can go from 20 seconds for the CPU based
+version to ~10 seconds on the GPU one. The effects become even more pronounced
 with higher dimensionality.
 
 <details>
@@ -333,9 +333,9 @@ IVF-GPU-nl707 (self)                                   4_169.96     8_393.61    
 </code></pre>
 </details>
 
-The exhaustive kNN search on the CPU takes ~190 seconds (3 minutes). Leveraging
+The exhaustive kNN search on the CPU takes ~200 seconds (3+ minutes). Leveraging
 the GPU, we cut this down to 45 seconds, a 4x speedup. The IVF CPU version
-takes in the best case 50 seconds, which gets cut down to 9 seconds. The
+takes in the best case 50 seconds, which gets cut down to 10+ seconds. The
 GPU acceleration really shines with larger, high dimensionsal data sets.
 
 #### Increasing the number of samples
@@ -473,12 +473,12 @@ IVF-GPU-nl1000 (self)                                 10_168.20    25_636.48    
 
 In these configurations, we can really appreciate the GPU acceleration. For
 64 dimensions, we go in the case of</br></br>
-Exhaustive CPU: 380 seconds -> Exhaustive GPU: 90 seconds **(4x)** </br>
-IVF CPU: 90 seconds -> IVF GPU: 35 seconds **(2.5x)** </br></br>
+Exhaustive CPU: ca. 6.5 min -> Exhaustive GPU: 1.5 seconds **(4x)** </br>
+IVF CPU: 90 seconds -> IVF GPU: 30 seconds **(3x)** </br></br>
 The acceleration is even more significant with higher dimensions, as seen
 here for the 128 dimension case.</br></br>
-Exhaustive CPU: 900 seconds -> Exhaustive GPU: 180 seconds **(5x)** </br>
-IVF CPU: 180 seconds -> IVF GPU: 55 seconds **(3x)** </br></br></br>
+Exhaustive CPU: 15 min -> Exhaustive GPU: 3 min **(5x)** </br>
+IVF CPU: 3 min -> IVF GPU: 1 min **(3x)** </br></br></br>
 
 *All benchmarks were run on M1 Max MacBook Pro with 64 GB unified memory.*
 *The GPU backend was the wgpu backend.*

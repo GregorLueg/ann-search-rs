@@ -1,18 +1,15 @@
 ## Binarised indices benchmarks and parameter
 
 Binarised indices compress the data stored in the index structure itself via
-very aggressive quantisation to basically only bits. This has two impacts:
+very aggressive quantisation to (basically) only bits. This has two impacts:
 
-1. Drastic reduction in memory usage.
+1. Drastic reduction in memory fingerprint of the index itself.
 2. Increased query speed in most cases as the bit-wise operations are very
-fast.
+fast on modern CPUs.
 3. However, when not using any re-ranking of the top candidates, dramatically
-lower recall (less so for RaBitQ).
+lower recall (less so for RaBitQ, an excellent way of compressing vectors).
 
-These indices can be nonetheless quite useful in memory-constrained scenarios.
-In both cases, there is an option to do re-ranking against the original vectors.
-However, these are stored on disk and accessed via rapid access. The benchmarks
-below show scenarios with and without re-ranking.
+The benchmarks below show scenarios with and without re-ranking.
 
 ```bash
 cargo run --example gridsearch_binary --release --features binary
@@ -35,11 +32,25 @@ benchmarked. Index size in memory is also provided.
 
 ### <u>Binary (IVF and exhaustive)</u>
 
-These indices uses binarisation via either SimHash or iterative quantisation
-via PCA rotations. They both have the option to use a VecStore that saves the
-original data on disk for fast retrieval and re-ranking. This is recommended if
-you wish to maintain some Recall. Generally speaking, these indices shine in
-very high-dimensional data where memory requirements becomes very constraining.
+Three binarisations are offered in this crate:
+
+- **SimHash**: Projects vectors onto random hyperplanes and encodes the sign of
+  each projection as a bit. The random planes are orthogonalised to improve
+  coverage of the vector space.
+- **ITQ (Iterative Quantisation)**: Uses PCA to find the axes of maximum
+  variance in the data, then iteratively rotates the data to minimise
+  quantisation error before binarising. This is more expensive to build but
+  tends to yield better recall than random projections pending the data
+  structure (it's not a must!).
+- **Signed**: Simply encodes the sign of each embedding dimension directly as
+  a bit, meaning n_bits is fixed to the number of dimensions. Straightforward
+  but only sensible for high-dimensional data; at low dimensionality the recall
+  degrades quickly.
+
+These indices have the option to use a VecStore that saves the original data on
+disk for fast retrieval and re-ranking. This is recommended if you wish to
+maintain reasonable recall. Generally speaking, these indices shine in very
+high-dimensional data where memory requirements become constraining.
 
 **Key parameters *(general)*:**
 
@@ -2000,9 +2011,9 @@ IVF-Binary-512-nl547-signed (self)                    37_477.07     7_528.54    
 
 ### <u>RaBitQ (IVF and exhaustive)</u>
 
-[RaBitQ](https://arxiv.org/abs/2405.12497) is an incredibly powerful
+[RaBitQ](https://arxiv.org/abs/2405.12497) is an very powerful
 quantisation that combines strong compression with excellent Recalls (even
-without re-ranking). It works better on higher dimensions. In the case of the
+without re-ranking!). It works better on higher dimensions. In the case of the
 `ExhaustiveRaBitQ`, the quantiser itself generates a smaller number of centroids
 for quantisation purposes (`sqrt(n)` centroids in this case). On the other
 hand for the `IVF-RaBitQ` index, the IVF centroids are directly used for
