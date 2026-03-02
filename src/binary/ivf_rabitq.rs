@@ -1,7 +1,7 @@
 use bytemuck::Pod;
 use faer::{MatRef, RowRef};
 use faer_traits::ComplexField;
-use num_traits::{Float, FromPrimitive, ToPrimitive};
+use num_traits::{Float, FromPrimitive};
 use rayon::prelude::*;
 use std::collections::BinaryHeap;
 use std::iter::Sum;
@@ -14,9 +14,8 @@ use thousands::*;
 use crate::binary::dist_binary::*;
 use crate::binary::rabitq::*;
 use crate::binary::vec_store::*;
-use crate::utils::dist::*;
-use crate::utils::heap_structs::*;
-use crate::utils::ivf_utils::*;
+use crate::prelude::*;
+use crate::utils::k_means_utils::*;
 use crate::utils::*;
 
 /// IVF index with RaBitQ quantisation
@@ -87,7 +86,7 @@ where
 
 impl<T> IvfIndexRaBitQ<T>
 where
-    T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum + ComplexField + SimdDistance + Pod,
+    T: AnnSearchFloat + ComplexField + Pod,
 {
     /// Build IVF-RaBitQ index
     ///
@@ -161,15 +160,8 @@ where
         };
 
         // subsample for training if large
-        let (training_data, n_train) = if n > 500_000 {
-            if verbose {
-                println!("  Sampling 250k vectors for centroid training.");
-            }
-            let (sampled, _) = sample_vectors(&vectors_flat, dim, n, 250_000, seed);
-            (sampled, 250_000)
-        } else {
-            (vectors_flat.clone(), n)
-        };
+        let n_train = (256 * nlist).min(250_000).min(n).max(1);
+        let (training_data, _) = sample_vectors(&vectors_flat, dim, n, n_train, seed);
 
         // train centroids
         let mut centroids_flat = train_centroids(
@@ -202,7 +194,7 @@ where
         }
 
         let centroids_norm: Vec<T> = (0..nlist)
-            .map(|i| compute_norm(&centroids_flat[i * dim..(i + 1) * dim]))
+            .map(|i| compute_l2_norm(&centroids_flat[i * dim..(i + 1) * dim]))
             .collect();
 
         // Assign all vectors
@@ -354,7 +346,7 @@ where
         }
 
         let centroids_norm: Vec<T> = (0..nlist)
-            .map(|i| compute_norm(&centroids_flat[i * dim..(i + 1) * dim]))
+            .map(|i| compute_l2_norm(&centroids_flat[i * dim..(i + 1) * dim]))
             .collect();
 
         let assignments = assign_all_parallel(
@@ -422,7 +414,7 @@ where
         // Normalise query for cosine
         let (query_normalised, _): (Vec<T>, T) = match self.encoder.metric {
             Dist::Cosine => {
-                let norm = compute_norm(query_vec);
+                let norm = compute_l2_norm(query_vec);
                 if norm > T::epsilon() {
                     (query_vec.iter().map(|&x| x / norm).collect(), norm)
                 } else {
@@ -518,7 +510,7 @@ where
         let (candidates, _) = self.query(query_vec, k * rerank_factor, nprobe);
 
         let query_norm = match self.encoder.metric {
-            Dist::Cosine => compute_norm(query_vec),
+            Dist::Cosine => compute_l2_norm(query_vec),
             Dist::Euclidean => T::one(),
         };
 

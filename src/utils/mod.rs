@@ -1,6 +1,7 @@
 pub mod dist;
 pub mod heap_structs;
-pub mod ivf_utils;
+pub mod k_means_utils;
+pub mod traits;
 pub mod tree_utils;
 
 use faer::MatRef;
@@ -12,8 +13,7 @@ use rustc_hash::FxHashSet;
 use std::collections::BinaryHeap;
 use std::iter::Sum;
 
-use crate::utils::dist::*;
-use crate::utils::heap_structs::*;
+use crate::prelude::*;
 
 /////////////
 // Helpers //

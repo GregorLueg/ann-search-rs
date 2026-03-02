@@ -1,4 +1,6 @@
 pub mod exhaustive_bf16;
+pub mod exhaustive_opq;
+pub mod exhaustive_pq;
 pub mod exhaustive_sq8;
 pub mod ivf_bf16;
 pub mod ivf_opq;

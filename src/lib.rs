@@ -7,6 +7,7 @@ pub mod hnsw;
 pub mod ivf;
 pub mod lsh;
 pub mod nndescent;
+pub mod prelude;
 pub mod utils;
 
 #[cfg(feature = "gpu")]
@@ -50,7 +51,7 @@ use crate::hnsw::*;
 use crate::ivf::*;
 use crate::lsh::*;
 use crate::nndescent::*;
-use crate::utils::dist::*;
+use crate::prelude::*;
 
 #[cfg(feature = "binary")]
 use crate::binary::{exhaustive_binary::*, exhaustive_rabitq::*, ivf_binary::*, ivf_rabitq::*};
@@ -58,7 +59,8 @@ use crate::binary::{exhaustive_binary::*, exhaustive_rabitq::*, ivf_binary::*, i
 use crate::gpu::{exhaustive_gpu::*, ivf_gpu::*};
 #[cfg(feature = "quantised")]
 use crate::quantised::{
-    exhaustive_bf16::*, exhaustive_sq8::*, ivf_bf16::*, ivf_opq::*, ivf_pq::*, ivf_sq8::*,
+    exhaustive_bf16::*, exhaustive_opq::*, exhaustive_pq::*, exhaustive_sq8::*, ivf_bf16::*,
+    ivf_opq::*, ivf_pq::*, ivf_sq8::*,
 };
 
 ////////////
@@ -207,7 +209,7 @@ where
 /// The initialised `ExhausiveIndex`
 pub fn build_exhaustive_index<T>(mat: MatRef<T>, dist_metric: &str) -> ExhaustiveIndex<T>
 where
-    T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum + SimdDistance,
+    T: AnnSearchFloat,
 {
     let metric = parse_ann_dist(dist_metric).unwrap_or_default();
     ExhaustiveIndex::new(mat, metric)
@@ -234,7 +236,7 @@ pub fn query_exhaustive_index<T>(
     verbose: bool,
 ) -> (Vec<Vec<usize>>, Option<Vec<Vec<T>>>)
 where
-    T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum + SimdDistance,
+    T: AnnSearchFloat,
 {
     query_parallel(query_mat.nrows(), return_dist, verbose, |i| {
         index.query_row(query_mat.row(i), k)
@@ -262,7 +264,7 @@ pub fn query_exhaustive_self<T>(
     verbose: bool,
 ) -> (Vec<Vec<usize>>, Option<Vec<Vec<T>>>)
 where
-    T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum + SimdDistance,
+    T: AnnSearchFloat,
 {
     index.generate_knn(k, return_dist, verbose)
 }
@@ -290,7 +292,7 @@ pub fn build_annoy_index<T>(
     seed: usize,
 ) -> AnnoyIndex<T>
 where
-    T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum + SimdDistance,
+    T: AnnSearchFloat,
 {
     let ann_dist = parse_ann_dist(&dist_metric).unwrap_or_default();
 
@@ -321,7 +323,7 @@ pub fn query_annoy_index<T>(
     verbose: bool,
 ) -> (Vec<Vec<usize>>, Option<Vec<Vec<T>>>)
 where
-    T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum + SimdDistance,
+    T: AnnSearchFloat,
 {
     query_parallel(query_mat.nrows(), return_dist, verbose, |i| {
         index.query_row(query_mat.row(i), k, search_budget)
@@ -352,7 +354,7 @@ pub fn query_annoy_self<T>(
     verbose: bool,
 ) -> (Vec<Vec<usize>>, Option<Vec<Vec<T>>>)
 where
-    T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum + SimdDistance,
+    T: AnnSearchFloat,
 {
     index.generate_knn(k, search_budget, return_dist, verbose)
 }
@@ -375,7 +377,7 @@ where
 /// The `BallTreeIndex`.
 pub fn build_balltree_index<T>(mat: MatRef<T>, dist_metric: String, seed: usize) -> BallTreeIndex<T>
 where
-    T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum + SimdDistance,
+    T: AnnSearchFloat,
 {
     let ann_dist = parse_ann_dist(&dist_metric).unwrap_or_default();
     BallTreeIndex::new(mat, ann_dist, seed)
@@ -405,7 +407,7 @@ pub fn query_balltree_index<T>(
     verbose: bool,
 ) -> (Vec<Vec<usize>>, Option<Vec<Vec<T>>>)
 where
-    T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum + SimdDistance,
+    T: AnnSearchFloat,
 {
     query_parallel(query_mat.nrows(), return_dist, verbose, |i| {
         index.query_row(query_mat.row(i), k, search_budget)
@@ -436,7 +438,7 @@ pub fn query_balltree_self<T>(
     verbose: bool,
 ) -> (Vec<Vec<usize>>, Option<Vec<Vec<T>>>)
 where
-    T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum + SimdDistance,
+    T: AnnSearchFloat,
 {
     index.generate_knn(k, search_budget, return_dist, verbose)
 }
@@ -469,7 +471,7 @@ pub fn build_hnsw_index<T>(
     verbose: bool,
 ) -> HnswIndex<T>
 where
-    T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum + SimdDistance,
+    T: AnnSearchFloat,
     HnswIndex<T>: HnswState<T>,
 {
     HnswIndex::build(mat, m, ef_construction, dist_metric, seed, verbose)
@@ -505,7 +507,7 @@ pub fn query_hnsw_index<T>(
     verbose: bool,
 ) -> (Vec<Vec<usize>>, Option<Vec<Vec<T>>>)
 where
-    T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum + SimdDistance,
+    T: AnnSearchFloat,
     HnswIndex<T>: HnswState<T>,
 {
     query_parallel(query_mat.nrows(), return_dist, verbose, |i| {
@@ -539,7 +541,7 @@ pub fn query_hnsw_self<T>(
     verbose: bool,
 ) -> (Vec<Vec<usize>>, Option<Vec<Vec<T>>>)
 where
-    T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum + SimdDistance,
+    T: AnnSearchFloat,
     HnswIndex<T>: HnswState<T>,
 {
     index.generate_knn(k, ef_search, return_dist, verbose)
@@ -574,7 +576,7 @@ pub fn build_ivf_index<T>(
     verbose: bool,
 ) -> IvfIndex<T>
 where
-    T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum + SimdDistance,
+    T: AnnSearchFloat,
 {
     let ann_dist = parse_ann_dist(dist_metric).unwrap_or_default();
 
@@ -611,7 +613,7 @@ pub fn query_ivf_index<T>(
     verbose: bool,
 ) -> (Vec<Vec<usize>>, Option<Vec<Vec<T>>>)
 where
-    T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum + SimdDistance,
+    T: AnnSearchFloat,
 {
     query_parallel(query_mat.nrows(), return_dist, verbose, |i| {
         index.query_row(query_mat.row(i), k, nprobe)
@@ -651,7 +653,7 @@ pub fn query_ivf_self<T>(
     verbose: bool,
 ) -> (Vec<Vec<usize>>, Option<Vec<Vec<T>>>)
 where
-    T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum + SimdDistance,
+    T: AnnSearchFloat,
 {
     index.generate_knn(k, nprobe, return_dist, verbose)
 }
@@ -683,8 +685,7 @@ pub fn build_lsh_index<T>(
     seed: usize,
 ) -> LSHIndex<T>
 where
-    T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum + SimdDistance,
-    LSHIndex<T>: LSHQuery<T>,
+    T: AnnSearchFloat,
 {
     let metric = parse_ann_dist(dist_metric).unwrap_or_default();
     LSHIndex::new(mat, metric, num_tables, bits_per_hash, seed)
@@ -701,6 +702,8 @@ where
 /// * `k` - Number of neighbours to return
 /// * `max_candidates` - Optional number to limit the candidate selection per
 ///   given table. Makes the querying faster at cost of Recall.
+/// * `nprobe` - Number of additional buckets to probe per table. Will identify
+///   the closest hash tables and use bit flipping to investigate these.
 /// * `return_dist` - Shall the distances be returned
 /// * `verbose` - Controls verbosity of the function
 ///
@@ -711,16 +714,16 @@ pub fn query_lsh_index<T>(
     query_mat: MatRef<T>,
     index: &LSHIndex<T>,
     k: usize,
+    n_probe: usize,
     max_candidates: Option<usize>,
     return_dist: bool,
     verbose: bool,
 ) -> (Vec<Vec<usize>>, Option<Vec<Vec<T>>>)
 where
-    T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum + SimdDistance,
-    LSHIndex<T>: LSHQuery<T>,
+    T: AnnSearchFloat,
 {
     query_parallel_with_flags(query_mat.nrows(), return_dist, verbose, |i| {
-        index.query_row(query_mat.row(i), k, max_candidates)
+        index.query_row(query_mat.row(i), k, max_candidates, n_probe)
     })
 }
 
@@ -732,6 +735,9 @@ where
 /// * `k` - Number of neighbours to return
 /// * `max_candidates` - Optional number to limit the candidate selection per
 ///   given table. Makes the querying faster at cost of Recall.
+/// * `n_probe` - Optional number of additional buckets to probe per table. Will
+///   identify the closest hash tables and use bit flipping to investigate
+///   these. Defaults to half the number of bits.
 /// * `return_dist` - Shall the distances be returned
 /// * `verbose` - Controls verbosity of the function
 ///
@@ -741,15 +747,17 @@ where
 pub fn query_lsh_self<T>(
     index: &LSHIndex<T>,
     k: usize,
+    n_probe: Option<usize>,
     max_candidates: Option<usize>,
     return_dist: bool,
     verbose: bool,
 ) -> (Vec<Vec<usize>>, Option<Vec<Vec<T>>>)
 where
-    T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum + SimdDistance,
-    LSHIndex<T>: LSHQuery<T>,
+    T: AnnSearchFloat,
 {
-    index.generate_knn(k, max_candidates, return_dist, verbose)
+    let n_probe = n_probe.unwrap_or(index.num_bits() / 2);
+
+    index.generate_knn(k, max_candidates, n_probe, return_dist, verbose)
 }
 
 ///////////////
@@ -790,7 +798,7 @@ pub fn build_nndescent_index<T>(
     verbose: bool,
 ) -> NNDescent<T>
 where
-    T: Float + FromPrimitive + Send + Sync + Sum + SimdDistance,
+    T: AnnSearchFloat,
     NNDescent<T>: ApplySortedUpdates<T>,
     NNDescent<T>: NNDescentQuery<T>,
 {
@@ -838,7 +846,7 @@ pub fn query_nndescent_index<T>(
     verbose: bool,
 ) -> (Vec<Vec<usize>>, Option<Vec<Vec<T>>>)
 where
-    T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum + SimdDistance,
+    T: AnnSearchFloat,
     NNDescent<T>: ApplySortedUpdates<T>,
     NNDescent<T>: NNDescentQuery<T>,
 {
@@ -876,7 +884,7 @@ pub fn query_nndescent_self<T>(
     verbose: bool,
 ) -> (Vec<Vec<usize>>, Option<Vec<Vec<T>>>)
 where
-    T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum + SimdDistance,
+    T: AnnSearchFloat,
     NNDescent<T>: ApplySortedUpdates<T>,
     NNDescent<T>: NNDescentQuery<T>,
 {
@@ -910,7 +918,7 @@ pub fn build_exhaustive_bf16_index<T>(
     verbose: bool,
 ) -> ExhaustiveIndexBf16<T>
 where
-    T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum + SimdDistance + Bf16Compatible,
+    T: AnnSearchFloat + Bf16Compatible,
 {
     let ann_dist = parse_ann_dist(dist_metric).unwrap_or_default();
     if verbose {
@@ -944,7 +952,7 @@ pub fn query_exhaustive_bf16_index<T>(
     verbose: bool,
 ) -> (Vec<Vec<usize>>, Option<Vec<Vec<T>>>)
 where
-    T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum + SimdDistance + Bf16Compatible,
+    T: AnnSearchFloat + Bf16Compatible,
 {
     query_parallel(query_mat.nrows(), return_dist, verbose, |i| {
         index.query_row(query_mat.row(i), k)
@@ -973,7 +981,7 @@ pub fn query_exhaustive_bf16_self<T>(
     verbose: bool,
 ) -> (Vec<Vec<usize>>, Option<Vec<Vec<T>>>)
 where
-    T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum + SimdDistance + Bf16Compatible,
+    T: AnnSearchFloat + Bf16Compatible,
 {
     index.generate_knn(k, return_dist, verbose)
 }
@@ -1001,7 +1009,7 @@ pub fn build_exhaustive_sq8_index<T>(
     verbose: bool,
 ) -> ExhaustiveSq8Index<T>
 where
-    T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum + SimdDistance,
+    T: AnnSearchFloat,
 {
     let ann_dist = parse_ann_dist(dist_metric).unwrap_or_default();
     if verbose {
@@ -1032,7 +1040,7 @@ pub fn query_exhaustive_sq8_index<T>(
     verbose: bool,
 ) -> (Vec<Vec<usize>>, Option<Vec<Vec<T>>>)
 where
-    T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum + SimdDistance,
+    T: AnnSearchFloat,
 {
     query_parallel(query_mat.nrows(), return_dist, verbose, |i| {
         index.query_row(query_mat.row(i), k)
@@ -1061,7 +1069,201 @@ pub fn query_exhaustive_sq8_self<T>(
     verbose: bool,
 ) -> (Vec<Vec<usize>>, Option<Vec<Vec<T>>>)
 where
-    T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum + SimdDistance,
+    T: AnnSearchFloat,
+{
+    index.generate_knn(k, return_dist, verbose)
+}
+
+////////////////////
+// Exhaustive-PQ //
+////////////////////
+
+#[cfg(feature = "quantised")]
+/// Build an Exhaustive-PQ index
+///
+/// ### Params
+///
+/// * `mat` - The data matrix. Rows represent the samples, columns represent
+///   the embedding dimensions
+/// * `m` - Number of subspaces for product quantisation (dim must be divisible
+///   by m)
+/// * `max_iters` - Maximum k-means iterations (defaults to 30 if None)
+/// * `n_pq_centroids` - Number of centroids per subspace (defaults to 256 if None)
+/// * `dist_metric` - Distance metric ("euclidean" or "cosine")
+/// * `seed` - Random seed for reproducibility
+/// * `verbose` - Print progress information during index construction
+///
+/// ### Return
+///
+/// The `ExhaustivePqIndex`.
+#[allow(clippy::too_many_arguments)]
+pub fn build_exhaustive_pq_index<T>(
+    mat: MatRef<T>,
+    m: usize,
+    max_iters: Option<usize>,
+    n_pq_centroids: Option<usize>,
+    dist_metric: &str,
+    seed: usize,
+    verbose: bool,
+) -> ExhaustivePqIndex<T>
+where
+    T: AnnSearchFloat,
+{
+    let ann_dist = parse_ann_dist(dist_metric).unwrap_or_default();
+    ExhaustivePqIndex::build(mat, m, ann_dist, max_iters, n_pq_centroids, seed, verbose)
+}
+
+#[cfg(feature = "quantised")]
+/// Helper function to query a given Exhaustive-PQ index
+///
+/// ### Params
+///
+/// * `query_mat` - The query matrix containing the samples x features
+/// * `index` - Reference to the built Exhaustive-PQ index
+/// * `k` - Number of neighbours to return
+/// * `return_dist` - Shall the distances be returned
+/// * `verbose` - Print progress information
+///
+/// ### Returns
+///
+/// A tuple of `(knn_indices, optional distances)`
+pub fn query_exhaustive_pq_index<T>(
+    query_mat: MatRef<T>,
+    index: &ExhaustivePqIndex<T>,
+    k: usize,
+    return_dist: bool,
+    verbose: bool,
+) -> (Vec<Vec<usize>>, Option<Vec<Vec<T>>>)
+where
+    T: AnnSearchFloat,
+{
+    query_parallel(query_mat.nrows(), return_dist, verbose, |i| {
+        index.query_row(query_mat.row(i), k)
+    })
+}
+
+#[cfg(feature = "quantised")]
+/// Helper function to self query an Exhaustive-PQ index
+///
+/// This function will generate a full kNN graph based on the internal data. To
+/// note, during quantisation information is lost, hence, the quality of the
+/// graph is reduced compared to other indices.
+///
+/// ### Params
+///
+/// * `index` - Reference to the built Exhaustive-PQ index
+/// * `k` - Number of neighbours to return
+/// * `return_dist` - Shall the distances be returned
+/// * `verbose` - Print progress information
+///
+/// ### Returns
+///
+/// A tuple of `(knn_indices, optional distances)`
+pub fn query_exhaustive_pq_index_self<T>(
+    index: &ExhaustivePqIndex<T>,
+    k: usize,
+    return_dist: bool,
+    verbose: bool,
+) -> (Vec<Vec<usize>>, Option<Vec<Vec<T>>>)
+where
+    T: AnnSearchFloat,
+{
+    index.generate_knn(k, return_dist, verbose)
+}
+
+////////////////////
+// Exhaustive-OPQ //
+////////////////////
+
+#[cfg(feature = "quantised")]
+/// Build an Exhaustive-OPQ index
+///
+/// ### Params
+///
+/// * `mat` - The data matrix. Rows represent the samples, columns represent
+///   the embedding dimensions
+/// * `m` - Number of subspaces for product quantisation (dim must be divisible
+///   by m)
+/// * `max_iters` - Maximum k-means iterations (defaults to 30 if None)
+/// * `n_pq_centroids` - Number of centroids per subspace (defaults to 256 if None)
+/// * `dist_metric` - Distance metric ("euclidean" or "cosine")
+/// * `seed` - Random seed for reproducibility
+/// * `verbose` - Print progress information during index construction
+///
+/// ### Return
+///
+/// The `ExhaustivePqIndex`.
+#[allow(clippy::too_many_arguments)]
+pub fn build_exhaustive_opq_index<T>(
+    mat: MatRef<T>,
+    m: usize,
+    max_iters: Option<usize>,
+    n_pq_centroids: Option<usize>,
+    dist_metric: &str,
+    seed: usize,
+    verbose: bool,
+) -> ExhaustiveOpqIndex<T>
+where
+    T: AnnSearchFloat + AddAssign,
+{
+    let ann_dist = parse_ann_dist(dist_metric).unwrap_or_default();
+    ExhaustiveOpqIndex::build(mat, m, ann_dist, max_iters, n_pq_centroids, seed, verbose)
+}
+
+#[cfg(feature = "quantised")]
+/// Helper function to query a given Exhaustive-OPQ index
+///
+/// ### Params
+///
+/// * `query_mat` - The query matrix containing the samples x features
+/// * `index` - Reference to the built Exhaustive-PQ index
+/// * `k` - Number of neighbours to return
+/// * `return_dist` - Shall the distances be returned
+/// * `verbose` - Print progress information
+///
+/// ### Returns
+///
+/// A tuple of `(knn_indices, optional distances)`
+pub fn query_exhaustive_opq_index<T>(
+    query_mat: MatRef<T>,
+    index: &ExhaustiveOpqIndex<T>,
+    k: usize,
+    return_dist: bool,
+    verbose: bool,
+) -> (Vec<Vec<usize>>, Option<Vec<Vec<T>>>)
+where
+    T: AnnSearchFloat + AddAssign,
+{
+    query_parallel(query_mat.nrows(), return_dist, verbose, |i| {
+        index.query_row(query_mat.row(i), k)
+    })
+}
+
+#[cfg(feature = "quantised")]
+/// Helper function to self query an Exhaustive-OPQ index
+///
+/// This function will generate a full kNN graph based on the internal data. To
+/// note, during quantisation information is lost, hence, the quality of the
+/// graph is reduced compared to other indices.
+///
+/// ### Params
+///
+/// * `index` - Reference to the built Exhaustive-PQ index
+/// * `k` - Number of neighbours to return
+/// * `return_dist` - Shall the distances be returned
+/// * `verbose` - Print progress information
+///
+/// ### Returns
+///
+/// A tuple of `(knn_indices, optional distances)`
+pub fn query_exhaustive_opq_index_self<T>(
+    index: &ExhaustiveOpqIndex<T>,
+    k: usize,
+    return_dist: bool,
+    verbose: bool,
+) -> (Vec<Vec<usize>>, Option<Vec<Vec<T>>>)
+where
+    T: AnnSearchFloat + AddAssign,
 {
     index.generate_knn(k, return_dist, verbose)
 }
@@ -1095,7 +1297,7 @@ pub fn build_ivf_bf16_index<T>(
     verbose: bool,
 ) -> IvfIndexBf16<T>
 where
-    T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum + SimdDistance + Bf16Compatible,
+    T: AnnSearchFloat + Bf16Compatible,
 {
     let ann_dist = parse_ann_dist(dist_metric).unwrap_or_default();
 
@@ -1127,7 +1329,7 @@ pub fn query_ivf_bf16_index<T>(
     verbose: bool,
 ) -> (Vec<Vec<usize>>, Option<Vec<Vec<T>>>)
 where
-    T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum + SimdDistance + Bf16Compatible,
+    T: AnnSearchFloat + Bf16Compatible,
 {
     query_parallel(query_mat.nrows(), return_dist, verbose, |i| {
         index.query_row(query_mat.row(i), k, nprobe)
@@ -1162,7 +1364,7 @@ pub fn query_ivf_bf16_self<T>(
     verbose: bool,
 ) -> (Vec<Vec<usize>>, Option<Vec<Vec<T>>>)
 where
-    T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum + SimdDistance + Bf16Compatible,
+    T: AnnSearchFloat + Bf16Compatible,
 {
     index.generate_knn(k, nprobe, return_dist, verbose)
 }
@@ -1196,7 +1398,7 @@ pub fn build_ivf_sq8_index<T>(
     verbose: bool,
 ) -> IvfSq8Index<T>
 where
-    T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum + SimdDistance,
+    T: AnnSearchFloat,
 {
     let ann_dist = parse_ann_dist(dist_metric).unwrap_or_default();
 
@@ -1228,7 +1430,7 @@ pub fn query_ivf_sq8_index<T>(
     verbose: bool,
 ) -> (Vec<Vec<usize>>, Option<Vec<Vec<T>>>)
 where
-    T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum + SimdDistance,
+    T: AnnSearchFloat,
 {
     query_parallel(query_mat.nrows(), return_dist, verbose, |i| {
         index.query_row(query_mat.row(i), k, nprobe)
@@ -1263,7 +1465,7 @@ pub fn query_ivf_sq8_self<T>(
     verbose: bool,
 ) -> (Vec<Vec<usize>>, Option<Vec<Vec<T>>>)
 where
-    T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum + SimdDistance,
+    T: AnnSearchFloat,
 {
     index.generate_knn(k, nprobe, return_dist, verbose)
 }
@@ -1302,7 +1504,7 @@ pub fn build_ivf_pq_index<T>(
     verbose: bool,
 ) -> IvfPqIndex<T>
 where
-    T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum + SimdDistance,
+    T: AnnSearchFloat,
 {
     let ann_dist = parse_ann_dist(dist_metric).unwrap_or_default();
 
@@ -1343,7 +1545,7 @@ pub fn query_ivf_pq_index<T>(
     verbose: bool,
 ) -> (Vec<Vec<usize>>, Option<Vec<Vec<T>>>)
 where
-    T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum + SimdDistance,
+    T: AnnSearchFloat,
 {
     query_parallel(query_mat.nrows(), return_dist, verbose, |i| {
         index.query_row(query_mat.row(i), k, nprobe)
@@ -1377,7 +1579,7 @@ pub fn query_ivf_pq_index_self<T>(
     verbose: bool,
 ) -> (Vec<Vec<usize>>, Option<Vec<Vec<T>>>)
 where
-    T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum + SimdDistance,
+    T: AnnSearchFloat,
 {
     index.generate_knn(k, nprobe, return_dist, verbose)
 }
@@ -1417,7 +1619,7 @@ pub fn build_ivf_opq_index<T>(
     verbose: bool,
 ) -> IvfOpqIndex<T>
 where
-    T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum + AddAssign + SimdDistance,
+    T: AnnSearchFloat + AddAssign,
 {
     let ann_dist = parse_ann_dist(dist_metric).unwrap_or_default();
 
@@ -1459,7 +1661,7 @@ pub fn query_ivf_opq_index<T>(
     verbose: bool,
 ) -> (Vec<Vec<usize>>, Option<Vec<Vec<T>>>)
 where
-    T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum + AddAssign + SimdDistance,
+    T: AnnSearchFloat + AddAssign,
 {
     query_parallel(query_mat.nrows(), return_dist, verbose, |i| {
         index.query_row(query_mat.row(i), k, nprobe)
@@ -1493,7 +1695,7 @@ pub fn query_ivf_opq_index_self<T>(
     verbose: bool,
 ) -> (Vec<Vec<usize>>, Option<Vec<Vec<T>>>)
 where
-    T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum + AddAssign + SimdDistance,
+    T: AnnSearchFloat + AddAssign,
 {
     index.generate_knn(k, nprobe, return_dist, verbose)
 }
@@ -1619,14 +1821,7 @@ pub fn build_ivf_index_gpu<T, R>(
 ) -> IvfIndexGpu<T, R>
 where
     R: Runtime,
-    T: Float
-        + Sum
-        + cubecl::frontend::Float
-        + cubecl::CubeElement
-        + FromPrimitive
-        + Send
-        + Sync
-        + SimdDistance,
+    T: AnnSearchFloat + cubecl::frontend::Float + cubecl::CubeElement,
 {
     let ann_dist = parse_ann_dist(dist_metric).unwrap_or_default();
     IvfIndexGpu::build(mat, ann_dist, nlist, max_iters, seed, verbose, device)
@@ -1659,14 +1854,7 @@ pub fn query_ivf_index_gpu<T, R>(
 ) -> (Vec<Vec<usize>>, Option<Vec<Vec<T>>>)
 where
     R: Runtime,
-    T: Float
-        + Sum
-        + cubecl::frontend::Float
-        + cubecl::CubeElement
-        + FromPrimitive
-        + Send
-        + Sync
-        + SimdDistance,
+    T: AnnSearchFloat + cubecl::frontend::Float + cubecl::CubeElement,
 {
     let (indices, distances) = index.query_batch(query_mat, k, nprobe, nquery, verbose);
 
@@ -1705,14 +1893,7 @@ pub fn query_ivf_index_gpu_self<T, R>(
 ) -> (Vec<Vec<usize>>, Option<Vec<Vec<T>>>)
 where
     R: Runtime,
-    T: Float
-        + Sum
-        + cubecl::frontend::Float
-        + cubecl::CubeElement
-        + FromPrimitive
-        + Send
-        + Sync
-        + SimdDistance,
+    T: AnnSearchFloat + cubecl::frontend::Float + cubecl::CubeElement,
 {
     index.generate_knn(k, nprobe, nquery, return_dist, verbose)
 }
@@ -1739,7 +1920,8 @@ where
 /// * `binary_init` - Initialisation method ("itq" or "random")
 /// * `metric` - Distance metric for reranking (when save_store is true)
 /// * `save_store` - Whether to save vector store for reranking
-/// * `save_path` - Path to save vector store files (required if save_store is true)
+/// * `save_path` - Path to save vector store files (required if save_store is
+///   true)
 ///
 /// ### Returns
 ///
@@ -1775,7 +1957,8 @@ where
 /// * `index` - The exhaustive binary index
 /// * `k` - Number of neighbours to return
 /// * `rerank` - Whether to use exact distance reranking (requires vector store)
-/// * `rerank_factor` - Multiplier for candidate set size (only used if rerank is true)
+/// * `rerank_factor` - Multiplier for candidate set size (only used if rerank
+///   is true)
 /// * `return_dist` - Shall the distances be returned
 /// * `verbose` - Controls verbosity of the function
 ///
@@ -1799,19 +1982,28 @@ where
             index.query_row_reranking(query_mat.row(i), k, rerank_factor)
         })
     } else {
-        let (indices, distances_u32) =
+        let (indices, dist) = if index.use_asymmetric() {
+            // path where asymmetric queries are sensible
             query_parallel(query_mat.nrows(), return_dist, verbose, |i| {
-                index.query_row(query_mat.row(i), k)
+                index.query_row_asymmetric(query_mat.row(i), k, rerank_factor)
+            })
+        } else {
+            // path where asymmetric queries are not sensible/possible
+            let (indices, distances_u32) =
+                query_parallel(query_mat.nrows(), return_dist, verbose, |i| {
+                    index.query_row(query_mat.row(i), k)
+                });
+            let distances_t = distances_u32.map(|dists| {
+                dists
+                    .into_iter()
+                    .map(|v| v.into_iter().map(|d| T::from_u32(d).unwrap()).collect())
+                    .collect()
             });
 
-        let distances_t = distances_u32.map(|dists| {
-            dists
-                .into_iter()
-                .map(|v| v.into_iter().map(|d| T::from_u32(d).unwrap()).collect())
-                .collect()
-        });
+            (indices, distances_t)
+        };
 
-        (indices, distances_t)
+        (indices, dist)
     }
 }
 
@@ -1824,7 +2016,8 @@ where
 ///
 /// * `index` - Reference to built index
 /// * `k` - Number of neighbours
-/// * `rerank_factor` - Multiplier for candidate set (only used if vector store available)
+/// * `rerank_factor` - Multiplier for candidate set (only used if vector store
+///   available)
 /// * `return_dist` - Return distances
 /// * `verbose` - Controls verbosity
 ///
@@ -1861,7 +2054,8 @@ where
 /// * `dist_metric` - "euclidean" or "cosine"
 /// * `seed` - Random seed
 /// * `save_store` - Whether to save vector store for reranking
-/// * `save_path` - Path to save vector store files (required if save_store is true)
+/// * `save_path` - Path to save vector store files (required if save_store
+///   is true)
 /// * `verbose` - Print progress
 ///
 /// ### Returns
@@ -1922,7 +2116,8 @@ where
 /// * `k` - Number of neighbours
 /// * `nprobe` - Clusters to search (defaults to √nlist)
 /// * `rerank` - Whether to use exact distance reranking (requires vector store)
-/// * `rerank_factor` - Multiplier for candidate set size (only used if rerank is true)
+/// * `rerank_factor` - Multiplier for candidate set size (only used if rerank
+///   is true)
 /// * `return_dist` - Return distances
 /// * `verbose` - Controls verbosity
 ///
@@ -1943,65 +2138,29 @@ pub fn query_ivf_index_binary<T>(
 where
     T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum + ComplexField + SimdDistance + Pod,
 {
-    let counter = Arc::new(AtomicUsize::new(0));
-    let n_queries = query_mat.nrows();
-
     if rerank {
-        let results: Vec<(Vec<usize>, Vec<T>)> = (0..n_queries)
-            .into_par_iter()
-            .map(|i| {
-                if verbose {
-                    let count = counter.fetch_add(1, Ordering::Relaxed) + 1;
-                    if count.is_multiple_of(100_000) {
-                        println!(
-                            "  Processed {} / {} queries.",
-                            count.separate_with_underscores(),
-                            n_queries.separate_with_underscores()
-                        );
-                    }
-                }
-                index.query_row_reranking(query_mat.row(i), k, nprobe, rerank_factor)
-            })
-            .collect();
-
-        if return_dist {
-            let (indices, distances) = results.into_iter().unzip();
-            (indices, Some(distances))
-        } else {
-            let indices: Vec<Vec<usize>> = results.into_iter().map(|(idx, _)| idx).collect();
-            (indices, None)
-        }
+        query_parallel(query_mat.nrows(), return_dist, verbose, |i| {
+            index.query_row_reranking(query_mat.row(i), k, nprobe, rerank_factor)
+        })
     } else {
-        let results: Vec<(Vec<usize>, Vec<u32>)> = (0..n_queries)
-            .into_par_iter()
-            .map(|i| {
-                let query_vec: Vec<T> = query_mat.row(i).iter().cloned().collect();
-                if verbose {
-                    let count = counter.fetch_add(1, Ordering::Relaxed) + 1;
-                    if count.is_multiple_of(100_000) {
-                        println!(
-                            "  Processed {} / {} queries.",
-                            count.separate_with_underscores(),
-                            n_queries.separate_with_underscores()
-                        );
-                    }
-                }
-                index.query(&query_vec, k, nprobe)
+        let (indices, dist) = if index.use_asymmetric() {
+            query_parallel(query_mat.nrows(), return_dist, verbose, |i| {
+                index.query_row_asymmetric(query_mat.row(i), k, nprobe, rerank_factor)
             })
-            .collect();
-
-        if return_dist {
-            let (indices, distances): (Vec<Vec<usize>>, Vec<Vec<u32>>) =
-                results.into_iter().unzip();
-            let distances_converted: Vec<Vec<T>> = distances
-                .into_iter()
-                .map(|v| v.into_iter().map(|d| T::from_u32(d).unwrap()).collect())
-                .collect();
-            (indices, Some(distances_converted))
         } else {
-            let indices: Vec<Vec<usize>> = results.into_iter().map(|(idx, _)| idx).collect();
-            (indices, None)
-        }
+            let (indices, distances_u32) =
+                query_parallel(query_mat.nrows(), return_dist, verbose, |i| {
+                    index.query_row(query_mat.row(i), k, nprobe)
+                });
+            let distances_t = distances_u32.map(|dists| {
+                dists
+                    .into_iter()
+                    .map(|v| v.into_iter().map(|d| T::from_u32(d).unwrap()).collect())
+                    .collect()
+            });
+            (indices, distances_t)
+        };
+        (indices, dist)
     }
 }
 

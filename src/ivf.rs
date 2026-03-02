@@ -1,14 +1,11 @@
 use faer::{MatRef, RowRef};
-use num_traits::{Float, FromPrimitive, ToPrimitive};
 use rayon::prelude::*;
-use std::iter::Sum;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use thousands::Separable;
 
-use crate::utils::dist::*;
-use crate::utils::heap_structs::*;
-use crate::utils::ivf_utils::*;
+use crate::prelude::*;
+use crate::utils::k_means_utils::*;
 use crate::utils::*;
 
 /// IVF (Inverted File) index for similarity search
@@ -50,7 +47,7 @@ pub struct IvfIndex<T> {
 
 impl<T> VectorDistance<T> for IvfIndex<T>
 where
-    T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum + SimdDistance,
+    T: AnnSearchFloat,
 {
     fn vectors_flat(&self) -> &[T] {
         &self.vectors_flat
@@ -71,7 +68,7 @@ where
 
 impl<T> CentroidDistance<T> for IvfIndex<T>
 where
-    T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum + SimdDistance,
+    T: AnnSearchFloat,
 {
     fn centroids(&self) -> &[T] {
         &self.centroids
@@ -100,7 +97,7 @@ where
 
 impl<T> IvfIndex<T>
 where
-    T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum + SimdDistance,
+    T: AnnSearchFloat,
 {
     //////////////////////
     // Index generation //
@@ -147,7 +144,7 @@ where
                 .map(|i| {
                     let start = i * dim;
                     let end = start + dim;
-                    T::calculate_norm(&vectors_flat[start..end])
+                    T::calculate_l2_norm(&vectors_flat[start..end])
                 })
                 .collect()
         } else {
@@ -157,16 +154,8 @@ where
         let max_iters = max_iters.unwrap_or(30);
         let nlist = nlist.unwrap_or((n as f32).sqrt() as usize).max(1);
 
-        // 1. subsample training data
-        let (training_data, n_train) = if n > 500_000 {
-            if verbose {
-                println!("  Sampling 250k vectors for training");
-            }
-            let (data, _) = sample_vectors(&vectors_flat, dim, n, 250_000, seed);
-            (data, 250_000)
-        } else {
-            (vectors_flat.clone(), n)
-        };
+        let n_train = (256 * nlist).min(250_000).min(n).max(1);
+        let (training_data, _) = sample_vectors(&vectors_flat, dim, n, n_train, seed);
 
         if verbose {
             println!("  Generating IVF index with {} Voronoi cells.", nlist);
@@ -410,7 +399,7 @@ where
 
 impl<T> KnnValidation<T> for IvfIndex<T>
 where
-    T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum + SimdDistance,
+    T: AnnSearchFloat,
 {
     fn query_for_validation(&self, query_vec: &[T], k: usize) -> (Vec<usize>, Vec<T>) {
         self.query(query_vec, k, None)

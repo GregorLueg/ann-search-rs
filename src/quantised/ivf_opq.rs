@@ -1,17 +1,15 @@
 use faer::{MatRef, RowRef};
-use num_traits::{Float, FromPrimitive, ToPrimitive};
 use rayon::prelude::*;
+use std::collections::BinaryHeap;
 use std::ops::AddAssign;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
-use std::{collections::BinaryHeap, iter::Sum};
 use thousands::*;
 
+use crate::prelude::*;
 use crate::quantised::quantisers::*;
-use crate::utils::dist::*;
-use crate::utils::heap_structs::*;
-use crate::utils::ivf_utils::*;
+use crate::utils::k_means_utils::*;
 use crate::utils::*;
 
 ////////////////
@@ -51,7 +49,7 @@ pub struct IvfOpqIndex<T> {
 
 impl<T> CentroidDistance<T> for IvfOpqIndex<T>
 where
-    T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum + SimdDistance,
+    T: AnnSearchFloat,
 {
     fn centroids(&self) -> &[T] {
         &self.centroids
@@ -80,7 +78,7 @@ where
 
 impl<T> VectorDistanceAdc<T> for IvfOpqIndex<T>
 where
-    T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum + AddAssign + SimdDistance,
+    T: AnnSearchFloat + AddAssign,
 {
     fn codebook_m(&self) -> usize {
         self.codebook.m()
@@ -117,7 +115,7 @@ where
 
 impl<T> IvfOpqIndex<T>
 where
-    T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum + AddAssign + SimdDistance,
+    T: AnnSearchFloat + AddAssign,
 {
     /// Build an IVF index with optimised product quantisation
     ///
@@ -166,15 +164,8 @@ where
         }
 
         // 1. Subsample training data
-        let (training_data, n_train) = if n > 500_000 {
-            if verbose {
-                println!("  Sampling 250k vectors for training");
-            }
-            let (data, _) = sample_vectors(&vectors_flat, dim, n, 250_000, seed);
-            (data, 250_000)
-        } else {
-            (vectors_flat.clone(), n)
-        };
+        let n_train = (256 * nlist).min(250_000).min(n).max(1);
+        let (training_data, _) = sample_vectors(&vectors_flat, dim, n, n_train, seed);
 
         if verbose {
             println!("  Generating IVF-OPQ index with {} Voronoi cells.", nlist);
@@ -226,10 +217,8 @@ where
             let vec_start = vec_idx * dim;
             let vec = &training_data[vec_start..vec_start + dim];
             let centroid = &centroids[cluster_id * dim..(cluster_id + 1) * dim];
-
-            for d in 0..dim {
-                training_residuals.push(vec[d] - centroid[d]);
-            }
+            let residuals = T::subtract_simd(vec, centroid);
+            training_residuals.extend_from_slice(&residuals);
         }
 
         // 4. train OPQ on residuals
@@ -281,11 +270,7 @@ where
                 let vec = &vectors_flat[vec_start..vec_start + dim];
 
                 let centroid = &centroids[cluster_id * dim..(cluster_id + 1) * dim];
-                let residual: Vec<T> = vec
-                    .iter()
-                    .zip(centroid.iter())
-                    .map(|(&v, &c)| v - c)
-                    .collect();
+                let residual = T::subtract_simd(vec, centroid);
 
                 let codes = codebook.encode(&residual);
                 chunk.copy_from_slice(&codes);
@@ -324,6 +309,7 @@ where
     /// ### Returns
     ///
     /// Tuple of (indices, distances) sorted by distance
+    #[inline]
     pub fn query(&self, query_vec: &[T], k: usize, nprobe: Option<usize>) -> (Vec<usize>, Vec<T>) {
         let mut query_vec = query_vec.to_vec();
 
@@ -342,7 +328,7 @@ where
         let mut heap: BinaryHeap<(OrderedFloat<T>, usize)> = BinaryHeap::with_capacity(k + 1);
 
         for &(_, cluster_idx) in cluster_scores.iter().take(nprobe) {
-            let lookup_tables = self.build_lookup_tables(&query_vec, cluster_idx);
+            let lookup_tables = self.build_lookup_tables_residual(&query_vec, cluster_idx);
 
             let start = self.offsets[cluster_idx];
             let end = self.offsets[cluster_idx + 1];
@@ -393,6 +379,7 @@ where
     /// ### Returns
     ///
     /// Tuple of (indices, distances) sorted by distance
+    #[inline]
     pub fn query_row(
         &self,
         query_row: RowRef<T>,
@@ -455,11 +442,7 @@ where
                 let my_centroid =
                     &self.centroids[my_cluster * self.dim..(my_cluster + 1) * self.dim];
                 let residual = self.codebook.decode(codes);
-                let reconstructed: Vec<T> = my_centroid
-                    .iter()
-                    .zip(residual.iter())
-                    .map(|(&c, &r)| c + r)
-                    .collect();
+                let reconstructed: Vec<T> = T::add_simd(my_centroid, &residual);
 
                 if verbose {
                     let count = counter.fetch_add(1, Ordering::Relaxed) + 1;
@@ -767,7 +750,7 @@ mod tests {
         );
 
         let query: Vec<f32> = (0..32).map(|x| x as f32 * 0.01).collect();
-        let table = index.build_lookup_tables(&query, 0);
+        let table = index.build_lookup_tables_residual(&query, 0);
 
         assert_eq!(table.len(), 32);
     }
@@ -788,7 +771,7 @@ mod tests {
         );
 
         let query: Vec<f32> = (0..32).map(|x| x as f32 * 0.01).collect();
-        let table = index.build_lookup_tables(&query, 0);
+        let table = index.build_lookup_tables_residual(&query, 0);
 
         let dist = index.compute_distance_adc(0, &table);
 

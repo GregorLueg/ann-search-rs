@@ -1,12 +1,10 @@
 use faer::{MatRef, RowRef};
-use num_traits::{Float, FromPrimitive, ToPrimitive};
 use rand::{rngs::StdRng, Rng, SeedableRng};
 use rayon::prelude::*;
-use std::{cmp::Ordering, collections::BinaryHeap, iter::Sum};
+use std::{cmp::Ordering, collections::BinaryHeap};
 use thousands::*;
 
-use crate::utils::dist::*;
-use crate::utils::heap_structs::*;
+use crate::prelude::*;
 use crate::utils::tree_utils::*;
 use crate::utils::*;
 
@@ -96,7 +94,7 @@ pub struct AnnoyIndex<T> {
 
 impl<T> VectorDistance<T> for AnnoyIndex<T>
 where
-    T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum + SimdDistance,
+    T: AnnSearchFloat,
 {
     fn vectors_flat(&self) -> &[T] {
         &self.vectors_flat
@@ -113,7 +111,7 @@ where
 
 impl<T> AnnoyIndex<T>
 where
-    T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum + SimdDistance,
+    T: AnnSearchFloat,
 {
     //////////////////////
     // Index generation //
@@ -147,7 +145,7 @@ where
                 .map(|i| {
                     let start = i * dim;
                     let end = start + dim;
-                    T::calculate_norm(&vectors_flat[start..end])
+                    T::calculate_l2_norm(&vectors_flat[start..end])
                 })
                 .collect()
         } else {
@@ -687,7 +685,7 @@ where
 
 impl<T> KnnValidation<T> for AnnoyIndex<T>
 where
-    T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum + SimdDistance,
+    T: AnnSearchFloat,
 {
     fn query_for_validation(&self, query_vec: &[T], k: usize) -> (Vec<usize>, Vec<T>) {
         // Use the default here
@@ -767,7 +765,7 @@ mod tests {
 
     #[test]
     fn test_annoy_query_cosine() {
-        use crate::utils::dist::*;
+        use crate::prelude::*;
 
         let mat = create_simple_matrix();
         let index = AnnoyIndex::new(mat.as_ref(), 8, Dist::Cosine, 42);
@@ -782,7 +780,7 @@ mod tests {
 
     #[test]
     fn test_annoy_query_k_larger_than_dataset() {
-        use crate::utils::dist::*;
+        use crate::prelude::*;
 
         let mat = create_simple_matrix();
         let index = AnnoyIndex::new(mat.as_ref(), 4, Dist::Euclidean, 42);
@@ -797,7 +795,7 @@ mod tests {
 
     #[test]
     fn test_annoy_query_search_k() {
-        use crate::utils::dist::*;
+        use crate::prelude::*;
 
         let mat = create_simple_matrix();
         let index = AnnoyIndex::new(mat.as_ref(), 4, Dist::Euclidean, 42);
@@ -899,7 +897,7 @@ mod tests {
 
     #[test]
     fn test_annoy_orthogonal_vectors() {
-        use crate::utils::dist::*;
+        use crate::prelude::*;
         let data = [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0];
         let mat = Mat::from_fn(3, 3, |i, j| data[i * 3 + j]);
         let index = AnnoyIndex::new(mat.as_ref(), 4, Dist::Cosine, 42);

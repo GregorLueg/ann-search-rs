@@ -1,16 +1,13 @@
 use faer::{MatRef, RowRef};
 use half::*;
-use num_traits::{Float, FromPrimitive, ToPrimitive};
 use rayon::prelude::*;
-use std::iter::Sum;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use thousands::Separable;
 
+use crate::prelude::*;
 use crate::quantised::quantisers::*;
-use crate::utils::dist::*;
-use crate::utils::heap_structs::*;
-use crate::utils::ivf_utils::*;
+use crate::utils::k_means_utils::*;
 use crate::utils::*;
 
 /// IVF index with bf16 quantisation
@@ -54,7 +51,7 @@ pub struct IvfIndexBf16<T> {
 
 impl<T> VectorDistanceBf16<T> for IvfIndexBf16<T>
 where
-    T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum + SimdDistance + Bf16Compatible,
+    T: AnnSearchFloat + Bf16Compatible,
 {
     fn vectors_flat(&self) -> &[bf16] {
         &self.vectors_flat
@@ -75,7 +72,7 @@ where
 
 impl<T> CentroidDistance<T> for IvfIndexBf16<T>
 where
-    T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum + SimdDistance,
+    T: AnnSearchFloat,
 {
     fn centroids(&self) -> &[T] {
         &self.centroids
@@ -104,7 +101,7 @@ where
 
 impl<T> IvfIndexBf16<T>
 where
-    T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum + SimdDistance + Bf16Compatible,
+    T: AnnSearchFloat + Bf16Compatible,
 {
     //////////////////////
     // Index generation //
@@ -151,7 +148,7 @@ where
                 .map(|i| {
                     let start = i * dim;
                     let end = start + dim;
-                    T::calculate_norm(&vectors_flat[start..end])
+                    T::calculate_l2_norm(&vectors_flat[start..end])
                 })
                 .collect()
         } else {
@@ -162,15 +159,8 @@ where
         let nlist = nlist.unwrap_or((n as f32).sqrt() as usize).max(1);
 
         // 1. subsample training data
-        let (training_data, n_train) = if n > 500_000 {
-            if verbose {
-                println!("  Sampling 250k vectors for training");
-            }
-            let (data, _) = sample_vectors(&vectors_flat, dim, n, 250_000, seed);
-            (data, 250_000)
-        } else {
-            (vectors_flat.clone(), n)
-        };
+        let n_train = (256 * nlist).min(250_000).min(n).max(1);
+        let (training_data, _) = sample_vectors(&vectors_flat, dim, n, n_train, seed);
 
         if verbose {
             println!("  Generating IVF index with {} Voronoi cells.", nlist);
@@ -480,6 +470,7 @@ mod tests {
     use super::*;
     use faer::Mat;
     use faer_traits::ComplexField;
+    use num_traits::{Float, FromPrimitive};
 
     fn create_test_data<T: Float + FromPrimitive + ComplexField>(n: usize, dim: usize) -> Mat<T> {
         let mut data = Mat::zeros(n, dim);

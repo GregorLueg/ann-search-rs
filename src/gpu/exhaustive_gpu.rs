@@ -1,12 +1,12 @@
 use cubecl::prelude::*;
 use faer::MatRef;
-use num_traits::Float;
+use num_traits::{Float, FromPrimitive};
 use rayon::prelude::*;
 use std::iter::Sum;
 
 use crate::gpu::dist_gpu::*;
 use crate::gpu::*;
-use crate::utils::dist::*;
+use crate::prelude::*;
 use crate::utils::*;
 
 ////////////////////////
@@ -37,12 +37,7 @@ pub struct ExhaustiveIndexGpu<T: Float, R: Runtime> {
 impl<T, R> ExhaustiveIndexGpu<T, R>
 where
     R: Runtime,
-    T: Float
-        + Sum
-        + cubecl::frontend::Float
-        + cubecl::CubeElement
-        + num_traits::FromPrimitive
-        + SimdDistance,
+    T: Float + Sum + cubecl::frontend::Float + cubecl::CubeElement + FromPrimitive + SimdDistance,
 {
     /// Generate a new exhaustive index (on the GPU)
     ///
@@ -71,7 +66,7 @@ where
                 .map(|i| {
                     let start = i * dim;
                     let end = start + dim;
-                    T::calculate_norm(&vectors_flat[start..end])
+                    T::calculate_l2_norm(&vectors_flat[start..end])
                 })
                 .collect()
         } else {
@@ -125,11 +120,7 @@ where
                 .into_par_iter()
                 .map(|i| {
                     let start = i * self.dim;
-                    vectors_query[start..start + self.dim]
-                        .iter()
-                        .map(|&x| x * x)
-                        .sum::<T>()
-                        .sqrt()
+                    T::calculate_l2_norm(&vectors_query[start..start + self.dim])
                 })
                 .collect::<Vec<_>>()
         } else {

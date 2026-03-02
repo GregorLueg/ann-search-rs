@@ -11,9 +11,8 @@ use std::{
 };
 use thousands::*;
 
+use crate::prelude::*;
 use crate::quantised::quantisers::*;
-use crate::utils::dist::*;
-use crate::utils::heap_structs::*;
 use crate::utils::matrix_to_flat;
 
 /////////////////////
@@ -68,7 +67,7 @@ where
 
 impl<T> ExhaustiveSq8Index<T>
 where
-    T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum + SimdDistance,
+    T: AnnSearchFloat,
 {
     //////////////////////
     // Index generation //

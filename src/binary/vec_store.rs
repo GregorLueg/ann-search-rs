@@ -8,7 +8,7 @@ use std::iter::Sum;
 use std::marker::PhantomData;
 use std::path::Path;
 
-use crate::utils::dist::*;
+use crate::prelude::*;
 
 /// Trait for vector storage backends
 pub trait VectorStore<T>
@@ -184,7 +184,7 @@ where
 
 impl<T> VectorDistance<T> for MmapVectorStore<T>
 where
-    T: Float + Sum + SimdDistance,
+    T: AnnSearchFloat,
 {
     fn vectors_flat(&self) -> &[T] {
         unsafe {

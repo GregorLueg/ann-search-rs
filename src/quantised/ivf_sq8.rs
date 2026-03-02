@@ -11,10 +11,9 @@ use std::{
 };
 use thousands::*;
 
+use crate::prelude::*;
 use crate::quantised::quantisers::*;
-use crate::utils::dist::*;
-use crate::utils::heap_structs::*;
-use crate::utils::ivf_utils::*;
+use crate::utils::k_means_utils::*;
 use crate::utils::*;
 
 ////////////////
@@ -81,7 +80,7 @@ where
 
 impl<T> CentroidDistance<T> for IvfSq8Index<T>
 where
-    T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum + SimdDistance,
+    T: AnnSearchFloat,
 {
     fn centroids(&self) -> &[T] {
         &self.centroids
@@ -110,7 +109,7 @@ where
 
 impl<T> IvfSq8Index<T>
 where
-    T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum + SimdDistance,
+    T: AnnSearchFloat,
 {
     /// Build an IVF index with scalar 8-bit quantisation.
     ///
@@ -166,15 +165,8 @@ where
         }
 
         // 1. subsample training data
-        let (training_data, n_train) = if n > 500_000 {
-            if verbose {
-                println!("  Sampling 250k vectors for training");
-            }
-            let (data, _) = sample_vectors(&vectors_flat, dim, n, 250_000, seed);
-            (data, 250_000)
-        } else {
-            (vectors_flat.clone(), n)
-        };
+        let n_train = (256 * nlist).min(250_000).min(n).max(1);
+        let (training_data, _) = sample_vectors(&vectors_flat, dim, n, n_train, seed);
 
         if verbose {
             println!("  Generating IVF-SQ8 index with {} Voronoi cells.", nlist);

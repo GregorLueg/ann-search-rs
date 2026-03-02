@@ -18,12 +18,13 @@ run_common_patterns() {
     local run_fn=$1
     local name=$2
     shift 2
-    
+
     echo "Running ${name} benchmarks..."
     $run_fn "$@" -- --distance euclidean
     $run_fn "$@" -- --distance cosine
     $run_fn "$@" -- --distance euclidean --data correlated
     $run_fn "$@" -- --distance euclidean --data lowrank
+    $run_fn "$@" -- --distance euclidean --data lowrank --dim 128
 }
 
 run_standard() {
@@ -35,23 +36,15 @@ run_standard() {
 
 run_quantised_benchmarks() {
     echo "=== Running quantised benchmarks ==="
-    
+
     # IVF-BF16 and IVF-SQ8
     for variant in bf16 sq8; do
         run_common_patterns run_quantised "${variant}" "${variant}"
     done
 
-    # Higher dimensions for SQ8
-    for dim in 96 128; do
-        echo "Running SQ8 benchmarks (dim=${dim})..."
-        run_quantised sq8 -- --distance euclidean --dim ${dim}
-        run_quantised sq8 -- --distance euclidean --dim ${dim} --data correlated
-        run_quantised sq8 -- --distance euclidean --dim ${dim} --data lowrank
-    done
-    
     # IVF-PQ and IVF-OPQ
-    for variant in ivf_pq ivf_opq; do
-        for dim in 128 192; do
+    for variant in pq opq; do
+        for dim in 128 256; do
             echo "Running ${variant} benchmarks (dim=${dim})..."
             run_quantised ${variant} -- --distance euclidean --dim ${dim}
             run_quantised ${variant} -- --distance euclidean --dim ${dim} --data correlated
@@ -63,45 +56,36 @@ run_quantised_benchmarks() {
 run_gpu_benchmarks() {
     echo "=== Running GPU benchmarks ==="
     run_common_patterns "cargo run --example gridsearch_gpu --release --features gpu" "GPU"
-    
+
     echo "Running GPU benchmarks (larger data sets)..."
     for n_cells in 250000 500000; do
-        cargo run --example gridsearch_ivf --release --features gpu -- --distance euclidean --n-cells ${n_cells} --dim 64
-        cargo run --example gridsearch_gpu --release --features gpu -- --distance euclidean --n-cells ${n_cells} --dim 64
+        for n_dim in 64 128; do
+            cargo run --example gridsearch_ivf --release --features gpu -- --distance euclidean --n-cells ${n_cells} --dim ${n_dim}
+            cargo run --example gridsearch_gpu --release --features gpu -- --distance euclidean --n-cells ${n_cells} --dim ${n_dim}
+        done
     done
-    
-    echo "Running GPU benchmarks (more dimensions)..."
-    cargo run --example gridsearch_gpu --release --features gpu -- --distance euclidean --dim 128 --data correlated
 }
 
 run_binary_benchmarks() {
-    echo "=== Running binary benchmarks ===" 
-    
-    # for variant in binary rabitq; do
+    echo "=== Running binary benchmarks ==="
+
     for variant in binary rabitq; do
         run_common_patterns "cargo run --example gridsearch_${variant} --release --features binary" "$(echo ${variant} | tr '[:lower:]' '[:upper:]')"
     done
 
-    echo "Running binary benchmarks (more dimensions)..."
-    for dim in 128; do
-        cargo run --example gridsearch_binary --release --features binary -- --distance euclidean --dim ${dim}
-        cargo run --example gridsearch_binary --release --features binary -- --distance euclidean --dim ${dim} --data correlated
-        cargo run --example gridsearch_binary --release --features binary -- --distance euclidean --dim ${dim} --data lowrank
-    done
-
-    echo "Running RaBitQ benchmarks (more dimensions)..."
-    for dim in 128; do
-        cargo run --example gridsearch_rabitq --release --features binary -- --distance euclidean --dim ${dim}
-        cargo run --example gridsearch_rabitq --release --features binary -- --distance euclidean --dim ${dim} --data correlated
-        cargo run --example gridsearch_rabitq --release --features binary -- --distance euclidean --dim ${dim} --data lowrank
+    echo "Running binary benchmarks higher dimensionality"
+    for variant in binary rabitq; do
+        for n_dim in 256 512; do
+            cargo run --example gridsearch_${variant} --release --features binary -- --dim ${n_dim} --data lowrank
+        done
     done
 }
 
 [ $# -eq 0 ] && { echo "Usage: $0 [--standard] [--quantised] [--gpu] [--binary] [--all]"; exit 1; }
 
-RUN_STANDARD=false 
-RUN_QUANTISED=false 
-RUN_GPU=false 
+RUN_STANDARD=false
+RUN_QUANTISED=false
+RUN_GPU=false
 RUN_BINARY=false
 
 for arg in "$@"; do

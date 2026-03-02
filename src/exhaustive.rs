@@ -1,11 +1,10 @@
 use faer::{MatRef, RowRef};
-use num_traits::{Float, FromPrimitive, ToPrimitive};
+
 use rayon::prelude::*;
-use std::{collections::BinaryHeap, iter::Sum};
+use std::collections::BinaryHeap;
 use thousands::*;
 
-use crate::utils::dist::*;
-use crate::utils::heap_structs::*;
+use crate::prelude::*;
 use crate::utils::matrix_to_flat;
 
 /////////////////////
@@ -38,7 +37,7 @@ pub struct ExhaustiveIndex<T> {
 
 impl<T> VectorDistance<T> for ExhaustiveIndex<T>
 where
-    T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum + SimdDistance,
+    T: AnnSearchFloat,
 {
     fn vectors_flat(&self) -> &[T] {
         &self.vectors_flat
@@ -59,7 +58,7 @@ where
 
 impl<T> ExhaustiveIndex<T>
 where
-    T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum + SimdDistance,
+    T: AnnSearchFloat,
 {
     //////////////////////
     // Index generation //
@@ -83,7 +82,7 @@ where
                 .map(|i| {
                     let start = i * dim;
                     let end = start + dim;
-                    T::calculate_norm(&vectors_flat[start..end])
+                    T::calculate_l2_norm(&vectors_flat[start..end])
                 })
                 .collect()
         } else {
