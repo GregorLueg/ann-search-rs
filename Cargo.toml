@@ -5,7 +5,7 @@ edition = "2021"
 authors = ["Gregor Lueg <gregorlueg@me.com>"]
 license = "MIT"
 repository = "https://github.com/GregorLueg/ann-search-rs"
-description = "Various vector search algorithms in Rust."
+description = "Various vector search algorithms in Rust. Designed specifically for single cell & computational biology applications."
 
 [lib]
 name = "ann_search_rs"
@@ -24,14 +24,13 @@ quantised = ["half"]
 approx = "0.5.1"
 bytemuck = { version = "1.24.0", features = ["derive"], optional = true }
 clap = { version = "4.5.53", features = ["derive"] }
-cubecl = { version = "0.8.1", features = ["wgpu", "cpu"], optional = true }
+cubecl = { version = "0.9.0", features = ["wgpu", "cpu"], optional = true }
 faer = "0.23.2"
 faer-traits = "0.23.2"
 fixedbitset = "0.5.7"
 half = { version = "2.7.1", optional = true }
 memmap2 = { version = "0.9.9", optional = true }
 num-traits = "0.2.19"
-parking_lot = "0.12.5"
 rand = "0.9.2"
 rand_distr = "0.5.1"
 rayon = "1.11.0"

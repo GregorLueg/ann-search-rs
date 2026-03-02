@@ -24,7 +24,7 @@ run_common_patterns() {
     $run_fn "$@" -- --distance cosine
     $run_fn "$@" -- --distance euclidean --data correlated
     $run_fn "$@" -- --distance euclidean --data lowrank
-    $run_fn "$@" -- --distance euclidean --data lowrank --n-dim 128
+    $run_fn "$@" -- --distance euclidean --data lowrank --dim 128
 }
 
 run_standard() {
@@ -44,7 +44,7 @@ run_quantised_benchmarks() {
 
     # IVF-PQ and IVF-OPQ
     for variant in pq opq; do
-        for dim in 128 192; do
+        for dim in 128 256; do
             echo "Running ${variant} benchmarks (dim=${dim})..."
             run_quantised ${variant} -- --distance euclidean --dim ${dim}
             run_quantised ${variant} -- --distance euclidean --dim ${dim} --data correlated
@@ -69,9 +69,15 @@ run_gpu_benchmarks() {
 run_binary_benchmarks() {
     echo "=== Running binary benchmarks ==="
 
-    # for variant in binary rabitq; do
     for variant in binary rabitq; do
         run_common_patterns "cargo run --example gridsearch_${variant} --release --features binary" "$(echo ${variant} | tr '[:lower:]' '[:upper:]')"
+    done
+
+    echo "Running binary benchmarks higher dimensionality"
+    for variant in binary rabitq; do
+        for n_dim in 256 512; do
+            cargo run --example gridsearch_${variant} --release --features binary -- --dim ${n_dim} --data lowrank
+        done
     done
 }
 

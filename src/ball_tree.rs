@@ -1,13 +1,13 @@
 use faer::{MatRef, RowRef};
-use num_traits::{Float, FromPrimitive, ToPrimitive};
+use num_traits::Float;
 use rand::{rngs::StdRng, Rng, SeedableRng};
 use rayon::prelude::*;
 use std::collections::BinaryHeap;
-use std::iter::Sum;
+
 use thousands::*;
 
 use crate::prelude::*;
-use crate::utils::ivf_utils::*;
+use crate::utils::k_means_utils::*;
 use crate::utils::tree_utils::*;
 use crate::utils::*;
 
@@ -257,6 +257,7 @@ pub struct BallTreeIndex<T> {
 // VectorDistance //
 ////////////////////
 
+/// VectorDistance implementation
 impl<T> VectorDistance<T> for BallTreeIndex<T>
 where
     T: AnnSearchFloat,
@@ -1009,7 +1010,7 @@ where
 /// KnnValidation trait implementation for the BallTreeIndex
 impl<T> KnnValidation<T> for BallTreeIndex<T>
 where
-    T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum + SimdDistance,
+    T: AnnSearchFloat,
 {
     fn query_for_validation(&self, query_vec: &[T], k: usize) -> (Vec<usize>, Vec<T>) {
         self.query(query_vec, k, None)

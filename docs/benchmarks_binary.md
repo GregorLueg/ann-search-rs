@@ -1,18 +1,15 @@
 ## Binarised indices benchmarks and parameter
 
 Binarised indices compress the data stored in the index structure itself via
-very aggressive quantisation to basically only bits. This has two impacts:
+very aggressive quantisation to (basically) only bits. This has two impacts:
 
-1. Drastic reduction in memory usage.
+1. Drastic reduction in memory fingerprint of the index itself.
 2. Increased query speed in most cases as the bit-wise operations are very
-fast.
+fast on modern CPUs.
 3. However, when not using any re-ranking of the top candidates, dramatically
-lower recall (less so for RaBitQ).
+lower recall (less so for RaBitQ, an excellent way of compressing vectors).
 
-These indices can be nonetheless quite useful in memory-constrained scenarios.
-In both cases, there is an option to do re-ranking against the original vectors.
-However, these are stored on disk and accessed via rapid access. The benchmarks
-below show scenarios with and without re-ranking.
+The benchmarks below show scenarios with and without re-ranking.
 
 ```bash
 cargo run --example gridsearch_binary --release --features binary
@@ -35,11 +32,25 @@ benchmarked. Index size in memory is also provided.
 
 ### <u>Binary (IVF and exhaustive)</u>
 
-These indices uses binarisation via either SimHash or iterative quantisation
-via PCA rotations. They both have the option to use a VecStore that saves the
-original data on disk for fast retrieval and re-ranking. This is recommended if
-you wish to maintain some Recall. Generally speaking, these indices shine in
-very high-dimensional data where memory requirements becomes very constraining.
+Three binarisations are offered in this crate:
+
+- **SimHash**: Projects vectors onto random hyperplanes and encodes the sign of
+  each projection as a bit. The random planes are orthogonalised to improve
+  coverage of the vector space.
+- **ITQ (Iterative Quantisation)**: Uses PCA to find the axes of maximum
+  variance in the data, then iteratively rotates the data to minimise
+  quantisation error before binarising. This is more expensive to build but
+  tends to yield better recall than random projections pending the data
+  structure (it's not a must!).
+- **Signed**: Simply encodes the sign of each embedding dimension directly as
+  a bit, meaning n_bits is fixed to the number of dimensions. Straightforward
+  but only sensible for high-dimensional data; at low dimensionality the recall
+  degrades quickly.
+
+These indices have the option to use a VecStore that saves the original data on
+disk for fast retrieval and re-ranking. This is recommended if you wish to
+maintain reasonable recall. Generally speaking, these indices shine in very
+high-dimensional data where memory requirements become constraining.
 
 **Key parameters *(general)*:**
 
@@ -78,178 +89,235 @@ and worse.
 
 <details>
 <summary><b>Binary - Euclidean (Gaussian)</b>:</summary>
+</br>
 <pre><code>
 ================================================================================================================================
 Benchmark: 150k cells, 32D - Binary Quantisation
 ================================================================================================================================
 Method                                               Build (ms)   Query (ms)   Total (ms)     Recall@k   Dist Error    Size (MB)
 --------------------------------------------------------------------------------------------------------------------------------
-Exhaustive (query)                                         3.04     1_518.37     1_521.40       1.0000     0.000000        18.31
-Exhaustive (self)                                          3.04    15_268.94    15_271.98       1.0000     0.000000        18.31
+Exhaustive (query)                                         3.16     1_526.64     1_529.79       1.0000     0.000000        18.31
+Exhaustive (self)                                          3.16    16_212.62    16_215.78       1.0000     0.000000        18.31
 --------------------------------------------------------------------------------------------------------------------------------
-ExhaustiveBinary-256-random_no_rr (query)              1_244.97       489.63     1_734.59       0.2031          NaN         4.61
-ExhaustiveBinary-256-random-rf5 (query)                1_244.97       534.99     1_779.96       0.4176     3.722044         4.61
-ExhaustiveBinary-256-random-rf10 (query)               1_244.97       594.70     1_839.67       0.5464     2.069161         4.61
-ExhaustiveBinary-256-random-rf20 (query)               1_244.97       715.16     1_960.13       0.6860     1.049073         4.61
-ExhaustiveBinary-256-random (self)                     1_244.97     5_837.77     7_082.74       0.5461     2.056589         4.61
-ExhaustiveBinary-256-itq_no_rr (query)                13_446.11       489.78    13_935.89       0.1962          NaN         4.61
-ExhaustiveBinary-256-itq-rf5 (query)                  13_446.11       532.96    13_979.07       0.4008     3.839819         4.61
-ExhaustiveBinary-256-itq-rf10 (query)                 13_446.11       582.84    14_028.95       0.5266     2.152408         4.61
-ExhaustiveBinary-256-itq-rf20 (query)                 13_446.11       682.84    14_128.95       0.6623     1.116198         4.61
-ExhaustiveBinary-256-itq (self)                       13_446.11     5_818.02    19_264.13       0.5242     2.138272         4.61
+ExhaustiveBinary-256-random_no_rr (query)              1_160.46       490.93     1_651.39       0.2031          NaN         4.61
+ExhaustiveBinary-256-random-rf5 (query)                1_160.46       552.51     1_712.97       0.4176     3.722044         4.61
+ExhaustiveBinary-256-random-rf10 (query)               1_160.46       589.50     1_749.96       0.5464     2.069161         4.61
+ExhaustiveBinary-256-random-rf20 (query)               1_160.46       695.81     1_856.27       0.6860     1.049073         4.61
+ExhaustiveBinary-256-random (self)                     1_160.46     5_996.37     7_156.83       0.5461     2.056589         4.61
 --------------------------------------------------------------------------------------------------------------------------------
-ExhaustiveBinary-512-random_no_rr (query)              2_458.00       841.15     3_299.16       0.2906          NaN         9.22
-ExhaustiveBinary-512-random-rf5 (query)                2_458.00       892.40     3_350.40       0.5836     1.792334         9.22
-ExhaustiveBinary-512-random-rf10 (query)               2_458.00       939.93     3_397.93       0.7240     0.832332         9.22
-ExhaustiveBinary-512-random-rf20 (query)               2_458.00     1_043.17     3_501.17       0.8440     0.344416         9.22
-ExhaustiveBinary-512-random (self)                     2_458.00     9_382.58    11_840.59       0.7223     0.828915         9.22
-ExhaustiveBinary-512-itq_no_rr (query)                10_418.05       838.71    11_256.76       0.2923          NaN         9.22
-ExhaustiveBinary-512-itq-rf5 (query)                  10_418.05       876.79    11_294.84       0.5833     1.686259         9.22
-ExhaustiveBinary-512-itq-rf10 (query)                 10_418.05       929.07    11_347.12       0.7204     0.786147         9.22
-ExhaustiveBinary-512-itq-rf20 (query)                 10_418.05     1_047.21    11_465.26       0.8387     0.321334         9.22
-ExhaustiveBinary-512-itq (self)                       10_418.05     9_336.06    19_754.11       0.7197     0.773467         9.22
+ExhaustiveBinary-256-itq_no_rr (query)                 1_362.43       488.94     1_851.36       0.1873          NaN         4.61
+ExhaustiveBinary-256-itq-rf5 (query)                   1_362.43       542.32     1_904.75       0.3844     4.171681         4.61
+ExhaustiveBinary-256-itq-rf10 (query)                  1_362.43       585.91     1_948.34       0.5073     2.366457         4.61
+ExhaustiveBinary-256-itq-rf20 (query)                  1_362.43       681.03     2_043.45       0.6439     1.245957         4.61
+ExhaustiveBinary-256-itq (self)                        1_362.43     5_872.02     7_234.45       0.5079     2.339769         4.61
 --------------------------------------------------------------------------------------------------------------------------------
-IVF-Binary-256-nl273-np13-rf0-random (query)           2_137.53        52.76     2_190.29       0.2064          NaN         5.79
-IVF-Binary-256-nl273-np16-rf0-random (query)           2_137.53        60.60     2_198.14       0.2053          NaN         5.79
-IVF-Binary-256-nl273-np23-rf0-random (query)           2_137.53        75.21     2_212.74       0.2044          NaN         5.79
-IVF-Binary-256-nl273-np13-rf5-random (query)           2_137.53        87.80     2_225.33       0.4239     3.637415         5.79
-IVF-Binary-256-nl273-np13-rf10-random (query)          2_137.53       110.30     2_247.83       0.5531     2.021145         5.79
-IVF-Binary-256-nl273-np13-rf20-random (query)          2_137.53       157.15     2_294.68       0.6927     1.020296         5.79
-IVF-Binary-256-nl273-np16-rf5-random (query)           2_137.53        91.79     2_229.32       0.4223     3.662012         5.79
-IVF-Binary-256-nl273-np16-rf10-random (query)          2_137.53       120.35     2_257.88       0.5515     2.033363         5.79
-IVF-Binary-256-nl273-np16-rf20-random (query)          2_137.53       169.78     2_307.31       0.6913     1.025118         5.79
-IVF-Binary-256-nl273-np23-rf5-random (query)           2_137.53       106.62     2_244.16       0.4198     3.692295         5.79
-IVF-Binary-256-nl273-np23-rf10-random (query)          2_137.53       138.39     2_275.92       0.5484     2.057241         5.79
-IVF-Binary-256-nl273-np23-rf20-random (query)          2_137.53       192.17     2_329.70       0.6879     1.040613         5.79
-IVF-Binary-256-nl273-random (self)                     2_137.53     1_189.42     3_326.95       0.5511     2.018819         5.79
-IVF-Binary-256-nl387-np19-rf0-random (query)           2_419.95        55.76     2_475.71       0.2060          NaN         5.80
-IVF-Binary-256-nl387-np27-rf0-random (query)           2_419.95        67.12     2_487.07       0.2047          NaN         5.80
-IVF-Binary-256-nl387-np19-rf5-random (query)           2_419.95        83.47     2_503.43       0.4238     3.633534         5.80
-IVF-Binary-256-nl387-np19-rf10-random (query)          2_419.95       111.67     2_531.62       0.5533     2.013383         5.80
-IVF-Binary-256-nl387-np19-rf20-random (query)          2_419.95       158.02     2_577.97       0.6934     1.014371         5.80
-IVF-Binary-256-nl387-np27-rf5-random (query)           2_419.95        96.88     2_516.84       0.4202     3.684350         5.80
-IVF-Binary-256-nl387-np27-rf10-random (query)          2_419.95       143.22     2_563.18       0.5496     2.044808         5.80
-IVF-Binary-256-nl387-np27-rf20-random (query)          2_419.95       204.81     2_624.76       0.6888     1.035978         5.80
-IVF-Binary-256-nl387-random (self)                     2_419.95     1_156.47     3_576.43       0.5532     1.998682         5.80
-IVF-Binary-256-nl547-np23-rf0-random (query)           2_922.20        52.99     2_975.19       0.2076          NaN         5.82
-IVF-Binary-256-nl547-np27-rf0-random (query)           2_922.20        56.99     2_979.19       0.2063          NaN         5.82
-IVF-Binary-256-nl547-np33-rf0-random (query)           2_922.20        63.29     2_985.48       0.2050          NaN         5.82
-IVF-Binary-256-nl547-np23-rf5-random (query)           2_922.20        80.00     3_002.20       0.4265     3.596401         5.82
-IVF-Binary-256-nl547-np23-rf10-random (query)          2_922.20       106.37     3_028.57       0.5576     1.983148         5.82
-IVF-Binary-256-nl547-np23-rf20-random (query)          2_922.20       153.67     3_075.86       0.6977     0.994532         5.82
-IVF-Binary-256-nl547-np27-rf5-random (query)           2_922.20        85.10     3_007.30       0.4238     3.631225         5.82
-IVF-Binary-256-nl547-np27-rf10-random (query)          2_922.20       113.28     3_035.48       0.5539     2.008651         5.82
-IVF-Binary-256-nl547-np27-rf20-random (query)          2_922.20       158.38     3_080.57       0.6941     1.007218         5.82
-IVF-Binary-256-nl547-np33-rf5-random (query)           2_922.20        92.04     3_014.24       0.4211     3.673312         5.82
-IVF-Binary-256-nl547-np33-rf10-random (query)          2_922.20       120.13     3_042.33       0.5506     2.035196         5.82
-IVF-Binary-256-nl547-np33-rf20-random (query)          2_922.20       169.61     3_091.81       0.6900     1.029156         5.82
-IVF-Binary-256-nl547-random (self)                     2_922.20     1_053.49     3_975.69       0.5570     1.967407         5.82
-IVF-Binary-256-nl273-np13-rf0-itq (query)              9_980.18        53.53    10_033.70       0.1999          NaN         5.79
-IVF-Binary-256-nl273-np16-rf0-itq (query)              9_980.18        59.16    10_039.34       0.1986          NaN         5.79
-IVF-Binary-256-nl273-np23-rf0-itq (query)              9_980.18        73.90    10_054.08       0.1973          NaN         5.79
-IVF-Binary-256-nl273-np13-rf5-itq (query)              9_980.18        81.86    10_062.04       0.4075     3.755238         5.79
-IVF-Binary-256-nl273-np13-rf10-itq (query)             9_980.18       108.50    10_088.68       0.5343     2.102086         5.79
-IVF-Binary-256-nl273-np13-rf20-itq (query)             9_980.18       163.93    10_144.11       0.6698     1.087633         5.79
-IVF-Binary-256-nl273-np16-rf5-itq (query)              9_980.18        90.05    10_070.23       0.4055     3.776912         5.79
-IVF-Binary-256-nl273-np16-rf10-itq (query)             9_980.18       118.48    10_098.65       0.5322     2.113827         5.79
-IVF-Binary-256-nl273-np16-rf20-itq (query)             9_980.18       167.67    10_147.84       0.6683     1.087712         5.79
-IVF-Binary-256-nl273-np23-rf5-itq (query)              9_980.18       106.81    10_086.98       0.4027     3.813394         5.79
-IVF-Binary-256-nl273-np23-rf10-itq (query)             9_980.18       138.83    10_119.00       0.5288     2.137900         5.79
-IVF-Binary-256-nl273-np23-rf20-itq (query)             9_980.18       190.00    10_170.18       0.6646     1.105484         5.79
-IVF-Binary-256-nl273-itq (self)                        9_980.18     1_183.95    11_164.12       0.5300     2.096063         5.79
-IVF-Binary-256-nl387-np19-rf0-itq (query)             10_483.29        55.11    10_538.40       0.1994          NaN         5.80
-IVF-Binary-256-nl387-np27-rf0-itq (query)             10_483.29        66.28    10_549.57       0.1977          NaN         5.80
-IVF-Binary-256-nl387-np19-rf5-itq (query)             10_483.29        84.80    10_568.09       0.4075     3.750131         5.80
-IVF-Binary-256-nl387-np19-rf10-itq (query)            10_483.29       109.47    10_592.76       0.5346     2.090951         5.80
-IVF-Binary-256-nl387-np19-rf20-itq (query)            10_483.29       156.60    10_639.89       0.6704     1.081536         5.80
-IVF-Binary-256-nl387-np27-rf5-itq (query)             10_483.29        97.02    10_580.31       0.4037     3.798110         5.80
-IVF-Binary-256-nl387-np27-rf10-itq (query)            10_483.29       128.05    10_611.34       0.5298     2.127606         5.80
-IVF-Binary-256-nl387-np27-rf20-itq (query)            10_483.29       173.66    10_656.95       0.6656     1.098403         5.80
-IVF-Binary-256-nl387-itq (self)                       10_483.29     1_098.98    11_582.28       0.5320     2.081287         5.80
-IVF-Binary-256-nl547-np23-rf0-itq (query)             10_647.50        52.85    10_700.35       0.2007          NaN         5.82
-IVF-Binary-256-nl547-np27-rf0-itq (query)             10_647.50        56.99    10_704.49       0.1994          NaN         5.82
-IVF-Binary-256-nl547-np33-rf0-itq (query)             10_647.50        63.20    10_710.70       0.1982          NaN         5.82
-IVF-Binary-256-nl547-np23-rf5-itq (query)             10_647.50        80.66    10_728.16       0.4103     3.710174         5.82
-IVF-Binary-256-nl547-np23-rf10-itq (query)            10_647.50       105.70    10_753.20       0.5382     2.062483         5.82
-IVF-Binary-256-nl547-np23-rf20-itq (query)            10_647.50       150.46    10_797.96       0.6755     1.058102         5.82
-IVF-Binary-256-nl547-np27-rf5-itq (query)             10_647.50        84.67    10_732.17       0.4076     3.744299         5.82
-IVF-Binary-256-nl547-np27-rf10-itq (query)            10_647.50       111.52    10_759.02       0.5348     2.086236         5.82
-IVF-Binary-256-nl547-np27-rf20-itq (query)            10_647.50       157.56    10_805.06       0.6714     1.072275         5.82
-IVF-Binary-256-nl547-np33-rf5-itq (query)             10_647.50        91.47    10_738.97       0.4048     3.783199         5.82
-IVF-Binary-256-nl547-np33-rf10-itq (query)            10_647.50       122.40    10_769.90       0.5312     2.116777         5.82
-IVF-Binary-256-nl547-np33-rf20-itq (query)            10_647.50       168.90    10_816.40       0.6674     1.090905         5.82
-IVF-Binary-256-nl547-itq (self)                       10_647.50     1_088.48    11_735.98       0.5363     2.045271         5.82
+ExhaustiveBinary-512-random_no_rr (query)              2_306.26       830.51     3_136.76       0.2906          NaN         9.22
+ExhaustiveBinary-512-random-rf5 (query)                2_306.26       864.77     3_171.02       0.5836     1.792334         9.22
+ExhaustiveBinary-512-random-rf10 (query)               2_306.26       936.20     3_242.46       0.7240     0.832332         9.22
+ExhaustiveBinary-512-random-rf20 (query)               2_306.26     1_017.12     3_323.37       0.8440     0.344416         9.22
+ExhaustiveBinary-512-random (self)                     2_306.26     9_207.21    11_513.47       0.7223     0.828915         9.22
 --------------------------------------------------------------------------------------------------------------------------------
-IVF-Binary-512-nl273-np13-rf0-random (query)           3_289.69       106.28     3_395.97       0.2929          NaN        10.40
-IVF-Binary-512-nl273-np16-rf0-random (query)           3_289.69       121.15     3_410.85       0.2924          NaN        10.40
-IVF-Binary-512-nl273-np23-rf0-random (query)           3_289.69       152.65     3_442.34       0.2915          NaN        10.40
-IVF-Binary-512-nl273-np13-rf5-random (query)           3_289.69       139.13     3_428.82       0.5866     1.777778        10.40
-IVF-Binary-512-nl273-np13-rf10-random (query)          3_289.69       172.95     3_462.64       0.7255     0.834322        10.40
-IVF-Binary-512-nl273-np13-rf20-random (query)          3_289.69       223.71     3_513.41       0.8433     0.358432        10.40
-IVF-Binary-512-nl273-np16-rf5-random (query)           3_289.69       156.99     3_446.68       0.5864     1.774118        10.40
-IVF-Binary-512-nl273-np16-rf10-random (query)          3_289.69       192.89     3_482.58       0.7262     0.823307        10.40
-IVF-Binary-512-nl273-np16-rf20-random (query)          3_289.69       245.27     3_534.97       0.8455     0.341275        10.40
-IVF-Binary-512-nl273-np23-rf5-random (query)           3_289.69       193.86     3_483.55       0.5849     1.784087        10.40
-IVF-Binary-512-nl273-np23-rf10-random (query)          3_289.69       228.25     3_517.95       0.7249     0.828403        10.40
-IVF-Binary-512-nl273-np23-rf20-random (query)          3_289.69       287.48     3_577.17       0.8447     0.342656        10.40
-IVF-Binary-512-nl273-random (self)                     3_289.69     1_880.86     5_170.55       0.7247     0.820090        10.40
-IVF-Binary-512-nl387-np19-rf0-random (query)           3_653.13       113.39     3_766.52       0.2924          NaN        10.41
-IVF-Binary-512-nl387-np27-rf0-random (query)           3_653.13       138.97     3_792.10       0.2915          NaN        10.41
-IVF-Binary-512-nl387-np19-rf5-random (query)           3_653.13       144.02     3_797.15       0.5871     1.768998        10.41
-IVF-Binary-512-nl387-np19-rf10-random (query)          3_653.13       176.92     3_830.05       0.7264     0.828266        10.41
-IVF-Binary-512-nl387-np19-rf20-random (query)          3_653.13       227.63     3_880.76       0.8449     0.354107        10.41
-IVF-Binary-512-nl387-np27-rf5-random (query)           3_653.13       185.60     3_838.73       0.5850     1.780764        10.41
-IVF-Binary-512-nl387-np27-rf10-random (query)          3_653.13       210.30     3_863.43       0.7251     0.826669        10.41
-IVF-Binary-512-nl387-np27-rf20-random (query)          3_653.13       264.38     3_917.52       0.8452     0.340960        10.41
-IVF-Binary-512-nl387-random (self)                     3_653.13     1_741.20     5_394.34       0.7248     0.827156        10.41
-IVF-Binary-512-nl547-np23-rf0-random (query)           4_115.84       104.83     4_220.68       0.2936          NaN        10.43
-IVF-Binary-512-nl547-np27-rf0-random (query)           4_115.84       114.11     4_229.95       0.2929          NaN        10.43
-IVF-Binary-512-nl547-np33-rf0-random (query)           4_115.84       130.36     4_246.20       0.2921          NaN        10.43
-IVF-Binary-512-nl547-np23-rf5-random (query)           4_115.84       135.43     4_251.27       0.5886     1.763517        10.43
-IVF-Binary-512-nl547-np23-rf10-random (query)          4_115.84       165.94     4_281.78       0.7281     0.824131        10.43
-IVF-Binary-512-nl547-np23-rf20-random (query)          4_115.84       214.59     4_330.44       0.8461     0.353593        10.43
-IVF-Binary-512-nl547-np27-rf5-random (query)           4_115.84       148.21     4_264.05       0.5871     1.766939        10.43
-IVF-Binary-512-nl547-np27-rf10-random (query)          4_115.84       182.14     4_297.98       0.7271     0.820926        10.43
-IVF-Binary-512-nl547-np27-rf20-random (query)          4_115.84       231.56     4_347.40       0.8464     0.341065        10.43
-IVF-Binary-512-nl547-np33-rf5-random (query)           4_115.84       162.77     4_278.61       0.5855     1.778571        10.43
-IVF-Binary-512-nl547-np33-rf10-random (query)          4_115.84       196.86     4_312.71       0.7259     0.824482        10.43
-IVF-Binary-512-nl547-np33-rf20-random (query)          4_115.84       249.50     4_365.34       0.8456     0.338961        10.43
-IVF-Binary-512-nl547-random (self)                     4_115.84     1_635.77     5_751.61       0.7268     0.818374        10.43
-IVF-Binary-512-nl273-np13-rf0-itq (query)             11_108.57       110.22    11_218.79       0.2946          NaN        10.40
-IVF-Binary-512-nl273-np16-rf0-itq (query)             11_108.57       123.00    11_231.58       0.2938          NaN        10.40
-IVF-Binary-512-nl273-np23-rf0-itq (query)             11_108.57       165.15    11_273.73       0.2928          NaN        10.40
-IVF-Binary-512-nl273-np13-rf5-itq (query)             11_108.57       143.66    11_252.24       0.5861     1.674212        10.40
-IVF-Binary-512-nl273-np13-rf10-itq (query)            11_108.57       171.73    11_280.31       0.7222     0.788901        10.40
-IVF-Binary-512-nl273-np13-rf20-itq (query)            11_108.57       224.73    11_333.31       0.8380     0.337141        10.40
-IVF-Binary-512-nl273-np16-rf5-itq (query)             11_108.57       158.88    11_267.46       0.5858     1.669777        10.40
-IVF-Binary-512-nl273-np16-rf10-itq (query)            11_108.57       193.31    11_301.89       0.7231     0.777003        10.40
-IVF-Binary-512-nl273-np16-rf20-itq (query)            11_108.57       246.19    11_354.77       0.8404     0.318308        10.40
-IVF-Binary-512-nl273-np23-rf5-itq (query)             11_108.57       193.98    11_302.55       0.5845     1.678209        10.40
-IVF-Binary-512-nl273-np23-rf10-itq (query)            11_108.57       234.99    11_343.57       0.7216     0.781877        10.40
-IVF-Binary-512-nl273-np23-rf20-itq (query)            11_108.57       289.90    11_398.48       0.8395     0.319796        10.40
-IVF-Binary-512-nl273-itq (self)                       11_108.57     1_899.48    13_008.06       0.7222     0.764851        10.40
-IVF-Binary-512-nl387-np19-rf0-itq (query)             11_509.08       113.11    11_622.19       0.2945          NaN        10.41
-IVF-Binary-512-nl387-np27-rf0-itq (query)             11_509.08       142.07    11_651.15       0.2931          NaN        10.41
-IVF-Binary-512-nl387-np19-rf5-itq (query)             11_509.08       152.12    11_661.20       0.5865     1.671161        10.41
-IVF-Binary-512-nl387-np19-rf10-itq (query)            11_509.08       175.05    11_684.13       0.7230     0.784775        10.41
-IVF-Binary-512-nl387-np19-rf20-itq (query)            11_509.08       237.57    11_746.65       0.8395     0.333336        10.41
-IVF-Binary-512-nl387-np27-rf5-itq (query)             11_509.08       185.68    11_694.76       0.5851     1.673364        10.41
-IVF-Binary-512-nl387-np27-rf10-itq (query)            11_509.08       209.47    11_718.55       0.7223     0.779235        10.41
-IVF-Binary-512-nl387-np27-rf20-itq (query)            11_509.08       265.96    11_775.04       0.8401     0.317695        10.41
-IVF-Binary-512-nl387-itq (self)                       11_509.08     1_744.55    13_253.63       0.7220     0.775487        10.41
-IVF-Binary-512-nl547-np23-rf0-itq (query)             11_986.12       104.75    12_090.86       0.2950          NaN        10.43
-IVF-Binary-512-nl547-np27-rf0-itq (query)             11_986.12       113.98    12_100.09       0.2942          NaN        10.43
-IVF-Binary-512-nl547-np33-rf0-itq (query)             11_986.12       128.30    12_114.41       0.2936          NaN        10.43
-IVF-Binary-512-nl547-np23-rf5-itq (query)             11_986.12       136.93    12_123.05       0.5882     1.660796        10.43
-IVF-Binary-512-nl547-np23-rf10-itq (query)            11_986.12       164.56    12_150.67       0.7249     0.779454        10.43
-IVF-Binary-512-nl547-np23-rf20-itq (query)            11_986.12       213.46    12_199.58       0.8409     0.333185        10.43
-IVF-Binary-512-nl547-np27-rf5-itq (query)             11_986.12       145.74    12_131.85       0.5872     1.660440        10.43
-IVF-Binary-512-nl547-np27-rf10-itq (query)            11_986.12       175.68    12_161.79       0.7242     0.773961        10.43
-IVF-Binary-512-nl547-np27-rf20-itq (query)            11_986.12       227.30    12_213.42       0.8415     0.319869        10.43
-IVF-Binary-512-nl547-np33-rf5-itq (query)             11_986.12       162.01    12_148.13       0.5857     1.670277        10.43
-IVF-Binary-512-nl547-np33-rf10-itq (query)            11_986.12       194.59    12_180.71       0.7229     0.777236        10.43
-IVF-Binary-512-nl547-np33-rf20-itq (query)            11_986.12       248.02    12_234.13       0.8406     0.316972        10.43
-IVF-Binary-512-nl547-itq (self)                       11_986.12     1_643.18    13_629.30       0.7241     0.767452        10.43
+ExhaustiveBinary-512-itq_no_rr (query)                 2_591.30       818.70     3_410.00       0.2823          NaN         9.22
+ExhaustiveBinary-512-itq-rf5 (query)                   2_591.30       863.38     3_454.68       0.5675     1.840282         9.22
+ExhaustiveBinary-512-itq-rf10 (query)                  2_591.30       915.13     3_506.43       0.7062     0.870974         9.22
+ExhaustiveBinary-512-itq-rf20 (query)                  2_591.30     1_036.09     3_627.39       0.8300     0.361878         9.22
+ExhaustiveBinary-512-itq (self)                        2_591.30     9_188.83    11_780.13       0.7065     0.858252         9.22
+--------------------------------------------------------------------------------------------------------------------------------
+ExhaustiveBinary-32-signed_no_rr (query)                 158.95       613.55       772.50       0.0578          NaN         0.58
+ExhaustiveBinary-32-signed-rf5 (query)                   158.95       640.66       799.61       0.1270    15.329844         0.58
+ExhaustiveBinary-32-signed-rf10 (query)                  158.95       681.63       840.58       0.1824    10.683378         0.58
+ExhaustiveBinary-32-signed-rf20 (query)                  158.95       756.74       915.69       0.2652     7.182754         0.58
+ExhaustiveBinary-32-signed (self)                        158.95     6_877.04     7_035.99       0.1841    10.412094         0.58
+--------------------------------------------------------------------------------------------------------------------------------
+IVF-Binary-256-nl273-np13-rf0-random (query)           1_941.44        53.47     1_994.91       0.2064          NaN         5.79
+IVF-Binary-256-nl273-np16-rf0-random (query)           1_941.44        61.02     2_002.46       0.2053          NaN         5.79
+IVF-Binary-256-nl273-np23-rf0-random (query)           1_941.44        75.36     2_016.80       0.2044          NaN         5.79
+IVF-Binary-256-nl273-np13-rf5-random (query)           1_941.44        82.03     2_023.47       0.4237     3.638423         5.79
+IVF-Binary-256-nl273-np13-rf10-random (query)          1_941.44       111.10     2_052.54       0.5531     2.019567         5.79
+IVF-Binary-256-nl273-np13-rf20-random (query)          1_941.44       156.22     2_097.66       0.6927     1.019852         5.79
+IVF-Binary-256-nl273-np16-rf5-random (query)           1_941.44        90.71     2_032.15       0.4219     3.666926         5.79
+IVF-Binary-256-nl273-np16-rf10-random (query)          1_941.44       119.97     2_061.41       0.5516     2.031950         5.79
+IVF-Binary-256-nl273-np16-rf20-random (query)          1_941.44       170.18     2_111.62       0.6910     1.025282         5.79
+IVF-Binary-256-nl273-np23-rf5-random (query)           1_941.44       107.92     2_049.36       0.4194     3.697758         5.79
+IVF-Binary-256-nl273-np23-rf10-random (query)          1_941.44       139.65     2_081.09       0.5486     2.056576         5.79
+IVF-Binary-256-nl273-np23-rf20-random (query)          1_941.44       194.23     2_135.67       0.6878     1.040576         5.79
+IVF-Binary-256-nl273-random (self)                     1_941.44     1_205.36     3_146.80       0.5511     2.018480         5.79
+--------------------------------------------------------------------------------------------------------------------------------
+IVF-Binary-256-nl387-np19-rf0-random (query)           2_243.18        53.63     2_296.80       0.2064          NaN         5.80
+IVF-Binary-256-nl387-np27-rf0-random (query)           2_243.18        66.71     2_309.89       0.2048          NaN         5.80
+IVF-Binary-256-nl387-np19-rf5-random (query)           2_243.18        80.55     2_323.72       0.4237     3.634957         5.80
+IVF-Binary-256-nl387-np19-rf10-random (query)          2_243.18       108.35     2_351.53       0.5534     2.012177         5.80
+IVF-Binary-256-nl387-np19-rf20-random (query)          2_243.18       152.38     2_395.56       0.6933     1.015195         5.80
+IVF-Binary-256-nl387-np27-rf5-random (query)           2_243.18        94.16     2_337.34       0.4202     3.684317         5.80
+IVF-Binary-256-nl387-np27-rf10-random (query)          2_243.18       122.48     2_365.66       0.5495     2.044215         5.80
+IVF-Binary-256-nl387-np27-rf20-random (query)          2_243.18       173.52     2_416.70       0.6887     1.035562         5.80
+IVF-Binary-256-nl387-random (self)                     2_243.18     1_077.56     3_320.74       0.5532     1.998143         5.80
+--------------------------------------------------------------------------------------------------------------------------------
+IVF-Binary-256-nl547-np23-rf0-random (query)           2_675.66        51.78     2_727.44       0.2075          NaN         5.82
+IVF-Binary-256-nl547-np27-rf0-random (query)           2_675.66        55.86     2_731.52       0.2063          NaN         5.82
+IVF-Binary-256-nl547-np33-rf0-random (query)           2_675.66        64.58     2_740.24       0.2052          NaN         5.82
+IVF-Binary-256-nl547-np23-rf5-random (query)           2_675.66        88.32     2_763.98       0.4263     3.598411         5.82
+IVF-Binary-256-nl547-np23-rf10-random (query)          2_675.66       103.92     2_779.58       0.5571     1.985476         5.82
+IVF-Binary-256-nl547-np23-rf20-random (query)          2_675.66       158.96     2_834.62       0.6973     0.994908         5.82
+IVF-Binary-256-nl547-np27-rf5-random (query)           2_675.66        82.74     2_758.40       0.4236     3.632258         5.82
+IVF-Binary-256-nl547-np27-rf10-random (query)          2_675.66       112.11     2_787.77       0.5537     2.010509         5.82
+IVF-Binary-256-nl547-np27-rf20-random (query)          2_675.66       155.97     2_831.63       0.6941     1.006790         5.82
+IVF-Binary-256-nl547-np33-rf5-random (query)           2_675.66        90.05     2_765.71       0.4210     3.674864         5.82
+IVF-Binary-256-nl547-np33-rf10-random (query)          2_675.66       119.66     2_795.32       0.5506     2.036845         5.82
+IVF-Binary-256-nl547-np33-rf20-random (query)          2_675.66       176.43     2_852.09       0.6901     1.028662         5.82
+IVF-Binary-256-nl547-random (self)                     2_675.66     1_040.40     3_716.06       0.5570     1.967753         5.82
+--------------------------------------------------------------------------------------------------------------------------------
+IVF-Binary-256-nl273-np13-rf0-itq (query)              2_120.51        52.70     2_173.21       0.1905          NaN         5.79
+IVF-Binary-256-nl273-np16-rf0-itq (query)              2_120.51        58.87     2_179.37       0.1893          NaN         5.79
+IVF-Binary-256-nl273-np23-rf0-itq (query)              2_120.51        75.08     2_195.58       0.1883          NaN         5.79
+IVF-Binary-256-nl273-np13-rf5-itq (query)              2_120.51        80.26     2_200.77       0.3914     4.063042         5.79
+IVF-Binary-256-nl273-np13-rf10-itq (query)             2_120.51       107.31     2_227.81       0.5149     2.303126         5.79
+IVF-Binary-256-nl273-np13-rf20-itq (query)             2_120.51       153.50     2_274.00       0.6520     1.207540         5.79
+IVF-Binary-256-nl273-np16-rf5-itq (query)              2_120.51        87.76     2_208.26       0.3888     4.102234         5.79
+IVF-Binary-256-nl273-np16-rf10-itq (query)             2_120.51       118.20     2_238.71       0.5127     2.322490         5.79
+IVF-Binary-256-nl273-np16-rf20-itq (query)             2_120.51       165.98     2_286.49       0.6497     1.217388         5.79
+IVF-Binary-256-nl273-np23-rf5-itq (query)              2_120.51       104.00     2_224.51       0.3863     4.144271         5.79
+IVF-Binary-256-nl273-np23-rf10-itq (query)             2_120.51       135.39     2_255.89       0.5094     2.347611         5.79
+IVF-Binary-256-nl273-np23-rf20-itq (query)             2_120.51       186.65     2_307.16       0.6461     1.235595         5.79
+IVF-Binary-256-nl273-itq (self)                        2_120.51     1_165.85     3_286.35       0.5137     2.293500         5.79
+--------------------------------------------------------------------------------------------------------------------------------
+IVF-Binary-256-nl387-np19-rf0-itq (query)              2_445.02        62.42     2_507.44       0.1902          NaN         5.80
+IVF-Binary-256-nl387-np27-rf0-itq (query)              2_445.02        74.94     2_519.96       0.1886          NaN         5.80
+IVF-Binary-256-nl387-np19-rf5-itq (query)              2_445.02        88.56     2_533.58       0.3907     4.063618         5.80
+IVF-Binary-256-nl387-np19-rf10-itq (query)             2_445.02       114.41     2_559.44       0.5153     2.298229         5.80
+IVF-Binary-256-nl387-np19-rf20-itq (query)             2_445.02       160.42     2_605.44       0.6520     1.205868         5.80
+IVF-Binary-256-nl387-np27-rf5-itq (query)              2_445.02       111.61     2_556.63       0.3868     4.129609         5.80
+IVF-Binary-256-nl387-np27-rf10-itq (query)             2_445.02       142.54     2_587.57       0.5107     2.334748         5.80
+IVF-Binary-256-nl387-np27-rf20-itq (query)             2_445.02       181.20     2_626.22       0.6474     1.227411         5.80
+IVF-Binary-256-nl387-itq (self)                        2_445.02     1_138.55     3_583.57       0.5160     2.270526         5.80
+--------------------------------------------------------------------------------------------------------------------------------
+IVF-Binary-256-nl547-np23-rf0-itq (query)              2_868.90        52.54     2_921.44       0.1917          NaN         5.82
+IVF-Binary-256-nl547-np27-rf0-itq (query)              2_868.90        56.28     2_925.18       0.1903          NaN         5.82
+IVF-Binary-256-nl547-np33-rf0-itq (query)              2_868.90        62.47     2_931.37       0.1892          NaN         5.82
+IVF-Binary-256-nl547-np23-rf5-itq (query)              2_868.90        78.49     2_947.39       0.3939     4.017812         5.82
+IVF-Binary-256-nl547-np23-rf10-itq (query)             2_868.90       104.57     2_973.47       0.5191     2.263756         5.82
+IVF-Binary-256-nl547-np23-rf20-itq (query)             2_868.90       147.52     3_016.42       0.6568     1.180336         5.82
+IVF-Binary-256-nl547-np27-rf5-itq (query)              2_868.90        82.59     2_951.49       0.3910     4.059910         5.82
+IVF-Binary-256-nl547-np27-rf10-itq (query)             2_868.90       109.02     2_977.92       0.5156     2.292191         5.82
+IVF-Binary-256-nl547-np27-rf20-itq (query)             2_868.90       155.87     3_024.77       0.6528     1.196090         5.82
+IVF-Binary-256-nl547-np33-rf5-itq (query)              2_868.90        89.91     2_958.81       0.3882     4.109983         5.82
+IVF-Binary-256-nl547-np33-rf10-itq (query)             2_868.90       117.48     2_986.38       0.5117     2.327676         5.82
+IVF-Binary-256-nl547-np33-rf20-itq (query)             2_868.90       164.65     3_033.55       0.6488     1.219085         5.82
+IVF-Binary-256-nl547-itq (self)                        2_868.90     1_033.00     3_901.90       0.5202     2.235200         5.82
+--------------------------------------------------------------------------------------------------------------------------------
+IVF-Binary-512-nl273-np13-rf0-random (query)           3_113.63       102.32     3_215.95       0.2928          NaN        10.40
+IVF-Binary-512-nl273-np16-rf0-random (query)           3_113.63       112.07     3_225.70       0.2922          NaN        10.40
+IVF-Binary-512-nl273-np23-rf0-random (query)           3_113.63       141.63     3_255.26       0.2915          NaN        10.40
+IVF-Binary-512-nl273-np13-rf5-random (query)           3_113.63       138.23     3_251.86       0.5865     1.777085        10.40
+IVF-Binary-512-nl273-np13-rf10-random (query)          3_113.63       173.15     3_286.78       0.7256     0.833652        10.40
+IVF-Binary-512-nl273-np13-rf20-random (query)          3_113.63       229.32     3_342.95       0.8431     0.358751        10.40
+IVF-Binary-512-nl273-np16-rf5-random (query)           3_113.63       153.93     3_267.56       0.5863     1.774697        10.40
+IVF-Binary-512-nl273-np16-rf10-random (query)          3_113.63       191.59     3_305.22       0.7262     0.823205        10.40
+IVF-Binary-512-nl273-np16-rf20-random (query)          3_113.63       252.01     3_365.64       0.8454     0.341524        10.40
+IVF-Binary-512-nl273-np23-rf5-random (query)           3_113.63       191.22     3_304.85       0.5847     1.785669        10.40
+IVF-Binary-512-nl273-np23-rf10-random (query)          3_113.63       229.55     3_343.18       0.7248     0.828478        10.40
+IVF-Binary-512-nl273-np23-rf20-random (query)          3_113.63       294.06     3_407.69       0.8446     0.342891        10.40
+IVF-Binary-512-nl273-random (self)                     3_113.63     1_911.39     5_025.02       0.7246     0.820201        10.40
+--------------------------------------------------------------------------------------------------------------------------------
+IVF-Binary-512-nl387-np19-rf0-random (query)           3_387.79       104.65     3_492.44       0.2927          NaN        10.41
+IVF-Binary-512-nl387-np27-rf0-random (query)           3_387.79       130.58     3_518.37       0.2916          NaN        10.41
+IVF-Binary-512-nl387-np19-rf5-random (query)           3_387.79       143.87     3_531.66       0.5870     1.770037        10.41
+IVF-Binary-512-nl387-np19-rf10-random (query)          3_387.79       179.34     3_567.13       0.7265     0.828245        10.41
+IVF-Binary-512-nl387-np19-rf20-random (query)          3_387.79       231.61     3_619.40       0.8449     0.354020        10.41
+IVF-Binary-512-nl387-np27-rf5-random (query)           3_387.79       171.07     3_558.86       0.5852     1.780085        10.41
+IVF-Binary-512-nl387-np27-rf10-random (query)          3_387.79       209.61     3_597.40       0.7252     0.826154        10.41
+IVF-Binary-512-nl387-np27-rf20-random (query)          3_387.79       271.66     3_659.45       0.8452     0.340889        10.41
+IVF-Binary-512-nl387-random (self)                     3_387.79     1_783.56     5_171.35       0.7248     0.826965        10.41
+--------------------------------------------------------------------------------------------------------------------------------
+IVF-Binary-512-nl547-np23-rf0-random (query)           3_836.45        96.26     3_932.71       0.2935          NaN        10.43
+IVF-Binary-512-nl547-np27-rf0-random (query)           3_836.45       105.20     3_941.65       0.2928          NaN        10.43
+IVF-Binary-512-nl547-np33-rf0-random (query)           3_836.45       119.35     3_955.80       0.2920          NaN        10.43
+IVF-Binary-512-nl547-np23-rf5-random (query)           3_836.45       131.99     3_968.44       0.5884     1.762465        10.43
+IVF-Binary-512-nl547-np23-rf10-random (query)          3_836.45       157.69     3_994.14       0.7278     0.824517        10.43
+IVF-Binary-512-nl547-np23-rf20-random (query)          3_836.45       207.01     4_043.46       0.8457     0.354496        10.43
+IVF-Binary-512-nl547-np27-rf5-random (query)           3_836.45       138.85     3_975.30       0.5872     1.765331        10.43
+IVF-Binary-512-nl547-np27-rf10-random (query)          3_836.45       168.97     4_005.42       0.7273     0.819011        10.43
+IVF-Binary-512-nl547-np27-rf20-random (query)          3_836.45       220.39     4_056.83       0.8465     0.341188        10.43
+IVF-Binary-512-nl547-np33-rf5-random (query)           3_836.45       165.15     4_001.60       0.5853     1.778278        10.43
+IVF-Binary-512-nl547-np33-rf10-random (query)          3_836.45       189.39     4_025.84       0.7260     0.822615        10.43
+IVF-Binary-512-nl547-np33-rf20-random (query)          3_836.45       240.31     4_076.76       0.8456     0.339646        10.43
+IVF-Binary-512-nl547-random (self)                     3_836.45     1_576.06     5_412.51       0.7267     0.818703        10.43
+--------------------------------------------------------------------------------------------------------------------------------
+IVF-Binary-512-nl273-np13-rf0-itq (query)              3_357.61       102.02     3_459.63       0.2843          NaN        10.40
+IVF-Binary-512-nl273-np16-rf0-itq (query)              3_357.61       116.36     3_473.96       0.2839          NaN        10.40
+IVF-Binary-512-nl273-np23-rf0-itq (query)              3_357.61       146.02     3_503.62       0.2830          NaN        10.40
+IVF-Binary-512-nl273-np13-rf5-itq (query)              3_357.61       134.85     3_492.46       0.5703     1.827586        10.40
+IVF-Binary-512-nl273-np13-rf10-itq (query)             3_357.61       184.99     3_542.60       0.7081     0.873482        10.40
+IVF-Binary-512-nl273-np13-rf20-itq (query)             3_357.61       217.83     3_575.44       0.8300     0.375367        10.40
+IVF-Binary-512-nl273-np16-rf5-itq (query)              3_357.61       154.51     3_512.12       0.5702     1.824096        10.40
+IVF-Binary-512-nl273-np16-rf10-itq (query)             3_357.61       186.73     3_544.34       0.7086     0.862286        10.40
+IVF-Binary-512-nl273-np16-rf20-itq (query)             3_357.61       240.98     3_598.59       0.8320     0.358562        10.40
+IVF-Binary-512-nl273-np23-rf5-itq (query)              3_357.61       184.85     3_542.46       0.5688     1.832095        10.40
+IVF-Binary-512-nl273-np23-rf10-itq (query)             3_357.61       219.86     3_577.47       0.7071     0.866835        10.40
+IVF-Binary-512-nl273-np23-rf20-itq (query)             3_357.61       279.31     3_636.92       0.8308     0.360078        10.40
+IVF-Binary-512-nl273-itq (self)                        3_357.61     1_820.00     5_177.61       0.7092     0.849450        10.40
+--------------------------------------------------------------------------------------------------------------------------------
+IVF-Binary-512-nl387-np19-rf0-itq (query)              3_674.85       107.19     3_782.04       0.2844          NaN        10.41
+IVF-Binary-512-nl387-np27-rf0-itq (query)              3_674.85       133.74     3_808.59       0.2834          NaN        10.41
+IVF-Binary-512-nl387-np19-rf5-itq (query)              3_674.85       140.05     3_814.91       0.5707     1.824636        10.41
+IVF-Binary-512-nl387-np19-rf10-itq (query)             3_674.85       170.28     3_845.13       0.7088     0.870642        10.41
+IVF-Binary-512-nl387-np19-rf20-itq (query)             3_674.85       228.13     3_902.98       0.8313     0.373148        10.41
+IVF-Binary-512-nl387-np27-rf5-itq (query)              3_674.85       168.38     3_843.24       0.5692     1.829770        10.41
+IVF-Binary-512-nl387-np27-rf10-itq (query)             3_674.85       203.81     3_878.66       0.7076     0.864124        10.41
+IVF-Binary-512-nl387-np27-rf20-itq (query)             3_674.85       256.64     3_931.49       0.8311     0.359219        10.41
+IVF-Binary-512-nl387-itq (self)                        3_674.85     1_736.16     5_411.01       0.7092     0.858656        10.41
+--------------------------------------------------------------------------------------------------------------------------------
+IVF-Binary-512-nl547-np23-rf0-itq (query)              4_126.66        98.89     4_225.55       0.2853          NaN        10.43
+IVF-Binary-512-nl547-np27-rf0-itq (query)              4_126.66       107.84     4_234.50       0.2845          NaN        10.43
+IVF-Binary-512-nl547-np33-rf0-itq (query)              4_126.66       121.78     4_248.44       0.2836          NaN        10.43
+IVF-Binary-512-nl547-np23-rf5-itq (query)              4_126.66       130.80     4_257.46       0.5724     1.811736        10.43
+IVF-Binary-512-nl547-np23-rf10-itq (query)             4_126.66       162.76     4_289.42       0.7108     0.864355        10.43
+IVF-Binary-512-nl547-np23-rf20-itq (query)             4_126.66       209.47     4_336.13       0.8323     0.372880        10.43
+IVF-Binary-512-nl547-np27-rf5-itq (query)              4_126.66       141.05     4_267.71       0.5714     1.813983        10.43
+IVF-Binary-512-nl547-np27-rf10-itq (query)             4_126.66       170.97     4_297.63       0.7102     0.857436        10.43
+IVF-Binary-512-nl547-np27-rf20-itq (query)             4_126.66       223.63     4_350.29       0.8331     0.359259        10.43
+IVF-Binary-512-nl547-np33-rf5-itq (query)              4_126.66       155.77     4_282.43       0.5696     1.824932        10.43
+IVF-Binary-512-nl547-np33-rf10-itq (query)             4_126.66       188.08     4_314.74       0.7083     0.861599        10.43
+IVF-Binary-512-nl547-np33-rf20-itq (query)             4_126.66       242.65     4_369.31       0.8317     0.357581        10.43
+IVF-Binary-512-nl547-itq (self)                        4_126.66     1_600.28     5_726.94       0.7111     0.850696        10.43
+--------------------------------------------------------------------------------------------------------------------------------
+IVF-Binary-32-nl273-np13-rf0-signed (query)              940.79        40.95       981.74       0.0679          NaN         1.76
+IVF-Binary-32-nl273-np16-rf0-signed (query)              940.79        48.41       989.21       0.0624          NaN         1.76
+IVF-Binary-32-nl273-np23-rf0-signed (query)              940.79        67.08     1_007.87       0.0602          NaN         1.76
+IVF-Binary-32-nl273-np13-rf5-signed (query)              940.79        63.33     1_004.12       0.1447    13.569746         1.76
+IVF-Binary-32-nl273-np13-rf10-signed (query)             940.79        79.02     1_019.81       0.2059     9.378159         1.76
+IVF-Binary-32-nl273-np13-rf20-signed (query)             940.79       113.77     1_054.56       0.2962     6.200633         1.76
+IVF-Binary-32-nl273-np16-rf5-signed (query)              940.79        69.50     1_010.29       0.1366    14.121664         1.76
+IVF-Binary-32-nl273-np16-rf10-signed (query)             940.79        88.02     1_028.81       0.1960     9.786761         1.76
+IVF-Binary-32-nl273-np16-rf20-signed (query)             940.79       124.85     1_065.64       0.2849     6.496712         1.76
+IVF-Binary-32-nl273-np23-rf5-signed (query)              940.79        91.49     1_032.28       0.1323    14.552605         1.76
+IVF-Binary-32-nl273-np23-rf10-signed (query)             940.79       126.94     1_067.74       0.1900    10.127619         1.76
+IVF-Binary-32-nl273-np23-rf20-signed (query)             940.79       147.85     1_088.64       0.2759     6.765662         1.76
+--------------------------------------------------------------------------------------------------------------------------------
+IVF-Binary-32-nl273-signed (self)                        940.79       874.63     1_815.42       0.1987     9.540459         1.76
+IVF-Binary-32-nl387-np19-rf0-signed (query)            1_262.76        42.19     1_304.95       0.0647          NaN         1.77
+IVF-Binary-32-nl387-np27-rf0-signed (query)            1_262.76        55.30     1_318.05       0.0616          NaN         1.77
+IVF-Binary-32-nl387-np19-rf5-signed (query)            1_262.76        60.42     1_323.18       0.1409    13.656099         1.77
+IVF-Binary-32-nl387-np19-rf10-signed (query)           1_262.76        78.89     1_341.65       0.2038     9.360511         1.77
+IVF-Binary-32-nl387-np19-rf20-signed (query)           1_262.76       113.02     1_375.77       0.2934     6.165021         1.77
+IVF-Binary-32-nl387-np27-rf5-signed (query)            1_262.76        74.53     1_337.28       0.1349    14.234154         1.77
+IVF-Binary-32-nl387-np27-rf10-signed (query)           1_262.76        94.16     1_356.92       0.1944     9.836159         1.77
+IVF-Binary-32-nl387-np27-rf20-signed (query)           1_262.76       131.40     1_394.16       0.2810     6.532805         1.77
+IVF-Binary-32-nl387-signed (self)                      1_262.76       786.24     2_048.99       0.2045     9.174261         1.77
+--------------------------------------------------------------------------------------------------------------------------------
+IVF-Binary-32-nl547-np23-rf0-signed (query)            1_725.98        39.18     1_765.16       0.0670          NaN         1.79
+IVF-Binary-32-nl547-np27-rf0-signed (query)            1_725.98        44.00     1_769.97       0.0650          NaN         1.79
+IVF-Binary-32-nl547-np33-rf0-signed (query)            1_725.98        50.70     1_776.68       0.0627          NaN         1.79
+IVF-Binary-32-nl547-np23-rf5-signed (query)            1_725.98        57.14     1_783.12       0.1458    13.298341         1.79
+IVF-Binary-32-nl547-np23-rf10-signed (query)           1_725.98        74.99     1_800.97       0.2095     9.093104         1.79
+IVF-Binary-32-nl547-np23-rf20-signed (query)           1_725.98       108.77     1_834.75       0.3024     5.928558         1.79
+IVF-Binary-32-nl547-np27-rf5-signed (query)            1_725.98        63.33     1_789.31       0.1413    13.650579         1.79
+IVF-Binary-32-nl547-np27-rf10-signed (query)           1_725.98        80.77     1_806.75       0.2032     9.392887         1.79
+IVF-Binary-32-nl547-np27-rf20-signed (query)           1_725.98       114.74     1_840.72       0.2937     6.177874         1.79
+IVF-Binary-32-nl547-np33-rf5-signed (query)            1_725.98        69.96     1_795.94       0.1373    14.019250         1.79
+IVF-Binary-32-nl547-np33-rf10-signed (query)           1_725.98        88.72     1_814.69       0.1971     9.710259         1.79
+IVF-Binary-32-nl547-np33-rf20-signed (query)           1_725.98       123.58     1_849.56       0.2845     6.443362         1.79
+IVF-Binary-32-nl547-signed (self)                      1_725.98       744.73     2_470.70       0.2109     8.898138         1.79
 --------------------------------------------------------------------------------------------------------------------------------
 </code></pre>
 </details>
@@ -258,178 +326,235 @@ IVF-Binary-512-nl547-itq (self)                       11_986.12     1_643.18    
 
 <details>
 <summary><b>Binary - Cosine (Gaussian)</b>:</summary>
+</br>
 <pre><code>
 ================================================================================================================================
 Benchmark: 150k cells, 32D - Binary Quantisation
 ================================================================================================================================
 Method                                               Build (ms)   Query (ms)   Total (ms)     Recall@k   Dist Error    Size (MB)
 --------------------------------------------------------------------------------------------------------------------------------
-Exhaustive (query)                                         4.33     1_489.44     1_493.77       1.0000     0.000000        18.88
-Exhaustive (self)                                          4.33    15_914.91    15_919.23       1.0000     0.000000        18.88
+Exhaustive (query)                                         3.85     1_565.91     1_569.76       1.0000     0.000000        18.88
+Exhaustive (self)                                          3.85    16_276.85    16_280.70       1.0000     0.000000        18.88
 --------------------------------------------------------------------------------------------------------------------------------
-ExhaustiveBinary-256-random_no_rr (query)              1_247.60       493.63     1_741.22       0.2159          NaN         4.61
-ExhaustiveBinary-256-random-rf5 (query)                1_247.60       545.65     1_793.25       0.4401     0.002523         4.61
-ExhaustiveBinary-256-random-rf10 (query)               1_247.60       605.91     1_853.51       0.5705     0.001386         4.61
-ExhaustiveBinary-256-random-rf20 (query)               1_247.60       699.91     1_947.50       0.7082     0.000695         4.61
-ExhaustiveBinary-256-random (self)                     1_247.60     6_137.71     7_385.31       0.5696     0.001382         4.61
-ExhaustiveBinary-256-itq_no_rr (query)                 9_712.09       527.17    10_239.26       0.2068          NaN         4.61
-ExhaustiveBinary-256-itq-rf5 (query)                   9_712.09       553.79    10_265.88       0.4203     0.002652         4.61
-ExhaustiveBinary-256-itq-rf10 (query)                  9_712.09       610.63    10_322.72       0.5468     0.001484         4.61
-ExhaustiveBinary-256-itq-rf20 (query)                  9_712.09       712.34    10_424.44       0.6809     0.000767         4.61
-ExhaustiveBinary-256-itq (self)                        9_712.09     6_388.25    16_100.34       0.5456     0.001474         4.61
+ExhaustiveBinary-256-random_no_rr (query)              1_162.09       497.31     1_659.40       0.2158          NaN         4.61
+ExhaustiveBinary-256-random-rf5 (query)                1_162.09       548.92     1_711.01       0.4401     0.002523         4.61
+ExhaustiveBinary-256-random-rf10 (query)               1_162.09       602.59     1_764.69       0.5705     0.001386         4.61
+ExhaustiveBinary-256-random-rf20 (query)               1_162.09       683.36     1_845.45       0.7082     0.000695         4.61
+ExhaustiveBinary-256-random (self)                     1_162.09     5_883.59     7_045.68       0.5696     0.001382         4.61
 --------------------------------------------------------------------------------------------------------------------------------
-ExhaustiveBinary-512-random_no_rr (query)              2_532.56       851.45     3_384.01       0.3136          NaN         9.22
-ExhaustiveBinary-512-random-rf5 (query)                2_532.56     1_026.54     3_559.11       0.6181     0.001103         9.22
-ExhaustiveBinary-512-random-rf10 (query)               2_532.56     1_138.07     3_670.63       0.7540     0.000502         9.22
-ExhaustiveBinary-512-random-rf20 (query)               2_532.56     1_083.54     3_616.10       0.8651     0.000202         9.22
-ExhaustiveBinary-512-random (self)                     2_532.56    10_283.86    12_816.42       0.7519     0.000503         9.22
-ExhaustiveBinary-512-itq_no_rr (query)                11_094.82       889.89    11_984.71       0.3144          NaN         9.22
-ExhaustiveBinary-512-itq-rf5 (query)                  11_094.82       895.22    11_990.04       0.6144     0.001065         9.22
-ExhaustiveBinary-512-itq-rf10 (query)                 11_094.82       938.44    12_033.26       0.7478     0.000491         9.22
-ExhaustiveBinary-512-itq-rf20 (query)                 11_094.82     1_042.25    12_137.07       0.8576     0.000201         9.22
-ExhaustiveBinary-512-itq (self)                       11_094.82    10_086.80    21_181.62       0.7466     0.000485         9.22
+ExhaustiveBinary-256-itq_no_rr (query)                 1_356.62       482.82     1_839.45       0.1983          NaN         4.61
+ExhaustiveBinary-256-itq-rf5 (query)                   1_356.62       531.85     1_888.47       0.4042     0.002874         4.61
+ExhaustiveBinary-256-itq-rf10 (query)                  1_356.62       579.13     1_935.75       0.5292     0.001626         4.61
+ExhaustiveBinary-256-itq-rf20 (query)                  1_356.62       676.90     2_033.53       0.6649     0.000853         4.61
+ExhaustiveBinary-256-itq (self)                        1_356.62     5_809.01     7_165.63       0.5290     0.001611         4.61
 --------------------------------------------------------------------------------------------------------------------------------
-IVF-Binary-256-nl273-np13-rf0-random (query)           2_129.49        53.00     2_182.50       0.2189          NaN         5.79
-IVF-Binary-256-nl273-np16-rf0-random (query)           2_129.49        63.16     2_192.66       0.2178          NaN         5.79
-IVF-Binary-256-nl273-np23-rf0-random (query)           2_129.49        78.20     2_207.69       0.2168          NaN         5.79
-IVF-Binary-256-nl273-np13-rf5-random (query)           2_129.49        83.07     2_212.56       0.4458     0.002466         5.79
-IVF-Binary-256-nl273-np13-rf10-random (query)          2_129.49       111.00     2_240.50       0.5771     0.001354         5.79
-IVF-Binary-256-nl273-np13-rf20-random (query)          2_129.49       158.28     2_287.78       0.7144     0.000676         5.79
-IVF-Binary-256-nl273-np16-rf5-random (query)           2_129.49        90.79     2_220.29       0.4440     0.002486         5.79
-IVF-Binary-256-nl273-np16-rf10-random (query)          2_129.49       120.99     2_250.48       0.5757     0.001360         5.79
-IVF-Binary-256-nl273-np16-rf20-random (query)          2_129.49       170.03     2_299.52       0.7130     0.000678         5.79
-IVF-Binary-256-nl273-np23-rf5-random (query)           2_129.49       108.38     2_237.87       0.4416     0.002508         5.79
-IVF-Binary-256-nl273-np23-rf10-random (query)          2_129.49       140.26     2_269.75       0.5727     0.001376         5.79
-IVF-Binary-256-nl273-np23-rf20-random (query)          2_129.49       193.63     2_323.13       0.7099     0.000689         5.79
-IVF-Binary-256-nl273-random (self)                     2_129.49     1_218.07     3_347.56       0.5746     0.001354         5.79
-IVF-Binary-256-nl387-np19-rf0-random (query)           2_471.79        55.68     2_527.48       0.2189          NaN         5.81
-IVF-Binary-256-nl387-np27-rf0-random (query)           2_471.79        68.55     2_540.34       0.2173          NaN         5.81
-IVF-Binary-256-nl387-np19-rf5-random (query)           2_471.79        86.55     2_558.34       0.4455     0.002465         5.81
-IVF-Binary-256-nl387-np19-rf10-random (query)          2_471.79       111.96     2_583.76       0.5775     0.001347         5.81
-IVF-Binary-256-nl387-np19-rf20-random (query)          2_471.79       159.02     2_630.81       0.7149     0.000670         5.81
-IVF-Binary-256-nl387-np27-rf5-random (query)           2_471.79       100.04     2_571.83       0.4420     0.002502         5.81
-IVF-Binary-256-nl387-np27-rf10-random (query)          2_471.79       130.65     2_602.44       0.5735     0.001369         5.81
-IVF-Binary-256-nl387-np27-rf20-random (query)          2_471.79       179.00     2_650.79       0.7106     0.000685         5.81
-IVF-Binary-256-nl387-random (self)                     2_471.79     1_116.18     3_587.97       0.5767     0.001341         5.81
-IVF-Binary-256-nl547-np23-rf0-random (query)           2_969.11        53.78     3_022.89       0.2198          NaN         5.83
-IVF-Binary-256-nl547-np27-rf0-random (query)           2_969.11        58.46     3_027.57       0.2187          NaN         5.83
-IVF-Binary-256-nl547-np33-rf0-random (query)           2_969.11        65.35     3_034.45       0.2175          NaN         5.83
-IVF-Binary-256-nl547-np23-rf5-random (query)           2_969.11        83.44     3_052.55       0.4486     0.002436         5.83
-IVF-Binary-256-nl547-np23-rf10-random (query)          2_969.11       106.86     3_075.97       0.5810     0.001327         5.83
-IVF-Binary-256-nl547-np23-rf20-random (query)          2_969.11       152.34     3_121.44       0.7187     0.000658         5.83
-IVF-Binary-256-nl547-np27-rf5-random (query)           2_969.11        87.64     3_056.75       0.4459     0.002461         5.83
-IVF-Binary-256-nl547-np27-rf10-random (query)          2_969.11       113.47     3_082.57       0.5779     0.001343         5.83
-IVF-Binary-256-nl547-np27-rf20-random (query)          2_969.11       159.83     3_128.94       0.7158     0.000666         5.83
-IVF-Binary-256-nl547-np33-rf5-random (query)           2_969.11        94.48     3_063.58       0.4430     0.002491         5.83
-IVF-Binary-256-nl547-np33-rf10-random (query)          2_969.11       125.83     3_094.94       0.5745     0.001364         5.83
-IVF-Binary-256-nl547-np33-rf20-random (query)          2_969.11       170.88     3_139.99       0.7119     0.000680         5.83
-IVF-Binary-256-nl547-random (self)                     2_969.11     1_071.27     4_040.38       0.5804     0.001321         5.83
-IVF-Binary-256-nl273-np13-rf0-itq (query)             10_048.68        52.09    10_100.77       0.2104          NaN         5.79
-IVF-Binary-256-nl273-np16-rf0-itq (query)             10_048.68        58.64    10_107.32       0.2090          NaN         5.79
-IVF-Binary-256-nl273-np23-rf0-itq (query)             10_048.68        74.93    10_123.61       0.2078          NaN         5.79
-IVF-Binary-256-nl273-np13-rf5-itq (query)             10_048.68        82.76    10_131.44       0.4272     0.002589         5.79
-IVF-Binary-256-nl273-np13-rf10-itq (query)            10_048.68       108.01    10_156.68       0.5545     0.001445         5.79
-IVF-Binary-256-nl273-np13-rf20-itq (query)            10_048.68       154.74    10_203.42       0.6884     0.000746         5.79
-IVF-Binary-256-nl273-np16-rf5-itq (query)             10_048.68        88.47    10_137.15       0.4250     0.002610         5.79
-IVF-Binary-256-nl273-np16-rf10-itq (query)            10_048.68       117.83    10_166.50       0.5524     0.001455         5.79
-IVF-Binary-256-nl273-np16-rf20-itq (query)            10_048.68       166.72    10_215.40       0.6867     0.000749         5.79
-IVF-Binary-256-nl273-np23-rf5-itq (query)             10_048.68       106.05    10_154.73       0.4224     0.002635         5.79
-IVF-Binary-256-nl273-np23-rf10-itq (query)            10_048.68       138.82    10_187.50       0.5488     0.001474         5.79
-IVF-Binary-256-nl273-np23-rf20-itq (query)            10_048.68       190.70    10_239.38       0.6829     0.000762         5.79
-IVF-Binary-256-nl273-itq (self)                       10_048.68     1_175.80    11_224.48       0.5511     0.001444         5.79
-IVF-Binary-256-nl387-np19-rf0-itq (query)             10_364.80        55.46    10_420.25       0.2102          NaN         5.81
-IVF-Binary-256-nl387-np27-rf0-itq (query)             10_364.80        66.08    10_430.87       0.2084          NaN         5.81
-IVF-Binary-256-nl387-np19-rf5-itq (query)             10_364.80        84.47    10_449.27       0.4271     0.002587         5.81
-IVF-Binary-256-nl387-np19-rf10-itq (query)            10_364.80       109.89    10_474.69       0.5547     0.001439         5.81
-IVF-Binary-256-nl387-np19-rf20-itq (query)            10_364.80       154.98    10_519.77       0.6888     0.000742         5.81
-IVF-Binary-256-nl387-np27-rf5-itq (query)             10_364.80        97.16    10_461.96       0.4233     0.002623         5.81
-IVF-Binary-256-nl387-np27-rf10-itq (query)            10_364.80       127.84    10_492.63       0.5501     0.001464         5.81
-IVF-Binary-256-nl387-np27-rf20-itq (query)            10_364.80       174.23    10_539.03       0.6845     0.000754         5.81
-IVF-Binary-256-nl387-itq (self)                       10_364.80     1_111.56    11_476.36       0.5535     0.001430         5.81
-IVF-Binary-256-nl547-np23-rf0-itq (query)             11_038.25        60.98    11_099.23       0.2114          NaN         5.83
-IVF-Binary-256-nl547-np27-rf0-itq (query)             11_038.25        60.52    11_098.77       0.2099          NaN         5.83
-IVF-Binary-256-nl547-np33-rf0-itq (query)             11_038.25        67.81    11_106.06       0.2087          NaN         5.83
-IVF-Binary-256-nl547-np23-rf5-itq (query)             11_038.25        83.84    11_122.09       0.4301     0.002556         5.83
-IVF-Binary-256-nl547-np23-rf10-itq (query)            11_038.25       108.78    11_147.04       0.5584     0.001417         5.83
-IVF-Binary-256-nl547-np23-rf20-itq (query)            11_038.25       152.85    11_191.10       0.6935     0.000724         5.83
-IVF-Binary-256-nl547-np27-rf5-itq (query)             11_038.25        90.22    11_128.47       0.4274     0.002583         5.83
-IVF-Binary-256-nl547-np27-rf10-itq (query)            11_038.25       116.17    11_154.43       0.5550     0.001435         5.83
-IVF-Binary-256-nl547-np27-rf20-itq (query)            11_038.25       160.98    11_199.23       0.6898     0.000734         5.83
-IVF-Binary-256-nl547-np33-rf5-itq (query)             11_038.25        97.27    11_135.52       0.4245     0.002612         5.83
-IVF-Binary-256-nl547-np33-rf10-itq (query)            11_038.25       125.46    11_163.71       0.5513     0.001457         5.83
-IVF-Binary-256-nl547-np33-rf20-itq (query)            11_038.25       173.16    11_211.42       0.6856     0.000750         5.83
-IVF-Binary-256-nl547-itq (self)                       11_038.25     1_090.67    12_128.93       0.5576     0.001407         5.83
+ExhaustiveBinary-512-random_no_rr (query)              2_307.90       822.29     3_130.19       0.3136          NaN         9.22
+ExhaustiveBinary-512-random-rf5 (query)                2_307.90       863.28     3_171.18       0.6181     0.001103         9.22
+ExhaustiveBinary-512-random-rf10 (query)               2_307.90       914.52     3_222.42       0.7540     0.000502         9.22
+ExhaustiveBinary-512-random-rf20 (query)               2_307.90     1_028.72     3_336.62       0.8652     0.000203         9.22
+ExhaustiveBinary-512-random (self)                     2_307.90     9_153.13    11_461.02       0.7519     0.000503         9.22
 --------------------------------------------------------------------------------------------------------------------------------
-IVF-Binary-512-nl273-np13-rf0-random (query)           3_314.79       104.15     3_418.94       0.3155          NaN        10.40
-IVF-Binary-512-nl273-np16-rf0-random (query)           3_314.79       126.01     3_440.80       0.3152          NaN        10.40
-IVF-Binary-512-nl273-np23-rf0-random (query)           3_314.79       153.30     3_468.09       0.3144          NaN        10.40
-IVF-Binary-512-nl273-np13-rf5-random (query)           3_314.79       139.52     3_454.31       0.6203     0.001095        10.40
-IVF-Binary-512-nl273-np13-rf10-random (query)          3_314.79       172.68     3_487.48       0.7548     0.000506        10.40
-IVF-Binary-512-nl273-np13-rf20-random (query)          3_314.79       232.00     3_546.79       0.8636     0.000215        10.40
-IVF-Binary-512-nl273-np16-rf5-random (query)           3_314.79       156.19     3_470.98       0.6205     0.001091        10.40
-IVF-Binary-512-nl273-np16-rf10-random (query)          3_314.79       192.13     3_506.92       0.7560     0.000497        10.40
-IVF-Binary-512-nl273-np16-rf20-random (query)          3_314.79       259.12     3_573.91       0.8664     0.000202        10.40
-IVF-Binary-512-nl273-np23-rf5-random (query)           3_314.79       195.75     3_510.54       0.6191     0.001099        10.40
-IVF-Binary-512-nl273-np23-rf10-random (query)          3_314.79       232.52     3_547.31       0.7548     0.000500        10.40
-IVF-Binary-512-nl273-np23-rf20-random (query)          3_314.79       297.49     3_612.28       0.8659     0.000201        10.40
-IVF-Binary-512-nl273-random (self)                     3_314.79     1_907.50     5_222.29       0.7540     0.000497        10.40
-IVF-Binary-512-nl387-np19-rf0-random (query)           3_668.80       108.95     3_777.75       0.3156          NaN        10.41
-IVF-Binary-512-nl387-np27-rf0-random (query)           3_668.80       136.30     3_805.09       0.3145          NaN        10.41
-IVF-Binary-512-nl387-np19-rf5-random (query)           3_668.80       143.51     3_812.31       0.6206     0.001092        10.41
-IVF-Binary-512-nl387-np19-rf10-random (query)          3_668.80       182.05     3_850.85       0.7557     0.000502        10.41
-IVF-Binary-512-nl387-np19-rf20-random (query)          3_668.80       235.00     3_903.79       0.8651     0.000210        10.41
-IVF-Binary-512-nl387-np27-rf5-random (query)           3_668.80       174.33     3_843.13       0.6191     0.001097        10.41
-IVF-Binary-512-nl387-np27-rf10-random (query)          3_668.80       209.18     3_877.98       0.7553     0.000498        10.41
-IVF-Binary-512-nl387-np27-rf20-random (query)          3_668.80       273.38     3_942.18       0.8660     0.000201        10.41
-IVF-Binary-512-nl387-random (self)                     3_668.80     1_768.74     5_437.54       0.7538     0.000502        10.41
-IVF-Binary-512-nl547-np23-rf0-random (query)           4_173.48       101.53     4_275.01       0.3162          NaN        10.44
-IVF-Binary-512-nl547-np27-rf0-random (query)           4_173.48       111.27     4_284.75       0.3154          NaN        10.44
-IVF-Binary-512-nl547-np33-rf0-random (query)           4_173.48       126.30     4_299.77       0.3145          NaN        10.44
-IVF-Binary-512-nl547-np23-rf5-random (query)           4_173.48       136.32     4_309.79       0.6227     0.001081        10.44
-IVF-Binary-512-nl547-np23-rf10-random (query)          4_173.48       168.97     4_342.45       0.7573     0.000497        10.44
-IVF-Binary-512-nl547-np23-rf20-random (query)          4_173.48       222.42     4_395.90       0.8660     0.000209        10.44
-IVF-Binary-512-nl547-np27-rf5-random (query)           4_173.48       147.07     4_320.55       0.6215     0.001085        10.44
-IVF-Binary-512-nl547-np27-rf10-random (query)          4_173.48       180.69     4_354.17       0.7570     0.000493        10.44
-IVF-Binary-512-nl547-np27-rf20-random (query)          4_173.48       238.42     4_411.89       0.8670     0.000201        10.44
-IVF-Binary-512-nl547-np33-rf5-random (query)           4_173.48       174.77     4_348.25       0.6199     0.001093        10.44
-IVF-Binary-512-nl547-np33-rf10-random (query)          4_173.48       198.45     4_371.93       0.7556     0.000497        10.44
-IVF-Binary-512-nl547-np33-rf20-random (query)          4_173.48       259.09     4_432.56       0.8665     0.000200        10.44
-IVF-Binary-512-nl547-random (self)                     4_173.48     1_690.04     5_863.52       0.7555     0.000498        10.44
-IVF-Binary-512-nl273-np13-rf0-itq (query)             11_237.76       106.63    11_344.38       0.3164          NaN        10.40
-IVF-Binary-512-nl273-np16-rf0-itq (query)             11_237.76       119.38    11_357.13       0.3158          NaN        10.40
-IVF-Binary-512-nl273-np23-rf0-itq (query)             11_237.76       154.69    11_392.44       0.3148          NaN        10.40
-IVF-Binary-512-nl273-np13-rf5-itq (query)             11_237.76       140.52    11_378.28       0.6167     0.001060        10.40
-IVF-Binary-512-nl273-np13-rf10-itq (query)            11_237.76       174.10    11_411.86       0.7491     0.000495        10.40
-IVF-Binary-512-nl273-np13-rf20-itq (query)            11_237.76       238.40    11_476.15       0.8565     0.000213        10.40
-IVF-Binary-512-nl273-np16-rf5-itq (query)             11_237.76       156.87    11_394.63       0.6167     0.001056        10.40
-IVF-Binary-512-nl273-np16-rf10-itq (query)            11_237.76       193.11    11_430.86       0.7504     0.000485        10.40
-IVF-Binary-512-nl273-np16-rf20-itq (query)            11_237.76       256.76    11_494.51       0.8594     0.000199        10.40
-IVF-Binary-512-nl273-np23-rf5-itq (query)             11_237.76       198.05    11_435.81       0.6154     0.001061        10.40
-IVF-Binary-512-nl273-np23-rf10-itq (query)            11_237.76       234.29    11_472.04       0.7489     0.000488        10.40
-IVF-Binary-512-nl273-np23-rf20-itq (query)            11_237.76       301.49    11_539.24       0.8585     0.000199        10.40
-IVF-Binary-512-nl273-itq (self)                       11_237.76     1_944.83    13_182.58       0.7488     0.000479        10.40
-IVF-Binary-512-nl387-np19-rf0-itq (query)             11_638.53       106.39    11_744.92       0.3165          NaN        10.41
-IVF-Binary-512-nl387-np27-rf0-itq (query)             11_638.53       133.72    11_772.25       0.3152          NaN        10.41
-IVF-Binary-512-nl387-np19-rf5-itq (query)             11_638.53       142.86    11_781.39       0.6171     0.001056        10.41
-IVF-Binary-512-nl387-np19-rf10-itq (query)            11_638.53       175.88    11_814.41       0.7498     0.000491        10.41
-IVF-Binary-512-nl387-np19-rf20-itq (query)            11_638.53       233.87    11_872.40       0.8580     0.000208        10.41
-IVF-Binary-512-nl387-np27-rf5-itq (query)             11_638.53       179.94    11_818.47       0.6161     0.001057        10.41
-IVF-Binary-512-nl387-np27-rf10-itq (query)            11_638.53       208.39    11_846.92       0.7493     0.000487        10.41
-IVF-Binary-512-nl387-np27-rf20-itq (query)            11_638.53       273.38    11_911.91       0.8588     0.000199        10.41
-IVF-Binary-512-nl387-itq (self)                       11_638.53     1_888.92    13_527.45       0.7486     0.000485        10.41
-IVF-Binary-512-nl547-np23-rf0-itq (query)             12_238.69       101.20    12_339.89       0.3173          NaN        10.44
-IVF-Binary-512-nl547-np27-rf0-itq (query)             12_238.69       111.04    12_349.73       0.3165          NaN        10.44
-IVF-Binary-512-nl547-np33-rf0-itq (query)             12_238.69       125.71    12_364.40       0.3156          NaN        10.44
-IVF-Binary-512-nl547-np23-rf5-itq (query)             12_238.69       134.65    12_373.34       0.6189     0.001047        10.44
-IVF-Binary-512-nl547-np23-rf10-itq (query)            12_238.69       168.10    12_406.79       0.7517     0.000487        10.44
-IVF-Binary-512-nl547-np23-rf20-itq (query)            12_238.69       221.96    12_460.65       0.8590     0.000208        10.44
-IVF-Binary-512-nl547-np27-rf5-itq (query)             12_238.69       145.33    12_384.02       0.6181     0.001048        10.44
-IVF-Binary-512-nl547-np27-rf10-itq (query)            12_238.69       180.04    12_418.73       0.7513     0.000483        10.44
-IVF-Binary-512-nl547-np27-rf20-itq (query)            12_238.69       236.10    12_474.79       0.8601     0.000199        10.44
-IVF-Binary-512-nl547-np33-rf5-itq (query)             12_238.69       164.83    12_403.52       0.6166     0.001055        10.44
-IVF-Binary-512-nl547-np33-rf10-itq (query)            12_238.69       196.57    12_435.26       0.7498     0.000486        10.44
-IVF-Binary-512-nl547-np33-rf20-itq (query)            12_238.69       257.88    12_496.56       0.8594     0.000198        10.44
-IVF-Binary-512-nl547-itq (self)                       12_238.69     1_676.83    13_915.52       0.7503     0.000482        10.44
+ExhaustiveBinary-512-itq_no_rr (query)                 2_591.70       825.77     3_417.47       0.3035          NaN         9.22
+ExhaustiveBinary-512-itq-rf5 (query)                   2_591.70       866.10     3_457.80       0.5988     0.001175         9.22
+ExhaustiveBinary-512-itq-rf10 (query)                  2_591.70       931.87     3_523.57       0.7344     0.000548         9.22
+ExhaustiveBinary-512-itq-rf20 (query)                  2_591.70     1_019.89     3_611.59       0.8497     0.000226         9.22
+ExhaustiveBinary-512-itq (self)                        2_591.70     9_161.15    11_752.85       0.7336     0.000546         9.22
+--------------------------------------------------------------------------------------------------------------------------------
+ExhaustiveBinary-32-signed_no_rr (query)                 159.35       606.85       766.20       0.0588          NaN         0.58
+ExhaustiveBinary-32-signed-rf5 (query)                   159.35       641.50       800.85       0.1297     0.011294         0.58
+ExhaustiveBinary-32-signed-rf10 (query)                  159.35       681.12       840.47       0.1862     0.007851         0.58
+ExhaustiveBinary-32-signed-rf20 (query)                  159.35       756.77       916.13       0.2706     0.005257         0.58
+ExhaustiveBinary-32-signed (self)                        159.35     6_799.28     6_958.63       0.1885     0.007670         0.58
+--------------------------------------------------------------------------------------------------------------------------------
+IVF-Binary-256-nl273-np13-rf0-random (query)           1_899.64        65.85     1_965.49       0.2193          NaN         5.79
+IVF-Binary-256-nl273-np16-rf0-random (query)           1_899.64        68.00     1_967.63       0.2181          NaN         5.79
+IVF-Binary-256-nl273-np23-rf0-random (query)           1_899.64        79.83     1_979.47       0.2170          NaN         5.79
+IVF-Binary-256-nl273-np13-rf5-random (query)           1_899.64        81.79     1_981.43       0.4460     0.002467         5.79
+IVF-Binary-256-nl273-np13-rf10-random (query)          1_899.64       107.63     2_007.27       0.5773     0.001353         5.79
+IVF-Binary-256-nl273-np13-rf20-random (query)          1_899.64       154.61     2_054.25       0.7143     0.000676         5.79
+IVF-Binary-256-nl273-np16-rf5-random (query)           1_899.64        88.57     1_988.21       0.4441     0.002485         5.79
+IVF-Binary-256-nl273-np16-rf10-random (query)          1_899.64       117.98     2_017.61       0.5757     0.001359         5.79
+IVF-Binary-256-nl273-np16-rf20-random (query)          1_899.64       167.11     2_066.75       0.7130     0.000677         5.79
+IVF-Binary-256-nl273-np23-rf5-random (query)           1_899.64       105.43     2_005.07       0.4416     0.002508         5.79
+IVF-Binary-256-nl273-np23-rf10-random (query)          1_899.64       137.64     2_037.27       0.5727     0.001375         5.79
+IVF-Binary-256-nl273-np23-rf20-random (query)          1_899.64       191.12     2_090.75       0.7101     0.000688         5.79
+IVF-Binary-256-nl273-random (self)                     1_899.64     1_183.25     3_082.88       0.5747     0.001354         5.79
+--------------------------------------------------------------------------------------------------------------------------------
+IVF-Binary-256-nl387-np19-rf0-random (query)           2_186.86        61.33     2_248.19       0.2185          NaN         5.81
+IVF-Binary-256-nl387-np27-rf0-random (query)           2_186.86        72.35     2_259.21       0.2168          NaN         5.81
+IVF-Binary-256-nl387-np19-rf5-random (query)           2_186.86        86.58     2_273.44       0.4459     0.002463         5.81
+IVF-Binary-256-nl387-np19-rf10-random (query)          2_186.86       113.06     2_299.92       0.5775     0.001347         5.81
+IVF-Binary-256-nl387-np19-rf20-random (query)          2_186.86       158.06     2_344.92       0.7151     0.000670         5.81
+IVF-Binary-256-nl387-np27-rf5-random (query)           2_186.86       103.27     2_290.13       0.4423     0.002500         5.81
+IVF-Binary-256-nl387-np27-rf10-random (query)          2_186.86       133.09     2_319.95       0.5735     0.001369         5.81
+IVF-Binary-256-nl387-np27-rf20-random (query)          2_186.86       183.39     2_370.25       0.7108     0.000685         5.81
+IVF-Binary-256-nl387-random (self)                     2_186.86     1_130.92     3_317.78       0.5768     0.001341         5.81
+--------------------------------------------------------------------------------------------------------------------------------
+IVF-Binary-256-nl547-np23-rf0-random (query)           2_598.62        58.77     2_657.39       0.2199          NaN         5.83
+IVF-Binary-256-nl547-np27-rf0-random (query)           2_598.62        62.94     2_661.56       0.2186          NaN         5.83
+IVF-Binary-256-nl547-np33-rf0-random (query)           2_598.62        71.13     2_669.75       0.2176          NaN         5.83
+IVF-Binary-256-nl547-np23-rf5-random (query)           2_598.62        85.52     2_684.14       0.4486     0.002437         5.83
+IVF-Binary-256-nl547-np23-rf10-random (query)          2_598.62       109.96     2_708.58       0.5813     0.001326         5.83
+IVF-Binary-256-nl547-np23-rf20-random (query)          2_598.62       153.01     2_751.63       0.7190     0.000657         5.83
+IVF-Binary-256-nl547-np27-rf5-random (query)           2_598.62        91.03     2_689.65       0.4460     0.002463         5.83
+IVF-Binary-256-nl547-np27-rf10-random (query)          2_598.62       117.08     2_715.70       0.5779     0.001344         5.83
+IVF-Binary-256-nl547-np27-rf20-random (query)          2_598.62       161.71     2_760.33       0.7158     0.000666         5.83
+IVF-Binary-256-nl547-np33-rf5-random (query)           2_598.62       100.15     2_698.77       0.4434     0.002490         5.83
+IVF-Binary-256-nl547-np33-rf10-random (query)          2_598.62       127.50     2_726.12       0.5745     0.001364         5.83
+IVF-Binary-256-nl547-np33-rf20-random (query)          2_598.62       174.57     2_773.19       0.7121     0.000680         5.83
+IVF-Binary-256-nl547-random (self)                     2_598.62     1_104.85     3_703.47       0.5803     0.001321         5.83
+--------------------------------------------------------------------------------------------------------------------------------
+IVF-Binary-256-nl273-np13-rf0-itq (query)              2_085.87        58.34     2_144.21       0.2019          NaN         5.79
+IVF-Binary-256-nl273-np16-rf0-itq (query)              2_085.87        65.97     2_151.84       0.2009          NaN         5.79
+IVF-Binary-256-nl273-np23-rf0-itq (query)              2_085.87        83.80     2_169.67       0.1996          NaN         5.79
+IVF-Binary-256-nl273-np13-rf5-itq (query)              2_085.87        87.64     2_173.50       0.4111     0.002797         5.79
+IVF-Binary-256-nl273-np13-rf10-itq (query)             2_085.87       114.81     2_200.68       0.5370     0.001578         5.79
+IVF-Binary-256-nl273-np13-rf20-itq (query)             2_085.87       163.22     2_249.09       0.6729     0.000826         5.79
+IVF-Binary-256-nl273-np16-rf5-itq (query)              2_085.87        95.83     2_181.70       0.4089     0.002823         5.79
+IVF-Binary-256-nl273-np16-rf10-itq (query)             2_085.87       126.39     2_212.26       0.5344     0.001593         5.79
+IVF-Binary-256-nl273-np16-rf20-itq (query)             2_085.87       178.69     2_264.56       0.6711     0.000830         5.79
+IVF-Binary-256-nl273-np23-rf5-itq (query)              2_085.87       117.34     2_203.20       0.4063     0.002850         5.79
+IVF-Binary-256-nl273-np23-rf10-itq (query)             2_085.87       149.05     2_234.92       0.5313     0.001613         5.79
+IVF-Binary-256-nl273-np23-rf20-itq (query)             2_085.87       207.86     2_293.73       0.6672     0.000844         5.79
+IVF-Binary-256-nl273-itq (self)                        2_085.87     1_256.41     3_342.28       0.5347     0.001578         5.79
+--------------------------------------------------------------------------------------------------------------------------------
+IVF-Binary-256-nl387-np19-rf0-itq (query)              2_377.92        54.61     2_432.54       0.2015          NaN         5.81
+IVF-Binary-256-nl387-np27-rf0-itq (query)              2_377.92        65.35     2_443.27       0.1997          NaN         5.81
+IVF-Binary-256-nl387-np19-rf5-itq (query)              2_377.92        81.50     2_459.43       0.4117     0.002789         5.81
+IVF-Binary-256-nl387-np19-rf10-itq (query)             2_377.92       107.72     2_485.65       0.5373     0.001574         5.81
+IVF-Binary-256-nl387-np19-rf20-itq (query)             2_377.92       152.62     2_530.55       0.6736     0.000819         5.81
+IVF-Binary-256-nl387-np27-rf5-itq (query)              2_377.92        94.95     2_472.88       0.4072     0.002839         5.81
+IVF-Binary-256-nl387-np27-rf10-itq (query)             2_377.92       123.61     2_501.53       0.5325     0.001604         5.81
+IVF-Binary-256-nl387-np27-rf20-itq (query)             2_377.92       174.34     2_552.27       0.6684     0.000837         5.81
+IVF-Binary-256-nl387-itq (self)                        2_377.92     1_072.24     3_450.17       0.5372     0.001560         5.81
+--------------------------------------------------------------------------------------------------------------------------------
+IVF-Binary-256-nl547-np23-rf0-itq (query)              2_797.87        56.02     2_853.89       0.2032          NaN         5.83
+IVF-Binary-256-nl547-np27-rf0-itq (query)              2_797.87        60.40     2_858.27       0.2015          NaN         5.83
+IVF-Binary-256-nl547-np33-rf0-itq (query)              2_797.87        67.81     2_865.68       0.2002          NaN         5.83
+IVF-Binary-256-nl547-np23-rf5-itq (query)              2_797.87        89.41     2_887.28       0.4146     0.002757         5.83
+IVF-Binary-256-nl547-np23-rf10-itq (query)             2_797.87       115.78     2_913.66       0.5413     0.001548         5.83
+IVF-Binary-256-nl547-np23-rf20-itq (query)             2_797.87       159.22     2_957.09       0.6779     0.000803         5.83
+IVF-Binary-256-nl547-np27-rf5-itq (query)              2_797.87        91.01     2_888.88       0.4116     0.002790         5.83
+IVF-Binary-256-nl547-np27-rf10-itq (query)             2_797.87       119.66     2_917.53       0.5376     0.001571         5.83
+IVF-Binary-256-nl547-np27-rf20-itq (query)             2_797.87       168.76     2_966.63       0.6742     0.000815         5.83
+IVF-Binary-256-nl547-np33-rf5-itq (query)              2_797.87       117.17     2_915.04       0.4085     0.002825         5.83
+IVF-Binary-256-nl547-np33-rf10-itq (query)             2_797.87       128.13     2_926.00       0.5336     0.001598         5.83
+IVF-Binary-256-nl547-np33-rf20-itq (query)             2_797.87       179.41     2_977.28       0.6700     0.000832         5.83
+IVF-Binary-256-nl547-itq (self)                        2_797.87     1_119.98     3_917.85       0.5410     0.001537         5.83
+--------------------------------------------------------------------------------------------------------------------------------
+IVF-Binary-512-nl273-np13-rf0-random (query)           3_040.70       106.20     3_146.89       0.3155          NaN        10.40
+IVF-Binary-512-nl273-np16-rf0-random (query)           3_040.70       121.90     3_162.60       0.3150          NaN        10.40
+IVF-Binary-512-nl273-np23-rf0-random (query)           3_040.70       159.23     3_199.93       0.3143          NaN        10.40
+IVF-Binary-512-nl273-np13-rf5-random (query)           3_040.70       139.45     3_180.15       0.6202     0.001095        10.40
+IVF-Binary-512-nl273-np13-rf10-random (query)          3_040.70       169.52     3_210.22       0.7548     0.000507        10.40
+IVF-Binary-512-nl273-np13-rf20-random (query)          3_040.70       221.53     3_262.23       0.8638     0.000215        10.40
+IVF-Binary-512-nl273-np16-rf5-random (query)           3_040.70       157.58     3_198.28       0.6201     0.001092        10.40
+IVF-Binary-512-nl273-np16-rf10-random (query)          3_040.70       192.18     3_232.88       0.7559     0.000497        10.40
+IVF-Binary-512-nl273-np16-rf20-random (query)          3_040.70       255.19     3_295.88       0.8665     0.000201        10.40
+IVF-Binary-512-nl273-np23-rf5-random (query)           3_040.70       197.85     3_238.55       0.6189     0.001099        10.40
+IVF-Binary-512-nl273-np23-rf10-random (query)          3_040.70       233.25     3_273.95       0.7548     0.000500        10.40
+IVF-Binary-512-nl273-np23-rf20-random (query)          3_040.70       295.78     3_336.48       0.8659     0.000201        10.40
+IVF-Binary-512-nl273-random (self)                     3_040.70     1_890.19     4_930.89       0.7541     0.000497        10.40
+--------------------------------------------------------------------------------------------------------------------------------
+IVF-Binary-512-nl387-np19-rf0-random (query)           3_338.63       113.92     3_452.56       0.3154          NaN        10.41
+IVF-Binary-512-nl387-np27-rf0-random (query)           3_338.63       138.59     3_477.23       0.3144          NaN        10.41
+IVF-Binary-512-nl387-np19-rf5-random (query)           3_338.63       149.18     3_487.82       0.6210     0.001090        10.41
+IVF-Binary-512-nl387-np19-rf10-random (query)          3_338.63       183.33     3_521.96       0.7559     0.000502        10.41
+IVF-Binary-512-nl387-np19-rf20-random (query)          3_338.63       237.61     3_576.24       0.8653     0.000209        10.41
+IVF-Binary-512-nl387-np27-rf5-random (query)           3_338.63       185.94     3_524.58       0.6193     0.001096        10.41
+IVF-Binary-512-nl387-np27-rf10-random (query)          3_338.63       219.73     3_558.36       0.7552     0.000499        10.41
+IVF-Binary-512-nl387-np27-rf20-random (query)          3_338.63       281.46     3_620.10       0.8661     0.000201        10.41
+IVF-Binary-512-nl387-random (self)                     3_338.63     1_838.56     5_177.20       0.7539     0.000502        10.41
+--------------------------------------------------------------------------------------------------------------------------------
+IVF-Binary-512-nl547-np23-rf0-random (query)           3_759.71       103.30     3_863.00       0.3162          NaN        10.44
+IVF-Binary-512-nl547-np27-rf0-random (query)           3_759.71       111.01     3_870.72       0.3157          NaN        10.44
+IVF-Binary-512-nl547-np33-rf0-random (query)           3_759.71       126.62     3_886.32       0.3148          NaN        10.44
+IVF-Binary-512-nl547-np23-rf5-random (query)           3_759.71       139.72     3_899.43       0.6225     0.001082        10.44
+IVF-Binary-512-nl547-np23-rf10-random (query)          3_759.71       185.83     3_945.54       0.7572     0.000498        10.44
+IVF-Binary-512-nl547-np23-rf20-random (query)          3_759.71       222.22     3_981.92       0.8660     0.000209        10.44
+IVF-Binary-512-nl547-np27-rf5-random (query)           3_759.71       150.32     3_910.02       0.6214     0.001086        10.44
+IVF-Binary-512-nl547-np27-rf10-random (query)          3_759.71       184.59     3_944.29       0.7570     0.000495        10.44
+IVF-Binary-512-nl547-np27-rf20-random (query)          3_759.71       238.11     3_997.81       0.8670     0.000202        10.44
+IVF-Binary-512-nl547-np33-rf5-random (query)           3_759.71       167.89     3_927.59       0.6198     0.001094        10.44
+IVF-Binary-512-nl547-np33-rf10-random (query)          3_759.71       203.80     3_963.50       0.7556     0.000497        10.44
+IVF-Binary-512-nl547-np33-rf20-random (query)          3_759.71       261.29     4_020.99       0.8666     0.000200        10.44
+IVF-Binary-512-nl547-random (self)                     3_759.71     1_707.64     5_467.34       0.7554     0.000498        10.44
+--------------------------------------------------------------------------------------------------------------------------------
+IVF-Binary-512-nl273-np13-rf0-itq (query)              3_316.08       108.77     3_424.85       0.3057          NaN        10.40
+IVF-Binary-512-nl273-np16-rf0-itq (query)              3_316.08       124.35     3_440.43       0.3051          NaN        10.40
+IVF-Binary-512-nl273-np23-rf0-itq (query)              3_316.08       161.87     3_477.95       0.3043          NaN        10.40
+IVF-Binary-512-nl273-np13-rf5-itq (query)              3_316.08       142.50     3_458.58       0.6012     0.001167        10.40
+IVF-Binary-512-nl273-np13-rf10-itq (query)             3_316.08       172.40     3_488.49       0.7359     0.000550        10.40
+IVF-Binary-512-nl273-np13-rf20-itq (query)             3_316.08       225.53     3_541.61       0.8491     0.000237        10.40
+IVF-Binary-512-nl273-np16-rf5-itq (query)              3_316.08       160.49     3_476.57       0.6011     0.001164        10.40
+IVF-Binary-512-nl273-np16-rf10-itq (query)             3_316.08       193.82     3_509.90       0.7364     0.000542        10.40
+IVF-Binary-512-nl273-np16-rf20-itq (query)             3_316.08       247.32     3_563.40       0.8513     0.000224        10.40
+IVF-Binary-512-nl273-np23-rf5-itq (query)              3_316.08       201.06     3_517.15       0.6000     0.001169        10.40
+IVF-Binary-512-nl273-np23-rf10-itq (query)             3_316.08       236.34     3_552.43       0.7355     0.000544        10.40
+IVF-Binary-512-nl273-np23-rf20-itq (query)             3_316.08       317.96     3_634.04       0.8503     0.000225        10.40
+IVF-Binary-512-nl273-itq (self)                        3_316.08     1_924.78     5_240.86       0.7360     0.000539        10.40
+--------------------------------------------------------------------------------------------------------------------------------
+IVF-Binary-512-nl387-np19-rf0-itq (query)              3_614.82       113.63     3_728.45       0.3056          NaN        10.41
+IVF-Binary-512-nl387-np27-rf0-itq (query)              3_614.82       143.03     3_757.85       0.3044          NaN        10.41
+IVF-Binary-512-nl387-np19-rf5-itq (query)              3_614.82       147.93     3_762.74       0.6017     0.001163        10.41
+IVF-Binary-512-nl387-np19-rf10-itq (query)             3_614.82       176.72     3_791.54       0.7367     0.000545        10.41
+IVF-Binary-512-nl387-np19-rf20-itq (query)             3_614.82       228.26     3_843.08       0.8505     0.000231        10.41
+IVF-Binary-512-nl387-np27-rf5-itq (query)              3_614.82       179.83     3_794.65       0.6001     0.001168        10.41
+IVF-Binary-512-nl387-np27-rf10-itq (query)             3_614.82       212.96     3_827.78       0.7357     0.000543        10.41
+IVF-Binary-512-nl387-np27-rf20-itq (query)             3_614.82       267.44     3_882.26       0.8505     0.000224        10.41
+IVF-Binary-512-nl387-itq (self)                        3_614.82     1_783.78     5_398.60       0.7359     0.000544        10.41
+--------------------------------------------------------------------------------------------------------------------------------
+IVF-Binary-512-nl547-np23-rf0-itq (query)              4_049.58       103.03     4_152.61       0.3063          NaN        10.44
+IVF-Binary-512-nl547-np27-rf0-itq (query)              4_049.58       122.04     4_171.62       0.3054          NaN        10.44
+IVF-Binary-512-nl547-np33-rf0-itq (query)              4_049.58       138.62     4_188.20       0.3045          NaN        10.44
+IVF-Binary-512-nl547-np23-rf5-itq (query)              4_049.58       139.05     4_188.63       0.6033     0.001155        10.44
+IVF-Binary-512-nl547-np23-rf10-itq (query)             4_049.58       164.60     4_214.18       0.7380     0.000543        10.44
+IVF-Binary-512-nl547-np23-rf20-itq (query)             4_049.58       230.31     4_279.89       0.8514     0.000231        10.44
+IVF-Binary-512-nl547-np27-rf5-itq (query)              4_049.58       147.11     4_196.69       0.6023     0.001158        10.44
+IVF-Binary-512-nl547-np27-rf10-itq (query)             4_049.58       176.95     4_226.53       0.7376     0.000539        10.44
+IVF-Binary-512-nl547-np27-rf20-itq (query)             4_049.58       229.25     4_278.83       0.8521     0.000223        10.44
+IVF-Binary-512-nl547-np33-rf5-itq (query)              4_049.58       163.15     4_212.72       0.6008     0.001164        10.44
+IVF-Binary-512-nl547-np33-rf10-itq (query)             4_049.58       204.81     4_254.39       0.7364     0.000541        10.44
+IVF-Binary-512-nl547-np33-rf20-itq (query)             4_049.58       270.51     4_320.09       0.8512     0.000223        10.44
+IVF-Binary-512-nl547-itq (self)                        4_049.58     1_638.64     5_688.22       0.7374     0.000541        10.44
+--------------------------------------------------------------------------------------------------------------------------------
+IVF-Binary-32-nl273-np13-rf0-signed (query)              898.65        40.52       939.17       0.0688          NaN         1.76
+IVF-Binary-32-nl273-np16-rf0-signed (query)              898.65        48.58       947.24       0.0632          NaN         1.76
+IVF-Binary-32-nl273-np23-rf0-signed (query)              898.65        64.85       963.50       0.0610          NaN         1.76
+IVF-Binary-32-nl273-np13-rf5-signed (query)              898.65        59.37       958.02       0.1488     0.009993         1.76
+IVF-Binary-32-nl273-np13-rf10-signed (query)             898.65        79.90       978.55       0.2108     0.006867         1.76
+IVF-Binary-32-nl273-np13-rf20-signed (query)             898.65       113.42     1_012.08       0.3022     0.004533         1.76
+IVF-Binary-32-nl273-np16-rf5-signed (query)              898.65        67.24       965.89       0.1404     0.010416         1.76
+IVF-Binary-32-nl273-np16-rf10-signed (query)             898.65        88.66       987.32       0.2007     0.007189         1.76
+IVF-Binary-32-nl273-np16-rf20-signed (query)             898.65       124.31     1_022.96       0.2905     0.004741         1.76
+IVF-Binary-32-nl273-np23-rf5-signed (query)              898.65        85.87       984.52       0.1354     0.010757         1.76
+IVF-Binary-32-nl273-np23-rf10-signed (query)             898.65       107.88     1_006.53       0.1934     0.007454         1.76
+IVF-Binary-32-nl273-np23-rf20-signed (query)             898.65       146.30     1_044.95       0.2806     0.004966         1.76
+IVF-Binary-32-nl273-signed (self)                        898.65       891.98     1_790.63       0.2029     0.007019         1.76
+--------------------------------------------------------------------------------------------------------------------------------
+IVF-Binary-32-nl387-np19-rf0-signed (query)            1_198.12        42.19     1_240.31       0.0656          NaN         1.77
+IVF-Binary-32-nl387-np27-rf0-signed (query)            1_198.12        56.41     1_254.54       0.0625          NaN         1.77
+IVF-Binary-32-nl387-np19-rf5-signed (query)            1_198.12        60.74     1_258.86       0.1445     0.010057         1.77
+IVF-Binary-32-nl387-np19-rf10-signed (query)           1_198.12        79.19     1_277.31       0.2081     0.006872         1.77
+IVF-Binary-32-nl387-np19-rf20-signed (query)           1_198.12       130.90     1_329.03       0.3001     0.004518         1.77
+IVF-Binary-32-nl387-np27-rf5-signed (query)            1_198.12        75.83     1_273.96       0.1372     0.010530         1.77
+IVF-Binary-32-nl387-np27-rf10-signed (query)           1_198.12        96.30     1_294.42       0.1979     0.007261         1.77
+IVF-Binary-32-nl387-np27-rf20-signed (query)           1_198.12       130.37     1_328.50       0.2858     0.004815         1.77
+IVF-Binary-32-nl387-signed (self)                      1_198.12       793.26     1_991.39       0.2098     0.006741         1.77
+--------------------------------------------------------------------------------------------------------------------------------
+IVF-Binary-32-nl547-np23-rf0-signed (query)            1_652.29        39.89     1_692.18       0.0677          NaN         1.79
+IVF-Binary-32-nl547-np27-rf0-signed (query)            1_652.29        43.74     1_696.02       0.0655          NaN         1.79
+IVF-Binary-32-nl547-np33-rf0-signed (query)            1_652.29        53.52     1_705.80       0.0635          NaN         1.79
+IVF-Binary-32-nl547-np23-rf5-signed (query)            1_652.29        57.57     1_709.86       0.1486     0.009791         1.79
+IVF-Binary-32-nl547-np23-rf10-signed (query)           1_652.29        76.50     1_728.79       0.2131     0.006681         1.79
+IVF-Binary-32-nl547-np23-rf20-signed (query)           1_652.29       109.52     1_761.81       0.3085     0.004339         1.79
+IVF-Binary-32-nl547-np27-rf5-signed (query)            1_652.29        61.80     1_714.09       0.1443     0.010053         1.79
+IVF-Binary-32-nl547-np27-rf10-signed (query)           1_652.29        80.08     1_732.37       0.2068     0.006903         1.79
+IVF-Binary-32-nl547-np27-rf20-signed (query)           1_652.29       114.03     1_766.31       0.2993     0.004526         1.79
+IVF-Binary-32-nl547-np33-rf5-signed (query)            1_652.29        69.56     1_721.85       0.1397     0.010380         1.79
+IVF-Binary-32-nl547-np33-rf10-signed (query)           1_652.29        88.14     1_740.43       0.2001     0.007158         1.79
+IVF-Binary-32-nl547-np33-rf20-signed (query)           1_652.29       123.22     1_775.50       0.2893     0.004724         1.79
+IVF-Binary-32-nl547-signed (self)                      1_652.29       744.40     2_396.69       0.2155     0.006553         1.79
 --------------------------------------------------------------------------------------------------------------------------------
 </code></pre>
 </details>
@@ -438,179 +563,235 @@ IVF-Binary-512-nl547-itq (self)                       12_238.69     1_676.83    
 
 <details>
 <summary><b>Binary - Euclidean (Correlated)</b>:</summary>
+</br>
 <pre><code>
 ================================================================================================================================
 Benchmark: 150k cells, 32D - Binary Quantisation
 ================================================================================================================================
 Method                                               Build (ms)   Query (ms)   Total (ms)     Recall@k   Dist Error    Size (MB)
 --------------------------------------------------------------------------------------------------------------------------------
-Exhaustive (query)                                         3.00     1_608.44     1_611.44       1.0000     0.000000        18.31
-Exhaustive (self)                                          3.00    16_495.26    16_498.26       1.0000     0.000000        18.31
+Exhaustive (query)                                         2.96     1_575.98     1_578.94       1.0000     0.000000        18.31
+Exhaustive (self)                                          2.96    16_510.17    16_513.13       1.0000     0.000000        18.31
 --------------------------------------------------------------------------------------------------------------------------------
-ExhaustiveBinary-256-random_no_rr (query)              1_249.33       492.81     1_742.14       0.1352          NaN         4.61
-ExhaustiveBinary-256-random-rf5 (query)                1_249.33       544.47     1_793.79       0.3069     0.751173         4.61
-ExhaustiveBinary-256-random-rf10 (query)               1_249.33       592.25     1_841.57       0.4237     0.452899         4.61
-ExhaustiveBinary-256-random-rf20 (query)               1_249.33       684.82     1_934.15       0.5614     0.256662         4.61
+ExhaustiveBinary-256-random_no_rr (query)              1_155.97       486.10     1_642.07       0.1352          NaN         4.61
+ExhaustiveBinary-256-random-rf5 (query)                1_155.97       539.60     1_695.57       0.3069     0.751173         4.61
+ExhaustiveBinary-256-random-rf10 (query)               1_155.97       619.33     1_775.31       0.4237     0.452899         4.61
+ExhaustiveBinary-256-random-rf20 (query)               1_155.97       667.86     1_823.83       0.5614     0.256662         4.61
+ExhaustiveBinary-256-random (self)                     1_155.97     5_781.42     6_937.40       0.4294     0.437191         4.61
 --------------------------------------------------------------------------------------------------------------------------------
-ExhaustiveBinary-256-random (self)                     1_249.33     5_907.29     7_156.62       0.4294     0.437191         4.61
-ExhaustiveBinary-256-itq_no_rr (query)                 9_174.21       491.52     9_665.73       0.1197          NaN         4.61
-ExhaustiveBinary-256-itq-rf5 (query)                   9_174.21       527.58     9_701.79       0.2765     0.831692         4.61
-ExhaustiveBinary-256-itq-rf10 (query)                  9_174.21       582.43     9_756.65       0.3861     0.506502         4.61
-ExhaustiveBinary-256-itq-rf20 (query)                  9_174.21       668.76     9_842.97       0.5230     0.288077         4.61
-ExhaustiveBinary-256-itq (self)                        9_174.21     5_753.64    14_927.86       0.3927     0.490943         4.61
+ExhaustiveBinary-256-itq_no_rr (query)                 1_359.10       488.36     1_847.47       0.1323          NaN         4.61
+ExhaustiveBinary-256-itq-rf5 (query)                   1_359.10       525.00     1_884.11       0.3010     0.745496         4.61
+ExhaustiveBinary-256-itq-rf10 (query)                  1_359.10       571.54     1_930.64       0.4149     0.448765         4.61
+ExhaustiveBinary-256-itq-rf20 (query)                  1_359.10       681.50     2_040.61       0.5534     0.252544         4.61
+ExhaustiveBinary-256-itq (self)                        1_359.10     5_694.74     7_053.84       0.4203     0.435859         4.61
 --------------------------------------------------------------------------------------------------------------------------------
-ExhaustiveBinary-512-random_no_rr (query)              2_452.85       833.52     3_286.36       0.2248          NaN         9.22
-ExhaustiveBinary-512-random-rf5 (query)                2_452.85       876.28     3_329.13       0.4749     0.355326         9.22
-ExhaustiveBinary-512-random-rf10 (query)               2_452.85       928.48     3_381.33       0.6150     0.188541         9.22
-ExhaustiveBinary-512-random-rf20 (query)               2_452.85     1_038.71     3_491.56       0.7526     0.090979         9.22
-ExhaustiveBinary-512-random (self)                     2_452.85     9_382.31    11_835.16       0.6185     0.184365         9.22
-ExhaustiveBinary-512-itq_no_rr (query)                10_342.76       828.20    11_170.96       0.2230          NaN         9.22
-ExhaustiveBinary-512-itq-rf5 (query)                  10_342.76       992.07    11_334.83       0.4733     0.353636         9.22
-ExhaustiveBinary-512-itq-rf10 (query)                 10_342.76     1_139.92    11_482.68       0.6117     0.187548         9.22
-ExhaustiveBinary-512-itq-rf20 (query)                 10_342.76     1_220.50    11_563.26       0.7467     0.091104         9.22
-ExhaustiveBinary-512-itq (self)                       10_342.76    10_616.56    20_959.32       0.6142     0.183153         9.22
+ExhaustiveBinary-512-random_no_rr (query)              2_303.82       823.17     3_126.99       0.2248          NaN         9.22
+ExhaustiveBinary-512-random-rf5 (query)                2_303.82       864.07     3_167.89       0.4749     0.355326         9.22
+ExhaustiveBinary-512-random-rf10 (query)               2_303.82       924.08     3_227.89       0.6150     0.188541         9.22
+ExhaustiveBinary-512-random-rf20 (query)               2_303.82     1_012.54     3_316.35       0.7526     0.090979         9.22
+ExhaustiveBinary-512-random (self)                     2_303.82     9_127.62    11_431.44       0.6185     0.184365         9.22
 --------------------------------------------------------------------------------------------------------------------------------
-IVF-Binary-256-nl273-np13-rf0-random (query)           2_241.20        51.25     2_292.45       0.1443          NaN         5.79
-IVF-Binary-256-nl273-np16-rf0-random (query)           2_241.20        59.64     2_300.84       0.1389          NaN         5.79
-IVF-Binary-256-nl273-np23-rf0-random (query)           2_241.20        85.90     2_327.10       0.1371          NaN         5.79
-IVF-Binary-256-nl273-np13-rf5-random (query)           2_241.20        77.77     2_318.97       0.3253     0.693086         5.79
-IVF-Binary-256-nl273-np13-rf10-random (query)          2_241.20       119.28     2_360.49       0.4471     0.412061         5.79
-IVF-Binary-256-nl273-np13-rf20-random (query)          2_241.20       159.33     2_400.54       0.5876     0.229141         5.79
-IVF-Binary-256-nl273-np16-rf5-random (query)           2_241.20        97.06     2_338.26       0.3165     0.721914         5.79
-IVF-Binary-256-nl273-np16-rf10-random (query)          2_241.20       113.18     2_354.38       0.4368     0.431051         5.79
-IVF-Binary-256-nl273-np16-rf20-random (query)          2_241.20       155.61     2_396.81       0.5764     0.241195         5.79
-IVF-Binary-256-nl273-np23-rf5-random (query)           2_241.20       107.01     2_348.22       0.3123     0.739522         5.79
-IVF-Binary-256-nl273-np23-rf10-random (query)          2_241.20       138.21     2_379.41       0.4312     0.443199         5.79
-IVF-Binary-256-nl273-np23-rf20-random (query)          2_241.20       193.29     2_434.50       0.5697     0.249326         5.79
-IVF-Binary-256-nl273-random (self)                     2_241.20     1_094.17     3_335.37       0.4422     0.416770         5.79
-IVF-Binary-256-nl387-np19-rf0-random (query)           2_691.12        60.02     2_751.14       0.1403          NaN         5.80
-IVF-Binary-256-nl387-np27-rf0-random (query)           2_691.12        66.98     2_758.10       0.1380          NaN         5.80
-IVF-Binary-256-nl387-np19-rf5-random (query)           2_691.12        86.43     2_777.55       0.3203     0.707597         5.80
-IVF-Binary-256-nl387-np19-rf10-random (query)          2_691.12       129.82     2_820.94       0.4414     0.420873         5.80
-IVF-Binary-256-nl387-np19-rf20-random (query)          2_691.12       186.54     2_877.66       0.5825     0.233592         5.80
-IVF-Binary-256-nl387-np27-rf5-random (query)           2_691.12       102.96     2_794.08       0.3145     0.730872         5.80
-IVF-Binary-256-nl387-np27-rf10-random (query)          2_691.12       140.02     2_831.14       0.4334     0.437743         5.80
-IVF-Binary-256-nl387-np27-rf20-random (query)          2_691.12       200.44     2_891.56       0.5726     0.245415         5.80
-IVF-Binary-256-nl387-random (self)                     2_691.12     1_166.61     3_857.73       0.4467     0.406727         5.80
-IVF-Binary-256-nl547-np23-rf0-random (query)           3_052.93        59.75     3_112.68       0.1414          NaN         5.82
-IVF-Binary-256-nl547-np27-rf0-random (query)           3_052.93        66.29     3_119.22       0.1400          NaN         5.82
-IVF-Binary-256-nl547-np33-rf0-random (query)           3_052.93        71.91     3_124.85       0.1386          NaN         5.82
-IVF-Binary-256-nl547-np23-rf5-random (query)           3_052.93        88.89     3_141.83       0.3224     0.697059         5.82
-IVF-Binary-256-nl547-np23-rf10-random (query)          3_052.93       116.13     3_169.06       0.4446     0.412600         5.82
-IVF-Binary-256-nl547-np23-rf20-random (query)          3_052.93       150.80     3_203.74       0.5866     0.227694         5.82
-IVF-Binary-256-nl547-np27-rf5-random (query)           3_052.93        84.13     3_137.07       0.3186     0.712202         5.82
-IVF-Binary-256-nl547-np27-rf10-random (query)          3_052.93       107.16     3_160.10       0.4393     0.423748         5.82
-IVF-Binary-256-nl547-np27-rf20-random (query)          3_052.93       144.36     3_197.29       0.5799     0.235834         5.82
-IVF-Binary-256-nl547-np33-rf5-random (query)           3_052.93        88.34     3_141.27       0.3148     0.727786         5.82
-IVF-Binary-256-nl547-np33-rf10-random (query)          3_052.93       114.47     3_167.40       0.4343     0.435387         5.82
-IVF-Binary-256-nl547-np33-rf20-random (query)          3_052.93       161.92     3_214.85       0.5738     0.243853         5.82
-IVF-Binary-256-nl547-random (self)                     3_052.93       983.23     4_036.16       0.4498     0.399477         5.82
-IVF-Binary-256-nl273-np13-rf0-itq (query)             16_093.08        53.10    16_146.19       0.1299          NaN         5.79
-IVF-Binary-256-nl273-np16-rf0-itq (query)             16_093.08        58.50    16_151.59       0.1239          NaN         5.79
-IVF-Binary-256-nl273-np23-rf0-itq (query)             16_093.08        77.68    16_170.76       0.1220          NaN         5.79
-IVF-Binary-256-nl273-np13-rf5-itq (query)             16_093.08        83.11    16_176.19       0.2980     0.760619         5.79
-IVF-Binary-256-nl273-np13-rf10-itq (query)            16_093.08        96.96    16_190.05       0.4143     0.455526         5.79
-IVF-Binary-256-nl273-np13-rf20-itq (query)            16_093.08       138.56    16_231.64       0.5536     0.256381         5.79
-IVF-Binary-256-nl273-np16-rf5-itq (query)             16_093.08        81.89    16_174.98       0.2866     0.799417         5.79
-IVF-Binary-256-nl273-np16-rf10-itq (query)            16_093.08       108.06    16_201.14       0.4006     0.481416         5.79
-IVF-Binary-256-nl273-np16-rf20-itq (query)            16_093.08       162.28    16_255.36       0.5395     0.272093         5.79
-IVF-Binary-256-nl273-np23-rf5-itq (query)             16_093.08       105.11    16_198.20       0.2825     0.819698         5.79
-IVF-Binary-256-nl273-np23-rf10-itq (query)            16_093.08       134.93    16_228.02       0.3941     0.496934         5.79
-IVF-Binary-256-nl273-np23-rf20-itq (query)            16_093.08       198.88    16_291.96       0.5322     0.282010         5.79
-IVF-Binary-256-nl273-itq (self)                       16_093.08     1_178.02    17_271.11       0.4069     0.467068         5.79
-IVF-Binary-256-nl387-np19-rf0-itq (query)             10_828.90        52.39    10_881.28       0.1259          NaN         5.80
-IVF-Binary-256-nl387-np27-rf0-itq (query)             10_828.90        63.44    10_892.34       0.1230          NaN         5.80
-IVF-Binary-256-nl387-np19-rf5-itq (query)             10_828.90        75.52    10_904.42       0.2906     0.783300         5.80
-IVF-Binary-256-nl387-np19-rf10-itq (query)            10_828.90       103.51    10_932.41       0.4060     0.469739         5.80
-IVF-Binary-256-nl387-np19-rf20-itq (query)            10_828.90       142.77    10_971.66       0.5456     0.264006         5.80
-IVF-Binary-256-nl387-np27-rf5-itq (query)             10_828.90        89.00    10_917.90       0.2835     0.815136         5.80
-IVF-Binary-256-nl387-np27-rf10-itq (query)            10_828.90       115.94    10_944.84       0.3962     0.492780         5.80
-IVF-Binary-256-nl387-np27-rf20-itq (query)            10_828.90       164.36    10_993.25       0.5336     0.279398         5.80
-IVF-Binary-256-nl387-itq (self)                       10_828.90     1_071.78    11_900.68       0.4117     0.456742         5.80
-IVF-Binary-256-nl547-np23-rf0-itq (query)             11_633.78        63.86    11_697.64       0.1260          NaN         5.82
-IVF-Binary-256-nl547-np27-rf0-itq (query)             11_633.78        73.22    11_707.00       0.1239          NaN         5.82
-IVF-Binary-256-nl547-np33-rf0-itq (query)             11_633.78        81.41    11_715.19       0.1224          NaN         5.82
-IVF-Binary-256-nl547-np23-rf5-itq (query)             11_633.78       101.44    11_735.22       0.2928     0.771548         5.82
-IVF-Binary-256-nl547-np23-rf10-itq (query)            11_633.78       125.92    11_759.70       0.4099     0.459383         5.82
-IVF-Binary-256-nl547-np23-rf20-itq (query)            11_633.78       167.12    11_800.90       0.5505     0.256651         5.82
-IVF-Binary-256-nl547-np27-rf5-itq (query)             11_633.78       101.21    11_734.99       0.2882     0.792145         5.82
-IVF-Binary-256-nl547-np27-rf10-itq (query)            11_633.78       131.70    11_765.48       0.4034     0.473440         5.82
-IVF-Binary-256-nl547-np27-rf20-itq (query)            11_633.78       185.86    11_819.64       0.5420     0.266865         5.82
-IVF-Binary-256-nl547-np33-rf5-itq (query)             11_633.78       103.27    11_737.05       0.2837     0.810164         5.82
-IVF-Binary-256-nl547-np33-rf10-itq (query)            11_633.78       128.97    11_762.74       0.3981     0.485662         5.82
-IVF-Binary-256-nl547-np33-rf20-itq (query)            11_633.78       196.28    11_830.06       0.5354     0.274889         5.82
-IVF-Binary-256-nl547-itq (self)                       11_633.78     1_095.49    12_729.27       0.4154     0.447606         5.82
+ExhaustiveBinary-512-itq_no_rr (query)                 2_581.66       824.66     3_406.32       0.2201          NaN         9.22
+ExhaustiveBinary-512-itq-rf5 (query)                   2_581.66       873.30     3_454.96       0.4659     0.364676         9.22
+ExhaustiveBinary-512-itq-rf10 (query)                  2_581.66       922.95     3_504.61       0.6031     0.194711         9.22
+ExhaustiveBinary-512-itq-rf20 (query)                  2_581.66     1_016.51     3_598.17       0.7399     0.094579         9.22
+ExhaustiveBinary-512-itq (self)                        2_581.66     9_162.83    11_744.49       0.6053     0.192118         9.22
 --------------------------------------------------------------------------------------------------------------------------------
-IVF-Binary-512-nl273-np13-rf0-random (query)           3_431.23       129.95     3_561.18       0.2304          NaN        10.40
-IVF-Binary-512-nl273-np16-rf0-random (query)           3_431.23       159.41     3_590.64       0.2278          NaN        10.40
-IVF-Binary-512-nl273-np23-rf0-random (query)           3_431.23       153.37     3_584.60       0.2270          NaN        10.40
-IVF-Binary-512-nl273-np13-rf5-random (query)           3_431.23       128.22     3_559.45       0.4860     0.337755        10.40
-IVF-Binary-512-nl273-np13-rf10-random (query)          3_431.23       197.68     3_628.91       0.6273     0.176939        10.40
-IVF-Binary-512-nl273-np13-rf20-random (query)          3_431.23       220.09     3_651.33       0.7652     0.083691        10.40
-IVF-Binary-512-nl273-np16-rf5-random (query)           3_431.23       142.98     3_574.22       0.4812     0.344920        10.40
-IVF-Binary-512-nl273-np16-rf10-random (query)          3_431.23       186.98     3_618.21       0.6224     0.181309        10.40
-IVF-Binary-512-nl273-np16-rf20-random (query)          3_431.23       249.40     3_680.63       0.7602     0.086526        10.40
-IVF-Binary-512-nl273-np23-rf5-random (query)           3_431.23       181.10     3_612.33       0.4791     0.349097        10.40
-IVF-Binary-512-nl273-np23-rf10-random (query)          3_431.23       221.43     3_652.66       0.6194     0.184459        10.40
-IVF-Binary-512-nl273-np23-rf20-random (query)          3_431.23       304.76     3_735.99       0.7568     0.088670        10.40
-IVF-Binary-512-nl273-random (self)                     3_431.23     1_811.30     5_242.53       0.6260     0.177548        10.40
-IVF-Binary-512-nl387-np19-rf0-random (query)           3_701.01       103.08     3_804.09       0.2289          NaN        10.41
-IVF-Binary-512-nl387-np27-rf0-random (query)           3_701.01       146.64     3_847.65       0.2274          NaN        10.41
-IVF-Binary-512-nl387-np19-rf5-random (query)           3_701.01       162.05     3_863.06       0.4838     0.341431        10.41
-IVF-Binary-512-nl387-np19-rf10-random (query)          3_701.01       232.66     3_933.68       0.6253     0.178808        10.41
-IVF-Binary-512-nl387-np19-rf20-random (query)          3_701.01       245.30     3_946.31       0.7626     0.084984        10.41
-IVF-Binary-512-nl387-np27-rf5-random (query)           3_701.01       175.17     3_876.18       0.4809     0.347136        10.41
-IVF-Binary-512-nl387-np27-rf10-random (query)          3_701.01       197.43     3_898.44       0.6210     0.183003        10.41
-IVF-Binary-512-nl387-np27-rf20-random (query)          3_701.01       251.07     3_952.08       0.7578     0.087874        10.41
-IVF-Binary-512-nl387-random (self)                     3_701.01     1_654.96     5_355.98       0.6282     0.175444        10.41
-IVF-Binary-512-nl547-np23-rf0-random (query)           4_209.01        95.54     4_304.55       0.2295          NaN        10.43
-IVF-Binary-512-nl547-np27-rf0-random (query)           4_209.01       104.21     4_313.22       0.2286          NaN        10.43
-IVF-Binary-512-nl547-np33-rf0-random (query)           4_209.01       116.18     4_325.19       0.2277          NaN        10.43
-IVF-Binary-512-nl547-np23-rf5-random (query)           4_209.01       126.43     4_335.44       0.4844     0.340126        10.43
-IVF-Binary-512-nl547-np23-rf10-random (query)          4_209.01       154.04     4_363.06       0.6262     0.177884        10.43
-IVF-Binary-512-nl547-np23-rf20-random (query)          4_209.01       200.36     4_409.37       0.7650     0.083907        10.43
-IVF-Binary-512-nl547-np27-rf5-random (query)           4_209.01       134.32     4_343.34       0.4822     0.344431        10.43
-IVF-Binary-512-nl547-np27-rf10-random (query)          4_209.01       163.62     4_372.63       0.6234     0.180818        10.43
-IVF-Binary-512-nl547-np27-rf20-random (query)          4_209.01       212.20     4_421.21       0.7614     0.086089        10.43
-IVF-Binary-512-nl547-np33-rf5-random (query)           4_209.01       152.53     4_361.54       0.4802     0.348094        10.43
-IVF-Binary-512-nl547-np33-rf10-random (query)          4_209.01       179.94     4_388.95       0.6210     0.183289        10.43
-IVF-Binary-512-nl547-np33-rf20-random (query)          4_209.01       237.60     4_446.61       0.7585     0.087937        10.43
-IVF-Binary-512-nl547-random (self)                     4_209.01     1_519.85     5_728.86       0.6297     0.174184        10.43
-IVF-Binary-512-nl273-np13-rf0-itq (query)             13_457.90       120.86    13_578.76       0.2291          NaN        10.40
-IVF-Binary-512-nl273-np16-rf0-itq (query)             13_457.90       128.07    13_585.97       0.2262          NaN        10.40
-IVF-Binary-512-nl273-np23-rf0-itq (query)             13_457.90       153.88    13_611.79       0.2253          NaN        10.40
-IVF-Binary-512-nl273-np13-rf5-itq (query)             13_457.90       144.00    13_601.90       0.4843     0.336509        10.40
-IVF-Binary-512-nl273-np13-rf10-itq (query)            13_457.90       182.42    13_640.32       0.6241     0.176585        10.40
-IVF-Binary-512-nl273-np13-rf20-itq (query)            13_457.90       235.63    13_693.53       0.7591     0.084287        10.40
-IVF-Binary-512-nl273-np16-rf5-itq (query)             13_457.90       152.88    13_610.78       0.4795     0.344009        10.40
-IVF-Binary-512-nl273-np16-rf10-itq (query)            13_457.90       196.00    13_653.90       0.6188     0.181286        10.40
-IVF-Binary-512-nl273-np16-rf20-itq (query)            13_457.90       257.48    13_715.38       0.7539     0.087383        10.40
-IVF-Binary-512-nl273-np23-rf5-itq (query)             13_457.90       202.38    13_660.28       0.4771     0.348313        10.40
-IVF-Binary-512-nl273-np23-rf10-itq (query)            13_457.90       233.00    13_690.90       0.6158     0.184229        10.40
-IVF-Binary-512-nl273-np23-rf20-itq (query)            13_457.90       298.59    13_756.50       0.7506     0.089206        10.40
-IVF-Binary-512-nl273-itq (self)                       13_457.90     1_861.28    15_319.18       0.6214     0.177187        10.40
-IVF-Binary-512-nl387-np19-rf0-itq (query)             12_420.04       104.38    12_524.42       0.2270          NaN        10.41
-IVF-Binary-512-nl387-np27-rf0-itq (query)             12_420.04       133.04    12_553.08       0.2254          NaN        10.41
-IVF-Binary-512-nl387-np19-rf5-itq (query)             12_420.04       146.90    12_566.94       0.4814     0.341319        10.41
-IVF-Binary-512-nl387-np19-rf10-itq (query)            12_420.04       168.29    12_588.33       0.6208     0.179146        10.41
-IVF-Binary-512-nl387-np19-rf20-itq (query)            12_420.04       213.23    12_633.27       0.7560     0.085918        10.41
-IVF-Binary-512-nl387-np27-rf5-itq (query)             12_420.04       162.21    12_582.25       0.4779     0.347485        10.41
-IVF-Binary-512-nl387-np27-rf10-itq (query)            12_420.04       192.86    12_612.90       0.6167     0.183252        10.41
-IVF-Binary-512-nl387-np27-rf20-itq (query)            12_420.04       245.88    12_665.92       0.7515     0.088753        10.41
-IVF-Binary-512-nl387-itq (self)                       12_420.04     1_705.24    14_125.28       0.6234     0.175207        10.41
-IVF-Binary-512-nl547-np23-rf0-itq (query)             14_503.15        96.91    14_600.07       0.2275          NaN        10.43
-IVF-Binary-512-nl547-np27-rf0-itq (query)             14_503.15       104.80    14_607.95       0.2265          NaN        10.43
-IVF-Binary-512-nl547-np33-rf0-itq (query)             14_503.15       117.87    14_621.02       0.2256          NaN        10.43
-IVF-Binary-512-nl547-np23-rf5-itq (query)             14_503.15       127.80    14_630.96       0.4828     0.338622        10.43
-IVF-Binary-512-nl547-np23-rf10-itq (query)            14_503.15       152.97    14_656.13       0.6224     0.177249        10.43
-IVF-Binary-512-nl547-np23-rf20-itq (query)            14_503.15       201.33    14_704.49       0.7590     0.084001        10.43
-IVF-Binary-512-nl547-np27-rf5-itq (query)             14_503.15       136.31    14_639.46       0.4801     0.343195        10.43
-IVF-Binary-512-nl547-np27-rf10-itq (query)            14_503.15       164.37    14_667.53       0.6191     0.180399        10.43
-IVF-Binary-512-nl547-np27-rf20-itq (query)            14_503.15       212.50    14_715.66       0.7552     0.086330        10.43
-IVF-Binary-512-nl547-np33-rf5-itq (query)             14_503.15       149.99    14_653.14       0.4780     0.346884        10.43
-IVF-Binary-512-nl547-np33-rf10-itq (query)            14_503.15       180.42    14_683.58       0.6168     0.182693        10.43
-IVF-Binary-512-nl547-np33-rf20-itq (query)            14_503.15       232.69    14_735.84       0.7527     0.087837        10.43
-IVF-Binary-512-nl547-itq (self)                       14_503.15     1_535.90    16_039.05       0.6257     0.173003        10.43
+ExhaustiveBinary-32-signed_no_rr (query)                 156.61       616.34       772.95       0.0127          NaN         0.58
+ExhaustiveBinary-32-signed-rf5 (query)                   156.61       629.52       786.13       0.0523     2.784656         0.58
+ExhaustiveBinary-32-signed-rf10 (query)                  156.61       659.58       816.19       0.0945     1.948956         0.58
+ExhaustiveBinary-32-signed-rf20 (query)                  156.61       743.79       900.40       0.1639     1.328894         0.58
+ExhaustiveBinary-32-signed (self)                        156.61     6_669.36     6_825.97       0.0975     1.917524         0.58
+--------------------------------------------------------------------------------------------------------------------------------
+IVF-Binary-256-nl273-np13-rf0-random (query)           1_938.78        48.96     1_987.74       0.1441          NaN         5.79
+IVF-Binary-256-nl273-np16-rf0-random (query)           1_938.78        56.45     1_995.23       0.1389          NaN         5.79
+IVF-Binary-256-nl273-np23-rf0-random (query)           1_938.78        73.57     2_012.35       0.1372          NaN         5.79
+IVF-Binary-256-nl273-np13-rf5-random (query)           1_938.78        73.44     2_012.22       0.3248     0.694129         5.79
+IVF-Binary-256-nl273-np13-rf10-random (query)          1_938.78        95.48     2_034.26       0.4466     0.414033         5.79
+IVF-Binary-256-nl273-np13-rf20-random (query)          1_938.78       140.16     2_078.94       0.5872     0.229701         5.79
+IVF-Binary-256-nl273-np16-rf5-random (query)           1_938.78        82.91     2_021.69       0.3162     0.723258         5.79
+IVF-Binary-256-nl273-np16-rf10-random (query)          1_938.78       107.64     2_046.42       0.4366     0.432150         5.79
+IVF-Binary-256-nl273-np16-rf20-random (query)          1_938.78       151.99     2_090.77       0.5767     0.241241         5.79
+IVF-Binary-256-nl273-np23-rf5-random (query)           1_938.78       104.09     2_042.87       0.3125     0.740161         5.79
+IVF-Binary-256-nl273-np23-rf10-random (query)          1_938.78       127.66     2_066.44       0.4310     0.444567         5.79
+IVF-Binary-256-nl273-np23-rf20-random (query)          1_938.78       174.73     2_113.52       0.5701     0.249304         5.79
+IVF-Binary-256-nl273-random (self)                     1_938.78     1_074.70     3_013.48       0.4421     0.417017         5.79
+--------------------------------------------------------------------------------------------------------------------------------
+IVF-Binary-256-nl387-np19-rf0-random (query)           2_224.62        54.08     2_278.70       0.1402          NaN         5.80
+IVF-Binary-256-nl387-np27-rf0-random (query)           2_224.62        65.46     2_290.08       0.1379          NaN         5.80
+IVF-Binary-256-nl387-np19-rf5-random (query)           2_224.62        77.00     2_301.61       0.3201     0.708580         5.80
+IVF-Binary-256-nl387-np19-rf10-random (query)          2_224.62       100.53     2_325.14       0.4412     0.421108         5.80
+IVF-Binary-256-nl387-np19-rf20-random (query)          2_224.62       139.80     2_364.42       0.5822     0.233784         5.80
+IVF-Binary-256-nl387-np27-rf5-random (query)           2_224.62        91.59     2_316.21       0.3145     0.731502         5.80
+IVF-Binary-256-nl387-np27-rf10-random (query)          2_224.62       117.27     2_341.89       0.4333     0.437798         5.80
+IVF-Binary-256-nl387-np27-rf20-random (query)          2_224.62       160.38     2_384.99       0.5721     0.245997         5.80
+IVF-Binary-256-nl387-random (self)                     2_224.62     1_005.99     3_230.61       0.4462     0.407720         5.80
+--------------------------------------------------------------------------------------------------------------------------------
+IVF-Binary-256-nl547-np23-rf0-random (query)           2_666.87        51.18     2_718.06       0.1413          NaN         5.82
+IVF-Binary-256-nl547-np27-rf0-random (query)           2_666.87        54.19     2_721.06       0.1399          NaN         5.82
+IVF-Binary-256-nl547-np33-rf0-random (query)           2_666.87        60.48     2_727.35       0.1382          NaN         5.82
+IVF-Binary-256-nl547-np23-rf5-random (query)           2_666.87        73.14     2_740.01       0.3224     0.696633         5.82
+IVF-Binary-256-nl547-np23-rf10-random (query)          2_666.87        94.93     2_761.81       0.4452     0.411720         5.82
+IVF-Binary-256-nl547-np23-rf20-random (query)          2_666.87       133.80     2_800.67       0.5868     0.227456         5.82
+IVF-Binary-256-nl547-np27-rf5-random (query)           2_666.87        77.57     2_744.44       0.3185     0.710966         5.82
+IVF-Binary-256-nl547-np27-rf10-random (query)          2_666.87       101.07     2_767.95       0.4401     0.422530         5.82
+IVF-Binary-256-nl547-np27-rf20-random (query)          2_666.87       140.86     2_807.73       0.5800     0.235760         5.82
+IVF-Binary-256-nl547-np33-rf5-random (query)           2_666.87        85.34     2_752.22       0.3148     0.727129         5.82
+IVF-Binary-256-nl547-np33-rf10-random (query)          2_666.87       116.68     2_783.55       0.4348     0.434719         5.82
+IVF-Binary-256-nl547-np33-rf20-random (query)          2_666.87       150.99     2_817.87       0.5737     0.244079         5.82
+IVF-Binary-256-nl547-random (self)                     2_666.87       948.86     3_615.74       0.4497     0.399649         5.82
+--------------------------------------------------------------------------------------------------------------------------------
+IVF-Binary-256-nl273-np13-rf0-itq (query)              2_123.89        52.16     2_176.05       0.1410          NaN         5.79
+IVF-Binary-256-nl273-np16-rf0-itq (query)              2_123.89        62.03     2_185.92       0.1357          NaN         5.79
+IVF-Binary-256-nl273-np23-rf0-itq (query)              2_123.89        76.25     2_200.14       0.1338          NaN         5.79
+IVF-Binary-256-nl273-np13-rf5-itq (query)              2_123.89        76.42     2_200.31       0.3208     0.685541         5.79
+IVF-Binary-256-nl273-np13-rf10-itq (query)             2_123.89        99.79     2_223.68       0.4396     0.407217         5.79
+IVF-Binary-256-nl273-np13-rf20-itq (query)             2_123.89       141.05     2_264.94       0.5798     0.225195         5.79
+IVF-Binary-256-nl273-np16-rf5-itq (query)              2_123.89        85.00     2_208.89       0.3109     0.715357         5.79
+IVF-Binary-256-nl273-np16-rf10-itq (query)             2_123.89       111.17     2_235.06       0.4280     0.426496         5.79
+IVF-Binary-256-nl273-np16-rf20-itq (query)             2_123.89       154.87     2_278.76       0.5688     0.236011         5.79
+IVF-Binary-256-nl273-np23-rf5-itq (query)              2_123.89       104.64     2_228.53       0.3066     0.734420         5.79
+IVF-Binary-256-nl273-np23-rf10-itq (query)             2_123.89       132.76     2_256.66       0.4225     0.438484         5.79
+IVF-Binary-256-nl273-np23-rf20-itq (query)             2_123.89       180.25     2_304.14       0.5615     0.245100         5.79
+IVF-Binary-256-nl273-itq (self)                        2_123.89     1_111.83     3_235.72       0.4337     0.414139         5.79
+--------------------------------------------------------------------------------------------------------------------------------
+IVF-Binary-256-nl387-np19-rf0-itq (query)              2_438.92        52.42     2_491.34       0.1377          NaN         5.80
+IVF-Binary-256-nl387-np27-rf0-itq (query)              2_438.92        63.97     2_502.89       0.1352          NaN         5.80
+IVF-Binary-256-nl387-np19-rf5-itq (query)              2_438.92        76.50     2_515.42       0.3141     0.702705         5.80
+IVF-Binary-256-nl387-np19-rf10-itq (query)             2_438.92       100.75     2_539.67       0.4329     0.416658         5.80
+IVF-Binary-256-nl387-np19-rf20-itq (query)             2_438.92       139.78     2_578.70       0.5744     0.230631         5.80
+IVF-Binary-256-nl387-np27-rf5-itq (query)              2_438.92        90.58     2_529.50       0.3081     0.726328         5.80
+IVF-Binary-256-nl387-np27-rf10-itq (query)             2_438.92       115.93     2_554.85       0.4247     0.432890         5.80
+IVF-Binary-256-nl387-np27-rf20-itq (query)             2_438.92       159.85     2_598.77       0.5644     0.242053         5.80
+IVF-Binary-256-nl387-itq (self)                        2_438.92     1_007.25     3_446.17       0.4379     0.405679         5.80
+--------------------------------------------------------------------------------------------------------------------------------
+IVF-Binary-256-nl547-np23-rf0-itq (query)              2_896.42        50.82     2_947.24       0.1385          NaN         5.82
+IVF-Binary-256-nl547-np27-rf0-itq (query)              2_896.42        56.88     2_953.29       0.1368          NaN         5.82
+IVF-Binary-256-nl547-np33-rf0-itq (query)              2_896.42        60.90     2_957.32       0.1350          NaN         5.82
+IVF-Binary-256-nl547-np23-rf5-itq (query)              2_896.42        73.41     2_969.82       0.3163     0.694441         5.82
+IVF-Binary-256-nl547-np23-rf10-itq (query)             2_896.42        97.80     2_994.22       0.4354     0.411362         5.82
+IVF-Binary-256-nl547-np23-rf20-itq (query)             2_896.42       140.77     3_037.19       0.5786     0.225544         5.82
+IVF-Binary-256-nl547-np27-rf5-itq (query)              2_896.42        79.79     2_976.21       0.3124     0.710008         5.82
+IVF-Binary-256-nl547-np27-rf10-itq (query)             2_896.42       102.27     2_998.69       0.4299     0.422999         5.82
+IVF-Binary-256-nl547-np27-rf20-itq (query)             2_896.42       141.45     3_037.87       0.5716     0.233715         5.82
+IVF-Binary-256-nl547-np33-rf5-itq (query)              2_896.42        84.53     2_980.94       0.3082     0.726527         5.82
+IVF-Binary-256-nl547-np33-rf10-itq (query)             2_896.42       128.91     3_025.33       0.4246     0.434241         5.82
+IVF-Binary-256-nl547-np33-rf20-itq (query)             2_896.42       164.16     3_060.58       0.5647     0.242161         5.82
+IVF-Binary-256-nl547-itq (self)                        2_896.42       953.75     3_850.17       0.4408     0.399864         5.82
+--------------------------------------------------------------------------------------------------------------------------------
+IVF-Binary-512-nl273-np13-rf0-random (query)           3_070.89       106.79     3_177.68       0.2301          NaN        10.40
+IVF-Binary-512-nl273-np16-rf0-random (query)           3_070.89       124.99     3_195.88       0.2277          NaN        10.40
+IVF-Binary-512-nl273-np23-rf0-random (query)           3_070.89       162.79     3_233.68       0.2271          NaN        10.40
+IVF-Binary-512-nl273-np13-rf5-random (query)           3_070.89       134.30     3_205.19       0.4858     0.337669        10.40
+IVF-Binary-512-nl273-np13-rf10-random (query)          3_070.89       171.28     3_242.17       0.6273     0.176951        10.40
+IVF-Binary-512-nl273-np13-rf20-random (query)          3_070.89       206.10     3_276.98       0.7651     0.083714        10.40
+IVF-Binary-512-nl273-np16-rf5-random (query)           3_070.89       154.23     3_225.11       0.4811     0.344883        10.40
+IVF-Binary-512-nl273-np16-rf10-random (query)          3_070.89       183.43     3_254.32       0.6226     0.181279        10.40
+IVF-Binary-512-nl273-np16-rf20-random (query)          3_070.89       233.98     3_304.87       0.7604     0.086426        10.40
+IVF-Binary-512-nl273-np23-rf5-random (query)           3_070.89       208.66     3_279.55       0.4790     0.349067        10.40
+IVF-Binary-512-nl273-np23-rf10-random (query)          3_070.89       231.59     3_302.48       0.6197     0.184441        10.40
+IVF-Binary-512-nl273-np23-rf20-random (query)          3_070.89       296.49     3_367.38       0.7568     0.088730        10.40
+IVF-Binary-512-nl273-random (self)                     3_070.89     1_827.29     4_898.18       0.6260     0.177568        10.40
+--------------------------------------------------------------------------------------------------------------------------------
+IVF-Binary-512-nl387-np19-rf0-random (query)           3_488.20       113.30     3_601.50       0.2288          NaN        10.41
+IVF-Binary-512-nl387-np27-rf0-random (query)           3_488.20       141.38     3_629.58       0.2273          NaN        10.41
+IVF-Binary-512-nl387-np19-rf5-random (query)           3_488.20       141.19     3_629.39       0.4834     0.341959        10.41
+IVF-Binary-512-nl387-np19-rf10-random (query)          3_488.20       165.44     3_653.64       0.6246     0.179194        10.41
+IVF-Binary-512-nl387-np19-rf20-random (query)          3_488.20       218.45     3_706.65       0.7627     0.085009        10.41
+IVF-Binary-512-nl387-np27-rf5-random (query)           3_488.20       171.06     3_659.26       0.4805     0.347662        10.41
+IVF-Binary-512-nl387-np27-rf10-random (query)          3_488.20       202.87     3_691.07       0.6204     0.183313        10.41
+IVF-Binary-512-nl387-np27-rf20-random (query)          3_488.20       250.40     3_738.60       0.7580     0.087911        10.41
+IVF-Binary-512-nl387-random (self)                     3_488.20     1_649.15     5_137.35       0.6279     0.175702        10.41
+--------------------------------------------------------------------------------------------------------------------------------
+IVF-Binary-512-nl547-np23-rf0-random (query)           3_832.86       102.66     3_935.52       0.2294          NaN        10.43
+IVF-Binary-512-nl547-np27-rf0-random (query)           3_832.86       116.35     3_949.21       0.2285          NaN        10.43
+IVF-Binary-512-nl547-np33-rf0-random (query)           3_832.86       128.36     3_961.21       0.2275          NaN        10.43
+IVF-Binary-512-nl547-np23-rf5-random (query)           3_832.86       132.17     3_965.03       0.4845     0.339823        10.43
+IVF-Binary-512-nl547-np23-rf10-random (query)          3_832.86       157.86     3_990.72       0.6260     0.178040        10.43
+IVF-Binary-512-nl547-np23-rf20-random (query)          3_832.86       200.56     4_033.42       0.7648     0.083955        10.43
+IVF-Binary-512-nl547-np27-rf5-random (query)           3_832.86       141.88     3_974.73       0.4820     0.344380        10.43
+IVF-Binary-512-nl547-np27-rf10-random (query)          3_832.86       168.75     4_001.61       0.6235     0.180762        10.43
+IVF-Binary-512-nl547-np27-rf20-random (query)          3_832.86       235.03     4_067.88       0.7614     0.086087        10.43
+IVF-Binary-512-nl547-np33-rf5-random (query)           3_832.86       170.40     4_003.26       0.4802     0.347987        10.43
+IVF-Binary-512-nl547-np33-rf10-random (query)          3_832.86       189.47     4_022.33       0.6207     0.183507        10.43
+IVF-Binary-512-nl547-np33-rf20-random (query)          3_832.86       237.87     4_070.73       0.7586     0.087878        10.43
+IVF-Binary-512-nl547-random (self)                     3_832.86     1_558.16     5_391.02       0.6297     0.174170        10.43
+--------------------------------------------------------------------------------------------------------------------------------
+IVF-Binary-512-nl273-np13-rf0-itq (query)              3_356.15       107.66     3_463.81       0.2255          NaN        10.40
+IVF-Binary-512-nl273-np16-rf0-itq (query)              3_356.15       124.08     3_480.23       0.2227          NaN        10.40
+IVF-Binary-512-nl273-np23-rf0-itq (query)              3_356.15       162.79     3_518.94       0.2216          NaN        10.40
+IVF-Binary-512-nl273-np13-rf5-itq (query)              3_356.15       135.51     3_491.65       0.4774     0.346615        10.40
+IVF-Binary-512-nl273-np13-rf10-itq (query)             3_356.15       161.65     3_517.80       0.6162     0.182766        10.40
+IVF-Binary-512-nl273-np13-rf20-itq (query)             3_356.15       213.00     3_569.15       0.7532     0.087053        10.40
+IVF-Binary-512-nl273-np16-rf5-itq (query)              3_356.15       155.68     3_511.82       0.4725     0.354320        10.40
+IVF-Binary-512-nl273-np16-rf10-itq (query)             3_356.15       183.99     3_540.14       0.6109     0.187407        10.40
+IVF-Binary-512-nl273-np16-rf20-itq (query)             3_356.15       234.12     3_590.27       0.7479     0.090065        10.40
+IVF-Binary-512-nl273-np23-rf5-itq (query)              3_356.15       195.96     3_552.11       0.4701     0.359322        10.40
+IVF-Binary-512-nl273-np23-rf10-itq (query)             3_356.15       241.93     3_598.08       0.6079     0.190805        10.40
+IVF-Binary-512-nl273-np23-rf20-itq (query)             3_356.15       286.03     3_642.18       0.7443     0.092319        10.40
+IVF-Binary-512-nl273-itq (self)                        3_356.15     1_840.84     5_196.99       0.6128     0.185261        10.40
+--------------------------------------------------------------------------------------------------------------------------------
+IVF-Binary-512-nl387-np19-rf0-itq (query)              3_673.20       113.78     3_786.99       0.2241          NaN        10.41
+IVF-Binary-512-nl387-np27-rf0-itq (query)              3_673.20       140.03     3_813.24       0.2227          NaN        10.41
+IVF-Binary-512-nl387-np19-rf5-itq (query)              3_673.20       143.09     3_816.30       0.4748     0.350717        10.41
+IVF-Binary-512-nl387-np19-rf10-itq (query)             3_673.20       166.35     3_839.56       0.6134     0.184894        10.41
+IVF-Binary-512-nl387-np19-rf20-itq (query)             3_673.20       220.69     3_893.89       0.7503     0.088493        10.41
+IVF-Binary-512-nl387-np27-rf5-itq (query)              3_673.20       173.63     3_846.84       0.4712     0.357131        10.41
+IVF-Binary-512-nl387-np27-rf10-itq (query)             3_673.20       199.09     3_872.29       0.6092     0.189326        10.41
+IVF-Binary-512-nl387-np27-rf20-itq (query)             3_673.20       250.55     3_923.75       0.7456     0.091400        10.41
+IVF-Binary-512-nl387-itq (self)                        3_673.20     1_661.29     5_334.50       0.6151     0.183109        10.41
+--------------------------------------------------------------------------------------------------------------------------------
+IVF-Binary-512-nl547-np23-rf0-itq (query)              4_114.02       103.83     4_217.86       0.2248          NaN        10.43
+IVF-Binary-512-nl547-np27-rf0-itq (query)              4_114.02       113.55     4_227.57       0.2240          NaN        10.43
+IVF-Binary-512-nl547-np33-rf0-itq (query)              4_114.02       128.62     4_242.65       0.2230          NaN        10.43
+IVF-Binary-512-nl547-np23-rf5-itq (query)              4_114.02       136.69     4_250.71       0.4759     0.348742        10.43
+IVF-Binary-512-nl547-np23-rf10-itq (query)             4_114.02       157.76     4_271.78       0.6141     0.183927        10.43
+IVF-Binary-512-nl547-np23-rf20-itq (query)             4_114.02       201.63     4_315.65       0.7529     0.087149        10.43
+IVF-Binary-512-nl547-np27-rf5-itq (query)              4_114.02       142.71     4_256.73       0.4736     0.353096        10.43
+IVF-Binary-512-nl547-np27-rf10-itq (query)             4_114.02       171.37     4_285.40       0.6111     0.187066        10.43
+IVF-Binary-512-nl547-np27-rf20-itq (query)             4_114.02       218.44     4_332.47       0.7488     0.089617        10.43
+IVF-Binary-512-nl547-np33-rf5-itq (query)              4_114.02       159.20     4_273.22       0.4713     0.357356        10.43
+IVF-Binary-512-nl547-np33-rf10-itq (query)             4_114.02       188.06     4_302.08       0.6084     0.190077        10.43
+IVF-Binary-512-nl547-np33-rf20-itq (query)             4_114.02       237.78     4_351.80       0.7457     0.091608        10.43
+IVF-Binary-512-nl547-itq (self)                        4_114.02     1_571.34     5_685.36       0.6169     0.181390        10.43
+--------------------------------------------------------------------------------------------------------------------------------
+IVF-Binary-32-nl273-np13-rf0-signed (query)              933.97        37.31       971.28       0.0234          NaN         1.76
+IVF-Binary-32-nl273-np16-rf0-signed (query)              933.97        45.86       979.83       0.0151          NaN         1.76
+IVF-Binary-32-nl273-np23-rf0-signed (query)              933.97        63.34       997.31       0.0136          NaN         1.76
+IVF-Binary-32-nl273-np13-rf5-signed (query)              933.97        48.08       982.05       0.0890     2.423463         1.76
+IVF-Binary-32-nl273-np13-rf10-signed (query)             933.97        59.61       993.58       0.1529     1.710396         1.76
+IVF-Binary-32-nl273-np13-rf20-signed (query)             933.97        83.09     1_017.06       0.2508     1.160225         1.76
+IVF-Binary-32-nl273-np16-rf5-signed (query)              933.97        55.68       989.65       0.0625     2.883751         1.76
+IVF-Binary-32-nl273-np16-rf10-signed (query)             933.97        68.28     1_002.25       0.1141     2.056626         1.76
+IVF-Binary-32-nl273-np16-rf20-signed (query)             933.97        93.62     1_027.59       0.1984     1.404948         1.76
+IVF-Binary-32-nl273-np23-rf5-signed (query)              933.97        75.32     1_009.29       0.0556     3.127341         1.76
+IVF-Binary-32-nl273-np23-rf10-signed (query)             933.97        90.96     1_024.93       0.1027     2.252976         1.76
+IVF-Binary-32-nl273-np23-rf20-signed (query)             933.97       116.46     1_050.43       0.1795     1.556631         1.76
+IVF-Binary-32-nl273-signed (self)                        933.97       678.14     1_612.11       0.1187     2.029094         1.76
+--------------------------------------------------------------------------------------------------------------------------------
+IVF-Binary-32-nl387-np19-rf0-signed (query)            1_250.92        39.98     1_290.90       0.0176          NaN         1.77
+IVF-Binary-32-nl387-np27-rf0-signed (query)            1_250.92        52.52     1_303.45       0.0148          NaN         1.77
+IVF-Binary-32-nl387-np19-rf5-signed (query)            1_250.92        50.42     1_301.34       0.0717     2.620430         1.77
+IVF-Binary-32-nl387-np19-rf10-signed (query)           1_250.92        62.55     1_313.47       0.1283     1.859415         1.77
+IVF-Binary-32-nl387-np19-rf20-signed (query)           1_250.92        87.80     1_338.73       0.2193     1.240960         1.77
+IVF-Binary-32-nl387-np27-rf5-signed (query)            1_250.92        64.29     1_315.21       0.0609     2.951507         1.77
+IVF-Binary-32-nl387-np27-rf10-signed (query)           1_250.92        77.65     1_328.58       0.1114     2.110392         1.77
+IVF-Binary-32-nl387-np27-rf20-signed (query)           1_250.92       101.90     1_352.83       0.1940     1.419800         1.77
+IVF-Binary-32-nl387-signed (self)                      1_250.92       615.63     1_866.55       0.1322     1.832312         1.77
+--------------------------------------------------------------------------------------------------------------------------------
+IVF-Binary-32-nl547-np23-rf0-signed (query)            1_702.01        37.70     1_739.71       0.0185          NaN         1.79
+IVF-Binary-32-nl547-np27-rf0-signed (query)            1_702.01        42.35     1_744.36       0.0172          NaN         1.79
+IVF-Binary-32-nl547-np33-rf0-signed (query)            1_702.01        48.87     1_750.88       0.0154          NaN         1.79
+IVF-Binary-32-nl547-np23-rf5-signed (query)            1_702.01        48.92     1_750.92       0.0762     2.550798         1.79
+IVF-Binary-32-nl547-np23-rf10-signed (query)           1_702.01        59.59     1_761.60       0.1351     1.776800         1.79
+IVF-Binary-32-nl547-np23-rf20-signed (query)           1_702.01        80.80     1_782.80       0.2283     1.159375         1.79
+IVF-Binary-32-nl547-np27-rf5-signed (query)            1_702.01        53.12     1_755.13       0.0706     2.699178         1.79
+IVF-Binary-32-nl547-np27-rf10-signed (query)           1_702.01        64.10     1_766.10       0.1257     1.900296         1.79
+IVF-Binary-32-nl547-np27-rf20-signed (query)           1_702.01        86.16     1_788.17       0.2132     1.248510         1.79
+IVF-Binary-32-nl547-np33-rf5-signed (query)            1_702.01        62.12     1_764.13       0.0634     2.959131         1.79
+IVF-Binary-32-nl547-np33-rf10-signed (query)           1_702.01        70.22     1_772.23       0.1138     2.101924         1.79
+IVF-Binary-32-nl547-np33-rf20-signed (query)           1_702.01        94.16     1_796.16       0.1957     1.387744         1.79
+IVF-Binary-32-nl547-signed (self)                      1_702.01       580.38     2_282.39       0.1380     1.740267         1.79
 --------------------------------------------------------------------------------------------------------------------------------
 </code></pre>
 </details>
@@ -619,976 +800,1220 @@ IVF-Binary-512-nl547-itq (self)                       14_503.15     1_535.90    
 
 <details>
 <summary><b>Binary - Euclidean (LowRank)</b>:</summary>
+</br>
 <pre><code>
 ================================================================================================================================
 Benchmark: 150k cells, 32D - Binary Quantisation
 ================================================================================================================================
 Method                                               Build (ms)   Query (ms)   Total (ms)     Recall@k   Dist Error    Size (MB)
 --------------------------------------------------------------------------------------------------------------------------------
-Exhaustive (query)                                         3.15     1_581.16     1_584.31       1.0000     0.000000        18.31
-Exhaustive (self)                                          3.15    16_590.94    16_594.09       1.0000     0.000000        18.31
-ExhaustiveBinary-256-random_no_rr (query)              1_259.18       512.08     1_771.26       0.0889          NaN         4.61
-ExhaustiveBinary-256-random-rf5 (query)                1_259.18       541.39     1_800.57       0.2205     5.185433         4.61
-ExhaustiveBinary-256-random-rf10 (query)               1_259.18       587.02     1_846.20       0.3209     3.263431         4.61
-ExhaustiveBinary-256-random-rf20 (query)               1_259.18       696.71     1_955.89       0.4521     1.957008         4.61
-ExhaustiveBinary-256-random (self)                     1_259.18     5_893.75     7_152.93       0.3238     3.208083         4.61
-ExhaustiveBinary-256-itq_no_rr (query)                 9_358.84       488.10     9_846.94       0.0734          NaN         4.61
-ExhaustiveBinary-256-itq-rf5 (query)                   9_358.84       525.41     9_884.25       0.1955     5.709191         4.61
-ExhaustiveBinary-256-itq-rf10 (query)                  9_358.84       636.19     9_995.04       0.2902     3.600771         4.61
-ExhaustiveBinary-256-itq-rf20 (query)                  9_358.84       724.61    10_083.45       0.4157     2.167224         4.61
-ExhaustiveBinary-256-itq (self)                        9_358.84     6_267.49    15_626.33       0.2960     3.485945         4.61
+Exhaustive (query)                                         2.98     1_563.45     1_566.43       1.0000     0.000000        18.31
+Exhaustive (self)                                          2.98    16_480.36    16_483.34       1.0000     0.000000        18.31
 --------------------------------------------------------------------------------------------------------------------------------
-ExhaustiveBinary-512-random_no_rr (query)              2_522.42       877.43     3_399.85       0.1603          NaN         9.22
-ExhaustiveBinary-512-random-rf5 (query)                2_522.42       947.26     3_469.68       0.3496     2.953827         9.22
-ExhaustiveBinary-512-random-rf10 (query)               2_522.42     1_106.54     3_628.96       0.4779     1.726989         9.22
-ExhaustiveBinary-512-random-rf20 (query)               2_522.42     1_186.28     3_708.70       0.6243     0.943773         9.22
-ExhaustiveBinary-512-random (self)                     2_522.42     9_603.13    12_125.54       0.4788     1.710526         9.22
-ExhaustiveBinary-512-itq_no_rr (query)                11_969.28       846.09    12_815.37       0.1518          NaN         9.22
-ExhaustiveBinary-512-itq-rf5 (query)                  11_969.28       920.90    12_890.18       0.3364     3.092957         9.22
-ExhaustiveBinary-512-itq-rf10 (query)                 11_969.28       933.71    12_902.99       0.4608     1.824577         9.22
-ExhaustiveBinary-512-itq-rf20 (query)                 11_969.28     1_033.10    13_002.38       0.6062     1.008706         9.22
-ExhaustiveBinary-512-itq (self)                       11_969.28     9_739.25    21_708.53       0.4642     1.796793         9.22
+ExhaustiveBinary-256-random_no_rr (query)              1_159.36       481.62     1_640.98       0.0889          NaN         4.61
+ExhaustiveBinary-256-random-rf5 (query)                1_159.36       531.90     1_691.25       0.2205     5.185433         4.61
+ExhaustiveBinary-256-random-rf10 (query)               1_159.36       581.99     1_741.35       0.3209     3.263431         4.61
+ExhaustiveBinary-256-random-rf20 (query)               1_159.36       658.35     1_817.71       0.4521     1.957008         4.61
+ExhaustiveBinary-256-random (self)                     1_159.36     5_729.25     6_888.61       0.3238     3.208083         4.61
 --------------------------------------------------------------------------------------------------------------------------------
-IVF-Binary-256-nl273-np13-rf0-random (query)           2_152.93        51.99     2_204.92       0.1015          NaN         5.79
-IVF-Binary-256-nl273-np16-rf0-random (query)           2_152.93        58.41     2_211.34       0.0925          NaN         5.79
-IVF-Binary-256-nl273-np23-rf0-random (query)           2_152.93        72.84     2_225.77       0.0904          NaN         5.79
-IVF-Binary-256-nl273-np13-rf5-random (query)           2_152.93        76.35     2_229.28       0.2466     4.683539         5.79
-IVF-Binary-256-nl273-np13-rf10-random (query)          2_152.93        94.99     2_247.92       0.3527     2.916659         5.79
-IVF-Binary-256-nl273-np13-rf20-random (query)          2_152.93       135.23     2_288.16       0.4886     1.698542         5.79
-IVF-Binary-256-nl273-np16-rf5-random (query)           2_152.93        81.32     2_234.25       0.2317     5.167780         5.79
-IVF-Binary-256-nl273-np16-rf10-random (query)          2_152.93       104.80     2_257.73       0.3353     3.191328         5.79
-IVF-Binary-256-nl273-np16-rf20-random (query)          2_152.93       149.10     2_302.03       0.4700     1.862975         5.79
-IVF-Binary-256-nl273-np23-rf5-random (query)           2_152.93       150.66     2_303.60       0.2280     5.297650         5.79
-IVF-Binary-256-nl273-np23-rf10-random (query)          2_152.93       155.81     2_308.75       0.3304     3.274626         5.79
-IVF-Binary-256-nl273-np23-rf20-random (query)          2_152.93       202.72     2_355.65       0.4637     1.916709         5.79
-IVF-Binary-256-nl273-random (self)                     2_152.93     1_161.65     3_314.58       0.3387     3.130514         5.79
-IVF-Binary-256-nl387-np19-rf0-random (query)           2_643.44        57.12     2_700.57       0.0945          NaN         5.80
-IVF-Binary-256-nl387-np27-rf0-random (query)           2_643.44        69.54     2_712.98       0.0919          NaN         5.80
-IVF-Binary-256-nl387-np19-rf5-random (query)           2_643.44        78.67     2_722.11       0.2358     4.931507         5.80
-IVF-Binary-256-nl387-np19-rf10-random (query)          2_643.44       109.76     2_753.21       0.3421     3.052683         5.80
-IVF-Binary-256-nl387-np19-rf20-random (query)          2_643.44       210.30     2_853.75       0.4777     1.802324         5.80
-IVF-Binary-256-nl387-np27-rf5-random (query)           2_643.44       116.28     2_759.72       0.2299     5.156744         5.80
-IVF-Binary-256-nl387-np27-rf10-random (query)          2_643.44       119.23     2_762.67       0.3340     3.196200         5.80
-IVF-Binary-256-nl387-np27-rf20-random (query)          2_643.44       162.85     2_806.29       0.4679     1.888188         5.80
-IVF-Binary-256-nl387-random (self)                     2_643.44     1_007.51     3_650.95       0.3448     3.003180         5.80
-IVF-Binary-256-nl547-np23-rf0-random (query)           2_960.53        51.55     3_012.08       0.0954          NaN         5.82
-IVF-Binary-256-nl547-np27-rf0-random (query)           2_960.53        53.58     3_014.11       0.0934          NaN         5.82
-IVF-Binary-256-nl547-np33-rf0-random (query)           2_960.53        63.29     3_023.82       0.0917          NaN         5.82
-IVF-Binary-256-nl547-np23-rf5-random (query)           2_960.53        71.51     3_032.04       0.2397     4.792322         5.82
-IVF-Binary-256-nl547-np23-rf10-random (query)          2_960.53        96.27     3_056.80       0.3460     2.991438         5.82
-IVF-Binary-256-nl547-np23-rf20-random (query)          2_960.53       133.19     3_093.72       0.4824     1.757612         5.82
-IVF-Binary-256-nl547-np27-rf5-random (query)           2_960.53        75.24     3_035.77       0.2354     4.927104         5.82
-IVF-Binary-256-nl547-np27-rf10-random (query)          2_960.53        98.07     3_058.60       0.3399     3.085668         5.82
-IVF-Binary-256-nl547-np27-rf20-random (query)          2_960.53       138.25     3_098.78       0.4749     1.823328         5.82
-IVF-Binary-256-nl547-np33-rf5-random (query)           2_960.53        82.01     3_042.54       0.2310     5.077596         5.82
-IVF-Binary-256-nl547-np33-rf10-random (query)          2_960.53       105.78     3_066.31       0.3339     3.187068         5.82
-IVF-Binary-256-nl547-np33-rf20-random (query)          2_960.53       146.22     3_106.75       0.4678     1.889583         5.82
-IVF-Binary-256-nl547-random (self)                     2_960.53       931.13     3_891.66       0.3483     2.939393         5.82
-IVF-Binary-256-nl273-np13-rf0-itq (query)             13_702.51        51.80    13_754.31       0.0873          NaN         5.79
-IVF-Binary-256-nl273-np16-rf0-itq (query)             13_702.51        54.39    13_756.90       0.0772          NaN         5.79
-IVF-Binary-256-nl273-np23-rf0-itq (query)             13_702.51        68.45    13_770.96       0.0756          NaN         5.79
-IVF-Binary-256-nl273-np13-rf5-itq (query)             13_702.51        70.55    13_773.05       0.2216     5.282755         5.79
-IVF-Binary-256-nl273-np13-rf10-itq (query)            13_702.51        93.96    13_796.47       0.3219     3.305650         5.79
-IVF-Binary-256-nl273-np13-rf20-itq (query)            13_702.51       131.40    13_833.91       0.4512     1.955763         5.79
-IVF-Binary-256-nl273-np16-rf5-itq (query)             13_702.51        78.90    13_781.40       0.2066     5.679316         5.79
-IVF-Binary-256-nl273-np16-rf10-itq (query)            13_702.51       101.93    13_804.44       0.3048     3.544723         5.79
-IVF-Binary-256-nl273-np16-rf20-itq (query)            13_702.51       143.87    13_846.38       0.4341     2.092938         5.79
-IVF-Binary-256-nl273-np23-rf5-itq (query)             13_702.51        92.94    13_795.45       0.2033     5.811737         5.79
-IVF-Binary-256-nl273-np23-rf10-itq (query)            13_702.51       123.76    13_826.26       0.3004     3.632149         5.79
-IVF-Binary-256-nl273-np23-rf20-itq (query)            13_702.51       164.87    13_867.37       0.4284     2.147688         5.79
-IVF-Binary-256-nl273-itq (self)                       13_702.51     1_025.72    14_728.23       0.3111     3.432551         5.79
-IVF-Binary-256-nl387-np19-rf0-itq (query)             10_292.38        52.79    10_345.16       0.0798          NaN         5.80
-IVF-Binary-256-nl387-np27-rf0-itq (query)             10_292.38        62.67    10_355.05       0.0767          NaN         5.80
-IVF-Binary-256-nl387-np19-rf5-itq (query)             10_292.38        71.61    10_363.99       0.2117     5.502615         5.80
-IVF-Binary-256-nl387-np19-rf10-itq (query)            10_292.38        93.22    10_385.60       0.3111     3.415891         5.80
-IVF-Binary-256-nl387-np19-rf20-itq (query)            10_292.38       132.12    10_424.50       0.4426     2.008934         5.80
-IVF-Binary-256-nl387-np27-rf5-itq (query)             10_292.38        84.15    10_376.53       0.2050     5.728015         5.80
-IVF-Binary-256-nl387-np27-rf10-itq (query)            10_292.38       108.19    10_400.57       0.3029     3.552823         5.80
-IVF-Binary-256-nl387-np27-rf20-itq (query)            10_292.38       148.26    10_440.64       0.4328     2.095211         5.80
-IVF-Binary-256-nl387-itq (self)                       10_292.38       932.28    11_224.66       0.3167     3.315809         5.80
-IVF-Binary-256-nl547-np23-rf0-itq (query)             10_782.21        49.55    10_831.76       0.0812          NaN         5.82
-IVF-Binary-256-nl547-np27-rf0-itq (query)             10_782.21        54.02    10_836.23       0.0790          NaN         5.82
-IVF-Binary-256-nl547-np33-rf0-itq (query)             10_782.21        59.53    10_841.74       0.0767          NaN         5.82
-IVF-Binary-256-nl547-np23-rf5-itq (query)             10_782.21        71.17    10_853.38       0.2158     5.309238         5.82
-IVF-Binary-256-nl547-np23-rf10-itq (query)            10_782.21        91.71    10_873.91       0.3164     3.309382         5.82
-IVF-Binary-256-nl547-np23-rf20-itq (query)            10_782.21       131.21    10_913.41       0.4486     1.951064         5.82
-IVF-Binary-256-nl547-np27-rf5-itq (query)             10_782.21        73.90    10_856.11       0.2107     5.492567         5.82
-IVF-Binary-256-nl547-np27-rf10-itq (query)            10_782.21       101.83    10_884.04       0.3095     3.427927         5.82
-IVF-Binary-256-nl547-np27-rf20-itq (query)            10_782.21       143.66    10_925.87       0.4404     2.024259         5.82
-IVF-Binary-256-nl547-np33-rf5-itq (query)             10_782.21        82.10    10_864.31       0.2062     5.639763         5.82
-IVF-Binary-256-nl547-np33-rf10-itq (query)            10_782.21       106.62    10_888.83       0.3036     3.522671         5.82
-IVF-Binary-256-nl547-np33-rf20-itq (query)            10_782.21       142.95    10_925.16       0.4332     2.084999         5.82
-IVF-Binary-256-nl547-itq (self)                       10_782.21       968.59    11_750.80       0.3219     3.220474         5.82
+ExhaustiveBinary-256-itq_no_rr (query)                 1_342.14       478.18     1_820.32       0.0723          NaN         4.61
+ExhaustiveBinary-256-itq-rf5 (query)                   1_342.14       521.25     1_863.39       0.1941     5.797375         4.61
+ExhaustiveBinary-256-itq-rf10 (query)                  1_342.14       564.62     1_906.76       0.2870     3.686845         4.61
+ExhaustiveBinary-256-itq-rf20 (query)                  1_342.14       651.70     1_993.84       0.4150     2.209544         4.61
+ExhaustiveBinary-256-itq (self)                        1_342.14     5_642.00     6_984.14       0.2901     3.621623         4.61
 --------------------------------------------------------------------------------------------------------------------------------
-IVF-Binary-512-nl273-np13-rf0-random (query)           3_290.57       100.25     3_390.82       0.1685          NaN        10.40
-IVF-Binary-512-nl273-np16-rf0-random (query)           3_290.57       112.61     3_403.18       0.1642          NaN        10.40
-IVF-Binary-512-nl273-np23-rf0-random (query)           3_290.57       143.35     3_433.92       0.1629          NaN        10.40
-IVF-Binary-512-nl273-np13-rf5-random (query)           3_290.57       128.25     3_418.82       0.3648     2.762852        10.40
-IVF-Binary-512-nl273-np13-rf10-random (query)          3_290.57       154.87     3_445.44       0.4946     1.613586        10.40
-IVF-Binary-512-nl273-np13-rf20-random (query)          3_290.57       200.78     3_491.35       0.6428     0.865216        10.40
-IVF-Binary-512-nl273-np16-rf5-random (query)           3_290.57       144.01     3_434.58       0.3574     2.870953        10.40
-IVF-Binary-512-nl273-np16-rf10-random (query)          3_290.57       172.69     3_463.26       0.4866     1.678608        10.40
-IVF-Binary-512-nl273-np16-rf20-random (query)          3_290.57       222.24     3_512.81       0.6348     0.903671        10.40
-IVF-Binary-512-nl273-np23-rf5-random (query)           3_290.57       175.80     3_466.37       0.3551     2.903769        10.40
-IVF-Binary-512-nl273-np23-rf10-random (query)          3_290.57       209.09     3_499.66       0.4839     1.699072        10.40
-IVF-Binary-512-nl273-np23-rf20-random (query)          3_290.57       263.00     3_553.57       0.6317     0.917169        10.40
-IVF-Binary-512-nl273-random (self)                     3_290.57     1_728.98     5_019.55       0.4885     1.655176        10.40
-IVF-Binary-512-nl387-np19-rf0-random (query)           3_633.60       104.19     3_737.79       0.1647          NaN        10.41
-IVF-Binary-512-nl387-np27-rf0-random (query)           3_633.60       129.37     3_762.97       0.1631          NaN        10.41
-IVF-Binary-512-nl387-np19-rf5-random (query)           3_633.60       132.83     3_766.43       0.3603     2.826319        10.41
-IVF-Binary-512-nl387-np19-rf10-random (query)          3_633.60       160.72     3_794.32       0.4905     1.642435        10.41
-IVF-Binary-512-nl387-np19-rf20-random (query)          3_633.60       206.17     3_839.77       0.6385     0.885603        10.41
-IVF-Binary-512-nl387-np27-rf5-random (query)           3_633.60       159.50     3_793.09       0.3567     2.886554        10.41
-IVF-Binary-512-nl387-np27-rf10-random (query)          3_633.60       188.98     3_822.58       0.4856     1.679814        10.41
-IVF-Binary-512-nl387-np27-rf20-random (query)          3_633.60       237.94     3_871.54       0.6332     0.909694        10.41
-IVF-Binary-512-nl387-random (self)                     3_633.60     1_597.78     5_231.38       0.4917     1.624176        10.41
-IVF-Binary-512-nl547-np23-rf0-random (query)           4_137.92       100.79     4_238.71       0.1660          NaN        10.43
-IVF-Binary-512-nl547-np27-rf0-random (query)           4_137.92       108.59     4_246.51       0.1648          NaN        10.43
-IVF-Binary-512-nl547-np33-rf0-random (query)           4_137.92       122.52     4_260.44       0.1637          NaN        10.43
-IVF-Binary-512-nl547-np23-rf5-random (query)           4_137.92       127.71     4_265.63       0.3623     2.788844        10.43
-IVF-Binary-512-nl547-np23-rf10-random (query)          4_137.92       152.38     4_290.30       0.4927     1.618053        10.43
-IVF-Binary-512-nl547-np23-rf20-random (query)          4_137.92       196.09     4_334.01       0.6419     0.867394        10.43
-IVF-Binary-512-nl547-np27-rf5-random (query)           4_137.92       137.04     4_274.96       0.3595     2.836677        10.43
-IVF-Binary-512-nl547-np27-rf10-random (query)          4_137.92       180.45     4_318.36       0.4890     1.650040        10.43
-IVF-Binary-512-nl547-np27-rf20-random (query)          4_137.92       209.17     4_347.09       0.6371     0.891042        10.43
-IVF-Binary-512-nl547-np33-rf5-random (query)           4_137.92       151.76     4_289.68       0.3568     2.876216        10.43
-IVF-Binary-512-nl547-np33-rf10-random (query)          4_137.92       178.91     4_316.83       0.4854     1.678098        10.43
-IVF-Binary-512-nl547-np33-rf20-random (query)          4_137.92       226.46     4_364.38       0.6333     0.908544        10.43
-IVF-Binary-512-nl547-random (self)                     4_137.92     1_517.15     5_655.07       0.4940     1.602593        10.43
-IVF-Binary-512-nl273-np13-rf0-itq (query)             11_352.13        99.19    11_451.32       0.1599          NaN        10.40
-IVF-Binary-512-nl273-np16-rf0-itq (query)             11_352.13       110.21    11_462.34       0.1554          NaN        10.40
-IVF-Binary-512-nl273-np23-rf0-itq (query)             11_352.13       142.13    11_494.27       0.1545          NaN        10.40
-IVF-Binary-512-nl273-np13-rf5-itq (query)             11_352.13       127.00    11_479.13       0.3516     2.904447        10.40
-IVF-Binary-512-nl273-np13-rf10-itq (query)            11_352.13       153.17    11_505.30       0.4794     1.698773        10.40
-IVF-Binary-512-nl273-np13-rf20-itq (query)            11_352.13       198.71    11_550.84       0.6251     0.933239        10.40
-IVF-Binary-512-nl273-np16-rf5-itq (query)             11_352.13       140.06    11_492.19       0.3442     3.008673        10.40
-IVF-Binary-512-nl273-np16-rf10-itq (query)            11_352.13       170.02    11_522.15       0.4709     1.762526        10.40
-IVF-Binary-512-nl273-np16-rf20-itq (query)            11_352.13       219.58    11_571.71       0.6173     0.967870        10.40
-IVF-Binary-512-nl273-np23-rf5-itq (query)             11_352.13       172.08    11_524.21       0.3421     3.040991        10.40
-IVF-Binary-512-nl273-np23-rf10-itq (query)            11_352.13       203.98    11_556.12       0.4680     1.783083        10.40
-IVF-Binary-512-nl273-np23-rf20-itq (query)            11_352.13       265.70    11_617.83       0.6141     0.981829        10.40
-IVF-Binary-512-nl273-itq (self)                       11_352.13     1_694.65    13_046.78       0.4743     1.736368        10.40
-IVF-Binary-512-nl387-np19-rf0-itq (query)             11_372.36       106.26    11_478.62       0.1565          NaN        10.41
-IVF-Binary-512-nl387-np27-rf0-itq (query)             11_372.36       130.09    11_502.45       0.1547          NaN        10.41
-IVF-Binary-512-nl387-np19-rf5-itq (query)             11_372.36       133.75    11_506.10       0.3474     2.963602        10.41
-IVF-Binary-512-nl387-np19-rf10-itq (query)            11_372.36       160.00    11_532.35       0.4743     1.734979        10.41
-IVF-Binary-512-nl387-np19-rf20-itq (query)            11_372.36       206.34    11_578.70       0.6202     0.953618        10.41
-IVF-Binary-512-nl387-np27-rf5-itq (query)             11_372.36       160.21    11_532.57       0.3441     3.017253        10.41
-IVF-Binary-512-nl387-np27-rf10-itq (query)            11_372.36       189.23    11_561.58       0.4700     1.772640        10.41
-IVF-Binary-512-nl387-np27-rf20-itq (query)            11_372.36       238.05    11_610.41       0.6155     0.976692        10.41
-IVF-Binary-512-nl387-itq (self)                       11_372.36     1_595.14    12_967.49       0.4776     1.709669        10.41
-IVF-Binary-512-nl547-np23-rf0-itq (query)             11_985.80       100.97    12_086.78       0.1576          NaN        10.43
-IVF-Binary-512-nl547-np27-rf0-itq (query)             11_985.80       118.48    12_104.29       0.1561          NaN        10.43
-IVF-Binary-512-nl547-np33-rf0-itq (query)             11_985.80       121.67    12_107.47       0.1550          NaN        10.43
-IVF-Binary-512-nl547-np23-rf5-itq (query)             11_985.80       126.93    12_112.74       0.3489     2.929000        10.43
-IVF-Binary-512-nl547-np23-rf10-itq (query)            11_985.80       151.77    12_137.58       0.4768     1.713785        10.43
-IVF-Binary-512-nl547-np23-rf20-itq (query)            11_985.80       197.07    12_182.87       0.6237     0.934706        10.43
-IVF-Binary-512-nl547-np27-rf5-itq (query)             11_985.80       136.23    12_122.03       0.3460     2.980107        10.43
-IVF-Binary-512-nl547-np27-rf10-itq (query)            11_985.80       167.87    12_153.68       0.4725     1.751391        10.43
-IVF-Binary-512-nl547-np27-rf20-itq (query)            11_985.80       207.51    12_193.31       0.6191     0.956698        10.43
-IVF-Binary-512-nl547-np33-rf5-itq (query)             11_985.80       150.32    12_136.12       0.3438     3.014642        10.43
-IVF-Binary-512-nl547-np33-rf10-itq (query)            11_985.80       177.39    12_163.19       0.4696     1.775743        10.43
-IVF-Binary-512-nl547-np33-rf20-itq (query)            11_985.80       226.16    12_211.96       0.6157     0.972174        10.43
-IVF-Binary-512-nl547-itq (self)                       11_985.80     1_514.43    13_500.23       0.4800     1.688610        10.43
+ExhaustiveBinary-512-random_no_rr (query)              2_305.52       821.56     3_127.07       0.1603          NaN         9.22
+ExhaustiveBinary-512-random-rf5 (query)                2_305.52       858.84     3_164.36       0.3496     2.953827         9.22
+ExhaustiveBinary-512-random-rf10 (query)               2_305.52       936.60     3_242.11       0.4779     1.726989         9.22
+ExhaustiveBinary-512-random-rf20 (query)               2_305.52     1_015.62     3_321.14       0.6243     0.943773         9.22
+ExhaustiveBinary-512-random (self)                     2_305.52     9_060.44    11_365.95       0.4788     1.710526         9.22
+--------------------------------------------------------------------------------------------------------------------------------
+ExhaustiveBinary-512-itq_no_rr (query)                 2_574.24       826.96     3_401.21       0.1559          NaN         9.22
+ExhaustiveBinary-512-itq-rf5 (query)                   2_574.24       862.49     3_436.73       0.3458     3.038797         9.22
+ExhaustiveBinary-512-itq-rf10 (query)                  2_574.24       911.44     3_485.68       0.4728     1.776101         9.22
+ExhaustiveBinary-512-itq-rf20 (query)                  2_574.24     1_010.25     3_584.49       0.6194     0.970394         9.22
+ExhaustiveBinary-512-itq (self)                        2_574.24     9_104.27    11_678.51       0.4718     1.776907         9.22
+--------------------------------------------------------------------------------------------------------------------------------
+ExhaustiveBinary-32-signed_no_rr (query)                 155.26       604.57       759.83       0.0061          NaN         0.58
+ExhaustiveBinary-32-signed-rf5 (query)                   155.26       626.68       781.94       0.0286    14.192335         0.58
+ExhaustiveBinary-32-signed-rf10 (query)                  155.26       654.65       809.91       0.0545    10.228876         0.58
+ExhaustiveBinary-32-signed-rf20 (query)                  155.26       720.58       875.84       0.1028     7.206309         0.58
+ExhaustiveBinary-32-signed (self)                        155.26     6_566.12     6_721.38       0.0548    10.217732         0.58
+--------------------------------------------------------------------------------------------------------------------------------
+IVF-Binary-256-nl273-np13-rf0-random (query)           1_947.84        47.57     1_995.41       0.1011          NaN         5.79
+IVF-Binary-256-nl273-np16-rf0-random (query)           1_947.84        54.25     2_002.10       0.0924          NaN         5.79
+IVF-Binary-256-nl273-np23-rf0-random (query)           1_947.84        68.39     2_016.23       0.0904          NaN         5.79
+IVF-Binary-256-nl273-np13-rf5-random (query)           1_947.84        70.17     2_018.01       0.2469     4.688474         5.79
+IVF-Binary-256-nl273-np13-rf10-random (query)          1_947.84        92.02     2_039.86       0.3531     2.912185         5.79
+IVF-Binary-256-nl273-np13-rf20-random (query)          1_947.84       132.14     2_079.98       0.4880     1.701449         5.79
+IVF-Binary-256-nl273-np16-rf5-random (query)           1_947.84        77.01     2_024.86       0.2317     5.164905         5.79
+IVF-Binary-256-nl273-np16-rf10-random (query)          1_947.84       101.29     2_049.13       0.3352     3.192027         5.79
+IVF-Binary-256-nl273-np16-rf20-random (query)          1_947.84       143.82     2_091.66       0.4693     1.864007         5.79
+IVF-Binary-256-nl273-np23-rf5-random (query)           1_947.84        92.07     2_039.91       0.2275     5.292553         5.79
+IVF-Binary-256-nl273-np23-rf10-random (query)          1_947.84       118.43     2_066.27       0.3301     3.272207         5.79
+IVF-Binary-256-nl273-np23-rf20-random (query)          1_947.84       162.94     2_110.78       0.4633     1.914805         5.79
+IVF-Binary-256-nl273-random (self)                     1_947.84     1_024.62     2_972.46       0.3386     3.127658         5.79
+--------------------------------------------------------------------------------------------------------------------------------
+IVF-Binary-256-nl387-np19-rf0-random (query)           2_237.06        49.54     2_286.60       0.0945          NaN         5.80
+IVF-Binary-256-nl387-np27-rf0-random (query)           2_237.06        60.88     2_297.94       0.0914          NaN         5.80
+IVF-Binary-256-nl387-np19-rf5-random (query)           2_237.06        71.78     2_308.84       0.2359     4.925976         5.80
+IVF-Binary-256-nl387-np19-rf10-random (query)          2_237.06        92.50     2_329.55       0.3422     3.051455         5.80
+IVF-Binary-256-nl387-np19-rf20-random (query)          2_237.06       131.05     2_368.11       0.4774     1.803083         5.80
+IVF-Binary-256-nl387-np27-rf5-random (query)           2_237.06        83.30     2_320.36       0.2291     5.147233         5.80
+IVF-Binary-256-nl387-np27-rf10-random (query)          2_237.06       106.38     2_343.44       0.3333     3.199914         5.80
+IVF-Binary-256-nl387-np27-rf20-random (query)          2_237.06       146.07     2_383.13       0.4671     1.891111         5.80
+IVF-Binary-256-nl387-random (self)                     2_237.06       918.68     3_155.74       0.3445     3.009237         5.80
+--------------------------------------------------------------------------------------------------------------------------------
+IVF-Binary-256-nl547-np23-rf0-random (query)           2_669.15        52.15     2_721.30       0.0947          NaN         5.82
+IVF-Binary-256-nl547-np27-rf0-random (query)           2_669.15        51.95     2_721.11       0.0929          NaN         5.82
+IVF-Binary-256-nl547-np33-rf0-random (query)           2_669.15        58.16     2_727.31       0.0910          NaN         5.82
+IVF-Binary-256-nl547-np23-rf5-random (query)           2_669.15        69.14     2_738.29       0.2389     4.810820         5.82
+IVF-Binary-256-nl547-np23-rf10-random (query)          2_669.15        89.09     2_758.25       0.3460     2.991620         5.82
+IVF-Binary-256-nl547-np23-rf20-random (query)          2_669.15       127.17     2_796.32       0.4824     1.751270         5.82
+IVF-Binary-256-nl547-np27-rf5-random (query)           2_669.15        73.09     2_742.24       0.2347     4.947063         5.82
+IVF-Binary-256-nl547-np27-rf10-random (query)          2_669.15        93.94     2_763.10       0.3398     3.083894         5.82
+IVF-Binary-256-nl547-np27-rf20-random (query)          2_669.15       132.24     2_801.40       0.4744     1.821608         5.82
+IVF-Binary-256-nl547-np33-rf5-random (query)           2_669.15        81.42     2_750.57       0.2300     5.116134         5.82
+IVF-Binary-256-nl547-np33-rf10-random (query)          2_669.15       101.93     2_771.09       0.3331     3.201004         5.82
+IVF-Binary-256-nl547-np33-rf20-random (query)          2_669.15       140.83     2_809.99       0.4666     1.890853         5.82
+IVF-Binary-256-nl547-random (self)                     2_669.15       901.24     3_570.39       0.3486     2.929273         5.82
+--------------------------------------------------------------------------------------------------------------------------------
+IVF-Binary-256-nl273-np13-rf0-itq (query)              2_105.84        54.84     2_160.69       0.0866          NaN         5.79
+IVF-Binary-256-nl273-np16-rf0-itq (query)              2_105.84        61.82     2_167.67       0.0760          NaN         5.79
+IVF-Binary-256-nl273-np23-rf0-itq (query)              2_105.84        78.53     2_184.37       0.0740          NaN         5.79
+IVF-Binary-256-nl273-np13-rf5-itq (query)              2_105.84        76.44     2_182.28       0.2237     5.261834         5.79
+IVF-Binary-256-nl273-np13-rf10-itq (query)             2_105.84        98.09     2_203.94       0.3227     3.335121         5.79
+IVF-Binary-256-nl273-np13-rf20-itq (query)             2_105.84       134.45     2_240.29       0.4538     1.957094         5.79
+IVF-Binary-256-nl273-np16-rf5-itq (query)              2_105.84        83.70     2_189.55       0.2056     5.858344         5.79
+IVF-Binary-256-nl273-np16-rf10-itq (query)             2_105.84       107.03     2_212.87       0.3030     3.667372         5.79
+IVF-Binary-256-nl273-np16-rf20-itq (query)             2_105.84       147.72     2_253.56       0.4353     2.130955         5.79
+IVF-Binary-256-nl273-np23-rf5-itq (query)              2_105.84       103.26     2_209.11       0.2023     6.011169         5.79
+IVF-Binary-256-nl273-np23-rf10-itq (query)             2_105.84       127.77     2_233.62       0.2984     3.754848         5.79
+IVF-Binary-256-nl273-np23-rf20-itq (query)             2_105.84       171.06     2_276.91       0.4298     2.183232         5.79
+IVF-Binary-256-nl273-itq (self)                        2_105.84     1_068.37     3_174.21       0.3060     3.592747         5.79
+--------------------------------------------------------------------------------------------------------------------------------
+IVF-Binary-256-nl387-np19-rf0-itq (query)              2_407.59        52.54     2_460.13       0.0789          NaN         5.80
+IVF-Binary-256-nl387-np27-rf0-itq (query)              2_407.59        62.14     2_469.72       0.0754          NaN         5.80
+IVF-Binary-256-nl387-np19-rf5-itq (query)              2_407.59        70.71     2_478.29       0.2110     5.546564         5.80
+IVF-Binary-256-nl387-np19-rf10-itq (query)             2_407.59        92.09     2_499.68       0.3114     3.466633         5.80
+IVF-Binary-256-nl387-np19-rf20-itq (query)             2_407.59       130.33     2_537.92       0.4429     2.032685         5.80
+IVF-Binary-256-nl387-np27-rf5-itq (query)              2_407.59        84.07     2_491.66       0.2040     5.830488         5.80
+IVF-Binary-256-nl387-np27-rf10-itq (query)             2_407.59       107.01     2_514.60       0.3021     3.637967         5.80
+IVF-Binary-256-nl387-np27-rf20-itq (query)             2_407.59       145.91     2_553.50       0.4321     2.138410         5.80
+IVF-Binary-256-nl387-itq (self)                        2_407.59       916.28     3_323.87       0.3132     3.418433         5.80
+--------------------------------------------------------------------------------------------------------------------------------
+IVF-Binary-256-nl547-np23-rf0-itq (query)              2_848.68        50.30     2_898.98       0.0788          NaN         5.82
+IVF-Binary-256-nl547-np27-rf0-itq (query)              2_848.68        54.64     2_903.31       0.0768          NaN         5.82
+IVF-Binary-256-nl547-np33-rf0-itq (query)              2_848.68        61.42     2_910.10       0.0748          NaN         5.82
+IVF-Binary-256-nl547-np23-rf5-itq (query)              2_848.68        68.90     2_917.58       0.2131     5.392806         5.82
+IVF-Binary-256-nl547-np23-rf10-itq (query)             2_848.68        89.84     2_938.52       0.3138     3.376187         5.82
+IVF-Binary-256-nl547-np23-rf20-itq (query)             2_848.68       126.12     2_974.80       0.4476     1.984036         5.82
+IVF-Binary-256-nl547-np27-rf5-itq (query)              2_848.68        73.10     2_921.78       0.2078     5.560815         5.82
+IVF-Binary-256-nl547-np27-rf10-itq (query)             2_848.68        93.34     2_942.02       0.3074     3.486131         5.82
+IVF-Binary-256-nl547-np27-rf20-itq (query)             2_848.68       131.77     2_980.44       0.4397     2.054047         5.82
+IVF-Binary-256-nl547-np33-rf5-itq (query)              2_848.68        80.74     2_929.42       0.2026     5.786136         5.82
+IVF-Binary-256-nl547-np33-rf10-itq (query)             2_848.68       100.76     2_949.44       0.3000     3.634165         5.82
+IVF-Binary-256-nl547-np33-rf20-itq (query)             2_848.68       141.74     2_990.42       0.4312     2.137257         5.82
+IVF-Binary-256-nl547-itq (self)                        2_848.68       894.74     3_743.42       0.3171     3.323726         5.82
+--------------------------------------------------------------------------------------------------------------------------------
+IVF-Binary-512-nl273-np13-rf0-random (query)           3_083.74       101.59     3_185.33       0.1683          NaN        10.40
+IVF-Binary-512-nl273-np16-rf0-random (query)           3_083.74       115.70     3_199.45       0.1639          NaN        10.40
+IVF-Binary-512-nl273-np23-rf0-random (query)           3_083.74       146.97     3_230.72       0.1627          NaN        10.40
+IVF-Binary-512-nl273-np13-rf5-random (query)           3_083.74       133.94     3_217.69       0.3646     2.767526        10.40
+IVF-Binary-512-nl273-np13-rf10-random (query)          3_083.74       154.59     3_238.33       0.4943     1.615565        10.40
+IVF-Binary-512-nl273-np13-rf20-random (query)          3_083.74       200.87     3_284.61       0.6426     0.866902        10.40
+IVF-Binary-512-nl273-np16-rf5-random (query)           3_083.74       144.79     3_228.53       0.3572     2.873210        10.40
+IVF-Binary-512-nl273-np16-rf10-random (query)          3_083.74       172.68     3_256.43       0.4862     1.680947        10.40
+IVF-Binary-512-nl273-np16-rf20-random (query)          3_083.74       220.21     3_303.95       0.6347     0.904506        10.40
+IVF-Binary-512-nl273-np23-rf5-random (query)           3_083.74       178.81     3_262.55       0.3551     2.904493        10.40
+IVF-Binary-512-nl273-np23-rf10-random (query)          3_083.74       209.54     3_293.28       0.4838     1.699523        10.40
+IVF-Binary-512-nl273-np23-rf20-random (query)          3_083.74       262.93     3_346.67       0.6316     0.917348        10.40
+IVF-Binary-512-nl273-random (self)                     3_083.74     1_713.04     4_796.79       0.4883     1.656119        10.40
+--------------------------------------------------------------------------------------------------------------------------------
+IVF-Binary-512-nl387-np19-rf0-random (query)           3_403.96       104.54     3_508.50       0.1646          NaN        10.41
+IVF-Binary-512-nl387-np27-rf0-random (query)           3_403.96       130.06     3_534.02       0.1629          NaN        10.41
+IVF-Binary-512-nl387-np19-rf5-random (query)           3_403.96       141.91     3_545.88       0.3606     2.821520        10.41
+IVF-Binary-512-nl387-np19-rf10-random (query)          3_403.96       156.94     3_560.90       0.4905     1.641297        10.41
+IVF-Binary-512-nl387-np19-rf20-random (query)          3_403.96       212.91     3_616.88       0.6384     0.885257        10.41
+IVF-Binary-512-nl387-np27-rf5-random (query)           3_403.96       159.40     3_563.36       0.3565     2.883438        10.41
+IVF-Binary-512-nl387-np27-rf10-random (query)          3_403.96       186.76     3_590.72       0.4854     1.680373        10.41
+IVF-Binary-512-nl387-np27-rf20-random (query)          3_403.96       234.70     3_638.66       0.6332     0.908750        10.41
+IVF-Binary-512-nl387-random (self)                     3_403.96     1_571.57     4_975.53       0.4916     1.624401        10.41
+--------------------------------------------------------------------------------------------------------------------------------
+IVF-Binary-512-nl547-np23-rf0-random (query)           3_878.43       100.44     3_978.87       0.1656          NaN        10.43
+IVF-Binary-512-nl547-np27-rf0-random (query)           3_878.43       109.92     3_988.35       0.1644          NaN        10.43
+IVF-Binary-512-nl547-np33-rf0-random (query)           3_878.43       123.40     4_001.83       0.1631          NaN        10.43
+IVF-Binary-512-nl547-np23-rf5-random (query)           3_878.43       126.39     4_004.82       0.3625     2.787397        10.43
+IVF-Binary-512-nl547-np23-rf10-random (query)          3_878.43       151.43     4_029.86       0.4925     1.617504        10.43
+IVF-Binary-512-nl547-np23-rf20-random (query)          3_878.43       194.55     4_072.98       0.6421     0.867831        10.43
+IVF-Binary-512-nl547-np27-rf5-random (query)           3_878.43       136.93     4_015.36       0.3595     2.836286        10.43
+IVF-Binary-512-nl547-np27-rf10-random (query)          3_878.43       162.09     4_040.52       0.4889     1.650064        10.43
+IVF-Binary-512-nl547-np27-rf20-random (query)          3_878.43       205.67     4_084.10       0.6374     0.891076        10.43
+IVF-Binary-512-nl547-np33-rf5-random (query)           3_878.43       150.97     4_029.40       0.3567     2.879432        10.43
+IVF-Binary-512-nl547-np33-rf10-random (query)          3_878.43       178.29     4_056.72       0.4850     1.679600        10.43
+IVF-Binary-512-nl547-np33-rf20-random (query)          3_878.43       224.74     4_103.17       0.6330     0.910585        10.43
+IVF-Binary-512-nl547-random (self)                     3_878.43     1_508.79     5_387.21       0.4939     1.602424        10.43
+--------------------------------------------------------------------------------------------------------------------------------
+IVF-Binary-512-nl273-np13-rf0-itq (query)              3_338.05       105.03     3_443.08       0.1641          NaN        10.40
+IVF-Binary-512-nl273-np16-rf0-itq (query)              3_338.05       119.75     3_457.80       0.1594          NaN        10.40
+IVF-Binary-512-nl273-np23-rf0-itq (query)              3_338.05       160.53     3_498.58       0.1586          NaN        10.40
+IVF-Binary-512-nl273-np13-rf5-itq (query)              3_338.05       134.81     3_472.86       0.3619     2.813177        10.40
+IVF-Binary-512-nl273-np13-rf10-itq (query)             3_338.05       158.48     3_496.53       0.4904     1.636914        10.40
+IVF-Binary-512-nl273-np13-rf20-itq (query)             3_338.05       202.63     3_540.68       0.6375     0.887765        10.40
+IVF-Binary-512-nl273-np16-rf5-itq (query)              3_338.05       147.18     3_485.23       0.3546     2.933729        10.40
+IVF-Binary-512-nl273-np16-rf10-itq (query)             3_338.05       177.55     3_515.60       0.4823     1.711114        10.40
+IVF-Binary-512-nl273-np16-rf20-itq (query)             3_338.05       223.19     3_561.23       0.6300     0.926617        10.40
+IVF-Binary-512-nl273-np23-rf5-itq (query)              3_338.05       181.72     3_519.77       0.3528     2.960040        10.40
+IVF-Binary-512-nl273-np23-rf10-itq (query)             3_338.05       214.06     3_552.10       0.4803     1.727661        10.40
+IVF-Binary-512-nl273-np23-rf20-itq (query)             3_338.05       264.43     3_602.48       0.6274     0.938000        10.40
+IVF-Binary-512-nl273-itq (self)                        3_338.05     1_751.03     5_089.08       0.4820     1.710575        10.40
+--------------------------------------------------------------------------------------------------------------------------------
+IVF-Binary-512-nl387-np19-rf0-itq (query)              3_648.91       112.02     3_760.93       0.1609          NaN        10.41
+IVF-Binary-512-nl387-np27-rf0-itq (query)              3_648.91       131.41     3_780.32       0.1592          NaN        10.41
+IVF-Binary-512-nl387-np19-rf5-itq (query)              3_648.91       135.11     3_784.02       0.3568     2.892556        10.41
+IVF-Binary-512-nl387-np19-rf10-itq (query)             3_648.91       158.62     3_807.53       0.4854     1.682095        10.41
+IVF-Binary-512-nl387-np19-rf20-itq (query)             3_648.91       202.30     3_851.21       0.6337     0.905241        10.41
+IVF-Binary-512-nl387-np27-rf5-itq (query)              3_648.91       160.14     3_809.05       0.3527     2.960534        10.41
+IVF-Binary-512-nl387-np27-rf10-itq (query)             3_648.91       188.24     3_837.15       0.4808     1.722693        10.41
+IVF-Binary-512-nl387-np27-rf20-itq (query)             3_648.91       236.80     3_885.71       0.6286     0.930674        10.41
+IVF-Binary-512-nl387-itq (self)                        3_648.91     1_572.60     5_221.51       0.4852     1.677564        10.41
+--------------------------------------------------------------------------------------------------------------------------------
+IVF-Binary-512-nl547-np23-rf0-itq (query)              4_079.68       105.64     4_185.31       0.1610          NaN        10.43
+IVF-Binary-512-nl547-np27-rf0-itq (query)              4_079.68       108.11     4_187.78       0.1597          NaN        10.43
+IVF-Binary-512-nl547-np33-rf0-itq (query)              4_079.68       121.97     4_201.64       0.1585          NaN        10.43
+IVF-Binary-512-nl547-np23-rf5-itq (query)              4_079.68       126.66     4_206.33       0.3587     2.845388        10.43
+IVF-Binary-512-nl547-np23-rf10-itq (query)             4_079.68       150.14     4_229.82       0.4877     1.654173        10.43
+IVF-Binary-512-nl547-np23-rf20-itq (query)             4_079.68       207.10     4_286.77       0.6368     0.890153        10.43
+IVF-Binary-512-nl547-np27-rf5-itq (query)              4_079.68       134.64     4_214.31       0.3558     2.897453        10.43
+IVF-Binary-512-nl547-np27-rf10-itq (query)             4_079.68       161.44     4_241.12       0.4840     1.690117        10.43
+IVF-Binary-512-nl547-np27-rf20-itq (query)             4_079.68       208.07     4_287.75       0.6324     0.913921        10.43
+IVF-Binary-512-nl547-np33-rf5-itq (query)              4_079.68       158.65     4_238.33       0.3530     2.949192        10.43
+IVF-Binary-512-nl547-np33-rf10-itq (query)             4_079.68       176.07     4_255.75       0.4806     1.719996        10.43
+IVF-Binary-512-nl547-np33-rf20-itq (query)             4_079.68       222.52     4_302.20       0.6284     0.933792        10.43
+IVF-Binary-512-nl547-itq (self)                        4_079.68     1_494.62     5_574.29       0.4876     1.653264        10.43
+--------------------------------------------------------------------------------------------------------------------------------
+IVF-Binary-32-nl273-np13-rf0-signed (query)              926.77        37.67       964.45       0.0129          NaN         1.76
+IVF-Binary-32-nl273-np16-rf0-signed (query)              926.77        43.38       970.16       0.0072          NaN         1.76
+IVF-Binary-32-nl273-np23-rf0-signed (query)              926.77        57.92       984.69       0.0063          NaN         1.76
+IVF-Binary-32-nl273-np13-rf5-signed (query)              926.77        43.49       970.27       0.0586    13.096980         1.76
+IVF-Binary-32-nl273-np13-rf10-signed (query)             926.77        51.21       977.98       0.1112     9.821555         1.76
+IVF-Binary-32-nl273-np13-rf20-signed (query)             926.77        68.36       995.13       0.2011     7.183025         1.76
+IVF-Binary-32-nl273-np16-rf5-signed (query)              926.77        50.08       976.85       0.0348    15.883413         1.76
+IVF-Binary-32-nl273-np16-rf10-signed (query)             926.77        57.54       984.31       0.0691    12.325441         1.76
+IVF-Binary-32-nl273-np16-rf20-signed (query)             926.77        75.18     1_001.96       0.1292     9.466448         1.76
+IVF-Binary-32-nl273-np23-rf5-signed (query)              926.77        66.25       993.03       0.0313    16.844205         1.76
+IVF-Binary-32-nl273-np23-rf10-signed (query)             926.77        74.72     1_001.50       0.0621    13.207787         1.76
+IVF-Binary-32-nl273-np23-rf20-signed (query)             926.77        92.13     1_018.91       0.1180    10.184865         1.76
+IVF-Binary-32-nl273-signed (self)                        926.77       573.84     1_500.61       0.0698    12.240784         1.76
+--------------------------------------------------------------------------------------------------------------------------------
+IVF-Binary-32-nl387-np19-rf0-signed (query)            1_249.43        38.86     1_288.29       0.0091          NaN         1.77
+IVF-Binary-32-nl387-np27-rf0-signed (query)            1_249.43        51.41     1_300.83       0.0074          NaN         1.77
+IVF-Binary-32-nl387-np19-rf5-signed (query)            1_249.43        46.46     1_295.89       0.0424    14.581671         1.77
+IVF-Binary-32-nl387-np19-rf10-signed (query)           1_249.43        52.46     1_301.88       0.0819    11.231527         1.77
+IVF-Binary-32-nl387-np19-rf20-signed (query)           1_249.43        71.26     1_320.69       0.1529     8.266913         1.77
+IVF-Binary-32-nl387-np27-rf5-signed (query)            1_249.43        57.55     1_306.98       0.0359    16.263112         1.77
+IVF-Binary-32-nl387-np27-rf10-signed (query)           1_249.43        66.68     1_316.11       0.0683    12.773930         1.77
+IVF-Binary-32-nl387-np27-rf20-signed (query)           1_249.43        82.75     1_332.18       0.1290     9.520516         1.77
+IVF-Binary-32-nl387-signed (self)                      1_249.43       521.82     1_771.25       0.0810    11.197807         1.77
+IVF-Binary-32-nl547-np23-rf0-signed (query)            1_714.77        36.82     1_751.59       0.0093          NaN         1.79
+IVF-Binary-32-nl547-np27-rf0-signed (query)            1_714.77        41.44     1_756.20       0.0082          NaN         1.79
+IVF-Binary-32-nl547-np33-rf0-signed (query)            1_714.77        47.49     1_762.25       0.0073          NaN         1.79
+--------------------------------------------------------------------------------------------------------------------------------
+IVF-Binary-32-nl547-np23-rf5-signed (query)            1_714.77        43.11     1_757.88       0.0435    13.965319         1.79
+IVF-Binary-32-nl547-np23-rf10-signed (query)           1_714.77        49.93     1_764.69       0.0846    10.644863         1.79
+IVF-Binary-32-nl547-np23-rf20-signed (query)           1_714.77        66.08     1_780.84       0.1608     7.468921         1.79
+IVF-Binary-32-nl547-np27-rf5-signed (query)            1_714.77        47.66     1_762.42       0.0394    15.076596         1.79
+IVF-Binary-32-nl547-np27-rf10-signed (query)           1_714.77        54.01     1_768.77       0.0769    11.641643         1.79
+IVF-Binary-32-nl547-np27-rf20-signed (query)           1_714.77        69.44     1_784.21       0.1463     8.230163         1.79
+IVF-Binary-32-nl547-np33-rf5-signed (query)            1_714.77        53.97     1_768.73       0.0352    16.505947         1.79
+IVF-Binary-32-nl547-np33-rf10-signed (query)           1_714.77        60.82     1_775.58       0.0684    12.933777         1.79
+IVF-Binary-32-nl547-np33-rf20-signed (query)           1_714.77        76.43     1_791.20       0.1304     9.277859         1.79
+IVF-Binary-32-nl547-signed (self)                      1_714.77       493.74     2_208.51       0.0872    10.587026         1.79
 --------------------------------------------------------------------------------------------------------------------------------
 </code></pre>
 </details>
 
-#### With higher dimensionality
+#### With more dimensions
 
-The compression performance increases; however, the Recall clearly suffers
-with higher dimensions. Potentially this can be mitigated with providing more
-bits.
+The binary indices shine more with more dimensions in the end; however,
+the strong compression still yields much worse Recalls.
 
 <details>
-<summary><b>Binary - Euclidean (Gaussian - higher dimensionality)</b>:</summary>
+<summary><b>Binary - Euclidean (LowRank - 128 bit)</b>:</summary>
+</br>
 <pre><code>
 ================================================================================================================================
 Benchmark: 150k cells, 128D - Binary Quantisation
 ================================================================================================================================
 Method                                               Build (ms)   Query (ms)   Total (ms)     Recall@k   Dist Error    Size (MB)
 --------------------------------------------------------------------------------------------------------------------------------
-Exhaustive (query)                                        14.10     6_220.39     6_234.49       1.0000     0.000000        73.24
-Exhaustive (self)                                         14.10    65_083.57    65_097.67       1.0000     0.000000        73.24
+Exhaustive (query)                                        14.49     5_942.66     5_957.15       1.0000     0.000000        73.24
+Exhaustive (self)                                         14.49    60_708.87    60_723.36       1.0000     0.000000        73.24
 --------------------------------------------------------------------------------------------------------------------------------
-ExhaustiveBinary-256-random_no_rr (query)              3_921.15       541.49     4_462.64       0.1084          NaN         4.70
-ExhaustiveBinary-256-random-rf5 (query)                3_921.15       626.67     4_547.82       0.1994    32.157948         4.70
-ExhaustiveBinary-256-random-rf10 (query)               3_921.15       755.48     4_676.63       0.2740    21.742093         4.70
-ExhaustiveBinary-256-random-rf20 (query)               3_921.15       905.33     4_826.48       0.3781    14.028739         4.70
-ExhaustiveBinary-256-random (self)                     3_921.15     6_839.61    10_760.76       0.2729    21.873275         4.70
-ExhaustiveBinary-256-itq_no_rr (query)                21_329.30       530.03    21_859.33       0.0945          NaN         4.70
-ExhaustiveBinary-256-itq-rf5 (query)                  21_329.30       574.26    21_903.56       0.1625    37.472052         4.70
-ExhaustiveBinary-256-itq-rf10 (query)                 21_329.30       648.32    21_977.62       0.2221    26.042140         4.70
-ExhaustiveBinary-256-itq-rf20 (query)                 21_329.30       789.57    22_118.87       0.3085    17.458979         4.70
-ExhaustiveBinary-256-itq (self)                       21_329.30     6_765.21    28_094.51       0.2220    26.221286         4.70
+ExhaustiveBinary-256-random_no_rr (query)              3_749.88       506.84     4_256.73       0.0770          NaN         4.70
+ExhaustiveBinary-256-random-rf5 (query)                3_749.88       551.92     4_301.80       0.1853    40.590911         4.70
+ExhaustiveBinary-256-random-rf10 (query)               3_749.88       610.01     4_359.89       0.2680    26.716815         4.70
+ExhaustiveBinary-256-random-rf20 (query)               3_749.88       705.65     4_455.53       0.3854    16.589779         4.70
+ExhaustiveBinary-256-random (self)                     3_749.88     6_451.39    10_201.27       0.2721    26.279507         4.70
 --------------------------------------------------------------------------------------------------------------------------------
-ExhaustiveBinary-512-random_no_rr (query)              7_734.60       904.19     8_638.79       0.1437          NaN         9.41
-ExhaustiveBinary-512-random-rf5 (query)                7_734.60       960.39     8_694.98       0.2864    21.279597         9.41
-ExhaustiveBinary-512-random-rf10 (query)               7_734.60     1_012.96     8_747.56       0.3868    13.379880         9.41
-ExhaustiveBinary-512-random-rf20 (query)               7_734.60     1_129.52     8_864.12       0.5137     7.900976         9.41
-ExhaustiveBinary-512-random (self)                     7_734.60    10_112.55    17_847.15       0.3866    13.445004         9.41
-ExhaustiveBinary-512-itq_no_rr (query)                21_780.10       898.33    22_678.43       0.1367          NaN         9.41
-ExhaustiveBinary-512-itq-rf5 (query)                  21_780.10       946.85    22_726.95       0.2673    22.229428         9.41
-ExhaustiveBinary-512-itq-rf10 (query)                 21_780.10     1_003.81    22_783.90       0.3636    14.093214         9.41
-ExhaustiveBinary-512-itq-rf20 (query)                 21_780.10     1_133.39    22_913.49       0.4852     8.407298         9.41
-ExhaustiveBinary-512-itq (self)                       21_780.10    10_266.74    32_046.84       0.3631    14.195195         9.41
+ExhaustiveBinary-256-itq_no_rr (query)                 4_523.65       506.95     5_030.60       0.0352          NaN         4.70
+ExhaustiveBinary-256-itq-rf5 (query)                   4_523.65       545.31     5_068.97       0.1078    58.311100         4.70
+ExhaustiveBinary-256-itq-rf10 (query)                  4_523.65       604.79     5_128.45       0.1716    39.742881         4.70
+ExhaustiveBinary-256-itq-rf20 (query)                  4_523.65       691.54     5_215.19       0.2692    25.845190         4.70
+ExhaustiveBinary-256-itq (self)                        4_523.65     5_980.26    10_503.92       0.1755    39.408653         4.70
 --------------------------------------------------------------------------------------------------------------------------------
-ExhaustiveBinary-1024-random_no_rr (query)            15_212.40     1_517.52    16_729.92       0.2051          NaN        18.81
-ExhaustiveBinary-1024-random-rf5 (query)              15_212.40     1_604.55    16_816.96       0.4198    11.866665        18.81
-ExhaustiveBinary-1024-random-rf10 (query)             15_212.40     1_901.96    17_114.36       0.5478     6.608533        18.81
-ExhaustiveBinary-1024-random-rf20 (query)             15_212.40     1_876.36    17_088.76       0.6844     3.360088        18.81
-ExhaustiveBinary-1024-random (self)                   15_212.40    16_703.55    31_915.96       0.5467     6.665345        18.81
-ExhaustiveBinary-1024-itq_no_rr (query)               29_500.80     1_716.92    31_217.72       0.2061          NaN        18.81
-ExhaustiveBinary-1024-itq-rf5 (query)                 29_500.80     1_749.40    31_250.20       0.4209    11.394439        18.81
-ExhaustiveBinary-1024-itq-rf10 (query)                29_500.80     1_726.90    31_227.70       0.5491     6.304691        18.81
-ExhaustiveBinary-1024-itq-rf20 (query)                29_500.80     1_855.63    31_356.43       0.6837     3.180706        18.81
-ExhaustiveBinary-1024-itq (self)                      29_500.80    17_392.05    46_892.84       0.5479     6.374041        18.81
+ExhaustiveBinary-512-random_no_rr (query)              7_295.14       880.11     8_175.25       0.1527          NaN         9.41
+ExhaustiveBinary-512-random-rf5 (query)                7_295.14       926.26     8_221.40       0.3242    22.196757         9.41
+ExhaustiveBinary-512-random-rf10 (query)               7_295.14       980.95     8_276.09       0.4419    13.545010         9.41
+ExhaustiveBinary-512-random-rf20 (query)               7_295.14     1_095.49     8_390.63       0.5832     7.719977         9.41
+ExhaustiveBinary-512-random (self)                     7_295.14     9_801.09    17_096.23       0.4431    13.453984         9.41
 --------------------------------------------------------------------------------------------------------------------------------
-IVF-Binary-256-nl273-np13-rf0-random (query)           6_905.42        93.26     6_998.68       0.1096          NaN         5.98
-IVF-Binary-256-nl273-np16-rf0-random (query)           6_905.42        95.63     7_001.05       0.1090          NaN         5.98
-IVF-Binary-256-nl273-np23-rf0-random (query)           6_905.42       110.38     7_015.80       0.1084          NaN         5.98
-IVF-Binary-256-nl273-np13-rf5-random (query)           6_905.42       134.30     7_039.72       0.2030    31.751737         5.98
-IVF-Binary-256-nl273-np13-rf10-random (query)          6_905.42       180.97     7_086.40       0.2783    21.451970         5.98
-IVF-Binary-256-nl273-np13-rf20-random (query)          6_905.42       248.56     7_153.99       0.3831    13.845393         5.98
-IVF-Binary-256-nl273-np16-rf5-random (query)           6_905.42       146.04     7_051.47       0.2018    31.841557         5.98
-IVF-Binary-256-nl273-np16-rf10-random (query)          6_905.42       176.57     7_082.00       0.2772    21.495384         5.98
-IVF-Binary-256-nl273-np16-rf20-random (query)          6_905.42       249.06     7_154.49       0.3822    13.865485         5.98
-IVF-Binary-256-nl273-np23-rf5-random (query)           6_905.42       157.87     7_063.29       0.2002    32.034661         5.98
-IVF-Binary-256-nl273-np23-rf10-random (query)          6_905.42       218.42     7_123.84       0.2754    21.644438         5.98
-IVF-Binary-256-nl273-np23-rf20-random (query)          6_905.42       284.39     7_189.81       0.3797    13.961364         5.98
-IVF-Binary-256-nl273-random (self)                     6_905.42     1_795.37     8_700.80       0.2761    21.639918         5.98
-IVF-Binary-256-nl387-np19-rf0-random (query)           7_831.69        94.42     7_926.11       0.1094          NaN         6.04
-IVF-Binary-256-nl387-np27-rf0-random (query)           7_831.69       109.13     7_940.82       0.1087          NaN         6.04
-IVF-Binary-256-nl387-np19-rf5-random (query)           7_831.69       132.50     7_964.20       0.2028    31.696102         6.04
-IVF-Binary-256-nl387-np19-rf10-random (query)          7_831.69       169.68     8_001.38       0.2786    21.406275         6.04
-IVF-Binary-256-nl387-np19-rf20-random (query)          7_831.69       239.57     8_071.27       0.3833    13.805239         6.04
-IVF-Binary-256-nl387-np27-rf5-random (query)           7_831.69       143.24     7_974.93       0.2007    31.963751         6.04
-IVF-Binary-256-nl387-np27-rf10-random (query)          7_831.69       182.47     8_014.16       0.2760    21.607746         6.04
-IVF-Binary-256-nl387-np27-rf20-random (query)          7_831.69       258.98     8_090.68       0.3804    13.920033         6.04
-IVF-Binary-256-nl387-random (self)                     7_831.69     1_693.94     9_525.64       0.2773    21.534373         6.04
-IVF-Binary-256-nl547-np23-rf0-random (query)           9_379.59        95.40     9_474.99       0.1100          NaN         6.12
-IVF-Binary-256-nl547-np27-rf0-random (query)           9_379.59       100.09     9_479.68       0.1096          NaN         6.12
-IVF-Binary-256-nl547-np33-rf0-random (query)           9_379.59       109.30     9_488.89       0.1093          NaN         6.12
-IVF-Binary-256-nl547-np23-rf5-random (query)           9_379.59       133.36     9_512.95       0.2038    31.573320         6.12
-IVF-Binary-256-nl547-np23-rf10-random (query)          9_379.59       170.38     9_549.97       0.2797    21.303754         6.12
-IVF-Binary-256-nl547-np23-rf20-random (query)          9_379.59       236.48     9_616.07       0.3853    13.729825         6.12
-IVF-Binary-256-nl547-np27-rf5-random (query)           9_379.59       136.08     9_515.67       0.2028    31.729254         6.12
-IVF-Binary-256-nl547-np27-rf10-random (query)          9_379.59       175.79     9_555.38       0.2788    21.394742         6.12
-IVF-Binary-256-nl547-np27-rf20-random (query)          9_379.59       244.75     9_624.34       0.3841    13.777109         6.12
-IVF-Binary-256-nl547-np33-rf5-random (query)           9_379.59       143.13     9_522.72       0.2016    31.877463         6.12
-IVF-Binary-256-nl547-np33-rf10-random (query)          9_379.59       184.03     9_563.62       0.2771    21.517933         6.12
-IVF-Binary-256-nl547-np33-rf20-random (query)          9_379.59       256.91     9_636.50       0.3815    13.885112         6.12
-IVF-Binary-256-nl547-random (self)                     9_379.59     1_709.47    11_089.06       0.2790    21.421506         6.12
-IVF-Binary-256-nl273-np13-rf0-itq (query)             29_780.77        95.01    29_875.78       0.0965          NaN         5.98
-IVF-Binary-256-nl273-np16-rf0-itq (query)             29_780.77        97.77    29_878.54       0.0958          NaN         5.98
-IVF-Binary-256-nl273-np23-rf0-itq (query)             29_780.77       117.73    29_898.50       0.0950          NaN         5.98
-IVF-Binary-256-nl273-np13-rf5-itq (query)             29_780.77       126.94    29_907.71       0.1665    36.739101         5.98
-IVF-Binary-256-nl273-np13-rf10-itq (query)            29_780.77       164.71    29_945.48       0.2275    25.483066         5.98
-IVF-Binary-256-nl273-np13-rf20-itq (query)            29_780.77       244.46    30_025.23       0.3162    17.032533         5.98
-IVF-Binary-256-nl273-np16-rf5-itq (query)             29_780.77       137.25    29_918.02       0.1650    36.979770         5.98
-IVF-Binary-256-nl273-np16-rf10-itq (query)            29_780.77       187.16    29_967.93       0.2257    25.658442         5.98
-IVF-Binary-256-nl273-np16-rf20-itq (query)            29_780.77       286.64    30_067.41       0.3139    17.150469         5.98
-IVF-Binary-256-nl273-np23-rf5-itq (query)             29_780.77       174.86    29_955.63       0.1636    37.284541         5.98
-IVF-Binary-256-nl273-np23-rf10-itq (query)            29_780.77       191.72    29_972.49       0.2234    25.907187         5.98
-IVF-Binary-256-nl273-np23-rf20-itq (query)            29_780.77       283.13    30_063.90       0.3105    17.343394         5.98
-IVF-Binary-256-nl273-itq (self)                       29_780.77     2_046.52    31_827.28       0.2259    25.817802         5.98
-IVF-Binary-256-nl387-np19-rf0-itq (query)             35_598.79        96.33    35_695.12       0.0961          NaN         6.04
-IVF-Binary-256-nl387-np27-rf0-itq (query)             35_598.79       105.74    35_704.53       0.0953          NaN         6.04
-IVF-Binary-256-nl387-np19-rf5-itq (query)             35_598.79       139.43    35_738.23       0.1664    36.733791         6.04
-IVF-Binary-256-nl387-np19-rf10-itq (query)            35_598.79       170.11    35_768.90       0.2270    25.500114         6.04
-IVF-Binary-256-nl387-np19-rf20-itq (query)            35_598.79       235.19    35_833.98       0.3156    17.018354         6.04
-IVF-Binary-256-nl387-np27-rf5-itq (query)             35_598.79       140.58    35_739.38       0.1643    37.153489         6.04
-IVF-Binary-256-nl387-np27-rf10-itq (query)            35_598.79       178.78    35_777.58       0.2241    25.807327         6.04
-IVF-Binary-256-nl387-np27-rf20-itq (query)            35_598.79       253.00    35_851.80       0.3116    17.249116         6.04
-IVF-Binary-256-nl387-itq (self)                       35_598.79     1_656.26    37_255.05       0.2273    25.650711         6.04
-IVF-Binary-256-nl547-np23-rf0-itq (query)             26_355.10       106.23    26_461.33       0.0968          NaN         6.12
-IVF-Binary-256-nl547-np27-rf0-itq (query)             26_355.10       109.46    26_464.55       0.0961          NaN         6.12
-IVF-Binary-256-nl547-np33-rf0-itq (query)             26_355.10       106.11    26_461.21       0.0956          NaN         6.12
-IVF-Binary-256-nl547-np23-rf5-itq (query)             26_355.10       135.76    26_490.85       0.1675    36.528420         6.12
-IVF-Binary-256-nl547-np23-rf10-itq (query)            26_355.10       191.41    26_546.51       0.2290    25.330151         6.12
-IVF-Binary-256-nl547-np23-rf20-itq (query)            26_355.10       308.46    26_663.56       0.3183    16.888824         6.12
-IVF-Binary-256-nl547-np27-rf5-itq (query)             26_355.10       142.18    26_497.28       0.1663    36.754181         6.12
-IVF-Binary-256-nl547-np27-rf10-itq (query)            26_355.10       174.68    26_529.78       0.2274    25.501755         6.12
-IVF-Binary-256-nl547-np27-rf20-itq (query)            26_355.10       295.39    26_650.48       0.3161    17.009611         6.12
-IVF-Binary-256-nl547-np33-rf5-itq (query)             26_355.10       167.00    26_522.09       0.1648    37.012561         6.12
-IVF-Binary-256-nl547-np33-rf10-itq (query)            26_355.10       224.82    26_579.91       0.2251    25.731574         6.12
-IVF-Binary-256-nl547-np33-rf20-itq (query)            26_355.10       276.56    26_631.66       0.3130    17.178192         6.12
-IVF-Binary-256-nl547-itq (self)                       26_355.10     1_729.34    28_084.44       0.2292    25.464976         6.12
+ExhaustiveBinary-512-itq_no_rr (query)                 8_298.31       880.78     9_179.09       0.1257          NaN         9.41
+ExhaustiveBinary-512-itq-rf5 (query)                   8_298.31       936.70     9_235.01       0.2688    27.688764         9.41
+ExhaustiveBinary-512-itq-rf10 (query)                  8_298.31       982.79     9_281.11       0.3728    17.457655         9.41
+ExhaustiveBinary-512-itq-rf20 (query)                  8_298.31     1_110.77     9_409.08       0.5062    10.365482         9.41
+ExhaustiveBinary-512-itq (self)                        8_298.31     9_823.33    18_121.65       0.3728    17.440968         9.41
 --------------------------------------------------------------------------------------------------------------------------------
-IVF-Binary-512-nl273-np13-rf0-random (query)          10_657.71       180.37    10_838.08       0.1448          NaN        10.69
-IVF-Binary-512-nl273-np16-rf0-random (query)          10_657.71       196.79    10_854.50       0.1444          NaN        10.69
-IVF-Binary-512-nl273-np23-rf0-random (query)          10_657.71       232.69    10_890.40       0.1441          NaN        10.69
-IVF-Binary-512-nl273-np13-rf5-random (query)          10_657.71       234.22    10_891.93       0.2872    21.249805        10.69
-IVF-Binary-512-nl273-np13-rf10-random (query)         10_657.71       275.24    10_932.94       0.3875    13.437040        10.69
-IVF-Binary-512-nl273-np13-rf20-random (query)         10_657.71       345.23    11_002.94       0.5122     8.034049        10.69
-IVF-Binary-512-nl273-np16-rf5-random (query)          10_657.71       250.75    10_908.45       0.2873    21.194718        10.69
-IVF-Binary-512-nl273-np16-rf10-random (query)         10_657.71       297.36    10_955.07       0.3888    13.330334        10.69
-IVF-Binary-512-nl273-np16-rf20-random (query)         10_657.71       372.33    11_030.03       0.5146     7.902241        10.69
-IVF-Binary-512-nl273-np23-rf5-random (query)          10_657.71       289.24    10_946.94       0.2867    21.236842        10.69
-IVF-Binary-512-nl273-np23-rf10-random (query)         10_657.71       341.41    10_999.12       0.3878    13.344013        10.69
-IVF-Binary-512-nl273-np23-rf20-random (query)         10_657.71       424.83    11_082.54       0.5144     7.878926        10.69
-IVF-Binary-512-nl273-random (self)                    10_657.71     2_971.85    13_629.56       0.3881    13.397683        10.69
-IVF-Binary-512-nl387-np19-rf0-random (query)          11_604.74       186.65    11_791.39       0.1448          NaN        10.74
-IVF-Binary-512-nl387-np27-rf0-random (query)          11_604.74       219.07    11_823.81       0.1443          NaN        10.74
-IVF-Binary-512-nl387-np19-rf5-random (query)          11_604.74       252.05    11_856.79       0.2876    21.174211        10.74
-IVF-Binary-512-nl387-np19-rf10-random (query)         11_604.74       288.82    11_893.56       0.3887    13.364617        10.74
-IVF-Binary-512-nl387-np19-rf20-random (query)         11_604.74       363.48    11_968.22       0.5143     7.941332        10.74
-IVF-Binary-512-nl387-np27-rf5-random (query)          11_604.74       283.55    11_888.28       0.2869    21.212750        10.74
-IVF-Binary-512-nl387-np27-rf10-random (query)         11_604.74       326.92    11_931.66       0.3884    13.326710        10.74
-IVF-Binary-512-nl387-np27-rf20-random (query)         11_604.74       461.05    12_065.79       0.5150     7.862487        10.74
-IVF-Binary-512-nl387-random (self)                    11_604.74     2_876.27    14_481.01       0.3882    13.418317        10.74
-IVF-Binary-512-nl547-np23-rf0-random (query)          13_276.55       182.63    13_459.17       0.1452          NaN        10.82
-IVF-Binary-512-nl547-np27-rf0-random (query)          13_276.55       193.41    13_469.95       0.1449          NaN        10.82
-IVF-Binary-512-nl547-np33-rf0-random (query)          13_276.55       211.53    13_488.07       0.1444          NaN        10.82
-IVF-Binary-512-nl547-np23-rf5-random (query)          13_276.55       246.17    13_522.71       0.2885    21.132808        10.82
-IVF-Binary-512-nl547-np23-rf10-random (query)         13_276.55       273.76    13_550.31       0.3893    13.351620        10.82
-IVF-Binary-512-nl547-np23-rf20-random (query)         13_276.55       351.07    13_627.61       0.5152     7.947935        10.82
-IVF-Binary-512-nl547-np27-rf5-random (query)          13_276.55       246.60    13_523.14       0.2886    21.124299        10.82
-IVF-Binary-512-nl547-np27-rf10-random (query)         13_276.55       288.70    13_565.25       0.3898    13.287882        10.82
-IVF-Binary-512-nl547-np27-rf20-random (query)         13_276.55       385.93    13_662.48       0.5167     7.854387        10.82
-IVF-Binary-512-nl547-np33-rf5-random (query)          13_276.55       274.01    13_550.56       0.2879    21.166019        10.82
-IVF-Binary-512-nl547-np33-rf10-random (query)         13_276.55       313.28    13_589.82       0.3891    13.290361        10.82
-IVF-Binary-512-nl547-np33-rf20-random (query)         13_276.55       384.67    13_661.21       0.5161     7.842132        10.82
-IVF-Binary-512-nl547-random (self)                    13_276.55     2_727.98    16_004.52       0.3891    13.391642        10.82
-IVF-Binary-512-nl273-np13-rf0-itq (query)             28_875.72       182.57    29_058.29       0.1378          NaN        10.69
-IVF-Binary-512-nl273-np16-rf0-itq (query)             28_875.72       196.04    29_071.76       0.1375          NaN        10.69
-IVF-Binary-512-nl273-np23-rf0-itq (query)             28_875.72       231.46    29_107.17       0.1371          NaN        10.69
-IVF-Binary-512-nl273-np13-rf5-itq (query)             28_875.72       232.59    29_108.31       0.2691    22.120983        10.69
-IVF-Binary-512-nl273-np13-rf10-itq (query)            28_875.72       275.99    29_151.70       0.3649    14.114843        10.69
-IVF-Binary-512-nl273-np13-rf20-itq (query)            28_875.72       342.67    29_218.39       0.4846     8.519714        10.69
-IVF-Binary-512-nl273-np16-rf5-itq (query)             28_875.72       251.42    29_127.14       0.2692    22.090805        10.69
-IVF-Binary-512-nl273-np16-rf10-itq (query)            28_875.72       294.57    29_170.29       0.3655    14.032002        10.69
-IVF-Binary-512-nl273-np16-rf20-itq (query)            28_875.72       370.36    29_246.08       0.4867     8.393640        10.69
-IVF-Binary-512-nl273-np23-rf5-itq (query)             28_875.72       298.73    29_174.45       0.2681    22.167927        10.69
-IVF-Binary-512-nl273-np23-rf10-itq (query)            28_875.72       341.41    29_217.13       0.3645    14.059004        10.69
-IVF-Binary-512-nl273-np23-rf20-itq (query)            28_875.72       422.25    29_297.96       0.4863     8.381342        10.69
-IVF-Binary-512-nl273-itq (self)                       28_875.72     2_958.33    31_834.05       0.3649    14.124327        10.69
-IVF-Binary-512-nl387-np19-rf0-itq (query)             26_148.24       187.81    26_336.05       0.1376          NaN        10.74
-IVF-Binary-512-nl387-np27-rf0-itq (query)             26_148.24       216.03    26_364.27       0.1372          NaN        10.74
-IVF-Binary-512-nl387-np19-rf5-itq (query)             26_148.24       241.30    26_389.54       0.2696    22.060949        10.74
-IVF-Binary-512-nl387-np19-rf10-itq (query)            26_148.24       281.35    26_429.59       0.3656    14.048951        10.74
-IVF-Binary-512-nl387-np19-rf20-itq (query)            26_148.24       350.59    26_498.83       0.4860     8.446059        10.74
-IVF-Binary-512-nl387-np27-rf5-itq (query)             26_148.24       272.71    26_420.95       0.2688    22.108863        10.74
-IVF-Binary-512-nl387-np27-rf10-itq (query)            26_148.24       319.57    26_467.81       0.3651    14.029173        10.74
-IVF-Binary-512-nl387-np27-rf20-itq (query)            26_148.24       407.22    26_555.45       0.4867     8.367913        10.74
-IVF-Binary-512-nl387-itq (self)                       26_148.24     2_817.74    28_965.98       0.3652    14.135805        10.74
-IVF-Binary-512-nl547-np23-rf0-itq (query)             33_655.11       184.25    33_839.36       0.1380          NaN        10.82
-IVF-Binary-512-nl547-np27-rf0-itq (query)             33_655.11       194.23    33_849.34       0.1377          NaN        10.82
-IVF-Binary-512-nl547-np33-rf0-itq (query)             33_655.11       210.57    33_865.68       0.1371          NaN        10.82
-IVF-Binary-512-nl547-np23-rf5-itq (query)             33_655.11       234.21    33_889.32       0.2705    21.995421        10.82
-IVF-Binary-512-nl547-np23-rf10-itq (query)            33_655.11       273.05    33_928.16       0.3669    14.000707        10.82
-IVF-Binary-512-nl547-np23-rf20-itq (query)            33_655.11       338.96    33_994.06       0.4870     8.442677        10.82
-IVF-Binary-512-nl547-np27-rf5-itq (query)             33_655.11       257.41    33_912.51       0.2701    22.003758        10.82
-IVF-Binary-512-nl547-np27-rf10-itq (query)            33_655.11       285.82    33_940.92       0.3669    13.977794        10.82
-IVF-Binary-512-nl547-np27-rf20-itq (query)            33_655.11       356.99    34_012.10       0.4880     8.361194        10.82
-IVF-Binary-512-nl547-np33-rf5-itq (query)             33_655.11       275.14    33_930.25       0.2692    22.079813        10.82
-IVF-Binary-512-nl547-np33-rf10-itq (query)            33_655.11       321.02    33_976.13       0.3660    13.994225        10.82
-IVF-Binary-512-nl547-np33-rf20-itq (query)            33_655.11       385.15    34_040.26       0.4876     8.341396        10.82
-IVF-Binary-512-nl547-itq (self)                       33_655.11     2_713.80    36_368.91       0.3662    14.101446        10.82
+ExhaustiveBinary-1024-random_no_rr (query)            14_571.27     1_486.66    16_057.93       0.2353          NaN        18.81
+ExhaustiveBinary-1024-random-rf5 (query)              14_571.27     1_565.00    16_136.27       0.4918    11.183271        18.81
+ExhaustiveBinary-1024-random-rf10 (query)             14_571.27     1_629.27    16_200.54       0.6358     5.988378        18.81
+ExhaustiveBinary-1024-random-rf20 (query)             14_571.27     1_748.26    16_319.53       0.7779     2.871209        18.81
+ExhaustiveBinary-1024-random (self)                   14_571.27    16_043.74    30_615.01       0.6381     5.940314        18.81
 --------------------------------------------------------------------------------------------------------------------------------
-IVF-Binary-1024-nl273-np13-rf0-random (query)         18_078.21       456.05    18_534.25       0.2048          NaN        20.09
-IVF-Binary-1024-nl273-np16-rf0-random (query)         18_078.21       515.45    18_593.66       0.2054          NaN        20.09
-IVF-Binary-1024-nl273-np23-rf0-random (query)         18_078.21       628.73    18_706.94       0.2054          NaN        20.09
-IVF-Binary-1024-nl273-np13-rf5-random (query)         18_078.21       509.51    18_587.72       0.4160    12.114475        20.09
-IVF-Binary-1024-nl273-np13-rf10-random (query)        18_078.21       556.52    18_634.73       0.5398     6.941152        20.09
-IVF-Binary-1024-nl273-np13-rf20-random (query)        18_078.21       632.38    18_710.59       0.6698     3.762648        20.09
-IVF-Binary-1024-nl273-np16-rf5-random (query)         18_078.21       596.57    18_674.78       0.4192    11.921203        20.09
-IVF-Binary-1024-nl273-np16-rf10-random (query)        18_078.21       660.91    18_739.12       0.5460     6.695390        20.09
-IVF-Binary-1024-nl273-np16-rf20-random (query)        18_078.21       677.44    18_755.65       0.6798     3.482393        20.09
-IVF-Binary-1024-nl273-np23-rf5-random (query)         18_078.21       683.26    18_761.47       0.4202    11.849902        20.09
-IVF-Binary-1024-nl273-np23-rf10-random (query)        18_078.21       732.48    18_810.69       0.5482     6.602384        20.09
-IVF-Binary-1024-nl273-np23-rf20-random (query)        18_078.21       821.79    18_900.00       0.6848     3.353218        20.09
-IVF-Binary-1024-nl273-random (self)                   18_078.21     6_077.12    24_155.33       0.5447     6.754030        20.09
-IVF-Binary-1024-nl387-np19-rf0-random (query)         19_759.23       480.90    20_240.13       0.2052          NaN        20.15
-IVF-Binary-1024-nl387-np27-rf0-random (query)         19_759.23       653.80    20_413.04       0.2054          NaN        20.15
-IVF-Binary-1024-nl387-np19-rf5-random (query)         19_759.23       543.16    20_302.39       0.4177    12.030220        20.15
-IVF-Binary-1024-nl387-np19-rf10-random (query)        19_759.23       589.05    20_348.29       0.5427     6.838746        20.15
-IVF-Binary-1024-nl387-np19-rf20-random (query)        19_759.23       631.65    20_390.88       0.6749     3.649398        20.15
-IVF-Binary-1024-nl387-np27-rf5-random (query)         19_759.23       630.88    20_390.11       0.4201    11.858151        20.15
-IVF-Binary-1024-nl387-np27-rf10-random (query)        19_759.23       678.21    20_437.45       0.5480     6.612012        20.15
-IVF-Binary-1024-nl387-np27-rf20-random (query)        19_759.23       756.35    20_515.59       0.6840     3.378677        20.15
-IVF-Binary-1024-nl387-random (self)                   19_759.23     5_469.66    25_228.90       0.5424     6.876210        20.15
-IVF-Binary-1024-nl547-np23-rf0-random (query)         20_687.81       427.42    21_115.23       0.2055          NaN        20.23
-IVF-Binary-1024-nl547-np27-rf0-random (query)         20_687.81       474.36    21_162.17       0.2059          NaN        20.23
-IVF-Binary-1024-nl547-np33-rf0-random (query)         20_687.81       518.05    21_205.86       0.2056          NaN        20.23
-IVF-Binary-1024-nl547-np23-rf5-random (query)         20_687.81       465.35    21_153.16       0.4177    12.044578        20.23
-IVF-Binary-1024-nl547-np23-rf10-random (query)        20_687.81       496.51    21_184.33       0.5419     6.884795        20.23
-IVF-Binary-1024-nl547-np23-rf20-random (query)        20_687.81       552.60    21_240.42       0.6725     3.716157        20.23
-IVF-Binary-1024-nl547-np27-rf5-random (query)         20_687.81       523.75    21_211.57       0.4202    11.892305        20.23
-IVF-Binary-1024-nl547-np27-rf10-random (query)        20_687.81       534.37    21_222.19       0.5467     6.686514        20.23
-IVF-Binary-1024-nl547-np27-rf20-random (query)        20_687.81       595.86    21_283.68       0.6804     3.485439        20.23
-IVF-Binary-1024-nl547-np33-rf5-random (query)         20_687.81       554.74    21_242.56       0.4207    11.834813        20.23
-IVF-Binary-1024-nl547-np33-rf10-random (query)        20_687.81       588.76    21_276.58       0.5484     6.603220        20.23
-IVF-Binary-1024-nl547-np33-rf20-random (query)        20_687.81       652.72    21_340.53       0.6844     3.375118        20.23
-IVF-Binary-1024-nl547-random (self)                   20_687.81     5_019.46    25_707.27       0.5413     6.922030        20.23
-IVF-Binary-1024-nl273-np13-rf0-itq (query)            32_429.69       447.94    32_877.64       0.2059          NaN        20.09
-IVF-Binary-1024-nl273-np16-rf0-itq (query)            32_429.69       509.27    32_938.96       0.2064          NaN        20.09
-IVF-Binary-1024-nl273-np23-rf0-itq (query)            32_429.69       611.85    33_041.55       0.2063          NaN        20.09
-IVF-Binary-1024-nl273-np13-rf5-itq (query)            32_429.69       486.40    32_916.10       0.4172    11.648506        20.09
-IVF-Binary-1024-nl273-np13-rf10-itq (query)           32_429.69       526.53    32_956.22       0.5412     6.632954        20.09
-IVF-Binary-1024-nl273-np13-rf20-itq (query)           32_429.69       577.84    33_007.53       0.6689     3.595940        20.09
-IVF-Binary-1024-nl273-np16-rf5-itq (query)            32_429.69       539.26    32_968.95       0.4203    11.446920        20.09
-IVF-Binary-1024-nl273-np16-rf10-itq (query)           32_429.69       573.55    33_003.24       0.5473     6.391086        20.09
-IVF-Binary-1024-nl273-np16-rf20-itq (query)           32_429.69       640.83    33_070.53       0.6790     3.316168        20.09
-IVF-Binary-1024-nl273-np23-rf5-itq (query)            32_429.69       658.39    33_088.08       0.4213    11.381911        20.09
-IVF-Binary-1024-nl273-np23-rf10-itq (query)           32_429.69       693.71    33_123.40       0.5496     6.291720        20.09
-IVF-Binary-1024-nl273-np23-rf20-itq (query)           32_429.69       765.13    33_194.82       0.6840     3.175858        20.09
-IVF-Binary-1024-nl273-itq (self)                      32_429.69     5_730.78    38_160.47       0.5457     6.467127        20.09
-IVF-Binary-1024-nl387-np19-rf0-itq (query)            33_115.22       454.83    33_570.06       0.2064          NaN        20.15
-IVF-Binary-1024-nl387-np27-rf0-itq (query)            33_115.22       556.88    33_672.11       0.2065          NaN        20.15
-IVF-Binary-1024-nl387-np19-rf5-itq (query)            33_115.22       494.54    33_609.76       0.4190    11.543580        20.15
-IVF-Binary-1024-nl387-np19-rf10-itq (query)           33_115.22       532.00    33_647.23       0.5446     6.517360        20.15
-IVF-Binary-1024-nl387-np19-rf20-itq (query)           33_115.22       594.92    33_710.15       0.6740     3.483711        20.15
-IVF-Binary-1024-nl387-np27-rf5-itq (query)            33_115.22       594.86    33_710.09       0.4216    11.375903        20.15
-IVF-Binary-1024-nl387-np27-rf10-itq (query)           33_115.22       639.40    33_754.62       0.5495     6.305210        20.15
-IVF-Binary-1024-nl387-np27-rf20-itq (query)           33_115.22       720.10    33_835.32       0.6837     3.195098        20.15
-IVF-Binary-1024-nl387-itq (self)                      33_115.22     5_329.92    38_445.14       0.5431     6.597160        20.15
-IVF-Binary-1024-nl547-np23-rf0-itq (query)            34_810.33       425.61    35_235.94       0.2064          NaN        20.23
-IVF-Binary-1024-nl547-np27-rf0-itq (query)            34_810.33       463.77    35_274.10       0.2066          NaN        20.23
-IVF-Binary-1024-nl547-np33-rf0-itq (query)            34_810.33       514.75    35_325.07       0.2066          NaN        20.23
-IVF-Binary-1024-nl547-np23-rf5-itq (query)            34_810.33       464.28    35_274.61       0.4190    11.576384        20.23
-IVF-Binary-1024-nl547-np23-rf10-itq (query)           34_810.33       496.83    35_307.16       0.5432     6.578658        20.23
-IVF-Binary-1024-nl547-np23-rf20-itq (query)           34_810.33       554.36    35_364.69       0.6715     3.550405        20.23
-IVF-Binary-1024-nl547-np27-rf5-itq (query)            34_810.33       499.52    35_309.84       0.4210    11.442230        20.23
-IVF-Binary-1024-nl547-np27-rf10-itq (query)           34_810.33       538.57    35_348.90       0.5476     6.396562        20.23
-IVF-Binary-1024-nl547-np27-rf20-itq (query)           34_810.33       599.86    35_410.19       0.6793     3.321167        20.23
-IVF-Binary-1024-nl547-np33-rf5-itq (query)            34_810.33       554.26    35_364.58       0.4218    11.369714        20.23
-IVF-Binary-1024-nl547-np33-rf10-itq (query)           34_810.33       585.74    35_396.06       0.5498     6.302854        20.23
-IVF-Binary-1024-nl547-np33-rf20-itq (query)           34_810.33       651.64    35_461.97       0.6837     3.199255        20.23
-IVF-Binary-1024-nl547-itq (self)                      34_810.33     4_951.93    39_762.25       0.5421     6.640109        20.23
+ExhaustiveBinary-1024-itq_no_rr (query)               15_812.63     1_491.79    17_304.42       0.2198          NaN        18.81
+ExhaustiveBinary-1024-itq-rf5 (query)                 15_812.63     1_551.49    17_364.13       0.4636    12.595159        18.81
+ExhaustiveBinary-1024-itq-rf10 (query)                15_812.63     1_613.83    17_426.46       0.6048     6.884343        18.81
+ExhaustiveBinary-1024-itq-rf20 (query)                15_812.63     1_734.47    17_547.10       0.7500     3.387537        18.81
+ExhaustiveBinary-1024-itq (self)                      15_812.63    16_148.33    31_960.97       0.6059     6.857783        18.81
 --------------------------------------------------------------------------------------------------------------------------------
-</code></pre>
-</details>
-
----
-
-<details>
-<summary><b>Binary - Euclidean (Correlated - higher dimensionality)</b>:</summary>
-<pre><code>
-================================================================================================================================
-Benchmark: 150k cells, 128D - Binary Quantisation
-================================================================================================================================
-Method                                               Build (ms)   Query (ms)   Total (ms)     Recall@k   Dist Error    Size (MB)
+ExhaustiveBinary-128-signed_no_rr (query)              1_904.95       412.49     2_317.44       0.0275          NaN         2.35
+ExhaustiveBinary-128-signed-rf5 (query)                1_904.95       440.47     2_345.41       0.0917    63.471902         2.35
+ExhaustiveBinary-128-signed-rf10 (query)               1_904.95       469.95     2_374.89       0.1491    44.012830         2.35
+ExhaustiveBinary-128-signed-rf20 (query)               1_904.95       564.91     2_469.86       0.2396    29.121769         2.35
+ExhaustiveBinary-128-signed (self)                     1_904.95     4_671.27     6_576.21       0.1538    43.418564         2.35
 --------------------------------------------------------------------------------------------------------------------------------
-Exhaustive (query)                                        14.15     6_176.60     6_190.75       1.0000     0.000000        73.24
-Exhaustive (self)                                         14.15    63_405.06    63_419.21       1.0000     0.000000        73.24
+IVF-Binary-256-nl273-np13-rf0-random (query)           4_392.27        83.89     4_476.16       0.0902          NaN         5.98
+IVF-Binary-256-nl273-np16-rf0-random (query)           4_392.27        90.05     4_482.32       0.0819          NaN         5.98
+IVF-Binary-256-nl273-np23-rf0-random (query)           4_392.27       102.03     4_494.29       0.0801          NaN         5.98
+IVF-Binary-256-nl273-np13-rf5-random (query)           4_392.27       116.74     4_509.00       0.2091    36.578792         5.98
+IVF-Binary-256-nl273-np13-rf10-random (query)          4_392.27       149.17     4_541.44       0.2994    23.787256         5.98
+IVF-Binary-256-nl273-np13-rf20-random (query)          4_392.27       210.22     4_602.49       0.4198    14.719867         5.98
+IVF-Binary-256-nl273-np16-rf5-random (query)           4_392.27       122.07     4_514.33       0.1953    39.550198         5.98
+IVF-Binary-256-nl273-np16-rf10-random (query)          4_392.27       157.58     4_549.85       0.2830    25.760295         5.98
+IVF-Binary-256-nl273-np16-rf20-random (query)          4_392.27       224.26     4_616.53       0.4022    15.936889         5.98
+IVF-Binary-256-nl273-np23-rf5-random (query)           4_392.27       135.47     4_527.74       0.1914    40.388363         5.98
+IVF-Binary-256-nl273-np23-rf10-random (query)          4_392.27       170.75     4_563.01       0.2780    26.330895         5.98
+IVF-Binary-256-nl273-np23-rf20-random (query)          4_392.27       241.77     4_634.03       0.3961    16.314407         5.98
+IVF-Binary-256-nl273-random (self)                     4_392.27     1_575.70     5_967.97       0.2863    25.401151         5.98
 --------------------------------------------------------------------------------------------------------------------------------
-ExhaustiveBinary-256-random_no_rr (query)              3_870.09       518.82     4_388.92       0.0835          NaN         4.70
-ExhaustiveBinary-256-random-rf5 (query)                3_870.09       561.86     4_431.95       0.1599    21.111789         4.70
-ExhaustiveBinary-256-random-rf10 (query)               3_870.09       614.86     4_484.95       0.2242    14.518074         4.70
-ExhaustiveBinary-256-random-rf20 (query)               3_870.09       724.93     4_595.03       0.3173     9.567601         4.70
-ExhaustiveBinary-256-random (self)                     3_870.09     6_153.95    10_024.05       0.2257    14.498282         4.70
-ExhaustiveBinary-256-itq_no_rr (query)                18_049.25       549.93    18_599.19       0.0522          NaN         4.70
-ExhaustiveBinary-256-itq-rf5 (query)                  18_049.25       645.86    18_695.11       0.1084    27.956034         4.70
-ExhaustiveBinary-256-itq-rf10 (query)                 18_049.25       705.36    18_754.62       0.1563    19.790083         4.70
-ExhaustiveBinary-256-itq-rf20 (query)                 18_049.25       789.14    18_838.39       0.2301    13.538437         4.70
-ExhaustiveBinary-256-itq (self)                       18_049.25     6_209.70    24_258.96       0.1607    19.585886         4.70
+IVF-Binary-256-nl387-np19-rf0-random (query)           4_752.36        89.63     4_842.00       0.0833          NaN         6.04
+IVF-Binary-256-nl387-np27-rf0-random (query)           4_752.36        98.75     4_851.11       0.0803          NaN         6.04
+IVF-Binary-256-nl387-np19-rf5-random (query)           4_752.36       119.77     4_872.13       0.1988    38.580488         6.04
+IVF-Binary-256-nl387-np19-rf10-random (query)          4_752.36       152.63     4_904.99       0.2878    25.052774         6.04
+IVF-Binary-256-nl387-np19-rf20-random (query)          4_752.36       215.03     4_967.40       0.4094    15.361461         6.04
+IVF-Binary-256-nl387-np27-rf5-random (query)           4_752.36       129.44     4_881.80       0.1924    40.100378         6.04
+IVF-Binary-256-nl387-np27-rf10-random (query)          4_752.36       164.58     4_916.94       0.2784    26.221115         6.04
+IVF-Binary-256-nl387-np27-rf20-random (query)          4_752.36       229.77     4_982.14       0.3991    16.078668         6.04
+IVF-Binary-256-nl387-random (self)                     4_752.36     1_523.08     6_275.44       0.2922    24.627327         6.04
 --------------------------------------------------------------------------------------------------------------------------------
-ExhaustiveBinary-512-random_no_rr (query)              7_657.30       923.31     8_580.61       0.1247          NaN         9.41
-ExhaustiveBinary-512-random-rf5 (query)                7_657.30       965.16     8_622.46       0.2451    13.652649         9.41
-ExhaustiveBinary-512-random-rf10 (query)               7_657.30     1_030.56     8_687.87       0.3362     8.805138         9.41
-ExhaustiveBinary-512-random-rf20 (query)               7_657.30     1_151.04     8_808.34       0.4554     5.389016         9.41
-ExhaustiveBinary-512-random (self)                     7_657.30    10_380.28    18_037.58       0.3357     8.840667         9.41
-ExhaustiveBinary-512-itq_no_rr (query)                21_808.51       912.67    22_721.18       0.1097          NaN         9.41
-ExhaustiveBinary-512-itq-rf5 (query)                  21_808.51       955.48    22_763.99       0.2108    16.038374         9.41
-ExhaustiveBinary-512-itq-rf10 (query)                 21_808.51     1_020.99    22_829.50       0.2904    10.670775         9.41
-ExhaustiveBinary-512-itq-rf20 (query)                 21_808.51     1_119.40    22_927.91       0.3995     6.762765         9.41
-ExhaustiveBinary-512-itq (self)                       21_808.51    10_053.60    31_862.11       0.2902    10.669535         9.41
+IVF-Binary-256-nl547-np23-rf0-random (query)           5_264.93        90.65     5_355.58       0.0849          NaN         6.12
+IVF-Binary-256-nl547-np27-rf0-random (query)           5_264.93        96.00     5_360.93       0.0833          NaN         6.12
+IVF-Binary-256-nl547-np33-rf0-random (query)           5_264.93       103.97     5_368.90       0.0816          NaN         6.12
+IVF-Binary-256-nl547-np23-rf5-random (query)           5_264.93       123.68     5_388.61       0.2032    37.491643         6.12
+IVF-Binary-256-nl547-np23-rf10-random (query)          5_264.93       157.49     5_422.43       0.2944    24.252697         6.12
+IVF-Binary-256-nl547-np23-rf20-random (query)          5_264.93       215.43     5_480.36       0.4167    14.903314         6.12
+IVF-Binary-256-nl547-np27-rf5-random (query)           5_264.93       125.04     5_389.97       0.1991    38.388563         6.12
+IVF-Binary-256-nl547-np27-rf10-random (query)          5_264.93       163.27     5_428.20       0.2887    24.923524         6.12
+IVF-Binary-256-nl547-np27-rf20-random (query)          5_264.93       222.82     5_487.75       0.4089    15.379880         6.12
+IVF-Binary-256-nl547-np33-rf5-random (query)           5_264.93       131.62     5_396.55       0.1956    39.282687         6.12
+IVF-Binary-256-nl547-np33-rf10-random (query)          5_264.93       165.81     5_430.75       0.2833    25.613983         6.12
+IVF-Binary-256-nl547-np33-rf20-random (query)          5_264.93       231.65     5_496.58       0.4024    15.812546         6.12
+IVF-Binary-256-nl547-random (self)                     5_264.93     1_565.66     6_830.59       0.2983    23.870101         6.12
 --------------------------------------------------------------------------------------------------------------------------------
-ExhaustiveBinary-1024-random_no_rr (query)            15_204.75     1_560.94    16_765.69       0.1760          NaN        18.81
-ExhaustiveBinary-1024-random-rf5 (query)              15_204.75     1_581.36    16_786.11       0.3642     7.961838        18.81
-ExhaustiveBinary-1024-random-rf10 (query)             15_204.75     1_665.44    16_870.19       0.4844     4.696347        18.81
-ExhaustiveBinary-1024-random-rf20 (query)             15_204.75     1_762.43    16_967.18       0.6214     2.539505        18.81
-ExhaustiveBinary-1024-random (self)                   15_204.75    16_652.07    31_856.83       0.4849     4.684572        18.81
-ExhaustiveBinary-1024-itq_no_rr (query)               29_707.15     1_539.70    31_246.85       0.1669          NaN        18.81
-ExhaustiveBinary-1024-itq-rf5 (query)                 29_707.15     1_605.81    31_312.96       0.3450     8.646287        18.81
-ExhaustiveBinary-1024-itq-rf10 (query)                29_707.15     1_650.62    31_357.76       0.4610     5.152251        18.81
-ExhaustiveBinary-1024-itq-rf20 (query)                29_707.15     1_762.62    31_469.76       0.5965     2.860810        18.81
-ExhaustiveBinary-1024-itq (self)                      29_707.15    16_626.51    46_333.65       0.4605     5.175618        18.81
+IVF-Binary-256-nl273-np13-rf0-itq (query)              5_154.01        85.01     5_239.02       0.0487          NaN         5.98
+IVF-Binary-256-nl273-np16-rf0-itq (query)              5_154.01        90.48     5_244.50       0.0384          NaN         5.98
+IVF-Binary-256-nl273-np23-rf0-itq (query)              5_154.01       103.35     5_257.36       0.0368          NaN         5.98
 --------------------------------------------------------------------------------------------------------------------------------
-IVF-Binary-256-nl273-np13-rf0-random (query)           6_759.00        89.17     6_848.17       0.0903          NaN         5.98
-IVF-Binary-256-nl273-np16-rf0-random (query)           6_759.00        94.74     6_853.73       0.0879          NaN         5.98
-IVF-Binary-256-nl273-np23-rf0-random (query)           6_759.00       109.40     6_868.39       0.0860          NaN         5.98
-IVF-Binary-256-nl273-np13-rf5-random (query)           6_759.00       122.45     6_881.45       0.1734    19.725447         5.98
-IVF-Binary-256-nl273-np13-rf10-random (query)          6_759.00       159.84     6_918.84       0.2422    13.453975         5.98
-IVF-Binary-256-nl273-np13-rf20-random (query)          6_759.00       223.36     6_982.36       0.3420     8.768326         5.98
-IVF-Binary-256-nl273-np16-rf5-random (query)           6_759.00       128.53     6_887.52       0.1691    20.136222         5.98
-IVF-Binary-256-nl273-np16-rf10-random (query)          6_759.00       164.86     6_923.85       0.2364    13.778082         5.98
-IVF-Binary-256-nl273-np16-rf20-random (query)          6_759.00       233.17     6_992.17       0.3340     9.023211         5.98
-IVF-Binary-256-nl273-np23-rf5-random (query)           6_759.00       145.13     6_904.13       0.1644    20.702271         5.98
-IVF-Binary-256-nl273-np23-rf10-random (query)          6_759.00       182.83     6_941.83       0.2299    14.222320         5.98
-IVF-Binary-256-nl273-np23-rf20-random (query)          6_759.00       256.07     7_015.07       0.3249     9.347148         5.98
-IVF-Binary-256-nl273-random (self)                     6_759.00     1_641.47     8_400.46       0.2375    13.776009         5.98
-IVF-Binary-256-nl387-np19-rf0-random (query)           7_831.26        99.20     7_930.46       0.0888          NaN         6.04
-IVF-Binary-256-nl387-np27-rf0-random (query)           7_831.26       111.97     7_943.23       0.0866          NaN         6.04
-IVF-Binary-256-nl387-np19-rf5-random (query)           7_831.26       133.49     7_964.74       0.1715    19.887155         6.04
-IVF-Binary-256-nl387-np19-rf10-random (query)          7_831.26       166.73     7_997.98       0.2400    13.567203         6.04
-IVF-Binary-256-nl387-np19-rf20-random (query)          7_831.26       229.33     8_060.59       0.3390     8.855966         6.04
-IVF-Binary-256-nl387-np27-rf5-random (query)           7_831.26       145.46     7_976.72       0.1663    20.504704         6.04
-IVF-Binary-256-nl387-np27-rf10-random (query)          7_831.26       185.15     8_016.40       0.2322    14.061194         6.04
-IVF-Binary-256-nl387-np27-rf20-random (query)          7_831.26       254.15     8_085.41       0.3270     9.257091         6.04
-IVF-Binary-256-nl387-random (self)                     7_831.26     1_651.21     9_482.47       0.2411    13.572372         6.04
-IVF-Binary-256-nl547-np23-rf0-random (query)           9_418.11        95.99     9_514.10       0.0902          NaN         6.12
-IVF-Binary-256-nl547-np27-rf0-random (query)           9_418.11       100.07     9_518.18       0.0888          NaN         6.12
-IVF-Binary-256-nl547-np33-rf0-random (query)           9_418.11       105.93     9_524.04       0.0873          NaN         6.12
-IVF-Binary-256-nl547-np23-rf5-random (query)           9_418.11       130.86     9_548.97       0.1747    19.559525         6.12
-IVF-Binary-256-nl547-np23-rf10-random (query)          9_418.11       165.81     9_583.91       0.2447    13.313891         6.12
-IVF-Binary-256-nl547-np23-rf20-random (query)          9_418.11       237.25     9_655.35       0.3462     8.638841         6.12
-IVF-Binary-256-nl547-np27-rf5-random (query)           9_418.11       136.31     9_554.42       0.1712    19.932302         6.12
-IVF-Binary-256-nl547-np27-rf10-random (query)          9_418.11       171.58     9_589.69       0.2396    13.616890         6.12
-IVF-Binary-256-nl547-np27-rf20-random (query)          9_418.11       236.08     9_654.19       0.3384     8.894881         6.12
-IVF-Binary-256-nl547-np33-rf5-random (query)           9_418.11       143.52     9_561.63       0.1673    20.376846         6.12
-IVF-Binary-256-nl547-np33-rf10-random (query)          9_418.11       179.67     9_597.77       0.2337    13.976421         6.12
-IVF-Binary-256-nl547-np33-rf20-random (query)          9_418.11       247.50     9_665.61       0.3300     9.176761         6.12
-IVF-Binary-256-nl547-random (self)                     9_418.11     1_651.07    11_069.18       0.2458    13.305652         6.12
-IVF-Binary-256-nl273-np13-rf0-itq (query)             22_209.29        92.20    22_301.48       0.0615          NaN         5.98
-IVF-Binary-256-nl273-np16-rf0-itq (query)             22_209.29        94.85    22_304.13       0.0573          NaN         5.98
-IVF-Binary-256-nl273-np23-rf0-itq (query)             22_209.29       108.87    22_318.16       0.0547          NaN         5.98
-IVF-Binary-256-nl273-np13-rf5-itq (query)             22_209.29       119.33    22_328.62       0.1267    25.425690         5.98
-IVF-Binary-256-nl273-np13-rf10-itq (query)            22_209.29       153.53    22_362.81       0.1816    17.807267         5.98
-IVF-Binary-256-nl273-np13-rf20-itq (query)            22_209.29       217.34    22_426.63       0.2647    11.990270         5.98
-IVF-Binary-256-nl273-np16-rf5-itq (query)             22_209.29       124.47    22_333.76       0.1194    26.395455         5.98
-IVF-Binary-256-nl273-np16-rf10-itq (query)            22_209.29       159.61    22_368.89       0.1718    18.570497         5.98
-IVF-Binary-256-nl273-np16-rf20-itq (query)            22_209.29       225.67    22_434.96       0.2520    12.544219         5.98
-IVF-Binary-256-nl273-np23-rf5-itq (query)             22_209.29       141.76    22_351.05       0.1141    27.395747         5.98
-IVF-Binary-256-nl273-np23-rf10-itq (query)            22_209.29       177.33    22_386.61       0.1640    19.381750         5.98
-IVF-Binary-256-nl273-np23-rf20-itq (query)            22_209.29       247.89    22_457.18       0.2403    13.210360         5.98
-IVF-Binary-256-nl273-itq (self)                       22_209.29     1_605.47    23_814.76       0.1756    18.397103         5.98
-IVF-Binary-256-nl387-np19-rf0-itq (query)             21_675.64        92.65    21_768.28       0.0579          NaN         6.04
-IVF-Binary-256-nl387-np27-rf0-itq (query)             21_675.64       103.55    21_779.19       0.0555          NaN         6.04
-IVF-Binary-256-nl387-np19-rf5-itq (query)             21_675.64       124.56    21_800.20       0.1215    25.943423         6.04
-IVF-Binary-256-nl387-np19-rf10-itq (query)            21_675.64       158.23    21_833.86       0.1750    18.201397         6.04
-IVF-Binary-256-nl387-np19-rf20-itq (query)            21_675.64       222.05    21_897.69       0.2581    12.231315         6.04
-IVF-Binary-256-nl387-np27-rf5-itq (query)             21_675.64       136.65    21_812.28       0.1154    26.965163         6.04
-IVF-Binary-256-nl387-np27-rf10-itq (query)            21_675.64       172.97    21_848.60       0.1661    19.018778         6.04
-IVF-Binary-256-nl387-np27-rf20-itq (query)            21_675.64       239.97    21_915.61       0.2452    12.865624         6.04
-IVF-Binary-256-nl387-itq (self)                       21_675.64     1_562.94    23_238.58       0.1795    18.011183         6.04
-IVF-Binary-256-nl547-np23-rf0-itq (query)             28_809.77       101.28    28_911.05       0.0597          NaN         6.12
-IVF-Binary-256-nl547-np27-rf0-itq (query)             28_809.77       100.80    28_910.58       0.0580          NaN         6.12
-IVF-Binary-256-nl547-np33-rf0-itq (query)             28_809.77       107.01    28_916.79       0.0562          NaN         6.12
-IVF-Binary-256-nl547-np23-rf5-itq (query)             28_809.77       126.58    28_936.35       0.1253    25.285566         6.12
-IVF-Binary-256-nl547-np23-rf10-itq (query)            28_809.77       160.32    28_970.09       0.1805    17.659946         6.12
-IVF-Binary-256-nl547-np23-rf20-itq (query)            28_809.77       282.71    29_092.49       0.2675    11.756794         6.12
-IVF-Binary-256-nl547-np27-rf5-itq (query)             28_809.77       131.14    28_940.91       0.1215    25.927407         6.12
-IVF-Binary-256-nl547-np27-rf10-itq (query)            28_809.77       179.40    28_989.18       0.1749    18.152284         6.12
-IVF-Binary-256-nl547-np27-rf20-itq (query)            28_809.77       245.17    29_054.94       0.2586    12.178429         6.12
-IVF-Binary-256-nl547-np33-rf5-itq (query)             28_809.77       140.08    28_949.85       0.1171    26.676971         6.12
-IVF-Binary-256-nl547-np33-rf10-itq (query)            28_809.77       173.98    28_983.76       0.1685    18.765645         6.12
-IVF-Binary-256-nl547-np33-rf20-itq (query)            28_809.77       244.96    29_054.74       0.2484    12.671178         6.12
-IVF-Binary-256-nl547-itq (self)                       28_809.77     1_694.15    30_503.92       0.1855    17.466254         6.12
+IVF-Binary-256-nl273-np13-rf5-itq (query)              5_154.01       126.23     5_280.25       0.1401    52.288654         5.98
+IVF-Binary-256-nl273-np13-rf10-itq (query)             5_154.01       142.59     5_296.60       0.2148    35.122498         5.98
+IVF-Binary-256-nl273-np13-rf20-itq (query)             5_154.01       201.14     5_355.16       0.3221    22.338869         5.98
+IVF-Binary-256-nl273-np16-rf5-itq (query)              5_154.01       116.43     5_270.44       0.1189    57.863947         5.98
+IVF-Binary-256-nl273-np16-rf10-itq (query)             5_154.01       149.24     5_303.25       0.1896    39.050758         5.98
+IVF-Binary-256-nl273-np16-rf20-itq (query)             5_154.01       212.53     5_366.55       0.2959    24.689005         5.98
+IVF-Binary-256-nl273-np23-rf5-itq (query)              5_154.01       130.17     5_284.18       0.1141    60.629599         5.98
+IVF-Binary-256-nl273-np23-rf10-itq (query)             5_154.01       160.21     5_314.22       0.1814    41.279348         5.98
+IVF-Binary-256-nl273-np23-rf20-itq (query)             5_154.01       224.71     5_378.73       0.2847    26.047475         5.98
+IVF-Binary-256-nl273-itq (self)                        5_154.01     1_472.79     6_626.81       0.1935    38.785311         5.98
 --------------------------------------------------------------------------------------------------------------------------------
-IVF-Binary-512-nl273-np13-rf0-random (query)          10_562.96       175.90    10_738.86       0.1288          NaN        10.69
-IVF-Binary-512-nl273-np16-rf0-random (query)          10_562.96       198.73    10_761.69       0.1274          NaN        10.69
-IVF-Binary-512-nl273-np23-rf0-random (query)          10_562.96       225.40    10_788.36       0.1263          NaN        10.69
-IVF-Binary-512-nl273-np13-rf5-random (query)          10_562.96       229.79    10_792.75       0.2554    13.056066        10.69
-IVF-Binary-512-nl273-np13-rf10-random (query)         10_562.96       270.18    10_833.14       0.3500     8.367575        10.69
-IVF-Binary-512-nl273-np13-rf20-random (query)         10_562.96       339.98    10_902.94       0.4731     5.065112        10.69
-IVF-Binary-512-nl273-np16-rf5-random (query)          10_562.96       246.94    10_809.90       0.2518    13.257603        10.69
-IVF-Binary-512-nl273-np16-rf10-random (query)         10_562.96       304.15    10_867.12       0.3445     8.532496        10.69
-IVF-Binary-512-nl273-np16-rf20-random (query)         10_562.96       361.85    10_924.82       0.4662     5.187718        10.69
-IVF-Binary-512-nl273-np23-rf5-random (query)          10_562.96       284.24    10_847.20       0.2483    13.488515        10.69
-IVF-Binary-512-nl273-np23-rf10-random (query)         10_562.96       332.97    10_895.93       0.3396     8.703304        10.69
-IVF-Binary-512-nl273-np23-rf20-random (query)         10_562.96       417.17    10_980.13       0.4594     5.320285        10.69
-IVF-Binary-512-nl273-random (self)                    10_562.96     2_884.05    13_447.01       0.3446     8.551848        10.69
-IVF-Binary-512-nl387-np19-rf0-random (query)          11_666.04       184.58    11_850.62       0.1280          NaN        10.74
-IVF-Binary-512-nl387-np27-rf0-random (query)          11_666.04       214.91    11_880.95       0.1262          NaN        10.74
-IVF-Binary-512-nl387-np19-rf5-random (query)          11_666.04       239.62    11_905.66       0.2546    13.095870        10.74
-IVF-Binary-512-nl387-np19-rf10-random (query)         11_666.04       275.58    11_941.62       0.3488     8.395705        10.74
-IVF-Binary-512-nl387-np19-rf20-random (query)         11_666.04       342.76    12_008.80       0.4720     5.083484        10.74
-IVF-Binary-512-nl387-np27-rf5-random (query)          11_666.04       268.31    11_934.35       0.2498    13.398829        10.74
-IVF-Binary-512-nl387-np27-rf10-random (query)         11_666.04       314.24    11_980.28       0.3414     8.645265        10.74
-IVF-Binary-512-nl387-np27-rf20-random (query)         11_666.04       390.10    12_056.14       0.4617     5.276591        10.74
-IVF-Binary-512-nl387-random (self)                    11_666.04     2_773.07    14_439.11       0.3485     8.424727        10.74
-IVF-Binary-512-nl547-np23-rf0-random (query)          13_232.56       180.35    13_412.91       0.1292          NaN        10.82
-IVF-Binary-512-nl547-np27-rf0-random (query)          13_232.56       190.90    13_423.46       0.1281          NaN        10.82
-IVF-Binary-512-nl547-np33-rf0-random (query)          13_232.56       207.13    13_439.69       0.1268          NaN        10.82
-IVF-Binary-512-nl547-np23-rf5-random (query)          13_232.56       230.63    13_463.18       0.2571    12.933708        10.82
-IVF-Binary-512-nl547-np23-rf10-random (query)         13_232.56       268.42    13_500.97       0.3534     8.252243        10.82
-IVF-Binary-512-nl547-np23-rf20-random (query)         13_232.56       330.93    13_563.49       0.4784     4.975109        10.82
-IVF-Binary-512-nl547-np27-rf5-random (query)          13_232.56       241.33    13_473.89       0.2538    13.135266        10.82
-IVF-Binary-512-nl547-np27-rf10-random (query)         13_232.56       281.50    13_514.05       0.3483     8.421781        10.82
-IVF-Binary-512-nl547-np27-rf20-random (query)         13_232.56       347.18    13_579.74       0.4715     5.105947        10.82
-IVF-Binary-512-nl547-np33-rf5-random (query)          13_232.56       259.26    13_491.82       0.2505    13.346677        10.82
-IVF-Binary-512-nl547-np33-rf10-random (query)         13_232.56       301.31    13_533.86       0.3429     8.595584        10.82
-IVF-Binary-512-nl547-np33-rf20-random (query)         13_232.56       372.27    13_604.83       0.4639     5.244616        10.82
-IVF-Binary-512-nl547-random (self)                    13_232.56     2_678.86    15_911.42       0.3531     8.282934        10.82
-IVF-Binary-512-nl273-np13-rf0-itq (query)             28_507.24       177.50    28_684.74       0.1142          NaN        10.69
-IVF-Binary-512-nl273-np16-rf0-itq (query)             28_507.24       192.03    28_699.27       0.1125          NaN        10.69
-IVF-Binary-512-nl273-np23-rf0-itq (query)             28_507.24       226.51    28_733.75       0.1112          NaN        10.69
-IVF-Binary-512-nl273-np13-rf5-itq (query)             28_507.24       251.53    28_758.77       0.2214    15.286978        10.69
-IVF-Binary-512-nl273-np13-rf10-itq (query)            28_507.24       281.09    28_788.33       0.3055    10.075350        10.69
-IVF-Binary-512-nl273-np13-rf20-itq (query)            28_507.24       345.08    28_852.33       0.4203     6.294868        10.69
-IVF-Binary-512-nl273-np16-rf5-itq (query)             28_507.24       243.82    28_751.06       0.2175    15.558026        10.69
-IVF-Binary-512-nl273-np16-rf10-itq (query)            28_507.24       292.51    28_799.75       0.3002    10.284617        10.69
-IVF-Binary-512-nl273-np16-rf20-itq (query)            28_507.24       358.94    28_866.18       0.4127     6.466201        10.69
-IVF-Binary-512-nl273-np23-rf5-itq (query)             28_507.24       282.50    28_789.74       0.2139    15.849197        10.69
-IVF-Binary-512-nl273-np23-rf10-itq (query)            28_507.24       340.23    28_847.47       0.2945    10.522865        10.69
-IVF-Binary-512-nl273-np23-rf20-itq (query)            28_507.24       413.37    28_920.61       0.4049     6.651241        10.69
-IVF-Binary-512-nl273-itq (self)                       28_507.24     2_868.98    31_376.22       0.3000    10.282058        10.69
-IVF-Binary-512-nl387-np19-rf0-itq (query)             26_922.96       182.92    27_105.88       0.1134          NaN        10.74
-IVF-Binary-512-nl387-np27-rf0-itq (query)             26_922.96       220.06    27_143.02       0.1117          NaN        10.74
-IVF-Binary-512-nl387-np19-rf5-itq (query)             26_922.96       236.50    27_159.46       0.2198    15.377204        10.74
-IVF-Binary-512-nl387-np19-rf10-itq (query)            26_922.96       272.94    27_195.90       0.3039    10.116887        10.74
-IVF-Binary-512-nl387-np19-rf20-itq (query)            26_922.96       338.69    27_261.65       0.4180     6.330257        10.74
-IVF-Binary-512-nl387-np27-rf5-itq (query)             26_922.96       267.05    27_190.01       0.2151    15.728427        10.74
-IVF-Binary-512-nl387-np27-rf10-itq (query)            26_922.96       311.36    27_234.32       0.2964    10.421052        10.74
-IVF-Binary-512-nl387-np27-rf20-itq (query)            26_922.96       384.53    27_307.49       0.4077     6.573184        10.74
-IVF-Binary-512-nl387-itq (self)                       26_922.96     2_727.45    29_650.41       0.3039    10.116424        10.74
-IVF-Binary-512-nl547-np23-rf0-itq (query)             30_784.49       194.68    30_979.16       0.1145          NaN        10.82
-IVF-Binary-512-nl547-np27-rf0-itq (query)             30_784.49       192.09    30_976.57       0.1133          NaN        10.82
-IVF-Binary-512-nl547-np33-rf0-itq (query)             30_784.49       215.21    30_999.70       0.1121          NaN        10.82
-IVF-Binary-512-nl547-np23-rf5-itq (query)             30_784.49       231.18    31_015.67       0.2226    15.146158        10.82
-IVF-Binary-512-nl547-np23-rf10-itq (query)            30_784.49       286.27    31_070.76       0.3085     9.939220        10.82
-IVF-Binary-512-nl547-np23-rf20-itq (query)            30_784.49       347.31    31_131.79       0.4253     6.178097        10.82
-IVF-Binary-512-nl547-np27-rf5-itq (query)             30_784.49       257.00    31_041.48       0.2193    15.392335        10.82
-IVF-Binary-512-nl547-np27-rf10-itq (query)            30_784.49       280.35    31_064.84       0.3034    10.142749        10.82
-IVF-Binary-512-nl547-np27-rf20-itq (query)            30_784.49       344.67    31_129.15       0.4178     6.352959        10.82
-IVF-Binary-512-nl547-np33-rf5-itq (query)             30_784.49       282.97    31_067.46       0.2158    15.671654        10.82
-IVF-Binary-512-nl547-np33-rf10-itq (query)            30_784.49       318.79    31_103.28       0.2982    10.359584        10.82
-IVF-Binary-512-nl547-np33-rf20-itq (query)            30_784.49       391.59    31_176.08       0.4104     6.531168        10.82
-IVF-Binary-512-nl547-itq (self)                       30_784.49     2_657.25    33_441.74       0.3085     9.934329        10.82
+IVF-Binary-256-nl387-np19-rf0-itq (query)              5_503.44        88.85     5_592.29       0.0406          NaN         6.04
+IVF-Binary-256-nl387-np27-rf0-itq (query)              5_503.44       100.48     5_603.92       0.0376          NaN         6.04
+IVF-Binary-256-nl387-np19-rf5-itq (query)              5_503.44       116.29     5_619.73       0.1245    55.409024         6.04
+IVF-Binary-256-nl387-np19-rf10-itq (query)             5_503.44       146.62     5_650.07       0.1982    37.188360         6.04
+IVF-Binary-256-nl387-np19-rf20-itq (query)             5_503.44       205.99     5_709.43       0.3050    23.672227         6.04
+IVF-Binary-256-nl387-np27-rf5-itq (query)              5_503.44       128.70     5_632.14       0.1162    58.675988         6.04
+IVF-Binary-256-nl387-np27-rf10-itq (query)             5_503.44       157.74     5_661.18       0.1862    39.515395         6.04
+IVF-Binary-256-nl387-np27-rf20-itq (query)             5_503.44       220.17     5_723.61       0.2892    25.386678         6.04
+IVF-Binary-256-nl387-itq (self)                        5_503.44     1_467.56     6_971.00       0.2014    37.046103         6.04
 --------------------------------------------------------------------------------------------------------------------------------
-IVF-Binary-1024-nl273-np13-rf0-random (query)         18_058.43       444.39    18_502.81       0.1798          NaN        20.09
-IVF-Binary-1024-nl273-np16-rf0-random (query)         18_058.43       508.92    18_567.35       0.1786          NaN        20.09
-IVF-Binary-1024-nl273-np23-rf0-random (query)         18_058.43       614.23    18_672.66       0.1774          NaN        20.09
-IVF-Binary-1024-nl273-np13-rf5-random (query)         18_058.43       484.98    18_543.40       0.3726     7.705916        20.09
-IVF-Binary-1024-nl273-np13-rf10-random (query)        18_058.43       543.54    18_601.96       0.4955     4.506521        20.09
-IVF-Binary-1024-nl273-np13-rf20-random (query)        18_058.43       587.58    18_646.01       0.6350     2.398236        20.09
-IVF-Binary-1024-nl273-np16-rf5-random (query)         18_058.43       542.94    18_601.37       0.3694     7.804042        20.09
-IVF-Binary-1024-nl273-np16-rf10-random (query)        18_058.43       573.02    18_631.44       0.4909     4.584533        20.09
-IVF-Binary-1024-nl273-np16-rf20-random (query)        18_058.43       635.61    18_694.03       0.6292     2.456994        20.09
-IVF-Binary-1024-nl273-np23-rf5-random (query)         18_058.43       683.41    18_741.84       0.3668     7.887871        20.09
-IVF-Binary-1024-nl273-np23-rf10-random (query)        18_058.43       694.60    18_753.03       0.4870     4.652723        20.09
-IVF-Binary-1024-nl273-np23-rf20-random (query)        18_058.43       785.14    18_843.57       0.6243     2.507896        20.09
-IVF-Binary-1024-nl273-random (self)                   18_058.43     5_871.34    23_929.77       0.4913     4.572337        20.09
-IVF-Binary-1024-nl387-np19-rf0-random (query)         19_194.72       460.65    19_655.37       0.1792          NaN        20.15
-IVF-Binary-1024-nl387-np27-rf0-random (query)         19_194.72       555.91    19_750.64       0.1776          NaN        20.15
-IVF-Binary-1024-nl387-np19-rf5-random (query)         19_194.72       532.99    19_727.71       0.3715     7.728045        20.15
-IVF-Binary-1024-nl387-np19-rf10-random (query)        19_194.72       526.62    19_721.35       0.4949     4.514208        20.15
-IVF-Binary-1024-nl387-np19-rf20-random (query)        19_194.72       584.12    19_778.85       0.6340     2.405332        20.15
-IVF-Binary-1024-nl387-np27-rf5-random (query)         19_194.72       596.84    19_791.56       0.3673     7.867217        20.15
-IVF-Binary-1024-nl387-np27-rf10-random (query)        19_194.72       627.88    19_822.61       0.4883     4.630894        20.15
-IVF-Binary-1024-nl387-np27-rf20-random (query)        19_194.72       696.65    19_891.38       0.6260     2.490097        20.15
-IVF-Binary-1024-nl387-random (self)                   19_194.72     5_360.71    24_555.44       0.4950     4.507483        20.15
-IVF-Binary-1024-nl547-np23-rf0-random (query)         20_914.33       460.10    21_374.43       0.1803          NaN        20.23
-IVF-Binary-1024-nl547-np27-rf0-random (query)         20_914.33       486.34    21_400.67       0.1791          NaN        20.23
-IVF-Binary-1024-nl547-np33-rf0-random (query)         20_914.33       612.08    21_526.41       0.1778          NaN        20.23
-IVF-Binary-1024-nl547-np23-rf5-random (query)         20_914.33       499.44    21_413.77       0.3746     7.642280        20.23
-IVF-Binary-1024-nl547-np23-rf10-random (query)        20_914.33       553.53    21_467.86       0.4990     4.437106        20.23
-IVF-Binary-1024-nl547-np23-rf20-random (query)        20_914.33       579.84    21_494.17       0.6395     2.348751        20.23
-IVF-Binary-1024-nl547-np27-rf5-random (query)         20_914.33       516.25    21_430.58       0.3710     7.749561        20.23
-IVF-Binary-1024-nl547-np27-rf10-random (query)        20_914.33       573.50    21_487.83       0.4944     4.520635        20.23
-IVF-Binary-1024-nl547-np27-rf20-random (query)        20_914.33       624.95    21_539.28       0.6335     2.410795        20.23
-IVF-Binary-1024-nl547-np33-rf5-random (query)         20_914.33       568.88    21_483.21       0.3683     7.840859        20.23
-IVF-Binary-1024-nl547-np33-rf10-random (query)        20_914.33       617.76    21_532.09       0.4899     4.600186        20.23
-IVF-Binary-1024-nl547-np33-rf20-random (query)        20_914.33       706.62    21_620.95       0.6274     2.474668        20.23
-IVF-Binary-1024-nl547-random (self)                   20_914.33     5_283.48    26_197.81       0.4992     4.434766        20.23
-IVF-Binary-1024-nl273-np13-rf0-itq (query)            40_397.40       567.84    40_965.25       0.1705          NaN        20.09
-IVF-Binary-1024-nl273-np16-rf0-itq (query)            40_397.40       547.54    40_944.94       0.1692          NaN        20.09
-IVF-Binary-1024-nl273-np23-rf0-itq (query)            40_397.40       689.65    41_087.05       0.1682          NaN        20.09
-IVF-Binary-1024-nl273-np13-rf5-itq (query)            40_397.40       519.43    40_916.83       0.3537     8.360736        20.09
-IVF-Binary-1024-nl273-np13-rf10-itq (query)           40_397.40       581.32    40_978.72       0.4717     4.958550        20.09
-IVF-Binary-1024-nl273-np13-rf20-itq (query)           40_397.40       761.17    41_158.57       0.6104     2.715850        20.09
-IVF-Binary-1024-nl273-np16-rf5-itq (query)            40_397.40       683.22    41_080.62       0.3506     8.464984        20.09
-IVF-Binary-1024-nl273-np16-rf10-itq (query)           40_397.40       687.12    41_084.53       0.4675     5.033830        20.09
-IVF-Binary-1024-nl273-np16-rf20-itq (query)           40_397.40       712.15    41_109.55       0.6047     2.775386        20.09
-IVF-Binary-1024-nl273-np23-rf5-itq (query)            40_397.40       768.64    41_166.04       0.3476     8.564604        20.09
-IVF-Binary-1024-nl273-np23-rf10-itq (query)           40_397.40       696.62    41_094.02       0.4636     5.109604        20.09
-IVF-Binary-1024-nl273-np23-rf20-itq (query)           40_397.40       776.02    41_173.42       0.5998     2.826663        20.09
-IVF-Binary-1024-nl273-itq (self)                      40_397.40     6_398.73    46_796.14       0.4673     5.052001        20.09
-IVF-Binary-1024-nl387-np19-rf0-itq (query)            35_382.22       541.09    35_923.31       0.1702          NaN        20.15
-IVF-Binary-1024-nl387-np27-rf0-itq (query)            35_382.22       552.43    35_934.65       0.1686          NaN        20.15
-IVF-Binary-1024-nl387-np19-rf5-itq (query)            35_382.22       544.36    35_926.58       0.3527     8.388790        20.15
-IVF-Binary-1024-nl387-np19-rf10-itq (query)           35_382.22       630.33    36_012.55       0.4707     4.971031        20.15
-IVF-Binary-1024-nl387-np19-rf20-itq (query)           35_382.22       734.59    36_116.81       0.6094     2.721655        20.15
-IVF-Binary-1024-nl387-np27-rf5-itq (query)            35_382.22       654.34    36_036.56       0.3484     8.533778        20.15
-IVF-Binary-1024-nl387-np27-rf10-itq (query)           35_382.22       695.18    36_077.40       0.4647     5.084729        20.15
-IVF-Binary-1024-nl387-np27-rf20-itq (query)           35_382.22       755.51    36_137.73       0.6008     2.812394        20.15
-IVF-Binary-1024-nl387-itq (self)                      35_382.22     5_579.95    40_962.17       0.4709     4.986071        20.15
-IVF-Binary-1024-nl547-np23-rf0-itq (query)            38_370.49       430.72    38_801.21       0.1707          NaN        20.23
-IVF-Binary-1024-nl547-np27-rf0-itq (query)            38_370.49       467.87    38_838.36       0.1697          NaN        20.23
-IVF-Binary-1024-nl547-np33-rf0-itq (query)            38_370.49       515.32    38_885.82       0.1687          NaN        20.23
-IVF-Binary-1024-nl547-np23-rf5-itq (query)            38_370.49       462.05    38_832.54       0.3557     8.297828        20.23
-IVF-Binary-1024-nl547-np23-rf10-itq (query)           38_370.49       494.75    38_865.25       0.4748     4.900112        20.23
-IVF-Binary-1024-nl547-np23-rf20-itq (query)           38_370.49       553.18    38_923.67       0.6148     2.662016        20.23
-IVF-Binary-1024-nl547-np27-rf5-itq (query)            38_370.49       499.77    38_870.26       0.3526     8.401633        20.23
-IVF-Binary-1024-nl547-np27-rf10-itq (query)           38_370.49       539.18    38_909.68       0.4703     4.984595        20.23
-IVF-Binary-1024-nl547-np27-rf20-itq (query)           38_370.49       628.67    38_999.16       0.6087     2.729952        20.23
-IVF-Binary-1024-nl547-np33-rf5-itq (query)            38_370.49       641.67    39_012.16       0.3496     8.501827        20.23
-IVF-Binary-1024-nl547-np33-rf10-itq (query)           38_370.49       661.79    39_032.28       0.4662     5.059001        20.23
-IVF-Binary-1024-nl547-np33-rf20-itq (query)           38_370.49       724.41    39_094.90       0.6031     2.789781        20.23
-IVF-Binary-1024-nl547-itq (self)                      38_370.49     5_017.11    43_387.60       0.4749     4.913051        20.23
+IVF-Binary-256-nl547-np23-rf0-itq (query)              6_014.52        90.60     6_105.12       0.0422          NaN         6.12
+IVF-Binary-256-nl547-np27-rf0-itq (query)              6_014.52        94.41     6_108.93       0.0405          NaN         6.12
+IVF-Binary-256-nl547-np33-rf0-itq (query)              6_014.52        99.70     6_114.22       0.0388          NaN         6.12
+IVF-Binary-256-nl547-np23-rf5-itq (query)              6_014.52       119.88     6_134.40       0.1299    53.388247         6.12
+IVF-Binary-256-nl547-np23-rf10-itq (query)             6_014.52       147.93     6_162.45       0.2055    35.710531         6.12
+IVF-Binary-256-nl547-np23-rf20-itq (query)             6_014.52       203.51     6_218.03       0.3158    22.516698         6.12
+IVF-Binary-256-nl547-np27-rf5-itq (query)              6_014.52       129.18     6_143.71       0.1248    55.169413         6.12
+IVF-Binary-256-nl547-np27-rf10-itq (query)             6_014.52       150.74     6_165.26       0.1985    37.017374         6.12
+IVF-Binary-256-nl547-np27-rf20-itq (query)             6_014.52       208.90     6_223.42       0.3063    23.439718         6.12
+IVF-Binary-256-nl547-np33-rf5-itq (query)              6_014.52       125.30     6_139.82       0.1199    57.122875         6.12
+IVF-Binary-256-nl547-np33-rf10-itq (query)             6_014.52       156.23     6_170.75       0.1918    38.438977         6.12
+IVF-Binary-256-nl547-np33-rf20-itq (query)             6_014.52       217.15     6_231.67       0.2971    24.418490         6.12
+IVF-Binary-256-nl547-itq (self)                        6_014.52     1_470.59     7_485.12       0.2087    35.561453         6.12
+--------------------------------------------------------------------------------------------------------------------------------
+IVF-Binary-512-nl273-np13-rf0-random (query)           8_043.76       173.94     8_217.69       0.1602          NaN        10.69
+IVF-Binary-512-nl273-np16-rf0-random (query)           8_043.76       188.51     8_232.26       0.1562          NaN        10.69
+IVF-Binary-512-nl273-np23-rf0-random (query)           8_043.76       220.73     8_264.49       0.1551          NaN        10.69
+IVF-Binary-512-nl273-np13-rf5-random (query)           8_043.76       226.02     8_269.77       0.3381    20.892325        10.69
+IVF-Binary-512-nl273-np13-rf10-random (query)          8_043.76       262.66     8_306.42       0.4580    12.672864        10.69
+IVF-Binary-512-nl273-np13-rf20-random (query)          8_043.76       328.29     8_372.05       0.5999     7.188412        10.69
+IVF-Binary-512-nl273-np16-rf5-random (query)           8_043.76       242.02     8_285.77       0.3309    21.652949        10.69
+IVF-Binary-512-nl273-np16-rf10-random (query)          8_043.76       285.05     8_328.81       0.4504    13.148010        10.69
+IVF-Binary-512-nl273-np16-rf20-random (query)          8_043.76       355.04     8_398.80       0.5921     7.463470        10.69
+IVF-Binary-512-nl273-np23-rf5-random (query)           8_043.76       275.12     8_318.88       0.3289    21.833934        10.69
+IVF-Binary-512-nl273-np23-rf10-random (query)          8_043.76       324.17     8_367.92       0.4476    13.287856        10.69
+IVF-Binary-512-nl273-np23-rf20-random (query)          8_043.76       401.17     8_444.93       0.5892     7.551369        10.69
+IVF-Binary-512-nl273-random (self)                     8_043.76     2_827.67    10_871.42       0.4516    13.064777        10.69
+--------------------------------------------------------------------------------------------------------------------------------
+IVF-Binary-512-nl387-np19-rf0-random (query)           8_286.62       179.00     8_465.62       0.1570          NaN        10.74
+IVF-Binary-512-nl387-np27-rf0-random (query)           8_286.62       204.48     8_491.11       0.1554          NaN        10.74
+IVF-Binary-512-nl387-np19-rf5-random (query)           8_286.62       230.64     8_517.26       0.3329    21.392194        10.74
+IVF-Binary-512-nl387-np19-rf10-random (query)          8_286.62       265.68     8_552.31       0.4539    12.917844        10.74
+IVF-Binary-512-nl387-np19-rf20-random (query)          8_286.62       331.21     8_617.84       0.5956     7.339191        10.74
+IVF-Binary-512-nl387-np27-rf5-random (query)           8_286.62       256.13     8_542.75       0.3292    21.773974        10.74
+IVF-Binary-512-nl387-np27-rf10-random (query)          8_286.62       299.21     8_585.84       0.4491    13.194343        10.74
+IVF-Binary-512-nl387-np27-rf20-random (query)          8_286.62       367.96     8_654.59       0.5904     7.519640        10.74
+IVF-Binary-512-nl387-random (self)                     8_286.62     2_659.36    10_945.99       0.4548    12.865173        10.74
+--------------------------------------------------------------------------------------------------------------------------------
+IVF-Binary-512-nl547-np23-rf0-random (query)           8_811.79       175.51     8_987.30       0.1583          NaN        10.82
+IVF-Binary-512-nl547-np27-rf0-random (query)           8_811.79       184.65     8_996.44       0.1572          NaN        10.82
+IVF-Binary-512-nl547-np33-rf0-random (query)           8_811.79       199.14     9_010.92       0.1564          NaN        10.82
+IVF-Binary-512-nl547-np23-rf5-random (query)           8_811.79       224.15     9_035.94       0.3359    21.084876        10.82
+IVF-Binary-512-nl547-np23-rf10-random (query)          8_811.79       258.27     9_070.06       0.4573    12.732967        10.82
+IVF-Binary-512-nl547-np23-rf20-random (query)          8_811.79       322.94     9_134.73       0.6004     7.180296        10.82
+IVF-Binary-512-nl547-np27-rf5-random (query)           8_811.79       247.28     9_059.07       0.3331    21.395559        10.82
+IVF-Binary-512-nl547-np27-rf10-random (query)          8_811.79       271.17     9_082.96       0.4534    12.958526        10.82
+IVF-Binary-512-nl547-np27-rf20-random (query)          8_811.79       332.86     9_144.65       0.5955     7.342621        10.82
+IVF-Binary-512-nl547-np33-rf5-random (query)           8_811.79       250.18     9_061.96       0.3305    21.646023        10.82
+IVF-Binary-512-nl547-np33-rf10-random (query)          8_811.79       290.34     9_102.13       0.4505    13.114137        10.82
+IVF-Binary-512-nl547-np33-rf20-random (query)          8_811.79       355.44     9_167.22       0.5920     7.461133        10.82
+IVF-Binary-512-nl547-random (self)                     8_811.79     2_573.02    11_384.81       0.4586    12.646246        10.82
+--------------------------------------------------------------------------------------------------------------------------------
+IVF-Binary-512-nl273-np13-rf0-itq (query)              8_800.82       172.06     8_972.87       0.1340          NaN        10.69
+IVF-Binary-512-nl273-np16-rf0-itq (query)              8_800.82       185.02     8_985.84       0.1293          NaN        10.69
+IVF-Binary-512-nl273-np23-rf0-itq (query)              8_800.82       214.33     9_015.14       0.1278          NaN        10.69
+IVF-Binary-512-nl273-np13-rf5-itq (query)              8_800.82       221.46     9_022.27       0.2839    25.978536        10.69
+IVF-Binary-512-nl273-np13-rf10-itq (query)             8_800.82       259.13     9_059.95       0.3917    16.248466        10.69
+IVF-Binary-512-nl273-np13-rf20-itq (query)             8_800.82       320.30     9_121.11       0.5269     9.600056        10.69
+IVF-Binary-512-nl273-np16-rf5-itq (query)              8_800.82       238.86     9_039.67       0.2761    26.883355        10.69
+IVF-Binary-512-nl273-np16-rf10-itq (query)             8_800.82       279.31     9_080.13       0.3827    16.844752        10.69
+IVF-Binary-512-nl273-np16-rf20-itq (query)             8_800.82       346.03     9_146.84       0.5176     9.960214        10.69
+IVF-Binary-512-nl273-np23-rf5-itq (query)              8_800.82       268.93     9_069.75       0.2734    27.240484        10.69
+IVF-Binary-512-nl273-np23-rf10-itq (query)             8_800.82       332.80     9_133.62       0.3791    17.094724        10.69
+IVF-Binary-512-nl273-np23-rf20-itq (query)             8_800.82       390.83     9_191.64       0.5136    10.119578        10.69
+IVF-Binary-512-nl273-itq (self)                        8_800.82     2_773.34    11_574.16       0.3830    16.857468        10.69
+--------------------------------------------------------------------------------------------------------------------------------
+IVF-Binary-512-nl387-np19-rf0-itq (query)              9_201.06       183.15     9_384.21       0.1304          NaN        10.74
+IVF-Binary-512-nl387-np27-rf0-itq (query)              9_201.06       209.20     9_410.27       0.1281          NaN        10.74
+IVF-Binary-512-nl387-np19-rf5-itq (query)              9_201.06       252.57     9_453.64       0.2781    26.595084        10.74
+IVF-Binary-512-nl387-np19-rf10-itq (query)             9_201.06       267.78     9_468.84       0.3865    16.598294        10.74
+IVF-Binary-512-nl387-np19-rf20-itq (query)             9_201.06       331.29     9_532.36       0.5215     9.795978        10.74
+IVF-Binary-512-nl387-np27-rf5-itq (query)              9_201.06       272.71     9_473.77       0.2740    27.188689        10.74
+IVF-Binary-512-nl387-np27-rf10-itq (query)             9_201.06       310.20     9_511.26       0.3808    17.014995        10.74
+IVF-Binary-512-nl387-np27-rf20-itq (query)             9_201.06       368.19     9_569.26       0.5144    10.085787        10.74
+IVF-Binary-512-nl387-itq (self)                        9_201.06     2_660.16    11_861.23       0.3865    16.606584        10.74
+--------------------------------------------------------------------------------------------------------------------------------
+IVF-Binary-512-nl547-np23-rf0-itq (query)              9_662.52       177.94     9_840.46       0.1316          NaN        10.82
+IVF-Binary-512-nl547-np27-rf0-itq (query)              9_662.52       187.15     9_849.67       0.1304          NaN        10.82
+IVF-Binary-512-nl547-np33-rf0-itq (query)              9_662.52       201.65     9_864.18       0.1292          NaN        10.82
+IVF-Binary-512-nl547-np23-rf5-itq (query)              9_662.52       239.11     9_901.64       0.2817    26.152205        10.82
+IVF-Binary-512-nl547-np23-rf10-itq (query)             9_662.52       259.56     9_922.08       0.3899    16.325027        10.82
+IVF-Binary-512-nl547-np23-rf20-itq (query)             9_662.52       319.64     9_982.16       0.5273     9.576019        10.82
+IVF-Binary-512-nl547-np27-rf5-itq (query)              9_662.52       234.27     9_896.79       0.2787    26.530614        10.82
+IVF-Binary-512-nl547-np27-rf10-itq (query)             9_662.52       275.04     9_937.56       0.3857    16.606746        10.82
+IVF-Binary-512-nl547-np27-rf20-itq (query)             9_662.52       333.74     9_996.26       0.5215     9.793693        10.82
+IVF-Binary-512-nl547-np33-rf5-itq (query)              9_662.52       252.06     9_914.58       0.2758    26.929552        10.82
+IVF-Binary-512-nl547-np33-rf10-itq (query)             9_662.52       297.53     9_960.06       0.3822    16.861961        10.82
+IVF-Binary-512-nl547-np33-rf20-itq (query)             9_662.52       354.65    10_017.17       0.5167     9.985026        10.82
+IVF-Binary-512-nl547-itq (self)                        9_662.52     2_583.98    12_246.50       0.3908    16.303195        10.82
+--------------------------------------------------------------------------------------------------------------------------------
+IVF-Binary-1024-nl273-np13-rf0-random (query)         15_064.69       425.55    15_490.23       0.2401          NaN        20.09
+IVF-Binary-1024-nl273-np16-rf0-random (query)         15_064.69       470.01    15_534.70       0.2381          NaN        20.09
+IVF-Binary-1024-nl273-np23-rf0-random (query)         15_064.69       564.64    15_629.33       0.2375          NaN        20.09
+IVF-Binary-1024-nl273-np13-rf5-random (query)         15_064.69       478.86    15_543.55       0.4998    10.816616        20.09
+IVF-Binary-1024-nl273-np13-rf10-random (query)        15_064.69       494.43    15_559.11       0.6434     5.777947        20.09
+IVF-Binary-1024-nl273-np13-rf20-random (query)        15_064.69       549.01    15_613.70       0.7844     2.752281        20.09
+IVF-Binary-1024-nl273-np16-rf5-random (query)         15_064.69       511.21    15_575.89       0.4962    10.985121        20.09
+IVF-Binary-1024-nl273-np16-rf10-random (query)        15_064.69       552.63    15_617.32       0.6403     5.869059        20.09
+IVF-Binary-1024-nl273-np16-rf20-random (query)        15_064.69       604.60    15_669.29       0.7816     2.805109        20.09
+IVF-Binary-1024-nl273-np23-rf5-random (query)         15_064.69       605.14    15_669.83       0.4952    11.037948        20.09
+IVF-Binary-1024-nl273-np23-rf10-random (query)        15_064.69       644.94    15_709.63       0.6392     5.897839        20.09
+IVF-Binary-1024-nl273-np23-rf20-random (query)        15_064.69       717.17    15_781.86       0.7806     2.824663        20.09
+IVF-Binary-1024-nl273-random (self)                   15_064.69     5_414.21    20_478.90       0.6427     5.817969        20.09
+--------------------------------------------------------------------------------------------------------------------------------
+IVF-Binary-1024-nl387-np19-rf0-random (query)         15_438.17       440.66    15_878.83       0.2383          NaN        20.15
+IVF-Binary-1024-nl387-np27-rf0-random (query)         15_438.17       518.63    15_956.80       0.2373          NaN        20.15
+IVF-Binary-1024-nl387-np19-rf5-random (query)         15_438.17       475.54    15_913.71       0.4979    10.898759        20.15
+IVF-Binary-1024-nl387-np19-rf10-random (query)        15_438.17       508.50    15_946.67       0.6416     5.825887        20.15
+IVF-Binary-1024-nl387-np19-rf20-random (query)        15_438.17       569.70    16_007.87       0.7831     2.775808        20.15
+IVF-Binary-1024-nl387-np27-rf5-random (query)         15_438.17       559.00    15_997.17       0.4959    11.003445        20.15
+IVF-Binary-1024-nl387-np27-rf10-random (query)        15_438.17       594.94    16_033.10       0.6392     5.891274        20.15
+IVF-Binary-1024-nl387-np27-rf20-random (query)        15_438.17       660.46    16_098.62       0.7810     2.815588        20.15
+IVF-Binary-1024-nl387-random (self)                   15_438.17     5_096.49    20_534.65       0.6440     5.775508        20.15
+--------------------------------------------------------------------------------------------------------------------------------
+IVF-Binary-1024-nl547-np23-rf0-random (query)         15_937.58       408.73    16_346.30       0.2395          NaN        20.23
+IVF-Binary-1024-nl547-np27-rf0-random (query)         15_937.58       440.86    16_378.44       0.2388          NaN        20.23
+IVF-Binary-1024-nl547-np33-rf0-random (query)         15_937.58       484.89    16_422.47       0.2382          NaN        20.23
+IVF-Binary-1024-nl547-np23-rf5-random (query)         15_937.58       444.35    16_381.93       0.4997    10.806026        20.23
+IVF-Binary-1024-nl547-np23-rf10-random (query)        15_937.58       477.70    16_415.27       0.6440     5.755572        20.23
+IVF-Binary-1024-nl547-np23-rf20-random (query)        15_937.58       531.42    16_469.00       0.7852     2.737681        20.23
+IVF-Binary-1024-nl547-np27-rf5-random (query)         15_937.58       480.31    16_417.89       0.4978    10.904969        20.23
+IVF-Binary-1024-nl547-np27-rf10-random (query)        15_937.58       516.58    16_454.16       0.6417     5.823544        20.23
+IVF-Binary-1024-nl547-np27-rf20-random (query)        15_937.58       566.11    16_503.69       0.7827     2.782061        20.23
+IVF-Binary-1024-nl547-np33-rf5-random (query)         15_937.58       520.78    16_458.35       0.4963    10.979509        20.23
+IVF-Binary-1024-nl547-np33-rf10-random (query)        15_937.58       555.75    16_493.33       0.6400     5.873334        20.23
+IVF-Binary-1024-nl547-np33-rf20-random (query)        15_937.58       619.11    16_556.68       0.7812     2.811811        20.23
+IVF-Binary-1024-nl547-random (self)                   15_937.58     4_797.55    20_735.13       0.6464     5.703027        20.23
+--------------------------------------------------------------------------------------------------------------------------------
+IVF-Binary-1024-nl273-np13-rf0-itq (query)            16_279.36       432.14    16_711.50       0.2249          NaN        20.09
+IVF-Binary-1024-nl273-np16-rf0-itq (query)            16_279.36       480.82    16_760.18       0.2228          NaN        20.09
+IVF-Binary-1024-nl273-np23-rf0-itq (query)            16_279.36       578.75    16_858.11       0.2222          NaN        20.09
+IVF-Binary-1024-nl273-np13-rf5-itq (query)            16_279.36       474.50    16_753.86       0.4721    12.145417        20.09
+IVF-Binary-1024-nl273-np13-rf10-itq (query)           16_279.36       510.74    16_790.10       0.6138     6.617575        20.09
+IVF-Binary-1024-nl273-np13-rf20-itq (query)           16_279.36       594.80    16_874.16       0.7576     3.236223        20.09
+IVF-Binary-1024-nl273-np16-rf5-itq (query)            16_279.36       545.52    16_824.88       0.4689    12.327458        20.09
+IVF-Binary-1024-nl273-np16-rf10-itq (query)           16_279.36       560.01    16_839.37       0.6102     6.730367        20.09
+IVF-Binary-1024-nl273-np16-rf20-itq (query)           16_279.36       610.81    16_890.17       0.7543     3.305606        20.09
+IVF-Binary-1024-nl273-np23-rf5-itq (query)            16_279.36       612.10    16_891.46       0.4674    12.407278        20.09
+IVF-Binary-1024-nl273-np23-rf10-itq (query)           16_279.36       661.56    16_940.92       0.6086     6.782831        20.09
+IVF-Binary-1024-nl273-np23-rf20-itq (query)           16_279.36       718.12    16_997.48       0.7526     3.335969        20.09
+IVF-Binary-1024-nl273-itq (self)                      16_279.36     5_501.02    21_780.38       0.6108     6.713118        20.09
+--------------------------------------------------------------------------------------------------------------------------------
+IVF-Binary-1024-nl387-np19-rf0-itq (query)            16_752.11       440.06    17_192.17       0.2233          NaN        20.15
+IVF-Binary-1024-nl387-np27-rf0-itq (query)            16_752.11       522.17    17_274.28       0.2224          NaN        20.15
+IVF-Binary-1024-nl387-np19-rf5-itq (query)            16_752.11       479.61    17_231.72       0.4697    12.264457        20.15
+IVF-Binary-1024-nl387-np19-rf10-itq (query)           16_752.11       508.94    17_261.05       0.6113     6.691400        20.15
+IVF-Binary-1024-nl387-np19-rf20-itq (query)           16_752.11       565.81    17_317.92       0.7558     3.274724        20.15
+IVF-Binary-1024-nl387-np27-rf5-itq (query)            16_752.11       560.99    17_313.11       0.4674    12.385999        20.15
+IVF-Binary-1024-nl387-np27-rf10-itq (query)           16_752.11       595.57    17_347.68       0.6086     6.776923        20.15
+IVF-Binary-1024-nl387-np27-rf20-itq (query)           16_752.11       656.08    17_408.19       0.7535     3.321376        20.15
+IVF-Binary-1024-nl387-itq (self)                      16_752.11     5_102.81    21_854.92       0.6122     6.665528        20.15
+--------------------------------------------------------------------------------------------------------------------------------
+IVF-Binary-1024-nl547-np23-rf0-itq (query)            17_281.54       416.82    17_698.36       0.2241          NaN        20.23
+IVF-Binary-1024-nl547-np27-rf0-itq (query)            17_281.54       446.95    17_728.50       0.2232          NaN        20.23
+IVF-Binary-1024-nl547-np33-rf0-itq (query)            17_281.54       493.05    17_774.59       0.2223          NaN        20.23
+IVF-Binary-1024-nl547-np23-rf5-itq (query)            17_281.54       461.77    17_743.32       0.4713    12.165897        20.23
+IVF-Binary-1024-nl547-np23-rf10-itq (query)           17_281.54       480.92    17_762.46       0.6141     6.602729        20.23
+IVF-Binary-1024-nl547-np23-rf20-itq (query)           17_281.54       540.76    17_822.30       0.7583     3.220276        20.23
+IVF-Binary-1024-nl547-np27-rf5-itq (query)            17_281.54       482.95    17_764.49       0.4697    12.266341        20.23
+IVF-Binary-1024-nl547-np27-rf10-itq (query)           17_281.54       524.17    17_805.71       0.6117     6.681995        20.23
+IVF-Binary-1024-nl547-np27-rf20-itq (query)           17_281.54       570.73    17_852.27       0.7556     3.273780        20.23
+IVF-Binary-1024-nl547-np33-rf5-itq (query)            17_281.54       529.92    17_811.47       0.4685    12.344726        20.23
+IVF-Binary-1024-nl547-np33-rf10-itq (query)           17_281.54       563.23    17_844.78       0.6099     6.739142        20.23
+IVF-Binary-1024-nl547-np33-rf20-itq (query)           17_281.54       632.20    17_913.75       0.7539     3.307580        20.23
+IVF-Binary-1024-nl547-itq (self)                      17_281.54     4_818.17    22_099.71       0.6147     6.580361        20.23
+--------------------------------------------------------------------------------------------------------------------------------
+IVF-Binary-128-nl273-np13-rf0-signed (query)           2_541.61        54.59     2_596.20       0.0405          NaN         3.63
+IVF-Binary-128-nl273-np16-rf0-signed (query)           2_541.61        59.14     2_600.75       0.0316          NaN         3.63
+IVF-Binary-128-nl273-np23-rf0-signed (query)           2_541.61        68.73     2_610.34       0.0298          NaN         3.63
+IVF-Binary-128-nl273-np13-rf5-signed (query)           2_541.61        77.80     2_619.42       0.1259    55.863005         3.63
+IVF-Binary-128-nl273-np13-rf10-signed (query)          2_541.61       105.13     2_646.75       0.1973    38.135787         3.63
+IVF-Binary-128-nl273-np13-rf20-signed (query)          2_541.61       146.69     2_688.30       0.3031    24.545632         3.63
+IVF-Binary-128-nl273-np16-rf5-signed (query)           2_541.61        80.95     2_622.56       0.1029    63.684530         3.63
+IVF-Binary-128-nl273-np16-rf10-signed (query)          2_541.61       105.46     2_647.08       0.1670    44.091872         3.63
+IVF-Binary-128-nl273-np16-rf20-signed (query)          2_541.61       154.01     2_695.63       0.2658    28.752678         3.63
+IVF-Binary-128-nl273-np23-rf5-signed (query)           2_541.61        91.50     2_633.11       0.0984    65.659545         3.63
+IVF-Binary-128-nl273-np23-rf10-signed (query)          2_541.61       117.22     2_658.83       0.1605    45.502618         3.63
+IVF-Binary-128-nl273-np23-rf20-signed (query)          2_541.61       165.25     2_706.86       0.2555    29.909447         3.63
+IVF-Binary-128-nl273-signed (self)                     2_541.61     1_060.98     3_602.59       0.1705    43.928033         3.63
+--------------------------------------------------------------------------------------------------------------------------------
+IVF-Binary-128-nl387-np19-rf0-signed (query)           2_878.32        59.56     2_937.88       0.0335          NaN         3.69
+IVF-Binary-128-nl387-np27-rf0-signed (query)           2_878.32        66.82     2_945.14       0.0311          NaN         3.69
+IVF-Binary-128-nl387-np19-rf5-signed (query)           2_878.32        82.81     2_961.13       0.1085    61.081309         3.69
+IVF-Binary-128-nl387-np19-rf10-signed (query)          2_878.32       105.00     2_983.32       0.1761    42.104932         3.69
+IVF-Binary-128-nl387-np19-rf20-signed (query)          2_878.32       158.06     3_036.37       0.2786    27.252575         3.69
+IVF-Binary-128-nl387-np27-rf5-signed (query)           2_878.32        90.30     2_968.62       0.1007    64.610159         3.69
+IVF-Binary-128-nl387-np27-rf10-signed (query)          2_878.32       115.33     2_993.65       0.1638    44.938258         3.69
+IVF-Binary-128-nl387-np27-rf20-signed (query)          2_878.32       162.47     3_040.78       0.2600    29.469313         3.69
+IVF-Binary-128-nl387-signed (self)                     2_878.32     1_045.77     3_924.08       0.1801    41.704632         3.69
+--------------------------------------------------------------------------------------------------------------------------------
+IVF-Binary-128-nl547-np23-rf0-signed (query)           3_412.35        61.34     3_473.69       0.0347          NaN         3.77
+IVF-Binary-128-nl547-np27-rf0-signed (query)           3_412.35        63.82     3_476.17       0.0332          NaN         3.77
+IVF-Binary-128-nl547-np33-rf0-signed (query)           3_412.35        68.87     3_481.22       0.0313          NaN         3.77
+IVF-Binary-128-nl547-np23-rf5-signed (query)           3_412.35        83.51     3_495.86       0.1136    58.440812         3.77
+IVF-Binary-128-nl547-np23-rf10-signed (query)          3_412.35       104.73     3_517.08       0.1836    39.855237         3.77
+IVF-Binary-128-nl547-np23-rf20-signed (query)          3_412.35       151.33     3_563.67       0.2887    25.505688         3.77
+IVF-Binary-128-nl547-np27-rf5-signed (query)           3_412.35        84.74     3_497.09       0.1096    60.271032         3.77
+IVF-Binary-128-nl547-np27-rf10-signed (query)          3_412.35       108.24     3_520.59       0.1769    41.374801         3.77
+IVF-Binary-128-nl547-np27-rf20-signed (query)          3_412.35       154.64     3_566.99       0.2780    26.736117         3.77
+IVF-Binary-128-nl547-np33-rf5-signed (query)           3_412.35        89.73     3_502.08       0.1045    62.486372         3.77
+IVF-Binary-128-nl547-np33-rf10-signed (query)          3_412.35       113.07     3_525.42       0.1698    43.037431         3.77
+IVF-Binary-128-nl547-np33-rf20-signed (query)          3_412.35       159.54     3_571.88       0.2677    27.966006         3.77
+IVF-Binary-128-nl547-signed (self)                     3_412.35     1_040.69     4_453.04       0.1881    39.440811         3.77
 --------------------------------------------------------------------------------------------------------------------------------
 </code></pre>
 </details>
 
----
-
 <details>
-<summary><b>Binary - Euclidean (Correlated - higher dimensionality)</b>:</summary>
+<summary><b>Binary - Euclidean (LowRank - 256 bit)</b>:</summary>
+</br>
 <pre><code>
 ================================================================================================================================
-Benchmark: 150k cells, 128D - Binary Quantisation
+Benchmark: 150k cells, 256D - Binary Quantisation
 ================================================================================================================================
 Method                                               Build (ms)   Query (ms)   Total (ms)     Recall@k   Dist Error    Size (MB)
 --------------------------------------------------------------------------------------------------------------------------------
-Exhaustive (query)                                        14.34     6_164.32     6_178.66       1.0000     0.000000        73.24
-Exhaustive (self)                                         14.34    64_351.70    64_366.05       1.0000     0.000000        73.24
+Exhaustive (query)                                        28.69    14_736.97    14_765.66       1.0000     0.000000       146.48
+Exhaustive (self)                                         28.69   148_773.57   148_802.26       1.0000     0.000000       146.48
 --------------------------------------------------------------------------------------------------------------------------------
-ExhaustiveBinary-256-random_no_rr (query)              3_896.60       528.19     4_424.79       0.0770          NaN         4.70
-ExhaustiveBinary-256-random-rf5 (query)                3_896.60       589.37     4_485.98       0.1853    40.590911         4.70
-ExhaustiveBinary-256-random-rf10 (query)               3_896.60       664.76     4_561.36       0.2680    26.716815         4.70
-ExhaustiveBinary-256-random-rf20 (query)               3_896.60       765.21     4_661.81       0.3854    16.589779         4.70
-ExhaustiveBinary-256-random (self)                     3_896.60     6_413.52    10_310.12       0.2721    26.279507         4.70
-ExhaustiveBinary-256-itq_no_rr (query)                18_493.79       591.11    19_084.89       0.0334          NaN         4.70
-ExhaustiveBinary-256-itq-rf5 (query)                  18_493.79       634.32    19_128.10       0.1047    59.774198         4.70
-ExhaustiveBinary-256-itq-rf10 (query)                 18_493.79       657.81    19_151.59       0.1682    40.784107         4.70
-ExhaustiveBinary-256-itq-rf20 (query)                 18_493.79       724.79    19_218.58       0.2648    26.557562         4.70
-ExhaustiveBinary-256-itq (self)                       18_493.79     6_620.06    25_113.84       0.1711    40.460557         4.70
+ExhaustiveBinary-256-random_no_rr (query)              7_667.15       563.16     8_230.32       0.0848          NaN         4.83
+ExhaustiveBinary-256-random-rf5 (query)                7_667.15       639.21     8_306.36       0.1980    84.795844         4.83
+ExhaustiveBinary-256-random-rf10 (query)               7_667.15       668.58     8_335.74       0.2831    55.592413         4.83
+ExhaustiveBinary-256-random-rf20 (query)               7_667.15       835.28     8_502.43       0.4015    34.646234         4.83
+ExhaustiveBinary-256-random (self)                     7_667.15     6_660.58    14_327.73       0.2867    54.828071         4.83
+ExhaustiveBinary-256-itq_no_rr (query)                 9_626.20       554.60    10_180.79       0.0027          NaN         4.83
 --------------------------------------------------------------------------------------------------------------------------------
-ExhaustiveBinary-512-random_no_rr (query)              7_783.07       921.22     8_704.28       0.1527          NaN         9.41
-ExhaustiveBinary-512-random-rf5 (query)                7_783.07     1_183.89     8_966.96       0.3242    22.196757         9.41
-ExhaustiveBinary-512-random-rf10 (query)               7_783.07     1_043.02     8_826.08       0.4419    13.545010         9.41
-ExhaustiveBinary-512-random-rf20 (query)               7_783.07     1_252.83     9_035.89       0.5832     7.719977         9.41
-ExhaustiveBinary-512-random (self)                     7_783.07    10_551.71    18_334.78       0.4431    13.453984         9.41
-ExhaustiveBinary-512-itq_no_rr (query)                22_438.56       905.31    23_343.87       0.1302          NaN         9.41
-ExhaustiveBinary-512-itq-rf5 (query)                  22_438.56       949.46    23_388.01       0.2779    26.538562         9.41
-ExhaustiveBinary-512-itq-rf10 (query)                 22_438.56     1_017.52    23_456.08       0.3835    16.663114         9.41
-ExhaustiveBinary-512-itq-rf20 (query)                 22_438.56     1_124.92    23_563.48       0.5194     9.834430         9.41
-ExhaustiveBinary-512-itq (self)                       22_438.56    10_505.61    32_944.16       0.3863    16.548400         9.41
+ExhaustiveBinary-256-itq-rf5 (query)                   9_626.20       623.26    10_249.46       0.0128   233.324047         4.83
+ExhaustiveBinary-256-itq-rf10 (query)                  9_626.20       611.38    10_237.58       0.0254   177.356207         4.83
+ExhaustiveBinary-256-itq-rf20 (query)                  9_626.20       685.38    10_311.58       0.0500   134.022852         4.83
+ExhaustiveBinary-256-itq (self)                        9_626.20     6_131.39    15_757.58       0.0256   177.818519         4.83
+ExhaustiveBinary-512-random_no_rr (query)             15_035.48       965.80    16_001.29       0.1519          NaN         9.66
 --------------------------------------------------------------------------------------------------------------------------------
-ExhaustiveBinary-1024-random_no_rr (query)            15_207.87     1_525.68    16_733.55       0.2353          NaN        18.81
-ExhaustiveBinary-1024-random-rf5 (query)              15_207.87     1_579.63    16_787.50       0.4918    11.183271        18.81
-ExhaustiveBinary-1024-random-rf10 (query)             15_207.87     1_627.91    16_835.78       0.6358     5.988378        18.81
-ExhaustiveBinary-1024-random-rf20 (query)             15_207.87     1_746.83    16_954.70       0.7779     2.871209        18.81
-ExhaustiveBinary-1024-random (self)                   15_207.87    16_600.74    31_808.61       0.6381     5.940314        18.81
-ExhaustiveBinary-1024-itq_no_rr (query)               29_369.77     1_678.66    31_048.43       0.2191          NaN        18.81
-ExhaustiveBinary-1024-itq-rf5 (query)                 29_369.77     1_754.71    31_124.48       0.4611    12.755652        18.81
-ExhaustiveBinary-1024-itq-rf10 (query)                29_369.77     1_850.45    31_220.22       0.6023     7.013961        18.81
-ExhaustiveBinary-1024-itq-rf20 (query)                29_369.77     2_047.43    31_417.21       0.7468     3.481342        18.81
-ExhaustiveBinary-1024-itq (self)                      29_369.77    18_733.00    48_102.78       0.6045     6.950550        18.81
+ExhaustiveBinary-512-random-rf5 (query)               15_035.48     1_027.89    16_063.37       0.3177    49.573717         9.66
+ExhaustiveBinary-512-random-rf10 (query)              15_035.48     1_116.43    16_151.91       0.4333    30.425506         9.66
+ExhaustiveBinary-512-random-rf20 (query)              15_035.48     1_242.85    16_278.33       0.5756    17.359891         9.66
+ExhaustiveBinary-512-random (self)                    15_035.48    10_943.37    25_978.85       0.4358    30.179063         9.66
+ExhaustiveBinary-512-itq_no_rr (query)                17_352.32       972.32    18_324.64       0.0848          NaN         9.66
 --------------------------------------------------------------------------------------------------------------------------------
-IVF-Binary-256-nl273-np13-rf0-random (query)           7_474.67        96.46     7_571.13       0.0894          NaN         5.98
-IVF-Binary-256-nl273-np16-rf0-random (query)           7_474.67       103.21     7_577.88       0.0819          NaN         5.98
-IVF-Binary-256-nl273-np23-rf0-random (query)           7_474.67       128.74     7_603.41       0.0801          NaN         5.98
-IVF-Binary-256-nl273-np13-rf5-random (query)           7_474.67       148.38     7_623.05       0.2082    37.003584         5.98
-IVF-Binary-256-nl273-np13-rf10-random (query)          7_474.67       184.61     7_659.28       0.2984    23.995106         5.98
-IVF-Binary-256-nl273-np13-rf20-random (query)          7_474.67       257.96     7_732.63       0.4184    14.855149         5.98
-IVF-Binary-256-nl273-np16-rf5-random (query)           7_474.67       130.06     7_604.73       0.1960    39.530049         5.98
-IVF-Binary-256-nl273-np16-rf10-random (query)          7_474.67       169.10     7_643.77       0.2836    25.718898         5.98
-IVF-Binary-256-nl273-np16-rf20-random (query)          7_474.67       235.34     7_710.01       0.4031    15.887879         5.98
-IVF-Binary-256-nl273-np23-rf5-random (query)           7_474.67       145.05     7_619.72       0.1927    40.256023         5.98
-IVF-Binary-256-nl273-np23-rf10-random (query)          7_474.67       188.19     7_662.86       0.2789    26.258727         5.98
-IVF-Binary-256-nl273-np23-rf20-random (query)          7_474.67       257.05     7_731.72       0.3972    16.273250         5.98
-IVF-Binary-256-nl273-random (self)                     7_474.67     1_711.90     9_186.57       0.2865    25.390828         5.98
-IVF-Binary-256-nl387-np19-rf0-random (query)           8_202.75        91.47     8_294.22       0.0832          NaN         6.04
-IVF-Binary-256-nl387-np27-rf0-random (query)           8_202.75       101.96     8_304.71       0.0801          NaN         6.04
-IVF-Binary-256-nl387-np19-rf5-random (query)           8_202.75       123.07     8_325.82       0.1995    38.528842         6.04
-IVF-Binary-256-nl387-np19-rf10-random (query)          8_202.75       158.14     8_360.89       0.2884    25.014672         6.04
-IVF-Binary-256-nl387-np19-rf20-random (query)          8_202.75       227.48     8_430.22       0.4104    15.315480         6.04
-IVF-Binary-256-nl387-np27-rf5-random (query)           8_202.75       135.36     8_338.11       0.1929    40.071462         6.04
-IVF-Binary-256-nl387-np27-rf10-random (query)          8_202.75       168.48     8_371.23       0.2798    26.100169         6.04
-IVF-Binary-256-nl387-np27-rf20-random (query)          8_202.75       237.48     8_440.23       0.4005    15.973244         6.04
-IVF-Binary-256-nl387-random (self)                     8_202.75     1_637.50     9_840.25       0.2930    24.576691         6.04
-IVF-Binary-256-nl547-np23-rf0-random (query)           9_693.66        98.74     9_792.40       0.0847          NaN         6.12
-IVF-Binary-256-nl547-np27-rf0-random (query)           9_693.66       101.27     9_794.94       0.0829          NaN         6.12
-IVF-Binary-256-nl547-np33-rf0-random (query)           9_693.66       108.41     9_802.08       0.0815          NaN         6.12
-IVF-Binary-256-nl547-np23-rf5-random (query)           9_693.66       130.13     9_823.79       0.2026    37.589199         6.12
-IVF-Binary-256-nl547-np23-rf10-random (query)          9_693.66       162.54     9_856.20       0.2933    24.331515         6.12
-IVF-Binary-256-nl547-np23-rf20-random (query)          9_693.66       235.24     9_928.90       0.4160    14.924581         6.12
-IVF-Binary-256-nl547-np27-rf5-random (query)           9_693.66       137.01     9_830.67       0.1985    38.518369         6.12
-IVF-Binary-256-nl547-np27-rf10-random (query)          9_693.66       170.19     9_863.85       0.2874    25.037356         6.12
-IVF-Binary-256-nl547-np27-rf20-random (query)          9_693.66       258.99     9_952.65       0.4081    15.411088         6.12
-IVF-Binary-256-nl547-np33-rf5-random (query)           9_693.66       167.14     9_860.80       0.1948    39.402901         6.12
-IVF-Binary-256-nl547-np33-rf10-random (query)          9_693.66       192.97     9_886.63       0.2821    25.705501         6.12
-IVF-Binary-256-nl547-np33-rf20-random (query)          9_693.66       271.21     9_964.88       0.4018    15.833821         6.12
-IVF-Binary-256-nl547-random (self)                     9_693.66     1_673.77    11_367.43       0.2978    23.888874         6.12
-IVF-Binary-256-nl273-np13-rf0-itq (query)             27_036.22        88.35    27_124.57       0.0462          NaN         5.98
-IVF-Binary-256-nl273-np16-rf0-itq (query)             27_036.22        90.97    27_127.19       0.0370          NaN         5.98
-IVF-Binary-256-nl273-np23-rf0-itq (query)             27_036.22       110.77    27_146.99       0.0355          NaN         5.98
-IVF-Binary-256-nl273-np13-rf5-itq (query)             27_036.22       112.75    27_148.97       0.1367    53.764831         5.98
-IVF-Binary-256-nl273-np13-rf10-itq (query)            27_036.22       145.96    27_182.18       0.2112    36.381584         5.98
-IVF-Binary-256-nl273-np13-rf20-itq (query)            27_036.22       201.41    27_237.63       0.3175    23.358034         5.98
-IVF-Binary-256-nl273-np16-rf5-itq (query)             27_036.22       117.08    27_153.30       0.1173    59.670220         5.98
-IVF-Binary-256-nl273-np16-rf10-itq (query)            27_036.22       151.46    27_187.68       0.1872    40.770059         5.98
-IVF-Binary-256-nl273-np16-rf20-itq (query)            27_036.22       218.95    27_255.18       0.2906    26.159204         5.98
-IVF-Binary-256-nl273-np23-rf5-itq (query)             27_036.22       131.86    27_168.09       0.1132    61.886937         5.98
-IVF-Binary-256-nl273-np23-rf10-itq (query)            27_036.22       162.85    27_199.07       0.1805    42.819528         5.98
-IVF-Binary-256-nl273-np23-rf20-itq (query)            27_036.22       228.63    27_264.86       0.2805    27.530959         5.98
-IVF-Binary-256-nl273-itq (self)                       27_036.22     1_493.78    28_530.00       0.1891    40.811783         5.98
-IVF-Binary-256-nl387-np19-rf0-itq (query)             22_256.67        89.36    22_346.03       0.0385          NaN         6.04
-IVF-Binary-256-nl387-np27-rf0-itq (query)             22_256.67        99.21    22_355.87       0.0357          NaN         6.04
-IVF-Binary-256-nl387-np19-rf5-itq (query)             22_256.67       118.02    22_374.68       0.1233    57.094275         6.04
-IVF-Binary-256-nl387-np19-rf10-itq (query)            22_256.67       162.17    22_418.84       0.1952    38.608729         6.04
-IVF-Binary-256-nl387-np19-rf20-itq (query)            22_256.67       232.27    22_488.94       0.3019    24.521453         6.04
-IVF-Binary-256-nl387-np27-rf5-itq (query)             22_256.67       127.27    22_383.94       0.1149    60.313468         6.04
-IVF-Binary-256-nl387-np27-rf10-itq (query)            22_256.67       164.97    22_421.64       0.1836    41.058709         6.04
-IVF-Binary-256-nl387-np27-rf20-itq (query)            22_256.67       223.07    22_479.74       0.2869    26.115333         6.04
-IVF-Binary-256-nl387-itq (self)                       22_256.67     1_499.31    23_755.98       0.1984    38.246832         6.04
-IVF-Binary-256-nl547-np23-rf0-itq (query)             23_663.28        91.05    23_754.32       0.0404          NaN         6.12
-IVF-Binary-256-nl547-np27-rf0-itq (query)             23_663.28        95.06    23_758.34       0.0389          NaN         6.12
-IVF-Binary-256-nl547-np33-rf0-itq (query)             23_663.28       100.39    23_763.66       0.0372          NaN         6.12
-IVF-Binary-256-nl547-np23-rf5-itq (query)             23_663.28       119.59    23_782.86       0.1270    55.047860         6.12
-IVF-Binary-256-nl547-np23-rf10-itq (query)            23_663.28       150.45    23_813.73       0.2012    37.295712         6.12
-IVF-Binary-256-nl547-np23-rf20-itq (query)            23_663.28       203.84    23_867.12       0.3089    23.748919         6.12
-IVF-Binary-256-nl547-np27-rf5-itq (query)             23_663.28       121.69    23_784.97       0.1227    56.668382         6.12
-IVF-Binary-256-nl547-np27-rf10-itq (query)            23_663.28       154.53    23_817.81       0.1944    38.564183         6.12
-IVF-Binary-256-nl547-np27-rf20-itq (query)            23_663.28       223.13    23_886.41       0.3002    24.578001         6.12
-IVF-Binary-256-nl547-np33-rf5-itq (query)             23_663.28       128.36    23_791.64       0.1177    58.839482         6.12
-IVF-Binary-256-nl547-np33-rf10-itq (query)            23_663.28       163.20    23_826.48       0.1868    40.208023         6.12
-IVF-Binary-256-nl547-np33-rf20-itq (query)            23_663.28       229.30    23_892.57       0.2904    25.678650         6.12
-IVF-Binary-256-nl547-itq (self)                       23_663.28     1_511.28    25_174.56       0.2043    37.026983         6.12
+ExhaustiveBinary-512-itq-rf5 (query)                  17_352.32     1_029.61    18_381.93       0.1972    85.264886         9.66
+ExhaustiveBinary-512-itq-rf10 (query)                 17_352.32     1_093.79    18_446.11       0.2835    55.811208         9.66
+ExhaustiveBinary-512-itq-rf20 (query)                 17_352.32     1_326.05    18_678.37       0.4008    34.735180         9.66
+ExhaustiveBinary-512-itq (self)                       17_352.32    10_908.51    28_260.83       0.2855    55.077668         9.66
+ExhaustiveBinary-1024-random_no_rr (query)            29_704.49     1_686.75    31_391.24       0.2320          NaN        19.31
 --------------------------------------------------------------------------------------------------------------------------------
-IVF-Binary-512-nl273-np13-rf0-random (query)          10_578.18       176.13    10_754.32       0.1596          NaN        10.69
-IVF-Binary-512-nl273-np16-rf0-random (query)          10_578.18       200.58    10_778.77       0.1563          NaN        10.69
-IVF-Binary-512-nl273-np23-rf0-random (query)          10_578.18       221.40    10_799.59       0.1554          NaN        10.69
-IVF-Binary-512-nl273-np13-rf5-random (query)          10_578.18       226.86    10_805.04       0.3370    20.987751        10.69
-IVF-Binary-512-nl273-np13-rf10-random (query)         10_578.18       265.49    10_843.67       0.4570    12.738091        10.69
-IVF-Binary-512-nl273-np13-rf20-random (query)         10_578.18       327.91    10_906.10       0.5992     7.207613        10.69
-IVF-Binary-512-nl273-np16-rf5-random (query)          10_578.18       245.17    10_823.35       0.3308    21.630921        10.69
-IVF-Binary-512-nl273-np16-rf10-random (query)         10_578.18       286.74    10_864.93       0.4506    13.121710        10.69
-IVF-Binary-512-nl273-np16-rf20-random (query)         10_578.18       361.50    10_939.69       0.5923     7.447657        10.69
-IVF-Binary-512-nl273-np23-rf5-random (query)          10_578.18       275.16    10_853.34       0.3289    21.801439        10.69
-IVF-Binary-512-nl273-np23-rf10-random (query)         10_578.18       322.06    10_900.25       0.4477    13.266981        10.69
-IVF-Binary-512-nl273-np23-rf20-random (query)         10_578.18       405.45    10_983.63       0.5898     7.527176        10.69
-IVF-Binary-512-nl273-random (self)                    10_578.18     2_890.17    13_468.35       0.4518    13.046860        10.69
-IVF-Binary-512-nl387-np19-rf0-random (query)          11_639.29       184.37    11_823.65       0.1571          NaN        10.74
-IVF-Binary-512-nl387-np27-rf0-random (query)          11_639.29       210.43    11_849.72       0.1557          NaN        10.74
-IVF-Binary-512-nl387-np19-rf5-random (query)          11_639.29       234.94    11_874.22       0.3331    21.366472        10.74
-IVF-Binary-512-nl387-np19-rf10-random (query)         11_639.29       271.77    11_911.06       0.4543    12.892701        10.74
-IVF-Binary-512-nl387-np19-rf20-random (query)         11_639.29       338.43    11_977.71       0.5962     7.323848        10.74
-IVF-Binary-512-nl387-np27-rf5-random (query)          11_639.29       290.26    11_929.55       0.3294    21.746609        10.74
-IVF-Binary-512-nl387-np27-rf10-random (query)         11_639.29       304.90    11_944.19       0.4493    13.172260        10.74
-IVF-Binary-512-nl387-np27-rf20-random (query)         11_639.29       378.04    12_017.32       0.5909     7.498725        10.74
-IVF-Binary-512-nl387-random (self)                    11_639.29     2_768.68    14_407.97       0.4552    12.836096        10.74
-IVF-Binary-512-nl547-np23-rf0-random (query)          13_369.42       183.58    13_552.99       0.1579          NaN        10.82
-IVF-Binary-512-nl547-np27-rf0-random (query)          13_369.42       198.67    13_568.09       0.1569          NaN        10.82
-IVF-Binary-512-nl547-np33-rf0-random (query)          13_369.42       207.35    13_576.76       0.1560          NaN        10.82
-IVF-Binary-512-nl547-np23-rf5-random (query)          13_369.42       231.14    13_600.56       0.3354    21.117508        10.82
-IVF-Binary-512-nl547-np23-rf10-random (query)         13_369.42       306.02    13_675.44       0.4570    12.738653        10.82
-IVF-Binary-512-nl547-np23-rf20-random (query)         13_369.42       334.19    13_703.60       0.5999     7.182206        10.82
-IVF-Binary-512-nl547-np27-rf5-random (query)          13_369.42       241.91    13_611.33       0.3326    21.426735        10.82
-IVF-Binary-512-nl547-np27-rf10-random (query)         13_369.42       288.66    13_658.07       0.4531    12.960609        10.82
-IVF-Binary-512-nl547-np27-rf20-random (query)         13_369.42       341.95    13_711.37       0.5949     7.349314        10.82
-IVF-Binary-512-nl547-np33-rf5-random (query)          13_369.42       257.00    13_626.41       0.3301    21.676819        10.82
-IVF-Binary-512-nl547-np33-rf10-random (query)         13_369.42       306.20    13_675.62       0.4501    13.125100        10.82
-IVF-Binary-512-nl547-np33-rf20-random (query)         13_369.42       365.42    13_734.83       0.5916     7.462558        10.82
-IVF-Binary-512-nl547-random (self)                    13_369.42     2_642.86    16_012.28       0.4583    12.660445        10.82
-IVF-Binary-512-nl273-np13-rf0-itq (query)             26_056.03       180.30    26_236.33       0.1373          NaN        10.69
-IVF-Binary-512-nl273-np16-rf0-itq (query)             26_056.03       199.24    26_255.26       0.1336          NaN        10.69
-IVF-Binary-512-nl273-np23-rf0-itq (query)             26_056.03       227.01    26_283.04       0.1327          NaN        10.69
-IVF-Binary-512-nl273-np13-rf5-itq (query)             26_056.03       254.26    26_310.29       0.2921    25.040561        10.69
-IVF-Binary-512-nl273-np13-rf10-itq (query)            26_056.03       265.23    26_321.26       0.4014    15.571823        10.69
-IVF-Binary-512-nl273-np13-rf20-itq (query)            26_056.03       336.63    26_392.66       0.5382     9.170711        10.69
-IVF-Binary-512-nl273-np16-rf5-itq (query)             26_056.03       240.72    26_296.75       0.2858    25.784569        10.69
-IVF-Binary-512-nl273-np16-rf10-itq (query)            26_056.03       321.98    26_378.01       0.3942    16.060633        10.69
-IVF-Binary-512-nl273-np16-rf20-itq (query)            26_056.03       361.80    26_417.82       0.5303     9.478394        10.69
-IVF-Binary-512-nl273-np23-rf5-itq (query)             26_056.03       274.56    26_330.58       0.2834    26.075631        10.69
-IVF-Binary-512-nl273-np23-rf10-itq (query)            26_056.03       329.77    26_385.80       0.3910    16.268067        10.69
-IVF-Binary-512-nl273-np23-rf20-itq (query)            26_056.03       395.65    26_451.68       0.5267     9.612246        10.69
-IVF-Binary-512-nl273-itq (self)                       26_056.03     2_839.80    28_895.83       0.3965    15.986403        10.69
-IVF-Binary-512-nl387-np19-rf0-itq (query)             34_822.04       187.80    35_009.85       0.1354          NaN        10.74
-IVF-Binary-512-nl387-np27-rf0-itq (query)             34_822.04       214.31    35_036.36       0.1337          NaN        10.74
-IVF-Binary-512-nl387-np19-rf5-itq (query)             34_822.04       235.65    35_057.70       0.2879    25.438761        10.74
-IVF-Binary-512-nl387-np19-rf10-itq (query)            34_822.04       277.68    35_099.73       0.3968    15.873447        10.74
-IVF-Binary-512-nl387-np19-rf20-itq (query)            34_822.04       336.40    35_158.44       0.5338     9.322012        10.74
-IVF-Binary-512-nl387-np27-rf5-itq (query)             34_822.04       263.02    35_085.06       0.2837    25.980320        10.74
-IVF-Binary-512-nl387-np27-rf10-itq (query)            34_822.04       303.53    35_125.57       0.3911    16.260259        10.74
-IVF-Binary-512-nl387-np27-rf20-itq (query)            34_822.04       373.71    35_195.76       0.5272     9.577323        10.74
-IVF-Binary-512-nl387-itq (self)                       34_822.04     2_716.36    37_538.41       0.4000    15.738281        10.74
-IVF-Binary-512-nl547-np23-rf0-itq (query)             27_961.44       180.66    28_142.11       0.1359          NaN        10.82
-IVF-Binary-512-nl547-np27-rf0-itq (query)             27_961.44       192.45    28_153.89       0.1346          NaN        10.82
-IVF-Binary-512-nl547-np33-rf0-itq (query)             27_961.44       205.96    28_167.40       0.1335          NaN        10.82
-IVF-Binary-512-nl547-np23-rf5-itq (query)             27_961.44       228.46    28_189.91       0.2909    25.061655        10.82
-IVF-Binary-512-nl547-np23-rf10-itq (query)            27_961.44       268.89    28_230.33       0.4003    15.624347        10.82
-IVF-Binary-512-nl547-np23-rf20-itq (query)            27_961.44       325.30    28_286.74       0.5386     9.142311        10.82
-IVF-Binary-512-nl547-np27-rf5-itq (query)             27_961.44       239.80    28_201.24       0.2880    25.409514        10.82
-IVF-Binary-512-nl547-np27-rf10-itq (query)            27_961.44       276.71    28_238.16       0.3963    15.878398        10.82
-IVF-Binary-512-nl547-np27-rf20-itq (query)            27_961.44       340.56    28_302.00       0.5335     9.325783        10.82
-IVF-Binary-512-nl547-np33-rf5-itq (query)             27_961.44       258.84    28_220.29       0.2856    25.723061        10.82
-IVF-Binary-512-nl547-np33-rf10-itq (query)            27_961.44       305.56    28_267.00       0.3927    16.122518        10.82
-IVF-Binary-512-nl547-np33-rf20-itq (query)            27_961.44       363.05    28_324.49       0.5294     9.482738        10.82
-IVF-Binary-512-nl547-itq (self)                       27_961.44     2_716.66    30_678.11       0.4033    15.508734        10.82
+ExhaustiveBinary-1024-random-rf5 (query)              29_704.49     1_763.96    31_468.45       0.4863    25.204494        19.31
+ExhaustiveBinary-1024-random-rf10 (query)             29_704.49     1_815.50    31_519.99       0.6287    13.571699        19.31
+ExhaustiveBinary-1024-random-rf20 (query)             29_704.49     1_963.79    31_668.29       0.7709     6.528124        19.31
+ExhaustiveBinary-1024-random (self)                   29_704.49    18_255.05    47_959.54       0.6327    13.347710        19.31
+ExhaustiveBinary-1024-itq_no_rr (query)               32_743.65     1_698.01    34_441.66       0.1937          NaN        19.31
 --------------------------------------------------------------------------------------------------------------------------------
-IVF-Binary-1024-nl273-np13-rf0-random (query)         18_304.93       444.82    18_749.75       0.2399          NaN        20.09
-IVF-Binary-1024-nl273-np16-rf0-random (query)         18_304.93       483.64    18_788.57       0.2382          NaN        20.09
-IVF-Binary-1024-nl273-np23-rf0-random (query)         18_304.93       612.39    18_917.32       0.2377          NaN        20.09
-IVF-Binary-1024-nl273-np13-rf5-random (query)         18_304.93       474.40    18_779.33       0.4992    10.834117        20.09
-IVF-Binary-1024-nl273-np13-rf10-random (query)        18_304.93       509.85    18_814.78       0.6434     5.779240        20.09
-IVF-Binary-1024-nl273-np13-rf20-random (query)        18_304.93       565.67    18_870.60       0.7845     2.747805        20.09
-IVF-Binary-1024-nl273-np16-rf5-random (query)         18_304.93       542.14    18_847.07       0.4962    10.981356        20.09
-IVF-Binary-1024-nl273-np16-rf10-random (query)        18_304.93       561.84    18_866.77       0.6406     5.859089        20.09
-IVF-Binary-1024-nl273-np16-rf20-random (query)        18_304.93       621.97    18_926.90       0.7820     2.797675        20.09
-IVF-Binary-1024-nl273-np23-rf5-random (query)         18_304.93       619.96    18_924.89       0.4952    11.037131        20.09
-IVF-Binary-1024-nl273-np23-rf10-random (query)        18_304.93       661.24    18_966.17       0.6394     5.893505        20.09
-IVF-Binary-1024-nl273-np23-rf20-random (query)        18_304.93       727.22    19_032.15       0.7808     2.820922        20.09
-IVF-Binary-1024-nl273-random (self)                   18_304.93     5_590.87    23_895.80       0.6428     5.813738        20.09
-IVF-Binary-1024-nl387-np19-rf0-random (query)         19_124.66       445.09    19_569.75       0.2387          NaN        20.15
-IVF-Binary-1024-nl387-np27-rf0-random (query)         19_124.66       525.57    19_650.23       0.2378          NaN        20.15
-IVF-Binary-1024-nl387-np19-rf5-random (query)         19_124.66       481.31    19_605.96       0.4978    10.900723        20.15
-IVF-Binary-1024-nl387-np19-rf10-random (query)        19_124.66       522.00    19_646.66       0.6417     5.823667        20.15
-IVF-Binary-1024-nl387-np19-rf20-random (query)        19_124.66       580.87    19_705.53       0.7830     2.778159        20.15
-IVF-Binary-1024-nl387-np27-rf5-random (query)         19_124.66       567.42    19_692.08       0.4959    11.002308        20.15
-IVF-Binary-1024-nl387-np27-rf10-random (query)        19_124.66       602.63    19_727.29       0.6394     5.889963        20.15
-IVF-Binary-1024-nl387-np27-rf20-random (query)        19_124.66       676.03    19_800.69       0.7809     2.816231        20.15
-IVF-Binary-1024-nl387-random (self)                   19_124.66     5_135.01    24_259.66       0.6441     5.772927        20.15
-IVF-Binary-1024-nl547-np23-rf0-random (query)         20_753.34       430.42    21_183.76       0.2394          NaN        20.23
-IVF-Binary-1024-nl547-np27-rf0-random (query)         20_753.34       458.88    21_212.22       0.2386          NaN        20.23
-IVF-Binary-1024-nl547-np33-rf0-random (query)         20_753.34       504.69    21_258.03       0.2379          NaN        20.23
-IVF-Binary-1024-nl547-np23-rf5-random (query)         20_753.34       463.67    21_217.01       0.4993    10.821170        20.23
-IVF-Binary-1024-nl547-np23-rf10-random (query)        20_753.34       491.38    21_244.72       0.6438     5.766783        20.23
-IVF-Binary-1024-nl547-np23-rf20-random (query)        20_753.34       546.76    21_300.10       0.7852     2.739547        20.23
-IVF-Binary-1024-nl547-np27-rf5-random (query)         20_753.34       488.96    21_242.30       0.4976    10.906894        20.23
-IVF-Binary-1024-nl547-np27-rf10-random (query)        20_753.34       525.67    21_279.01       0.6415     5.829356        20.23
-IVF-Binary-1024-nl547-np27-rf20-random (query)        20_753.34       581.03    21_334.37       0.7828     2.783124        20.23
-IVF-Binary-1024-nl547-np33-rf5-random (query)         20_753.34       547.79    21_301.13       0.4962    10.976622        20.23
-IVF-Binary-1024-nl547-np33-rf10-random (query)        20_753.34       577.05    21_330.40       0.6400     5.874798        20.23
-IVF-Binary-1024-nl547-np33-rf20-random (query)        20_753.34       635.21    21_388.56       0.7814     2.811286        20.23
-IVF-Binary-1024-nl547-random (self)                   20_753.34     4_900.86    25_654.20       0.6462     5.710279        20.23
-IVF-Binary-1024-nl273-np13-rf0-itq (query)            37_836.14       440.99    38_277.13       0.2233          NaN        20.09
-IVF-Binary-1024-nl273-np16-rf0-itq (query)            37_836.14       482.76    38_318.91       0.2215          NaN        20.09
-IVF-Binary-1024-nl273-np23-rf0-itq (query)            37_836.14       579.85    38_415.99       0.2211          NaN        20.09
-IVF-Binary-1024-nl273-np13-rf5-itq (query)            37_836.14       484.55    38_320.69       0.4696    12.292956        20.09
-IVF-Binary-1024-nl273-np13-rf10-itq (query)           37_836.14       507.70    38_343.84       0.6111     6.715975        20.09
-IVF-Binary-1024-nl273-np13-rf20-itq (query)           37_836.14       569.40    38_405.55       0.7546     3.314411        20.09
-IVF-Binary-1024-nl273-np16-rf5-itq (query)            37_836.14       522.56    38_358.70       0.4663    12.481269        20.09
-IVF-Binary-1024-nl273-np16-rf10-itq (query)           37_836.14       558.27    38_394.41       0.6075     6.838615        20.09
-IVF-Binary-1024-nl273-np16-rf20-itq (query)           37_836.14       620.31    38_456.45       0.7513     3.382404        20.09
-IVF-Binary-1024-nl273-np23-rf5-itq (query)            37_836.14       631.23    38_467.37       0.4651    12.562426        20.09
-IVF-Binary-1024-nl273-np23-rf10-itq (query)           37_836.14       659.10    38_495.24       0.6060     6.888351        20.09
-IVF-Binary-1024-nl273-np23-rf20-itq (query)           37_836.14       728.57    38_564.71       0.7499     3.413899        20.09
-IVF-Binary-1024-nl273-itq (self)                      37_836.14     5_560.78    43_396.93       0.6101     6.773542        20.09
-IVF-Binary-1024-nl387-np19-rf0-itq (query)            33_872.73       444.26    34_316.99       0.2222          NaN        20.15
-IVF-Binary-1024-nl387-np27-rf0-itq (query)            33_872.73       528.74    34_401.47       0.2210          NaN        20.15
-IVF-Binary-1024-nl387-np19-rf5-itq (query)            33_872.73       484.46    34_357.19       0.4677    12.397357        20.15
-IVF-Binary-1024-nl387-np19-rf10-itq (query)           33_872.73       515.82    34_388.54       0.6087     6.790945        20.15
-IVF-Binary-1024-nl387-np19-rf20-itq (query)           33_872.73       582.80    34_455.53       0.7530     3.347757        20.15
-IVF-Binary-1024-nl387-np27-rf5-itq (query)            33_872.73       567.27    34_440.00       0.4649    12.568854        20.15
-IVF-Binary-1024-nl387-np27-rf10-itq (query)           33_872.73       608.05    34_480.78       0.6058     6.889699        20.15
-IVF-Binary-1024-nl387-np27-rf20-itq (query)           33_872.73       667.65    34_540.37       0.7503     3.409586        20.15
-IVF-Binary-1024-nl387-itq (self)                      33_872.73     5_192.00    39_064.73       0.6116     6.726584        20.15
-IVF-Binary-1024-nl547-np23-rf0-itq (query)            37_554.65       420.77    37_975.42       0.2230          NaN        20.23
-IVF-Binary-1024-nl547-np27-rf0-itq (query)            37_554.65       451.74    38_006.40       0.2223          NaN        20.23
-IVF-Binary-1024-nl547-np33-rf0-itq (query)            37_554.65       497.82    38_052.48       0.2217          NaN        20.23
-IVF-Binary-1024-nl547-np23-rf5-itq (query)            37_554.65       459.87    38_014.53       0.4689    12.314975        20.23
-IVF-Binary-1024-nl547-np23-rf10-itq (query)           37_554.65       488.32    38_042.97       0.6108     6.717628        20.23
-IVF-Binary-1024-nl547-np23-rf20-itq (query)           37_554.65       543.63    38_098.28       0.7554     3.300256        20.23
-IVF-Binary-1024-nl547-np27-rf5-itq (query)            37_554.65       487.91    38_042.57       0.4670    12.424460        20.23
-IVF-Binary-1024-nl547-np27-rf10-itq (query)           37_554.65       520.83    38_075.49       0.6084     6.799578        20.23
-IVF-Binary-1024-nl547-np27-rf20-itq (query)           37_554.65       587.22    38_141.87       0.7527     3.359085        20.23
-IVF-Binary-1024-nl547-np33-rf5-itq (query)            37_554.65       538.25    38_092.91       0.4659    12.496578        20.23
-IVF-Binary-1024-nl547-np33-rf10-itq (query)           37_554.65       574.97    38_129.62       0.6067     6.854108        20.23
-IVF-Binary-1024-nl547-np33-rf20-itq (query)           37_554.65       631.85    38_186.51       0.7510     3.394109        20.23
-IVF-Binary-1024-nl547-itq (self)                      37_554.65     4_953.25    42_507.90       0.6138     6.650776        20.23
+ExhaustiveBinary-1024-itq-rf5 (query)                 32_743.65     1_767.09    34_510.74       0.4069    34.763449        19.31
+ExhaustiveBinary-1024-itq-rf10 (query)                32_743.65     1_836.10    34_579.75       0.5407    19.947772        19.31
+ExhaustiveBinary-1024-itq-rf20 (query)                32_743.65     1_963.40    34_707.05       0.6873    10.488234        19.31
+ExhaustiveBinary-1024-itq (self)                      32_743.65    18_408.90    51_152.55       0.5428    19.821924        19.31
+ExhaustiveBinary-256-signed_no_rr (query)              7_676.77       560.03     8_236.80       0.0848          NaN         4.83
 --------------------------------------------------------------------------------------------------------------------------------
+ExhaustiveBinary-256-signed-rf5 (query)                7_676.77       617.30     8_294.07       0.1980    84.795844         4.83
+ExhaustiveBinary-256-signed-rf10 (query)               7_676.77       667.57     8_344.34       0.2831    55.592413         4.83
+ExhaustiveBinary-256-signed-rf20 (query)               7_676.77       798.01     8_474.78       0.4015    34.646234         4.83
+ExhaustiveBinary-256-signed (self)                     7_676.77     6_663.51    14_340.28       0.2867    54.828071         4.83
+--------------------------------------------------------------------------------------------------------------------------------
+IVF-Binary-256-nl273-np13-rf0-random (query)           8_733.23       141.95     8_875.18       0.0975          NaN         6.24
+IVF-Binary-256-nl273-np16-rf0-random (query)           8_733.23       147.46     8_880.70       0.0903          NaN         6.24
+IVF-Binary-256-nl273-np23-rf0-random (query)           8_733.23       161.81     8_895.04       0.0874          NaN         6.24
+IVF-Binary-256-nl273-np13-rf5-random (query)           8_733.23       195.83     8_929.07       0.2202    76.986041         6.24
+IVF-Binary-256-nl273-np13-rf10-random (query)          8_733.23       244.16     8_977.39       0.3106    49.904755         6.24
+IVF-Binary-256-nl273-np13-rf20-random (query)          8_733.23       332.14     9_065.37       0.4342    30.708365         6.24
+IVF-Binary-256-nl273-np16-rf5-random (query)           8_733.23       199.29     8_932.52       0.2092    81.570143         6.24
+IVF-Binary-256-nl273-np16-rf10-random (query)          8_733.23       254.04     8_987.28       0.2985    52.787271         6.24
+IVF-Binary-256-nl273-np16-rf20-random (query)          8_733.23       341.30     9_074.53       0.4205    32.516565         6.24
+IVF-Binary-256-nl273-np23-rf5-random (query)           8_733.23       211.01     8_944.24       0.2036    84.117063         6.24
+IVF-Binary-256-nl273-np23-rf10-random (query)          8_733.23       270.92     9_004.15       0.2912    54.726832         6.24
+IVF-Binary-256-nl273-np23-rf20-random (query)          8_733.23       367.58     9_100.81       0.4117    33.856600         6.24
+IVF-Binary-256-nl273-random (self)                     8_733.23     2_530.27    11_263.50       0.3019    52.280744         6.24
+--------------------------------------------------------------------------------------------------------------------------------
+IVF-Binary-256-nl387-np19-rf0-random (query)           9_320.74       151.71     9_472.45       0.0917          NaN         6.35
+IVF-Binary-256-nl387-np27-rf0-random (query)           9_320.74       163.32     9_484.06       0.0890          NaN         6.35
+IVF-Binary-256-nl387-np19-rf5-random (query)           9_320.74       209.04     9_529.78       0.2131    79.271693         6.35
+IVF-Binary-256-nl387-np19-rf10-random (query)          9_320.74       255.65     9_576.39       0.3030    51.248429         6.35
+IVF-Binary-256-nl387-np19-rf20-random (query)          9_320.74       338.42     9_659.16       0.4279    31.362689         6.35
+IVF-Binary-256-nl387-np27-rf5-random (query)           9_320.74       216.44     9_537.18       0.2067    82.316705         6.35
+IVF-Binary-256-nl387-np27-rf10-random (query)          9_320.74       274.78     9_595.53       0.2951    53.352131         6.35
+IVF-Binary-256-nl387-np27-rf20-random (query)          9_320.74       362.95     9_683.69       0.4171    32.933454         6.35
+IVF-Binary-256-nl387-random (self)                     9_320.74     2_548.94    11_869.69       0.3066    50.676822         6.35
+--------------------------------------------------------------------------------------------------------------------------------
+IVF-Binary-256-nl547-np23-rf0-random (query)           9_943.66       160.83    10_104.48       0.0929          NaN         6.51
+IVF-Binary-256-nl547-np27-rf0-random (query)           9_943.66       165.33    10_108.99       0.0907          NaN         6.51
+IVF-Binary-256-nl547-np33-rf0-random (query)           9_943.66       172.81    10_116.47       0.0888          NaN         6.51
+IVF-Binary-256-nl547-np23-rf5-random (query)           9_943.66       219.97    10_163.63       0.2167    76.983647         6.51
+IVF-Binary-256-nl547-np23-rf10-random (query)          9_943.66       282.61    10_226.27       0.3093    49.456854         6.51
+IVF-Binary-256-nl547-np23-rf20-random (query)          9_943.66       342.28    10_285.94       0.4348    30.219562         6.51
+IVF-Binary-256-nl547-np27-rf5-random (query)           9_943.66       220.82    10_164.48       0.2121    79.100710         6.51
+IVF-Binary-256-nl547-np27-rf10-random (query)          9_943.66       270.06    10_213.71       0.3024    51.043113         6.51
+IVF-Binary-256-nl547-np27-rf20-random (query)          9_943.66       351.69    10_295.34       0.4263    31.325323         6.51
+IVF-Binary-256-nl547-np33-rf5-random (query)           9_943.66       230.67    10_174.32       0.2083    81.042925         6.51
+IVF-Binary-256-nl547-np33-rf10-random (query)          9_943.66       280.97    10_224.63       0.2966    52.484571         6.51
+IVF-Binary-256-nl547-np33-rf20-random (query)          9_943.66       369.77    10_313.42       0.4193    32.278388         6.51
+IVF-Binary-256-nl547-random (self)                     9_943.66     2_624.89    12_568.54       0.3132    48.780140         6.51
+--------------------------------------------------------------------------------------------------------------------------------
+IVF-Binary-256-nl273-np13-rf0-itq (query)             10_615.21       149.18    10_764.39       0.0066          NaN         6.24
+IVF-Binary-256-nl273-np16-rf0-itq (query)             10_615.21       156.35    10_771.56       0.0040          NaN         6.24
+IVF-Binary-256-nl273-np23-rf0-itq (query)             10_615.21       171.56    10_786.77       0.0034          NaN         6.24
+IVF-Binary-256-nl273-np13-rf5-itq (query)             10_615.21       179.04    10_794.26       0.0302   204.860825         6.24
+IVF-Binary-256-nl273-np13-rf10-itq (query)            10_615.21       211.25    10_826.46       0.0611   156.677726         6.24
+IVF-Binary-256-nl273-np13-rf20-itq (query)            10_615.21       272.85    10_888.06       0.1215   118.466106         6.24
+IVF-Binary-256-nl273-np16-rf5-itq (query)             10_615.21       185.71    10_800.92       0.0187   229.874198         6.24
+IVF-Binary-256-nl273-np16-rf10-itq (query)            10_615.21       216.93    10_832.15       0.0380   180.668158         6.24
+IVF-Binary-256-nl273-np16-rf20-itq (query)            10_615.21       275.70    10_890.91       0.0756   142.404774         6.24
+IVF-Binary-256-nl273-np23-rf5-itq (query)             10_615.21       198.33    10_813.54       0.0157   244.018146         6.24
+IVF-Binary-256-nl273-np23-rf10-itq (query)            10_615.21       230.47    10_845.68       0.0315   194.560815         6.24
+IVF-Binary-256-nl273-np23-rf20-itq (query)            10_615.21       294.89    10_910.10       0.0626   156.283445         6.24
+IVF-Binary-256-nl273-itq (self)                       10_615.21     2_147.85    12_763.06       0.0388   180.605269         6.24
+--------------------------------------------------------------------------------------------------------------------------------
+IVF-Binary-256-nl387-np19-rf0-itq (query)             11_058.63       151.27    11_209.90       0.0044          NaN         6.35
+IVF-Binary-256-nl387-np27-rf0-itq (query)             11_058.63       162.70    11_221.33       0.0036          NaN         6.35
+IVF-Binary-256-nl387-np19-rf5-itq (query)             11_058.63       182.97    11_241.59       0.0223   221.454963         6.35
+IVF-Binary-256-nl387-np19-rf10-itq (query)            11_058.63       214.11    11_272.74       0.0442   174.213070         6.35
+IVF-Binary-256-nl387-np19-rf20-itq (query)            11_058.63       274.41    11_333.04       0.0881   136.442481         6.35
+IVF-Binary-256-nl387-np27-rf5-itq (query)             11_058.63       198.69    11_257.31       0.0182   237.005507         6.35
+IVF-Binary-256-nl387-np27-rf10-itq (query)            11_058.63       223.73    11_282.36       0.0359   188.916676         6.35
+IVF-Binary-256-nl387-np27-rf20-itq (query)            11_058.63       304.25    11_362.87       0.0728   149.971472         6.35
+IVF-Binary-256-nl387-itq (self)                       11_058.63     2_259.38    13_318.01       0.0443   173.705136         6.35
+--------------------------------------------------------------------------------------------------------------------------------
+IVF-Binary-256-nl547-np23-rf0-itq (query)             11_858.97       160.80    12_019.77       0.0048          NaN         6.51
+IVF-Binary-256-nl547-np27-rf0-itq (query)             11_858.97       164.31    12_023.29       0.0042          NaN         6.51
+IVF-Binary-256-nl547-np33-rf0-itq (query)             11_858.97       181.01    12_039.99       0.0037          NaN         6.51
+IVF-Binary-256-nl547-np23-rf5-itq (query)             11_858.97       196.68    12_055.65       0.0241   213.678718         6.51
+IVF-Binary-256-nl547-np23-rf10-itq (query)            11_858.97       225.42    12_084.39       0.0476   168.381951         6.51
+IVF-Binary-256-nl547-np23-rf20-itq (query)            11_858.97       285.28    12_144.25       0.0962   127.673372         6.51
+IVF-Binary-256-nl547-np27-rf5-itq (query)             11_858.97       193.73    12_052.70       0.0208   226.070632         6.51
+IVF-Binary-256-nl547-np27-rf10-itq (query)            11_858.97       228.78    12_087.75       0.0412   180.096713         6.51
+IVF-Binary-256-nl547-np27-rf20-itq (query)            11_858.97       284.17    12_143.14       0.0825   138.553616         6.51
+IVF-Binary-256-nl547-np33-rf5-itq (query)             11_858.97       197.92    12_056.90       0.0182   237.496159         6.51
+IVF-Binary-256-nl547-np33-rf10-itq (query)            11_858.97       232.57    12_091.55       0.0363   190.644118         6.51
+IVF-Binary-256-nl547-np33-rf20-itq (query)            11_858.97       292.85    12_151.83       0.0723   147.504525         6.51
+IVF-Binary-256-nl547-itq (self)                       11_858.97     2_241.62    14_100.59       0.0491   168.890799         6.51
+--------------------------------------------------------------------------------------------------------------------------------
+IVF-Binary-512-nl273-np13-rf0-random (query)          16_062.60       277.02    16_339.62       0.1585          NaN        11.07
+IVF-Binary-512-nl273-np16-rf0-random (query)          16_062.60       292.29    16_354.89       0.1556          NaN        11.07
+IVF-Binary-512-nl273-np23-rf0-random (query)          16_062.60       335.45    16_398.05       0.1542          NaN        11.07
+IVF-Binary-512-nl273-np13-rf5-random (query)          16_062.60       370.06    16_432.65       0.3312    46.806070        11.07
+IVF-Binary-512-nl273-np13-rf10-random (query)         16_062.60       396.79    16_459.39       0.4499    28.530589        11.07
+IVF-Binary-512-nl273-np13-rf20-random (query)         16_062.60       479.80    16_542.39       0.5930    16.162221        11.07
+IVF-Binary-512-nl273-np16-rf5-random (query)          16_062.60       367.36    16_429.95       0.3258    47.985698        11.07
+IVF-Binary-512-nl273-np16-rf10-random (query)         16_062.60       421.01    16_483.60       0.4430    29.305110        11.07
+IVF-Binary-512-nl273-np16-rf20-random (query)         16_062.60       548.38    16_610.97       0.5866    16.621724        11.07
+IVF-Binary-512-nl273-np23-rf5-random (query)          16_062.60       409.01    16_471.60       0.3225    48.701864        11.07
+IVF-Binary-512-nl273-np23-rf10-random (query)         16_062.60       491.89    16_554.49       0.4390    29.816257        11.07
+IVF-Binary-512-nl273-np23-rf20-random (query)         16_062.60       595.82    16_658.41       0.5818    16.971071        11.07
+IVF-Binary-512-nl273-random (self)                    16_062.60     4_199.00    20_261.60       0.4456    29.092256        11.07
+--------------------------------------------------------------------------------------------------------------------------------
+IVF-Binary-512-nl387-np19-rf0-random (query)          16_521.23       292.40    16_813.63       0.1562          NaN        11.18
+IVF-Binary-512-nl387-np27-rf0-random (query)          16_521.23       323.13    16_844.36       0.1542          NaN        11.18
+IVF-Binary-512-nl387-np19-rf5-random (query)          16_521.23       366.17    16_887.41       0.3276    47.541240        11.18
+IVF-Binary-512-nl387-np19-rf10-random (query)         16_521.23       411.03    16_932.26       0.4461    28.906371        11.18
+IVF-Binary-512-nl387-np19-rf20-random (query)         16_521.23       495.06    17_016.29       0.5893    16.401606        11.18
+IVF-Binary-512-nl387-np27-rf5-random (query)          16_521.23       399.30    16_920.53       0.3238    48.474272        11.18
+IVF-Binary-512-nl387-np27-rf10-random (query)         16_521.23       455.10    16_976.33       0.4408    29.588087        11.18
+IVF-Binary-512-nl387-np27-rf20-random (query)         16_521.23       548.16    17_069.39       0.5835    16.840666        11.18
+IVF-Binary-512-nl387-random (self)                    16_521.23     4_096.35    20_617.58       0.4480    28.751399        11.18
+--------------------------------------------------------------------------------------------------------------------------------
+IVF-Binary-512-nl547-np23-rf0-random (query)          17_411.93       295.45    17_707.38       0.1574          NaN        11.34
+IVF-Binary-512-nl547-np27-rf0-random (query)          17_411.93       307.35    17_719.28       0.1559          NaN        11.34
+IVF-Binary-512-nl547-np33-rf0-random (query)          17_411.93       324.86    17_736.80       0.1546          NaN        11.34
+IVF-Binary-512-nl547-np23-rf5-random (query)          17_411.93       365.49    17_777.42       0.3306    46.796057        11.34
+IVF-Binary-512-nl547-np23-rf10-random (query)         17_411.93       408.79    17_820.73       0.4498    28.416225        11.34
+IVF-Binary-512-nl547-np23-rf20-random (query)         17_411.93       489.24    17_901.17       0.5937    16.066491        11.34
+IVF-Binary-512-nl547-np27-rf5-random (query)          17_411.93       375.37    17_787.30       0.3268    47.630979        11.34
+IVF-Binary-512-nl547-np27-rf10-random (query)         17_411.93       425.47    17_837.41       0.4450    29.018144        11.34
+IVF-Binary-512-nl547-np27-rf20-random (query)         17_411.93       528.28    17_940.21       0.5879    16.487216        11.34
+IVF-Binary-512-nl547-np33-rf5-random (query)          17_411.93       406.87    17_818.81       0.3243    48.228451        11.34
+IVF-Binary-512-nl547-np33-rf10-random (query)         17_411.93       458.30    17_870.23       0.4414    29.460866        11.34
+IVF-Binary-512-nl547-np33-rf20-random (query)         17_411.93       544.04    17_955.97       0.5840    16.783482        11.34
+IVF-Binary-512-nl547-random (self)                    17_411.93     4_101.46    21_513.39       0.4521    28.251501        11.34
+--------------------------------------------------------------------------------------------------------------------------------
+IVF-Binary-512-nl273-np13-rf0-itq (query)             18_306.47       282.04    18_588.52       0.0976          NaN        11.07
+IVF-Binary-512-nl273-np16-rf0-itq (query)             18_306.47       296.84    18_603.31       0.0903          NaN        11.07
+IVF-Binary-512-nl273-np23-rf0-itq (query)             18_306.47       330.84    18_637.32       0.0879          NaN        11.07
+IVF-Binary-512-nl273-np13-rf5-itq (query)             18_306.47       354.79    18_661.26       0.2222    75.897669        11.07
+IVF-Binary-512-nl273-np13-rf10-itq (query)            18_306.47       400.26    18_706.73       0.3147    49.114348        11.07
+IVF-Binary-512-nl273-np13-rf20-itq (query)            18_306.47       486.66    18_793.14       0.4362    30.338010        11.07
+IVF-Binary-512-nl273-np16-rf5-itq (query)             18_306.47       371.86    18_678.33       0.2100    81.526193        11.07
+IVF-Binary-512-nl273-np16-rf10-itq (query)            18_306.47       423.34    18_729.81       0.2999    52.867249        11.07
+IVF-Binary-512-nl273-np16-rf20-itq (query)            18_306.47       511.06    18_817.53       0.4209    32.567948        11.07
+IVF-Binary-512-nl273-np23-rf5-itq (query)             18_306.47       412.09    18_718.57       0.2050    83.770981        11.07
+IVF-Binary-512-nl273-np23-rf10-itq (query)            18_306.47       471.23    18_777.70       0.2931    54.494866        11.07
+IVF-Binary-512-nl273-np23-rf20-itq (query)            18_306.47       568.03    18_874.50       0.4129    33.630415        11.07
+IVF-Binary-512-nl273-itq (self)                       18_306.47     4_218.91    22_525.38       0.3010    52.355476        11.07
+--------------------------------------------------------------------------------------------------------------------------------
+IVF-Binary-512-nl387-np19-rf0-itq (query)             18_785.44       297.02    19_082.46       0.0918          NaN        11.18
+IVF-Binary-512-nl387-np27-rf0-itq (query)             18_785.44       335.22    19_120.67       0.0892          NaN        11.18
+IVF-Binary-512-nl387-np19-rf5-itq (query)             18_785.44       370.18    19_155.62       0.2125    79.962584        11.18
+IVF-Binary-512-nl387-np19-rf10-itq (query)            18_785.44       413.31    19_198.75       0.3035    51.779923        11.18
+IVF-Binary-512-nl387-np19-rf20-itq (query)            18_785.44       494.82    19_280.27       0.4252    31.882383        11.18
+IVF-Binary-512-nl387-np27-rf5-itq (query)             18_785.44       408.06    19_193.50       0.2066    82.508429        11.18
+IVF-Binary-512-nl387-np27-rf10-itq (query)            18_785.44       455.30    19_240.74       0.2953    53.862960        11.18
+IVF-Binary-512-nl387-np27-rf20-itq (query)            18_785.44       543.16    19_328.60       0.4156    33.232527        11.18
+IVF-Binary-512-nl387-itq (self)                       18_785.44     4_108.65    22_894.10       0.3054    51.114799        11.18
+--------------------------------------------------------------------------------------------------------------------------------
+IVF-Binary-512-nl547-np23-rf0-itq (query)             19_593.87       299.24    19_893.11       0.0928          NaN        11.34
+IVF-Binary-512-nl547-np27-rf0-itq (query)             19_593.87       332.69    19_926.56       0.0906          NaN        11.34
+IVF-Binary-512-nl547-np33-rf0-itq (query)             19_593.87       326.38    19_920.25       0.0887          NaN        11.34
+IVF-Binary-512-nl547-np23-rf5-itq (query)             19_593.87       367.18    19_961.05       0.2163    77.815923        11.34
+IVF-Binary-512-nl547-np23-rf10-itq (query)            19_593.87       410.76    20_004.63       0.3094    50.225444        11.34
+IVF-Binary-512-nl547-np23-rf20-itq (query)            19_593.87       501.22    20_095.09       0.4325    30.827118        11.34
+IVF-Binary-512-nl547-np27-rf5-itq (query)             19_593.87       378.05    19_971.92       0.2113    79.816910        11.34
+IVF-Binary-512-nl547-np27-rf10-itq (query)            19_593.87       426.45    20_020.32       0.3024    51.793071        11.34
+IVF-Binary-512-nl547-np27-rf20-itq (query)            19_593.87       516.29    20_110.16       0.4241    31.830457        11.34
+IVF-Binary-512-nl547-np33-rf5-itq (query)             19_593.87       398.41    19_992.28       0.2071    82.030970        11.34
+IVF-Binary-512-nl547-np33-rf10-itq (query)            19_593.87       450.20    20_044.06       0.2963    53.421778        11.34
+IVF-Binary-512-nl547-np33-rf20-itq (query)            19_593.87       534.04    20_127.91       0.4162    33.056877        11.34
+IVF-Binary-512-nl547-itq (self)                       19_593.87     4_109.56    23_703.43       0.3107    49.702907        11.34
+--------------------------------------------------------------------------------------------------------------------------------
+IVF-Binary-1024-nl273-np13-rf0-random (query)         30_759.15       629.96    31_389.11       0.2364          NaN        20.72
+IVF-Binary-1024-nl273-np16-rf0-random (query)         30_759.15       693.14    31_452.29       0.2347          NaN        20.72
+IVF-Binary-1024-nl273-np23-rf0-random (query)         30_759.15       805.79    31_564.94       0.2338          NaN        20.72
+IVF-Binary-1024-nl273-np13-rf5-random (query)         30_759.15       678.99    31_438.14       0.4942    24.374124        20.72
+IVF-Binary-1024-nl273-np13-rf10-random (query)        30_759.15       726.46    31_485.61       0.6366    13.052042        20.72
+IVF-Binary-1024-nl273-np13-rf20-random (query)        30_759.15       792.42    31_551.57       0.7781     6.233594        20.72
+IVF-Binary-1024-nl273-np16-rf5-random (query)         30_759.15       730.61    31_489.76       0.4912    24.690673        20.72
+IVF-Binary-1024-nl273-np16-rf10-random (query)        30_759.15       774.66    31_533.81       0.6340    13.219695        20.72
+IVF-Binary-1024-nl273-np16-rf20-random (query)        30_759.15       855.58    31_614.73       0.7754     6.342967        20.72
+IVF-Binary-1024-nl273-np23-rf5-random (query)         30_759.15       860.57    31_619.72       0.4896    24.875110        20.72
+IVF-Binary-1024-nl273-np23-rf10-random (query)        30_759.15       902.54    31_661.69       0.6322    13.342830        20.72
+IVF-Binary-1024-nl273-np23-rf20-random (query)        30_759.15       983.99    31_743.14       0.7737     6.421981        20.72
+IVF-Binary-1024-nl273-random (self)                   30_759.15     7_724.12    38_483.27       0.6379    13.027924        20.72
+--------------------------------------------------------------------------------------------------------------------------------
+IVF-Binary-1024-nl387-np19-rf0-random (query)         31_299.56       646.07    31_945.64       0.2353          NaN        20.84
+IVF-Binary-1024-nl387-np27-rf0-random (query)         31_299.56       753.52    32_053.08       0.2342          NaN        20.84
+IVF-Binary-1024-nl387-np19-rf5-random (query)         31_299.56       696.26    31_995.82       0.4923    24.565964        20.84
+IVF-Binary-1024-nl387-np19-rf10-random (query)        31_299.56       744.28    32_043.84       0.6351    13.165115        20.84
+IVF-Binary-1024-nl387-np19-rf20-random (query)        31_299.56       814.22    32_113.78       0.7765     6.301286        20.84
+IVF-Binary-1024-nl387-np27-rf5-random (query)         31_299.56       795.88    32_095.45       0.4903    24.788303        20.84
+IVF-Binary-1024-nl387-np27-rf10-random (query)        31_299.56       842.65    32_142.21       0.6328    13.317639        20.84
+IVF-Binary-1024-nl387-np27-rf20-random (query)        31_299.56       909.55    32_209.11       0.7741     6.396815        20.84
+IVF-Binary-1024-nl387-random (self)                   31_299.56     7_310.45    38_610.02       0.6389    12.968449        20.84
+--------------------------------------------------------------------------------------------------------------------------------
+IVF-Binary-1024-nl547-np23-rf0-random (query)         32_213.86       633.91    32_847.78       0.2363          NaN        20.99
+IVF-Binary-1024-nl547-np27-rf0-random (query)         32_213.86       660.19    32_874.05       0.2353          NaN        20.99
+IVF-Binary-1024-nl547-np33-rf0-random (query)         32_213.86       723.65    32_937.51       0.2345          NaN        20.99
+IVF-Binary-1024-nl547-np23-rf5-random (query)         32_213.86       671.98    32_885.85       0.4942    24.350197        20.99
+IVF-Binary-1024-nl547-np23-rf10-random (query)        32_213.86       708.66    32_922.52       0.6371    13.012765        20.99
+IVF-Binary-1024-nl547-np23-rf20-random (query)        32_213.86       792.47    33_006.34       0.7791     6.185553        20.99
+IVF-Binary-1024-nl547-np27-rf5-random (query)         32_213.86       724.83    32_938.70       0.4918    24.619173        20.99
+IVF-Binary-1024-nl547-np27-rf10-random (query)        32_213.86       755.04    32_968.90       0.6343    13.205686        20.99
+IVF-Binary-1024-nl547-np27-rf20-random (query)        32_213.86       820.01    33_033.87       0.7760     6.320139        20.99
+IVF-Binary-1024-nl547-np33-rf5-random (query)         32_213.86       759.63    32_973.49       0.4902    24.792155        20.99
+IVF-Binary-1024-nl547-np33-rf10-random (query)        32_213.86       801.43    33_015.29       0.6327    13.309994        20.99
+IVF-Binary-1024-nl547-np33-rf20-random (query)        32_213.86       871.85    33_085.71       0.7744     6.391359        20.99
+IVF-Binary-1024-nl547-random (self)                   32_213.86     7_102.34    39_316.20       0.6414    12.802013        20.99
+--------------------------------------------------------------------------------------------------------------------------------
+IVF-Binary-1024-nl273-np13-rf0-itq (query)            33_983.35       647.51    34_630.85       0.1995          NaN        20.72
+IVF-Binary-1024-nl273-np16-rf0-itq (query)            33_983.35       701.14    34_684.49       0.1972          NaN        20.72
+IVF-Binary-1024-nl273-np23-rf0-itq (query)            33_983.35       821.46    34_804.81       0.1959          NaN        20.72
+IVF-Binary-1024-nl273-np13-rf5-itq (query)            33_983.35       704.19    34_687.54       0.4172    33.291521        20.72
+IVF-Binary-1024-nl273-np13-rf10-itq (query)           33_983.35       741.11    34_724.46       0.5520    18.978683        20.72
+IVF-Binary-1024-nl273-np13-rf20-itq (query)           33_983.35       800.06    34_783.40       0.6985     9.908255        20.72
+IVF-Binary-1024-nl273-np16-rf5-itq (query)            33_983.35       760.12    34_743.46       0.4133    33.910620        20.72
+IVF-Binary-1024-nl273-np16-rf10-itq (query)           33_983.35       791.30    34_774.64       0.5474    19.391421        20.72
+IVF-Binary-1024-nl273-np16-rf20-itq (query)           33_983.35       873.37    34_856.72       0.6940    10.152299        20.72
+IVF-Binary-1024-nl273-np23-rf5-itq (query)            33_983.35       875.76    34_859.10       0.4111    34.226334        20.72
+IVF-Binary-1024-nl273-np23-rf10-itq (query)           33_983.35       914.52    34_897.87       0.5446    19.648231        20.72
+IVF-Binary-1024-nl273-np23-rf20-itq (query)           33_983.35       994.40    34_977.75       0.6914    10.289526        20.72
+IVF-Binary-1024-nl273-itq (self)                      33_983.35     7_893.41    41_876.76       0.5497    19.249374        20.72
+--------------------------------------------------------------------------------------------------------------------------------
+IVF-Binary-1024-nl387-np19-rf0-itq (query)            34_346.03       661.07    35_007.10       0.1976          NaN        20.84
+IVF-Binary-1024-nl387-np27-rf0-itq (query)            34_346.03       761.21    35_107.24       0.1963          NaN        20.84
+IVF-Binary-1024-nl387-np19-rf5-itq (query)            34_346.03       708.20    35_054.23       0.4150    33.656789        20.84
+IVF-Binary-1024-nl387-np19-rf10-itq (query)           34_346.03       747.89    35_093.92       0.5488    19.299001        20.84
+IVF-Binary-1024-nl387-np19-rf20-itq (query)           34_346.03       824.24    35_170.28       0.6954    10.074423        20.84
+IVF-Binary-1024-nl387-np27-rf5-itq (query)            34_346.03       813.89    35_159.92       0.4122    34.084996        20.84
+IVF-Binary-1024-nl387-np27-rf10-itq (query)           34_346.03       862.12    35_208.15       0.5453    19.602657        20.84
+IVF-Binary-1024-nl387-np27-rf20-itq (query)           34_346.03       927.61    35_273.64       0.6919    10.253922        20.84
+IVF-Binary-1024-nl387-itq (self)                      34_346.03     7_473.72    41_819.75       0.5514    19.121436        20.84
+--------------------------------------------------------------------------------------------------------------------------------
+IVF-Binary-1024-nl547-np23-rf0-itq (query)            35_328.16       645.24    35_973.40       0.1981          NaN        20.99
+IVF-Binary-1024-nl547-np27-rf0-itq (query)            35_328.16       681.34    36_009.50       0.1970          NaN        20.99
+IVF-Binary-1024-nl547-np33-rf0-itq (query)            35_328.16       734.10    36_062.26       0.1960          NaN        20.99
+IVF-Binary-1024-nl547-np23-rf5-itq (query)            35_328.16       691.15    36_019.30       0.4170    33.326480        20.99
+IVF-Binary-1024-nl547-np23-rf10-itq (query)           35_328.16       734.47    36_062.62       0.5521    19.006299        20.99
+IVF-Binary-1024-nl547-np23-rf20-itq (query)           35_328.16       788.34    36_116.50       0.6991     9.899350        20.99
+IVF-Binary-1024-nl547-np27-rf5-itq (query)            35_328.16       720.03    36_048.19       0.4138    33.792146        20.99
+IVF-Binary-1024-nl547-np27-rf10-itq (query)           35_328.16       761.00    36_089.15       0.5483    19.321586        20.99
+IVF-Binary-1024-nl547-np27-rf20-itq (query)           35_328.16       836.96    36_165.12       0.6949    10.116089        20.99
+IVF-Binary-1024-nl547-np33-rf5-itq (query)            35_328.16       786.53    36_114.69       0.4118    34.123305        20.99
+IVF-Binary-1024-nl547-np33-rf10-itq (query)           35_328.16       837.07    36_165.22       0.5459    19.535544        20.99
+IVF-Binary-1024-nl547-np33-rf20-itq (query)           35_328.16       891.53    36_219.68       0.6924    10.247352        20.99
+IVF-Binary-1024-nl547-itq (self)                      35_328.16     7_243.78    42_571.94       0.5543    18.871955        20.99
+--------------------------------------------------------------------------------------------------------------------------------
+IVF-Binary-256-nl273-np13-rf0-signed (query)           8_770.17       142.43     8_912.59       0.0975          NaN         6.24
+IVF-Binary-256-nl273-np16-rf0-signed (query)           8_770.17       148.88     8_919.05       0.0903          NaN         6.24
+IVF-Binary-256-nl273-np23-rf0-signed (query)           8_770.17       166.23     8_936.39       0.0874          NaN         6.24
+IVF-Binary-256-nl273-np13-rf5-signed (query)           8_770.17       195.62     8_965.79       0.2202    76.986041         6.24
+IVF-Binary-256-nl273-np13-rf10-signed (query)          8_770.17       244.49     9_014.66       0.3106    49.904755         6.24
+IVF-Binary-256-nl273-np13-rf20-signed (query)          8_770.17       327.81     9_097.97       0.4342    30.708365         6.24
+IVF-Binary-256-nl273-np16-rf5-signed (query)           8_770.17       197.42     8_967.58       0.2092    81.570143         6.24
+IVF-Binary-256-nl273-np16-rf10-signed (query)          8_770.17       252.94     9_023.11       0.2985    52.787271         6.24
+IVF-Binary-256-nl273-np16-rf20-signed (query)          8_770.17       346.11     9_116.28       0.4205    32.516565         6.24
+IVF-Binary-256-nl273-np23-rf5-signed (query)           8_770.17       210.90     8_981.06       0.2036    84.117063         6.24
+IVF-Binary-256-nl273-np23-rf10-signed (query)          8_770.17       268.52     9_038.69       0.2912    54.726832         6.24
+IVF-Binary-256-nl273-np23-rf20-signed (query)          8_770.17       366.85     9_137.02       0.4117    33.856600         6.24
+IVF-Binary-256-nl273-signed (self)                     8_770.17     2_517.97    11_288.14       0.3019    52.280744         6.24
+--------------------------------------------------------------------------------------------------------------------------------
+IVF-Binary-256-nl387-np19-rf0-signed (query)           9_221.73       153.09     9_374.82       0.0917          NaN         6.35
+IVF-Binary-256-nl387-np27-rf0-signed (query)           9_221.73       165.07     9_386.80       0.0890          NaN         6.35
+IVF-Binary-256-nl387-np19-rf5-signed (query)           9_221.73       208.19     9_429.92       0.2131    79.271693         6.35
+IVF-Binary-256-nl387-np19-rf10-signed (query)          9_221.73       255.05     9_476.78       0.3030    51.248429         6.35
+IVF-Binary-256-nl387-np19-rf20-signed (query)          9_221.73       338.91     9_560.64       0.4279    31.362689         6.35
+IVF-Binary-256-nl387-np27-rf5-signed (query)           9_221.73       221.05     9_442.78       0.2067    82.316705         6.35
+IVF-Binary-256-nl387-np27-rf10-signed (query)          9_221.73       283.53     9_505.26       0.2951    53.352131         6.35
+IVF-Binary-256-nl387-np27-rf20-signed (query)          9_221.73       373.42     9_595.15       0.4171    32.933454         6.35
+IVF-Binary-256-nl387-signed (self)                     9_221.73     2_551.75    11_773.48       0.3066    50.676822         6.35
+--------------------------------------------------------------------------------------------------------------------------------
+IVF-Binary-256-nl547-np23-rf0-signed (query)          10_237.07       160.28    10_397.35       0.0929          NaN         6.51
+IVF-Binary-256-nl547-np27-rf0-signed (query)          10_237.07       164.64    10_401.71       0.0907          NaN         6.51
+IVF-Binary-256-nl547-np33-rf0-signed (query)          10_237.07       171.41    10_408.48       0.0888          NaN         6.51
+IVF-Binary-256-nl547-np23-rf5-signed (query)          10_237.07       217.69    10_454.76       0.2167    76.983647         6.51
+IVF-Binary-256-nl547-np23-rf10-signed (query)         10_237.07       262.03    10_499.10       0.3093    49.456854         6.51
+IVF-Binary-256-nl547-np23-rf20-signed (query)         10_237.07       340.79    10_577.86       0.4348    30.219562         6.51
+IVF-Binary-256-nl547-np27-rf5-signed (query)          10_237.07       219.28    10_456.35       0.2121    79.100710         6.51
+IVF-Binary-256-nl547-np27-rf10-signed (query)         10_237.07       268.48    10_505.55       0.3024    51.043113         6.51
+IVF-Binary-256-nl547-np27-rf20-signed (query)         10_237.07       359.36    10_596.43       0.4263    31.325323         6.51
+IVF-Binary-256-nl547-np33-rf5-signed (query)          10_237.07       231.25    10_468.32       0.2083    81.042925         6.51
+IVF-Binary-256-nl547-np33-rf10-signed (query)         10_237.07       277.18    10_514.25       0.2966    52.484571         6.51
+IVF-Binary-256-nl547-np33-rf20-signed (query)         10_237.07       363.07    10_600.14       0.4193    32.278388         6.51
+IVF-Binary-256-nl547-signed (self)                    10_237.07     2_597.51    12_834.58       0.3132    48.780140         6.51
+--------------------------------------------------------------------------------------------------------------------------------
+</code></pre>
+</details>
+
+<details>
+<summary><b>Binary - Euclidean (LowRank - 512 bit)</b>:</summary>
+</br>
+================================================================================================================================
+Benchmark: 150k cells, 512D - Binary Quantisation
+================================================================================================================================
+Method                                               Build (ms)   Query (ms)   Total (ms)     Recall@k   Dist Error    Size (MB)
+--------------------------------------------------------------------------------------------------------------------------------
+Exhaustive (query)                                        62.55    32_889.81    32_952.36       1.0000     0.000000       292.97
+Exhaustive (self)                                         62.55   326_664.49   326_727.04       1.0000     0.000000       292.97
+--------------------------------------------------------------------------------------------------------------------------------
+ExhaustiveBinary-256-random_no_rr (query)             16_883.13       669.32    17_552.46       0.0845          NaN         5.08
+ExhaustiveBinary-256-random-rf5 (query)               16_883.13       729.62    17_612.75       0.1952   176.518712         5.08
+ExhaustiveBinary-256-random-rf10 (query)              16_883.13       821.94    17_705.07       0.2797   115.500230         5.08
+ExhaustiveBinary-256-random-rf20 (query)              16_883.13       959.79    17_842.93       0.3971    71.994085         5.08
+ExhaustiveBinary-256-random (self)                    16_883.13     7_992.01    24_875.14       0.2816   114.414527         5.08
+--------------------------------------------------------------------------------------------------------------------------------
+ExhaustiveBinary-256-itq_no_rr (query)                19_465.16       662.88    20_128.04       0.0028          NaN         5.08
+ExhaustiveBinary-256-itq-rf5 (query)                  19_465.16       698.99    20_164.15       0.0128   483.900180         5.08
+ExhaustiveBinary-256-itq-rf10 (query)                 19_465.16       739.32    20_204.48       0.0254   368.460394         5.08
+ExhaustiveBinary-256-itq-rf20 (query)                 19_465.16       841.17    20_306.33       0.0504   278.818201         5.08
+ExhaustiveBinary-256-itq (self)                       19_465.16     7_425.42    26_890.58       0.0254   369.278263         5.08
+--------------------------------------------------------------------------------------------------------------------------------
+ExhaustiveBinary-512-random_no_rr (query)             33_025.83     1_190.17    34_216.00       0.1540          NaN        10.16
+ExhaustiveBinary-512-random-rf5 (query)               33_025.83     1_275.87    34_301.70       0.3232   101.322531        10.16
+ExhaustiveBinary-512-random-rf10 (query)              33_025.83     1_337.76    34_363.59       0.4401    61.958812        10.16
+ExhaustiveBinary-512-random-rf20 (query)              33_025.83     1_512.67    34_538.50       0.5831    35.248181        10.16
+ExhaustiveBinary-512-random (self)                    33_025.83    13_345.18    46_371.01       0.4408    61.967741        10.16
+--------------------------------------------------------------------------------------------------------------------------------
+ExhaustiveBinary-512-itq_no_rr (query)                38_392.24     1_188.02    39_580.26       0.0030          NaN        10.16
+ExhaustiveBinary-512-itq-rf5 (query)                  38_392.24     1_235.99    39_628.23       0.0134   481.784629        10.16
+ExhaustiveBinary-512-itq-rf10 (query)                 38_392.24     1_277.04    39_669.27       0.0262   366.971659        10.16
+ExhaustiveBinary-512-itq-rf20 (query)                 38_392.24     1_398.68    39_790.92       0.0517   277.301568        10.16
+ExhaustiveBinary-512-itq (self)                       38_392.24    12_783.76    51_175.99       0.0262   367.742681        10.16
+--------------------------------------------------------------------------------------------------------------------------------
+ExhaustiveBinary-1024-random_no_rr (query)            65_569.46     2_078.17    67_647.63       0.2347          NaN        20.31
+ExhaustiveBinary-1024-random-rf5 (query)              65_569.46     2_308.52    67_877.97       0.4901    51.452302        20.31
+ExhaustiveBinary-1024-random-rf10 (query)             65_569.46     2_272.11    67_841.57       0.6349    27.349367        20.31
+ExhaustiveBinary-1024-random-rf20 (query)             65_569.46     2_474.30    68_043.75       0.7761    13.107840        20.31
+ExhaustiveBinary-1024-random (self)                   65_569.46    22_657.04    88_226.49       0.6349    27.516157        20.31
+--------------------------------------------------------------------------------------------------------------------------------
+ExhaustiveBinary-1024-itq_no_rr (query)               72_296.58     2_112.94    74_409.53       0.1537          NaN        20.31
+ExhaustiveBinary-1024-itq-rf5 (query)                 72_296.58     2_194.96    74_491.55       0.3240   102.060707        20.31
+ExhaustiveBinary-1024-itq-rf10 (query)                72_296.58     2_283.66    74_580.24       0.4416    62.332213        20.31
+ExhaustiveBinary-1024-itq-rf20 (query)                72_296.58     2_497.93    74_794.51       0.5822    35.683979        20.31
+ExhaustiveBinary-1024-itq (self)                      72_296.58    22_852.22    95_148.81       0.4440    61.950177        20.31
+--------------------------------------------------------------------------------------------------------------------------------
+ExhaustiveBinary-512-signed_no_rr (query)             33_142.13     1_210.16    34_352.29       0.1540          NaN        10.16
+ExhaustiveBinary-512-signed-rf5 (query)               33_142.13     1_284.19    34_426.32       0.3232   101.322531        10.16
+ExhaustiveBinary-512-signed-rf10 (query)              33_142.13     1_362.80    34_504.93       0.4401    61.958812        10.16
+ExhaustiveBinary-512-signed-rf20 (query)              33_142.13     1_519.27    34_661.40       0.5831    35.248181        10.16
+ExhaustiveBinary-512-signed (self)                    33_142.13    13_696.25    46_838.37       0.4408    61.967741        10.16
+--------------------------------------------------------------------------------------------------------------------------------
+IVF-Binary-256-nl273-np13-rf0-random (query)          18_852.14       271.38    19_123.53       0.0957          NaN         6.76
+IVF-Binary-256-nl273-np16-rf0-random (query)          18_852.14       296.83    19_148.98       0.0892          NaN         6.76
+IVF-Binary-256-nl273-np23-rf0-random (query)          18_852.14       294.31    19_146.45       0.0867          NaN         6.76
+IVF-Binary-256-nl273-np13-rf5-random (query)          18_852.14       356.20    19_208.35       0.2167   160.665291         6.76
+IVF-Binary-256-nl273-np13-rf10-random (query)         18_852.14       414.79    19_266.94       0.3057   104.612323         6.76
+IVF-Binary-256-nl273-np13-rf20-random (query)         18_852.14       550.82    19_402.96       0.4278    64.592741         6.76
+IVF-Binary-256-nl273-np16-rf5-random (query)          18_852.14       365.78    19_217.93       0.2062   169.437515         6.76
+IVF-Binary-256-nl273-np16-rf10-random (query)         18_852.14       438.56    19_290.70       0.2940   110.114643         6.76
+IVF-Binary-256-nl273-np16-rf20-random (query)         18_852.14       556.87    19_409.01       0.4150    67.983527         6.76
+IVF-Binary-256-nl273-np23-rf5-random (query)          18_852.14       377.16    19_229.31       0.2015   173.833155         6.76
+IVF-Binary-256-nl273-np23-rf10-random (query)         18_852.14       473.27    19_325.41       0.2882   113.201701         6.76
+IVF-Binary-256-nl273-np23-rf20-random (query)         18_852.14       582.49    19_434.64       0.4078    70.076568         6.76
+IVF-Binary-256-nl273-random (self)                    18_852.14     4_262.12    23_114.27       0.2968   108.971982         6.76
+--------------------------------------------------------------------------------------------------------------------------------
+IVF-Binary-256-nl387-np19-rf0-random (query)          19_515.78       297.44    19_813.21       0.0905          NaN         6.98
+IVF-Binary-256-nl387-np27-rf0-random (query)          19_515.78       339.38    19_855.16       0.0875          NaN         6.98
+IVF-Binary-256-nl387-np19-rf5-random (query)          19_515.78       382.62    19_898.39       0.2082   167.908692         6.98
+IVF-Binary-256-nl387-np19-rf10-random (query)         19_515.78       448.89    19_964.67       0.2972   108.942427         6.98
+IVF-Binary-256-nl387-np19-rf20-random (query)         19_515.78       559.26    20_075.04       0.4179    67.501987         6.98
+IVF-Binary-256-nl387-np27-rf5-random (query)          19_515.78       396.76    19_912.54       0.2023   173.626664         6.98
+IVF-Binary-256-nl387-np27-rf10-random (query)         19_515.78       464.38    19_980.16       0.2892   113.016527         6.98
+IVF-Binary-256-nl387-np27-rf20-random (query)         19_515.78       593.41    20_109.19       0.4081    70.109372         6.98
+IVF-Binary-256-nl387-random (self)                    19_515.78     4_347.39    23_863.16       0.2995   108.124364         6.98
+--------------------------------------------------------------------------------------------------------------------------------
+IVF-Binary-256-nl547-np23-rf0-random (query)          21_028.79       310.52    21_339.31       0.0929          NaN         7.29
+IVF-Binary-256-nl547-np27-rf0-random (query)          21_028.79       315.11    21_343.89       0.0907          NaN         7.29
+IVF-Binary-256-nl547-np33-rf0-random (query)          21_028.79       323.60    21_352.39       0.0884          NaN         7.29
+IVF-Binary-256-nl547-np23-rf5-random (query)          21_028.79       420.69    21_449.47       0.2138   161.993936         7.29
+IVF-Binary-256-nl547-np23-rf10-random (query)         21_028.79       451.78    21_480.57       0.3047   104.830137         7.29
+IVF-Binary-256-nl547-np23-rf20-random (query)         21_028.79       563.19    21_591.98       0.4280    64.333361         7.29
+IVF-Binary-256-nl547-np27-rf5-random (query)          21_028.79       396.36    21_425.15       0.2085   166.628896         7.29
+IVF-Binary-256-nl547-np27-rf10-random (query)         21_028.79       463.45    21_492.23       0.2973   108.206512         7.29
+IVF-Binary-256-nl547-np27-rf20-random (query)         21_028.79       574.27    21_603.06       0.4193    66.592847         7.29
+IVF-Binary-256-nl547-np33-rf5-random (query)          21_028.79       407.31    21_436.10       0.2039   170.793158         7.29
+IVF-Binary-256-nl547-np33-rf10-random (query)         21_028.79       474.30    21_503.09       0.2916   111.064499         7.29
+IVF-Binary-256-nl547-np33-rf20-random (query)         21_028.79       592.60    21_621.39       0.4120    68.556604         7.29
+IVF-Binary-256-nl547-random (self)                    21_028.79     4_502.26    25_531.05       0.3064   103.792337         7.29
+--------------------------------------------------------------------------------------------------------------------------------
+IVF-Binary-256-nl273-np13-rf0-itq (query)             21_594.93       274.11    21_869.04       0.0061          NaN         6.76
+IVF-Binary-256-nl273-np16-rf0-itq (query)             21_594.93       280.27    21_875.20       0.0040          NaN         6.76
+IVF-Binary-256-nl273-np23-rf0-itq (query)             21_594.93       302.65    21_897.58       0.0033          NaN         6.76
+IVF-Binary-256-nl273-np13-rf5-itq (query)             21_594.93       339.70    21_934.64       0.0291   427.889671         6.76
+IVF-Binary-256-nl273-np13-rf10-itq (query)            21_594.93       377.26    21_972.20       0.0589   326.853795         6.76
+IVF-Binary-256-nl273-np13-rf20-itq (query)            21_594.93       474.40    22_069.34       0.1182   244.496794         6.76
+IVF-Binary-256-nl273-np16-rf5-itq (query)             21_594.93       341.51    21_936.44       0.0189   473.816716         6.76
+IVF-Binary-256-nl273-np16-rf10-itq (query)            21_594.93       385.62    21_980.56       0.0381   371.111667         6.76
+IVF-Binary-256-nl273-np16-rf20-itq (query)            21_594.93       491.12    22_086.05       0.0767   288.546859         6.76
+IVF-Binary-256-nl273-np23-rf5-itq (query)             21_594.93       348.00    21_942.93       0.0163   495.201920         6.76
+IVF-Binary-256-nl273-np23-rf10-itq (query)            21_594.93       406.17    22_001.11       0.0329   391.192628         6.76
+IVF-Binary-256-nl273-np23-rf20-itq (query)            21_594.93       508.00    22_102.94       0.0659   308.783928         6.76
+IVF-Binary-256-nl273-itq (self)                       21_594.93     3_840.77    25_435.71       0.0379   371.738968         6.76
+--------------------------------------------------------------------------------------------------------------------------------
+IVF-Binary-256-nl387-np19-rf0-itq (query)             22_420.86       293.24    22_714.11       0.0043          NaN         6.98
+IVF-Binary-256-nl387-np27-rf0-itq (query)             22_420.86       313.31    22_734.17       0.0034          NaN         6.98
+IVF-Binary-256-nl387-np19-rf5-itq (query)             22_420.86       349.23    22_770.10       0.0211   461.235087         6.98
+IVF-Binary-256-nl387-np19-rf10-itq (query)            22_420.86       398.06    22_818.92       0.0418   362.314752         6.98
+IVF-Binary-256-nl387-np19-rf20-itq (query)            22_420.86       492.47    22_913.33       0.0836   281.793643         6.98
+IVF-Binary-256-nl387-np27-rf5-itq (query)             22_420.86       360.67    22_781.54       0.0169   497.976409         6.98
+IVF-Binary-256-nl387-np27-rf10-itq (query)            22_420.86       424.08    22_844.94       0.0333   396.379403         6.98
+IVF-Binary-256-nl387-np27-rf20-itq (query)            22_420.86       515.81    22_936.68       0.0673   313.223385         6.98
+IVF-Binary-256-nl387-itq (self)                       22_420.86     3_928.64    26_349.50       0.0424   362.147177         6.98
+--------------------------------------------------------------------------------------------------------------------------------
+IVF-Binary-256-nl547-np23-rf0-itq (query)             23_757.89       311.61    24_069.50       0.0051          NaN         7.30
+IVF-Binary-256-nl547-np27-rf0-itq (query)             23_757.89       316.15    24_074.04       0.0044          NaN         7.30
+IVF-Binary-256-nl547-np33-rf0-itq (query)             23_757.89       323.42    24_081.31       0.0037          NaN         7.30
+IVF-Binary-256-nl547-np23-rf5-itq (query)             23_757.89       372.78    24_130.67       0.0247   440.615430         7.30
+IVF-Binary-256-nl547-np23-rf10-itq (query)            23_757.89       424.25    24_182.14       0.0489   345.732137         7.30
+IVF-Binary-256-nl547-np23-rf20-itq (query)            23_757.89       511.19    24_269.08       0.0968   261.935671         7.30
+IVF-Binary-256-nl547-np27-rf5-itq (query)             23_757.89       383.22    24_141.11       0.0216   462.825801         7.30
+IVF-Binary-256-nl547-np27-rf10-itq (query)            23_757.89       428.22    24_186.11       0.0427   367.074711         7.30
+IVF-Binary-256-nl547-np27-rf20-itq (query)            23_757.89       518.05    24_275.94       0.0846   281.454411         7.30
+IVF-Binary-256-nl547-np33-rf5-itq (query)             23_757.89       383.34    24_141.23       0.0186   484.778469         7.30
+IVF-Binary-256-nl547-np33-rf10-itq (query)            23_757.89       434.62    24_192.51       0.0367   388.753131         7.30
+IVF-Binary-256-nl547-np33-rf20-itq (query)            23_757.89       529.75    24_287.64       0.0724   300.718784         7.30
+IVF-Binary-256-nl547-itq (self)                       23_757.89     4_152.41    27_910.30       0.0486   346.169069         7.30
+--------------------------------------------------------------------------------------------------------------------------------
+IVF-Binary-512-nl273-np13-rf0-random (query)          35_074.87       526.65    35_601.51       0.1599          NaN        11.84
+IVF-Binary-512-nl273-np16-rf0-random (query)          35_074.87       550.33    35_625.20       0.1571          NaN        11.84
+IVF-Binary-512-nl273-np23-rf0-random (query)          35_074.87       594.40    35_669.27       0.1560          NaN        11.84
+IVF-Binary-512-nl273-np13-rf5-random (query)          35_074.87       638.49    35_713.36       0.3353    96.351106        11.84
+IVF-Binary-512-nl273-np13-rf10-random (query)         35_074.87       689.88    35_764.75       0.4555    58.420827        11.84
+IVF-Binary-512-nl273-np13-rf20-random (query)         35_074.87       795.21    35_870.08       0.5993    32.991403        11.84
+IVF-Binary-512-nl273-np16-rf5-random (query)          35_074.87       640.96    35_715.83       0.3303    98.570883        11.84
+IVF-Binary-512-nl273-np16-rf10-random (query)         35_074.87       713.82    35_788.69       0.4492    59.882774        11.84
+IVF-Binary-512-nl273-np16-rf20-random (query)         35_074.87       827.74    35_902.61       0.5929    33.882468        11.84
+IVF-Binary-512-nl273-np23-rf5-random (query)          35_074.87       696.60    35_771.47       0.3275    99.795531        11.84
+IVF-Binary-512-nl273-np23-rf10-random (query)         35_074.87       770.89    35_845.76       0.4458    60.780937        11.84
+IVF-Binary-512-nl273-np23-rf20-random (query)         35_074.87       900.35    35_975.22       0.5891    34.439524        11.84
+IVF-Binary-512-nl273-random (self)                    35_074.87     7_097.29    42_172.16       0.4505    59.843277        11.84
+--------------------------------------------------------------------------------------------------------------------------------
+IVF-Binary-512-nl387-np19-rf0-random (query)          36_182.09       551.58    36_733.67       0.1577          NaN        12.06
+IVF-Binary-512-nl387-np27-rf0-random (query)          36_182.09       587.98    36_770.07       0.1560          NaN        12.06
+IVF-Binary-512-nl387-np19-rf5-random (query)          36_182.09       644.79    36_826.87       0.3323    97.801190        12.06
+IVF-Binary-512-nl387-np19-rf10-random (query)         36_182.09       707.82    36_889.91       0.4506    59.645195        12.06
+IVF-Binary-512-nl387-np19-rf20-random (query)         36_182.09       815.93    36_998.02       0.5948    33.653650        12.06
+IVF-Binary-512-nl387-np27-rf5-random (query)          36_182.09       682.80    36_864.89       0.3287    99.396340        12.06
+IVF-Binary-512-nl387-np27-rf10-random (query)         36_182.09       754.53    36_936.62       0.4458    60.810695        12.06
+IVF-Binary-512-nl387-np27-rf20-random (query)         36_182.09       881.18    37_063.27       0.5898    34.355937        12.06
+IVF-Binary-512-nl387-random (self)                    36_182.09     6_948.09    43_130.18       0.4521    59.458274        12.06
+--------------------------------------------------------------------------------------------------------------------------------
+IVF-Binary-512-nl547-np23-rf0-random (query)          37_379.06       563.71    37_942.77       0.1595          NaN        12.37
+IVF-Binary-512-nl547-np27-rf0-random (query)          37_379.06       577.99    37_957.04       0.1580          NaN        12.37
+IVF-Binary-512-nl547-np33-rf0-random (query)          37_379.06       599.97    37_979.03       0.1568          NaN        12.37
+IVF-Binary-512-nl547-np23-rf5-random (query)          37_379.06       647.82    38_026.88       0.3360    96.088527        12.37
+IVF-Binary-512-nl547-np23-rf10-random (query)         37_379.06       706.38    38_085.44       0.4559    58.273753        12.37
+IVF-Binary-512-nl547-np23-rf20-random (query)         37_379.06       815.84    38_194.90       0.6010    32.712228        12.37
+IVF-Binary-512-nl547-np27-rf5-random (query)          37_379.06       661.03    38_040.09       0.3326    97.548526        12.37
+IVF-Binary-512-nl547-np27-rf10-random (query)         37_379.06       723.89    38_102.95       0.4509    59.474107        12.37
+IVF-Binary-512-nl547-np27-rf20-random (query)         37_379.06       844.38    38_223.44       0.5953    33.508355        12.37
+IVF-Binary-512-nl547-np33-rf5-random (query)          37_379.06       697.18    38_076.24       0.3300    98.653713        12.37
+IVF-Binary-512-nl547-np33-rf10-random (query)         37_379.06       757.74    38_136.80       0.4475    60.241849        12.37
+IVF-Binary-512-nl547-np33-rf20-random (query)         37_379.06       882.08    38_261.14       0.5916    34.043211        12.37
+IVF-Binary-512-nl547-random (self)                    37_379.06     7_122.84    44_501.90       0.4567    58.235755        12.37
+--------------------------------------------------------------------------------------------------------------------------------
+IVF-Binary-512-nl273-np13-rf0-itq (query)             40_687.75       636.71    41_324.46       0.0064          NaN        11.84
+IVF-Binary-512-nl273-np16-rf0-itq (query)             40_687.75       563.85    41_251.60       0.0042          NaN        11.84
+IVF-Binary-512-nl273-np23-rf0-itq (query)             40_687.75       600.30    41_288.05       0.0036          NaN        11.84
+IVF-Binary-512-nl273-np13-rf5-itq (query)             40_687.75       595.59    41_283.34       0.0299   426.096978        11.84
+IVF-Binary-512-nl273-np13-rf10-itq (query)            40_687.75       651.14    41_338.89       0.0599   325.315319        11.84
+IVF-Binary-512-nl273-np13-rf20-itq (query)            40_687.75       735.32    41_423.07       0.1200   242.983863        11.84
+IVF-Binary-512-nl273-np16-rf5-itq (query)             40_687.75       617.67    41_305.42       0.0196   471.936710        11.84
+IVF-Binary-512-nl273-np16-rf10-itq (query)            40_687.75       662.31    41_350.06       0.0391   369.472730        11.84
+IVF-Binary-512-nl273-np16-rf20-itq (query)            40_687.75       767.92    41_455.67       0.0784   286.942014        11.84
+IVF-Binary-512-nl273-np23-rf5-itq (query)             40_687.75       674.67    41_362.42       0.0168   493.358953        11.84
+IVF-Binary-512-nl273-np23-rf10-itq (query)            40_687.75       719.80    41_407.55       0.0337   389.546798        11.84
+IVF-Binary-512-nl273-np23-rf20-itq (query)            40_687.75       818.64    41_506.39       0.0674   307.026485        11.84
+IVF-Binary-512-nl273-itq (self)                       40_687.75     6_613.64    47_301.39       0.0390   369.958255        11.84
+--------------------------------------------------------------------------------------------------------------------------------
+IVF-Binary-512-nl387-np19-rf0-itq (query)             41_455.31       567.07    42_022.38       0.0044          NaN        12.06
+IVF-Binary-512-nl387-np27-rf0-itq (query)             41_455.31       605.45    42_060.76       0.0035          NaN        12.06
+IVF-Binary-512-nl387-np19-rf5-itq (query)             41_455.31       622.48    42_077.79       0.0218   459.819374        12.06
+IVF-Binary-512-nl387-np19-rf10-itq (query)            41_455.31       661.16    42_116.47       0.0426   361.116021        12.06
+IVF-Binary-512-nl387-np19-rf20-itq (query)            41_455.31       753.59    42_208.89       0.0849   280.515789        12.06
+IVF-Binary-512-nl387-np27-rf5-itq (query)             41_455.31       658.32    42_113.62       0.0175   496.470791        12.06
+IVF-Binary-512-nl387-np27-rf10-itq (query)            41_455.31       707.34    42_162.64       0.0341   394.989471        12.06
+IVF-Binary-512-nl387-np27-rf20-itq (query)            41_455.31       819.70    42_275.01       0.0687   311.735574        12.06
+IVF-Binary-512-nl387-itq (self)                       41_455.31     6_582.04    48_037.35       0.0433   360.817949        12.06
+--------------------------------------------------------------------------------------------------------------------------------
+IVF-Binary-512-nl547-np23-rf0-itq (query)             42_783.00       576.24    43_359.24       0.0053          NaN        12.37
+IVF-Binary-512-nl547-np27-rf0-itq (query)             42_783.00       594.28    43_377.28       0.0046          NaN        12.37
+IVF-Binary-512-nl547-np33-rf0-itq (query)             42_783.00       609.20    43_392.20       0.0038          NaN        12.37
+IVF-Binary-512-nl547-np23-rf5-itq (query)             42_783.00       639.61    43_422.61       0.0253   439.140137        12.37
+IVF-Binary-512-nl547-np23-rf10-itq (query)            42_783.00       692.18    43_475.18       0.0499   344.140967        12.37
+IVF-Binary-512-nl547-np23-rf20-itq (query)            42_783.00       765.93    43_548.93       0.0982   260.462666        12.37
+IVF-Binary-512-nl547-np27-rf5-itq (query)             42_783.00       645.00    43_428.00       0.0222   461.372143        12.37
+IVF-Binary-512-nl547-np27-rf10-itq (query)            42_783.00       691.46    43_474.46       0.0437   365.311496        12.37
+IVF-Binary-512-nl547-np27-rf20-itq (query)            42_783.00       793.02    43_576.02       0.0859   279.780281        12.37
+IVF-Binary-512-nl547-np33-rf5-itq (query)             42_783.00       682.22    43_465.22       0.0191   483.242519        12.37
+IVF-Binary-512-nl547-np33-rf10-itq (query)            42_783.00       730.75    43_513.75       0.0376   386.724513        12.37
+IVF-Binary-512-nl547-np33-rf20-itq (query)            42_783.00       808.84    43_591.84       0.0738   298.620954        12.37
+IVF-Binary-512-nl547-itq (self)                       42_783.00     6_724.27    49_507.27       0.0496   344.599554        12.37
+--------------------------------------------------------------------------------------------------------------------------------
+IVF-Binary-1024-nl273-np13-rf0-random (query)         67_804.63     1_094.06    68_898.69       0.2390          NaN        21.99
+IVF-Binary-1024-nl273-np16-rf0-random (query)         67_804.63     1_158.36    68_962.98       0.2374          NaN        21.99
+IVF-Binary-1024-nl273-np23-rf0-random (query)         67_804.63     1_285.37    69_089.99       0.2364          NaN        21.99
+IVF-Binary-1024-nl273-np13-rf5-random (query)         67_804.63     1_157.98    68_962.61       0.4975    49.846542        21.99
+IVF-Binary-1024-nl273-np13-rf10-random (query)        67_804.63     1_200.45    69_005.08       0.6423    26.412121        21.99
+IVF-Binary-1024-nl273-np13-rf20-random (query)        67_804.63     1_309.84    69_114.47       0.7822    12.585593        21.99
+IVF-Binary-1024-nl273-np16-rf5-random (query)         67_804.63     1_215.38    69_020.00       0.4952    50.384320        21.99
+IVF-Binary-1024-nl273-np16-rf10-random (query)        67_804.63     1_261.66    69_066.29       0.6395    26.778764        21.99
+IVF-Binary-1024-nl273-np16-rf20-random (query)        67_804.63     1_400.17    69_204.80       0.7797    12.789591        21.99
+IVF-Binary-1024-nl273-np23-rf5-random (query)         67_804.63     1_393.78    69_198.40       0.4935    50.734683        21.99
+IVF-Binary-1024-nl273-np23-rf10-random (query)        67_804.63     1_416.76    69_221.38       0.6378    27.000161        21.99
+IVF-Binary-1024-nl273-np23-rf20-random (query)        67_804.63     1_525.20    69_329.82       0.7785    12.894928        21.99
+IVF-Binary-1024-nl273-random (self)                   67_804.63    12_496.45    80_301.08       0.6396    26.902952        21.99
+--------------------------------------------------------------------------------------------------------------------------------
+IVF-Binary-1024-nl387-np19-rf0-random (query)         68_732.65     1_102.98    69_835.62       0.2378          NaN        22.21
+IVF-Binary-1024-nl387-np27-rf0-random (query)         68_732.65     1_229.96    69_962.61       0.2368          NaN        22.21
+IVF-Binary-1024-nl387-np19-rf5-random (query)         68_732.65     1_161.72    69_894.37       0.4954    50.312337        22.21
+IVF-Binary-1024-nl387-np19-rf10-random (query)        68_732.65     1_216.20    69_948.85       0.6402    26.683907        22.21
+IVF-Binary-1024-nl387-np19-rf20-random (query)        68_732.65     1_320.44    70_053.09       0.7806    12.730999        22.21
+IVF-Binary-1024-nl387-np27-rf5-random (query)         68_732.65     1_275.27    70_007.92       0.4932    50.850925        22.21
+IVF-Binary-1024-nl387-np27-rf10-random (query)        68_732.65     1_324.42    70_057.07       0.6377    27.044311        22.21
+IVF-Binary-1024-nl387-np27-rf20-random (query)        68_732.65     1_438.92    70_171.56       0.7780    12.949822        22.21
+IVF-Binary-1024-nl387-random (self)                   68_732.65    12_074.31    80_806.95       0.6404    26.811227        22.21
+--------------------------------------------------------------------------------------------------------------------------------
+IVF-Binary-1024-nl547-np23-rf0-random (query)         69_792.95     1_111.01    70_903.96       0.2389          NaN        22.53
+IVF-Binary-1024-nl547-np27-rf0-random (query)         69_792.95     1_146.73    70_939.68       0.2380          NaN        22.53
+IVF-Binary-1024-nl547-np33-rf0-random (query)         69_792.95     1_204.69    70_997.64       0.2373          NaN        22.53
+IVF-Binary-1024-nl547-np23-rf5-random (query)         69_792.95     1_159.13    70_952.08       0.4979    49.773250        22.53
+IVF-Binary-1024-nl547-np23-rf10-random (query)        69_792.95     1_207.48    71_000.43       0.6430    26.336457        22.53
+IVF-Binary-1024-nl547-np23-rf20-random (query)        69_792.95     1_320.80    71_113.75       0.7833    12.497196        22.53
+IVF-Binary-1024-nl547-np27-rf5-random (query)         69_792.95     1_226.50    71_019.45       0.4956    50.305517        22.53
+IVF-Binary-1024-nl547-np27-rf10-random (query)        69_792.95     1_336.94    71_129.89       0.6401    26.703161        22.53
+IVF-Binary-1024-nl547-np27-rf20-random (query)        69_792.95     1_361.54    71_154.48       0.7804    12.758650        22.53
+IVF-Binary-1024-nl547-np33-rf5-random (query)         69_792.95     1_268.68    71_061.63       0.4942    50.593966        22.53
+IVF-Binary-1024-nl547-np33-rf10-random (query)        69_792.95     1_311.00    71_103.94       0.6385    26.897202        22.53
+IVF-Binary-1024-nl547-np33-rf20-random (query)        69_792.95     1_428.95    71_221.90       0.7787    12.888226        22.53
+IVF-Binary-1024-nl547-random (self)                   69_792.95    12_090.27    81_883.21       0.6432    26.439123        22.53
+--------------------------------------------------------------------------------------------------------------------------------
+IVF-Binary-1024-nl273-np13-rf0-itq (query)            74_505.62     1_186.25    75_691.86       0.1608          NaN        21.99
+IVF-Binary-1024-nl273-np16-rf0-itq (query)            74_505.62     1_167.31    75_672.93       0.1581          NaN        21.99
+IVF-Binary-1024-nl273-np23-rf0-itq (query)            74_505.62     1_294.38    75_799.99       0.1567          NaN        21.99
+IVF-Binary-1024-nl273-np13-rf5-itq (query)            74_505.62     1_167.34    75_672.95       0.3365    96.493855        21.99
+IVF-Binary-1024-nl273-np13-rf10-itq (query)           74_505.62     1_210.39    75_716.00       0.4561    58.720492        21.99
+IVF-Binary-1024-nl273-np13-rf20-itq (query)           74_505.62     1_314.24    75_819.85       0.5983    33.309435        21.99
+IVF-Binary-1024-nl273-np16-rf5-itq (query)            74_505.62     1_219.48    75_725.09       0.3315    98.500862        21.99
+IVF-Binary-1024-nl273-np16-rf10-itq (query)           74_505.62     1_271.75    75_777.36       0.4505    60.011650        21.99
+IVF-Binary-1024-nl273-np16-rf20-itq (query)           74_505.62     1_395.60    75_901.21       0.5928    34.089455        21.99
+IVF-Binary-1024-nl273-np23-rf5-itq (query)            74_505.62     1_352.66    75_858.27       0.3285   100.035358        21.99
+IVF-Binary-1024-nl273-np23-rf10-itq (query)           74_505.62     1_407.33    75_912.95       0.4467    61.078614        21.99
+IVF-Binary-1024-nl273-np23-rf20-itq (query)           74_505.62     1_519.50    76_025.12       0.5884    34.811803        21.99
+IVF-Binary-1024-nl273-itq (self)                      74_505.62    12_693.24    87_198.86       0.4538    59.503677        21.99
+--------------------------------------------------------------------------------------------------------------------------------
+IVF-Binary-1024-nl387-np19-rf0-itq (query)            75_291.49     1_144.98    76_436.46       0.1576          NaN        22.22
+IVF-Binary-1024-nl387-np27-rf0-itq (query)            75_291.49     1_237.21    76_528.70       0.1561          NaN        22.22
+IVF-Binary-1024-nl387-np19-rf5-itq (query)            75_291.49     1_278.55    76_570.03       0.3330    98.183018        22.22
+IVF-Binary-1024-nl387-np19-rf10-itq (query)           75_291.49     1_230.27    76_521.75       0.4522    59.742709        22.22
+IVF-Binary-1024-nl387-np19-rf20-itq (query)           75_291.49     1_335.72    76_627.21       0.5933    34.082845        22.22
+IVF-Binary-1024-nl387-np27-rf5-itq (query)            75_291.49     1_295.03    76_586.52       0.3290   100.157986        22.22
+IVF-Binary-1024-nl387-np27-rf10-itq (query)           75_291.49     1_343.22    76_634.71       0.4471    61.128957        22.22
+IVF-Binary-1024-nl387-np27-rf20-itq (query)           75_291.49     1_468.58    76_760.07       0.5884    34.883688        22.22
+IVF-Binary-1024-nl387-itq (self)                      75_291.49    12_274.70    87_566.18       0.4552    59.254810        22.22
+--------------------------------------------------------------------------------------------------------------------------------
+IVF-Binary-1024-nl547-np23-rf0-itq (query)            76_613.79     1_124.81    77_738.60       0.1598          NaN        22.53
+IVF-Binary-1024-nl547-np27-rf0-itq (query)            76_613.79     1_192.20    77_805.99       0.1581          NaN        22.53
+IVF-Binary-1024-nl547-np33-rf0-itq (query)            76_613.79     1_248.33    77_862.12       0.1568          NaN        22.53
+IVF-Binary-1024-nl547-np23-rf5-itq (query)            76_613.79     1_208.83    77_822.62       0.3361    96.368810        22.53
+IVF-Binary-1024-nl547-np23-rf10-itq (query)           76_613.79     1_268.07    77_881.86       0.4574    58.222166        22.53
+IVF-Binary-1024-nl547-np23-rf20-itq (query)           76_613.79     1_330.42    77_944.21       0.5999    32.952157        22.53
+IVF-Binary-1024-nl547-np27-rf5-itq (query)            76_613.79     1_208.84    77_822.63       0.3324    98.133030        22.53
+IVF-Binary-1024-nl547-np27-rf10-itq (query)           76_613.79     1_255.64    77_869.44       0.4526    59.450642        22.53
+IVF-Binary-1024-nl547-np27-rf20-itq (query)           76_613.79     1_372.80    77_986.59       0.5938    33.883582        22.53
+IVF-Binary-1024-nl547-np33-rf5-itq (query)            76_613.79     1_269.72    77_883.51       0.3299    99.313165        22.53
+IVF-Binary-1024-nl547-np33-rf10-itq (query)           76_613.79     1_317.24    77_931.03       0.4492    60.336405        22.53
+IVF-Binary-1024-nl547-np33-rf20-itq (query)           76_613.79     1_431.65    78_045.44       0.5897    34.526797        22.53
+IVF-Binary-1024-nl547-itq (self)                      76_613.79    12_155.69    88_769.48       0.4601    57.883100        22.53
+--------------------------------------------------------------------------------------------------------------------------------
+IVF-Binary-512-nl273-np13-rf0-signed (query)          35_142.26       529.25    35_671.51       0.1599          NaN        11.84
+IVF-Binary-512-nl273-np16-rf0-signed (query)          35_142.26       548.80    35_691.06       0.1571          NaN        11.84
+IVF-Binary-512-nl273-np23-rf0-signed (query)          35_142.26       592.45    35_734.71       0.1560          NaN        11.84
+IVF-Binary-512-nl273-np13-rf5-signed (query)          35_142.26       625.89    35_768.15       0.3353    96.351106        11.84
+IVF-Binary-512-nl273-np13-rf10-signed (query)         35_142.26       688.32    35_830.58       0.4555    58.420827        11.84
+IVF-Binary-512-nl273-np13-rf20-signed (query)         35_142.26       794.19    35_936.45       0.5993    32.991403        11.84
+IVF-Binary-512-nl273-np16-rf5-signed (query)          35_142.26       643.10    35_785.36       0.3303    98.570883        11.84
+IVF-Binary-512-nl273-np16-rf10-signed (query)         35_142.26       713.28    35_855.54       0.4492    59.882774        11.84
+IVF-Binary-512-nl273-np16-rf20-signed (query)         35_142.26       831.94    35_974.20       0.5929    33.882468        11.84
+IVF-Binary-512-nl273-np23-rf5-signed (query)          35_142.26       698.83    35_841.09       0.3275    99.795531        11.84
+IVF-Binary-512-nl273-np23-rf10-signed (query)         35_142.26       772.23    35_914.49       0.4458    60.780937        11.84
+IVF-Binary-512-nl273-np23-rf20-signed (query)         35_142.26       901.34    36_043.60       0.5891    34.439524        11.84
+IVF-Binary-512-nl273-signed (self)                    35_142.26     7_080.64    42_222.90       0.4505    59.843277        11.84
+--------------------------------------------------------------------------------------------------------------------------------
+IVF-Binary-512-nl387-np19-rf0-signed (query)          35_949.17       549.60    36_498.77       0.1577          NaN        12.06
+IVF-Binary-512-nl387-np27-rf0-signed (query)          35_949.17       587.28    36_536.45       0.1560          NaN        12.06
+IVF-Binary-512-nl387-np19-rf5-signed (query)          35_949.17       692.83    36_642.00       0.3323    97.801190        12.06
+IVF-Binary-512-nl387-np19-rf10-signed (query)         35_949.17       704.06    36_653.23       0.4506    59.645195        12.06
+IVF-Binary-512-nl387-np19-rf20-signed (query)         35_949.17       819.65    36_768.82       0.5948    33.653650        12.06
+IVF-Binary-512-nl387-np27-rf5-signed (query)          35_949.17       689.38    36_638.55       0.3287    99.396340        12.06
+IVF-Binary-512-nl387-np27-rf10-signed (query)         35_949.17       753.14    36_702.31       0.4458    60.810695        12.06
+IVF-Binary-512-nl387-np27-rf20-signed (query)         35_949.17       886.13    36_835.30       0.5898    34.355937        12.06
+IVF-Binary-512-nl387-signed (self)                    35_949.17     7_039.13    42_988.30       0.4521    59.458274        12.06
+--------------------------------------------------------------------------------------------------------------------------------
+IVF-Binary-512-nl547-np23-rf0-signed (query)          37_477.07       562.24    38_039.31       0.1595          NaN        12.37
+IVF-Binary-512-nl547-np27-rf0-signed (query)          37_477.07       582.66    38_059.73       0.1580          NaN        12.37
+IVF-Binary-512-nl547-np33-rf0-signed (query)          37_477.07       602.56    38_079.63       0.1568          NaN        12.37
+IVF-Binary-512-nl547-np23-rf5-signed (query)          37_477.07       649.71    38_126.78       0.3360    96.088527        12.37
+IVF-Binary-512-nl547-np23-rf10-signed (query)         37_477.07       720.16    38_197.23       0.4559    58.273753        12.37
+IVF-Binary-512-nl547-np23-rf20-signed (query)         37_477.07       818.48    38_295.55       0.6010    32.712228        12.37
+IVF-Binary-512-nl547-np27-rf5-signed (query)          37_477.07       661.88    38_138.96       0.3326    97.548526        12.37
+IVF-Binary-512-nl547-np27-rf10-signed (query)         37_477.07       728.84    38_205.91       0.4509    59.474107        12.37
+IVF-Binary-512-nl547-np27-rf20-signed (query)         37_477.07       861.75    38_338.83       0.5953    33.508355        12.37
+IVF-Binary-512-nl547-np33-rf5-signed (query)          37_477.07       687.22    38_164.30       0.3300    98.653713        12.37
+IVF-Binary-512-nl547-np33-rf10-signed (query)         37_477.07       752.91    38_229.98       0.4475    60.241849        12.37
+IVF-Binary-512-nl547-np33-rf20-signed (query)         37_477.07       869.98    38_347.05       0.5916    34.043211        12.37
+IVF-Binary-512-nl547-signed (self)                    37_477.07     7_528.54    45_005.61       0.4567    58.235755        12.37
+--------------------------------------------------------------------------------------------------------------------------------
+<pre><code>
+
 </code></pre>
 </details>
 
 ### <u>RaBitQ (IVF and exhaustive)</u>
 
-[RaBitQ](https://arxiv.org/abs/2405.12497) is an incredibly powerful
+[RaBitQ](https://arxiv.org/abs/2405.12497) is an very powerful
 quantisation that combines strong compression with excellent Recalls (even
-without re-ranking). It works better on higher dimensions. In the case of the
+without re-ranking!). It works better on higher dimensions. In the case of the
 `ExhaustiveRaBitQ`, the quantiser itself generates a smaller number of centroids
 for quantisation purposes (`sqrt(n)` centroids in this case). On the other
 hand for the `IVF-RaBitQ` index, the IVF centroids are directly used for
@@ -1617,56 +2042,59 @@ distance calculation.
 
 <details>
 <summary><b>RaBitQ - Euclidean (Gaussian)</b>:</summary>
+</br>
 <pre><code>
 ================================================================================================================================
 Benchmark: 150k cells, 32D - IVF-RaBitQ
 ================================================================================================================================
 Method                                               Build (ms)   Query (ms)   Total (ms)     Recall@k   Dist Error    Size (MB)
 --------------------------------------------------------------------------------------------------------------------------------
-Exhaustive (query)                                         3.15     1_731.83     1_734.98       1.0000     0.000000        18.31
-Exhaustive (self)                                          3.15    17_066.93    17_070.08       1.0000     0.000000        18.31
+Exhaustive (query)                                         3.73     1_520.85     1_524.58       1.0000     0.000000        18.31
+Exhaustive (self)                                          3.73    16_168.30    16_172.03       1.0000     0.000000        18.31
 --------------------------------------------------------------------------------------------------------------------------------
-ExhaustiveRaBitQ-rf0 (query)                           1_723.09       498.88     2_221.97       0.3141    41.590414         3.46
-ExhaustiveRaBitQ-rf5 (query)                           1_723.09       581.89     2_304.98       0.6781     1.424540         3.46
-ExhaustiveRaBitQ-rf10 (query)                          1_723.09       654.06     2_377.15       0.8317     0.540476         3.46
-ExhaustiveRaBitQ-rf20 (query)                          1_723.09       788.72     2_511.81       0.9366     0.159663         3.46
-ExhaustiveRaBitQ (self)                                1_723.09     6_577.00     8_300.09       0.8323     0.527516         3.46
+ExhaustiveRaBitQ-rf0 (query)                           1_305.07       494.54     1_799.61       0.3144    41.590284         3.46
+ExhaustiveRaBitQ-rf5 (query)                           1_305.07       592.97     1_898.03       0.6776     1.428163         3.46
+ExhaustiveRaBitQ-rf10 (query)                          1_305.07       648.97     1_954.03       0.8321     0.534643         3.46
+ExhaustiveRaBitQ-rf20 (query)                          1_305.07       781.12     2_086.19       0.9366     0.161174         3.46
+ExhaustiveRaBitQ (self)                                1_305.07     6_608.70     7_913.77       0.8324     0.527768         3.46
 --------------------------------------------------------------------------------------------------------------------------------
-IVF-RaBitQ-nl273-np13-rf0 (query)                        984.49       117.39     1_101.87       0.3202    41.573392         3.47
-IVF-RaBitQ-nl273-np16-rf0 (query)                        984.49       140.51     1_125.00       0.3192    41.580432         3.47
-IVF-RaBitQ-nl273-np23-rf0 (query)                        984.49       193.91     1_178.39       0.3180    41.584057         3.47
-IVF-RaBitQ-nl273-np13-rf5 (query)                        984.49       170.53     1_155.02       0.6871     1.446173         3.47
-IVF-RaBitQ-nl273-np13-rf10 (query)                       984.49       217.49     1_201.98       0.8371     0.557811         3.47
-IVF-RaBitQ-nl273-np13-rf20 (query)                       984.49       301.43     1_285.91       0.9353     0.179328         3.47
-IVF-RaBitQ-nl273-np16-rf5 (query)                        984.49       195.03     1_179.52       0.6868     1.449165         3.47
-IVF-RaBitQ-nl273-np16-rf10 (query)                       984.49       247.12     1_231.61       0.8393     0.547250         3.47
-IVF-RaBitQ-nl273-np16-rf20 (query)                       984.49       339.57     1_324.06       0.9397     0.160266         3.47
-IVF-RaBitQ-nl273-np23-rf5 (query)                        984.49       252.74     1_237.23       0.6854     1.459348         3.47
-IVF-RaBitQ-nl273-np23-rf10 (query)                       984.49       310.78     1_295.27       0.8389     0.549605         3.47
-IVF-RaBitQ-nl273-np23-rf20 (query)                       984.49       403.33     1_387.81       0.9407     0.158794         3.47
-IVF-RaBitQ-nl273 (self)                                  984.49     4_012.58     4_997.07       0.9410     0.156272         3.47
-IVF-RaBitQ-nl387-np19-rf0 (query)                      1_360.44       125.89     1_486.32       0.3212    41.562779         3.49
-IVF-RaBitQ-nl387-np27-rf0 (query)                      1_360.44       168.48     1_528.92       0.3189    41.572400         3.49
-IVF-RaBitQ-nl387-np19-rf5 (query)                      1_360.44       189.82     1_550.26       0.6915     1.395785         3.49
-IVF-RaBitQ-nl387-np19-rf10 (query)                     1_360.44       225.17     1_585.61       0.8427     0.519210         3.49
-IVF-RaBitQ-nl387-np19-rf20 (query)                     1_360.44       307.68     1_668.12       0.9398     0.165810         3.49
-IVF-RaBitQ-nl387-np27-rf5 (query)                      1_360.44       222.17     1_582.61       0.6887     1.419301         3.49
-IVF-RaBitQ-nl387-np27-rf10 (query)                     1_360.44       275.36     1_635.80       0.8422     0.517173         3.49
-IVF-RaBitQ-nl387-np27-rf20 (query)                     1_360.44       362.90     1_723.34       0.9428     0.146533         3.49
-IVF-RaBitQ-nl387 (self)                                1_360.44     3_654.02     5_014.46       0.9429     0.146867         3.49
-IVF-RaBitQ-nl547-np23-rf0 (query)                      1_861.81       115.24     1_977.05       0.3271    41.545557         3.51
-IVF-RaBitQ-nl547-np27-rf0 (query)                      1_861.81       131.69     1_993.49       0.3252    41.553699         3.51
-IVF-RaBitQ-nl547-np33-rf0 (query)                      1_861.81       154.62     2_016.43       0.3237    41.559148         3.51
-IVF-RaBitQ-nl547-np23-rf5 (query)                      1_861.81       165.76     2_027.57       0.6983     1.345744         3.51
-IVF-RaBitQ-nl547-np23-rf10 (query)                     1_861.81       209.67     2_071.48       0.8470     0.505474         3.51
-IVF-RaBitQ-nl547-np23-rf20 (query)                     1_861.81       291.97     2_153.77       0.9405     0.167264         3.51
-IVF-RaBitQ-nl547-np27-rf5 (query)                      1_861.81       186.56     2_048.37       0.6962     1.356471         3.51
-IVF-RaBitQ-nl547-np27-rf10 (query)                     1_861.81       230.54     2_092.35       0.8474     0.498117         3.51
-IVF-RaBitQ-nl547-np27-rf20 (query)                     1_861.81       313.40     2_175.21       0.9440     0.148206         3.51
-IVF-RaBitQ-nl547-np33-rf5 (query)                      1_861.81       210.03     2_071.84       0.6943     1.372707         3.51
-IVF-RaBitQ-nl547-np33-rf10 (query)                     1_861.81       257.34     2_119.14       0.8465     0.502442         3.51
-IVF-RaBitQ-nl547-np33-rf20 (query)                     1_861.81       348.22     2_210.02       0.9451     0.142254         3.51
-IVF-RaBitQ-nl547 (self)                                1_861.81     3_457.95     5_319.76       0.9453     0.139847         3.51
+IVF-RaBitQ-nl273-np13-rf0 (query)                        854.92       115.23       970.15       0.3195    41.573323         3.47
+IVF-RaBitQ-nl273-np16-rf0 (query)                        854.92       137.89       992.81       0.3185    41.580439         3.47
+IVF-RaBitQ-nl273-np23-rf0 (query)                        854.92       191.43     1_046.35       0.3175    41.584033         3.47
+IVF-RaBitQ-nl273-np13-rf5 (query)                        854.92       166.35     1_021.27       0.6876     1.444602         3.47
+IVF-RaBitQ-nl273-np13-rf10 (query)                       854.92       215.63     1_070.55       0.8368     0.555261         3.47
+IVF-RaBitQ-nl273-np13-rf20 (query)                       854.92       295.96     1_150.88       0.9353     0.178942         3.47
+IVF-RaBitQ-nl273-np16-rf5 (query)                        854.92       193.08     1_048.00       0.6874     1.447090         3.47
+IVF-RaBitQ-nl273-np16-rf10 (query)                       854.92       242.43     1_097.35       0.8389     0.545002         3.47
+IVF-RaBitQ-nl273-np16-rf20 (query)                       854.92       334.27     1_189.19       0.9398     0.160040         3.47
+IVF-RaBitQ-nl273-np23-rf5 (query)                        854.92       248.18     1_103.10       0.6858     1.457594         3.47
+IVF-RaBitQ-nl273-np23-rf10 (query)                       854.92       303.19     1_158.11       0.8386     0.547127         3.47
+IVF-RaBitQ-nl273-np23-rf20 (query)                       854.92       408.66     1_263.58       0.9408     0.158475         3.47
+IVF-RaBitQ-nl273 (self)                                  854.92     3_967.98     4_822.90       0.9410     0.156568         3.47
+--------------------------------------------------------------------------------------------------------------------------------
+IVF-RaBitQ-nl387-np19-rf0 (query)                      1_162.08       121.18     1_283.26       0.3214    41.563286         3.49
+IVF-RaBitQ-nl387-np27-rf0 (query)                      1_162.08       164.65     1_326.73       0.3190    41.572722         3.49
+IVF-RaBitQ-nl387-np19-rf5 (query)                      1_162.08       171.96     1_334.04       0.6913     1.395216         3.49
+IVF-RaBitQ-nl387-np19-rf10 (query)                     1_162.08       220.21     1_382.29       0.8430     0.517782         3.49
+IVF-RaBitQ-nl387-np19-rf20 (query)                     1_162.08       301.82     1_463.90       0.9401     0.165874         3.49
+IVF-RaBitQ-nl387-np27-rf5 (query)                      1_162.08       224.69     1_386.77       0.6884     1.418525         3.49
+IVF-RaBitQ-nl387-np27-rf10 (query)                     1_162.08       271.15     1_433.23       0.8426     0.516410         3.49
+IVF-RaBitQ-nl387-np27-rf20 (query)                     1_162.08       358.09     1_520.17       0.9429     0.146813         3.49
+IVF-RaBitQ-nl387 (self)                                1_162.08     3_589.14     4_751.22       0.9430     0.146811         3.49
+--------------------------------------------------------------------------------------------------------------------------------
+IVF-RaBitQ-nl547-np23-rf0 (query)                      1_603.47       110.44     1_713.92       0.3271    41.546231         3.51
+IVF-RaBitQ-nl547-np27-rf0 (query)                      1_603.47       127.62     1_731.09       0.3249    41.554688         3.51
+IVF-RaBitQ-nl547-np33-rf0 (query)                      1_603.47       151.76     1_755.23       0.3234    41.560268         3.51
+IVF-RaBitQ-nl547-np23-rf5 (query)                      1_603.47       161.34     1_764.81       0.6964     1.352767         3.51
+IVF-RaBitQ-nl547-np23-rf10 (query)                     1_603.47       205.98     1_809.45       0.8458     0.508759         3.51
+IVF-RaBitQ-nl547-np23-rf20 (query)                     1_603.47       288.46     1_891.93       0.9405     0.166157         3.51
+IVF-RaBitQ-nl547-np27-rf5 (query)                      1_603.47       176.44     1_779.91       0.6948     1.361829         3.51
+IVF-RaBitQ-nl547-np27-rf10 (query)                     1_603.47       235.22     1_838.69       0.8463     0.500727         3.51
+IVF-RaBitQ-nl547-np27-rf20 (query)                     1_603.47       307.59     1_911.06       0.9444     0.146654         3.51
+IVF-RaBitQ-nl547-np33-rf5 (query)                      1_603.47       203.59     1_807.06       0.6928     1.379005         3.51
+IVF-RaBitQ-nl547-np33-rf10 (query)                     1_603.47       251.94     1_855.41       0.8451     0.505865         3.51
+IVF-RaBitQ-nl547-np33-rf20 (query)                     1_603.47       339.16     1_942.63       0.9452     0.141182         3.51
+IVF-RaBitQ-nl547 (self)                                1_603.47     3_405.42     5_008.90       0.9454     0.139824         3.51
 --------------------------------------------------------------------------------------------------------------------------------
 </code></pre>
 </details>
@@ -1674,57 +2102,59 @@ IVF-RaBitQ-nl547 (self)                                1_861.81     3_457.95    
 ---
 
 <details>
-<summary><b>Binary - Cosine (Gaussian)</b>:</summary>
+<summary><b>RaBitQ - Cosine (Gaussian)</b>:</summary>
 <pre><code>
 ================================================================================================================================
 Benchmark: 150k cells, 32D - IVF-RaBitQ
 ================================================================================================================================
 Method                                               Build (ms)   Query (ms)   Total (ms)     Recall@k   Dist Error    Size (MB)
 --------------------------------------------------------------------------------------------------------------------------------
-Exhaustive (query)                                         3.74     1_564.85     1_568.59       1.0000     0.000000        18.88
-Exhaustive (self)                                          3.74    16_416.31    16_420.05       1.0000     0.000000        18.88
+Exhaustive (query)                                         3.75     1_565.53     1_569.28       1.0000     0.000000        18.88
+Exhaustive (self)                                          3.75    16_441.54    16_445.29       1.0000     0.000000        18.88
 --------------------------------------------------------------------------------------------------------------------------------
-ExhaustiveRaBitQ-rf0 (query)                           1_654.56       444.40     2_098.97       0.3182     0.168383         3.46
-ExhaustiveRaBitQ-rf5 (query)                           1_654.56       525.17     2_179.73       0.6833     0.001047         3.46
-ExhaustiveRaBitQ-rf10 (query)                          1_654.56       588.14     2_242.70       0.8370     0.000387         3.46
-ExhaustiveRaBitQ-rf20 (query)                          1_654.56       713.22     2_367.78       0.9399     0.000109         3.46
-ExhaustiveRaBitQ (self)                                1_654.56     5_930.34     7_584.91       0.8377     0.000386         3.46
+ExhaustiveRaBitQ-rf0 (query)                           1_291.33       438.05     1_729.39       0.3169     0.168415         3.46
+ExhaustiveRaBitQ-rf5 (query)                           1_291.33       522.25     1_813.58       0.6840     0.001052         3.46
+ExhaustiveRaBitQ-rf10 (query)                          1_291.33       589.89     1_881.22       0.8364     0.000396         3.46
+ExhaustiveRaBitQ-rf20 (query)                          1_291.33       706.54     1_997.88       0.9404     0.000112         3.46
+ExhaustiveRaBitQ (self)                                1_291.33     5_880.05     7_171.38       0.8380     0.000388         3.46
 --------------------------------------------------------------------------------------------------------------------------------
-IVF-RaBitQ-nl273-np13-rf0 (query)                        933.51       117.69     1_051.20       0.3157     0.167945         3.47
-IVF-RaBitQ-nl273-np16-rf0 (query)                        933.51       140.85     1_074.36       0.3143     0.167649         3.47
-IVF-RaBitQ-nl273-np23-rf0 (query)                        933.51       200.01     1_133.53       0.3131     0.167498         3.47
-IVF-RaBitQ-nl273-np13-rf5 (query)                        933.51       169.39     1_102.91       0.6843     0.001126         3.47
-IVF-RaBitQ-nl273-np13-rf10 (query)                       933.51       217.26     1_150.77       0.8358     0.000439         3.47
-IVF-RaBitQ-nl273-np13-rf20 (query)                       933.51       301.61     1_235.13       0.9346     0.000143         3.47
-IVF-RaBitQ-nl273-np16-rf5 (query)                        933.51       195.98     1_129.50       0.6837     0.001134         3.47
-IVF-RaBitQ-nl273-np16-rf10 (query)                       933.51       247.56     1_181.08       0.8375     0.000434         3.47
-IVF-RaBitQ-nl273-np16-rf20 (query)                       933.51       337.23     1_270.74       0.9395     0.000129         3.47
-IVF-RaBitQ-nl273-np23-rf5 (query)                        933.51       255.15     1_188.67       0.6821     0.001143         3.47
-IVF-RaBitQ-nl273-np23-rf10 (query)                       933.51       310.98     1_244.49       0.8367     0.000436         3.47
-IVF-RaBitQ-nl273-np23-rf20 (query)                       933.51       405.68     1_339.20       0.9402     0.000127         3.47
-IVF-RaBitQ-nl273 (self)                                  933.51     4_078.41     5_011.93       0.9408     0.000126         3.47
-IVF-RaBitQ-nl387-np19-rf0 (query)                      1_284.61       138.30     1_422.91       0.3194     0.168487         3.49
-IVF-RaBitQ-nl387-np27-rf0 (query)                      1_284.61       172.07     1_456.68       0.3171     0.168118         3.49
-IVF-RaBitQ-nl387-np19-rf5 (query)                      1_284.61       176.57     1_461.18       0.6886     0.001098         3.49
-IVF-RaBitQ-nl387-np19-rf10 (query)                     1_284.61       224.28     1_508.89       0.8409     0.000418         3.49
-IVF-RaBitQ-nl387-np19-rf20 (query)                     1_284.61       307.47     1_592.08       0.9395     0.000129         3.49
-IVF-RaBitQ-nl387-np27-rf5 (query)                      1_284.61       229.58     1_514.19       0.6860     0.001116         3.49
-IVF-RaBitQ-nl387-np27-rf10 (query)                     1_284.61       302.61     1_587.22       0.8402     0.000421         3.49
-IVF-RaBitQ-nl387-np27-rf20 (query)                     1_284.61       365.69     1_650.30       0.9420     0.000121         3.49
-IVF-RaBitQ-nl387 (self)                                1_284.61     3_647.40     4_932.02       0.9429     0.000118         3.49
-IVF-RaBitQ-nl547-np23-rf0 (query)                      1_742.84       113.87     1_856.71       0.3232     0.169083         3.51
-IVF-RaBitQ-nl547-np27-rf0 (query)                      1_742.84       130.89     1_873.73       0.3210     0.168769         3.51
-IVF-RaBitQ-nl547-np33-rf0 (query)                      1_742.84       154.14     1_896.98       0.3192     0.168561         3.51
-IVF-RaBitQ-nl547-np23-rf5 (query)                      1_742.84       164.50     1_907.35       0.6951     0.001058         3.51
-IVF-RaBitQ-nl547-np23-rf10 (query)                     1_742.84       216.33     1_959.17       0.8454     0.000401         3.51
-IVF-RaBitQ-nl547-np23-rf20 (query)                     1_742.84       300.81     2_043.65       0.9409     0.000129         3.51
-IVF-RaBitQ-nl547-np27-rf5 (query)                      1_742.84       190.73     1_933.58       0.6928     0.001070         3.51
-IVF-RaBitQ-nl547-np27-rf10 (query)                     1_742.84       267.31     2_010.16       0.8455     0.000400         3.51
-IVF-RaBitQ-nl547-np27-rf20 (query)                     1_742.84       319.69     2_062.53       0.9440     0.000119         3.51
-IVF-RaBitQ-nl547-np33-rf5 (query)                      1_742.84       210.14     1_952.98       0.6907     0.001084         3.51
-IVF-RaBitQ-nl547-np33-rf10 (query)                     1_742.84       256.78     1_999.63       0.8443     0.000403         3.51
-IVF-RaBitQ-nl547-np33-rf20 (query)                     1_742.84       344.72     2_087.56       0.9446     0.000117         3.51
-IVF-RaBitQ-nl547 (self)                                1_742.84     3_464.86     5_207.70       0.9451     0.000112         3.51
+IVF-RaBitQ-nl273-np13-rf0 (query)                        842.42       116.27       958.69       0.3168     0.167977         3.47
+IVF-RaBitQ-nl273-np16-rf0 (query)                        842.42       139.06       981.48       0.3153     0.167681         3.47
+IVF-RaBitQ-nl273-np23-rf0 (query)                        842.42       198.07     1_040.50       0.3142     0.167536         3.47
+IVF-RaBitQ-nl273-np13-rf5 (query)                        842.42       169.09     1_011.51       0.6846     0.001130         3.47
+IVF-RaBitQ-nl273-np13-rf10 (query)                       842.42       213.36     1_055.78       0.8364     0.000437         3.47
+IVF-RaBitQ-nl273-np13-rf20 (query)                       842.42       295.66     1_138.08       0.9351     0.000141         3.47
+IVF-RaBitQ-nl273-np16-rf5 (query)                        842.42       209.90     1_052.32       0.6842     0.001136         3.47
+IVF-RaBitQ-nl273-np16-rf10 (query)                       842.42       243.27     1_085.69       0.8383     0.000429         3.47
+IVF-RaBitQ-nl273-np16-rf20 (query)                       842.42       331.33     1_173.75       0.9395     0.000128         3.47
+IVF-RaBitQ-nl273-np23-rf5 (query)                        842.42       251.97     1_094.40       0.6826     0.001146         3.47
+IVF-RaBitQ-nl273-np23-rf10 (query)                       842.42       307.31     1_149.73       0.8379     0.000432         3.47
+IVF-RaBitQ-nl273-np23-rf20 (query)                       842.42       417.16     1_259.59       0.9406     0.000126         3.47
+IVF-RaBitQ-nl273 (self)                                  842.42     4_033.22     4_875.64       0.9412     0.000125         3.47
+--------------------------------------------------------------------------------------------------------------------------------
+IVF-RaBitQ-nl387-np19-rf0 (query)                      1_140.67       127.97     1_268.64       0.3200     0.168476         3.49
+IVF-RaBitQ-nl387-np27-rf0 (query)                      1_140.67       169.98     1_310.65       0.3178     0.168112         3.49
+IVF-RaBitQ-nl387-np19-rf5 (query)                      1_140.67       173.84     1_314.51       0.6890     0.001097         3.49
+IVF-RaBitQ-nl387-np19-rf10 (query)                     1_140.67       219.39     1_360.06       0.8411     0.000416         3.49
+IVF-RaBitQ-nl387-np19-rf20 (query)                     1_140.67       311.47     1_452.15       0.9397     0.000129         3.49
+IVF-RaBitQ-nl387-np27-rf5 (query)                      1_140.67       221.34     1_362.01       0.6862     0.001116         3.49
+IVF-RaBitQ-nl387-np27-rf10 (query)                     1_140.67       271.82     1_412.49       0.8402     0.000420         3.49
+IVF-RaBitQ-nl387-np27-rf20 (query)                     1_140.67       359.75     1_500.42       0.9420     0.000120         3.49
+IVF-RaBitQ-nl387 (self)                                1_140.67     3_593.27     4_733.94       0.9431     0.000118         3.49
+--------------------------------------------------------------------------------------------------------------------------------
+IVF-RaBitQ-nl547-np23-rf0 (query)                      1_544.06       117.23     1_661.29       0.3235     0.169070         3.51
+IVF-RaBitQ-nl547-np27-rf0 (query)                      1_544.06       127.15     1_671.21       0.3212     0.168758         3.51
+IVF-RaBitQ-nl547-np33-rf0 (query)                      1_544.06       150.78     1_694.84       0.3196     0.168559         3.51
+IVF-RaBitQ-nl547-np23-rf5 (query)                      1_544.06       164.58     1_708.65       0.6951     0.001062         3.51
+IVF-RaBitQ-nl547-np23-rf10 (query)                     1_544.06       204.88     1_748.94       0.8449     0.000403         3.51
+IVF-RaBitQ-nl547-np23-rf20 (query)                     1_544.06       285.05     1_829.12       0.9403     0.000129         3.51
+IVF-RaBitQ-nl547-np27-rf5 (query)                      1_544.06       176.59     1_720.66       0.6927     0.001073         3.51
+IVF-RaBitQ-nl547-np27-rf10 (query)                     1_544.06       226.01     1_770.08       0.8450     0.000402         3.51
+IVF-RaBitQ-nl547-np27-rf20 (query)                     1_544.06       307.51     1_851.58       0.9434     0.000118         3.51
+IVF-RaBitQ-nl547-np33-rf5 (query)                      1_544.06       203.33     1_747.40       0.6904     0.001088         3.51
+IVF-RaBitQ-nl547-np33-rf10 (query)                     1_544.06       252.41     1_796.47       0.8441     0.000406         3.51
+IVF-RaBitQ-nl547-np33-rf20 (query)                     1_544.06       338.85     1_882.91       0.9442     0.000116         3.51
+IVF-RaBitQ-nl547 (self)                                1_544.06     3_393.95     4_938.01       0.9453     0.000112         3.51
 --------------------------------------------------------------------------------------------------------------------------------
 </code></pre>
 </details>
@@ -1739,50 +2169,52 @@ Benchmark: 150k cells, 32D - IVF-RaBitQ
 ================================================================================================================================
 Method                                               Build (ms)   Query (ms)   Total (ms)     Recall@k   Dist Error    Size (MB)
 --------------------------------------------------------------------------------------------------------------------------------
-Exhaustive (query)                                         3.19     1_605.50     1_608.69       1.0000     0.000000        18.31
-Exhaustive (self)                                          3.19    16_515.02    16_518.21       1.0000     0.000000        18.31
+Exhaustive (query)                                         2.96     1_529.34     1_532.30       1.0000     0.000000        18.31
+Exhaustive (self)                                          2.96    15_872.84    15_875.79       1.0000     0.000000        18.31
 --------------------------------------------------------------------------------------------------------------------------------
-ExhaustiveRaBitQ-rf0 (query)                           1_677.44       391.67     2_069.12       0.4426     1.402652         3.46
-ExhaustiveRaBitQ-rf5 (query)                           1_677.44       468.64     2_146.09       0.8785     0.030781         3.46
-ExhaustiveRaBitQ-rf10 (query)                          1_677.44       533.63     2_211.07       0.9682     0.005679         3.46
-ExhaustiveRaBitQ-rf20 (query)                          1_677.44       642.43     2_319.87       0.9954     0.000665         3.46
-ExhaustiveRaBitQ (self)                                1_677.44     5_359.04     7_036.49       0.9696     0.005520         3.46
+ExhaustiveRaBitQ-rf0 (query)                           1_292.92       386.08     1_678.99       0.4436     1.402695         3.46
+ExhaustiveRaBitQ-rf5 (query)                           1_292.92       464.12     1_757.03       0.8785     0.030801         3.46
+ExhaustiveRaBitQ-rf10 (query)                          1_292.92       527.20     1_820.11       0.9683     0.005703         3.46
+ExhaustiveRaBitQ-rf20 (query)                          1_292.92       636.27     1_929.19       0.9954     0.000689         3.46
+ExhaustiveRaBitQ (self)                                1_292.92     5_327.88     6_620.80       0.9697     0.005504         3.46
 --------------------------------------------------------------------------------------------------------------------------------
-IVF-RaBitQ-nl273-np13-rf0 (query)                        971.74       113.76     1_085.50       0.4624     1.393408         3.47
-IVF-RaBitQ-nl273-np16-rf0 (query)                        971.74       140.20     1_111.94       0.4620     1.393563         3.47
-IVF-RaBitQ-nl273-np23-rf0 (query)                        971.74       199.08     1_170.83       0.4619     1.393619         3.47
-IVF-RaBitQ-nl273-np13-rf5 (query)                        971.74       162.38     1_134.13       0.8931     0.028100         3.47
-IVF-RaBitQ-nl273-np13-rf10 (query)                       971.74       214.88     1_186.62       0.9745     0.004925         3.47
-IVF-RaBitQ-nl273-np13-rf20 (query)                       971.74       280.93     1_252.68       0.9968     0.000521         3.47
-IVF-RaBitQ-nl273-np16-rf5 (query)                        971.74       200.01     1_171.76       0.8928     0.028226         3.47
-IVF-RaBitQ-nl273-np16-rf10 (query)                       971.74       243.32     1_215.07       0.9744     0.004949         3.47
-IVF-RaBitQ-nl273-np16-rf20 (query)                       971.74       327.40     1_299.15       0.9969     0.000502         3.47
-IVF-RaBitQ-nl273-np23-rf5 (query)                        971.74       258.92     1_230.66       0.8926     0.028290         3.47
-IVF-RaBitQ-nl273-np23-rf10 (query)                       971.74       316.25     1_288.00       0.9743     0.004969         3.47
-IVF-RaBitQ-nl273-np23-rf20 (query)                       971.74       403.45     1_375.20       0.9969     0.000504         3.47
-IVF-RaBitQ-nl273 (self)                                  971.74     4_021.93     4_993.68       0.9973     0.000448         3.47
-IVF-RaBitQ-nl387-np19-rf0 (query)                      1_328.76       121.63     1_450.39       0.4729     1.382072         3.49
-IVF-RaBitQ-nl387-np27-rf0 (query)                      1_328.76       166.96     1_495.72       0.4728     1.382135         3.49
-IVF-RaBitQ-nl387-np19-rf5 (query)                      1_328.76       177.21     1_505.97       0.9030     0.024211         3.49
-IVF-RaBitQ-nl387-np19-rf10 (query)                     1_328.76       219.72     1_548.48       0.9778     0.004106         3.49
-IVF-RaBitQ-nl387-np19-rf20 (query)                     1_328.76       302.85     1_631.62       0.9976     0.000386         3.49
-IVF-RaBitQ-nl387-np27-rf5 (query)                      1_328.76       223.01     1_551.77       0.9028     0.024253         3.49
-IVF-RaBitQ-nl387-np27-rf10 (query)                     1_328.76       271.79     1_600.55       0.9778     0.004117         3.49
-IVF-RaBitQ-nl387-np27-rf20 (query)                     1_328.76       354.58     1_683.34       0.9976     0.000376         3.49
-IVF-RaBitQ-nl387 (self)                                1_328.76     3_540.53     4_869.29       0.9978     0.000345         3.49
-IVF-RaBitQ-nl547-np23-rf0 (query)                      1_838.34       115.14     1_953.49       0.4837     1.373041         3.51
-IVF-RaBitQ-nl547-np27-rf0 (query)                      1_838.34       134.00     1_972.34       0.4835     1.373146         3.51
-IVF-RaBitQ-nl547-np33-rf0 (query)                      1_838.34       153.87     1_992.22       0.4834     1.373185         3.51
-IVF-RaBitQ-nl547-np23-rf5 (query)                      1_838.34       165.83     2_004.18       0.9115     0.021036         3.51
-IVF-RaBitQ-nl547-np23-rf10 (query)                     1_838.34       206.67     2_045.01       0.9815     0.003284         3.51
-IVF-RaBitQ-nl547-np23-rf20 (query)                     1_838.34       279.61     2_117.95       0.9980     0.000305         3.51
-IVF-RaBitQ-nl547-np27-rf5 (query)                      1_838.34       192.25     2_030.59       0.9112     0.021118         3.51
-IVF-RaBitQ-nl547-np27-rf10 (query)                     1_838.34       227.42     2_065.76       0.9813     0.003309         3.51
-IVF-RaBitQ-nl547-np27-rf20 (query)                     1_838.34       309.88     2_148.23       0.9980     0.000300         3.51
-IVF-RaBitQ-nl547-np33-rf5 (query)                      1_838.34       213.54     2_051.89       0.9111     0.021140         3.51
-IVF-RaBitQ-nl547-np33-rf10 (query)                     1_838.34       257.56     2_095.91       0.9813     0.003314         3.51
-IVF-RaBitQ-nl547-np33-rf20 (query)                     1_838.34       335.90     2_174.25       0.9980     0.000294         3.51
-IVF-RaBitQ-nl547 (self)                                1_838.34     3_374.00     5_212.34       0.9982     0.000269         3.51
+IVF-RaBitQ-nl273-np13-rf0 (query)                        846.45       115.73       962.18       0.4623     1.393377         3.47
+IVF-RaBitQ-nl273-np16-rf0 (query)                        846.45       141.73       988.18       0.4621     1.393535         3.47
+IVF-RaBitQ-nl273-np23-rf0 (query)                        846.45       195.89     1_042.33       0.4619     1.393594         3.47
+IVF-RaBitQ-nl273-np13-rf5 (query)                        846.45       162.67     1_009.12       0.8930     0.027876         3.47
+IVF-RaBitQ-nl273-np13-rf10 (query)                       846.45       205.48     1_051.92       0.9748     0.004928         3.47
+IVF-RaBitQ-nl273-np13-rf20 (query)                       846.45       278.58     1_125.03       0.9967     0.000541         3.47
+IVF-RaBitQ-nl273-np16-rf5 (query)                        846.45       192.35     1_038.80       0.8928     0.027953         3.47
+IVF-RaBitQ-nl273-np16-rf10 (query)                       846.45       240.82     1_087.26       0.9747     0.004953         3.47
+IVF-RaBitQ-nl273-np16-rf20 (query)                       846.45       331.84     1_178.28       0.9967     0.000530         3.47
+IVF-RaBitQ-nl273-np23-rf5 (query)                        846.45       264.55     1_110.99       0.8926     0.028029         3.47
+IVF-RaBitQ-nl273-np23-rf10 (query)                       846.45       311.35     1_157.79       0.9746     0.004969         3.47
+IVF-RaBitQ-nl273-np23-rf20 (query)                       846.45       398.43     1_244.88       0.9967     0.000530         3.47
+IVF-RaBitQ-nl273 (self)                                  846.45     4_027.71     4_874.16       0.9972     0.000459         3.47
+--------------------------------------------------------------------------------------------------------------------------------
+IVF-RaBitQ-nl387-np19-rf0 (query)                      1_157.19       119.00     1_276.19       0.4728     1.382032         3.49
+IVF-RaBitQ-nl387-np27-rf0 (query)                      1_157.19       173.22     1_330.41       0.4727     1.382090         3.49
+IVF-RaBitQ-nl387-np19-rf5 (query)                      1_157.19       169.30     1_326.49       0.9029     0.024285         3.49
+IVF-RaBitQ-nl387-np19-rf10 (query)                     1_157.19       214.13     1_371.32       0.9780     0.004021         3.49
+IVF-RaBitQ-nl387-np19-rf20 (query)                     1_157.19       287.50     1_444.69       0.9976     0.000377         3.49
+IVF-RaBitQ-nl387-np27-rf5 (query)                      1_157.19       218.89     1_376.08       0.9027     0.024327         3.49
+IVF-RaBitQ-nl387-np27-rf10 (query)                     1_157.19       267.38     1_424.57       0.9779     0.004030         3.49
+IVF-RaBitQ-nl387-np27-rf20 (query)                     1_157.19       355.34     1_512.54       0.9976     0.000374         3.49
+IVF-RaBitQ-nl387 (self)                                1_157.19     3_487.56     4_644.75       0.9978     0.000353         3.49
+--------------------------------------------------------------------------------------------------------------------------------
+IVF-RaBitQ-nl547-np23-rf0 (query)                      1_603.63       110.34     1_713.98       0.4827     1.373328         3.51
+IVF-RaBitQ-nl547-np27-rf0 (query)                      1_603.63       136.30     1_739.93       0.4825     1.373426         3.51
+IVF-RaBitQ-nl547-np33-rf0 (query)                      1_603.63       151.77     1_755.40       0.4824     1.373469         3.51
+IVF-RaBitQ-nl547-np23-rf5 (query)                      1_603.63       160.44     1_764.07       0.9112     0.021537         3.51
+IVF-RaBitQ-nl547-np23-rf10 (query)                     1_603.63       200.50     1_804.14       0.9814     0.003302         3.51
+IVF-RaBitQ-nl547-np23-rf20 (query)                     1_603.63       280.61     1_884.25       0.9981     0.000292         3.51
+IVF-RaBitQ-nl547-np27-rf5 (query)                      1_603.63       176.07     1_779.70       0.9109     0.021633         3.51
+IVF-RaBitQ-nl547-np27-rf10 (query)                     1_603.63       222.11     1_825.75       0.9813     0.003336         3.51
+IVF-RaBitQ-nl547-np27-rf20 (query)                     1_603.63       295.77     1_899.40       0.9981     0.000296         3.51
+IVF-RaBitQ-nl547-np33-rf5 (query)                      1_603.63       211.85     1_815.48       0.9107     0.021672         3.51
+IVF-RaBitQ-nl547-np33-rf10 (query)                     1_603.63       248.39     1_852.02       0.9813     0.003336         3.51
+IVF-RaBitQ-nl547-np33-rf20 (query)                     1_603.63       329.01     1_932.64       0.9981     0.000292         3.51
+IVF-RaBitQ-nl547 (self)                                1_603.63     3_315.35     4_918.98       0.9982     0.000273         3.51
 --------------------------------------------------------------------------------------------------------------------------------
 </code></pre>
 </details>
@@ -1790,238 +2222,249 @@ IVF-RaBitQ-nl547 (self)                                1_838.34     3_374.00    
 ---
 
 <details>
-<summary><b>Binary - Euclidean (LowRank)</b>:</summary>
+<summary><b>RaBitQ - Euclidean (LowRank)</b>:</summary>
 <pre><code>
 ================================================================================================================================
 Benchmark: 150k cells, 32D - IVF-RaBitQ
 ================================================================================================================================
 Method                                               Build (ms)   Query (ms)   Total (ms)     Recall@k   Dist Error    Size (MB)
 --------------------------------------------------------------------------------------------------------------------------------
-Exhaustive (query)                                         3.06     1_664.46     1_667.52       1.0000     0.000000        18.31
-Exhaustive (self)                                          3.06    16_863.45    16_866.51       1.0000     0.000000        18.31
+Exhaustive (query)                                         3.13     1_524.26     1_527.39       1.0000     0.000000        18.31
+Exhaustive (self)                                          3.13    15_868.61    15_871.75       1.0000     0.000000        18.31
 --------------------------------------------------------------------------------------------------------------------------------
-ExhaustiveRaBitQ-rf0 (query)                           1_673.53       412.25     2_085.78       0.4782     7.158251         3.46
-ExhaustiveRaBitQ-rf5 (query)                           1_673.53       489.28     2_162.82       0.9142     0.089866         3.46
-ExhaustiveRaBitQ-rf10 (query)                          1_673.53       560.81     2_234.34       0.9836     0.012771         3.46
-ExhaustiveRaBitQ-rf20 (query)                          1_673.53       647.12     2_320.65       0.9985     0.001016         3.46
-ExhaustiveRaBitQ (self)                                1_673.53     5_467.32     7_140.85       0.9834     0.013139         3.46
+ExhaustiveRaBitQ-rf0 (query)                           1_284.40       407.44     1_691.84       0.4785     7.157863         3.46
+ExhaustiveRaBitQ-rf5 (query)                           1_284.40       485.15     1_769.55       0.9138     0.090004         3.46
+ExhaustiveRaBitQ-rf10 (query)                          1_284.40       539.03     1_823.43       0.9834     0.012928         3.46
+ExhaustiveRaBitQ-rf20 (query)                          1_284.40       653.86     1_938.26       0.9984     0.001130         3.46
+ExhaustiveRaBitQ (self)                                1_284.40     5_413.57     6_697.97       0.9836     0.012962         3.46
+IVF-RaBitQ-nl273-np13-rf0 (query)                        856.24       110.68       966.93       0.4889     7.133483         3.47
 --------------------------------------------------------------------------------------------------------------------------------
-IVF-RaBitQ-nl273-np13-rf0 (query)                        978.15       113.35     1_091.50       0.4887     7.133549         3.47
-IVF-RaBitQ-nl273-np16-rf0 (query)                        978.15       135.37     1_113.53       0.4887     7.133579         3.47
-IVF-RaBitQ-nl273-np23-rf0 (query)                        978.15       185.17     1_163.32       0.4887     7.133583         3.47
-IVF-RaBitQ-nl273-np13-rf5 (query)                        978.15       161.78     1_139.93       0.9216     0.078073         3.47
-IVF-RaBitQ-nl273-np13-rf10 (query)                       978.15       206.22     1_184.38       0.9858     0.010544         3.47
-IVF-RaBitQ-nl273-np13-rf20 (query)                       978.15       282.89     1_261.04       0.9988     0.000755         3.47
-IVF-RaBitQ-nl273-np16-rf5 (query)                        978.15       190.79     1_168.94       0.9216     0.078134         3.47
-IVF-RaBitQ-nl273-np16-rf10 (query)                       978.15       243.42     1_221.58       0.9857     0.010553         3.47
-IVF-RaBitQ-nl273-np16-rf20 (query)                       978.15       320.25     1_298.41       0.9988     0.000741         3.47
-IVF-RaBitQ-nl273-np23-rf5 (query)                        978.15       245.81     1_223.97       0.9216     0.078134         3.47
-IVF-RaBitQ-nl273-np23-rf10 (query)                       978.15       299.41     1_277.57       0.9857     0.010558         3.47
-IVF-RaBitQ-nl273-np23-rf20 (query)                       978.15       385.61     1_363.76       0.9988     0.000741         3.47
-IVF-RaBitQ-nl273 (self)                                  978.15     3_858.46     4_836.61       0.9988     0.000729         3.47
-IVF-RaBitQ-nl387-np19-rf0 (query)                      1_319.66       120.63     1_440.29       0.5004     7.112884         3.49
-IVF-RaBitQ-nl387-np27-rf0 (query)                      1_319.66       164.96     1_484.62       0.5004     7.112886         3.49
-IVF-RaBitQ-nl387-np19-rf5 (query)                      1_319.66       172.21     1_491.87       0.9290     0.068019         3.49
-IVF-RaBitQ-nl387-np19-rf10 (query)                     1_319.66       219.44     1_539.10       0.9875     0.009165         3.49
-IVF-RaBitQ-nl387-np19-rf20 (query)                     1_319.66       291.36     1_611.02       0.9992     0.000510         3.49
-IVF-RaBitQ-nl387-np27-rf5 (query)                      1_319.66       220.60     1_540.26       0.9289     0.068041         3.49
-IVF-RaBitQ-nl387-np27-rf10 (query)                     1_319.66       269.59     1_589.25       0.9874     0.009171         3.49
-IVF-RaBitQ-nl387-np27-rf20 (query)                     1_319.66       350.38     1_670.04       0.9992     0.000510         3.49
-IVF-RaBitQ-nl387 (self)                                1_319.66     3_498.15     4_817.81       0.9991     0.000580         3.49
-IVF-RaBitQ-nl547-np23-rf0 (query)                      1_837.86       117.55     1_955.40       0.5107     7.089671         3.51
-IVF-RaBitQ-nl547-np27-rf0 (query)                      1_837.86       130.64     1_968.50       0.5107     7.089685         3.51
-IVF-RaBitQ-nl547-np33-rf0 (query)                      1_837.86       153.57     1_991.43       0.5107     7.089688         3.51
-IVF-RaBitQ-nl547-np23-rf5 (query)                      1_837.86       163.87     2_001.72       0.9363     0.058700         3.51
-IVF-RaBitQ-nl547-np23-rf10 (query)                     1_837.86       206.57     2_044.43       0.9896     0.007452         3.51
-IVF-RaBitQ-nl547-np23-rf20 (query)                     1_837.86       278.10     2_115.96       0.9994     0.000388         3.51
-IVF-RaBitQ-nl547-np27-rf5 (query)                      1_837.86       181.28     2_019.13       0.9362     0.058742         3.51
-IVF-RaBitQ-nl547-np27-rf10 (query)                     1_837.86       226.48     2_064.33       0.9895     0.007453         3.51
-IVF-RaBitQ-nl547-np27-rf20 (query)                     1_837.86       320.32     2_158.18       0.9994     0.000393         3.51
-IVF-RaBitQ-nl547-np33-rf5 (query)                      1_837.86       208.50     2_046.36       0.9362     0.058742         3.51
-IVF-RaBitQ-nl547-np33-rf10 (query)                     1_837.86       261.89     2_099.75       0.9895     0.007453         3.51
-IVF-RaBitQ-nl547-np33-rf20 (query)                     1_837.86       332.79     2_170.64       0.9994     0.000393         3.51
-IVF-RaBitQ-nl547 (self)                                1_837.86     3_317.85     5_155.70       0.9993     0.000388         3.51
+IVF-RaBitQ-nl273-np16-rf0 (query)                        856.24       135.93       992.17       0.4888     7.133529         3.47
+IVF-RaBitQ-nl273-np23-rf0 (query)                        856.24       184.83     1_041.08       0.4888     7.133535         3.47
+IVF-RaBitQ-nl273-np13-rf5 (query)                        856.24       160.19     1_016.43       0.9213     0.078670         3.47
+IVF-RaBitQ-nl273-np13-rf10 (query)                       856.24       203.55     1_059.80       0.9859     0.010581         3.47
+IVF-RaBitQ-nl273-np13-rf20 (query)                       856.24       275.45     1_131.69       0.9988     0.000820         3.47
+IVF-RaBitQ-nl273-np16-rf5 (query)                        856.24       204.06     1_060.30       0.9212     0.078723         3.47
+IVF-RaBitQ-nl273-np16-rf10 (query)                       856.24       238.27     1_094.51       0.9859     0.010572         3.47
+IVF-RaBitQ-nl273-np16-rf20 (query)                       856.24       317.09     1_173.33       0.9988     0.000807         3.47
+IVF-RaBitQ-nl273-np23-rf5 (query)                        856.24       241.09     1_097.33       0.9212     0.078726         3.47
+IVF-RaBitQ-nl273-np23-rf10 (query)                       856.24       295.63     1_151.87       0.9859     0.010574         3.47
+IVF-RaBitQ-nl273-np23-rf20 (query)                       856.24       380.79     1_237.03       0.9988     0.000807         3.47
+IVF-RaBitQ-nl273 (self)                                  856.24     3_820.57     4_676.81       0.9989     0.000730         3.47
+--------------------------------------------------------------------------------------------------------------------------------
+IVF-RaBitQ-nl387-np19-rf0 (query)                      1_154.29       117.93     1_272.22       0.5001     7.113013         3.49
+IVF-RaBitQ-nl387-np27-rf0 (query)                      1_154.29       162.18     1_316.47       0.5001     7.113015         3.49
+IVF-RaBitQ-nl387-np19-rf5 (query)                      1_154.29       169.20     1_323.49       0.9291     0.067027         3.49
+IVF-RaBitQ-nl387-np19-rf10 (query)                     1_154.29       213.01     1_367.30       0.9875     0.009238         3.49
+IVF-RaBitQ-nl387-np19-rf20 (query)                     1_154.29       286.25     1_440.54       0.9992     0.000493         3.49
+IVF-RaBitQ-nl387-np27-rf5 (query)                      1_154.29       217.15     1_371.44       0.9291     0.067041         3.49
+IVF-RaBitQ-nl387-np27-rf10 (query)                     1_154.29       263.42     1_417.70       0.9875     0.009244         3.49
+IVF-RaBitQ-nl387-np27-rf20 (query)                     1_154.29       354.78     1_509.07       0.9992     0.000493         3.49
+IVF-RaBitQ-nl387 (self)                                1_154.29     3_428.05     4_582.34       0.9991     0.000590         3.49
+--------------------------------------------------------------------------------------------------------------------------------
+IVF-RaBitQ-nl547-np23-rf0 (query)                      1_586.38       110.42     1_696.80       0.5119     7.089816         3.51
+IVF-RaBitQ-nl547-np27-rf0 (query)                      1_586.38       127.13     1_713.51       0.5119     7.089833         3.51
+IVF-RaBitQ-nl547-np33-rf0 (query)                      1_586.38       161.08     1_747.46       0.5119     7.089837         3.51
+IVF-RaBitQ-nl547-np23-rf5 (query)                      1_586.38       170.28     1_756.66       0.9356     0.059028         3.51
+IVF-RaBitQ-nl547-np23-rf10 (query)                     1_586.38       202.04     1_788.42       0.9895     0.007504         3.51
+IVF-RaBitQ-nl547-np23-rf20 (query)                     1_586.38       275.96     1_862.33       0.9993     0.000410         3.51
+IVF-RaBitQ-nl547-np27-rf5 (query)                      1_586.38       176.08     1_762.46       0.9355     0.059066         3.51
+IVF-RaBitQ-nl547-np27-rf10 (query)                     1_586.38       221.30     1_807.68       0.9895     0.007519         3.51
+IVF-RaBitQ-nl547-np27-rf20 (query)                     1_586.38       293.97     1_880.35       0.9993     0.000415         3.51
+IVF-RaBitQ-nl547-np33-rf5 (query)                      1_586.38       204.16     1_790.54       0.9355     0.059062         3.51
+IVF-RaBitQ-nl547-np33-rf10 (query)                     1_586.38       252.53     1_838.91       0.9895     0.007516         3.51
+IVF-RaBitQ-nl547-np33-rf20 (query)                     1_586.38       328.12     1_914.49       0.9993     0.000412         3.51
+IVF-RaBitQ-nl547 (self)                                1_586.38     3_258.39     4_844.77       0.9993     0.000391         3.51
 --------------------------------------------------------------------------------------------------------------------------------
 </code></pre>
 </details>
 
-#### With higher dimensionality
+#### With more dimensions
 
-RaBitQ particularly shines with higher dimensionality in the data.
+RaBitQ particularly shines with higher dimensionality in the data. The
+interesting property of RaBitQ is that its own query mechanism becomes
+better and better, the higher the dimensionality of the data.
 
 <details>
-<summary><b>RaBitQ - Euclidean (Gaussian - more dimensions)</b>:</summary>
+<summary><b>RaBitQ - Euclidean (LowRank - 128 dimensions)</b>:</summary>
+</br>
 <pre><code>
 ================================================================================================================================
 Benchmark: 150k cells, 128D - IVF-RaBitQ
 ================================================================================================================================
 Method                                               Build (ms)   Query (ms)   Total (ms)     Recall@k   Dist Error    Size (MB)
 --------------------------------------------------------------------------------------------------------------------------------
-Exhaustive (query)                                        14.19     6_118.83     6_133.01       1.0000     0.000000        73.24
-Exhaustive (self)                                         14.19    69_404.57    69_418.76       1.0000     0.000000        73.24
+Exhaustive (query)                                        14.03     5_894.30     5_908.33       1.0000     0.000000        73.24
+Exhaustive (self)                                         14.03    59_997.84    60_011.87       1.0000     0.000000        73.24
 --------------------------------------------------------------------------------------------------------------------------------
-ExhaustiveRaBitQ-rf0 (query)                           5_300.49       999.33     6_299.82       0.3639   349.112289         5.31
-ExhaustiveRaBitQ-rf5 (query)                           5_300.49     1_099.73     6_400.23       0.7183     3.897594         5.31
-ExhaustiveRaBitQ-rf10 (query)                          5_300.49     1_261.72     6_562.21       0.8545     1.514929         5.31
-ExhaustiveRaBitQ-rf20 (query)                          5_300.49     1_292.67     6_593.16       0.9452     0.461817         5.31
-ExhaustiveRaBitQ (self)                                5_300.49    11_416.41    16_716.90       0.8556     1.514067         5.31
+ExhaustiveRaBitQ-rf0 (query)                           2_793.51       856.46     3_649.97       0.7023    73.762204         5.31
+ExhaustiveRaBitQ-rf5 (query)                           2_793.51       930.40     3_723.90       0.9950     0.019100         5.31
+ExhaustiveRaBitQ-rf10 (query)                          2_793.51     1_005.24     3_798.75       0.9999     0.000396         5.31
+ExhaustiveRaBitQ-rf20 (query)                          2_793.51     1_125.41     3_918.92       1.0000     0.000000         5.31
+ExhaustiveRaBitQ (self)                                2_793.51    10_052.31    12_845.82       0.9999     0.000444         5.31
 --------------------------------------------------------------------------------------------------------------------------------
-IVF-RaBitQ-nl273-np13-rf0 (query)                      3_419.99       273.40     3_693.39       0.3589   349.079531         5.35
-IVF-RaBitQ-nl273-np16-rf0 (query)                      3_419.99       326.43     3_746.43       0.3616   349.097123         5.35
-IVF-RaBitQ-nl273-np23-rf0 (query)                      3_419.99       449.03     3_869.03       0.3629   349.109287         5.35
-IVF-RaBitQ-nl273-np13-rf5 (query)                      3_419.99       333.68     3_753.67       0.6970     4.355675         5.35
-IVF-RaBitQ-nl273-np13-rf10 (query)                     3_419.99       393.06     3_813.05       0.8213     2.049424         5.35
-IVF-RaBitQ-nl273-np13-rf20 (query)                     3_419.99       506.10     3_926.10       0.8983     1.070961         5.35
-IVF-RaBitQ-nl273-np16-rf5 (query)                      3_419.99       428.72     3_848.71       0.7108     4.051565         5.35
-IVF-RaBitQ-nl273-np16-rf10 (query)                     3_419.99       476.62     3_896.61       0.8427     1.695339         5.35
-IVF-RaBitQ-nl273-np16-rf20 (query)                     3_419.99       680.58     4_100.58       0.9271     0.681385         5.35
-IVF-RaBitQ-nl273-np23-rf5 (query)                      3_419.99       547.13     3_967.13       0.7189     3.877703         5.35
-IVF-RaBitQ-nl273-np23-rf10 (query)                     3_419.99       593.92     4_013.92       0.8557     1.498582         5.35
-IVF-RaBitQ-nl273-np23-rf20 (query)                     3_419.99       773.59     4_193.58       0.9453     0.462298         5.35
-IVF-RaBitQ-nl273 (self)                                3_419.99     7_345.25    10_765.25       0.9460     0.461372         5.35
-IVF-RaBitQ-nl387-np19-rf0 (query)                      4_552.30       313.21     4_865.51       0.3614   349.087561         5.41
-IVF-RaBitQ-nl387-np27-rf0 (query)                      4_552.30       483.79     5_036.09       0.3638   349.107939         5.41
-IVF-RaBitQ-nl387-np19-rf5 (query)                      4_552.30       449.10     5_001.40       0.7069     4.172279         5.41
-IVF-RaBitQ-nl387-np19-rf10 (query)                     4_552.30       500.96     5_053.26       0.8332     1.888360         5.41
-IVF-RaBitQ-nl387-np19-rf20 (query)                     4_552.30       556.62     5_108.93       0.9146     0.882773         5.41
-IVF-RaBitQ-nl387-np27-rf5 (query)                      4_552.30       481.68     5_033.98       0.7208     3.855511         5.41
-IVF-RaBitQ-nl387-np27-rf10 (query)                     4_552.30       549.28     5_101.58       0.8551     1.518584         5.41
-IVF-RaBitQ-nl387-np27-rf20 (query)                     4_552.30       658.49     5_210.79       0.9449     0.470040         5.41
-IVF-RaBitQ-nl387 (self)                                4_552.30     7_716.52    12_268.82       0.9440     0.495864         5.41
-IVF-RaBitQ-nl547-np23-rf0 (query)                      6_288.84       360.51     6_649.36       0.3606   349.077719         5.49
-IVF-RaBitQ-nl547-np27-rf0 (query)                      6_288.84       415.89     6_704.73       0.3624   349.092489         5.49
-IVF-RaBitQ-nl547-np33-rf0 (query)                      6_288.84       447.46     6_736.30       0.3640   349.103934         5.49
-IVF-RaBitQ-nl547-np23-rf5 (query)                      6_288.84       437.28     6_726.12       0.7003     4.298619         5.49
-IVF-RaBitQ-nl547-np23-rf10 (query)                     6_288.84       466.66     6_755.51       0.8238     2.019129         5.49
-IVF-RaBitQ-nl547-np23-rf20 (query)                     6_288.84       566.36     6_855.20       0.9017     1.026178         5.49
-IVF-RaBitQ-nl547-np27-rf5 (query)                      6_288.84       448.87     6_737.71       0.7108     4.043362         5.49
-IVF-RaBitQ-nl547-np27-rf10 (query)                     6_288.84       503.23     6_792.07       0.8402     1.724642         5.49
-IVF-RaBitQ-nl547-np27-rf20 (query)                     6_288.84       618.33     6_907.17       0.9242     0.706346         5.49
-IVF-RaBitQ-nl547-np33-rf5 (query)                      6_288.84       504.92     6_793.76       0.7185     3.898642         5.49
-IVF-RaBitQ-nl547-np33-rf10 (query)                     6_288.84       562.91     6_851.75       0.8526     1.550835         5.49
-IVF-RaBitQ-nl547-np33-rf20 (query)                     6_288.84       672.18     6_961.02       0.9419     0.506257         5.49
-IVF-RaBitQ-nl547 (self)                                6_288.84     6_880.57    13_169.42       0.9415     0.506658         5.49
+IVF-RaBitQ-nl273-np13-rf0 (query)                      1_090.96       248.59     1_339.56       0.7067    73.750627         5.35
+IVF-RaBitQ-nl273-np16-rf0 (query)                      1_090.96       287.71     1_378.68       0.7067    73.750827         5.35
+IVF-RaBitQ-nl273-np23-rf0 (query)                      1_090.96       399.89     1_490.86       0.7067    73.750840         5.35
+IVF-RaBitQ-nl273-np13-rf5 (query)                      1_090.96       307.08     1_398.04       0.9953     0.016873         5.35
+IVF-RaBitQ-nl273-np13-rf10 (query)                     1_090.96       345.75     1_436.71       0.9996     0.002258         5.35
+IVF-RaBitQ-nl273-np13-rf20 (query)                     1_090.96       436.94     1_527.91       0.9997     0.002042         5.35
+IVF-RaBitQ-nl273-np16-rf5 (query)                      1_090.96       349.37     1_440.33       0.9956     0.014900         5.35
+IVF-RaBitQ-nl273-np16-rf10 (query)                     1_090.96       408.08     1_499.05       0.9999     0.000269         5.35
+IVF-RaBitQ-nl273-np16-rf20 (query)                     1_090.96       502.80     1_593.77       1.0000     0.000053         5.35
+IVF-RaBitQ-nl273-np23-rf5 (query)                      1_090.96       460.72     1_551.69       0.9956     0.014855         5.35
+IVF-RaBitQ-nl273-np23-rf10 (query)                     1_090.96       521.67     1_612.63       0.9999     0.000216         5.35
+IVF-RaBitQ-nl273-np23-rf20 (query)                     1_090.96       621.94     1_712.90       1.0000     0.000000         5.35
+IVF-RaBitQ-nl273 (self)                                1_090.96     6_218.64     7_309.61       1.0000     0.000000         5.35
 --------------------------------------------------------------------------------------------------------------------------------
-</code></pre>
-</details>
-
----
-
-<details>
-<summary><b>RaBitQ - Euclidean (Correlated - more dimensions)</b>:</summary>
-<pre><code>
-================================================================================================================================
-Benchmark: 150k cells, 128D - IVF-RaBitQ
-================================================================================================================================
-Method                                               Build (ms)   Query (ms)   Total (ms)     Recall@k   Dist Error    Size (MB)
+IVF-RaBitQ-nl387-np19-rf0 (query)                      1_443.14       280.76     1_723.90       0.7134    73.741226         5.41
+IVF-RaBitQ-nl387-np27-rf0 (query)                      1_443.14       375.00     1_818.14       0.7133    73.741243         5.41
+IVF-RaBitQ-nl387-np19-rf5 (query)                      1_443.14       337.61     1_780.75       0.9960     0.013943         5.41
+IVF-RaBitQ-nl387-np19-rf10 (query)                     1_443.14       393.88     1_837.01       0.9999     0.000359         5.41
+IVF-RaBitQ-nl387-np19-rf20 (query)                     1_443.14       484.98     1_928.12       1.0000     0.000192         5.41
+IVF-RaBitQ-nl387-np27-rf5 (query)                      1_443.14       441.40     1_884.54       0.9961     0.013746         5.41
+IVF-RaBitQ-nl387-np27-rf10 (query)                     1_443.14       497.75     1_940.89       0.9999     0.000167         5.41
+IVF-RaBitQ-nl387-np27-rf20 (query)                     1_443.14       594.96     2_038.10       1.0000     0.000000         5.41
+IVF-RaBitQ-nl387 (self)                                1_443.14     5_906.09     7_349.23       1.0000     0.000004         5.41
 --------------------------------------------------------------------------------------------------------------------------------
-Exhaustive (query)                                        15.07     7_213.49     7_228.56       1.0000     0.000000        73.24
-Exhaustive (self)                                         15.07    69_382.77    69_397.84       1.0000     0.000000        73.24
---------------------------------------------------------------------------------------------------------------------------------
-ExhaustiveRaBitQ-rf0 (query)                           5_351.05       924.57     6_275.62       0.5388    88.769533         5.31
-ExhaustiveRaBitQ-rf5 (query)                           5_351.05       997.24     6_348.29       0.9253     0.242421         5.31
-ExhaustiveRaBitQ-rf10 (query)                          5_351.05     1_055.35     6_406.40       0.9836     0.038503         5.31
-ExhaustiveRaBitQ-rf20 (query)                          5_351.05     1_184.38     6_535.43       0.9982     0.003158         5.31
-ExhaustiveRaBitQ (self)                                5_351.05    10_548.49    15_899.54       0.9837     0.038445         5.31
---------------------------------------------------------------------------------------------------------------------------------
-IVF-RaBitQ-nl273-np13-rf0 (query)                      3_245.08       274.18     3_519.26       0.5446    88.760310         5.35
-IVF-RaBitQ-nl273-np16-rf0 (query)                      3_245.08       323.17     3_568.25       0.5445    88.762307         5.35
-IVF-RaBitQ-nl273-np23-rf0 (query)                      3_245.08       443.97     3_689.04       0.5444    88.763081         5.35
-IVF-RaBitQ-nl273-np13-rf5 (query)                      3_245.08       333.54     3_578.62       0.9268     0.257748         5.35
-IVF-RaBitQ-nl273-np13-rf10 (query)                     3_245.08       383.01     3_628.09       0.9796     0.062082         5.35
-IVF-RaBitQ-nl273-np13-rf20 (query)                     3_245.08       482.70     3_727.77       0.9921     0.028068         5.35
-IVF-RaBitQ-nl273-np16-rf5 (query)                      3_245.08       397.25     3_642.32       0.9294     0.243259         5.35
-IVF-RaBitQ-nl273-np16-rf10 (query)                     3_245.08       439.16     3_684.23       0.9838     0.044760         5.35
-IVF-RaBitQ-nl273-np16-rf20 (query)                     3_245.08       538.05     3_783.12       0.9969     0.009793         5.35
-IVF-RaBitQ-nl273-np23-rf5 (query)                      3_245.08       516.42     3_761.49       0.9301     0.238085         5.35
-IVF-RaBitQ-nl273-np23-rf10 (query)                     3_245.08       573.95     3_819.03       0.9850     0.038312         5.35
-IVF-RaBitQ-nl273-np23-rf20 (query)                     3_245.08       679.92     3_924.99       0.9984     0.003068         5.35
-IVF-RaBitQ-nl273 (self)                                3_245.08     6_802.99    10_048.06       0.9985     0.002875         5.35
-IVF-RaBitQ-nl387-np19-rf0 (query)                      4_336.23       314.74     4_650.97       0.5474    88.755538         5.41
-IVF-RaBitQ-nl387-np27-rf0 (query)                      4_336.23       423.60     4_759.83       0.5471    88.757297         5.41
-IVF-RaBitQ-nl387-np19-rf5 (query)                      4_336.23       372.51     4_708.74       0.9301     0.240722         5.41
-IVF-RaBitQ-nl387-np19-rf10 (query)                     4_336.23       424.12     4_760.35       0.9826     0.049320         5.41
-IVF-RaBitQ-nl387-np19-rf20 (query)                     4_336.23       517.51     4_853.74       0.9944     0.017985         5.41
-IVF-RaBitQ-nl387-np27-rf5 (query)                      4_336.23       486.38     4_822.61       0.9320     0.229739         5.41
-IVF-RaBitQ-nl387-np27-rf10 (query)                     4_336.23       541.79     4_878.02       0.9859     0.035760         5.41
-IVF-RaBitQ-nl387-np27-rf20 (query)                     4_336.23       642.73     4_978.96       0.9985     0.003076         5.41
-IVF-RaBitQ-nl387 (self)                                4_336.23     6_438.07    10_774.30       0.9985     0.003013         5.41
-IVF-RaBitQ-nl547-np23-rf0 (query)                      5_921.62       324.11     6_245.73       0.5509    88.748225         5.49
-IVF-RaBitQ-nl547-np27-rf0 (query)                      5_921.62       366.63     6_288.25       0.5509    88.750112         5.49
-IVF-RaBitQ-nl547-np33-rf0 (query)                      5_921.62       431.74     6_353.36       0.5508    88.751159         5.49
-IVF-RaBitQ-nl547-np23-rf5 (query)                      5_921.62       380.09     6_301.71       0.9305     0.234073         5.49
-IVF-RaBitQ-nl547-np23-rf10 (query)                     5_921.62       427.99     6_349.61       0.9807     0.054097         5.49
-IVF-RaBitQ-nl547-np23-rf20 (query)                     5_921.62       521.11     6_442.73       0.9917     0.025312         5.49
-IVF-RaBitQ-nl547-np27-rf5 (query)                      5_921.62       420.34     6_341.97       0.9331     0.221993         5.49
-IVF-RaBitQ-nl547-np27-rf10 (query)                     5_921.62       474.78     6_396.40       0.9845     0.039788         5.49
-IVF-RaBitQ-nl547-np27-rf20 (query)                     5_921.62       570.93     6_492.55       0.9961     0.010073         5.49
-IVF-RaBitQ-nl547-np33-rf5 (query)                      5_921.62       486.66     6_408.28       0.9342     0.216583         5.49
-IVF-RaBitQ-nl547-np33-rf10 (query)                     5_921.62       542.90     6_464.52       0.9864     0.033124         5.49
-IVF-RaBitQ-nl547-np33-rf20 (query)                     5_921.62       641.44     6_563.06       0.9985     0.002691         5.49
-IVF-RaBitQ-nl547 (self)                                5_921.62     6_395.71    12_317.34       0.9983     0.003533         5.49
+IVF-RaBitQ-nl547-np23-rf0 (query)                      1_917.53       271.86     2_189.38       0.7169    73.731426         5.49
+IVF-RaBitQ-nl547-np27-rf0 (query)                      1_917.53       316.42     2_233.95       0.7169    73.731517         5.49
+IVF-RaBitQ-nl547-np33-rf0 (query)                      1_917.53       401.25     2_318.78       0.7169    73.731534         5.49
+IVF-RaBitQ-nl547-np23-rf5 (query)                      1_917.53       355.42     2_272.94       0.9962     0.012944         5.49
+IVF-RaBitQ-nl547-np23-rf10 (query)                     1_917.53       376.81     2_294.34       0.9998     0.000864         5.49
+IVF-RaBitQ-nl547-np23-rf20 (query)                     1_917.53       465.34     2_382.87       0.9999     0.000586         5.49
+IVF-RaBitQ-nl547-np27-rf5 (query)                      1_917.53       368.37     2_285.89       0.9963     0.012548         5.49
+IVF-RaBitQ-nl547-np27-rf10 (query)                     1_917.53       421.00     2_338.53       0.9999     0.000390         5.49
+IVF-RaBitQ-nl547-np27-rf20 (query)                     1_917.53       528.32     2_445.84       1.0000     0.000112         5.49
+IVF-RaBitQ-nl547-np33-rf5 (query)                      1_917.53       431.89     2_349.41       0.9964     0.012439         5.49
+IVF-RaBitQ-nl547-np33-rf10 (query)                     1_917.53       487.44     2_404.96       0.9999     0.000281         5.49
+IVF-RaBitQ-nl547-np33-rf20 (query)                     1_917.53       583.00     2_500.53       1.0000     0.000003         5.49
+IVF-RaBitQ-nl547 (self)                                1_917.53     5_786.43     7_703.96       1.0000     0.000002         5.49
 --------------------------------------------------------------------------------------------------------------------------------
 </code></pre>
 </details>
 
----
 
 <details>
-<summary><b>RaBitQ - Euclidean (LowRank - more dimensions)</b>:</summary>
+<summary><b>RaBitQ - Euclidean (LowRank - 256 dimensions)</b>:</summary>
+</br>
 <pre><code>
 ================================================================================================================================
-Benchmark: 150k cells, 128D - IVF-RaBitQ
+Benchmark: 150k cells, 256D - IVF-RaBitQ
 ================================================================================================================================
 Method                                               Build (ms)   Query (ms)   Total (ms)     Recall@k   Dist Error    Size (MB)
 --------------------------------------------------------------------------------------------------------------------------------
-Exhaustive (query)                                        14.79     6_380.16     6_394.95       1.0000     0.000000        73.24
-Exhaustive (self)                                         14.79    64_528.65    64_543.44       1.0000     0.000000        73.24
+Exhaustive (query)                                        28.81    14_896.25    14_925.06       1.0000     0.000000       146.48
+Exhaustive (self)                                         28.81   150_809.13   150_837.94       1.0000     0.000000       146.48
 --------------------------------------------------------------------------------------------------------------------------------
-ExhaustiveRaBitQ-rf0 (query)                           5_116.58       898.26     6_014.84       0.7024    73.760101         5.31
-ExhaustiveRaBitQ-rf5 (query)                           5_116.58       978.58     6_095.16       0.9952     0.017331         5.31
-ExhaustiveRaBitQ-rf10 (query)                          5_116.58     1_068.81     6_185.40       0.9999     0.000453         5.31
-ExhaustiveRaBitQ-rf20 (query)                          5_116.58     1_175.04     6_291.62       1.0000     0.000000         5.31
-ExhaustiveRaBitQ (self)                                5_116.58    10_306.07    15_422.65       0.9999     0.000420         5.31
+ExhaustiveRaBitQ-rf0 (query)                           6_779.01     1_820.35     8_599.35       0.7812   172.768307         7.88
+ExhaustiveRaBitQ-rf5 (query)                           6_779.01     1_911.38     8_690.38       0.9995     0.002595         7.88
+ExhaustiveRaBitQ-rf10 (query)                          6_779.01     1_975.61     8_754.62       1.0000     0.000000         7.88
+ExhaustiveRaBitQ-rf20 (query)                          6_779.01     2_128.76     8_907.77       1.0000     0.000000         7.88
+ExhaustiveRaBitQ (self)                                6_779.01    19_753.59    26_532.59       1.0000     0.000002         7.88
 --------------------------------------------------------------------------------------------------------------------------------
-IVF-RaBitQ-nl273-np13-rf0 (query)                      3_261.52       263.67     3_525.19       0.7066    73.750602         5.35
-IVF-RaBitQ-nl273-np16-rf0 (query)                      3_261.52       313.63     3_575.15       0.7066    73.750778         5.35
-IVF-RaBitQ-nl273-np23-rf0 (query)                      3_261.52       437.52     3_699.04       0.7066    73.750784         5.35
-IVF-RaBitQ-nl273-np13-rf5 (query)                      3_261.52       331.32     3_592.84       0.9954     0.017287         5.35
-IVF-RaBitQ-nl273-np13-rf10 (query)                     3_261.52       374.16     3_635.68       0.9996     0.002368         5.35
-IVF-RaBitQ-nl273-np13-rf20 (query)                     3_261.52       466.58     3_728.10       0.9997     0.002034         5.35
-IVF-RaBitQ-nl273-np16-rf5 (query)                      3_261.52       372.96     3_634.48       0.9956     0.015465         5.35
-IVF-RaBitQ-nl273-np16-rf10 (query)                     3_261.52       431.17     3_692.69       0.9999     0.000515         5.35
-IVF-RaBitQ-nl273-np16-rf20 (query)                     3_261.52       539.32     3_800.84       1.0000     0.000182         5.35
-IVF-RaBitQ-nl273-np23-rf5 (query)                      3_261.52       484.98     3_746.50       0.9956     0.015283         5.35
-IVF-RaBitQ-nl273-np23-rf10 (query)                     3_261.52       545.22     3_806.74       0.9999     0.000333         5.35
-IVF-RaBitQ-nl273-np23-rf20 (query)                     3_261.52       650.61     3_912.13       1.0000     0.000000         5.35
-IVF-RaBitQ-nl273 (self)                                3_261.52     6_457.20     9_718.72       1.0000     0.000001         5.35
-IVF-RaBitQ-nl387-np19-rf0 (query)                      4_368.28       307.46     4_675.74       0.7122    73.742352         5.41
-IVF-RaBitQ-nl387-np27-rf0 (query)                      4_368.28       409.26     4_777.54       0.7122    73.742373         5.41
-IVF-RaBitQ-nl387-np19-rf5 (query)                      4_368.28       366.35     4_734.63       0.9959     0.014264         5.41
-IVF-RaBitQ-nl387-np19-rf10 (query)                     4_368.28       417.35     4_785.63       0.9999     0.000347         5.41
-IVF-RaBitQ-nl387-np19-rf20 (query)                     4_368.28       509.61     4_877.90       1.0000     0.000111         5.41
-IVF-RaBitQ-nl387-np27-rf5 (query)                      4_368.28       467.55     4_835.83       0.9959     0.014164         5.41
-IVF-RaBitQ-nl387-np27-rf10 (query)                     4_368.28       524.69     4_892.98       0.9999     0.000236         5.41
-IVF-RaBitQ-nl387-np27-rf20 (query)                     4_368.28       625.25     4_993.53       1.0000     0.000000         5.41
-IVF-RaBitQ-nl387 (self)                                4_368.28     6_190.39    10_558.67       1.0000     0.000004         5.41
-IVF-RaBitQ-nl547-np23-rf0 (query)                      5_939.23       319.57     6_258.80       0.7163    73.731249         5.49
-IVF-RaBitQ-nl547-np27-rf0 (query)                      5_939.23       361.85     6_301.08       0.7162    73.731338         5.49
-IVF-RaBitQ-nl547-np33-rf0 (query)                      5_939.23       423.12     6_362.35       0.7162    73.731350         5.49
-IVF-RaBitQ-nl547-np23-rf5 (query)                      5_939.23       376.22     6_315.45       0.9962     0.013968         5.49
-IVF-RaBitQ-nl547-np23-rf10 (query)                     5_939.23       425.83     6_365.07       0.9998     0.000954         5.49
-IVF-RaBitQ-nl547-np23-rf20 (query)                     5_939.23       546.03     6_485.26       0.9999     0.000615         5.49
-IVF-RaBitQ-nl547-np27-rf5 (query)                      5_939.23       417.21     6_356.44       0.9963     0.013478         5.49
-IVF-RaBitQ-nl547-np27-rf10 (query)                     5_939.23       470.33     6_409.57       0.9999     0.000400         5.49
-IVF-RaBitQ-nl547-np27-rf20 (query)                     5_939.23       569.91     6_509.14       1.0000     0.000062         5.49
-IVF-RaBitQ-nl547-np33-rf5 (query)                      5_939.23       480.26     6_419.49       0.9963     0.013416         5.49
-IVF-RaBitQ-nl547-np33-rf10 (query)                     5_939.23       537.11     6_476.34       0.9999     0.000339         5.49
-IVF-RaBitQ-nl547-np33-rf20 (query)                     5_939.23       628.76     6_567.99       1.0000     0.000000         5.49
-IVF-RaBitQ-nl547 (self)                                5_939.23     6_539.54    12_478.77       1.0000     0.000001         5.49
+IVF-RaBitQ-nl273-np13-rf0 (query)                      2_884.30       537.36     3_421.66       0.7838   172.759184         7.96
+IVF-RaBitQ-nl273-np16-rf0 (query)                      2_884.30       657.38     3_541.68       0.7839   172.759408         7.96
+IVF-RaBitQ-nl273-np23-rf0 (query)                      2_884.30       912.78     3_797.07       0.7839   172.759416         7.96
+IVF-RaBitQ-nl273-np13-rf5 (query)                      2_884.30       602.08     3_486.38       0.9994     0.005565         7.96
+IVF-RaBitQ-nl273-np13-rf10 (query)                     2_884.30       656.60     3_540.90       0.9997     0.004006         7.96
+IVF-RaBitQ-nl273-np13-rf20 (query)                     2_884.30       775.56     3_659.86       0.9997     0.004006         7.96
+IVF-RaBitQ-nl273-np16-rf5 (query)                      2_884.30       716.37     3_600.67       0.9997     0.001772         7.96
+IVF-RaBitQ-nl273-np16-rf10 (query)                     2_884.30       784.13     3_668.42       1.0000     0.000213         7.96
+IVF-RaBitQ-nl273-np16-rf20 (query)                     2_884.30       894.45     3_778.74       1.0000     0.000213         7.96
+IVF-RaBitQ-nl273-np23-rf5 (query)                      2_884.30       993.49     3_877.79       0.9997     0.001559         7.96
+IVF-RaBitQ-nl273-np23-rf10 (query)                     2_884.30     1_132.97     4_017.26       1.0000     0.000000         7.96
+IVF-RaBitQ-nl273-np23-rf20 (query)                     2_884.30     1_166.69     4_050.98       1.0000     0.000000         7.96
+IVF-RaBitQ-nl273 (self)                                2_884.30    11_656.62    14_540.92       1.0000     0.000000         7.96
+--------------------------------------------------------------------------------------------------------------------------------
+IVF-RaBitQ-nl387-np19-rf0 (query)                      3_315.64       662.77     3_978.41       0.7874   172.749734         8.07
+IVF-RaBitQ-nl387-np27-rf0 (query)                      3_315.64       927.71     4_243.35       0.7874   172.749752         8.07
+IVF-RaBitQ-nl387-np19-rf5 (query)                      3_315.64       732.28     4_047.92       0.9996     0.002304         8.07
+IVF-RaBitQ-nl387-np19-rf10 (query)                     3_315.64       791.88     4_107.53       1.0000     0.000365         8.07
+IVF-RaBitQ-nl387-np19-rf20 (query)                     3_315.64       902.98     4_218.62       1.0000     0.000365         8.07
+IVF-RaBitQ-nl387-np27-rf5 (query)                      3_315.64       994.95     4_310.60       0.9997     0.001966         8.07
+IVF-RaBitQ-nl387-np27-rf10 (query)                     3_315.64     1_061.21     4_376.86       1.0000     0.000000         8.07
+IVF-RaBitQ-nl387-np27-rf20 (query)                     3_315.64     1_179.23     4_494.87       1.0000     0.000000         8.07
+IVF-RaBitQ-nl387 (self)                                3_315.64    11_776.55    15_092.20       1.0000     0.000000         8.07
+--------------------------------------------------------------------------------------------------------------------------------
+IVF-RaBitQ-nl547-np23-rf0 (query)                      4_188.88       717.04     4_905.92       0.7904   172.743150         8.23
+IVF-RaBitQ-nl547-np27-rf0 (query)                      4_188.88       832.38     5_021.26       0.7904   172.743304         8.23
+IVF-RaBitQ-nl547-np33-rf0 (query)                      4_188.88       998.04     5_186.93       0.7904   172.743314         8.23
+IVF-RaBitQ-nl547-np23-rf5 (query)                      4_188.88       807.59     4_996.47       0.9995     0.004037         8.23
+IVF-RaBitQ-nl547-np23-rf10 (query)                     4_188.88       836.60     5_025.49       0.9998     0.002925         8.23
+IVF-RaBitQ-nl547-np23-rf20 (query)                     4_188.88       955.47     5_144.36       0.9998     0.002925         8.23
+IVF-RaBitQ-nl547-np27-rf5 (query)                      4_188.88       912.33     5_101.22       0.9997     0.001330         8.23
+IVF-RaBitQ-nl547-np27-rf10 (query)                     4_188.88       966.74     5_155.62       1.0000     0.000231         8.23
+IVF-RaBitQ-nl547-np27-rf20 (query)                     4_188.88     1_069.72     5_258.61       1.0000     0.000231         8.23
+IVF-RaBitQ-nl547-np33-rf5 (query)                      4_188.88     1_073.98     5_262.87       0.9998     0.001099         8.23
+IVF-RaBitQ-nl547-np33-rf10 (query)                     4_188.88     1_141.32     5_330.21       1.0000     0.000000         8.23
+IVF-RaBitQ-nl547-np33-rf20 (query)                     4_188.88     1_255.74     5_444.62       1.0000     0.000000         8.23
+IVF-RaBitQ-nl547 (self)                                4_188.88    12_556.71    16_745.59       1.0000     0.000000         8.23
+--------------------------------------------------------------------------------------------------------------------------------
+</code></pre>
+</details>
+
+<details>
+<summary><b>RaBitQ - Euclidean (LowRank - 512 dimensions)</b>:</summary>
+</br>
+<pre><code>
+================================================================================================================================
+Benchmark: 150k cells, 512D - IVF-RaBitQ
+================================================================================================================================
+Method                                               Build (ms)   Query (ms)   Total (ms)     Recall@k   Dist Error    Size (MB)
+--------------------------------------------------------------------------------------------------------------------------------
+Exhaustive (query)                                        60.66    32_462.03    32_522.69       1.0000     0.000000       292.97
+Exhaustive (self)                                         60.66   327_346.00   327_406.66       1.0000     0.000000       292.97
+--------------------------------------------------------------------------------------------------------------------------------
+ExhaustiveRaBitQ-rf0 (query)                          17_292.61     4_810.76    22_103.37       0.8405   370.189430        13.40
+ExhaustiveRaBitQ-rf5 (query)                          17_292.61     4_910.64    22_203.25       0.9994     0.084579        13.40
+ExhaustiveRaBitQ-rf10 (query)                         17_292.61     4_968.70    22_261.30       0.9995     0.052237        13.40
+ExhaustiveRaBitQ-rf20 (query)                         17_292.61     5_132.64    22_425.25       0.9996     0.031282        13.40
+ExhaustiveRaBitQ (self)                               17_292.61    49_652.31    66_944.92       0.9995     0.059264        13.40
+--------------------------------------------------------------------------------------------------------------------------------
+IVF-RaBitQ-nl273-np13-rf0 (query)                      8_819.66     1_560.97    10_380.63       0.8406   370.186223        13.55
+IVF-RaBitQ-nl273-np16-rf0 (query)                      8_819.66     1_872.32    10_691.98       0.8408   370.186601        13.55
+IVF-RaBitQ-nl273-np23-rf0 (query)                      8_819.66     2_657.77    11_477.43       0.8408   370.186621        13.55
+IVF-RaBitQ-nl273-np13-rf5 (query)                      8_819.66     1_609.84    10_429.49       0.9991     0.090643        13.55
+IVF-RaBitQ-nl273-np13-rf10 (query)                     8_819.66     1_694.91    10_514.57       0.9992     0.059367        13.55
+IVF-RaBitQ-nl273-np13-rf20 (query)                     8_819.66     1_811.06    10_630.71       0.9993     0.046711        13.55
+IVF-RaBitQ-nl273-np16-rf5 (query)                      8_819.66     1_949.34    10_769.00       0.9995     0.075727        13.55
+IVF-RaBitQ-nl273-np16-rf10 (query)                     8_819.66     2_026.21    10_845.87       0.9996     0.044451        13.55
+IVF-RaBitQ-nl273-np16-rf20 (query)                     8_819.66     2_169.46    10_989.12       0.9996     0.031795        13.55
+IVF-RaBitQ-nl273-np23-rf5 (query)                      8_819.66     2_736.52    11_556.18       0.9995     0.075348        13.55
+IVF-RaBitQ-nl273-np23-rf10 (query)                     8_819.66     2_826.38    11_646.04       0.9996     0.044072        13.55
+IVF-RaBitQ-nl273-np23-rf20 (query)                     8_819.66     2_986.04    11_805.69       0.9996     0.031417        13.55
+IVF-RaBitQ-nl273 (self)                                8_819.66    29_695.70    38_515.36       0.9996     0.034065        13.55
+--------------------------------------------------------------------------------------------------------------------------------
+IVF-RaBitQ-nl387-np19-rf0 (query)                      9_632.05     2_035.32    11_667.37       0.8444   370.183354        13.78
+IVF-RaBitQ-nl387-np27-rf0 (query)                      9_632.05     3_028.45    12_660.50       0.8444   370.183376        13.78
+IVF-RaBitQ-nl387-np19-rf5 (query)                      9_632.05     2_098.09    11_730.14       0.9995     0.060023        13.78
+IVF-RaBitQ-nl387-np19-rf10 (query)                     9_632.05     2_174.22    11_806.27       0.9995     0.050791        13.78
+IVF-RaBitQ-nl387-np19-rf20 (query)                     9_632.05     2_326.69    11_958.74       0.9996     0.034409        13.78
+IVF-RaBitQ-nl387-np27-rf5 (query)                      9_632.05     2_939.82    12_571.87       0.9995     0.058974        13.78
+IVF-RaBitQ-nl387-np27-rf10 (query)                     9_632.05     2_996.05    12_628.10       0.9996     0.049741        13.78
+IVF-RaBitQ-nl387-np27-rf20 (query)                     9_632.05     3_192.48    12_824.53       0.9996     0.033360        13.78
+IVF-RaBitQ-nl387 (self)                                9_632.05    31_825.19    41_457.24       0.9996     0.026435        13.78
+--------------------------------------------------------------------------------------------------------------------------------
+IVF-RaBitQ-nl547-np23-rf0 (query)                     11_011.65     2_280.29    13_291.94       0.8468   370.175057        14.09
+IVF-RaBitQ-nl547-np27-rf0 (query)                     11_011.65     2_656.68    13_668.33       0.8468   370.175243        14.09
+IVF-RaBitQ-nl547-np33-rf0 (query)                     11_011.65     3_258.48    14_270.12       0.8468   370.175269        14.09
+IVF-RaBitQ-nl547-np23-rf5 (query)                     11_011.65     2_317.28    13_328.93       0.9993     0.044230        14.09
+IVF-RaBitQ-nl547-np23-rf10 (query)                    11_011.65     2_368.10    13_379.75       0.9994     0.040785        14.09
+IVF-RaBitQ-nl547-np23-rf20 (query)                    11_011.65     2_522.87    13_534.52       0.9994     0.029099        14.09
+IVF-RaBitQ-nl547-np27-rf5 (query)                     11_011.65     2_670.34    13_681.98       0.9996     0.038662        14.09
+IVF-RaBitQ-nl547-np27-rf10 (query)                    11_011.65     2_772.34    13_783.99       0.9996     0.035217        14.09
+IVF-RaBitQ-nl547-np27-rf20 (query)                    11_011.65     2_908.61    13_920.26       0.9997     0.023531        14.09
+IVF-RaBitQ-nl547-np33-rf5 (query)                     11_011.65     3_266.69    14_278.34       0.9996     0.038161        14.09
+IVF-RaBitQ-nl547-np33-rf10 (query)                    11_011.65     3_313.36    14_325.01       0.9996     0.034715        14.09
+IVF-RaBitQ-nl547-np33-rf20 (query)                    11_011.65     3_425.85    14_437.50       0.9997     0.023029        14.09
+IVF-RaBitQ-nl547 (self)                               11_011.65    34_320.38    45_332.03       0.9996     0.025413        14.09
 --------------------------------------------------------------------------------------------------------------------------------
 </code></pre>
 </details>
 
 Overall, this is a fantastic binary index that massively compresses the data,
-while still allowing for great Recalls.
+while still allowing for great Recalls. If you need to compress your data
+and reduce memory fingerprint, please, use RaBitQ!
 
 *All benchmarks were run on M1 Max MacBook Pro with 64 GB unified memory.*

@@ -19,6 +19,8 @@ thread_local! {
     static LSH_SEEN_SET: RefCell<FxHashSet<usize>> = RefCell::new(FxHashSet::default());
 }
 
+type TablesAndHashes = Vec<(FxHashMap<u64, Vec<usize>>, Vec<u64>)>;
+
 ////////////////
 // Main index //
 ////////////////
@@ -168,7 +170,7 @@ where
         };
 
         // compute all hashes and build tables in parallel
-        let tables_and_hashes: Vec<(FxHashMap<u64, Vec<usize>>, Vec<u64>)> = (0..num_tables)
+        let tables_and_hashes: TablesAndHashes = (0..num_tables)
             .into_par_iter()
             .map(|table_idx| {
                 let mut table = FxHashMap::default();

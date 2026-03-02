@@ -4,9 +4,12 @@
 
 **Features:**
 
-- SIMD add and assign add added - slightly better k-means performance on larger
-  data sets.
-- Binary quantiser with reranking.
+- *New*: Binary signed quantiser with reranking -for very large vectors.
+- SIMD add and assign add added - used for better k-means clustering.
+- Improved k-means clustering (impacting IVF) for higher dimensions.
+- Improvned NNDescent with less
+- Improved LSH index with multi-probe support.
+- Updated benchmarks with 128 dimensions tested across various indices.
 
 ## 0.2.3
 
