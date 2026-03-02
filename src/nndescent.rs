@@ -471,7 +471,7 @@ where
 
         for iter in 0..max_iter {
             let updates_count = AtomicUsize::new(0);
-            let mut rng = SmallRng::seed_from_u64((seed as u64).wrapping_add(iter as u64));
+            let iter_seed = (seed as u64).wrapping_add(iter as u64);
 
             if verbose {
                 println!(" Preparing candidates for iter {}", iter + 1);
@@ -480,7 +480,7 @@ where
                 &graph,
                 k,
                 max_candidates,
-                &mut rng,
+                iter_seed,
                 &mut new_cands,
                 &mut old_cands,
                 &mut new_cands_sym,
@@ -550,95 +550,113 @@ where
     ///
     /// For each node, samples up to `max_candidates` new and old neighbours,
     /// then adds symmetric reverse candidates to ensure connectivity.
+    ///
+    /// ### Params
+    ///
+    /// * `graph` - Reference to current neighbours
+    /// * `k` - Number of neighbours to take
+    /// * `iter_seed` - Iteration seed
+    /// * `new_cands` - Mutable slice to new candidates
+    /// * `old_cands` - Mutable slice to old candidates
+    /// * `new_cands_sym` - Mutable slice to new symmetric candidates
+    /// * `old_cands_sym` - Mutable slice to old symmetric candidates
     #[allow(clippy::too_many_arguments)]
     fn build_candidates(
         &self,
         graph: &[Neighbour<T>],
         k: usize,
         max_candidates: usize,
-        rng: &mut SmallRng,
+        iter_seed: u64,
         new_cands: &mut [Vec<usize>],
         old_cands: &mut [Vec<usize>],
         new_cands_sym: &mut [Vec<usize>],
         old_cands_sym: &mut [Vec<usize>],
     ) {
-        for i in 0..self.n {
-            new_cands[i].clear();
-            old_cands[i].clear();
-            new_cands_sym[i].clear();
-            old_cands_sym[i].clear();
+        for v in new_cands_sym.iter_mut().chain(old_cands_sym.iter_mut()) {
+            v.clear();
         }
 
-        let mut new_temp: Vec<(f64, usize)> = Vec::with_capacity(max_candidates * 2);
-        let mut old_temp: Vec<(f64, usize)> = Vec::with_capacity(max_candidates * 2);
+        // Phase 1: Parallel sampling -- each thread writes only to its own node
+        let n = self.n;
+        new_cands
+            .par_iter_mut()
+            .zip(old_cands.par_iter_mut())
+            .enumerate()
+            .for_each(|(i, (new_c, old_c))| {
+                new_c.clear();
+                old_c.clear();
 
-        for i in 0..self.n {
-            new_temp.clear();
-            old_temp.clear();
+                let mut rng = SmallRng::seed_from_u64(iter_seed.wrapping_add(i as u64));
+                let base = i * k;
 
-            let base = i * k;
-            for slot in &graph[base..base + k] {
-                if slot.is_sentinel() {
-                    continue;
-                }
+                let mut new_temp: Vec<(f64, usize)> = Vec::new();
+                let mut old_temp: Vec<(f64, usize)> = Vec::new();
 
-                let j = slot.pid();
-                if j >= self.n {
-                    continue;
-                }
+                for slot in &graph[base..base + k] {
+                    if slot.is_sentinel() {
+                        continue;
+                    }
+                    let j = slot.pid();
+                    if j >= n {
+                        continue;
+                    }
 
-                let priority = rng.random::<f64>();
-                if slot.is_new() {
-                    new_temp.push((priority, j));
-                } else {
-                    old_temp.push((priority, j));
-                }
-            }
-
-            if !new_temp.is_empty() {
-                new_temp.sort_unstable_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
-                new_temp.truncate(max_candidates);
-
-                let mut last_seen = usize::MAX;
-                for &(_, idx) in &new_temp {
-                    if idx != last_seen {
-                        new_cands[i].push(idx);
-                        last_seen = idx;
+                    let priority = rng.random::<f64>();
+                    if slot.is_new() {
+                        new_temp.push((priority, j));
+                    } else {
+                        old_temp.push((priority, j));
                     }
                 }
-            }
 
-            if !old_temp.is_empty() {
-                old_temp.sort_unstable_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
-                old_temp.truncate(max_candidates);
-
-                let mut last_seen = usize::MAX;
-                for &(_, idx) in &old_temp {
-                    if idx != last_seen {
-                        old_cands[i].push(idx);
-                        last_seen = idx;
-                    }
+                // O(n) partial sort instead of O(n log n) full sort
+                if new_temp.len() > max_candidates {
+                    new_temp.select_nth_unstable_by(max_candidates - 1, |a, b| {
+                        a.0.partial_cmp(&b.0).unwrap()
+                    });
+                    new_temp.truncate(max_candidates);
                 }
-            }
-        }
+                new_c.extend(new_temp.iter().map(|&(_, idx)| idx));
 
+                if old_temp.len() > max_candidates {
+                    old_temp.select_nth_unstable_by(max_candidates - 1, |a, b| {
+                        a.0.partial_cmp(&b.0).unwrap()
+                    });
+                    old_temp.truncate(max_candidates);
+                }
+                old_c.extend(old_temp.iter().map(|&(_, idx)| idx));
+            });
+
+        // Phase 2: Symmetric candidates (sequential -- cross-node writes)
+        // No .contains() guard: duplicates are removed by sort+dedup in phase 3
         for i in 0..self.n {
             for &j in &new_cands[i] {
-                if j < self.n && !new_cands_sym[j].contains(&i) {
+                if j < self.n {
                     new_cands_sym[j].push(i);
                 }
             }
             for &j in &old_cands[i] {
-                if j < self.n && !old_cands_sym[j].contains(&i) {
+                if j < self.n {
                     old_cands_sym[j].push(i);
                 }
             }
         }
 
-        for i in 0..self.n {
-            new_cands[i].extend_from_slice(&new_cands_sym[i]);
-            old_cands[i].extend_from_slice(&old_cands_sym[i]);
-        }
+        // Phase 3: Merge symmetric, sort, dedup (parallel, per-node independent)
+        new_cands
+            .par_iter_mut()
+            .zip(old_cands.par_iter_mut())
+            .zip(new_cands_sym.par_iter())
+            .zip(old_cands_sym.par_iter())
+            .for_each(|(((new_c, old_c), new_sym), old_sym)| {
+                new_c.extend_from_slice(new_sym);
+                new_c.sort_unstable();
+                new_c.dedup();
+
+                old_c.extend_from_slice(old_sym);
+                old_c.sort_unstable();
+                old_c.dedup();
+            });
     }
 
     /// Mark neighbours as old if they appear in the new candidate lists.
@@ -653,7 +671,7 @@ where
                 if slot.is_sentinel() {
                     continue;
                 }
-                if slot.is_new() && new_cands[i].contains(&slot.pid()) {
+                if slot.is_new() && new_cands[i].binary_search(&slot.pid()).is_ok() {
                     slot.mark_old();
                 }
             }
@@ -664,6 +682,10 @@ where
     ///
     /// Emits both edge directions `(p, q, d)` and `(q, p, d)` so that
     /// the caller can sort by target and apply lock-free.
+    ///
+    /// ### Params
+    ///
+    ///
     fn generate_updates_for_chunk(
         &self,
         new_cands: &[Vec<usize>],
