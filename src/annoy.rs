@@ -5,6 +5,10 @@ use fixedbitset::FixedBitSet;
 use rand::{rngs::StdRng, Rng, SeedableRng};
 use rayon::prelude::*;
 use std::collections::BinaryHeap;
+use std::sync::{
+    atomic::{AtomicUsize, Ordering},
+    Arc,
+};
 use thousands::*;
 
 use crate::prelude::*;
@@ -88,6 +92,8 @@ pub struct AnnoyIndex<T> {
     leaf_indices: Vec<usize>,
     /// Number of trees in the forest
     pub n_trees: usize,
+    /// Orignal indices
+    original_ids: Vec<usize>,
 }
 
 impl<T> VectorDistance<T> for AnnoyIndex<T>
@@ -211,7 +217,7 @@ where
             }
         }
 
-        AnnoyIndex {
+        let mut idx = AnnoyIndex {
             nodes,
             roots,
             split_data,
@@ -222,7 +228,13 @@ where
             n,
             norms,
             metric,
-        }
+            original_ids: (0..n).collect(),
+        };
+
+        let new_to_old = idx.optimise_memory_layout();
+        idx.original_ids = new_to_old;
+
+        idx
     }
 
     /// Build a single tree recursively
@@ -408,6 +420,87 @@ where
         T::dot_simd(v1, &v2[..dim]) - v2[dim]
     }
 
+    /// Reorders vectors in memory to match the layout of Tree 0.
+    ///
+    /// This drastically reduces L2/L3 cache misses during leaf evaluation and
+    /// reduces memory bandwidth problems
+    ///
+    /// ### Returns
+    ///
+    /// New to old mapping
+    fn optimise_memory_layout(&mut self) -> Vec<usize> {
+        if self.roots.is_empty() || self.n == 0 {
+            return Vec::new();
+        }
+
+        let mut new_to_old = Vec::with_capacity(self.n);
+        let mut old_to_new = vec![usize::MAX; self.n];
+        let mut visited = vec![false; self.n];
+
+        // 1. DFS traversal of Tree 0
+        let mut stack = vec![self.roots[0]];
+        while let Some(node_idx) = stack.pop() {
+            let node = unsafe { self.nodes.get_unchecked(node_idx as usize) };
+
+            if node.n_descendants == 1 {
+                let start = node.child_a as usize;
+                let len = node.child_b as usize;
+                let leaf_items = unsafe { self.leaf_indices.get_unchecked(start..start + len) };
+
+                for &old_id in leaf_items {
+                    if !visited[old_id] {
+                        visited[old_id] = true;
+                        old_to_new[old_id] = new_to_old.len();
+                        new_to_old.push(old_id);
+                    }
+                }
+            } else {
+                stack.push(node.child_b);
+                stack.push(node.child_a);
+            }
+        }
+
+        // 2. Catch any items that somehow weren't in Tree 0 - safe guard
+        for old_id in 0..self.n {
+            if !visited[old_id] {
+                old_to_new[old_id] = new_to_old.len();
+                new_to_old.push(old_id);
+            }
+        }
+
+        // 3. Shuffle the actual vector data into a new, contiguous layout
+        let mut new_vectors_flat = Vec::with_capacity(self.vectors_flat.len());
+        let mut new_norms = if self.norms.is_empty() {
+            Vec::new()
+        } else {
+            Vec::with_capacity(self.n)
+        };
+
+        for &old_id in &new_to_old {
+            let start = old_id * self.dim;
+            let end = start + self.dim;
+
+            // Push the vector to its new physical location
+            new_vectors_flat.extend_from_slice(&self.vectors_flat[start..end]);
+
+            // Keep norms aligned
+            if !self.norms.is_empty() {
+                new_norms.push(self.norms[old_id]);
+            }
+        }
+
+        // 4. Rewrite ALL leaves in ALL trees to use the new IDs
+        for id_ref in self.leaf_indices.iter_mut() {
+            *id_ref = old_to_new[*id_ref];
+        }
+
+        // 5. Swap the data (the old arrays get dropped automatically)
+        self.vectors_flat = new_vectors_flat;
+        self.norms = new_norms;
+
+        new_to_old
+    }
+
     ///////////
     // Query //
     ///////////
@@ -563,7 +656,11 @@ where
 
         candidates
             .into_iter()
-            .map(|(dist, idx)| (idx, dist))
+            .map(|(dist, idx)| {
+                // remap
+                let original_idx = self.original_ids[idx];
+                (original_idx, dist)
+            })
             .unzip()
     }
 
@@ -622,19 +719,18 @@ where
         return_dist: bool,
         verbose: bool,
     ) -> (Vec<Vec<usize>>, Option<Vec<Vec<T>>>) {
-        use std::sync::{
-            atomic::{AtomicUsize, Ordering},
-            Arc,
-        };
-
         let counter = Arc::new(AtomicUsize::new(0));
 
-        let results: Vec<(Vec<usize>, Vec<T>)> = (0..self.n)
+        // collect unordered results, tagging them with their ORIGINAL id
+        let unordered_results: Vec<(usize, Vec<usize>, Vec<T>)> = (0..self.n)
             .into_par_iter()
             .map(|i| {
                 let start = i * self.dim;
                 let end = start + self.dim;
                 let vec = &self.vectors_flat[start..end];
+
+                // fetch what the actual original ID for this vector was
+                let orig_id = self.original_ids[i];
 
                 if verbose {
                     let count = counter.fetch_add(1, Ordering::Relaxed) + 1;
@@ -647,17 +743,28 @@ where
                     }
                 }
 
-                self.query(vec, k, search_k)
+                let (indices, dists) = self.query(vec, k, search_k);
+                (orig_id, indices, dists)
             })
             .collect();
 
-        if return_dist {
-            let (indices, distances) = results.into_iter().unzip();
-            (indices, Some(distances))
+        // pre-allocate the final ordered arrays
+        let mut final_indices = vec![Vec::new(); self.n];
+        let mut final_dists = if return_dist {
+            Some(vec![Vec::new(); self.n])
         } else {
-            let indices: Vec<Vec<usize>> = results.into_iter().map(|(idx, _)| idx).collect();
-            (indices, None)
+            None
+        };
+
+        // scatter the results back into their original, expected positions
+        for (orig_id, indices, dists) in unordered_results {
+            final_indices[orig_id] = indices;
+            if let Some(ref mut fd) = final_dists {
+                fd[orig_id] = dists;
+            }
         }
+
+        (final_indices, final_dists)
     }
 
     /// Returns the size of the index in bytes
