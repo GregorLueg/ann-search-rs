@@ -1,3 +1,6 @@
+//! HNSW implementation in ann-search-rs. Uses parallel updates during
+//! construction of the index which comes at the cost of determinism.
+
 use faer::{MatRef, RowRef};
 use num_traits::Float;
 use rand::{prelude::*, rng};
@@ -35,33 +38,27 @@ type TablesAndHashes = Vec<(FxHashMap<u64, Vec<usize>>, Vec<u64>)>;
 /// For Euclidean distance, vectors are L2-normalised before hashing so that
 /// SimHash (an angular hash) provides a reasonable proxy. Actual distance
 /// computations always use the original unnormalised vectors.
-///
-/// ### Fields
-///
-/// * `vectors_flat` - Original data, flattened row-major for cache efficiency
-/// * `dim` - Embedding dimensionality
-/// * `n` - Number of vectors
-/// * `norms` - Pre-computed L2 norms for Cosine distance (empty for Euclidean)
-/// * `metric` - Distance metric (Euclidean or Cosine)
-/// * `hash_tables` - Maps hash values to vector indices for each table
-/// * `random_vecs` - Orthogonalised random projection vectors from N(0,1)
-/// * `num_tables` - Number of hash tables
-/// * `bits_per_hash` - Bits in each hash code (higher = fewer collisions)
-/// * `vector_hashes` - Pre-computed hashes per vector per table, layout:
-///   `[table_idx * n + vec_idx]`. Used to skip re-hashing during self-query.
 pub struct LSHIndex<T> {
-    // main fields
+    /// Original data, flattened row-major for cache efficiency
     pub vectors_flat: Vec<T>,
+    /// Embedding dimensionality
     pub dim: usize,
+    /// Number of vectors
     pub n: usize,
+    /// Pre-computed L2 norms for Cosine distance (empty for Euclidean)
     norms: Vec<T>,
+    /// Distance metric (Euclidean or Cosine)
     metric: Dist,
-    // index-specific
+    /// Maps hash values to vector indices for each table
     hash_tables: Vec<FxHashMap<u64, Vec<usize>>>,
+    /// Orthogonalised random projection vectors from N(0,1)
     random_vecs: Vec<T>,
+    /// Number of hash tables
     num_tables: usize,
+    /// Bits in each hash code (higher = fewer collisions)
     bits_per_hash: usize,
-    // pre-computed per-vector hashes for fast self-query
+    /// Pre-computed hashes per vector per table, layout:
+    /// `[table_idx * n + vec_idx]`. Used to skip re-hashing during self-query.
     vector_hashes: Vec<u64>,
 }
 
