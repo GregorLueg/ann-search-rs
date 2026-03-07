@@ -1,3 +1,6 @@
+//! This module contains all of the helpers, structures and methods related
+//! to GPU-accelerated indices.
+
 pub mod dist_gpu;
 pub mod exhaustive_gpu;
 pub mod ivf_gpu;

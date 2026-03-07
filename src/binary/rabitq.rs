@@ -1,3 +1,5 @@
+//! RaBitQ quantiser and helpers
+
 use faer::{Mat, MatRef};
 use faer_traits::ComplexField;
 use num_traits::{Float, FromPrimitive, ToPrimitive};
@@ -22,20 +24,17 @@ const RABITQ_K_MEANS_ITER: usize = 30;
 /////////////////
 
 /// Encoded query for RaBitQ distance estimation
-///
-/// ### Fields
-///
-/// * `quantised` - Int4 quantised values (one per dimension, stored as u8)
-/// * `dist_to_centroid` - Distance from query to centroid
-/// * `lower` - Lower bound used in quantisation
-/// * `width` - Bucket width used in quantisation
-/// * `sum_quantised` - Sum of all quantised values
 #[repr(C)]
 pub struct RaBitQQuery<T> {
+    /// Int4 quantised values (one per dimension, stored as u8)
     pub quantised: Vec<u8>,
+    /// Distance from query to centroid
     pub dist_to_centroid: T,
+    /// Lower bound used in quantisation
     pub lower: T,
+    /// Bucket width used in quantisation
     pub width: T,
+    /// Sum of all quantised values
     pub sum_quantised: u32,
 }
 
@@ -47,17 +46,14 @@ pub struct RaBitQQuery<T> {
 pub type VecEncoding<T> = (Vec<u8>, T, T, u32);
 
 /// Pure encoding logic for RaBitQ
-///
-/// ### Fields
-///
-/// * `rotation` - The rotation matrix
-/// * `dim` - Dimensions of the encode
-/// * `n_bytes` - Number of bytes
-/// * `metric` - Distance metric to use
 pub struct RaBitQEncoder<T> {
+    /// The rotation matrix
     pub rotation: Vec<T>,
+    /// Dimensions of the encode
     pub dim: usize,
+    /// Number of bytes
     pub n_bytes: usize,
+    /// Distance metric to use
     pub metric: Dist,
 }
 
@@ -279,17 +275,14 @@ where
 ///
 /// Packed vector representation for RaBitQ encoded vectors for better cache
 /// locality and reduced misses
-///
-/// ### Fields
-///
-/// * `dist_to_centroid` - Distance to centroid
-/// * `dot_correction` - Dot correction
-/// * `popcount` - Popcount
 #[repr(C)]
 #[derive(Clone)]
 pub struct RaBitQPackedVector<T> {
+    /// Distance to centroid
     pub dist_to_centroid: T,
+    /// Dot correction
     pub dot_correction: T,
+    /// Popcount
     pub popcount: u32,
 }
 
@@ -306,28 +299,25 @@ impl<T> RaBitQPackedVector<T> {
 }
 
 /// CSR-layout storage for RaBitQ encoded vectors
-///
-/// ### Fields
-///
-/// * `centroids` - the centroids of the data, nlist * dim, flattened
-/// * `centroids_norm` - norms of the centroids
-/// * `binary_codes` - all vectors, ordered by cluster
-/// * `packed_vectors` - Packed vectors of distances to centroids, dot
-///   corrections, and popcounts.
-/// * `vector_indices` - Original indices, ordered by cluster
-/// * `offsets` - cluster boundaries, len = nlist + 1
-/// * `nlist` - Number of lists
-/// * `dim` - Number of dimensions
-/// * `n_bytes` - Number of bytes
 pub struct RaBitQStorage<T> {
+    /// The centroids of the data, nlist * dim, flattened
     pub centroids: Vec<T>,
+    /// Norms of the centroids
     pub centroids_norm: Vec<T>,
+    /// All vectors, ordered by cluster
     pub binary_codes: Vec<u8>,
+    /// Packed vectors of distances to centroids, dot corrections, and
+    /// popcounts.
     pub packed_vectors: Vec<RaBitQPackedVector<T>>,
+    /// Original indices, ordered by cluster
     pub vector_indices: Vec<usize>,
+    /// Cluster boundaries, len = nlist + 1
     pub offsets: Vec<usize>,
+    /// Number of lists
     pub nlist: usize,
+    /// Number of dimensions
     pub dim: usize,
+    /// Number of bytes
     pub n_bytes: usize,
 }
 
@@ -409,6 +399,16 @@ impl<T: Float + FromPrimitive + Clone> RaBitQStorage<T> {
         &self.binary_codes[byte_start..byte_start + self.n_bytes]
     }
 
+    /// Returns the vector data for a given cluster index
+    ///
+    /// ### Params
+    ///
+    /// * `cluster_idx` Index position of the cluster
+    /// * `local_idx` - Index position of within the cluster
+    ///
+    /// ### Returns
+    ///
+    /// The vector index in that cluster with the specific local index
     #[inline]
     pub fn get_vector_data(&self, cluster_idx: usize, local_idx: usize) -> &RaBitQPackedVector<T> {
         let global_idx = self.offsets[cluster_idx] + local_idx;
@@ -416,6 +416,14 @@ impl<T: Float + FromPrimitive + Clone> RaBitQStorage<T> {
     }
 
     /// Slice access for cluster - only if you actually need to iterate
+    ///
+    /// ### Params
+    ///
+    /// * `cluster_idx` Index position of the cluster
+    ///
+    /// ### Returns
+    ///
+    /// Slice of the packed vector in this cluster index
     #[inline]
     pub fn cluster_packed_data(&self, cluster_idx: usize) -> &[RaBitQPackedVector<T>] {
         let start = self.offsets[cluster_idx];
@@ -625,13 +633,10 @@ where
 /////////////////////
 
 /// RaBitQ quantiser using CSR storage
-///
-/// ### Fields
-///
-/// * `encoder` - The encoder structure
-/// * `storage` - The storage structure
 pub struct RaBitQQuantiser<T> {
+    /// The RaBitQ encoder structure
     pub encoder: RaBitQEncoder<T>,
+    /// The RaBitQ storage structure
     pub storage: RaBitQStorage<T>,
 }
 

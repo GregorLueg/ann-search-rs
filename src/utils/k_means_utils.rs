@@ -1,3 +1,6 @@
+//! Implementations of fast k-means clustering, leveraging SIMD or GEMM during
+//! fitting, pending the data set sizes.
+
 use faer::{linalg::matmul::matmul, Accum, Mat, MatRef, Par};
 use faer_traits::ComplexField;
 use num_traits::Float;

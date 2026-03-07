@@ -1,3 +1,5 @@
+//! Shared traits and trait boundaries that are used across the crate.
+
 use faer_traits::ComplexField;
 use num_traits::{Float, FromPrimitive, ToPrimitive};
 use std::iter::Sum;

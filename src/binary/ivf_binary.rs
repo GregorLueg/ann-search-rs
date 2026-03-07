@@ -1,3 +1,6 @@
+//! Inverted file binary index. Compresses the vectors via binarisation and
+//! leverages Voronoi cells to reduce the search space.
+
 use bytemuck::Pod;
 use faer::{MatRef, RowRef};
 use faer_traits::ComplexField;
@@ -32,18 +35,32 @@ use crate::utils::*;
 /// * `nlist` - Number of clusters
 /// * `vector_store` - Optional on-disk vector storage
 pub struct IvfIndexBinary<T> {
+    /// Binary codes, flattened (n * n_bytes)
     pub vectors_flat_binarised: Vec<u8>,
+    /// Bytes per vector (n_bits / 8)
     pub n_bytes: usize,
+    /// Number of samples in the index
     pub n: usize,
+    /// Original vector dimensionality
     pub dim: usize,
+    /// Distance metric
     metric: Dist,
+    /// Binarisation type to use
     binarisation_type: BinarisationInit,
+    /// Binariser
     binariser: Binariser<T>,
+    /// Flat representation of the centroids
     centroids_float: Vec<T>,
+    /// Flat representations of the L2 norms of the centroids for Cosine
+    /// distances
     centroids_norm: Vec<T>,
+    /// Vector indices for each cluster (CSR format)
     all_indices: Vec<usize>,
+    /// Offsets for CSR access
     offsets: Vec<usize>,
+    /// Number of clusters/lists in this index
     nlist: usize,
+    /// Optional vector store that is saved in binary on disk
     vector_store: Option<MmapVectorStore<T>>,
 }
 

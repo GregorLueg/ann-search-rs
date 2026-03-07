@@ -1,3 +1,7 @@
+//! GPU-accelerated (via CubeCL) distance calculations for the GPU-based indices
+
+#![allow(missing_docs)] // complains about cubecl macros...
+
 use cubecl::prelude::*;
 use std::iter::Sum;
 

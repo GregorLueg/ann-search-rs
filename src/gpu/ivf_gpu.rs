@@ -1,3 +1,6 @@
+//! Inverted file GPU-accelerated index. Keeps the data on GPU to avoid moving
+//! data around.
+
 use cubecl::prelude::*;
 use faer::MatRef;
 use faer_traits::ComplexField;
@@ -40,31 +43,28 @@ const TARGET_BUFFER_MB: usize = 1500;
 ///
 /// * `T` - Float type (f32 or f64)
 /// * `R` - CubeCL runtime
-///
-/// ### Fields
-///
-/// * `vectors_gpu` - All vectors reorganised by cluster, resident on GPU
-/// * `norms_gpu` - All norms reorganised by cluster, resident on GPU (Cosine only)
-/// * `original_indices` - Maps reorganised position -> original index
-/// * `cluster_offsets` - CSR offsets
-/// * `centroids_gpu` - Centroids kept on the GPU
-/// * `centroid_norms_gpu` - Centroid norms kept on the GPU
-/// * `dim` - Dimensionality of the index
-/// * `n` - Number of samples in the index
-/// * `nlist` - Number of lists in the index
-/// * `metric` - Distance metric used
-/// * `device` - Device runtime for the GPU work
 pub struct IvfIndexGpu<T: Float + cubecl::frontend::Float + cubecl::CubeElement, R: Runtime> {
+    /// All vectors reorganised by cluster, resident on GPU
     vectors_gpu: GpuTensor<R, T>,
+    /// All norms reorganised by cluster, resident on GPU (Cosine only)
     norms_gpu: Option<GpuTensor<R, T>>,
+    /// Maps reorganised position -> original index
     original_indices: Vec<usize>,
+    /// CSR offsets
     cluster_offsets: Vec<usize>,
+    /// Centroids kept on the GPU
     centroids_gpu: GpuTensor<R, T>,
+    ///  Centroid norms kept on the GPU
     centroid_norms_gpu: Option<GpuTensor<R, T>>,
+    /// Dimensionality of the index
     dim: usize,
+    /// Number of samples in the index
     n: usize,
+    /// Number of lists in the index
     nlist: usize,
+    /// Distance metric used
     metric: Dist,
+    /// Device runtime for the GPU work
     device: R::Device,
 }
 

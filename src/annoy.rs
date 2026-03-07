@@ -1,3 +1,5 @@
+//! Annoy implementation in ann-search-rs.
+
 use faer::{MatRef, RowRef};
 use rand::{rngs::StdRng, Rng, SeedableRng};
 use rayon::prelude::*;
@@ -64,31 +66,26 @@ enum BuildNode<T> {
 /// Uses a forest of random projection trees to partition the space. Each tree
 /// recursively splits the data using random hyperplanes until reaching leaves
 /// of size ≤ 64 items.
-///
-/// ### Fields
-///
-/// * `vectors_flat` - Original vector data, flattened for cache locality
-/// * `dim` - Embedding dimensions
-/// * `n` - Number of vectors
-/// * `norms` - Pre-computed norms for Cosine distance (empty for Euclidean)
-/// * `metric` - Distance metric (Euclidean or Cosine)
-/// * `nodes` - Flattened tree structure containing all split and leaf nodes
-/// * `roots` - Starting indices for each tree in the forest
-/// * `split_data` - Hyperplane coefficients and offsets for split nodes
-/// * `leaf_indices` - Actual data indices stored in leaf nodes
-/// * `n_trees` - Number of trees in the forest
 pub struct AnnoyIndex<T> {
-    // shared ones
+    /// Original vector data, flattened for cache locality
     pub vectors_flat: Vec<T>,
+    /// Embedding dimensions
     pub dim: usize,
+    /// Number of vectors
     pub n: usize,
+    /// Pre-computed norms for Cosine distance (empty for Euclidean)
     norms: Vec<T>,
+    /// Distance metric (Euclidean or Cosine)
     metric: Dist,
-    // index specific
+    /// Flattened tree structure containing all split and leaf nodes
     nodes: Vec<FlatNode>,
+    /// Starting indices for each tree in the forest
     roots: Vec<u32>,
+    /// Hyperplane coefficients and offsets for split nodes
     split_data: Vec<T>,
+    /// Actual data indices stored in leaf nodes
     leaf_indices: Vec<usize>,
+    /// Number of trees in the forest
     pub n_trees: usize,
 }
 

@@ -1,3 +1,6 @@
+//! Inverted file RaBitQ index. Compresses the vectors via RaBitQ and
+//! leverages Voronoi cells to reduce the search space.
+
 use bytemuck::Pod;
 use faer::{MatRef, RowRef};
 use faer_traits::ComplexField;
@@ -22,17 +25,14 @@ use crate::utils::*;
 ///
 /// Two-stage search: IVF routing using float centroids, then RaBitQ
 /// distance estimation within probed clusters.
-///
-/// ### Fields
-///
-/// * `encoder` - The RabitQ encoder
-/// * `storage` - The RabitQ storage
-/// * `n` - Number of vectors in the structure
-/// * `vector_store` - Optional on-disk vector storage
 pub struct IvfIndexRaBitQ<T> {
+    /// The RabitQ encoder
     encoder: RaBitQEncoder<T>,
+    /// The RabitQ storage
     storage: RaBitQStorage<T>,
+    /// Number of vectors in the structure
     n: usize,
+    /// Optional vector store that is saved in binary on disk
     vector_store: Option<MmapVectorStore<T>>,
 }
 
@@ -628,6 +628,11 @@ where
         }
     }
 
+    /// Returns the size of the index in bytes
+    ///
+    /// ### Returns
+    ///
+    /// The memory finger print in bytes
     pub fn memory_usage_bytes(&self) -> usize {
         std::mem::size_of_val(self)
             + self.encoder.memory_usage_bytes()

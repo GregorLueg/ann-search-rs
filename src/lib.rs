@@ -1,4 +1,5 @@
 #![allow(clippy::needless_range_loop)] // I want these loops!
+#![warn(missing_docs)]
 
 pub mod annoy;
 pub mod ball_tree;

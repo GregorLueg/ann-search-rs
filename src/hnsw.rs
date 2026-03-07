@@ -1,7 +1,11 @@
+//! HNSW implementation in ann-search-rs. Uses parallel updates during
+//! construction of the index which comes at the cost of determinism.
+
 use faer::{MatRef, RowRef};
 use num_traits::{Float, FromPrimitive};
 use rand::{rngs::SmallRng, Rng, SeedableRng};
 use rayon::prelude::*;
+use std::cell::RefCell;
 use std::{
     cell::UnsafeCell,
     cmp::Reverse,
@@ -20,18 +24,16 @@ use crate::utils::*;
 // Helpers //
 /////////////
 
+/// Type alias for the Neighbour updates
 pub type NeighbourUpdates<T> = Vec<(usize, Vec<(OrderedFloat<T>, usize)>)>;
 
 /// Lock-free bitset for node-level locking during construction
 ///
 /// Uses atomic u64 chunks to allow concurrent lock operations without blocking.
 /// Each bit represents one node's lock state.
-///
-/// ### Fields
-///
-/// * `bits` - Vector of atomic u64 chunks, each storing 64 lock bits
 #[derive(Debug)]
 pub struct AtomicNodeLocks {
+    /// Vector of atomic u64 chunks, each storing 64 lock bits
     bits: Vec<AtomicU64>,
 }
 
@@ -536,17 +538,29 @@ where
 //////////////////////////
 
 thread_local! {
-    static SEARCH_STATE_F32: std::cell::RefCell<SearchState<f32>> = std::cell::RefCell::new(SearchState::new(1000));
-    static BUILD_STATE_F32: std::cell::RefCell<SearchState<f32>> = std::cell::RefCell::new(SearchState::new(1000));
-    static SEARCH_STATE_F64: std::cell::RefCell<SearchState<f64>> = std::cell::RefCell::new(SearchState::new(1000));
-    static BUILD_STATE_F64: std::cell::RefCell<SearchState<f64>> = std::cell::RefCell::new(SearchState::new(1000));
+    static SEARCH_STATE_F32: RefCell<SearchState<f32>> = RefCell::new(SearchState::new(1000));
+    static BUILD_STATE_F32: RefCell<SearchState<f32>> = RefCell::new(SearchState::new(1000));
+    static SEARCH_STATE_F64: RefCell<SearchState<f64>> = RefCell::new(SearchState::new(1000));
+    static BUILD_STATE_F64: RefCell<SearchState<f64>> = RefCell::new(SearchState::new(1000));
 }
 
+/// Provides access to thread-local [`SearchState`] buffers for a given float type.
+///
+/// Separates query and construction state to allow both to run concurrently on
+/// the same thread without clobbering each other's traversal bookkeeping.
 pub trait HnswState<T> {
+    /// Access the thread-local search state for query traversal.
+    ///
+    /// Calls `f` with a reference to the [`RefCell`]-wrapped state and returns
+    /// its result. The borrow must not outlive the closure.
     fn with_search_state<F, R>(f: F) -> R
     where
         F: FnOnce(&std::cell::RefCell<SearchState<T>>) -> R;
 
+    /// Access the thread-local search state for index construction.
+    ///
+    /// Calls `f` with a reference to the [`RefCell`]-wrapped state and returns
+    /// its result. The borrow must not outlive the closure.
     fn with_build_state<F, R>(f: F) -> R
     where
         F: FnOnce(&std::cell::RefCell<SearchState<T>>) -> R;
@@ -593,42 +607,37 @@ impl HnswState<f64> for HnswIndex<f64> {
 /// Implements the HNSW algorithm with multi-layer neighbour storage. Each node
 /// maintains separate neighbour lists for each layer it appears in, enabling
 /// efficient hierarchical search.
-///
-/// ### Fields
-///
-/// * `vectors_flat` - Flattened vector data for cache locality
-/// * `dim` - Dimensionality of vectors
-/// * `n` - Number of vectors
-/// * `norms` - Pre-computed norms for Cosine distance (empty for Euclidean)
-/// * `metric` - Distance metric (Euclidean or Cosine)
-/// * `layer_assignments` - Maximum layer each node appears in
-/// * `neighbours_flat` - Flattened neighbour storage across all layers
-/// * `neighbour_offsets` - Starting offset for each node's neighbours
-/// * `entry_point` - Starting node for queries (highest-layer node)
-/// * `max_layer` - Highest layer in the graph
-/// * `m` - Base connectivity parameter
-/// * `ef_construction` - Size of dynamic candidate list during construction
-/// * `extend_candidates` - Whether to extend candidate pool (unused)
-/// * `keep_pruned` - Whether to keep pruned candidates
 pub struct HnswIndex<T>
 where
     T: AnnSearchFloat,
 {
-    // Vector data
+    /// Flattened vector data for cache locality
     pub vectors_flat: Vec<T>,
+    /// Dimensionality of vectors
     pub dim: usize,
+    /// Number of vectors
     pub n: usize,
+    /// Pre-computed norms for Cosine distance (empty for Euclidean)
     pub norms: Vec<T>,
+    /// Distance metric (Euclidean or Cosine)
     metric: Dist,
-    // HNSW
+    /// Maximum layer each node appears in
     layer_assignments: Vec<u8>,
+    /// Flattened neighbour storage across all layers
     neighbours_flat: Vec<u32>,
+    /// Starting offset for each node's neighbours
     neighbour_offsets: Vec<usize>,
+    /// Starting node for queries (highest-layer node)
     entry_point: u32,
+    /// Highest layer in the graph
     max_layer: u8,
+    /// Base connectivity parameter
     m: usize,
+    /// Size of dynamic candidate list during construction
     ef_construction: usize,
+    ///  Whether to extend candidate pool (unused)
     extend_candidates: bool,
+    /// Whether to keep pruned candidates
     keep_pruned: bool,
 }
 

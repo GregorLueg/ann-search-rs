@@ -1,3 +1,5 @@
+//! Exhaustive (flat) GPU-accelerated index.
+
 use cubecl::prelude::*;
 use faer::MatRef;
 use num_traits::{Float, FromPrimitive};

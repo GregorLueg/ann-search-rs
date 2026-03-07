@@ -1,3 +1,5 @@
+//! SIMD-optimised distance functions for the binary indices
+
 #![allow(dead_code)]
 
 use num_traits::{Float, FromPrimitive};
