@@ -1,3 +1,6 @@
+//! Inverted file index. Leverages k-means clustering to partition data into
+//! Voronoi cells that are being searched during querying.
+
 use faer::{MatRef, RowRef};
 use rayon::prelude::*;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -14,30 +17,26 @@ use crate::utils::*;
 /// cluster maintains an inverted list of vector indices assigned to it.
 /// Queries search only the nprobe nearest clusters, trading perfect recall
 /// for speed.
-///
-/// ### Fields
-///
-/// * `vectors_flat` - Original vector data, flattened for cache locality
-/// * `dim` - Embedding dimensions
-/// * `n` - Number of vectors
-/// * `norms` - Pre-computed norms for Cosine distance (empty for Euclidean)
-/// * `metric` - Distance metric (Euclidean or Cosine)
-/// * `centroids` - Cluster centres (nlist * dim elements)
-/// * `all_indices` - Vector indices for each cluster (in a flat structure)
-/// * `offsets` - Offsets of the elements of each inverted list.
-/// * `nlist` - Number of clusters in the index
 pub struct IvfIndex<T> {
-    /// shared ones
+    /// Original vector data, flattened for cache locality
     pub vectors_flat: Vec<T>,
+    /// Embedding dimensions
     pub dim: usize,
+    /// Number of vectors
     pub n: usize,
+    /// Pre-computed norms for Cosine distance (empty for Euclidean)
     pub norms: Vec<T>,
+    /// The type of distance the index is designed for
     metric: Dist,
-    // index specific ones
+    /// Cluster centres (nlist * dim elements), i.e., the centroids
     centroids: Vec<T>,
+    /// The norms of the centroids for Cosine distance calculations
     centroids_norm: Vec<T>,
+    /// Vector indices for each cluster (in a flat structure)
     all_indices: Vec<usize>,
+    /// Offsets of the elements of each inverted list
     offsets: Vec<usize>,
+    /// Number of clusters in the index
     nlist: usize,
 }
 

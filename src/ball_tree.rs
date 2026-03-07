@@ -1,3 +1,5 @@
+//! BallTree implementation in ann-search-rs.
+
 use faer::{MatRef, RowRef};
 use num_traits::Float;
 use rand::{rngs::StdRng, Rng, SeedableRng};
@@ -226,30 +228,27 @@ enum BuildNode<T> {
 
 /// BallTreeIndex
 ///
-/// ### Fields
-///
-/// * `vectors_flat` - Original vector data, flattened for cache locality
-/// * `dim` - Embedding dimensions
-/// * `n` - Number of vectors
-/// * `norms` - Pre-computed norms for Cosine distance (empty for Euclidean)
-/// * `metric` - Distance metric (Euclidean or Cosine)
-/// * `nodes` - Flattened tree structure containing all split and leaf nodes
-/// * `root` - Starting index of the root
-/// * `centers_data` - Data of the centers
-/// * `radii_data` - Data of the corresponding radii of the ceneters
-/// * `leaf_indices` - Actual data indices stored in leaf nodes
+/// Structure that contains the BallTree index.
 pub struct BallTreeIndex<T> {
-    // Shared data
+    /// Original vector data, flattened for cache locality
     pub vectors_flat: Vec<T>,
+    /// Embedding dimensions
     pub dim: usize,
+    /// Number of vectors
     pub n: usize,
+    /// Pre-computed norms for Cosine distance (empty for Euclidean)
     norms: Vec<T>,
+    /// Distance metric (Euclidean or Cosine)
     metric: Dist,
-    // Index-specific data
+    /// Flattened tree structure containing all split and leaf nodes
     nodes: Vec<BallNode<T>>,
+    /// Starting index of the root
     root: u32,
+    /// Data of the centers
     centers_data: Vec<T>,
+    /// Norms of the centers
     centers_data_norm: Vec<T>,
+    /// Actual data indices stored in leaf nodes
     leaf_indices: Vec<usize>,
 }
 

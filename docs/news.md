@@ -1,5 +1,11 @@
 # News
 
+## 0.2.5
+
+**Features:**
+
+- Improved Annoy with better memory layout for faster querying.
+
 ## 0.2.4
 
 **Features:**

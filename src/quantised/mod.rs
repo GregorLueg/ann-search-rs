@@ -1,3 +1,6 @@
+//! This module contains all of the helpers, structures and methods related
+//! to quantised indices (bf16, SQ8, PQ and OPQ).
+
 pub mod exhaustive_bf16;
 pub mod exhaustive_opq;
 pub mod exhaustive_pq;

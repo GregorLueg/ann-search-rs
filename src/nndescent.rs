@@ -1,3 +1,6 @@
+//! NNDescent implementation in ann-search-rs. Uses concepts of the original
+//! implementation, PyNNDescent and EFANNA.
+
 use faer::{MatRef, RowRef};
 use fixedbitset::FixedBitSet;
 use rand::{rngs::SmallRng, Rng, SeedableRng};
@@ -24,15 +27,12 @@ use crate::utils::*;
 /// Flat structure in C representation for cache locality. The high bit
 /// of `pid_and_flag` stores the is-new flag, leaving 31 bits for the
 /// point id (sufficient for ~2 billion points).
-///
-/// ### Fields
-///
-/// * `pid_and_flag` - Point index + new/old flag in the high bit
-/// * `dist` - Distance to the neighbour
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
 pub struct Neighbour<T> {
+    /// Point index + new/old flag in the high bit
     pid_and_flag: u32,
+    /// Distance to the neighbour
     pub dist: T,
 }
 
@@ -174,7 +174,10 @@ pub trait NNDescentQuery<T> {
     ) -> (Vec<usize>, Vec<T>);
 }
 
+/// Type alias for the query candidates for f32
 pub type QueryCandF32 = RefCell<BinaryHeap<Reverse<(OrderedFloat<f32>, usize)>>>;
+
+/// Type alias for the query candidates for f64
 pub type QueryCandF64 = RefCell<BinaryHeap<Reverse<(OrderedFloat<f64>, usize)>>>;
 
 thread_local! {
@@ -224,27 +227,24 @@ thread_local! {
 /// `O(chunk_size * max_candidates)` rather than `O(n * max_candidates)`.
 /// Each chunk emits both edge directions, sorts by target, and applies
 /// updates lock-free via disjoint pointer writes.
-///
-/// ### Fields
-///
-/// * `vectors_flat` - Original vectors, flattened row-major
-/// * `dim` - Dimensionality
-/// * `n` - Number of vectors
-/// * `k` - Neighbours per node in the graph
-/// * `norms` - Pre-computed L2 norms (Cosine only; empty for Euclidean)
-/// * `metric` - Distance metric
-/// * `forest` - Annoy index for entry points
-/// * `graph` - Flat k-NN graph of size `n * k`
-/// * `converged` - Whether construction converged
 pub struct NNDescent<T> {
+    /// Original vectors, flattened row-major
     pub vectors_flat: Vec<T>,
+    /// Dimensionality of the vectors
     pub dim: usize,
+    /// Number of vectors
     pub n: usize,
+    /// Neighbours per node in the generated kNN graph
     pub k: usize,
+    /// Pre-computed L2 norms (Cosine only; empty for Euclidean)
     pub norms: Vec<T>,
+    /// Distance metric of the index
     metric: Dist,
+    /// Annoy index initialisation and finding the entry points
     forest: AnnoyIndex<T>,
+    /// Flat k-NN graph of size `n * k`
     graph: Vec<(usize, T)>,
+    /// Whether construction converged
     converged: bool,
 }
 

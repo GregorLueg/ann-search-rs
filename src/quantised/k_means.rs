@@ -1,3 +1,6 @@
+//! K-means clustering specifically designed for the product quantisers in
+//! this crate. Optimised specifically for the use case of product quantisation.
+
 use num_traits::Float;
 use rayon::prelude::*;
 

@@ -1,3 +1,6 @@
+//! Exhaustive SQ8 index: quantises the original data to scalar quantisation
+//! to 8 bit (i8).
+
 use faer::{MatRef, RowRef};
 use num_traits::{Float, FromPrimitive, ToPrimitive};
 use rayon::prelude::*;

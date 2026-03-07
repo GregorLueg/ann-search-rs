@@ -1,3 +1,7 @@
+//! Inverted file SQ8 index: quantises the original data to scalar quantisation
+//! to 8 bit (i8) and uses Voronoi cells to identify the most interesting
+//! candidates.
+
 use faer::{MatRef, RowRef};
 use num_traits::{Float, FromPrimitive, ToPrimitive};
 use rayon::prelude::*;
