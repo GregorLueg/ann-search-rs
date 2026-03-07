@@ -1,3 +1,6 @@
+//! Exhaustive bf16 index: quantises the original data to bf16 (keeps the
+//! norms).
+
 use faer::{MatRef, RowRef};
 use half::bf16;
 use rayon::prelude::*;
@@ -17,23 +20,20 @@ use crate::utils::matrix_to_flat;
 ///
 /// Uses under the hood bf16 quantisation for reduced memory finger print and
 /// increased query speed at cost of precision.
-///
-/// ### Fields
-///
-/// * `vectors_flat` - Original vector data for distance calculations. Flattened
-///   for better cache locality
-/// * `norms` - Normalised pre-calculated values per sample if distance is set
-///   to Cosine. Keep `T` here to avoid massive precision loss for Cosine.
-/// * `dim` - Embedding dimensions
-/// * `n` - Number of samples
-/// * `dist_metric` - The type of distance the index is designed for
 pub struct ExhaustiveIndexBf16<T> {
-    // shared ones
+    /// Original vector data for distance calculations. Flattened for better
+    /// cache locality and quantised to bf16
     pub vectors_flat: Vec<bf16>,
+    /// Embedding dimensions
     pub dim: usize,
+    /// Number of samples
     pub n: usize,
+    /// Normalised pre-calculated values per sample if distance is set to
+    /// Cosine. Keep `T` here to avoid massive precision loss for Cosine.
     norms: Vec<T>,
+    /// The type of distance the index is designed for
     metric: Dist,
+    /// PhantomData
     _phantom: PhantomData<T>,
 }
 

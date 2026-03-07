@@ -1,9 +1,10 @@
 //! Annoy implementation in ann-search-rs.
 
 use faer::{MatRef, RowRef};
+use fixedbitset::FixedBitSet;
 use rand::{rngs::StdRng, Rng, SeedableRng};
 use rayon::prelude::*;
-use std::{cmp::Ordering, collections::BinaryHeap};
+use std::collections::BinaryHeap;
 use thousands::*;
 
 use crate::prelude::*;
@@ -404,11 +405,7 @@ where
     /// Signed margin (distance to hyperplane along normal direction)
     #[inline(always)]
     fn get_margin(v1: &[T], v2: &[T], dim: usize) -> T {
-        v1.iter()
-            .zip(v2.iter())
-            .map(|(&a, &b)| a * b)
-            .fold(T::zero(), |acc, x| acc + x)
-            - v2[dim]
+        T::dot_simd(v1, &v2[..dim]) - v2[dim]
     }
 
     ///////////
@@ -442,8 +439,9 @@ where
         let limit = search_k.unwrap_or(k * self.n_trees * 20);
         let mut visited_count = 0;
 
-        let n_vectors = self.vectors_flat.len() / self.dim;
-        let mut visited = VisitedSet::new(n_vectors);
+        // FixedBitSet is < 20KB for 150k nodes. L1 Cache loves this.
+        // (If you use thread locals, keep this in a RefCell to avoid the alloc)
+        let mut visited = FixedBitSet::with_capacity(self.n);
 
         let query_norm = if self.metric == Dist::Cosine {
             query_vec
@@ -455,8 +453,10 @@ where
             T::one()
         };
 
-        let mut top_k: BinaryHeap<(OrderedFloat<T>, usize)> = BinaryHeap::with_capacity(k + 1);
-        let mut kth_dist = T::infinity();
+        // Replace the heap with a flat vector sized exactly to our search budget
+        let mut candidates: Vec<(T, usize)> = Vec::with_capacity(limit);
+
+        // We still need the PQ for tree traversal, but this is much lower volume
         let mut pq = BinaryHeap::with_capacity(self.n_trees * 2);
 
         for &root in &self.roots {
@@ -469,13 +469,10 @@ where
         while visited_count < limit {
             let Some(entry) = pq.pop() else { break };
 
-            if top_k.len() == k && -entry.margin > kth_dist.to_f64().unwrap() {
-                break;
-            }
-
             let mut current_idx = entry.node_idx;
 
             loop {
+                // SAFETY: Tree structure is static and verified at build
                 let node = unsafe { self.nodes.get_unchecked(current_idx as usize) };
 
                 if node.n_descendants == 1 {
@@ -486,9 +483,10 @@ where
                     let leaf_items = unsafe { self.leaf_indices.get_unchecked(start..start + len) };
 
                     for &item in leaf_items {
-                        if visited.mark(item) {
+                        if visited.contains(item) {
                             continue;
                         }
+                        visited.insert(item);
 
                         let vec_start = item * self.dim;
                         let vec = unsafe {
@@ -520,15 +518,8 @@ where
                             }
                         };
 
-                        if dist < kth_dist || top_k.len() < k {
-                            top_k.push((OrderedFloat(dist), item));
-                            if top_k.len() > k {
-                                top_k.pop();
-                            }
-                            if top_k.len() == k {
-                                kth_dist = top_k.peek().unwrap().0 .0;
-                            }
-                        }
+                        // FLAT ARRAY PUSH - No heap overhead!
+                        candidates.push((dist, item));
                     }
                     break;
                 } else {
@@ -558,13 +549,22 @@ where
             }
         }
 
-        let mut results: Vec<(usize, T)> = top_k
-            .into_iter()
-            .map(|(OrderedFloat(dist), idx)| (idx, dist))
-            .collect();
+        // O(N) selection of the top K elements
+        if candidates.len() > k {
+            candidates.select_nth_unstable_by(k - 1, |a, b| {
+                a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal)
+            });
+            candidates.truncate(k);
+        }
 
-        results.sort_unstable_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(Ordering::Equal));
-        results.into_iter().unzip()
+        // Sort only the final K elements
+        candidates
+            .sort_unstable_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+
+        candidates
+            .into_iter()
+            .map(|(dist, idx)| (idx, dist))
+            .unzip()
     }
 
     /// Query using a matrix row reference

@@ -1,3 +1,8 @@
+//! Optimised vector searches in Rust originally designed for single cell
+//! applications, but now as additionally GPU-accelerated, quantised (with
+//! binary indices) vector searches leveraging Rust's performance under the
+//! hood.
+
 #![allow(clippy::needless_range_loop)] // I want these loops!
 #![warn(missing_docs)]
 

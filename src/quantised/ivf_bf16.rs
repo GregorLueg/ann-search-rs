@@ -1,3 +1,7 @@
+//! Inverted file index with bf16 quantisation: quantises the original data to
+//! bf16 (keeps the norms) and uses Voronoi cells to identify the most
+//! interesting candidates.
+
 use faer::{MatRef, RowRef};
 use half::*;
 use rayon::prelude::*;
@@ -17,31 +21,28 @@ use crate::utils::*;
 /// Queries search only the nprobe nearest clusters, trading perfect recall
 /// for speed. This version leverages `bf16` quantisation under the hood,
 /// reducing memory fingerprint and query speed at cost of precision.
-///
-/// ### Fields
-///
-/// * `vectors_flat` - Original vector data, flattened for cache locality
-/// * `dim` - Embedding dimensions
-/// * `n` - Number of vectors
-/// * `norms` - Pre-computed norms for Cosine distance (empty for Euclidean).
-///   Keep `T` here to avoid massive precision loss for Cosine.
-/// * `metric` - Distance metric (Euclidean or Cosine)
-/// * `centroids` - Cluster centres (nlist * dim elements)
-/// * `all_indices` - Vector indices for each cluster (in a flat structure)
-/// * `offsets` - Offsets of the elements of each inverted list.
-/// * `nlist` - Number of clusters in the index
 pub struct IvfIndexBf16<T> {
-    /// shared ones
+    /// Original vector data, flattened for cache locality and quantised
+    /// to bf16
     pub vectors_flat: Vec<bf16>,
+    /// Embedding dimensions
     pub dim: usize,
+    /// Number of vectors
     pub n: usize,
+    /// Pre-computed norms for Cosine distance (empty for Euclidean). Keep
+    /// `T` here to avoid massive precision loss for Cosine.
     pub norms: Vec<T>,
+    /// Distance metric (Euclidean or Cosine)
     metric: Dist,
-    // index specific ones
+    /// Cluster centroids (nlist * dim elements)
     centroids: Vec<T>,
+    /// Cluster centroids norms for Cosine distance
     centroids_norm: Vec<T>,
+    /// Vector indices for each cluster (in a flat structure)
     all_indices: Vec<usize>,
+    /// Offsets of the elements of each inverted list
     offsets: Vec<usize>,
+    /// Number of clusters in the index
     nlist: usize,
 }
 

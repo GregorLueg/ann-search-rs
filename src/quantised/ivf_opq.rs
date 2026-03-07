@@ -1,3 +1,7 @@
+//! Inverted file OPQ index: quantises the original data via optimised product
+//! quantisation and uses Voronoi cells to identify the most interesting
+//! candidates.
+
 use faer::{MatRef, RowRef};
 use rayon::prelude::*;
 use std::collections::BinaryHeap;
