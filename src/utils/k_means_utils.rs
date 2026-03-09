@@ -1174,9 +1174,9 @@ fn gemm_lloyd_cosine<T>(
     }
 }
 
-///////////////////
-// Lloyd's (SIMD //
-///////////////////
+////////////////////
+// Lloyd's (SIMD) //
+////////////////////
 
 /// Parallel Lloyd's k-means iterations
 ///

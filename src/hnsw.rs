@@ -6,18 +6,11 @@ use num_traits::{Float, FromPrimitive};
 use rand::{rngs::SmallRng, Rng, SeedableRng};
 use rayon::prelude::*;
 use std::cell::RefCell;
-use std::{
-    cell::UnsafeCell,
-    cmp::Reverse,
-    collections::BinaryHeap,
-    iter::Sum,
-    marker::PhantomData,
-    sync::atomic::{AtomicU64, Ordering},
-    time::Instant,
-};
+use std::{cell::UnsafeCell, cmp::Reverse, iter::Sum, marker::PhantomData, time::Instant};
 use thousands::*;
 
 use crate::prelude::*;
+use crate::utils::graph_utils::*;
 use crate::utils::*;
 
 /////////////
@@ -26,223 +19,6 @@ use crate::utils::*;
 
 /// Type alias for the Neighbour updates
 pub type NeighbourUpdates<T> = Vec<(usize, Vec<(OrderedFloat<T>, usize)>)>;
-
-/// Lock-free bitset for node-level locking during construction
-///
-/// Uses atomic u64 chunks to allow concurrent lock operations without blocking.
-/// Each bit represents one node's lock state.
-#[derive(Debug)]
-pub struct AtomicNodeLocks {
-    /// Vector of atomic u64 chunks, each storing 64 lock bits
-    bits: Vec<AtomicU64>,
-}
-
-impl AtomicNodeLocks {
-    /// Create a new lock bitset with capacity for n nodes
-    ///
-    /// Allocates enough u64 chunks to store one bit per node, rounding up
-    /// to the nearest 64-node boundary.
-    ///
-    /// ### Params
-    ///
-    /// * `capacity` - Number of nodes to support
-    ///
-    /// ### Returns
-    ///
-    /// Initialised lock bitset with all locks released
-    pub fn new(capacity: usize) -> Self {
-        let num_slots = capacity.div_ceil(64);
-        Self {
-            bits: (0..num_slots).map(|_| AtomicU64::new(0)).collect(),
-        }
-    }
-
-    /// Attempt to acquire a lock on a node
-    ///
-    /// Returns immediately without blocking. Uses compare-and-swap to
-    /// atomically check and set the lock bit.
-    ///
-    /// ### Params
-    ///
-    /// * `idx` - Node index to lock
-    ///
-    /// ### Returns
-    ///
-    /// `true` if lock was already held, `false` if successfully acquired
-    #[inline(always)]
-    pub fn try_lock(&self, idx: usize) -> bool {
-        let slot = idx / 64;
-        let bit = 1u64 << (idx % 64);
-        let prev = self.bits[slot].fetch_or(bit, Ordering::Acquire);
-        (prev & bit) != 0
-    }
-
-    /// Acquire a lock on a node, spinning until successful
-    ///
-    /// Repeatedly calls try_lock until the lock is acquired. Uses spin_loop
-    /// hint to reduce CPU contention.
-    ///
-    /// ### Params
-    ///
-    /// * `idx` - Node index to lock
-    #[inline(always)]
-    pub fn lock(&self, idx: usize) {
-        while self.try_lock(idx) {
-            std::hint::spin_loop();
-        }
-    }
-
-    /// Release a lock on a node
-    ///
-    /// Atomically clears the lock bit, making it available for other threads.
-    ///
-    /// ### Params
-    ///
-    /// * `idx` - Node index to unlock
-    #[inline(always)]
-    pub fn unlock(&self, idx: usize) {
-        let slot = idx / 64;
-        let bit = !(1u64 << (idx % 64));
-        self.bits[slot].fetch_and(bit, Ordering::Release);
-    }
-
-    /// Acquire a lock and return an RAII guard
-    ///
-    /// The lock is automatically released when the guard is dropped.
-    ///
-    /// ### Params
-    ///
-    /// * `idx` - Node index to lock
-    ///
-    /// ### Returns
-    ///
-    /// Guard that releases the lock on drop
-    #[inline(always)]
-    pub fn lock_guard(&self, idx: usize) -> NodeLockGuard<'_> {
-        self.lock(idx);
-        NodeLockGuard { locks: self, idx }
-    }
-}
-
-/// RAII guard for automatic lock release
-///
-/// Holds a reference to the lock bitset and the locked node index.
-/// Automatically releases the lock when dropped.
-///
-/// ### Fields
-///
-/// * `locks` - Reference to the parent lock bitset
-/// * `idx` - Index of the locked node
-pub struct NodeLockGuard<'a> {
-    locks: &'a AtomicNodeLocks,
-    idx: usize,
-}
-
-impl<'a> Drop for NodeLockGuard<'a> {
-    /// Drop method
-    fn drop(&mut self) {
-        self.locks.unlock(self.idx);
-    }
-}
-
-/// Search state for HNSW queries and construction
-///
-/// Maintains visited tracking and candidate management for graph traversal.
-/// Reused across queries to amortise allocation costs.
-///
-/// ### Fields
-///
-/// * `visited` - Per-node visit tracking using incrementing IDs
-/// * `visit_id` - Current visit epoch (wraps around, triggers reset)
-/// * `candidates` - Min-heap of nodes to explore, ordered by distance
-/// * `working_sorted` - Sorted buffer of current best candidates
-/// * `scratch_working` - Temporary storage for heuristic selection
-/// * `scratch_discarded` - Temporary storage for pruned candidates
-pub struct SearchState<T> {
-    visited: Vec<usize>,
-    visit_id: usize,
-    candidates: BinaryHeap<Reverse<(OrderedFloat<T>, usize)>>,
-    working_sorted: SortedBuffer<(OrderedFloat<T>, usize)>,
-    scratch_working: Vec<(OrderedFloat<T>, usize)>,
-    scratch_discarded: Vec<(OrderedFloat<T>, usize)>,
-}
-
-impl<T> SearchState<T>
-where
-    T: Float + Sum,
-{
-    /// Create a new search state with initial capacity
-    ///
-    /// Allocates buffers sized for the given capacity to avoid reallocations
-    /// during typical queries.
-    ///
-    /// ### Params
-    ///
-    /// * `capacity` - Initial capacity for internal buffers
-    ///
-    /// ### Returns
-    ///
-    /// Initialised search state ready for use
-    fn new(capacity: usize) -> Self {
-        Self {
-            visited: vec![0; capacity],
-            visit_id: 1,
-            candidates: BinaryHeap::with_capacity(capacity),
-            working_sorted: SortedBuffer::with_capacity(capacity),
-            scratch_working: Vec::with_capacity(capacity),
-            scratch_discarded: Vec::with_capacity(capacity),
-        }
-    }
-
-    /// Reset state for a new query
-    ///
-    /// Clears all buffers and advances the visit epoch. If the epoch wraps
-    /// around to zero, performs a full reset of the visited array.
-    ///
-    /// ### Params
-    ///
-    /// * `n` - Number of nodes in the graph (for capacity adjustment)
-    fn reset(&mut self, n: usize) {
-        if self.visited.len() < n {
-            self.visited.resize(n, 0);
-        }
-
-        self.visit_id = self.visit_id.wrapping_add(1);
-        if self.visit_id == 0 {
-            self.visited.fill(0);
-            self.visit_id = 1;
-        }
-
-        self.candidates.clear();
-        self.working_sorted.clear();
-        self.scratch_working.clear();
-        self.scratch_discarded.clear();
-    }
-
-    /// Check if a node has been visited in the current query
-    ///
-    /// ### Params
-    ///
-    /// * `node` - Node index to check
-    ///
-    /// ### Returns
-    ///
-    /// `true` if node was already visited, `false` otherwise
-    #[inline(always)]
-    fn is_visited(&self, node: usize) -> bool {
-        self.visited[node] == self.visit_id
-    }
-
-    /// Mark a node as visited in the current query
-    ///
-    /// ### Params
-    ///
-    /// * `node` - Node index to mark
-    #[inline(always)]
-    fn mark_visited(&mut self, node: usize) {
-        self.visited[node] = self.visit_id;
-    }
-}
 
 impl<T: Ord> Default for SortedBuffer<T> {
     fn default() -> Self {
@@ -799,7 +575,7 @@ where
             })
             .collect();
 
-        let max_layer = *layer_assignments.iter().max().unwrap_or(&0);
+        let max_layer = layer_assignments.iter().copied().fold(0u8, u8::max);
         let entry_point = layer_assignments
             .iter()
             .position(|&l| l == max_layer)
