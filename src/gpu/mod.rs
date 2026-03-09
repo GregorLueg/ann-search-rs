@@ -4,6 +4,7 @@
 pub mod dist_gpu;
 pub mod exhaustive_gpu;
 pub mod ivf_gpu;
+pub mod nndescent_gpu;
 pub mod tensor;
 
 ///////////
