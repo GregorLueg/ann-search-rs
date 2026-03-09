@@ -1,5 +1,4 @@
-//! HNSW implementation in ann-search-rs. Uses parallel updates during
-//! construction of the index which comes at the cost of determinism.
+//! LSH multi-probe implemetation in ann-search-rs.
 
 use faer::{MatRef, RowRef};
 use num_traits::Float;

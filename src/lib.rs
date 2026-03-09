@@ -15,6 +15,7 @@ pub mod lsh;
 pub mod nndescent;
 pub mod prelude;
 pub mod utils;
+pub mod vamana;
 
 #[cfg(feature = "gpu")]
 pub mod gpu;
@@ -58,6 +59,7 @@ use crate::ivf::*;
 use crate::lsh::*;
 use crate::nndescent::*;
 use crate::prelude::*;
+use crate::vamana::*;
 
 #[cfg(feature = "binary")]
 use crate::binary::{exhaustive_binary::*, exhaustive_rabitq::*, ivf_binary::*, ivf_rabitq::*};
@@ -893,6 +895,101 @@ where
     T: AnnSearchFloat,
     NNDescent<T>: ApplySortedUpdates<T>,
     NNDescent<T>: NNDescentQuery<T>,
+{
+    index.generate_knn(k, ef_search, return_dist, verbose)
+}
+
+////////////
+// Vamana //
+////////////
+
+/// Build a Vamana index
+///
+/// ### Params
+///
+/// * `mat` - The data matrix. Rows are samples, columns are dimensions.
+/// * `r` - Maximum out-degree (edges per node).
+/// * `l_build` - Beam width during construction.
+/// * `alpha_pass1` - Pruning alpha for pass 1 (typically 1.0).
+/// * `alpha_pass2` - Pruning alpha for pass 2 (typically 1.2–1.5).
+/// * `dist_metric` - One of `"euclidean"` or `"cosine"`.
+/// * `seed` - Random seed for reproducibility.
+///
+/// ### Returns
+///
+/// The built `VamanaIndex`.
+pub fn build_vamana_index<T>(
+    mat: MatRef<T>,
+    r: usize,
+    l_build: usize,
+    alpha_pass1: f32,
+    alpha_pass2: f32,
+    dist_metric: &str,
+    seed: usize,
+) -> VamanaIndex<T>
+where
+    T: AnnSearchFloat,
+    VamanaIndex<T>: VamanaState<T>,
+{
+    let metric = parse_ann_dist(dist_metric).unwrap_or(Dist::Euclidean);
+    VamanaIndex::build(mat, metric, r, l_build, alpha_pass1, alpha_pass2, seed)
+}
+
+/// Query a Vamana index with an external query matrix
+///
+/// ### Params
+///
+/// * `query_mat` - Query matrix (samples × features).
+/// * `index` - Reference to the built index.
+/// * `k` - Number of neighbours to return.
+/// * `ef_search` - Optional beam width override. Defaults to 100 inside the
+///   index if `None`.
+/// * `return_dist` - Whether to return distances.
+/// * `verbose` - Print progress every 100,000 samples.
+///
+/// ### Returns
+///
+/// A tuple of `(knn_indices, optional distances)`.
+pub fn query_vamana_index<T>(
+    query_mat: MatRef<T>,
+    index: &VamanaIndex<T>,
+    k: usize,
+    ef_search: Option<usize>,
+    return_dist: bool,
+    verbose: bool,
+) -> (Vec<Vec<usize>>, Option<Vec<Vec<T>>>)
+where
+    T: AnnSearchFloat,
+    VamanaIndex<T>: VamanaState<T>,
+{
+    query_parallel(query_mat.nrows(), return_dist, verbose, |i| {
+        index.query_row(query_mat.row(i), k, ef_search)
+    })
+}
+
+/// Self-query a Vamana index to generate a full kNN graph
+///
+/// ### Params
+///
+/// * `index` - Reference to the built index.
+/// * `k` - Number of neighbours to return.
+/// * `ef_search` - Optional beam width override.
+/// * `return_dist` - Whether to return distances.
+/// * `verbose` - Print progress every 100,000 samples.
+///
+/// ### Returns
+///
+/// A tuple of `(knn_indices, optional distances)`.
+pub fn query_vamana_self<T>(
+    index: &VamanaIndex<T>,
+    k: usize,
+    ef_search: Option<usize>,
+    return_dist: bool,
+    verbose: bool,
+) -> (Vec<Vec<usize>>, Option<Vec<Vec<T>>>)
+where
+    T: AnnSearchFloat,
+    VamanaIndex<T>: VamanaState<T>,
 {
     index.generate_knn(k, ef_search, return_dist, verbose)
 }

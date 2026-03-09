@@ -553,13 +553,16 @@ where
     ///
     /// ### Params
     ///
-    /// * `graph` - Reference to current neighbours
-    /// * `k` - Number of neighbours to take
-    /// * `iter_seed` - Iteration seed
-    /// * `new_cands` - Mutable slice to new candidates
-    /// * `old_cands` - Mutable slice to old candidates
-    /// * `new_cands_sym` - Mutable slice to new symmetric candidates
-    /// * `old_cands_sym` - Mutable slice to old symmetric candidates
+    /// * `graph` - Current flat k-NN graph
+    /// * `k` - Neighbours per node
+    /// * `max_candidates` - Maximum candidates to sample per node
+    /// * `iter_seed` - Per-iteration seed for reproducible sampling
+    /// * `new_cands` - Output: sampled new (unexplored) neighbours per node
+    /// * `old_cands` - Output: sampled old (explored) neighbours per node
+    /// * `new_cands_sym` - Output: reverse edges into `new_cands` (cleared and
+    ///   repopulated)
+    /// * `old_cands_sym` - Output: reverse edges into `old_cands` (cleared and
+    ///   repopulated)
     #[allow(clippy::too_many_arguments)]
     fn build_candidates(
         &self,
@@ -685,7 +688,16 @@ where
     ///
     /// ### Params
     ///
+    /// * `new_cands` - New (unexplored) candidate lists per node
+    /// * `old_cands` - Old (explored) candidate lists per node
+    /// * `graph` - Current flat k-NN graph
+    /// * `k` - Neighbours per node
+    /// * `chunk_start` - First source node index (inclusive)
+    /// * `chunk_end` - Last source node index (exclusive)
     ///
+    /// ### Returns
+    ///
+    /// Unsorted list of `(target, source, distance)` update triples
     fn generate_updates_for_chunk(
         &self,
         new_cands: &[Vec<usize>],
@@ -763,6 +775,15 @@ where
     }
 
     /// Calculate distance between two indexed points.
+    ///
+    /// ### Params
+    ///
+    /// * `i` - Index of first vector
+    /// * `j` - Index of second vector
+    ///
+    /// ### Returns
+    ///
+    /// Distance under the index metric
     #[inline]
     fn distance(&self, i: usize, j: usize) -> T {
         match self.metric {

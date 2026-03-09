@@ -5,6 +5,9 @@
 **Features:**
 
 - Improved Annoy with better memory layout for faster querying.
+- Better documentation (more Rust idiomatic), plus correction of copy and paste
+  errors.
+- Vamana index added
 
 ## 0.2.4
 
