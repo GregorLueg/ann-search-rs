@@ -559,7 +559,7 @@ where
         let rho = rho.unwrap_or(DEFAULT_RHO);
         let rho_thresh = (rho * 65535.0) as u32;
 
-        // Pad dim to next multiple of LINE_SIZE
+        // pad dim to next multiple of LINE_SIZE
         let line = LINE_SIZE as usize;
         let dim_padded = dim.next_multiple_of(line);
         let dim_vec = dim_padded / line;
@@ -592,33 +592,32 @@ where
         let client = R::client(&device);
         let use_cosine = metric == Dist::Cosine;
 
-        // Upload vectors (stays resident for the entire build)
+        // upload vectors (stays resident for the entire build)
         let vectors_gpu = GpuTensor::<R, T>::from_slice(&vectors_padded, vec![n, dim_vec], &client);
 
-        // Norms tensor (dummy scalar if Euclidean to avoid Option in kernel args)
+        // norms tensor (dummy scalar if Euclidean to avoid Option in kernel args)
         let norms_gpu = if use_cosine {
             GpuTensor::<R, T>::from_slice(&norms, vec![n], &client)
         } else {
             GpuTensor::<R, T>::from_slice(&[T::zero()], vec![1], &client)
         };
 
-        // Graph buffers on GPU
+        // graph buffers on GPU
         let graph_idx_gpu = GpuTensor::<R, u32>::empty(vec![n, k], &client);
         let graph_dist_gpu = GpuTensor::<R, T>::empty(vec![n, k], &client);
 
-        // Proposal buffers on GPU
+        // proposal buffers on GPU
         let max_prop = MAX_PROPOSALS;
         let prop_idx_gpu = GpuTensor::<R, u32>::empty(vec![n, max_prop], &client);
         let prop_dist_gpu = GpuTensor::<R, T>::empty(vec![n, max_prop], &client);
         let prop_count_gpu = GpuTensor::<R, u32>::empty(vec![n], &client);
 
-        // Convergence counter (single u32)
+        // convergence counter (single u32)
         let update_counter_gpu = GpuTensor::<R, u32>::empty(vec![1], &client);
 
         let grid_n = (n as u32).div_ceil(WORKGROUP_SIZE_X);
 
-        // ---- Step 1: Random graph initialisation ----
-
+        // generate the random graph
         let start = Instant::now();
 
         unsafe {
@@ -640,7 +639,7 @@ where
             println!("  Random init: {:.2?}", start.elapsed());
         }
 
-        // ---- Step 2: NNDescent iterations ----
+        // nndescent iterations
 
         let iter_start = Instant::now();
         let mut converged = false;
@@ -658,7 +657,7 @@ where
                 );
             }
 
-            // Local join: enumerate pairs, compute distances, write proposals
+            // local join: enumerate pairs, compute distances, write proposals
             let iter_seed = seed as u32 ^ (iter as u32).wrapping_mul(0x9E3779B9u32);
             unsafe {
                 let _ = local_join::launch_unchecked::<T, R>(
@@ -680,7 +679,7 @@ where
                 );
             }
 
-            // Merge proposals into the graph
+            // merge proposals into the graph
             unsafe {
                 let _ = merge_proposals::launch_unchecked::<T, R>(
                     &client,
@@ -697,7 +696,7 @@ where
                 );
             }
 
-            // Download single u32 to check convergence
+            // download single u32 to check convergence
             let counter_data = update_counter_gpu.clone().read(&client);
             let updates = counter_data[0] as f64;
             let rate = updates / (n * k) as f64;
@@ -724,7 +723,7 @@ where
             println!("  NNDescent iterations: {:.2?}", iter_start.elapsed());
         }
 
-        // ---- Step 3: Download final graph ----
+        // pull final graph from GPU
 
         let final_idx = graph_idx_gpu.read(&client);
         let final_dist = graph_dist_gpu.read(&client);
@@ -806,11 +805,11 @@ mod tests {
         for i in 0..20 {
             let nbrs = index.neighbours(i);
             assert_eq!(nbrs.len(), 5);
-            // Distances should be sorted ascending
+            // distances should be sorted ascending
             for w in nbrs.windows(2) {
                 assert!(w[1].1 >= w[0].1);
             }
-            // No self-loops
+            // no self-loops
             for &(pid, _) in nbrs {
                 assert_ne!(pid, i);
             }
