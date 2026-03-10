@@ -2,11 +2,6 @@
 //!
 //! All vector data remains GPU-resident throughout construction. The host
 //! loop only downloads a single u32 convergence counter per iteration.
-//!
-//! NOTE: The atomic operations (`Atomic::add`, `Atomic::load`,
-//! `Atomic::store`) used in these kernels depend on CubeCL's atomic API.
-//! The exact method signatures may need adjustment depending on your
-//! CubeCL version. The pattern and intent should be clear.
 
 use cubecl::frontend::{Atomic, CubePrimitive, Float};
 use cubecl::prelude::*;
@@ -34,11 +29,19 @@ const DEFAULT_DELTA: f32 = 0.001;
 /// Default sampling rate for the local join
 const DEFAULT_RHO: f32 = 0.5;
 
-/////////////////////
-// Kernel helpers  //
-/////////////////////
+////////////////////
+// Kernel helpers //
+////////////////////
 
 /// Simple xorshift32 PRNG for deterministic per-thread random decisions.
+///
+/// ### Params
+///
+/// * `state` - Current PRNG state
+///
+/// ### Returns
+///
+/// Next PRNG state
 #[cube]
 fn xorshift(state: u32) -> u32 {
     let mut x = state;
@@ -49,14 +52,36 @@ fn xorshift(state: u32) -> u32 {
 }
 
 /// Deterministic hash for per-entry rho sampling decisions.
-/// Same (node, entry, seed) triple always produces the same result,
-/// so no local storage is needed for the participation decision.
+///
+/// Same (node, entry, seed) triple always produces the same result, so no local
+/// storage is needed for the participation decision.
+///
+/// ### Params
+///
+/// * `node` - Source node index
+/// * `entry` - Neighbour slot index within the node's adjacency list
+/// * `seed` - Per-iteration seed
+///
+/// ### Returns
+///
+/// A pseudo-random u32 for use in sampling decisions
 #[cube]
 fn entry_hash(node: u32, entry: u32, seed: u32) -> u32 {
     xorshift(node ^ (entry * 2654435769u32) ^ seed)
 }
 
 /// Squared Euclidean distance between vectors at indices `a` and `b`.
+///
+/// ### Params
+///
+/// * `vectors` - Row-major vector matrix, line-vectorised along the feature
+///   dimension
+/// * `a` - Row index of the first vector
+/// * `b` - Row index of the second vector
+///
+/// ### Returns
+///
+/// Squared Euclidean distance between the two vectors
 #[cube]
 fn dist_sq_euclidean<F: Float + CubePrimitive>(vectors: &Tensor<Line<F>>, a: u32, b: u32) -> F {
     let dim_lines = vectors.shape(1);
@@ -79,7 +104,20 @@ fn dist_sq_euclidean<F: Float + CubePrimitive>(vectors: &Tensor<Line<F>>, a: u32
 }
 
 /// Cosine distance (1 - cosine similarity) between vectors at `a` and `b`.
+///
 /// Requires pre-computed L2 norms.
+///
+/// ### Params
+///
+/// * `vectors` - Row-major vector matrix, line-vectorised along the feature
+///   dimension
+/// * `norms` - Pre-computed L2 norms, one per row
+/// * `a` - Row index of the first vector
+/// * `b` - Row index of the second vector
+///
+/// ### Returns
+///
+/// Cosine distance in the range [0, 2]
 #[cube]
 fn dist_cosine<F: Float>(vectors: &Tensor<Line<F>>, norms: &Tensor<F>, a: u32, b: u32) -> F {
     let dim_lines = vectors.shape(1);
@@ -109,6 +147,17 @@ fn dist_cosine<F: Float>(vectors: &Tensor<Line<F>>, norms: &Tensor<F>, a: u32, b
 /// One thread per node. Generates k random neighbours, computes distances,
 /// and maintains a sorted (ascending by distance) list via insertion.
 /// All entries are flagged as new (MSB set).
+///
+/// ### Params
+///
+/// * `vectors` - Row-major vector matrix, line-vectorised along the feature
+///   dimension
+/// * `norms` - Pre-computed L2 norms (ignored when `use_cosine` is false)
+/// * `n` - Number of vectors
+/// * `seed` - Random seed for neighbour generation
+/// * `use_cosine` - Whether to use cosine distance instead of squared Euclidean
+///
+/// Writes an initialised sorted kNN graph into `graph_idx` and `graph_dist`.
 ///
 /// ### Grid mapping
 ///
@@ -177,6 +226,12 @@ fn init_random_graph<F: Float>(
 ///
 /// One thread per node. Thread 0 additionally resets the update counter.
 ///
+/// ### Params
+///
+/// * `n` - Number of nodes
+///
+/// Zeroes all entries in `prop_count` and resets `update_counter[0]` to zero.
+///
 /// ### Grid mapping
 ///
 /// * `ABSOLUTE_POS_X` -> node index
@@ -203,6 +258,24 @@ fn reset_proposals(prop_count: &mut Tensor<u32>, update_counter: &mut Tensor<u32
 /// is needed; the participation decision for entry `i` of node `S` is
 /// recomputed identically each time it is checked.
 ///
+/// ### Params
+///
+/// * `vectors` - Row-major vector matrix, line-vectorised along the feature
+///   dimension
+/// * `norms` - Pre-computed L2 norms (ignored when `use_cosine` is false)
+/// * `graph_idx` - Current kNN graph indices, MSB encodes the is-new flag
+/// * `graph_dist` - Current kNN graph distances, sorted ascending per row
+/// * `n` - Number of nodes
+/// * `rho_thresh` - Sampling threshold in [0, 65535]; entry participates if
+///   hash < threshold
+/// * `iter_seed` - Per-iteration seed for the sampling hash
+/// * `max_proposals` - Proposal buffer capacity per node (comptime)
+/// * `use_cosine` - Whether to use cosine distance instead of squared Euclidean
+///   (comptime)
+///
+/// Appends candidate (index, distance) pairs into `prop_idx`, `prop_dist`,
+/// and increments `prop_count` atomically for each target node.
+///
 /// ### Grid mapping
 ///
 /// * `ABSOLUTE_POS_X` -> source node index
@@ -214,7 +287,7 @@ fn local_join<F: Float>(
     graph_dist: &Tensor<F>,
     prop_idx: &mut Tensor<u32>,
     prop_dist: &mut Tensor<F>,
-    prop_count: &Tensor<Atomic<u32>>, // Keep as Tensor of Atomic
+    prop_count: &Tensor<Atomic<u32>>,
     n: u32,
     rho_thresh: u32,
     iter_seed: u32,
@@ -253,11 +326,7 @@ fn local_join<F: Float>(
                                 dist_sq_euclidean(vectors, pid_i, pid_j)
                             };
 
-                            // --- 0.9.0 CORRECT ATOMIC PATTERN ---
-                            // We use the variable directly from the tensor.
-                            // The method 'add' is defined on the Atomic element.
-
-                            let slot_i = prop_count[pid_i as usize].add(1u32);
+                            let slot_i = prop_count[pid_i as usize].fetch_add(1u32);
                             if slot_i < max_proposals {
                                 let off =
                                     pid_i as usize * (max_proposals as usize) + (slot_i as usize);
@@ -265,7 +334,7 @@ fn local_join<F: Float>(
                                 prop_dist[off] = dist;
                             }
 
-                            let slot_j = prop_count[pid_j as usize].add(1u32);
+                            let slot_j = prop_count[pid_j as usize].fetch_add(1u32);
                             if slot_j < max_proposals {
                                 let off =
                                     pid_j as usize * (max_proposals as usize) + (slot_j as usize);
@@ -288,6 +357,19 @@ fn local_join<F: Float>(
 /// 3. Skips duplicates already in the graph.
 /// 4. Inserts improvements into the sorted list, flagged as new.
 /// 5. Atomically accumulates the total improvement count.
+///
+/// ### Params
+///
+/// * `prop_idx` - Proposal candidate indices, row-major with `max_proposals`
+///   columns
+/// * `prop_dist` - Proposal candidate distances, matching layout to `prop_idx`
+/// * `prop_count` - Number of valid proposals received per node
+/// * `n` - Number of nodes
+/// * `max_proposals` - Proposal buffer capacity per node (comptime)
+///
+/// Updates `graph_idx` and `graph_dist` in place with any improvements, flags
+/// inserted entries as new, and accumulates the total improvement count into
+/// `update_counter[0]`.
 ///
 /// ### Grid mapping
 ///
@@ -332,7 +414,7 @@ fn merge_proposals<F: Float>(
             // Only process if better than current worst
             if dist < graph_dist[base + k - 1] {
                 // Check for duplicates
-                let mut exists = 0u32;
+                let mut exists: u32 = 0u32;
                 for j in 0..k {
                     if (graph_idx[base + j] & pid_mask) == candidate {
                         exists = 1u32;
@@ -369,41 +451,65 @@ fn merge_proposals<F: Float>(
     }
 
     if improvements > 0u32 {
-        Atomic::add(&update_counter[0usize], improvements);
+        update_counter[0usize].fetch_add(improvements);
     }
 }
 
-/////////////////////
-// NNDescentGpu    //
-/////////////////////
+/////////////
+// Helpers //
+/////////////
+
+/// Pad vectors to `dim_padded` by appending zeros to each row.
+///
+/// ### Params
+///
+/// * `flat` - Flattened row-major vector data with `dim` features per row
+/// * `n` - Number of vectors
+/// * `dim` - Original feature dimensionality
+/// * `dim_padded` - Target dimensionality, must be >= `dim`
+///
+/// ### Returns
+///
+/// Flattened row-major buffer of size `n * dim_padded` with each row zero-padded
+/// to `dim_padded`
+fn pad_vectors<T: Float>(flat: &[T], n: usize, dim: usize, dim_padded: usize) -> Vec<T> {
+    let mut padded = vec![T::zero(); n * dim_padded];
+    for i in 0..n {
+        let src = &flat[i * dim..(i + 1) * dim];
+        let dst = &mut padded[i * dim_padded..i * dim_padded + dim];
+        dst.copy_from_slice(src);
+    }
+    padded
+}
+
+//////////////////
+// NNDescentGpu //
+//////////////////
 
 /// GPU-accelerated NNDescent kNN graph builder.
 ///
 /// Builds a k-NN graph entirely on the GPU, downloading only a single u32
 /// convergence counter per iteration. The final graph is downloaded once
 /// at the end.
-///
-/// ### Fields
-///
-/// * `vectors_flat` - Original (unpadded) vector data, flattened row-major
-/// * `dim` - Original embedding dimensionality
-/// * `n` - Number of vectors
-/// * `k` - Neighbours per node
-/// * `norms` - Pre-computed L2 norms (Cosine only; empty for Euclidean)
-/// * `metric` - Distance metric
-/// * `graph` - Flat kNN graph of size `n * k`, sorted by distance per row
-/// * `converged` - Whether construction hit the delta threshold
-/// * `device` - CubeCL runtime device
 pub struct NNDescentGpu<T: Float, R: Runtime> {
+    /// Original (unpadded) vector data, flattened row-major
     pub vectors_flat: Vec<T>,
+    /// Original embedding dimensionality
     pub dim: usize,
+    /// Number of vectors
     pub n: usize,
+    /// Neighbours per node
     pub k: usize,
+    /// Pre-computed L2 norms (Cosine only; empty for Euclidean)
     pub norms: Vec<T>,
+    /// Distance metric
     pub metric: Dist,
+    /// Flat kNN graph of size `n * k`, sorted by distance per row
     pub graph: Vec<(usize, T)>,
+    /// Whether construction hit the delta threshold
     pub converged: bool,
-    device: R::Device,
+    /// CubeCL runtime device
+    _device: R::Device,
 }
 
 impl<T, R> NNDescentGpu<T, R>
@@ -553,7 +659,7 @@ where
             }
 
             // Local join: enumerate pairs, compute distances, write proposals
-            let iter_seed = seed as u32 ^ (iter as u32 * 0x9E3779B9u32);
+            let iter_seed = seed as u32 ^ (iter as u32).wrapping_mul(0x9E3779B9u32);
             unsafe {
                 let _ = local_join::launch_unchecked::<T, R>(
                     &client,
@@ -643,7 +749,7 @@ where
             metric,
             graph,
             converged,
-            device,
+            _device: device,
         }
     }
 
@@ -666,21 +772,6 @@ where
     }
 }
 
-/////////////
-// Helpers //
-/////////////
-
-/// Pad vectors to `dim_padded` by appending zeros to each row.
-fn pad_vectors<T: Float>(flat: &[T], n: usize, dim: usize, dim_padded: usize) -> Vec<T> {
-    let mut padded = vec![T::zero(); n * dim_padded];
-    for i in 0..n {
-        let src = &flat[i * dim..(i + 1) * dim];
-        let dst = &mut padded[i * dim_padded..i * dim_padded + dim];
-        dst.copy_from_slice(src);
-    }
-    padded
-}
-
 ///////////
 // Tests //
 ///////////
@@ -688,18 +779,18 @@ fn pad_vectors<T: Float>(flat: &[T], n: usize, dim: usize, dim_padded: usize) ->
 #[cfg(test)]
 mod tests {
     use super::*;
-    use cubecl::cpu::CpuDevice;
-    use cubecl::cpu::CpuRuntime;
+    use cubecl::wgpu::WgpuDevice;
+    use cubecl::wgpu::WgpuRuntime;
     use faer::Mat;
 
     #[test]
     fn test_nndescent_gpu_basic() {
-        let device = CpuDevice;
+        let device = WgpuDevice::DefaultDevice;
 
         // 20 vectors, 4 dimensions (divisible by LINE_SIZE)
         let data = Mat::from_fn(20, 4, |i, j| ((i * 3 + j) as f32) / 10.0);
 
-        let index = NNDescentGpu::<f32, CpuRuntime>::build(
+        let index = NNDescentGpu::<f32, WgpuRuntime>::build(
             data.as_ref(),
             Dist::Euclidean,
             Some(5),
@@ -728,11 +819,11 @@ mod tests {
 
     #[test]
     fn test_nndescent_gpu_cosine() {
-        let device = CpuDevice;
+        let device = WgpuDevice::DefaultDevice;
 
         let data = Mat::from_fn(16, 4, |i, _| (i as f32) + 1.0);
 
-        let index = NNDescentGpu::<f32, CpuRuntime>::build(
+        let index = NNDescentGpu::<f32, WgpuRuntime>::build(
             data.as_ref(),
             Dist::Cosine,
             Some(3),
@@ -750,12 +841,12 @@ mod tests {
 
     #[test]
     fn test_nndescent_gpu_padded_dim() {
-        let device = CpuDevice;
+        let device = WgpuDevice::DefaultDevice;
 
         // dim=3 requires padding to 4
         let data = Mat::from_fn(12, 3, |i, j| (i + j) as f32);
 
-        let index = NNDescentGpu::<f32, CpuRuntime>::build(
+        let index = NNDescentGpu::<f32, WgpuRuntime>::build(
             data.as_ref(),
             Dist::Euclidean,
             Some(3),

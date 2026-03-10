@@ -610,17 +610,12 @@ where
             }
         }
 
-        // FIX #7: still allocates here but this is once per node, not per
-        // reverse edge. Could be eliminated by returning a slice reference
-        // but that complicates lifetimes with the scratch buffer usage below.
+        // allocation happens here, but oh well...
         state.working_sorted.data().to_vec()
     }
 
     /// Selects up to `max_degree` neighbours from a candidate pool using the
     /// alpha-heuristic.
-    ///
-    /// FIX #3: single sort by distance after dedup by index, avoiding the
-    /// previous double-sort.
     ///
     /// ### Params
     ///
