@@ -599,6 +599,17 @@ pub struct BenchmarkResultPurity {
 /// ### Returns
 ///
 /// The Recall@k
+/// Calculate Recall@k
+///
+/// ### Params
+///
+/// * `true_neighbors` - Slice of true neighbours
+/// * `approx_neighbors` - Slice of the approximate neighbours
+/// * `k` - Number of selected k
+///
+/// ### Returns
+///
+/// The Recall@k
 pub fn calculate_recall(
     true_neighbors: &[Vec<usize>],
     approx_neighbors: &[Vec<usize>],
@@ -608,11 +619,11 @@ pub fn calculate_recall(
 
     for (true_nn, approx_nn) in true_neighbors.iter().zip(approx_neighbors.iter()) {
         let true_set: FxHashSet<_> = true_nn.iter().take(k).collect();
-        let matches = approx_nn
-            .iter()
-            .take(k)
-            .filter(|&idx| true_set.contains(idx))
-            .count();
+        let approx_set: FxHashSet<_> = approx_nn.iter().take(k).collect();
+
+        // This forces deduplication on the GPU results
+        let matches = approx_set.intersection(&true_set).count();
+
         total_recall += matches as f64 / k as f64;
     }
 

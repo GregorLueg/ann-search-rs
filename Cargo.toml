@@ -44,6 +44,10 @@ name = "gridsearch_gpu"
 required-features = ["gpu"]
 
 [[example]]
+name = "gridsearch_carga"
+required-features = ["gpu"]
+
+[[example]]
 name = "gridsearch_sq8"
 required-features = ["quantised"]
 

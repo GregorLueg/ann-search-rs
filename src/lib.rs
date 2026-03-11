@@ -64,7 +64,7 @@ use crate::vamana::*;
 #[cfg(feature = "binary")]
 use crate::binary::{exhaustive_binary::*, exhaustive_rabitq::*, ivf_binary::*, ivf_rabitq::*};
 #[cfg(feature = "gpu")]
-use crate::gpu::{exhaustive_gpu::*, ivf_gpu::*};
+use crate::gpu::{exhaustive_gpu::*, ivf_gpu::*, nndescent_gpu::*};
 #[cfg(feature = "quantised")]
 use crate::quantised::{
     exhaustive_bf16::*, exhaustive_opq::*, exhaustive_pq::*, exhaustive_sq8::*, ivf_bf16::*,
@@ -1999,6 +1999,131 @@ where
     T: AnnSearchFloat + cubecl::frontend::Float + cubecl::CubeElement,
 {
     index.generate_knn(k, nprobe, nquery, return_dist, verbose)
+}
+
+///////////////////
+// NNDescent GPU //
+///////////////////
+
+#[cfg(feature = "gpu")]
+/// Build an NNDescent index with GPU-accelerated graph construction
+/// and CAGRA optimisation.
+///
+/// ### Params
+///
+/// * `mat` - Data matrix [samples, features]
+/// * `dist_metric` - "euclidean" or "cosine"
+/// * `k` - Final neighbours per node (default 30)
+/// * `build_k` - Internal NNDescent degree before CAGRA pruning (default 2*k)
+/// * `max_iters` - Maximum NNDescent iterations (default 15)
+/// * `n_trees` - Annoy forest size (default auto)
+/// * `delta` - Convergence threshold (default 0.001)
+/// * `rho` - Sampling rate (default 0.5)
+/// * `seed` - Random seed
+/// * `verbose` - Print progress
+/// * `device` - GPU device
+#[allow(clippy::too_many_arguments)]
+pub fn build_nndescent_index_gpu<T, R>(
+    mat: MatRef<T>,
+    dist_metric: &str,
+    k: Option<usize>,
+    build_k: Option<usize>,
+    max_iters: Option<usize>,
+    n_trees: Option<usize>,
+    delta: Option<f32>,
+    rho: Option<f32>,
+    seed: usize,
+    verbose: bool,
+    device: R::Device,
+) -> NNDescentGpu<T, R>
+where
+    R: Runtime,
+    T: AnnSearchFloat + cubecl::frontend::Float + cubecl::CubeElement,
+    NNDescentGpu<T, R>: NNDescentQuery<T>,
+{
+    let ann_dist = parse_ann_dist(dist_metric).unwrap_or_default();
+    NNDescentGpu::build(
+        mat, ann_dist, k, build_k, max_iters, n_trees, delta, rho, seed, verbose, device,
+    )
+}
+
+#[cfg(feature = "gpu")]
+/// Query an NNDescent GPU index.
+///
+/// ### Params
+///
+/// * `query_mat` - Query matrix [samples, features]
+/// * `index` - Reference to built index
+/// * `k` - Number of neighbours
+/// * `ef_search` - Beam width (default auto)
+/// * `return_dist` - Return distances
+/// * `verbose` - Print progress
+///
+/// ### Returns
+///
+/// Tuple of (indices, optional distances)
+pub fn query_nndescent_index_gpu<T, R>(
+    query_mat: MatRef<T>,
+    index: &NNDescentGpu<T, R>,
+    k: usize,
+    ef_search: Option<usize>,
+    return_dist: bool,
+    verbose: bool,
+) -> (Vec<Vec<usize>>, Option<Vec<Vec<T>>>)
+where
+    R: Runtime,
+    T: AnnSearchFloat + cubecl::frontend::Float + cubecl::CubeElement,
+    NNDescentGpu<T, R>: NNDescentQuery<T>,
+{
+    use rayon::prelude::*;
+
+    let n_queries = query_mat.nrows();
+
+    if verbose {
+        println!("  Querying {} vectors (ef={:?})...", n_queries, ef_search);
+    }
+
+    let results: Vec<(Vec<usize>, Vec<T>)> = (0..n_queries)
+        .into_par_iter()
+        .map(|i| {
+            let row = query_mat.row(i);
+            index.query_row(row, k, ef_search)
+        })
+        .collect();
+
+    if return_dist {
+        let (indices, distances) = results.into_iter().unzip();
+        (indices, Some(distances))
+    } else {
+        let indices = results.into_iter().map(|(idx, _)| idx).collect();
+        (indices, None)
+    }
+}
+
+#[cfg(feature = "gpu")]
+/// Extract the internal kNN graph from an NNDescent GPU index.
+///
+/// No search is performed -- this simply reshapes the graph that
+/// was already built during construction.
+///
+/// ### Params
+///
+/// * `index` - Reference to built index
+/// * `return_dist` - Return distances
+///
+/// ### Returns
+///
+/// Tuple of (indices, optional distances)
+pub fn extract_nndescent_knn_gpu<T, R>(
+    index: &NNDescentGpu<T, R>,
+    return_dist: bool,
+) -> (Vec<Vec<usize>>, Option<Vec<Vec<T>>>)
+where
+    R: Runtime,
+    T: AnnSearchFloat + cubecl::frontend::Float + cubecl::CubeElement,
+    NNDescentGpu<T, R>: NNDescentQuery<T>,
+{
+    index.extract_knn(return_dist)
 }
 
 ////////////

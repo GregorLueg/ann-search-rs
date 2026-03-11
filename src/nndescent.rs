@@ -37,7 +37,7 @@ pub struct Neighbour<T> {
 }
 
 /// Sentinel PID used to mark empty slots in the flat graph.
-const SENTINEL_PID: usize = u32::MAX as usize >> 1;
+pub const SENTINEL_PID: usize = u32::MAX as usize >> 1;
 
 impl<T: Copy> Neighbour<T> {
     const IS_NEW_MASK: u32 = 1 << 31;

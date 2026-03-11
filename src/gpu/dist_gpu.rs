@@ -129,6 +129,7 @@ pub fn extract_topk<F: Float>(
     out_dists: &mut Tensor<F>,
     out_indices: &mut Tensor<u32>,
     chunk_offset: u32,
+    actual_chunk_size: u32, // <--- Add this
 ) {
     let query_idx = ABSOLUTE_POS_X as usize;
 
@@ -136,13 +137,13 @@ pub fn extract_topk<F: Float>(
         terminate!();
     }
 
-    let chunk_size = distances.shape(1);
     let k = out_dists.shape(1);
     let dist_offset = query_idx * distances.stride(0);
     let out_offset = query_idx * out_dists.stride(0);
 
-    for i in 0..chunk_size {
-        let dist = distances[dist_offset + i];
+    for i in 0..actual_chunk_size {
+        // <--- Change to actual_chunk_size
+        let dist = distances[dist_offset + i as usize];
 
         // Only process if better than current worst
         if dist < out_dists[out_offset + k - 1] {
@@ -166,7 +167,7 @@ pub fn extract_topk<F: Float>(
 
             // Insert
             out_dists[out_offset + insert_pos] = dist;
-            out_indices[out_offset + insert_pos] = chunk_offset + i as u32;
+            out_indices[out_offset + insert_pos] = chunk_offset + i;
         }
     }
 }
@@ -206,18 +207,22 @@ pub fn merge_topk<F: Float>(
         let a_valid = ptr_a < k;
         let b_valid = ptr_b < k;
 
-        // Take from A if: A valid AND (B exhausted OR A <= B)
-        let dist_a = dists_a[offset_a + ptr_a];
-        let dist_b = dists_b[offset_b + ptr_b];
+        // Prevent out-of-bounds VRAM reads
+        let safe_ptr_a = if a_valid { ptr_a } else { k - 1 };
+        let safe_ptr_b = if b_valid { ptr_b } else { k - 1 };
+
+        let dist_a = dists_a[offset_a + safe_ptr_a];
+        let dist_b = dists_b[offset_b + safe_ptr_b];
+
         let take_a = a_valid && (!b_valid || dist_a <= dist_b);
 
         if take_a {
             out_dists[offset_out + out_idx] = dist_a;
-            out_indices[offset_out + out_idx] = indices_a[offset_a + ptr_a];
+            out_indices[offset_out + out_idx] = indices_a[offset_a + safe_ptr_a];
             ptr_a += 1;
         } else {
             out_dists[offset_out + out_idx] = dist_b;
-            out_indices[offset_out + out_idx] = indices_b[offset_b + ptr_b];
+            out_indices[offset_out + out_idx] = indices_b[offset_b + safe_ptr_b];
             ptr_b += 1;
         }
     }
@@ -498,12 +503,13 @@ where
             None
         };
 
-        // Allocate running top-k on GPU
-        let mut topk_dists = GpuTensor::<R, T>::empty(vec![current_query_chunk_size, k], &client);
-        let mut topk_indices =
-            GpuTensor::<R, u32>::empty(vec![current_query_chunk_size, k], &client);
+        // allocate running top-k on GPU (Double-buffer pattern: A and B)
+        let topk_dists_a = GpuTensor::<R, T>::empty(vec![current_query_chunk_size, k], &client);
+        let topk_indices_a = GpuTensor::<R, u32>::empty(vec![current_query_chunk_size, k], &client);
+        let topk_dists_b = GpuTensor::<R, T>::empty(vec![current_query_chunk_size, k], &client);
+        let topk_indices_b = GpuTensor::<R, u32>::empty(vec![current_query_chunk_size, k], &client);
 
-        // Initialise to MAX
+        // initialise Buffer A to MAX
         let init_grid_x = (k as u32).div_ceil(WORKGROUP_SIZE_X);
         let init_grid_y = (current_query_chunk_size as u32).div_ceil(WORKGROUP_SIZE_Y);
         unsafe {
@@ -511,22 +517,23 @@ where
                 &client,
                 CubeCount::Static(init_grid_x, init_grid_y, 1),
                 CubeDim::new_2d(WORKGROUP_SIZE_X, WORKGROUP_SIZE_Y),
-                topk_dists.clone().into_tensor_arg(1),
-                topk_indices.clone().into_tensor_arg(1),
+                topk_dists_a.clone().into_tensor_arg(1),
+                topk_indices_a.clone().into_tensor_arg(1),
             );
         }
 
-        // Pre-allocate distance buffer for largest possible chunk
+        // pre-allocate distance buffer for largest possible chunk
         let max_db_chunk = DB_CHUNK_SIZE.min(db_data.n);
         let distances_gpu =
             GpuTensor::<R, T>::empty(vec![current_query_chunk_size, max_db_chunk], &client);
 
-        // Temp buffers for merge (double-buffer pattern)
+        // temp buffers for the current chunk's top-k
         let chunk_topk_dists = GpuTensor::<R, T>::empty(vec![current_query_chunk_size, k], &client);
         let chunk_topk_indices =
             GpuTensor::<R, u32>::empty(vec![current_query_chunk_size, k], &client);
-        let merged_dists = GpuTensor::<R, T>::empty(vec![current_query_chunk_size, k], &client);
-        let merged_indices = GpuTensor::<R, u32>::empty(vec![current_query_chunk_size, k], &client);
+
+        // state flag for our ping-pong buffer
+        let mut use_a_as_input = true;
 
         for db_chunk_idx in 0..n_db_chunks {
             let db_start = db_chunk_idx * DB_CHUNK_SIZE;
@@ -600,32 +607,61 @@ where
                     cubecl::frontend::ScalarArg {
                         elem: db_start as u32,
                     },
+                    cubecl::frontend::ScalarArg {
+                        elem: current_db_chunk_size as u32,
+                    },
                 );
             }
 
-            // 4. Merge with running top-k
-            unsafe {
-                let _ = merge_topk::launch_unchecked::<T, R>(
-                    &client,
-                    CubeCount::Static(extract_grid, 1, 1),
-                    CubeDim::new_2d(WORKGROUP_SIZE_X, 1),
-                    topk_dists.clone().into_tensor_arg(1),
-                    topk_indices.clone().into_tensor_arg(1),
-                    chunk_topk_dists.clone().into_tensor_arg(1),
-                    chunk_topk_indices.clone().into_tensor_arg(1),
-                    merged_dists.clone().into_tensor_arg(1),
-                    merged_indices.clone().into_tensor_arg(1),
-                );
+            // 4. Merge with running top-k (Ping-Pong buffers)
+            if use_a_as_input {
+                // Read from A + Chunk -> Write to B
+                unsafe {
+                    let _ = merge_topk::launch_unchecked::<T, R>(
+                        &client,
+                        CubeCount::Static(extract_grid, 1, 1),
+                        CubeDim::new_2d(WORKGROUP_SIZE_X, 1),
+                        topk_dists_a.clone().into_tensor_arg(1),
+                        topk_indices_a.clone().into_tensor_arg(1),
+                        chunk_topk_dists.clone().into_tensor_arg(1),
+                        chunk_topk_indices.clone().into_tensor_arg(1),
+                        topk_dists_b.clone().into_tensor_arg(1),
+                        topk_indices_b.clone().into_tensor_arg(1),
+                    );
+                }
+            } else {
+                // Read from B + Chunk -> Write to A
+                unsafe {
+                    let _ = merge_topk::launch_unchecked::<T, R>(
+                        &client,
+                        CubeCount::Static(extract_grid, 1, 1),
+                        CubeDim::new_2d(WORKGROUP_SIZE_X, 1),
+                        topk_dists_b.clone().into_tensor_arg(1),
+                        topk_indices_b.clone().into_tensor_arg(1),
+                        chunk_topk_dists.clone().into_tensor_arg(1),
+                        chunk_topk_indices.clone().into_tensor_arg(1),
+                        topk_dists_a.clone().into_tensor_arg(1),
+                        topk_indices_a.clone().into_tensor_arg(1),
+                    );
+                }
             }
 
-            // Swap: merged becomes new running top-k
-            topk_dists = merged_dists.clone();
-            topk_indices = merged_indices.clone();
+            // Flip the state for the next chunk
+            use_a_as_input = !use_a_as_input;
         }
 
-        // Read final results - only k items per query!
-        let final_dists = topk_dists.read(&client);
-        let final_indices = topk_indices.read(&client);
+        // Read final results from whichever buffer was the *output* of the last iteration.
+        // If use_a_as_input is true, the last loop read from B and wrote to A.
+        let final_dists = if use_a_as_input {
+            topk_dists_a.read(&client)
+        } else {
+            topk_dists_b.read(&client)
+        };
+        let final_indices = if use_a_as_input {
+            topk_indices_a.read(&client)
+        } else {
+            topk_indices_b.read(&client)
+        };
 
         for q in 0..current_query_chunk_size {
             let start = q * k;
@@ -641,6 +677,170 @@ where
     }
 
     (all_indices, all_distances)
+}
+
+/////////////////////////////////////////
+// Mega Kernel & Top-K IVF Reductions  //
+/////////////////////////////////////////
+
+/// Compute Euclidean distances using a flattened Task List
+#[cube(launch_unchecked)]
+pub fn compute_ivf_mega_euclidean<F: Float>(
+    query_vectors: &Tensor<Line<F>>,
+    db_vectors: &Tensor<Line<F>>,
+    task_q_idx: &Tensor<u32>,
+    task_db_start: &Tensor<u32>,
+    task_write_offset: &Tensor<u32>,
+    task_db_count: &Tensor<u32>,
+    out_dists: &mut Tensor<F>,
+    out_indices: &mut Tensor<u32>,
+) {
+    let local_db_idx = ABSOLUTE_POS_X;
+    let task_idx = ABSOLUTE_POS_Y;
+
+    if task_idx >= task_q_idx.len() as u32 {
+        terminate!();
+    }
+
+    let db_count = task_db_count[task_idx as usize];
+    if local_db_idx >= db_count {
+        terminate!();
+    }
+
+    let q_idx = task_q_idx[task_idx as usize];
+    let db_start = task_db_start[task_idx as usize];
+    let write_offset = task_write_offset[task_idx as usize];
+
+    let real_db_idx = db_start + local_db_idx;
+    let write_pos = write_offset + local_db_idx;
+
+    let dim_lines = query_vectors.shape(1);
+    let mut sum = F::new(0.0);
+
+    let q_offset = q_idx as usize * query_vectors.stride(0);
+    let d_offset = real_db_idx as usize * db_vectors.stride(0);
+
+    for i in 0..dim_lines {
+        let q_line = query_vectors[q_offset + i];
+        let d_line = db_vectors[d_offset + i];
+        let diff = q_line - d_line;
+        let sq = diff * diff;
+
+        sum += sq[0];
+        sum += sq[1];
+        sum += sq[2];
+        sum += sq[3];
+    }
+
+    let out_offset = q_idx as usize * out_dists.stride(0) + write_pos as usize;
+    out_dists[out_offset] = sum;
+    out_indices[out_offset] = real_db_idx;
+}
+
+/// Compute Cosine distances using a flattened Task List
+#[cube(launch_unchecked)]
+pub fn compute_ivf_mega_cosine<F: Float>(
+    query_vectors: &Tensor<Line<F>>,
+    db_vectors: &Tensor<Line<F>>,
+    query_norms: &Tensor<F>,
+    db_norms: &Tensor<F>,
+    task_q_idx: &Tensor<u32>,
+    task_db_start: &Tensor<u32>,
+    task_write_offset: &Tensor<u32>,
+    task_db_count: &Tensor<u32>,
+    out_dists: &mut Tensor<F>,
+    out_indices: &mut Tensor<u32>,
+) {
+    let local_db_idx = ABSOLUTE_POS_X;
+    let task_idx = ABSOLUTE_POS_Y;
+
+    if task_idx >= task_q_idx.len() as u32 {
+        terminate!();
+    }
+
+    let db_count = task_db_count[task_idx as usize];
+    if local_db_idx >= db_count {
+        terminate!();
+    }
+
+    let q_idx = task_q_idx[task_idx as usize];
+    let db_start = task_db_start[task_idx as usize];
+    let write_offset = task_write_offset[task_idx as usize];
+
+    let real_db_idx = db_start + local_db_idx;
+    let write_pos = write_offset + local_db_idx;
+
+    let dim_lines = query_vectors.shape(1);
+    let mut dot = F::new(0.0);
+
+    let q_offset = q_idx as usize * query_vectors.stride(0);
+    let d_offset = real_db_idx as usize * db_vectors.stride(0);
+
+    for i in 0..dim_lines {
+        let q_line = query_vectors[q_offset + i];
+        let d_line = db_vectors[d_offset + i];
+        let prod = q_line * d_line;
+
+        dot += prod[0];
+        dot += prod[1];
+        dot += prod[2];
+        dot += prod[3];
+    }
+
+    let q_norm = query_norms[q_idx as usize];
+    let d_norm = db_norms[real_db_idx as usize];
+
+    let out_offset = q_idx as usize * out_dists.stride(0) + write_pos as usize;
+    out_dists[out_offset] = F::new(1.0) - (dot / (q_norm * d_norm));
+    out_indices[out_offset] = real_db_idx;
+}
+
+/// In-place Top-K reduction for the variable-length candidate buffer
+#[cube(launch_unchecked)]
+pub fn reduce_ivf_topk<F: Float>(
+    candidate_dists: &Tensor<F>,
+    candidate_indices: &Tensor<u32>,
+    candidates_per_query: &Tensor<u32>,
+    out_dists: &mut Tensor<F>,
+    out_indices: &mut Tensor<u32>,
+) {
+    let q_idx = ABSOLUTE_POS_X as usize;
+
+    if q_idx >= candidate_dists.shape(0) {
+        terminate!();
+    }
+
+    let k = out_dists.shape(1);
+    let count = candidates_per_query[q_idx];
+
+    let in_offset = q_idx * candidate_dists.stride(0);
+    let out_offset = q_idx * out_dists.stride(0);
+
+    for i in 0..count {
+        let dist = candidate_dists[in_offset + i as usize];
+        let idx = candidate_indices[in_offset + i as usize];
+
+        if dist < out_dists[out_offset + k - 1] {
+            let mut insert_pos: usize = k - 1;
+            for j in 0..k {
+                if dist < out_dists[out_offset + j] && insert_pos == k - 1 {
+                    insert_pos = j;
+                }
+            }
+
+            for j in 0..k - 1 {
+                let src = k - 2 - j;
+                let dst = k - 1 - j;
+                if src >= insert_pos {
+                    out_dists[out_offset + dst] = out_dists[out_offset + src];
+                    out_indices[out_offset + dst] = out_indices[out_offset + src];
+                }
+            }
+
+            out_dists[out_offset + insert_pos] = dist;
+            out_indices[out_offset + insert_pos] = idx;
+        }
+    }
 }
 
 ///////////

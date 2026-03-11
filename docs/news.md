@@ -8,6 +8,11 @@
 - Better documentation (more Rust idiomatic), plus correction of copy and paste
   errors.
 - Vamana index added
+- Massive improvement in the IVF indices due to better memory layout.
+
+**Bugs:**
+
+- *Nasty GPU memory pointer bug* in the exhaustive GPU implementation.
 
 ## 0.2.4
 
