@@ -582,7 +582,7 @@ where
             })
             .collect();
 
-        let max_candidates: usize = *candidates_per_query.iter().max().unwrap_or(&0);
+        let max_candidates: usize = candidates_per_query.iter().fold(0, |acc, &x| acc.max(x));
 
         if verbose {
             println!(
