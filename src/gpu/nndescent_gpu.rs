@@ -83,16 +83,20 @@ fn entry_hash(node: u32, entry: u32, seed: u32) -> u32 {
 ///   dimension
 /// * `a` - Row index of the first vector
 /// * `b` - Row index of the second vector
+/// * `dim_lines` - Number of `Line<F>` elements per vector row (comptime)
 ///
 /// ### Returns
 ///
 /// Squared Euclidean distance between the two vectors
 #[cube]
-fn dist_sq_euclidean<F: Float + CubePrimitive>(vectors: &Tensor<Line<F>>, a: u32, b: u32) -> F {
-    let dim_lines = vectors.shape(1);
-    let stride = vectors.stride(0);
-    let off_a = a as usize * stride;
-    let off_b = b as usize * stride;
+fn dist_sq_euclidean<F: Float + CubePrimitive>(
+    vectors: &Tensor<Line<F>>,
+    a: u32,
+    b: u32,
+    #[comptime] dim_lines: usize,
+) -> F {
+    let off_a = a as usize * dim_lines;
+    let off_b = b as usize * dim_lines;
     let mut sum = F::new(0.0);
 
     for i in 0..dim_lines {
@@ -119,16 +123,21 @@ fn dist_sq_euclidean<F: Float + CubePrimitive>(vectors: &Tensor<Line<F>>, a: u32
 /// * `norms` - Pre-computed L2 norms, one per row
 /// * `a` - Row index of the first vector
 /// * `b` - Row index of the second vector
+/// * `dim_lines` - Number of `Line<F>` elements per vector row (comptime)
 ///
 /// ### Returns
 ///
 /// Cosine distance in the range [0, 2]
 #[cube]
-fn dist_cosine<F: Float>(vectors: &Tensor<Line<F>>, norms: &Tensor<F>, a: u32, b: u32) -> F {
-    let dim_lines = vectors.shape(1);
-    let stride = vectors.stride(0);
-    let off_a = a as usize * stride;
-    let off_b = b as usize * stride;
+fn dist_cosine<F: Float>(
+    vectors: &Tensor<Line<F>>,
+    norms: &Tensor<F>,
+    a: u32,
+    b: u32,
+    #[comptime] dim_lines: usize,
+) -> F {
+    let off_a = a as usize * dim_lines;
+    let off_b = b as usize * dim_lines;
     let mut dot = F::new(0.0);
 
     for i in 0..dim_lines {
@@ -165,6 +174,7 @@ fn dist_cosine<F: Float>(vectors: &Tensor<Line<F>>, norms: &Tensor<F>, a: u32, b
 /// * `n` - Number of vectors
 /// * `seed` - Random seed for neighbour generation
 /// * `use_cosine` - Whether to use cosine distance instead of squared Euclidean
+/// * `dim_lines` - Number of `Line<F>` elements per vector row (comptime)
 ///
 /// Writes an initialised sorted kNN graph into `graph_idx` and `graph_dist`.
 ///
@@ -180,6 +190,7 @@ fn init_random_graph<F: Float>(
     n: u32,
     seed: u32,
     #[comptime] use_cosine: bool,
+    #[comptime] dim_lines: usize,
 ) {
     let node = ABSOLUTE_POS_X;
     if node >= n {
@@ -193,18 +204,16 @@ fn init_random_graph<F: Float>(
     let mut rng = xorshift(node ^ seed ^ 0xDEADBEEFu32);
 
     for slot in 0..k {
-        // generate random PID, reject self-loops
         rng = xorshift(rng);
         let mut pid = rng % n;
         if pid == node {
             pid = (pid + 1u32) % n;
         }
 
-        // compute distance
         let dist = if use_cosine {
-            dist_cosine(vectors, norms, node, pid)
+            dist_cosine(vectors, norms, node, pid, dim_lines)
         } else {
-            dist_sq_euclidean(vectors, node, pid)
+            dist_sq_euclidean(vectors, node, pid, dim_lines)
         };
 
         // sorted insertion into slots [0..slot].
@@ -255,8 +264,22 @@ fn reset_proposals(prop_count: &mut Tensor<u32>, update_counter: &mut Tensor<u32
     }
 }
 
-/// Scatters forward edges into a reverse edge buffer to ensure symmetric
-/// information flow during the local join phase.
+/// Scatter forward edges into a reverse edge buffer.
+///
+/// Ensures symmetric information flow during the local join phase by
+/// creating reverse (target -> source) copies of each forward edge.
+///
+/// ### Params
+///
+/// * `graph_idx` - Current kNN graph indices (with IS_NEW flag in MSB)
+/// * `reverse_idx` - Output reverse edge buffer, row-major `[n, build_k]`
+/// * `reverse_count` - Atomic per-node counter for reverse edge slots
+/// * `n` - Number of nodes
+/// * `build_k` - Degree of the build graph (comptime)
+///
+/// ### Grid mapping
+///
+/// * `ABSOLUTE_POS_X` -> node index
 #[cube(launch_unchecked)]
 pub fn build_reverse_candidates(
     graph_idx: &Tensor<u32>,
@@ -293,12 +316,39 @@ pub fn build_reverse_candidates(
 }
 
 /// Core NNDescent local join kernel.
+///
+/// For each node, loads forward and reverse candidates into shared memory,
+/// evaluates all sampled (new, new) and (new, old) pairs, computes distances
+/// using shared-memory vectors, and emits proposals for both endpoints.
+///
+/// ### Params
+///
+/// * `vectors` - Row-major vector matrix, line-vectorised along the feature dimension
+/// * `norms` - Pre-computed L2 norms (ignored when `use_cosine` is false)
+/// * `graph_idx` - Current kNN graph indices (with IS_NEW flag in MSB)
+/// * `graph_dist` - Current kNN graph distances (used for threshold filtering)
+/// * `reverse_idx` - Reverse edge buffer from `build_reverse_candidates`
+/// * `reverse_count` - Number of valid reverse edges per node
+/// * `prop_idx` - Output proposal indices, row-major `[n, max_proposals]`
+/// * `prop_dist` - Output proposal distances, matching layout to `prop_idx`
+/// * `prop_count` - Atomic per-node counter for proposal slots
+/// * `n` - Number of nodes
+/// * `rho_thresh` - Sampling threshold (scaled to 16-bit range)
+/// * `iter_seed` - Per-iteration seed for deterministic sampling
+/// * `max_proposals` - Proposal buffer capacity per node (comptime)
+/// * `use_cosine` - Whether to use cosine distance (comptime)
+/// * `dim_lines` - Number of `Line<F>` elements per vector row (comptime)
+/// * `build_k` - Degree of the build graph (comptime)
+///
+/// ### Grid mapping
+///
+/// * One workgroup (cube) per node
 #[cube(launch_unchecked)]
 pub fn local_join_shared<F: Float>(
     vectors: &Tensor<Line<F>>,
     norms: &Tensor<F>,
     graph_idx: &Tensor<u32>,
-    graph_dist: &Tensor<F>, // <--- NEW: Need this to threshold proposals!
+    graph_dist: &Tensor<F>,
     reverse_idx: &Tensor<u32>,
     reverse_count: &Tensor<u32>,
     prop_idx: &mut Tensor<u32>,
@@ -323,10 +373,11 @@ pub fn local_join_shared<F: Float>(
     let is_new_bit = 1u32 << 31;
 
     let max_cands_comp = build_k * 2usize;
+    let dim_scalars = dim_lines * 4usize;
 
-    let mut shared_vecs = SharedMemory::<Line<F>>::new(max_cands_comp * dim_lines);
+    let mut shared_vecs = SharedMemory::<F>::new(max_cands_comp * dim_scalars);
     let mut shared_pids = SharedMemory::<u32>::new(max_cands_comp);
-    let mut shared_is_new = SharedMemory::<bool>::new(max_cands_comp);
+    let mut shared_is_new = SharedMemory::<u32>::new(max_cands_comp);
     let mut shared_norms = SharedMemory::<F>::new(max_cands_comp);
 
     let mut shared_rev_count = SharedMemory::<u32>::new(1usize);
@@ -348,7 +399,11 @@ pub fn local_join_shared<F: Float>(
         };
 
         shared_pids[i_load as usize] = entry & pid_mask;
-        shared_is_new[i_load as usize] = entry >= is_new_bit;
+        shared_is_new[i_load as usize] = if entry >= is_new_bit {
+            1u32.into()
+        } else {
+            0u32.into()
+        };
         if use_cosine {
             shared_norms[i_load as usize] = norms[shared_pids[i_load as usize] as usize];
         }
@@ -356,16 +411,21 @@ pub fn local_join_shared<F: Float>(
     }
     sync_cube();
 
-    let total_loads = total_cands as usize * dim_lines;
+    // Load vectors into shared memory as scalars (Line<F> shared memory
+    // does not preserve individual lanes on wgpu/WGSL backends)
+    let total_scalars = total_cands as usize * dim_scalars;
     let mut idx_load = tx as usize;
-    while idx_load < total_loads {
-        let n_idx = idx_load / dim_lines;
-        let d_idx = idx_load % dim_lines;
+    while idx_load < total_scalars {
+        let n_idx = idx_load / dim_scalars;
+        let s_idx = idx_load % dim_scalars;
+        let line_idx = s_idx / 4usize;
+        let lane = s_idx % 4usize;
         let pid = shared_pids[n_idx];
 
         if pid < n {
-            let vec_offset = pid as usize * vectors.stride(0usize) as usize + d_idx;
-            shared_vecs[idx_load] = vectors[vec_offset];
+            let vec_offset = pid as usize * dim_lines + line_idx;
+            let line_val = vectors[vec_offset];
+            shared_vecs[idx_load] = line_val[lane];
         }
         idx_load += WORKGROUP_SIZE_X as usize;
     }
@@ -391,33 +451,25 @@ pub fn local_join_shared<F: Float>(
             let hash_j = entry_hash(node, j as u32, iter_seed);
 
             if (hash_j & 0xFFFFu32) < rho_thresh {
-                let is_new_i = shared_is_new[i];
-                let is_new_j = shared_is_new[j];
+                let is_new_i = shared_is_new[i] != 0u32;
+                let is_new_j = shared_is_new[j] != 0u32;
                 let pid_i = shared_pids[i];
                 let pid_j = shared_pids[j];
 
                 if (is_new_i || is_new_j) && pid_i != pid_j {
                     let mut sum = F::new(0.0);
-                    let mut d = 0usize;
-                    while d < dim_lines {
-                        let va = shared_vecs[i * dim_lines + d];
-                        let vb = shared_vecs[j * dim_lines + d];
+                    let mut s = 0usize;
+                    while s < dim_scalars {
+                        let va = shared_vecs[i * dim_scalars + s];
+                        let vb = shared_vecs[j * dim_scalars + s];
 
                         if use_cosine {
-                            let prod = va * vb;
-                            sum += prod[0usize];
-                            sum += prod[1usize];
-                            sum += prod[2usize];
-                            sum += prod[3usize];
+                            sum += va * vb;
                         } else {
                             let diff = va - vb;
-                            let sq = diff * diff;
-                            sum += sq[0usize];
-                            sum += sq[1usize];
-                            sum += sq[2usize];
-                            sum += sq[3usize];
+                            sum += diff * diff;
                         }
-                        d += 1usize;
+                        s += 1usize;
                     }
 
                     let dist = if use_cosine {
@@ -426,8 +478,6 @@ pub fn local_join_shared<F: Float>(
                         sum
                     };
 
-                    // --- THE FIX: THRESHOLD BEFORE PROPOSING ---
-                    // Read the worst distance for both targets
                     let thresh_i = graph_dist[pid_i as usize * k as usize + k as usize - 1usize];
                     let thresh_j = graph_dist[pid_j as usize * k as usize + k as usize - 1usize];
 
@@ -561,11 +611,30 @@ fn merge_proposals<F: Float>(
     }
 }
 
-/// 2-Hop Refinement Kernel
+/// 2-hop refinement kernel.
 ///
-/// Runs after NNDescent convergence. For each node, evaluates the K^2
-/// second-degree neighbors. Filters aggressively against duplicates and the
-/// current worst distance before pushing to the proposal buffer.
+/// Runs after NNDescent convergence. For each node, evaluates the k^2
+/// second-degree neighbours. Filters aggressively against duplicates and
+/// the current worst distance before pushing to the proposal buffer.
+/// Overflow beyond `max_proposals` is handled via reservoir sampling.
+///
+/// ### Params
+///
+/// * `vectors` - Row-major vector matrix, line-vectorised along the feature dimension
+/// * `norms` - Pre-computed L2 norms (ignored when `use_cosine` is false)
+/// * `graph_idx` - Current kNN graph indices (with IS_NEW flag in MSB)
+/// * `graph_dist` - Current kNN graph distances
+/// * `prop_idx` - Output proposal indices, row-major `[n, max_proposals]`
+/// * `prop_dist` - Output proposal distances, matching layout to `prop_idx`
+/// * `prop_count` - Atomic per-node counter for proposal slots
+/// * `n` - Number of nodes
+/// * `max_proposals` - Proposal buffer capacity per node (comptime)
+/// * `use_cosine` - Whether to use cosine distance (comptime)
+/// * `dim_lines` - Number of `Line<F>` elements per vector row (comptime)
+///
+/// ### Grid mapping
+///
+/// * One workgroup (cube) per node
 #[cube(launch_unchecked)]
 pub fn two_hop_refinement<F: Float>(
     vectors: &Tensor<Line<F>>,
@@ -588,16 +657,21 @@ pub fn two_hop_refinement<F: Float>(
     let tx = UNIT_POS_X;
     let k = graph_idx.shape(1usize);
     let pid_mask = 0x7FFFFFFFu32;
-    let graph_base = node as usize * k as usize;
+    let graph_base = node as usize * k;
+    let dim_scalars = dim_lines * 4usize;
 
-    let mut shared_source = SharedMemory::<Line<F>>::new(dim_lines);
+    // Load source vector into shared memory as scalars
+    let mut shared_source = SharedMemory::<F>::new(dim_scalars);
     let mut shared_worst_dist = SharedMemory::<F>::new(1usize);
 
-    let mut d_idx = tx as usize;
-    while d_idx < dim_lines {
-        let vec_offset = node as usize * vectors.stride(0usize) + d_idx;
-        shared_source[d_idx] = vectors[vec_offset];
-        d_idx += WORKGROUP_SIZE_X as usize;
+    let mut idx_load = tx as usize;
+    while idx_load < dim_scalars {
+        let line_idx = idx_load / 4usize;
+        let lane = idx_load % 4usize;
+        let vec_offset = node as usize * dim_lines + line_idx;
+        let line_val = vectors[vec_offset];
+        shared_source[idx_load] = line_val[lane];
+        idx_load += WORKGROUP_SIZE_X as usize;
     }
 
     if tx == 0u32 {
@@ -609,7 +683,6 @@ pub fn two_hop_refinement<F: Float>(
     let num_candidates = k * k;
     let mut cand_idx = tx as usize;
 
-    // Linearize the K^2 candidate evaluation
     while cand_idx < num_candidates {
         let n1_idx = cand_idx / k;
         let n2_idx = cand_idx % k;
@@ -618,13 +691,10 @@ pub fn two_hop_refinement<F: Float>(
         let n1_pid = n1_raw & pid_mask;
 
         if n1_pid < n {
-            // Get the 2-hop neighbor
             let n2_raw = graph_idx[n1_pid as usize * k + n2_idx];
             let cand_pid = n2_raw & pid_mask;
 
-            // Basic sanity checks: don't evaluate self
             if cand_pid < n && cand_pid != node {
-                // --- THE FIX: DUPLICATE FILTERING ---
                 let mut is_dup: bool = false;
                 let mut scan_idx = 0usize;
                 while scan_idx < k {
@@ -635,27 +705,22 @@ pub fn two_hop_refinement<F: Float>(
                 }
 
                 if !is_dup {
-                    // Compute distance
                     let mut sum = F::new(0.0);
-                    let mut d = 0usize;
-                    while d < dim_lines {
-                        let va = shared_source[d];
-                        let vb = vectors[cand_pid as usize * vectors.stride(0usize) + d];
+                    let mut s = 0usize;
+                    while s < dim_scalars {
+                        let va = shared_source[s];
+                        let line_idx = s / 4usize;
+                        let lane = s % 4usize;
+                        let line_val = vectors[cand_pid as usize * dim_lines + line_idx];
+                        let vb = line_val[lane];
+
                         if use_cosine {
-                            let prod = va * vb;
-                            sum += prod[0usize];
-                            sum += prod[1usize];
-                            sum += prod[2usize];
-                            sum += prod[3usize];
+                            sum += va * vb;
                         } else {
                             let diff = va - vb;
-                            let sq = diff * diff;
-                            sum += sq[0usize];
-                            sum += sq[1usize];
-                            sum += sq[2usize];
-                            sum += sq[3usize];
+                            sum += diff * diff;
                         }
-                        d += 1usize;
+                        s += 1usize;
                     }
 
                     let dist = if use_cosine {
@@ -664,7 +729,6 @@ pub fn two_hop_refinement<F: Float>(
                         sum
                     };
 
-                    // Only propose if it actually improves our graph
                     if dist < worst_dist {
                         let slot = prop_count[node as usize].fetch_add(1u32);
                         if slot < max_proposals {
@@ -672,7 +736,6 @@ pub fn two_hop_refinement<F: Float>(
                             prop_idx[off] = cand_pid;
                             prop_dist[off] = dist;
                         } else {
-                            // Reservoir sample into the proposal buffer
                             let rand_val = xorshift(node ^ slot ^ cand_pid) % (slot + 1u32);
                             if rand_val < max_proposals {
                                 let off =
@@ -906,6 +969,17 @@ pub fn cagra_merge_graphs(
 /////////////
 
 /// Pad vectors to `dim_padded` by appending zeros to each row.
+///
+/// ### Params
+///
+/// * `flat` - Flattened row-major vector data of size `n * dim`
+/// * `n` - Number of vectors
+/// * `dim` - Original dimensionality
+/// * `dim_padded` - Target dimensionality (must be >= `dim`)
+///
+/// ### Returns
+///
+/// Padded flat vector of size `n * dim_padded`
 fn pad_vectors<T: Float>(flat: &[T], n: usize, dim: usize, dim_padded: usize) -> Vec<T> {
     let mut padded = vec![T::zero(); n * dim_padded];
     for i in 0..n {
@@ -921,6 +995,14 @@ fn pad_vectors<T: Float>(flat: &[T], n: usize, dim: usize, dim_padded: usize) ->
 /// Queries the Annoy forest for each node to obtain `build_k` initial
 /// neighbours, sorts them by distance, and encodes the IS_NEW flag into
 /// the MSB of each index entry.
+///
+/// ### Params
+///
+/// * `vectors_flat` - Flattened row-major vector data
+/// * `n` - Number of vectors
+/// * `dim` - Dimensionality
+/// * `build_k` - Neighbours per node
+/// * `forest` - Pre-built Annoy index
 ///
 /// ### Returns
 ///
@@ -1194,9 +1276,9 @@ macro_rules! impl_nndescent_gpu_query {
 impl_nndescent_gpu_query!(f32, QUERY_CANDIDATES_F32, QUERY_RESULTS_F32);
 impl_nndescent_gpu_query!(f64, QUERY_CANDIDATES_F64, QUERY_RESULTS_F64);
 
-//////////////////
+////////////////
 // NNDescentGpu //
-//////////////////
+////////////////
 
 /// GPU-accelerated NNDescent kNN graph builder with CAGRA graph optimisation.
 ///
@@ -1264,25 +1346,21 @@ where
     /// * `data` - Data matrix (samples x features). Dimensions will be
     ///   padded to the next multiple of LINE_SIZE if necessary.
     /// * `metric` - Distance metric
-    /// * `k` - Final neighbours per node (default 30). This is the degree
-    ///   of the output CAGRA graph.
+    /// * `k` - Final neighbours per node (default 30)
     /// * `build_k` - Internal NNDescent degree before CAGRA pruning.
     ///   Defaults to `2 * k`. Must be >= `k`.
     /// * `max_iters` - Maximum NNDescent iterations (default 15)
+    /// * `n_trees` - Number of Annoy trees for graph initialisation.
+    ///   Defaults to `5 + n^0.25`, capped at 32.
     /// * `delta` - Convergence threshold as fraction of n*k (default 0.001)
     /// * `rho` - Sampling rate for the local join (default 0.5)
-    /// * `use_annoy_init` - If true (default), use an Annoy forest for
-    ///   graph initialisation instead of random neighbours. Produces a
-    ///   better starting graph and converges in fewer iterations.
-    /// * `n_trees` - Number of Annoy trees (only used when `use_annoy_init`
-    ///   is true). Defaults to `5 + n^0.25`, capped at 32.
     /// * `seed` - Random seed
     /// * `verbose` - Print progress
     /// * `device` - CubeCL runtime device
     ///
     /// ### Returns
     ///
-    /// Initialised struct with the completed kNN graph
+    /// Initialised struct with the completed kNN and CAGRA navigational graphs
     #[allow(clippy::too_many_arguments)]
     pub fn build(
         data: MatRef<T>,
@@ -1368,7 +1446,8 @@ where
         let use_cosine = metric == Dist::Cosine;
 
         // upload vectors (stays resident for the entire build)
-        let vectors_gpu = GpuTensor::<R, T>::from_slice(&vectors_padded, vec![n, dim_vec], &client);
+        let vectors_gpu =
+            GpuTensor::<R, T>::from_slice(&vectors_padded, vec![n, dim_padded], &client);
 
         // norms tensor (dummy scalar if Euclidean to avoid Option in kernel args)
         let norms_gpu = if use_cosine {
@@ -1464,7 +1543,7 @@ where
                     MAX_PROPOSALS as u32,
                     use_cosine,
                     dim_vec,
-                    build_k, // <--- ADD THIS BACK HERE
+                    build_k,
                 );
             }
 
@@ -1512,6 +1591,45 @@ where
             println!("  NNDescent iterations: {:.2?}", iter_start.elapsed());
         }
 
+        {
+            let g_idx = graph_idx_gpu.clone().read(&client);
+            let g_dist: Vec<T> = graph_dist_gpu.clone().read(&client);
+            let pid_mask = 0x7FFFFFFFu32;
+            let mut mismatches = 0;
+            for i in 0..5 {
+                let raw = g_idx[i * build_k];
+                let pid = (raw & pid_mask) as usize;
+                let gpu_d = g_dist[i * build_k];
+                let a = &vectors_flat[i * dim..(i + 1) * dim];
+                let b = &vectors_flat[pid * dim..(pid + 1) * dim];
+                let cpu_d = if use_cosine {
+                    let dot: T = a
+                        .iter()
+                        .zip(b)
+                        .map(|(&x, &y)| x * y)
+                        .fold(T::zero(), |s, v| s + v);
+                    T::one() - dot / (norms[i] * norms[pid])
+                } else {
+                    a.iter()
+                        .zip(b)
+                        .map(|(&x, &y)| (x - y) * (x - y))
+                        .fold(T::zero(), |s, v| s + v)
+                };
+                let ok = (gpu_d.to_f64().unwrap() - cpu_d.to_f64().unwrap()).abs() < 1e-4;
+                if !ok {
+                    mismatches += 1;
+                }
+                println!(
+                    "  post-iter node {i}->pid {pid}: gpu={:.6e} cpu={:.6e} match={ok}",
+                    gpu_d.to_f64().unwrap(),
+                    cpu_d.to_f64().unwrap()
+                );
+            }
+            if mismatches > 0 {
+                println!("  *** {mismatches}/5 post-iteration distance mismatches ***");
+            }
+        }
+
         if verbose {
             println!("  Running 2-Hop Refinement Sweep...");
         }
@@ -1549,7 +1667,7 @@ where
                 ScalarArg { elem: n as u32 },
                 MAX_PROPOSALS as u32,
                 use_cosine,
-                dim_vec, // Note: build_k was removed here
+                dim_vec,
             );
         }
 
@@ -1772,7 +1890,15 @@ where
         self.query(&query_vec, k, ef_search)
     }
 
-    /// Returns the neighbours of node `i` as a slice of `(index, distance)`.
+    /// Return the CAGRA navigational neighbours of node `idx`.
+    ///
+    /// ### Params
+    ///
+    /// * `idx` - Node index
+    ///
+    /// ### Returns
+    ///
+    /// Slice of `(neighbour_index, distance)` pairs, length `k`
     fn graph_neighbours(&self, idx: usize) -> &[(usize, T)] {
         &self.nav_graph[idx * self.k..(idx + 1) * self.k]
     }
@@ -1992,16 +2118,1158 @@ mod tests {
     }
 }
 
-///////////////
-// Dead code //
-///////////////
+/// Kernel-level tests targeting individual GPU operations.
+///
+/// Each test creates its own wgpu device and skips gracefully if no
+/// backend is available.
+#[cfg(test)]
+mod kernel_tests {
+    use super::*;
+    use cubecl::wgpu::WgpuDevice;
+    use cubecl::wgpu::WgpuRuntime;
+    use faer::Mat;
 
-// Keeping this for potential future iterations
+    fn try_device() -> Option<WgpuDevice> {
+        let device = WgpuDevice::DefaultDevice;
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            cubecl::wgpu::WgpuRuntime::client(&device);
+        }));
+        result.ok().map(|_| device)
+    }
 
-// // NOTE: cagra_search_shared is shelved pending CubeCL warp-level primitive
-// // support. The kernel has known correctness issues (no shared-memory
-// // broadcasting of thread-0 state, no cooperative distance reduction, broken
-// // visited-node tracking). Revisit when CubeCL exposes warp shuffles.
+    #[cube(launch_unchecked)]
+    fn probe_stride<F: Float>(vectors: &Tensor<Line<F>>, out: &mut Tensor<u32>) {
+        if ABSOLUTE_POS_X == 0u32 {
+            out[0usize] = vectors.stride(0) as u32;
+            out[1usize] = vectors.shape(1) as u32;
+            out[2usize] = vectors.stride(1) as u32;
+            out[3usize] = vectors.shape(0) as u32;
+        }
+    }
+
+    #[test]
+    fn test_stride_probe() {
+        let Some(device) = try_device() else {
+            eprintln!("Skipping: no wgpu backend");
+            return;
+        };
+
+        let client = WgpuRuntime::client(&device);
+        let line: usize = LINE_SIZE as usize;
+
+        // 8 vectors of dim 32 -> dim_padded=32, dim_vec=8
+        let n = 8usize;
+        let dim_padded = 32usize;
+        let dim_vec = dim_padded / line;
+        let data: Vec<f32> = (0..n * dim_padded).map(|i| i as f32).collect();
+
+        let vectors_gpu =
+            GpuTensor::<WgpuRuntime, f32>::from_slice(&data, vec![n, dim_padded], &client);
+        let out_gpu = GpuTensor::<WgpuRuntime, u32>::from_slice(&[0u32; 4], vec![4], &client);
+
+        unsafe {
+            let _ = probe_stride::launch_unchecked::<f32, WgpuRuntime>(
+                &client,
+                CubeCount::Static(1, 1, 1),
+                CubeDim::new_2d(1, 1),
+                vectors_gpu.into_tensor_arg(line),
+                out_gpu.clone().into_tensor_arg(1),
+            );
+        }
+
+        let result = out_gpu.read(&client);
+        let stride_0 = result[0];
+        let shape_1 = result[1];
+        let stride_1 = result[2];
+        let shape_0 = result[3];
+
+        println!("Tensor [n={n}, dim_padded={dim_padded}] with line_size={line}:");
+        println!("  stride(0) = {stride_0}  (expected {dim_vec} in Line units, or {dim_padded} in f32 units)");
+        println!("  shape(1)  = {shape_1}  (expected {dim_vec} in Line units)");
+        println!("  stride(1) = {stride_1}  (expected 1)");
+        println!("  shape(0)  = {shape_0}  (expected {n})");
+
+        // CubeCL reports stride(0) and shape(1) in the *element type* units
+        // (f32), not in Line<F> units. This means kernels must use a comptime
+        // `dim_lines` parameter for row offsets, not `vectors.stride(0)`.
+        assert_eq!(shape_0, n as u32, "shape(0) should be n");
+        assert_eq!(
+            stride_0, dim_padded as u32,
+            "stride(0) should be dim_padded (f32 units)"
+        );
+    }
+
+    #[cube(launch_unchecked)]
+    fn read_vector_via_stride<F: Float>(
+        vectors: &Tensor<Line<F>>,
+        row_idx: u32,
+        out: &mut Tensor<F>,
+        #[comptime] dim_lines: usize,
+    ) {
+        if ABSOLUTE_POS_X == 0u32 {
+            let off = row_idx as usize * dim_lines;
+
+            let mut d = 0usize;
+            while d < dim_lines {
+                let line_val = vectors[off + d];
+                out[d * 4usize] = line_val[0usize];
+                out[d * 4usize + 1usize] = line_val[1usize];
+                out[d * 4usize + 2usize] = line_val[2usize];
+                out[d * 4usize + 3usize] = line_val[3usize];
+                d += 1usize;
+            }
+        }
+    }
+
+    #[test]
+    fn test_vector_roundtrip_line() {
+        let Some(device) = try_device() else {
+            eprintln!("Skipping: no wgpu backend");
+            return;
+        };
+
+        let client = WgpuRuntime::client(&device);
+        let line: usize = LINE_SIZE as usize;
+        let n = 4usize;
+        let dim = 8usize; // 2 lines per row
+        let dim_vec = dim / line;
+
+        // Each vector has recognisable values: row i has values i*100+0, i*100+1, ...
+        let mut data = vec![0.0f32; n * dim];
+        for i in 0..n {
+            for j in 0..dim {
+                data[i * dim + j] = (i * 100 + j) as f32;
+            }
+        }
+
+        let vectors_gpu = GpuTensor::<WgpuRuntime, f32>::from_slice(&data, vec![n, dim], &client);
+
+        // Read each row and verify
+        for row in 0..n {
+            // Reset output
+            let out_gpu =
+                GpuTensor::<WgpuRuntime, f32>::from_slice(&vec![-1.0f32; dim], vec![dim], &client);
+
+            unsafe {
+                let _ = read_vector_via_stride::launch_unchecked::<f32, WgpuRuntime>(
+                    &client,
+                    CubeCount::Static(1, 1, 1),
+                    CubeDim::new_2d(1, 1),
+                    vectors_gpu.clone().into_tensor_arg(line),
+                    ScalarArg { elem: row as u32 },
+                    out_gpu.clone().into_tensor_arg(1),
+                    dim_vec,
+                );
+            }
+
+            let result = out_gpu.read(&client);
+            let expected: Vec<f32> = (0..dim).map(|j| (row * 100 + j) as f32).collect();
+
+            println!("Row {row}: got {:?}", &result[..dim]);
+            println!("         exp {:?}", &expected);
+
+            for j in 0..dim {
+                if (result[j] - expected[j]).abs() > 1e-6 {
+                    eprintln!(
+                        "*** MISMATCH at row={row}, col={j}: got {}, expected {} ***",
+                        result[j], expected[j]
+                    );
+                }
+            }
+            assert_eq!(&result[..dim], &expected[..], "Row {row} data mismatch");
+        }
+    }
+
+    #[cube(launch_unchecked)]
+    fn compute_pairwise_dist<F: Float>(
+        vectors: &Tensor<Line<F>>,
+        norms: &Tensor<F>,
+        out_sq_euclid: &mut Tensor<F>,
+        out_cosine: &mut Tensor<F>,
+        n: u32,
+        #[comptime] use_cosine: bool,
+        #[comptime] dim_lines: usize,
+    ) {
+        let idx = ABSOLUTE_POS_X;
+        let n_pairs = n * (n - 1u32) / 2u32;
+        if idx >= n_pairs {
+            terminate!();
+        }
+
+        let mut rem = idx;
+        let mut i = 0u32;
+        let mut step = n - 1u32;
+        while rem >= step {
+            rem -= step;
+            i += 1u32;
+            step = n - 1u32 - i;
+        }
+        let j = i + 1u32 + rem;
+
+        out_sq_euclid[idx as usize] = dist_sq_euclidean(vectors, i, j, dim_lines);
+        if use_cosine {
+            out_cosine[idx as usize] = dist_cosine(vectors, norms, i, j, dim_lines);
+        }
+    }
+
+    #[test]
+    fn test_gpu_distances_euclidean() {
+        let Some(device) = try_device() else {
+            eprintln!("Skipping: no wgpu backend");
+            return;
+        };
+
+        let client = WgpuRuntime::client(&device);
+        let line: usize = LINE_SIZE as usize;
+        let n = 4usize;
+        let dim = 8usize;
+        let dim_vec = dim / line;
+
+        // Known vectors
+        let mut data = vec![0.0f32; n * dim];
+        data[0..dim].copy_from_slice(&[1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]); // v0
+        data[dim..2 * dim].copy_from_slice(&[0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]); // v1
+        data[2 * dim..3 * dim].copy_from_slice(&[1.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]); // v2
+        data[3 * dim..4 * dim].copy_from_slice(&[0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0]); // v3
+
+        let n_pairs = n * (n - 1) / 2; // 6
+
+        let vectors_gpu = GpuTensor::<WgpuRuntime, f32>::from_slice(&data, vec![n, dim], &client);
+        let norms_gpu = GpuTensor::<WgpuRuntime, f32>::from_slice(&[0.0f32], vec![1], &client);
+        let out_euclid = GpuTensor::<WgpuRuntime, f32>::from_slice(
+            &vec![0.0f32; n_pairs],
+            vec![n_pairs],
+            &client,
+        );
+        let out_cosine = GpuTensor::<WgpuRuntime, f32>::from_slice(
+            &vec![0.0f32; n_pairs],
+            vec![n_pairs],
+            &client,
+        );
+
+        unsafe {
+            let _ = compute_pairwise_dist::launch_unchecked::<f32, WgpuRuntime>(
+                &client,
+                CubeCount::Static(1, 1, 1),
+                CubeDim::new_2d(WORKGROUP_SIZE_X, 1),
+                vectors_gpu.into_tensor_arg(line),
+                norms_gpu.into_tensor_arg(1),
+                out_euclid.clone().into_tensor_arg(1),
+                out_cosine.clone().into_tensor_arg(1),
+                ScalarArg { elem: n as u32 },
+                false,
+                dim_vec,
+            );
+        }
+
+        let euclid = out_euclid.read(&client);
+
+        // Expected squared Euclidean distances:
+        // (0,1): |v0-v1|^2 = 1+1 = 2
+        // (0,2): |v0-v2|^2 = 0+1 = 1
+        // (0,3): |v0-v3|^2 = 1+1 = 2
+        // (1,2): |v1-v2|^2 = 1+0 = 1
+        // (1,3): |v1-v3|^2 = 1+1 = 2
+        // (2,3): |v2-v3|^2 = 1+1+1 = 3  (wait: [1,1,0,...,0] vs [0,0,...,0,1])
+        let expected = [2.0f32, 1.0, 2.0, 1.0, 2.0, 3.0];
+
+        println!("Squared Euclidean distances:");
+        let pairs = [(0, 1), (0, 2), (0, 3), (1, 2), (1, 3), (2, 3)];
+        for (k, &(i, j)) in pairs.iter().enumerate() {
+            println!(
+                "  ({i},{j}): gpu={:.4}  expected={:.4}  match={}",
+                euclid[k],
+                expected[k],
+                (euclid[k] - expected[k]).abs() < 1e-4
+            );
+        }
+
+        for (k, &exp) in expected.iter().enumerate() {
+            assert!(
+                (euclid[k] - exp).abs() < 1e-4,
+                "Pair {:?}: gpu={}, expected={}",
+                pairs[k],
+                euclid[k],
+                exp
+            );
+        }
+    }
+
+    #[test]
+    fn test_gpu_distances_cosine() {
+        let Some(device) = try_device() else {
+            eprintln!("Skipping: no wgpu backend");
+            return;
+        };
+
+        let client = WgpuRuntime::client(&device);
+        let line: usize = LINE_SIZE as usize;
+        let n = 4usize;
+        let dim = 8usize;
+        let dim_vec = dim / line;
+        let mut data = vec![0.0f32; n * dim];
+        data[0..dim].copy_from_slice(&[1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]);
+        data[dim..2 * dim].copy_from_slice(&[0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]);
+        data[2 * dim..3 * dim].copy_from_slice(&[1.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]);
+        data[3 * dim..4 * dim].copy_from_slice(&[0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0]);
+
+        let norms: Vec<f32> = (0..n)
+            .map(|i| {
+                let row = &data[i * dim..(i + 1) * dim];
+                row.iter().map(|x| x * x).sum::<f32>().sqrt()
+            })
+            .collect();
+        // norms = [1.0, 1.0, sqrt(2), 1.0]
+
+        let n_pairs = n * (n - 1) / 2;
+        let vectors_gpu = GpuTensor::<WgpuRuntime, f32>::from_slice(&data, vec![n, dim], &client);
+        let norms_gpu = GpuTensor::<WgpuRuntime, f32>::from_slice(&norms, vec![n], &client);
+        let out_euclid = GpuTensor::<WgpuRuntime, f32>::from_slice(
+            &vec![0.0f32; n_pairs],
+            vec![n_pairs],
+            &client,
+        );
+        let out_cosine = GpuTensor::<WgpuRuntime, f32>::from_slice(
+            &vec![0.0f32; n_pairs],
+            vec![n_pairs],
+            &client,
+        );
+
+        unsafe {
+            let _ = compute_pairwise_dist::launch_unchecked::<f32, WgpuRuntime>(
+                &client,
+                CubeCount::Static(1, 1, 1),
+                CubeDim::new_2d(WORKGROUP_SIZE_X, 1),
+                vectors_gpu.into_tensor_arg(line),
+                norms_gpu.into_tensor_arg(1),
+                out_euclid.clone().into_tensor_arg(1),
+                out_cosine.clone().into_tensor_arg(1),
+                ScalarArg { elem: n as u32 },
+                true,
+                dim_vec,
+            );
+        }
+
+        let cosine = out_cosine.read(&client);
+
+        // Expected cosine distances: 1 - dot/(norm_a * norm_b)
+        // (0,1): 1 - 0/(1*1) = 1.0
+        // (0,2): 1 - 1/(1*sqrt(2)) = 1 - 0.7071 = 0.2929
+        // (0,3): 1 - 0/(1*1) = 1.0
+        // (1,2): 1 - 1/(1*sqrt(2)) = 0.2929
+        // (1,3): 1 - 0/(1*1) = 1.0
+        // (2,3): 1 - 0/(sqrt(2)*1) = 1.0
+        let sqrt2 = 2.0f32.sqrt();
+        let expected = [1.0, 1.0 - 1.0 / sqrt2, 1.0, 1.0 - 1.0 / sqrt2, 1.0, 1.0];
+
+        println!("Cosine distances:");
+        let pairs = [(0, 1), (0, 2), (0, 3), (1, 2), (1, 3), (2, 3)];
+        for (k, &(i, j)) in pairs.iter().enumerate() {
+            println!(
+                "  ({i},{j}): gpu={:.6}  expected={:.6}  match={}",
+                cosine[k],
+                expected[k],
+                (cosine[k] - expected[k]).abs() < 1e-4
+            );
+            // Check for negative values -- physically impossible
+            if cosine[k] < -1e-6 {
+                eprintln!("  *** NEGATIVE cosine distance: {} ***", cosine[k]);
+            }
+        }
+
+        for (k, &exp) in expected.iter().enumerate() {
+            assert!(
+                (cosine[k] - exp).abs() < 1e-3,
+                "Pair {:?}: gpu={}, expected={}",
+                pairs[k],
+                cosine[k],
+                exp
+            );
+        }
+    }
+
+    #[test]
+    fn test_local_join_distances() {
+        let Some(device) = try_device() else {
+            eprintln!("Skipping: no wgpu backend");
+            return;
+        };
+
+        let client = WgpuRuntime::client(&device);
+        let line: usize = LINE_SIZE as usize;
+
+        let n = 8usize;
+        let dim = 8usize;
+        let dim_vec = dim / line;
+        let build_k = 4usize;
+
+        // Create vectors with known distances
+        let mut data = vec![0.0f32; n * dim];
+        for i in 0..n {
+            // Unit vector along dimension i (mod dim)
+            data[i * dim + (i % dim)] = 1.0;
+        }
+
+        // Norms (all 1.0 for unit vectors)
+        let norms = vec![1.0f32; n];
+
+        // Build a simple graph: each node's neighbours are the next build_k nodes (wrap)
+        let is_new_bit = 1u32 << 31;
+        let mut graph_idx = vec![0u32; n * build_k];
+        let mut graph_dist = vec![0.0f32; n * build_k];
+
+        for i in 0..n {
+            for j in 0..build_k {
+                let nbr = (i + j + 1) % n;
+                graph_idx[i * build_k + j] = (nbr as u32) | is_new_bit; // all new
+                                                                        // Correct cosine distance for orthogonal unit vectors = 1.0
+                                                                        // For same-dim vectors (i==nbr mod dim): cos_dist = 0.0
+                let a = &data[i * dim..(i + 1) * dim];
+                let b = &data[nbr * dim..(nbr + 1) * dim];
+                let dot: f32 = a.iter().zip(b).map(|(x, y)| x * y).sum();
+                graph_dist[i * build_k + j] = 1.0 - dot; // / (1.0 * 1.0)
+            }
+            // Sort by distance
+            let base = i * build_k;
+            let mut pairs: Vec<(u32, f32)> = (0..build_k)
+                .map(|j| (graph_idx[base + j], graph_dist[base + j]))
+                .collect();
+            pairs.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
+            for (j, (idx, dist)) in pairs.into_iter().enumerate() {
+                graph_idx[base + j] = idx;
+                graph_dist[base + j] = dist;
+            }
+        }
+
+        let vectors_gpu = GpuTensor::<WgpuRuntime, f32>::from_slice(&data, vec![n, dim], &client);
+        let norms_gpu = GpuTensor::<WgpuRuntime, f32>::from_slice(&norms, vec![n], &client);
+        let graph_idx_gpu =
+            GpuTensor::<WgpuRuntime, u32>::from_slice(&graph_idx, vec![n, build_k], &client);
+        let graph_dist_gpu =
+            GpuTensor::<WgpuRuntime, f32>::from_slice(&graph_dist, vec![n, build_k], &client);
+
+        // Empty reverse edges (no reverse pass for this test)
+        let reverse_idx_gpu = GpuTensor::<WgpuRuntime, u32>::from_slice(
+            &vec![0u32; n * build_k],
+            vec![n, build_k],
+            &client,
+        );
+        let reverse_count_gpu =
+            GpuTensor::<WgpuRuntime, u32>::from_slice(&vec![0u32; n], vec![n], &client);
+
+        let max_prop = MAX_PROPOSALS;
+        let prop_idx_gpu = GpuTensor::<WgpuRuntime, u32>::empty(vec![n, max_prop], &client);
+        let prop_dist_gpu = GpuTensor::<WgpuRuntime, f32>::empty(vec![n, max_prop], &client);
+        let prop_count_gpu =
+            GpuTensor::<WgpuRuntime, u32>::from_slice(&vec![0u32; n], vec![n], &client);
+
+        let rho_thresh = 65535u32; // rho=1.0, accept all pairs
+
+        unsafe {
+            let _ = local_join_shared::launch_unchecked::<f32, WgpuRuntime>(
+                &client,
+                CubeCount::Static(n as u32, 1, 1),
+                CubeDim::new_2d(WORKGROUP_SIZE_X, 1),
+                vectors_gpu.into_tensor_arg(line),
+                norms_gpu.into_tensor_arg(1),
+                graph_idx_gpu.into_tensor_arg(1),
+                graph_dist_gpu.into_tensor_arg(1),
+                reverse_idx_gpu.into_tensor_arg(1),
+                reverse_count_gpu.into_tensor_arg(1),
+                prop_idx_gpu.clone().into_tensor_arg(1),
+                prop_dist_gpu.clone().into_tensor_arg(1),
+                prop_count_gpu.clone().into_tensor_arg(1),
+                ScalarArg { elem: n as u32 },
+                ScalarArg { elem: rho_thresh },
+                ScalarArg { elem: 42u32 },
+                MAX_PROPOSALS as u32,
+                true, // use_cosine
+                dim_vec,
+                build_k,
+            );
+        }
+
+        let p_idx = prop_idx_gpu.read(&client);
+        let p_dist = prop_dist_gpu.read(&client);
+        let p_count = prop_count_gpu.read(&client);
+
+        println!("Local join proposals (n={n}, build_k={build_k}, cosine):");
+        let mut any_negative = false;
+        let mut any_mismatch = false;
+
+        for node in 0..n {
+            let count = (p_count[node] as usize).min(max_prop);
+            if count == 0 {
+                continue;
+            }
+
+            println!("  node {node}: {count} proposals");
+            for p in 0..count.min(5) {
+                let cand = p_idx[node * max_prop + p] as usize;
+                let gpu_dist = p_dist[node * max_prop + p];
+
+                // Recompute on CPU
+                let a = &data[node * dim..(node + 1) * dim];
+                let b = &data[cand * dim..(cand + 1) * dim];
+                let dot: f32 = a.iter().zip(b).map(|(x, y)| x * y).sum();
+                let cpu_dist = 1.0 - dot / (norms[node] * norms[cand]);
+
+                let ok = (gpu_dist - cpu_dist).abs() < 1e-4;
+                println!(
+                    "    -> cand {cand}: gpu={:.6e}  cpu={:.6e}  match={ok}",
+                    gpu_dist, cpu_dist
+                );
+
+                if gpu_dist < -1e-6 {
+                    any_negative = true;
+                    eprintln!("    *** NEGATIVE distance: {gpu_dist} ***");
+                }
+                if !ok {
+                    any_mismatch = true;
+                }
+            }
+        }
+
+        assert!(
+            !any_negative,
+            "Negative cosine distances found in local_join proposals"
+        );
+        assert!(
+            !any_mismatch,
+            "Distance mismatches found in local_join proposals"
+        );
+    }
+
+    #[test]
+    fn test_merge_proposals() {
+        let Some(device) = try_device() else {
+            eprintln!("Skipping: no wgpu backend");
+            return;
+        };
+
+        let client = WgpuRuntime::client(&device);
+        let n = 4usize;
+        let k = 3usize;
+        let pid_mask = 0x7FFFFFFFu32;
+
+        // Initial graph: each node has 3 neighbours with known distances
+        // Node 0: neighbours [1, 2, 3] with distances [0.1, 0.5, 0.9]
+        let graph_idx_data: Vec<u32> = vec![
+            1, 2, 3, // node 0
+            0, 2, 3, // node 1
+            0, 1, 3, // node 2
+            0, 1, 2, // node 3
+        ];
+        let graph_dist_data: Vec<f32> = vec![
+            0.1, 0.5, 0.9, // node 0
+            0.1, 0.3, 0.8, // node 1
+            0.2, 0.3, 0.7, // node 2
+            0.2, 0.4, 0.6, // node 3
+        ];
+
+        // Proposals for node 0: candidate 2 with dist 0.05 (better than current best!)
+        // and candidate 1 with dist 0.08 (duplicate, should be skipped or replaced)
+        let mut prop_idx = vec![0u32; n * MAX_PROPOSALS];
+        let mut prop_dist = vec![0.0f32; n * MAX_PROPOSALS];
+        let mut prop_count = vec![0u32; n];
+
+        // Node 0 gets 2 proposals
+        prop_idx[0] = 2; // candidate 2
+        prop_dist[0] = 0.05; // very close
+        prop_idx[1] = 1; // duplicate of existing
+        prop_dist[1] = 0.08;
+        prop_count[0] = 2;
+
+        let graph_idx_gpu =
+            GpuTensor::<WgpuRuntime, u32>::from_slice(&graph_idx_data, vec![n, k], &client);
+        let graph_dist_gpu =
+            GpuTensor::<WgpuRuntime, f32>::from_slice(&graph_dist_data, vec![n, k], &client);
+        let prop_idx_gpu =
+            GpuTensor::<WgpuRuntime, u32>::from_slice(&prop_idx, vec![n, MAX_PROPOSALS], &client);
+        let prop_dist_gpu =
+            GpuTensor::<WgpuRuntime, f32>::from_slice(&prop_dist, vec![n, MAX_PROPOSALS], &client);
+        let prop_count_gpu =
+            GpuTensor::<WgpuRuntime, u32>::from_slice(&prop_count, vec![n], &client);
+        let update_counter = GpuTensor::<WgpuRuntime, u32>::from_slice(&[0u32], vec![1], &client);
+
+        let grid_n = (n as u32).div_ceil(WORKGROUP_SIZE_X);
+
+        unsafe {
+            let _ = merge_proposals::launch_unchecked::<f32, WgpuRuntime>(
+                &client,
+                CubeCount::Static(grid_n, 1, 1),
+                CubeDim::new_2d(WORKGROUP_SIZE_X, 1),
+                graph_idx_gpu.clone().into_tensor_arg(1),
+                graph_dist_gpu.clone().into_tensor_arg(1),
+                prop_idx_gpu.into_tensor_arg(1),
+                prop_dist_gpu.into_tensor_arg(1),
+                prop_count_gpu.into_tensor_arg(1),
+                update_counter.clone().into_tensor_arg(1),
+                ScalarArg { elem: n as u32 },
+                MAX_PROPOSALS as u32,
+            );
+        }
+
+        let result_idx = graph_idx_gpu.read(&client);
+        let result_dist = graph_dist_gpu.read(&client);
+        let updates = update_counter.read(&client);
+
+        println!("Merge proposals result:");
+        println!("  Total updates: {}", updates[0]);
+
+        for node in 0..n {
+            let base = node * k;
+            print!("  Node {node}:");
+            for j in 0..k {
+                let pid = result_idx[base + j] & pid_mask;
+                let is_new = result_idx[base + j] & (1u32 << 31) != 0;
+                let dist = result_dist[base + j];
+                print!("  ({pid}, {dist:.4}{}) ", if is_new { "*" } else { "" });
+            }
+            println!();
+        }
+
+        // Node 0 checks:
+        // - Candidate 2 at dist 0.05 should be inserted (better than worst 0.9)
+        // - Candidate 1 at dist 0.08 is duplicate (1 already in graph) -> skipped
+        // After merge: [2@0.05, 1@0.1, 2@0.5] -- wait, 2 is already in graph at 0.5!
+        // So candidate 2 at 0.05 is a duplicate of existing pid=2. Should be skipped!
+
+        // Actually, the existing graph has pid=2 at dist=0.5. The proposal is pid=2
+        // at dist=0.05. merge_proposals checks for duplicate PIDs. So 2 is already
+        // there, the proposal is skipped.
+        // Proposal 1 is pid=1, already at dist=0.1. Also skipped.
+        // Result should be unchanged: [1@0.1, 2@0.5, 3@0.9] with all flags cleared.
+
+        let base = 0;
+        assert_eq!(
+            result_idx[base] & pid_mask,
+            1,
+            "Node 0, slot 0 should be pid=1"
+        );
+        assert_eq!(
+            result_idx[base + 1] & pid_mask,
+            2,
+            "Node 0, slot 1 should be pid=2"
+        );
+        assert_eq!(
+            result_idx[base + 2] & pid_mask,
+            3,
+            "Node 0, slot 2 should be pid=3"
+        );
+
+        // Now test with a genuinely new proposal
+        let mut prop_idx2 = vec![0u32; n * MAX_PROPOSALS];
+        let mut prop_dist2 = vec![0.0f32; n * MAX_PROPOSALS];
+        let mut prop_count2 = vec![0u32; n];
+
+        // Reset graph to original (with cleared new flags from previous merge)
+        let graph_idx_gpu2 =
+            GpuTensor::<WgpuRuntime, u32>::from_slice(&graph_idx_data, vec![n, k], &client);
+        let graph_dist_gpu2 =
+            GpuTensor::<WgpuRuntime, f32>::from_slice(&graph_dist_data, vec![n, k], &client);
+
+        // This time, node 1 is NOT in node 2's graph (node 2 has [0, 1, 3]).
+        // Wait, it is. Let me use a 5-node graph instead.
+        // Actually for simplicity: node 0 has [1, 2, 3]. A proposal of a
+        // hypothetical node 4 would be truly new. But n=4, so no node 4.
+        // Let me just verify sorted order is maintained with a non-duplicate.
+
+        // Actually let's just check that node 1's graph (currently [0@0.1, 2@0.3, 3@0.8])
+        // accepts a proposal from node 0 at a better distance, say node 0 at dist 0.05.
+        // But 0 is already there! Let me restructure:
+
+        // Better test: n=5, k=3
+        // Node 0 has [1@0.1, 2@0.5, 3@0.9]
+        // Proposal: node 4 at dist 0.3 (truly new, better than worst)
+        // Expected after merge: [1@0.1, 4@0.3*, 2@0.5] (3@0.9 evicted)
+
+        let n2 = 5usize;
+        let k2 = 3usize;
+        let graph_idx_data2: Vec<u32> = vec![
+            1, 2, 3, // node 0
+            0, 2, 3, // node 1
+            0, 1, 3, // node 2
+            0, 1, 2, // node 3
+            0, 1, 2, // node 4
+        ];
+        let graph_dist_data2: Vec<f32> = vec![
+            0.1, 0.5, 0.9, // node 0
+            0.1, 0.3, 0.8, // node 1
+            0.2, 0.3, 0.7, // node 2
+            0.2, 0.4, 0.6, // node 3
+            0.1, 0.2, 0.3, // node 4
+        ];
+
+        prop_idx2 = vec![0u32; n2 * MAX_PROPOSALS];
+        prop_dist2 = vec![0.0f32; n2 * MAX_PROPOSALS];
+        prop_count2 = vec![0u32; n2];
+
+        prop_idx2[0] = 4; // truly new for node 0
+        prop_dist2[0] = 0.3;
+        prop_count2[0] = 1;
+
+        let graph_idx_gpu2 =
+            GpuTensor::<WgpuRuntime, u32>::from_slice(&graph_idx_data2, vec![n2, k2], &client);
+        let graph_dist_gpu2 =
+            GpuTensor::<WgpuRuntime, f32>::from_slice(&graph_dist_data2, vec![n2, k2], &client);
+        let prop_idx_gpu2 =
+            GpuTensor::<WgpuRuntime, u32>::from_slice(&prop_idx2, vec![n2, MAX_PROPOSALS], &client);
+        let prop_dist_gpu2 = GpuTensor::<WgpuRuntime, f32>::from_slice(
+            &prop_dist2,
+            vec![n2, MAX_PROPOSALS],
+            &client,
+        );
+        let prop_count_gpu2 =
+            GpuTensor::<WgpuRuntime, u32>::from_slice(&prop_count2, vec![n2], &client);
+        let update_counter2 = GpuTensor::<WgpuRuntime, u32>::from_slice(&[0u32], vec![1], &client);
+
+        let grid_n2 = (n2 as u32).div_ceil(WORKGROUP_SIZE_X);
+
+        unsafe {
+            let _ = merge_proposals::launch_unchecked::<f32, WgpuRuntime>(
+                &client,
+                CubeCount::Static(grid_n2, 1, 1),
+                CubeDim::new_2d(WORKGROUP_SIZE_X, 1),
+                graph_idx_gpu2.clone().into_tensor_arg(1),
+                graph_dist_gpu2.clone().into_tensor_arg(1),
+                prop_idx_gpu2.into_tensor_arg(1),
+                prop_dist_gpu2.into_tensor_arg(1),
+                prop_count_gpu2.into_tensor_arg(1),
+                update_counter2.clone().into_tensor_arg(1),
+                ScalarArg { elem: n2 as u32 },
+                MAX_PROPOSALS as u32,
+            );
+        }
+
+        let r_idx = graph_idx_gpu2.read(&client);
+        let r_dist = graph_dist_gpu2.read(&client);
+        let r_updates = update_counter2.read(&client);
+
+        println!("\nMerge with new candidate:");
+        println!("  Updates: {}", r_updates[0]);
+        let base = 0;
+        for j in 0..k2 {
+            let pid = r_idx[base + j] & pid_mask;
+            let is_new = r_idx[base + j] & (1u32 << 31) != 0;
+            let dist = r_dist[base + j];
+            println!("  Node 0 slot {j}: pid={pid} dist={dist:.4} new={is_new}");
+        }
+
+        assert_eq!(r_updates[0], 1, "Should have exactly 1 update");
+        assert_eq!(r_idx[base] & pid_mask, 1, "Slot 0: pid=1 (unchanged)");
+        assert_eq!(r_idx[base + 1] & pid_mask, 4, "Slot 1: pid=4 (new)");
+        assert!(
+            r_idx[base + 1] & (1u32 << 31) != 0,
+            "Slot 1 should be flagged new"
+        );
+        assert_eq!(r_idx[base + 2] & pid_mask, 2, "Slot 2: pid=2 (shifted)");
+        assert!((r_dist[base] - 0.1).abs() < 1e-6);
+        assert!((r_dist[base + 1] - 0.3).abs() < 1e-6);
+        assert!((r_dist[base + 2] - 0.5).abs() < 1e-6);
+
+        // Verify node 0's slot 2 (pid=3 at dist=0.9) was evicted
+        for j in 0..k2 {
+            assert_ne!(
+                r_idx[base + j] & pid_mask,
+                3,
+                "pid=3 should have been evicted"
+            );
+        }
+    }
+
+    #[test]
+    fn test_annoy_init_quality() {
+        let n = 200;
+        let dim = 8;
+        let k = 10;
+
+        // Create clustered data (2 clusters)
+        let mut data_flat = vec![0.0f32; n * dim];
+        for i in 0..n {
+            let cluster = if i < n / 2 { 0.0 } else { 10.0 };
+            for j in 0..dim {
+                data_flat[i * dim + j] = cluster + (i * 7 + j * 3) as f32 * 0.01;
+            }
+        }
+
+        let mat = Mat::from_fn(n, dim, |i, j| data_flat[i * dim + j]);
+        let forest = AnnoyIndex::new(mat.as_ref(), 10, Dist::Euclidean, 42);
+        let (idx_flat, dist_flat) = annoy_init_graph(&data_flat, n, dim, k, &forest);
+
+        let pid_mask = 0x7FFFFFFFu32;
+
+        // Compute brute-force kNN for first 20 nodes
+        let mut recall_sum = 0.0f64;
+        let check_n = 20;
+
+        for i in 0..check_n {
+            // Brute-force: compute distance to all others, take k nearest
+            let mut dists: Vec<(usize, f32)> = (0..n)
+                .filter(|&j| j != i)
+                .map(|j| {
+                    let a = &data_flat[i * dim..(i + 1) * dim];
+                    let b = &data_flat[j * dim..(j + 1) * dim];
+                    let d: f32 = a.iter().zip(b).map(|(x, y)| (x - y) * (x - y)).sum();
+                    (j, d)
+                })
+                .collect();
+            dists.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
+            let gt_set: std::collections::HashSet<usize> =
+                dists.iter().take(k).map(|&(j, _)| j).collect();
+
+            // Check Annoy's result
+            let base = i * k;
+            let annoy_set: std::collections::HashSet<usize> = (0..k)
+                .map(|j| (idx_flat[base + j] & pid_mask) as usize)
+                .collect();
+
+            let hits = gt_set.intersection(&annoy_set).count();
+            recall_sum += hits as f64 / k as f64;
+        }
+
+        let avg_recall = recall_sum / check_n as f64;
+        println!("Annoy init recall@{k} (avg over {check_n} nodes): {avg_recall:.4}");
+        assert!(
+            avg_recall > 0.5,
+            "Annoy init recall too low: {avg_recall:.4} -- something is wrong with annoy_init_graph"
+        );
+    }
+
+    #[test]
+    fn test_end_to_end_quality() {
+        let Some(device) = try_device() else {
+            eprintln!("Skipping: no wgpu backend");
+            return;
+        };
+
+        let n = 100;
+        let dim = 8;
+        let k = 5;
+
+        let data_flat: Vec<f32> = (0..n * dim)
+            .map(|idx| {
+                let i = idx / dim;
+                let j = idx % dim;
+                let cluster = (i / 10) as f32 * 5.0;
+                cluster + (i % 10) as f32 * 0.1 + j as f32 * 0.01
+            })
+            .collect();
+
+        let data = Mat::from_fn(n, dim, |i, j| data_flat[i * dim + j]);
+
+        // Brute-force ground truth (squared Euclidean)
+        let mut ground_truth: Vec<Vec<usize>> = Vec::with_capacity(n);
+        for i in 0..n {
+            let mut dists: Vec<(usize, f32)> = (0..n)
+                .filter(|&j| j != i)
+                .map(|j| {
+                    let a = &data_flat[i * dim..(i + 1) * dim];
+                    let b = &data_flat[j * dim..(j + 1) * dim];
+                    let d: f32 = a.iter().zip(b).map(|(x, y)| (x - y) * (x - y)).sum();
+                    (j, d)
+                })
+                .collect();
+            dists.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
+            ground_truth.push(dists.iter().take(k).map(|&(j, _)| j).collect());
+        }
+
+        let index = NNDescentGpu::<f32, WgpuRuntime>::build(
+            data.as_ref(),
+            Dist::Euclidean,
+            Some(k),
+            None,
+            Some(15),
+            None,
+            Some(0.001),
+            Some(0.5),
+            42,
+            true,
+            device,
+        );
+
+        let (knn_indices, _) = index.extract_knn(false);
+
+        let mut total_hits = 0;
+        let total_possible = n * k;
+        for i in 0..n {
+            let gt_set: std::collections::HashSet<usize> =
+                ground_truth[i].iter().copied().collect();
+            for &idx in &knn_indices[i] {
+                if gt_set.contains(&idx) {
+                    total_hits += 1;
+                }
+            }
+        }
+
+        let recall = total_hits as f64 / total_possible as f64;
+        println!("End-to-end extract recall@{k}: {recall:.4} ({total_hits}/{total_possible})");
+
+        // With proper distance computation, should be > 0.8 at minimum
+        assert!(recall > 0.7, "End-to-end recall too low: {recall:.4}");
+    }
+
+    #[test]
+    fn test_distances_dim32() {
+        let Some(device) = try_device() else {
+            return;
+        };
+        let client = WgpuRuntime::client(&device);
+        let line = LINE_SIZE as usize;
+        let n = 16usize;
+        let dim = 32usize;
+        let dim_vec = dim / line; // 8
+
+        // Vectors where each row has a distinct pattern
+        let data: Vec<f32> = (0..n * dim)
+            .map(|i| ((i % 7) as f32) * 0.1 + (i / dim) as f32)
+            .collect();
+
+        let vectors_gpu = GpuTensor::<WgpuRuntime, f32>::from_slice(&data, vec![n, dim], &client);
+        let norms_gpu = GpuTensor::<WgpuRuntime, f32>::from_slice(&[0.0f32], vec![1], &client);
+        let out = GpuTensor::<WgpuRuntime, f32>::from_slice(&vec![0.0f32; 1], vec![1], &client);
+
+        // Compute dist(0, 1) on GPU via dist_sq_euclidean
+        // We need a tiny wrapper kernel:
+        // (reuse compute_pairwise_dist with n=2 subset, or write a one-off)
+
+        let n_pairs = n * (n - 1) / 2;
+        let out_euclid = GpuTensor::<WgpuRuntime, f32>::from_slice(
+            &vec![0.0f32; n_pairs],
+            vec![n_pairs],
+            &client,
+        );
+        let out_cos = GpuTensor::<WgpuRuntime, f32>::from_slice(
+            &vec![0.0f32; n_pairs],
+            vec![n_pairs],
+            &client,
+        );
+
+        unsafe {
+            let _ = compute_pairwise_dist::launch_unchecked::<f32, WgpuRuntime>(
+                &client,
+                CubeCount::Static(1, 1, 1),
+                CubeDim::new_2d(WORKGROUP_SIZE_X, 1),
+                vectors_gpu.into_tensor_arg(line),
+                norms_gpu.into_tensor_arg(1),
+                out_euclid.clone().into_tensor_arg(1),
+                out_cos.into_tensor_arg(1),
+                ScalarArg { elem: n as u32 },
+                false,
+                dim_vec,
+            );
+        }
+
+        let euclid = out_euclid.read(&client);
+
+        // Check first pair: dist(0, 1)
+        let a = &data[0..dim];
+        let b = &data[dim..2 * dim];
+        let expected: f32 = a.iter().zip(b).map(|(x, y)| (x - y) * (x - y)).sum();
+
+        println!("dim=32 dist(0,1): gpu={:.6} cpu={:.6}", euclid[0], expected);
+        assert!(
+            (euclid[0] - expected).abs() < 1e-3,
+            "dim=32 distance mismatch: gpu={}, cpu={}",
+            euclid[0],
+            expected
+        );
+    }
+
+    /// Minimal reproduction of local_join's shared memory pattern.
+    /// Loads two vectors into shared memory using the same indexing
+    /// as local_join_shared, computes their distance, and writes
+    /// the result plus the raw shared memory contents to output.
+    #[cube(launch_unchecked)]
+    fn debug_shared_mem_dist<F: Float>(
+        vectors: &Tensor<Line<F>>,
+        norms: &Tensor<F>,
+        pid_a: u32,
+        pid_b: u32,
+        out_dist: &mut Tensor<F>,
+        out_raw: &mut Tensor<F>,
+        #[comptime] max_proposals: u32,
+        #[comptime] use_cosine: bool,
+        #[comptime] dim_lines: usize,
+        #[comptime] build_k: usize,
+    ) {
+        let tx = UNIT_POS_X;
+        let max_cands_comp = build_k * 2usize;
+        let dim_scalars = dim_lines * 4usize;
+
+        let mut shared_vecs = SharedMemory::<F>::new(max_cands_comp * dim_scalars);
+        let mut shared_pids = SharedMemory::<u32>::new(max_cands_comp);
+        let mut shared_is_new = SharedMemory::<u32>::new(max_cands_comp);
+        let mut shared_norms = SharedMemory::<F>::new(max_cands_comp);
+
+        if tx == 0u32 {
+            shared_pids[0usize] = pid_a;
+            shared_pids[1usize] = pid_b;
+            if use_cosine {
+                shared_norms[0usize] = norms[pid_a as usize];
+                shared_norms[1usize] = norms[pid_b as usize];
+            }
+        }
+        sync_cube();
+
+        let total_scalars = 2usize * dim_scalars;
+        let mut idx_load = tx as usize;
+        while idx_load < total_scalars {
+            let n_idx = idx_load / dim_scalars;
+            let s_idx = idx_load % dim_scalars;
+            let line_idx = s_idx / 4usize;
+            let lane = s_idx % 4usize;
+            let pid = shared_pids[n_idx];
+            let vec_offset = pid as usize * dim_lines + line_idx;
+            let line_val = vectors[vec_offset];
+            shared_vecs[idx_load] = line_val[lane];
+            idx_load += WORKGROUP_SIZE_X as usize;
+        }
+        sync_cube();
+
+        if tx == 0u32 {
+            let mut sum = F::new(0.0);
+            let mut s = 0usize;
+            while s < dim_scalars {
+                let va = shared_vecs[s];
+                let vb = shared_vecs[dim_scalars + s];
+                if use_cosine {
+                    sum += va * vb;
+                } else {
+                    let diff = va - vb;
+                    sum += diff * diff;
+                }
+                s += 1usize;
+            }
+
+            let dist = if use_cosine {
+                F::new(1.0) - (sum / (shared_norms[0usize] * shared_norms[1usize]))
+            } else {
+                sum
+            };
+
+            out_dist[0usize] = dist;
+            out_dist[1usize] = sum;
+            if use_cosine {
+                out_dist[2usize] = shared_norms[0usize];
+                out_dist[3usize] = shared_norms[1usize];
+            }
+
+            let mut i = 0usize;
+            while i < total_scalars {
+                out_raw[i] = shared_vecs[i];
+                i += 1usize;
+            }
+        }
+    }
+
+    #[test]
+    fn test_shared_mem_local_join_pattern() {
+        let Some(device) = try_device() else {
+            eprintln!("Skipping: no wgpu backend");
+            return;
+        };
+
+        let client = WgpuRuntime::client(&device);
+        let line = LINE_SIZE as usize;
+
+        // Production dimensions: dim=32 (dim_lines=8), build_k=30
+        let n = 100usize;
+        let dim = 32usize;
+        let dim_vec = dim / line; // 8
+        let build_k = 30usize;
+
+        // Create recognisable data
+        let mut data = vec![0.0f32; n * dim];
+        for i in 0..n {
+            for j in 0..dim {
+                data[i * dim + j] = (i * 1000 + j) as f32;
+            }
+        }
+
+        let norms: Vec<f32> = (0..n)
+            .map(|i| {
+                let row = &data[i * dim..(i + 1) * dim];
+                row.iter().map(|x| x * x).sum::<f32>().sqrt()
+            })
+            .collect();
+
+        let vectors_gpu = GpuTensor::<WgpuRuntime, f32>::from_slice(&data, vec![n, dim], &client);
+        let norms_gpu = GpuTensor::<WgpuRuntime, f32>::from_slice(&norms, vec![n], &client);
+        let out_dist =
+            GpuTensor::<WgpuRuntime, f32>::from_slice(&vec![0.0f32; 4], vec![4], &client);
+        let out_raw = GpuTensor::<WgpuRuntime, f32>::from_slice(
+            &vec![0.0f32; 2 * dim],
+            vec![2 * dim],
+            &client,
+        );
+
+        // Test distance between rows 0 and 1
+        let pid_a = 0u32;
+        let pid_b = 1u32;
+
+        unsafe {
+            let _ = debug_shared_mem_dist::launch_unchecked::<f32, WgpuRuntime>(
+                &client,
+                CubeCount::Static(1, 1, 1),
+                CubeDim::new_2d(WORKGROUP_SIZE_X, 1),
+                vectors_gpu.clone().into_tensor_arg(line),
+                norms_gpu.clone().into_tensor_arg(1),
+                ScalarArg { elem: pid_a },
+                ScalarArg { elem: pid_b },
+                out_dist.clone().into_tensor_arg(1),
+                out_raw.clone().into_tensor_arg(1),
+                MAX_PROPOSALS as u32, // same comptime order as local_join
+                false,                // euclidean first
+                dim_vec,              // dim_lines
+                build_k,              // build_k
+            );
+        }
+
+        let dist_result = out_dist.read(&client);
+        let raw = out_raw.read(&client);
+
+        // Check raw shared memory contents
+        let expected_a: Vec<f32> = (0..dim).map(|j| j as f32).collect();
+        let expected_b: Vec<f32> = (0..dim).map(|j| (1000 + j) as f32).collect();
+
+        println!("Shared mem vec A (first 8): {:?}", &raw[..8]);
+        println!("Expected vec A  (first 8): {:?}", &expected_a[..8]);
+        println!("Shared mem vec B (first 8): {:?}", &raw[dim..dim + 8]);
+        println!("Expected vec B  (first 8): {:?}", &expected_b[..8]);
+
+        let vec_a_ok = (0..dim).all(|j| (raw[j] - expected_a[j]).abs() < 1e-4);
+        let vec_b_ok = (0..dim).all(|j| (raw[dim + j] - expected_b[j]).abs() < 1e-4);
+
+        println!("Vec A correct: {vec_a_ok}");
+        println!("Vec B correct: {vec_b_ok}");
+
+        // Check distance
+        let cpu_dist: f32 = expected_a
+            .iter()
+            .zip(&expected_b)
+            .map(|(a, b)| (a - b) * (a - b))
+            .sum();
+        let gpu_dist = dist_result[0];
+
+        println!(
+            "GPU dist: {gpu_dist:.4}  CPU dist: {cpu_dist:.4}  match: {}",
+            (gpu_dist - cpu_dist).abs() < 1e-2
+        );
+
+        assert!(vec_a_ok, "Vector A in shared memory is wrong");
+        assert!(vec_b_ok, "Vector B in shared memory is wrong");
+        assert!(
+            (gpu_dist - cpu_dist).abs() < 1e-2,
+            "Distance mismatch: gpu={gpu_dist}, cpu={cpu_dist}"
+        );
+    }
+}
+
+// NOTE: cagra_search_shared is shelved pending CubeCL warp-level primitive
+// support. The kernel has known correctness issues (no shared-memory
+// broadcasting of thread-0 state, no cooperative distance reduction, broken
+// visited-node tracking). Revisit when CubeCL exposes warp shuffles.
 // #[allow(dead_code)]
 // #[cube(launch_unchecked)]
 // pub fn cagra_search_shared<F: Float>(
