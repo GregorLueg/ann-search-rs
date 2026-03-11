@@ -147,6 +147,10 @@ fn dist_cosine<F: Float>(vectors: &Tensor<Line<F>>, norms: &Tensor<F>, a: u32, b
 // Kernels //
 /////////////
 
+///////////////
+// NNDescent //
+///////////////
+
 /// Initialise the kNN graph with random neighbours.
 ///
 /// One thread per node. Generates k random neighbours, computes distances,
@@ -251,44 +255,52 @@ fn reset_proposals(prop_count: &mut Tensor<u32>, update_counter: &mut Tensor<u32
     }
 }
 
+/// Scatters forward edges into a reverse edge buffer to ensure symmetric
+/// information flow during the local join phase.
+#[cube(launch_unchecked)]
+pub fn build_reverse_candidates(
+    graph_idx: &Tensor<u32>,
+    reverse_idx: &mut Tensor<u32>,
+    reverse_count: &Tensor<Atomic<u32>>,
+    n: u32,
+    #[comptime] build_k: u32,
+) {
+    let node = ABSOLUTE_POS_X;
+    if node >= n {
+        terminate!();
+    }
+
+    let pid_mask = 0x7FFFFFFFu32;
+    let base = node as usize * build_k as usize;
+
+    let mut i = 0usize;
+    while i < build_k as usize {
+        let target_raw = graph_idx[base + i];
+        let target = target_raw & pid_mask;
+
+        // Sentinels and out-of-bounds check
+        if target < n && target != node {
+            let pos = reverse_count[target as usize].fetch_add(1u32);
+            if pos < build_k {
+                let rev_base = target as usize * build_k as usize;
+                // Preserve the "is_new" flag from the forward edge
+                let is_new_bit = target_raw & (1u32 << 31);
+                reverse_idx[rev_base + pos as usize] = node | is_new_bit;
+            }
+        }
+        i += 1usize;
+    }
+}
+
 /// Core NNDescent local join kernel.
-///
-/// One thread per source node. For each source node S, iterates over all
-/// pairs (i, j) of S's k neighbours where at least one is flagged "new",
-/// both pass the rho sampling check, and i < j. Computes the distance
-/// between the pair and proposes each as a candidate to the other via
-/// atomic slot allocation in the proposal buffers.
-///
-/// The rho sampling uses a deterministic hash so no per-entry storage
-/// is needed; the participation decision for entry `i` of node `S` is
-/// recomputed identically each time it is checked.
-///
-/// ### Params
-///
-/// * `vectors` - Row-major vector matrix, line-vectorised along the feature
-///   dimension
-/// * `norms` - Pre-computed L2 norms (ignored when `use_cosine` is false)
-/// * `graph_idx` - Current kNN graph indices, MSB encodes the is-new flag
-/// * `graph_dist` - Current kNN graph distances, sorted ascending per row
-/// * `n` - Number of nodes
-/// * `rho_thresh` - Sampling threshold in [0, 65535]; entry participates if
-///   hash < threshold
-/// * `iter_seed` - Per-iteration seed for the sampling hash
-/// * `max_proposals` - Proposal buffer capacity per node (comptime)
-/// * `use_cosine` - Whether to use cosine distance instead of squared Euclidean
-///   (comptime)
-///
-/// Appends candidate (index, distance) pairs into `prop_idx`, `prop_dist`,
-/// and increments `prop_count` atomically for each target node.
-///
-/// ### Grid mapping
-///
-/// * `ABSOLUTE_POS_X` -> source node index
 #[cube(launch_unchecked)]
 pub fn local_join_shared<F: Float>(
     vectors: &Tensor<Line<F>>,
     norms: &Tensor<F>,
     graph_idx: &Tensor<u32>,
+    graph_dist: &Tensor<F>, // <--- NEW: Need this to threshold proposals!
+    reverse_idx: &Tensor<u32>,
+    reverse_count: &Tensor<u32>,
     prop_idx: &mut Tensor<u32>,
     prop_dist: &mut Tensor<F>,
     prop_count: &Tensor<Atomic<u32>>,
@@ -297,8 +309,8 @@ pub fn local_join_shared<F: Float>(
     iter_seed: u32,
     #[comptime] max_proposals: u32,
     #[comptime] use_cosine: bool,
-    #[comptime] max_k: usize,
     #[comptime] dim_lines: usize,
+    #[comptime] build_k: usize,
 ) {
     let node = CUBE_POS_Y * CUBE_COUNT_X + CUBE_POS_X;
     if node >= n {
@@ -306,94 +318,129 @@ pub fn local_join_shared<F: Float>(
     }
 
     let tx = UNIT_POS_X;
-    let k = graph_idx.shape(1);
+    let k = graph_idx.shape(1usize) as u32;
     let pid_mask = 0x7FFFFFFFu32;
     let is_new_bit = 1u32 << 31;
-    let graph_base = node as usize * k;
 
-    let mut shared_vecs = SharedMemory::<Line<F>>::new(max_k * dim_lines);
-    let mut shared_pids = SharedMemory::<u32>::new(max_k);
-    let mut shared_is_new = SharedMemory::<bool>::new(max_k);
-    let mut shared_norms = SharedMemory::<F>::new(max_k);
+    let max_cands_comp = build_k * 2usize;
 
-    let mut i = tx as usize;
-    while i < k {
-        let entry = graph_idx[graph_base + i];
-        shared_pids[i] = entry & pid_mask;
-        shared_is_new[i] = entry >= is_new_bit;
-        if use_cosine {
-            shared_norms[i] = norms[shared_pids[i] as usize];
-        }
-        i += WORKGROUP_SIZE_X as usize;
+    let mut shared_vecs = SharedMemory::<Line<F>>::new(max_cands_comp * dim_lines);
+    let mut shared_pids = SharedMemory::<u32>::new(max_cands_comp);
+    let mut shared_is_new = SharedMemory::<bool>::new(max_cands_comp);
+    let mut shared_norms = SharedMemory::<F>::new(max_cands_comp);
+
+    let mut shared_rev_count = SharedMemory::<u32>::new(1usize);
+    if tx == 0u32 {
+        let rc = reverse_count[node as usize];
+        shared_rev_count[0usize] = if rc > k { k } else { rc };
     }
-
     sync_cube();
 
-    let total_loads = k * dim_lines;
-    let mut idx = tx as usize;
-    while idx < total_loads {
-        let n_idx = idx / dim_lines;
-        let d_idx = idx % dim_lines;
+    let rev_k = shared_rev_count[0usize];
+    let total_cands = k + rev_k;
+
+    let mut i_load = tx;
+    while i_load < total_cands {
+        let entry = if i_load < k {
+            graph_idx[(node * k + i_load) as usize]
+        } else {
+            reverse_idx[(node * k + i_load - k) as usize]
+        };
+
+        shared_pids[i_load as usize] = entry & pid_mask;
+        shared_is_new[i_load as usize] = entry >= is_new_bit;
+        if use_cosine {
+            shared_norms[i_load as usize] = norms[shared_pids[i_load as usize] as usize];
+        }
+        i_load += WORKGROUP_SIZE_X;
+    }
+    sync_cube();
+
+    let total_loads = total_cands as usize * dim_lines;
+    let mut idx_load = tx as usize;
+    while idx_load < total_loads {
+        let n_idx = idx_load / dim_lines;
+        let d_idx = idx_load % dim_lines;
         let pid = shared_pids[n_idx];
 
-        let vec_offset = pid as usize * vectors.stride(0) + d_idx;
-        shared_vecs[idx] = vectors[vec_offset];
-        idx += WORKGROUP_SIZE_X as usize;
+        if pid < n {
+            let vec_offset = pid as usize * vectors.stride(0usize) as usize + d_idx;
+            shared_vecs[idx_load] = vectors[vec_offset];
+        }
+        idx_load += WORKGROUP_SIZE_X as usize;
     }
-
     sync_cube();
 
-    let mut i_compute = tx as usize;
-    while i_compute < k {
-        let hash_i = entry_hash(node, i_compute as u32, iter_seed);
+    let num_pairs = (total_cands * (total_cands - 1u32)) / 2u32;
+    let mut pair_idx = tx as usize;
+
+    while pair_idx < num_pairs as usize {
+        let mut rem = pair_idx;
+        let mut i = 0usize;
+        let mut step = total_cands as usize - 1usize;
+
+        while rem >= step {
+            rem -= step;
+            i += 1usize;
+            step = total_cands as usize - 1usize - i;
+        }
+        let j = i + 1usize + rem;
+
+        let hash_i = entry_hash(node, i as u32, iter_seed);
         if (hash_i & 0xFFFFu32) < rho_thresh {
-            let pid_i = shared_pids[i_compute];
-            let is_new_i = shared_is_new[i_compute];
+            let hash_j = entry_hash(node, j as u32, iter_seed);
 
-            let mut j = i_compute + 1;
-            while j < k {
-                let hash_j = entry_hash(node, j as u32, iter_seed);
-                if (hash_j & 0xFFFFu32) < rho_thresh {
-                    let pid_j = shared_pids[j];
-                    let is_new_j = shared_is_new[j];
+            if (hash_j & 0xFFFFu32) < rho_thresh {
+                let is_new_i = shared_is_new[i];
+                let is_new_j = shared_is_new[j];
+                let pid_i = shared_pids[i];
+                let pid_j = shared_pids[j];
 
-                    if (is_new_i || is_new_j) && pid_i != pid_j {
-                        let mut sum = F::new(0.0);
-                        let mut d = 0;
-                        while d < dim_lines {
-                            let va = shared_vecs[i_compute * dim_lines + d];
-                            let vb = shared_vecs[j * dim_lines + d];
+                if (is_new_i || is_new_j) && pid_i != pid_j {
+                    let mut sum = F::new(0.0);
+                    let mut d = 0usize;
+                    while d < dim_lines {
+                        let va = shared_vecs[i * dim_lines + d];
+                        let vb = shared_vecs[j * dim_lines + d];
 
-                            if use_cosine {
-                                let prod = va * vb;
-                                sum += prod[0];
-                                sum += prod[1];
-                                sum += prod[2];
-                                sum += prod[3];
-                            } else {
-                                let diff = va - vb;
-                                let sq = diff * diff;
-                                sum += sq[0];
-                                sum += sq[1];
-                                sum += sq[2];
-                                sum += sq[3];
-                            }
-                            d += 1;
-                        }
-
-                        let dist = if use_cosine {
-                            F::new(1.0) - (sum / (shared_norms[i_compute] * shared_norms[j]))
+                        if use_cosine {
+                            let prod = va * vb;
+                            sum += prod[0usize];
+                            sum += prod[1usize];
+                            sum += prod[2usize];
+                            sum += prod[3usize];
                         } else {
-                            sum
-                        };
+                            let diff = va - vb;
+                            let sq = diff * diff;
+                            sum += sq[0usize];
+                            sum += sq[1usize];
+                            sum += sq[2usize];
+                            sum += sq[3usize];
+                        }
+                        d += 1usize;
+                    }
 
+                    let dist = if use_cosine {
+                        F::new(1.0) - (sum / (shared_norms[i] * shared_norms[j]))
+                    } else {
+                        sum
+                    };
+
+                    // --- THE FIX: THRESHOLD BEFORE PROPOSING ---
+                    // Read the worst distance for both targets
+                    let thresh_i = graph_dist[pid_i as usize * k as usize + k as usize - 1usize];
+                    let thresh_j = graph_dist[pid_j as usize * k as usize + k as usize - 1usize];
+
+                    if dist < thresh_i {
                         let slot_i = prop_count[pid_i as usize].fetch_add(1u32);
                         if slot_i < max_proposals {
                             let off = pid_i as usize * max_proposals as usize + slot_i as usize;
                             prop_idx[off] = pid_j;
                             prop_dist[off] = dist;
                         }
+                    }
 
+                    if dist < thresh_j {
                         let slot_j = prop_count[pid_j as usize].fetch_add(1u32);
                         if slot_j < max_proposals {
                             let off = pid_j as usize * max_proposals as usize + slot_j as usize;
@@ -402,10 +449,9 @@ pub fn local_join_shared<F: Float>(
                         }
                     }
                 }
-                j += 1;
             }
         }
-        i_compute += WORKGROUP_SIZE_X as usize;
+        pair_idx += WORKGROUP_SIZE_X as usize;
     }
 }
 
@@ -514,6 +560,138 @@ fn merge_proposals<F: Float>(
         update_counter[0usize].fetch_add(improvements);
     }
 }
+
+/// 2-Hop Refinement Kernel
+///
+/// Runs after NNDescent convergence. For each node, evaluates the K^2
+/// second-degree neighbors. Filters aggressively against duplicates and the
+/// current worst distance before pushing to the proposal buffer.
+#[cube(launch_unchecked)]
+pub fn two_hop_refinement<F: Float>(
+    vectors: &Tensor<Line<F>>,
+    norms: &Tensor<F>,
+    graph_idx: &Tensor<u32>,
+    graph_dist: &Tensor<F>,
+    prop_idx: &mut Tensor<u32>,
+    prop_dist: &mut Tensor<F>,
+    prop_count: &Tensor<Atomic<u32>>,
+    n: u32,
+    #[comptime] max_proposals: u32,
+    #[comptime] use_cosine: bool,
+    #[comptime] dim_lines: usize,
+) {
+    let node = CUBE_POS_Y * CUBE_COUNT_X + CUBE_POS_X;
+    if node >= n {
+        terminate!();
+    }
+
+    let tx = UNIT_POS_X;
+    let k = graph_idx.shape(1usize);
+    let pid_mask = 0x7FFFFFFFu32;
+    let graph_base = node as usize * k as usize;
+
+    let mut shared_source = SharedMemory::<Line<F>>::new(dim_lines);
+    let mut shared_worst_dist = SharedMemory::<F>::new(1usize);
+
+    let mut d_idx = tx as usize;
+    while d_idx < dim_lines {
+        let vec_offset = node as usize * vectors.stride(0usize) + d_idx;
+        shared_source[d_idx] = vectors[vec_offset];
+        d_idx += WORKGROUP_SIZE_X as usize;
+    }
+
+    if tx == 0u32 {
+        shared_worst_dist[0usize] = graph_dist[graph_base + k - 1usize];
+    }
+    sync_cube();
+
+    let worst_dist = shared_worst_dist[0usize];
+    let num_candidates = k * k;
+    let mut cand_idx = tx as usize;
+
+    // Linearize the K^2 candidate evaluation
+    while cand_idx < num_candidates {
+        let n1_idx = cand_idx / k;
+        let n2_idx = cand_idx % k;
+
+        let n1_raw = graph_idx[graph_base + n1_idx];
+        let n1_pid = n1_raw & pid_mask;
+
+        if n1_pid < n {
+            // Get the 2-hop neighbor
+            let n2_raw = graph_idx[n1_pid as usize * k + n2_idx];
+            let cand_pid = n2_raw & pid_mask;
+
+            // Basic sanity checks: don't evaluate self
+            if cand_pid < n && cand_pid != node {
+                // --- THE FIX: DUPLICATE FILTERING ---
+                let mut is_dup: bool = false;
+                let mut scan_idx = 0usize;
+                while scan_idx < k {
+                    if (graph_idx[graph_base + scan_idx] & pid_mask) == cand_pid {
+                        is_dup = true;
+                    }
+                    scan_idx += 1usize;
+                }
+
+                if !is_dup {
+                    // Compute distance
+                    let mut sum = F::new(0.0);
+                    let mut d = 0usize;
+                    while d < dim_lines {
+                        let va = shared_source[d];
+                        let vb = vectors[cand_pid as usize * vectors.stride(0usize) + d];
+                        if use_cosine {
+                            let prod = va * vb;
+                            sum += prod[0usize];
+                            sum += prod[1usize];
+                            sum += prod[2usize];
+                            sum += prod[3usize];
+                        } else {
+                            let diff = va - vb;
+                            let sq = diff * diff;
+                            sum += sq[0usize];
+                            sum += sq[1usize];
+                            sum += sq[2usize];
+                            sum += sq[3usize];
+                        }
+                        d += 1usize;
+                    }
+
+                    let dist = if use_cosine {
+                        F::new(1.0) - (sum / (norms[node as usize] * norms[cand_pid as usize]))
+                    } else {
+                        sum
+                    };
+
+                    // Only propose if it actually improves our graph
+                    if dist < worst_dist {
+                        let slot = prop_count[node as usize].fetch_add(1u32);
+                        if slot < max_proposals {
+                            let off = node as usize * max_proposals as usize + slot as usize;
+                            prop_idx[off] = cand_pid;
+                            prop_dist[off] = dist;
+                        } else {
+                            // Reservoir sample into the proposal buffer
+                            let rand_val = xorshift(node ^ slot ^ cand_pid) % (slot + 1u32);
+                            if rand_val < max_proposals {
+                                let off =
+                                    node as usize * max_proposals as usize + rand_val as usize;
+                                prop_idx[off] = cand_pid;
+                                prop_dist[off] = dist;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        cand_idx += WORKGROUP_SIZE_X as usize;
+    }
+}
+
+///////////
+// CAGRA //
+///////////
 
 /// Rank-based edge reordering and pruning (CAGRA graph optimisation step 1).
 ///
@@ -1218,9 +1396,17 @@ where
         let iter_start = Instant::now();
         let mut converged = false;
 
+        let reverse_idx_gpu = GpuTensor::<R, u32>::empty(vec![n, build_k], &client);
+        let reverse_count_gpu = GpuTensor::<R, u32>::empty(vec![n], &client);
+
         for iter in 0..max_iters {
-            // Reset proposal counts and update counter
+            // Calculate 2D grid: max x-dimension is typically 65535
+            let cubes_x = 65535u32;
+            let cubes_y = (n as u32).div_ceil(cubes_x);
+
+            // 1. Reset BOTH proposal counts and reverse counts (and the update counter)
             unsafe {
+                // Reset proposals
                 let _ = reset_proposals::launch_unchecked::<R>(
                     &client,
                     CubeCount::Static(grid_n, 1, 1),
@@ -1229,14 +1415,35 @@ where
                     update_counter_gpu.clone().into_tensor_arg(1),
                     ScalarArg { elem: n as u32 },
                 );
+
+                // Reset reverse counts (safe to zero update_counter a second time)
+                let _ = reset_proposals::launch_unchecked::<R>(
+                    &client,
+                    CubeCount::Static(grid_n, 1, 1),
+                    CubeDim::new_2d(WORKGROUP_SIZE_X, 1),
+                    reverse_count_gpu.clone().into_tensor_arg(1),
+                    update_counter_gpu.clone().into_tensor_arg(1),
+                    ScalarArg { elem: n as u32 },
+                );
             }
 
-            // Calculate 2D grid: max x-dimension is typically 65535
-            let cubes_x = 65535u32;
-            let cubes_y = (n as u32).div_ceil(cubes_x);
+            // 2. Build reverse edges
+            unsafe {
+                let _ = build_reverse_candidates::launch_unchecked::<R>(
+                    &client,
+                    CubeCount::Static(grid_n, 1, 1),
+                    CubeDim::new_2d(WORKGROUP_SIZE_X, 1),
+                    graph_idx_gpu.clone().into_tensor_arg(1),
+                    reverse_idx_gpu.clone().into_tensor_arg(1),
+                    reverse_count_gpu.clone().into_tensor_arg(1),
+                    ScalarArg { elem: n as u32 },
+                    build_k as u32,
+                );
+            }
 
             let iter_seed = seed as u32 ^ (iter as u32).wrapping_mul(0x9E3779B9u32);
 
+            // 3. Local join (Now receiving the reverse edges!)
             unsafe {
                 let _ = local_join_shared::launch_unchecked::<T, R>(
                     &client,
@@ -1245,6 +1452,9 @@ where
                     vectors_gpu.clone().into_tensor_arg(line),
                     norms_gpu.clone().into_tensor_arg(1),
                     graph_idx_gpu.clone().into_tensor_arg(1),
+                    graph_dist_gpu.clone().into_tensor_arg(1),
+                    reverse_idx_gpu.clone().into_tensor_arg(1),
+                    reverse_count_gpu.clone().into_tensor_arg(1),
                     prop_idx_gpu.clone().into_tensor_arg(1),
                     prop_dist_gpu.clone().into_tensor_arg(1),
                     prop_count_gpu.clone().into_tensor_arg(1),
@@ -1253,12 +1463,12 @@ where
                     ScalarArg { elem: iter_seed },
                     MAX_PROPOSALS as u32,
                     use_cosine,
-                    build_k, // max_k
-                    dim_vec, // dim_lines
+                    dim_vec,
+                    build_k, // <--- ADD THIS BACK HERE
                 );
             }
 
-            // Merge proposals into the graph
+            // 4. Merge proposals into the graph
             unsafe {
                 let _ = merge_proposals::launch_unchecked::<T, R>(
                     &client,
@@ -1275,7 +1485,7 @@ where
                 );
             }
 
-            // Download single u32 to check convergence
+            // 5. Download single u32 to check convergence
             let counter_data = update_counter_gpu.clone().read(&client);
             let updates = counter_data[0] as f64;
             let rate = updates / (n * build_k) as f64;
@@ -1300,6 +1510,71 @@ where
 
         if verbose {
             println!("  NNDescent iterations: {:.2?}", iter_start.elapsed());
+        }
+
+        if verbose {
+            println!("  Running 2-Hop Refinement Sweep...");
+        }
+
+        let refinement_start = Instant::now();
+
+        let cubes_x = 65535u32;
+        let cubes_y = (n as u32).div_ceil(cubes_x);
+
+        // Zero out proposal counts
+        unsafe {
+            let _ = reset_proposals::launch_unchecked::<R>(
+                &client,
+                CubeCount::Static(grid_n, 1, 1),
+                CubeDim::new_2d(WORKGROUP_SIZE_X, 1),
+                prop_count_gpu.clone().into_tensor_arg(1),
+                update_counter_gpu.clone().into_tensor_arg(1),
+                ScalarArg { elem: n as u32 },
+            );
+        }
+
+        // Run the 2-hop sweep
+        unsafe {
+            let _ = two_hop_refinement::launch_unchecked::<T, R>(
+                &client,
+                CubeCount::Static(cubes_x, cubes_y, 1),
+                CubeDim::new_2d(WORKGROUP_SIZE_X, 1),
+                vectors_gpu.clone().into_tensor_arg(line),
+                norms_gpu.clone().into_tensor_arg(1),
+                graph_idx_gpu.clone().into_tensor_arg(1),
+                graph_dist_gpu.clone().into_tensor_arg(1),
+                prop_idx_gpu.clone().into_tensor_arg(1),
+                prop_dist_gpu.clone().into_tensor_arg(1),
+                prop_count_gpu.clone().into_tensor_arg(1),
+                ScalarArg { elem: n as u32 },
+                MAX_PROPOSALS as u32,
+                use_cosine,
+                dim_vec, // Note: build_k was removed here
+            );
+        }
+
+        // Merge the refined proposals
+        unsafe {
+            let _ = merge_proposals::launch_unchecked::<T, R>(
+                &client,
+                CubeCount::Static(grid_n, 1, 1),
+                CubeDim::new_2d(WORKGROUP_SIZE_X, 1),
+                graph_idx_gpu.clone().into_tensor_arg(1),
+                graph_dist_gpu.clone().into_tensor_arg(1),
+                prop_idx_gpu.clone().into_tensor_arg(1),
+                prop_dist_gpu.clone().into_tensor_arg(1),
+                prop_count_gpu.clone().into_tensor_arg(1),
+                update_counter_gpu.clone().into_tensor_arg(1),
+                ScalarArg { elem: n as u32 },
+                MAX_PROPOSALS as u32,
+            );
+        }
+
+        if verbose {
+            println!(
+                "  2-Hop Sweep finished in {:.2?}",
+                refinement_start.elapsed()
+            );
         }
 
         let nndescent_idx = graph_idx_gpu.clone().read(&client);

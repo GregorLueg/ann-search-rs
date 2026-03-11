@@ -6,7 +6,6 @@ use faer::MatRef;
 use faer_traits::ComplexField;
 use num_traits::{Float, FromPrimitive};
 use rayon::prelude::*;
-use std::collections::BinaryHeap;
 use std::iter::Sum;
 use thousands::*;
 
@@ -565,7 +564,7 @@ where
             })
             .collect();
 
-        // Build the Mega Kernel Task Schedule
+        // build the Mega Kernel Task Schedule
         let mut cpu_write_pointers = vec![0u32; n_queries];
         let mut task_q_idx = Vec::new();
         let mut task_db_start = Vec::new();
@@ -627,7 +626,7 @@ where
         let grid_x = max_db_count.div_ceil(WORKGROUP_SIZE_X).max(1);
         let grid_y = (n_tasks as u32).div_ceil(WORKGROUP_SIZE_Y).max(1);
 
-        // 1. Launch Mega Kernel for Distance Computation
+        // launch mega kernel for distance Computation
         match self.metric {
             Dist::Euclidean => unsafe {
                 let _ = compute_ivf_mega_euclidean::launch_unchecked::<T, R>(
@@ -663,7 +662,7 @@ where
             },
         }
 
-        // 2. Prepare Top-K buffers and initialize to MAX
+        // prepare Top-K buffers and initialize to MAX
         let topk_dists_gpu = GpuTensor::<R, T>::empty(vec![n_queries, k], client);
         let topk_indices_gpu = GpuTensor::<R, u32>::empty(vec![n_queries, k], client);
 
@@ -684,7 +683,7 @@ where
             GpuTensor::<R, u32>::from_slice(&cpu_write_pointers, vec![n_queries], client);
         let reduce_grid_x = (n_queries as u32).div_ceil(WORKGROUP_SIZE_X);
 
-        // 3. Launch Top-K Reduction Kernel
+        // launch Top-K Reduction Kernel
         unsafe {
             let _ = reduce_ivf_topk::launch_unchecked::<T, R>(
                 client,
@@ -702,7 +701,7 @@ where
             println!("  GPU Mega-Kernel & Top-K finished. Transferring final results...");
         }
 
-        // 4. Single tiny PCIe read for just the final K items
+        // single tiny read for just the final K items
         let final_dists = topk_dists_gpu.read(client);
         let final_indices = topk_indices_gpu.read(client);
 
@@ -716,7 +715,7 @@ where
 
             for i in 0..k {
                 let d = final_dists[start + i];
-                // Only collect valid elements (where dist isn't MAX)
+                // only collect valid elements (where dist isn't MAX)
                 if d < T::from_f32(f32::MAX).unwrap() {
                     let reorg_idx = final_indices[start + i] as usize;
                     row_idx.push(self.original_indices[reorg_idx]);
@@ -831,29 +830,6 @@ fn reorganise_by_cluster<T: Float + Copy + Send + Sync + Sum>(
     }
 
     (vectors_reorg, indices_reorg, offsets, norms_reorg)
-}
-
-/// Invert probe lists to map clusters to queries
-///
-/// Transforms per-query cluster lists into per-cluster query lists.
-/// Given probe_lists[q] = [c1, c2, ...] returns result[c] = [q1, q2, ...]
-///
-/// ### Params
-///
-/// * `probe_lists` - For each query, which clusters it probes
-/// * `nlist` - Total number of clusters
-///
-/// ### Returns
-///
-/// For each cluster, which queries probe it
-fn invert_probe_lists(probe_lists: &[Vec<usize>], nlist: usize) -> Vec<Vec<usize>> {
-    let mut result = vec![Vec::new(); nlist];
-    for (query_idx, probes) in probe_lists.iter().enumerate() {
-        for &cluster_idx in probes {
-            result[cluster_idx].push(query_idx);
-        }
-    }
-    result
 }
 
 ///////////
@@ -977,18 +953,5 @@ mod tests {
         assert_eq!(offsets.len(), 3);
         assert_eq!(offsets[0], 0);
         assert_eq!(offsets[2], 4);
-    }
-
-    #[test]
-    fn test_invert_probe_lists() {
-        let probe_lists = vec![vec![0, 1, 2], vec![1, 2], vec![0, 3]];
-
-        let inverted = invert_probe_lists(&probe_lists, 4);
-
-        assert_eq!(inverted.len(), 4);
-        assert_eq!(inverted[0], vec![0, 2]);
-        assert_eq!(inverted[1], vec![0, 1]);
-        assert_eq!(inverted[2], vec![0, 1]);
-        assert_eq!(inverted[3], vec![2]);
     }
 }
