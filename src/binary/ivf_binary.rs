@@ -19,21 +19,6 @@ use crate::utils::k_means_utils::*;
 use crate::utils::*;
 
 /// IVF index with binary quantisation
-///
-/// ### Fields
-///
-/// * `vectors_flat_binarised` - Binary codes, flattened (n * n_bytes)
-/// * `n_bytes` - Bytes per vector (n_bits / 8)
-/// * `n` - Number of samples
-/// * `dim` - Original vector dimensionality
-/// * `metric` - Distance metric
-/// * `binariser` - Binariser for encoding query vectors
-/// * `centroids_float` - Float centroids for routing (nlist * dim)
-/// * `centroids_norm` - Precomputed norms for Cosine distance
-/// * `all_indices` - Vector indices for each cluster (CSR format)
-/// * `offsets` - Offsets for CSR access
-/// * `nlist` - Number of clusters
-/// * `vector_store` - Optional on-disk vector storage
 pub struct IvfIndexBinary<T> {
     /// Binary codes, flattened (n * n_bytes)
     pub vectors_flat_binarised: Vec<u8>,
@@ -62,6 +47,10 @@ pub struct IvfIndexBinary<T> {
     nlist: usize,
     /// Optional vector store that is saved in binary on disk
     vector_store: Option<MmapVectorStore<T>>,
+    /// New to old mapping
+    original_ids: Vec<usize>,
+    /// Old to new mapping
+    old_to_new: Vec<usize>,
 }
 
 //////////////////////////
@@ -233,7 +222,7 @@ where
             vectors_flat_binarised.extend(binariser.encode(&original));
         }
 
-        Self {
+        let mut idx = Self {
             vectors_flat_binarised,
             n_bytes,
             n,
@@ -247,7 +236,14 @@ where
             offsets,
             nlist,
             vector_store: None,
-        }
+            original_ids: Vec::new(),
+            old_to_new: Vec::new(),
+        };
+
+        let new_to_old = idx.optimise_memory_layout();
+        idx.original_ids = new_to_old;
+
+        idx
     }
 
     /// Build an IVF index with binary quantisation and vector store for reranking
@@ -408,7 +404,7 @@ where
 
         let vector_store = MmapVectorStore::new(vectors_path, norms_path, dim, n)?;
 
-        Ok(Self {
+        let mut idx = Self {
             vectors_flat_binarised,
             n_bytes,
             n,
@@ -422,7 +418,14 @@ where
             offsets,
             nlist,
             vector_store: Some(vector_store),
-        })
+            original_ids: Vec::new(),
+            old_to_new: Vec::new(),
+        };
+
+        let new_to_old = idx.optimise_memory_layout();
+        idx.original_ids = new_to_old;
+
+        Ok(idx)
     }
 
     ///////////
@@ -473,7 +476,7 @@ where
             let start = self.offsets[cluster_idx];
             let end = self.offsets[cluster_idx + 1];
 
-            for &vec_idx in &self.all_indices[start..end] {
+            for vec_idx in start..end {
                 let dist = self.hamming_distance_query(&query_binary, vec_idx);
 
                 if heap.len() < k {
@@ -488,7 +491,10 @@ where
         let mut results: Vec<_> = heap.into_iter().collect();
         results.sort_unstable_by_key(|&(dist, _)| dist);
 
-        let (distances, indices): (Vec<_>, Vec<_>) = results.into_iter().unzip();
+        let (distances, indices): (Vec<_>, Vec<_>) = results
+            .into_iter()
+            .map(|(d, i)| (d, self.original_ids[i]))
+            .unzip();
 
         (indices, distances)
     }
@@ -564,12 +570,12 @@ where
         let mut scored: Vec<(usize, T)> = candidates
             .iter()
             .map(|&idx| {
-                let start_i = idx * self.n_bytes;
+                let physical = self.old_to_new[idx];
+                let start_i = physical * self.n_bytes;
                 let vec_i = unsafe {
                     self.vectors_flat_binarised
                         .get_unchecked(start_i..start_i + self.n_bytes)
                 };
-
                 let dist_i = asymmetric_binary_dot(query_vec, vec_i, self.dim);
                 (idx, dist_i)
             })
@@ -750,10 +756,11 @@ where
         let counter = Arc::new(AtomicUsize::new(0));
 
         if let Some(vector_store) = &self.vector_store {
-            let results: Vec<(Vec<usize>, Vec<T>)> = (0..self.n)
+            let unordered_results: Vec<(usize, Vec<usize>, Vec<T>)> = (0..self.n)
                 .into_par_iter()
                 .map(|i| {
-                    let vec = vector_store.load_vector(i);
+                    let orig_id = self.original_ids[i];
+                    let vec = vector_store.load_vector(orig_id);
 
                     if verbose {
                         let count = counter.fetch_add(1, Ordering::Relaxed) + 1;
@@ -766,24 +773,34 @@ where
                         }
                     }
 
-                    self.query_reranking(vec, k, nprobe, rerank_factor)
+                    let (indices, dists) = self.query_reranking(vec, k, nprobe, rerank_factor);
+                    (orig_id, indices, dists)
                 })
                 .collect();
 
-            if return_dist {
-                let (indices, distances) = results.into_iter().unzip();
-                (indices, Some(distances))
+            let mut final_indices = vec![Vec::new(); self.n];
+            let mut final_dists = if return_dist {
+                Some(vec![Vec::new(); self.n])
             } else {
-                let indices: Vec<Vec<usize>> = results.into_iter().map(|(idx, _)| idx).collect();
-                (indices, None)
+                None
+            };
+
+            for (orig_id, indices, dists) in unordered_results {
+                final_indices[orig_id] = indices;
+                if let Some(ref mut fd) = final_dists {
+                    fd[orig_id] = dists;
+                }
             }
+
+            (final_indices, final_dists)
         } else {
-            // Fallback to binary-only search
-            let results: Vec<(Vec<usize>, Vec<u32>)> = (0..self.n)
+            let unordered_results: Vec<(usize, Vec<usize>, Vec<u32>)> = (0..self.n)
                 .into_par_iter()
                 .map(|i| {
+                    let orig_id = self.original_ids[i];
                     let start = i * self.n_bytes;
                     let query_binary = &self.vectors_flat_binarised[start..start + self.n_bytes];
+                    let k = k.min(self.n);
 
                     if verbose {
                         let count = counter.fetch_add(1, Ordering::Relaxed) + 1;
@@ -796,21 +813,13 @@ where
                         }
                     }
 
-                    let k = k.min(self.n);
-
-                    // Need to get the float vector for centroid routing
-                    // This is a limitation - without vector_store, we need another way
-                    // For now, we'll compute distances to all centroids using binary codes
-                    // which is not ideal but maintains functionality
-
-                    // Simplified approach: search all clusters since we don't have float vectors
                     let mut heap: BinaryHeap<(u32, usize)> = BinaryHeap::with_capacity(k + 1);
 
                     for cluster_idx in 0..self.nlist {
                         let start_idx = self.offsets[cluster_idx];
                         let end_idx = self.offsets[cluster_idx + 1];
 
-                        for &vec_idx in &self.all_indices[start_idx..end_idx] {
+                        for vec_idx in start_idx..end_idx {
                             let dist = self.hamming_distance_query(query_binary, vec_idx);
 
                             if heap.len() < k {
@@ -825,24 +834,30 @@ where
                     let mut results: Vec<_> = heap.into_iter().collect();
                     results.sort_unstable_by_key(|&(dist, _)| dist);
 
-                    let (distances, indices): (Vec<_>, Vec<_>) = results.into_iter().unzip();
+                    let (distances, indices): (Vec<_>, Vec<_>) = results
+                        .into_iter()
+                        .map(|(d, i)| (d, self.original_ids[i]))
+                        .unzip();
 
-                    (indices, distances)
+                    (orig_id, indices, distances)
                 })
                 .collect();
 
-            if return_dist {
-                let (indices, distances): (Vec<Vec<usize>>, Vec<Vec<u32>>) =
-                    results.into_iter().unzip();
-                let distances_converted: Vec<Vec<T>> = distances
-                    .into_iter()
-                    .map(|v| v.into_iter().map(|d| T::from_u32(d).unwrap()).collect())
-                    .collect();
-                (indices, Some(distances_converted))
+            let mut final_indices = vec![Vec::new(); self.n];
+            let mut final_dists = if return_dist {
+                Some(vec![Vec::new(); self.n])
             } else {
-                let indices: Vec<Vec<usize>> = results.into_iter().map(|(idx, _)| idx).collect();
-                (indices, None)
+                None
+            };
+
+            for (orig_id, indices, dists) in unordered_results {
+                final_indices[orig_id] = indices.clone();
+                if let Some(ref mut fd) = final_dists {
+                    fd[orig_id] = dists.into_iter().map(|d| T::from_u32(d).unwrap()).collect();
+                }
             }
+
+            (final_indices, final_dists)
         }
     }
 
@@ -868,6 +883,40 @@ where
     /// True if yes
     pub fn use_asymmetric(&self) -> bool {
         matches!(self.binarisation_type, BinarisationInit::SignBased)
+    }
+
+    /// Function will optimise memory layout and put vectors sorted by cluster
+    /// id
+    ///
+    /// ### Returns
+    ///
+    /// New to old mapping
+    fn optimise_memory_layout(&mut self) -> Vec<usize> {
+        let mut new_to_old = Vec::with_capacity(self.n);
+        let mut old_to_new = vec![0usize; self.n];
+
+        for cluster in 0..self.nlist {
+            let start = self.offsets[cluster];
+            let end = self.offsets[cluster + 1];
+            for &old_id in &self.all_indices[start..end] {
+                old_to_new[old_id] = new_to_old.len();
+                new_to_old.push(old_id);
+            }
+        }
+
+        let mut new_binarised = Vec::with_capacity(self.vectors_flat_binarised.len());
+        for &old_id in &new_to_old {
+            let start = old_id * self.n_bytes;
+            new_binarised
+                .extend_from_slice(&self.vectors_flat_binarised[start..start + self.n_bytes]);
+        }
+
+        self.vectors_flat_binarised = new_binarised;
+        self.old_to_new = old_to_new;
+        self.all_indices.clear();
+        self.all_indices.shrink_to_fit();
+
+        new_to_old
     }
 }
 
