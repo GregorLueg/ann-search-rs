@@ -25,33 +25,31 @@ use crate::utils::*;
 ////////////////
 
 /// IVF index quantised to scalar 8 bits
-///
-/// ### Fields
-///
-/// * `quantised_vectors` - The original vectors quantised to `i8`.
-/// * `quantised_norms` - The quantised norms (if metric is set to cosine).
-/// * `dim` - The original dimensions
-/// * `n` - Number of samples in the index
-/// * `metric` - The chosen distance metric
-/// * `centroids` - The centrois of the each k-mean cluster
-/// * `centroids_norm` - Norms of the centroids - not relevant for this index.
-/// * `all_indices` - Vector indices for each cluster (in a flat structure)
-/// * `offsets` - Offsets of the elements of each inverted list.
-/// * `codebook` - The codebook that contains the information of the
-///   quantisation.
-/// * `nlist` - Number of k-means clusters.
 pub struct IvfSq8Index<T> {
+    /// The original vectors quantised to `i8`.
     quantised_vectors: Vec<i8>,
+    /// The quantised norms (if metric is set to cosine).
     quantised_norms: Vec<i32>,
+    /// The original dimensions
     dim: usize,
+    /// Number of samples in the index
     n: usize,
+    /// The chosen distance metric
     metric: Dist,
+    /// The centrois of the each k-mean cluster
     centroids: Vec<T>,
+    /// Norms of the centroids - not relevant for this index.
     centroids_norm: Vec<T>,
+    /// Vector indices for each cluster (in a flat structure)
     all_indices: Vec<usize>,
+    /// Offsets of the elements of each inverted list.
     offsets: Vec<usize>,
+    /// The codebook that contains the information of the quantisation.
     codebook: ScalarQuantiser<T>,
+    /// Number of k-means clusters.
     nlist: usize,
+    /// Original indices
+    original_ids: Vec<usize>,
 }
 
 //////////////////////
@@ -253,7 +251,7 @@ where
             println!("  Quantisation complete");
         }
 
-        Self {
+        let mut idx = Self {
             quantised_vectors,
             centroids,
             all_indices,
@@ -265,7 +263,12 @@ where
             nlist,
             metric,
             centroids_norm: Vec::new(),
-        }
+            original_ids: Vec::new(),
+        };
+
+        let new_to_old = idx.optimise_memory_layout();
+        idx.original_ids = new_to_old;
+        idx
     }
 
     /// Query the index for approximate nearest neighbours.
@@ -309,7 +312,7 @@ where
             let start = self.offsets[cluster_idx];
             let end = self.offsets[cluster_idx + 1];
 
-            for &vec_idx in &self.all_indices[start..end] {
+            for vec_idx in start..end {
                 let dist = match self.metric {
                     Dist::Cosine => self.cosine_distance_i8(vec_idx, &query_i8, query_norm_sq),
                     Dist::Euclidean => self.euclidean_distance_i8(vec_idx, &query_i8),
@@ -326,7 +329,11 @@ where
 
         let mut results: Vec<_> = heap.into_iter().collect();
         results.sort_unstable_by_key(|&(dist, _)| dist);
-        let (distances, indices) = results.into_iter().map(|(d, i)| (d.0, i)).unzip();
+        let (distances, indices) = results
+            .into_iter()
+            .map(|(d, i)| (d.0, self.original_ids[i]))
+            .unzip();
+
         (indices, distances)
     }
 
@@ -388,7 +395,7 @@ where
             let start = self.offsets[cluster_idx];
             let end = self.offsets[cluster_idx + 1];
 
-            for &vec_idx in &self.all_indices[start..end] {
+            for vec_idx in start..end {
                 let dist = match self.metric {
                     Dist::Cosine => self.cosine_distance_i8(vec_idx, query_i8, query_norm_sq),
                     Dist::Euclidean => self.euclidean_distance_i8(vec_idx, query_i8),
@@ -405,7 +412,11 @@ where
 
         let mut results: Vec<_> = heap.into_iter().collect();
         results.sort_unstable_by_key(|&(dist, _)| dist);
-        let (distances, indices) = results.into_iter().map(|(d, i)| (d.0, i)).unzip();
+        let (distances, indices) = results
+            .into_iter()
+            .map(|(d, i)| (d.0, self.original_ids[i]))
+            .unzip();
+
         (indices, distances)
     }
 
@@ -434,7 +445,7 @@ where
     ) -> (Vec<Vec<usize>>, Option<Vec<Vec<T>>>) {
         let counter = Arc::new(AtomicUsize::new(0));
 
-        let results: Vec<(Vec<usize>, Vec<T>)> = (0..self.n)
+        let unordered_results: Vec<(usize, Vec<usize>, Vec<T>)> = (0..self.n)
             .into_par_iter()
             .map(|i| {
                 let start = i * self.dim;
@@ -445,6 +456,7 @@ where
                 } else {
                     0
                 };
+                let orig_id = self.original_ids[i];
 
                 if verbose {
                     let count = counter.fetch_add(1, Ordering::Relaxed) + 1;
@@ -457,17 +469,26 @@ where
                     }
                 }
 
-                self.query_quantised(query_i8, query_norm_sq, k, nprobe)
+                let (indices, dists) = self.query_quantised(query_i8, query_norm_sq, k, nprobe);
+                (orig_id, indices, dists)
             })
             .collect();
 
-        if return_dist {
-            let (indices, distances) = results.into_iter().unzip();
-            (indices, Some(distances))
+        let mut final_indices = vec![Vec::new(); self.n];
+        let mut final_dists = if return_dist {
+            Some(vec![Vec::new(); self.n])
         } else {
-            let indices = results.into_iter().map(|(idx, _)| idx).collect();
-            (indices, None)
+            None
+        };
+
+        for (orig_id, indices, dists) in unordered_results {
+            final_indices[orig_id] = indices;
+            if let Some(ref mut fd) = final_dists {
+                fd[orig_id] = dists;
+            }
         }
+
+        (final_indices, final_dists)
     }
 
     /// Returns the size of the index in bytes
@@ -484,6 +505,48 @@ where
             + self.all_indices.capacity() * std::mem::size_of::<usize>()
             + self.offsets.capacity() * std::mem::size_of::<usize>()
             + self.codebook.memory_usage_bytes()
+    }
+
+    /// Function will optimise memory layout and put vectors sorted by cluster
+    /// id
+    ///
+    /// ### Returns
+    ///
+    /// New to old mapping
+    fn optimise_memory_layout(&mut self) -> Vec<usize> {
+        let mut new_to_old = Vec::with_capacity(self.n);
+        let mut old_to_new = vec![0usize; self.n];
+
+        for cluster in 0..self.nlist {
+            let start = self.offsets[cluster];
+            let end = self.offsets[cluster + 1];
+            for &old_id in &self.all_indices[start..end] {
+                old_to_new[old_id] = new_to_old.len();
+                new_to_old.push(old_id);
+            }
+        }
+
+        let mut new_vectors = Vec::with_capacity(self.quantised_vectors.len());
+        let mut new_norms = if self.quantised_norms.is_empty() {
+            Vec::new()
+        } else {
+            Vec::with_capacity(self.n)
+        };
+
+        for &old_id in &new_to_old {
+            let start = old_id * self.dim;
+            new_vectors.extend_from_slice(&self.quantised_vectors[start..start + self.dim]);
+            if !self.quantised_norms.is_empty() {
+                new_norms.push(self.quantised_norms[old_id]);
+            }
+        }
+
+        self.quantised_vectors = new_vectors;
+        self.quantised_norms = new_norms;
+        self.all_indices.clear();
+        self.all_indices.shrink_to_fit();
+
+        new_to_old
     }
 }
 
