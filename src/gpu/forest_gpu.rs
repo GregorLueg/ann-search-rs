@@ -271,7 +271,9 @@ pub fn leaf_pairwise_proposals<F: AnnSearchGpuFloat>(
 /// Set IS_NEW flag on all non-sentinel graph entries.
 ///
 /// ### Grid mapping
-/// * 2D grid, flat index = (CUBE_POS_Y * CUBE_COUNT_X + CUBE_POS_X) * WG + UNIT_POS_X
+///
+/// 2D grid, flat index = (CUBE_POS_Y * CUBE_COUNT_X + CUBE_POS_X) * WG +
+/// UNIT_POS_X
 #[cube(launch_unchecked)]
 fn mark_all_new(graph_idx: &mut Tensor<u32>, total_entries: u32) {
     let idx = (CUBE_POS_Y * CUBE_COUNT_X + CUBE_POS_X) * WORKGROUP_SIZE_X + UNIT_POS_X;
@@ -345,9 +347,9 @@ fn compute_partition_medians<T: AnnSearchFloat>(
     medians
 }
 
-/////////////////////////////
-// Main orchestration      //
-/////////////////////////////
+////////////////////////
+// Main orchestration //
+////////////////////////
 
 /// Build the initial kNN graph via GPU random partition forest.
 ///
@@ -369,7 +371,6 @@ pub fn gpu_forest_init<T, R>(
     n: usize,
     dim: usize,
     dim_padded: usize,
-    build_k: usize,
     n_trees: usize,
     seed: usize,
     use_cosine: bool,
@@ -399,6 +400,7 @@ pub fn gpu_forest_init<T, R>(
     let forest_start = Instant::now();
 
     // ---- Phase 1: Build ALL trees on CPU in parallel ----
+
     let cpu_start = Instant::now();
 
     let all_tree_partitions: Vec<Vec<u32>> = (0..n_trees)
@@ -422,11 +424,11 @@ pub fn gpu_forest_init<T, R>(
                 let norm = num_traits::Float::sqrt(norm_sq);
                 if norm > T::zero() {
                     for x in random_vec.iter_mut() {
-                        *x = *x / norm;
+                        *x /= norm;
                     }
                 }
 
-                // Dot products
+                // dot products
                 let dot_values: Vec<T> = (0..n)
                     .map(|i| {
                         let row = &vectors_flat[i * dim..(i + 1) * dim];
@@ -437,11 +439,11 @@ pub fn gpu_forest_init<T, R>(
                     })
                     .collect();
 
-                // Per-partition medians
+                // per-partition medians
                 let n_partitions = 1usize << level;
                 let medians = compute_partition_medians(&partition_ids, &dot_values, n_partitions);
 
-                // Partition
+                // partition
                 for i in 0..n {
                     let pid = partition_ids[i] as usize;
                     partition_ids[i] = if dot_values[i] <= medians[pid] {
@@ -461,6 +463,7 @@ pub fn gpu_forest_init<T, R>(
     }
 
     // ---- Phase 2: Concatenate leaf structures per batch ----
+
     let gpu_start = Instant::now();
 
     let trees_per_batch = 5;
@@ -506,7 +509,7 @@ pub fn gpu_forest_init<T, R>(
             client,
         );
 
-        // Reset proposals for this batch
+        // reset proposals for this batch
         unsafe {
             let _ = reset_proposals::launch_unchecked::<R>(
                 client,
@@ -518,7 +521,7 @@ pub fn gpu_forest_init<T, R>(
             );
         }
 
-        // Leaf pairwise for this batch
+        // leaf pairwise for this batch
         let cubes_x = (batch_leaves as u32).min(65535);
         let cubes_y = (batch_leaves as u32).div_ceil(cubes_x);
 
@@ -546,7 +549,7 @@ pub fn gpu_forest_init<T, R>(
             );
         }
 
-        // Merge this batch's proposals (graph thresholds update for next batch)
+        // merge this batch's proposals (graph thresholds update for next batch)
         unsafe {
             let _ = merge_proposals::launch_unchecked::<T, R>(
                 client,
@@ -564,18 +567,18 @@ pub fn gpu_forest_init<T, R>(
         }
     }
 
-    // Force GPU sync to flush deferred forest work
-    if verbose {
-        let _ = update_counter_gpu.clone().read(client);
-        println!("  GPU forest init: {:.2?}", forest_start.elapsed());
-    }
-
     if verbose {
         println!(
             "    GPU batched pairwise + merge ({} batches): {:.2?}",
             n_batches,
             gpu_start.elapsed()
         );
+    }
+
+    // Force GPU sync to flush deferred forest work
+    if verbose {
+        let _ = update_counter_gpu.clone().read(client);
+        println!("  GPU forest init: {:.2?}", forest_start.elapsed());
     }
 }
 
@@ -809,7 +812,7 @@ mod tests {
         for i in 0..n_leaves {
             let size = leaf_offsets[i + 1] - leaf_offsets[i];
             assert!(
-                size >= 2 && size <= 8,
+                (2..=8).contains(&size),
                 "Leaf {i} has {size} points (expected ~4)"
             );
         }
@@ -1263,99 +1266,98 @@ mod tests {
     // 5. Full forest init quality
     // ---------------------------------------------------------------
 
-    // #[test]
-    // fn test_forest_init_recall() {
-    //     let Some(device) = try_device() else {
-    //         eprintln!("Skipping: no wgpu backend");
-    //         return;
-    //     };
-    //     let client = WgpuRuntime::client(&device);
-    //     let line = LINE_SIZE as usize;
-    //     let n = 500usize;
-    //     let dim = 8usize;
-    //     let dim_padded = dim;
-    //     let build_k = 10usize;
-    //     let n_trees = 5;
+    #[test]
+    fn test_forest_init_recall() {
+        let Some(device) = try_device() else {
+            eprintln!("Skipping: no wgpu backend");
+            return;
+        };
+        let client = WgpuRuntime::client(&device);
+        let n = 500usize;
+        let dim = 8usize;
+        let dim_padded = dim;
+        let build_k = 10usize;
+        let n_trees = 5;
 
-    //     let data: Vec<f32> = (0..n)
-    //         .flat_map(|i| {
-    //             let cluster = (i / 100) as f32 * 10.0;
-    //             (0..dim).map(move |j| cluster + (i % 100) as f32 * 0.05 + j as f32 * 0.01)
-    //         })
-    //         .collect();
+        let data: Vec<f32> = (0..n)
+            .flat_map(|i| {
+                let cluster = (i / 100) as f32 * 10.0;
+                (0..dim).map(move |j| cluster + (i % 100) as f32 * 0.05 + j as f32 * 0.01)
+            })
+            .collect();
 
-    //     let vectors_gpu =
-    //         GpuTensor::<WgpuRuntime, f32>::from_slice(&data, vec![n, dim_padded], &client);
-    //     let norms_gpu = GpuTensor::<WgpuRuntime, f32>::from_slice(&[0.0f32], vec![1], &client);
-    //     let graph_idx_gpu = GpuTensor::<WgpuRuntime, u32>::from_slice(
-    //         &vec![0x7FFFFFFFu32; n * build_k],
-    //         vec![n, build_k],
-    //         &client,
-    //     );
-    //     let graph_dist_gpu = GpuTensor::<WgpuRuntime, f32>::from_slice(
-    //         &vec![f32::MAX; n * build_k],
-    //         vec![n, build_k],
-    //         &client,
-    //     );
-    //     let prop_idx_gpu = GpuTensor::<WgpuRuntime, u32>::empty(vec![n, MAX_PROPOSALS], &client);
-    //     let prop_dist_gpu = GpuTensor::<WgpuRuntime, f32>::empty(vec![n, MAX_PROPOSALS], &client);
-    //     let prop_count_gpu =
-    //         GpuTensor::<WgpuRuntime, u32>::from_slice(&vec![0u32; n], vec![n], &client);
-    //     let update_counter_gpu =
-    //         GpuTensor::<WgpuRuntime, u32>::from_slice(&[0u32], vec![1], &client);
+        let vectors_gpu =
+            GpuTensor::<WgpuRuntime, f32>::from_slice(&data, vec![n, dim_padded], &client);
+        let norms_gpu = GpuTensor::<WgpuRuntime, f32>::from_slice(&[0.0f32], vec![1], &client);
+        let graph_idx_gpu = GpuTensor::<WgpuRuntime, u32>::from_slice(
+            &vec![0x7FFFFFFFu32; n * build_k],
+            vec![n, build_k],
+            &client,
+        );
+        let graph_dist_gpu = GpuTensor::<WgpuRuntime, f32>::from_slice(
+            &vec![f32::MAX; n * build_k],
+            vec![n, build_k],
+            &client,
+        );
+        let prop_idx_gpu = GpuTensor::<WgpuRuntime, u32>::empty(vec![n, MAX_PROPOSALS], &client);
+        let prop_dist_gpu = GpuTensor::<WgpuRuntime, f32>::empty(vec![n, MAX_PROPOSALS], &client);
+        let prop_count_gpu =
+            GpuTensor::<WgpuRuntime, u32>::from_slice(&vec![0u32; n], vec![n], &client);
+        let update_counter_gpu =
+            GpuTensor::<WgpuRuntime, u32>::from_slice(&[0u32], vec![1], &client);
 
-    //     gpu_forest_init(
-    //         &vectors_gpu,
-    //         &norms_gpu,
-    //         &graph_idx_gpu,
-    //         &graph_dist_gpu,
-    //         &prop_idx_gpu,
-    //         &prop_dist_gpu,
-    //         &prop_count_gpu,
-    //         &update_counter_gpu,
-    //         n,
-    //         dim,
-    //         dim_padded,
-    //         build_k,
-    //         n_trees,
-    //         42,
-    //         false,
-    //         true,
-    //         &client,
-    //     );
+        gpu_forest_init(
+            &vectors_gpu,
+            &norms_gpu,
+            &graph_idx_gpu,
+            &graph_dist_gpu,
+            &prop_idx_gpu,
+            &prop_dist_gpu,
+            &prop_count_gpu,
+            &update_counter_gpu,
+            &data,
+            n,
+            dim,
+            dim_padded,
+            n_trees,
+            42,
+            false,
+            true,
+            &client,
+        );
 
-    //     let result_idx = graph_idx_gpu.read(&client);
-    //     let pid_mask = 0x7FFFFFFFu32;
+        let result_idx = graph_idx_gpu.read(&client);
+        let pid_mask = 0x7FFFFFFFu32;
 
-    //     let mut total_hits = 0;
-    //     let mut total_possible = 0;
-    //     for i in 0..n {
-    //         let mut dists: Vec<(usize, f32)> = (0..n)
-    //             .filter(|&j| j != i)
-    //             .map(|j| {
-    //                 let d: f32 = data[i * dim..(i + 1) * dim]
-    //                     .iter()
-    //                     .zip(&data[j * dim..(j + 1) * dim])
-    //                     .map(|(a, b)| (a - b) * (a - b))
-    //                     .sum();
-    //                 (j, d)
-    //             })
-    //             .collect();
-    //         dists.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
-    //         let gt_set: std::collections::HashSet<usize> =
-    //             dists.iter().take(build_k).map(|&(j, _)| j).collect();
-    //         let init_set: std::collections::HashSet<usize> = (0..build_k)
-    //             .map(|j| (result_idx[i * build_k + j] & pid_mask) as usize)
-    //             .filter(|&pid| pid < n)
-    //             .collect();
-    //         total_hits += gt_set.intersection(&init_set).count();
-    //         total_possible += build_k;
-    //     }
+        let mut total_hits = 0;
+        let mut total_possible = 0;
+        for i in 0..n {
+            let mut dists: Vec<(usize, f32)> = (0..n)
+                .filter(|&j| j != i)
+                .map(|j| {
+                    let d: f32 = data[i * dim..(i + 1) * dim]
+                        .iter()
+                        .zip(&data[j * dim..(j + 1) * dim])
+                        .map(|(a, b)| (a - b) * (a - b))
+                        .sum();
+                    (j, d)
+                })
+                .collect();
+            dists.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
+            let gt_set: std::collections::HashSet<usize> =
+                dists.iter().take(build_k).map(|&(j, _)| j).collect();
+            let init_set: std::collections::HashSet<usize> = (0..build_k)
+                .map(|j| (result_idx[i * build_k + j] & pid_mask) as usize)
+                .filter(|&pid| pid < n)
+                .collect();
+            total_hits += gt_set.intersection(&init_set).count();
+            total_possible += build_k;
+        }
 
-    //     let recall = total_hits as f64 / total_possible as f64;
-    //     println!("Forest init recall@{build_k} ({n_trees} trees): {recall:.4}");
-    //     assert!(recall > 0.3, "Forest init recall too low: {recall:.4}");
-    // }
+        let recall = total_hits as f64 / total_possible as f64;
+        println!("Forest init recall@{build_k} ({n_trees} trees): {recall:.4}");
+        assert!(recall > 0.3, "Forest init recall too low: {recall:.4}");
+    }
 
     // ---------------------------------------------------------------
     // 6. CPU helpers

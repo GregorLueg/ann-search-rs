@@ -15,6 +15,7 @@ use std::{cell::RefCell, cmp::Reverse, collections::BinaryHeap};
 use thousands::*;
 
 use crate::annoy::*;
+use crate::gpu::cagra_gpu_search::*;
 use crate::gpu::forest_gpu::*;
 use crate::gpu::tensor::*;
 use crate::gpu::*;
@@ -1011,6 +1012,7 @@ fn pad_vectors<T: Float>(flat: &[T], n: usize, dim: usize, dim_padded: usize) ->
 /// ### Returns
 ///
 /// `(idx_flat, dist_flat)` -- flat row-major arrays of size `n * build_k`
+#[allow(dead_code)]
 fn annoy_init_graph<T>(
     vectors_flat: &[T],
     n: usize,
@@ -1293,7 +1295,7 @@ impl_nndescent_gpu_query!(f64, QUERY_CANDIDATES_F64, QUERY_RESULTS_F64);
 /// The final graph has exactly `k` neighbours per node (the user-requested
 /// degree). Internally, NNDescent runs at a higher degree (`build_k`, default
 /// `2*k`) which CAGRA then prunes down to `k`.
-pub struct NNDescentGpu<T: Float, R: Runtime> {
+pub struct NNDescentGpu<T: AnnSearchFloat + AnnSearchGpuFloat, R: Runtime> {
     /// Original (unpadded) vector data, flattened row-major
     pub vectors_flat: Vec<T>,
     /// Original embedding dimensionality
@@ -1318,12 +1320,20 @@ pub struct NNDescentGpu<T: Float, R: Runtime> {
     forest: AnnoyIndex<T>,
     /// CubeCL runtime device
     _device: R::Device,
+    /// Padded dimensionality (next multiple of LINE_SIZE)
+    dim_padded: usize,
+    /// GPU-resident CAGRA navigational graph [n, k] (raw u32 node IDs)
+    nav_graph_gpu: Option<GpuTensor<R, u32>>,
+    /// GPU-resident vectors [n, dim_padded]
+    vectors_gpu: Option<GpuTensor<R, T>>,
+    /// GPU-resident norms [n] (cosine) or [1] (euclidean)
+    norms_gpu: Option<GpuTensor<R, T>>,
 }
 
 /// VectorDistance implementation for NNDescentGPU
 impl<T, R> VectorDistance<T> for NNDescentGpu<T, R>
 where
-    T: AnnSearchFloat + cubecl::frontend::Float + cubecl::CubeElement,
+    T: AnnSearchFloat + AnnSearchGpuFloat,
     R: Runtime,
 {
     fn vectors_flat(&self) -> &[T] {
@@ -1375,8 +1385,10 @@ where
         n_trees: Option<usize>,
         delta: Option<f32>,
         rho: Option<f32>,
+        refine_knn: Option<usize>,
         seed: usize,
         verbose: bool,
+        retain_gpu: bool,
         device: R::Device,
     ) -> Self {
         let (vectors_flat, n, dim) = matrix_to_flat(data);
@@ -1386,6 +1398,7 @@ where
         let delta = delta.unwrap_or(DEFAULT_DELTA);
         let rho = rho.unwrap_or(DEFAULT_RHO);
         let rho_thresh = (rho * 65535.0) as u32;
+        let refine_knn = refine_knn.unwrap_or(0);
 
         // pad dim to next multiple of LINE_SIZE
         let line = LINE_SIZE as usize;
@@ -1476,7 +1489,6 @@ where
             println!("  Running GPU forest init ({} trees)...", n_trees_forest);
         }
 
-        let forest_start = Instant::now();
         gpu_forest_init(
             &vectors_gpu,
             &norms_gpu,
@@ -1490,17 +1502,12 @@ where
             n,
             dim,
             dim_padded,
-            build_k,
             n_trees_forest,
             seed,
             use_cosine,
             verbose,
             &client,
         );
-
-        if verbose {
-            println!("  GPU forest init: {:.2?}", forest_start.elapsed());
-        }
 
         // ---- 2: NNDescent iterations on the GPU ----
 
@@ -1622,7 +1629,7 @@ where
 
         // ---- 3: 2-Hop Refinement ----
 
-        if verbose {
+        if verbose && refine_knn > 0 {
             println!("  Running 2-Hop Refinement Sweep...");
         }
 
@@ -1631,7 +1638,7 @@ where
         let cubes_x = 65535u32;
         let cubes_y = (n as u32).div_ceil(cubes_x);
 
-        for sweep in 0..2 {
+        for sweep in 0..refine_knn {
             unsafe {
                 let _ = reset_proposals::launch_unchecked::<R>(
                     &client,
@@ -1681,6 +1688,12 @@ where
             if verbose {
                 let counter_data = update_counter_gpu.clone().read(&client);
                 println!("    2-Hop sweep {}: {} updates", sweep + 1, counter_data[0]);
+            }
+
+            let refinement_stop = refinement_start.elapsed();
+
+            if verbose {
+                println!("  NNDescent refinement done in: {:.2?}", refinement_stop);
             }
         }
 
@@ -1766,7 +1779,7 @@ where
 
         // ---- 6: Download CAGRA graph and compute CPU distances ----
 
-        let final_idx = final_idx_gpu.read(&client);
+        let final_idx = final_idx_gpu.clone().read(&client);
         let pid_mask = 0x7FFFFFFFu32;
         let sentinel = 0x7FFFFFFFusize;
 
@@ -1803,9 +1816,18 @@ where
             println!("  Total build time: {:.2?}", start.elapsed());
         }
 
+        let (nav_graph_gpu, vectors_gpu, norms_gpu) = if retain_gpu {
+            // vectors_gpu and norms_gpu already exist from earlier in build(),
+            // final_idx_gpu is the CAGRA output -- keep them alive
+            (Some(final_idx_gpu), Some(vectors_gpu), Some(norms_gpu))
+        } else {
+            (None, None, None)
+        };
+
         Self {
             vectors_flat,
             dim,
+            dim_padded,
             n,
             k,
             norms,
@@ -1814,6 +1836,9 @@ where
             knn_graph,
             nav_graph: cagra_graph,
             converged,
+            nav_graph_gpu,
+            vectors_gpu,
+            norms_gpu,
             _device: device,
         }
     }
@@ -1872,6 +1897,90 @@ where
         let query_vec: Vec<T> = query_row.iter().cloned().collect();
         self.query(&query_vec, k, ef_search)
     }
+
+    /// Batch query via GPU beam search on the CAGRA navigational graph.
+    ///
+    /// Re-uploads tensors if they were not retained during build.
+    /// For small batch sizes (< ~32), the CPU path may be faster due
+    /// to kernel launch overhead.
+    ///
+    /// ### Params
+    ///
+    /// * `queries_flat` - Flattened query vectors, row-major [n_queries, dim]
+    /// * `n_queries` - Number of query vectors
+    /// * `k` - Number of neighbours to return per query
+    /// * `seed` - Random seed for entry point generation
+    ///
+    /// ### Returns
+    ///
+    /// `(indices, distances)` per query, sorted by distance ascending
+    pub fn query_batch_gpu(
+        &mut self,
+        queries_flat: &[T],
+        n_queries: usize,
+        k: usize,
+        seed: usize,
+    ) -> (Vec<Vec<usize>>, Vec<Vec<T>>)
+    where
+        T: AnnSearchGpuFloat + num_traits::Float,
+    {
+        assert_eq!(
+            queries_flat.len(),
+            n_queries * self.dim,
+            "queries_flat length must be n_queries * dim"
+        );
+
+        self.ensure_gpu_tensors();
+
+        let client = R::client(&self._device);
+        let use_cosine = self.metric == Dist::Cosine;
+
+        let t0 = std::time::Instant::now();
+
+        let search_k = N_ENTRY_POINTS * self.forest.n_trees * 2;
+        let entry_flat: Vec<u32> = (0..n_queries)
+            .into_par_iter()
+            .flat_map_iter(|i| {
+                let query = &queries_flat[i * self.dim..(i + 1) * self.dim];
+                let (indices, _) = self.forest.query(query, N_ENTRY_POINTS, Some(search_k));
+                indices.into_iter().map(|idx| idx as u32)
+            })
+            .collect();
+
+        let t1 = std::time::Instant::now();
+
+        let result = cagra_search_batch_gpu(
+            queries_flat,
+            n_queries,
+            self.dim,
+            self.vectors_gpu.as_ref().unwrap(),
+            self.norms_gpu.as_ref().unwrap(),
+            self.nav_graph_gpu.as_ref().unwrap(),
+            self.n,
+            self.k,
+            k,
+            use_cosine,
+            seed,
+            Some(&entry_flat),
+            &client,
+        );
+
+        let t2 = std::time::Instant::now();
+
+        eprintln!(
+                    "  [query_batch_gpu] annoy={:.1}ms  kernel+download={:.1}ms  total={:.1}ms  ({} queries)",
+                    t1.duration_since(t0).as_secs_f64() * 1000.0,
+                    t2.duration_since(t1).as_secs_f64() * 1000.0,
+                    t2.duration_since(t0).as_secs_f64() * 1000.0,
+                    n_queries,
+                );
+
+        result
+    }
+
+    ///////////
+    // Utils //
+    ///////////
 
     /// Return the CAGRA navigational neighbours of node `idx`.
     ///
@@ -1945,6 +2054,105 @@ where
 
         (indices, distances)
     }
+
+    /// Self-query: run GPU beam search for every vector in the index.
+    ///
+    /// Searches the CAGRA navigational graph, so results differ from
+    /// `extract_knn` (which returns the raw NNDescent graph).
+    ///
+    /// ### Params
+    ///
+    /// * `k` - Number of neighbours per vector
+    /// * `seed` - Random seed for entry points
+    ///
+    /// ### Returns
+    ///
+    /// `(indices, distances)` per vector, sorted by distance ascending
+    pub fn self_query_gpu(&mut self, k: usize, seed: usize) -> (Vec<Vec<usize>>, Vec<Vec<T>>)
+    where
+        T: AnnSearchGpuFloat + AnnSearchFloat,
+    {
+        self.ensure_gpu_tensors();
+
+        let client = R::client(&self._device);
+        let use_cosine = self.metric == Dist::Cosine;
+
+        // Build entry points from kNN graph: take first N_ENTRY_POINTS
+        // neighbours per node. These are already sorted by distance,
+        // so we get the best-known neighbours as seeds.
+        let n_entry = N_ENTRY_POINTS;
+        let entry_flat: Vec<u32> = (0..self.n)
+            .flat_map(|i| {
+                let row = &self.knn_graph[i * self.k..(i + 1) * self.k];
+                let mut entries: Vec<u32> = row
+                    .iter()
+                    .filter(|&&(pid, _)| pid != SENTINEL_PID)
+                    .take(n_entry)
+                    .map(|&(pid, _)| pid as u32)
+                    .collect();
+                // Pad with random if fewer than n_entry valid neighbours
+                let mut rng_val = (i as u32) ^ (seed as u32);
+                while entries.len() < n_entry {
+                    rng_val = rng_val.wrapping_mul(1664525).wrapping_add(1013904223);
+                    entries.push(rng_val % self.n as u32);
+                }
+                entries
+            })
+            .collect();
+
+        let queries_flat = self.vectors_flat.clone();
+
+        cagra_search_batch_gpu(
+            &queries_flat,
+            self.n,
+            self.dim,
+            self.vectors_gpu.as_ref().unwrap(),
+            self.norms_gpu.as_ref().unwrap(),
+            self.nav_graph_gpu.as_ref().unwrap(),
+            self.n,
+            self.k,
+            k,
+            use_cosine,
+            seed,
+            Some(&entry_flat),
+            &client,
+        )
+    }
+
+    /// Ensure GPU tensors are resident. If they were dropped after build,
+    /// re-uploads from CPU data.
+    fn ensure_gpu_tensors(&mut self) {
+        if self.nav_graph_gpu.is_some() {
+            return;
+        }
+
+        let client = R::client(&self._device);
+        let dim_padded = self.dim_padded;
+
+        let vectors_padded = if dim_padded != self.dim {
+            pad_vectors(&self.vectors_flat, self.n, self.dim, dim_padded)
+        } else {
+            self.vectors_flat.clone()
+        };
+        self.vectors_gpu = Some(GpuTensor::<R, T>::from_slice(
+            &vectors_padded,
+            vec![self.n, dim_padded],
+            &client,
+        ));
+
+        self.norms_gpu = Some(if self.metric == Dist::Cosine {
+            GpuTensor::<R, T>::from_slice(&self.norms, vec![self.n], &client)
+        } else {
+            GpuTensor::<R, T>::from_slice(&[T::zero()], vec![1], &client)
+        });
+
+        let nav_flat: Vec<u32> = self.nav_graph.iter().map(|&(pid, _)| pid as u32).collect();
+        self.nav_graph_gpu = Some(GpuTensor::<R, u32>::from_slice(
+            &nav_flat,
+            vec![self.n, self.k],
+            &client,
+        ));
+    }
 }
 
 ///////////
@@ -1989,7 +2197,9 @@ mod tests {
             None,
             Some(0.001),
             Some(0.5),
+            None,
             42,
+            false,
             false,
             device,
         );
@@ -2022,7 +2232,9 @@ mod tests {
             None,
             Some(0.001),
             Some(0.5),
+            None,
             42,
+            false,
             false,
             device,
         );
@@ -2049,7 +2261,9 @@ mod tests {
             None,
             Some(0.001),
             Some(0.5),
+            None,
             42,
+            false,
             false,
             device,
         );
@@ -2076,7 +2290,9 @@ mod tests {
             None,
             Some(0.001),
             Some(0.5),
+            None,
             42,
+            false,
             false,
             device,
         );
@@ -2946,8 +3162,10 @@ mod kernel_tests {
             None,
             Some(0.001),
             Some(0.5),
+            None,
             42,
             true,
+            false,
             device,
         );
 

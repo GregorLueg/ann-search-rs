@@ -21,7 +21,7 @@ fn main() {
     println!("-----------------------------");
 
     let (data, _): (Mat<f32>, _) = generate_data(&cli);
-    let query_data = subsample_with_noise(&data, DEFAULT_N_QUERY, cli.seed + 1);
+    let query_data = subsample_with_noise(&data, cli.n_cells / 10, cli.seed + 1);
     let mut results = Vec::new();
 
     // Ground truth: GPU exhaustive self-query
@@ -149,7 +149,7 @@ fn main() {
     // GPU NNDescent (default params)
     println!("Building GPU NNDescent...");
     let start = Instant::now();
-    let gpu_nndescent_idx = build_nndescent_index_gpu::<f32, cubecl::wgpu::WgpuRuntime>(
+    let mut gpu_nndescent_idx = build_nndescent_index_gpu::<f32, cubecl::wgpu::WgpuRuntime>(
         data.as_ref(),
         &cli.distance,
         Some(cli.k),
@@ -158,7 +158,9 @@ fn main() {
         None,
         Some(0.0005),
         None,
+        Some(1),
         cli.seed as usize,
+        true,
         true,
         device.clone(),
     );
@@ -189,12 +191,37 @@ fn main() {
         index_size_mb: gpu_index_size_mb,
     });
 
+    // GPU NNDescent self-query via GPU beam search
+    println!("Self-querying GPU NNDescent (GPU beam search)...");
+    let start = Instant::now();
+    let (gpu_self_beam_neighbors, gpu_self_beam_distances) =
+        query_nndescent_index_gpu_self(&mut gpu_nndescent_idx, cli.k, true);
+    let gpu_self_beam_time = start.elapsed().as_secs_f64() * 1000.0;
+
+    let gpu_self_beam_recall =
+        calculate_recall(&true_neighbors_self, &gpu_self_beam_neighbors, cli.k);
+    let gpu_self_beam_dist_err = calculate_dist_error(
+        true_distances_self.as_ref().unwrap(),
+        gpu_self_beam_distances.as_ref().unwrap(),
+        cli.k,
+    );
+
+    results.push(BenchmarkResultSize {
+        method: "GPU-NNDescent (self-beam)".to_string(),
+        build_time_ms: gpu_build_time,
+        query_time_ms: gpu_self_beam_time,
+        total_time_ms: gpu_build_time + gpu_self_beam_time,
+        recall_at_k: gpu_self_beam_recall,
+        mean_dist_err: gpu_self_beam_dist_err,
+        index_size_mb: gpu_index_size_mb,
+    });
+
     // GPU NNDescent external query (CPU beam search over CAGRA graph)
     println!("Querying GPU NNDescent...");
     let start = Instant::now();
     let (gpu_query_neighbors, gpu_query_distances) = query_nndescent_index_gpu(
         query_data.as_ref(),
-        &gpu_nndescent_idx,
+        &mut gpu_nndescent_idx,
         cli.k,
         None,
         true,

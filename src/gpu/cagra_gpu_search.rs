@@ -8,24 +8,87 @@
 
 use cubecl::frontend::{Float, SharedMemory};
 use cubecl::prelude::*;
+use rand::{rngs::SmallRng, Rng, SeedableRng};
 
 use crate::gpu::tensor::*;
 use crate::gpu::*;
+use crate::prelude::*;
 
 ///////////
 // Const //
 ///////////
 
 /// Beam width (number of active candidates maintained during search)
-const BEAM_WIDTH: usize = 64;
+const BEAM_WIDTH: usize = 16;
 /// Hash table size for visited-node tracking (must be power of 2)
 const HASH_SIZE: usize = 2048;
-/// Sentinel value for empty hash/candidate slots
-const SENTINEL: u32 = 0x7FFFFFFFu32;
 /// Maximum beam search iterations before forced termination
-const MAX_BEAM_ITERS: usize = 128;
+const MAX_BEAM_ITERS: usize = 32;
 /// Number of random entry points per query
-const N_ENTRY_POINTS: usize = 8;
+pub const N_ENTRY_POINTS: usize = 8;
+
+////////////
+// Params //
+////////////
+
+/// Parameters for the CAGRA style GPU beam search
+pub struct CagraGpuSearchParams {
+    /// Optional width of the beam. If not provided, will default to
+    /// `BEAM_WIDTH`
+    pub beam_width: Option<usize>,
+    /// Optional maximum iterations for the beam search. Good rule of thumb is
+    /// 2x beam_width. Will default to `MAX_BEAM_ITERS` if not provided.
+    pub max_beam_iters: Option<usize>,
+    /// Optional number of entry points. If not provided, will default to
+    /// `N_ENTRY_POINTS`.
+    pub n_entry_points: Option<usize>,
+}
+
+impl CagraGpuSearchParams {
+    /// Generates a new instance of the search
+    ///
+    /// ### Params
+    ///
+    /// * `beam_width` - Beam width for the kNN search
+    /// * `max_beam_iters` - Maximum numbers of iterations to do. Rule of thumb
+    ///   to be 2x beam width
+    /// * `n_entry_points` - Number of entry points to use in the CAGRA graph.
+    ///
+    /// ### Returns
+    ///
+    /// Initialised self
+    pub fn new(
+        beam_width: Option<usize>,
+        max_beam_iters: Option<usize>,
+        n_entry_points: Option<usize>,
+    ) -> Self {
+        Self {
+            beam_width,
+            max_beam_iters,
+            n_entry_points,
+        }
+    }
+
+    /// Pull out the needed values for the beam search
+    ///
+    /// ### Returns
+    ///
+    /// Tuple of `(width, iters, n_entry)`
+    pub fn get_vals(&self) -> (usize, usize, usize) {
+        let width = self.beam_width.unwrap_or(BEAM_WIDTH);
+        let iters = self.max_beam_iters.unwrap_or(MAX_BEAM_ITERS);
+        let n_entry = self.n_entry_points.unwrap_or(N_ENTRY_POINTS);
+
+        (width, iters, n_entry)
+    }
+}
+
+/// Default implementation for CagraGpuSearchParams
+impl Default for CagraGpuSearchParams {
+    fn default() -> Self {
+        Self::new(None, None, None)
+    }
+}
 
 ////////////////////
 // Kernel helpers //
@@ -40,10 +103,9 @@ fn xorshift_search(state: u32) -> u32 {
     x
 }
 
-///////////////////////
-// Step 1: Distance  //
-// probe kernel      //
-///////////////////////
+///////////////////////////
+// Distance probe kernel //
+///////////////////////////
 
 /// Probe kernel: loads a query vector into scalar shared memory,
 /// computes distance to a single database vector from global memory.
@@ -202,9 +264,9 @@ pub fn probe_hash_table(
     }
 }
 
-///////////////////////////
-// Step 3: Beam search   //
-///////////////////////////
+/////////////////
+// Beam search //
+/////////////////
 
 /// CAGRA beam search kernel. One workgroup per query.
 ///
@@ -223,6 +285,7 @@ pub fn cagra_beam_search<F: Float>(
     entry_points: &Tensor<u32>,
     out_indices: &mut Tensor<u32>,
     out_dists: &mut Tensor<F>,
+    out_iters: &mut Tensor<u32>,
     n_nodes: u32,
     k_out: u32,
     #[comptime] k_graph: usize,
@@ -247,7 +310,7 @@ pub fn cagra_beam_search<F: Float>(
     let bw = beam_width as u32;
     let bw_last = beam_width - 1usize;
 
-    // ---- Shared memory ----
+    // shared memory set up
     let mut sq_vec = SharedMemory::<F>::new(dim_scalars);
     let mut s_cand_dist = SharedMemory::<F>::new(beam_width);
     let mut s_cand_idx = SharedMemory::<u32>::new(beam_width);
@@ -259,7 +322,6 @@ pub fn cagra_beam_search<F: Float>(
     let mut s_num_cands = SharedMemory::<u32>::new(1usize);
     let mut s_query_norm = SharedMemory::<F>::new(1usize);
 
-    // ---- Phase 1: Load query vector into scalar shared memory ----
     let q_line_offset = q_idx as usize * dim_lines;
     let mut il = tx as usize;
     while il < dim_scalars {
@@ -270,7 +332,6 @@ pub fn cagra_beam_search<F: Float>(
         il += WORKGROUP_SIZE_X as usize;
     }
 
-    // ---- Phase 2: Init hash table and candidate queue ----
     let mut ih = tx as usize;
     while ih < hash_size {
         s_hash[ih] = sentinel;
@@ -286,7 +347,6 @@ pub fn cagra_beam_search<F: Float>(
 
     sync_cube();
 
-    // ---- Phase 3: Query norm + seed entry points (thread 0) ----
     if tx == 0u32 {
         if use_cosine {
             let mut norm_sq = F::new(0.0);
@@ -377,11 +437,11 @@ pub fn cagra_beam_search<F: Float>(
 
     sync_cube();
 
-    // ---- Phase 4: Beam search loop ----
     let max_iter_u32 = max_iters as u32;
     let mut iter: u32 = 0u32;
     while iter < max_iter_u32 {
         if tx == 0u32 {
+            out_iters[q_idx as usize] = iter;
             let nc = s_num_cands[0usize];
             s_active_node[0usize] = sentinel;
 
@@ -414,7 +474,8 @@ pub fn cagra_beam_search<F: Float>(
                                     ha += 1u32;
                                 }
                             }
-                            // Never use if-expression for value assignment in CubeCL
+                            // never use if-expression for value assignment in
+                            // CubeCL... bad idea
                             if is_new {
                                 s_nbr_idx[j] = nbr;
                             } else {
@@ -435,6 +496,12 @@ pub fn cagra_beam_search<F: Float>(
         sync_cube();
 
         let active = s_active_node[0usize];
+
+        // early termination
+        if active == sentinel {
+            iter = max_iter_u32;
+        }
+
         if active != sentinel {
             let mut ms = tx as usize;
             while ms < k_graph {
@@ -482,10 +549,8 @@ pub fn cagra_beam_search<F: Float>(
 
                     let worst = s_cand_dist[bw_last];
                     let mut skip: bool = false;
-                    if nc >= bw {
-                        if dist >= worst {
-                            skip = true;
-                        }
+                    if nc >= bw && dist >= worst {
+                        skip = true;
                     }
 
                     if !skip {
@@ -543,8 +608,8 @@ pub fn cagra_beam_search<F: Float>(
         iter += 1u32;
     }
 
-    // ---- Phase 5: Write output ----
     sync_cube();
+
     let num_cands = s_num_cands[0usize];
     let out_base = q_idx * k_out;
     let mut wr = tx;
@@ -560,12 +625,9 @@ pub fn cagra_beam_search<F: Float>(
     }
 }
 
-/////////////////////
-// Host dispatch   //
-/////////////////////
-
-use crate::gpu::traits_gpu::AnnSearchGpuFloat;
-use rand::{rngs::SmallRng, Rng, SeedableRng};
+//////////////
+// Dispatch //
+//////////////
 
 /// Batch CAGRA beam search on GPU.
 ///
@@ -584,6 +646,7 @@ pub fn cagra_search_batch_gpu<T, R>(
     k_out: usize,
     use_cosine: bool,
     seed: usize,
+    entry_points: Option<&[u32]>,
     client: &ComputeClient<R>,
 ) -> (Vec<Vec<usize>>, Vec<Vec<T>>)
 where
@@ -610,17 +673,26 @@ where
     let queries_gpu =
         GpuTensor::<R, T>::from_slice(&queries_padded, vec![n_queries, dim_padded], client);
 
-    // Generate random entry points
-    let mut rng = SmallRng::seed_from_u64(seed as u64);
-    let entry_flat: Vec<u32> = (0..n_queries * N_ENTRY_POINTS)
-        .map(|_| rng.random_range(0..n as u32))
-        .collect();
+    // Entry points: use provided or fall back to random
+    let entry_flat = match entry_points {
+        Some(pts) => {
+            assert_eq!(pts.len(), n_queries * N_ENTRY_POINTS);
+            pts.to_vec()
+        }
+        None => {
+            let mut rng = SmallRng::seed_from_u64(seed as u64);
+            (0..n_queries * N_ENTRY_POINTS)
+                .map(|_| rng.random_range(0..n as u32))
+                .collect()
+        }
+    };
     let entry_gpu =
         GpuTensor::<R, u32>::from_slice(&entry_flat, vec![n_queries, N_ENTRY_POINTS], client);
 
     // Output tensors
     let out_idx_gpu = GpuTensor::<R, u32>::empty(vec![n_queries, k_out], client);
     let out_dist_gpu = GpuTensor::<R, T>::empty(vec![n_queries, k_out], client);
+    let out_iters_gpu = GpuTensor::<R, u32>::empty(vec![n_queries], client);
 
     // 2D grid for large query counts
     let cubes_x = (n_queries as u32).min(65535);
@@ -638,6 +710,7 @@ where
             entry_gpu.into_tensor_arg(1),
             out_idx_gpu.clone().into_tensor_arg(1),
             out_dist_gpu.clone().into_tensor_arg(1),
+            out_iters_gpu.clone().into_tensor_arg(1),
             ScalarArg { elem: n as u32 },
             ScalarArg { elem: k_out as u32 },
             k_graph,
@@ -654,6 +727,15 @@ where
     let idx_flat = out_idx_gpu.read(client);
     let dist_flat = out_dist_gpu.read(client);
     let sentinel_usize = 0x7FFFFFFFusize;
+
+    let iters_flat = out_iters_gpu.read(client);
+    let avg_iters = iters_flat.iter().map(|&x| x as f64).sum::<f64>() / n_queries as f64;
+    let max_iters_actual = iters_flat.iter().copied().max().unwrap_or(0);
+    let min_iters = iters_flat.iter().copied().min().unwrap_or(0);
+    eprintln!(
+        "  [beam_search] iters: avg={:.1} min={} max={} (beam_width={}, k_graph={})",
+        avg_iters, min_iters, max_iters_actual, BEAM_WIDTH, k_graph,
+    );
 
     let indices: Vec<Vec<usize>> = (0..n_queries)
         .map(|i| {
@@ -697,10 +779,6 @@ mod tests {
         }));
         result.ok().map(|_| device)
     }
-
-    // ---------------------------------------------------------------
-    // 1. Distance probe: shared memory loading + distance computation
-    // ---------------------------------------------------------------
 
     #[test]
     fn test_probe_query_distance_euclidean_dim32() {
@@ -834,10 +912,6 @@ mod tests {
             "Dot product mismatch: gpu={gpu_dot}, cpu={cpu_dot}"
         );
     }
-
-    // ---------------------------------------------------------------
-    // 2. Hash table: insert + probe correctness
-    // ---------------------------------------------------------------
 
     #[test]
     fn test_hash_table_basic() {
@@ -993,10 +1067,6 @@ mod tests {
         }
     }
 
-    // ---------------------------------------------------------------
-    // 3. Beam search: star graph (basic connectivity)
-    // ---------------------------------------------------------------
-
     #[test]
     fn test_beam_search_star_graph() {
         let Some(device) = try_device() else {
@@ -1005,7 +1075,6 @@ mod tests {
         };
 
         let client = WgpuRuntime::client(&device);
-        let line = LINE_SIZE as usize;
         let n = 50usize;
         let dim = 32usize;
         let k_graph = 10usize;
@@ -1040,6 +1109,7 @@ mod tests {
             k_out,
             false,
             42,
+            None,
             &client,
         );
 
@@ -1058,10 +1128,6 @@ mod tests {
             hits
         );
     }
-
-    // ---------------------------------------------------------------
-    // 4. Beam search: recall vs brute force
-    // ---------------------------------------------------------------
 
     #[test]
     fn test_beam_search_recall_euclidean() {
@@ -1115,6 +1181,7 @@ mod tests {
             k_out,
             false,
             42,
+            None,
             &client,
         );
 
@@ -1139,10 +1206,6 @@ mod tests {
             "Recall too low: {recall:.4} (expected > 0.85 with brute-force graph)"
         );
     }
-
-    // ---------------------------------------------------------------
-    // Test helpers
-    // ---------------------------------------------------------------
 
     fn build_brute_force_graph(data: &[f32], n: usize, dim: usize, k: usize) -> Vec<u32> {
         let sentinel = 0x7FFFFFFFu32;
