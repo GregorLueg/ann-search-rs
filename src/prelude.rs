@@ -9,3 +9,6 @@ pub use crate::utils::heap_structs::*;
 pub use crate::utils::parallelism::AtomicNodeLocks;
 pub use crate::utils::prefetch_read;
 pub use crate::utils::traits::AnnSearchFloat;
+
+#[cfg(feature = "gpu")]
+pub use crate::gpu::traits_gpu::AnnSearchGpuFloat;

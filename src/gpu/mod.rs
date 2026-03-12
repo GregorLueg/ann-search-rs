@@ -1,11 +1,14 @@
 //! This module contains all of the helpers, structures and methods related
 //! to GPU-accelerated indices.
 
+pub mod cagra_gpu_search;
 pub mod dist_gpu;
 pub mod exhaustive_gpu;
+pub mod forest_gpu;
 pub mod ivf_gpu;
 pub mod nndescent_gpu;
 pub mod tensor;
+pub mod traits_gpu;
 
 ///////////
 // Const //

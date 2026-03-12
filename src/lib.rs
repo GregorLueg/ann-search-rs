@@ -1829,7 +1829,7 @@ pub fn build_exhaustive_index_gpu<T, R>(
     device: R::Device,
 ) -> ExhaustiveIndexGpu<T, R>
 where
-    T: Float + Sum + cubecl::frontend::Float + cubecl::CubeElement + FromPrimitive + SimdDistance,
+    T: AnnSearchGpuFloat + AnnSearchFloat,
     R: Runtime,
 {
     let metric = parse_ann_dist(dist_metric).unwrap_or_default();
@@ -1857,7 +1857,7 @@ pub fn query_exhaustive_index_gpu<T, R>(
     verbose: bool,
 ) -> (Vec<Vec<usize>>, Option<Vec<Vec<T>>>)
 where
-    T: Float + Sum + cubecl::frontend::Float + cubecl::CubeElement + FromPrimitive + SimdDistance,
+    T: AnnSearchGpuFloat + AnnSearchFloat,
     R: Runtime,
 {
     let (indices, distances) = index.query_batch(query_mat, k, verbose);
@@ -1891,7 +1891,7 @@ pub fn query_exhaustive_index_gpu_self<T, R>(
     verbose: bool,
 ) -> (Vec<Vec<usize>>, Option<Vec<Vec<T>>>)
 where
-    T: Float + Sum + cubecl::frontend::Float + cubecl::CubeElement + FromPrimitive + SimdDistance,
+    T: AnnSearchGpuFloat + AnnSearchFloat,
     R: Runtime,
 {
     index.generate_knn(k, return_dist, verbose)
@@ -1924,7 +1924,7 @@ pub fn build_ivf_index_gpu<T, R>(
 ) -> IvfIndexGpu<T, R>
 where
     R: Runtime,
-    T: AnnSearchFloat + cubecl::frontend::Float + cubecl::CubeElement,
+    T: AnnSearchFloat + AnnSearchGpuFloat,
 {
     let ann_dist = parse_ann_dist(dist_metric).unwrap_or_default();
     IvfIndexGpu::build(mat, ann_dist, nlist, max_iters, seed, verbose, device)
@@ -1957,7 +1957,7 @@ pub fn query_ivf_index_gpu<T, R>(
 ) -> (Vec<Vec<usize>>, Option<Vec<Vec<T>>>)
 where
     R: Runtime,
-    T: AnnSearchFloat + cubecl::frontend::Float + cubecl::CubeElement,
+    T: AnnSearchFloat + AnnSearchGpuFloat,
 {
     let (indices, distances) = index.query_batch(query_mat, k, nprobe, nquery, verbose);
 
@@ -1996,7 +1996,7 @@ pub fn query_ivf_index_gpu_self<T, R>(
 ) -> (Vec<Vec<usize>>, Option<Vec<Vec<T>>>)
 where
     R: Runtime,
-    T: AnnSearchFloat + cubecl::frontend::Float + cubecl::CubeElement,
+    T: AnnSearchFloat + AnnSearchGpuFloat,
 {
     index.generate_knn(k, nprobe, nquery, return_dist, verbose)
 }

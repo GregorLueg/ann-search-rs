@@ -3,8 +3,7 @@
 
 use cubecl::prelude::*;
 use faer::MatRef;
-use faer_traits::ComplexField;
-use num_traits::{Float, FromPrimitive};
+use num_traits::Float;
 use rayon::prelude::*;
 use std::iter::Sum;
 use thousands::*;
@@ -42,7 +41,7 @@ const TARGET_BUFFER_MB: usize = 1500;
 ///
 /// * `T` - Float type (f32 or f64)
 /// * `R` - CubeCL runtime
-pub struct IvfIndexGpu<T: Float + cubecl::frontend::Float + cubecl::CubeElement, R: Runtime> {
+pub struct IvfIndexGpu<T: AnnSearchFloat + AnnSearchGpuFloat, R: Runtime> {
     /// All vectors reorganised by cluster, resident on GPU
     vectors_gpu: GpuTensor<R, T>,
     /// All norms reorganised by cluster, resident on GPU (Cosine only)
@@ -70,15 +69,7 @@ pub struct IvfIndexGpu<T: Float + cubecl::frontend::Float + cubecl::CubeElement,
 impl<T, R> IvfIndexGpu<T, R>
 where
     R: Runtime,
-    T: Float
-        + Sum
-        + cubecl::frontend::Float
-        + cubecl::CubeElement
-        + FromPrimitive
-        + Send
-        + Sync
-        + SimdDistance
-        + ComplexField,
+    T: AnnSearchFloat + AnnSearchGpuFloat,
 {
     /// Build a batched IVF index
     ///
@@ -599,9 +590,7 @@ where
 
         let max_candidates: usize = cpu_write_pointers
             .iter()
-            .map(|&x| x as usize)
-            .max()
-            .unwrap_or(0);
+            .fold(0, |acc, &x| acc.max(x as usize));
 
         if verbose {
             println!(
