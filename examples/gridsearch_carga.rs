@@ -195,7 +195,7 @@ fn main() {
     println!("Self-querying GPU NNDescent (GPU beam search)...");
     let start = Instant::now();
     let (gpu_self_beam_neighbors, gpu_self_beam_distances) =
-        query_nndescent_index_gpu_self(&mut gpu_nndescent_idx, cli.k, true);
+        query_nndescent_index_gpu_self(&mut gpu_nndescent_idx, cli.k, None, true);
     let gpu_self_beam_time = start.elapsed().as_secs_f64() * 1000.0;
 
     let gpu_self_beam_recall =
@@ -223,6 +223,7 @@ fn main() {
         query_data.as_ref(),
         &mut gpu_nndescent_idx,
         cli.k,
+        None,
         None,
         true,
         false,

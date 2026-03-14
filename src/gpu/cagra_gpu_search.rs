@@ -81,6 +81,15 @@ impl CagraGpuSearchParams {
 
         (width, iters, n_entry)
     }
+
+    /// Get the number of entry points
+    ///
+    /// ### Returns
+    ///
+    /// n_entry
+    pub fn get_n_entry(&self) -> usize {
+        self.n_entry_points.unwrap_or(N_ENTRY_POINTS)
+    }
 }
 
 /// Default implementation for CagraGpuSearchParams
@@ -116,7 +125,7 @@ fn xorshift_search(state: u32) -> u32 {
 /// ### Grid mapping
 /// * Single workgroup (1,1,1), result written by thread 0
 #[cube(launch_unchecked)]
-pub fn probe_query_distance<F: Float>(
+fn probe_query_distance<F: Float>(
     vectors: &Tensor<Line<F>>,
     query: &Tensor<Line<F>>,
     out_dist: &mut Tensor<F>,
@@ -182,7 +191,7 @@ pub fn probe_query_distance<F: Float>(
 /// ### Grid mapping
 /// * Single workgroup (1,1,1)
 #[cube(launch_unchecked)]
-pub fn probe_hash_table(
+fn probe_hash_table(
     insert_ids: &Tensor<u32>,
     probe_ids: &Tensor<u32>,
     probe_results: &mut Tensor<u32>,
@@ -270,12 +279,38 @@ pub fn probe_hash_table(
 
 /// CAGRA beam search kernel. One workgroup per query.
 ///
-/// Thread 0 manages the hash table (visited tracking) and sorted candidate
-/// queue. All threads cooperate on loading the query vector and computing
-/// distances to candidate neighbours.
+/// Thread 0 manages the sorted candidate queue and the linear-probing hash
+/// table for visited-node deduplication. All threads cooperate on loading
+/// the query vector into scalar shared memory and computing distances to
+/// the candidate's graph neighbours.
+///
+/// ### Params
+///
+/// * `vectors` - Database vectors [n_nodes, dim/LINE_SIZE] as Line<F>
+/// * `norms` - Pre-computed L2 norms [n_nodes] (ignored when `use_cosine` is
+///   false)
+/// * `graph` - CAGRA navigational graph [n_nodes, k_graph] of neighbour IDs
+/// * `queries` - Query vectors [n_queries, dim/LINE_SIZE] as Line<F>
+/// * `entry_points` - Initial seed nodes [n_queries, n_entry]
+/// * `out_indices` - Output neighbour indices [n_queries, k_out]
+/// * `out_dists` - Output neighbour distances [n_queries, k_out]
+/// * `out_iters` - Number of beam iterations actually used per query
+///   [n_queries]
+/// * `n_nodes` - Total number of nodes in the graph
+/// * `k_out` - Number of neighbours to return per query
+/// * `k_graph` - Degree of the navigational graph (comptime)
+/// * `use_cosine` - Whether to compute cosine distance (comptime)
+/// * `dim_lines` - Number of `Line<F>` elements per vector row (comptime)
+/// * `beam_width` - Number of active candidates maintained during search
+///   (comptime)
+/// * `hash_size` - Hash table capacity for visited tracking (comptime, must be
+///   power of 2)
+/// * `max_iters` - Maximum beam iterations before forced termination (comptime)
+/// * `n_entry` - Number of entry points per query (comptime)
 ///
 /// ### Grid mapping
-/// * One Cube per query: q_idx = CUBE_POS_Y * CUBE_COUNT_X + CUBE_POS_X
+///
+/// * One Cube per query: `q_idx = CUBE_POS_Y * CUBE_COUNT_X + CUBE_POS_X`
 #[cube(launch_unchecked)]
 pub fn cagra_beam_search<F: Float>(
     vectors: &Tensor<Line<F>>,
@@ -631,8 +666,33 @@ pub fn cagra_beam_search<F: Float>(
 
 /// Batch CAGRA beam search on GPU.
 ///
-/// Pads queries, generates random entry points, launches one workgroup
-/// per query, downloads results.
+/// Pads query vectors to the next multiple of LINE_SIZE, uploads them,
+/// generates or uses provided entry points, launches one workgroup per
+/// query, and downloads results.
+///
+/// ### Params
+///
+/// * `queries_flat` - Flattened query vectors [n_queries * dim]
+/// * `n_queries` - Number of queries
+/// * `dim` - Original (unpadded) query dimensionality
+/// * `vectors_gpu` - GPU-resident database vectors [n, dim_padded/LINE_SIZE]
+/// * `norms_gpu` - GPU-resident L2 norms [n] (Cosine) or a dummy scalar
+///   (Euclidean)
+/// * `graph_gpu` - GPU-resident CAGRA navigational graph [n, k_graph]
+/// * `n` - Number of vectors in the database
+/// * `k_graph` - Degree of the navigational graph
+/// * `k_out` - Number of neighbours to return per query
+/// * `use_cosine` - Whether to use cosine distance
+/// * `seed` - Random seed used when `entry_points` is `None`
+/// * `entry_points` - Optional pre-computed entry point IDs
+///   [n_queries * N_ENTRY_POINTS].
+///   If `None`, random entry points are sampled from `[0, n)`.
+/// * `client` - GPU compute client
+///
+/// ### Returns
+///
+/// `(indices, distances)` per query, sorted by distance ascending.
+/// Sentinel entries (unfilled slots) are filtered out.
 #[allow(clippy::too_many_arguments)]
 pub fn cagra_search_batch_gpu<T, R>(
     queries_flat: &[T],
@@ -646,6 +706,7 @@ pub fn cagra_search_batch_gpu<T, R>(
     k_out: usize,
     use_cosine: bool,
     seed: usize,
+    query_params: &CagraGpuSearchParams,
     entry_points: Option<&[u32]>,
     client: &ComputeClient<R>,
 ) -> (Vec<Vec<usize>>, Vec<Vec<T>>)
@@ -656,6 +717,8 @@ where
     let line = LINE_SIZE as usize;
     let dim_padded = dim.next_multiple_of(line);
     let dim_vec = dim_padded / line;
+
+    let (width, iters, n_entry) = query_params.get_vals();
 
     // Pad queries
     let queries_padded = if dim_padded != dim {
@@ -676,18 +739,17 @@ where
     // Entry points: use provided or fall back to random
     let entry_flat = match entry_points {
         Some(pts) => {
-            assert_eq!(pts.len(), n_queries * N_ENTRY_POINTS);
+            assert_eq!(pts.len(), n_queries * n_entry);
             pts.to_vec()
         }
         None => {
             let mut rng = SmallRng::seed_from_u64(seed as u64);
-            (0..n_queries * N_ENTRY_POINTS)
+            (0..n_queries * n_entry)
                 .map(|_| rng.random_range(0..n as u32))
                 .collect()
         }
     };
-    let entry_gpu =
-        GpuTensor::<R, u32>::from_slice(&entry_flat, vec![n_queries, N_ENTRY_POINTS], client);
+    let entry_gpu = GpuTensor::<R, u32>::from_slice(&entry_flat, vec![n_queries, n_entry], client);
 
     // Output tensors
     let out_idx_gpu = GpuTensor::<R, u32>::empty(vec![n_queries, k_out], client);
@@ -716,10 +778,10 @@ where
             k_graph,
             use_cosine,
             dim_vec,
-            BEAM_WIDTH,
+            width,
             HASH_SIZE,
-            MAX_BEAM_ITERS,
-            N_ENTRY_POINTS,
+            iters,
+            n_entry,
         );
     }
 
@@ -1109,6 +1171,7 @@ mod tests {
             k_out,
             false,
             42,
+            &CagraGpuSearchParams::default(),
             None,
             &client,
         );
@@ -1181,6 +1244,7 @@ mod tests {
             k_out,
             false,
             42,
+            &CagraGpuSearchParams::default(),
             None,
             &client,
         );

@@ -70,3 +70,8 @@ required-features = ["binary"]
 [[example]]
 name = "gridsearch_rabitq"
 required-features = ["binary"]
+
+[[bench]]
+name = "gpu_exhaustive_kernels"
+harness = false
+required-features = ["gpu"]

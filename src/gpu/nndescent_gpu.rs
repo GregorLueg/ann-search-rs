@@ -244,13 +244,14 @@ fn init_random_graph<F: Float>(
 
 /// Zero out proposal counts and the global update counter.
 ///
-/// One thread per node. Thread 0 additionally resets the update counter.
+/// One thread per node zeroes its entry in `prop_count`. Thread 0
+/// additionally resets `update_counter[0]` to zero.
 ///
 /// ### Params
 ///
+/// * `prop_count` - Per-node proposal counter to reset [n]
+/// * `update_counter` - Global update accumulator to reset [1]
 /// * `n` - Number of nodes
-///
-/// Zeroes all entries in `prop_count` and resets `update_counter[0]` to zero.
 ///
 /// ### Grid mapping
 ///
@@ -993,71 +994,6 @@ fn pad_vectors<T: Float>(flat: &[T], n: usize, dim: usize, dim_padded: usize) ->
         dst.copy_from_slice(src);
     }
     padded
-}
-
-/// Build Annoy-initialised graph arrays ready for GPU upload.
-///
-/// Queries the Annoy forest for each node to obtain `build_k` initial
-/// neighbours, sorts them by distance, and encodes the IS_NEW flag into
-/// the MSB of each index entry.
-///
-/// ### Params
-///
-/// * `vectors_flat` - Flattened row-major vector data
-/// * `n` - Number of vectors
-/// * `dim` - Dimensionality
-/// * `build_k` - Neighbours per node
-/// * `forest` - Pre-built Annoy index
-///
-/// ### Returns
-///
-/// `(idx_flat, dist_flat)` -- flat row-major arrays of size `n * build_k`
-#[allow(dead_code)]
-fn annoy_init_graph<T>(
-    vectors_flat: &[T],
-    n: usize,
-    dim: usize,
-    build_k: usize,
-    forest: &AnnoyIndex<T>,
-) -> (Vec<u32>, Vec<T>)
-where
-    T: AnnSearchFloat,
-{
-    let is_new_bit = 1u32 << 31;
-    let mut idx_flat = vec![0u32; n * build_k];
-    let mut dist_flat = vec![T::zero(); n * build_k];
-
-    let search_k = build_k * forest.n_trees * 2;
-
-    // parallel per-node Annoy queries
-    idx_flat
-        .par_chunks_mut(build_k)
-        .zip(dist_flat.par_chunks_mut(build_k))
-        .enumerate()
-        .for_each(|(i, (idx_slot, dist_slot))| {
-            let query = &vectors_flat[i * dim..(i + 1) * dim];
-            let (indices, distances) = forest.query(query, build_k + 1, Some(search_k));
-
-            // Skip self (index 0 in results is typically the query itself),
-            // take up to build_k neighbours, already sorted by distance from Annoy
-            let mut written = 0;
-            for (idx, dist) in indices.into_iter().zip(distances) {
-                if idx == i || written >= build_k {
-                    continue;
-                }
-                idx_slot[written] = (idx as u32) | is_new_bit;
-                dist_slot[written] = dist;
-                written += 1;
-            }
-
-            // Pad remaining slots with sentinels
-            for s in written..build_k {
-                idx_slot[s] = 0x7FFFFFFFu32 | is_new_bit;
-                dist_slot[s] = T::max_value();
-            }
-        });
-
-    (idx_flat, dist_flat)
 }
 
 //////////////
@@ -1908,6 +1844,8 @@ where
     ///
     /// * `queries_flat` - Flattened query vectors, row-major [n_queries, dim]
     /// * `n_queries` - Number of query vectors
+    /// * `query_params` - Optional Cagra beam search parameters if you want
+    ///   to specify width, iterations.
     /// * `k` - Number of neighbours to return per query
     /// * `seed` - Random seed for entry point generation
     ///
@@ -1918,6 +1856,7 @@ where
         &mut self,
         queries_flat: &[T],
         n_queries: usize,
+        query_params: Option<CagraGpuSearchParams>,
         k: usize,
         seed: usize,
     ) -> (Vec<Vec<usize>>, Vec<Vec<T>>)
@@ -1930,24 +1869,23 @@ where
             "queries_flat length must be n_queries * dim"
         );
 
+        let query_params = query_params.unwrap_or_default();
+        let n_entry = query_params.get_n_entry();
+
         self.ensure_gpu_tensors();
 
         let client = R::client(&self._device);
         let use_cosine = self.metric == Dist::Cosine;
 
-        let t0 = std::time::Instant::now();
-
-        let search_k = N_ENTRY_POINTS * self.forest.n_trees * 2;
+        let search_k = n_entry * self.forest.n_trees * 2;
         let entry_flat: Vec<u32> = (0..n_queries)
             .into_par_iter()
             .flat_map_iter(|i| {
                 let query = &queries_flat[i * self.dim..(i + 1) * self.dim];
-                let (indices, _) = self.forest.query(query, N_ENTRY_POINTS, Some(search_k));
+                let (indices, _) = self.forest.query(query, n_entry, Some(search_k));
                 indices.into_iter().map(|idx| idx as u32)
             })
             .collect();
-
-        let t1 = std::time::Instant::now();
 
         let result = cagra_search_batch_gpu(
             queries_flat,
@@ -1961,19 +1899,10 @@ where
             k,
             use_cosine,
             seed,
+            &query_params,
             Some(&entry_flat),
             &client,
         );
-
-        let t2 = std::time::Instant::now();
-
-        eprintln!(
-                    "  [query_batch_gpu] annoy={:.1}ms  kernel+download={:.1}ms  total={:.1}ms  ({} queries)",
-                    t1.duration_since(t0).as_secs_f64() * 1000.0,
-                    t2.duration_since(t1).as_secs_f64() * 1000.0,
-                    t2.duration_since(t0).as_secs_f64() * 1000.0,
-                    n_queries,
-                );
 
         result
     }
@@ -1995,12 +1924,24 @@ where
         &self.nav_graph[idx * self.k..(idx + 1) * self.k]
     }
 
-    /// Whether the algorithm converged during construction.
+    /// Whether NNDescent reached the convergence threshold during construction.
+    ///
+    /// ### Returns
+    ///
+    /// `true` if the update rate fell below `delta` before `max_iters` was
+    /// exhausted, `false` otherwise.
     pub fn converged(&self) -> bool {
         self.converged
     }
 
-    /// Returns the size of the struct in bytes (CPU side only).
+    /// Returns the CPU-side memory footprint of the index in bytes.
+    ///
+    /// Does not account for any GPU-resident tensors. Use the VRAM figures
+    /// from `GpuTensor::vram_bytes` separately if needed.
+    ///
+    /// ### Returns
+    ///
+    /// Total bytes allocated on the CPU for this struct and its owned Vecs.
     pub fn memory_usage_bytes(&self) -> usize {
         std::mem::size_of_val(self)
             + self.vectors_flat.capacity() * std::mem::size_of::<T>()
@@ -2068,11 +2009,19 @@ where
     /// ### Returns
     ///
     /// `(indices, distances)` per vector, sorted by distance ascending
-    pub fn self_query_gpu(&mut self, k: usize, seed: usize) -> (Vec<Vec<usize>>, Vec<Vec<T>>)
+    pub fn self_query_gpu(
+        &mut self,
+        k: usize,
+        query_params: Option<CagraGpuSearchParams>,
+        seed: usize,
+    ) -> (Vec<Vec<usize>>, Vec<Vec<T>>)
     where
         T: AnnSearchGpuFloat + AnnSearchFloat,
     {
         self.ensure_gpu_tensors();
+
+        let query_params = query_params.unwrap_or_default();
+        let n_entry = query_params.get_n_entry();
 
         let client = R::client(&self._device);
         let use_cosine = self.metric == Dist::Cosine;
@@ -2080,7 +2029,6 @@ where
         // Build entry points from kNN graph: take first N_ENTRY_POINTS
         // neighbours per node. These are already sorted by distance,
         // so we get the best-known neighbours as seeds.
-        let n_entry = N_ENTRY_POINTS;
         let entry_flat: Vec<u32> = (0..self.n)
             .flat_map(|i| {
                 let row = &self.knn_graph[i * self.k..(i + 1) * self.k];
@@ -2114,13 +2062,18 @@ where
             k,
             use_cosine,
             seed,
+            &query_params,
             Some(&entry_flat),
             &client,
         )
     }
 
-    /// Ensure GPU tensors are resident. If they were dropped after build,
-    /// re-uploads from CPU data.
+    /// Ensure GPU tensors are resident, re-uploading from CPU data if needed.
+    ///
+    /// If `retain_gpu` was `false` during `build`, the GPU tensors are `None`.
+    /// This method reconstructs them from `vectors_flat`, `norms`, and
+    /// `nav_graph` so that `query_batch_gpu` and `self_query_gpu` can proceed.
+    /// No-ops if tensors are already present.
     fn ensure_gpu_tensors(&mut self) {
         if self.nav_graph_gpu.is_some() {
             return;
@@ -3055,64 +3008,6 @@ mod kernel_tests {
                 "pid=3 should have been evicted"
             );
         }
-    }
-
-    #[test]
-    fn test_annoy_init_quality() {
-        let n = 200;
-        let dim = 8;
-        let k = 10;
-
-        // Create clustered data (2 clusters)
-        let mut data_flat = vec![0.0f32; n * dim];
-        for i in 0..n {
-            let cluster = if i < n / 2 { 0.0 } else { 10.0 };
-            for j in 0..dim {
-                data_flat[i * dim + j] = cluster + (i * 7 + j * 3) as f32 * 0.01;
-            }
-        }
-
-        let mat = Mat::from_fn(n, dim, |i, j| data_flat[i * dim + j]);
-        let forest = AnnoyIndex::new(mat.as_ref(), 10, Dist::Euclidean, 42);
-        let (idx_flat, _) = annoy_init_graph(&data_flat, n, dim, k, &forest);
-
-        let pid_mask = 0x7FFFFFFFu32;
-
-        // Compute brute-force kNN for first 20 nodes
-        let mut recall_sum = 0.0f64;
-        let check_n = 20;
-
-        for i in 0..check_n {
-            // Brute-force: compute distance to all others, take k nearest
-            let mut dists: Vec<(usize, f32)> = (0..n)
-                .filter(|&j| j != i)
-                .map(|j| {
-                    let a = &data_flat[i * dim..(i + 1) * dim];
-                    let b = &data_flat[j * dim..(j + 1) * dim];
-                    let d: f32 = a.iter().zip(b).map(|(x, y)| (x - y) * (x - y)).sum();
-                    (j, d)
-                })
-                .collect();
-            dists.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
-            let gt_set: std::collections::HashSet<usize> =
-                dists.iter().take(k).map(|&(j, _)| j).collect();
-
-            // Check Annoy's result
-            let base = i * k;
-            let annoy_set: std::collections::HashSet<usize> = (0..k)
-                .map(|j| (idx_flat[base + j] & pid_mask) as usize)
-                .collect();
-
-            let hits = gt_set.intersection(&annoy_set).count();
-            recall_sum += hits as f64 / k as f64;
-        }
-
-        let avg_recall = recall_sum / check_n as f64;
-        println!("Annoy init recall@{k} (avg over {check_n} nodes): {avg_recall:.4}");
-        assert!(
-            avg_recall > 0.5,
-            "Annoy init recall too low: {avg_recall:.4} -- something is wrong with annoy_init_graph"
-        );
     }
 
     #[test]

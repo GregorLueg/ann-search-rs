@@ -2059,6 +2059,7 @@ where
 /// * `index` - Reference to built index
 /// * `k` - Number of neighbours
 /// * `ef_search` - Beam width (default auto)
+/// * `query_params` - Optional GPU beam search parameters
 /// * `return_dist` - Return distances
 /// * `verbose` - Print progress
 ///
@@ -2070,6 +2071,7 @@ pub fn query_nndescent_index_gpu<T, R>(
     index: &mut NNDescentGpu<T, R>,
     k: usize,
     ef_search: Option<usize>,
+    query_params: Option<CagraGpuSearchParams>,
     return_dist: bool,
     verbose: bool,
 ) -> (Vec<Vec<usize>>, Option<Vec<Vec<T>>>)
@@ -2099,7 +2101,8 @@ where
             })
             .collect();
 
-        let (indices, distances) = index.query_batch_gpu(&queries_flat, n_queries, k, 42);
+        let (indices, distances) =
+            index.query_batch_gpu(&queries_flat, n_queries, query_params, k, 42);
 
         if return_dist {
             (indices, Some(distances))
@@ -2169,6 +2172,7 @@ where
 ///
 /// * `index` - Mutable reference to built index
 /// * `k` - Number of neighbours
+/// * `query_params` - Optional GPU beam search parameters
 /// * `return_dist` - Return distances
 ///
 /// ### Returns
@@ -2177,6 +2181,7 @@ where
 pub fn query_nndescent_index_gpu_self<T, R>(
     index: &mut NNDescentGpu<T, R>,
     k: usize,
+    query_params: Option<CagraGpuSearchParams>,
     return_dist: bool,
 ) -> (Vec<Vec<usize>>, Option<Vec<Vec<T>>>)
 where
@@ -2184,7 +2189,7 @@ where
     T: AnnSearchFloat + cubecl::frontend::Float + cubecl::CubeElement,
     NNDescentGpu<T, R>: NNDescentQuery<T>,
 {
-    let (indices, distances) = index.self_query_gpu(k, 42);
+    let (indices, distances) = index.self_query_gpu(k, query_params, 42);
 
     if return_dist {
         (indices, Some(distances))

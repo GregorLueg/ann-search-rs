@@ -108,9 +108,31 @@ fn partition_points<F: AnnSearchGpuFloat>(
 /// All-pairs distance computation within a leaf, emitting proposals.
 ///
 /// One workgroup per leaf. Loads leaf vectors into scalar shared memory,
-/// computes C(leaf_size, 2) pairwise distances, writes proposals via atomics.
+/// computes C(leaf_size, 2) pairwise distances, and writes proposals via
+/// atomics. Overflow beyond `max_proposals` is handled via reservoir sampling.
+///
+/// ### Params
+///
+/// * `vectors` - Row-major vector matrix, line-vectorised [n, dim/LINE_SIZE]
+/// * `norms` - Pre-computed L2 norms [n] (ignored when `use_cosine` is false)
+/// * `leaf_points` - Flat array of global point IDs in leaf order
+/// * `leaf_offsets` - CSR-style offsets into `leaf_points`, length n_leaves + 1
+/// * `graph_dist` - Current kNN graph distances [n, k], used for threshold
+///   filtering
+/// * `prop_idx` - Output proposal indices [n, max_proposals]
+/// * `prop_dist` - Output proposal distances [n, max_proposals]
+/// * `prop_count` - Atomic per-node proposal counter [n]
+/// * `n` - Total number of points in the dataset
+/// * `n_leaves` - Number of leaves in the current batch
+/// * `max_proposals` - Proposal buffer capacity per node (comptime)
+/// * `use_cosine` - Whether to compute cosine distance instead of squared
+///   Euclidean (comptime)
+/// * `dim_lines` - Number of `Line<F>` elements per vector row (comptime)
+/// * `max_leaf_size` - Maximum points per leaf for shared memory allocation
+///   (comptime)
 ///
 /// ### Grid mapping
+///
 /// * One Cube per leaf
 #[cube(launch_unchecked)]
 pub fn leaf_pairwise_proposals<F: AnnSearchGpuFloat>(
@@ -294,7 +316,20 @@ fn mark_all_new(graph_idx: &mut Tensor<u32>, total_entries: u32) {
 
 /// Build leaf-point arrays from final partition IDs.
 ///
-/// Returns `(leaf_points, leaf_offsets, n_leaves)`.
+/// Groups points by partition, sorts them, and builds a CSR-style offset
+/// array for subsequent per-leaf GPU kernels.
+///
+/// ### Params
+///
+/// * `partition_ids` - Partition ID per point, length `n`
+/// * `n` - Number of points
+///
+/// ### Returns
+///
+/// `(leaf_points, leaf_offsets, n_leaves)` where `leaf_points` is the
+/// global point IDs sorted by partition, `leaf_offsets` is the CSR offset
+/// array of length `n_leaves + 1`, and `n_leaves` is the number of distinct
+/// partitions.
 fn build_leaf_structure(partition_ids: &[u32], n: usize) -> (Vec<u32>, Vec<u32>, usize) {
     let mut sorted: Vec<(u32, u32)> = partition_ids
         .iter()
@@ -318,6 +353,21 @@ fn build_leaf_structure(partition_ids: &[u32], n: usize) -> (Vec<u32>, Vec<u32>,
 }
 
 /// Compute per-partition median dot values on CPU.
+///
+/// Used after each random projection step to determine the split threshold
+/// for bisecting each partition.
+///
+/// ### Params
+///
+/// * `partition_ids` - Current partition ID per point, length `n`
+/// * `dot_values` - Dot product of each point with the projection vector,
+///   length `n`
+/// * `n_partitions` - Number of active partitions at the current tree level
+///
+/// ### Returns
+///
+/// Vector of length `n_partitions` containing the median dot value for each
+/// partition. Empty partitions retain `T::zero()`.
 fn compute_partition_medians<T: AnnSearchFloat>(
     partition_ids: &[u32],
     dot_values: &[T],
