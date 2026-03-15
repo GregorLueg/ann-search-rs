@@ -2370,6 +2370,7 @@ mod tests {
 /// Each test creates its own wgpu device and skips gracefully if no
 /// backend is available.
 #[cfg(test)]
+#[cfg(feature = "gpu-tests")]
 mod kernel_tests {
     use super::*;
     use cubecl::wgpu::WgpuDevice;

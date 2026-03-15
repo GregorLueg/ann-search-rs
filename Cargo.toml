@@ -19,6 +19,7 @@ codegen-units = 1
 [features]
 binary = ["memmap2", "tempfile", "bytemuck"]
 gpu = ["cubecl"]
+gpu-tests = ["gpu"]
 quantised = ["half"]
 
 # Dependecies

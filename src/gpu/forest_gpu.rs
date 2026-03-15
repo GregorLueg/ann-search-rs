@@ -719,6 +719,7 @@ pub fn gpu_forest_init<T, R>(
 ///////////
 
 #[cfg(test)]
+#[cfg(feature = "gpu-tests")]
 mod tests {
     use super::*;
     use cubecl::wgpu::WgpuDevice;

@@ -877,6 +877,7 @@ where
 ///////////
 
 #[cfg(test)]
+#[cfg(feature = "gpu-tests")]
 mod tests {
     use super::*;
     use cubecl::wgpu::WgpuDevice;
