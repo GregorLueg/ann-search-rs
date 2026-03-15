@@ -1,6 +1,13 @@
 # News
 
+## 0.2.6
+
+Same as version 0.2.6; however, the MiMalloc activation was made optional via
+a feature flag.
+
 ## 0.2.5
+
+**Yanked**
 
 Aggressive performance optimisations for various CPU-based indices, removed a
 nasty memory corruption bug from the exhaustive GPU search. Reordering of the
