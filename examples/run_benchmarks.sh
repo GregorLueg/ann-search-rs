@@ -29,7 +29,7 @@ run_common_patterns() {
 
 run_standard() {
     echo "=== Running standard benchmarks ==="
-    for algo in annoy balltree hnsw ivf lsh nndescent; do
+    for algo in annoy balltree hnsw ivf lsh nndescent vamana; do
         run_common_patterns run_benchmark "${algo}" "${algo}"
     done
 }

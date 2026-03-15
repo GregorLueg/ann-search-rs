@@ -14,6 +14,17 @@ use crate::utils::dist::{cosine_distance_static, euclidean_distance_static};
 use crate::utils::graph_utils::SearchState;
 use crate::utils::*;
 
+///////////////////
+// Thread locals //
+///////////////////
+
+thread_local! {
+    static VAMANA_BUILD_STATE_F32: RefCell<SearchState<f32>> = RefCell::new(SearchState::new(1000));
+    static VAMANA_BUILD_STATE_F64: RefCell<SearchState<f64>> = RefCell::new(SearchState::new(1000));
+    static VAMANA_SEARCH_STATE_F32: RefCell<SearchState<f32>> = RefCell::new(SearchState::new(1000));
+    static VAMANA_SEARCH_STATE_F64: RefCell<SearchState<f64>> = RefCell::new(SearchState::new(1000));
+}
+
 /////////////
 // Helpers //
 /////////////
@@ -275,13 +286,6 @@ pub fn compute_medoid<T: AnnSearchFloat>(
     medoid_idx as u32
 }
 
-thread_local! {
-    static VAMANA_BUILD_STATE_F32: RefCell<SearchState<f32>> = RefCell::new(SearchState::new(1000));
-    static VAMANA_BUILD_STATE_F64: RefCell<SearchState<f64>> = RefCell::new(SearchState::new(1000));
-    static VAMANA_SEARCH_STATE_F32: RefCell<SearchState<f32>> = RefCell::new(SearchState::new(1000));
-    static VAMANA_SEARCH_STATE_F64: RefCell<SearchState<f64>> = RefCell::new(SearchState::new(1000));
-}
-
 /// Provides access to thread-local SearchState buffers for Vamana for building
 /// and querying the graph
 pub trait VamanaState<T> {
@@ -480,8 +484,7 @@ where
                     // 4.) update p's out-edges
                     build_graph.set_neighbours(p, &pruned_edges);
 
-                    // 5.) reverse edges: add p to q's neighbours, pruning q
-                    //     if needed.
+                    // 5.) reverse edges: add p to q's neighbours
                     for &q in &pruned_edges {
                         let q = q as usize;
                         let _guard = build_graph.locks.lock_guard(q); // RAII Lock!
@@ -495,18 +498,26 @@ where
                             if q_degree < r {
                                 build_graph.add_neighbour_unsafe(q, p as u32);
                             } else {
-                                let q_scratch = &mut state.scratch_discarded;
-                                q_scratch.clear();
+                                let dist_q_p = index.distance(q, p);
 
-                                // only iterate valid neighbours
-                                for &nbr in &q_edges[..q_degree] {
-                                    let n_idx = nbr as usize;
-                                    q_scratch.push((OrderedFloat(index.distance(q, n_idx)), n_idx));
+                                // Quick check: is p even competitive?
+                                let worst_dist = q_edges[..q_degree]
+                                    .iter()
+                                    .map(|&nbr| index.distance(q, nbr as usize))
+                                    .fold(T::neg_infinity(), |a, b| if b > a { b } else { a });
+
+                                if dist_q_p < worst_dist {
+                                    let q_scratch = &mut state.scratch_discarded;
+                                    q_scratch.clear();
+                                    for &nbr in &q_edges[..q_degree] {
+                                        let n_idx = nbr as usize;
+                                        q_scratch
+                                            .push((OrderedFloat(index.distance(q, n_idx)), n_idx));
+                                    }
+                                    q_scratch.push((OrderedFloat(dist_q_p), p));
+                                    let new_q_edges = index.robust_prune(q, q_scratch, alpha, r);
+                                    build_graph.set_neighbours_unsafe(q, &new_q_edges);
                                 }
-                                q_scratch.push((OrderedFloat(index.distance(q, p)), p));
-
-                                let new_q_edges = index.robust_prune(q, q_scratch, alpha, r);
-                                build_graph.set_neighbours_unsafe(q, &new_q_edges);
                             }
                         }
                     }
@@ -610,17 +621,12 @@ where
             }
         }
 
-        // FIX #7: still allocates here but this is once per node, not per
-        // reverse edge. Could be eliminated by returning a slice reference
-        // but that complicates lifetimes with the scratch buffer usage below.
+        // allocation happens here, but oh well...
         state.working_sorted.data().to_vec()
     }
 
     /// Selects up to `max_degree` neighbours from a candidate pool using the
     /// alpha-heuristic.
-    ///
-    /// FIX #3: single sort by distance after dedup by index, avoiding the
-    /// previous double-sort.
     ///
     /// ### Params
     ///
@@ -631,15 +637,10 @@ where
     fn robust_prune(
         &self,
         base_node: usize,
-        candidates: &mut Vec<(OrderedFloat<T>, usize)>,
+        candidates: &mut [(OrderedFloat<T>, usize)],
         alpha: f32,
         max_degree: usize,
     ) -> Vec<u32> {
-        // sort by index for dedup, keeping closest distance per index
-        candidates.sort_unstable_by_key(|&(_, id)| id);
-        candidates.dedup_by_key(|a| a.1);
-
-        // single sort by distance (ascending)
         candidates.sort_unstable_by(|a, b| a.0.cmp(&b.0));
 
         let mut selected = Vec::with_capacity(max_degree);
@@ -652,21 +653,15 @@ where
             if selected.len() >= max_degree {
                 break;
             }
-
-            let mut is_good = true;
-
-            // check if this candidate is eclipsed by any already selected
-            // neighbour
-            for &selected_id in &selected {
-                let dist_to_selected = OrderedFloat(self.distance(cand_id, selected_id as usize));
-
-                // The Vamana Prune Condition:
-                // alpha * d(selected, candidate) <= d(base, candidate)
-                if alpha_t * dist_to_selected.0 <= cand_dist.0 {
-                    is_good = false;
-                    break;
-                }
+            // skip duplicates -- the closest one comes first due to sort order
+            if selected.contains(&(cand_id as u32)) {
+                continue;
             }
+
+            let is_good = !selected.iter().any(|&sel_id| {
+                let dist_to_selected = OrderedFloat(self.distance(cand_id, sel_id as usize));
+                alpha_t * dist_to_selected.0 <= cand_dist.0
+            });
 
             if is_good {
                 selected.push(cand_id as u32);
@@ -749,7 +744,7 @@ where
     /// * `query` - Query vector (must match index dimensionality)
     /// * `k` - Number of neighbours to return
     /// * `ef_search` - Optional Beam width (higher = better recall, slower).
-    ///   If not provided, it will default to `100`.
+    ///   If not provided, it will default to `75`.
     ///
     /// ### Returns
     ///
@@ -758,7 +753,7 @@ where
     pub fn query(&self, query: &[T], k: usize, ef_search: Option<usize>) -> (Vec<usize>, Vec<T>) {
         assert_eq!(query.len(), self.dim);
 
-        let ef_search = ef_search.unwrap_or(100);
+        let ef_search = ef_search.unwrap_or(75);
 
         // Ensure the beam is at least as wide as k
         let ef = ef_search.max(k);

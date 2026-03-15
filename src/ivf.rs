@@ -38,6 +38,8 @@ pub struct IvfIndex<T> {
     offsets: Vec<usize>,
     /// Number of clusters in the index
     nlist: usize,
+    /// Original indices
+    original_ids: Vec<usize>,
 }
 
 ////////////////////
@@ -213,7 +215,8 @@ where
         // 4. generate a flat version for better cache locality
         let (all_indices, offsets) = build_csr_layout(assignments, n, nlist);
 
-        Self {
+        // 5. optimise memory layout for access pattern
+        let mut idx = Self {
             vectors_flat,
             dim,
             n,
@@ -224,7 +227,12 @@ where
             all_indices,
             offsets,
             nlist,
-        }
+            original_ids: Vec::new(),
+        };
+
+        let new_to_old = idx.optimise_memory_layout();
+        idx.original_ids = new_to_old;
+        idx
     }
 
     ///////////
@@ -273,17 +281,21 @@ where
             let start = self.offsets[cluster_idx];
             let end = self.offsets[cluster_idx + 1];
 
-            for &vec_idx in &self.all_indices[start..end] {
+            for vec_idx in start..end {
                 let dist = match self.metric {
                     Dist::Euclidean => self.euclidean_distance_to_query(vec_idx, query_vec),
                     Dist::Cosine => self.cosine_distance_to_query(vec_idx, query_vec, query_norm),
                 };
-
                 buffer.insert((OrderedFloat(dist), vec_idx), k);
             }
         }
 
-        let (distances, indices) = buffer.data().iter().map(|(d, i)| (d.0, *i)).unzip();
+        let (distances, indices) = buffer
+            .data()
+            .iter()
+            .map(|(d, i)| (d.0, self.original_ids[*i]))
+            .unzip();
+
         (indices, distances)
     }
 
@@ -345,12 +357,13 @@ where
     ) -> (Vec<Vec<usize>>, Option<Vec<Vec<T>>>) {
         let counter = Arc::new(AtomicUsize::new(0));
 
-        let results: Vec<(Vec<usize>, Vec<T>)> = (0..self.n)
+        let unordered_results: Vec<(usize, Vec<usize>, Vec<T>)> = (0..self.n)
             .into_par_iter()
             .map(|i| {
                 let start = i * self.dim;
                 let end = start + self.dim;
                 let vec = &self.vectors_flat[start..end];
+                let orig_id = self.original_ids[i];
 
                 if verbose {
                     let count = counter.fetch_add(1, Ordering::Relaxed) + 1;
@@ -363,17 +376,71 @@ where
                     }
                 }
 
-                self.query(vec, k, nprobe)
+                let (indices, dists) = self.query(vec, k, nprobe);
+                (orig_id, indices, dists)
             })
             .collect();
 
-        if return_dist {
-            let (indices, distances) = results.into_iter().unzip();
-            (indices, Some(distances))
+        let mut final_indices = vec![Vec::new(); self.n];
+        let mut final_dists = if return_dist {
+            Some(vec![Vec::new(); self.n])
         } else {
-            let indices: Vec<Vec<usize>> = results.into_iter().map(|(idx, _)| idx).collect();
-            (indices, None)
+            None
+        };
+
+        for (orig_id, indices, dists) in unordered_results {
+            final_indices[orig_id] = indices;
+            if let Some(ref mut fd) = final_dists {
+                fd[orig_id] = dists;
+            }
         }
+
+        (final_indices, final_dists)
+    }
+
+    /// Function will optimise memory layout and put vectors sorted by cluster
+    /// id
+    ///
+    /// ### Returns
+    ///
+    /// New to old mapping
+    fn optimise_memory_layout(&mut self) -> Vec<usize> {
+        let mut new_to_old = Vec::with_capacity(self.n);
+        let mut old_to_new = vec![0usize; self.n];
+
+        for cluster in 0..self.nlist {
+            let start = self.offsets[cluster];
+            let end = self.offsets[cluster + 1];
+            for &old_id in &self.all_indices[start..end] {
+                old_to_new[old_id] = new_to_old.len();
+                new_to_old.push(old_id);
+            }
+        }
+
+        let mut new_vectors_flat = Vec::with_capacity(self.vectors_flat.len());
+        let mut new_norms = if self.norms.is_empty() {
+            Vec::new()
+        } else {
+            Vec::with_capacity(self.n)
+        };
+
+        for &old_id in &new_to_old {
+            let start = old_id * self.dim;
+            new_vectors_flat.extend_from_slice(&self.vectors_flat[start..start + self.dim]);
+            if !self.norms.is_empty() {
+                new_norms.push(self.norms[old_id]);
+            }
+        }
+
+        self.vectors_flat = new_vectors_flat;
+        self.norms = new_norms;
+
+        // offsets now directly index vectors_flat — no change needed since
+        // all_indices was already built in cluster order
+        self.all_indices.clear();
+        self.all_indices.shrink_to_fit();
+
+        new_to_old
     }
 
     /// Returns the size of the index in bytes
