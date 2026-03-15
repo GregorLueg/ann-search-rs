@@ -717,6 +717,8 @@ CAGRA-bw64 (self)                                      7_241.90     2_627.73    
 
 #### Larger data sets
 
+Let's test CAGRA similar to IVF GPU on larger data sets.
+
 <details>
 <summary><b>GPU NNDescent with CAGRA style pruning (250k samples; 64 dimensions)</b>:</summary>
 <pre><code>
