@@ -2,13 +2,23 @@
 
 ## 0.2.5
 
+Aggressive performance optimisations for various CPU-based indices, removed a
+nasty memory corruption bug from the exhaustive GPU search.
+
 **Features:**
 
 - Improved Annoy with better memory layout for faster querying.
 - Better documentation (more Rust idiomatic), plus correction of copy and paste
   errors.
-- Vamana index added
+- Vamana index added and optimised.
 - Massive improvement in the IVF indices due to better memory layout.
+- Improvements in some of the GPU kernels for exhaustive and IVF search for
+  better performance.
+- [CAGRA style kNN search](https://arxiv.org/abs/2308.15136) with wgpu
+  backend.
+- Faster index building for HNSW with a first sequential and then parallel
+  phase.
+- MiMalloc for better allocations patterns.
 
 **Bugs:**
 
@@ -18,10 +28,10 @@
 
 **Features:**
 
-- *New*: Binary signed quantiser with reranking -for very large vectors.
+- *New*: Binary signed quantiser with reranking - for very large vectors.
 - SIMD add and assign add added - used for better k-means clustering.
 - Improved k-means clustering (impacting IVF) for higher dimensions.
-- Improvned NNDescent with less
+- Improved NNDescent with less
 - Improved LSH index with multi-probe support.
 - Updated benchmarks with 128 dimensions tested across various indices.
 

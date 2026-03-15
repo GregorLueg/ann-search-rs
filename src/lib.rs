@@ -6,6 +6,12 @@
 #![allow(clippy::needless_range_loop)] // I want these loops!
 #![warn(missing_docs)]
 
+use mimalloc::MiMalloc;
+
+// MiMalloc for better allocations
+#[global_allocator]
+static GLOBAL: MiMalloc = MiMalloc;
+
 pub mod annoy;
 pub mod ball_tree;
 pub mod exhaustive;
@@ -27,15 +33,11 @@ pub mod quantised;
 pub mod binary;
 
 use faer::MatRef;
-use num_traits::{Float, FromPrimitive, ToPrimitive};
 use rayon::prelude::*;
 
-use std::{
-    iter::Sum,
-    sync::{
-        atomic::{AtomicUsize, Ordering},
-        Arc,
-    },
+use std::sync::{
+    atomic::{AtomicUsize, Ordering},
+    Arc,
 };
 use thousands::*;
 
@@ -46,8 +48,6 @@ use std::ops::AddAssign;
 
 #[cfg(feature = "binary")]
 use bytemuck::Pod;
-#[cfg(feature = "binary")]
-use faer_traits::ComplexField;
 #[cfg(feature = "binary")]
 use std::path::Path;
 
@@ -2040,7 +2040,7 @@ pub fn build_nndescent_index_gpu<T, R>(
 ) -> NNDescentGpu<T, R>
 where
     R: Runtime,
-    T: AnnSearchFloat + cubecl::frontend::Float + cubecl::CubeElement,
+    T: AnnSearchFloat + AnnSearchGpuFloat,
     NNDescentGpu<T, R>: NNDescentQuery<T>,
 {
     let ann_dist = parse_ann_dist(dist_metric).unwrap_or_default();
@@ -2155,7 +2155,7 @@ pub fn extract_nndescent_knn_gpu<T, R>(
 ) -> (Vec<Vec<usize>>, Option<Vec<Vec<T>>>)
 where
     R: Runtime,
-    T: AnnSearchFloat + cubecl::frontend::Float + cubecl::CubeElement,
+    T: AnnSearchFloat + AnnSearchGpuFloat,
     NNDescentGpu<T, R>: NNDescentQuery<T>,
 {
     index.extract_knn(return_dist)
@@ -2186,7 +2186,7 @@ pub fn query_nndescent_index_gpu_self<T, R>(
 ) -> (Vec<Vec<usize>>, Option<Vec<Vec<T>>>)
 where
     R: Runtime,
-    T: AnnSearchFloat + cubecl::frontend::Float + cubecl::CubeElement,
+    T: AnnSearchFloat + AnnSearchGpuFloat,
     NNDescentGpu<T, R>: NNDescentQuery<T>,
 {
     let (indices, distances) = index.self_query_gpu(k, query_params, 42);
@@ -2236,7 +2236,7 @@ pub fn build_exhaustive_index_binary<T>(
     save_path: Option<impl AsRef<Path>>,
 ) -> std::io::Result<ExhaustiveIndexBinary<T>>
 where
-    T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum + ComplexField + SimdDistance + Pod,
+    T: AnnSearchFloat + Pod,
 {
     let metric = parse_ann_dist(metric).unwrap_or_default();
 
@@ -2275,7 +2275,7 @@ pub fn query_exhaustive_index_binary<T>(
     verbose: bool,
 ) -> (Vec<Vec<usize>>, Option<Vec<Vec<T>>>)
 where
-    T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum + ComplexField + SimdDistance + Pod,
+    T: AnnSearchFloat + Pod,
 {
     if rerank {
         query_parallel(query_mat.nrows(), return_dist, verbose, |i| {
@@ -2332,7 +2332,7 @@ pub fn query_exhaustive_index_binary_self<T>(
     verbose: bool,
 ) -> (Vec<Vec<usize>>, Option<Vec<Vec<T>>>)
 where
-    T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum + ComplexField + SimdDistance + Pod,
+    T: AnnSearchFloat + Pod,
 {
     index.generate_knn(k, rerank_factor, return_dist, verbose)
 }
@@ -2375,7 +2375,7 @@ pub fn build_ivf_index_binary<T>(
     verbose: bool,
 ) -> std::io::Result<IvfIndexBinary<T>>
 where
-    T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum + ComplexField + SimdDistance + Pod,
+    T: AnnSearchFloat + Pod,
 {
     let ann_dist = parse_ann_dist(dist_metric).unwrap_or_default();
 
@@ -2436,7 +2436,7 @@ pub fn query_ivf_index_binary<T>(
     verbose: bool,
 ) -> (Vec<Vec<usize>>, Option<Vec<Vec<T>>>)
 where
-    T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum + ComplexField + SimdDistance + Pod,
+    T: AnnSearchFloat + Pod,
 {
     if rerank {
         query_parallel(query_mat.nrows(), return_dist, verbose, |i| {
@@ -2490,7 +2490,7 @@ pub fn query_ivf_index_binary_self<T>(
     verbose: bool,
 ) -> (Vec<Vec<usize>>, Option<Vec<Vec<T>>>)
 where
-    T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum + ComplexField + SimdDistance + Pod,
+    T: AnnSearchFloat + Pod,
 {
     index.generate_knn(k, nprobe, rerank_factor, return_dist, verbose)
 }
@@ -2524,7 +2524,7 @@ pub fn build_exhaustive_index_rabitq<T>(
     save_path: Option<impl AsRef<Path>>,
 ) -> std::io::Result<ExhaustiveIndexRaBitQ<T>>
 where
-    T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum + ComplexField + SimdDistance + Pod,
+    T: AnnSearchFloat + Pod,
 {
     let ann_dist = parse_ann_dist(dist_metric).unwrap_or_default();
     if save_store {
@@ -2569,7 +2569,7 @@ pub fn query_exhaustive_index_rabitq<T>(
     verbose: bool,
 ) -> (Vec<Vec<usize>>, Option<Vec<Vec<T>>>)
 where
-    T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum + ComplexField + SimdDistance + Pod,
+    T: AnnSearchFloat + Pod,
 {
     if rerank {
         query_parallel(query_mat.nrows(), return_dist, verbose, |i| {
@@ -2609,7 +2609,7 @@ pub fn query_exhaustive_index_rabitq_self<T>(
     verbose: bool,
 ) -> (Vec<Vec<usize>>, Option<Vec<Vec<T>>>)
 where
-    T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum + ComplexField + SimdDistance + Pod,
+    T: AnnSearchFloat + Pod,
 {
     index.generate_knn(k, n_probe, rerank_factor, return_dist, verbose)
 }
@@ -2648,7 +2648,7 @@ pub fn build_ivf_index_rabitq<T>(
     verbose: bool,
 ) -> std::io::Result<IvfIndexRaBitQ<T>>
 where
-    T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum + ComplexField + SimdDistance + Pod,
+    T: AnnSearchFloat + Pod,
 {
     let ann_dist = parse_ann_dist(dist_metric).unwrap_or_default();
     if save_store {
@@ -2692,7 +2692,7 @@ pub fn query_ivf_index_rabitq<T>(
     verbose: bool,
 ) -> (Vec<Vec<usize>>, Option<Vec<Vec<T>>>)
 where
-    T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum + ComplexField + SimdDistance + Pod,
+    T: AnnSearchFloat + Pod,
 {
     if rerank {
         query_parallel(query_mat.nrows(), return_dist, verbose, |i| {
@@ -2732,7 +2732,7 @@ pub fn query_ivf_index_rabitq_self<T>(
     verbose: bool,
 ) -> (Vec<Vec<usize>>, Option<Vec<Vec<T>>>)
 where
-    T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum + ComplexField + SimdDistance + Pod,
+    T: AnnSearchFloat + Pod,
 {
     index.generate_knn(k, nprobe, rerank_factor, return_dist, verbose)
 }

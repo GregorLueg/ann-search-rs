@@ -11,9 +11,37 @@ use crate::gpu::tensor::*;
 use crate::gpu::*;
 use crate::utils::dist::Dist;
 
-/////////////////////////////////////
-// Exhaustive distance computation //
-/////////////////////////////////////
+/////////////
+// Helpers //
+/////////////
+
+/// Container for batch query/DB data passed to `query_batch_gpu`
+///
+/// ### Fields
+///
+/// * `data` - Flattened vector data (n * dim elements)
+/// * `norm` - Pre-computed L2 norms (n elements, empty if not cosine)
+/// * `n` - Number of vectors
+pub struct BatchData<'a, T> {
+    pub data: &'a [T],
+    pub norm: &'a [T],
+    pub n: usize,
+}
+
+impl<'a, T> BatchData<'a, T> {
+    /// Create a new BatchData instance
+    ///
+    /// ### Params
+    ///
+    /// * `data` -
+    pub fn new(data: &'a [T], norm: &'a [T], n: usize) -> Self {
+        Self { data, norm, n }
+    }
+}
+
+///////////////////////
+// Exhaustive search //
+///////////////////////
 
 /// Tiled squared Euclidean distance kernel with shared-memory query caching
 ///
@@ -183,6 +211,42 @@ pub fn cosine_tiled<F: Float>(
 // Top-k selection //
 /////////////////////
 
+/// Returns true if the runtime benefits from coalesced top-k extraction.
+/// Discrete GPUs (CUDA, Vulkan) have strict coalescing requirements.
+/// Unified memory architectures (Metal/Apple) are largely indifferent.
+///
+/// ### Returns
+///
+/// True if not metal
+#[allow(dead_code)]
+fn prefer_coalesced_topk<R: Runtime>(client: &ComputeClient<R>) -> bool {
+    let name = R::name(client).to_lowercase();
+    // Metal on Apple Silicon handles both patterns equally well.
+    // CUDA, Vulkan, and OpenCL benefit significantly from coalescing.
+    !name.contains("metal")
+}
+
+/// Initialise top-k buffers to sentinel values (`f32::MAX` / `0`)
+///
+/// ### Grid mapping
+///
+/// * `ABSOLUTE_POS_X` -> k slot index
+/// * `ABSOLUTE_POS_Y` -> query index
+#[cube(launch_unchecked)]
+pub fn init_topk<F: Float>(dists: &mut Tensor<F>, indices: &mut Tensor<u32>) {
+    let query_idx = ABSOLUTE_POS_Y as usize;
+    let k_idx = ABSOLUTE_POS_X as usize;
+    let k = dists.shape(1);
+
+    if query_idx >= dists.shape(0) || k_idx >= k {
+        terminate!();
+    }
+
+    let offset = query_idx * dists.stride(0) + k_idx;
+    dists[offset] = F::new(f32::MAX);
+    indices[offset] = 0u32;
+}
+
 /// Extract top-k smallest distances per query via insertion sort
 ///
 /// One thread per query, serial scan of the distance row. Writes directly
@@ -238,420 +302,153 @@ pub fn extract_topk<F: Float>(
     }
 }
 
-/// Initialise top-k buffers to sentinel values (`f32::MAX` / `0`)
+/// Coalesced top-k extraction. One workgroup per query, threads
+/// cooperate by striding through consecutive columns of the distance
+/// row. Memory accesses are coalesced: adjacent threads read adjacent
+/// elements.
+///
+/// Per-thread top-k kept in local Arrays (registers) during the scan,
+/// copied to shared memory only for the final merge.
 ///
 /// ### Grid mapping
 ///
-/// * `ABSOLUTE_POS_X` -> k slot index
-/// * `ABSOLUTE_POS_Y` -> query index
+/// * `CUBE_POS_X` -> query index
+/// * `UNIT_POS_X` -> thread within workgroup (32 threads)
 #[cube(launch_unchecked)]
-pub fn init_topk<F: Float>(dists: &mut Tensor<F>, indices: &mut Tensor<u32>) {
-    let query_idx = ABSOLUTE_POS_Y as usize;
-    let k_idx = ABSOLUTE_POS_X as usize;
-    let k = dists.shape(1);
-
-    if query_idx >= dists.shape(0) || k_idx >= k {
-        terminate!();
-    }
-
-    let offset = query_idx * dists.stride(0) + k_idx;
-    dists[offset] = F::new(f32::MAX);
-    indices[offset] = 0u32;
-}
-
-/////////////////////////////////
-// Fire-and-Forget IVF kernels //
-/////////////////////////////////
-
-/// Compute squared Euclidean distances on GPU
-///
-/// Each GPU thread computes the distance between one query vector and one
-/// database vector. Vectors are processed in LINE_SIZE chunks for vectorised
-/// memory access.
-///
-/// ### Params
-///
-/// * `query_vectors` - Query vectors [n_queries, dim / LINE_SIZE] as Line<F>
-/// * `db_chunk` - Database vectors [n_db, dim / LINE_SIZE] as Line<F>
-/// * `distances` - Output matrix [n_queries, n_db] of squared distances
-///
-/// ### Grid mapping
-///
-/// * `ABSOLUTE_POS_X` → database vector index
-/// * `ABSOLUTE_POS_Y` → query vector index
-#[cube(launch_unchecked)]
-pub fn euclidean_distances_gpu_chunk<F: Float>(
-    query_vectors: &Tensor<Line<F>>,
-    db_chunk: &Tensor<Line<F>>,
-    distances: &mut Tensor<F>,
-) {
-    let query_idx = ABSOLUTE_POS_Y as usize;
-    let db_idx = ABSOLUTE_POS_X as usize;
-
-    if query_idx < query_vectors.shape(0) && db_idx < db_chunk.shape(0) {
-        let dim_lines = query_vectors.shape(1);
-        let mut sum = F::new(0.0);
-        for i in 0..dim_lines {
-            let q_line = query_vectors[query_idx * query_vectors.stride(0) + i];
-            let d_line = db_chunk[db_idx * db_chunk.stride(0) + i];
-            let diff = q_line - d_line;
-            let sq = diff * diff;
-            sum += sq[0];
-            sum += sq[1];
-            sum += sq[2];
-            sum += sq[3];
-        }
-        distances[query_idx * distances.stride(0) + db_idx] = sum;
-    }
-}
-
-/// Compute cosine distances on GPU
-///
-/// Each GPU thread computes the cosine distance (1 - cosine similarity)
-/// between one query vector and one database vector. Requires pre-computed
-/// L2 norms for both query and database vectors.
-///
-/// ### Params
-///
-/// * `query_vectors` - Query vectors [n_queries, dim / LINE_SIZE] as Line<F>
-/// * `db_chunk` - Database vectors [n_db, dim / LINE_SIZE] as Line<F>
-/// * `query_norms` - Pre-computed L2 norms [n_queries]
-/// * `db_norms` - Pre-computed L2 norms [n_db]
-/// * `distances` - Output matrix [n_queries, n_db] of cosine distances
-///
-/// ### Grid mapping
-///
-/// * `ABSOLUTE_POS_X` → database vector index
-/// * `ABSOLUTE_POS_Y` → query vector index
-#[cube(launch_unchecked)]
-pub fn cosine_distances_gpu_chunk<F: Float>(
-    query_vectors: &Tensor<Line<F>>,
-    db_chunk: &Tensor<Line<F>>,
-    query_norms: &Tensor<F>,
-    db_norms: &Tensor<F>,
-    distances: &mut Tensor<F>,
-) {
-    let query_idx = ABSOLUTE_POS_Y as usize;
-    let db_idx = ABSOLUTE_POS_X as usize;
-
-    if query_idx < query_vectors.shape(0) && db_idx < db_chunk.shape(0) {
-        let dim_lines = query_vectors.shape(1);
-
-        let mut dot = F::new(0.0);
-
-        for i in 0..dim_lines {
-            let q_line = query_vectors[query_idx * query_vectors.stride(0) + i];
-            let d_line = db_chunk[db_idx * db_chunk.stride(0) + i];
-            let prod = q_line * d_line;
-
-            // Manual unroll for LINE_SIZE = 4
-            dot += prod[0];
-            dot += prod[1];
-            dot += prod[2];
-            dot += prod[3];
-        }
-
-        let q_norm = query_norms[query_idx];
-        let d_norm = db_norms[db_idx];
-
-        distances[query_idx * distances.stride(0) + db_idx] =
-            F::new(1.0) - (dot / (q_norm * d_norm));
-    }
-}
-
-/// Compute Euclidean distances for a single IVF cluster and write to a
-/// pre-allocated global candidate buffer at per-query offsets
-///
-/// ### Grid mapping
-///
-/// * `ABSOLUTE_POS_X` -> vector index within the cluster (0..db_count)
-/// * `ABSOLUTE_POS_Y` -> index within the active query list (0..n_active)
-#[cube(launch_unchecked)]
-pub fn compute_candidates_euclidean<F: Float>(
-    query_vectors: &Tensor<Line<F>>,
-    db_vectors: &Tensor<Line<F>>,
-    active_indices: &Tensor<u32>,
-    write_offsets: &Tensor<u32>,
+pub fn extract_topk_coalesced<F: Float>(
+    distances: &Tensor<F>,
     out_dists: &mut Tensor<F>,
     out_indices: &mut Tensor<u32>,
-    db_start: u32,
-    db_count: u32,
+    chunk_offset: u32,
+    actual_chunk_size: u32,
+    dist_stride: u32,
+    k_param: u32,
+    #[comptime] k: usize,
 ) {
-    let local_db_idx = ABSOLUTE_POS_X;
-    let active_q_idx = ABSOLUTE_POS_Y;
+    let query_idx = CUBE_POS_X as usize;
+    let tx = UNIT_POS_X as usize;
+    let wg = WORKGROUP_SIZE_X as usize;
+    let kr = k_param as usize;
 
-    if active_q_idx >= active_indices.len() as u32 || local_db_idx >= db_count {
+    if query_idx >= out_dists.shape(0) {
         terminate!();
     }
 
-    let real_q_idx = active_indices[active_q_idx as usize];
-    let write_pos = write_offsets[active_q_idx as usize] + local_db_idx;
-    let db_idx = db_start + local_db_idx;
-
-    let dim_lines = query_vectors.shape(1);
-    let mut sum = F::new(0.0);
-
-    let q_offset = real_q_idx as usize * query_vectors.stride(0);
-    let d_offset = db_idx as usize * db_vectors.stride(0);
-
-    for i in 0..dim_lines {
-        let q_line = query_vectors[q_offset + i];
-        let d_line = db_vectors[d_offset + i];
-        let diff = q_line - d_line;
-        let sq = diff * diff;
-
-        sum += sq[0];
-        sum += sq[1];
-        sum += sq[2];
-        sum += sq[3];
+    // Per-thread top-k in registers
+    let mut local_dists = Array::<F>::new(k);
+    let mut local_indices = Array::<u32>::new(k);
+    for i in 0..k {
+        local_dists[i] = F::new(f32::MAX);
+        local_indices[i] = 0u32;
     }
 
-    let out_offset = real_q_idx as usize * out_dists.stride(0) + write_pos as usize;
-    out_dists[out_offset] = sum;
-    out_indices[out_offset] = db_idx;
-}
+    // Coalesced strided scan: adjacent threads read adjacent columns
+    let dist_base = query_idx * dist_stride as usize;
+    let mut col = tx as u32;
+    while col < actual_chunk_size {
+        let dist = distances[dist_base + col as usize];
 
-/// Compute cosine distances for a single IVF cluster and write to a
-/// pre-allocated global candidate buffer at per-query offsets
-///
-/// ### Grid mapping
-///
-/// * `ABSOLUTE_POS_X` -> vector index within the cluster (0..db_count)
-/// * `ABSOLUTE_POS_Y` -> index within the active query list (0..n_active)
-#[cube(launch_unchecked)]
-pub fn compute_candidates_cosine<F: Float>(
-    query_vectors: &Tensor<Line<F>>,
-    db_vectors: &Tensor<Line<F>>,
-    query_norms: &Tensor<F>,
-    db_norms: &Tensor<F>,
-    active_indices: &Tensor<u32>,
-    write_offsets: &Tensor<u32>,
-    out_dists: &mut Tensor<F>,
-    out_indices: &mut Tensor<u32>,
-    db_start: u32,
-    db_count: u32,
-) {
-    let local_db_idx = ABSOLUTE_POS_X;
-    let active_q_idx = ABSOLUTE_POS_Y;
-
-    if active_q_idx >= active_indices.len() as u32 || local_db_idx >= db_count {
-        terminate!();
-    }
-
-    let real_q_idx = active_indices[active_q_idx as usize];
-    let write_pos = write_offsets[active_q_idx as usize] + local_db_idx;
-    let db_idx = db_start + local_db_idx;
-
-    let dim_lines = query_vectors.shape(1);
-    let mut dot = F::new(0.0);
-
-    let q_offset = real_q_idx as usize * query_vectors.stride(0);
-    let d_offset = db_idx as usize * db_vectors.stride(0);
-
-    for i in 0..dim_lines {
-        let q_line = query_vectors[q_offset + i];
-        let d_line = db_vectors[d_offset + i];
-        let prod = q_line * d_line;
-
-        dot += prod[0];
-        dot += prod[1];
-        dot += prod[2];
-        dot += prod[3];
-    }
-
-    let q_norm = query_norms[real_q_idx as usize];
-    let d_norm = db_norms[db_idx as usize];
-
-    let out_offset = real_q_idx as usize * out_dists.stride(0) + write_pos as usize;
-    out_dists[out_offset] = F::new(1.0) - (dot / (q_norm * d_norm));
-    out_indices[out_offset] = db_idx;
-}
-
-//////////////////////////////
-// IVF mega kernel variants //
-//////////////////////////////
-
-/// Compute Euclidean distances using a flattened IVF task list
-#[cube(launch_unchecked)]
-pub fn compute_ivf_mega_euclidean<F: Float>(
-    query_vectors: &Tensor<Line<F>>,
-    db_vectors: &Tensor<Line<F>>,
-    task_q_idx: &Tensor<u32>,
-    task_db_start: &Tensor<u32>,
-    task_write_offset: &Tensor<u32>,
-    task_db_count: &Tensor<u32>,
-    out_dists: &mut Tensor<F>,
-    out_indices: &mut Tensor<u32>,
-) {
-    let local_db_idx = ABSOLUTE_POS_X;
-    let task_idx = ABSOLUTE_POS_Y;
-
-    if task_idx >= task_q_idx.len() as u32 {
-        terminate!();
-    }
-
-    let db_count = task_db_count[task_idx as usize];
-    if local_db_idx >= db_count {
-        terminate!();
-    }
-
-    let q_idx = task_q_idx[task_idx as usize];
-    let db_start = task_db_start[task_idx as usize];
-    let write_offset = task_write_offset[task_idx as usize];
-
-    let real_db_idx = db_start + local_db_idx;
-    let write_pos = write_offset + local_db_idx;
-
-    let dim_lines = query_vectors.shape(1);
-    let mut sum = F::new(0.0);
-
-    let q_offset = q_idx as usize * query_vectors.stride(0);
-    let d_offset = real_db_idx as usize * db_vectors.stride(0);
-
-    for i in 0..dim_lines {
-        let q_line = query_vectors[q_offset + i];
-        let d_line = db_vectors[d_offset + i];
-        let diff = q_line - d_line;
-        let sq = diff * diff;
-
-        sum += sq[0];
-        sum += sq[1];
-        sum += sq[2];
-        sum += sq[3];
-    }
-
-    let out_offset = q_idx as usize * out_dists.stride(0) + write_pos as usize;
-    out_dists[out_offset] = sum;
-    out_indices[out_offset] = real_db_idx;
-}
-
-/// Compute cosine distances using a flattened IVF task list
-#[cube(launch_unchecked)]
-pub fn compute_ivf_mega_cosine<F: Float>(
-    query_vectors: &Tensor<Line<F>>,
-    db_vectors: &Tensor<Line<F>>,
-    query_norms: &Tensor<F>,
-    db_norms: &Tensor<F>,
-    task_q_idx: &Tensor<u32>,
-    task_db_start: &Tensor<u32>,
-    task_write_offset: &Tensor<u32>,
-    task_db_count: &Tensor<u32>,
-    out_dists: &mut Tensor<F>,
-    out_indices: &mut Tensor<u32>,
-) {
-    let local_db_idx = ABSOLUTE_POS_X;
-    let task_idx = ABSOLUTE_POS_Y;
-
-    if task_idx >= task_q_idx.len() as u32 {
-        terminate!();
-    }
-
-    let db_count = task_db_count[task_idx as usize];
-    if local_db_idx >= db_count {
-        terminate!();
-    }
-
-    let q_idx = task_q_idx[task_idx as usize];
-    let db_start = task_db_start[task_idx as usize];
-    let write_offset = task_write_offset[task_idx as usize];
-
-    let real_db_idx = db_start + local_db_idx;
-    let write_pos = write_offset + local_db_idx;
-
-    let dim_lines = query_vectors.shape(1);
-    let mut dot = F::new(0.0);
-
-    let q_offset = q_idx as usize * query_vectors.stride(0);
-    let d_offset = real_db_idx as usize * db_vectors.stride(0);
-
-    for i in 0..dim_lines {
-        let q_line = query_vectors[q_offset + i];
-        let d_line = db_vectors[d_offset + i];
-        let prod = q_line * d_line;
-
-        dot += prod[0];
-        dot += prod[1];
-        dot += prod[2];
-        dot += prod[3];
-    }
-
-    let q_norm = query_norms[q_idx as usize];
-    let d_norm = db_norms[real_db_idx as usize];
-
-    let out_offset = q_idx as usize * out_dists.stride(0) + write_pos as usize;
-    out_dists[out_offset] = F::new(1.0) - (dot / (q_norm * d_norm));
-    out_indices[out_offset] = real_db_idx;
-}
-
-/// In-place top-k reduction for the IVF variable-length candidate buffer
-#[cube(launch_unchecked)]
-pub fn reduce_ivf_topk<F: Float>(
-    candidate_dists: &Tensor<F>,
-    candidate_indices: &Tensor<u32>,
-    candidates_per_query: &Tensor<u32>,
-    out_dists: &mut Tensor<F>,
-    out_indices: &mut Tensor<u32>,
-) {
-    let q_idx = ABSOLUTE_POS_X as usize;
-
-    if q_idx >= candidate_dists.shape(0) {
-        terminate!();
-    }
-
-    let k = out_dists.shape(1);
-    let count = candidates_per_query[q_idx];
-
-    let in_offset = q_idx * candidate_dists.stride(0);
-    let out_offset = q_idx * out_dists.stride(0);
-
-    for i in 0..count {
-        let dist = candidate_dists[in_offset + i as usize];
-        let idx = candidate_indices[in_offset + i as usize];
-
-        if dist < out_dists[out_offset + k - 1] {
-            let mut insert_pos: usize = k - 1;
+        if dist < local_dists[kr - 1] {
+            let mut pos = kr - 1;
             for j in 0..k {
-                if dist < out_dists[out_offset + j] && insert_pos == k - 1 {
-                    insert_pos = j;
+                if dist < local_dists[j] && pos == kr - 1 {
+                    pos = j;
                 }
             }
 
-            for j in 0..k - 1 {
-                let src = k - 2 - j;
-                let dst = k - 1 - j;
-                if src >= insert_pos {
-                    out_dists[out_offset + dst] = out_dists[out_offset + src];
-                    out_indices[out_offset + dst] = out_indices[out_offset + src];
-                }
+            let mut s = kr - 1;
+            while s > pos {
+                local_dists[s] = local_dists[s - 1];
+                local_indices[s] = local_indices[s - 1];
+                s -= 1usize;
             }
 
-            out_dists[out_offset + insert_pos] = dist;
-            out_indices[out_offset + insert_pos] = idx;
+            local_dists[pos] = dist;
+            local_indices[pos] = chunk_offset + col;
         }
+
+        col += wg as u32;
     }
-}
 
-////////////////////
-// Main functions //
-////////////////////
+    // ── Merge phase: copy to shared memory, thread 0 merges ──
+    let mut s_dist = SharedMemory::<F>::new(32 * k);
+    let mut s_idx = SharedMemory::<u32>::new(32 * k);
 
-/// Container for batch query/DB data passed to `query_batch_gpu`
-///
-/// ### Fields
-///
-/// * `data` - Flattened vector data (n * dim elements)
-/// * `norm` - Pre-computed L2 norms (n elements, empty if not cosine)
-/// * `n` - Number of vectors
-pub struct BatchData<'a, T> {
-    pub data: &'a [T],
-    pub norm: &'a [T],
-    pub n: usize,
-}
+    let s_base = tx * kr;
+    for i in 0..k {
+        s_dist[s_base + i] = local_dists[i];
+        s_idx[s_base + i] = local_indices[i];
+    }
 
-impl<'a, T> BatchData<'a, T> {
-    /// Create a new BatchData instance
-    pub fn new(data: &'a [T], norm: &'a [T], n: usize) -> Self {
-        Self { data, norm, n }
+    sync_cube();
+
+    if tx == 0usize {
+        // Merge threads 1..31 into thread 0's list
+        let mut t = 1usize;
+        while t < wg {
+            let t_base = t * kr;
+            let mut done: u32 = 0u32;
+            for i in 0..k {
+                if done == 0u32 {
+                    let cd = s_dist[t_base + i];
+                    let ci = s_idx[t_base + i];
+
+                    if cd >= s_dist[kr - 1] {
+                        done = 1u32;
+                    } else {
+                        let mut pos = kr - 1;
+                        for j in 0..k {
+                            if cd < s_dist[j] && pos == kr - 1 {
+                                pos = j;
+                            }
+                        }
+
+                        let mut s_i = kr - 1;
+                        while s_i > pos {
+                            s_dist[s_i] = s_dist[s_i - 1];
+                            s_idx[s_i] = s_idx[s_i - 1];
+                            s_i -= 1usize;
+                        }
+
+                        s_dist[pos] = cd;
+                        s_idx[pos] = ci;
+                    }
+                }
+            }
+            t += 1usize;
+        }
+
+        // Merge with running top-k from previous chunks
+        let out_base = query_idx * kr;
+        for i in 0..k {
+            let running_dist = out_dists[out_base + i];
+            let running_idx = out_indices[out_base + i];
+
+            if running_dist < s_dist[kr - 1] {
+                let mut pos = kr - 1;
+                for j in 0..k {
+                    if running_dist < s_dist[j] && pos == kr - 1 {
+                        pos = j;
+                    }
+                }
+
+                let mut s_i = kr - 1;
+                while s_i > pos {
+                    s_dist[s_i] = s_dist[s_i - 1];
+                    s_idx[s_i] = s_idx[s_i - 1];
+                    s_i -= 1usize;
+                }
+
+                s_dist[pos] = running_dist;
+                s_idx[pos] = running_idx;
+            }
+        }
+
+        // Write final result
+        for i in 0..k {
+            out_dists[out_base + i] = s_dist[i];
+            out_indices[out_base + i] = s_idx[i];
+        }
     }
 }
 
@@ -847,6 +644,382 @@ where
 
     (all_indices, all_distances)
 }
+
+/////////////////////////////////
+// Fire-and-Forget IVF kernels //
+/////////////////////////////////
+
+/// Compute squared Euclidean distances on GPU
+///
+/// Each GPU thread computes the distance between one query vector and one
+/// database vector. Vectors are processed in LINE_SIZE chunks for vectorised
+/// memory access.
+///
+/// ### Params
+///
+/// * `query_vectors` - Query vectors [n_queries, dim / LINE_SIZE] as Line<F>
+/// * `db_chunk` - Database vectors [n_db, dim / LINE_SIZE] as Line<F>
+/// * `distances` - Output matrix [n_queries, n_db] of squared distances
+///
+/// ### Grid mapping
+///
+/// * `ABSOLUTE_POS_X` → database vector index
+/// * `ABSOLUTE_POS_Y` → query vector index
+#[cube(launch_unchecked)]
+pub fn euclidean_distances_gpu_chunk<F: Float>(
+    query_vectors: &Tensor<Line<F>>,
+    db_chunk: &Tensor<Line<F>>,
+    distances: &mut Tensor<F>,
+) {
+    let query_idx = ABSOLUTE_POS_Y as usize;
+    let db_idx = ABSOLUTE_POS_X as usize;
+
+    if query_idx < query_vectors.shape(0) && db_idx < db_chunk.shape(0) {
+        let dim_lines = query_vectors.shape(1);
+        let mut sum = F::new(0.0);
+        for i in 0..dim_lines {
+            let q_line = query_vectors[query_idx * query_vectors.stride(0) + i];
+            let d_line = db_chunk[db_idx * db_chunk.stride(0) + i];
+            let diff = q_line - d_line;
+            let sq = diff * diff;
+            sum += sq[0];
+            sum += sq[1];
+            sum += sq[2];
+            sum += sq[3];
+        }
+        distances[query_idx * distances.stride(0) + db_idx] = sum;
+    }
+}
+
+/// Compute cosine distances on GPU
+///
+/// Each GPU thread computes the cosine distance (1 - cosine similarity)
+/// between one query vector and one database vector. Requires pre-computed
+/// L2 norms for both query and database vectors.
+///
+/// ### Params
+///
+/// * `query_vectors` - Query vectors [n_queries, dim / LINE_SIZE] as Line<F>
+/// * `db_chunk` - Database vectors [n_db, dim / LINE_SIZE] as Line<F>
+/// * `query_norms` - Pre-computed L2 norms [n_queries]
+/// * `db_norms` - Pre-computed L2 norms [n_db]
+/// * `distances` - Output matrix [n_queries, n_db] of cosine distances
+///
+/// ### Grid mapping
+///
+/// * `ABSOLUTE_POS_X` → database vector index
+/// * `ABSOLUTE_POS_Y` → query vector index
+#[cube(launch_unchecked)]
+pub fn cosine_distances_gpu_chunk<F: Float>(
+    query_vectors: &Tensor<Line<F>>,
+    db_chunk: &Tensor<Line<F>>,
+    query_norms: &Tensor<F>,
+    db_norms: &Tensor<F>,
+    distances: &mut Tensor<F>,
+) {
+    let query_idx = ABSOLUTE_POS_Y as usize;
+    let db_idx = ABSOLUTE_POS_X as usize;
+
+    if query_idx < query_vectors.shape(0) && db_idx < db_chunk.shape(0) {
+        let dim_lines = query_vectors.shape(1);
+
+        let mut dot = F::new(0.0);
+
+        for i in 0..dim_lines {
+            let q_line = query_vectors[query_idx * query_vectors.stride(0) + i];
+            let d_line = db_chunk[db_idx * db_chunk.stride(0) + i];
+            let prod = q_line * d_line;
+
+            // Manual unroll for LINE_SIZE = 4
+            dot += prod[0];
+            dot += prod[1];
+            dot += prod[2];
+            dot += prod[3];
+        }
+
+        let q_norm = query_norms[query_idx];
+        let d_norm = db_norms[db_idx];
+
+        distances[query_idx * distances.stride(0) + db_idx] =
+            F::new(1.0) - (dot / (q_norm * d_norm));
+    }
+}
+
+/// Compute Euclidean distances for a single IVF cluster and write to a
+/// pre-allocated global candidate buffer at per-query offsets
+///
+/// ### Grid mapping
+///
+/// * `ABSOLUTE_POS_X` -> vector index within the cluster (0..db_count)
+/// * `ABSOLUTE_POS_Y` -> index within the active query list (0..n_active)
+#[cube(launch_unchecked)]
+pub fn compute_candidates_euclidean<F: Float>(
+    query_vectors: &Tensor<Line<F>>,
+    db_vectors: &Tensor<Line<F>>,
+    active_indices: &Tensor<u32>,
+    write_offsets: &Tensor<u32>,
+    out_dists: &mut Tensor<F>,
+    out_indices: &mut Tensor<u32>,
+    db_start: u32,
+    db_count: u32,
+) {
+    let local_db_idx = ABSOLUTE_POS_X;
+    let active_q_idx = ABSOLUTE_POS_Y;
+
+    if active_q_idx >= active_indices.len() as u32 || local_db_idx >= db_count {
+        terminate!();
+    }
+
+    let real_q_idx = active_indices[active_q_idx as usize];
+    let write_pos = write_offsets[active_q_idx as usize] + local_db_idx;
+    let db_idx = db_start + local_db_idx;
+
+    let mut sum = F::new(0.0);
+
+    let dim_lines = query_vectors.shape(1) / LINE_SIZE as usize;
+    let q_offset = real_q_idx as usize * dim_lines;
+    let d_offset = db_idx as usize * dim_lines;
+
+    for i in 0..dim_lines {
+        let q_line = query_vectors[q_offset + i];
+        let d_line = db_vectors[d_offset + i];
+        let diff = q_line - d_line;
+        let sq = diff * diff;
+
+        sum += sq[0];
+        sum += sq[1];
+        sum += sq[2];
+        sum += sq[3];
+    }
+
+    let out_offset = real_q_idx as usize * out_dists.stride(0) + write_pos as usize;
+    out_dists[out_offset] = sum;
+    out_indices[out_offset] = db_idx;
+}
+
+/// Compute cosine distances for a single IVF cluster and write to a
+/// pre-allocated global candidate buffer at per-query offsets
+///
+/// ### Grid mapping
+///
+/// * `ABSOLUTE_POS_X` -> vector index within the cluster (0..db_count)
+/// * `ABSOLUTE_POS_Y` -> index within the active query list (0..n_active)
+#[cube(launch_unchecked)]
+pub fn compute_candidates_cosine<F: Float>(
+    query_vectors: &Tensor<Line<F>>,
+    db_vectors: &Tensor<Line<F>>,
+    query_norms: &Tensor<F>,
+    db_norms: &Tensor<F>,
+    active_indices: &Tensor<u32>,
+    write_offsets: &Tensor<u32>,
+    out_dists: &mut Tensor<F>,
+    out_indices: &mut Tensor<u32>,
+    db_start: u32,
+    db_count: u32,
+) {
+    let local_db_idx = ABSOLUTE_POS_X;
+    let active_q_idx = ABSOLUTE_POS_Y;
+
+    if active_q_idx >= active_indices.len() as u32 || local_db_idx >= db_count {
+        terminate!();
+    }
+
+    let real_q_idx = active_indices[active_q_idx as usize];
+    let write_pos = write_offsets[active_q_idx as usize] + local_db_idx;
+    let db_idx = db_start + local_db_idx;
+
+    let dim_lines = query_vectors.shape(1) / LINE_SIZE as usize;
+    let mut dot = F::new(0.0);
+
+    let q_offset = real_q_idx as usize * dim_lines;
+    let d_offset = db_idx as usize * dim_lines;
+
+    for i in 0..dim_lines {
+        let q_line = query_vectors[q_offset + i];
+        let d_line = db_vectors[d_offset + i];
+        let prod = q_line * d_line;
+
+        dot += prod[0];
+        dot += prod[1];
+        dot += prod[2];
+        dot += prod[3];
+    }
+
+    let q_norm = query_norms[real_q_idx as usize];
+    let d_norm = db_norms[db_idx as usize];
+
+    let out_offset = real_q_idx as usize * out_dists.stride(0) + write_pos as usize;
+    out_dists[out_offset] = F::new(1.0) - (dot / (q_norm * d_norm));
+    out_indices[out_offset] = db_idx;
+}
+
+//////////////////////////////
+// IVF mega kernel variants //
+//////////////////////////////
+
+/// Compute Euclidean distances using a flattened IVF task list
+#[cube(launch_unchecked)]
+pub fn compute_ivf_mega_euclidean<F: Float>(
+    query_vectors: &Tensor<Line<F>>,
+    db_vectors: &Tensor<Line<F>>,
+    task_q_idx: &Tensor<u32>,
+    task_db_start: &Tensor<u32>,
+    task_write_offset: &Tensor<u32>,
+    task_db_count: &Tensor<u32>,
+    out_dists: &mut Tensor<F>,
+    out_indices: &mut Tensor<u32>,
+) {
+    let local_db_idx = ABSOLUTE_POS_X;
+    let task_idx = ABSOLUTE_POS_Y;
+
+    if task_idx >= task_q_idx.len() as u32 {
+        terminate!();
+    }
+
+    let db_count = task_db_count[task_idx as usize];
+    if local_db_idx >= db_count {
+        terminate!();
+    }
+
+    let q_idx = task_q_idx[task_idx as usize];
+    let db_start = task_db_start[task_idx as usize];
+    let write_offset = task_write_offset[task_idx as usize];
+
+    let real_db_idx = db_start + local_db_idx;
+    let write_pos = write_offset + local_db_idx;
+
+    let mut sum = F::new(0.0);
+
+    let dim_lines = query_vectors.shape(1) / LINE_SIZE as usize;
+    let q_offset = q_idx as usize * dim_lines;
+    let d_offset = real_db_idx as usize * dim_lines;
+
+    for i in 0..dim_lines {
+        let q_line = query_vectors[q_offset + i];
+        let d_line = db_vectors[d_offset + i];
+        let diff = q_line - d_line;
+        let sq = diff * diff;
+
+        sum += sq[0];
+        sum += sq[1];
+        sum += sq[2];
+        sum += sq[3];
+    }
+
+    let out_offset = q_idx as usize * out_dists.stride(0) + write_pos as usize;
+    out_dists[out_offset] = sum;
+    out_indices[out_offset] = real_db_idx;
+}
+
+/// Compute cosine distances using a flattened IVF task list
+#[cube(launch_unchecked)]
+pub fn compute_ivf_mega_cosine<F: Float>(
+    query_vectors: &Tensor<Line<F>>,
+    db_vectors: &Tensor<Line<F>>,
+    query_norms: &Tensor<F>,
+    db_norms: &Tensor<F>,
+    task_q_idx: &Tensor<u32>,
+    task_db_start: &Tensor<u32>,
+    task_write_offset: &Tensor<u32>,
+    task_db_count: &Tensor<u32>,
+    out_dists: &mut Tensor<F>,
+    out_indices: &mut Tensor<u32>,
+) {
+    let local_db_idx = ABSOLUTE_POS_X;
+    let task_idx = ABSOLUTE_POS_Y;
+
+    if task_idx >= task_q_idx.len() as u32 {
+        terminate!();
+    }
+
+    let db_count = task_db_count[task_idx as usize];
+    if local_db_idx >= db_count {
+        terminate!();
+    }
+
+    let q_idx = task_q_idx[task_idx as usize];
+    let db_start = task_db_start[task_idx as usize];
+    let write_offset = task_write_offset[task_idx as usize];
+
+    let real_db_idx = db_start + local_db_idx;
+    let write_pos = write_offset + local_db_idx;
+
+    let mut dot = F::new(0.0);
+
+    let dim_lines = query_vectors.shape(1) / LINE_SIZE as usize;
+    let q_offset = q_idx as usize * dim_lines;
+    let d_offset = real_db_idx as usize * dim_lines;
+
+    for i in 0..dim_lines {
+        let q_line = query_vectors[q_offset + i];
+        let d_line = db_vectors[d_offset + i];
+        let prod = q_line * d_line;
+
+        dot += prod[0];
+        dot += prod[1];
+        dot += prod[2];
+        dot += prod[3];
+    }
+
+    let q_norm = query_norms[q_idx as usize];
+    let d_norm = db_norms[real_db_idx as usize];
+
+    let out_offset = q_idx as usize * out_dists.stride(0) + write_pos as usize;
+    out_dists[out_offset] = F::new(1.0) - (dot / (q_norm * d_norm));
+    out_indices[out_offset] = real_db_idx;
+}
+
+/// In-place top-k reduction for the IVF variable-length candidate buffer
+#[cube(launch_unchecked)]
+pub fn reduce_ivf_topk<F: Float>(
+    candidate_dists: &Tensor<F>,
+    candidate_indices: &Tensor<u32>,
+    candidates_per_query: &Tensor<u32>,
+    out_dists: &mut Tensor<F>,
+    out_indices: &mut Tensor<u32>,
+) {
+    let q_idx = ABSOLUTE_POS_X as usize;
+
+    if q_idx >= candidate_dists.shape(0) {
+        terminate!();
+    }
+
+    let k = out_dists.shape(1);
+    let count = candidates_per_query[q_idx];
+
+    let in_offset = q_idx * candidate_dists.stride(0);
+    let out_offset = q_idx * out_dists.stride(0);
+
+    for i in 0..count {
+        let dist = candidate_dists[in_offset + i as usize];
+        let idx = candidate_indices[in_offset + i as usize];
+
+        if dist < out_dists[out_offset + k - 1] {
+            let mut insert_pos: usize = k - 1;
+            for j in 0..k {
+                if dist < out_dists[out_offset + j] && insert_pos == k - 1 {
+                    insert_pos = j;
+                }
+            }
+
+            for j in 0..k - 1 {
+                let src = k - 2 - j;
+                let dst = k - 1 - j;
+                if src >= insert_pos {
+                    out_dists[out_offset + dst] = out_dists[out_offset + src];
+                    out_indices[out_offset + dst] = out_indices[out_offset + src];
+                }
+            }
+
+            out_dists[out_offset + insert_pos] = dist;
+            out_indices[out_offset + insert_pos] = idx;
+        }
+    }
+}
+
+////////////////////
+// Main functions //
+////////////////////
 
 ///////////
 // Tests //

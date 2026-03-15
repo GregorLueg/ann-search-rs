@@ -1218,9 +1218,9 @@ macro_rules! impl_nndescent_gpu_query {
 impl_nndescent_gpu_query!(f32, QUERY_CANDIDATES_F32, QUERY_RESULTS_F32);
 impl_nndescent_gpu_query!(f64, QUERY_CANDIDATES_F64, QUERY_RESULTS_F64);
 
-////////////////
+//////////////////
 // NNDescentGpu //
-////////////////
+//////////////////
 
 /// GPU-accelerated NNDescent kNN graph builder with CAGRA graph optimisation.
 ///
@@ -1379,6 +1379,11 @@ where
         }
         let forest = AnnoyIndex::new(data, n_trees_entry, metric, seed);
 
+        // ---- 1a: Random graph initialisation (baseline for NNDescent) ----
+        if verbose {
+            println!("  Random graph initialisation...");
+        }
+
         // ---- 1: GPU forest graph initialisation ----
 
         let n_trees_forest = n_trees.unwrap_or_else(|| {
@@ -1421,10 +1426,28 @@ where
 
         let grid_n = (n as u32).div_ceil(WORKGROUP_SIZE_X);
 
+        // ---- 1a: Random graph initialisation (baseline for NNDescent) ----
         if verbose {
-            println!("  Running GPU forest init ({} trees)...", n_trees_forest);
+            println!("  Random graph initialisation...");
         }
 
+        unsafe {
+            let _ = init_random_graph::launch_unchecked::<T, R>(
+                &client,
+                CubeCount::Static(grid_n, 1, 1),
+                CubeDim::new_2d(WORKGROUP_SIZE_X, 1),
+                vectors_gpu.clone().into_tensor_arg(line),
+                norms_gpu.clone().into_tensor_arg(1),
+                graph_idx_gpu.clone().into_tensor_arg(1),
+                graph_dist_gpu.clone().into_tensor_arg(1),
+                ScalarArg { elem: n as u32 },
+                ScalarArg { elem: seed as u32 },
+                use_cosine,
+                dim_vec,
+            );
+        }
+
+        // ---- 1b: GPU forest graph initialisation ----
         gpu_forest_init(
             &vectors_gpu,
             &norms_gpu,
@@ -1444,6 +1467,25 @@ where
             verbose,
             &client,
         );
+
+        // ---- 1c: Mark all graph entries as new for NNDescent ----
+        // Forest merge clears IS_NEW flags, so NNDescent would skip
+        // all pairs in its first iteration without this.
+        let total_entries = (n * build_k) as u32;
+        let mark_grid_flat = total_entries.div_ceil(WORKGROUP_SIZE_X);
+        let mark_cubes_x = mark_grid_flat.min(65535);
+        let mark_cubes_y = mark_grid_flat.div_ceil(mark_cubes_x);
+        unsafe {
+            let _ = mark_all_new::launch_unchecked::<R>(
+                &client,
+                CubeCount::Static(mark_cubes_x, mark_cubes_y, 1),
+                CubeDim::new_2d(WORKGROUP_SIZE_X, 1),
+                graph_idx_gpu.clone().into_tensor_arg(1),
+                ScalarArg {
+                    elem: total_entries,
+                },
+            );
+        }
 
         // ---- 2: NNDescent iterations on the GPU ----
 
@@ -1869,7 +1911,8 @@ where
             "queries_flat length must be n_queries * dim"
         );
 
-        let query_params = query_params.unwrap_or_default();
+        let query_params =
+            query_params.unwrap_or_else(|| CagraGpuSearchParams::from_graph(k, self.k));
         let n_entry = query_params.get_n_entry();
 
         self.ensure_gpu_tensors();
@@ -2020,7 +2063,8 @@ where
     {
         self.ensure_gpu_tensors();
 
-        let query_params = query_params.unwrap_or_default();
+        let query_params =
+            query_params.unwrap_or_else(|| CagraGpuSearchParams::from_graph(k, self.k));
         let n_entry = query_params.get_n_entry();
 
         let client = R::client(&self._device);

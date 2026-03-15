@@ -46,6 +46,8 @@ pub struct IvfIndexGpu<T: AnnSearchFloat + AnnSearchGpuFloat, R: Runtime> {
     vectors_gpu: GpuTensor<R, T>,
     /// All norms reorganised by cluster, resident on GPU (Cosine only)
     norms_gpu: Option<GpuTensor<R, T>>,
+    /// CPU variants for reorganisation
+    vectors_cpu: Vec<T>,
     /// Maps reorganised position -> original index
     original_indices: Vec<usize>,
     /// CSR offsets
@@ -100,7 +102,6 @@ where
             LINE_SIZE
         );
 
-        let dim_vectorized = dim / LINE_SIZE as usize;
         let max_iters = max_iters.unwrap_or(30);
         let nlist = nlist.unwrap_or((n as f32).sqrt() as usize).max(1);
 
@@ -170,9 +171,10 @@ where
 
         let client = R::client(&device);
 
+        let vectors_cpu = vectors_by_cluster.clone();
+
         // Upload all vectors to GPU (the key optimisation)
-        let vectors_gpu =
-            GpuTensor::<R, T>::from_slice(&vectors_by_cluster, vec![n, dim_vectorized], &client);
+        let vectors_gpu = GpuTensor::<R, T>::from_slice(&vectors_by_cluster, vec![n, dim], &client);
 
         let norms_gpu = if metric == Dist::Cosine {
             Some(GpuTensor::<R, T>::from_slice(
@@ -184,8 +186,7 @@ where
             None
         };
 
-        let centroids_gpu =
-            GpuTensor::<R, T>::from_slice(&centroids, vec![nlist, dim_vectorized], &client);
+        let centroids_gpu = GpuTensor::<R, T>::from_slice(&centroids, vec![nlist, dim], &client);
 
         let centroid_norms_gpu = if metric == Dist::Cosine {
             Some(GpuTensor::<R, T>::from_slice(
@@ -204,6 +205,7 @@ where
         Self {
             vectors_gpu,
             norms_gpu,
+            vectors_cpu,
             original_indices,
             cluster_offsets,
             centroids_gpu,
@@ -387,11 +389,11 @@ where
         if verbose {
             println!("  Reading vectors from GPU for self-query...");
         }
-        let vectors_by_cluster = self.vectors_gpu.clone().read(&client);
+        let vectors_by_cluster = &self.vectors_cpu;
 
         // 4. Run batched query
         let (indices_reorg, dist_reorg) = self.query_internal(
-            &vectors_by_cluster,
+            vectors_by_cluster,
             self.n,
             self.dim,
             k,
@@ -474,8 +476,8 @@ where
         verbose: bool,
         client: &ComputeClient<R>,
     ) -> (Vec<Vec<usize>>, Vec<Vec<T>>) {
-        let dim_vectorized = self.dim / LINE_SIZE as usize;
         let vec_size = LINE_SIZE as usize;
+        let dim_lines = self.dim / vec_size;
 
         let query_norms = if self.metric == Dist::Cosine {
             (0..n_queries)
@@ -490,7 +492,7 @@ where
         };
 
         let queries_gpu =
-            GpuTensor::<R, T>::from_slice(queries_flat, vec![n_queries, dim_vectorized], client);
+            GpuTensor::<R, T>::from_slice(queries_flat, vec![n_queries, self.dim], client);
 
         let query_norms_gpu = if self.metric == Dist::Cosine {
             Some(GpuTensor::<R, T>::from_slice(
@@ -502,23 +504,36 @@ where
             None
         };
 
+        // ── Step 1: Centroid distances using tiled kernels ──
+
         let centroid_dists_gpu = GpuTensor::<R, T>::empty(vec![n_queries, self.nlist], client);
         let grid_x = (self.nlist as u32).div_ceil(WORKGROUP_SIZE_X);
         let grid_y = (n_queries as u32).div_ceil(WORKGROUP_SIZE_Y);
 
         match self.metric {
             Dist::Euclidean => unsafe {
-                let _ = euclidean_distances_gpu_chunk::launch_unchecked::<T, R>(
+                let _ = euclidean_tiled::launch_unchecked::<T, R>(
                     client,
                     CubeCount::Static(grid_x, grid_y, 1),
                     CubeDim::new_2d(WORKGROUP_SIZE_X, WORKGROUP_SIZE_Y),
                     queries_gpu.clone().into_tensor_arg(vec_size),
                     self.centroids_gpu.clone().into_tensor_arg(vec_size),
                     centroid_dists_gpu.into_tensor_arg(1),
+                    ScalarArg { elem: 0u32 },
+                    ScalarArg {
+                        elem: self.nlist as u32,
+                    },
+                    ScalarArg {
+                        elem: n_queries as u32,
+                    },
+                    ScalarArg {
+                        elem: self.nlist as u32,
+                    },
+                    dim_lines,
                 );
             },
             Dist::Cosine => unsafe {
-                let _ = cosine_distances_gpu_chunk::launch_unchecked::<T, R>(
+                let _ = cosine_tiled::launch_unchecked::<T, R>(
                     client,
                     CubeCount::Static(grid_x, grid_y, 1),
                     CubeDim::new_2d(WORKGROUP_SIZE_X, WORKGROUP_SIZE_Y),
@@ -531,9 +546,22 @@ where
                         .clone()
                         .into_tensor_arg(1),
                     centroid_dists_gpu.into_tensor_arg(1),
+                    ScalarArg { elem: 0u32 },
+                    ScalarArg {
+                        elem: self.nlist as u32,
+                    },
+                    ScalarArg {
+                        elem: n_queries as u32,
+                    },
+                    ScalarArg {
+                        elem: self.nlist as u32,
+                    },
+                    dim_lines,
                 );
             },
         }
+
+        // ── Step 2: Probe selection (CPU) ──
 
         let centroid_dists = centroid_dists_gpu.read(client);
 
@@ -555,13 +583,10 @@ where
             })
             .collect();
 
-        // build the Mega Kernel Task Schedule
-        let mut cpu_write_pointers = vec![0u32; n_queries];
-        let mut task_q_idx = Vec::new();
-        let mut task_db_start = Vec::new();
-        let mut task_write_offset = Vec::new();
-        let mut task_db_count = Vec::new();
+        // ── Step 3: Build task schedule, sorted by q_idx ──
 
+        let mut cpu_write_pointers = vec![0u32; n_queries];
+        let mut tasks: Vec<(u32, u32, u32, u32)> = Vec::new();
         let mut max_db_count = 0u32;
 
         for q_idx in 0..n_queries {
@@ -570,10 +595,12 @@ where
                 let count = self.cluster_offsets[c + 1] - start;
 
                 if count > 0 {
-                    task_q_idx.push(q_idx as u32);
-                    task_db_start.push(start as u32);
-                    task_write_offset.push(cpu_write_pointers[q_idx]);
-                    task_db_count.push(count as u32);
+                    tasks.push((
+                        q_idx as u32,
+                        start as u32,
+                        cpu_write_pointers[q_idx],
+                        count as u32,
+                    ));
 
                     cpu_write_pointers[q_idx] += count as u32;
                     if count as u32 > max_db_count {
@@ -583,10 +610,19 @@ where
             }
         }
 
-        let n_tasks = task_q_idx.len();
+        // Sort by q_idx so consecutive Y-threads in the mega kernel
+        // access the same query vector, improving L1 cache hit rate
+        tasks.sort_unstable_by_key(|t| t.0);
+
+        let n_tasks = tasks.len();
         if n_tasks == 0 {
             return (vec![vec![]; n_queries], vec![vec![]; n_queries]);
         }
+
+        let task_q_idx: Vec<u32> = tasks.iter().map(|t| t.0).collect();
+        let task_db_start: Vec<u32> = tasks.iter().map(|t| t.1).collect();
+        let task_write_offset: Vec<u32> = tasks.iter().map(|t| t.2).collect();
+        let task_db_count: Vec<u32> = tasks.iter().map(|t| t.3).collect();
 
         let max_candidates: usize = cpu_write_pointers
             .iter()
@@ -599,6 +635,8 @@ where
             );
             println!("  Launching mega-kernel with {} tasks", n_tasks);
         }
+
+        // ── Step 4: Mega kernel ──
 
         let candidate_dists_gpu = GpuTensor::<R, T>::empty(vec![n_queries, max_candidates], client);
         let candidate_indices_gpu =
@@ -615,7 +653,6 @@ where
         let grid_x = max_db_count.div_ceil(WORKGROUP_SIZE_X).max(1);
         let grid_y = (n_tasks as u32).div_ceil(WORKGROUP_SIZE_Y).max(1);
 
-        // launch mega kernel for distance Computation
         match self.metric {
             Dist::Euclidean => unsafe {
                 let _ = compute_ivf_mega_euclidean::launch_unchecked::<T, R>(
@@ -651,7 +688,8 @@ where
             },
         }
 
-        // prepare Top-K buffers and initialize to MAX
+        // ── Step 5: Top-K reduction ──
+
         let topk_dists_gpu = GpuTensor::<R, T>::empty(vec![n_queries, k], client);
         let topk_indices_gpu = GpuTensor::<R, u32>::empty(vec![n_queries, k], client);
 
@@ -672,7 +710,6 @@ where
             GpuTensor::<R, u32>::from_slice(&cpu_write_pointers, vec![n_queries], client);
         let reduce_grid_x = (n_queries as u32).div_ceil(WORKGROUP_SIZE_X);
 
-        // launch Top-K Reduction Kernel
         unsafe {
             let _ = reduce_ivf_topk::launch_unchecked::<T, R>(
                 client,
@@ -690,7 +727,8 @@ where
             println!("  GPU Mega-Kernel & Top-K finished. Transferring final results...");
         }
 
-        // single tiny read for just the final K items
+        // ── Step 6: Read results ──
+
         let final_dists = topk_dists_gpu.read(client);
         let final_indices = topk_indices_gpu.read(client);
 
@@ -704,7 +742,6 @@ where
 
             for i in 0..k {
                 let d = final_dists[start + i];
-                // only collect valid elements (where dist isn't MAX)
                 if d < T::from_f32(f32::MAX).unwrap() {
                     let reorg_idx = final_indices[start + i] as usize;
                     row_idx.push(self.original_indices[reorg_idx]);

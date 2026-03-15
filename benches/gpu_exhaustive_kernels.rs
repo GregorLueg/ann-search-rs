@@ -1,6 +1,9 @@
-//! GPU kernel microbenchmarks using CubeCL's Benchmark trait.
+//! GPU kernel microbenchmarks using CubeCL's Benchmark trait. This bench is for
+//! the Kernel used in the exhaustive search
 //!
 //! Run with: cargo bench --bench gpu_exhaustive_kernels --features gpu
+
+#![allow(dead_code)]
 
 use cubecl::benchmark::{Benchmark, TimingMethod};
 use cubecl::future;
@@ -272,10 +275,102 @@ impl<R: Runtime> Benchmark for FullPipelineBench<R> {
 }
 
 // ──────────────────────────────────────────────
+// 4. TopK Coalesced kernel
+// ──────────────────────────────────────────────
+
+struct TopkCoalescedBench<R: Runtime> {
+    cfg: BenchConfig,
+    client: ComputeClient<R>,
+}
+
+impl<R: Runtime> Clone for TopkCoalescedBench<R> {
+    fn clone(&self) -> Self {
+        Self {
+            cfg: self.cfg.clone(),
+            client: self.client.clone(),
+        }
+    }
+}
+
+impl<R: Runtime> Benchmark for TopkCoalescedBench<R> {
+    type Input = TopkInput<R>;
+    type Output = ();
+
+    fn prepare(&self) -> Self::Input {
+        let nq = self.cfg.n_queries;
+        let ndb = self.cfg.n_db;
+        let k = self.cfg.k;
+
+        let dists: Vec<f32> = (0..nq * ndb)
+            .map(|i| ((i * 7 + 13) % 1000) as f32 * 0.01)
+            .collect();
+
+        let distances_gpu = GpuTensor::<R, f32>::from_slice(&dists, vec![nq, ndb], &self.client);
+        let topk_dists = GpuTensor::<R, f32>::empty(vec![nq, k], &self.client);
+        let topk_indices = GpuTensor::<R, u32>::empty(vec![nq, k], &self.client);
+
+        let init_gx = (k as u32).div_ceil(WORKGROUP_SIZE_X);
+        let init_gy = (nq as u32).div_ceil(WORKGROUP_SIZE_Y);
+        unsafe {
+            _ = init_topk::launch_unchecked::<f32, R>(
+                &self.client,
+                CubeCount::Static(init_gx, init_gy, 1),
+                CubeDim::new_2d(WORKGROUP_SIZE_X, WORKGROUP_SIZE_Y),
+                topk_dists.clone().into_tensor_arg(1),
+                topk_indices.clone().into_tensor_arg(1),
+            );
+        }
+        future::block_on(self.client.sync()).expect("sync failed");
+
+        TopkInput {
+            distances_gpu,
+            topk_dists,
+            topk_indices,
+        }
+    }
+
+    fn execute(&self, input: Self::Input) -> Result<Self::Output, String> {
+        let nq = self.cfg.n_queries;
+        let ndb = self.cfg.n_db;
+        let k = self.cfg.k;
+
+        let grid = nq as u32; // one workgroup per query
+        unsafe {
+            _ = extract_topk_coalesced::launch_unchecked::<f32, R>(
+                &self.client,
+                CubeCount::Static(grid, 1, 1),
+                CubeDim::new_2d(32, 1),
+                input.distances_gpu.into_tensor_arg(1),
+                input.topk_dists.into_tensor_arg(1),
+                input.topk_indices.into_tensor_arg(1),
+                ScalarArg { elem: 0u32 },
+                ScalarArg { elem: ndb as u32 },
+                ScalarArg { elem: ndb as u32 },
+                ScalarArg { elem: k as u32 },
+                k,
+            );
+        }
+
+        Ok(())
+    }
+
+    fn name(&self) -> String {
+        format!(
+            "topk_coalesced_{}q_{}db_k{}",
+            self.cfg.n_queries, self.cfg.n_db, self.cfg.k
+        )
+    }
+
+    fn sync(&self) {
+        future::block_on(self.client.sync()).expect("sync failed");
+    }
+}
+
+// ──────────────────────────────────────────────
 // Runner
 // ──────────────────────────────────────────────
 
-fn run_suite<R: Runtime>(device: &R::Device) {
+fn run_exhaustive_suite<R: Runtime>(device: &R::Device) {
     let client = R::client(device);
 
     // ── Kernel-level benchmarks (single chunk sizes) ──
@@ -310,12 +405,19 @@ fn run_suite<R: Runtime>(device: &R::Device) {
             cfg: cfg.clone(),
             client: client.clone(),
         };
+        let fused_bench = TopkBench::<R> {
+            cfg: cfg.clone(),
+            client: client.clone(),
+        };
 
         println!("{}", dist_bench.name());
         println!("{:?}", dist_bench.run(TimingMethod::System));
 
         println!("{}", topk_bench.name());
         println!("{:?}", topk_bench.run(TimingMethod::System));
+
+        println!("{}", fused_bench.name());
+        println!("{:?}", fused_bench.run(TimingMethod::System));
     }
 
     // ── Pipeline-level benchmarks (realistic workloads) ──
@@ -328,22 +430,10 @@ fn run_suite<R: Runtime>(device: &R::Device) {
             dim: 32,
             k: 15,
         },
-        BenchConfig {
-            n_queries: 100_000,
-            n_db: 100_000,
-            dim: 32,
-            k: 15,
-        },
-        BenchConfig {
-            n_queries: 150_000,
-            n_db: 150_000,
-            dim: 32,
-            k: 15,
-        },
         // Cross-batch pattern
         BenchConfig {
-            n_queries: 50_000,
-            n_db: 150_000,
+            n_queries: 25_000,
+            n_db: 50_000,
             dim: 32,
             k: 15,
         },
@@ -354,15 +444,9 @@ fn run_suite<R: Runtime>(device: &R::Device) {
             dim: 64,
             k: 15,
         },
-        BenchConfig {
-            n_queries: 100_000,
-            n_db: 100_000,
-            dim: 64,
-            k: 15,
-        },
     ];
 
-    println!("\n====== Full pipeline (realistic) ======");
+    println!("\n====== Full pipeline vs Fused ======");
     for cfg in pipeline_configs {
         println!(
             "\n--- {}q x {}db, dim={}, k={} ---\n",
@@ -381,5 +465,5 @@ fn run_suite<R: Runtime>(device: &R::Device) {
 }
 
 fn main() {
-    run_suite::<cubecl::wgpu::WgpuRuntime>(&Default::default());
+    run_exhaustive_suite::<cubecl::wgpu::WgpuRuntime>(&Default::default());
 }

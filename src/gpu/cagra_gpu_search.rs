@@ -20,10 +20,10 @@ use crate::prelude::*;
 
 /// Beam width (number of active candidates maintained during search)
 const BEAM_WIDTH: usize = 16;
-/// Hash table size for visited-node tracking (must be power of 2)
-const HASH_SIZE: usize = 2048;
 /// Maximum beam search iterations before forced termination
 const MAX_BEAM_ITERS: usize = 32;
+/// Hash table size for visited-node tracking (must be power of 2)
+const HASH_SIZE: usize = 2048;
 /// Number of random entry points per query
 pub const N_ENTRY_POINTS: usize = 8;
 
@@ -89,6 +89,26 @@ impl CagraGpuSearchParams {
     /// n_entry
     pub fn get_n_entry(&self) -> usize {
         self.n_entry_points.unwrap_or(N_ENTRY_POINTS)
+    }
+
+    /// Create params with defaults scaled to the graph and query parameters.
+    ///
+    /// ### Params
+    ///
+    /// * `k_out` - Number of neighbours to return per query
+    /// * `k_graph` - Degree of the navigational graph
+    ///
+    /// ### Returns
+    ///
+    /// Params with beam width and iterations scaled appropriately
+    pub fn from_graph(k_out: usize, k_graph: usize) -> Self {
+        let beam_width = k_out.max(k_graph).max(16) * 2;
+        let max_beam_iters = beam_width * 2;
+        Self {
+            beam_width: Some(beam_width),
+            max_beam_iters: Some(max_beam_iters),
+            n_entry_points: None,
+        }
     }
 }
 
@@ -789,15 +809,6 @@ where
     let idx_flat = out_idx_gpu.read(client);
     let dist_flat = out_dist_gpu.read(client);
     let sentinel_usize = 0x7FFFFFFFusize;
-
-    let iters_flat = out_iters_gpu.read(client);
-    let avg_iters = iters_flat.iter().map(|&x| x as f64).sum::<f64>() / n_queries as f64;
-    let max_iters_actual = iters_flat.iter().copied().max().unwrap_or(0);
-    let min_iters = iters_flat.iter().copied().min().unwrap_or(0);
-    eprintln!(
-        "  [beam_search] iters: avg={:.1} min={} max={} (beam_width={}, k_graph={})",
-        avg_iters, min_iters, max_iters_actual, BEAM_WIDTH, k_graph,
-    );
 
     let indices: Vec<Vec<usize>> = (0..n_queries)
         .map(|i| {

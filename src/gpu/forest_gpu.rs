@@ -23,9 +23,8 @@ use crate::prelude::*;
 // Const //
 ///////////
 
-/// Maximum points per leaf for shared memory allocation.
-/// At dim=32: 256 * 32 * 4B = 32KB vectors + 1KB PIDs + 1KB norms = 34KB.
-const MAX_LEAF_SIZE: usize = 128;
+/// Shared memory budget in bytes (conservative for Apple Silicon / older GPUs)
+const SMEM_BUDGET: usize = 32_768;
 
 ////////////////////
 // Kernel helpers //
@@ -103,6 +102,20 @@ fn partition_points<F: AnnSearchGpuFloat>(
         pid * 2u32 + 1u32
     };
     partition_id[idx as usize] = new_pid;
+}
+
+/// Compute the maximum leaf size that fits within the shared memory budget
+/// for `leaf_pairwise_proposals`.
+///
+/// Per-point cost: dim_scalars * sizeof(F) [vectors] + sizeof(u32) [pid]
+///                 + sizeof(F) [norm]
+fn compute_max_leaf_size(dim_padded: usize) -> usize {
+    let line = LINE_SIZE as usize;
+    let dim_scalars = (dim_padded / line) * 4;
+    let per_point = dim_scalars * std::mem::size_of::<f32>() + 4 + 4;
+    let overhead = 8; // shared_leaf_start + shared_leaf_size
+    let available = SMEM_BUDGET.saturating_sub(overhead);
+    (available / per_point).clamp(2, 256)
 }
 
 /// All-pairs distance computation within a leaf, emitting proposals.
@@ -297,7 +310,7 @@ pub fn leaf_pairwise_proposals<F: AnnSearchGpuFloat>(
 /// 2D grid, flat index = (CUBE_POS_Y * CUBE_COUNT_X + CUBE_POS_X) * WG +
 /// UNIT_POS_X
 #[cube(launch_unchecked)]
-fn mark_all_new(graph_idx: &mut Tensor<u32>, total_entries: u32) {
+pub fn mark_all_new(graph_idx: &mut Tensor<u32>, total_entries: u32) {
     let idx = (CUBE_POS_Y * CUBE_COUNT_X + CUBE_POS_X) * WORKGROUP_SIZE_X + UNIT_POS_X;
     if idx >= total_entries {
         terminate!();
@@ -434,16 +447,19 @@ pub fn gpu_forest_init<T, R>(
     let dim_vec = dim_padded / line;
     let grid_n = (n as u32).div_ceil(WORKGROUP_SIZE_X);
 
-    let max_depth = if n <= MAX_LEAF_SIZE {
+    // Dynamic leaf size based on dimension
+    let max_leaf_size = compute_max_leaf_size(dim_padded);
+
+    let max_depth = if n <= max_leaf_size {
         0
     } else {
-        ((n as f64) / (MAX_LEAF_SIZE as f64)).log2().ceil() as usize
+        ((n as f64) / (max_leaf_size as f64)).log2().ceil() as usize
     };
 
     if verbose {
         println!(
             "  GPU forest init: {} trees, max_depth={}, max_leaf={}",
-            n_trees, max_depth, MAX_LEAF_SIZE
+            n_trees, max_depth, max_leaf_size
         );
     }
 
@@ -595,7 +611,7 @@ pub fn gpu_forest_init<T, R>(
                 MAX_PROPOSALS as u32,
                 use_cosine,
                 dim_vec,
-                MAX_LEAF_SIZE,
+                max_leaf_size,
             );
         }
 
@@ -649,6 +665,9 @@ mod tests {
         }));
         result.ok().map(|_| device)
     }
+
+    // For testing the code with 32 dimension
+    const MAX_LEAF_SIZE: usize = 128;
 
     // ---------------------------------------------------------------
     // 1. Dot product kernel

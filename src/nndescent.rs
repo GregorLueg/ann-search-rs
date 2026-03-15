@@ -18,6 +18,43 @@ use crate::annoy::*;
 use crate::prelude::*;
 use crate::utils::*;
 
+///////////////////
+// Thread locals //
+///////////////////
+
+thread_local! {
+    static HEAP_F32: RefCell<BinaryHeap<(OrderedFloat<f32>, usize, bool)>> =
+        const { RefCell::new(BinaryHeap::new()) };
+    static HEAP_F64: RefCell<BinaryHeap<(OrderedFloat<f64>, usize, bool)>> =
+        const { RefCell::new(BinaryHeap::new()) };
+    static PID_SET: RefCell<Vec<bool>> = const { RefCell::new(Vec::new()) };
+
+    static SORT_BUF_F32: RefCell<Vec<(f32, usize, bool)>> =
+        const { RefCell::new(Vec::new()) };
+    static SORT_BUF_F64: RefCell<Vec<(f64, usize, bool)>> =
+        const { RefCell::new(Vec::new()) };
+
+    static QUERY_VISITED: RefCell<FixedBitSet> = const { RefCell::new(FixedBitSet::new()) };
+    static QUERY_CANDIDATES_F32: QueryCandF32 =
+        const { RefCell::new(BinaryHeap::new()) };
+    static QUERY_CANDIDATES_F64: QueryCandF64 =
+        const { RefCell::new(BinaryHeap::new()) };
+    static QUERY_RESULTS_F32: RefCell<BinaryHeap<(OrderedFloat<f32>, usize)>> =
+        const { RefCell::new(BinaryHeap::new()) };
+    static QUERY_RESULTS_F64: RefCell<BinaryHeap<(OrderedFloat<f64>, usize)>> =
+        const { RefCell::new(BinaryHeap::new()) };
+}
+
+///////////
+// Types //
+///////////
+
+/// Type alias for the query candidates for f32
+pub type QueryCandF32 = RefCell<BinaryHeap<Reverse<(OrderedFloat<f32>, usize)>>>;
+
+/// Type alias for the query candidates for f64
+pub type QueryCandF64 = RefCell<BinaryHeap<Reverse<(OrderedFloat<f64>, usize)>>>;
+
 /////////////
 // Helpers //
 /////////////
@@ -172,35 +209,6 @@ pub trait NNDescentQuery<T> {
         candidates: &mut BinaryHeap<Reverse<(OrderedFloat<T>, usize)>>,
         results: &mut BinaryHeap<(OrderedFloat<T>, usize)>,
     ) -> (Vec<usize>, Vec<T>);
-}
-
-/// Type alias for the query candidates for f32
-pub type QueryCandF32 = RefCell<BinaryHeap<Reverse<(OrderedFloat<f32>, usize)>>>;
-
-/// Type alias for the query candidates for f64
-pub type QueryCandF64 = RefCell<BinaryHeap<Reverse<(OrderedFloat<f64>, usize)>>>;
-
-thread_local! {
-    static HEAP_F32: RefCell<BinaryHeap<(OrderedFloat<f32>, usize, bool)>> =
-        const { RefCell::new(BinaryHeap::new()) };
-    static HEAP_F64: RefCell<BinaryHeap<(OrderedFloat<f64>, usize, bool)>> =
-        const { RefCell::new(BinaryHeap::new()) };
-    static PID_SET: RefCell<Vec<bool>> = const { RefCell::new(Vec::new()) };
-
-    static SORT_BUF_F32: RefCell<Vec<(f32, usize, bool)>> =
-        const { RefCell::new(Vec::new()) };
-    static SORT_BUF_F64: RefCell<Vec<(f64, usize, bool)>> =
-        const { RefCell::new(Vec::new()) };
-
-    static QUERY_VISITED: RefCell<FixedBitSet> = const { RefCell::new(FixedBitSet::new()) };
-    static QUERY_CANDIDATES_F32: QueryCandF32 =
-        const { RefCell::new(BinaryHeap::new()) };
-    static QUERY_CANDIDATES_F64: QueryCandF64 =
-        const { RefCell::new(BinaryHeap::new()) };
-    static QUERY_RESULTS_F32: RefCell<BinaryHeap<(OrderedFloat<f32>, usize)>> =
-        const { RefCell::new(BinaryHeap::new()) };
-    static QUERY_RESULTS_F64: RefCell<BinaryHeap<(OrderedFloat<f64>, usize)>> =
-        const { RefCell::new(BinaryHeap::new()) };
 }
 
 /// NN-Descent index for approximate nearest neighbour search.
