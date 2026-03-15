@@ -15,23 +15,19 @@ use crate::utils::*;
 ////////////////////////
 
 /// Exhaustive (brute-force) nearest neighbour index (on GPU)
-///
-/// ### Fields
-///
-/// * `vectors_flat` - Original vector data for distance calculations. Flattened
-///   for better cache locality
-/// * `norms` - Normalised pre-calculated values per sample if distance is set to
-///   Cosine
-/// * `dim` - Embedding dimensions
-/// * `n` - Number of samples
-/// * `dist_metric` - The type of distance the index is designed for
-/// * `device` - The cubecl runtime
 pub struct ExhaustiveIndexGpu<T: Float, R: Runtime> {
+    /// Original vector data for distance calculations. Flattened for better
+    /// cache locality
     vectors_flat: Vec<T>,
+    /// Pre-calculated L2 norms per sample; empty if metric is not Cosine
     norms: Vec<T>,
+    /// Embedding dimensionality
     dim: usize,
+    /// Number of samples
     n: usize,
+    /// Distance metric the index is configured for
     metric: Dist,
+    /// The CubeCL runtime device
     device: R::Device,
 }
 
