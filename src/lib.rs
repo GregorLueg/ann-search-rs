@@ -12,16 +12,9 @@ use mimalloc::MiMalloc;
 #[global_allocator]
 static GLOBAL: MiMalloc = MiMalloc;
 
-pub mod annoy;
-pub mod ball_tree;
-pub mod exhaustive;
-pub mod hnsw;
-pub mod ivf;
-pub mod lsh;
-pub mod nndescent;
+pub mod cpu;
 pub mod prelude;
 pub mod utils;
-pub mod vamana;
 
 #[cfg(feature = "gpu")]
 pub mod gpu;
@@ -51,15 +44,10 @@ use bytemuck::Pod;
 #[cfg(feature = "binary")]
 use std::path::Path;
 
-use crate::annoy::*;
-use crate::ball_tree::*;
-use crate::exhaustive::*;
-use crate::hnsw::*;
-use crate::ivf::*;
-use crate::lsh::*;
-use crate::nndescent::*;
+use crate::cpu::{
+    annoy::*, ball_tree::*, exhaustive::*, hnsw::*, ivf::*, lsh::*, nndescent::*, vamana::*,
+};
 use crate::prelude::*;
-use crate::vamana::*;
 
 #[cfg(feature = "binary")]
 use crate::binary::{exhaustive_binary::*, exhaustive_rabitq::*, ivf_binary::*, ivf_rabitq::*};

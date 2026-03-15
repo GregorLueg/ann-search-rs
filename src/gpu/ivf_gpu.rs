@@ -16,9 +16,10 @@ use crate::utils::dist::Dist;
 use crate::utils::k_means_utils::*;
 use crate::utils::*;
 
-/// To not explode memory VRAM memory
+/// Maximum number of queries processed in a single GPU batch to avoid
+/// exhausting VRAM
 const IVF_GPU_QUERY_BATCH_SIZE: usize = 100_000;
-/// Target max size for the candidate buffer
+/// Target maximum size for the candidate buffer in megabytes
 const TARGET_BUFFER_MB: usize = 1500;
 
 /// Batched IVF index with GPU acceleration
@@ -46,11 +47,12 @@ pub struct IvfIndexGpu<T: AnnSearchFloat + AnnSearchGpuFloat, R: Runtime> {
     vectors_gpu: GpuTensor<R, T>,
     /// All norms reorganised by cluster, resident on GPU (Cosine only)
     norms_gpu: Option<GpuTensor<R, T>>,
-    /// CPU variants for reorganisation
+    /// Reorganised vector data mirrored on CPU, used as query input for
+    /// `generate_knn` without a GPU readback
     vectors_cpu: Vec<T>,
     /// Maps reorganised position -> original index
     original_indices: Vec<usize>,
-    /// CSR offsets
+    /// CSR-style offsets into `vectors_gpu` per cluster; length `nlist + 1`
     cluster_offsets: Vec<usize>,
     /// Centroids kept on the GPU
     centroids_gpu: GpuTensor<R, T>,
@@ -84,6 +86,10 @@ where
     /// * `seed` - Random seed
     /// * `verbose` - Print progress
     /// * `device` - GPU device
+    ///
+    /// ### Returns
+    ///
+    /// Initialised `IvfIndexGpu` with all vectors and centroids resident on GPU
     pub fn build(
         data: MatRef<T>,
         metric: Dist,
@@ -431,9 +437,7 @@ where
         }
     }
 
-    /// Returns memory usage
-    ///
-    /// Also returns the data stored on the GPU
+    /// Returns the approximate memory footprint of the index.
     ///
     /// ### Returns
     ///

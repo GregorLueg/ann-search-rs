@@ -30,6 +30,16 @@ const SMEM_BUDGET: usize = 32_768;
 // Kernel helpers //
 ////////////////////
 
+/// Single xorshift step used to generate random node offsets during
+/// reservoir sampling.
+///
+/// ### Params
+///
+/// * `state` - Current RNG state (must be non-zero)
+///
+/// ### Returns
+///
+/// Next RNG state
 #[cube]
 fn xorshift32(state: u32) -> u32 {
     let mut x = state;
@@ -45,7 +55,16 @@ fn xorshift32(state: u32) -> u32 {
 
 /// Compute dot product of each vector with a random projection vector.
 ///
+/// ### Params
+///
+/// * `vectors` - Row-major vector matrix, line-vectorised `[n, dim/LINE_SIZE]`
+/// * `random_vec` - Random projection vector `[dim/LINE_SIZE]`
+/// * `dot_values` - Output dot products `[n]`
+/// * `n` - Number of points
+/// * `dim_lines` - Number of `Line<F>` elements per vector row (comptime)
+///
 /// ### Grid mapping
+///
 /// * `ABSOLUTE_POS_X` -> point index
 #[cube(launch_unchecked)]
 fn compute_dot_products<F: AnnSearchGpuFloat>(
@@ -78,7 +97,16 @@ fn compute_dot_products<F: AnnSearchGpuFloat>(
 
 /// Partition points by comparing dot products against per-partition medians.
 ///
+/// ### Params
+///
+/// * `partition_id` - Current partition ID per point `[n]`; updated in-place
+///   to `pid * 2` (left) or `pid * 2 + 1` (right)
+/// * `dot_values` - Dot product of each point with the projection vector `[n]`
+/// * `medians` - Median dot value per partition `[n_partitions]`
+/// * `n` - Number of points
+///
 /// ### Grid mapping
+///
 /// * `ABSOLUTE_POS_X` -> point index
 #[cube(launch_unchecked)]
 fn partition_points<F: AnnSearchGpuFloat>(
@@ -107,8 +135,16 @@ fn partition_points<F: AnnSearchGpuFloat>(
 /// Compute the maximum leaf size that fits within the shared memory budget
 /// for `leaf_pairwise_proposals`.
 ///
-/// Per-point cost: dim_scalars * sizeof(F) [vectors] + sizeof(u32) [pid]
-///                 + sizeof(F) [norm]
+/// Per-point cost: `dim_scalars * sizeof(F)` (vectors) + `sizeof(u32)` (pid)
+/// + `sizeof(F)` (norm).
+///
+/// ### Params
+///
+/// * `dim_padded` - Vector dimensionality padded to a multiple of `LINE_SIZE`
+///
+/// ### Returns
+///
+/// Maximum number of points per leaf, clamped to `[2, 256]`
 fn compute_max_leaf_size(dim_padded: usize) -> usize {
     let line = LINE_SIZE as usize;
     let dim_scalars = (dim_padded / line) * 4;
@@ -303,12 +339,17 @@ pub fn leaf_pairwise_proposals<F: AnnSearchGpuFloat>(
     }
 }
 
-/// Set IS_NEW flag on all non-sentinel graph entries.
+/// Set the IS_NEW flag on all non-sentinel graph entries.
+///
+/// ### Params
+///
+/// * `graph_idx` - kNN graph index buffer `[n * k]`; entries are updated
+///   in-place by setting bit 31
+/// * `total_entries` - Total number of entries in `graph_idx` (`n * k`)
 ///
 /// ### Grid mapping
 ///
-/// 2D grid, flat index = (CUBE_POS_Y * CUBE_COUNT_X + CUBE_POS_X) * WG +
-/// UNIT_POS_X
+/// * Flat index = `(CUBE_POS_Y * CUBE_COUNT_X + CUBE_POS_X) * WG + UNIT_POS_X`
 #[cube(launch_unchecked)]
 pub fn mark_all_new(graph_idx: &mut Tensor<u32>, total_entries: u32) {
     let idx = (CUBE_POS_Y * CUBE_COUNT_X + CUBE_POS_X) * WORKGROUP_SIZE_X + UNIT_POS_X;
@@ -418,8 +459,33 @@ fn compute_partition_medians<T: AnnSearchFloat>(
 ///
 /// Tree construction (dot products + partitioning) runs entirely on CPU
 /// with rayon parallelism. Only the expensive leaf pairwise distance
-/// computation and merge runs on GPU. This eliminates all per-level
+/// computation and proposal merge runs on GPU. This eliminates all per-level
 /// GPU sync overhead.
+///
+/// ### Params
+///
+/// * `vectors_gpu` - GPU-resident vector matrix `[n, dim_padded/LINE_SIZE]`
+/// * `norms_gpu` - GPU-resident L2 norms `[n]`; unused when `use_cosine` is
+///   false
+/// * `graph_idx_gpu` - kNN graph index buffer `[n, k]`; updated in-place
+/// * `graph_dist_gpu` - kNN graph distance buffer `[n, k]`; updated in-place
+/// * `prop_idx_gpu` - Proposal index scratch buffer `[n, MAX_PROPOSALS]`
+/// * `prop_dist_gpu` - Proposal distance scratch buffer `[n, MAX_PROPOSALS]`
+/// * `prop_count_gpu` - Atomic proposal counter scratch buffer `[n]`
+/// * `update_counter_gpu` - Global update counter used by
+///   `merge_proposals` `[1]`
+/// * `vectors_flat` - CPU-side flattened vector data `[n * dim]`; used for
+///   dot product and median computation during tree construction
+/// * `n` - Number of points
+/// * `dim` - Original (unpadded) vector dimensionality
+/// * `dim_padded` - Vector dimensionality padded to a multiple of `LINE_SIZE`
+/// * `n_trees` - Number of random projection trees to build
+/// * `seed` - Base random seed; each tree and level derives its own seed from
+///   this
+/// * `use_cosine` - Whether to compute cosine distance instead of squared
+///   Euclidean
+/// * `verbose` - Print timing information for each phase
+/// * `client` - GPU compute client
 #[allow(clippy::too_many_arguments)]
 pub fn gpu_forest_init<T, R>(
     vectors_gpu: &GpuTensor<R, T>,

@@ -14,12 +14,12 @@ use std::time::Instant;
 use std::{cell::RefCell, cmp::Reverse, collections::BinaryHeap};
 use thousands::*;
 
-use crate::annoy::*;
+use crate::cpu::annoy::*;
+use crate::cpu::nndescent::*;
 use crate::gpu::cagra_gpu_search::*;
 use crate::gpu::forest_gpu::*;
 use crate::gpu::tensor::*;
 use crate::gpu::*;
-use crate::nndescent::*;
 use crate::prelude::*;
 use crate::utils::*;
 
@@ -178,7 +178,10 @@ fn dist_cosine<F: Float>(
 /// * `use_cosine` - Whether to use cosine distance instead of squared Euclidean
 /// * `dim_lines` - Number of `Line<F>` elements per vector row (comptime)
 ///
+/// ### Returns
+///
 /// Writes an initialised sorted kNN graph into `graph_idx` and `graph_dist`.
+/// All entries are flagged as new (MSB set).
 ///
 /// ### Grid mapping
 ///
@@ -529,6 +532,8 @@ pub fn local_join_shared<F: Float>(
 /// * `n` - Number of nodes
 /// * `max_proposals` - Proposal buffer capacity per node (comptime)
 ///
+/// ### Returns
+///
 /// Updates `graph_idx` and `graph_dist` in place with any improvements, flags
 /// inserted entries as new, and accumulates the total improvement count into
 /// `update_counter[0]`.
@@ -637,6 +642,11 @@ pub fn merge_proposals<F: Float>(
 /// * `max_proposals` - Proposal buffer capacity per node (comptime)
 /// * `use_cosine` - Whether to use cosine distance (comptime)
 /// * `dim_lines` - Number of `Line<F>` elements per vector row (comptime)
+///
+/// ### Returns
+///
+/// Emits improvement proposals into `prop_idx` and `prop_dist` for subsequent
+/// merging via `merge_proposals`. Does not modify the graph directly.
 ///
 /// ### Grid mapping
 ///
@@ -771,6 +781,14 @@ pub fn two_hop_refinement<F: Float>(
 ///
 /// Uses shared memory for the neighbour list and detour counts.
 ///
+/// ### Params
+///
+/// * `graph_idx` - Current kNN graph indices `[n, k]`
+/// * `pruned_idx` - Output pruned graph `[n, d]`
+/// * `n` - Number of nodes
+/// * `k` - Input graph degree (comptime)
+/// * `d` - Output graph degree after pruning (comptime)
+///
 /// ### Grid mapping
 ///
 /// * One workgroup (cube) per node
@@ -869,6 +887,15 @@ pub fn cagra_rank_prune_shared(
 /// appends itself as a reverse neighbour of each target node. Overflow
 /// beyond degree `d` is silently dropped.
 ///
+/// ### Params
+///
+/// * `pruned_idx` - Pruned forward graph from `cagra_rank_prune_shared`
+///   `[n, d]`
+/// * `reverse_idx` - Output reverse edge buffer `[n, d]`
+/// * `reverse_counts` - Atomic per-node reverse edge counter `[n]`
+/// * `n` - Number of nodes
+/// * `d` - Graph degree (comptime)
+///
 /// ### Grid mapping
 ///
 /// * `ABSOLUTE_POS_X` -> node index
@@ -903,6 +930,15 @@ pub fn cagra_build_reverse(
 ///
 /// For each node, takes up to `d/2` reverse edges and fills the remainder
 /// from the pruned forward graph, deduplicating. Pads with sentinels.
+///
+/// ### Params
+///
+/// * `pruned_idx` - Pruned forward graph `[n, d]`
+/// * `reverse_idx` - Reverse edge buffer from `cagra_build_reverse` `[n, d]`
+/// * `reverse_counts` - Number of valid reverse edges per node `[n]`
+/// * `final_idx` - Output merged graph `[n, d]`
+/// * `n` - Number of nodes
+/// * `d` - Graph degree (comptime)
 ///
 /// ### Grid mapping
 ///
@@ -1859,6 +1895,16 @@ where
     ///
     /// Uses a zero-copy path when stride is 1, otherwise copies to a
     /// temporary vector.
+    ///
+    /// ### Params
+    ///
+    /// * `query_row` - Row reference into a faer matrix
+    /// * `k` - Number of neighbours to return
+    /// * `ef_search` - Beam width; see `query` for details
+    ///
+    /// ### Returns
+    ///
+    /// `(indices, distances)` sorted by distance ascending
     #[inline]
     pub fn query_row(
         &self,
@@ -2118,6 +2164,11 @@ where
     /// This method reconstructs them from `vectors_flat`, `norms`, and
     /// `nav_graph` so that `query_batch_gpu` and `self_query_gpu` can proceed.
     /// No-ops if tensors are already present.
+    ///
+    /// ### Params
+    ///
+    /// * `&mut self` - Mutates `vectors_gpu`, `norms_gpu`, and `nav_graph_gpu`
+    ///   in place if they are `None`
     fn ensure_gpu_tensors(&mut self) {
         if self.nav_graph_gpu.is_some() {
             return;

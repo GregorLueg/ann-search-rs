@@ -42,14 +42,16 @@ tempfile = { version = "3.24.0", optional = true }
 thousands = "0.2.0"
 wide = "1.1.1"
 
-# Examples
+################
+# Gridsearches #
+################
 
 [[example]]
 name = "gridsearch_gpu"
 required-features = ["gpu"]
 
 [[example]]
-name = "gridsearch_carga"
+name = "gridsearch_cagra"
 required-features = ["gpu"]
 
 [[example]]
@@ -76,11 +78,17 @@ required-features = ["binary"]
 name = "gridsearch_rabitq"
 required-features = ["binary"]
 
+##################
+# Other examples #
+##################
+
 [[example]]
-name = "knn_comparison_carga"
+name = "knn_comparison_cagra"
 required-features = ["gpu"]
 
-# Benches
+###########
+# Benches #
+###########
 
 [[bench]]
 name = "gpu_exhaustive_kernels"

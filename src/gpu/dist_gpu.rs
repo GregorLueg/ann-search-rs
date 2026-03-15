@@ -16,15 +16,12 @@ use crate::utils::dist::Dist;
 /////////////
 
 /// Container for batch query/DB data passed to `query_batch_gpu`
-///
-/// ### Fields
-///
-/// * `data` - Flattened vector data (n * dim elements)
-/// * `norm` - Pre-computed L2 norms (n elements, empty if not cosine)
-/// * `n` - Number of vectors
 pub struct BatchData<'a, T> {
+    /// Flattened vector data (n * dim elements)
     pub data: &'a [T],
+    /// Pre-computed L2 norms (n elements, empty if not cosine)
     pub norm: &'a [T],
+    /// Number of vectors
     pub n: usize,
 }
 
@@ -33,7 +30,13 @@ impl<'a, T> BatchData<'a, T> {
     ///
     /// ### Params
     ///
-    /// * `data` -
+    /// * `data` - Flattened vector data `[n * dim]`
+    /// * `norm` - Pre-computed L2 norms `[n]`, empty slice if not using cosine
+    /// * `n` - Number of vectors
+    ///
+    /// ### Returns
+    ///
+    /// Initialised self
     pub fn new(data: &'a [T], norm: &'a [T], n: usize) -> Self {
         Self { data, norm, n }
     }
@@ -50,7 +53,19 @@ impl<'a, T> BatchData<'a, T> {
 /// the same query row. DB vectors are read directly from global memory via
 /// the `db_start` offset into a pre-uploaded full DB tensor.
 ///
-/// Shared memory usage: WORKGROUP_SIZE_Y * dim_lines * 4 scalars.
+/// Shared memory usage: `WORKGROUP_SIZE_Y * dim_lines * 4` scalars.
+///
+/// ### Params
+///
+/// * `query_vectors` - Query vectors `[n_queries, dim / LINE_SIZE]` as
+///   `Line<F>`
+/// * `db_vectors` - Database vectors `[n_db, dim / LINE_SIZE]` as `Line<F>`
+/// * `distances` - Output distance matrix `[n_queries, dist_stride]`
+/// * `db_start` - Global offset into `db_vectors` for this chunk
+/// * `n_db_chunk` - Number of DB vectors in this chunk
+/// * `n_queries` - Total number of query vectors
+/// * `dist_stride` - Column stride of the output distance matrix
+/// * `dim_lines` - Number of `Line<F>` elements per vector row (comptime)
 ///
 /// ### Grid mapping
 ///
@@ -131,6 +146,20 @@ pub fn euclidean_tiled<F: Float>(
 ///
 /// Same tiling strategy as `euclidean_tiled` but computes
 /// `1 - dot(q, d) / (||q|| * ||d||)`.
+///
+/// ### Params
+///
+/// * `query_vectors` - Query vectors `[n_queries, dim / LINE_SIZE]` as
+///   `Line<F>`
+/// * `db_vectors` - Database vectors `[n_db, dim / LINE_SIZE]` as `Line<F>`
+/// * `query_norms` - Pre-computed L2 norms `[n_queries]`
+/// * `db_norms` - Pre-computed L2 norms `[n_db]`
+/// * `distances` - Output distance matrix `[n_queries, dist_stride]`
+/// * `db_start` - Global offset into `db_vectors` for this chunk
+/// * `n_db_chunk` - Number of DB vectors in this chunk
+/// * `n_queries` - Total number of query vectors
+/// * `dist_stride` - Column stride of the output distance matrix
+/// * `dim_lines` - Number of `Line<F>` elements per vector row (comptime)
 ///
 /// ### Grid mapping
 ///
@@ -228,6 +257,11 @@ fn prefer_coalesced_topk<R: Runtime>(client: &ComputeClient<R>) -> bool {
 
 /// Initialise top-k buffers to sentinel values (`f32::MAX` / `0`)
 ///
+/// ### Params
+///
+/// * `dists` - Distance buffer `[n_queries, k]` to fill with `f32::MAX`
+/// * `indices` - Index buffer `[n_queries, k]` to fill with `0`
+///
 /// ### Grid mapping
 ///
 /// * `ABSOLUTE_POS_X` -> k slot index
@@ -252,6 +286,15 @@ pub fn init_topk<F: Float>(dists: &mut Tensor<F>, indices: &mut Tensor<u32>) {
 /// One thread per query, serial scan of the distance row. Writes directly
 /// into the running top-k buffer, so no separate merge step is needed.
 /// The buffer must be pre-initialised with `init_topk`.
+///
+/// ### Params
+///
+/// * `distances` - Full distance matrix for this chunk
+///   `[n_queries, dist_stride]`
+/// * `out_dists` - Running top-k distance buffer `[n_queries, k]`
+/// * `out_indices` - Running top-k index buffer `[n_queries, k]`
+/// * `chunk_offset` - Global DB index corresponding to column 0 of this chunk
+/// * `actual_chunk_size` - Number of valid columns in this chunk
 ///
 /// ### Grid mapping
 ///
@@ -309,6 +352,18 @@ pub fn extract_topk<F: Float>(
 ///
 /// Per-thread top-k kept in local Arrays (registers) during the scan,
 /// copied to shared memory only for the final merge.
+///
+/// ### Params
+///
+/// * `distances` - Full distance matrix for this chunk
+///   `[n_queries, dist_stride]`
+/// * `out_dists` - Running top-k distance buffer `[n_queries, k]`
+/// * `out_indices` - Running top-k index buffer `[n_queries, k]`
+/// * `chunk_offset` - Global DB index corresponding to column 0 of this chunk
+/// * `actual_chunk_size` - Number of valid columns in this chunk
+/// * `dist_stride` - Column stride of the distance matrix
+/// * `k_param` - Runtime value of k (must equal comptime `k`)
+/// * `k` - Comptime top-k count; must match `k_param` at launch (comptime)
 ///
 /// ### Grid mapping
 ///
@@ -748,10 +803,22 @@ pub fn cosine_distances_gpu_chunk<F: Float>(
 /// Compute Euclidean distances for a single IVF cluster and write to a
 /// pre-allocated global candidate buffer at per-query offsets
 ///
+/// ### Params
+///
+/// * `query_vectors` - Query vectors `[n_queries, dim / LINE_SIZE]` as `Line<F>`
+/// * `db_vectors` - Full database vectors `[n_db, dim / LINE_SIZE]` as `Line<F>`
+/// * `active_indices` - Query indices active for this cluster `[n_active]`
+/// * `write_offsets` - Per-active-query write offset into the candidate buffer
+///   `[n_active]`
+/// * `out_dists` - Output candidate distances `[n_queries, max_candidates]`
+/// * `out_indices` - Output candidate DB indices `[n_queries, max_candidates]`
+/// * `db_start` - Global DB index of the first vector in this cluster
+/// * `db_count` - Number of vectors in this cluster
+///
 /// ### Grid mapping
 ///
-/// * `ABSOLUTE_POS_X` -> vector index within the cluster (0..db_count)
-/// * `ABSOLUTE_POS_Y` -> index within the active query list (0..n_active)
+/// * `ABSOLUTE_POS_X` -> vector index within the cluster (`0..db_count`)
+/// * `ABSOLUTE_POS_Y` -> index within the active query list (`0..n_active`)
 #[cube(launch_unchecked)]
 pub fn compute_candidates_euclidean<F: Float>(
     query_vectors: &Tensor<Line<F>>,
@@ -800,10 +867,26 @@ pub fn compute_candidates_euclidean<F: Float>(
 /// Compute cosine distances for a single IVF cluster and write to a
 /// pre-allocated global candidate buffer at per-query offsets
 ///
+/// ### Params
+///
+/// * `query_vectors` - Query vectors `[n_queries, dim / LINE_SIZE]` as
+///   `Line<F>`
+/// * `db_vectors` - Full database vectors `[n_db, dim / LINE_SIZE]` as
+///   `Line<F>`
+/// * `query_norms` - Pre-computed L2 norms `[n_queries]`
+/// * `db_norms` - Pre-computed L2 norms `[n_db]`
+/// * `active_indices` - Query indices active for this cluster `[n_active]`
+/// * `write_offsets` - Per-active-query write offset into the candidate buffer
+///   `[n_active]`
+/// * `out_dists` - Output candidate distances `[n_queries, max_candidates]`
+/// * `out_indices` - Output candidate DB indices `[n_queries, max_candidates]`
+/// * `db_start` - Global DB index of the first vector in this cluster
+/// * `db_count` - Number of vectors in this cluster
+///
 /// ### Grid mapping
 ///
-/// * `ABSOLUTE_POS_X` -> vector index within the cluster (0..db_count)
-/// * `ABSOLUTE_POS_Y` -> index within the active query list (0..n_active)
+/// * `ABSOLUTE_POS_X` -> vector index within the cluster (`0..db_count`)
+/// * `ABSOLUTE_POS_Y` -> index within the active query list (`0..n_active`)
 #[cube(launch_unchecked)]
 pub fn compute_candidates_cosine<F: Float>(
     query_vectors: &Tensor<Line<F>>,
@@ -858,6 +941,27 @@ pub fn compute_candidates_cosine<F: Float>(
 //////////////////////////////
 
 /// Compute Euclidean distances using a flattened IVF task list
+///
+/// Each task represents one (query, cluster) pair. The grid maps threads
+/// directly to `(db_element, task)` pairs, avoiding a per-cluster kernel
+/// launch.
+///
+/// ### Params
+///
+/// * `query_vectors` - Query vectors `[n_queries, dim / LINE_SIZE]` as `Line<F>`
+/// * `db_vectors` - Full database vectors `[n_db, dim / LINE_SIZE]` as `Line<F>`
+/// * `task_q_idx` - Query index for each task `[n_tasks]`
+/// * `task_db_start` - Global DB start index for each task `[n_tasks]`
+/// * `task_write_offset` - Write offset into the candidate row for each task
+///   `[n_tasks]`
+/// * `task_db_count` - Number of DB vectors in each task's cluster `[n_tasks]`
+/// * `out_dists` - Output candidate distances `[n_queries, max_candidates]`
+/// * `out_indices` - Output candidate DB indices `[n_queries, max_candidates]`
+///
+/// ### Grid mapping
+///
+/// * `ABSOLUTE_POS_X` -> vector index within the task's cluster (`0..db_count`)
+/// * `ABSOLUTE_POS_Y` -> task index (`0..n_tasks`)
 #[cube(launch_unchecked)]
 pub fn compute_ivf_mega_euclidean<F: Float>(
     query_vectors: &Tensor<Line<F>>,
@@ -912,6 +1016,28 @@ pub fn compute_ivf_mega_euclidean<F: Float>(
 }
 
 /// Compute cosine distances using a flattened IVF task list
+///
+/// Same structure as `compute_ivf_mega_euclidean` but computes
+/// `1 - dot(q, d) / (||q|| * ||d||)`.
+///
+/// ### Params
+///
+/// * `query_vectors` - Query vectors `[n_queries, dim / LINE_SIZE]` as `Line<F>`
+/// * `db_vectors` - Full database vectors `[n_db, dim / LINE_SIZE]` as `Line<F>`
+/// * `query_norms` - Pre-computed L2 norms `[n_queries]`
+/// * `db_norms` - Pre-computed L2 norms `[n_db]`
+/// * `task_q_idx` - Query index for each task `[n_tasks]`
+/// * `task_db_start` - Global DB start index for each task `[n_tasks]`
+/// * `task_write_offset` - Write offset into the candidate row for each task
+///   `[n_tasks]`
+/// * `task_db_count` - Number of DB vectors in each task's cluster `[n_tasks]`
+/// * `out_dists` - Output candidate distances `[n_queries, max_candidates]`
+/// * `out_indices` - Output candidate DB indices `[n_queries, max_candidates]`
+///
+/// ### Grid mapping
+///
+/// * `ABSOLUTE_POS_X` -> vector index within the task's cluster (`0..db_count`)
+/// * `ABSOLUTE_POS_Y` -> task index (`0..n_tasks`)
 #[cube(launch_unchecked)]
 pub fn compute_ivf_mega_cosine<F: Float>(
     query_vectors: &Tensor<Line<F>>,
@@ -970,6 +1096,23 @@ pub fn compute_ivf_mega_cosine<F: Float>(
 }
 
 /// In-place top-k reduction for the IVF variable-length candidate buffer
+///
+/// One thread per query. Performs insertion-sort over the variable-length
+/// candidate slice produced by the distance kernels and writes the k
+/// smallest results into the output buffers.
+///
+/// ### Params
+///
+/// * `candidate_dists` - Candidate distances `[n_queries, max_candidates]`
+/// * `candidate_indices` - Candidate DB indices `[n_queries, max_candidates]`
+/// * `candidates_per_query` - Number of valid candidates for each query
+///   `[n_queries]`
+/// * `out_dists` - Output top-k distances `[n_queries, k]`
+/// * `out_indices` - Output top-k DB indices `[n_queries, k]`
+///
+/// ### Grid mapping
+///
+/// * `ABSOLUTE_POS_X` -> query index
 #[cube(launch_unchecked)]
 pub fn reduce_ivf_topk<F: Float>(
     candidate_dists: &Tensor<F>,

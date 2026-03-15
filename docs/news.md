@@ -3,7 +3,8 @@
 ## 0.2.5
 
 Aggressive performance optimisations for various CPU-based indices, removed a
-nasty memory corruption bug from the exhaustive GPU search.
+nasty memory corruption bug from the exhaustive GPU search. Reordering of the
+module structure to clean up the library.
 
 **Features:**
 
@@ -11,7 +12,8 @@ nasty memory corruption bug from the exhaustive GPU search.
 - Better documentation (more Rust idiomatic), plus correction of copy and paste
   errors.
 - Vamana index added and optimised.
-- Massive improvement in the IVF indices due to better memory layout.
+- Massive improvement in the IVF indices due to better memory layout. This
+  impacts the quantised and some of the binary indices, too.
 - Improvements in some of the GPU kernels for exhaustive and IVF search for
   better performance.
 - [CAGRA style kNN search](https://arxiv.org/abs/2308.15136) with wgpu
@@ -22,7 +24,8 @@ nasty memory corruption bug from the exhaustive GPU search.
 
 **Bugs:**
 
-- *Nasty GPU memory pointer bug* in the exhaustive GPU implementation.
+- *Nasty GPU memory pointer bug* in the exhaustive GPU implementation which
+  could cause corruption errors.
 
 ## 0.2.4
 

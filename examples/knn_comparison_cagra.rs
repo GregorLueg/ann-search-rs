@@ -67,7 +67,7 @@ fn main() {
         None,
         None,
         cli.seed as usize,
-        true,
+        false,
     );
     let cpu_build = start.elapsed().as_secs_f64() * 1000.0;
     let cpu_size = cpu_nndescent_idx.memory_usage_bytes() as f64 / (1024.0 * 1024.0);

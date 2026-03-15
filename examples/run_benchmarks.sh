@@ -55,13 +55,22 @@ run_quantised_benchmarks() {
 
 run_gpu_benchmarks() {
     echo "=== Running GPU benchmarks ==="
-    run_common_patterns "cargo run --example gridsearch_gpu --release --features gpu" "GPU"
+    # run_common_patterns "cargo run --example gridsearch_gpu --release --features gpu" "GPU (IVF)"
+    # run_common_patterns "cargo run --example gridsearch_cagra --release --features gpu" "GPU (Cagra)"
 
     echo "Running GPU benchmarks (larger data sets)..."
     for n_cells in 250000 500000; do
         for n_dim in 64 128; do
-            cargo run --example gridsearch_ivf --release --features gpu -- --distance euclidean --n-cells ${n_cells} --dim ${n_dim}
-            cargo run --example gridsearch_gpu --release --features gpu -- --distance euclidean --n-cells ${n_cells} --dim ${n_dim}
+            cargo run --example gridsearch_ivf --release --features gpu -- --distance euclidean --n-cells ${n_cells} --dim ${n_dim} --data lowrank
+            cargo run --example gridsearch_gpu --release --features gpu -- --distance euclidean --n-cells ${n_cells} --dim ${n_dim} --data lowrank
+            cargo run --example gridsearch_cagra --release --features gpu -- --distance euclidean --n-cells ${n_cells} --dim ${n_dim} --data lowrank
+        done
+    done
+
+    echo "Running kNN specific benchmarks ..."
+    for n_cells in 250000 500000 1000000; do
+        for n_dim in 32 64; do
+            cargo run --example knn_comparison_cagra --release --features gpu -- --distance euclidean --data lowrank --n-cells ${n_cells} --dim ${n_dim}
         done
     done
 }

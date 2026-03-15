@@ -123,6 +123,15 @@ impl Default for CagraGpuSearchParams {
 // Kernel helpers //
 ////////////////////
 
+/// Single xorshift step used to generate random node offsets.
+///
+/// ### Params
+///
+/// * `state` - Current RNG state (must be non-zero)
+///
+/// ### Returns
+///
+/// Next RNG state
 #[cube]
 fn xorshift_search(state: u32) -> u32 {
     let mut x = state;
@@ -139,11 +148,24 @@ fn xorshift_search(state: u32) -> u32 {
 /// Probe kernel: loads a query vector into scalar shared memory,
 /// computes distance to a single database vector from global memory.
 ///
-/// Validates the shared memory loading pattern and distance computation
-/// at production dimensions (dim=32, dim_lines=8).
+/// ### Params
+///
+/// * `vectors` - Database vectors `[n_nodes, dim/LINE_SIZE]` as `Line<F>`
+/// * `query` - Query vector `[dim/LINE_SIZE]` as `Line<F>`
+/// * `out_dist` - Output scalar distance `[1]`
+/// * `out_shared` - Output copy of the query shared memory `[dim_scalars]`
+/// * `target_node` - Index of the database vector to compare against
+/// * `use_cosine` - If true, computes dot product instead of squared L2 (comptime)
+/// * `dim_lines` - Number of `Line<F>` elements per vector row (comptime)
+///
+/// ### Returns
+///
+/// Writes computed distance to `out_dist[0]` and shared memory contents to
+/// `out_shared`. Both written by thread 0 only.
 ///
 /// ### Grid mapping
-/// * Single workgroup (1,1,1), result written by thread 0
+///
+/// * Single workgroup `(1,1,1)`, result written by thread 0
 #[cube(launch_unchecked)]
 fn probe_query_distance<F: Float>(
     vectors: &Tensor<Line<F>>,
@@ -208,8 +230,22 @@ fn probe_query_distance<F: Float>(
 /// then probes for `n_probe` IDs from `probe_ids`, writing 1 (found) or
 /// 0 (not found) into `probe_results`.
 ///
+/// ### Params
+///
+/// * `insert_ids` - Node IDs to insert `[n_insert]`
+/// * `probe_ids` - Node IDs to probe for `[n_probe]`
+/// * `probe_results` - Output presence flags `[n_probe]`; 1 = found, 0 = absent
+/// * `n_insert` - Number of IDs to insert
+/// * `n_probe` - Number of IDs to probe
+/// * `hash_size` - Hash table capacity (comptime, must be a power of 2)
+///
+/// ### Returns
+///
+/// Writes per-probe presence flags into `probe_results`.
+///
 /// ### Grid mapping
-/// * Single workgroup (1,1,1)
+///
+/// * Single workgroup `(1,1,1)`, all work done by thread 0
 #[cube(launch_unchecked)]
 fn probe_hash_table(
     insert_ids: &Tensor<u32>,
@@ -704,8 +740,10 @@ pub fn cagra_beam_search<F: Float>(
 /// * `k_out` - Number of neighbours to return per query
 /// * `use_cosine` - Whether to use cosine distance
 /// * `seed` - Random seed used when `entry_points` is `None`
+/// * `query_params` - Beam search parameters (beam width, max iterations,
+///   number of entry points); defaults applied where fields are `None`
 /// * `entry_points` - Optional pre-computed entry point IDs
-///   [n_queries * N_ENTRY_POINTS].
+///   `[n_queries * query_params.get_n_entry()]`.
 ///   If `None`, random entry points are sampled from `[0, n)`.
 /// * `client` - GPU compute client
 ///
