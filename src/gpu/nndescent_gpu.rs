@@ -14,12 +14,12 @@ use std::time::Instant;
 use std::{cell::RefCell, cmp::Reverse, collections::BinaryHeap};
 use thousands::*;
 
-use crate::annoy::*;
+use crate::cpu::annoy::*;
+use crate::cpu::nndescent::*;
 use crate::gpu::cagra_gpu_search::*;
 use crate::gpu::forest_gpu::*;
 use crate::gpu::tensor::*;
 use crate::gpu::*;
-use crate::nndescent::*;
 use crate::prelude::*;
 use crate::utils::*;
 
