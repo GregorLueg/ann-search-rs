@@ -2468,3 +2468,4 @@ while still allowing for great Recalls. If you need to compress your data
 and reduce memory fingerprint, please, use RaBitQ!
 
 *All benchmarks were run on M1 Max MacBook Pro with 64 GB unified memory.*
+*Last update: 2026/03/15 with version **0.2.5***
