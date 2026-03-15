@@ -51,7 +51,7 @@ name = "gridsearch_gpu"
 required-features = ["gpu"]
 
 [[example]]
-name = "gridsearch_carga"
+name = "gridsearch_cagra"
 required-features = ["gpu"]
 
 [[example]]
@@ -83,7 +83,7 @@ required-features = ["binary"]
 ##################
 
 [[example]]
-name = "knn_comparison_carga"
+name = "knn_comparison_cagra"
 required-features = ["gpu"]
 
 ###########
