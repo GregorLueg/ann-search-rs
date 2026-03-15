@@ -1,3 +1,6 @@
+//! Exhaustive RaBitQ index. Compresses the vectors via RaBitQ and does
+//! exhaustive searches against query vectors.
+
 use bytemuck::Pod;
 use faer::{MatRef, RowRef};
 use faer_traits::ComplexField;
@@ -22,15 +25,12 @@ use crate::utils::*;
 /// Uses IVF-style partitioning with RaBitQ encoding per cluster.
 /// At query time, probes the nearest clusters and searches exhaustively
 /// within each.
-///
-/// ### Fields
-///
-/// * `quantiser` - The RaBitQQuantiser
-/// * `n` - Number of vectors
-/// * `vector_store` - Optional on-disk vector storage
 pub struct ExhaustiveIndexRaBitQ<T> {
+    /// The RaBitQQuantiser
     quantiser: RaBitQQuantiser<T>,
+    /// Number of vectors
     n: usize,
+    /// Optional on-disk vector storage
     vector_store: Option<MmapVectorStore<T>>,
 }
 

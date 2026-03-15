@@ -1,3 +1,6 @@
+//! Exhaustive binary index. Compresses the vectors via binarisation and does
+//! exhaustive searches against query vectors.
+
 use bytemuck::Pod;
 use faer::{MatRef, RowRef};
 use faer_traits::ComplexField;
@@ -18,24 +21,22 @@ use crate::prelude::*;
 /// Exhaustive (brute-force) binary nearest neighbour index
 ///
 /// Stores vectors as binary codes and uses Hamming distance for queries.
-///
-/// ### Fields
-///
-/// * `vectors_flat_binarised` - Binary codes, flattened (n * n_bytes)
-/// * `n_bytes` - Bytes per vector (n_bits / 8)
-/// * `n` - Number of samples
-/// * `dim` - Vector dimensionality
-/// * `metric` - The distance metric
-/// * `binariser` - Binariser for encoding query vectors
-/// * `vector_store` - Optional on-disk vector storage
 pub struct ExhaustiveIndexBinary<T> {
+    /// Binary codes, flattened (n * n_bytes)
     pub vectors_flat_binarised: Vec<u8>,
+    /// Bytes per vector (n_bits / 8)
     pub n_bytes: usize,
+    /// Number of samples in the index
     pub n: usize,
+    /// Original dimensionality
     pub dim: usize,
+    /// Distance metric to use
     metric: Dist,
+    /// Binarisation type to use
     binarisation_type: BinarisationInit,
+    /// Binariser
     binariser: Binariser<T>,
+    /// Optional vector store that is saved in binary on disk
     vector_store: Option<MmapVectorStore<T>>,
 }
 

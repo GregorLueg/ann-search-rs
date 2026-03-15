@@ -1,3 +1,6 @@
+//! SIMD-optimised distance calculations (and other calculations useful across
+//! the different indices) for all types of architectures.
+
 #![allow(dead_code)]
 
 use faer::RowRef;
@@ -58,7 +61,7 @@ pub fn parse_ann_dist(s: &str) -> Option<Dist> {
 // SIMD for f32/f64 //
 //////////////////////
 
-// Enum for the different architectures and potential SIMD levels
+/// Enum for the different architectures and potential SIMD levels
 #[derive(Clone, Copy, Debug)]
 pub enum SimdLevel {
     /// Scalar version
@@ -4324,6 +4327,8 @@ where
 // VectorDistanceAdc //
 ///////////////////////
 
+/// Implementation of an asymmetric distance calculation trait for the quantised
+/// indices.
 #[cfg(feature = "quantised")]
 pub trait VectorDistanceAdc<T>
 where

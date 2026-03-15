@@ -1,3 +1,5 @@
+//! Exhaustive PQ index: quantises the original data via product quantisation.
+
 use faer::{MatRef, RowRef};
 use rayon::prelude::*;
 use std::collections::BinaryHeap;

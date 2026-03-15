@@ -1,3 +1,5 @@
+//! Contains the (flat) vector store that has the original indices on-disk.
+
 use bytemuck::Pod;
 use memmap2::Mmap;
 use num_traits::Float;

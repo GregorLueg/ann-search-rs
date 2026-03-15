@@ -1,3 +1,5 @@
+//! Implementation of the tensor structures for this crate.
+
 use cubecl::prelude::*;
 use cubecl::server::Handle;
 use cubecl::std::tensor::compact_strides;
@@ -8,19 +10,16 @@ use std::marker::PhantomData;
 ///////////////
 
 /// GPU-resident tensor for use with CubeCL kernels
-///
-/// ### Fields
-///
-/// * `data` - Handle to the GPU buffer containing tensor data
-/// * `shape` - Dimensions of the tensor (e.g., [n_rows, n_cols])
-/// * `strides` - Memory strides for each dimension in row-major order
-/// * `_r` - Phantom marker for the runtime type
-/// * `_f` - Phantom marker for the float element type
 pub struct GpuTensor<R: Runtime, F: CubeElement + Numeric> {
+    /// Handle to the GPU buffer containing tensor data
     data: Handle,
+    /// Dimensions of the tensor (e.g., [n_rows, n_cols])
     shape: Vec<usize>,
+    /// Memory strides for each dimension in row-major order
     strides: Vec<usize>,
+    /// Phantom marker for the runtime type
     _r: PhantomData<R>,
+    /// Phantom marker for the float element type
     _f: PhantomData<F>,
 }
 

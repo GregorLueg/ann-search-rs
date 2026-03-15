@@ -1,3 +1,5 @@
+//! Contains the binarisers
+
 use faer::{Mat, MatRef};
 use faer_traits::ComplexField;
 use num_traits::{Float, FromPrimitive, ToPrimitive};
@@ -51,9 +53,17 @@ pub fn parse_binarisation_init(s: &str) -> Option<BinarisationInit> {
 /// Enum representing different binarisation methods
 pub enum BinarisationMethod<T> {
     /// SimHash with random orthogonalised projections
-    SimHash { projections: Vec<T> },
+    SimHash {
+        /// The random, orthogonal projection
+        projections: Vec<T>,
+    },
     /// ITQ with PCA-derived projections and mean centering
-    Itq { projections: Vec<T>, mean: Vec<T> },
+    Itq {
+        /// Projections based on PCA
+        projections: Vec<T>,
+        /// The mean value across that feature
+        mean: Vec<T>,
+    },
     /// Sign-based binarisation (no projections needed)
     SignBased,
 }
@@ -367,15 +377,12 @@ fn encode_sign_based<T: Float>(vec: &[T], dim: usize) -> Vec<u8> {
 /// - **SimHash**: Random orthogonalised projections
 /// - **ITQ**: PCA followed by Iterative Quantisation
 /// - **SignBased**: Simple sign binarisation (no training required)
-///
-/// ### Fields
-///
-/// * `method` - The binarisation method and its parameters
-/// * `n_bits` - Number of bits in output codes
-/// * `dim` - Input vector dimensionality
 pub struct Binariser<T> {
+    /// The binarisation method and its parameters
     pub method: BinarisationMethod<T>,
+    /// Number of bits in output codes
     pub n_bits: usize,
+    /// Input vector dimensionality
     pub dim: usize,
 }
 

@@ -1,3 +1,6 @@
+//! Exhaustive (flat) implementation for nearest neighbour searches in
+//! ann-search-rs.
+
 use faer::{MatRef, RowRef};
 
 use rayon::prelude::*;
@@ -12,22 +15,18 @@ use crate::utils::matrix_to_flat;
 /////////////////////
 
 /// Exhaustive (brute-force) nearest neighbour index
-///
-/// ### Fields
-///
-/// * `vectors_flat` - Original vector data for distance calculations. Flattened
-///   for better cache locality
-/// * `norms` - Normalised pre-calculated values per sample if distance is set
-///   to Cosine
-/// * `dim` - Embedding dimensions
-/// * `n` - Number of samples
-/// * `metric` - The type of distance the index is designed for
 pub struct ExhaustiveIndex<T> {
-    // shared ones
+    /// Original vector data for distance calculations. Flattened for better
+    /// cache locality
     pub vectors_flat: Vec<T>,
+    /// Embedding dimensions
     pub dim: usize,
+    /// Number of samples
     pub n: usize,
+    /// Normalised pre-calculated values per sample if distance is set to
+    /// Cosine.
     norms: Vec<T>,
+    /// The type of distance the index is designed for
     metric: Dist,
 }
 

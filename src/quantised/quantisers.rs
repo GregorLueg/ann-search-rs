@@ -1,3 +1,5 @@
+//! Module contains the different quantisers
+
 use faer::{Mat, Scale};
 use half::bf16;
 use num_traits::{Float, FromPrimitive, ToPrimitive};
@@ -99,6 +101,7 @@ where
 /// * `scales` - The maximum absolute values across each dimensions for
 ///   renormalisation.
 pub struct ScalarQuantiser<T> {
+    /// The maximum absolute values across each dimensions for renormalisation.
     pub scales: Vec<T>,
 }
 
@@ -192,7 +195,10 @@ where
 // ProductQuantiser //
 //////////////////////
 
+/// Number of clusters to use for k-means clustering during PQ
 pub const N_CLUSTERS_PQ: usize = 256;
+
+/// Number of iterations to run for in optimised product quantisation
 pub const OPQ_ITER: usize = 3;
 
 /// ProductQuantiser

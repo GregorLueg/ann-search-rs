@@ -1,3 +1,6 @@
+//! NNDescent implementation in ann-search-rs. Uses concepts of the original
+//! implementation, PyNNDescent and EFANNA.
+
 use faer::{MatRef, RowRef};
 use fixedbitset::FixedBitSet;
 use rand::{rngs::SmallRng, Rng, SeedableRng};
@@ -11,9 +14,46 @@ use std::{
 };
 use thousands::*;
 
-use crate::annoy::*;
+use crate::cpu::annoy::*;
 use crate::prelude::*;
 use crate::utils::*;
+
+///////////////////
+// Thread locals //
+///////////////////
+
+thread_local! {
+    static HEAP_F32: RefCell<BinaryHeap<(OrderedFloat<f32>, usize, bool)>> =
+        const { RefCell::new(BinaryHeap::new()) };
+    static HEAP_F64: RefCell<BinaryHeap<(OrderedFloat<f64>, usize, bool)>> =
+        const { RefCell::new(BinaryHeap::new()) };
+    static PID_SET: RefCell<Vec<bool>> = const { RefCell::new(Vec::new()) };
+
+    static SORT_BUF_F32: RefCell<Vec<(f32, usize, bool)>> =
+        const { RefCell::new(Vec::new()) };
+    static SORT_BUF_F64: RefCell<Vec<(f64, usize, bool)>> =
+        const { RefCell::new(Vec::new()) };
+
+    static QUERY_VISITED: RefCell<FixedBitSet> = const { RefCell::new(FixedBitSet::new()) };
+    static QUERY_CANDIDATES_F32: QueryCandF32 =
+        const { RefCell::new(BinaryHeap::new()) };
+    static QUERY_CANDIDATES_F64: QueryCandF64 =
+        const { RefCell::new(BinaryHeap::new()) };
+    static QUERY_RESULTS_F32: RefCell<BinaryHeap<(OrderedFloat<f32>, usize)>> =
+        const { RefCell::new(BinaryHeap::new()) };
+    static QUERY_RESULTS_F64: RefCell<BinaryHeap<(OrderedFloat<f64>, usize)>> =
+        const { RefCell::new(BinaryHeap::new()) };
+}
+
+///////////
+// Types //
+///////////
+
+/// Type alias for the query candidates for f32
+pub type QueryCandF32 = RefCell<BinaryHeap<Reverse<(OrderedFloat<f32>, usize)>>>;
+
+/// Type alias for the query candidates for f64
+pub type QueryCandF64 = RefCell<BinaryHeap<Reverse<(OrderedFloat<f64>, usize)>>>;
 
 /////////////
 // Helpers //
@@ -24,20 +64,17 @@ use crate::utils::*;
 /// Flat structure in C representation for cache locality. The high bit
 /// of `pid_and_flag` stores the is-new flag, leaving 31 bits for the
 /// point id (sufficient for ~2 billion points).
-///
-/// ### Fields
-///
-/// * `pid_and_flag` - Point index + new/old flag in the high bit
-/// * `dist` - Distance to the neighbour
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
 pub struct Neighbour<T> {
+    /// Point index + new/old flag in the high bit
     pid_and_flag: u32,
+    /// Distance to the neighbour
     pub dist: T,
 }
 
 /// Sentinel PID used to mark empty slots in the flat graph.
-const SENTINEL_PID: usize = u32::MAX as usize >> 1;
+pub const SENTINEL_PID: usize = u32::MAX as usize >> 1;
 
 impl<T: Copy> Neighbour<T> {
     const IS_NEW_MASK: u32 = 1 << 31;
@@ -174,32 +211,6 @@ pub trait NNDescentQuery<T> {
     ) -> (Vec<usize>, Vec<T>);
 }
 
-pub type QueryCandF32 = RefCell<BinaryHeap<Reverse<(OrderedFloat<f32>, usize)>>>;
-pub type QueryCandF64 = RefCell<BinaryHeap<Reverse<(OrderedFloat<f64>, usize)>>>;
-
-thread_local! {
-    static HEAP_F32: RefCell<BinaryHeap<(OrderedFloat<f32>, usize, bool)>> =
-        const { RefCell::new(BinaryHeap::new()) };
-    static HEAP_F64: RefCell<BinaryHeap<(OrderedFloat<f64>, usize, bool)>> =
-        const { RefCell::new(BinaryHeap::new()) };
-    static PID_SET: RefCell<Vec<bool>> = const { RefCell::new(Vec::new()) };
-
-    static SORT_BUF_F32: RefCell<Vec<(f32, usize, bool)>> =
-        const { RefCell::new(Vec::new()) };
-    static SORT_BUF_F64: RefCell<Vec<(f64, usize, bool)>> =
-        const { RefCell::new(Vec::new()) };
-
-    static QUERY_VISITED: RefCell<FixedBitSet> = const { RefCell::new(FixedBitSet::new()) };
-    static QUERY_CANDIDATES_F32: QueryCandF32 =
-        const { RefCell::new(BinaryHeap::new()) };
-    static QUERY_CANDIDATES_F64: QueryCandF64 =
-        const { RefCell::new(BinaryHeap::new()) };
-    static QUERY_RESULTS_F32: RefCell<BinaryHeap<(OrderedFloat<f32>, usize)>> =
-        const { RefCell::new(BinaryHeap::new()) };
-    static QUERY_RESULTS_F64: RefCell<BinaryHeap<(OrderedFloat<f64>, usize)>> =
-        const { RefCell::new(BinaryHeap::new()) };
-}
-
 /// NN-Descent index for approximate nearest neighbour search.
 ///
 /// Builds a k-NN graph via the NN-Descent algorithm, using an Annoy
@@ -224,27 +235,24 @@ thread_local! {
 /// `O(chunk_size * max_candidates)` rather than `O(n * max_candidates)`.
 /// Each chunk emits both edge directions, sorts by target, and applies
 /// updates lock-free via disjoint pointer writes.
-///
-/// ### Fields
-///
-/// * `vectors_flat` - Original vectors, flattened row-major
-/// * `dim` - Dimensionality
-/// * `n` - Number of vectors
-/// * `k` - Neighbours per node in the graph
-/// * `norms` - Pre-computed L2 norms (Cosine only; empty for Euclidean)
-/// * `metric` - Distance metric
-/// * `forest` - Annoy index for entry points
-/// * `graph` - Flat k-NN graph of size `n * k`
-/// * `converged` - Whether construction converged
 pub struct NNDescent<T> {
+    /// Original vectors, flattened row-major
     pub vectors_flat: Vec<T>,
+    /// Dimensionality of the vectors
     pub dim: usize,
+    /// Number of vectors
     pub n: usize,
+    /// Neighbours per node in the generated kNN graph
     pub k: usize,
+    /// Pre-computed L2 norms (Cosine only; empty for Euclidean)
     pub norms: Vec<T>,
+    /// Distance metric of the index
     metric: Dist,
+    /// Annoy index initialisation and finding the entry points
     forest: AnnoyIndex<T>,
+    /// Flat k-NN graph of size `n * k`
     graph: Vec<(usize, T)>,
+    /// Whether construction converged
     converged: bool,
 }
 
@@ -553,13 +561,16 @@ where
     ///
     /// ### Params
     ///
-    /// * `graph` - Reference to current neighbours
-    /// * `k` - Number of neighbours to take
-    /// * `iter_seed` - Iteration seed
-    /// * `new_cands` - Mutable slice to new candidates
-    /// * `old_cands` - Mutable slice to old candidates
-    /// * `new_cands_sym` - Mutable slice to new symmetric candidates
-    /// * `old_cands_sym` - Mutable slice to old symmetric candidates
+    /// * `graph` - Current flat k-NN graph
+    /// * `k` - Neighbours per node
+    /// * `max_candidates` - Maximum candidates to sample per node
+    /// * `iter_seed` - Per-iteration seed for reproducible sampling
+    /// * `new_cands` - Output: sampled new (unexplored) neighbours per node
+    /// * `old_cands` - Output: sampled old (explored) neighbours per node
+    /// * `new_cands_sym` - Output: reverse edges into `new_cands` (cleared and
+    ///   repopulated)
+    /// * `old_cands_sym` - Output: reverse edges into `old_cands` (cleared and
+    ///   repopulated)
     #[allow(clippy::too_many_arguments)]
     fn build_candidates(
         &self,
@@ -685,7 +696,16 @@ where
     ///
     /// ### Params
     ///
+    /// * `new_cands` - New (unexplored) candidate lists per node
+    /// * `old_cands` - Old (explored) candidate lists per node
+    /// * `graph` - Current flat k-NN graph
+    /// * `k` - Neighbours per node
+    /// * `chunk_start` - First source node index (inclusive)
+    /// * `chunk_end` - Last source node index (exclusive)
     ///
+    /// ### Returns
+    ///
+    /// Unsorted list of `(target, source, distance)` update triples
     fn generate_updates_for_chunk(
         &self,
         new_cands: &[Vec<usize>],
@@ -763,6 +783,15 @@ where
     }
 
     /// Calculate distance between two indexed points.
+    ///
+    /// ### Params
+    ///
+    /// * `i` - Index of first vector
+    /// * `j` - Index of second vector
+    ///
+    /// ### Returns
+    ///
+    /// Distance under the index metric
     #[inline]
     fn distance(&self, i: usize, j: usize) -> T {
         match self.metric {

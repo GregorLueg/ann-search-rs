@@ -1,3 +1,7 @@
+//! Inverted file PQ index: quantises the original data via product
+//! quantisation and uses Voronoi cells to identify the most interesting
+//! candidates.
+
 use faer::{MatRef, RowRef};
 use rayon::prelude::*;
 use std::collections::BinaryHeap;
@@ -16,30 +20,29 @@ use crate::utils::*;
 ////////////////
 
 /// IVF index with product quantisation
-///
-/// ### Fields
-///
-/// * `quantised_codes` - Encoded vectors (M u8 codes per vector)
-/// * `dim` - Original dimensions
-/// * `n` - Number of samples in the index
-/// * `metric` - Distance metric
-/// * `centroids` - K-means cluster centroids
-/// * `centroids_norm` - Norms of the centroids - not relevant for this index.
-/// * `all_indices` - Vector indices for each cluster (CSR format)
-/// * `offsets` - Offsets for each inverted list
-/// * `codebook` - Product quantiser with M codebooks
-/// * `nlist` - Number of k-means clusters
 pub struct IvfPqIndex<T> {
+    /// Encoded vectors (M u8 codes per vector)
     quantised_codes: Vec<u8>,
+    /// Original dimensions
     dim: usize,
+    /// Number of samples in the index
     n: usize,
+    /// Distance metric
     metric: Dist,
+    /// K-means cluster centroids
     centroids: Vec<T>,
+    /// Norms of the centroids - not relevant for this index.
     centroids_norm: Vec<T>,
+    /// Vector indices for each cluster (CSR format)
     all_indices: Vec<usize>,
+    /// Offsets for each inverted list
     offsets: Vec<usize>,
+    /// Product quantiser with M codebooks
     codebook: ProductQuantiser<T>,
+    /// Number of k-means clusters
     nlist: usize,
+    /// Original indices
+    original_ids: Vec<usize>,
 }
 
 //////////////////////
@@ -274,7 +277,7 @@ where
             println!("  Quantisation complete");
         }
 
-        Self {
+        let mut idx = Self {
             quantised_codes,
             centroids,
             all_indices,
@@ -285,7 +288,12 @@ where
             nlist,
             metric,
             centroids_norm: Vec::new(),
-        }
+            original_ids: Vec::new(),
+        };
+
+        let new_to_old = idx.optimise_memory_layout();
+        idx.original_ids = new_to_old;
+        idx
     }
 
     /// Query the index for approximate nearest neighbours
@@ -327,14 +335,13 @@ where
             let start = self.offsets[cluster_idx];
             let end = self.offsets[cluster_idx + 1];
 
-            // early termination optimisation
             let mut worst_dist = if heap.len() >= k {
                 heap.peek().unwrap().0 .0
             } else {
                 T::infinity()
             };
 
-            for &vec_idx in &self.all_indices[start..end] {
+            for vec_idx in start..end {
                 let dist = self.compute_distance_adc(vec_idx, &lookup_tables);
 
                 if dist >= worst_dist {
@@ -357,7 +364,10 @@ where
         let mut results: Vec<_> = heap.into_iter().collect();
         results.sort_unstable_by_key(|&(dist, _)| dist);
 
-        let (distances, indices) = results.into_iter().map(|(d, i)| (d.0, i)).unzip();
+        let (distances, indices) = results
+            .into_iter()
+            .map(|(d, i)| (d.0, self.original_ids[i]))
+            .unzip();
 
         (indices, distances)
     }
@@ -416,28 +426,27 @@ where
         let m = self.codebook.m();
         let counter = Arc::new(AtomicUsize::new(0));
 
-        // Build cluster assignments
         let mut cluster_assignments = vec![0usize; self.n];
         for cluster_idx in 0..self.nlist {
             let start = self.offsets[cluster_idx];
             let end = self.offsets[cluster_idx + 1];
-            for &vec_idx in &self.all_indices[start..end] {
-                cluster_assignments[vec_idx] = cluster_idx;
+            for new_idx in start..end {
+                cluster_assignments[new_idx] = cluster_idx;
             }
         }
 
-        let results: Vec<(Vec<usize>, Vec<T>)> = (0..self.n)
+        let unordered_results: Vec<(usize, Vec<usize>, Vec<T>)> = (0..self.n)
             .into_par_iter()
             .map(|i| {
                 let my_cluster = cluster_assignments[i];
                 let codes = &self.quantised_codes[i * m..(i + 1) * m];
 
-                // Reconstruct: centroid + decoded residual
                 let my_centroid =
                     &self.centroids[my_cluster * self.dim..(my_cluster + 1) * self.dim];
                 let residual = self.codebook.decode(codes);
-
                 let reconstructed: Vec<T> = T::add_simd(my_centroid, &residual);
+
+                let orig_id = self.original_ids[i];
 
                 if verbose {
                     let count = counter.fetch_add(1, Ordering::Relaxed) + 1;
@@ -450,17 +459,26 @@ where
                     }
                 }
 
-                self.query(&reconstructed, k, nprobe)
+                let (indices, dists) = self.query(&reconstructed, k, nprobe);
+                (orig_id, indices, dists)
             })
             .collect();
 
-        if return_dist {
-            let (indices, distances) = results.into_iter().unzip();
-            (indices, Some(distances))
+        let mut final_indices = vec![Vec::new(); self.n];
+        let mut final_dists = if return_dist {
+            Some(vec![Vec::new(); self.n])
         } else {
-            let indices = results.into_iter().map(|(idx, _)| idx).collect();
-            (indices, None)
+            None
+        };
+
+        for (orig_id, indices, dists) in unordered_results {
+            final_indices[orig_id] = indices;
+            if let Some(ref mut fd) = final_dists {
+                fd[orig_id] = dists;
+            }
         }
+
+        (final_indices, final_dists)
     }
 
     /// Returns the size of the index in bytes
@@ -476,6 +494,39 @@ where
             + self.all_indices.capacity() * std::mem::size_of::<usize>()
             + self.offsets.capacity() * std::mem::size_of::<usize>()
             + self.codebook.memory_usage_bytes()
+    }
+
+    /// Function will optimise memory layout and put vectors sorted by cluster
+    /// id
+    ///
+    /// ### Returns
+    ///
+    /// New to old mapping
+    fn optimise_memory_layout(&mut self) -> Vec<usize> {
+        let m = self.codebook.m();
+        let mut new_to_old = Vec::with_capacity(self.n);
+        let mut old_to_new = vec![0usize; self.n];
+
+        for cluster in 0..self.nlist {
+            let start = self.offsets[cluster];
+            let end = self.offsets[cluster + 1];
+            for &old_id in &self.all_indices[start..end] {
+                old_to_new[old_id] = new_to_old.len();
+                new_to_old.push(old_id);
+            }
+        }
+
+        let mut new_codes = Vec::with_capacity(self.quantised_codes.len());
+        for &old_id in &new_to_old {
+            let start = old_id * m;
+            new_codes.extend_from_slice(&self.quantised_codes[start..start + m]);
+        }
+
+        self.quantised_codes = new_codes;
+        self.all_indices.clear();
+        self.all_indices.shrink_to_fit();
+
+        new_to_old
     }
 }
 

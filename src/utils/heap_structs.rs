@@ -1,3 +1,6 @@
+//! Structures that can be kept on the heap or sorted buffers for situations
+//! where data is small enough.
+
 use num_traits::Float;
 
 ///////////////////

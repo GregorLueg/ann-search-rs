@@ -1,12 +1,18 @@
-#![allow(clippy::needless_range_loop)] // I want these loops!
+//! Optimised vector searches in Rust originally designed for single cell
+//! applications, but now as additionally GPU-accelerated, quantised (with
+//! binary indices) vector searches leveraging Rust's performance under the
+//! hood.
 
-pub mod annoy;
-pub mod ball_tree;
-pub mod exhaustive;
-pub mod hnsw;
-pub mod ivf;
-pub mod lsh;
-pub mod nndescent;
+#![allow(clippy::needless_range_loop)] // I want these loops!
+#![warn(missing_docs)]
+
+use mimalloc::MiMalloc;
+
+// MiMalloc for better allocations
+#[global_allocator]
+static GLOBAL: MiMalloc = MiMalloc;
+
+pub mod cpu;
 pub mod prelude;
 pub mod utils;
 
@@ -20,15 +26,11 @@ pub mod quantised;
 pub mod binary;
 
 use faer::MatRef;
-use num_traits::{Float, FromPrimitive, ToPrimitive};
 use rayon::prelude::*;
 
-use std::{
-    iter::Sum,
-    sync::{
-        atomic::{AtomicUsize, Ordering},
-        Arc,
-    },
+use std::sync::{
+    atomic::{AtomicUsize, Ordering},
+    Arc,
 };
 use thousands::*;
 
@@ -40,23 +42,17 @@ use std::ops::AddAssign;
 #[cfg(feature = "binary")]
 use bytemuck::Pod;
 #[cfg(feature = "binary")]
-use faer_traits::ComplexField;
-#[cfg(feature = "binary")]
 use std::path::Path;
 
-use crate::annoy::*;
-use crate::ball_tree::*;
-use crate::exhaustive::*;
-use crate::hnsw::*;
-use crate::ivf::*;
-use crate::lsh::*;
-use crate::nndescent::*;
+use crate::cpu::{
+    annoy::*, ball_tree::*, exhaustive::*, hnsw::*, ivf::*, lsh::*, nndescent::*, vamana::*,
+};
 use crate::prelude::*;
 
 #[cfg(feature = "binary")]
 use crate::binary::{exhaustive_binary::*, exhaustive_rabitq::*, ivf_binary::*, ivf_rabitq::*};
 #[cfg(feature = "gpu")]
-use crate::gpu::{exhaustive_gpu::*, ivf_gpu::*};
+use crate::gpu::{exhaustive_gpu::*, ivf_gpu::*, nndescent_gpu::*};
 #[cfg(feature = "quantised")]
 use crate::quantised::{
     exhaustive_bf16::*, exhaustive_opq::*, exhaustive_pq::*, exhaustive_sq8::*, ivf_bf16::*,
@@ -887,6 +883,101 @@ where
     T: AnnSearchFloat,
     NNDescent<T>: ApplySortedUpdates<T>,
     NNDescent<T>: NNDescentQuery<T>,
+{
+    index.generate_knn(k, ef_search, return_dist, verbose)
+}
+
+////////////
+// Vamana //
+////////////
+
+/// Build a Vamana index
+///
+/// ### Params
+///
+/// * `mat` - The data matrix. Rows are samples, columns are dimensions.
+/// * `r` - Maximum out-degree (edges per node).
+/// * `l_build` - Beam width during construction.
+/// * `alpha_pass1` - Pruning alpha for pass 1 (typically 1.0).
+/// * `alpha_pass2` - Pruning alpha for pass 2 (typically 1.2–1.5).
+/// * `dist_metric` - One of `"euclidean"` or `"cosine"`.
+/// * `seed` - Random seed for reproducibility.
+///
+/// ### Returns
+///
+/// The built `VamanaIndex`.
+pub fn build_vamana_index<T>(
+    mat: MatRef<T>,
+    r: usize,
+    l_build: usize,
+    alpha_pass1: f32,
+    alpha_pass2: f32,
+    dist_metric: &str,
+    seed: usize,
+) -> VamanaIndex<T>
+where
+    T: AnnSearchFloat,
+    VamanaIndex<T>: VamanaState<T>,
+{
+    let metric = parse_ann_dist(dist_metric).unwrap_or(Dist::Euclidean);
+    VamanaIndex::build(mat, metric, r, l_build, alpha_pass1, alpha_pass2, seed)
+}
+
+/// Query a Vamana index with an external query matrix
+///
+/// ### Params
+///
+/// * `query_mat` - Query matrix (samples × features).
+/// * `index` - Reference to the built index.
+/// * `k` - Number of neighbours to return.
+/// * `ef_search` - Optional beam width override. Defaults to 100 inside the
+///   index if `None`.
+/// * `return_dist` - Whether to return distances.
+/// * `verbose` - Print progress every 100,000 samples.
+///
+/// ### Returns
+///
+/// A tuple of `(knn_indices, optional distances)`.
+pub fn query_vamana_index<T>(
+    query_mat: MatRef<T>,
+    index: &VamanaIndex<T>,
+    k: usize,
+    ef_search: Option<usize>,
+    return_dist: bool,
+    verbose: bool,
+) -> (Vec<Vec<usize>>, Option<Vec<Vec<T>>>)
+where
+    T: AnnSearchFloat,
+    VamanaIndex<T>: VamanaState<T>,
+{
+    query_parallel(query_mat.nrows(), return_dist, verbose, |i| {
+        index.query_row(query_mat.row(i), k, ef_search)
+    })
+}
+
+/// Self-query a Vamana index to generate a full kNN graph
+///
+/// ### Params
+///
+/// * `index` - Reference to the built index.
+/// * `k` - Number of neighbours to return.
+/// * `ef_search` - Optional beam width override.
+/// * `return_dist` - Whether to return distances.
+/// * `verbose` - Print progress every 100,000 samples.
+///
+/// ### Returns
+///
+/// A tuple of `(knn_indices, optional distances)`.
+pub fn query_vamana_self<T>(
+    index: &VamanaIndex<T>,
+    k: usize,
+    ef_search: Option<usize>,
+    return_dist: bool,
+    verbose: bool,
+) -> (Vec<Vec<usize>>, Option<Vec<Vec<T>>>)
+where
+    T: AnnSearchFloat,
+    VamanaIndex<T>: VamanaState<T>,
 {
     index.generate_knn(k, ef_search, return_dist, verbose)
 }
@@ -1726,7 +1817,7 @@ pub fn build_exhaustive_index_gpu<T, R>(
     device: R::Device,
 ) -> ExhaustiveIndexGpu<T, R>
 where
-    T: Float + Sum + cubecl::frontend::Float + cubecl::CubeElement + FromPrimitive + SimdDistance,
+    T: AnnSearchGpuFloat + AnnSearchFloat,
     R: Runtime,
 {
     let metric = parse_ann_dist(dist_metric).unwrap_or_default();
@@ -1754,7 +1845,7 @@ pub fn query_exhaustive_index_gpu<T, R>(
     verbose: bool,
 ) -> (Vec<Vec<usize>>, Option<Vec<Vec<T>>>)
 where
-    T: Float + Sum + cubecl::frontend::Float + cubecl::CubeElement + FromPrimitive + SimdDistance,
+    T: AnnSearchGpuFloat + AnnSearchFloat,
     R: Runtime,
 {
     let (indices, distances) = index.query_batch(query_mat, k, verbose);
@@ -1788,7 +1879,7 @@ pub fn query_exhaustive_index_gpu_self<T, R>(
     verbose: bool,
 ) -> (Vec<Vec<usize>>, Option<Vec<Vec<T>>>)
 where
-    T: Float + Sum + cubecl::frontend::Float + cubecl::CubeElement + FromPrimitive + SimdDistance,
+    T: AnnSearchGpuFloat + AnnSearchFloat,
     R: Runtime,
 {
     index.generate_knn(k, return_dist, verbose)
@@ -1821,7 +1912,7 @@ pub fn build_ivf_index_gpu<T, R>(
 ) -> IvfIndexGpu<T, R>
 where
     R: Runtime,
-    T: AnnSearchFloat + cubecl::frontend::Float + cubecl::CubeElement,
+    T: AnnSearchFloat + AnnSearchGpuFloat,
 {
     let ann_dist = parse_ann_dist(dist_metric).unwrap_or_default();
     IvfIndexGpu::build(mat, ann_dist, nlist, max_iters, seed, verbose, device)
@@ -1854,7 +1945,7 @@ pub fn query_ivf_index_gpu<T, R>(
 ) -> (Vec<Vec<usize>>, Option<Vec<Vec<T>>>)
 where
     R: Runtime,
-    T: AnnSearchFloat + cubecl::frontend::Float + cubecl::CubeElement,
+    T: AnnSearchFloat + AnnSearchGpuFloat,
 {
     let (indices, distances) = index.query_batch(query_mat, k, nprobe, nquery, verbose);
 
@@ -1893,9 +1984,206 @@ pub fn query_ivf_index_gpu_self<T, R>(
 ) -> (Vec<Vec<usize>>, Option<Vec<Vec<T>>>)
 where
     R: Runtime,
-    T: AnnSearchFloat + cubecl::frontend::Float + cubecl::CubeElement,
+    T: AnnSearchFloat + AnnSearchGpuFloat,
 {
     index.generate_knn(k, nprobe, nquery, return_dist, verbose)
+}
+
+///////////////////
+// NNDescent GPU //
+///////////////////
+
+#[cfg(feature = "gpu")]
+/// Build an NNDescent index with GPU-accelerated graph construction
+/// and CAGRA optimisation.
+///
+/// ### Params
+///
+/// * `mat` - Data matrix [samples, features]
+/// * `dist_metric` - "euclidean" or "cosine"
+/// * `k` - Final neighbours per node (default 30)
+/// * `build_k` - Internal NNDescent degree before CAGRA pruning (default 2*k)
+/// * `max_iters` - Maximum NNDescent iterations (default 15)
+/// * `n_trees` - Annoy forest size (default auto)
+/// * `delta` - Convergence threshold (default 0.001)
+/// * `rho` - Sampling rate (default 0.5)
+/// * `seed` - Random seed
+/// * `verbose` - Print progress
+/// * `device` - GPU device
+#[allow(clippy::too_many_arguments)]
+pub fn build_nndescent_index_gpu<T, R>(
+    mat: MatRef<T>,
+    dist_metric: &str,
+    k: Option<usize>,
+    build_k: Option<usize>,
+    max_iters: Option<usize>,
+    n_trees: Option<usize>,
+    delta: Option<f32>,
+    rho: Option<f32>,
+    refine_knn: Option<usize>,
+    seed: usize,
+    verbose: bool,
+    retain_gpu: bool,
+    device: R::Device,
+) -> NNDescentGpu<T, R>
+where
+    R: Runtime,
+    T: AnnSearchFloat + AnnSearchGpuFloat,
+    NNDescentGpu<T, R>: NNDescentQuery<T>,
+{
+    let ann_dist = parse_ann_dist(dist_metric).unwrap_or_default();
+    NNDescentGpu::build(
+        mat, ann_dist, k, build_k, max_iters, n_trees, delta, rho, refine_knn, seed, verbose,
+        retain_gpu, device,
+    )
+}
+
+#[cfg(feature = "gpu")]
+/// Query an NNDescent GPU index.
+///
+/// ### Params
+///
+/// * `query_mat` - Query matrix [samples, features]
+/// * `index` - Reference to built index
+/// * `k` - Number of neighbours
+/// * `ef_search` - Beam width (default auto)
+/// * `query_params` - Optional GPU beam search parameters
+/// * `return_dist` - Return distances
+/// * `verbose` - Print progress
+///
+/// ### Returns
+///
+/// Tuple of (indices, optional distances)
+pub fn query_nndescent_index_gpu<T, R>(
+    query_mat: MatRef<T>,
+    index: &mut NNDescentGpu<T, R>,
+    k: usize,
+    ef_search: Option<usize>,
+    query_params: Option<CagraGpuSearchParams>,
+    return_dist: bool,
+    verbose: bool,
+) -> (Vec<Vec<usize>>, Option<Vec<Vec<T>>>)
+where
+    R: Runtime,
+    T: AnnSearchFloat + AnnSearchGpuFloat,
+    NNDescentGpu<T, R>: NNDescentQuery<T>,
+{
+    use rayon::prelude::*;
+
+    let n_queries = query_mat.nrows();
+    let gpu_batch_threshold = 32;
+
+    if n_queries >= gpu_batch_threshold && ef_search.is_none() {
+        if verbose {
+            println!("  GPU batch query: {} vectors, k={}...", n_queries, k);
+        }
+
+        let queries_flat: Vec<T> = (0..n_queries)
+            .flat_map(|i| {
+                let row = query_mat.row(i);
+                if row.col_stride() == 1 {
+                    unsafe { std::slice::from_raw_parts(row.as_ptr(), row.ncols()) }.to_vec()
+                } else {
+                    row.iter().cloned().collect()
+                }
+            })
+            .collect();
+
+        let (indices, distances) =
+            index.query_batch_gpu(&queries_flat, n_queries, query_params, k, 42);
+
+        if return_dist {
+            (indices, Some(distances))
+        } else {
+            (indices, None)
+        }
+    } else {
+        if verbose {
+            println!(
+                "  CPU beam search: {} vectors (ef={:?})...",
+                n_queries, ef_search
+            );
+        }
+
+        let results: Vec<(Vec<usize>, Vec<T>)> = (0..n_queries)
+            .into_par_iter()
+            .map(|i| {
+                let row = query_mat.row(i);
+                index.query_row(row, k, ef_search)
+            })
+            .collect();
+
+        if return_dist {
+            let (indices, distances) = results.into_iter().unzip();
+            (indices, Some(distances))
+        } else {
+            let indices = results.into_iter().map(|(idx, _)| idx).collect();
+            (indices, None)
+        }
+    }
+}
+
+#[cfg(feature = "gpu")]
+/// Extract the internal kNN graph from an NNDescent GPU index.
+///
+/// No search is performed -- this simply reshapes the graph that
+/// was already built during construction.
+///
+/// ### Params
+///
+/// * `index` - Reference to built index
+/// * `return_dist` - Return distances
+///
+/// ### Returns
+///
+/// Tuple of (indices, optional distances)
+pub fn extract_nndescent_knn_gpu<T, R>(
+    index: &NNDescentGpu<T, R>,
+    return_dist: bool,
+) -> (Vec<Vec<usize>>, Option<Vec<Vec<T>>>)
+where
+    R: Runtime,
+    T: AnnSearchFloat + AnnSearchGpuFloat,
+    NNDescentGpu<T, R>: NNDescentQuery<T>,
+{
+    index.extract_knn(return_dist)
+}
+
+#[cfg(feature = "gpu")]
+/// Self-query the NNDescent GPU index via GPU beam search.
+///
+/// Searches the CAGRA navigational graph for every vector in the index,
+/// producing a full kNN graph. Results differ from `extract_nndescent_knn_gpu`
+/// which returns the raw NNDescent graph without beam search refinement.
+///
+/// ### Params
+///
+/// * `index` - Mutable reference to built index
+/// * `k` - Number of neighbours
+/// * `query_params` - Optional GPU beam search parameters
+/// * `return_dist` - Return distances
+///
+/// ### Returns
+///
+/// Tuple of (indices, optional distances)
+pub fn query_nndescent_index_gpu_self<T, R>(
+    index: &mut NNDescentGpu<T, R>,
+    k: usize,
+    query_params: Option<CagraGpuSearchParams>,
+    return_dist: bool,
+) -> (Vec<Vec<usize>>, Option<Vec<Vec<T>>>)
+where
+    R: Runtime,
+    T: AnnSearchFloat + AnnSearchGpuFloat,
+    NNDescentGpu<T, R>: NNDescentQuery<T>,
+{
+    let (indices, distances) = index.self_query_gpu(k, query_params, 42);
+
+    if return_dist {
+        (indices, Some(distances))
+    } else {
+        (indices, None)
+    }
 }
 
 ////////////
@@ -1936,7 +2224,7 @@ pub fn build_exhaustive_index_binary<T>(
     save_path: Option<impl AsRef<Path>>,
 ) -> std::io::Result<ExhaustiveIndexBinary<T>>
 where
-    T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum + ComplexField + SimdDistance + Pod,
+    T: AnnSearchFloat + Pod,
 {
     let metric = parse_ann_dist(metric).unwrap_or_default();
 
@@ -1975,7 +2263,7 @@ pub fn query_exhaustive_index_binary<T>(
     verbose: bool,
 ) -> (Vec<Vec<usize>>, Option<Vec<Vec<T>>>)
 where
-    T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum + ComplexField + SimdDistance + Pod,
+    T: AnnSearchFloat + Pod,
 {
     if rerank {
         query_parallel(query_mat.nrows(), return_dist, verbose, |i| {
@@ -2032,7 +2320,7 @@ pub fn query_exhaustive_index_binary_self<T>(
     verbose: bool,
 ) -> (Vec<Vec<usize>>, Option<Vec<Vec<T>>>)
 where
-    T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum + ComplexField + SimdDistance + Pod,
+    T: AnnSearchFloat + Pod,
 {
     index.generate_knn(k, rerank_factor, return_dist, verbose)
 }
@@ -2075,7 +2363,7 @@ pub fn build_ivf_index_binary<T>(
     verbose: bool,
 ) -> std::io::Result<IvfIndexBinary<T>>
 where
-    T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum + ComplexField + SimdDistance + Pod,
+    T: AnnSearchFloat + Pod,
 {
     let ann_dist = parse_ann_dist(dist_metric).unwrap_or_default();
 
@@ -2136,7 +2424,7 @@ pub fn query_ivf_index_binary<T>(
     verbose: bool,
 ) -> (Vec<Vec<usize>>, Option<Vec<Vec<T>>>)
 where
-    T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum + ComplexField + SimdDistance + Pod,
+    T: AnnSearchFloat + Pod,
 {
     if rerank {
         query_parallel(query_mat.nrows(), return_dist, verbose, |i| {
@@ -2190,7 +2478,7 @@ pub fn query_ivf_index_binary_self<T>(
     verbose: bool,
 ) -> (Vec<Vec<usize>>, Option<Vec<Vec<T>>>)
 where
-    T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum + ComplexField + SimdDistance + Pod,
+    T: AnnSearchFloat + Pod,
 {
     index.generate_knn(k, nprobe, rerank_factor, return_dist, verbose)
 }
@@ -2224,7 +2512,7 @@ pub fn build_exhaustive_index_rabitq<T>(
     save_path: Option<impl AsRef<Path>>,
 ) -> std::io::Result<ExhaustiveIndexRaBitQ<T>>
 where
-    T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum + ComplexField + SimdDistance + Pod,
+    T: AnnSearchFloat + Pod,
 {
     let ann_dist = parse_ann_dist(dist_metric).unwrap_or_default();
     if save_store {
@@ -2269,7 +2557,7 @@ pub fn query_exhaustive_index_rabitq<T>(
     verbose: bool,
 ) -> (Vec<Vec<usize>>, Option<Vec<Vec<T>>>)
 where
-    T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum + ComplexField + SimdDistance + Pod,
+    T: AnnSearchFloat + Pod,
 {
     if rerank {
         query_parallel(query_mat.nrows(), return_dist, verbose, |i| {
@@ -2309,7 +2597,7 @@ pub fn query_exhaustive_index_rabitq_self<T>(
     verbose: bool,
 ) -> (Vec<Vec<usize>>, Option<Vec<Vec<T>>>)
 where
-    T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum + ComplexField + SimdDistance + Pod,
+    T: AnnSearchFloat + Pod,
 {
     index.generate_knn(k, n_probe, rerank_factor, return_dist, verbose)
 }
@@ -2348,7 +2636,7 @@ pub fn build_ivf_index_rabitq<T>(
     verbose: bool,
 ) -> std::io::Result<IvfIndexRaBitQ<T>>
 where
-    T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum + ComplexField + SimdDistance + Pod,
+    T: AnnSearchFloat + Pod,
 {
     let ann_dist = parse_ann_dist(dist_metric).unwrap_or_default();
     if save_store {
@@ -2392,7 +2680,7 @@ pub fn query_ivf_index_rabitq<T>(
     verbose: bool,
 ) -> (Vec<Vec<usize>>, Option<Vec<Vec<T>>>)
 where
-    T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum + ComplexField + SimdDistance + Pod,
+    T: AnnSearchFloat + Pod,
 {
     if rerank {
         query_parallel(query_mat.nrows(), return_dist, verbose, |i| {
@@ -2432,7 +2720,7 @@ pub fn query_ivf_index_rabitq_self<T>(
     verbose: bool,
 ) -> (Vec<Vec<usize>>, Option<Vec<Vec<T>>>)
 where
-    T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum + ComplexField + SimdDistance + Pod,
+    T: AnnSearchFloat + Pod,
 {
     index.generate_knn(k, nprobe, rerank_factor, return_dist, verbose)
 }

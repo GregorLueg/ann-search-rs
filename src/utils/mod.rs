@@ -1,6 +1,12 @@
+//! All types of utilities of this crate. From SIMD-accelerated distance
+//! calculations, to highly optimised k-means clustering to structure to be
+//! kept on the heap, shared traits, etd.
+
 pub mod dist;
+pub mod graph_utils;
 pub mod heap_structs;
 pub mod k_means_utils;
+pub mod parallelism;
 pub mod traits;
 pub mod tree_utils;
 
@@ -19,6 +25,7 @@ use crate::prelude::*;
 // Helpers //
 /////////////
 
+/// Type alias for flattened structure
 pub type FlattenData<T> = (Vec<T>, usize, usize);
 
 /// Flatten a matrix to a vector
@@ -49,6 +56,9 @@ where
 // Validation //
 ////////////////
 
+/// Trait for validation of the approximate nearest neighbour searches.
+/// This will do an exhaustive search on a small subset and compare the
+/// Recall@k against the internal query function of the index.
 pub trait KnnValidation<T>: VectorDistance<T>
 where
     T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum + SimdDistance,
@@ -173,5 +183,33 @@ where
         }
 
         total_recall / no_samples as f64
+    }
+}
+
+/////////////////////////
+// Pre-fetching helper //
+/////////////////////////
+
+/// Helper function to pre-fetch next values
+///
+/// ### Params
+///
+/// * `ptr` - The memory address to pre-fetch
+#[inline(always)]
+pub fn prefetch_read<T>(ptr: *const T) {
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        // Cast the generic pointer to *const i8 as required by the x86 intrinsic
+        core::arch::x86_64::_mm_prefetch(ptr as *const i8, core::arch::x86_64::_MM_HINT_T0);
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    unsafe {
+        // The inline assembly just needs the 64-bit memory address in a register
+        core::arch::asm!(
+            "prfm pldl1keep, [{}]",
+            in(reg) ptr,
+            options(readonly, preserves_flags, nostack)
+        );
     }
 }

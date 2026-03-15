@@ -1,3 +1,5 @@
+//! Utility functions for the tree-based indices
+
 use std::cmp::Ordering;
 
 /// Min members per leaf
@@ -11,14 +13,10 @@ pub const LEAF_MIN_MEMBERS: usize = 64;
 ///
 /// Stores nodes to revisit, ordered by distance to query (further = lower
 /// priority)
-///
-/// ### Fields
-///
-/// * `margin` - Negative absolute margin to hyperplane (for max-heap ->
-///   min-distance)
-/// * `node_idx` - Index of node to explore
 pub struct BacktrackEntry {
+    /// Negative absolute margin to hyperplane (for max-heap -> min-distance)
     pub margin: f64,
+    /// Index of node to explore
     pub node_idx: u32,
 }
 
