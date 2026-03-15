@@ -27,19 +27,21 @@ Other backends like cuda might provide even more speed benefits.
 
 ## Table of Contents
 
-- [Comparison of GPU exhaustive and IVF against CPU exhaustive](#comparison-against-cpu-exhaustive)
-- [Comparison of GPU exhaustive and IVF against CPU IVF (small dataset)](#with-250k-samples-and-64-dimensions)
-- [Comparison of GPU exhaustive and IVF against CPU IVF (large dataset)](#with-250k-samples-and-64-dimensions)
+- [GPU exhaustive and IVF](#gpu-accelerated-exhaustive-and-ivf-vs-cpu-exhaustive)
+- [Comparison on larger data sets against the CPU](#comparison-against-ivf-cpu)
+- [CAGRA style index](#cagra-type-querying)
+- [CAGRA index on larger data](#larger-data-sets)
+- [CAGRA for kNN generation](#two-tier-knn-generation)
 
 ### GPU-accelerated exhaustive and IVF vs CPU exhaustive
 
-The GPU acceleration is notable already in the exhaustive index. The IVF-GPU
-reaches very fast speeds here, but not much faster actually than the IVF-CPU
-version (or exhaustive GPU index). The advantages for the IVF-GPU index become
-more apparent in larger data sets (more to that below). Also to note is that
-the data is kept on the GPU for easier access and less frequent transfer between
-CPU and GPU, hence, the apparent reduced memory footprint. The data lives on
-the GPU for this version.
+The GPU acceleration is particularly notable for the exhaustive index. The
+IVF-GPU reaches very fast speeds here, but not much faster actually than the
+IVF-CPU version (or exhaustive GPU index). The advantages for the IVF-GPU index
+become more apparent in larger data sets (more to that below). Also to note is
+that the data is kept on the GPU for easier access and less frequent transfer
+between CPU and GPU, hence, the apparent reduced memory footprint. The data
+lives on the GPU for this version. (Be aware of your VRAM limits!).
 
 <details>
 <summary><b>GPU - Euclidean (Gaussian)</b>:</summary>
@@ -242,6 +244,8 @@ IVF-nl707 (self)                                       4_498.31     5_141.98    
 </code></pre>
 </details>
 
+---
+
 <details>
 <summary><b>GPU-IVF (250k samples; 64 dimensions)</b>:</summary>
 <pre><code>
@@ -274,11 +278,15 @@ IVF-GPU-nl707 (self)                                   4_508.97     4_153.39    
 </code></pre>
 </details>
 
+---
+
 The results here are more favourable of the GPU acceleration. We go from ~90
 seconds with exhaustive search on CPU to ~20 seconds on GPU for full kNN
-generation; with the IVF variants, we can go from 20 seconds for the CPU based
-version to ~10 seconds on the GPU one. The effects become even more pronounced
-with higher dimensionality.
+generation; with the IVF variants, we can go from 10 seconds for the CPU based
+version to ~7 seconds on the GPU one, a smaller effect than on for the
+exhaustive search.
+
+---
 
 <details>
 <summary><b>CPU-IVF (250k samples; 128 dimensions)</b>:</summary>
@@ -308,6 +316,8 @@ IVF-nl707 (self)                                       2_678.36    12_436.94    
 --------------------------------------------------------------------------------------------------------------------------------
 </code></pre>
 </details>
+
+---
 
 <details>
 <summary><b>GPU-IVF (250k samples; 128 dimensions)</b>:</summary>
@@ -342,14 +352,14 @@ IVF-GPU-nl707 (self)                                   2_760.12     7_007.39    
 </details>
 
 The exhaustive kNN search on the CPU takes ~200 seconds (3+ minutes). Leveraging
-the GPU, we cut this down to 45 seconds, a 4x speedup. The IVF CPU as a highly
+the GPU, we cut this down to 30 seconds, a 4x speedup. The IVF CPU as a highly
 optimised version takes 15 seconds, we can cut this down to 10 seconds. In
-this case, the acceleration is more modest – the exhaustiv search benefits
-from the large volume of data.
+this case, the acceleration is more modest (similar as before) – the exhaustiv
+search benefits from the large volume of data.
 
 #### Increasing the number of samples
 
-Results are becoming even more pronounced with more cells and showing the
+Results are becoming more pronounced with more cells and showing the
 advantage of the GPU acceleration.
 
 <details>
@@ -480,14 +490,12 @@ IVF-GPU-nl1000 (self)                                  6_699.74    22_993.16    
 </code></pre>
 </details>
 
-In these configurations, we can really appreciate the GPU acceleration. For
-64 dimensions, we go in the case of</br></br>
-Exhaustive CPU: ca. 6.5 min -> Exhaustive GPU: 1.5 seconds **(4x)** </br>
-IVF CPU: 90 seconds -> IVF GPU: 30 seconds **(3x)** </br></br>
-The acceleration is even more significant with higher dimensions, as seen
-here for the 128 dimension case.</br></br>
-Exhaustive CPU: 15 min -> Exhaustive GPU: 3 min **(5x)** </br>
-IVF CPU: 3 min -> IVF GPU: 1 min **(3x)** </br></br></br>
+---
+
+The overall trends hold true. The exhaustive search becomes much faster on the
+GPU, the IVF-based version gets a decent 2x bonus here. In this case, the
+dimensionality starts being large enough that the GPU has enough data to
+churn through and the difference with CPU versions becomes more apparent.
 
 ### CAGRA-type querying
 
@@ -553,17 +561,6 @@ NNDescent convergence).
 
 Generally speaking CAGRA allows for very fast querying; however, the generation
 of the index takes a bit more time compared to IVF for example.
-
-#### Two-tier kNN generation
-
-For downstream tasks that require a full kNN graph (e.g. BBKNN, MNN, UMAP,
-Leiden clustering), the index offers three paths with different speed/accuracy
-trade-offs:
-
-| Method | Mechanism | Typical recall | Use case |
-|--------|-----------|---------------|----------|
-| **Extract** | Direct reshape of the NNDescent graph. No search performed. | ~0.9 | Fast, however, lowever precision. |
-| **Self-beam** | GPU beam search over the CAGRA navigational graph for every vector in the index. | 0.99 | Production kNN graphs for all types of applications. |
 
 <details>
 <summary><b>GPU NNDescent with CAGRA style pruning - Euclidean (Gaussian)</b>:</summary>
@@ -842,7 +839,16 @@ CAGRA-bw64 (self)                                     33_446.75     9_404.53    
 </code></pre>
 </details>
 
-#### kNN extraction and generation
+#### Two-tier kNN generation
+
+For downstream tasks that require a full kNN graph (e.g. BBKNN, MNN, UMAP,
+Leiden clustering), the index offers three paths with different speed/accuracy
+trade-offs:
+
+| Method | Mechanism | Typical recall | Use case |
+|--------|-----------|---------------|----------|
+| **Extract** | Direct reshape of the NNDescent graph. No search performed. | ~0.9 | Fast, however, lowever precision. |
+| **Self-beam** | GPU beam search over the CAGRA navigational graph for every vector in the index. | 0.99 | Production kNN graphs for all types of applications. |
 
 Below are examples of kNN generation. The dimensions are specifically kept
 quite low to mimic single cell situations. This is where the CAGRA-style part
