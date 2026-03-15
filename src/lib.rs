@@ -6,9 +6,11 @@
 #![allow(clippy::needless_range_loop)] // I want these loops!
 #![warn(missing_docs)]
 
+#[cfg(feature = "mimalloc")]
 use mimalloc::MiMalloc;
 
 // MiMalloc for better allocations
+#[cfg(feature = "mimalloc")]
 #[global_allocator]
 static GLOBAL: MiMalloc = MiMalloc;
 
