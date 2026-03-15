@@ -44,6 +44,7 @@ anticipated. If you want to see what changed, please check this
   - *LSH (Locality Sensitive Hashing)*
   - *IVF (Inverted File index)*
   - *Exhaustive flat index*
+  - *Vanama (the graph powering DiskANN)*
 
 - **Distance metrics**:
   - Euclidean
@@ -62,6 +63,7 @@ anticipated. If you want to see what changed, please check this
 - **GPU-accelerated indices** (optional feature):
   - *Exhaustive flat index with GPU acceleration*
   - *IVF (Inverted File index) with GPU acceleration*
+  - *CAGRA style index*
 
 - **Binarised indices** (optional feature):
   - *Binary* (different types of binary quantisations for exhaustive and IVF
