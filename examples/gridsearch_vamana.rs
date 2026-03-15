@@ -79,7 +79,7 @@ fn main() {
         (64, 150),
     ];
 
-    let ef_search_values: &[Option<usize>] = &[None, Some(50), Some(150)];
+    let ef_search_values: &[Option<usize>] = &[Some(50), None, Some(150)];
 
     for &(r, l_build) in build_params {
         println!("Building Vamana index (R={}, L_build={})...", r, l_build);
@@ -138,7 +138,7 @@ fn main() {
         println!("Self-querying Vamana index...");
         let start = Instant::now();
         let (approx_neighbors_self, approx_distances_self) =
-            query_vamana_self(&vamana_idx, cli.k, Some(100), true, false);
+            query_vamana_self(&vamana_idx, cli.k, None, true, false);
         let self_query_time = start.elapsed().as_secs_f64() * 1000.0;
 
         let recall_self = calculate_recall(&true_neighbors_self, &approx_neighbors_self, cli.k);

@@ -118,7 +118,8 @@ where
         if layer > node_level {
             return Vec::new();
         }
-        // SAFETY: We're only reading and cloning
+        let _guard = self.locks.lock_guard(node_id);
+        // SAFETY: Lock guard ensures no concurrent mutation
         unsafe {
             let layers = &*self.nodes[node_id].get();
             layers[layer as usize].clone()
@@ -190,7 +191,6 @@ where
         let layers = unsafe { &mut *self.nodes[node_id].get() };
         let layer_neighbours = &mut layers[layer as usize];
 
-        // Check if already present
         if layer_neighbours
             .iter()
             .any(|&n| n as usize == new_neighbour)
@@ -198,7 +198,6 @@ where
             return;
         }
 
-        // If there's room, just add
         if layer_neighbours.len() < max_neighbours {
             layer_neighbours.push(new_neighbour as u32);
             return;
@@ -218,37 +217,22 @@ where
             new_neighbour,
         ));
 
-        // Sort by distance
         candidates.sort_unstable_by(|a, b| a.0.cmp(&b.0));
 
-        // Apply simple heuristic: keep closest, but prefer diversity
         let mut selected = Vec::with_capacity(max_neighbours);
 
-        for (dist, cand_id) in &candidates {
+        for &(dist, cand_id) in &candidates {
             if selected.len() >= max_neighbours {
                 break;
             }
 
-            // Check if this candidate is closer to query than to any selected
             let dominated = selected.iter().any(|&sel_id| {
-                let dist_to_selected = OrderedFloat(distance_fn(*cand_id, sel_id));
-                dist_to_selected < *dist
+                let dist_to_selected = OrderedFloat(distance_fn(cand_id, sel_id));
+                dist_to_selected < dist
             });
 
-            if !dominated || selected.len() < max_neighbours / 2 {
-                selected.push(*cand_id);
-            }
-        }
-
-        // Ensure we have at least some neighbours
-        if selected.len() < max_neighbours && candidates.len() > selected.len() {
-            for (_, cand_id) in &candidates {
-                if selected.len() >= max_neighbours {
-                    break;
-                }
-                if !selected.contains(cand_id) {
-                    selected.push(*cand_id);
-                }
+            if !dominated {
+                selected.push(cand_id);
             }
         }
 
@@ -413,8 +397,6 @@ where
     ef_construction: usize,
     ///  Whether to extend candidate pool (unused)
     extend_candidates: bool,
-    /// Whether to keep pruned candidates
-    keep_pruned: bool,
 }
 
 impl<T> VectorDistance<T> for HnswIndex<T>
@@ -439,74 +421,6 @@ where
     T: AnnSearchFloat,
     Self: HnswState<T>,
 {
-    /// Compute the offset in neighbours_flat for a specific node and layer
-    ///
-    /// Calculates where in the flat array this node's layer begins, accounting
-    /// for layer 0 having 2*M slots and upper layers having M slots each.
-    ///
-    /// ### Params
-    ///
-    /// * `node_id` - Node index
-    /// * `layer` - Layer number
-    ///
-    /// ### Returns
-    ///
-    /// Offset into neighbours_flat
-    #[inline]
-    fn neighbours_offset(&self, node_id: usize, layer: u8) -> usize {
-        let base = self.neighbour_offsets[node_id];
-        if layer == 0 {
-            base
-        } else {
-            // Skip layer 0 (M*2) plus previous upper layers (M each)
-            base + self.m * 2 + self.m * (layer as usize - 1)
-        }
-    }
-
-    /// Get the maximum number of neighbours for a layer
-    ///
-    /// ### Params
-    ///
-    /// * `layer` - Layer number
-    ///
-    /// ### Returns
-    ///
-    /// 2*M for layer 0, M for upper layers
-    #[inline]
-    fn max_neighbours_for_layer(&self, layer: u8) -> usize {
-        if layer == 0 {
-            self.m * 2
-        } else {
-            self.m
-        }
-    }
-
-    /// Get neighbours for a node at a specific layer (for queries)
-    ///
-    /// Returns empty slice if the node doesn't exist at this layer.
-    ///
-    /// ### Params
-    ///
-    /// * `node_id` - Node index
-    /// * `layer` - Layer to query
-    ///
-    /// ### Returns
-    ///
-    /// Slice of neighbour indices (may contain u32::MAX padding)
-    #[inline]
-    fn get_neighbours_at_layer(&self, node_id: usize, layer: u8) -> &[u32] {
-        let node_level = self.layer_assignments[node_id];
-        if layer > node_level {
-            return &[];
-        }
-
-        let offset = self.neighbours_offset(node_id, layer);
-        let count = self.max_neighbours_for_layer(layer);
-
-        // Safety: bounds are guaranteed by construction
-        &self.neighbours_flat[offset..offset + count]
-    }
-
     //////////////////////
     // Index generation //
     //////////////////////
@@ -606,7 +520,6 @@ where
             m,
             ef_construction,
             extend_candidates: false,
-            keep_pruned: true,
         };
 
         // Build the graph layer by layer, from TOP to BOTTOM
@@ -634,94 +547,93 @@ where
     /// * `graph` - Construction graph to populate
     /// * `verbose` - Whether to print progress
     fn build_graph(&self, graph: &ConstructionGraph<T>, verbose: bool) {
-        for layer in (0..=self.max_layer).rev() {
-            let start = Instant::now();
+        // Sort nodes: highest layer first, then by node id for determinism
+        // within a layer.
+        let mut insertion_order: Vec<usize> = (0..self.n).collect();
+        insertion_order.sort_unstable_by(|&a, &b| {
+            self.layer_assignments[b]
+                .cmp(&self.layer_assignments[a])
+                .then(a.cmp(&b))
+        });
 
-            let layer_nodes: Vec<usize> = (0..self.n)
-                .filter(|&i| self.layer_assignments[i] >= layer)
-                .collect();
+        if verbose {
+            println!(
+                "Inserting {} nodes incrementally",
+                self.n.separate_with_underscores()
+            );
+        }
 
-            if verbose {
-                println!(
-                    "Building layer {} with {} nodes",
-                    layer,
-                    layer_nodes.len().separate_with_underscores()
-                );
-            }
+        let start = Instant::now();
 
-            self.build_layer_parallel(layer, &layer_nodes, graph);
+        // Insert the entry point first (it's the highest-layer node, so it
+        // should be first in our sorted order, but let's be explicit)
+        let ep = self.entry_point as usize;
 
-            if verbose {
-                println!("  Layer {} built in {:.2?}", layer, start.elapsed());
-            }
+        // First phase: Insert upper-layer nodes sequentially
+        // These are few in number and form the critical highway structure.
+        // Sequential insertion ensures they see each other's connections.
+        let (upper_nodes, base_only_nodes): (Vec<usize>, Vec<usize>) = insertion_order
+            .into_iter()
+            .filter(|&id| id != ep)
+            .partition(|&id| self.layer_assignments[id] > 0);
+
+        if verbose {
+            println!(
+                "  Phase 1: {} upper-layer nodes (sequential)",
+                upper_nodes.len().separate_with_underscores()
+            );
+        }
+
+        for &node in &upper_nodes {
+            Self::with_build_state(|state_cell| {
+                let mut state = state_cell.borrow_mut();
+                self.insert_node(node, graph, &mut state);
+            });
+        }
+
+        if verbose {
+            println!("  Phase 1 done in {:.2?}", start.elapsed());
+            println!(
+                "  Phase 2: {} base-layer nodes (parallel)",
+                base_only_nodes.len().separate_with_underscores()
+            );
+        }
+
+        let phase2_start = Instant::now();
+
+        // Phase 2: Insert base-only nodes in parallel
+        // The upper layers are now fully built, so these nodes can find good
+        // entry points via greedy descent. Concurrent insertions at layer 0
+        // are protected by per-node locks.
+        base_only_nodes.par_iter().for_each(|&node| {
+            Self::with_build_state(|state_cell| {
+                let mut state = state_cell.borrow_mut();
+                self.insert_node(node, graph, &mut state);
+            });
+        });
+
+        if verbose {
+            println!("  Phase 2 done in {:.2?}", phase2_start.elapsed());
+            println!("  Total build in {:.2?}", start.elapsed());
         }
     }
 
-    /// Build a single layer with parallel processing
+    /// Insert a single node into the construction graph across all its layers
     ///
-    /// Processes all nodes at a layer in parallel, computing their connections
-    /// and forming bidirectional links with pruning.
-    ///
-    /// ### Params
-    ///
-    /// * `layer` - Layer to build
-    /// * `nodes` - Nodes present at this layer
-    /// * `graph` - Construction graph to update
-    fn build_layer_parallel(&self, layer: u8, nodes: &[usize], graph: &ConstructionGraph<T>) {
-        nodes.par_iter().for_each(|&node| {
-            let connections = Self::with_build_state(|state_cell| {
-                let mut state = state_cell.borrow_mut();
-                self.compute_node_connections_for_layer(node, layer, graph, &mut state)
-            });
-
-            graph.set_neighbours(node, layer, &connections);
-
-            let distance_fn = |a: usize, b: usize| -> T {
-                match self.metric {
-                    Dist::Euclidean => self.euclidean_distance(a, b),
-                    Dist::Cosine => self.cosine_distance(a, b),
-                }
-            };
-
-            for &(_, neighbour_id) in &connections {
-                if neighbour_id != node && graph.node_level(neighbour_id) >= layer {
-                    graph.add_neighbour_with_pruning(neighbour_id, layer, node, &distance_fn);
-                }
-            }
-        });
-    }
-
-    /// Compute connections for a node at a specific layer
-    ///
-    /// Performs greedy descent through upper layers, then ef_construction
-    /// search at the target layer, followed by heuristic pruning.
-    ///
-    /// ### Params
-    ///
-    /// * `node` - Node to connect
-    /// * `target_layer` - Layer to compute connections for
-    /// * `graph` - Construction graph
-    /// * `state` - Search state for traversal
-    ///
-    /// ### Returns
-    ///
-    /// Selected neighbours as (distance, id) pairs
-    fn compute_node_connections_for_layer(
-        &self,
-        node: usize,
-        target_layer: u8,
-        graph: &ConstructionGraph<T>,
-        state: &mut SearchState<T>,
-    ) -> Vec<(OrderedFloat<T>, usize)> {
-        state.reset(self.n);
-
+    /// Performs greedy descent from the entry point through upper layers,
+    /// then does ef_construction search and connects the node at each
+    /// layer it belongs to, from its highest layer down to layer 0.
+    fn insert_node(&self, node: usize, graph: &ConstructionGraph<T>, state: &mut SearchState<T>) {
+        let node_level = self.layer_assignments[node];
         let mut current_node = self.entry_point as usize;
+
+        // greedy descent through layers above this node's highest layer
         let mut current_dist = OrderedFloat(match self.metric {
             Dist::Euclidean => self.euclidean_distance(node, current_node),
             Dist::Cosine => self.cosine_distance(node, current_node),
         });
 
-        for layer in (target_layer + 1..=self.max_layer).rev() {
+        for layer in (node_level + 1..=self.max_layer).rev() {
             let mut changed = true;
             while changed {
                 changed = false;
@@ -731,16 +643,10 @@ where
                         continue;
                     }
                     let neighbour = neighbour as usize;
-
-                    if graph.node_level(neighbour) < layer {
-                        continue;
-                    }
-
                     let dist = OrderedFloat(match self.metric {
                         Dist::Euclidean => self.euclidean_distance(node, neighbour),
                         Dist::Cosine => self.cosine_distance(node, neighbour),
                     });
-
                     if dist < current_dist {
                         current_node = neighbour;
                         current_dist = dist;
@@ -750,19 +656,111 @@ where
             }
         }
 
-        // At target layer, do full ef_construction search
-        // Use reduced ef for base layer to avoid aggressive pruning
-        let ef = if target_layer == 0 {
-            self.ef_construction / 2
-        } else {
-            self.ef_construction
+        // for each layer this node belongs to (top-down), search and connect
+        let distance_fn = |a: usize, b: usize| -> T {
+            match self.metric {
+                Dist::Euclidean => self.euclidean_distance(a, b),
+                Dist::Cosine => self.cosine_distance(a, b),
+            }
         };
 
-        state.reset(self.n);
-        let candidates =
-            self.search_layer_construction(node, target_layer, current_node, ef, graph, state);
+        for layer in (0..=node_level).rev() {
+            state.reset(self.n);
 
-        self.select_neighbours_heuristic(node, &candidates, target_layer, state)
+            let candidates = self.search_layer_construction(
+                node,
+                layer,
+                current_node,
+                self.ef_construction,
+                graph,
+                state,
+            );
+
+            let selected = self.select_neighbours_heuristic(node, &candidates, layer, state);
+
+            // set this node's outgoing neighbours
+            graph.set_neighbours(node, layer, &selected);
+
+            // update reverse links: add this node to each neighbour's list
+            for &(_, neighbour_id) in &selected {
+                if neighbour_id != node && graph.node_level(neighbour_id) >= layer {
+                    graph.add_neighbour_with_pruning(neighbour_id, layer, node, &distance_fn);
+                }
+            }
+
+            // use the closest result as entry point for the next layer down
+            if let Some(&(_, closest)) = selected.first() {
+                current_node = closest;
+            }
+        }
+    }
+
+    /// Compute the offset in neighbours_flat for a specific node and layer
+    ///
+    /// Calculates where in the flat array this node's layer begins, accounting
+    /// for layer 0 having 2*M slots and upper layers having M slots each.
+    ///
+    /// ### Params
+    ///
+    /// * `node_id` - Node index
+    /// * `layer` - Layer number
+    ///
+    /// ### Returns
+    ///
+    /// Offset into neighbours_flat
+    #[inline]
+    fn neighbours_offset(&self, node_id: usize, layer: u8) -> usize {
+        let base = self.neighbour_offsets[node_id];
+        if layer == 0 {
+            base
+        } else {
+            // Skip layer 0 (M*2) plus previous upper layers (M each)
+            base + self.m * 2 + self.m * (layer as usize - 1)
+        }
+    }
+
+    /// Get the maximum number of neighbours for a layer
+    ///
+    /// ### Params
+    ///
+    /// * `layer` - Layer number
+    ///
+    /// ### Returns
+    ///
+    /// 2*M for layer 0, M for upper layers
+    #[inline]
+    fn max_neighbours_for_layer(&self, layer: u8) -> usize {
+        if layer == 0 {
+            self.m * 2
+        } else {
+            self.m
+        }
+    }
+
+    /// Get neighbours for a node at a specific layer (for queries)
+    ///
+    /// Returns empty slice if the node doesn't exist at this layer.
+    ///
+    /// ### Params
+    ///
+    /// * `node_id` - Node index
+    /// * `layer` - Layer to query
+    ///
+    /// ### Returns
+    ///
+    /// Slice of neighbour indices (may contain u32::MAX padding)
+    #[inline]
+    fn get_neighbours_at_layer(&self, node_id: usize, layer: u8) -> &[u32] {
+        let node_level = self.layer_assignments[node_id];
+        if layer > node_level {
+            return &[];
+        }
+
+        let offset = self.neighbours_offset(node_id, layer);
+        let count = self.max_neighbours_for_layer(layer);
+
+        // safety: bounds are guaranteed by construction
+        &self.neighbours_flat[offset..offset + count]
     }
 
     /// Search layer during construction
@@ -778,7 +776,7 @@ where
     /// * `entry_node` - Starting point for search
     /// * `ef` - Size of candidate list
     /// * `graph` - Construction graph
-    /// * `state` - Search state
+    /// * `state` - Mutable reference to search state
     ///
     /// ### Returns
     ///
@@ -811,43 +809,35 @@ where
                 break;
             }
 
-            let current_level = graph.node_level(current_id);
+            let neighbours = graph.get_neighbours(current_id, target_layer);
 
-            for layer in 0..=current_level {
-                let neighbours = graph.get_neighbours(current_id, layer);
+            for &neighbour in &neighbours {
+                if neighbour == u32::MAX {
+                    continue;
+                }
+                let neighbour_id = neighbour as usize;
 
-                for &neighbour in &neighbours {
-                    if neighbour == u32::MAX {
-                        continue;
-                    }
-                    let neighbour_id = neighbour as usize;
+                if state.is_visited(neighbour_id) {
+                    continue;
+                }
+                state.mark_visited(neighbour_id);
 
-                    if graph.node_level(neighbour_id) < target_layer {
-                        continue;
-                    }
+                let dist = OrderedFloat(match self.metric {
+                    Dist::Euclidean => self.euclidean_distance(query_node, neighbour_id),
+                    Dist::Cosine => self.cosine_distance(query_node, neighbour_id),
+                });
 
-                    if state.is_visited(neighbour_id) {
-                        continue;
-                    }
-                    state.mark_visited(neighbour_id);
+                if dist < furthest_dist || state.working_sorted.len() < ef {
+                    state.candidates.push(Reverse((dist, neighbour_id)));
 
-                    let dist = OrderedFloat(match self.metric {
-                        Dist::Euclidean => self.euclidean_distance(query_node, neighbour_id),
-                        Dist::Cosine => self.cosine_distance(query_node, neighbour_id),
-                    });
-
-                    if dist < furthest_dist || state.working_sorted.len() < ef {
-                        state.candidates.push(Reverse((dist, neighbour_id)));
-
-                        if state.working_sorted.insert((dist, neighbour_id), ef)
-                            && state.working_sorted.len() >= ef
-                        {
-                            furthest_dist = state
-                                .working_sorted
-                                .top()
-                                .map(|(d, _)| *d)
-                                .unwrap_or(OrderedFloat(T::infinity()));
-                        }
+                    if state.working_sorted.insert((dist, neighbour_id), ef)
+                        && state.working_sorted.len() >= ef
+                    {
+                        furthest_dist = state
+                            .working_sorted
+                            .top()
+                            .map(|(d, _)| *d)
+                            .unwrap_or(OrderedFloat(T::infinity()));
                     }
                 }
             }
@@ -882,7 +872,6 @@ where
         let max_neighbours = if layer == 0 { self.m * 2 } else { self.m };
 
         state.scratch_working.clear();
-        state.scratch_discarded.clear();
 
         for &(dist, id) in candidates {
             if id != node {
@@ -899,36 +888,16 @@ where
                 break;
             }
 
-            let mut is_good = true;
-            for &(_, selected_id) in &result {
+            let is_good = !result.iter().any(|&(_, selected_id)| {
                 let dist_to_selected = OrderedFloat(match self.metric {
                     Dist::Euclidean => self.euclidean_distance(cand_id, selected_id),
                     Dist::Cosine => self.cosine_distance(cand_id, selected_id),
                 });
-
-                if dist_to_selected < cand_dist {
-                    is_good = false;
-                    break;
-                }
-            }
+                dist_to_selected < cand_dist
+            });
 
             if is_good {
                 result.push((cand_dist, cand_id));
-            } else if self.keep_pruned {
-                state.scratch_discarded.push((cand_dist, cand_id));
-            }
-        }
-
-        if self.keep_pruned {
-            state
-                .scratch_discarded
-                .sort_unstable_by(|a, b| a.0.cmp(&b.0));
-
-            for &candidate in &state.scratch_discarded {
-                if result.len() >= max_neighbours {
-                    break;
-                }
-                result.push(candidate);
             }
         }
 
