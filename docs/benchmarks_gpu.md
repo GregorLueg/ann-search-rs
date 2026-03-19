@@ -1163,7 +1163,11 @@ Especially on larger data sets, we can accelerate the queries substantially
 and get up to 2x to 3x speed increases to generate the full kNN graph with
 Recall@k of ≥0.99. If you are okay with a graph that has Recall ≥0.9 you
 can do that in <10 seconds on a million cells or ~30 seconds on 2.5 million
-cells (with n_dim = 32 dim).
+cells (with n_dim = 32 dim). Also, the data is very contrived here... On real
+data, NNDescent will have to do quite a few iterations. The Annoy
+initialisations are already very good, so the CPU version basically has no
+need for refining the kNN graph. On real data, the GPU outperforms more
+substantially.
 
 ## Conclusions
 
