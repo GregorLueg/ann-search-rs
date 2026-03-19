@@ -858,7 +858,7 @@ is quite performant and can be used to quickly generate kNN graphs from the
 data... To run these, you can use:
 
 ```bash
-cargo run --example gridsearch_cagra --features gpu --release
+cargo run --example knn_comparison_cagra --features gpu --release
 ```
 
 The application idea here is to use these for large single cell data sets in
@@ -1084,10 +1084,86 @@ GPU-NND bk=3x refine=2 (self-beam)                    94_679.89     6_319.99   1
 </code></pre>
 </details>
 
+---
+
+<details>
+<summary><b>Generation of a kNN graph with CAGRA (1m samples; 64 dimensions)</b>:</summary>
+<pre><code>
+================================================================================================================================
+Benchmark: 1000k cells, 64D kNN graph generation (build_k x refinement)
+================================================================================================================================
+Method                                               Build (ms)   Query (ms)   Total (ms)     Recall@k   Dist Error    Size (MB)
+--------------------------------------------------------------------------------------------------------------------------------
+GPU-Exhaustive (ground truth)                             43.07   343_565.91   343_608.97       1.0000     0.000000       244.14
+CPU-NNDescent (k=15)                                  35_095.38     9_958.45    45_053.84       0.9989     0.001938      1652.12
+--------------------------------------------------------------------------------------------------------------------------------
+GPU-NND bk=1x refine=0 (extract)                      10_071.99        88.51    10_160.50       0.8424     2.221546       701.90
+GPU-NND bk=1x refine=0 (self-beam)                    10_071.99     5_922.49    15_994.48       0.9773     0.046142       701.90
+GPU-NND bk=1x refine=1 (extract)                      13_917.49        83.50    14_001.00       0.8957     2.041443       701.90
+GPU-NND bk=1x refine=1 (self-beam)                    13_917.49     5_819.84    19_737.33       0.9797     0.039889       701.90
+GPU-NND bk=1x refine=2 (extract)                      17_899.80        82.60    17_982.40       0.9012     2.025916       701.90
+GPU-NND bk=1x refine=2 (self-beam)                    17_899.80     5_803.19    23_702.99       0.9802     0.038870       701.90
+--------------------------------------------------------------------------------------------------------------------------------
+GPU-NND bk=2x refine=0 (extract)                      17_588.76        87.83    17_676.59       0.9083     2.010620       701.90
+GPU-NND bk=2x refine=0 (self-beam)                    17_588.76     6_301.61    23_890.37       0.9875     0.018654       701.90
+GPU-NND bk=2x refine=1 (extract)                      28_256.74        82.49    28_339.22       0.9294     1.950539       701.90
+GPU-NND bk=2x refine=1 (self-beam)                    28_256.74     6_196.36    34_453.10       0.9902     0.012203       701.90
+GPU-NND bk=2x refine=2 (extract)                      44_362.02        82.05    44_444.07       0.9302     1.948461       701.90
+GPU-NND bk=2x refine=2 (self-beam)                    44_362.02     5_800.10    50_162.12       0.9904     0.011695       701.90
+--------------------------------------------------------------------------------------------------------------------------------
+GPU-NND bk=3x refine=0 (extract)                      44_005.58        83.44    44_089.02       0.9242     1.964038       701.90
+GPU-NND bk=3x refine=0 (self-beam)                    44_005.58     6_330.88    50_336.46       0.9901     0.011718       701.90
+GPU-NND bk=3x refine=1 (extract)                      64_769.09        83.67    64_852.75       0.9328     1.941931       701.90
+GPU-NND bk=3x refine=1 (self-beam)                    64_769.09     5_834.33    70_603.41       0.9916     0.008480       701.90
+GPU-NND bk=3x refine=2 (extract)                      94_679.89        82.30    94_762.18       0.9329     1.941600       701.90
+GPU-NND bk=3x refine=2 (self-beam)                    94_679.89     6_319.99   100_999.88       0.9916     0.008280       701.90
+--------------------------------------------------------------------------------------------------------------------------------
+</code></pre>
+</details>
+
+Let's do one large data set with 2.5m cells at 32 dimensions and see what
+happens ... ?
+
+<details>
+<summary><b>Generation of a kNN graph with CAGRA (2.5m samples; 32 dimensions)</b>:</summary>
+<pre><code>
+================================================================================================================================
+Benchmark: 2500k cells, 32D kNN graph generation (build_k x refinement)
+================================================================================================================================
+Method                                               Build (ms)   Query (ms)   Total (ms)     Recall@k   Dist Error    Size (MB)
+--------------------------------------------------------------------------------------------------------------------------------
+GPU-Exhaustive (ground truth)                             57.25 1_468_501.04 1_468_558.29       1.0000     0.000000       305.18
+CPU-NNDescent (k=15)                                  65_984.14    20_250.36    86_234.49       0.9991     0.000418      3235.77
+--------------------------------------------------------------------------------------------------------------------------------
+GPU-NND bk=1x refine=0 (extract)                      19_919.09       442.76    20_361.85       0.8489     0.583217      1449.59
+GPU-NND bk=1x refine=0 (self-beam)                    19_919.09    12_834.35    32_753.43       0.9807     0.010239      1449.59
+GPU-NND bk=1x refine=1 (extract)                      23_022.03       449.21    23_471.24       0.8991     0.537751      1449.59
+GPU-NND bk=1x refine=1 (self-beam)                    23_022.03    12_792.96    35_814.99       0.9831     0.008733      1449.59
+GPU-NND bk=1x refine=2 (extract)                      26_379.19       449.91    26_829.09       0.9043     0.533820      1449.59
+GPU-NND bk=1x refine=2 (self-beam)                    26_379.19    12_955.97    39_335.16       0.9835     0.008434      1449.59
+--------------------------------------------------------------------------------------------------------------------------------
+GPU-NND bk=2x refine=0 (extract)                      27_630.71       439.61    28_070.32       0.9113     0.529758      1449.59
+GPU-NND bk=2x refine=0 (self-beam)                    27_630.71    12_704.59    40_335.30       0.9902     0.003774      1449.59
+GPU-NND bk=2x refine=1 (extract)                      37_544.14       438.75    37_982.89       0.9301     0.515632      1449.59
+GPU-NND bk=2x refine=1 (self-beam)                    37_544.14    12_614.01    50_158.15       0.9925     0.002372      1449.59
+GPU-NND bk=2x refine=2 (extract)                      50_440.12       441.07    50_881.19       0.9308     0.515140      1449.59
+GPU-NND bk=2x refine=2 (self-beam)                    50_440.12    13_043.14    63_483.26       0.9928     0.002233      1449.59
+--------------------------------------------------------------------------------------------------------------------------------
+GPU-NND bk=3x refine=0 (extract)                      50_051.65       455.02    50_506.68       0.9255     0.518781      1449.59
+GPU-NND bk=3x refine=0 (self-beam)                    50_051.65    12_844.15    62_895.81       0.9925     0.002232      1449.59
+GPU-NND bk=3x refine=1 (extract)                      68_104.28       439.79    68_544.07       0.9329     0.513755      1449.59
+GPU-NND bk=3x refine=1 (self-beam)                    68_104.28    12_767.82    80_872.10       0.9937     0.001551      1449.59
+GPU-NND bk=3x refine=2 (extract)                      91_675.37       437.76    92_113.14       0.9330     0.513689      1449.59
+GPU-NND bk=3x refine=2 (self-beam)                    91_675.37    12_860.18   104_535.56       0.9937     0.001526      1449.59
+--------------------------------------------------------------------------------------------------------------------------------
+</code></pre>
+</details>
+
 Especially on larger data sets, we can accelerate the queries substantially
 and get up to 2x to 3x speed increases to generate the full kNN graph with
 Recall@k of ≥0.99. If you are okay with a graph that has Recall ≥0.9 you
-can do that in <10 seconds.
+can do that in <10 seconds on a million cells or ~30 seconds on 2.5 million
+cells (with n_dim = 32 dim).
 
 ## Conclusions
 
@@ -1107,4 +1183,4 @@ in specific situations and were designed to enable fast kNN generation for
 
 *All benchmarks were run on M1 Max MacBook Pro with 64 GB unified memory.*
 *The GPU backend was the `wgpu` backend.*
-*Last update: 2026/03/15 with version **0.2.5***
+*Last update: 2026/03/19 with version **0.2.7***

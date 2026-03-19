@@ -1,6 +1,6 @@
 [package]
 name = "ann-search-rs"
-version = "0.2.6"
+version = "0.2.7"
 edition = "2021"
 authors = ["Gregor Lueg <gregorlueg@me.com>"]
 license = "MIT"
@@ -15,12 +15,20 @@ path = "src/lib.rs"
 lto = true
 codegen-units = 1
 
-# Features
+############
+# Features #
+############
+
 [features]
+## Enables binary index support with optional memory-mapped files for on-disk vector storage
 binary = ["memmap2", "tempfile", "bytemuck"]
+## Enables GPU-accelerated indices via the CubeCL backend
 gpu = ["cubecl"]
+## Enables GPU integration tests (requires 'wgpu' and a GPU on the machine)
 gpu-tests = ["gpu"]
+## Enables quantised indices with different quantisations (BF16, SQ8, PQ, OPQ)
 quantised = ["half"]
+## Enables mimalloc as the global allocator for improved performance
 mimalloc = ["dep:mimalloc"]
 
 # Dependecies
@@ -29,6 +37,7 @@ approx = "0.5.1"
 bytemuck = { version = "1.24.0", features = ["derive"], optional = true }
 clap = { version = "4.5.53", features = ["derive"] }
 cubecl = { version = "0.9.0", features = ["wgpu", "cpu"], optional = true }
+document-features = "0.2.12"
 faer = "0.23.2"
 faer-traits = "0.23.2"
 fixedbitset = "0.5.7"
@@ -43,6 +52,9 @@ rustc-hash = "2.1.1"
 tempfile = { version = "3.24.0", optional = true }
 thousands = "0.2.0"
 wide = "1.1.1"
+
+[package.metadata.docs.rs]
+all-features = true
 
 ################
 # Gridsearches #

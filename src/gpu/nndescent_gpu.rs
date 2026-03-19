@@ -197,7 +197,7 @@ fn init_random_graph<F: Float>(
     #[comptime] use_cosine: bool,
     #[comptime] dim_lines: usize,
 ) {
-    let node = ABSOLUTE_POS_X;
+    let node = (CUBE_POS_Y * CUBE_COUNT_X + CUBE_POS_X) * WORKGROUP_SIZE_X + UNIT_POS_X;
     if node >= n {
         terminate!();
     }
@@ -261,7 +261,7 @@ fn init_random_graph<F: Float>(
 /// * `ABSOLUTE_POS_X` -> node index
 #[cube(launch_unchecked)]
 pub fn reset_proposals(prop_count: &mut Tensor<u32>, update_counter: &mut Tensor<u32>, n: u32) {
-    let idx = ABSOLUTE_POS_X;
+    let idx = (CUBE_POS_Y * CUBE_COUNT_X + CUBE_POS_X) * WORKGROUP_SIZE_X + UNIT_POS_X;
     if idx < n {
         prop_count[idx as usize] = 0u32;
     }
@@ -294,7 +294,7 @@ pub fn build_reverse_candidates(
     n: u32,
     #[comptime] build_k: u32,
 ) {
-    let node = ABSOLUTE_POS_X;
+    let node = (CUBE_POS_Y * CUBE_COUNT_X + CUBE_POS_X) * WORKGROUP_SIZE_X + UNIT_POS_X;
     if node >= n {
         terminate!();
     }
@@ -552,7 +552,7 @@ pub fn merge_proposals<F: Float>(
     n: u32,
     #[comptime] max_proposals: u32,
 ) {
-    let node = ABSOLUTE_POS_X;
+    let node = (CUBE_POS_Y * CUBE_COUNT_X + CUBE_POS_X) * WORKGROUP_SIZE_X + UNIT_POS_X;
     if node >= n {
         terminate!();
     }
@@ -907,7 +907,7 @@ pub fn cagra_build_reverse(
     n: u32,
     #[comptime] d: usize,
 ) {
-    let node = ABSOLUTE_POS_X;
+    let node = (CUBE_POS_Y * CUBE_COUNT_X + CUBE_POS_X) * WORKGROUP_SIZE_X + UNIT_POS_X;
     if node >= n {
         terminate!();
     }
@@ -952,7 +952,7 @@ pub fn cagra_merge_graphs(
     n: u32,
     #[comptime] d: usize,
 ) {
-    let node = ABSOLUTE_POS_X;
+    let node = (CUBE_POS_Y * CUBE_COUNT_X + CUBE_POS_X) * WORKGROUP_SIZE_X + UNIT_POS_X;
     if node >= n {
         terminate!();
     }
@@ -1460,7 +1460,7 @@ where
         let prop_count_gpu = GpuTensor::<R, u32>::empty(vec![n], &client);
         let update_counter_gpu = GpuTensor::<R, u32>::empty(vec![1], &client);
 
-        let grid_n = (n as u32).div_ceil(WORKGROUP_SIZE_X);
+        let (grid_n_x, grid_n_y) = grid_2d((n as u32).div_ceil(WORKGROUP_SIZE_X));
 
         // ---- 1a: Random graph initialisation (baseline for NNDescent) ----
         if verbose {
@@ -1470,7 +1470,7 @@ where
         unsafe {
             let _ = init_random_graph::launch_unchecked::<T, R>(
                 &client,
-                CubeCount::Static(grid_n, 1, 1),
+                CubeCount::Static(grid_n_x, grid_n_y, 1),
                 CubeDim::new_2d(WORKGROUP_SIZE_X, 1),
                 vectors_gpu.clone().into_tensor_arg(line),
                 norms_gpu.clone().into_tensor_arg(1),
@@ -1539,7 +1539,7 @@ where
             unsafe {
                 let _ = reset_proposals::launch_unchecked::<R>(
                     &client,
-                    CubeCount::Static(grid_n, 1, 1),
+                    CubeCount::Static(grid_n_x, grid_n_y, 1),
                     CubeDim::new_2d(WORKGROUP_SIZE_X, 1),
                     prop_count_gpu.clone().into_tensor_arg(1),
                     update_counter_gpu.clone().into_tensor_arg(1),
@@ -1548,7 +1548,7 @@ where
 
                 let _ = reset_proposals::launch_unchecked::<R>(
                     &client,
-                    CubeCount::Static(grid_n, 1, 1),
+                    CubeCount::Static(grid_n_x, grid_n_y, 1),
                     CubeDim::new_2d(WORKGROUP_SIZE_X, 1),
                     reverse_count_gpu.clone().into_tensor_arg(1),
                     update_counter_gpu.clone().into_tensor_arg(1),
@@ -1560,7 +1560,7 @@ where
             unsafe {
                 let _ = build_reverse_candidates::launch_unchecked::<R>(
                     &client,
-                    CubeCount::Static(grid_n, 1, 1),
+                    CubeCount::Static(grid_n_x, grid_n_y, 1),
                     CubeDim::new_2d(WORKGROUP_SIZE_X, 1),
                     graph_idx_gpu.clone().into_tensor_arg(1),
                     reverse_idx_gpu.clone().into_tensor_arg(1),
@@ -1601,7 +1601,7 @@ where
             unsafe {
                 let _ = merge_proposals::launch_unchecked::<T, R>(
                     &client,
-                    CubeCount::Static(grid_n, 1, 1),
+                    CubeCount::Static(grid_n_x, grid_n_y, 1),
                     CubeDim::new_2d(WORKGROUP_SIZE_X, 1),
                     graph_idx_gpu.clone().into_tensor_arg(1),
                     graph_dist_gpu.clone().into_tensor_arg(1),
@@ -1656,7 +1656,7 @@ where
             unsafe {
                 let _ = reset_proposals::launch_unchecked::<R>(
                     &client,
-                    CubeCount::Static(grid_n, 1, 1),
+                    CubeCount::Static(grid_n_x, grid_n_y, 1),
                     CubeDim::new_2d(WORKGROUP_SIZE_X, 1),
                     prop_count_gpu.clone().into_tensor_arg(1),
                     update_counter_gpu.clone().into_tensor_arg(1),
@@ -1686,7 +1686,7 @@ where
             unsafe {
                 let _ = merge_proposals::launch_unchecked::<T, R>(
                     &client,
-                    CubeCount::Static(grid_n, 1, 1),
+                    CubeCount::Static(grid_n_x, grid_n_y, 1),
                     CubeDim::new_2d(WORKGROUP_SIZE_X, 1),
                     graph_idx_gpu.clone().into_tensor_arg(1),
                     graph_dist_gpu.clone().into_tensor_arg(1),
@@ -1765,7 +1765,7 @@ where
 
             let _ = cagra_build_reverse::launch_unchecked::<R>(
                 &client,
-                CubeCount::Static(grid_n, 1, 1),
+                CubeCount::Static(grid_n_x, grid_n_y, 1),
                 CubeDim::new_2d(WORKGROUP_SIZE_X, 1),
                 pruned_idx_gpu.clone().into_tensor_arg(1),
                 reverse_idx_gpu.clone().into_tensor_arg(1),
@@ -1776,7 +1776,7 @@ where
 
             let _ = cagra_merge_graphs::launch_unchecked::<R>(
                 &client,
-                CubeCount::Static(grid_n, 1, 1),
+                CubeCount::Static(grid_n_x, grid_n_y, 1),
                 CubeDim::new_2d(WORKGROUP_SIZE_X, 1),
                 pruned_idx_gpu.into_tensor_arg(1),
                 reverse_idx_gpu.into_tensor_arg(1),

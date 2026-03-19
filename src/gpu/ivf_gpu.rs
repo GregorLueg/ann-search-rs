@@ -512,13 +512,13 @@ where
 
         let centroid_dists_gpu = GpuTensor::<R, T>::empty(vec![n_queries, self.nlist], client);
         let grid_x = (self.nlist as u32).div_ceil(WORKGROUP_SIZE_X);
-        let grid_y = (n_queries as u32).div_ceil(WORKGROUP_SIZE_Y);
+        let (grid_y, grid_z) = grid_2d((n_queries as u32).div_ceil(WORKGROUP_SIZE_Y));
 
         match self.metric {
             Dist::Euclidean => unsafe {
                 let _ = euclidean_tiled::launch_unchecked::<T, R>(
                     client,
-                    CubeCount::Static(grid_x, grid_y, 1),
+                    CubeCount::Static(grid_x, grid_y, grid_z),
                     CubeDim::new_2d(WORKGROUP_SIZE_X, WORKGROUP_SIZE_Y),
                     queries_gpu.clone().into_tensor_arg(vec_size),
                     self.centroids_gpu.clone().into_tensor_arg(vec_size),
@@ -539,7 +539,7 @@ where
             Dist::Cosine => unsafe {
                 let _ = cosine_tiled::launch_unchecked::<T, R>(
                     client,
-                    CubeCount::Static(grid_x, grid_y, 1),
+                    CubeCount::Static(grid_x, grid_y, grid_z),
                     CubeDim::new_2d(WORKGROUP_SIZE_X, WORKGROUP_SIZE_Y),
                     queries_gpu.clone().into_tensor_arg(vec_size),
                     self.centroids_gpu.clone().into_tensor_arg(vec_size),
@@ -661,7 +661,7 @@ where
             Dist::Euclidean => unsafe {
                 let _ = compute_ivf_mega_euclidean::launch_unchecked::<T, R>(
                     client,
-                    CubeCount::Static(grid_x, grid_y, 1),
+                    CubeCount::Static(grid_x, grid_y, grid_z),
                     CubeDim::new_2d(WORKGROUP_SIZE_X, WORKGROUP_SIZE_Y),
                     queries_gpu.clone().into_tensor_arg(vec_size),
                     self.vectors_gpu.clone().into_tensor_arg(vec_size),
@@ -676,7 +676,7 @@ where
             Dist::Cosine => unsafe {
                 let _ = compute_ivf_mega_cosine::launch_unchecked::<T, R>(
                     client,
-                    CubeCount::Static(grid_x, grid_y, 1),
+                    CubeCount::Static(grid_x, grid_y, grid_z),
                     CubeDim::new_2d(WORKGROUP_SIZE_X, WORKGROUP_SIZE_Y),
                     queries_gpu.clone().into_tensor_arg(vec_size),
                     self.vectors_gpu.clone().into_tensor_arg(vec_size),
@@ -698,12 +698,12 @@ where
         let topk_indices_gpu = GpuTensor::<R, u32>::empty(vec![n_queries, k], client);
 
         let init_grid_x = (k as u32).div_ceil(WORKGROUP_SIZE_X);
-        let init_grid_y = (n_queries as u32).div_ceil(WORKGROUP_SIZE_Y);
+        let (init_grid_y, init_grid_z) = grid_2d((n_queries as u32).div_ceil(WORKGROUP_SIZE_Y));
 
         unsafe {
             let _ = init_topk::launch_unchecked::<T, R>(
                 client,
-                CubeCount::Static(init_grid_x, init_grid_y, 1),
+                CubeCount::Static(init_grid_x, init_grid_y, init_grid_z),
                 CubeDim::new_2d(WORKGROUP_SIZE_X, WORKGROUP_SIZE_Y),
                 topk_dists_gpu.clone().into_tensor_arg(1),
                 topk_indices_gpu.clone().into_tensor_arg(1),
@@ -712,12 +712,12 @@ where
 
         let queries_per_cluster_gpu =
             GpuTensor::<R, u32>::from_slice(&cpu_write_pointers, vec![n_queries], client);
-        let reduce_grid_x = (n_queries as u32).div_ceil(WORKGROUP_SIZE_X);
+        let (reduce_grid_x, reduce_grid_y) = grid_2d((n_queries as u32).div_ceil(WORKGROUP_SIZE_X));
 
         unsafe {
             let _ = reduce_ivf_topk::launch_unchecked::<T, R>(
                 client,
-                CubeCount::Static(reduce_grid_x, 1, 1),
+                CubeCount::Static(reduce_grid_x, reduce_grid_y, 1),
                 CubeDim::new_2d(WORKGROUP_SIZE_X, 1),
                 candidate_dists_gpu.into_tensor_arg(1),
                 candidate_indices_gpu.into_tensor_arg(1),

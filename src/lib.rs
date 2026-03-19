@@ -2,7 +2,9 @@
 //! applications, but now as additionally GPU-accelerated, quantised (with
 //! binary indices) vector searches leveraging Rust's performance under the
 //! hood.
-
+//!
+//! ## Feature flags
+#![doc = document_features::document_features!()]
 #![allow(clippy::needless_range_loop)] // I want these loops!
 #![warn(missing_docs)]
 

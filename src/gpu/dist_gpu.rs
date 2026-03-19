@@ -83,7 +83,8 @@ pub fn euclidean_tiled<F: Float>(
     #[comptime] dim_lines: usize,
 ) {
     let db_idx = ABSOLUTE_POS_X as usize;
-    let query_idx = ABSOLUTE_POS_Y as usize;
+    let query_idx =
+        ((CUBE_POS_Z * CUBE_COUNT_Y + CUBE_POS_Y) * WORKGROUP_SIZE_Y + UNIT_POS_Y) as usize;
     let local_y = UNIT_POS_Y as usize;
     let local_x = UNIT_POS_X as usize;
 
@@ -179,7 +180,8 @@ pub fn cosine_tiled<F: Float>(
     #[comptime] dim_lines: usize,
 ) {
     let db_idx = ABSOLUTE_POS_X as usize;
-    let query_idx = ABSOLUTE_POS_Y as usize;
+    let query_idx =
+        ((CUBE_POS_Z * CUBE_COUNT_Y + CUBE_POS_Y) * WORKGROUP_SIZE_Y + UNIT_POS_Y) as usize;
     let local_y = UNIT_POS_Y as usize;
     let local_x = UNIT_POS_X as usize;
 
@@ -268,7 +270,8 @@ fn prefer_coalesced_topk<R: Runtime>(client: &ComputeClient<R>) -> bool {
 /// * `ABSOLUTE_POS_Y` -> query index
 #[cube(launch_unchecked)]
 pub fn init_topk<F: Float>(dists: &mut Tensor<F>, indices: &mut Tensor<u32>) {
-    let query_idx = ABSOLUTE_POS_Y as usize;
+    let query_idx =
+        ((CUBE_POS_Z * CUBE_COUNT_Y + CUBE_POS_Y) * WORKGROUP_SIZE_Y + UNIT_POS_Y) as usize;
     let k_idx = ABSOLUTE_POS_X as usize;
     let k = dists.shape(1);
 
@@ -307,7 +310,8 @@ pub fn extract_topk<F: Float>(
     chunk_offset: u32,
     actual_chunk_size: u32,
 ) {
-    let query_idx = ABSOLUTE_POS_X as usize;
+    let query_idx =
+        ((CUBE_POS_Y * CUBE_COUNT_X + CUBE_POS_X) * WORKGROUP_SIZE_X + UNIT_POS_X) as usize;
 
     if query_idx >= distances.shape(0) {
         terminate!();
@@ -597,11 +601,11 @@ where
         let topk_indices = GpuTensor::<R, u32>::empty(vec![n_q, k], &client);
 
         let init_gx = (k as u32).div_ceil(WORKGROUP_SIZE_X);
-        let init_gy = (n_q as u32).div_ceil(WORKGROUP_SIZE_Y);
+        let (init_gy, init_gz) = grid_2d((n_q as u32).div_ceil(WORKGROUP_SIZE_Y));
         unsafe {
             let _ = init_topk::launch_unchecked::<T, R>(
                 &client,
-                CubeCount::Static(init_gx, init_gy, 1),
+                CubeCount::Static(init_gx, init_gy, init_gz),
                 CubeDim::new_2d(WORKGROUP_SIZE_X, WORKGROUP_SIZE_Y),
                 topk_dists.clone().into_tensor_arg(1),
                 topk_indices.clone().into_tensor_arg(1),
@@ -617,13 +621,13 @@ where
             let n_db = db_end - db_start;
 
             let grid_x = (n_db as u32).div_ceil(WORKGROUP_SIZE_X);
-            let grid_y = (n_q as u32).div_ceil(WORKGROUP_SIZE_Y);
+            let (grid_y, grid_z) = grid_2d((n_q as u32).div_ceil(WORKGROUP_SIZE_Y));
 
             match *metric {
                 Dist::Euclidean => unsafe {
                     let _ = euclidean_tiled::launch_unchecked::<T, R>(
                         &client,
-                        CubeCount::Static(grid_x, grid_y, 1),
+                        CubeCount::Static(grid_x, grid_y, grid_z),
                         CubeDim::new_2d(WORKGROUP_SIZE_X, WORKGROUP_SIZE_Y),
                         query_gpu.clone().into_tensor_arg(vec_size),
                         db_gpu.clone().into_tensor_arg(vec_size),
@@ -642,7 +646,7 @@ where
                 Dist::Cosine => unsafe {
                     let _ = cosine_tiled::launch_unchecked::<T, R>(
                         &client,
-                        CubeCount::Static(grid_x, grid_y, 1),
+                        CubeCount::Static(grid_x, grid_y, grid_z),
                         CubeDim::new_2d(WORKGROUP_SIZE_X, WORKGROUP_SIZE_Y),
                         query_gpu.clone().into_tensor_arg(vec_size),
                         db_gpu.clone().into_tensor_arg(vec_size),
@@ -663,11 +667,11 @@ where
             }
 
             // Extract directly into the running top-k buffer
-            let extract_grid = (n_q as u32).div_ceil(WORKGROUP_SIZE_X);
+            let (extract_grid_x, extract_grid_y) = grid_2d((n_q as u32).div_ceil(WORKGROUP_SIZE_X));
             unsafe {
                 let _ = extract_topk::launch_unchecked::<T, R>(
                     &client,
-                    CubeCount::Static(extract_grid, 1, 1),
+                    CubeCount::Static(extract_grid_x, extract_grid_y, 1),
                     CubeDim::new_2d(WORKGROUP_SIZE_X, 1),
                     distances_gpu.clone().into_tensor_arg(1),
                     topk_dists.clone().into_tensor_arg(1),
@@ -974,7 +978,7 @@ pub fn compute_ivf_mega_euclidean<F: Float>(
     out_indices: &mut Tensor<u32>,
 ) {
     let local_db_idx = ABSOLUTE_POS_X;
-    let task_idx = ABSOLUTE_POS_Y;
+    let task_idx = (CUBE_POS_Z * CUBE_COUNT_Y + CUBE_POS_Y) * WORKGROUP_SIZE_Y + UNIT_POS_Y;
 
     if task_idx >= task_q_idx.len() as u32 {
         terminate!();
@@ -1052,7 +1056,7 @@ pub fn compute_ivf_mega_cosine<F: Float>(
     out_indices: &mut Tensor<u32>,
 ) {
     let local_db_idx = ABSOLUTE_POS_X;
-    let task_idx = ABSOLUTE_POS_Y;
+    let task_idx = (CUBE_POS_Z * CUBE_COUNT_Y + CUBE_POS_Y) * WORKGROUP_SIZE_Y + UNIT_POS_Y;
 
     if task_idx >= task_q_idx.len() as u32 {
         terminate!();
@@ -1121,7 +1125,7 @@ pub fn reduce_ivf_topk<F: Float>(
     out_dists: &mut Tensor<F>,
     out_indices: &mut Tensor<u32>,
 ) {
-    let q_idx = ABSOLUTE_POS_X as usize;
+    let q_idx = ((CUBE_POS_Y * CUBE_COUNT_X + CUBE_POS_X) * WORKGROUP_SIZE_X + UNIT_POS_X) as usize;
 
     if q_idx >= candidate_dists.shape(0) {
         terminate!();
