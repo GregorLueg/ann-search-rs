@@ -780,6 +780,7 @@ where
             + self.roots.capacity() * std::mem::size_of::<u32>()
             + self.split_data.capacity() * std::mem::size_of::<T>()
             + self.leaf_indices.capacity() * std::mem::size_of::<usize>()
+            + self.original_ids.capacity() * std::mem::size_of::<usize>()
     }
 }
 
@@ -802,6 +803,10 @@ where
 
     fn metric(&self) -> Dist {
         self.metric
+    }
+
+    fn original_ids(&self) -> &[usize] {
+        &self.original_ids
     }
 }
 

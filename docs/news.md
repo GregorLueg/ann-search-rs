@@ -1,5 +1,7 @@
 # News
 
+## 0.2.7
+
 ## 0.2.6
 
 Same as version 0.2.6; however, the MiMalloc activation was made optional via

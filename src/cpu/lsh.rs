@@ -59,6 +59,8 @@ pub struct LSHIndex<T> {
     /// Pre-computed hashes per vector per table, layout:
     /// `[table_idx * n + vec_idx]`. Used to skip re-hashing during self-query.
     vector_hashes: Vec<u64>,
+    /// Orignal indices
+    original_ids: Vec<usize>,
 }
 
 /// VectorDistance trait
@@ -203,6 +205,7 @@ where
             num_tables,
             bits_per_hash,
             vector_hashes,
+            original_ids: (0..n).collect(),
         }
     }
 
@@ -863,6 +866,10 @@ where
 
     fn metric(&self) -> Dist {
         self.metric
+    }
+
+    fn original_ids(&self) -> &[usize] {
+        &self.original_ids
     }
 }
 

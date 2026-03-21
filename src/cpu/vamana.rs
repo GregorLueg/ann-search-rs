@@ -358,6 +358,8 @@ pub struct VamanaIndex<T> {
     pub r: usize,
     /// Search beam width during construction
     pub l_build: usize,
+    /// Orignal indices
+    original_ids: Vec<usize>,
 }
 
 /// VectorDistance implementation
@@ -437,6 +439,7 @@ where
             medoid,
             r,
             l_build,
+            original_ids: (0..n).collect(),
         };
 
         let passes = [alpha_pass1, alpha_pass2];
@@ -928,6 +931,33 @@ where
             + self.vectors_flat.capacity() * std::mem::size_of::<T>()
             + self.norms.capacity() * std::mem::size_of::<T>()
             + self.graph.capacity() * std::mem::size_of::<u32>()
+    }
+}
+
+///////////////////
+// KnnValidation //
+///////////////////
+
+impl<T> KnnValidation<T> for VamanaIndex<T>
+where
+    T: AnnSearchFloat,
+    Self: VamanaState<T>,
+{
+    fn query_for_validation(&self, query_vec: &[T], k: usize) -> (Vec<usize>, Vec<T>) {
+        // Default budget
+        self.query(query_vec, k, None)
+    }
+
+    fn n(&self) -> usize {
+        self.n
+    }
+
+    fn metric(&self) -> Dist {
+        self.metric
+    }
+
+    fn original_ids(&self) -> &[usize] {
+        &self.original_ids
     }
 }
 

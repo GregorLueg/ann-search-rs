@@ -397,6 +397,8 @@ where
     ef_construction: usize,
     ///  Whether to extend candidate pool (unused)
     extend_candidates: bool,
+    /// Original indices - for trait purposes
+    original_ids: Vec<usize>,
 }
 
 impl<T> VectorDistance<T> for HnswIndex<T>
@@ -520,6 +522,7 @@ where
             m,
             ef_construction,
             extend_candidates: false,
+            original_ids: (0..n).collect(),
         };
 
         // Build the graph layer by layer, from TOP to BOTTOM
@@ -1267,6 +1270,10 @@ where
 
     fn metric(&self) -> Dist {
         self.metric
+    }
+
+    fn original_ids(&self) -> &[usize] {
+        &self.original_ids
     }
 }
 
