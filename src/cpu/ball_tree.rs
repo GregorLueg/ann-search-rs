@@ -250,6 +250,8 @@ pub struct BallTreeIndex<T> {
     centers_data_norm: Vec<T>,
     /// Actual data indices stored in leaf nodes
     leaf_indices: Vec<usize>,
+    /// Original indices - for trait purposes
+    original_ids: Vec<usize>,
 }
 
 ////////////////////
@@ -359,6 +361,7 @@ where
             n,
             norms,
             metric,
+            original_ids: (0..n).collect(),
         }
     }
 
@@ -999,6 +1002,7 @@ where
             + self.nodes.capacity() * std::mem::size_of::<BallNode<T>>()
             + self.centers_data.capacity() * std::mem::size_of::<T>()
             + self.leaf_indices.capacity() * std::mem::size_of::<usize>()
+            + self.original_ids.capacity() * std::mem::size_of::<usize>()
     }
 }
 
@@ -1021,6 +1025,10 @@ where
 
     fn metric(&self) -> Dist {
         self.metric
+    }
+
+    fn original_ids(&self) -> &[usize] {
+        &self.original_ids
     }
 }
 

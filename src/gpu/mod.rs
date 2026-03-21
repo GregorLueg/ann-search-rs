@@ -28,3 +28,22 @@ pub const WORKGROUP_SIZE_Y: u32 = 32;
 
 /// Line size for vectorisations in this crate
 pub const LINE_SIZE: u32 = 4;
+
+/////////////
+// Helpers //
+/////////////
+
+/// Split a flat workgroup count into a 2D grid that respects the 65535 limit.
+///
+/// ### Params
+///
+/// * `total_cubes` - Total number of cubes
+///
+/// ### Returns
+///
+/// (x, y) in terms of size
+pub fn grid_2d(total_cubes: u32) -> (u32, u32) {
+    let x = total_cubes.min(65535);
+    let y = total_cubes.div_ceil(x);
+    (x, y)
+}

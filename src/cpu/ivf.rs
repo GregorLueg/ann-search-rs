@@ -478,6 +478,10 @@ where
     fn metric(&self) -> Dist {
         self.metric
     }
+
+    fn original_ids(&self) -> &[usize] {
+        &self.original_ids
+    }
 }
 
 ///////////

@@ -84,6 +84,15 @@ where
     /// The Dist metric.
     fn metric(&self) -> Dist;
 
+    /// Return the original indices
+    ///
+    /// Needed for situations where the index remaps the data
+    ///
+    /// ### Returns
+    ///
+    /// The original indices of the index
+    fn original_ids(&self) -> &[usize];
+
     /// Exhaustive search for ground truth
     ///
     /// ### Params
@@ -138,7 +147,7 @@ where
 
         let (distances, indices): (Vec<_>, Vec<_>) = results
             .into_iter()
-            .map(|(OrderedFloat(dist), idx)| (dist, idx))
+            .map(|(OrderedFloat(dist), idx)| (dist, self.original_ids()[idx]))
             .unzip();
 
         (indices, distances)

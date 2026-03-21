@@ -254,6 +254,8 @@ pub struct NNDescent<T> {
     graph: Vec<(usize, T)>,
     /// Whether construction converged
     converged: bool,
+    /// Original indices - for trait purposes
+    original_ids: Vec<usize>,
 }
 
 ////////////////////
@@ -357,6 +359,7 @@ where
             graph: Vec::new(),
             converged: false,
             forest: annoy_index,
+            original_ids: (0..n).collect(),
         };
 
         let (build_graph, converged) =
@@ -378,6 +381,7 @@ where
             graph,
             converged,
             forest: builder.forest,
+            original_ids: (0..n).collect(),
         }
     }
 
@@ -1377,6 +1381,10 @@ where
 
     fn metric(&self) -> Dist {
         self.metric
+    }
+
+    fn original_ids(&self) -> &[usize] {
+        &self.original_ids
     }
 }
 

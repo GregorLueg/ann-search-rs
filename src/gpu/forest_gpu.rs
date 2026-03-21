@@ -74,7 +74,7 @@ fn compute_dot_products<F: AnnSearchGpuFloat>(
     n: u32,
     #[comptime] dim_lines: usize,
 ) {
-    let idx = ABSOLUTE_POS_X;
+    let idx = (CUBE_POS_Y * CUBE_COUNT_X + CUBE_POS_X) * WORKGROUP_SIZE_X + UNIT_POS_X;
     if idx >= n {
         terminate!();
     }
@@ -115,7 +115,7 @@ fn partition_points<F: AnnSearchGpuFloat>(
     medians: &Tensor<F>,
     n: u32,
 ) {
-    let idx = ABSOLUTE_POS_X;
+    let idx = (CUBE_POS_Y * CUBE_COUNT_X + CUBE_POS_X) * WORKGROUP_SIZE_X + UNIT_POS_X;
     if idx >= n {
         terminate!();
     }
@@ -511,7 +511,7 @@ pub fn gpu_forest_init<T, R>(
 {
     let line = LINE_SIZE as usize;
     let dim_vec = dim_padded / line;
-    let grid_n = (n as u32).div_ceil(WORKGROUP_SIZE_X);
+    let (grid_n_x, grid_n_y) = grid_2d((n as u32).div_ceil(WORKGROUP_SIZE_X));
 
     // Dynamic leaf size based on dimension
     let max_leaf_size = compute_max_leaf_size(dim_padded);
@@ -645,7 +645,7 @@ pub fn gpu_forest_init<T, R>(
         unsafe {
             let _ = reset_proposals::launch_unchecked::<R>(
                 client,
-                CubeCount::Static(grid_n, 1, 1),
+                CubeCount::Static(grid_n_x, grid_n_y, 1),
                 CubeDim::new_2d(WORKGROUP_SIZE_X, 1),
                 prop_count_gpu.clone().into_tensor_arg(1),
                 update_counter_gpu.clone().into_tensor_arg(1),
@@ -685,7 +685,7 @@ pub fn gpu_forest_init<T, R>(
         unsafe {
             let _ = merge_proposals::launch_unchecked::<T, R>(
                 client,
-                CubeCount::Static(grid_n, 1, 1),
+                CubeCount::Static(grid_n_x, grid_n_y, 1),
                 CubeDim::new_2d(WORKGROUP_SIZE_X, 1),
                 graph_idx_gpu.clone().into_tensor_arg(1),
                 graph_dist_gpu.clone().into_tensor_arg(1),
