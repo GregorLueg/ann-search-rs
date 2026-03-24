@@ -604,7 +604,6 @@ pub fn gpu_forest_init<T, R>(
     prop_dist_gpu: &GpuTensor<R, T>,
     prop_count_gpu: &GpuTensor<R, u32>,
     update_counter_gpu: &GpuTensor<R, u32>,
-    vectors_flat: &[T],
     n: usize,
     dim: usize,
     dim_padded: usize,
@@ -645,6 +644,10 @@ where
 
     let cpu_start = Instant::now();
 
+    let dot_values_gpu = GpuTensor::<R, T>::empty(vec![n], client);
+    let dot_grid = (n as u32).div_ceil(WORKGROUP_SIZE_X);
+    let (dot_grid_x, dot_grid_y) = grid_2d(dot_grid);
+
     let all_tree_results: TreeResults<T> = (0..n_trees)
         .map(|tree_idx| {
             let tree_seed =
@@ -668,6 +671,7 @@ where
                     tree_seed.wrapping_add((level as u64).wrapping_mul(0x517CC1B727220A95u64));
                 let mut rng = SmallRng::seed_from_u64(level_seed);
 
+                // Generate and normalise random projection vector
                 let mut random_vec = vec![T::zero(); dim];
                 for v in random_vec.iter_mut() {
                     *v = T::from_f64(rng.random_range(-1.0..1.0)).unwrap();
@@ -680,18 +684,34 @@ where
                     }
                 }
 
-                // Full thread pool available for 2.8M-way parallelism
-                let dot_values: Vec<T> = (0..n)
-                    .into_par_iter()
-                    .map(|i| {
-                        let row = &vectors_flat[i * dim..(i + 1) * dim];
-                        T::dot_simd(row, &random_vec)
-                    })
-                    .collect();
+                // Pad to dim_padded for the GPU kernel's Line<F> layout
+                let mut random_vec_padded = vec![T::zero(); dim_padded];
+                random_vec_padded[..dim].copy_from_slice(&random_vec);
+                let random_vec_gpu =
+                    GpuTensor::<R, T>::from_slice(&random_vec_padded, vec![dim_padded], client);
 
+                // GPU dot products (2.8M threads, ~2ms per launch)
+                unsafe {
+                    let _ = compute_dot_products::launch_unchecked::<T, R>(
+                        client,
+                        CubeCount::Static(dot_grid_x, dot_grid_y, 1),
+                        CubeDim::new_2d(WORKGROUP_SIZE_X, 1),
+                        vectors_gpu.clone().into_tensor_arg(line),
+                        random_vec_gpu.into_tensor_arg(line),
+                        dot_values_gpu.clone().into_tensor_arg(1),
+                        ScalarArg { elem: n as u32 },
+                        dim_vec,
+                    );
+                }
+
+                // Read back dot values (~11MB, sub-millisecond)
+                let dot_values = dot_values_gpu.clone().read(client);
+
+                // CPU median computation (fast, O(n))
                 let n_partitions = 1usize << level;
                 let medians = compute_partition_medians(&partition_ids, &dot_values, n_partitions);
 
+                // CPU partition update (trivial parallel scatter)
                 partition_ids
                     .par_iter_mut()
                     .zip(dot_values.par_iter())
@@ -1601,7 +1621,6 @@ mod tests {
             &prop_dist_gpu,
             &prop_count_gpu,
             &update_counter_gpu,
-            &data,
             n,
             dim,
             dim_padded,

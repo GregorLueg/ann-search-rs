@@ -1475,7 +1475,6 @@ where
             &prop_dist_gpu,
             &prop_count_gpu,
             &update_counter_gpu,
-            &vectors_flat,
             n,
             dim,
             dim_padded,
