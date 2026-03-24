@@ -159,14 +159,14 @@ fn partition_points<F: AnnSearchGpuFloat>(
 ///
 /// ### Returns
 ///
-/// Maximum number of points per leaf, clamped to `[2, 256]`
+/// Maximum number of points per leaf, clamped to `[2, 64]`
 fn compute_max_leaf_size(dim_padded: usize) -> usize {
     let line = LINE_SIZE as usize;
     let dim_scalars = (dim_padded / line) * 4;
     let per_point = dim_scalars * std::mem::size_of::<f32>() + 4 + 4;
     let overhead = 8; // shared_leaf_start + shared_leaf_size
     let available = SMEM_BUDGET.saturating_sub(overhead);
-    (available / per_point).clamp(2, 256)
+    (available / per_point).clamp(2, 64)
 }
 
 /// All-pairs distance computation within a leaf, emitting proposals.
@@ -680,7 +680,7 @@ where
                     tree_seed.wrapping_add((level as u64).wrapping_mul(0x517CC1B727220A95u64));
                 let mut rng = SmallRng::seed_from_u64(level_seed);
 
-                // Generate and normalise random projection vector
+                // generate and normalise random projection vector
                 let mut random_vec = vec![T::zero(); dim];
                 for v in random_vec.iter_mut() {
                     *v = T::from_f64(rng.random_range(-1.0..1.0)).unwrap();
@@ -693,7 +693,7 @@ where
                     }
                 }
 
-                // Pad to dim_padded for the GPU kernel's Line<F> layout
+                // pad to dim_padded for the GPU kernel's Line<F> layout
                 let mut random_vec_padded = vec![T::zero(); dim_padded];
                 random_vec_padded[..dim].copy_from_slice(&random_vec);
                 let random_vec_gpu =
@@ -716,7 +716,7 @@ where
                 // Read back dot values (~11MB, blocking but overlapped by Rayon)
                 let dot_values = dot_values_gpu.clone().read(client);
 
-                // CPU median computation (fast, O(n), parallelized internally)
+                // CPU median computation (fast, O(n), parallelised internally)
                 let n_partitions = 1usize << level;
                 let medians = compute_partition_medians(&partition_ids, &dot_values, n_partitions);
 
@@ -741,6 +741,11 @@ where
 
             (partition_ids, routing_vecs, routing_medians)
         })
+        .collect();
+
+    let leaf_structures: Vec<_> = all_tree_results
+        .par_iter()
+        .map(|tree| build_leaf_structure(&tree.0, n))
         .collect();
 
     if verbose {
@@ -788,18 +793,17 @@ where
         let mut batch_leaf_offsets: Vec<u32> = Vec::new();
 
         for tree_idx in batch_start..batch_end {
-            let (leaf_points, leaf_offsets, n_leaves) =
-                build_leaf_structure(&all_tree_results[tree_idx].0, n);
+            let (leaf_points, leaf_offsets, n_leaves) = &leaf_structures[tree_idx];
 
-            if n_leaves == 0 {
+            if *n_leaves == 0 {
                 continue;
             }
 
             let base_offset = batch_leaf_points.len() as u32;
-            for i in 0..n_leaves {
+            for i in 0..*n_leaves {
                 batch_leaf_offsets.push(leaf_offsets[i] + base_offset);
             }
-            batch_leaf_points.extend_from_slice(&leaf_points);
+            batch_leaf_points.extend_from_slice(leaf_points);
         }
 
         batch_leaf_offsets.push(batch_leaf_points.len() as u32);
