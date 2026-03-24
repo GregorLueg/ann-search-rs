@@ -929,29 +929,6 @@ mod tests {
     }
 
     #[test]
-    fn test_ivf_generate_knn() {
-        let device = CpuDevice;
-
-        let data = Mat::from_fn(30, 4, |i, j| ((i * 3 + j) as f32) / 20.0);
-
-        let index = IvfIndexGpu::<f32, CpuRuntime>::build(
-            data.as_ref(),
-            Dist::Euclidean,
-            Some(5),
-            Some(5),
-            42,
-            false,
-            device,
-        );
-
-        let (indices, distances) = index.generate_knn(4, Some(3), None, true, false);
-
-        assert_eq!(indices.len(), 30);
-        assert!(distances.is_some());
-        assert_eq!(distances.unwrap().len(), 30);
-    }
-
-    #[test]
     fn test_reorganise_by_cluster() {
         let vectors: Vec<f32> = vec![
             1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0,
@@ -966,5 +943,48 @@ mod tests {
         assert_eq!(offsets.len(), 3);
         assert_eq!(offsets[0], 0);
         assert_eq!(offsets[2], 4);
+    }
+}
+
+#[cfg(test)]
+#[cfg(feature = "gpu-tests")]
+mod tests_wpgu {
+    use super::*;
+    use cubecl::wgpu::WgpuDevice;
+    use cubecl::wgpu::WgpuRuntime;
+    use faer::Mat;
+
+    fn try_device() -> Option<WgpuDevice> {
+        let device = WgpuDevice::DefaultDevice;
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            cubecl::wgpu::WgpuRuntime::client(&device);
+        }));
+        result.ok().map(|_| device)
+    }
+
+    #[test]
+    fn test_ivf_generate_knn() {
+        let Some(device) = try_device() else {
+            eprintln!("Skipping test: no wgpu backend available");
+            return;
+        };
+
+        let data = Mat::from_fn(30, 4, |i, j| ((i * 3 + j) as f32) / 20.0);
+
+        let index = IvfIndexGpu::<f32, WgpuRuntime>::build(
+            data.as_ref(),
+            Dist::Euclidean,
+            Some(5),
+            Some(5),
+            42,
+            false,
+            device,
+        );
+
+        let (indices, distances) = index.generate_knn(4, Some(3), None, true, false);
+
+        assert_eq!(indices.len(), 30);
+        assert!(distances.is_some());
+        assert_eq!(distances.unwrap().len(), 30);
     }
 }
