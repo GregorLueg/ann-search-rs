@@ -47,3 +47,30 @@ pub fn grid_2d(total_cubes: u32) -> (u32, u32) {
     let y = total_cubes.div_ceil(x);
     (x, y)
 }
+
+/// Pad vectors to `dim_padded` by appending zeros to each row.
+///
+/// ### Params
+///
+/// * `flat` - Flattened row-major vector data of size `n * dim`
+/// * `n` - Number of vectors
+/// * `dim` - Original dimensionality
+/// * `dim_padded` - Target dimensionality (must be >= `dim`)
+///
+/// ### Returns
+///
+/// Padded flat vector of size `n * dim_padded`
+pub fn pad_vectors<T: num_traits::Float>(
+    flat: &[T],
+    n: usize,
+    dim: usize,
+    dim_padded: usize,
+) -> Vec<T> {
+    let mut padded = vec![T::zero(); n * dim_padded];
+    for i in 0..n {
+        let src = &flat[i * dim..(i + 1) * dim];
+        let dst = &mut padded[i * dim_padded..i * dim_padded + dim];
+        dst.copy_from_slice(src);
+    }
+    padded
+}

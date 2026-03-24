@@ -2,6 +2,11 @@
 
 ## 0.2.8
 
+**Features**
+
+- Improved GPU searches. Padding used for exhaustive and IVF, speed increases
+  thanks to shared memory.
+
 ## 0.2.7
 
 **Features**
