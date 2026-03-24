@@ -567,14 +567,21 @@ where
                 let mut cluster_dists: Vec<(T, usize)> = (0..self.nlist)
                     .map(|c| (centroid_dists[row_start + c], c))
                     .collect();
-                cluster_dists.sort_unstable_by(|a, b| {
-                    a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal)
-                });
-                cluster_dists
-                    .into_iter()
-                    .take(nprobe)
-                    .map(|(_, c)| c)
-                    .collect()
+
+                if nprobe < self.nlist {
+                    cluster_dists.select_nth_unstable_by(nprobe, |a, b| {
+                        a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal)
+                    });
+                    cluster_dists[..nprobe].sort_unstable_by(|a, b| {
+                        a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal)
+                    });
+                } else {
+                    cluster_dists.sort_unstable_by(|a, b| {
+                        a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal)
+                    });
+                }
+
+                cluster_dists[..nprobe].iter().map(|&(_, c)| c).collect()
             })
             .collect();
 
@@ -637,14 +644,14 @@ where
         let task_db_count_gpu =
             GpuTensor::<R, u32>::from_slice(&task_db_count, vec![n_tasks], client);
 
-        let grid_x = max_db_count.div_ceil(WORKGROUP_SIZE_X).max(1);
-        let grid_y = (n_tasks as u32).div_ceil(WORKGROUP_SIZE_Y).max(1);
+        let mega_grid_x = max_db_count.div_ceil(WORKGROUP_SIZE_X).max(1);
+        let (mega_grid_y, mega_grid_z) = grid_2d((n_tasks as u32).div_ceil(WORKGROUP_SIZE_Y));
 
         match self.metric {
             Dist::Euclidean => unsafe {
-                let _ = compute_ivf_mega_euclidean::launch_unchecked::<T, R>(
+                let _ = compute_ivf_mega_euclidean_cached::launch_unchecked::<T, R>(
                     client,
-                    CubeCount::Static(grid_x, grid_y, grid_z),
+                    CubeCount::Static(mega_grid_x, mega_grid_y, mega_grid_z),
                     CubeDim::new_2d(WORKGROUP_SIZE_X, WORKGROUP_SIZE_Y),
                     queries_gpu.clone().into_tensor_arg(vec_size),
                     self.vectors_gpu.clone().into_tensor_arg(vec_size),
@@ -654,12 +661,16 @@ where
                     task_db_count_gpu.into_tensor_arg(1),
                     candidate_dists_gpu.clone().into_tensor_arg(1),
                     candidate_indices_gpu.clone().into_tensor_arg(1),
+                    ScalarArg {
+                        elem: n_tasks as u32,
+                    },
+                    dim_lines,
                 );
             },
             Dist::Cosine => unsafe {
-                let _ = compute_ivf_mega_cosine::launch_unchecked::<T, R>(
+                let _ = compute_ivf_mega_cosine_cached::launch_unchecked::<T, R>(
                     client,
-                    CubeCount::Static(grid_x, grid_y, grid_z),
+                    CubeCount::Static(mega_grid_x, mega_grid_y, mega_grid_z),
                     CubeDim::new_2d(WORKGROUP_SIZE_X, WORKGROUP_SIZE_Y),
                     queries_gpu.clone().into_tensor_arg(vec_size),
                     self.vectors_gpu.clone().into_tensor_arg(vec_size),
@@ -671,49 +682,40 @@ where
                     task_db_count_gpu.into_tensor_arg(1),
                     candidate_dists_gpu.clone().into_tensor_arg(1),
                     candidate_indices_gpu.clone().into_tensor_arg(1),
+                    ScalarArg {
+                        elem: n_tasks as u32,
+                    },
+                    dim_lines,
                 );
             },
         }
 
         // ── Step 5: Top-K reduction ──
 
-        let topk_dists_gpu = GpuTensor::<R, T>::empty(vec![n_queries, k], client);
-        let topk_indices_gpu = GpuTensor::<R, u32>::empty(vec![n_queries, k], client);
+        let topk_dists = GpuTensor::<R, T>::empty(vec![n_queries, k], client);
+        let topk_indices = GpuTensor::<R, u32>::empty(vec![n_queries, k], client);
 
-        let init_grid_x = (k as u32).div_ceil(WORKGROUP_SIZE_X);
-        let (init_grid_y, init_grid_z) = grid_2d((n_queries as u32).div_ceil(WORKGROUP_SIZE_Y));
-
+        let cpq = GpuTensor::<R, u32>::from_slice(&cpu_write_pointers, vec![n_queries], client);
+        let (coal_gx, coal_gy) = grid_2d(n_queries as u32);
         unsafe {
-            let _ = init_topk::launch_unchecked::<T, R>(
+            let _ = reduce_ivf_topk_coalesced::launch_unchecked::<T, R>(
                 client,
-                CubeCount::Static(init_grid_x, init_grid_y, init_grid_z),
-                CubeDim::new_2d(WORKGROUP_SIZE_X, WORKGROUP_SIZE_Y),
-                topk_dists_gpu.clone().into_tensor_arg(1),
-                topk_indices_gpu.clone().into_tensor_arg(1),
-            );
-        }
-
-        let queries_per_cluster_gpu =
-            GpuTensor::<R, u32>::from_slice(&cpu_write_pointers, vec![n_queries], client);
-        let (reduce_grid_x, reduce_grid_y) = grid_2d((n_queries as u32).div_ceil(WORKGROUP_SIZE_X));
-
-        unsafe {
-            let _ = reduce_ivf_topk::launch_unchecked::<T, R>(
-                client,
-                CubeCount::Static(reduce_grid_x, reduce_grid_y, 1),
+                CubeCount::Static(coal_gx, coal_gy, 1),
                 CubeDim::new_2d(WORKGROUP_SIZE_X, 1),
-                candidate_dists_gpu.into_tensor_arg(1),
-                candidate_indices_gpu.into_tensor_arg(1),
-                queries_per_cluster_gpu.into_tensor_arg(1),
-                topk_dists_gpu.clone().into_tensor_arg(1),
-                topk_indices_gpu.clone().into_tensor_arg(1),
+                candidate_dists_gpu.clone().into_tensor_arg(1),
+                candidate_indices_gpu.clone().into_tensor_arg(1),
+                cpq.into_tensor_arg(1),
+                topk_dists.clone().into_tensor_arg(1),
+                topk_indices.clone().into_tensor_arg(1),
+                ScalarArg { elem: k as u32 },
+                k,
             );
         }
 
         // ── Step 6: Read results ──
 
-        let final_dists = topk_dists_gpu.read(client);
-        let final_indices = topk_indices_gpu.read(client);
+        let final_dists = topk_dists.read(client);
+        let final_indices = topk_indices.read(client);
 
         let mut results_indices = Vec::with_capacity(n_queries);
         let mut results_dists = Vec::with_capacity(n_queries);

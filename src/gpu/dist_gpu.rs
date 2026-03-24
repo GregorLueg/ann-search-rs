@@ -708,6 +708,174 @@ where
 // Fire-and-Forget IVF kernels //
 /////////////////////////////////
 
+/// Coalesced top-k reduction for the IVF variable-length candidate buffer.
+///
+/// One workgroup (32 threads) per query. Threads cooperatively stride through
+/// the candidate slice, each maintaining a thread-local sorted top-k in
+/// registers. After the scan, per-thread results are written to shared memory
+/// and thread 0 merges all 32 sorted lists into the final top-k output.
+///
+/// ### Params
+///
+/// * `candidate_dists` - Candidate distances `[n_queries, max_candidates]`.
+///   Each row contains the distances produced by the mega distance kernel,
+///   of which only the first `candidates_per_query[q]` entries are valid.
+/// * `candidate_indices` - Candidate DB indices `[n_queries, max_candidates]`.
+///   Layout mirrors `candidate_dists`.
+/// * `candidates_per_query` - Number of valid candidates per query
+///   `[n_queries]`. Entries beyond this count in each row are ignored.
+/// * `out_dists` - Output top-k distances `[n_queries, k]`. Written only by
+///   thread 0 of each workgroup after the merge phase.
+/// * `out_indices` - Output top-k DB indices `[n_queries, k]`. Written only
+///   by thread 0 of each workgroup after the merge phase.
+/// * `k_param` - Runtime value of k (must equal comptime `k`). Required
+///   because CubeCL comptime values cannot be used in runtime assignments.
+/// * `k` - Number of nearest neighbours to extract per query (comptime).
+///   Used only for `Array::new` and `SharedMemory::new` sizing.
+///
+/// ### Grid mapping
+///
+/// * `CUBE_POS_Y * CUBE_COUNT_X + CUBE_POS_X` -> query index (one cube per
+///   query)
+/// * `UNIT_POS_X` -> thread within workgroup (`0..WORKGROUP_SIZE_X`), used
+///   for strided candidate scanning and cooperative merge
+#[cube(launch_unchecked)]
+pub fn reduce_ivf_topk_coalesced<F: Float>(
+    candidate_dists: &Tensor<F>,
+    candidate_indices: &Tensor<u32>,
+    candidates_per_query: &Tensor<u32>,
+    out_dists: &mut Tensor<F>,
+    out_indices: &mut Tensor<u32>,
+    k_param: u32,
+    #[comptime] k: usize,
+) {
+    let q_idx = (CUBE_POS_Y * CUBE_COUNT_X + CUBE_POS_X) as usize;
+    let tx = UNIT_POS_X;
+    let wg = WORKGROUP_SIZE_X;
+
+    if q_idx >= candidate_dists.shape(0) {
+        terminate!();
+    }
+
+    let count = candidates_per_query[q_idx];
+    let in_base = q_idx * candidate_dists.stride(0);
+
+    // ── Phase 1: per-thread top-k in registers ──
+
+    let mut local_dists = Array::<F>::new(k);
+    let mut local_indices = Array::<u32>::new(k);
+
+    let mut init_i = 0u32;
+    while init_i < k_param {
+        local_dists[init_i as usize] = F::new(f32::MAX);
+        local_indices[init_i as usize] = 0u32;
+        init_i += 1u32;
+    }
+
+    // Coalesced strided scan: adjacent threads read adjacent columns
+    let mut col: u32 = tx;
+    while col < count {
+        let dist = candidate_dists[in_base + col as usize];
+
+        if dist < local_dists[(k_param - 1u32) as usize] {
+            // Find insertion position
+            let mut pos = 0u32;
+            let mut found: bool = false;
+            while pos < k_param && !found {
+                if dist < local_dists[pos as usize] {
+                    found = true;
+                } else {
+                    pos += 1u32;
+                }
+            }
+
+            // Shift right from end down to pos+1
+            if found {
+                let mut sh = k_param - 1u32;
+                while sh > pos {
+                    local_dists[sh as usize] = local_dists[(sh - 1u32) as usize];
+                    local_indices[sh as usize] = local_indices[(sh - 1u32) as usize];
+                    sh -= 1u32;
+                }
+                local_dists[pos as usize] = dist;
+                local_indices[pos as usize] = candidate_indices[in_base + col as usize];
+            }
+        }
+
+        col += wg;
+    }
+
+    // ── Phase 2: shared memory merge ──
+
+    let mut s_dist = SharedMemory::<F>::new(32 * k);
+    let mut s_idx = SharedMemory::<u32>::new(32 * k);
+
+    let s_base = tx as usize * k_param as usize;
+    let mut cp = 0u32;
+    while cp < k_param {
+        s_dist[s_base + cp as usize] = local_dists[cp as usize];
+        s_idx[s_base + cp as usize] = local_indices[cp as usize];
+        cp += 1u32;
+    }
+
+    sync_cube();
+
+    // Thread 0 merges all 32 sorted thread-local lists
+    if tx == 0u32 {
+        let mut t: u32 = 1u32;
+        while t < wg {
+            let t_base = t as usize * k_param as usize;
+            let mut i = 0u32;
+            let mut early_stop = false;
+
+            while i < k_param && !early_stop {
+                let cd = s_dist[t_base + i as usize];
+                let ci = s_idx[t_base + i as usize];
+
+                // This thread's list is sorted; once we exceed the current
+                // worst in merged list, all remaining are worse
+                if cd >= s_dist[(k_param - 1u32) as usize] {
+                    early_stop = true;
+                } else {
+                    // Find insertion position in merged list [0..k_param)
+                    let mut pos = 0u32;
+                    let mut found = false;
+                    while pos < k_param && !found {
+                        if cd < s_dist[pos as usize] {
+                            found = true;
+                        } else {
+                            pos += 1u32;
+                        }
+                    }
+
+                    if found {
+                        let mut sh = k_param - 1u32;
+                        while sh > pos {
+                            s_dist[sh as usize] = s_dist[(sh - 1u32) as usize];
+                            s_idx[sh as usize] = s_idx[(sh - 1u32) as usize];
+                            sh -= 1u32;
+                        }
+                        s_dist[pos as usize] = cd;
+                        s_idx[pos as usize] = ci;
+                    }
+
+                    i += 1u32;
+                }
+            }
+            t += 1u32;
+        }
+
+        // Write final result
+        let out_base = q_idx * k_param as usize;
+        let mut w = 0u32;
+        while w < k_param {
+            out_dists[out_base + w as usize] = s_dist[w as usize];
+            out_indices[out_base + w as usize] = s_idx[w as usize];
+            w += 1u32;
+        }
+    }
+}
+
 /// Compute squared Euclidean distances on GPU
 ///
 /// Each GPU thread computes the distance between one query vector and one
@@ -1164,6 +1332,310 @@ pub fn reduce_ivf_topk<F: Float>(
     }
 }
 
+/// Euclidean mega kernel with shared-memory query caching.
+///
+/// Same task-based architecture as `compute_ivf_mega_euclidean`, but
+/// cooperatively loads query vectors into scalar shared memory so that
+/// all X-threads in a workgroup row (and Y-threads sharing the same
+/// query) read from shared memory instead of global memory.
+///
+/// Also caches per-task metadata (q_idx, db_start, write_offset,
+/// db_count) in shared memory to avoid redundant global reads across
+/// the 32 X-threads in each row.
+///
+/// ### Params
+///
+/// * `query_vectors` - Query vectors `[n_queries, dim]` as `Line<F>`.
+///   Shape must be in element units (not Line units). Accessed via
+///   the comptime `dim_lines` parameter, never via tensor strides.
+/// * `db_vectors` - Full database vectors `[n_db, dim]` as `Line<F>`.
+///   Same element-unit shape convention as `query_vectors`.
+/// * `task_q_idx` - Query index for each task `[n_tasks]`. Tasks must
+///   be sorted by this value for optimal shared-memory reuse.
+/// * `task_db_start` - Global DB start index for each task `[n_tasks]`.
+///   Points into the cluster-reorganised `db_vectors`.
+/// * `task_write_offset` - Write offset into the candidate row for each
+///   task `[n_tasks]`. Determines where this task's distances are written
+///   within the query's candidate buffer row.
+/// * `task_db_count` - Number of DB vectors in each task's cluster
+///   `[n_tasks]`. Threads with `ABSOLUTE_POS_X >= db_count` terminate.
+/// * `out_dists` - Output candidate distances `[n_queries, max_candidates]`.
+///   Written at position `[q_idx, write_offset + local_db_idx]`.
+/// * `out_indices` - Output candidate DB indices `[n_queries, max_candidates]`.
+///   Written at the same position as `out_dists`.
+/// * `n_tasks` - Total number of tasks. Used for bounds checking since
+///   `task_q_idx.len()` is unreliable for Line tensors in the same
+///   kernel.
+/// * `dim_lines` - Number of `Line<F>` elements per vector row (comptime).
+///   Equal to `dim / LINE_SIZE`. Used for all indexing into Line tensors
+///   and for shared memory sizing. Passed as comptime to avoid reliance
+///   on tensor metadata.
+///
+/// ### Grid mapping
+///
+/// * `ABSOLUTE_POS_X` -> vector index within the task's cluster
+///   (`0..db_count`)
+/// * `(CUBE_POS_Z * CUBE_COUNT_Y + CUBE_POS_Y) * WORKGROUP_SIZE_Y
+///   + UNIT_POS_Y` -> task index (`0..n_tasks`)
+///
+/// ### Shared memory layout
+///
+/// * `s_q_idx[32]` - query index per Y-slot
+/// * `s_db_start[32]` - DB start per Y-slot
+/// * `s_write_offset[32]` - write offset per Y-slot
+/// * `s_db_count[32]` - DB count per Y-slot
+/// * `s_query[32 * dim_scalars]` - query vectors in scalar form, where
+///   `dim_scalars = dim_lines * 4`
+#[cube(launch_unchecked)]
+pub fn compute_ivf_mega_euclidean_cached<F: Float>(
+    query_vectors: &Tensor<Line<F>>,
+    db_vectors: &Tensor<Line<F>>,
+    task_q_idx: &Tensor<u32>,
+    task_db_start: &Tensor<u32>,
+    task_write_offset: &Tensor<u32>,
+    task_db_count: &Tensor<u32>,
+    out_dists: &mut Tensor<F>,
+    out_indices: &mut Tensor<u32>,
+    n_tasks: u32,
+    #[comptime] dim_lines: usize,
+) {
+    let local_db_idx = ABSOLUTE_POS_X;
+    let task_idx = (CUBE_POS_Z * CUBE_COUNT_Y + CUBE_POS_Y) * WORKGROUP_SIZE_Y + UNIT_POS_Y;
+    let local_y = UNIT_POS_Y as usize;
+    let local_x = UNIT_POS_X as usize;
+
+    let dim_scalars = dim_lines * 4usize;
+    let wg_y = WORKGROUP_SIZE_Y as usize;
+
+    // ── Phase 1: Load task metadata into shared memory ──
+
+    let mut s_q_idx = SharedMemory::<u32>::new(32usize);
+    let mut s_db_start = SharedMemory::<u32>::new(32usize);
+    let mut s_write_offset = SharedMemory::<u32>::new(32usize);
+    let mut s_db_count = SharedMemory::<u32>::new(32usize);
+
+    if local_x == 0usize {
+        if task_idx < n_tasks {
+            s_q_idx[local_y] = task_q_idx[task_idx as usize];
+            s_db_start[local_y] = task_db_start[task_idx as usize];
+            s_write_offset[local_y] = task_write_offset[task_idx as usize];
+            s_db_count[local_y] = task_db_count[task_idx as usize];
+        } else {
+            s_q_idx[local_y] = 0u32;
+            s_db_start[local_y] = 0u32;
+            s_write_offset[local_y] = 0u32;
+            s_db_count[local_y] = 0u32;
+        }
+    }
+
+    sync_cube();
+
+    // ── Phase 2: Cooperative load of query vectors into scalar smem ──
+
+    let mut s_query = SharedMemory::<F>::new(32 * dim_scalars);
+
+    let thread_id = local_y * WORKGROUP_SIZE_X as usize + local_x;
+    let total_threads = WORKGROUP_SIZE_X as usize * wg_y;
+    let total_elems = wg_y * dim_scalars;
+
+    let mut load_idx = thread_id;
+    while load_idx < total_elems {
+        let q_local = load_idx / dim_scalars;
+        let elem = load_idx % dim_scalars;
+        let q_global = s_q_idx[q_local];
+
+        let line_idx = elem / 4usize;
+        let lane = elem % 4usize;
+        let line_val = query_vectors[q_global as usize * dim_lines + line_idx];
+        s_query[load_idx] = line_val[lane];
+
+        load_idx += total_threads;
+    }
+
+    sync_cube();
+
+    // ── Phase 3: Bounds check and compute distance ──
+
+    if task_idx >= n_tasks {
+        terminate!();
+    }
+
+    let db_count = s_db_count[local_y];
+    if local_db_idx >= db_count {
+        terminate!();
+    }
+
+    let real_db_idx = s_db_start[local_y] + local_db_idx;
+    let write_pos = s_write_offset[local_y] + local_db_idx;
+    let q_shared_base = local_y * dim_scalars;
+    let d_offset = real_db_idx as usize * dim_lines;
+
+    let mut sum = F::new(0.0);
+    for i in 0..dim_lines {
+        let d_line = db_vectors[d_offset + i];
+        let s_off = q_shared_base + i * 4usize;
+
+        let diff0 = s_query[s_off] - d_line[0];
+        let diff1 = s_query[s_off + 1usize] - d_line[1];
+        let diff2 = s_query[s_off + 2usize] - d_line[2];
+        let diff3 = s_query[s_off + 3usize] - d_line[3];
+
+        sum += diff0 * diff0 + diff1 * diff1 + diff2 * diff2 + diff3 * diff3;
+    }
+
+    let q_idx = s_q_idx[local_y];
+    let out_offset = q_idx as usize * out_dists.stride(0) + write_pos as usize;
+    out_dists[out_offset] = sum;
+    out_indices[out_offset] = real_db_idx;
+}
+
+/// Cosine mega kernel with shared-memory query caching.
+///
+/// Same shared-memory caching strategy as
+/// `compute_ivf_mega_euclidean_cached`, but computes
+/// `1 - dot(q, d) / (||q|| * ||d||)`.
+///
+/// Additionally caches per-query L2 norms in a small shared memory
+/// array `s_query_norms[32]` to avoid redundant global reads.
+///
+/// ### Params
+///
+/// * `query_vectors` - Query vectors `[n_queries, dim]` as `Line<F>`.
+///   Shape in element units.
+/// * `db_vectors` - Full database vectors `[n_db, dim]` as `Line<F>`.
+///   Shape in element units.
+/// * `query_norms` - Pre-computed L2 norms for queries `[n_queries]`.
+///   Scalar tensor, one norm per query.
+/// * `db_norms` - Pre-computed L2 norms for DB vectors `[n_db]`.
+///   Scalar tensor, one norm per DB vector.
+/// * `task_q_idx` - Query index for each task `[n_tasks]`. Sorted.
+/// * `task_db_start` - Global DB start index for each task `[n_tasks]`.
+/// * `task_write_offset` - Write offset into the candidate row for each
+///   task `[n_tasks]`.
+/// * `task_db_count` - Number of DB vectors per task `[n_tasks]`.
+/// * `out_dists` - Output candidate distances `[n_queries, max_candidates]`.
+/// * `out_indices` - Output candidate DB indices `[n_queries, max_candidates]`.
+/// * `n_tasks` - Total number of tasks for bounds checking.
+/// * `dim_lines` - Number of `Line<F>` elements per vector row (comptime).
+///
+/// ### Grid mapping
+///
+/// Same as `compute_ivf_mega_euclidean_cached`.
+///
+/// ### Shared memory layout
+///
+/// Same as Euclidean variant, plus:
+/// * `s_query_norms[32]` - L2 norm per Y-slot query
+#[cube(launch_unchecked)]
+pub fn compute_ivf_mega_cosine_cached<F: Float>(
+    query_vectors: &Tensor<Line<F>>,
+    db_vectors: &Tensor<Line<F>>,
+    query_norms: &Tensor<F>,
+    db_norms: &Tensor<F>,
+    task_q_idx: &Tensor<u32>,
+    task_db_start: &Tensor<u32>,
+    task_write_offset: &Tensor<u32>,
+    task_db_count: &Tensor<u32>,
+    out_dists: &mut Tensor<F>,
+    out_indices: &mut Tensor<u32>,
+    n_tasks: u32,
+    #[comptime] dim_lines: usize,
+) {
+    let local_db_idx = ABSOLUTE_POS_X;
+    let task_idx = (CUBE_POS_Z * CUBE_COUNT_Y + CUBE_POS_Y) * WORKGROUP_SIZE_Y + UNIT_POS_Y;
+    let local_y = UNIT_POS_Y as usize;
+    let local_x = UNIT_POS_X as usize;
+
+    let dim_scalars = dim_lines * 4usize;
+    let wg_y = WORKGROUP_SIZE_Y as usize;
+
+    // ── Phase 1: Load task metadata + query norms into shared memory ──
+
+    let mut s_q_idx = SharedMemory::<u32>::new(32usize);
+    let mut s_db_start = SharedMemory::<u32>::new(32usize);
+    let mut s_write_offset = SharedMemory::<u32>::new(32usize);
+    let mut s_db_count = SharedMemory::<u32>::new(32usize);
+    let mut s_query_norms = SharedMemory::<F>::new(32usize);
+
+    if local_x == 0usize {
+        if task_idx < n_tasks {
+            let q = task_q_idx[task_idx as usize];
+            s_q_idx[local_y] = q;
+            s_db_start[local_y] = task_db_start[task_idx as usize];
+            s_write_offset[local_y] = task_write_offset[task_idx as usize];
+            s_db_count[local_y] = task_db_count[task_idx as usize];
+            s_query_norms[local_y] = query_norms[q as usize];
+        } else {
+            s_q_idx[local_y] = 0u32;
+            s_db_start[local_y] = 0u32;
+            s_write_offset[local_y] = 0u32;
+            s_db_count[local_y] = 0u32;
+            s_query_norms[local_y] = F::new(1.0);
+        }
+    }
+
+    sync_cube();
+
+    // ── Phase 2: Cooperative load of query vectors into scalar smem ──
+
+    let mut s_query = SharedMemory::<F>::new(32 * dim_scalars);
+
+    let thread_id = local_y * WORKGROUP_SIZE_X as usize + local_x;
+    let total_threads = WORKGROUP_SIZE_X as usize * wg_y;
+    let total_elems = wg_y * dim_scalars;
+
+    let mut load_idx = thread_id;
+    while load_idx < total_elems {
+        let q_local = load_idx / dim_scalars;
+        let elem = load_idx % dim_scalars;
+        let q_global = s_q_idx[q_local];
+
+        let line_idx = elem / 4usize;
+        let lane = elem % 4usize;
+        let line_val = query_vectors[q_global as usize * dim_lines + line_idx];
+        s_query[load_idx] = line_val[lane];
+
+        load_idx += total_threads;
+    }
+
+    sync_cube();
+
+    // ── Phase 3: Bounds check and compute cosine distance ──
+
+    if task_idx >= n_tasks {
+        terminate!();
+    }
+
+    let db_count = s_db_count[local_y];
+    if local_db_idx >= db_count {
+        terminate!();
+    }
+
+    let real_db_idx = s_db_start[local_y] + local_db_idx;
+    let write_pos = s_write_offset[local_y] + local_db_idx;
+    let q_shared_base = local_y * dim_scalars;
+    let d_offset = real_db_idx as usize * dim_lines;
+
+    let mut dot = F::new(0.0);
+    for i in 0..dim_lines {
+        let d_line = db_vectors[d_offset + i];
+        let s_off = q_shared_base + i * 4usize;
+
+        dot += s_query[s_off] * d_line[0]
+            + s_query[s_off + 1usize] * d_line[1]
+            + s_query[s_off + 2usize] * d_line[2]
+            + s_query[s_off + 3usize] * d_line[3];
+    }
+
+    let q_norm = s_query_norms[local_y];
+    let d_norm = db_norms[real_db_idx as usize];
+
+    let q_idx = s_q_idx[local_y];
+    let out_offset = q_idx as usize * out_dists.stride(0) + write_pos as usize;
+    out_dists[out_offset] = F::new(1.0) - (dot / (q_norm * d_norm));
+    out_indices[out_offset] = real_db_idx;
+}
+
 ////////////////////
 // Main functions //
 ////////////////////
@@ -1522,5 +1994,652 @@ mod tests {
 
         assert_eq!(idx[0][0], 0);
         assert!((dist[0][0] - 64.0).abs() < 1e-3);
+    }
+
+    // ── Diagnostic tests for reduce_ivf_topk_coalesced ──
+
+    /// Helper: run the OLD serial reduce_ivf_topk on known data and return
+    /// (dists, indices). Provides the ground truth to compare against.
+    fn run_serial_reduce(
+        candidate_dists: &[f32],
+        candidate_indices: &[u32],
+        candidates_per_query: &[u32],
+        n_queries: usize,
+        max_candidates: usize,
+        k: usize,
+        device: &WgpuDevice,
+    ) -> (Vec<f32>, Vec<u32>) {
+        let client = WgpuRuntime::client(device);
+
+        let cd_gpu = GpuTensor::<WgpuRuntime, f32>::from_slice(
+            candidate_dists,
+            vec![n_queries, max_candidates],
+            &client,
+        );
+        let ci_gpu = GpuTensor::<WgpuRuntime, u32>::from_slice(
+            candidate_indices,
+            vec![n_queries, max_candidates],
+            &client,
+        );
+        let cpq_gpu = GpuTensor::<WgpuRuntime, u32>::from_slice(
+            candidates_per_query,
+            vec![n_queries],
+            &client,
+        );
+
+        let topk_d = GpuTensor::<WgpuRuntime, f32>::empty(vec![n_queries, k], &client);
+        let topk_i = GpuTensor::<WgpuRuntime, u32>::empty(vec![n_queries, k], &client);
+
+        // init_topk
+        let init_gx = (k as u32).div_ceil(WORKGROUP_SIZE_X);
+        let (init_gy, init_gz) = grid_2d((n_queries as u32).div_ceil(WORKGROUP_SIZE_Y));
+        unsafe {
+            let _ = init_topk::launch_unchecked::<f32, WgpuRuntime>(
+                &client,
+                CubeCount::Static(init_gx, init_gy, init_gz),
+                CubeDim::new_2d(WORKGROUP_SIZE_X, WORKGROUP_SIZE_Y),
+                topk_d.clone().into_tensor_arg(1),
+                topk_i.clone().into_tensor_arg(1),
+            );
+        }
+
+        // serial reduce
+        let (rgx, rgy) = grid_2d((n_queries as u32).div_ceil(WORKGROUP_SIZE_X));
+        unsafe {
+            let _ = reduce_ivf_topk::launch_unchecked::<f32, WgpuRuntime>(
+                &client,
+                CubeCount::Static(rgx, rgy, 1),
+                CubeDim::new_2d(WORKGROUP_SIZE_X, 1),
+                cd_gpu.into_tensor_arg(1),
+                ci_gpu.into_tensor_arg(1),
+                cpq_gpu.into_tensor_arg(1),
+                topk_d.clone().into_tensor_arg(1),
+                topk_i.clone().into_tensor_arg(1),
+            );
+        }
+
+        (topk_d.read(&client), topk_i.read(&client))
+    }
+
+    /// Helper: run the NEW coalesced reduce on the same data.
+    fn run_coalesced_reduce(
+        candidate_dists: &[f32],
+        candidate_indices: &[u32],
+        candidates_per_query: &[u32],
+        n_queries: usize,
+        max_candidates: usize,
+        k: usize,
+        device: &WgpuDevice,
+    ) -> (Vec<f32>, Vec<u32>) {
+        let client = WgpuRuntime::client(device);
+
+        let cd_gpu = GpuTensor::<WgpuRuntime, f32>::from_slice(
+            candidate_dists,
+            vec![n_queries, max_candidates],
+            &client,
+        );
+        let ci_gpu = GpuTensor::<WgpuRuntime, u32>::from_slice(
+            candidate_indices,
+            vec![n_queries, max_candidates],
+            &client,
+        );
+        let cpq_gpu = GpuTensor::<WgpuRuntime, u32>::from_slice(
+            candidates_per_query,
+            vec![n_queries],
+            &client,
+        );
+
+        let topk_d = GpuTensor::<WgpuRuntime, f32>::empty(vec![n_queries, k], &client);
+        let topk_i = GpuTensor::<WgpuRuntime, u32>::empty(vec![n_queries, k], &client);
+
+        let (rgx, rgy) = grid_2d(n_queries as u32);
+        unsafe {
+            let _ = reduce_ivf_topk_coalesced::launch_unchecked::<f32, WgpuRuntime>(
+                &client,
+                CubeCount::Static(rgx, rgy, 1),
+                CubeDim::new_2d(WORKGROUP_SIZE_X, 1),
+                cd_gpu.into_tensor_arg(1),
+                ci_gpu.into_tensor_arg(1),
+                cpq_gpu.into_tensor_arg(1),
+                topk_d.clone().into_tensor_arg(1),
+                topk_i.clone().into_tensor_arg(1),
+                ScalarArg { elem: k as u32 },
+                k,
+            );
+        }
+
+        (topk_d.read(&client), topk_i.read(&client))
+    }
+
+    // Test 1: Trivial case. 1 query, 5 candidates, k=3.
+    // Candidates are in reverse order so we know sorting matters.
+    #[test]
+    fn test_coalesced_reduce_trivial() {
+        let Some(device) = try_device() else { return };
+
+        let k = 3usize;
+        let n_queries = 1usize;
+        let max_candidates = 5usize;
+
+        // Distances: 50, 40, 30, 20, 10 -- indices: 100, 101, 102, 103, 104
+        // Expected top-3: dist=[10, 20, 30], idx=[104, 103, 102]
+        let candidate_dists = vec![50.0f32, 40.0, 30.0, 20.0, 10.0];
+        let candidate_indices = vec![100u32, 101, 102, 103, 104];
+        let candidates_per_query = vec![5u32];
+
+        let (dists, indices) = run_coalesced_reduce(
+            &candidate_dists,
+            &candidate_indices,
+            &candidates_per_query,
+            n_queries,
+            max_candidates,
+            k,
+            &device,
+        );
+
+        println!("Trivial: dists={:?}, indices={:?}", dists, indices);
+        assert_eq!(indices, vec![104, 103, 102], "Wrong indices");
+        assert_eq!(dists, vec![10.0, 20.0, 30.0], "Wrong distances");
+    }
+
+    // Test 2: Verify thread 0 alone finds the right answer when
+    // candidates <= 32 (single thread's stride covers everything).
+    #[test]
+    fn test_coalesced_reduce_single_stride() {
+        let Some(device) = try_device() else { return };
+
+        let k = 3usize;
+        let n_queries = 1usize;
+        let max_candidates = 20usize;
+
+        // 20 candidates, distances = 20, 19, ..., 1
+        let candidate_dists: Vec<f32> = (0..20).rev().map(|i| (i + 1) as f32).collect();
+        let candidate_indices: Vec<u32> = (0..20).map(|i| i as u32 + 200).collect();
+        let candidates_per_query = vec![20u32];
+
+        let (dists, indices) = run_coalesced_reduce(
+            &candidate_dists,
+            &candidate_indices,
+            &candidates_per_query,
+            n_queries,
+            max_candidates,
+            k,
+            &device,
+        );
+
+        println!("Single stride: dists={:?}, indices={:?}", dists, indices);
+        // Smallest dists are 1.0, 2.0, 3.0 at positions 19, 18, 17
+        assert_eq!(dists, vec![1.0, 2.0, 3.0]);
+        assert_eq!(indices, vec![219, 218, 217]);
+    }
+
+    // Test 3: Multi-thread merge required. 200 candidates forces multiple
+    // threads to each hold partial top-k that must be merged correctly.
+    #[test]
+    fn test_coalesced_reduce_needs_merge() {
+        let Some(device) = try_device() else { return };
+
+        let k = 5usize;
+        let n_queries = 1usize;
+        let max_candidates = 200usize;
+
+        // Plant known winners at positions that land on DIFFERENT threads.
+        // Thread assignment = position % 32.
+        // Best 5: pos 3 (thread 3), pos 35 (thread 3), pos 64 (thread 0),
+        //         pos 100 (thread 4), pos 129 (thread 1)
+        let mut candidate_dists = vec![999.0f32; max_candidates];
+        let candidate_indices: Vec<u32> = (0..max_candidates as u32).collect();
+
+        candidate_dists[3] = 1.0; // thread 3
+        candidate_dists[35] = 2.0; // thread 3
+        candidate_dists[64] = 3.0; // thread 0
+        candidate_dists[100] = 4.0; // thread 4
+        candidate_dists[129] = 5.0; // thread 1
+
+        let candidates_per_query = vec![max_candidates as u32];
+
+        let (dists, indices) = run_coalesced_reduce(
+            &candidate_dists,
+            &candidate_indices,
+            &candidates_per_query,
+            n_queries,
+            max_candidates,
+            k,
+            &device,
+        );
+
+        println!("Merge test: dists={:?}, indices={:?}", dists, indices);
+        assert_eq!(dists, vec![1.0, 2.0, 3.0, 4.0, 5.0]);
+        assert_eq!(indices, vec![3, 35, 64, 100, 129]);
+    }
+
+    // Test 4: A/B comparison with serial kernel on random-ish data.
+    // If this fails but tests 1-3 pass, the bug is scale-dependent.
+    #[test]
+    fn test_coalesced_vs_serial_random() {
+        let Some(device) = try_device() else { return };
+
+        let k = 10usize;
+        let n_queries = 8usize;
+        let max_candidates = 500usize;
+
+        // Deterministic pseudo-random distances
+        let mut candidate_dists = vec![0.0f32; n_queries * max_candidates];
+        let mut candidate_indices = vec![0u32; n_queries * max_candidates];
+        for q in 0..n_queries {
+            for c in 0..max_candidates {
+                let idx = q * max_candidates + c;
+                candidate_dists[idx] = ((idx * 17 + 31) % 9973) as f32 * 0.1;
+                candidate_indices[idx] = (q * 10000 + c) as u32;
+            }
+        }
+        let candidates_per_query = vec![max_candidates as u32; n_queries];
+
+        let (serial_d, serial_i) = run_serial_reduce(
+            &candidate_dists,
+            &candidate_indices,
+            &candidates_per_query,
+            n_queries,
+            max_candidates,
+            k,
+            &device,
+        );
+
+        let (coal_d, coal_i) = run_coalesced_reduce(
+            &candidate_dists,
+            &candidate_indices,
+            &candidates_per_query,
+            n_queries,
+            max_candidates,
+            k,
+            &device,
+        );
+
+        for q in 0..n_queries {
+            let s = q * k;
+            let e = s + k;
+            let sd = &serial_d[s..e];
+            let cd = &coal_d[s..e];
+            let si = &serial_i[s..e];
+            let ci = &coal_i[s..e];
+
+            for i in 0..k {
+                assert!(
+                    (sd[i] - cd[i]).abs() < 1e-4,
+                    "Query {} rank {}: serial dist {} != coalesced dist {}",
+                    q,
+                    i,
+                    sd[i],
+                    cd[i]
+                );
+                assert_eq!(
+                    si[i], ci[i],
+                    "Query {} rank {}: serial idx {} != coalesced idx {}",
+                    q, i, si[i], ci[i]
+                );
+            }
+        }
+    }
+
+    // Test 5: Multiple queries to verify q_idx indexing is correct
+    // (catches stride/offset bugs in the output write)
+    #[test]
+    fn test_coalesced_reduce_multi_query() {
+        let Some(device) = try_device() else { return };
+
+        let k = 3usize;
+        let n_queries = 4usize;
+        let max_candidates = 10usize;
+
+        let mut candidate_dists = vec![f32::MAX; n_queries * max_candidates];
+        let mut candidate_indices = vec![0u32; n_queries * max_candidates];
+
+        // Each query has a unique planted winner
+        for q in 0..n_queries {
+            let base = q * max_candidates;
+            for c in 0..max_candidates {
+                candidate_dists[base + c] = 100.0 + c as f32;
+                candidate_indices[base + c] = (q * 1000 + c) as u32;
+            }
+            // Plant winner at different position per query
+            candidate_dists[base + q + 1] = 0.5 + q as f32 * 0.1;
+        }
+
+        let candidates_per_query = vec![max_candidates as u32; n_queries];
+
+        let (dists, indices) = run_coalesced_reduce(
+            &candidate_dists,
+            &candidate_indices,
+            &candidates_per_query,
+            n_queries,
+            max_candidates,
+            k,
+            &device,
+        );
+
+        for q in 0..n_queries {
+            let s = q * k;
+            let best_dist = dists[s];
+            let best_idx = indices[s];
+            let expected_dist = 0.5 + q as f32 * 0.1;
+            let expected_idx = (q * 1000 + q + 1) as u32;
+
+            assert!(
+                (best_dist - expected_dist).abs() < 1e-4,
+                "Query {}: best dist {} != expected {}",
+                q,
+                best_dist,
+                expected_dist
+            );
+            assert_eq!(
+                best_idx, expected_idx,
+                "Query {}: best idx {} != expected {}",
+                q, best_idx, expected_idx
+            );
+        }
+    }
+
+    // Test 6: Candidates fewer than k -- output should contain only
+    // valid entries, rest should remain f32::MAX / 0
+    #[test]
+    fn test_coalesced_reduce_fewer_than_k() {
+        let Some(device) = try_device() else { return };
+
+        let k = 5usize;
+        let n_queries = 1usize;
+        let max_candidates = 10usize;
+
+        let mut candidate_dists = vec![f32::MAX; max_candidates];
+        let mut candidate_indices = vec![0u32; max_candidates];
+
+        // Only 2 valid candidates
+        candidate_dists[0] = 5.0;
+        candidate_dists[1] = 3.0;
+        candidate_indices[0] = 42;
+        candidate_indices[1] = 99;
+
+        let candidates_per_query = vec![2u32];
+
+        let (dists, indices) = run_coalesced_reduce(
+            &candidate_dists,
+            &candidate_indices,
+            &candidates_per_query,
+            n_queries,
+            max_candidates,
+            k,
+            &device,
+        );
+
+        println!("Fewer than k: dists={:?}, indices={:?}", dists, indices);
+        assert!((dists[0] - 3.0).abs() < 1e-4, "First should be 3.0");
+        assert!((dists[1] - 5.0).abs() < 1e-4, "Second should be 5.0");
+        assert_eq!(indices[0], 99);
+        assert_eq!(indices[1], 42);
+        // Remaining should be sentinel
+        assert!(dists[2] >= f32::MAX / 2.0, "Slot 2 should be sentinel");
+    }
+
+    /// Helper: build synthetic IVF task data and run a mega kernel,
+    /// returning the output (dists, indices) flat buffers.
+    ///
+    /// * `queries` - flat query data `[n_queries * dim]`
+    /// * `db` - flat DB data `[n_db * dim]`
+    /// * `tasks` - Vec of `(q_idx, db_start, write_offset, db_count)`
+    /// * `n_queries`, `n_db`, `dim`, `max_candidates` - dimensions
+    /// * `device` - GPU device
+    /// * `use_cached` - if true, runs the new cached kernel; otherwise
+    ///   the old one
+    #[allow(clippy::too_many_arguments)]
+    fn run_mega_euclidean(
+        queries: &[f32],
+        db: &[f32],
+        tasks: &[(u32, u32, u32, u32)],
+        n_queries: usize,
+        n_db: usize,
+        dim: usize,
+        max_candidates: usize,
+        device: &WgpuDevice,
+        use_cached: bool,
+    ) -> (Vec<f32>, Vec<u32>) {
+        let client = WgpuRuntime::client(device);
+        let vec_size = LINE_SIZE as usize;
+        let dim_lines = dim / vec_size;
+        let n_tasks = tasks.len();
+
+        let q_gpu =
+            GpuTensor::<WgpuRuntime, f32>::from_slice(queries, vec![n_queries, dim], &client);
+        let db_gpu = GpuTensor::<WgpuRuntime, f32>::from_slice(db, vec![n_db, dim], &client);
+
+        let task_q: Vec<u32> = tasks.iter().map(|t| t.0).collect();
+        let task_db_s: Vec<u32> = tasks.iter().map(|t| t.1).collect();
+        let task_wo: Vec<u32> = tasks.iter().map(|t| t.2).collect();
+        let task_dc: Vec<u32> = tasks.iter().map(|t| t.3).collect();
+
+        let tq_gpu = GpuTensor::<WgpuRuntime, u32>::from_slice(&task_q, vec![n_tasks], &client);
+        let tds_gpu = GpuTensor::<WgpuRuntime, u32>::from_slice(&task_db_s, vec![n_tasks], &client);
+        let two_gpu = GpuTensor::<WgpuRuntime, u32>::from_slice(&task_wo, vec![n_tasks], &client);
+        let tdc_gpu = GpuTensor::<WgpuRuntime, u32>::from_slice(&task_dc, vec![n_tasks], &client);
+
+        let out_d = GpuTensor::<WgpuRuntime, f32>::empty(vec![n_queries, max_candidates], &client);
+        let out_i = GpuTensor::<WgpuRuntime, u32>::empty(vec![n_queries, max_candidates], &client);
+
+        let max_db_count = tasks.iter().map(|t| t.3).max().unwrap_or(0);
+        let gx = max_db_count.div_ceil(WORKGROUP_SIZE_X).max(1);
+        let (gy, gz) = grid_2d((n_tasks as u32).div_ceil(WORKGROUP_SIZE_Y));
+
+        if use_cached {
+            unsafe {
+                let _ = compute_ivf_mega_euclidean_cached::launch_unchecked::<f32, WgpuRuntime>(
+                    &client,
+                    CubeCount::Static(gx, gy, gz),
+                    CubeDim::new_2d(WORKGROUP_SIZE_X, WORKGROUP_SIZE_Y),
+                    q_gpu.into_tensor_arg(vec_size),
+                    db_gpu.into_tensor_arg(vec_size),
+                    tq_gpu.into_tensor_arg(1),
+                    tds_gpu.into_tensor_arg(1),
+                    two_gpu.into_tensor_arg(1),
+                    tdc_gpu.into_tensor_arg(1),
+                    out_d.clone().into_tensor_arg(1),
+                    out_i.clone().into_tensor_arg(1),
+                    ScalarArg {
+                        elem: n_tasks as u32,
+                    },
+                    dim_lines,
+                );
+            }
+        } else {
+            unsafe {
+                let _ = compute_ivf_mega_euclidean::launch_unchecked::<f32, WgpuRuntime>(
+                    &client,
+                    CubeCount::Static(gx, gy, gz),
+                    CubeDim::new_2d(WORKGROUP_SIZE_X, WORKGROUP_SIZE_Y),
+                    q_gpu.into_tensor_arg(vec_size),
+                    db_gpu.into_tensor_arg(vec_size),
+                    tq_gpu.into_tensor_arg(1),
+                    tds_gpu.into_tensor_arg(1),
+                    two_gpu.into_tensor_arg(1),
+                    tdc_gpu.into_tensor_arg(1),
+                    out_d.clone().into_tensor_arg(1),
+                    out_i.clone().into_tensor_arg(1),
+                );
+            }
+        }
+
+        (out_d.read(&client), out_i.read(&client))
+    }
+
+    /// CPU reference: squared Euclidean distance between query q and DB
+    /// vector d.
+    fn cpu_sq_euclidean(queries: &[f32], db: &[f32], q: usize, d: usize, dim: usize) -> f32 {
+        let mut sum = 0.0f32;
+        for j in 0..dim {
+            let diff = queries[q * dim + j] - db[d * dim + j];
+            sum += diff * diff;
+        }
+        sum
+    }
+
+    // Test 1: Known-answer. 2 queries, 3 tasks, dim=4.
+    // Verify exact distances against CPU computation.
+    #[test]
+    fn test_mega_cached_known_answer() {
+        let Some(device) = try_device() else { return };
+
+        let dim = 4usize;
+        let n_queries = 2usize;
+        let n_db = 5usize;
+        let max_candidates = 5usize;
+
+        // q0 = [1, 0, 0, 0], q1 = [0, 1, 0, 0]
+        let queries = vec![1.0f32, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0];
+        // db0=[1,1,0,0] db1=[2,0,0,0] db2=[0,0,1,1] db3=[0,2,0,0] db4=[0,0,0,3]
+        let db = vec![
+            1.0, 1.0, 0.0, 0.0, 2.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 1.0, 0.0, 2.0, 0.0, 0.0, 0.0,
+            0.0, 0.0, 3.0,
+        ];
+
+        // Tasks (sorted by q_idx):
+        //   q0 probes cluster [0..3) and [3..5)
+        //   q1 probes cluster [0..3)
+        let tasks = vec![
+            (0u32, 0u32, 0u32, 3u32), // q0, db[0..3], write at 0
+            (0u32, 3u32, 3u32, 2u32), // q0, db[3..5], write at 3
+            (1u32, 0u32, 0u32, 3u32), // q1, db[0..3], write at 0
+        ];
+
+        let (dists, indices) = run_mega_euclidean(
+            &queries,
+            &db,
+            &tasks,
+            n_queries,
+            n_db,
+            dim,
+            max_candidates,
+            &device,
+            true,
+        );
+
+        // Verify q0's candidates
+        for c in 0..3 {
+            let expected = cpu_sq_euclidean(&queries, &db, 0, c, dim);
+            let got = dists[c];
+            assert!(
+                (got - expected).abs() < 1e-4,
+                "q0 vs db{}: got {} expected {}",
+                c,
+                got,
+                expected,
+            );
+            assert_eq!(indices[c], c as u32);
+        }
+        for c in 0..2 {
+            let db_idx = 3 + c;
+            let expected = cpu_sq_euclidean(&queries, &db, 0, db_idx, dim);
+            let got = dists[3 + c];
+            assert!(
+                (got - expected).abs() < 1e-4,
+                "q0 vs db{}: got {} expected {}",
+                db_idx,
+                got,
+                expected,
+            );
+            assert_eq!(indices[3 + c], db_idx as u32);
+        }
+        // Verify q1's candidates
+        for c in 0..3 {
+            let expected = cpu_sq_euclidean(&queries, &db, 1, c, dim);
+            let got = dists[max_candidates + c];
+            assert!(
+                (got - expected).abs() < 1e-4,
+                "q1 vs db{}: got {} expected {}",
+                c,
+                got,
+                expected,
+            );
+        }
+
+        println!("Known-answer: PASSED");
+    }
+
+    // Test 1: Known-answer. 2 queries, 3 tasks, dim=4.
+    // Verify exact distances against CPU computation.
+    #[test]
+    fn test_mega_cached_known_answer_2() {
+        let Some(device) = try_device() else { return };
+
+        let dim = 4usize;
+        let n_queries = 2usize;
+        let n_db = 5usize;
+        let max_candidates = 5usize;
+
+        // q0 = [1, 0, 0, 0], q1 = [0, 1, 0, 0]
+        let queries = vec![1.0f32, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0];
+        // db0=[1,1,0,0] db1=[2,0,0,0] db2=[0,0,1,1] db3=[0,2,0,0] db4=[0,0,0,3]
+        let db = vec![
+            1.0, 1.0, 0.0, 0.0, 2.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 1.0, 0.0, 2.0, 0.0, 0.0, 0.0,
+            0.0, 0.0, 3.0,
+        ];
+
+        // Tasks (sorted by q_idx):
+        //   q0 probes cluster [0..3) and [3..5)
+        //   q1 probes cluster [0..3)
+        let tasks = vec![
+            (0u32, 0u32, 0u32, 3u32), // q0, db[0..3], write at 0
+            (0u32, 3u32, 3u32, 2u32), // q0, db[3..5], write at 3
+            (1u32, 0u32, 0u32, 3u32), // q1, db[0..3], write at 0
+        ];
+
+        let (dists, indices) = run_mega_euclidean(
+            &queries,
+            &db,
+            &tasks,
+            n_queries,
+            n_db,
+            dim,
+            max_candidates,
+            &device,
+            true,
+        );
+
+        // Verify q0's candidates
+        for c in 0..3 {
+            let expected = cpu_sq_euclidean(&queries, &db, 0, c, dim);
+            let got = dists[c];
+            assert!(
+                (got - expected).abs() < 1e-4,
+                "q0 vs db{}: got {} expected {}",
+                c,
+                got,
+                expected,
+            );
+            assert_eq!(indices[c], c as u32);
+        }
+        for c in 0..2 {
+            let db_idx = 3 + c;
+            let expected = cpu_sq_euclidean(&queries, &db, 0, db_idx, dim);
+            let got = dists[3 + c];
+            assert!(
+                (got - expected).abs() < 1e-4,
+                "q0 vs db{}: got {} expected {}",
+                db_idx,
+                got,
+                expected,
+            );
+            assert_eq!(indices[3 + c], db_idx as u32);
+        }
+        // Verify q1's candidates
+        for c in 0..3 {
+            let expected = cpu_sq_euclidean(&queries, &db, 1, c, dim);
+            let got = dists[max_candidates + c];
+            assert!(
+                (got - expected).abs() < 1e-4,
+                "q1 vs db{}: got {} expected {}",
+                c,
+                got,
+                expected,
+            );
+        }
+
+        println!("Known-answer: PASSED");
     }
 }
