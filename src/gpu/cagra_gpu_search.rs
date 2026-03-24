@@ -22,8 +22,6 @@ use crate::prelude::*;
 const BEAM_WIDTH: usize = 16;
 /// Maximum beam search iterations before forced termination
 const MAX_BEAM_ITERS: usize = 48;
-/// Hash table size for visited-node tracking (must be power of 2)
-const HASH_SIZE: usize = 2048;
 /// Number of random entry points per query
 pub const N_ENTRY_POINTS: usize = 8;
 
@@ -122,6 +120,23 @@ impl Default for CagraGpuSearchParams {
 ////////////////////
 // Kernel helpers //
 ////////////////////
+
+/// Mark a node as visited in the global bitfield.
+#[cube]
+fn bitfield_mark(visited: &mut Tensor<u32>, vis_base: u32, node_id: u32) {
+    let word_idx = vis_base + (node_id >> 5u32);
+    let bit_mask = 1u32 << (node_id & 31u32);
+    let old = visited[word_idx as usize];
+    visited[word_idx as usize] = old | bit_mask;
+}
+
+/// Check whether a node has been visited.
+#[cube]
+fn bitfield_is_visited(visited: &Tensor<u32>, vis_base: u32, node_id: u32) -> bool {
+    let word_idx = vis_base + (node_id >> 5u32);
+    let bit_mask = 1u32 << (node_id & 31u32);
+    (visited[word_idx as usize] & bit_mask) != 0u32
+}
 
 /// Single xorshift step used to generate random node offsets.
 ///
@@ -377,15 +392,16 @@ pub fn cagra_beam_search<F: Float>(
     out_indices: &mut Tensor<u32>,
     out_dists: &mut Tensor<F>,
     out_iters: &mut Tensor<u32>,
+    visited: &mut Tensor<u32>, // NEW: global bitfield [n_queries, n_words]
     n_nodes: u32,
     k_out: u32,
     #[comptime] k_graph: usize,
     #[comptime] use_cosine: bool,
     #[comptime] dim_lines: usize,
     #[comptime] beam_width: usize,
-    #[comptime] hash_size: usize,
     #[comptime] max_iters: usize,
     #[comptime] n_entry: usize,
+    #[comptime] n_words: usize, // NEW: ceil(n_nodes / 32), replaces hash_size
 ) {
     let q_idx = CUBE_POS_Y * CUBE_COUNT_X + CUBE_POS_X;
     let n_queries = out_indices.shape(0usize) as u32;
@@ -395,24 +411,33 @@ pub fn cagra_beam_search<F: Float>(
 
     let tx = UNIT_POS_X;
     let dim_scalars = dim_lines * 4usize;
-    let hash_mask = hash_size as u32 - 1u32;
     let sentinel = 0x7FFFFFFFu32;
     let f_max = F::new(999999999.0);
     let bw = beam_width as u32;
     let bw_last = beam_width - 1usize;
 
-    // shared memory set up
+    // ---- CHANGED: bitfield base offset for this query ----
+    let vis_base = q_idx * n_words as u32;
+
+    // ---- CHANGED: cooperatively zero the bitfield for this query ----
+    let mut iz = tx as usize;
+    while iz < n_words {
+        visited[(vis_base as usize) + iz] = 0u32;
+        iz += WORKGROUP_SIZE_X as usize;
+    }
+
+    // shared memory -- no more s_hash!
     let mut sq_vec = SharedMemory::<F>::new(dim_scalars);
     let mut s_cand_dist = SharedMemory::<F>::new(beam_width);
     let mut s_cand_idx = SharedMemory::<u32>::new(beam_width);
     let mut s_cand_expanded = SharedMemory::<u32>::new(beam_width);
-    let mut s_hash = SharedMemory::<u32>::new(hash_size);
     let mut s_nbr_idx = SharedMemory::<u32>::new(k_graph);
     let mut s_nbr_dist = SharedMemory::<F>::new(k_graph);
     let mut s_active_node = SharedMemory::<u32>::new(1usize);
     let mut s_num_cands = SharedMemory::<u32>::new(1usize);
     let mut s_query_norm = SharedMemory::<F>::new(1usize);
 
+    // load query into shared memory
     let q_line_offset = q_idx as usize * dim_lines;
     let mut il = tx as usize;
     while il < dim_scalars {
@@ -423,11 +448,6 @@ pub fn cagra_beam_search<F: Float>(
         il += WORKGROUP_SIZE_X as usize;
     }
 
-    let mut ih = tx as usize;
-    while ih < hash_size {
-        s_hash[ih] = sentinel;
-        ih += WORKGROUP_SIZE_X as usize;
-    }
     let mut ic = tx as usize;
     while ic < beam_width {
         s_cand_dist[ic] = f_max;
@@ -438,6 +458,7 @@ pub fn cagra_beam_search<F: Float>(
 
     sync_cube();
 
+    // ---- entry point seeding (thread 0) ----
     if tx == 0u32 {
         if use_cosine {
             let mut norm_sq = F::new(0.0);
@@ -457,22 +478,11 @@ pub fn cagra_beam_search<F: Float>(
         while e < n_entry {
             let node_id = entry_points[entry_base + e];
             if node_id < n_nodes {
-                let mut hs = node_id & hash_mask;
-                let mut ha = 0u32;
-                let mut hd = false;
+                // ---- CHANGED: bitfield check + mark instead of hash ----
                 let mut is_new: bool = false;
-                while !hd && ha < hash_size as u32 {
-                    let ex = s_hash[hs as usize];
-                    if ex == sentinel {
-                        s_hash[hs as usize] = node_id;
-                        is_new = true;
-                        hd = true;
-                    } else if ex == node_id {
-                        hd = true;
-                    } else {
-                        hs = (hs + 1u32) & hash_mask;
-                        ha += 1u32;
-                    }
+                if !bitfield_is_visited(visited, vis_base, node_id) {
+                    bitfield_mark(visited, vis_base, node_id);
+                    is_new = true;
                 }
 
                 if is_new {
@@ -498,6 +508,7 @@ pub fn cagra_beam_search<F: Float>(
                         sum
                     };
 
+                    // sorted insertion (unchanged)
                     let mut insert_pos = num_cands;
                     let mut ip = 0u32;
                     while ip < num_cands {
@@ -528,6 +539,7 @@ pub fn cagra_beam_search<F: Float>(
 
     sync_cube();
 
+    // ---- main beam search loop ----
     let max_iter_u32 = max_iters as u32;
     let mut iter: u32 = 0u32;
     while iter < max_iter_u32 {
@@ -548,26 +560,9 @@ pub fn cagra_beam_search<F: Float>(
                     while j < k_graph {
                         let nbr = graph[gb + j];
                         if nbr < n_nodes && nbr != sentinel {
-                            let mut hs = nbr & hash_mask;
-                            let mut ha = 0u32;
-                            let mut hd = false;
-                            let mut is_new: bool = false;
-                            while !hd && ha < hash_size as u32 {
-                                let ex = s_hash[hs as usize];
-                                if ex == sentinel {
-                                    s_hash[hs as usize] = nbr;
-                                    is_new = true;
-                                    hd = true;
-                                } else if ex == nbr {
-                                    hd = true;
-                                } else {
-                                    hs = (hs + 1u32) & hash_mask;
-                                    ha += 1u32;
-                                }
-                            }
-                            // never use if-expression for value assignment in
-                            // CubeCL... bad idea
-                            if is_new {
+                            // ---- CHANGED: bitfield instead of hash ----
+                            if !bitfield_is_visited(visited, vis_base, nbr) {
+                                bitfield_mark(visited, vis_base, nbr);
                                 s_nbr_idx[j] = nbr;
                             } else {
                                 s_nbr_idx[j] = sentinel;
@@ -588,12 +583,12 @@ pub fn cagra_beam_search<F: Float>(
 
         let active = s_active_node[0usize];
 
-        // early termination
         if active == sentinel {
             iter = max_iter_u32;
         }
 
         if active != sentinel {
+            // distance computation (unchanged -- all threads cooperate)
             let mut ms = tx as usize;
             while ms < k_graph {
                 let nbr = s_nbr_idx[ms];
@@ -629,6 +624,7 @@ pub fn cagra_beam_search<F: Float>(
 
         sync_cube();
 
+        // candidate insertion (unchanged)
         if tx == 0u32 && active != sentinel {
             let mut nc = s_num_cands[0usize];
 
@@ -699,6 +695,7 @@ pub fn cagra_beam_search<F: Float>(
         iter += 1u32;
     }
 
+    // output (unchanged)
     sync_cube();
 
     let num_cands = s_num_cands[0usize];
@@ -724,7 +721,11 @@ pub fn cagra_beam_search<F: Float>(
 ///
 /// Pads query vectors to the next multiple of LINE_SIZE, uploads them,
 /// generates or uses provided entry points, launches one workgroup per
-/// query, and downloads results.
+/// query, and downloads results. Uses a global bitfield for visited-node
+/// tracking instead of a shared-memory hash table.
+///
+/// Automatically chunks queries to keep the bitfield allocation within
+/// a configurable VRAM budget.
 ///
 /// ### Params
 ///
@@ -791,9 +792,6 @@ where
         queries_flat.to_vec()
     };
 
-    let queries_gpu =
-        GpuTensor::<R, T>::from_slice(&queries_padded, vec![n_queries, dim_padded], client);
-
     // Entry points: use provided or fall back to random
     let entry_flat = match entry_points {
         Some(pts) => {
@@ -807,69 +805,98 @@ where
                 .collect()
         }
     };
-    let entry_gpu = GpuTensor::<R, u32>::from_slice(&entry_flat, vec![n_queries, n_entry], client);
 
-    // Output tensors
-    let out_idx_gpu = GpuTensor::<R, u32>::empty(vec![n_queries, k_out], client);
-    let out_dist_gpu = GpuTensor::<R, T>::empty(vec![n_queries, k_out], client);
-    let out_iters_gpu = GpuTensor::<R, u32>::empty(vec![n_queries], client);
+    // Bitfield sizing: one bit per database vector per query
+    let n_words = n.div_ceil(32);
+    let bytes_per_query = n_words * std::mem::size_of::<u32>();
 
-    // 2D grid for large query counts
-    let cubes_x = (n_queries as u32).min(65535);
-    let cubes_y = (n_queries as u32).div_ceil(cubes_x);
+    // Cap at ~512MB for the bitfield allocation
+    const BITFIELD_BUDGET_BYTES: usize = 512 * 1024 * 1024;
+    let max_queries_per_chunk = (BITFIELD_BUDGET_BYTES / bytes_per_query).max(64);
 
-    unsafe {
-        let _ = cagra_beam_search::launch_unchecked::<T, R>(
-            client,
-            CubeCount::Static(cubes_x, cubes_y, 1),
-            CubeDim::new_2d(WORKGROUP_SIZE_X, 1),
-            vectors_gpu.clone().into_tensor_arg(line),
-            norms_gpu.clone().into_tensor_arg(1),
-            graph_gpu.clone().into_tensor_arg(1),
-            queries_gpu.into_tensor_arg(line),
-            entry_gpu.into_tensor_arg(1),
-            out_idx_gpu.clone().into_tensor_arg(1),
-            out_dist_gpu.clone().into_tensor_arg(1),
-            out_iters_gpu.clone().into_tensor_arg(1),
-            ScalarArg { elem: n as u32 },
-            ScalarArg { elem: k_out as u32 },
-            k_graph,
-            use_cosine,
-            dim_vec,
-            width,
-            HASH_SIZE,
-            iters,
-            n_entry,
-        );
-    }
-
-    // Download
-    let idx_flat = out_idx_gpu.read(client);
-    let dist_flat = out_dist_gpu.read(client);
     let sentinel_usize = 0x7FFFFFFFusize;
 
-    let indices: Vec<Vec<usize>> = (0..n_queries)
-        .map(|i| {
-            (0..k_out)
+    let mut all_indices: Vec<Vec<usize>> = Vec::with_capacity(n_queries);
+    let mut all_distances: Vec<Vec<T>> = Vec::with_capacity(n_queries);
+
+    for chunk_start in (0..n_queries).step_by(max_queries_per_chunk) {
+        let chunk_end = (chunk_start + max_queries_per_chunk).min(n_queries);
+        let chunk_size = chunk_end - chunk_start;
+
+        // Slice this chunk's queries and entry points
+        let chunk_queries = &queries_padded[chunk_start * dim_padded..chunk_end * dim_padded];
+        let chunk_entries = &entry_flat[chunk_start * n_entry..chunk_end * n_entry];
+
+        let queries_gpu =
+            GpuTensor::<R, T>::from_slice(chunk_queries, vec![chunk_size, dim_padded], client);
+        let entry_gpu =
+            GpuTensor::<R, u32>::from_slice(chunk_entries, vec![chunk_size, n_entry], client);
+
+        // Output tensors for this chunk
+        let out_idx_gpu = GpuTensor::<R, u32>::empty(vec![chunk_size, k_out], client);
+        let out_dist_gpu = GpuTensor::<R, T>::empty(vec![chunk_size, k_out], client);
+        let out_iters_gpu = GpuTensor::<R, u32>::empty(vec![chunk_size], client);
+
+        // Global bitfield for visited tracking -- zeroed on upload
+        let visited_gpu = GpuTensor::<R, u32>::from_slice(
+            &vec![0u32; chunk_size * n_words],
+            vec![chunk_size, n_words],
+            client,
+        );
+
+        let cubes_x = (chunk_size as u32).min(65535);
+        let cubes_y = (chunk_size as u32).div_ceil(cubes_x);
+
+        unsafe {
+            let _ = cagra_beam_search::launch_unchecked::<T, R>(
+                client,
+                CubeCount::Static(cubes_x, cubes_y, 1),
+                CubeDim::new_2d(WORKGROUP_SIZE_X, 1),
+                vectors_gpu.clone().into_tensor_arg(line),
+                norms_gpu.clone().into_tensor_arg(1),
+                graph_gpu.clone().into_tensor_arg(1),
+                queries_gpu.into_tensor_arg(line),
+                entry_gpu.into_tensor_arg(1),
+                out_idx_gpu.clone().into_tensor_arg(1),
+                out_dist_gpu.clone().into_tensor_arg(1),
+                out_iters_gpu.clone().into_tensor_arg(1),
+                visited_gpu.into_tensor_arg(1),
+                ScalarArg { elem: n as u32 },
+                ScalarArg { elem: k_out as u32 },
+                k_graph,
+                use_cosine,
+                dim_vec,
+                width,
+                iters,
+                n_entry,
+                n_words,
+            );
+        }
+
+        // Download this chunk
+        let idx_flat = out_idx_gpu.read(client);
+        let dist_flat = out_dist_gpu.read(client);
+
+        for i in 0..chunk_size {
+            let indices: Vec<usize> = (0..k_out)
                 .map(|j| (idx_flat[i * k_out + j] & 0x7FFFFFFFu32) as usize)
                 .filter(|&pid| pid < n && pid != sentinel_usize)
-                .collect()
-        })
-        .collect();
+                .collect();
 
-    let distances: Vec<Vec<T>> = (0..n_queries)
-        .map(|i| {
-            (0..k_out)
+            let distances: Vec<T> = (0..k_out)
                 .filter(|&j| {
                     let pid = (idx_flat[i * k_out + j] & 0x7FFFFFFFu32) as usize;
                     pid < n && pid != sentinel_usize
                 })
                 .map(|j| dist_flat[i * k_out + j])
-                .collect()
-        })
-        .collect();
+                .collect();
 
-    (indices, distances)
+            all_indices.push(indices);
+            all_distances.push(distances);
+        }
+    }
+
+    (all_indices, all_distances)
 }
 
 ///////////
