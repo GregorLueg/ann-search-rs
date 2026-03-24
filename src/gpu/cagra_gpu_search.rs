@@ -21,7 +21,7 @@ use crate::prelude::*;
 /// Beam width (number of active candidates maintained during search)
 const BEAM_WIDTH: usize = 16;
 /// Maximum beam search iterations before forced termination
-const MAX_BEAM_ITERS: usize = 32;
+const MAX_BEAM_ITERS: usize = 48;
 /// Hash table size for visited-node tracking (must be power of 2)
 const HASH_SIZE: usize = 2048;
 /// Number of random entry points per query
@@ -37,7 +37,7 @@ pub struct CagraGpuSearchParams {
     /// `BEAM_WIDTH`
     pub beam_width: Option<usize>,
     /// Optional maximum iterations for the beam search. Good rule of thumb is
-    /// 2x beam_width. Will default to `MAX_BEAM_ITERS` if not provided.
+    /// 3x beam_width. Will default to `MAX_BEAM_ITERS` if not provided.
     pub max_beam_iters: Option<usize>,
     /// Optional number of entry points. If not provided, will default to
     /// `N_ENTRY_POINTS`.
@@ -103,7 +103,7 @@ impl CagraGpuSearchParams {
     /// Params with beam width and iterations scaled appropriately
     pub fn from_graph(k_out: usize, k_graph: usize) -> Self {
         let beam_width = k_out.max(k_graph).max(16) * 2;
-        let max_beam_iters = beam_width * 2;
+        let max_beam_iters = beam_width * 3;
         Self {
             beam_width: Some(beam_width),
             max_beam_iters: Some(max_beam_iters),

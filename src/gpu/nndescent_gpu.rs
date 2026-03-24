@@ -14,8 +14,8 @@ use std::time::Instant;
 use std::{cell::RefCell, cmp::Reverse, collections::BinaryHeap};
 use thousands::*;
 
-use crate::cpu::annoy::*;
 use crate::cpu::nndescent::*;
+use crate::cpu::vamana::compute_medoid;
 use crate::gpu::cagra_gpu_search::*;
 use crate::gpu::forest_gpu::*;
 use crate::gpu::tensor::*;
@@ -324,8 +324,9 @@ pub fn build_reverse_candidates(
 /// Core NNDescent local join kernel.
 ///
 /// For each node, loads forward and reverse candidates into shared memory,
-/// evaluates all sampled (new, new) and (new, old) pairs, computes distances
-/// using shared-memory vectors, and emits proposals for both endpoints.
+/// pre-filters by rho sampling and compacts the candidate list before loading
+/// vectors, then evaluates all (new, new) and (new, old) pairs and emits
+/// proposals for both endpoints.
 ///
 /// ### Params
 ///
@@ -386,6 +387,9 @@ pub fn local_join_shared<F: Float>(
     let mut shared_is_new = SharedMemory::<u32>::new(max_cands_comp);
     let mut shared_norms = SharedMemory::<F>::new(max_cands_comp);
 
+    // Compacted candidate count and whether any new candidates exist
+    let mut shared_compact = SharedMemory::<u32>::new(2usize);
+
     let mut shared_rev_count = SharedMemory::<u32>::new(1usize);
     if tx == 0u32 {
         let rc = reverse_count[node as usize];
@@ -394,10 +398,10 @@ pub fn local_join_shared<F: Float>(
     sync_cube();
 
     let rev_k = shared_rev_count[0usize];
-    let total_cands = k + rev_k;
+    let raw_total = k + rev_k;
 
     let mut i_load = tx;
-    while i_load < total_cands {
+    while i_load < raw_total {
         let entry = if i_load < k {
             graph_idx[(node * k + i_load) as usize]
         } else {
@@ -407,21 +411,54 @@ pub fn local_join_shared<F: Float>(
         shared_pids[i_load as usize] = entry & pid_mask;
 
         shared_is_new[i_load as usize] = if entry >= is_new_bit {
-            #[allow(clippy::useless_conversion)] // is needed for cubecl
+            #[allow(clippy::useless_conversion)]
             1u32.into()
         } else {
-            #[allow(clippy::useless_conversion)] // is needed for cubecl
+            #[allow(clippy::useless_conversion)]
             0u32.into()
         };
-        if use_cosine {
-            shared_norms[i_load as usize] = norms[shared_pids[i_load as usize] as usize];
-        }
         i_load += WORKGROUP_SIZE_X;
     }
     sync_cube();
 
-    // Load vectors into shared memory as scalars (Line<F> shared memory
-    // does not preserve individual lanes on wgpu/WGSL backends)
+    if tx == 0u32 {
+        let mut write = 0u32;
+        let mut has_new = 0u32;
+        let mut read = 0u32;
+        while read < raw_total {
+            let hash = entry_hash(node, read, iter_seed);
+            if (hash & 0xFFFFu32) < rho_thresh {
+                shared_pids[write as usize] = shared_pids[read as usize];
+                shared_is_new[write as usize] = shared_is_new[read as usize];
+                if shared_is_new[read as usize] != 0u32 {
+                    has_new = 1u32;
+                }
+                write += 1u32;
+            }
+            read += 1u32;
+        }
+        shared_compact[0usize] = write;
+        shared_compact[1usize] = has_new;
+    }
+    sync_cube();
+
+    let total_cands = shared_compact[0usize];
+    let has_new = shared_compact[1usize];
+
+    // early exit: fewer than 2 candidates or no new candidates at all
+    if total_cands < 2u32 || has_new == 0u32 {
+        terminate!();
+    }
+
+    if use_cosine {
+        let mut i_norm = tx;
+        while i_norm < total_cands {
+            shared_norms[i_norm as usize] = norms[shared_pids[i_norm as usize] as usize];
+            i_norm += WORKGROUP_SIZE_X;
+        }
+        sync_cube();
+    }
+
     let total_scalars = total_cands as usize * dim_scalars;
     let mut idx_load = tx as usize;
     while idx_load < total_scalars {
@@ -455,58 +492,51 @@ pub fn local_join_shared<F: Float>(
         }
         let j = i + 1usize + rem;
 
-        let hash_i = entry_hash(node, i as u32, iter_seed);
-        if (hash_i & 0xFFFFu32) < rho_thresh {
-            let hash_j = entry_hash(node, j as u32, iter_seed);
+        let is_new_i = shared_is_new[i] != 0u32;
+        let is_new_j = shared_is_new[j] != 0u32;
+        let pid_i = shared_pids[i];
+        let pid_j = shared_pids[j];
 
-            if (hash_j & 0xFFFFu32) < rho_thresh {
-                let is_new_i = shared_is_new[i] != 0u32;
-                let is_new_j = shared_is_new[j] != 0u32;
-                let pid_i = shared_pids[i];
-                let pid_j = shared_pids[j];
+        if (is_new_i || is_new_j) && pid_i != pid_j {
+            let mut sum = F::new(0.0);
+            let mut s = 0usize;
+            while s < dim_scalars {
+                let va = shared_vecs[i * dim_scalars + s];
+                let vb = shared_vecs[j * dim_scalars + s];
 
-                if (is_new_i || is_new_j) && pid_i != pid_j {
-                    let mut sum = F::new(0.0);
-                    let mut s = 0usize;
-                    while s < dim_scalars {
-                        let va = shared_vecs[i * dim_scalars + s];
-                        let vb = shared_vecs[j * dim_scalars + s];
+                if use_cosine {
+                    sum += va * vb;
+                } else {
+                    let diff = va - vb;
+                    sum += diff * diff;
+                }
+                s += 1usize;
+            }
 
-                        if use_cosine {
-                            sum += va * vb;
-                        } else {
-                            let diff = va - vb;
-                            sum += diff * diff;
-                        }
-                        s += 1usize;
-                    }
+            let dist = if use_cosine {
+                F::new(1.0) - (sum / (shared_norms[i] * shared_norms[j]))
+            } else {
+                sum
+            };
 
-                    let dist = if use_cosine {
-                        F::new(1.0) - (sum / (shared_norms[i] * shared_norms[j]))
-                    } else {
-                        sum
-                    };
+            let thresh_i = graph_dist[pid_i as usize * k as usize + k as usize - 1usize];
+            let thresh_j = graph_dist[pid_j as usize * k as usize + k as usize - 1usize];
 
-                    let thresh_i = graph_dist[pid_i as usize * k as usize + k as usize - 1usize];
-                    let thresh_j = graph_dist[pid_j as usize * k as usize + k as usize - 1usize];
+            if dist < thresh_i {
+                let slot_i = prop_count[pid_i as usize].fetch_add(1u32);
+                if slot_i < max_proposals {
+                    let off = pid_i as usize * max_proposals as usize + slot_i as usize;
+                    prop_idx[off] = pid_j;
+                    prop_dist[off] = dist;
+                }
+            }
 
-                    if dist < thresh_i {
-                        let slot_i = prop_count[pid_i as usize].fetch_add(1u32);
-                        if slot_i < max_proposals {
-                            let off = pid_i as usize * max_proposals as usize + slot_i as usize;
-                            prop_idx[off] = pid_j;
-                            prop_dist[off] = dist;
-                        }
-                    }
-
-                    if dist < thresh_j {
-                        let slot_j = prop_count[pid_j as usize].fetch_add(1u32);
-                        if slot_j < max_proposals {
-                            let off = pid_j as usize * max_proposals as usize + slot_j as usize;
-                            prop_idx[off] = pid_i;
-                            prop_dist[off] = dist;
-                        }
-                    }
+            if dist < thresh_j {
+                let slot_j = prop_count[pid_j as usize].fetch_add(1u32);
+                if slot_j < max_proposals {
+                    let off = pid_j as usize * max_proposals as usize + slot_j as usize;
+                    prop_idx[off] = pid_i;
+                    prop_dist[off] = dist;
                 }
             }
         }
@@ -1105,11 +1135,9 @@ macro_rules! impl_nndescent_gpu_query {
                 candidates: &mut BinaryHeap<Reverse<(OrderedFloat<$float>, usize)>>,
                 results: &mut BinaryHeap<(OrderedFloat<$float>, usize)>,
             ) -> (Vec<usize>, Vec<$float>) {
-                let init_candidates = (ef / 2).max(2 * k).min(self.n);
-                let search_k = init_candidates * 3;
-                let (init_indices, _) =
-                    self.forest
-                        .query(query_vec, init_candidates, Some(search_k));
+                let init_indices = self
+                    .router
+                    .find_entry_points(query_vec, (ef / 2).max(2 * k).min(self.n));
 
                 for &entry_idx in &init_indices {
                     if entry_idx >= self.n || visited.contains(entry_idx) {
@@ -1182,11 +1210,9 @@ macro_rules! impl_nndescent_gpu_query {
                 candidates: &mut BinaryHeap<Reverse<(OrderedFloat<$float>, usize)>>,
                 results: &mut BinaryHeap<(OrderedFloat<$float>, usize)>,
             ) -> (Vec<usize>, Vec<$float>) {
-                let init_candidates = (ef / 2).max(k).min(self.n);
-                let search_k = init_candidates * 3;
-                let (init_indices, _) =
-                    self.forest
-                        .query(query_vec, init_candidates, Some(search_k));
+                let init_indices = self
+                    .router
+                    .find_entry_points(query_vec, (ef / 2).max(2 * k).min(self.n));
 
                 for &entry_idx in &init_indices {
                     if entry_idx >= self.n || visited.contains(entry_idx) {
@@ -1280,6 +1306,8 @@ pub struct NNDescentGpu<T: AnnSearchFloat + AnnSearchGpuFloat, R: Runtime> {
     pub norms: Vec<T>,
     /// Distance metric
     pub metric: Dist,
+    /// The medoid of the graph as entry point
+    pub medoid: u32,
     /// True kNN graph of size n * k, sorted by distance per row.
     /// Extracted from NNDescent output before CAGRA pruning.
     knn_graph: Vec<(usize, T)>,
@@ -1288,8 +1316,8 @@ pub struct NNDescentGpu<T: AnnSearchFloat + AnnSearchGpuFloat, R: Runtime> {
     nav_graph: Vec<(usize, T)>,
     /// Whether NNDescent hit the delta threshold
     converged: bool,
-    /// Annoy index initialisation and finding the entry points
-    forest: AnnoyIndex<T>,
+    /// Forest router for query entry points (replaces Annoy)
+    router: ForestRouter<T>,
     /// CubeCL runtime device
     _device: R::Device,
     /// Padded dimensionality (next multiple of LINE_SIZE)
@@ -1334,7 +1362,7 @@ where
     /// * `metric` - Distance metric
     /// * `k` - Final neighbours per node (default 30)
     /// * `build_k` - Internal NNDescent degree before CAGRA pruning.
-    ///   Defaults to `2 * k`. Must be >= `k`.
+    ///   Defaults to `1.5 * k`. Must be >= `k`.
     /// * `max_iters` - Maximum NNDescent iterations (default 15)
     /// * `n_trees` - Number of Annoy trees for graph initialisation.
     ///   Defaults to `5 + n^0.25`, capped at 32.
@@ -1365,12 +1393,14 @@ where
     ) -> Self {
         let (vectors_flat, n, dim) = matrix_to_flat(data);
         let k = k.unwrap_or(30);
-        let build_k = build_k.unwrap_or(2 * k).max(k);
+        let build_k = build_k.unwrap_or((1.5 * k as f32) as usize).max(k);
         let max_iters = max_iters.unwrap_or(DEFAULT_MAX_ITERS);
         let delta = delta.unwrap_or(DEFAULT_DELTA);
         let rho = rho.unwrap_or(DEFAULT_RHO);
         let rho_thresh = (rho * 65535.0) as u32;
         let refine_knn = refine_knn.unwrap_or(0);
+
+        let medoid = compute_medoid(&vectors_flat, n, dim, metric);
 
         // pad dim to next multiple of LINE_SIZE
         let line = LINE_SIZE as usize;
@@ -1405,22 +1435,7 @@ where
 
         let start = Instant::now();
 
-        // ---- 0: Small Annoy forest for query entry points only ----
-        let n_trees_entry = 3.min(n); // cheap, just for beam search seeding
-        if verbose {
-            println!(
-                "  Building small Annoy forest ({} trees) for query entry points...",
-                n_trees_entry
-            );
-        }
-        let forest = AnnoyIndex::new(data, n_trees_entry, metric, seed);
-
-        // ---- 1a: Random graph initialisation (baseline for NNDescent) ----
-        if verbose {
-            println!("  Random graph initialisation...");
-        }
-
-        // ---- 1: GPU forest graph initialisation ----
+        // ---- 0: GPU setup ----
 
         let n_trees_forest = n_trees.unwrap_or_else(|| {
             let calculated = 5 + ((n as f64).powf(0.25)).round() as usize;
@@ -1462,7 +1477,7 @@ where
 
         let (grid_n_x, grid_n_y) = grid_2d((n as u32).div_ceil(WORKGROUP_SIZE_X));
 
-        // ---- 1a: Random graph initialisation (baseline for NNDescent) ----
+        // 1: random graph initialisation (baseline for NNDescent)
         if verbose {
             println!("  Random graph initialisation...");
         }
@@ -1483,8 +1498,8 @@ where
             );
         }
 
-        // ---- 1b: GPU forest graph initialisation ----
-        gpu_forest_init(
+        // 1b: GPU forest graph initialisation
+        let router = gpu_forest_init(
             &vectors_gpu,
             &norms_gpu,
             &graph_idx_gpu,
@@ -1493,7 +1508,6 @@ where
             &prop_dist_gpu,
             &prop_count_gpu,
             &update_counter_gpu,
-            &vectors_flat,
             n,
             dim,
             dim_padded,
@@ -1504,9 +1518,7 @@ where
             &client,
         );
 
-        // ---- 1c: Mark all graph entries as new for NNDescent ----
-        // Forest merge clears IS_NEW flags, so NNDescent would skip
-        // all pairs in its first iteration without this.
+        // 1c: Mark all graph entries as new for NNDescent
         let total_entries = (n * build_k) as u32;
         let mark_grid_flat = total_entries.div_ceil(WORKGROUP_SIZE_X);
         let mark_cubes_x = mark_grid_flat.min(65535);
@@ -1523,7 +1535,7 @@ where
             );
         }
 
-        // ---- 2: NNDescent iterations on the GPU ----
+        // 2: NNDescent iterations on the GPU
 
         let iter_start = Instant::now();
         let mut converged = false;
@@ -1831,8 +1843,6 @@ where
         }
 
         let (nav_graph_gpu, vectors_gpu, norms_gpu) = if retain_gpu {
-            // vectors_gpu and norms_gpu already exist from earlier in build(),
-            // final_idx_gpu is the CAGRA output -- keep them alive
             (Some(final_idx_gpu), Some(vectors_gpu), Some(norms_gpu))
         } else {
             (None, None, None)
@@ -1844,9 +1854,10 @@ where
             dim_padded,
             n,
             k,
+            medoid,
             norms,
             metric,
-            forest,
+            router,
             knn_graph,
             nav_graph: cagra_graph,
             converged,
@@ -1960,19 +1971,56 @@ where
         let query_params =
             query_params.unwrap_or_else(|| CagraGpuSearchParams::from_graph(k, self.k));
         let n_entry = query_params.get_n_entry();
-
         self.ensure_gpu_tensors();
-
         let client = R::client(&self._device);
         let use_cosine = self.metric == Dist::Cosine;
 
-        let search_k = n_entry * self.forest.n_trees * 2;
+        let medoid = self.medoid;
         let entry_flat: Vec<u32> = (0..n_queries)
             .into_par_iter()
             .flat_map_iter(|i| {
                 let query = &queries_flat[i * self.dim..(i + 1) * self.dim];
-                let (indices, _) = self.forest.query(query, n_entry, Some(search_k));
-                indices.into_iter().map(|idx| idx as u32)
+                let mut candidates = self.router.find_entry_points(query, n_entry * 4);
+
+                candidates.sort_unstable_by(|&a, &b| {
+                    let dist_a = match self.metric {
+                        Dist::Euclidean => {
+                            let va = &self.vectors_flat[a * self.dim..(a + 1) * self.dim];
+                            T::euclidean_simd(query, va)
+                        }
+                        Dist::Cosine => {
+                            let va = &self.vectors_flat[a * self.dim..(a + 1) * self.dim];
+                            let dot = T::dot_simd(query, va);
+                            let q_norm = T::calculate_l2_norm(query);
+                            T::one() - dot / (q_norm * self.norms[a])
+                        }
+                    };
+                    let dist_b = match self.metric {
+                        Dist::Euclidean => {
+                            let vb = &self.vectors_flat[b * self.dim..(b + 1) * self.dim];
+                            T::euclidean_simd(query, vb)
+                        }
+                        Dist::Cosine => {
+                            let vb = &self.vectors_flat[b * self.dim..(b + 1) * self.dim];
+                            let dot = T::dot_simd(query, vb);
+                            let q_norm = T::calculate_l2_norm(query);
+                            T::one() - dot / (q_norm * self.norms[b])
+                        }
+                    };
+                    dist_a
+                        .partial_cmp(&dist_b)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                });
+
+                // deduplicate against medoid, take the closest ones
+                candidates.retain(|&e| e != medoid as usize);
+                candidates.truncate(n_entry - 1);
+
+                let mut final_entries = Vec::with_capacity(n_entry);
+                final_entries.push(medoid);
+                final_entries.extend(candidates.into_iter().map(|idx| idx as u32));
+                final_entries.resize(n_entry, 0);
+                final_entries.into_iter()
             })
             .collect();
 
@@ -1992,7 +2040,6 @@ where
             Some(&entry_flat),
             &client,
         );
-
         result
     }
 

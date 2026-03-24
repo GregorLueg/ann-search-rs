@@ -12,6 +12,8 @@ use cubecl::prelude::*;
 use rand::rngs::SmallRng;
 use rand::{Rng, SeedableRng};
 use rayon::prelude::*;
+use std::cmp::Reverse;
+use std::collections::BinaryHeap;
 use std::time::Instant;
 
 use crate::gpu::nndescent_gpu::{merge_proposals, reset_proposals, MAX_PROPOSALS};
@@ -25,6 +27,19 @@ use crate::prelude::*;
 
 /// Shared memory budget in bytes (conservative for Apple Silicon / older GPUs)
 const SMEM_BUDGET: usize = 32_768;
+
+/// Result of parallel tree construction for a single tree.
+///
+/// Each element is a tuple of:
+/// - `Vec<u32>` -- final partition ID per point (length `n`), used to build the
+///   leaf structure for GPU pairwise distance computation.
+/// - `Option<Vec<Vec<T>>>` -- per-level random projection vectors
+///   (`[max_depth][dim]`). Present only for trees retained by the
+///   `ForestRouter` for query-time entry point routing.
+/// - `Option<Vec<Vec<T>>>` -- per-level partition medians
+///   (`[max_depth][n_partitions_at_level]`). Present only for router
+///   trees, paired with the projection vectors above.
+type TreeResults<T> = Vec<(Vec<u32>, Option<Vec<Vec<T>>>, Option<Vec<Vec<T>>>)>;
 
 ////////////////////
 // Kernel helpers //
@@ -144,7 +159,7 @@ fn partition_points<F: AnnSearchGpuFloat>(
 ///
 /// ### Returns
 ///
-/// Maximum number of points per leaf, clamped to `[2, 256]`
+/// Maximum number of points per leaf, clamped to `[2, 64]`
 fn compute_max_leaf_size(dim_padded: usize) -> usize {
     let line = LINE_SIZE as usize;
     let dim_scalars = (dim_padded / line) * 4;
@@ -427,8 +442,11 @@ fn compute_partition_medians<T: AnnSearchFloat>(
     dot_values: &[T],
     n_partitions: usize,
 ) -> Vec<T> {
-    // Group dot values by partition
-    let mut buckets: Vec<Vec<T>> = vec![Vec::new(); n_partitions];
+    // add 50% slack to the expected capacity to accommodate uneven splits
+    // and drastically reduce reallocation thrashing.
+    let expected_cap = dot_values.len() / n_partitions + (dot_values.len() / n_partitions / 2);
+    let mut buckets: Vec<Vec<T>> = vec![Vec::with_capacity(expected_cap); n_partitions];
+
     for (&pid, &dot) in partition_ids.iter().zip(dot_values.iter()) {
         let p = pid as usize;
         if p < n_partitions {
@@ -436,19 +454,114 @@ fn compute_partition_medians<T: AnnSearchFloat>(
         }
     }
 
-    let mut medians = vec![T::zero(); n_partitions];
-    for (pid, bucket) in buckets.iter_mut().enumerate() {
-        if bucket.is_empty() {
-            continue;
-        }
-        let mid = bucket.len() / 2;
-        bucket.select_nth_unstable_by(mid, |a, b| {
-            a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal)
-        });
-        medians[pid] = bucket[mid];
-    }
+    // parallelise the median finding using Rayon - hopefully faster ... ?
+    buckets
+        .into_par_iter()
+        .map(|mut bucket| {
+            if bucket.is_empty() {
+                T::zero()
+            } else {
+                let mid = bucket.len() / 2;
+                bucket.select_nth_unstable_by(mid, |a, b| {
+                    a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal)
+                });
+                bucket[mid]
+            }
+        })
+        .collect()
+}
 
-    medians
+//////////////////
+// ForestRouter //
+//////////////////
+
+/// Lightweight query-time router reusing GPU forest tree structure.
+/// Replaces the Annoy index for beam search entry point selection.
+pub struct ForestRouter<T: AnnSearchFloat> {
+    /// Per tree, per level: random projection vector [n_trees][max_depth][dim]
+    random_vecs: Vec<Vec<Vec<T>>>,
+    /// Per tree, per level: median per partition [n_trees][max_depth][variable]
+    medians: Vec<Vec<Vec<T>>>,
+    /// Per tree: leaves[partition_id] -> point indices [n_trees][2^max_depth][]
+    leaves: Vec<Vec<Vec<u32>>>,
+    /// Tree depth
+    max_depth: usize,
+    /// Original (unpadded) dimensionality
+    dim: usize,
+    /// Number of trees stored for routing
+    n_trees: usize,
+}
+
+impl<T: AnnSearchFloat> ForestRouter<T> {
+    /// Route a query through every stored tree using priority-queue
+    /// traversal (same strategy as Annoy) to find entry point candidates.
+    ///
+    /// Explores multiple leaves per tree by backtracking to the most
+    /// promising unexplored branches, ranked by distance to the split
+    /// hyperplane.
+    ///
+    /// ### Params
+    ///
+    /// * `query` - The query for which to identify the entry points
+    ///
+    /// ### Returns
+    ///
+    /// Leaf-co-members
+    pub fn find_entry_points(&self, query: &[T], max_candidates: usize) -> Vec<usize> {
+        let mut candidates = Vec::new();
+        let q = &query[..self.dim];
+        let per_tree = (max_candidates / self.n_trees).max(1);
+
+        for t in 0..self.n_trees {
+            // Priority queue: (margin to hyperplane, pid, level)
+            // Smallest margin = most promising unexplored branch
+            let mut pq: BinaryHeap<Reverse<(OrderedFloat<T>, u32, usize)>> = BinaryHeap::new();
+            pq.push(Reverse((OrderedFloat(T::zero()), 0u32, 0usize)));
+
+            let mut found = 0usize;
+
+            while let Some(Reverse((_, pid, level))) = pq.pop() {
+                if found >= per_tree {
+                    break;
+                }
+
+                if level >= self.max_depth {
+                    // Reached a leaf
+                    if let Some(leaf) = self.leaves[t].get(pid as usize) {
+                        candidates.extend(leaf.iter().map(|&p| p as usize));
+                        found += leaf.len();
+                    }
+                    continue;
+                }
+
+                let dot = T::dot_simd(q, &self.random_vecs[t][level]);
+                let median = self.medians[t][level]
+                    .get(pid as usize)
+                    .copied()
+                    .unwrap_or_else(T::zero);
+                let margin = if dot <= median {
+                    median - dot
+                } else {
+                    dot - median
+                };
+
+                // Go to the preferred side first (margin = 0),
+                // push the other side with its actual margin
+                let (preferred, other) = if dot <= median {
+                    (pid * 2, pid * 2 + 1)
+                } else {
+                    (pid * 2 + 1, pid * 2)
+                };
+
+                pq.push(Reverse((OrderedFloat(T::zero()), preferred, level + 1)));
+                pq.push(Reverse((OrderedFloat(margin), other, level + 1)));
+            }
+        }
+
+        candidates.sort_unstable();
+        candidates.dedup();
+        candidates
+    }
 }
 
 ////////////////////////
@@ -496,7 +609,6 @@ pub fn gpu_forest_init<T, R>(
     prop_dist_gpu: &GpuTensor<R, T>,
     prop_count_gpu: &GpuTensor<R, u32>,
     update_counter_gpu: &GpuTensor<R, u32>,
-    vectors_flat: &[T],
     n: usize,
     dim: usize,
     dim_padded: usize,
@@ -505,7 +617,8 @@ pub fn gpu_forest_init<T, R>(
     use_cosine: bool,
     verbose: bool,
     client: &ComputeClient<R>,
-) where
+) -> ForestRouter<T>
+where
     R: Runtime,
     T: AnnSearchFloat + AnnSearchGpuFloat,
 {
@@ -513,44 +626,67 @@ pub fn gpu_forest_init<T, R>(
     let dim_vec = dim_padded / line;
     let (grid_n_x, grid_n_y) = grid_2d((n as u32).div_ceil(WORKGROUP_SIZE_X));
 
-    // Dynamic leaf size based on dimension
     let max_leaf_size = compute_max_leaf_size(dim_padded);
 
-    let max_depth = if n <= max_leaf_size {
+    // cecouple the depth calculation to target leaves of ~64
+    let target_leaf_size = 64.0;
+    let max_depth = if n as f64 <= target_leaf_size {
         0
     } else {
-        ((n as f64) / (max_leaf_size as f64)).log2().ceil() as usize
+        ((n as f64) / target_leaf_size).log2().ceil() as usize
     };
+
+    // How many trees to keep routing data for (query entry points)
+    let n_router_trees = n_trees.min(5);
 
     if verbose {
         println!(
-            "  GPU forest init: {} trees, max_depth={}, max_leaf={}",
-            n_trees, max_depth, max_leaf_size
+            "  GPU forest init: {} trees, max_depth={}, max_leaf={}, router_trees={}",
+            n_trees, max_depth, max_leaf_size, n_router_trees
         );
     }
 
     let forest_start = Instant::now();
 
-    // ---- Phase 1: Build ALL trees on CPU in parallel ----
-
+    // Build trees in parallel
     let cpu_start = Instant::now();
 
-    let all_tree_partitions: Vec<Vec<u32>> = (0..n_trees)
+    let dot_grid = (n as u32).div_ceil(WORKGROUP_SIZE_X);
+    let (dot_grid_x, dot_grid_y) = grid_2d(dot_grid);
+
+    // parallelise the outer tree loop to overlap GPU execution with CPU memory reads
+    let all_tree_results: TreeResults<T> = (0..n_trees)
         .into_par_iter()
         .map(|tree_idx| {
+            // allocate the GPU buffer inside the parallel closure so each tree
+            // has an isolated buffer, preventing thread contention on the client.
+            let dot_values_gpu = GpuTensor::<R, T>::empty(vec![n], client);
+
             let tree_seed =
                 (seed as u64).wrapping_add((tree_idx as u64).wrapping_mul(0x9E3779B97F4A7C15u64));
+            let save_routing = tree_idx < n_router_trees;
 
             let mut partition_ids = vec![0u32; n];
+            let mut routing_vecs: Option<Vec<Vec<T>>> = if save_routing {
+                Some(Vec::with_capacity(max_depth))
+            } else {
+                None
+            };
+            let mut routing_medians: Option<Vec<Vec<T>>> = if save_routing {
+                Some(Vec::with_capacity(max_depth))
+            } else {
+                None
+            };
 
             for level in 0..max_depth {
                 let level_seed =
                     tree_seed.wrapping_add((level as u64).wrapping_mul(0x517CC1B727220A95u64));
                 let mut rng = SmallRng::seed_from_u64(level_seed);
 
+                // generate and normalise random projection vector
                 let mut random_vec = vec![T::zero(); dim];
-                for j in 0..dim {
-                    random_vec[j] = T::from_f64(rng.random_range(-1.0..1.0)).unwrap();
+                for v in random_vec.iter_mut() {
+                    *v = T::from_f64(rng.random_range(-1.0..1.0)).unwrap();
                 }
                 let norm_sq: T = random_vec.iter().map(|x| *x * *x).sum();
                 let norm = num_traits::Float::sqrt(norm_sq);
@@ -560,44 +696,95 @@ pub fn gpu_forest_init<T, R>(
                     }
                 }
 
-                // dot products
-                let dot_values: Vec<T> = (0..n)
-                    .map(|i| {
-                        let row = &vectors_flat[i * dim..(i + 1) * dim];
-                        row.iter()
-                            .zip(random_vec.iter())
-                            .map(|(&v, &r)| v * r)
-                            .sum()
-                    })
-                    .collect();
+                // pad to dim_padded for the GPU kernel's Line<F> layout
+                let mut random_vec_padded = vec![T::zero(); dim_padded];
+                random_vec_padded[..dim].copy_from_slice(&random_vec);
+                let random_vec_gpu =
+                    GpuTensor::<R, T>::from_slice(&random_vec_padded, vec![dim_padded], client);
 
-                // per-partition medians
+                // GPU dot products (2.8M threads, ~2ms per launch)
+                unsafe {
+                    let _ = compute_dot_products::launch_unchecked::<T, R>(
+                        client,
+                        CubeCount::Static(dot_grid_x, dot_grid_y, 1),
+                        CubeDim::new_2d(WORKGROUP_SIZE_X, 1),
+                        vectors_gpu.clone().into_tensor_arg(line),
+                        random_vec_gpu.into_tensor_arg(line),
+                        dot_values_gpu.clone().into_tensor_arg(1),
+                        ScalarArg { elem: n as u32 },
+                        dim_vec,
+                    );
+                }
+
+                // Read back dot values (~11MB, blocking but overlapped by Rayon)
+                let dot_values = dot_values_gpu.clone().read(client);
+
+                // CPU median computation (fast, O(n), parallelised internally)
                 let n_partitions = 1usize << level;
                 let medians = compute_partition_medians(&partition_ids, &dot_values, n_partitions);
 
-                // partition
-                for i in 0..n {
-                    let pid = partition_ids[i] as usize;
-                    partition_ids[i] = if dot_values[i] <= medians[pid] {
-                        partition_ids[i] * 2
-                    } else {
-                        partition_ids[i] * 2 + 1
-                    };
+                // CPU partition update (trivial parallel scatter)
+                partition_ids
+                    .par_iter_mut()
+                    .zip(dot_values.par_iter())
+                    .for_each(|(pid, &dot)| {
+                        let p = *pid as usize;
+                        *pid = if dot <= medians[p] {
+                            *pid * 2
+                        } else {
+                            *pid * 2 + 1
+                        };
+                    });
+
+                if save_routing {
+                    routing_vecs.as_mut().unwrap().push(random_vec);
+                    routing_medians.as_mut().unwrap().push(medians);
                 }
             }
 
-            partition_ids
+            (partition_ids, routing_vecs, routing_medians)
         })
         .collect();
 
+    let leaf_structures: Vec<_> = all_tree_results
+        .par_iter()
+        .map(|tree| build_leaf_structure(&tree.0, n))
+        .collect();
+
     if verbose {
-        println!("    CPU tree construction: {:.2?}", cpu_start.elapsed());
+        println!("    Tree construction: {:.2?}", cpu_start.elapsed());
     }
 
-    // ---- Phase 2: Concatenate leaf structures per batch ----
+    // build forest router
+    let mut router_rvecs = Vec::with_capacity(n_router_trees);
+    let mut router_medians = Vec::with_capacity(n_router_trees);
+    let mut router_leaves = Vec::with_capacity(n_router_trees);
 
+    for (partition_ids, rvecs_opt, medians_opt) in &all_tree_results[..n_router_trees] {
+        router_rvecs.push(rvecs_opt.clone().unwrap());
+        router_medians.push(medians_opt.clone().unwrap());
+
+        let max_pid = partition_ids
+            .iter()
+            .fold(0u32, |acc, &x| if x > acc { x } else { acc }) as usize;
+        let mut leaves = vec![Vec::new(); max_pid + 1];
+        for (i, &pid) in partition_ids.iter().enumerate() {
+            leaves[pid as usize].push(i as u32);
+        }
+        router_leaves.push(leaves);
+    }
+
+    let router = ForestRouter {
+        random_vecs: router_rvecs,
+        medians: router_medians,
+        leaves: router_leaves,
+        max_depth,
+        dim,
+        n_trees: n_router_trees,
+    };
+
+    // GPU phase: batched pairwise + merge
     let gpu_start = Instant::now();
-
     let trees_per_batch = 5;
     let n_batches = n_trees.div_ceil(trees_per_batch);
 
@@ -609,18 +796,17 @@ pub fn gpu_forest_init<T, R>(
         let mut batch_leaf_offsets: Vec<u32> = Vec::new();
 
         for tree_idx in batch_start..batch_end {
-            let (leaf_points, leaf_offsets, n_leaves) =
-                build_leaf_structure(&all_tree_partitions[tree_idx], n);
+            let (leaf_points, leaf_offsets, n_leaves) = &leaf_structures[tree_idx];
 
-            if n_leaves == 0 {
+            if *n_leaves == 0 {
                 continue;
             }
 
             let base_offset = batch_leaf_points.len() as u32;
-            for i in 0..n_leaves {
+            for i in 0..*n_leaves {
                 batch_leaf_offsets.push(leaf_offsets[i] + base_offset);
             }
-            batch_leaf_points.extend_from_slice(&leaf_points);
+            batch_leaf_points.extend_from_slice(leaf_points);
         }
 
         batch_leaf_offsets.push(batch_leaf_points.len() as u32);
@@ -641,7 +827,6 @@ pub fn gpu_forest_init<T, R>(
             client,
         );
 
-        // reset proposals for this batch
         unsafe {
             let _ = reset_proposals::launch_unchecked::<R>(
                 client,
@@ -653,7 +838,6 @@ pub fn gpu_forest_init<T, R>(
             );
         }
 
-        // leaf pairwise for this batch
         let cubes_x = (batch_leaves as u32).min(65535);
         let cubes_y = (batch_leaves as u32).div_ceil(cubes_x);
 
@@ -681,7 +865,6 @@ pub fn gpu_forest_init<T, R>(
             );
         }
 
-        // merge this batch's proposals (graph thresholds update for next batch)
         unsafe {
             let _ = merge_proposals::launch_unchecked::<T, R>(
                 client,
@@ -707,11 +890,12 @@ pub fn gpu_forest_init<T, R>(
         );
     }
 
-    // Force GPU sync to flush deferred forest work
     if verbose {
         let _ = update_counter_gpu.clone().read(client);
         println!("  GPU forest init: {:.2?}", forest_start.elapsed());
     }
+
+    router
 }
 
 ///////////
@@ -1451,7 +1635,6 @@ mod tests {
             &prop_dist_gpu,
             &prop_count_gpu,
             &update_counter_gpu,
-            &data,
             n,
             dim,
             dim_padded,
