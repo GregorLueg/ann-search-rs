@@ -324,8 +324,9 @@ pub fn build_reverse_candidates(
 /// Core NNDescent local join kernel.
 ///
 /// For each node, loads forward and reverse candidates into shared memory,
-/// evaluates all sampled (new, new) and (new, old) pairs, computes distances
-/// using shared-memory vectors, and emits proposals for both endpoints.
+/// pre-filters by rho sampling and compacts the candidate list before loading
+/// vectors, then evaluates all (new, new) and (new, old) pairs and emits
+/// proposals for both endpoints.
 ///
 /// ### Params
 ///
@@ -386,6 +387,9 @@ pub fn local_join_shared<F: Float>(
     let mut shared_is_new = SharedMemory::<u32>::new(max_cands_comp);
     let mut shared_norms = SharedMemory::<F>::new(max_cands_comp);
 
+    // Compacted candidate count and whether any new candidates exist
+    let mut shared_compact = SharedMemory::<u32>::new(2usize);
+
     let mut shared_rev_count = SharedMemory::<u32>::new(1usize);
     if tx == 0u32 {
         let rc = reverse_count[node as usize];
@@ -394,10 +398,10 @@ pub fn local_join_shared<F: Float>(
     sync_cube();
 
     let rev_k = shared_rev_count[0usize];
-    let total_cands = k + rev_k;
+    let raw_total = k + rev_k;
 
     let mut i_load = tx;
-    while i_load < total_cands {
+    while i_load < raw_total {
         let entry = if i_load < k {
             graph_idx[(node * k + i_load) as usize]
         } else {
@@ -407,21 +411,54 @@ pub fn local_join_shared<F: Float>(
         shared_pids[i_load as usize] = entry & pid_mask;
 
         shared_is_new[i_load as usize] = if entry >= is_new_bit {
-            #[allow(clippy::useless_conversion)] // is needed for cubecl
+            #[allow(clippy::useless_conversion)]
             1u32.into()
         } else {
-            #[allow(clippy::useless_conversion)] // is needed for cubecl
+            #[allow(clippy::useless_conversion)]
             0u32.into()
         };
-        if use_cosine {
-            shared_norms[i_load as usize] = norms[shared_pids[i_load as usize] as usize];
-        }
         i_load += WORKGROUP_SIZE_X;
     }
     sync_cube();
 
-    // Load vectors into shared memory as scalars (Line<F> shared memory
-    // does not preserve individual lanes on wgpu/WGSL backends)
+    if tx == 0u32 {
+        let mut write = 0u32;
+        let mut has_new = 0u32;
+        let mut read = 0u32;
+        while read < raw_total {
+            let hash = entry_hash(node, read, iter_seed);
+            if (hash & 0xFFFFu32) < rho_thresh {
+                shared_pids[write as usize] = shared_pids[read as usize];
+                shared_is_new[write as usize] = shared_is_new[read as usize];
+                if shared_is_new[read as usize] != 0u32 {
+                    has_new = 1u32;
+                }
+                write += 1u32;
+            }
+            read += 1u32;
+        }
+        shared_compact[0usize] = write;
+        shared_compact[1usize] = has_new;
+    }
+    sync_cube();
+
+    let total_cands = shared_compact[0usize];
+    let has_new = shared_compact[1usize];
+
+    // early exit: fewer than 2 candidates or no new candidates at all
+    if total_cands < 2u32 || has_new == 0u32 {
+        terminate!();
+    }
+
+    if use_cosine {
+        let mut i_norm = tx;
+        while i_norm < total_cands {
+            shared_norms[i_norm as usize] = norms[shared_pids[i_norm as usize] as usize];
+            i_norm += WORKGROUP_SIZE_X;
+        }
+        sync_cube();
+    }
+
     let total_scalars = total_cands as usize * dim_scalars;
     let mut idx_load = tx as usize;
     while idx_load < total_scalars {
@@ -455,58 +492,51 @@ pub fn local_join_shared<F: Float>(
         }
         let j = i + 1usize + rem;
 
-        let hash_i = entry_hash(node, i as u32, iter_seed);
-        if (hash_i & 0xFFFFu32) < rho_thresh {
-            let hash_j = entry_hash(node, j as u32, iter_seed);
+        let is_new_i = shared_is_new[i] != 0u32;
+        let is_new_j = shared_is_new[j] != 0u32;
+        let pid_i = shared_pids[i];
+        let pid_j = shared_pids[j];
 
-            if (hash_j & 0xFFFFu32) < rho_thresh {
-                let is_new_i = shared_is_new[i] != 0u32;
-                let is_new_j = shared_is_new[j] != 0u32;
-                let pid_i = shared_pids[i];
-                let pid_j = shared_pids[j];
+        if (is_new_i || is_new_j) && pid_i != pid_j {
+            let mut sum = F::new(0.0);
+            let mut s = 0usize;
+            while s < dim_scalars {
+                let va = shared_vecs[i * dim_scalars + s];
+                let vb = shared_vecs[j * dim_scalars + s];
 
-                if (is_new_i || is_new_j) && pid_i != pid_j {
-                    let mut sum = F::new(0.0);
-                    let mut s = 0usize;
-                    while s < dim_scalars {
-                        let va = shared_vecs[i * dim_scalars + s];
-                        let vb = shared_vecs[j * dim_scalars + s];
+                if use_cosine {
+                    sum += va * vb;
+                } else {
+                    let diff = va - vb;
+                    sum += diff * diff;
+                }
+                s += 1usize;
+            }
 
-                        if use_cosine {
-                            sum += va * vb;
-                        } else {
-                            let diff = va - vb;
-                            sum += diff * diff;
-                        }
-                        s += 1usize;
-                    }
+            let dist = if use_cosine {
+                F::new(1.0) - (sum / (shared_norms[i] * shared_norms[j]))
+            } else {
+                sum
+            };
 
-                    let dist = if use_cosine {
-                        F::new(1.0) - (sum / (shared_norms[i] * shared_norms[j]))
-                    } else {
-                        sum
-                    };
+            let thresh_i = graph_dist[pid_i as usize * k as usize + k as usize - 1usize];
+            let thresh_j = graph_dist[pid_j as usize * k as usize + k as usize - 1usize];
 
-                    let thresh_i = graph_dist[pid_i as usize * k as usize + k as usize - 1usize];
-                    let thresh_j = graph_dist[pid_j as usize * k as usize + k as usize - 1usize];
+            if dist < thresh_i {
+                let slot_i = prop_count[pid_i as usize].fetch_add(1u32);
+                if slot_i < max_proposals {
+                    let off = pid_i as usize * max_proposals as usize + slot_i as usize;
+                    prop_idx[off] = pid_j;
+                    prop_dist[off] = dist;
+                }
+            }
 
-                    if dist < thresh_i {
-                        let slot_i = prop_count[pid_i as usize].fetch_add(1u32);
-                        if slot_i < max_proposals {
-                            let off = pid_i as usize * max_proposals as usize + slot_i as usize;
-                            prop_idx[off] = pid_j;
-                            prop_dist[off] = dist;
-                        }
-                    }
-
-                    if dist < thresh_j {
-                        let slot_j = prop_count[pid_j as usize].fetch_add(1u32);
-                        if slot_j < max_proposals {
-                            let off = pid_j as usize * max_proposals as usize + slot_j as usize;
-                            prop_idx[off] = pid_i;
-                            prop_dist[off] = dist;
-                        }
-                    }
+            if dist < thresh_j {
+                let slot_j = prop_count[pid_j as usize].fetch_add(1u32);
+                if slot_j < max_proposals {
+                    let off = pid_j as usize * max_proposals as usize + slot_j as usize;
+                    prop_idx[off] = pid_i;
+                    prop_dist[off] = dist;
                 }
             }
         }
@@ -1332,7 +1362,7 @@ where
     /// * `metric` - Distance metric
     /// * `k` - Final neighbours per node (default 30)
     /// * `build_k` - Internal NNDescent degree before CAGRA pruning.
-    ///   Defaults to `2 * k`. Must be >= `k`.
+    ///   Defaults to `1.5 * k`. Must be >= `k`.
     /// * `max_iters` - Maximum NNDescent iterations (default 15)
     /// * `n_trees` - Number of Annoy trees for graph initialisation.
     ///   Defaults to `5 + n^0.25`, capped at 32.
@@ -1363,7 +1393,7 @@ where
     ) -> Self {
         let (vectors_flat, n, dim) = matrix_to_flat(data);
         let k = k.unwrap_or(30);
-        let build_k = build_k.unwrap_or(2 * k).max(k);
+        let build_k = build_k.unwrap_or((1.5 * k as f32) as usize).max(k);
         let max_iters = max_iters.unwrap_or(DEFAULT_MAX_ITERS);
         let delta = delta.unwrap_or(DEFAULT_DELTA);
         let rho = rho.unwrap_or(DEFAULT_RHO);
@@ -1447,7 +1477,7 @@ where
 
         let (grid_n_x, grid_n_y) = grid_2d((n as u32).div_ceil(WORKGROUP_SIZE_X));
 
-        // ---- 1a: Random graph initialisation (baseline for NNDescent) ----
+        // 1: random graph initialisation (baseline for NNDescent)
         if verbose {
             println!("  Random graph initialisation...");
         }
@@ -1468,9 +1498,7 @@ where
             );
         }
 
-        // ---- 1b: GPU forest graph initialisation ----
-        // Also produces the ForestRouter for query entry points,
-        // eliminating the separate Annoy build entirely.
+        // 1b: GPU forest graph initialisation
         let router = gpu_forest_init(
             &vectors_gpu,
             &norms_gpu,
@@ -1490,9 +1518,7 @@ where
             &client,
         );
 
-        // ---- 1c: Mark all graph entries as new for NNDescent ----
-        // Forest merge clears IS_NEW flags, so NNDescent would skip
-        // all pairs in its first iteration without this.
+        // 1c: Mark all graph entries as new for NNDescent
         let total_entries = (n * build_k) as u32;
         let mark_grid_flat = total_entries.div_ceil(WORKGROUP_SIZE_X);
         let mark_cubes_x = mark_grid_flat.min(65535);
@@ -1509,7 +1535,7 @@ where
             );
         }
 
-        // ---- 2: NNDescent iterations on the GPU ----
+        // 2: NNDescent iterations on the GPU
 
         let iter_start = Instant::now();
         let mut converged = false;
