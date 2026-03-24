@@ -18,13 +18,15 @@ use crate::utils::*;
 pub struct ExhaustiveIndexGpu<T: Float, R: Runtime> {
     /// Original vector data for distance calculations. Flattened for better
     /// cache locality
-    vectors_flat: Vec<T>,
+    pub vectors_flat: Vec<T>,
     /// Pre-calculated L2 norms per sample; empty if metric is not Cosine
-    norms: Vec<T>,
+    pub norms: Vec<T>,
     /// Embedding dimensionality
-    dim: usize,
+    pub dim: usize,
+    /// Padded dimensions for line size
+    pub dim_padded: usize,
     /// Number of samples
-    n: usize,
+    pub n: usize,
     /// Distance metric the index is configured for
     metric: Dist,
     /// The CubeCL runtime device
@@ -50,14 +52,16 @@ where
     pub fn new(data: MatRef<T>, metric: Dist, device: R::Device) -> Self {
         let (vectors_flat, n, dim) = matrix_to_flat(data);
 
-        // assertion for the manual unrolling
-        assert!(
-            dim.is_multiple_of(LINE_SIZE as usize),
-            "Dimension {} must be divisible by LINE_SIZE {}",
-            dim,
-            LINE_SIZE
-        );
+        let line = LINE_SIZE as usize;
+        let dim_padded = dim.next_multiple_of(line);
 
+        let vectors_padded = if dim_padded != dim {
+            pad_vectors(&vectors_flat, n, dim, dim_padded)
+        } else {
+            vectors_flat.clone()
+        };
+
+        // Compute norms on the ORIGINAL vectors_flat (not padded)
         let norms = if metric == Dist::Cosine {
             (0..n)
                 .map(|i| {
@@ -71,9 +75,10 @@ where
         };
 
         Self {
-            vectors_flat,
+            vectors_flat: vectors_padded,
             norms,
             dim,
+            dim_padded,
             n,
             metric,
             device,
@@ -98,40 +103,40 @@ where
         k: usize,
         verbose: bool,
     ) -> (Vec<Vec<usize>>, Vec<Vec<T>>) {
-        assert!(
-            self.dim.is_multiple_of(LINE_SIZE as usize),
-            "Dimension {} must be divisible by LINE_SIZE {}",
-            self.dim,
-            LINE_SIZE
-        );
-
         let (vectors_query, n_query, dim_query) = matrix_to_flat(query_mat);
-
         assert!(
             self.dim == dim_query,
             "The query matrix has not the same dimensionality as the index"
         );
 
+        let dim_padded = self.dim_padded;
+        let vectors_query_padded = if dim_padded != self.dim {
+            pad_vectors(&vectors_query, n_query, dim_query, dim_padded)
+        } else {
+            vectors_query.clone()
+        };
+
+        // Compute query norms on original dim, before padding
         let query_norms = if self.metric == Dist::Cosine {
             (0..n_query)
                 .into_par_iter()
                 .map(|i| {
-                    let start = i * self.dim;
-                    T::calculate_l2_norm(&vectors_query[start..start + self.dim])
+                    let start = i * dim_query;
+                    T::calculate_l2_norm(&vectors_query[start..start + dim_query])
                 })
                 .collect::<Vec<_>>()
         } else {
             Vec::new()
         };
 
-        let query_data = BatchData::new(&vectors_query, &query_norms, n_query);
+        let query_data = BatchData::new(&vectors_query_padded, &query_norms, n_query);
         let db_data = BatchData::new(&self.vectors_flat, &self.norms, self.n);
 
         query_batch_gpu::<T, R>(
             k,
             &query_data,
             &db_data,
-            self.dim,
+            dim_padded, // <-- pass padded dim to the GPU
             &self.metric,
             self.device.clone(),
             verbose,
@@ -166,7 +171,7 @@ where
             k,
             &query_data,
             &db_data,
-            self.dim,
+            self.dim_padded,
             &self.metric,
             self.device.clone(),
             verbose,
