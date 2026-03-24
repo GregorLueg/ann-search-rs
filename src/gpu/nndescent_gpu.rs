@@ -15,6 +15,7 @@ use std::{cell::RefCell, cmp::Reverse, collections::BinaryHeap};
 use thousands::*;
 
 use crate::cpu::nndescent::*;
+use crate::cpu::vamana::compute_medoid;
 use crate::gpu::cagra_gpu_search::*;
 use crate::gpu::forest_gpu::*;
 use crate::gpu::tensor::*;
@@ -1275,6 +1276,8 @@ pub struct NNDescentGpu<T: AnnSearchFloat + AnnSearchGpuFloat, R: Runtime> {
     pub norms: Vec<T>,
     /// Distance metric
     pub metric: Dist,
+    /// The medoid of the graph as entry point
+    pub medoid: u32,
     /// True kNN graph of size n * k, sorted by distance per row.
     /// Extracted from NNDescent output before CAGRA pruning.
     knn_graph: Vec<(usize, T)>,
@@ -1366,6 +1369,8 @@ where
         let rho = rho.unwrap_or(DEFAULT_RHO);
         let rho_thresh = (rho * 65535.0) as u32;
         let refine_knn = refine_knn.unwrap_or(0);
+
+        let medoid = compute_medoid(&vectors_flat, n, dim, metric);
 
         // pad dim to next multiple of LINE_SIZE
         let line = LINE_SIZE as usize;
@@ -1823,6 +1828,7 @@ where
             dim_padded,
             n,
             k,
+            medoid,
             norms,
             metric,
             router,
@@ -1935,6 +1941,7 @@ where
             n_queries * self.dim,
             "queries_flat length must be n_queries * dim"
         );
+
         let query_params =
             query_params.unwrap_or_else(|| CagraGpuSearchParams::from_graph(k, self.k));
         let n_entry = query_params.get_n_entry();
@@ -1942,16 +1949,52 @@ where
         let client = R::client(&self._device);
         let use_cosine = self.metric == Dist::Cosine;
 
+        let medoid = self.medoid;
         let entry_flat: Vec<u32> = (0..n_queries)
             .into_par_iter()
             .flat_map_iter(|i| {
                 let query = &queries_flat[i * self.dim..(i + 1) * self.dim];
-                let mut entries = self.router.find_entry_points(query, n_entry * 4);
-                entries.truncate(n_entry);
-                entries.resize(n_entry, 0);
-                // Pad with zeros if the router returned fewer than n_entry
-                entries.resize(n_entry, 0);
-                entries.into_iter().map(|idx| idx as u32)
+                let mut candidates = self.router.find_entry_points(query, n_entry * 4);
+
+                candidates.sort_unstable_by(|&a, &b| {
+                    let dist_a = match self.metric {
+                        Dist::Euclidean => {
+                            let va = &self.vectors_flat[a * self.dim..(a + 1) * self.dim];
+                            T::euclidean_simd(query, va)
+                        }
+                        Dist::Cosine => {
+                            let va = &self.vectors_flat[a * self.dim..(a + 1) * self.dim];
+                            let dot = T::dot_simd(query, va);
+                            let q_norm = T::calculate_l2_norm(query);
+                            T::one() - dot / (q_norm * self.norms[a])
+                        }
+                    };
+                    let dist_b = match self.metric {
+                        Dist::Euclidean => {
+                            let vb = &self.vectors_flat[b * self.dim..(b + 1) * self.dim];
+                            T::euclidean_simd(query, vb)
+                        }
+                        Dist::Cosine => {
+                            let vb = &self.vectors_flat[b * self.dim..(b + 1) * self.dim];
+                            let dot = T::dot_simd(query, vb);
+                            let q_norm = T::calculate_l2_norm(query);
+                            T::one() - dot / (q_norm * self.norms[b])
+                        }
+                    };
+                    dist_a
+                        .partial_cmp(&dist_b)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                });
+
+                // deduplicate against medoid, take the closest ones
+                candidates.retain(|&e| e != medoid as usize);
+                candidates.truncate(n_entry - 1);
+
+                let mut final_entries = Vec::with_capacity(n_entry);
+                final_entries.push(medoid);
+                final_entries.extend(candidates.into_iter().map(|idx| idx as u32));
+                final_entries.resize(n_entry, 0);
+                final_entries.into_iter()
             })
             .collect();
 
