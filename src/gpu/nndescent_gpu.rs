@@ -14,7 +14,6 @@ use std::time::Instant;
 use std::{cell::RefCell, cmp::Reverse, collections::BinaryHeap};
 use thousands::*;
 
-use crate::cpu::annoy::*;
 use crate::cpu::nndescent::*;
 use crate::gpu::cagra_gpu_search::*;
 use crate::gpu::forest_gpu::*;
@@ -1105,11 +1104,9 @@ macro_rules! impl_nndescent_gpu_query {
                 candidates: &mut BinaryHeap<Reverse<(OrderedFloat<$float>, usize)>>,
                 results: &mut BinaryHeap<(OrderedFloat<$float>, usize)>,
             ) -> (Vec<usize>, Vec<$float>) {
-                let init_candidates = (ef / 2).max(2 * k).min(self.n);
-                let search_k = init_candidates * 3;
-                let (init_indices, _) =
-                    self.forest
-                        .query(query_vec, init_candidates, Some(search_k));
+                let init_indices = self
+                    .router
+                    .find_entry_points(query_vec, (ef / 2).max(2 * k).min(self.n));
 
                 for &entry_idx in &init_indices {
                     if entry_idx >= self.n || visited.contains(entry_idx) {
@@ -1182,11 +1179,9 @@ macro_rules! impl_nndescent_gpu_query {
                 candidates: &mut BinaryHeap<Reverse<(OrderedFloat<$float>, usize)>>,
                 results: &mut BinaryHeap<(OrderedFloat<$float>, usize)>,
             ) -> (Vec<usize>, Vec<$float>) {
-                let init_candidates = (ef / 2).max(k).min(self.n);
-                let search_k = init_candidates * 3;
-                let (init_indices, _) =
-                    self.forest
-                        .query(query_vec, init_candidates, Some(search_k));
+                let init_indices = self
+                    .router
+                    .find_entry_points(query_vec, (ef / 2).max(2 * k).min(self.n));
 
                 for &entry_idx in &init_indices {
                     if entry_idx >= self.n || visited.contains(entry_idx) {
@@ -1288,8 +1283,8 @@ pub struct NNDescentGpu<T: AnnSearchFloat + AnnSearchGpuFloat, R: Runtime> {
     nav_graph: Vec<(usize, T)>,
     /// Whether NNDescent hit the delta threshold
     converged: bool,
-    /// Annoy index initialisation and finding the entry points
-    forest: AnnoyIndex<T>,
+    /// Forest router for query entry points (replaces Annoy)
+    router: ForestRouter<T>,
     /// CubeCL runtime device
     _device: R::Device,
     /// Padded dimensionality (next multiple of LINE_SIZE)
@@ -1405,22 +1400,7 @@ where
 
         let start = Instant::now();
 
-        // ---- 0: Small Annoy forest for query entry points only ----
-        let n_trees_entry = 3.min(n); // cheap, just for beam search seeding
-        if verbose {
-            println!(
-                "  Building small Annoy forest ({} trees) for query entry points...",
-                n_trees_entry
-            );
-        }
-        let forest = AnnoyIndex::new(data, n_trees_entry, metric, seed);
-
-        // ---- 1a: Random graph initialisation (baseline for NNDescent) ----
-        if verbose {
-            println!("  Random graph initialisation...");
-        }
-
-        // ---- 1: GPU forest graph initialisation ----
+        // ---- 0: GPU setup ----
 
         let n_trees_forest = n_trees.unwrap_or_else(|| {
             let calculated = 5 + ((n as f64).powf(0.25)).round() as usize;
@@ -1484,7 +1464,9 @@ where
         }
 
         // ---- 1b: GPU forest graph initialisation ----
-        gpu_forest_init(
+        // Also produces the ForestRouter for query entry points,
+        // eliminating the separate Annoy build entirely.
+        let router = gpu_forest_init(
             &vectors_gpu,
             &norms_gpu,
             &graph_idx_gpu,
@@ -1831,8 +1813,6 @@ where
         }
 
         let (nav_graph_gpu, vectors_gpu, norms_gpu) = if retain_gpu {
-            // vectors_gpu and norms_gpu already exist from earlier in build(),
-            // final_idx_gpu is the CAGRA output -- keep them alive
             (Some(final_idx_gpu), Some(vectors_gpu), Some(norms_gpu))
         } else {
             (None, None, None)
@@ -1846,7 +1826,7 @@ where
             k,
             norms,
             metric,
-            forest,
+            router,
             knn_graph,
             nav_graph: cagra_graph,
             converged,
@@ -1956,23 +1936,23 @@ where
             n_queries * self.dim,
             "queries_flat length must be n_queries * dim"
         );
-
         let query_params =
             query_params.unwrap_or_else(|| CagraGpuSearchParams::from_graph(k, self.k));
         let n_entry = query_params.get_n_entry();
-
         self.ensure_gpu_tensors();
-
         let client = R::client(&self._device);
         let use_cosine = self.metric == Dist::Cosine;
 
-        let search_k = n_entry * self.forest.n_trees * 2;
         let entry_flat: Vec<u32> = (0..n_queries)
             .into_par_iter()
             .flat_map_iter(|i| {
                 let query = &queries_flat[i * self.dim..(i + 1) * self.dim];
-                let (indices, _) = self.forest.query(query, n_entry, Some(search_k));
-                indices.into_iter().map(|idx| idx as u32)
+                let mut entries = self.router.find_entry_points(query, n_entry * 4);
+                entries.truncate(n_entry);
+                entries.resize(n_entry, 0);
+                // Pad with zeros if the router returned fewer than n_entry
+                entries.resize(n_entry, 0);
+                entries.into_iter().map(|idx| idx as u32)
             })
             .collect();
 
@@ -1992,7 +1972,6 @@ where
             Some(&entry_flat),
             &client,
         );
-
         result
     }
 

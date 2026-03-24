@@ -560,7 +560,8 @@ NNDescent convergence).
   or from the kNN graph's closest neighbours (self-query).
 
 Generally speaking CAGRA allows for very fast querying; however, the generation
-of the index takes a bit more time compared to IVF for example.
+of the index takes a bit more time compared to IVF for example. Also, it "fails"
+in very well clustered data. It works better in data sets
 
 <details>
 <summary><b>GPU NNDescent with CAGRA style pruning - Euclidean (Gaussian)</b>:</summary>
