@@ -442,8 +442,11 @@ fn compute_partition_medians<T: AnnSearchFloat>(
     dot_values: &[T],
     n_partitions: usize,
 ) -> Vec<T> {
-    // Group dot values by partition
-    let mut buckets: Vec<Vec<T>> = vec![Vec::new(); n_partitions];
+    // add 50% slack to the expected capacity to accommodate uneven splits
+    // and drastically reduce reallocation thrashing.
+    let expected_cap = dot_values.len() / n_partitions + (dot_values.len() / n_partitions / 2);
+    let mut buckets: Vec<Vec<T>> = vec![Vec::with_capacity(expected_cap); n_partitions];
+
     for (&pid, &dot) in partition_ids.iter().zip(dot_values.iter()) {
         let p = pid as usize;
         if p < n_partitions {
@@ -451,19 +454,21 @@ fn compute_partition_medians<T: AnnSearchFloat>(
         }
     }
 
-    let mut medians = vec![T::zero(); n_partitions];
-    for (pid, bucket) in buckets.iter_mut().enumerate() {
-        if bucket.is_empty() {
-            continue;
-        }
-        let mid = bucket.len() / 2;
-        bucket.select_nth_unstable_by(mid, |a, b| {
-            a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal)
-        });
-        medians[pid] = bucket[mid];
-    }
-
-    medians
+    // parallelise the median finding using Rayon - hopefully faster ... ?
+    buckets
+        .into_par_iter()
+        .map(|mut bucket| {
+            if bucket.is_empty() {
+                T::zero()
+            } else {
+                let mid = bucket.len() / 2;
+                bucket.select_nth_unstable_by(mid, |a, b| {
+                    a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal)
+                });
+                bucket[mid]
+            }
+        })
+        .collect()
 }
 
 //////////////////
@@ -641,15 +646,19 @@ where
     let forest_start = Instant::now();
 
     // Build trees in parallel
-
     let cpu_start = Instant::now();
 
-    let dot_values_gpu = GpuTensor::<R, T>::empty(vec![n], client);
     let dot_grid = (n as u32).div_ceil(WORKGROUP_SIZE_X);
     let (dot_grid_x, dot_grid_y) = grid_2d(dot_grid);
 
+    // parallelise the outer tree loop to overlap GPU execution with CPU memory reads
     let all_tree_results: TreeResults<T> = (0..n_trees)
+        .into_par_iter()
         .map(|tree_idx| {
+            // allocate the GPU buffer inside the parallel closure so each tree
+            // has an isolated buffer, preventing thread contention on the client.
+            let dot_values_gpu = GpuTensor::<R, T>::empty(vec![n], client);
+
             let tree_seed =
                 (seed as u64).wrapping_add((tree_idx as u64).wrapping_mul(0x9E3779B97F4A7C15u64));
             let save_routing = tree_idx < n_router_trees;
@@ -704,10 +713,10 @@ where
                     );
                 }
 
-                // Read back dot values (~11MB, sub-millisecond)
+                // Read back dot values (~11MB, blocking but overlapped by Rayon)
                 let dot_values = dot_values_gpu.clone().read(client);
 
-                // CPU median computation (fast, O(n))
+                // CPU median computation (fast, O(n), parallelized internally)
                 let n_partitions = 1usize << level;
                 let medians = compute_partition_medians(&partition_ids, &dot_values, n_partitions);
 
@@ -739,7 +748,6 @@ where
     }
 
     // build forest router
-
     let mut router_rvecs = Vec::with_capacity(n_router_trees);
     let mut router_medians = Vec::with_capacity(n_router_trees);
     let mut router_leaves = Vec::with_capacity(n_router_trees);
@@ -767,8 +775,7 @@ where
         n_trees: n_router_trees,
     };
 
-    // GPU phase: batched pairwise + merge (unchanged)
-
+    // GPU phase: batched pairwise + merge
     let gpu_start = Instant::now();
     let trees_per_batch = 5;
     let n_batches = n_trees.div_ceil(trees_per_batch);
