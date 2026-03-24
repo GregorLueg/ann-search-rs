@@ -166,7 +166,7 @@ fn compute_max_leaf_size(dim_padded: usize) -> usize {
     let per_point = dim_scalars * std::mem::size_of::<f32>() + 4 + 4;
     let overhead = 8; // shared_leaf_start + shared_leaf_size
     let available = SMEM_BUDGET.saturating_sub(overhead);
-    (available / per_point).clamp(2, 64)
+    (available / per_point).clamp(2, 256)
 }
 
 /// All-pairs distance computation within a leaf, emitting proposals.
@@ -627,10 +627,13 @@ where
     let (grid_n_x, grid_n_y) = grid_2d((n as u32).div_ceil(WORKGROUP_SIZE_X));
 
     let max_leaf_size = compute_max_leaf_size(dim_padded);
-    let max_depth = if n <= max_leaf_size {
+
+    // cecouple the depth calculation to target leaves of ~64
+    let target_leaf_size = 64.0;
+    let max_depth = if n as f64 <= target_leaf_size {
         0
     } else {
-        ((n as f64) / (max_leaf_size as f64)).log2().ceil() as usize
+        ((n as f64) / target_leaf_size).log2().ceil() as usize
     };
 
     // How many trees to keep routing data for (query entry points)
