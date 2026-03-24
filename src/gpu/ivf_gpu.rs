@@ -101,6 +101,9 @@ where
     ) -> Self {
         let (vectors_flat, n, dim) = matrix_to_flat(data);
 
+        let max_iters = max_iters.unwrap_or(30);
+        let nlist = nlist.unwrap_or((n as f32).sqrt() as usize).max(1);
+
         assert!(
             dim.is_multiple_of(LINE_SIZE as usize),
             "Dimension {} must be divisible by LINE_SIZE {}",
@@ -108,19 +111,11 @@ where
             LINE_SIZE
         );
 
-        let max_iters = max_iters.unwrap_or(30);
-        let nlist = nlist.unwrap_or((n as f32).sqrt() as usize).max(1);
-
-        // subsample for training if large
         let n_train = (256 * nlist).min(250_000).min(n).max(1);
         let (training_data, _) = sample_vectors(&vectors_flat, dim, n, n_train, seed);
 
         if verbose {
-            println!(
-                "  Building IVF-GPU-Batched index with {} clusters for {} vectors",
-                nlist,
-                n.separate_with_underscores()
-            );
+            println!("  Generating IVF index with {} Voronoi cells.", nlist);
         }
 
         // train centroids
@@ -275,20 +270,17 @@ where
 
         if n_batches == 1 {
             // Small enough to process in one go
-            return self.query_batch_internal(queries_flat, n_queries, k, nprobe, verbose, client);
+            return self.query_batch_internal(queries_flat, n_queries, k, nprobe, client);
         }
 
         let mut all_indices = Vec::with_capacity(n_queries);
         let mut all_distances = Vec::with_capacity(n_queries);
 
         for batch_idx in 0..n_batches {
-            if verbose {
-                println!(
-                    "Processing query batch {}/{} ({} queries per batch)",
-                    batch_idx + 1,
-                    n_batches,
-                    nquery.separate_with_underscores()
-                );
+            if verbose
+                && (batch_idx == 0 || (batch_idx + 1) % 100 == 0 || batch_idx + 1 == n_batches)
+            {
+                println!("  Query batch {}/{}", batch_idx + 1, n_batches,);
             }
 
             let batch_start = batch_idx * nquery;
@@ -298,7 +290,7 @@ where
             let batch_queries = &queries_flat[batch_start * self.dim..batch_end * self.dim];
 
             let (batch_indices, batch_dists) =
-                self.query_batch_internal(batch_queries, batch_size, k, nprobe, verbose, client);
+                self.query_batch_internal(batch_queries, batch_size, k, nprobe, client);
 
             all_indices.extend(batch_indices);
             all_distances.extend(batch_dists);
@@ -477,7 +469,6 @@ where
         n_queries: usize,
         k: usize,
         nprobe: usize,
-        verbose: bool,
         client: &ComputeClient<R>,
     ) -> (Vec<Vec<usize>>, Vec<Vec<T>>) {
         let vec_size = LINE_SIZE as usize;
@@ -632,14 +623,6 @@ where
             .iter()
             .fold(0, |acc, &x| acc.max(x as usize));
 
-        if verbose {
-            println!(
-                "  Allocating dense candidate buffer: {} x {} floats",
-                n_queries, max_candidates
-            );
-            println!("  Launching mega-kernel with {} tasks", n_tasks);
-        }
-
         // ── Step 4: Mega kernel ──
 
         let candidate_dists_gpu = GpuTensor::<R, T>::empty(vec![n_queries, max_candidates], client);
@@ -725,10 +708,6 @@ where
                 topk_dists_gpu.clone().into_tensor_arg(1),
                 topk_indices_gpu.clone().into_tensor_arg(1),
             );
-        }
-
-        if verbose {
-            println!("  GPU Mega-Kernel & Top-K finished. Transferring final results...");
         }
 
         // ── Step 6: Read results ──
