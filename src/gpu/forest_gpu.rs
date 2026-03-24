@@ -646,7 +646,6 @@ where
     let cpu_start = Instant::now();
 
     let all_tree_results: TreeResults<T> = (0..n_trees)
-        .into_par_iter()
         .map(|tree_idx| {
             let tree_seed =
                 (seed as u64).wrapping_add((tree_idx as u64).wrapping_mul(0x9E3779B97F4A7C15u64));
@@ -669,7 +668,6 @@ where
                     tree_seed.wrapping_add((level as u64).wrapping_mul(0x517CC1B727220A95u64));
                 let mut rng = SmallRng::seed_from_u64(level_seed);
 
-                // generate and normalise random projection vector
                 let mut random_vec = vec![T::zero(); dim];
                 for v in random_vec.iter_mut() {
                     *v = T::from_f64(rng.random_range(-1.0..1.0)).unwrap();
@@ -682,7 +680,7 @@ where
                     }
                 }
 
-                // parallel dot products + SIMD (used to be slow)
+                // Full thread pool available for 2.8M-way parallelism
                 let dot_values: Vec<T> = (0..n)
                     .into_par_iter()
                     .map(|i| {
@@ -691,11 +689,9 @@ where
                     })
                     .collect();
 
-                // medians (sequential, O(n), fast enough)
                 let n_partitions = 1usize << level;
                 let medians = compute_partition_medians(&partition_ids, &dot_values, n_partitions);
 
-                // parallel partition update
                 partition_ids
                     .par_iter_mut()
                     .zip(dot_values.par_iter())
