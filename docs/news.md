@@ -1,5 +1,12 @@
 # News
 
+## 0.2.9
+
+**Features**
+
+- Harmonised Annoy to also use the SIMD-accelerated distance metrics and
+  returning squared Euclidean distance instead of Euclidean distance.
+
 ## 0.2.8
 
 **Features**
