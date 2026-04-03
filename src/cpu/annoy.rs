@@ -581,33 +581,10 @@ where
                         }
                         visited.insert(item);
 
-                        let vec_start = item * self.dim;
-                        let vec = unsafe {
-                            self.vectors_flat
-                                .get_unchecked(vec_start..vec_start + self.dim)
-                        };
-
                         let dist = match self.metric {
-                            Dist::Euclidean => {
-                                let mut dist_sq = T::zero();
-                                for i in 0..self.dim {
-                                    let diff = unsafe {
-                                        *query_vec.get_unchecked(i) - *vec.get_unchecked(i)
-                                    };
-                                    dist_sq = dist_sq + diff * diff;
-                                }
-                                dist_sq.sqrt()
-                            }
+                            Dist::Euclidean => self.euclidean_distance_to_query(item, query_vec),
                             Dist::Cosine => {
-                                let mut dot = T::zero();
-                                for i in 0..self.dim {
-                                    dot = dot
-                                        + unsafe {
-                                            *query_vec.get_unchecked(i) * *vec.get_unchecked(i)
-                                        };
-                                }
-                                let norm = unsafe { *self.norms.get_unchecked(item) };
-                                T::one() - dot / (query_norm * norm)
+                                self.cosine_distance_to_query(item, query_vec, query_norm)
                             }
                         };
 
