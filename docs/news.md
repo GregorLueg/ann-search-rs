@@ -1,5 +1,12 @@
 # News
 
+## 0.2.10
+
+**Features**
+
+- Making some other functions public in the k-means part supporting IVF for
+  easier re-use in other crates.
+
 ## 0.2.9
 
 **Features**

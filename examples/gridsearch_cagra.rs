@@ -148,10 +148,64 @@ fn main() {
     let cagra_build = start.elapsed().as_secs_f64() * 1000.0;
     let cagra_size = gpu_nndescent_idx.memory_usage_bytes() as f64 / (1024.0 * 1024.0);
 
+    // Auto params (library defaults)
+    println!("Querying CAGRA (auto params)...");
+    let start = Instant::now();
+    let (cagra_neighbors, cagra_distances) = query_nndescent_index_gpu(
+        query_data.as_ref(),
+        &mut gpu_nndescent_idx,
+        cli.k,
+        None,
+        None,
+        true,
+        false,
+    );
+    let cagra_query = start.elapsed().as_secs_f64() * 1000.0;
+
+    let recall = calculate_recall(&true_neighbors, &cagra_neighbors, cli.k);
+    let dist_err = calculate_dist_error(
+        true_distances.as_ref().unwrap(),
+        cagra_distances.as_ref().unwrap(),
+        cli.k,
+    );
+
+    results.push(BenchmarkResultSize {
+        method: "CAGRA-auto (query)".to_string(),
+        build_time_ms: cagra_build,
+        query_time_ms: cagra_query,
+        total_time_ms: cagra_build + cagra_query,
+        recall_at_k: recall,
+        mean_dist_err: dist_err,
+        index_size_mb: cagra_size,
+    });
+
+    println!("Self-querying CAGRA (auto params)...");
+    let start = Instant::now();
+    let (cagra_self_neighbors, cagra_self_distances) =
+        query_nndescent_index_gpu_self(&mut gpu_nndescent_idx, cli.k, None, true);
+    let cagra_self = start.elapsed().as_secs_f64() * 1000.0;
+
+    let recall_self = calculate_recall(&true_neighbors_self, &cagra_self_neighbors, cli.k);
+    let dist_err_self = calculate_dist_error(
+        true_distances_self.as_ref().unwrap(),
+        cagra_self_distances.as_ref().unwrap(),
+        cli.k,
+    );
+
+    results.push(BenchmarkResultSize {
+        method: "CAGRA-auto (self)".to_string(),
+        build_time_ms: cagra_build,
+        query_time_ms: cagra_self,
+        total_time_ms: cagra_build + cagra_self,
+        recall_at_k: recall_self,
+        mean_dist_err: dist_err_self,
+        index_size_mb: cagra_size,
+    });
+
     let beam_widths = [16, 30, 48, 64];
 
     for &bw in &beam_widths {
-        let max_iters = bw * 2;
+        let max_iters = bw * 3;
         let params = CagraGpuSearchParams::new(Some(bw), Some(max_iters), None);
 
         // External query
