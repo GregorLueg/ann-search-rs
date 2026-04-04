@@ -23,8 +23,8 @@ benchmarked. Index size in memory is also provided.
 
 - [BF16 quantisation](#bf16-ivf-and-exhaustive)
 - [SQ8 quantisation](#sq8-ivf-and-exhaustive)
-- [Product quantisation](#product-quantisation-ivf-only)
-- [Optimised product quantisation](#optimised-product-quantisation-ivf-only)
+- [Product quantisation](#product-quantisation-exhaustive-and-ivf)
+- [Optimised product quantisation](#optimised-product-quantisation-exhaustive-and-ivf)
 
 ### BF16 (IVF and exhaustive)
 
@@ -681,6 +681,7 @@ IVF-PQ-nl547-m64-np27 (query)                          6_973.67     2_855.22    
 IVF-PQ-nl547-m64-np33 (query)                          6_973.67     3_421.73    10_395.40       0.5240          NaN         9.95
 IVF-PQ-nl547-m64 (self)                                6_973.67    34_603.71    41_577.38       0.4379          NaN         9.95
 --------------------------------------------------------------------------------------------------------------------------------
+</code></pre>
 </details>
 
 ---
