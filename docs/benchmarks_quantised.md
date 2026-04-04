@@ -517,7 +517,6 @@ IVF-PQ-nl547-m16 (self)                                3_573.40     9_414.41    
 
 <details>
 <summary><b>PQ quantisations - Euclidean (Correlated - 128 dim)</b>:</summary>
-</br>
 <pre><code>
 ================================================================================================================================
 Benchmark: 150k cells, 128D
@@ -622,7 +621,6 @@ intrinsic data in the structure, the performance increases.
 
 <details>
 <summary><b>PQ quantisations - Euclidean (Gaussian - 256 dim)</b>:</summary>
-</br>
 <pre><code>
 ================================================================================================================================
 Benchmark: 150k cells, 256D
@@ -758,7 +756,6 @@ IVF-PQ-nl547-m64 (self)                                6_261.06    34_557.58    
 <details>
 <summary><b>PQ quantisations - Euclidean (Low Rank - 256 dim)</b>:</summary>
 <pre><code>
-</br>
 ================================================================================================================================
 Benchmark: 150k cells, 256D
 ================================================================================================================================
@@ -820,6 +817,10 @@ IVF-PQ-nl547-m64 (self)                                5_946.52    34_604.17    
 --------------------------------------------------------------------------------------------------------------------------------
 </code></pre>
 </details>
+
+Especially for the data with more internal structure, we can appreciate that
+the Recalls reach ≥0.7 while providing a massive reduction in memory
+fingerprint.
 
 ### Optimised product quantisation (Exhaustive and IVF)
 
@@ -890,7 +891,6 @@ building. Querying on the other hand is very performant.
 <details>
 <summary><b>OPQ quantisations - Euclidean (Gaussian - 128 dim)</b>:</summary>
 <pre><code>
-</br>
 ================================================================================================================================
 Benchmark: 150k cells, 128D
 ================================================================================================================================
@@ -941,7 +941,6 @@ IVF-OPQ-nl547-m16 (self)                               6_281.58     9_820.50    
 <details>
 <summary><b>OPQ quantisations - Euclidean (Correlated - 128 dim)</b>:</summary>
 <pre><code>
-</br>
 ================================================================================================================================
 Benchmark: 150k cells, 128D
 ================================================================================================================================
@@ -990,9 +989,8 @@ IVF-OPQ-nl547-m16 (self)                               5_623.42     9_783.92    
 ---
 
 <details>
-<summary><b>PQ quantisations - Euclidean (Low Rank - 128 dim)</b>:</summary>
+<summary><b>OPQ quantisations - Euclidean (Low Rank - 128 dim)</b>:</summary>
 <pre><code>
-</br>
 ================================================================================================================================
 Benchmark: 150k cells, 128D
 ================================================================================================================================
@@ -1045,9 +1043,8 @@ blob" data, the performance is not too great, but the moment there is more
 intrinsic data in the structure, the performance increases.
 
 <details>
-<summary><b>PQ quantisations - Euclidean (Gaussian - 256 dim)</b>:</summary>
+<summary><b>OPQ quantisations - Euclidean (Gaussian - 256 dim)</b>:</summary>
 <pre><code>
-</br>
 ================================================================================================================================
 Benchmark: 150k cells, 256D
 ================================================================================================================================
@@ -1113,9 +1110,8 @@ IVF-OPQ-nl547-m64 (self)                              15_914.75    35_563.28    
 ---
 
 <details>
-<summary><b>PQ quantisations - Euclidean (Correlated - 256 dim)</b>:</summary>
+<summary><b>OPQ quantisations - Euclidean (Correlated - 256 dim)</b>:</summary>
 <pre><code>
-</br>
 ================================================================================================================================
 Benchmark: 150k cells, 256D
 ================================================================================================================================
@@ -1181,9 +1177,8 @@ IVF-OPQ-nl547-m64 (self)                              15_243.36    36_124.69    
 ---
 
 <details>
-<summary><b>PQ quantisations - Euclidean (Low Rank - 256 dim)</b>:</summary>
+<summary><b>OPQ quantisations - Euclidean (Low Rank - 256 dim)</b>:</summary>
 <pre><code>
-</br>
 ================================================================================================================================
 Benchmark: 150k cells, 256D
 ================================================================================================================================
