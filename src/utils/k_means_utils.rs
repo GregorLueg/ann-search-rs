@@ -303,7 +303,7 @@ where
 /// ### Returns
 ///
 /// Initial centroids (k * dim elements)
-fn kmeans_parallel_init<T>(
+pub fn kmeans_parallel_init<T>(
     data: &[T],
     data_norms: &[T],
     dim: usize,
@@ -784,7 +784,7 @@ fn update_centroids<T>(
 /// * `dim` - Embedding dimensions
 /// * `k` - Number of centroids
 /// * `deltas` - Output: Euclidean distance each centroid moved
-fn compute_centroid_drift<T>(
+pub fn compute_centroid_drift<T>(
     old_centroids: &[T],
     new_centroids: &[T],
     dim: usize,
