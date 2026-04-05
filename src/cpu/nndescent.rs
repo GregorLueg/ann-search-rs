@@ -398,9 +398,9 @@ where
         let max_candidates = max_candidates.unwrap_or(k.min(60));
 
         let start = Instant::now();
-        let annoy_index = AnnoyIndex::new(data, n_trees, metric, seed);
+        let forest = AnnoyIndex::new(data, n_trees, metric, seed);
         if verbose {
-            println!("Built Annoy index: {:.2?}", start.elapsed());
+            println!("Built Kd forest: {:.2?}", start.elapsed());
         }
 
         let builder = NNDescent {
@@ -412,7 +412,7 @@ where
             norms,
             graph: Vec::new(),
             converged: false,
-            forest: annoy_index,
+            forest,
             original_ids: (0..n).collect(),
         };
 
@@ -464,7 +464,7 @@ where
     /// Returns a contiguous `Vec<Neighbour<T>>` of size `n * k`. Each
     /// node's block is filled with Annoy results (marked new) and padded
     /// with sentinels.
-    fn init_with_annoy(&self, k: usize) -> Vec<Neighbour<T>> {
+    fn init_with_forest(&self, k: usize) -> Vec<Neighbour<T>> {
         let sentinel = Neighbour::new(SENTINEL_PID, T::max_value(), false);
         let mut graph = vec![sentinel; self.n * k];
 
@@ -513,7 +513,7 @@ where
         let mut converged = false;
 
         let start = Instant::now();
-        let mut graph = self.init_with_annoy(k);
+        let mut graph = self.init_with_forest(k);
 
         if verbose {
             println!("Queried Annoy index: {:.2?}", start.elapsed());

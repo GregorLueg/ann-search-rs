@@ -39,6 +39,7 @@ of exact times, but the overall trends should reproduce on your system.
 - [HNSW](#hnsw)
 - [LSH](#lsh)
 - [IVF](#ivf)
+- [Kd forest](#kd-forest)
 - [NNDescent](#nndescent)
 - [Vamana](#vamana)
 
@@ -914,9 +915,6 @@ Self is queried with the default search budget.
 <summary><b>Kd forest - Euclidean (Gaussian)</b>:</summary>
 </br>
 <pre><code>
-
-</code></pre>
-</details>
 ================================================================================================================================
 Benchmark: 150k samples, 32D
 ================================================================================================================================
@@ -960,6 +958,9 @@ KdTree-nt100-s:10x (query)                               526.84       426.69    
 KdTree-nt100-s:5x (query)                                526.84       273.02       799.86       0.9782     0.063215       163.98
 KdTree-nt100 (self)                                      526.84     5_018.40     5_545.24       0.9999     0.000279       163.98
 --------------------------------------------------------------------------------------------------------------------------------
+</code></pre>
+</details>
+
 ---
 
 <details>

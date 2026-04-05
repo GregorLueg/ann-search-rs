@@ -23,6 +23,7 @@ pub const DEFAULT_DISTANCE: &str = "euclidean";
 pub const DEFAULT_COR_STRENGTH: f64 = 0.5;
 pub const DEFAULT_DATA: &str = "gaussian";
 pub const DEFAULT_INTRINSIC_DIM: usize = 16;
+pub const DEFAULT_SPECTRAL_DECAY: f64 = 1.5;
 
 ////////////
 // Parser //
@@ -64,6 +65,9 @@ pub struct Cli {
 
     #[arg(long, default_value_t = DEFAULT_INTRINSIC_DIM)]
     pub intrinsic_dim: usize,
+
+    #[arg(long, default_value_t = DEFAULT_SPECTRAL_DECAY)]
+    pub spectral_decay: f64,
 }
 
 //////////
@@ -76,6 +80,7 @@ pub enum SyntheticData {
     GaussianNoise,
     Correlated,
     LowRank,
+    QuantisationStress,
 }
 
 /// Helper function to parse the data type
@@ -92,6 +97,7 @@ pub fn parse_data(s: &str) -> Option<SyntheticData> {
         "gaussian" => Some(SyntheticData::GaussianNoise),
         "correlated" => Some(SyntheticData::Correlated),
         "lowrank" => Some(SyntheticData::LowRank),
+        "quantisation" | "quantization" => Some(SyntheticData::QuantisationStress),
         _ => None,
     }
 }
@@ -455,6 +461,165 @@ where
     (data_high_dim, cluster_assignments)
 }
 
+/// Random orthogonal matrix via Gram-Schmidt on Gaussian random matrix.
+///
+/// ### Params
+///
+/// * `dim` - Dimensions
+/// * `rng` - StdRng for the random sampling
+///
+/// ### Returns
+///
+/// Orthogonal matrix
+fn random_orthogonal_matrix<T>(dim: usize, rng: &mut StdRng) -> Mat<T>
+where
+    T: Float + FromPrimitive + ComplexField,
+{
+    let mut q = Mat::<T>::zeros(dim, dim);
+
+    for i in 0..dim {
+        for j in 0..dim {
+            let val: f64 = rng.sample(StandardNormal);
+            q[(i, j)] = T::from_f64(val).unwrap();
+        }
+    }
+
+    for col in 0..dim {
+        for prev in 0..col {
+            let mut dot = T::zero();
+            for row in 0..dim {
+                dot = dot + q[(row, col)] * q[(row, prev)];
+            }
+            for row in 0..dim {
+                q[(row, col)] = q[(row, col)] - dot * q[(row, prev)];
+            }
+        }
+        let mut norm_sq = T::zero();
+        for row in 0..dim {
+            norm_sq = norm_sq + q[(row, col)] * q[(row, col)];
+        }
+        let norm = norm_sq.sqrt();
+        if norm > T::epsilon() {
+            for row in 0..dim {
+                q[(row, col)] = q[(row, col)] / norm;
+            }
+        }
+    }
+
+    q
+}
+
+/// Generate combined quantisation stress test data
+///
+/// Creates high-dimensional data combining power-law eigenvalue spectrum with
+/// norm-stratified clusters, randomly rotated so the important subspace doesn't
+/// align with coordinate axes. Clusters are paired to share directions at
+/// different radii, stressing sign binarisation (norm-blind), axis-aligned PQ
+/// (mixes signal and noise partitions), and low-bit methods generally.
+///
+/// ### Params
+///
+/// * `n_samples` - Number of samples
+/// * `dim` - Embedding dimensionality (e.g., 128, 256)
+/// * `n_clusters` - Number of distinct clusters
+/// * `spectral_decay` - Exponent for power-law variance decay (1.5 = moderate,
+///   2.0 = aggressive)
+/// * `seed` - Random seed for reproducibility
+///
+/// ### Returns
+///
+/// Matrix of shape (n_samples, dim) and cluster assignments
+pub fn generate_quantisation_stress<T>(
+    n_samples: usize,
+    dim: usize,
+    n_clusters: usize,
+    spectral_decay: f64,
+    seed: u64,
+) -> (Mat<T>, Vec<usize>)
+where
+    T: Float + FromPrimitive + ComplexField,
+{
+    let mut rng = StdRng::seed_from_u64(seed);
+
+    // power-law eigenvalues: variance concentrated in first few dims
+    let eigenvalues: Vec<f64> = (0..dim)
+        .map(|i| 1.0 / ((i + 1) as f64).powf(spectral_decay))
+        .collect();
+
+    // generate unit directions, then assign radii to create norm stratification
+    // half the clusters share directions with a partner at a different radius
+    let n_directions = n_clusters.div_ceil(2);
+    let radii = [2.0, 8.0, 20.0];
+
+    let mut direction_vecs = Vec::with_capacity(n_directions);
+    for _ in 0..n_directions {
+        let raw: Vec<f64> = (0..dim)
+            .map(|_| rng.sample::<f64, _>(StandardNormal))
+            .collect();
+        let norm: f64 = raw.iter().map(|x| x * x).sum::<f64>().sqrt();
+        direction_vecs.push(raw.into_iter().map(|x| x / norm).collect::<Vec<f64>>());
+    }
+
+    // centres: direction * radius, scaled per-dim by eigenvalue
+    let mut centres = Vec::with_capacity(n_clusters);
+    for cidx in 0..n_clusters {
+        let dir = &direction_vecs[cidx % n_directions];
+        let radius = radii[cidx % radii.len()];
+        let centre: Vec<f64> = (0..dim)
+            .map(|d| dir[d] * radius * eigenvalues[d].sqrt())
+            .collect();
+        centres.push(centre);
+    }
+
+    // variable cluster sizes
+    let mut assignments = Vec::new();
+    for idx in 0..n_clusters {
+        let weight = rng.random_range(0.5..2.5);
+        let n = ((n_samples as f64 * weight) / (n_clusters as f64 * 1.25)) as usize;
+        assignments.extend(vec![idx; n]);
+    }
+    while assignments.len() < n_samples {
+        assignments.push(rng.random_range(0..n_clusters));
+    }
+    assignments.shuffle(&mut rng);
+    assignments.truncate(n_samples);
+
+    // samples with dimension-dependent variance, cluster std proportional to radius
+    let mut data = Mat::<T>::zeros(n_samples, dim);
+    for (i, &cidx) in assignments.iter().enumerate() {
+        let centre = &centres[cidx];
+        let radius: f64 = centre.iter().map(|x| x * x).sum::<f64>().sqrt().max(1.0);
+        let base_std = radius * 0.06;
+
+        for j in 0..dim {
+            let u1: f64 = rng.random();
+            let u2: f64 = rng.random();
+            let noise = (-2.0 * u1.ln()).sqrt() * (2.0 * std::f64::consts::PI * u2).cos();
+            let std = base_std * eigenvalues[j].sqrt();
+            data[(i, j)] = T::from_f64(centre[j] + noise * std).unwrap();
+        }
+    }
+
+    // random rotation so nothing is axis-aligned
+    let rotation = random_orthogonal_matrix::<T>(dim, &mut rng);
+    let mut rotated = Mat::<T>::zeros(n_samples, dim);
+    for i in 0..n_samples {
+        for j in 0..dim {
+            let mut sum = T::zero();
+            for k in 0..dim {
+                sum = sum + data[(i, k)] * rotation[(k, j)];
+            }
+            rotated[(i, j)] = sum;
+        }
+    }
+
+    (rotated, assignments)
+}
+
+////////////////////////////
+// Main dispatch function //
+////////////////////////////
+
 /// Wrapper function to generate the synthetic data to use
 ///
 /// ### Params
@@ -488,6 +653,16 @@ pub fn generate_data(cli: &Cli) -> (Mat<f32>, Vec<usize>) {
                 cli.dim,
                 cli.intrinsic_dim,
                 cli.n_clusters,
+                cli.seed,
+            )
+        }
+        SyntheticData::QuantisationStress => {
+            println!(">>> Using quantisation stress test data. <<<");
+            generate_quantisation_stress(
+                cli.n_samples,
+                cli.dim,
+                cli.n_clusters,
+                cli.spectral_decay,
                 cli.seed,
             )
         }

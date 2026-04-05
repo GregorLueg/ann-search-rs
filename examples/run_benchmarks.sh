@@ -29,7 +29,7 @@ run_common_patterns() {
 
 run_standard() {
     echo "=== Running standard benchmarks ==="
-    for algo in annoy balltree hnsw ivf lsh nndescent vamana; do
+    for algo in annoy balltree hnsw ivf kd_forest lsh nndescent vamana; do
         run_common_patterns run_benchmark "${algo}" "${algo}"
     done
 }
@@ -44,11 +44,10 @@ run_quantised_benchmarks() {
 
     # IVF-PQ and IVF-OPQ
     for variant in pq opq; do
-        for dim in 128 256; do
+        for dim in 128 256 512; do
             echo "Running ${variant} benchmarks (dim=${dim})..."
-            run_quantised ${variant} -- --distance euclidean --dim ${dim}
-            run_quantised ${variant} -- --distance euclidean --dim ${dim} --data correlated
-            run_quantised ${variant} -- --distance euclidean --dim ${dim} --data lowrank
+            run_quantised ${variant} -- --distance euclidean --dim ${dim} --data lowrank --n-samples 50000
+            run_quantised ${variant} -- --distance euclidean --dim ${dim} --data quantisation --n-samples 50000
         done
     done
 }
@@ -79,13 +78,9 @@ run_binary_benchmarks() {
     echo "=== Running binary benchmarks ==="
 
     for variant in binary rabitq; do
-        run_common_patterns "cargo run --example gridsearch_${variant} --release --features binary" "$(echo ${variant} | tr '[:lower:]' '[:upper:]')"
-    done
-
-    echo "Running binary benchmarks higher dimensionality"
-    for variant in binary rabitq; do
-        for n_dim in 256 512; do
-            cargo run --example gridsearch_${variant} --release --features binary -- --dim ${n_dim} --data lowrank
+        for n_dim in 256 512 1024; do
+            cargo run --example gridsearch_${variant} --release --features binary -- --dim ${n_dim} --data lowrank --n-samples 50000
+            cargo run --example gridsearch_${variant} --release --features binary -- --dim ${n_dim} --data quantisation --n-samples 50000
         done
     done
 }

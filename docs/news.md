@@ -4,9 +4,10 @@
 
 **Features**
 
-- Various documentation updates
+- Various documentation updates and benchmark updates.
 - Improved NNDescent with faster sorts.
-- Kd tree/forest implementation
+- Kd tree/forest implementation.
+- TurboQuant versions of the exhaustive and IVF index.
 
 ## 0.2.10
 
