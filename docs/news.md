@@ -7,7 +7,9 @@
 - Various documentation updates and benchmark updates.
 - Improved NNDescent with faster sorts.
 - Kd tree/forest implementation.
-- TurboQuant versions of the exhaustive and IVF index.
+- Better benchmarks for the quantisation methods with a data set that is more
+  challenging for the data sets.
+- Removed the ITQ binarisation approach and replaced for PcaHashing.
 
 ## 0.2.10
 

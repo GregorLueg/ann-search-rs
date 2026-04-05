@@ -38,12 +38,13 @@ anticipated. If you want to see what changed, please check this
 - **Multiple ANN algorithms**:
   - *Annoy (Approximate Nearest Neighbours Oh Yeah)*
   - *BallTree*
+  - *Exhaustive flat index*
   - *HNSW (Hierarchical Navigable Small World)*
+  - *IVF (Inverted File index)*
+  - *Kd forest (based on Kd trees)*
+  - *LSH (Locality Sensitive Hashing)*
   - *NNDescent (Nearest Neighbour Descent)*
   (heavily inspired by [PyNNDescent](https://github.com/lmcinnes/pynndescent)).
-  - *LSH (Locality Sensitive Hashing)*
-  - *IVF (Inverted File index)*
-  - *Exhaustive flat index*
   - *Vanama (the graph powering DiskANN)*
 
 - **Distance metrics**:
@@ -65,7 +66,7 @@ anticipated. If you want to see what changed, please check this
   - *IVF (Inverted File index) with GPU acceleration*
   - *CAGRA style index*
 
-- **Binarised indices** (optional feature):
+- **(Near) Binarised indices** (optional feature):
   - *Binary* (different types of binary quantisations for exhaustive and IVF
     indices.)
   - *RaBitQ* (RaBitQ quantisation for exhaustive and IVF indices.)
@@ -158,6 +159,22 @@ Simulates the manifold hypothesis where high-dimensional data actually lies on a
 lower-dimensional manifold. Adds minimal isotropic noise to model measurement
 error.
 
+**QuantisationStress**
+
+Combines power-law eigenvalue spectrum with norm-stratified clusters, randomly
+rotated out of axis alignment. Variance decays as 1/(i+1)^decay across principal
+components, so most information concentrates in a small subspace. Cluster pairs
+share directions but sit at very different radii (2, 8, 20), meaning points with
+near-identical angular signatures can have wildly different true distances. The
+random rotation ensures no coordinate axis is privileged. Specifically targets
+failure modes of aggressive quantisation: sign binarisation wastes bits on noise
+dimensions and cannot distinguish radially-separated clusters, axis-aligned
+product quantisation mixes informative and uninformative dimensions within
+sub-vectors, and low-bit methods generally lose angular resolution in the
+informative subspace. Use spectral_decay=1.5 for moderate concentration (~80% of
+variance in top 25% of principal components) or 2.0 for aggressive (~90% in top
+15%). Recommended with `dim=128` or `dim=256` and `n_clusters=50+`.
+
 ### Running the grid searches
 
 To identify good basic thresholds, there are a set of different gridsearch
@@ -173,7 +190,7 @@ cargo run --example gridsearch_annoy --release -- --n-samples 500000 --dim 32 --
 # Available parameters with their defaults:
 # --n-samples 150_000
 # --dim 32
-# --n-clusters 25
+# --n-clusters 30
 # --k 15
 # --seed 42
 # --distance cosine
@@ -295,8 +312,8 @@ the CPU to GPU and back copying of data.
 For the extreme compression needs, binary indices are also provided. There
 are two approaches for binarisation
 
-- Bitwise binarisation either leveraging a SimHash random projection approach
-  or ITQ via PCA.
+- Bitwise binarisation either leveraging a SimHash random projection, PCA
+  hashing or signed-based binarisation.
 - [RaBitQ](https://arxiv.org/abs/2405.12497) binarisation while storing
   additional data for approximate distance calculations.
 

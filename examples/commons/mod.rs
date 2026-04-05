@@ -16,7 +16,7 @@ use thousands::*;
 pub const DEFAULT_N_SAMPLES: usize = 150_000;
 pub const DEFAULT_N_QUERY: usize = DEFAULT_N_SAMPLES / 10;
 pub const DEFAULT_DIM: usize = 32;
-pub const DEFAULT_N_CLUSTERS: usize = 25;
+pub const DEFAULT_N_CLUSTERS: usize = 30;
 pub const DEFAULT_K: usize = 15;
 pub const DEFAULT_SEED: u64 = 42;
 pub const DEFAULT_DISTANCE: &str = "euclidean";

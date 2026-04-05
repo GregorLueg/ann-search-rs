@@ -211,7 +211,7 @@ where
         // 5. initialise binariser and encode all vectors
         let init = parse_binarisation_init(binarisation_init).unwrap_or_default();
         let binariser = match init {
-            BinarisationInit::Itq => Binariser::new_itq(data, dim, n_bits, seed),
+            BinarisationInit::PcaHashing => Binariser::new_pca_hashing(data, dim, n_bits, seed),
             BinarisationInit::RandomProjections => Binariser::new_simhash(dim, n_bits, seed),
             BinarisationInit::SignBased => Binariser::new_sign_based(dim),
         };
@@ -373,7 +373,7 @@ where
         // 5. initialise binariser and encode all vectors
         let init = parse_binarisation_init(binarisation_init).unwrap_or_default();
         let binariser = match init {
-            BinarisationInit::Itq => Binariser::new_itq(data, dim, n_bits, seed),
+            BinarisationInit::PcaHashing => Binariser::new_pca_hashing(data, dim, n_bits, seed),
             BinarisationInit::RandomProjections => Binariser::new_simhash(dim, n_bits, seed),
             BinarisationInit::SignBased => Binariser::new_sign_based(dim),
         };
@@ -581,7 +581,7 @@ where
             })
             .collect();
 
-        scored.sort_unstable_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+        scored.sort_unstable_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
         scored.truncate(k);
 
         let mut indices: Vec<usize> = Vec::with_capacity(k);

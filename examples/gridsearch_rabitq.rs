@@ -183,7 +183,7 @@ fn main() {
         (cli.n_samples as f32 * 2.0).sqrt() as usize,
     ];
 
-    let rerank_factors = [5, 10, 20];
+    let rerank_factors = [10, 20];
 
     for nlist in nlist_values {
         let temp_dir = TempDir::new().unwrap();
@@ -228,7 +228,7 @@ fn main() {
                 nlist, nprobe
             );
             let start = Instant::now();
-            let (approx_neighbors, approx_distances) = query_ivf_index_rabitq(
+            let (approx_neighbors, _) = query_ivf_index_rabitq(
                 query_data.as_ref(),
                 &ivf_rabitq_idx,
                 cli.k,
@@ -241,11 +241,6 @@ fn main() {
             let query_time = start.elapsed().as_secs_f64() * 1000.0;
 
             let recall = calculate_recall(&true_neighbors, &approx_neighbors, cli.k);
-            let dist_error = calculate_dist_error(
-                true_distances.as_ref().unwrap(),
-                approx_distances.as_ref().unwrap(),
-                cli.k,
-            );
 
             results.push(BenchmarkResultSize {
                 method: format!("IVF-RaBitQ-nl{}-np{}-rf0 (query)", nlist, nprobe),
@@ -253,7 +248,7 @@ fn main() {
                 query_time_ms: query_time,
                 total_time_ms: build_time + query_time,
                 recall_at_k: recall,
-                mean_dist_err: dist_error,
+                mean_dist_err: f64::NAN,
                 index_size_mb,
             });
         }

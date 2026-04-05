@@ -72,23 +72,23 @@ fn main() {
     let n_bits_values = if cli.dim <= 64 {
         vec![
             (256, "random"),
-            (256, "itq"),
+            (256, "pca"),
             (512, "random"),
-            (512, "itq"),
+            (512, "pca"),
             (cli.dim, "signed"),
         ]
     } else {
         vec![
             (256, "random"),
-            (256, "itq"),
+            (256, "pca"),
             (512, "random"),
-            (512, "itq"),
+            (512, "pca"),
             (1024, "random"),
-            (1024, "itq"),
+            (1024, "pca"),
             (cli.dim, "signed"),
         ]
     };
-    let rerank_factors = [5, 10, 20];
+    let rerank_factors = [10, 20];
 
     for (n_bits, init) in &n_bits_values {
         let temp_dir = TempDir::new().unwrap();
