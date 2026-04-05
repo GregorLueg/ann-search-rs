@@ -13,8 +13,8 @@ fn main() {
 
     println!("-----------------------------");
     println!(
-        "Generating synthetic data: {} cells, {} dimensions, {} clusters, {} dist.",
-        cli.n_cells.separate_with_underscores(),
+        "Generating synthetic data: {} samples, {} dimensions, {} clusters, {} dist.",
+        cli.n_samples.separate_with_underscores(),
         cli.dim,
         cli.n_clusters,
         cli.distance
@@ -22,7 +22,7 @@ fn main() {
     println!("-----------------------------");
 
     let (data, _): (Mat<f32>, _) = generate_data(&cli);
-    let query_data = subsample_with_noise(&data, cli.n_cells / 10, cli.seed + 1);
+    let query_data = subsample_with_noise(&data, cli.n_samples / 10, cli.seed + 1);
     let mut results = Vec::new();
 
     let device: cubecl::wgpu::WgpuDevice = Default::default();
@@ -273,8 +273,8 @@ fn main() {
 
     print_results_size(
         &format!(
-            "{}k cells, {}D (Exhaustive vs CAGRA beam search)",
-            cli.n_cells / 1000,
+            "{}k samples, {}D (Exhaustive vs CAGRA beam search)",
+            cli.n_samples / 1000,
             cli.dim
         ),
         &results,

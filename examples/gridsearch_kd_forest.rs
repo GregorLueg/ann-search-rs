@@ -1,10 +1,8 @@
 mod commons;
-
 use ann_search_rs::*;
 use clap::Parser;
 use commons::*;
 use faer::Mat;
-use std::collections::HashSet;
 use std::time::Instant;
 use thousands::*;
 
@@ -29,9 +27,9 @@ fn main() {
     println!("Building exhaustive index...");
     let start = Instant::now();
     let exhaustive_idx = build_exhaustive_index(data.as_ref(), &cli.distance);
-    let build_time = start.elapsed().as_secs_f64() * 1000.0;
-
     let index_size_mb = exhaustive_idx.memory_usage_bytes() as f64 / (1024.0 * 1024.0);
+
+    let build_time = start.elapsed().as_secs_f64() * 1000.0;
 
     println!("Querying exhaustive index...");
     let start = Instant::now();
@@ -68,52 +66,36 @@ fn main() {
 
     println!("-----------------------------");
 
-    let nlist_values = [
-        (cli.n_samples as f32 * 0.5).sqrt() as usize,
-        (cli.n_samples as f32).sqrt() as usize,
-        (cli.n_samples as f32 * 2.0).sqrt() as usize,
-    ];
+    let n_trees_values = [5, 10, 15, 25, 50, 75, 100];
 
-    for nlist in nlist_values {
-        println!("Building IVF index (nlist={})...", nlist);
+    for n_trees in n_trees_values {
+        println!("Building KdTree index ({} trees)...", n_trees);
         let start = Instant::now();
-        let ivf_idx = build_ivf_index(
+        let kd_idx = build_kd_tree_index(
             data.as_ref(),
-            Some(nlist),
-            None,
-            &cli.distance,
+            cli.distance.clone(),
+            n_trees,
             cli.seed as usize,
-            false,
         );
         let build_time = start.elapsed().as_secs_f64() * 1000.0;
 
-        let index_size_mb = ivf_idx.memory_usage_bytes() as f64 / (1024.0 * 1024.0);
+        let index_size_mb = kd_idx.memory_usage_bytes() as f64 / (1024.0 * 1024.0);
 
-        let nprobe_values = [
-            (nlist as f32).sqrt() as usize,
-            (nlist as f32 * 2.0).sqrt() as usize,
-            (0.05 * nlist as f32) as usize,
+        let search_budgets = [
+            (None, "auto"),
+            (Some(cli.k * n_trees * 10), "10x"),
+            (Some(cli.k * n_trees * 5), "5x"),
         ];
-        let mut nprobe_values: Vec<_> = nprobe_values
-            .into_iter()
-            .collect::<HashSet<_>>()
-            .into_iter()
-            .collect();
-        nprobe_values.sort();
 
         // Query benchmarks
-        for nprobe in &nprobe_values {
-            if *nprobe > nlist || *nprobe == 0 {
-                continue;
-            }
-
-            println!("Querying IVF index (nlist={}, nprobe={})...", nlist, nprobe);
+        for (search_budget, budget_label) in search_budgets {
+            println!("Querying KdTree index (search_budget={})...", budget_label);
             let start = Instant::now();
-            let (approx_neighbors, approx_distances) = query_ivf_index(
+            let (approx_neighbors, approx_distances) = query_kd_tree_index(
                 query_data.as_ref(),
-                &ivf_idx,
+                &kd_idx,
                 cli.k,
-                Some(*nprobe),
+                search_budget,
                 true,
                 false,
             );
@@ -127,7 +109,7 @@ fn main() {
             );
 
             results.push(BenchmarkResultSize {
-                method: format!("IVF-nl{}-np{} (query)", nlist, nprobe),
+                method: format!("KdTree-nt{}-s:{} (query)", n_trees, budget_label),
                 build_time_ms: build_time,
                 query_time_ms: query_time,
                 total_time_ms: build_time + query_time,
@@ -138,11 +120,10 @@ fn main() {
         }
 
         // Self-query benchmark
-        let nprobe_self = (nlist as f32 * 2.0).sqrt() as usize;
-        println!("Self-querying IVF index (nprobe={})...", nprobe_self);
+        println!("Self-querying KdTree index...");
         let start = Instant::now();
         let (approx_neighbors_self, approx_distances_self) =
-            query_ivf_self(&ivf_idx, cli.k, Some(nprobe_self), true, false);
+            query_kd_tree_self(&kd_idx, cli.k, None, true, false);
         let self_query_time = start.elapsed().as_secs_f64() * 1000.0;
 
         let recall_self = calculate_recall(&true_neighbors_self, &approx_neighbors_self, cli.k);
@@ -153,7 +134,7 @@ fn main() {
         );
 
         results.push(BenchmarkResultSize {
-            method: format!("IVF-nl{} (self)", nlist),
+            method: format!("KdTree-nt{} (self)", n_trees),
             build_time_ms: build_time,
             query_time_ms: self_query_time,
             total_time_ms: build_time + self_query_time,

@@ -13,8 +13,8 @@ fn main() {
 
     println!("-----------------------------");
     println!(
-        "Generating synthetic data: {} cells, {} dimensions, {} clusters, {} dist.",
-        cli.n_cells.separate_with_underscores(),
+        "Generating synthetic data: {} samples, {} dimensions, {} clusters, {} dist.",
+        cli.n_samples.separate_with_underscores(),
         cli.dim,
         cli.n_clusters,
         cli.distance
@@ -130,9 +130,9 @@ fn main() {
 
     // IVF GPU with various nlist/nprobe combinations
     let nlist_values = [
-        (cli.n_cells as f32 * 0.5).sqrt() as usize,
-        (cli.n_cells as f32).sqrt() as usize,
-        (cli.n_cells as f32 * 2.0).sqrt() as usize,
+        (cli.n_samples as f32 * 0.5).sqrt() as usize,
+        (cli.n_samples as f32).sqrt() as usize,
+        (cli.n_samples as f32 * 2.0).sqrt() as usize,
     ];
 
     for nlist in nlist_values {
@@ -230,8 +230,8 @@ fn main() {
 
     print_results_size(
         &format!(
-            "{}k cells, {}D (CPU vs GPU Exhaustive vs IVF-GPU)",
-            cli.n_cells / 1000,
+            "{}k samples, {}D (CPU vs GPU Exhaustive vs IVF-GPU)",
+            cli.n_samples / 1000,
             cli.dim
         ),
         &results,

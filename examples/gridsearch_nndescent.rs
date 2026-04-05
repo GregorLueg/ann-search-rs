@@ -12,8 +12,8 @@ fn main() {
 
     println!("-----------------------------");
     println!(
-        "Generating synthetic data: {} cells, {} dimensions, {} clusters, {} dist.",
-        cli.n_cells.separate_with_underscores(),
+        "Generating synthetic data: {} samples, {} dimensions, {} clusters, {} dist.",
+        cli.n_samples.separate_with_underscores(),
         cli.dim,
         cli.n_clusters,
         cli.distance
@@ -167,7 +167,7 @@ fn main() {
     }
 
     print_results_size(
-        &format!("{}k cells, {}D", cli.n_cells / 1000, cli.dim),
+        &format!("{}k samples, {}D", cli.n_samples / 1000, cli.dim),
         &results,
     );
 }

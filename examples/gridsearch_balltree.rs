@@ -11,8 +11,8 @@ fn main() {
 
     println!("-----------------------------");
     println!(
-        "Generating synthetic data: {} cells, {} dimensions, {} clusters, {} dist.",
-        cli.n_cells.separate_with_underscores(),
+        "Generating synthetic data: {} samples, {} dimensions, {} clusters, {} dist.",
+        cli.n_samples.separate_with_underscores(),
         cli.dim,
         cli.n_clusters,
         cli.distance
@@ -67,12 +67,12 @@ fn main() {
     println!("-----------------------------");
 
     let search_budgets = [
-        ("1%", (0.01 * cli.n_cells as f32) as usize),
-        ("2%", (0.02 * cli.n_cells as f32) as usize),
-        ("5%", (0.05 * cli.n_cells as f32) as usize),
-        ("10%", (0.1 * cli.n_cells as f32) as usize),
-        ("15%", (0.15 * cli.n_cells as f32) as usize),
-        ("20%", (0.2 * cli.n_cells as f32) as usize),
+        ("1%", (0.01 * cli.n_samples as f32) as usize),
+        ("2%", (0.02 * cli.n_samples as f32) as usize),
+        ("5%", (0.05 * cli.n_samples as f32) as usize),
+        ("10%", (0.1 * cli.n_samples as f32) as usize),
+        ("15%", (0.15 * cli.n_samples as f32) as usize),
+        ("20%", (0.2 * cli.n_samples as f32) as usize),
     ];
 
     println!("Building BallTree index...");
@@ -140,7 +140,7 @@ fn main() {
     });
 
     print_results_size(
-        &format!("{}k cells, {}D", cli.n_cells / 1000, cli.dim),
+        &format!("{}k samples, {}D", cli.n_samples / 1000, cli.dim),
         &results,
     );
 }

@@ -13,8 +13,8 @@ use thousands::*;
 // Consts //
 ////////////
 
-pub const DEFAULT_N_CELLS: usize = 150_000;
-pub const DEFAULT_N_QUERY: usize = DEFAULT_N_CELLS / 10;
+pub const DEFAULT_N_SAMPLES: usize = 150_000;
+pub const DEFAULT_N_QUERY: usize = DEFAULT_N_SAMPLES / 10;
 pub const DEFAULT_DIM: usize = 32;
 pub const DEFAULT_N_CLUSTERS: usize = 25;
 pub const DEFAULT_K: usize = 15;
@@ -32,7 +32,7 @@ pub const DEFAULT_INTRINSIC_DIM: usize = 16;
 ///
 /// ### Fields
 ///
-/// * `n_cells` - Number of cells/samples
+/// * `n_samples` - Number of samples/samples
 /// * `dim` - Number of dimensions to use
 /// * `n_clusters` - Number of clusters in the data
 /// * `k` - Number of neighbours to search
@@ -41,8 +41,8 @@ pub const DEFAULT_INTRINSIC_DIM: usize = 16;
 /// * `data` - The data to use. One of `"gaussian"` or `"correlated"`.
 #[derive(Parser, Clone)]
 pub struct Cli {
-    #[arg(long, default_value_t = DEFAULT_N_CELLS)]
-    pub n_cells: usize,
+    #[arg(long, default_value_t = DEFAULT_N_SAMPLES)]
+    pub n_samples: usize,
 
     #[arg(long, default_value_t = DEFAULT_DIM)]
     pub dim: usize,
@@ -103,7 +103,7 @@ pub fn parse_data(s: &str) -> Option<SyntheticData> {
 ///
 /// ### Params
 ///
-/// * `n_samples` - Number of cells (samples)
+/// * `n_samples` - Number of samples (samples)
 /// * `dim` - Embedding dimensionality
 /// * `n_clusters` - Number of distinct clusters
 /// * `cluster_std` - Standard deviation within clusters
@@ -174,7 +174,7 @@ where
 ///
 /// ### Params
 ///
-/// * `n_samples` - Number of cells (samples)
+/// * `n_samples` - Number of samples (samples)
 /// * `dim` - Embedding dimensionality
 /// * `n_clusters` - Number of distinct clusters
 /// * `correlation_strength` - How strongly correlated dims depend on source
@@ -469,12 +469,12 @@ pub fn generate_data(cli: &Cli) -> (Mat<f32>, Vec<usize>) {
     let res: (Mat<f32>, Vec<usize>) = match data_type {
         SyntheticData::GaussianNoise => {
             println!(">>> Using simple Gaussian cluster data. <<<");
-            generate_clustered_data(cli.n_cells, cli.dim, cli.n_clusters, cli.seed)
+            generate_clustered_data(cli.n_samples, cli.dim, cli.n_clusters, cli.seed)
         }
         SyntheticData::Correlated => {
             println!(">>> Using data with subspace structure and correlated features. <<<");
             generate_clustered_data_high_dim(
-                cli.n_cells,
+                cli.n_samples,
                 cli.dim,
                 cli.n_clusters,
                 DEFAULT_COR_STRENGTH,
@@ -484,7 +484,7 @@ pub fn generate_data(cli: &Cli) -> (Mat<f32>, Vec<usize>) {
         SyntheticData::LowRank => {
             println!(">>> Using data that simulating manifold hypothesis. <<<");
             generate_low_rank_rotated_data(
-                cli.n_cells,
+                cli.n_samples,
                 cli.dim,
                 cli.intrinsic_dim,
                 cli.n_clusters,

@@ -1,5 +1,13 @@
 # News
 
+## 0.2.11
+
+**Features**
+
+- Various documentation updates
+- Improved NNDescent with faster sorts.
+- Kd tree/forest implementation
+
 ## 0.2.10
 
 **Features**

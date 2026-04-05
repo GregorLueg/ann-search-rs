@@ -5,6 +5,8 @@ use faer::{MatRef, RowRef};
 use fixedbitset::FixedBitSet;
 use rand::{rngs::SmallRng, Rng, SeedableRng};
 use rayon::prelude::*;
+use rdst::RadixKey;
+use rdst::RadixSort;
 use std::{
     cell::RefCell,
     cmp::Reverse,
@@ -58,6 +60,10 @@ pub type QueryCandF64 = RefCell<BinaryHeap<Reverse<(OrderedFloat<f64>, usize)>>>
 /////////////
 // Helpers //
 /////////////
+
+////////////////
+// Neighbours //
+////////////////
 
 /// Neighbour entry in the k-NN graph (build phase only)
 ///
@@ -122,6 +128,10 @@ impl<T: Copy> Neighbour<T> {
     }
 }
 
+///////////////
+// Graph ptr //
+///////////////
+
 /// Unsafe pointer wrapper for lock-free parallel writes to the flat graph.
 ///
 /// Safety is guaranteed by the update pattern: segments are grouped by
@@ -132,6 +142,42 @@ struct UnsafeGraphPtr<T>(*mut Neighbour<T>);
 
 unsafe impl<T> Send for UnsafeGraphPtr<T> {}
 unsafe impl<T> Sync for UnsafeGraphPtr<T> {}
+
+/////////////
+// Updates //
+/////////////
+
+/// Helper structure for updates with Radix sort
+#[derive(Clone, Copy)]
+pub struct Update<T> {
+    /// Target node id
+    target: usize,
+    /// Source node id
+    source: usize,
+    /// Distance between the two
+    dist: T,
+}
+
+impl<T> Update<T> {
+    /// Create a new update instance
+    pub fn new(target: usize, source: usize, dist: T) -> Self {
+        Self {
+            target,
+            source,
+            dist,
+        }
+    }
+}
+
+/// Implement the RadixKey for target
+impl<T> RadixKey for Update<T> {
+    const LEVELS: usize = 4;
+
+    #[inline]
+    fn get_level(&self, level: usize) -> u8 {
+        (self.target >> (level * 8)) as u8
+    }
+}
 
 /// Apply sorted neighbour updates to the flat graph.
 ///
@@ -157,12 +203,16 @@ pub trait ApplySortedUpdates<T> {
     /// * `updates_count` - Atomic counter for edge updates
     fn apply_sorted_updates(
         &self,
-        updates: &[(usize, usize, T)],
+        updates: &[Update<T>],
         graph: &mut [Neighbour<T>],
         k: usize,
         updates_count: &AtomicUsize,
     );
 }
+
+////////////////////
+// NNDescentQuery //
+////////////////////
 
 /// Query interface for the NN-Descent index.
 pub trait NNDescentQuery<T> {
@@ -210,6 +260,10 @@ pub trait NNDescentQuery<T> {
         results: &mut BinaryHeap<(OrderedFloat<T>, usize)>,
     ) -> (Vec<usize>, Vec<T>);
 }
+
+//////////
+// Main //
+//////////
 
 /// NN-Descent index for approximate nearest neighbour search.
 ///
@@ -416,7 +470,7 @@ where
 
         graph.par_chunks_mut(k).enumerate().for_each(|(i, slot)| {
             let query = &self.vectors_flat[i * self.dim..(i + 1) * self.dim];
-            let search_k = k * self.forest.n_trees * 2;
+            let search_k = k * self.forest.n_trees;
             let (indices, distances) = self.forest.query(query, k + 1, Some(search_k));
 
             for (j, (idx, dist)) in indices
@@ -470,7 +524,7 @@ where
 
         if verbose {
             println!(
-                "Using chunk size {} ({} chunks) for memory-efficient updates",
+                " Using chunk size {} ({} chunks) for memory-efficient updates",
                 chunk_size.separate_with_underscores(),
                 n_chunks
             );
@@ -522,7 +576,7 @@ where
                     chunk_end,
                 );
 
-                chunk_updates.par_sort_unstable_by_key(|&(target, _, _)| target);
+                chunk_updates.radix_sort_unstable();
 
                 self.apply_sorted_updates(&chunk_updates, &mut graph, k, &updates_count);
             }
@@ -591,7 +645,7 @@ where
             v.clear();
         }
 
-        // Phase 1: Parallel sampling -- each thread writes only to its own node
+        // Phase 1: Parallel sampling - each thread writes only to its own node
         let n = self.n;
         new_cands
             .par_iter_mut()
@@ -642,8 +696,7 @@ where
                 old_c.extend(old_temp.iter().map(|&(_, idx)| idx));
             });
 
-        // Phase 2: Symmetric candidates (sequential -- cross-node writes)
-        // No .contains() guard: duplicates are removed by sort+dedup in phase 3
+        // Phase 2: Symmetric candidates (sequential - cross-node writes)
         for i in 0..self.n {
             for &j in &new_cands[i] {
                 if j < self.n {
@@ -718,11 +771,11 @@ where
         k: usize,
         chunk_start: usize,
         chunk_end: usize,
-    ) -> Vec<(usize, usize, T)> {
+    ) -> Vec<Update<T>> {
         (chunk_start..chunk_end)
             .into_par_iter()
             .flat_map(|i| {
-                let mut updates = Vec::new();
+                let mut updates: Vec<Update<T>> = Vec::new();
 
                 // Threshold = worst (last non-sentinel) distance for a node
                 let get_threshold = |idx: usize| -> T {
@@ -753,8 +806,8 @@ where
                         let d = self.distance(p, q);
 
                         if d <= p_threshold || d <= get_threshold(q) {
-                            updates.push((p, q, d));
-                            updates.push((q, p, d));
+                            updates.push(Update::new(p, q, d));
+                            updates.push(Update::new(q, p, d));
                         }
                     }
                 }
@@ -775,8 +828,8 @@ where
                         let d = self.distance(p, q);
 
                         if d <= p_threshold || d <= get_threshold(q) {
-                            updates.push((p, q, d));
-                            updates.push((q, p, d));
+                            updates.push(Update::new(p, q, d));
+                            updates.push(Update::new(q, p, d));
                         }
                     }
                 }
@@ -993,7 +1046,7 @@ where
 /// Find boundaries between different target nodes in sorted updates.
 ///
 /// Returns indices where the target changes, including 0 and `updates.len()`.
-fn find_target_boundaries<T>(updates: &[(usize, usize, T)]) -> Vec<usize> {
+fn find_target_boundaries<T>(updates: &[Update<T>]) -> Vec<usize> {
     if updates.is_empty() {
         return vec![0, 0];
     }
@@ -1001,7 +1054,7 @@ fn find_target_boundaries<T>(updates: &[(usize, usize, T)]) -> Vec<usize> {
     let mut boundaries = vec![0];
 
     for i in 1..updates.len() {
-        if updates[i].0 != updates[i - 1].0 {
+        if updates[i].target != updates[i - 1].target {
             boundaries.push(i);
         }
     }
@@ -1027,7 +1080,7 @@ macro_rules! impl_apply_sorted_updates {
         impl ApplySortedUpdates<$float> for NNDescent<$float> {
             fn apply_sorted_updates(
                 &self,
-                updates: &[(usize, usize, $float)],
+                updates: &[Update<$float>],
                 graph: &mut [Neighbour<$float>],
                 k: usize,
                 updates_count: &AtomicUsize,
@@ -1038,13 +1091,13 @@ macro_rules! impl_apply_sorted_updates {
 
                 let boundaries = find_target_boundaries(updates);
 
-                let segments: Vec<(usize, &[(usize, usize, $float)])> = boundaries
+                let segments: Vec<(usize, &[Update<$float>])> = boundaries
                     .windows(2)
                     .filter_map(|w| {
                         let start = w[0];
                         let end = w[1];
                         if start < end {
-                            Some((updates[start].0, &updates[start..end]))
+                            Some((updates[start].target, &updates[start..end]))
                         } else {
                             None
                         }
@@ -1089,22 +1142,26 @@ macro_rules! impl_apply_sorted_updates {
                                 }
 
                                 // Merge incoming updates
-                                for &(_, source, dist) in segment {
-                                    if pid_set[source] {
+                                for update in segment {
+                                    if pid_set[update.source] {
                                         continue;
                                     }
 
                                     if heap.len() < k {
-                                        heap.push((OrderedFloat(dist), source, true));
-                                        pid_set[source] = true;
+                                        heap.push((OrderedFloat(update.dist), update.source, true));
+                                        pid_set[update.source] = true;
                                         edge_updates += 1;
                                     } else if let Some(&(OrderedFloat(worst), _, _)) = heap.peek() {
-                                        if dist < worst {
+                                        if update.dist < worst {
                                             if let Some((_, old_pid, _)) = heap.pop() {
                                                 pid_set[old_pid] = false;
                                             }
-                                            heap.push((OrderedFloat(dist), source, true));
-                                            pid_set[source] = true;
+                                            heap.push((
+                                                OrderedFloat(update.dist),
+                                                update.source,
+                                                true,
+                                            ));
+                                            pid_set[update.source] = true;
                                             edge_updates += 1;
                                         }
                                     }

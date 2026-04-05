@@ -28,7 +28,7 @@ generations are ubiqituos, thus, I want to expose the APIs to other packages.
 Feel free to use these implementations where you might need approximate nearest
 neighbour searches. This work is based on the great work from others who
 figured out how to design these algorithms and is just an implementation into
-Rust of some of these. Over time, I started getting interested into vector
+Rust of many of these. Over time, I started getting interested into vector
 searches and implement WAY more indices and new stuff into this than initially
 anticipated. If you want to see what changed, please check this
 [one out](https://github.com/GregorLueg/ann-search-rs/blob/main/docs/news.md)
@@ -167,10 +167,10 @@ scripts available. These can be run via
 cargo run --example gridsearch_annoy --release
 
 # Override specific parameters
-cargo run --example gridsearch_annoy --release -- --n-cells 500000 --dim 32 --distance euclidean
+cargo run --example gridsearch_annoy --release -- --n-samples 500000 --dim 32 --distance euclidean
 
 # Available parameters with their defaults:
-# --n-cells 150_000
+# --n-samples 150_000
 # --dim 32
 # --n-clusters 25
 # --k 15
@@ -179,49 +179,55 @@ cargo run --example gridsearch_annoy --release -- --n-cells 500000 --dim 32 --di
 # --data gaussian
 ```
 
-Every index is trained on 150k cells with 32 dimensions distance and 25 distinct
+Every index is trained on 150k samples with 32 dimensions distance and 25 distinct
 clusters (of different sizes each). Then the index is tested against a subset of
-10% of cells with a little Gaussian noise added and for full kNN self
+10% of samples with a little Gaussian noise added and for full kNN self
 generation. Below are the results shown for `Annoy` with the GaussianNoise
 data sets.
 
 ```
 ================================================================================================================================
-Benchmark: 150k cells, 32D
+Benchmark: 150k samples, 32D
 ================================================================================================================================
 Method                                               Build (ms)   Query (ms)   Total (ms)     Recall@k   Dist Error    Size (MB)
 --------------------------------------------------------------------------------------------------------------------------------
-Exhaustive (query)                                         3.03     1_649.50     1_652.53       1.0000     0.000000        18.31
-Exhaustive (self)                                          3.03    15_986.63    15_989.66       1.0000     0.000000        18.31
+Exhaustive (query)                                         3.58     1_725.77     1_729.35       1.0000     0.000000        18.31
+Exhaustive (self)                                          3.58    17_651.75    17_655.33       1.0000     0.000000        18.31
 --------------------------------------------------------------------------------------------------------------------------------
-Annoy-nt5-s:auto (query)                                  74.68        91.88       166.56       0.6834    40.648110        33.67
-Annoy-nt5-s:10x (query)                                   74.68        56.78       131.46       0.5240    40.565845        33.67
-Annoy-nt5-s:5x (query)                                    74.68        37.23       111.91       0.3732    40.431273        33.67
-Annoy-nt5 (self)                                          74.68       893.45       968.13       0.6838    40.084992        33.67
-Annoy-nt10-s:auto (query)                                101.73       171.40       273.13       0.8810    40.727710        49.03
-Annoy-nt10-s:10x (query)                                 101.73       106.78       208.51       0.7412    40.683223        49.03
-Annoy-nt10-s:5x (query)                                  101.73        66.31       168.04       0.5626    40.594216        49.03
-Annoy-nt10 (self)                                        101.73     1_693.22     1_794.95       0.8804    40.163717        49.03
-Annoy-nt15-s:auto (query)                                147.05       240.76       387.81       0.9524    40.748981        49.65
-Annoy-nt15-s:10x (query)                                 147.05       152.60       299.65       0.8546    40.723903        49.65
-Annoy-nt15-s:5x (query)                                  147.05        95.32       242.37       0.6907    40.662767        49.65
-Annoy-nt15 (self)                                        147.05     2_457.67     2_604.72       0.9516    40.184645        49.65
-Annoy-nt25-s:auto (query)                                235.88       359.11       594.99       0.9908    40.758739        80.37
-Annoy-nt25-s:10x (query)                                 235.88       227.98       463.86       0.9508    40.750722        80.37
-Annoy-nt25-s:5x (query)                                  235.88       145.74       381.62       0.8410    40.720771        80.37
-Annoy-nt25 (self)                                        235.88     3_557.84     3_793.72       0.9906    40.194411        80.37
-Annoy-nt50-s:auto (query)                                443.24       596.36     1_039.61       0.9997    40.760798       142.43
-Annoy-nt50-s:10x (query)                                 443.24       423.75       867.00       0.9957    40.760169       142.43
-Annoy-nt50-s:5x (query)                                  443.24       295.07       738.31       0.9644    40.754108       142.43
-Annoy-nt50 (self)                                        443.24     5_967.66     6_410.90       0.9997    40.196443       142.43
-Annoy-nt75-s:auto (query)                                659.26       875.79     1_535.05       1.0000    40.760868       177.49
-Annoy-nt75-s:10x (query)                                 659.26       627.17     1_286.43       0.9995    40.760801       177.49
-Annoy-nt75-s:5x (query)                                  659.26       432.90     1_092.15       0.9912    40.759442       177.49
-Annoy-nt75 (self)                                        659.26     8_815.59     9_474.84       1.0000    40.196503       177.49
-Annoy-nt100-s:auto (query)                               878.96     1_105.10     1_984.06       1.0000    40.760873       266.55
-Annoy-nt100-s:10x (query)                                878.96       797.44     1_676.40       0.9999    40.760864       266.55
-Annoy-nt100-s:5x (query)                                 878.96       564.09     1_443.04       0.9975    40.760539       266.55
-Annoy-nt100 (self)                                       878.96    11_044.74    11_923.70       1.0000    40.196506       266.55
+HNSW-M16-ef50-s50 (query)                                922.59        58.86       981.46       0.9991     0.000799        51.60
+HNSW-M16-ef50-s75 (query)                                922.59        81.45     1_004.05       0.9998     0.000221        51.60
+HNSW-M16-ef50-s100 (query)                               922.59       106.08     1_028.68       0.9999     0.000087        51.60
+HNSW-M16-ef50 (self)                                     922.59     1_085.24     2_007.84       0.9999     0.000083        51.60
+HNSW-M16-ef100-s50 (query)                             1_688.76        68.75     1_757.50       0.9997     0.000272        51.60
+HNSW-M16-ef100-s75 (query)                             1_688.76       101.03     1_789.79       0.9999     0.000063        51.60
+HNSW-M16-ef100-s100 (query)                            1_688.76       144.57     1_833.33       1.0000     0.000027        51.60
+HNSW-M16-ef100 (self)                                  1_688.76     1_205.42     2_894.17       1.0000     0.000009        51.60
+HNSW-M16-ef200-s50 (query)                             3_149.52        70.57     3_220.09       0.9997     0.000191        51.60
+HNSW-M16-ef200-s75 (query)                             3_149.52        98.13     3_247.65       1.0000     0.000014        51.60
+HNSW-M16-ef200-s100 (query)                            3_149.52       127.51     3_277.03       1.0000     0.000005        51.60
+HNSW-M16-ef200 (self)                                  3_149.52     1_236.76     4_386.28       1.0000     0.000004        51.60
+--------------------------------------------------------------------------------------------------------------------------------
+HNSW-M24-ef100-s50 (query)                             1_620.61        67.83     1_688.44       0.9998     0.000110        51.60
+HNSW-M24-ef100-s75 (query)                             1_620.61        93.32     1_713.93       1.0000     0.000008        51.60
+HNSW-M24-ef100-s100 (query)                            1_620.61       120.86     1_741.48       1.0000     0.000000        51.60
+HNSW-M24-ef100 (self)                                  1_620.61     1_226.84     2_847.46       1.0000     0.000004        51.60
+HNSW-M24-ef200-s50 (query)                             2_814.24        67.77     2_882.02       0.9999     0.000075        51.60
+HNSW-M24-ef200-s75 (query)                             2_814.24        99.43     2_913.67       1.0000     0.000005        51.60
+HNSW-M24-ef200-s100 (query)                            2_814.24       130.41     2_944.65       1.0000     0.000001        51.60
+HNSW-M24-ef200 (self)                                  2_814.24     1_319.07     4_133.32       1.0000     0.000006        51.60
+HNSW-M24-ef300-s50 (query)                             4_291.04        87.58     4_378.62       0.9999     0.000073        51.60
+HNSW-M24-ef300-s75 (query)                             4_291.04       101.72     4_392.76       1.0000     0.000005        51.60
+HNSW-M24-ef300-s100 (query)                            4_291.04       126.36     4_417.40       1.0000     0.000001        51.60
+HNSW-M24-ef300 (self)                                  4_291.04     1_236.42     5_527.46       1.0000     0.000001        51.60
+--------------------------------------------------------------------------------------------------------------------------------
+HNSW-M32-ef200-s50 (query)                             2_779.77        81.97     2_861.74       0.9995     9.232197        83.60
+HNSW-M32-ef200-s75 (query)                             2_779.77       100.55     2_880.32       1.0000     0.000018        83.60
+HNSW-M32-ef200-s100 (query)                            2_779.77       135.59     2_915.36       1.0000     0.000013        83.60
+HNSW-M32-ef200 (self)                                  2_779.77     1_258.12     4_037.89       1.0000     0.000002        83.60
+HNSW-M32-ef300-s50 (query)                             3_827.90        73.96     3_901.86       1.0000     0.000034        83.60
+HNSW-M32-ef300-s75 (query)                             3_827.90        99.55     3_927.44       1.0000     0.000005        83.60
+HNSW-M32-ef300-s100 (query)                            3_827.90       125.16     3_953.06       1.0000     0.000000        83.60
+HNSW-M32-ef300 (self)                                  3_827.90     1_272.95     5_100.85       1.0000     0.000003        83.60
 --------------------------------------------------------------------------------------------------------------------------------
 ```
 

@@ -15,6 +15,7 @@ pub mod ball_tree;
 pub mod exhaustive;
 pub mod hnsw;
 pub mod ivf;
+pub mod kd_forest;
 pub mod lsh;
 pub mod nndescent;
 pub mod vamana;
