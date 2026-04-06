@@ -20,17 +20,12 @@ cargo run --example gridsearch_<INDEX> --release -- --distance cosine
 # --data gaussian
 ```
 
-If you wish to run all of them, you can just run:
-
-```bash
-bash ./examples/run_benchmarks.sh --standard
-```
-
 To note, the data sets are just there for testing and get an idea on the
 behaviour with different types of structure in the data. You should not
 extrapolate from the results here what the ideal parameters are for your
 specific problem. Also, this is a single run. There is some variation in terms
-of exact times, but the overall trends should reproduce on your system.
+of exact times, but the overall trends should reproduce on your system with
+your specific specifications.
 
 ## Table of Contents
 
@@ -153,7 +148,7 @@ Self is queried with the default search budget.
 <summary><b>BallTree - Euclidean (LowRank)</b>:</summary>
 </br>
 <pre><code>
-<!-- BENCH:balltree:lowrank:correlated:32 -->
+<!-- BENCH:balltree:euclidean:lowrank:32 -->
 </code></pre>
 </details>
 
@@ -163,7 +158,7 @@ Self is queried with the default search budget.
 <summary><b>BallTree - Euclidean (LowRank; more dimensions)</b>:</summary>
 </br>
 <pre><code>
-<!-- BENCH:balltree:lowrank:correlated:128 -->
+<!-- BENCH:balltree:euclidean:lowrank:128 -->
 </code></pre>
 </details>
 
@@ -216,7 +211,7 @@ Self is queried with `s=100`.
 <summary><b>HNSW - Euclidean (LowRank)</b>:</summary>
 </br>
 <pre><code>
-<!-- BENCH:hnsw:lowrank:correlated:32 -->
+<!-- BENCH:hnsw:euclidean:lowrank:32 -->
 </code></pre>
 </details>
 
@@ -226,7 +221,7 @@ Self is queried with `s=100`.
 <summary><b>HNSW - Euclidean (LowRank; more dimensions)</b>:</summary>
 </br>
 <pre><code>
-<!-- BENCH:hnsw:lowrank:correlated:128 -->
+<!-- BENCH:hnsw:euclidean:lowrank:128 -->
 </code></pre>
 </details>
 
@@ -278,7 +273,7 @@ Self query was done with `2 * sqrt(nlist)`.
 <summary><b>IVF - Euclidean (LowRank)</b>:</summary>
 </br>
 <pre><code>
-<!-- BENCH:ivf:lowrank:correlated:32 -->
+<!-- BENCH:ivf:euclidean:lowrank:32 -->
 </code></pre>
 </details>
 
@@ -288,7 +283,7 @@ Self query was done with `2 * sqrt(nlist)`.
 <summary><b>IVF - Euclidean (LowRank; more dimensions)</b>:</summary>
 </br>
 <pre><code>
-<!-- BENCH:ivf:lowrank:correlated:128 -->
+<!-- BENCH:ivf:euclidean:lowrank:128 -->
 </code></pre>
 </details>
 
@@ -335,7 +330,7 @@ Self is queried with the default search budget.
 <summary><b>Kd forest - Euclidean (Correlated)</b>:</summary>
 </br>
 <pre><code>
-<!-- BENCH:kf_forest:euclidean:correlated:32 -->
+<!-- BENCH:kd_forest:euclidean:correlated:32 -->
 </code></pre>
 </details>
 
@@ -345,7 +340,7 @@ Self is queried with the default search budget.
 <summary><b>Kd forest - Euclidean (LowRank)</b>:</summary>
 </br>
 <pre><code>
-<!-- BENCH:kd_forest:lowrank:correlated:32 -->
+<!-- BENCH:kd_forest:euclidean:lowrank:32 -->
 </code></pre>
 </details>
 
@@ -354,7 +349,7 @@ Self is queried with the default search budget.
 <details>
 <summary><b>Kd forest - Euclidean (LowRank; more dimensions)</b>:</summary>
 <pre><code>
-<!-- BENCH:kd_forest:lowrank:correlated:128 -->
+<!-- BENCH:kd_forest:euclidean:lowrank:128 -->
 </code></pre>
 </details>
 
@@ -410,7 +405,7 @@ tables, the memory fingerprint does increase.
 <summary><b>LSH - Euclidean (LowRank)</b>:</summary>
 </br>
 <pre><code>
-<!-- BENCH:lsh:lowrank:correlated:32 -->
+<!-- BENCH:lsh:euclidean:lowrank:32 -->
 </code></pre>
 </details>
 
@@ -420,7 +415,7 @@ tables, the memory fingerprint does increase.
 <summary><b>LSH - Euclidean (LowRank; more dimensions)</b>:</summary>
 </br>
 <pre><code>
-<!-- BENCH:lsh:lowrank:correlated:128 -->
+<!-- BENCH:lsh:euclidean:lowrank:128 -->
 </code></pre>
 </details>
 
@@ -478,7 +473,7 @@ exhaustive search)!
 <summary><b>NNDescent - Euclidean (LowRank)</b>:</summary>
 </br>
 <pre><code>
-<!-- BENCH:nndescent:lowrank:correlated:32 -->
+<!-- BENCH:nndescent:euclidean:lowrank:32 -->
 </code></pre>
 </details>
 
@@ -486,7 +481,7 @@ exhaustive search)!
 <summary><b>NNDescent - Euclidean (LowRank; more dimensions)</b>:</summary>
 </br>
 <pre><code>
-<!-- BENCH:nndescent:lowrank:correlated:128 -->
+<!-- BENCH:nndescent:euclidean:lowrank:128 -->
 </code></pre>
 </details>
 
@@ -541,7 +536,7 @@ Self is queried with `ef_search=75` (default value).
 <summary><b>Vamana - Euclidean (LowRank)</b>:</summary>
 </br>
 <pre><code>
-    <!-- BENCH:vamana:lowrank:correlated:32 -->
+    <!-- BENCH:vamana:euclidean:lowrank:32 -->
 </code></pre>
 </details>
 
@@ -550,7 +545,7 @@ Self is queried with `ef_search=75` (default value).
 <details>
 <summary><b>Vamana - Euclidean (LowRank; more dimensions)</b>:</summary>
 <pre><code>
-<!-- BENCH:vamana:lowrank:correlated:128 -->
+<!-- BENCH:vamana:euclidean:lowrank:128 -->
 </code></pre>
 </details>
 

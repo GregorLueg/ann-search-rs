@@ -1,0 +1,446 @@
+## GPU-accelerated indices benchmarks and parameter gridsearch
+
+Below are benchmarks shown for the GPU-accelerated code. If you wish to run
+the version with GPU-accelerated exhaustive and IVF script, please use:
+
+```bash
+cargo run --example gridsearch_gpu --features gpu --release
+```
+
+For the CAGRA style search, use:
+
+```bash
+cargo run --example gridsearch_cagra --features gpu --release
+```
+
+Similar to the other benchmarks, index building, query against 10% slightly
+different data based on the trainings data and full kNN generation is being
+benchmarked. Index size in memory is also provided (however, GPU memory is not
+reported). To note also, every benchmark here is run on the wgpu backend.
+Other backends like cuda might provide even more speed benefits.
+
+## Table of Contents
+
+- [GPU exhaustive and IVF](#gpu-accelerated-exhaustive-and-ivf-vs-cpu-exhaustive)
+- [Comparison on larger data sets against the CPU](#comparison-against-ivf-cpu)
+- [CAGRA style index](#cagra-type-querying)
+- [CAGRA index on larger data](#larger-data-sets)
+- [CAGRA for kNN generation](#two-tier-knn-generation)
+
+### GPU-accelerated exhaustive and IVF vs CPU exhaustive
+
+The GPU acceleration is particularly notable for the exhaustive index. The
+IVF-GPU reaches very fast speeds here, but not much faster actually than the
+IVF-CPU version (or exhaustive GPU index). The advantages for the IVF-GPU index
+become more apparent in larger data sets (more to that below). Also to note is
+that the data is kept on the GPU for easier access and less frequent transfer
+between CPU and GPU, hence, the apparent reduced memory footprint. The data
+lives on the GPU for this version. (Be aware of your VRAM limits!).
+
+<details>
+<summary><b>GPU - Euclidean (Gaussian)</b>:</summary>
+<pre><code>
+<!-- BENCH:gpu:euclidean:gaussian:32 -->
+</code></pre>
+</details>
+
+---
+
+<details>
+<summary><b>GPU - Cosine (Gaussian)</b>:</summary>
+<pre><code>
+<!-- BENCH:gpu:cosine:gaussian:32 -->
+</code></pre>
+</details>
+
+---
+
+<details>
+<summary><b>GPU - Euclidean (Correlated)</b>:</summary>
+<pre><code>
+<!-- BENCH:gpu:euclidean:correlated:32 -->
+</code></pre>
+</details>
+
+---
+
+<details>
+<summary><b>GPU - Euclidean (LowRank)</b>:</summary>
+<pre><code>
+<!-- BENCH:gpu:euclidean:lowrank:32 -->
+</code></pre>
+</details>
+
+---
+
+<details>
+<summary><b>GPU - Euclidean (LowRank; 128 dimensions)</b>:</summary>
+<pre><code>
+<!-- BENCH:gpu:euclidean:lowrank:128 -->
+</code></pre>
+</details>
+
+### Comparison against IVF CPU
+
+In this case, the IVF CPU implementation is being compared against the GPU
+version. GPU acceleration shines with larger data sets and larger dimensions,
+hence, the number of samples was increased to 250_000 and dimensions to 64 or
+128 for these benchmarks.
+
+#### With 250k samples and 64 dimensions
+
+<details>
+<summary><b>CPU-IVF (250k samples; 64 dimensions)</b>:</summary>
+<pre><code>
+<!-- BENCH:ivf:euclidean:lowrank:64:250000 -->
+</code></pre>
+</details>
+
+---
+
+<details>
+<summary><b>GPU-IVF (250k samples; 64 dimensions)</b>:</summary>
+<pre><code>
+<!-- BENCH:gpu:euclidean:lowrank:64:250000 -->
+</code></pre>
+</details>
+
+---
+
+The results here are more favourable of the GPU acceleration. We go from ~90
+seconds with exhaustive search on CPU to ~20 seconds on GPU for full kNN
+generation; with the IVF variants, we can go from 10 seconds for the CPU based
+version to ~7 seconds on the GPU one, a smaller effect than on for the
+exhaustive search.
+
+---
+
+<details>
+<summary><b>CPU-IVF (250k samples; 128 dimensions)</b>:</summary>
+<pre><code>
+<!-- BENCH:ivf:euclidean:lowrank:128:250000 -->
+</code></pre>
+</details>
+
+---
+
+<details>
+<summary><b>GPU-IVF (250k samples; 128 dimensions)</b>:</summary>
+<pre><code>
+<!-- BENCH:gpu:euclidean:lowrank:128:250000 -->
+</code></pre>
+</details>
+
+The exhaustive kNN search on the CPU takes ~200 seconds (3+ minutes). Leveraging
+the GPU, we cut this down to 30 seconds, a 4x speedup. The IVF CPU as a highly
+optimised version takes 15 seconds, we can cut this down to 10 seconds. In
+this case, the acceleration is more modest (similar as before) – the exhaustiv
+search benefits from the large volume of data.
+
+#### Increasing the number of samples
+
+Results are becoming more pronounced with more samples and showing the
+advantage of the GPU acceleration.
+
+<details>
+<summary><b>CPU-IVF (500k samples, 64 dimensions)</b>:</summary>
+<pre><code>
+<!-- BENCH:ivf:euclidean:lowrank:64:500000 -->
+</code></pre>
+</details>
+
+---
+
+<details>
+<summary><b>GPU-IVF (500k samples, 64 dimensions)</b>:</summary>
+<pre><code>
+<!-- BENCH:gpu:euclidean:lowrank:64:500000 -->
+</code></pre>
+</details>
+
+---
+
+<details>
+<summary><b>CPU-IVF (500k samples, 128 dimensions)</b>:</summary>
+<pre><code>
+<!-- BENCH:ivf:euclidean:lowrank:128:500000 -->
+</code></pre>
+</details>
+
+---
+
+<details>
+<summary><b>GPU-IVF (500k samples, 128 dimensions)</b>:</summary>
+<pre><code>
+<!-- BENCH:gpu:euclidean:lowrank:128:500000 -->
+</code></pre>
+</details>
+
+---
+
+The overall trends hold true. The exhaustive search becomes much faster on the
+GPU, the IVF-based version gets a decent 2x bonus here. In this case, the
+dimensionality starts being large enough that the GPU has enough data to
+churn through and the difference with CPU versions becomes more apparent.
+
+### CAGRA-type querying
+
+The crate also offers a [CAGRA-style index](https://arxiv.org/abs/2308.15136),
+combining GPU-accelerated NNDescent graph construction with CAGRA navigational
+graph optimisation and beam search. The index is built in four phases:
+
+1. **Random graph initialisation**: each node gets `build_k` random neighbours
+   with computed distances, providing a baseline graph even before the forest
+   runs.
+2. **GPU forest initialisation**: a shallow random partition forest (default 20
+   trees) groups nearby points into leaves. All-pairs distances within each
+   leaf are computed on the GPU and merged into the graph via a proposal
+   buffer. Leaf sizes are dynamically capped to fit within the GPU's shared
+   memory budget (32 KB), so this scales correctly to high dimensions.
+3. **GPU NNDescent iterations**: the standard local join loop runs entirely on
+   the GPU. Each iteration builds reverse edges, evaluates (new, new) and
+   (new, old) candidate pairs in shared memory, and merges proposals into the
+   sorted graph. Convergence is checked by downloading a single `u32` counter
+   per iteration. Typically converges in 4-6 iterations.
+4. **CAGRA graph optimisation**: the NNDescent graph (at degree `build_k`) is
+   pruned to degree `k` using rank-based detour counting, reverse edge
+   construction, and forward/reverse merge. This produces a directed
+   navigational graph with improved long-range reachability for beam search.
+
+Querying uses a GPU beam search kernel: one workgroup per query, with the query
+vector in shared memory, a sorted candidate queue, and a linear-probing hash
+table for visited-node deduplication. Beam width and iteration limits are
+scaled automatically based on `k` and the graph degree via
+`CagraGpuSearchParams::from_graph()`. For small individual queries, a CPU
+path is used that doesn't have the overhead of the GPU kernel launches.
+Generally speaking, this index does not perform too well on very well separated
+data. However, it does perform well on low-rank data.
+
+#### Parameter guidance
+
+The two key build parameters are `build_k` (internal NNDescent degree before
+CAGRA pruning) and `refine_knn` (number of 2-hop refinement sweeps after
+NNDescent convergence).
+
+**Key parameters:**
+
+* `build_k`: Internal NNDescent degree before CAGRA pruning. Defaults to 2 * k.
+  Higher values give CAGRA more edges to select from when building the
+  navigational graph, at the cost of build time. 3 * k shows diminishing returns.
+* `refine_knn`: Number of 2-hop refinement sweeps after NNDescent convergence.
+  Each sweep evaluates all neighbours-of-neighbours and merges improvements.
+  Defaults to 0. Marginal benefit for beam search recall; primarily improves
+  extract graph quality up to the forest ceiling.
+* `n_trees`: Number of random partition trees for forest initialisation.
+  Defaults to 5 + n^0.25, capped at 20. More trees raise the raw graph quality
+  ceiling but increase build time linearly.
+* `beam_width`: Number of active candidates maintained during beam search.
+  Defaults to 2 * max(k_out, k_graph). Wider beams improve recall at the cost
+  of query latency. Auto-scaled when using CagraGpuSearchParams::from_graph().
+* `max_beam_iters`: Safety cap on beam search iterations. Defaults to
+  3 * beam_width. Most queries terminate naturally well before this limit; it
+  only fires for pathological cases where the search keeps discovering better
+  candidates.
+* `n_entry_points`: Number of seed nodes per query for beam search. Defaults
+  to 8. Entry points are sourced from a small Annoy forest (external queries)
+  or from the kNN graph's closest neighbours (self-query).
+
+Generally speaking CAGRA allows for very fast querying; however, the generation
+of the index takes a bit more time compared to IVF for example. Also, it "fails"
+in very well clustered data. It works better in data sets
+
+<details>
+<summary><b>GPU NNDescent with CAGRA style pruning - Euclidean (Gaussian)</b>:</summary>
+<pre><code>
+<!-- BENCH:cagra:euclidean:gaussian:32 -->
+</code></pre>
+</details>
+
+---
+
+<details>
+<summary><b>GPU NNDescent with CAGRA style pruning - Cosine (Gaussian)</b>:</summary>
+<pre><code>
+<!-- BENCH:cagra:cosine:gaussian:32 -->
+</code></pre>
+</details>
+
+---
+
+<details>
+<summary><b>GPU NNDescent with CAGRA style pruning - Euclidean (Correlated)</b>:</summary>
+<pre><code>
+<!-- BENCH:cagra:euclidean:correlated:32 -->
+</code></pre>
+</details>
+
+---
+
+<details>
+<summary><b>GPU NNDescent with CAGRA style pruning - Euclidean (LowRank)</b>:</summary>
+<pre><code>
+<!-- BENCH:cagra:euclidean:lowrank:32 -->
+</code></pre>
+</details>
+
+---
+
+<details>
+<summary><b>GPU NNDescent with CAGRA style pruning - Euclidean (LowRank; 128 dimensions)</b>:</summary>
+<pre><code>
+<!-- BENCH:cagra:euclidean:lowrank:128 -->
+</code></pre>
+</details>
+
+#### Larger data sets
+
+Let's test CAGRA similar to IVF GPU on larger data sets.
+
+<details>
+<summary><b>GPU NNDescent with CAGRA style pruning (250k samples; 64 dimensions)</b>:</summary>
+<pre><code>
+<!-- BENCH:cagra:euclidean:lowrank:64:250000 -->
+</code></pre>
+</details>
+
+---
+
+<details>
+<summary><b>GPU NNDescent with CAGRA style pruning (250k samples; 128 dimensions)</b>:</summary>
+<pre><code>
+<!-- BENCH:cagra:euclidean:lowrank:128:250000 -->
+</code></pre>
+</details>
+
+---
+
+<details>
+<summary><b>GPU NNDescent with CAGRA style pruning (500k samples; 64 dimensions)</b>:</summary>
+<pre><code>
+<!-- BENCH:cagra:euclidean:lowrank:64:500000 -->
+</code></pre>
+</details>
+
+---
+
+<details>
+<summary><b>GPU NNDescent with CAGRA style pruning (500k samples; 128 dimensions)</b>:</summary>
+<pre><code>
+<!-- BENCH:cagra:euclidean:lowrank:128:500000 -->
+</code></pre>
+</details>
+
+#### Two-tier kNN generation
+
+For downstream tasks that require a full kNN graph (e.g. BBKNN, MNN, UMAP,
+Leiden clustering), the index offers three paths with different speed/accuracy
+trade-offs:
+
+| Method | Mechanism | Typical recall | Use case |
+|--------|-----------|---------------|----------|
+| **Extract** | Direct reshape of the NNDescent graph. No search performed. | ~0.9 | Fast, however, lowever precision. |
+| **Self-beam** | GPU beam search over the CAGRA navigational graph for every vector in the index. | 0.99 | Production kNN graphs for all types of applications. |
+
+Below are examples of kNN generation. The dimensions are specifically kept
+quite low to mimic single cell situations. This is where the CAGRA-style part
+is quite performant and can be used to quickly generate kNN graphs from the
+data... To run these, you can use:
+
+```bash
+cargo run --example knn_comparison_cagra --features gpu --release
+```
+
+The application idea here is to use these for large single cell data sets in
+which the kNN can be further accelerated.
+
+<details>
+<summary><b>Generation of a kNN graph with CAGRA (250k samples; 32 dimensions)</b>:</summary>
+<pre><code>
+<!-- BENCH:cagra_knn:euclidean:lowrank:32:250000 -->
+</code></pre>
+</details>
+
+---
+
+<details>
+<summary><b>Generation of a kNN graph with CAGRA (250k samples; 64 dimensions)</b>:</summary>
+<pre><code>
+<!-- BENCH:cagra_knn:euclidean:lowrank:64:250000 -->
+</code></pre>
+</details>
+
+---
+
+<details>
+<summary><b>Generation of a kNN graph with CAGRA (500k samples; 32 dimensions)</b>:</summary>
+<pre><code>
+<!-- BENCH:cagra_knn:euclidean:lowrank:32:500000 -->
+</code></pre>
+</details>
+
+---
+
+<details>
+<summary><b>Generation of a kNN graph with CAGRA (500k samples; 64 dimensions)</b>:</summary>
+<pre><code>
+<!-- BENCH:cagra_knn:euclidean:lowrank:64:500000 -->
+</code></pre>
+</details>
+
+---
+
+<details>
+<summary><b>Generation of a kNN graph with CAGRA (1m samples; 32 dimensions)</b>:</summary>
+<pre><code>
+<!-- BENCH:cagra_knn:euclidean:lowrank:32:1000000 -->
+</code></pre>
+</details>
+
+---
+
+<details>
+<summary><b>Generation of a kNN graph with CAGRA (1m samples; 64 dimensions)</b>:</summary>
+<pre><code>
+<!-- BENCH:cagra_knn:euclidean:lowrank:64:1000000 -->
+</code></pre>
+</details>
+
+Let's do one large data set with 2.5m samples at 32 dimensions and see what
+happens ... ?
+
+<details>
+<summary><b>Generation of a kNN graph with CAGRA (2.5m samples; 32 dimensions)</b>:</summary>
+<pre><code>
+<!-- BENCH:cagra_knn:euclidean:lowrank:32:2500000 -->
+</code></pre>
+</details>
+
+Especially on larger data sets, we can accelerate the queries substantially
+and get up to 2x to 3x speed increases to generate the full kNN graph with
+Recall@k of ≥0.99. If you are okay with a graph that has Recall ≥0.9 you
+can do that in <10 seconds on a million samples or ~30 seconds on 2.5 million
+samples (with n_dim = 32 dim). Also, the data is very contrived here... On real
+data, NNDescent will have to do quite a few iterations. The Annoy
+initialisations are already very good, so the CPU version basically has no
+need for refining the kNN graph. On real data, the GPU outperforms more
+substantially.
+
+## Conclusions
+
+GPU acceleration in the setting of the `wgpu` backend only starts making sense
+with large indices and large dimensionality (assuming you can hold the data
+in VRAM or unified memory for Apple Silicon). With smaller dimensionalities and
+less samples, the overhead of launching the GPU kernels does not give
+substantial performance benefits over the highly optimised CPU code. Exhaustive
+searches over larger data sets however become more viable with GPU acceleration
+and it here where some of the biggest gains can be observed. To note, these
+implemetations are not designed (and cannot) compete with what is possible
+on data centre GPUs with cuBLAS under the hood! They serve as an acceleration
+in specific situations and were designed to enable fast kNN generation for
+1m to 10m sample situations with lower dimensions (think single cell).
+
+### Runtime info
+
+*All benchmarks were run on M1 Max MacBook Pro with 64 GB unified memory.*
+*The GPU backend was the `wgpu` backend.*
+*Last update: 2026/04/04 with version **0.2.11***
