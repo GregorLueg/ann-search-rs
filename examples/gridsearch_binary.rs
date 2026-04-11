@@ -45,7 +45,7 @@ fn main() {
         query_time_ms: query_time,
         total_time_ms: build_time + query_time,
         recall_at_k: 1.0,
-        mean_dist_err: 0.0,
+        rel_dist_err: 0.0,
         index_size_mb,
     });
 
@@ -61,7 +61,7 @@ fn main() {
         query_time_ms: self_query_time,
         total_time_ms: build_time + self_query_time,
         recall_at_k: 1.0,
-        mean_dist_err: 0.0,
+        rel_dist_err: 0.0,
         index_size_mb,
     });
 
@@ -136,7 +136,7 @@ fn main() {
             query_time_ms: query_time,
             total_time_ms: build_time + query_time,
             recall_at_k: recall,
-            mean_dist_err: f64::NAN,
+            rel_dist_err: f64::NAN,
             index_size_mb,
         });
 
@@ -159,7 +159,7 @@ fn main() {
             let query_time = start.elapsed().as_secs_f64() * 1000.0;
 
             let recall = calculate_recall(&true_neighbors, &binary_neighbors, cli.k);
-            let dist_error = calculate_dist_error(
+            let dist_error = calculate_relative_dist_error(
                 true_distances.as_ref().unwrap(),
                 binary_distances.as_ref().unwrap(),
                 cli.k,
@@ -174,7 +174,7 @@ fn main() {
                 query_time_ms: query_time,
                 total_time_ms: build_time + query_time,
                 recall_at_k: recall,
-                mean_dist_err: dist_error,
+                rel_dist_err: dist_error,
                 index_size_mb,
             });
         }
@@ -189,7 +189,7 @@ fn main() {
         let self_query_time = start.elapsed().as_secs_f64() * 1000.0;
 
         let recall_self = calculate_recall(&true_neighbors_self, &binary_neighbors_self, cli.k);
-        let dist_error_self = calculate_dist_error(
+        let dist_error_self = calculate_relative_dist_error(
             true_distances_self.as_ref().unwrap(),
             binary_distances_self.as_ref().unwrap(),
             cli.k,
@@ -201,7 +201,7 @@ fn main() {
             query_time_ms: self_query_time,
             total_time_ms: build_time + self_query_time,
             recall_at_k: recall_self,
-            mean_dist_err: dist_error_self,
+            rel_dist_err: dist_error_self,
             index_size_mb,
         });
     }
@@ -286,7 +286,7 @@ fn main() {
                     query_time_ms: query_time,
                     total_time_ms: build_time + query_time,
                     recall_at_k: recall,
-                    mean_dist_err: f64::NAN,
+                    rel_dist_err: f64::NAN,
                     index_size_mb,
                 });
             }
@@ -316,7 +316,7 @@ fn main() {
                     let query_time = start.elapsed().as_secs_f64() * 1000.0;
 
                     let recall = calculate_recall(&true_neighbors, &ivf_binary_neighbors, cli.k);
-                    let dist_error = calculate_dist_error(
+                    let dist_error = calculate_relative_dist_error(
                         true_distances.as_ref().unwrap(),
                         ivf_binary_distances.as_ref().unwrap(),
                         cli.k,
@@ -331,7 +331,7 @@ fn main() {
                         query_time_ms: query_time,
                         total_time_ms: build_time + query_time,
                         recall_at_k: recall,
-                        mean_dist_err: dist_error,
+                        rel_dist_err: dist_error,
                         index_size_mb,
                     });
                 }
@@ -355,7 +355,7 @@ fn main() {
 
             let recall_self =
                 calculate_recall(&true_neighbors_self, &ivf_binary_neighbors_self, cli.k);
-            let dist_error_self = calculate_dist_error(
+            let dist_error_self = calculate_relative_dist_error(
                 true_distances_self.as_ref().unwrap(),
                 ivf_binary_distances_self.as_ref().unwrap(),
                 cli.k,
@@ -367,7 +367,7 @@ fn main() {
                 query_time_ms: self_query_time,
                 total_time_ms: build_time + self_query_time,
                 recall_at_k: recall_self,
-                mean_dist_err: dist_error_self,
+                rel_dist_err: dist_error_self,
                 index_size_mb,
             });
         }

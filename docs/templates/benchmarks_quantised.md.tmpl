@@ -37,7 +37,7 @@ The BF16 quantisation reduces the floats to `bf16` which keeps the range of
 calculations in the index happen in `f32`; however, due to lossy compression
 to `bf16` there is some Recall loss. This is compensated with drastically
 reduced memory fingerprint (nearly halved for f32). The precision loss is
-higher for Cosine over Euclidean distance.
+higher for Cosine compared to Euclidean distance.
 
 **Key parameters:**
 
@@ -70,7 +70,7 @@ higher for Cosine over Euclidean distance.
 <summary><b>BF16 quantisations - Euclidean (Correlated)</b>:</summary>
 </br>
 <pre><code>
-<!-- BENCH:bf16:cosine:correlated:32 -->
+<!-- BENCH:bf16:euclidean:correlated:32 -->
 </code></pre>
 </details>
 
@@ -80,7 +80,7 @@ higher for Cosine over Euclidean distance.
 <summary><b>BF16 quantisations - Euclidean (LowRank)</b>:</summary>
 </br>
 <pre><code>
-<!-- BENCH:bf16:cosine:lowrank:32 -->
+<!-- BENCH:bf16:euclidean:lowrank:32 -->
 </code></pre>
 </details>
 
@@ -90,7 +90,7 @@ higher for Cosine over Euclidean distance.
 <summary><b>BF16 quantisations - Euclidean (LowRank; more dimensions)</b>:</summary>
 </br>
 <pre><code>
-<!-- BENCH:bf16:cosine:lowrank:128 -->
+<!-- BENCH:bf16:euclidean:lowrank:128 -->
 </code></pre>
 </details>
 
@@ -166,7 +166,24 @@ become better again.
 </code></pre>
 </details>
 
-### Product quantisation (Exhaustive and IVF)
+### Product quantisations
+
+Product quantisation methods (PQ, OPQ) compress vectors far more aggressively
+than BF16 or SQ8 by dividing each vector into subvectors and encoding each with
+a small codebook. Compared to the previous benchmarks, we use higher
+dimensionality (128, 256, 512) with reduced sample counts (50k - for faster
+bench marking) to reflect the regime where these methods are most relevant:
+large vectors under memory pressure. We benchmark against three synthetic data
+types of increasing difficulty:
+
+- `"correlated"` data with subspace-clustered activation patterns.
+- `"lowrank"` data embedded from a lower-dimensional manifold.
+- Lastly, `"quantisation"` stress data that combines power-law spectral decay
+  with norm-stratified clusters: specifically designed to expose failure modes
+  of aggressive quantisation such as sign binarisation, axis-aligned sub-vector
+  splits, and low-bit angular resolution loss.
+
+#### Product quantisation (Exhaustive and IVF)
 
 This index uses product quantisation. To note, the quantisation is quite harsh
 and hence, reduces the Recall quite substantially. In the case of 192
@@ -220,7 +237,7 @@ to quantise accurately. Mean-centering or rotations (OPQ) do not create this
 locality - they shift or rotate the data but do not reduce its intrinsic
 spread. The clustering step is not optional for high-recall PQ search.
 
-#### Correlated data
+##### Correlated data
 
 <details>
 <summary><b>Correlated data - 128 dimensions</b>:</summary>
@@ -250,7 +267,7 @@ spread. The clustering step is not optional for high-recall PQ search.
 </code></pre>
 </details>
 
-#### Lowrank data
+##### Lowrank data
 
 <details>
 <summary><b>Lowrank data - 128 dimensions</b>:</summary>
@@ -280,7 +297,7 @@ spread. The clustering step is not optional for high-recall PQ search.
 </code></pre>
 </details>
 
-#### Quantisation (stress) data
+##### Quantisation (stress) data
 
 <details>
 <summary><b>Quantisation stress data - 128 dimensions</b>:</summary>
@@ -314,7 +331,7 @@ Especially for the data with more internal structure, we can appreciate that
 the Recalls reach ≥0.7 while providing a massive reduction in memory
 fingerprint.
 
-### Optimised product quantisation (Exhaustive and IVF)
+#### Optimised product quantisation (Exhaustive and IVF)
 
 This index uses optimised product quantisation - this substantially increases
 the build time. Similar to IVF-PQ, the quantisation is quite harsh and hence,
@@ -342,7 +359,7 @@ with the same loss of Recall due to the severe compression. Again, similar to
 `IVF-SQ8` the distances are difficult to interpret/compare against original
 vectors due to the heavy quantisation (plus rotation), thus, are not reported.
 
-#### Why IVF massively outperforms Exhaustive OPQ
+##### Why IVF massively outperforms Exhaustive OPQ
 
 A key observation is the large outperformance of the IVF index over the
 exhaustive index. This is not incidental - it is fundamental to how PQ works,
@@ -371,7 +388,7 @@ to quantise accurately. OPQ's rotation improves subspace independence but does
 not create locality - it transforms the data without reducing its intrinsic
 spread. The clustering step is not optional for high-recall quantised search.
 
-#### Correlated data
+##### Correlated data
 
 <details>
 <summary><b>Correlated data - 128 dimensions</b>:</summary>
@@ -401,7 +418,7 @@ spread. The clustering step is not optional for high-recall quantised search.
 </code></pre>
 </details>
 
-#### Lowrank data
+##### Lowrank data
 
 <details>
 <summary><b>Lowrank data - 128 dimensions</b>:</summary>
@@ -431,7 +448,7 @@ spread. The clustering step is not optional for high-recall quantised search.
 </code></pre>
 </details>
 
-#### Quantisation (stress) data
+##### Quantisation (stress) data
 
 <details>
 <summary><b>Quantisation stress data - 128 dimensions</b>:</summary>

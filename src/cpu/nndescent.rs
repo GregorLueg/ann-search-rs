@@ -1,5 +1,6 @@
 //! NNDescent implementation in ann-search-rs. Uses concepts of the original
-//! implementation, PyNNDescent and EFANNA.
+//! implementation, PyNNDescent and EFANNA. Leverages Annoy over Kd forest for
+//! graph initialisation.
 
 use faer::{MatRef, RowRef};
 use fixedbitset::FixedBitSet;
@@ -774,69 +775,63 @@ where
     ) -> Vec<Update<T>> {
         (chunk_start..chunk_end)
             .into_par_iter()
-            .flat_map(|i| {
-                let mut updates: Vec<Update<T>> = Vec::new();
+            .fold(
+                || Vec::with_capacity(2048),
+                |mut updates, i| {
+                    let get_threshold = |idx: usize| -> T { graph[idx * k + k - 1].dist };
 
-                // Threshold = worst (last non-sentinel) distance for a node
-                let get_threshold = |idx: usize| -> T {
-                    let base = idx * k;
-                    // Slots are sorted by distance; the last non-sentinel
-                    // is the worst current neighbour. Sentinels have
-                    // T::max_value so simply reading the last slot works:
-                    // if all k slots are filled it is the true threshold,
-                    // otherwise it is max_value which accepts everything.
-                    graph[base + k - 1].dist
-                };
-
-                // new-new pairs
-                for j in 0..new_cands[i].len() {
-                    let p = new_cands[i][j];
-                    if p >= self.n {
-                        continue;
-                    }
-
-                    let p_threshold = get_threshold(p);
-
-                    for l in (j + 1)..new_cands[i].len() {
-                        let q = new_cands[i][l];
-                        if q >= self.n || p == q {
+                    // new-new pairs
+                    for j in 0..new_cands[i].len() {
+                        let p = new_cands[i][j];
+                        if p >= self.n {
                             continue;
                         }
+                        let p_threshold = get_threshold(p);
 
-                        let d = self.distance(p, q);
-
-                        if d <= p_threshold || d <= get_threshold(q) {
-                            updates.push(Update::new(p, q, d));
-                            updates.push(Update::new(q, p, d));
+                        for l in (j + 1)..new_cands[i].len() {
+                            let q = new_cands[i][l];
+                            if q >= self.n || p == q {
+                                continue;
+                            }
+                            let d = self.distance(p, q);
+                            if d <= p_threshold || d <= get_threshold(q) {
+                                updates.push(Update::new(p, q, d));
+                                updates.push(Update::new(q, p, d));
+                            }
                         }
                     }
-                }
 
-                // new-old pairs
-                for &p in &new_cands[i] {
-                    if p >= self.n {
-                        continue;
-                    }
-
-                    let p_threshold = get_threshold(p);
-
-                    for &q in &old_cands[i] {
-                        if q >= self.n || p == q {
+                    // new-old pairs
+                    for &p in &new_cands[i] {
+                        if p >= self.n {
                             continue;
                         }
+                        let p_threshold = get_threshold(p);
 
-                        let d = self.distance(p, q);
-
-                        if d <= p_threshold || d <= get_threshold(q) {
-                            updates.push(Update::new(p, q, d));
-                            updates.push(Update::new(q, p, d));
+                        for &q in &old_cands[i] {
+                            if q >= self.n || p == q {
+                                continue;
+                            }
+                            let d = self.distance(p, q);
+                            if d <= p_threshold || d <= get_threshold(q) {
+                                updates.push(Update::new(p, q, d));
+                                updates.push(Update::new(q, p, d));
+                            }
                         }
                     }
-                }
 
-                updates
+                    updates
+                },
+            )
+            .reduce(Vec::new, |mut a, mut b| {
+                if a.len() >= b.len() {
+                    a.extend_from_slice(&b);
+                    a
+                } else {
+                    b.extend_from_slice(&a);
+                    b
+                }
             })
-            .collect()
     }
 
     /// Calculate distance between two indexed points.

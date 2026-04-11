@@ -4,8 +4,8 @@
 
 # ann-search-rs
 
-Various approximate nearest neighbour/vector searches implemented in Rust.
-Helper library to be used in other libraries.
+Various approximate nearest neighbour/vector searches implemented in Rust
+(with focus on computational biology methods).
 
 ## Table of Contents
 
@@ -80,17 +80,6 @@ Add this to your `Cargo.toml`:
 [dependencies]
 ann-search-rs = "*" # always get the latest version
 ```
-
-To note, I have changed some of the interfaces between versions.
-
-## Roadmap
-
-- ~~First GPU support~~ (Implemented with version `0.2.1` of the crate).
-- ~~Binary indices~~ (Also implemented with version `0.2.1`).
-- ~~Proper SIMD~~ (Implemented with `0.2.2` via the [wide crate](https://docs.rs/wide/latest/wide/)).
-- Option to save indices on-disk and maybe do on-disk querying ... ? The binary
-  indices already use some aspects of on-disk storage.
-- More GPU support for other indices. TBD, needs to warrant the time investment.
 
 ## Example Usage
 
@@ -190,7 +179,7 @@ cargo run --example gridsearch_annoy --release -- --n-samples 500000 --dim 32 --
 # Available parameters with their defaults:
 # --n-samples 150_000
 # --dim 32
-# --n-clusters 30
+# --n-clusters 25
 # --k 15
 # --seed 42
 # --distance cosine
@@ -207,59 +196,60 @@ data sets.
 ================================================================================================================================
 Benchmark: 150k samples, 32D
 ================================================================================================================================
-Method                                               Build (ms)   Query (ms)   Total (ms)     Recall@k   Dist Error    Size (MB)
+Method                                               Build (ms)   Query (ms)   Total (ms)     Recall@k Rel dist err    Size (MB)
 --------------------------------------------------------------------------------------------------------------------------------
-Exhaustive (query)                                         3.58     1_725.77     1_729.35       1.0000     0.000000        18.31
-Exhaustive (self)                                          3.58    17_651.75    17_655.33       1.0000     0.000000        18.31
+Exhaustive (query)                                         3.28     1_602.87     1_606.15       1.0000       0.0000        18.31
+Exhaustive (self)                                          3.28    16_690.33    16_693.60       1.0000       0.0000        18.31
 --------------------------------------------------------------------------------------------------------------------------------
-HNSW-M16-ef50-s50 (query)                                922.59        58.86       981.46       0.9991     0.000799        51.60
-HNSW-M16-ef50-s75 (query)                                922.59        81.45     1_004.05       0.9998     0.000221        51.60
-HNSW-M16-ef50-s100 (query)                               922.59       106.08     1_028.68       0.9999     0.000087        51.60
-HNSW-M16-ef50 (self)                                     922.59     1_085.24     2_007.84       0.9999     0.000083        51.60
-HNSW-M16-ef100-s50 (query)                             1_688.76        68.75     1_757.50       0.9997     0.000272        51.60
-HNSW-M16-ef100-s75 (query)                             1_688.76       101.03     1_789.79       0.9999     0.000063        51.60
-HNSW-M16-ef100-s100 (query)                            1_688.76       144.57     1_833.33       1.0000     0.000027        51.60
-HNSW-M16-ef100 (self)                                  1_688.76     1_205.42     2_894.17       1.0000     0.000009        51.60
-HNSW-M16-ef200-s50 (query)                             3_149.52        70.57     3_220.09       0.9997     0.000191        51.60
-HNSW-M16-ef200-s75 (query)                             3_149.52        98.13     3_247.65       1.0000     0.000014        51.60
-HNSW-M16-ef200-s100 (query)                            3_149.52       127.51     3_277.03       1.0000     0.000005        51.60
-HNSW-M16-ef200 (self)                                  3_149.52     1_236.76     4_386.28       1.0000     0.000004        51.60
+Annoy-nt5-s:auto (query)                                  81.01        65.71       146.72       0.7006       0.0302        34.82
+Annoy-nt5-s:10x (query)                                   81.01        39.97       120.98       0.5252       0.0617        34.82
+Annoy-nt5-s:5x (query)                                    81.01        25.88       106.89       0.3732       0.1068        34.82
+Annoy-nt5 (self)                                          81.01       349.56       430.57       0.7005       0.0325        34.82
 --------------------------------------------------------------------------------------------------------------------------------
-HNSW-M24-ef100-s50 (query)                             1_620.61        67.83     1_688.44       0.9998     0.000110        51.60
-HNSW-M24-ef100-s75 (query)                             1_620.61        93.32     1_713.93       1.0000     0.000008        51.60
-HNSW-M24-ef100-s100 (query)                            1_620.61       120.86     1_741.48       1.0000     0.000000        51.60
-HNSW-M24-ef100 (self)                                  1_620.61     1_226.84     2_847.46       1.0000     0.000004        51.60
-HNSW-M24-ef200-s50 (query)                             2_814.24        67.77     2_882.02       0.9999     0.000075        51.60
-HNSW-M24-ef200-s75 (query)                             2_814.24        99.43     2_913.67       1.0000     0.000005        51.60
-HNSW-M24-ef200-s100 (query)                            2_814.24       130.41     2_944.65       1.0000     0.000001        51.60
-HNSW-M24-ef200 (self)                                  2_814.24     1_319.07     4_133.32       1.0000     0.000006        51.60
-HNSW-M24-ef300-s50 (query)                             4_291.04        87.58     4_378.62       0.9999     0.000073        51.60
-HNSW-M24-ef300-s75 (query)                             4_291.04       101.72     4_392.76       1.0000     0.000005        51.60
-HNSW-M24-ef300-s100 (query)                            4_291.04       126.36     4_417.40       1.0000     0.000001        51.60
-HNSW-M24-ef300 (self)                                  4_291.04     1_236.42     5_527.46       1.0000     0.000001        51.60
+Annoy-nt10-s:auto (query)                                102.08       123.94       226.02       0.8910       0.0082        50.18
+Annoy-nt10-s:10x (query)                                 102.08        77.19       179.27       0.7415       0.0243        50.18
+Annoy-nt10-s:5x (query)                                  102.08        48.77       150.85       0.5626       0.0533        50.18
+Annoy-nt10 (self)                                        102.08       719.81       821.89       0.8902       0.0089        50.18
 --------------------------------------------------------------------------------------------------------------------------------
-HNSW-M32-ef200-s50 (query)                             2_779.77        81.97     2_861.74       0.9995     9.232197        83.60
-HNSW-M32-ef200-s75 (query)                             2_779.77       100.55     2_880.32       1.0000     0.000018        83.60
-HNSW-M32-ef200-s100 (query)                            2_779.77       135.59     2_915.36       1.0000     0.000013        83.60
-HNSW-M32-ef200 (self)                                  2_779.77     1_258.12     4_037.89       1.0000     0.000002        83.60
-HNSW-M32-ef300-s50 (query)                             3_827.90        73.96     3_901.86       1.0000     0.000034        83.60
-HNSW-M32-ef300-s75 (query)                             3_827.90        99.55     3_927.44       1.0000     0.000005        83.60
-HNSW-M32-ef300-s100 (query)                            3_827.90       125.16     3_953.06       1.0000     0.000000        83.60
-HNSW-M32-ef300 (self)                                  3_827.90     1_272.95     5_100.85       1.0000     0.000003        83.60
+Annoy-nt15-s:auto (query)                                159.61       181.20       340.81       0.9582       0.0027        50.79
+Annoy-nt15-s:10x (query)                                 159.61       115.06       274.67       0.8546       0.0114        50.79
+Annoy-nt15-s:5x (query)                                  159.61        73.07       232.68       0.6907       0.0311        50.79
+Annoy-nt15 (self)                                        159.61     1_084.09     1_243.71       0.9571       0.0029        50.79
+--------------------------------------------------------------------------------------------------------------------------------
+Annoy-nt25-s:auto (query)                                248.71       275.95       524.66       0.9928       0.0004        81.51
+Annoy-nt25-s:10x (query)                                 248.71       182.43       431.15       0.9508       0.0031        81.51
+Annoy-nt25-s:5x (query)                                  248.71       119.58       368.29       0.8410       0.0126        81.51
+Annoy-nt25 (self)                                        248.71     1_868.17     2_116.89       0.9925       0.0004        81.51
+--------------------------------------------------------------------------------------------------------------------------------
+Annoy-nt50-s:auto (query)                                462.06       507.49       969.55       0.9998       0.0000       143.57
+Annoy-nt50-s:10x (query)                                 462.06       343.51       805.57       0.9957       0.0002       143.57
+Annoy-nt50-s:5x (query)                                  462.06       232.82       694.88       0.9644       0.0021       143.57
+Annoy-nt50 (self)                                        462.06     3_747.19     4_209.25       0.9998       0.0000       143.57
+--------------------------------------------------------------------------------------------------------------------------------
+Annoy-nt75-s:auto (query)                                674.52       788.23     1_462.75       1.0000       0.0000       178.63
+Annoy-nt75-s:10x (query)                                 674.52       541.05     1_215.57       0.9995       0.0000       178.63
+Annoy-nt75-s:5x (query)                                  674.52       434.04     1_108.56       0.9912       0.0004       178.63
+Annoy-nt75 (self)                                        674.52     6_092.44     6_766.96       1.0000       0.0000       178.63
+--------------------------------------------------------------------------------------------------------------------------------
+Annoy-nt100-s:auto (query)                               889.04     1_041.54     1_930.58       1.0000       0.0000       267.69
+Annoy-nt100-s:10x (query)                                889.04       728.21     1_617.26       0.9999       0.0000       267.69
+Annoy-nt100-s:5x (query)                                 889.04       538.96     1_428.00       0.9975       0.0001       267.69
+Annoy-nt100 (self)                                       889.04     7_866.57     8_755.61       1.0000       0.0000       267.69
 --------------------------------------------------------------------------------------------------------------------------------
 ```
 
-Detailed benchmarks on all the standard benchmarks can be found
+Detailed benchmarks on all the "standard" indices can be found
 [here](https://github.com/GregorLueg/ann-search-rs/blob/main/docs/benchmarks_general.md).
-Every index was tested on every data set.
+Every index was tested on every data set with 32 dimensions (mimicking typical
+single cell scenarios) and against the lowrank data set with 128 dimensions.
 
 ## Quantised indices
 
 The crate also provides some quantised approximate nearest neighbour searches,
-designed for very large data sets where memory and time both start becoming
-incredibly constraining. There are a total of four different quantisation
-methods available (plus some binary quantisation, see further below). The crate
-does NOT provide re-ranking on the full vectors (yet).
+designed for very large data sets where memory (and query time) starts becoming
+constraining. There are a total of four different quantisation methods available
+(plus some binary quantisation, see further below). The crate does NOT provide
+re-ranking on the full vectors (yet) for these quantised indices.
 
 - *BF16*: An exhaustive search and IVF index are available with BF16
   quantisation. In this case the `f32` or `f64` are transformed during storage
@@ -268,14 +258,17 @@ does NOT provide re-ranking on the full vectors (yet).
 - *SQ8*: A scalar quantisation to `i8`. Exhaustive and IVF indices are provided.
   For each dimensions in the data, the min and max values are being computed and
   the respective data points are projected to integers between `-128` to `127`.
-  This enables fast integer math; however, this comes at cost of precision.
+  This enables fast integer math; however, this comes at cost of recall of the
+  real nearest neighbours.
 - *PQ*: Uses product quantisation. Useful when the dimensions of the vectors
   are incredibly large and one needs to compress the index in memory even
   further. Only useful when dim ≥ 128 in most cases and ideal for very large
-  dimensions. Only IVF is available with product quantisation.
+  dimensions. Exhaustive and IVF are available with product quantisation.
+  Exhaustive PQ is not recommend due to worse performance across the board
+  compared to IVF-PQ – the index was added for completeness.
 - *OPQ*: Uses optimised product quantisation. Tries to de-correlate the
   residuals and can in times improve the Recall. Please see the benchmarks.
-  Only IVF is available with optimised product quantisation.
+  Same indices available as for PQ.
 
 The benchmarks can be found
 [here](https://github.com/GregorLueg/ann-search-rs/blob/main/docs/benchmarks_quantised.md).
@@ -288,14 +281,14 @@ ann-search-rs = { version = "*", features = ["quantised"] }
 
 ## GPU
 
-Two indices are also implemented in GPU-accelerated versions. The exhaustive
-search and the IVF index. Under the hood, this uses
-[cubecl](https://github.com/tracel-ai/cubecl) with wgpu backend (system agnostic,
-for details please check [here](https://burn.dev/books/cubecl/getting-started/installation.html)).
-Let's first look at the indices compared against exhaustive (CPU). You can
-of course provide other backends.
-
-The benchmarks can be found [here](https://github.com/GregorLueg/ann-search-rs/blob/main/docs/benchmarks_gpu.md).
+Three indices are also implemented in GPU-accelerated versions. A
+GPU-accelerated exhaustive and IVF index. And a new addition with release
+`0.2.6` a [CAGRA-style index](https://arxiv.org/abs/2308.15136). Under the hood,
+this use [cubecl](https://github.com/tracel-ai/cubecl) with wgpu backend (which
+makes them largely agnostic to the type of hardware), for details please check
+[here](https://burn.dev/books/cubecl/getting-started/installation.html)). The
+benchmarks can be found
+[here](https://github.com/GregorLueg/ann-search-rs/blob/main/docs/benchmarks_gpu.md).
 To unlock GPU-acceleration, please use:
 
 ```toml
@@ -303,14 +296,10 @@ To unlock GPU-acceleration, please use:
 ann-search-rs = { version = "*", features = ["gpu"] }
 ```
 
-There is for sure room for improvement in terms of the design of the indices,
-but they do the job as is. Longer term, I will add smarter design(s) to avoid
-the CPU to GPU and back copying of data.
-
 ## Binarised indices
 
-For the extreme compression needs, binary indices are also provided. There
-are two approaches for binarisation
+For the most extreme compression needs, binary indices are also provided. There
+are two approaches for binarisation available in the crate:
 
 - Bitwise binarisation either leveraging a SimHash random projection, PCA
   hashing or signed-based binarisation.

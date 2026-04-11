@@ -44,7 +44,7 @@ fn main() {
         query_time_ms: query_time,
         total_time_ms: build_time + query_time,
         recall_at_k: 1.0,
-        mean_dist_err: 0.0,
+        rel_dist_err: 0.0,
         index_size_mb,
     });
 
@@ -60,13 +60,15 @@ fn main() {
         query_time_ms: self_query_time,
         total_time_ms: build_time + self_query_time,
         recall_at_k: 1.0,
-        mean_dist_err: 0.0,
+        rel_dist_err: 0.0,
         index_size_mb,
     });
 
     println!("-----------------------------------------------------------------------------------------------");
 
-    let m_values: Vec<usize> = if cli.dim > 128 {
+    let m_values: Vec<usize> = if cli.dim >= 1024 {
+        vec![16, 32, 64, 128]
+    } else if cli.dim > 128 {
         vec![16, 32, 64]
     } else {
         vec![8, 16]
@@ -112,7 +114,7 @@ fn main() {
             query_time_ms: query_time,
             total_time_ms: build_time + query_time,
             recall_at_k: recall,
-            mean_dist_err: f64::NAN,
+            rel_dist_err: f64::NAN,
             index_size_mb,
         });
 
@@ -131,7 +133,7 @@ fn main() {
             query_time_ms: self_query_time,
             total_time_ms: build_time + self_query_time,
             recall_at_k: recall_self,
-            mean_dist_err: f64::NAN,
+            rel_dist_err: f64::NAN,
             index_size_mb,
         });
     }
@@ -209,7 +211,7 @@ fn main() {
                     query_time_ms: query_time,
                     total_time_ms: build_time + query_time,
                     recall_at_k: recall,
-                    mean_dist_err: f64::NAN,
+                    rel_dist_err: f64::NAN,
                     index_size_mb,
                 });
             }
@@ -231,7 +233,7 @@ fn main() {
                 query_time_ms: self_query_time,
                 total_time_ms: build_time + self_query_time,
                 recall_at_k: recall_self,
-                mean_dist_err: f64::NAN,
+                rel_dist_err: f64::NAN,
                 index_size_mb,
             });
         }

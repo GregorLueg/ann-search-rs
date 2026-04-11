@@ -13,13 +13,21 @@ use thousands::*;
 // Consts //
 ////////////
 
+/// Default number of samples
 pub const DEFAULT_N_SAMPLES: usize = 150_000;
+/// Default number for the querying
 pub const DEFAULT_N_QUERY: usize = DEFAULT_N_SAMPLES / 10;
+/// Default dimensionality -> typical for single cell
 pub const DEFAULT_DIM: usize = 32;
-pub const DEFAULT_N_CLUSTERS: usize = 30;
+/// Number of default clusters
+pub const DEFAULT_N_CLUSTERS: usize = 25;
+/// Default number of neighbours
 pub const DEFAULT_K: usize = 15;
+/// Default random seed
 pub const DEFAULT_SEED: u64 = 42;
+/// Default distance metric
 pub const DEFAULT_DISTANCE: &str = "euclidean";
+/// Correlation strength for
 pub const DEFAULT_COR_STRENGTH: f64 = 0.5;
 pub const DEFAULT_DATA: &str = "gaussian";
 pub const DEFAULT_INTRINSIC_DIM: usize = 16;
@@ -315,7 +323,7 @@ where
     (data, cluster_assignments)
 }
 
-/// Generate data specifically
+/// Generate manifold-based data
 ///
 /// Creates high-dimensional data that actually lives in a low-dimensional
 /// subspace with rotated cluster structure.
@@ -718,44 +726,40 @@ where
 ////////////////
 
 /// BenchmarkResult
-///
-/// ### Fields
-///
-/// * `method` - Name of the method
-/// * `build_time_ms` - The build time of the index in ms
-/// * `query_time_ms` - The query time of the index in ms
-/// * `total_time_ms` - Total time the index build & query takes in ms
-/// * `recall_at_k` - Recall@k neighbours against ground truth
-/// * `mean_dist_err` - Mean distance error against ground truth
-/// * `index_size_mb` - Size of the index
 pub struct BenchmarkResultSize {
+    /// Name of the method
     pub method: String,
+    /// The build time of the index in ms
     pub build_time_ms: f64,
+    /// The query time of the index in ms
     pub query_time_ms: f64,
+    ///  Total time the index build & query takes in ms
     pub total_time_ms: f64,
+    /// Recall@k neighbours against ground truth. Overlap in top k neighbours
+    /// for given k
     pub recall_at_k: f64,
-    pub mean_dist_err: f64,
+    /// Relative distance error against ground truth
+    pub rel_dist_err: f64,
+    /// Size of the index
     pub index_size_mb: f64,
 }
 
 /// BenchmarkResultPurity - includes cluster purity metric
-///
-/// ### Fields
-///
-/// * `method` - Name of the method
-/// * `build_time_ms` - The build time of the index in ms
-/// * `query_time_ms` - The query time of the index in ms
-/// * `total_time_ms` - Total time the index build & query takes in ms
-/// * `recall_at_k` - Recall@k neighbours against ground truth
-/// * `cluster_purity` - Fraction of neighbors from same cluster
-/// * `index_size_mb` - Index size in MB
 pub struct BenchmarkResultPurity {
+    /// Name of the method
     pub method: String,
+    /// The build time of the index in ms
     pub build_time_ms: f64,
+    /// The query time of the index in ms
     pub query_time_ms: f64,
+    ///  Total time the index build & query takes in ms
     pub total_time_ms: f64,
+    /// Recall@k neighbours against ground truth. Overlap in top k neighbours
+    /// for given k
     pub recall_at_k: f64,
+    /// Fraction of neighbors from same cluster
     pub cluster_purity: f64,
+    /// Index size in MB
     pub index_size_mb: f64,
 }
 
@@ -763,17 +767,6 @@ pub struct BenchmarkResultPurity {
 // Helpers //
 /////////////
 
-/// Calculate Recall@k
-///
-/// ### Params
-///
-/// * `true_neighbors` - Slice of true neighbours
-/// * `approx_neighbors` - Slice of the approximate neighbours
-/// * `k` - Number of selected k
-///
-/// ### Returns
-///
-/// The Recall@k
 /// Calculate Recall@k
 ///
 /// ### Params
@@ -796,7 +789,6 @@ pub fn calculate_recall(
         let true_set: FxHashSet<_> = true_nn.iter().take(k).collect();
         let approx_set: FxHashSet<_> = approx_nn.iter().take(k).collect();
 
-        // This forces deduplication on the GPU results
         let matches = approx_set.intersection(&true_set).count();
 
         total_recall += matches as f64 / k as f64;
@@ -805,7 +797,7 @@ pub fn calculate_recall(
     total_recall / true_neighbors.len() as f64
 }
 
-/// Calculate mean distance error
+/// Calculate mean relative distance error
 ///
 /// ### Params
 ///
@@ -815,21 +807,30 @@ pub fn calculate_recall(
 ///
 /// ### Returns
 ///
-/// The mean distance error
-pub fn calculate_dist_error<T>(true_dist: &[Vec<T>], approx_dist: &[Vec<T>], k: usize) -> f64
+/// The mean relative distance error (0.0 = perfect, 0.05 = 5% average error).
+/// Pairs where the true distance is near zero (< 1e-12) are excluded to avoid
+/// division instability.
+pub fn calculate_relative_dist_error<T>(
+    true_dist: &[Vec<T>],
+    approx_dist: &[Vec<T>],
+    k: usize,
+) -> f64
 where
     T: Float + ToPrimitive,
 {
     let mut total_error = 0.0;
-
-    for (true_dist, approx_dist) in true_dist.iter().zip(approx_dist.iter()) {
-        for i in 0..k.min(true_dist.len()).min(approx_dist.len()) {
-            let error = (true_dist[i].to_f64().unwrap() - approx_dist[i].to_f64().unwrap()).abs();
-            total_error += error;
+    let mut count = 0usize;
+    for (td, ad) in true_dist.iter().zip(approx_dist.iter()) {
+        for i in 0..k.min(td.len()).min(ad.len()) {
+            let t = td[i].to_f64().unwrap();
+            let a = ad[i].to_f64().unwrap();
+            if t > 1e-12 {
+                total_error += (a - t).abs() / t;
+                count += 1;
+            }
         }
     }
-
-    total_error / (true_dist.len() * k) as f64
+    total_error / count as f64
 }
 
 /// Calculate cluster purity of kNN graph
@@ -885,18 +886,18 @@ pub fn print_results_size(config: &str, results: &[BenchmarkResultSize]) {
     println!("{:=>128}", "");
     println!(
         "{:<50} {:>12} {:>12} {:>12} {:>12} {:>12} {:>12}",
-        "Method", "Build (ms)", "Query (ms)", "Total (ms)", "Recall@k", "Dist Error", "Size (MB)"
+        "Method", "Build (ms)", "Query (ms)", "Total (ms)", "Recall@k", "Rel dist err", "Size (MB)"
     );
     println!("{:->128}", "");
     for result in results {
         println!(
-            "{:<50} {:>12} {:>12} {:>12} {:>12.4} {:>12.6} {:>12.2}",
+            "{:<50} {:>12} {:>12} {:>12} {:>12.4} {:>12.4} {:>12.2}",
             result.method,
             format_with_underscores(result.build_time_ms),
             format_with_underscores(result.query_time_ms),
             format_with_underscores(result.total_time_ms),
             result.recall_at_k,
-            result.mean_dist_err,
+            result.rel_dist_err,
             result.index_size_mb
         );
     }

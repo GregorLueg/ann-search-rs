@@ -6,6 +6,7 @@
 
 - Various documentation updates and benchmark updates.
 - Improved NNDescent with faster sorts.
+- Improved HNSW with less allocation pressure.
 - Kd tree/forest implementation.
 - Better benchmarks for the quantisation methods with a data set that is more
   challenging for the data sets - also templated version of running the

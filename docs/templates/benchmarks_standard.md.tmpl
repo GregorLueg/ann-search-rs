@@ -13,7 +13,7 @@ cargo run --example gridsearch_<INDEX> --release -- --distance cosine
 # Available parameters with their defaults:
 # --n-samples 150_000
 # --dim 32
-# --n-clusters 30
+# --n-clusters 25
 # --k 15
 # --seed 42
 # --distance cosine
@@ -551,19 +551,21 @@ Self is queried with `ef_search=75` (default value).
 
 ## Conclusions
 
-In terms of choice of the index, it really depends on your use case and the
-constraints you are having. The tree-based version tend to work well in typical
-small data cases with ≤500,000 samples and not too much dimensionality. They
-build fast and can query fast. At higher dimensions, they are starting to be
-less efficient. LSH is overall one of the weakest indices here. Build times are
-very fast, but the data structure needs to be right for this index to perform
-well. IVF is excellent and it is not surprising that it is often used and
-can also be very easily combined with quantisiers and due to the flat
-querying pattern it also very amenable to GPU acceleration. The graph-based
-ones are all excellet. Vamana and HNSW can take longer when increasing the
-edge numbers to build for more precision. If you are more interested in high
-fidelity queries with high speed, these are great choices. The NNDescent
-version provided in the crate was designed to be fast in index building
+In terms of choice of the index, it really depends on your use case, underlying
+data and the constraints you are facing. The tree-based version tend to work
+well in typical small data cases with ≤500,000 samples and lower dimensionality.
+They build fast and can query fast here. With more dimensions, they suffer more
+from the curse of dimensionality. LSH is overall one of the weaker indices
+here. Build times are very fast, but pending underlying structure of your data,
+a lot of candidates might have to be evaluated. IVF is excellent and it is not
+surprising that it is often used and can also be very easily combined with
+different quantisations. The graph-based ones are overall excellent. HNSW
+struggles with strongly clustered data, but shines with other data structures.
+Vamana and HNSW can take longer when increasing the edge numbers to build for
+more precision. If you are more interested in high fidelity queries with high
+speed, these are great choices. The NNDescent version provided in the crate was
+designed to be fast in index building and leverages Annoy under the hood over
+a Kd forest for better initialisation.
 
 ### Runtime info
 
