@@ -1,0 +1,573 @@
+## Standard indices benchmarks and parameter gridsearch
+
+Below are all of the standard indices shown and their performance. These
+are run via:
+
+```bash
+# Run with default parameters
+cargo run --example gridsearch_<INDEX> --release -- --distance euclidean
+
+# Override specific parameters
+cargo run --example gridsearch_<INDEX> --release -- --distance cosine
+
+# Available parameters with their defaults:
+# --n-samples 150_000
+# --dim 32
+# --n-clusters 25
+# --k 15
+# --seed 42
+# --distance cosine
+# --data gaussian
+```
+
+To note, the data sets are just there for testing and get an idea on the
+behaviour with different types of structure in the data. You should not
+extrapolate from the results here what the ideal parameters are for your
+specific problem. Also, this is a single run. There is some variation in terms
+of exact times, but the overall trends should reproduce on your system with
+your specific specifications.
+
+## Table of Contents
+
+- [Annoy](#annoy)
+- [BallTree](#balltree)
+- [HNSW](#hnsw)
+- [LSH](#lsh)
+- [IVF](#ivf)
+- [Kd forest](#kd-forest)
+- [NNDescent](#nndescent)
+- [Vamana](#vamana)
+
+### Annoy
+
+`Approximate nearest neighbours Oh Yeah`. A tree-based method for vector
+searches. Fast index building and good query speed. The size of the index
+however increases quite drastically the increased number of trees. This version
+does not support the on-disk querying of the original and is designed as a
+pure in-memory index.
+
+**Key parameters:**
+
+- *Number of trees (nt)*: The number of trees to generate in the forest
+- *Search budget (s)*: The search budget per tree. If set to auto it uses
+  `k * n_trees * 20`; versions with a `10x` or `5x` (i.e., less) are also shown.
+
+Self is queried with the default search budget.
+
+<details>
+<summary><b>Annoy - Euclidean (Gaussian)</b>:</summary>
+</br>
+<pre><code>
+<!-- BENCH:annoy:euclidean:gaussian:32 -->
+</code></pre>
+</details>
+
+---
+
+<details>
+<summary><b>Annoy - Cosine (Gaussian)</b>:</summary>
+</br>
+<pre><code>
+<!-- BENCH:annoy:cosine:gaussian:32 -->
+</code></pre>
+</details>
+
+---
+
+<details>
+<summary><b>Annoy - Euclidean (Correlated)</b>:</summary>
+</br>
+<pre><code>
+<!-- BENCH:annoy:euclidean:correlated:32 -->
+</code></pre>
+</details>
+
+---
+
+<details>
+<summary><b>Annoy - Euclidean (LowRank)</b>:</summary>
+</br>
+<pre><code>
+<!-- BENCH:annoy:euclidean:lowrank:32 -->
+</code></pre>
+</details>
+
+---
+
+<details>
+<summary><b>Annoy - Euclidean (LowRank; more dimensions)</b>:</summary>
+<pre><code>
+<!-- BENCH:annoy:euclidean:lowrank:128 -->
+</code></pre>
+</details>
+
+### BallTree
+
+A metric tree data structure that partitions data points into nested
+hyperspheres. Unlike Annoy, which relies on random projections, BallTree uses
+the triangle inequality to prune the search space efficiently. This means
+instead of a forest it can just use a single tree.
+
+**Key parameters:**
+
+* *Search budget (s)*: The percentage of the total nodes/points to inspect
+  during the query. If not provided, it will default to `5%`.
+
+Self is queried with the default search budget.
+
+<details>
+<summary><b>BallTree - Euclidean (Gaussian)</b>:</summary>
+<pre><code>
+<!-- BENCH:balltree:euclidean:gaussian:32 -->
+</code></pre>
+</details>
+
+---
+
+<details>
+<summary><b>BallTree - Cosine (Gaussian)</b>:</summary>
+</br>
+<pre><code>
+<!-- BENCH:balltree:cosine:gaussian:32 -->
+</code></pre>
+</details>
+
+---
+
+<details>
+<summary><b>BallTree - Euclidean (Correlated)</b>:</summary>
+</br>
+<pre><code>
+<!-- BENCH:balltree:euclidean:correlated:32 -->
+</code></pre>
+</details>
+
+---
+
+<details>
+<summary><b>BallTree - Euclidean (LowRank)</b>:</summary>
+</br>
+<pre><code>
+<!-- BENCH:balltree:euclidean:lowrank:32 -->
+</code></pre>
+</details>
+
+---
+
+<details>
+<summary><b>BallTree - Euclidean (LowRank; more dimensions)</b>:</summary>
+</br>
+<pre><code>
+<!-- BENCH:balltree:euclidean:lowrank:128 -->
+</code></pre>
+</details>
+
+### HNSW
+
+Hierarchical navigatable small worlds. A graph-based index that needs more time
+to build the index. However, fast query speed and compared to some other
+approximate indices limited memory finger print.
+
+**Key parameters:**
+
+- *M (m)*: The number of connections between layers
+- *EF construction (ef)*: The budget to generate good connections during
+  construction of the index.
+- *EF search (s)*: The budget for the search queries.
+
+Self is queried with `s=100`.
+
+<details>
+<summary><b>HNSW - Euclidean (Gaussian)</b>:</summary>
+</br>
+<pre><code>
+<!-- BENCH:hnsw:euclidean:gaussian:32 -->
+</code></pre>
+</details>
+
+---
+
+<details>
+<summary><b>HNSW - Cosine (Gaussian)</b>:</summary>
+</br>
+<pre><code>
+<!-- BENCH:hnsw:cosine:gaussian:32 -->
+</code></pre>
+</details>
+
+---
+
+<details>
+<summary><b>HNSW - Euclidean (Correlated)</b>:</summary>
+</br>
+<pre><code>
+<!-- BENCH:hnsw:euclidean:correlated:32 -->
+</code></pre>
+</details>
+
+---
+
+<details>
+<summary><b>HNSW - Euclidean (LowRank)</b>:</summary>
+</br>
+<pre><code>
+<!-- BENCH:hnsw:euclidean:lowrank:32 -->
+</code></pre>
+</details>
+
+---
+
+<details>
+<summary><b>HNSW - Euclidean (LowRank; more dimensions)</b>:</summary>
+</br>
+<pre><code>
+<!-- BENCH:hnsw:euclidean:lowrank:128 -->
+</code></pre>
+</details>
+
+### IVF
+
+Inverted file index. Uses Voronoi cells to sub-partition the original data.
+Very small index size in memory.
+
+**Key parameters:**
+
+- *Number of lists (nl)*: The number of independent k-means cluster to generate.
+  If the structure of the data is unknown, people use `sqrt(n)` as a heuristic.
+- *Number of points (np)*: The number of clusters to probe during search.
+  Numbers here tend to be `sqrt(nlist)` or up to 5% of the nlist.
+
+Self query was done with `2 * sqrt(nlist)`.
+
+<details>
+<summary><b>IVF - Euclidean (Gaussian)</b>:</summary>
+</br>
+<pre><code>
+<!-- BENCH:ivf:euclidean:gaussian:32 -->
+</code></pre>
+</details>
+
+---
+
+<details>
+<summary><b>IVF - Cosine (Gaussian)</b>:</summary>
+</br>
+<pre><code>
+<!-- BENCH:ivf:cosine:gaussian:32 -->
+</code></pre>
+</details>
+
+---
+
+<details>
+<summary><b>IVF - Euclidean (Correlated)</b>:</summary>
+</br>
+<pre><code>
+<!-- BENCH:ivf:euclidean:correlated:32 -->
+</code></pre>
+</details>
+
+---
+
+<details>
+<summary><b>IVF - Euclidean (LowRank)</b>:</summary>
+</br>
+<pre><code>
+<!-- BENCH:ivf:euclidean:lowrank:32 -->
+</code></pre>
+</details>
+
+---
+
+<details>
+<summary><b>IVF - Euclidean (LowRank; more dimensions)</b>:</summary>
+</br>
+<pre><code>
+<!-- BENCH:ivf:euclidean:lowrank:128 -->
+</code></pre>
+</details>
+
+### Kd forest
+
+A forest of randomised Kd-trees for approximate nearest neighbour search. Each
+tree splits along coordinate axes selected randomly from the top highest-spread
+dimensions, providing diversity across trees. Split decisions are cheap (single
+coordinate comparison rather than a full dot product), which makes tree
+traversal fast and build times low. For Cosine distance, trees are built on
+normalised vectors so that axis-aligned splits approximate angular partitions.
+Kd-trees degrade in very high dimensions but remain competitive for approximate
+search up to ~100-200 dimensions when combined with a forest.
+
+**Key parameters:**
+
+- *Number of trees (nt)*: The number of trees to generate in the forest
+- *Search budget (s)*: The search budget per tree. If set to auto it uses
+  `k * n_trees * 20`; versions with a `10x` or `5x` (i.e., less) are also shown.
+
+Self is queried with the default search budget.
+
+<details>
+<summary><b>Kd forest - Euclidean (Gaussian)</b>:</summary>
+</br>
+<pre><code>
+<!-- BENCH:kd_forest:euclidean:gaussian:32 -->
+</code></pre>
+</details>
+
+---
+
+<details>
+<summary><b>Kd forest - Cosine (Gaussian)</b>:</summary>
+</br>
+<pre><code>
+<!-- BENCH:kd_forest:cosine:gaussian:32 -->
+</code></pre>
+</details>
+
+---
+
+<details>
+<summary><b>Kd forest - Euclidean (Correlated)</b>:</summary>
+</br>
+<pre><code>
+<!-- BENCH:kd_forest:euclidean:correlated:32 -->
+</code></pre>
+</details>
+
+---
+
+<details>
+<summary><b>Kd forest - Euclidean (LowRank)</b>:</summary>
+</br>
+<pre><code>
+<!-- BENCH:kd_forest:euclidean:lowrank:32 -->
+</code></pre>
+</details>
+
+---
+
+<details>
+<summary><b>Kd forest - Euclidean (LowRank; more dimensions)</b>:</summary>
+<pre><code>
+<!-- BENCH:kd_forest:euclidean:lowrank:128 -->
+</code></pre>
+</details>
+
+### LSH
+
+Locality sensitive hashing. Can be a very fast index, but with increasing
+tables, the memory fingerprint does increase.
+
+**Key parameters:**
+
+- *Number of tables (nt)*: The number of independent hash tables to generate.
+  More tables improve recall at the cost of query time and memory.
+- *Number of bits (nb)*: The bit resolution of the hash functions. Higher values
+  create finer partitions but may reduce collision rates.
+- *Number probes (n)*: How many additional buckets to explore per given
+  hash table. A good heuristic tends to be `number of bits / 2` to
+  `number of bits`.
+- *Max candidates (s)*: The search budget limiting the number of candidates
+  examined. Set to 'auto' for full search or a fixed value (e.g., 5k) for faster
+  queries with lower recall.
+
+<details>
+<summary><b>LSH - Euclidean (Gaussian)</b>:</summary>
+</br>
+<pre><code>
+<!-- BENCH:lsh:euclidean:gaussian:32 -->
+</code></pre>
+</details>
+
+---
+
+<details>
+<summary><b>LSH - Cosine (Gaussian)</b>:</summary>
+</br>
+<pre><code>
+<!-- BENCH:lsh:cosine:gaussian:32 -->
+</code></pre>
+</details>
+
+---
+
+<details>
+<summary><b>LSH - Euclidean (Correlated)</b>:</summary>
+</br>
+<pre><code>
+<!-- BENCH:lsh:euclidean:correlated:32 -->
+</code></pre>
+</details>
+
+---
+
+<details>
+<summary><b>LSH - Euclidean (LowRank)</b>:</summary>
+</br>
+<pre><code>
+<!-- BENCH:lsh:euclidean:lowrank:32 -->
+</code></pre>
+</details>
+
+---
+
+<details>
+<summary><b>LSH - Euclidean (LowRank; more dimensions)</b>:</summary>
+</br>
+<pre><code>
+<!-- BENCH:lsh:euclidean:lowrank:128 -->
+</code></pre>
+</details>
+
+### NNDescent
+
+The NNDescent implementation in this crate, heavily inspired by the amazing
+[PyNNDescent](https://github.com/lmcinnes/pynndescent), shows a very good
+compromise between index building and fast querying. It's a great arounder
+that reaches easily performance of ≥0.98 Recalls@k neighbours. You can even
+heavily short cut the initialisation of the index with only 12 trees (instead
+of 32) and get in 4 seconds to a recall ≥0.9 (compared to 48 seconds for
+exhaustive search)!
+
+**Key parameters:**
+
+- *Number of trees (nt)*: Number of trees to use for the initialisation. If set
+  to auto, it defaults to `min(5 + round(n^0.25), 32)`
+- *Search budget (s)*: The search budget for the exploration of the graph during
+  querying. Here it defaults to `k * n_trees`.
+- *Diversify probability (dp)*: This is based on the original papers leveraging
+  NNDescent and it is supposed to remove redundant edges from the graph to
+  increase query speed.
+
+<details>
+<summary><b>NNDescent - Euclidean (Gaussian)</b>:</summary>
+</br>
+<pre><code>
+<!-- BENCH:nndescent:euclidean:gaussian:32 -->
+</code></pre>
+</details>
+
+---
+
+<details>
+<summary><b>NNDescent - Cosine (Gaussian)</b>:</summary>
+</br>
+<pre><code>
+<!-- BENCH:nndescent:cosine:gaussian:32 -->
+</code></pre>
+</details>
+
+---
+
+<details>
+<summary><b>NNDescent - Euclidean (Correlated)</b>:</summary>
+</br>
+<pre><code>
+<!-- BENCH:nndescent:euclidean:correlated:32 -->
+</code></pre>
+</details>
+
+---
+
+<details>
+<summary><b>NNDescent - Euclidean (LowRank)</b>:</summary>
+</br>
+<pre><code>
+<!-- BENCH:nndescent:euclidean:lowrank:32 -->
+</code></pre>
+</details>
+
+<details>
+<summary><b>NNDescent - Euclidean (LowRank; more dimensions)</b>:</summary>
+</br>
+<pre><code>
+<!-- BENCH:nndescent:euclidean:lowrank:128 -->
+</code></pre>
+</details>
+
+### Vamana
+
+`Disk Approximate Nearest Neighbors`. A graph-based method for vector searches
+that powers DiskANN. Builds a directed navigable graph initialised with random
+long-range edges, then refines it over two passes using a beam search and a
+robust pruning heuristic (alpha-pruning). The entry point is the dataset medoid.
+This is the in-memory variant.
+
+**Key parameters:**
+
+- *Max degree (R)*: Maximum out-degree per node in the graph
+- *Build list size (L_build)*: Beam width during index construction
+- *Search list size (ef_search)*: Candidate list size at query time. Defaults
+  to `75` if not set.
+
+Self is queried with `ef_search=75` (default value).
+
+<details>
+<summary><b>Vamana - Euclidean (Gaussian)</b>:</summary>
+</br>
+<pre><code>
+<!-- BENCH:vamana:euclidean:gaussian:32 -->
+</code></pre>
+</details>
+
+---
+
+<details>
+<summary><b>Vamana - Cosine (Gaussian)</b>:</summary>
+</br>
+<pre><code>
+<!-- BENCH:vamana:cosine:gaussian:32 -->
+</code></pre>
+</details>
+
+---
+
+<details>
+<summary><b>Vamana - Euclidean (Correlated)</b>:</summary>
+</br>
+<pre><code>
+<!-- BENCH:vamana:euclidean:correlated:32 -->
+</code></pre>
+</details>
+
+---
+
+<details>
+<summary><b>Vamana - Euclidean (LowRank)</b>:</summary>
+</br>
+<pre><code>
+    <!-- BENCH:vamana:euclidean:lowrank:32 -->
+</code></pre>
+</details>
+
+---
+
+<details>
+<summary><b>Vamana - Euclidean (LowRank; more dimensions)</b>:</summary>
+<pre><code>
+<!-- BENCH:vamana:euclidean:lowrank:128 -->
+</code></pre>
+</details>
+
+## Conclusions
+
+In terms of choice of the index, it really depends on your use case, underlying
+data and the constraints you are facing. The tree-based version tend to work
+well in typical small data cases with ≤500,000 samples and lower dimensionality.
+They build fast and can query fast here. With more dimensions, they suffer more
+from the curse of dimensionality. LSH is overall one of the weaker indices
+here. Build times are very fast, but pending underlying structure of your data,
+a lot of candidates might have to be evaluated. IVF is excellent and it is not
+surprising that it is often used and can also be very easily combined with
+different quantisations. The graph-based ones are overall excellent. HNSW
+struggles with strongly clustered data, but shines with other data structures.
+Vamana and HNSW can take longer when increasing the edge numbers to build for
+more precision. If you are more interested in high fidelity queries with high
+speed, these are great choices. The NNDescent version provided in the crate was
+designed to be fast in index building and leverages Annoy under the hood over
+a Kd forest for better initialisation.
+
+### Runtime info
+
+*All benchmarks were run on M1 Max MacBook Pro with 64 GB unified memory.*
+*Last update: 2026/04/05 with version **0.2.11***

@@ -13,8 +13,8 @@ fn main() {
 
     println!("-----------------------------");
     println!(
-        "Generating synthetic data: {} cells, {} dimensions, {} clusters, {} dist.",
-        cli.n_cells.separate_with_underscores(),
+        "Generating synthetic data: {} samples, {} dimensions, {} clusters, {} dist.",
+        cli.n_samples.separate_with_underscores(),
         cli.dim,
         cli.n_clusters,
         cli.distance
@@ -48,7 +48,7 @@ fn main() {
         query_time_ms: ex_query,
         total_time_ms: ex_build + ex_query,
         recall_at_k: 1.0,
-        mean_dist_err: 0.0,
+        rel_dist_err: 0.0,
         index_size_mb: gpu_exhaustive_idx.memory_usage_bytes() as f64 / (1024.0 * 1024.0),
     });
 
@@ -79,7 +79,7 @@ fn main() {
     let cpu_extract = start.elapsed().as_secs_f64() * 1000.0;
 
     let cpu_recall = calculate_recall(&true_neighbors, &cpu_neighbors, cli.k);
-    let cpu_dist_err = calculate_dist_error(
+    let cpu_dist_err = calculate_relative_dist_error(
         true_distances.as_ref().unwrap(),
         cpu_distances.as_ref().unwrap(),
         cli.k,
@@ -91,7 +91,7 @@ fn main() {
         query_time_ms: cpu_extract,
         total_time_ms: cpu_build + cpu_extract,
         recall_at_k: cpu_recall,
-        mean_dist_err: cpu_dist_err,
+        rel_dist_err: cpu_dist_err,
         index_size_mb: cpu_size,
     });
 
@@ -137,7 +137,7 @@ fn main() {
             let gpu_extract = start.elapsed().as_secs_f64() * 1000.0;
 
             let gpu_recall = calculate_recall(&true_neighbors, &gpu_neighbors, cli.k);
-            let gpu_dist_err = calculate_dist_error(
+            let gpu_dist_err = calculate_relative_dist_error(
                 true_distances.as_ref().unwrap(),
                 gpu_distances.as_ref().unwrap(),
                 cli.k,
@@ -149,7 +149,7 @@ fn main() {
                 query_time_ms: gpu_extract,
                 total_time_ms: gpu_build + gpu_extract,
                 recall_at_k: gpu_recall,
-                mean_dist_err: gpu_dist_err,
+                rel_dist_err: gpu_dist_err,
                 index_size_mb: gpu_size,
             });
 
@@ -161,7 +161,7 @@ fn main() {
             let gpu_beam = start.elapsed().as_secs_f64() * 1000.0;
 
             let gpu_beam_recall = calculate_recall(&true_neighbors, &gpu_beam_neighbors, cli.k);
-            let gpu_beam_dist_err = calculate_dist_error(
+            let gpu_beam_dist_err = calculate_relative_dist_error(
                 true_distances.as_ref().unwrap(),
                 gpu_beam_distances.as_ref().unwrap(),
                 cli.k,
@@ -173,7 +173,7 @@ fn main() {
                 query_time_ms: gpu_beam,
                 total_time_ms: gpu_build + gpu_beam,
                 recall_at_k: gpu_beam_recall,
-                mean_dist_err: gpu_beam_dist_err,
+                rel_dist_err: gpu_beam_dist_err,
                 index_size_mb: gpu_size,
             });
 
@@ -183,8 +183,8 @@ fn main() {
 
     print_results_size(
         &format!(
-            "{}k cells, {}D kNN graph generation (build_k x refinement)",
-            cli.n_cells / 1000,
+            "{}k samples, {}D kNN graph generation (build_k x refinement)",
+            cli.n_samples / 1000,
             cli.dim
         ),
         &results,

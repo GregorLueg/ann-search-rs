@@ -49,7 +49,8 @@ use bytemuck::Pod;
 use std::path::Path;
 
 use crate::cpu::{
-    annoy::*, ball_tree::*, exhaustive::*, hnsw::*, ivf::*, lsh::*, nndescent::*, vamana::*,
+    annoy::*, ball_tree::*, exhaustive::*, hnsw::*, ivf::*, kd_forest::*, lsh::*, nndescent::*,
+    vamana::*,
 };
 use crate::prelude::*;
 
@@ -656,6 +657,99 @@ where
     T: AnnSearchFloat,
 {
     index.generate_knn(k, nprobe, return_dist, verbose)
+}
+
+////////////
+// KdTree //
+////////////
+
+/// Build a Kd-Tree forest index
+///
+/// ### Params
+///
+/// * `mat` - The data matrix. Rows represent the samples, columns represent
+///   the embedding dimensions
+/// * `dist_metric` - Distance metric string ("euclidean" or "cosine")
+/// * `n_trees` - Number of trees to use to build the index
+/// * `seed` - Random seed for reproducibility
+/// * `overlap` - Spill-tree overlap fraction. If None, uses the default
+///   (5%). If Some(0.0), builds a standard Kd-tree without overlap.
+///
+/// ### Return
+///
+/// The `KdTreeIndex`.
+pub fn build_kd_tree_index<T>(
+    mat: MatRef<T>,
+    dist_metric: String,
+    n_trees: usize,
+    seed: usize,
+) -> KdTreeIndex<T>
+where
+    T: AnnSearchFloat,
+{
+    let ann_dist = parse_ann_dist(&dist_metric).unwrap_or_default();
+
+    KdTreeIndex::new(mat, n_trees, ann_dist, seed)
+}
+
+/// Helper function to query a given Kd-Tree index
+///
+/// ### Params
+///
+/// * `query_mat` - The query matrix containing the samples x features
+/// * `index` - The KdTreeIndex to query
+/// * `k` - Number of neighbours to return
+/// * `search_budget` - Search budget (total items to examine)
+/// * `return_dist` - Shall the distances between the different points be
+///   returned
+/// * `verbose` - Controls verbosity of the function
+///
+/// ### Returns
+///
+/// A tuple of `(knn_indices, optional distances)`
+pub fn query_kd_tree_index<T>(
+    query_mat: MatRef<T>,
+    index: &KdTreeIndex<T>,
+    k: usize,
+    search_budget: Option<usize>,
+    return_dist: bool,
+    verbose: bool,
+) -> (Vec<Vec<usize>>, Option<Vec<Vec<T>>>)
+where
+    T: AnnSearchFloat,
+{
+    query_parallel(query_mat.nrows(), return_dist, verbose, |i| {
+        index.query_row(query_mat.row(i), k, search_budget)
+    })
+}
+
+/// Helper function to self query the Kd-Tree index
+///
+/// This function will generate a full kNN graph based on the internal data.
+///
+/// ### Params
+///
+/// * `index` - The KdTreeIndex to query
+/// * `k` - Number of neighbours to return
+/// * `search_budget` - Search budget (total items to examine)
+/// * `return_dist` - Shall the distances between the different points be
+///   returned
+/// * `verbose` - Controls verbosity of the function
+///
+/// ### Returns
+///
+/// A tuple of `(knn_indices, optional distances)`
+pub fn query_kd_tree_self<T>(
+    index: &KdTreeIndex<T>,
+    k: usize,
+    search_budget: Option<usize>,
+    return_dist: bool,
+    verbose: bool,
+) -> (Vec<Vec<usize>>, Option<Vec<Vec<T>>>)
+where
+    T: AnnSearchFloat,
+{
+    index.generate_knn(k, search_budget, return_dist, verbose)
 }
 
 /////////

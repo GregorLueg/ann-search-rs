@@ -12,8 +12,8 @@ fn main() {
 
     println!("-----------------------------");
     println!(
-        "Generating synthetic data: {} cells, {} dimensions, {} clusters, {} dist.",
-        cli.n_cells.separate_with_underscores(),
+        "Generating synthetic data: {} samples, {} dimensions, {} clusters, {} dist.",
+        cli.n_samples.separate_with_underscores(),
         cli.dim,
         cli.n_clusters,
         cli.distance
@@ -44,7 +44,7 @@ fn main() {
         query_time_ms: query_time,
         total_time_ms: build_time + query_time,
         recall_at_k: 1.0,
-        mean_dist_err: 0.0,
+        rel_dist_err: 0.0,
         index_size_mb,
     });
 
@@ -60,13 +60,15 @@ fn main() {
         query_time_ms: self_query_time,
         total_time_ms: build_time + self_query_time,
         recall_at_k: 1.0,
-        mean_dist_err: 0.0,
+        rel_dist_err: 0.0,
         index_size_mb,
     });
 
     println!("-----------------------------------------------------------------------------------------------");
 
-    let m_values: Vec<usize> = if cli.dim > 128 {
+    let m_values: Vec<usize> = if cli.dim >= 1024 {
+        vec![16, 32, 64, 128]
+    } else if cli.dim > 128 {
         vec![16, 32, 64]
     } else {
         vec![8, 16]
@@ -107,7 +109,7 @@ fn main() {
             query_time_ms: query_time,
             total_time_ms: build_time + query_time,
             recall_at_k: recall,
-            mean_dist_err: f64::NAN,
+            rel_dist_err: f64::NAN,
             index_size_mb,
         });
 
@@ -126,7 +128,7 @@ fn main() {
             query_time_ms: self_query_time,
             total_time_ms: build_time + self_query_time,
             recall_at_k: recall_self,
-            mean_dist_err: f64::NAN,
+            rel_dist_err: f64::NAN,
             index_size_mb,
         });
     }
@@ -134,9 +136,9 @@ fn main() {
     println!("-----------------------------------------------------------------------------------------------");
 
     let nlist_values = [
-        (cli.n_cells as f32 * 0.5).sqrt() as usize,
-        (cli.n_cells as f32).sqrt() as usize,
-        (cli.n_cells as f32 * 2.0).sqrt() as usize,
+        (cli.n_samples as f32 * 0.5).sqrt() as usize,
+        (cli.n_samples as f32).sqrt() as usize,
+        (cli.n_samples as f32 * 2.0).sqrt() as usize,
     ];
 
     for nlist in nlist_values {
@@ -203,7 +205,7 @@ fn main() {
                     query_time_ms: query_time,
                     total_time_ms: build_time + query_time,
                     recall_at_k: recall,
-                    mean_dist_err: f64::NAN,
+                    rel_dist_err: f64::NAN,
                     index_size_mb,
                 });
             }
@@ -225,14 +227,14 @@ fn main() {
                 query_time_ms: self_query_time,
                 total_time_ms: build_time + self_query_time,
                 recall_at_k: recall_self,
-                mean_dist_err: f64::NAN,
+                rel_dist_err: f64::NAN,
                 index_size_mb,
             });
         }
     }
 
     print_results_size(
-        &format!("{}k cells, {}D", cli.n_cells / 1000, cli.dim),
+        &format!("{}k samples, {}D", cli.n_samples / 1000, cli.dim),
         &results,
     );
 }

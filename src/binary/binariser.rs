@@ -14,7 +14,6 @@ use rand_distr::StandardNormal;
 ///////////////
 
 const MAX_SAMPLES_PCA: usize = 100_000;
-const ITQ_ITERATIONS: usize = 10;
 
 /// Initialisation of the binariser
 #[derive(Default, Eq, PartialEq)]
@@ -22,8 +21,8 @@ pub enum BinarisationInit {
     /// Random projection with orthogonalisation
     #[default]
     RandomProjections,
-    /// Iterative Quantisation
-    Itq,
+    /// PCA-based hashing
+    PcaHashing,
     /// Sign-based binarisation
     SignBased,
 }
@@ -39,7 +38,7 @@ pub enum BinarisationInit {
 /// `Option<BinarisationInit>`
 pub fn parse_binarisation_init(s: &str) -> Option<BinarisationInit> {
     match s.to_lowercase().as_str() {
-        "itq" => Some(BinarisationInit::Itq),
+        "pca" | "pca_hashing" => Some(BinarisationInit::PcaHashing),
         "random" | "random_projections" => Some(BinarisationInit::RandomProjections),
         "sign" | "sign_based" => Some(BinarisationInit::SignBased),
         _ => None,
@@ -57,11 +56,11 @@ pub enum BinarisationMethod<T> {
         /// The random, orthogonal projection
         projections: Vec<T>,
     },
-    /// ITQ with PCA-derived projections and mean centering
-    Itq {
-        /// Projections based on PCA
+    /// PCA hashing with learned projections and mean centring
+    PcaHashing {
+        /// Projections based on PCA loadings
         projections: Vec<T>,
-        /// The mean value across that feature
+        /// The mean value across each feature
         mean: Vec<T>,
     },
     /// Sign-based binarisation (no projections needed)
@@ -143,49 +142,49 @@ where
     random_projections
 }
 
-/// Initialise binariser using PCA followed by Iterative Quantisation (ITQ)
+/// Initialise binariser using PCA hashing
 ///
-/// ITQ learns a rotation of the PCA subspace that minimises quantisation error
-/// when binarising. This typically produces better codes than random projections
-/// when the data has strong principal components.
+/// Learns a projection from the top principal components of the training
+/// data. Each bit corresponds to the sign of a data point's score on one
+/// principal component. The top PCs capture the directions of greatest
+/// variance, so the resulting bits preserve the most informative structure
+/// in the data.
 ///
 /// ### Algorithm
 ///
 /// 1. Sample and centre training data
-/// 2. Compute thin SVD to get top-k principal components
-/// 3. Iteratively refine rotation matrix via Procrustes alignment
-/// 4. Final projections = PCA directions × learned rotation
+/// 2. Compute thin SVD to obtain the top-k right singular vectors (loadings)
+/// 3. Use the loadings directly as projection directions
 ///
 /// ### Limitations
 ///
-/// ITQ can only produce `min(n_bits, dim)` meaningful bits. If `n_bits > dim`,
-/// the excess bits are filled with random orthogonal projections, as there are
-/// no additional variance directions to capture.
+/// PCA hashing can only produce `min(n_bits, dim)` meaningful bits. If
+/// `n_bits > dim`, the excess bits are filled with random orthogonal
+/// projections, as there are no additional variance directions to capture.
+///
+/// The top principal components tend to carry disproportionately more
+/// variance than lower ones, so not all bits are equally informative.
+/// This is a known trade-off compared to methods like ITQ which attempt
+/// to balance variance across bits via rotation.
 ///
 /// ### Params
 ///
-/// * `data` - Training data matrix (n_samples × dim). Automatically downsampled
-///   if n_samples exceeds MAX_SAMPLES_PCA
+/// * `data` - Training data matrix (n_samples x dim). Automatically
+///   downsampled if n_samples exceeds MAX_SAMPLES_PCA
 /// * `n_bits` - Number of bits in output
-/// * `seed` - Random seed for reproducibility
-/// * `itq_iterations` - Number of Procrustes refinement iterations
+/// * `seed` - Random seed for reproducibility (used for subsampling and
+///   fallback random projections)
 ///
 /// ### Returns
 ///
-/// Tuple of data means and projections
-fn prepare_itq_projections<T>(
-    data: MatRef<T>,
-    n_bits: usize,
-    seed: usize,
-    itq_iterations: usize,
-) -> (Vec<T>, Vec<T>)
+/// Tuple of (projections, mean) where projections is flattened
+/// (n_bits x dim) and mean is the per-feature mean (length dim)
+fn prepare_pca_projections<T>(data: MatRef<T>, n_bits: usize, seed: usize) -> (Vec<T>, Vec<T>)
 where
     T: Float + FromPrimitive + ToPrimitive + ComplexField,
 {
     let n = data.nrows();
     let dim = data.ncols();
-
-    // ITQ can only produce meaningful bits up to dim
     let effective_bits = n_bits.min(dim);
 
     let mut rng = StdRng::seed_from_u64(seed as u64);
@@ -220,68 +219,22 @@ where
         }
     }
 
-    // thin SVD - only computes what we need
+    // thin SVD to obtain loadings
     let svd = centered.as_ref().thin_svd().unwrap();
-    let v_full = svd.V(); // dim × min(n_samples, dim)
+    let v_full = svd.V(); // dim x min(n_samples, dim)
 
-    // extract top-k components
+    // extract top-k loadings as projection directions
     let k = effective_bits.min(v_full.ncols());
-    let mut v_k = Mat::<T>::zeros(dim, k);
-    for i in 0..dim {
-        for j in 0..k {
-            v_k[(i, j)] = v_full[(i, j)];
-        }
-    }
-
-    // project data onto PCA subspace
-    let projected = &centered * &v_k; // n_samples × k
-
-    // initialise rotation matrix randomly
-    let mut r_mat = Mat::<T>::zeros(k, k);
-    for i in 0..k {
-        for j in 0..k {
-            r_mat[(i, j)] = T::from_f64(rng.sample(StandardNormal)).unwrap();
-        }
-    }
-    let qr = r_mat.as_ref().qr();
-    let mut r_ortho = qr.compute_Q();
-
-    // ITQ iterations
-    for _ in 0..itq_iterations {
-        let rotated = &projected * &r_ortho;
-
-        // Binarise
-        let mut b_mat = Mat::<T>::zeros(n_samples, k);
-        for i in 0..n_samples {
-            for j in 0..k {
-                b_mat[(i, j)] = if rotated[(i, j)] >= T::zero() {
-                    T::one()
-                } else {
-                    -T::one()
-                };
-            }
-        }
-
-        // Procrustes: find R minimising ||B - Y*R||
-        let c_mat = projected.transpose() * &b_mat;
-        let svd_c = c_mat.as_ref().thin_svd().unwrap();
-        r_ortho = svd_c.U() * svd_c.V().transpose();
-    }
-
-    // Final projection matrix: V_k * R
-    let final_proj = &v_k * &r_ortho;
-
-    // Flatten to output format
-    let mut projections = Vec::with_capacity(effective_bits * dim);
-    for j in 0..effective_bits {
+    let mut projections = Vec::with_capacity(n_bits * dim);
+    for j in 0..k {
         for i in 0..dim {
-            projections.push(final_proj[(i, j)]);
+            projections.push(v_full[(i, j)]);
         }
     }
 
-    // If n_bits > effective_bits, pad with random projections
-    if n_bits > effective_bits {
-        let extra = prepare_simhash_projections::<T>(dim, n_bits - effective_bits, seed + 1);
+    // pad with random projections if n_bits > effective rank
+    if n_bits > k {
+        let extra = prepare_simhash_projections::<T>(dim, n_bits - k, seed + 1);
         projections.extend(extra);
     }
 
@@ -414,30 +367,29 @@ where
         }
     }
 
-    /// Initialise binariser using PCA followed by ITQ rotation
+    /// Initialise binariser using PCA hashing
     ///
     /// Uses Principal Component Analysis to find the directions of maximum
-    /// variance, then applies Iterative Quantisation (ITQ) to rotate these
-    /// components for optimal binary quantisation. This typically produces
-    /// better quality codes than random projections.
+    /// variance in the training data, then binarises by taking the sign of
+    /// each data point's projection onto these directions.
     ///
     /// ### Params
     ///
-    /// * `data` - Training data matrix (n_samples × dim)
+    /// * `data` - Training data matrix (n_samples x dim)
     /// * `dim` - Input vector dimensionality
     /// * `n_bits` - Number of bits in output (must be multiple of 8)
     /// * `seed` - Random seed for reproducibility
     ///
     /// ### Returns
     ///
-    /// Initialised binariser with PCA+ITQ projections
-    pub fn new_itq(data: MatRef<T>, dim: usize, n_bits: usize, seed: usize) -> Self {
+    /// Initialised binariser with PCA projections
+    pub fn new_pca_hashing(data: MatRef<T>, dim: usize, n_bits: usize, seed: usize) -> Self {
         assert!(n_bits.is_multiple_of(8), "n_bits must be multiple of 8");
 
-        let (projections, mean) = prepare_itq_projections(data, n_bits, seed, ITQ_ITERATIONS);
+        let (projections, mean) = prepare_pca_projections(data, n_bits, seed);
 
         Self {
-            method: BinarisationMethod::Itq { projections, mean },
+            method: BinarisationMethod::PcaHashing { projections, mean },
             n_bits,
             dim,
         }
@@ -479,7 +431,7 @@ where
             BinarisationMethod::SimHash { projections } => {
                 encode_with_projections(vec, projections, &[], self.n_bits, self.dim)
             }
-            BinarisationMethod::Itq { projections, mean } => {
+            BinarisationMethod::PcaHashing { projections, mean } => {
                 encode_with_projections(vec, projections, mean, self.n_bits, self.dim)
             }
             BinarisationMethod::SignBased => encode_sign_based(vec, self.dim),
@@ -497,7 +449,7 @@ where
             BinarisationMethod::SimHash { projections } => {
                 total += projections.capacity() * std::mem::size_of::<T>();
             }
-            BinarisationMethod::Itq { projections, mean } => {
+            BinarisationMethod::PcaHashing { projections, mean } => {
                 total += projections.capacity() * std::mem::size_of::<T>();
                 total += mean.capacity() * std::mem::size_of::<T>();
             }
@@ -553,7 +505,7 @@ mod tests {
     }
 
     #[test]
-    fn test_itq_basic() {
+    fn test_pca_hashing_basic() {
         let n_samples = 1000;
         let dim = 64;
         let n_bits = 128;
@@ -565,7 +517,7 @@ mod tests {
             }
         }
 
-        let binariser = Binariser::<f64>::new_itq(data.as_ref(), dim, n_bits, 42);
+        let binariser = Binariser::<f64>::new_pca_hashing(data.as_ref(), dim, n_bits, 42);
 
         let vec1: Vec<f64> = (0..dim).map(|i| (i as f64).sin()).collect();
         let binary = binariser.encode(&vec1);
@@ -574,7 +526,7 @@ mod tests {
     }
 
     #[test]
-    fn test_itq_orthogonality() {
+    fn test_pca_hashing_orthogonality() {
         let n_samples = 500;
         let dim = 32;
         let n_bits = 128;
@@ -586,9 +538,9 @@ mod tests {
             }
         }
 
-        let binariser = Binariser::<f64>::new_itq(data.as_ref(), dim, n_bits, 42);
+        let binariser = Binariser::<f64>::new_pca_hashing(data.as_ref(), dim, n_bits, 42);
 
-        if let BinarisationMethod::Itq { projections, .. } = &binariser.method {
+        if let BinarisationMethod::PcaHashing { projections, .. } = &binariser.method {
             for i in 0..n_bits.min(dim) {
                 let i_base = i * dim;
                 let mut norm_sq = 0.0;
@@ -619,12 +571,12 @@ mod tests {
                 }
             }
         } else {
-            panic!("Expected ITQ method");
+            panic!("Expected PcaHashing method");
         }
     }
 
     #[test]
-    fn test_itq_centering() {
+    fn test_pca_hashing_centring() {
         let n_samples = 100;
         let dim = 16;
         let n_bits = 32;
@@ -636,15 +588,15 @@ mod tests {
             }
         }
 
-        let binariser = Binariser::<f64>::new_itq(data.as_ref(), dim, n_bits, 42);
+        let binariser = Binariser::<f64>::new_pca_hashing(data.as_ref(), dim, n_bits, 42);
 
-        if let BinarisationMethod::Itq { mean, .. } = &binariser.method {
+        if let BinarisationMethod::PcaHashing { mean, .. } = &binariser.method {
             for d in 0..dim {
                 let expected_mean = (n_samples as f64 - 1.0) / 2.0 + 10.0;
                 assert!((mean[d] - expected_mean).abs() < 1e-6);
             }
         } else {
-            panic!("Expected ITQ method");
+            panic!("Expected PcaHashing method");
         }
     }
 
@@ -676,9 +628,9 @@ mod tests {
         let dim = 64;
         let binariser = Binariser::<f64>::new_sign_based(dim);
 
-        let vec1: Vec<f64> = (0..dim).map(|i| (i + 1) as f64).collect(); // Start from 1
+        let vec1: Vec<f64> = (0..dim).map(|i| (i + 1) as f64).collect();
         let vec2: Vec<f64> = (0..dim).map(|i| (i + 1) as f64 + 0.1).collect();
-        let vec3: Vec<f64> = (0..dim).map(|i| -((i + 1) as f64)).collect(); // All negative
+        let vec3: Vec<f64> = (0..dim).map(|i| -((i + 1) as f64)).collect();
 
         let bin1 = binariser.encode(&vec1);
         let bin2 = binariser.encode(&vec2);
@@ -715,12 +667,12 @@ mod tests {
     #[test]
     fn test_parse_binarisation_init() {
         assert!(matches!(
-            parse_binarisation_init("itq"),
-            Some(BinarisationInit::Itq)
+            parse_binarisation_init("pca"),
+            Some(BinarisationInit::PcaHashing)
         ));
         assert!(matches!(
-            parse_binarisation_init("ITQ"),
-            Some(BinarisationInit::Itq)
+            parse_binarisation_init("pca_hashing"),
+            Some(BinarisationInit::PcaHashing)
         ));
         assert!(matches!(
             parse_binarisation_init("random"),
@@ -749,9 +701,9 @@ mod tests {
 
     #[test]
     #[should_panic]
-    fn test_invalid_n_bits_itq() {
+    fn test_invalid_n_bits_pca_hashing() {
         let data = Mat::<f64>::zeros(100, 64);
-        let _binariser = Binariser::<f64>::new_itq(data.as_ref(), 64, 123, 42);
+        let _binariser = Binariser::<f64>::new_pca_hashing(data.as_ref(), 64, 123, 42);
     }
 
     #[test]

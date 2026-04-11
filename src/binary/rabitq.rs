@@ -1,4 +1,7 @@
-//! RaBitQ quantiser and helpers
+//! Implements the quantisation approach from RaBitQ, see:
+//!
+//! "RaBitQ: Quantizing High-Dimensional Vectors with a Theoretical Error Bound
+//! for Approximate Nearest Neighbor Search" (Gao and Long, 2024).
 
 use faer::{Mat, MatRef};
 use faer_traits::ComplexField;

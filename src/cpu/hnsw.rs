@@ -27,19 +27,19 @@ impl<T: Ord> Default for SortedBuffer<T> {
 }
 
 /// Construction-time neighbour storage
-///
-/// ### Fields
-///
-/// * `nodes` - For each node, vector of neighbour lists (one per layer)
-/// * `locks` - Lock bitset for thread-safe updates
-/// * `node_levels` - Maximum layer each node appears in
-/// * `m` - Base connectivity parameter
-/// * `_phantom` - Phantom data for type parameter
 struct ConstructionGraph<T> {
-    nodes: Vec<UnsafeCell<Vec<Vec<u32>>>>,
+    /// Flat storage: each layer is a fixed-size block padded with u32::MAX.
+    /// Layout per node: [layer0 (M*2 slots), layer1 (M slots), ...].
+    /// Sentinels (u32::MAX) mark unused slots; valid IDs are packed at the
+    /// front of each layer block.
+    nodes: Vec<UnsafeCell<Vec<u32>>>,
+    /// Lock bitset for thread-safe writes
     locks: AtomicNodeLocks,
+    /// Maximum layer each node appears in
     node_levels: Vec<u8>,
+    /// Base connectivity parameter
     m: usize,
+    /// Phantom data for type parameter
     _phantom: PhantomData<T>,
 }
 
@@ -49,10 +49,13 @@ impl<T> ConstructionGraph<T>
 where
     T: Float + FromPrimitive + Send + Sync + Sum,
 {
-    /// Create a new construction graph with proper per-layer storage
+    /// Create a new construction graph with fixed-size sentinel-padded storage
     ///
-    /// Pre-allocates neighbour vectors for each layer each node appears in,
-    /// with layer 0 having 2*M capacity and upper layers having M capacity.
+    /// Pre-allocates a contiguous slot array for each node, with layer 0
+    /// having 2*M slots and upper layers having M slots each. All slots are
+    /// initialised to `u32::MAX` (sentinel). This fixed layout ensures that
+    /// concurrent lock-free readers never observe an empty or half-allocated
+    /// neighbour list.
     ///
     /// ### Params
     ///
@@ -62,19 +65,13 @@ where
     ///
     /// ### Returns
     ///
-    /// Initialised construction graph with empty neighbour lists
+    /// Initialised construction graph with sentinel-filled neighbour slots
     fn new(n: usize, layer_assignments: &[u8], m: usize) -> Self {
         let nodes = (0..n)
             .map(|i| {
                 let level = layer_assignments[i] as usize;
-                // pre-allocate vectors for each layer this node appears in
-                // layer 0 gets M*2, layers 1+ get M
-                let mut layers = Vec::with_capacity(level + 1);
-                for l in 0..=level {
-                    let capacity = if l == 0 { m * 2 } else { m };
-                    layers.push(Vec::with_capacity(capacity));
-                }
-                UnsafeCell::new(layers)
+                let total_slots = m * 2 + level * m;
+                UnsafeCell::new(vec![u32::MAX; total_slots])
             })
             .collect();
 
@@ -84,6 +81,45 @@ where
             node_levels: layer_assignments.to_vec(),
             m,
             _phantom: PhantomData,
+        }
+    }
+
+    /// Compute the offset within a node's flat slot array for a given layer
+    ///
+    /// Layer 0 starts at offset 0 and occupies 2*M slots. Each subsequent
+    /// layer occupies M slots.
+    ///
+    /// ### Params
+    ///
+    /// * `layer` - Layer number
+    ///
+    /// ### Returns
+    ///
+    /// Starting index within the node's flat slot array
+    #[inline]
+    fn layer_offset(&self, layer: u8) -> usize {
+        if layer == 0 {
+            0
+        } else {
+            self.m * 2 + (layer as usize - 1) * self.m
+        }
+    }
+
+    /// Get the maximum number of neighbours for a layer
+    ///
+    /// ### Params
+    ///
+    /// * `layer` - Layer number
+    ///
+    /// ### Returns
+    ///
+    /// 2*M for layer 0, M for upper layers
+    #[inline]
+    fn max_neighbours(&self, layer: u8) -> usize {
+        if layer == 0 {
+            self.m * 2
+        } else {
+            self.m
         }
     }
 
@@ -101,9 +137,16 @@ where
         self.node_levels[node_id]
     }
 
-    /// Get neighbours for a node at a specific layer
+    /// Get a read-only slice of neighbours for a node at a specific layer
     ///
-    /// Returns empty vector if the node doesn't exist at the requested layer.
+    /// Returns the fixed-size slot range for the requested layer. The slice
+    /// may contain `u32::MAX` sentinels marking unused positions, packed at
+    /// the end. No lock is acquired; benign torn reads are accepted during
+    /// construction search because individual `u32` writes are atomic on all
+    /// relevant architectures, so each slot is always either a valid node ID
+    /// or a sentinel.
+    ///
+    /// Returns empty slice if the node does not exist at the requested layer.
     ///
     /// ### Params
     ///
@@ -112,30 +155,39 @@ where
     ///
     /// ### Returns
     ///
-    /// Vector of neighbour indices at this layer
-    fn get_neighbours(&self, node_id: usize, layer: u8) -> Vec<u32> {
+    /// Slice of neighbour slots (may contain `u32::MAX` padding)
+    ///
+    /// ### Safety
+    ///
+    /// Caller must ensure no concurrent reallocation of this node's backing
+    /// storage. Safe with fixed-size sentinel-padded layout since writes are
+    /// always in-place overwrites.
+    #[inline]
+    pub unsafe fn get_neighbours_slice(&self, node_id: usize, layer: u8) -> &[u32] {
         let node_level = self.node_levels[node_id];
         if layer > node_level {
-            return Vec::new();
+            return &[];
         }
-        let _guard = self.locks.lock_guard(node_id);
-        // SAFETY: Lock guard ensures no concurrent mutation
-        unsafe {
-            let layers = &*self.nodes[node_id].get();
-            layers[layer as usize].clone()
-        }
+        let flat = &*self.nodes[node_id].get();
+        let offset = self.layer_offset(layer);
+        let count = self.max_neighbours(layer);
+        &flat[offset..offset + count]
     }
 
     /// Set neighbours for a node at a specific layer
     ///
-    /// Replaces the entire neighbour list for this layer, respecting the
-    /// maximum neighbour count (2*M for layer 0, M for upper layers).
+    /// Acquires the node lock, then overwrites the layer's slot range
+    /// in-place. Valid IDs are written first, followed by sentinel padding.
+    /// Self-loops are filtered out. At no point does the slot range appear
+    /// empty to concurrent readers.
+    ///
+    /// No-op if the node does not exist at the requested layer.
     ///
     /// ### Params
     ///
     /// * `node_id` - Node to update
     /// * `layer` - Layer to update
-    /// * `neighbours` - New neighbour list (distance, id) pairs
+    /// * `neighbours` - New neighbour list as (distance, id) pairs
     fn set_neighbours(&self, node_id: usize, layer: u8, neighbours: &[(OrderedFloat<T>, usize)]) {
         let node_level = self.node_levels[node_id];
         if layer > node_level {
@@ -143,25 +195,33 @@ where
         }
 
         let _guard = self.locks.lock_guard(node_id);
+        let max_n = self.max_neighbours(layer);
+        let flat = unsafe { &mut *self.nodes[node_id].get() };
+        let offset = self.layer_offset(layer);
+        let slot = &mut flat[offset..offset + max_n];
 
-        let max_neighbours = if layer == 0 { self.m * 2 } else { self.m };
-
-        // SAFETY: Lock guard ensures exclusive access
-        let layers = unsafe { &mut *self.nodes[node_id].get() };
-        let layer_neighbours = &mut layers[layer as usize];
-        layer_neighbours.clear();
-
-        for &(_, neighbour_id) in neighbours.iter().take(max_neighbours) {
+        let mut i = 0;
+        for &(_, neighbour_id) in neighbours.iter().take(max_n) {
             if neighbour_id != node_id {
-                layer_neighbours.push(neighbour_id as u32);
+                slot[i] = neighbour_id as u32;
+                i += 1;
             }
+        }
+        for j in i..max_n {
+            slot[j] = u32::MAX;
         }
     }
 
-    /// Add a single neighbour with pruning if needed
+    /// Add a single neighbour with pruning if the layer is full
     ///
-    /// If the neighbour list is full, applies the heuristic pruning strategy
-    /// to maintain diversity whilst respecting the maximum neighbour count.
+    /// Acquires the node lock, then either appends to the first sentinel
+    /// slot (if space remains) or applies the heuristic pruning strategy to
+    /// select the best `max_neighbours` from the existing set plus the new
+    /// candidate. Writes are always in-place overwrites, ensuring concurrent
+    /// readers never see an empty list.
+    ///
+    /// No-op if the node does not exist at the requested layer, or if the
+    /// neighbour is already present.
     ///
     /// ### Params
     ///
@@ -184,27 +244,25 @@ where
         }
 
         let _guard = self.locks.lock_guard(node_id);
+        let max_n = self.max_neighbours(layer);
+        let flat = unsafe { &mut *self.nodes[node_id].get() };
+        let offset = self.layer_offset(layer);
+        let slot = &mut flat[offset..offset + max_n];
 
-        let max_neighbours = if layer == 0 { self.m * 2 } else { self.m };
+        // Degree is the index of the first sentinel
+        let degree = slot.iter().position(|&e| e == u32::MAX).unwrap_or(max_n);
 
-        // SAFETY: Lock guard ensures exclusive access
-        let layers = unsafe { &mut *self.nodes[node_id].get() };
-        let layer_neighbours = &mut layers[layer as usize];
-
-        if layer_neighbours
-            .iter()
-            .any(|&n| n as usize == new_neighbour)
-        {
+        if slot[..degree].iter().any(|&n| n as usize == new_neighbour) {
             return;
         }
 
-        if layer_neighbours.len() < max_neighbours {
-            layer_neighbours.push(new_neighbour as u32);
+        if degree < max_n {
+            slot[degree] = new_neighbour as u32;
             return;
         }
 
-        // Need to prune - collect all candidates with distances
-        let mut candidates: Vec<(OrderedFloat<T>, usize)> = layer_neighbours
+        // Full: collect all candidates with distances, then prune
+        let mut candidates: Vec<(OrderedFloat<T>, usize)> = slot[..degree]
             .iter()
             .map(|&n| {
                 let n = n as usize;
@@ -216,77 +274,51 @@ where
             OrderedFloat(distance_fn(node_id, new_neighbour)),
             new_neighbour,
         ));
-
         candidates.sort_unstable_by(|a, b| a.0.cmp(&b.0));
 
-        let mut selected = Vec::with_capacity(max_neighbours);
-
+        let mut selected = Vec::with_capacity(max_n);
         for &(dist, cand_id) in &candidates {
-            if selected.len() >= max_neighbours {
+            if selected.len() >= max_n {
                 break;
             }
-
             let dominated = selected.iter().any(|&sel_id| {
                 let dist_to_selected = OrderedFloat(distance_fn(cand_id, sel_id));
                 dist_to_selected < dist
             });
-
             if !dominated {
                 selected.push(cand_id);
             }
         }
 
-        layer_neighbours.clear();
-        for id in selected {
-            layer_neighbours.push(id as u32);
+        // In-place overwrite with sentinel padding
+        for i in 0..max_n {
+            slot[i] = if i < selected.len() {
+                selected[i] as u32
+            } else {
+                u32::MAX
+            };
         }
     }
 
     /// Convert to flat layout for queries
     ///
-    /// Transforms the per-layer storage into a flattened array for better
-    /// cache performance during queries. Each node's layers are stored
-    /// contiguously with padding. Layout:
-    /// [node0_layer0(M*2), node0_layer1(M), ..., node1_layer0(M*2), ...]
-    ///
-    /// ### Params
-    ///
-    /// * `m` - Connectivity parameter for size calculation
+    /// Consumes the construction graph and produces a flattened neighbour
+    /// array suitable for cache-friendly query traversal. Each node's layers
+    /// are stored contiguously, preserving the fixed-size sentinel-padded
+    /// layout. The offset array records where each node's data begins.
     ///
     /// ### Returns
     ///
-    /// Tuple of (flat neighbours, offsets, level assignments)
-    fn into_flat(self, m: usize) -> (Vec<u32>, Vec<usize>, Vec<u8>) {
+    /// Tuple of (flat neighbours, per-node offsets, level assignments)
+    fn into_flat(self) -> (Vec<u32>, Vec<usize>, Vec<u8>) {
         let n = self.nodes.len();
         let mut neighbours_flat = Vec::new();
         let mut neighbour_offsets = Vec::with_capacity(n);
         let node_levels = self.node_levels.clone();
 
-        for (node_id, node_cell) in self.nodes.into_iter().enumerate() {
+        for node_cell in self.nodes {
             neighbour_offsets.push(neighbours_flat.len());
-
-            let layers = node_cell.into_inner();
-            let node_level = node_levels[node_id];
-
-            // Write each layer's neighbours with padding
-            for layer in 0..=node_level {
-                let max_neighbours = if layer == 0 { m * 2 } else { m };
-                let layer_neighbours = if (layer as usize) < layers.len() {
-                    &layers[layer as usize]
-                } else {
-                    &Vec::new()
-                };
-
-                // Write actual neighbours
-                for &n in layer_neighbours {
-                    neighbours_flat.push(n);
-                }
-
-                // Pad with INVALID
-                for _ in layer_neighbours.len()..max_neighbours {
-                    neighbours_flat.push(u32::MAX);
-                }
-            }
+            neighbours_flat.extend(node_cell.into_inner());
         }
 
         (neighbours_flat, neighbour_offsets, node_levels)
@@ -529,7 +561,7 @@ where
         index.build_graph(&construction_graph, verbose);
 
         // Convert construction graph to flat layout
-        let (neighbours_flat, neighbour_offsets, _) = construction_graph.into_flat(m);
+        let (neighbours_flat, neighbour_offsets, _) = construction_graph.into_flat();
         index.neighbours_flat = neighbours_flat;
         index.neighbour_offsets = neighbour_offsets;
 
@@ -640,16 +672,24 @@ where
             let mut changed = true;
             while changed {
                 changed = false;
-                let neighbours = graph.get_neighbours(current_node, layer);
-                for &neighbour in &neighbours {
+
+                // SAFETY: lock-free read of fixed-size sentinel-padded slots.
+                // Benign torn reads are acceptable during greedy descent; a
+                // stale or partial neighbour list may slow convergence but
+                // cannot produce incorrect final results.
+                let neighbours = unsafe { graph.get_neighbours_slice(current_node, layer) };
+
+                for &neighbour in neighbours {
                     if neighbour == u32::MAX {
-                        continue;
+                        break;
                     }
                     let neighbour = neighbour as usize;
+
                     let dist = OrderedFloat(match self.metric {
                         Dist::Euclidean => self.euclidean_distance(node, neighbour),
                         Dist::Cosine => self.cosine_distance(node, neighbour),
                     });
+
                     if dist < current_dist {
                         current_node = neighbour;
                         current_dist = dist;
@@ -670,7 +710,7 @@ where
         for layer in (0..=node_level).rev() {
             state.reset(self.n);
 
-            let candidates = self.search_layer_construction(
+            self.search_layer_construction(
                 node,
                 layer,
                 current_node,
@@ -679,6 +719,7 @@ where
                 state,
             );
 
+            let candidates: Vec<(OrderedFloat<T>, usize)> = state.working_sorted.data().to_vec();
             let selected = self.select_neighbours_heuristic(node, &candidates, layer, state);
 
             // set this node's outgoing neighbours
@@ -792,7 +833,7 @@ where
         ef: usize,
         graph: &ConstructionGraph<T>,
         state: &mut SearchState<T>,
-    ) -> Vec<(OrderedFloat<T>, usize)> {
+    ) {
         state.working_sorted.clear();
         state.candidates.clear();
 
@@ -812,9 +853,11 @@ where
                 break;
             }
 
-            let neighbours = graph.get_neighbours(current_id, target_layer);
+            // SAFETY: benign race — stale/torn reads are acceptable during
+            // construction search, same rationale as Vamana.
+            let neighbours = unsafe { graph.get_neighbours_slice(current_id, target_layer) };
 
-            for &neighbour in &neighbours {
+            for &neighbour in neighbours {
                 if neighbour == u32::MAX {
                     continue;
                 }
@@ -845,8 +888,6 @@ where
                 }
             }
         }
-
-        state.working_sorted.data().to_vec()
     }
 
     /// Select neighbours using the heuristic from the HNSW paper (Algorithm 4)

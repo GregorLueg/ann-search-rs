@@ -69,17 +69,17 @@ fn main() {
     let n_trees_values = [5, 10, 15, 25, 50, 75, 100];
 
     for n_trees in n_trees_values {
-        println!("Building Annoy index ({} trees)...", n_trees);
+        println!("Building KdTree index ({} trees)...", n_trees);
         let start = Instant::now();
-        let annoy_idx = build_annoy_index(
+        let kd_idx = build_kd_tree_index(
             data.as_ref(),
-            cli.distance.as_str().into(),
+            cli.distance.clone(),
             n_trees,
             cli.seed as usize,
         );
         let build_time = start.elapsed().as_secs_f64() * 1000.0;
 
-        let index_size_mb = annoy_idx.memory_usage_bytes() as f64 / (1024.0 * 1024.0);
+        let index_size_mb = kd_idx.memory_usage_bytes() as f64 / (1024.0 * 1024.0);
 
         let search_budgets = [
             (None, "auto"),
@@ -89,11 +89,11 @@ fn main() {
 
         // Query benchmarks
         for (search_budget, budget_label) in search_budgets {
-            println!("Querying Annoy index (search_budget={})...", budget_label);
+            println!("Querying KdTree index (search_budget={})...", budget_label);
             let start = Instant::now();
-            let (approx_neighbors, approx_distances) = query_annoy_index(
+            let (approx_neighbors, approx_distances) = query_kd_tree_index(
                 query_data.as_ref(),
-                &annoy_idx,
+                &kd_idx,
                 cli.k,
                 search_budget,
                 true,
@@ -109,7 +109,7 @@ fn main() {
             );
 
             results.push(BenchmarkResultSize {
-                method: format!("Annoy-nt{}-s:{} (query)", n_trees, budget_label),
+                method: format!("KdTree-nt{}-s:{} (query)", n_trees, budget_label),
                 build_time_ms: build_time,
                 query_time_ms: query_time,
                 total_time_ms: build_time + query_time,
@@ -120,10 +120,10 @@ fn main() {
         }
 
         // Self-query benchmark
-        println!("Self-querying Annoy index...");
+        println!("Self-querying KdTree index...");
         let start = Instant::now();
         let (approx_neighbors_self, approx_distances_self) =
-            query_annoy_self(&annoy_idx, cli.k, None, true, false);
+            query_kd_tree_self(&kd_idx, cli.k, None, true, false);
         let self_query_time = start.elapsed().as_secs_f64() * 1000.0;
 
         let recall_self = calculate_recall(&true_neighbors_self, &approx_neighbors_self, cli.k);
@@ -134,7 +134,7 @@ fn main() {
         );
 
         results.push(BenchmarkResultSize {
-            method: format!("Annoy-nt{} (self)", n_trees),
+            method: format!("KdTree-nt{} (self)", n_trees),
             build_time_ms: build_time,
             query_time_ms: self_query_time,
             total_time_ms: build_time + self_query_time,

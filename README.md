@@ -4,8 +4,8 @@
 
 # ann-search-rs
 
-Various approximate nearest neighbour/vector searches implemented in Rust.
-Helper library to be used in other libraries.
+Various approximate nearest neighbour/vector searches implemented in Rust
+(with focus on computational biology methods).
 
 ## Table of Contents
 
@@ -28,7 +28,7 @@ generations are ubiqituos, thus, I want to expose the APIs to other packages.
 Feel free to use these implementations where you might need approximate nearest
 neighbour searches. This work is based on the great work from others who
 figured out how to design these algorithms and is just an implementation into
-Rust of some of these. Over time, I started getting interested into vector
+Rust of many of these. Over time, I started getting interested into vector
 searches and implement WAY more indices and new stuff into this than initially
 anticipated. If you want to see what changed, please check this
 [one out](https://github.com/GregorLueg/ann-search-rs/blob/main/docs/news.md)
@@ -38,12 +38,13 @@ anticipated. If you want to see what changed, please check this
 - **Multiple ANN algorithms**:
   - *Annoy (Approximate Nearest Neighbours Oh Yeah)*
   - *BallTree*
+  - *Exhaustive flat index*
   - *HNSW (Hierarchical Navigable Small World)*
+  - *IVF (Inverted File index)*
+  - *Kd forest (based on Kd trees)*
+  - *LSH (Locality Sensitive Hashing)*
   - *NNDescent (Nearest Neighbour Descent)*
   (heavily inspired by [PyNNDescent](https://github.com/lmcinnes/pynndescent)).
-  - *LSH (Locality Sensitive Hashing)*
-  - *IVF (Inverted File index)*
-  - *Exhaustive flat index*
   - *Vanama (the graph powering DiskANN)*
 
 - **Distance metrics**:
@@ -65,10 +66,11 @@ anticipated. If you want to see what changed, please check this
   - *IVF (Inverted File index) with GPU acceleration*
   - *CAGRA style index*
 
-- **Binarised indices** (optional feature):
+- **(Near) Binarised indices** (optional feature):
   - *Binary* (different types of binary quantisations for exhaustive and IVF
     indices.)
   - *RaBitQ* (RaBitQ quantisation for exhaustive and IVF indices.)
+  - *TurboQuant* (TurboQuant quantisation for exhaustive and IVF indices.)
 
 ## Installation
 
@@ -78,17 +80,6 @@ Add this to your `Cargo.toml`:
 [dependencies]
 ann-search-rs = "*" # always get the latest version
 ```
-
-To note, I have changed some of the interfaces between versions.
-
-## Roadmap
-
-- ~~First GPU support~~ (Implemented with version `0.2.1` of the crate).
-- ~~Binary indices~~ (Also implemented with version `0.2.1`).
-- ~~Proper SIMD~~ (Implemented with `0.2.2` via the [wide crate](https://docs.rs/wide/latest/wide/)).
-- Option to save indices on-disk and maybe do on-disk querying ... ? The binary
-  indices already use some aspects of on-disk storage.
-- More GPU support for other indices. TBD, needs to warrant the time investment.
 
 ## Example Usage
 
@@ -157,6 +148,22 @@ Simulates the manifold hypothesis where high-dimensional data actually lies on a
 lower-dimensional manifold. Adds minimal isotropic noise to model measurement
 error.
 
+**QuantisationStress**
+
+Combines power-law eigenvalue spectrum with norm-stratified clusters, randomly
+rotated out of axis alignment. Variance decays as 1/(i+1)^decay across principal
+components, so most information concentrates in a small subspace. Cluster pairs
+share directions but sit at very different radii (2, 8, 20), meaning points with
+near-identical angular signatures can have wildly different true distances. The
+random rotation ensures no coordinate axis is privileged. Specifically targets
+failure modes of aggressive quantisation: sign binarisation wastes bits on noise
+dimensions and cannot distinguish radially-separated clusters, axis-aligned
+product quantisation mixes informative and uninformative dimensions within
+sub-vectors, and low-bit methods generally lose angular resolution in the
+informative subspace. Use spectral_decay=1.5 for moderate concentration (~80% of
+variance in top 25% of principal components) or 2.0 for aggressive (~90% in top
+15%). Recommended with `dim=128` or `dim=256` and `n_clusters=50+`.
+
 ### Running the grid searches
 
 To identify good basic thresholds, there are a set of different gridsearch
@@ -167,10 +174,10 @@ scripts available. These can be run via
 cargo run --example gridsearch_annoy --release
 
 # Override specific parameters
-cargo run --example gridsearch_annoy --release -- --n-cells 500000 --dim 32 --distance euclidean
+cargo run --example gridsearch_annoy --release -- --n-samples 500000 --dim 32 --distance euclidean
 
 # Available parameters with their defaults:
-# --n-cells 150_000
+# --n-samples 150_000
 # --dim 32
 # --n-clusters 25
 # --k 15
@@ -179,63 +186,70 @@ cargo run --example gridsearch_annoy --release -- --n-cells 500000 --dim 32 --di
 # --data gaussian
 ```
 
-Every index is trained on 150k cells with 32 dimensions distance and 25 distinct
+Every index is trained on 150k samples with 32 dimensions distance and 25 distinct
 clusters (of different sizes each). Then the index is tested against a subset of
-10% of cells with a little Gaussian noise added and for full kNN self
+10% of samples with a little Gaussian noise added and for full kNN self
 generation. Below are the results shown for `Annoy` with the GaussianNoise
 data sets.
 
 ```
 ================================================================================================================================
-Benchmark: 150k cells, 32D
+Benchmark: 150k samples, 32D
 ================================================================================================================================
-Method                                               Build (ms)   Query (ms)   Total (ms)     Recall@k   Dist Error    Size (MB)
+Method                                               Build (ms)   Query (ms)   Total (ms)     Recall@k Rel dist err    Size (MB)
 --------------------------------------------------------------------------------------------------------------------------------
-Exhaustive (query)                                         3.03     1_649.50     1_652.53       1.0000     0.000000        18.31
-Exhaustive (self)                                          3.03    15_986.63    15_989.66       1.0000     0.000000        18.31
+Exhaustive (query)                                         3.28     1_602.87     1_606.15       1.0000       0.0000        18.31
+Exhaustive (self)                                          3.28    16_690.33    16_693.60       1.0000       0.0000        18.31
 --------------------------------------------------------------------------------------------------------------------------------
-Annoy-nt5-s:auto (query)                                  74.68        91.88       166.56       0.6834    40.648110        33.67
-Annoy-nt5-s:10x (query)                                   74.68        56.78       131.46       0.5240    40.565845        33.67
-Annoy-nt5-s:5x (query)                                    74.68        37.23       111.91       0.3732    40.431273        33.67
-Annoy-nt5 (self)                                          74.68       893.45       968.13       0.6838    40.084992        33.67
-Annoy-nt10-s:auto (query)                                101.73       171.40       273.13       0.8810    40.727710        49.03
-Annoy-nt10-s:10x (query)                                 101.73       106.78       208.51       0.7412    40.683223        49.03
-Annoy-nt10-s:5x (query)                                  101.73        66.31       168.04       0.5626    40.594216        49.03
-Annoy-nt10 (self)                                        101.73     1_693.22     1_794.95       0.8804    40.163717        49.03
-Annoy-nt15-s:auto (query)                                147.05       240.76       387.81       0.9524    40.748981        49.65
-Annoy-nt15-s:10x (query)                                 147.05       152.60       299.65       0.8546    40.723903        49.65
-Annoy-nt15-s:5x (query)                                  147.05        95.32       242.37       0.6907    40.662767        49.65
-Annoy-nt15 (self)                                        147.05     2_457.67     2_604.72       0.9516    40.184645        49.65
-Annoy-nt25-s:auto (query)                                235.88       359.11       594.99       0.9908    40.758739        80.37
-Annoy-nt25-s:10x (query)                                 235.88       227.98       463.86       0.9508    40.750722        80.37
-Annoy-nt25-s:5x (query)                                  235.88       145.74       381.62       0.8410    40.720771        80.37
-Annoy-nt25 (self)                                        235.88     3_557.84     3_793.72       0.9906    40.194411        80.37
-Annoy-nt50-s:auto (query)                                443.24       596.36     1_039.61       0.9997    40.760798       142.43
-Annoy-nt50-s:10x (query)                                 443.24       423.75       867.00       0.9957    40.760169       142.43
-Annoy-nt50-s:5x (query)                                  443.24       295.07       738.31       0.9644    40.754108       142.43
-Annoy-nt50 (self)                                        443.24     5_967.66     6_410.90       0.9997    40.196443       142.43
-Annoy-nt75-s:auto (query)                                659.26       875.79     1_535.05       1.0000    40.760868       177.49
-Annoy-nt75-s:10x (query)                                 659.26       627.17     1_286.43       0.9995    40.760801       177.49
-Annoy-nt75-s:5x (query)                                  659.26       432.90     1_092.15       0.9912    40.759442       177.49
-Annoy-nt75 (self)                                        659.26     8_815.59     9_474.84       1.0000    40.196503       177.49
-Annoy-nt100-s:auto (query)                               878.96     1_105.10     1_984.06       1.0000    40.760873       266.55
-Annoy-nt100-s:10x (query)                                878.96       797.44     1_676.40       0.9999    40.760864       266.55
-Annoy-nt100-s:5x (query)                                 878.96       564.09     1_443.04       0.9975    40.760539       266.55
-Annoy-nt100 (self)                                       878.96    11_044.74    11_923.70       1.0000    40.196506       266.55
+Annoy-nt5-s:auto (query)                                  81.01        65.71       146.72       0.7006       0.0302        34.82
+Annoy-nt5-s:10x (query)                                   81.01        39.97       120.98       0.5252       0.0617        34.82
+Annoy-nt5-s:5x (query)                                    81.01        25.88       106.89       0.3732       0.1068        34.82
+Annoy-nt5 (self)                                          81.01       349.56       430.57       0.7005       0.0325        34.82
+--------------------------------------------------------------------------------------------------------------------------------
+Annoy-nt10-s:auto (query)                                102.08       123.94       226.02       0.8910       0.0082        50.18
+Annoy-nt10-s:10x (query)                                 102.08        77.19       179.27       0.7415       0.0243        50.18
+Annoy-nt10-s:5x (query)                                  102.08        48.77       150.85       0.5626       0.0533        50.18
+Annoy-nt10 (self)                                        102.08       719.81       821.89       0.8902       0.0089        50.18
+--------------------------------------------------------------------------------------------------------------------------------
+Annoy-nt15-s:auto (query)                                159.61       181.20       340.81       0.9582       0.0027        50.79
+Annoy-nt15-s:10x (query)                                 159.61       115.06       274.67       0.8546       0.0114        50.79
+Annoy-nt15-s:5x (query)                                  159.61        73.07       232.68       0.6907       0.0311        50.79
+Annoy-nt15 (self)                                        159.61     1_084.09     1_243.71       0.9571       0.0029        50.79
+--------------------------------------------------------------------------------------------------------------------------------
+Annoy-nt25-s:auto (query)                                248.71       275.95       524.66       0.9928       0.0004        81.51
+Annoy-nt25-s:10x (query)                                 248.71       182.43       431.15       0.9508       0.0031        81.51
+Annoy-nt25-s:5x (query)                                  248.71       119.58       368.29       0.8410       0.0126        81.51
+Annoy-nt25 (self)                                        248.71     1_868.17     2_116.89       0.9925       0.0004        81.51
+--------------------------------------------------------------------------------------------------------------------------------
+Annoy-nt50-s:auto (query)                                462.06       507.49       969.55       0.9998       0.0000       143.57
+Annoy-nt50-s:10x (query)                                 462.06       343.51       805.57       0.9957       0.0002       143.57
+Annoy-nt50-s:5x (query)                                  462.06       232.82       694.88       0.9644       0.0021       143.57
+Annoy-nt50 (self)                                        462.06     3_747.19     4_209.25       0.9998       0.0000       143.57
+--------------------------------------------------------------------------------------------------------------------------------
+Annoy-nt75-s:auto (query)                                674.52       788.23     1_462.75       1.0000       0.0000       178.63
+Annoy-nt75-s:10x (query)                                 674.52       541.05     1_215.57       0.9995       0.0000       178.63
+Annoy-nt75-s:5x (query)                                  674.52       434.04     1_108.56       0.9912       0.0004       178.63
+Annoy-nt75 (self)                                        674.52     6_092.44     6_766.96       1.0000       0.0000       178.63
+--------------------------------------------------------------------------------------------------------------------------------
+Annoy-nt100-s:auto (query)                               889.04     1_041.54     1_930.58       1.0000       0.0000       267.69
+Annoy-nt100-s:10x (query)                                889.04       728.21     1_617.26       0.9999       0.0000       267.69
+Annoy-nt100-s:5x (query)                                 889.04       538.96     1_428.00       0.9975       0.0001       267.69
+Annoy-nt100 (self)                                       889.04     7_866.57     8_755.61       1.0000       0.0000       267.69
 --------------------------------------------------------------------------------------------------------------------------------
 ```
 
-Detailed benchmarks on all the standard benchmarks can be found
+Detailed benchmarks on all the "standard" indices can be found
 [here](https://github.com/GregorLueg/ann-search-rs/blob/main/docs/benchmarks_general.md).
-Every index was tested on every data set.
+Every index was tested on every data set with 32 dimensions (mimicking typical
+single cell scenarios) and against the lowrank data set with 128 dimensions.
 
 ## Quantised indices
 
 The crate also provides some quantised approximate nearest neighbour searches,
-designed for very large data sets where memory and time both start becoming
-incredibly constraining. There are a total of four different quantisation
-methods available (plus some binary quantisation, see further below). The crate
-does NOT provide re-ranking on the full vectors (yet).
+designed for very large data sets where memory (and query time) starts becoming
+constraining. There are a total of four different quantisation methods available
+(plus some binary quantisation, see further below). The crate does NOT provide
+re-ranking on the full vectors (yet) for these quantised indices.
 
 - *BF16*: An exhaustive search and IVF index are available with BF16
   quantisation. In this case the `f32` or `f64` are transformed during storage
@@ -244,14 +258,17 @@ does NOT provide re-ranking on the full vectors (yet).
 - *SQ8*: A scalar quantisation to `i8`. Exhaustive and IVF indices are provided.
   For each dimensions in the data, the min and max values are being computed and
   the respective data points are projected to integers between `-128` to `127`.
-  This enables fast integer math; however, this comes at cost of precision.
+  This enables fast integer math; however, this comes at cost of recall of the
+  real nearest neighbours.
 - *PQ*: Uses product quantisation. Useful when the dimensions of the vectors
   are incredibly large and one needs to compress the index in memory even
   further. Only useful when dim ≥ 128 in most cases and ideal for very large
-  dimensions. Only IVF is available with product quantisation.
+  dimensions. Exhaustive and IVF are available with product quantisation.
+  Exhaustive PQ is not recommend due to worse performance across the board
+  compared to IVF-PQ – the index was added for completeness.
 - *OPQ*: Uses optimised product quantisation. Tries to de-correlate the
   residuals and can in times improve the Recall. Please see the benchmarks.
-  Only IVF is available with optimised product quantisation.
+  Same indices available as for PQ.
 
 The benchmarks can be found
 [here](https://github.com/GregorLueg/ann-search-rs/blob/main/docs/benchmarks_quantised.md).
@@ -264,14 +281,14 @@ ann-search-rs = { version = "*", features = ["quantised"] }
 
 ## GPU
 
-Two indices are also implemented in GPU-accelerated versions. The exhaustive
-search and the IVF index. Under the hood, this uses
-[cubecl](https://github.com/tracel-ai/cubecl) with wgpu backend (system agnostic,
-for details please check [here](https://burn.dev/books/cubecl/getting-started/installation.html)).
-Let's first look at the indices compared against exhaustive (CPU). You can
-of course provide other backends.
-
-The benchmarks can be found [here](https://github.com/GregorLueg/ann-search-rs/blob/main/docs/benchmarks_gpu.md).
+Three indices are also implemented in GPU-accelerated versions. A
+GPU-accelerated exhaustive and IVF index. And a new addition with release
+`0.2.6` a [CAGRA-style index](https://arxiv.org/abs/2308.15136). Under the hood,
+this use [cubecl](https://github.com/tracel-ai/cubecl) with wgpu backend (which
+makes them largely agnostic to the type of hardware), for details please check
+[here](https://burn.dev/books/cubecl/getting-started/installation.html)). The
+benchmarks can be found
+[here](https://github.com/GregorLueg/ann-search-rs/blob/main/docs/benchmarks_gpu.md).
 To unlock GPU-acceleration, please use:
 
 ```toml
@@ -279,17 +296,13 @@ To unlock GPU-acceleration, please use:
 ann-search-rs = { version = "*", features = ["gpu"] }
 ```
 
-There is for sure room for improvement in terms of the design of the indices,
-but they do the job as is. Longer term, I will add smarter design(s) to avoid
-the CPU to GPU and back copying of data.
-
 ## Binarised indices
 
-For the extreme compression needs, binary indices are also provided. There
-are two approaches for binarisation
+For the most extreme compression needs, binary indices are also provided. There
+are two approaches for binarisation available in the crate:
 
-- Bitwise binarisation either leveraging a SimHash random projection approach
-  or ITQ via PCA.
+- Bitwise binarisation either leveraging a SimHash random projection, PCA
+  hashing or signed-based binarisation.
 - [RaBitQ](https://arxiv.org/abs/2405.12497) binarisation while storing
   additional data for approximate distance calculations.
 

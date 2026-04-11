@@ -13,8 +13,8 @@ fn main() {
 
     println!("-----------------------------");
     println!(
-        "Generating synthetic data: {} cells, {} dimensions, {} clusters, {} dist.",
-        cli.n_cells.separate_with_underscores(),
+        "Generating synthetic data: {} samples, {} dimensions, {} clusters, {} dist.",
+        cli.n_samples.separate_with_underscores(),
         cli.dim,
         cli.n_clusters,
         cli.distance
@@ -22,7 +22,7 @@ fn main() {
     println!("-----------------------------");
 
     let (data, _): (Mat<f32>, _) = generate_data(&cli);
-    let query_data = subsample_with_noise(&data, cli.n_cells / 10, cli.seed + 1);
+    let query_data = subsample_with_noise(&data, cli.n_samples / 10, cli.seed + 1);
     let mut results = Vec::new();
 
     let device: cubecl::wgpu::WgpuDevice = Default::default();
@@ -46,7 +46,7 @@ fn main() {
         query_time_ms: cpu_ex_query,
         total_time_ms: cpu_ex_build + cpu_ex_query,
         recall_at_k: 1.0,
-        mean_dist_err: 0.0,
+        rel_dist_err: 0.0,
         index_size_mb: cpu_ex_size,
     });
 
@@ -62,7 +62,7 @@ fn main() {
         query_time_ms: cpu_ex_self,
         total_time_ms: cpu_ex_build + cpu_ex_self,
         recall_at_k: 1.0,
-        mean_dist_err: 0.0,
+        rel_dist_err: 0.0,
         index_size_mb: cpu_ex_size,
     });
 
@@ -86,7 +86,7 @@ fn main() {
     let gpu_ex_query = start.elapsed().as_secs_f64() * 1000.0;
 
     let recall = calculate_recall(&true_neighbors, &gpu_ex_neighbors, cli.k);
-    let dist_err = calculate_dist_error(
+    let dist_err = calculate_relative_dist_error(
         true_distances.as_ref().unwrap(),
         gpu_ex_distances.as_ref().unwrap(),
         cli.k,
@@ -98,7 +98,7 @@ fn main() {
         query_time_ms: gpu_ex_query,
         total_time_ms: gpu_ex_build + gpu_ex_query,
         recall_at_k: recall,
-        mean_dist_err: dist_err,
+        rel_dist_err: dist_err,
         index_size_mb: gpu_ex_size,
     });
 
@@ -109,7 +109,7 @@ fn main() {
     let gpu_ex_self = start.elapsed().as_secs_f64() * 1000.0;
 
     let recall_self = calculate_recall(&true_neighbors_self, &gpu_ex_self_neighbors, cli.k);
-    let dist_err_self = calculate_dist_error(
+    let dist_err_self = calculate_relative_dist_error(
         true_distances_self.as_ref().unwrap(),
         gpu_ex_self_distances.as_ref().unwrap(),
         cli.k,
@@ -121,7 +121,7 @@ fn main() {
         query_time_ms: gpu_ex_self,
         total_time_ms: gpu_ex_build + gpu_ex_self,
         recall_at_k: recall_self,
-        mean_dist_err: dist_err_self,
+        rel_dist_err: dist_err_self,
         index_size_mb: gpu_ex_size,
     });
 
@@ -163,7 +163,7 @@ fn main() {
     let cagra_query = start.elapsed().as_secs_f64() * 1000.0;
 
     let recall = calculate_recall(&true_neighbors, &cagra_neighbors, cli.k);
-    let dist_err = calculate_dist_error(
+    let dist_err = calculate_relative_dist_error(
         true_distances.as_ref().unwrap(),
         cagra_distances.as_ref().unwrap(),
         cli.k,
@@ -175,7 +175,7 @@ fn main() {
         query_time_ms: cagra_query,
         total_time_ms: cagra_build + cagra_query,
         recall_at_k: recall,
-        mean_dist_err: dist_err,
+        rel_dist_err: dist_err,
         index_size_mb: cagra_size,
     });
 
@@ -186,7 +186,7 @@ fn main() {
     let cagra_self = start.elapsed().as_secs_f64() * 1000.0;
 
     let recall_self = calculate_recall(&true_neighbors_self, &cagra_self_neighbors, cli.k);
-    let dist_err_self = calculate_dist_error(
+    let dist_err_self = calculate_relative_dist_error(
         true_distances_self.as_ref().unwrap(),
         cagra_self_distances.as_ref().unwrap(),
         cli.k,
@@ -198,7 +198,7 @@ fn main() {
         query_time_ms: cagra_self,
         total_time_ms: cagra_build + cagra_self,
         recall_at_k: recall_self,
-        mean_dist_err: dist_err_self,
+        rel_dist_err: dist_err_self,
         index_size_mb: cagra_size,
     });
 
@@ -226,7 +226,7 @@ fn main() {
         let cagra_query = start.elapsed().as_secs_f64() * 1000.0;
 
         let recall = calculate_recall(&true_neighbors, &cagra_neighbors, cli.k);
-        let dist_err = calculate_dist_error(
+        let dist_err = calculate_relative_dist_error(
             true_distances.as_ref().unwrap(),
             cagra_distances.as_ref().unwrap(),
             cli.k,
@@ -238,7 +238,7 @@ fn main() {
             query_time_ms: cagra_query,
             total_time_ms: cagra_build + cagra_query,
             recall_at_k: recall,
-            mean_dist_err: dist_err,
+            rel_dist_err: dist_err,
             index_size_mb: cagra_size,
         });
 
@@ -252,7 +252,7 @@ fn main() {
         let cagra_self = start.elapsed().as_secs_f64() * 1000.0;
 
         let recall_self = calculate_recall(&true_neighbors_self, &cagra_self_neighbors, cli.k);
-        let dist_err_self = calculate_dist_error(
+        let dist_err_self = calculate_relative_dist_error(
             true_distances_self.as_ref().unwrap(),
             cagra_self_distances.as_ref().unwrap(),
             cli.k,
@@ -264,7 +264,7 @@ fn main() {
             query_time_ms: cagra_self,
             total_time_ms: cagra_build + cagra_self,
             recall_at_k: recall_self,
-            mean_dist_err: dist_err_self,
+            rel_dist_err: dist_err_self,
             index_size_mb: cagra_size,
         });
     }
@@ -273,8 +273,8 @@ fn main() {
 
     print_results_size(
         &format!(
-            "{}k cells, {}D (Exhaustive vs CAGRA beam search)",
-            cli.n_cells / 1000,
+            "{}k samples, {}D (Exhaustive vs CAGRA beam search)",
+            cli.n_samples / 1000,
             cli.dim
         ),
         &results,

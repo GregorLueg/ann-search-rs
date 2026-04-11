@@ -7,3 +7,5 @@ target
 
 # Apple
 .DS_Store
+
+*.tmp

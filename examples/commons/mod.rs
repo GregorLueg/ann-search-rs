@@ -13,16 +13,25 @@ use thousands::*;
 // Consts //
 ////////////
 
-pub const DEFAULT_N_CELLS: usize = 150_000;
-pub const DEFAULT_N_QUERY: usize = DEFAULT_N_CELLS / 10;
+/// Default number of samples
+pub const DEFAULT_N_SAMPLES: usize = 150_000;
+/// Default number for the querying
+pub const DEFAULT_N_QUERY: usize = DEFAULT_N_SAMPLES / 10;
+/// Default dimensionality -> typical for single cell
 pub const DEFAULT_DIM: usize = 32;
+/// Number of default clusters
 pub const DEFAULT_N_CLUSTERS: usize = 25;
+/// Default number of neighbours
 pub const DEFAULT_K: usize = 15;
+/// Default random seed
 pub const DEFAULT_SEED: u64 = 42;
+/// Default distance metric
 pub const DEFAULT_DISTANCE: &str = "euclidean";
+/// Correlation strength for
 pub const DEFAULT_COR_STRENGTH: f64 = 0.5;
 pub const DEFAULT_DATA: &str = "gaussian";
 pub const DEFAULT_INTRINSIC_DIM: usize = 16;
+pub const DEFAULT_SPECTRAL_DECAY: f64 = 1.5;
 
 ////////////
 // Parser //
@@ -32,7 +41,7 @@ pub const DEFAULT_INTRINSIC_DIM: usize = 16;
 ///
 /// ### Fields
 ///
-/// * `n_cells` - Number of cells/samples
+/// * `n_samples` - Number of samples/samples
 /// * `dim` - Number of dimensions to use
 /// * `n_clusters` - Number of clusters in the data
 /// * `k` - Number of neighbours to search
@@ -41,8 +50,8 @@ pub const DEFAULT_INTRINSIC_DIM: usize = 16;
 /// * `data` - The data to use. One of `"gaussian"` or `"correlated"`.
 #[derive(Parser, Clone)]
 pub struct Cli {
-    #[arg(long, default_value_t = DEFAULT_N_CELLS)]
-    pub n_cells: usize,
+    #[arg(long, default_value_t = DEFAULT_N_SAMPLES)]
+    pub n_samples: usize,
 
     #[arg(long, default_value_t = DEFAULT_DIM)]
     pub dim: usize,
@@ -64,6 +73,9 @@ pub struct Cli {
 
     #[arg(long, default_value_t = DEFAULT_INTRINSIC_DIM)]
     pub intrinsic_dim: usize,
+
+    #[arg(long, default_value_t = DEFAULT_SPECTRAL_DECAY)]
+    pub spectral_decay: f64,
 }
 
 //////////
@@ -76,6 +88,7 @@ pub enum SyntheticData {
     GaussianNoise,
     Correlated,
     LowRank,
+    QuantisationStress,
 }
 
 /// Helper function to parse the data type
@@ -92,6 +105,7 @@ pub fn parse_data(s: &str) -> Option<SyntheticData> {
         "gaussian" => Some(SyntheticData::GaussianNoise),
         "correlated" => Some(SyntheticData::Correlated),
         "lowrank" => Some(SyntheticData::LowRank),
+        "quantisation" | "quantization" => Some(SyntheticData::QuantisationStress),
         _ => None,
     }
 }
@@ -103,7 +117,7 @@ pub fn parse_data(s: &str) -> Option<SyntheticData> {
 ///
 /// ### Params
 ///
-/// * `n_samples` - Number of cells (samples)
+/// * `n_samples` - Number of samples (samples)
 /// * `dim` - Embedding dimensionality
 /// * `n_clusters` - Number of distinct clusters
 /// * `cluster_std` - Standard deviation within clusters
@@ -174,7 +188,7 @@ where
 ///
 /// ### Params
 ///
-/// * `n_samples` - Number of cells (samples)
+/// * `n_samples` - Number of samples (samples)
 /// * `dim` - Embedding dimensionality
 /// * `n_clusters` - Number of distinct clusters
 /// * `correlation_strength` - How strongly correlated dims depend on source
@@ -309,7 +323,7 @@ where
     (data, cluster_assignments)
 }
 
-/// Generate data specifically
+/// Generate manifold-based data
 ///
 /// Creates high-dimensional data that actually lives in a low-dimensional
 /// subspace with rotated cluster structure.
@@ -455,6 +469,165 @@ where
     (data_high_dim, cluster_assignments)
 }
 
+/// Random orthogonal matrix via Gram-Schmidt on Gaussian random matrix.
+///
+/// ### Params
+///
+/// * `dim` - Dimensions
+/// * `rng` - StdRng for the random sampling
+///
+/// ### Returns
+///
+/// Orthogonal matrix
+fn random_orthogonal_matrix<T>(dim: usize, rng: &mut StdRng) -> Mat<T>
+where
+    T: Float + FromPrimitive + ComplexField,
+{
+    let mut q = Mat::<T>::zeros(dim, dim);
+
+    for i in 0..dim {
+        for j in 0..dim {
+            let val: f64 = rng.sample(StandardNormal);
+            q[(i, j)] = T::from_f64(val).unwrap();
+        }
+    }
+
+    for col in 0..dim {
+        for prev in 0..col {
+            let mut dot = T::zero();
+            for row in 0..dim {
+                dot = dot + q[(row, col)] * q[(row, prev)];
+            }
+            for row in 0..dim {
+                q[(row, col)] = q[(row, col)] - dot * q[(row, prev)];
+            }
+        }
+        let mut norm_sq = T::zero();
+        for row in 0..dim {
+            norm_sq = norm_sq + q[(row, col)] * q[(row, col)];
+        }
+        let norm = norm_sq.sqrt();
+        if norm > T::epsilon() {
+            for row in 0..dim {
+                q[(row, col)] = q[(row, col)] / norm;
+            }
+        }
+    }
+
+    q
+}
+
+/// Generate combined quantisation stress test data
+///
+/// Creates high-dimensional data combining power-law eigenvalue spectrum with
+/// norm-stratified clusters, randomly rotated so the important subspace doesn't
+/// align with coordinate axes. Clusters are paired to share directions at
+/// different radii, stressing sign binarisation (norm-blind), axis-aligned PQ
+/// (mixes signal and noise partitions), and low-bit methods generally.
+///
+/// ### Params
+///
+/// * `n_samples` - Number of samples
+/// * `dim` - Embedding dimensionality (e.g., 128, 256)
+/// * `n_clusters` - Number of distinct clusters
+/// * `spectral_decay` - Exponent for power-law variance decay (1.5 = moderate,
+///   2.0 = aggressive)
+/// * `seed` - Random seed for reproducibility
+///
+/// ### Returns
+///
+/// Matrix of shape (n_samples, dim) and cluster assignments
+pub fn generate_quantisation_stress<T>(
+    n_samples: usize,
+    dim: usize,
+    n_clusters: usize,
+    spectral_decay: f64,
+    seed: u64,
+) -> (Mat<T>, Vec<usize>)
+where
+    T: Float + FromPrimitive + ComplexField,
+{
+    let mut rng = StdRng::seed_from_u64(seed);
+
+    // power-law eigenvalues: variance concentrated in first few dims
+    let eigenvalues: Vec<f64> = (0..dim)
+        .map(|i| 1.0 / ((i + 1) as f64).powf(spectral_decay))
+        .collect();
+
+    // generate unit directions, then assign radii to create norm stratification
+    // half the clusters share directions with a partner at a different radius
+    let n_directions = n_clusters.div_ceil(2);
+    let radii = [2.0, 8.0, 20.0];
+
+    let mut direction_vecs = Vec::with_capacity(n_directions);
+    for _ in 0..n_directions {
+        let raw: Vec<f64> = (0..dim)
+            .map(|_| rng.sample::<f64, _>(StandardNormal))
+            .collect();
+        let norm: f64 = raw.iter().map(|x| x * x).sum::<f64>().sqrt();
+        direction_vecs.push(raw.into_iter().map(|x| x / norm).collect::<Vec<f64>>());
+    }
+
+    // centres: direction * radius, scaled per-dim by eigenvalue
+    let mut centres = Vec::with_capacity(n_clusters);
+    for cidx in 0..n_clusters {
+        let dir = &direction_vecs[cidx % n_directions];
+        let radius = radii[cidx % radii.len()];
+        let centre: Vec<f64> = (0..dim)
+            .map(|d| dir[d] * radius * eigenvalues[d].sqrt())
+            .collect();
+        centres.push(centre);
+    }
+
+    // variable cluster sizes
+    let mut assignments = Vec::new();
+    for idx in 0..n_clusters {
+        let weight = rng.random_range(0.5..2.5);
+        let n = ((n_samples as f64 * weight) / (n_clusters as f64 * 1.25)) as usize;
+        assignments.extend(vec![idx; n]);
+    }
+    while assignments.len() < n_samples {
+        assignments.push(rng.random_range(0..n_clusters));
+    }
+    assignments.shuffle(&mut rng);
+    assignments.truncate(n_samples);
+
+    // samples with dimension-dependent variance, cluster std proportional to radius
+    let mut data = Mat::<T>::zeros(n_samples, dim);
+    for (i, &cidx) in assignments.iter().enumerate() {
+        let centre = &centres[cidx];
+        let radius: f64 = centre.iter().map(|x| x * x).sum::<f64>().sqrt().max(1.0);
+        let base_std = radius * 0.06;
+
+        for j in 0..dim {
+            let u1: f64 = rng.random();
+            let u2: f64 = rng.random();
+            let noise = (-2.0 * u1.ln()).sqrt() * (2.0 * std::f64::consts::PI * u2).cos();
+            let std = base_std * eigenvalues[j].sqrt();
+            data[(i, j)] = T::from_f64(centre[j] + noise * std).unwrap();
+        }
+    }
+
+    // random rotation so nothing is axis-aligned
+    let rotation = random_orthogonal_matrix::<T>(dim, &mut rng);
+    let mut rotated = Mat::<T>::zeros(n_samples, dim);
+    for i in 0..n_samples {
+        for j in 0..dim {
+            let mut sum = T::zero();
+            for k in 0..dim {
+                sum = sum + data[(i, k)] * rotation[(k, j)];
+            }
+            rotated[(i, j)] = sum;
+        }
+    }
+
+    (rotated, assignments)
+}
+
+////////////////////////////
+// Main dispatch function //
+////////////////////////////
+
 /// Wrapper function to generate the synthetic data to use
 ///
 /// ### Params
@@ -469,12 +642,12 @@ pub fn generate_data(cli: &Cli) -> (Mat<f32>, Vec<usize>) {
     let res: (Mat<f32>, Vec<usize>) = match data_type {
         SyntheticData::GaussianNoise => {
             println!(">>> Using simple Gaussian cluster data. <<<");
-            generate_clustered_data(cli.n_cells, cli.dim, cli.n_clusters, cli.seed)
+            generate_clustered_data(cli.n_samples, cli.dim, cli.n_clusters, cli.seed)
         }
         SyntheticData::Correlated => {
             println!(">>> Using data with subspace structure and correlated features. <<<");
             generate_clustered_data_high_dim(
-                cli.n_cells,
+                cli.n_samples,
                 cli.dim,
                 cli.n_clusters,
                 DEFAULT_COR_STRENGTH,
@@ -484,10 +657,20 @@ pub fn generate_data(cli: &Cli) -> (Mat<f32>, Vec<usize>) {
         SyntheticData::LowRank => {
             println!(">>> Using data that simulating manifold hypothesis. <<<");
             generate_low_rank_rotated_data(
-                cli.n_cells,
+                cli.n_samples,
                 cli.dim,
                 cli.intrinsic_dim,
                 cli.n_clusters,
+                cli.seed,
+            )
+        }
+        SyntheticData::QuantisationStress => {
+            println!(">>> Using quantisation stress test data. <<<");
+            generate_quantisation_stress(
+                cli.n_samples,
+                cli.dim,
+                cli.n_clusters,
+                cli.spectral_decay,
                 cli.seed,
             )
         }
@@ -543,44 +726,40 @@ where
 ////////////////
 
 /// BenchmarkResult
-///
-/// ### Fields
-///
-/// * `method` - Name of the method
-/// * `build_time_ms` - The build time of the index in ms
-/// * `query_time_ms` - The query time of the index in ms
-/// * `total_time_ms` - Total time the index build & query takes in ms
-/// * `recall_at_k` - Recall@k neighbours against ground truth
-/// * `mean_dist_err` - Mean distance error against ground truth
-/// * `index_size_mb` - Size of the index
 pub struct BenchmarkResultSize {
+    /// Name of the method
     pub method: String,
+    /// The build time of the index in ms
     pub build_time_ms: f64,
+    /// The query time of the index in ms
     pub query_time_ms: f64,
+    ///  Total time the index build & query takes in ms
     pub total_time_ms: f64,
+    /// Recall@k neighbours against ground truth. Overlap in top k neighbours
+    /// for given k
     pub recall_at_k: f64,
-    pub mean_dist_err: f64,
+    /// Relative distance error against ground truth
+    pub rel_dist_err: f64,
+    /// Size of the index
     pub index_size_mb: f64,
 }
 
 /// BenchmarkResultPurity - includes cluster purity metric
-///
-/// ### Fields
-///
-/// * `method` - Name of the method
-/// * `build_time_ms` - The build time of the index in ms
-/// * `query_time_ms` - The query time of the index in ms
-/// * `total_time_ms` - Total time the index build & query takes in ms
-/// * `recall_at_k` - Recall@k neighbours against ground truth
-/// * `cluster_purity` - Fraction of neighbors from same cluster
-/// * `index_size_mb` - Index size in MB
 pub struct BenchmarkResultPurity {
+    /// Name of the method
     pub method: String,
+    /// The build time of the index in ms
     pub build_time_ms: f64,
+    /// The query time of the index in ms
     pub query_time_ms: f64,
+    ///  Total time the index build & query takes in ms
     pub total_time_ms: f64,
+    /// Recall@k neighbours against ground truth. Overlap in top k neighbours
+    /// for given k
     pub recall_at_k: f64,
+    /// Fraction of neighbors from same cluster
     pub cluster_purity: f64,
+    /// Index size in MB
     pub index_size_mb: f64,
 }
 
@@ -588,17 +767,6 @@ pub struct BenchmarkResultPurity {
 // Helpers //
 /////////////
 
-/// Calculate Recall@k
-///
-/// ### Params
-///
-/// * `true_neighbors` - Slice of true neighbours
-/// * `approx_neighbors` - Slice of the approximate neighbours
-/// * `k` - Number of selected k
-///
-/// ### Returns
-///
-/// The Recall@k
 /// Calculate Recall@k
 ///
 /// ### Params
@@ -621,7 +789,6 @@ pub fn calculate_recall(
         let true_set: FxHashSet<_> = true_nn.iter().take(k).collect();
         let approx_set: FxHashSet<_> = approx_nn.iter().take(k).collect();
 
-        // This forces deduplication on the GPU results
         let matches = approx_set.intersection(&true_set).count();
 
         total_recall += matches as f64 / k as f64;
@@ -630,7 +797,7 @@ pub fn calculate_recall(
     total_recall / true_neighbors.len() as f64
 }
 
-/// Calculate mean distance error
+/// Calculate mean relative distance error
 ///
 /// ### Params
 ///
@@ -640,21 +807,30 @@ pub fn calculate_recall(
 ///
 /// ### Returns
 ///
-/// The mean distance error
-pub fn calculate_dist_error<T>(true_dist: &[Vec<T>], approx_dist: &[Vec<T>], k: usize) -> f64
+/// The mean relative distance error (0.0 = perfect, 0.05 = 5% average error).
+/// Pairs where the true distance is near zero (< 1e-12) are excluded to avoid
+/// division instability.
+pub fn calculate_relative_dist_error<T>(
+    true_dist: &[Vec<T>],
+    approx_dist: &[Vec<T>],
+    k: usize,
+) -> f64
 where
     T: Float + ToPrimitive,
 {
     let mut total_error = 0.0;
-
-    for (true_dist, approx_dist) in true_dist.iter().zip(approx_dist.iter()) {
-        for i in 0..k.min(true_dist.len()).min(approx_dist.len()) {
-            let error = (true_dist[i].to_f64().unwrap() - approx_dist[i].to_f64().unwrap()).abs();
-            total_error += error;
+    let mut count = 0usize;
+    for (td, ad) in true_dist.iter().zip(approx_dist.iter()) {
+        for i in 0..k.min(td.len()).min(ad.len()) {
+            let t = td[i].to_f64().unwrap();
+            let a = ad[i].to_f64().unwrap();
+            if t > 1e-12 {
+                total_error += (a - t).abs() / t;
+                count += 1;
+            }
         }
     }
-
-    total_error / (true_dist.len() * k) as f64
+    total_error / count as f64
 }
 
 /// Calculate cluster purity of kNN graph
@@ -710,18 +886,18 @@ pub fn print_results_size(config: &str, results: &[BenchmarkResultSize]) {
     println!("{:=>128}", "");
     println!(
         "{:<50} {:>12} {:>12} {:>12} {:>12} {:>12} {:>12}",
-        "Method", "Build (ms)", "Query (ms)", "Total (ms)", "Recall@k", "Dist Error", "Size (MB)"
+        "Method", "Build (ms)", "Query (ms)", "Total (ms)", "Recall@k", "Rel dist err", "Size (MB)"
     );
     println!("{:->128}", "");
     for result in results {
         println!(
-            "{:<50} {:>12} {:>12} {:>12} {:>12.4} {:>12.6} {:>12.2}",
+            "{:<50} {:>12} {:>12} {:>12} {:>12.4} {:>12.4} {:>12.2}",
             result.method,
             format_with_underscores(result.build_time_ms),
             format_with_underscores(result.query_time_ms),
             format_with_underscores(result.total_time_ms),
             result.recall_at_k,
-            result.mean_dist_err,
+            result.rel_dist_err,
             result.index_size_mb
         );
     }

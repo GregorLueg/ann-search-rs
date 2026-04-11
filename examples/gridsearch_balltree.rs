@@ -11,8 +11,8 @@ fn main() {
 
     println!("-----------------------------");
     println!(
-        "Generating synthetic data: {} cells, {} dimensions, {} clusters, {} dist.",
-        cli.n_cells.separate_with_underscores(),
+        "Generating synthetic data: {} samples, {} dimensions, {} clusters, {} dist.",
+        cli.n_samples.separate_with_underscores(),
         cli.dim,
         cli.n_clusters,
         cli.distance
@@ -43,7 +43,7 @@ fn main() {
         query_time_ms: query_time,
         total_time_ms: build_time + query_time,
         recall_at_k: 1.0,
-        mean_dist_err: 0.0,
+        rel_dist_err: 0.0,
         index_size_mb,
     });
 
@@ -60,19 +60,19 @@ fn main() {
         query_time_ms: self_query_time,
         total_time_ms: build_time + self_query_time,
         recall_at_k: 1.0,
-        mean_dist_err: 0.0,
+        rel_dist_err: 0.0,
         index_size_mb,
     });
 
     println!("-----------------------------");
 
     let search_budgets = [
-        ("1%", (0.01 * cli.n_cells as f32) as usize),
-        ("2%", (0.02 * cli.n_cells as f32) as usize),
-        ("5%", (0.05 * cli.n_cells as f32) as usize),
-        ("10%", (0.1 * cli.n_cells as f32) as usize),
-        ("15%", (0.15 * cli.n_cells as f32) as usize),
-        ("20%", (0.2 * cli.n_cells as f32) as usize),
+        ("1%", (0.01 * cli.n_samples as f32) as usize),
+        ("2%", (0.02 * cli.n_samples as f32) as usize),
+        ("5%", (0.05 * cli.n_samples as f32) as usize),
+        ("10%", (0.1 * cli.n_samples as f32) as usize),
+        ("15%", (0.15 * cli.n_samples as f32) as usize),
+        ("20%", (0.2 * cli.n_samples as f32) as usize),
     ];
 
     println!("Building BallTree index...");
@@ -99,7 +99,7 @@ fn main() {
         let query_time = start.elapsed().as_secs_f64() * 1000.0;
 
         let recall = calculate_recall(&true_neighbors, &approx_neighbours, cli.k);
-        let dist_error = calculate_dist_error(
+        let dist_error = calculate_relative_dist_error(
             true_distances.as_ref().unwrap(),
             approx_distances.as_ref().unwrap(),
             cli.k,
@@ -111,7 +111,7 @@ fn main() {
             query_time_ms: query_time,
             total_time_ms: build_time + query_time,
             recall_at_k: recall,
-            mean_dist_err: dist_error,
+            rel_dist_err: dist_error,
             index_size_mb,
         });
     }
@@ -123,7 +123,7 @@ fn main() {
     let self_query_time = start.elapsed().as_secs_f64() * 1000.0;
 
     let recall_self = calculate_recall(&true_neighbors_self, &approx_neighbours_self, cli.k);
-    let dist_error_self = calculate_dist_error(
+    let dist_error_self = calculate_relative_dist_error(
         true_distances_self.as_ref().unwrap(),
         approx_dist_self.as_ref().unwrap(),
         cli.k,
@@ -135,12 +135,12 @@ fn main() {
         query_time_ms: self_query_time,
         total_time_ms: build_time + self_query_time,
         recall_at_k: recall_self,
-        mean_dist_err: dist_error_self,
+        rel_dist_err: dist_error_self,
         index_size_mb,
     });
 
     print_results_size(
-        &format!("{}k cells, {}D", cli.n_cells / 1000, cli.dim),
+        &format!("{}k samples, {}D", cli.n_samples / 1000, cli.dim),
         &results,
     );
 }
