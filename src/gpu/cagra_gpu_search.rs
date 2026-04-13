@@ -342,16 +342,16 @@ fn probe_hash_table(
 ///
 /// ### Params
 ///
-/// * `vectors` - Database vectors [n_nodes, dim/LINE_SIZE] as Line<F>
-/// * `norms` - Pre-computed L2 norms [n_nodes] (ignored when `use_cosine` is
+/// * `vectors` - Database vectors `[n_nodes, dim/LINE_SIZE]` as `Line<F>`
+/// * `norms` - Pre-computed L2 norms `[n_nodes]` (ignored when `use_cosine` is
 ///   false)
-/// * `graph` - CAGRA navigational graph [n_nodes, k_graph] of neighbour IDs
-/// * `queries` - Query vectors [n_queries, dim/LINE_SIZE] as Line<F>
-/// * `entry_points` - Initial seed nodes [n_queries, n_entry]
-/// * `out_indices` - Output neighbour indices [n_queries, k_out]
-/// * `out_dists` - Output neighbour distances [n_queries, k_out]
+/// * `graph` - CAGRA navigational graph `[n_nodes, k_graph]` of neighbour IDs
+/// * `queries` - Query vectors `[n_queries, dim/LINE_SIZE]` as `Line<F>`
+/// * `entry_points` - Initial seed nodes `[n_queries, n_entry]`
+/// * `out_indices` - Output neighbour indices `[n_queries, k_out]`
+/// * `out_dists` - Output neighbour distances `[n_queries, k_out]`
 /// * `out_iters` - Number of beam iterations actually used per query
-///   [n_queries]
+///   `[n_queries]`
 /// * `n_nodes` - Total number of nodes in the graph
 /// * `k_out` - Number of neighbours to return per query
 /// * `k_graph` - Degree of the navigational graph (comptime)
@@ -732,7 +732,7 @@ pub fn cagra_beam_search<F: Float>(
 /// * `n_queries` - Number of queries
 /// * `dim` - Original (unpadded) query dimensionality
 /// * `vectors_gpu` - GPU-resident database vectors [n, dim_padded/LINE_SIZE]
-/// * `norms_gpu` - GPU-resident L2 norms [n] (Cosine) or a dummy scalar
+/// * `norms_gpu` - GPU-resident L2 norms `[n]` (Cosine) or a dummy scalar
 ///   (Euclidean)
 /// * `graph_gpu` - GPU-resident CAGRA navigational graph [n, k_graph]
 /// * `n` - Number of vectors in the database

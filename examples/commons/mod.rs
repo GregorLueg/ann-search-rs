@@ -29,8 +29,11 @@ pub const DEFAULT_SEED: u64 = 42;
 pub const DEFAULT_DISTANCE: &str = "euclidean";
 /// Correlation strength for
 pub const DEFAULT_COR_STRENGTH: f64 = 0.5;
+/// Default data type
 pub const DEFAULT_DATA: &str = "gaussian";
+/// Default intrinsic dimensions
 pub const DEFAULT_INTRINSIC_DIM: usize = 16;
+/// Default spectral decay
 pub const DEFAULT_SPECTRAL_DECAY: f64 = 1.5;
 
 ////////////
@@ -738,8 +741,8 @@ pub struct BenchmarkResultSize {
     /// Recall@k neighbours against ground truth. Overlap in top k neighbours
     /// for given k
     pub recall_at_k: f64,
-    /// Relative distance error against ground truth
-    pub rel_dist_err: f64,
+    /// Mean distance ratio
+    pub mean_dist_rat: f64,
     /// Size of the index
     pub index_size_mb: f64,
 }
@@ -797,20 +800,31 @@ pub fn calculate_recall(
     total_recall / true_neighbors.len() as f64
 }
 
-/// Calculate mean relative distance error
+/// Calculate mean distance ratio across queries
+///
+/// For each query, computes the ratio of the sum of approximate distances
+/// to the sum of true distances across the top-k neighbours. A ratio of
+/// 1.0 indicates perfect results; values above 1.0 indicate how much
+/// worse the approximate distances are on average (e.g. 1.05 means 5%
+/// worse than optimal).
+///
+/// This metric is stable across distance metrics and dimensionalities
+/// because summing over k neighbours avoids the division-by-near-zero
+/// instability that plagues per-pair relative error, particularly with
+/// cosine distance. Queries where the true distance sum is negligible
+/// (< 1e-12) are excluded.
 ///
 /// ### Params
 ///
-/// * `true_dist` - Slice of true distances to the neighbours
-/// * `approx_dist` - Slice of approximate distances to the neighbours
-/// * `k` - Number of selected k
+/// * `true_dist` - Slice of true distances to the neighbours (one vec per query)
+/// * `approx_dist` - Slice of approximate distances to the neighbours (one vec per query)
+/// * `k` - Number of neighbours to consider per query
 ///
 /// ### Returns
 ///
-/// The mean relative distance error (0.0 = perfect, 0.05 = 5% average error).
-/// Pairs where the true distance is near zero (< 1e-12) are excluded to avoid
-/// division instability.
-pub fn calculate_relative_dist_error<T>(
+/// The mean distance ratio (1.0 = perfect, >1.0 = proportionally worse).
+/// Returns `NaN` if no queries have a non-negligible true distance sum.
+pub fn calculate_mean_distance_ratio<T>(
     true_dist: &[Vec<T>],
     approx_dist: &[Vec<T>],
     k: usize,
@@ -818,19 +832,18 @@ pub fn calculate_relative_dist_error<T>(
 where
     T: Float + ToPrimitive,
 {
-    let mut total_error = 0.0;
+    let mut total_ratio = 0.0;
     let mut count = 0usize;
     for (td, ad) in true_dist.iter().zip(approx_dist.iter()) {
-        for i in 0..k.min(td.len()).min(ad.len()) {
-            let t = td[i].to_f64().unwrap();
-            let a = ad[i].to_f64().unwrap();
-            if t > 1e-12 {
-                total_error += (a - t).abs() / t;
-                count += 1;
-            }
+        let n = k.min(td.len()).min(ad.len());
+        let sum_true: f64 = td[..n].iter().map(|v| v.to_f64().unwrap()).sum();
+        let sum_approx: f64 = ad[..n].iter().map(|v| v.to_f64().unwrap()).sum();
+        if sum_true > 1e-12 {
+            total_ratio += sum_approx / sum_true;
+            count += 1;
         }
     }
-    total_error / count as f64
+    total_ratio / count as f64
 }
 
 /// Calculate cluster purity of kNN graph
@@ -881,27 +894,33 @@ fn format_with_underscores(value: f64) -> String {
 /// * `config` - Benchmark configuration
 /// * `results` - Benchmark results to print
 pub fn print_results_size(config: &str, results: &[BenchmarkResultSize]) {
-    println!("\n{:=>128}", "");
+    println!("\n{:=>131}", "");
     println!("Benchmark: {}", config);
-    println!("{:=>128}", "");
+    println!("{:=>131}", "");
     println!(
-        "{:<50} {:>12} {:>12} {:>12} {:>12} {:>12} {:>12}",
-        "Method", "Build (ms)", "Query (ms)", "Total (ms)", "Recall@k", "Rel dist err", "Size (MB)"
+        "{:<50} {:>12} {:>12} {:>12} {:>12} {:>15} {:>12}",
+        "Method",
+        "Build (ms)",
+        "Query (ms)",
+        "Total (ms)",
+        "Recall@k",
+        "Mean dist ratio",
+        "Size (MB)"
     );
     println!("{:->128}", "");
     for result in results {
         println!(
-            "{:<50} {:>12} {:>12} {:>12} {:>12.4} {:>12.4} {:>12.2}",
+            "{:<50} {:>12} {:>12} {:>12} {:>12.4} {:>15.4} {:>12.2}",
             result.method,
             format_with_underscores(result.build_time_ms),
             format_with_underscores(result.query_time_ms),
             format_with_underscores(result.total_time_ms),
             result.recall_at_k,
-            result.rel_dist_err,
+            result.mean_dist_rat,
             result.index_size_mb
         );
     }
-    println!("{:->128}\n", "");
+    println!("{:->131}\n", "");
 }
 
 /// Helper to print results to console

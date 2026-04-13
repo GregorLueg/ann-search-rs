@@ -239,7 +239,7 @@ Annoy-nt100 (self)                                       889.04     7_866.57    
 ```
 
 Detailed benchmarks on all the "standard" indices can be found
-[here](https://github.com/GregorLueg/ann-search-rs/blob/main/docs/benchmarks_general.md).
+[here](https://github.com/GregorLueg/ann-search-rs/blob/main/docs/benchmarks_standard.md).
 Every index was tested on every data set with 32 dimensions (mimicking typical
 single cell scenarios) and against the lowrank data set with 128 dimensions.
 

@@ -423,7 +423,7 @@ where
     ///
     /// ### Returns
     ///
-    /// Binary code as Vec<u8>
+    /// Binary code as `Vec<u8>`
     pub fn encode(&self, vec: &[T]) -> Vec<u8> {
         assert_eq!(vec.len(), self.dim);
 

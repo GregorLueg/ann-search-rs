@@ -13,7 +13,7 @@ use std::marker::PhantomData;
 pub struct GpuTensor<R: Runtime, F: CubeElement + Numeric> {
     /// Handle to the GPU buffer containing tensor data
     data: Handle,
-    /// Dimensions of the tensor (e.g., [n_rows, n_cols])
+    /// Dimensions of the tensor (e.g., `[n_rows, n_cols]`)
     shape: Vec<usize>,
     /// Memory strides for each dimension in row-major order
     strides: Vec<usize>,
@@ -86,7 +86,7 @@ impl<R: Runtime, F: Numeric + CubeElement> GpuTensor<R, F> {
     ///
     /// ### Params
     ///
-    /// * `line_size` - Vectorisation width (1 for scalar, 4 for Line<F>)
+    /// * `line_size` - Vectorisation width (1 for scalar, 4 for `Line<F>`)
     ///
     /// ### Returns
     ///

@@ -884,9 +884,10 @@ pub fn reduce_ivf_topk_coalesced<F: Float>(
 ///
 /// ### Params
 ///
-/// * `query_vectors` - Query vectors [n_queries, dim / LINE_SIZE] as Line<F>
-/// * `db_chunk` - Database vectors [n_db, dim / LINE_SIZE] as Line<F>
-/// * `distances` - Output matrix [n_queries, n_db] of squared distances
+/// * `query_vectors` - Query vectors `[n_queries, dim / LINE_SIZE]` as
+///   `Line<F>`
+/// * `db_chunk` - Database vectors `[n_db, dim / LINE_SIZE]` as `Line<F>`
+/// * `distances` - Output matrix `[n_queries, n_db]` of squared distances
 ///
 /// ### Grid mapping
 ///
@@ -926,11 +927,12 @@ pub fn euclidean_distances_gpu_chunk<F: Float>(
 ///
 /// ### Params
 ///
-/// * `query_vectors` - Query vectors [n_queries, dim / LINE_SIZE] as Line<F>
-/// * `db_chunk` - Database vectors [n_db, dim / LINE_SIZE] as Line<F>
-/// * `query_norms` - Pre-computed L2 norms [n_queries]
-/// * `db_norms` - Pre-computed L2 norms [n_db]
-/// * `distances` - Output matrix [n_queries, n_db] of cosine distances
+/// * `query_vectors` - Query vectors `[n_queries, dim / LINE_SIZE]` as
+///   `Line<F>`
+/// * `db_chunk` - Database vectors `[n_db, dim / LINE_SIZE]` as `Line<F>`
+/// * `query_norms` - Pre-computed L2 norms `[n_queries]`
+/// * `db_norms` - Pre-computed L2 norms `[n_db]`
+/// * `distances` - Output matrix `[n_queries, n_db]` of cosine distances
 ///
 /// ### Grid mapping
 ///
@@ -977,8 +979,10 @@ pub fn cosine_distances_gpu_chunk<F: Float>(
 ///
 /// ### Params
 ///
-/// * `query_vectors` - Query vectors `[n_queries, dim / LINE_SIZE]` as `Line<F>`
-/// * `db_vectors` - Full database vectors `[n_db, dim / LINE_SIZE]` as `Line<F>`
+/// * `query_vectors` - Query vectors `[n_queries, dim / LINE_SIZE]` as
+///   `Line<F>`
+/// * `db_vectors` - Full database vectors `[n_db, dim / LINE_SIZE]` as
+///   `Line<F>`
 /// * `active_indices` - Query indices active for this cluster `[n_active]`
 /// * `write_offsets` - Per-active-query write offset into the candidate buffer
 ///   `[n_active]`

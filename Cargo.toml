@@ -1,6 +1,6 @@
 [package]
 name = "ann-search-rs"
-version = "0.2.11"
+version = "0.2.12"
 edition = "2021"
 authors = ["Gregor Lueg <gregorlueg@me.com>"]
 license = "MIT"
@@ -55,7 +55,7 @@ thousands = "0.2.0"
 wide = "1.1.1"
 
 [package.metadata.docs.rs]
-all-features = true
+features = ["binary", "quantised", "mimalloc"]
 
 ################
 # Gridsearches #

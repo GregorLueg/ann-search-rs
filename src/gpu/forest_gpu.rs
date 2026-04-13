@@ -177,15 +177,15 @@ fn compute_max_leaf_size(dim_padded: usize) -> usize {
 ///
 /// ### Params
 ///
-/// * `vectors` - Row-major vector matrix, line-vectorised [n, dim/LINE_SIZE]
-/// * `norms` - Pre-computed L2 norms [n] (ignored when `use_cosine` is false)
+/// * `vectors` - Row-major vector matrix, line-vectorised `[n, dim/LINE_SIZE]`
+/// * `norms` - Pre-computed L2 norms `[n]` (ignored when `use_cosine` is false)
 /// * `leaf_points` - Flat array of global point IDs in leaf order
 /// * `leaf_offsets` - CSR-style offsets into `leaf_points`, length n_leaves + 1
 /// * `graph_dist` - Current kNN graph distances [n, k], used for threshold
 ///   filtering
-/// * `prop_idx` - Output proposal indices [n, max_proposals]
-/// * `prop_dist` - Output proposal distances [n, max_proposals]
-/// * `prop_count` - Atomic per-node proposal counter [n]
+/// * `prop_idx` - Output proposal indices `[n, max_proposals]`
+/// * `prop_dist` - Output proposal distances `[n, max_proposals]`
+/// * `prop_count` - Atomic per-node proposal counter `[n]`
 /// * `n` - Total number of points in the dataset
 /// * `n_leaves` - Number of leaves in the current batch
 /// * `max_proposals` - Proposal buffer capacity per node (comptime)
