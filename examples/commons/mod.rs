@@ -907,7 +907,7 @@ pub fn print_results_size(config: &str, results: &[BenchmarkResultSize]) {
         "Mean dist ratio",
         "Size (MB)"
     );
-    println!("{:->128}", "");
+    println!("{:->131}", "");
     for result in results {
         println!(
             "{:<50} {:>12} {:>12} {:>12} {:>12.4} {:>15.4} {:>12.2}",
