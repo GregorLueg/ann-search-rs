@@ -4364,7 +4364,7 @@ where
     ///
     /// ### Returns
     ///
-    /// Lookup table as flat Vec<T> of size M * n_centroids
+    /// Lookup table as flat `Vec<T>` of size `M * n_centroids`
     fn build_lookup_tables_residual(&self, query_vec: &[T], cluster_idx: usize) -> Vec<T> {
         let m = self.codebook_m();
         let subvec_dim = self.codebook_subvec_dim();
@@ -4384,7 +4384,7 @@ where
     ///
     /// ### Returns
     ///
-    /// Lookup table as flat Vec<T> of size M * n_centroids
+    /// Lookup table as flat `Vec<T>` of size M * n_centroids
     fn build_lookup_tables_direct(&self, query_vec: &[T]) -> Vec<T> {
         let m = self.codebook_m();
         let subvec_dim = self.codebook_subvec_dim();
@@ -4404,7 +4404,7 @@ where
     ///
     /// ### Returns
     ///
-    /// Lookup table as flat Vec<T> of size M * n_centroids
+    /// Lookup table as flat `Vec<T>` of size M * n_centroids
     fn build_lookup_tables_impl(
         &self,
         query_vec: &[T],

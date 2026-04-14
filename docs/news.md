@@ -1,5 +1,12 @@
 # News
 
+## 0.2.12
+
+**Features**
+
+- Documentation fixes
+- Better metrics in the benchmarks
+
 ## 0.2.11
 
 **Features**

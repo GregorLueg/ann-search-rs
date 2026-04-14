@@ -252,8 +252,8 @@ fn init_random_graph<F: Float>(
 ///
 /// ### Params
 ///
-/// * `prop_count` - Per-node proposal counter to reset [n]
-/// * `update_counter` - Global update accumulator to reset [1]
+/// * `prop_count` - Per-node proposal counter to reset `[n]`
+/// * `update_counter` - Global update accumulator to reset `[1]`
 /// * `n` - Number of nodes
 ///
 /// ### Grid mapping
