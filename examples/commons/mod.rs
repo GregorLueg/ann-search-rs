@@ -85,12 +85,17 @@ pub struct Cli {
 // Data //
 //////////
 
+/// Enum defining the synthetic data
 #[derive(Default)]
 pub enum SyntheticData {
+    /// Default Gaussian noise cluster
     #[default]
     GaussianNoise,
+    /// Correlated structure
     Correlated,
+    /// LowRank type of data
     LowRank,
+    /// Data type to stress quantisation methods
     QuantisationStress,
 }
 
@@ -123,7 +128,6 @@ pub fn parse_data(s: &str) -> Option<SyntheticData> {
 /// * `n_samples` - Number of samples (samples)
 /// * `dim` - Embedding dimensionality
 /// * `n_clusters` - Number of distinct clusters
-/// * `cluster_std` - Standard deviation within clusters
 /// * `seed` - Random seed for reproducibility
 ///
 /// ### Returns
