@@ -9,12 +9,6 @@ print. If you wish to run on the examples, you can do so via:
 cargo run --example gridsearch_sq8 --release --features quantised
 ```
 
-If you wish to run all of the benchmarks, below, you can just run:
-
-```bash
-bash examples/run_benchmarks.sh --quantised
-```
-
 Similar to the other benchmarks, index building, query against 10% slightly
 different data based on the trainings data and full kNN generation is being
 benchmarked. Index size in memory is also provided. Compared to other
