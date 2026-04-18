@@ -49,8 +49,8 @@ use bytemuck::Pod;
 use std::path::Path;
 
 use crate::cpu::{
-    annoy::*, ball_tree::*, exhaustive::*, hnsw::*, ivf::*, kd_forest::*, lsh::*, nndescent::*,
-    vamana::*,
+    annoy::*, ball_tree::*, exhaustive::*, hnsw::*, ivf::*, kd_forest::*, kmknn::*, lsh::*,
+    nndescent::*, vamana::*,
 };
 use crate::prelude::*;
 
@@ -260,6 +260,93 @@ where
 /// A tuple of `(knn_indices, optional distances)`
 pub fn query_exhaustive_self<T>(
     index: &ExhaustiveIndex<T>,
+    k: usize,
+    return_dist: bool,
+    verbose: bool,
+) -> (Vec<Vec<usize>>, Option<Vec<Vec<T>>>)
+where
+    T: AnnSearchFloat,
+{
+    index.generate_knn(k, return_dist, verbose)
+}
+
+///////////
+// kMkNN //
+///////////
+
+/// Build a kMkNN index
+///
+/// ### Params
+///
+/// * `mat` - The initial matrix with samples x features
+/// * `dist_metric` - Distance metric: "euclidean" or "cosine"
+/// * `nlist` - Optional number of clusters. Defaults to sqrt(n).
+/// * `max_iters` - Optional maximum k-means iterations (defaults to 30).
+/// * `seed` - Random seed for reproducibility
+/// * `verbose` - Print build progress
+///
+/// ### Returns
+///
+/// The initialised `KmknnIndex`
+pub fn build_kmknn_index<T>(
+    mat: MatRef<T>,
+    dist_metric: &str,
+    nlist: Option<usize>,
+    max_iters: Option<usize>,
+    seed: usize,
+    verbose: bool,
+) -> KmknnIndex<T>
+where
+    T: AnnSearchFloat,
+{
+    let metric = parse_ann_dist(dist_metric).unwrap_or_default();
+    KmknnIndex::build(mat, metric, nlist, max_iters, seed, verbose)
+}
+
+/// Helper function to query a given kMkNN index
+///
+/// ### Params
+///
+/// * `query_mat` - The query matrix containing the samples × features
+/// * `index` - The kMkNN index
+/// * `k` - Number of neighbours to return
+/// * `return_dist` - Shall the distances be returned
+/// * `verbose` - Controls verbosity of the function
+///
+/// ### Returns
+///
+/// A tuple of `(knn_indices, optional distances)`
+pub fn query_kmknn_index<T>(
+    query_mat: MatRef<T>,
+    index: &KmknnIndex<T>,
+    k: usize,
+    return_dist: bool,
+    verbose: bool,
+) -> (Vec<Vec<usize>>, Option<Vec<Vec<T>>>)
+where
+    T: AnnSearchFloat,
+{
+    query_parallel(query_mat.nrows(), return_dist, verbose, |i| {
+        index.query_row(query_mat.row(i), k)
+    })
+}
+
+/// Helper function to self query a kMkNN index
+///
+/// Generates a full kNN graph based on the internal data.
+///
+/// ### Params
+///
+/// * `index` - The kMkNN index
+/// * `k` - Number of neighbours to return
+/// * `return_dist` - Shall the distances be returned
+/// * `verbose` - Controls verbosity of the function
+///
+/// ### Returns
+///
+/// A tuple of `(knn_indices, optional distances)`
+pub fn query_kmknn_self<T>(
+    index: &KmknnIndex<T>,
     k: usize,
     return_dist: bool,
     verbose: bool,

@@ -35,6 +35,7 @@ your specific specifications.
 - [LSH](#lsh)
 - [IVF](#ivf)
 - [Kd forest](#kd-forest)
+- [KmKnn](#kmknn)
 - [NNDescent](#nndescent)
 - [Vamana](#vamana)
 
@@ -293,10 +294,8 @@ A forest of randomised Kd-trees for approximate nearest neighbour search. Each
 tree splits along coordinate axes selected randomly from the top highest-spread
 dimensions, providing diversity across trees. Split decisions are cheap (single
 coordinate comparison rather than a full dot product), which makes tree
-traversal fast and build times low. For Cosine distance, trees are built on
-normalised vectors so that axis-aligned splits approximate angular partitions.
-Kd-trees degrade in very high dimensions but remain competitive for approximate
-search up to ~100-200 dimensions when combined with a forest.
+traversal fast and build times low. Quality tends to be lower than Annoy however
+and you might need more trees for similar performance.
 
 **Key parameters:**
 
@@ -350,6 +349,77 @@ Self is queried with the default search budget.
 <summary><b>Kd forest - Euclidean (LowRank; more dimensions)</b>:</summary>
 <pre><code>
 <!-- BENCH:kd_forest:euclidean:lowrank:128 -->
+</code></pre>
+</details>
+
+### kMkNN
+
+k-means nearest neighbour index. Partitions the data into Voronoi cells via
+k-means and uses the triangle inequality to prune distance computations
+during search. Unlike IVF, kMkNN is an **exact** method; it returns the
+same neighbours as a brute-force scan, so recall is always 1.0.
+
+Works best in low-to-moderate dimensionality (roughly 20-100) where distances
+still have meaningful spread and cluster structure is informative. On
+high-dimensional isotropic data the pruning bounds become slack and performance
+collapses towards exhaustive search.
+
+For Cosine distance, vectors are L2-normalised at build time and the index
+operates internally in Euclidean space (squared Euclidean on the unit sphere is
+monotone in Cosine distance), which keeps the triangle inequality valid.
+
+**Key parameters:**
+
+- *Number of lists (nl)*: The number of k-means clusters to generate. As with
+  IVF, `sqrt(n)` is a reasonable default. Fewer clusters means larger cluster
+  radii and weaker pruning; more clusters tightens bounds but increases the
+  centroid-scan cost at query time.
+
+<details>
+<summary><b>kMkNN - Euclidean (Gaussian)</b>:</summary>
+</br>
+<pre><code>
+<!-- BENCH:kmknn:euclidean:gaussian:32 -->
+</code></pre>
+</details>
+
+---
+
+<details>
+<summary><b>kMkNN - Cosine (Gaussian)</b>:</summary>
+</br>
+<pre><code>
+<!-- BENCH:kmknn:cosine:gaussian:32 -->
+</code></pre>
+</details>
+
+---
+
+<details>
+<summary><b>kMkNN - Euclidean (Correlated)</b>:</summary>
+</br>
+<pre><code>
+<!-- BENCH:kmknn:euclidean:correlated:32 -->
+</code></pre>
+</details>
+
+---
+
+<details>
+<summary><b>kMkNN - Euclidean (LowRank)</b>:</summary>
+</br>
+<pre><code>
+<!-- BENCH:kmknn:euclidean:lowrank:32 -->
+</code></pre>
+</details>
+
+---
+
+<details>
+<summary><b>kMkNN - Euclidean (LowRank; more dimensions)</b>:</summary>
+</br>
+<pre><code>
+<!-- BENCH:kmknn:euclidean:lowrank:128 -->
 </code></pre>
 </details>
 

@@ -1,5 +1,11 @@
 # News
 
+## 0.2.13
+
+**Features**
+
+- Implemented KmKnn as an accelerated exhaustive search algorithm.
+
 ## 0.2.12
 
 **Features**
