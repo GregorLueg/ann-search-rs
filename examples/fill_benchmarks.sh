@@ -114,6 +114,13 @@ case "$KIND" in
             "kd_forest:euclidean:lowrank:32|cargo run --example gridsearch_kd_forest --release -- --distance euclidean --data lowrank"
             "kd_forest:euclidean:lowrank:128|cargo run --example gridsearch_kd_forest --release -- --distance euclidean --data lowrank --dim 128"
 
+            # kmknn
+            "kmknn:euclidean:gaussian:32|cargo run --example gridsearch_kmknn --release -- --distance euclidean"
+            "kmknn:cosine:gaussian:32|cargo run --example gridsearch_kmknn --release -- --distance cosine"
+            "kmknn:euclidean:correlated:32|cargo run --example gridsearch_kmknn --release -- --distance euclidean --data correlated"
+            "kmknn:euclidean:lowrank:32|cargo run --example gridsearch_kmknn --release -- --distance euclidean --data lowrank"
+            "kmknn:euclidean:lowrank:128|cargo run --example gridsearch_kmknn --release -- --distance euclidean --data lowrank --dim 128"
+
             # lsh
             "lsh:euclidean:gaussian:32|cargo run --example gridsearch_lsh --release -- --distance euclidean"
             "lsh:cosine:gaussian:32|cargo run --example gridsearch_lsh --release -- --distance cosine"

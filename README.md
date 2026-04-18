@@ -4,8 +4,8 @@
 
 # ann-search-rs
 
-Various approximate nearest neighbour/vector searches implemented in Rust
-(with focus on computational biology methods).
+Various approximate nearest neighbour/vector searches implemented in Rust (with
+focus on computational biology applications, very specifically single cell).
 
 ## Table of Contents
 
@@ -42,6 +42,7 @@ anticipated. If you want to see what changed, please check this
   - *HNSW (Hierarchical Navigable Small World)*
   - *IVF (Inverted File index)*
   - *Kd forest (based on Kd trees)*
+  - *KmKnn (k-means kNN)*
   - *LSH (Locality Sensitive Hashing)*
   - *NNDescent (Nearest Neighbour Descent)*
   (heavily inspired by [PyNNDescent](https://github.com/lmcinnes/pynndescent)).
@@ -238,7 +239,7 @@ Annoy-nt100 (self)                                       906.98     8_425.02    
 -----------------------------------------------------------------------------------------------------------------------------------
 ```
 
-Detailed benchmarks on all the "standard" indices can be found
+Detailed benchmarks on all the "standard" CPU-based indices can be found
 [here](https://github.com/GregorLueg/ann-search-rs/blob/main/docs/benchmarks_standard.md).
 Every index was tested on every data set with 32 dimensions (mimicking typical
 single cell scenarios) and against the lowrank data set with 128 dimensions.
