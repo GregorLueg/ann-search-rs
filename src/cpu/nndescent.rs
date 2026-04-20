@@ -87,13 +87,20 @@ impl<T: Copy> Neighbour<T> {
     const IS_NEW_MASK: u32 = 1 << 31;
     const PID_MASK: u32 = !Self::IS_NEW_MASK;
 
-    /// Create a new neighbour entry.
+    /// Create a new neighbour entry
+    ///
+    /// The point ID must fit in 31 bits; the 32nd bit is reserved for the
+    /// is-new flag. PIDs up to ~2 billion are supported.
     ///
     /// ### Params
     ///
     /// * `pid` - Point id (must fit in 31 bits)
     /// * `dist` - Distance to the neighbour
     /// * `is_new` - Whether this neighbour has been explored yet
+    ///
+    /// ### Returns
+    ///
+    /// Packed neighbour entry with encoded flag
     #[inline(always)]
     pub fn new(pid: usize, dist: T, is_new: bool) -> Self {
         debug_assert!(pid <= Self::PID_MASK as usize, "PID exceeds 31-bit limit");
@@ -104,25 +111,42 @@ impl<T: Copy> Neighbour<T> {
         }
     }
 
-    /// Whether this neighbour is new (not yet explored).
+    /// Whether this neighbour has not yet been explored
+    ///
+    /// New neighbours participate in local joins during the next iteration;
+    /// old ones only contribute to old-new pair generation.
+    ///
+    /// ### Returns
+    ///
+    /// `true` if the high bit is set, `false` otherwise
     #[inline(always)]
     pub fn is_new(&self) -> bool {
         (self.pid_and_flag & Self::IS_NEW_MASK) != 0
     }
 
-    /// Return the point id.
+    /// Return the point id with the flag bit masked out
+    ///
+    /// ### Returns
+    ///
+    /// Point index in the range `[0, 2^31)`
     #[inline(always)]
     pub fn pid(&self) -> usize {
         (self.pid_and_flag & Self::PID_MASK) as usize
     }
 
-    /// Whether this slot is a sentinel (empty).
+    /// Whether this slot is empty (holds the sentinel PID)
+    ///
+    /// ### Returns
+    ///
+    /// `true` if this slot does not hold a valid neighbour
     #[inline(always)]
     pub fn is_sentinel(&self) -> bool {
         self.pid() == SENTINEL_PID
     }
 
-    /// Mark this neighbour as old (already explored).
+    /// Mark this neighbour as old (already explored)
+    ///
+    /// Clears the high bit whilst preserving the point id and distance.
     #[inline(always)]
     pub fn mark_old(&mut self) {
         self.pid_and_flag &= Self::PID_MASK;
@@ -160,7 +184,22 @@ pub struct Update<T> {
 }
 
 impl<T> Update<T> {
-    /// Create a new update instance
+    /// Create a new update triple
+    ///
+    /// Represents a candidate edge from `source` to `target` with the pre-
+    /// computed distance. Both directions are typically emitted per candidate
+    /// pair so that radix sorting by target groups them for lock-free
+    /// application.
+    ///
+    /// ### Params
+    ///
+    /// * `target` - Node receiving the edge
+    /// * `source` - Node on the other end of the edge
+    /// * `dist` - Distance between the two nodes
+    ///
+    /// ### Returns
+    ///
+    /// Update triple ready for radix sorting
     pub fn new(target: usize, source: usize, dist: T) -> Self {
         Self {
             target,
@@ -401,7 +440,7 @@ where
         let start = Instant::now();
         let forest = AnnoyIndex::new(data, n_trees, metric, seed);
         if verbose {
-            println!("Built Kd forest: {:.2?}", start.elapsed());
+            println!("Built Annoy: {:.2?}", start.elapsed());
         }
 
         let builder = NNDescent {
@@ -445,9 +484,20 @@ where
         self.converged
     }
 
-    /// Compute chunk size for memory-bounded update processing.
+    /// Compute chunk size for memory-bounded update processing
     ///
-    /// Targets roughly 200 MB of update storage per chunk.
+    /// Targets roughly 200 MB of update storage per chunk based on the size
+    /// of an `Update<T>` and the expected number of updates per source node.
+    /// Clamped to at least 10k nodes (or the full dataset if smaller) and at
+    /// most the total number of nodes.
+    ///
+    /// ### Params
+    ///
+    /// * `max_candidates` - Maximum candidates sampled per node per iteration
+    ///
+    /// ### Returns
+    ///
+    /// Number of source nodes to process per chunk
     fn compute_chunk_size(&self, max_candidates: usize) -> usize {
         const TARGET_BYTES: usize = 200 * 1024 * 1024;
         const BYTES_PER_UPDATE: usize = 24;
@@ -460,11 +510,20 @@ where
         chunk_size.clamp(min_chunk, self.n)
     }
 
-    /// Initialise the flat k-NN graph using the Annoy index.
+    /// Initialise the flat k-NN graph using the Annoy forest
     ///
-    /// Returns a contiguous `Vec<Neighbour<T>>` of size `n * k`. Each
-    /// node's block is filled with Annoy results (marked new) and padded
-    /// with sentinels.
+    /// Each node queries Annoy for `k+1` candidates, skips the self-match,
+    /// and takes the next `k`. Results are marked new so they participate
+    /// in the first iteration's local joins. Unused trailing slots are
+    /// padded with sentinels.
+    ///
+    /// ### Params
+    ///
+    /// * `k` - Neighbours per node
+    ///
+    /// ### Returns
+    ///
+    /// Flat graph of size `n * k` with Annoy-seeded initial neighbours
     fn init_with_forest(&self, k: usize) -> Vec<Neighbour<T>> {
         let sentinel = Neighbour::new(SENTINEL_PID, T::max_value(), false);
         let mut graph = vec![sentinel; self.n * k];
@@ -488,12 +547,25 @@ where
         graph
     }
 
-    /// Run the main NN-Descent algorithm with chunked updates.
+    /// Run the main NN-Descent algorithm with chunked updates
+    ///
+    /// Alternates between building candidate lists (new and old, forward and
+    /// reverse) and applying pairwise distance updates back into the graph.
+    /// Processes candidates in chunks to bound peak memory. Terminates early
+    /// when the fraction of edge updates drops below `delta`.
+    ///
+    /// ### Params
+    ///
+    /// * `k` - Neighbours per node
+    /// * `max_iter` - Maximum iterations before giving up
+    /// * `delta` - Convergence threshold (fraction of edges updated)
+    /// * `max_candidates` - Max candidates sampled per node per iteration
+    /// * `seed` - Random seed for per-iteration sampling
+    /// * `verbose` - Print progress information
     ///
     /// ### Returns
     ///
-    /// `(flat_graph, converged)` where `flat_graph` is `Vec<(usize, T)>`
-    /// of size `n * k`.
+    /// Tuple of (flat graph as `(pid, dist)` pairs, converged flag)
     fn generate_index(
         &self,
         k: usize,
@@ -728,7 +800,17 @@ where
             });
     }
 
-    /// Mark neighbours as old if they appear in the new candidate lists.
+    /// Mark neighbours as old if they were sampled into the new-candidate list
+    ///
+    /// After sampling, any neighbour that survived into `new_cands[i]` will
+    /// have been "explored" during this iteration's local joins, so flip its
+    /// flag so subsequent iterations treat it as old.
+    ///
+    /// ### Params
+    ///
+    /// * `graph` - Current flat k-NN graph (mutated in place)
+    /// * `k` - Neighbours per node
+    /// * `new_cands` - Sorted new-candidate lists per node
     fn mark_as_old(&self, graph: &mut [Neighbour<T>], k: usize, new_cands: &[Vec<usize>]) {
         for i in 0..self.n {
             if new_cands[i].is_empty() {
@@ -834,7 +916,7 @@ where
             })
     }
 
-    /// Calculate distance between two indexed points.
+    /// Calculate distance between two indexed points under the index metric
     ///
     /// ### Params
     ///
@@ -843,7 +925,7 @@ where
     ///
     /// ### Returns
     ///
-    /// Distance under the index metric
+    /// Distance value under `self.metric`
     #[inline]
     fn distance(&self, i: usize, j: usize) -> T {
         match self.metric {
@@ -852,10 +934,23 @@ where
         }
     }
 
-    /// Diversify graph by pruning redundant edges.
+    /// Diversify the graph by probabilistically pruning redundant edges
     ///
-    /// Operates on the flat `(usize, T)` graph. Pruned nodes have their
-    /// remaining slots padded with sentinels.
+    /// Walks each node's neighbour list in distance order, keeping the closest
+    /// and discarding candidates that are closer to an already-kept neighbour
+    /// than to the query node (with probability `prune_prob`). Operates on the
+    /// final `(pid, dist)` graph. Pruned slots are padded with sentinels.
+    ///
+    /// ### Params
+    ///
+    /// * `graph` - Input flat graph
+    /// * `k` - Neighbours per node
+    /// * `prune_prob` - Probability of pruning a redundant edge
+    /// * `seed` - Random seed for per-node pruning decisions
+    ///
+    /// ### Returns
+    ///
+    /// New graph with redundant edges replaced by sentinels
     fn diversify_graph(
         &self,
         graph: &[(usize, T)],
@@ -918,7 +1013,15 @@ where
     // Query //
     ///////////
 
-    /// Return the neighbours slice for node `idx` from the query graph.
+    /// Return the neighbours slice for node `idx` from the query graph
+    ///
+    /// ### Params
+    ///
+    /// * `idx` - Node index
+    ///
+    /// ### Returns
+    ///
+    /// Slice of `k` `(pid, distance)` pairs, possibly containing sentinels
     #[inline]
     fn graph_neighbours(&self, idx: usize) -> &[(usize, T)] {
         &self.graph[idx * self.k..(idx + 1) * self.k]
@@ -1038,9 +1141,19 @@ where
     }
 }
 
-/// Find boundaries between different target nodes in sorted updates.
+/// Find boundaries between different target nodes in sorted updates
 ///
-/// Returns indices where the target changes, including 0 and `updates.len()`.
+/// Given a slice sorted by `target`, returns the indices where the target
+/// changes, bracketed by 0 and `updates.len()`. The resulting `windows(2)`
+/// gives per-target slice ranges suitable for lock-free parallel application.
+///
+/// ### Params
+///
+/// * `updates` - Updates sorted by target
+///
+/// ### Returns
+///
+/// Vector of boundary indices of length `num_distinct_targets + 1`
 fn find_target_boundaries<T>(updates: &[Update<T>]) -> Vec<usize> {
     if updates.is_empty() {
         return vec![0, 0];

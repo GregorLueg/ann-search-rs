@@ -127,7 +127,7 @@ where
     /// * `nlist` - Optional number of clusters. Defaults to `sqrt(n)`.
     /// * `m` - Number of subspaces for PQ (dim must be divisible by m)
     /// * `metric` - Distance metric (Euclidean or Cosine)
-    /// * `max_iters` - Optional maximum k-means iterations (defaults to `30`).
+    /// * `max_iters` - Optional maximum k-means iterations (defaults to `50`).
     /// * `n_pq_centroids` - Number of centroids to use for the product
     ///   quantisation. If not provided, it uses the default `256`.
     /// * `seed` - Random seed
@@ -149,7 +149,7 @@ where
     ) -> Self {
         let (mut vectors_flat, n, dim) = matrix_to_flat(data);
 
-        let max_iters = max_iters.unwrap_or(30);
+        let max_iters = max_iters.unwrap_or(50);
         let nlist = nlist.unwrap_or((n as f32).sqrt() as usize).max(1);
 
         // normalise for cosine distance

@@ -1754,14 +1754,14 @@ pub fn print_cluster_summary(assignments: &[usize], nlist: usize) {
     let p75 = counts[3 * nlist / 4];
     let mean = n / nlist;
 
-    println!("Cluster size distribution:");
-    println!("  Min:    {}", min);
-    println!("  P25:    {}", p25);
-    println!("  Median: {}", p50);
-    println!("  P75:    {}", p75);
-    println!("  Max:    {}", max);
-    println!("  Mean:   {}", mean);
-    println!("  Imbalance ratio: {:.2}", max as f64 / mean as f64);
+    println!("   Cluster size distribution (diagnostics):");
+    println!("    Min:    {}", min);
+    println!("    P25:    {}", p25);
+    println!("    Median: {}", p50);
+    println!("    P75:    {}", p75);
+    println!("    Max:    {}", max);
+    println!("    Mean:   {}", mean);
+    println!("    Imbalance ratio: {:.2}", max as f64 / mean as f64);
 }
 
 ///////////

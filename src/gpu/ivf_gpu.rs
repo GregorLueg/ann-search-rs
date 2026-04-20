@@ -83,8 +83,8 @@ where
     ///
     /// * `data` - Database vectors [n, dim]
     /// * `metric` - Distance metric
-    /// * `nlist` - Number of clusters (defaults to √n)
-    /// * `max_iters` - K-means iterations (defaults to 30)
+    /// * `nlist` - Number of clusters (defaults to `sqrt(n)`)
+    /// * `max_iters` - Optional k-means iterations (defaults to `50`)
     /// * `seed` - Random seed
     /// * `verbose` - Print progress
     /// * `device` - GPU device
@@ -103,7 +103,7 @@ where
     ) -> Self {
         let (vectors_flat, n, dim) = matrix_to_flat(data);
 
-        let max_iters = max_iters.unwrap_or(30);
+        let max_iters = max_iters.unwrap_or(50);
         let nlist = nlist.unwrap_or((n as f32).sqrt() as usize).max(1);
 
         let line = LINE_SIZE as usize;

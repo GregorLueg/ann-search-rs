@@ -11,6 +11,7 @@ use thousands::*;
 
 use crate::prelude::*;
 use crate::utils::graph_utils::*;
+use crate::utils::parallelism::*;
 use crate::utils::*;
 
 /////////////
@@ -33,8 +34,9 @@ struct ConstructionGraph<T> {
     /// Sentinels (u32::MAX) mark unused slots; valid IDs are packed at the
     /// front of each layer block.
     nodes: Vec<UnsafeCell<Vec<u32>>>,
-    /// Lock bitset for thread-safe writes
-    locks: AtomicNodeLocks,
+    /// Striped spin-locks for thread-safe writes. Stripe count is independent
+    /// of graph size, so memory overhead stays constant as the index grows.
+    locks: StripedLocks,
     /// Maximum layer each node appears in
     node_levels: Vec<u8>,
     /// Base connectivity parameter
@@ -62,11 +64,13 @@ where
     /// * `n` - Number of nodes
     /// * `layer_assignments` - Maximum layer for each node
     /// * `m` - Base connectivity parameter
+    /// * `threads` - Expected number of concurrent writers, used to size the
+    ///   striped lock array
     ///
     /// ### Returns
     ///
     /// Initialised construction graph with sentinel-filled neighbour slots
-    fn new(n: usize, layer_assignments: &[u8], m: usize) -> Self {
+    fn new(n: usize, layer_assignments: &[u8], m: usize, threads: usize) -> Self {
         let nodes = (0..n)
             .map(|i| {
                 let level = layer_assignments[i] as usize;
@@ -77,7 +81,7 @@ where
 
         Self {
             nodes,
-            locks: AtomicNodeLocks::new(n),
+            locks: StripedLocks::new(threads, m),
             node_levels: layer_assignments.to_vec(),
             m,
             _phantom: PhantomData,
@@ -214,11 +218,17 @@ where
 
     /// Add a single neighbour with pruning if the layer is full
     ///
-    /// Acquires the node lock, then either appends to the first sentinel
-    /// slot (if space remains) or applies the heuristic pruning strategy to
-    /// select the best `max_neighbours` from the existing set plus the new
-    /// candidate. Writes are always in-place overwrites, ensuring concurrent
-    /// readers never see an empty list.
+    /// Uses a short-critical-section pattern: snapshot the current neighbour
+    /// list under lock, release the lock whilst computing distances and
+    /// applying heuristic pruning in thread-local scratch, then reacquire the
+    /// lock only to write the result.
+    ///
+    /// If another thread modified the neighbour list between snapshot and
+    /// write (detected by degree comparison), the full path is retried once
+    /// under a held lock to guarantee progress.
+    ///
+    /// Writes are always in-place overwrites of the fixed-size slot range,
+    /// so concurrent readers never see an empty list.
     ///
     /// No-op if the node does not exist at the requested layer, or if the
     /// neighbour is already present.
@@ -243,26 +253,146 @@ where
             return;
         }
 
-        let _guard = self.locks.lock_guard(node_id);
         let max_n = self.max_neighbours(layer);
-        let flat = unsafe { &mut *self.nodes[node_id].get() };
         let offset = self.layer_offset(layer);
-        let slot = &mut flat[offset..offset + max_n];
 
-        // Degree is the index of the first sentinel
-        let degree = slot.iter().position(|&e| e == u32::MAX).unwrap_or(max_n);
+        // Fast path: snapshot under lock, compute outside, write under lock
+        let snapshot: Vec<u32> = {
+            let _guard = self.locks.lock_guard(node_id);
+            let flat = unsafe { &*self.nodes[node_id].get() };
+            flat[offset..offset + max_n].to_vec()
+        };
 
-        if slot[..degree].iter().any(|&n| n as usize == new_neighbour) {
+        let degree = snapshot
+            .iter()
+            .position(|&e| e == u32::MAX)
+            .unwrap_or(max_n);
+
+        if snapshot[..degree]
+            .iter()
+            .any(|&n| n as usize == new_neighbour)
+        {
             return;
         }
 
+        // Room available: try to append directly
         if degree < max_n {
-            slot[degree] = new_neighbour as u32;
+            let _guard = self.locks.lock_guard(node_id);
+            let flat = unsafe { &mut *self.nodes[node_id].get() };
+            let slot = &mut flat[offset..offset + max_n];
+            let current_degree = slot.iter().position(|&e| e == u32::MAX).unwrap_or(max_n);
+            // Re-check presence in case another thread added it meanwhile
+            if slot[..current_degree]
+                .iter()
+                .any(|&n| n as usize == new_neighbour)
+            {
+                return;
+            }
+            if current_degree < max_n {
+                slot[current_degree] = new_neighbour as u32;
+                return;
+            }
+            // List filled up between snapshot and write; fall through to
+            // the pruning path below, still under lock.
+            self.prune_and_write(slot, max_n, new_neighbour, node_id, &distance_fn);
             return;
         }
 
-        // Full: collect all candidates with distances, then prune
-        let mut candidates: Vec<(OrderedFloat<T>, usize)> = slot[..degree]
+        // Full list: compute pruning outside the lock
+        let selected =
+            self.compute_pruned(&snapshot[..degree], new_neighbour, node_id, &distance_fn);
+
+        // Reacquire to write, validate snapshot is still current
+        let _guard = self.locks.lock_guard(node_id);
+        let flat = unsafe { &mut *self.nodes[node_id].get() };
+        let slot = &mut flat[offset..offset + max_n];
+        let current_degree = slot.iter().position(|&e| e == u32::MAX).unwrap_or(max_n);
+
+        if current_degree == degree && slot[..degree] == snapshot[..degree] {
+            // Snapshot still valid: commit the pre-computed result
+            for i in 0..max_n {
+                slot[i] = if i < selected.len() {
+                    selected[i] as u32
+                } else {
+                    u32::MAX
+                };
+            }
+        } else {
+            // Snapshot stale: redo pruning under the held lock
+            if slot[..current_degree]
+                .iter()
+                .any(|&n| n as usize == new_neighbour)
+            {
+                return;
+            }
+            self.prune_and_write(slot, max_n, new_neighbour, node_id, &distance_fn);
+        }
+    }
+
+    /// Apply heuristic pruning and overwrite a neighbour slot in place
+    ///
+    /// Used both by the slow path of `add_neighbour_with_pruning` and by the
+    /// fall-back path when a snapshot is invalidated by a concurrent writer.
+    /// Must be called with the caller holding the node lock.
+    ///
+    /// ### Params
+    ///
+    /// * `slot` - Mutable neighbour slot range for the target layer
+    /// * `max_n` - Capacity of the slot range
+    /// * `new_neighbour` - Neighbour being considered for inclusion
+    /// * `node_id` - Node whose neighbours are being pruned
+    /// * `distance_fn` - Function to compute distances between nodes
+    fn prune_and_write<F>(
+        &self,
+        slot: &mut [u32],
+        max_n: usize,
+        new_neighbour: usize,
+        node_id: usize,
+        distance_fn: &F,
+    ) where
+        F: Fn(usize, usize) -> T,
+    {
+        let degree = slot.iter().position(|&e| e == u32::MAX).unwrap_or(max_n);
+        let selected = self.compute_pruned(&slot[..degree], new_neighbour, node_id, distance_fn);
+        for i in 0..max_n {
+            slot[i] = if i < selected.len() {
+                selected[i] as u32
+            } else {
+                u32::MAX
+            };
+        }
+    }
+
+    /// Compute the heuristically pruned neighbour set outside of any lock
+    ///
+    /// Collects the current neighbours plus the new candidate, sorts by
+    /// distance to `node_id`, then applies the HNSW diversity heuristic: a
+    /// candidate is included only if no already-selected neighbour is closer
+    /// to it than the query node is. Caller is responsible for persisting the
+    /// result to the neighbour slot.
+    ///
+    /// ### Params
+    ///
+    /// * `existing` - Current neighbour IDs (excluding sentinels)
+    /// * `new_neighbour` - Candidate neighbour to consider
+    /// * `node_id` - Node whose neighbourhood is being pruned
+    /// * `distance_fn` - Function to compute distances between nodes
+    ///
+    /// ### Returns
+    ///
+    /// Pruned neighbour list of length at most `max_neighbours(layer)`
+    fn compute_pruned<F>(
+        &self,
+        existing: &[u32],
+        new_neighbour: usize,
+        node_id: usize,
+        distance_fn: &F,
+    ) -> Vec<usize>
+    where
+        F: Fn(usize, usize) -> T,
+    {
+        let max_n = existing.len() + 1;
+        let mut candidates: Vec<(OrderedFloat<T>, usize)> = existing
             .iter()
             .map(|&n| {
                 let n = n as usize;
@@ -278,7 +408,7 @@ where
 
         let mut selected = Vec::with_capacity(max_n);
         for &(dist, cand_id) in &candidates {
-            if selected.len() >= max_n {
+            if selected.len() >= existing.len() {
                 break;
             }
             let dominated = selected.iter().any(|&sel_id| {
@@ -289,15 +419,7 @@ where
                 selected.push(cand_id);
             }
         }
-
-        // In-place overwrite with sentinel padding
-        for i in 0..max_n {
-            slot[i] = if i < selected.len() {
-                selected[i] as u32
-            } else {
-                u32::MAX
-            };
-        }
+        selected
     }
 
     /// Convert to flat layout for queries
@@ -538,7 +660,8 @@ where
         }
 
         // Create construction graph with proper per-layer storage
-        let construction_graph = ConstructionGraph::new(n, &layer_assignments, m);
+        let threads = rayon::current_num_threads();
+        let construction_graph = ConstructionGraph::new(n, &layer_assignments, m, threads);
 
         let mut index = HnswIndex {
             vectors_flat,
