@@ -11,7 +11,6 @@ use thousands::*;
 
 use crate::prelude::*;
 use crate::utils::graph_utils::*;
-use crate::utils::parallelism::*;
 use crate::utils::*;
 
 /////////////

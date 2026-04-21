@@ -6,7 +6,7 @@
 
 pub use crate::utils::dist::*;
 pub use crate::utils::heap_structs::*;
-pub use crate::utils::parallelism::AtomicNodeLocks;
+pub use crate::utils::parallelism::StripedLocks;
 pub use crate::utils::prefetch_read;
 pub use crate::utils::traits::AnnSearchFloat;
 

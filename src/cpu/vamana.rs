@@ -7,6 +7,7 @@ use rand::{rng, rngs::SmallRng, seq::SliceRandom, Rng, SeedableRng};
 use rayon::prelude::*;
 use std::cell::{RefCell, UnsafeCell};
 use std::cmp::{Ordering, Reverse};
+use std::sync::{atomic::AtomicUsize, Arc};
 use thousands::*;
 
 use crate::prelude::*;
@@ -33,8 +34,10 @@ thread_local! {
 struct VamanaConstructionGraph {
     /// Each node gets a fixed array of size R. u32::MAX is the sentinel.
     nodes: Vec<UnsafeCell<Vec<u32>>>,
-    /// For locking a given node during construction
-    locks: AtomicNodeLocks,
+    /// Striped spin-locks for concurrent edge updates during construction.
+    /// Stripe count is independent of graph size, so memory overhead stays
+    /// constant as the dataset grows.
+    locks: StripedLocks,
     /// Degree of that node
     r: usize,
 }
@@ -45,22 +48,26 @@ impl VamanaConstructionGraph {
     /// Create a new construction graph initialised with sentinels
     ///
     /// Pre-allocates a fixed-size vector for each node filled with `u32::MAX`
-    /// to denote empty slots.
+    /// to denote empty slots. The striped lock array is sized to the expected
+    /// concurrency rather than the node count, keeping lock memory constant
+    /// regardless of dataset size.
     ///
     /// ### Params
     ///
     /// * `n` - Number of nodes in the dataset
     /// * `r` - Maximum degree (number of edges) per node
+    /// * `threads` - Expected number of concurrent writers, used to size the
+    ///   striped lock array
     ///
     /// ### Returns
     ///
     /// Constructed self
-    pub fn new(n: usize, r: usize) -> Self {
+    pub fn new(n: usize, r: usize, threads: usize) -> Self {
         let nodes = (0..n).map(|_| UnsafeCell::new(vec![u32::MAX; r])).collect();
 
         Self {
             nodes,
-            locks: AtomicNodeLocks::new(n),
+            locks: StripedLocks::new(threads, r),
             r,
         }
     }
@@ -72,6 +79,9 @@ impl VamanaConstructionGraph {
     /// Pass 1 of the build process will use these to jump across the dataset,
     /// explicitly preserving the best "highways" while discovering local
     /// clusters.
+    ///
+    /// Lock-free by construction: the parallel iterator guarantees that each
+    /// node's slot is touched by exactly one thread during initialisation.
     ///
     /// ### Params
     ///
@@ -110,7 +120,9 @@ impl VamanaConstructionGraph {
     /// Get a read-only slice of neighbours for a node (no allocation).
     ///
     /// Unlocked read for speed; benign races are accepted during the build
-    /// phase.
+    /// phase. Since slot writes are always in-place overwrites of `u32`
+    /// values (atomic on all supported architectures), a concurrent reader
+    /// either sees a valid neighbour id or a sentinel, never a torn value.
     ///
     /// ### Params
     ///
@@ -127,7 +139,9 @@ impl VamanaConstructionGraph {
 
     /// Count the number of actual (non-sentinel) neighbours for a node.
     ///
-    /// Assumes the caller holds the lock or has exclusive access.
+    /// Assumes the caller holds the stripe lock for this node or has
+    /// exclusive access. Sentinels are packed at the end of the slot range,
+    /// so the first sentinel marks the degree.
     ///
     /// ### Params
     ///
@@ -143,12 +157,15 @@ impl VamanaConstructionGraph {
         edges.iter().position(|&e| e == u32::MAX).unwrap_or(self.r)
     }
 
-    /// Set neighbours safely by acquiring the node's lock first.
+    /// Set neighbours safely by acquiring the node's stripe lock first.
+    ///
+    /// Lock is held for the duration of the in-place overwrite and released
+    /// automatically when the guard is dropped.
     ///
     /// ### Params
     ///
     /// * `node_id` - Id of the node
-    /// * `neighbours` - Id of the neighbour to add
+    /// * `neighbours` - New neighbour list (will be padded with sentinels)
     pub fn set_neighbours(&self, node_id: usize, neighbours: &[u32]) {
         let _guard = self.locks.lock_guard(node_id);
         self.set_neighbours_unsafe(node_id, neighbours);
@@ -157,9 +174,13 @@ impl VamanaConstructionGraph {
     /// Convert the construction graph into a single flat `Vec<u32>` for
     /// queries.
     ///
+    /// Consumes the construction graph. The resulting flat layout has each
+    /// node's R-sized slot range stored contiguously in node-id order,
+    /// suitable for cache-friendly query traversal.
+    ///
     /// ### Returns
     ///
-    /// The flatten neighbours
+    /// Flattened neighbour array of size `n * r`
     pub fn into_flat(self) -> Vec<u32> {
         let mut flat = Vec::with_capacity(self.nodes.len() * self.r);
         for cell in self.nodes {
@@ -168,14 +189,16 @@ impl VamanaConstructionGraph {
         flat
     }
 
-    /// Set neighbours assuming the lock is already held.
+    /// Set neighbours assuming the stripe lock is already held.
     ///
-    /// Pads the remainder of the fixed-size array with `u32::MAX`.
+    /// Overwrites the slot range in place and pads the remainder with
+    /// `u32::MAX`. Writes are always full-range overwrites, so concurrent
+    /// readers never observe an empty list.
     ///
     /// ### Params
     ///
     /// * `node_id` - Id of the node
-    /// * `neighbours` - Id of the neighbour to add
+    /// * `neighbours` - New neighbour list (will be padded with sentinels)
     #[inline]
     pub fn set_neighbours_unsafe(&self, node_id: usize, neighbours: &[u32]) {
         unsafe {
@@ -190,9 +213,10 @@ impl VamanaConstructionGraph {
         }
     }
 
-    /// Append a single neighbour assuming the lock is already held.
+    /// Append a single neighbour assuming the stripe lock is already held.
     ///
-    /// Only adds if there is an empty (sentinel) slot available.
+    /// Scans for the first sentinel slot and writes the new neighbour there.
+    /// No-op if the slot range is already full.
     ///
     /// ### Params
     ///
@@ -413,7 +437,8 @@ where
 
         let medoid = compute_medoid(&vectors_flat, n, dim, metric);
 
-        let build_graph = VamanaConstructionGraph::new(n, r);
+        let threads = rayon::current_num_threads();
+        let build_graph = VamanaConstructionGraph::new(n, r, threads);
         build_graph.initialise_random(seed as u64);
 
         // pre-calculate norms for Cosine
@@ -881,11 +906,6 @@ where
         return_dist: bool,
         verbose: bool,
     ) -> (Vec<Vec<usize>>, Option<Vec<Vec<T>>>) {
-        use std::sync::{
-            atomic::{AtomicUsize, Ordering},
-            Arc,
-        };
-
         let counter = Arc::new(AtomicUsize::new(0));
 
         let results: Vec<(Vec<usize>, Vec<T>)> = (0..self.n)
@@ -896,7 +916,7 @@ where
                 let vec = &self.vectors_flat[start..end];
 
                 if verbose {
-                    let count = counter.fetch_add(1, Ordering::Relaxed) + 1;
+                    let count = counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
                     if count.is_multiple_of(100_000) {
                         println!(
                             "  Processed {} / {} samples.",

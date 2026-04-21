@@ -820,8 +820,10 @@ pub fn calculate_recall(
 ///
 /// ### Params
 ///
-/// * `true_dist` - Slice of true distances to the neighbours (one vec per query)
-/// * `approx_dist` - Slice of approximate distances to the neighbours (one vec per query)
+/// * `true_dist` - Slice of true distances to the neighbours (one vec per
+///   query)
+/// * `approx_dist` - Slice of approximate distances to the neighbours (one vec
+///   per query)
 /// * `k` - Number of neighbours to consider per query
 ///
 /// ### Returns
