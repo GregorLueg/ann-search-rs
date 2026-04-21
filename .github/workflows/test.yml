@@ -5,18 +5,15 @@ on:
   pull_request:
     branches: [main, dev]
 jobs:
-  test:
-    name: Test on ${{ matrix.os }}
-    runs-on: ${{ matrix.os }}
+  test-cpu:
+    name: CPU tests on ${{ matrix.os }}
     strategy:
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
-
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
-
+      - uses: dtolnay/rust-toolchain@stable
       - name: Cache cargo
         uses: actions/cache@v4
         with:
@@ -26,9 +23,36 @@ jobs:
             ~/.cargo/registry/cache/
             ~/.cargo/git/db/
             target/
-          key: ${{ runner.os }}-cargo-${{ github.sha }}
+          key: ${{ runner.os }}-cargo-cpu-${{ github.sha }}
           restore-keys: |
-            ${{ runner.os }}-cargo-
-
-      - name: Run tests
-        run: cargo test --features binary,gpu,quantised
+            ${{ runner.os }}-cargo-cpu-
+      - run: cargo test --release --features binary,quantised,gpu
+  test-gpu:
+    name: GPU tests on ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: ${{ runner.os }}-cargo-gpu-${{ github.sha }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-gpu-
+      - name: Install Vulkan (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libvulkan1 mesa-vulkan-drivers libgl1-mesa-dri
+          echo "WGPU_BACKEND=vulkan" >> $GITHUB_ENV
+        # gpu-tests uses GPU backends for shared memory -> not behaving on windows
+      - run: cargo test --release --features binary,gpu,gpu-tests,quantised
