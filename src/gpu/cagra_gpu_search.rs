@@ -24,6 +24,10 @@ const BEAM_WIDTH: usize = 16;
 const MAX_BEAM_ITERS: usize = 48;
 /// Hash table size for visited-node tracking (must be power of 2)
 const HASH_SIZE: usize = 2048;
+/// Expansion per given iteration. 1 -> one additional neighbour is explored,
+/// 2 -> two, etc. pp. Usually something between 1 to 4.
+const EXPAND_PER_ITER: usize = 3;
+
 /// Number of random entry points per query
 pub const N_ENTRY_POINTS: usize = 8;
 
@@ -42,6 +46,8 @@ pub struct CagraGpuSearchParams {
     /// Optional number of entry points. If not provided, will default to
     /// `N_ENTRY_POINTS`.
     pub n_entry_points: Option<usize>,
+    /// Number of neighbours to explore per iteration
+    pub expand_per_iter: Option<usize>,
 }
 
 impl CagraGpuSearchParams {
@@ -51,8 +57,10 @@ impl CagraGpuSearchParams {
     ///
     /// * `beam_width` - Beam width for the kNN search
     /// * `max_beam_iters` - Maximum numbers of iterations to do. Rule of thumb
-    ///   to be 2x beam width
+    ///   to be 2 to 3x beam width
     /// * `n_entry_points` - Number of entry points to use in the CAGRA graph.
+    /// * `expand_per_iter` - Number of additional neighbours to explore per
+    ///   iteration. Usually something between 1 to 4.
     ///
     /// ### Returns
     ///
@@ -61,11 +69,13 @@ impl CagraGpuSearchParams {
         beam_width: Option<usize>,
         max_beam_iters: Option<usize>,
         n_entry_points: Option<usize>,
+        expand_per_iter: Option<usize>,
     ) -> Self {
         Self {
             beam_width,
             max_beam_iters,
             n_entry_points,
+            expand_per_iter,
         }
     }
 
@@ -73,13 +83,14 @@ impl CagraGpuSearchParams {
     ///
     /// ### Returns
     ///
-    /// Tuple of `(width, iters, n_entry)`
-    pub fn get_vals(&self) -> (usize, usize, usize) {
+    /// Tuple of `(width, iters, n_entry, expand)`
+    pub fn get_vals(&self) -> (usize, usize, usize, usize) {
         let width = self.beam_width.unwrap_or(BEAM_WIDTH);
         let iters = self.max_beam_iters.unwrap_or(MAX_BEAM_ITERS);
         let n_entry = self.n_entry_points.unwrap_or(N_ENTRY_POINTS);
+        let expand = self.expand_per_iter.unwrap_or(EXPAND_PER_ITER);
 
-        (width, iters, n_entry)
+        (width, iters, n_entry, expand)
     }
 
     /// Get the number of entry points
@@ -108,6 +119,7 @@ impl CagraGpuSearchParams {
             beam_width: Some(beam_width),
             max_beam_iters: Some(max_beam_iters),
             n_entry_points: None,
+            expand_per_iter: None,
         }
     }
 }
@@ -115,7 +127,7 @@ impl CagraGpuSearchParams {
 /// Default implementation for CagraGpuSearchParams
 impl Default for CagraGpuSearchParams {
     fn default() -> Self {
-        Self::new(None, None, None)
+        Self::new(None, None, None, None)
     }
 }
 
@@ -386,6 +398,7 @@ pub fn cagra_beam_search<F: Float>(
     #[comptime] hash_size: usize,
     #[comptime] max_iters: usize,
     #[comptime] n_entry: usize,
+    #[comptime] expand_per_iter: usize,
 ) {
     let q_idx = CUBE_POS_Y * CUBE_COUNT_X + CUBE_POS_X;
     let n_queries = out_indices.shape(0usize) as u32;
@@ -400,6 +413,8 @@ pub fn cagra_beam_search<F: Float>(
     let f_max = F::new(999999999.0);
     let bw = beam_width as u32;
     let bw_last = beam_width - 1usize;
+    let total_slots = k_graph * expand_per_iter;
+    let expand_u32 = expand_per_iter as u32;
 
     // shared memory set up
     let mut sq_vec = SharedMemory::<F>::new(dim_scalars);
@@ -407,9 +422,9 @@ pub fn cagra_beam_search<F: Float>(
     let mut s_cand_idx = SharedMemory::<u32>::new(beam_width);
     let mut s_cand_expanded = SharedMemory::<u32>::new(beam_width);
     let mut s_hash = SharedMemory::<u32>::new(hash_size);
-    let mut s_nbr_idx = SharedMemory::<u32>::new(k_graph);
-    let mut s_nbr_dist = SharedMemory::<F>::new(k_graph);
-    let mut s_active_node = SharedMemory::<u32>::new(1usize);
+    let mut s_nbr_idx = SharedMemory::<u32>::new(total_slots);
+    let mut s_nbr_dist = SharedMemory::<F>::new(total_slots);
+    let mut s_active_flag = SharedMemory::<u32>::new(1usize);
     let mut s_num_cands = SharedMemory::<u32>::new(1usize);
     let mut s_query_norm = SharedMemory::<F>::new(1usize);
 
@@ -477,20 +492,21 @@ pub fn cagra_beam_search<F: Float>(
 
                 if is_new {
                     let mut sum = F::new(0.0);
-                    let mut s = 0usize;
-                    while s < dim_scalars {
-                        let li = s / 4usize;
-                        let la = s % 4usize;
+                    for li in 0..dim_lines {
                         let lv = vectors[node_id as usize * dim_lines + li];
-                        let vb = lv[la];
-                        let va = sq_vec[s];
+                        let s_off = li * 4usize;
                         if use_cosine {
-                            sum += va * vb;
+                            sum += sq_vec[s_off] * lv[0]
+                                + sq_vec[s_off + 1usize] * lv[1]
+                                + sq_vec[s_off + 2usize] * lv[2]
+                                + sq_vec[s_off + 3usize] * lv[3];
                         } else {
-                            let diff = va - vb;
-                            sum += diff * diff;
+                            let d0 = sq_vec[s_off] - lv[0];
+                            let d1 = sq_vec[s_off + 1usize] - lv[1];
+                            let d2 = sq_vec[s_off + 2usize] - lv[2];
+                            let d3 = sq_vec[s_off + 3usize] - lv[3];
+                            sum += d0 * d0 + d1 * d1 + d2 * d2 + d3 * d3;
                         }
-                        s += 1usize;
                     }
                     let dist = if use_cosine {
                         F::new(1.0) - sum / (s_query_norm[0usize] * norms[node_id as usize])
@@ -533,17 +549,19 @@ pub fn cagra_beam_search<F: Float>(
     while iter < max_iter_u32 {
         if tx == 0u32 {
             out_iters[q_idx as usize] = iter;
+            s_active_flag[0usize] = sentinel;
             let nc = s_num_cands[0usize];
-            s_active_node[0usize] = sentinel;
+            let mut active_count: u32 = 0u32;
 
+            // Claim up to P unexpanded candidates in beam order (ascending dist).
             let mut fc = 0u32;
-            while fc < nc {
+            while fc < nc && active_count < expand_u32 {
                 if s_cand_expanded[fc as usize] == 0u32 {
                     let active = s_cand_idx[fc as usize];
                     s_cand_expanded[fc as usize] = 1u32;
-                    s_active_node[0usize] = active;
 
                     let gb = active as usize * k_graph;
+                    let slot_base = active_count as usize * k_graph;
                     let mut j = 0usize;
                     while j < k_graph {
                         let nbr = graph[gb + j];
@@ -565,54 +583,99 @@ pub fn cagra_beam_search<F: Float>(
                                     ha += 1u32;
                                 }
                             }
-                            // never use if-expression for value assignment in
-                            // CubeCL... bad idea
                             if is_new {
-                                s_nbr_idx[j] = nbr;
+                                s_nbr_idx[slot_base + j] = nbr;
                             } else {
-                                s_nbr_idx[j] = sentinel;
+                                s_nbr_idx[slot_base + j] = sentinel;
                             }
                         } else {
-                            s_nbr_idx[j] = sentinel;
+                            s_nbr_idx[slot_base + j] = sentinel;
                         }
                         j += 1usize;
                     }
-
-                    fc = nc; // break
+                    active_count += 1u32;
                 }
                 fc += 1u32;
+            }
+
+            // Pad remaining expansion slots with sentinels.
+            while active_count < expand_u32 {
+                let slot_base = active_count as usize * k_graph;
+                let mut j = 0usize;
+                while j < k_graph {
+                    s_nbr_idx[slot_base + j] = sentinel;
+                    j += 1usize;
+                }
+                active_count += 1u32;
+            }
+
+            // Signal termination only if nothing was claimed.
+            if fc > 0u32 || nc > 0u32 {
+                // at least one iteration of the scan ran; flag based on whether
+                // we found an unexpanded candidate
+                let mut any_unexpanded: bool = false;
+                let mut sc = 0u32;
+                while sc < nc {
+                    if s_cand_expanded[sc as usize] == 0u32 {
+                        any_unexpanded = true;
+                    }
+                    sc += 1u32;
+                }
+                // We expanded `expand_u32 - (expand_u32 - actually_expanded)` this iter.
+                // If we expanded at least one, keep going; the termination check
+                // simply reflects whether we produced any work this iter.
+                if any_unexpanded {
+                    s_active_flag[0usize] = 0u32;
+                } else {
+                    // flag stays sentinel, loop will terminate
+                }
+            }
+
+            // Simpler, correct rule: if we expanded nothing this iter, terminate.
+            // Overwrite based on whether any non-sentinel was written into s_nbr_idx.
+            let mut any_real: bool = false;
+            let mut ck = 0usize;
+            while ck < total_slots {
+                if s_nbr_idx[ck] != sentinel {
+                    any_real = true;
+                }
+                ck += 1usize;
+            }
+            if any_real {
+                s_active_flag[0usize] = 0u32;
+            } else {
+                s_active_flag[0usize] = sentinel;
             }
         }
 
         sync_cube();
 
-        let active = s_active_node[0usize];
-
-        // early termination
-        if active == sentinel {
+        let flag = s_active_flag[0usize];
+        if flag == sentinel {
             iter = max_iter_u32;
         }
 
-        if active != sentinel {
+        if flag != sentinel {
             let mut ms = tx as usize;
-            while ms < k_graph {
+            while ms < total_slots {
                 let nbr = s_nbr_idx[ms];
                 if nbr != sentinel {
                     let mut sum = F::new(0.0);
-                    let mut s = 0usize;
-                    while s < dim_scalars {
-                        let li = s / 4usize;
-                        let la = s % 4usize;
+                    for li in 0..dim_lines {
                         let lv = vectors[nbr as usize * dim_lines + li];
-                        let vb = lv[la];
-                        let va = sq_vec[s];
+                        let s_off = li * 4usize;
                         if use_cosine {
-                            sum += va * vb;
+                            sum += sq_vec[s_off] * lv[0]
+                                + sq_vec[s_off + 1usize] * lv[1]
+                                + sq_vec[s_off + 2usize] * lv[2]
+                                + sq_vec[s_off + 3usize] * lv[3];
                         } else {
-                            let diff = va - vb;
-                            sum += diff * diff;
+                            let d0 = sq_vec[s_off] - lv[0];
+                            let d1 = sq_vec[s_off + 1usize] - lv[1];
+                            let d2 = sq_vec[s_off + 2usize] - lv[2];
+                            let d3 = sq_vec[s_off + 3usize] - lv[3];
+                            sum += d0 * d0 + d1 * d1 + d2 * d2 + d3 * d3;
                         }
-                        s += 1usize;
                     }
                     let dist = if use_cosine {
                         F::new(1.0) - sum / (s_query_norm[0usize] * norms[nbr as usize])
@@ -629,11 +692,11 @@ pub fn cagra_beam_search<F: Float>(
 
         sync_cube();
 
-        if tx == 0u32 && active != sentinel {
+        if tx == 0u32 && flag != sentinel {
             let mut nc = s_num_cands[0usize];
 
-            let mut j = 0usize;
-            while j < k_graph {
+            let mut j: usize = 0usize;
+            while j < total_slots {
                 if s_nbr_idx[j] != sentinel {
                     let dist = s_nbr_dist[j];
                     let nbr = s_nbr_idx[j];
@@ -776,7 +839,7 @@ where
     let dim_padded = dim.next_multiple_of(line);
     let dim_vec = dim_padded / line;
 
-    let (width, iters, n_entry) = query_params.get_vals();
+    let (width, iters, n_entry, expand) = query_params.get_vals();
 
     // Pad queries
     let queries_padded = if dim_padded != dim {
@@ -840,6 +903,7 @@ where
             HASH_SIZE,
             iters,
             n_entry,
+            expand,
         );
     }
 

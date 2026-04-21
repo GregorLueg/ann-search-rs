@@ -122,7 +122,7 @@ where
     /// * `data` - Matrix reference with vectors as rows (n × dim)
     /// * `metric` - Distance metric (Euclidean or Cosine)
     /// * `nlist` - Optional number of clusters. Defaults to `sqrt(n)`.
-    /// * `max_iters` - Optional maximum k-means iterations (defaults to `30`).
+    /// * `max_iters` - Optional maximum k-means iterations (defaults to `50`).
     /// * `seed` - Random seed for reproducibility
     /// * `verbose` - Print training progress
     ///
@@ -152,7 +152,7 @@ where
             Vec::new()
         };
 
-        let max_iters = max_iters.unwrap_or(30);
+        let max_iters = max_iters.unwrap_or(50);
         let nlist = nlist.unwrap_or((n as f32).sqrt() as usize).max(1);
 
         let n_train = (256 * nlist).min(250_000).min(n).max(1);

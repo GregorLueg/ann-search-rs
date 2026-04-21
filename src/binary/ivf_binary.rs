@@ -113,7 +113,7 @@ where
     /// * `n_bits` - Number of bits per binary code (must be multiple of 8)
     /// * `metric` - Distance metric for centroid routing
     /// * `nlist` - Optional number of clusters (defaults to sqrt(n))
-    /// * `max_iters` - Optional max k-means iterations (defaults to 30)
+    /// * `max_iters` - Optional max k-means iterations (defaults to `50`)
     /// * `seed` - Random seed
     /// * `verbose` - Print progress
     ///
@@ -139,7 +139,7 @@ where
 
         let (vectors_flat, _, _) = matrix_to_flat(data);
 
-        let max_iters = max_iters.unwrap_or(30);
+        let max_iters = max_iters.unwrap_or(50);
         let nlist = nlist.unwrap_or((n as f32).sqrt() as usize).max(1);
 
         if verbose {
@@ -258,7 +258,7 @@ where
     /// * `n_bits` - Number of bits per binary code (must be multiple of 8)
     /// * `metric` - Distance metric for centroid routing and reranking
     /// * `nlist` - Optional number of clusters (defaults to sqrt(n))
-    /// * `max_iters` - Optional max k-means iterations (defaults to 30)
+    /// * `max_iters` - Optional max k-means iterations (defaults to `50`)
     /// * `seed` - Random seed
     /// * `verbose` - Print progress
     /// * `save_path` - Directory to save vector store files
@@ -286,7 +286,7 @@ where
 
         let (vectors_flat, _, _) = matrix_to_flat(data);
 
-        let max_iters = max_iters.unwrap_or(30);
+        let max_iters = max_iters.unwrap_or(50);
         let nlist = nlist.unwrap_or((n as f32).sqrt() as usize).max(1);
 
         if verbose {

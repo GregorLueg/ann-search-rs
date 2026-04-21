@@ -206,7 +206,7 @@ fn main() {
 
     for &bw in &beam_widths {
         let max_iters = bw * 3;
-        let params = CagraGpuSearchParams::new(Some(bw), Some(max_iters), None);
+        let params = CagraGpuSearchParams::new(Some(bw), Some(max_iters), None, None);
 
         // External query
         println!(
@@ -243,7 +243,7 @@ fn main() {
         });
 
         // Self query
-        let params = CagraGpuSearchParams::new(Some(bw), Some(max_iters), None);
+        let params = CagraGpuSearchParams::new(Some(bw), Some(max_iters), None, None);
 
         println!("Self-querying CAGRA (beam_width={})...", bw);
         let start = Instant::now();

@@ -547,6 +547,7 @@ pub fn local_join_shared<F: Float>(
 /// Merge proposals into the sorted kNN graph.
 ///
 /// One thread per node. For each node:
+///
 /// 1. Clears the IS_NEW flag on all existing neighbours (marks old).
 /// 2. Iterates over received proposals (up to MAX_PROPOSALS).
 /// 3. Skips duplicates already in the graph.
@@ -661,7 +662,8 @@ pub fn merge_proposals<F: Float>(
 ///
 /// ### Params
 ///
-/// * `vectors` - Row-major vector matrix, line-vectorised along the feature dimension
+/// * `vectors` - Row-major vector matrix, line-vectorised along the feature
+///   dimension
 /// * `norms` - Pre-computed L2 norms (ignored when `use_cosine` is false)
 /// * `graph_idx` - Current kNN graph indices (with IS_NEW flag in MSB)
 /// * `graph_dist` - Current kNN graph distances
@@ -1366,8 +1368,8 @@ where
     /// * `max_iters` - Maximum NNDescent iterations (default 15)
     /// * `n_trees` - Number of Annoy trees for graph initialisation.
     ///   Defaults to `5 + n^0.25`, capped at 32.
-    /// * `delta` - Convergence threshold as fraction of n*k (default 0.001)
-    /// * `rho` - Sampling rate for the local join (default 0.5)
+    /// * `delta` - Convergence threshold as fraction of n*k (default `0.001`)
+    /// * `rho` - Sampling rate for the local join (default `0.5`)
     /// * `seed` - Random seed
     /// * `verbose` - Print progress
     /// * `device` - CubeCL runtime device
@@ -1633,7 +1635,7 @@ where
 
             if verbose {
                 println!(
-                    "  Iter {}: {} updates (rate={:.6})",
+                    "   Iter {}: {} updates (rate={:.6})",
                     iter + 1,
                     (updates as usize).separate_with_underscores(),
                     rate
@@ -1713,7 +1715,11 @@ where
 
             if verbose {
                 let counter_data = update_counter_gpu.clone().read(&client);
-                println!("    2-Hop sweep {}: {} updates", sweep + 1, counter_data[0]);
+                println!(
+                    "    2-Hop sweep {}: {} updates",
+                    sweep + 1,
+                    counter_data[0].separate_with_underscores()
+                );
             }
 
             let refinement_stop = refinement_start.elapsed();
@@ -2169,11 +2175,14 @@ where
         let entry_flat: Vec<u32> = (0..self.n)
             .flat_map(|i| {
                 let row = &self.knn_graph[i * self.k..(i + 1) * self.k];
-                let mut entries: Vec<u32> = row
+                let valid: Vec<u32> = row
                     .iter()
                     .filter(|&&(pid, _)| pid != SENTINEL_PID)
-                    .take(n_entry)
                     .map(|&(pid, _)| pid as u32)
+                    .collect();
+                let stride = (valid.len() / n_entry).max(1);
+                let mut entries: Vec<u32> = (0..n_entry)
+                    .filter_map(|j| valid.get(j * stride).copied())
                     .collect();
                 // Pad with random if fewer than n_entry valid neighbours
                 let mut rng_val = (i as u32) ^ (seed as u32);

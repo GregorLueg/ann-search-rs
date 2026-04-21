@@ -101,7 +101,7 @@ where
         verbose: bool,
     ) -> Self {
         let (mut vectors_flat, n, dim) = matrix_to_flat(data);
-        let max_iters = max_iters.unwrap_or(30);
+        let max_iters = max_iters.unwrap_or(50);
 
         if metric == Dist::Cosine {
             vectors_flat
