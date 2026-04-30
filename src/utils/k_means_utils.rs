@@ -126,6 +126,11 @@ const GEMM_DIRTY_THRESHOLD: usize = 128;
 /// be better.
 const GEMM_DIM_THRESHOLD: usize = 96;
 
+/// Minimum number of centroids at which Hamerly's pruning beats plain Lloyd's
+/// on the SIMD path. Below this, per-iteration overhead of computing s[c] and
+/// updating bounds outweighs the saved distance work.
+const SIMD_HAMERLY_K_THRESHOLD: usize = 200;
+
 /////////////
 // Helpers //
 /////////////
@@ -796,7 +801,8 @@ pub fn compute_centroid_drift<T>(
     for c in 0..k {
         let old = &old_centroids[c * dim..(c + 1) * dim];
         let new = &new_centroids[c * dim..(c + 1) * dim];
-        deltas[c] = euclidean_distance_static(old, new);
+        // needs the square root here
+        deltas[c] = euclidean_distance_static(old, new).sqrt();
     }
 }
 
@@ -1299,6 +1305,321 @@ fn parallel_lloyd<T>(
     }
 }
 
+////////////////////
+// Hamerly's SIMD //
+////////////////////
+
+/// Find best and second-best centroid for a single vector via direct SIMD
+///
+/// Tracks squared distances in the inner loop and converts to actual
+/// distances at the end. Used by both the full-assignment and dirty-point
+/// paths in Hamerly's SIMD implementation.
+///
+/// ### Params
+///
+/// * `vec` - Query vector slice (dim elements)
+/// * `centroids` - All centroids, flattened row-major
+/// * `dim` - Embedding dimensions
+/// * `k` - Number of centroids
+///
+/// ### Returns
+///
+/// Tuple of (best centroid index, distance to best, distance to second-best)
+#[inline]
+fn assign_one_with_bounds_simd<T>(vec: &[T], centroids: &[T], dim: usize, k: usize) -> (usize, T, T)
+where
+    T: Float + SimdDistance,
+{
+    let mut best_c = 0;
+    let mut best_sq = T::infinity();
+    let mut second_sq = T::infinity();
+
+    for c in 0..k {
+        let cent = &centroids[c * dim..(c + 1) * dim];
+        let dist_sq = euclidean_distance_static(vec, cent);
+        if dist_sq < best_sq {
+            second_sq = best_sq;
+            best_sq = dist_sq;
+            best_c = c;
+        } else if dist_sq < second_sq {
+            second_sq = dist_sq;
+        }
+    }
+
+    (best_c, best_sq.sqrt(), second_sq.sqrt())
+}
+
+/// Full nearest-centroid assignment via direct SIMD, with Hamerly bounds
+///
+/// SIMD analogue of `gemm_assign_full` for the Euclidean Hamerly path. Iterates
+/// over all n vectors in parallel; for each, scans all k centroids and records
+/// the closest and second-closest distances.
+///
+/// ### Params
+///
+/// * `data` - All vectors, flattened row-major
+/// * `dim` - Embedding dimensions
+/// * `centroids` - All centroids, flattened row-major
+/// * `k` - Number of centroids
+/// * `assignments` - Output: nearest centroid index per vector
+/// * `upper_bounds` - Output: distance to nearest centroid per vector
+/// * `lower_bounds` - Output: distance to second-nearest centroid per vector
+fn simd_assign_full_with_bounds<T>(
+    data: &[T],
+    dim: usize,
+    centroids: &[T],
+    k: usize,
+    assignments: &mut [usize],
+    upper_bounds: &mut [T],
+    lower_bounds: &mut [T],
+) where
+    T: Float + Send + Sync + SimdDistance,
+{
+    assignments
+        .par_iter_mut()
+        .zip(upper_bounds.par_iter_mut())
+        .zip(lower_bounds.par_iter_mut())
+        .enumerate()
+        .for_each(|(i, ((assign, upper), lower))| {
+            let vec = &data[i * dim..(i + 1) * dim];
+            let (best_c, best_dist, second_dist) =
+                assign_one_with_bounds_simd(vec, centroids, dim, k);
+            *assign = best_c;
+            *upper = best_dist;
+            *lower = second_dist;
+        });
+}
+
+/// Reassign a subset of "dirty" points via direct SIMD
+///
+/// SIMD analogue of `gemm_reassign_dirty`. No gather/scatter is needed since
+/// the distance kernel works directly on per-point slices. Distances are
+/// computed in parallel and scattered back sequentially.
+///
+/// ### Params
+///
+/// * `data` - All vectors, flattened row-major
+/// * `dim` - Embedding dimensions
+/// * `centroids` - All centroids, flattened row-major
+/// * `k` - Number of centroids
+/// * `dirty` - Indices of vectors requiring reassignment
+/// * `assignments` - In/out: nearest centroid index per vector
+/// * `upper_bounds` - In/out: distance to nearest centroid per vector
+/// * `lower_bounds` - In/out: distance to second-nearest centroid per vector
+#[allow(clippy::too_many_arguments)]
+fn simd_reassign_dirty<T>(
+    data: &[T],
+    dim: usize,
+    centroids: &[T],
+    k: usize,
+    dirty: &[usize],
+    assignments: &mut [usize],
+    upper_bounds: &mut [T],
+    lower_bounds: &mut [T],
+) where
+    T: Float + Send + Sync + SimdDistance,
+{
+    let updates: Vec<(usize, T, T)> = dirty
+        .par_iter()
+        .map(|&i| {
+            let vec = &data[i * dim..(i + 1) * dim];
+            assign_one_with_bounds_simd(vec, centroids, dim, k)
+        })
+        .collect();
+
+    for (&i, (best_c, best_dist, second_dist)) in dirty.iter().zip(updates.into_iter()) {
+        assignments[i] = best_c;
+        upper_bounds[i] = best_dist;
+        lower_bounds[i] = second_dist;
+    }
+}
+
+/// Compute s[c] = 0.5 * min_{c' != c} dist(c, c') via direct SIMD
+///
+/// SIMD analogue of `compute_half_min_centroid_dists`. Computes k^2
+/// pairwise centroid distances directly rather than via GEMM. Cheap
+/// for moderate k (~10^4 evaluations at k=100).
+///
+/// ### Params
+///
+/// * `centroids` - All centroids, flattened row-major
+/// * `dim` - Embedding dimensions
+/// * `k` - Number of centroids
+///
+/// ### Returns
+///
+/// Vector of length k with half-minimum inter-centroid distances
+fn compute_half_min_centroid_dists_simd<T>(centroids: &[T], dim: usize, k: usize) -> Vec<T>
+where
+    T: Float + Send + Sync + SimdDistance,
+{
+    let half = T::one() / (T::one() + T::one());
+
+    (0..k)
+        .into_par_iter()
+        .map(|i| {
+            let cent_i = &centroids[i * dim..(i + 1) * dim];
+            let mut min_sq = T::infinity();
+            for j in 0..k {
+                if i == j {
+                    continue;
+                }
+                let cent_j = &centroids[j * dim..(j + 1) * dim];
+                let dist_sq = euclidean_distance_static(cent_i, cent_j);
+                if dist_sq < min_sq {
+                    min_sq = dist_sq;
+                }
+            }
+            min_sq.sqrt() * half
+        })
+        .collect()
+}
+
+/// Hamerly's accelerated k-means for Euclidean distance via SIMD
+///
+/// SIMD-only variant of Hamerly's bound-based k-means. Used when dim is
+/// below the GEMM threshold but k is large enough for bound pruning to
+/// pay off. Initial full assignment runs via SIMD, then iteratively only
+/// those points whose bounds have become loose are reassigned. Bound
+/// updates and the bound-check / dirty-collection step run in parallel
+/// via Rayon.
+///
+/// ### Params
+///
+/// * `data` - All vectors, flattened row-major
+/// * `dim` - Embedding dimensions
+/// * `n` - Number of vectors
+/// * `centroids` - In/out: centroids, flattened row-major
+/// * `centroid_norms` - In/out: per-centroid norms (kept consistent for
+///   `update_centroids`; not used for assignment on the SIMD path)
+/// * `k` - Number of centroids
+/// * `max_iters` - Maximum number of Lloyd's iterations
+/// * `verbose` - Print convergence diagnostics
+#[allow(clippy::too_many_arguments)]
+fn hamerly_lloyd_simd<T>(
+    data: &[T],
+    dim: usize,
+    n: usize,
+    centroids: &mut [T],
+    centroid_norms: &mut [T],
+    k: usize,
+    max_iters: usize,
+    verbose: bool,
+) where
+    T: Float + Send + Sync + SimdDistance + FromPrimitive,
+{
+    let mut assignments = vec![0usize; n];
+    let mut upper = vec![T::infinity(); n];
+    let mut lower = vec![T::zero(); n];
+    let mut old_centroids = vec![T::zero(); k * dim];
+    let mut deltas = vec![T::zero(); k];
+
+    simd_assign_full_with_bounds(
+        data,
+        dim,
+        centroids,
+        k,
+        &mut assignments,
+        &mut upper,
+        &mut lower,
+    );
+
+    for iter in 0..max_iters {
+        old_centroids.copy_from_slice(centroids);
+
+        update_centroids(
+            data,
+            dim,
+            n,
+            &assignments,
+            centroids,
+            centroid_norms,
+            k,
+            &Dist::Euclidean,
+        );
+
+        compute_centroid_drift(&old_centroids, centroids, dim, k, &mut deltas);
+        let (max_delta, second_max_delta, max_delta_idx) = top_two_deltas(&deltas);
+
+        if max_delta <= T::from_f64(1e-5).unwrap() {
+            if verbose {
+                println!("    Converged at iteration {}", iter + 1);
+            }
+            break;
+        }
+
+        // Parallel bound update: shift upper by the drift of the assigned
+        // centroid; loosen lower by the largest drift among other centroids
+        upper
+            .par_iter_mut()
+            .zip(lower.par_iter_mut())
+            .zip(assignments.par_iter())
+            .for_each(|((u, l), &a)| {
+                *u = *u + deltas[a];
+                let other_max = if a == max_delta_idx {
+                    second_max_delta
+                } else {
+                    max_delta
+                };
+                *l = (*l - other_max).max(T::zero());
+            });
+
+        let s = compute_half_min_centroid_dists_simd(centroids, dim, k);
+
+        // Parallel bound check: tighten loose upper bounds against the
+        // assigned centroid; collect surviving points into the dirty list
+        let dirty: Vec<usize> = upper
+            .par_iter_mut()
+            .zip(lower.par_iter())
+            .zip(assignments.par_iter())
+            .enumerate()
+            .filter_map(|(i, ((u, &l), &a))| {
+                let s_a = s[a];
+                let m = if s_a > l { s_a } else { l };
+                if *u <= m {
+                    return None;
+                }
+                let vec = &data[i * dim..(i + 1) * dim];
+                let cent = &centroids[a * dim..(a + 1) * dim];
+                *u = euclidean_distance_static(vec, cent).sqrt();
+                if *u > m {
+                    Some(i)
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        if dirty.is_empty() {
+            if verbose {
+                println!("    Converged at iteration {} (bounds tight)", iter + 1);
+            }
+            break;
+        }
+
+        simd_reassign_dirty(
+            data,
+            dim,
+            centroids,
+            k,
+            &dirty,
+            &mut assignments,
+            &mut upper,
+            &mut lower,
+        );
+
+        if verbose && (iter + 1) % 10 == 0 {
+            println!(
+                "    Iteration {} ({} / {} points reassessed, {:.1}% pruned)",
+                iter + 1,
+                dirty.len(),
+                n,
+                (1.0 - dirty.len() as f64 / n as f64) * 100.0,
+            );
+        }
+    }
+}
+
 ////////////////
 // Assignment //
 ////////////////
@@ -1593,27 +1914,7 @@ where
     }
 
     match metric {
-        _ if dim < GEMM_DIM_THRESHOLD => {
-            if verbose {
-                println!(
-                    "    (direct SIMD assignment, dim={} below GEMM threshold)",
-                    dim
-                );
-            }
-            parallel_lloyd(
-                data,
-                &data_norms,
-                dim,
-                n,
-                &mut centroids,
-                &mut centroid_norms,
-                n_centroids,
-                metric,
-                max_iters,
-                verbose,
-            );
-        }
-        Dist::Euclidean => {
+        Dist::Euclidean if dim >= GEMM_DIM_THRESHOLD => {
             if verbose {
                 println!("    (Hamerly's bounds + GEMM assignment)");
             }
@@ -1629,7 +1930,22 @@ where
                 verbose,
             );
         }
-        Dist::Cosine => {
+        Dist::Euclidean if n_centroids >= SIMD_HAMERLY_K_THRESHOLD => {
+            if verbose {
+                println!("    (Hamerly's bounds + SIMD assignment)");
+            }
+            hamerly_lloyd_simd(
+                data,
+                dim,
+                n,
+                &mut centroids,
+                &mut centroid_norms,
+                n_centroids,
+                max_iters,
+                verbose,
+            );
+        }
+        Dist::Cosine if dim >= GEMM_DIM_THRESHOLD => {
             if verbose {
                 println!("    (GEMM assignment, no Hamerly -- cosine lacks triangle inequality)");
             }
@@ -1641,6 +1957,26 @@ where
                 &mut centroids,
                 &mut centroid_norms,
                 n_centroids,
+                max_iters,
+                verbose,
+            );
+        }
+        _ => {
+            if verbose {
+                println!(
+                    "    (direct SIMD assignment, dim={} below GEMM threshold, k={})",
+                    dim, n_centroids,
+                );
+            }
+            parallel_lloyd(
+                data,
+                &data_norms,
+                dim,
+                n,
+                &mut centroids,
+                &mut centroid_norms,
+                n_centroids,
+                metric,
                 max_iters,
                 verbose,
             );
@@ -2008,5 +2344,165 @@ mod tests {
         let near_ten_1 = (cent1.0 - 10.0).abs() < 1.0 && (cent1.1 - 10.0).abs() < 1.0;
 
         assert!((near_zero_0 && near_ten_1) || (near_ten_0 && near_zero_1));
+    }
+
+    #[test]
+    fn test_assign_one_with_bounds_simd() {
+        // Three centroids at (0,0), (3,0), (10,0). Query at (1,0):
+        // best = c0 (dist 1), second = c1 (dist 2)
+        let centroids = vec![0.0_f64, 0.0, 3.0, 0.0, 10.0, 0.0];
+        let vec = vec![1.0_f64, 0.0];
+
+        let (best_c, best_d, second_d) = assign_one_with_bounds_simd(&vec, &centroids, 2, 3);
+
+        assert_eq!(best_c, 0);
+        assert_relative_eq!(best_d, 1.0, epsilon = 1e-10);
+        assert_relative_eq!(second_d, 2.0, epsilon = 1e-10);
+    }
+
+    #[test]
+    fn test_simd_assign_full_with_bounds() {
+        let data = vec![
+            0.0_f64, 0.0, // near c0
+            0.1, 0.1, // near c0
+            10.0, 10.0, // near c1
+            9.9, 10.1, // near c1
+        ];
+        let centroids = vec![0.0_f64, 0.0, 10.0, 10.0];
+
+        let mut assignments = vec![0usize; 4];
+        let mut upper = vec![0.0_f64; 4];
+        let mut lower = vec![0.0_f64; 4];
+
+        simd_assign_full_with_bounds(
+            &data,
+            2,
+            &centroids,
+            2,
+            &mut assignments,
+            &mut upper,
+            &mut lower,
+        );
+
+        assert_eq!(assignments, vec![0, 0, 1, 1]);
+        // Vector 0 sits exactly on c0
+        assert_relative_eq!(upper[0], 0.0, epsilon = 1e-10);
+        // Lower bound for vector 0 is distance to c1
+        assert_relative_eq!(lower[0], (200.0_f64).sqrt(), epsilon = 1e-10);
+        // Upper < lower for every well-clustered point
+        for i in 0..4 {
+            assert!(upper[i] <= lower[i]);
+        }
+    }
+
+    #[test]
+    fn test_simd_reassign_dirty_updates_only_dirty() {
+        let data = vec![
+            0.0_f64, 0.0, //
+            0.1, 0.1, //
+            10.0, 10.0, //
+            9.9, 10.1, //
+        ];
+        let centroids = vec![0.0_f64, 0.0, 10.0, 10.0];
+
+        let mut assignments = vec![99usize; 4];
+        let mut upper = vec![-1.0_f64; 4];
+        let mut lower = vec![-1.0_f64; 4];
+
+        // Only points 0 and 2 are dirty
+        let dirty = vec![0usize, 2];
+
+        simd_reassign_dirty(
+            &data,
+            2,
+            &centroids,
+            2,
+            &dirty,
+            &mut assignments,
+            &mut upper,
+            &mut lower,
+        );
+
+        // Dirty points overwritten
+        assert_eq!(assignments[0], 0);
+        assert_eq!(assignments[2], 1);
+        assert!(upper[0] >= 0.0 && upper[2] >= 0.0);
+
+        // Non-dirty points untouched
+        assert_eq!(assignments[1], 99);
+        assert_eq!(assignments[3], 99);
+        assert_relative_eq!(upper[1], -1.0, epsilon = 1e-10);
+        assert_relative_eq!(upper[3], -1.0, epsilon = 1e-10);
+    }
+
+    #[test]
+    fn test_compute_half_min_centroid_dists_simd() {
+        // Three centroids at (0,0), (3,0), (10,0).
+        // dist(c0,c1)=3, dist(c0,c2)=10, dist(c1,c2)=7
+        // s[0] = 3/2, s[1] = 3/2, s[2] = 7/2
+        let centroids = vec![0.0_f64, 0.0, 3.0, 0.0, 10.0, 0.0];
+
+        let s = compute_half_min_centroid_dists_simd(&centroids, 2, 3);
+
+        assert_relative_eq!(s[0], 1.5, epsilon = 1e-10);
+        assert_relative_eq!(s[1], 1.5, epsilon = 1e-10);
+        assert_relative_eq!(s[2], 3.5, epsilon = 1e-10);
+    }
+
+    #[test]
+    fn test_hamerly_lloyd_simd_two_clusters() {
+        // Same shape as test_train_centroids_small but driving the SIMD
+        // Hamerly path directly
+        let data = vec![0.0_f64, 0.0, 0.1, 0.1, 10.0, 10.0, 10.1, 10.1];
+        let mut centroids = vec![0.0_f64, 0.0, 10.0, 10.0];
+        let mut centroid_norms = vec![0.0_f64; 2];
+
+        hamerly_lloyd_simd(
+            &data,
+            2,
+            4,
+            &mut centroids,
+            &mut centroid_norms,
+            2,
+            20,
+            false,
+        );
+
+        let cent0 = (centroids[0], centroids[1]);
+        let cent1 = (centroids[2], centroids[3]);
+
+        // Centroids should sit at the cluster means
+        let near_low = |c: (f64, f64)| (c.0 - 0.05).abs() < 1e-6 && (c.1 - 0.05).abs() < 1e-6;
+        let near_high = |c: (f64, f64)| (c.0 - 10.05).abs() < 1e-6 && (c.1 - 10.05).abs() < 1e-6;
+
+        assert!((near_low(cent0) && near_high(cent1)) || (near_high(cent0) && near_low(cent1)));
+    }
+
+    #[test]
+    fn test_train_centroids_dispatches_simd_hamerly() {
+        // Synthetic 2D data with many tight clusters; n_centroids above
+        // SIMD_HAMERLY_K_THRESHOLD forces the SIMD Hamerly path
+        let n_clusters = 120;
+        let pts_per_cluster = 5;
+        let dim = 2;
+        let n = n_clusters * pts_per_cluster;
+
+        let mut data = Vec::with_capacity(n * dim);
+        for c in 0..n_clusters {
+            let cx = c as f64;
+            let cy = (c * 3) as f64;
+            for p in 0..pts_per_cluster {
+                let jitter = p as f64 * 1e-3;
+                data.push(cx + jitter);
+                data.push(cy + jitter);
+            }
+        }
+
+        let centroids = train_centroids(&data, dim, n, n_clusters, &Dist::Euclidean, 30, 42, false);
+
+        assert_eq!(centroids.len(), n_clusters * dim);
+
+        // Every centroid should be finite
+        assert!(centroids.iter().all(|x: &f64| x.is_finite()));
     }
 }
