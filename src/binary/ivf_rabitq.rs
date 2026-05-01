@@ -147,7 +147,7 @@ where
         };
 
         let nlist = nlist.unwrap_or((n as f32).sqrt() as usize).max(1);
-        let max_iters = max_iters.unwrap_or(50);
+        let max_iters = max_iters.unwrap_or(30);
 
         if verbose {
             println!("  Building IVF-RaBitQ index with {} cells.", nlist);
@@ -294,7 +294,7 @@ where
         };
 
         let nlist = nlist.unwrap_or((n as f32).sqrt() as usize).max(1);
-        let max_iters = max_iters.unwrap_or(50);
+        let max_iters = max_iters.unwrap_or(30);
 
         if verbose {
             println!("  Building IVF-RaBitQ index with {} cells.", nlist);

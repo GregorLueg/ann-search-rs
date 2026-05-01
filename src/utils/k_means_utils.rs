@@ -129,7 +129,12 @@ const GEMM_DIM_THRESHOLD: usize = 96;
 /// Minimum number of centroids at which Hamerly's pruning beats plain Lloyd's
 /// on the SIMD path. Below this, per-iteration overhead of computing s[c] and
 /// updating bounds outweighs the saved distance work.
-const SIMD_HAMERLY_K_THRESHOLD: usize = 200;
+const SIMD_HAMERLY_K_THRESHOLD: usize = 100;
+
+/// Minimum number of dimensions at which Hamerly's pruning beats plain Lloyd's
+/// on the SIMD path. Below this, per-iteration overhead of computing s[c] and
+/// updating bounds outweighs the saved distance work.
+const SIMD_HAMERLY_DIM_MIN: usize = 64;
 
 /////////////
 // Helpers //
@@ -1930,7 +1935,10 @@ where
                 verbose,
             );
         }
-        Dist::Euclidean if n_centroids >= SIMD_HAMERLY_K_THRESHOLD => {
+        Dist::Euclidean
+            if (SIMD_HAMERLY_DIM_MIN..GEMM_DIM_THRESHOLD).contains(&dim)
+                && n_centroids >= SIMD_HAMERLY_K_THRESHOLD =>
+        {
             if verbose {
                 println!("    (Hamerly's bounds + SIMD assignment)");
             }

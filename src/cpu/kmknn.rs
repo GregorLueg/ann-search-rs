@@ -152,7 +152,7 @@ where
             }
         }
 
-        let max_iters = max_iters.unwrap_or(50);
+        let max_iters = max_iters.unwrap_or(30);
         let nlist = nlist.unwrap_or((n as f32).sqrt() as usize).max(1);
 
         let n_train = (256 * nlist).min(250_000).min(n).max(1);

@@ -1,5 +1,19 @@
 # News
 
+## 0.2.15
+
+**Features**
+
+- A SIMD path version of Hamerly's algorithm for k-means
+
+## 0.2.14
+
+**Features**
+
+- Improved parallel back-ends for Vamana and HNSW which have better memory
+  bandwidth
+- Improved CAGRA search evaluating more neighbours in one go per iteration.
+
 ## 0.2.13
 
 **Features**

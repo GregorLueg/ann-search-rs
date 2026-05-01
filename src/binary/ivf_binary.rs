@@ -139,7 +139,7 @@ where
 
         let (vectors_flat, _, _) = matrix_to_flat(data);
 
-        let max_iters = max_iters.unwrap_or(50);
+        let max_iters = max_iters.unwrap_or(30);
         let nlist = nlist.unwrap_or((n as f32).sqrt() as usize).max(1);
 
         if verbose {
@@ -286,7 +286,7 @@ where
 
         let (vectors_flat, _, _) = matrix_to_flat(data);
 
-        let max_iters = max_iters.unwrap_or(50);
+        let max_iters = max_iters.unwrap_or(30);
         let nlist = nlist.unwrap_or((n as f32).sqrt() as usize).max(1);
 
         if verbose {
