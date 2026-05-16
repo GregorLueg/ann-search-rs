@@ -281,7 +281,9 @@ where
 /// * `mat` - The initial matrix with samples x features
 /// * `dist_metric` - Distance metric: "euclidean" or "cosine"
 /// * `nlist` - Optional number of clusters. Defaults to sqrt(n).
-/// * `max_iters` - Optional maximum k-means iterations (defaults to 30).
+/// * `k_means_params` - Optional k-means trainings parameters, see
+///   [KMeansTrainingParams]. If not provided, will default to sensible
+///   defaults.
 /// * `seed` - Random seed for reproducibility
 /// * `verbose` - Print build progress
 ///
@@ -292,7 +294,7 @@ pub fn build_kmknn_index<T>(
     mat: MatRef<T>,
     dist_metric: &str,
     nlist: Option<usize>,
-    max_iters: Option<usize>,
+    k_means_params: Option<KMeansTrainingParams>,
     seed: usize,
     verbose: bool,
 ) -> KmknnIndex<T>
@@ -300,7 +302,7 @@ where
     T: AnnSearchFloat,
 {
     let metric = parse_ann_dist(dist_metric).unwrap_or_default();
-    KmknnIndex::build(mat, metric, nlist, max_iters, seed, verbose)
+    KmknnIndex::build(mat, metric, nlist, k_means_params, seed, verbose)
 }
 
 /// Helper function to query a given kMkNN index
@@ -646,7 +648,9 @@ where
 /// * `mat` - The data matrix. Rows represent the samples, columns represent
 ///   the embedding dimensions
 /// * `nlist` - Number of clusters to create
-/// * `max_iters` - Maximum k-means iterations (defaults to 30 if None)
+/// * `k_means_params` - Optional k-means trainings parameters, see
+///   [KMeansTrainingParams]. If not provided, will default to sensible
+///   defaults.
 /// * `dist_metric` - The distance metric to use. One of `"euclidean"` or
 ///   `"cosine"`
 /// * `seed` - Random seed for reproducibility
@@ -658,7 +662,7 @@ where
 pub fn build_ivf_index<T>(
     mat: MatRef<T>,
     nlist: Option<usize>,
-    max_iters: Option<usize>,
+    k_means_params: Option<KMeansTrainingParams>,
     dist_metric: &str,
     seed: usize,
     verbose: bool,
@@ -668,7 +672,7 @@ where
 {
     let ann_dist = parse_ann_dist(dist_metric).unwrap_or_default();
 
-    IvfIndex::build(mat, ann_dist, nlist, max_iters, seed, verbose)
+    IvfIndex::build(mat, ann_dist, nlist, k_means_params, seed, verbose)
 }
 
 /// Helper function to query a given IVF index
@@ -1557,7 +1561,9 @@ where
 ///   the embedding dimensions
 /// * `nlist` - Optional number of cells to create. If not provided, defaults
 ///   to `sqrt(n)`.
-/// * `max_iters` - Maximum k-means iterations (defaults to 30 if None)
+/// * `k_means_params` - Optional k-means trainings parameters, see
+///   [KMeansTrainingParams]. If not provided, will default to sensible
+///   defaults.
 /// * `seed` - Random seed for reproducibility
 /// * `verbose` - Print progress information during index construction
 ///
@@ -1567,7 +1573,7 @@ where
 pub fn build_ivf_bf16_index<T>(
     mat: MatRef<T>,
     nlist: Option<usize>,
-    max_iters: Option<usize>,
+    k_means_params: Option<KMeansTrainingParams>,
     dist_metric: &str,
     seed: usize,
     verbose: bool,
@@ -1577,7 +1583,7 @@ where
 {
     let ann_dist = parse_ann_dist(dist_metric).unwrap_or_default();
 
-    IvfIndexBf16::build(mat, ann_dist, nlist, max_iters, seed, verbose)
+    IvfIndexBf16::build(mat, ann_dist, nlist, k_means_params, seed, verbose)
 }
 
 #[cfg(feature = "quantised")]
@@ -1658,7 +1664,9 @@ where
 ///   the embedding dimensions
 /// * `nlist` - Optional number of cells to create. If not provided, defaults
 ///   to `sqrt(n)`.
-/// * `max_iters` - Maximum k-means iterations (defaults to 30 if None)
+/// * `k_means_params` - Optional k-means trainings parameters, see
+///   [KMeansTrainingParams]. If not provided, will default to sensible
+///   defaults.
 /// * `seed` - Random seed for reproducibility
 /// * `verbose` - Print progress information during index construction
 ///
@@ -1668,7 +1676,7 @@ where
 pub fn build_ivf_sq8_index<T>(
     mat: MatRef<T>,
     nlist: Option<usize>,
-    max_iters: Option<usize>,
+    k_means_params: Option<KMeansTrainingParams>,
     dist_metric: &str,
     seed: usize,
     verbose: bool,
@@ -1678,7 +1686,7 @@ where
 {
     let ann_dist = parse_ann_dist(dist_metric).unwrap_or_default();
 
-    IvfSq8Index::build(mat, nlist, ann_dist, max_iters, seed, verbose)
+    IvfSq8Index::build(mat, nlist, ann_dist, k_means_params, seed, verbose)
 }
 
 #[cfg(feature = "quantised")]
@@ -1760,7 +1768,9 @@ where
 /// * `nlist` - Number of IVF clusters to create
 /// * `m` - Number of subspaces for product quantisation (dim must be divisible
 ///   by m)
-/// * `max_iters` - Maximum k-means iterations (defaults to 30 if None)
+/// * `k_means_params` - Optional k-means trainings parameters, see
+///   [KMeansTrainingParams]. If not provided, will default to sensible
+///   defaults.
 /// * `dist_metric` - Distance metric ("euclidean" or "cosine")
 /// * `seed` - Random seed for reproducibility
 /// * `verbose` - Print progress information during index construction
@@ -1773,7 +1783,7 @@ pub fn build_ivf_pq_index<T>(
     mat: MatRef<T>,
     nlist: Option<usize>,
     m: usize,
-    max_iters: Option<usize>,
+    k_means_params: Option<KMeansTrainingParams>,
     n_pq_centroids: Option<usize>,
     dist_metric: &str,
     seed: usize,
@@ -1789,7 +1799,7 @@ where
         nlist,
         m,
         ann_dist,
-        max_iters,
+        k_means_params,
         n_pq_centroids,
         seed,
         verbose,
@@ -1874,7 +1884,9 @@ where
 /// * `nlist` - Number of IVF clusters to create
 /// * `m` - Number of subspaces for product quantisation (dim must be divisible
 ///   by m)
-/// * `max_iters` - Maximum k-means iterations (defaults to 30 if None)
+/// * `k_means_params` - Optional k-means trainings parameters, see
+///   [KMeansTrainingParams]. If not provided, will default to sensible
+///   defaults.
 /// * `dist_metric` - Distance metric ("euclidean" or "cosine")
 /// * `seed` - Random seed for reproducibility
 /// * `verbose` - Print progress information during index construction
@@ -1887,7 +1899,7 @@ pub fn build_ivf_opq_index<T>(
     mat: MatRef<T>,
     nlist: Option<usize>,
     m: usize,
-    max_iters: Option<usize>,
+    k_means_params: Option<KMeansTrainingParams>,
     n_opq_centroids: Option<usize>,
     n_opq_iter: Option<usize>,
     dist_metric: &str,
@@ -1904,7 +1916,7 @@ where
         nlist,
         m,
         ann_dist,
-        max_iters,
+        k_means_params,
         n_opq_iter,
         n_opq_centroids,
         seed,
@@ -2081,7 +2093,9 @@ where
 ///
 /// * `mat` - Data matrix [samples, features]
 /// * `nlist` - Number of clusters (defaults to √n)
-/// * `max_iters` - K-means iterations (defaults to 30)
+/// * `k_means_params` - Optional k-means trainings parameters, see
+///   [KMeansTrainingParams]. If not provided, will default to sensible
+///   defaults.
 /// * `dist_metric` - "euclidean" or "cosine"
 /// * `seed` - Random seed
 /// * `verbose` - Print progress
@@ -2089,7 +2103,7 @@ where
 pub fn build_ivf_index_gpu<T, R>(
     mat: MatRef<T>,
     nlist: Option<usize>,
-    max_iters: Option<usize>,
+    k_means_params: Option<KMeansTrainingParams>,
     dist_metric: &str,
     seed: usize,
     verbose: bool,
@@ -2100,7 +2114,7 @@ where
     T: AnnSearchFloat + AnnSearchGpuFloat,
 {
     let ann_dist = parse_ann_dist(dist_metric).unwrap_or_default();
-    IvfIndexGpu::build(mat, ann_dist, nlist, max_iters, seed, verbose, device)
+    IvfIndexGpu::build(mat, ann_dist, nlist, k_means_params, seed, verbose, device)
 }
 
 #[cfg(feature = "gpu")]
@@ -2523,7 +2537,9 @@ where
 /// * `binarisation_init` - "itq" or "random"
 /// * `n_bits` - Number of bits per code (multiple of 8)
 /// * `nlist` - Number of clusters (defaults to √n)
-/// * `max_iters` - K-means iterations (defaults to 30)
+/// * `k_means_params` - Optional k-means trainings parameters, see
+///   [KMeansTrainingParams]. If not provided, will default to sensible
+///   defaults.
 /// * `dist_metric` - "euclidean" or "cosine"
 /// * `seed` - Random seed
 /// * `save_store` - Whether to save vector store for reranking
@@ -2540,7 +2556,7 @@ pub fn build_ivf_index_binary<T>(
     binarisation_init: &str,
     n_bits: usize,
     nlist: Option<usize>,
-    max_iters: Option<usize>,
+    k_means_params: Option<KMeansTrainingParams>,
     dist_metric: &str,
     seed: usize,
     save_store: bool,
@@ -2560,7 +2576,7 @@ where
             n_bits,
             ann_dist,
             nlist,
-            max_iters,
+            k_means_params,
             seed,
             verbose,
             path,
@@ -2572,7 +2588,7 @@ where
             n_bits,
             ann_dist,
             nlist,
-            max_iters,
+            k_means_params,
             seed,
             verbose,
         ))
@@ -2798,7 +2814,9 @@ where
 ///
 /// * `mat` - The initial matrix with samples x features
 /// * `nlist` - Number of IVF cells (None for sqrt(n))
-/// * `max_iters` - K-means iterations (None for 30)
+/// * `k_means_params` - Optional k-means trainings parameters, see
+///   [KMeansTrainingParams]. If not provided, will default to sensible
+///   defaults.
 /// * `dist_metric` - "euclidean" or "cosine"
 /// * `seed` - Random seed
 /// * `save_store` - Whether to save vector store for reranking
@@ -2813,7 +2831,7 @@ where
 pub fn build_ivf_index_rabitq<T>(
     mat: MatRef<T>,
     nlist: Option<usize>,
-    max_iters: Option<usize>,
+    k_means_params: Option<KMeansTrainingParams>,
     dist_metric: &str,
     seed: usize,
     save_store: bool,
@@ -2827,11 +2845,22 @@ where
     if save_store {
         let path = save_path.expect("save_path required when save_store is true");
         IvfIndexRaBitQ::build_with_vector_store(
-            mat, ann_dist, nlist, max_iters, seed, verbose, path,
+            mat,
+            ann_dist,
+            nlist,
+            k_means_params,
+            seed,
+            verbose,
+            path,
         )
     } else {
         Ok(IvfIndexRaBitQ::build(
-            mat, ann_dist, nlist, max_iters, seed, verbose,
+            mat,
+            ann_dist,
+            nlist,
+            k_means_params,
+            seed,
+            verbose,
         ))
     }
 }

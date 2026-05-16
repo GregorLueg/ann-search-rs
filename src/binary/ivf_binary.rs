@@ -113,7 +113,9 @@ where
     /// * `n_bits` - Number of bits per binary code (must be multiple of 8)
     /// * `metric` - Distance metric for centroid routing
     /// * `nlist` - Optional number of clusters (defaults to sqrt(n))
-    /// * `max_iters` - Optional max k-means iterations (defaults to `50`)
+    /// * `k_means_params` - Optional k-means trainings parameters, see
+    ///   [KMeansTrainingParams]. If not provided, will default to sensible
+    ///   defaults.
     /// * `seed` - Random seed
     /// * `verbose` - Print progress
     ///
@@ -127,7 +129,7 @@ where
         n_bits: usize,
         metric: Dist,
         nlist: Option<usize>,
-        max_iters: Option<usize>,
+        k_means_params: Option<KMeansTrainingParams>,
         seed: usize,
         verbose: bool,
     ) -> Self {
@@ -139,7 +141,6 @@ where
 
         let (vectors_flat, _, _) = matrix_to_flat(data);
 
-        let max_iters = max_iters.unwrap_or(30);
         let nlist = nlist.unwrap_or((n as f32).sqrt() as usize).max(1);
 
         if verbose {
@@ -160,7 +161,7 @@ where
             n_train,
             nlist,
             &metric,
-            max_iters,
+            k_means_params,
             seed,
             verbose,
         );
@@ -258,7 +259,9 @@ where
     /// * `n_bits` - Number of bits per binary code (must be multiple of 8)
     /// * `metric` - Distance metric for centroid routing and reranking
     /// * `nlist` - Optional number of clusters (defaults to sqrt(n))
-    /// * `max_iters` - Optional max k-means iterations (defaults to `50`)
+    /// * `k_means_params` - Optional k-means trainings parameters, see
+    ///   [KMeansTrainingParams]. If not provided, will default to sensible
+    ///   defaults.
     /// * `seed` - Random seed
     /// * `verbose` - Print progress
     /// * `save_path` - Directory to save vector store files
@@ -273,7 +276,7 @@ where
         n_bits: usize,
         metric: Dist,
         nlist: Option<usize>,
-        max_iters: Option<usize>,
+        k_means_params: Option<KMeansTrainingParams>,
         seed: usize,
         verbose: bool,
         save_path: impl AsRef<Path>,
@@ -286,7 +289,6 @@ where
 
         let (vectors_flat, _, _) = matrix_to_flat(data);
 
-        let max_iters = max_iters.unwrap_or(30);
         let nlist = nlist.unwrap_or((n as f32).sqrt() as usize).max(1);
 
         if verbose {
@@ -314,7 +316,7 @@ where
             n_train,
             nlist,
             &metric,
-            max_iters,
+            k_means_params,
             seed,
             verbose,
         );
@@ -941,6 +943,10 @@ mod tests {
         data
     }
 
+    fn get_default_k_means() -> Option<KMeansTrainingParams> {
+        Some(KMeansTrainingParams::new(10, None, None))
+    }
+
     #[test]
     fn test_ivf_binary_construction() {
         let data = create_test_data::<f32>(200, 32);
@@ -950,7 +956,7 @@ mod tests {
             64,
             Dist::Cosine,
             Some(10),
-            Some(10),
+            get_default_k_means(),
             42,
             false,
         );
@@ -971,7 +977,7 @@ mod tests {
             64,
             Dist::Cosine,
             Some(10),
-            Some(10),
+            get_default_k_means(),
             42,
             false,
         );
@@ -992,7 +998,7 @@ mod tests {
             64,
             Dist::Cosine,
             Some(10),
-            Some(10),
+            get_default_k_means(),
             42,
             false,
         );
@@ -1014,7 +1020,7 @@ mod tests {
             64,
             Dist::Cosine,
             Some(20),
-            Some(10),
+            get_default_k_means(),
             42,
             false,
         );
@@ -1036,7 +1042,7 @@ mod tests {
             64,
             Dist::Cosine,
             Some(10),
-            Some(10),
+            get_default_k_means(),
             42,
             false,
         );
@@ -1057,7 +1063,7 @@ mod tests {
             64,
             Dist::Cosine,
             Some(10),
-            Some(10),
+            get_default_k_means(),
             42,
             false,
         );
@@ -1083,7 +1089,7 @@ mod tests {
             64,
             Dist::Cosine,
             Some(10),
-            Some(10),
+            get_default_k_means(),
             42,
             false,
             temp_dir.path(),
@@ -1107,7 +1113,7 @@ mod tests {
             64,
             Dist::Cosine,
             Some(10),
-            Some(10),
+            get_default_k_means(),
             42,
             false,
             temp_dir.path(),
@@ -1136,7 +1142,7 @@ mod tests {
             64,
             Dist::Euclidean,
             Some(10),
-            Some(10),
+            get_default_k_means(),
             42,
             false,
             temp_dir.path(),
@@ -1162,7 +1168,7 @@ mod tests {
             64,
             Dist::Cosine,
             Some(10),
-            Some(10),
+            get_default_k_means(),
             42,
             false,
             temp_dir.path(),
@@ -1189,7 +1195,7 @@ mod tests {
             64,
             Dist::Cosine,
             Some(10),
-            Some(10),
+            get_default_k_means(),
             42,
             false,
         );
@@ -1207,7 +1213,7 @@ mod tests {
             64,
             Dist::Cosine,
             Some(16),
-            Some(10),
+            get_default_k_means(),
             42,
             false,
         );

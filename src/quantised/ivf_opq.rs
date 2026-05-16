@@ -128,7 +128,9 @@ where
     /// * `nlist` - Optional number of clusters. Defaults to `sqrt(n)`.
     /// * `m` - Number of subspaces for PQ (dim must be divisible by m)
     /// * `metric` - Distance metric (Euclidean or Cosine)
-    /// * `max_iters` - Optional maximum k-means iterations (defaults to `50`).
+    /// * `k_means_params` - Optional k-means trainings parameters, see
+    ///   [KMeansTrainingParams]. If not provided, will default to sensible
+    ///   defaults.
     /// * `opq_iter` - Optional number of iterations to get the rotation matrix.
     ///   Defaults to `3`.
     /// * `n_opq_centroids` - Number of centroids to use for the product
@@ -145,7 +147,7 @@ where
         nlist: Option<usize>,
         m: usize,
         metric: Dist,
-        max_iters: Option<usize>,
+        k_means_params: Option<KMeansTrainingParams>,
         opq_iter: Option<usize>,
         n_opq_centroids: Option<usize>,
         seed: usize,
@@ -153,7 +155,6 @@ where
     ) -> Self {
         let (mut vectors_flat, n, dim) = matrix_to_flat(data);
 
-        let max_iters = max_iters.unwrap_or(30);
         let nlist = nlist.unwrap_or((n as f32).sqrt() as usize).max(1);
 
         // normalise for cosine distance
@@ -181,7 +182,7 @@ where
             n_train,
             nlist,
             &metric,
-            max_iters,
+            k_means_params,
             seed,
             verbose,
         );
@@ -234,7 +235,7 @@ where
             m,
             n_opq_centroids,
             opq_iter,
-            max_iters,
+            30,
             seed + 1000,
             verbose,
         );
@@ -563,6 +564,10 @@ mod tests {
         Mat::from_fn(6, 32, |i, j| data[i * 32 + j])
     }
 
+    fn get_default_k_means() -> Option<KMeansTrainingParams> {
+        Some(KMeansTrainingParams::new(10, None, None))
+    }
+
     #[test]
     fn test_build_euclidean() {
         let data = create_simple_dataset();
@@ -571,7 +576,7 @@ mod tests {
             Some(2),
             8,
             Dist::Euclidean,
-            Some(10),
+            get_default_k_means(),
             Some(1),
             Some(4),
             42,
@@ -595,7 +600,7 @@ mod tests {
             Some(2),
             8,
             Dist::Cosine,
-            Some(10),
+            get_default_k_means(),
             Some(1),
             Some(4),
             42,
@@ -613,7 +618,7 @@ mod tests {
             Some(2),
             8,
             Dist::Euclidean,
-            Some(10),
+            get_default_k_means(),
             Some(1),
             Some(4),
             42,
@@ -635,7 +640,7 @@ mod tests {
             Some(2),
             8,
             Dist::Euclidean,
-            Some(10),
+            get_default_k_means(),
             Some(1),
             Some(4),
             42,
@@ -656,7 +661,7 @@ mod tests {
             Some(2),
             8,
             Dist::Euclidean,
-            Some(10),
+            get_default_k_means(),
             Some(1),
             Some(4),
             42,
@@ -679,7 +684,7 @@ mod tests {
             Some(2),
             8,
             Dist::Cosine,
-            Some(10),
+            get_default_k_means(),
             Some(1),
             Some(4),
             42,
@@ -701,7 +706,7 @@ mod tests {
             Some(2),
             8,
             Dist::Euclidean,
-            Some(10),
+            get_default_k_means(),
             Some(1),
             Some(4),
             42,
@@ -725,7 +730,7 @@ mod tests {
             Some(2),
             8,
             Dist::Euclidean,
-            Some(10),
+            get_default_k_means(),
             Some(1),
             Some(4),
             42,
@@ -749,7 +754,7 @@ mod tests {
             Some(2),
             8,
             Dist::Euclidean,
-            Some(10),
+            get_default_k_means(),
             Some(1),
             Some(4),
             42,
@@ -774,7 +779,7 @@ mod tests {
             Some(2),
             8,
             Dist::Euclidean,
-            Some(5),
+            get_default_k_means(),
             Some(1),
             Some(4),
             42,
@@ -794,7 +799,7 @@ mod tests {
             Some(2),
             8,
             Dist::Euclidean,
-            Some(10),
+            get_default_k_means(),
             Some(1),
             Some(4),
             42,
@@ -815,7 +820,7 @@ mod tests {
             Some(2),
             8,
             Dist::Euclidean,
-            Some(10),
+            get_default_k_means(),
             Some(1),
             Some(4),
             42,
@@ -839,7 +844,7 @@ mod tests {
             Some(5),
             8,
             Dist::Euclidean,
-            Some(5),
+            get_default_k_means(),
             Some(2),
             Some(4),
             42,
@@ -858,7 +863,7 @@ mod tests {
             Some(5),
             8,
             Dist::Euclidean,
-            Some(5),
+            get_default_k_means(),
             Some(1),
             Some(4),
             42,

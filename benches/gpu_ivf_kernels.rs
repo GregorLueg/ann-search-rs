@@ -4,6 +4,7 @@
 
 #![allow(dead_code)]
 
+use ann_search_rs::prelude::KMeansTrainingParams;
 use cubecl::benchmark::{Benchmark, TimingMethod};
 use cubecl::future;
 use cubecl::prelude::*;
@@ -32,6 +33,10 @@ struct IvfBuildInput {
     dim: usize,
 }
 
+fn default_k_means_params() -> Option<KMeansTrainingParams> {
+    Some(KMeansTrainingParams::new(10, None, None))
+}
+
 impl<R: Runtime> Benchmark for IvfBuildBench<R> {
     type Input = IvfBuildInput;
     type Output = ();
@@ -52,7 +57,7 @@ impl<R: Runtime> Benchmark for IvfBuildBench<R> {
             mat.as_ref(),
             self.metric,
             Some(self.nlist),
-            Some(10),
+            default_k_means_params(),
             42,
             false,
             self.device.clone(),
@@ -169,7 +174,7 @@ fn run_ivf_suite<R: Runtime>(device: &R::Device) {
             mat.as_ref(),
             Dist::Euclidean,
             Some(nlist),
-            Some(10),
+            default_k_means_params(),
             42,
             false,
             device.clone(),

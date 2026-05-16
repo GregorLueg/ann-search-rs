@@ -95,7 +95,9 @@ where
     /// * `data` - Data matrix (n × dim)
     /// * `metric` - Distance metric
     /// * `nlist` - Number of IVF cells (defaults to sqrt(n))
-    /// * `max_iters` - K-means iterations (defaults to 30)
+    /// * `k_means_params` - Optional k-means trainings parameters, see
+    ///   [KMeansTrainingParams]. If not provided, will default to sensible
+    ///   defaults.
     /// * `seed` - Random seed
     /// * `verbose` - Print progress
     ///
@@ -107,7 +109,7 @@ where
         data: MatRef<T>,
         metric: Dist,
         nlist: Option<usize>,
-        max_iters: Option<usize>,
+        k_means_params: Option<KMeansTrainingParams>,
         seed: usize,
         verbose: bool,
     ) -> Self {
@@ -147,7 +149,6 @@ where
         };
 
         let nlist = nlist.unwrap_or((n as f32).sqrt() as usize).max(1);
-        let max_iters = max_iters.unwrap_or(30);
 
         if verbose {
             println!("  Building IVF-RaBitQ index with {} cells.", nlist);
@@ -170,7 +171,7 @@ where
             n_train,
             nlist,
             &metric,
-            max_iters,
+            k_means_params,
             seed,
             verbose,
         );
@@ -244,7 +245,9 @@ where
     /// * `data` - Data matrix (n × dim)
     /// * `metric` - Distance metric
     /// * `nlist` - Number of IVF cells (defaults to sqrt(n))
-    /// * `max_iters` - K-means iterations (defaults to 30)
+    /// * `k_means_params` - Optional k-means trainings parameters, see
+    ///   [KMeansTrainingParams]. If not provided, will default to sensible
+    ///   defaults.
     /// * `seed` - Random seed
     /// * `verbose` - Print progress
     /// * `save_path` - Path to save vector store
@@ -257,7 +260,7 @@ where
         data: MatRef<T>,
         metric: Dist,
         nlist: Option<usize>,
-        max_iters: Option<usize>,
+        k_means_params: Option<KMeansTrainingParams>,
         seed: usize,
         verbose: bool,
         save_path: impl AsRef<Path>,
@@ -294,7 +297,6 @@ where
         };
 
         let nlist = nlist.unwrap_or((n as f32).sqrt() as usize).max(1);
-        let max_iters = max_iters.unwrap_or(30);
 
         if verbose {
             println!("  Building IVF-RaBitQ index with {} cells.", nlist);
@@ -322,7 +324,7 @@ where
             n_train,
             nlist,
             &metric,
-            max_iters,
+            k_means_params,
             seed,
             verbose,
         );
@@ -660,6 +662,10 @@ mod tests {
         data
     }
 
+    fn get_default_k_means() -> Option<KMeansTrainingParams> {
+        Some(KMeansTrainingParams::new(10, None, None))
+    }
+
     #[test]
     fn test_ivf_rabitq_construction() {
         let data = create_test_data::<f32>(100, 32);
@@ -667,7 +673,7 @@ mod tests {
             data.as_ref(),
             Dist::Euclidean,
             Some(10),
-            Some(10),
+            get_default_k_means(),
             42,
             false,
         );
@@ -684,7 +690,7 @@ mod tests {
             data.as_ref(),
             Dist::Euclidean,
             Some(10),
-            Some(10),
+            get_default_k_means(),
             42,
             false,
         );
@@ -703,7 +709,7 @@ mod tests {
             data.as_ref(),
             Dist::Euclidean,
             Some(10),
-            Some(10),
+            get_default_k_means(),
             42,
             false,
         );
@@ -719,8 +725,14 @@ mod tests {
     #[test]
     fn test_ivf_rabitq_query_k_exceeds_n() {
         let data = create_test_data::<f32>(50, 32);
-        let index =
-            IvfIndexRaBitQ::build(data.as_ref(), Dist::Euclidean, Some(5), Some(10), 42, false);
+        let index = IvfIndexRaBitQ::build(
+            data.as_ref(),
+            Dist::Euclidean,
+            Some(5),
+            get_default_k_means(),
+            42,
+            false,
+        );
 
         let query: Vec<f32> = (0..32).map(|i| i as f32 * 0.1).collect();
         let (indices, _) = index.query(&query, 100, Some(5));
@@ -735,7 +747,7 @@ mod tests {
             data.as_ref(),
             Dist::Euclidean,
             Some(10),
-            Some(10),
+            get_default_k_means(),
             42,
             false,
         );
@@ -749,8 +761,14 @@ mod tests {
     #[test]
     fn test_ivf_rabitq_cosine() {
         let data = create_test_data::<f32>(100, 32);
-        let index =
-            IvfIndexRaBitQ::build(data.as_ref(), Dist::Cosine, Some(10), Some(10), 42, false);
+        let index = IvfIndexRaBitQ::build(
+            data.as_ref(),
+            Dist::Cosine,
+            Some(10),
+            get_default_k_means(),
+            42,
+            false,
+        );
 
         let query: Vec<f32> = (0..32).map(|i| i as f32 * 0.1).collect();
         let (indices, distances) = index.query(&query, 10, Some(10));
@@ -766,7 +784,7 @@ mod tests {
             data.as_ref(),
             Dist::Euclidean,
             Some(10),
-            Some(10),
+            get_default_k_means(),
             42,
             false,
         );
@@ -786,7 +804,7 @@ mod tests {
             data.as_ref(),
             Dist::Euclidean,
             Some(5),
-            Some(10),
+            get_default_k_means(),
             42,
             false,
             temp_dir.path(),
@@ -806,7 +824,7 @@ mod tests {
             data.as_ref(),
             Dist::Cosine,
             Some(10),
-            Some(10),
+            get_default_k_means(),
             42,
             false,
             temp_dir.path(),
@@ -833,7 +851,7 @@ mod tests {
             data.as_ref(),
             Dist::Euclidean,
             Some(10),
-            Some(10),
+            get_default_k_means(),
             42,
             false,
             temp_dir.path(),
@@ -856,7 +874,7 @@ mod tests {
             data.as_ref(),
             Dist::Cosine,
             Some(5),
-            Some(10),
+            get_default_k_means(),
             42,
             false,
             temp_dir.path(),
@@ -878,8 +896,14 @@ mod tests {
     #[should_panic]
     fn test_knn_without_vector_store_panics() {
         let data = create_test_data::<f32>(50, 32);
-        let index =
-            IvfIndexRaBitQ::build(data.as_ref(), Dist::Euclidean, Some(5), Some(10), 42, false);
+        let index = IvfIndexRaBitQ::build(
+            data.as_ref(),
+            Dist::Euclidean,
+            Some(5),
+            get_default_k_means(),
+            42,
+            false,
+        );
 
         let _ = index.generate_knn(5, Some(5), Some(10), false, false);
     }
@@ -888,8 +912,14 @@ mod tests {
     #[should_panic]
     fn test_query_reranking_without_vector_store_panics() {
         let data = create_test_data::<f32>(50, 32);
-        let index =
-            IvfIndexRaBitQ::build(data.as_ref(), Dist::Euclidean, Some(5), Some(10), 42, false);
+        let index = IvfIndexRaBitQ::build(
+            data.as_ref(),
+            Dist::Euclidean,
+            Some(5),
+            get_default_k_means(),
+            42,
+            false,
+        );
 
         let query: Vec<f32> = (0..32).map(|i| i as f32 * 0.1).collect();
         let _ = index.query_reranking(&query, 10, Some(5), Some(5));
@@ -898,8 +928,14 @@ mod tests {
     #[test]
     fn test_default_nlist() {
         let data = create_test_data::<f32>(100, 32);
-        let index =
-            IvfIndexRaBitQ::build(data.as_ref(), Dist::Euclidean, None, Some(10), 42, false);
+        let index = IvfIndexRaBitQ::build(
+            data.as_ref(),
+            Dist::Euclidean,
+            None,
+            get_default_k_means(),
+            42,
+            false,
+        );
 
         assert_eq!(index.storage.nlist, 10);
     }

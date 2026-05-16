@@ -128,7 +128,9 @@ where
     /// * `data` - Matrix reference with vectors as rows (n × dim)
     /// * `metric` - Distance metric (Euclidean or Cosine)
     /// * `nlist` - Optional number of clusters. Defaults to `sqrt(n)`.
-    /// * `max_iters` - Optional maximum k-means iterations (defaults to `50`).
+    /// * `k_means_params` - Optional k-means trainings parameters, see
+    ///   [KMeansTrainingParams]. If not provided, will default to sensible
+    ///   defaults.
     /// * `seed` - Random seed for reproducibility
     /// * `verbose` - Print training progress
     ///
@@ -139,7 +141,7 @@ where
         data: MatRef<T>,
         metric: Dist,
         nlist: Option<usize>,
-        max_iters: Option<usize>,
+        k_means_params: Option<KMeansTrainingParams>,
         seed: usize,
         verbose: bool,
     ) -> Self {
@@ -158,7 +160,6 @@ where
             Vec::new()
         };
 
-        let max_iters = max_iters.unwrap_or(30);
         let nlist = nlist.unwrap_or((n as f32).sqrt() as usize).max(1);
 
         // 1. subsample training data
@@ -176,7 +177,7 @@ where
             n_train,
             nlist,
             &metric,
-            max_iters,
+            k_means_params,
             seed,
             verbose,
         );
@@ -542,6 +543,10 @@ mod tests {
     use faer_traits::ComplexField;
     use num_traits::{Float, FromPrimitive};
 
+    fn get_default_k_means() -> Option<KMeansTrainingParams> {
+        Some(KMeansTrainingParams::new(10, None, None))
+    }
+
     fn create_test_data<T: Float + FromPrimitive + ComplexField>(n: usize, dim: usize) -> Mat<T> {
         let mut data = Mat::zeros(n, dim);
         for i in 0..n {
@@ -559,7 +564,7 @@ mod tests {
             data.as_ref(),
             Dist::Euclidean,
             Some(10),
-            Some(10),
+            get_default_k_means(),
             42,
             false,
         );
@@ -574,7 +579,14 @@ mod tests {
     #[test]
     fn test_ivf_bf16_construction_cosine() {
         let data = create_test_data::<f32>(200, 32);
-        let index = IvfIndexBf16::build(data.as_ref(), Dist::Cosine, Some(10), Some(10), 42, false);
+        let index = IvfIndexBf16::build(
+            data.as_ref(),
+            Dist::Cosine,
+            Some(10),
+            get_default_k_means(),
+            42,
+            false,
+        );
 
         assert_eq!(index.n, 200);
         assert_eq!(index.dim, 32);
@@ -589,7 +601,7 @@ mod tests {
             data.as_ref(),
             Dist::Euclidean,
             Some(10),
-            Some(10),
+            get_default_k_means(),
             42,
             false,
         );
@@ -608,7 +620,7 @@ mod tests {
             data.as_ref(),
             Dist::Euclidean,
             Some(10),
-            Some(10),
+            get_default_k_means(),
             42,
             false,
         );
@@ -628,7 +640,7 @@ mod tests {
             data.as_ref(),
             Dist::Euclidean,
             Some(10),
-            Some(10),
+            get_default_k_means(),
             42,
             false,
         );
@@ -643,7 +655,14 @@ mod tests {
     #[test]
     fn test_ivf_bf16_query_cosine() {
         let data = create_test_data::<f32>(200, 32);
-        let index = IvfIndexBf16::build(data.as_ref(), Dist::Cosine, Some(10), Some(10), 42, false);
+        let index = IvfIndexBf16::build(
+            data.as_ref(),
+            Dist::Cosine,
+            Some(10),
+            get_default_k_means(),
+            42,
+            false,
+        );
 
         let query: Vec<f32> = (0..32).map(|i| i as f32 * 0.1).collect();
         let (indices, distances) = index.query(&query, 10, Some(10));
@@ -662,7 +681,7 @@ mod tests {
             data.as_ref(),
             Dist::Euclidean,
             Some(10),
-            Some(10),
+            get_default_k_means(),
             42,
             false,
         );
@@ -684,7 +703,7 @@ mod tests {
             data.as_ref(),
             Dist::Euclidean,
             Some(20),
-            Some(10),
+            get_default_k_means(),
             42,
             false,
         );

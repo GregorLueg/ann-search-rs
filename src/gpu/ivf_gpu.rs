@@ -84,7 +84,9 @@ where
     /// * `data` - Database vectors [n, dim]
     /// * `metric` - Distance metric
     /// * `nlist` - Number of clusters (defaults to `sqrt(n)`)
-    /// * `max_iters` - Optional k-means iterations (defaults to `50`)
+    /// * `k_means_params` - Optional k-means trainings parameters, see
+    ///   [KMeansTrainingParams]. If not provided, will default to sensible
+    ///   defaults.
     /// * `seed` - Random seed
     /// * `verbose` - Print progress
     /// * `device` - GPU device
@@ -96,14 +98,13 @@ where
         data: MatRef<T>,
         metric: Dist,
         nlist: Option<usize>,
-        max_iters: Option<usize>,
+        k_means_params: Option<KMeansTrainingParams>,
         seed: usize,
         verbose: bool,
         device: R::Device,
     ) -> Self {
         let (vectors_flat, n, dim) = matrix_to_flat(data);
 
-        let max_iters = max_iters.unwrap_or(30);
         let nlist = nlist.unwrap_or((n as f32).sqrt() as usize).max(1);
 
         let line = LINE_SIZE as usize;
@@ -122,7 +123,7 @@ where
             n_train,
             nlist,
             &metric,
-            max_iters,
+            k_means_params,
             seed,
             verbose,
         );
@@ -856,6 +857,10 @@ mod tests {
     use cubecl::cpu::CpuRuntime;
     use faer::Mat;
 
+    fn get_default_k_means() -> Option<KMeansTrainingParams> {
+        Some(KMeansTrainingParams::new(10, None, None))
+    }
+
     #[test]
     fn test_ivf_index_build() {
         let device = CpuDevice;
@@ -867,7 +872,7 @@ mod tests {
             data.as_ref(),
             Dist::Euclidean,
             Some(10),
-            Some(5),
+            get_default_k_means(),
             42,
             false,
             device,
@@ -889,7 +894,7 @@ mod tests {
             data.as_ref(),
             Dist::Euclidean,
             Some(5),
-            Some(10),
+            get_default_k_means(),
             42,
             false,
             device,
@@ -914,7 +919,7 @@ mod tests {
             data.as_ref(),
             Dist::Cosine,
             Some(5),
-            Some(10),
+            get_default_k_means(),
             42,
             false,
             device,
@@ -954,6 +959,10 @@ mod tests_wpgu {
     use cubecl::wgpu::WgpuRuntime;
     use faer::Mat;
 
+    fn get_default_k_means() -> Option<KMeansTrainingParams> {
+        Some(KMeansTrainingParams::new(10, None, None))
+    }
+
     fn try_device() -> Option<WgpuDevice> {
         let device = WgpuDevice::DefaultDevice;
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -975,7 +984,7 @@ mod tests_wpgu {
             data.as_ref(),
             Dist::Euclidean,
             Some(5),
-            Some(5),
+            get_default_k_means(),
             42,
             false,
             device,

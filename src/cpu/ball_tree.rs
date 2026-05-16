@@ -463,13 +463,15 @@ where
                 })
                 .collect();
 
+            let k_means_params = KMeansTrainingParams::new(5, None, None);
+
             let centroids = train_centroids(
                 &sample_data,
                 dim,
                 items.len(),
                 2,
                 &metric,
-                5,
+                Some(k_means_params),
                 (rng.random::<f32>() * 100.0) as usize,
                 false,
             );

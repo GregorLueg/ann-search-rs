@@ -136,7 +136,9 @@ where
     /// * `data` - Matrix reference with vectors as rows (n × dim)
     /// * `nlist` - Optional number of clusters. Defaults to `sqrt(n)`.
     /// * `metric` - Distance metric (Euclidean or Cosine)
-    /// * `max_iters` - Optional maximum k-means iterations (defaults to `50`).
+    /// * `k_means_params` - Optional k-means trainings parameters, see
+    ///   [KMeansTrainingParams]. If not provided, will default to sensible
+    ///   defaults.
     /// * `seed` - Random seed for reproducibility
     /// * `verbose` - Print training progress
     ///
@@ -147,13 +149,12 @@ where
         data: MatRef<T>,
         nlist: Option<usize>,
         metric: Dist,
-        max_iters: Option<usize>,
+        k_means_params: Option<KMeansTrainingParams>,
         seed: usize,
         verbose: bool,
     ) -> Self {
         let (mut vectors_flat, n, dim) = matrix_to_flat(data);
 
-        let max_iters = max_iters.unwrap_or(30);
         let nlist = nlist.unwrap_or((n as f32).sqrt() as usize).max(1);
 
         // normalise for cosine distance
@@ -181,7 +182,7 @@ where
             n_train,
             nlist,
             &metric,
-            max_iters,
+            k_means_params,
             seed,
             verbose,
         );
@@ -577,11 +578,21 @@ mod tests {
         Mat::from_fn(6, 32, |i, j| data[i * 32 + j])
     }
 
+    fn get_default_k_means() -> Option<KMeansTrainingParams> {
+        Some(KMeansTrainingParams::new(10, None, None))
+    }
+
     #[test]
     fn test_build_euclidean() {
         let data = create_simple_dataset();
-        let index =
-            IvfSq8Index::build(data.as_ref(), Some(2), Dist::Euclidean, Some(10), 42, false);
+        let index = IvfSq8Index::build(
+            data.as_ref(),
+            Some(2),
+            Dist::Euclidean,
+            get_default_k_means(),
+            42,
+            false,
+        );
 
         assert_eq!(index.dim, 32);
         assert_eq!(index.n, 6);
@@ -595,7 +606,14 @@ mod tests {
     #[test]
     fn test_build_cosine() {
         let data = create_simple_dataset();
-        let index = IvfSq8Index::build(data.as_ref(), Some(2), Dist::Cosine, Some(10), 42, false);
+        let index = IvfSq8Index::build(
+            data.as_ref(),
+            Some(2),
+            Dist::Cosine,
+            get_default_k_means(),
+            42,
+            false,
+        );
 
         assert_eq!(index.metric, Dist::Cosine);
         assert_eq!(index.quantised_norms.len(), 6);
@@ -604,8 +622,14 @@ mod tests {
     #[test]
     fn test_query_returns_k_results() {
         let data = create_simple_dataset();
-        let index =
-            IvfSq8Index::build(data.as_ref(), Some(2), Dist::Euclidean, Some(10), 42, false);
+        let index = IvfSq8Index::build(
+            data.as_ref(),
+            Some(2),
+            Dist::Euclidean,
+            get_default_k_means(),
+            42,
+            false,
+        );
 
         let query: Vec<f32> = (0..32).map(|x| x as f32 * 0.01).collect();
         let (indices, distances) = index.query(&query, 3, Some(2));
@@ -617,8 +641,14 @@ mod tests {
     #[test]
     fn test_query_k_exceeds_n() {
         let data = create_simple_dataset();
-        let index =
-            IvfSq8Index::build(data.as_ref(), Some(2), Dist::Euclidean, Some(10), 42, false);
+        let index = IvfSq8Index::build(
+            data.as_ref(),
+            Some(2),
+            Dist::Euclidean,
+            get_default_k_means(),
+            42,
+            false,
+        );
 
         let query: Vec<f32> = (0..32).map(|x| x as f32 * 0.01).collect();
         let (indices, _) = index.query(&query, 100, None);
@@ -629,8 +659,14 @@ mod tests {
     #[test]
     fn test_query_finds_nearest() {
         let data = create_simple_dataset();
-        let index =
-            IvfSq8Index::build(data.as_ref(), Some(2), Dist::Euclidean, Some(10), 42, false);
+        let index = IvfSq8Index::build(
+            data.as_ref(),
+            Some(2),
+            Dist::Euclidean,
+            get_default_k_means(),
+            42,
+            false,
+        );
 
         let query: Vec<f32> = (0..32).map(|x| x as f32 * 0.01).collect();
         let (indices, distances) = index.query(&query, 3, Some(2));
@@ -645,7 +681,14 @@ mod tests {
     #[test]
     fn test_query_cosine() {
         let data = create_simple_dataset();
-        let index = IvfSq8Index::build(data.as_ref(), Some(2), Dist::Cosine, Some(10), 42, false);
+        let index = IvfSq8Index::build(
+            data.as_ref(),
+            Some(2),
+            Dist::Cosine,
+            get_default_k_means(),
+            42,
+            false,
+        );
 
         let query: Vec<f32> = (0..32).map(|x| if x < 16 { 1.0 } else { 0.0 }).collect();
         let (indices, distances) = index.query(&query, 3, Some(2));
@@ -657,8 +700,14 @@ mod tests {
     #[test]
     fn test_query_different_nprobe() {
         let data = create_simple_dataset();
-        let index =
-            IvfSq8Index::build(data.as_ref(), Some(2), Dist::Euclidean, Some(10), 42, false);
+        let index = IvfSq8Index::build(
+            data.as_ref(),
+            Some(2),
+            Dist::Euclidean,
+            get_default_k_means(),
+            42,
+            false,
+        );
 
         let query: Vec<f32> = (0..32).map(|x| 5.0 + x as f32 * 0.01).collect();
 
@@ -672,8 +721,14 @@ mod tests {
     #[test]
     fn test_query_deterministic() {
         let data = create_simple_dataset();
-        let index =
-            IvfSq8Index::build(data.as_ref(), Some(2), Dist::Euclidean, Some(10), 42, false);
+        let index = IvfSq8Index::build(
+            data.as_ref(),
+            Some(2),
+            Dist::Euclidean,
+            get_default_k_means(),
+            42,
+            false,
+        );
 
         let query: Vec<f32> = (0..32).map(|x| 0.5 + x as f32 * 0.01).collect();
 
@@ -687,8 +742,14 @@ mod tests {
     #[test]
     fn test_query_row() {
         let data = create_simple_dataset();
-        let index =
-            IvfSq8Index::build(data.as_ref(), Some(2), Dist::Euclidean, Some(10), 42, false);
+        let index = IvfSq8Index::build(
+            data.as_ref(),
+            Some(2),
+            Dist::Euclidean,
+            get_default_k_means(),
+            42,
+            false,
+        );
 
         let query_mat = Mat::<f32>::from_fn(1, 32, |_, j| 0.5 + j as f32 * 0.01);
         let row = query_mat.row(0);
@@ -703,8 +764,14 @@ mod tests {
     fn test_build_large_nlist() {
         let data = Mat::from_fn(100, 8, |i, j| (i + j) as f32);
 
-        let index =
-            IvfSq8Index::build(data.as_ref(), Some(10), Dist::Euclidean, Some(5), 42, false);
+        let index = IvfSq8Index::build(
+            data.as_ref(),
+            Some(10),
+            Dist::Euclidean,
+            get_default_k_means(),
+            42,
+            false,
+        );
 
         assert_eq!(index.nlist, 10);
         assert_eq!(index.offsets.len(), 11);
@@ -713,8 +780,14 @@ mod tests {
     #[test]
     fn test_quantisation_preserves_structure() {
         let data = create_simple_dataset();
-        let index =
-            IvfSq8Index::build(data.as_ref(), Some(2), Dist::Euclidean, Some(10), 42, false);
+        let index = IvfSq8Index::build(
+            data.as_ref(),
+            Some(2),
+            Dist::Euclidean,
+            get_default_k_means(),
+            42,
+            false,
+        );
 
         let query: Vec<f32> = (0..32).map(|x| x as f32 * 0.01).collect();
         let (indices, _) = index.query(&query, 1, Some(2));

@@ -699,6 +699,8 @@ where
             data_norms
         };
 
+        let k_means_params = KMeansTrainingParams::new(RABITQ_K_MEANS_ITER, None, None);
+
         // Train centroids
         let centroids_flat = train_centroids(
             &data_flat,
@@ -706,7 +708,7 @@ where
             n,
             k,
             metric,
-            RABITQ_K_MEANS_ITER,
+            Some(k_means_params),
             seed,
             false,
         );
