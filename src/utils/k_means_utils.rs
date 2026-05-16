@@ -58,7 +58,7 @@ where
             .map(|c| {
                 let cent = &self.centroids()[c * self.dim()..(c + 1) * self.dim()];
                 let dist = match self.metric() {
-                    Dist::Euclidean => euclidean_distance_static(query_vec, cent),
+                    Dist::SquaredEuclidean => euclidean_distance_static(query_vec, cent),
                     Dist::Cosine => {
                         let c_norm = &self.centroids_norm()[c];
                         cosine_distance_static_norm(query_vec, cent, &query_norm, c_norm)
@@ -92,7 +92,7 @@ where
                 let cent = &self.centroids()[c * self.dim()..(c + 1) * self.dim()];
                 let dist = match self.metric() {
                     Dist::Cosine => T::one() - T::dot_simd(query_vec, cent),
-                    Dist::Euclidean => T::euclidean_simd(query_vec, cent),
+                    Dist::SquaredEuclidean => T::euclidean_simd(query_vec, cent),
                 };
                 (dist, c)
             })
@@ -213,8 +213,8 @@ fn resolve_path(
     metric: &Dist,
 ) -> LloydPath {
     let chosen = path.unwrap_or_else(|| match metric {
-        Dist::Euclidean if dim >= GEMM_DIM_THRESHOLD => LloydPath::HamerlyGemm,
-        Dist::Euclidean
+        Dist::SquaredEuclidean if dim >= GEMM_DIM_THRESHOLD => LloydPath::HamerlyGemm,
+        Dist::SquaredEuclidean
             if (SIMD_HAMERLY_DIM_MIN..GEMM_DIM_THRESHOLD).contains(&dim)
                 && n_centroids >= SIMD_HAMERLY_K_THRESHOLD =>
         {
@@ -304,7 +304,7 @@ where
     let mut min_dist = T::infinity();
 
     match metric {
-        Dist::Euclidean => {
+        Dist::SquaredEuclidean => {
             for cent in centroids.chunks_exact(dim).take(n_centroids) {
                 let dist = euclidean_distance_static(vec, cent);
                 if dist < min_dist {
@@ -377,7 +377,7 @@ where
         let latest_norm = *centroid_norms.last().unwrap();
 
         match metric {
-            Dist::Euclidean => {
+            Dist::SquaredEuclidean => {
                 for (i, dist) in distances.iter_mut().enumerate() {
                     let vec = &data[i * dim..(i + 1) * dim];
                     let d = euclidean_distance_static(vec, latest_centroid);
@@ -644,7 +644,7 @@ fn gemm_assign_full<T>(
                     let mut second_score = T::neg_infinity();
 
                     match metric {
-                        Dist::Euclidean => {
+                        Dist::SquaredEuclidean => {
                             for c in 0..k {
                                 let score = two * dots[(local_i, c)] - centroid_norms[c];
                                 if score > best_score {
@@ -756,7 +756,7 @@ fn gemm_reassign_dirty<T>(
             let mut second_score = T::neg_infinity();
 
             match metric {
-                Dist::Euclidean => {
+                Dist::SquaredEuclidean => {
                     for c in 0..k {
                         let cent = &centroids[c * dim..(c + 1) * dim];
                         let dot = T::dot_simd(vec, cent);
@@ -910,8 +910,8 @@ fn update_centroids<T>(
         }
         let cent = &centroids[c * dim..(c + 1) * dim];
         centroid_norms[c] = match metric {
-            Dist::Euclidean => T::dot_simd(cent, cent), // ||c||^2
-            Dist::Cosine => T::calculate_l2_norm(cent), // ||c||
+            Dist::SquaredEuclidean => T::dot_simd(cent, cent), // ||c||^2
+            Dist::Cosine => T::calculate_l2_norm(cent),        // ||c||
         };
     }
 }
@@ -1122,7 +1122,7 @@ fn hamerly_lloyd<T>(
         centroids,
         centroid_norms_sq,
         k,
-        &Dist::Euclidean,
+        &Dist::SquaredEuclidean,
         &mut assignments,
         &mut upper,
         &mut lower,
@@ -1139,7 +1139,7 @@ fn hamerly_lloyd<T>(
             centroids,
             centroid_norms_sq,
             k,
-            &Dist::Euclidean,
+            &Dist::SquaredEuclidean,
         );
 
         compute_centroid_drift(&old_centroids, centroids, dim, k, &mut deltas);
@@ -1201,7 +1201,7 @@ fn hamerly_lloyd<T>(
             centroids,
             centroid_norms_sq,
             k,
-            &Dist::Euclidean,
+            &Dist::SquaredEuclidean,
             &dirty,
             &mut assignments,
             &mut upper,
@@ -1671,7 +1671,7 @@ fn hamerly_lloyd_simd<T>(
             centroids,
             centroid_norms,
             k,
-            &Dist::Euclidean,
+            &Dist::SquaredEuclidean,
         );
 
         compute_centroid_drift(&old_centroids, centroids, dim, k, &mut deltas);
@@ -1786,7 +1786,7 @@ where
     T: Float + Send + Sync + SimdDistance + ComplexField,
 {
     let data_norms: Vec<T> = match metric {
-        Dist::Euclidean => (0..n)
+        Dist::SquaredEuclidean => (0..n)
             .map(|i| {
                 let v = &data[i * dim..(i + 1) * dim];
                 T::dot_simd(v, v)
@@ -1797,7 +1797,7 @@ where
             .collect(),
     };
     let centroid_norms: Vec<T> = match metric {
-        Dist::Euclidean => (0..k)
+        Dist::SquaredEuclidean => (0..k)
             .map(|c| {
                 let cent = &centroids[c * dim..(c + 1) * dim];
                 T::dot_simd(cent, cent)
@@ -1861,7 +1861,7 @@ where
     let two = T::one() + T::one();
 
     let shortcut_norms: Vec<T> = match metric {
-        Dist::Euclidean => (0..k)
+        Dist::SquaredEuclidean => (0..k)
             .map(|c| {
                 let cent = &centroids[c * dim..(c + 1) * dim];
                 T::dot_simd(cent, cent)
@@ -1880,7 +1880,7 @@ where
     };
 
     match metric {
-        Dist::Euclidean => (0..n)
+        Dist::SquaredEuclidean => (0..n)
             .into_par_iter()
             .map(|i| {
                 let vec = &data[i * dim..(i + 1) * dim];
@@ -2006,7 +2006,7 @@ where
     let params = params_k_means.unwrap_or_default();
 
     let data_norms: Vec<T> = match metric {
-        Dist::Euclidean => (0..n)
+        Dist::SquaredEuclidean => (0..n)
             .into_par_iter()
             .map(|i| {
                 let v = &data[i * dim..(i + 1) * dim];
@@ -2033,7 +2033,7 @@ where
                 println!("  Initialising centroids via k-means||");
             }
             let init_norms: Vec<T> = match metric {
-                Dist::Euclidean => (0..n)
+                Dist::SquaredEuclidean => (0..n)
                     .map(|i| T::calculate_l2_norm(&data[i * dim..(i + 1) * dim]))
                     .collect(),
                 Dist::Cosine => data_norms.clone(),
@@ -2043,7 +2043,7 @@ where
     };
 
     let mut centroid_norms: Vec<T> = match metric {
-        Dist::Euclidean => (0..n_centroids)
+        Dist::SquaredEuclidean => (0..n_centroids)
             .map(|i| {
                 let c = &centroids[i * dim..(i + 1) * dim];
                 T::dot_simd(c, c)
@@ -2316,7 +2316,7 @@ mod tests {
             &centroids,
             &centroid_norms,
             2,
-            &Dist::Euclidean,
+            &Dist::SquaredEuclidean,
         );
 
         assert_eq!(assignments, vec![0, 0, 1, 1]);
@@ -2422,7 +2422,7 @@ mod tests {
     fn test_train_centroids_small() {
         let data = vec![0.0, 0.0, 0.1, 0.1, 10.0, 10.0, 10.1, 10.1];
 
-        let centroids = train_centroids(&data, 2, 4, 2, &Dist::Euclidean, None, 42, false);
+        let centroids = train_centroids(&data, 2, 4, 2, &Dist::SquaredEuclidean, None, 42, false);
 
         assert_eq!(centroids.len(), 4);
 
@@ -2455,7 +2455,7 @@ mod tests {
             &centroid_norms,
             2,
             2,
-            &Dist::Euclidean,
+            &Dist::SquaredEuclidean,
         );
 
         // Distance to (0,0) is 50, to (10,10) is 50, so min is 50
@@ -2475,7 +2475,8 @@ mod tests {
             })
             .collect();
 
-        let centroids = weighted_kmeans_plus_plus(&data, &data_norms, 2, 2, &Dist::Euclidean, 42);
+        let centroids =
+            weighted_kmeans_plus_plus(&data, &data_norms, 2, 2, &Dist::SquaredEuclidean, 42);
 
         assert_eq!(centroids.len(), 4);
 
@@ -2643,8 +2644,16 @@ mod tests {
             }
         }
 
-        let centroids =
-            train_centroids(&data, dim, n, n_clusters, &Dist::Euclidean, None, 42, false);
+        let centroids = train_centroids(
+            &data,
+            dim,
+            n,
+            n_clusters,
+            &Dist::SquaredEuclidean,
+            None,
+            42,
+            false,
+        );
 
         assert_eq!(centroids.len(), n_clusters * dim);
 

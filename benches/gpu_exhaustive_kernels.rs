@@ -254,7 +254,7 @@ impl<R: Runtime> Benchmark for FullPipelineBench<R> {
             &qb,
             &dbb,
             self.cfg.dim,
-            &Dist::Euclidean,
+            &Dist::SquaredEuclidean,
             self.device.clone(),
             false,
         );

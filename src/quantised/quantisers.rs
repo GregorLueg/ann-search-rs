@@ -536,7 +536,7 @@ where
             dim,
             m,
             n_centroids,
-            &Dist::Euclidean,
+            &Dist::SquaredEuclidean,
             max_iters,
             seed,
             false,
@@ -558,7 +558,7 @@ where
                 dim,
                 m,
                 n_centroids,
-                &Dist::Euclidean,
+                &Dist::SquaredEuclidean,
                 max_iters,
                 seed + iter,
                 false,
@@ -585,7 +585,7 @@ where
             dim,
             m,
             n_centroids,
-            &Dist::Euclidean,
+            &Dist::SquaredEuclidean,
             max_iters,
             seed,
             verbose,
@@ -963,7 +963,8 @@ mod tests {
             }
         }
 
-        let pq = ProductQuantiser::train(&data, 32, 2, Some(2), &Dist::Euclidean, 5, 42, false);
+        let pq =
+            ProductQuantiser::train(&data, 32, 2, Some(2), &Dist::SquaredEuclidean, 5, 42, false);
 
         assert_eq!(pq.m(), 2);
         assert_eq!(pq.subvec_dim(), 16);
@@ -1021,7 +1022,8 @@ mod tests {
             }
         }
 
-        let pq = ProductQuantiser::train(&data, 32, 2, Some(2), &Dist::Euclidean, 5, 42, false);
+        let pq =
+            ProductQuantiser::train(&data, 32, 2, Some(2), &Dist::SquaredEuclidean, 5, 42, false);
 
         assert_eq!(pq.m(), 2);
         assert_eq!(pq.subvec_dim(), 16);
@@ -1040,7 +1042,16 @@ mod tests {
             }
         }
 
-        let pq = ProductQuantiser::train(&data, 32, 2, Some(2), &Dist::Euclidean, 10, 42, false);
+        let pq = ProductQuantiser::train(
+            &data,
+            32,
+            2,
+            Some(2),
+            &Dist::SquaredEuclidean,
+            10,
+            42,
+            false,
+        );
 
         let vec: Vec<f32> = (0..32).map(|x| x as f32).collect();
         let codes = pq.encode(&vec);
@@ -1059,9 +1070,11 @@ mod tests {
             }
         }
 
-        let pq1 = ProductQuantiser::train(&data, 32, 2, Some(2), &Dist::Euclidean, 5, 42, false);
+        let pq1 =
+            ProductQuantiser::train(&data, 32, 2, Some(2), &Dist::SquaredEuclidean, 5, 42, false);
 
-        let pq2 = ProductQuantiser::train(&data, 32, 2, Some(2), &Dist::Euclidean, 5, 42, false);
+        let pq2 =
+            ProductQuantiser::train(&data, 32, 2, Some(2), &Dist::SquaredEuclidean, 5, 42, false);
 
         let vec: Vec<f32> = (16..48).map(|x| x as f32).collect();
         let codes1 = pq1.encode(&vec);
@@ -1074,14 +1087,14 @@ mod tests {
     #[should_panic(expected = "Dimension must be divisible by m")]
     fn test_product_quantiser_invalid_m() {
         let data = vec![1.0, 2.0, 3.0, 4.0, 5.0];
-        ProductQuantiser::train(&data, 5, 2, Some(2), &Dist::Euclidean, 5, 42, false);
+        ProductQuantiser::train(&data, 5, 2, Some(2), &Dist::SquaredEuclidean, 5, 42, false);
     }
 
     #[test]
     #[should_panic(expected = "Dimension too small")]
     fn test_product_quantiser_dim_too_small() {
         let data = vec![1.0, 2.0, 3.0, 4.0];
-        ProductQuantiser::train(&data, 16, 2, Some(2), &Dist::Euclidean, 5, 42, false);
+        ProductQuantiser::train(&data, 16, 2, Some(2), &Dist::SquaredEuclidean, 5, 42, false);
     }
 
     #[test]

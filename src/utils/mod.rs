@@ -110,7 +110,7 @@ where
         let mut heap: BinaryHeap<(OrderedFloat<T>, usize)> = BinaryHeap::with_capacity(k + 1);
 
         match self.metric() {
-            Dist::Euclidean => {
+            Dist::SquaredEuclidean => {
                 for idx in 0..n_vectors {
                     let dist = self.euclidean_distance_to_query(idx, query_vec);
 
@@ -192,6 +192,40 @@ where
         }
 
         total_recall / no_samples as f64
+    }
+}
+
+//////////////////////////
+// Dimension validation //
+//////////////////////////
+
+/// Trait to check dimension mismatches
+pub trait DimensionValidation {
+    /// Returns the dimensionality of the index
+    ///
+    /// ### Returns
+    ///
+    /// Dimensionality of the index
+    fn dim(&self) -> usize;
+
+    /// Returns an error upon dimension mismatch
+    ///
+    /// ### Params
+    ///
+    /// * `query_dim` - The dimensionality of the error
+    ///
+    /// ### Returns
+    ///
+    /// An error upon dimension mismatch
+    fn check_dim(&self, query_dim: usize) -> Result<(), AnnSearchErrors> {
+        if query_dim != self.dim() {
+            return Err(AnnSearchErrors::DimensionMismatch {
+                index_dim: self.dim(),
+                query_dim,
+            });
+        }
+
+        Ok(())
     }
 }
 

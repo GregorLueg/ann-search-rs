@@ -92,7 +92,7 @@ where
 
     /// Always Euclidean: Cosine is handled via normalisation at build time.
     fn metric(&self) -> Dist {
-        Dist::Euclidean
+        Dist::SquaredEuclidean
     }
 
     fn nlist(&self) -> usize {
@@ -169,7 +169,7 @@ where
             dim,
             n_train,
             nlist,
-            &Dist::Euclidean,
+            &Dist::SquaredEuclidean,
             k_means_params,
             seed,
             verbose,
@@ -185,7 +185,7 @@ where
             &centroids,
             &dummy_centroid_norms,
             nlist,
-            &Dist::Euclidean,
+            &Dist::SquaredEuclidean,
         );
 
         if verbose {
@@ -325,7 +325,7 @@ where
             .into_iter()
             .map(|(OrderedFloat(d_sq), pos)| {
                 let out = match self.metric {
-                    Dist::Euclidean => d_sq,
+                    Dist::SquaredEuclidean => d_sq,
                     Dist::Cosine => d_sq * half,
                 };
                 (out, self.original_ids[pos])
@@ -508,13 +508,27 @@ mod tests {
     #[test]
     fn test_kmknn_index_creation() {
         let data = create_simple_matrix();
-        let _ = KmknnIndex::build(data.as_ref(), Dist::Euclidean, Some(2), None, 42, false);
+        let _ = KmknnIndex::build(
+            data.as_ref(),
+            Dist::SquaredEuclidean,
+            Some(2),
+            None,
+            42,
+            false,
+        );
     }
 
     #[test]
     fn test_kmknn_query_finds_self_euclidean() {
         let data = create_simple_matrix();
-        let index = KmknnIndex::build(data.as_ref(), Dist::Euclidean, Some(2), None, 42, false);
+        let index = KmknnIndex::build(
+            data.as_ref(),
+            Dist::SquaredEuclidean,
+            Some(2),
+            None,
+            42,
+            false,
+        );
 
         let query = vec![1.0, 0.0, 0.0];
         let (indices, distances) = index.query(&query, 1);
@@ -538,7 +552,14 @@ mod tests {
     #[test]
     fn test_kmknn_query_sorted() {
         let data = create_simple_matrix();
-        let index = KmknnIndex::build(data.as_ref(), Dist::Euclidean, Some(2), None, 42, false);
+        let index = KmknnIndex::build(
+            data.as_ref(),
+            Dist::SquaredEuclidean,
+            Some(2),
+            None,
+            42,
+            false,
+        );
 
         let query = vec![1.0, 0.0, 0.0];
         let (_, distances) = index.query(&query, 5);
@@ -551,7 +572,14 @@ mod tests {
     #[test]
     fn test_kmknn_query_k_larger_than_dataset() {
         let data = create_simple_matrix();
-        let index = KmknnIndex::build(data.as_ref(), Dist::Euclidean, Some(2), None, 42, false);
+        let index = KmknnIndex::build(
+            data.as_ref(),
+            Dist::SquaredEuclidean,
+            Some(2),
+            None,
+            42,
+            false,
+        );
 
         let query = vec![1.0, 0.0, 0.0];
         let (indices, _) = index.query(&query, 10);
@@ -577,8 +605,22 @@ mod tests {
     fn test_kmknn_reproducibility() {
         let data = create_simple_matrix();
 
-        let idx1 = KmknnIndex::build(data.as_ref(), Dist::Euclidean, Some(2), None, 42, false);
-        let idx2 = KmknnIndex::build(data.as_ref(), Dist::Euclidean, Some(2), None, 42, false);
+        let idx1 = KmknnIndex::build(
+            data.as_ref(),
+            Dist::SquaredEuclidean,
+            Some(2),
+            None,
+            42,
+            false,
+        );
+        let idx2 = KmknnIndex::build(
+            data.as_ref(),
+            Dist::SquaredEuclidean,
+            Some(2),
+            None,
+            42,
+            false,
+        );
 
         let query = vec![0.5, 0.5, 0.0];
         let (i1, _) = idx1.query(&query, 3);
@@ -589,7 +631,14 @@ mod tests {
     #[test]
     fn test_kmknn_query_row() {
         let data = create_simple_matrix();
-        let index = KmknnIndex::build(data.as_ref(), Dist::Euclidean, Some(2), None, 42, false);
+        let index = KmknnIndex::build(
+            data.as_ref(),
+            Dist::SquaredEuclidean,
+            Some(2),
+            None,
+            42,
+            false,
+        );
 
         let (indices, distances) = index.query_row(data.row(0), 1);
         assert_eq!(indices[0], 0);
@@ -602,7 +651,14 @@ mod tests {
         let dim = 10;
         let data = Mat::from_fn(n, dim, |i, j| (i * j) as f32 / 10.0);
 
-        let index = KmknnIndex::build(data.as_ref(), Dist::Euclidean, Some(10), None, 42, false);
+        let index = KmknnIndex::build(
+            data.as_ref(),
+            Dist::SquaredEuclidean,
+            Some(10),
+            None,
+            42,
+            false,
+        );
         let query: Vec<f32> = (0..dim).map(|_| 0.0).collect();
         let (indices, _) = index.query(&query, 5);
 
@@ -613,7 +669,14 @@ mod tests {
     #[test]
     fn test_kmknn_generate_knn() {
         let data = create_simple_matrix();
-        let index = KmknnIndex::build(data.as_ref(), Dist::Euclidean, Some(2), None, 42, false);
+        let index = KmknnIndex::build(
+            data.as_ref(),
+            Dist::SquaredEuclidean,
+            Some(2),
+            None,
+            42,
+            false,
+        );
 
         let (indices, dists) = index.generate_knn(3, true, false);
 
@@ -636,8 +699,15 @@ mod tests {
         let dim = 16;
         let data = Mat::from_fn(n, dim, |i, j| ((i * 7 + j * 13) % 97) as f32 / 10.0);
 
-        let kmknn = KmknnIndex::build(data.as_ref(), Dist::Euclidean, Some(14), None, 42, false);
-        let exhaustive = ExhaustiveIndex::new(data.as_ref(), Dist::Euclidean);
+        let kmknn = KmknnIndex::build(
+            data.as_ref(),
+            Dist::SquaredEuclidean,
+            Some(14),
+            None,
+            42,
+            false,
+        );
+        let exhaustive = ExhaustiveIndex::new(data.as_ref(), Dist::SquaredEuclidean);
 
         let query: Vec<f32> = (0..dim).map(|j| (j * 3 % 17) as f32 / 5.0).collect();
         let k = 10;

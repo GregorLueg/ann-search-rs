@@ -5,6 +5,7 @@
 
 use faer::RowRef;
 use num_traits::Float;
+use std::fmt::Display;
 use std::iter::Sum;
 use std::sync::OnceLock;
 use wide::{f32x4, f32x8, f64x2, f64x4};
@@ -27,9 +28,20 @@ use std::arch::x86_64::*;
 pub enum Dist {
     /// Euclidean distance
     #[default]
-    Euclidean,
+    SquaredEuclidean,
     /// Cosine distance
     Cosine,
+}
+
+/// Display implementation for Dist
+impl Display for Dist {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let s = match self {
+            Dist::SquaredEuclidean => "squared_euclidean",
+            Dist::Cosine => "cosine",
+        };
+        write!(f, "{}", s)
+    }
 }
 
 /// Parsing the approximate nearest neighbour distance
@@ -47,7 +59,7 @@ pub enum Dist {
 /// neighbour search.
 pub fn parse_ann_dist(s: &str) -> Option<Dist> {
     match s.to_lowercase().as_str() {
-        "euclidean" => Some(Dist::Euclidean),
+        "euclidean" | "l2" => Some(Dist::SquaredEuclidean),
         "cosine" => Some(Dist::Cosine),
         _ => None,
     }
@@ -1042,9 +1054,9 @@ fn subtract_f64_avx512(a: &[f64], b: &[f64]) -> Vec<f64> {
     subtract_f64_avx2(a, b)
 }
 
-//////////////
-// f32 add  //
-//////////////
+/////////////
+// f32 add //
+/////////////
 
 /// Vector addition - f32, scalar
 ///
@@ -1191,9 +1203,9 @@ fn add_f32_avx512(a: &[f32], b: &[f32]) -> Vec<f32> {
     add_f32_avx2(a, b)
 }
 
-//////////////
-// f64 add  //
-//////////////
+/////////////
+// f64 add //
+/////////////
 
 /// Vector addition - f64, scalar
 ///
@@ -1340,9 +1352,9 @@ fn add_f64_avx512(a: &[f64], b: &[f64]) -> Vec<f64> {
     add_f64_avx2(a, b)
 }
 
-//////////////////////
-// f32 add_assign   //
-//////////////////////
+////////////////////
+// f32 add_assign //
+////////////////////
 
 /// In-place vector addition - f32, scalar
 ///
@@ -1467,9 +1479,9 @@ fn add_assign_f32_avx512(dst: &mut [f32], src: &[f32]) {
     add_assign_f32_avx2(dst, src);
 }
 
-//////////////////////
-// f64 add_assign   //
-//////////////////////
+////////////////////
+// f64 add_assign //
+////////////////////
 
 /// In-place vector addition - f64, scalar
 ///
@@ -4678,9 +4690,9 @@ mod tests {
 
     #[test]
     fn test_parse_ann_dist_euclidean() {
-        assert_eq!(parse_ann_dist("euclidean"), Some(Dist::Euclidean));
-        assert_eq!(parse_ann_dist("Euclidean"), Some(Dist::Euclidean));
-        assert_eq!(parse_ann_dist("EUCLIDEAN"), Some(Dist::Euclidean));
+        assert_eq!(parse_ann_dist("euclidean"), Some(Dist::SquaredEuclidean));
+        assert_eq!(parse_ann_dist("Euclidean"), Some(Dist::SquaredEuclidean));
+        assert_eq!(parse_ann_dist("EUCLIDEAN"), Some(Dist::SquaredEuclidean));
     }
 
     #[test]

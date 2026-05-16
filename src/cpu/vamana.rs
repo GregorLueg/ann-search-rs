@@ -571,7 +571,7 @@ where
     #[inline]
     fn distance(&self, i: usize, j: usize) -> T {
         match self.metric {
-            Dist::Euclidean => self.euclidean_distance(i, j),
+            Dist::SquaredEuclidean => self.euclidean_distance(i, j),
             Dist::Cosine => self.cosine_distance(i, j),
         }
     }
@@ -758,7 +758,7 @@ where
     #[inline(always)]
     fn compute_query_distance(&self, query: &[T], idx: usize, query_norm: T) -> T {
         match self.metric {
-            Dist::Euclidean => self.euclidean_distance_to_query(idx, query),
+            Dist::SquaredEuclidean => self.euclidean_distance_to_query(idx, query),
             Dist::Cosine => self.cosine_distance_to_query(idx, query, query_norm),
         }
     }
@@ -1003,7 +1003,7 @@ mod tests {
     fn build_default(mat: &Mat<f32>, metric: &str) -> VamanaIndex<f32> {
         VamanaIndex::<f32>::build(
             mat.as_ref(),
-            parse_ann_dist(metric).unwrap_or(Dist::Euclidean),
+            parse_ann_dist(metric).unwrap_or(Dist::SquaredEuclidean),
             16,
             100,
             1.0,
@@ -1086,7 +1086,8 @@ mod tests {
         let data: Vec<f32> = (0..n * dim).map(|i| (i as f32) * 0.01).collect();
         let mat = Mat::from_fn(n, dim, |i, j| data[i * dim + j]);
 
-        let index = VamanaIndex::<f32>::build(mat.as_ref(), Dist::Euclidean, 32, 150, 1.0, 1.2, 42);
+        let index =
+            VamanaIndex::<f32>::build(mat.as_ref(), Dist::SquaredEuclidean, 32, 150, 1.0, 1.2, 42);
 
         let query: Vec<f32> = (0..dim).map(|_| 0.5).collect();
 
@@ -1110,7 +1111,8 @@ mod tests {
         }
         let mat = Mat::from_fn(n, dim, |i, j| data[i * dim + j]);
 
-        let index = VamanaIndex::<f32>::build(mat.as_ref(), Dist::Euclidean, 16, 200, 1.0, 1.2, 42);
+        let index =
+            VamanaIndex::<f32>::build(mat.as_ref(), Dist::SquaredEuclidean, 16, 200, 1.0, 1.2, 42);
 
         let query = vec![0.0_f32, 0.0, 0.0];
         let (indices, _) = index.query(&query, 5, Some(150));
@@ -1207,7 +1209,8 @@ mod tests {
         let dim = 4;
         let data: Vec<f32> = (0..n * dim).map(|i| i as f32).collect();
         let mat = Mat::from_fn(n, dim, |i, j| data[i * dim + j]);
-        let index = VamanaIndex::<f32>::build(mat.as_ref(), Dist::Euclidean, 16, 100, 1.0, 1.2, 42);
+        let index =
+            VamanaIndex::<f32>::build(mat.as_ref(), Dist::SquaredEuclidean, 16, 100, 1.0, 1.2, 42);
 
         let k = 5;
         let (indices, distances) = index.generate_knn(k, None, true, false);
@@ -1235,8 +1238,15 @@ mod tests {
         let mat = Mat::from_fn(n, dim, |i, j| data[i * dim + j]);
 
         for r in [16, 32, 48, 64] {
-            let index =
-                VamanaIndex::<f32>::build(mat.as_ref(), Dist::Euclidean, r, 150, 1.0, 1.2, 42);
+            let index = VamanaIndex::<f32>::build(
+                mat.as_ref(),
+                Dist::SquaredEuclidean,
+                r,
+                150,
+                1.0,
+                1.2,
+                42,
+            );
             let query: Vec<f32> = (0..dim).map(|_| 0.5).collect();
             let (indices, _) = index.query(&query, 10, None);
             assert_eq!(indices.len(), 10, "Failed with r={}", r);
@@ -1251,7 +1261,8 @@ mod tests {
         let data: Vec<f32> = (0..n * dim).map(|i| (i as f32) * 0.01).collect();
         let mat = Mat::from_fn(n, dim, |i, j| data[i * dim + j]);
 
-        let index = VamanaIndex::<f32>::build(mat.as_ref(), Dist::Euclidean, 32, 150, 1.0, 1.4, 42);
+        let index =
+            VamanaIndex::<f32>::build(mat.as_ref(), Dist::SquaredEuclidean, 32, 150, 1.0, 1.4, 42);
 
         let query: Vec<f32> = (0..dim).map(|_| 0.5).collect();
         let (indices, _) = index.query(&query, 10, None);
@@ -1261,7 +1272,7 @@ mod tests {
     #[test]
     fn test_compute_medoid_single_point() {
         let data = vec![1.0_f32, 2.0, 3.0];
-        let medoid = compute_medoid(&data, 1, 3, Dist::Euclidean);
+        let medoid = compute_medoid(&data, 1, 3, Dist::SquaredEuclidean);
         assert_eq!(medoid, 0);
     }
 

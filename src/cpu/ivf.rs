@@ -284,7 +284,7 @@ where
 
             for vec_idx in start..end {
                 let dist = match self.metric {
-                    Dist::Euclidean => self.euclidean_distance_to_query(vec_idx, query_vec),
+                    Dist::SquaredEuclidean => self.euclidean_distance_to_query(vec_idx, query_vec),
                     Dist::Cosine => self.cosine_distance_to_query(vec_idx, query_vec, query_norm),
                 };
                 buffer.insert((OrderedFloat(dist), vec_idx), k);
@@ -512,7 +512,7 @@ mod tests {
         let data = create_simple_matrix();
         let _ = IvfIndex::build(
             data.as_ref(),
-            Dist::Euclidean,
+            Dist::SquaredEuclidean,
             Some(2), // nlist
             None,
             42,
@@ -523,7 +523,14 @@ mod tests {
     #[test]
     fn test_ivf_query_finds_self() {
         let data = create_simple_matrix();
-        let index = IvfIndex::build(data.as_ref(), Dist::Euclidean, Some(2), None, 42, false);
+        let index = IvfIndex::build(
+            data.as_ref(),
+            Dist::SquaredEuclidean,
+            Some(2),
+            None,
+            42,
+            false,
+        );
 
         let query = vec![1.0, 0.0, 0.0];
         let (indices, distances) = index.query(&query, 1, None);
@@ -536,7 +543,14 @@ mod tests {
     #[test]
     fn test_ivf_query_euclidean() {
         let data = create_simple_matrix();
-        let index = IvfIndex::build(data.as_ref(), Dist::Euclidean, Some(2), None, 42, false);
+        let index = IvfIndex::build(
+            data.as_ref(),
+            Dist::SquaredEuclidean,
+            Some(2),
+            None,
+            42,
+            false,
+        );
 
         let query = vec![1.0, 0.0, 0.0];
         let (indices, distances) = index.query(&query, 3, None);
@@ -565,7 +579,14 @@ mod tests {
     #[test]
     fn test_ivf_query_k_larger_than_dataset() {
         let data = create_simple_matrix();
-        let index = IvfIndex::build(data.as_ref(), Dist::Euclidean, Some(2), None, 42, false);
+        let index = IvfIndex::build(
+            data.as_ref(),
+            Dist::SquaredEuclidean,
+            Some(2),
+            None,
+            42,
+            false,
+        );
 
         let query = vec![1.0, 0.0, 0.0];
         let (indices, _) = index.query(&query, 10, None);
@@ -576,7 +597,14 @@ mod tests {
     #[test]
     fn test_ivf_query_nprobe() {
         let data = create_simple_matrix();
-        let index = IvfIndex::build(data.as_ref(), Dist::Euclidean, Some(3), None, 42, false);
+        let index = IvfIndex::build(
+            data.as_ref(),
+            Dist::SquaredEuclidean,
+            Some(3),
+            None,
+            42,
+            false,
+        );
 
         let query = vec![1.0, 0.0, 0.0];
         let (indices1, _) = index.query(&query, 3, Some(1));
@@ -590,8 +618,22 @@ mod tests {
     fn test_ivf_reproducibility() {
         let data = create_simple_matrix();
 
-        let index1 = IvfIndex::build(data.as_ref(), Dist::Euclidean, Some(2), None, 42, false);
-        let index2 = IvfIndex::build(data.as_ref(), Dist::Euclidean, Some(2), None, 42, false);
+        let index1 = IvfIndex::build(
+            data.as_ref(),
+            Dist::SquaredEuclidean,
+            Some(2),
+            None,
+            42,
+            false,
+        );
+        let index2 = IvfIndex::build(
+            data.as_ref(),
+            Dist::SquaredEuclidean,
+            Some(2),
+            None,
+            42,
+            false,
+        );
 
         let query = vec![0.5, 0.5, 0.0];
         let (indices1, _) = index1.query(&query, 3, None);
@@ -604,8 +646,22 @@ mod tests {
     fn test_ivf_different_seeds() {
         let data = create_simple_matrix();
 
-        let index1 = IvfIndex::build(data.as_ref(), Dist::Euclidean, Some(2), None, 42, false);
-        let index2 = IvfIndex::build(data.as_ref(), Dist::Euclidean, Some(2), None, 123, false);
+        let index1 = IvfIndex::build(
+            data.as_ref(),
+            Dist::SquaredEuclidean,
+            Some(2),
+            None,
+            42,
+            false,
+        );
+        let index2 = IvfIndex::build(
+            data.as_ref(),
+            Dist::SquaredEuclidean,
+            Some(2),
+            None,
+            123,
+            false,
+        );
 
         let query = vec![0.5, 0.5, 0.0];
         let (indices1, _) = index1.query(&query, 3, Some(2));
@@ -623,7 +679,7 @@ mod tests {
 
         let index = IvfIndex::build(
             data.as_ref(),
-            Dist::Euclidean,
+            Dist::SquaredEuclidean,
             Some(10), // sqrt(100)
             None,
             42,
@@ -661,8 +717,22 @@ mod tests {
     fn test_ivf_more_clusters() {
         let data = create_simple_matrix();
 
-        let index_few = IvfIndex::build(data.as_ref(), Dist::Euclidean, Some(2), None, 42, false);
-        let index_many = IvfIndex::build(data.as_ref(), Dist::Euclidean, Some(4), None, 42, false);
+        let index_few = IvfIndex::build(
+            data.as_ref(),
+            Dist::SquaredEuclidean,
+            Some(2),
+            None,
+            42,
+            false,
+        );
+        let index_many = IvfIndex::build(
+            data.as_ref(),
+            Dist::SquaredEuclidean,
+            Some(4),
+            None,
+            42,
+            false,
+        );
 
         let query = vec![0.9, 0.1, 0.0];
         let (indices1, _) = index_few.query(&query, 3, Some(2));

@@ -1104,7 +1104,7 @@ macro_rules! impl_nndescent_gpu_query {
                             results.clear();
 
                             match self.metric {
-                                Dist::Euclidean => self.query_euclidean(
+                                Dist::SquaredEuclidean => self.query_euclidean(
                                     query_vec,
                                     k,
                                     ef,
@@ -1829,7 +1829,7 @@ where
                         let a = &vectors_flat[i * dim..(i + 1) * dim];
                         let b = &vectors_flat[pid * dim..(pid + 1) * dim];
                         let dist = match metric {
-                            Dist::Euclidean => T::euclidean_simd(a, b),
+                            Dist::SquaredEuclidean => T::euclidean_simd(a, b),
                             Dist::Cosine => {
                                 let dot = T::dot_simd(a, b);
                                 T::one() - dot / (norms[i] * norms[pid])
@@ -1990,7 +1990,7 @@ where
 
                 candidates.sort_unstable_by(|&a, &b| {
                     let dist_a = match self.metric {
-                        Dist::Euclidean => {
+                        Dist::SquaredEuclidean => {
                             let va = &self.vectors_flat[a * self.dim..(a + 1) * self.dim];
                             T::euclidean_simd(query, va)
                         }
@@ -2002,7 +2002,7 @@ where
                         }
                     };
                     let dist_b = match self.metric {
-                        Dist::Euclidean => {
+                        Dist::SquaredEuclidean => {
                             let vb = &self.vectors_flat[b * self.dim..(b + 1) * self.dim];
                             T::euclidean_simd(query, vb)
                         }
@@ -2294,7 +2294,7 @@ mod tests {
 
         let index = NNDescentGpu::<f32, WgpuRuntime>::build(
             data.as_ref(),
-            Dist::Euclidean,
+            Dist::SquaredEuclidean,
             Some(5),
             None,
             Some(10),
@@ -2358,7 +2358,7 @@ mod tests {
 
         let index = NNDescentGpu::<f32, WgpuRuntime>::build(
             data.as_ref(),
-            Dist::Euclidean,
+            Dist::SquaredEuclidean,
             Some(3),
             None,
             Some(10),
@@ -2387,7 +2387,7 @@ mod tests {
 
         let index = NNDescentGpu::<f32, WgpuRuntime>::build(
             data.as_ref(),
-            Dist::Euclidean,
+            Dist::SquaredEuclidean,
             Some(5),
             None,
             Some(10),
@@ -3202,7 +3202,7 @@ mod kernel_tests {
 
         let index = NNDescentGpu::<f32, WgpuRuntime>::build(
             data.as_ref(),
-            Dist::Euclidean,
+            Dist::SquaredEuclidean,
             Some(k),
             None,
             Some(15),

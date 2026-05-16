@@ -797,7 +797,7 @@ mod tests {
     #[test]
     fn test_rabitq_trait_dim() {
         let data = create_test_data::<f32>(50, 32);
-        let quantiser = RaBitQQuantiser::new(data.as_ref(), &Dist::Euclidean, Some(5), 42);
+        let quantiser = RaBitQQuantiser::new(data.as_ref(), &Dist::SquaredEuclidean, Some(5), 42);
 
         assert_eq!(quantiser.dim(), 32);
     }
@@ -805,7 +805,7 @@ mod tests {
     #[test]
     fn test_rabitq_trait_n_bytes() {
         let data = create_test_data::<f32>(50, 32);
-        let quantiser = RaBitQQuantiser::new(data.as_ref(), &Dist::Euclidean, Some(5), 42);
+        let quantiser = RaBitQQuantiser::new(data.as_ref(), &Dist::SquaredEuclidean, Some(5), 42);
 
         assert_eq!(quantiser.n_bytes(), 4);
     }
@@ -813,7 +813,7 @@ mod tests {
     #[test]
     fn test_rabitq_popcount() {
         let data = create_test_data::<f32>(50, 32);
-        let quantiser = RaBitQQuantiser::new(data.as_ref(), &Dist::Euclidean, Some(5), 42);
+        let quantiser = RaBitQQuantiser::new(data.as_ref(), &Dist::SquaredEuclidean, Some(5), 42);
 
         let popcount = quantiser.popcount(0, 0);
         assert!(popcount <= 32);
@@ -822,7 +822,7 @@ mod tests {
     #[test]
     fn test_rabitq_dot_query_binary() {
         let data = create_test_data::<f32>(50, 32);
-        let quantiser = RaBitQQuantiser::new(data.as_ref(), &Dist::Euclidean, Some(5), 42);
+        let quantiser = RaBitQQuantiser::new(data.as_ref(), &Dist::SquaredEuclidean, Some(5), 42);
 
         let query = vec![1.0f32; 32];
         let encoded_query = quantiser.encode_query(&query, 0);
@@ -834,7 +834,7 @@ mod tests {
     #[test]
     fn test_rabitq_dist_positive() {
         let data = create_test_data::<f32>(50, 32);
-        let quantiser = RaBitQQuantiser::new(data.as_ref(), &Dist::Euclidean, Some(5), 42);
+        let quantiser = RaBitQQuantiser::new(data.as_ref(), &Dist::SquaredEuclidean, Some(5), 42);
 
         let query = vec![1.0f32; 32];
         let encoded_query = quantiser.encode_query(&query, 0);
@@ -846,7 +846,7 @@ mod tests {
     #[test]
     fn test_rabitq_dist_consistency() {
         let data = create_test_data::<f32>(50, 32);
-        let quantiser = RaBitQQuantiser::new(data.as_ref(), &Dist::Euclidean, Some(5), 42);
+        let quantiser = RaBitQQuantiser::new(data.as_ref(), &Dist::SquaredEuclidean, Some(5), 42);
 
         let query = vec![1.0f32; 32];
         let encoded_query = quantiser.encode_query(&query, 0);
@@ -860,7 +860,7 @@ mod tests {
     #[test]
     fn test_rabitq_dist_different_vectors() {
         let data = create_test_data::<f32>(50, 32);
-        let quantiser = RaBitQQuantiser::new(data.as_ref(), &Dist::Euclidean, Some(5), 42);
+        let quantiser = RaBitQQuantiser::new(data.as_ref(), &Dist::SquaredEuclidean, Some(5), 42);
 
         let query = vec![1.0f32; 32];
         let encoded_query = quantiser.encode_query(&query, 0);
@@ -889,7 +889,7 @@ mod tests {
     #[test]
     fn test_rabitq_multiple_clusters() {
         let data = create_test_data::<f32>(100, 32);
-        let quantiser = RaBitQQuantiser::new(data.as_ref(), &Dist::Euclidean, Some(10), 42);
+        let quantiser = RaBitQQuantiser::new(data.as_ref(), &Dist::SquaredEuclidean, Some(10), 42);
 
         let query = vec![1.0f32; 32];
 

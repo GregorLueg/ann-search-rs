@@ -521,7 +521,7 @@ where
         let (grid_y, grid_z) = grid_2d((n_queries as u32).div_ceil(WORKGROUP_SIZE_Y));
 
         match self.metric {
-            Dist::Euclidean => unsafe {
+            Dist::SquaredEuclidean => unsafe {
                 let _ = euclidean_tiled::launch_unchecked::<T, R>(
                     client,
                     CubeCount::Static(grid_x, grid_y, grid_z),
@@ -655,7 +655,7 @@ where
         let (mega_grid_y, mega_grid_z) = grid_2d((n_tasks as u32).div_ceil(WORKGROUP_SIZE_Y));
 
         match self.metric {
-            Dist::Euclidean => unsafe {
+            Dist::SquaredEuclidean => unsafe {
                 let _ = compute_ivf_mega_euclidean_cached::launch_unchecked::<T, R>(
                     client,
                     CubeCount::Static(mega_grid_x, mega_grid_y, mega_grid_z),
@@ -870,7 +870,7 @@ mod tests {
 
         let index = IvfIndexGpu::<f32, CpuRuntime>::build(
             data.as_ref(),
-            Dist::Euclidean,
+            Dist::SquaredEuclidean,
             Some(10),
             get_default_k_means(),
             42,
@@ -892,7 +892,7 @@ mod tests {
 
         let index = IvfIndexGpu::<f32, CpuRuntime>::build(
             data.as_ref(),
-            Dist::Euclidean,
+            Dist::SquaredEuclidean,
             Some(5),
             get_default_k_means(),
             42,
@@ -941,7 +941,7 @@ mod tests {
         let assignments = vec![0, 1, 0, 1];
 
         let (reorg, indices, offsets, _) =
-            reorganise_by_cluster(&vectors, 4, 4, &assignments, 2, &Dist::Euclidean);
+            reorganise_by_cluster(&vectors, 4, 4, &assignments, 2, &Dist::SquaredEuclidean);
 
         assert_eq!(reorg.len(), 16);
         assert_eq!(indices.len(), 4);
@@ -982,7 +982,7 @@ mod tests_wpgu {
 
         let index = IvfIndexGpu::<f32, WgpuRuntime>::build(
             data.as_ref(),
-            Dist::Euclidean,
+            Dist::SquaredEuclidean,
             Some(5),
             get_default_k_means(),
             42,

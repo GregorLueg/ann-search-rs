@@ -929,7 +929,7 @@ where
     #[inline]
     fn distance(&self, i: usize, j: usize) -> T {
         match self.metric {
-            Dist::Euclidean => self.euclidean_distance(i, j),
+            Dist::SquaredEuclidean => self.euclidean_distance(i, j),
             Dist::Cosine => self.cosine_distance(i, j),
         }
     }
@@ -1343,7 +1343,7 @@ macro_rules! impl_nndescent_query {
                             results.clear();
 
                             match self.metric {
-                                Dist::Euclidean => self.query_euclidean(
+                                Dist::SquaredEuclidean => self.query_euclidean(
                                     query_vec,
                                     k,
                                     ef,
@@ -1591,7 +1591,7 @@ mod tests {
         let mat = create_simple_matrix();
         let index = NNDescent::<f32>::new(
             mat.as_ref(),
-            Dist::Euclidean,
+            Dist::SquaredEuclidean,
             Some(3),
             None,
             Some(10),
@@ -1633,7 +1633,7 @@ mod tests {
         let mat = create_simple_matrix();
         let index = NNDescent::<f32>::new(
             mat.as_ref(),
-            Dist::Euclidean,
+            Dist::SquaredEuclidean,
             Some(3),
             None,
             Some(10),
@@ -1657,7 +1657,7 @@ mod tests {
         let mat = create_simple_matrix();
         let index = NNDescent::<f32>::new(
             mat.as_ref(),
-            Dist::Euclidean,
+            Dist::SquaredEuclidean,
             Some(3),
             None,
             Some(100),
@@ -1677,7 +1677,7 @@ mod tests {
 
         let g1 = NNDescent::<f32>::new(
             mat.as_ref(),
-            Dist::Euclidean,
+            Dist::SquaredEuclidean,
             Some(3),
             None,
             Some(10),
@@ -1689,7 +1689,7 @@ mod tests {
         );
         let g2 = NNDescent::<f32>::new(
             mat.as_ref(),
-            Dist::Euclidean,
+            Dist::SquaredEuclidean,
             Some(3),
             None,
             Some(10),
@@ -1712,7 +1712,7 @@ mod tests {
 
         let gk2 = NNDescent::<f32>::new(
             mat.as_ref(),
-            Dist::Euclidean,
+            Dist::SquaredEuclidean,
             Some(2),
             None,
             Some(10),
@@ -1724,7 +1724,7 @@ mod tests {
         );
         let gk4 = NNDescent::<f32>::new(
             mat.as_ref(),
-            Dist::Euclidean,
+            Dist::SquaredEuclidean,
             Some(4),
             None,
             Some(10),
@@ -1757,7 +1757,7 @@ mod tests {
         let mat = Mat::from_fn(n, dim, |i, j| data[i * dim + j]);
         let index = NNDescent::<f32>::new(
             mat.as_ref(),
-            Dist::Euclidean,
+            Dist::SquaredEuclidean,
             Some(10),
             None,
             Some(15),
@@ -1781,7 +1781,7 @@ mod tests {
         let mat = create_simple_matrix();
         let index = NNDescent::<f32>::new(
             mat.as_ref(),
-            Dist::Euclidean,
+            Dist::SquaredEuclidean,
             Some(3),
             None,
             Some(10),
@@ -1807,7 +1807,7 @@ mod tests {
 
         let index = NNDescent::<f64>::new(
             mat.as_ref(),
-            Dist::Euclidean,
+            Dist::SquaredEuclidean,
             Some(2),
             None,
             Some(10),
@@ -1842,7 +1842,7 @@ mod tests {
         let mat = Mat::from_fn(n, dim, |i, j| data[i * dim + j]);
         let index = NNDescent::<f32>::new(
             mat.as_ref(),
-            Dist::Euclidean,
+            Dist::SquaredEuclidean,
             Some(5),
             None,
             Some(20),
@@ -1867,7 +1867,7 @@ mod tests {
         let mat = create_simple_matrix();
         let index = NNDescent::<f32>::new(
             mat.as_ref(),
-            Dist::Euclidean,
+            Dist::SquaredEuclidean,
             Some(3),
             None,
             Some(10),

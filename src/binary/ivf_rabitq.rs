@@ -423,7 +423,7 @@ where
                     (query_vec.to_vec(), T::one())
                 }
             }
-            Dist::Euclidean => (query_vec.to_vec(), T::one()),
+            Dist::SquaredEuclidean => (query_vec.to_vec(), T::one()),
         };
 
         // Use trait method - prenorm version since we've already normalised
@@ -513,7 +513,7 @@ where
 
         let query_norm = match self.encoder.metric {
             Dist::Cosine => compute_l2_norm(query_vec),
-            Dist::Euclidean => T::one(),
+            Dist::SquaredEuclidean => T::one(),
         };
 
         let mut scored: Vec<_> = candidates
@@ -523,7 +523,9 @@ where
                     Dist::Cosine => {
                         vector_store.cosine_distance_to_query(idx, query_vec, query_norm)
                     }
-                    Dist::Euclidean => vector_store.euclidean_distance_to_query(idx, query_vec),
+                    Dist::SquaredEuclidean => {
+                        vector_store.euclidean_distance_to_query(idx, query_vec)
+                    }
                 };
                 (dist, idx)
             })
@@ -671,7 +673,7 @@ mod tests {
         let data = create_test_data::<f32>(100, 32);
         let index = IvfIndexRaBitQ::build(
             data.as_ref(),
-            Dist::Euclidean,
+            Dist::SquaredEuclidean,
             Some(10),
             get_default_k_means(),
             42,
@@ -688,7 +690,7 @@ mod tests {
         let data = create_test_data::<f32>(100, 32);
         let index = IvfIndexRaBitQ::build(
             data.as_ref(),
-            Dist::Euclidean,
+            Dist::SquaredEuclidean,
             Some(10),
             get_default_k_means(),
             42,
@@ -707,7 +709,7 @@ mod tests {
         let data = create_test_data::<f32>(100, 32);
         let index = IvfIndexRaBitQ::build(
             data.as_ref(),
-            Dist::Euclidean,
+            Dist::SquaredEuclidean,
             Some(10),
             get_default_k_means(),
             42,
@@ -727,7 +729,7 @@ mod tests {
         let data = create_test_data::<f32>(50, 32);
         let index = IvfIndexRaBitQ::build(
             data.as_ref(),
-            Dist::Euclidean,
+            Dist::SquaredEuclidean,
             Some(5),
             get_default_k_means(),
             42,
@@ -745,7 +747,7 @@ mod tests {
         let data = create_test_data::<f32>(100, 32);
         let index = IvfIndexRaBitQ::build(
             data.as_ref(),
-            Dist::Euclidean,
+            Dist::SquaredEuclidean,
             Some(10),
             get_default_k_means(),
             42,
@@ -782,7 +784,7 @@ mod tests {
         let data = create_test_data::<f32>(100, 32);
         let index = IvfIndexRaBitQ::build(
             data.as_ref(),
-            Dist::Euclidean,
+            Dist::SquaredEuclidean,
             Some(10),
             get_default_k_means(),
             42,
@@ -802,7 +804,7 @@ mod tests {
 
         let index = IvfIndexRaBitQ::build_with_vector_store(
             data.as_ref(),
-            Dist::Euclidean,
+            Dist::SquaredEuclidean,
             Some(5),
             get_default_k_means(),
             42,
@@ -849,7 +851,7 @@ mod tests {
 
         let index = IvfIndexRaBitQ::build_with_vector_store(
             data.as_ref(),
-            Dist::Euclidean,
+            Dist::SquaredEuclidean,
             Some(10),
             get_default_k_means(),
             42,
@@ -898,7 +900,7 @@ mod tests {
         let data = create_test_data::<f32>(50, 32);
         let index = IvfIndexRaBitQ::build(
             data.as_ref(),
-            Dist::Euclidean,
+            Dist::SquaredEuclidean,
             Some(5),
             get_default_k_means(),
             42,
@@ -914,7 +916,7 @@ mod tests {
         let data = create_test_data::<f32>(50, 32);
         let index = IvfIndexRaBitQ::build(
             data.as_ref(),
-            Dist::Euclidean,
+            Dist::SquaredEuclidean,
             Some(5),
             get_default_k_means(),
             42,
@@ -930,7 +932,7 @@ mod tests {
         let data = create_test_data::<f32>(100, 32);
         let index = IvfIndexRaBitQ::build(
             data.as_ref(),
-            Dist::Euclidean,
+            Dist::SquaredEuclidean,
             None,
             get_default_k_means(),
             42,

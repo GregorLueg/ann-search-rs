@@ -128,7 +128,7 @@ where
         let mut heap: BinaryHeap<(OrderedFloat<T>, usize)> = BinaryHeap::with_capacity(k + 1);
 
         match self.metric {
-            Dist::Euclidean => {
+            Dist::SquaredEuclidean => {
                 for idx in 0..n_vectors {
                     let dist = self.euclidean_distance_to_query(idx, query_vec);
 
@@ -298,7 +298,7 @@ mod tests {
     #[test]
     fn test_exhaustive_index_creation_euclidean() {
         let mat = create_simple_matrix();
-        let index = ExhaustiveIndex::new(mat.as_ref(), Dist::Euclidean);
+        let index = ExhaustiveIndex::new(mat.as_ref(), Dist::SquaredEuclidean);
 
         assert_eq!(index.n, 5);
         assert_eq!(index.dim, 3);
@@ -320,7 +320,7 @@ mod tests {
     #[test]
     fn test_exhaustive_query_finds_self_euclidean() {
         let mat = create_simple_matrix();
-        let index = ExhaustiveIndex::new(mat.as_ref(), Dist::Euclidean);
+        let index = ExhaustiveIndex::new(mat.as_ref(), Dist::SquaredEuclidean);
 
         // Query with point 0, should find itself first
         let query = vec![1.0, 0.0, 0.0];
@@ -347,7 +347,7 @@ mod tests {
     #[test]
     fn test_exhaustive_query_euclidean_multiple() {
         let mat = create_simple_matrix();
-        let index = ExhaustiveIndex::new(mat.as_ref(), Dist::Euclidean);
+        let index = ExhaustiveIndex::new(mat.as_ref(), Dist::SquaredEuclidean);
 
         let query = vec![1.0, 0.0, 0.0];
         let (indices, distances) = index.query(&query, 3);
@@ -386,7 +386,7 @@ mod tests {
     #[test]
     fn test_exhaustive_query_k_larger_than_dataset() {
         let mat = create_simple_matrix();
-        let index = ExhaustiveIndex::new(mat.as_ref(), Dist::Euclidean);
+        let index = ExhaustiveIndex::new(mat.as_ref(), Dist::SquaredEuclidean);
 
         let query = vec![1.0, 0.0, 0.0];
         // Ask for 10 neighbours but only 5 points exist
@@ -399,7 +399,7 @@ mod tests {
     #[test]
     fn test_exhaustive_query_row() {
         let mat = create_simple_matrix();
-        let index = ExhaustiveIndex::new(mat.as_ref(), Dist::Euclidean);
+        let index = ExhaustiveIndex::new(mat.as_ref(), Dist::SquaredEuclidean);
 
         // Query using a row from the matrix
         let (indices, distances) = index.query_row(mat.row(0), 1);
@@ -411,7 +411,7 @@ mod tests {
     #[test]
     fn test_exhaustive_euclidean_distances() {
         let mat = create_simple_matrix();
-        let index = ExhaustiveIndex::new(mat.as_ref(), Dist::Euclidean);
+        let index = ExhaustiveIndex::new(mat.as_ref(), Dist::SquaredEuclidean);
 
         let query = vec![1.0, 0.0, 0.0];
         let (indices, distances) = index.query(&query, 5);
@@ -435,7 +435,7 @@ mod tests {
     #[test]
     fn test_exhaustive_all_points_found() {
         let mat = create_simple_matrix();
-        let index = ExhaustiveIndex::new(mat.as_ref(), Dist::Euclidean);
+        let index = ExhaustiveIndex::new(mat.as_ref(), Dist::SquaredEuclidean);
 
         let query = vec![0.5, 0.5, 0.5];
         let (indices, _) = index.query(&query, 5);
@@ -463,7 +463,7 @@ mod tests {
         }
 
         let mat = Mat::from_fn(n, dim, |i, j| data[i * dim + j]);
-        let index = ExhaustiveIndex::new(mat.as_ref(), Dist::Euclidean);
+        let index = ExhaustiveIndex::new(mat.as_ref(), Dist::SquaredEuclidean);
 
         // Query for point 0
         let query: Vec<f32> = (0..dim).map(|_| 0.0).collect();
@@ -502,7 +502,7 @@ mod tests {
     #[test]
     fn test_exhaustive_implements_vector_distance() {
         let mat = create_simple_matrix();
-        let index = ExhaustiveIndex::new(mat.as_ref(), Dist::Euclidean);
+        let index = ExhaustiveIndex::new(mat.as_ref(), Dist::SquaredEuclidean);
 
         // Test that we can call VectorDistance methods
         let dist = index.euclidean_distance(0, 1);
@@ -529,7 +529,7 @@ mod tests {
     fn test_exhaustive_query_consistency() {
         // Test that query and query_row give same results
         let mat = create_simple_matrix();
-        let index = ExhaustiveIndex::new(mat.as_ref(), Dist::Euclidean);
+        let index = ExhaustiveIndex::new(mat.as_ref(), Dist::SquaredEuclidean);
 
         let query_vec = vec![1.0, 0.0, 0.0];
         let (indices1, distances1) = index.query(&query_vec, 3);

@@ -17,6 +17,7 @@ use mimalloc::MiMalloc;
 static GLOBAL: MiMalloc = MiMalloc;
 
 pub mod cpu;
+pub mod errors;
 pub mod prelude;
 pub mod utils;
 
@@ -117,6 +118,58 @@ where
     } else {
         let indices: Vec<Vec<usize>> = results.into_iter().map(|(idx, _)| idx).collect();
         (indices, None)
+    }
+}
+
+/// Helper function to execute parallel queries across samples
+///
+/// ### Params
+///
+/// * `n_samples` - Number of samples to query
+/// * `return_dist` - Whether to return distances alongside indices
+/// * `verbose` - Print progress information every 100,000 samples
+/// * `query_fn` - Closure that takes a sample index and returns (indices,
+///   distances)
+///
+/// ### Returns
+///
+/// A tuple of `(knn_indices, optional distances)`
+fn query_parallel_2<T, F>(
+    n_samples: usize,
+    return_dist: bool,
+    verbose: bool,
+    query_fn: F,
+) -> AnnSearchResult<T>
+where
+    T: Send,
+    F: Fn(usize) -> Result<(Vec<usize>, Vec<T>), AnnSearchErrors> + Sync,
+{
+    let counter = Arc::new(AtomicUsize::new(0));
+
+    let results: Vec<(Vec<usize>, Vec<T>)> = (0..n_samples)
+        .into_par_iter()
+        .map(|i| {
+            let result = query_fn(i)?;
+            if verbose {
+                let count = counter.fetch_add(1, Ordering::Relaxed) + 1;
+                if count.is_multiple_of(100_000) {
+                    println!(
+                        "  Processed {} / {} samples.",
+                        count.separate_with_underscores(),
+                        n_samples.separate_with_underscores()
+                    );
+                }
+            }
+            Ok(result)
+        })
+        .collect::<Result<Vec<_>, AnnSearchErrors>>()?;
+
+    if return_dist {
+        let (indices, distances) = results.into_iter().unzip();
+        Ok((indices, Some(distances)))
+    } else {
+        let indices: Vec<Vec<usize>> = results.into_iter().map(|(idx, _)| idx).collect();
+        Ok((indices, None))
     }
 }
 
@@ -1108,7 +1161,7 @@ where
     T: AnnSearchFloat,
     VamanaIndex<T>: VamanaState<T>,
 {
-    let metric = parse_ann_dist(dist_metric).unwrap_or(Dist::Euclidean);
+    let metric = parse_ann_dist(dist_metric).unwrap_or(Dist::SquaredEuclidean);
     VamanaIndex::build(mat, metric, r, l_build, alpha_pass1, alpha_pass2, seed)
 }
 
@@ -2421,7 +2474,7 @@ pub fn build_exhaustive_index_binary<T>(
     metric: &str,
     save_store: bool,
     save_path: Option<impl AsRef<Path>>,
-) -> std::io::Result<ExhaustiveIndexBinary<T>>
+) -> Result<ExhaustiveIndexBinary<T>, AnnSearchErrors>
 where
     T: AnnSearchFloat + Pod,
 {
@@ -2431,7 +2484,7 @@ where
         let path = save_path.expect("save_path required when save_store is true");
         ExhaustiveIndexBinary::new_with_vector_store(mat, binary_init, n_bits, metric, seed, path)
     } else {
-        Ok(ExhaustiveIndexBinary::new(mat, binary_init, n_bits, seed))
+        ExhaustiveIndexBinary::new(mat, binary_init, n_bits, seed)
     }
 }
 
@@ -2460,26 +2513,26 @@ pub fn query_exhaustive_index_binary<T>(
     rerank_factor: Option<usize>,
     return_dist: bool,
     verbose: bool,
-) -> (Vec<Vec<usize>>, Option<Vec<Vec<T>>>)
+) -> AnnSearchResult<T>
 where
     T: AnnSearchFloat + Pod,
 {
     if rerank {
-        query_parallel(query_mat.nrows(), return_dist, verbose, |i| {
+        query_parallel_2(query_mat.nrows(), return_dist, verbose, |i| {
             index.query_row_reranking(query_mat.row(i), k, rerank_factor)
         })
     } else {
         let (indices, dist) = if index.use_asymmetric() {
             // path where asymmetric queries are sensible
-            query_parallel(query_mat.nrows(), return_dist, verbose, |i| {
+            query_parallel_2(query_mat.nrows(), return_dist, verbose, |i| {
                 index.query_row_asymmetric(query_mat.row(i), k, rerank_factor)
-            })
+            })?
         } else {
             // path where asymmetric queries are not sensible/possible
             let (indices, distances_u32) =
-                query_parallel(query_mat.nrows(), return_dist, verbose, |i| {
+                query_parallel_2(query_mat.nrows(), return_dist, verbose, |i| {
                     index.query_row(query_mat.row(i), k)
-                });
+                })?;
             let distances_t = distances_u32.map(|dists| {
                 dists
                     .into_iter()
@@ -2490,7 +2543,7 @@ where
             (indices, distances_t)
         };
 
-        (indices, dist)
+        Ok((indices, dist))
     }
 }
 
@@ -2517,11 +2570,13 @@ pub fn query_exhaustive_index_binary_self<T>(
     rerank_factor: Option<usize>,
     return_dist: bool,
     verbose: bool,
-) -> (Vec<Vec<usize>>, Option<Vec<Vec<T>>>)
+) -> AnnSearchResult<T>
 where
     T: AnnSearchFloat + Pod,
 {
-    index.generate_knn(k, rerank_factor, return_dist, verbose)
+    let res = index.generate_knn(k, rerank_factor, return_dist, verbose)?;
+
+    Ok(res)
 }
 
 ////////////////
@@ -2562,7 +2617,7 @@ pub fn build_ivf_index_binary<T>(
     save_store: bool,
     save_path: Option<impl AsRef<Path>>,
     verbose: bool,
-) -> std::io::Result<IvfIndexBinary<T>>
+) -> Result<IvfIndexBinary<T>, AnnSearchErrors>
 where
     T: AnnSearchFloat + Pod,
 {
@@ -2582,7 +2637,7 @@ where
             path,
         )
     } else {
-        Ok(IvfIndexBinary::build(
+        IvfIndexBinary::build(
             mat,
             binarisation_init,
             n_bits,
@@ -2591,7 +2646,7 @@ where
             k_means_params,
             seed,
             verbose,
-        ))
+        )
     }
 }
 
@@ -2623,24 +2678,24 @@ pub fn query_ivf_index_binary<T>(
     rerank_factor: Option<usize>,
     return_dist: bool,
     verbose: bool,
-) -> (Vec<Vec<usize>>, Option<Vec<Vec<T>>>)
+) -> AnnSearchResult<T>
 where
     T: AnnSearchFloat + Pod,
 {
     if rerank {
-        query_parallel(query_mat.nrows(), return_dist, verbose, |i| {
+        query_parallel_2(query_mat.nrows(), return_dist, verbose, |i| {
             index.query_row_reranking(query_mat.row(i), k, nprobe, rerank_factor)
         })
     } else {
         let (indices, dist) = if index.use_asymmetric() {
-            query_parallel(query_mat.nrows(), return_dist, verbose, |i| {
+            query_parallel_2(query_mat.nrows(), return_dist, verbose, |i| {
                 index.query_row_asymmetric(query_mat.row(i), k, nprobe, rerank_factor)
-            })
+            })?
         } else {
             let (indices, distances_u32) =
-                query_parallel(query_mat.nrows(), return_dist, verbose, |i| {
+                query_parallel_2(query_mat.nrows(), return_dist, verbose, |i| {
                     index.query_row(query_mat.row(i), k, nprobe)
-                });
+                })?;
             let distances_t = distances_u32.map(|dists| {
                 dists
                     .into_iter()
@@ -2649,7 +2704,7 @@ where
             });
             (indices, distances_t)
         };
-        (indices, dist)
+        Ok((indices, dist))
     }
 }
 
@@ -2677,7 +2732,7 @@ pub fn query_ivf_index_binary_self<T>(
     rerank_factor: Option<usize>,
     return_dist: bool,
     verbose: bool,
-) -> (Vec<Vec<usize>>, Option<Vec<Vec<T>>>)
+) -> AnnSearchResult<T>
 where
     T: AnnSearchFloat + Pod,
 {

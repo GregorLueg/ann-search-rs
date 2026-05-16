@@ -214,8 +214,11 @@ mod tests {
         // 8 samples, 4 dimensions
         let data = Mat::from_fn(8, 4, |i, j| if i == j { 1.0_f32 } else { 0.0_f32 });
 
-        let index =
-            ExhaustiveIndexGpu::<f32, CpuRuntime>::new(data.as_ref(), Dist::Euclidean, device);
+        let index = ExhaustiveIndexGpu::<f32, CpuRuntime>::new(
+            data.as_ref(),
+            Dist::SquaredEuclidean,
+            device,
+        );
 
         let query = Mat::from_fn(2, 4, |i, j| if i == j { 1.0_f32 } else { 0.0_f32 });
 
@@ -252,8 +255,11 @@ mod tests {
 
         let data = Mat::from_fn(6, 4, |i, j| if i == j { 1.0_f32 } else { 0.1_f32 });
 
-        let index =
-            ExhaustiveIndexGpu::<f32, CpuRuntime>::new(data.as_ref(), Dist::Euclidean, device);
+        let index = ExhaustiveIndexGpu::<f32, CpuRuntime>::new(
+            data.as_ref(),
+            Dist::SquaredEuclidean,
+            device,
+        );
 
         let (indices, distances) = index.generate_knn(3, true, false);
 

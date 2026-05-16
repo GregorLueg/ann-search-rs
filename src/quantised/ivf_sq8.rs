@@ -316,7 +316,7 @@ where
             for vec_idx in start..end {
                 let dist = match self.metric {
                     Dist::Cosine => self.cosine_distance_i8(vec_idx, &query_i8, query_norm_sq),
-                    Dist::Euclidean => self.euclidean_distance_i8(vec_idx, &query_i8),
+                    Dist::SquaredEuclidean => self.euclidean_distance_i8(vec_idx, &query_i8),
                 };
 
                 if heap.len() < k {
@@ -399,7 +399,7 @@ where
             for vec_idx in start..end {
                 let dist = match self.metric {
                     Dist::Cosine => self.cosine_distance_i8(vec_idx, query_i8, query_norm_sq),
-                    Dist::Euclidean => self.euclidean_distance_i8(vec_idx, query_i8),
+                    Dist::SquaredEuclidean => self.euclidean_distance_i8(vec_idx, query_i8),
                 };
 
                 if heap.len() < k {
@@ -588,7 +588,7 @@ mod tests {
         let index = IvfSq8Index::build(
             data.as_ref(),
             Some(2),
-            Dist::Euclidean,
+            Dist::SquaredEuclidean,
             get_default_k_means(),
             42,
             false,
@@ -597,7 +597,7 @@ mod tests {
         assert_eq!(index.dim, 32);
         assert_eq!(index.n, 6);
         assert_eq!(index.nlist, 2);
-        assert_eq!(index.metric, Dist::Euclidean);
+        assert_eq!(index.metric, Dist::SquaredEuclidean);
         assert_eq!(index.quantised_vectors.len(), 192);
         assert_eq!(index.centroids.len(), 64);
         assert_eq!(index.offsets.len(), 3);
@@ -625,7 +625,7 @@ mod tests {
         let index = IvfSq8Index::build(
             data.as_ref(),
             Some(2),
-            Dist::Euclidean,
+            Dist::SquaredEuclidean,
             get_default_k_means(),
             42,
             false,
@@ -644,7 +644,7 @@ mod tests {
         let index = IvfSq8Index::build(
             data.as_ref(),
             Some(2),
-            Dist::Euclidean,
+            Dist::SquaredEuclidean,
             get_default_k_means(),
             42,
             false,
@@ -662,7 +662,7 @@ mod tests {
         let index = IvfSq8Index::build(
             data.as_ref(),
             Some(2),
-            Dist::Euclidean,
+            Dist::SquaredEuclidean,
             get_default_k_means(),
             42,
             false,
@@ -703,7 +703,7 @@ mod tests {
         let index = IvfSq8Index::build(
             data.as_ref(),
             Some(2),
-            Dist::Euclidean,
+            Dist::SquaredEuclidean,
             get_default_k_means(),
             42,
             false,
@@ -724,7 +724,7 @@ mod tests {
         let index = IvfSq8Index::build(
             data.as_ref(),
             Some(2),
-            Dist::Euclidean,
+            Dist::SquaredEuclidean,
             get_default_k_means(),
             42,
             false,
@@ -745,7 +745,7 @@ mod tests {
         let index = IvfSq8Index::build(
             data.as_ref(),
             Some(2),
-            Dist::Euclidean,
+            Dist::SquaredEuclidean,
             get_default_k_means(),
             42,
             false,
@@ -767,7 +767,7 @@ mod tests {
         let index = IvfSq8Index::build(
             data.as_ref(),
             Some(10),
-            Dist::Euclidean,
+            Dist::SquaredEuclidean,
             get_default_k_means(),
             42,
             false,
@@ -783,7 +783,7 @@ mod tests {
         let index = IvfSq8Index::build(
             data.as_ref(),
             Some(2),
-            Dist::Euclidean,
+            Dist::SquaredEuclidean,
             get_default_k_means(),
             42,
             false,

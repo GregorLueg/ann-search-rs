@@ -313,7 +313,7 @@ mod tests {
         let index = ExhaustiveOpqIndex::build(
             data.as_ref(),
             8,
-            Dist::Euclidean,
+            Dist::SquaredEuclidean,
             Some(10),
             Some(4),
             42,
@@ -322,7 +322,7 @@ mod tests {
 
         assert_eq!(index.dim, 32);
         assert_eq!(index.n, 6);
-        assert_eq!(index.metric, Dist::Euclidean);
+        assert_eq!(index.metric, Dist::SquaredEuclidean);
         assert_eq!(index.quantised_codes.len(), 48); // 6 vectors * 8 subspaces
     }
 
@@ -341,7 +341,7 @@ mod tests {
         let index = ExhaustiveOpqIndex::build(
             data.as_ref(),
             8,
-            Dist::Euclidean,
+            Dist::SquaredEuclidean,
             Some(10),
             Some(4),
             42,
@@ -361,7 +361,7 @@ mod tests {
         let index = ExhaustiveOpqIndex::build(
             data.as_ref(),
             8,
-            Dist::Euclidean,
+            Dist::SquaredEuclidean,
             Some(10),
             Some(4),
             42,
@@ -380,7 +380,7 @@ mod tests {
         let index = ExhaustiveOpqIndex::build(
             data.as_ref(),
             8,
-            Dist::Euclidean,
+            Dist::SquaredEuclidean,
             Some(10),
             Some(4),
             42,
@@ -414,7 +414,7 @@ mod tests {
         let index = ExhaustiveOpqIndex::build(
             data.as_ref(),
             8,
-            Dist::Euclidean,
+            Dist::SquaredEuclidean,
             Some(10),
             Some(4),
             42,
@@ -436,7 +436,7 @@ mod tests {
         let index = ExhaustiveOpqIndex::build(
             data.as_ref(),
             8,
-            Dist::Euclidean,
+            Dist::SquaredEuclidean,
             Some(10),
             Some(4),
             42,
@@ -459,7 +459,7 @@ mod tests {
         let index = ExhaustiveOpqIndex::build(
             data.as_ref(),
             8,
-            Dist::Euclidean,
+            Dist::SquaredEuclidean,
             Some(5),
             Some(4),
             42,
@@ -477,7 +477,7 @@ mod tests {
         let index = ExhaustiveOpqIndex::build(
             data.as_ref(),
             8,
-            Dist::Euclidean,
+            Dist::SquaredEuclidean,
             Some(10),
             Some(4),
             42,
@@ -497,7 +497,7 @@ mod tests {
         let index = ExhaustiveOpqIndex::build(
             data.as_ref(),
             8,
-            Dist::Euclidean,
+            Dist::SquaredEuclidean,
             Some(10),
             Some(4),
             42,
@@ -519,7 +519,7 @@ mod tests {
         let index = ExhaustiveOpqIndex::build(
             data.as_ref(),
             8,
-            Dist::Euclidean,
+            Dist::SquaredEuclidean,
             Some(5),
             Some(4),
             42,
@@ -540,7 +540,7 @@ mod tests {
         let index = ExhaustiveOpqIndex::build(
             data.as_ref(),
             8,
-            Dist::Euclidean,
+            Dist::SquaredEuclidean,
             Some(10),
             Some(4),
             42,
@@ -558,7 +558,7 @@ mod tests {
         let index = ExhaustiveOpqIndex::build(
             data.as_ref(),
             8,
-            Dist::Euclidean,
+            Dist::SquaredEuclidean,
             Some(5),
             Some(4),
             42,
@@ -586,7 +586,7 @@ mod tests {
         let index = ExhaustiveOpqIndex::build(
             data.as_ref(),
             8,
-            Dist::Euclidean,
+            Dist::SquaredEuclidean,
             Some(5),
             Some(4),
             42,
@@ -611,7 +611,7 @@ mod tests {
         let index_4 = ExhaustiveOpqIndex::build(
             data.as_ref(),
             4,
-            Dist::Euclidean,
+            Dist::SquaredEuclidean,
             Some(5),
             Some(4),
             42,
@@ -624,7 +624,7 @@ mod tests {
         let index_16 = ExhaustiveOpqIndex::build(
             data.as_ref(),
             16,
-            Dist::Euclidean,
+            Dist::SquaredEuclidean,
             Some(5),
             Some(4),
             42,

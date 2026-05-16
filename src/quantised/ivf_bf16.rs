@@ -290,7 +290,9 @@ where
 
             for vec_idx in start..end {
                 let dist = match self.metric {
-                    Dist::Euclidean => self.euclidean_distance_to_query_bf16(vec_idx, query_vec),
+                    Dist::SquaredEuclidean => {
+                        self.euclidean_distance_to_query_bf16(vec_idx, query_vec)
+                    }
                     Dist::Cosine => {
                         self.cosine_distance_to_query_bf16(vec_idx, query_vec, query_norm)
                     }
@@ -453,7 +455,7 @@ where
 
             for vec_idx in start..end {
                 let dist = match self.metric {
-                    Dist::Euclidean => {
+                    Dist::SquaredEuclidean => {
                         self.euclidean_distance_to_query_dual_bf16(vec_idx, query_vec)
                     }
                     Dist::Cosine => self.cosine_distance_to_query_dual_bf16(
@@ -562,7 +564,7 @@ mod tests {
         let data = create_test_data::<f32>(200, 32);
         let index = IvfIndexBf16::build(
             data.as_ref(),
-            Dist::Euclidean,
+            Dist::SquaredEuclidean,
             Some(10),
             get_default_k_means(),
             42,
@@ -599,7 +601,7 @@ mod tests {
         let data = create_test_data::<f32>(200, 32);
         let index = IvfIndexBf16::build(
             data.as_ref(),
-            Dist::Euclidean,
+            Dist::SquaredEuclidean,
             Some(10),
             get_default_k_means(),
             42,
@@ -618,7 +620,7 @@ mod tests {
         let data = create_test_data::<f32>(200, 32);
         let index = IvfIndexBf16::build(
             data.as_ref(),
-            Dist::Euclidean,
+            Dist::SquaredEuclidean,
             Some(10),
             get_default_k_means(),
             42,
@@ -638,7 +640,7 @@ mod tests {
         let data = create_test_data::<f32>(200, 32);
         let index = IvfIndexBf16::build(
             data.as_ref(),
-            Dist::Euclidean,
+            Dist::SquaredEuclidean,
             Some(10),
             get_default_k_means(),
             42,
@@ -679,7 +681,7 @@ mod tests {
         let data = create_test_data::<f32>(100, 32);
         let index = IvfIndexBf16::build(
             data.as_ref(),
-            Dist::Euclidean,
+            Dist::SquaredEuclidean,
             Some(10),
             get_default_k_means(),
             42,
@@ -701,7 +703,7 @@ mod tests {
         let data = create_test_data::<f32>(500, 32);
         let index = IvfIndexBf16::build(
             data.as_ref(),
-            Dist::Euclidean,
+            Dist::SquaredEuclidean,
             Some(20),
             get_default_k_means(),
             42,

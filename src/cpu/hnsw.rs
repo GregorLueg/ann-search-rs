@@ -786,7 +786,7 @@ where
 
         // greedy descent through layers above this node's highest layer
         let mut current_dist = OrderedFloat(match self.metric {
-            Dist::Euclidean => self.euclidean_distance(node, current_node),
+            Dist::SquaredEuclidean => self.euclidean_distance(node, current_node),
             Dist::Cosine => self.cosine_distance(node, current_node),
         });
 
@@ -808,7 +808,7 @@ where
                     let neighbour = neighbour as usize;
 
                     let dist = OrderedFloat(match self.metric {
-                        Dist::Euclidean => self.euclidean_distance(node, neighbour),
+                        Dist::SquaredEuclidean => self.euclidean_distance(node, neighbour),
                         Dist::Cosine => self.cosine_distance(node, neighbour),
                     });
 
@@ -824,7 +824,7 @@ where
         // for each layer this node belongs to (top-down), search and connect
         let distance_fn = |a: usize, b: usize| -> T {
             match self.metric {
-                Dist::Euclidean => self.euclidean_distance(a, b),
+                Dist::SquaredEuclidean => self.euclidean_distance(a, b),
                 Dist::Cosine => self.cosine_distance(a, b),
             }
         };
@@ -960,7 +960,7 @@ where
         state.candidates.clear();
 
         let entry_dist = OrderedFloat(match self.metric {
-            Dist::Euclidean => self.euclidean_distance(query_node, entry_node),
+            Dist::SquaredEuclidean => self.euclidean_distance(query_node, entry_node),
             Dist::Cosine => self.cosine_distance(query_node, entry_node),
         });
 
@@ -991,7 +991,7 @@ where
                 state.mark_visited(neighbour_id);
 
                 let dist = OrderedFloat(match self.metric {
-                    Dist::Euclidean => self.euclidean_distance(query_node, neighbour_id),
+                    Dist::SquaredEuclidean => self.euclidean_distance(query_node, neighbour_id),
                     Dist::Cosine => self.cosine_distance(query_node, neighbour_id),
                 });
 
@@ -1056,7 +1056,7 @@ where
 
             let is_good = !result.iter().any(|&(_, selected_id)| {
                 let dist_to_selected = OrderedFloat(match self.metric {
-                    Dist::Euclidean => self.euclidean_distance(cand_id, selected_id),
+                    Dist::SquaredEuclidean => self.euclidean_distance(cand_id, selected_id),
                     Dist::Cosine => self.cosine_distance(cand_id, selected_id),
                 });
                 dist_to_selected < cand_dist
@@ -1383,7 +1383,7 @@ where
     #[inline(always)]
     fn compute_query_distance(&self, query: &[T], idx: usize, query_norm: T) -> T {
         match self.metric {
-            Dist::Euclidean => self.euclidean_distance_to_query(idx, query),
+            Dist::SquaredEuclidean => self.euclidean_distance_to_query(idx, query),
             Dist::Cosine => self.cosine_distance_to_query(idx, query, query_norm),
         }
     }

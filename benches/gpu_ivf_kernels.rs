@@ -172,7 +172,7 @@ fn run_ivf_suite<R: Runtime>(device: &R::Device) {
 
         let index = std::sync::Arc::new(IvfIndexGpu::<f32, R>::build(
             mat.as_ref(),
-            Dist::Euclidean,
+            Dist::SquaredEuclidean,
             Some(nlist),
             default_k_means_params(),
             42,

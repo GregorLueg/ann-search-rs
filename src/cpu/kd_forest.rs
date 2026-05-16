@@ -624,7 +624,7 @@ where
                 // margin^2 is one component, so cos_dist >= margin^2/2
                 // Claude says this is the right way to do this...
                 let lower_bound = match self.metric {
-                    Dist::Euclidean => abs_margin * abs_margin,
+                    Dist::SquaredEuclidean => abs_margin * abs_margin,
                     Dist::Cosine => abs_margin * abs_margin * 0.5,
                 };
                 if lower_bound > kth_dist.to_f64().unwrap() {
@@ -653,7 +653,9 @@ where
                         visited.insert(item);
 
                         let dist = match self.metric {
-                            Dist::Euclidean => self.euclidean_distance_to_query(item, query_vec),
+                            Dist::SquaredEuclidean => {
+                                self.euclidean_distance_to_query(item, query_vec)
+                            }
                             Dist::Cosine => {
                                 self.cosine_distance_to_query(item, query_vec, query_norm)
                             }
@@ -879,7 +881,7 @@ mod tests {
     #[test]
     fn test_kd_tree_index_creation() {
         let mat = create_simple_matrix();
-        let _ = KdTreeIndex::new(mat.as_ref(), 4, Dist::Euclidean, 42);
+        let _ = KdTreeIndex::new(mat.as_ref(), 4, Dist::SquaredEuclidean, 42);
 
         // just verify it doesn't panic
     }
@@ -887,7 +889,7 @@ mod tests {
     #[test]
     fn test_kd_tree_query_finds_self() {
         let mat = create_simple_matrix();
-        let index = KdTreeIndex::new(mat.as_ref(), 4, Dist::Euclidean, 42);
+        let index = KdTreeIndex::new(mat.as_ref(), 4, Dist::SquaredEuclidean, 42);
 
         let query = vec![1.0, 0.0, 0.0];
         let (indices, distances) = index.query(&query, 1, None);
@@ -900,7 +902,7 @@ mod tests {
     #[test]
     fn test_kd_tree_query_euclidean() {
         let mat = create_simple_matrix();
-        let index = KdTreeIndex::new(mat.as_ref(), 8, Dist::Euclidean, 42);
+        let index = KdTreeIndex::new(mat.as_ref(), 8, Dist::SquaredEuclidean, 42);
 
         let query = vec![1.0, 0.0, 0.0];
         let (indices, distances) = index.query(&query, 3, None);
@@ -931,7 +933,7 @@ mod tests {
     #[test]
     fn test_kd_tree_query_k_larger_than_dataset() {
         let mat = create_simple_matrix();
-        let index = KdTreeIndex::new(mat.as_ref(), 4, Dist::Euclidean, 42);
+        let index = KdTreeIndex::new(mat.as_ref(), 4, Dist::SquaredEuclidean, 42);
 
         let query = vec![1.0, 0.0, 0.0];
         // ask for 10 neighbours but only 5 points exist
@@ -944,7 +946,7 @@ mod tests {
     #[test]
     fn test_kd_tree_query_search_k() {
         let mat = create_simple_matrix();
-        let index = KdTreeIndex::new(mat.as_ref(), 4, Dist::Euclidean, 42);
+        let index = KdTreeIndex::new(mat.as_ref(), 4, Dist::SquaredEuclidean, 42);
 
         let query = vec![1.0, 0.0, 0.0];
 
@@ -961,8 +963,8 @@ mod tests {
         let mat = create_simple_matrix();
 
         // More trees should give better recall
-        let index_few = KdTreeIndex::new(mat.as_ref(), 2, Dist::Euclidean, 42);
-        let index_many = KdTreeIndex::new(mat.as_ref(), 16, Dist::Euclidean, 42);
+        let index_few = KdTreeIndex::new(mat.as_ref(), 2, Dist::SquaredEuclidean, 42);
+        let index_many = KdTreeIndex::new(mat.as_ref(), 16, Dist::SquaredEuclidean, 42);
 
         let query = vec![0.9, 0.1, 0.0];
         let (indices1, _) = index_few.query(&query, 3, None);
@@ -975,7 +977,7 @@ mod tests {
     #[test]
     fn test_kd_tree_query_row() {
         let mat = create_simple_matrix();
-        let index = KdTreeIndex::new(mat.as_ref(), 8, Dist::Euclidean, 42);
+        let index = KdTreeIndex::new(mat.as_ref(), 8, Dist::SquaredEuclidean, 42);
 
         let (indices, distances) = index.query_row(mat.row(0), 1, None);
 
@@ -988,8 +990,8 @@ mod tests {
         let mat = create_simple_matrix();
 
         // Same seed should give same results
-        let index1 = KdTreeIndex::new(mat.as_ref(), 8, Dist::Euclidean, 42);
-        let index2 = KdTreeIndex::new(mat.as_ref(), 8, Dist::Euclidean, 42);
+        let index1 = KdTreeIndex::new(mat.as_ref(), 8, Dist::SquaredEuclidean, 42);
+        let index2 = KdTreeIndex::new(mat.as_ref(), 8, Dist::SquaredEuclidean, 42);
 
         let query = vec![0.5, 0.5, 0.0];
         let (indices1, _) = index1.query(&query, 3, None);
@@ -1002,8 +1004,8 @@ mod tests {
     fn test_kd_tree_different_seeds() {
         let mat = create_simple_matrix();
 
-        let index1 = KdTreeIndex::new(mat.as_ref(), 8, Dist::Euclidean, 42);
-        let index2 = KdTreeIndex::new(mat.as_ref(), 8, Dist::Euclidean, 123);
+        let index1 = KdTreeIndex::new(mat.as_ref(), 8, Dist::SquaredEuclidean, 42);
+        let index2 = KdTreeIndex::new(mat.as_ref(), 8, Dist::SquaredEuclidean, 123);
 
         let query = vec![0.5, 0.5, 0.0];
 
@@ -1027,7 +1029,7 @@ mod tests {
         }
 
         let mat = Mat::from_fn(n, dim, |i, j| data[i * dim + j]);
-        let index = KdTreeIndex::new(mat.as_ref(), 16, Dist::Euclidean, 42);
+        let index = KdTreeIndex::new(mat.as_ref(), 16, Dist::SquaredEuclidean, 42);
 
         // Query for point 0
         let query: Vec<f32> = (0..dim).map(|_| 0.0).collect();
@@ -1062,7 +1064,7 @@ mod tests {
         let data: Vec<f32> = (0..n * dim).map(|i| i as f32).collect();
         let mat = Mat::from_fn(n, dim, |i, j| data[i * dim + j]);
 
-        let index = KdTreeIndex::new(mat.as_ref(), 32, Dist::Euclidean, 42);
+        let index = KdTreeIndex::new(mat.as_ref(), 32, Dist::SquaredEuclidean, 42);
 
         let query: Vec<f32> = (0..dim).map(|_| 0.0).collect();
         let (indices, _) = index.query(&query, 3, None);
@@ -1085,7 +1087,7 @@ mod tests {
         let mat = Mat::from_fn(n, dim, |i, j| data[i * dim + j]);
 
         // Build with zero overlap (standard Kd-tree)
-        let index = KdTreeIndex::new(mat.as_ref(), 8, Dist::Euclidean, 42);
+        let index = KdTreeIndex::new(mat.as_ref(), 8, Dist::SquaredEuclidean, 42);
 
         let query: Vec<f32> = (0..dim).map(|_| 0.0).collect();
         let (indices, _) = index.query(&query, 5, None);

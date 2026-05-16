@@ -29,7 +29,7 @@ pub struct ExhaustiveIndexBinary<T> {
     /// Number of samples in the index
     pub n: usize,
     /// Original dimensionality
-    pub dim: usize,
+    dim: usize,
     /// Distance metric to use
     metric: Dist,
     /// Binarisation type to use
@@ -54,6 +54,20 @@ impl<T> VectorDistanceBinary for ExhaustiveIndexBinary<T> {
     }
 }
 
+/////////////////////////
+// DimensionValidation //
+/////////////////////////
+
+impl<T> DimensionValidation for ExhaustiveIndexBinary<T> {
+    fn dim(&self) -> usize {
+        self.dim
+    }
+}
+
+///////////////////////////
+// ExhaustiveIndexBinary //
+///////////////////////////
+
 impl<T> ExhaustiveIndexBinary<T>
 where
     T: AnnSearchFloat + ComplexField + Pod,
@@ -66,25 +80,36 @@ where
     /// ### Params
     ///
     /// * `data` - Data matrix (samples x features)
-    /// * `binarisation_init` - Initialisation method ("itq" or "random")
+    /// * `binarisation_init` - Initialisation method (`"random"`, `"pca"`, or
+    ///   `"sign"`)
     /// * `n_bits` - Number of bits per binary code (must be multiple of 8)
     /// * `seed` - Random seed for binariser
     ///
     /// ### Returns
     ///
     /// Initialised exhaustive binary index
-    pub fn new(data: MatRef<T>, binarisation_init: &str, n_bits: usize, seed: usize) -> Self {
-        assert!(n_bits.is_multiple_of(8), "n_bits must be multiple of 8");
+    pub fn new(
+        data: MatRef<T>,
+        binarisation_init: &str,
+        n_bits: usize,
+        seed: usize,
+    ) -> Result<Self, AnnSearchErrors> {
+        if !n_bits.is_multiple_of(8) {
+            return Err(AnnSearchErrors::NBitsMustBe8Multiple { n_bits });
+        }
 
-        let init = parse_binarisation_init(binarisation_init).unwrap_or_default();
+        let init = parse_binarisation_init(binarisation_init).unwrap_or({
+            eprintln!("Unknown binarisation string provided. Using the default");
+            BinarisationInit::default()
+        });
 
         let n_bytes = n_bits / 8;
         let n = data.nrows();
         let dim = data.ncols();
 
         let binariser = match init {
-            BinarisationInit::PcaHashing => Binariser::new_pca_hashing(data, dim, n_bits, seed),
-            BinarisationInit::RandomProjections => Binariser::new_simhash(dim, n_bits, seed),
+            BinarisationInit::PcaHashing => Binariser::new_pca_hashing(data, dim, n_bits, seed)?,
+            BinarisationInit::RandomProjections => Binariser::new_simhash(dim, n_bits, seed)?,
             BinarisationInit::SignBased => Binariser::new_sign_based(dim),
         };
 
@@ -92,10 +117,10 @@ where
 
         for i in 0..n {
             let original: Vec<T> = data.row(i).iter().cloned().collect();
-            vectors_flat_binarised.extend(binariser.encode(&original));
+            vectors_flat_binarised.extend(binariser.encode(&original)?);
         }
 
-        Self {
+        Ok(Self {
             vectors_flat_binarised,
             n_bytes,
             n,
@@ -104,7 +129,7 @@ where
             binarisation_type: init,
             vector_store: None,
             metric: Dist::Cosine,
-        }
+        })
     }
 
     /// Generate a new exhaustive binary index with vector store for reranking
@@ -130,8 +155,10 @@ where
         metric: Dist,
         seed: usize,
         save_path: impl AsRef<Path>,
-    ) -> std::io::Result<Self> {
-        assert!(n_bits.is_multiple_of(8), "n_bits must be multiple of 8");
+    ) -> Result<Self, AnnSearchErrors> {
+        if !n_bits.is_multiple_of(8) {
+            return Err(AnnSearchErrors::NBitsMustBe8Multiple { n_bits });
+        }
 
         let init = parse_binarisation_init(binarisation_init).unwrap_or_default();
 
@@ -140,8 +167,8 @@ where
         let dim = data.ncols();
 
         let binariser = match init {
-            BinarisationInit::PcaHashing => Binariser::new_pca_hashing(data, dim, n_bits, seed),
-            BinarisationInit::RandomProjections => Binariser::new_simhash(dim, n_bits, seed),
+            BinarisationInit::PcaHashing => Binariser::new_pca_hashing(data, dim, n_bits, seed)?,
+            BinarisationInit::RandomProjections => Binariser::new_simhash(dim, n_bits, seed)?,
             BinarisationInit::SignBased => Binariser::new_sign_based(dim),
         };
 
@@ -149,7 +176,7 @@ where
 
         for i in 0..n {
             let original: Vec<T> = data.row(i).iter().cloned().collect();
-            vectors_flat_binarised.extend(binariser.encode(&original));
+            vectors_flat_binarised.extend(binariser.encode(&original)?);
         }
 
         // Save vector store
@@ -205,8 +232,14 @@ where
     ///
     /// Tuple of `(indices, distances)` where distances are Hamming distances
     #[inline]
-    pub fn query(&self, query_vec: &[T], k: usize) -> (Vec<usize>, Vec<u32>) {
-        let query_binary = self.binariser.encode(query_vec);
+    pub fn query(
+        &self,
+        query_vec: &[T],
+        k: usize,
+    ) -> Result<(Vec<usize>, Vec<u32>), AnnSearchErrors> {
+        self.check_dim(query_vec.len())?;
+
+        let query_binary = self.binariser.encode(query_vec)?;
         let k = k.min(self.n);
 
         let mut heap: BinaryHeap<(u32, usize)> = BinaryHeap::with_capacity(k + 1);
@@ -227,7 +260,7 @@ where
 
         let (distances, indices): (Vec<_>, Vec<_>) = results.into_iter().unzip();
 
-        (indices, distances)
+        Ok((indices, distances))
     }
 
     /// Query function for asymmetric querying
@@ -256,15 +289,15 @@ where
         query_vec: &[T],
         k: usize,
         rerank_factor: Option<usize>,
-    ) -> (Vec<usize>, Vec<T>) {
-        assert!(
-            self.use_asymmetric(),
-            "Only sign-based binarisation is supported for asymmetric queries"
-        );
+    ) -> Result<(Vec<usize>, Vec<T>), AnnSearchErrors> {
+        if !self.use_asymmetric() {
+            return Err(AnnSearchErrors::AsymmetricQueryMisMatch);
+        }
+
         let rerank_factor = rerank_factor.unwrap_or(20);
         let k = k.min(self.n);
 
-        let (candidates, _) = self.query(query_vec, k * rerank_factor);
+        let (candidates, _) = self.query(query_vec, k * rerank_factor)?;
 
         let mut scored: Vec<(usize, T)> = candidates
             .iter()
@@ -291,7 +324,7 @@ where
             dists.push(dist);
         }
 
-        (indices, dists)
+        Ok((indices, dists))
     }
 
     /// Query function for row references
@@ -308,7 +341,11 @@ where
     ///
     /// Tuple of `(indices, distances)`
     #[inline]
-    pub fn query_row(&self, query_row: RowRef<T>, k: usize) -> (Vec<usize>, Vec<u32>) {
+    pub fn query_row(
+        &self,
+        query_row: RowRef<T>,
+        k: usize,
+    ) -> Result<(Vec<usize>, Vec<u32>), AnnSearchErrors> {
         if query_row.col_stride() == 1 {
             let slice =
                 unsafe { std::slice::from_raw_parts(query_row.as_ptr(), query_row.ncols()) };
@@ -341,7 +378,7 @@ where
         query_row: RowRef<T>,
         k: usize,
         rerank_factor: Option<usize>,
-    ) -> (Vec<usize>, Vec<T>) {
+    ) -> Result<(Vec<usize>, Vec<T>), AnnSearchErrors> {
         if query_row.col_stride() == 1 {
             let slice =
                 unsafe { std::slice::from_raw_parts(query_row.as_ptr(), query_row.ncols()) };
@@ -376,24 +413,24 @@ where
         query_vec: &[T],
         k: usize,
         rerank_factor: Option<usize>,
-    ) -> (Vec<usize>, Vec<T>) {
+    ) -> Result<(Vec<usize>, Vec<T>), AnnSearchErrors> {
         let rerank_factor = rerank_factor.unwrap_or(20);
         let vector_store = self
             .vector_store
             .as_ref()
-            .expect("Vector store required for reranking - use new_with_vector_store()");
+            .ok_or(AnnSearchErrors::VectorStoreNotAvailable)?;
 
         let candidates = if matches!(self.binarisation_type, BinarisationInit::SignBased) {
-            let (idx, _) = self.query_asymmetric(query_vec, k, Some(2 * rerank_factor));
+            let (idx, _) = self.query_asymmetric(query_vec, k, Some(2 * rerank_factor))?;
             idx
         } else {
-            let (idx, _) = self.query(query_vec, k * rerank_factor);
+            let (idx, _) = self.query(query_vec, k * rerank_factor)?;
             idx
         };
 
         let query_norm = match self.metric {
             Dist::Cosine => T::calculate_l2_norm(query_vec),
-            Dist::Euclidean => T::one(),
+            Dist::SquaredEuclidean => T::one(),
         };
 
         let mut scored: Vec<_> = candidates
@@ -403,7 +440,9 @@ where
                     Dist::Cosine => {
                         vector_store.cosine_distance_to_query(idx, query_vec, query_norm)
                     }
-                    Dist::Euclidean => vector_store.euclidean_distance_to_query(idx, query_vec),
+                    Dist::SquaredEuclidean => {
+                        vector_store.euclidean_distance_to_query(idx, query_vec)
+                    }
                 };
                 (idx, dist)
             })
@@ -420,7 +459,7 @@ where
             dists.push(dist);
         }
 
-        (indices, dists)
+        Ok((indices, dists))
     }
 
     /// Query with reranking for row references
@@ -441,7 +480,7 @@ where
         query_row: RowRef<T>,
         k: usize,
         rerank_factor: Option<usize>,
-    ) -> (Vec<usize>, Vec<T>) {
+    ) -> Result<(Vec<usize>, Vec<T>), AnnSearchErrors> {
         if query_row.col_stride() == 1 {
             let slice =
                 unsafe { std::slice::from_raw_parts(query_row.as_ptr(), query_row.ncols()) };
@@ -474,7 +513,7 @@ where
         rerank_factor: Option<usize>,
         return_dist: bool,
         verbose: bool,
-    ) -> (Vec<Vec<usize>>, Option<Vec<Vec<T>>>) {
+    ) -> AnnSearchResult<T> {
         use std::sync::{
             atomic::{AtomicUsize, Ordering},
             Arc,
@@ -501,14 +540,14 @@ where
 
                     self.query_reranking(vec, k, rerank_factor)
                 })
-                .collect();
+                .collect::<Result<Vec<_>, _>>()?;
 
             if return_dist {
                 let (indices, distances) = results.into_iter().unzip();
-                (indices, Some(distances))
+                Ok((indices, Some(distances)))
             } else {
                 let indices: Vec<Vec<usize>> = results.into_iter().map(|(idx, _)| idx).collect();
-                (indices, None)
+                Ok((indices, None))
             }
         } else {
             // Fallback to binary-only search
@@ -559,10 +598,10 @@ where
                     .into_iter()
                     .map(|v| v.into_iter().map(|d| T::from_u32(d).unwrap()).collect())
                     .collect();
-                (indices, Some(distances_converted))
+                Ok((indices, Some(distances_converted)))
             } else {
                 let indices: Vec<Vec<usize>> = results.into_iter().map(|(idx, _)| idx).collect();
-                (indices, None)
+                Ok((indices, None))
             }
         }
     }
@@ -612,7 +651,7 @@ mod tests {
     #[test]
     fn test_exhaustive_binary_construction() {
         let data = create_test_data::<f32>(100, 32);
-        let index = ExhaustiveIndexBinary::new(data.as_ref(), "random", 64, 42);
+        let index = ExhaustiveIndexBinary::new(data.as_ref(), "random", 64, 42).unwrap();
 
         assert_eq!(index.n, 100);
         assert_eq!(index.n_bytes, 8);
@@ -622,10 +661,10 @@ mod tests {
     #[test]
     fn test_exhaustive_binary_query_returns_k_results() {
         let data = create_test_data::<f32>(100, 32);
-        let index = ExhaustiveIndexBinary::new(data.as_ref(), "random", 64, 42);
+        let index = ExhaustiveIndexBinary::new(data.as_ref(), "random", 64, 42).unwrap();
 
         let query: Vec<f32> = (0..32).map(|i| i as f32 * 0.1).collect();
-        let (indices, distances) = index.query(&query, 10);
+        let (indices, distances) = index.query(&query, 10).unwrap();
 
         assert_eq!(indices.len(), 10);
         assert_eq!(distances.len(), 10);
@@ -634,10 +673,10 @@ mod tests {
     #[test]
     fn test_exhaustive_binary_query_sorted() {
         let data = create_test_data::<f32>(100, 32);
-        let index = ExhaustiveIndexBinary::new(data.as_ref(), "random", 64, 42);
+        let index = ExhaustiveIndexBinary::new(data.as_ref(), "random", 64, 42).unwrap();
 
         let query: Vec<f32> = (0..32).map(|i| i as f32 * 0.1).collect();
-        let (_, distances) = index.query(&query, 10);
+        let (_, distances) = index.query(&query, 10).unwrap();
 
         for i in 1..distances.len() {
             assert!(distances[i] >= distances[i - 1]);
@@ -647,10 +686,10 @@ mod tests {
     #[test]
     fn test_exhaustive_binary_query_k_exceeds_n() {
         let data = create_test_data::<f32>(50, 32);
-        let index = ExhaustiveIndexBinary::new(data.as_ref(), "random", 64, 42);
+        let index = ExhaustiveIndexBinary::new(data.as_ref(), "random", 64, 42).unwrap();
 
         let query: Vec<f32> = (0..32).map(|i| i as f32 * 0.1).collect();
-        let (indices, _) = index.query(&query, 100);
+        let (indices, _) = index.query(&query, 100).unwrap();
 
         assert_eq!(indices.len(), 50);
     }
@@ -658,9 +697,9 @@ mod tests {
     #[test]
     fn test_exhaustive_binary_query_row() {
         let data = create_test_data::<f32>(100, 32);
-        let index = ExhaustiveIndexBinary::new(data.as_ref(), "random", 64, 42);
+        let index = ExhaustiveIndexBinary::new(data.as_ref(), "random", 64, 42).unwrap();
 
-        let (indices1, distances1) = index.query_row(data.as_ref().row(0), 10);
+        let (indices1, distances1) = index.query_row(data.as_ref().row(0), 10).unwrap();
 
         assert_eq!(indices1.len(), 10);
         assert_eq!(distances1.len(), 10);
@@ -670,9 +709,9 @@ mod tests {
     #[test]
     fn test_exhaustive_binary_knn_graph_no_vector_store() {
         let data = create_test_data::<f32>(50, 32);
-        let index = ExhaustiveIndexBinary::new(data.as_ref(), "random", 64, 42);
+        let index = ExhaustiveIndexBinary::new(data.as_ref(), "random", 64, 42).unwrap();
 
-        let (knn_indices, knn_distances) = index.generate_knn(5, None, true, false);
+        let (knn_indices, knn_distances) = index.generate_knn(5, None, true, false).unwrap();
 
         assert_eq!(knn_indices.len(), 50);
         assert!(knn_distances.is_some());
@@ -686,10 +725,10 @@ mod tests {
     #[test]
     fn test_hamming_distances_in_valid_range() {
         let data = create_test_data::<f32>(100, 32);
-        let index = ExhaustiveIndexBinary::new(data.as_ref(), "random", 64, 42);
+        let index = ExhaustiveIndexBinary::new(data.as_ref(), "random", 64, 42).unwrap();
 
         let query: Vec<f32> = (0..32).map(|i| i as f32 * 0.1).collect();
-        let (_, distances) = index.query(&query, 20);
+        let (_, distances) = index.query(&query, 20).unwrap();
 
         for &dist in &distances {
             assert!(dist <= 64);
@@ -733,7 +772,7 @@ mod tests {
         .unwrap();
 
         let query: Vec<f32> = (0..32).map(|i| i as f32 * 0.1).collect();
-        let (indices, distances) = index.query_reranking(&query, 10, Some(5));
+        let (indices, distances) = index.query_reranking(&query, 10, Some(5)).unwrap();
 
         assert_eq!(indices.len(), 10);
         assert_eq!(distances.len(), 10);
@@ -752,13 +791,15 @@ mod tests {
             data.as_ref(),
             "random",
             64,
-            Dist::Euclidean,
+            Dist::SquaredEuclidean,
             42,
             temp_dir.path(),
         )
         .unwrap();
 
-        let (indices, distances) = index.query_row_reranking(data.as_ref().row(0), 10, Some(5));
+        let (indices, distances) = index
+            .query_row_reranking(data.as_ref().row(0), 10, Some(5))
+            .unwrap();
 
         assert_eq!(indices.len(), 10);
         assert_eq!(distances.len(), 10);
@@ -781,7 +822,7 @@ mod tests {
         )
         .unwrap();
 
-        let (knn_indices, knn_distances) = index.generate_knn(5, Some(10), true, false);
+        let (knn_indices, knn_distances) = index.generate_knn(5, Some(10), true, false).unwrap();
 
         assert_eq!(knn_indices.len(), 50);
         assert!(knn_distances.is_some());
@@ -796,7 +837,7 @@ mod tests {
     #[should_panic(expected = "Vector store required for reranking")]
     fn test_query_reranking_without_vector_store_panics() {
         let data = create_test_data::<f32>(50, 32);
-        let index = ExhaustiveIndexBinary::new(data.as_ref(), "random", 64, 42);
+        let index = ExhaustiveIndexBinary::new(data.as_ref(), "random", 64, 42).unwrap();
 
         let query: Vec<f32> = (0..32).map(|i| i as f32 * 0.1).collect();
         let _ = index.query_reranking(&query, 10, Some(5));

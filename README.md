@@ -71,7 +71,6 @@ anticipated. If you want to see what changed, please check this
   - *Binary* (different types of binary quantisations for exhaustive and IVF
     indices.)
   - *RaBitQ* (RaBitQ quantisation for exhaustive and IVF indices.)
-  - *TurboQuant* (TurboQuant quantisation for exhaustive and IVF indices.)
 
 ## Installation
 
@@ -79,7 +78,7 @@ Add this to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-ann-search-rs = "*" # always get the latest version
+ann-search-rs = "0.3.0"
 ```
 
 ## Example Usage
