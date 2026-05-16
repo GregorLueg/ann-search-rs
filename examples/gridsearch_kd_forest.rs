@@ -71,12 +71,7 @@ fn main() {
     for n_trees in n_trees_values {
         println!("Building KdTree index ({} trees)...", n_trees);
         let start = Instant::now();
-        let kd_idx = build_kd_tree_index(
-            data.as_ref(),
-            cli.distance.clone(),
-            n_trees,
-            cli.seed as usize,
-        );
+        let kd_idx = build_kd_tree_index(data.as_ref(), &cli.distance, n_trees, cli.seed as usize);
         let build_time = start.elapsed().as_secs_f64() * 1000.0;
 
         let index_size_mb = kd_idx.memory_usage_bytes() as f64 / (1024.0 * 1024.0);

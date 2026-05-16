@@ -344,7 +344,7 @@ where
             &mut rng,
             metric,
             max_parallel_depth,
-        );
+        )?;
 
         let mut nodes = Vec::new();
         let mut centers_data = Vec::new();
@@ -409,7 +409,7 @@ where
         rng: &mut StdRng,
         metric: Dist,
         max_parallel_depth: usize,
-    ) -> Vec<BuildNode<T>> {
+    ) -> Result<Vec<BuildNode<T>>, AnnSearchErrors> {
         let mut nodes = Vec::new();
         Self::build_node_local(
             vectors_flat,
@@ -420,8 +420,8 @@ where
             metric,
             0,
             max_parallel_depth,
-        );
-        nodes
+        )?;
+        Ok(nodes)
     }
 
     /// Build a local node
@@ -582,7 +582,7 @@ where
             let seed_left = rng.random();
             let seed_right = rng.random();
 
-            let (mut left_tree, mut right_tree) = rayon::join(
+            let (left_result, right_result) = rayon::join(
                 || {
                     let mut left_rng = rand::rngs::StdRng::seed_from_u64(seed_left);
                     Self::build_subtree(
@@ -608,6 +608,9 @@ where
                     )
                 },
             );
+
+            let mut left_tree = left_result?;
+            let mut right_tree = right_result?;
 
             let left_offset = nodes.len();
             Self::adjust_subtree_indices(&mut left_tree, left_offset);
@@ -675,7 +678,7 @@ where
         metric: Dist,
         depth: usize,
         max_parallel_depth: usize,
-    ) -> Vec<BuildNode<T>> {
+    ) -> Result<Vec<BuildNode<T>>, AnnSearchErrors> {
         let mut nodes = Vec::new();
         Self::build_node_local(
             vectors_flat,
@@ -686,8 +689,8 @@ where
             metric,
             depth,
             max_parallel_depth,
-        );
-        nodes
+        )?;
+        Ok(nodes)
     }
 
     /// Flatten the tree structures

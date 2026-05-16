@@ -71,13 +71,8 @@ fn main() {
     for n_trees in n_trees_values {
         println!("Building Annoy index ({} trees)...", n_trees);
         let start = Instant::now();
-        let annoy_idx = build_annoy_index(
-            data.as_ref(),
-            cli.distance.as_str().into(),
-            n_trees,
-            cli.seed as usize,
-        )
-        .unwrap();
+        let annoy_idx =
+            build_annoy_index(data.as_ref(), &cli.distance, n_trees, cli.seed as usize).unwrap();
         let build_time = start.elapsed().as_secs_f64() * 1000.0;
 
         let index_size_mb = annoy_idx.memory_usage_bytes() as f64 / (1024.0 * 1024.0);

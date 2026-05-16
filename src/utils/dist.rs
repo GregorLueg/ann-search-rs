@@ -8,7 +8,7 @@ use num_traits::Float;
 use std::fmt::Display;
 use std::iter::Sum;
 use std::sync::OnceLock;
-use wide::{f32x4, f32x8, f64x2, f64x4};
+use wide::{f32x4, f32x8, f64x2, f64x4, CmpEq};
 
 #[cfg(feature = "quantised")]
 use half::bf16;
@@ -49,8 +49,7 @@ impl Display for Dist {
 
 /// Parsing the approximate nearest neighbour distance
 ///
-/// Currently, only Cosine and Euclidean are supported. Longer term, others
-/// shall be implemented.
+/// Currently squared Euclidean, Cosine and Manhattan distance are available.
 ///
 /// ### Params
 ///
@@ -64,6 +63,7 @@ pub fn parse_ann_dist(s: &str) -> Option<Dist> {
     match s.to_lowercase().as_str() {
         "euclidean" | "l2" => Some(Dist::SquaredEuclidean),
         "cosine" => Some(Dist::Cosine),
+        "manhatten" | "l1" => Some(Dist::Manhattan),
         _ => None,
     }
 }
@@ -159,8 +159,20 @@ pub trait SimdDistance: Sized + Copy {
     ///
     /// ### Returns
     ///
-    /// Squared Euclidean distance
+    /// Manhattan distance
     fn manhattan_simd(a: &[Self], b: &[Self]) -> Self;
+
+    /// Calculate Canberra distance via SIMD
+    ///
+    /// ### Params
+    ///
+    /// * `a` - Slice of vector a
+    /// * `b` - Slice of vector b
+    ///
+    /// ### Returns
+    ///
+    /// Canberra distance
+    fn canberra_simd(a: &[Self], b: &[Self]) -> Self;
 
     /// Subtracts one vector from the other
     ///
@@ -1083,91 +1095,91 @@ fn canberra_f32_scalar(a: &[f32], b: &[f32]) -> f32 {
     sum
 }
 
-// /// Canberra distance - f32, 128-bit
-// ///
-// /// ### Params
-// ///
-// /// * `a` - Slice of vector a
-// /// * `b` - Slice of vector b
-// ///
-// /// ### Returns
-// ///
-// /// Canberra distance
-// #[inline(always)]
-// fn canberra_f32_sse(a: &[f32], b: &[f32]) -> f32 {
-//     let len = a.len();
-//     let chunks = len / 4;
-//     let mut acc = f32x4::ZERO;
-//     let zero = f32x4::ZERO;
-//     let one = f32x4::splat(1.0);
+/// Canberra distance - f32, 128-bit
+///
+/// ### Params
+///
+/// * `a` - Slice of vector a
+/// * `b` - Slice of vector b
+///
+/// ### Returns
+///
+/// Canberra distance
+#[inline(always)]
+fn canberra_f32_sse(a: &[f32], b: &[f32]) -> f32 {
+    let len = a.len();
+    let chunks = len / 4;
+    let mut acc = f32x4::ZERO;
+    let zero = f32x4::ZERO;
+    let one = f32x4::splat(1.0);
 
-//     unsafe {
-//         let a_ptr = a.as_ptr();
-//         let b_ptr = b.as_ptr();
+    unsafe {
+        let a_ptr = a.as_ptr();
+        let b_ptr = b.as_ptr();
 
-//         for i in 0..chunks {
-//             let offset = i * 4;
-//             let va = f32x4::from(*(a_ptr.add(offset) as *const [f32; 4]));
-//             let vb = f32x4::from(*(b_ptr.add(offset) as *const [f32; 4]));
-//             let num = (va - vb).abs();
-//             let denom = va.abs() + vb.abs();
-//             let safe_denom = denom.cmp_eq(zero).blend(one, denom);
-//             acc += num / safe_denom;
-//         }
-//     }
+        for i in 0..chunks {
+            let offset = i * 4;
+            let va = f32x4::from(*(a_ptr.add(offset) as *const [f32; 4]));
+            let vb = f32x4::from(*(b_ptr.add(offset) as *const [f32; 4]));
+            let num = (va - vb).abs();
+            let denom = va.abs() + vb.abs();
+            let safe_denom = denom.simd_eq(zero).blend(one, denom);
+            acc += num / safe_denom;
+        }
+    }
 
-//     let mut sum = acc.reduce_add();
-//     for i in (chunks * 4)..len {
-//         let denom = a[i].abs() + b[i].abs();
-//         if denom > 0.0 {
-//             sum += (a[i] - b[i]).abs() / denom;
-//         }
-//     }
-//     sum
-// }
+    let mut sum = acc.reduce_add();
+    for i in (chunks * 4)..len {
+        let denom = a[i].abs() + b[i].abs();
+        if denom > 0.0 {
+            sum += (a[i] - b[i]).abs() / denom;
+        }
+    }
+    sum
+}
 
-// /// Canberra distance - f32, 256-bit
-// ///
-// /// ### Params
-// ///
-// /// * `a` - Slice of vector a
-// /// * `b` - Slice of vector b
-// ///
-// /// ### Returns
-// ///
-// /// Canberra distance
-// #[inline(always)]
-// fn canberra_f32_avx2(a: &[f32], b: &[f32]) -> f32 {
-//     let len = a.len();
-//     let chunks = len / 8;
-//     let mut acc = f32x8::ZERO;
-//     let zero = f32x8::ZERO;
-//     let one = f32x8::splat(1.0);
+/// Canberra distance - f32, 256-bit
+///
+/// ### Params
+///
+/// * `a` - Slice of vector a
+/// * `b` - Slice of vector b
+///
+/// ### Returns
+///
+/// Canberra distance
+#[inline(always)]
+fn canberra_f32_avx2(a: &[f32], b: &[f32]) -> f32 {
+    let len = a.len();
+    let chunks = len / 8;
+    let mut acc = f32x8::ZERO;
+    let zero = f32x8::ZERO;
+    let one = f32x8::splat(1.0);
 
-//     unsafe {
-//         let a_ptr = a.as_ptr();
-//         let b_ptr = b.as_ptr();
+    unsafe {
+        let a_ptr = a.as_ptr();
+        let b_ptr = b.as_ptr();
 
-//         for i in 0..chunks {
-//             let offset = i * 8;
-//             let va = f32x8::from(*(a_ptr.add(offset) as *const [f32; 8]));
-//             let vb = f32x8::from(*(b_ptr.add(offset) as *const [f32; 8]));
-//             let num = (va - vb).abs();
-//             let denom = va.abs() + vb.abs();
-//             let safe_denom = denom.cmp_eq(zero).blend(one, denom);
-//             acc += num / safe_denom;
-//         }
-//     }
+        for i in 0..chunks {
+            let offset = i * 8;
+            let va = f32x8::from(*(a_ptr.add(offset) as *const [f32; 8]));
+            let vb = f32x8::from(*(b_ptr.add(offset) as *const [f32; 8]));
+            let num = (va - vb).abs();
+            let denom = va.abs() + vb.abs();
+            let safe_denom = denom.simd_eq(zero).blend(one, denom);
+            acc += num / safe_denom;
+        }
+    }
 
-//     let mut sum = acc.reduce_add();
-//     for i in (chunks * 8)..len {
-//         let denom = a[i].abs() + b[i].abs();
-//         if denom > 0.0 {
-//             sum += (a[i] - b[i]).abs() / denom;
-//         }
-//     }
-//     sum
-// }
+    let mut sum = acc.reduce_add();
+    for i in (chunks * 8)..len {
+        let denom = a[i].abs() + b[i].abs();
+        if denom > 0.0 {
+            sum += (a[i] - b[i]).abs() / denom;
+        }
+    }
+    sum
+}
 
 /// Canberra distance - f32, 512-bit
 ///
@@ -1213,21 +1225,143 @@ fn canberra_f32_avx512(a: &[f32], b: &[f32]) -> f32 {
     }
 }
 
-// /// Canberra distance - f32, 512-bit, fallback
-// ///
-// /// ### Params
-// ///
-// /// * `a` - Slice of vector a
-// /// * `b` - Slice of vector b
-// ///
-// /// ### Returns
-// ///
-// /// Canberra distance
-// #[cfg(not(all(target_arch = "x86_64", target_feature = "avx512f")))]
-// #[inline(always)]
-// fn canberra_f32_avx512(a: &[f32], b: &[f32]) -> f32 {
-//     canberra_f32_avx2(a, b)
-// }
+/// Canberra distance - f32, 512-bit, fallback
+///
+/// ### Params
+///
+/// * `a` - Slice of vector a
+/// * `b` - Slice of vector b
+///
+/// ### Returns
+///
+/// Canberra distance
+#[cfg(not(all(target_arch = "x86_64", target_feature = "avx512f")))]
+#[inline(always)]
+fn canberra_f32_avx512(a: &[f32], b: &[f32]) -> f32 {
+    canberra_f32_avx2(a, b)
+}
+
+//////////////////
+// f64 Canberra //
+//////////////////
+
+#[inline(always)]
+fn canberra_f64_scalar(a: &[f64], b: &[f64]) -> f64 {
+    let mut sum = 0.0_f64;
+    for (&x, &y) in a.iter().zip(b.iter()) {
+        let denom = x.abs() + y.abs();
+        if denom > 0.0 {
+            sum += (x - y).abs() / denom;
+        }
+    }
+    sum
+}
+
+#[inline(always)]
+fn canberra_f64_sse(a: &[f64], b: &[f64]) -> f64 {
+    let len = a.len();
+    let chunks = len / 2;
+    let mut acc = f64x2::ZERO;
+    let zero = f64x2::ZERO;
+    let one = f64x2::splat(1.0);
+
+    unsafe {
+        let a_ptr = a.as_ptr();
+        let b_ptr = b.as_ptr();
+
+        for i in 0..chunks {
+            let offset = i * 2;
+            let va = f64x2::from(*(a_ptr.add(offset) as *const [f64; 2]));
+            let vb = f64x2::from(*(b_ptr.add(offset) as *const [f64; 2]));
+            let num = (va - vb).abs();
+            let denom = va.abs() + vb.abs();
+            let safe_denom = denom.simd_eq(zero).blend(one, denom);
+            acc += num / safe_denom;
+        }
+    }
+
+    let mut sum = acc.reduce_add();
+    if len % 2 == 1 {
+        let denom = a[len - 1].abs() + b[len - 1].abs();
+        if denom > 0.0 {
+            sum += (a[len - 1] - b[len - 1]).abs() / denom;
+        }
+    }
+    sum
+}
+
+#[inline(always)]
+fn canberra_f64_avx2(a: &[f64], b: &[f64]) -> f64 {
+    let len = a.len();
+    let chunks = len / 4;
+    let mut acc = f64x4::ZERO;
+    let zero = f64x4::ZERO;
+    let one = f64x4::splat(1.0);
+
+    unsafe {
+        let a_ptr = a.as_ptr();
+        let b_ptr = b.as_ptr();
+
+        for i in 0..chunks {
+            let offset = i * 4;
+            let va = f64x4::from(*(a_ptr.add(offset) as *const [f64; 4]));
+            let vb = f64x4::from(*(b_ptr.add(offset) as *const [f64; 4]));
+            let num = (va - vb).abs();
+            let denom = va.abs() + vb.abs();
+            let safe_denom = denom.simd_eq(zero).blend(one, denom);
+            acc += num / safe_denom;
+        }
+    }
+
+    let mut sum = acc.reduce_add();
+    for i in (chunks * 4)..len {
+        let denom = a[i].abs() + b[i].abs();
+        if denom > 0.0 {
+            sum += (a[i] - b[i]).abs() / denom;
+        }
+    }
+    sum
+}
+
+#[cfg(all(target_arch = "x86_64", target_feature = "avx512f"))]
+#[inline(always)]
+fn canberra_f64_avx512(a: &[f64], b: &[f64]) -> f64 {
+    use std::arch::x86_64::*;
+
+    let len = a.len();
+    let chunks = len / 8;
+
+    unsafe {
+        let mut acc = _mm512_setzero_pd();
+        let zero = _mm512_setzero_pd();
+        let one = _mm512_set1_pd(1.0);
+
+        for i in 0..chunks {
+            let va = _mm512_loadu_pd(a.as_ptr().add(i * 8));
+            let vb = _mm512_loadu_pd(b.as_ptr().add(i * 8));
+            let num = _mm512_abs_pd(_mm512_sub_pd(va, vb));
+            let denom = _mm512_add_pd(_mm512_abs_pd(va), _mm512_abs_pd(vb));
+            let mask = _mm512_cmp_pd_mask::<_CMP_EQ_OQ>(denom, zero);
+            let safe_denom = _mm512_mask_blend_pd(mask, denom, one);
+            acc = _mm512_add_pd(acc, _mm512_div_pd(num, safe_denom));
+        }
+
+        let mut sum = _mm512_reduce_add_pd(acc);
+        for i in (chunks * 8)..len {
+            let denom = a[i].abs() + b[i].abs();
+            if denom > 0.0 {
+                sum += (a[i] - b[i]).abs() / denom;
+            }
+        }
+        sum
+    }
+}
+
+#[cfg(not(all(target_arch = "x86_64", target_feature = "avx512f")))]
+#[inline(always)]
+fn canberra_f64_avx512(a: &[f64], b: &[f64]) -> f64 {
+    canberra_f64_avx2(a, b)
+}
 
 /////////////////////////
 // Vector subtractions //
@@ -2630,6 +2764,16 @@ impl SimdDistance for f32 {
     }
 
     #[inline]
+    fn canberra_simd(a: &[f32], b: &[f32]) -> f32 {
+        match detect_simd_level() {
+            SimdLevel::Avx512 => canberra_f32_avx512(a, b),
+            SimdLevel::Avx2 => canberra_f32_avx2(a, b),
+            SimdLevel::Sse => canberra_f32_sse(a, b),
+            SimdLevel::Scalar => canberra_f32_sse(a, b),
+        }
+    }
+
+    #[inline]
     fn subtract_simd(a: &[f32], b: &[f32]) -> Vec<f32> {
         match detect_simd_level() {
             SimdLevel::Avx512 => subtract_f32_avx512(a, b),
@@ -2712,6 +2856,16 @@ impl SimdDistance for f64 {
             SimdLevel::Avx2 => manhattan_f64_avx2(a, b),
             SimdLevel::Sse => manhattan_f64_sse(a, b),
             SimdLevel::Scalar => manhattan_f64_sse(a, b),
+        }
+    }
+
+    #[inline]
+    fn canberra_simd(a: &[f64], b: &[f64]) -> f64 {
+        match detect_simd_level() {
+            SimdLevel::Avx512 => canberra_f64_avx512(a, b),
+            SimdLevel::Avx2 => canberra_f64_avx2(a, b),
+            SimdLevel::Sse => canberra_f64_sse(a, b),
+            SimdLevel::Scalar => canberra_f64_sse(a, b),
         }
     }
 
@@ -5715,6 +5869,271 @@ mod tests {
         }
     }
 
+    #[test]
+    fn test_canberra_f32_basic() {
+        let a: Vec<f32> = vec![1.0, 2.0, 3.0, 4.0];
+        let b: Vec<f32> = vec![2.0, 4.0, 6.0, 8.0];
+        // |1-2|/(1+2) + |2-4|/(2+4) + |3-6|/(3+6) + |4-8|/(4+8)
+        // = 1/3 + 1/3 + 1/3 + 1/3 = 4/3
+        assert_relative_eq!(f32::canberra_simd(&a, &b), 4.0 / 3.0, epsilon = 1e-5);
+    }
+
+    #[test]
+    fn test_canberra_f32_identity() {
+        let a: Vec<f32> = (1..33).map(|i| i as f32).collect();
+        assert_relative_eq!(f32::canberra_simd(&a, &a), 0.0, epsilon = 1e-5);
+    }
+
+    #[test]
+    fn test_canberra_f32_zero_denominator() {
+        // Lanes where both a_i and b_i are zero must contribute 0,
+        // not NaN
+        let a: Vec<f32> = vec![0.0, 1.0, 0.0, 2.0];
+        let b: Vec<f32> = vec![0.0, 3.0, 0.0, 4.0];
+        // 0 + |1-3|/(1+3) + 0 + |2-4|/(2+4) = 0.5 + 1/3
+        let expected = 0.5 + 1.0 / 3.0;
+        let result = f32::canberra_simd(&a, &b);
+        assert!(result.is_finite(), "got non-finite: {}", result);
+        assert_relative_eq!(result, expected, epsilon = 1e-5);
+    }
+
+    #[test]
+    fn test_canberra_f32_all_zeros() {
+        let a: Vec<f32> = vec![0.0; 17];
+        let b: Vec<f32> = vec![0.0; 17];
+        let result = f32::canberra_simd(&a, &b);
+        assert!(result.is_finite());
+        assert_relative_eq!(result, 0.0, epsilon = 1e-5);
+    }
+
+    #[test]
+    fn test_canberra_f32_signs() {
+        // Denominator uses |a| + |b|, so signs of components matter
+        // but denom stays positive
+        let a: Vec<f32> = vec![-1.0, 2.0];
+        let b: Vec<f32> = vec![1.0, -2.0];
+        // |-1-1|/(1+1) + |2-(-2)|/(2+2) = 1 + 1 = 2
+        assert_relative_eq!(f32::canberra_simd(&a, &b), 2.0, epsilon = 1e-5);
+    }
+
+    #[test]
+    fn test_canberra_f32_various_lengths() {
+        for len in [1usize, 3, 4, 7, 8, 15, 16, 17, 31, 33, 64, 100, 257] {
+            // Offset by 1 so we don't trip the zero-denominator branch
+            let a: Vec<f32> = (0..len).map(|i| (i as f32) + 1.0).collect();
+            let b: Vec<f32> = (0..len).map(|i| (i as f32) * 0.5 + 1.0).collect();
+
+            let simd = f32::canberra_simd(&a, &b);
+            let scalar: f32 = a
+                .iter()
+                .zip(b.iter())
+                .map(|(&x, &y)| {
+                    let denom = x.abs() + y.abs();
+                    if denom > 0.0 {
+                        (x - y).abs() / denom
+                    } else {
+                        0.0
+                    }
+                })
+                .sum();
+
+            assert_relative_eq!(simd, scalar, epsilon = 1e-4);
+        }
+    }
+
+    #[test]
+    fn test_canberra_f32_mixed_zeros_various_lengths() {
+        // Sprinkle zero pairs across the vector to hit the
+        // safe_denom path in different SIMD lanes
+        for len in [4usize, 8, 16, 17, 33, 65] {
+            let mut a: Vec<f32> = (0..len).map(|i| (i as f32) + 1.0).collect();
+            let mut b: Vec<f32> = (0..len).map(|i| (i as f32) * 0.5 + 1.0).collect();
+            for i in (0..len).step_by(3) {
+                a[i] = 0.0;
+                b[i] = 0.0;
+            }
+
+            let simd = f32::canberra_simd(&a, &b);
+            let scalar: f32 = a
+                .iter()
+                .zip(b.iter())
+                .map(|(&x, &y)| {
+                    let denom = x.abs() + y.abs();
+                    if denom > 0.0 {
+                        (x - y).abs() / denom
+                    } else {
+                        0.0
+                    }
+                })
+                .sum();
+
+            assert!(simd.is_finite());
+            assert_relative_eq!(simd, scalar, epsilon = 1e-4);
+        }
+    }
+
+    #[test]
+    fn test_canberra_f64_basic() {
+        let a: Vec<f64> = vec![1.0, 2.0, 3.0, 4.0];
+        let b: Vec<f64> = vec![2.0, 4.0, 6.0, 8.0];
+        assert_relative_eq!(f64::canberra_simd(&a, &b), 4.0 / 3.0, epsilon = 1e-10);
+    }
+
+    #[test]
+    fn test_canberra_f64_identity() {
+        let a: Vec<f64> = (1..33).map(|i| i as f64).collect();
+        assert_relative_eq!(f64::canberra_simd(&a, &a), 0.0, epsilon = 1e-10);
+    }
+
+    #[test]
+    fn test_canberra_f64_zero_denominator() {
+        let a: Vec<f64> = vec![0.0, 1.0, 0.0, 2.0];
+        let b: Vec<f64> = vec![0.0, 3.0, 0.0, 4.0];
+        let expected = 0.5 + 1.0 / 3.0;
+        let result = f64::canberra_simd(&a, &b);
+        assert!(result.is_finite(), "got non-finite: {}", result);
+        assert_relative_eq!(result, expected, epsilon = 1e-10);
+    }
+
+    #[test]
+    fn test_canberra_f64_all_zeros() {
+        let a: Vec<f64> = vec![0.0; 17];
+        let b: Vec<f64> = vec![0.0; 17];
+        let result = f64::canberra_simd(&a, &b);
+        assert!(result.is_finite());
+        assert_relative_eq!(result, 0.0, epsilon = 1e-10);
+    }
+
+    #[test]
+    fn test_canberra_f64_signs() {
+        let a: Vec<f64> = vec![-1.0, 2.0];
+        let b: Vec<f64> = vec![1.0, -2.0];
+        assert_relative_eq!(f64::canberra_simd(&a, &b), 2.0, epsilon = 1e-10);
+    }
+
+    #[test]
+    fn test_canberra_f64_various_lengths() {
+        for len in [1usize, 2, 3, 4, 7, 8, 15, 16, 17, 31, 33, 64, 100, 257] {
+            let a: Vec<f64> = (0..len).map(|i| (i as f64) + 1.0).collect();
+            let b: Vec<f64> = (0..len).map(|i| (i as f64) * 0.5 + 1.0).collect();
+
+            let simd = f64::canberra_simd(&a, &b);
+            let scalar: f64 = a
+                .iter()
+                .zip(b.iter())
+                .map(|(&x, &y)| {
+                    let denom = x.abs() + y.abs();
+                    if denom > 0.0 {
+                        (x - y).abs() / denom
+                    } else {
+                        0.0
+                    }
+                })
+                .sum();
+
+            assert_relative_eq!(simd, scalar, epsilon = 1e-10);
+        }
+    }
+
+    #[test]
+    fn test_canberra_f64_mixed_zeros_various_lengths() {
+        for len in [4usize, 8, 16, 17, 33, 65] {
+            let mut a: Vec<f64> = (0..len).map(|i| (i as f64) + 1.0).collect();
+            let mut b: Vec<f64> = (0..len).map(|i| (i as f64) * 0.5 + 1.0).collect();
+            for i in (0..len).step_by(3) {
+                a[i] = 0.0;
+                b[i] = 0.0;
+            }
+
+            let simd = f64::canberra_simd(&a, &b);
+            let scalar: f64 = a
+                .iter()
+                .zip(b.iter())
+                .map(|(&x, &y)| {
+                    let denom = x.abs() + y.abs();
+                    if denom > 0.0 {
+                        (x - y).abs() / denom
+                    } else {
+                        0.0
+                    }
+                })
+                .sum();
+
+            assert!(simd.is_finite());
+            assert_relative_eq!(simd, scalar, epsilon = 1e-10);
+        }
+    }
+
+    #[test]
+    fn test_manhattan_f32_basic() {
+        let a: Vec<f32> = vec![1.0, 2.0, 3.0, 4.0];
+        let b: Vec<f32> = vec![2.0, 4.0, 6.0, 8.0];
+        // |1-2| + |2-4| + |3-6| + |4-8| = 1 + 2 + 3 + 4 = 10
+        assert_relative_eq!(f32::manhattan_simd(&a, &b), 10.0, epsilon = 1e-5);
+    }
+
+    #[test]
+    fn test_manhattan_f32_identity() {
+        let a: Vec<f32> = (0..32).map(|i| i as f32).collect();
+        assert_relative_eq!(f32::manhattan_simd(&a, &a), 0.0, epsilon = 1e-5);
+    }
+
+    #[test]
+    fn test_manhattan_f32_signs() {
+        // Mixed signs should still produce |diff|
+        let a: Vec<f32> = vec![-3.0, 2.0, -1.0, 4.0];
+        let b: Vec<f32> = vec![1.0, -2.0, 1.0, -4.0];
+        // 4 + 4 + 2 + 8 = 18
+        assert_relative_eq!(f32::manhattan_simd(&a, &b), 18.0, epsilon = 1e-5);
+    }
+
+    #[test]
+    fn test_manhattan_f32_various_lengths() {
+        // Exercise SIMD chunks + scalar tail across all paths
+        for len in [1usize, 3, 4, 7, 8, 15, 16, 17, 31, 33, 64, 100, 257] {
+            let a: Vec<f32> = (0..len).map(|i| (i as f32) * 0.5).collect();
+            let b: Vec<f32> = (0..len).map(|i| (i as f32) * 0.25).collect();
+
+            let simd = f32::manhattan_simd(&a, &b);
+            let scalar: f32 = a.iter().zip(b.iter()).map(|(&x, &y)| (x - y).abs()).sum();
+
+            assert_relative_eq!(simd, scalar, epsilon = 1e-4);
+        }
+    }
+
+    #[test]
+    fn test_manhattan_f64_basic() {
+        let a: Vec<f64> = vec![1.0, 2.0, 3.0, 4.0];
+        let b: Vec<f64> = vec![2.0, 4.0, 6.0, 8.0];
+        assert_relative_eq!(f64::manhattan_simd(&a, &b), 10.0, epsilon = 1e-10);
+    }
+
+    #[test]
+    fn test_manhattan_f64_identity() {
+        let a: Vec<f64> = (0..32).map(|i| i as f64).collect();
+        assert_relative_eq!(f64::manhattan_simd(&a, &a), 0.0, epsilon = 1e-10);
+    }
+
+    #[test]
+    fn test_manhattan_f64_signs() {
+        let a: Vec<f64> = vec![-3.0, 2.0, -1.0, 4.0];
+        let b: Vec<f64> = vec![1.0, -2.0, 1.0, -4.0];
+        assert_relative_eq!(f64::manhattan_simd(&a, &b), 18.0, epsilon = 1e-10);
+    }
+
+    #[test]
+    fn test_manhattan_f64_various_lengths() {
+        for len in [1usize, 2, 3, 4, 7, 8, 15, 16, 17, 31, 33, 64, 100, 257] {
+            let a: Vec<f64> = (0..len).map(|i| (i as f64) * 0.5).collect();
+            let b: Vec<f64> = (0..len).map(|i| (i as f64) * 0.25).collect();
+
+            let simd = f64::manhattan_simd(&a, &b);
+            let scalar: f64 = a.iter().zip(b.iter()).map(|(&x, &y)| (x - y).abs()).sum();
+
+            assert_relative_eq!(simd, scalar, epsilon = 1e-10);
+        }
+    }
+
     #[cfg(feature = "quantised")]
     mod quantised_tests {
         use super::*;
@@ -5780,76 +6199,6 @@ mod tests {
             // Same direction
             let dist_2 = vecs.cosine_distance_i8(2, &query, query_norm_sq);
             assert_relative_eq!(dist_2, 0.0, epsilon = 1e-5);
-        }
-
-        #[test]
-        fn test_manhattan_f32_basic() {
-            let a: Vec<f32> = vec![1.0, 2.0, 3.0, 4.0];
-            let b: Vec<f32> = vec![2.0, 4.0, 6.0, 8.0];
-            // |1-2| + |2-4| + |3-6| + |4-8| = 1 + 2 + 3 + 4 = 10
-            assert_relative_eq!(f32::manhattan_simd(&a, &b), 10.0, epsilon = 1e-5);
-        }
-
-        #[test]
-        fn test_manhattan_f32_identity() {
-            let a: Vec<f32> = (0..32).map(|i| i as f32).collect();
-            assert_relative_eq!(f32::manhattan_simd(&a, &a), 0.0, epsilon = 1e-5);
-        }
-
-        #[test]
-        fn test_manhattan_f32_signs() {
-            // Mixed signs should still produce |diff|
-            let a: Vec<f32> = vec![-3.0, 2.0, -1.0, 4.0];
-            let b: Vec<f32> = vec![1.0, -2.0, 1.0, -4.0];
-            // 4 + 4 + 2 + 8 = 18
-            assert_relative_eq!(f32::manhattan_simd(&a, &b), 18.0, epsilon = 1e-5);
-        }
-
-        #[test]
-        fn test_manhattan_f32_various_lengths() {
-            // Exercise SIMD chunks + scalar tail across all paths
-            for len in [1usize, 3, 4, 7, 8, 15, 16, 17, 31, 33, 64, 100, 257] {
-                let a: Vec<f32> = (0..len).map(|i| (i as f32) * 0.5).collect();
-                let b: Vec<f32> = (0..len).map(|i| (i as f32) * 0.25).collect();
-
-                let simd = f32::manhattan_simd(&a, &b);
-                let scalar: f32 = a.iter().zip(b.iter()).map(|(&x, &y)| (x - y).abs()).sum();
-
-                assert_relative_eq!(simd, scalar, epsilon = 1e-4);
-            }
-        }
-
-        #[test]
-        fn test_manhattan_f64_basic() {
-            let a: Vec<f64> = vec![1.0, 2.0, 3.0, 4.0];
-            let b: Vec<f64> = vec![2.0, 4.0, 6.0, 8.0];
-            assert_relative_eq!(f64::manhattan_simd(&a, &b), 10.0, epsilon = 1e-10);
-        }
-
-        #[test]
-        fn test_manhattan_f64_identity() {
-            let a: Vec<f64> = (0..32).map(|i| i as f64).collect();
-            assert_relative_eq!(f64::manhattan_simd(&a, &a), 0.0, epsilon = 1e-10);
-        }
-
-        #[test]
-        fn test_manhattan_f64_signs() {
-            let a: Vec<f64> = vec![-3.0, 2.0, -1.0, 4.0];
-            let b: Vec<f64> = vec![1.0, -2.0, 1.0, -4.0];
-            assert_relative_eq!(f64::manhattan_simd(&a, &b), 18.0, epsilon = 1e-10);
-        }
-
-        #[test]
-        fn test_manhattan_f64_various_lengths() {
-            for len in [1usize, 2, 3, 4, 7, 8, 15, 16, 17, 31, 33, 64, 100, 257] {
-                let a: Vec<f64> = (0..len).map(|i| (i as f64) * 0.5).collect();
-                let b: Vec<f64> = (0..len).map(|i| (i as f64) * 0.25).collect();
-
-                let simd = f64::manhattan_simd(&a, &b);
-                let scalar: f64 = a.iter().zip(b.iter()).map(|(&x, &y)| (x - y).abs()).sum();
-
-                assert_relative_eq!(simd, scalar, epsilon = 1e-10);
-            }
         }
     }
 }

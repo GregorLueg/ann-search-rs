@@ -613,7 +613,7 @@ where
     /// * `data` - Data matrix (rows = samples, columns = dimensions)
     /// * `m` - Base connectivity parameter (neighbours per layer)
     /// * `ef_construction` - Size of dynamic candidate list during construction
-    /// * `dist_metric` - Distance metric ("euclidean" or "cosine")
+    /// * `metric` - The distance metric, see [Dist].
     /// * `seed` - Random seed for layer assignment
     /// * `verbose` - Whether to print progress information
     ///
@@ -624,11 +624,10 @@ where
         data: MatRef<T>,
         m: usize,
         ef_construction: usize,
-        dist_metric: &str,
+        metric: &Dist,
         seed: usize,
         verbose: bool,
     ) -> Self {
-        let metric = parse_ann_dist(dist_metric).unwrap_or(Dist::Cosine);
         let (vectors_flat, n, dim) = matrix_to_flat(data);
 
         if verbose {
@@ -642,7 +641,7 @@ where
         let start_total = Instant::now();
 
         // Compute norms for cosine distance
-        let norms = if metric == Dist::Cosine {
+        let norms = if *metric == Dist::Cosine {
             (0..n)
                 .map(|i| {
                     let start = i * dim;
@@ -688,7 +687,7 @@ where
             vectors_flat,
             dim,
             n,
-            metric,
+            metric: *metric,
             norms,
             layer_assignments: layer_assignments.clone(),
             neighbours_flat: Vec::new(),
@@ -1508,19 +1507,20 @@ mod tests {
     #[test]
     fn test_hnsw_build_euclidean() {
         let mat = create_simple_matrix();
-        let _ = HnswIndex::<f32>::build(mat.as_ref(), 16, 100, "euclidean", 42, false);
+        let _ = HnswIndex::<f32>::build(mat.as_ref(), 16, 100, &Dist::SquaredEuclidean, 42, false);
     }
 
     #[test]
     fn test_hnsw_build_cosine() {
         let mat = create_simple_matrix();
-        let _ = HnswIndex::<f32>::build(mat.as_ref(), 16, 100, "cosine", 42, false);
+        let _ = HnswIndex::<f32>::build(mat.as_ref(), 16, 100, &Dist::Cosine, 42, false);
     }
 
     #[test]
     fn test_hnsw_query_finds_self() {
         let mat = create_simple_matrix();
-        let index = HnswIndex::<f32>::build(mat.as_ref(), 16, 100, "euclidean", 42, false);
+        let index =
+            HnswIndex::<f32>::build(mat.as_ref(), 16, 100, &Dist::SquaredEuclidean, 42, false);
 
         let query = vec![1.0, 0.0, 0.0];
         let (indices, distances) = index.query(&query, 1, 50).unwrap();
@@ -1533,7 +1533,8 @@ mod tests {
     #[test]
     fn test_hnsw_query_euclidean() {
         let mat = create_simple_matrix();
-        let index = HnswIndex::<f32>::build(mat.as_ref(), 16, 100, "euclidean", 42, false);
+        let index =
+            HnswIndex::<f32>::build(mat.as_ref(), 16, 100, &Dist::SquaredEuclidean, 42, false);
 
         let query = vec![1.0, 0.0, 0.0];
         let (indices, distances) = index.query(&query, 3, 50).unwrap();
@@ -1549,7 +1550,7 @@ mod tests {
     #[test]
     fn test_hnsw_query_cosine() {
         let mat = create_simple_matrix();
-        let index = HnswIndex::<f32>::build(mat.as_ref(), 16, 100, "cosine", 42, false);
+        let index = HnswIndex::<f32>::build(mat.as_ref(), 16, 100, &Dist::Cosine, 42, false);
 
         let query = vec![1.0, 0.0, 0.0];
         let (indices, distances) = index.query(&query, 3, 50).unwrap();
@@ -1565,7 +1566,8 @@ mod tests {
         let data: Vec<f32> = (0..n * dim).map(|i| i as f32).collect();
         let mat = Mat::from_fn(n, dim, |i, j| data[i * dim + j]);
 
-        let index = HnswIndex::<f32>::build(mat.as_ref(), 16, 200, "euclidean", 42, false);
+        let index =
+            HnswIndex::<f32>::build(mat.as_ref(), 16, 200, &Dist::SquaredEuclidean, 42, false);
 
         let query: Vec<f32> = (0..dim).map(|_| 0.0).collect();
         let (indices, _) = index.query(&query, 5, 50).unwrap();
@@ -1580,7 +1582,7 @@ mod tests {
             mat.as_ref(),
             16,
             100,
-            "euclidean",
+            &Dist::SquaredEuclidean,
             42,
             false,
         ));
@@ -1605,8 +1607,10 @@ mod tests {
     fn test_hnsw_reproducibility() {
         let mat = create_simple_matrix();
 
-        let index1 = HnswIndex::<f32>::build(mat.as_ref(), 16, 100, "euclidean", 42, false);
-        let index2 = HnswIndex::<f32>::build(mat.as_ref(), 16, 100, "euclidean", 42, false);
+        let index1 =
+            HnswIndex::<f32>::build(mat.as_ref(), 16, 100, &Dist::SquaredEuclidean, 42, false);
+        let index2 =
+            HnswIndex::<f32>::build(mat.as_ref(), 16, 100, &Dist::SquaredEuclidean, 42, false);
 
         let query = vec![0.5, 0.5, 0.0];
         let (indices1, _) = index1.query(&query, 3, 50).unwrap();
@@ -1629,7 +1633,8 @@ mod tests {
         }
 
         let mat = Mat::from_fn(n, dim, |i, j| data[i * dim + j]);
-        let index = HnswIndex::<f32>::build(mat.as_ref(), 16, 200, "euclidean", 42, false);
+        let index =
+            HnswIndex::<f32>::build(mat.as_ref(), 16, 200, &Dist::SquaredEuclidean, 42, false);
 
         let query = vec![0.0, 0.0, 0.0];
         let (indices, _) = index.query(&query, 5, 100).unwrap();
@@ -1654,7 +1659,8 @@ mod tests {
         let data: Vec<f32> = (0..n * dim).map(|i| (i as f32) * 0.01).collect();
         let mat = Mat::from_fn(n, dim, |i, j| data[i * dim + j]);
 
-        let index = HnswIndex::<f32>::build(mat.as_ref(), 8, 100, "euclidean", 42, true);
+        let index =
+            HnswIndex::<f32>::build(mat.as_ref(), 8, 100, &Dist::SquaredEuclidean, 42, true);
 
         // Count nodes at each layer
         let mut layer_counts = vec![0usize; (index.max_layer + 1) as usize];
@@ -1692,7 +1698,8 @@ mod tests {
         let mat = Mat::from_fn(n, dim, |i, j| data[i * dim + j]);
 
         for m in [8, 12, 16, 20] {
-            let index = HnswIndex::<f32>::build(mat.as_ref(), m, 200, "euclidean", 42, false);
+            let index =
+                HnswIndex::<f32>::build(mat.as_ref(), m, 200, &Dist::SquaredEuclidean, 42, false);
 
             let query: Vec<f32> = (0..dim).map(|_| 0.5).collect();
             let (indices, _) = index.query(&query, 10, 50).unwrap();

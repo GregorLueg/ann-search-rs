@@ -204,7 +204,7 @@ where
 /// ### Params
 ///
 /// * `mat` - The initial matrix with samples x features
-/// * `dist_metric` - Distance metric: "euclidean" or "cosine"
+/// * `dist_metric` - Distance metric: "euclidean", "cosine" or "manhattan"
 ///
 /// ### Returns
 ///
@@ -213,7 +213,9 @@ pub fn build_exhaustive_index<T>(mat: MatRef<T>, dist_metric: &str) -> Exhaustiv
 where
     T: AnnSearchFloat,
 {
-    let metric = parse_ann_dist(dist_metric).unwrap_or_default();
+    let metric = parse_ann_dist(dist_metric).unwrap_or({
+        eprintln!("[WARNING] Weird string used for distance metric. Using default squared Euclidean distance"); Dist::default()
+    });
     ExhaustiveIndex::new(mat, metric)
 }
 
@@ -280,7 +282,8 @@ where
 /// ### Params
 ///
 /// * `mat` - The initial matrix with samples x features
-/// * `dist_metric` - Distance metric: "euclidean" or "cosine"
+/// * `dist_metric` - Distance metric: "euclidean" or "cosine". "manhatten" is
+///   not supported.
 /// * `nlist` - Optional number of clusters. Defaults to sqrt(n).
 /// * `k_means_params` - Optional k-means trainings parameters, see
 ///   [KMeansTrainingParams]. If not provided, will default to sensible
@@ -302,7 +305,9 @@ pub fn build_kmknn_index<T>(
 where
     T: AnnSearchFloat,
 {
-    let metric = parse_ann_dist(dist_metric).unwrap_or_default();
+    let metric = parse_ann_dist(dist_metric).unwrap_or({
+        eprintln!("[WARNING] Weird string used for distance metric. Using default squared Euclidean distance"); Dist::default()
+    });
     KmknnIndex::build(mat, metric, nlist, k_means_params, seed, verbose)
 }
 
@@ -370,6 +375,8 @@ where
 ///
 /// * `mat` - The data matrix. Rows represent the samples, columns represent
 ///   the embedding dimensions
+/// * `dist_metric` - Distance metric: "euclidean" or "cosine". "manhatten" is
+///   not supported.
 /// * `n_trees` - Number of trees to use to build the index
 /// * `seed` - Random seed for reproducibility
 ///
@@ -378,16 +385,18 @@ where
 /// The `AnnoyIndex`.
 pub fn build_annoy_index<T>(
     mat: MatRef<T>,
-    dist_metric: String,
+    dist_metric: &str,
     n_trees: usize,
     seed: usize,
 ) -> Result<AnnoyIndex<T>, AnnSearchErrors>
 where
     T: AnnSearchFloat,
 {
-    let ann_dist = parse_ann_dist(&dist_metric).unwrap_or_default();
+    let metric = parse_ann_dist(dist_metric).unwrap_or({
+        eprintln!("[WARNING] Weird string used for distance metric. Using default squared Euclidean distance"); Dist::default()
+    });
 
-    AnnoyIndex::new(mat, n_trees, ann_dist, seed)
+    AnnoyIndex::new(mat, n_trees, metric, seed)
 }
 
 /// Helper function to query a given Annoy index
@@ -460,7 +469,8 @@ where
 ///
 /// * `mat` - The data matrix. Rows represent the samples, columns represent
 ///   the embedding dimensions
-/// * `dist_metric` - Distance metric to use
+/// * `dist_metric` - Distance metric: "euclidean" or "cosine". "manhatten" is
+///   not supported.
 /// * `seed` - Random seed for reproducibility
 ///
 /// ### Return
@@ -468,14 +478,16 @@ where
 /// The `BallTreeIndex`.
 pub fn build_balltree_index<T>(
     mat: MatRef<T>,
-    dist_metric: String,
+    dist_metric: &str,
     seed: usize,
 ) -> Result<BallTreeIndex<T>, AnnSearchErrors>
 where
     T: AnnSearchFloat,
 {
-    let ann_dist = parse_ann_dist(&dist_metric).unwrap_or_default();
-    BallTreeIndex::new(mat, ann_dist, seed)
+    let metric = parse_ann_dist(dist_metric).unwrap_or({
+        eprintln!("[WARNING] Weird string used for distance metric. Using default squared Euclidean distance"); Dist::default()
+    });
+    BallTreeIndex::new(mat, metric, seed)
 }
 
 /// Helper function to query a given BallTree index
@@ -550,8 +562,7 @@ where
 ///   the embedding dimensions.
 /// * `m` - Number of bidirectional connections per layer.
 /// * `ef_construction` - Size of candidate list during construction.
-/// * `dist_metric` - The distance metric to use. One of `"euclidean"` or
-///   `"cosine"`.
+/// * `dist_metric` - Distance metric: "euclidean", "cosine" or "manhatten".
 /// * `seed` - Random seed for reproducibility
 ///
 /// ### Return
@@ -569,7 +580,11 @@ where
     T: AnnSearchFloat,
     HnswIndex<T>: HnswState<T>,
 {
-    HnswIndex::build(mat, m, ef_construction, dist_metric, seed, verbose)
+    let metric = parse_ann_dist(dist_metric).unwrap_or({
+        eprintln!("[WARNING] Weird string used for distance metric. Using default squared Euclidean distance"); Dist::default()
+    });
+
+    HnswIndex::build(mat, m, ef_construction, &metric, seed, verbose)
 }
 
 /// Helper function to query a given HNSW index
@@ -656,8 +671,8 @@ where
 /// * `k_means_params` - Optional k-means trainings parameters, see
 ///   [KMeansTrainingParams]. If not provided, will default to sensible
 ///   defaults.
-/// * `dist_metric` - The distance metric to use. One of `"euclidean"` or
-///   `"cosine"`
+/// * `dist_metric` - Distance metric: "euclidean" or "cosine". "manhatten" is
+///   not supported.
 /// * `seed` - Random seed for reproducibility
 /// * `verbose` - Print progress information during index construction
 ///
@@ -675,9 +690,11 @@ pub fn build_ivf_index<T>(
 where
     T: AnnSearchFloat,
 {
-    let ann_dist = parse_ann_dist(dist_metric).unwrap_or_default();
+    let metric = parse_ann_dist(dist_metric).unwrap_or({
+        eprintln!("[WARNING] Weird string used for distance metric. Using default squared Euclidean distance"); Dist::default()
+    });
 
-    IvfIndex::build(mat, ann_dist, nlist, k_means_params, seed, verbose)
+    IvfIndex::build(mat, metric, nlist, k_means_params, seed, verbose)
 }
 
 /// Helper function to query a given IVF index
@@ -765,7 +782,7 @@ where
 ///
 /// * `mat` - The data matrix. Rows represent the samples, columns represent
 ///   the embedding dimensions
-/// * `dist_metric` - Distance metric string ("euclidean" or "cosine")
+/// * `dist_metric` - Distance metric: "euclidean", "cosine" or "manhatten".
 /// * `n_trees` - Number of trees to use to build the index
 /// * `seed` - Random seed for reproducibility
 /// * `overlap` - Spill-tree overlap fraction. If None, uses the default
@@ -776,16 +793,18 @@ where
 /// The `KdTreeIndex`.
 pub fn build_kd_tree_index<T>(
     mat: MatRef<T>,
-    dist_metric: String,
+    dist_metric: &str,
     n_trees: usize,
     seed: usize,
 ) -> KdTreeIndex<T>
 where
     T: AnnSearchFloat,
 {
-    let ann_dist = parse_ann_dist(&dist_metric).unwrap_or_default();
+    let metric = parse_ann_dist(dist_metric).unwrap_or({
+        eprintln!("[WARNING] Weird string used for distance metric. Using default squared Euclidean distance"); Dist::default()
+    });
 
-    KdTreeIndex::new(mat, n_trees, ann_dist, seed)
+    KdTreeIndex::new(mat, n_trees, metric, seed)
 }
 
 /// Helper function to query a given Kd-Tree index
@@ -857,7 +876,8 @@ where
 /// ### Params
 ///
 /// * `mat` - The initial matrix with samples x features
-/// * `dist_metric` - Distance metric: "euclidean" or "cosine"
+/// * `dist_metric` - Distance metric: "euclidean" or "cosine". "manhatten" is
+///   not supported.
 /// * `num_tables` - Number of HashMaps to use (usually something 20 to 100)
 /// * `bits_per_hash` - How many bits per hash. Lower values (8) usually yield
 ///   better Recall with higher query time; higher values (16) have worse Recall
@@ -877,7 +897,9 @@ pub fn build_lsh_index<T>(
 where
     T: AnnSearchFloat,
 {
-    let metric = parse_ann_dist(dist_metric).unwrap_or_default();
+    let metric = parse_ann_dist(dist_metric).unwrap_or({
+        eprintln!("[WARNING] Weird string used for distance metric. Using default squared Euclidean distance"); Dist::default()
+    });
     LSHIndex::new(mat, metric, num_tables, bits_per_hash, seed)
 }
 
@@ -961,8 +983,7 @@ where
 /// * `mat` - The data matrix. Rows represent the samples, columns represent
 ///   the embedding dimensions.
 /// * `k` - Number of neighbours for the k-NN graph.
-/// * `dist_metric` - The distance metric to use. One of `"euclidean"` or
-///   `"cosine"`.
+/// * `dist_metric` - Distance metric: "euclidean", "cosine" or "manhatten".
 /// * `max_iter` - Maximum iterations for the algorithm.
 /// * `delta` - Early stop criterium for the algorithm.
 /// * `rho` - Sampling rate for the old neighbours. Will adaptively decrease
@@ -992,7 +1013,9 @@ where
     NNDescent<T>: ApplySortedUpdates<T>,
     NNDescent<T>: NNDescentQuery<T>,
 {
-    let metric = parse_ann_dist(dist_metric).unwrap_or(Dist::Cosine);
+    let metric = parse_ann_dist(dist_metric).unwrap_or({
+        eprintln!("[WARNING] Weird string used for distance metric. Using default squared Euclidean distance"); Dist::default()
+    });
     NNDescent::new(
         mat,
         metric,
@@ -1094,7 +1117,7 @@ where
 /// * `l_build` - Beam width during construction.
 /// * `alpha_pass1` - Pruning alpha for pass 1 (typically 1.0).
 /// * `alpha_pass2` - Pruning alpha for pass 2 (typically 1.2–1.5).
-/// * `dist_metric` - One of `"euclidean"` or `"cosine"`.
+/// * `dist_metric` - Distance metric: "euclidean", "cosine" or "manhatten".
 /// * `seed` - Random seed for reproducibility.
 ///
 /// ### Returns
@@ -1113,7 +1136,9 @@ where
     T: AnnSearchFloat,
     VamanaIndex<T>: VamanaState<T>,
 {
-    let metric = parse_ann_dist(dist_metric).unwrap_or(Dist::SquaredEuclidean);
+    let metric = parse_ann_dist(dist_metric).unwrap_or({
+        eprintln!("[WARNING] Weird string used for distance metric. Using default squared Euclidean distance"); Dist::default()
+    });
     VamanaIndex::build(mat, metric, r, l_build, alpha_pass1, alpha_pass2, seed)
 }
 
@@ -1191,7 +1216,8 @@ where
 ///
 /// * `mat` - The data matrix. Rows represent the samples, columns represent
 ///   the embedding dimensions
-/// * `dist_metric` - Distance metric to use
+/// * `dist_metric` - Distance metric: "euclidean" or "cosine". "manhatten" is
+///   not supported.
 /// * `verbose` - Print progress information during index construction
 ///
 /// ### Return
@@ -1205,14 +1231,16 @@ pub fn build_exhaustive_bf16_index<T>(
 where
     T: AnnSearchFloat + Bf16Compatible,
 {
-    let ann_dist = parse_ann_dist(dist_metric).unwrap_or_default();
+    let metric = parse_ann_dist(dist_metric).unwrap_or({
+        eprintln!("[WARNING] Weird string used for distance metric. Using default squared Euclidean distance"); Dist::default()
+    });
     if verbose {
         println!(
             "Building exhaustive BF16 index with {} samples",
             mat.nrows()
         );
     }
-    ExhaustiveIndexBf16::new(mat, ann_dist)
+    ExhaustiveIndexBf16::new(mat, metric)
 }
 
 #[cfg(feature = "quantised")]
@@ -1282,7 +1310,8 @@ where
 ///
 /// * `mat` - The data matrix. Rows represent the samples, columns represent
 ///   the embedding dimensions
-/// * `dist_metric` - Distance metric to use
+/// * `dist_metric` - Distance metric: "euclidean" or "cosine". "manhatten" is
+///   not supported.
 /// * `verbose` - Print progress information during index construction
 ///
 /// ### Return
@@ -1296,11 +1325,13 @@ pub fn build_exhaustive_sq8_index<T>(
 where
     T: AnnSearchFloat,
 {
-    let ann_dist = parse_ann_dist(dist_metric).unwrap_or_default();
+    let metric = parse_ann_dist(dist_metric).unwrap_or({
+        eprintln!("[WARNING] Weird string used for distance metric. Using default squared Euclidean distance"); Dist::default()
+    });
     if verbose {
         println!("Building exhaustive SQ8 index with {} samples", mat.nrows());
     }
-    ExhaustiveSq8Index::new(mat, ann_dist)
+    ExhaustiveSq8Index::new(mat, metric)
 }
 
 #[cfg(feature = "quantised")]
@@ -1374,7 +1405,8 @@ where
 ///   by m)
 /// * `max_iters` - Maximum k-means iterations (defaults to 30 if None)
 /// * `n_pq_centroids` - Number of centroids per subspace (defaults to 256 if None)
-/// * `dist_metric` - Distance metric ("euclidean" or "cosine")
+/// * `dist_metric` - Distance metric: "euclidean" or "cosine". "manhatten" is
+///   not supported.
 /// * `seed` - Random seed for reproducibility
 /// * `verbose` - Print progress information during index construction
 ///
@@ -1394,8 +1426,10 @@ pub fn build_exhaustive_pq_index<T>(
 where
     T: AnnSearchFloat,
 {
-    let ann_dist = parse_ann_dist(dist_metric).unwrap_or_default();
-    ExhaustivePqIndex::build(mat, m, ann_dist, max_iters, n_pq_centroids, seed, verbose)
+    let metric = parse_ann_dist(dist_metric).unwrap_or({
+        eprintln!("[WARNING] Weird string used for distance metric. Using default squared Euclidean distance"); Dist::default()
+    });
+    ExhaustivePqIndex::build(mat, m, metric, max_iters, n_pq_centroids, seed, verbose)
 }
 
 #[cfg(feature = "quantised")]
@@ -1471,7 +1505,8 @@ where
 ///   by m)
 /// * `max_iters` - Maximum k-means iterations (defaults to 30 if None)
 /// * `n_pq_centroids` - Number of centroids per subspace (defaults to 256 if None)
-/// * `dist_metric` - Distance metric ("euclidean" or "cosine")
+/// * `dist_metric` - Distance metric: "euclidean" or "cosine". "manhatten" is
+///   not supported.
 /// * `seed` - Random seed for reproducibility
 /// * `verbose` - Print progress information during index construction
 ///
@@ -1491,8 +1526,10 @@ pub fn build_exhaustive_opq_index<T>(
 where
     T: AnnSearchFloat + AddAssign,
 {
-    let ann_dist = parse_ann_dist(dist_metric).unwrap_or_default();
-    ExhaustiveOpqIndex::build(mat, m, ann_dist, max_iters, n_pq_centroids, seed, verbose)
+    let metric = parse_ann_dist(dist_metric).unwrap_or({
+        eprintln!("[WARNING] Weird string used for distance metric. Using default squared Euclidean distance"); Dist::default()
+    });
+    ExhaustiveOpqIndex::build(mat, m, metric, max_iters, n_pq_centroids, seed, verbose)
 }
 
 #[cfg(feature = "quantised")]
@@ -1569,6 +1606,8 @@ where
 /// * `k_means_params` - Optional k-means trainings parameters, see
 ///   [KMeansTrainingParams]. If not provided, will default to sensible
 ///   defaults.
+/// * `dist_metric` - Distance metric: "euclidean" or "cosine". "manhatten" is
+///   not supported.
 /// * `seed` - Random seed for reproducibility
 /// * `verbose` - Print progress information during index construction
 ///
@@ -1586,9 +1625,11 @@ pub fn build_ivf_bf16_index<T>(
 where
     T: AnnSearchFloat + Bf16Compatible,
 {
-    let ann_dist = parse_ann_dist(dist_metric).unwrap_or_default();
+    let metric = parse_ann_dist(dist_metric).unwrap_or({
+        eprintln!("[WARNING] Weird string used for distance metric. Using default squared Euclidean distance"); Dist::default()
+    });
 
-    IvfIndexBf16::build(mat, ann_dist, nlist, k_means_params, seed, verbose)
+    IvfIndexBf16::build(mat, metric, nlist, k_means_params, seed, verbose)
 }
 
 #[cfg(feature = "quantised")]
@@ -1672,6 +1713,8 @@ where
 /// * `k_means_params` - Optional k-means trainings parameters, see
 ///   [KMeansTrainingParams]. If not provided, will default to sensible
 ///   defaults.
+/// * `dist_metric` - Distance metric: "euclidean" or "cosine". "manhatten" is
+///   not supported.
 /// * `seed` - Random seed for reproducibility
 /// * `verbose` - Print progress information during index construction
 ///
@@ -1689,9 +1732,11 @@ pub fn build_ivf_sq8_index<T>(
 where
     T: AnnSearchFloat,
 {
-    let ann_dist = parse_ann_dist(dist_metric).unwrap_or_default();
+    let metric = parse_ann_dist(dist_metric).unwrap_or({
+        eprintln!("[WARNING] Weird string used for distance metric. Using default squared Euclidean distance"); Dist::default()
+    });
 
-    IvfSq8Index::build(mat, nlist, ann_dist, k_means_params, seed, verbose)
+    IvfSq8Index::build(mat, nlist, metric, k_means_params, seed, verbose)
 }
 
 #[cfg(feature = "quantised")]
@@ -1776,7 +1821,8 @@ where
 /// * `k_means_params` - Optional k-means trainings parameters, see
 ///   [KMeansTrainingParams]. If not provided, will default to sensible
 ///   defaults.
-/// * `dist_metric` - Distance metric ("euclidean" or "cosine")
+/// * `dist_metric` - Distance metric: "euclidean" or "cosine". "manhatten" is
+///   not supported.
 /// * `seed` - Random seed for reproducibility
 /// * `verbose` - Print progress information during index construction
 ///
@@ -1797,13 +1843,15 @@ pub fn build_ivf_pq_index<T>(
 where
     T: AnnSearchFloat,
 {
-    let ann_dist = parse_ann_dist(dist_metric).unwrap_or_default();
+    let metric = parse_ann_dist(dist_metric).unwrap_or({
+        eprintln!("[WARNING] Weird string used for distance metric. Using default squared Euclidean distance"); Dist::default()
+    });
 
     IvfPqIndex::build(
         mat,
         nlist,
         m,
-        ann_dist,
+        metric,
         k_means_params,
         n_pq_centroids,
         seed,
@@ -1892,7 +1940,8 @@ where
 /// * `k_means_params` - Optional k-means trainings parameters, see
 ///   [KMeansTrainingParams]. If not provided, will default to sensible
 ///   defaults.
-/// * `dist_metric` - Distance metric ("euclidean" or "cosine")
+/// * `dist_metric` - Distance metric: "euclidean" or "cosine". "manhatten" is
+///   not supported.
 /// * `seed` - Random seed for reproducibility
 /// * `verbose` - Print progress information during index construction
 ///
@@ -1914,13 +1963,15 @@ pub fn build_ivf_opq_index<T>(
 where
     T: AnnSearchFloat + AddAssign,
 {
-    let ann_dist = parse_ann_dist(dist_metric).unwrap_or_default();
+    let metric = parse_ann_dist(dist_metric).unwrap_or({
+        eprintln!("[WARNING] Weird string used for distance metric. Using default squared Euclidean distance"); Dist::default()
+    });
 
     IvfOpqIndex::build(
         mat,
         nlist,
         m,
-        ann_dist,
+        metric,
         k_means_params,
         n_opq_iter,
         n_opq_centroids,
@@ -2007,7 +2058,8 @@ where
 /// ### Params
 ///
 /// * `mat` - The initial matrix with samples x features
-/// * `dist_metric` - Distance metric: "euclidean" or "cosine"
+/// * `dist_metric` - Distance metric: "euclidean" or "cosine". "manhatten" is
+///   not supported.
 /// * `device` - The GPU device to use
 ///
 /// ### Returns
@@ -2022,7 +2074,9 @@ where
     T: AnnSearchGpuFloat + AnnSearchFloat,
     R: Runtime,
 {
-    let metric = parse_ann_dist(dist_metric).unwrap_or_default();
+    let metric = parse_ann_dist(dist_metric).unwrap_or({
+        eprintln!("[WARNING] Weird string used for distance metric. Using default squared Euclidean distance"); Dist::default()
+    });
     ExhaustiveIndexGpu::new(mat, metric, device)
 }
 
@@ -2101,7 +2155,8 @@ where
 /// * `k_means_params` - Optional k-means trainings parameters, see
 ///   [KMeansTrainingParams]. If not provided, will default to sensible
 ///   defaults.
-/// * `dist_metric` - "euclidean" or "cosine"
+/// * `dist_metric` - Distance metric: "euclidean" or "cosine". "manhatten" is
+///   not supported.
 /// * `seed` - Random seed
 /// * `verbose` - Print progress
 /// * `device` - GPU device
@@ -2118,8 +2173,10 @@ where
     R: Runtime,
     T: AnnSearchFloat + AnnSearchGpuFloat,
 {
-    let ann_dist = parse_ann_dist(dist_metric).unwrap_or_default();
-    IvfIndexGpu::build(mat, ann_dist, nlist, k_means_params, seed, verbose, device)
+    let metric = parse_ann_dist(dist_metric).unwrap_or({
+        eprintln!("[WARNING] Weird string used for distance metric. Using default squared Euclidean distance"); Dist::default()
+    });
+    IvfIndexGpu::build(mat, metric, nlist, k_means_params, seed, verbose, device)
 }
 
 #[cfg(feature = "gpu")]
@@ -2204,7 +2261,8 @@ where
 /// ### Params
 ///
 /// * `mat` - Data matrix [samples, features]
-/// * `dist_metric` - "euclidean" or "cosine"
+/// * `dist_metric` - Distance metric: "euclidean" or "cosine". "manhatten" is
+///   not supported.
 /// * `k` - Final neighbours per node (default 30)
 /// * `build_k` - Internal NNDescent degree before CAGRA pruning (default 2*k)
 /// * `max_iters` - Maximum NNDescent iterations (default 15)
@@ -2235,9 +2293,11 @@ where
     T: AnnSearchFloat + AnnSearchGpuFloat,
     NNDescentGpu<T, R>: NNDescentQuery<T>,
 {
-    let ann_dist = parse_ann_dist(dist_metric).unwrap_or_default();
+    let metric = parse_ann_dist(dist_metric).unwrap_or({
+        eprintln!("[WARNING] Weird string used for distance metric. Using default squared Euclidean distance"); Dist::default()
+    });
     NNDescentGpu::build(
-        mat, ann_dist, k, build_k, max_iters, n_trees, delta, rho, refine_knn, seed, verbose,
+        mat, metric, k, build_k, max_iters, n_trees, delta, rho, refine_knn, seed, verbose,
         retain_gpu, device,
     )
 }
@@ -2410,7 +2470,8 @@ where
 /// * `n_bits` - Number of bits per binary code (must be multiple of 8)
 /// * `seed` - Random seed for binariser
 /// * `binary_init` - Initialisation method ("itq" or "random")
-/// * `metric` - Distance metric for reranking (when save_store is true)
+/// * `dist_metric` - Distance metric: "euclidean" or "cosine". "manhatten" is
+///   not supported.
 /// * `save_store` - Whether to save vector store for reranking
 /// * `save_path` - Path to save vector store files (required if save_store is
 ///   true)
@@ -2423,14 +2484,16 @@ pub fn build_exhaustive_index_binary<T>(
     n_bits: usize,
     seed: usize,
     binary_init: &str,
-    metric: &str,
+    dist_metric: &str,
     save_store: bool,
     save_path: Option<impl AsRef<Path>>,
 ) -> Result<ExhaustiveIndexBinary<T>, AnnSearchErrors>
 where
     T: AnnSearchFloat + Pod,
 {
-    let metric = parse_ann_dist(metric).unwrap_or_default();
+    let metric = parse_ann_dist(dist_metric).unwrap_or({
+        eprintln!("[WARNING] Weird string used for distance metric. Using default squared Euclidean distance"); Dist::default()
+    });
 
     if save_store {
         let path = save_path.expect("save_path required when save_store is true");
@@ -2547,7 +2610,8 @@ where
 /// * `k_means_params` - Optional k-means trainings parameters, see
 ///   [KMeansTrainingParams]. If not provided, will default to sensible
 ///   defaults.
-/// * `dist_metric` - "euclidean" or "cosine"
+/// * `dist_metric` - Distance metric: "euclidean" or "cosine". "manhatten" is
+///   not supported.
 /// * `seed` - Random seed
 /// * `save_store` - Whether to save vector store for reranking
 /// * `save_path` - Path to save vector store files (required if save_store
@@ -2573,7 +2637,9 @@ pub fn build_ivf_index_binary<T>(
 where
     T: AnnSearchFloat + Pod,
 {
-    let ann_dist = parse_ann_dist(dist_metric).unwrap_or_default();
+    let metric = parse_ann_dist(dist_metric).unwrap_or({
+        eprintln!("[WARNING] Weird string used for distance metric. Using default squared Euclidean distance"); Dist::default()
+    });
 
     if save_store {
         let path = save_path.expect("save_path required when save_store is true");
@@ -2581,7 +2647,7 @@ where
             mat,
             binarisation_init,
             n_bits,
-            ann_dist,
+            metric,
             nlist,
             k_means_params,
             seed,
@@ -2593,7 +2659,7 @@ where
             mat,
             binarisation_init,
             n_bits,
-            ann_dist,
+            metric,
             nlist,
             k_means_params,
             seed,
@@ -2702,7 +2768,8 @@ where
 ///
 /// * `mat` - The initial matrix with samples x features
 /// * `n_clust_rabitq` - Number of clusters (None for automatic)
-/// * `dist_metric` - "euclidean" or "cosine"
+/// * `dist_metric` - Distance metric: "euclidean" or "cosine". "manhatten" is
+///   not supported.
 /// * `seed` - Random seed
 /// * `save_store` - Whether to save vector store for reranking
 /// * `save_path` - Path to save vector store files (required if save_store is
@@ -2722,12 +2789,14 @@ pub fn build_exhaustive_index_rabitq<T>(
 where
     T: AnnSearchFloat + Pod,
 {
-    let ann_dist = parse_ann_dist(dist_metric).unwrap_or_default();
+    let metric = parse_ann_dist(dist_metric).unwrap_or({
+        eprintln!("[WARNING] Weird string used for distance metric. Using default squared Euclidean distance"); Dist::default()
+    });
     if save_store {
         let path = save_path.expect("save_path required when save_store is true");
-        ExhaustiveIndexRaBitQ::new_with_vector_store(mat, &ann_dist, n_clust_rabitq, seed, path)
+        ExhaustiveIndexRaBitQ::new_with_vector_store(mat, &metric, n_clust_rabitq, seed, path)
     } else {
-        ExhaustiveIndexRaBitQ::new(mat, &ann_dist, n_clust_rabitq, seed)
+        ExhaustiveIndexRaBitQ::new(mat, &metric, n_clust_rabitq, seed)
     }
 }
 
@@ -2819,7 +2888,8 @@ where
 /// * `k_means_params` - Optional k-means trainings parameters, see
 ///   [KMeansTrainingParams]. If not provided, will default to sensible
 ///   defaults.
-/// * `dist_metric` - "euclidean" or "cosine"
+/// * `dist_metric` - Distance metric: "euclidean" or "cosine". "manhatten" is
+///   not supported.
 /// * `seed` - Random seed
 /// * `save_store` - Whether to save vector store for reranking
 /// * `save_path` - Path to save vector store files (required if save_store is
@@ -2843,12 +2913,15 @@ pub fn build_ivf_index_rabitq<T>(
 where
     T: AnnSearchFloat + Pod,
 {
-    let ann_dist = parse_ann_dist(dist_metric).unwrap_or_default();
+    let metric = parse_ann_dist(dist_metric).unwrap_or({
+        eprintln!("[WARNING] Weird string used for distance metric. Using default squared Euclidean distance"); Dist::default()
+    });
+
     if save_store {
         let path = save_path.expect("save_path required when save_store is true");
         IvfIndexRaBitQ::build_with_vector_store(
             mat,
-            ann_dist,
+            metric,
             nlist,
             k_means_params,
             seed,
@@ -2856,7 +2929,7 @@ where
             path,
         )
     } else {
-        IvfIndexRaBitQ::build(mat, ann_dist, nlist, k_means_params, seed, verbose)
+        IvfIndexRaBitQ::build(mat, metric, nlist, k_means_params, seed, verbose)
     }
 }
 

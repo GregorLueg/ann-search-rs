@@ -255,9 +255,93 @@ pub trait ApplySortedUpdates<T> {
 // Forest //
 ////////////
 
-enum InternalForest {
-    Annoy,
-    KdForest,
+/// Wrapper over the two forest types usable as an NNDescent initialiser.
+///
+/// Annoy gives better init quality but can't handle Manhattan; KdForest
+/// handles all three metrics including Manhattan. Selection is automatic
+/// based on the metric.
+enum Forest<T> {
+    /// Annoy version
+    Annoy(AnnoyIndex<T>),
+    /// KdForest version
+    Kd(KdTreeIndex<T>),
+}
+
+impl<T> Forest<T>
+where
+    T: AnnSearchFloat,
+{
+    /// Build the appropriate forest for the given metric.
+    ///
+    /// ### Params
+    ///
+    /// * `data` - The underlying data
+    /// * `n_trees` - The number of trees to use in the forest
+    /// * `metric` - The distance metric to use, see [Dist].
+    /// * `seed` - The random seed for reproducibility
+    ///
+    /// ### Returns
+    ///
+    /// The [Forest].
+    fn new(
+        data: MatRef<T>,
+        n_trees: usize,
+        metric: Dist,
+        seed: usize,
+    ) -> Result<Self, AnnSearchErrors> {
+        match metric {
+            Dist::Manhattan => Ok(Forest::Kd(KdTreeIndex::new(data, n_trees, metric, seed))),
+            _ => Ok(Forest::Annoy(AnnoyIndex::new(data, n_trees, metric, seed)?)),
+        }
+    }
+
+    /// Number of trees in the underlying forest. Used to size the per-query
+    /// search budget.
+    ///
+    /// ### Returns
+    ///
+    /// The number of trees.
+    fn n_trees(&self) -> usize {
+        match self {
+            Forest::Annoy(f) => f.n_trees,
+            Forest::Kd(f) => f.n_trees,
+        }
+    }
+
+    /// Query the forest for approximate nearest neighbours.
+    ///
+    /// ### Params
+    ///
+    /// * `query_vec` - The query vector
+    /// * `k` - Number of neighbours to return
+    /// * `search_k` - The budget
+    ///
+    /// ### Returns
+    ///
+    /// The `(indices, dist)`
+    fn query(
+        &self,
+        query_vec: &[T],
+        k: usize,
+        search_k: Option<usize>,
+    ) -> Result<(Vec<usize>, Vec<T>), AnnSearchErrors> {
+        match self {
+            Forest::Annoy(f) => f.query(query_vec, k, search_k),
+            Forest::Kd(f) => f.query(query_vec, k, search_k),
+        }
+    }
+
+    /// Memory footprint in bytes.
+    ///
+    /// ### Returns
+    ///
+    /// The memory usage
+    fn memory_usage_bytes(&self) -> usize {
+        match self {
+            Forest::Annoy(f) => f.memory_usage_bytes(),
+            Forest::Kd(f) => f.memory_usage_bytes(),
+        }
+    }
 }
 
 ////////////////////
@@ -363,8 +447,9 @@ pub struct NNDescent<T> {
     pub norms: Vec<T>,
     /// Distance metric of the index
     metric: Dist,
-    /// Annoy index initialisation and finding the entry points
-    forest: AnnoyIndex<T>,
+    /// Forest used for graph initialisation and query entry points. Annoy for
+    /// Euclidean/Cosine, KdForest for Manhattan.
+    forest: Forest<T>,
     /// Flat k-NN graph of size `n * k`
     graph: Vec<(usize, T)>,
     /// Whether construction converged
@@ -427,7 +512,7 @@ where
     /// * `k` - Neighbours per node (default 30)
     /// * `max_candidates` - Max candidates per node per iteration
     /// * `max_iter` - Maximum iterations
-    /// * `n_trees` - Annoy forest size
+    /// * `n_trees` - Annoy/Kd forest size
     /// * `delta` - Convergence threshold (fraction of edges updated)
     /// * `diversify_prob` - Probability of pruning redundant edges (0 to disable)
     /// * `seed` - Random seed
@@ -445,10 +530,6 @@ where
         seed: usize,
         verbose: bool,
     ) -> Result<Self, AnnSearchErrors> {
-        if metric == Dist::Manhattan {
-            return Err(AnnSearchErrors::DistanceNotSupported(metric));
-        }
-
         let (vectors_flat, n, dim) = matrix_to_flat(data);
 
         let norms = if metric == Dist::Cosine {
@@ -477,9 +558,9 @@ where
         let max_candidates = max_candidates.unwrap_or(k.min(60));
 
         let start = Instant::now();
-        let forest = AnnoyIndex::new(data, n_trees, metric, seed)?;
+        let forest = Forest::new(data, n_trees, metric, seed)?;
         if verbose {
-            println!("Built Annoy: {:.2?}", start.elapsed());
+            println!("Built forest: {:.2?}", start.elapsed());
         }
 
         let builder = NNDescent {
@@ -569,7 +650,7 @@ where
         graph.par_chunks_mut(k).enumerate().try_for_each(
             |(i, slot)| -> Result<(), AnnSearchErrors> {
                 let query = &self.vectors_flat[i * self.dim..(i + 1) * self.dim];
-                let search_k = k * self.forest.n_trees;
+                let search_k = k * self.forest.n_trees();
                 let (indices, distances) = self.forest.query(query, k + 1, Some(search_k))?;
                 for (j, (idx, dist)) in indices
                     .into_iter()
