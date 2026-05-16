@@ -2766,7 +2766,7 @@ pub fn build_exhaustive_index_rabitq<T>(
     seed: usize,
     save_store: bool,
     save_path: Option<impl AsRef<Path>>,
-) -> std::io::Result<ExhaustiveIndexRaBitQ<T>>
+) -> Result<ExhaustiveIndexRaBitQ<T>, AnnSearchErrors>
 where
     T: AnnSearchFloat + Pod,
 {
@@ -2775,12 +2775,7 @@ where
         let path = save_path.expect("save_path required when save_store is true");
         ExhaustiveIndexRaBitQ::new_with_vector_store(mat, &ann_dist, n_clust_rabitq, seed, path)
     } else {
-        Ok(ExhaustiveIndexRaBitQ::new(
-            mat,
-            &ann_dist,
-            n_clust_rabitq,
-            seed,
-        ))
+        ExhaustiveIndexRaBitQ::new(mat, &ann_dist, n_clust_rabitq, seed)
     }
 }
 
@@ -2811,16 +2806,16 @@ pub fn query_exhaustive_index_rabitq<T>(
     rerank_factor: Option<usize>,
     return_dist: bool,
     verbose: bool,
-) -> (Vec<Vec<usize>>, Option<Vec<Vec<T>>>)
+) -> AnnSearchResult<T>
 where
     T: AnnSearchFloat + Pod,
 {
     if rerank {
-        query_parallel(query_mat.nrows(), return_dist, verbose, |i| {
+        query_parallel_2(query_mat.nrows(), return_dist, verbose, |i| {
             index.query_row_reranking(query_mat.row(i), k, n_probe, rerank_factor)
         })
     } else {
-        query_parallel(query_mat.nrows(), return_dist, verbose, |i| {
+        query_parallel_2(query_mat.nrows(), return_dist, verbose, |i| {
             index.query_row(query_mat.row(i), k, n_probe)
         })
     }
@@ -2851,7 +2846,7 @@ pub fn query_exhaustive_index_rabitq_self<T>(
     rerank_factor: Option<usize>,
     return_dist: bool,
     verbose: bool,
-) -> (Vec<Vec<usize>>, Option<Vec<Vec<T>>>)
+) -> AnnSearchResult<T>
 where
     T: AnnSearchFloat + Pod,
 {
@@ -2892,7 +2887,7 @@ pub fn build_ivf_index_rabitq<T>(
     save_store: bool,
     save_path: Option<impl AsRef<Path>>,
     verbose: bool,
-) -> std::io::Result<IvfIndexRaBitQ<T>>
+) -> Result<IvfIndexRaBitQ<T>, AnnSearchErrors>
 where
     T: AnnSearchFloat + Pod,
 {
@@ -2909,14 +2904,7 @@ where
             path,
         )
     } else {
-        Ok(IvfIndexRaBitQ::build(
-            mat,
-            ann_dist,
-            nlist,
-            k_means_params,
-            seed,
-            verbose,
-        ))
+        IvfIndexRaBitQ::build(mat, ann_dist, nlist, k_means_params, seed, verbose)
     }
 }
 
@@ -2947,16 +2935,16 @@ pub fn query_ivf_index_rabitq<T>(
     rerank_factor: Option<usize>,
     return_dist: bool,
     verbose: bool,
-) -> (Vec<Vec<usize>>, Option<Vec<Vec<T>>>)
+) -> AnnSearchResult<T>
 where
     T: AnnSearchFloat + Pod,
 {
     if rerank {
-        query_parallel(query_mat.nrows(), return_dist, verbose, |i| {
+        query_parallel_2(query_mat.nrows(), return_dist, verbose, |i| {
             index.query_row_reranking(query_mat.row(i), k, nprobe, rerank_factor)
         })
     } else {
-        query_parallel(query_mat.nrows(), return_dist, verbose, |i| {
+        query_parallel_2(query_mat.nrows(), return_dist, verbose, |i| {
             index.query_row(query_mat.row(i), k, nprobe)
         })
     }
@@ -2987,7 +2975,7 @@ pub fn query_ivf_index_rabitq_self<T>(
     rerank_factor: Option<usize>,
     return_dist: bool,
     verbose: bool,
-) -> (Vec<Vec<usize>>, Option<Vec<Vec<T>>>)
+) -> AnnSearchResult<T>
 where
     T: AnnSearchFloat + Pod,
 {
