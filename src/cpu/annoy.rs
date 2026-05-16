@@ -1,4 +1,5 @@
-//! Annoy implementation in ann-search-rs.
+//! Annoy implementation in ann-search-rs. This is an in-memory implementation
+//! of Annoy in Rust.
 
 use faer::{MatRef, RowRef};
 use fixedbitset::FixedBitSet;
@@ -96,6 +97,10 @@ pub struct AnnoyIndex<T> {
     original_ids: Vec<usize>,
 }
 
+////////////////////
+// VectorDistance //
+////////////////////
+
 impl<T> VectorDistance<T> for AnnoyIndex<T>
 where
     T: AnnSearchFloat,
@@ -112,6 +117,20 @@ where
         &self.norms
     }
 }
+
+/////////////////////////
+// DimensionValidation //
+/////////////////////////
+
+impl<T> DimensionValidation for AnnoyIndex<T> {
+    fn dim(&self) -> usize {
+        self.dim
+    }
+}
+
+/////////////////////////
+// Main implementation //
+/////////////////////////
 
 impl<T> AnnoyIndex<T>
 where
@@ -528,7 +547,9 @@ where
         query_vec: &[T],
         k: usize,
         search_k: Option<usize>,
-    ) -> (Vec<usize>, Vec<T>) {
+    ) -> Result<(Vec<usize>, Vec<T>), AnnSearchErrors> {
+        self.check_dim(query_vec.len())?;
+
         let limit = search_k.unwrap_or(k * self.n_trees * 20);
         let mut visited_count = 0;
 
@@ -633,14 +654,14 @@ where
         candidates
             .sort_unstable_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
 
-        candidates
+        Ok(candidates
             .into_iter()
             .map(|(dist, idx)| {
                 // remap
                 let original_idx = self.original_ids[idx];
                 (original_idx, dist)
             })
-            .unzip()
+            .unzip())
     }
 
     /// Query using a matrix row reference
@@ -664,7 +685,7 @@ where
         query_row: RowRef<T>,
         k: usize,
         search_k: Option<usize>,
-    ) -> (Vec<usize>, Vec<T>) {
+    ) -> Result<(Vec<usize>, Vec<T>), AnnSearchErrors> {
         if query_row.col_stride() == 1 {
             let slice =
                 unsafe { std::slice::from_raw_parts(query_row.as_ptr(), query_row.ncols()) };
@@ -697,7 +718,7 @@ where
         search_k: Option<usize>,
         return_dist: bool,
         verbose: bool,
-    ) -> (Vec<Vec<usize>>, Option<Vec<Vec<T>>>) {
+    ) -> AnnSearchOptionResult<T> {
         let counter = Arc::new(AtomicUsize::new(0));
 
         // collect unordered results, tagging them with their ORIGINAL id
@@ -722,10 +743,10 @@ where
                     }
                 }
 
-                let (indices, dists) = self.query(vec, k, search_k);
-                (orig_id, indices, dists)
+                let (indices, dists) = self.query(vec, k, search_k)?;
+                Ok((orig_id, indices, dists))
             })
-            .collect();
+            .collect::<Result<Vec<_>, AnnSearchErrors>>()?;
 
         // pre-allocate the final ordered arrays
         let mut final_indices = vec![Vec::new(); self.n];
@@ -743,7 +764,7 @@ where
             }
         }
 
-        (final_indices, final_dists)
+        Ok((final_indices, final_dists))
     }
 
     /// Returns the size of the index in bytes
@@ -771,13 +792,21 @@ impl<T> KnnValidation<T> for AnnoyIndex<T>
 where
     T: AnnSearchFloat,
 {
-    fn query_for_validation(&self, query_vec: &[T], k: usize) -> (Vec<usize>, Vec<T>) {
+    fn query_for_validation(
+        &self,
+        query_vec: &[T],
+        k: usize,
+    ) -> Result<(Vec<usize>, Vec<T>), AnnSearchErrors> {
         // Use the default here
         self.query(query_vec, k, None)
     }
 
     fn n(&self) -> usize {
         self.n
+    }
+
+    fn dim(&self) -> usize {
+        self.dim
     }
 
     fn metric(&self) -> Dist {
@@ -826,7 +855,7 @@ mod tests {
 
         // Query with point 0, should find itself first
         let query = vec![1.0, 0.0, 0.0];
-        let (indices, distances) = index.query(&query, 1, None);
+        let (indices, distances) = index.query(&query, 1, None).unwrap();
 
         assert_eq!(indices.len(), 1);
         assert_eq!(indices[0], 0);
@@ -839,7 +868,7 @@ mod tests {
         let index = AnnoyIndex::new(mat.as_ref(), 8, Dist::SquaredEuclidean, 42);
 
         let query = vec![1.0, 0.0, 0.0];
-        let (indices, distances) = index.query(&query, 3, None);
+        let (indices, distances) = index.query(&query, 3, None).unwrap();
 
         // Should find point 0 first (exact match)
         assert_eq!(indices[0], 0);
@@ -859,7 +888,7 @@ mod tests {
         let index = AnnoyIndex::new(mat.as_ref(), 8, Dist::Cosine, 42);
 
         let query = vec![1.0, 0.0, 0.0];
-        let (indices, distances) = index.query(&query, 3, None);
+        let (indices, distances) = index.query(&query, 3, None).unwrap();
 
         // Should find point 0 first (identical direction)
         assert_eq!(indices[0], 0);
@@ -875,7 +904,7 @@ mod tests {
 
         let query = vec![1.0, 0.0, 0.0];
         // ask for 10 neighbours but only 5 points exist
-        let (indices, _) = index.query(&query, 10, None);
+        let (indices, _) = index.query(&query, 10, None).unwrap();
 
         // Should return at most 5 results
         assert!(indices.len() <= 5);
@@ -891,8 +920,8 @@ mod tests {
         let query = vec![1.0, 0.0, 0.0];
 
         // With higher search_k, should get same or better results
-        let (indices1, _) = index.query(&query, 3, Some(10));
-        let (indices2, _) = index.query(&query, 3, Some(50));
+        let (indices1, _) = index.query(&query, 3, Some(10)).unwrap();
+        let (indices2, _) = index.query(&query, 3, Some(50)).unwrap();
 
         assert_eq!(indices1.len(), 3);
         assert_eq!(indices2.len(), 3);
@@ -907,8 +936,8 @@ mod tests {
         let index_many = AnnoyIndex::new(mat.as_ref(), 16, Dist::SquaredEuclidean, 42);
 
         let query = vec![0.9, 0.1, 0.0];
-        let (indices1, _) = index_few.query(&query, 3, None);
-        let (indices2, _) = index_many.query(&query, 3, None);
+        let (indices1, _) = index_few.query(&query, 3, None).unwrap();
+        let (indices2, _) = index_many.query(&query, 3, None).unwrap();
 
         assert_eq!(indices1.len(), 3);
         assert_eq!(indices2.len(), 3);
@@ -920,7 +949,7 @@ mod tests {
         let index = AnnoyIndex::new(mat.as_ref(), 8, Dist::SquaredEuclidean, 42);
 
         // Query using a row from the matrix
-        let (indices, distances) = index.query_row(mat.row(0), 1, None);
+        let (indices, distances) = index.query_row(mat.row(0), 1, None).unwrap();
 
         assert_eq!(indices[0], 0);
         assert_relative_eq!(distances[0], 0.0, epsilon = 1e-5);
@@ -935,8 +964,8 @@ mod tests {
         let index2 = AnnoyIndex::new(mat.as_ref(), 8, Dist::SquaredEuclidean, 42);
 
         let query = vec![0.5, 0.5, 0.0];
-        let (indices1, _) = index1.query(&query, 3, None);
-        let (indices2, _) = index2.query(&query, 3, None);
+        let (indices1, _) = index1.query(&query, 3, None).unwrap();
+        let (indices2, _) = index2.query(&query, 3, None).unwrap();
 
         assert_eq!(indices1, indices2);
     }
@@ -952,8 +981,8 @@ mod tests {
         let query = vec![0.5, 0.5, 0.0];
 
         // Both should still find reasonable neighbours (though order might differ)
-        let (indices1, _) = index1.query(&query, 3, None);
-        let (indices2, _) = index2.query(&query, 3, None);
+        let (indices1, _) = index1.query(&query, 3, None).unwrap();
+        let (indices2, _) = index2.query(&query, 3, None).unwrap();
 
         assert_eq!(indices1.len(), 3);
         assert_eq!(indices2.len(), 3);
@@ -977,7 +1006,7 @@ mod tests {
 
         // Query for point 0
         let query: Vec<f32> = (0..dim).map(|_| 0.0).collect();
-        let (indices, _) = index.query(&query, 5, None);
+        let (indices, _) = index.query(&query, 5, None).unwrap();
 
         assert_eq!(indices.len(), 5);
         assert_eq!(indices[0], 0); // Should find exact match
@@ -991,7 +1020,7 @@ mod tests {
         let index = AnnoyIndex::new(mat.as_ref(), 4, Dist::Cosine, 42);
 
         let query = vec![1.0, 0.0, 0.0];
-        let (indices, distances) = index.query(&query, 3, None);
+        let (indices, distances) = index.query(&query, 3, None).unwrap();
 
         // First result should be the parallel vector
         assert_eq!(indices[0], 0);
@@ -1012,7 +1041,7 @@ mod tests {
         let index = AnnoyIndex::new(mat.as_ref(), 32, Dist::SquaredEuclidean, 42);
 
         let query: Vec<f32> = (0..dim).map(|_| 0.0).collect();
-        let (indices, _) = index.query(&query, 3, None);
+        let (indices, _) = index.query(&query, 3, None).unwrap();
 
         assert_eq!(indices.len(), 3);
     }

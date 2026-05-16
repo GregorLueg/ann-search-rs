@@ -276,6 +276,20 @@ where
     }
 }
 
+/////////////////////////
+// DimensionValidation //
+/////////////////////////
+
+impl<T> DimensionValidation for BallTreeIndex<T> {
+    fn dim(&self) -> usize {
+        self.dim
+    }
+}
+
+/////////////////////////
+// Main implementation //
+/////////////////////////
+
 impl<T> BallTreeIndex<T>
 where
     T: AnnSearchFloat,
@@ -767,7 +781,9 @@ where
         query_vec: &[T],
         k: usize,
         search_k: Option<usize>,
-    ) -> (Vec<usize>, Vec<T>) {
+    ) -> Result<(Vec<usize>, Vec<T>), AnnSearchErrors> {
+        self.check_dim(query_vec.len())?;
+
         let limit = search_k.unwrap_or((self.n as f32 * 0.05) as usize);
         let mut visited_count = 0;
 
@@ -902,7 +918,7 @@ where
             .map(|(OrderedFloat(dist), idx)| (*idx, *dist))
             .collect();
 
-        results.into_iter().unzip()
+        Ok(results.into_iter().unzip())
     }
 
     /// Query the index with row references
@@ -925,7 +941,7 @@ where
         query_row: RowRef<T>,
         k: usize,
         search_k: Option<usize>,
-    ) -> (Vec<usize>, Vec<T>) {
+    ) -> Result<(Vec<usize>, Vec<T>), AnnSearchErrors> {
         if query_row.col_stride() == 1 {
             let slice =
                 unsafe { std::slice::from_raw_parts(query_row.as_ptr(), query_row.ncols()) };
@@ -955,7 +971,7 @@ where
         search_k: Option<usize>,
         return_dist: bool,
         verbose: bool,
-    ) -> (Vec<Vec<usize>>, Option<Vec<Vec<T>>>) {
+    ) -> AnnSearchOptionResult<T> {
         use std::sync::{
             atomic::{AtomicUsize, Ordering},
             Arc,
@@ -983,14 +999,14 @@ where
 
                 self.query(vec, k, search_k)
             })
-            .collect();
+            .collect::<Result<Vec<_>, AnnSearchErrors>>()?;
 
         if return_dist {
             let (indices, distances) = results.into_iter().unzip();
-            (indices, Some(distances))
+            Ok((indices, Some(distances)))
         } else {
             let indices: Vec<Vec<usize>> = results.into_iter().map(|(idx, _)| idx).collect();
-            (indices, None)
+            Ok((indices, None))
         }
     }
 
@@ -1019,12 +1035,20 @@ impl<T> KnnValidation<T> for BallTreeIndex<T>
 where
     T: AnnSearchFloat,
 {
-    fn query_for_validation(&self, query_vec: &[T], k: usize) -> (Vec<usize>, Vec<T>) {
+    fn query_for_validation(
+        &self,
+        query_vec: &[T],
+        k: usize,
+    ) -> Result<(Vec<usize>, Vec<T>), AnnSearchErrors> {
         self.query(query_vec, k, None)
     }
 
     fn n(&self) -> usize {
         self.n
+    }
+
+    fn dim(&self) -> usize {
+        self.dim
     }
 
     fn metric(&self) -> Dist {
@@ -1072,7 +1096,7 @@ mod tests {
         // Query with point 0, should find itself first
         let query = vec![1.0, 0.0, 0.0];
         // FIX: Pass explicit search_k (5) because default 5% of 5 is 0
-        let (indices, distances) = index.query(&query, 1, Some(5));
+        let (indices, distances) = index.query(&query, 1, Some(5)).unwrap();
 
         assert_eq!(indices.len(), 1);
         assert_eq!(indices[0], 0);
@@ -1086,7 +1110,7 @@ mod tests {
 
         let query = vec![1.0, 0.0, 0.0];
         // FIX: Pass explicit search_k
-        let (indices, distances) = index.query(&query, 3, Some(5));
+        let (indices, distances) = index.query(&query, 3, Some(5)).unwrap();
 
         // Should find point 0 first (exact match)
         assert_eq!(indices[0], 0);
@@ -1107,7 +1131,7 @@ mod tests {
 
         let query = vec![1.0, 0.0, 0.0];
         // FIX: Pass explicit search_k
-        let (indices, distances) = index.query(&query, 3, Some(5));
+        let (indices, distances) = index.query(&query, 3, Some(5)).unwrap();
 
         // Should find point 0 first (identical direction)
         assert_eq!(indices[0], 0);
@@ -1124,7 +1148,7 @@ mod tests {
         let query = vec![1.0, 0.0, 0.0];
         // ask for 10 neighbours but only 5 points exist
         // FIX: Pass explicit search_k
-        let (indices, _) = index.query(&query, 10, Some(5));
+        let (indices, _) = index.query(&query, 10, Some(5)).unwrap();
 
         // Should return at most 5 results
         assert!(indices.len() <= 5);
@@ -1140,8 +1164,8 @@ mod tests {
         let query = vec![1.0, 0.0, 0.0];
 
         // This test was actually passing before because we set Some(10) and Some(1)
-        let (indices1, _) = index.query(&query, 3, Some(10));
-        let (indices2, _) = index.query(&query, 3, Some(1));
+        let (indices1, _) = index.query(&query, 3, Some(10)).unwrap();
+        let (indices2, _) = index.query(&query, 3, Some(1)).unwrap();
 
         assert_eq!(indices1.len(), 3);
         assert!(!indices2.is_empty());
@@ -1154,7 +1178,7 @@ mod tests {
 
         // Query using a row from the matrix
         // FIX: Pass explicit search_k
-        let (indices, distances) = index.query_row(mat.row(0), 1, Some(5));
+        let (indices, distances) = index.query_row(mat.row(0), 1, Some(5)).unwrap();
 
         assert_eq!(indices[0], 0);
         assert_relative_eq!(distances[0], 0.0, epsilon = 1e-5);
@@ -1169,8 +1193,8 @@ mod tests {
 
         let query = vec![0.5, 0.5, 0.0];
         // FIX: Pass explicit search_k
-        let (indices1, _) = index1.query(&query, 3, Some(5));
-        let (indices2, _) = index2.query(&query, 3, Some(5));
+        let (indices1, _) = index1.query(&query, 3, Some(5)).unwrap();
+        let (indices2, _) = index2.query(&query, 3, Some(5)).unwrap();
 
         assert_eq!(indices1, indices2);
     }
@@ -1185,8 +1209,8 @@ mod tests {
         let query = vec![0.5, 0.5, 0.0];
 
         // FIX: Pass explicit search_k
-        let (indices1, _) = index1.query(&query, 3, Some(5));
-        let (indices2, _) = index2.query(&query, 3, Some(5));
+        let (indices1, _) = index1.query(&query, 3, Some(5)).unwrap();
+        let (indices2, _) = index2.query(&query, 3, Some(5)).unwrap();
 
         assert_eq!(indices1.len(), 3);
         assert_eq!(indices2.len(), 3);
@@ -1211,7 +1235,7 @@ mod tests {
         let index = BallTreeIndex::new(mat.as_ref(), Dist::SquaredEuclidean, 42);
 
         let query: Vec<f32> = (0..dim).map(|_| 0.0).collect();
-        let (indices, _) = index.query(&query, 5, None);
+        let (indices, _) = index.query(&query, 5, None).unwrap();
 
         assert_eq!(indices.len(), 5);
         assert_eq!(indices[0], 0);
@@ -1226,7 +1250,7 @@ mod tests {
 
         let query = vec![1.0, 0.0, 0.0];
         // FIX: Pass explicit search_k
-        let (indices, distances) = index.query(&query, 3, Some(3));
+        let (indices, distances) = index.query(&query, 3, Some(3)).unwrap();
 
         assert_eq!(indices[0], 0);
         assert_relative_eq!(distances[0], 0.0, epsilon = 1e-5);
@@ -1244,7 +1268,7 @@ mod tests {
         let index = BallTreeIndex::new(mat.as_ref(), Dist::SquaredEuclidean, 42);
 
         let query: Vec<f32> = (0..dim).map(|_| 0.0).collect();
-        let (indices, _) = index.query(&query, 3, None); // 5% of 50 is 2.5 -> 2. Safe-ish.
+        let (indices, _) = index.query(&query, 3, None).unwrap(); // 5% of 50 is 2.5 -> 2. Safe-ish.
 
         assert_eq!(indices.len(), 3);
     }

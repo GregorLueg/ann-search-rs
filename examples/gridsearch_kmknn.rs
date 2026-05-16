@@ -35,7 +35,7 @@ fn main() {
     println!("Querying exhaustive index...");
     let start = Instant::now();
     let (true_neighbors, true_distances) =
-        query_exhaustive_index(query_data.as_ref(), &exhaustive_idx, cli.k, true, false);
+        query_exhaustive_index(query_data.as_ref(), &exhaustive_idx, cli.k, true, false).unwrap();
     let query_time = start.elapsed().as_secs_f64() * 1000.0;
 
     results.push(BenchmarkResultSize {
@@ -52,7 +52,7 @@ fn main() {
     println!("Self-querying exhaustive index...");
     let start = Instant::now();
     let (true_neighbors_self, true_distances_self) =
-        query_exhaustive_self(&exhaustive_idx, cli.k, true, false);
+        query_exhaustive_self(&exhaustive_idx, cli.k, true, false).unwrap();
     let self_query_time = start.elapsed().as_secs_f64() * 1000.0;
 
     results.push(BenchmarkResultSize {
@@ -92,7 +92,7 @@ fn main() {
         println!("Querying kMkNN index (nlist={})...", nlist);
         let start = Instant::now();
         let (exact_neighbors, exact_distances) =
-            query_kmknn_index(query_data.as_ref(), &kmknn_idx, cli.k, true, false);
+            query_kmknn_index(query_data.as_ref(), &kmknn_idx, cli.k, true, false).unwrap();
         let query_time = start.elapsed().as_secs_f64() * 1000.0;
 
         // Recall should be 1.0 since kMkNN is exact; compute anyway as a
@@ -118,7 +118,7 @@ fn main() {
         println!("Self-querying kMkNN index (nlist={})...", nlist);
         let start = Instant::now();
         let (exact_neighbors_self, exact_distances_self) =
-            query_kmknn_self(&kmknn_idx, cli.k, true, false);
+            query_kmknn_self(&kmknn_idx, cli.k, true, false).unwrap();
         let self_query_time = start.elapsed().as_secs_f64() * 1000.0;
 
         let recall_self = calculate_recall(&true_neighbors_self, &exact_neighbors_self, cli.k);

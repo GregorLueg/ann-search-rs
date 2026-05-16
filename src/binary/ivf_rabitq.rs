@@ -600,7 +600,7 @@ where
         rerank_factor: Option<usize>,
         return_dist: bool,
         verbose: bool,
-    ) -> AnnSearchResult<T> {
+    ) -> AnnSearchOptionResult<T> {
         let vector_store = self
             .vector_store
             .as_ref()

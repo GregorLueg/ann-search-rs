@@ -767,7 +767,7 @@ where
         rerank_factor: Option<usize>,
         return_dist: bool,
         verbose: bool,
-    ) -> AnnSearchResult<T> {
+    ) -> AnnSearchOptionResult<T> {
         let counter = Arc::new(AtomicUsize::new(0));
 
         if let Some(vector_store) = &self.vector_store {

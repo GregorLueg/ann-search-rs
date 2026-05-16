@@ -35,7 +35,7 @@ fn main() {
     println!("Querying exhaustive index...");
     let start = Instant::now();
     let (true_neighbours, _) =
-        query_exhaustive_index(query_data.as_ref(), &exhaustive_idx, cli.k, false, false);
+        query_exhaustive_index(query_data.as_ref(), &exhaustive_idx, cli.k, false, false).unwrap();
     let query_time = start.elapsed().as_secs_f64() * 1000.0;
 
     results.push(BenchmarkResultSize {
@@ -51,7 +51,8 @@ fn main() {
     // Exhaustive self-query benchmark
     println!("Self-querying exhaustive index...");
     let start = Instant::now();
-    let (true_neighbours_self, _) = query_exhaustive_self(&exhaustive_idx, cli.k, false, false);
+    let (true_neighbours_self, _) =
+        query_exhaustive_self(&exhaustive_idx, cli.k, false, false).unwrap();
     let self_query_time = start.elapsed().as_secs_f64() * 1000.0;
 
     results.push(BenchmarkResultSize {

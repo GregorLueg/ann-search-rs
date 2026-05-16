@@ -35,7 +35,7 @@ fn main() {
     println!("Querying CPU exhaustive index...");
     let start = Instant::now();
     let (true_neighbors, true_distances) =
-        query_exhaustive_index(query_data.as_ref(), &exhaustive_idx, cli.k, true, false);
+        query_exhaustive_index(query_data.as_ref(), &exhaustive_idx, cli.k, true, false).unwrap();
     let query_time = start.elapsed().as_secs_f64() * 1000.0;
 
     results.push(BenchmarkResultSize {
@@ -52,7 +52,7 @@ fn main() {
     println!("Self-querying CPU exhaustive index...");
     let start = Instant::now();
     let (true_neighbors_self, true_distances_self) =
-        query_exhaustive_self(&exhaustive_idx, cli.k, true, false);
+        query_exhaustive_self(&exhaustive_idx, cli.k, true, false).unwrap();
     let self_query_time = start.elapsed().as_secs_f64() * 1000.0;
 
     results.push(BenchmarkResultSize {
@@ -83,7 +83,8 @@ fn main() {
     println!("Querying GPU exhaustive index (WGPU)...");
     let start = Instant::now();
     let (gpu_neighbors, gpu_distances) =
-        query_exhaustive_index_gpu(query_data.as_ref(), &gpu_exhaustive_idx, cli.k, true, false);
+        query_exhaustive_index_gpu(query_data.as_ref(), &gpu_exhaustive_idx, cli.k, true, false)
+            .unwrap();
     let query_time = start.elapsed().as_secs_f64() * 1000.0;
 
     let recall = calculate_recall(&true_neighbors, &gpu_neighbors, cli.k);
@@ -106,7 +107,7 @@ fn main() {
     println!("Self-querying GPU exhaustive index (WGPU)...");
     let start = Instant::now();
     let (gpu_neighbors_self, gpu_distances_self) =
-        query_exhaustive_index_gpu_self(&gpu_exhaustive_idx, cli.k, true, false);
+        query_exhaustive_index_gpu_self(&gpu_exhaustive_idx, cli.k, true, false).unwrap();
     let self_query_time = start.elapsed().as_secs_f64() * 1000.0;
 
     let recall_self = calculate_recall(&true_neighbors_self, &gpu_neighbors_self, cli.k);
@@ -180,7 +181,8 @@ fn main() {
                 None,
                 true,
                 false,
-            );
+            )
+            .unwrap();
             let query_time = start.elapsed().as_secs_f64() * 1000.0;
 
             let recall = calculate_recall(&true_neighbors, &knn_neighbors, cli.k);
@@ -207,7 +209,8 @@ fn main() {
 
         let start = Instant::now();
         let (knn_neighbors_self, knn_distances_self) =
-            query_ivf_index_gpu_self(&ivf_gpu_idx, cli.k, Some(nprobe_self), None, true, false);
+            query_ivf_index_gpu_self(&ivf_gpu_idx, cli.k, Some(nprobe_self), None, true, false)
+                .unwrap();
         let self_query_time = start.elapsed().as_secs_f64() * 1000.0;
 
         let recall_self = calculate_recall(&true_neighbors_self, &knn_neighbors_self, cli.k);

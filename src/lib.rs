@@ -139,7 +139,7 @@ fn query_parallel_2<T, F>(
     return_dist: bool,
     verbose: bool,
     query_fn: F,
-) -> AnnSearchResult<T>
+) -> AnnSearchOptionResult<T>
 where
     T: Send,
     F: Fn(usize) -> Result<(Vec<usize>, Vec<T>), AnnSearchErrors> + Sync,
@@ -193,22 +193,22 @@ where
 /// than 1% of queries return true flags, a warning is printed. Used primarily
 /// for LSH queries where the flag indicates samples not represented in hash
 /// buckets.
-fn query_parallel_with_flags<T, F>(
+fn query_parallel_with_flags_2<T, F>(
     n_samples: usize,
     return_dist: bool,
     verbose: bool,
     query_fn: F,
-) -> (Vec<Vec<usize>>, Option<Vec<Vec<T>>>)
+) -> AnnSearchOptionResult<T>
 where
     T: Send,
-    F: Fn(usize) -> (Vec<usize>, Vec<T>, bool) + Sync,
+    F: Fn(usize) -> Result<(Vec<usize>, Vec<T>, bool), AnnSearchErrors> + Sync,
 {
     let counter = Arc::new(AtomicUsize::new(0));
 
     let results: Vec<(Vec<usize>, Vec<T>, bool)> = (0..n_samples)
         .into_par_iter()
         .map(|i| {
-            let result = query_fn(i);
+            let result = query_fn(i)?;
             if verbose {
                 let count = counter.fetch_add(1, Ordering::Relaxed) + 1;
                 if count.is_multiple_of(100_000) {
@@ -219,9 +219,9 @@ where
                     );
                 }
             }
-            result
+            Ok(result)
         })
-        .collect();
+        .collect::<Result<Vec<_>, AnnSearchErrors>>()?;
 
     let mut random: usize = 0;
     let mut indices: Vec<Vec<usize>> = Vec::with_capacity(results.len());
@@ -241,9 +241,9 @@ where
     }
 
     if return_dist {
-        (indices, Some(distances))
+        Ok((indices, Some(distances)))
     } else {
-        (indices, None)
+        Ok((indices, None))
     }
 }
 
@@ -288,11 +288,11 @@ pub fn query_exhaustive_index<T>(
     k: usize,
     return_dist: bool,
     verbose: bool,
-) -> (Vec<Vec<usize>>, Option<Vec<Vec<T>>>)
+) -> AnnSearchOptionResult<T>
 where
     T: AnnSearchFloat,
 {
-    query_parallel(query_mat.nrows(), return_dist, verbose, |i| {
+    query_parallel_2(query_mat.nrows(), return_dist, verbose, |i| {
         index.query_row(query_mat.row(i), k)
     })
 }
@@ -316,7 +316,7 @@ pub fn query_exhaustive_self<T>(
     k: usize,
     return_dist: bool,
     verbose: bool,
-) -> (Vec<Vec<usize>>, Option<Vec<Vec<T>>>)
+) -> AnnSearchOptionResult<T>
 where
     T: AnnSearchFloat,
 {
@@ -377,11 +377,11 @@ pub fn query_kmknn_index<T>(
     k: usize,
     return_dist: bool,
     verbose: bool,
-) -> (Vec<Vec<usize>>, Option<Vec<Vec<T>>>)
+) -> AnnSearchOptionResult<T>
 where
     T: AnnSearchFloat,
 {
-    query_parallel(query_mat.nrows(), return_dist, verbose, |i| {
+    query_parallel_2(query_mat.nrows(), return_dist, verbose, |i| {
         index.query_row(query_mat.row(i), k)
     })
 }
@@ -405,7 +405,7 @@ pub fn query_kmknn_self<T>(
     k: usize,
     return_dist: bool,
     verbose: bool,
-) -> (Vec<Vec<usize>>, Option<Vec<Vec<T>>>)
+) -> AnnSearchOptionResult<T>
 where
     T: AnnSearchFloat,
 {
@@ -464,11 +464,11 @@ pub fn query_annoy_index<T>(
     search_budget: Option<usize>,
     return_dist: bool,
     verbose: bool,
-) -> (Vec<Vec<usize>>, Option<Vec<Vec<T>>>)
+) -> AnnSearchOptionResult<T>
 where
     T: AnnSearchFloat,
 {
-    query_parallel(query_mat.nrows(), return_dist, verbose, |i| {
+    query_parallel_2(query_mat.nrows(), return_dist, verbose, |i| {
         index.query_row(query_mat.row(i), k, search_budget)
     })
 }
@@ -495,7 +495,7 @@ pub fn query_annoy_self<T>(
     search_budget: Option<usize>,
     return_dist: bool,
     verbose: bool,
-) -> (Vec<Vec<usize>>, Option<Vec<Vec<T>>>)
+) -> AnnSearchOptionResult<T>
 where
     T: AnnSearchFloat,
 {
@@ -548,11 +548,11 @@ pub fn query_balltree_index<T>(
     search_budget: Option<usize>,
     return_dist: bool,
     verbose: bool,
-) -> (Vec<Vec<usize>>, Option<Vec<Vec<T>>>)
+) -> AnnSearchOptionResult<T>
 where
     T: AnnSearchFloat,
 {
-    query_parallel(query_mat.nrows(), return_dist, verbose, |i| {
+    query_parallel_2(query_mat.nrows(), return_dist, verbose, |i| {
         index.query_row(query_mat.row(i), k, search_budget)
     })
 }
@@ -579,7 +579,7 @@ pub fn query_balltree_self<T>(
     search_budget: Option<usize>,
     return_dist: bool,
     verbose: bool,
-) -> (Vec<Vec<usize>>, Option<Vec<Vec<T>>>)
+) -> AnnSearchOptionResult<T>
 where
     T: AnnSearchFloat,
 {
@@ -648,12 +648,12 @@ pub fn query_hnsw_index<T>(
     ef_search: usize,
     return_dist: bool,
     verbose: bool,
-) -> (Vec<Vec<usize>>, Option<Vec<Vec<T>>>)
+) -> AnnSearchOptionResult<T>
 where
     T: AnnSearchFloat,
     HnswIndex<T>: HnswState<T>,
 {
-    query_parallel(query_mat.nrows(), return_dist, verbose, |i| {
+    query_parallel_2(query_mat.nrows(), return_dist, verbose, |i| {
         index.query_row(query_mat.row(i), k, ef_search)
     })
 }
@@ -682,7 +682,7 @@ pub fn query_hnsw_self<T>(
     ef_search: usize,
     return_dist: bool,
     verbose: bool,
-) -> (Vec<Vec<usize>>, Option<Vec<Vec<T>>>)
+) -> AnnSearchOptionResult<T>
 where
     T: AnnSearchFloat,
     HnswIndex<T>: HnswState<T>,
@@ -756,11 +756,11 @@ pub fn query_ivf_index<T>(
     nprobe: Option<usize>,
     return_dist: bool,
     verbose: bool,
-) -> (Vec<Vec<usize>>, Option<Vec<Vec<T>>>)
+) -> AnnSearchOptionResult<T>
 where
     T: AnnSearchFloat,
 {
-    query_parallel(query_mat.nrows(), return_dist, verbose, |i| {
+    query_parallel_2(query_mat.nrows(), return_dist, verbose, |i| {
         index.query_row(query_mat.row(i), k, nprobe)
     })
 }
@@ -796,7 +796,7 @@ pub fn query_ivf_self<T>(
     nprobe: Option<usize>,
     return_dist: bool,
     verbose: bool,
-) -> (Vec<Vec<usize>>, Option<Vec<Vec<T>>>)
+) -> AnnSearchOptionResult<T>
 where
     T: AnnSearchFloat,
 {
@@ -858,11 +858,11 @@ pub fn query_kd_tree_index<T>(
     search_budget: Option<usize>,
     return_dist: bool,
     verbose: bool,
-) -> (Vec<Vec<usize>>, Option<Vec<Vec<T>>>)
+) -> AnnSearchOptionResult<T>
 where
     T: AnnSearchFloat,
 {
-    query_parallel(query_mat.nrows(), return_dist, verbose, |i| {
+    query_parallel_2(query_mat.nrows(), return_dist, verbose, |i| {
         index.query_row(query_mat.row(i), k, search_budget)
     })
 }
@@ -889,7 +889,7 @@ pub fn query_kd_tree_self<T>(
     search_budget: Option<usize>,
     return_dist: bool,
     verbose: bool,
-) -> (Vec<Vec<usize>>, Option<Vec<Vec<T>>>)
+) -> AnnSearchOptionResult<T>
 where
     T: AnnSearchFloat,
 {
@@ -956,11 +956,11 @@ pub fn query_lsh_index<T>(
     max_candidates: Option<usize>,
     return_dist: bool,
     verbose: bool,
-) -> (Vec<Vec<usize>>, Option<Vec<Vec<T>>>)
+) -> AnnSearchOptionResult<T>
 where
     T: AnnSearchFloat,
 {
-    query_parallel_with_flags(query_mat.nrows(), return_dist, verbose, |i| {
+    query_parallel_with_flags_2(query_mat.nrows(), return_dist, verbose, |i| {
         index.query_row(query_mat.row(i), k, max_candidates, n_probe)
     })
 }
@@ -989,13 +989,13 @@ pub fn query_lsh_self<T>(
     max_candidates: Option<usize>,
     return_dist: bool,
     verbose: bool,
-) -> (Vec<Vec<usize>>, Option<Vec<Vec<T>>>)
+) -> AnnSearchOptionResult<T>
 where
     T: AnnSearchFloat,
 {
     let n_probe = n_probe.unwrap_or(index.num_bits() / 2);
 
-    index.generate_knn(k, max_candidates, n_probe, return_dist, verbose)
+    Ok(index.generate_knn(k, max_candidates, n_probe, return_dist, verbose))
 }
 
 ///////////////
@@ -1034,7 +1034,7 @@ pub fn build_nndescent_index<T>(
     n_tree: Option<usize>,
     seed: usize,
     verbose: bool,
-) -> NNDescent<T>
+) -> Result<NNDescent<T>, AnnSearchErrors>
 where
     T: AnnSearchFloat,
     NNDescent<T>: ApplySortedUpdates<T>,
@@ -1082,13 +1082,13 @@ pub fn query_nndescent_index<T>(
     ef_search: Option<usize>,
     return_dist: bool,
     verbose: bool,
-) -> (Vec<Vec<usize>>, Option<Vec<Vec<T>>>)
+) -> AnnSearchOptionResult<T>
 where
     T: AnnSearchFloat,
     NNDescent<T>: ApplySortedUpdates<T>,
     NNDescent<T>: NNDescentQuery<T>,
 {
-    query_parallel(query_mat.nrows(), return_dist, verbose, |i| {
+    query_parallel_2(query_mat.nrows(), return_dist, verbose, |i| {
         index.query_row(query_mat.row(i), k, ef_search)
     })
 }
@@ -1120,7 +1120,7 @@ pub fn query_nndescent_self<T>(
     ef_search: Option<usize>,
     return_dist: bool,
     verbose: bool,
-) -> (Vec<Vec<usize>>, Option<Vec<Vec<T>>>)
+) -> AnnSearchOptionResult<T>
 where
     T: AnnSearchFloat,
     NNDescent<T>: ApplySortedUpdates<T>,
@@ -1187,12 +1187,12 @@ pub fn query_vamana_index<T>(
     ef_search: Option<usize>,
     return_dist: bool,
     verbose: bool,
-) -> (Vec<Vec<usize>>, Option<Vec<Vec<T>>>)
+) -> AnnSearchOptionResult<T>
 where
     T: AnnSearchFloat,
     VamanaIndex<T>: VamanaState<T>,
 {
-    query_parallel(query_mat.nrows(), return_dist, verbose, |i| {
+    query_parallel_2(query_mat.nrows(), return_dist, verbose, |i| {
         index.query_row(query_mat.row(i), k, ef_search)
     })
 }
@@ -1216,7 +1216,7 @@ pub fn query_vamana_self<T>(
     ef_search: Option<usize>,
     return_dist: bool,
     verbose: bool,
-) -> (Vec<Vec<usize>>, Option<Vec<Vec<T>>>)
+) -> AnnSearchOptionResult<T>
 where
     T: AnnSearchFloat,
     VamanaIndex<T>: VamanaState<T>,
@@ -2093,17 +2093,17 @@ pub fn query_exhaustive_index_gpu<T, R>(
     k: usize,
     return_dist: bool,
     verbose: bool,
-) -> (Vec<Vec<usize>>, Option<Vec<Vec<T>>>)
+) -> AnnSearchOptionResult<T>
 where
     T: AnnSearchGpuFloat + AnnSearchFloat,
     R: Runtime,
 {
-    let (indices, distances) = index.query_batch(query_mat, k, verbose);
+    let (indices, distances) = index.query_batch(query_mat, k, verbose)?;
 
     if return_dist {
-        (indices, Some(distances))
+        Ok((indices, Some(distances)))
     } else {
-        (indices, None)
+        Ok((indices, None))
     }
 }
 
@@ -2127,12 +2127,12 @@ pub fn query_exhaustive_index_gpu_self<T, R>(
     k: usize,
     return_dist: bool,
     verbose: bool,
-) -> (Vec<Vec<usize>>, Option<Vec<Vec<T>>>)
+) -> AnnSearchOptionResult<T>
 where
     T: AnnSearchGpuFloat + AnnSearchFloat,
     R: Runtime,
 {
-    index.generate_knn(k, return_dist, verbose)
+    Ok(index.generate_knn(k, return_dist, verbose))
 }
 
 //////////////
@@ -2194,17 +2194,17 @@ pub fn query_ivf_index_gpu<T, R>(
     nquery: Option<usize>,
     return_dist: bool,
     verbose: bool,
-) -> (Vec<Vec<usize>>, Option<Vec<Vec<T>>>)
+) -> AnnSearchOptionResult<T>
 where
     R: Runtime,
     T: AnnSearchFloat + AnnSearchGpuFloat,
 {
-    let (indices, distances) = index.query_batch(query_mat, k, nprobe, nquery, verbose);
+    let (indices, distances) = index.query_batch(query_mat, k, nprobe, nquery, verbose)?;
 
     if return_dist {
-        (indices, Some(distances))
+        Ok((indices, Some(distances)))
     } else {
-        (indices, None)
+        Ok((indices, None))
     }
 }
 
@@ -2233,7 +2233,7 @@ pub fn query_ivf_index_gpu_self<T, R>(
     nquery: Option<usize>,
     return_dist: bool,
     verbose: bool,
-) -> (Vec<Vec<usize>>, Option<Vec<Vec<T>>>)
+) -> AnnSearchOptionResult<T>
 where
     R: Runtime,
     T: AnnSearchFloat + AnnSearchGpuFloat,
@@ -2314,7 +2314,7 @@ pub fn query_nndescent_index_gpu<T, R>(
     query_params: Option<CagraGpuSearchParams>,
     return_dist: bool,
     verbose: bool,
-) -> (Vec<Vec<usize>>, Option<Vec<Vec<T>>>)
+) -> AnnSearchOptionResult<T>
 where
     R: Runtime,
     T: AnnSearchFloat + AnnSearchGpuFloat,
@@ -2342,12 +2342,12 @@ where
             .collect();
 
         let (indices, distances) =
-            index.query_batch_gpu(&queries_flat, n_queries, query_params, k, 42);
+            index.query_batch_gpu(&queries_flat, n_queries, query_params, k, 42)?;
 
         if return_dist {
-            (indices, Some(distances))
+            Ok((indices, Some(distances)))
         } else {
-            (indices, None)
+            Ok((indices, None))
         }
     } else {
         if verbose {
@@ -2363,14 +2363,14 @@ where
                 let row = query_mat.row(i);
                 index.query_row(row, k, ef_search)
             })
-            .collect();
+            .collect::<Result<Vec<_>, _>>()?;
 
         if return_dist {
             let (indices, distances) = results.into_iter().unzip();
-            (indices, Some(distances))
+            Ok((indices, Some(distances)))
         } else {
             let indices = results.into_iter().map(|(idx, _)| idx).collect();
-            (indices, None)
+            Ok((indices, None))
         }
     }
 }
@@ -2513,7 +2513,7 @@ pub fn query_exhaustive_index_binary<T>(
     rerank_factor: Option<usize>,
     return_dist: bool,
     verbose: bool,
-) -> AnnSearchResult<T>
+) -> AnnSearchOptionResult<T>
 where
     T: AnnSearchFloat + Pod,
 {
@@ -2570,7 +2570,7 @@ pub fn query_exhaustive_index_binary_self<T>(
     rerank_factor: Option<usize>,
     return_dist: bool,
     verbose: bool,
-) -> AnnSearchResult<T>
+) -> AnnSearchOptionResult<T>
 where
     T: AnnSearchFloat + Pod,
 {
@@ -2678,7 +2678,7 @@ pub fn query_ivf_index_binary<T>(
     rerank_factor: Option<usize>,
     return_dist: bool,
     verbose: bool,
-) -> AnnSearchResult<T>
+) -> AnnSearchOptionResult<T>
 where
     T: AnnSearchFloat + Pod,
 {
@@ -2732,7 +2732,7 @@ pub fn query_ivf_index_binary_self<T>(
     rerank_factor: Option<usize>,
     return_dist: bool,
     verbose: bool,
-) -> AnnSearchResult<T>
+) -> AnnSearchOptionResult<T>
 where
     T: AnnSearchFloat + Pod,
 {
@@ -2806,7 +2806,7 @@ pub fn query_exhaustive_index_rabitq<T>(
     rerank_factor: Option<usize>,
     return_dist: bool,
     verbose: bool,
-) -> AnnSearchResult<T>
+) -> AnnSearchOptionResult<T>
 where
     T: AnnSearchFloat + Pod,
 {
@@ -2846,7 +2846,7 @@ pub fn query_exhaustive_index_rabitq_self<T>(
     rerank_factor: Option<usize>,
     return_dist: bool,
     verbose: bool,
-) -> AnnSearchResult<T>
+) -> AnnSearchOptionResult<T>
 where
     T: AnnSearchFloat + Pod,
 {
@@ -2935,7 +2935,7 @@ pub fn query_ivf_index_rabitq<T>(
     rerank_factor: Option<usize>,
     return_dist: bool,
     verbose: bool,
-) -> AnnSearchResult<T>
+) -> AnnSearchOptionResult<T>
 where
     T: AnnSearchFloat + Pod,
 {
@@ -2975,7 +2975,7 @@ pub fn query_ivf_index_rabitq_self<T>(
     rerank_factor: Option<usize>,
     return_dist: bool,
     verbose: bool,
-) -> AnnSearchResult<T>
+) -> AnnSearchOptionResult<T>
 where
     T: AnnSearchFloat + Pod,
 {

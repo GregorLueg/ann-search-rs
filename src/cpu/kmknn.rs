@@ -104,6 +104,16 @@ where
     }
 }
 
+/////////////////////////
+// DimensionValidation //
+/////////////////////////
+
+impl<T> DimensionValidation for KmknnIndex<T> {
+    fn dim(&self) -> usize {
+        self.dim
+    }
+}
+
 ////////////////
 // Main index //
 ////////////////
@@ -353,18 +363,19 @@ where
     /// Tuple of `(indices, distances)` sorted nearest-first. Euclidean mode
     /// returns squared distances; Cosine mode returns Cosine distance.
     #[inline]
-    pub fn query(&self, query_vec: &[T], k: usize) -> (Vec<usize>, Vec<T>) {
-        assert!(
-            query_vec.len() == self.dim,
-            "The query vector has different dimensionality than the index"
-        );
+    pub fn query(
+        &self,
+        query_vec: &[T],
+        k: usize,
+    ) -> Result<(Vec<usize>, Vec<T>), AnnSearchErrors> {
+        self.check_dim(query_vec.len())?;
 
         if self.metric == Dist::Cosine {
             let mut q = query_vec.to_vec();
             normalise_vector(&mut q);
-            self.query_internal(&q, k)
+            Ok(self.query_internal(&q, k))
         } else {
-            self.query_internal(query_vec, k)
+            Ok(self.query_internal(query_vec, k))
         }
     }
 
@@ -372,12 +383,11 @@ where
     ///
     /// Fast path for contiguous rows (stride == 1); otherwise clones.
     #[inline]
-    pub fn query_row(&self, query_row: RowRef<T>, k: usize) -> (Vec<usize>, Vec<T>) {
-        assert!(
-            query_row.ncols() == self.dim,
-            "The query row has different dimensionality than the index"
-        );
-
+    pub fn query_row(
+        &self,
+        query_row: RowRef<T>,
+        k: usize,
+    ) -> Result<(Vec<usize>, Vec<T>), AnnSearchErrors> {
         if query_row.col_stride() == 1 {
             let slice =
                 unsafe { std::slice::from_raw_parts(query_row.as_ptr(), query_row.ncols()) };
@@ -404,7 +414,7 @@ where
         k: usize,
         return_dist: bool,
         verbose: bool,
-    ) -> (Vec<Vec<usize>>, Option<Vec<Vec<T>>>) {
+    ) -> AnnSearchOptionResult<T> {
         let counter = Arc::new(AtomicUsize::new(0));
 
         let unordered_results: Vec<(usize, Vec<usize>, Vec<T>)> = (0..self.n)
@@ -447,7 +457,7 @@ where
             }
         }
 
-        (final_indices, final_dists)
+        Ok((final_indices, final_dists))
     }
 
     /// Returns the size of the index in bytes
@@ -470,12 +480,20 @@ impl<T> KnnValidation<T> for KmknnIndex<T>
 where
     T: AnnSearchFloat,
 {
-    fn query_for_validation(&self, query_vec: &[T], k: usize) -> (Vec<usize>, Vec<T>) {
+    fn query_for_validation(
+        &self,
+        query_vec: &[T],
+        k: usize,
+    ) -> Result<(Vec<usize>, Vec<T>), AnnSearchErrors> {
         self.query(query_vec, k)
     }
 
     fn n(&self) -> usize {
         self.n
+    }
+
+    fn dim(&self) -> usize {
+        self.dim
     }
 
     fn metric(&self) -> Dist {
@@ -531,7 +549,7 @@ mod tests {
         );
 
         let query = vec![1.0, 0.0, 0.0];
-        let (indices, distances) = index.query(&query, 1);
+        let (indices, distances) = index.query(&query, 1).unwrap();
 
         assert_eq!(indices[0], 0);
         assert_relative_eq!(distances[0], 0.0, epsilon = 1e-5);
@@ -543,7 +561,7 @@ mod tests {
         let index = KmknnIndex::build(data.as_ref(), Dist::Cosine, Some(2), None, 42, false);
 
         let query = vec![1.0, 0.0, 0.0];
-        let (indices, distances) = index.query(&query, 1);
+        let (indices, distances) = index.query(&query, 1).unwrap();
 
         assert_eq!(indices[0], 0);
         assert_relative_eq!(distances[0], 0.0, epsilon = 1e-5);
@@ -562,7 +580,7 @@ mod tests {
         );
 
         let query = vec![1.0, 0.0, 0.0];
-        let (_, distances) = index.query(&query, 5);
+        let (_, distances) = index.query(&query, 5).unwrap();
 
         for i in 1..distances.len() {
             assert!(distances[i] >= distances[i - 1]);
@@ -582,7 +600,7 @@ mod tests {
         );
 
         let query = vec![1.0, 0.0, 0.0];
-        let (indices, _) = index.query(&query, 10);
+        let (indices, _) = index.query(&query, 10).unwrap();
 
         assert_eq!(indices.len(), 5);
     }
@@ -593,7 +611,7 @@ mod tests {
         let index = KmknnIndex::build(data.as_ref(), Dist::Cosine, Some(3), None, 42, false);
 
         let query = vec![1.0, 0.0, 0.0];
-        let (indices, distances) = index.query(&query, 3);
+        let (indices, distances) = index.query(&query, 3).unwrap();
 
         assert_eq!(indices[0], 0);
         assert_relative_eq!(distances[0], 0.0, epsilon = 1e-5);
@@ -623,8 +641,8 @@ mod tests {
         );
 
         let query = vec![0.5, 0.5, 0.0];
-        let (i1, _) = idx1.query(&query, 3);
-        let (i2, _) = idx2.query(&query, 3);
+        let (i1, _) = idx1.query(&query, 3).unwrap();
+        let (i2, _) = idx2.query(&query, 3).unwrap();
         assert_eq!(i1, i2);
     }
 
@@ -640,7 +658,7 @@ mod tests {
             false,
         );
 
-        let (indices, distances) = index.query_row(data.row(0), 1);
+        let (indices, distances) = index.query_row(data.row(0), 1).unwrap();
         assert_eq!(indices[0], 0);
         assert_relative_eq!(distances[0], 0.0, epsilon = 1e-5);
     }
@@ -660,7 +678,7 @@ mod tests {
             false,
         );
         let query: Vec<f32> = (0..dim).map(|_| 0.0).collect();
-        let (indices, _) = index.query(&query, 5);
+        let (indices, _) = index.query(&query, 5).unwrap();
 
         assert_eq!(indices.len(), 5);
         assert_eq!(indices[0], 0);
@@ -678,7 +696,7 @@ mod tests {
             false,
         );
 
-        let (indices, dists) = index.generate_knn(3, true, false);
+        let (indices, dists) = index.generate_knn(3, true, false).unwrap();
 
         assert_eq!(indices.len(), 5);
         assert!(dists.is_some());
@@ -712,8 +730,8 @@ mod tests {
         let query: Vec<f32> = (0..dim).map(|j| (j * 3 % 17) as f32 / 5.0).collect();
         let k = 10;
 
-        let (_, kmknn_dist) = kmknn.query(&query, k);
-        let (_, exh_dist) = exhaustive.query(&query, k);
+        let (_, kmknn_dist) = kmknn.query(&query, k).unwrap();
+        let (_, exh_dist) = exhaustive.query(&query, k).unwrap();
 
         // Distances must match exactly (up to float noise); indices may
         // differ only on ties
@@ -734,8 +752,8 @@ mod tests {
         let query: Vec<f32> = (0..dim).map(|j| (j * 3 % 17) as f32 / 5.0 + 0.1).collect();
         let k = 10;
 
-        let (_, kmknn_dist) = kmknn.query(&query, k);
-        let (_, exh_dist) = exhaustive.query(&query, k);
+        let (_, kmknn_dist) = kmknn.query(&query, k).unwrap();
+        let (_, exh_dist) = exhaustive.query(&query, k).unwrap();
 
         for i in 0..k {
             assert_relative_eq!(kmknn_dist[i], exh_dist[i], epsilon = 1e-4);

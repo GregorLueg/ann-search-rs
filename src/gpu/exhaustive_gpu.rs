@@ -33,6 +33,24 @@ pub struct ExhaustiveIndexGpu<T: Float, R: Runtime> {
     device: R::Device,
 }
 
+/////////////////////////
+// DimensionValidation //
+/////////////////////////
+
+impl<T, R> DimensionValidation for ExhaustiveIndexGpu<T, R>
+where
+    R: Runtime,
+    T: AnnSearchGpuFloat + AnnSearchFloat,
+{
+    fn dim(&self) -> usize {
+        self.dim
+    }
+}
+
+/////////////////////////
+// Main implementation //
+/////////////////////////
+
 impl<T, R> ExhaustiveIndexGpu<T, R>
 where
     R: Runtime,
@@ -102,12 +120,9 @@ where
         query_mat: MatRef<T>,
         k: usize,
         verbose: bool,
-    ) -> (Vec<Vec<usize>>, Vec<Vec<T>>) {
+    ) -> AnnSearchResults<T> {
         let (vectors_query, n_query, dim_query) = matrix_to_flat(query_mat);
-        assert!(
-            self.dim == dim_query,
-            "The query matrix has not the same dimensionality as the index"
-        );
+        self.check_dim(dim_query)?;
 
         let dim_padded = self.dim_padded;
         let vectors_query_padded = if dim_padded != self.dim {
@@ -132,7 +147,7 @@ where
         let query_data = BatchData::new(&vectors_query_padded, &query_norms, n_query);
         let db_data = BatchData::new(&self.vectors_flat, &self.norms, self.n);
 
-        query_batch_gpu::<T, R>(
+        Ok(query_batch_gpu::<T, R>(
             k,
             &query_data,
             &db_data,
@@ -140,7 +155,7 @@ where
             &self.metric,
             self.device.clone(),
             verbose,
-        )
+        ))
     }
 
     /// Generate kNN graph from vectors stored in the index
@@ -222,7 +237,7 @@ mod tests {
 
         let query = Mat::from_fn(2, 4, |i, j| if i == j { 1.0_f32 } else { 0.0_f32 });
 
-        let (indices, distances) = index.query_batch(query.as_ref(), 3, false);
+        let (indices, distances) = index.query_batch(query.as_ref(), 3, false).unwrap();
 
         assert_eq!(indices.len(), 2);
         assert_eq!(distances.len(), 2);
@@ -242,7 +257,7 @@ mod tests {
         let index = ExhaustiveIndexGpu::<f32, CpuRuntime>::new(data.as_ref(), Dist::Cosine, device);
 
         let query = Mat::from_fn(1, 4, |_, _| 1.0_f32);
-        let (indices, distances) = index.query_batch(query.as_ref(), 2, false);
+        let (indices, distances) = index.query_batch(query.as_ref(), 2, false).unwrap();
 
         assert_eq!(indices.len(), 1);
         assert_eq!(indices[0].len(), 2);

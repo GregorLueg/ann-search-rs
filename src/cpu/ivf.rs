@@ -92,6 +92,16 @@ where
     }
 }
 
+/////////////////////////
+// DimensionValidation //
+/////////////////////////
+
+impl<T> DimensionValidation for IvfIndex<T> {
+    fn dim(&self) -> usize {
+        self.dim
+    }
+}
+
 ////////////////
 // Main index //
 ////////////////
@@ -257,7 +267,14 @@ where
     ///
     /// Tuple of `(indices, distances)` sorted by distance (nearest first)
     #[inline]
-    pub fn query(&self, query_vec: &[T], k: usize, nprobe: Option<usize>) -> (Vec<usize>, Vec<T>) {
+    pub fn query(
+        &self,
+        query_vec: &[T],
+        k: usize,
+        nprobe: Option<usize>,
+    ) -> Result<(Vec<usize>, Vec<T>), AnnSearchErrors> {
+        self.check_dim(query_vec.len())?;
+
         let nprobe = nprobe
             .unwrap_or_else(|| ((self.nlist as f64).sqrt() as usize).max(1))
             .min(self.nlist);
@@ -297,7 +314,7 @@ where
             .map(|(d, i)| (d.0, self.original_ids[*i]))
             .unzip();
 
-        (indices, distances)
+        Ok((indices, distances))
     }
 
     /// Query the index for approximate nearest neighbours
@@ -321,7 +338,7 @@ where
         query_row: RowRef<T>,
         k: usize,
         nprobe: Option<usize>,
-    ) -> (Vec<usize>, Vec<T>) {
+    ) -> Result<(Vec<usize>, Vec<T>), AnnSearchErrors> {
         if query_row.col_stride() == 1 {
             let slice =
                 unsafe { std::slice::from_raw_parts(query_row.as_ptr(), query_row.ncols()) };
@@ -355,7 +372,7 @@ where
         nprobe: Option<usize>,
         return_dist: bool,
         verbose: bool,
-    ) -> (Vec<Vec<usize>>, Option<Vec<Vec<T>>>) {
+    ) -> AnnSearchOptionResult<T> {
         let counter = Arc::new(AtomicUsize::new(0));
 
         let unordered_results: Vec<(usize, Vec<usize>, Vec<T>)> = (0..self.n)
@@ -377,10 +394,10 @@ where
                     }
                 }
 
-                let (indices, dists) = self.query(vec, k, nprobe);
-                (orig_id, indices, dists)
+                let (indices, dists) = self.query(vec, k, nprobe)?;
+                Ok((orig_id, indices, dists))
             })
-            .collect();
+            .collect::<Result<Vec<_>, AnnSearchErrors>>()?;
 
         let mut final_indices = vec![Vec::new(); self.n];
         let mut final_dists = if return_dist {
@@ -396,7 +413,7 @@ where
             }
         }
 
-        (final_indices, final_dists)
+        Ok((final_indices, final_dists))
     }
 
     /// Function will optimise memory layout and put vectors sorted by cluster
@@ -468,8 +485,16 @@ impl<T> KnnValidation<T> for IvfIndex<T>
 where
     T: AnnSearchFloat,
 {
-    fn query_for_validation(&self, query_vec: &[T], k: usize) -> (Vec<usize>, Vec<T>) {
+    fn query_for_validation(
+        &self,
+        query_vec: &[T],
+        k: usize,
+    ) -> Result<(Vec<usize>, Vec<T>), AnnSearchErrors> {
         self.query(query_vec, k, None)
+    }
+
+    fn dim(&self) -> usize {
+        self.dim
     }
 
     fn n(&self) -> usize {
@@ -533,7 +558,7 @@ mod tests {
         );
 
         let query = vec![1.0, 0.0, 0.0];
-        let (indices, distances) = index.query(&query, 1, None);
+        let (indices, distances) = index.query(&query, 1, None).unwrap();
 
         assert_eq!(indices.len(), 1);
         assert_eq!(indices[0], 0);
@@ -553,7 +578,7 @@ mod tests {
         );
 
         let query = vec![1.0, 0.0, 0.0];
-        let (indices, distances) = index.query(&query, 3, None);
+        let (indices, distances) = index.query(&query, 3, None).unwrap();
 
         assert_eq!(indices[0], 0);
         assert_relative_eq!(distances[0], 0.0, epsilon = 1e-5);
@@ -570,7 +595,7 @@ mod tests {
         let index = IvfIndex::build(data.as_ref(), Dist::Cosine, Some(2), None, 42, false);
 
         let query = vec![1.0, 0.0, 0.0];
-        let (indices, distances) = index.query(&query, 3, None);
+        let (indices, distances) = index.query(&query, 3, None).unwrap();
 
         assert_eq!(indices[0], 0);
         assert_relative_eq!(distances[0], 0.0, epsilon = 1e-5);
@@ -589,7 +614,7 @@ mod tests {
         );
 
         let query = vec![1.0, 0.0, 0.0];
-        let (indices, _) = index.query(&query, 10, None);
+        let (indices, _) = index.query(&query, 10, None).unwrap();
 
         assert!(indices.len() <= 5);
     }
@@ -607,8 +632,8 @@ mod tests {
         );
 
         let query = vec![1.0, 0.0, 0.0];
-        let (indices1, _) = index.query(&query, 3, Some(1));
-        let (indices2, _) = index.query(&query, 3, Some(2));
+        let (indices1, _) = index.query(&query, 3, Some(1)).unwrap();
+        let (indices2, _) = index.query(&query, 3, Some(2)).unwrap();
 
         assert!(!indices1.is_empty());
         assert!(!indices2.is_empty());
@@ -636,8 +661,8 @@ mod tests {
         );
 
         let query = vec![0.5, 0.5, 0.0];
-        let (indices1, _) = index1.query(&query, 3, None);
-        let (indices2, _) = index2.query(&query, 3, None);
+        let (indices1, _) = index1.query(&query, 3, None).unwrap();
+        let (indices2, _) = index2.query(&query, 3, None).unwrap();
 
         assert_eq!(indices1, indices2);
     }
@@ -664,8 +689,8 @@ mod tests {
         );
 
         let query = vec![0.5, 0.5, 0.0];
-        let (indices1, _) = index1.query(&query, 3, Some(2));
-        let (indices2, _) = index2.query(&query, 3, Some(2));
+        let (indices1, _) = index1.query(&query, 3, Some(2)).unwrap();
+        let (indices2, _) = index2.query(&query, 3, Some(2)).unwrap();
 
         assert!(!indices1.is_empty());
         assert!(!indices2.is_empty());
@@ -687,7 +712,7 @@ mod tests {
         );
 
         let query: Vec<f32> = (0..dim).map(|_| 0.0).collect();
-        let (indices, _) = index.query(&query, 5, None);
+        let (indices, _) = index.query(&query, 5, None).unwrap();
 
         assert_eq!(indices.len(), 5);
         assert_eq!(indices[0], 0);
@@ -700,7 +725,7 @@ mod tests {
         let index = IvfIndex::build(data.as_ref(), Dist::Cosine, Some(3), None, 42, false);
 
         let query = vec![1.0, 0.0, 0.0];
-        let (indices, distances) = index.query(&query, 3, None);
+        let (indices, distances) = index.query(&query, 3, None).unwrap();
 
         assert_eq!(indices[0], 0);
         assert_relative_eq!(distances[0], 0.0, epsilon = 1e-5);
@@ -735,8 +760,8 @@ mod tests {
         );
 
         let query = vec![0.9, 0.1, 0.0];
-        let (indices1, _) = index_few.query(&query, 3, Some(2));
-        let (indices2, _) = index_many.query(&query, 3, Some(4));
+        let (indices1, _) = index_few.query(&query, 3, Some(2)).unwrap();
+        let (indices2, _) = index_many.query(&query, 3, Some(4)).unwrap();
 
         assert_eq!(indices1.len(), 3);
         assert_eq!(indices2.len(), 3);

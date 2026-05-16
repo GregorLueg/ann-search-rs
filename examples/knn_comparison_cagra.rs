@@ -39,7 +39,7 @@ fn main() {
     println!("Self-querying GPU exhaustive (ground truth)...");
     let start = Instant::now();
     let (true_neighbors, true_distances) =
-        query_exhaustive_index_gpu_self(&gpu_exhaustive_idx, cli.k, true, false);
+        query_exhaustive_index_gpu_self(&gpu_exhaustive_idx, cli.k, true, false).unwrap();
     let ex_query = start.elapsed().as_secs_f64() * 1000.0;
 
     results.push(BenchmarkResultSize {
@@ -68,14 +68,15 @@ fn main() {
         None,
         cli.seed as usize,
         false,
-    );
+    )
+    .unwrap();
     let cpu_build = start.elapsed().as_secs_f64() * 1000.0;
     let cpu_size = cpu_nndescent_idx.memory_usage_bytes() as f64 / (1024.0 * 1024.0);
 
     println!("Extracting CPU NNDescent kNN graph...");
     let start = Instant::now();
     let (cpu_neighbors, cpu_distances) =
-        query_nndescent_self(&cpu_nndescent_idx, cli.k, None, true, false);
+        query_nndescent_self(&cpu_nndescent_idx, cli.k, None, true, false).unwrap();
     let cpu_extract = start.elapsed().as_secs_f64() * 1000.0;
 
     let cpu_recall = calculate_recall(&true_neighbors, &cpu_neighbors, cli.k);

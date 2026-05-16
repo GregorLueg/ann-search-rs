@@ -554,6 +554,10 @@ where
     original_ids: Vec<usize>,
 }
 
+////////////////////
+// VectorDistance //
+////////////////////
+
 impl<T> VectorDistance<T> for HnswIndex<T>
 where
     T: AnnSearchFloat,
@@ -570,6 +574,24 @@ where
         &self.norms
     }
 }
+
+/////////////////////////
+// DimensionValidation //
+/////////////////////////
+
+impl<T> DimensionValidation for HnswIndex<T>
+where
+    T: AnnSearchFloat,
+    Self: HnswState<T>,
+{
+    fn dim(&self) -> usize {
+        self.dim
+    }
+}
+
+//////////
+// Main //
+//////////
 
 impl<T> HnswIndex<T>
 where
@@ -1090,8 +1112,13 @@ where
     ///
     /// Tuple of `(indices, distances)` sorted by distance (nearest first)
     #[inline]
-    pub fn query(&self, query: &[T], k: usize, ef_search: usize) -> (Vec<usize>, Vec<T>) {
-        assert_eq!(query.len(), self.dim);
+    pub fn query(
+        &self,
+        query: &[T],
+        k: usize,
+        ef_search: usize,
+    ) -> Result<(Vec<usize>, Vec<T>), AnnSearchErrors> {
+        self.check_dim(query.len())?;
 
         Self::with_search_state(|state_cell| {
             let mut state = state_cell.borrow_mut();
@@ -1134,7 +1161,7 @@ where
                 .map(|(OrderedFloat(d), id)| (id, d))
                 .unzip();
 
-            (indices, distances)
+            Ok((indices, distances))
         })
     }
 
@@ -1297,7 +1324,7 @@ where
         query_row: RowRef<T>,
         k: usize,
         ef_search: usize,
-    ) -> (Vec<usize>, Vec<T>) {
+    ) -> Result<(Vec<usize>, Vec<T>), AnnSearchErrors> {
         if query_row.col_stride() == 1 {
             let slice =
                 unsafe { std::slice::from_raw_parts(query_row.as_ptr(), query_row.ncols()) };
@@ -1330,7 +1357,7 @@ where
         ef_search: usize,
         return_dist: bool,
         verbose: bool,
-    ) -> (Vec<Vec<usize>>, Option<Vec<Vec<T>>>) {
+    ) -> AnnSearchOptionResult<T> {
         use std::sync::{
             atomic::{AtomicUsize, Ordering},
             Arc,
@@ -1358,14 +1385,14 @@ where
 
                 self.query(vec, k, ef_search)
             })
-            .collect();
+            .collect::<Result<Vec<_>, AnnSearchErrors>>()?;
 
         if return_dist {
             let (indices, distances) = results.into_iter().unzip();
-            (indices, Some(distances))
+            Ok((indices, Some(distances)))
         } else {
             let indices: Vec<Vec<usize>> = results.into_iter().map(|(idx, _)| idx).collect();
-            (indices, None)
+            Ok((indices, None))
         }
     }
 
@@ -1423,12 +1450,20 @@ where
     T: AnnSearchFloat,
     Self: HnswState<T>,
 {
-    fn query_for_validation(&self, query_vec: &[T], k: usize) -> (Vec<usize>, Vec<T>) {
+    fn query_for_validation(
+        &self,
+        query_vec: &[T],
+        k: usize,
+    ) -> Result<(Vec<usize>, Vec<T>), AnnSearchErrors> {
         self.query(query_vec, k, 200)
     }
 
     fn n(&self) -> usize {
         self.n
+    }
+
+    fn dim(&self) -> usize {
+        self.dim
     }
 
     fn metric(&self) -> Dist {
@@ -1481,7 +1516,7 @@ mod tests {
         let index = HnswIndex::<f32>::build(mat.as_ref(), 16, 100, "euclidean", 42, false);
 
         let query = vec![1.0, 0.0, 0.0];
-        let (indices, distances) = index.query(&query, 1, 50);
+        let (indices, distances) = index.query(&query, 1, 50).unwrap();
 
         assert_eq!(indices.len(), 1);
         assert_eq!(indices[0], 0);
@@ -1494,7 +1529,7 @@ mod tests {
         let index = HnswIndex::<f32>::build(mat.as_ref(), 16, 100, "euclidean", 42, false);
 
         let query = vec![1.0, 0.0, 0.0];
-        let (indices, distances) = index.query(&query, 3, 50);
+        let (indices, distances) = index.query(&query, 3, 50).unwrap();
 
         assert_eq!(indices[0], 0);
         assert_relative_eq!(distances[0], 0.0, epsilon = 1e-5);
@@ -1510,7 +1545,7 @@ mod tests {
         let index = HnswIndex::<f32>::build(mat.as_ref(), 16, 100, "cosine", 42, false);
 
         let query = vec![1.0, 0.0, 0.0];
-        let (indices, distances) = index.query(&query, 3, 50);
+        let (indices, distances) = index.query(&query, 3, 50).unwrap();
 
         assert_eq!(indices[0], 0);
         assert_relative_eq!(distances[0], 0.0, epsilon = 1e-5);
@@ -1526,7 +1561,7 @@ mod tests {
         let index = HnswIndex::<f32>::build(mat.as_ref(), 16, 200, "euclidean", 42, false);
 
         let query: Vec<f32> = (0..dim).map(|_| 0.0).collect();
-        let (indices, _) = index.query(&query, 5, 50);
+        let (indices, _) = index.query(&query, 5, 50).unwrap();
 
         assert_eq!(indices.len(), 5);
     }
@@ -1548,7 +1583,7 @@ mod tests {
             let index_clone = Arc::clone(&index);
             let handle = thread::spawn(move || {
                 let query = vec![0.5, 0.5, 0.0];
-                let (indices, _) = index_clone.query(&query, 3, 50);
+                let (indices, _) = index_clone.query(&query, 3, 50).unwrap();
                 assert_eq!(indices.len(), 3);
             });
             handles.push(handle);
@@ -1567,8 +1602,8 @@ mod tests {
         let index2 = HnswIndex::<f32>::build(mat.as_ref(), 16, 100, "euclidean", 42, false);
 
         let query = vec![0.5, 0.5, 0.0];
-        let (indices1, _) = index1.query(&query, 3, 50);
-        let (indices2, _) = index2.query(&query, 3, 50);
+        let (indices1, _) = index1.query(&query, 3, 50).unwrap();
+        let (indices2, _) = index2.query(&query, 3, 50).unwrap();
 
         assert_eq!(indices1, indices2);
     }
@@ -1590,7 +1625,7 @@ mod tests {
         let index = HnswIndex::<f32>::build(mat.as_ref(), 16, 200, "euclidean", 42, false);
 
         let query = vec![0.0, 0.0, 0.0];
-        let (indices, _) = index.query(&query, 5, 100);
+        let (indices, _) = index.query(&query, 5, 100).unwrap();
 
         assert_eq!(indices[0], 0);
 
@@ -1637,7 +1672,7 @@ mod tests {
 
         // Verify queries work
         let query: Vec<f32> = (0..dim).map(|_| 0.5).collect();
-        let (indices, _) = index.query(&query, 10, 50);
+        let (indices, _) = index.query(&query, 10, 50).unwrap();
         assert_eq!(indices.len(), 10);
     }
 
@@ -1653,7 +1688,7 @@ mod tests {
             let index = HnswIndex::<f32>::build(mat.as_ref(), m, 200, "euclidean", 42, false);
 
             let query: Vec<f32> = (0..dim).map(|_| 0.5).collect();
-            let (indices, _) = index.query(&query, 10, 50);
+            let (indices, _) = index.query(&query, 10, 50).unwrap();
 
             assert_eq!(indices.len(), 10, "Failed with m = {}", m);
         }

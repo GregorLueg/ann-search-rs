@@ -56,9 +56,9 @@ where
 // Validation //
 ////////////////
 
-/// Trait for validation of the approximate nearest neighbour searches.
-/// This will do an exhaustive search on a small subset and compare the
-/// Recall@k against the internal query function of the index.
+/// Trait for validation of the approximate nearest neighbour searches. This
+/// will do an exhaustive search on a small subset and compare the `Recall@k`
+/// against the internal query function of the index.
 pub trait KnnValidation<T>: VectorDistance<T>
 where
     T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum + SimdDistance,
@@ -68,7 +68,11 @@ where
     /// * `query_vec` - The query Vec for which to do the exhaustive search
     ///   for.
     /// * `k` - Number of neighbours to return
-    fn query_for_validation(&self, query_vec: &[T], k: usize) -> (Vec<usize>, Vec<T>);
+    fn query_for_validation(
+        &self,
+        query_vec: &[T],
+        k: usize,
+    ) -> Result<(Vec<usize>, Vec<T>), AnnSearchErrors>;
 
     /// Returns number of samples
     ///
@@ -76,6 +80,13 @@ where
     ///
     /// The number of samples stored in the index
     fn n(&self) -> usize;
+
+    /// Returns the dimensionality of index
+    ///
+    /// ### Returns
+    ///
+    /// The dimensionality of the index
+    fn dim(&self) -> usize;
 
     /// Returns the Distance metric
     ///
@@ -104,7 +115,11 @@ where
     /// ### Returns
     ///
     /// Tuple of `(indices, dist)`
-    fn exhaustive_query(&self, query_vec: &[T], k: usize) -> (Vec<usize>, Vec<T>) {
+    fn exhaustive_query(
+        &self,
+        query_vec: &[T],
+        k: usize,
+    ) -> Result<(Vec<usize>, Vec<T>), AnnSearchErrors> {
         let n_vectors = self.n();
         let k = k.min(n_vectors);
         let mut heap: BinaryHeap<(OrderedFloat<T>, usize)> = BinaryHeap::with_capacity(k + 1);
@@ -150,7 +165,7 @@ where
             .map(|(OrderedFloat(dist), idx)| (dist, self.original_ids()[idx]))
             .unzip();
 
-        (indices, distances)
+        Ok((indices, distances))
     }
 
     /// Validation function for the index
@@ -165,7 +180,12 @@ where
     /// ### Returns
     ///
     /// Recall@k for a subset of queried samples.
-    fn validate_index(&self, k: usize, seed: usize, no_samples: Option<usize>) -> f64 {
+    fn validate_index(
+        &self,
+        k: usize,
+        seed: usize,
+        no_samples: Option<usize>,
+    ) -> Result<f64, AnnSearchErrors> {
         let no_samples = no_samples.unwrap_or(1000).min(self.n());
         let mut rng = StdRng::seed_from_u64(seed as u64);
 
@@ -176,11 +196,11 @@ where
         let mut total_recall = 0.0;
 
         for &query_idx in &query_indices {
-            let start = query_idx * self.dim();
-            let query_vec = &self.vectors_flat()[start..start + self.dim()];
+            let start = query_idx * KnnValidation::dim(self);
+            let query_vec = &self.vectors_flat()[start..start + KnnValidation::dim(self)];
 
-            let (approx_indices, _) = self.query_for_validation(query_vec, k);
-            let (true_indices, _) = self.exhaustive_query(query_vec, k);
+            let (approx_indices, _) = self.query_for_validation(query_vec, k)?;
+            let (true_indices, _) = self.exhaustive_query(query_vec, k)?;
 
             let approx_set: FxHashSet<_> = approx_indices.into_iter().collect();
             let matches = true_indices
@@ -191,13 +211,34 @@ where
             total_recall += matches as f64 / k as f64;
         }
 
-        total_recall / no_samples as f64
+        Ok(total_recall / no_samples as f64)
     }
 }
 
 //////////////////////////
 // Dimension validation //
 //////////////////////////
+
+/// Helper function to validate the dimensions
+///
+/// ### Params
+///
+/// * `query_dim` - Dimensionality of the queries
+/// * `index_dim` - Dimensionality of the index
+///
+/// ### Returns
+///
+/// `Result<(), AnnSearchErrors::DimensionMismatch>`
+pub fn validate_dim(query_dim: usize, index_dim: usize) -> Result<(), AnnSearchErrors> {
+    if query_dim != index_dim {
+        Err(AnnSearchErrors::DimensionMismatch {
+            index_dim,
+            query_dim,
+        })
+    } else {
+        Ok(())
+    }
+}
 
 /// Trait to check dimension mismatches
 pub trait DimensionValidation {

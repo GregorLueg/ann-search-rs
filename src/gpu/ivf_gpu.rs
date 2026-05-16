@@ -72,6 +72,24 @@ pub struct IvfIndexGpu<T: AnnSearchFloat + AnnSearchGpuFloat, R: Runtime> {
     device: R::Device,
 }
 
+/////////////////////////
+// DimensionValidation //
+/////////////////////////
+
+impl<T, R> DimensionValidation for IvfIndexGpu<T, R>
+where
+    R: Runtime,
+    T: AnnSearchGpuFloat + AnnSearchFloat,
+{
+    fn dim(&self) -> usize {
+        self.dim
+    }
+}
+
+/////////////////////////
+// Main implementation //
+/////////////////////////
+
 impl<T, R> IvfIndexGpu<T, R>
 where
     R: Runtime,
@@ -258,12 +276,8 @@ where
         nquery: Option<usize>,
         client: &ComputeClient<R>,
         verbose: bool,
-    ) -> (Vec<Vec<usize>>, Vec<Vec<T>>) {
-        assert_eq!(
-            dim_query, self.dim_padded,
-            "Query dimension {} != index padded dimension {}",
-            dim_query, self.dim_padded
-        );
+    ) -> AnnSearchResults<T> {
+        self.check_dim(dim_query)?;
 
         let nprobe = nprobe
             .unwrap_or_else(|| ((self.nlist as f64).sqrt() as usize).max(1))
@@ -281,7 +295,7 @@ where
         let n_batches = n_queries.div_ceil(nquery);
 
         if n_batches == 1 {
-            return self.query_batch_internal(queries_flat, n_queries, k, nprobe, client);
+            return Ok(self.query_batch_internal(queries_flat, n_queries, k, nprobe, client));
         }
 
         let mut all_indices = Vec::with_capacity(n_queries);
@@ -308,7 +322,7 @@ where
             all_distances.extend(batch_dists);
         }
 
-        (all_indices, all_distances)
+        Ok((all_indices, all_distances))
     }
 
     /// Query the index with a batch of vectors
@@ -332,13 +346,9 @@ where
         nprobe: Option<usize>,
         nquery: Option<usize>,
         verbose: bool,
-    ) -> (Vec<Vec<usize>>, Vec<Vec<T>>) {
+    ) -> AnnSearchResults<T> {
         let (queries_flat, n_queries, dim_query) = matrix_to_flat(query_mat);
-        assert_eq!(
-            dim_query, self.dim,
-            "Query dimension {} != index dimension {}",
-            dim_query, self.dim
-        );
+        self.check_dim(dim_query)?;
 
         let client: ComputeClient<R> = R::client(&self.device);
 
@@ -360,10 +370,10 @@ where
             Some(batch_size),
             &client,
             verbose,
-        );
+        )?;
 
         client.memory_cleanup();
-        (indices, dist)
+        Ok((indices, dist))
     }
 
     /// Generate kNN graph from vectors stored in the index
@@ -390,7 +400,7 @@ where
         nquery: Option<usize>,
         return_dist: bool,
         verbose: bool,
-    ) -> (Vec<Vec<usize>>, Option<Vec<Vec<T>>>) {
+    ) -> AnnSearchOptionResult<T> {
         let client: ComputeClient<R> = R::client(&self.device);
 
         let nprobe = nprobe.unwrap_or(((self.nlist as f32).sqrt() as usize).max(1));
@@ -417,7 +427,7 @@ where
             Some(batch_size),
             &client,
             verbose,
-        );
+        )?;
 
         client.memory_cleanup();
 
@@ -440,9 +450,9 @@ where
         }
 
         if return_dist {
-            (indices, Some(dist))
+            Ok((indices, Some(dist)))
         } else {
-            (indices, None)
+            Ok((indices, None))
         }
     }
 
@@ -902,7 +912,9 @@ mod tests {
 
         let query = Mat::from_fn(3, 4, |i, j| if i == j { 1.0_f32 } else { 0.0_f32 });
 
-        let (indices, distances) = index.query_batch(query.as_ref(), 5, Some(3), None, false);
+        let (indices, distances) = index
+            .query_batch(query.as_ref(), 5, Some(3), None, false)
+            .unwrap();
 
         assert_eq!(indices.len(), 3);
         assert_eq!(distances.len(), 3);
@@ -926,7 +938,9 @@ mod tests {
         );
 
         let query = Mat::from_fn(2, 4, |_, _| 1.0_f32);
-        let (indices, distances) = index.query_batch(query.as_ref(), 3, Some(2), None, false);
+        let (indices, distances) = index
+            .query_batch(query.as_ref(), 3, Some(2), None, false)
+            .unwrap();
 
         assert_eq!(indices.len(), 2);
         assert_eq!(indices[0].len(), 3);
@@ -990,7 +1004,7 @@ mod tests_wpgu {
             device,
         );
 
-        let (indices, distances) = index.generate_knn(4, Some(3), None, true, false);
+        let (indices, distances) = index.generate_knn(4, Some(3), None, true, false).unwrap();
 
         assert_eq!(indices.len(), 30);
         assert!(distances.is_some());

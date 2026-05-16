@@ -106,7 +106,8 @@ impl<R: Runtime> Benchmark for IvfQueryBench<R> {
         });
         let result = self
             .index
-            .query_batch(mat.as_ref(), self.k, Some(self.nprobe), None, false);
+            .query_batch(mat.as_ref(), self.k, Some(self.nprobe), None, false)
+            .unwrap();
         Ok(result)
     }
 
@@ -139,7 +140,8 @@ impl<R: Runtime> Benchmark for IvfKnnBench<R> {
     fn execute(&self, _input: Self::Input) -> Result<Self::Output, String> {
         let result = self
             .index
-            .generate_knn(self.k, Some(self.nprobe), None, true, false);
+            .generate_knn(self.k, Some(self.nprobe), None, true, false)
+            .unwrap();
         Ok(result)
     }
 

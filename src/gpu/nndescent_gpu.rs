@@ -1090,7 +1090,7 @@ macro_rules! impl_nndescent_gpu_query {
                 query_norm: $float,
                 k: usize,
                 ef: usize,
-            ) -> (Vec<usize>, Vec<$float>) {
+            ) -> Result<(Vec<usize>, Vec<$float>), AnnSearchErrors> {
                 QUERY_VISITED.with(|visited_cell| {
                     $cand_tls.with(|cand_cell| {
                         $res_tls.with(|res_cell| {
@@ -1136,7 +1136,7 @@ macro_rules! impl_nndescent_gpu_query {
                 visited: &mut FixedBitSet,
                 candidates: &mut BinaryHeap<Reverse<(OrderedFloat<$float>, usize)>>,
                 results: &mut BinaryHeap<(OrderedFloat<$float>, usize)>,
-            ) -> (Vec<usize>, Vec<$float>) {
+            ) -> Result<(Vec<usize>, Vec<$float>), AnnSearchErrors> {
                 let init_indices = self
                     .router
                     .find_entry_points(query_vec, (ef / 2).max(2 * k).min(self.n));
@@ -1195,10 +1195,10 @@ macro_rules! impl_nndescent_gpu_query {
                 final_results.sort_unstable_by(|a, b| a.0.cmp(&b.0));
                 final_results.truncate(k);
 
-                final_results
+                Ok(final_results
                     .into_iter()
                     .map(|(OrderedFloat(d), i)| (i, d))
-                    .unzip()
+                    .unzip())
             }
 
             #[inline(always)]
@@ -1211,7 +1211,7 @@ macro_rules! impl_nndescent_gpu_query {
                 visited: &mut FixedBitSet,
                 candidates: &mut BinaryHeap<Reverse<(OrderedFloat<$float>, usize)>>,
                 results: &mut BinaryHeap<(OrderedFloat<$float>, usize)>,
-            ) -> (Vec<usize>, Vec<$float>) {
+            ) -> Result<(Vec<usize>, Vec<$float>), AnnSearchErrors> {
                 let init_indices = self
                     .router
                     .find_entry_points(query_vec, (ef / 2).max(2 * k).min(self.n));
@@ -1270,10 +1270,10 @@ macro_rules! impl_nndescent_gpu_query {
                 final_results.sort_unstable_by(|a, b| a.0.cmp(&b.0));
                 final_results.truncate(k);
 
-                final_results
+                Ok(final_results
                     .into_iter()
                     .map(|(OrderedFloat(d), i)| (i, d))
-                    .unzip()
+                    .unzip())
             }
         }
     };
@@ -1332,6 +1332,10 @@ pub struct NNDescentGpu<T: AnnSearchFloat + AnnSearchGpuFloat, R: Runtime> {
     norms_gpu: Option<GpuTensor<R, T>>,
 }
 
+////////////////////
+// VectorDistance //
+////////////////////
+
 /// VectorDistance implementation for NNDescentGPU
 impl<T, R> VectorDistance<T> for NNDescentGpu<T, R>
 where
@@ -1348,6 +1352,24 @@ where
         &self.norms
     }
 }
+
+/////////////////////////
+// DimensionValidation //
+/////////////////////////
+
+impl<T, R> DimensionValidation for NNDescentGpu<T, R>
+where
+    R: Runtime,
+    T: AnnSearchGpuFloat + AnnSearchFloat,
+{
+    fn dim(&self) -> usize {
+        self.dim
+    }
+}
+
+/////////////////////////
+// Main implementation //
+/////////////////////////
 
 impl<T, R> NNDescentGpu<T, R>
 where
@@ -1895,7 +1917,7 @@ where
         query_vec: &[T],
         k: usize,
         ef_search: Option<usize>,
-    ) -> (Vec<usize>, Vec<T>) {
+    ) -> Result<(Vec<usize>, Vec<T>), AnnSearchErrors> {
         let k = k.min(self.n);
         let ef = ef_search.unwrap_or_else(|| (k * 2).clamp(50, 200)).max(k);
 
@@ -1928,7 +1950,7 @@ where
         query_row: RowRef<T>,
         k: usize,
         ef_search: Option<usize>,
-    ) -> (Vec<usize>, Vec<T>) {
+    ) -> Result<(Vec<usize>, Vec<T>), AnnSearchErrors> {
         if query_row.col_stride() == 1 {
             let slice =
                 unsafe { std::slice::from_raw_parts(query_row.as_ptr(), query_row.ncols()) };
@@ -1964,15 +1986,13 @@ where
         query_params: Option<CagraGpuSearchParams>,
         k: usize,
         seed: usize,
-    ) -> (Vec<Vec<usize>>, Vec<Vec<T>>)
+    ) -> AnnSearchResults<T>
     where
         T: AnnSearchGpuFloat + num_traits::Float,
     {
-        assert_eq!(
-            queries_flat.len(),
-            n_queries * self.dim,
-            "queries_flat length must be n_queries * dim"
-        );
+        let dim_query = queries_flat.len() / n_queries;
+
+        self.check_dim(dim_query)?;
 
         let query_params =
             query_params.unwrap_or_else(|| CagraGpuSearchParams::from_graph(k, self.k));
@@ -2046,7 +2066,8 @@ where
             Some(&entry_flat),
             &client,
         );
-        result
+
+        Ok(result)
     }
 
     ///////////

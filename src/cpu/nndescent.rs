@@ -274,7 +274,7 @@ pub trait NNDescentQuery<T> {
         query_norm: T,
         k: usize,
         ef: usize,
-    ) -> (Vec<usize>, Vec<T>);
+    ) -> Result<(Vec<usize>, Vec<T>), AnnSearchErrors>;
 
     /// Beam search using Euclidean distance.
     fn query_euclidean(
@@ -285,7 +285,7 @@ pub trait NNDescentQuery<T> {
         visited: &mut FixedBitSet,
         candidates: &mut BinaryHeap<Reverse<(OrderedFloat<T>, usize)>>,
         results: &mut BinaryHeap<(OrderedFloat<T>, usize)>,
-    ) -> (Vec<usize>, Vec<T>);
+    ) -> Result<(Vec<usize>, Vec<T>), AnnSearchErrors>;
 
     /// Beam search using Cosine distance.
     #[allow(clippy::too_many_arguments)]
@@ -298,7 +298,7 @@ pub trait NNDescentQuery<T> {
         visited: &mut FixedBitSet,
         candidates: &mut BinaryHeap<Reverse<(OrderedFloat<T>, usize)>>,
         results: &mut BinaryHeap<(OrderedFloat<T>, usize)>,
-    ) -> (Vec<usize>, Vec<T>);
+    ) -> Result<(Vec<usize>, Vec<T>), AnnSearchErrors>;
 }
 
 //////////
@@ -373,6 +373,20 @@ where
     }
 }
 
+/////////////////////////
+// DimensionValidation //
+/////////////////////////
+
+impl<T> DimensionValidation for NNDescent<T> {
+    fn dim(&self) -> usize {
+        self.dim
+    }
+}
+
+//////////
+// Main //
+//////////
+
 impl<T> NNDescent<T>
 where
     T: AnnSearchFloat,
@@ -409,7 +423,7 @@ where
         diversify_prob: T,
         seed: usize,
         verbose: bool,
-    ) -> Self {
+    ) -> Result<Self, AnnSearchErrors> {
         let (vectors_flat, n, dim) = matrix_to_flat(data);
 
         let norms = if metric == Dist::Cosine {
@@ -457,7 +471,7 @@ where
         };
 
         let (build_graph, converged) =
-            builder.generate_index(k, max_iter, delta, max_candidates, seed, verbose);
+            builder.generate_index(k, max_iter, delta, max_candidates, seed, verbose)?;
 
         let graph = if diversify_prob > T::zero() {
             builder.diversify_graph(&build_graph, k, diversify_prob, seed)
@@ -465,7 +479,7 @@ where
             build_graph
         };
 
-        NNDescent {
+        Ok(NNDescent {
             vectors_flat: builder.vectors_flat,
             dim: builder.dim,
             n: builder.n,
@@ -476,7 +490,7 @@ where
             converged,
             forest: builder.forest,
             original_ids: (0..n).collect(),
-        }
+        })
     }
 
     /// Whether the algorithm converged during construction.
@@ -524,27 +538,28 @@ where
     /// ### Returns
     ///
     /// Flat graph of size `n * k` with Annoy-seeded initial neighbours
-    fn init_with_forest(&self, k: usize) -> Vec<Neighbour<T>> {
+    fn init_with_forest(&self, k: usize) -> Result<Vec<Neighbour<T>>, AnnSearchErrors> {
         let sentinel = Neighbour::new(SENTINEL_PID, T::max_value(), false);
         let mut graph = vec![sentinel; self.n * k];
+        graph.par_chunks_mut(k).enumerate().try_for_each(
+            |(i, slot)| -> Result<(), AnnSearchErrors> {
+                let query = &self.vectors_flat[i * self.dim..(i + 1) * self.dim];
+                let search_k = k * self.forest.n_trees;
+                let (indices, distances) = self.forest.query(query, k + 1, Some(search_k))?;
+                for (j, (idx, dist)) in indices
+                    .into_iter()
+                    .zip(distances)
+                    .skip(1)
+                    .take(k)
+                    .enumerate()
+                {
+                    slot[j] = Neighbour::new(idx, dist, true);
+                }
+                Ok(())
+            },
+        )?;
 
-        graph.par_chunks_mut(k).enumerate().for_each(|(i, slot)| {
-            let query = &self.vectors_flat[i * self.dim..(i + 1) * self.dim];
-            let search_k = k * self.forest.n_trees;
-            let (indices, distances) = self.forest.query(query, k + 1, Some(search_k));
-
-            for (j, (idx, dist)) in indices
-                .into_iter()
-                .zip(distances)
-                .skip(1)
-                .take(k)
-                .enumerate()
-            {
-                slot[j] = Neighbour::new(idx, dist, true);
-            }
-        });
-
-        graph
+        Ok(graph)
     }
 
     /// Run the main NN-Descent algorithm with chunked updates
@@ -574,7 +589,7 @@ where
         max_candidates: usize,
         seed: usize,
         verbose: bool,
-    ) -> (Vec<(usize, T)>, bool) {
+    ) -> Result<(Vec<(usize, T)>, bool), AnnSearchErrors> {
         if verbose {
             println!(
                 "Running NN-Descent: {} samples, max_candidates={}",
@@ -586,7 +601,7 @@ where
         let mut converged = false;
 
         let start = Instant::now();
-        let mut graph = self.init_with_forest(k);
+        let mut graph = self.init_with_forest(k)?;
 
         if verbose {
             println!("Queried Annoy index: {:.2?}", start.elapsed());
@@ -682,7 +697,7 @@ where
 
         let res = graph.into_iter().map(|n| (n.pid(), n.dist)).collect();
 
-        (res, converged)
+        Ok((res, converged))
     }
 
     /// Build candidate lists for the local join step.
@@ -1044,7 +1059,9 @@ where
         query_vec: &[T],
         k: usize,
         ef_search: Option<usize>,
-    ) -> (Vec<usize>, Vec<T>) {
+    ) -> Result<(Vec<usize>, Vec<T>), AnnSearchErrors> {
+        self.check_dim(query_vec.len())?;
+
         let k = k.min(self.n);
         let ef = ef_search.unwrap_or_else(|| (k * 2).clamp(50, 200)).max(k);
 
@@ -1054,7 +1071,8 @@ where
             T::one()
         };
 
-        self.query_internal(query_vec, query_norm, k, ef)
+        #[allow(clippy::needless_question_mark)]
+        Ok(self.query_internal(query_vec, query_norm, k, ef)?)
     }
 
     /// Query using a matrix row reference.
@@ -1067,7 +1085,7 @@ where
         query_row: RowRef<T>,
         k: usize,
         ef_search: Option<usize>,
-    ) -> (Vec<usize>, Vec<T>) {
+    ) -> Result<(Vec<usize>, Vec<T>), AnnSearchErrors> {
         if query_row.col_stride() == 1 {
             let slice =
                 unsafe { std::slice::from_raw_parts(query_row.as_ptr(), query_row.ncols()) };
@@ -1089,7 +1107,7 @@ where
         ef_search: Option<usize>,
         return_dist: bool,
         verbose: bool,
-    ) -> (Vec<Vec<usize>>, Option<Vec<Vec<T>>>) {
+    ) -> AnnSearchOptionResult<T> {
         use std::sync::{
             atomic::{AtomicUsize, Ordering},
             Arc,
@@ -1117,14 +1135,14 @@ where
 
                 self.query(vec, k, ef_search)
             })
-            .collect();
+            .collect::<Result<Vec<_>, AnnSearchErrors>>()?;
 
         if return_dist {
             let (indices, distances) = results.into_iter().unzip();
-            (indices, Some(distances))
+            Ok((indices, Some(distances)))
         } else {
             let indices: Vec<Vec<usize>> = results.into_iter().map(|(idx, _)| idx).collect();
-            (indices, None)
+            Ok((indices, None))
         }
     }
 
@@ -1329,7 +1347,7 @@ macro_rules! impl_nndescent_query {
                 query_norm: $float,
                 k: usize,
                 ef: usize,
-            ) -> (Vec<usize>, Vec<$float>) {
+            ) -> Result<(Vec<usize>, Vec<$float>), AnnSearchErrors> {
                 QUERY_VISITED.with(|visited_cell| {
                     $cand_tls.with(|cand_cell| {
                         $res_tls.with(|res_cell| {
@@ -1375,12 +1393,12 @@ macro_rules! impl_nndescent_query {
                 visited: &mut FixedBitSet,
                 candidates: &mut BinaryHeap<Reverse<(OrderedFloat<$float>, usize)>>,
                 results: &mut BinaryHeap<(OrderedFloat<$float>, usize)>,
-            ) -> (Vec<usize>, Vec<$float>) {
+            ) -> Result<(Vec<usize>, Vec<$float>), AnnSearchErrors> {
                 let init_candidates = (ef / 2).max(2 * k).min(self.n);
                 let search_k = init_candidates * 3;
                 let (init_indices, _) =
                     self.forest
-                        .query(query_vec, init_candidates, Some(search_k));
+                        .query(query_vec, init_candidates, Some(search_k))?;
 
                 for &entry_idx in &init_indices {
                     if entry_idx >= self.n || visited.contains(entry_idx) {
@@ -1436,10 +1454,10 @@ macro_rules! impl_nndescent_query {
                 final_results.sort_unstable_by(|a, b| a.0.cmp(&b.0));
                 final_results.truncate(k);
 
-                final_results
+                Ok(final_results
                     .into_iter()
                     .map(|(OrderedFloat(d), i)| (i, d))
-                    .unzip()
+                    .unzip())
             }
 
             #[inline(always)]
@@ -1452,12 +1470,12 @@ macro_rules! impl_nndescent_query {
                 visited: &mut FixedBitSet,
                 candidates: &mut BinaryHeap<Reverse<(OrderedFloat<$float>, usize)>>,
                 results: &mut BinaryHeap<(OrderedFloat<$float>, usize)>,
-            ) -> (Vec<usize>, Vec<$float>) {
+            ) -> Result<(Vec<usize>, Vec<$float>), AnnSearchErrors> {
                 let init_candidates = (ef / 2).max(k).min(self.n);
                 let search_k = init_candidates * 3;
                 let (init_indices, _) =
                     self.forest
-                        .query(query_vec, init_candidates, Some(search_k));
+                        .query(query_vec, init_candidates, Some(search_k))?;
 
                 for &entry_idx in &init_indices {
                     if entry_idx >= self.n || visited.contains(entry_idx) {
@@ -1513,10 +1531,10 @@ macro_rules! impl_nndescent_query {
                 final_results.sort_unstable_by(|a, b| a.0.cmp(&b.0));
                 final_results.truncate(k);
 
-                final_results
+                Ok(final_results
                     .into_iter()
                     .map(|(OrderedFloat(d), i)| (i, d))
-                    .unzip()
+                    .unzip())
             }
         }
     };
@@ -1535,13 +1553,21 @@ where
     Self: ApplySortedUpdates<T>,
     Self: NNDescentQuery<T>,
 {
-    fn query_for_validation(&self, query_vec: &[T], k: usize) -> (Vec<usize>, Vec<T>) {
+    fn query_for_validation(
+        &self,
+        query_vec: &[T],
+        k: usize,
+    ) -> Result<(Vec<usize>, Vec<T>), AnnSearchErrors> {
         // Default budget
         self.query(query_vec, k, None)
     }
 
     fn n(&self) -> usize {
         self.n
+    }
+
+    fn dim(&self) -> usize {
+        self.dim
     }
 
     fn metric(&self) -> Dist {
@@ -1600,7 +1626,8 @@ mod tests {
             0.0,
             42,
             false,
-        );
+        )
+        .unwrap();
 
         assert_eq!(index.graph.len(), 5 * 3);
         for i in 0..5 {
@@ -1622,7 +1649,8 @@ mod tests {
             0.0,
             42,
             false,
-        );
+        )
+        .unwrap();
 
         assert_eq!(index.graph.len(), 5 * 3);
         assert!(!index.norms.is_empty());
@@ -1642,10 +1670,11 @@ mod tests {
             0.0,
             42,
             false,
-        );
+        )
+        .unwrap();
 
         let query = vec![1.0, 0.0, 0.0];
-        let (indices, distances) = index.query(&query, 3, Some(50));
+        let (indices, distances) = index.query(&query, 3, Some(50)).unwrap();
 
         assert_eq!(indices.len(), 3);
         assert_eq!(distances.len(), 3);
@@ -1666,7 +1695,8 @@ mod tests {
             0.0,
             42,
             false,
-        );
+        )
+        .unwrap();
 
         assert_eq!(index.graph.len(), 5 * 3);
     }
@@ -1686,7 +1716,8 @@ mod tests {
             0.0,
             42,
             false,
-        );
+        )
+        .unwrap();
         let g2 = NNDescent::<f32>::new(
             mat.as_ref(),
             Dist::SquaredEuclidean,
@@ -1698,7 +1729,8 @@ mod tests {
             0.0,
             42,
             false,
-        );
+        )
+        .unwrap();
 
         assert_eq!(g1.graph.len(), g2.graph.len());
         for i in 0..g1.n {
@@ -1721,7 +1753,8 @@ mod tests {
             0.0,
             42,
             false,
-        );
+        )
+        .unwrap();
         let gk4 = NNDescent::<f32>::new(
             mat.as_ref(),
             Dist::SquaredEuclidean,
@@ -1733,7 +1766,8 @@ mod tests {
             0.0,
             42,
             false,
-        );
+        )
+        .unwrap();
 
         for i in 0..5 {
             assert!(neighbours(&gk2, i).len() <= 2);
@@ -1766,7 +1800,8 @@ mod tests {
             0.0,
             42,
             false,
-        );
+        )
+        .unwrap();
 
         assert_eq!(index.graph.len(), n * 10);
         for i in 0..n {
@@ -1790,7 +1825,8 @@ mod tests {
             0.0,
             42,
             false,
-        );
+        )
+        .unwrap();
 
         for i in 0..5 {
             let nbrs = neighbours(&index, i);
@@ -1816,7 +1852,8 @@ mod tests {
             0.0,
             42,
             false,
-        );
+        )
+        .unwrap();
 
         assert_eq!(index.graph.len(), 3 * 2);
         for i in 0..3 {
@@ -1851,7 +1888,8 @@ mod tests {
             0.0,
             42,
             false,
-        );
+        )
+        .unwrap();
 
         let nbrs_0 = neighbours(&index, 0);
         let in_cluster = nbrs_0.iter().filter(|(idx, _)| *idx < 10).count();
@@ -1876,7 +1914,8 @@ mod tests {
             0.5,
             42,
             false,
-        );
+        )
+        .unwrap();
 
         assert_eq!(index.graph.len(), 5 * 3);
         for i in 0..5 {
