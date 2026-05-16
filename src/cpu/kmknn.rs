@@ -153,7 +153,11 @@ where
         k_means_params: Option<KMeansTrainingParams>,
         seed: usize,
         verbose: bool,
-    ) -> Self {
+    ) -> Result<Self, AnnSearchErrors> {
+        if metric == Dist::Manhattan {
+            return Err(AnnSearchErrors::DistanceNotSupported(metric));
+        }
+
         let (mut vectors_flat, n, dim) = matrix_to_flat(data);
 
         // Cosine: normalise in place and proceed in Euclidean space
@@ -183,7 +187,7 @@ where
             k_means_params,
             seed,
             verbose,
-        );
+        )?;
 
         let dummy_data_norms = vec![T::one(); n];
         let dummy_centroid_norms = vec![T::one(); nlist];
@@ -239,7 +243,7 @@ where
             }
         }
 
-        Self {
+        Ok(Self {
             vectors_flat: new_vectors_flat,
             dim,
             n,
@@ -251,7 +255,7 @@ where
             point_to_centroid_sq,
             cluster_radii_sq,
             max_cluster_radius_sq,
-        }
+        })
     }
 
     ///////////
@@ -337,6 +341,7 @@ where
                 let out = match self.metric {
                     Dist::SquaredEuclidean => d_sq,
                     Dist::Cosine => d_sq * half,
+                    Dist::Manhattan => unreachable!(),
                 };
                 (out, self.original_ids[pos])
             })
@@ -409,12 +414,7 @@ where
     /// ### Returns
     ///
     /// Tuple of `(knn_indices, optional distances)` indexed by original id
-    pub fn generate_knn(
-        &self,
-        k: usize,
-        return_dist: bool,
-        verbose: bool,
-    ) -> AnnSearchOptionResult<T> {
+    pub fn generate_knn(&self, k: usize, return_dist: bool, verbose: bool) -> KnnOptionResult<T> {
         let counter = Arc::new(AtomicUsize::new(0));
 
         let unordered_results: Vec<(usize, Vec<usize>, Vec<T>)> = (0..self.n)
@@ -546,7 +546,8 @@ mod tests {
             None,
             42,
             false,
-        );
+        )
+        .unwrap();
 
         let query = vec![1.0, 0.0, 0.0];
         let (indices, distances) = index.query(&query, 1).unwrap();
@@ -558,7 +559,8 @@ mod tests {
     #[test]
     fn test_kmknn_query_finds_self_cosine() {
         let data = create_simple_matrix();
-        let index = KmknnIndex::build(data.as_ref(), Dist::Cosine, Some(2), None, 42, false);
+        let index =
+            KmknnIndex::build(data.as_ref(), Dist::Cosine, Some(2), None, 42, false).unwrap();
 
         let query = vec![1.0, 0.0, 0.0];
         let (indices, distances) = index.query(&query, 1).unwrap();
@@ -577,7 +579,8 @@ mod tests {
             None,
             42,
             false,
-        );
+        )
+        .unwrap();
 
         let query = vec![1.0, 0.0, 0.0];
         let (_, distances) = index.query(&query, 5).unwrap();
@@ -597,7 +600,8 @@ mod tests {
             None,
             42,
             false,
-        );
+        )
+        .unwrap();
 
         let query = vec![1.0, 0.0, 0.0];
         let (indices, _) = index.query(&query, 10).unwrap();
@@ -608,7 +612,8 @@ mod tests {
     #[test]
     fn test_kmknn_orthogonal_cosine() {
         let data = Mat::from_fn(3, 3, |i, j| if i == j { 1.0 } else { 0.0 });
-        let index = KmknnIndex::build(data.as_ref(), Dist::Cosine, Some(3), None, 42, false);
+        let index =
+            KmknnIndex::build(data.as_ref(), Dist::Cosine, Some(3), None, 42, false).unwrap();
 
         let query = vec![1.0, 0.0, 0.0];
         let (indices, distances) = index.query(&query, 3).unwrap();
@@ -630,7 +635,8 @@ mod tests {
             None,
             42,
             false,
-        );
+        )
+        .unwrap();
         let idx2 = KmknnIndex::build(
             data.as_ref(),
             Dist::SquaredEuclidean,
@@ -638,7 +644,8 @@ mod tests {
             None,
             42,
             false,
-        );
+        )
+        .unwrap();
 
         let query = vec![0.5, 0.5, 0.0];
         let (i1, _) = idx1.query(&query, 3).unwrap();
@@ -656,7 +663,8 @@ mod tests {
             None,
             42,
             false,
-        );
+        )
+        .unwrap();
 
         let (indices, distances) = index.query_row(data.row(0), 1).unwrap();
         assert_eq!(indices[0], 0);
@@ -676,7 +684,8 @@ mod tests {
             None,
             42,
             false,
-        );
+        )
+        .unwrap();
         let query: Vec<f32> = (0..dim).map(|_| 0.0).collect();
         let (indices, _) = index.query(&query, 5).unwrap();
 
@@ -694,7 +703,8 @@ mod tests {
             None,
             42,
             false,
-        );
+        )
+        .unwrap();
 
         let (indices, dists) = index.generate_knn(3, true, false).unwrap();
 
@@ -724,7 +734,8 @@ mod tests {
             None,
             42,
             false,
-        );
+        )
+        .unwrap();
         let exhaustive = ExhaustiveIndex::new(data.as_ref(), Dist::SquaredEuclidean);
 
         let query: Vec<f32> = (0..dim).map(|j| (j * 3 % 17) as f32 / 5.0).collect();
@@ -746,7 +757,8 @@ mod tests {
         let dim = 16;
         let data = Mat::from_fn(n, dim, |i, j| ((i * 7 + j * 13) % 97) as f32 / 10.0 + 0.1);
 
-        let kmknn = KmknnIndex::build(data.as_ref(), Dist::Cosine, Some(14), None, 42, false);
+        let kmknn =
+            KmknnIndex::build(data.as_ref(), Dist::Cosine, Some(14), None, 42, false).unwrap();
         let exhaustive = ExhaustiveIndex::new(data.as_ref(), Dist::Cosine);
 
         let query: Vec<f32> = (0..dim).map(|j| (j * 3 % 17) as f32 / 5.0 + 0.1).collect();

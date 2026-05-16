@@ -136,6 +136,9 @@ where
         if !n_bits.is_multiple_of(8) {
             return Err(AnnSearchErrors::NBitsMustBe8Multiple { n_bits });
         }
+        if metric == Dist::Manhattan {
+            return Err(AnnSearchErrors::DistanceNotSupported(metric));
+        }
 
         let n = data.nrows();
         let dim = data.ncols();
@@ -166,7 +169,7 @@ where
             k_means_params,
             seed,
             verbose,
-        );
+        )?;
 
         let centroids_norm = if metric == Dist::Cosine {
             (0..nlist)
@@ -290,6 +293,9 @@ where
         if !n_bits.is_multiple_of(8) {
             return Err(AnnSearchErrors::NBitsMustBe8Multiple { n_bits });
         }
+        if metric == Dist::Manhattan {
+            return Err(AnnSearchErrors::DistanceNotSupported(metric));
+        }
 
         let n = data.nrows();
         let dim = data.ncols();
@@ -327,7 +333,7 @@ where
             k_means_params,
             seed,
             verbose,
-        );
+        )?;
 
         let centroids_norm = if metric == Dist::Cosine {
             (0..nlist)
@@ -683,6 +689,7 @@ where
         let query_norm = match self.metric {
             Dist::Cosine => T::calculate_l2_norm(query_vec),
             Dist::SquaredEuclidean => T::one(),
+            Dist::Manhattan => unreachable!(),
         };
 
         let mut scored: Vec<_> = candidates
@@ -695,6 +702,7 @@ where
                     Dist::SquaredEuclidean => {
                         vector_store.euclidean_distance_to_query(idx, query_vec)
                     }
+                    Dist::Manhattan => unreachable!(),
                 };
                 (dist, idx)
             })
@@ -767,7 +775,7 @@ where
         rerank_factor: Option<usize>,
         return_dist: bool,
         verbose: bool,
-    ) -> AnnSearchOptionResult<T> {
+    ) -> KnnOptionResult<T> {
         let counter = Arc::new(AtomicUsize::new(0));
 
         if let Some(vector_store) = &self.vector_store {
@@ -1211,8 +1219,7 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "Vector store required for reranking")]
-    fn test_query_reranking_without_vector_store_panics() {
+    fn test_query_reranking_without_vector_store() {
         let data = create_test_data::<f32>(100, 32);
         let index = IvfIndexBinary::build(
             data.as_ref(),
@@ -1225,9 +1232,12 @@ mod tests {
             false,
         )
         .unwrap();
-
         let query: Vec<f32> = (0..32).map(|i| i as f32 * 0.1).collect();
-        let _ = index.query_reranking(&query, 10, Some(10), Some(5));
+        let result = index.query_reranking(&query, 10, Some(10), Some(5));
+        assert!(matches!(
+            result,
+            Err(AnnSearchErrors::VectorStoreNotAvailable)
+        ));
     }
 
     #[test]

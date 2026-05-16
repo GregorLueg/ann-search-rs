@@ -148,7 +148,11 @@ where
         k_means_params: Option<KMeansTrainingParams>,
         seed: usize,
         verbose: bool,
-    ) -> Self {
+    ) -> Result<Self, AnnSearchErrors> {
+        if metric == Dist::Manhattan {
+            return Err(AnnSearchErrors::DistanceNotSupported(metric));
+        }
+
         let (vectors_flat, n, dim) = matrix_to_flat(data);
 
         // Compute norms for Cosine distance
@@ -183,7 +187,7 @@ where
             k_means_params,
             seed,
             verbose,
-        );
+        )?;
 
         let centroids_norm = if metric == Dist::Cosine {
             (0..nlist)
@@ -243,7 +247,8 @@ where
 
         let new_to_old = idx.optimise_memory_layout();
         idx.original_ids = new_to_old;
-        idx
+
+        Ok(idx)
     }
 
     ///////////
@@ -303,6 +308,7 @@ where
                 let dist = match self.metric {
                     Dist::SquaredEuclidean => self.euclidean_distance_to_query(vec_idx, query_vec),
                     Dist::Cosine => self.cosine_distance_to_query(vec_idx, query_vec, query_norm),
+                    Dist::Manhattan => unreachable!(),
                 };
                 buffer.insert((OrderedFloat(dist), vec_idx), k);
             }
@@ -372,7 +378,7 @@ where
         nprobe: Option<usize>,
         return_dist: bool,
         verbose: bool,
-    ) -> AnnSearchOptionResult<T> {
+    ) -> KnnOptionResult<T> {
         let counter = Arc::new(AtomicUsize::new(0));
 
         let unordered_results: Vec<(usize, Vec<usize>, Vec<T>)> = (0..self.n)
@@ -555,7 +561,8 @@ mod tests {
             None,
             42,
             false,
-        );
+        )
+        .unwrap();
 
         let query = vec![1.0, 0.0, 0.0];
         let (indices, distances) = index.query(&query, 1, None).unwrap();
@@ -575,7 +582,8 @@ mod tests {
             None,
             42,
             false,
-        );
+        )
+        .unwrap();
 
         let query = vec![1.0, 0.0, 0.0];
         let (indices, distances) = index.query(&query, 3, None).unwrap();
@@ -592,7 +600,7 @@ mod tests {
     fn test_ivf_query_cosine() {
         let data = create_simple_matrix();
 
-        let index = IvfIndex::build(data.as_ref(), Dist::Cosine, Some(2), None, 42, false);
+        let index = IvfIndex::build(data.as_ref(), Dist::Cosine, Some(2), None, 42, false).unwrap();
 
         let query = vec![1.0, 0.0, 0.0];
         let (indices, distances) = index.query(&query, 3, None).unwrap();
@@ -611,7 +619,8 @@ mod tests {
             None,
             42,
             false,
-        );
+        )
+        .unwrap();
 
         let query = vec![1.0, 0.0, 0.0];
         let (indices, _) = index.query(&query, 10, None).unwrap();
@@ -629,7 +638,8 @@ mod tests {
             None,
             42,
             false,
-        );
+        )
+        .unwrap();
 
         let query = vec![1.0, 0.0, 0.0];
         let (indices1, _) = index.query(&query, 3, Some(1)).unwrap();
@@ -650,7 +660,8 @@ mod tests {
             None,
             42,
             false,
-        );
+        )
+        .unwrap();
         let index2 = IvfIndex::build(
             data.as_ref(),
             Dist::SquaredEuclidean,
@@ -658,7 +669,8 @@ mod tests {
             None,
             42,
             false,
-        );
+        )
+        .unwrap();
 
         let query = vec![0.5, 0.5, 0.0];
         let (indices1, _) = index1.query(&query, 3, None).unwrap();
@@ -678,7 +690,8 @@ mod tests {
             None,
             42,
             false,
-        );
+        )
+        .unwrap();
         let index2 = IvfIndex::build(
             data.as_ref(),
             Dist::SquaredEuclidean,
@@ -686,7 +699,8 @@ mod tests {
             None,
             123,
             false,
-        );
+        )
+        .unwrap();
 
         let query = vec![0.5, 0.5, 0.0];
         let (indices1, _) = index1.query(&query, 3, Some(2)).unwrap();
@@ -709,7 +723,8 @@ mod tests {
             None,
             42,
             false,
-        );
+        )
+        .unwrap();
 
         let query: Vec<f32> = (0..dim).map(|_| 0.0).collect();
         let (indices, _) = index.query(&query, 5, None).unwrap();
@@ -722,7 +737,7 @@ mod tests {
     fn test_ivf_orthogonal_vectors() {
         let data = Mat::from_fn(3, 3, |i, j| if i == j { 1.0 } else { 0.0 });
 
-        let index = IvfIndex::build(data.as_ref(), Dist::Cosine, Some(3), None, 42, false);
+        let index = IvfIndex::build(data.as_ref(), Dist::Cosine, Some(3), None, 42, false).unwrap();
 
         let query = vec![1.0, 0.0, 0.0];
         let (indices, distances) = index.query(&query, 3, None).unwrap();
@@ -749,7 +764,8 @@ mod tests {
             None,
             42,
             false,
-        );
+        )
+        .unwrap();
         let index_many = IvfIndex::build(
             data.as_ref(),
             Dist::SquaredEuclidean,
@@ -757,7 +773,8 @@ mod tests {
             None,
             42,
             false,
-        );
+        )
+        .unwrap();
 
         let query = vec![0.9, 0.1, 0.0];
         let (indices1, _) = index_few.query(&query, 3, Some(2)).unwrap();

@@ -76,7 +76,8 @@ fn main() {
         data.as_ref(),
         &cli.distance,
         device.clone(),
-    );
+    )
+    .unwrap();
     let gpu_ex_build = start.elapsed().as_secs_f64() * 1000.0;
     let gpu_ex_size = gpu_exhaustive_idx.memory_usage_bytes() as f64 / (1024.0 * 1024.0);
 
@@ -146,7 +147,8 @@ fn main() {
         false,
         true,
         device.clone(),
-    );
+    )
+    .unwrap();
     let cagra_build = start.elapsed().as_secs_f64() * 1000.0;
     let cagra_size = gpu_nndescent_idx.memory_usage_bytes() as f64 / (1024.0 * 1024.0);
 

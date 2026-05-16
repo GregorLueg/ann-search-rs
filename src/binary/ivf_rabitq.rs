@@ -113,6 +113,9 @@ where
         seed: usize,
         verbose: bool,
     ) -> Result<Self, AnnSearchErrors> {
+        if metric == Dist::Manhattan {
+            return Err(AnnSearchErrors::DistanceNotSupported(metric));
+        }
         let (vectors_flat, n, dim) = matrix_to_flat(data);
 
         // compute norms for Cosine distance
@@ -174,7 +177,7 @@ where
             k_means_params,
             seed,
             verbose,
-        );
+        )?;
 
         // normalise centroids for Cosine
         if metric == Dist::Cosine {
@@ -265,6 +268,9 @@ where
         verbose: bool,
         save_path: impl AsRef<Path>,
     ) -> Result<Self, AnnSearchErrors> {
+        if metric == Dist::Manhattan {
+            return Err(AnnSearchErrors::DistanceNotSupported(metric));
+        }
         let (vectors_flat, n, dim) = matrix_to_flat(data);
 
         // compute norms for Cosine distance
@@ -327,7 +333,7 @@ where
             k_means_params,
             seed,
             verbose,
-        );
+        )?;
 
         // Normalise centroids for Cosine
         if metric == Dist::Cosine {
@@ -429,6 +435,7 @@ where
                 }
             }
             Dist::SquaredEuclidean => (query_vec.to_vec(), T::one()),
+            Dist::Manhattan => unreachable!(),
         };
 
         // Use trait method - prenorm version since we've already normalised
@@ -519,6 +526,7 @@ where
         let query_norm = match self.encoder.metric {
             Dist::Cosine => compute_l2_norm(query_vec),
             Dist::SquaredEuclidean => T::one(),
+            Dist::Manhattan => unreachable!(),
         };
 
         let mut scored: Vec<_> = candidates
@@ -531,6 +539,7 @@ where
                     Dist::SquaredEuclidean => {
                         vector_store.euclidean_distance_to_query(idx, query_vec)
                     }
+                    Dist::Manhattan => unreachable!(),
                 };
                 (dist, idx)
             })
@@ -600,7 +609,7 @@ where
         rerank_factor: Option<usize>,
         return_dist: bool,
         verbose: bool,
-    ) -> AnnSearchOptionResult<T> {
+    ) -> KnnOptionResult<T> {
         let vector_store = self
             .vector_store
             .as_ref()

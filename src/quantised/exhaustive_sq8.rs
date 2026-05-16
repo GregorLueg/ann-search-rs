@@ -65,6 +65,16 @@ where
 }
 
 /////////////////////////
+// DimensionValidation //
+/////////////////////////
+
+impl<T> DimensionValidation for ExhaustiveSq8Index<T> {
+    fn dim(&self) -> usize {
+        self.dim
+    }
+}
+
+/////////////////////////
 // ExhaustiveSq8Index //
 /////////////////////////
 
@@ -90,7 +100,11 @@ where
     /// ### Returns
     ///
     /// Initialised exhaustive quantised index
-    pub fn new(data: MatRef<T>, metric: Dist) -> Self {
+    pub fn new(data: MatRef<T>, metric: Dist) -> Result<Self, AnnSearchErrors> {
+        if metric == Dist::Manhattan {
+            return Err(AnnSearchErrors::DistanceNotSupported(metric));
+        }
+
         let (mut vectors_flat, n, dim) = matrix_to_flat(data);
 
         // Normalise for cosine distance
@@ -122,16 +136,17 @@ where
                 .map(|chunk| chunk.iter().map(|&v| v as i32 * v as i32).sum())
                 .collect(),
             Dist::SquaredEuclidean => Vec::new(),
+            Dist::Manhattan => unreachable!(),
         };
 
-        Self {
+        Ok(Self {
             quantised_vectors,
             quantised_norms,
             dim,
             n,
             metric,
             codebook,
-        }
+        })
     }
 
     //////////////////
@@ -153,11 +168,12 @@ where
     ///
     /// A tuple of `(indices, distances)`
     #[inline]
-    pub fn query(&self, query_vec: &[T], k: usize) -> (Vec<usize>, Vec<T>) {
-        assert!(
-            query_vec.len() == self.dim,
-            "The query vector has different dimensionality than the index"
-        );
+    pub fn query(
+        &self,
+        query_vec: &[T],
+        k: usize,
+    ) -> Result<(Vec<usize>, Vec<T>), AnnSearchErrors> {
+        self.check_dim(query_vec.len())?;
 
         let mut query_vec = query_vec.to_vec();
         let k = k.min(self.n);
@@ -198,6 +214,7 @@ where
                     }
                 }
             }
+            Dist::Manhattan => unreachable!(),
         }
 
         let mut results: Vec<_> = heap.into_iter().collect();
@@ -208,7 +225,7 @@ where
             .map(|(OrderedFloat(dist), idx)| (dist, idx))
             .unzip();
 
-        (indices, distances)
+        Ok((indices, distances))
     }
 
     /// Query function for row references
@@ -226,12 +243,11 @@ where
     ///
     /// A tuple of `(indices, distances)`
     #[inline]
-    pub fn query_row(&self, query_row: RowRef<T>, k: usize) -> (Vec<usize>, Vec<T>) {
-        assert!(
-            query_row.ncols() == self.dim,
-            "The query row has different dimensionality than the index"
-        );
-
+    pub fn query_row(
+        &self,
+        query_row: RowRef<T>,
+        k: usize,
+    ) -> Result<(Vec<usize>, Vec<T>), AnnSearchErrors> {
         if query_row.col_stride() == 1 {
             let slice =
                 unsafe { std::slice::from_raw_parts(query_row.as_ptr(), query_row.ncols()) };
@@ -295,6 +311,7 @@ where
                     let dist = match self.metric {
                         Dist::SquaredEuclidean => self.euclidean_distance_i8(idx, query_i8),
                         Dist::Cosine => self.cosine_distance_i8(idx, query_i8, query_norm_sq),
+                        Dist::Manhattan => unreachable!(),
                     };
 
                     if heap.len() < k {
@@ -358,7 +375,7 @@ mod tests {
     #[test]
     fn test_exhaustive_sq8_index_creation_euclidean() {
         let mat = create_simple_matrix();
-        let index = ExhaustiveSq8Index::new(mat.as_ref(), Dist::SquaredEuclidean);
+        let index = ExhaustiveSq8Index::new(mat.as_ref(), Dist::SquaredEuclidean).unwrap();
 
         assert_eq!(index.n, 5);
         assert_eq!(index.dim, 3);
@@ -369,7 +386,7 @@ mod tests {
     #[test]
     fn test_exhaustive_sq8_index_creation_cosine() {
         let mat = create_simple_matrix();
-        let index = ExhaustiveSq8Index::new(mat.as_ref(), Dist::Cosine);
+        let index = ExhaustiveSq8Index::new(mat.as_ref(), Dist::Cosine).unwrap();
 
         assert_eq!(index.n, 5);
         assert_eq!(index.dim, 3);
@@ -380,10 +397,10 @@ mod tests {
     #[test]
     fn test_exhaustive_sq8_query_finds_self_euclidean() {
         let mat = create_simple_matrix();
-        let index = ExhaustiveSq8Index::new(mat.as_ref(), Dist::SquaredEuclidean);
+        let index = ExhaustiveSq8Index::new(mat.as_ref(), Dist::SquaredEuclidean).unwrap();
 
         let query = vec![1.0, 0.0, 0.0];
-        let (indices, distances) = index.query(&query, 1);
+        let (indices, distances) = index.query(&query, 1).unwrap();
 
         assert_eq!(indices.len(), 1);
         assert_eq!(indices[0], 0);
@@ -393,10 +410,10 @@ mod tests {
     #[test]
     fn test_exhaustive_sq8_query_finds_self_cosine() {
         let mat = create_simple_matrix();
-        let index = ExhaustiveSq8Index::new(mat.as_ref(), Dist::Cosine);
+        let index = ExhaustiveSq8Index::new(mat.as_ref(), Dist::Cosine).unwrap();
 
         let query = vec![1.0, 0.0, 0.0];
-        let (indices, _distances) = index.query(&query, 1);
+        let (indices, _distances) = index.query(&query, 1).unwrap();
 
         assert_eq!(indices[0], 0);
     }
@@ -404,10 +421,10 @@ mod tests {
     #[test]
     fn test_exhaustive_sq8_query_euclidean_multiple() {
         let mat = create_simple_matrix();
-        let index = ExhaustiveSq8Index::new(mat.as_ref(), Dist::SquaredEuclidean);
+        let index = ExhaustiveSq8Index::new(mat.as_ref(), Dist::SquaredEuclidean).unwrap();
 
         let query = vec![1.0, 0.0, 0.0];
-        let (indices, distances) = index.query(&query, 3);
+        let (indices, distances) = index.query(&query, 3).unwrap();
 
         assert_eq!(indices[0], 0);
 
@@ -419,10 +436,10 @@ mod tests {
     #[test]
     fn test_exhaustive_sq8_query_cosine_orthogonal() {
         let mat = create_simple_matrix();
-        let index = ExhaustiveSq8Index::new(mat.as_ref(), Dist::Cosine);
+        let index = ExhaustiveSq8Index::new(mat.as_ref(), Dist::Cosine).unwrap();
 
         let query = vec![1.0, 0.0, 0.0];
-        let (indices, distances) = index.query(&query, 5);
+        let (indices, distances) = index.query(&query, 5).unwrap();
 
         assert_eq!(indices[0], 0);
 
@@ -435,10 +452,10 @@ mod tests {
     #[test]
     fn test_exhaustive_sq8_query_k_larger_than_dataset() {
         let mat = create_simple_matrix();
-        let index = ExhaustiveSq8Index::new(mat.as_ref(), Dist::SquaredEuclidean);
+        let index = ExhaustiveSq8Index::new(mat.as_ref(), Dist::SquaredEuclidean).unwrap();
 
         let query = vec![1.0, 0.0, 0.0];
-        let (indices, _) = index.query(&query, 10);
+        let (indices, _) = index.query(&query, 10).unwrap();
 
         assert_eq!(indices.len(), 5);
     }
@@ -446,9 +463,9 @@ mod tests {
     #[test]
     fn test_exhaustive_sq8_query_row() {
         let mat = create_simple_matrix();
-        let index = ExhaustiveSq8Index::new(mat.as_ref(), Dist::SquaredEuclidean);
+        let index = ExhaustiveSq8Index::new(mat.as_ref(), Dist::SquaredEuclidean).unwrap();
 
-        let (indices, distances) = index.query_row(mat.row(0), 1);
+        let (indices, distances) = index.query_row(mat.row(0), 1).unwrap();
 
         assert_eq!(indices[0], 0);
         assert!(distances[0] < 0.1);
@@ -457,10 +474,10 @@ mod tests {
     #[test]
     fn test_exhaustive_sq8_euclidean_distances() {
         let mat = create_simple_matrix();
-        let index = ExhaustiveSq8Index::new(mat.as_ref(), Dist::SquaredEuclidean);
+        let index = ExhaustiveSq8Index::new(mat.as_ref(), Dist::SquaredEuclidean).unwrap();
 
         let query = vec![1.0, 0.0, 0.0];
-        let (indices, distances) = index.query(&query, 5);
+        let (indices, distances) = index.query(&query, 5).unwrap();
 
         assert_eq!(indices[0], 0);
         assert!(distances[0] < 0.1);
@@ -473,10 +490,10 @@ mod tests {
     #[test]
     fn test_exhaustive_sq8_all_points_found() {
         let mat = create_simple_matrix();
-        let index = ExhaustiveSq8Index::new(mat.as_ref(), Dist::SquaredEuclidean);
+        let index = ExhaustiveSq8Index::new(mat.as_ref(), Dist::SquaredEuclidean).unwrap();
 
         let query = vec![0.5, 0.5, 0.5];
-        let (indices, _) = index.query(&query, 5);
+        let (indices, _) = index.query(&query, 5).unwrap();
 
         assert_eq!(indices.len(), 5);
 
@@ -498,10 +515,10 @@ mod tests {
         }
 
         let mat = Mat::from_fn(n, dim, |i, j| data[i * dim + j]);
-        let index = ExhaustiveSq8Index::new(mat.as_ref(), Dist::SquaredEuclidean);
+        let index = ExhaustiveSq8Index::new(mat.as_ref(), Dist::SquaredEuclidean).unwrap();
 
         let query: Vec<f32> = (0..dim).map(|_| 0.0).collect();
-        let (indices, _) = index.query(&query, 5);
+        let (indices, _) = index.query(&query, 5).unwrap();
 
         assert_eq!(indices.len(), 5);
         assert_eq!(indices[0], 0);
@@ -515,10 +532,10 @@ mod tests {
             -2.0, 1.0, 0.0, // Vector 2
         ];
         let mat = Mat::from_fn(3, 3, |i, j| data[i * 3 + j]);
-        let index = ExhaustiveSq8Index::new(mat.as_ref(), Dist::Cosine);
+        let index = ExhaustiveSq8Index::new(mat.as_ref(), Dist::Cosine).unwrap();
 
         let query = vec![1.0, 2.0, 3.0];
-        let (indices, distances) = index.query(&query, 3);
+        let (indices, distances) = index.query(&query, 3).unwrap();
 
         assert_eq!(indices[0], 0);
         assert!(distances[0] < 0.1);
@@ -530,7 +547,7 @@ mod tests {
     #[test]
     fn test_exhaustive_sq8_implements_vector_distance() {
         let mat = create_simple_matrix();
-        let index = ExhaustiveSq8Index::new(mat.as_ref(), Dist::SquaredEuclidean);
+        let index = ExhaustiveSq8Index::new(mat.as_ref(), Dist::SquaredEuclidean).unwrap();
 
         let query = vec![1.0, 0.0, 0.0];
         let query_i8 = index.codebook.encode(&query);
@@ -545,7 +562,7 @@ mod tests {
     #[test]
     fn test_exhaustive_sq8_cosine_implements_vector_distance() {
         let mat = create_simple_matrix();
-        let index = ExhaustiveSq8Index::new(mat.as_ref(), Dist::Cosine);
+        let index = ExhaustiveSq8Index::new(mat.as_ref(), Dist::Cosine).unwrap();
 
         let query = vec![1.0, 0.0, 0.0];
         let query_i8 = index.codebook.encode(&query);
@@ -561,11 +578,11 @@ mod tests {
     #[test]
     fn test_exhaustive_sq8_query_consistency() {
         let mat = create_simple_matrix();
-        let index = ExhaustiveSq8Index::new(mat.as_ref(), Dist::SquaredEuclidean);
+        let index = ExhaustiveSq8Index::new(mat.as_ref(), Dist::SquaredEuclidean).unwrap();
 
         let query_vec = vec![1.0, 0.0, 0.0];
-        let (indices1, distances1) = index.query(&query_vec, 3);
-        let (indices2, distances2) = index.query_row(mat.row(0), 3);
+        let (indices1, distances1) = index.query(&query_vec, 3).unwrap();
+        let (indices2, distances2) = index.query_row(mat.row(0), 3).unwrap();
 
         assert_eq!(indices1, indices2);
         for i in 0..distances1.len() {
@@ -576,7 +593,7 @@ mod tests {
     #[test]
     fn test_exhaustive_sq8_generate_knn() {
         let mat = create_simple_matrix();
-        let index = ExhaustiveSq8Index::new(mat.as_ref(), Dist::SquaredEuclidean);
+        let index = ExhaustiveSq8Index::new(mat.as_ref(), Dist::SquaredEuclidean).unwrap();
 
         let (knn_indices, knn_distances) = index.generate_knn(2, true, false);
 
@@ -597,7 +614,7 @@ mod tests {
     #[test]
     fn test_exhaustive_sq8_memory_usage() {
         let mat = create_simple_matrix();
-        let index = ExhaustiveSq8Index::new(mat.as_ref(), Dist::SquaredEuclidean);
+        let index = ExhaustiveSq8Index::new(mat.as_ref(), Dist::SquaredEuclidean).unwrap();
 
         let memory = index.memory_usage_bytes();
         assert!(memory > 0);

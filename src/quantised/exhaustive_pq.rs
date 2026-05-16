@@ -68,6 +68,16 @@ where
 }
 
 /////////////////////////
+// DimensionValidation //
+/////////////////////////
+
+impl<T> DimensionValidation for ExhaustivePqIndex<T> {
+    fn dim(&self) -> usize {
+        self.dim
+    }
+}
+
+/////////////////////////
 // Main implementation //
 /////////////////////////
 
@@ -99,7 +109,11 @@ where
         n_pq_centroids: Option<usize>,
         seed: usize,
         verbose: bool,
-    ) -> Self {
+    ) -> Result<Self, AnnSearchErrors> {
+        if metric == Dist::Manhattan {
+            return Err(AnnSearchErrors::DistanceNotSupported(metric));
+        }
+
         let (mut vectors_flat, n, dim) = matrix_to_flat(data);
         let max_iters = max_iters.unwrap_or(30);
 
@@ -125,7 +139,7 @@ where
             max_iters,
             seed,
             verbose,
-        );
+        )?;
 
         let mut quantised_codes = vec![0u8; n * m];
         quantised_codes
@@ -138,13 +152,13 @@ where
                 chunk.copy_from_slice(&codes);
             });
 
-        Self {
+        Ok(Self {
             quantised_codes,
             codebook,
             dim,
             n,
             metric,
-        }
+        })
     }
 
     /// Query the index for approximate nearest neighbours
@@ -161,7 +175,13 @@ where
     /// ### Returns
     ///
     /// Tuple of (indices, distances) sorted by distance
-    pub fn query(&self, query_vec: &[T], k: usize) -> (Vec<usize>, Vec<T>) {
+    pub fn query(
+        &self,
+        query_vec: &[T],
+        k: usize,
+    ) -> Result<(Vec<usize>, Vec<T>), AnnSearchErrors> {
+        self.check_dim(query_vec.len())?;
+
         let mut query_vec = query_vec.to_vec();
         if self.metric == Dist::Cosine {
             normalise_vector(&mut query_vec);
@@ -185,7 +205,8 @@ where
         let mut results: Vec<_> = heap.into_iter().collect();
         results.sort_unstable_by_key(|&(dist, _)| dist);
         let (distances, indices) = results.into_iter().map(|(d, i)| (d.0, i)).unzip();
-        (indices, distances)
+
+        Ok((indices, distances))
     }
 
     /// Query using a matrix row reference
@@ -199,7 +220,11 @@ where
     /// ### Returns
     ///
     /// Tuple of (indices, distances) sorted by distance
-    pub fn query_row(&self, query_row: RowRef<T>, k: usize) -> (Vec<usize>, Vec<T>) {
+    pub fn query_row(
+        &self,
+        query_row: RowRef<T>,
+        k: usize,
+    ) -> Result<(Vec<usize>, Vec<T>), AnnSearchErrors> {
         if query_row.col_stride() == 1 {
             let slice =
                 unsafe { std::slice::from_raw_parts(query_row.as_ptr(), query_row.ncols()) };
@@ -225,12 +250,7 @@ where
     ///
     /// Tuple of `(knn_indices, optional distances)` where each row corresponds
     /// to a vector in the index
-    pub fn generate_knn(
-        &self,
-        k: usize,
-        return_dist: bool,
-        verbose: bool,
-    ) -> (Vec<Vec<usize>>, Option<Vec<Vec<T>>>) {
+    pub fn generate_knn(&self, k: usize, return_dist: bool, verbose: bool) -> KnnOptionResult<T> {
         let m = self.codebook.m();
         let counter = Arc::new(AtomicUsize::new(0));
 
@@ -255,14 +275,14 @@ where
 
                 self.query(&reconstructed, k)
             })
-            .collect();
+            .collect::<Result<Vec<_>, _>>()?;
 
         if return_dist {
             let (indices, distances) = results.into_iter().unzip();
-            (indices, Some(distances))
+            Ok((indices, Some(distances)))
         } else {
             let indices = results.into_iter().map(|(idx, _)| idx).collect();
-            (indices, None)
+            Ok((indices, None))
         }
     }
 
@@ -316,7 +336,8 @@ mod tests {
             Some(4),
             42,
             false,
-        );
+        )
+        .unwrap();
 
         assert_eq!(index.dim, 32);
         assert_eq!(index.n, 6);
@@ -328,7 +349,8 @@ mod tests {
     fn test_build_cosine() {
         let data = create_simple_dataset();
         let index =
-            ExhaustivePqIndex::build(data.as_ref(), 8, Dist::Cosine, Some(10), Some(4), 42, false);
+            ExhaustivePqIndex::build(data.as_ref(), 8, Dist::Cosine, Some(10), Some(4), 42, false)
+                .unwrap();
 
         assert_eq!(index.metric, Dist::Cosine);
     }
@@ -344,10 +366,11 @@ mod tests {
             Some(4),
             42,
             false,
-        );
+        )
+        .unwrap();
 
         let query: Vec<f32> = (0..32).map(|x| x as f32 * 0.01).collect();
-        let (indices, distances) = index.query(&query, 3);
+        let (indices, distances) = index.query(&query, 3).unwrap();
 
         assert_eq!(indices.len(), 3);
         assert_eq!(distances.len(), 3);
@@ -364,10 +387,11 @@ mod tests {
             Some(4),
             42,
             false,
-        );
+        )
+        .unwrap();
 
         let query: Vec<f32> = (0..32).map(|x| x as f32 * 0.01).collect();
-        let (indices, _) = index.query(&query, 100);
+        let (indices, _) = index.query(&query, 100).unwrap();
 
         assert_eq!(indices.len(), 6);
     }
@@ -383,10 +407,11 @@ mod tests {
             Some(4),
             42,
             false,
-        );
+        )
+        .unwrap();
 
         let query: Vec<f32> = (0..32).map(|x| x as f32 * 0.01).collect();
-        let (_, distances) = index.query(&query, 3);
+        let (_, distances) = index.query(&query, 3).unwrap();
 
         for i in 1..distances.len() {
             assert!(distances[i] >= distances[i - 1]);
@@ -397,10 +422,11 @@ mod tests {
     fn test_query_cosine() {
         let data = create_simple_dataset();
         let index =
-            ExhaustivePqIndex::build(data.as_ref(), 8, Dist::Cosine, Some(10), Some(4), 42, false);
+            ExhaustivePqIndex::build(data.as_ref(), 8, Dist::Cosine, Some(10), Some(4), 42, false)
+                .unwrap();
 
         let query: Vec<f32> = (0..32).map(|x| if x < 16 { 1.0 } else { 0.0 }).collect();
-        let (indices, distances) = index.query(&query, 3);
+        let (indices, distances) = index.query(&query, 3).unwrap();
 
         assert_eq!(indices.len(), 3);
         assert_eq!(distances.len(), 3);
@@ -417,12 +443,13 @@ mod tests {
             Some(4),
             42,
             false,
-        );
+        )
+        .unwrap();
 
         let query: Vec<f32> = (0..32).map(|x| 0.5 + x as f32 * 0.01).collect();
 
-        let (indices1, distances1) = index.query(&query, 3);
-        let (indices2, distances2) = index.query(&query, 3);
+        let (indices1, distances1) = index.query(&query, 3).unwrap();
+        let (indices2, distances2) = index.query(&query, 3).unwrap();
 
         assert_eq!(indices1, indices2);
         assert_eq!(distances1, distances2);
@@ -439,12 +466,13 @@ mod tests {
             Some(4),
             42,
             false,
-        );
+        )
+        .unwrap();
 
         let query_mat = Mat::<f32>::from_fn(1, 32, |_, j| 0.5 + j as f32 * 0.01);
         let row = query_mat.row(0);
 
-        let (indices, distances) = index.query_row(row, 3);
+        let (indices, distances) = index.query_row(row, 3).unwrap();
 
         assert_eq!(indices.len(), 3);
         assert_eq!(distances.len(), 3);
@@ -462,7 +490,8 @@ mod tests {
             Some(4),
             42,
             false,
-        );
+        )
+        .unwrap();
 
         assert_eq!(index.codebook.m(), 8);
         assert_eq!(index.codebook.subvec_dim(), 4);
@@ -480,7 +509,8 @@ mod tests {
             Some(4),
             42,
             false,
-        );
+        )
+        .unwrap();
 
         let query: Vec<f32> = (0..32).map(|x| x as f32 * 0.01).collect();
         let table = index.build_lookup_tables_direct(&query);
@@ -500,7 +530,8 @@ mod tests {
             Some(4),
             42,
             false,
-        );
+        )
+        .unwrap();
 
         let query: Vec<f32> = (0..32).map(|x| x as f32 * 0.01).collect();
         let table = index.build_lookup_tables_direct(&query);
@@ -522,11 +553,12 @@ mod tests {
             Some(4),
             42,
             false,
-        );
+        )
+        .unwrap();
 
         // Query with vector from dataset
         let query: Vec<f32> = (0..32).map(|x| x as f32).collect();
-        let (indices, _) = index.query(&query, 1);
+        let (indices, _) = index.query(&query, 1).unwrap();
 
         // Should find exact or very close match
         assert_eq!(indices[0], 0);
@@ -543,7 +575,8 @@ mod tests {
             Some(4),
             42,
             false,
-        );
+        )
+        .unwrap();
 
         let memory = index.memory_usage_bytes();
         assert!(memory > 0);
@@ -561,9 +594,10 @@ mod tests {
             Some(4),
             42,
             false,
-        );
+        )
+        .unwrap();
 
-        let (knn_indices, knn_distances) = index.generate_knn(3, true, false);
+        let (knn_indices, knn_distances) = index.generate_knn(3, true, false).unwrap();
 
         assert_eq!(knn_indices.len(), 10);
         assert!(knn_distances.is_some());
@@ -589,9 +623,10 @@ mod tests {
             Some(4),
             42,
             false,
-        );
+        )
+        .unwrap();
 
-        let (knn_indices, knn_distances) = index.generate_knn(3, false, false);
+        let (knn_indices, knn_distances) = index.generate_knn(3, false, false).unwrap();
 
         assert_eq!(knn_indices.len(), 10);
         assert!(knn_distances.is_none());
@@ -614,7 +649,8 @@ mod tests {
             Some(4),
             42,
             false,
-        );
+        )
+        .unwrap();
         assert_eq!(index_4.codebook.m(), 4);
         assert_eq!(index_4.codebook.subvec_dim(), 16);
 
@@ -627,7 +663,8 @@ mod tests {
             Some(4),
             42,
             false,
-        );
+        )
+        .unwrap();
         assert_eq!(index_16.codebook.m(), 16);
         assert_eq!(index_16.codebook.subvec_dim(), 4);
     }

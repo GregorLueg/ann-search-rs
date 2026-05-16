@@ -664,6 +664,7 @@ where
                         dim_lines,
                     );
                 },
+                Dist::Manhattan => unreachable!(),
             }
 
             // Extract directly into the running top-k buffer

@@ -90,7 +90,8 @@ fn main() {
             &cli.distance,
             cli.seed as usize,
             false,
-        );
+        )
+        .unwrap();
         let build_time = start.elapsed().as_secs_f64() * 1000.0;
 
         let index_size_mb = exhaustive_opq_idx.memory_usage_bytes() as f64 / (1024.0 * 1024.0);
@@ -104,7 +105,8 @@ fn main() {
             cli.k,
             false,
             false,
-        );
+        )
+        .unwrap();
         let query_time = start.elapsed().as_secs_f64() * 1000.0;
 
         let recall = calculate_recall(&true_neighbours, &approx_neighbours, cli.k);
@@ -123,7 +125,7 @@ fn main() {
         println!("Self-querying exhaustive OPQ index with m={}...", m);
         let start = Instant::now();
         let (approx_neighbours_self, _) =
-            query_exhaustive_opq_index_self(&exhaustive_opq_idx, cli.k, false, false);
+            query_exhaustive_opq_index_self(&exhaustive_opq_idx, cli.k, false, false).unwrap();
         let self_query_time = start.elapsed().as_secs_f64() * 1000.0;
 
         let recall_self = calculate_recall(&true_neighbours_self, &approx_neighbours_self, cli.k);
@@ -165,7 +167,8 @@ fn main() {
                 &cli.distance,
                 cli.seed as usize,
                 false,
-            );
+            )
+            .unwrap();
             let build_time = start.elapsed().as_secs_f64() * 1000.0;
 
             let index_size_mb = ivf_opq_idx.memory_usage_bytes() as f64 / (1024.0 * 1024.0);
@@ -201,7 +204,8 @@ fn main() {
                     Some(*nprobe),
                     false,
                     false,
-                );
+                )
+                .unwrap();
                 let query_time = start.elapsed().as_secs_f64() * 1000.0;
 
                 let recall = calculate_recall(&true_neighbours, &approx_neighbours, cli.k);
@@ -222,7 +226,8 @@ fn main() {
             println!("Self-querying IVF-OPQ index (nprobe={})...", nprobe_self);
             let start = Instant::now();
             let (approx_neighbours_self, _) =
-                query_ivf_opq_index_self(&ivf_opq_idx, cli.k, Some(nprobe_self), false, false);
+                query_ivf_opq_index_self(&ivf_opq_idx, cli.k, Some(nprobe_self), false, false)
+                    .unwrap();
             let self_query_time = start.elapsed().as_secs_f64() * 1000.0;
 
             let recall_self =

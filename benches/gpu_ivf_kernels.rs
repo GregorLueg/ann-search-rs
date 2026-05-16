@@ -172,15 +172,18 @@ fn run_ivf_suite<R: Runtime>(device: &R::Device) {
             .collect();
         let mat = Mat::from_fn(n, dim, |i, j| data[i * dim + j]);
 
-        let index = std::sync::Arc::new(IvfIndexGpu::<f32, R>::build(
-            mat.as_ref(),
-            Dist::SquaredEuclidean,
-            Some(nlist),
-            default_k_means_params(),
-            42,
-            false,
-            device.clone(),
-        ));
+        let index = std::sync::Arc::new(
+            IvfIndexGpu::<f32, R>::build(
+                mat.as_ref(),
+                Dist::SquaredEuclidean,
+                Some(nlist),
+                default_k_means_params(),
+                42,
+                false,
+                device.clone(),
+            )
+            .unwrap(),
+        );
 
         let nprobe_values = vec![
             ((nlist as f32).sqrt() as usize).max(1),

@@ -67,7 +67,11 @@ where
     /// ### Returns
     ///
     /// Initialised exhaustive index (on GPU)
-    pub fn new(data: MatRef<T>, metric: Dist, device: R::Device) -> Self {
+    pub fn new(data: MatRef<T>, metric: Dist, device: R::Device) -> Result<Self, AnnSearchErrors> {
+        if metric == Dist::Manhattan {
+            return Err(AnnSearchErrors::DistanceNotSupported(metric));
+        }
+
         let (vectors_flat, n, dim) = matrix_to_flat(data);
 
         let line = LINE_SIZE as usize;
@@ -92,7 +96,7 @@ where
             Vec::new()
         };
 
-        Self {
+        Ok(Self {
             vectors_flat: vectors_padded,
             norms,
             dim,
@@ -100,7 +104,7 @@ where
             n,
             metric,
             device,
-        }
+        })
     }
 
     /// Query the exhaustive index
@@ -115,12 +119,7 @@ where
     /// ### Returns
     ///
     /// A tuple of `(Vec<indices>, Vec<distances>)`
-    pub fn query_batch(
-        &self,
-        query_mat: MatRef<T>,
-        k: usize,
-        verbose: bool,
-    ) -> AnnSearchResults<T> {
+    pub fn query_batch(&self, query_mat: MatRef<T>, k: usize, verbose: bool) -> KnnResult<T> {
         let (vectors_query, n_query, dim_query) = matrix_to_flat(query_mat);
         self.check_dim(dim_query)?;
 
@@ -233,7 +232,8 @@ mod tests {
             data.as_ref(),
             Dist::SquaredEuclidean,
             device,
-        );
+        )
+        .unwrap();
 
         let query = Mat::from_fn(2, 4, |i, j| if i == j { 1.0_f32 } else { 0.0_f32 });
 
@@ -254,7 +254,8 @@ mod tests {
 
         let data = Mat::from_fn(4, 4, |i, _j| i as f32 + 1.0);
 
-        let index = ExhaustiveIndexGpu::<f32, CpuRuntime>::new(data.as_ref(), Dist::Cosine, device);
+        let index = ExhaustiveIndexGpu::<f32, CpuRuntime>::new(data.as_ref(), Dist::Cosine, device)
+            .unwrap();
 
         let query = Mat::from_fn(1, 4, |_, _| 1.0_f32);
         let (indices, distances) = index.query_batch(query.as_ref(), 2, false).unwrap();
@@ -274,7 +275,8 @@ mod tests {
             data.as_ref(),
             Dist::SquaredEuclidean,
             device,
-        );
+        )
+        .unwrap();
 
         let (indices, distances) = index.generate_knn(3, true, false);
 

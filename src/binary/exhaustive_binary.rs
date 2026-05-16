@@ -431,6 +431,7 @@ where
         let query_norm = match self.metric {
             Dist::Cosine => T::calculate_l2_norm(query_vec),
             Dist::SquaredEuclidean => T::one(),
+            Dist::Manhattan => unreachable!(),
         };
 
         let mut scored: Vec<_> = candidates
@@ -443,6 +444,7 @@ where
                     Dist::SquaredEuclidean => {
                         vector_store.euclidean_distance_to_query(idx, query_vec)
                     }
+                    Dist::Manhattan => unreachable!(),
                 };
                 (idx, dist)
             })
@@ -513,7 +515,7 @@ where
         rerank_factor: Option<usize>,
         return_dist: bool,
         verbose: bool,
-    ) -> AnnSearchOptionResult<T> {
+    ) -> KnnOptionResult<T> {
         use std::sync::{
             atomic::{AtomicUsize, Ordering},
             Arc,
@@ -834,12 +836,14 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "Vector store required for reranking")]
-    fn test_query_reranking_without_vector_store_panics() {
+    fn test_query_reranking_without_vector_store() {
         let data = create_test_data::<f32>(50, 32);
         let index = ExhaustiveIndexBinary::new(data.as_ref(), "random", 64, 42).unwrap();
-
         let query: Vec<f32> = (0..32).map(|i| i as f32 * 0.1).collect();
-        let _ = index.query_reranking(&query, 10, Some(5));
+        let result = index.query_reranking(&query, 10, Some(5));
+        assert!(matches!(
+            result,
+            Err(AnnSearchErrors::VectorStoreNotAvailable)
+        ));
     }
 }

@@ -98,6 +98,16 @@ where
     }
 }
 
+/////////////////////////
+// DimensionValidation //
+/////////////////////////
+
+impl<T> DimensionValidation for IvfIndexBf16<T> {
+    fn dim(&self) -> usize {
+        self.dim
+    }
+}
+
 ////////////////
 // Main index //
 ////////////////
@@ -144,7 +154,11 @@ where
         k_means_params: Option<KMeansTrainingParams>,
         seed: usize,
         verbose: bool,
-    ) -> Self {
+    ) -> Result<Self, AnnSearchErrors> {
+        if metric == Dist::Manhattan {
+            return Err(AnnSearchErrors::DistanceNotSupported(metric));
+        }
+
         let (vectors_flat, n, dim) = matrix_to_flat(data);
 
         // Compute norms for Cosine distance
@@ -180,7 +194,7 @@ where
             k_means_params,
             seed,
             verbose,
-        );
+        )?;
 
         let centroids_norm = if metric == Dist::Cosine {
             (0..nlist)
@@ -239,7 +253,8 @@ where
 
         let new_to_old = idx.optimise_memory_layout();
         idx.original_ids = new_to_old;
-        idx
+
+        Ok(idx)
     }
 
     ///////////
@@ -263,7 +278,14 @@ where
     ///
     /// Tuple of `(indices, distances)` sorted by distance (nearest first)
     #[inline]
-    pub fn query(&self, query_vec: &[T], k: usize, nprobe: Option<usize>) -> (Vec<usize>, Vec<T>) {
+    pub fn query(
+        &self,
+        query_vec: &[T],
+        k: usize,
+        nprobe: Option<usize>,
+    ) -> Result<(Vec<usize>, Vec<T>), AnnSearchErrors> {
+        self.check_dim(query_vec.len())?;
+
         let nprobe = nprobe
             .unwrap_or_else(|| ((self.nlist as f64).sqrt() as usize).max(1))
             .min(self.nlist);
@@ -296,6 +318,7 @@ where
                     Dist::Cosine => {
                         self.cosine_distance_to_query_bf16(vec_idx, query_vec, query_norm)
                     }
+                    Dist::Manhattan => unreachable!(),
                 };
                 buffer.insert((OrderedFloat(dist), vec_idx), k);
             }
@@ -306,7 +329,8 @@ where
             .iter()
             .map(|(d, i)| (d.0, self.original_ids[*i]))
             .unzip();
-        (indices, distances)
+
+        Ok((indices, distances))
     }
 
     /// Query the index for approximate nearest neighbours
@@ -330,7 +354,7 @@ where
         query_row: RowRef<T>,
         k: usize,
         nprobe: Option<usize>,
-    ) -> (Vec<usize>, Vec<T>) {
+    ) -> Result<(Vec<usize>, Vec<T>), AnnSearchErrors> {
         if query_row.col_stride() == 1 {
             let slice =
                 unsafe { std::slice::from_raw_parts(query_row.as_ptr(), query_row.ncols()) };
@@ -463,6 +487,7 @@ where
                         query_vec,
                         bf16::from_f32(query_norm.to_f32().unwrap()),
                     ),
+                    Dist::Manhattan => unreachable!(),
                 };
                 buffer.insert((OrderedFloat(dist), vec_idx), k);
             }
@@ -569,7 +594,8 @@ mod tests {
             get_default_k_means(),
             42,
             false,
-        );
+        )
+        .unwrap();
 
         assert_eq!(index.n, 200);
         assert_eq!(index.dim, 32);
@@ -588,7 +614,8 @@ mod tests {
             get_default_k_means(),
             42,
             false,
-        );
+        )
+        .unwrap();
 
         assert_eq!(index.n, 200);
         assert_eq!(index.dim, 32);
@@ -606,10 +633,11 @@ mod tests {
             get_default_k_means(),
             42,
             false,
-        );
+        )
+        .unwrap();
 
         let query: Vec<f32> = (0..32).map(|i| i as f32 * 0.1).collect();
-        let (indices, distances) = index.query(&query, 10, Some(10));
+        let (indices, distances) = index.query(&query, 10, Some(10)).unwrap();
 
         assert_eq!(indices.len(), 10);
         assert_eq!(distances.len(), 10);
@@ -625,10 +653,11 @@ mod tests {
             get_default_k_means(),
             42,
             false,
-        );
+        )
+        .unwrap();
 
         let query: Vec<f32> = (0..32).map(|i| i as f32 * 0.1).collect();
-        let (_, distances) = index.query(&query, 10, Some(10));
+        let (_, distances) = index.query(&query, 10, Some(10)).unwrap();
 
         for i in 1..distances.len() {
             assert!(distances[i] >= distances[i - 1]);
@@ -645,9 +674,10 @@ mod tests {
             get_default_k_means(),
             42,
             false,
-        );
+        )
+        .unwrap();
 
-        let (indices, distances) = index.query_row(data.as_ref().row(0), 10, Some(10));
+        let (indices, distances) = index.query_row(data.as_ref().row(0), 10, Some(10)).unwrap();
 
         assert!(indices.len() <= 10);
         assert!(distances.len() <= 10);
@@ -664,10 +694,11 @@ mod tests {
             get_default_k_means(),
             42,
             false,
-        );
+        )
+        .unwrap();
 
         let query: Vec<f32> = (0..32).map(|i| i as f32 * 0.1).collect();
-        let (indices, distances) = index.query(&query, 10, Some(10));
+        let (indices, distances) = index.query(&query, 10, Some(10)).unwrap();
 
         assert_eq!(indices.len(), 10);
         assert_eq!(distances.len(), 10);
@@ -686,7 +717,8 @@ mod tests {
             get_default_k_means(),
             42,
             false,
-        );
+        )
+        .unwrap();
 
         let (knn_indices, knn_distances) = index.generate_knn(5, Some(10), true, false);
 
@@ -708,11 +740,12 @@ mod tests {
             get_default_k_means(),
             42,
             false,
-        );
+        )
+        .unwrap();
 
         let query: Vec<f32> = (0..32).map(|i| i as f32 * 0.1).collect();
-        let (indices1, _) = index.query(&query, 10, Some(2));
-        let (indices2, _) = index.query(&query, 10, Some(10));
+        let (indices1, _) = index.query(&query, 10, Some(2)).unwrap();
+        let (indices2, _) = index.query(&query, 10, Some(10)).unwrap();
 
         assert!(indices1.len() <= 10);
         assert!(indices2.len() <= 10);

@@ -112,6 +112,16 @@ where
     }
 }
 
+/////////////////////////
+// DimensionValidation //
+/////////////////////////
+
+impl<T> DimensionValidation for IvfOpqIndex<T> {
+    fn dim(&self) -> usize {
+        self.dim
+    }
+}
+
 ////////////////
 // Main index //
 ////////////////
@@ -152,7 +162,11 @@ where
         n_opq_centroids: Option<usize>,
         seed: usize,
         verbose: bool,
-    ) -> Self {
+    ) -> Result<Self, AnnSearchErrors> {
+        if metric == Dist::Manhattan {
+            return Err(AnnSearchErrors::DistanceNotSupported(metric));
+        }
+
         let (mut vectors_flat, n, dim) = matrix_to_flat(data);
 
         let nlist = nlist.unwrap_or((n as f32).sqrt() as usize).max(1);
@@ -185,7 +199,7 @@ where
             k_means_params,
             seed,
             verbose,
-        );
+        )?;
 
         // normalise centroids for cosine
         if metric == Dist::Cosine {
@@ -238,7 +252,7 @@ where
             30,
             seed + 1000,
             verbose,
-        );
+        )?;
 
         // 5. assign all vectors to IVF clusters
         let data_norms = vec![T::one(); n];
@@ -300,7 +314,8 @@ where
 
         let new_to_old = idx.optimise_memory_layout();
         idx.original_ids = new_to_old;
-        idx
+
+        Ok(idx)
     }
 
     /// Query the index for approximate nearest neighbours
@@ -319,7 +334,14 @@ where
     ///
     /// Tuple of (indices, distances) sorted by distance
     #[inline]
-    pub fn query(&self, query_vec: &[T], k: usize, nprobe: Option<usize>) -> (Vec<usize>, Vec<T>) {
+    pub fn query(
+        &self,
+        query_vec: &[T],
+        k: usize,
+        nprobe: Option<usize>,
+    ) -> Result<(Vec<usize>, Vec<T>), AnnSearchErrors> {
+        self.check_dim(query_vec.len())?;
+
         let mut query_vec = query_vec.to_vec();
 
         if self.metric == Dist::Cosine {
@@ -376,7 +398,7 @@ where
             .map(|(d, i)| (d.0, self.original_ids[i]))
             .unzip();
 
-        (indices, distances)
+        Ok((indices, distances))
     }
 
     /// Query using a matrix row reference
@@ -396,7 +418,7 @@ where
         query_row: RowRef<T>,
         k: usize,
         nprobe: Option<usize>,
-    ) -> (Vec<usize>, Vec<T>) {
+    ) -> Result<(Vec<usize>, Vec<T>), AnnSearchErrors> {
         if query_row.col_stride() == 1 {
             let slice =
                 unsafe { std::slice::from_raw_parts(query_row.as_ptr(), query_row.ncols()) };
@@ -429,7 +451,7 @@ where
         nprobe: Option<usize>,
         return_dist: bool,
         verbose: bool,
-    ) -> (Vec<Vec<usize>>, Option<Vec<Vec<T>>>) {
+    ) -> KnnOptionResult<T> {
         let m = self.codebook.m();
         let counter = Arc::new(AtomicUsize::new(0));
 
@@ -466,10 +488,10 @@ where
                     }
                 }
 
-                let (indices, dists) = self.query(&reconstructed, k, nprobe);
-                (orig_id, indices, dists)
+                let (indices, dists) = self.query(&reconstructed, k, nprobe)?;
+                Ok((orig_id, indices, dists))
             })
-            .collect();
+            .collect::<Result<Vec<_>, AnnSearchErrors>>()?;
 
         let mut final_indices = vec![Vec::new(); self.n];
         let mut final_dists = if return_dist {
@@ -485,7 +507,7 @@ where
             }
         }
 
-        (final_indices, final_dists)
+        Ok((final_indices, final_dists))
     }
 
     /// Returns the size of the index in bytes
@@ -581,7 +603,8 @@ mod tests {
             Some(4),
             42,
             false,
-        );
+        )
+        .unwrap();
 
         assert_eq!(index.dim, 32);
         assert_eq!(index.n, 6);
@@ -605,7 +628,8 @@ mod tests {
             Some(4),
             42,
             false,
-        );
+        )
+        .unwrap();
 
         assert_eq!(index.metric, Dist::Cosine);
     }
@@ -623,10 +647,11 @@ mod tests {
             Some(4),
             42,
             false,
-        );
+        )
+        .unwrap();
 
         let query: Vec<f32> = (0..32).map(|x| x as f32 * 0.01).collect();
-        let (indices, distances) = index.query(&query, 3, None);
+        let (indices, distances) = index.query(&query, 3, None).unwrap();
 
         assert_eq!(indices.len(), 3);
         assert_eq!(distances.len(), 3);
@@ -645,10 +670,11 @@ mod tests {
             Some(4),
             42,
             false,
-        );
+        )
+        .unwrap();
 
         let query: Vec<f32> = (0..32).map(|x| x as f32 * 0.01).collect();
-        let (indices, _) = index.query(&query, 100, None);
+        let (indices, _) = index.query(&query, 100, None).unwrap();
 
         assert!(indices.len() <= 6);
     }
@@ -666,10 +692,11 @@ mod tests {
             Some(4),
             42,
             false,
-        );
+        )
+        .unwrap();
 
         let query: Vec<f32> = (0..32).map(|x| x as f32 * 0.01).collect();
-        let (_, distances) = index.query(&query, 3, Some(2));
+        let (_, distances) = index.query(&query, 3, Some(2)).unwrap();
 
         for i in 1..distances.len() {
             assert!(distances[i] >= distances[i - 1]);
@@ -689,10 +716,11 @@ mod tests {
             Some(4),
             42,
             false,
-        );
+        )
+        .unwrap();
 
         let query: Vec<f32> = (0..32).map(|x| if x < 16 { 1.0 } else { 0.0 }).collect();
-        let (indices, distances) = index.query(&query, 3, None);
+        let (indices, distances) = index.query(&query, 3, None).unwrap();
 
         assert_eq!(indices.len(), 3);
         assert_eq!(distances.len(), 3);
@@ -711,12 +739,13 @@ mod tests {
             Some(4),
             42,
             false,
-        );
+        )
+        .unwrap();
 
         let query: Vec<f32> = (0..32).map(|x| 5.0 + x as f32 * 0.01).collect();
 
-        let (indices1, _) = index.query(&query, 3, Some(1));
-        let (indices2, _) = index.query(&query, 3, Some(2));
+        let (indices1, _) = index.query(&query, 3, Some(1)).unwrap();
+        let (indices2, _) = index.query(&query, 3, Some(2)).unwrap();
 
         assert_eq!(indices1.len(), 3);
         assert_eq!(indices2.len(), 3);
@@ -735,12 +764,13 @@ mod tests {
             Some(4),
             42,
             false,
-        );
+        )
+        .unwrap();
 
         let query: Vec<f32> = (0..32).map(|x| 0.5 + x as f32 * 0.01).collect();
 
-        let (indices1, distances1) = index.query(&query, 3, Some(2));
-        let (indices2, distances2) = index.query(&query, 3, Some(2));
+        let (indices1, distances1) = index.query(&query, 3, Some(2)).unwrap();
+        let (indices2, distances2) = index.query(&query, 3, Some(2)).unwrap();
 
         assert_eq!(indices1, indices2);
         assert_eq!(distances1, distances2);
@@ -759,12 +789,13 @@ mod tests {
             Some(4),
             42,
             false,
-        );
+        )
+        .unwrap();
 
         let query_mat = Mat::<f32>::from_fn(1, 32, |_, j| 0.5 + j as f32 * 0.01);
         let row = query_mat.row(0);
 
-        let (indices, distances) = index.query_row(row, 3, None);
+        let (indices, distances) = index.query_row(row, 3, None).unwrap();
 
         assert_eq!(indices.len(), 3);
         assert_eq!(distances.len(), 3);
@@ -784,7 +815,8 @@ mod tests {
             Some(4),
             42,
             false,
-        );
+        )
+        .unwrap();
 
         assert_eq!(index.codebook.m(), 8);
         assert_eq!(index.codebook.subvec_dim(), 4);
@@ -804,7 +836,8 @@ mod tests {
             Some(4),
             42,
             false,
-        );
+        )
+        .unwrap();
 
         let query: Vec<f32> = (0..32).map(|x| x as f32 * 0.01).collect();
         let table = index.build_lookup_tables_residual(&query, 0);
@@ -825,7 +858,8 @@ mod tests {
             Some(4),
             42,
             false,
-        );
+        )
+        .unwrap();
 
         let query: Vec<f32> = (0..32).map(|x| x as f32 * 0.01).collect();
         let table = index.build_lookup_tables_residual(&query, 0);
@@ -849,7 +883,8 @@ mod tests {
             Some(4),
             42,
             false,
-        );
+        )
+        .unwrap();
 
         assert_eq!(index.codebook.m(), 8);
     }
@@ -868,10 +903,11 @@ mod tests {
             Some(4),
             42,
             false,
-        );
+        )
+        .unwrap();
 
         let query: Vec<f32> = (0..32).map(|x| x as f32).collect();
-        let (indices, _) = index.query(&query, 1, Some(5));
+        let (indices, _) = index.query(&query, 1, Some(5)).unwrap();
 
         assert_eq!(indices[0], 0);
     }

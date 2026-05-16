@@ -1121,6 +1121,7 @@ macro_rules! impl_nndescent_gpu_query {
                                     &mut candidates,
                                     &mut results,
                                 ),
+                                Dist::Manhattan => unreachable!(),
                             }
                         })
                     })
@@ -1275,6 +1276,19 @@ macro_rules! impl_nndescent_gpu_query {
                     .map(|(OrderedFloat(d), i)| (i, d))
                     .unzip())
             }
+
+            #[inline(always)]
+            fn query_manhattan(
+                &self,
+                _query_vec: &[$float],
+                _k: usize,
+                _ef: usize,
+                _visited: &mut FixedBitSet,
+                _candidates: &mut BinaryHeap<Reverse<(OrderedFloat<$float>, usize)>>,
+                _results: &mut BinaryHeap<(OrderedFloat<$float>, usize)>,
+            ) -> Result<(Vec<usize>, Vec<$float>), AnnSearchErrors> {
+                unreachable!("NNDescentGpu does not support Manhattan distance")
+            }
         }
     };
 }
@@ -1307,7 +1321,7 @@ pub struct NNDescentGpu<T: AnnSearchFloat + AnnSearchGpuFloat, R: Runtime> {
     /// Pre-computed L2 norms (Cosine only; empty for Euclidean)
     pub norms: Vec<T>,
     /// Distance metric
-    pub metric: Dist,
+    metric: Dist,
     /// The medoid of the graph as entry point
     pub medoid: u32,
     /// True kNN graph of size n * k, sorted by distance per row.
@@ -1414,7 +1428,11 @@ where
         verbose: bool,
         retain_gpu: bool,
         device: R::Device,
-    ) -> Self {
+    ) -> Result<Self, AnnSearchErrors> {
+        if metric == Dist::Manhattan {
+            return Err(AnnSearchErrors::DistanceNotSupported(metric));
+        }
+
         let (vectors_flat, n, dim) = matrix_to_flat(data);
         let k = k.unwrap_or(30);
         let build_k = build_k.unwrap_or((1.5 * k as f32) as usize).max(k);
@@ -1856,6 +1874,7 @@ where
                                 let dot = T::dot_simd(a, b);
                                 T::one() - dot / (norms[i] * norms[pid])
                             }
+                            Dist::Manhattan => unreachable!(),
                         };
                         slot[j] = (pid, dist);
                     }
@@ -1876,7 +1895,7 @@ where
             (None, None, None)
         };
 
-        Self {
+        Ok(Self {
             vectors_flat,
             dim,
             dim_padded,
@@ -1893,7 +1912,7 @@ where
             vectors_gpu,
             norms_gpu,
             _device: device,
-        }
+        })
     }
 
     ///////////
@@ -1986,7 +2005,7 @@ where
         query_params: Option<CagraGpuSearchParams>,
         k: usize,
         seed: usize,
-    ) -> AnnSearchResults<T>
+    ) -> KnnResult<T>
     where
         T: AnnSearchGpuFloat + num_traits::Float,
     {
@@ -2020,6 +2039,7 @@ where
                             let q_norm = T::calculate_l2_norm(query);
                             T::one() - dot / (q_norm * self.norms[a])
                         }
+                        Dist::Manhattan => unreachable!(),
                     };
                     let dist_b = match self.metric {
                         Dist::SquaredEuclidean => {
@@ -2032,6 +2052,7 @@ where
                             let q_norm = T::calculate_l2_norm(query);
                             T::one() - dot / (q_norm * self.norms[b])
                         }
+                        Dist::Manhattan => unreachable!(),
                     };
                     dist_a
                         .partial_cmp(&dist_b)
@@ -2327,7 +2348,8 @@ mod tests {
             false,
             false,
             device,
-        );
+        )
+        .unwrap();
 
         assert_eq!(index.nav_graph.len(), 20 * 5);
         for i in 0..20 {
@@ -2362,7 +2384,8 @@ mod tests {
             false,
             false,
             device,
-        );
+        )
+        .unwrap();
 
         assert_eq!(index.nav_graph.len(), 16 * 3);
         assert!(!index.norms.is_empty());
@@ -2391,7 +2414,8 @@ mod tests {
             false,
             false,
             device,
-        );
+        )
+        .unwrap();
 
         assert_eq!(index.dim, 3);
         assert_eq!(index.nav_graph.len(), 12 * 3);
@@ -2420,7 +2444,8 @@ mod tests {
             false,
             false,
             device,
-        );
+        )
+        .unwrap();
 
         let (indices, Some(distances)) = index.extract_knn(true) else {
             panic!("Expected distances");
@@ -3235,7 +3260,8 @@ mod kernel_tests {
             true,
             false,
             device,
-        );
+        )
+        .unwrap();
 
         let (knn_indices, _) = index.extract_knn(false);
 

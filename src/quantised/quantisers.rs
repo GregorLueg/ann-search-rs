@@ -251,16 +251,18 @@ where
         max_iters: usize,
         seed: usize,
         verbose: bool,
-    ) -> Self {
+    ) -> Result<Self, AnnSearchErrors> {
         let n_centroids = n_centroids.unwrap_or(N_CLUSTERS_PQ);
-
         // checks
-        assert!(dim.is_multiple_of(m), "Dimension must be divisible by m");
-        assert!(dim >= 32, "Dimension too small for product quantisation");
-        assert!(
-            n_centroids <= 256,
-            "The number of centroids for PQ is limited to 256."
-        );
+        if !dim.is_multiple_of(m) {
+            return Err(AnnSearchErrors::DimensionNotDivisibleByM { dim, m });
+        }
+        if dim < 32 {
+            return Err(AnnSearchErrors::DimensionTooSmallForPQ { dim });
+        }
+        if n_centroids > 256 {
+            return Err(AnnSearchErrors::TooManyCentroidsForPQ { n_centroids });
+        }
 
         // function body
         let subvec_dim = dim / m;
@@ -291,12 +293,12 @@ where
             println!("  Product quantiser training complete");
         }
 
-        Self {
+        Ok(Self {
             codebooks,
             m,
             subvec_dim,
             n_centroids,
-        }
+        })
     }
 
     /// Encode a vector to M indices
@@ -304,7 +306,6 @@ where
     /// ### Params
     ///
     /// * `vec` - Vector to encode
-    /// * `metric` - Distance metric
     ///
     /// ### Returns
     ///
@@ -512,7 +513,7 @@ where
         max_iters: usize,
         seed: usize,
         verbose: bool,
-    ) -> Self {
+    ) -> Result<Self, AnnSearchErrors> {
         let n = vectors_flat.len() / dim;
 
         // identity rotation
@@ -540,7 +541,7 @@ where
             max_iters,
             seed,
             false,
-        );
+        )?;
 
         let rotation_iter = n_iter.unwrap_or(OPQ_ITER);
 
@@ -562,7 +563,7 @@ where
                 max_iters,
                 seed + iter,
                 false,
-            );
+            )?;
 
             // encode and reconstruct
             let codes = pq.encode_batch(&rotated, n_train);
@@ -589,13 +590,13 @@ where
             max_iters,
             seed,
             verbose,
-        );
+        )?;
 
-        Self {
+        Ok(Self {
             rotation_matrix,
             pq,
             dim,
-        }
+        })
     }
 
     /// Encode a vector to M indices
@@ -964,7 +965,8 @@ mod tests {
         }
 
         let pq =
-            ProductQuantiser::train(&data, 32, 2, Some(2), &Dist::SquaredEuclidean, 5, 42, false);
+            ProductQuantiser::train(&data, 32, 2, Some(2), &Dist::SquaredEuclidean, 5, 42, false)
+                .unwrap();
 
         assert_eq!(pq.m(), 2);
         assert_eq!(pq.subvec_dim(), 16);
@@ -1023,7 +1025,8 @@ mod tests {
         }
 
         let pq =
-            ProductQuantiser::train(&data, 32, 2, Some(2), &Dist::SquaredEuclidean, 5, 42, false);
+            ProductQuantiser::train(&data, 32, 2, Some(2), &Dist::SquaredEuclidean, 5, 42, false)
+                .unwrap();
 
         assert_eq!(pq.m(), 2);
         assert_eq!(pq.subvec_dim(), 16);
@@ -1051,7 +1054,8 @@ mod tests {
             10,
             42,
             false,
-        );
+        )
+        .unwrap();
 
         let vec: Vec<f32> = (0..32).map(|x| x as f32).collect();
         let codes = pq.encode(&vec);
@@ -1071,10 +1075,12 @@ mod tests {
         }
 
         let pq1 =
-            ProductQuantiser::train(&data, 32, 2, Some(2), &Dist::SquaredEuclidean, 5, 42, false);
+            ProductQuantiser::train(&data, 32, 2, Some(2), &Dist::SquaredEuclidean, 5, 42, false)
+                .unwrap();
 
         let pq2 =
-            ProductQuantiser::train(&data, 32, 2, Some(2), &Dist::SquaredEuclidean, 5, 42, false);
+            ProductQuantiser::train(&data, 32, 2, Some(2), &Dist::SquaredEuclidean, 5, 42, false)
+                .unwrap();
 
         let vec: Vec<f32> = (16..48).map(|x| x as f32).collect();
         let codes1 = pq1.encode(&vec);
@@ -1084,17 +1090,25 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "Dimension must be divisible by m")]
     fn test_product_quantiser_invalid_m() {
         let data = vec![1.0, 2.0, 3.0, 4.0, 5.0];
-        ProductQuantiser::train(&data, 5, 2, Some(2), &Dist::SquaredEuclidean, 5, 42, false);
+        let result =
+            ProductQuantiser::train(&data, 5, 2, Some(2), &Dist::SquaredEuclidean, 5, 42, false);
+        assert!(matches!(
+            result,
+            Err(AnnSearchErrors::DimensionNotDivisibleByM { dim: 5, m: 2 })
+        ));
     }
 
     #[test]
-    #[should_panic(expected = "Dimension too small")]
     fn test_product_quantiser_dim_too_small() {
         let data = vec![1.0, 2.0, 3.0, 4.0];
-        ProductQuantiser::train(&data, 16, 2, Some(2), &Dist::SquaredEuclidean, 5, 42, false);
+        let result =
+            ProductQuantiser::train(&data, 16, 2, Some(2), &Dist::SquaredEuclidean, 5, 42, false);
+        assert!(matches!(
+            result,
+            Err(AnnSearchErrors::DimensionTooSmallForPQ { dim: 16 })
+        ));
     }
 
     #[test]
@@ -1106,7 +1120,8 @@ mod tests {
             }
         }
 
-        let opq = OptimisedProductQuantiser::train(&data, 32, 4, Some(4), Some(1), 5, 42, false);
+        let opq =
+            OptimisedProductQuantiser::train(&data, 32, 4, Some(4), Some(1), 5, 42, false).unwrap();
 
         assert_eq!(opq.m(), 4);
         assert_eq!(opq.subvec_dim(), 8);
@@ -1122,7 +1137,8 @@ mod tests {
             }
         }
 
-        let opq = OptimisedProductQuantiser::train(&data, 32, 4, Some(4), Some(1), 5, 42, false);
+        let opq =
+            OptimisedProductQuantiser::train(&data, 32, 4, Some(4), Some(1), 5, 42, false).unwrap();
 
         let vec: Vec<f32> = (0..32).map(|x| x as f32).collect();
         let codes = opq.encode(&vec);
@@ -1134,7 +1150,8 @@ mod tests {
     fn test_opq_rotate() {
         let data: Vec<f32> = (0..320).map(|x| x as f32).collect();
 
-        let opq = OptimisedProductQuantiser::train(&data, 32, 4, Some(4), Some(1), 5, 42, false);
+        let opq =
+            OptimisedProductQuantiser::train(&data, 32, 4, Some(4), Some(1), 5, 42, false).unwrap();
 
         let vec: Vec<f32> = (0..32).map(|x| x as f32).collect();
         let rotated = opq.rotate(&vec);
@@ -1146,9 +1163,11 @@ mod tests {
     fn test_opq_deterministic() {
         let data: Vec<f32> = (0..320).map(|x| x as f32).collect();
 
-        let opq1 = OptimisedProductQuantiser::train(&data, 32, 4, Some(4), Some(1), 5, 42, false);
+        let opq1 =
+            OptimisedProductQuantiser::train(&data, 32, 4, Some(4), Some(1), 5, 42, false).unwrap();
 
-        let opq2 = OptimisedProductQuantiser::train(&data, 32, 4, Some(4), Some(1), 5, 42, false);
+        let opq2 =
+            OptimisedProductQuantiser::train(&data, 32, 4, Some(4), Some(1), 5, 42, false).unwrap();
 
         let vec: Vec<f32> = (0..32).map(|x| x as f32).collect();
         let codes1 = opq1.encode(&vec);

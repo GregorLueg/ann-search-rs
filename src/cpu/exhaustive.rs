@@ -169,6 +169,18 @@ where
                     }
                 }
             }
+            Dist::Manhattan => {
+                for idx in 0..n_vectors {
+                    let dist = self.manhattan_distance_to_query(idx, query_vec);
+
+                    if heap.len() < k {
+                        heap.push((OrderedFloat(dist), idx));
+                    } else if dist < heap.peek().unwrap().0 .0 {
+                        heap.pop();
+                        heap.push((OrderedFloat(dist), idx));
+                    }
+                }
+            }
         }
 
         let mut results: Vec<_> = heap.into_iter().collect();
@@ -227,12 +239,7 @@ where
     ///
     /// Tuple of `(knn_indices, optional distances)` where each row corresponds
     /// to a vector in the index
-    pub fn generate_knn(
-        &self,
-        k: usize,
-        return_dist: bool,
-        verbose: bool,
-    ) -> AnnSearchOptionResult<T> {
+    pub fn generate_knn(&self, k: usize, return_dist: bool, verbose: bool) -> KnnOptionResult<T> {
         use std::sync::{
             atomic::{AtomicUsize, Ordering},
             Arc,

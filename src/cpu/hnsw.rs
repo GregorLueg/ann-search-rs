@@ -810,6 +810,7 @@ where
         let mut current_dist = OrderedFloat(match self.metric {
             Dist::SquaredEuclidean => self.euclidean_distance(node, current_node),
             Dist::Cosine => self.cosine_distance(node, current_node),
+            Dist::Manhattan => self.manhattan_distance(node, current_node),
         });
 
         for layer in (node_level + 1..=self.max_layer).rev() {
@@ -832,6 +833,7 @@ where
                     let dist = OrderedFloat(match self.metric {
                         Dist::SquaredEuclidean => self.euclidean_distance(node, neighbour),
                         Dist::Cosine => self.cosine_distance(node, neighbour),
+                        Dist::Manhattan => self.manhattan_distance(node, current_node),
                     });
 
                     if dist < current_dist {
@@ -848,6 +850,7 @@ where
             match self.metric {
                 Dist::SquaredEuclidean => self.euclidean_distance(a, b),
                 Dist::Cosine => self.cosine_distance(a, b),
+                Dist::Manhattan => self.manhattan_distance(a, b),
             }
         };
 
@@ -984,6 +987,7 @@ where
         let entry_dist = OrderedFloat(match self.metric {
             Dist::SquaredEuclidean => self.euclidean_distance(query_node, entry_node),
             Dist::Cosine => self.cosine_distance(query_node, entry_node),
+            Dist::Manhattan => self.cosine_distance(query_node, entry_node),
         });
 
         state.mark_visited(entry_node);
@@ -1015,6 +1019,7 @@ where
                 let dist = OrderedFloat(match self.metric {
                     Dist::SquaredEuclidean => self.euclidean_distance(query_node, neighbour_id),
                     Dist::Cosine => self.cosine_distance(query_node, neighbour_id),
+                    Dist::Manhattan => self.manhattan_distance(query_node, neighbour_id),
                 });
 
                 if dist < furthest_dist || state.working_sorted.len() < ef {
@@ -1080,6 +1085,7 @@ where
                 let dist_to_selected = OrderedFloat(match self.metric {
                     Dist::SquaredEuclidean => self.euclidean_distance(cand_id, selected_id),
                     Dist::Cosine => self.cosine_distance(cand_id, selected_id),
+                    Dist::Manhattan => self.manhattan_distance(cand_id, selected_id),
                 });
                 dist_to_selected < cand_dist
             });
@@ -1357,7 +1363,7 @@ where
         ef_search: usize,
         return_dist: bool,
         verbose: bool,
-    ) -> AnnSearchOptionResult<T> {
+    ) -> KnnOptionResult<T> {
         use std::sync::{
             atomic::{AtomicUsize, Ordering},
             Arc,
@@ -1412,6 +1418,7 @@ where
         match self.metric {
             Dist::SquaredEuclidean => self.euclidean_distance_to_query(idx, query),
             Dist::Cosine => self.cosine_distance_to_query(idx, query, query_norm),
+            Dist::Manhattan => self.manhattan_distance_to_query(idx, query),
         }
     }
 

@@ -591,6 +591,7 @@ where
         match self.metric {
             Dist::SquaredEuclidean => self.euclidean_distance(i, j),
             Dist::Cosine => self.cosine_distance(i, j),
+            Dist::Manhattan => self.manhattan_distance(i, j),
         }
     }
 
@@ -778,6 +779,7 @@ where
         match self.metric {
             Dist::SquaredEuclidean => self.euclidean_distance_to_query(idx, query),
             Dist::Cosine => self.cosine_distance_to_query(idx, query, query_norm),
+            Dist::Manhattan => self.manhattan_distance_to_query(idx, query),
         }
     }
 
@@ -928,7 +930,7 @@ where
         ef_search: Option<usize>,
         return_dist: bool,
         verbose: bool,
-    ) -> AnnSearchOptionResult<T> {
+    ) -> KnnOptionResult<T> {
         let counter = Arc::new(AtomicUsize::new(0));
 
         let results: Vec<(Vec<usize>, Vec<T>)> = (0..self.n)

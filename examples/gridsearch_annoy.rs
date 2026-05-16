@@ -76,7 +76,8 @@ fn main() {
             cli.distance.as_str().into(),
             n_trees,
             cli.seed as usize,
-        );
+        )
+        .unwrap();
         let build_time = start.elapsed().as_secs_f64() * 1000.0;
 
         let index_size_mb = annoy_idx.memory_usage_bytes() as f64 / (1024.0 * 1024.0);

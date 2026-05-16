@@ -33,7 +33,8 @@ fn main() {
         data.as_ref(),
         &cli.distance,
         device.clone(),
-    );
+    )
+    .unwrap();
     let ex_build = start.elapsed().as_secs_f64() * 1000.0;
 
     println!("Self-querying GPU exhaustive (ground truth)...");
@@ -127,7 +128,8 @@ fn main() {
                 false,
                 true,
                 device.clone(),
-            );
+            )
+            .unwrap();
             let gpu_build = start.elapsed().as_secs_f64() * 1000.0;
             let gpu_size = gpu_idx.memory_usage_bytes() as f64 / (1024.0 * 1024.0);
 

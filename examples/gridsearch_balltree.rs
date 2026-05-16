@@ -77,7 +77,8 @@ fn main() {
 
     println!("Building BallTree index...");
     let start = Instant::now();
-    let balltree_idx = build_balltree_index(data.as_ref(), cli.distance, cli.seed as usize);
+    let balltree_idx =
+        build_balltree_index(data.as_ref(), cli.distance, cli.seed as usize).unwrap();
     let index_size_mb = balltree_idx.memory_usage_bytes() as f64 / (1024.0 * 1024.0);
 
     let build_time = start.elapsed().as_secs_f64() * 1000.0;

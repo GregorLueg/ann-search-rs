@@ -83,6 +83,10 @@ where
         n_clusters: Option<usize>,
         seed: usize,
     ) -> Result<Self, AnnSearchErrors> {
+        if *metric == Dist::Manhattan {
+            return Err(AnnSearchErrors::DistanceNotSupported(*metric));
+        }
+
         let n = data.nrows();
         let quantiser = RaBitQQuantiser::new(data, metric, n_clusters, seed)?;
         Ok(Self {
@@ -112,6 +116,10 @@ where
         seed: usize,
         save_path: impl AsRef<Path>,
     ) -> Result<Self, AnnSearchErrors> {
+        if *metric == Dist::Manhattan {
+            return Err(AnnSearchErrors::DistanceNotSupported(*metric));
+        }
+
         let n = data.nrows();
         let dim = data.ncols();
         let quantiser = RaBitQQuantiser::new(data, metric, n_clusters, seed)?;
@@ -171,6 +179,7 @@ where
                 }
             }
             Dist::SquaredEuclidean => query_vec.to_vec(),
+            Dist::Manhattan => unreachable!(),
         };
 
         let cluster_dists = self
@@ -265,6 +274,7 @@ where
         let query_norm = match self.quantiser.encoder.metric {
             Dist::Cosine => compute_l2_norm(query_vec),
             Dist::SquaredEuclidean => T::one(),
+            Dist::Manhattan => unreachable!(),
         };
 
         let mut scored: Vec<_> = candidates
@@ -277,6 +287,7 @@ where
                     Dist::SquaredEuclidean => {
                         vector_store.euclidean_distance_to_query(idx, query_vec)
                     }
+                    Dist::Manhattan => unreachable!(),
                 };
                 (dist, idx)
             })
@@ -350,11 +361,11 @@ where
         rerank_factor: Option<usize>,
         return_dist: bool,
         verbose: bool,
-    ) -> AnnSearchOptionResult<T> {
+    ) -> KnnOptionResult<T> {
         let vector_store = self
             .vector_store
             .as_ref()
-            .expect("generate_knn requires vector_store");
+            .ok_or(AnnSearchErrors::VectorStoreNotAvailable)?;
 
         let counter = Arc::new(AtomicUsize::new(0));
 
@@ -604,6 +615,9 @@ mod tests {
         let index = ExhaustiveIndexRaBitQ::new(data.as_ref(), &Dist::SquaredEuclidean, Some(5), 42)
             .unwrap();
         let result = index.generate_knn(5, Some(5), Some(10), false, false);
+
+        println!("What is this {:?}", result);
+
         assert!(matches!(
             result,
             Err(AnnSearchErrors::VectorStoreNotAvailable)

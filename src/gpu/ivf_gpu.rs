@@ -120,7 +120,11 @@ where
         seed: usize,
         verbose: bool,
         device: R::Device,
-    ) -> Self {
+    ) -> Result<Self, AnnSearchErrors> {
+        if metric == Dist::Manhattan {
+            return Err(AnnSearchErrors::DistanceNotSupported(metric));
+        }
+
         let (vectors_flat, n, dim) = matrix_to_flat(data);
 
         let nlist = nlist.unwrap_or((n as f32).sqrt() as usize).max(1);
@@ -144,7 +148,7 @@ where
             k_means_params,
             seed,
             verbose,
-        );
+        )?;
 
         // Norms on original (unpadded) data
         let data_norms = if metric == Dist::Cosine {
@@ -232,7 +236,7 @@ where
             println!("  Index ready");
         }
 
-        Self {
+        Ok(Self {
             vectors_gpu,
             norms_gpu,
             vectors_cpu,
@@ -246,7 +250,7 @@ where
             nlist,
             metric,
             device,
-        }
+        })
     }
 
     /// Internal helper for querying
@@ -276,7 +280,7 @@ where
         nquery: Option<usize>,
         client: &ComputeClient<R>,
         verbose: bool,
-    ) -> AnnSearchResults<T> {
+    ) -> KnnResult<T> {
         self.check_dim(dim_query)?;
 
         let nprobe = nprobe
@@ -346,7 +350,7 @@ where
         nprobe: Option<usize>,
         nquery: Option<usize>,
         verbose: bool,
-    ) -> AnnSearchResults<T> {
+    ) -> KnnResult<T> {
         let (queries_flat, n_queries, dim_query) = matrix_to_flat(query_mat);
         self.check_dim(dim_query)?;
 
@@ -400,7 +404,7 @@ where
         nquery: Option<usize>,
         return_dist: bool,
         verbose: bool,
-    ) -> AnnSearchOptionResult<T> {
+    ) -> KnnOptionResult<T> {
         let client: ComputeClient<R> = R::client(&self.device);
 
         let nprobe = nprobe.unwrap_or(((self.nlist as f32).sqrt() as usize).max(1));
@@ -579,6 +583,7 @@ where
                     dim_lines,
                 );
             },
+            Dist::Manhattan => unreachable!(),
         }
 
         let centroid_dists = centroid_dists_gpu.read(client);
@@ -705,6 +710,7 @@ where
                     dim_lines,
                 );
             },
+            Dist::Manhattan => unreachable!(),
         }
 
         let topk_dists = GpuTensor::<R, T>::empty(vec![n_queries, k], client);
@@ -886,7 +892,8 @@ mod tests {
             42,
             false,
             device,
-        );
+        )
+        .unwrap();
 
         assert_eq!(index.dim, 4);
         assert_eq!(index.n, 100);
@@ -908,7 +915,8 @@ mod tests {
             42,
             false,
             device,
-        );
+        )
+        .unwrap();
 
         let query = Mat::from_fn(3, 4, |i, j| if i == j { 1.0_f32 } else { 0.0_f32 });
 
@@ -935,7 +943,8 @@ mod tests {
             42,
             false,
             device,
-        );
+        )
+        .unwrap();
 
         let query = Mat::from_fn(2, 4, |_, _| 1.0_f32);
         let (indices, distances) = index
@@ -1002,7 +1011,8 @@ mod tests_wpgu {
             42,
             false,
             device,
-        );
+        )
+        .unwrap();
 
         let (indices, distances) = index.generate_knn(4, Some(3), None, true, false).unwrap();
 

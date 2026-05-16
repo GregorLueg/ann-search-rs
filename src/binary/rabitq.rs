@@ -171,6 +171,7 @@ where
                 }
             }
             Dist::SquaredEuclidean => query.to_vec(),
+            Dist::Manhattan => unreachable!(),
         };
 
         // Residual relative to centroid
@@ -688,6 +689,9 @@ where
         n_clusters: Option<usize>,
         seed: usize,
     ) -> Result<Self, AnnSearchErrors> {
+        if *metric == Dist::Manhattan {
+            return Err(AnnSearchErrors::DistanceNotSupported(*metric));
+        }
         let n = data.nrows();
         let dim = data.ncols();
 
@@ -717,6 +721,7 @@ where
                 Dist::SquaredEuclidean => {
                     data_flat.extend(vec);
                 }
+                Dist::Manhattan => unreachable!(),
             }
         }
 
@@ -738,7 +743,7 @@ where
             Some(k_means_params),
             seed,
             false,
-        );
+        )?;
 
         let centroid_norms: Vec<T> = (0..k)
             .map(|c| {

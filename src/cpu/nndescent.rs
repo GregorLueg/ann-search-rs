@@ -18,6 +18,7 @@ use std::{
 use thousands::*;
 
 use crate::cpu::annoy::*;
+use crate::cpu::kd_forest::*;
 use crate::prelude::*;
 use crate::utils::*;
 
@@ -250,6 +251,15 @@ pub trait ApplySortedUpdates<T> {
     );
 }
 
+////////////
+// Forest //
+////////////
+
+enum InternalForest {
+    Annoy,
+    KdForest,
+}
+
 ////////////////////
 // NNDescentQuery //
 ////////////////////
@@ -278,6 +288,17 @@ pub trait NNDescentQuery<T> {
 
     /// Beam search using Euclidean distance.
     fn query_euclidean(
+        &self,
+        query_vec: &[T],
+        k: usize,
+        ef: usize,
+        visited: &mut FixedBitSet,
+        candidates: &mut BinaryHeap<Reverse<(OrderedFloat<T>, usize)>>,
+        results: &mut BinaryHeap<(OrderedFloat<T>, usize)>,
+    ) -> Result<(Vec<usize>, Vec<T>), AnnSearchErrors>;
+
+    /// Beam search using Manhattan distance.
+    fn query_manhattan(
         &self,
         query_vec: &[T],
         k: usize,
@@ -424,6 +445,10 @@ where
         seed: usize,
         verbose: bool,
     ) -> Result<Self, AnnSearchErrors> {
+        if metric == Dist::Manhattan {
+            return Err(AnnSearchErrors::DistanceNotSupported(metric));
+        }
+
         let (vectors_flat, n, dim) = matrix_to_flat(data);
 
         let norms = if metric == Dist::Cosine {
@@ -452,7 +477,7 @@ where
         let max_candidates = max_candidates.unwrap_or(k.min(60));
 
         let start = Instant::now();
-        let forest = AnnoyIndex::new(data, n_trees, metric, seed);
+        let forest = AnnoyIndex::new(data, n_trees, metric, seed)?;
         if verbose {
             println!("Built Annoy: {:.2?}", start.elapsed());
         }
@@ -946,6 +971,7 @@ where
         match self.metric {
             Dist::SquaredEuclidean => self.euclidean_distance(i, j),
             Dist::Cosine => self.cosine_distance(i, j),
+            Dist::Manhattan => self.manhattan_distance(i, j),
         }
     }
 
@@ -1107,7 +1133,7 @@ where
         ef_search: Option<usize>,
         return_dist: bool,
         verbose: bool,
-    ) -> AnnSearchOptionResult<T> {
+    ) -> KnnOptionResult<T> {
         use std::sync::{
             atomic::{AtomicUsize, Ordering},
             Arc,
@@ -1369,6 +1395,14 @@ macro_rules! impl_nndescent_query {
                                     &mut candidates,
                                     &mut results,
                                 ),
+                                Dist::Manhattan => self.query_manhattan(
+                                    query_vec,
+                                    k,
+                                    ef,
+                                    &mut visited,
+                                    &mut candidates,
+                                    &mut results,
+                                ),
                                 Dist::Cosine => self.query_cosine(
                                     query_vec,
                                     query_norm,
@@ -1406,6 +1440,82 @@ macro_rules! impl_nndescent_query {
                     }
                     visited.insert(entry_idx);
                     let dist = self.euclidean_distance_to_query(entry_idx, query_vec);
+                    candidates.push(Reverse((OrderedFloat(dist), entry_idx)));
+                    results.push((OrderedFloat(dist), entry_idx));
+                }
+
+                while results.len() > ef {
+                    results.pop();
+                }
+
+                let mut lower_bound = if results.len() >= ef {
+                    results.peek().unwrap().0 .0
+                } else {
+                    <$float>::MAX
+                };
+
+                while let Some(Reverse((OrderedFloat(curr_dist), curr_idx))) = candidates.pop() {
+                    if curr_dist > lower_bound {
+                        break;
+                    }
+
+                    for &(nbr_idx, _) in self.graph_neighbours(curr_idx) {
+                        if nbr_idx == SENTINEL_PID || visited.contains(nbr_idx) {
+                            continue;
+                        }
+                        visited.insert(nbr_idx);
+
+                        let dist = self.euclidean_distance_to_query(nbr_idx, query_vec);
+
+                        if dist < lower_bound || results.len() < ef {
+                            candidates.push(Reverse((OrderedFloat(dist), nbr_idx)));
+
+                            if results.len() < ef {
+                                results.push((OrderedFloat(dist), nbr_idx));
+                                if results.len() == ef {
+                                    lower_bound = results.peek().unwrap().0 .0;
+                                }
+                            } else if dist < lower_bound {
+                                results.pop();
+                                results.push((OrderedFloat(dist), nbr_idx));
+                                lower_bound = results.peek().unwrap().0 .0;
+                            }
+                        }
+                    }
+                }
+
+                let mut final_results: Vec<_> = results.drain().collect();
+                final_results.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+                final_results.truncate(k);
+
+                Ok(final_results
+                    .into_iter()
+                    .map(|(OrderedFloat(d), i)| (i, d))
+                    .unzip())
+            }
+
+            #[inline(always)]
+            fn query_manhattan(
+                &self,
+                query_vec: &[$float],
+                k: usize,
+                ef: usize,
+                visited: &mut FixedBitSet,
+                candidates: &mut BinaryHeap<Reverse<(OrderedFloat<$float>, usize)>>,
+                results: &mut BinaryHeap<(OrderedFloat<$float>, usize)>,
+            ) -> Result<(Vec<usize>, Vec<$float>), AnnSearchErrors> {
+                let init_candidates = (ef / 2).max(2 * k).min(self.n);
+                let search_k = init_candidates * 3;
+                let (init_indices, _) =
+                    self.forest
+                        .query(query_vec, init_candidates, Some(search_k))?;
+
+                for &entry_idx in &init_indices {
+                    if entry_idx >= self.n || visited.contains(entry_idx) {
+                        continue;
+                    }
+                    visited.insert(entry_idx);
+                    let dist = self.manhattan_distance_to_query(entry_idx, query_vec);
                     candidates.push(Reverse((OrderedFloat(dist), entry_idx)));
                     results.push((OrderedFloat(dist), entry_idx));
                 }

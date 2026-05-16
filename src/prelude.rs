@@ -24,7 +24,7 @@ pub use crate::gpu::traits_gpu::AnnSearchGpuFloat;
 
 /// Results type for large approximate nearest neighbour searches. The distances
 /// are options here.
-pub type AnnSearchOptionResult<T> = Result<(Vec<Vec<usize>>, Option<Vec<Vec<T>>>), AnnSearchErrors>;
+pub type KnnOptionResult<T> = Result<(Vec<Vec<usize>>, Option<Vec<Vec<T>>>), AnnSearchErrors>;
 
 /// Results type for large approximate nearest neighbour searches.
-pub type AnnSearchResults<T> = Result<(Vec<Vec<usize>>, Vec<Vec<T>>), AnnSearchErrors>;
+pub type KnnResult<T> = Result<(Vec<Vec<usize>>, Vec<Vec<T>>), AnnSearchErrors>;

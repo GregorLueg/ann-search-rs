@@ -98,7 +98,8 @@ fn main() {
             num_tables,
             bits_per_hash,
             cli.seed as usize,
-        );
+        )
+        .unwrap();
         let build_time = start.elapsed().as_secs_f64() * 1000.0;
 
         let index_size_mb = lsh_index.memory_usage_bytes() as f64 / (1024.0 * 1024.0);

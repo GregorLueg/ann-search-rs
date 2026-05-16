@@ -157,7 +157,15 @@ where
     /// ### Returns
     ///
     /// Constructed index ready for querying
-    pub fn new(data: MatRef<T>, n_trees: usize, metric: Dist, seed: usize) -> Self {
+    pub fn new(
+        data: MatRef<T>,
+        n_trees: usize,
+        metric: Dist,
+        seed: usize,
+    ) -> Result<Self, AnnSearchErrors> {
+        if metric == Dist::Manhattan {
+            return Err(AnnSearchErrors::DistanceNotSupported(metric));
+        }
         let mut rng = StdRng::seed_from_u64(seed as u64);
 
         let (vectors_flat, n, dim) = matrix_to_flat(data);
@@ -253,7 +261,7 @@ where
         let new_to_old = idx.optimise_memory_layout();
         idx.original_ids = new_to_old;
 
-        idx
+        Ok(idx)
     }
 
     /// Build a single tree recursively
@@ -364,6 +372,7 @@ where
                     let thresh = (dot_v1 - dot_v2) / T::from_f64(2.0).unwrap();
                     (hp, thresh)
                 }
+                Dist::Manhattan => unreachable!(),
             };
 
             let mut left_items = Vec::new();
@@ -609,6 +618,7 @@ where
                             Dist::Cosine => {
                                 self.cosine_distance_to_query(item, query_vec, query_norm)
                             }
+                            Dist::Manhattan => unreachable!(),
                         };
 
                         // FLAT ARRAY PUSH - No heap overhead!
@@ -718,7 +728,7 @@ where
         search_k: Option<usize>,
         return_dist: bool,
         verbose: bool,
-    ) -> AnnSearchOptionResult<T> {
+    ) -> KnnOptionResult<T> {
         let counter = Arc::new(AtomicUsize::new(0));
 
         // collect unordered results, tagging them with their ORIGINAL id
@@ -851,7 +861,7 @@ mod tests {
     #[test]
     fn test_annoy_query_finds_self() {
         let mat = create_simple_matrix();
-        let index = AnnoyIndex::new(mat.as_ref(), 4, Dist::SquaredEuclidean, 42);
+        let index = AnnoyIndex::new(mat.as_ref(), 4, Dist::SquaredEuclidean, 42).unwrap();
 
         // Query with point 0, should find itself first
         let query = vec![1.0, 0.0, 0.0];
@@ -865,7 +875,7 @@ mod tests {
     #[test]
     fn test_annoy_query_euclidean() {
         let mat = create_simple_matrix();
-        let index = AnnoyIndex::new(mat.as_ref(), 8, Dist::SquaredEuclidean, 42);
+        let index = AnnoyIndex::new(mat.as_ref(), 8, Dist::SquaredEuclidean, 42).unwrap();
 
         let query = vec![1.0, 0.0, 0.0];
         let (indices, distances) = index.query(&query, 3, None).unwrap();
@@ -885,7 +895,7 @@ mod tests {
         use crate::prelude::*;
 
         let mat = create_simple_matrix();
-        let index = AnnoyIndex::new(mat.as_ref(), 8, Dist::Cosine, 42);
+        let index = AnnoyIndex::new(mat.as_ref(), 8, Dist::Cosine, 42).unwrap();
 
         let query = vec![1.0, 0.0, 0.0];
         let (indices, distances) = index.query(&query, 3, None).unwrap();
@@ -900,7 +910,7 @@ mod tests {
         use crate::prelude::*;
 
         let mat = create_simple_matrix();
-        let index = AnnoyIndex::new(mat.as_ref(), 4, Dist::SquaredEuclidean, 42);
+        let index = AnnoyIndex::new(mat.as_ref(), 4, Dist::SquaredEuclidean, 42).unwrap();
 
         let query = vec![1.0, 0.0, 0.0];
         // ask for 10 neighbours but only 5 points exist
@@ -915,7 +925,7 @@ mod tests {
         use crate::prelude::*;
 
         let mat = create_simple_matrix();
-        let index = AnnoyIndex::new(mat.as_ref(), 4, Dist::SquaredEuclidean, 42);
+        let index = AnnoyIndex::new(mat.as_ref(), 4, Dist::SquaredEuclidean, 42).unwrap();
 
         let query = vec![1.0, 0.0, 0.0];
 
@@ -932,8 +942,8 @@ mod tests {
         let mat = create_simple_matrix();
 
         // More trees should give better recall
-        let index_few = AnnoyIndex::new(mat.as_ref(), 2, Dist::SquaredEuclidean, 42);
-        let index_many = AnnoyIndex::new(mat.as_ref(), 16, Dist::SquaredEuclidean, 42);
+        let index_few = AnnoyIndex::new(mat.as_ref(), 2, Dist::SquaredEuclidean, 42).unwrap();
+        let index_many = AnnoyIndex::new(mat.as_ref(), 16, Dist::SquaredEuclidean, 42).unwrap();
 
         let query = vec![0.9, 0.1, 0.0];
         let (indices1, _) = index_few.query(&query, 3, None).unwrap();
@@ -946,7 +956,7 @@ mod tests {
     #[test]
     fn test_annoy_query_row() {
         let mat = create_simple_matrix();
-        let index = AnnoyIndex::new(mat.as_ref(), 8, Dist::SquaredEuclidean, 42);
+        let index = AnnoyIndex::new(mat.as_ref(), 8, Dist::SquaredEuclidean, 42).unwrap();
 
         // Query using a row from the matrix
         let (indices, distances) = index.query_row(mat.row(0), 1, None).unwrap();
@@ -960,8 +970,8 @@ mod tests {
         let mat = create_simple_matrix();
 
         // Same seed should give same results
-        let index1 = AnnoyIndex::new(mat.as_ref(), 8, Dist::SquaredEuclidean, 42);
-        let index2 = AnnoyIndex::new(mat.as_ref(), 8, Dist::SquaredEuclidean, 42);
+        let index1 = AnnoyIndex::new(mat.as_ref(), 8, Dist::SquaredEuclidean, 42).unwrap();
+        let index2 = AnnoyIndex::new(mat.as_ref(), 8, Dist::SquaredEuclidean, 42).unwrap();
 
         let query = vec![0.5, 0.5, 0.0];
         let (indices1, _) = index1.query(&query, 3, None).unwrap();
@@ -975,8 +985,8 @@ mod tests {
         let mat = create_simple_matrix();
 
         // Different seeds might give different tree structures
-        let index1 = AnnoyIndex::new(mat.as_ref(), 8, Dist::SquaredEuclidean, 42);
-        let index2 = AnnoyIndex::new(mat.as_ref(), 8, Dist::SquaredEuclidean, 123);
+        let index1 = AnnoyIndex::new(mat.as_ref(), 8, Dist::SquaredEuclidean, 42).unwrap();
+        let index2 = AnnoyIndex::new(mat.as_ref(), 8, Dist::SquaredEuclidean, 123).unwrap();
 
         let query = vec![0.5, 0.5, 0.0];
 
@@ -1002,7 +1012,7 @@ mod tests {
         }
 
         let mat = Mat::from_fn(n, dim, |i, j| data[i * dim + j]);
-        let index = AnnoyIndex::new(mat.as_ref(), 16, Dist::SquaredEuclidean, 42);
+        let index = AnnoyIndex::new(mat.as_ref(), 16, Dist::SquaredEuclidean, 42).unwrap();
 
         // Query for point 0
         let query: Vec<f32> = (0..dim).map(|_| 0.0).collect();
@@ -1017,7 +1027,7 @@ mod tests {
         use crate::prelude::*;
         let data = [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0];
         let mat = Mat::from_fn(3, 3, |i, j| data[i * 3 + j]);
-        let index = AnnoyIndex::new(mat.as_ref(), 4, Dist::Cosine, 42);
+        let index = AnnoyIndex::new(mat.as_ref(), 4, Dist::Cosine, 42).unwrap();
 
         let query = vec![1.0, 0.0, 0.0];
         let (indices, distances) = index.query(&query, 3, None).unwrap();
@@ -1038,7 +1048,7 @@ mod tests {
         let data: Vec<f32> = (0..n * dim).map(|i| i as f32).collect();
         let mat = Mat::from_fn(n, dim, |i, j| data[i * dim + j]);
 
-        let index = AnnoyIndex::new(mat.as_ref(), 32, Dist::SquaredEuclidean, 42);
+        let index = AnnoyIndex::new(mat.as_ref(), 32, Dist::SquaredEuclidean, 42).unwrap();
 
         let query: Vec<f32> = (0..dim).map(|_| 0.0).collect();
         let (indices, _) = index.query(&query, 3, None).unwrap();

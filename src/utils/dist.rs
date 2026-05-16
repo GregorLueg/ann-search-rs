@@ -31,6 +31,8 @@ pub enum Dist {
     SquaredEuclidean,
     /// Cosine distance
     Cosine,
+    /// Manhattan
+    Manhattan,
 }
 
 /// Display implementation for Dist
@@ -39,6 +41,7 @@ impl Display for Dist {
         let s = match self {
             Dist::SquaredEuclidean => "squared_euclidean",
             Dist::Cosine => "cosine",
+            Dist::Manhattan => "manhattan",
         };
         write!(f, "{}", s)
     }
@@ -123,7 +126,7 @@ pub fn detect_simd_level() -> SimdLevel {
 /// This includes Euclidean distance, dot products, L1/2 normalisations and
 /// addition/subtraction operations.
 pub trait SimdDistance: Sized + Copy {
-    /// Calculate Euclidean distance via SIMD
+    /// Calculate (squared) Euclidean distance via SIMD
     ///
     /// ### Params
     ///
@@ -146,6 +149,18 @@ pub trait SimdDistance: Sized + Copy {
     ///
     /// Dot product
     fn dot_simd(a: &[Self], b: &[Self]) -> Self;
+
+    /// Calculate Manhattan distance via SIMD
+    ///
+    /// ### Params
+    ///
+    /// * `a` - Slice of vector a
+    /// * `b` - Slice of vector b
+    ///
+    /// ### Returns
+    ///
+    /// Squared Euclidean distance
+    fn manhattan_simd(a: &[Self], b: &[Self]) -> Self;
 
     /// Subtracts one vector from the other
     ///
@@ -751,6 +766,468 @@ fn dot_f64_avx512(a: &[f64], b: &[f64]) -> f64 {
 fn dot_f64_avx512(a: &[f64], b: &[f64]) -> f64 {
     dot_f64_avx2(a, b)
 }
+
+///////////////
+// Manhattan //
+///////////////
+
+///////////////////
+// f32 Manhattan //
+///////////////////
+
+/// Manhattan distance - f32, scalar
+///
+/// ### Params
+///
+/// * `a` - Slice of vector a
+/// * `b` - Slice of vector b
+///
+/// ### Returns
+///
+/// Manhattan distance (L1)
+#[inline(always)]
+fn manhattan_f32_scalar(a: &[f32], b: &[f32]) -> f32 {
+    a.iter().zip(b.iter()).map(|(&x, &y)| (x - y).abs()).sum()
+}
+
+/// Manhattan distance - f32, 128-bit
+///
+/// ### Params
+///
+/// * `a` - Slice of vector a
+/// * `b` - Slice of vector b
+///
+/// ### Returns
+///
+/// Manhattan distance (L1)
+#[inline(always)]
+fn manhattan_f32_sse(a: &[f32], b: &[f32]) -> f32 {
+    let len = a.len();
+    let chunks = len / 4;
+    let mut acc = f32x4::ZERO;
+
+    unsafe {
+        let a_ptr = a.as_ptr();
+        let b_ptr = b.as_ptr();
+
+        for i in 0..chunks {
+            let offset = i * 4;
+            let va = f32x4::from(*(a_ptr.add(offset) as *const [f32; 4]));
+            let vb = f32x4::from(*(b_ptr.add(offset) as *const [f32; 4]));
+            acc += (va - vb).abs();
+        }
+    }
+
+    let mut sum = acc.reduce_add();
+    for i in (chunks * 4)..len {
+        sum += (a[i] - b[i]).abs();
+    }
+    sum
+}
+
+/// Manhattan distance - f32, 256-bit
+///
+/// ### Params
+///
+/// * `a` - Slice of vector a
+/// * `b` - Slice of vector b
+///
+/// ### Returns
+///
+/// Manhattan distance (L1)
+#[inline(always)]
+fn manhattan_f32_avx2(a: &[f32], b: &[f32]) -> f32 {
+    let len = a.len();
+    let chunks = len / 8;
+    let mut acc = f32x8::ZERO;
+
+    unsafe {
+        let a_ptr = a.as_ptr();
+        let b_ptr = b.as_ptr();
+
+        for i in 0..chunks {
+            let offset = i * 8;
+            let va = f32x8::from(*(a_ptr.add(offset) as *const [f32; 8]));
+            let vb = f32x8::from(*(b_ptr.add(offset) as *const [f32; 8]));
+            acc += (va - vb).abs();
+        }
+    }
+
+    let mut sum = acc.reduce_add();
+    for i in (chunks * 8)..len {
+        sum += (a[i] - b[i]).abs();
+    }
+    sum
+}
+
+/// Manhattan distance - f32, 512-bit
+///
+/// ### Params
+///
+/// * `a` - Slice of vector a
+/// * `b` - Slice of vector b
+///
+/// ### Returns
+///
+/// Manhattan distance (L1)
+#[cfg(all(target_arch = "x86_64", target_feature = "avx512f"))]
+#[inline(always)]
+fn manhattan_f32_avx512(a: &[f32], b: &[f32]) -> f32 {
+    use std::arch::x86_64::*;
+
+    let len = a.len();
+    let chunks = len / 16;
+
+    unsafe {
+        let mut acc = _mm512_setzero_ps();
+
+        for i in 0..chunks {
+            let va = _mm512_loadu_ps(a.as_ptr().add(i * 16));
+            let vb = _mm512_loadu_ps(b.as_ptr().add(i * 16));
+            let diff = _mm512_sub_ps(va, vb);
+            acc = _mm512_add_ps(acc, _mm512_abs_ps(diff));
+        }
+
+        let mut sum = _mm512_reduce_add_ps(acc);
+        for i in (chunks * 16)..len {
+            sum += (a[i] - b[i]).abs();
+        }
+        sum
+    }
+}
+
+/// Manhattan distance - f32, 512-bit (fallback)
+///
+/// ### Params
+///
+/// * `a` - Slice of vector a
+/// * `b` - Slice of vector b
+///
+/// ### Returns
+///
+/// Manhattan distance (L1)
+#[cfg(not(all(target_arch = "x86_64", target_feature = "avx512f")))]
+#[inline(always)]
+fn manhattan_f32_avx512(a: &[f32], b: &[f32]) -> f32 {
+    manhattan_f32_avx2(a, b)
+}
+
+///////////////////
+// f64 Manhattan //
+///////////////////
+
+/// Manhattan distance - f64, scalar
+///
+/// ### Params
+///
+/// * `a` - Slice of vector a
+/// * `b` - Slice of vector b
+///
+/// ### Returns
+///
+/// Manhattan distance (L1)
+#[inline(always)]
+fn manhattan_f64_scalar(a: &[f64], b: &[f64]) -> f64 {
+    a.iter().zip(b.iter()).map(|(&x, &y)| (x - y).abs()).sum()
+}
+
+/// Manhattan distance - f64, 128-bit
+///
+/// ### Params
+///
+/// * `a` - Slice of vector a
+/// * `b` - Slice of vector b
+///
+/// ### Returns
+///
+/// Manhattan distance (L1)
+#[inline(always)]
+fn manhattan_f64_sse(a: &[f64], b: &[f64]) -> f64 {
+    let len = a.len();
+    let chunks = len / 2;
+    let mut acc = f64x2::ZERO;
+
+    unsafe {
+        let a_ptr = a.as_ptr();
+        let b_ptr = b.as_ptr();
+
+        for i in 0..chunks {
+            let offset = i * 2;
+            let va = f64x2::from(*(a_ptr.add(offset) as *const [f64; 2]));
+            let vb = f64x2::from(*(b_ptr.add(offset) as *const [f64; 2]));
+            acc += (va - vb).abs();
+        }
+    }
+
+    let mut sum = acc.reduce_add();
+    if len % 2 == 1 {
+        sum += (a[len - 1] - b[len - 1]).abs();
+    }
+    sum
+}
+
+/// Manhattan distance - f64, 256-bit
+///
+/// ### Params
+///
+/// * `a` - Slice of vector a
+/// * `b` - Slice of vector b
+///
+/// ### Returns
+///
+/// Manhattan distance (L1)
+#[inline(always)]
+fn manhattan_f64_avx2(a: &[f64], b: &[f64]) -> f64 {
+    let len = a.len();
+    let chunks = len / 4;
+    let mut acc = f64x4::ZERO;
+
+    unsafe {
+        let a_ptr = a.as_ptr();
+        let b_ptr = b.as_ptr();
+
+        for i in 0..chunks {
+            let offset = i * 4;
+            let va = f64x4::from(*(a_ptr.add(offset) as *const [f64; 4]));
+            let vb = f64x4::from(*(b_ptr.add(offset) as *const [f64; 4]));
+            acc += (va - vb).abs();
+        }
+    }
+
+    let mut sum = acc.reduce_add();
+    for i in (chunks * 4)..len {
+        sum += (a[i] - b[i]).abs();
+    }
+    sum
+}
+
+/// Manhattan distance - f64, 512-bit
+///
+/// ### Params
+///
+/// * `a` - Slice of vector a
+/// * `b` - Slice of vector b
+///
+/// ### Returns
+///
+/// Manhattan distance (L1)
+#[cfg(all(target_arch = "x86_64", target_feature = "avx512f"))]
+#[inline(always)]
+fn manhattan_f64_avx512(a: &[f64], b: &[f64]) -> f64 {
+    use std::arch::x86_64::*;
+
+    let len = a.len();
+    let chunks = len / 8;
+
+    unsafe {
+        let mut acc = _mm512_setzero_pd();
+
+        for i in 0..chunks {
+            let va = _mm512_loadu_pd(a.as_ptr().add(i * 8));
+            let vb = _mm512_loadu_pd(b.as_ptr().add(i * 8));
+            let diff = _mm512_sub_pd(va, vb);
+            acc = _mm512_add_pd(acc, _mm512_abs_pd(diff));
+        }
+
+        let mut sum = _mm512_reduce_add_pd(acc);
+        for i in (chunks * 8)..len {
+            sum += (a[i] - b[i]).abs();
+        }
+        sum
+    }
+}
+
+/// Manhattan distance - f64, 512-bit (fallback)
+///
+/// ### Params
+///
+/// * `a` - Slice of vector a
+/// * `b` - Slice of vector b
+///
+/// ### Returns
+///
+/// Manhattan distance (L1)
+#[cfg(not(all(target_arch = "x86_64", target_feature = "avx512f")))]
+#[inline(always)]
+fn manhattan_f64_avx512(a: &[f64], b: &[f64]) -> f64 {
+    manhattan_f64_avx2(a, b)
+}
+
+//////////////
+// Canberra //
+//////////////
+
+//////////////////
+// f32 Canberra //
+//////////////////
+
+/// Canberra distance - f32, scalar
+///
+/// ### Params
+///
+/// * `a` - Slice of vector a
+/// * `b` - Slice of vector b
+///
+/// ### Returns
+///
+/// Canberra distance
+#[inline(always)]
+fn canberra_f32_scalar(a: &[f32], b: &[f32]) -> f32 {
+    let mut sum = 0.0_f32;
+    for (&x, &y) in a.iter().zip(b.iter()) {
+        let denom = x.abs() + y.abs();
+        if denom > 0.0 {
+            sum += (x - y).abs() / denom;
+        }
+    }
+    sum
+}
+
+// /// Canberra distance - f32, 128-bit
+// ///
+// /// ### Params
+// ///
+// /// * `a` - Slice of vector a
+// /// * `b` - Slice of vector b
+// ///
+// /// ### Returns
+// ///
+// /// Canberra distance
+// #[inline(always)]
+// fn canberra_f32_sse(a: &[f32], b: &[f32]) -> f32 {
+//     let len = a.len();
+//     let chunks = len / 4;
+//     let mut acc = f32x4::ZERO;
+//     let zero = f32x4::ZERO;
+//     let one = f32x4::splat(1.0);
+
+//     unsafe {
+//         let a_ptr = a.as_ptr();
+//         let b_ptr = b.as_ptr();
+
+//         for i in 0..chunks {
+//             let offset = i * 4;
+//             let va = f32x4::from(*(a_ptr.add(offset) as *const [f32; 4]));
+//             let vb = f32x4::from(*(b_ptr.add(offset) as *const [f32; 4]));
+//             let num = (va - vb).abs();
+//             let denom = va.abs() + vb.abs();
+//             let safe_denom = denom.cmp_eq(zero).blend(one, denom);
+//             acc += num / safe_denom;
+//         }
+//     }
+
+//     let mut sum = acc.reduce_add();
+//     for i in (chunks * 4)..len {
+//         let denom = a[i].abs() + b[i].abs();
+//         if denom > 0.0 {
+//             sum += (a[i] - b[i]).abs() / denom;
+//         }
+//     }
+//     sum
+// }
+
+// /// Canberra distance - f32, 256-bit
+// ///
+// /// ### Params
+// ///
+// /// * `a` - Slice of vector a
+// /// * `b` - Slice of vector b
+// ///
+// /// ### Returns
+// ///
+// /// Canberra distance
+// #[inline(always)]
+// fn canberra_f32_avx2(a: &[f32], b: &[f32]) -> f32 {
+//     let len = a.len();
+//     let chunks = len / 8;
+//     let mut acc = f32x8::ZERO;
+//     let zero = f32x8::ZERO;
+//     let one = f32x8::splat(1.0);
+
+//     unsafe {
+//         let a_ptr = a.as_ptr();
+//         let b_ptr = b.as_ptr();
+
+//         for i in 0..chunks {
+//             let offset = i * 8;
+//             let va = f32x8::from(*(a_ptr.add(offset) as *const [f32; 8]));
+//             let vb = f32x8::from(*(b_ptr.add(offset) as *const [f32; 8]));
+//             let num = (va - vb).abs();
+//             let denom = va.abs() + vb.abs();
+//             let safe_denom = denom.cmp_eq(zero).blend(one, denom);
+//             acc += num / safe_denom;
+//         }
+//     }
+
+//     let mut sum = acc.reduce_add();
+//     for i in (chunks * 8)..len {
+//         let denom = a[i].abs() + b[i].abs();
+//         if denom > 0.0 {
+//             sum += (a[i] - b[i]).abs() / denom;
+//         }
+//     }
+//     sum
+// }
+
+/// Canberra distance - f32, 512-bit
+///
+/// ### Params
+///
+/// * `a` - Slice of vector a
+/// * `b` - Slice of vector b
+///
+/// ### Returns
+///
+/// Canberra distance
+#[cfg(all(target_arch = "x86_64", target_feature = "avx512f"))]
+#[inline(always)]
+fn canberra_f32_avx512(a: &[f32], b: &[f32]) -> f32 {
+    use std::arch::x86_64::*;
+
+    let len = a.len();
+    let chunks = len / 16;
+
+    unsafe {
+        let mut acc = _mm512_setzero_ps();
+        let zero = _mm512_setzero_ps();
+        let one = _mm512_set1_ps(1.0);
+
+        for i in 0..chunks {
+            let va = _mm512_loadu_ps(a.as_ptr().add(i * 16));
+            let vb = _mm512_loadu_ps(b.as_ptr().add(i * 16));
+            let num = _mm512_abs_ps(_mm512_sub_ps(va, vb));
+            let denom = _mm512_add_ps(_mm512_abs_ps(va), _mm512_abs_ps(vb));
+            let mask = _mm512_cmp_ps_mask::<_CMP_EQ_OQ>(denom, zero);
+            let safe_denom = _mm512_mask_blend_ps(mask, denom, one);
+            acc = _mm512_add_ps(acc, _mm512_div_ps(num, safe_denom));
+        }
+
+        let mut sum = _mm512_reduce_add_ps(acc);
+        for i in (chunks * 16)..len {
+            let denom = a[i].abs() + b[i].abs();
+            if denom > 0.0 {
+                sum += (a[i] - b[i]).abs() / denom;
+            }
+        }
+        sum
+    }
+}
+
+// /// Canberra distance - f32, 512-bit, fallback
+// ///
+// /// ### Params
+// ///
+// /// * `a` - Slice of vector a
+// /// * `b` - Slice of vector b
+// ///
+// /// ### Returns
+// ///
+// /// Canberra distance
+// #[cfg(not(all(target_arch = "x86_64", target_feature = "avx512f")))]
+// #[inline(always)]
+// fn canberra_f32_avx512(a: &[f32], b: &[f32]) -> f32 {
+//     canberra_f32_avx2(a, b)
+// }
 
 /////////////////////////
 // Vector subtractions //
@@ -2143,6 +2620,16 @@ impl SimdDistance for f32 {
     }
 
     #[inline]
+    fn manhattan_simd(a: &[f32], b: &[f32]) -> f32 {
+        match detect_simd_level() {
+            SimdLevel::Avx512 => manhattan_f32_avx512(a, b),
+            SimdLevel::Avx2 => manhattan_f32_avx2(a, b),
+            SimdLevel::Sse => manhattan_f32_sse(a, b),
+            SimdLevel::Scalar => manhattan_f32_sse(a, b),
+        }
+    }
+
+    #[inline]
     fn subtract_simd(a: &[f32], b: &[f32]) -> Vec<f32> {
         match detect_simd_level() {
             SimdLevel::Avx512 => subtract_f32_avx512(a, b),
@@ -2215,6 +2702,16 @@ impl SimdDistance for f64 {
             SimdLevel::Avx2 => dot_f64_avx2(a, b),
             SimdLevel::Sse => dot_f64_sse(a, b),
             SimdLevel::Scalar => dot_f64_scalar(a, b),
+        }
+    }
+
+    #[inline]
+    fn manhattan_simd(a: &[f64], b: &[f64]) -> f64 {
+        match detect_simd_level() {
+            SimdLevel::Avx512 => manhattan_f64_avx512(a, b),
+            SimdLevel::Avx2 => manhattan_f64_avx2(a, b),
+            SimdLevel::Sse => manhattan_f64_sse(a, b),
+            SimdLevel::Scalar => manhattan_f64_sse(a, b),
         }
     }
 
@@ -2370,6 +2867,46 @@ where
         let vec = &self.vectors_flat()[start..start + self.dim()];
         let dot = T::dot_simd(vec, query);
         T::one() - (dot / (query_norm * self.norms()[internal_idx]))
+    }
+
+    ///////////////
+    // Manhattan //
+    ///////////////
+
+    /// Manhattan distance between two internal vectors
+    ///
+    /// ### Params
+    ///
+    /// * `i` - Sample index i
+    /// * `j` - Sample index j
+    ///
+    /// ### Returns
+    ///
+    /// The Manhattan distance between the two samples
+    #[inline(always)]
+    fn manhattan_distance(&self, i: usize, j: usize) -> T {
+        let start_i = i * self.dim();
+        let start_j = j * self.dim();
+        let vec_i = &self.vectors_flat()[start_i..start_i + self.dim()];
+        let vec_j = &self.vectors_flat()[start_j..start_j + self.dim()];
+        T::manhattan_simd(vec_i, vec_j)
+    }
+
+    /// Manhattan distance between query vector and internal vector
+    ///
+    /// ### Params
+    ///
+    /// * `internal_idx` - Index of internal vector
+    /// * `query` - Query vector slice
+    ///
+    /// ### Returns
+    ///
+    /// The Manhattan distance
+    #[inline(always)]
+    fn manhattan_distance_to_query(&self, internal_idx: usize, query: &[T]) -> T {
+        let start = internal_idx * self.dim();
+        let vec = &self.vectors_flat()[start..start + self.dim()];
+        T::manhattan_simd(vec, query)
     }
 }
 
@@ -5243,6 +5780,76 @@ mod tests {
             // Same direction
             let dist_2 = vecs.cosine_distance_i8(2, &query, query_norm_sq);
             assert_relative_eq!(dist_2, 0.0, epsilon = 1e-5);
+        }
+
+        #[test]
+        fn test_manhattan_f32_basic() {
+            let a: Vec<f32> = vec![1.0, 2.0, 3.0, 4.0];
+            let b: Vec<f32> = vec![2.0, 4.0, 6.0, 8.0];
+            // |1-2| + |2-4| + |3-6| + |4-8| = 1 + 2 + 3 + 4 = 10
+            assert_relative_eq!(f32::manhattan_simd(&a, &b), 10.0, epsilon = 1e-5);
+        }
+
+        #[test]
+        fn test_manhattan_f32_identity() {
+            let a: Vec<f32> = (0..32).map(|i| i as f32).collect();
+            assert_relative_eq!(f32::manhattan_simd(&a, &a), 0.0, epsilon = 1e-5);
+        }
+
+        #[test]
+        fn test_manhattan_f32_signs() {
+            // Mixed signs should still produce |diff|
+            let a: Vec<f32> = vec![-3.0, 2.0, -1.0, 4.0];
+            let b: Vec<f32> = vec![1.0, -2.0, 1.0, -4.0];
+            // 4 + 4 + 2 + 8 = 18
+            assert_relative_eq!(f32::manhattan_simd(&a, &b), 18.0, epsilon = 1e-5);
+        }
+
+        #[test]
+        fn test_manhattan_f32_various_lengths() {
+            // Exercise SIMD chunks + scalar tail across all paths
+            for len in [1usize, 3, 4, 7, 8, 15, 16, 17, 31, 33, 64, 100, 257] {
+                let a: Vec<f32> = (0..len).map(|i| (i as f32) * 0.5).collect();
+                let b: Vec<f32> = (0..len).map(|i| (i as f32) * 0.25).collect();
+
+                let simd = f32::manhattan_simd(&a, &b);
+                let scalar: f32 = a.iter().zip(b.iter()).map(|(&x, &y)| (x - y).abs()).sum();
+
+                assert_relative_eq!(simd, scalar, epsilon = 1e-4);
+            }
+        }
+
+        #[test]
+        fn test_manhattan_f64_basic() {
+            let a: Vec<f64> = vec![1.0, 2.0, 3.0, 4.0];
+            let b: Vec<f64> = vec![2.0, 4.0, 6.0, 8.0];
+            assert_relative_eq!(f64::manhattan_simd(&a, &b), 10.0, epsilon = 1e-10);
+        }
+
+        #[test]
+        fn test_manhattan_f64_identity() {
+            let a: Vec<f64> = (0..32).map(|i| i as f64).collect();
+            assert_relative_eq!(f64::manhattan_simd(&a, &a), 0.0, epsilon = 1e-10);
+        }
+
+        #[test]
+        fn test_manhattan_f64_signs() {
+            let a: Vec<f64> = vec![-3.0, 2.0, -1.0, 4.0];
+            let b: Vec<f64> = vec![1.0, -2.0, 1.0, -4.0];
+            assert_relative_eq!(f64::manhattan_simd(&a, &b), 18.0, epsilon = 1e-10);
+        }
+
+        #[test]
+        fn test_manhattan_f64_various_lengths() {
+            for len in [1usize, 2, 3, 4, 7, 8, 15, 16, 17, 31, 33, 64, 100, 257] {
+                let a: Vec<f64> = (0..len).map(|i| (i as f64) * 0.5).collect();
+                let b: Vec<f64> = (0..len).map(|i| (i as f64) * 0.25).collect();
+
+                let simd = f64::manhattan_simd(&a, &b);
+                let scalar: f64 = a.iter().zip(b.iter()).map(|(&x, &y)| (x - y).abs()).sum();
+
+                assert_relative_eq!(simd, scalar, epsilon = 1e-10);
+            }
         }
     }
 }

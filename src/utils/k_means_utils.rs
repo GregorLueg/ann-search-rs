@@ -13,6 +13,7 @@ use rayon::prelude::*;
 use std::iter::Sum;
 use std::num::NonZero;
 
+use crate::errors::AnnSearchErrors;
 use crate::prelude::AnnSearchFloat;
 use crate::utils::dist::*;
 use crate::utils::Dist;
@@ -63,6 +64,9 @@ where
                         let c_norm = &self.centroids_norm()[c];
                         cosine_distance_static_norm(query_vec, cent, &query_norm, c_norm)
                     }
+                    Dist::Manhattan => {
+                        unreachable!()
+                    }
                 };
                 (dist, c)
             })
@@ -93,6 +97,9 @@ where
                 let dist = match self.metric() {
                     Dist::Cosine => T::one() - T::dot_simd(query_vec, cent),
                     Dist::SquaredEuclidean => T::euclidean_simd(query_vec, cent),
+                    Dist::Manhattan => {
+                        unreachable!()
+                    }
                 };
                 (dist, c)
             })
@@ -323,6 +330,9 @@ where
                 }
             }
         }
+        Dist::Manhattan => {
+            unreachable!()
+        }
     }
 
     min_dist
@@ -399,6 +409,9 @@ where
                         *dist = d;
                     }
                 }
+            }
+            Dist::Manhattan => {
+                unreachable!()
             }
         }
 
@@ -688,6 +701,9 @@ fn gemm_assign_full<T>(
                             upper_block[local_i] = T::one() - best_score * inv_xn;
                             lower_block[local_i] = T::one() - second_score * inv_xn;
                         }
+                        Dist::Manhattan => {
+                            unreachable!()
+                        }
                     }
                 }
             },
@@ -802,6 +818,9 @@ fn gemm_reassign_dirty<T>(
                     upper_bounds[i] = T::one() - best_score * inv_xn;
                     lower_bounds[i] = T::one() - second_score * inv_xn;
                 }
+                Dist::Manhattan => {
+                    unreachable!()
+                }
             }
         }
         return;
@@ -912,6 +931,9 @@ fn update_centroids<T>(
         centroid_norms[c] = match metric {
             Dist::SquaredEuclidean => T::dot_simd(cent, cent), // ||c||^2
             Dist::Cosine => T::calculate_l2_norm(cent),        // ||c||
+            Dist::Manhattan => {
+                unreachable!()
+            }
         };
     }
 }
@@ -1795,6 +1817,9 @@ where
         Dist::Cosine => (0..n)
             .map(|i| T::calculate_l2_norm(&data[i * dim..(i + 1) * dim]))
             .collect(),
+        Dist::Manhattan => {
+            unreachable!()
+        }
     };
     let centroid_norms: Vec<T> = match metric {
         Dist::SquaredEuclidean => (0..k)
@@ -1806,6 +1831,9 @@ where
         Dist::Cosine => (0..k)
             .map(|c| T::calculate_l2_norm(&centroids[c * dim..(c + 1) * dim]))
             .collect(),
+        Dist::Manhattan => {
+            unreachable!()
+        }
     };
 
     let mut assignments = vec![0usize; n];
@@ -1877,6 +1905,9 @@ where
                 }
             })
             .collect(),
+        Dist::Manhattan => {
+            unreachable!()
+        }
     };
 
     match metric {
@@ -1914,6 +1945,9 @@ where
                 best
             })
             .collect(),
+        Dist::Manhattan => {
+            unreachable!()
+        }
     }
 }
 
@@ -1999,10 +2033,14 @@ pub fn train_centroids<T>(
     params_k_means: Option<KMeansTrainingParams>,
     seed: usize,
     verbose: bool,
-) -> Vec<T>
+) -> Result<Vec<T>, AnnSearchErrors>
 where
     T: AnnSearchFloat,
 {
+    if *metric == Dist::Manhattan {
+        return Err(AnnSearchErrors::DistanceNotSupported(*metric));
+    }
+
     let params = params_k_means.unwrap_or_default();
 
     let data_norms: Vec<T> = match metric {
@@ -2017,6 +2055,9 @@ where
             .into_par_iter()
             .map(|i| T::calculate_l2_norm(&data[i * dim..(i + 1) * dim]))
             .collect(),
+        Dist::Manhattan => {
+            unreachable!()
+        }
     };
 
     let init_method = resolve_init(params.init, n_centroids);
@@ -2037,6 +2078,9 @@ where
                     .map(|i| T::calculate_l2_norm(&data[i * dim..(i + 1) * dim]))
                     .collect(),
                 Dist::Cosine => data_norms.clone(),
+                Dist::Manhattan => {
+                    unreachable!()
+                }
             };
             kmeans_parallel_init(data, &init_norms, dim, n, n_centroids, metric, seed)
         }
@@ -2052,6 +2096,9 @@ where
         Dist::Cosine => (0..n_centroids)
             .map(|i| T::calculate_l2_norm(&centroids[i * dim..(i + 1) * dim]))
             .collect(),
+        Dist::Manhattan => {
+            unreachable!()
+        }
     };
 
     if verbose {
@@ -2128,7 +2175,7 @@ where
         }
     }
 
-    centroids
+    Ok(centroids)
 }
 
 /// Convert flat assignments to CSR (Compressed Sparse Row) layout
@@ -2422,7 +2469,8 @@ mod tests {
     fn test_train_centroids_small() {
         let data = vec![0.0, 0.0, 0.1, 0.1, 10.0, 10.0, 10.1, 10.1];
 
-        let centroids = train_centroids(&data, 2, 4, 2, &Dist::SquaredEuclidean, None, 42, false);
+        let centroids =
+            train_centroids(&data, 2, 4, 2, &Dist::SquaredEuclidean, None, 42, false).unwrap();
 
         assert_eq!(centroids.len(), 4);
 
@@ -2653,7 +2701,8 @@ mod tests {
             None,
             42,
             false,
-        );
+        )
+        .unwrap();
 
         assert_eq!(centroids.len(), n_clusters * dim);
 

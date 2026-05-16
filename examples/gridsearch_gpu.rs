@@ -76,7 +76,8 @@ fn main() {
         data.as_ref(),
         &cli.distance,
         device.clone(),
-    );
+    )
+    .unwrap();
     let build_time = start.elapsed().as_secs_f64() * 1000.0;
     let index_size_mb = gpu_exhaustive_idx.memory_usage_bytes() as f64 / (1024.0 * 1024.0);
 
@@ -147,7 +148,8 @@ fn main() {
             cli.seed as usize,
             false,
             device.clone(),
-        );
+        )
+        .unwrap();
         let build_time = start.elapsed().as_secs_f64() * 1000.0;
 
         let (index_size_ram, _) = ivf_gpu_idx.memory_usage_bytes();

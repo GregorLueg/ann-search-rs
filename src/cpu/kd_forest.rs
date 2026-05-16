@@ -642,6 +642,7 @@ where
                 let lower_bound = match self.metric {
                     Dist::SquaredEuclidean => abs_margin * abs_margin,
                     Dist::Cosine => abs_margin * abs_margin * 0.5,
+                    Dist::Manhattan => abs_margin,
                 };
                 if lower_bound > kth_dist.to_f64().unwrap() {
                     break;
@@ -675,6 +676,7 @@ where
                             Dist::Cosine => {
                                 self.cosine_distance_to_query(item, query_vec, query_norm)
                             }
+                            Dist::Manhattan => self.manhattan_distance_to_query(item, query_vec),
                         };
 
                         if dist < kth_dist || top_k.len() < k {
@@ -782,7 +784,7 @@ where
         search_k: Option<usize>,
         return_dist: bool,
         verbose: bool,
-    ) -> AnnSearchOptionResult<T> {
+    ) -> KnnOptionResult<T> {
         let counter = Arc::new(AtomicUsize::new(0));
 
         let unordered_results: Vec<(usize, Vec<usize>, Vec<T>)> = (0..self.n)
