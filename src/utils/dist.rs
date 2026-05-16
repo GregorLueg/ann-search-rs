@@ -5395,7 +5395,7 @@ mod tests {
 
     #[test]
     fn test_parse_ann_dist_invalid() {
-        assert_eq!(parse_ann_dist("manhattan"), None);
+        assert_eq!(parse_ann_dist("manhatten"), None);
         assert_eq!(parse_ann_dist(""), None);
         assert_eq!(parse_ann_dist("cosine "), None); // Trailing space
         assert_eq!(parse_ann_dist(" euclidean"), None); // Leading space

@@ -5,7 +5,7 @@ TEMPLATE_DIR="docs/templates"
 OUTPUT_DIR="docs"
 
 usage() {
-    echo "Usage: $0 --kind <standard|gpu|binary|quantised> [--dry-run]"
+    echo "Usage: $0 --kind <standard|gpu|binary|quantised|all> [--dry-run]"
     exit 1
 }
 
@@ -77,6 +77,18 @@ run_and_replace() {
 }
 
 case "$KIND" in
+    all)
+        for k in standard gpu binary quantised; do
+            echo "===== Running kind: $k =====" >&2
+            if $DRY_RUN; then
+                "$0" --kind "$k" --dry-run
+            else
+                "$0" --kind "$k"
+            fi
+        done
+        echo "Generated all benchmark docs"
+        exit 0
+        ;;
     standard)
         BENCHMARKS=(
             # annoy
