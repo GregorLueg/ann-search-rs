@@ -1622,7 +1622,7 @@ macro_rules! impl_nndescent_query {
                         }
                         visited.insert(nbr_idx);
 
-                        let dist = self.euclidean_distance_to_query(nbr_idx, query_vec);
+                        let dist = self.manhattan_distance_to_query(nbr_idx, query_vec);
 
                         if dist < lower_bound || results.len() < ef {
                             candidates.push(Reverse((OrderedFloat(dist), nbr_idx)));

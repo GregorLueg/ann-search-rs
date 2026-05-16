@@ -96,6 +96,7 @@ case "$KIND" in
             # hnsw
             "hnsw:euclidean:gaussian:32|cargo run --example gridsearch_hnsw --release -- --distance euclidean"
             "hnsw:cosine:gaussian:32|cargo run --example gridsearch_hnsw --release -- --distance cosine"
+            "hnsw:cosine:manhattan:32|cargo run --example gridsearch_hnsw --release -- --distance manhattan"
             "hnsw:euclidean:correlated:32|cargo run --example gridsearch_hnsw --release -- --distance euclidean --data correlated"
             "hnsw:euclidean:lowrank:32|cargo run --example gridsearch_hnsw --release -- --distance euclidean --data lowrank"
             "hnsw:euclidean:lowrank:128|cargo run --example gridsearch_hnsw --release -- --distance euclidean --data lowrank --dim 128"
@@ -110,6 +111,7 @@ case "$KIND" in
             # kd_forest
             "kd_forest:euclidean:gaussian:32|cargo run --example gridsearch_kd_forest --release -- --distance euclidean"
             "kd_forest:cosine:gaussian:32|cargo run --example gridsearch_kd_forest --release -- --distance cosine"
+            "kd_forest:cosine:manhattan:32|cargo run --example gridsearch_kd_forest --release -- --distance manhattan"
             "kd_forest:euclidean:correlated:32|cargo run --example gridsearch_kd_forest --release -- --distance euclidean --data correlated"
             "kd_forest:euclidean:lowrank:32|cargo run --example gridsearch_kd_forest --release -- --distance euclidean --data lowrank"
             "kd_forest:euclidean:lowrank:128|cargo run --example gridsearch_kd_forest --release -- --distance euclidean --data lowrank --dim 128"
@@ -131,6 +133,7 @@ case "$KIND" in
             # nndescent
             "nndescent:euclidean:gaussian:32|cargo run --example gridsearch_nndescent --release -- --distance euclidean"
             "nndescent:cosine:gaussian:32|cargo run --example gridsearch_nndescent --release -- --distance cosine"
+            "nndescent:cosine:manhattan:32|cargo run --example gridsearch_nndescent --release -- --distance manhattan"
             "nndescent:euclidean:correlated:32|cargo run --example gridsearch_nndescent --release -- --distance euclidean --data correlated"
             "nndescent:euclidean:lowrank:32|cargo run --example gridsearch_nndescent --release -- --distance euclidean --data lowrank"
             "nndescent:euclidean:lowrank:128|cargo run --example gridsearch_nndescent --release -- --distance euclidean --data lowrank --dim 128"
@@ -138,6 +141,7 @@ case "$KIND" in
              # vamana
              "vamana:euclidean:gaussian:32|cargo run --example gridsearch_vamana --release -- --distance euclidean"
              "vamana:cosine:gaussian:32|cargo run --example gridsearch_vamana --release -- --distance cosine"
+             "vamana:cosine:manhattan:32|cargo run --example gridsearch_vamana --release -- --distance manhattan"
              "vamana:euclidean:correlated:32|cargo run --example gridsearch_vamana --release -- --distance euclidean --data correlated"
              "vamana:euclidean:lowrank:32|cargo run --example gridsearch_vamana --release -- --distance euclidean --data lowrank"
              "vamana:euclidean:lowrank:128|cargo run --example gridsearch_vamana --release -- --distance euclidean --data lowrank --dim 128"

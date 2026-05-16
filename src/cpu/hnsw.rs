@@ -832,7 +832,7 @@ where
                     let dist = OrderedFloat(match self.metric {
                         Dist::SquaredEuclidean => self.euclidean_distance(node, neighbour),
                         Dist::Cosine => self.cosine_distance(node, neighbour),
-                        Dist::Manhattan => self.manhattan_distance(node, current_node),
+                        Dist::Manhattan => self.manhattan_distance(node, neighbour),
                     });
 
                     if dist < current_dist {
@@ -986,7 +986,7 @@ where
         let entry_dist = OrderedFloat(match self.metric {
             Dist::SquaredEuclidean => self.euclidean_distance(query_node, entry_node),
             Dist::Cosine => self.cosine_distance(query_node, entry_node),
-            Dist::Manhattan => self.cosine_distance(query_node, entry_node),
+            Dist::Manhattan => self.manhattan_distance(query_node, entry_node),
         });
 
         state.mark_visited(entry_node);

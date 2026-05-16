@@ -63,7 +63,7 @@ pub fn parse_ann_dist(s: &str) -> Option<Dist> {
     match s.to_lowercase().as_str() {
         "euclidean" | "l2" => Some(Dist::SquaredEuclidean),
         "cosine" => Some(Dist::Cosine),
-        "manhatten" | "l1" => Some(Dist::Manhattan),
+        "manhattan" | "l1" => Some(Dist::Manhattan),
         _ => None,
     }
 }

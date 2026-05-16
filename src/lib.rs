@@ -213,9 +213,11 @@ pub fn build_exhaustive_index<T>(mat: MatRef<T>, dist_metric: &str) -> Exhaustiv
 where
     T: AnnSearchFloat,
 {
-    let metric = parse_ann_dist(dist_metric).unwrap_or({
-        eprintln!("[WARNING] Weird string used for distance metric. Using default squared Euclidean distance"); Dist::default()
+    let metric = parse_ann_dist(dist_metric).unwrap_or_else(|| {
+        println!("[WARNING] Weird string used for distance metric. Using default squared Euclidean distance");
+        Dist::default()
     });
+
     ExhaustiveIndex::new(mat, metric)
 }
 
@@ -305,8 +307,9 @@ pub fn build_kmknn_index<T>(
 where
     T: AnnSearchFloat,
 {
-    let metric = parse_ann_dist(dist_metric).unwrap_or({
-        eprintln!("[WARNING] Weird string used for distance metric. Using default squared Euclidean distance"); Dist::default()
+    let metric = parse_ann_dist(dist_metric).unwrap_or_else(|| {
+        println!("[WARNING] Weird string used for distance metric. Using default squared Euclidean distance");
+        Dist::default()
     });
     KmknnIndex::build(mat, metric, nlist, k_means_params, seed, verbose)
 }
@@ -392,8 +395,9 @@ pub fn build_annoy_index<T>(
 where
     T: AnnSearchFloat,
 {
-    let metric = parse_ann_dist(dist_metric).unwrap_or({
-        eprintln!("[WARNING] Weird string used for distance metric. Using default squared Euclidean distance"); Dist::default()
+    let metric = parse_ann_dist(dist_metric).unwrap_or_else(|| {
+        println!("[WARNING] Weird string used for distance metric. Using default squared Euclidean distance");
+        Dist::default()
     });
 
     AnnoyIndex::new(mat, n_trees, metric, seed)
@@ -484,8 +488,9 @@ pub fn build_balltree_index<T>(
 where
     T: AnnSearchFloat,
 {
-    let metric = parse_ann_dist(dist_metric).unwrap_or({
-        eprintln!("[WARNING] Weird string used for distance metric. Using default squared Euclidean distance"); Dist::default()
+    let metric = parse_ann_dist(dist_metric).unwrap_or_else(|| {
+        println!("[WARNING] Weird string used for distance metric. Using default squared Euclidean distance");
+        Dist::default()
     });
     BallTreeIndex::new(mat, metric, seed)
 }
@@ -580,8 +585,9 @@ where
     T: AnnSearchFloat,
     HnswIndex<T>: HnswState<T>,
 {
-    let metric = parse_ann_dist(dist_metric).unwrap_or({
-        eprintln!("[WARNING] Weird string used for distance metric. Using default squared Euclidean distance"); Dist::default()
+    let metric = parse_ann_dist(dist_metric).unwrap_or_else(|| {
+        println!("[WARNING] Weird string used for distance metric. Using default squared Euclidean distance");
+        Dist::default()
     });
 
     HnswIndex::build(mat, m, ef_construction, &metric, seed, verbose)
@@ -690,8 +696,9 @@ pub fn build_ivf_index<T>(
 where
     T: AnnSearchFloat,
 {
-    let metric = parse_ann_dist(dist_metric).unwrap_or({
-        eprintln!("[WARNING] Weird string used for distance metric. Using default squared Euclidean distance"); Dist::default()
+    let metric = parse_ann_dist(dist_metric).unwrap_or_else(|| {
+        println!("[WARNING] Weird string used for distance metric. Using default squared Euclidean distance");
+        Dist::default()
     });
 
     IvfIndex::build(mat, metric, nlist, k_means_params, seed, verbose)
@@ -800,8 +807,9 @@ pub fn build_kd_tree_index<T>(
 where
     T: AnnSearchFloat,
 {
-    let metric = parse_ann_dist(dist_metric).unwrap_or({
-        eprintln!("[WARNING] Weird string used for distance metric. Using default squared Euclidean distance"); Dist::default()
+    let metric = parse_ann_dist(dist_metric).unwrap_or_else(|| {
+        println!("[WARNING] Weird string used for distance metric. Using default squared Euclidean distance");
+        Dist::default()
     });
 
     KdTreeIndex::new(mat, n_trees, metric, seed)
@@ -897,9 +905,11 @@ pub fn build_lsh_index<T>(
 where
     T: AnnSearchFloat,
 {
-    let metric = parse_ann_dist(dist_metric).unwrap_or({
-        eprintln!("[WARNING] Weird string used for distance metric. Using default squared Euclidean distance"); Dist::default()
+    let metric = parse_ann_dist(dist_metric).unwrap_or_else(|| {
+        println!("[WARNING] Weird string used for distance metric. Using default squared Euclidean distance");
+        Dist::default()
     });
+
     LSHIndex::new(mat, metric, num_tables, bits_per_hash, seed)
 }
 
@@ -1013,9 +1023,11 @@ where
     NNDescent<T>: ApplySortedUpdates<T>,
     NNDescent<T>: NNDescentQuery<T>,
 {
-    let metric = parse_ann_dist(dist_metric).unwrap_or({
-        eprintln!("[WARNING] Weird string used for distance metric. Using default squared Euclidean distance"); Dist::default()
+    let metric = parse_ann_dist(dist_metric).unwrap_or_else(|| {
+        println!("[WARNING] Weird string used for distance metric. Using default squared Euclidean distance");
+        Dist::default()
     });
+
     NNDescent::new(
         mat,
         metric,
@@ -1136,9 +1148,11 @@ where
     T: AnnSearchFloat,
     VamanaIndex<T>: VamanaState<T>,
 {
-    let metric = parse_ann_dist(dist_metric).unwrap_or({
-        eprintln!("[WARNING] Weird string used for distance metric. Using default squared Euclidean distance"); Dist::default()
+    let metric = parse_ann_dist(dist_metric).unwrap_or_else(|| {
+        println!("[WARNING] Weird string used for distance metric. Using default squared Euclidean distance");
+        Dist::default()
     });
+
     VamanaIndex::build(mat, metric, r, l_build, alpha_pass1, alpha_pass2, seed)
 }
 
@@ -1231,9 +1245,11 @@ pub fn build_exhaustive_bf16_index<T>(
 where
     T: AnnSearchFloat + Bf16Compatible,
 {
-    let metric = parse_ann_dist(dist_metric).unwrap_or({
-        eprintln!("[WARNING] Weird string used for distance metric. Using default squared Euclidean distance"); Dist::default()
+    let metric = parse_ann_dist(dist_metric).unwrap_or_else(|| {
+        println!("[WARNING] Weird string used for distance metric. Using default squared Euclidean distance");
+        Dist::default()
     });
+
     if verbose {
         println!(
             "Building exhaustive BF16 index with {} samples",
@@ -1325,9 +1341,11 @@ pub fn build_exhaustive_sq8_index<T>(
 where
     T: AnnSearchFloat,
 {
-    let metric = parse_ann_dist(dist_metric).unwrap_or({
-        eprintln!("[WARNING] Weird string used for distance metric. Using default squared Euclidean distance"); Dist::default()
+    let metric = parse_ann_dist(dist_metric).unwrap_or_else(|| {
+        println!("[WARNING] Weird string used for distance metric. Using default squared Euclidean distance");
+        Dist::default()
     });
+
     if verbose {
         println!("Building exhaustive SQ8 index with {} samples", mat.nrows());
     }
@@ -1426,9 +1444,11 @@ pub fn build_exhaustive_pq_index<T>(
 where
     T: AnnSearchFloat,
 {
-    let metric = parse_ann_dist(dist_metric).unwrap_or({
-        eprintln!("[WARNING] Weird string used for distance metric. Using default squared Euclidean distance"); Dist::default()
+    let metric = parse_ann_dist(dist_metric).unwrap_or_else(|| {
+        println!("[WARNING] Weird string used for distance metric. Using default squared Euclidean distance");
+        Dist::default()
     });
+
     ExhaustivePqIndex::build(mat, m, metric, max_iters, n_pq_centroids, seed, verbose)
 }
 
@@ -1526,8 +1546,9 @@ pub fn build_exhaustive_opq_index<T>(
 where
     T: AnnSearchFloat + AddAssign,
 {
-    let metric = parse_ann_dist(dist_metric).unwrap_or({
-        eprintln!("[WARNING] Weird string used for distance metric. Using default squared Euclidean distance"); Dist::default()
+    let metric = parse_ann_dist(dist_metric).unwrap_or_else(|| {
+        println!("[WARNING] Weird string used for distance metric. Using default squared Euclidean distance");
+        Dist::default()
     });
     ExhaustiveOpqIndex::build(mat, m, metric, max_iters, n_pq_centroids, seed, verbose)
 }
@@ -1625,8 +1646,9 @@ pub fn build_ivf_bf16_index<T>(
 where
     T: AnnSearchFloat + Bf16Compatible,
 {
-    let metric = parse_ann_dist(dist_metric).unwrap_or({
-        eprintln!("[WARNING] Weird string used for distance metric. Using default squared Euclidean distance"); Dist::default()
+    let metric = parse_ann_dist(dist_metric).unwrap_or_else(|| {
+        println!("[WARNING] Weird string used for distance metric. Using default squared Euclidean distance");
+        Dist::default()
     });
 
     IvfIndexBf16::build(mat, metric, nlist, k_means_params, seed, verbose)
@@ -1732,8 +1754,9 @@ pub fn build_ivf_sq8_index<T>(
 where
     T: AnnSearchFloat,
 {
-    let metric = parse_ann_dist(dist_metric).unwrap_or({
-        eprintln!("[WARNING] Weird string used for distance metric. Using default squared Euclidean distance"); Dist::default()
+    let metric = parse_ann_dist(dist_metric).unwrap_or_else(|| {
+        println!("[WARNING] Weird string used for distance metric. Using default squared Euclidean distance");
+        Dist::default()
     });
 
     IvfSq8Index::build(mat, nlist, metric, k_means_params, seed, verbose)
@@ -1843,8 +1866,9 @@ pub fn build_ivf_pq_index<T>(
 where
     T: AnnSearchFloat,
 {
-    let metric = parse_ann_dist(dist_metric).unwrap_or({
-        eprintln!("[WARNING] Weird string used for distance metric. Using default squared Euclidean distance"); Dist::default()
+    let metric = parse_ann_dist(dist_metric).unwrap_or_else(|| {
+        println!("[WARNING] Weird string used for distance metric. Using default squared Euclidean distance");
+        Dist::default()
     });
 
     IvfPqIndex::build(
@@ -1963,8 +1987,9 @@ pub fn build_ivf_opq_index<T>(
 where
     T: AnnSearchFloat + AddAssign,
 {
-    let metric = parse_ann_dist(dist_metric).unwrap_or({
-        eprintln!("[WARNING] Weird string used for distance metric. Using default squared Euclidean distance"); Dist::default()
+    let metric = parse_ann_dist(dist_metric).unwrap_or_else(|| {
+        println!("[WARNING] Weird string used for distance metric. Using default squared Euclidean distance");
+        Dist::default()
     });
 
     IvfOpqIndex::build(
@@ -2074,8 +2099,9 @@ where
     T: AnnSearchGpuFloat + AnnSearchFloat,
     R: Runtime,
 {
-    let metric = parse_ann_dist(dist_metric).unwrap_or({
-        eprintln!("[WARNING] Weird string used for distance metric. Using default squared Euclidean distance"); Dist::default()
+    let metric = parse_ann_dist(dist_metric).unwrap_or_else(|| {
+        println!("[WARNING] Weird string used for distance metric. Using default squared Euclidean distance");
+        Dist::default()
     });
     ExhaustiveIndexGpu::new(mat, metric, device)
 }
@@ -2173,8 +2199,9 @@ where
     R: Runtime,
     T: AnnSearchFloat + AnnSearchGpuFloat,
 {
-    let metric = parse_ann_dist(dist_metric).unwrap_or({
-        eprintln!("[WARNING] Weird string used for distance metric. Using default squared Euclidean distance"); Dist::default()
+    let metric = parse_ann_dist(dist_metric).unwrap_or_else(|| {
+        println!("[WARNING] Weird string used for distance metric. Using default squared Euclidean distance");
+        Dist::default()
     });
     IvfIndexGpu::build(mat, metric, nlist, k_means_params, seed, verbose, device)
 }
@@ -2293,9 +2320,11 @@ where
     T: AnnSearchFloat + AnnSearchGpuFloat,
     NNDescentGpu<T, R>: NNDescentQuery<T>,
 {
-    let metric = parse_ann_dist(dist_metric).unwrap_or({
-        eprintln!("[WARNING] Weird string used for distance metric. Using default squared Euclidean distance"); Dist::default()
+    let metric = parse_ann_dist(dist_metric).unwrap_or_else(|| {
+        println!("[WARNING] Weird string used for distance metric. Using default squared Euclidean distance");
+        Dist::default()
     });
+
     NNDescentGpu::build(
         mat, metric, k, build_k, max_iters, n_trees, delta, rho, refine_knn, seed, verbose,
         retain_gpu, device,
@@ -2491,8 +2520,9 @@ pub fn build_exhaustive_index_binary<T>(
 where
     T: AnnSearchFloat + Pod,
 {
-    let metric = parse_ann_dist(dist_metric).unwrap_or({
-        eprintln!("[WARNING] Weird string used for distance metric. Using default squared Euclidean distance"); Dist::default()
+    let metric = parse_ann_dist(dist_metric).unwrap_or_else(|| {
+        println!("[WARNING] Weird string used for distance metric. Using default squared Euclidean distance");
+        Dist::default()
     });
 
     if save_store {
@@ -2637,8 +2667,9 @@ pub fn build_ivf_index_binary<T>(
 where
     T: AnnSearchFloat + Pod,
 {
-    let metric = parse_ann_dist(dist_metric).unwrap_or({
-        eprintln!("[WARNING] Weird string used for distance metric. Using default squared Euclidean distance"); Dist::default()
+    let metric = parse_ann_dist(dist_metric).unwrap_or_else(|| {
+        println!("[WARNING] Weird string used for distance metric. Using default squared Euclidean distance");
+        Dist::default()
     });
 
     if save_store {
@@ -2789,9 +2820,11 @@ pub fn build_exhaustive_index_rabitq<T>(
 where
     T: AnnSearchFloat + Pod,
 {
-    let metric = parse_ann_dist(dist_metric).unwrap_or({
-        eprintln!("[WARNING] Weird string used for distance metric. Using default squared Euclidean distance"); Dist::default()
+    let metric = parse_ann_dist(dist_metric).unwrap_or_else(|| {
+        println!("[WARNING] Weird string used for distance metric. Using default squared Euclidean distance");
+        Dist::default()
     });
+
     if save_store {
         let path = save_path.expect("save_path required when save_store is true");
         ExhaustiveIndexRaBitQ::new_with_vector_store(mat, &metric, n_clust_rabitq, seed, path)
@@ -2913,8 +2946,9 @@ pub fn build_ivf_index_rabitq<T>(
 where
     T: AnnSearchFloat + Pod,
 {
-    let metric = parse_ann_dist(dist_metric).unwrap_or({
-        eprintln!("[WARNING] Weird string used for distance metric. Using default squared Euclidean distance"); Dist::default()
+    let metric = parse_ann_dist(dist_metric).unwrap_or_else(|| {
+        println!("[WARNING] Weird string used for distance metric. Using default squared Euclidean distance");
+        Dist::default()
     });
 
     if save_store {

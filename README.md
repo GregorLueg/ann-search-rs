@@ -51,7 +51,8 @@ anticipated. If you want to see what changed, please check this
 - **Distance metrics**:
   - Euclidean
   - Cosine
-  - More to come maybe... ?
+  - Manhattan (support for a subset of the approximate nearest neighbour
+    searches).
 
 - **High performance**: Optimised implementations with SIMD, heavy
   multi-threading were possible and optimised structures for memory access.
@@ -80,6 +81,11 @@ Add this to your `Cargo.toml`:
 [dependencies]
 ann-search-rs = "0.3.0"
 ```
+
+### Note
+
+With version `"0.3.0"` some breaking API changes were introduced: this harmonise
+several of the functions and avoid panics in favour of errors.
 
 ## Example Usage
 
