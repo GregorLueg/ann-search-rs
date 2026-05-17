@@ -22,6 +22,19 @@ done
 
 [ -z "$KIND" ] && usage
 
+if [ "$KIND" = "all" ]; then
+    for k in standard gpu binary quantised; do
+        echo "===== Running kind: $k =====" >&2
+        if $DRY_RUN; then
+            "$0" --kind "$k" --dry-run
+        else
+            "$0" --kind "$k"
+        fi
+    done
+    echo "Generated all benchmark docs"
+    exit 0
+fi
+
 TEMPLATE="${TEMPLATE_DIR}/benchmarks_${KIND}.md.tmpl"
 OUTPUT="${OUTPUT_DIR}/benchmarks_${KIND}.md"
 
@@ -77,18 +90,6 @@ run_and_replace() {
 }
 
 case "$KIND" in
-    all)
-        for k in standard gpu binary quantised; do
-            echo "===== Running kind: $k =====" >&2
-            if $DRY_RUN; then
-                "$0" --kind "$k" --dry-run
-            else
-                "$0" --kind "$k"
-            fi
-        done
-        echo "Generated all benchmark docs"
-        exit 0
-        ;;
     standard)
         BENCHMARKS=(
             # annoy

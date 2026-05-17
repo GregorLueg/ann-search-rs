@@ -178,10 +178,6 @@ where
             &metric,
         );
 
-        if verbose {
-            print_cluster_summary(&assignments, nlist);
-        }
-
         let (vectors_by_cluster, original_indices, cluster_offsets, norms_by_cluster) =
             reorganise_by_cluster(&vectors_flat, dim, n, &assignments, nlist, &metric);
 

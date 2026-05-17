@@ -282,7 +282,7 @@ If you wish to use these, please add the `"quantised"` feature:
 
 ```toml
 [dependencies]
-ann-search-rs = { version = "*", features = ["quantised"] }
+ann-search-rs = { version = "0.3.0", features = ["quantised"] }
 ```
 
 ## GPU
@@ -299,7 +299,7 @@ To unlock GPU-acceleration, please use:
 
 ```toml
 [dependencies]
-ann-search-rs = { version = "*", features = ["gpu"] }
+ann-search-rs = { version = "0.3.0", features = ["gpu"] }
 ```
 
 ## Binarised indices
@@ -318,7 +318,7 @@ can drastically improve the Recall. To enable the feature, please use:
 
 ```toml
 [dependencies]
-ann-search-rs = { version = "*", features = ["binary"] }
+ann-search-rs = { version = "0.3.0", features = ["binary"] }
 ```
 
 The benchmarks can be found [here](https://github.com/GregorLueg/ann-search-rs/blob/main/docs/benchmarks_binary.md).

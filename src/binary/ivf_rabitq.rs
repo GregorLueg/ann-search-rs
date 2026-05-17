@@ -213,10 +213,6 @@ where
             &metric,
         );
 
-        if verbose {
-            print_cluster_summary(&assignments, nlist);
-        }
-
         // create encoder with shared rotation
         let encoder = RaBitQEncoder::new(dim, metric, seed as u64);
 
@@ -367,10 +363,6 @@ where
             nlist,
             &metric,
         );
-
-        if verbose {
-            print_cluster_summary(&assignments, nlist);
-        }
 
         let encoder = RaBitQEncoder::new(dim, metric, seed as u64);
 

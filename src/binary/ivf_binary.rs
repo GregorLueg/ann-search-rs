@@ -207,10 +207,6 @@ where
             &metric,
         );
 
-        if verbose {
-            print_cluster_summary(&assignments, nlist);
-        }
-
         // 4. build CSR layout
         let (all_indices, offsets) = build_csr_layout(assignments, n, nlist);
 
@@ -378,10 +374,6 @@ where
             nlist,
             &metric,
         );
-
-        if verbose {
-            print_cluster_summary(&assignments, nlist);
-        }
 
         // 4. build CSR layout
         let (all_indices, offsets) = build_csr_layout(assignments, n, nlist);

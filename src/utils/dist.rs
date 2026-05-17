@@ -1245,6 +1245,16 @@ fn canberra_f32_avx512(a: &[f32], b: &[f32]) -> f32 {
 // f64 Canberra //
 //////////////////
 
+/// Canberra distance - f64, scalar
+///
+/// ### Params
+///
+/// * `a` - Slice of vector a
+/// * `b` - Slice of vector b
+///
+/// ### Returns
+///
+/// Canberra distance
 #[inline(always)]
 fn canberra_f64_scalar(a: &[f64], b: &[f64]) -> f64 {
     let mut sum = 0.0_f64;
@@ -1257,6 +1267,16 @@ fn canberra_f64_scalar(a: &[f64], b: &[f64]) -> f64 {
     sum
 }
 
+/// Canberra distance - f64, 128-bit
+///
+/// ### Params
+///
+/// * `a` - Slice of vector a
+/// * `b` - Slice of vector b
+///
+/// ### Returns
+///
+/// Canberra distance
 #[inline(always)]
 fn canberra_f64_sse(a: &[f64], b: &[f64]) -> f64 {
     let len = a.len();
@@ -1290,6 +1310,16 @@ fn canberra_f64_sse(a: &[f64], b: &[f64]) -> f64 {
     sum
 }
 
+/// Canberra distance - f64, 256-bit
+///
+/// ### Params
+///
+/// * `a` - Slice of vector a
+/// * `b` - Slice of vector b
+///
+/// ### Returns
+///
+/// Canberra distance
 #[inline(always)]
 fn canberra_f64_avx2(a: &[f64], b: &[f64]) -> f64 {
     let len = a.len();
@@ -1323,6 +1353,16 @@ fn canberra_f64_avx2(a: &[f64], b: &[f64]) -> f64 {
     sum
 }
 
+/// Canberra distance - f64, 512-bit
+///
+/// ### Params
+///
+/// * `a` - Slice of vector a
+/// * `b` - Slice of vector b
+///
+/// ### Returns
+///
+/// Canberra distance
 #[cfg(all(target_arch = "x86_64", target_feature = "avx512f"))]
 #[inline(always)]
 fn canberra_f64_avx512(a: &[f64], b: &[f64]) -> f64 {
@@ -1357,6 +1397,16 @@ fn canberra_f64_avx512(a: &[f64], b: &[f64]) -> f64 {
     }
 }
 
+/// Canberra distance - f64, 512-bit (fallback)
+///
+/// ### Params
+///
+/// * `a` - Slice of vector a
+/// * `b` - Slice of vector b
+///
+/// ### Returns
+///
+/// Canberra distance
 #[cfg(not(all(target_arch = "x86_64", target_feature = "avx512f")))]
 #[inline(always)]
 fn canberra_f64_avx512(a: &[f64], b: &[f64]) -> f64 {
