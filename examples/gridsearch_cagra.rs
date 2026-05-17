@@ -37,7 +37,8 @@ fn main() {
     println!("Querying CPU exhaustive (ground truth)...");
     let start = Instant::now();
     let (true_neighbors, true_distances) =
-        query_exhaustive_index(query_data.as_ref(), &cpu_exhaustive_idx, cli.k, true, false);
+        query_exhaustive_index(query_data.as_ref(), &cpu_exhaustive_idx, cli.k, true, false)
+            .unwrap();
     let cpu_ex_query = start.elapsed().as_secs_f64() * 1000.0;
 
     results.push(BenchmarkResultSize {
@@ -53,7 +54,7 @@ fn main() {
     println!("Self-querying CPU exhaustive (ground truth)...");
     let start = Instant::now();
     let (true_neighbors_self, true_distances_self) =
-        query_exhaustive_self(&cpu_exhaustive_idx, cli.k, true, false);
+        query_exhaustive_self(&cpu_exhaustive_idx, cli.k, true, false).unwrap();
     let cpu_ex_self = start.elapsed().as_secs_f64() * 1000.0;
 
     results.push(BenchmarkResultSize {
@@ -75,14 +76,16 @@ fn main() {
         data.as_ref(),
         &cli.distance,
         device.clone(),
-    );
+    )
+    .unwrap();
     let gpu_ex_build = start.elapsed().as_secs_f64() * 1000.0;
     let gpu_ex_size = gpu_exhaustive_idx.memory_usage_bytes() as f64 / (1024.0 * 1024.0);
 
     println!("Querying GPU exhaustive...");
     let start = Instant::now();
     let (gpu_ex_neighbors, gpu_ex_distances) =
-        query_exhaustive_index_gpu(query_data.as_ref(), &gpu_exhaustive_idx, cli.k, true, false);
+        query_exhaustive_index_gpu(query_data.as_ref(), &gpu_exhaustive_idx, cli.k, true, false)
+            .unwrap();
     let gpu_ex_query = start.elapsed().as_secs_f64() * 1000.0;
 
     let recall = calculate_recall(&true_neighbors, &gpu_ex_neighbors, cli.k);
@@ -105,7 +108,7 @@ fn main() {
     println!("Self-querying GPU exhaustive...");
     let start = Instant::now();
     let (gpu_ex_self_neighbors, gpu_ex_self_distances) =
-        query_exhaustive_index_gpu_self(&gpu_exhaustive_idx, cli.k, true, false);
+        query_exhaustive_index_gpu_self(&gpu_exhaustive_idx, cli.k, true, false).unwrap();
     let gpu_ex_self = start.elapsed().as_secs_f64() * 1000.0;
 
     let recall_self = calculate_recall(&true_neighbors_self, &gpu_ex_self_neighbors, cli.k);
@@ -144,7 +147,8 @@ fn main() {
         false,
         true,
         device.clone(),
-    );
+    )
+    .unwrap();
     let cagra_build = start.elapsed().as_secs_f64() * 1000.0;
     let cagra_size = gpu_nndescent_idx.memory_usage_bytes() as f64 / (1024.0 * 1024.0);
 
@@ -159,7 +163,8 @@ fn main() {
         None,
         true,
         false,
-    );
+    )
+    .unwrap();
     let cagra_query = start.elapsed().as_secs_f64() * 1000.0;
 
     let recall = calculate_recall(&true_neighbors, &cagra_neighbors, cli.k);
@@ -222,7 +227,8 @@ fn main() {
             Some(params),
             true,
             false,
-        );
+        )
+        .unwrap();
         let cagra_query = start.elapsed().as_secs_f64() * 1000.0;
 
         let recall = calculate_recall(&true_neighbors, &cagra_neighbors, cli.k);

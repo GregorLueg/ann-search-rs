@@ -95,7 +95,9 @@ where
     /// * `data` - Data matrix (n × dim)
     /// * `metric` - Distance metric
     /// * `nlist` - Number of IVF cells (defaults to sqrt(n))
-    /// * `max_iters` - K-means iterations (defaults to 30)
+    /// * `k_means_params` - Optional k-means trainings parameters, see
+    ///   [KMeansTrainingParams]. If not provided, will default to sensible
+    ///   defaults.
     /// * `seed` - Random seed
     /// * `verbose` - Print progress
     ///
@@ -107,10 +109,13 @@ where
         data: MatRef<T>,
         metric: Dist,
         nlist: Option<usize>,
-        max_iters: Option<usize>,
+        k_means_params: Option<KMeansTrainingParams>,
         seed: usize,
         verbose: bool,
-    ) -> Self {
+    ) -> Result<Self, AnnSearchErrors> {
+        if metric == Dist::Manhattan {
+            return Err(AnnSearchErrors::DistanceNotSupported(metric));
+        }
         let (vectors_flat, n, dim) = matrix_to_flat(data);
 
         // compute norms for Cosine distance
@@ -147,7 +152,6 @@ where
         };
 
         let nlist = nlist.unwrap_or((n as f32).sqrt() as usize).max(1);
-        let max_iters = max_iters.unwrap_or(30);
 
         if verbose {
             println!("  Building IVF-RaBitQ index with {} cells.", nlist);
@@ -170,10 +174,10 @@ where
             n_train,
             nlist,
             &metric,
-            max_iters,
+            k_means_params,
             seed,
             verbose,
-        );
+        )?;
 
         // normalise centroids for Cosine
         if metric == Dist::Cosine {
@@ -209,10 +213,6 @@ where
             &metric,
         );
 
-        if verbose {
-            print_cluster_summary(&assignments, nlist);
-        }
-
         // create encoder with shared rotation
         let encoder = RaBitQEncoder::new(dim, metric, seed as u64);
 
@@ -225,14 +225,14 @@ where
             nlist,
             &assignments,
             &encoder,
-        );
+        )?;
 
-        Self {
+        Ok(Self {
             encoder,
             storage,
             n,
             vector_store: None,
-        }
+        })
     }
 
     /// Build IVF-RaBitQ index with vector store
@@ -244,7 +244,9 @@ where
     /// * `data` - Data matrix (n × dim)
     /// * `metric` - Distance metric
     /// * `nlist` - Number of IVF cells (defaults to sqrt(n))
-    /// * `max_iters` - K-means iterations (defaults to 30)
+    /// * `k_means_params` - Optional k-means trainings parameters, see
+    ///   [KMeansTrainingParams]. If not provided, will default to sensible
+    ///   defaults.
     /// * `seed` - Random seed
     /// * `verbose` - Print progress
     /// * `save_path` - Path to save vector store
@@ -257,11 +259,14 @@ where
         data: MatRef<T>,
         metric: Dist,
         nlist: Option<usize>,
-        max_iters: Option<usize>,
+        k_means_params: Option<KMeansTrainingParams>,
         seed: usize,
         verbose: bool,
         save_path: impl AsRef<Path>,
-    ) -> std::io::Result<Self> {
+    ) -> Result<Self, AnnSearchErrors> {
+        if metric == Dist::Manhattan {
+            return Err(AnnSearchErrors::DistanceNotSupported(metric));
+        }
         let (vectors_flat, n, dim) = matrix_to_flat(data);
 
         // compute norms for Cosine distance
@@ -294,7 +299,6 @@ where
         };
 
         let nlist = nlist.unwrap_or((n as f32).sqrt() as usize).max(1);
-        let max_iters = max_iters.unwrap_or(30);
 
         if verbose {
             println!("  Building IVF-RaBitQ index with {} cells.", nlist);
@@ -322,10 +326,10 @@ where
             n_train,
             nlist,
             &metric,
-            max_iters,
+            k_means_params,
             seed,
             verbose,
-        );
+        )?;
 
         // Normalise centroids for Cosine
         if metric == Dist::Cosine {
@@ -360,10 +364,6 @@ where
             &metric,
         );
 
-        if verbose {
-            print_cluster_summary(&assignments, nlist);
-        }
-
         let encoder = RaBitQEncoder::new(dim, metric, seed as u64);
 
         let storage = build_rabitq_storage(
@@ -374,7 +374,7 @@ where
             nlist,
             &assignments,
             &encoder,
-        );
+        )?;
 
         // Save vector store
         std::fs::create_dir_all(&save_path)?;
@@ -405,7 +405,12 @@ where
     ///
     /// Tuple of (indices, distances)
     #[inline]
-    pub fn query(&self, query_vec: &[T], k: usize, nprobe: Option<usize>) -> (Vec<usize>, Vec<T>) {
+    pub fn query(
+        &self,
+        query_vec: &[T],
+        k: usize,
+        nprobe: Option<usize>,
+    ) -> Result<(Vec<usize>, Vec<T>), AnnSearchErrors> {
         let nprobe = nprobe
             .unwrap_or_else(|| ((self.storage.nlist as f64).sqrt() as usize).max(1))
             .min(self.storage.nlist);
@@ -421,7 +426,8 @@ where
                     (query_vec.to_vec(), T::one())
                 }
             }
-            Dist::Euclidean => (query_vec.to_vec(), T::one()),
+            Dist::SquaredEuclidean => (query_vec.to_vec(), T::one()),
+            Dist::Manhattan => unreachable!(),
         };
 
         // Use trait method - prenorm version since we've already normalised
@@ -431,7 +437,7 @@ where
 
         for &(_, c_idx) in cluster_dists.iter().take(nprobe) {
             let centroid = self.storage.centroid(c_idx);
-            let query_encoded = self.encoder.encode_query(&query_normalised, centroid);
+            let query_encoded = self.encoder.encode_query(&query_normalised, centroid)?;
             let cluster_size = self.storage.cluster_size(c_idx);
 
             for local_idx in 0..cluster_size {
@@ -450,7 +456,7 @@ where
         let mut results: Vec<_> = heap.into_iter().collect();
         results.sort_unstable();
 
-        results.into_iter().map(|(d, i)| (i, d.0)).unzip()
+        Ok(results.into_iter().map(|(d, i)| (i, d.0)).unzip())
     }
 
     /// Query using a row reference
@@ -470,7 +476,7 @@ where
         query_row: RowRef<T>,
         k: usize,
         nprobe: Option<usize>,
-    ) -> (Vec<usize>, Vec<T>) {
+    ) -> Result<(Vec<usize>, Vec<T>), AnnSearchErrors> {
         if query_row.col_stride() == 1 {
             let slice =
                 unsafe { std::slice::from_raw_parts(query_row.as_ptr(), query_row.ncols()) };
@@ -500,18 +506,19 @@ where
         k: usize,
         nprobe: Option<usize>,
         rerank_factor: Option<usize>,
-    ) -> (Vec<usize>, Vec<T>) {
+    ) -> Result<(Vec<usize>, Vec<T>), AnnSearchErrors> {
         let rerank_factor = rerank_factor.unwrap_or(20);
         let vector_store = self
             .vector_store
             .as_ref()
-            .expect("Vector store required for reranking");
+            .ok_or(AnnSearchErrors::VectorStoreNotAvailable)?;
 
-        let (candidates, _) = self.query(query_vec, k * rerank_factor, nprobe);
+        let (candidates, _) = self.query(query_vec, k * rerank_factor, nprobe)?;
 
         let query_norm = match self.encoder.metric {
             Dist::Cosine => compute_l2_norm(query_vec),
-            Dist::Euclidean => T::one(),
+            Dist::SquaredEuclidean => T::one(),
+            Dist::Manhattan => unreachable!(),
         };
 
         let mut scored: Vec<_> = candidates
@@ -521,7 +528,10 @@ where
                     Dist::Cosine => {
                         vector_store.cosine_distance_to_query(idx, query_vec, query_norm)
                     }
-                    Dist::Euclidean => vector_store.euclidean_distance_to_query(idx, query_vec),
+                    Dist::SquaredEuclidean => {
+                        vector_store.euclidean_distance_to_query(idx, query_vec)
+                    }
+                    Dist::Manhattan => unreachable!(),
                 };
                 (dist, idx)
             })
@@ -538,7 +548,7 @@ where
             dists.push(dist);
         }
 
-        (indices, dists)
+        Ok((indices, dists))
     }
 
     /// Query row with reranking using exact distances
@@ -561,7 +571,7 @@ where
         k: usize,
         nprobe: Option<usize>,
         rerank_factor: Option<usize>,
-    ) -> (Vec<usize>, Vec<T>) {
+    ) -> Result<(Vec<usize>, Vec<T>), AnnSearchErrors> {
         if query_row.col_stride() == 1 {
             let slice =
                 unsafe { std::slice::from_raw_parts(query_row.as_ptr(), query_row.ncols()) };
@@ -591,11 +601,11 @@ where
         rerank_factor: Option<usize>,
         return_dist: bool,
         verbose: bool,
-    ) -> (Vec<Vec<usize>>, Option<Vec<Vec<T>>>) {
+    ) -> KnnOptionResult<T> {
         let vector_store = self
             .vector_store
             .as_ref()
-            .expect("generate_knn requires vector_store");
+            .ok_or(AnnSearchErrors::VectorStoreNotAvailable)?;
 
         let counter = Arc::new(AtomicUsize::new(0));
 
@@ -617,14 +627,14 @@ where
 
                 self.query_reranking(vec, k, nprobe, rerank_factor)
             })
-            .collect();
+            .collect::<Result<Vec<_>, _>>()?;
 
         if return_dist {
             let (indices, distances) = results.into_iter().unzip();
-            (indices, Some(distances))
+            Ok((indices, Some(distances)))
         } else {
             let indices = results.into_iter().map(|(idx, _)| idx).collect();
-            (indices, None)
+            Ok((indices, None))
         }
     }
 
@@ -660,17 +670,22 @@ mod tests {
         data
     }
 
+    fn get_default_k_means() -> Option<KMeansTrainingParams> {
+        Some(KMeansTrainingParams::new(10, None, None))
+    }
+
     #[test]
     fn test_ivf_rabitq_construction() {
         let data = create_test_data::<f32>(100, 32);
         let index = IvfIndexRaBitQ::build(
             data.as_ref(),
-            Dist::Euclidean,
+            Dist::SquaredEuclidean,
             Some(10),
-            Some(10),
+            get_default_k_means(),
             42,
             false,
-        );
+        )
+        .unwrap();
 
         assert_eq!(index.n, 100);
         assert_eq!(index.storage.nlist, 10);
@@ -682,15 +697,16 @@ mod tests {
         let data = create_test_data::<f32>(100, 32);
         let index = IvfIndexRaBitQ::build(
             data.as_ref(),
-            Dist::Euclidean,
+            Dist::SquaredEuclidean,
             Some(10),
-            Some(10),
+            get_default_k_means(),
             42,
             false,
-        );
+        )
+        .unwrap();
 
         let query: Vec<f32> = (0..32).map(|i| i as f32 * 0.1).collect();
-        let (indices, distances) = index.query(&query, 10, Some(10));
+        let (indices, distances) = index.query(&query, 10, Some(10)).unwrap();
 
         assert_eq!(indices.len(), 10);
         assert_eq!(distances.len(), 10);
@@ -701,15 +717,16 @@ mod tests {
         let data = create_test_data::<f32>(100, 32);
         let index = IvfIndexRaBitQ::build(
             data.as_ref(),
-            Dist::Euclidean,
+            Dist::SquaredEuclidean,
             Some(10),
-            Some(10),
+            get_default_k_means(),
             42,
             false,
-        );
+        )
+        .unwrap();
 
         let query: Vec<f32> = (0..32).map(|i| i as f32 * 0.1).collect();
-        let (_, distances) = index.query(&query, 10, Some(10));
+        let (_, distances) = index.query(&query, 10, Some(10)).unwrap();
 
         for i in 1..distances.len() {
             assert!(distances[i] >= distances[i - 1]);
@@ -719,11 +736,18 @@ mod tests {
     #[test]
     fn test_ivf_rabitq_query_k_exceeds_n() {
         let data = create_test_data::<f32>(50, 32);
-        let index =
-            IvfIndexRaBitQ::build(data.as_ref(), Dist::Euclidean, Some(5), Some(10), 42, false);
+        let index = IvfIndexRaBitQ::build(
+            data.as_ref(),
+            Dist::SquaredEuclidean,
+            Some(5),
+            get_default_k_means(),
+            42,
+            false,
+        )
+        .unwrap();
 
         let query: Vec<f32> = (0..32).map(|i| i as f32 * 0.1).collect();
-        let (indices, _) = index.query(&query, 100, Some(5));
+        let (indices, _) = index.query(&query, 100, Some(5)).unwrap();
 
         assert_eq!(indices.len(), 50);
     }
@@ -733,14 +757,15 @@ mod tests {
         let data = create_test_data::<f32>(100, 32);
         let index = IvfIndexRaBitQ::build(
             data.as_ref(),
-            Dist::Euclidean,
+            Dist::SquaredEuclidean,
             Some(10),
-            Some(10),
+            get_default_k_means(),
             42,
             false,
-        );
+        )
+        .unwrap();
 
-        let (indices, distances) = index.query_row(data.as_ref().row(0), 10, Some(10));
+        let (indices, distances) = index.query_row(data.as_ref().row(0), 10, Some(10)).unwrap();
 
         assert_eq!(indices.len(), 10);
         assert_eq!(distances.len(), 10);
@@ -749,11 +774,18 @@ mod tests {
     #[test]
     fn test_ivf_rabitq_cosine() {
         let data = create_test_data::<f32>(100, 32);
-        let index =
-            IvfIndexRaBitQ::build(data.as_ref(), Dist::Cosine, Some(10), Some(10), 42, false);
+        let index = IvfIndexRaBitQ::build(
+            data.as_ref(),
+            Dist::Cosine,
+            Some(10),
+            get_default_k_means(),
+            42,
+            false,
+        )
+        .unwrap();
 
         let query: Vec<f32> = (0..32).map(|i| i as f32 * 0.1).collect();
-        let (indices, distances) = index.query(&query, 10, Some(10));
+        let (indices, distances) = index.query(&query, 10, Some(10)).unwrap();
 
         assert_eq!(indices.len(), 10);
         assert_eq!(distances.len(), 10);
@@ -764,15 +796,16 @@ mod tests {
         let data = create_test_data::<f32>(100, 32);
         let index = IvfIndexRaBitQ::build(
             data.as_ref(),
-            Dist::Euclidean,
+            Dist::SquaredEuclidean,
             Some(10),
-            Some(10),
+            get_default_k_means(),
             42,
             false,
-        );
+        )
+        .unwrap();
 
         let query: Vec<f32> = (0..32).map(|i| i as f32 * 0.1).collect();
-        let (indices, _) = index.query(&query, 5, None);
+        let (indices, _) = index.query(&query, 5, None).unwrap();
 
         assert!(indices.len() <= 5);
     }
@@ -784,9 +817,9 @@ mod tests {
 
         let index = IvfIndexRaBitQ::build_with_vector_store(
             data.as_ref(),
-            Dist::Euclidean,
+            Dist::SquaredEuclidean,
             Some(5),
-            Some(10),
+            get_default_k_means(),
             42,
             false,
             temp_dir.path(),
@@ -806,7 +839,7 @@ mod tests {
             data.as_ref(),
             Dist::Cosine,
             Some(10),
-            Some(10),
+            get_default_k_means(),
             42,
             false,
             temp_dir.path(),
@@ -814,7 +847,9 @@ mod tests {
         .unwrap();
 
         let query: Vec<f32> = (0..32).map(|i| i as f32 * 0.1).collect();
-        let (indices, distances) = index.query_reranking(&query, 10, Some(10), Some(5));
+        let (indices, distances) = index
+            .query_reranking(&query, 10, Some(10), Some(5))
+            .unwrap();
 
         assert_eq!(indices.len(), 10);
         assert_eq!(distances.len(), 10);
@@ -831,17 +866,18 @@ mod tests {
 
         let index = IvfIndexRaBitQ::build_with_vector_store(
             data.as_ref(),
-            Dist::Euclidean,
+            Dist::SquaredEuclidean,
             Some(10),
-            Some(10),
+            get_default_k_means(),
             42,
             false,
             temp_dir.path(),
         )
         .unwrap();
 
-        let (indices, distances) =
-            index.query_row_reranking(data.as_ref().row(0), 10, Some(10), Some(5));
+        let (indices, distances) = index
+            .query_row_reranking(data.as_ref().row(0), 10, Some(10), Some(5))
+            .unwrap();
 
         assert_eq!(indices.len(), 10);
         assert_eq!(distances.len(), 10);
@@ -856,14 +892,16 @@ mod tests {
             data.as_ref(),
             Dist::Cosine,
             Some(5),
-            Some(10),
+            get_default_k_means(),
             42,
             false,
             temp_dir.path(),
         )
         .unwrap();
 
-        let (knn_indices, knn_distances) = index.generate_knn(5, Some(5), Some(10), true, false);
+        let (knn_indices, knn_distances) = index
+            .generate_knn(5, Some(5), Some(10), true, false)
+            .unwrap();
 
         assert_eq!(knn_indices.len(), 50);
         assert!(knn_distances.is_some());
@@ -875,31 +913,56 @@ mod tests {
     }
 
     #[test]
-    #[should_panic]
-    fn test_knn_without_vector_store_panics() {
+    fn test_knn_without_vector_store() {
         let data = create_test_data::<f32>(50, 32);
-        let index =
-            IvfIndexRaBitQ::build(data.as_ref(), Dist::Euclidean, Some(5), Some(10), 42, false);
-
-        let _ = index.generate_knn(5, Some(5), Some(10), false, false);
+        let index = IvfIndexRaBitQ::build(
+            data.as_ref(),
+            Dist::SquaredEuclidean,
+            Some(5),
+            get_default_k_means(),
+            42,
+            false,
+        )
+        .unwrap();
+        let result = index.generate_knn(5, Some(5), Some(10), false, false);
+        assert!(matches!(
+            result,
+            Err(AnnSearchErrors::VectorStoreNotAvailable)
+        ));
     }
 
     #[test]
-    #[should_panic]
-    fn test_query_reranking_without_vector_store_panics() {
+    fn test_query_reranking_without_vector_store() {
         let data = create_test_data::<f32>(50, 32);
-        let index =
-            IvfIndexRaBitQ::build(data.as_ref(), Dist::Euclidean, Some(5), Some(10), 42, false);
-
+        let index = IvfIndexRaBitQ::build(
+            data.as_ref(),
+            Dist::SquaredEuclidean,
+            Some(5),
+            get_default_k_means(),
+            42,
+            false,
+        )
+        .unwrap();
         let query: Vec<f32> = (0..32).map(|i| i as f32 * 0.1).collect();
-        let _ = index.query_reranking(&query, 10, Some(5), Some(5));
+        let result = index.query_reranking(&query, 10, Some(5), Some(5));
+        assert!(matches!(
+            result,
+            Err(AnnSearchErrors::VectorStoreNotAvailable)
+        ));
     }
 
     #[test]
     fn test_default_nlist() {
         let data = create_test_data::<f32>(100, 32);
-        let index =
-            IvfIndexRaBitQ::build(data.as_ref(), Dist::Euclidean, None, Some(10), 42, false);
+        let index = IvfIndexRaBitQ::build(
+            data.as_ref(),
+            Dist::SquaredEuclidean,
+            None,
+            get_default_k_means(),
+            42,
+            false,
+        )
+        .unwrap();
 
         assert_eq!(index.storage.nlist, 10);
     }

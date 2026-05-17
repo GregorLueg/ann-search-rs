@@ -36,7 +36,7 @@ fn main() {
     println!("Querying exhaustive index...");
     let start = Instant::now();
     let (true_neighbors, true_distances) =
-        query_exhaustive_index(query_data.as_ref(), &exhaustive_idx, cli.k, true, false);
+        query_exhaustive_index(query_data.as_ref(), &exhaustive_idx, cli.k, true, false).unwrap();
     let query_time = start.elapsed().as_secs_f64() * 1000.0;
 
     results.push(BenchmarkResultSize {
@@ -52,7 +52,7 @@ fn main() {
     println!("Self-querying exhaustive index...");
     let start = Instant::now();
     let (true_neighbors_self, true_distances_self) =
-        query_exhaustive_self(&exhaustive_idx, cli.k, true, false);
+        query_exhaustive_self(&exhaustive_idx, cli.k, true, false).unwrap();
     let self_query_time = start.elapsed().as_secs_f64() * 1000.0;
 
     results.push(BenchmarkResultSize {
@@ -125,7 +125,8 @@ fn main() {
             None,
             false,
             false,
-        );
+        )
+        .unwrap();
         let query_time = start.elapsed().as_secs_f64() * 1000.0;
 
         let recall = calculate_recall(&true_neighbors, &binary_neighbors, cli.k);
@@ -155,7 +156,8 @@ fn main() {
                 Some(rerank_factor),
                 true,
                 false,
-            );
+            )
+            .unwrap();
             let query_time = start.elapsed().as_secs_f64() * 1000.0;
 
             let recall = calculate_recall(&true_neighbors, &binary_neighbors, cli.k);
@@ -185,7 +187,7 @@ fn main() {
         );
         let start = Instant::now();
         let (binary_neighbors_self, binary_distances_self) =
-            query_exhaustive_index_binary_self(&binary_idx, cli.k, Some(10), true, false);
+            query_exhaustive_index_binary_self(&binary_idx, cli.k, Some(10), true, false).unwrap();
         let self_query_time = start.elapsed().as_secs_f64() * 1000.0;
 
         let recall_self = calculate_recall(&true_neighbors_self, &binary_neighbors_self, cli.k);
@@ -272,7 +274,8 @@ fn main() {
                     None,
                     false,
                     false,
-                );
+                )
+                .unwrap();
                 let query_time = start.elapsed().as_secs_f64() * 1000.0;
 
                 let recall = calculate_recall(&true_neighbors, &ivf_binary_neighbors, cli.k);
@@ -312,7 +315,8 @@ fn main() {
                         Some(rerank_factor),
                         true,
                         false,
-                    );
+                    )
+                    .unwrap();
                     let query_time = start.elapsed().as_secs_f64() * 1000.0;
 
                     let recall = calculate_recall(&true_neighbors, &ivf_binary_neighbors, cli.k);
@@ -350,7 +354,8 @@ fn main() {
                     Some(10),
                     true,
                     false,
-                );
+                )
+                .unwrap();
             let self_query_time = start.elapsed().as_secs_f64() * 1000.0;
 
             let recall_self =

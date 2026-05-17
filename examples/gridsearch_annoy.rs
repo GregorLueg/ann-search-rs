@@ -34,7 +34,7 @@ fn main() {
     println!("Querying exhaustive index...");
     let start = Instant::now();
     let (true_neighbors, true_distances) =
-        query_exhaustive_index(query_data.as_ref(), &exhaustive_idx, cli.k, true, false);
+        query_exhaustive_index(query_data.as_ref(), &exhaustive_idx, cli.k, true, false).unwrap();
     let query_time = start.elapsed().as_secs_f64() * 1000.0;
 
     results.push(BenchmarkResultSize {
@@ -51,7 +51,7 @@ fn main() {
     println!("Self-querying exhaustive index...");
     let start = Instant::now();
     let (true_neighbors_self, true_distances_self) =
-        query_exhaustive_self(&exhaustive_idx, cli.k, true, false);
+        query_exhaustive_self(&exhaustive_idx, cli.k, true, false).unwrap();
     let self_query_time = start.elapsed().as_secs_f64() * 1000.0;
 
     results.push(BenchmarkResultSize {
@@ -71,12 +71,8 @@ fn main() {
     for n_trees in n_trees_values {
         println!("Building Annoy index ({} trees)...", n_trees);
         let start = Instant::now();
-        let annoy_idx = build_annoy_index(
-            data.as_ref(),
-            cli.distance.as_str().into(),
-            n_trees,
-            cli.seed as usize,
-        );
+        let annoy_idx =
+            build_annoy_index(data.as_ref(), &cli.distance, n_trees, cli.seed as usize).unwrap();
         let build_time = start.elapsed().as_secs_f64() * 1000.0;
 
         let index_size_mb = annoy_idx.memory_usage_bytes() as f64 / (1024.0 * 1024.0);
@@ -98,7 +94,8 @@ fn main() {
                 search_budget,
                 true,
                 false,
-            );
+            )
+            .unwrap();
             let query_time = start.elapsed().as_secs_f64() * 1000.0;
 
             let recall = calculate_recall(&true_neighbors, &approx_neighbors, cli.k);
@@ -123,7 +120,7 @@ fn main() {
         println!("Self-querying Annoy index...");
         let start = Instant::now();
         let (approx_neighbors_self, approx_distances_self) =
-            query_annoy_self(&annoy_idx, cli.k, None, true, false);
+            query_annoy_self(&annoy_idx, cli.k, None, true, false).unwrap();
         let self_query_time = start.elapsed().as_secs_f64() * 1000.0;
 
         let recall_self = calculate_recall(&true_neighbors_self, &approx_neighbors_self, cli.k);

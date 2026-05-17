@@ -72,6 +72,24 @@ pub struct IvfIndexGpu<T: AnnSearchFloat + AnnSearchGpuFloat, R: Runtime> {
     device: R::Device,
 }
 
+/////////////////////////
+// DimensionValidation //
+/////////////////////////
+
+impl<T, R> DimensionValidation for IvfIndexGpu<T, R>
+where
+    R: Runtime,
+    T: AnnSearchGpuFloat + AnnSearchFloat,
+{
+    fn dim(&self) -> usize {
+        self.dim
+    }
+}
+
+/////////////////////////
+// Main implementation //
+/////////////////////////
+
 impl<T, R> IvfIndexGpu<T, R>
 where
     R: Runtime,
@@ -84,7 +102,9 @@ where
     /// * `data` - Database vectors [n, dim]
     /// * `metric` - Distance metric
     /// * `nlist` - Number of clusters (defaults to `sqrt(n)`)
-    /// * `max_iters` - Optional k-means iterations (defaults to `50`)
+    /// * `k_means_params` - Optional k-means trainings parameters, see
+    ///   [KMeansTrainingParams]. If not provided, will default to sensible
+    ///   defaults.
     /// * `seed` - Random seed
     /// * `verbose` - Print progress
     /// * `device` - GPU device
@@ -96,14 +116,17 @@ where
         data: MatRef<T>,
         metric: Dist,
         nlist: Option<usize>,
-        max_iters: Option<usize>,
+        k_means_params: Option<KMeansTrainingParams>,
         seed: usize,
         verbose: bool,
         device: R::Device,
-    ) -> Self {
+    ) -> Result<Self, AnnSearchErrors> {
+        if metric == Dist::Manhattan {
+            return Err(AnnSearchErrors::DistanceNotSupported(metric));
+        }
+
         let (vectors_flat, n, dim) = matrix_to_flat(data);
 
-        let max_iters = max_iters.unwrap_or(30);
         let nlist = nlist.unwrap_or((n as f32).sqrt() as usize).max(1);
 
         let line = LINE_SIZE as usize;
@@ -122,10 +145,10 @@ where
             n_train,
             nlist,
             &metric,
-            max_iters,
+            k_means_params,
             seed,
             verbose,
-        );
+        )?;
 
         // Norms on original (unpadded) data
         let data_norms = if metric == Dist::Cosine {
@@ -154,10 +177,6 @@ where
             nlist,
             &metric,
         );
-
-        if verbose {
-            print_cluster_summary(&assignments, nlist);
-        }
 
         let (vectors_by_cluster, original_indices, cluster_offsets, norms_by_cluster) =
             reorganise_by_cluster(&vectors_flat, dim, n, &assignments, nlist, &metric);
@@ -213,7 +232,7 @@ where
             println!("  Index ready");
         }
 
-        Self {
+        Ok(Self {
             vectors_gpu,
             norms_gpu,
             vectors_cpu,
@@ -227,7 +246,7 @@ where
             nlist,
             metric,
             device,
-        }
+        })
     }
 
     /// Internal helper for querying
@@ -257,12 +276,8 @@ where
         nquery: Option<usize>,
         client: &ComputeClient<R>,
         verbose: bool,
-    ) -> (Vec<Vec<usize>>, Vec<Vec<T>>) {
-        assert_eq!(
-            dim_query, self.dim_padded,
-            "Query dimension {} != index padded dimension {}",
-            dim_query, self.dim_padded
-        );
+    ) -> KnnResult<T> {
+        self.check_dim(dim_query)?;
 
         let nprobe = nprobe
             .unwrap_or_else(|| ((self.nlist as f64).sqrt() as usize).max(1))
@@ -280,7 +295,7 @@ where
         let n_batches = n_queries.div_ceil(nquery);
 
         if n_batches == 1 {
-            return self.query_batch_internal(queries_flat, n_queries, k, nprobe, client);
+            return Ok(self.query_batch_internal(queries_flat, n_queries, k, nprobe, client));
         }
 
         let mut all_indices = Vec::with_capacity(n_queries);
@@ -307,7 +322,7 @@ where
             all_distances.extend(batch_dists);
         }
 
-        (all_indices, all_distances)
+        Ok((all_indices, all_distances))
     }
 
     /// Query the index with a batch of vectors
@@ -331,13 +346,9 @@ where
         nprobe: Option<usize>,
         nquery: Option<usize>,
         verbose: bool,
-    ) -> (Vec<Vec<usize>>, Vec<Vec<T>>) {
+    ) -> KnnResult<T> {
         let (queries_flat, n_queries, dim_query) = matrix_to_flat(query_mat);
-        assert_eq!(
-            dim_query, self.dim,
-            "Query dimension {} != index dimension {}",
-            dim_query, self.dim
-        );
+        self.check_dim(dim_query)?;
 
         let client: ComputeClient<R> = R::client(&self.device);
 
@@ -359,10 +370,10 @@ where
             Some(batch_size),
             &client,
             verbose,
-        );
+        )?;
 
         client.memory_cleanup();
-        (indices, dist)
+        Ok((indices, dist))
     }
 
     /// Generate kNN graph from vectors stored in the index
@@ -389,7 +400,7 @@ where
         nquery: Option<usize>,
         return_dist: bool,
         verbose: bool,
-    ) -> (Vec<Vec<usize>>, Option<Vec<Vec<T>>>) {
+    ) -> KnnOptionResult<T> {
         let client: ComputeClient<R> = R::client(&self.device);
 
         let nprobe = nprobe.unwrap_or(((self.nlist as f32).sqrt() as usize).max(1));
@@ -416,7 +427,7 @@ where
             Some(batch_size),
             &client,
             verbose,
-        );
+        )?;
 
         client.memory_cleanup();
 
@@ -439,9 +450,9 @@ where
         }
 
         if return_dist {
-            (indices, Some(dist))
+            Ok((indices, Some(dist)))
         } else {
-            (indices, None)
+            Ok((indices, None))
         }
     }
 
@@ -520,7 +531,7 @@ where
         let (grid_y, grid_z) = grid_2d((n_queries as u32).div_ceil(WORKGROUP_SIZE_Y));
 
         match self.metric {
-            Dist::Euclidean => unsafe {
+            Dist::SquaredEuclidean => unsafe {
                 let _ = euclidean_tiled::launch_unchecked::<T, R>(
                     client,
                     CubeCount::Static(grid_x, grid_y, grid_z),
@@ -568,6 +579,7 @@ where
                     dim_lines,
                 );
             },
+            Dist::Manhattan => unreachable!(),
         }
 
         let centroid_dists = centroid_dists_gpu.read(client);
@@ -654,7 +666,7 @@ where
         let (mega_grid_y, mega_grid_z) = grid_2d((n_tasks as u32).div_ceil(WORKGROUP_SIZE_Y));
 
         match self.metric {
-            Dist::Euclidean => unsafe {
+            Dist::SquaredEuclidean => unsafe {
                 let _ = compute_ivf_mega_euclidean_cached::launch_unchecked::<T, R>(
                     client,
                     CubeCount::Static(mega_grid_x, mega_grid_y, mega_grid_z),
@@ -694,6 +706,7 @@ where
                     dim_lines,
                 );
             },
+            Dist::Manhattan => unreachable!(),
         }
 
         let topk_dists = GpuTensor::<R, T>::empty(vec![n_queries, k], client);
@@ -856,6 +869,10 @@ mod tests {
     use cubecl::cpu::CpuRuntime;
     use faer::Mat;
 
+    fn get_default_k_means() -> Option<KMeansTrainingParams> {
+        Some(KMeansTrainingParams::new(10, None, None))
+    }
+
     #[test]
     fn test_ivf_index_build() {
         let device = CpuDevice;
@@ -865,13 +882,14 @@ mod tests {
 
         let index = IvfIndexGpu::<f32, CpuRuntime>::build(
             data.as_ref(),
-            Dist::Euclidean,
+            Dist::SquaredEuclidean,
             Some(10),
-            Some(5),
+            get_default_k_means(),
             42,
             false,
             device,
-        );
+        )
+        .unwrap();
 
         assert_eq!(index.dim, 4);
         assert_eq!(index.n, 100);
@@ -887,17 +905,20 @@ mod tests {
 
         let index = IvfIndexGpu::<f32, CpuRuntime>::build(
             data.as_ref(),
-            Dist::Euclidean,
+            Dist::SquaredEuclidean,
             Some(5),
-            Some(10),
+            get_default_k_means(),
             42,
             false,
             device,
-        );
+        )
+        .unwrap();
 
         let query = Mat::from_fn(3, 4, |i, j| if i == j { 1.0_f32 } else { 0.0_f32 });
 
-        let (indices, distances) = index.query_batch(query.as_ref(), 5, Some(3), None, false);
+        let (indices, distances) = index
+            .query_batch(query.as_ref(), 5, Some(3), None, false)
+            .unwrap();
 
         assert_eq!(indices.len(), 3);
         assert_eq!(distances.len(), 3);
@@ -914,14 +935,17 @@ mod tests {
             data.as_ref(),
             Dist::Cosine,
             Some(5),
-            Some(10),
+            get_default_k_means(),
             42,
             false,
             device,
-        );
+        )
+        .unwrap();
 
         let query = Mat::from_fn(2, 4, |_, _| 1.0_f32);
-        let (indices, distances) = index.query_batch(query.as_ref(), 3, Some(2), None, false);
+        let (indices, distances) = index
+            .query_batch(query.as_ref(), 3, Some(2), None, false)
+            .unwrap();
 
         assert_eq!(indices.len(), 2);
         assert_eq!(indices[0].len(), 3);
@@ -936,7 +960,7 @@ mod tests {
         let assignments = vec![0, 1, 0, 1];
 
         let (reorg, indices, offsets, _) =
-            reorganise_by_cluster(&vectors, 4, 4, &assignments, 2, &Dist::Euclidean);
+            reorganise_by_cluster(&vectors, 4, 4, &assignments, 2, &Dist::SquaredEuclidean);
 
         assert_eq!(reorg.len(), 16);
         assert_eq!(indices.len(), 4);
@@ -953,6 +977,10 @@ mod tests_wpgu {
     use cubecl::wgpu::WgpuDevice;
     use cubecl::wgpu::WgpuRuntime;
     use faer::Mat;
+
+    fn get_default_k_means() -> Option<KMeansTrainingParams> {
+        Some(KMeansTrainingParams::new(10, None, None))
+    }
 
     fn try_device() -> Option<WgpuDevice> {
         let device = WgpuDevice::DefaultDevice;
@@ -973,15 +1001,16 @@ mod tests_wpgu {
 
         let index = IvfIndexGpu::<f32, WgpuRuntime>::build(
             data.as_ref(),
-            Dist::Euclidean,
+            Dist::SquaredEuclidean,
             Some(5),
-            Some(5),
+            get_default_k_means(),
             42,
             false,
             device,
-        );
+        )
+        .unwrap();
 
-        let (indices, distances) = index.generate_knn(4, Some(3), None, true, false);
+        let (indices, distances) = index.generate_knn(4, Some(3), None, true, false).unwrap();
 
         assert_eq!(indices.len(), 30);
         assert!(distances.is_some());

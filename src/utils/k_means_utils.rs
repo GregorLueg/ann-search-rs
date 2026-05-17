@@ -13,6 +13,7 @@ use rayon::prelude::*;
 use std::iter::Sum;
 use std::num::NonZero;
 
+use crate::errors::AnnSearchErrors;
 use crate::prelude::AnnSearchFloat;
 use crate::utils::dist::*;
 use crate::utils::Dist;
@@ -58,10 +59,13 @@ where
             .map(|c| {
                 let cent = &self.centroids()[c * self.dim()..(c + 1) * self.dim()];
                 let dist = match self.metric() {
-                    Dist::Euclidean => euclidean_distance_static(query_vec, cent),
+                    Dist::SquaredEuclidean => euclidean_distance_static(query_vec, cent),
                     Dist::Cosine => {
                         let c_norm = &self.centroids_norm()[c];
                         cosine_distance_static_norm(query_vec, cent, &query_norm, c_norm)
+                    }
+                    Dist::Manhattan => {
+                        unreachable!()
                     }
                 };
                 (dist, c)
@@ -92,7 +96,10 @@ where
                 let cent = &self.centroids()[c * self.dim()..(c + 1) * self.dim()];
                 let dist = match self.metric() {
                     Dist::Cosine => T::one() - T::dot_simd(query_vec, cent),
-                    Dist::Euclidean => T::euclidean_simd(query_vec, cent),
+                    Dist::SquaredEuclidean => T::euclidean_simd(query_vec, cent),
+                    Dist::Manhattan => {
+                        unreachable!()
+                    }
                 };
                 (dist, c)
             })
@@ -136,6 +143,137 @@ const SIMD_HAMERLY_K_THRESHOLD: usize = 100;
 /// updating bounds outweighs the saved distance work.
 const SIMD_HAMERLY_DIM_MIN: usize = 64;
 
+///////////////////
+// Enums, Params //
+///////////////////
+
+/// Initialisation of initial k-means centroids
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KMeansInit {
+    /// Random path -> useful on very large data sets
+    Random,
+    /// Uses the KMeansParallel path, better initial centroids but slower
+    /// initialisation
+    KMeansParallel,
+}
+
+/// Computation path for the k-means clustering
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LloydPath {
+    /// Uses Hamerly's bounds to reduce computations and GEMM acceleration.
+    /// Ideal on large N and large dimensionality data sets with Euclidean
+    /// distance.
+    HamerlyGemm,
+    /// Uses Hamerly's bounds to reduce computations and SIMD acceleration.
+    /// Ideal on large N and moderate dimensionality data sets with Euclidean
+    /// distance.
+    HamerlySimd,
+    /// Uses GEMM acceleration and standard Lloyd's
+    GemmLloyd,
+    /// ParallelLloyd uses SIMD
+    ParallelLloyd,
+}
+
+/// Resolve init strategy: if `None`, pick based on `n_centroids`.
+///
+/// ### Params
+///
+/// * `init` - The Option of the [KMeansInit]
+/// * `n_centroids` - The number of centroids. If `init` is None, it will use
+///   this to generate a good default based on heuristics.
+///
+/// ### Returns
+///
+/// The [KMeansInit]
+fn resolve_init(init: Option<KMeansInit>, n_centroids: usize) -> KMeansInit {
+    init.unwrap_or({
+        if n_centroids > 200 {
+            KMeansInit::Random
+        } else {
+            KMeansInit::KMeansParallel
+        }
+    })
+}
+
+/// Resolve Lloyd's path
+///
+/// If a Hamerly variant is requested with Cosine (no triangle inequality), fall
+/// back to a compatible non-Hamerly path: `HamerlyGemm` to `GemmLloyd`,
+/// `HamerlySimd` to `ParallelLloyd`.
+///
+/// ### Params
+///
+/// * `path` - The Option of the [LloydPath].
+/// * `dim` - The dimensionality of the data set. Will be used if `None` is
+///   provided for `path`.
+/// * `n_centroids` - The number of requested centroids. Will be used if `None`
+///   is provided for `path`.
+/// * `metric` - The distance metric, see [Dist].
+///
+/// ### Returns
+///
+/// The [LloydPath].
+fn resolve_path(
+    path: Option<LloydPath>,
+    dim: usize,
+    n_centroids: usize,
+    metric: &Dist,
+) -> LloydPath {
+    let chosen = path.unwrap_or_else(|| match metric {
+        Dist::SquaredEuclidean if dim >= GEMM_DIM_THRESHOLD => LloydPath::HamerlyGemm,
+        Dist::SquaredEuclidean
+            if (SIMD_HAMERLY_DIM_MIN..GEMM_DIM_THRESHOLD).contains(&dim)
+                && n_centroids >= SIMD_HAMERLY_K_THRESHOLD =>
+        {
+            LloydPath::HamerlySimd
+        }
+        Dist::Cosine if dim >= GEMM_DIM_THRESHOLD => LloydPath::GemmLloyd,
+        _ => LloydPath::ParallelLloyd,
+    });
+
+    match (chosen, metric) {
+        (LloydPath::HamerlyGemm, Dist::Cosine) => LloydPath::GemmLloyd,
+        (LloydPath::HamerlySimd, Dist::Cosine) => LloydPath::ParallelLloyd,
+        _ => chosen,
+    }
+}
+
+/// K-means clustering parameters to enable tighter control over the method
+pub struct KMeansTrainingParams {
+    /// Number of iterations to run the clustering algorithm for
+    pub iters: usize,
+    /// Optional [KMeansInit] for tighter control over the initialisation
+    pub init: Option<KMeansInit>,
+    /// Optional [LloydPath] to control
+    pub path: Option<LloydPath>,
+}
+
+impl KMeansTrainingParams {
+    /// Generate a new instance of self
+    ///
+    /// ### Params
+    ///
+    /// * `iters` - Number of iterations to run the clustering algorithm for
+    /// * `init` - Optional specification of the [KMeansInit] for better
+    ///   control
+    /// * `path` - The Lloyd's path you want to use, see [LloydPath] for better
+    ///   control
+    ///
+    /// ### Returns
+    ///
+    /// [KMeansTrainingParams]
+    pub fn new(iters: usize, init: Option<KMeansInit>, path: Option<LloydPath>) -> Self {
+        Self { iters, init, path }
+    }
+}
+
+/// Default implementation for CagraGpuSearchParams
+impl Default for KMeansTrainingParams {
+    fn default() -> Self {
+        Self::new(30, None, None)
+    }
+}
+
 /////////////
 // Helpers //
 /////////////
@@ -173,7 +311,7 @@ where
     let mut min_dist = T::infinity();
 
     match metric {
-        Dist::Euclidean => {
+        Dist::SquaredEuclidean => {
             for cent in centroids.chunks_exact(dim).take(n_centroids) {
                 let dist = euclidean_distance_static(vec, cent);
                 if dist < min_dist {
@@ -191,6 +329,9 @@ where
                     min_dist = dist;
                 }
             }
+        }
+        Dist::Manhattan => {
+            unreachable!()
         }
     }
 
@@ -246,7 +387,7 @@ where
         let latest_norm = *centroid_norms.last().unwrap();
 
         match metric {
-            Dist::Euclidean => {
+            Dist::SquaredEuclidean => {
                 for (i, dist) in distances.iter_mut().enumerate() {
                     let vec = &data[i * dim..(i + 1) * dim];
                     let d = euclidean_distance_static(vec, latest_centroid);
@@ -268,6 +409,9 @@ where
                         *dist = d;
                     }
                 }
+            }
+            Dist::Manhattan => {
+                unreachable!()
             }
         }
 
@@ -513,7 +657,7 @@ fn gemm_assign_full<T>(
                     let mut second_score = T::neg_infinity();
 
                     match metric {
-                        Dist::Euclidean => {
+                        Dist::SquaredEuclidean => {
                             for c in 0..k {
                                 let score = two * dots[(local_i, c)] - centroid_norms[c];
                                 if score > best_score {
@@ -556,6 +700,9 @@ fn gemm_assign_full<T>(
                             assign_block[local_i] = best_c;
                             upper_block[local_i] = T::one() - best_score * inv_xn;
                             lower_block[local_i] = T::one() - second_score * inv_xn;
+                        }
+                        Dist::Manhattan => {
+                            unreachable!()
                         }
                     }
                 }
@@ -625,7 +772,7 @@ fn gemm_reassign_dirty<T>(
             let mut second_score = T::neg_infinity();
 
             match metric {
-                Dist::Euclidean => {
+                Dist::SquaredEuclidean => {
                     for c in 0..k {
                         let cent = &centroids[c * dim..(c + 1) * dim];
                         let dot = T::dot_simd(vec, cent);
@@ -670,6 +817,9 @@ fn gemm_reassign_dirty<T>(
                     assignments[i] = best_c;
                     upper_bounds[i] = T::one() - best_score * inv_xn;
                     lower_bounds[i] = T::one() - second_score * inv_xn;
+                }
+                Dist::Manhattan => {
+                    unreachable!()
                 }
             }
         }
@@ -779,8 +929,11 @@ fn update_centroids<T>(
         }
         let cent = &centroids[c * dim..(c + 1) * dim];
         centroid_norms[c] = match metric {
-            Dist::Euclidean => T::dot_simd(cent, cent), // ||c||^2
-            Dist::Cosine => T::calculate_l2_norm(cent), // ||c||
+            Dist::SquaredEuclidean => T::dot_simd(cent, cent), // ||c||^2
+            Dist::Cosine => T::calculate_l2_norm(cent),        // ||c||
+            Dist::Manhattan => {
+                unreachable!()
+            }
         };
     }
 }
@@ -991,7 +1144,7 @@ fn hamerly_lloyd<T>(
         centroids,
         centroid_norms_sq,
         k,
-        &Dist::Euclidean,
+        &Dist::SquaredEuclidean,
         &mut assignments,
         &mut upper,
         &mut lower,
@@ -1008,7 +1161,7 @@ fn hamerly_lloyd<T>(
             centroids,
             centroid_norms_sq,
             k,
-            &Dist::Euclidean,
+            &Dist::SquaredEuclidean,
         );
 
         compute_centroid_drift(&old_centroids, centroids, dim, k, &mut deltas);
@@ -1070,7 +1223,7 @@ fn hamerly_lloyd<T>(
             centroids,
             centroid_norms_sq,
             k,
-            &Dist::Euclidean,
+            &Dist::SquaredEuclidean,
             &dirty,
             &mut assignments,
             &mut upper,
@@ -1094,16 +1247,16 @@ fn hamerly_lloyd<T>(
     }
 }
 
-////////////////////////////////
-// GEMM-only Lloyd's (Cosine) //
-////////////////////////////////
+///////////////////////////////////
+// GEMM-only Lloyd's (Euclidean) //
+///////////////////////////////////
 
-/// Plain Lloyd's k-means for cosine distance using GEMM assignment
+/// Plain Lloyd's k-means using GEMM assignment.
 ///
-/// Cosine distance does not satisfy the triangle inequality, so
-/// Hamerly's bound-based pruning is not applicable. Instead, runs
-/// full GEMM reassignment every iteration and converges when no
-/// assignments change.
+/// Runs full GEMM reassignment every iteration and converges when no
+/// assignments change. Works for both Euclidean and Cosine; for Cosine this is
+/// the GEMM path of choice because Hamerly's bound-based pruning is not
+/// applicable (no triangle inequality).
 ///
 /// ### Params
 ///
@@ -1117,7 +1270,7 @@ fn hamerly_lloyd<T>(
 /// * `max_iters` - Maximum number of Lloyd's iterations
 /// * `verbose` - Print convergence diagnostics
 #[allow(clippy::too_many_arguments)]
-fn gemm_lloyd_cosine<T>(
+fn gemm_lloyd<T>(
     data: &[T],
     data_norms: &[T],
     dim: usize,
@@ -1125,6 +1278,7 @@ fn gemm_lloyd_cosine<T>(
     centroids: &mut [T],
     centroid_norms: &mut [T],
     k: usize,
+    metric: &Dist,
     max_iters: usize,
     verbose: bool,
 ) where
@@ -1143,7 +1297,7 @@ fn gemm_lloyd_cosine<T>(
             centroids,
             centroid_norms,
             k,
-            &Dist::Cosine,
+            metric,
             &mut assignments,
             &mut upper,
             &mut lower,
@@ -1170,7 +1324,7 @@ fn gemm_lloyd_cosine<T>(
             centroids,
             centroid_norms,
             k,
-            &Dist::Cosine,
+            metric,
         );
 
         std::mem::swap(&mut prev_assignments, &mut assignments);
@@ -1184,7 +1338,6 @@ fn gemm_lloyd_cosine<T>(
         }
     }
 }
-
 ////////////////////
 // Lloyd's (SIMD) //
 ////////////////////
@@ -1540,7 +1693,7 @@ fn hamerly_lloyd_simd<T>(
             centroids,
             centroid_norms,
             k,
-            &Dist::Euclidean,
+            &Dist::SquaredEuclidean,
         );
 
         compute_centroid_drift(&old_centroids, centroids, dim, k, &mut deltas);
@@ -1655,7 +1808,7 @@ where
     T: Float + Send + Sync + SimdDistance + ComplexField,
 {
     let data_norms: Vec<T> = match metric {
-        Dist::Euclidean => (0..n)
+        Dist::SquaredEuclidean => (0..n)
             .map(|i| {
                 let v = &data[i * dim..(i + 1) * dim];
                 T::dot_simd(v, v)
@@ -1664,9 +1817,12 @@ where
         Dist::Cosine => (0..n)
             .map(|i| T::calculate_l2_norm(&data[i * dim..(i + 1) * dim]))
             .collect(),
+        Dist::Manhattan => {
+            unreachable!()
+        }
     };
     let centroid_norms: Vec<T> = match metric {
-        Dist::Euclidean => (0..k)
+        Dist::SquaredEuclidean => (0..k)
             .map(|c| {
                 let cent = &centroids[c * dim..(c + 1) * dim];
                 T::dot_simd(cent, cent)
@@ -1675,6 +1831,9 @@ where
         Dist::Cosine => (0..k)
             .map(|c| T::calculate_l2_norm(&centroids[c * dim..(c + 1) * dim]))
             .collect(),
+        Dist::Manhattan => {
+            unreachable!()
+        }
     };
 
     let mut assignments = vec![0usize; n];
@@ -1730,7 +1889,7 @@ where
     let two = T::one() + T::one();
 
     let shortcut_norms: Vec<T> = match metric {
-        Dist::Euclidean => (0..k)
+        Dist::SquaredEuclidean => (0..k)
             .map(|c| {
                 let cent = &centroids[c * dim..(c + 1) * dim];
                 T::dot_simd(cent, cent)
@@ -1746,10 +1905,13 @@ where
                 }
             })
             .collect(),
+        Dist::Manhattan => {
+            unreachable!()
+        }
     };
 
     match metric {
-        Dist::Euclidean => (0..n)
+        Dist::SquaredEuclidean => (0..n)
             .into_par_iter()
             .map(|i| {
                 let vec = &data[i * dim..(i + 1) * dim];
@@ -1783,6 +1945,9 @@ where
                 best
             })
             .collect(),
+        Dist::Manhattan => {
+            unreachable!()
+        }
     }
 }
 
@@ -1849,7 +2014,9 @@ where
 /// * `n` - Number of samples in the data
 /// * `n_centroids` - Number of centroids to identify
 /// * `metric` - Distance metric to use
-/// * `max_iters` - Maximum iterations for the k-means clustering.
+/// * `params_k_means` - An option for [KMeansTrainingParams]. This gives you
+///   control over the maximum iterations, initialisation and path. If not
+///   provided, will default to sensible heuristics.
 /// * `seed` - Seed for reproducibility
 /// * `verbose` - Controls verbosity of the function
 ///
@@ -1863,15 +2030,21 @@ pub fn train_centroids<T>(
     n: usize,
     n_centroids: usize,
     metric: &Dist,
-    max_iters: usize,
+    params_k_means: Option<KMeansTrainingParams>,
     seed: usize,
     verbose: bool,
-) -> Vec<T>
+) -> Result<Vec<T>, AnnSearchErrors>
 where
     T: AnnSearchFloat,
 {
+    if *metric == Dist::Manhattan {
+        return Err(AnnSearchErrors::DistanceNotSupported(*metric));
+    }
+
+    let params = params_k_means.unwrap_or_default();
+
     let data_norms: Vec<T> = match metric {
-        Dist::Euclidean => (0..n)
+        Dist::SquaredEuclidean => (0..n)
             .into_par_iter()
             .map(|i| {
                 let v = &data[i * dim..(i + 1) * dim];
@@ -1882,28 +2055,39 @@ where
             .into_par_iter()
             .map(|i| T::calculate_l2_norm(&data[i * dim..(i + 1) * dim]))
             .collect(),
+        Dist::Manhattan => {
+            unreachable!()
+        }
     };
 
-    let mut centroids = if n_centroids > 200 {
-        if verbose {
-            println!("  Initialising centroids via fast random selection");
+    let init_method = resolve_init(params.init, n_centroids);
+
+    let mut centroids = match init_method {
+        KMeansInit::Random => {
+            if verbose {
+                println!("  Initialising centroids via fast random selection");
+            }
+            fast_random_init(data, dim, n, n_centroids, seed)
         }
-        fast_random_init(data, dim, n, n_centroids, seed)
-    } else {
-        if verbose {
-            println!("  Initialising centroids via k-means||");
+        KMeansInit::KMeansParallel => {
+            if verbose {
+                println!("  Initialising centroids via k-means||");
+            }
+            let init_norms: Vec<T> = match metric {
+                Dist::SquaredEuclidean => (0..n)
+                    .map(|i| T::calculate_l2_norm(&data[i * dim..(i + 1) * dim]))
+                    .collect(),
+                Dist::Cosine => data_norms.clone(),
+                Dist::Manhattan => {
+                    unreachable!()
+                }
+            };
+            kmeans_parallel_init(data, &init_norms, dim, n, n_centroids, metric, seed)
         }
-        let init_norms: Vec<T> = match metric {
-            Dist::Euclidean => (0..n)
-                .map(|i| T::calculate_l2_norm(&data[i * dim..(i + 1) * dim]))
-                .collect(),
-            Dist::Cosine => data_norms.clone(),
-        };
-        kmeans_parallel_init(data, &init_norms, dim, n, n_centroids, metric, seed)
     };
 
     let mut centroid_norms: Vec<T> = match metric {
-        Dist::Euclidean => (0..n_centroids)
+        Dist::SquaredEuclidean => (0..n_centroids)
             .map(|i| {
                 let c = &centroids[i * dim..(i + 1) * dim];
                 T::dot_simd(c, c)
@@ -1912,14 +2096,19 @@ where
         Dist::Cosine => (0..n_centroids)
             .map(|i| T::calculate_l2_norm(&centroids[i * dim..(i + 1) * dim]))
             .collect(),
+        Dist::Manhattan => {
+            unreachable!()
+        }
     };
 
     if verbose {
         println!("  Running Lloyd's iterations");
     }
 
-    match metric {
-        Dist::Euclidean if dim >= GEMM_DIM_THRESHOLD => {
+    let lloyd_path = resolve_path(params.path, dim, n_centroids, metric);
+
+    match lloyd_path {
+        LloydPath::HamerlyGemm => {
             if verbose {
                 println!("    (Hamerly's bounds + GEMM assignment)");
             }
@@ -1931,14 +2120,11 @@ where
                 &mut centroids,
                 &mut centroid_norms,
                 n_centroids,
-                max_iters,
+                params.iters,
                 verbose,
             );
         }
-        Dist::Euclidean
-            if (SIMD_HAMERLY_DIM_MIN..GEMM_DIM_THRESHOLD).contains(&dim)
-                && n_centroids >= SIMD_HAMERLY_K_THRESHOLD =>
-        {
+        LloydPath::HamerlySimd => {
             if verbose {
                 println!("    (Hamerly's bounds + SIMD assignment)");
             }
@@ -1949,15 +2135,15 @@ where
                 &mut centroids,
                 &mut centroid_norms,
                 n_centroids,
-                max_iters,
+                params.iters,
                 verbose,
             );
         }
-        Dist::Cosine if dim >= GEMM_DIM_THRESHOLD => {
+        LloydPath::GemmLloyd => {
             if verbose {
-                println!("    (GEMM assignment, no Hamerly -- cosine lacks triangle inequality)");
+                println!("    (GEMM assignment, no Hamerly)");
             }
-            gemm_lloyd_cosine(
+            gemm_lloyd(
                 data,
                 &data_norms,
                 dim,
@@ -1965,16 +2151,14 @@ where
                 &mut centroids,
                 &mut centroid_norms,
                 n_centroids,
-                max_iters,
+                metric,
+                params.iters,
                 verbose,
             );
         }
-        _ => {
+        LloydPath::ParallelLloyd => {
             if verbose {
-                println!(
-                    "    (direct SIMD assignment, dim={} below GEMM threshold, k={})",
-                    dim, n_centroids,
-                );
+                println!("    (direct SIMD assignment)");
             }
             parallel_lloyd(
                 data,
@@ -1985,13 +2169,13 @@ where
                 &mut centroid_norms,
                 n_centroids,
                 metric,
-                max_iters,
+                params.iters,
                 verbose,
             );
         }
     }
 
-    centroids
+    Ok(centroids)
 }
 
 /// Convert flat assignments to CSR (Compressed Sparse Row) layout
@@ -2179,7 +2363,7 @@ mod tests {
             &centroids,
             &centroid_norms,
             2,
-            &Dist::Euclidean,
+            &Dist::SquaredEuclidean,
         );
 
         assert_eq!(assignments, vec![0, 0, 1, 1]);
@@ -2285,7 +2469,8 @@ mod tests {
     fn test_train_centroids_small() {
         let data = vec![0.0, 0.0, 0.1, 0.1, 10.0, 10.0, 10.1, 10.1];
 
-        let centroids = train_centroids(&data, 2, 4, 2, &Dist::Euclidean, 10, 42, false);
+        let centroids =
+            train_centroids(&data, 2, 4, 2, &Dist::SquaredEuclidean, None, 42, false).unwrap();
 
         assert_eq!(centroids.len(), 4);
 
@@ -2318,7 +2503,7 @@ mod tests {
             &centroid_norms,
             2,
             2,
-            &Dist::Euclidean,
+            &Dist::SquaredEuclidean,
         );
 
         // Distance to (0,0) is 50, to (10,10) is 50, so min is 50
@@ -2338,7 +2523,8 @@ mod tests {
             })
             .collect();
 
-        let centroids = weighted_kmeans_plus_plus(&data, &data_norms, 2, 2, &Dist::Euclidean, 42);
+        let centroids =
+            weighted_kmeans_plus_plus(&data, &data_norms, 2, 2, &Dist::SquaredEuclidean, 42);
 
         assert_eq!(centroids.len(), 4);
 
@@ -2506,7 +2692,17 @@ mod tests {
             }
         }
 
-        let centroids = train_centroids(&data, dim, n, n_clusters, &Dist::Euclidean, 30, 42, false);
+        let centroids = train_centroids(
+            &data,
+            dim,
+            n,
+            n_clusters,
+            &Dist::SquaredEuclidean,
+            None,
+            42,
+            false,
+        )
+        .unwrap();
 
         assert_eq!(centroids.len(), n_clusters * dim);
 

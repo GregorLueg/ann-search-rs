@@ -1090,7 +1090,7 @@ macro_rules! impl_nndescent_gpu_query {
                 query_norm: $float,
                 k: usize,
                 ef: usize,
-            ) -> (Vec<usize>, Vec<$float>) {
+            ) -> Result<(Vec<usize>, Vec<$float>), AnnSearchErrors> {
                 QUERY_VISITED.with(|visited_cell| {
                     $cand_tls.with(|cand_cell| {
                         $res_tls.with(|res_cell| {
@@ -1104,7 +1104,7 @@ macro_rules! impl_nndescent_gpu_query {
                             results.clear();
 
                             match self.metric {
-                                Dist::Euclidean => self.query_euclidean(
+                                Dist::SquaredEuclidean => self.query_euclidean(
                                     query_vec,
                                     k,
                                     ef,
@@ -1121,6 +1121,7 @@ macro_rules! impl_nndescent_gpu_query {
                                     &mut candidates,
                                     &mut results,
                                 ),
+                                Dist::Manhattan => unreachable!(),
                             }
                         })
                     })
@@ -1136,7 +1137,7 @@ macro_rules! impl_nndescent_gpu_query {
                 visited: &mut FixedBitSet,
                 candidates: &mut BinaryHeap<Reverse<(OrderedFloat<$float>, usize)>>,
                 results: &mut BinaryHeap<(OrderedFloat<$float>, usize)>,
-            ) -> (Vec<usize>, Vec<$float>) {
+            ) -> Result<(Vec<usize>, Vec<$float>), AnnSearchErrors> {
                 let init_indices = self
                     .router
                     .find_entry_points(query_vec, (ef / 2).max(2 * k).min(self.n));
@@ -1195,10 +1196,10 @@ macro_rules! impl_nndescent_gpu_query {
                 final_results.sort_unstable_by(|a, b| a.0.cmp(&b.0));
                 final_results.truncate(k);
 
-                final_results
+                Ok(final_results
                     .into_iter()
                     .map(|(OrderedFloat(d), i)| (i, d))
-                    .unzip()
+                    .unzip())
             }
 
             #[inline(always)]
@@ -1211,7 +1212,7 @@ macro_rules! impl_nndescent_gpu_query {
                 visited: &mut FixedBitSet,
                 candidates: &mut BinaryHeap<Reverse<(OrderedFloat<$float>, usize)>>,
                 results: &mut BinaryHeap<(OrderedFloat<$float>, usize)>,
-            ) -> (Vec<usize>, Vec<$float>) {
+            ) -> Result<(Vec<usize>, Vec<$float>), AnnSearchErrors> {
                 let init_indices = self
                     .router
                     .find_entry_points(query_vec, (ef / 2).max(2 * k).min(self.n));
@@ -1270,10 +1271,23 @@ macro_rules! impl_nndescent_gpu_query {
                 final_results.sort_unstable_by(|a, b| a.0.cmp(&b.0));
                 final_results.truncate(k);
 
-                final_results
+                Ok(final_results
                     .into_iter()
                     .map(|(OrderedFloat(d), i)| (i, d))
-                    .unzip()
+                    .unzip())
+            }
+
+            #[inline(always)]
+            fn query_manhattan(
+                &self,
+                _query_vec: &[$float],
+                _k: usize,
+                _ef: usize,
+                _visited: &mut FixedBitSet,
+                _candidates: &mut BinaryHeap<Reverse<(OrderedFloat<$float>, usize)>>,
+                _results: &mut BinaryHeap<(OrderedFloat<$float>, usize)>,
+            ) -> Result<(Vec<usize>, Vec<$float>), AnnSearchErrors> {
+                unreachable!("NNDescentGpu does not support Manhattan distance")
             }
         }
     };
@@ -1307,7 +1321,7 @@ pub struct NNDescentGpu<T: AnnSearchFloat + AnnSearchGpuFloat, R: Runtime> {
     /// Pre-computed L2 norms (Cosine only; empty for Euclidean)
     pub norms: Vec<T>,
     /// Distance metric
-    pub metric: Dist,
+    metric: Dist,
     /// The medoid of the graph as entry point
     pub medoid: u32,
     /// True kNN graph of size n * k, sorted by distance per row.
@@ -1332,6 +1346,10 @@ pub struct NNDescentGpu<T: AnnSearchFloat + AnnSearchGpuFloat, R: Runtime> {
     norms_gpu: Option<GpuTensor<R, T>>,
 }
 
+////////////////////
+// VectorDistance //
+////////////////////
+
 /// VectorDistance implementation for NNDescentGPU
 impl<T, R> VectorDistance<T> for NNDescentGpu<T, R>
 where
@@ -1348,6 +1366,24 @@ where
         &self.norms
     }
 }
+
+/////////////////////////
+// DimensionValidation //
+/////////////////////////
+
+impl<T, R> DimensionValidation for NNDescentGpu<T, R>
+where
+    R: Runtime,
+    T: AnnSearchGpuFloat + AnnSearchFloat,
+{
+    fn dim(&self) -> usize {
+        self.dim
+    }
+}
+
+/////////////////////////
+// Main implementation //
+/////////////////////////
 
 impl<T, R> NNDescentGpu<T, R>
 where
@@ -1392,7 +1428,11 @@ where
         verbose: bool,
         retain_gpu: bool,
         device: R::Device,
-    ) -> Self {
+    ) -> Result<Self, AnnSearchErrors> {
+        if metric == Dist::Manhattan {
+            return Err(AnnSearchErrors::DistanceNotSupported(metric));
+        }
+
         let (vectors_flat, n, dim) = matrix_to_flat(data);
         let k = k.unwrap_or(30);
         let build_k = build_k.unwrap_or((1.5 * k as f32) as usize).max(k);
@@ -1829,11 +1869,12 @@ where
                         let a = &vectors_flat[i * dim..(i + 1) * dim];
                         let b = &vectors_flat[pid * dim..(pid + 1) * dim];
                         let dist = match metric {
-                            Dist::Euclidean => T::euclidean_simd(a, b),
+                            Dist::SquaredEuclidean => T::euclidean_simd(a, b),
                             Dist::Cosine => {
                                 let dot = T::dot_simd(a, b);
                                 T::one() - dot / (norms[i] * norms[pid])
                             }
+                            Dist::Manhattan => unreachable!(),
                         };
                         slot[j] = (pid, dist);
                     }
@@ -1854,7 +1895,7 @@ where
             (None, None, None)
         };
 
-        Self {
+        Ok(Self {
             vectors_flat,
             dim,
             dim_padded,
@@ -1871,7 +1912,7 @@ where
             vectors_gpu,
             norms_gpu,
             _device: device,
-        }
+        })
     }
 
     ///////////
@@ -1895,7 +1936,7 @@ where
         query_vec: &[T],
         k: usize,
         ef_search: Option<usize>,
-    ) -> (Vec<usize>, Vec<T>) {
+    ) -> Result<(Vec<usize>, Vec<T>), AnnSearchErrors> {
         let k = k.min(self.n);
         let ef = ef_search.unwrap_or_else(|| (k * 2).clamp(50, 200)).max(k);
 
@@ -1928,7 +1969,7 @@ where
         query_row: RowRef<T>,
         k: usize,
         ef_search: Option<usize>,
-    ) -> (Vec<usize>, Vec<T>) {
+    ) -> Result<(Vec<usize>, Vec<T>), AnnSearchErrors> {
         if query_row.col_stride() == 1 {
             let slice =
                 unsafe { std::slice::from_raw_parts(query_row.as_ptr(), query_row.ncols()) };
@@ -1964,15 +2005,13 @@ where
         query_params: Option<CagraGpuSearchParams>,
         k: usize,
         seed: usize,
-    ) -> (Vec<Vec<usize>>, Vec<Vec<T>>)
+    ) -> KnnResult<T>
     where
         T: AnnSearchGpuFloat + num_traits::Float,
     {
-        assert_eq!(
-            queries_flat.len(),
-            n_queries * self.dim,
-            "queries_flat length must be n_queries * dim"
-        );
+        let dim_query = queries_flat.len() / n_queries;
+
+        self.check_dim(dim_query)?;
 
         let query_params =
             query_params.unwrap_or_else(|| CagraGpuSearchParams::from_graph(k, self.k));
@@ -1990,7 +2029,7 @@ where
 
                 candidates.sort_unstable_by(|&a, &b| {
                     let dist_a = match self.metric {
-                        Dist::Euclidean => {
+                        Dist::SquaredEuclidean => {
                             let va = &self.vectors_flat[a * self.dim..(a + 1) * self.dim];
                             T::euclidean_simd(query, va)
                         }
@@ -2000,9 +2039,10 @@ where
                             let q_norm = T::calculate_l2_norm(query);
                             T::one() - dot / (q_norm * self.norms[a])
                         }
+                        Dist::Manhattan => unreachable!(),
                     };
                     let dist_b = match self.metric {
-                        Dist::Euclidean => {
+                        Dist::SquaredEuclidean => {
                             let vb = &self.vectors_flat[b * self.dim..(b + 1) * self.dim];
                             T::euclidean_simd(query, vb)
                         }
@@ -2012,6 +2052,7 @@ where
                             let q_norm = T::calculate_l2_norm(query);
                             T::one() - dot / (q_norm * self.norms[b])
                         }
+                        Dist::Manhattan => unreachable!(),
                     };
                     dist_a
                         .partial_cmp(&dist_b)
@@ -2046,7 +2087,8 @@ where
             Some(&entry_flat),
             &client,
         );
-        result
+
+        Ok(result)
     }
 
     ///////////
@@ -2294,7 +2336,7 @@ mod tests {
 
         let index = NNDescentGpu::<f32, WgpuRuntime>::build(
             data.as_ref(),
-            Dist::Euclidean,
+            Dist::SquaredEuclidean,
             Some(5),
             None,
             Some(10),
@@ -2306,7 +2348,8 @@ mod tests {
             false,
             false,
             device,
-        );
+        )
+        .unwrap();
 
         assert_eq!(index.nav_graph.len(), 20 * 5);
         for i in 0..20 {
@@ -2341,7 +2384,8 @@ mod tests {
             false,
             false,
             device,
-        );
+        )
+        .unwrap();
 
         assert_eq!(index.nav_graph.len(), 16 * 3);
         assert!(!index.norms.is_empty());
@@ -2358,7 +2402,7 @@ mod tests {
 
         let index = NNDescentGpu::<f32, WgpuRuntime>::build(
             data.as_ref(),
-            Dist::Euclidean,
+            Dist::SquaredEuclidean,
             Some(3),
             None,
             Some(10),
@@ -2370,7 +2414,8 @@ mod tests {
             false,
             false,
             device,
-        );
+        )
+        .unwrap();
 
         assert_eq!(index.dim, 3);
         assert_eq!(index.nav_graph.len(), 12 * 3);
@@ -2387,7 +2432,7 @@ mod tests {
 
         let index = NNDescentGpu::<f32, WgpuRuntime>::build(
             data.as_ref(),
-            Dist::Euclidean,
+            Dist::SquaredEuclidean,
             Some(5),
             None,
             Some(10),
@@ -2399,7 +2444,8 @@ mod tests {
             false,
             false,
             device,
-        );
+        )
+        .unwrap();
 
         let (indices, Some(distances)) = index.extract_knn(true) else {
             panic!("Expected distances");
@@ -3202,7 +3248,7 @@ mod kernel_tests {
 
         let index = NNDescentGpu::<f32, WgpuRuntime>::build(
             data.as_ref(),
-            Dist::Euclidean,
+            Dist::SquaredEuclidean,
             Some(k),
             None,
             Some(15),
@@ -3214,7 +3260,8 @@ mod kernel_tests {
             true,
             false,
             device,
-        );
+        )
+        .unwrap();
 
         let (knn_indices, _) = index.extract_knn(false);
 

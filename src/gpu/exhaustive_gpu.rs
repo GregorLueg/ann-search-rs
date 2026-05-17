@@ -33,6 +33,24 @@ pub struct ExhaustiveIndexGpu<T: Float, R: Runtime> {
     device: R::Device,
 }
 
+/////////////////////////
+// DimensionValidation //
+/////////////////////////
+
+impl<T, R> DimensionValidation for ExhaustiveIndexGpu<T, R>
+where
+    R: Runtime,
+    T: AnnSearchGpuFloat + AnnSearchFloat,
+{
+    fn dim(&self) -> usize {
+        self.dim
+    }
+}
+
+/////////////////////////
+// Main implementation //
+/////////////////////////
+
 impl<T, R> ExhaustiveIndexGpu<T, R>
 where
     R: Runtime,
@@ -49,7 +67,11 @@ where
     /// ### Returns
     ///
     /// Initialised exhaustive index (on GPU)
-    pub fn new(data: MatRef<T>, metric: Dist, device: R::Device) -> Self {
+    pub fn new(data: MatRef<T>, metric: Dist, device: R::Device) -> Result<Self, AnnSearchErrors> {
+        if metric == Dist::Manhattan {
+            return Err(AnnSearchErrors::DistanceNotSupported(metric));
+        }
+
         let (vectors_flat, n, dim) = matrix_to_flat(data);
 
         let line = LINE_SIZE as usize;
@@ -74,7 +96,7 @@ where
             Vec::new()
         };
 
-        Self {
+        Ok(Self {
             vectors_flat: vectors_padded,
             norms,
             dim,
@@ -82,7 +104,7 @@ where
             n,
             metric,
             device,
-        }
+        })
     }
 
     /// Query the exhaustive index
@@ -97,17 +119,9 @@ where
     /// ### Returns
     ///
     /// A tuple of `(Vec<indices>, Vec<distances>)`
-    pub fn query_batch(
-        &self,
-        query_mat: MatRef<T>,
-        k: usize,
-        verbose: bool,
-    ) -> (Vec<Vec<usize>>, Vec<Vec<T>>) {
+    pub fn query_batch(&self, query_mat: MatRef<T>, k: usize, verbose: bool) -> KnnResult<T> {
         let (vectors_query, n_query, dim_query) = matrix_to_flat(query_mat);
-        assert!(
-            self.dim == dim_query,
-            "The query matrix has not the same dimensionality as the index"
-        );
+        self.check_dim(dim_query)?;
 
         let dim_padded = self.dim_padded;
         let vectors_query_padded = if dim_padded != self.dim {
@@ -132,7 +146,7 @@ where
         let query_data = BatchData::new(&vectors_query_padded, &query_norms, n_query);
         let db_data = BatchData::new(&self.vectors_flat, &self.norms, self.n);
 
-        query_batch_gpu::<T, R>(
+        Ok(query_batch_gpu::<T, R>(
             k,
             &query_data,
             &db_data,
@@ -140,7 +154,7 @@ where
             &self.metric,
             self.device.clone(),
             verbose,
-        )
+        ))
     }
 
     /// Generate kNN graph from vectors stored in the index
@@ -214,12 +228,16 @@ mod tests {
         // 8 samples, 4 dimensions
         let data = Mat::from_fn(8, 4, |i, j| if i == j { 1.0_f32 } else { 0.0_f32 });
 
-        let index =
-            ExhaustiveIndexGpu::<f32, CpuRuntime>::new(data.as_ref(), Dist::Euclidean, device);
+        let index = ExhaustiveIndexGpu::<f32, CpuRuntime>::new(
+            data.as_ref(),
+            Dist::SquaredEuclidean,
+            device,
+        )
+        .unwrap();
 
         let query = Mat::from_fn(2, 4, |i, j| if i == j { 1.0_f32 } else { 0.0_f32 });
 
-        let (indices, distances) = index.query_batch(query.as_ref(), 3, false);
+        let (indices, distances) = index.query_batch(query.as_ref(), 3, false).unwrap();
 
         assert_eq!(indices.len(), 2);
         assert_eq!(distances.len(), 2);
@@ -236,10 +254,11 @@ mod tests {
 
         let data = Mat::from_fn(4, 4, |i, _j| i as f32 + 1.0);
 
-        let index = ExhaustiveIndexGpu::<f32, CpuRuntime>::new(data.as_ref(), Dist::Cosine, device);
+        let index = ExhaustiveIndexGpu::<f32, CpuRuntime>::new(data.as_ref(), Dist::Cosine, device)
+            .unwrap();
 
         let query = Mat::from_fn(1, 4, |_, _| 1.0_f32);
-        let (indices, distances) = index.query_batch(query.as_ref(), 2, false);
+        let (indices, distances) = index.query_batch(query.as_ref(), 2, false).unwrap();
 
         assert_eq!(indices.len(), 1);
         assert_eq!(indices[0].len(), 2);
@@ -252,8 +271,12 @@ mod tests {
 
         let data = Mat::from_fn(6, 4, |i, j| if i == j { 1.0_f32 } else { 0.1_f32 });
 
-        let index =
-            ExhaustiveIndexGpu::<f32, CpuRuntime>::new(data.as_ref(), Dist::Euclidean, device);
+        let index = ExhaustiveIndexGpu::<f32, CpuRuntime>::new(
+            data.as_ref(),
+            Dist::SquaredEuclidean,
+            device,
+        )
+        .unwrap();
 
         let (indices, distances) = index.generate_knn(3, true, false);
 

@@ -98,6 +98,16 @@ where
     }
 }
 
+/////////////////////////
+// DimensionValidation //
+/////////////////////////
+
+impl<T> DimensionValidation for IvfIndexBf16<T> {
+    fn dim(&self) -> usize {
+        self.dim
+    }
+}
+
 ////////////////
 // Main index //
 ////////////////
@@ -128,7 +138,9 @@ where
     /// * `data` - Matrix reference with vectors as rows (n × dim)
     /// * `metric` - Distance metric (Euclidean or Cosine)
     /// * `nlist` - Optional number of clusters. Defaults to `sqrt(n)`.
-    /// * `max_iters` - Optional maximum k-means iterations (defaults to `50`).
+    /// * `k_means_params` - Optional k-means trainings parameters, see
+    ///   [KMeansTrainingParams]. If not provided, will default to sensible
+    ///   defaults.
     /// * `seed` - Random seed for reproducibility
     /// * `verbose` - Print training progress
     ///
@@ -139,10 +151,14 @@ where
         data: MatRef<T>,
         metric: Dist,
         nlist: Option<usize>,
-        max_iters: Option<usize>,
+        k_means_params: Option<KMeansTrainingParams>,
         seed: usize,
         verbose: bool,
-    ) -> Self {
+    ) -> Result<Self, AnnSearchErrors> {
+        if metric == Dist::Manhattan {
+            return Err(AnnSearchErrors::DistanceNotSupported(metric));
+        }
+
         let (vectors_flat, n, dim) = matrix_to_flat(data);
 
         // Compute norms for Cosine distance
@@ -158,7 +174,6 @@ where
             Vec::new()
         };
 
-        let max_iters = max_iters.unwrap_or(30);
         let nlist = nlist.unwrap_or((n as f32).sqrt() as usize).max(1);
 
         // 1. subsample training data
@@ -176,10 +191,10 @@ where
             n_train,
             nlist,
             &metric,
-            max_iters,
+            k_means_params,
             seed,
             verbose,
-        );
+        )?;
 
         let centroids_norm = if metric == Dist::Cosine {
             (0..nlist)
@@ -215,10 +230,6 @@ where
             &metric,
         );
 
-        if verbose {
-            print_cluster_summary(&assignments, nlist);
-        }
-
         // 4. generate a flat version for better cache locality
         let (all_indices, offsets) = build_csr_layout(assignments, n, nlist);
 
@@ -238,7 +249,8 @@ where
 
         let new_to_old = idx.optimise_memory_layout();
         idx.original_ids = new_to_old;
-        idx
+
+        Ok(idx)
     }
 
     ///////////
@@ -262,7 +274,14 @@ where
     ///
     /// Tuple of `(indices, distances)` sorted by distance (nearest first)
     #[inline]
-    pub fn query(&self, query_vec: &[T], k: usize, nprobe: Option<usize>) -> (Vec<usize>, Vec<T>) {
+    pub fn query(
+        &self,
+        query_vec: &[T],
+        k: usize,
+        nprobe: Option<usize>,
+    ) -> Result<(Vec<usize>, Vec<T>), AnnSearchErrors> {
+        self.check_dim(query_vec.len())?;
+
         let nprobe = nprobe
             .unwrap_or_else(|| ((self.nlist as f64).sqrt() as usize).max(1))
             .min(self.nlist);
@@ -289,10 +308,13 @@ where
 
             for vec_idx in start..end {
                 let dist = match self.metric {
-                    Dist::Euclidean => self.euclidean_distance_to_query_bf16(vec_idx, query_vec),
+                    Dist::SquaredEuclidean => {
+                        self.euclidean_distance_to_query_bf16(vec_idx, query_vec)
+                    }
                     Dist::Cosine => {
                         self.cosine_distance_to_query_bf16(vec_idx, query_vec, query_norm)
                     }
+                    Dist::Manhattan => unreachable!(),
                 };
                 buffer.insert((OrderedFloat(dist), vec_idx), k);
             }
@@ -303,7 +325,8 @@ where
             .iter()
             .map(|(d, i)| (d.0, self.original_ids[*i]))
             .unzip();
-        (indices, distances)
+
+        Ok((indices, distances))
     }
 
     /// Query the index for approximate nearest neighbours
@@ -327,7 +350,7 @@ where
         query_row: RowRef<T>,
         k: usize,
         nprobe: Option<usize>,
-    ) -> (Vec<usize>, Vec<T>) {
+    ) -> Result<(Vec<usize>, Vec<T>), AnnSearchErrors> {
         if query_row.col_stride() == 1 {
             let slice =
                 unsafe { std::slice::from_raw_parts(query_row.as_ptr(), query_row.ncols()) };
@@ -452,7 +475,7 @@ where
 
             for vec_idx in start..end {
                 let dist = match self.metric {
-                    Dist::Euclidean => {
+                    Dist::SquaredEuclidean => {
                         self.euclidean_distance_to_query_dual_bf16(vec_idx, query_vec)
                     }
                     Dist::Cosine => self.cosine_distance_to_query_dual_bf16(
@@ -460,6 +483,7 @@ where
                         query_vec,
                         bf16::from_f32(query_norm.to_f32().unwrap()),
                     ),
+                    Dist::Manhattan => unreachable!(),
                 };
                 buffer.insert((OrderedFloat(dist), vec_idx), k);
             }
@@ -542,6 +566,10 @@ mod tests {
     use faer_traits::ComplexField;
     use num_traits::{Float, FromPrimitive};
 
+    fn get_default_k_means() -> Option<KMeansTrainingParams> {
+        Some(KMeansTrainingParams::new(10, None, None))
+    }
+
     fn create_test_data<T: Float + FromPrimitive + ComplexField>(n: usize, dim: usize) -> Mat<T> {
         let mut data = Mat::zeros(n, dim);
         for i in 0..n {
@@ -557,12 +585,13 @@ mod tests {
         let data = create_test_data::<f32>(200, 32);
         let index = IvfIndexBf16::build(
             data.as_ref(),
-            Dist::Euclidean,
+            Dist::SquaredEuclidean,
             Some(10),
-            Some(10),
+            get_default_k_means(),
             42,
             false,
-        );
+        )
+        .unwrap();
 
         assert_eq!(index.n, 200);
         assert_eq!(index.dim, 32);
@@ -574,7 +603,15 @@ mod tests {
     #[test]
     fn test_ivf_bf16_construction_cosine() {
         let data = create_test_data::<f32>(200, 32);
-        let index = IvfIndexBf16::build(data.as_ref(), Dist::Cosine, Some(10), Some(10), 42, false);
+        let index = IvfIndexBf16::build(
+            data.as_ref(),
+            Dist::Cosine,
+            Some(10),
+            get_default_k_means(),
+            42,
+            false,
+        )
+        .unwrap();
 
         assert_eq!(index.n, 200);
         assert_eq!(index.dim, 32);
@@ -587,15 +624,16 @@ mod tests {
         let data = create_test_data::<f32>(200, 32);
         let index = IvfIndexBf16::build(
             data.as_ref(),
-            Dist::Euclidean,
+            Dist::SquaredEuclidean,
             Some(10),
-            Some(10),
+            get_default_k_means(),
             42,
             false,
-        );
+        )
+        .unwrap();
 
         let query: Vec<f32> = (0..32).map(|i| i as f32 * 0.1).collect();
-        let (indices, distances) = index.query(&query, 10, Some(10));
+        let (indices, distances) = index.query(&query, 10, Some(10)).unwrap();
 
         assert_eq!(indices.len(), 10);
         assert_eq!(distances.len(), 10);
@@ -606,15 +644,16 @@ mod tests {
         let data = create_test_data::<f32>(200, 32);
         let index = IvfIndexBf16::build(
             data.as_ref(),
-            Dist::Euclidean,
+            Dist::SquaredEuclidean,
             Some(10),
-            Some(10),
+            get_default_k_means(),
             42,
             false,
-        );
+        )
+        .unwrap();
 
         let query: Vec<f32> = (0..32).map(|i| i as f32 * 0.1).collect();
-        let (_, distances) = index.query(&query, 10, Some(10));
+        let (_, distances) = index.query(&query, 10, Some(10)).unwrap();
 
         for i in 1..distances.len() {
             assert!(distances[i] >= distances[i - 1]);
@@ -626,14 +665,15 @@ mod tests {
         let data = create_test_data::<f32>(200, 32);
         let index = IvfIndexBf16::build(
             data.as_ref(),
-            Dist::Euclidean,
+            Dist::SquaredEuclidean,
             Some(10),
-            Some(10),
+            get_default_k_means(),
             42,
             false,
-        );
+        )
+        .unwrap();
 
-        let (indices, distances) = index.query_row(data.as_ref().row(0), 10, Some(10));
+        let (indices, distances) = index.query_row(data.as_ref().row(0), 10, Some(10)).unwrap();
 
         assert!(indices.len() <= 10);
         assert!(distances.len() <= 10);
@@ -643,10 +683,18 @@ mod tests {
     #[test]
     fn test_ivf_bf16_query_cosine() {
         let data = create_test_data::<f32>(200, 32);
-        let index = IvfIndexBf16::build(data.as_ref(), Dist::Cosine, Some(10), Some(10), 42, false);
+        let index = IvfIndexBf16::build(
+            data.as_ref(),
+            Dist::Cosine,
+            Some(10),
+            get_default_k_means(),
+            42,
+            false,
+        )
+        .unwrap();
 
         let query: Vec<f32> = (0..32).map(|i| i as f32 * 0.1).collect();
-        let (indices, distances) = index.query(&query, 10, Some(10));
+        let (indices, distances) = index.query(&query, 10, Some(10)).unwrap();
 
         assert_eq!(indices.len(), 10);
         assert_eq!(distances.len(), 10);
@@ -660,12 +708,13 @@ mod tests {
         let data = create_test_data::<f32>(100, 32);
         let index = IvfIndexBf16::build(
             data.as_ref(),
-            Dist::Euclidean,
+            Dist::SquaredEuclidean,
             Some(10),
-            Some(10),
+            get_default_k_means(),
             42,
             false,
-        );
+        )
+        .unwrap();
 
         let (knn_indices, knn_distances) = index.generate_knn(5, Some(10), true, false);
 
@@ -682,16 +731,17 @@ mod tests {
         let data = create_test_data::<f32>(500, 32);
         let index = IvfIndexBf16::build(
             data.as_ref(),
-            Dist::Euclidean,
+            Dist::SquaredEuclidean,
             Some(20),
-            Some(10),
+            get_default_k_means(),
             42,
             false,
-        );
+        )
+        .unwrap();
 
         let query: Vec<f32> = (0..32).map(|i| i as f32 * 0.1).collect();
-        let (indices1, _) = index.query(&query, 10, Some(2));
-        let (indices2, _) = index.query(&query, 10, Some(10));
+        let (indices1, _) = index.query(&query, 10, Some(2)).unwrap();
+        let (indices2, _) = index.query(&query, 10, Some(10)).unwrap();
 
         assert!(indices1.len() <= 10);
         assert!(indices2.len() <= 10);

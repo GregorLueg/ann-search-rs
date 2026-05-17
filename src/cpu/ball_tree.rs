@@ -82,17 +82,20 @@ where
     for &idx in indices {
         let vec = &data[idx * dim..(idx + 1) * dim];
         let vec_norm = match metric {
-            Dist::Euclidean => T::zero(),
+            Dist::SquaredEuclidean => T::zero(),
             Dist::Cosine => T::calculate_l2_norm(vec),
+            Dist::Manhattan => unreachable!(),
         };
 
         let d1 = match metric {
-            Dist::Euclidean => euclidean_distance_static(vec, pivot_1),
+            Dist::SquaredEuclidean => euclidean_distance_static(vec, pivot_1),
             Dist::Cosine => cosine_distance_static_norm(vec, pivot_1, &vec_norm, &norm_pivot_1),
+            Dist::Manhattan => unreachable!(),
         };
         let d2 = match metric {
-            Dist::Euclidean => euclidean_distance_static(vec, pivot_2),
+            Dist::SquaredEuclidean => euclidean_distance_static(vec, pivot_2),
             Dist::Cosine => cosine_distance_static_norm(vec, pivot_2, &vec_norm, &norm_pivot_2),
+            Dist::Manhattan => unreachable!(),
         };
 
         if d1 <= d2 {
@@ -160,11 +163,12 @@ where
     for &idx in indices {
         let vec = &data[idx * dim..(idx + 1) * dim];
         let dist = match metric {
-            Dist::Euclidean => euclidean_distance_static(center, vec),
+            Dist::SquaredEuclidean => euclidean_distance_static(center, vec),
             Dist::Cosine => {
                 let vec_norm = T::calculate_l2_norm(vec);
                 cosine_distance_static_norm(center, vec, &center_norm, &vec_norm)
             }
+            Dist::Manhattan => unreachable!(),
         };
         if dist > max_dist {
             max_dist = dist;
@@ -276,6 +280,20 @@ where
     }
 }
 
+/////////////////////////
+// DimensionValidation //
+/////////////////////////
+
+impl<T> DimensionValidation for BallTreeIndex<T> {
+    fn dim(&self) -> usize {
+        self.dim
+    }
+}
+
+/////////////////////////
+// Main implementation //
+/////////////////////////
+
 impl<T> BallTreeIndex<T>
 where
     T: AnnSearchFloat,
@@ -297,7 +315,11 @@ where
     /// ### Returns
     ///
     /// Index ready for querying
-    pub fn new(data: MatRef<T>, metric: Dist, seed: usize) -> Self {
+    pub fn new(data: MatRef<T>, metric: Dist, seed: usize) -> Result<Self, AnnSearchErrors> {
+        if metric == Dist::Manhattan {
+            return Err(AnnSearchErrors::DistanceNotSupported(metric));
+        }
+
         let (vectors_flat, n, dim) = matrix_to_flat(data);
 
         let norms = if metric == Dist::Cosine {
@@ -322,7 +344,7 @@ where
             &mut rng,
             metric,
             max_parallel_depth,
-        );
+        )?;
 
         let mut nodes = Vec::new();
         let mut centers_data = Vec::new();
@@ -350,7 +372,7 @@ where
             Vec::new()
         };
 
-        BallTreeIndex {
+        Ok(BallTreeIndex {
             nodes,
             root,
             centers_data,
@@ -362,7 +384,7 @@ where
             norms,
             metric,
             original_ids: (0..n).collect(),
-        }
+        })
     }
 
     /// Build a local node
@@ -387,7 +409,7 @@ where
         rng: &mut StdRng,
         metric: Dist,
         max_parallel_depth: usize,
-    ) -> Vec<BuildNode<T>> {
+    ) -> Result<Vec<BuildNode<T>>, AnnSearchErrors> {
         let mut nodes = Vec::new();
         Self::build_node_local(
             vectors_flat,
@@ -398,8 +420,8 @@ where
             metric,
             0,
             max_parallel_depth,
-        );
-        nodes
+        )?;
+        Ok(nodes)
     }
 
     /// Build a local node
@@ -424,11 +446,11 @@ where
         metric: Dist,
         depth: usize,
         max_parallel_depth: usize,
-    ) -> usize {
+    ) -> Result<usize, AnnSearchErrors> {
         if items.len() <= LEAF_MIN_MEMBERS {
             let node_idx = nodes.len();
             nodes.push(BuildNode::Leaf { items });
-            return node_idx;
+            return Ok(node_idx);
         }
 
         let (center, left_items, right_items) = if items.len() > 500 {
@@ -463,16 +485,18 @@ where
                 })
                 .collect();
 
+            let k_means_params = KMeansTrainingParams::new(5, None, None);
+
             let centroids = train_centroids(
                 &sample_data,
                 dim,
                 items.len(),
                 2,
                 &metric,
-                5,
+                Some(k_means_params),
                 (rng.random::<f32>() * 100.0) as usize,
                 false,
-            );
+            )?;
 
             let sample_norms = if metric == Dist::Cosine {
                 (0..items.len())
@@ -505,22 +529,26 @@ where
                 let vec_norm = &sample_norms[i];
 
                 let d0 = match metric {
-                    Dist::Euclidean => euclidean_distance_static(vec, &centroids[0..dim]),
+                    Dist::SquaredEuclidean => euclidean_distance_static(vec, &centroids[0..dim]),
                     Dist::Cosine => cosine_distance_static_norm(
                         vec,
                         &centroids[0..dim],
                         vec_norm,
                         &centroid_norms[0],
                     ),
+                    Dist::Manhattan => unreachable!(),
                 };
                 let d1 = match metric {
-                    Dist::Euclidean => euclidean_distance_static(vec, &centroids[dim..2 * dim]),
+                    Dist::SquaredEuclidean => {
+                        euclidean_distance_static(vec, &centroids[dim..2 * dim])
+                    }
                     Dist::Cosine => cosine_distance_static_norm(
                         vec,
                         &centroids[dim..2 * dim],
                         vec_norm,
                         &centroid_norms[1],
                     ),
+                    Dist::Manhattan => unreachable!(),
                 };
 
                 if d0 <= d1 {
@@ -554,7 +582,7 @@ where
             let seed_left = rng.random();
             let seed_right = rng.random();
 
-            let (mut left_tree, mut right_tree) = rayon::join(
+            let (left_result, right_result) = rayon::join(
                 || {
                     let mut left_rng = rand::rngs::StdRng::seed_from_u64(seed_left);
                     Self::build_subtree(
@@ -581,6 +609,9 @@ where
                 },
             );
 
+            let mut left_tree = left_result?;
+            let mut right_tree = right_result?;
+
             let left_offset = nodes.len();
             Self::adjust_subtree_indices(&mut left_tree, left_offset);
             nodes.extend(left_tree);
@@ -600,7 +631,7 @@ where
                 metric,
                 depth + 1,
                 max_parallel_depth,
-            );
+            )?;
             let right_idx = Self::build_node_local(
                 vectors_flat,
                 dim,
@@ -610,7 +641,7 @@ where
                 metric,
                 depth + 1,
                 max_parallel_depth,
-            );
+            )?;
             (left_idx, right_idx)
         };
 
@@ -624,7 +655,7 @@ where
             *right = right_idx;
         }
 
-        node_idx
+        Ok(node_idx)
     }
 
     /// Helper function to recursively build the sub trees
@@ -647,7 +678,7 @@ where
         metric: Dist,
         depth: usize,
         max_parallel_depth: usize,
-    ) -> Vec<BuildNode<T>> {
+    ) -> Result<Vec<BuildNode<T>>, AnnSearchErrors> {
         let mut nodes = Vec::new();
         Self::build_node_local(
             vectors_flat,
@@ -658,8 +689,8 @@ where
             metric,
             depth,
             max_parallel_depth,
-        );
-        nodes
+        )?;
+        Ok(nodes)
     }
 
     /// Flatten the tree structures
@@ -763,7 +794,9 @@ where
         query_vec: &[T],
         k: usize,
         search_k: Option<usize>,
-    ) -> (Vec<usize>, Vec<T>) {
+    ) -> Result<(Vec<usize>, Vec<T>), AnnSearchErrors> {
+        self.check_dim(query_vec.len())?;
+
         let limit = search_k.unwrap_or((self.n as f32 * 0.05) as usize);
         let mut visited_count = 0;
 
@@ -815,11 +848,12 @@ where
                         };
 
                         let dist = match self.metric {
-                            Dist::Euclidean => T::euclidean_simd(query_vec, vec),
+                            Dist::SquaredEuclidean => T::euclidean_simd(query_vec, vec),
                             Dist::Cosine => {
                                 let norm = unsafe { *self.norms.get_unchecked(item) };
                                 T::one() - T::dot_simd(query_vec, vec) / (query_norm * norm)
                             }
+                            Dist::Manhattan => unreachable!(),
                         };
 
                         if dist < kth_dist || top_k.len() < k {
@@ -842,7 +876,7 @@ where
                     };
 
                     let dist_to_left = match self.metric {
-                        Dist::Euclidean => T::euclidean_simd(query_vec, left_center),
+                        Dist::SquaredEuclidean => T::euclidean_simd(query_vec, left_center),
                         Dist::Cosine => {
                             let left_norm = unsafe {
                                 *self
@@ -852,6 +886,7 @@ where
                             T::one()
                                 - T::dot_simd(query_vec, left_center) / (query_norm * left_norm)
                         }
+                        Dist::Manhattan => unreachable!(),
                     };
 
                     let right_center_offset = right_node.center_idx as usize * self.dim;
@@ -861,7 +896,7 @@ where
                     };
 
                     let dist_to_right = match self.metric {
-                        Dist::Euclidean => T::euclidean_simd(query_vec, right_center),
+                        Dist::SquaredEuclidean => T::euclidean_simd(query_vec, right_center),
                         Dist::Cosine => {
                             let right_norm = unsafe {
                                 *self
@@ -871,6 +906,7 @@ where
                             T::one()
                                 - T::dot_simd(query_vec, right_center) / (query_norm * right_norm)
                         }
+                        Dist::Manhattan => unreachable!(),
                     };
 
                     let (closer, farther, farther_dist, farther_radius) =
@@ -898,7 +934,7 @@ where
             .map(|(OrderedFloat(dist), idx)| (*idx, *dist))
             .collect();
 
-        results.into_iter().unzip()
+        Ok(results.into_iter().unzip())
     }
 
     /// Query the index with row references
@@ -921,7 +957,7 @@ where
         query_row: RowRef<T>,
         k: usize,
         search_k: Option<usize>,
-    ) -> (Vec<usize>, Vec<T>) {
+    ) -> Result<(Vec<usize>, Vec<T>), AnnSearchErrors> {
         if query_row.col_stride() == 1 {
             let slice =
                 unsafe { std::slice::from_raw_parts(query_row.as_ptr(), query_row.ncols()) };
@@ -951,7 +987,7 @@ where
         search_k: Option<usize>,
         return_dist: bool,
         verbose: bool,
-    ) -> (Vec<Vec<usize>>, Option<Vec<Vec<T>>>) {
+    ) -> KnnOptionResult<T> {
         use std::sync::{
             atomic::{AtomicUsize, Ordering},
             Arc,
@@ -979,14 +1015,14 @@ where
 
                 self.query(vec, k, search_k)
             })
-            .collect();
+            .collect::<Result<Vec<_>, AnnSearchErrors>>()?;
 
         if return_dist {
             let (indices, distances) = results.into_iter().unzip();
-            (indices, Some(distances))
+            Ok((indices, Some(distances)))
         } else {
             let indices: Vec<Vec<usize>> = results.into_iter().map(|(idx, _)| idx).collect();
-            (indices, None)
+            Ok((indices, None))
         }
     }
 
@@ -1015,12 +1051,20 @@ impl<T> KnnValidation<T> for BallTreeIndex<T>
 where
     T: AnnSearchFloat,
 {
-    fn query_for_validation(&self, query_vec: &[T], k: usize) -> (Vec<usize>, Vec<T>) {
+    fn query_for_validation(
+        &self,
+        query_vec: &[T],
+        k: usize,
+    ) -> Result<(Vec<usize>, Vec<T>), AnnSearchErrors> {
         self.query(query_vec, k, None)
     }
 
     fn n(&self) -> usize {
         self.n
+    }
+
+    fn dim(&self) -> usize {
+        self.dim
     }
 
     fn metric(&self) -> Dist {
@@ -1057,18 +1101,18 @@ mod tests {
     #[test]
     fn test_ball_tree_index_creation() {
         let mat = create_simple_matrix();
-        let _ = BallTreeIndex::new(mat.as_ref(), Dist::Euclidean, 42);
+        let _ = BallTreeIndex::new(mat.as_ref(), Dist::SquaredEuclidean, 42);
     }
 
     #[test]
     fn test_ball_tree_query_finds_self() {
         let mat = create_simple_matrix();
-        let index = BallTreeIndex::new(mat.as_ref(), Dist::Euclidean, 42);
+        let index = BallTreeIndex::new(mat.as_ref(), Dist::SquaredEuclidean, 42).unwrap();
 
         // Query with point 0, should find itself first
         let query = vec![1.0, 0.0, 0.0];
         // FIX: Pass explicit search_k (5) because default 5% of 5 is 0
-        let (indices, distances) = index.query(&query, 1, Some(5));
+        let (indices, distances) = index.query(&query, 1, Some(5)).unwrap();
 
         assert_eq!(indices.len(), 1);
         assert_eq!(indices[0], 0);
@@ -1078,11 +1122,11 @@ mod tests {
     #[test]
     fn test_ball_tree_query_euclidean() {
         let mat = create_simple_matrix();
-        let index = BallTreeIndex::new(mat.as_ref(), Dist::Euclidean, 42);
+        let index = BallTreeIndex::new(mat.as_ref(), Dist::SquaredEuclidean, 42).unwrap();
 
         let query = vec![1.0, 0.0, 0.0];
         // FIX: Pass explicit search_k
-        let (indices, distances) = index.query(&query, 3, Some(5));
+        let (indices, distances) = index.query(&query, 3, Some(5)).unwrap();
 
         // Should find point 0 first (exact match)
         assert_eq!(indices[0], 0);
@@ -1099,11 +1143,11 @@ mod tests {
         use crate::prelude::*;
 
         let mat = create_simple_matrix();
-        let index = BallTreeIndex::new(mat.as_ref(), Dist::Cosine, 42);
+        let index = BallTreeIndex::new(mat.as_ref(), Dist::Cosine, 42).unwrap();
 
         let query = vec![1.0, 0.0, 0.0];
         // FIX: Pass explicit search_k
-        let (indices, distances) = index.query(&query, 3, Some(5));
+        let (indices, distances) = index.query(&query, 3, Some(5)).unwrap();
 
         // Should find point 0 first (identical direction)
         assert_eq!(indices[0], 0);
@@ -1115,12 +1159,12 @@ mod tests {
         use crate::prelude::*;
 
         let mat = create_simple_matrix();
-        let index = BallTreeIndex::new(mat.as_ref(), Dist::Euclidean, 42);
+        let index = BallTreeIndex::new(mat.as_ref(), Dist::SquaredEuclidean, 42).unwrap();
 
         let query = vec![1.0, 0.0, 0.0];
         // ask for 10 neighbours but only 5 points exist
         // FIX: Pass explicit search_k
-        let (indices, _) = index.query(&query, 10, Some(5));
+        let (indices, _) = index.query(&query, 10, Some(5)).unwrap();
 
         // Should return at most 5 results
         assert!(indices.len() <= 5);
@@ -1131,13 +1175,13 @@ mod tests {
         use crate::prelude::*;
 
         let mat = create_simple_matrix();
-        let index = BallTreeIndex::new(mat.as_ref(), Dist::Euclidean, 42);
+        let index = BallTreeIndex::new(mat.as_ref(), Dist::SquaredEuclidean, 42).unwrap();
 
         let query = vec![1.0, 0.0, 0.0];
 
         // This test was actually passing before because we set Some(10) and Some(1)
-        let (indices1, _) = index.query(&query, 3, Some(10));
-        let (indices2, _) = index.query(&query, 3, Some(1));
+        let (indices1, _) = index.query(&query, 3, Some(10)).unwrap();
+        let (indices2, _) = index.query(&query, 3, Some(1)).unwrap();
 
         assert_eq!(indices1.len(), 3);
         assert!(!indices2.is_empty());
@@ -1146,11 +1190,11 @@ mod tests {
     #[test]
     fn test_ball_tree_query_row() {
         let mat = create_simple_matrix();
-        let index = BallTreeIndex::new(mat.as_ref(), Dist::Euclidean, 42);
+        let index = BallTreeIndex::new(mat.as_ref(), Dist::SquaredEuclidean, 42).unwrap();
 
         // Query using a row from the matrix
         // FIX: Pass explicit search_k
-        let (indices, distances) = index.query_row(mat.row(0), 1, Some(5));
+        let (indices, distances) = index.query_row(mat.row(0), 1, Some(5)).unwrap();
 
         assert_eq!(indices[0], 0);
         assert_relative_eq!(distances[0], 0.0, epsilon = 1e-5);
@@ -1160,13 +1204,13 @@ mod tests {
     fn test_ball_tree_reproducibility() {
         let mat = create_simple_matrix();
 
-        let index1 = BallTreeIndex::new(mat.as_ref(), Dist::Euclidean, 42);
-        let index2 = BallTreeIndex::new(mat.as_ref(), Dist::Euclidean, 42);
+        let index1 = BallTreeIndex::new(mat.as_ref(), Dist::SquaredEuclidean, 42).unwrap();
+        let index2 = BallTreeIndex::new(mat.as_ref(), Dist::SquaredEuclidean, 42).unwrap();
 
         let query = vec![0.5, 0.5, 0.0];
         // FIX: Pass explicit search_k
-        let (indices1, _) = index1.query(&query, 3, Some(5));
-        let (indices2, _) = index2.query(&query, 3, Some(5));
+        let (indices1, _) = index1.query(&query, 3, Some(5)).unwrap();
+        let (indices2, _) = index2.query(&query, 3, Some(5)).unwrap();
 
         assert_eq!(indices1, indices2);
     }
@@ -1175,14 +1219,14 @@ mod tests {
     fn test_ball_tree_different_seeds() {
         let mat = create_simple_matrix();
 
-        let index1 = BallTreeIndex::new(mat.as_ref(), Dist::Euclidean, 42);
-        let index2 = BallTreeIndex::new(mat.as_ref(), Dist::Euclidean, 123);
+        let index1 = BallTreeIndex::new(mat.as_ref(), Dist::SquaredEuclidean, 42).unwrap();
+        let index2 = BallTreeIndex::new(mat.as_ref(), Dist::SquaredEuclidean, 123).unwrap();
 
         let query = vec![0.5, 0.5, 0.0];
 
         // FIX: Pass explicit search_k
-        let (indices1, _) = index1.query(&query, 3, Some(5));
-        let (indices2, _) = index2.query(&query, 3, Some(5));
+        let (indices1, _) = index1.query(&query, 3, Some(5)).unwrap();
+        let (indices2, _) = index2.query(&query, 3, Some(5)).unwrap();
 
         assert_eq!(indices1.len(), 3);
         assert_eq!(indices2.len(), 3);
@@ -1204,10 +1248,10 @@ mod tests {
         }
 
         let mat = Mat::from_fn(n, dim, |i, j| data[i * dim + j]);
-        let index = BallTreeIndex::new(mat.as_ref(), Dist::Euclidean, 42);
+        let index = BallTreeIndex::new(mat.as_ref(), Dist::SquaredEuclidean, 42).unwrap();
 
         let query: Vec<f32> = (0..dim).map(|_| 0.0).collect();
-        let (indices, _) = index.query(&query, 5, None);
+        let (indices, _) = index.query(&query, 5, None).unwrap();
 
         assert_eq!(indices.len(), 5);
         assert_eq!(indices[0], 0);
@@ -1218,11 +1262,11 @@ mod tests {
         use crate::prelude::*;
         let data = [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0];
         let mat = Mat::from_fn(3, 3, |i, j| data[i * 3 + j]);
-        let index = BallTreeIndex::new(mat.as_ref(), Dist::Cosine, 42);
+        let index = BallTreeIndex::new(mat.as_ref(), Dist::Cosine, 42).unwrap();
 
         let query = vec![1.0, 0.0, 0.0];
         // FIX: Pass explicit search_k
-        let (indices, distances) = index.query(&query, 3, Some(3));
+        let (indices, distances) = index.query(&query, 3, Some(3)).unwrap();
 
         assert_eq!(indices[0], 0);
         assert_relative_eq!(distances[0], 0.0, epsilon = 1e-5);
@@ -1237,10 +1281,10 @@ mod tests {
         let data: Vec<f32> = (0..n * dim).map(|i| i as f32).collect();
         let mat = Mat::from_fn(n, dim, |i, j| data[i * dim + j]);
 
-        let index = BallTreeIndex::new(mat.as_ref(), Dist::Euclidean, 42);
+        let index = BallTreeIndex::new(mat.as_ref(), Dist::SquaredEuclidean, 42).unwrap();
 
         let query: Vec<f32> = (0..dim).map(|_| 0.0).collect();
-        let (indices, _) = index.query(&query, 3, None); // 5% of 50 is 2.5 -> 2. Safe-ish.
+        let (indices, _) = index.query(&query, 3, None).unwrap(); // 5% of 50 is 2.5 -> 2. Safe-ish.
 
         assert_eq!(indices.len(), 3);
     }

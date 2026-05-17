@@ -17,6 +17,7 @@ use mimalloc::MiMalloc;
 static GLOBAL: MiMalloc = MiMalloc;
 
 pub mod cpu;
+pub mod errors;
 pub mod prelude;
 pub mod utils;
 
@@ -86,17 +87,17 @@ fn query_parallel<T, F>(
     return_dist: bool,
     verbose: bool,
     query_fn: F,
-) -> (Vec<Vec<usize>>, Option<Vec<Vec<T>>>)
+) -> KnnOptionResult<T>
 where
     T: Send,
-    F: Fn(usize) -> (Vec<usize>, Vec<T>) + Sync,
+    F: Fn(usize) -> Result<(Vec<usize>, Vec<T>), AnnSearchErrors> + Sync,
 {
     let counter = Arc::new(AtomicUsize::new(0));
 
     let results: Vec<(Vec<usize>, Vec<T>)> = (0..n_samples)
         .into_par_iter()
         .map(|i| {
-            let result = query_fn(i);
+            let result = query_fn(i)?;
             if verbose {
                 let count = counter.fetch_add(1, Ordering::Relaxed) + 1;
                 if count.is_multiple_of(100_000) {
@@ -107,16 +108,16 @@ where
                     );
                 }
             }
-            result
+            Ok(result)
         })
-        .collect();
+        .collect::<Result<Vec<_>, AnnSearchErrors>>()?;
 
     if return_dist {
         let (indices, distances) = results.into_iter().unzip();
-        (indices, Some(distances))
+        Ok((indices, Some(distances)))
     } else {
         let indices: Vec<Vec<usize>> = results.into_iter().map(|(idx, _)| idx).collect();
-        (indices, None)
+        Ok((indices, None))
     }
 }
 
@@ -145,17 +146,17 @@ fn query_parallel_with_flags<T, F>(
     return_dist: bool,
     verbose: bool,
     query_fn: F,
-) -> (Vec<Vec<usize>>, Option<Vec<Vec<T>>>)
+) -> KnnOptionResult<T>
 where
     T: Send,
-    F: Fn(usize) -> (Vec<usize>, Vec<T>, bool) + Sync,
+    F: Fn(usize) -> Result<(Vec<usize>, Vec<T>, bool), AnnSearchErrors> + Sync,
 {
     let counter = Arc::new(AtomicUsize::new(0));
 
     let results: Vec<(Vec<usize>, Vec<T>, bool)> = (0..n_samples)
         .into_par_iter()
         .map(|i| {
-            let result = query_fn(i);
+            let result = query_fn(i)?;
             if verbose {
                 let count = counter.fetch_add(1, Ordering::Relaxed) + 1;
                 if count.is_multiple_of(100_000) {
@@ -166,9 +167,9 @@ where
                     );
                 }
             }
-            result
+            Ok(result)
         })
-        .collect();
+        .collect::<Result<Vec<_>, AnnSearchErrors>>()?;
 
     let mut random: usize = 0;
     let mut indices: Vec<Vec<usize>> = Vec::with_capacity(results.len());
@@ -188,9 +189,9 @@ where
     }
 
     if return_dist {
-        (indices, Some(distances))
+        Ok((indices, Some(distances)))
     } else {
-        (indices, None)
+        Ok((indices, None))
     }
 }
 
@@ -203,7 +204,7 @@ where
 /// ### Params
 ///
 /// * `mat` - The initial matrix with samples x features
-/// * `dist_metric` - Distance metric: "euclidean" or "cosine"
+/// * `dist_metric` - Distance metric: "euclidean", "cosine" or "manhattan"
 ///
 /// ### Returns
 ///
@@ -212,7 +213,11 @@ pub fn build_exhaustive_index<T>(mat: MatRef<T>, dist_metric: &str) -> Exhaustiv
 where
     T: AnnSearchFloat,
 {
-    let metric = parse_ann_dist(dist_metric).unwrap_or_default();
+    let metric = parse_ann_dist(dist_metric).unwrap_or_else(|| {
+        println!("[WARNING] Weird string used for distance metric. Using default squared Euclidean distance");
+        Dist::default()
+    });
+
     ExhaustiveIndex::new(mat, metric)
 }
 
@@ -235,7 +240,7 @@ pub fn query_exhaustive_index<T>(
     k: usize,
     return_dist: bool,
     verbose: bool,
-) -> (Vec<Vec<usize>>, Option<Vec<Vec<T>>>)
+) -> KnnOptionResult<T>
 where
     T: AnnSearchFloat,
 {
@@ -263,7 +268,7 @@ pub fn query_exhaustive_self<T>(
     k: usize,
     return_dist: bool,
     verbose: bool,
-) -> (Vec<Vec<usize>>, Option<Vec<Vec<T>>>)
+) -> KnnOptionResult<T>
 where
     T: AnnSearchFloat,
 {
@@ -279,9 +284,12 @@ where
 /// ### Params
 ///
 /// * `mat` - The initial matrix with samples x features
-/// * `dist_metric` - Distance metric: "euclidean" or "cosine"
+/// * `dist_metric` - Distance metric: "euclidean" or "cosine". "manhatten" is
+///   not supported.
 /// * `nlist` - Optional number of clusters. Defaults to sqrt(n).
-/// * `max_iters` - Optional maximum k-means iterations (defaults to 30).
+/// * `k_means_params` - Optional k-means trainings parameters, see
+///   [KMeansTrainingParams]. If not provided, will default to sensible
+///   defaults.
 /// * `seed` - Random seed for reproducibility
 /// * `verbose` - Print build progress
 ///
@@ -292,15 +300,18 @@ pub fn build_kmknn_index<T>(
     mat: MatRef<T>,
     dist_metric: &str,
     nlist: Option<usize>,
-    max_iters: Option<usize>,
+    k_means_params: Option<KMeansTrainingParams>,
     seed: usize,
     verbose: bool,
-) -> KmknnIndex<T>
+) -> Result<KmknnIndex<T>, AnnSearchErrors>
 where
     T: AnnSearchFloat,
 {
-    let metric = parse_ann_dist(dist_metric).unwrap_or_default();
-    KmknnIndex::build(mat, metric, nlist, max_iters, seed, verbose)
+    let metric = parse_ann_dist(dist_metric).unwrap_or_else(|| {
+        println!("[WARNING] Weird string used for distance metric. Using default squared Euclidean distance");
+        Dist::default()
+    });
+    KmknnIndex::build(mat, metric, nlist, k_means_params, seed, verbose)
 }
 
 /// Helper function to query a given kMkNN index
@@ -322,7 +333,7 @@ pub fn query_kmknn_index<T>(
     k: usize,
     return_dist: bool,
     verbose: bool,
-) -> (Vec<Vec<usize>>, Option<Vec<Vec<T>>>)
+) -> KnnOptionResult<T>
 where
     T: AnnSearchFloat,
 {
@@ -350,7 +361,7 @@ pub fn query_kmknn_self<T>(
     k: usize,
     return_dist: bool,
     verbose: bool,
-) -> (Vec<Vec<usize>>, Option<Vec<Vec<T>>>)
+) -> KnnOptionResult<T>
 where
     T: AnnSearchFloat,
 {
@@ -367,6 +378,8 @@ where
 ///
 /// * `mat` - The data matrix. Rows represent the samples, columns represent
 ///   the embedding dimensions
+/// * `dist_metric` - Distance metric: "euclidean" or "cosine". "manhatten" is
+///   not supported.
 /// * `n_trees` - Number of trees to use to build the index
 /// * `seed` - Random seed for reproducibility
 ///
@@ -375,16 +388,19 @@ where
 /// The `AnnoyIndex`.
 pub fn build_annoy_index<T>(
     mat: MatRef<T>,
-    dist_metric: String,
+    dist_metric: &str,
     n_trees: usize,
     seed: usize,
-) -> AnnoyIndex<T>
+) -> Result<AnnoyIndex<T>, AnnSearchErrors>
 where
     T: AnnSearchFloat,
 {
-    let ann_dist = parse_ann_dist(&dist_metric).unwrap_or_default();
+    let metric = parse_ann_dist(dist_metric).unwrap_or_else(|| {
+        println!("[WARNING] Weird string used for distance metric. Using default squared Euclidean distance");
+        Dist::default()
+    });
 
-    AnnoyIndex::new(mat, n_trees, ann_dist, seed)
+    AnnoyIndex::new(mat, n_trees, metric, seed)
 }
 
 /// Helper function to query a given Annoy index
@@ -409,7 +425,7 @@ pub fn query_annoy_index<T>(
     search_budget: Option<usize>,
     return_dist: bool,
     verbose: bool,
-) -> (Vec<Vec<usize>>, Option<Vec<Vec<T>>>)
+) -> KnnOptionResult<T>
 where
     T: AnnSearchFloat,
 {
@@ -440,7 +456,7 @@ pub fn query_annoy_self<T>(
     search_budget: Option<usize>,
     return_dist: bool,
     verbose: bool,
-) -> (Vec<Vec<usize>>, Option<Vec<Vec<T>>>)
+) -> KnnOptionResult<T>
 where
     T: AnnSearchFloat,
 {
@@ -457,18 +473,26 @@ where
 ///
 /// * `mat` - The data matrix. Rows represent the samples, columns represent
 ///   the embedding dimensions
-/// * `dist_metric` - Distance metric to use
+/// * `dist_metric` - Distance metric: "euclidean" or "cosine". "manhatten" is
+///   not supported.
 /// * `seed` - Random seed for reproducibility
 ///
 /// ### Return
 ///
 /// The `BallTreeIndex`.
-pub fn build_balltree_index<T>(mat: MatRef<T>, dist_metric: String, seed: usize) -> BallTreeIndex<T>
+pub fn build_balltree_index<T>(
+    mat: MatRef<T>,
+    dist_metric: &str,
+    seed: usize,
+) -> Result<BallTreeIndex<T>, AnnSearchErrors>
 where
     T: AnnSearchFloat,
 {
-    let ann_dist = parse_ann_dist(&dist_metric).unwrap_or_default();
-    BallTreeIndex::new(mat, ann_dist, seed)
+    let metric = parse_ann_dist(dist_metric).unwrap_or_else(|| {
+        println!("[WARNING] Weird string used for distance metric. Using default squared Euclidean distance");
+        Dist::default()
+    });
+    BallTreeIndex::new(mat, metric, seed)
 }
 
 /// Helper function to query a given BallTree index
@@ -493,7 +517,7 @@ pub fn query_balltree_index<T>(
     search_budget: Option<usize>,
     return_dist: bool,
     verbose: bool,
-) -> (Vec<Vec<usize>>, Option<Vec<Vec<T>>>)
+) -> KnnOptionResult<T>
 where
     T: AnnSearchFloat,
 {
@@ -524,7 +548,7 @@ pub fn query_balltree_self<T>(
     search_budget: Option<usize>,
     return_dist: bool,
     verbose: bool,
-) -> (Vec<Vec<usize>>, Option<Vec<Vec<T>>>)
+) -> KnnOptionResult<T>
 where
     T: AnnSearchFloat,
 {
@@ -543,8 +567,7 @@ where
 ///   the embedding dimensions.
 /// * `m` - Number of bidirectional connections per layer.
 /// * `ef_construction` - Size of candidate list during construction.
-/// * `dist_metric` - The distance metric to use. One of `"euclidean"` or
-///   `"cosine"`.
+/// * `dist_metric` - Distance metric: "euclidean", "cosine" or "manhatten".
 /// * `seed` - Random seed for reproducibility
 ///
 /// ### Return
@@ -562,7 +585,12 @@ where
     T: AnnSearchFloat,
     HnswIndex<T>: HnswState<T>,
 {
-    HnswIndex::build(mat, m, ef_construction, dist_metric, seed, verbose)
+    let metric = parse_ann_dist(dist_metric).unwrap_or_else(|| {
+        println!("[WARNING] Weird string used for distance metric. Using default squared Euclidean distance");
+        Dist::default()
+    });
+
+    HnswIndex::build(mat, m, ef_construction, &metric, seed, verbose)
 }
 
 /// Helper function to query a given HNSW index
@@ -593,7 +621,7 @@ pub fn query_hnsw_index<T>(
     ef_search: usize,
     return_dist: bool,
     verbose: bool,
-) -> (Vec<Vec<usize>>, Option<Vec<Vec<T>>>)
+) -> KnnOptionResult<T>
 where
     T: AnnSearchFloat,
     HnswIndex<T>: HnswState<T>,
@@ -627,7 +655,7 @@ pub fn query_hnsw_self<T>(
     ef_search: usize,
     return_dist: bool,
     verbose: bool,
-) -> (Vec<Vec<usize>>, Option<Vec<Vec<T>>>)
+) -> KnnOptionResult<T>
 where
     T: AnnSearchFloat,
     HnswIndex<T>: HnswState<T>,
@@ -646,9 +674,11 @@ where
 /// * `mat` - The data matrix. Rows represent the samples, columns represent
 ///   the embedding dimensions
 /// * `nlist` - Number of clusters to create
-/// * `max_iters` - Maximum k-means iterations (defaults to 30 if None)
-/// * `dist_metric` - The distance metric to use. One of `"euclidean"` or
-///   `"cosine"`
+/// * `k_means_params` - Optional k-means trainings parameters, see
+///   [KMeansTrainingParams]. If not provided, will default to sensible
+///   defaults.
+/// * `dist_metric` - Distance metric: "euclidean" or "cosine". "manhatten" is
+///   not supported.
 /// * `seed` - Random seed for reproducibility
 /// * `verbose` - Print progress information during index construction
 ///
@@ -658,17 +688,20 @@ where
 pub fn build_ivf_index<T>(
     mat: MatRef<T>,
     nlist: Option<usize>,
-    max_iters: Option<usize>,
+    k_means_params: Option<KMeansTrainingParams>,
     dist_metric: &str,
     seed: usize,
     verbose: bool,
-) -> IvfIndex<T>
+) -> Result<IvfIndex<T>, AnnSearchErrors>
 where
     T: AnnSearchFloat,
 {
-    let ann_dist = parse_ann_dist(dist_metric).unwrap_or_default();
+    let metric = parse_ann_dist(dist_metric).unwrap_or_else(|| {
+        println!("[WARNING] Weird string used for distance metric. Using default squared Euclidean distance");
+        Dist::default()
+    });
 
-    IvfIndex::build(mat, ann_dist, nlist, max_iters, seed, verbose)
+    IvfIndex::build(mat, metric, nlist, k_means_params, seed, verbose)
 }
 
 /// Helper function to query a given IVF index
@@ -699,7 +732,7 @@ pub fn query_ivf_index<T>(
     nprobe: Option<usize>,
     return_dist: bool,
     verbose: bool,
-) -> (Vec<Vec<usize>>, Option<Vec<Vec<T>>>)
+) -> KnnOptionResult<T>
 where
     T: AnnSearchFloat,
 {
@@ -739,7 +772,7 @@ pub fn query_ivf_self<T>(
     nprobe: Option<usize>,
     return_dist: bool,
     verbose: bool,
-) -> (Vec<Vec<usize>>, Option<Vec<Vec<T>>>)
+) -> KnnOptionResult<T>
 where
     T: AnnSearchFloat,
 {
@@ -756,7 +789,7 @@ where
 ///
 /// * `mat` - The data matrix. Rows represent the samples, columns represent
 ///   the embedding dimensions
-/// * `dist_metric` - Distance metric string ("euclidean" or "cosine")
+/// * `dist_metric` - Distance metric: "euclidean", "cosine" or "manhatten".
 /// * `n_trees` - Number of trees to use to build the index
 /// * `seed` - Random seed for reproducibility
 /// * `overlap` - Spill-tree overlap fraction. If None, uses the default
@@ -767,16 +800,19 @@ where
 /// The `KdTreeIndex`.
 pub fn build_kd_tree_index<T>(
     mat: MatRef<T>,
-    dist_metric: String,
+    dist_metric: &str,
     n_trees: usize,
     seed: usize,
 ) -> KdTreeIndex<T>
 where
     T: AnnSearchFloat,
 {
-    let ann_dist = parse_ann_dist(&dist_metric).unwrap_or_default();
+    let metric = parse_ann_dist(dist_metric).unwrap_or_else(|| {
+        println!("[WARNING] Weird string used for distance metric. Using default squared Euclidean distance");
+        Dist::default()
+    });
 
-    KdTreeIndex::new(mat, n_trees, ann_dist, seed)
+    KdTreeIndex::new(mat, n_trees, metric, seed)
 }
 
 /// Helper function to query a given Kd-Tree index
@@ -801,7 +837,7 @@ pub fn query_kd_tree_index<T>(
     search_budget: Option<usize>,
     return_dist: bool,
     verbose: bool,
-) -> (Vec<Vec<usize>>, Option<Vec<Vec<T>>>)
+) -> KnnOptionResult<T>
 where
     T: AnnSearchFloat,
 {
@@ -832,7 +868,7 @@ pub fn query_kd_tree_self<T>(
     search_budget: Option<usize>,
     return_dist: bool,
     verbose: bool,
-) -> (Vec<Vec<usize>>, Option<Vec<Vec<T>>>)
+) -> KnnOptionResult<T>
 where
     T: AnnSearchFloat,
 {
@@ -848,7 +884,8 @@ where
 /// ### Params
 ///
 /// * `mat` - The initial matrix with samples x features
-/// * `dist_metric` - Distance metric: "euclidean" or "cosine"
+/// * `dist_metric` - Distance metric: "euclidean" or "cosine". "manhatten" is
+///   not supported.
 /// * `num_tables` - Number of HashMaps to use (usually something 20 to 100)
 /// * `bits_per_hash` - How many bits per hash. Lower values (8) usually yield
 ///   better Recall with higher query time; higher values (16) have worse Recall
@@ -864,11 +901,15 @@ pub fn build_lsh_index<T>(
     num_tables: usize,
     bits_per_hash: usize,
     seed: usize,
-) -> LSHIndex<T>
+) -> Result<LSHIndex<T>, AnnSearchErrors>
 where
     T: AnnSearchFloat,
 {
-    let metric = parse_ann_dist(dist_metric).unwrap_or_default();
+    let metric = parse_ann_dist(dist_metric).unwrap_or_else(|| {
+        println!("[WARNING] Weird string used for distance metric. Using default squared Euclidean distance");
+        Dist::default()
+    });
+
     LSHIndex::new(mat, metric, num_tables, bits_per_hash, seed)
 }
 
@@ -899,7 +940,7 @@ pub fn query_lsh_index<T>(
     max_candidates: Option<usize>,
     return_dist: bool,
     verbose: bool,
-) -> (Vec<Vec<usize>>, Option<Vec<Vec<T>>>)
+) -> KnnOptionResult<T>
 where
     T: AnnSearchFloat,
 {
@@ -932,13 +973,13 @@ pub fn query_lsh_self<T>(
     max_candidates: Option<usize>,
     return_dist: bool,
     verbose: bool,
-) -> (Vec<Vec<usize>>, Option<Vec<Vec<T>>>)
+) -> KnnOptionResult<T>
 where
     T: AnnSearchFloat,
 {
     let n_probe = n_probe.unwrap_or(index.num_bits() / 2);
 
-    index.generate_knn(k, max_candidates, n_probe, return_dist, verbose)
+    Ok(index.generate_knn(k, max_candidates, n_probe, return_dist, verbose))
 }
 
 ///////////////
@@ -952,8 +993,7 @@ where
 /// * `mat` - The data matrix. Rows represent the samples, columns represent
 ///   the embedding dimensions.
 /// * `k` - Number of neighbours for the k-NN graph.
-/// * `dist_metric` - The distance metric to use. One of `"euclidean"` or
-///   `"cosine"`.
+/// * `dist_metric` - Distance metric: "euclidean", "cosine" or "manhatten".
 /// * `max_iter` - Maximum iterations for the algorithm.
 /// * `delta` - Early stop criterium for the algorithm.
 /// * `rho` - Sampling rate for the old neighbours. Will adaptively decrease
@@ -977,13 +1017,17 @@ pub fn build_nndescent_index<T>(
     n_tree: Option<usize>,
     seed: usize,
     verbose: bool,
-) -> NNDescent<T>
+) -> Result<NNDescent<T>, AnnSearchErrors>
 where
     T: AnnSearchFloat,
     NNDescent<T>: ApplySortedUpdates<T>,
     NNDescent<T>: NNDescentQuery<T>,
 {
-    let metric = parse_ann_dist(dist_metric).unwrap_or(Dist::Cosine);
+    let metric = parse_ann_dist(dist_metric).unwrap_or_else(|| {
+        println!("[WARNING] Weird string used for distance metric. Using default squared Euclidean distance");
+        Dist::default()
+    });
+
     NNDescent::new(
         mat,
         metric,
@@ -1025,7 +1069,7 @@ pub fn query_nndescent_index<T>(
     ef_search: Option<usize>,
     return_dist: bool,
     verbose: bool,
-) -> (Vec<Vec<usize>>, Option<Vec<Vec<T>>>)
+) -> KnnOptionResult<T>
 where
     T: AnnSearchFloat,
     NNDescent<T>: ApplySortedUpdates<T>,
@@ -1063,7 +1107,7 @@ pub fn query_nndescent_self<T>(
     ef_search: Option<usize>,
     return_dist: bool,
     verbose: bool,
-) -> (Vec<Vec<usize>>, Option<Vec<Vec<T>>>)
+) -> KnnOptionResult<T>
 where
     T: AnnSearchFloat,
     NNDescent<T>: ApplySortedUpdates<T>,
@@ -1085,7 +1129,7 @@ where
 /// * `l_build` - Beam width during construction.
 /// * `alpha_pass1` - Pruning alpha for pass 1 (typically 1.0).
 /// * `alpha_pass2` - Pruning alpha for pass 2 (typically 1.2–1.5).
-/// * `dist_metric` - One of `"euclidean"` or `"cosine"`.
+/// * `dist_metric` - Distance metric: "euclidean", "cosine" or "manhatten".
 /// * `seed` - Random seed for reproducibility.
 ///
 /// ### Returns
@@ -1104,7 +1148,11 @@ where
     T: AnnSearchFloat,
     VamanaIndex<T>: VamanaState<T>,
 {
-    let metric = parse_ann_dist(dist_metric).unwrap_or(Dist::Euclidean);
+    let metric = parse_ann_dist(dist_metric).unwrap_or_else(|| {
+        println!("[WARNING] Weird string used for distance metric. Using default squared Euclidean distance");
+        Dist::default()
+    });
+
     VamanaIndex::build(mat, metric, r, l_build, alpha_pass1, alpha_pass2, seed)
 }
 
@@ -1130,7 +1178,7 @@ pub fn query_vamana_index<T>(
     ef_search: Option<usize>,
     return_dist: bool,
     verbose: bool,
-) -> (Vec<Vec<usize>>, Option<Vec<Vec<T>>>)
+) -> KnnOptionResult<T>
 where
     T: AnnSearchFloat,
     VamanaIndex<T>: VamanaState<T>,
@@ -1159,7 +1207,7 @@ pub fn query_vamana_self<T>(
     ef_search: Option<usize>,
     return_dist: bool,
     verbose: bool,
-) -> (Vec<Vec<usize>>, Option<Vec<Vec<T>>>)
+) -> KnnOptionResult<T>
 where
     T: AnnSearchFloat,
     VamanaIndex<T>: VamanaState<T>,
@@ -1182,7 +1230,8 @@ where
 ///
 /// * `mat` - The data matrix. Rows represent the samples, columns represent
 ///   the embedding dimensions
-/// * `dist_metric` - Distance metric to use
+/// * `dist_metric` - Distance metric: "euclidean" or "cosine". "manhatten" is
+///   not supported.
 /// * `verbose` - Print progress information during index construction
 ///
 /// ### Return
@@ -1192,18 +1241,22 @@ pub fn build_exhaustive_bf16_index<T>(
     mat: MatRef<T>,
     dist_metric: &str,
     verbose: bool,
-) -> ExhaustiveIndexBf16<T>
+) -> Result<ExhaustiveIndexBf16<T>, AnnSearchErrors>
 where
     T: AnnSearchFloat + Bf16Compatible,
 {
-    let ann_dist = parse_ann_dist(dist_metric).unwrap_or_default();
+    let metric = parse_ann_dist(dist_metric).unwrap_or_else(|| {
+        println!("[WARNING] Weird string used for distance metric. Using default squared Euclidean distance");
+        Dist::default()
+    });
+
     if verbose {
         println!(
             "Building exhaustive BF16 index with {} samples",
             mat.nrows()
         );
     }
-    ExhaustiveIndexBf16::new(mat, ann_dist)
+    ExhaustiveIndexBf16::new(mat, metric)
 }
 
 #[cfg(feature = "quantised")]
@@ -1226,7 +1279,7 @@ pub fn query_exhaustive_bf16_index<T>(
     k: usize,
     return_dist: bool,
     verbose: bool,
-) -> (Vec<Vec<usize>>, Option<Vec<Vec<T>>>)
+) -> KnnOptionResult<T>
 where
     T: AnnSearchFloat + Bf16Compatible,
 {
@@ -1255,11 +1308,11 @@ pub fn query_exhaustive_bf16_self<T>(
     k: usize,
     return_dist: bool,
     verbose: bool,
-) -> (Vec<Vec<usize>>, Option<Vec<Vec<T>>>)
+) -> KnnOptionResult<T>
 where
     T: AnnSearchFloat + Bf16Compatible,
 {
-    index.generate_knn(k, return_dist, verbose)
+    Ok(index.generate_knn(k, return_dist, verbose))
 }
 
 ////////////////////
@@ -1273,7 +1326,8 @@ where
 ///
 /// * `mat` - The data matrix. Rows represent the samples, columns represent
 ///   the embedding dimensions
-/// * `dist_metric` - Distance metric to use
+/// * `dist_metric` - Distance metric: "euclidean" or "cosine". "manhatten" is
+///   not supported.
 /// * `verbose` - Print progress information during index construction
 ///
 /// ### Return
@@ -1283,15 +1337,19 @@ pub fn build_exhaustive_sq8_index<T>(
     mat: MatRef<T>,
     dist_metric: &str,
     verbose: bool,
-) -> ExhaustiveSq8Index<T>
+) -> Result<ExhaustiveSq8Index<T>, AnnSearchErrors>
 where
     T: AnnSearchFloat,
 {
-    let ann_dist = parse_ann_dist(dist_metric).unwrap_or_default();
+    let metric = parse_ann_dist(dist_metric).unwrap_or_else(|| {
+        println!("[WARNING] Weird string used for distance metric. Using default squared Euclidean distance");
+        Dist::default()
+    });
+
     if verbose {
         println!("Building exhaustive SQ8 index with {} samples", mat.nrows());
     }
-    ExhaustiveSq8Index::new(mat, ann_dist)
+    ExhaustiveSq8Index::new(mat, metric)
 }
 
 #[cfg(feature = "quantised")]
@@ -1314,7 +1372,7 @@ pub fn query_exhaustive_sq8_index<T>(
     k: usize,
     return_dist: bool,
     verbose: bool,
-) -> (Vec<Vec<usize>>, Option<Vec<Vec<T>>>)
+) -> KnnOptionResult<T>
 where
     T: AnnSearchFloat,
 {
@@ -1343,11 +1401,11 @@ pub fn query_exhaustive_sq8_self<T>(
     k: usize,
     return_dist: bool,
     verbose: bool,
-) -> (Vec<Vec<usize>>, Option<Vec<Vec<T>>>)
+) -> KnnOptionResult<T>
 where
     T: AnnSearchFloat,
 {
-    index.generate_knn(k, return_dist, verbose)
+    Ok(index.generate_knn(k, return_dist, verbose))
 }
 
 ////////////////////
@@ -1365,7 +1423,8 @@ where
 ///   by m)
 /// * `max_iters` - Maximum k-means iterations (defaults to 30 if None)
 /// * `n_pq_centroids` - Number of centroids per subspace (defaults to 256 if None)
-/// * `dist_metric` - Distance metric ("euclidean" or "cosine")
+/// * `dist_metric` - Distance metric: "euclidean" or "cosine". "manhatten" is
+///   not supported.
 /// * `seed` - Random seed for reproducibility
 /// * `verbose` - Print progress information during index construction
 ///
@@ -1381,12 +1440,16 @@ pub fn build_exhaustive_pq_index<T>(
     dist_metric: &str,
     seed: usize,
     verbose: bool,
-) -> ExhaustivePqIndex<T>
+) -> Result<ExhaustivePqIndex<T>, AnnSearchErrors>
 where
     T: AnnSearchFloat,
 {
-    let ann_dist = parse_ann_dist(dist_metric).unwrap_or_default();
-    ExhaustivePqIndex::build(mat, m, ann_dist, max_iters, n_pq_centroids, seed, verbose)
+    let metric = parse_ann_dist(dist_metric).unwrap_or_else(|| {
+        println!("[WARNING] Weird string used for distance metric. Using default squared Euclidean distance");
+        Dist::default()
+    });
+
+    ExhaustivePqIndex::build(mat, m, metric, max_iters, n_pq_centroids, seed, verbose)
 }
 
 #[cfg(feature = "quantised")]
@@ -1409,7 +1472,7 @@ pub fn query_exhaustive_pq_index<T>(
     k: usize,
     return_dist: bool,
     verbose: bool,
-) -> (Vec<Vec<usize>>, Option<Vec<Vec<T>>>)
+) -> KnnOptionResult<T>
 where
     T: AnnSearchFloat,
 {
@@ -1440,7 +1503,7 @@ pub fn query_exhaustive_pq_index_self<T>(
     k: usize,
     return_dist: bool,
     verbose: bool,
-) -> (Vec<Vec<usize>>, Option<Vec<Vec<T>>>)
+) -> KnnOptionResult<T>
 where
     T: AnnSearchFloat,
 {
@@ -1462,7 +1525,8 @@ where
 ///   by m)
 /// * `max_iters` - Maximum k-means iterations (defaults to 30 if None)
 /// * `n_pq_centroids` - Number of centroids per subspace (defaults to 256 if None)
-/// * `dist_metric` - Distance metric ("euclidean" or "cosine")
+/// * `dist_metric` - Distance metric: "euclidean" or "cosine". "manhatten" is
+///   not supported.
 /// * `seed` - Random seed for reproducibility
 /// * `verbose` - Print progress information during index construction
 ///
@@ -1478,12 +1542,15 @@ pub fn build_exhaustive_opq_index<T>(
     dist_metric: &str,
     seed: usize,
     verbose: bool,
-) -> ExhaustiveOpqIndex<T>
+) -> Result<ExhaustiveOpqIndex<T>, AnnSearchErrors>
 where
     T: AnnSearchFloat + AddAssign,
 {
-    let ann_dist = parse_ann_dist(dist_metric).unwrap_or_default();
-    ExhaustiveOpqIndex::build(mat, m, ann_dist, max_iters, n_pq_centroids, seed, verbose)
+    let metric = parse_ann_dist(dist_metric).unwrap_or_else(|| {
+        println!("[WARNING] Weird string used for distance metric. Using default squared Euclidean distance");
+        Dist::default()
+    });
+    ExhaustiveOpqIndex::build(mat, m, metric, max_iters, n_pq_centroids, seed, verbose)
 }
 
 #[cfg(feature = "quantised")]
@@ -1506,7 +1573,7 @@ pub fn query_exhaustive_opq_index<T>(
     k: usize,
     return_dist: bool,
     verbose: bool,
-) -> (Vec<Vec<usize>>, Option<Vec<Vec<T>>>)
+) -> KnnOptionResult<T>
 where
     T: AnnSearchFloat + AddAssign,
 {
@@ -1537,7 +1604,7 @@ pub fn query_exhaustive_opq_index_self<T>(
     k: usize,
     return_dist: bool,
     verbose: bool,
-) -> (Vec<Vec<usize>>, Option<Vec<Vec<T>>>)
+) -> KnnOptionResult<T>
 where
     T: AnnSearchFloat + AddAssign,
 {
@@ -1557,7 +1624,11 @@ where
 ///   the embedding dimensions
 /// * `nlist` - Optional number of cells to create. If not provided, defaults
 ///   to `sqrt(n)`.
-/// * `max_iters` - Maximum k-means iterations (defaults to 30 if None)
+/// * `k_means_params` - Optional k-means trainings parameters, see
+///   [KMeansTrainingParams]. If not provided, will default to sensible
+///   defaults.
+/// * `dist_metric` - Distance metric: "euclidean" or "cosine". "manhatten" is
+///   not supported.
 /// * `seed` - Random seed for reproducibility
 /// * `verbose` - Print progress information during index construction
 ///
@@ -1567,17 +1638,20 @@ where
 pub fn build_ivf_bf16_index<T>(
     mat: MatRef<T>,
     nlist: Option<usize>,
-    max_iters: Option<usize>,
+    k_means_params: Option<KMeansTrainingParams>,
     dist_metric: &str,
     seed: usize,
     verbose: bool,
-) -> IvfIndexBf16<T>
+) -> Result<IvfIndexBf16<T>, AnnSearchErrors>
 where
     T: AnnSearchFloat + Bf16Compatible,
 {
-    let ann_dist = parse_ann_dist(dist_metric).unwrap_or_default();
+    let metric = parse_ann_dist(dist_metric).unwrap_or_else(|| {
+        println!("[WARNING] Weird string used for distance metric. Using default squared Euclidean distance");
+        Dist::default()
+    });
 
-    IvfIndexBf16::build(mat, ann_dist, nlist, max_iters, seed, verbose)
+    IvfIndexBf16::build(mat, metric, nlist, k_means_params, seed, verbose)
 }
 
 #[cfg(feature = "quantised")]
@@ -1603,7 +1677,7 @@ pub fn query_ivf_bf16_index<T>(
     nprobe: Option<usize>,
     return_dist: bool,
     verbose: bool,
-) -> (Vec<Vec<usize>>, Option<Vec<Vec<T>>>)
+) -> KnnOptionResult<T>
 where
     T: AnnSearchFloat + Bf16Compatible,
 {
@@ -1638,11 +1712,11 @@ pub fn query_ivf_bf16_self<T>(
     nprobe: Option<usize>,
     return_dist: bool,
     verbose: bool,
-) -> (Vec<Vec<usize>>, Option<Vec<Vec<T>>>)
+) -> KnnOptionResult<T>
 where
     T: AnnSearchFloat + Bf16Compatible,
 {
-    index.generate_knn(k, nprobe, return_dist, verbose)
+    Ok(index.generate_knn(k, nprobe, return_dist, verbose))
 }
 
 /////////////
@@ -1658,7 +1732,11 @@ where
 ///   the embedding dimensions
 /// * `nlist` - Optional number of cells to create. If not provided, defaults
 ///   to `sqrt(n)`.
-/// * `max_iters` - Maximum k-means iterations (defaults to 30 if None)
+/// * `k_means_params` - Optional k-means trainings parameters, see
+///   [KMeansTrainingParams]. If not provided, will default to sensible
+///   defaults.
+/// * `dist_metric` - Distance metric: "euclidean" or "cosine". "manhatten" is
+///   not supported.
 /// * `seed` - Random seed for reproducibility
 /// * `verbose` - Print progress information during index construction
 ///
@@ -1668,17 +1746,20 @@ where
 pub fn build_ivf_sq8_index<T>(
     mat: MatRef<T>,
     nlist: Option<usize>,
-    max_iters: Option<usize>,
+    k_means_params: Option<KMeansTrainingParams>,
     dist_metric: &str,
     seed: usize,
     verbose: bool,
-) -> IvfSq8Index<T>
+) -> Result<IvfSq8Index<T>, AnnSearchErrors>
 where
     T: AnnSearchFloat,
 {
-    let ann_dist = parse_ann_dist(dist_metric).unwrap_or_default();
+    let metric = parse_ann_dist(dist_metric).unwrap_or_else(|| {
+        println!("[WARNING] Weird string used for distance metric. Using default squared Euclidean distance");
+        Dist::default()
+    });
 
-    IvfSq8Index::build(mat, nlist, ann_dist, max_iters, seed, verbose)
+    IvfSq8Index::build(mat, nlist, metric, k_means_params, seed, verbose)
 }
 
 #[cfg(feature = "quantised")]
@@ -1704,7 +1785,7 @@ pub fn query_ivf_sq8_index<T>(
     nprobe: Option<usize>,
     return_dist: bool,
     verbose: bool,
-) -> (Vec<Vec<usize>>, Option<Vec<Vec<T>>>)
+) -> KnnOptionResult<T>
 where
     T: AnnSearchFloat,
 {
@@ -1739,11 +1820,11 @@ pub fn query_ivf_sq8_self<T>(
     nprobe: Option<usize>,
     return_dist: bool,
     verbose: bool,
-) -> (Vec<Vec<usize>>, Option<Vec<Vec<T>>>)
+) -> KnnOptionResult<T>
 where
     T: AnnSearchFloat,
 {
-    index.generate_knn(k, nprobe, return_dist, verbose)
+    Ok(index.generate_knn(k, nprobe, return_dist, verbose))
 }
 
 ////////////
@@ -1760,8 +1841,11 @@ where
 /// * `nlist` - Number of IVF clusters to create
 /// * `m` - Number of subspaces for product quantisation (dim must be divisible
 ///   by m)
-/// * `max_iters` - Maximum k-means iterations (defaults to 30 if None)
-/// * `dist_metric` - Distance metric ("euclidean" or "cosine")
+/// * `k_means_params` - Optional k-means trainings parameters, see
+///   [KMeansTrainingParams]. If not provided, will default to sensible
+///   defaults.
+/// * `dist_metric` - Distance metric: "euclidean" or "cosine". "manhatten" is
+///   not supported.
 /// * `seed` - Random seed for reproducibility
 /// * `verbose` - Print progress information during index construction
 ///
@@ -1773,23 +1857,26 @@ pub fn build_ivf_pq_index<T>(
     mat: MatRef<T>,
     nlist: Option<usize>,
     m: usize,
-    max_iters: Option<usize>,
+    k_means_params: Option<KMeansTrainingParams>,
     n_pq_centroids: Option<usize>,
     dist_metric: &str,
     seed: usize,
     verbose: bool,
-) -> IvfPqIndex<T>
+) -> Result<IvfPqIndex<T>, AnnSearchErrors>
 where
     T: AnnSearchFloat,
 {
-    let ann_dist = parse_ann_dist(dist_metric).unwrap_or_default();
+    let metric = parse_ann_dist(dist_metric).unwrap_or_else(|| {
+        println!("[WARNING] Weird string used for distance metric. Using default squared Euclidean distance");
+        Dist::default()
+    });
 
     IvfPqIndex::build(
         mat,
         nlist,
         m,
-        ann_dist,
-        max_iters,
+        metric,
+        k_means_params,
         n_pq_centroids,
         seed,
         verbose,
@@ -1819,7 +1906,7 @@ pub fn query_ivf_pq_index<T>(
     nprobe: Option<usize>,
     return_dist: bool,
     verbose: bool,
-) -> (Vec<Vec<usize>>, Option<Vec<Vec<T>>>)
+) -> KnnOptionResult<T>
 where
     T: AnnSearchFloat,
 {
@@ -1853,7 +1940,7 @@ pub fn query_ivf_pq_index_self<T>(
     nprobe: Option<usize>,
     return_dist: bool,
     verbose: bool,
-) -> (Vec<Vec<usize>>, Option<Vec<Vec<T>>>)
+) -> KnnOptionResult<T>
 where
     T: AnnSearchFloat,
 {
@@ -1874,8 +1961,11 @@ where
 /// * `nlist` - Number of IVF clusters to create
 /// * `m` - Number of subspaces for product quantisation (dim must be divisible
 ///   by m)
-/// * `max_iters` - Maximum k-means iterations (defaults to 30 if None)
-/// * `dist_metric` - Distance metric ("euclidean" or "cosine")
+/// * `k_means_params` - Optional k-means trainings parameters, see
+///   [KMeansTrainingParams]. If not provided, will default to sensible
+///   defaults.
+/// * `dist_metric` - Distance metric: "euclidean" or "cosine". "manhatten" is
+///   not supported.
 /// * `seed` - Random seed for reproducibility
 /// * `verbose` - Print progress information during index construction
 ///
@@ -1887,24 +1977,27 @@ pub fn build_ivf_opq_index<T>(
     mat: MatRef<T>,
     nlist: Option<usize>,
     m: usize,
-    max_iters: Option<usize>,
+    k_means_params: Option<KMeansTrainingParams>,
     n_opq_centroids: Option<usize>,
     n_opq_iter: Option<usize>,
     dist_metric: &str,
     seed: usize,
     verbose: bool,
-) -> IvfOpqIndex<T>
+) -> Result<IvfOpqIndex<T>, AnnSearchErrors>
 where
     T: AnnSearchFloat + AddAssign,
 {
-    let ann_dist = parse_ann_dist(dist_metric).unwrap_or_default();
+    let metric = parse_ann_dist(dist_metric).unwrap_or_else(|| {
+        println!("[WARNING] Weird string used for distance metric. Using default squared Euclidean distance");
+        Dist::default()
+    });
 
     IvfOpqIndex::build(
         mat,
         nlist,
         m,
-        ann_dist,
-        max_iters,
+        metric,
+        k_means_params,
         n_opq_iter,
         n_opq_centroids,
         seed,
@@ -1935,7 +2028,7 @@ pub fn query_ivf_opq_index<T>(
     nprobe: Option<usize>,
     return_dist: bool,
     verbose: bool,
-) -> (Vec<Vec<usize>>, Option<Vec<Vec<T>>>)
+) -> KnnOptionResult<T>
 where
     T: AnnSearchFloat + AddAssign,
 {
@@ -1969,7 +2062,7 @@ pub fn query_ivf_opq_index_self<T>(
     nprobe: Option<usize>,
     return_dist: bool,
     verbose: bool,
-) -> (Vec<Vec<usize>>, Option<Vec<Vec<T>>>)
+) -> KnnOptionResult<T>
 where
     T: AnnSearchFloat + AddAssign,
 {
@@ -1990,7 +2083,8 @@ where
 /// ### Params
 ///
 /// * `mat` - The initial matrix with samples x features
-/// * `dist_metric` - Distance metric: "euclidean" or "cosine"
+/// * `dist_metric` - Distance metric: "euclidean" or "cosine". "manhatten" is
+///   not supported.
 /// * `device` - The GPU device to use
 ///
 /// ### Returns
@@ -2000,12 +2094,15 @@ pub fn build_exhaustive_index_gpu<T, R>(
     mat: MatRef<T>,
     dist_metric: &str,
     device: R::Device,
-) -> ExhaustiveIndexGpu<T, R>
+) -> Result<ExhaustiveIndexGpu<T, R>, AnnSearchErrors>
 where
     T: AnnSearchGpuFloat + AnnSearchFloat,
     R: Runtime,
 {
-    let metric = parse_ann_dist(dist_metric).unwrap_or_default();
+    let metric = parse_ann_dist(dist_metric).unwrap_or_else(|| {
+        println!("[WARNING] Weird string used for distance metric. Using default squared Euclidean distance");
+        Dist::default()
+    });
     ExhaustiveIndexGpu::new(mat, metric, device)
 }
 
@@ -2028,17 +2125,17 @@ pub fn query_exhaustive_index_gpu<T, R>(
     k: usize,
     return_dist: bool,
     verbose: bool,
-) -> (Vec<Vec<usize>>, Option<Vec<Vec<T>>>)
+) -> KnnOptionResult<T>
 where
     T: AnnSearchGpuFloat + AnnSearchFloat,
     R: Runtime,
 {
-    let (indices, distances) = index.query_batch(query_mat, k, verbose);
+    let (indices, distances) = index.query_batch(query_mat, k, verbose)?;
 
     if return_dist {
-        (indices, Some(distances))
+        Ok((indices, Some(distances)))
     } else {
-        (indices, None)
+        Ok((indices, None))
     }
 }
 
@@ -2062,12 +2159,12 @@ pub fn query_exhaustive_index_gpu_self<T, R>(
     k: usize,
     return_dist: bool,
     verbose: bool,
-) -> (Vec<Vec<usize>>, Option<Vec<Vec<T>>>)
+) -> KnnOptionResult<T>
 where
     T: AnnSearchGpuFloat + AnnSearchFloat,
     R: Runtime,
 {
-    index.generate_knn(k, return_dist, verbose)
+    Ok(index.generate_knn(k, return_dist, verbose))
 }
 
 //////////////
@@ -2081,26 +2178,32 @@ where
 ///
 /// * `mat` - Data matrix [samples, features]
 /// * `nlist` - Number of clusters (defaults to √n)
-/// * `max_iters` - K-means iterations (defaults to 30)
-/// * `dist_metric` - "euclidean" or "cosine"
+/// * `k_means_params` - Optional k-means trainings parameters, see
+///   [KMeansTrainingParams]. If not provided, will default to sensible
+///   defaults.
+/// * `dist_metric` - Distance metric: "euclidean" or "cosine". "manhatten" is
+///   not supported.
 /// * `seed` - Random seed
 /// * `verbose` - Print progress
 /// * `device` - GPU device
 pub fn build_ivf_index_gpu<T, R>(
     mat: MatRef<T>,
     nlist: Option<usize>,
-    max_iters: Option<usize>,
+    k_means_params: Option<KMeansTrainingParams>,
     dist_metric: &str,
     seed: usize,
     verbose: bool,
     device: R::Device,
-) -> IvfIndexGpu<T, R>
+) -> Result<IvfIndexGpu<T, R>, AnnSearchErrors>
 where
     R: Runtime,
     T: AnnSearchFloat + AnnSearchGpuFloat,
 {
-    let ann_dist = parse_ann_dist(dist_metric).unwrap_or_default();
-    IvfIndexGpu::build(mat, ann_dist, nlist, max_iters, seed, verbose, device)
+    let metric = parse_ann_dist(dist_metric).unwrap_or_else(|| {
+        println!("[WARNING] Weird string used for distance metric. Using default squared Euclidean distance");
+        Dist::default()
+    });
+    IvfIndexGpu::build(mat, metric, nlist, k_means_params, seed, verbose, device)
 }
 
 #[cfg(feature = "gpu")]
@@ -2127,17 +2230,17 @@ pub fn query_ivf_index_gpu<T, R>(
     nquery: Option<usize>,
     return_dist: bool,
     verbose: bool,
-) -> (Vec<Vec<usize>>, Option<Vec<Vec<T>>>)
+) -> KnnOptionResult<T>
 where
     R: Runtime,
     T: AnnSearchFloat + AnnSearchGpuFloat,
 {
-    let (indices, distances) = index.query_batch(query_mat, k, nprobe, nquery, verbose);
+    let (indices, distances) = index.query_batch(query_mat, k, nprobe, nquery, verbose)?;
 
     if return_dist {
-        (indices, Some(distances))
+        Ok((indices, Some(distances)))
     } else {
-        (indices, None)
+        Ok((indices, None))
     }
 }
 
@@ -2166,7 +2269,7 @@ pub fn query_ivf_index_gpu_self<T, R>(
     nquery: Option<usize>,
     return_dist: bool,
     verbose: bool,
-) -> (Vec<Vec<usize>>, Option<Vec<Vec<T>>>)
+) -> KnnOptionResult<T>
 where
     R: Runtime,
     T: AnnSearchFloat + AnnSearchGpuFloat,
@@ -2185,7 +2288,8 @@ where
 /// ### Params
 ///
 /// * `mat` - Data matrix [samples, features]
-/// * `dist_metric` - "euclidean" or "cosine"
+/// * `dist_metric` - Distance metric: "euclidean" or "cosine". "manhatten" is
+///   not supported.
 /// * `k` - Final neighbours per node (default 30)
 /// * `build_k` - Internal NNDescent degree before CAGRA pruning (default 2*k)
 /// * `max_iters` - Maximum NNDescent iterations (default 15)
@@ -2210,15 +2314,19 @@ pub fn build_nndescent_index_gpu<T, R>(
     verbose: bool,
     retain_gpu: bool,
     device: R::Device,
-) -> NNDescentGpu<T, R>
+) -> Result<NNDescentGpu<T, R>, AnnSearchErrors>
 where
     R: Runtime,
     T: AnnSearchFloat + AnnSearchGpuFloat,
     NNDescentGpu<T, R>: NNDescentQuery<T>,
 {
-    let ann_dist = parse_ann_dist(dist_metric).unwrap_or_default();
+    let metric = parse_ann_dist(dist_metric).unwrap_or_else(|| {
+        println!("[WARNING] Weird string used for distance metric. Using default squared Euclidean distance");
+        Dist::default()
+    });
+
     NNDescentGpu::build(
-        mat, ann_dist, k, build_k, max_iters, n_trees, delta, rho, refine_knn, seed, verbose,
+        mat, metric, k, build_k, max_iters, n_trees, delta, rho, refine_knn, seed, verbose,
         retain_gpu, device,
     )
 }
@@ -2247,7 +2355,7 @@ pub fn query_nndescent_index_gpu<T, R>(
     query_params: Option<CagraGpuSearchParams>,
     return_dist: bool,
     verbose: bool,
-) -> (Vec<Vec<usize>>, Option<Vec<Vec<T>>>)
+) -> KnnOptionResult<T>
 where
     R: Runtime,
     T: AnnSearchFloat + AnnSearchGpuFloat,
@@ -2275,12 +2383,12 @@ where
             .collect();
 
         let (indices, distances) =
-            index.query_batch_gpu(&queries_flat, n_queries, query_params, k, 42);
+            index.query_batch_gpu(&queries_flat, n_queries, query_params, k, 42)?;
 
         if return_dist {
-            (indices, Some(distances))
+            Ok((indices, Some(distances)))
         } else {
-            (indices, None)
+            Ok((indices, None))
         }
     } else {
         if verbose {
@@ -2296,14 +2404,14 @@ where
                 let row = query_mat.row(i);
                 index.query_row(row, k, ef_search)
             })
-            .collect();
+            .collect::<Result<Vec<_>, _>>()?;
 
         if return_dist {
             let (indices, distances) = results.into_iter().unzip();
-            (indices, Some(distances))
+            Ok((indices, Some(distances)))
         } else {
             let indices = results.into_iter().map(|(idx, _)| idx).collect();
-            (indices, None)
+            Ok((indices, None))
         }
     }
 }
@@ -2391,7 +2499,8 @@ where
 /// * `n_bits` - Number of bits per binary code (must be multiple of 8)
 /// * `seed` - Random seed for binariser
 /// * `binary_init` - Initialisation method ("itq" or "random")
-/// * `metric` - Distance metric for reranking (when save_store is true)
+/// * `dist_metric` - Distance metric: "euclidean" or "cosine". "manhatten" is
+///   not supported.
 /// * `save_store` - Whether to save vector store for reranking
 /// * `save_path` - Path to save vector store files (required if save_store is
 ///   true)
@@ -2404,20 +2513,23 @@ pub fn build_exhaustive_index_binary<T>(
     n_bits: usize,
     seed: usize,
     binary_init: &str,
-    metric: &str,
+    dist_metric: &str,
     save_store: bool,
     save_path: Option<impl AsRef<Path>>,
-) -> std::io::Result<ExhaustiveIndexBinary<T>>
+) -> Result<ExhaustiveIndexBinary<T>, AnnSearchErrors>
 where
     T: AnnSearchFloat + Pod,
 {
-    let metric = parse_ann_dist(metric).unwrap_or_default();
+    let metric = parse_ann_dist(dist_metric).unwrap_or_else(|| {
+        println!("[WARNING] Weird string used for distance metric. Using default squared Euclidean distance");
+        Dist::default()
+    });
 
     if save_store {
         let path = save_path.expect("save_path required when save_store is true");
         ExhaustiveIndexBinary::new_with_vector_store(mat, binary_init, n_bits, metric, seed, path)
     } else {
-        Ok(ExhaustiveIndexBinary::new(mat, binary_init, n_bits, seed))
+        ExhaustiveIndexBinary::new(mat, binary_init, n_bits, seed)
     }
 }
 
@@ -2446,7 +2558,7 @@ pub fn query_exhaustive_index_binary<T>(
     rerank_factor: Option<usize>,
     return_dist: bool,
     verbose: bool,
-) -> (Vec<Vec<usize>>, Option<Vec<Vec<T>>>)
+) -> KnnOptionResult<T>
 where
     T: AnnSearchFloat + Pod,
 {
@@ -2459,13 +2571,13 @@ where
             // path where asymmetric queries are sensible
             query_parallel(query_mat.nrows(), return_dist, verbose, |i| {
                 index.query_row_asymmetric(query_mat.row(i), k, rerank_factor)
-            })
+            })?
         } else {
             // path where asymmetric queries are not sensible/possible
             let (indices, distances_u32) =
                 query_parallel(query_mat.nrows(), return_dist, verbose, |i| {
                     index.query_row(query_mat.row(i), k)
-                });
+                })?;
             let distances_t = distances_u32.map(|dists| {
                 dists
                     .into_iter()
@@ -2476,7 +2588,7 @@ where
             (indices, distances_t)
         };
 
-        (indices, dist)
+        Ok((indices, dist))
     }
 }
 
@@ -2503,11 +2615,13 @@ pub fn query_exhaustive_index_binary_self<T>(
     rerank_factor: Option<usize>,
     return_dist: bool,
     verbose: bool,
-) -> (Vec<Vec<usize>>, Option<Vec<Vec<T>>>)
+) -> KnnOptionResult<T>
 where
     T: AnnSearchFloat + Pod,
 {
-    index.generate_knn(k, rerank_factor, return_dist, verbose)
+    let res = index.generate_knn(k, rerank_factor, return_dist, verbose)?;
+
+    Ok(res)
 }
 
 ////////////////
@@ -2523,8 +2637,11 @@ where
 /// * `binarisation_init` - "itq" or "random"
 /// * `n_bits` - Number of bits per code (multiple of 8)
 /// * `nlist` - Number of clusters (defaults to √n)
-/// * `max_iters` - K-means iterations (defaults to 30)
-/// * `dist_metric` - "euclidean" or "cosine"
+/// * `k_means_params` - Optional k-means trainings parameters, see
+///   [KMeansTrainingParams]. If not provided, will default to sensible
+///   defaults.
+/// * `dist_metric` - Distance metric: "euclidean" or "cosine". "manhatten" is
+///   not supported.
 /// * `seed` - Random seed
 /// * `save_store` - Whether to save vector store for reranking
 /// * `save_path` - Path to save vector store files (required if save_store
@@ -2540,17 +2657,20 @@ pub fn build_ivf_index_binary<T>(
     binarisation_init: &str,
     n_bits: usize,
     nlist: Option<usize>,
-    max_iters: Option<usize>,
+    k_means_params: Option<KMeansTrainingParams>,
     dist_metric: &str,
     seed: usize,
     save_store: bool,
     save_path: Option<impl AsRef<Path>>,
     verbose: bool,
-) -> std::io::Result<IvfIndexBinary<T>>
+) -> Result<IvfIndexBinary<T>, AnnSearchErrors>
 where
     T: AnnSearchFloat + Pod,
 {
-    let ann_dist = parse_ann_dist(dist_metric).unwrap_or_default();
+    let metric = parse_ann_dist(dist_metric).unwrap_or_else(|| {
+        println!("[WARNING] Weird string used for distance metric. Using default squared Euclidean distance");
+        Dist::default()
+    });
 
     if save_store {
         let path = save_path.expect("save_path required when save_store is true");
@@ -2558,24 +2678,24 @@ where
             mat,
             binarisation_init,
             n_bits,
-            ann_dist,
+            metric,
             nlist,
-            max_iters,
+            k_means_params,
             seed,
             verbose,
             path,
         )
     } else {
-        Ok(IvfIndexBinary::build(
+        IvfIndexBinary::build(
             mat,
             binarisation_init,
             n_bits,
-            ann_dist,
+            metric,
             nlist,
-            max_iters,
+            k_means_params,
             seed,
             verbose,
-        ))
+        )
     }
 }
 
@@ -2607,7 +2727,7 @@ pub fn query_ivf_index_binary<T>(
     rerank_factor: Option<usize>,
     return_dist: bool,
     verbose: bool,
-) -> (Vec<Vec<usize>>, Option<Vec<Vec<T>>>)
+) -> KnnOptionResult<T>
 where
     T: AnnSearchFloat + Pod,
 {
@@ -2619,12 +2739,12 @@ where
         let (indices, dist) = if index.use_asymmetric() {
             query_parallel(query_mat.nrows(), return_dist, verbose, |i| {
                 index.query_row_asymmetric(query_mat.row(i), k, nprobe, rerank_factor)
-            })
+            })?
         } else {
             let (indices, distances_u32) =
                 query_parallel(query_mat.nrows(), return_dist, verbose, |i| {
                     index.query_row(query_mat.row(i), k, nprobe)
-                });
+                })?;
             let distances_t = distances_u32.map(|dists| {
                 dists
                     .into_iter()
@@ -2633,7 +2753,7 @@ where
             });
             (indices, distances_t)
         };
-        (indices, dist)
+        Ok((indices, dist))
     }
 }
 
@@ -2661,7 +2781,7 @@ pub fn query_ivf_index_binary_self<T>(
     rerank_factor: Option<usize>,
     return_dist: bool,
     verbose: bool,
-) -> (Vec<Vec<usize>>, Option<Vec<Vec<T>>>)
+) -> KnnOptionResult<T>
 where
     T: AnnSearchFloat + Pod,
 {
@@ -2679,7 +2799,8 @@ where
 ///
 /// * `mat` - The initial matrix with samples x features
 /// * `n_clust_rabitq` - Number of clusters (None for automatic)
-/// * `dist_metric` - "euclidean" or "cosine"
+/// * `dist_metric` - Distance metric: "euclidean" or "cosine". "manhatten" is
+///   not supported.
 /// * `seed` - Random seed
 /// * `save_store` - Whether to save vector store for reranking
 /// * `save_path` - Path to save vector store files (required if save_store is
@@ -2695,21 +2816,20 @@ pub fn build_exhaustive_index_rabitq<T>(
     seed: usize,
     save_store: bool,
     save_path: Option<impl AsRef<Path>>,
-) -> std::io::Result<ExhaustiveIndexRaBitQ<T>>
+) -> Result<ExhaustiveIndexRaBitQ<T>, AnnSearchErrors>
 where
     T: AnnSearchFloat + Pod,
 {
-    let ann_dist = parse_ann_dist(dist_metric).unwrap_or_default();
+    let metric = parse_ann_dist(dist_metric).unwrap_or_else(|| {
+        println!("[WARNING] Weird string used for distance metric. Using default squared Euclidean distance");
+        Dist::default()
+    });
+
     if save_store {
         let path = save_path.expect("save_path required when save_store is true");
-        ExhaustiveIndexRaBitQ::new_with_vector_store(mat, &ann_dist, n_clust_rabitq, seed, path)
+        ExhaustiveIndexRaBitQ::new_with_vector_store(mat, &metric, n_clust_rabitq, seed, path)
     } else {
-        Ok(ExhaustiveIndexRaBitQ::new(
-            mat,
-            &ann_dist,
-            n_clust_rabitq,
-            seed,
-        ))
+        ExhaustiveIndexRaBitQ::new(mat, &metric, n_clust_rabitq, seed)
     }
 }
 
@@ -2740,7 +2860,7 @@ pub fn query_exhaustive_index_rabitq<T>(
     rerank_factor: Option<usize>,
     return_dist: bool,
     verbose: bool,
-) -> (Vec<Vec<usize>>, Option<Vec<Vec<T>>>)
+) -> KnnOptionResult<T>
 where
     T: AnnSearchFloat + Pod,
 {
@@ -2780,7 +2900,7 @@ pub fn query_exhaustive_index_rabitq_self<T>(
     rerank_factor: Option<usize>,
     return_dist: bool,
     verbose: bool,
-) -> (Vec<Vec<usize>>, Option<Vec<Vec<T>>>)
+) -> KnnOptionResult<T>
 where
     T: AnnSearchFloat + Pod,
 {
@@ -2798,8 +2918,11 @@ where
 ///
 /// * `mat` - The initial matrix with samples x features
 /// * `nlist` - Number of IVF cells (None for sqrt(n))
-/// * `max_iters` - K-means iterations (None for 30)
-/// * `dist_metric` - "euclidean" or "cosine"
+/// * `k_means_params` - Optional k-means trainings parameters, see
+///   [KMeansTrainingParams]. If not provided, will default to sensible
+///   defaults.
+/// * `dist_metric` - Distance metric: "euclidean" or "cosine". "manhatten" is
+///   not supported.
 /// * `seed` - Random seed
 /// * `save_store` - Whether to save vector store for reranking
 /// * `save_path` - Path to save vector store files (required if save_store is
@@ -2813,26 +2936,34 @@ where
 pub fn build_ivf_index_rabitq<T>(
     mat: MatRef<T>,
     nlist: Option<usize>,
-    max_iters: Option<usize>,
+    k_means_params: Option<KMeansTrainingParams>,
     dist_metric: &str,
     seed: usize,
     save_store: bool,
     save_path: Option<impl AsRef<Path>>,
     verbose: bool,
-) -> std::io::Result<IvfIndexRaBitQ<T>>
+) -> Result<IvfIndexRaBitQ<T>, AnnSearchErrors>
 where
     T: AnnSearchFloat + Pod,
 {
-    let ann_dist = parse_ann_dist(dist_metric).unwrap_or_default();
+    let metric = parse_ann_dist(dist_metric).unwrap_or_else(|| {
+        println!("[WARNING] Weird string used for distance metric. Using default squared Euclidean distance");
+        Dist::default()
+    });
+
     if save_store {
         let path = save_path.expect("save_path required when save_store is true");
         IvfIndexRaBitQ::build_with_vector_store(
-            mat, ann_dist, nlist, max_iters, seed, verbose, path,
+            mat,
+            metric,
+            nlist,
+            k_means_params,
+            seed,
+            verbose,
+            path,
         )
     } else {
-        Ok(IvfIndexRaBitQ::build(
-            mat, ann_dist, nlist, max_iters, seed, verbose,
-        ))
+        IvfIndexRaBitQ::build(mat, metric, nlist, k_means_params, seed, verbose)
     }
 }
 
@@ -2863,7 +2994,7 @@ pub fn query_ivf_index_rabitq<T>(
     rerank_factor: Option<usize>,
     return_dist: bool,
     verbose: bool,
-) -> (Vec<Vec<usize>>, Option<Vec<Vec<T>>>)
+) -> KnnOptionResult<T>
 where
     T: AnnSearchFloat + Pod,
 {
@@ -2903,7 +3034,7 @@ pub fn query_ivf_index_rabitq_self<T>(
     rerank_factor: Option<usize>,
     return_dist: bool,
     verbose: bool,
-) -> (Vec<Vec<usize>>, Option<Vec<Vec<T>>>)
+) -> KnnOptionResult<T>
 where
     T: AnnSearchFloat + Pod,
 {

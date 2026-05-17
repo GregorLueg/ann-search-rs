@@ -4,6 +4,7 @@
 
 #![allow(dead_code)]
 
+use ann_search_rs::prelude::KMeansTrainingParams;
 use cubecl::benchmark::{Benchmark, TimingMethod};
 use cubecl::future;
 use cubecl::prelude::*;
@@ -32,6 +33,10 @@ struct IvfBuildInput {
     dim: usize,
 }
 
+fn default_k_means_params() -> Option<KMeansTrainingParams> {
+    Some(KMeansTrainingParams::new(10, None, None))
+}
+
 impl<R: Runtime> Benchmark for IvfBuildBench<R> {
     type Input = IvfBuildInput;
     type Output = ();
@@ -52,7 +57,7 @@ impl<R: Runtime> Benchmark for IvfBuildBench<R> {
             mat.as_ref(),
             self.metric,
             Some(self.nlist),
-            Some(10),
+            default_k_means_params(),
             42,
             false,
             self.device.clone(),
@@ -101,7 +106,8 @@ impl<R: Runtime> Benchmark for IvfQueryBench<R> {
         });
         let result = self
             .index
-            .query_batch(mat.as_ref(), self.k, Some(self.nprobe), None, false);
+            .query_batch(mat.as_ref(), self.k, Some(self.nprobe), None, false)
+            .unwrap();
         Ok(result)
     }
 
@@ -134,7 +140,8 @@ impl<R: Runtime> Benchmark for IvfKnnBench<R> {
     fn execute(&self, _input: Self::Input) -> Result<Self::Output, String> {
         let result = self
             .index
-            .generate_knn(self.k, Some(self.nprobe), None, true, false);
+            .generate_knn(self.k, Some(self.nprobe), None, true, false)
+            .unwrap();
         Ok(result)
     }
 
@@ -165,15 +172,18 @@ fn run_ivf_suite<R: Runtime>(device: &R::Device) {
             .collect();
         let mat = Mat::from_fn(n, dim, |i, j| data[i * dim + j]);
 
-        let index = std::sync::Arc::new(IvfIndexGpu::<f32, R>::build(
-            mat.as_ref(),
-            Dist::Euclidean,
-            Some(nlist),
-            Some(10),
-            42,
-            false,
-            device.clone(),
-        ));
+        let index = std::sync::Arc::new(
+            IvfIndexGpu::<f32, R>::build(
+                mat.as_ref(),
+                Dist::SquaredEuclidean,
+                Some(nlist),
+                default_k_means_params(),
+                42,
+                false,
+                device.clone(),
+            )
+            .unwrap(),
+        );
 
         let nprobe_values = vec![
             ((nlist as f32).sqrt() as usize).max(1),

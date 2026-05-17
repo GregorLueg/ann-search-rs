@@ -51,6 +51,16 @@ where
     }
 }
 
+/////////////////////////
+// DimensionValidation //
+/////////////////////////
+
+impl<T> DimensionValidation for ExhaustiveIndex<T> {
+    fn dim(&self) -> usize {
+        self.dim
+    }
+}
+
 /////////////////////
 // ExhaustiveIndex //
 /////////////////////
@@ -116,11 +126,12 @@ where
     ///
     /// A tuple of `(indices, distances)`
     #[inline]
-    pub fn query(&self, query_vec: &[T], k: usize) -> (Vec<usize>, Vec<T>) {
-        assert!(
-            query_vec.len() == self.dim,
-            "The query vector has different dimensionality than the index"
-        );
+    pub fn query(
+        &self,
+        query_vec: &[T],
+        k: usize,
+    ) -> Result<(Vec<usize>, Vec<T>), AnnSearchErrors> {
+        self.check_dim(query_vec.len())?;
 
         let n_vectors = self.vectors_flat.len() / self.dim;
         let k = k.min(n_vectors);
@@ -128,7 +139,7 @@ where
         let mut heap: BinaryHeap<(OrderedFloat<T>, usize)> = BinaryHeap::with_capacity(k + 1);
 
         match self.metric {
-            Dist::Euclidean => {
+            Dist::SquaredEuclidean => {
                 for idx in 0..n_vectors {
                     let dist = self.euclidean_distance_to_query(idx, query_vec);
 
@@ -158,6 +169,18 @@ where
                     }
                 }
             }
+            Dist::Manhattan => {
+                for idx in 0..n_vectors {
+                    let dist = self.manhattan_distance_to_query(idx, query_vec);
+
+                    if heap.len() < k {
+                        heap.push((OrderedFloat(dist), idx));
+                    } else if dist < heap.peek().unwrap().0 .0 {
+                        heap.pop();
+                        heap.push((OrderedFloat(dist), idx));
+                    }
+                }
+            }
         }
 
         let mut results: Vec<_> = heap.into_iter().collect();
@@ -168,7 +191,7 @@ where
             .map(|(OrderedFloat(dist), idx)| (dist, idx))
             .unzip();
 
-        (indices, distances)
+        Ok((indices, distances))
     }
 
     /// Query function for row references
@@ -186,12 +209,11 @@ where
     ///
     /// A tuple of `(indices, distances)`
     #[inline]
-    pub fn query_row(&self, query_row: RowRef<T>, k: usize) -> (Vec<usize>, Vec<T>) {
-        assert!(
-            query_row.ncols() == self.dim,
-            "The query row has different dimensionality than the index"
-        );
-
+    pub fn query_row(
+        &self,
+        query_row: RowRef<T>,
+        k: usize,
+    ) -> Result<(Vec<usize>, Vec<T>), AnnSearchErrors> {
         if query_row.col_stride() == 1 {
             let slice =
                 unsafe { std::slice::from_raw_parts(query_row.as_ptr(), query_row.ncols()) };
@@ -217,12 +239,7 @@ where
     ///
     /// Tuple of `(knn_indices, optional distances)` where each row corresponds
     /// to a vector in the index
-    pub fn generate_knn(
-        &self,
-        k: usize,
-        return_dist: bool,
-        verbose: bool,
-    ) -> (Vec<Vec<usize>>, Option<Vec<Vec<T>>>) {
+    pub fn generate_knn(&self, k: usize, return_dist: bool, verbose: bool) -> KnnOptionResult<T> {
         use std::sync::{
             atomic::{AtomicUsize, Ordering},
             Arc,
@@ -250,14 +267,14 @@ where
 
                 self.query(vec, k)
             })
-            .collect();
+            .collect::<Result<Vec<_>, _>>()?;
 
         if return_dist {
             let (indices, distances) = results.into_iter().unzip();
-            (indices, Some(distances))
+            Ok((indices, Some(distances)))
         } else {
             let indices: Vec<Vec<usize>> = results.into_iter().map(|(idx, _)| idx).collect();
-            (indices, None)
+            Ok((indices, None))
         }
     }
 
@@ -298,7 +315,7 @@ mod tests {
     #[test]
     fn test_exhaustive_index_creation_euclidean() {
         let mat = create_simple_matrix();
-        let index = ExhaustiveIndex::new(mat.as_ref(), Dist::Euclidean);
+        let index = ExhaustiveIndex::new(mat.as_ref(), Dist::SquaredEuclidean);
 
         assert_eq!(index.n, 5);
         assert_eq!(index.dim, 3);
@@ -320,11 +337,11 @@ mod tests {
     #[test]
     fn test_exhaustive_query_finds_self_euclidean() {
         let mat = create_simple_matrix();
-        let index = ExhaustiveIndex::new(mat.as_ref(), Dist::Euclidean);
+        let index = ExhaustiveIndex::new(mat.as_ref(), Dist::SquaredEuclidean);
 
         // Query with point 0, should find itself first
         let query = vec![1.0, 0.0, 0.0];
-        let (indices, distances) = index.query(&query, 1);
+        let (indices, distances) = index.query(&query, 1).unwrap();
 
         assert_eq!(indices.len(), 1);
         assert_eq!(indices[0], 0);
@@ -338,7 +355,7 @@ mod tests {
 
         // Query with point 0, should find itself first
         let query = vec![1.0, 0.0, 0.0];
-        let (indices, distances) = index.query(&query, 1);
+        let (indices, distances) = index.query(&query, 1).unwrap();
 
         assert_eq!(indices[0], 0);
         assert_relative_eq!(distances[0], 0.0, epsilon = 1e-5);
@@ -347,10 +364,10 @@ mod tests {
     #[test]
     fn test_exhaustive_query_euclidean_multiple() {
         let mat = create_simple_matrix();
-        let index = ExhaustiveIndex::new(mat.as_ref(), Dist::Euclidean);
+        let index = ExhaustiveIndex::new(mat.as_ref(), Dist::SquaredEuclidean);
 
         let query = vec![1.0, 0.0, 0.0];
-        let (indices, distances) = index.query(&query, 3);
+        let (indices, distances) = index.query(&query, 3).unwrap();
 
         // Should find point 0 first (exact match)
         assert_eq!(indices[0], 0);
@@ -368,7 +385,7 @@ mod tests {
         let index = ExhaustiveIndex::new(mat.as_ref(), Dist::Cosine);
 
         let query = vec![1.0, 0.0, 0.0];
-        let (indices, distances) = index.query(&query, 5); // Get all 5
+        let (indices, distances) = index.query(&query, 5).unwrap(); // Get all 5
 
         // Should find point 0 first (identical direction)
         assert_eq!(indices[0], 0);
@@ -386,11 +403,11 @@ mod tests {
     #[test]
     fn test_exhaustive_query_k_larger_than_dataset() {
         let mat = create_simple_matrix();
-        let index = ExhaustiveIndex::new(mat.as_ref(), Dist::Euclidean);
+        let index = ExhaustiveIndex::new(mat.as_ref(), Dist::SquaredEuclidean);
 
         let query = vec![1.0, 0.0, 0.0];
         // Ask for 10 neighbours but only 5 points exist
-        let (indices, _) = index.query(&query, 10);
+        let (indices, _) = index.query(&query, 10).unwrap();
 
         // Should return exactly 5 results
         assert_eq!(indices.len(), 5);
@@ -399,10 +416,10 @@ mod tests {
     #[test]
     fn test_exhaustive_query_row() {
         let mat = create_simple_matrix();
-        let index = ExhaustiveIndex::new(mat.as_ref(), Dist::Euclidean);
+        let index = ExhaustiveIndex::new(mat.as_ref(), Dist::SquaredEuclidean);
 
         // Query using a row from the matrix
-        let (indices, distances) = index.query_row(mat.row(0), 1);
+        let (indices, distances) = index.query_row(mat.row(0), 1).unwrap();
 
         assert_eq!(indices[0], 0);
         assert_relative_eq!(distances[0], 0.0, epsilon = 1e-5);
@@ -411,10 +428,10 @@ mod tests {
     #[test]
     fn test_exhaustive_euclidean_distances() {
         let mat = create_simple_matrix();
-        let index = ExhaustiveIndex::new(mat.as_ref(), Dist::Euclidean);
+        let index = ExhaustiveIndex::new(mat.as_ref(), Dist::SquaredEuclidean);
 
         let query = vec![1.0, 0.0, 0.0];
-        let (indices, distances) = index.query(&query, 5);
+        let (indices, distances) = index.query(&query, 5).unwrap();
 
         // Distance from [1,0,0] to [1,0,0] = 0
         assert_eq!(indices[0], 0);
@@ -435,10 +452,10 @@ mod tests {
     #[test]
     fn test_exhaustive_all_points_found() {
         let mat = create_simple_matrix();
-        let index = ExhaustiveIndex::new(mat.as_ref(), Dist::Euclidean);
+        let index = ExhaustiveIndex::new(mat.as_ref(), Dist::SquaredEuclidean);
 
         let query = vec![0.5, 0.5, 0.5];
-        let (indices, _) = index.query(&query, 5);
+        let (indices, _) = index.query(&query, 5).unwrap();
 
         // All 5 points should be found
         assert_eq!(indices.len(), 5);
@@ -463,11 +480,11 @@ mod tests {
         }
 
         let mat = Mat::from_fn(n, dim, |i, j| data[i * dim + j]);
-        let index = ExhaustiveIndex::new(mat.as_ref(), Dist::Euclidean);
+        let index = ExhaustiveIndex::new(mat.as_ref(), Dist::SquaredEuclidean);
 
         // Query for point 0
         let query: Vec<f32> = (0..dim).map(|_| 0.0).collect();
-        let (indices, _) = index.query(&query, 5);
+        let (indices, _) = index.query(&query, 5).unwrap();
 
         assert_eq!(indices.len(), 5);
         assert_eq!(indices[0], 0); // Should find exact match first
@@ -484,7 +501,7 @@ mod tests {
         let index = ExhaustiveIndex::new(mat.as_ref(), Dist::Cosine);
 
         let query = vec![1.0, 2.0, 3.0];
-        let (indices, distances) = index.query(&query, 3);
+        let (indices, distances) = index.query(&query, 3).unwrap();
 
         // Should find itself first
         assert_eq!(indices[0], 0);
@@ -502,7 +519,7 @@ mod tests {
     #[test]
     fn test_exhaustive_implements_vector_distance() {
         let mat = create_simple_matrix();
-        let index = ExhaustiveIndex::new(mat.as_ref(), Dist::Euclidean);
+        let index = ExhaustiveIndex::new(mat.as_ref(), Dist::SquaredEuclidean);
 
         // Test that we can call VectorDistance methods
         let dist = index.euclidean_distance(0, 1);
@@ -529,11 +546,11 @@ mod tests {
     fn test_exhaustive_query_consistency() {
         // Test that query and query_row give same results
         let mat = create_simple_matrix();
-        let index = ExhaustiveIndex::new(mat.as_ref(), Dist::Euclidean);
+        let index = ExhaustiveIndex::new(mat.as_ref(), Dist::SquaredEuclidean);
 
         let query_vec = vec![1.0, 0.0, 0.0];
-        let (indices1, distances1) = index.query(&query_vec, 3);
-        let (indices2, distances2) = index.query_row(mat.row(0), 3);
+        let (indices1, distances1) = index.query(&query_vec, 3).unwrap();
+        let (indices2, distances2) = index.query_row(mat.row(0), 3).unwrap();
 
         assert_eq!(indices1, indices2);
         for i in 0..distances1.len() {

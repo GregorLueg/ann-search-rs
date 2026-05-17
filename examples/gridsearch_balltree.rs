@@ -34,7 +34,7 @@ fn main() {
     println!("Querying exhaustive index...");
     let start = Instant::now();
     let (true_neighbors, true_distances) =
-        query_exhaustive_index(query_data.as_ref(), &exhaustive_idx, cli.k, true, false);
+        query_exhaustive_index(query_data.as_ref(), &exhaustive_idx, cli.k, true, false).unwrap();
     let query_time = start.elapsed().as_secs_f64() * 1000.0;
 
     results.push(BenchmarkResultSize {
@@ -51,7 +51,7 @@ fn main() {
     println!("Self-querying exhaustive index...");
     let start = Instant::now();
     let (true_neighbors_self, true_distances_self) =
-        query_exhaustive_self(&exhaustive_idx, cli.k, true, false);
+        query_exhaustive_self(&exhaustive_idx, cli.k, true, false).unwrap();
     let self_query_time = start.elapsed().as_secs_f64() * 1000.0;
 
     results.push(BenchmarkResultSize {
@@ -77,7 +77,8 @@ fn main() {
 
     println!("Building BallTree index...");
     let start = Instant::now();
-    let balltree_idx = build_balltree_index(data.as_ref(), cli.distance, cli.seed as usize);
+    let balltree_idx =
+        build_balltree_index(data.as_ref(), &cli.distance, cli.seed as usize).unwrap();
     let index_size_mb = balltree_idx.memory_usage_bytes() as f64 / (1024.0 * 1024.0);
 
     let build_time = start.elapsed().as_secs_f64() * 1000.0;
@@ -95,7 +96,8 @@ fn main() {
             Some(search_budget),
             true,
             false,
-        );
+        )
+        .unwrap();
         let query_time = start.elapsed().as_secs_f64() * 1000.0;
 
         let recall = calculate_recall(&true_neighbors, &approx_neighbours, cli.k);
@@ -118,7 +120,7 @@ fn main() {
 
     let start = Instant::now();
     let (approx_neighbours_self, approx_dist_self) =
-        query_balltree_self(&balltree_idx, cli.k, None, true, false);
+        query_balltree_self(&balltree_idx, cli.k, None, true, false).unwrap();
 
     let self_query_time = start.elapsed().as_secs_f64() * 1000.0;
 
