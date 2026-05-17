@@ -386,6 +386,10 @@ pub struct VamanaIndex<T> {
     original_ids: Vec<usize>,
 }
 
+////////////////////
+// VectorDistance //
+////////////////////
+
 /// VectorDistance implementation
 impl<T> VectorDistance<T> for VamanaIndex<T>
 where
@@ -403,6 +407,20 @@ where
         &self.norms
     }
 }
+
+/////////////////////////
+// DimensionValidation //
+/////////////////////////
+
+impl<T> DimensionValidation for VamanaIndex<T> {
+    fn dim(&self) -> usize {
+        self.dim
+    }
+}
+
+/////////////////////////
+// Main implementation //
+/////////////////////////
 
 impl<T> VamanaIndex<T>
 where
@@ -571,8 +589,9 @@ where
     #[inline]
     fn distance(&self, i: usize, j: usize) -> T {
         match self.metric {
-            Dist::Euclidean => self.euclidean_distance(i, j),
+            Dist::SquaredEuclidean => self.euclidean_distance(i, j),
             Dist::Cosine => self.cosine_distance(i, j),
+            Dist::Manhattan => self.manhattan_distance(i, j),
         }
     }
 
@@ -758,8 +777,9 @@ where
     #[inline(always)]
     fn compute_query_distance(&self, query: &[T], idx: usize, query_norm: T) -> T {
         match self.metric {
-            Dist::Euclidean => self.euclidean_distance_to_query(idx, query),
+            Dist::SquaredEuclidean => self.euclidean_distance_to_query(idx, query),
             Dist::Cosine => self.cosine_distance_to_query(idx, query, query_norm),
+            Dist::Manhattan => self.manhattan_distance_to_query(idx, query),
         }
     }
 
@@ -778,8 +798,13 @@ where
     ///
     /// Tuple of `(indices, distances)` sorted by distance (nearest first)
     #[inline]
-    pub fn query(&self, query: &[T], k: usize, ef_search: Option<usize>) -> (Vec<usize>, Vec<T>) {
-        assert_eq!(query.len(), self.dim);
+    pub fn query(
+        &self,
+        query: &[T],
+        k: usize,
+        ef_search: Option<usize>,
+    ) -> Result<(Vec<usize>, Vec<T>), AnnSearchErrors> {
+        self.check_dim(query.len())?;
 
         let ef_search = ef_search.unwrap_or(75);
 
@@ -860,7 +885,7 @@ where
                 .map(|(OrderedFloat(d), id)| (id, d))
                 .unzip();
 
-            (indices, distances)
+            Ok((indices, distances))
         })
     }
 
@@ -874,7 +899,7 @@ where
         query_row: RowRef<T>,
         k: usize,
         ef_search: Option<usize>,
-    ) -> (Vec<usize>, Vec<T>) {
+    ) -> Result<(Vec<usize>, Vec<T>), AnnSearchErrors> {
         if query_row.col_stride() == 1 {
             let slice =
                 unsafe { std::slice::from_raw_parts(query_row.as_ptr(), query_row.ncols()) };
@@ -905,7 +930,7 @@ where
         ef_search: Option<usize>,
         return_dist: bool,
         verbose: bool,
-    ) -> (Vec<Vec<usize>>, Option<Vec<Vec<T>>>) {
+    ) -> KnnOptionResult<T> {
         let counter = Arc::new(AtomicUsize::new(0));
 
         let results: Vec<(Vec<usize>, Vec<T>)> = (0..self.n)
@@ -928,14 +953,14 @@ where
 
                 self.query(vec, k, ef_search)
             })
-            .collect();
+            .collect::<Result<Vec<_>, AnnSearchErrors>>()?;
 
         if return_dist {
             let (indices, distances) = results.into_iter().unzip();
-            (indices, Some(distances))
+            Ok((indices, Some(distances)))
         } else {
             let indices: Vec<Vec<usize>> = results.into_iter().map(|(idx, _)| idx).collect();
-            (indices, None)
+            Ok((indices, None))
         }
     }
 
@@ -963,13 +988,21 @@ where
     T: AnnSearchFloat,
     Self: VamanaState<T>,
 {
-    fn query_for_validation(&self, query_vec: &[T], k: usize) -> (Vec<usize>, Vec<T>) {
+    fn query_for_validation(
+        &self,
+        query_vec: &[T],
+        k: usize,
+    ) -> Result<(Vec<usize>, Vec<T>), AnnSearchErrors> {
         // Default budget
         self.query(query_vec, k, None)
     }
 
     fn n(&self) -> usize {
         self.n
+    }
+
+    fn dim(&self) -> usize {
+        self.dim
     }
 
     fn metric(&self) -> Dist {
@@ -1003,7 +1036,7 @@ mod tests {
     fn build_default(mat: &Mat<f32>, metric: &str) -> VamanaIndex<f32> {
         VamanaIndex::<f32>::build(
             mat.as_ref(),
-            parse_ann_dist(metric).unwrap_or(Dist::Euclidean),
+            parse_ann_dist(metric).unwrap_or(Dist::SquaredEuclidean),
             16,
             100,
             1.0,
@@ -1030,7 +1063,7 @@ mod tests {
         let index = build_default(&mat, "euclidean");
 
         let query = vec![1.0_f32, 0.0, 0.0];
-        let (indices, distances) = index.query(&query, 1, None);
+        let (indices, distances) = index.query(&query, 1, None).unwrap();
 
         assert_eq!(indices.len(), 1);
         assert_eq!(indices[0], 0);
@@ -1043,7 +1076,7 @@ mod tests {
         let index = build_default(&mat, "cosine");
 
         let query = vec![1.0_f32, 0.0, 0.0];
-        let (indices, distances) = index.query(&query, 1, None);
+        let (indices, distances) = index.query(&query, 1, None).unwrap();
 
         assert_eq!(indices[0], 0);
         assert_relative_eq!(distances[0], 0.0, epsilon = 1e-5);
@@ -1055,7 +1088,7 @@ mod tests {
         let index = build_default(&mat, "euclidean");
 
         let query = vec![0.5_f32, 0.5, 0.0];
-        let (_, distances) = index.query(&query, 4, None);
+        let (_, distances) = index.query(&query, 4, None).unwrap();
 
         for i in 1..distances.len() {
             assert!(
@@ -1073,7 +1106,7 @@ mod tests {
 
         let query = vec![0.0_f32, 0.0, 0.0];
         for k in 1..=5 {
-            let (indices, distances) = index.query(&query, k, None);
+            let (indices, distances) = index.query(&query, k, None).unwrap();
             assert_eq!(indices.len(), k);
             assert_eq!(distances.len(), k);
         }
@@ -1086,16 +1119,17 @@ mod tests {
         let data: Vec<f32> = (0..n * dim).map(|i| (i as f32) * 0.01).collect();
         let mat = Mat::from_fn(n, dim, |i, j| data[i * dim + j]);
 
-        let index = VamanaIndex::<f32>::build(mat.as_ref(), Dist::Euclidean, 32, 150, 1.0, 1.2, 42);
+        let index =
+            VamanaIndex::<f32>::build(mat.as_ref(), Dist::SquaredEuclidean, 32, 150, 1.0, 1.2, 42);
 
         let query: Vec<f32> = (0..dim).map(|_| 0.5).collect();
 
         // Higher ef_search should return same or better results
-        let (_, _) = index.query(&query, 10, Some(50));
-        let (_, _) = index.query(&query, 10, Some(200));
+        let (_, _) = index.query(&query, 10, Some(50)).unwrap();
+        let (_, _) = index.query(&query, 10, Some(200)).unwrap();
         // Both must return exactly k results
-        let (idx_low, _) = index.query(&query, 10, Some(50));
-        let (idx_high, _) = index.query(&query, 10, Some(200));
+        let (idx_low, _) = index.query(&query, 10, Some(50)).unwrap();
+        let (idx_high, _) = index.query(&query, 10, Some(200)).unwrap();
         assert_eq!(idx_low.len(), 10);
         assert_eq!(idx_high.len(), 10);
     }
@@ -1110,10 +1144,11 @@ mod tests {
         }
         let mat = Mat::from_fn(n, dim, |i, j| data[i * dim + j]);
 
-        let index = VamanaIndex::<f32>::build(mat.as_ref(), Dist::Euclidean, 16, 200, 1.0, 1.2, 42);
+        let index =
+            VamanaIndex::<f32>::build(mat.as_ref(), Dist::SquaredEuclidean, 16, 200, 1.0, 1.2, 42);
 
         let query = vec![0.0_f32, 0.0, 0.0];
-        let (indices, _) = index.query(&query, 5, Some(150));
+        let (indices, _) = index.query(&query, 5, Some(150)).unwrap();
 
         assert_eq!(indices[0], 0, "Nearest point should be index 0");
 
@@ -1178,7 +1213,7 @@ mod tests {
                 let idx = Arc::clone(&index);
                 thread::spawn(move || {
                     let query = vec![0.5_f32, 0.5, 0.0];
-                    let (indices, _) = idx.query(&query, 3, None);
+                    let (indices, _) = idx.query(&query, 3, None).unwrap();
                     assert_eq!(indices.len(), 3);
                 })
             })
@@ -1196,8 +1231,8 @@ mod tests {
         let idx2 = build_default(&mat, "euclidean");
 
         let query = vec![0.5_f32, 0.5, 0.0];
-        let (i1, _) = idx1.query(&query, 3, None);
-        let (i2, _) = idx2.query(&query, 3, None);
+        let (i1, _) = idx1.query(&query, 3, None).unwrap();
+        let (i2, _) = idx2.query(&query, 3, None).unwrap();
         assert_eq!(i1, i2);
     }
 
@@ -1207,10 +1242,11 @@ mod tests {
         let dim = 4;
         let data: Vec<f32> = (0..n * dim).map(|i| i as f32).collect();
         let mat = Mat::from_fn(n, dim, |i, j| data[i * dim + j]);
-        let index = VamanaIndex::<f32>::build(mat.as_ref(), Dist::Euclidean, 16, 100, 1.0, 1.2, 42);
+        let index =
+            VamanaIndex::<f32>::build(mat.as_ref(), Dist::SquaredEuclidean, 16, 100, 1.0, 1.2, 42);
 
         let k = 5;
-        let (indices, distances) = index.generate_knn(k, None, true, false);
+        let (indices, distances) = index.generate_knn(k, None, true, false).unwrap();
         assert_eq!(indices.len(), n);
         assert!(distances.is_some());
         let dists = distances.unwrap();
@@ -1235,10 +1271,17 @@ mod tests {
         let mat = Mat::from_fn(n, dim, |i, j| data[i * dim + j]);
 
         for r in [16, 32, 48, 64] {
-            let index =
-                VamanaIndex::<f32>::build(mat.as_ref(), Dist::Euclidean, r, 150, 1.0, 1.2, 42);
+            let index = VamanaIndex::<f32>::build(
+                mat.as_ref(),
+                Dist::SquaredEuclidean,
+                r,
+                150,
+                1.0,
+                1.2,
+                42,
+            );
             let query: Vec<f32> = (0..dim).map(|_| 0.5).collect();
-            let (indices, _) = index.query(&query, 10, None);
+            let (indices, _) = index.query(&query, 10, None).unwrap();
             assert_eq!(indices.len(), 10, "Failed with r={}", r);
         }
     }
@@ -1251,17 +1294,18 @@ mod tests {
         let data: Vec<f32> = (0..n * dim).map(|i| (i as f32) * 0.01).collect();
         let mat = Mat::from_fn(n, dim, |i, j| data[i * dim + j]);
 
-        let index = VamanaIndex::<f32>::build(mat.as_ref(), Dist::Euclidean, 32, 150, 1.0, 1.4, 42);
+        let index =
+            VamanaIndex::<f32>::build(mat.as_ref(), Dist::SquaredEuclidean, 32, 150, 1.0, 1.4, 42);
 
         let query: Vec<f32> = (0..dim).map(|_| 0.5).collect();
-        let (indices, _) = index.query(&query, 10, None);
+        let (indices, _) = index.query(&query, 10, None).unwrap();
         assert_eq!(indices.len(), 10);
     }
 
     #[test]
     fn test_compute_medoid_single_point() {
         let data = vec![1.0_f32, 2.0, 3.0];
-        let medoid = compute_medoid(&data, 1, 3, Dist::Euclidean);
+        let medoid = compute_medoid(&data, 1, 3, Dist::SquaredEuclidean);
         assert_eq!(medoid, 0);
     }
 

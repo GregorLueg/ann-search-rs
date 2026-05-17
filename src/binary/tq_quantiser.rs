@@ -341,7 +341,7 @@ mod tests {
 
     #[test]
     fn test_encoder_creation_4bit() {
-        let enc = TurboQuantEncoder::<f32>::new(64, 4, Dist::Euclidean, 42);
+        let enc = TurboQuantEncoder::<f32>::new(64, 4, Dist::SquaredEuclidean, 42);
         assert_eq!(enc.dim, 64);
         assert_eq!(enc.bits, 4);
         assert_eq!(enc.bytes_per_vec, 32);
@@ -351,11 +351,11 @@ mod tests {
 
     #[test]
     fn test_encoder_creation_2bit_3bit() {
-        let e2 = TurboQuantEncoder::<f32>::new(64, 2, Dist::Euclidean, 42);
+        let e2 = TurboQuantEncoder::<f32>::new(64, 2, Dist::SquaredEuclidean, 42);
         assert_eq!(e2.bytes_per_vec, 16);
         assert_eq!(e2.levels.len(), 4);
 
-        let e3 = TurboQuantEncoder::<f32>::new(64, 3, Dist::Euclidean, 42);
+        let e3 = TurboQuantEncoder::<f32>::new(64, 3, Dist::SquaredEuclidean, 42);
         assert_eq!(e3.bytes_per_vec, 24);
         assert_eq!(e3.levels.len(), 8);
     }
@@ -363,7 +363,7 @@ mod tests {
     #[test]
     fn test_rotation_orthogonality() {
         let dim = 16;
-        let enc = TurboQuantEncoder::<f64>::new(dim, 4, Dist::Euclidean, 42);
+        let enc = TurboQuantEncoder::<f64>::new(dim, 4, Dist::SquaredEuclidean, 42);
         for i in 0..dim {
             for j in 0..dim {
                 let mut dot = 0.0f64;
@@ -378,14 +378,14 @@ mod tests {
 
     #[test]
     fn test_rotation_deterministic() {
-        let e1 = TurboQuantEncoder::<f32>::new(16, 4, Dist::Euclidean, 42);
-        let e2 = TurboQuantEncoder::<f32>::new(16, 4, Dist::Euclidean, 42);
+        let e1 = TurboQuantEncoder::<f32>::new(16, 4, Dist::SquaredEuclidean, 42);
+        let e2 = TurboQuantEncoder::<f32>::new(16, 4, Dist::SquaredEuclidean, 42);
         assert_eq!(e1.rotation, e2.rotation);
     }
 
     #[test]
     fn test_encode_vector_norm() {
-        let enc = TurboQuantEncoder::<f32>::new(8, 4, Dist::Euclidean, 42);
+        let enc = TurboQuantEncoder::<f32>::new(8, 4, Dist::SquaredEuclidean, 42);
         let v = vec![3.0_f32, 4.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
         let (packed, norm) = enc.encode_vector(&v);
         assert_abs_diff_eq!(norm, 5.0, epsilon = 1e-5);
@@ -394,7 +394,7 @@ mod tests {
 
     #[test]
     fn test_encode_zero_vector() {
-        let enc = TurboQuantEncoder::<f32>::new(8, 4, Dist::Euclidean, 42);
+        let enc = TurboQuantEncoder::<f32>::new(8, 4, Dist::SquaredEuclidean, 42);
         let v = vec![0.0_f32; 8];
         let (_, norm) = enc.encode_vector(&v);
         assert_abs_diff_eq!(norm, 0.0, epsilon = 1e-7);
@@ -412,7 +412,7 @@ mod tests {
 
     #[test]
     fn test_encode_query_zero() {
-        let enc = TurboQuantEncoder::<f32>::new(8, 4, Dist::Euclidean, 42);
+        let enc = TurboQuantEncoder::<f32>::new(8, 4, Dist::SquaredEuclidean, 42);
         let q = vec![0.0_f32; 8];
         let eq = enc.encode_query(&q);
         assert_abs_diff_eq!(eq.query_norm, 0.0, epsilon = 1e-7);
@@ -475,7 +475,7 @@ mod tests {
                 data[(i, j)] = (i * dim + j) as f32 * 0.1;
             }
         }
-        let q = TurboQuantQuantiser::new(data.as_ref(), &Dist::Euclidean, 4, 42);
+        let q = TurboQuantQuantiser::new(data.as_ref(), &Dist::SquaredEuclidean, 4, 42);
 
         assert_eq!(q.n_vectors(), n);
         assert_eq!(q.storage.dim, dim);
@@ -495,7 +495,7 @@ mod tests {
                 data[(i, j)] = (i * dim + j) as f32 * 0.1;
             }
         }
-        let q = TurboQuantQuantiser::new(data.as_ref(), &Dist::Euclidean, 4, 42);
+        let q = TurboQuantQuantiser::new(data.as_ref(), &Dist::SquaredEuclidean, 4, 42);
 
         for i in 0..n {
             let row: Vec<f32> = (0..dim).map(|j| data[(i, j)]).collect();
@@ -509,7 +509,7 @@ mod tests {
         let n = 4;
         let dim = 16;
         let data = Mat::<f32>::zeros(n, dim);
-        let q = TurboQuantQuantiser::new(data.as_ref(), &Dist::Euclidean, 4, 42);
+        let q = TurboQuantQuantiser::new(data.as_ref(), &Dist::SquaredEuclidean, 4, 42);
         for i in 0..n {
             assert_eq!(q.storage.vector_packed(i).len(), q.storage.bytes_per_vec);
         }
@@ -518,12 +518,12 @@ mod tests {
     #[test]
     #[should_panic(expected = "bits must be 2, 3, or 4")]
     fn test_invalid_bits() {
-        let _ = TurboQuantEncoder::<f32>::new(8, 5, Dist::Euclidean, 42);
+        let _ = TurboQuantEncoder::<f32>::new(8, 5, Dist::SquaredEuclidean, 42);
     }
 
     #[test]
     #[should_panic(expected = "dim must be a multiple of 8")]
     fn test_invalid_dim() {
-        let _ = TurboQuantEncoder::<f32>::new(7, 4, Dist::Euclidean, 42);
+        let _ = TurboQuantEncoder::<f32>::new(7, 4, Dist::SquaredEuclidean, 42);
     }
 }

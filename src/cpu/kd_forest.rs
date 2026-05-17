@@ -139,6 +139,20 @@ where
     }
 }
 
+/////////////////////////
+// DimensionValidation //
+/////////////////////////
+
+impl<T> DimensionValidation for KdTreeIndex<T> {
+    fn dim(&self) -> usize {
+        self.dim
+    }
+}
+
+//////////
+// Main //
+//////////
+
 impl<T> KdTreeIndex<T>
 where
     T: AnnSearchFloat,
@@ -580,7 +594,9 @@ where
         query_vec: &[T],
         k: usize,
         search_k: Option<usize>,
-    ) -> (Vec<usize>, Vec<T>) {
+    ) -> Result<(Vec<usize>, Vec<T>), AnnSearchErrors> {
+        self.check_dim(query_vec.len())?;
+
         let limit = search_k.unwrap_or(k * self.n_trees * 20);
         let mut visited_count = 0;
 
@@ -624,8 +640,9 @@ where
                 // margin^2 is one component, so cos_dist >= margin^2/2
                 // Claude says this is the right way to do this...
                 let lower_bound = match self.metric {
-                    Dist::Euclidean => abs_margin * abs_margin,
+                    Dist::SquaredEuclidean => abs_margin * abs_margin,
                     Dist::Cosine => abs_margin * abs_margin * 0.5,
+                    Dist::Manhattan => abs_margin,
                 };
                 if lower_bound > kth_dist.to_f64().unwrap() {
                     break;
@@ -653,10 +670,13 @@ where
                         visited.insert(item);
 
                         let dist = match self.metric {
-                            Dist::Euclidean => self.euclidean_distance_to_query(item, query_vec),
+                            Dist::SquaredEuclidean => {
+                                self.euclidean_distance_to_query(item, query_vec)
+                            }
                             Dist::Cosine => {
                                 self.cosine_distance_to_query(item, query_vec, query_norm)
                             }
+                            Dist::Manhattan => self.manhattan_distance_to_query(item, query_vec),
                         };
 
                         if dist < kth_dist || top_k.len() < k {
@@ -701,7 +721,7 @@ where
             })
             .collect();
 
-        results.into_iter().unzip()
+        Ok(results.into_iter().unzip())
     }
 
     /// Query using a matrix row reference
@@ -725,7 +745,7 @@ where
         query_row: RowRef<T>,
         k: usize,
         search_k: Option<usize>,
-    ) -> (Vec<usize>, Vec<T>) {
+    ) -> Result<(Vec<usize>, Vec<T>), AnnSearchErrors> {
         if query_row.col_stride() == 1 {
             let slice =
                 unsafe { std::slice::from_raw_parts(query_row.as_ptr(), query_row.ncols()) };
@@ -764,7 +784,7 @@ where
         search_k: Option<usize>,
         return_dist: bool,
         verbose: bool,
-    ) -> (Vec<Vec<usize>>, Option<Vec<Vec<T>>>) {
+    ) -> KnnOptionResult<T> {
         let counter = Arc::new(AtomicUsize::new(0));
 
         let unordered_results: Vec<(usize, Vec<usize>, Vec<T>)> = (0..self.n)
@@ -787,10 +807,10 @@ where
                     }
                 }
 
-                let (indices, dists) = self.query(vec, k, search_k);
-                (orig_id, indices, dists)
+                let (indices, dists) = self.query(vec, k, search_k)?;
+                Ok((orig_id, indices, dists))
             })
-            .collect();
+            .collect::<Result<Vec<_>, AnnSearchErrors>>()?;
 
         let mut final_indices = vec![Vec::new(); self.n];
         let mut final_dists = if return_dist {
@@ -806,7 +826,7 @@ where
             }
         }
 
-        (final_indices, final_dists)
+        Ok((final_indices, final_dists))
     }
 
     ////////////
@@ -837,12 +857,20 @@ impl<T> KnnValidation<T> for KdTreeIndex<T>
 where
     T: AnnSearchFloat,
 {
-    fn query_for_validation(&self, query_vec: &[T], k: usize) -> (Vec<usize>, Vec<T>) {
+    fn query_for_validation(
+        &self,
+        query_vec: &[T],
+        k: usize,
+    ) -> Result<(Vec<usize>, Vec<T>), AnnSearchErrors> {
         self.query(query_vec, k, None)
     }
 
     fn n(&self) -> usize {
         self.n
+    }
+
+    fn dim(&self) -> usize {
+        self.dim
     }
 
     fn metric(&self) -> Dist {
@@ -879,7 +907,7 @@ mod tests {
     #[test]
     fn test_kd_tree_index_creation() {
         let mat = create_simple_matrix();
-        let _ = KdTreeIndex::new(mat.as_ref(), 4, Dist::Euclidean, 42);
+        let _ = KdTreeIndex::new(mat.as_ref(), 4, Dist::SquaredEuclidean, 42);
 
         // just verify it doesn't panic
     }
@@ -887,10 +915,10 @@ mod tests {
     #[test]
     fn test_kd_tree_query_finds_self() {
         let mat = create_simple_matrix();
-        let index = KdTreeIndex::new(mat.as_ref(), 4, Dist::Euclidean, 42);
+        let index = KdTreeIndex::new(mat.as_ref(), 4, Dist::SquaredEuclidean, 42);
 
         let query = vec![1.0, 0.0, 0.0];
-        let (indices, distances) = index.query(&query, 1, None);
+        let (indices, distances) = index.query(&query, 1, None).unwrap();
 
         assert_eq!(indices.len(), 1);
         assert_eq!(indices[0], 0);
@@ -900,10 +928,10 @@ mod tests {
     #[test]
     fn test_kd_tree_query_euclidean() {
         let mat = create_simple_matrix();
-        let index = KdTreeIndex::new(mat.as_ref(), 8, Dist::Euclidean, 42);
+        let index = KdTreeIndex::new(mat.as_ref(), 8, Dist::SquaredEuclidean, 42);
 
         let query = vec![1.0, 0.0, 0.0];
-        let (indices, distances) = index.query(&query, 3, None);
+        let (indices, distances) = index.query(&query, 3, None).unwrap();
 
         // Should find point 0 first (exact match)
         assert_eq!(indices[0], 0);
@@ -921,7 +949,7 @@ mod tests {
         let index = KdTreeIndex::new(mat.as_ref(), 8, Dist::Cosine, 42);
 
         let query = vec![1.0, 0.0, 0.0];
-        let (indices, distances) = index.query(&query, 3, None);
+        let (indices, distances) = index.query(&query, 3, None).unwrap();
 
         // Should find point 0 first (identical direction)
         assert_eq!(indices[0], 0);
@@ -931,11 +959,11 @@ mod tests {
     #[test]
     fn test_kd_tree_query_k_larger_than_dataset() {
         let mat = create_simple_matrix();
-        let index = KdTreeIndex::new(mat.as_ref(), 4, Dist::Euclidean, 42);
+        let index = KdTreeIndex::new(mat.as_ref(), 4, Dist::SquaredEuclidean, 42);
 
         let query = vec![1.0, 0.0, 0.0];
         // ask for 10 neighbours but only 5 points exist
-        let (indices, _) = index.query(&query, 10, None);
+        let (indices, _) = index.query(&query, 10, None).unwrap();
 
         // Should return at most 5 results
         assert!(indices.len() <= 5);
@@ -944,13 +972,13 @@ mod tests {
     #[test]
     fn test_kd_tree_query_search_k() {
         let mat = create_simple_matrix();
-        let index = KdTreeIndex::new(mat.as_ref(), 4, Dist::Euclidean, 42);
+        let index = KdTreeIndex::new(mat.as_ref(), 4, Dist::SquaredEuclidean, 42);
 
         let query = vec![1.0, 0.0, 0.0];
 
         // With higher search_k, should get same or better results
-        let (indices1, _) = index.query(&query, 3, Some(10));
-        let (indices2, _) = index.query(&query, 3, Some(50));
+        let (indices1, _) = index.query(&query, 3, Some(10)).unwrap();
+        let (indices2, _) = index.query(&query, 3, Some(50)).unwrap();
 
         assert_eq!(indices1.len(), 3);
         assert_eq!(indices2.len(), 3);
@@ -961,12 +989,12 @@ mod tests {
         let mat = create_simple_matrix();
 
         // More trees should give better recall
-        let index_few = KdTreeIndex::new(mat.as_ref(), 2, Dist::Euclidean, 42);
-        let index_many = KdTreeIndex::new(mat.as_ref(), 16, Dist::Euclidean, 42);
+        let index_few = KdTreeIndex::new(mat.as_ref(), 2, Dist::SquaredEuclidean, 42);
+        let index_many = KdTreeIndex::new(mat.as_ref(), 16, Dist::SquaredEuclidean, 42);
 
         let query = vec![0.9, 0.1, 0.0];
-        let (indices1, _) = index_few.query(&query, 3, None);
-        let (indices2, _) = index_many.query(&query, 3, None);
+        let (indices1, _) = index_few.query(&query, 3, None).unwrap();
+        let (indices2, _) = index_many.query(&query, 3, None).unwrap();
 
         assert_eq!(indices1.len(), 3);
         assert_eq!(indices2.len(), 3);
@@ -975,9 +1003,9 @@ mod tests {
     #[test]
     fn test_kd_tree_query_row() {
         let mat = create_simple_matrix();
-        let index = KdTreeIndex::new(mat.as_ref(), 8, Dist::Euclidean, 42);
+        let index = KdTreeIndex::new(mat.as_ref(), 8, Dist::SquaredEuclidean, 42);
 
-        let (indices, distances) = index.query_row(mat.row(0), 1, None);
+        let (indices, distances) = index.query_row(mat.row(0), 1, None).unwrap();
 
         assert_eq!(indices[0], 0);
         assert_relative_eq!(distances[0], 0.0, epsilon = 1e-5);
@@ -988,12 +1016,12 @@ mod tests {
         let mat = create_simple_matrix();
 
         // Same seed should give same results
-        let index1 = KdTreeIndex::new(mat.as_ref(), 8, Dist::Euclidean, 42);
-        let index2 = KdTreeIndex::new(mat.as_ref(), 8, Dist::Euclidean, 42);
+        let index1 = KdTreeIndex::new(mat.as_ref(), 8, Dist::SquaredEuclidean, 42);
+        let index2 = KdTreeIndex::new(mat.as_ref(), 8, Dist::SquaredEuclidean, 42);
 
         let query = vec![0.5, 0.5, 0.0];
-        let (indices1, _) = index1.query(&query, 3, None);
-        let (indices2, _) = index2.query(&query, 3, None);
+        let (indices1, _) = index1.query(&query, 3, None).unwrap();
+        let (indices2, _) = index2.query(&query, 3, None).unwrap();
 
         assert_eq!(indices1, indices2);
     }
@@ -1002,13 +1030,13 @@ mod tests {
     fn test_kd_tree_different_seeds() {
         let mat = create_simple_matrix();
 
-        let index1 = KdTreeIndex::new(mat.as_ref(), 8, Dist::Euclidean, 42);
-        let index2 = KdTreeIndex::new(mat.as_ref(), 8, Dist::Euclidean, 123);
+        let index1 = KdTreeIndex::new(mat.as_ref(), 8, Dist::SquaredEuclidean, 42);
+        let index2 = KdTreeIndex::new(mat.as_ref(), 8, Dist::SquaredEuclidean, 123);
 
         let query = vec![0.5, 0.5, 0.0];
 
-        let (indices1, _) = index1.query(&query, 3, None);
-        let (indices2, _) = index2.query(&query, 3, None);
+        let (indices1, _) = index1.query(&query, 3, None).unwrap();
+        let (indices2, _) = index2.query(&query, 3, None).unwrap();
 
         assert_eq!(indices1.len(), 3);
         assert_eq!(indices2.len(), 3);
@@ -1027,11 +1055,11 @@ mod tests {
         }
 
         let mat = Mat::from_fn(n, dim, |i, j| data[i * dim + j]);
-        let index = KdTreeIndex::new(mat.as_ref(), 16, Dist::Euclidean, 42);
+        let index = KdTreeIndex::new(mat.as_ref(), 16, Dist::SquaredEuclidean, 42);
 
         // Query for point 0
         let query: Vec<f32> = (0..dim).map(|_| 0.0).collect();
-        let (indices, _) = index.query(&query, 5, None);
+        let (indices, _) = index.query(&query, 5, None).unwrap();
 
         assert_eq!(indices.len(), 5);
         assert_eq!(indices[0], 0); // Should find exact match
@@ -1044,7 +1072,7 @@ mod tests {
         let index = KdTreeIndex::new(mat.as_ref(), 4, Dist::Cosine, 42);
 
         let query = vec![1.0, 0.0, 0.0];
-        let (indices, distances) = index.query(&query, 3, None);
+        let (indices, distances) = index.query(&query, 3, None).unwrap();
 
         // First result should be the parallel vector
         assert_eq!(indices[0], 0);
@@ -1062,10 +1090,10 @@ mod tests {
         let data: Vec<f32> = (0..n * dim).map(|i| i as f32).collect();
         let mat = Mat::from_fn(n, dim, |i, j| data[i * dim + j]);
 
-        let index = KdTreeIndex::new(mat.as_ref(), 32, Dist::Euclidean, 42);
+        let index = KdTreeIndex::new(mat.as_ref(), 32, Dist::SquaredEuclidean, 42);
 
         let query: Vec<f32> = (0..dim).map(|_| 0.0).collect();
-        let (indices, _) = index.query(&query, 3, None);
+        let (indices, _) = index.query(&query, 3, None).unwrap();
 
         assert_eq!(indices.len(), 3);
     }
@@ -1085,10 +1113,10 @@ mod tests {
         let mat = Mat::from_fn(n, dim, |i, j| data[i * dim + j]);
 
         // Build with zero overlap (standard Kd-tree)
-        let index = KdTreeIndex::new(mat.as_ref(), 8, Dist::Euclidean, 42);
+        let index = KdTreeIndex::new(mat.as_ref(), 8, Dist::SquaredEuclidean, 42);
 
         let query: Vec<f32> = (0..dim).map(|_| 0.0).collect();
-        let (indices, _) = index.query(&query, 5, None);
+        let (indices, _) = index.query(&query, 5, None).unwrap();
 
         assert_eq!(indices.len(), 5);
         assert_eq!(indices[0], 0);

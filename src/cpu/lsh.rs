@@ -63,6 +63,10 @@ pub struct LSHIndex<T> {
     original_ids: Vec<usize>,
 }
 
+////////////////////
+// VectorDistance //
+////////////////////
+
 /// VectorDistance trait
 impl<T> VectorDistance<T> for LSHIndex<T>
 where
@@ -80,6 +84,20 @@ where
         &self.norms
     }
 }
+
+/////////////////////////
+// DimensionValidation //
+/////////////////////////
+
+impl<T> DimensionValidation for LSHIndex<T> {
+    fn dim(&self) -> usize {
+        self.dim
+    }
+}
+
+//////////
+// Main //
+//////////
 
 impl<T> LSHIndex<T>
 where
@@ -118,7 +136,11 @@ where
         num_tables: usize,
         bits_per_hash: usize,
         seed: usize,
-    ) -> Self {
+    ) -> Result<Self, AnnSearchErrors> {
+        if metric == Dist::Manhattan {
+            return Err(AnnSearchErrors::DistanceNotSupported(metric));
+        }
+
         let (vectors_flat, n, dim) = matrix_to_flat(data);
 
         let norms = if metric == Dist::Cosine {
@@ -145,7 +167,7 @@ where
         orthogonalise_table_projections(&mut random_vecs, num_tables, bits_per_hash, dim);
 
         // pre-compute L2-normalised vectors for Euclidean hashing
-        let normalised: Vec<T> = if metric == Dist::Euclidean {
+        let normalised: Vec<T> = if metric == Dist::SquaredEuclidean {
             let mut buf = vec![T::zero(); n * dim];
             for i in 0..n {
                 let start = i * dim;
@@ -161,7 +183,7 @@ where
             Vec::new()
         };
 
-        let hash_source: &[T] = if metric == Dist::Euclidean {
+        let hash_source: &[T] = if metric == Dist::SquaredEuclidean {
             &normalised
         } else {
             &vectors_flat
@@ -194,7 +216,7 @@ where
             vector_hashes[base..base + n].copy_from_slice(&hashes);
         }
 
-        Self {
+        Ok(Self {
             vectors_flat,
             dim,
             n,
@@ -206,7 +228,7 @@ where
             bits_per_hash,
             vector_hashes,
             original_ids: (0..n).collect(),
-        }
+        })
     }
 
     ///////////
@@ -240,15 +262,12 @@ where
         k: usize,
         max_cand: Option<usize>,
         n_probes: usize,
-    ) -> (Vec<usize>, Vec<T>, bool) {
-        assert!(
-            query_vec.len() == self.dim,
-            "Query vector dimensionality mismatch"
-        );
+    ) -> Result<(Vec<usize>, Vec<T>, bool), AnnSearchErrors> {
+        self.check_dim(query_vec.len())?;
 
         // normalise query for hashing if Euclidean
         let hash_vec;
-        let hash_input = if self.metric == Dist::Euclidean {
+        let hash_input = if self.metric == Dist::SquaredEuclidean {
             let norm = T::calculate_l2_norm(query_vec);
             hash_vec = if norm > T::epsilon() {
                 query_vec.iter().map(|&v| v / norm).collect::<Vec<T>>()
@@ -307,7 +326,7 @@ where
             }
 
             let (indices, dists) = self.rank_candidates(query_vec, &candidates, k);
-            (indices, dists, fallback_triggered)
+            Ok((indices, dists, fallback_triggered))
         })
     }
 
@@ -332,12 +351,7 @@ where
         k: usize,
         max_cand: Option<usize>,
         n_probes: usize,
-    ) -> (Vec<usize>, Vec<T>, bool) {
-        assert!(
-            query_row.ncols() == self.dim,
-            "Query row dimensionality mismatch"
-        );
-
+    ) -> Result<(Vec<usize>, Vec<T>, bool), AnnSearchErrors> {
         if query_row.col_stride() == 1 {
             let slice =
                 unsafe { std::slice::from_raw_parts(query_row.as_ptr(), query_row.ncols()) };
@@ -562,7 +576,7 @@ where
             let mut heap: BinaryHeap<(OrderedFloat<T>, usize)> = BinaryHeap::with_capacity(k + 1);
 
             match self.metric {
-                Dist::Euclidean => {
+                Dist::SquaredEuclidean => {
                     for &idx in candidates {
                         if seen.insert(idx) {
                             let d = self.euclidean_distance_to_query(idx, query_vec);
@@ -593,6 +607,7 @@ where
                         }
                     }
                 }
+                Dist::Manhattan => unreachable!(),
             }
 
             let mut results: Vec<_> = heap.into_vec();
@@ -855,13 +870,21 @@ impl<T> KnnValidation<T> for LSHIndex<T>
 where
     T: AnnSearchFloat,
 {
-    fn query_for_validation(&self, query_vec: &[T], k: usize) -> (Vec<usize>, Vec<T>) {
-        let (indices, dist, _) = self.query(query_vec, k, None, self.bits_per_hash);
-        (indices, dist)
+    fn query_for_validation(
+        &self,
+        query_vec: &[T],
+        k: usize,
+    ) -> Result<(Vec<usize>, Vec<T>), AnnSearchErrors> {
+        let (indices, dist, _) = self.query(query_vec, k, None, self.bits_per_hash)?;
+        Ok((indices, dist))
     }
 
     fn n(&self) -> usize {
         self.n
+    }
+
+    fn dim(&self) -> usize {
+        self.dim
     }
 
     fn metric(&self) -> Dist {
@@ -896,7 +919,7 @@ mod tests {
     #[test]
     fn test_index_creation_euclidean() {
         let mat = simple_test_data();
-        let index = LSHIndex::new(mat.as_ref(), Dist::Euclidean, 4, 8, 42);
+        let index = LSHIndex::new(mat.as_ref(), Dist::SquaredEuclidean, 4, 8, 42).unwrap();
 
         assert_eq!(index.n, 5);
         assert_eq!(index.dim, 3);
@@ -909,7 +932,7 @@ mod tests {
     #[test]
     fn test_index_creation_cosine() {
         let mat = simple_test_data();
-        let index = LSHIndex::new(mat.as_ref(), Dist::Cosine, 4, 8, 42);
+        let index = LSHIndex::new(mat.as_ref(), Dist::Cosine, 4, 8, 42).unwrap();
 
         assert_eq!(index.n, 5);
         assert_eq!(index.dim, 3);
@@ -920,7 +943,7 @@ mod tests {
     #[test]
     fn test_stored_hashes_match_recomputed() {
         let mat = simple_test_data();
-        let index = LSHIndex::new(mat.as_ref(), Dist::Euclidean, 4, 8, 42);
+        let index = LSHIndex::new(mat.as_ref(), Dist::SquaredEuclidean, 4, 8, 42).unwrap();
 
         // Recompute hash for vector 0, table 0 and compare with stored
         let vec = &index.vectors_flat[0..index.dim];
@@ -942,10 +965,10 @@ mod tests {
     #[test]
     fn test_basic_query_no_probes() {
         let mat = simple_test_data();
-        let index = LSHIndex::new(mat.as_ref(), Dist::Euclidean, 4, 8, 42);
+        let index = LSHIndex::new(mat.as_ref(), Dist::SquaredEuclidean, 4, 8, 42).unwrap();
 
         let query = vec![1.0, 0.0, 0.0];
-        let (indices, distances, _) = index.query(&query, 3, None, 0);
+        let (indices, distances, _) = index.query(&query, 3, None, 0).unwrap();
 
         assert!(!indices.is_empty());
         assert!(indices.len() <= 3);
@@ -960,10 +983,10 @@ mod tests {
     #[test]
     fn test_basic_query_with_probes() {
         let mat = simple_test_data();
-        let index = LSHIndex::new(mat.as_ref(), Dist::Euclidean, 4, 8, 42);
+        let index = LSHIndex::new(mat.as_ref(), Dist::SquaredEuclidean, 4, 8, 42).unwrap();
 
         let query = vec![1.0, 0.0, 0.0];
-        let (indices, distances, _) = index.query(&query, 3, None, 8);
+        let (indices, distances, _) = index.query(&query, 3, None, 8).unwrap();
 
         assert!(!indices.is_empty());
         assert!(indices.len() <= 3);
@@ -983,11 +1006,11 @@ mod tests {
         let dim = 50;
         let mat = Mat::from_fn(n, dim, |i, j| ((i * 7 + j * 13) % 100) as f32 / 100.0);
 
-        let index = LSHIndex::new(mat.as_ref(), Dist::Euclidean, 2, 12, 42);
+        let index = LSHIndex::new(mat.as_ref(), Dist::SquaredEuclidean, 2, 12, 42).unwrap();
 
         let query = vec![0.5; dim];
-        let (idx_no_probe, _, _) = index.query(&query, 10, None, 0);
-        let (idx_probed, _, _) = index.query(&query, 10, None, 12);
+        let (idx_no_probe, _, _) = index.query(&query, 10, None, 0).unwrap();
+        let (idx_probed, _, _) = index.query(&query, 10, None, 12).unwrap();
 
         // Multi-probe should find at least as many candidates
         assert!(idx_probed.len() >= idx_no_probe.len());
@@ -996,10 +1019,10 @@ mod tests {
     #[test]
     fn test_query_cosine() {
         let mat = simple_test_data();
-        let index = LSHIndex::new(mat.as_ref(), Dist::Cosine, 4, 8, 42);
+        let index = LSHIndex::new(mat.as_ref(), Dist::Cosine, 4, 8, 42).unwrap();
 
         let query = vec![2.0, 0.0, 0.0];
-        let (indices, distances, _) = index.query(&query, 2, None, 0);
+        let (indices, distances, _) = index.query(&query, 2, None, 0).unwrap();
 
         assert!(!indices.is_empty());
         assert!(indices.len() <= 2);
@@ -1009,10 +1032,10 @@ mod tests {
     #[test]
     fn test_query_row() {
         let mat = simple_test_data();
-        let index = LSHIndex::new(mat.as_ref(), Dist::Euclidean, 4, 8, 42);
+        let index = LSHIndex::new(mat.as_ref(), Dist::SquaredEuclidean, 4, 8, 42).unwrap();
 
         let query_mat = Mat::from_fn(1, 3, |_, j| [1.0, 0.0, 0.0][j]);
-        let (indices, distances, _) = index.query_row(query_mat.row(0), 3, None, 0);
+        let (indices, distances, _) = index.query_row(query_mat.row(0), 3, None, 0).unwrap();
 
         assert!(!indices.is_empty());
         assert!(indices.len() <= 3);
@@ -1022,10 +1045,10 @@ mod tests {
     #[test]
     fn test_max_cand_limit() {
         let mat = simple_test_data();
-        let index = LSHIndex::new(mat.as_ref(), Dist::Euclidean, 10, 8, 42);
+        let index = LSHIndex::new(mat.as_ref(), Dist::SquaredEuclidean, 10, 8, 42).unwrap();
 
         let query = vec![1.0, 0.0, 0.0];
-        let (indices, _, _) = index.query(&query, 2, Some(3), 0);
+        let (indices, _, _) = index.query(&query, 2, Some(3), 0).unwrap();
 
         assert!(indices.len() <= 2);
     }
@@ -1033,43 +1056,48 @@ mod tests {
     #[test]
     fn test_k_larger_than_n() {
         let mat = simple_test_data();
-        let index = LSHIndex::new(mat.as_ref(), Dist::Euclidean, 4, 8, 42);
+        let index = LSHIndex::new(mat.as_ref(), Dist::SquaredEuclidean, 4, 8, 42).unwrap();
 
         let query = vec![1.0, 0.0, 0.0];
-        let (indices, distances, _) = index.query(&query, 100, None, 0);
+        let (indices, distances, _) = index.query(&query, 100, None, 0).unwrap();
 
         assert!(indices.len() <= 5);
         assert_eq!(indices.len(), distances.len());
     }
 
     #[test]
-    #[should_panic(expected = "Query vector dimensionality mismatch")]
     fn test_dimension_mismatch() {
         let mat = simple_test_data();
-        let index = LSHIndex::new(mat.as_ref(), Dist::Euclidean, 4, 8, 42);
-
+        let index = LSHIndex::new(mat.as_ref(), Dist::SquaredEuclidean, 4, 8, 42).unwrap();
         let query = vec![1.0, 0.0];
-        index.query(&query, 3, None, 0);
+        let result = index.query(&query, 3, None, 0);
+        assert!(matches!(
+            result,
+            Err(AnnSearchErrors::DimensionMismatch { .. })
+        ));
     }
 
     #[test]
-    #[should_panic(expected = "Query row dimensionality mismatch")]
     fn test_query_row_dimension_mismatch() {
         let mat = simple_test_data();
-        let index = LSHIndex::new(mat.as_ref(), Dist::Euclidean, 4, 8, 42);
-
+        let index = LSHIndex::new(mat.as_ref(), Dist::SquaredEuclidean, 4, 8, 42).unwrap();
         let query_mat = Mat::from_fn(1, 2, |_, j| [1.0, 0.0][j]);
-        index.query_row(query_mat.row(0), 3, None, 0);
+        let result = index.query_row(query_mat.row(0), 3, None, 0);
+
+        assert!(matches!(
+            result,
+            Err(AnnSearchErrors::DimensionMismatch { .. })
+        ));
     }
 
     #[test]
     fn test_fallback_mechanism() {
         let mat = Mat::from_fn(10, 100, |i, j| if j == i * 10 { 1.0 } else { 0.0 });
 
-        let index = LSHIndex::new(mat.as_ref(), Dist::Euclidean, 2, 16, 42);
+        let index = LSHIndex::new(mat.as_ref(), Dist::SquaredEuclidean, 2, 16, 42).unwrap();
 
         let query = vec![1.0; 100];
-        let (indices, distances, _) = index.query(&query, 3, None, 0);
+        let (indices, distances, _) = index.query(&query, 3, None, 0).unwrap();
 
         assert!(!indices.is_empty());
         assert_eq!(indices.len(), distances.len());
@@ -1079,12 +1107,12 @@ mod tests {
     fn test_deterministic_with_seed() {
         let mat = simple_test_data();
 
-        let index1 = LSHIndex::new(mat.as_ref(), Dist::Euclidean, 4, 8, 42);
-        let index2 = LSHIndex::new(mat.as_ref(), Dist::Euclidean, 4, 8, 42);
+        let index1 = LSHIndex::new(mat.as_ref(), Dist::SquaredEuclidean, 4, 8, 42).unwrap();
+        let index2 = LSHIndex::new(mat.as_ref(), Dist::SquaredEuclidean, 4, 8, 42).unwrap();
 
         let query = vec![1.0, 0.0, 0.0];
-        let (indices1, _, _) = index1.query(&query, 3, None, 4);
-        let (indices2, _, _) = index2.query(&query, 3, None, 4);
+        let (indices1, _, _) = index1.query(&query, 3, None, 4).unwrap();
+        let (indices2, _, _) = index2.query(&query, 3, None, 4).unwrap();
 
         assert_eq!(indices1, indices2);
     }
@@ -1092,10 +1120,10 @@ mod tests {
     #[test]
     fn test_f64_query() {
         let mat = Mat::from_fn(3, 3, |i, j| if i == j { 1.0f64 } else { 0.0f64 });
-        let index = LSHIndex::new(mat.as_ref(), Dist::Euclidean, 4, 8, 42);
+        let index = LSHIndex::new(mat.as_ref(), Dist::SquaredEuclidean, 4, 8, 42).unwrap();
 
         let query = vec![1.0, 0.0, 0.0];
-        let (indices, distances, _) = index.query(&query, 2, None, 0);
+        let (indices, distances, _) = index.query(&query, 2, None, 0).unwrap();
 
         assert!(!indices.is_empty());
         assert!(indices.len() <= 2);
@@ -1105,10 +1133,10 @@ mod tests {
     #[test]
     fn test_distances_sorted() {
         let mat = simple_test_data();
-        let index = LSHIndex::new(mat.as_ref(), Dist::Euclidean, 4, 8, 42);
+        let index = LSHIndex::new(mat.as_ref(), Dist::SquaredEuclidean, 4, 8, 42).unwrap();
 
         let query = vec![1.0, 0.0, 0.0];
-        let (_, distances, _) = index.query(&query, 5, None, 8);
+        let (_, distances, _) = index.query(&query, 5, None, 8).unwrap();
 
         for i in 1..distances.len() {
             assert!(distances[i - 1] <= distances[i]);
@@ -1118,12 +1146,12 @@ mod tests {
     #[test]
     fn test_query_returns_k_or_fewer() {
         let mat = simple_test_data();
-        let index = LSHIndex::new(mat.as_ref(), Dist::Euclidean, 8, 6, 42);
+        let index = LSHIndex::new(mat.as_ref(), Dist::SquaredEuclidean, 8, 6, 42).unwrap();
 
         let query = vec![1.0, 0.0, 0.0];
 
         for k in 1..=5 {
-            let (indices, distances, _) = index.query(&query, k, None, 0);
+            let (indices, distances, _) = index.query(&query, k, None, 0).unwrap();
             assert!(indices.len() <= k);
             assert_eq!(indices.len(), distances.len());
         }
@@ -1132,10 +1160,10 @@ mod tests {
     #[test]
     fn test_no_duplicate_results() {
         let mat = simple_test_data();
-        let index = LSHIndex::new(mat.as_ref(), Dist::Euclidean, 8, 6, 42);
+        let index = LSHIndex::new(mat.as_ref(), Dist::SquaredEuclidean, 8, 6, 42).unwrap();
 
         let query = vec![1.0, 0.0, 0.0];
-        let (indices, _, _) = index.query(&query, 5, None, 6);
+        let (indices, _, _) = index.query(&query, 5, None, 6).unwrap();
 
         let mut sorted = indices.clone();
         sorted.sort_unstable();
@@ -1147,10 +1175,10 @@ mod tests {
     #[test]
     fn test_no_duplicate_results_with_probes() {
         let mat = simple_test_data();
-        let index = LSHIndex::new(mat.as_ref(), Dist::Euclidean, 8, 6, 42);
+        let index = LSHIndex::new(mat.as_ref(), Dist::SquaredEuclidean, 8, 6, 42).unwrap();
 
         let query = vec![0.5, 0.5, 0.5];
-        let (indices, _, _) = index.query(&query, 5, None, 10);
+        let (indices, _, _) = index.query(&query, 5, None, 10).unwrap();
 
         let mut sorted = indices.clone();
         sorted.sort_unstable();
@@ -1166,7 +1194,7 @@ mod tests {
     #[test]
     fn test_self_query_uses_stored_hashes() {
         let mat = simple_test_data();
-        let index = LSHIndex::new(mat.as_ref(), Dist::Euclidean, 4, 8, 42);
+        let index = LSHIndex::new(mat.as_ref(), Dist::SquaredEuclidean, 4, 8, 42).unwrap();
 
         // Self-query for vector 0
         let (indices, distances, _) = index.self_query_at(0, 3, None, 0);
@@ -1181,7 +1209,7 @@ mod tests {
     #[test]
     fn test_generate_knn() {
         let mat = simple_test_data();
-        let index = LSHIndex::new(mat.as_ref(), Dist::Euclidean, 4, 8, 42);
+        let index = LSHIndex::new(mat.as_ref(), Dist::SquaredEuclidean, 4, 8, 42).unwrap();
 
         let (knn_indices, knn_dists) = index.generate_knn(2, None, 4, true, false);
 
@@ -1200,7 +1228,7 @@ mod tests {
     #[test]
     fn test_generate_knn_no_distances() {
         let mat = simple_test_data();
-        let index = LSHIndex::new(mat.as_ref(), Dist::Euclidean, 4, 8, 42);
+        let index = LSHIndex::new(mat.as_ref(), Dist::SquaredEuclidean, 4, 8, 42).unwrap();
 
         let (knn_indices, knn_dists) = index.generate_knn(2, None, 0, false, false);
 
@@ -1214,10 +1242,10 @@ mod tests {
         let dim = 50;
         let mat = Mat::from_fn(n, dim, |i, j| ((i * 7 + j * 13) % 100) as f32 / 100.0);
 
-        let index = LSHIndex::new(mat.as_ref(), Dist::Euclidean, 6, 10, 42);
+        let index = LSHIndex::new(mat.as_ref(), Dist::SquaredEuclidean, 6, 10, 42).unwrap();
 
         let query = vec![0.5; dim];
-        let (indices, distances, _) = index.query(&query, 10, None, 10);
+        let (indices, distances, _) = index.query(&query, 10, None, 10).unwrap();
 
         assert!(!indices.is_empty());
         assert!(indices.len() <= 10);
@@ -1271,7 +1299,7 @@ mod tests {
     #[test]
     fn test_memory_usage_includes_hashes() {
         let mat = simple_test_data();
-        let index = LSHIndex::new(mat.as_ref(), Dist::Euclidean, 4, 8, 42);
+        let index = LSHIndex::new(mat.as_ref(), Dist::SquaredEuclidean, 4, 8, 42).unwrap();
 
         let mem = index.memory_usage_bytes();
         // Should at least account for vector_hashes (4 tables * 5 vecs * 8 bytes)

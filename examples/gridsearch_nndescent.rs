@@ -35,7 +35,7 @@ fn main() {
     println!("Querying exhaustive index...");
     let start = Instant::now();
     let (true_neighbors, true_distances) =
-        query_exhaustive_index(query_data.as_ref(), &exhaustive_idx, cli.k, true, false);
+        query_exhaustive_index(query_data.as_ref(), &exhaustive_idx, cli.k, true, false).unwrap();
     let query_time = start.elapsed().as_secs_f64() * 1000.0;
 
     results.push(BenchmarkResultSize {
@@ -52,7 +52,7 @@ fn main() {
     println!("Self-querying exhaustive index...");
     let start = Instant::now();
     let (true_neighbors_self, true_distances_self) =
-        query_exhaustive_self(&exhaustive_idx, cli.k, true, false);
+        query_exhaustive_self(&exhaustive_idx, cli.k, true, false).unwrap();
     let self_query_time = start.elapsed().as_secs_f64() * 1000.0;
 
     results.push(BenchmarkResultSize {
@@ -97,7 +97,8 @@ fn main() {
             n_trees,
             cli.seed as usize,
             false,
-        );
+        )
+        .unwrap();
         let build_time = start.elapsed().as_secs_f64() * 1000.0;
 
         let index_size_mb = nndescent_idx.memory_usage_bytes() as f64 / (1024.0 * 1024.0);
@@ -117,7 +118,8 @@ fn main() {
                 *ef_search,
                 true,
                 false,
-            );
+            )
+            .unwrap();
             let query_time = start.elapsed().as_secs_f64() * 1000.0;
 
             let recall = calculate_recall(&true_neighbors, &approx_neighbors, cli.k);
@@ -145,7 +147,7 @@ fn main() {
         println!("Self-querying NNDescent index...");
         let start = Instant::now();
         let (approx_neighbors_self, approx_distances_self) =
-            query_nndescent_self(&nndescent_idx, cli.k, None, true, false);
+            query_nndescent_self(&nndescent_idx, cli.k, None, true, false).unwrap();
         let self_query_time = start.elapsed().as_secs_f64() * 1000.0;
 
         let recall_self = calculate_recall(&true_neighbors_self, &approx_neighbors_self, cli.k);

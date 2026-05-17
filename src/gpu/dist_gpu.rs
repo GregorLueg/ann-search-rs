@@ -624,7 +624,7 @@ where
             let (grid_y, grid_z) = grid_2d((n_q as u32).div_ceil(WORKGROUP_SIZE_Y));
 
             match *metric {
-                Dist::Euclidean => unsafe {
+                Dist::SquaredEuclidean => unsafe {
                     let _ = euclidean_tiled::launch_unchecked::<T, R>(
                         &client,
                         CubeCount::Static(grid_x, grid_y, grid_z),
@@ -664,6 +664,7 @@ where
                         dim_lines,
                     );
                 },
+                Dist::Manhattan => unreachable!(),
             }
 
             // Extract directly into the running top-k buffer
@@ -1748,8 +1749,15 @@ mod tests {
         let qb = BatchData::new(&queries, &[], nq);
         let dbb = BatchData::new(&db, &[], ndb);
 
-        let (_, gpu_dist) =
-            query_batch_gpu::<f32, WgpuRuntime>(k, &qb, &dbb, dim, &Dist::Euclidean, device, false);
+        let (_, gpu_dist) = query_batch_gpu::<f32, WgpuRuntime>(
+            k,
+            &qb,
+            &dbb,
+            dim,
+            &Dist::SquaredEuclidean,
+            device,
+            false,
+        );
 
         let cpu_d = cpu_euclidean_dists(&queries, &db, nq, ndb, dim);
         let (_, cpu_dist) = cpu_topk(&cpu_d, nq, ndb, k);
@@ -1788,8 +1796,15 @@ mod tests {
         let qb = BatchData::new(&queries, &[], nq);
         let dbb = BatchData::new(&db, &[], ndb);
 
-        let (_, gpu_dist) =
-            query_batch_gpu::<f32, WgpuRuntime>(k, &qb, &dbb, dim, &Dist::Euclidean, device, false);
+        let (_, gpu_dist) = query_batch_gpu::<f32, WgpuRuntime>(
+            k,
+            &qb,
+            &dbb,
+            dim,
+            &Dist::SquaredEuclidean,
+            device,
+            false,
+        );
 
         let cpu_d = cpu_euclidean_dists(&queries, &db, nq, ndb, dim);
         let (_, cpu_dist) = cpu_topk(&cpu_d, nq, ndb, k);
@@ -1871,7 +1886,7 @@ mod tests {
             &batch,
             &batch,
             dim,
-            &Dist::Euclidean,
+            &Dist::SquaredEuclidean,
             device,
             false,
         );
@@ -1907,8 +1922,15 @@ mod tests {
         let qb = BatchData::new(&queries, &[], nq);
         let dbb = BatchData::new(&db, &[], ndb);
 
-        let (indices, distances) =
-            query_batch_gpu::<f32, WgpuRuntime>(k, &qb, &dbb, dim, &Dist::Euclidean, device, false);
+        let (indices, distances) = query_batch_gpu::<f32, WgpuRuntime>(
+            k,
+            &qb,
+            &dbb,
+            dim,
+            &Dist::SquaredEuclidean,
+            device,
+            false,
+        );
 
         for q in 0..nq {
             for i in 1..k {
@@ -1939,8 +1961,15 @@ mod tests {
         let qb = BatchData::new(&query, &[], 1);
         let dbb = BatchData::new(&data, &[], 4);
 
-        let (idx, dist) =
-            query_batch_gpu::<f32, WgpuRuntime>(1, &qb, &dbb, 4, &Dist::Euclidean, device, false);
+        let (idx, dist) = query_batch_gpu::<f32, WgpuRuntime>(
+            1,
+            &qb,
+            &dbb,
+            4,
+            &Dist::SquaredEuclidean,
+            device,
+            false,
+        );
 
         assert_eq!(idx[0][0], 1);
         assert!((dist[0][0] - 0.01).abs() < 1e-3);
@@ -1968,8 +1997,15 @@ mod tests {
         let qb = BatchData::new(&queries, &[], nq);
         let dbb = BatchData::new(&db, &[], ndb);
 
-        let (idx, dist) =
-            query_batch_gpu::<f32, WgpuRuntime>(k, &qb, &dbb, dim, &Dist::Euclidean, device, false);
+        let (idx, dist) = query_batch_gpu::<f32, WgpuRuntime>(
+            k,
+            &qb,
+            &dbb,
+            dim,
+            &Dist::SquaredEuclidean,
+            device,
+            false,
+        );
 
         assert_eq!(idx[0][0], 73, "Should find planted nearest at index 73");
         assert!(dist[0][0] < 0.01);
@@ -1993,8 +2029,15 @@ mod tests {
         let qb = BatchData::new(&query, &[], 1);
         let dbb = BatchData::new(&db, &[], 1);
 
-        let (idx, dist) =
-            query_batch_gpu::<f32, WgpuRuntime>(1, &qb, &dbb, dim, &Dist::Euclidean, device, false);
+        let (idx, dist) = query_batch_gpu::<f32, WgpuRuntime>(
+            1,
+            &qb,
+            &dbb,
+            dim,
+            &Dist::SquaredEuclidean,
+            device,
+            false,
+        );
 
         assert_eq!(idx[0][0], 0);
         assert!((dist[0][0] - 64.0).abs() < 1e-3);

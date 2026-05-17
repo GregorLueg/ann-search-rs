@@ -554,6 +554,10 @@ where
     original_ids: Vec<usize>,
 }
 
+////////////////////
+// VectorDistance //
+////////////////////
+
 impl<T> VectorDistance<T> for HnswIndex<T>
 where
     T: AnnSearchFloat,
@@ -570,6 +574,24 @@ where
         &self.norms
     }
 }
+
+/////////////////////////
+// DimensionValidation //
+/////////////////////////
+
+impl<T> DimensionValidation for HnswIndex<T>
+where
+    T: AnnSearchFloat,
+    Self: HnswState<T>,
+{
+    fn dim(&self) -> usize {
+        self.dim
+    }
+}
+
+//////////
+// Main //
+//////////
 
 impl<T> HnswIndex<T>
 where
@@ -591,7 +613,7 @@ where
     /// * `data` - Data matrix (rows = samples, columns = dimensions)
     /// * `m` - Base connectivity parameter (neighbours per layer)
     /// * `ef_construction` - Size of dynamic candidate list during construction
-    /// * `dist_metric` - Distance metric ("euclidean" or "cosine")
+    /// * `metric` - The distance metric, see [Dist].
     /// * `seed` - Random seed for layer assignment
     /// * `verbose` - Whether to print progress information
     ///
@@ -602,11 +624,10 @@ where
         data: MatRef<T>,
         m: usize,
         ef_construction: usize,
-        dist_metric: &str,
+        metric: &Dist,
         seed: usize,
         verbose: bool,
     ) -> Self {
-        let metric = parse_ann_dist(dist_metric).unwrap_or(Dist::Cosine);
         let (vectors_flat, n, dim) = matrix_to_flat(data);
 
         if verbose {
@@ -620,7 +641,7 @@ where
         let start_total = Instant::now();
 
         // Compute norms for cosine distance
-        let norms = if metric == Dist::Cosine {
+        let norms = if *metric == Dist::Cosine {
             (0..n)
                 .map(|i| {
                     let start = i * dim;
@@ -666,7 +687,7 @@ where
             vectors_flat,
             dim,
             n,
-            metric,
+            metric: *metric,
             norms,
             layer_assignments: layer_assignments.clone(),
             neighbours_flat: Vec::new(),
@@ -786,8 +807,9 @@ where
 
         // greedy descent through layers above this node's highest layer
         let mut current_dist = OrderedFloat(match self.metric {
-            Dist::Euclidean => self.euclidean_distance(node, current_node),
+            Dist::SquaredEuclidean => self.euclidean_distance(node, current_node),
             Dist::Cosine => self.cosine_distance(node, current_node),
+            Dist::Manhattan => self.manhattan_distance(node, current_node),
         });
 
         for layer in (node_level + 1..=self.max_layer).rev() {
@@ -808,8 +830,9 @@ where
                     let neighbour = neighbour as usize;
 
                     let dist = OrderedFloat(match self.metric {
-                        Dist::Euclidean => self.euclidean_distance(node, neighbour),
+                        Dist::SquaredEuclidean => self.euclidean_distance(node, neighbour),
                         Dist::Cosine => self.cosine_distance(node, neighbour),
+                        Dist::Manhattan => self.manhattan_distance(node, neighbour),
                     });
 
                     if dist < current_dist {
@@ -824,8 +847,9 @@ where
         // for each layer this node belongs to (top-down), search and connect
         let distance_fn = |a: usize, b: usize| -> T {
             match self.metric {
-                Dist::Euclidean => self.euclidean_distance(a, b),
+                Dist::SquaredEuclidean => self.euclidean_distance(a, b),
                 Dist::Cosine => self.cosine_distance(a, b),
+                Dist::Manhattan => self.manhattan_distance(a, b),
             }
         };
 
@@ -960,8 +984,9 @@ where
         state.candidates.clear();
 
         let entry_dist = OrderedFloat(match self.metric {
-            Dist::Euclidean => self.euclidean_distance(query_node, entry_node),
+            Dist::SquaredEuclidean => self.euclidean_distance(query_node, entry_node),
             Dist::Cosine => self.cosine_distance(query_node, entry_node),
+            Dist::Manhattan => self.manhattan_distance(query_node, entry_node),
         });
 
         state.mark_visited(entry_node);
@@ -991,8 +1016,9 @@ where
                 state.mark_visited(neighbour_id);
 
                 let dist = OrderedFloat(match self.metric {
-                    Dist::Euclidean => self.euclidean_distance(query_node, neighbour_id),
+                    Dist::SquaredEuclidean => self.euclidean_distance(query_node, neighbour_id),
                     Dist::Cosine => self.cosine_distance(query_node, neighbour_id),
+                    Dist::Manhattan => self.manhattan_distance(query_node, neighbour_id),
                 });
 
                 if dist < furthest_dist || state.working_sorted.len() < ef {
@@ -1056,8 +1082,9 @@ where
 
             let is_good = !result.iter().any(|&(_, selected_id)| {
                 let dist_to_selected = OrderedFloat(match self.metric {
-                    Dist::Euclidean => self.euclidean_distance(cand_id, selected_id),
+                    Dist::SquaredEuclidean => self.euclidean_distance(cand_id, selected_id),
                     Dist::Cosine => self.cosine_distance(cand_id, selected_id),
+                    Dist::Manhattan => self.manhattan_distance(cand_id, selected_id),
                 });
                 dist_to_selected < cand_dist
             });
@@ -1090,8 +1117,13 @@ where
     ///
     /// Tuple of `(indices, distances)` sorted by distance (nearest first)
     #[inline]
-    pub fn query(&self, query: &[T], k: usize, ef_search: usize) -> (Vec<usize>, Vec<T>) {
-        assert_eq!(query.len(), self.dim);
+    pub fn query(
+        &self,
+        query: &[T],
+        k: usize,
+        ef_search: usize,
+    ) -> Result<(Vec<usize>, Vec<T>), AnnSearchErrors> {
+        self.check_dim(query.len())?;
 
         Self::with_search_state(|state_cell| {
             let mut state = state_cell.borrow_mut();
@@ -1134,7 +1166,7 @@ where
                 .map(|(OrderedFloat(d), id)| (id, d))
                 .unzip();
 
-            (indices, distances)
+            Ok((indices, distances))
         })
     }
 
@@ -1297,7 +1329,7 @@ where
         query_row: RowRef<T>,
         k: usize,
         ef_search: usize,
-    ) -> (Vec<usize>, Vec<T>) {
+    ) -> Result<(Vec<usize>, Vec<T>), AnnSearchErrors> {
         if query_row.col_stride() == 1 {
             let slice =
                 unsafe { std::slice::from_raw_parts(query_row.as_ptr(), query_row.ncols()) };
@@ -1330,7 +1362,7 @@ where
         ef_search: usize,
         return_dist: bool,
         verbose: bool,
-    ) -> (Vec<Vec<usize>>, Option<Vec<Vec<T>>>) {
+    ) -> KnnOptionResult<T> {
         use std::sync::{
             atomic::{AtomicUsize, Ordering},
             Arc,
@@ -1358,14 +1390,14 @@ where
 
                 self.query(vec, k, ef_search)
             })
-            .collect();
+            .collect::<Result<Vec<_>, AnnSearchErrors>>()?;
 
         if return_dist {
             let (indices, distances) = results.into_iter().unzip();
-            (indices, Some(distances))
+            Ok((indices, Some(distances)))
         } else {
             let indices: Vec<Vec<usize>> = results.into_iter().map(|(idx, _)| idx).collect();
-            (indices, None)
+            Ok((indices, None))
         }
     }
 
@@ -1383,8 +1415,9 @@ where
     #[inline(always)]
     fn compute_query_distance(&self, query: &[T], idx: usize, query_norm: T) -> T {
         match self.metric {
-            Dist::Euclidean => self.euclidean_distance_to_query(idx, query),
+            Dist::SquaredEuclidean => self.euclidean_distance_to_query(idx, query),
             Dist::Cosine => self.cosine_distance_to_query(idx, query, query_norm),
+            Dist::Manhattan => self.manhattan_distance_to_query(idx, query),
         }
     }
 
@@ -1423,12 +1456,20 @@ where
     T: AnnSearchFloat,
     Self: HnswState<T>,
 {
-    fn query_for_validation(&self, query_vec: &[T], k: usize) -> (Vec<usize>, Vec<T>) {
+    fn query_for_validation(
+        &self,
+        query_vec: &[T],
+        k: usize,
+    ) -> Result<(Vec<usize>, Vec<T>), AnnSearchErrors> {
         self.query(query_vec, k, 200)
     }
 
     fn n(&self) -> usize {
         self.n
+    }
+
+    fn dim(&self) -> usize {
+        self.dim
     }
 
     fn metric(&self) -> Dist {
@@ -1466,22 +1507,23 @@ mod tests {
     #[test]
     fn test_hnsw_build_euclidean() {
         let mat = create_simple_matrix();
-        let _ = HnswIndex::<f32>::build(mat.as_ref(), 16, 100, "euclidean", 42, false);
+        let _ = HnswIndex::<f32>::build(mat.as_ref(), 16, 100, &Dist::SquaredEuclidean, 42, false);
     }
 
     #[test]
     fn test_hnsw_build_cosine() {
         let mat = create_simple_matrix();
-        let _ = HnswIndex::<f32>::build(mat.as_ref(), 16, 100, "cosine", 42, false);
+        let _ = HnswIndex::<f32>::build(mat.as_ref(), 16, 100, &Dist::Cosine, 42, false);
     }
 
     #[test]
     fn test_hnsw_query_finds_self() {
         let mat = create_simple_matrix();
-        let index = HnswIndex::<f32>::build(mat.as_ref(), 16, 100, "euclidean", 42, false);
+        let index =
+            HnswIndex::<f32>::build(mat.as_ref(), 16, 100, &Dist::SquaredEuclidean, 42, false);
 
         let query = vec![1.0, 0.0, 0.0];
-        let (indices, distances) = index.query(&query, 1, 50);
+        let (indices, distances) = index.query(&query, 1, 50).unwrap();
 
         assert_eq!(indices.len(), 1);
         assert_eq!(indices[0], 0);
@@ -1491,10 +1533,11 @@ mod tests {
     #[test]
     fn test_hnsw_query_euclidean() {
         let mat = create_simple_matrix();
-        let index = HnswIndex::<f32>::build(mat.as_ref(), 16, 100, "euclidean", 42, false);
+        let index =
+            HnswIndex::<f32>::build(mat.as_ref(), 16, 100, &Dist::SquaredEuclidean, 42, false);
 
         let query = vec![1.0, 0.0, 0.0];
-        let (indices, distances) = index.query(&query, 3, 50);
+        let (indices, distances) = index.query(&query, 3, 50).unwrap();
 
         assert_eq!(indices[0], 0);
         assert_relative_eq!(distances[0], 0.0, epsilon = 1e-5);
@@ -1507,10 +1550,10 @@ mod tests {
     #[test]
     fn test_hnsw_query_cosine() {
         let mat = create_simple_matrix();
-        let index = HnswIndex::<f32>::build(mat.as_ref(), 16, 100, "cosine", 42, false);
+        let index = HnswIndex::<f32>::build(mat.as_ref(), 16, 100, &Dist::Cosine, 42, false);
 
         let query = vec![1.0, 0.0, 0.0];
-        let (indices, distances) = index.query(&query, 3, 50);
+        let (indices, distances) = index.query(&query, 3, 50).unwrap();
 
         assert_eq!(indices[0], 0);
         assert_relative_eq!(distances[0], 0.0, epsilon = 1e-5);
@@ -1523,10 +1566,11 @@ mod tests {
         let data: Vec<f32> = (0..n * dim).map(|i| i as f32).collect();
         let mat = Mat::from_fn(n, dim, |i, j| data[i * dim + j]);
 
-        let index = HnswIndex::<f32>::build(mat.as_ref(), 16, 200, "euclidean", 42, false);
+        let index =
+            HnswIndex::<f32>::build(mat.as_ref(), 16, 200, &Dist::SquaredEuclidean, 42, false);
 
         let query: Vec<f32> = (0..dim).map(|_| 0.0).collect();
-        let (indices, _) = index.query(&query, 5, 50);
+        let (indices, _) = index.query(&query, 5, 50).unwrap();
 
         assert_eq!(indices.len(), 5);
     }
@@ -1538,7 +1582,7 @@ mod tests {
             mat.as_ref(),
             16,
             100,
-            "euclidean",
+            &Dist::SquaredEuclidean,
             42,
             false,
         ));
@@ -1548,7 +1592,7 @@ mod tests {
             let index_clone = Arc::clone(&index);
             let handle = thread::spawn(move || {
                 let query = vec![0.5, 0.5, 0.0];
-                let (indices, _) = index_clone.query(&query, 3, 50);
+                let (indices, _) = index_clone.query(&query, 3, 50).unwrap();
                 assert_eq!(indices.len(), 3);
             });
             handles.push(handle);
@@ -1563,12 +1607,14 @@ mod tests {
     fn test_hnsw_reproducibility() {
         let mat = create_simple_matrix();
 
-        let index1 = HnswIndex::<f32>::build(mat.as_ref(), 16, 100, "euclidean", 42, false);
-        let index2 = HnswIndex::<f32>::build(mat.as_ref(), 16, 100, "euclidean", 42, false);
+        let index1 =
+            HnswIndex::<f32>::build(mat.as_ref(), 16, 100, &Dist::SquaredEuclidean, 42, false);
+        let index2 =
+            HnswIndex::<f32>::build(mat.as_ref(), 16, 100, &Dist::SquaredEuclidean, 42, false);
 
         let query = vec![0.5, 0.5, 0.0];
-        let (indices1, _) = index1.query(&query, 3, 50);
-        let (indices2, _) = index2.query(&query, 3, 50);
+        let (indices1, _) = index1.query(&query, 3, 50).unwrap();
+        let (indices2, _) = index2.query(&query, 3, 50).unwrap();
 
         assert_eq!(indices1, indices2);
     }
@@ -1587,10 +1633,11 @@ mod tests {
         }
 
         let mat = Mat::from_fn(n, dim, |i, j| data[i * dim + j]);
-        let index = HnswIndex::<f32>::build(mat.as_ref(), 16, 200, "euclidean", 42, false);
+        let index =
+            HnswIndex::<f32>::build(mat.as_ref(), 16, 200, &Dist::SquaredEuclidean, 42, false);
 
         let query = vec![0.0, 0.0, 0.0];
-        let (indices, _) = index.query(&query, 5, 100);
+        let (indices, _) = index.query(&query, 5, 100).unwrap();
 
         assert_eq!(indices[0], 0);
 
@@ -1612,7 +1659,8 @@ mod tests {
         let data: Vec<f32> = (0..n * dim).map(|i| (i as f32) * 0.01).collect();
         let mat = Mat::from_fn(n, dim, |i, j| data[i * dim + j]);
 
-        let index = HnswIndex::<f32>::build(mat.as_ref(), 8, 100, "euclidean", 42, true);
+        let index =
+            HnswIndex::<f32>::build(mat.as_ref(), 8, 100, &Dist::SquaredEuclidean, 42, true);
 
         // Count nodes at each layer
         let mut layer_counts = vec![0usize; (index.max_layer + 1) as usize];
@@ -1637,7 +1685,7 @@ mod tests {
 
         // Verify queries work
         let query: Vec<f32> = (0..dim).map(|_| 0.5).collect();
-        let (indices, _) = index.query(&query, 10, 50);
+        let (indices, _) = index.query(&query, 10, 50).unwrap();
         assert_eq!(indices.len(), 10);
     }
 
@@ -1650,10 +1698,11 @@ mod tests {
         let mat = Mat::from_fn(n, dim, |i, j| data[i * dim + j]);
 
         for m in [8, 12, 16, 20] {
-            let index = HnswIndex::<f32>::build(mat.as_ref(), m, 200, "euclidean", 42, false);
+            let index =
+                HnswIndex::<f32>::build(mat.as_ref(), m, 200, &Dist::SquaredEuclidean, 42, false);
 
             let query: Vec<f32> = (0..dim).map(|_| 0.5).collect();
-            let (indices, _) = index.query(&query, 10, 50);
+            let (indices, _) = index.query(&query, 10, 50).unwrap();
 
             assert_eq!(indices.len(), 10, "Failed with m = {}", m);
         }

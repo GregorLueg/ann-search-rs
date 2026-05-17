@@ -58,6 +58,16 @@ where
     }
 }
 
+/////////////////////////
+// DimensionValidation //
+/////////////////////////
+
+impl<T> DimensionValidation for ExhaustiveIndexBf16<T> {
+    fn dim(&self) -> usize {
+        self.dim
+    }
+}
+
 /////////////////////
 // ExhaustiveIndex //
 /////////////////////
@@ -80,7 +90,11 @@ where
     /// ### Returns
     ///
     /// Initialised exhaustive index
-    pub fn new(data: MatRef<T>, metric: Dist) -> Self {
+    pub fn new(data: MatRef<T>, metric: Dist) -> Result<Self, AnnSearchErrors> {
+        if metric == Dist::Manhattan {
+            return Err(AnnSearchErrors::DistanceNotSupported(metric));
+        }
+
         let (vectors_flat, n, dim) = matrix_to_flat(data);
 
         let norms = if metric == Dist::Cosine {
@@ -95,14 +109,14 @@ where
             Vec::new()
         };
 
-        Self {
+        Ok(Self {
             vectors_flat: encode_bf16_quantisation(&vectors_flat),
             norms,
             dim,
             metric,
             n,
             _phantom: std::marker::PhantomData,
-        }
+        })
     }
 
     //////////////////
@@ -124,11 +138,12 @@ where
     ///
     /// A tuple of `(indices, distances)`
     #[inline]
-    pub fn query(&self, query_vec: &[T], k: usize) -> (Vec<usize>, Vec<T>) {
-        assert!(
-            query_vec.len() == self.dim,
-            "The query vector has different dimensionality than the index"
-        );
+    pub fn query(
+        &self,
+        query_vec: &[T],
+        k: usize,
+    ) -> Result<(Vec<usize>, Vec<T>), AnnSearchErrors> {
+        self.check_dim(query_vec.len())?;
 
         let n_vectors = self.vectors_flat.len() / self.dim;
         let k = k.min(n_vectors);
@@ -136,7 +151,7 @@ where
         let mut heap: BinaryHeap<(OrderedFloat<T>, usize)> = BinaryHeap::with_capacity(k + 1);
 
         match self.metric {
-            Dist::Euclidean => {
+            Dist::SquaredEuclidean => {
                 for idx in 0..n_vectors {
                     let dist = self.euclidean_distance_to_query_bf16(idx, query_vec);
 
@@ -166,6 +181,7 @@ where
                     }
                 }
             }
+            Dist::Manhattan => unreachable!(),
         }
 
         let mut results: Vec<_> = heap.into_iter().collect();
@@ -176,7 +192,7 @@ where
             .map(|(OrderedFloat(dist), idx)| (dist, idx))
             .unzip();
 
-        (indices, distances)
+        Ok((indices, distances))
     }
 
     /// Query function for row references
@@ -194,12 +210,11 @@ where
     ///
     /// A tuple of `(indices, distances)`
     #[inline]
-    pub fn query_row(&self, query_row: RowRef<T>, k: usize) -> (Vec<usize>, Vec<T>) {
-        assert!(
-            query_row.ncols() == self.dim,
-            "The query row has different dimensionality than the index"
-        );
-
+    pub fn query_row(
+        &self,
+        query_row: RowRef<T>,
+        k: usize,
+    ) -> Result<(Vec<usize>, Vec<T>), AnnSearchErrors> {
         if query_row.col_stride() == 1 {
             let slice =
                 unsafe { std::slice::from_raw_parts(query_row.as_ptr(), query_row.ncols()) };
@@ -210,6 +225,16 @@ where
         self.query(&query_vec, k)
     }
 
+    /// Internal BF16 query function
+    ///
+    /// ### Params
+    ///
+    /// * `query_vec` - The query vec already quantised to `bf16`.
+    /// * `k` - Number of nearest neighbours to return
+    ///
+    /// ### Returns
+    ///
+    /// A tuple of `(indices, distances)`
     fn query_bf16(&self, query_vec: &[bf16], k: usize) -> (Vec<usize>, Vec<T>) {
         let n_vectors = self.vectors_flat.len() / self.dim;
         let k = k.min(n_vectors);
@@ -217,7 +242,7 @@ where
         let mut heap: BinaryHeap<(OrderedFloat<T>, usize)> = BinaryHeap::with_capacity(k + 1);
 
         match self.metric {
-            Dist::Euclidean => {
+            Dist::SquaredEuclidean => {
                 for idx in 0..n_vectors {
                     let dist = self.euclidean_distance_to_query_dual_bf16(idx, query_vec);
 
@@ -251,6 +276,7 @@ where
                     }
                 }
             }
+            Dist::Manhattan => unreachable!(),
         }
 
         let mut results: Vec<_> = heap.into_iter().collect();
@@ -335,6 +361,10 @@ where
     }
 }
 
+///////////
+// Tests //
+///////////
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -355,7 +385,7 @@ mod tests {
     #[test]
     fn test_exhaustive_bf16_construction_euclidean() {
         let data = create_test_data::<f32>(100, 32);
-        let index = ExhaustiveIndexBf16::new(data.as_ref(), Dist::Euclidean);
+        let index = ExhaustiveIndexBf16::new(data.as_ref(), Dist::SquaredEuclidean).unwrap();
 
         assert_eq!(index.n, 100);
         assert_eq!(index.dim, 32);
@@ -366,7 +396,7 @@ mod tests {
     #[test]
     fn test_exhaustive_bf16_construction_cosine() {
         let data = create_test_data::<f32>(100, 32);
-        let index = ExhaustiveIndexBf16::new(data.as_ref(), Dist::Cosine);
+        let index = ExhaustiveIndexBf16::new(data.as_ref(), Dist::Cosine).unwrap();
 
         assert_eq!(index.n, 100);
         assert_eq!(index.dim, 32);
@@ -376,10 +406,10 @@ mod tests {
     #[test]
     fn test_exhaustive_bf16_query_returns_k_results() {
         let data = create_test_data::<f32>(100, 32);
-        let index = ExhaustiveIndexBf16::new(data.as_ref(), Dist::Euclidean);
+        let index = ExhaustiveIndexBf16::new(data.as_ref(), Dist::SquaredEuclidean).unwrap();
 
         let query: Vec<f32> = (0..32).map(|i| i as f32 * 0.1).collect();
-        let (indices, distances) = index.query(&query, 10);
+        let (indices, distances) = index.query(&query, 10).unwrap();
 
         assert_eq!(indices.len(), 10);
         assert_eq!(distances.len(), 10);
@@ -388,10 +418,10 @@ mod tests {
     #[test]
     fn test_exhaustive_bf16_query_sorted() {
         let data = create_test_data::<f32>(100, 32);
-        let index = ExhaustiveIndexBf16::new(data.as_ref(), Dist::Euclidean);
+        let index = ExhaustiveIndexBf16::new(data.as_ref(), Dist::SquaredEuclidean).unwrap();
 
         let query: Vec<f32> = (0..32).map(|i| i as f32 * 0.1).collect();
-        let (_, distances) = index.query(&query, 10);
+        let (_, distances) = index.query(&query, 10).unwrap();
 
         for i in 1..distances.len() {
             assert!(distances[i] >= distances[i - 1]);
@@ -401,10 +431,10 @@ mod tests {
     #[test]
     fn test_exhaustive_bf16_query_k_exceeds_n() {
         let data = create_test_data::<f32>(50, 32);
-        let index = ExhaustiveIndexBf16::new(data.as_ref(), Dist::Euclidean);
+        let index = ExhaustiveIndexBf16::new(data.as_ref(), Dist::SquaredEuclidean).unwrap();
 
         let query: Vec<f32> = (0..32).map(|i| i as f32 * 0.1).collect();
-        let (indices, _) = index.query(&query, 100);
+        let (indices, _) = index.query(&query, 100).unwrap();
 
         assert_eq!(indices.len(), 50);
     }
@@ -412,9 +442,9 @@ mod tests {
     #[test]
     fn test_exhaustive_bf16_query_row() {
         let data = create_test_data::<f32>(100, 32);
-        let index = ExhaustiveIndexBf16::new(data.as_ref(), Dist::Euclidean);
+        let index = ExhaustiveIndexBf16::new(data.as_ref(), Dist::SquaredEuclidean).unwrap();
 
-        let (indices, distances) = index.query_row(data.as_ref().row(0), 10);
+        let (indices, distances) = index.query_row(data.as_ref().row(0), 10).unwrap();
 
         assert_eq!(indices.len(), 10);
         assert_eq!(distances.len(), 10);
@@ -424,10 +454,10 @@ mod tests {
     #[test]
     fn test_exhaustive_bf16_query_cosine() {
         let data = create_test_data::<f32>(100, 32);
-        let index = ExhaustiveIndexBf16::new(data.as_ref(), Dist::Cosine);
+        let index = ExhaustiveIndexBf16::new(data.as_ref(), Dist::Cosine).unwrap();
 
         let query: Vec<f32> = (0..32).map(|i| i as f32 * 0.1).collect();
-        let (indices, distances) = index.query(&query, 10);
+        let (indices, distances) = index.query(&query, 10).unwrap();
 
         assert_eq!(indices.len(), 10);
         assert_eq!(distances.len(), 10);
@@ -439,7 +469,7 @@ mod tests {
     #[test]
     fn test_exhaustive_bf16_knn_graph() {
         let data = create_test_data::<f32>(50, 32);
-        let index = ExhaustiveIndexBf16::new(data.as_ref(), Dist::Euclidean);
+        let index = ExhaustiveIndexBf16::new(data.as_ref(), Dist::SquaredEuclidean).unwrap();
 
         let (knn_indices, knn_distances) = index.generate_knn(5, true, false);
 

@@ -5,7 +5,10 @@
 # ann-search-rs
 
 Various approximate nearest neighbour/vector searches implemented in Rust (with
-focus on computational biology applications, very specifically single cell).
+focus on computational biology applications, very specifically single cell). The
+search algorithms are designed for high in-memory performance. Longer term,
+I might add the option to add/remove vectors from some of the indices and
+persistent on-disk storage.
 
 ## Table of Contents
 
@@ -51,7 +54,8 @@ anticipated. If you want to see what changed, please check this
 - **Distance metrics**:
   - Euclidean
   - Cosine
-  - More to come maybe... ?
+  - Manhattan (support for a subset of the approximate nearest neighbour
+    searches).
 
 - **High performance**: Optimised implementations with SIMD, heavy
   multi-threading were possible and optimised structures for memory access.
@@ -71,7 +75,6 @@ anticipated. If you want to see what changed, please check this
   - *Binary* (different types of binary quantisations for exhaustive and IVF
     indices.)
   - *RaBitQ* (RaBitQ quantisation for exhaustive and IVF indices.)
-  - *TurboQuant* (TurboQuant quantisation for exhaustive and IVF indices.)
 
 ## Installation
 
@@ -79,8 +82,13 @@ Add this to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-ann-search-rs = "*" # always get the latest version
+ann-search-rs = "0.3.0"
 ```
+
+### Note
+
+With version `"0.3.0"` some breaking API changes were introduced: this harmonise
+several of the functions and avoid panics in favour of errors.
 
 ## Example Usage
 
@@ -277,7 +285,7 @@ If you wish to use these, please add the `"quantised"` feature:
 
 ```toml
 [dependencies]
-ann-search-rs = { version = "*", features = ["quantised"] }
+ann-search-rs = { version = "0.3.0", features = ["quantised"] }
 ```
 
 ## GPU
@@ -294,7 +302,7 @@ To unlock GPU-acceleration, please use:
 
 ```toml
 [dependencies]
-ann-search-rs = { version = "*", features = ["gpu"] }
+ann-search-rs = { version = "0.3.0", features = ["gpu"] }
 ```
 
 ## Binarised indices
@@ -313,7 +321,7 @@ can drastically improve the Recall. To enable the feature, please use:
 
 ```toml
 [dependencies]
-ann-search-rs = { version = "*", features = ["binary"] }
+ann-search-rs = { version = "0.3.0", features = ["binary"] }
 ```
 
 The benchmarks can be found [here](https://github.com/GregorLueg/ann-search-rs/blob/main/docs/benchmarks_binary.md).

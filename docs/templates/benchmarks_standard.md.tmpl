@@ -25,7 +25,8 @@ behaviour with different types of structure in the data. You should not
 extrapolate from the results here what the ideal parameters are for your
 specific problem. Also, this is a single run. There is some variation in terms
 of exact times, but the overall trends should reproduce on your system with
-your specific specifications.
+your specific specifications. Some of the indices also support now Manhattan
+distance.
 
 ## Table of Contents
 
@@ -199,6 +200,16 @@ Self is queried with `s=100`.
 ---
 
 <details>
+<summary><b>HNSW - Manhattan (Gaussian)</b>:</summary>
+</br>
+<pre><code>
+<!-- BENCH:hnsw:manhattan:gaussian:32 -->
+</code></pre>
+</details>
+
+---
+
+<details>
 <summary><b>HNSW - Euclidean (Correlated)</b>:</summary>
 </br>
 <pre><code>
@@ -320,6 +331,16 @@ Self is queried with the default search budget.
 </br>
 <pre><code>
 <!-- BENCH:kd_forest:cosine:gaussian:32 -->
+</code></pre>
+</details>
+
+---
+
+<details>
+<summary><b>Kd forest - Manhattan (Gaussian)</b>:</summary>
+</br>
+<pre><code>
+<!-- BENCH:kd_forest:manhattan:gaussian:32 -->
 </code></pre>
 </details>
 
@@ -530,6 +551,16 @@ exhaustive search)!
 ---
 
 <details>
+<summary><b>NNDescent - Manhattan (Gaussian)</b>:</summary>
+</br>
+<pre><code>
+<!-- BENCH:nndescent:manhattan:gaussian:32 -->
+</code></pre>
+</details>
+
+---
+
+<details>
 <summary><b>NNDescent - Euclidean (Correlated)</b>:</summary>
 </br>
 <pre><code>
@@ -589,6 +620,16 @@ Self is queried with `ef_search=75` (default value).
 </br>
 <pre><code>
 <!-- BENCH:vamana:cosine:gaussian:32 -->
+</code></pre>
+</details>
+
+---
+
+<details>
+<summary><b>Vamana - Manhattan (Gaussian)</b>:</summary>
+</br>
+<pre><code>
+<!-- BENCH:vamana:manhattan:gaussian:32 -->
 </code></pre>
 </details>
 

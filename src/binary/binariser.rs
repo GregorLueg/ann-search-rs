@@ -9,6 +9,8 @@ use rand::Rng;
 use rand::SeedableRng;
 use rand_distr::StandardNormal;
 
+use crate::prelude::*;
+
 ///////////////
 // Binariser //
 ///////////////
@@ -264,11 +266,16 @@ fn encode_with_projections<T>(
     mean: &[T],
     n_bits: usize,
     dim: usize,
-) -> Vec<u8>
+) -> Result<Vec<u8>, AnnSearchErrors>
 where
     T: Float,
 {
-    assert_eq!(vec.len(), dim, "Vector dimension mismatch");
+    if vec.len() != dim {
+        return Err(AnnSearchErrors::DimensionMismatch {
+            index_dim: dim,
+            query_dim: vec.len(),
+        });
+    }
 
     let n_bytes = n_bits / 8;
     let mut binary = vec![0u8; n_bytes];
@@ -292,7 +299,7 @@ where
         }
     }
 
-    binary
+    Ok(binary)
 }
 
 /// Encode a vector to binary using sign-based binarisation
@@ -356,15 +363,18 @@ where
     /// ### Returns
     ///
     /// Initialised binariser
-    pub fn new_simhash(dim: usize, n_bits: usize, seed: usize) -> Self {
-        assert!(n_bits.is_multiple_of(8), "n_bits must be multiple of 8");
+    pub fn new_simhash(dim: usize, n_bits: usize, seed: usize) -> Result<Self, AnnSearchErrors> {
+        if !n_bits.is_multiple_of(8) {
+            return Err(AnnSearchErrors::NBitsMustBe8Multiple { n_bits });
+        }
 
         let projections = prepare_simhash_projections(dim, n_bits, seed);
-        Self {
+
+        Ok(Self {
             method: BinarisationMethod::SimHash { projections },
             n_bits,
             dim,
-        }
+        })
     }
 
     /// Initialise binariser using PCA hashing
@@ -383,16 +393,23 @@ where
     /// ### Returns
     ///
     /// Initialised binariser with PCA projections
-    pub fn new_pca_hashing(data: MatRef<T>, dim: usize, n_bits: usize, seed: usize) -> Self {
-        assert!(n_bits.is_multiple_of(8), "n_bits must be multiple of 8");
+    pub fn new_pca_hashing(
+        data: MatRef<T>,
+        dim: usize,
+        n_bits: usize,
+        seed: usize,
+    ) -> Result<Self, AnnSearchErrors> {
+        if !n_bits.is_multiple_of(8) {
+            return Err(AnnSearchErrors::NBitsMustBe8Multiple { n_bits });
+        }
 
         let (projections, mean) = prepare_pca_projections(data, n_bits, seed);
 
-        Self {
+        Ok(Self {
             method: BinarisationMethod::PcaHashing { projections, mean },
             n_bits,
             dim,
-        }
+        })
     }
 
     /// Create a new binariser using sign-based binarisation
@@ -424,8 +441,13 @@ where
     /// ### Returns
     ///
     /// Binary code as `Vec<u8>`
-    pub fn encode(&self, vec: &[T]) -> Vec<u8> {
-        assert_eq!(vec.len(), self.dim);
+    pub fn encode(&self, vec: &[T]) -> Result<Vec<u8>, AnnSearchErrors> {
+        if vec.len() != self.dim {
+            return Err(AnnSearchErrors::DimensionMismatch {
+                index_dim: self.dim,
+                query_dim: vec.len(),
+            });
+        }
 
         match &self.method {
             BinarisationMethod::SimHash { projections } => {
@@ -434,7 +456,7 @@ where
             BinarisationMethod::PcaHashing { projections, mean } => {
                 encode_with_projections(vec, projections, mean, self.n_bits, self.dim)
             }
-            BinarisationMethod::SignBased => encode_sign_based(vec, self.dim),
+            BinarisationMethod::SignBased => Ok(encode_sign_based(vec, self.dim)),
         }
     }
 
@@ -473,10 +495,10 @@ mod tests {
     fn test_simhash_basic() {
         let dim = 128;
         let n_bits = 256;
-        let binariser = Binariser::<f64>::new_simhash(dim, n_bits, 42);
+        let binariser = Binariser::<f64>::new_simhash(dim, n_bits, 42).unwrap();
 
         let vec1: Vec<f64> = (0..dim).map(|i| (i as f64) / (dim as f64)).collect();
-        let binary = binariser.encode(&vec1);
+        let binary = binariser.encode(&vec1).unwrap();
 
         assert_eq!(binary.len(), n_bits / 8);
     }
@@ -485,15 +507,15 @@ mod tests {
     fn test_simhash_preserves_similarity() {
         let dim = 64;
         let n_bits = 128;
-        let binariser = Binariser::<f64>::new_simhash(dim, n_bits, 42);
+        let binariser = Binariser::<f64>::new_simhash(dim, n_bits, 42).unwrap();
 
         let vec1: Vec<f64> = (0..dim).map(|i| i as f64).collect();
         let vec2: Vec<f64> = (0..dim).map(|i| i as f64 + 0.1).collect();
         let vec3: Vec<f64> = (0..dim).map(|i| -(i as f64)).collect();
 
-        let bin1 = binariser.encode(&vec1);
-        let bin2 = binariser.encode(&vec2);
-        let bin3 = binariser.encode(&vec3);
+        let bin1 = binariser.encode(&vec1).unwrap();
+        let bin2 = binariser.encode(&vec2).unwrap();
+        let bin3 = binariser.encode(&vec3).unwrap();
 
         let dist_12 = hamming_distance(&bin1, &bin2);
         let dist_13 = hamming_distance(&bin1, &bin3);
@@ -517,10 +539,10 @@ mod tests {
             }
         }
 
-        let binariser = Binariser::<f64>::new_pca_hashing(data.as_ref(), dim, n_bits, 42);
+        let binariser = Binariser::<f64>::new_pca_hashing(data.as_ref(), dim, n_bits, 42).unwrap();
 
         let vec1: Vec<f64> = (0..dim).map(|i| (i as f64).sin()).collect();
-        let binary = binariser.encode(&vec1);
+        let binary = binariser.encode(&vec1).unwrap();
 
         assert_eq!(binary.len(), n_bits / 8);
     }
@@ -538,7 +560,7 @@ mod tests {
             }
         }
 
-        let binariser = Binariser::<f64>::new_pca_hashing(data.as_ref(), dim, n_bits, 42);
+        let binariser = Binariser::<f64>::new_pca_hashing(data.as_ref(), dim, n_bits, 42).unwrap();
 
         if let BinarisationMethod::PcaHashing { projections, .. } = &binariser.method {
             for i in 0..n_bits.min(dim) {
@@ -588,7 +610,7 @@ mod tests {
             }
         }
 
-        let binariser = Binariser::<f64>::new_pca_hashing(data.as_ref(), dim, n_bits, 42);
+        let binariser = Binariser::<f64>::new_pca_hashing(data.as_ref(), dim, n_bits, 42).unwrap();
 
         if let BinarisationMethod::PcaHashing { mean, .. } = &binariser.method {
             for d in 0..dim {
@@ -610,7 +632,7 @@ mod tests {
         let vec: Vec<f64> = (0..dim)
             .map(|i| if i % 2 == 0 { 1.0 } else { -1.0 })
             .collect();
-        let binary = binariser.encode(&vec);
+        let binary = binariser.encode(&vec).unwrap();
 
         assert_eq!(binary.len(), dim.div_ceil(8));
 
@@ -632,9 +654,9 @@ mod tests {
         let vec2: Vec<f64> = (0..dim).map(|i| (i + 1) as f64 + 0.1).collect();
         let vec3: Vec<f64> = (0..dim).map(|i| -((i + 1) as f64)).collect();
 
-        let bin1 = binariser.encode(&vec1);
-        let bin2 = binariser.encode(&vec2);
-        let bin3 = binariser.encode(&vec3);
+        let bin1 = binariser.encode(&vec1).unwrap();
+        let bin2 = binariser.encode(&vec2).unwrap();
+        let bin3 = binariser.encode(&vec3).unwrap();
 
         let dist_12 = hamming_distance(&bin1, &bin2);
         let dist_13 = hamming_distance(&bin1, &bin3);
@@ -654,12 +676,12 @@ mod tests {
         let dim = 32;
         let n_bits = 64;
 
-        let binariser1 = Binariser::<f64>::new_simhash(dim, n_bits, 42);
-        let binariser2 = Binariser::<f64>::new_simhash(dim, n_bits, 42);
+        let binariser1 = Binariser::<f64>::new_simhash(dim, n_bits, 42).unwrap();
+        let binariser2 = Binariser::<f64>::new_simhash(dim, n_bits, 42).unwrap();
 
         let vec: Vec<f64> = (0..dim).map(|i| i as f64).collect();
-        let bin1 = binariser1.encode(&vec);
-        let bin2 = binariser2.encode(&vec);
+        let bin1 = binariser1.encode(&vec).unwrap();
+        let bin2 = binariser2.encode(&vec).unwrap();
 
         assert_eq!(bin1, bin2);
     }
@@ -694,24 +716,35 @@ mod tests {
     }
 
     #[test]
-    #[should_panic]
     fn test_invalid_n_bits_simhash() {
-        let _binariser = Binariser::<f64>::new_simhash(64, 123, 42);
+        let result = Binariser::<f64>::new_simhash(64, 123, 42);
+        assert!(matches!(
+            result,
+            Err(AnnSearchErrors::NBitsMustBe8Multiple { n_bits: 123 })
+        ));
     }
 
     #[test]
-    #[should_panic]
     fn test_invalid_n_bits_pca_hashing() {
         let data = Mat::<f64>::zeros(100, 64);
-        let _binariser = Binariser::<f64>::new_pca_hashing(data.as_ref(), 64, 123, 42);
+        let result = Binariser::<f64>::new_pca_hashing(data.as_ref(), 64, 123, 42);
+        assert!(matches!(
+            result,
+            Err(AnnSearchErrors::NBitsMustBe8Multiple { n_bits: 123 })
+        ));
     }
 
     #[test]
-    #[should_panic]
     fn test_dimension_mismatch() {
-        let binariser = Binariser::<f64>::new_simhash(64, 128, 42);
-        let wrong_vec: Vec<f64> = vec![0.0; 32];
-        let _binary = binariser.encode(&wrong_vec);
+        let binariser = Binariser::<f64>::new_simhash(64, 128, 42).unwrap();
+        let result = binariser.encode(&vec![0.0; 32]);
+        assert!(matches!(
+            result,
+            Err(AnnSearchErrors::DimensionMismatch {
+                index_dim: 64,
+                query_dim: 32
+            })
+        ));
     }
 
     #[test]
@@ -719,7 +752,7 @@ mod tests {
         let dim = 32;
         let n_bits = 64;
 
-        let simhash = Binariser::<f64>::new_simhash(dim, n_bits, 42);
+        let simhash = Binariser::<f64>::new_simhash(dim, n_bits, 42).unwrap();
         let simhash_mem = simhash.memory_usage_bytes();
         assert!(simhash_mem > 0);
 

@@ -113,7 +113,9 @@ where
     /// * `n_bits` - Number of bits per binary code (must be multiple of 8)
     /// * `metric` - Distance metric for centroid routing
     /// * `nlist` - Optional number of clusters (defaults to sqrt(n))
-    /// * `max_iters` - Optional max k-means iterations (defaults to `50`)
+    /// * `k_means_params` - Optional k-means trainings parameters, see
+    ///   [KMeansTrainingParams]. If not provided, will default to sensible
+    ///   defaults.
     /// * `seed` - Random seed
     /// * `verbose` - Print progress
     ///
@@ -127,11 +129,16 @@ where
         n_bits: usize,
         metric: Dist,
         nlist: Option<usize>,
-        max_iters: Option<usize>,
+        k_means_params: Option<KMeansTrainingParams>,
         seed: usize,
         verbose: bool,
-    ) -> Self {
-        assert!(n_bits.is_multiple_of(8), "n_bits must be multiple of 8");
+    ) -> Result<Self, AnnSearchErrors> {
+        if !n_bits.is_multiple_of(8) {
+            return Err(AnnSearchErrors::NBitsMustBe8Multiple { n_bits });
+        }
+        if metric == Dist::Manhattan {
+            return Err(AnnSearchErrors::DistanceNotSupported(metric));
+        }
 
         let n = data.nrows();
         let dim = data.ncols();
@@ -139,7 +146,6 @@ where
 
         let (vectors_flat, _, _) = matrix_to_flat(data);
 
-        let max_iters = max_iters.unwrap_or(30);
         let nlist = nlist.unwrap_or((n as f32).sqrt() as usize).max(1);
 
         if verbose {
@@ -160,10 +166,10 @@ where
             n_train,
             nlist,
             &metric,
-            max_iters,
+            k_means_params,
             seed,
             verbose,
-        );
+        )?;
 
         let centroids_norm = if metric == Dist::Cosine {
             (0..nlist)
@@ -201,25 +207,25 @@ where
             &metric,
         );
 
-        if verbose {
-            print_cluster_summary(&assignments, nlist);
-        }
-
         // 4. build CSR layout
         let (all_indices, offsets) = build_csr_layout(assignments, n, nlist);
 
         // 5. initialise binariser and encode all vectors
-        let init = parse_binarisation_init(binarisation_init).unwrap_or_default();
+        let init = parse_binarisation_init(binarisation_init).unwrap_or({
+            eprintln!("Unknown binarisation string provided. Using the default");
+            BinarisationInit::default()
+        });
+
         let binariser = match init {
-            BinarisationInit::PcaHashing => Binariser::new_pca_hashing(data, dim, n_bits, seed),
-            BinarisationInit::RandomProjections => Binariser::new_simhash(dim, n_bits, seed),
+            BinarisationInit::PcaHashing => Binariser::new_pca_hashing(data, dim, n_bits, seed)?,
+            BinarisationInit::RandomProjections => Binariser::new_simhash(dim, n_bits, seed)?,
             BinarisationInit::SignBased => Binariser::new_sign_based(dim),
         };
 
         let mut vectors_flat_binarised: Vec<u8> = Vec::with_capacity(n * n_bytes);
         for i in 0..n {
             let original: Vec<T> = data.row(i).iter().cloned().collect();
-            vectors_flat_binarised.extend(binariser.encode(&original));
+            vectors_flat_binarised.extend(binariser.encode(&original)?);
         }
 
         let mut idx = Self {
@@ -243,7 +249,7 @@ where
         let new_to_old = idx.optimise_memory_layout();
         idx.original_ids = new_to_old;
 
-        idx
+        Ok(idx)
     }
 
     /// Build an IVF index with binary quantisation and vector store for reranking
@@ -258,7 +264,9 @@ where
     /// * `n_bits` - Number of bits per binary code (must be multiple of 8)
     /// * `metric` - Distance metric for centroid routing and reranking
     /// * `nlist` - Optional number of clusters (defaults to sqrt(n))
-    /// * `max_iters` - Optional max k-means iterations (defaults to `50`)
+    /// * `k_means_params` - Optional k-means trainings parameters, see
+    ///   [KMeansTrainingParams]. If not provided, will default to sensible
+    ///   defaults.
     /// * `seed` - Random seed
     /// * `verbose` - Print progress
     /// * `save_path` - Directory to save vector store files
@@ -273,12 +281,17 @@ where
         n_bits: usize,
         metric: Dist,
         nlist: Option<usize>,
-        max_iters: Option<usize>,
+        k_means_params: Option<KMeansTrainingParams>,
         seed: usize,
         verbose: bool,
         save_path: impl AsRef<Path>,
-    ) -> std::io::Result<Self> {
-        assert!(n_bits.is_multiple_of(8), "n_bits must be multiple of 8");
+    ) -> Result<Self, AnnSearchErrors> {
+        if !n_bits.is_multiple_of(8) {
+            return Err(AnnSearchErrors::NBitsMustBe8Multiple { n_bits });
+        }
+        if metric == Dist::Manhattan {
+            return Err(AnnSearchErrors::DistanceNotSupported(metric));
+        }
 
         let n = data.nrows();
         let dim = data.ncols();
@@ -286,7 +299,6 @@ where
 
         let (vectors_flat, _, _) = matrix_to_flat(data);
 
-        let max_iters = max_iters.unwrap_or(30);
         let nlist = nlist.unwrap_or((n as f32).sqrt() as usize).max(1);
 
         if verbose {
@@ -314,10 +326,10 @@ where
             n_train,
             nlist,
             &metric,
-            max_iters,
+            k_means_params,
             seed,
             verbose,
-        );
+        )?;
 
         let centroids_norm = if metric == Dist::Cosine {
             (0..nlist)
@@ -363,25 +375,25 @@ where
             &metric,
         );
 
-        if verbose {
-            print_cluster_summary(&assignments, nlist);
-        }
-
         // 4. build CSR layout
         let (all_indices, offsets) = build_csr_layout(assignments, n, nlist);
 
         // 5. initialise binariser and encode all vectors
-        let init = parse_binarisation_init(binarisation_init).unwrap_or_default();
+        let init = parse_binarisation_init(binarisation_init).unwrap_or({
+            eprintln!("Unknown binarisation string provided. Using the default");
+            BinarisationInit::default()
+        });
+
         let binariser = match init {
-            BinarisationInit::PcaHashing => Binariser::new_pca_hashing(data, dim, n_bits, seed),
-            BinarisationInit::RandomProjections => Binariser::new_simhash(dim, n_bits, seed),
+            BinarisationInit::PcaHashing => Binariser::new_pca_hashing(data, dim, n_bits, seed)?,
+            BinarisationInit::RandomProjections => Binariser::new_simhash(dim, n_bits, seed)?,
             BinarisationInit::SignBased => Binariser::new_sign_based(dim),
         };
 
         let mut vectors_flat_binarised: Vec<u8> = Vec::with_capacity(n * n_bytes);
         for i in 0..n {
             let original: Vec<T> = data.row(i).iter().cloned().collect();
-            vectors_flat_binarised.extend(binariser.encode(&original));
+            vectors_flat_binarised.extend(binariser.encode(&original)?);
         }
 
         // Save vector store
@@ -452,13 +464,13 @@ where
         query_vec: &[T],
         k: usize,
         nprobe: Option<usize>,
-    ) -> (Vec<usize>, Vec<u32>) {
+    ) -> Result<(Vec<usize>, Vec<u32>), AnnSearchErrors> {
         let nprobe = nprobe
             .unwrap_or_else(|| ((self.nlist as f64).sqrt() as usize).max(1))
             .min(self.nlist);
         let k = k.min(self.n);
 
-        let query_binary = self.binariser.encode(query_vec);
+        let query_binary = self.binariser.encode(query_vec)?;
 
         let query_norm = if matches!(self.metric, Dist::Cosine) {
             T::calculate_l2_norm(query_vec)
@@ -496,7 +508,7 @@ where
             .map(|(d, i)| (d, self.original_ids[i]))
             .unzip();
 
-        (indices, distances)
+        Ok((indices, distances))
     }
 
     /// Query using row reference
@@ -518,7 +530,7 @@ where
         query_row: RowRef<T>,
         k: usize,
         nprobe: Option<usize>,
-    ) -> (Vec<usize>, Vec<u32>) {
+    ) -> Result<(Vec<usize>, Vec<u32>), AnnSearchErrors> {
         if query_row.col_stride() == 1 {
             let slice =
                 unsafe { std::slice::from_raw_parts(query_row.as_ptr(), query_row.ncols()) };
@@ -558,14 +570,13 @@ where
         k: usize,
         nprobe: Option<usize>,
         rerank_factor: Option<usize>,
-    ) -> (Vec<usize>, Vec<T>) {
-        assert!(
-            self.use_asymmetric(),
-            "Only sign-based binarisation is supported for asymmetric queries."
-        );
+    ) -> Result<(Vec<usize>, Vec<T>), AnnSearchErrors> {
+        if !self.use_asymmetric() {
+            return Err(AnnSearchErrors::AsymmetricQueryMisMatch);
+        }
         let rerank_factor = rerank_factor.unwrap_or(20);
 
-        let (candidates, _) = self.query(query_vec, k * rerank_factor, nprobe);
+        let (candidates, _) = self.query(query_vec, k * rerank_factor, nprobe)?;
 
         let mut scored: Vec<(usize, T)> = candidates
             .iter()
@@ -592,7 +603,7 @@ where
             dists.push(dist);
         }
 
-        (indices, dists)
+        Ok((indices, dists))
     }
 
     /// Query using row reference (asymmetric)
@@ -615,7 +626,7 @@ where
         k: usize,
         nprobe: Option<usize>,
         rerank_factor: Option<usize>,
-    ) -> (Vec<usize>, Vec<T>) {
+    ) -> Result<(Vec<usize>, Vec<T>), AnnSearchErrors> {
         if query_row.col_stride() == 1 {
             let slice =
                 unsafe { std::slice::from_raw_parts(query_row.as_ptr(), query_row.ncols()) };
@@ -652,24 +663,25 @@ where
         k: usize,
         nprobe: Option<usize>,
         rerank_factor: Option<usize>,
-    ) -> (Vec<usize>, Vec<T>) {
+    ) -> Result<(Vec<usize>, Vec<T>), AnnSearchErrors> {
         let vector_store = self
             .vector_store
             .as_ref()
-            .expect("Vector store required for reranking - use build_with_vector_store()");
+            .ok_or(AnnSearchErrors::VectorStoreNotAvailable)?;
         let rerank_factor = rerank_factor.unwrap_or(20);
 
         let candidates = if matches!(self.binarisation_type, BinarisationInit::SignBased) {
-            let (idx, _) = self.query_asymmetric(query_vec, k, nprobe, Some(2 * rerank_factor));
+            let (idx, _) = self.query_asymmetric(query_vec, k, nprobe, Some(2 * rerank_factor))?;
             idx
         } else {
-            let (idx, _) = self.query(query_vec, k * rerank_factor, nprobe);
+            let (idx, _) = self.query(query_vec, k * rerank_factor, nprobe)?;
             idx
         };
 
         let query_norm = match self.metric {
             Dist::Cosine => T::calculate_l2_norm(query_vec),
-            Dist::Euclidean => T::one(),
+            Dist::SquaredEuclidean => T::one(),
+            Dist::Manhattan => unreachable!(),
         };
 
         let mut scored: Vec<_> = candidates
@@ -679,7 +691,10 @@ where
                     Dist::Cosine => {
                         vector_store.cosine_distance_to_query(idx, query_vec, query_norm)
                     }
-                    Dist::Euclidean => vector_store.euclidean_distance_to_query(idx, query_vec),
+                    Dist::SquaredEuclidean => {
+                        vector_store.euclidean_distance_to_query(idx, query_vec)
+                    }
+                    Dist::Manhattan => unreachable!(),
                 };
                 (dist, idx)
             })
@@ -696,7 +711,7 @@ where
             dists.push(dist);
         }
 
-        (indices, dists)
+        Ok((indices, dists))
     }
 
     /// Query with reranking for row references
@@ -718,7 +733,7 @@ where
         k: usize,
         nprobe: Option<usize>,
         rerank_factor: Option<usize>,
-    ) -> (Vec<usize>, Vec<T>) {
+    ) -> Result<(Vec<usize>, Vec<T>), AnnSearchErrors> {
         if query_row.col_stride() == 1 {
             let slice =
                 unsafe { std::slice::from_raw_parts(query_row.as_ptr(), query_row.ncols()) };
@@ -752,7 +767,7 @@ where
         rerank_factor: Option<usize>,
         return_dist: bool,
         verbose: bool,
-    ) -> (Vec<Vec<usize>>, Option<Vec<Vec<T>>>) {
+    ) -> KnnOptionResult<T> {
         let counter = Arc::new(AtomicUsize::new(0));
 
         if let Some(vector_store) = &self.vector_store {
@@ -773,10 +788,10 @@ where
                         }
                     }
 
-                    let (indices, dists) = self.query_reranking(vec, k, nprobe, rerank_factor);
-                    (orig_id, indices, dists)
+                    let (indices, dists) = self.query_reranking(vec, k, nprobe, rerank_factor)?;
+                    Ok((orig_id, indices, dists))
                 })
-                .collect();
+                .collect::<Result<Vec<_>, AnnSearchErrors>>()?;
 
             let mut final_indices = vec![Vec::new(); self.n];
             let mut final_dists = if return_dist {
@@ -792,7 +807,7 @@ where
                 }
             }
 
-            (final_indices, final_dists)
+            Ok((final_indices, final_dists))
         } else {
             let unordered_results: Vec<(usize, Vec<usize>, Vec<u32>)> = (0..self.n)
                 .into_par_iter()
@@ -857,7 +872,7 @@ where
                 }
             }
 
-            (final_indices, final_dists)
+            Ok((final_indices, final_dists))
         }
     }
 
@@ -941,6 +956,10 @@ mod tests {
         data
     }
 
+    fn get_default_k_means() -> Option<KMeansTrainingParams> {
+        Some(KMeansTrainingParams::new(10, None, None))
+    }
+
     #[test]
     fn test_ivf_binary_construction() {
         let data = create_test_data::<f32>(200, 32);
@@ -950,10 +969,11 @@ mod tests {
             64,
             Dist::Cosine,
             Some(10),
-            Some(10),
+            get_default_k_means(),
             42,
             false,
-        );
+        )
+        .unwrap();
 
         assert_eq!(index.n, 200);
         assert_eq!(index.n_bytes, 8);
@@ -971,13 +991,14 @@ mod tests {
             64,
             Dist::Cosine,
             Some(10),
-            Some(10),
+            get_default_k_means(),
             42,
             false,
-        );
+        )
+        .unwrap();
 
         let query: Vec<f32> = (0..32).map(|i| i as f32 * 0.1).collect();
-        let (indices, distances) = index.query(&query, 10, Some(10));
+        let (indices, distances) = index.query(&query, 10, Some(10)).unwrap();
 
         assert_eq!(indices.len(), 10);
         assert_eq!(distances.len(), 10);
@@ -992,13 +1013,14 @@ mod tests {
             64,
             Dist::Cosine,
             Some(10),
-            Some(10),
+            get_default_k_means(),
             42,
             false,
-        );
+        )
+        .unwrap();
 
         let query: Vec<f32> = (0..32).map(|i| i as f32 * 0.1).collect();
-        let (_, distances) = index.query(&query, 10, Some(10));
+        let (_, distances) = index.query(&query, 10, Some(10)).unwrap();
 
         for i in 1..distances.len() {
             assert!(distances[i] >= distances[i - 1]);
@@ -1014,14 +1036,15 @@ mod tests {
             64,
             Dist::Cosine,
             Some(20),
-            Some(10),
+            get_default_k_means(),
             42,
             false,
-        );
+        )
+        .unwrap();
 
         let query: Vec<f32> = (0..32).map(|i| i as f32 * 0.1).collect();
-        let (indices1, _) = index.query(&query, 10, Some(2));
-        let (indices2, _) = index.query(&query, 10, Some(10));
+        let (indices1, _) = index.query(&query, 10, Some(2)).unwrap();
+        let (indices2, _) = index.query(&query, 10, Some(10)).unwrap();
 
         assert!(indices1.len() <= 10);
         assert!(indices2.len() <= 10);
@@ -1036,12 +1059,13 @@ mod tests {
             64,
             Dist::Cosine,
             Some(10),
-            Some(10),
+            get_default_k_means(),
             42,
             false,
-        );
+        )
+        .unwrap();
 
-        let (indices, distances) = index.query_row(data.as_ref().row(0), 10, Some(10));
+        let (indices, distances) = index.query_row(data.as_ref().row(0), 10, Some(10)).unwrap();
 
         assert!(indices.len() <= 10);
         assert!(distances.len() <= 10);
@@ -1057,12 +1081,14 @@ mod tests {
             64,
             Dist::Cosine,
             Some(10),
-            Some(10),
+            get_default_k_means(),
             42,
             false,
-        );
+        )
+        .unwrap();
 
-        let (knn_indices, knn_distances) = index.generate_knn(5, Some(10), None, true, false);
+        let (knn_indices, knn_distances) =
+            index.generate_knn(5, Some(10), None, true, false).unwrap();
 
         assert_eq!(knn_indices.len(), 100);
         assert!(knn_distances.is_some());
@@ -1083,7 +1109,7 @@ mod tests {
             64,
             Dist::Cosine,
             Some(10),
-            Some(10),
+            get_default_k_means(),
             42,
             false,
             temp_dir.path(),
@@ -1107,7 +1133,7 @@ mod tests {
             64,
             Dist::Cosine,
             Some(10),
-            Some(10),
+            get_default_k_means(),
             42,
             false,
             temp_dir.path(),
@@ -1115,7 +1141,9 @@ mod tests {
         .unwrap();
 
         let query: Vec<f32> = (0..32).map(|i| i as f32 * 0.1).collect();
-        let (indices, distances) = index.query_reranking(&query, 10, Some(10), Some(5));
+        let (indices, distances) = index
+            .query_reranking(&query, 10, Some(10), Some(5))
+            .unwrap();
 
         assert_eq!(indices.len(), 10);
         assert_eq!(distances.len(), 10);
@@ -1134,17 +1162,18 @@ mod tests {
             data.as_ref(),
             "random",
             64,
-            Dist::Euclidean,
+            Dist::SquaredEuclidean,
             Some(10),
-            Some(10),
+            get_default_k_means(),
             42,
             false,
             temp_dir.path(),
         )
         .unwrap();
 
-        let (indices, distances) =
-            index.query_row_reranking(data.as_ref().row(0), 10, Some(10), Some(5));
+        let (indices, distances) = index
+            .query_row_reranking(data.as_ref().row(0), 10, Some(10), Some(5))
+            .unwrap();
 
         assert_eq!(indices.len(), 10);
         assert_eq!(distances.len(), 10);
@@ -1162,14 +1191,16 @@ mod tests {
             64,
             Dist::Cosine,
             Some(10),
-            Some(10),
+            get_default_k_means(),
             42,
             false,
             temp_dir.path(),
         )
         .unwrap();
 
-        let (knn_indices, knn_distances) = index.generate_knn(5, Some(10), Some(10), true, false);
+        let (knn_indices, knn_distances) = index
+            .generate_knn(5, Some(10), Some(10), true, false)
+            .unwrap();
 
         assert_eq!(knn_indices.len(), 100);
         assert!(knn_distances.is_some());
@@ -1180,8 +1211,7 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "Vector store required for reranking")]
-    fn test_query_reranking_without_vector_store_panics() {
+    fn test_query_reranking_without_vector_store() {
         let data = create_test_data::<f32>(100, 32);
         let index = IvfIndexBinary::build(
             data.as_ref(),
@@ -1189,13 +1219,17 @@ mod tests {
             64,
             Dist::Cosine,
             Some(10),
-            Some(10),
+            get_default_k_means(),
             42,
             false,
-        );
-
+        )
+        .unwrap();
         let query: Vec<f32> = (0..32).map(|i| i as f32 * 0.1).collect();
-        let _ = index.query_reranking(&query, 10, Some(10), Some(5));
+        let result = index.query_reranking(&query, 10, Some(10), Some(5));
+        assert!(matches!(
+            result,
+            Err(AnnSearchErrors::VectorStoreNotAvailable)
+        ));
     }
 
     #[test]
@@ -1207,13 +1241,14 @@ mod tests {
             64,
             Dist::Cosine,
             Some(16),
-            Some(10),
+            get_default_k_means(),
             42,
             false,
-        );
+        )
+        .unwrap();
 
         let query: Vec<f32> = (0..32).map(|i| i as f32 * 0.1).collect();
-        let (indices, _) = index.query(&query, 10, None);
+        let (indices, _) = index.query(&query, 10, None).unwrap();
 
         assert!(indices.len() <= 10);
     }

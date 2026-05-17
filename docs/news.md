@@ -1,5 +1,17 @@
 # News
 
+## 0.3.0
+
+Large update with breaking changes!
+
+**Features**
+
+- Manhattan distance enabled on some indices
+- More fine control over k-means parameters
+- Canberra distance implemented for the SimdDistance trait
+  - Renamed of `Euclidean` to `SquaredEuclidean` to be more explicit
+- Proper error handling across the board and return of results over asserts
+
 ## 0.2.15
 
 **Features**

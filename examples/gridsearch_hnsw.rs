@@ -35,7 +35,7 @@ fn main() {
     println!("Querying exhaustive index...");
     let start = Instant::now();
     let (true_neighbors, true_distances) =
-        query_exhaustive_index(query_data.as_ref(), &exhaustive_idx, cli.k, true, false);
+        query_exhaustive_index(query_data.as_ref(), &exhaustive_idx, cli.k, true, false).unwrap();
     let query_time = start.elapsed().as_secs_f64() * 1000.0;
 
     results.push(BenchmarkResultSize {
@@ -52,7 +52,7 @@ fn main() {
     println!("Self-querying exhaustive index...");
     let start = Instant::now();
     let (true_neighbors_self, true_distances_self) =
-        query_exhaustive_self(&exhaustive_idx, cli.k, true, false);
+        query_exhaustive_self(&exhaustive_idx, cli.k, true, false).unwrap();
     let self_query_time = start.elapsed().as_secs_f64() * 1000.0;
 
     results.push(BenchmarkResultSize {
@@ -108,7 +108,8 @@ fn main() {
                 ef_search,
                 true,
                 false,
-            );
+            )
+            .unwrap();
             let query_time = start.elapsed().as_secs_f64() * 1000.0;
 
             let recall = calculate_recall(&true_neighbors, &approx_neighbors, cli.k);
@@ -133,7 +134,7 @@ fn main() {
         println!("Self-querying HNSW index...");
         let start = Instant::now();
         let (approx_neighbors_self, approx_distances_self) =
-            query_hnsw_self(&hnsw_idx, cli.k, 100, true, false);
+            query_hnsw_self(&hnsw_idx, cli.k, 100, true, false).unwrap();
         let self_query_time = start.elapsed().as_secs_f64() * 1000.0;
 
         let recall_self = calculate_recall(&true_neighbors_self, &approx_neighbors_self, cli.k);
