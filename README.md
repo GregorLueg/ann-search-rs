@@ -5,7 +5,10 @@
 # ann-search-rs
 
 Various approximate nearest neighbour/vector searches implemented in Rust (with
-focus on computational biology applications, very specifically single cell).
+focus on computational biology applications, very specifically single cell). The
+search algorithms are designed for high in-memory performance. Longer term,
+I might add the option to add/remove vectors from some of the indices and
+persistent on-disk storage.
 
 ## Table of Contents
 
