@@ -12,6 +12,8 @@
 use num_traits::{Float, FromPrimitive};
 use statrs::distribution::{Beta, Continuous, ContinuousCDF};
 
+use crate::errors::AnnSearchErrors;
+
 ////////////
 // Consts //
 ////////////
@@ -202,15 +204,13 @@ fn lloyd_max(bits: usize, dim: usize, max_iter: usize, tol: f64) -> (Vec<f64>, V
 /// Tuple `(boundaries, centroids)`. There are `2^bits - 1` boundaries
 /// and `2^bits` centroids, both sorted ascending. Centroids are symmetric
 /// about zero.
-pub fn codebook<T>(bits: usize, dim: usize) -> (Vec<T>, Vec<T>)
+pub fn codebook<T>(bits: usize, dim: usize) -> Result<(Vec<T>, Vec<T>), AnnSearchErrors>
 where
     T: Float + FromPrimitive,
 {
-    assert!((2..=4).contains(&bits), "bits must be 2, 3, or 4");
-    assert!(
-        dim >= 2,
-        "dim must be >= 2 for the Beta distribution to be defined"
-    );
+    if !(2..=4).contains(&bits) {
+        return Err(AnnSearchErrors::TQInvalidBits { n_bits: bits });
+    }
 
     let (boundaries_f64, centroids_f64) = lloyd_max(bits, dim, LLOYD_MAX_ITERS, LLOYD_MAX_TOL);
 
@@ -223,7 +223,7 @@ where
         .map(|x| T::from_f64(x).unwrap())
         .collect();
 
-    (boundaries, centroids)
+    Ok((boundaries, centroids))
 }
 
 ///////////
@@ -238,7 +238,7 @@ mod tests {
     #[test]
     fn test_codebook_lengths() {
         for bits in 2..=4 {
-            let (boundaries, centroids) = codebook::<f32>(bits, 128);
+            let (boundaries, centroids) = codebook::<f32>(bits, 128).unwrap();
             assert_eq!(centroids.len(), 1 << bits);
             assert_eq!(boundaries.len(), (1 << bits) - 1);
         }
@@ -247,7 +247,7 @@ mod tests {
     #[test]
     fn test_centroids_sorted() {
         for bits in 2..=4 {
-            let (_, centroids) = codebook::<f64>(bits, 128);
+            let (_, centroids) = codebook::<f64>(bits, 128).unwrap();
             for i in 1..centroids.len() {
                 assert!(centroids[i] > centroids[i - 1]);
             }
@@ -256,7 +256,7 @@ mod tests {
 
     #[test]
     fn test_boundaries_are_midpoints() {
-        let (boundaries, centroids) = codebook::<f64>(4, 128);
+        let (boundaries, centroids) = codebook::<f64>(4, 128).unwrap();
         for i in 0..boundaries.len() {
             let mid = (centroids[i] + centroids[i + 1]) / 2.0;
             assert_abs_diff_eq!(boundaries[i], mid, epsilon = 1e-10);
@@ -266,7 +266,7 @@ mod tests {
     #[test]
     fn test_centroids_symmetric_about_zero() {
         for bits in 2..=4 {
-            let (_, centroids) = codebook::<f64>(bits, 128);
+            let (_, centroids) = codebook::<f64>(bits, 128).unwrap();
             let n = centroids.len();
             for i in 0..n / 2 {
                 assert_abs_diff_eq!(centroids[i], -centroids[n - 1 - i], epsilon = 1e-8);
@@ -277,7 +277,7 @@ mod tests {
     #[test]
     fn test_centroids_in_open_interval() {
         for bits in 2..=4 {
-            let (_, centroids) = codebook::<f64>(bits, 128);
+            let (_, centroids) = codebook::<f64>(bits, 128).unwrap();
             for &c in &centroids {
                 assert!(c > -1.0 && c < 1.0);
             }
@@ -286,8 +286,8 @@ mod tests {
 
     #[test]
     fn test_deterministic() {
-        let (b1, c1) = codebook::<f64>(4, 256);
-        let (b2, c2) = codebook::<f64>(4, 256);
+        let (b1, c1) = codebook::<f64>(4, 256).unwrap();
+        let (b2, c2) = codebook::<f64>(4, 256).unwrap();
         assert_eq!(b1, b2);
         assert_eq!(c1, c2);
     }
@@ -297,16 +297,16 @@ mod tests {
         // Beta((d-1)/2, (d-1)/2) tightens around 1/2 as d grows, so the
         // shifted distribution concentrates at 0 and the extreme centroids
         // shrink in magnitude.
-        let (_, c_low) = codebook::<f64>(4, 16);
-        let (_, c_high) = codebook::<f64>(4, 1024);
+        let (_, c_low) = codebook::<f64>(4, 16).unwrap();
+        let (_, c_high) = codebook::<f64>(4, 1024).unwrap();
         assert!(c_high[0].abs() < c_low[0].abs());
         assert!(c_high.last().unwrap() < c_low.last().unwrap());
     }
 
     #[test]
     fn test_f32_matches_f64() {
-        let (b32, c32) = codebook::<f32>(4, 128);
-        let (b64, c64) = codebook::<f64>(4, 128);
+        let (b32, c32) = codebook::<f32>(4, 128).unwrap();
+        let (b64, c64) = codebook::<f64>(4, 128).unwrap();
         for (a, b) in b32.iter().zip(b64.iter()) {
             assert_abs_diff_eq!(*a as f64, *b, epsilon = 1e-6);
         }
@@ -316,14 +316,20 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "bits must be 2, 3, or 4")]
     fn test_invalid_bits() {
-        let _ = codebook::<f32>(5, 128);
+        let result = codebook::<f32>(5, 128);
+        assert!(matches!(
+            result,
+            Err(AnnSearchErrors::TQInvalidBits { n_bits: 5 })
+        ));
     }
 
     #[test]
-    #[should_panic(expected = "dim must be >= 2")]
     fn test_invalid_dim() {
-        let _ = codebook::<f32>(4, 1);
+        let result = codebook::<f32>(4, 1);
+        assert!(matches!(
+            result,
+            Err(AnnSearchErrors::TQInvalidDim { dims: 1 })
+        ));
     }
 }

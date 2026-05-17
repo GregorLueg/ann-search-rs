@@ -1,10 +1,10 @@
 //! TurboQuant encoder, query, flat storage, and quantiser.
 //!
-//! Each unit-normalised data vector is rotated by a fixed random
-//! orthogonal matrix and scalar-quantised against the Lloyd-Max codebook
-//! for `Beta((d-1)/2, (d-1)/2)`. Codes are stored in bit-plane format:
-//! `bits` planes of `dim/8` bytes each per vector. The bit-plane layout
-//! is later re-packed for SIMD scoring (see `tq_pack.rs`).
+//! Each unit-normalised data vector is rotated by a fixed random orthogonal
+//! matrix and scalar-quantised against the Lloyd-Max codebook for
+//! `Beta((d-1)/2, (d-1)/2)`. Codes are stored in bit-plane format: `bits`
+//! planes of `dim/8` bytes each per vector. The bit-plane layout is later
+//! re-packed for SIMD scoring (see `tq_pack.rs`).
 
 use faer::{Mat, MatRef};
 use faer_traits::ComplexField;
@@ -56,6 +56,20 @@ pub struct TurboQuantEncoder<T> {
     pub metric: Dist,
 }
 
+/////////////////////////
+// DimensionValidation //
+/////////////////////////
+
+impl<T> DimensionValidation for TurboQuantEncoder<T> {
+    fn dim(&self) -> usize {
+        self.dim
+    }
+}
+
+//////////////////
+// Main encoder //
+//////////////////
+
 impl<T> TurboQuantEncoder<T>
 where
     T: Float + FromPrimitive + ToPrimitive + ComplexField + SimdDistance,
@@ -68,15 +82,19 @@ where
     /// * `bits` - Bits per coordinate (2, 3, or 4)
     /// * `metric` - Distance metric
     /// * `seed` - Random seed for the rotation matrix
-    pub fn new(dim: usize, bits: usize, metric: Dist, seed: u64) -> Self {
-        assert!((2..=4).contains(&bits), "bits must be 2, 3, or 4");
-        assert!(dim % 8 == 0, "dim must be a multiple of 8");
+    pub fn new(dim: usize, bits: usize, metric: Dist, seed: u64) -> Result<Self, AnnSearchErrors> {
+        if !(2..=4).contains(&bits) {
+            return Err(AnnSearchErrors::TQInvalidBits { n_bits: bits });
+        }
+        if dim % 8 != 0 {
+            return Err(AnnSearchErrors::TQDimMustBe8Multiple { dims: dim });
+        }
 
         let rotation = Self::generate_random_orthogonal(dim, seed);
-        let (boundaries, levels) = codebook::<T>(bits, dim);
+        let (boundaries, levels) = codebook::<T>(bits, dim)?;
         let bytes_per_vec = bits * dim / 8;
 
-        Self {
+        Ok(Self {
             rotation,
             boundaries,
             levels,
@@ -84,7 +102,7 @@ where
             bits,
             bytes_per_vec,
             metric,
-        }
+        })
     }
 
     /// Encode a single vector.
@@ -93,10 +111,10 @@ where
     ///
     /// `(packed_bit_plane_codes, l2_norm)`
     #[inline]
-    pub fn encode_vector(&self, vec: &[T]) -> (Vec<u8>, T) {
+    pub fn encode_vector(&self, vec: &[T]) -> Result<(Vec<u8>, T), AnnSearchErrors> {
         let mut packed = vec![0u8; self.bytes_per_vec];
-        let norm = self.encode_vector_into(vec, &mut packed);
-        (packed, norm)
+        let norm = self.encode_vector_into(vec, &mut packed)?;
+        Ok((packed, norm))
     }
 
     /// Encode a single vector into a caller-owned buffer.
@@ -105,13 +123,15 @@ where
     ///
     /// L2 norm of the input.
     #[inline]
-    pub fn encode_vector_into(&self, vec: &[T], out: &mut [u8]) -> T {
-        assert_eq!(vec.len(), self.dim, "vector length must equal dim");
-        assert_eq!(
-            out.len(),
-            self.bytes_per_vec,
-            "output buffer must be bytes_per_vec"
-        );
+    pub fn encode_vector_into(&self, vec: &[T], out: &mut [u8]) -> Result<T, AnnSearchErrors> {
+        self.check_dim(vec.len())?;
+
+        if out.len() != self.bytes_per_vec {
+            return Err(AnnSearchErrors::TQBufferUnequalBytesPerVec {
+                bytes_per_vec: self.bytes_per_vec,
+                len: out.len(),
+            });
+        }
 
         let norm = compute_l2_norm(vec);
 
@@ -148,13 +168,13 @@ where
             }
         }
 
-        norm
+        Ok(norm)
     }
 
     /// Encode a query: unit-normalise, rotate, retain original norm.
     #[inline]
-    pub fn encode_query(&self, query: &[T]) -> TurboQuantQuery<T> {
-        assert_eq!(query.len(), self.dim, "query length must equal dim");
+    pub fn encode_query(&self, query: &[T]) -> Result<TurboQuantQuery<T>, AnnSearchErrors> {
+        self.check_dim(query.len())?;
 
         let query_norm = compute_l2_norm(query);
 
@@ -167,7 +187,7 @@ where
 
         let q_rot = self.apply_rotation(&q_unit);
 
-        TurboQuantQuery { q_rot, query_norm }
+        Ok(TurboQuantQuery { q_rot, query_norm })
     }
 
     /// Apply the rotation matrix to a vector: `out = R · vec`.
@@ -276,7 +296,12 @@ where
     T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum + ComplexField + SimdDistance,
 {
     /// Build the quantiser by encoding all rows of `data`.
-    pub fn new(data: MatRef<T>, metric: &Dist, bits: usize, seed: u64) -> Self {
+    pub fn new(
+        data: MatRef<T>,
+        metric: &Dist,
+        bits: usize,
+        seed: u64,
+    ) -> Result<Self, AnnSearchErrors> {
         let n = data.nrows();
         let dim = data.ncols();
 
@@ -287,7 +312,7 @@ where
             }
         }
 
-        let encoder = TurboQuantEncoder::new(dim, bits, *metric, seed);
+        let encoder = TurboQuantEncoder::new(dim, bits, *metric, seed)?;
         let bytes_per_vec = encoder.bytes_per_vec;
 
         let mut packed_codes = vec![0u8; n * bytes_per_vec];
@@ -297,9 +322,12 @@ where
             .par_chunks_mut(bytes_per_vec)
             .zip(norms.par_iter_mut())
             .zip(data_flat.par_chunks(dim))
-            .for_each(|((packed_slice, norm_out), data_row)| {
-                *norm_out = encoder.encode_vector_into(data_row, packed_slice);
-            });
+            .try_for_each(
+                |((packed_slice, norm_out), data_row)| -> Result<(), AnnSearchErrors> {
+                    *norm_out = encoder.encode_vector_into(data_row, packed_slice)?;
+                    Ok(())
+                },
+            )?;
 
         let storage = TurboQuantStorage {
             packed_codes,
@@ -310,12 +338,12 @@ where
             n,
         };
 
-        Self { encoder, storage }
+        Ok(Self { encoder, storage })
     }
 
     /// Encode a query.
     #[inline]
-    pub fn encode_query(&self, query: &[T]) -> TurboQuantQuery<T> {
+    pub fn encode_query(&self, query: &[T]) -> Result<TurboQuantQuery<T>, AnnSearchErrors> {
         self.encoder.encode_query(query)
     }
 
@@ -341,7 +369,7 @@ mod tests {
 
     #[test]
     fn test_encoder_creation_4bit() {
-        let enc = TurboQuantEncoder::<f32>::new(64, 4, Dist::SquaredEuclidean, 42);
+        let enc = TurboQuantEncoder::<f32>::new(64, 4, Dist::SquaredEuclidean, 42).unwrap();
         assert_eq!(enc.dim, 64);
         assert_eq!(enc.bits, 4);
         assert_eq!(enc.bytes_per_vec, 32);
@@ -351,11 +379,11 @@ mod tests {
 
     #[test]
     fn test_encoder_creation_2bit_3bit() {
-        let e2 = TurboQuantEncoder::<f32>::new(64, 2, Dist::SquaredEuclidean, 42);
+        let e2 = TurboQuantEncoder::<f32>::new(64, 2, Dist::SquaredEuclidean, 42).unwrap();
         assert_eq!(e2.bytes_per_vec, 16);
         assert_eq!(e2.levels.len(), 4);
 
-        let e3 = TurboQuantEncoder::<f32>::new(64, 3, Dist::SquaredEuclidean, 42);
+        let e3 = TurboQuantEncoder::<f32>::new(64, 3, Dist::SquaredEuclidean, 42).unwrap();
         assert_eq!(e3.bytes_per_vec, 24);
         assert_eq!(e3.levels.len(), 8);
     }
@@ -363,7 +391,7 @@ mod tests {
     #[test]
     fn test_rotation_orthogonality() {
         let dim = 16;
-        let enc = TurboQuantEncoder::<f64>::new(dim, 4, Dist::SquaredEuclidean, 42);
+        let enc = TurboQuantEncoder::<f64>::new(dim, 4, Dist::SquaredEuclidean, 42).unwrap();
         for i in 0..dim {
             for j in 0..dim {
                 let mut dot = 0.0f64;
@@ -378,33 +406,33 @@ mod tests {
 
     #[test]
     fn test_rotation_deterministic() {
-        let e1 = TurboQuantEncoder::<f32>::new(16, 4, Dist::SquaredEuclidean, 42);
-        let e2 = TurboQuantEncoder::<f32>::new(16, 4, Dist::SquaredEuclidean, 42);
+        let e1 = TurboQuantEncoder::<f32>::new(16, 4, Dist::SquaredEuclidean, 42).unwrap();
+        let e2 = TurboQuantEncoder::<f32>::new(16, 4, Dist::SquaredEuclidean, 42).unwrap();
         assert_eq!(e1.rotation, e2.rotation);
     }
 
     #[test]
     fn test_encode_vector_norm() {
-        let enc = TurboQuantEncoder::<f32>::new(8, 4, Dist::SquaredEuclidean, 42);
+        let enc = TurboQuantEncoder::<f32>::new(8, 4, Dist::SquaredEuclidean, 42).unwrap();
         let v = vec![3.0_f32, 4.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
-        let (packed, norm) = enc.encode_vector(&v);
+        let (packed, norm) = enc.encode_vector(&v).unwrap();
         assert_abs_diff_eq!(norm, 5.0, epsilon = 1e-5);
         assert_eq!(packed.len(), enc.bytes_per_vec);
     }
 
     #[test]
     fn test_encode_zero_vector() {
-        let enc = TurboQuantEncoder::<f32>::new(8, 4, Dist::SquaredEuclidean, 42);
+        let enc = TurboQuantEncoder::<f32>::new(8, 4, Dist::SquaredEuclidean, 42).unwrap();
         let v = vec![0.0_f32; 8];
-        let (_, norm) = enc.encode_vector(&v);
+        let (_, norm) = enc.encode_vector(&v).unwrap();
         assert_abs_diff_eq!(norm, 0.0, epsilon = 1e-7);
     }
 
     #[test]
     fn test_encode_query_normalises() {
-        let enc = TurboQuantEncoder::<f32>::new(8, 4, Dist::Cosine, 42);
+        let enc = TurboQuantEncoder::<f32>::new(8, 4, Dist::Cosine, 42).unwrap();
         let q = vec![3.0_f32, 4.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
-        let eq = enc.encode_query(&q);
+        let eq = enc.encode_query(&q).unwrap();
         assert_abs_diff_eq!(eq.query_norm, 5.0, epsilon = 1e-5);
         let rot_norm: f32 = eq.q_rot.iter().map(|x| x * x).sum::<f32>().sqrt();
         assert_abs_diff_eq!(rot_norm, 1.0, epsilon = 1e-5);
@@ -412,9 +440,9 @@ mod tests {
 
     #[test]
     fn test_encode_query_zero() {
-        let enc = TurboQuantEncoder::<f32>::new(8, 4, Dist::SquaredEuclidean, 42);
+        let enc = TurboQuantEncoder::<f32>::new(8, 4, Dist::SquaredEuclidean, 42).unwrap();
         let q = vec![0.0_f32; 8];
-        let eq = enc.encode_query(&q);
+        let eq = enc.encode_query(&q).unwrap();
         assert_abs_diff_eq!(eq.query_norm, 0.0, epsilon = 1e-7);
     }
 
@@ -425,7 +453,7 @@ mod tests {
         // space (rotation is isometric, so it equals original-space cosine).
         let dim = 64;
         let bits = 4;
-        let enc = TurboQuantEncoder::<f32>::new(dim, bits, Dist::Cosine, 42);
+        let enc = TurboQuantEncoder::<f32>::new(dim, bits, Dist::Cosine, 42).unwrap();
         let bytes_per_plane = dim / 8;
 
         let mut total_sim = 0.0f32;
@@ -437,7 +465,7 @@ mod tests {
             let norm: f32 = v.iter().map(|x| x * x).sum::<f32>().sqrt();
             let unit: Vec<f32> = v.iter().map(|x| x / norm).collect();
 
-            let (packed, _) = enc.encode_vector(&unit);
+            let (packed, _) = enc.encode_vector(&unit).unwrap();
 
             let rotated_unit = enc.apply_rotation(&unit);
             let mut decoded_rot = vec![0.0f32; dim];
@@ -475,7 +503,7 @@ mod tests {
                 data[(i, j)] = (i * dim + j) as f32 * 0.1;
             }
         }
-        let q = TurboQuantQuantiser::new(data.as_ref(), &Dist::SquaredEuclidean, 4, 42);
+        let q = TurboQuantQuantiser::new(data.as_ref(), &Dist::SquaredEuclidean, 4, 42).unwrap();
 
         assert_eq!(q.n_vectors(), n);
         assert_eq!(q.storage.dim, dim);
@@ -495,7 +523,7 @@ mod tests {
                 data[(i, j)] = (i * dim + j) as f32 * 0.1;
             }
         }
-        let q = TurboQuantQuantiser::new(data.as_ref(), &Dist::SquaredEuclidean, 4, 42);
+        let q = TurboQuantQuantiser::new(data.as_ref(), &Dist::SquaredEuclidean, 4, 42).unwrap();
 
         for i in 0..n {
             let row: Vec<f32> = (0..dim).map(|j| data[(i, j)]).collect();
@@ -509,21 +537,27 @@ mod tests {
         let n = 4;
         let dim = 16;
         let data = Mat::<f32>::zeros(n, dim);
-        let q = TurboQuantQuantiser::new(data.as_ref(), &Dist::SquaredEuclidean, 4, 42);
+        let q = TurboQuantQuantiser::new(data.as_ref(), &Dist::SquaredEuclidean, 4, 42).unwrap();
         for i in 0..n {
             assert_eq!(q.storage.vector_packed(i).len(), q.storage.bytes_per_vec);
         }
     }
 
     #[test]
-    #[should_panic(expected = "bits must be 2, 3, or 4")]
     fn test_invalid_bits() {
-        let _ = TurboQuantEncoder::<f32>::new(8, 5, Dist::SquaredEuclidean, 42);
+        let result = TurboQuantEncoder::<f32>::new(8, 5, Dist::SquaredEuclidean, 42);
+        assert!(matches!(
+            result,
+            Err(AnnSearchErrors::TQInvalidBits { n_bits: 5 })
+        ));
     }
 
     #[test]
-    #[should_panic(expected = "dim must be a multiple of 8")]
     fn test_invalid_dim() {
-        let _ = TurboQuantEncoder::<f32>::new(7, 4, Dist::SquaredEuclidean, 42);
+        let result = TurboQuantEncoder::<f32>::new(7, 4, Dist::SquaredEuclidean, 42);
+        assert!(matches!(
+            result,
+            Err(AnnSearchErrors::TQDimMustBe8Multiple { dims: 7 })
+        ));
     }
 }

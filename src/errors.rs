@@ -70,4 +70,38 @@ pub enum AnnSearchErrors {
     #[cfg(feature = "binary")]
     #[error("IO error: {0}")]
     IoError(#[from] std::io::Error),
+
+    /// Turbo quant error for invalid number of bits
+    #[cfg(feature = "binary")]
+    #[error("Turbu quantisation only allows bits of 2, 3 or 4. Chosen n of bits {n_bits}")]
+    TQInvalidBits {
+        /// Number of chosen bits
+        n_bits: usize,
+    },
+
+    /// Turbo quant error for invalid dimensionality
+    #[cfg(feature = "binary")]
+    #[error("Turbu quantisation needs a minimum dimensionality of 2. Data set dimensionality is {dims}.")]
+    TQInvalidDim {
+        /// Dimensionality of the data
+        dims: usize,
+    },
+
+    /// Error when dimensionality is not a multiple of 8
+    #[cfg(feature = "binary")]
+    #[error("Turbo quantisation: dimensions must be multiple of 8; dimensionality of the data is {dims}.")]
+    TQDimMustBe8Multiple {
+        /// Dimensionality of the data
+        dims: usize,
+    },
+
+    /// Error when the output buffer is not the length of bytes per vec
+    #[cfg(feature = "binary")]
+    #[error("Turbo quantisation: output buffer must be length bytes_per_vec ({bytes_per_vec}); has length ({len}).")]
+    TQBufferUnequalBytesPerVec {
+        /// Bytes per vec
+        bytes_per_vec: usize,
+        /// Output buffer length
+        len: usize,
+    },
 }
