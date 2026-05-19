@@ -43,7 +43,7 @@ where
     T: AnnSearchGpuFloat + AnnSearchFloat,
 {
     fn dim(&self) -> usize {
-        self.dim
+        self.dim_padded
     }
 }
 
