@@ -1,5 +1,12 @@
 # News
 
+## 0.3.1
+
+**Fix**
+
+- The GPU indices would throw errors due to a bug with the wrong dimensionality
+  being checked.
+
 ## 0.3.0
 
 Large update with breaking changes!

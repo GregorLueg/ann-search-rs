@@ -42,6 +42,9 @@ where
     R: Runtime,
     T: AnnSearchGpuFloat + AnnSearchFloat,
 {
+    // needs to be allowed here, because dim_padded is the relevant dim for GPU
+    // indices
+    #[allow(clippy::misnamed_getters)]
     fn dim(&self) -> usize {
         self.dim_padded
     }
