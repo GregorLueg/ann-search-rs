@@ -86,11 +86,11 @@ fn compute_dot_products<F: AnnSearchGpuFloat, N: Size>(
     vectors: &Tensor<Vector<F, N>>,
     random_vec: &Tensor<Vector<F, N>>,
     dot_values: &mut Tensor<F>,
-    n: u32,
+    n_pts: u32,
     #[comptime] dim_lines: usize,
 ) {
     let idx = (CUBE_POS_Y * CUBE_COUNT_X + CUBE_POS_X) * WORKGROUP_SIZE_X + UNIT_POS_X;
-    if idx >= n {
+    if idx >= n_pts {
         terminate!();
     }
     let lanes = comptime!(N::value());
@@ -184,7 +184,7 @@ fn compute_max_leaf_size(dim_padded: usize) -> usize {
 /// * `prop_idx` - Output proposal indices `[n, max_proposals]`
 /// * `prop_dist` - Output proposal distances `[n, max_proposals]`
 /// * `prop_count` - Atomic per-node proposal counter `[n]`
-/// * `n` - Total number of points in the dataset
+/// * `n_pts` - Total number of points in the dataset
 /// * `n_leaves` - Number of leaves in the current batch
 /// * `max_proposals` - Proposal buffer capacity per node (comptime)
 /// * `use_cosine` - Whether to compute cosine distance instead of squared
@@ -206,7 +206,7 @@ pub fn leaf_pairwise_proposals<F: AnnSearchGpuFloat, N: Size>(
     prop_idx: &mut Tensor<u32>,
     prop_dist: &mut Tensor<F>,
     prop_count: &Tensor<Atomic<u32>>,
-    n: u32,
+    n_pts: u32,
     n_leaves: u32,
     #[comptime] max_proposals: u32,
     #[comptime] use_cosine: bool,
@@ -264,7 +264,7 @@ pub fn leaf_pairwise_proposals<F: AnnSearchGpuFloat, N: Size>(
         let lane = s_idx % 4usize;
         let pid = shared_pids[n_idx];
 
-        if pid < n {
+        if pid < n_pts {
             let vec_offset = pid as usize * dim_lines + line_idx;
             let line_val = vectors[vec_offset];
             shared_vecs[idx_load] = line_val[lane];
@@ -292,7 +292,7 @@ pub fn leaf_pairwise_proposals<F: AnnSearchGpuFloat, N: Size>(
         let pid_i = shared_pids[ii];
         let pid_j = shared_pids[jj];
 
-        if pid_i != pid_j && pid_i < n && pid_j < n {
+        if pid_i != pid_j && pid_i < n_pts && pid_j < n_pts {
             let mut sum = F::new(0.0);
             let mut s = 0usize;
             while s < dim_scalars {
@@ -615,7 +615,7 @@ pub fn gpu_forest_init<T, R>(
     use_cosine: bool,
     verbose: bool,
     client: &ComputeClient<R>,
-) -> ForestRouter<T>
+) -> Result<ForestRouter<T>, AnnSearchErrors>
 where
     R: Runtime,
     T: AnnSearchFloat + AnnSearchGpuFloat,
@@ -733,7 +733,7 @@ where
             }
             Ok((partition_ids, routing_vecs, routing_medians))
         })
-        .collect::<Result<TreeResults<T>, _>>()?;
+        .collect::<Result<TreeResults<T>, AnnSearchErrors>>()?;
 
     let leaf_structures: Vec<_> = all_tree_results
         .par_iter()
@@ -883,7 +883,7 @@ where
         println!("  GPU forest init: {:.2?}", forest_start.elapsed());
     }
 
-    router
+    Ok(router)
 }
 
 ///////////
@@ -1127,7 +1127,7 @@ mod tests {
         leaf_points: &Tensor<u32>,
         leaf_offsets: &Tensor<u32>,
         out_vecs: &mut Tensor<F>,
-        n: u32,
+        n_pts: u32,
         #[comptime] dim_lines: usize,
         #[comptime] max_leaf_size: usize,
     ) {
@@ -1168,7 +1168,7 @@ mod tests {
             let lane = s_idx % 4usize;
             let pid = shared_pids[n_idx];
 
-            if pid < n {
+            if pid < n_pts {
                 let vec_offset = pid as usize * dim_lines + line_idx;
                 let line_val = vectors[vec_offset];
                 shared_vecs[idx_load] = line_val[lane];

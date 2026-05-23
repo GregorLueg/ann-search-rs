@@ -81,35 +81,35 @@ fn entry_hash(node: u32, entry: u32, seed: u32) -> u32 {
 ///
 /// ### Params
 ///
-/// * `vectors` - Row-major vector matrix, line-vectorised along the feature
+/// * `vectors` - Row-major vector matrix, vectorised along the feature
 ///   dimension
 /// * `a` - Row index of the first vector
 /// * `b` - Row index of the second vector
-/// * `dim_lines` - Number of `Line<F>` elements per vector row (comptime)
+/// * `dim_lines` - Number of `Vector<F, N>` elements per vector row (comptime)
 ///
 /// ### Returns
 ///
 /// Squared Euclidean distance between the two vectors
 #[cube]
-fn dist_sq_euclidean<F: Float + CubePrimitive>(
-    vectors: &Tensor<Line<F>>,
+fn dist_sq_euclidean<F: Float + CubePrimitive, N: Size>(
+    vectors: &Tensor<Vector<F, N>>,
     a: u32,
     b: u32,
     #[comptime] dim_lines: usize,
 ) -> F {
+    let lanes = comptime!(N::value());
     let off_a = a as usize * dim_lines;
     let off_b = b as usize * dim_lines;
     let mut sum = F::new(0.0);
-
     for i in 0..dim_lines {
         let va = vectors[off_a + i];
         let vb = vectors[off_b + i];
         let diff = va - vb;
         let sq = diff * diff;
-        sum += sq[0];
-        sum += sq[1];
-        sum += sq[2];
-        sum += sq[3];
+        #[unroll]
+        for lane in 0..lanes {
+            sum += sq[lane];
+        }
     }
     sum
 }
@@ -120,36 +120,36 @@ fn dist_sq_euclidean<F: Float + CubePrimitive>(
 ///
 /// ### Params
 ///
-/// * `vectors` - Row-major vector matrix, line-vectorised along the feature
+/// * `vectors` - Row-major vector matrix, vectorised along the feature
 ///   dimension
 /// * `norms` - Pre-computed L2 norms, one per row
 /// * `a` - Row index of the first vector
 /// * `b` - Row index of the second vector
-/// * `dim_lines` - Number of `Line<F>` elements per vector row (comptime)
+/// * `dim_lines` - Number of `Vector<F, N>` elements per vector row (comptime)
 ///
 /// ### Returns
 ///
 /// Cosine distance in the range [0, 2]
 #[cube]
-fn dist_cosine<F: Float>(
-    vectors: &Tensor<Line<F>>,
+fn dist_cosine<F: Float, N: Size>(
+    vectors: &Tensor<Vector<F, N>>,
     norms: &Tensor<F>,
     a: u32,
     b: u32,
     #[comptime] dim_lines: usize,
 ) -> F {
+    let lanes = comptime!(N::value());
     let off_a = a as usize * dim_lines;
     let off_b = b as usize * dim_lines;
     let mut dot = F::new(0.0);
-
     for i in 0..dim_lines {
         let va = vectors[off_a + i];
         let vb = vectors[off_b + i];
         let prod = va * vb;
-        dot += prod[0];
-        dot += prod[1];
-        dot += prod[2];
-        dot += prod[3];
+        #[unroll]
+        for lane in 0..lanes {
+            dot += prod[lane];
+        }
     }
     F::new(1.0) - dot / (norms[a as usize] * norms[b as usize])
 }
@@ -187,8 +187,8 @@ fn dist_cosine<F: Float>(
 ///
 /// * `ABSOLUTE_POS_X` -> node index
 #[cube(launch_unchecked)]
-fn init_random_graph<F: Float>(
-    vectors: &Tensor<Line<F>>,
+fn init_random_graph<F: Float, N: Size>(
+    vectors: &Tensor<Vector<F, N>>,
     norms: &Tensor<F>,
     graph_idx: &mut Tensor<u32>,
     graph_dist: &mut Tensor<F>,
@@ -351,8 +351,8 @@ pub fn build_reverse_candidates(
 ///
 /// * One workgroup (cube) per node
 #[cube(launch_unchecked)]
-pub fn local_join_shared<F: Float>(
-    vectors: &Tensor<Line<F>>,
+pub fn local_join_shared<F: Float, N: Size>(
+    vectors: &Tensor<Vector<F, N>>,
     norms: &Tensor<F>,
     graph_idx: &Tensor<u32>,
     graph_dist: &Tensor<F>,
@@ -684,8 +684,8 @@ pub fn merge_proposals<F: Float>(
 ///
 /// * One workgroup (cube) per node
 #[cube(launch_unchecked)]
-pub fn two_hop_refinement<F: Float>(
-    vectors: &Tensor<Line<F>>,
+pub fn two_hop_refinement<F: Float, N: Size>(
+    vectors: &Tensor<Vector<F, N>>,
     norms: &Tensor<F>,
     graph_idx: &Tensor<u32>,
     graph_dist: &Tensor<F>,
@@ -1532,12 +1532,13 @@ where
                 &client,
                 CubeCount::Static(grid_n_x, grid_n_y, 1),
                 CubeDim::new_2d(WORKGROUP_SIZE_X, 1),
-                vectors_gpu.clone().into_tensor_arg(line),
-                norms_gpu.clone().into_tensor_arg(1),
-                graph_idx_gpu.clone().into_tensor_arg(1),
-                graph_dist_gpu.clone().into_tensor_arg(1),
-                ScalarArg { elem: n as u32 },
-                ScalarArg { elem: seed as u32 },
+                line,
+                vectors_gpu.clone().into_tensor_arg(),
+                norms_gpu.clone().into_tensor_arg(),
+                graph_idx_gpu.clone().into_tensor_arg(),
+                graph_dist_gpu.clone().into_tensor_arg(),
+                n as u32,
+                seed as u32,
                 use_cosine,
                 dim_vec,
             );
@@ -1561,7 +1562,7 @@ where
             use_cosine,
             verbose,
             &client,
-        );
+        )?;
 
         // 1c: Mark all graph entries as new for NNDescent
         let total_entries = (n * build_k) as u32;
@@ -1573,10 +1574,8 @@ where
                 &client,
                 CubeCount::Static(mark_cubes_x, mark_cubes_y, 1),
                 CubeDim::new_2d(WORKGROUP_SIZE_X, 1),
-                graph_idx_gpu.clone().into_tensor_arg(1),
-                ScalarArg {
-                    elem: total_entries,
-                },
+                graph_idx_gpu.clone().into_tensor_arg(),
+                total_entries,
             );
         }
 
@@ -1598,18 +1597,18 @@ where
                     &client,
                     CubeCount::Static(grid_n_x, grid_n_y, 1),
                     CubeDim::new_2d(WORKGROUP_SIZE_X, 1),
-                    prop_count_gpu.clone().into_tensor_arg(1),
-                    update_counter_gpu.clone().into_tensor_arg(1),
-                    ScalarArg { elem: n as u32 },
+                    prop_count_gpu.clone().into_tensor_arg(),
+                    update_counter_gpu.clone().into_tensor_arg(),
+                    n as u32,
                 );
 
                 let _ = reset_proposals::launch_unchecked::<R>(
                     &client,
                     CubeCount::Static(grid_n_x, grid_n_y, 1),
                     CubeDim::new_2d(WORKGROUP_SIZE_X, 1),
-                    reverse_count_gpu.clone().into_tensor_arg(1),
-                    update_counter_gpu.clone().into_tensor_arg(1),
-                    ScalarArg { elem: n as u32 },
+                    reverse_count_gpu.clone().into_tensor_arg(),
+                    update_counter_gpu.clone().into_tensor_arg(),
+                    n as u32,
                 );
             }
 
@@ -1619,10 +1618,10 @@ where
                     &client,
                     CubeCount::Static(grid_n_x, grid_n_y, 1),
                     CubeDim::new_2d(WORKGROUP_SIZE_X, 1),
-                    graph_idx_gpu.clone().into_tensor_arg(1),
-                    reverse_idx_gpu.clone().into_tensor_arg(1),
-                    reverse_count_gpu.clone().into_tensor_arg(1),
-                    ScalarArg { elem: n as u32 },
+                    graph_idx_gpu.clone().into_tensor_arg(),
+                    reverse_idx_gpu.clone().into_tensor_arg(),
+                    reverse_count_gpu.clone().into_tensor_arg(),
+                    n as u32,
                     build_k as u32,
                 );
             }
@@ -1635,18 +1634,19 @@ where
                     &client,
                     CubeCount::Static(cubes_x, cubes_y, 1),
                     CubeDim::new_2d(WORKGROUP_SIZE_X, 1),
-                    vectors_gpu.clone().into_tensor_arg(line),
-                    norms_gpu.clone().into_tensor_arg(1),
-                    graph_idx_gpu.clone().into_tensor_arg(1),
-                    graph_dist_gpu.clone().into_tensor_arg(1),
-                    reverse_idx_gpu.clone().into_tensor_arg(1),
-                    reverse_count_gpu.clone().into_tensor_arg(1),
-                    prop_idx_gpu.clone().into_tensor_arg(1),
-                    prop_dist_gpu.clone().into_tensor_arg(1),
-                    prop_count_gpu.clone().into_tensor_arg(1),
-                    ScalarArg { elem: n as u32 },
-                    ScalarArg { elem: rho_thresh },
-                    ScalarArg { elem: iter_seed },
+                    line,
+                    vectors_gpu.clone().into_tensor_arg(),
+                    norms_gpu.clone().into_tensor_arg(),
+                    graph_idx_gpu.clone().into_tensor_arg(),
+                    graph_dist_gpu.clone().into_tensor_arg(),
+                    reverse_idx_gpu.clone().into_tensor_arg(),
+                    reverse_count_gpu.clone().into_tensor_arg(),
+                    prop_idx_gpu.clone().into_tensor_arg(),
+                    prop_dist_gpu.clone().into_tensor_arg(),
+                    prop_count_gpu.clone().into_tensor_arg(),
+                    n as u32,
+                    rho_thresh,
+                    iter_seed,
                     MAX_PROPOSALS as u32,
                     use_cosine,
                     dim_vec,
@@ -1660,19 +1660,19 @@ where
                     &client,
                     CubeCount::Static(grid_n_x, grid_n_y, 1),
                     CubeDim::new_2d(WORKGROUP_SIZE_X, 1),
-                    graph_idx_gpu.clone().into_tensor_arg(1),
-                    graph_dist_gpu.clone().into_tensor_arg(1),
-                    prop_idx_gpu.clone().into_tensor_arg(1),
-                    prop_dist_gpu.clone().into_tensor_arg(1),
-                    prop_count_gpu.clone().into_tensor_arg(1),
-                    update_counter_gpu.clone().into_tensor_arg(1),
-                    ScalarArg { elem: n as u32 },
+                    graph_idx_gpu.clone().into_tensor_arg(),
+                    graph_dist_gpu.clone().into_tensor_arg(),
+                    prop_idx_gpu.clone().into_tensor_arg(),
+                    prop_dist_gpu.clone().into_tensor_arg(),
+                    prop_count_gpu.clone().into_tensor_arg(),
+                    update_counter_gpu.clone().into_tensor_arg(),
+                    n as u32,
                     MAX_PROPOSALS as u32,
                 );
             }
 
             // 5. Download single u32 to check convergence
-            let counter_data = update_counter_gpu.clone().read(&client);
+            let counter_data = update_counter_gpu.clone().read(&client)?;
             let updates = counter_data[0] as f64;
             let rate = updates / (n * build_k) as f64;
 
@@ -1715,9 +1715,9 @@ where
                     &client,
                     CubeCount::Static(grid_n_x, grid_n_y, 1),
                     CubeDim::new_2d(WORKGROUP_SIZE_X, 1),
-                    prop_count_gpu.clone().into_tensor_arg(1),
-                    update_counter_gpu.clone().into_tensor_arg(1),
-                    ScalarArg { elem: n as u32 },
+                    prop_count_gpu.clone().into_tensor_arg(),
+                    update_counter_gpu.clone().into_tensor_arg(),
+                    n as u32,
                 );
             }
 
@@ -1726,14 +1726,15 @@ where
                     &client,
                     CubeCount::Static(cubes_x, cubes_y, 1),
                     CubeDim::new_2d(WORKGROUP_SIZE_X, 1),
-                    vectors_gpu.clone().into_tensor_arg(line),
-                    norms_gpu.clone().into_tensor_arg(1),
-                    graph_idx_gpu.clone().into_tensor_arg(1),
-                    graph_dist_gpu.clone().into_tensor_arg(1),
-                    prop_idx_gpu.clone().into_tensor_arg(1),
-                    prop_dist_gpu.clone().into_tensor_arg(1),
-                    prop_count_gpu.clone().into_tensor_arg(1),
-                    ScalarArg { elem: n as u32 },
+                    line,
+                    vectors_gpu.clone().into_tensor_arg(),
+                    norms_gpu.clone().into_tensor_arg(),
+                    graph_idx_gpu.clone().into_tensor_arg(),
+                    graph_dist_gpu.clone().into_tensor_arg(),
+                    prop_idx_gpu.clone().into_tensor_arg(),
+                    prop_dist_gpu.clone().into_tensor_arg(),
+                    prop_count_gpu.clone().into_tensor_arg(),
+                    n as u32,
                     MAX_PROPOSALS as u32,
                     use_cosine,
                     dim_vec,
@@ -1745,19 +1746,19 @@ where
                     &client,
                     CubeCount::Static(grid_n_x, grid_n_y, 1),
                     CubeDim::new_2d(WORKGROUP_SIZE_X, 1),
-                    graph_idx_gpu.clone().into_tensor_arg(1),
-                    graph_dist_gpu.clone().into_tensor_arg(1),
-                    prop_idx_gpu.clone().into_tensor_arg(1),
-                    prop_dist_gpu.clone().into_tensor_arg(1),
-                    prop_count_gpu.clone().into_tensor_arg(1),
-                    update_counter_gpu.clone().into_tensor_arg(1),
-                    ScalarArg { elem: n as u32 },
+                    graph_idx_gpu.clone().into_tensor_arg(),
+                    graph_dist_gpu.clone().into_tensor_arg(),
+                    prop_idx_gpu.clone().into_tensor_arg(),
+                    prop_dist_gpu.clone().into_tensor_arg(),
+                    prop_count_gpu.clone().into_tensor_arg(),
+                    update_counter_gpu.clone().into_tensor_arg(),
+                    n as u32,
                     MAX_PROPOSALS as u32,
                 );
             }
 
             if verbose {
-                let counter_data = update_counter_gpu.clone().read(&client);
+                let counter_data = update_counter_gpu.clone().read(&client)?;
                 println!(
                     "    2-Hop sweep {}: {} updates",
                     sweep + 1,
@@ -1774,8 +1775,8 @@ where
 
         // ---- 4: Extract kNN graph from NNDescent result ----
 
-        let nndescent_idx = graph_idx_gpu.clone().read(&client);
-        let nndescent_dist = graph_dist_gpu.clone().read(&client);
+        let nndescent_idx = graph_idx_gpu.clone().read(&client)?;
+        let nndescent_dist = graph_dist_gpu.clone().read(&client)?;
         let pid_mask = 0x7FFFFFFFu32;
         let sentinel = 0x7FFFFFFFusize;
 
@@ -1817,9 +1818,9 @@ where
                 &client,
                 CubeCount::Static(cubes_x, cubes_y, 1),
                 CubeDim::new_2d(WORKGROUP_SIZE_X, 1),
-                graph_idx_gpu.into_tensor_arg(1),
-                pruned_idx_gpu.clone().into_tensor_arg(1),
-                ScalarArg { elem: n as u32 },
+                graph_idx_gpu.into_tensor_arg(),
+                pruned_idx_gpu.clone().into_tensor_arg(),
+                n as u32,
                 build_k,
                 k,
             );
@@ -1828,10 +1829,10 @@ where
                 &client,
                 CubeCount::Static(grid_n_x, grid_n_y, 1),
                 CubeDim::new_2d(WORKGROUP_SIZE_X, 1),
-                pruned_idx_gpu.clone().into_tensor_arg(1),
-                reverse_idx_gpu.clone().into_tensor_arg(1),
-                reverse_counts_gpu.clone().into_tensor_arg(1),
-                ScalarArg { elem: n as u32 },
+                pruned_idx_gpu.clone().into_tensor_arg(),
+                reverse_idx_gpu.clone().into_tensor_arg(),
+                reverse_counts_gpu.clone().into_tensor_arg(),
+                n as u32,
                 k,
             );
 
@@ -1839,11 +1840,11 @@ where
                 &client,
                 CubeCount::Static(grid_n_x, grid_n_y, 1),
                 CubeDim::new_2d(WORKGROUP_SIZE_X, 1),
-                pruned_idx_gpu.into_tensor_arg(1),
-                reverse_idx_gpu.into_tensor_arg(1),
-                reverse_counts_gpu.into_tensor_arg(1),
-                final_idx_gpu.clone().into_tensor_arg(1),
-                ScalarArg { elem: n as u32 },
+                pruned_idx_gpu.into_tensor_arg(),
+                reverse_idx_gpu.into_tensor_arg(),
+                reverse_counts_gpu.into_tensor_arg(),
+                final_idx_gpu.clone().into_tensor_arg(),
+                n as u32,
                 k,
             );
         }
@@ -1854,7 +1855,7 @@ where
 
         // ---- 6: Download CAGRA graph and compute CPU distances ----
 
-        let final_idx = final_idx_gpu.clone().read(&client);
+        let final_idx = final_idx_gpu.clone().read(&client)?;
         let pid_mask = 0x7FFFFFFFu32;
         let sentinel = 0x7FFFFFFFusize;
 
@@ -2089,7 +2090,7 @@ where
             &query_params,
             Some(&entry_flat),
             &client,
-        );
+        )?;
 
         Ok(result)
     }
@@ -2201,7 +2202,7 @@ where
         k: usize,
         query_params: Option<CagraGpuSearchParams>,
         seed: usize,
-    ) -> (Vec<Vec<usize>>, Vec<Vec<T>>)
+    ) -> KnnResult<T>
     where
         T: AnnSearchGpuFloat + AnnSearchFloat,
     {
@@ -2491,7 +2492,7 @@ mod kernel_tests {
     }
 
     #[cube(launch_unchecked)]
-    fn probe_stride<F: Float>(vectors: &Tensor<Line<F>>, out: &mut Tensor<u32>) {
+    fn probe_stride<F: Float, N: Size>(vectors: &Tensor<Vector<F, N>>, out: &mut Tensor<u32>) {
         if ABSOLUTE_POS_X == 0u32 {
             out[0usize] = vectors.stride(0) as u32;
             out[1usize] = vectors.shape(1) as u32;
@@ -2525,12 +2526,13 @@ mod kernel_tests {
                 &client,
                 CubeCount::Static(1, 1, 1),
                 CubeDim::new_2d(1, 1),
-                vectors_gpu.into_tensor_arg(line),
-                out_gpu.clone().into_tensor_arg(1),
+                line,
+                vectors_gpu.into_tensor_arg(),
+                out_gpu.clone().into_tensor_arg(),
             );
         }
 
-        let result = out_gpu.read(&client);
+        let result = out_gpu.read(&client).unwrap();
         let stride_0 = result[0];
         let shape_1 = result[1];
         let stride_1 = result[2];
@@ -2553,8 +2555,8 @@ mod kernel_tests {
     }
 
     #[cube(launch_unchecked)]
-    fn read_vector_via_stride<F: Float>(
-        vectors: &Tensor<Line<F>>,
+    fn read_vector_via_stride<F: Float, N: Size>(
+        vectors: &Tensor<Vector<F, N>>,
         row_idx: u32,
         out: &mut Tensor<F>,
         #[comptime] dim_lines: usize,
@@ -2608,14 +2610,15 @@ mod kernel_tests {
                     &client,
                     CubeCount::Static(1, 1, 1),
                     CubeDim::new_2d(1, 1),
-                    vectors_gpu.clone().into_tensor_arg(line),
-                    ScalarArg { elem: row as u32 },
-                    out_gpu.clone().into_tensor_arg(1),
+                    line,
+                    vectors_gpu.clone().into_tensor_arg(),
+                    row as u32,
+                    out_gpu.clone().into_tensor_arg(),
                     dim_vec,
                 );
             }
 
-            let result = out_gpu.read(&client);
+            let result = out_gpu.read(&client).unwrap();
             let expected: Vec<f32> = (0..dim).map(|j| (row * 100 + j) as f32).collect();
 
             println!("Row {row}: got {:?}", &result[..dim]);
@@ -2634,8 +2637,8 @@ mod kernel_tests {
     }
 
     #[cube(launch_unchecked)]
-    fn compute_pairwise_dist<F: Float>(
-        vectors: &Tensor<Line<F>>,
+    fn compute_pairwise_dist<F: Float, N: Size>(
+        vectors: &Tensor<Vector<F, N>>,
         norms: &Tensor<F>,
         out_sq_euclid: &mut Tensor<F>,
         out_cosine: &mut Tensor<F>,
@@ -2705,17 +2708,18 @@ mod kernel_tests {
                 &client,
                 CubeCount::Static(1, 1, 1),
                 CubeDim::new_2d(WORKGROUP_SIZE_X, 1),
-                vectors_gpu.into_tensor_arg(line),
-                norms_gpu.into_tensor_arg(1),
-                out_euclid.clone().into_tensor_arg(1),
-                out_cosine.clone().into_tensor_arg(1),
-                ScalarArg { elem: n as u32 },
+                line,
+                vectors_gpu.into_tensor_arg(),
+                norms_gpu.into_tensor_arg(),
+                out_euclid.clone().into_tensor_arg(),
+                out_cosine.clone().into_tensor_arg(),
+                n as u32,
                 false,
                 dim_vec,
             );
         }
 
-        let euclid = out_euclid.read(&client);
+        let euclid = out_euclid.read(&client).unwrap();
 
         // Expected squared Euclidean distances:
         // (0,1): |v0-v1|^2 = 1+1 = 2
@@ -2793,17 +2797,18 @@ mod kernel_tests {
                 &client,
                 CubeCount::Static(1, 1, 1),
                 CubeDim::new_2d(WORKGROUP_SIZE_X, 1),
-                vectors_gpu.into_tensor_arg(line),
-                norms_gpu.into_tensor_arg(1),
-                out_euclid.clone().into_tensor_arg(1),
-                out_cosine.clone().into_tensor_arg(1),
-                ScalarArg { elem: n as u32 },
+                line,
+                vectors_gpu.into_tensor_arg(),
+                norms_gpu.into_tensor_arg(),
+                out_euclid.clone().into_tensor_arg(),
+                out_cosine.clone().into_tensor_arg(),
+                n as u32,
                 true,
                 dim_vec,
             );
         }
 
-        let cosine = out_cosine.read(&client);
+        let cosine = out_cosine.read(&client).unwrap();
 
         // Expected cosine distances: 1 - dot/(norm_a * norm_b)
         // (0,1): 1 - 0/(1*1) = 1.0
@@ -2921,18 +2926,19 @@ mod kernel_tests {
                 &client,
                 CubeCount::Static(n as u32, 1, 1),
                 CubeDim::new_2d(WORKGROUP_SIZE_X, 1),
-                vectors_gpu.into_tensor_arg(line),
-                norms_gpu.into_tensor_arg(1),
-                graph_idx_gpu.into_tensor_arg(1),
-                graph_dist_gpu.into_tensor_arg(1),
-                reverse_idx_gpu.into_tensor_arg(1),
-                reverse_count_gpu.into_tensor_arg(1),
-                prop_idx_gpu.clone().into_tensor_arg(1),
-                prop_dist_gpu.clone().into_tensor_arg(1),
-                prop_count_gpu.clone().into_tensor_arg(1),
-                ScalarArg { elem: n as u32 },
-                ScalarArg { elem: rho_thresh },
-                ScalarArg { elem: 42u32 },
+                line,
+                vectors_gpu.into_tensor_arg(),
+                norms_gpu.into_tensor_arg(),
+                graph_idx_gpu.into_tensor_arg(),
+                graph_dist_gpu.into_tensor_arg(),
+                reverse_idx_gpu.into_tensor_arg(),
+                reverse_count_gpu.into_tensor_arg(),
+                prop_idx_gpu.clone().into_tensor_arg(),
+                prop_dist_gpu.clone().into_tensor_arg(),
+                prop_count_gpu.clone().into_tensor_arg(),
+                n as u32,
+                rho_thresh,
+                42u32,
                 MAX_PROPOSALS as u32,
                 true, // use_cosine
                 dim_vec,
@@ -2940,9 +2946,9 @@ mod kernel_tests {
             );
         }
 
-        let p_idx = prop_idx_gpu.read(&client);
-        let p_dist = prop_dist_gpu.read(&client);
-        let p_count = prop_count_gpu.read(&client);
+        let p_idx = prop_idx_gpu.read(&client).unwrap();
+        let p_dist = prop_dist_gpu.read(&client).unwrap();
+        let p_count = prop_count_gpu.read(&client).unwrap();
 
         println!("Local join proposals (n={n}, build_k={build_k}, cosine):");
         let mut any_negative = false;
@@ -3050,20 +3056,20 @@ mod kernel_tests {
                 &client,
                 CubeCount::Static(grid_n, 1, 1),
                 CubeDim::new_2d(WORKGROUP_SIZE_X, 1),
-                graph_idx_gpu.clone().into_tensor_arg(1),
-                graph_dist_gpu.clone().into_tensor_arg(1),
-                prop_idx_gpu.into_tensor_arg(1),
-                prop_dist_gpu.into_tensor_arg(1),
-                prop_count_gpu.into_tensor_arg(1),
-                update_counter.clone().into_tensor_arg(1),
-                ScalarArg { elem: n as u32 },
+                graph_idx_gpu.clone().into_tensor_arg(),
+                graph_dist_gpu.clone().into_tensor_arg(),
+                prop_idx_gpu.into_tensor_arg(),
+                prop_dist_gpu.into_tensor_arg(),
+                prop_count_gpu.into_tensor_arg(),
+                update_counter.clone().into_tensor_arg(),
+                n as u32,
                 MAX_PROPOSALS as u32,
             );
         }
 
-        let result_idx = graph_idx_gpu.read(&client);
-        let result_dist = graph_dist_gpu.read(&client);
-        let updates = update_counter.read(&client);
+        let result_idx = graph_idx_gpu.read(&client).unwrap();
+        let result_dist = graph_dist_gpu.read(&client).unwrap();
+        let updates = update_counter.read(&client).unwrap();
 
         println!("Merge proposals result:");
         println!("  Total updates: {}", updates[0]);
@@ -3164,20 +3170,20 @@ mod kernel_tests {
                 &client,
                 CubeCount::Static(grid_n2, 1, 1),
                 CubeDim::new_2d(WORKGROUP_SIZE_X, 1),
-                graph_idx_gpu2.clone().into_tensor_arg(1),
-                graph_dist_gpu2.clone().into_tensor_arg(1),
-                prop_idx_gpu2.into_tensor_arg(1),
-                prop_dist_gpu2.into_tensor_arg(1),
-                prop_count_gpu2.into_tensor_arg(1),
-                update_counter2.clone().into_tensor_arg(1),
-                ScalarArg { elem: n2 as u32 },
+                graph_idx_gpu2.clone().into_tensor_arg(),
+                graph_dist_gpu2.clone().into_tensor_arg(),
+                prop_idx_gpu2.into_tensor_arg(),
+                prop_dist_gpu2.into_tensor_arg(),
+                prop_count_gpu2.into_tensor_arg(),
+                update_counter2.clone().into_tensor_arg(),
+                n2 as u32,
                 MAX_PROPOSALS as u32,
             );
         }
 
-        let r_idx = graph_idx_gpu2.read(&client);
-        let r_dist = graph_dist_gpu2.read(&client);
-        let r_updates = update_counter2.read(&client);
+        let r_idx = graph_idx_gpu2.read(&client).unwrap();
+        let r_dist = graph_dist_gpu2.read(&client).unwrap();
+        let r_updates = update_counter2.read(&client).unwrap();
 
         println!("\nMerge with new candidate:");
         println!("  Updates: {}", r_updates[0]);
@@ -3327,17 +3333,18 @@ mod kernel_tests {
                 &client,
                 CubeCount::Static(1, 1, 1),
                 CubeDim::new_2d(WORKGROUP_SIZE_X, 1),
-                vectors_gpu.into_tensor_arg(line),
-                norms_gpu.into_tensor_arg(1),
-                out_euclid.clone().into_tensor_arg(1),
-                out_cos.into_tensor_arg(1),
-                ScalarArg { elem: n as u32 },
+                line,
+                vectors_gpu.into_tensor_arg(),
+                norms_gpu.into_tensor_arg(),
+                out_euclid.clone().into_tensor_arg(),
+                out_cos.into_tensor_arg(),
+                n as u32,
                 false,
                 dim_vec,
             );
         }
 
-        let euclid = out_euclid.read(&client);
+        let euclid = out_euclid.read(&client).unwrap();
 
         // Check first pair: dist(0, 1)
         let a = &data[0..dim];
@@ -3358,8 +3365,8 @@ mod kernel_tests {
     /// as local_join_shared, computes their distance, and writes
     /// the result plus the raw shared memory contents to output.
     #[cube(launch_unchecked)]
-    fn debug_shared_mem_dist<F: Float>(
-        vectors: &Tensor<Line<F>>,
+    fn debug_shared_mem_dist<F: Float, N: Size>(
+        vectors: &Tensor<Vector<F, N>>,
         norms: &Tensor<F>,
         pid_a: u32,
         pid_b: u32,
@@ -3489,12 +3496,13 @@ mod kernel_tests {
                 &client,
                 CubeCount::Static(1, 1, 1),
                 CubeDim::new_2d(WORKGROUP_SIZE_X, 1),
-                vectors_gpu.clone().into_tensor_arg(line),
-                norms_gpu.clone().into_tensor_arg(1),
-                ScalarArg { elem: pid_a },
-                ScalarArg { elem: pid_b },
-                out_dist.clone().into_tensor_arg(1),
-                out_raw.clone().into_tensor_arg(1),
+                line,
+                vectors_gpu.clone().into_tensor_arg(),
+                norms_gpu.clone().into_tensor_arg(),
+                pid_a,
+                pid_b,
+                out_dist.clone().into_tensor_arg(),
+                out_raw.clone().into_tensor_arg(),
                 MAX_PROPOSALS as u32, // same comptime order as local_join
                 false,                // euclidean first
                 dim_vec,              // dim_lines
@@ -3502,8 +3510,8 @@ mod kernel_tests {
             );
         }
 
-        let dist_result = out_dist.read(&client);
-        let raw = out_raw.read(&client);
+        let dist_result = out_dist.read(&client).unwrap();
+        let raw = out_raw.read(&client).unwrap();
 
         // Check raw shared memory contents
         let expected_a: Vec<f32> = (0..dim).map(|j| j as f32).collect();
