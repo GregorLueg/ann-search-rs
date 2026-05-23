@@ -86,7 +86,7 @@ where
         if !(2..=4).contains(&bits) {
             return Err(AnnSearchErrors::TQInvalidBits { n_bits: bits });
         }
-        if dim.is_multiple_of(8) {
+        if !dim.is_multiple_of(8) {
             return Err(AnnSearchErrors::TQDimMustBe8Multiple { dims: dim });
         }
 
@@ -358,206 +358,206 @@ where
     }
 }
 
-// ///////////
-// // Tests //
-// ///////////
+///////////
+// Tests //
+///////////
 
-// #[cfg(test)]
-// mod tests {
-//     use super::*;
-//     use approx::assert_abs_diff_eq;
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use approx::assert_abs_diff_eq;
 
-//     #[test]
-//     fn test_encoder_creation_4bit() {
-//         let enc = TurboQuantEncoder::<f32>::new(64, 4, Dist::SquaredEuclidean, 42).unwrap();
-//         assert_eq!(enc.dim, 64);
-//         assert_eq!(enc.bits, 4);
-//         assert_eq!(enc.bytes_per_vec, 32);
-//         assert_eq!(enc.boundaries.len(), 15);
-//         assert_eq!(enc.levels.len(), 16);
-//     }
+    #[test]
+    fn test_encoder_creation_4bit() {
+        let enc = TurboQuantEncoder::<f32>::new(64, 4, Dist::SquaredEuclidean, 42).unwrap();
+        assert_eq!(enc.dim, 64);
+        assert_eq!(enc.bits, 4);
+        assert_eq!(enc.bytes_per_vec, 32);
+        assert_eq!(enc.boundaries.len(), 15);
+        assert_eq!(enc.levels.len(), 16);
+    }
 
-//     #[test]
-//     fn test_encoder_creation_2bit_3bit() {
-//         let e2 = TurboQuantEncoder::<f32>::new(64, 2, Dist::SquaredEuclidean, 42).unwrap();
-//         assert_eq!(e2.bytes_per_vec, 16);
-//         assert_eq!(e2.levels.len(), 4);
+    #[test]
+    fn test_encoder_creation_2bit_3bit() {
+        let e2 = TurboQuantEncoder::<f32>::new(64, 2, Dist::SquaredEuclidean, 42).unwrap();
+        assert_eq!(e2.bytes_per_vec, 16);
+        assert_eq!(e2.levels.len(), 4);
 
-//         let e3 = TurboQuantEncoder::<f32>::new(64, 3, Dist::SquaredEuclidean, 42).unwrap();
-//         assert_eq!(e3.bytes_per_vec, 24);
-//         assert_eq!(e3.levels.len(), 8);
-//     }
+        let e3 = TurboQuantEncoder::<f32>::new(64, 3, Dist::SquaredEuclidean, 42).unwrap();
+        assert_eq!(e3.bytes_per_vec, 24);
+        assert_eq!(e3.levels.len(), 8);
+    }
 
-//     #[test]
-//     fn test_rotation_orthogonality() {
-//         let dim = 16;
-//         let enc = TurboQuantEncoder::<f64>::new(dim, 4, Dist::SquaredEuclidean, 42).unwrap();
-//         for i in 0..dim {
-//             for j in 0..dim {
-//                 let mut dot = 0.0f64;
-//                 for k in 0..dim {
-//                     dot += enc.rotation[i * dim + k] * enc.rotation[j * dim + k];
-//                 }
-//                 let expected = if i == j { 1.0 } else { 0.0 };
-//                 assert_abs_diff_eq!(dot, expected, epsilon = 1e-10);
-//             }
-//         }
-//     }
+    #[test]
+    fn test_rotation_orthogonality() {
+        let dim = 16;
+        let enc = TurboQuantEncoder::<f64>::new(dim, 4, Dist::SquaredEuclidean, 42).unwrap();
+        for i in 0..dim {
+            for j in 0..dim {
+                let mut dot = 0.0f64;
+                for k in 0..dim {
+                    dot += enc.rotation[i * dim + k] * enc.rotation[j * dim + k];
+                }
+                let expected = if i == j { 1.0 } else { 0.0 };
+                assert_abs_diff_eq!(dot, expected, epsilon = 1e-10);
+            }
+        }
+    }
 
-//     #[test]
-//     fn test_rotation_deterministic() {
-//         let e1 = TurboQuantEncoder::<f32>::new(16, 4, Dist::SquaredEuclidean, 42).unwrap();
-//         let e2 = TurboQuantEncoder::<f32>::new(16, 4, Dist::SquaredEuclidean, 42).unwrap();
-//         assert_eq!(e1.rotation, e2.rotation);
-//     }
+    #[test]
+    fn test_rotation_deterministic() {
+        let e1 = TurboQuantEncoder::<f32>::new(16, 4, Dist::SquaredEuclidean, 42).unwrap();
+        let e2 = TurboQuantEncoder::<f32>::new(16, 4, Dist::SquaredEuclidean, 42).unwrap();
+        assert_eq!(e1.rotation, e2.rotation);
+    }
 
-//     #[test]
-//     fn test_encode_vector_norm() {
-//         let enc = TurboQuantEncoder::<f32>::new(8, 4, Dist::SquaredEuclidean, 42).unwrap();
-//         let v = vec![3.0_f32, 4.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
-//         let (packed, norm) = enc.encode_vector(&v).unwrap();
-//         assert_abs_diff_eq!(norm, 5.0, epsilon = 1e-5);
-//         assert_eq!(packed.len(), enc.bytes_per_vec);
-//     }
+    #[test]
+    fn test_encode_vector_norm() {
+        let enc = TurboQuantEncoder::<f32>::new(8, 4, Dist::SquaredEuclidean, 42).unwrap();
+        let v = vec![3.0_f32, 4.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
+        let (packed, norm) = enc.encode_vector(&v).unwrap();
+        assert_abs_diff_eq!(norm, 5.0, epsilon = 1e-5);
+        assert_eq!(packed.len(), enc.bytes_per_vec);
+    }
 
-//     #[test]
-//     fn test_encode_zero_vector() {
-//         let enc = TurboQuantEncoder::<f32>::new(8, 4, Dist::SquaredEuclidean, 42).unwrap();
-//         let v = vec![0.0_f32; 8];
-//         let (_, norm) = enc.encode_vector(&v).unwrap();
-//         assert_abs_diff_eq!(norm, 0.0, epsilon = 1e-7);
-//     }
+    #[test]
+    fn test_encode_zero_vector() {
+        let enc = TurboQuantEncoder::<f32>::new(8, 4, Dist::SquaredEuclidean, 42).unwrap();
+        let v = vec![0.0_f32; 8];
+        let (_, norm) = enc.encode_vector(&v).unwrap();
+        assert_abs_diff_eq!(norm, 0.0, epsilon = 1e-7);
+    }
 
-//     #[test]
-//     fn test_encode_query_normalises() {
-//         let enc = TurboQuantEncoder::<f32>::new(8, 4, Dist::Cosine, 42).unwrap();
-//         let q = vec![3.0_f32, 4.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
-//         let eq = enc.encode_query(&q).unwrap();
-//         assert_abs_diff_eq!(eq.query_norm, 5.0, epsilon = 1e-5);
-//         let rot_norm: f32 = eq.q_rot.iter().map(|x| x * x).sum::<f32>().sqrt();
-//         assert_abs_diff_eq!(rot_norm, 1.0, epsilon = 1e-5);
-//     }
+    #[test]
+    fn test_encode_query_normalises() {
+        let enc = TurboQuantEncoder::<f32>::new(8, 4, Dist::Cosine, 42).unwrap();
+        let q = vec![3.0_f32, 4.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
+        let eq = enc.encode_query(&q).unwrap();
+        assert_abs_diff_eq!(eq.query_norm, 5.0, epsilon = 1e-5);
+        let rot_norm: f32 = eq.q_rot.iter().map(|x| x * x).sum::<f32>().sqrt();
+        assert_abs_diff_eq!(rot_norm, 1.0, epsilon = 1e-5);
+    }
 
-//     #[test]
-//     fn test_encode_query_zero() {
-//         let enc = TurboQuantEncoder::<f32>::new(8, 4, Dist::SquaredEuclidean, 42).unwrap();
-//         let q = vec![0.0_f32; 8];
-//         let eq = enc.encode_query(&q).unwrap();
-//         assert_abs_diff_eq!(eq.query_norm, 0.0, epsilon = 1e-7);
-//     }
+    #[test]
+    fn test_encode_query_zero() {
+        let enc = TurboQuantEncoder::<f32>::new(8, 4, Dist::SquaredEuclidean, 42).unwrap();
+        let q = vec![0.0_f32; 8];
+        let eq = enc.encode_query(&q).unwrap();
+        assert_abs_diff_eq!(eq.query_norm, 0.0, epsilon = 1e-7);
+    }
 
-//     #[test]
-//     fn test_encode_roundtrip_low_error() {
-//         // Encode many pseudo-random unit vectors, decode via bit-plane
-//         // walk + level lookup, check mean cosine similarity in rotated
-//         // space (rotation is isometric, so it equals original-space cosine).
-//         let dim = 64;
-//         let bits = 4;
-//         let enc = TurboQuantEncoder::<f32>::new(dim, bits, Dist::Cosine, 42).unwrap();
-//         let bytes_per_plane = dim / 8;
+    #[test]
+    fn test_encode_roundtrip_low_error() {
+        // Encode many pseudo-random unit vectors, decode via bit-plane
+        // walk + level lookup, check mean cosine similarity in rotated
+        // space (rotation is isometric, so it equals original-space cosine).
+        let dim = 64;
+        let bits = 4;
+        let enc = TurboQuantEncoder::<f32>::new(dim, bits, Dist::Cosine, 42).unwrap();
+        let bytes_per_plane = dim / 8;
 
-//         let mut total_sim = 0.0f32;
-//         let n_trials = 50;
-//         for trial in 0..n_trials {
-//             let v: Vec<f32> = (0..dim)
-//                 .map(|i| ((i as f32) * 0.123 + 0.7 + trial as f32 * 0.317).sin())
-//                 .collect();
-//             let norm: f32 = v.iter().map(|x| x * x).sum::<f32>().sqrt();
-//             let unit: Vec<f32> = v.iter().map(|x| x / norm).collect();
+        let mut total_sim = 0.0f32;
+        let n_trials = 50;
+        for trial in 0..n_trials {
+            let v: Vec<f32> = (0..dim)
+                .map(|i| ((i as f32) * 0.123 + 0.7 + trial as f32 * 0.317).sin())
+                .collect();
+            let norm: f32 = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+            let unit: Vec<f32> = v.iter().map(|x| x / norm).collect();
 
-//             let (packed, _) = enc.encode_vector(&unit).unwrap();
+            let (packed, _) = enc.encode_vector(&unit).unwrap();
 
-//             let rotated_unit = enc.apply_rotation(&unit);
-//             let mut decoded_rot = vec![0.0f32; dim];
-//             for d in 0..dim {
-//                 let byte_pos = d / 8;
-//                 let bit_mask = 1u8 << (7 - (d % 8));
-//                 let mut code = 0u8;
-//                 for p in 0..bits {
-//                     if packed[p * bytes_per_plane + byte_pos] & bit_mask != 0 {
-//                         code |= 1 << p;
-//                     }
-//                 }
-//                 decoded_rot[d] = enc.levels[code as usize];
-//             }
+            let rotated_unit = enc.apply_rotation(&unit);
+            let mut decoded_rot = vec![0.0f32; dim];
+            for d in 0..dim {
+                let byte_pos = d / 8;
+                let bit_mask = 1u8 << (7 - (d % 8));
+                let mut code = 0u8;
+                for p in 0..bits {
+                    if packed[p * bytes_per_plane + byte_pos] & bit_mask != 0 {
+                        code |= 1 << p;
+                    }
+                }
+                decoded_rot[d] = enc.levels[code as usize];
+            }
 
-//             let dot: f32 = rotated_unit
-//                 .iter()
-//                 .zip(decoded_rot.iter())
-//                 .map(|(a, b)| a * b)
-//                 .sum();
-//             let n_d: f32 = decoded_rot.iter().map(|x| x * x).sum::<f32>().sqrt();
-//             total_sim += dot / n_d;
-//         }
-//         let mean_sim = total_sim / n_trials as f32;
-//         assert!(mean_sim > 0.9, "mean cosine sim {mean_sim} below threshold");
-//     }
+            let dot: f32 = rotated_unit
+                .iter()
+                .zip(decoded_rot.iter())
+                .map(|(a, b)| a * b)
+                .sum();
+            let n_d: f32 = decoded_rot.iter().map(|x| x * x).sum::<f32>().sqrt();
+            total_sim += dot / n_d;
+        }
+        let mean_sim = total_sim / n_trials as f32;
+        assert!(mean_sim > 0.9, "mean cosine sim {mean_sim} below threshold");
+    }
 
-//     #[test]
-//     fn test_storage_via_quantiser() {
-//         let n = 10;
-//         let dim = 16;
-//         let mut data = Mat::<f32>::zeros(n, dim);
-//         for i in 0..n {
-//             for j in 0..dim {
-//                 data[(i, j)] = (i * dim + j) as f32 * 0.1;
-//             }
-//         }
-//         let q = TurboQuantQuantiser::new(data.as_ref(), &Dist::SquaredEuclidean, 4, 42).unwrap();
+    #[test]
+    fn test_storage_via_quantiser() {
+        let n = 10;
+        let dim = 16;
+        let mut data = Mat::<f32>::zeros(n, dim);
+        for i in 0..n {
+            for j in 0..dim {
+                data[(i, j)] = (i * dim + j) as f32 * 0.1;
+            }
+        }
+        let q = TurboQuantQuantiser::new(data.as_ref(), &Dist::SquaredEuclidean, 4, 42).unwrap();
 
-//         assert_eq!(q.n_vectors(), n);
-//         assert_eq!(q.storage.dim, dim);
-//         assert_eq!(q.storage.bits, 4);
-//         assert_eq!(q.storage.bytes_per_vec, 8);
-//         assert_eq!(q.storage.packed_codes.len(), n * 8);
-//         assert_eq!(q.storage.norms.len(), n);
-//     }
+        assert_eq!(q.n_vectors(), n);
+        assert_eq!(q.storage.dim, dim);
+        assert_eq!(q.storage.bits, 4);
+        assert_eq!(q.storage.bytes_per_vec, 8);
+        assert_eq!(q.storage.packed_codes.len(), n * 8);
+        assert_eq!(q.storage.norms.len(), n);
+    }
 
-//     #[test]
-//     fn test_quantiser_norms_match_input() {
-//         let n = 5;
-//         let dim = 16;
-//         let mut data = Mat::<f32>::zeros(n, dim);
-//         for i in 0..n {
-//             for j in 0..dim {
-//                 data[(i, j)] = (i * dim + j) as f32 * 0.1;
-//             }
-//         }
-//         let q = TurboQuantQuantiser::new(data.as_ref(), &Dist::SquaredEuclidean, 4, 42).unwrap();
+    #[test]
+    fn test_quantiser_norms_match_input() {
+        let n = 5;
+        let dim = 16;
+        let mut data = Mat::<f32>::zeros(n, dim);
+        for i in 0..n {
+            for j in 0..dim {
+                data[(i, j)] = (i * dim + j) as f32 * 0.1;
+            }
+        }
+        let q = TurboQuantQuantiser::new(data.as_ref(), &Dist::SquaredEuclidean, 4, 42).unwrap();
 
-//         for i in 0..n {
-//             let row: Vec<f32> = (0..dim).map(|j| data[(i, j)]).collect();
-//             let expected_norm: f32 = row.iter().map(|x| x * x).sum::<f32>().sqrt();
-//             assert_abs_diff_eq!(q.storage.norms[i], expected_norm, epsilon = 1e-5);
-//         }
-//     }
+        for i in 0..n {
+            let row: Vec<f32> = (0..dim).map(|j| data[(i, j)]).collect();
+            let expected_norm: f32 = row.iter().map(|x| x * x).sum::<f32>().sqrt();
+            assert_abs_diff_eq!(q.storage.norms[i], expected_norm, epsilon = 1e-5);
+        }
+    }
 
-//     #[test]
-//     fn test_vector_packed_slice_length() {
-//         let n = 4;
-//         let dim = 16;
-//         let data = Mat::<f32>::zeros(n, dim);
-//         let q = TurboQuantQuantiser::new(data.as_ref(), &Dist::SquaredEuclidean, 4, 42).unwrap();
-//         for i in 0..n {
-//             assert_eq!(q.storage.vector_packed(i).len(), q.storage.bytes_per_vec);
-//         }
-//     }
+    #[test]
+    fn test_vector_packed_slice_length() {
+        let n = 4;
+        let dim = 16;
+        let data = Mat::<f32>::zeros(n, dim);
+        let q = TurboQuantQuantiser::new(data.as_ref(), &Dist::SquaredEuclidean, 4, 42).unwrap();
+        for i in 0..n {
+            assert_eq!(q.storage.vector_packed(i).len(), q.storage.bytes_per_vec);
+        }
+    }
 
-//     #[test]
-//     fn test_invalid_bits() {
-//         let result = TurboQuantEncoder::<f32>::new(8, 5, Dist::SquaredEuclidean, 42);
-//         assert!(matches!(
-//             result,
-//             Err(AnnSearchErrors::TQInvalidBits { n_bits: 5 })
-//         ));
-//     }
+    #[test]
+    fn test_invalid_bits() {
+        let result = TurboQuantEncoder::<f32>::new(8, 5, Dist::SquaredEuclidean, 42);
+        assert!(matches!(
+            result,
+            Err(AnnSearchErrors::TQInvalidBits { n_bits: 5 })
+        ));
+    }
 
-//     #[test]
-//     fn test_invalid_dim() {
-//         let result = TurboQuantEncoder::<f32>::new(7, 4, Dist::SquaredEuclidean, 42);
-//         assert!(matches!(
-//             result,
-//             Err(AnnSearchErrors::TQDimMustBe8Multiple { dims: 7 })
-//         ));
-//     }
-// }
+    #[test]
+    fn test_invalid_dim() {
+        let result = TurboQuantEncoder::<f32>::new(7, 4, Dist::SquaredEuclidean, 42);
+        assert!(matches!(
+            result,
+            Err(AnnSearchErrors::TQDimMustBe8Multiple { dims: 7 })
+        ));
+    }
+}

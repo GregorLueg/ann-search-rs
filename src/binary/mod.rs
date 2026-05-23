@@ -10,5 +10,6 @@ pub mod ivf_binary;
 pub mod ivf_rabitq;
 pub mod rabitq;
 pub mod tq_codebook;
+pub mod tq_pack;
 pub mod tq_quantiser;
 pub mod vec_store;

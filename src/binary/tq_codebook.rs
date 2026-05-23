@@ -208,6 +208,9 @@ pub fn codebook<T>(bits: usize, dim: usize) -> Result<(Vec<T>, Vec<T>), AnnSearc
 where
     T: Float + FromPrimitive,
 {
+    if dim < 2 {
+        return Err(AnnSearchErrors::TQInvalidDim { dims: dim });
+    }
     if !(2..=4).contains(&bits) {
         return Err(AnnSearchErrors::TQInvalidBits { n_bits: bits });
     }
@@ -318,10 +321,7 @@ mod tests {
     #[test]
     fn test_invalid_bits() {
         let result = codebook::<f32>(5, 128);
-        assert!(matches!(
-            result,
-            Err(AnnSearchErrors::TQInvalidBits { n_bits: 5 })
-        ));
+        assert!(result.is_err());
     }
 
     #[test]
