@@ -2164,7 +2164,9 @@ where
     T: AnnSearchGpuFloat + AnnSearchFloat,
     R: Runtime,
 {
-    Ok(index.generate_knn(k, return_dist, verbose))
+    let res = index.generate_knn(k, return_dist, verbose)?;
+
+    Ok(res)
 }
 
 //////////////

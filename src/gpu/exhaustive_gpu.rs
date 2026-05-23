@@ -149,7 +149,7 @@ where
         let query_data = BatchData::new(&vectors_query_padded, &query_norms, n_query);
         let db_data = BatchData::new(&self.vectors_flat, &self.norms, self.n);
 
-        Ok(query_batch_gpu::<T, R>(
+        let res = query_batch_gpu::<T, R>(
             k,
             &query_data,
             &db_data,
@@ -157,7 +157,9 @@ where
             &self.metric,
             self.device.clone(),
             verbose,
-        ))
+        )?;
+
+        Ok(res)
     }
 
     /// Generate kNN graph from vectors stored in the index
@@ -180,7 +182,7 @@ where
         k: usize,
         return_dist: bool,
         verbose: bool,
-    ) -> (Vec<Vec<usize>>, Option<Vec<Vec<T>>>) {
+    ) -> Result<(Vec<Vec<usize>>, Option<Vec<Vec<T>>>), AnnSearchErrors> {
         let query_data = BatchData::new(&self.vectors_flat, &self.norms, self.n);
         let db_data = BatchData::new(&self.vectors_flat, &self.norms, self.n);
 
@@ -192,12 +194,12 @@ where
             &self.metric,
             self.device.clone(),
             verbose,
-        );
+        )?;
 
         if return_dist {
-            (indices, Some(distances))
+            Ok((indices, Some(distances)))
         } else {
-            (indices, None)
+            Ok((indices, None))
         }
     }
 
@@ -281,7 +283,7 @@ mod tests {
         )
         .unwrap();
 
-        let (indices, distances) = index.generate_knn(3, true, false);
+        let (indices, distances) = index.generate_knn(3, true, false).unwrap();
 
         assert_eq!(indices.len(), 6);
         assert!(distances.is_some());

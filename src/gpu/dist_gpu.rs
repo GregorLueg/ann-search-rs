@@ -859,8 +859,8 @@ pub fn reduce_ivf_topk_coalesced<F: Float>(
 ///
 /// ### Params
 ///
-/// * `query_vectors` - Query vectors `[n_queries, dim / LINE_SIZE]` as `Line<F>`
-/// * `db_vectors` - Full database vectors `[n_db, dim / LINE_SIZE]` as `Line<F>`
+/// * `query_vectors` - Query vectors `[n_queries, dim / N]` as `Vector<F, N>`
+/// * `db_vectors` - Full database vectors `[n_db, dim / N]` as `Vector<F, N>`
 /// * `task_q_idx` - Query index for each task `[n_tasks]`
 /// * `task_db_start` - Global DB start index for each task `[n_tasks]`
 /// * `task_write_offset` - Write offset into the candidate row for each task
@@ -874,9 +874,9 @@ pub fn reduce_ivf_topk_coalesced<F: Float>(
 /// * `ABSOLUTE_POS_X` -> vector index within the task's cluster (`0..db_count`)
 /// * `ABSOLUTE_POS_Y` -> task index (`0..n_tasks`)
 #[cube(launch_unchecked)]
-pub fn compute_ivf_mega_euclidean<F: Float>(
-    query_vectors: &Tensor<Line<F>>,
-    db_vectors: &Tensor<Line<F>>,
+pub fn compute_ivf_mega_euclidean<F: Float, N: Size>(
+    query_vectors: &Tensor<Vector<F, N>>,
+    db_vectors: &Tensor<Vector<F, N>>,
     task_q_idx: &Tensor<u32>,
     task_db_start: &Tensor<u32>,
     task_write_offset: &Tensor<u32>,
@@ -884,6 +884,7 @@ pub fn compute_ivf_mega_euclidean<F: Float>(
     out_dists: &mut Tensor<F>,
     out_indices: &mut Tensor<u32>,
 ) {
+    let lanes = comptime!(N::value());
     let local_db_idx = ABSOLUTE_POS_X;
     let task_idx = (CUBE_POS_Z * CUBE_COUNT_Y + CUBE_POS_Y) * WORKGROUP_SIZE_Y + UNIT_POS_Y;
 
@@ -905,7 +906,7 @@ pub fn compute_ivf_mega_euclidean<F: Float>(
 
     let mut sum = F::new(0.0);
 
-    let dim_lines = query_vectors.shape(1) / LINE_SIZE as usize;
+    let dim_lines = query_vectors.shape(1) / lanes;
     let q_offset = q_idx as usize * dim_lines;
     let d_offset = real_db_idx as usize * dim_lines;
 
@@ -915,10 +916,10 @@ pub fn compute_ivf_mega_euclidean<F: Float>(
         let diff = q_line - d_line;
         let sq = diff * diff;
 
-        sum += sq[0];
-        sum += sq[1];
-        sum += sq[2];
-        sum += sq[3];
+        #[unroll]
+        for lane in 0..lanes {
+            sum += sq[lane];
+        }
     }
 
     let out_offset = q_idx as usize * out_dists.stride(0) + write_pos as usize;
@@ -933,8 +934,8 @@ pub fn compute_ivf_mega_euclidean<F: Float>(
 ///
 /// ### Params
 ///
-/// * `query_vectors` - Query vectors `[n_queries, dim / LINE_SIZE]` as `Line<F>`
-/// * `db_vectors` - Full database vectors `[n_db, dim / LINE_SIZE]` as `Line<F>`
+/// * `query_vectors` - Query vectors `[n_queries, dim / N]` as `Vector<F, N>`
+/// * `db_vectors` - Full database vectors `[n_db, dim / N]` as `Vector<F, N>`
 /// * `query_norms` - Pre-computed L2 norms `[n_queries]`
 /// * `db_norms` - Pre-computed L2 norms `[n_db]`
 /// * `task_q_idx` - Query index for each task `[n_tasks]`
@@ -950,9 +951,9 @@ pub fn compute_ivf_mega_euclidean<F: Float>(
 /// * `ABSOLUTE_POS_X` -> vector index within the task's cluster (`0..db_count`)
 /// * `ABSOLUTE_POS_Y` -> task index (`0..n_tasks`)
 #[cube(launch_unchecked)]
-pub fn compute_ivf_mega_cosine<F: Float>(
-    query_vectors: &Tensor<Line<F>>,
-    db_vectors: &Tensor<Line<F>>,
+pub fn compute_ivf_mega_cosine<F: Float, N: Size>(
+    query_vectors: &Tensor<Vector<F, N>>,
+    db_vectors: &Tensor<Vector<F, N>>,
     query_norms: &Tensor<F>,
     db_norms: &Tensor<F>,
     task_q_idx: &Tensor<u32>,
@@ -962,6 +963,7 @@ pub fn compute_ivf_mega_cosine<F: Float>(
     out_dists: &mut Tensor<F>,
     out_indices: &mut Tensor<u32>,
 ) {
+    let lanes = comptime!(N::value());
     let local_db_idx = ABSOLUTE_POS_X;
     let task_idx = (CUBE_POS_Z * CUBE_COUNT_Y + CUBE_POS_Y) * WORKGROUP_SIZE_Y + UNIT_POS_Y;
 
@@ -983,7 +985,7 @@ pub fn compute_ivf_mega_cosine<F: Float>(
 
     let mut dot = F::new(0.0);
 
-    let dim_lines = query_vectors.shape(1) / LINE_SIZE as usize;
+    let dim_lines = query_vectors.shape(1) / lanes;
     let q_offset = q_idx as usize * dim_lines;
     let d_offset = real_db_idx as usize * dim_lines;
 
@@ -992,10 +994,10 @@ pub fn compute_ivf_mega_cosine<F: Float>(
         let d_line = db_vectors[d_offset + i];
         let prod = q_line * d_line;
 
-        dot += prod[0];
-        dot += prod[1];
-        dot += prod[2];
-        dot += prod[3];
+        #[unroll]
+        for lane in 0..lanes {
+            dot += prod[lane];
+        }
     }
 
     let q_norm = query_norms[q_idx as usize];
@@ -1084,10 +1086,10 @@ pub fn reduce_ivf_topk<F: Float>(
 ///
 /// ### Params
 ///
-/// * `query_vectors` - Query vectors `[n_queries, dim]` as `Line<F>`.
-///   Shape must be in element units (not Line units). Accessed via
+/// * `query_vectors` - Query vectors `[n_queries, dim]` as `Vector<F, N>`.
+///   Shape must be in element units (not vector units). Accessed via
 ///   the comptime `dim_lines` parameter, never via tensor strides.
-/// * `db_vectors` - Full database vectors `[n_db, dim]` as `Line<F>`.
+/// * `db_vectors` - Full database vectors `[n_db, dim]` as `Vector<F, N>`.
 ///   Same element-unit shape convention as `query_vectors`.
 /// * `task_q_idx` - Query index for each task `[n_tasks]`. Tasks must
 ///   be sorted by this value for optimal shared-memory reuse.
@@ -1103,12 +1105,12 @@ pub fn reduce_ivf_topk<F: Float>(
 /// * `out_indices` - Output candidate DB indices `[n_queries, max_candidates]`.
 ///   Written at the same position as `out_dists`.
 /// * `n_tasks` - Total number of tasks. Used for bounds checking since
-///   `task_q_idx.len()` is unreliable for Line tensors in the same
-///   kernel.
-/// * `dim_lines` - Number of `Line<F>` elements per vector row (comptime).
-///   Equal to `dim / LINE_SIZE`. Used for all indexing into Line tensors
-///   and for shared memory sizing. Passed as comptime to avoid reliance
-///   on tensor metadata.
+///   `task_q_idx.len()` is unreliable when vectorised tensors are present
+///   in the same kernel.
+/// * `dim_lines` - Number of `Vector<F, N>` elements per vector row (comptime).
+///   Equal to `dim / N`. Used for all indexing into vector tensors and for
+///   shared memory sizing. Passed as comptime to avoid reliance on tensor
+///   metadata.
 ///
 /// ### Grid mapping
 ///
@@ -1124,11 +1126,11 @@ pub fn reduce_ivf_topk<F: Float>(
 /// * `s_write_offset[32]` - write offset per Y-slot
 /// * `s_db_count[32]` - DB count per Y-slot
 /// * `s_query[32 * dim_scalars]` - query vectors in scalar form, where
-///   `dim_scalars = dim_lines * 4`
+///   `dim_scalars = dim_lines * N`
 #[cube(launch_unchecked)]
-pub fn compute_ivf_mega_euclidean_cached<F: Float>(
-    query_vectors: &Tensor<Line<F>>,
-    db_vectors: &Tensor<Line<F>>,
+pub fn compute_ivf_mega_euclidean_cached<F: Float, N: Size>(
+    query_vectors: &Tensor<Vector<F, N>>,
+    db_vectors: &Tensor<Vector<F, N>>,
     task_q_idx: &Tensor<u32>,
     task_db_start: &Tensor<u32>,
     task_write_offset: &Tensor<u32>,
@@ -1138,12 +1140,13 @@ pub fn compute_ivf_mega_euclidean_cached<F: Float>(
     n_tasks: u32,
     #[comptime] dim_lines: usize,
 ) {
+    let lanes = comptime!(N::value());
     let local_db_idx = ABSOLUTE_POS_X;
     let task_idx = (CUBE_POS_Z * CUBE_COUNT_Y + CUBE_POS_Y) * WORKGROUP_SIZE_Y + UNIT_POS_Y;
     let local_y = UNIT_POS_Y as usize;
     let local_x = UNIT_POS_X as usize;
 
-    let dim_scalars = dim_lines * 4usize;
+    let dim_scalars = dim_lines * lanes;
     let wg_y = WORKGROUP_SIZE_Y as usize;
 
     // ── Phase 1: Load task metadata into shared memory ──
@@ -1183,8 +1186,8 @@ pub fn compute_ivf_mega_euclidean_cached<F: Float>(
         let elem = load_idx % dim_scalars;
         let q_global = s_q_idx[q_local];
 
-        let line_idx = elem / 4usize;
-        let lane = elem % 4usize;
+        let line_idx = elem / lanes;
+        let lane = elem % lanes;
         let line_val = query_vectors[q_global as usize * dim_lines + line_idx];
         s_query[load_idx] = line_val[lane];
 
@@ -1212,14 +1215,12 @@ pub fn compute_ivf_mega_euclidean_cached<F: Float>(
     let mut sum = F::new(0.0);
     for i in 0..dim_lines {
         let d_line = db_vectors[d_offset + i];
-        let s_off = q_shared_base + i * 4usize;
-
-        let diff0 = s_query[s_off] - d_line[0];
-        let diff1 = s_query[s_off + 1usize] - d_line[1];
-        let diff2 = s_query[s_off + 2usize] - d_line[2];
-        let diff3 = s_query[s_off + 3usize] - d_line[3];
-
-        sum += diff0 * diff0 + diff1 * diff1 + diff2 * diff2 + diff3 * diff3;
+        let s_off = q_shared_base + i * lanes;
+        #[unroll]
+        for lane in 0..lanes {
+            let diff = s_query[s_off + lane] - d_line[lane];
+            sum += diff * diff;
+        }
     }
 
     let q_idx = s_q_idx[local_y];
@@ -1239,9 +1240,9 @@ pub fn compute_ivf_mega_euclidean_cached<F: Float>(
 ///
 /// ### Params
 ///
-/// * `query_vectors` - Query vectors `[n_queries, dim]` as `Line<F>`.
+/// * `query_vectors` - Query vectors `[n_queries, dim]` as `Vector<F, N>`.
 ///   Shape in element units.
-/// * `db_vectors` - Full database vectors `[n_db, dim]` as `Line<F>`.
+/// * `db_vectors` - Full database vectors `[n_db, dim]` as `Vector<F, N>`.
 ///   Shape in element units.
 /// * `query_norms` - Pre-computed L2 norms for queries `[n_queries]`.
 ///   Scalar tensor, one norm per query.
@@ -1255,7 +1256,7 @@ pub fn compute_ivf_mega_euclidean_cached<F: Float>(
 /// * `out_dists` - Output candidate distances `[n_queries, max_candidates]`.
 /// * `out_indices` - Output candidate DB indices `[n_queries, max_candidates]`.
 /// * `n_tasks` - Total number of tasks for bounds checking.
-/// * `dim_lines` - Number of `Line<F>` elements per vector row (comptime).
+/// * `dim_lines` - Number of `Vector<F, N>` elements per vector row (comptime).
 ///
 /// ### Grid mapping
 ///
@@ -1266,9 +1267,9 @@ pub fn compute_ivf_mega_euclidean_cached<F: Float>(
 /// Same as Euclidean variant, plus:
 /// * `s_query_norms[32]` - L2 norm per Y-slot query
 #[cube(launch_unchecked)]
-pub fn compute_ivf_mega_cosine_cached<F: Float>(
-    query_vectors: &Tensor<Line<F>>,
-    db_vectors: &Tensor<Line<F>>,
+pub fn compute_ivf_mega_cosine_cached<F: Float, N: Size>(
+    query_vectors: &Tensor<Vector<F, N>>,
+    db_vectors: &Tensor<Vector<F, N>>,
     query_norms: &Tensor<F>,
     db_norms: &Tensor<F>,
     task_q_idx: &Tensor<u32>,
@@ -1280,12 +1281,13 @@ pub fn compute_ivf_mega_cosine_cached<F: Float>(
     n_tasks: u32,
     #[comptime] dim_lines: usize,
 ) {
+    let lanes = comptime!(N::value());
     let local_db_idx = ABSOLUTE_POS_X;
     let task_idx = (CUBE_POS_Z * CUBE_COUNT_Y + CUBE_POS_Y) * WORKGROUP_SIZE_Y + UNIT_POS_Y;
     let local_y = UNIT_POS_Y as usize;
     let local_x = UNIT_POS_X as usize;
 
-    let dim_scalars = dim_lines * 4usize;
+    let dim_scalars = dim_lines * lanes;
     let wg_y = WORKGROUP_SIZE_Y as usize;
 
     // ── Phase 1: Load task metadata + query norms into shared memory ──
@@ -1329,8 +1331,8 @@ pub fn compute_ivf_mega_cosine_cached<F: Float>(
         let elem = load_idx % dim_scalars;
         let q_global = s_q_idx[q_local];
 
-        let line_idx = elem / 4usize;
-        let lane = elem % 4usize;
+        let line_idx = elem / lanes;
+        let lane = elem % lanes;
         let line_val = query_vectors[q_global as usize * dim_lines + line_idx];
         s_query[load_idx] = line_val[lane];
 
@@ -1358,12 +1360,11 @@ pub fn compute_ivf_mega_cosine_cached<F: Float>(
     let mut dot = F::new(0.0);
     for i in 0..dim_lines {
         let d_line = db_vectors[d_offset + i];
-        let s_off = q_shared_base + i * 4usize;
-
-        dot += s_query[s_off] * d_line[0]
-            + s_query[s_off + 1usize] * d_line[1]
-            + s_query[s_off + 2usize] * d_line[2]
-            + s_query[s_off + 3usize] * d_line[3];
+        let s_off = q_shared_base + i * lanes;
+        #[unroll]
+        for lane in 0..lanes {
+            dot += s_query[s_off + lane] * d_line[lane];
+        }
     }
 
     let q_norm = s_query_norms[local_y];
@@ -1491,7 +1492,8 @@ mod tests {
             &Dist::SquaredEuclidean,
             device,
             false,
-        );
+        )
+        .unwrap();
 
         let cpu_d = cpu_euclidean_dists(&queries, &db, nq, ndb, dim);
         let (_, cpu_dist) = cpu_topk(&cpu_d, nq, ndb, k);
@@ -1538,7 +1540,8 @@ mod tests {
             &Dist::SquaredEuclidean,
             device,
             false,
-        );
+        )
+        .unwrap();
 
         let cpu_d = cpu_euclidean_dists(&queries, &db, nq, ndb, dim);
         let (_, cpu_dist) = cpu_topk(&cpu_d, nq, ndb, k);
@@ -1585,7 +1588,8 @@ mod tests {
         let dbb = BatchData::new(&db, &d_norms, ndb);
 
         let (_, gpu_dist) =
-            query_batch_gpu::<f32, WgpuRuntime>(k, &qb, &dbb, dim, &Dist::Cosine, device, false);
+            query_batch_gpu::<f32, WgpuRuntime>(k, &qb, &dbb, dim, &Dist::Cosine, device, false)
+                .unwrap();
 
         let cpu_d = cpu_cosine_dists(&queries, &db, &q_norms, &d_norms, nq, ndb, dim);
         let (_, cpu_dist) = cpu_topk(&cpu_d, nq, ndb, k);
@@ -1623,7 +1627,8 @@ mod tests {
             &Dist::SquaredEuclidean,
             device,
             false,
-        );
+        )
+        .unwrap();
 
         for q in 0..n {
             assert_eq!(
@@ -1664,7 +1669,8 @@ mod tests {
             &Dist::SquaredEuclidean,
             device,
             false,
-        );
+        )
+        .unwrap();
 
         for q in 0..nq {
             for i in 1..k {
@@ -1703,7 +1709,8 @@ mod tests {
             &Dist::SquaredEuclidean,
             device,
             false,
-        );
+        )
+        .unwrap();
 
         assert_eq!(idx[0][0], 1);
         assert!((dist[0][0] - 0.01).abs() < 1e-3);
@@ -1739,7 +1746,8 @@ mod tests {
             &Dist::SquaredEuclidean,
             device,
             false,
-        );
+        )
+        .unwrap();
 
         assert_eq!(idx[0][0], 73, "Should find planted nearest at index 73");
         assert!(dist[0][0] < 0.01);
@@ -1771,7 +1779,8 @@ mod tests {
             &Dist::SquaredEuclidean,
             device,
             false,
-        );
+        )
+        .unwrap();
 
         assert_eq!(idx[0][0], 0);
         assert!((dist[0][0] - 64.0).abs() < 1e-3);
@@ -1819,8 +1828,8 @@ mod tests {
                 &client,
                 CubeCount::Static(init_gx, init_gy, init_gz),
                 CubeDim::new_2d(WORKGROUP_SIZE_X, WORKGROUP_SIZE_Y),
-                topk_d.clone().into_tensor_arg(1),
-                topk_i.clone().into_tensor_arg(1),
+                topk_d.clone().into_tensor_arg(),
+                topk_i.clone().into_tensor_arg(),
             );
         }
 
@@ -1831,15 +1840,15 @@ mod tests {
                 &client,
                 CubeCount::Static(rgx, rgy, 1),
                 CubeDim::new_2d(WORKGROUP_SIZE_X, 1),
-                cd_gpu.into_tensor_arg(1),
-                ci_gpu.into_tensor_arg(1),
-                cpq_gpu.into_tensor_arg(1),
-                topk_d.clone().into_tensor_arg(1),
-                topk_i.clone().into_tensor_arg(1),
+                cd_gpu.into_tensor_arg(),
+                ci_gpu.into_tensor_arg(),
+                cpq_gpu.into_tensor_arg(),
+                topk_d.clone().into_tensor_arg(),
+                topk_i.clone().into_tensor_arg(),
             );
         }
 
-        (topk_d.read(&client), topk_i.read(&client))
+        (topk_d.read(&client).unwrap(), topk_i.read(&client).unwrap())
     }
 
     /// Helper: run the NEW coalesced reduce on the same data.
@@ -1879,17 +1888,17 @@ mod tests {
                 &client,
                 CubeCount::Static(rgx, rgy, 1),
                 CubeDim::new_2d(WORKGROUP_SIZE_X, 1),
-                cd_gpu.into_tensor_arg(1),
-                ci_gpu.into_tensor_arg(1),
-                cpq_gpu.into_tensor_arg(1),
-                topk_d.clone().into_tensor_arg(1),
-                topk_i.clone().into_tensor_arg(1),
-                ScalarArg { elem: k as u32 },
+                cd_gpu.into_tensor_arg(),
+                ci_gpu.into_tensor_arg(),
+                cpq_gpu.into_tensor_arg(),
+                topk_d.clone().into_tensor_arg(),
+                topk_i.clone().into_tensor_arg(),
+                k as u32,
                 k,
             );
         }
 
-        (topk_d.read(&client), topk_i.read(&client))
+        (topk_d.read(&client).unwrap(), topk_i.read(&client).unwrap())
     }
 
     // Test 1: Trivial case. 1 query, 5 candidates, k=3.
@@ -2186,45 +2195,38 @@ mod tests {
         let vec_size = LINE_SIZE as usize;
         let dim_lines = dim / vec_size;
         let n_tasks = tasks.len();
-
         let q_gpu =
             GpuTensor::<WgpuRuntime, f32>::from_slice(queries, vec![n_queries, dim], &client);
         let db_gpu = GpuTensor::<WgpuRuntime, f32>::from_slice(db, vec![n_db, dim], &client);
-
         let task_q: Vec<u32> = tasks.iter().map(|t| t.0).collect();
         let task_db_s: Vec<u32> = tasks.iter().map(|t| t.1).collect();
         let task_wo: Vec<u32> = tasks.iter().map(|t| t.2).collect();
         let task_dc: Vec<u32> = tasks.iter().map(|t| t.3).collect();
-
         let tq_gpu = GpuTensor::<WgpuRuntime, u32>::from_slice(&task_q, vec![n_tasks], &client);
         let tds_gpu = GpuTensor::<WgpuRuntime, u32>::from_slice(&task_db_s, vec![n_tasks], &client);
         let two_gpu = GpuTensor::<WgpuRuntime, u32>::from_slice(&task_wo, vec![n_tasks], &client);
         let tdc_gpu = GpuTensor::<WgpuRuntime, u32>::from_slice(&task_dc, vec![n_tasks], &client);
-
         let out_d = GpuTensor::<WgpuRuntime, f32>::empty(vec![n_queries, max_candidates], &client);
         let out_i = GpuTensor::<WgpuRuntime, u32>::empty(vec![n_queries, max_candidates], &client);
-
         let max_db_count = tasks.iter().map(|t| t.3).max().unwrap_or(0);
         let gx = max_db_count.div_ceil(WORKGROUP_SIZE_X).max(1);
         let (gy, gz) = grid_2d((n_tasks as u32).div_ceil(WORKGROUP_SIZE_Y));
-
         if use_cached {
             unsafe {
                 let _ = compute_ivf_mega_euclidean_cached::launch_unchecked::<f32, WgpuRuntime>(
                     &client,
                     CubeCount::Static(gx, gy, gz),
                     CubeDim::new_2d(WORKGROUP_SIZE_X, WORKGROUP_SIZE_Y),
-                    q_gpu.into_tensor_arg(vec_size),
-                    db_gpu.into_tensor_arg(vec_size),
-                    tq_gpu.into_tensor_arg(1),
-                    tds_gpu.into_tensor_arg(1),
-                    two_gpu.into_tensor_arg(1),
-                    tdc_gpu.into_tensor_arg(1),
-                    out_d.clone().into_tensor_arg(1),
-                    out_i.clone().into_tensor_arg(1),
-                    ScalarArg {
-                        elem: n_tasks as u32,
-                    },
+                    vec_size,
+                    q_gpu.into_tensor_arg(),
+                    db_gpu.into_tensor_arg(),
+                    tq_gpu.into_tensor_arg(),
+                    tds_gpu.into_tensor_arg(),
+                    two_gpu.into_tensor_arg(),
+                    tdc_gpu.into_tensor_arg(),
+                    out_d.clone().into_tensor_arg(),
+                    out_i.clone().into_tensor_arg(),
+                    n_tasks as u32,
                     dim_lines,
                 );
             }
@@ -2234,19 +2236,19 @@ mod tests {
                     &client,
                     CubeCount::Static(gx, gy, gz),
                     CubeDim::new_2d(WORKGROUP_SIZE_X, WORKGROUP_SIZE_Y),
-                    q_gpu.into_tensor_arg(vec_size),
-                    db_gpu.into_tensor_arg(vec_size),
-                    tq_gpu.into_tensor_arg(1),
-                    tds_gpu.into_tensor_arg(1),
-                    two_gpu.into_tensor_arg(1),
-                    tdc_gpu.into_tensor_arg(1),
-                    out_d.clone().into_tensor_arg(1),
-                    out_i.clone().into_tensor_arg(1),
+                    vec_size,
+                    q_gpu.into_tensor_arg(),
+                    db_gpu.into_tensor_arg(),
+                    tq_gpu.into_tensor_arg(),
+                    tds_gpu.into_tensor_arg(),
+                    two_gpu.into_tensor_arg(),
+                    tdc_gpu.into_tensor_arg(),
+                    out_d.clone().into_tensor_arg(),
+                    out_i.clone().into_tensor_arg(),
                 );
             }
         }
-
-        (out_d.read(&client), out_i.read(&client))
+        (out_d.read(&client).unwrap(), out_i.read(&client).unwrap())
     }
 
     /// CPU reference: squared Euclidean distance between query q and DB

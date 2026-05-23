@@ -72,19 +72,19 @@ fn xorshift32(state: u32) -> u32 {
 ///
 /// ### Params
 ///
-/// * `vectors` - Row-major vector matrix, line-vectorised `[n, dim/LINE_SIZE]`
-/// * `random_vec` - Random projection vector `[dim/LINE_SIZE]`
+/// * `vectors` - Row-major vector matrix, line-vectorised `[n, dim/N]`
+/// * `random_vec` - Random projection vector `[dim/N]`
 /// * `dot_values` - Output dot products `[n]`
 /// * `n` - Number of points
-/// * `dim_lines` - Number of `Line<F>` elements per vector row (comptime)
+/// * `dim_lines` - Number of `Vector<F, N>` elements per vector row (comptime)
 ///
 /// ### Grid mapping
 ///
 /// * `ABSOLUTE_POS_X` -> point index
 #[cube(launch_unchecked)]
-fn compute_dot_products<F: AnnSearchGpuFloat>(
-    vectors: &Tensor<Line<F>>,
-    random_vec: &Tensor<Line<F>>,
+fn compute_dot_products<F: AnnSearchGpuFloat, N: Size>(
+    vectors: &Tensor<Vector<F, N>>,
+    random_vec: &Tensor<Vector<F, N>>,
     dot_values: &mut Tensor<F>,
     n: u32,
     #[comptime] dim_lines: usize,
@@ -93,20 +93,18 @@ fn compute_dot_products<F: AnnSearchGpuFloat>(
     if idx >= n {
         terminate!();
     }
-
+    let lanes = comptime!(N::value());
     let off = idx as usize * dim_lines;
     let mut sum = F::new(0.0);
-
     for i in 0..dim_lines {
         let v = vectors[off + i];
         let r = random_vec[i];
         let prod = v * r;
-        sum += prod[0];
-        sum += prod[1];
-        sum += prod[2];
-        sum += prod[3];
+        #[unroll]
+        for lane in 0..lanes {
+            sum += prod[lane];
+        }
     }
-
     dot_values[idx as usize] = sum;
 }
 
@@ -199,8 +197,8 @@ fn compute_max_leaf_size(dim_padded: usize) -> usize {
 ///
 /// * One Cube per leaf
 #[cube(launch_unchecked)]
-pub fn leaf_pairwise_proposals<F: AnnSearchGpuFloat>(
-    vectors: &Tensor<Line<F>>,
+pub fn leaf_pairwise_proposals<F: AnnSearchGpuFloat, N: Size>(
+    vectors: &Tensor<Vector<F, N>>,
     norms: &Tensor<F>,
     leaf_points: &Tensor<u32>,
     leaf_offsets: &Tensor<u32>,
@@ -655,17 +653,16 @@ where
     let (dot_grid_x, dot_grid_y) = grid_2d(dot_grid);
 
     // parallelise the outer tree loop to overlap GPU execution with CPU memory reads
+    // parallelise the outer tree loop to overlap GPU execution with CPU memory reads
     let all_tree_results: TreeResults<T> = (0..n_trees)
         .into_par_iter()
         .map(|tree_idx| {
             // allocate the GPU buffer inside the parallel closure so each tree
             // has an isolated buffer, preventing thread contention on the client.
             let dot_values_gpu = GpuTensor::<R, T>::empty(vec![n], client);
-
             let tree_seed =
                 (seed as u64).wrapping_add((tree_idx as u64).wrapping_mul(0x9E3779B97F4A7C15u64));
             let save_routing = tree_idx < n_router_trees;
-
             let mut partition_ids = vec![0u32; n];
             let mut routing_vecs: Option<Vec<Vec<T>>> = if save_routing {
                 Some(Vec::with_capacity(max_depth))
@@ -677,12 +674,10 @@ where
             } else {
                 None
             };
-
             for level in 0..max_depth {
                 let level_seed =
                     tree_seed.wrapping_add((level as u64).wrapping_mul(0x517CC1B727220A95u64));
                 let mut rng = SmallRng::seed_from_u64(level_seed);
-
                 // generate and normalise random projection vector
                 let mut random_vec = vec![T::zero(); dim];
                 for v in random_vec.iter_mut() {
@@ -695,34 +690,30 @@ where
                         *x /= norm;
                     }
                 }
-
-                // pad to dim_padded for the GPU kernel's Line<F> layout
+                // pad to dim_padded for the GPU kernel's vector layout
                 let mut random_vec_padded = vec![T::zero(); dim_padded];
                 random_vec_padded[..dim].copy_from_slice(&random_vec);
                 let random_vec_gpu =
                     GpuTensor::<R, T>::from_slice(&random_vec_padded, vec![dim_padded], client);
-
                 // GPU dot products (2.8M threads, ~2ms per launch)
                 unsafe {
                     let _ = compute_dot_products::launch_unchecked::<T, R>(
                         client,
                         CubeCount::Static(dot_grid_x, dot_grid_y, 1),
                         CubeDim::new_2d(WORKGROUP_SIZE_X, 1),
-                        vectors_gpu.clone().into_tensor_arg(line),
-                        random_vec_gpu.into_tensor_arg(line),
-                        dot_values_gpu.clone().into_tensor_arg(1),
-                        ScalarArg { elem: n as u32 },
+                        line,
+                        vectors_gpu.clone().into_tensor_arg(),
+                        random_vec_gpu.into_tensor_arg(),
+                        dot_values_gpu.clone().into_tensor_arg(),
+                        n as u32,
                         dim_vec,
                     );
                 }
-
                 // Read back dot values (~11MB, blocking but overlapped by Rayon)
-                let dot_values = dot_values_gpu.clone().read(client);
-
+                let dot_values = dot_values_gpu.clone().read(client)?;
                 // CPU median computation (fast, O(n), parallelised internally)
                 let n_partitions = 1usize << level;
                 let medians = compute_partition_medians(&partition_ids, &dot_values, n_partitions);
-
                 // CPU partition update (trivial parallel scatter)
                 partition_ids
                     .par_iter_mut()
@@ -735,16 +726,14 @@ where
                             *pid * 2 + 1
                         };
                     });
-
                 if save_routing {
                     routing_vecs.as_mut().unwrap().push(random_vec);
                     routing_medians.as_mut().unwrap().push(medians);
                 }
             }
-
-            (partition_ids, routing_vecs, routing_medians)
+            Ok((partition_ids, routing_vecs, routing_medians))
         })
-        .collect();
+        .collect::<Result<TreeResults<T>, _>>()?;
 
     let leaf_structures: Vec<_> = all_tree_results
         .par_iter()
@@ -832,9 +821,9 @@ where
                 client,
                 CubeCount::Static(grid_n_x, grid_n_y, 1),
                 CubeDim::new_2d(WORKGROUP_SIZE_X, 1),
-                prop_count_gpu.clone().into_tensor_arg(1),
-                update_counter_gpu.clone().into_tensor_arg(1),
-                ScalarArg { elem: n as u32 },
+                prop_count_gpu.clone().into_tensor_arg(),
+                update_counter_gpu.clone().into_tensor_arg(),
+                n as u32,
             );
         }
 
@@ -846,18 +835,17 @@ where
                 client,
                 CubeCount::Static(cubes_x, cubes_y, 1),
                 CubeDim::new_2d(WORKGROUP_SIZE_X, 1),
-                vectors_gpu.clone().into_tensor_arg(line),
-                norms_gpu.clone().into_tensor_arg(1),
-                leaf_points_gpu.into_tensor_arg(1),
-                leaf_offsets_gpu.into_tensor_arg(1),
-                graph_dist_gpu.clone().into_tensor_arg(1),
-                prop_idx_gpu.clone().into_tensor_arg(1),
-                prop_dist_gpu.clone().into_tensor_arg(1),
-                prop_count_gpu.clone().into_tensor_arg(1),
-                ScalarArg { elem: n as u32 },
-                ScalarArg {
-                    elem: batch_leaves as u32,
-                },
+                line,
+                vectors_gpu.clone().into_tensor_arg(),
+                norms_gpu.clone().into_tensor_arg(),
+                leaf_points_gpu.into_tensor_arg(),
+                leaf_offsets_gpu.into_tensor_arg(),
+                graph_dist_gpu.clone().into_tensor_arg(),
+                prop_idx_gpu.clone().into_tensor_arg(),
+                prop_dist_gpu.clone().into_tensor_arg(),
+                prop_count_gpu.clone().into_tensor_arg(),
+                n as u32,
+                batch_leaves as u32,
                 MAX_PROPOSALS as u32,
                 use_cosine,
                 dim_vec,
@@ -870,13 +858,13 @@ where
                 client,
                 CubeCount::Static(grid_n_x, grid_n_y, 1),
                 CubeDim::new_2d(WORKGROUP_SIZE_X, 1),
-                graph_idx_gpu.clone().into_tensor_arg(1),
-                graph_dist_gpu.clone().into_tensor_arg(1),
-                prop_idx_gpu.clone().into_tensor_arg(1),
-                prop_dist_gpu.clone().into_tensor_arg(1),
-                prop_count_gpu.clone().into_tensor_arg(1),
-                update_counter_gpu.clone().into_tensor_arg(1),
-                ScalarArg { elem: n as u32 },
+                graph_idx_gpu.clone().into_tensor_arg(),
+                graph_dist_gpu.clone().into_tensor_arg(),
+                prop_idx_gpu.clone().into_tensor_arg(),
+                prop_dist_gpu.clone().into_tensor_arg(),
+                prop_count_gpu.clone().into_tensor_arg(),
+                update_counter_gpu.clone().into_tensor_arg(),
+                n as u32,
                 MAX_PROPOSALS as u32,
             );
         }
@@ -920,10 +908,6 @@ mod tests {
     // For testing the code with 32 dimension
     const MAX_LEAF_SIZE: usize = 128;
 
-    // ---------------------------------------------------------------
-    // 1. Dot product kernel
-    // ---------------------------------------------------------------
-
     #[test]
     fn test_dot_products_basic() {
         let Some(device) = try_device() else {
@@ -951,15 +935,16 @@ mod tests {
                 &client,
                 CubeCount::Static(grid, 1, 1),
                 CubeDim::new_2d(WORKGROUP_SIZE_X, 1),
-                vectors_gpu.into_tensor_arg(line),
-                rvec_gpu.into_tensor_arg(line),
-                dots_gpu.clone().into_tensor_arg(1),
-                ScalarArg { elem: n as u32 },
+                line,
+                vectors_gpu.into_tensor_arg(),
+                rvec_gpu.into_tensor_arg(),
+                dots_gpu.clone().into_tensor_arg(),
+                n as u32,
                 dim_vec,
             );
         }
 
-        let dots = dots_gpu.read(&client);
+        let dots = dots_gpu.read(&client).unwrap();
         let expected = [1.0f32, 0.0, 1.0, 0.5];
         for (i, (&got, &exp)) in dots.iter().zip(expected.iter()).enumerate() {
             assert!(
@@ -994,15 +979,16 @@ mod tests {
                 &client,
                 CubeCount::Static(grid, 1, 1),
                 CubeDim::new_2d(WORKGROUP_SIZE_X, 1),
-                vectors_gpu.into_tensor_arg(line),
-                rvec_gpu.into_tensor_arg(line),
-                dots_gpu.clone().into_tensor_arg(1),
-                ScalarArg { elem: n as u32 },
+                line,
+                vectors_gpu.into_tensor_arg(),
+                rvec_gpu.into_tensor_arg(),
+                dots_gpu.clone().into_tensor_arg(),
+                n as u32,
                 dim_vec,
             );
         }
 
-        let dots = dots_gpu.read(&client);
+        let dots = dots_gpu.read(&client).unwrap();
         for i in 0..n {
             let expected = (i + 1) as f32 * dim as f32;
             assert!(
@@ -1013,10 +999,6 @@ mod tests {
             );
         }
     }
-
-    // ---------------------------------------------------------------
-    // 2. Partition kernel
-    // ---------------------------------------------------------------
 
     #[test]
     fn test_partition_basic() {
@@ -1040,14 +1022,14 @@ mod tests {
                 &client,
                 CubeCount::Static(grid, 1, 1),
                 CubeDim::new_2d(WORKGROUP_SIZE_X, 1),
-                pid_gpu.clone().into_tensor_arg(1),
-                dot_gpu.into_tensor_arg(1),
-                med_gpu.into_tensor_arg(1),
-                ScalarArg { elem: n as u32 },
+                pid_gpu.clone().into_tensor_arg(),
+                dot_gpu.into_tensor_arg(),
+                med_gpu.into_tensor_arg(),
+                n as u32,
             );
         }
 
-        let result = pid_gpu.read(&client);
+        let result = pid_gpu.read(&client).unwrap();
         for i in 0..4 {
             assert_eq!(result[i], 0, "point {i} should be in partition 0");
         }
@@ -1085,15 +1067,16 @@ mod tests {
                     &client,
                     CubeCount::Static(grid, 1, 1),
                     CubeDim::new_2d(WORKGROUP_SIZE_X, 1),
-                    vectors_gpu.clone().into_tensor_arg(line),
-                    rvec_gpu.into_tensor_arg(line),
-                    dots_gpu.clone().into_tensor_arg(1),
-                    ScalarArg { elem: n as u32 },
+                    line,
+                    vectors_gpu.clone().into_tensor_arg(),
+                    rvec_gpu.into_tensor_arg(),
+                    dots_gpu.clone().into_tensor_arg(),
+                    n as u32,
                     dim_vec,
                 );
             }
 
-            let dots_cpu = dots_gpu.clone().read(&client);
+            let dots_cpu = dots_gpu.clone().read(&client).unwrap();
             let n_partitions = 1usize << level;
             let medians = compute_partition_medians(&cpu_pids, &dots_cpu, n_partitions);
             let med_gpu =
@@ -1104,10 +1087,10 @@ mod tests {
                     &client,
                     CubeCount::Static(grid, 1, 1),
                     CubeDim::new_2d(WORKGROUP_SIZE_X, 1),
-                    pid_gpu.clone().into_tensor_arg(1),
-                    dots_gpu.clone().into_tensor_arg(1),
-                    med_gpu.into_tensor_arg(1),
-                    ScalarArg { elem: n as u32 },
+                    pid_gpu.clone().into_tensor_arg(),
+                    dots_gpu.clone().into_tensor_arg(),
+                    med_gpu.into_tensor_arg(),
+                    n as u32,
                 );
             }
 
@@ -1123,7 +1106,7 @@ mod tests {
         }
 
         // Verify GPU and CPU agree
-        let gpu_pids = pid_gpu.read(&client);
+        let gpu_pids = pid_gpu.read(&client).unwrap();
         assert_eq!(gpu_pids, cpu_pids, "GPU and CPU partition IDs must match");
 
         let (_, leaf_offsets, n_leaves) = build_leaf_structure(&cpu_pids, n);
@@ -1138,13 +1121,9 @@ mod tests {
         }
     }
 
-    // ---------------------------------------------------------------
-    // 3. Leaf shared memory roundtrip
-    // ---------------------------------------------------------------
-
     #[cube(launch_unchecked)]
-    fn debug_leaf_shared_roundtrip<F: AnnSearchGpuFloat>(
-        vectors: &Tensor<Line<F>>,
+    fn debug_leaf_shared_roundtrip<F: AnnSearchGpuFloat, N: Size>(
+        vectors: &Tensor<Vector<F, N>>,
         leaf_points: &Tensor<u32>,
         leaf_offsets: &Tensor<u32>,
         out_vecs: &mut Tensor<F>,
@@ -1243,17 +1222,18 @@ mod tests {
                 &client,
                 CubeCount::Static(1, 1, 1),
                 CubeDim::new_2d(WORKGROUP_SIZE_X, 1),
-                vectors_gpu.into_tensor_arg(line),
-                lp_gpu.into_tensor_arg(1),
-                lo_gpu.into_tensor_arg(1),
-                out_gpu.clone().into_tensor_arg(1),
-                ScalarArg { elem: n as u32 },
+                line,
+                vectors_gpu.into_tensor_arg(),
+                lp_gpu.into_tensor_arg(),
+                lo_gpu.into_tensor_arg(),
+                out_gpu.clone().into_tensor_arg(),
+                n as u32,
                 dim_vec,
                 MAX_LEAF_SIZE,
             );
         }
 
-        let result = out_gpu.read(&client);
+        let result = out_gpu.read(&client).unwrap();
         for (local_idx, &global_pid) in leaf_points.iter().enumerate() {
             let expected: Vec<f32> = (0..dim)
                 .map(|j| (global_pid as usize * 100 + j) as f32)
@@ -1302,17 +1282,18 @@ mod tests {
                 &client,
                 CubeCount::Static(1, 1, 1),
                 CubeDim::new_2d(WORKGROUP_SIZE_X, 1),
-                vectors_gpu.into_tensor_arg(line),
-                lp_gpu.into_tensor_arg(1),
-                lo_gpu.into_tensor_arg(1),
-                out_gpu.clone().into_tensor_arg(1),
-                ScalarArg { elem: n as u32 },
+                line,
+                vectors_gpu.into_tensor_arg(),
+                lp_gpu.into_tensor_arg(),
+                lo_gpu.into_tensor_arg(),
+                out_gpu.clone().into_tensor_arg(),
+                n as u32,
                 dim_vec,
                 MAX_LEAF_SIZE,
             );
         }
 
-        let result = out_gpu.read(&client);
+        let result = out_gpu.read(&client).unwrap();
         for (local_idx, &global_pid) in leaf_points.iter().enumerate() {
             for j in 0..dim {
                 let got = result[local_idx * dim + j];
@@ -1324,10 +1305,6 @@ mod tests {
             }
         }
     }
-
-    // ---------------------------------------------------------------
-    // 4. Leaf pairwise proposals
-    // ---------------------------------------------------------------
 
     #[test]
     fn test_leaf_pairwise_small_euclidean() {
@@ -1365,16 +1342,17 @@ mod tests {
                 &client,
                 CubeCount::Static(1, 1, 1),
                 CubeDim::new_2d(WORKGROUP_SIZE_X, 1),
-                vectors_gpu.into_tensor_arg(line),
-                norms_gpu.into_tensor_arg(1),
-                lp_gpu.into_tensor_arg(1),
-                lo_gpu.into_tensor_arg(1),
-                gdist_gpu.into_tensor_arg(1),
-                prop_idx_gpu.clone().into_tensor_arg(1),
-                prop_dist_gpu.clone().into_tensor_arg(1),
-                prop_count_gpu.clone().into_tensor_arg(1),
-                ScalarArg { elem: n as u32 },
-                ScalarArg { elem: 1u32 },
+                line,
+                vectors_gpu.into_tensor_arg(),
+                norms_gpu.into_tensor_arg(),
+                lp_gpu.into_tensor_arg(),
+                lo_gpu.into_tensor_arg(),
+                gdist_gpu.into_tensor_arg(),
+                prop_idx_gpu.clone().into_tensor_arg(),
+                prop_dist_gpu.clone().into_tensor_arg(),
+                prop_count_gpu.clone().into_tensor_arg(),
+                n as u32,
+                1u32,
                 MAX_PROPOSALS as u32,
                 false,
                 dim_vec,
@@ -1382,9 +1360,9 @@ mod tests {
             );
         }
 
-        let p_idx = prop_idx_gpu.read(&client);
-        let p_dist = prop_dist_gpu.read(&client);
-        let p_count = prop_count_gpu.read(&client);
+        let p_idx = prop_idx_gpu.read(&client).unwrap();
+        let p_dist = prop_dist_gpu.read(&client).unwrap();
+        let p_count = prop_count_gpu.read(&client).unwrap();
 
         for node in 0..n {
             assert_eq!(
@@ -1457,26 +1435,27 @@ mod tests {
                 &client,
                 CubeCount::Static(1, 1, 1),
                 CubeDim::new_2d(WORKGROUP_SIZE_X, 1),
-                vectors_gpu.into_tensor_arg(line),
-                norms_gpu.into_tensor_arg(1),
-                lp_gpu.into_tensor_arg(1),
-                lo_gpu.into_tensor_arg(1),
-                gdist_gpu.into_tensor_arg(1),
-                prop_idx_gpu.clone().into_tensor_arg(1),
-                prop_dist_gpu.clone().into_tensor_arg(1),
-                prop_count_gpu.clone().into_tensor_arg(1),
-                ScalarArg { elem: n as u32 },
-                ScalarArg { elem: 1u32 },
+                line,
+                vectors_gpu.into_tensor_arg(),
+                norms_gpu.into_tensor_arg(),
+                lp_gpu.into_tensor_arg(),
+                lo_gpu.into_tensor_arg(),
+                gdist_gpu.into_tensor_arg(),
+                prop_idx_gpu.clone().into_tensor_arg(),
+                prop_dist_gpu.clone().into_tensor_arg(),
+                prop_count_gpu.clone().into_tensor_arg(),
+                n as u32,
+                1u32,
                 MAX_PROPOSALS as u32,
-                true,
+                false,
                 dim_vec,
                 MAX_LEAF_SIZE,
             );
         }
 
-        let p_idx = prop_idx_gpu.read(&client);
-        let p_dist = prop_dist_gpu.read(&client);
-        let p_count = prop_count_gpu.read(&client);
+        let p_idx = prop_idx_gpu.read(&client).unwrap();
+        let p_dist = prop_dist_gpu.read(&client).unwrap();
+        let p_count = prop_count_gpu.read(&client).unwrap();
 
         let mut any_negative = false;
         let mut any_mismatch = false;
@@ -1539,16 +1518,17 @@ mod tests {
                 &client,
                 CubeCount::Static(1, 1, 1),
                 CubeDim::new_2d(WORKGROUP_SIZE_X, 1),
-                vectors_gpu.into_tensor_arg(line),
-                norms_gpu.into_tensor_arg(1),
-                lp_gpu.into_tensor_arg(1),
-                lo_gpu.into_tensor_arg(1),
-                gdist_gpu.into_tensor_arg(1),
-                prop_idx_gpu.clone().into_tensor_arg(1),
-                prop_dist_gpu.clone().into_tensor_arg(1),
-                prop_count_gpu.clone().into_tensor_arg(1),
-                ScalarArg { elem: n as u32 },
-                ScalarArg { elem: 1u32 },
+                line,
+                vectors_gpu.into_tensor_arg(),
+                norms_gpu.into_tensor_arg(),
+                lp_gpu.into_tensor_arg(),
+                lo_gpu.into_tensor_arg(),
+                gdist_gpu.into_tensor_arg(),
+                prop_idx_gpu.clone().into_tensor_arg(),
+                prop_dist_gpu.clone().into_tensor_arg(),
+                prop_count_gpu.clone().into_tensor_arg(),
+                n as u32,
+                1u32,
                 MAX_PROPOSALS as u32,
                 false,
                 dim_vec,
@@ -1556,9 +1536,9 @@ mod tests {
             );
         }
 
-        let p_idx = prop_idx_gpu.read(&client);
-        let p_dist = prop_dist_gpu.read(&client);
-        let p_count = prop_count_gpu.read(&client);
+        let p_idx = prop_idx_gpu.read(&client).unwrap();
+        let p_dist = prop_dist_gpu.read(&client).unwrap();
+        let p_count = prop_count_gpu.read(&client).unwrap();
 
         let mut mismatch_count = 0;
         for node in 0..16 {
@@ -1581,10 +1561,6 @@ mod tests {
             "dim=32 leaf pairwise: {mismatch_count} mismatches"
         );
     }
-
-    // ---------------------------------------------------------------
-    // 5. Full forest init quality
-    // ---------------------------------------------------------------
 
     #[test]
     fn test_forest_init_recall() {
@@ -1645,7 +1621,7 @@ mod tests {
             &client,
         );
 
-        let result_idx = graph_idx_gpu.read(&client);
+        let result_idx = graph_idx_gpu.read(&client).unwrap();
         let pid_mask = 0x7FFFFFFFu32;
 
         let mut total_hits = 0;
@@ -1678,10 +1654,6 @@ mod tests {
         assert!(recall > 0.3, "Forest init recall too low: {recall:.4}");
     }
 
-    // ---------------------------------------------------------------
-    // 6. CPU helpers
-    // ---------------------------------------------------------------
-
     #[test]
     fn test_build_leaf_structure() {
         let partition_ids = vec![2u32, 0, 1, 0, 2, 1, 0, 2];
@@ -1708,10 +1680,6 @@ mod tests {
         assert!((medians[1] - 6.0).abs() < 1e-6);
     }
 
-    // ---------------------------------------------------------------
-    // 7. mark_all_new kernel
-    // ---------------------------------------------------------------
-
     #[test]
     fn test_mark_all_new() {
         let Some(device) = try_device() else {
@@ -1729,12 +1697,12 @@ mod tests {
                 &client,
                 CubeCount::Static(1, 1, 1),
                 CubeDim::new_2d(WORKGROUP_SIZE_X, 1),
-                gpu.clone().into_tensor_arg(1),
-                ScalarArg { elem: 4u32 },
+                gpu.clone().into_tensor_arg(),
+                4u32,
             );
         }
 
-        let result = gpu.read(&client);
+        let result = gpu.read(&client).unwrap();
         let is_new = 1u32 << 31;
         let pid_mask = 0x7FFFFFFFu32;
 
@@ -1746,10 +1714,6 @@ mod tests {
         assert_eq!(result[3] & pid_mask, 42);
         assert_ne!(result[3] & is_new, 0);
     }
-
-    // ---------------------------------------------------------------
-    // 8. CPU-GPU partition mirror consistency
-    // ---------------------------------------------------------------
 
     #[test]
     fn test_cpu_gpu_partition_mirror() {
@@ -1786,15 +1750,16 @@ mod tests {
                     &client,
                     CubeCount::Static(grid, 1, 1),
                     CubeDim::new_2d(WORKGROUP_SIZE_X, 1),
-                    vectors_gpu.clone().into_tensor_arg(line),
-                    rvec_gpu.into_tensor_arg(line),
-                    dots_gpu.clone().into_tensor_arg(1),
-                    ScalarArg { elem: n as u32 },
+                    line,
+                    vectors_gpu.clone().into_tensor_arg(),
+                    rvec_gpu.into_tensor_arg(),
+                    dots_gpu.clone().into_tensor_arg(),
+                    n as u32,
                     dim_vec,
                 );
             }
 
-            let dots_cpu = dots_gpu.clone().read(&client);
+            let dots_cpu = dots_gpu.clone().read(&client).unwrap();
             let n_partitions = 1usize << level;
             let medians = compute_partition_medians(&cpu_pids, &dots_cpu, n_partitions);
             let med_gpu =
@@ -1805,10 +1770,10 @@ mod tests {
                     &client,
                     CubeCount::Static(grid, 1, 1),
                     CubeDim::new_2d(WORKGROUP_SIZE_X, 1),
-                    pid_gpu.clone().into_tensor_arg(1),
-                    dots_gpu.clone().into_tensor_arg(1),
-                    med_gpu.into_tensor_arg(1),
-                    ScalarArg { elem: n as u32 },
+                    pid_gpu.clone().into_tensor_arg(),
+                    dots_gpu.clone().into_tensor_arg(),
+                    med_gpu.into_tensor_arg(),
+                    n as u32,
                 );
             }
 
@@ -1822,7 +1787,7 @@ mod tests {
             }
         }
 
-        let gpu_pids = pid_gpu.read(&client);
+        let gpu_pids = pid_gpu.read(&client).unwrap();
         assert_eq!(
             gpu_pids, cpu_pids,
             "GPU and CPU partitions diverged after 4 levels"
