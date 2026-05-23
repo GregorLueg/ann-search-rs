@@ -261,8 +261,8 @@ pub fn leaf_pairwise_proposals<F: AnnSearchGpuFloat, N: Size>(
     while idx_load < total_scalars {
         let n_idx = idx_load / dim_scalars;
         let s_idx = idx_load % dim_scalars;
-        let line_idx = s_idx / 4usize;
-        let lane = s_idx % 4usize;
+        let line_idx = s_idx / lanes;
+        let lane = s_idx % lanes;
         let pid = shared_pids[n_idx];
 
         if pid < n_pts {
@@ -1134,7 +1134,8 @@ mod tests {
     ) {
         let leaf_idx = CUBE_POS_X;
         let tx = UNIT_POS_X;
-        let dim_scalars = dim_lines * 4usize;
+        let lanes = LINE_SIZE;
+        let dim_scalars = dim_lines * lanes;
 
         let mut shared_leaf_start = SharedMemory::<u32>::new(1usize);
         let mut shared_leaf_size = SharedMemory::<u32>::new(1usize);
@@ -1450,7 +1451,7 @@ mod tests {
                 n as u32,
                 1u32,
                 MAX_PROPOSALS as u32,
-                false,
+                true,
                 dim_vec,
                 MAX_LEAF_SIZE,
             );

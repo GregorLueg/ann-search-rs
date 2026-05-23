@@ -1,11 +1,11 @@
 # News
 
-## 0.3.1
+## 0.3.2
 
 **Features**
 
 - Version bump on cubecl to `"0.10.0"`.
-- TurboQuantisation
+- TurboQuantisation with exhaustive and IVF index implemented
 
 ## 0.3.1
 
