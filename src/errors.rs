@@ -4,6 +4,9 @@ use thiserror::Error;
 
 use crate::utils::dist::Dist;
 
+#[cfg(feature = "gpu")]
+use cubecl::server::ServerError;
+
 /// All error variants that can occur across `ann-search-rs` operations.
 #[derive(Debug, Error)]
 pub enum AnnSearchErrors {
@@ -23,6 +26,7 @@ pub enum AnnSearchErrors {
     #[error("Distance metric '{0}' is not supported for this method.")]
     DistanceNotSupported(Dist),
 
+    // -- quantisation errors --
     /// Dimension must be divisible by m
     #[error("Dimension ({dim}) must be divisible by m ({m}).")]
     #[cfg(feature = "quantised")]
@@ -104,4 +108,10 @@ pub enum AnnSearchErrors {
         /// Output buffer length
         len: usize,
     },
+
+    // -- gpu errors --
+    /// Propagate errors from the ann-search-rs crate
+    #[cfg(feature = "gpu")]
+    #[error("Error from the cubecl runtime: {0}")]
+    CubeClServerError(#[from] ServerError),
 }

@@ -179,9 +179,9 @@ fn xorshift_search(state: u32) -> u32 {
 ///
 /// * Single workgroup `(1,1,1)`, result written by thread 0
 #[cube(launch_unchecked)]
-fn probe_query_distance<F: Float>(
-    vectors: &Tensor<Line<F>>,
-    query: &Tensor<Line<F>>,
+fn probe_query_distance<F: Float, N: Size>(
+    vectors: &Tensor<Vector<F, N>>,
+    query: &Tensor<Vector<F, N>>,
     out_dist: &mut Tensor<F>,
     out_shared: &mut Tensor<F>,
     target_node: u32,
@@ -354,11 +354,11 @@ fn probe_hash_table(
 ///
 /// ### Params
 ///
-/// * `vectors` - Database vectors `[n_nodes, dim/LINE_SIZE]` as `Line<F>`
+/// * `vectors` - Database vectors `[n_nodes, dim/N]` as `Vector<F, N>`
 /// * `norms` - Pre-computed L2 norms `[n_nodes]` (ignored when `use_cosine` is
 ///   false)
 /// * `graph` - CAGRA navigational graph `[n_nodes, k_graph]` of neighbour IDs
-/// * `queries` - Query vectors `[n_queries, dim/LINE_SIZE]` as `Line<F>`
+/// * `queries` - Query vectors `[n_queries, dim/N]` as `Vector<F, N>`
 /// * `entry_points` - Initial seed nodes `[n_queries, n_entry]`
 /// * `out_indices` - Output neighbour indices `[n_queries, k_out]`
 /// * `out_dists` - Output neighbour distances `[n_queries, k_out]`
@@ -368,7 +368,7 @@ fn probe_hash_table(
 /// * `k_out` - Number of neighbours to return per query
 /// * `k_graph` - Degree of the navigational graph (comptime)
 /// * `use_cosine` - Whether to compute cosine distance (comptime)
-/// * `dim_lines` - Number of `Line<F>` elements per vector row (comptime)
+/// * `dim_lines` - Number of `Vector<F, N>` elements per vector row (comptime)
 /// * `beam_width` - Number of active candidates maintained during search
 ///   (comptime)
 /// * `hash_size` - Hash table capacity for visited tracking (comptime, must be
@@ -380,11 +380,11 @@ fn probe_hash_table(
 ///
 /// * One Cube per query: `q_idx = CUBE_POS_Y * CUBE_COUNT_X + CUBE_POS_X`
 #[cube(launch_unchecked)]
-pub fn cagra_beam_search<F: Float>(
-    vectors: &Tensor<Line<F>>,
+pub fn cagra_beam_search<F: Float, N: Size>(
+    vectors: &Tensor<Vector<F, N>>,
     norms: &Tensor<F>,
     graph: &Tensor<u32>,
-    queries: &Tensor<Line<F>>,
+    queries: &Tensor<Vector<F, N>>,
     entry_points: &Tensor<u32>,
     out_indices: &mut Tensor<u32>,
     out_dists: &mut Tensor<F>,
@@ -406,8 +406,9 @@ pub fn cagra_beam_search<F: Float>(
         terminate!();
     }
 
+    let lanes = LINE_SIZE;
     let tx = UNIT_POS_X;
-    let dim_scalars = dim_lines * 4usize;
+    let dim_scalars = dim_lines * lanes;
     let hash_mask = hash_size as u32 - 1u32;
     let sentinel = 0x7FFFFFFFu32;
     let f_max = F::new(999999999.0);
@@ -431,8 +432,8 @@ pub fn cagra_beam_search<F: Float>(
     let q_line_offset = q_idx as usize * dim_lines;
     let mut il = tx as usize;
     while il < dim_scalars {
-        let line_idx = il / 4usize;
-        let lane = il % 4usize;
+        let line_idx = il / lanes;
+        let lane = il % lanes;
         let line_val = queries[q_line_offset + line_idx];
         sq_vec[il] = line_val[lane];
         il += WORKGROUP_SIZE_X as usize;
@@ -494,18 +495,18 @@ pub fn cagra_beam_search<F: Float>(
                     let mut sum = F::new(0.0);
                     for li in 0..dim_lines {
                         let lv = vectors[node_id as usize * dim_lines + li];
-                        let s_off = li * 4usize;
+                        let s_off = li * lanes;
                         if use_cosine {
-                            sum += sq_vec[s_off] * lv[0]
-                                + sq_vec[s_off + 1usize] * lv[1]
-                                + sq_vec[s_off + 2usize] * lv[2]
-                                + sq_vec[s_off + 3usize] * lv[3];
+                            #[unroll]
+                            for lane in 0..lanes {
+                                sum += sq_vec[s_off + lane] * lv[lane];
+                            }
                         } else {
-                            let d0 = sq_vec[s_off] - lv[0];
-                            let d1 = sq_vec[s_off + 1usize] - lv[1];
-                            let d2 = sq_vec[s_off + 2usize] - lv[2];
-                            let d3 = sq_vec[s_off + 3usize] - lv[3];
-                            sum += d0 * d0 + d1 * d1 + d2 * d2 + d3 * d3;
+                            #[unroll]
+                            for lane in 0..lanes {
+                                let d = sq_vec[s_off + lane] - lv[lane];
+                                sum += d * d;
+                            }
                         }
                     }
                     let dist = if use_cosine {
@@ -663,18 +664,18 @@ pub fn cagra_beam_search<F: Float>(
                     let mut sum = F::new(0.0);
                     for li in 0..dim_lines {
                         let lv = vectors[nbr as usize * dim_lines + li];
-                        let s_off = li * 4usize;
+                        let s_off = li * lanes;
                         if use_cosine {
-                            sum += sq_vec[s_off] * lv[0]
-                                + sq_vec[s_off + 1usize] * lv[1]
-                                + sq_vec[s_off + 2usize] * lv[2]
-                                + sq_vec[s_off + 3usize] * lv[3];
+                            #[unroll]
+                            for lane in 0..lanes {
+                                sum += sq_vec[s_off + lane] * lv[lane];
+                            }
                         } else {
-                            let d0 = sq_vec[s_off] - lv[0];
-                            let d1 = sq_vec[s_off + 1usize] - lv[1];
-                            let d2 = sq_vec[s_off + 2usize] - lv[2];
-                            let d3 = sq_vec[s_off + 3usize] - lv[3];
-                            sum += d0 * d0 + d1 * d1 + d2 * d2 + d3 * d3;
+                            #[unroll]
+                            for lane in 0..lanes {
+                                let d = sq_vec[s_off + lane] - lv[lane];
+                                sum += d * d;
+                            }
                         }
                     }
                     let dist = if use_cosine {
@@ -830,12 +831,12 @@ pub fn cagra_search_batch_gpu<T, R>(
     query_params: &CagraGpuSearchParams,
     entry_points: Option<&[u32]>,
     client: &ComputeClient<R>,
-) -> (Vec<Vec<usize>>, Vec<Vec<T>>)
+) -> KnnResult<T>
 where
     R: Runtime,
     T: AnnSearchGpuFloat + num_traits::Float,
 {
-    let line = LINE_SIZE as usize;
+    let line = LINE_SIZE;
     let dim_padded = dim.next_multiple_of(line);
     let dim_vec = dim_padded / line;
 
@@ -882,20 +883,21 @@ where
     let cubes_y = (n_queries as u32).div_ceil(cubes_x);
 
     unsafe {
-        let _ = cagra_beam_search::launch_unchecked::<T, R>(
+        cagra_beam_search::launch_unchecked::<T, R>(
             client,
             CubeCount::Static(cubes_x, cubes_y, 1),
             CubeDim::new_2d(WORKGROUP_SIZE_X, 1),
-            vectors_gpu.clone().into_tensor_arg(line),
-            norms_gpu.clone().into_tensor_arg(1),
-            graph_gpu.clone().into_tensor_arg(1),
-            queries_gpu.into_tensor_arg(line),
-            entry_gpu.into_tensor_arg(1),
-            out_idx_gpu.clone().into_tensor_arg(1),
-            out_dist_gpu.clone().into_tensor_arg(1),
-            out_iters_gpu.clone().into_tensor_arg(1),
-            ScalarArg { elem: n as u32 },
-            ScalarArg { elem: k_out as u32 },
+            line,
+            vectors_gpu.clone().into_tensor_arg(),
+            norms_gpu.clone().into_tensor_arg(),
+            graph_gpu.clone().into_tensor_arg(),
+            queries_gpu.into_tensor_arg(),
+            entry_gpu.into_tensor_arg(),
+            out_idx_gpu.clone().into_tensor_arg(),
+            out_dist_gpu.clone().into_tensor_arg(),
+            out_iters_gpu.clone().into_tensor_arg(),
+            n as u32,
+            k_out as u32,
             k_graph,
             use_cosine,
             dim_vec,
@@ -908,8 +910,8 @@ where
     }
 
     // Download
-    let idx_flat = out_idx_gpu.read(client);
-    let dist_flat = out_dist_gpu.read(client);
+    let idx_flat = out_idx_gpu.read(client)?;
+    let dist_flat = out_dist_gpu.read(client)?;
     let sentinel_usize = 0x7FFFFFFFusize;
 
     let indices: Vec<Vec<usize>> = (0..n_queries)
@@ -933,7 +935,7 @@ where
         })
         .collect();
 
-    (indices, distances)
+    Ok((indices, distances))
 }
 
 ///////////
@@ -964,7 +966,7 @@ mod tests {
         };
 
         let client = WgpuRuntime::client(&device);
-        let line = LINE_SIZE as usize;
+        let line = LINE_SIZE;
         let n = 50usize;
         let dim = 32usize;
         let dim_vec = dim / line;
@@ -987,22 +989,23 @@ mod tests {
         let target_node = 3u32;
 
         unsafe {
-            let _ = probe_query_distance::launch_unchecked::<f32, WgpuRuntime>(
+            probe_query_distance::launch_unchecked::<f32, WgpuRuntime>(
                 &client,
                 CubeCount::Static(1, 1, 1),
                 CubeDim::new_2d(WORKGROUP_SIZE_X, 1),
-                vectors_gpu.into_tensor_arg(line),
-                query_gpu.into_tensor_arg(line),
-                out_dist.clone().into_tensor_arg(1),
-                out_shared.clone().into_tensor_arg(1),
-                ScalarArg { elem: target_node },
+                line,
+                vectors_gpu.into_tensor_arg(),
+                query_gpu.into_tensor_arg(),
+                out_dist.clone().into_tensor_arg(),
+                out_shared.clone().into_tensor_arg(),
+                target_node,
                 false,
                 dim_vec,
             );
         }
 
-        let shared_result = out_shared.read(&client);
-        let dist_result = out_dist.read(&client);
+        let shared_result = out_shared.read(&client).unwrap();
+        let dist_result = out_dist.read(&client).unwrap();
 
         for j in 0..dim {
             let expected = j as f32 + 0.5;
@@ -1038,7 +1041,7 @@ mod tests {
         };
 
         let client = WgpuRuntime::client(&device);
-        let line = LINE_SIZE as usize;
+        let line = LINE_SIZE;
         let n = 50usize;
         let dim = 32usize;
         let dim_vec = dim / line;
@@ -1061,21 +1064,22 @@ mod tests {
         let target_node = 5u32;
 
         unsafe {
-            let _ = probe_query_distance::launch_unchecked::<f32, WgpuRuntime>(
+            probe_query_distance::launch_unchecked::<f32, WgpuRuntime>(
                 &client,
                 CubeCount::Static(1, 1, 1),
                 CubeDim::new_2d(WORKGROUP_SIZE_X, 1),
-                vectors_gpu.into_tensor_arg(line),
-                query_gpu.into_tensor_arg(line),
-                out_dist.clone().into_tensor_arg(1),
-                out_shared.clone().into_tensor_arg(1),
-                ScalarArg { elem: target_node },
+                line,
+                vectors_gpu.into_tensor_arg(),
+                query_gpu.into_tensor_arg(),
+                out_dist.clone().into_tensor_arg(),
+                out_shared.clone().into_tensor_arg(),
+                target_node,
                 true,
                 dim_vec,
             );
         }
 
-        let dist_result = out_dist.read(&client);
+        let dist_result = out_dist.read(&client).unwrap();
 
         let cpu_dot: f32 = (0..dim)
             .map(|j| query[j] * data[target_node as usize * dim + j])
@@ -1113,24 +1117,20 @@ mod tests {
         );
 
         unsafe {
-            let _ = probe_hash_table::launch_unchecked::<WgpuRuntime>(
+            probe_hash_table::launch_unchecked::<WgpuRuntime>(
                 &client,
                 CubeCount::Static(1, 1, 1),
                 CubeDim::new_2d(WORKGROUP_SIZE_X, 1),
-                insert_gpu.into_tensor_arg(1),
-                probe_gpu.into_tensor_arg(1),
-                results_gpu.clone().into_tensor_arg(1),
-                ScalarArg {
-                    elem: insert_ids.len() as u32,
-                },
-                ScalarArg {
-                    elem: probe_ids.len() as u32,
-                },
+                insert_gpu.into_tensor_arg(),
+                probe_gpu.into_tensor_arg(),
+                results_gpu.clone().into_tensor_arg(),
+                insert_ids.len() as u32,
+                probe_ids.len() as u32,
                 HASH_SIZE,
             );
         }
 
-        let results = results_gpu.read(&client);
+        let results = results_gpu.read(&client).unwrap();
         for (i, (&got, &exp)) in results.iter().zip(expected.iter()).enumerate() {
             assert_eq!(
                 got, exp,
@@ -1165,24 +1165,20 @@ mod tests {
         );
 
         unsafe {
-            let _ = probe_hash_table::launch_unchecked::<WgpuRuntime>(
+            probe_hash_table::launch_unchecked::<WgpuRuntime>(
                 &client,
                 CubeCount::Static(1, 1, 1),
                 CubeDim::new_2d(WORKGROUP_SIZE_X, 1),
-                insert_gpu.into_tensor_arg(1),
-                probe_gpu.into_tensor_arg(1),
-                results_gpu.clone().into_tensor_arg(1),
-                ScalarArg {
-                    elem: insert_ids.len() as u32,
-                },
-                ScalarArg {
-                    elem: probe_ids.len() as u32,
-                },
+                insert_gpu.into_tensor_arg(),
+                probe_gpu.into_tensor_arg(),
+                results_gpu.clone().into_tensor_arg(),
+                insert_ids.len() as u32,
+                probe_ids.len() as u32,
                 HASH_SIZE,
             );
         }
 
-        let results = results_gpu.read(&client);
+        let results = results_gpu.read(&client).unwrap();
         for (i, (&got, &exp)) in results.iter().zip(expected.iter()).enumerate() {
             assert_eq!(
                 got, exp,
@@ -1216,24 +1212,20 @@ mod tests {
         );
 
         unsafe {
-            let _ = probe_hash_table::launch_unchecked::<WgpuRuntime>(
+            probe_hash_table::launch_unchecked::<WgpuRuntime>(
                 &client,
                 CubeCount::Static(1, 1, 1),
                 CubeDim::new_2d(WORKGROUP_SIZE_X, 1),
-                insert_gpu.into_tensor_arg(1),
-                probe_gpu.into_tensor_arg(1),
-                results_gpu.clone().into_tensor_arg(1),
-                ScalarArg {
-                    elem: insert_ids.len() as u32,
-                },
-                ScalarArg {
-                    elem: probe_ids.len() as u32,
-                },
+                insert_gpu.into_tensor_arg(),
+                probe_gpu.into_tensor_arg(),
+                results_gpu.clone().into_tensor_arg(),
+                insert_ids.len() as u32,
+                probe_ids.len() as u32,
                 HASH_SIZE,
             );
         }
 
-        let results = results_gpu.read(&client);
+        let results = results_gpu.read(&client).unwrap();
         for (i, (&got, &exp)) in results.iter().zip(expected.iter()).enumerate() {
             assert_eq!(
                 got, exp,
@@ -1288,7 +1280,8 @@ mod tests {
             &CagraGpuSearchParams::default(),
             None,
             &client,
-        );
+        )
+        .unwrap();
 
         println!("Star graph results: {:?}", indices[0]);
         println!("Star graph dists:   {:?}", distances[0]);
@@ -1361,7 +1354,8 @@ mod tests {
             &CagraGpuSearchParams::default(),
             None,
             &client,
-        );
+        )
+        .unwrap();
 
         let gt = brute_force_knn(&queries, &data, n_queries, n, dim, k_out);
 

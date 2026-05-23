@@ -78,24 +78,25 @@ impl<R: Runtime> Benchmark for DistanceBench<R> {
     fn execute(&self, input: Self::Input) -> Result<Self::Output, String> {
         let nq = self.cfg.n_queries;
         let ndb = self.cfg.n_db;
-        let dim_lines = self.cfg.dim / LINE_SIZE as usize;
-        let vec_size = LINE_SIZE as usize;
+        let dim_lines = self.cfg.dim / LINE_SIZE;
+        let vec_size = LINE_SIZE;
 
         let grid_x = (ndb as u32).div_ceil(WORKGROUP_SIZE_X);
         let grid_y = (nq as u32).div_ceil(WORKGROUP_SIZE_Y);
 
         unsafe {
-            let _ = euclidean_tiled::launch_unchecked::<f32, R>(
+            euclidean_tiled::launch_unchecked::<f32, R>(
                 &self.client,
                 CubeCount::Static(grid_x, grid_y, 1),
                 CubeDim::new_2d(WORKGROUP_SIZE_X, WORKGROUP_SIZE_Y),
-                input.query_gpu.into_tensor_arg(vec_size),
-                input.db_gpu.into_tensor_arg(vec_size),
-                input.distances_gpu.into_tensor_arg(1),
-                ScalarArg { elem: 0u32 },
-                ScalarArg { elem: ndb as u32 },
-                ScalarArg { elem: nq as u32 },
-                ScalarArg { elem: ndb as u32 },
+                vec_size,
+                input.query_gpu.into_tensor_arg(),
+                input.db_gpu.into_tensor_arg(),
+                input.distances_gpu.into_tensor_arg(),
+                0u32,
+                ndb as u32,
+                nq as u32,
+                ndb as u32,
                 dim_lines,
             );
         }
@@ -160,12 +161,12 @@ impl<R: Runtime> Benchmark for TopkBench<R> {
         let init_gx = (k as u32).div_ceil(WORKGROUP_SIZE_X);
         let init_gy = (nq as u32).div_ceil(WORKGROUP_SIZE_Y);
         unsafe {
-            let _ = init_topk::launch_unchecked::<f32, R>(
+            init_topk::launch_unchecked::<f32, R>(
                 &self.client,
                 CubeCount::Static(init_gx, init_gy, 1),
                 CubeDim::new_2d(WORKGROUP_SIZE_X, WORKGROUP_SIZE_Y),
-                topk_dists.clone().into_tensor_arg(1),
-                topk_indices.clone().into_tensor_arg(1),
+                topk_dists.clone().into_tensor_arg(),
+                topk_indices.clone().into_tensor_arg(),
             );
         }
         future::block_on(self.client.sync()).expect("sync failed");
@@ -183,15 +184,15 @@ impl<R: Runtime> Benchmark for TopkBench<R> {
 
         let extract_grid = (nq as u32).div_ceil(WORKGROUP_SIZE_X);
         unsafe {
-            let _ = extract_topk::launch_unchecked::<f32, R>(
+            extract_topk::launch_unchecked::<f32, R>(
                 &self.client,
                 CubeCount::Static(extract_grid, 1, 1),
                 CubeDim::new_2d(WORKGROUP_SIZE_X, 1),
-                input.distances_gpu.into_tensor_arg(1),
-                input.topk_dists.into_tensor_arg(1),
-                input.topk_indices.into_tensor_arg(1),
-                ScalarArg { elem: 0u32 },
-                ScalarArg { elem: ndb as u32 },
+                input.distances_gpu.into_tensor_arg(),
+                input.topk_dists.into_tensor_arg(),
+                input.topk_indices.into_tensor_arg(),
+                0u32,
+                ndb as u32,
             );
         }
 
@@ -257,7 +258,8 @@ impl<R: Runtime> Benchmark for FullPipelineBench<R> {
             &Dist::SquaredEuclidean,
             self.device.clone(),
             false,
-        );
+        )
+        .unwrap();
 
         Ok(result)
     }
@@ -312,12 +314,12 @@ impl<R: Runtime> Benchmark for TopkCoalescedBench<R> {
         let init_gx = (k as u32).div_ceil(WORKGROUP_SIZE_X);
         let init_gy = (nq as u32).div_ceil(WORKGROUP_SIZE_Y);
         unsafe {
-            _ = init_topk::launch_unchecked::<f32, R>(
+            init_topk::launch_unchecked::<f32, R>(
                 &self.client,
                 CubeCount::Static(init_gx, init_gy, 1),
                 CubeDim::new_2d(WORKGROUP_SIZE_X, WORKGROUP_SIZE_Y),
-                topk_dists.clone().into_tensor_arg(1),
-                topk_indices.clone().into_tensor_arg(1),
+                topk_dists.clone().into_tensor_arg(),
+                topk_indices.clone().into_tensor_arg(),
             );
         }
         future::block_on(self.client.sync()).expect("sync failed");
@@ -336,17 +338,17 @@ impl<R: Runtime> Benchmark for TopkCoalescedBench<R> {
 
         let grid = nq as u32; // one workgroup per query
         unsafe {
-            _ = extract_topk_coalesced::launch_unchecked::<f32, R>(
+            extract_topk_coalesced::launch_unchecked::<f32, R>(
                 &self.client,
                 CubeCount::Static(grid, 1, 1),
                 CubeDim::new_2d(32, 1),
-                input.distances_gpu.into_tensor_arg(1),
-                input.topk_dists.into_tensor_arg(1),
-                input.topk_indices.into_tensor_arg(1),
-                ScalarArg { elem: 0u32 },
-                ScalarArg { elem: ndb as u32 },
-                ScalarArg { elem: ndb as u32 },
-                ScalarArg { elem: k as u32 },
+                input.distances_gpu.into_tensor_arg(),
+                input.topk_dists.into_tensor_arg(),
+                input.topk_indices.into_tensor_arg(),
+                0u32,
+                ndb as u32,
+                ndb as u32,
+                k as u32,
                 k,
             );
         }

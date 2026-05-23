@@ -2,8 +2,11 @@
 
 use cubecl::prelude::*;
 use cubecl::server::Handle;
-use cubecl::std::tensor::compact_strides;
+use cubecl::zspace::striding::row_major_contiguous_strides;
+use cubecl::zspace::{Shape, Strides};
 use std::marker::PhantomData;
+
+use crate::errors::AnnSearchErrors;
 
 ///////////////
 // GpuTensor //
@@ -49,7 +52,7 @@ impl<R: Runtime, F: Numeric + CubeElement> GpuTensor<R, F> {
     /// A new GpuTensor with data copied to GPU memory
     pub fn from_slice(data: &[F], shape: Vec<usize>, client: &ComputeClient<R>) -> Self {
         let handle = client.create_from_slice(F::as_bytes(data));
-        let strides = compact_strides(&shape);
+        let strides = row_major_contiguous_strides(&shape).to_vec();
         Self {
             data: handle,
             shape,
@@ -72,7 +75,7 @@ impl<R: Runtime, F: Numeric + CubeElement> GpuTensor<R, F> {
     pub fn empty(shape: Vec<usize>, client: &ComputeClient<R>) -> Self {
         let size = shape.iter().product::<usize>() * core::mem::size_of::<F>();
         let handle = client.empty(size);
-        let strides = compact_strides(&shape);
+        let strides = row_major_contiguous_strides(&shape).to_vec();
         Self {
             data: handle,
             shape,
@@ -84,15 +87,19 @@ impl<R: Runtime, F: Numeric + CubeElement> GpuTensor<R, F> {
 
     /// Convert to a TensorArg for kernel launches
     ///
-    /// ### Params
-    ///
-    /// * `line_size` - Vectorisation width (1 for scalar, 4 for `Line<F>`)
-    ///
     /// ### Returns
     ///
-    /// A TensorArg reference suitable for passing to CubeCL kernels
-    pub fn into_tensor_arg(&self, line_size: usize) -> TensorArg<'_, R> {
-        unsafe { TensorArg::from_raw_parts::<F>(&self.data, &self.strides, &self.shape, line_size) }
+    /// A TensorArg suitable for passing to CubeCL kernels. Vectorisation width
+    /// is no longer set per-tensor; it is passed once at launch as the argument
+    /// for the kernel's `N: Size` generic.
+    pub fn into_tensor_arg(&self) -> TensorArg<R> {
+        unsafe {
+            TensorArg::from_raw_parts(
+                self.data.clone(),
+                Strides::new(&self.strides),
+                Shape::from(self.shape.clone()),
+            )
+        }
     }
 
     /// Read tensor data back to CPU
@@ -106,9 +113,9 @@ impl<R: Runtime, F: Numeric + CubeElement> GpuTensor<R, F> {
     /// ### Returns
     ///
     /// Vector containing the tensor data
-    pub fn read(self, client: &ComputeClient<R>) -> Vec<F> {
-        let bytes = client.read_one(self.data);
-        F::from_bytes(&bytes).to_vec()
+    pub fn read(self, client: &ComputeClient<R>) -> Result<Vec<F>, AnnSearchErrors> {
+        let bytes = client.read_one(self.data)?;
+        Ok(F::from_bytes(&bytes).to_vec())
     }
 
     /// Returns the size in bytes on the GPU
@@ -140,7 +147,7 @@ mod tests {
         let shape = vec![2, 3];
 
         let tensor = GpuTensor::<CpuRuntime, f32>::from_slice(&data, shape, &client);
-        let result = tensor.read(&client);
+        let result = tensor.read(&client).unwrap();
 
         assert_eq!(result, data);
     }

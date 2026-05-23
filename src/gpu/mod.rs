@@ -27,7 +27,7 @@ pub const WORKGROUP_SIZE_X: u32 = 32;
 pub const WORKGROUP_SIZE_Y: u32 = 32;
 
 /// Line size for vectorisations in this crate
-pub const LINE_SIZE: u32 = 4;
+pub const LINE_SIZE: usize = 4;
 
 /////////////
 // Helpers //
