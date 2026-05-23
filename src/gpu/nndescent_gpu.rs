@@ -97,7 +97,7 @@ fn dist_sq_euclidean<F: Float + CubePrimitive, N: Size>(
     b: u32,
     #[comptime] dim_lines: usize,
 ) -> F {
-    let lanes = comptime!(N::value());
+    let lanes = LINE_SIZE;
     let off_a = a as usize * dim_lines;
     let off_b = b as usize * dim_lines;
     let mut sum = F::new(0.0);
@@ -138,7 +138,7 @@ fn dist_cosine<F: Float, N: Size>(
     b: u32,
     #[comptime] dim_lines: usize,
 ) -> F {
-    let lanes = comptime!(N::value());
+    let lanes = LINE_SIZE;
     let off_a = a as usize * dim_lines;
     let off_b = b as usize * dim_lines;
     let mut dot = F::new(0.0);
@@ -173,7 +173,7 @@ fn dist_cosine<F: Float, N: Size>(
 /// * `vectors` - Row-major vector matrix, line-vectorised along the feature
 ///   dimension
 /// * `norms` - Pre-computed L2 norms (ignored when `use_cosine` is false)
-/// * `n` - Number of vectors
+/// * `n_pts` - Number of vectors
 /// * `seed` - Random seed for neighbour generation
 /// * `use_cosine` - Whether to use cosine distance instead of squared Euclidean
 /// * `dim_lines` - Number of `Line<F>` elements per vector row (comptime)
@@ -192,13 +192,13 @@ fn init_random_graph<F: Float, N: Size>(
     norms: &Tensor<F>,
     graph_idx: &mut Tensor<u32>,
     graph_dist: &mut Tensor<F>,
-    n: u32,
+    n_pts: u32,
     seed: u32,
     #[comptime] use_cosine: bool,
     #[comptime] dim_lines: usize,
 ) {
     let node = (CUBE_POS_Y * CUBE_COUNT_X + CUBE_POS_X) * WORKGROUP_SIZE_X + UNIT_POS_X;
-    if node >= n {
+    if node >= n_pts {
         terminate!();
     }
 
@@ -210,9 +210,9 @@ fn init_random_graph<F: Float, N: Size>(
 
     for slot in 0..k {
         rng = xorshift(rng);
-        let mut pid = rng % n;
+        let mut pid = rng % n_pts;
         if pid == node {
-            pid = (pid + 1u32) % n;
+            pid = (pid + 1u32) % n_pts;
         }
 
         let dist = if use_cosine {
@@ -361,7 +361,7 @@ pub fn local_join_shared<F: Float, N: Size>(
     prop_idx: &mut Tensor<u32>,
     prop_dist: &mut Tensor<F>,
     prop_count: &Tensor<Atomic<u32>>,
-    n: u32,
+    n_pts: u32,
     rho_thresh: u32,
     iter_seed: u32,
     #[comptime] max_proposals: u32,
@@ -370,7 +370,7 @@ pub fn local_join_shared<F: Float, N: Size>(
     #[comptime] build_k: usize,
 ) {
     let node = CUBE_POS_Y * CUBE_COUNT_X + CUBE_POS_X;
-    if node >= n {
+    if node >= n_pts {
         terminate!();
     }
 
@@ -410,13 +410,7 @@ pub fn local_join_shared<F: Float, N: Size>(
 
         shared_pids[i_load as usize] = entry & pid_mask;
 
-        shared_is_new[i_load as usize] = if entry >= is_new_bit {
-            #[allow(clippy::useless_conversion)]
-            1u32.into()
-        } else {
-            #[allow(clippy::useless_conversion)]
-            0u32.into()
-        };
+        shared_is_new[i_load as usize] = if entry >= is_new_bit { 1u32 } else { 0u32 };
         i_load += WORKGROUP_SIZE_X;
     }
     sync_cube();
@@ -468,7 +462,7 @@ pub fn local_join_shared<F: Float, N: Size>(
         let lane = s_idx % 4usize;
         let pid = shared_pids[n_idx];
 
-        if pid < n {
+        if pid < n_pts {
             let vec_offset = pid as usize * dim_lines + line_idx;
             let line_val = vectors[vec_offset];
             shared_vecs[idx_load] = line_val[lane];
@@ -692,13 +686,13 @@ pub fn two_hop_refinement<F: Float, N: Size>(
     prop_idx: &mut Tensor<u32>,
     prop_dist: &mut Tensor<F>,
     prop_count: &Tensor<Atomic<u32>>,
-    n: u32,
+    n_pts: u32,
     #[comptime] max_proposals: u32,
     #[comptime] use_cosine: bool,
     #[comptime] dim_lines: usize,
 ) {
     let node = CUBE_POS_Y * CUBE_COUNT_X + CUBE_POS_X;
-    if node >= n {
+    if node >= n_pts {
         terminate!();
     }
 
@@ -738,11 +732,11 @@ pub fn two_hop_refinement<F: Float, N: Size>(
         let n1_raw = graph_idx[graph_base + n1_idx];
         let n1_pid = n1_raw & pid_mask;
 
-        if n1_pid < n {
+        if n1_pid < n_pts {
             let n2_raw = graph_idx[n1_pid as usize * k + n2_idx];
             let cand_pid = n2_raw & pid_mask;
 
-            if cand_pid < n && cand_pid != node {
+            if cand_pid < n_pts && cand_pid != node {
                 let mut is_dup: bool = false;
                 let mut scan_idx = 0usize;
                 while scan_idx < k {
@@ -1448,7 +1442,7 @@ where
         let medoid = compute_medoid(&vectors_flat, n, dim, metric);
 
         // pad dim to next multiple of LINE_SIZE
-        let line = LINE_SIZE as usize;
+        let line = LINE_SIZE;
         let dim_padded = dim.next_multiple_of(line);
         let dim_vec = dim_padded / line;
 
@@ -1528,7 +1522,7 @@ where
         }
 
         unsafe {
-            let _ = init_random_graph::launch_unchecked::<T, R>(
+            init_random_graph::launch_unchecked::<T, R>(
                 &client,
                 CubeCount::Static(grid_n_x, grid_n_y, 1),
                 CubeDim::new_2d(WORKGROUP_SIZE_X, 1),
@@ -1570,7 +1564,7 @@ where
         let mark_cubes_x = mark_grid_flat.min(65535);
         let mark_cubes_y = mark_grid_flat.div_ceil(mark_cubes_x);
         unsafe {
-            let _ = mark_all_new::launch_unchecked::<R>(
+            mark_all_new::launch_unchecked::<R>(
                 &client,
                 CubeCount::Static(mark_cubes_x, mark_cubes_y, 1),
                 CubeDim::new_2d(WORKGROUP_SIZE_X, 1),
@@ -1593,7 +1587,7 @@ where
 
             // 1. Reset proposal counts, reverse counts, and update counter
             unsafe {
-                let _ = reset_proposals::launch_unchecked::<R>(
+                reset_proposals::launch_unchecked::<R>(
                     &client,
                     CubeCount::Static(grid_n_x, grid_n_y, 1),
                     CubeDim::new_2d(WORKGROUP_SIZE_X, 1),
@@ -1602,7 +1596,7 @@ where
                     n as u32,
                 );
 
-                let _ = reset_proposals::launch_unchecked::<R>(
+                reset_proposals::launch_unchecked::<R>(
                     &client,
                     CubeCount::Static(grid_n_x, grid_n_y, 1),
                     CubeDim::new_2d(WORKGROUP_SIZE_X, 1),
@@ -1614,7 +1608,7 @@ where
 
             // 2. Build reverse edges
             unsafe {
-                let _ = build_reverse_candidates::launch_unchecked::<R>(
+                build_reverse_candidates::launch_unchecked::<R>(
                     &client,
                     CubeCount::Static(grid_n_x, grid_n_y, 1),
                     CubeDim::new_2d(WORKGROUP_SIZE_X, 1),
@@ -1630,7 +1624,7 @@ where
 
             // 3. Local join
             unsafe {
-                let _ = local_join_shared::launch_unchecked::<T, R>(
+                local_join_shared::launch_unchecked::<T, R>(
                     &client,
                     CubeCount::Static(cubes_x, cubes_y, 1),
                     CubeDim::new_2d(WORKGROUP_SIZE_X, 1),
@@ -1656,7 +1650,7 @@ where
 
             // 4. Merge proposals into the graph
             unsafe {
-                let _ = merge_proposals::launch_unchecked::<T, R>(
+                merge_proposals::launch_unchecked::<T, R>(
                     &client,
                     CubeCount::Static(grid_n_x, grid_n_y, 1),
                     CubeDim::new_2d(WORKGROUP_SIZE_X, 1),
@@ -1711,7 +1705,7 @@ where
 
         for sweep in 0..refine_knn {
             unsafe {
-                let _ = reset_proposals::launch_unchecked::<R>(
+                reset_proposals::launch_unchecked::<R>(
                     &client,
                     CubeCount::Static(grid_n_x, grid_n_y, 1),
                     CubeDim::new_2d(WORKGROUP_SIZE_X, 1),
@@ -1722,7 +1716,7 @@ where
             }
 
             unsafe {
-                let _ = two_hop_refinement::launch_unchecked::<T, R>(
+                two_hop_refinement::launch_unchecked::<T, R>(
                     &client,
                     CubeCount::Static(cubes_x, cubes_y, 1),
                     CubeDim::new_2d(WORKGROUP_SIZE_X, 1),
@@ -1742,7 +1736,7 @@ where
             }
 
             unsafe {
-                let _ = merge_proposals::launch_unchecked::<T, R>(
+                merge_proposals::launch_unchecked::<T, R>(
                     &client,
                     CubeCount::Static(grid_n_x, grid_n_y, 1),
                     CubeDim::new_2d(WORKGROUP_SIZE_X, 1),
@@ -1814,7 +1808,7 @@ where
         let cubes_y = (n as u32).div_ceil(cubes_x);
 
         unsafe {
-            let _ = cagra_rank_prune_shared::launch_unchecked::<R>(
+            cagra_rank_prune_shared::launch_unchecked::<R>(
                 &client,
                 CubeCount::Static(cubes_x, cubes_y, 1),
                 CubeDim::new_2d(WORKGROUP_SIZE_X, 1),
@@ -1825,7 +1819,7 @@ where
                 k,
             );
 
-            let _ = cagra_build_reverse::launch_unchecked::<R>(
+            cagra_build_reverse::launch_unchecked::<R>(
                 &client,
                 CubeCount::Static(grid_n_x, grid_n_y, 1),
                 CubeDim::new_2d(WORKGROUP_SIZE_X, 1),
@@ -1836,7 +1830,7 @@ where
                 k,
             );
 
-            let _ = cagra_merge_graphs::launch_unchecked::<R>(
+            cagra_merge_graphs::launch_unchecked::<R>(
                 &client,
                 CubeCount::Static(grid_n_x, grid_n_y, 1),
                 CubeDim::new_2d(WORKGROUP_SIZE_X, 1),
@@ -2509,7 +2503,7 @@ mod kernel_tests {
         };
 
         let client = WgpuRuntime::client(&device);
-        let line: usize = LINE_SIZE as usize;
+        let line: usize = LINE_SIZE;
 
         // 8 vectors of dim 32 -> dim_padded=32, dim_vec=8
         let n = 8usize;
@@ -2522,7 +2516,7 @@ mod kernel_tests {
         let out_gpu = GpuTensor::<WgpuRuntime, u32>::from_slice(&[0u32; 4], vec![4], &client);
 
         unsafe {
-            let _ = probe_stride::launch_unchecked::<f32, WgpuRuntime>(
+            probe_stride::launch_unchecked::<f32, WgpuRuntime>(
                 &client,
                 CubeCount::Static(1, 1, 1),
                 CubeDim::new_2d(1, 1),
@@ -2584,7 +2578,7 @@ mod kernel_tests {
         };
 
         let client = WgpuRuntime::client(&device);
-        let line: usize = LINE_SIZE as usize;
+        let line: usize = LINE_SIZE;
         let n = 4usize;
         let dim = 8usize; // 2 lines per row
         let dim_vec = dim / line;
@@ -2606,7 +2600,7 @@ mod kernel_tests {
                 GpuTensor::<WgpuRuntime, f32>::from_slice(&vec![-1.0f32; dim], vec![dim], &client);
 
             unsafe {
-                let _ = read_vector_via_stride::launch_unchecked::<f32, WgpuRuntime>(
+                read_vector_via_stride::launch_unchecked::<f32, WgpuRuntime>(
                     &client,
                     CubeCount::Static(1, 1, 1),
                     CubeDim::new_2d(1, 1),
@@ -2642,23 +2636,23 @@ mod kernel_tests {
         norms: &Tensor<F>,
         out_sq_euclid: &mut Tensor<F>,
         out_cosine: &mut Tensor<F>,
-        n: u32,
+        n_pts: u32,
         #[comptime] use_cosine: bool,
         #[comptime] dim_lines: usize,
     ) {
         let idx = ABSOLUTE_POS_X;
-        let n_pairs = n * (n - 1u32) / 2u32;
+        let n_pairs = n_pts * (n_pts - 1u32) / 2u32;
         if idx >= n_pairs {
             terminate!();
         }
 
         let mut rem = idx;
         let mut i = 0u32;
-        let mut step = n - 1u32;
+        let mut step = n_pts - 1u32;
         while rem >= step {
             rem -= step;
             i += 1u32;
-            step = n - 1u32 - i;
+            step = n_pts - 1u32 - i;
         }
         let j = i + 1u32 + rem;
 
@@ -2676,7 +2670,7 @@ mod kernel_tests {
         };
 
         let client = WgpuRuntime::client(&device);
-        let line: usize = LINE_SIZE as usize;
+        let line: usize = LINE_SIZE;
         let n = 4usize;
         let dim = 8usize;
         let dim_vec = dim / line;
@@ -2704,7 +2698,7 @@ mod kernel_tests {
         );
 
         unsafe {
-            let _ = compute_pairwise_dist::launch_unchecked::<f32, WgpuRuntime>(
+            compute_pairwise_dist::launch_unchecked::<f32, WgpuRuntime>(
                 &client,
                 CubeCount::Static(1, 1, 1),
                 CubeDim::new_2d(WORKGROUP_SIZE_X, 1),
@@ -2760,7 +2754,7 @@ mod kernel_tests {
         };
 
         let client = WgpuRuntime::client(&device);
-        let line: usize = LINE_SIZE as usize;
+        let line: usize = LINE_SIZE;
         let n = 4usize;
         let dim = 8usize;
         let dim_vec = dim / line;
@@ -2793,7 +2787,7 @@ mod kernel_tests {
         );
 
         unsafe {
-            let _ = compute_pairwise_dist::launch_unchecked::<f32, WgpuRuntime>(
+            compute_pairwise_dist::launch_unchecked::<f32, WgpuRuntime>(
                 &client,
                 CubeCount::Static(1, 1, 1),
                 CubeDim::new_2d(WORKGROUP_SIZE_X, 1),
@@ -2854,7 +2848,7 @@ mod kernel_tests {
         };
 
         let client = WgpuRuntime::client(&device);
-        let line: usize = LINE_SIZE as usize;
+        let line: usize = LINE_SIZE;
 
         let n = 8usize;
         let dim = 8usize;
@@ -2922,7 +2916,7 @@ mod kernel_tests {
         let rho_thresh = 65535u32; // rho=1.0, accept all pairs
 
         unsafe {
-            let _ = local_join_shared::launch_unchecked::<f32, WgpuRuntime>(
+            local_join_shared::launch_unchecked::<f32, WgpuRuntime>(
                 &client,
                 CubeCount::Static(n as u32, 1, 1),
                 CubeDim::new_2d(WORKGROUP_SIZE_X, 1),
@@ -3052,7 +3046,7 @@ mod kernel_tests {
         let grid_n = (n as u32).div_ceil(WORKGROUP_SIZE_X);
 
         unsafe {
-            let _ = merge_proposals::launch_unchecked::<f32, WgpuRuntime>(
+            merge_proposals::launch_unchecked::<f32, WgpuRuntime>(
                 &client,
                 CubeCount::Static(grid_n, 1, 1),
                 CubeDim::new_2d(WORKGROUP_SIZE_X, 1),
@@ -3166,7 +3160,7 @@ mod kernel_tests {
         let grid_n2 = (n2 as u32).div_ceil(WORKGROUP_SIZE_X);
 
         unsafe {
-            let _ = merge_proposals::launch_unchecked::<f32, WgpuRuntime>(
+            merge_proposals::launch_unchecked::<f32, WgpuRuntime>(
                 &client,
                 CubeCount::Static(grid_n2, 1, 1),
                 CubeDim::new_2d(WORKGROUP_SIZE_X, 1),
@@ -3299,7 +3293,7 @@ mod kernel_tests {
             return;
         };
         let client = WgpuRuntime::client(&device);
-        let line = LINE_SIZE as usize;
+        let line = LINE_SIZE;
         let n = 16usize;
         let dim = 32usize;
         let dim_vec = dim / line; // 8
@@ -3329,7 +3323,7 @@ mod kernel_tests {
         );
 
         unsafe {
-            let _ = compute_pairwise_dist::launch_unchecked::<f32, WgpuRuntime>(
+            compute_pairwise_dist::launch_unchecked::<f32, WgpuRuntime>(
                 &client,
                 CubeCount::Static(1, 1, 1),
                 CubeDim::new_2d(WORKGROUP_SIZE_X, 1),
@@ -3455,7 +3449,7 @@ mod kernel_tests {
         };
 
         let client = WgpuRuntime::client(&device);
-        let line = LINE_SIZE as usize;
+        let line = LINE_SIZE;
 
         // Production dimensions: dim=32 (dim_lines=8), build_k=30
         let n = 100usize;
@@ -3492,7 +3486,7 @@ mod kernel_tests {
         let pid_b = 1u32;
 
         unsafe {
-            let _ = debug_shared_mem_dist::launch_unchecked::<f32, WgpuRuntime>(
+            debug_shared_mem_dist::launch_unchecked::<f32, WgpuRuntime>(
                 &client,
                 CubeCount::Static(1, 1, 1),
                 CubeDim::new_2d(WORKGROUP_SIZE_X, 1),

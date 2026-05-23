@@ -7,9 +7,9 @@
 use cubecl::prelude::*;
 use std::iter::Sum;
 
-use crate::errors::AnnSearchErrors;
 use crate::gpu::tensor::*;
 use crate::gpu::*;
+use crate::prelude::KnnResult;
 use crate::utils::dist::Dist;
 
 /////////////
@@ -82,7 +82,7 @@ pub fn euclidean_tiled<F: Float, N: Size>(
     dist_stride: u32,
     #[comptime] dim_lines: usize,
 ) {
-    let lanes = comptime!(N::value());
+    let lanes = LINE_SIZE;
     let db_idx = ABSOLUTE_POS_X as usize;
     let query_idx =
         ((CUBE_POS_Z * CUBE_COUNT_Y + CUBE_POS_Y) * WORKGROUP_SIZE_Y + UNIT_POS_Y) as usize;
@@ -166,7 +166,7 @@ pub fn cosine_tiled<F: Float, N: Size>(
     dist_stride: u32,
     #[comptime] dim_lines: usize,
 ) {
-    let lanes = comptime!(N::value());
+    let lanes = LINE_SIZE;
     let db_idx = ABSOLUTE_POS_X as usize;
     let query_idx =
         ((CUBE_POS_Z * CUBE_COUNT_Y + CUBE_POS_Y) * WORKGROUP_SIZE_Y + UNIT_POS_Y) as usize;
@@ -516,13 +516,13 @@ pub fn query_batch_gpu<T, R>(
     metric: &Dist,
     device: R::Device,
     verbose: bool,
-) -> Result<(Vec<Vec<usize>>, Vec<Vec<T>>), AnnSearchErrors>
+) -> KnnResult<T>
 where
     R: Runtime,
     T: Float + Sum + cubecl::CubeElement + num_traits::Float + num_traits::FromPrimitive,
 {
     let client = R::client(&device);
-    let vec_size = LINE_SIZE as usize;
+    let vec_size = LINE_SIZE;
     let dim_lines = dim / vec_size;
 
     let n_query_chunks = query_data.n.div_ceil(QUERY_CHUNK_SIZE);
@@ -581,7 +581,7 @@ where
         let init_gx = (k as u32).div_ceil(WORKGROUP_SIZE_X);
         let (init_gy, init_gz) = grid_2d((n_q as u32).div_ceil(WORKGROUP_SIZE_Y));
         unsafe {
-            let _ = init_topk::launch_unchecked::<T, R>(
+            init_topk::launch_unchecked::<T, R>(
                 &client,
                 CubeCount::Static(init_gx, init_gy, init_gz),
                 CubeDim::new_2d(WORKGROUP_SIZE_X, WORKGROUP_SIZE_Y),
@@ -603,7 +603,7 @@ where
 
             match *metric {
                 Dist::SquaredEuclidean => unsafe {
-                    let _ = euclidean_tiled::launch_unchecked::<T, R>(
+                    euclidean_tiled::launch_unchecked::<T, R>(
                         &client,
                         CubeCount::Static(grid_x, grid_y, grid_z),
                         CubeDim::new_2d(WORKGROUP_SIZE_X, WORKGROUP_SIZE_Y),
@@ -619,7 +619,7 @@ where
                     );
                 },
                 Dist::Cosine => unsafe {
-                    let _ = cosine_tiled::launch_unchecked::<T, R>(
+                    cosine_tiled::launch_unchecked::<T, R>(
                         &client,
                         CubeCount::Static(grid_x, grid_y, grid_z),
                         CubeDim::new_2d(WORKGROUP_SIZE_X, WORKGROUP_SIZE_Y),
@@ -642,7 +642,7 @@ where
             // Extract directly into the running top-k buffer
             let (extract_grid_x, extract_grid_y) = grid_2d((n_q as u32).div_ceil(WORKGROUP_SIZE_X));
             unsafe {
-                let _ = extract_topk::launch_unchecked::<T, R>(
+                extract_topk::launch_unchecked::<T, R>(
                     &client,
                     CubeCount::Static(extract_grid_x, extract_grid_y, 1),
                     CubeDim::new_2d(WORKGROUP_SIZE_X, 1),
@@ -884,7 +884,7 @@ pub fn compute_ivf_mega_euclidean<F: Float, N: Size>(
     out_dists: &mut Tensor<F>,
     out_indices: &mut Tensor<u32>,
 ) {
-    let lanes = comptime!(N::value());
+    let lanes = LINE_SIZE;
     let local_db_idx = ABSOLUTE_POS_X;
     let task_idx = (CUBE_POS_Z * CUBE_COUNT_Y + CUBE_POS_Y) * WORKGROUP_SIZE_Y + UNIT_POS_Y;
 
@@ -963,7 +963,7 @@ pub fn compute_ivf_mega_cosine<F: Float, N: Size>(
     out_dists: &mut Tensor<F>,
     out_indices: &mut Tensor<u32>,
 ) {
-    let lanes = comptime!(N::value());
+    let lanes = LINE_SIZE;
     let local_db_idx = ABSOLUTE_POS_X;
     let task_idx = (CUBE_POS_Z * CUBE_COUNT_Y + CUBE_POS_Y) * WORKGROUP_SIZE_Y + UNIT_POS_Y;
 
@@ -1140,7 +1140,7 @@ pub fn compute_ivf_mega_euclidean_cached<F: Float, N: Size>(
     n_tasks: u32,
     #[comptime] dim_lines: usize,
 ) {
-    let lanes = comptime!(N::value());
+    let lanes = LINE_SIZE;
     let local_db_idx = ABSOLUTE_POS_X;
     let task_idx = (CUBE_POS_Z * CUBE_COUNT_Y + CUBE_POS_Y) * WORKGROUP_SIZE_Y + UNIT_POS_Y;
     let local_y = UNIT_POS_Y as usize;
@@ -1281,7 +1281,7 @@ pub fn compute_ivf_mega_cosine_cached<F: Float, N: Size>(
     n_tasks: u32,
     #[comptime] dim_lines: usize,
 ) {
-    let lanes = comptime!(N::value());
+    let lanes = LINE_SIZE;
     let local_db_idx = ABSOLUTE_POS_X;
     let task_idx = (CUBE_POS_Z * CUBE_COUNT_Y + CUBE_POS_Y) * WORKGROUP_SIZE_Y + UNIT_POS_Y;
     let local_y = UNIT_POS_Y as usize;
@@ -1824,7 +1824,7 @@ mod tests {
         let init_gx = (k as u32).div_ceil(WORKGROUP_SIZE_X);
         let (init_gy, init_gz) = grid_2d((n_queries as u32).div_ceil(WORKGROUP_SIZE_Y));
         unsafe {
-            let _ = init_topk::launch_unchecked::<f32, WgpuRuntime>(
+            init_topk::launch_unchecked::<f32, WgpuRuntime>(
                 &client,
                 CubeCount::Static(init_gx, init_gy, init_gz),
                 CubeDim::new_2d(WORKGROUP_SIZE_X, WORKGROUP_SIZE_Y),
@@ -1836,7 +1836,7 @@ mod tests {
         // serial reduce
         let (rgx, rgy) = grid_2d((n_queries as u32).div_ceil(WORKGROUP_SIZE_X));
         unsafe {
-            let _ = reduce_ivf_topk::launch_unchecked::<f32, WgpuRuntime>(
+            reduce_ivf_topk::launch_unchecked::<f32, WgpuRuntime>(
                 &client,
                 CubeCount::Static(rgx, rgy, 1),
                 CubeDim::new_2d(WORKGROUP_SIZE_X, 1),
@@ -1884,7 +1884,7 @@ mod tests {
 
         let (rgx, rgy) = grid_2d(n_queries as u32);
         unsafe {
-            let _ = reduce_ivf_topk_coalesced::launch_unchecked::<f32, WgpuRuntime>(
+            reduce_ivf_topk_coalesced::launch_unchecked::<f32, WgpuRuntime>(
                 &client,
                 CubeCount::Static(rgx, rgy, 1),
                 CubeDim::new_2d(WORKGROUP_SIZE_X, 1),
@@ -2192,7 +2192,7 @@ mod tests {
         use_cached: bool,
     ) -> (Vec<f32>, Vec<u32>) {
         let client = WgpuRuntime::client(device);
-        let vec_size = LINE_SIZE as usize;
+        let vec_size = LINE_SIZE;
         let dim_lines = dim / vec_size;
         let n_tasks = tasks.len();
         let q_gpu =
@@ -2213,7 +2213,7 @@ mod tests {
         let (gy, gz) = grid_2d((n_tasks as u32).div_ceil(WORKGROUP_SIZE_Y));
         if use_cached {
             unsafe {
-                let _ = compute_ivf_mega_euclidean_cached::launch_unchecked::<f32, WgpuRuntime>(
+                compute_ivf_mega_euclidean_cached::launch_unchecked::<f32, WgpuRuntime>(
                     &client,
                     CubeCount::Static(gx, gy, gz),
                     CubeDim::new_2d(WORKGROUP_SIZE_X, WORKGROUP_SIZE_Y),
@@ -2232,7 +2232,7 @@ mod tests {
             }
         } else {
             unsafe {
-                let _ = compute_ivf_mega_euclidean::launch_unchecked::<f32, WgpuRuntime>(
+                compute_ivf_mega_euclidean::launch_unchecked::<f32, WgpuRuntime>(
                     &client,
                     CubeCount::Static(gx, gy, gz),
                     CubeDim::new_2d(WORKGROUP_SIZE_X, WORKGROUP_SIZE_Y),

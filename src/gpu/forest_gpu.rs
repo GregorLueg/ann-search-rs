@@ -93,7 +93,7 @@ fn compute_dot_products<F: AnnSearchGpuFloat, N: Size>(
     if idx >= n_pts {
         terminate!();
     }
-    let lanes = comptime!(N::value());
+    let lanes = LINE_SIZE;
     let off = idx as usize * dim_lines;
     let mut sum = F::new(0.0);
     for i in 0..dim_lines {
@@ -159,7 +159,7 @@ fn partition_points<F: AnnSearchGpuFloat>(
 ///
 /// Maximum number of points per leaf, clamped to `[2, 64]`
 fn compute_max_leaf_size(dim_padded: usize) -> usize {
-    let line = LINE_SIZE as usize;
+    let line = LINE_SIZE;
     let dim_scalars = (dim_padded / line) * 4;
     let per_point = dim_scalars * std::mem::size_of::<f32>() + 4 + 4;
     let overhead = 8; // shared_leaf_start + shared_leaf_size
@@ -620,7 +620,7 @@ where
     R: Runtime,
     T: AnnSearchFloat + AnnSearchGpuFloat,
 {
-    let line = LINE_SIZE as usize;
+    let line = LINE_SIZE;
     let dim_vec = dim_padded / line;
     let (grid_n_x, grid_n_y) = grid_2d((n as u32).div_ceil(WORKGROUP_SIZE_X));
 
@@ -697,7 +697,7 @@ where
                     GpuTensor::<R, T>::from_slice(&random_vec_padded, vec![dim_padded], client);
                 // GPU dot products (2.8M threads, ~2ms per launch)
                 unsafe {
-                    let _ = compute_dot_products::launch_unchecked::<T, R>(
+                    compute_dot_products::launch_unchecked::<T, R>(
                         client,
                         CubeCount::Static(dot_grid_x, dot_grid_y, 1),
                         CubeDim::new_2d(WORKGROUP_SIZE_X, 1),
@@ -817,7 +817,7 @@ where
         );
 
         unsafe {
-            let _ = reset_proposals::launch_unchecked::<R>(
+            reset_proposals::launch_unchecked::<R>(
                 client,
                 CubeCount::Static(grid_n_x, grid_n_y, 1),
                 CubeDim::new_2d(WORKGROUP_SIZE_X, 1),
@@ -831,7 +831,7 @@ where
         let cubes_y = (batch_leaves as u32).div_ceil(cubes_x);
 
         unsafe {
-            let _ = leaf_pairwise_proposals::launch_unchecked::<T, R>(
+            leaf_pairwise_proposals::launch_unchecked::<T, R>(
                 client,
                 CubeCount::Static(cubes_x, cubes_y, 1),
                 CubeDim::new_2d(WORKGROUP_SIZE_X, 1),
@@ -854,7 +854,7 @@ where
         }
 
         unsafe {
-            let _ = merge_proposals::launch_unchecked::<T, R>(
+            merge_proposals::launch_unchecked::<T, R>(
                 client,
                 CubeCount::Static(grid_n_x, grid_n_y, 1),
                 CubeDim::new_2d(WORKGROUP_SIZE_X, 1),
@@ -915,7 +915,7 @@ mod tests {
             return;
         };
         let client = WgpuRuntime::client(&device);
-        let line = LINE_SIZE as usize;
+        let line = LINE_SIZE;
         let n = 4usize;
         let dim = 4usize;
         let dim_vec = dim / line;
@@ -931,7 +931,7 @@ mod tests {
 
         let grid = (n as u32).div_ceil(WORKGROUP_SIZE_X);
         unsafe {
-            let _ = compute_dot_products::launch_unchecked::<f32, WgpuRuntime>(
+            compute_dot_products::launch_unchecked::<f32, WgpuRuntime>(
                 &client,
                 CubeCount::Static(grid, 1, 1),
                 CubeDim::new_2d(WORKGROUP_SIZE_X, 1),
@@ -961,7 +961,7 @@ mod tests {
             return;
         };
         let client = WgpuRuntime::client(&device);
-        let line = LINE_SIZE as usize;
+        let line = LINE_SIZE;
         let n = 16usize;
         let dim = 32usize;
         let dim_vec = dim / line;
@@ -975,7 +975,7 @@ mod tests {
 
         let grid = (n as u32).div_ceil(WORKGROUP_SIZE_X);
         unsafe {
-            let _ = compute_dot_products::launch_unchecked::<f32, WgpuRuntime>(
+            compute_dot_products::launch_unchecked::<f32, WgpuRuntime>(
                 &client,
                 CubeCount::Static(grid, 1, 1),
                 CubeDim::new_2d(WORKGROUP_SIZE_X, 1),
@@ -1018,7 +1018,7 @@ mod tests {
 
         let grid = (n as u32).div_ceil(WORKGROUP_SIZE_X);
         unsafe {
-            let _ = partition_points::launch_unchecked::<f32, WgpuRuntime>(
+            partition_points::launch_unchecked::<f32, WgpuRuntime>(
                 &client,
                 CubeCount::Static(grid, 1, 1),
                 CubeDim::new_2d(WORKGROUP_SIZE_X, 1),
@@ -1046,7 +1046,7 @@ mod tests {
         };
         let client = WgpuRuntime::client(&device);
         let n = 16usize;
-        let line = LINE_SIZE as usize;
+        let line = LINE_SIZE;
         let dim = 4usize;
         let dim_vec = dim / line;
 
@@ -1063,7 +1063,7 @@ mod tests {
             let rvec_gpu = GpuTensor::<WgpuRuntime, f32>::from_slice(&rvec, vec![dim], &client);
 
             unsafe {
-                let _ = compute_dot_products::launch_unchecked::<f32, WgpuRuntime>(
+                compute_dot_products::launch_unchecked::<f32, WgpuRuntime>(
                     &client,
                     CubeCount::Static(grid, 1, 1),
                     CubeDim::new_2d(WORKGROUP_SIZE_X, 1),
@@ -1083,7 +1083,7 @@ mod tests {
                 GpuTensor::<WgpuRuntime, f32>::from_slice(&medians, vec![n_partitions], &client);
 
             unsafe {
-                let _ = partition_points::launch_unchecked::<f32, WgpuRuntime>(
+                partition_points::launch_unchecked::<f32, WgpuRuntime>(
                     &client,
                     CubeCount::Static(grid, 1, 1),
                     CubeDim::new_2d(WORKGROUP_SIZE_X, 1),
@@ -1193,7 +1193,7 @@ mod tests {
             return;
         };
         let client = WgpuRuntime::client(&device);
-        let line = LINE_SIZE as usize;
+        let line = LINE_SIZE;
         let n = 8usize;
         let dim = 8usize;
         let dim_vec = dim / line;
@@ -1218,7 +1218,7 @@ mod tests {
         );
 
         unsafe {
-            let _ = debug_leaf_shared_roundtrip::launch_unchecked::<f32, WgpuRuntime>(
+            debug_leaf_shared_roundtrip::launch_unchecked::<f32, WgpuRuntime>(
                 &client,
                 CubeCount::Static(1, 1, 1),
                 CubeDim::new_2d(WORKGROUP_SIZE_X, 1),
@@ -1253,7 +1253,7 @@ mod tests {
             return;
         };
         let client = WgpuRuntime::client(&device);
-        let line = LINE_SIZE as usize;
+        let line = LINE_SIZE;
         let n = 64usize;
         let dim = 32usize;
         let dim_vec = dim / line;
@@ -1278,7 +1278,7 @@ mod tests {
         );
 
         unsafe {
-            let _ = debug_leaf_shared_roundtrip::launch_unchecked::<f32, WgpuRuntime>(
+            debug_leaf_shared_roundtrip::launch_unchecked::<f32, WgpuRuntime>(
                 &client,
                 CubeCount::Static(1, 1, 1),
                 CubeDim::new_2d(WORKGROUP_SIZE_X, 1),
@@ -1313,7 +1313,7 @@ mod tests {
             return;
         };
         let client = WgpuRuntime::client(&device);
-        let line = LINE_SIZE as usize;
+        let line = LINE_SIZE;
         let n = 4usize;
         let dim = 4usize;
         let dim_vec = dim / line;
@@ -1338,7 +1338,7 @@ mod tests {
             GpuTensor::<WgpuRuntime, u32>::from_slice(&vec![0u32; n], vec![n], &client);
 
         unsafe {
-            let _ = leaf_pairwise_proposals::launch_unchecked::<f32, WgpuRuntime>(
+            leaf_pairwise_proposals::launch_unchecked::<f32, WgpuRuntime>(
                 &client,
                 CubeCount::Static(1, 1, 1),
                 CubeDim::new_2d(WORKGROUP_SIZE_X, 1),
@@ -1397,7 +1397,7 @@ mod tests {
             return;
         };
         let client = WgpuRuntime::client(&device);
-        let line = LINE_SIZE as usize;
+        let line = LINE_SIZE;
         let n = 4usize;
         let dim = 4usize;
         let dim_vec = dim / line;
@@ -1431,7 +1431,7 @@ mod tests {
             GpuTensor::<WgpuRuntime, u32>::from_slice(&vec![0u32; n], vec![n], &client);
 
         unsafe {
-            let _ = leaf_pairwise_proposals::launch_unchecked::<f32, WgpuRuntime>(
+            leaf_pairwise_proposals::launch_unchecked::<f32, WgpuRuntime>(
                 &client,
                 CubeCount::Static(1, 1, 1),
                 CubeDim::new_2d(WORKGROUP_SIZE_X, 1),
@@ -1489,7 +1489,7 @@ mod tests {
             return;
         };
         let client = WgpuRuntime::client(&device);
-        let line = LINE_SIZE as usize;
+        let line = LINE_SIZE;
         let n = 32usize;
         let dim = 32usize;
         let dim_vec = dim / line;
@@ -1514,7 +1514,7 @@ mod tests {
             GpuTensor::<WgpuRuntime, u32>::from_slice(&vec![0u32; n], vec![n], &client);
 
         unsafe {
-            let _ = leaf_pairwise_proposals::launch_unchecked::<f32, WgpuRuntime>(
+            leaf_pairwise_proposals::launch_unchecked::<f32, WgpuRuntime>(
                 &client,
                 CubeCount::Static(1, 1, 1),
                 CubeDim::new_2d(WORKGROUP_SIZE_X, 1),
@@ -1602,7 +1602,7 @@ mod tests {
         let update_counter_gpu =
             GpuTensor::<WgpuRuntime, u32>::from_slice(&[0u32], vec![1], &client);
 
-        gpu_forest_init(
+        let _ = gpu_forest_init(
             &vectors_gpu,
             &norms_gpu,
             &graph_idx_gpu,
@@ -1693,7 +1693,7 @@ mod tests {
         let gpu = GpuTensor::<WgpuRuntime, u32>::from_slice(&data, vec![4], &client);
 
         unsafe {
-            let _ = mark_all_new::launch_unchecked::<WgpuRuntime>(
+            mark_all_new::launch_unchecked::<WgpuRuntime>(
                 &client,
                 CubeCount::Static(1, 1, 1),
                 CubeDim::new_2d(WORKGROUP_SIZE_X, 1),
@@ -1722,7 +1722,7 @@ mod tests {
             return;
         };
         let client = WgpuRuntime::client(&device);
-        let line = LINE_SIZE as usize;
+        let line = LINE_SIZE;
         let n = 64usize;
         let dim = 8usize;
         let dim_vec = dim / line;
@@ -1746,7 +1746,7 @@ mod tests {
             let rvec_gpu = GpuTensor::<WgpuRuntime, f32>::from_slice(&rvec, vec![dim], &client);
 
             unsafe {
-                let _ = compute_dot_products::launch_unchecked::<f32, WgpuRuntime>(
+                compute_dot_products::launch_unchecked::<f32, WgpuRuntime>(
                     &client,
                     CubeCount::Static(grid, 1, 1),
                     CubeDim::new_2d(WORKGROUP_SIZE_X, 1),
@@ -1766,7 +1766,7 @@ mod tests {
                 GpuTensor::<WgpuRuntime, f32>::from_slice(&medians, vec![n_partitions], &client);
 
             unsafe {
-                let _ = partition_points::launch_unchecked::<f32, WgpuRuntime>(
+                partition_points::launch_unchecked::<f32, WgpuRuntime>(
                     &client,
                     CubeCount::Static(grid, 1, 1),
                     CubeDim::new_2d(WORKGROUP_SIZE_X, 1),

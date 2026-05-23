@@ -406,7 +406,7 @@ pub fn cagra_beam_search<F: Float, N: Size>(
         terminate!();
     }
 
-    let lanes = comptime!(N::value());
+    let lanes = LINE_SIZE;
     let tx = UNIT_POS_X;
     let dim_scalars = dim_lines * lanes;
     let hash_mask = hash_size as u32 - 1u32;
@@ -836,7 +836,7 @@ where
     R: Runtime,
     T: AnnSearchGpuFloat + num_traits::Float,
 {
-    let line = LINE_SIZE as usize;
+    let line = LINE_SIZE;
     let dim_padded = dim.next_multiple_of(line);
     let dim_vec = dim_padded / line;
 
@@ -883,7 +883,7 @@ where
     let cubes_y = (n_queries as u32).div_ceil(cubes_x);
 
     unsafe {
-        let _ = cagra_beam_search::launch_unchecked::<T, R>(
+        cagra_beam_search::launch_unchecked::<T, R>(
             client,
             CubeCount::Static(cubes_x, cubes_y, 1),
             CubeDim::new_2d(WORKGROUP_SIZE_X, 1),
@@ -966,7 +966,7 @@ mod tests {
         };
 
         let client = WgpuRuntime::client(&device);
-        let line = LINE_SIZE as usize;
+        let line = LINE_SIZE;
         let n = 50usize;
         let dim = 32usize;
         let dim_vec = dim / line;
@@ -989,7 +989,7 @@ mod tests {
         let target_node = 3u32;
 
         unsafe {
-            let _ = probe_query_distance::launch_unchecked::<f32, WgpuRuntime>(
+            probe_query_distance::launch_unchecked::<f32, WgpuRuntime>(
                 &client,
                 CubeCount::Static(1, 1, 1),
                 CubeDim::new_2d(WORKGROUP_SIZE_X, 1),
@@ -1041,7 +1041,7 @@ mod tests {
         };
 
         let client = WgpuRuntime::client(&device);
-        let line = LINE_SIZE as usize;
+        let line = LINE_SIZE;
         let n = 50usize;
         let dim = 32usize;
         let dim_vec = dim / line;
@@ -1064,7 +1064,7 @@ mod tests {
         let target_node = 5u32;
 
         unsafe {
-            let _ = probe_query_distance::launch_unchecked::<f32, WgpuRuntime>(
+            probe_query_distance::launch_unchecked::<f32, WgpuRuntime>(
                 &client,
                 CubeCount::Static(1, 1, 1),
                 CubeDim::new_2d(WORKGROUP_SIZE_X, 1),
@@ -1117,7 +1117,7 @@ mod tests {
         );
 
         unsafe {
-            let _ = probe_hash_table::launch_unchecked::<WgpuRuntime>(
+            probe_hash_table::launch_unchecked::<WgpuRuntime>(
                 &client,
                 CubeCount::Static(1, 1, 1),
                 CubeDim::new_2d(WORKGROUP_SIZE_X, 1),
@@ -1165,7 +1165,7 @@ mod tests {
         );
 
         unsafe {
-            let _ = probe_hash_table::launch_unchecked::<WgpuRuntime>(
+            probe_hash_table::launch_unchecked::<WgpuRuntime>(
                 &client,
                 CubeCount::Static(1, 1, 1),
                 CubeDim::new_2d(WORKGROUP_SIZE_X, 1),
@@ -1212,7 +1212,7 @@ mod tests {
         );
 
         unsafe {
-            let _ = probe_hash_table::launch_unchecked::<WgpuRuntime>(
+            probe_hash_table::launch_unchecked::<WgpuRuntime>(
                 &client,
                 CubeCount::Static(1, 1, 1),
                 CubeDim::new_2d(WORKGROUP_SIZE_X, 1),

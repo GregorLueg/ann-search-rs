@@ -688,7 +688,7 @@ where
         alpha: f32,
         max_degree: usize,
     ) -> Vec<u32> {
-        candidates.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+        candidates.sort_unstable_by_key(|a| a.0);
 
         let mut selected = Vec::with_capacity(max_degree);
         let alpha_t = T::from_f32(alpha).unwrap();

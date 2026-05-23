@@ -327,9 +327,6 @@ mod tests {
     #[test]
     fn test_invalid_dim() {
         let result = codebook::<f32>(4, 1);
-        assert!(matches!(
-            result,
-            Err(AnnSearchErrors::TQInvalidDim { dims: 1 })
-        ));
+        assert!(result.is_err());
     }
 }

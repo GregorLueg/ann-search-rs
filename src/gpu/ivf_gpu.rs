@@ -132,7 +132,7 @@ where
 
         let nlist = nlist.unwrap_or((n as f32).sqrt() as usize).max(1);
 
-        let line = LINE_SIZE as usize;
+        let line = LINE_SIZE;
         let dim_padded = dim.next_multiple_of(line);
 
         let n_train = (256 * nlist).min(250_000).min(n).max(1);
@@ -502,8 +502,8 @@ where
         k: usize,
         nprobe: usize,
         client: &ComputeClient<R>,
-    ) -> Result<(Vec<Vec<usize>>, Vec<Vec<T>>), AnnSearchErrors> {
-        let vec_size = LINE_SIZE as usize;
+    ) -> KnnResult<T> {
+        let vec_size = LINE_SIZE;
         let dim_lines = self.dim_padded / vec_size;
 
         let query_norms = if self.metric == Dist::Cosine {
@@ -537,7 +537,7 @@ where
 
         match self.metric {
             Dist::SquaredEuclidean => unsafe {
-                let _ = euclidean_tiled::launch_unchecked::<T, R>(
+                euclidean_tiled::launch_unchecked::<T, R>(
                     client,
                     CubeCount::Static(grid_x, grid_y, grid_z),
                     CubeDim::new_2d(WORKGROUP_SIZE_X, WORKGROUP_SIZE_Y),
@@ -553,7 +553,7 @@ where
                 );
             },
             Dist::Cosine => unsafe {
-                let _ = cosine_tiled::launch_unchecked::<T, R>(
+                cosine_tiled::launch_unchecked::<T, R>(
                     client,
                     CubeCount::Static(grid_x, grid_y, grid_z),
                     CubeDim::new_2d(WORKGROUP_SIZE_X, WORKGROUP_SIZE_Y),
@@ -662,7 +662,7 @@ where
 
         match self.metric {
             Dist::SquaredEuclidean => unsafe {
-                let _ = compute_ivf_mega_euclidean_cached::launch_unchecked::<T, R>(
+                compute_ivf_mega_euclidean_cached::launch_unchecked::<T, R>(
                     client,
                     CubeCount::Static(mega_grid_x, mega_grid_y, mega_grid_z),
                     CubeDim::new_2d(WORKGROUP_SIZE_X, WORKGROUP_SIZE_Y),
@@ -680,7 +680,7 @@ where
                 );
             },
             Dist::Cosine => unsafe {
-                let _ = compute_ivf_mega_cosine_cached::launch_unchecked::<T, R>(
+                compute_ivf_mega_cosine_cached::launch_unchecked::<T, R>(
                     client,
                     CubeCount::Static(mega_grid_x, mega_grid_y, mega_grid_z),
                     CubeDim::new_2d(WORKGROUP_SIZE_X, WORKGROUP_SIZE_Y),
@@ -708,7 +708,7 @@ where
         let cpq = GpuTensor::<R, u32>::from_slice(&cpu_write_pointers, vec![n_queries], client);
         let (coal_gx, coal_gy) = grid_2d(n_queries as u32);
         unsafe {
-            let _ = reduce_ivf_topk_coalesced::launch_unchecked::<T, R>(
+            reduce_ivf_topk_coalesced::launch_unchecked::<T, R>(
                 client,
                 CubeCount::Static(coal_gx, coal_gy, 1),
                 CubeDim::new_2d(WORKGROUP_SIZE_X, 1),

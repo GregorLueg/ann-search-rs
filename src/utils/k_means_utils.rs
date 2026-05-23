@@ -1585,7 +1585,7 @@ fn simd_reassign_dirty<T>(
         })
         .collect();
 
-    for (&i, (best_c, best_dist, second_dist)) in dirty.iter().zip(updates.into_iter()) {
+    for (&i, (best_c, best_dist, second_dist)) in dirty.iter().zip(updates) {
         assignments[i] = best_c;
         upper_bounds[i] = best_dist;
         lower_bounds[i] = second_dist;

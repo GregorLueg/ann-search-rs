@@ -77,7 +77,7 @@ where
 
         let (vectors_flat, n, dim) = matrix_to_flat(data);
 
-        let line = LINE_SIZE as usize;
+        let line = LINE_SIZE;
         let dim_padded = dim.next_multiple_of(line);
 
         let vectors_padded = if dim_padded != dim {
@@ -177,12 +177,7 @@ where
     ///
     /// Tuple of `(knn_indices, optional distances)` where each row corresponds
     /// to a vector in the index
-    pub fn generate_knn(
-        &self,
-        k: usize,
-        return_dist: bool,
-        verbose: bool,
-    ) -> Result<(Vec<Vec<usize>>, Option<Vec<Vec<T>>>), AnnSearchErrors> {
+    pub fn generate_knn(&self, k: usize, return_dist: bool, verbose: bool) -> KnnOptionResult<T> {
         let query_data = BatchData::new(&self.vectors_flat, &self.norms, self.n);
         let db_data = BatchData::new(&self.vectors_flat, &self.norms, self.n);
 

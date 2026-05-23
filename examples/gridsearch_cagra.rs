@@ -187,7 +187,7 @@ fn main() {
     println!("Self-querying CAGRA (auto params)...");
     let start = Instant::now();
     let (cagra_self_neighbors, cagra_self_distances) =
-        query_nndescent_index_gpu_self(&mut gpu_nndescent_idx, cli.k, None, true);
+        query_nndescent_index_gpu_self(&mut gpu_nndescent_idx, cli.k, None, true).unwrap();
     let cagra_self = start.elapsed().as_secs_f64() * 1000.0;
 
     let recall_self = calculate_recall(&true_neighbors_self, &cagra_self_neighbors, cli.k);
@@ -254,7 +254,8 @@ fn main() {
         println!("Self-querying CAGRA (beam_width={})...", bw);
         let start = Instant::now();
         let (cagra_self_neighbors, cagra_self_distances) =
-            query_nndescent_index_gpu_self(&mut gpu_nndescent_idx, cli.k, Some(params), true);
+            query_nndescent_index_gpu_self(&mut gpu_nndescent_idx, cli.k, Some(params), true)
+                .unwrap();
         let cagra_self = start.elapsed().as_secs_f64() * 1000.0;
 
         let recall_self = calculate_recall(&true_neighbors_self, &cagra_self_neighbors, cli.k);

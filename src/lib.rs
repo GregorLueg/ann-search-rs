@@ -2466,18 +2466,18 @@ pub fn query_nndescent_index_gpu_self<T, R>(
     k: usize,
     query_params: Option<CagraGpuSearchParams>,
     return_dist: bool,
-) -> (Vec<Vec<usize>>, Option<Vec<Vec<T>>>)
+) -> KnnOptionResult<T>
 where
     R: Runtime,
     T: AnnSearchFloat + AnnSearchGpuFloat,
     NNDescentGpu<T, R>: NNDescentQuery<T>,
 {
-    let (indices, distances) = index.self_query_gpu(k, query_params, 42);
+    let (indices, distances) = index.self_query_gpu(k, query_params, 42)?;
 
     if return_dist {
-        (indices, Some(distances))
+        Ok((indices, Some(distances)))
     } else {
-        (indices, None)
+        Ok((indices, None))
     }
 }
 
