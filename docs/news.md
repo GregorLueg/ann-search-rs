@@ -2,6 +2,13 @@
 
 ## 0.3.1
 
+**Features**
+
+- Version bump on cubecl to `"0.10.0"`.
+- TurboQuantisation
+
+## 0.3.1
+
 **Fix**
 
 - The GPU indices would throw errors due to a bug with the wrong dimensionality
