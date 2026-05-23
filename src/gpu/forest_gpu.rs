@@ -1,9 +1,9 @@
 //! GPU-accelerated random partition forest for kNN graph initialisation.
 //!
-//! Replaces the CPU Annoy forest for populating the initial kNN graph.
-//! Builds multiple random projection trees on GPU, computes intra-leaf
-//! pairwise distances, and merges results via the existing proposal
-//! infrastructure from nndescent_gpu.
+//! Replaces the CPU Annoy forest for populating the initial kNN graph. Builds
+//! multiple random projection trees on GPU, computes intra-leaf pairwise
+//! distances, and merges results via the existing proposal infrastructure from
+//! nndescent_gpu.
 
 #![allow(missing_docs)]
 
@@ -219,7 +219,8 @@ pub fn leaf_pairwise_proposals<F: AnnSearchGpuFloat, N: Size>(
     }
 
     let tx = UNIT_POS_X;
-    let dim_scalars = dim_lines * 4usize;
+    let lanes = LINE_SIZE;
+    let dim_scalars = dim_lines * lanes;
 
     let mut shared_leaf_start = SharedMemory::<u32>::new(1usize);
     let mut shared_leaf_size = SharedMemory::<u32>::new(1usize);
@@ -1164,8 +1165,8 @@ mod tests {
         while idx_load < total_scalars {
             let n_idx = idx_load / dim_scalars;
             let s_idx = idx_load % dim_scalars;
-            let line_idx = s_idx / 4usize;
-            let lane = s_idx % 4usize;
+            let line_idx = s_idx / lanes;
+            let lane = s_idx % lanes;
             let pid = shared_pids[n_idx];
 
             if pid < n_pts {
@@ -1402,7 +1403,6 @@ mod tests {
         let dim = 4usize;
         let dim_vec = dim / line;
         let build_k = 3usize;
-
         let data: Vec<f32> = vec![
             1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 1.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0,
         ];
@@ -1418,7 +1418,6 @@ mod tests {
         let leaf_points: Vec<u32> = vec![0, 1, 2, 3];
         let leaf_offsets: Vec<u32> = vec![0, 4];
         let graph_dist = vec![f32::MAX; n * build_k];
-
         let vectors_gpu = GpuTensor::<WgpuRuntime, f32>::from_slice(&data, vec![n, dim], &client);
         let norms_gpu = GpuTensor::<WgpuRuntime, f32>::from_slice(&norms, vec![n], &client);
         let lp_gpu = GpuTensor::<WgpuRuntime, u32>::from_slice(&leaf_points, vec![4], &client);
@@ -1429,6 +1428,10 @@ mod tests {
         let prop_dist_gpu = GpuTensor::<WgpuRuntime, f32>::empty(vec![n, MAX_PROPOSALS], &client);
         let prop_count_gpu =
             GpuTensor::<WgpuRuntime, u32>::from_slice(&vec![0u32; n], vec![n], &client);
+
+        eprintln!(
+                "config: dim={dim} line={line} dim_vec={dim_vec} MAX_LEAF_SIZE={MAX_LEAF_SIZE} MAX_PROPOSALS={MAX_PROPOSALS}"
+            );
 
         unsafe {
             leaf_pairwise_proposals::launch_unchecked::<f32, WgpuRuntime>(
@@ -1452,7 +1455,6 @@ mod tests {
                 MAX_LEAF_SIZE,
             );
         }
-
         let p_idx = prop_idx_gpu.read(&client).unwrap();
         let p_dist = prop_dist_gpu.read(&client).unwrap();
         let p_count = prop_count_gpu.read(&client).unwrap();
@@ -1461,6 +1463,7 @@ mod tests {
         let mut any_mismatch = false;
         for node in 0..n {
             let count = (p_count[node] as usize).min(MAX_PROPOSALS);
+            eprintln!("node {node}: count={} (raw={})", count, p_count[node]);
             for p in 0..count {
                 let cand = p_idx[node * MAX_PROPOSALS + p] as usize;
                 let gpu_dist = p_dist[node * MAX_PROPOSALS + p];
@@ -1470,12 +1473,13 @@ mod tests {
                     .map(|(a, b)| a * b)
                     .sum();
                 let cpu_dist = 1.0 - dot / (norms[node] * norms[cand]);
-                if gpu_dist < -1e-6 {
-                    any_negative = true;
-                }
-                if (gpu_dist - cpu_dist).abs() > 1e-4 {
-                    any_mismatch = true;
-                }
+                let neg = gpu_dist < -1e-6;
+                let mismatch = (gpu_dist - cpu_dist).abs() > 1e-4;
+                eprintln!(
+                        "  p{p}: cand={cand} gpu={gpu_dist:.6} cpu={cpu_dist:.6} neg={neg} mismatch={mismatch}"
+                    );
+                any_negative |= neg;
+                any_mismatch |= mismatch;
             }
         }
         assert!(!any_negative, "Negative cosine distances");
