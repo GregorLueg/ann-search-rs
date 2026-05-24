@@ -12,7 +12,7 @@ cargo run --example gridsearch_sq8 --release --features quantised
 Similar to the other benchmarks, index building, query against 10% slightly
 different data based on the trainings data and full kNN generation is being
 benchmarked. Index size in memory is also provided. Compared to other
-benchmarks, we will use the `"correlated"`, `"lowrank"` and `"quantisation"`
+benchmarks, we will use the `"correlated"`, `"lowrank"` and `"embedding"`
 with higher dimensionality, but reduced samples (for the sake of fast'ish
 benchmarking). The different synthetic data types pose different challenges
 for the quantisation methods.
@@ -297,7 +297,7 @@ spread. The clustering step is not optional for high-recall PQ search.
 <summary><b>Quantisation stress data - 128 dimensions</b>:</summary>
 </br>
 <pre><code>
-<!-- BENCH:pq:euclidean:quantisation:128:50000 -->
+<!-- BENCH:pq:euclidean:embedding:128:50000 -->
 </code></pre>
 </details>
 
@@ -307,7 +307,7 @@ spread. The clustering step is not optional for high-recall PQ search.
 <summary><b>Quantisation stress data - 256 dimensions</b>:</summary>
 </br>
 <pre><code>
-<!-- BENCH:pq:euclidean:quantisation:256:50000 -->
+<!-- BENCH:pq:euclidean:embedding:256:50000 -->
 </code></pre>
 </details>
 
@@ -317,7 +317,7 @@ spread. The clustering step is not optional for high-recall PQ search.
 <summary><b>Quantisation stress data - 512 dimensions</b>:</summary>
 </br>
 <pre><code>
-<!-- BENCH:pq:euclidean:quantisation:512:50000 -->
+<!-- BENCH:pq:euclidean:embedding:512:50000 -->
 </code></pre>
 </details>
 
@@ -448,7 +448,7 @@ spread. The clustering step is not optional for high-recall quantised search.
 <summary><b>Quantisation stress data - 128 dimensions</b>:</summary>
 </br>
 <pre><code>
-<!-- BENCH:opq:euclidean:quantisation:128:50000 -->
+<!-- BENCH:opq:euclidean:embedding:128:50000 -->
 </code></pre>
 </details>
 
@@ -458,7 +458,7 @@ spread. The clustering step is not optional for high-recall quantised search.
 <summary><b>Quantisation stress data - 256 dimensions</b>:</summary>
 </br>
 <pre><code>
-<!-- BENCH:opq:euclidean:quantisation:256:50000 -->
+<!-- BENCH:opq:euclidean:embedding:256:50000 -->
 </code></pre>
 </details>
 
@@ -468,7 +468,7 @@ spread. The clustering step is not optional for high-recall quantised search.
 <summary><b>Quantisation stress data - 512 dimensions</b>:</summary>
 </br>
 <pre><code>
-<!-- BENCH:opq:euclidean:quantisation:512:50000 -->
+<!-- BENCH:opq:euclidean:embedding:512:50000 -->
 </code></pre>
 </details>
 

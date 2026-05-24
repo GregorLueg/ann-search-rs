@@ -15,36 +15,64 @@ use thousands::*;
 
 /// Default number of samples
 pub const DEFAULT_N_SAMPLES: usize = 150_000;
+
 /// Default number for the querying
 pub const DEFAULT_N_QUERY: usize = DEFAULT_N_SAMPLES / 10;
+
 /// Default dimensionality -> typical for single cell
 pub const DEFAULT_DIM: usize = 32;
+
 /// Number of default clusters
 pub const DEFAULT_N_CLUSTERS: usize = 25;
+
 /// Default number of neighbours
 pub const DEFAULT_K: usize = 15;
+
 /// Default random seed
 pub const DEFAULT_SEED: u64 = 42;
+
 /// Default distance metric
 pub const DEFAULT_DISTANCE: &str = "euclidean";
-/// Correlation strength for
+
+/// Share of structured variance routed to the global off-axis subspace (0.0 to
+/// 1.0).
 pub const DEFAULT_COR_STRENGTH: f64 = 0.5;
+
 /// Default data type
 pub const DEFAULT_DATA: &str = "gaussian";
+
 /// Default intrinsic dimensions
 pub const DEFAULT_INTRINSIC_DIM: usize = 16;
-/// Default spectral decay
-pub const DEFAULT_SPECTRAL_DECAY: f64 = 1.5;
+
 /// Fraction of GaussianNoise samples placed on inter-cluster bridges.
 pub const DEFAULT_BRIDGE_FRACTION: f64 = 0.2;
+
 /// Fraction of LowRank samples placed along differentiation trajectories.
 pub const DEFAULT_TRAJECTORY_FRACTION: f64 = 0.15;
+
 /// Strong directions per cluster (local anisotropy) in the Correlated modality.
 pub const DEFAULT_LOCAL_RANK: usize = 16;
+
 /// Globally shared correlated directions (off-axis, what OPQ can exploit).
 pub const DEFAULT_CORR_RANK: usize = 32;
+
 /// Power-law decay exponent for the structured variance spectra.
 pub const DEFAULT_ANISO_DECAY: f64 = 1.0;
+
+/// Number of high-variance rogue dimensions in cell embeddings.
+pub const DEFAULT_N_ROGUE: usize = 4;
+
+/// Magnitude of the shared mean offset (anisotropy cone).
+pub const DEFAULT_CONE_SHIFT: f64 = 8.0;
+
+/// Local intrinsic rank of each cell type's variation.
+pub const DEFAULT_CELL_LOCAL_RANK: usize = 10;
+
+/// Fraction of samples placed on differentiation trajectories.
+pub const DEFAULT_CELL_TRAJ_FRACTION: f64 = 0.25;
+
+/// Gentle power-law decay: heavy-tailed but high participation ratio.
+pub const DEFAULT_CELL_DECAY: f64 = 0.6;
 
 ////////////
 // Parser //
@@ -60,7 +88,10 @@ pub const DEFAULT_ANISO_DECAY: f64 = 1.0;
 /// * `k` - Number of neighbours to search
 /// * `seed` - Random seed for reproducibility
 /// * `distance` - The distance to use. One of `"euclidean"` or `"cosine"`.
-/// * `data` - The data to use. One of `"gaussian"` or `"correlated"`.
+/// * `data` - The data to use. One of `"gaussian"`, `"correlated"`, `"lowrank"`
+///   or `"cell"`.
+/// * `intrinsic_dim` - True dimensionality for the `"lowrank"` manifold data.
+/// * `spectral_decay` - Currently unused (was the quantisation-stress decay exponent).
 #[derive(Parser, Clone)]
 pub struct Cli {
     #[arg(long, default_value_t = DEFAULT_N_SAMPLES)]
@@ -86,9 +117,6 @@ pub struct Cli {
 
     #[arg(long, default_value_t = DEFAULT_INTRINSIC_DIM)]
     pub intrinsic_dim: usize,
-
-    #[arg(long, default_value_t = DEFAULT_SPECTRAL_DECAY)]
-    pub spectral_decay: f64,
 }
 
 //////////
@@ -105,8 +133,8 @@ pub enum SyntheticData {
     Correlated,
     /// LowRank type of data
     LowRank,
-    /// Data type to stress quantisation methods
-    QuantisationStress,
+    /// Foundation-model cell embeddings (Geneformer/scGPT-like)
+    CellEmbedding,
 }
 
 /// Helper function to parse the data type
@@ -123,7 +151,7 @@ pub fn parse_data(s: &str) -> Option<SyntheticData> {
         "gaussian" => Some(SyntheticData::GaussianNoise),
         "correlated" => Some(SyntheticData::Correlated),
         "lowrank" => Some(SyntheticData::LowRank),
-        "quantisation" | "quantization" => Some(SyntheticData::QuantisationStress),
+        "cell" | "embedding" => Some(SyntheticData::CellEmbedding),
         _ => None,
     }
 }
@@ -566,79 +594,29 @@ where
     (high, labels)
 }
 
-/// Random orthogonal matrix via Gram-Schmidt on Gaussian random matrix.
+/// Generate synthetic foundation-model cell embeddings
+///
+/// Reproduces the geometry of Geneformer/scGPT-style embeddings: a strong
+/// anisotropy cone (large shared mean offset), a few axis-aligned rogue
+/// dimensions that dominate dot products, per-cell-type low-rank subspaces with
+/// independent orientations (full-rank globally), differentiation trajectories
+/// between related types, and per-cell norm variation standing in for library
+/// size. Each property targets a distinct quantisation failure mode.
 ///
 /// ### Params
 ///
-/// * `dim` - Dimensions
-/// * `rng` - StdRng for the random sampling
-///
-/// ### Returns
-///
-/// Orthogonal matrix
-fn random_orthogonal_matrix<T>(dim: usize, rng: &mut StdRng) -> Mat<T>
-where
-    T: Float + FromPrimitive + ComplexField,
-{
-    let mut q = Mat::<T>::zeros(dim, dim);
-
-    for i in 0..dim {
-        for j in 0..dim {
-            let val: f64 = rng.sample(StandardNormal);
-            q[(i, j)] = T::from_f64(val).unwrap();
-        }
-    }
-
-    for col in 0..dim {
-        for prev in 0..col {
-            let mut dot = T::zero();
-            for row in 0..dim {
-                dot = dot + q[(row, col)] * q[(row, prev)];
-            }
-            for row in 0..dim {
-                q[(row, col)] = q[(row, col)] - dot * q[(row, prev)];
-            }
-        }
-        let mut norm_sq = T::zero();
-        for row in 0..dim {
-            norm_sq = norm_sq + q[(row, col)] * q[(row, col)];
-        }
-        let norm = norm_sq.sqrt();
-        if norm > T::epsilon() {
-            for row in 0..dim {
-                q[(row, col)] = q[(row, col)] / norm;
-            }
-        }
-    }
-
-    q
-}
-
-/// Generate combined quantisation stress test data
-///
-/// Creates high-dimensional data combining power-law eigenvalue spectrum with
-/// norm-stratified clusters, randomly rotated so the important subspace doesn't
-/// align with coordinate axes. Clusters are paired to share directions at
-/// different radii, stressing sign binarisation (norm-blind), axis-aligned PQ
-/// (mixes signal and noise partitions), and low-bit methods generally.
-///
-/// ### Params
-///
-/// * `n_samples` - Number of samples
-/// * `dim` - Embedding dimensionality (e.g., 128, 256)
-/// * `n_clusters` - Number of distinct clusters
-/// * `spectral_decay` - Exponent for power-law variance decay (1.5 = moderate,
-///   2.0 = aggressive)
+/// * `n_samples` - Number of cells
+/// * `dim` - Embedding dimensionality (256-768 typical)
+/// * `n_clusters` - Number of cell types
 /// * `seed` - Random seed for reproducibility
 ///
 /// ### Returns
 ///
-/// Matrix of shape (n_samples, dim) and cluster assignments
-pub fn generate_quantisation_stress<T>(
+/// Matrix of shape (n_samples, dim) and cell-type assignments
+pub fn generate_cell_embeddings<T>(
     n_samples: usize,
     dim: usize,
     n_clusters: usize,
-    spectral_decay: f64,
     seed: u64,
 ) -> (Mat<T>, Vec<usize>)
 where
@@ -646,79 +624,166 @@ where
 {
     let mut rng = StdRng::seed_from_u64(seed);
 
-    // power-law eigenvalues: variance concentrated in first few dims
-    let eigenvalues: Vec<f64> = (0..dim)
-        .map(|i| 1.0 / ((i + 1) as f64).powf(spectral_decay))
+    // shared cone: every cell carries this offset, pushing the mean far from the
+    // origin and raising pairwise cosine.
+    let cone: Vec<f64> = (0..dim)
+        .map(|_| rng.sample::<f64, _>(StandardNormal))
+        .collect();
+    let cn: f64 = cone.iter().map(|x| x * x).sum::<f64>().sqrt();
+    let cone: Vec<f64> = cone
+        .into_iter()
+        .map(|x| x / cn * DEFAULT_CONE_SHIFT * (dim as f64).sqrt())
         .collect();
 
-    // generate unit directions, then assign radii to create norm stratification
-    // half the clusters share directions with a partner at a different radius
-    let n_directions = n_clusters.div_ceil(2);
-    let radii = [2.0, 8.0, 20.0];
+    // lineage hierarchy: roots are lineages, leaves are types within a lineage.
+    let n_roots = (n_clusters as f64).sqrt().ceil().max(1.0) as usize;
+    let spread = (dim as f64).sqrt();
+    let roots: Vec<Vec<f64>> = (0..n_roots)
+        .map(|_| {
+            (0..dim)
+                .map(|_| rng.random_range(-spread..spread))
+                .collect()
+        })
+        .collect();
+    let leaf_root: Vec<usize> = (0..n_clusters).map(|l| l % n_roots).collect();
+    let centres: Vec<Vec<f64>> = (0..n_clusters)
+        .map(|leaf| {
+            let root = &roots[leaf_root[leaf]];
+            (0..dim)
+                .map(|d| root[d] + rng.sample::<f64, _>(StandardNormal) * spread * 0.3)
+                .collect()
+        })
+        .collect();
 
-    let mut direction_vecs = Vec::with_capacity(n_directions);
-    for _ in 0..n_directions {
-        let raw: Vec<f64> = (0..dim)
-            .map(|_| rng.sample::<f64, _>(StandardNormal))
-            .collect();
-        let norm: f64 = raw.iter().map(|x| x * x).sum::<f64>().sqrt();
-        direction_vecs.push(raw.into_iter().map(|x| x / norm).collect::<Vec<f64>>());
+    // differentiation trajectories chain leaves within a lineage.
+    let mut edges: Vec<(usize, usize)> = Vec::new();
+    for r in 0..n_roots {
+        let members: Vec<usize> = (0..n_clusters).filter(|&l| leaf_root[l] == r).collect();
+        for w in members.windows(2) {
+            edges.push((w[0], w[1]));
+        }
     }
 
-    // centres: direction * radius, scaled per-dim by eigenvalue
-    let mut centres = Vec::with_capacity(n_clusters);
-    for cidx in 0..n_clusters {
-        let dir = &direction_vecs[cidx % n_directions];
-        let radius = radii[cidx % radii.len()];
-        let centre: Vec<f64> = (0..dim)
-            .map(|d| dir[d] * radius * eigenvalues[d].sqrt())
-            .collect();
-        centres.push(centre);
-    }
+    // per-type oriented low-rank covariance; the union over types is full-rank.
+    let rank = DEFAULT_CELL_LOCAL_RANK.min(dim);
+    let bases: Vec<Mat<T>> = (0..n_clusters)
+        .map(|_| random_orthonormal_basis::<T>(dim, rank, &mut rng))
+        .collect();
+    let spectra: Vec<Vec<f64>> = (0..n_clusters)
+        .map(|_| {
+            let s = rng.random_range(0.5..1.5);
+            (0..rank)
+                .map(|i| s / ((i + 1) as f64).powf(DEFAULT_CELL_DECAY))
+                .collect()
+        })
+        .collect();
+    let floor = 0.05;
 
-    // variable cluster sizes
-    let mut assignments = Vec::new();
-    for idx in 0..n_clusters {
+    // rogue dimensions: a few coordinate axes with huge variance, lineage-biased.
+    let n_rogue = DEFAULT_N_ROGUE.min(dim);
+    let rogue_dims: Vec<usize> = {
+        let mut all: Vec<usize> = (0..dim).collect();
+        all.shuffle(&mut rng);
+        all.truncate(n_rogue);
+        all
+    };
+    let rogue_scale = DEFAULT_CONE_SHIFT * (dim as f64).sqrt() * 0.5;
+
+    let n_traj = if edges.is_empty() {
+        0
+    } else {
+        (n_samples as f64 * DEFAULT_CELL_TRAJ_FRACTION) as usize
+    };
+    let n_blob = n_samples - n_traj;
+
+    let mut assignments = Vec::with_capacity(n_blob);
+    for leaf in 0..n_clusters {
         let weight = rng.random_range(0.5..2.5);
-        let n = ((n_samples as f64 * weight) / (n_clusters as f64 * 1.25)) as usize;
-        assignments.extend(vec![idx; n]);
+        let n = ((n_blob as f64 * weight) / (n_clusters as f64 * 1.25)) as usize;
+        assignments.extend(vec![leaf; n]);
     }
-    while assignments.len() < n_samples {
+    while assignments.len() < n_blob {
         assignments.push(rng.random_range(0..n_clusters));
     }
     assignments.shuffle(&mut rng);
-    assignments.truncate(n_samples);
+    assignments.truncate(n_blob);
 
-    // samples with dimension-dependent variance, cluster std proportional to radius
     let mut data = Mat::<T>::zeros(n_samples, dim);
-    for (i, &cidx) in assignments.iter().enumerate() {
-        let centre = &centres[cidx];
-        let radius: f64 = centre.iter().map(|x| x * x).sum::<f64>().sqrt().max(1.0);
-        let base_std = radius * 0.06;
+    let mut labels = Vec::with_capacity(n_samples);
+    let mut row = 0;
 
+    for &leaf in &assignments {
+        let centre = &centres[leaf];
         for j in 0..dim {
-            let u1: f64 = rng.random();
-            let u2: f64 = rng.random();
-            let noise = (-2.0 * u1.ln()).sqrt() * (2.0 * std::f64::consts::PI * u2).cos();
-            let std = base_std * eigenvalues[j].sqrt();
-            data[(i, j)] = T::from_f64(centre[j] + noise * std).unwrap();
+            let g: f64 = rng.sample(StandardNormal);
+            data[(row, j)] = T::from_f64(cone[j] + centre[j] + g * floor).unwrap();
         }
-    }
-
-    // random rotation so nothing is axis-aligned
-    let rotation = random_orthogonal_matrix::<T>(dim, &mut rng);
-    let mut rotated = Mat::<T>::zeros(n_samples, dim);
-    for i in 0..n_samples {
-        for j in 0..dim {
-            let mut sum = T::zero();
-            for k in 0..dim {
-                sum = sum + data[(i, k)] * rotation[(k, j)];
+        let basis = &bases[leaf];
+        let spec = &spectra[leaf];
+        for k in 0..rank {
+            let z: f64 = rng.sample(StandardNormal);
+            let amp = T::from_f64(z * spec[k]).unwrap();
+            for j in 0..dim {
+                data[(row, j)] = data[(row, j)] + amp * basis[(j, k)];
             }
-            rotated[(i, j)] = sum;
+        }
+        labels.push(leaf);
+        row += 1;
+    }
+
+    // trajectory cells: quadratic Bezier between connected types, local variation
+    // drawn from the nearer endpoint's subspace.
+    for _ in 0..n_traj {
+        let (a, b) = edges[rng.random_range(0..edges.len())];
+        let ctrl: Vec<f64> = (0..dim)
+            .map(|d| {
+                0.5 * (centres[a][d] + centres[b][d])
+                    + rng.sample::<f64, _>(StandardNormal) * spread * 0.15
+            })
+            .collect();
+        let t: f64 = rng.random();
+        let (u, v, w) = ((1.0 - t) * (1.0 - t), 2.0 * (1.0 - t) * t, t * t);
+        let leaf = if t < 0.5 { a } else { b };
+        for j in 0..dim {
+            let pos = u * centres[a][j] + v * ctrl[j] + w * centres[b][j];
+            let g: f64 = rng.sample(StandardNormal);
+            data[(row, j)] = T::from_f64(cone[j] + pos + g * floor).unwrap();
+        }
+        let basis = &bases[leaf];
+        let spec = &spectra[leaf];
+        for k in 0..rank {
+            let z: f64 = rng.sample(StandardNormal);
+            let amp = T::from_f64(z * spec[k]).unwrap();
+            for j in 0..dim {
+                data[(row, j)] = data[(row, j)] + amp * basis[(j, k)];
+            }
+        }
+        labels.push(leaf);
+        row += 1;
+    }
+
+    // inject rogue dims after the base embedding so they are axis-aligned.
+    for i in 0..n_samples {
+        let lineage = leaf_root[labels[i]] as f64;
+        for (ri, &d) in rogue_dims.iter().enumerate() {
+            let bias = (lineage + ri as f64) * 0.7;
+            let g: f64 = rng.sample(StandardNormal);
+            let val = data[(i, d)].to_f64().unwrap() + (bias + g) * rogue_scale;
+            data[(i, d)] = T::from_f64(val).unwrap();
         }
     }
 
-    (rotated, assignments)
+    // per-cell norm variation (library size / depth): lognormal whole-vector scale.
+    for i in 0..n_samples {
+        let g: f64 = rng.sample(StandardNormal);
+        let scale = (g * 0.3).exp();
+        for j in 0..dim {
+            let val = data[(i, j)].to_f64().unwrap() * scale;
+            data[(i, j)] = T::from_f64(val).unwrap();
+        }
+    }
+
+    (data, labels)
 }
 
 ////////////////////////////
@@ -761,33 +826,26 @@ pub fn generate_data(cli: &Cli) -> (Mat<f32>, Vec<usize>) {
                 cli.seed,
             )
         }
-        SyntheticData::QuantisationStress => {
-            println!(">>> Using quantisation stress test data. <<<");
-            generate_quantisation_stress(
-                cli.n_samples,
-                cli.dim,
-                cli.n_clusters,
-                cli.spectral_decay,
-                cli.seed,
-            )
+        SyntheticData::CellEmbedding => {
+            println!(">>> Using foundation-model cell embedding data. <<<");
+            generate_cell_embeddings(cli.n_samples, cli.dim, cli.n_clusters, cli.seed)
         }
     };
 
     res
 }
 
-/// Randomly subsample a matrix and add Gaussian noise
+/// Randomly subsample a matrix and add fixed Gaussian noise
 ///
 /// ### Params
 ///
 /// * `data` - The input matrix to subsample
 /// * `n_samples` - Number of samples to draw
-/// * `noise_scale` - Standard deviation of noise to add
 /// * `seed` - Random seed for reproducibility
 ///
 /// ### Returns
 ///
-/// Matrix of shape (n_samples, dim) with noise added
+/// Matrix of shape (min(n_samples, n_rows), dim) with noise added
 pub fn subsample_with_noise<T>(data: &Mat<T>, n_samples: usize, seed: u64) -> Mat<T>
 where
     T: Float + FromPrimitive + ComplexField,

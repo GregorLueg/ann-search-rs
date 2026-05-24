@@ -18,10 +18,9 @@ cargo run --example gridsearch_binary --release --features binary
 Similar to the other benchmarks, index building, query against 10% slightly
 different data based on the trainings data and full kNN generation is being
 benchmarked. Index size in memory is also provided. Compared to other
-benchmarks, we will use the `"correlated"`, `"lowrank"` and `"quantisation"`
+benchmarks, we will use the `"correlated"`, `"lowrank"` and `"embedding"`
 with higher dimensionality, but reduced samples (for the sake of fast'ish
-benchmarking). The different synthetic data types pose different challenges
-for the quantisation methods.
+benchmarking).
 
 ## Table of Contents
 
@@ -151,7 +150,7 @@ and worse.
 <summary><b>Quantisation stress data - 256 dimensions</b>:</summary>
 </br>
 <pre><code>
-<!-- BENCH:binary:euclidean:quantisation:256:50000 -->
+<!-- BENCH:binary:euclidean:embedding:256:50000 -->
 </code></pre>
 </details>
 
@@ -161,7 +160,7 @@ and worse.
 <summary><b>Quantisation stress data - 512 dimensions</b>:</summary>
 </br>
 <pre><code>
-<!-- BENCH:binary:euclidean:quantisation:512:50000 -->
+<!-- BENCH:binary:euclidean:embedding:512:50000 -->
 </code></pre>
 </details>
 
@@ -171,7 +170,7 @@ and worse.
 <summary><b>Quantisation stress data - 768 dimensions</b>:</summary>
 </br>
 <pre><code>
-<!-- BENCH:binary:euclidean:quantisation:768:50000 -->
+<!-- BENCH:binary:euclidean:embedding:768:50000 -->
 </code></pre>
 </details>
 
@@ -270,7 +269,7 @@ distance calculation.
 <summary><b>Quantisation stress data - 256 dimensions</b>:</summary>
 </br>
 <pre><code>
-<!-- BENCH:rabitq:euclidean:quantisation:256:50000 -->
+<!-- BENCH:rabitq:euclidean:embedding:256:50000 -->
 </code></pre>
 </details>
 
@@ -280,7 +279,7 @@ distance calculation.
 <summary><b>Quantisation stress data - 512 dimensions</b>:</summary>
 </br>
 <pre><code>
-<!-- BENCH:rabitq:euclidean:quantisation:512:50000 -->
+<!-- BENCH:rabitq:euclidean:embedding:512:50000 -->
 </code></pre>
 </details>
 
@@ -290,7 +289,7 @@ distance calculation.
 <summary><b>Quantisation stress data - 768 dimensions</b>:</summary>
 </br>
 <pre><code>
-<!-- BENCH:rabitq:euclidean:quantisation:768:50000 -->
+<!-- BENCH:rabitq:euclidean:embedding:768:50000 -->
 </code></pre>
 </details>
 
@@ -405,7 +404,7 @@ The self queries (i.e., kNN generation) are done with `reranking_factor = 20`.
 <summary><b>Quantisation stress data - 256 dimensions</b>:</summary>
 </br>
 <pre><code>
-<!-- BENCH:turboquant:euclidean:quantisation:256:50000 -->
+<!-- BENCH:turboquant:euclidean:embedding:256:50000 -->
 </code></pre>
 </details>
 
@@ -415,7 +414,7 @@ The self queries (i.e., kNN generation) are done with `reranking_factor = 20`.
 <summary><b>Quantisation stress data - 512 dimensions</b>:</summary>
 </br>
 <pre><code>
-<!-- BENCH:turboquant:euclidean:quantisation:512:50000 -->
+<!-- BENCH:turboquant:euclidean:embedding:512:50000 -->
 </code></pre>
 </details>
 
@@ -425,7 +424,7 @@ The self queries (i.e., kNN generation) are done with `reranking_factor = 20`.
 <summary><b>Quantisation stress data - 768 dimensions</b>:</summary>
 </br>
 <pre><code>
-<!-- BENCH:turboquant:euclidean:quantisation:768:50000 -->
+<!-- BENCH:turboquant:euclidean:embedding:768:50000 -->
 </code></pre>
 </details>
 
