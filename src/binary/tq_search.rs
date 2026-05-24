@@ -340,7 +340,7 @@ pub fn score_block_scalar(
 /// `blocked` must hold at least `(block_idx + 1) * n_byte_groups * BLOCK`
 /// bytes and `lut.luts_u8` at least `n_byte_groups * 32`.
 #[cfg(target_arch = "aarch64")]
-pub unsafe fn score_block_neon(
+pub(crate) unsafe fn score_block_neon(
     lut: &QueryLut,
     blocked: &[u8],
     block_idx: usize,
@@ -449,7 +449,7 @@ pub unsafe fn score_block_neon(
 /// and `lut.luts_u8` ≥ `n_byte_groups * 32`. Requires AVX2 + FMA at runtime.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2", enable = "fma")]
-pub unsafe fn score_block_avx2(
+pub(crate) unsafe fn score_block_avx2(
     lut: &QueryLut,
     blocked: &[u8],
     block_idx: usize,
@@ -802,13 +802,60 @@ pub(crate) unsafe fn fused4_avx2(
     k: usize,
     batch_nq: usize,
 ) -> Vec<(Vec<u32>, Vec<f32>)> {
+    let mut heaps: Vec<TopK> = (0..4).map(|_| TopK::new(k.min(n_vectors).max(1))).collect();
+    score_into_heaps_avx2(
+        luts,
+        blocked,
+        n_vectors,
+        n_blocks,
+        norms_f32,
+        query_norms,
+        metric,
+        batch_nq,
+        0,
+        &mut heaps,
+    );
+    heaps
+        .into_iter()
+        .enumerate()
+        .take(batch_nq)
+        .map(|(qi, h)| h.into_sorted(query_norms[qi], metric))
+        .collect()
+}
+
+/// Score `n_blocks` blocks for up to 4 queries into caller-owned heaps
+/// (AVX2 + FMA).
+///
+/// The reusable scoring core behind both [`fused4_avx2`] (exhaustive, one
+/// segment, `base_index = 0`) and the IVF path (one call per probed cluster,
+/// `base_index` set to the cluster's global slot offset so pushed indices are
+/// global). Heaps are persistent across calls, so the in-register prune sees
+/// the running minimum across all segments scored so far.
+///
+/// ### Safety
+///
+/// Requires AVX2 + FMA. `heaps.len()` must be >= `batch_nq`; buffers sized as
+/// in the scalar path.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2", enable = "fma")]
+#[allow(clippy::too_many_arguments)]
+pub(crate) unsafe fn score_into_heaps_avx2(
+    luts: &[&QueryLut; 4],
+    blocked: &[u8],
+    n_vectors: usize,
+    n_blocks: usize,
+    norms_f32: &[f32],
+    query_norms: [f32; 4],
+    metric: Dist,
+    batch_nq: usize,
+    base_index: u32,
+    heaps: &mut [TopK],
+) {
     use std::arch::x86_64::*;
 
     let n_byte_groups = luts[0].n_byte_groups;
     let scales = [luts[0].scale, luts[1].scale, luts[2].scale, luts[3].scale];
     let biases = [luts[0].bias, luts[1].bias, luts[2].bias, luts[3].bias];
-
-    let mut heaps: Vec<TopK> = (0..4).map(|_| TopK::new(k.min(n_vectors).max(1))).collect();
 
     let mask = _mm256_set1_epi8(0x0F);
     let codes_base = blocked.as_ptr();
@@ -817,8 +864,6 @@ pub(crate) unsafe fn fused4_avx2(
         let base_vec = b * BLOCK;
         let end_lane = (base_vec + BLOCK).min(n_vectors) - base_vec;
 
-        // Accumulate all 4 queries over this block's byte-groups, sharing
-        // the code load + nibble split.
         let mut accus = [[_mm256_setzero_si256(); 4]; 4];
         for g in 0..n_byte_groups {
             let cp = codes_base.add((b * n_byte_groups + g) * BLOCK);
@@ -837,8 +882,6 @@ pub(crate) unsafe fn fused4_avx2(
             }
         }
 
-        let norms_ptr = norms_f32.as_ptr().add(base_vec);
-
         for qi in 0..batch_nq {
             epilogue_one_query_avx2(
                 &accus[qi],
@@ -849,17 +892,11 @@ pub(crate) unsafe fn fused4_avx2(
                 biases[qi],
                 query_norms[qi],
                 metric,
+                base_index,
                 &mut heaps[qi],
             );
         }
     }
-
-    heaps
-        .into_iter()
-        .enumerate()
-        .take(batch_nq)
-        .map(|(qi, h)| h.into_sorted(query_norms[qi], metric))
-        .collect()
 }
 
 /// Per-query block epilogue (AVX2): combine accumulators, convert, apply
@@ -885,6 +922,7 @@ unsafe fn epilogue_one_query_avx2(
     bias: f32,
     query_norm: f32,
     metric: Dist,
+    base_index: u32,
     heap: &mut TopK,
 ) {
     use std::arch::x86_64::*;
@@ -938,7 +976,7 @@ unsafe fn epilogue_one_query_avx2(
             _mm256_storeu_ps(bp.add(16), ip2);
             _mm256_storeu_ps(bp.add(24), ip3);
             for lane in 0..end_lane {
-                heap.push(buf[lane], (base_vec + lane) as u32);
+                heap.push(buf[lane], base_index + (base_vec + lane) as u32);
             }
         }
         Dist::SquaredEuclidean => {
@@ -972,7 +1010,7 @@ unsafe fn epilogue_one_query_avx2(
                 _mm256_storeu_ps(bp.add(16), k2);
                 _mm256_storeu_ps(bp.add(24), k3);
                 for lane in 0..BLOCK {
-                    heap.push(buf[lane], (base_vec + lane) as u32);
+                    heap.push(buf[lane], base_index + (base_vec + lane) as u32);
                 }
             } else {
                 let mut buf = [0.0f32; BLOCK];
@@ -984,7 +1022,7 @@ unsafe fn epilogue_one_query_avx2(
                 for lane in 0..end_lane {
                     let vi = base_vec + lane;
                     let key = ip_to_key(buf[lane], query_norm, norms_f32[vi], metric);
-                    heap.push(key, vi as u32);
+                    heap.push(key, base_index + vi as u32);
                 }
             }
         }
@@ -1010,7 +1048,7 @@ unsafe fn epilogue_one_query_avx2(
     enable = "avx512bw"
 )]
 #[allow(clippy::too_many_arguments)]
-pub unsafe fn fused4_avx512bw(
+pub(crate) unsafe fn fused4_avx512bw(
     luts: &[&QueryLut; 4],
     blocked: &[u8],
     n_vectors: usize,
@@ -1021,25 +1059,67 @@ pub unsafe fn fused4_avx512bw(
     k: usize,
     batch_nq: usize,
 ) -> Vec<(Vec<u32>, Vec<f32>)> {
+    let mut heaps: Vec<TopK> = (0..4).map(|_| TopK::new(k.min(n_vectors).max(1))).collect();
+    score_into_heaps_avx512bw(
+        luts,
+        blocked,
+        n_vectors,
+        n_blocks,
+        norms_f32,
+        query_norms,
+        metric,
+        batch_nq,
+        0,
+        &mut heaps,
+    );
+    heaps
+        .into_iter()
+        .enumerate()
+        .take(batch_nq)
+        .map(|(qi, h)| h.into_sorted(query_norms[qi], metric))
+        .collect()
+}
+
+/// AVX-512BW scoring core into caller-owned heaps. The block-pair counterpart
+/// to [`score_into_heaps_avx2`]; see [`fused4_avx512bw`] for the algorithm and
+/// [`score_into_heaps_avx2`] for the persistent-heap / `base_index` contract.
+///
+/// ### Safety
+///
+/// Requires AVX2 + FMA + AVX-512F + AVX-512BW. `heaps.len()` must be >=
+/// `batch_nq`.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(
+    enable = "avx2",
+    enable = "fma",
+    enable = "avx512f",
+    enable = "avx512bw"
+)]
+#[allow(clippy::too_many_arguments)]
+pub(crate) unsafe fn score_into_heaps_avx512bw(
+    luts: &[&QueryLut; 4],
+    blocked: &[u8],
+    n_vectors: usize,
+    n_blocks: usize,
+    norms_f32: &[f32],
+    query_norms: [f32; 4],
+    metric: Dist,
+    batch_nq: usize,
+    base_index: u32,
+    heaps: &mut [TopK],
+) {
     use std::arch::x86_64::*;
 
     let n_byte_groups = luts[0].n_byte_groups;
-    let scales = [luts[0].scale, luts[1].scale, luts[2].scale, luts[3].scale];
-    let biases = [luts[0].bias, luts[1].bias, luts[2].bias, luts[3].bias];
-
-    let mut heaps: Vec<TopK> = (0..4).map(|_| TopK::new(k.min(n_vectors).max(1))).collect();
-
     let mask512 = _mm512_set1_epi8(0x0F);
     let mask256 = _mm256_set1_epi8(0x0F);
     let codes_base = blocked.as_ptr();
     let n_block_pairs = n_blocks / 2;
 
-    // Main loop: block pairs (64 vectors per group shuffle).
     for p in 0..n_block_pairs {
         let b0 = p * 2;
         let b1 = b0 + 1;
 
-        // [query][0..4] zmm: low 256 = block b0, high 256 = block b1.
         let mut accus = [[_mm512_setzero_si512(); 4]; 4];
 
         for g in 0..n_byte_groups {
@@ -1066,7 +1146,6 @@ pub unsafe fn fused4_avx512bw(
             }
         }
 
-        // Run the shared epilogue on each block's 256-bit half.
         for which in 0..2 {
             let b = b0 + which;
             let base_vec = b * BLOCK;
@@ -1095,17 +1174,17 @@ pub unsafe fn fused4_avx512bw(
                     base_vec,
                     end_lane,
                     norms_f32,
-                    scales[qi],
-                    biases[qi],
+                    luts[qi].scale,
+                    luts[qi].bias,
                     query_norms[qi],
                     metric,
+                    base_index,
                     &mut heaps[qi],
                 );
             }
         }
     }
 
-    // Tail: odd final block via AVX2 accumulation + the same epilogue.
     if n_block_pairs * 2 < n_blocks {
         let b = n_block_pairs * 2;
         let base_vec = b * BLOCK;
@@ -1134,15 +1213,236 @@ pub unsafe fn fused4_avx512bw(
                 base_vec,
                 end_lane,
                 norms_f32,
-                scales[qi],
-                biases[qi],
+                luts[qi].scale,
+                luts[qi].bias,
                 query_norms[qi],
                 metric,
+                base_index,
                 &mut heaps[qi],
             );
         }
     }
+}
 
+///////////
+// Tests //
+///////////
+
+/// NEON scoring core into caller-owned heaps (aarch64).
+///
+/// Per-query single-block kernel ([`score_block_neon`]) looped over the
+/// `batch_nq` queries, then a scalar key transform + heap push. Not 4-query
+/// fused (no NEON fused kernel exists), but still SIMD-scored. Same persistent
+/// heap / `base_index` contract as [`score_into_heaps_avx2`].
+///
+/// ### Safety
+///
+/// `heaps.len()` must be >= `batch_nq`. Buffers sized as in the scalar path.
+#[cfg(target_arch = "aarch64")]
+#[allow(clippy::too_many_arguments)]
+pub(crate) unsafe fn score_into_heaps_neon(
+    luts: &[&QueryLut; 4],
+    blocked: &[u8],
+    n_vectors: usize,
+    n_blocks: usize,
+    norms_f32: &[f32],
+    query_norms: [f32; 4],
+    metric: Dist,
+    batch_nq: usize,
+    base_index: u32,
+    heaps: &mut [TopK],
+) {
+    let mut out = [0.0f32; BLOCK];
+    for qi in 0..batch_nq {
+        for b in 0..n_blocks {
+            score_block_neon(luts[qi], blocked, b, &mut out);
+            let base_vec = b * BLOCK;
+            let end_lane = (base_vec + BLOCK).min(n_vectors) - base_vec;
+            for lane in 0..end_lane {
+                let vi = base_vec + lane;
+                let key = ip_to_key(out[lane], query_norms[qi], norms_f32[vi], metric);
+                heaps[qi].push(key, base_index + vi as u32);
+            }
+        }
+    }
+}
+
+/// Scalar scoring core into caller-owned heaps (portable fallback).
+///
+/// Used on x86 without AVX2/FMA and on architectures without a SIMD kernel.
+/// 2-bit / 4-bit only (it consumes a [`QueryLut`]); 3-bit codes are served by
+/// the bit-plane path in `tq_dists`. Same persistent heap / `base_index`
+/// contract as [`score_into_heaps_avx2`].
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn score_into_heaps_scalar(
+    luts: &[&QueryLut; 4],
+    blocked: &[u8],
+    n_vectors: usize,
+    n_blocks: usize,
+    norms_f32: &[f32],
+    query_norms: [f32; 4],
+    metric: Dist,
+    batch_nq: usize,
+    base_index: u32,
+    heaps: &mut [TopK],
+) {
+    let mut out = [0.0f32; BLOCK];
+    for qi in 0..batch_nq {
+        for b in 0..n_blocks {
+            score_block_scalar(luts[qi], blocked, b, &mut out);
+            let base_vec = b * BLOCK;
+            let end_lane = (base_vec + BLOCK).min(n_vectors) - base_vec;
+            for lane in 0..end_lane {
+                let vi = base_vec + lane;
+                let key = ip_to_key(out[lane], query_norms[qi], norms_f32[vi], metric);
+                heaps[qi].push(key, base_index + vi as u32);
+            }
+        }
+    }
+}
+
+/// Architecture-dispatched scoring of one blocked segment into caller-owned
+/// heaps.
+///
+/// Picks AVX-512BW / AVX2 / NEON / scalar at runtime and scores `n_blocks`
+/// blocks for `batch_nq` queries, pushing global indices `base_index + slot`
+/// into `heaps`. Heaps persist across calls, so an IVF index can call this
+/// once per probed cluster (with `base_index` set to the cluster's global slot
+/// offset) and the running top-k accumulates across clusters. 2-bit / 4-bit
+/// only.
+///
+/// `luts` must hold 4 entries; pad unused slots for `batch_nq < 4`.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn score_into_heaps(
+    luts: &[&QueryLut; 4],
+    blocked: &[u8],
+    n_vectors: usize,
+    n_blocks: usize,
+    norms_f32: &[f32],
+    query_norms: [f32; 4],
+    metric: Dist,
+    batch_nq: usize,
+    base_index: u32,
+    heaps: &mut [TopK],
+) {
+    #[cfg(target_arch = "x86_64")]
+    {
+        let has_fma = is_x86_feature_detected!("fma");
+        match detect_simd_level() {
+            SimdLevel::Avx512 if has_fma && is_x86_feature_detected!("avx512bw") => unsafe {
+                score_into_heaps_avx512bw(
+                    luts,
+                    blocked,
+                    n_vectors,
+                    n_blocks,
+                    norms_f32,
+                    query_norms,
+                    metric,
+                    batch_nq,
+                    base_index,
+                    heaps,
+                );
+            },
+            SimdLevel::Avx512 | SimdLevel::Avx2 if has_fma => unsafe {
+                score_into_heaps_avx2(
+                    luts,
+                    blocked,
+                    n_vectors,
+                    n_blocks,
+                    norms_f32,
+                    query_norms,
+                    metric,
+                    batch_nq,
+                    base_index,
+                    heaps,
+                );
+            },
+            _ => score_into_heaps_scalar(
+                luts,
+                blocked,
+                n_vectors,
+                n_blocks,
+                norms_f32,
+                query_norms,
+                metric,
+                batch_nq,
+                base_index,
+                heaps,
+            ),
+        }
+        return;
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        // NEON is always present on aarch64.
+        unsafe {
+            score_into_heaps_neon(
+                luts,
+                blocked,
+                n_vectors,
+                n_blocks,
+                norms_f32,
+                query_norms,
+                metric,
+                batch_nq,
+                base_index,
+                heaps,
+            );
+        }
+        return;
+    }
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+    {
+        score_into_heaps_scalar(
+            luts,
+            blocked,
+            n_vectors,
+            n_blocks,
+            norms_f32,
+            query_norms,
+            metric,
+            batch_nq,
+            base_index,
+            heaps,
+        );
+    }
+}
+
+/// Top-k over a single blocked segment (exhaustive path).
+///
+/// Convenience wrapper over [`score_into_heaps`] with `base_index = 0`: builds
+/// the heaps, scores, and returns per-query `(indices, distances)` sorted
+/// nearest-first. The exhaustive index calls this; the IVF index drives
+/// [`score_into_heaps`] directly with persistent heaps.
+///
+/// `luts` must hold 4 entries; pad unused slots for `batch_nq < 4`.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn topk_blocked(
+    luts: &[&QueryLut; 4],
+    blocked: &[u8],
+    n_vectors: usize,
+    n_blocks: usize,
+    norms_f32: &[f32],
+    query_norms: [f32; 4],
+    metric: Dist,
+    k: usize,
+    batch_nq: usize,
+) -> Vec<(Vec<u32>, Vec<f32>)> {
+    let mut heaps: Vec<TopK> = (0..batch_nq.max(1))
+        .map(|_| TopK::new(k.min(n_vectors).max(1)))
+        .collect();
+    score_into_heaps(
+        luts,
+        blocked,
+        n_vectors,
+        n_blocks,
+        norms_f32,
+        query_norms,
+        metric,
+        batch_nq,
+        0,
+        &mut heaps,
+    );
     heaps
         .into_iter()
         .enumerate()
@@ -1150,10 +1450,6 @@ pub unsafe fn fused4_avx512bw(
         .map(|(qi, h)| h.into_sorted(query_norms[qi], metric))
         .collect()
 }
-
-///////////
-// Tests //
-///////////
 
 #[cfg(test)]
 mod tests {
@@ -1676,149 +1972,6 @@ mod tests {
     }
 
     #[cfg(target_arch = "x86_64")]
-    fn assert_fused4_matches_oracle(
-        bits: usize,
-        dim: usize,
-        n: usize,
-        k: usize,
-        metric: Dist,
-        nq: usize,
-    ) {
-        if !is_x86_feature_detected!("avx2") || !is_x86_feature_detected!("fma") {
-            eprintln!("skipping: AVX2/FMA not available");
-            return;
-        }
-
-        let q = TurboQuantQuantiser::new(test_data(n, dim).as_ref(), &metric, bits, 42).unwrap();
-        let (blocked, n_blocks) = blocked_data(&q);
-
-        // Build nq distinct queries.
-        let queries: Vec<Vec<f32>> = (0..nq)
-            .map(|qi| {
-                (0..dim)
-                    .map(|i| ((i + 3 * qi) as f32 * 0.061 + qi as f32).sin())
-                    .collect()
-            })
-            .collect();
-
-        // Per-query scalar oracle.
-        let mut expected = Vec::new();
-        for query in &queries {
-            let eq = q.encode_query(query).unwrap();
-            let (q_rot, levels) = prepare_scalar_scoring(&eq, &q.encoder);
-            let lut = build_query_lut(&q_rot, &levels, bits, dim).unwrap();
-            expected.push(score_query_topk_scalar(
-                &lut,
-                &blocked,
-                n,
-                n_blocks,
-                &q.storage.norms,
-                eq.query_norm,
-                metric,
-                k,
-            ));
-        }
-
-        // Fused kernel, batched in groups of 4 with last-query padding.
-        let encoded: Vec<_> = queries
-            .iter()
-            .map(|query| {
-                let eq = q.encode_query(query).unwrap();
-                let (q_rot, levels) = prepare_scalar_scoring(&eq, &q.encoder);
-                (
-                    build_query_lut(&q_rot, &levels, bits, dim).unwrap(),
-                    eq.query_norm,
-                )
-            })
-            .collect();
-
-        let mut got = Vec::new();
-        let mut qi = 0;
-        while qi < nq {
-            let batch_nq = (nq - qi).min(4);
-            let pad = qi + batch_nq - 1;
-            let luts: [&QueryLut; 4] = [
-                &encoded[qi].0,
-                &encoded[(qi + 1).min(pad)].0,
-                &encoded[(qi + 2).min(pad)].0,
-                &encoded[(qi + 3).min(pad)].0,
-            ];
-            let qnorms = [
-                encoded[qi].1,
-                encoded[(qi + 1).min(pad)].1,
-                encoded[(qi + 2).min(pad)].1,
-                encoded[(qi + 3).min(pad)].1,
-            ];
-            let batch = unsafe {
-                fused4_avx2(
-                    &luts,
-                    &blocked,
-                    n,
-                    n_blocks,
-                    &q.storage.norms,
-                    qnorms,
-                    metric,
-                    k,
-                    batch_nq,
-                )
-            };
-            got.extend(batch);
-            qi += batch_nq;
-        }
-
-        assert_eq!(got.len(), nq);
-        for (i, ((g_idx, g_dist), (e_idx, e_dist))) in got.iter().zip(expected.iter()).enumerate() {
-            assert_eq!(g_idx, e_idx, "{metric:?} query {i} indices diverge");
-            assert_eq!(g_dist, e_dist, "{metric:?} query {i} distances diverge");
-        }
-    }
-
-    #[cfg(target_arch = "x86_64")]
-    #[test]
-    fn test_fused4_cosine_one_batch() {
-        assert_fused4_matches_oracle(4, 256, BLOCK * 4 + 13, 10, Dist::Cosine, 4);
-    }
-
-    #[cfg(target_arch = "x86_64")]
-    #[test]
-    fn test_fused4_sqeuclidean_one_batch() {
-        assert_fused4_matches_oracle(4, 256, BLOCK * 4 + 13, 10, Dist::SquaredEuclidean, 4);
-    }
-
-    #[cfg(target_arch = "x86_64")]
-    #[test]
-    fn test_fused4_cosine_tail_batch() {
-        // nq = 7 -> one full batch of 4 + a padded batch of 3.
-        assert_fused4_matches_oracle(4, 128, BLOCK * 3 + 5, 8, Dist::Cosine, 7);
-    }
-
-    #[cfg(target_arch = "x86_64")]
-    #[test]
-    fn test_fused4_sqeuclidean_tail_batch() {
-        assert_fused4_matches_oracle(4, 128, BLOCK * 3 + 5, 8, Dist::SquaredEuclidean, 7);
-    }
-
-    #[cfg(target_arch = "x86_64")]
-    #[test]
-    fn test_fused4_2bit() {
-        assert_fused4_matches_oracle(2, 512, BLOCK * 2 + 9, 8, Dist::Cosine, 4);
-    }
-
-    #[cfg(target_arch = "x86_64")]
-    #[test]
-    fn test_fused4_prune_path() {
-        // Large n, small k forces the heap full early so the in-register
-        // prune skips most blocks — exercises that path against the oracle.
-        assert_fused4_matches_oracle(4, 256, BLOCK * 20, 5, Dist::Cosine, 4);
-    }
-
-    #[cfg(target_arch = "x86_64")]
-    #[test]
-    fn test_fused4_high_dim() {
-        assert_fused4_matches_oracle(4, 1536, BLOCK * 5 + 1, 10, Dist::SquaredEuclidean, 4);
-    }
-
-    #[cfg(target_arch = "x86_64")]
     type FusedKernel = unsafe fn(
         &[&QueryLut; 4],
         &[u8],
@@ -1834,6 +1987,7 @@ mod tests {
     #[cfg(target_arch = "x86_64")]
     fn assert_fused_matches_oracle(
         kernel: FusedKernel,
+        needs_avx512: bool,
         bits: usize,
         dim: usize,
         n: usize,
@@ -1841,7 +1995,18 @@ mod tests {
         metric: Dist,
         nq: usize,
     ) {
-        let q = TurboQuantQuantiser::new(test_data(n, dim).as_ref(), &metric, bits, 42);
+        if !is_x86_feature_detected!("avx2") || !is_x86_feature_detected!("fma") {
+            eprintln!("skipping: AVX2/FMA not available");
+            return;
+        }
+        if needs_avx512
+            && !(is_x86_feature_detected!("avx512f") && is_x86_feature_detected!("avx512bw"))
+        {
+            eprintln!("skipping: AVX-512BW not available");
+            return;
+        }
+
+        let q = TurboQuantQuantiser::new(test_data(n, dim).as_ref(), &metric, bits, 42).unwrap();
         let (blocked, n_blocks) = blocked_data(&q);
 
         let queries: Vec<Vec<f32>> = (0..nq)
@@ -1855,9 +2020,9 @@ mod tests {
         let mut expected = Vec::new();
         let mut encoded = Vec::new();
         for query in &queries {
-            let eq = q.encode_query(query);
+            let eq = q.encode_query(query).unwrap();
             let (q_rot, levels) = prepare_scalar_scoring(&eq, &q.encoder);
-            let lut = build_query_lut(&q_rot, &levels, bits, dim);
+            let lut = build_query_lut(&q_rot, &levels, bits, dim).unwrap();
             expected.push(score_query_topk_scalar(
                 &lut,
                 &blocked,
@@ -1909,5 +2074,367 @@ mod tests {
             assert_eq!(g_idx, e_idx, "{metric:?} query {i} indices diverge");
             assert_eq!(g_dist, e_dist, "{metric:?} query {i} distances diverge");
         }
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn test_fused4_cosine_one_batch() {
+        assert_fused_matches_oracle(
+            fused4_avx2,
+            false,
+            4,
+            256,
+            BLOCK * 4 + 13,
+            10,
+            Dist::Cosine,
+            4,
+        );
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn test_fused4_sqeuclidean_one_batch() {
+        assert_fused_matches_oracle(
+            fused4_avx2,
+            false,
+            4,
+            256,
+            BLOCK * 4 + 13,
+            10,
+            Dist::SquaredEuclidean,
+            4,
+        );
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn test_fused4_cosine_tail_batch() {
+        // nq = 7 -> one full batch of 4 + a padded batch of 3.
+        assert_fused_matches_oracle(
+            fused4_avx2,
+            false,
+            4,
+            128,
+            BLOCK * 3 + 5,
+            8,
+            Dist::Cosine,
+            7,
+        );
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn test_fused4_sqeuclidean_tail_batch() {
+        assert_fused_matches_oracle(
+            fused4_avx2,
+            false,
+            4,
+            128,
+            BLOCK * 3 + 5,
+            8,
+            Dist::SquaredEuclidean,
+            7,
+        );
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn test_fused4_2bit() {
+        assert_fused_matches_oracle(
+            fused4_avx2,
+            false,
+            2,
+            512,
+            BLOCK * 2 + 9,
+            8,
+            Dist::Cosine,
+            4,
+        );
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn test_fused4_prune_path() {
+        assert_fused_matches_oracle(fused4_avx2, false, 4, 256, BLOCK * 20, 5, Dist::Cosine, 4);
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn test_fused4_high_dim() {
+        assert_fused_matches_oracle(
+            fused4_avx2,
+            false,
+            4,
+            1536,
+            BLOCK * 5 + 1,
+            10,
+            Dist::SquaredEuclidean,
+            4,
+        );
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn test_avx512_cosine() {
+        assert_fused_matches_oracle(
+            fused4_avx512bw,
+            true,
+            4,
+            256,
+            BLOCK * 5 + 13,
+            10,
+            Dist::Cosine,
+            4,
+        );
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn test_avx512_sqeuclidean() {
+        assert_fused_matches_oracle(
+            fused4_avx512bw,
+            true,
+            4,
+            256,
+            BLOCK * 5 + 13,
+            10,
+            Dist::SquaredEuclidean,
+            4,
+        );
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn test_avx512_odd_blocks() {
+        assert_fused_matches_oracle(fused4_avx512bw, true, 4, 128, BLOCK * 7, 8, Dist::Cosine, 4);
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn test_avx512_even_blocks() {
+        assert_fused_matches_oracle(
+            fused4_avx512bw,
+            true,
+            4,
+            128,
+            BLOCK * 8,
+            8,
+            Dist::SquaredEuclidean,
+            4,
+        );
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn test_avx512_tail_batch() {
+        assert_fused_matches_oracle(
+            fused4_avx512bw,
+            true,
+            4,
+            256,
+            BLOCK * 4 + 7,
+            8,
+            Dist::Cosine,
+            7,
+        );
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn test_avx512_high_dim_prune() {
+        assert_fused_matches_oracle(
+            fused4_avx512bw,
+            true,
+            4,
+            1536,
+            BLOCK * 20,
+            5,
+            Dist::SquaredEuclidean,
+            4,
+        );
+    }
+
+    ////////////////////////////////
+    // e4: score_into_heaps tests  //
+    ////////////////////////////////
+
+    /// The arch-dispatched `score_into_heaps` over a single segment
+    /// (`base_index = 0`) must reproduce the scalar single-query oracle.
+    fn assert_dispatch_matches_oracle(bits: usize, dim: usize, n: usize, k: usize, metric: Dist) {
+        let q = TurboQuantQuantiser::new(test_data(n, dim).as_ref(), &metric, bits, 42).unwrap();
+        let (blocked, n_blocks) = blocked_data(&q);
+
+        let query: Vec<f32> = (0..dim).map(|i| (i as f32 * 0.071 + 0.2).sin()).collect();
+        let eq = q.encode_query(&query).unwrap();
+        let (q_rot, levels) = prepare_scalar_scoring(&eq, &q.encoder);
+        let lut = build_query_lut(&q_rot, &levels, bits, dim).unwrap();
+
+        let (e_idx, e_dist) = score_query_topk_scalar(
+            &lut,
+            &blocked,
+            n,
+            n_blocks,
+            &q.storage.norms,
+            eq.query_norm,
+            metric,
+            k,
+        );
+
+        let luts: [&QueryLut; 4] = [&lut, &lut, &lut, &lut];
+        let qnorms = [eq.query_norm; 4];
+        let mut heaps: Vec<TopK> = (0..1).map(|_| TopK::new(k.min(n).max(1))).collect();
+        score_into_heaps(
+            &luts,
+            &blocked,
+            n,
+            n_blocks,
+            &q.storage.norms,
+            qnorms,
+            metric,
+            1,
+            0,
+            &mut heaps,
+        );
+        let (g_idx, g_dist) = heaps.pop().unwrap().into_sorted(eq.query_norm, metric);
+
+        assert_eq!(
+            g_idx, e_idx,
+            "{metric:?} bits {bits} dispatch indices diverge"
+        );
+        for (a, b) in g_dist.iter().zip(e_dist.iter()) {
+            assert_eq!(a, b, "{metric:?} dispatch distance mismatch");
+        }
+    }
+
+    #[test]
+    fn test_dispatch_matches_oracle_4bit_cosine() {
+        assert_dispatch_matches_oracle(4, 256, BLOCK * 3 + 7, 10, Dist::Cosine);
+    }
+
+    #[test]
+    fn test_dispatch_matches_oracle_4bit_sqeuclidean() {
+        assert_dispatch_matches_oracle(4, 256, BLOCK * 3 + 7, 10, Dist::SquaredEuclidean);
+    }
+
+    #[test]
+    fn test_dispatch_matches_oracle_2bit() {
+        assert_dispatch_matches_oracle(2, 512, BLOCK * 2 + 5, 8, Dist::Cosine);
+    }
+
+    /// IVF emulation: two independently-encoded segments sharing one encoder
+    /// (same dim/bits/seed), scored into ONE persistent heap with per-segment
+    /// `base_index`, must equal a merged brute-force top-k over the global
+    /// index space `[0, n0) ++ [n0, n0 + n1)`.
+    fn assert_ivf_base_index_accumulates(
+        bits: usize,
+        dim: usize,
+        n0: usize,
+        n1: usize,
+        k: usize,
+        metric: Dist,
+    ) {
+        // Two distinct data sets, same encoder parameters -> identical rotation
+        // and levels, so a single query LUT applies to both.
+        let d0 = Mat::from_fn(n0, dim, |i, j| ((i * 31 + j * 7 + 1) as f32 * 0.013).sin());
+        let d1 = Mat::from_fn(n1, dim, |i, j| {
+            ((i * 17 + j * 5 + 9999) as f32 * 0.019).cos()
+        });
+        let q0 = TurboQuantQuantiser::new(d0.as_ref(), &metric, bits, 7).unwrap();
+        let q1 = TurboQuantQuantiser::new(d1.as_ref(), &metric, bits, 7).unwrap();
+
+        let query: Vec<f32> = (0..dim).map(|i| (i as f32 * 0.043 + 0.6).sin()).collect();
+        let eq = q0.encode_query(&query).unwrap();
+        let (q_rot, levels) = prepare_scalar_scoring(&eq, &q0.encoder);
+        let lut = build_query_lut(&q_rot, &levels, bits, dim).unwrap();
+        let qnorm = eq.query_norm;
+
+        let (bl0, nb0) = blocked_data(&q0);
+        let (bl1, nb1) = blocked_data(&q1);
+
+        // Persistent heap across both segments.
+        let total = n0 + n1;
+        let luts: [&QueryLut; 4] = [&lut, &lut, &lut, &lut];
+        let qnorms = [qnorm; 4];
+        let mut heaps: Vec<TopK> = (0..1).map(|_| TopK::new(k.min(total).max(1))).collect();
+        score_into_heaps(
+            &luts,
+            &bl0,
+            n0,
+            nb0,
+            &q0.storage.norms,
+            qnorms,
+            metric,
+            1,
+            0,
+            &mut heaps,
+        );
+        score_into_heaps(
+            &luts,
+            &bl1,
+            n1,
+            nb1,
+            &q1.storage.norms,
+            qnorms,
+            metric,
+            1,
+            n0 as u32,
+            &mut heaps,
+        );
+        let (g_idx, g_dist) = heaps.pop().unwrap().into_sorted(qnorm, metric);
+
+        // Merged brute-force oracle over global indices via the bit-plane scorer.
+        let mut all: Vec<(f32, u32)> = Vec::new();
+        for i in 0..n0 {
+            let ip = score_via_lut_bitplane(&lut, q0.storage.vector_packed(i), bits, dim);
+            all.push((ip_to_key(ip, qnorm, q0.storage.norms[i], metric), i as u32));
+        }
+        for j in 0..n1 {
+            let ip = score_via_lut_bitplane(&lut, q1.storage.vector_packed(j), bits, dim);
+            all.push((
+                ip_to_key(ip, qnorm, q1.storage.norms[j], metric),
+                (n0 + j) as u32,
+            ));
+        }
+        all.sort_unstable_by(|a, b| {
+            b.0.partial_cmp(&a.0)
+                .unwrap_or(Ordering::Equal)
+                .then(a.1.cmp(&b.1))
+        });
+        all.truncate(k.min(total));
+        let e_idx: Vec<u32> = all.iter().map(|p| p.1).collect();
+        let e_dist: Vec<f32> = all
+            .iter()
+            .map(|p| key_to_distance(p.0, qnorm, metric))
+            .collect();
+
+        assert_eq!(
+            g_idx, e_idx,
+            "{metric:?} bits {bits} IVF-accumulated indices diverge"
+        );
+        for (a, b) in g_dist.iter().zip(e_dist.iter()) {
+            assert_eq!(a, b, "{metric:?} IVF-accumulated distance mismatch");
+        }
+    }
+
+    #[test]
+    fn test_ivf_base_index_cosine() {
+        assert_ivf_base_index_accumulates(4, 256, BLOCK * 2 + 5, BLOCK * 3 + 11, 10, Dist::Cosine);
+    }
+
+    #[test]
+    fn test_ivf_base_index_sqeuclidean() {
+        assert_ivf_base_index_accumulates(
+            4,
+            256,
+            BLOCK + 3,
+            BLOCK * 2 + 7,
+            8,
+            Dist::SquaredEuclidean,
+        );
+    }
+
+    #[test]
+    fn test_ivf_base_index_2bit() {
+        assert_ivf_base_index_accumulates(2, 512, BLOCK * 2, BLOCK + 9, 8, Dist::Cosine);
     }
 }
