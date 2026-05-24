@@ -18,8 +18,10 @@ use num_traits::{Float, FromPrimitive};
 /// AVX2 / AVX-512BW / NEON kernels all assume this exact value.
 pub const BLOCK: usize = 32;
 
+/// Inverse of `PERM0`: `PERM0_INV[v]` is the `j` with `PERM0[j] == v`.
+/// Used to recover a lane's code byte from the interleaved x86 layout.
 #[cfg(target_arch = "x86_64")]
-const PERM0: [usize; 16] = [0, 8, 1, 9, 2, 10, 3, 11, 4, 12, 5, 13, 6, 14, 7, 15];
+pub(crate) const PERM0_INV: [usize; 16] = [0, 2, 4, 6, 8, 10, 12, 14, 1, 3, 5, 7, 9, 11, 13, 15];
 
 /// Blocked layout for 2-bit and 4-bit codes.
 pub struct BlockedCodes {

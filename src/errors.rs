@@ -109,8 +109,16 @@ pub enum AnnSearchErrors {
         len: usize,
     },
 
+    /// Error when LUT is being attempted with wrong bits
+    #[cfg(feature = "binary")]
+    #[error("Turbo quantisation: LUT scoring supports 2-bit and 4-bit only (chosen bit: {bit}")]
+    TQLutError {
+        /// The chosen bit
+        bit: usize,
+    },
+
     // -- gpu errors --
-    /// Propagate errors from the ann-search-rs crate
+    /// Propagate errors from the CubeCL
     #[cfg(feature = "gpu")]
     #[error("Error from the cubecl runtime: {0}")]
     CubeClServerError(#[from] ServerError),
