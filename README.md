@@ -75,6 +75,7 @@ anticipated. If you want to see what changed, please check this
   - *Binary* (different types of binary quantisations for exhaustive and IVF
     indices.)
   - *RaBitQ* (RaBitQ quantisation for exhaustive and IVF indices.)
+  - *TurboQuant* ()
 
 ## Installation
 

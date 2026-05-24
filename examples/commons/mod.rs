@@ -35,6 +35,16 @@ pub const DEFAULT_DATA: &str = "gaussian";
 pub const DEFAULT_INTRINSIC_DIM: usize = 16;
 /// Default spectral decay
 pub const DEFAULT_SPECTRAL_DECAY: f64 = 1.5;
+/// Fraction of GaussianNoise samples placed on inter-cluster bridges.
+pub const DEFAULT_BRIDGE_FRACTION: f64 = 0.2;
+/// Fraction of LowRank samples placed along differentiation trajectories.
+pub const DEFAULT_TRAJECTORY_FRACTION: f64 = 0.15;
+/// Strong directions per cluster (local anisotropy) in the Correlated modality.
+pub const DEFAULT_LOCAL_RANK: usize = 16;
+/// Globally shared correlated directions (off-axis, what OPQ can exploit).
+pub const DEFAULT_CORR_RANK: usize = 32;
+/// Power-law decay exponent for the structured variance spectra.
+pub const DEFAULT_ANISO_DECAY: f64 = 1.0;
 
 ////////////
 // Parser //
@@ -145,66 +155,149 @@ where
     let mut rng = StdRng::seed_from_u64(seed);
     let mut data = Mat::<T>::zeros(n_samples, dim);
 
-    // variable cluster sizes and std deviations
-    let mut centres = Vec::with_capacity(n_clusters);
-    let mut cluster_stds = Vec::new();
-
+    let mut centres: Vec<Vec<f64>> = Vec::with_capacity(n_clusters);
+    let mut cluster_stds = Vec::with_capacity(n_clusters);
     for _ in 0..n_clusters {
-        let centre: Vec<f64> = (0..dim).map(|_| rng.random_range(-7.5..7.5)).collect();
-        centres.push(centre);
+        centres.push((0..dim).map(|_| rng.random_range(-7.5..7.5)).collect());
         cluster_stds.push(rng.random_range(0.5..2.5));
     }
 
-    // assign samples with variable cluster sizes
-    // with some clusters bigger than others
-    let mut cluster_assignments = Vec::new();
-    for cluster_idx in 0..n_clusters {
-        let weight = rng.random_range(0.5..2.5);
-        let n_in_cluster = ((n_samples as f64 * weight) / (n_clusters as f64 * 1.25)) as usize;
-        cluster_assignments.extend(vec![cluster_idx; n_in_cluster]);
-    }
-
-    // fill remaining
-    while cluster_assignments.len() < n_samples {
-        cluster_assignments.push(rng.random_range(0..n_clusters));
-    }
-    cluster_assignments.shuffle(&mut rng);
-    cluster_assignments.truncate(n_samples);
-
-    // generate with variable noise
-    for (i, &cluster_idx) in cluster_assignments.iter().enumerate() {
-        let centre = &centres[cluster_idx];
-        let std = cluster_stds[cluster_idx];
-
-        for j in 0..dim {
-            let u1: f64 = rng.random();
-            let u2: f64 = rng.random();
-            let noise = (-2.0 * u1.ln()).sqrt() * (2.0 * std::f64::consts::PI * u2).cos();
-            data[(i, j)] = T::from_f64(centre[j] + noise * std).unwrap();
+    // bridge edges: connect each cluster to its nearest neighbour, dedup
+    let mut edges: Vec<(usize, usize)> = Vec::new();
+    if n_clusters >= 2 {
+        for a in 0..n_clusters {
+            let mut best = usize::MAX;
+            let mut best_d = f64::INFINITY;
+            for b in 0..n_clusters {
+                if a == b {
+                    continue;
+                }
+                let d: f64 = centres[a]
+                    .iter()
+                    .zip(&centres[b])
+                    .map(|(x, y)| (x - y).powi(2))
+                    .sum();
+                if d < best_d {
+                    best_d = d;
+                    best = b;
+                }
+            }
+            let edge = (a.min(best), a.max(best));
+            if !edges.contains(&edge) {
+                edges.push(edge);
+            }
         }
     }
 
-    (data, cluster_assignments)
+    let n_bridge = if edges.is_empty() {
+        0
+    } else {
+        (n_samples as f64 * DEFAULT_BRIDGE_FRACTION) as usize
+    };
+    let n_blob = n_samples - n_bridge;
+
+    // variable cluster sizes over the blob budget
+    let mut assignments = Vec::with_capacity(n_blob);
+    for cluster_idx in 0..n_clusters {
+        let weight = rng.random_range(0.5..2.5);
+        let n_in_cluster = ((n_blob as f64 * weight) / (n_clusters as f64 * 1.25)) as usize;
+        assignments.extend(vec![cluster_idx; n_in_cluster]);
+    }
+    while assignments.len() < n_blob {
+        assignments.push(rng.random_range(0..n_clusters));
+    }
+    assignments.shuffle(&mut rng);
+    assignments.truncate(n_blob);
+
+    let mut labels = Vec::with_capacity(n_samples);
+    let mut row = 0;
+
+    for &cluster_idx in &assignments {
+        let centre = &centres[cluster_idx];
+        let std = cluster_stds[cluster_idx];
+        for j in 0..dim {
+            let noise: f64 = rng.sample(StandardNormal);
+            data[(row, j)] = T::from_f64(centre[j] + noise * std).unwrap();
+        }
+        labels.push(cluster_idx);
+        row += 1;
+    }
+
+    // bridge points: thin Gaussian tube interpolating between connected centres
+    for _ in 0..n_bridge {
+        let (a, b) = edges[rng.random_range(0..edges.len())];
+        let t: f64 = rng.random();
+        let tube = (cluster_stds[a] + cluster_stds[b]) * 0.5 * 0.3;
+        for j in 0..dim {
+            let mid = (1.0 - t) * centres[a][j] + t * centres[b][j];
+            let noise: f64 = rng.sample(StandardNormal);
+            data[(row, j)] = T::from_f64(mid + noise * tube).unwrap();
+        }
+        labels.push(if t < 0.5 { a } else { b });
+        row += 1;
+    }
+
+    (data, labels)
+}
+
+/// Random matrix with `rank` orthonormal columns in `dim`-space (Gram-Schmidt).
+fn random_orthonormal_basis<T>(dim: usize, rank: usize, rng: &mut StdRng) -> Mat<T>
+where
+    T: Float + FromPrimitive + ComplexField,
+{
+    let r = rank.min(dim);
+    let mut b = Mat::<T>::zeros(dim, r);
+    for i in 0..dim {
+        for j in 0..r {
+            b[(i, j)] = T::from_f64(rng.sample(StandardNormal)).unwrap();
+        }
+    }
+    for col in 0..r {
+        for prev in 0..col {
+            let mut dot = T::zero();
+            for row in 0..dim {
+                dot = dot + b[(row, col)] * b[(row, prev)];
+            }
+            for row in 0..dim {
+                b[(row, col)] = b[(row, col)] - dot * b[(row, prev)];
+            }
+        }
+        let mut norm_sq = T::zero();
+        for row in 0..dim {
+            norm_sq = norm_sq + b[(row, col)] * b[(row, col)];
+        }
+        let norm = norm_sq.sqrt();
+        if norm > T::epsilon() {
+            for row in 0..dim {
+                b[(row, col)] = b[(row, col)] / norm;
+            }
+        }
+    }
+    b
 }
 
 /// Generate synthetic single-cell-like data with cluster structure and
-/// correlated dimensions
+/// off-axis correlated dimensions.
 ///
-/// Creates well-separated clusters with subspace structure plus inter-dimension
-/// correlations that OPQ can exploit.
+/// Well-separated clusters, each an arbitrarily-oriented ellipsoid (low-rank
+/// power-law covariance), plus a globally-shared off-axis subspace carrying
+/// inter-dimension correlation. The structured variance does not align with the
+/// coordinate axes, so a learned rotation (OPQ) can recover it while axis-aligned
+/// PQ cannot. `correlation_strength` splits structured variance between the
+/// shared global subspace (1.0) and the cluster-local one (0.0).
 ///
 /// ### Params
 ///
-/// * `n_samples` - Number of samples (samples)
+/// * `n_samples` - Number of samples
 /// * `dim` - Embedding dimensionality
 /// * `n_clusters` - Number of distinct clusters
-/// * `correlation_strength` - How strongly correlated dims depend on source
-///   dims (0.0-1.0)
+/// * `correlation_strength` - Share of structured variance in the global
+///   off-axis subspace (0.0-1.0)
 /// * `seed` - Random seed for reproducibility
 ///
 /// ### Returns
 ///
-/// Matrix of shape (n_samples, dim)
+/// Matrix of shape (n_samples, dim) and cluster assignments
 pub fn generate_clustered_data_high_dim<T>(
     n_samples: usize,
     dim: usize,
@@ -219,21 +312,20 @@ where
     let mut data = Mat::<T>::zeros(n_samples, dim);
 
     let scale = (dim as f64).sqrt() * 2.0;
-
-    // generate well-separated centres
-    let mut centres = Vec::with_capacity(n_clusters);
     let min_separation = scale * 0.8;
 
+    // well-separated centres
+    let mut centres: Vec<Vec<f64>> = Vec::with_capacity(n_clusters);
     for _ in 0..n_clusters {
         let centre = loop {
             let candidate: Vec<f64> = (0..dim).map(|_| rng.random_range(-scale..scale)).collect();
             let too_close = centres.iter().any(|existing: &Vec<f64>| {
-                let dist_sq: f64 = candidate
+                let d: f64 = candidate
                     .iter()
-                    .zip(existing.iter())
+                    .zip(existing)
                     .map(|(a, b)| (a - b).powi(2))
                     .sum();
-                dist_sq < min_separation.powi(2)
+                d < min_separation.powi(2)
             });
             if !too_close {
                 break candidate;
@@ -242,92 +334,72 @@ where
         centres.push(centre);
     }
 
-    // subspace structure
-    let active_dims_per_cluster = (dim / 2).max(3);
-    let cluster_active_dims: Vec<Vec<usize>> = centres
-        .iter()
-        .map(|_| {
-            let mut dims: Vec<usize> = (0..dim).collect();
-            dims.shuffle(&mut rng);
-            dims.truncate(active_dims_per_cluster);
-            dims
-        })
+    // globally-shared off-axis correlated subspace
+    let corr_rank = DEFAULT_CORR_RANK.min(dim);
+    let global_basis = random_orthonormal_basis::<T>(dim, corr_rank, &mut rng);
+    let global_spec: Vec<f64> = (0..corr_rank)
+        .map(|i| (scale / 10.0) / ((i + 1) as f64).powf(DEFAULT_ANISO_DECAY))
         .collect();
 
-    let mut cluster_stds = Vec::new();
-    for _ in 0..n_clusters {
-        cluster_stds.push(rng.random_range(0.3..1.0) * scale / 10.0);
-    }
+    // per-cluster oriented covariance: random basis + power-law spectrum
+    let rank = DEFAULT_LOCAL_RANK.min(dim);
+    let bases: Vec<Mat<T>> = (0..n_clusters)
+        .map(|_| random_orthonormal_basis::<T>(dim, rank, &mut rng))
+        .collect();
+    let spectra: Vec<Vec<f64>> = (0..n_clusters)
+        .map(|_| {
+            let s = rng.random_range(0.3..1.0) * scale / 10.0;
+            (0..rank)
+                .map(|i| s / ((i + 1) as f64).powf(DEFAULT_ANISO_DECAY))
+                .collect()
+        })
+        .collect();
+    let floor = scale / 100.0;
 
-    // assign samples
-    let mut cluster_assignments = Vec::new();
+    let sg = correlation_strength.clamp(0.0, 1.0).sqrt();
+    let sl = (1.0 - correlation_strength.clamp(0.0, 1.0)).sqrt();
+
+    // variable cluster sizes
+    let mut assignments = Vec::new();
     for cluster_idx in 0..n_clusters {
         let weight = rng.random_range(0.5..2.5);
         let n_in_cluster = ((n_samples as f64 * weight) / (n_clusters as f64 * 1.25)) as usize;
-        cluster_assignments.extend(vec![cluster_idx; n_in_cluster]);
+        assignments.extend(vec![cluster_idx; n_in_cluster]);
     }
-    while cluster_assignments.len() < n_samples {
-        cluster_assignments.push(rng.random_range(0..n_clusters));
+    while assignments.len() < n_samples {
+        assignments.push(rng.random_range(0..n_clusters));
     }
-    cluster_assignments.shuffle(&mut rng);
-    cluster_assignments.truncate(n_samples);
+    assignments.shuffle(&mut rng);
+    assignments.truncate(n_samples);
 
-    // generate base samples
-    for (i, &cluster_idx) in cluster_assignments.iter().enumerate() {
+    // sample = centre + isotropic floor + shared global component + cluster-local component
+    for (i, &cluster_idx) in assignments.iter().enumerate() {
         let centre = &centres[cluster_idx];
-        let std = cluster_stds[cluster_idx];
-        let active_dims = &cluster_active_dims[cluster_idx];
-
         for j in 0..dim {
-            let noise_scale = if active_dims.contains(&j) {
-                std
-            } else {
-                std * 0.1
-            };
-            let u1: f64 = rng.random();
-            let u2: f64 = rng.random();
-            let noise = (-2.0 * u1.ln()).sqrt() * (2.0 * std::f64::consts::PI * u2).cos();
-            data[(i, j)] = T::from_f64(centre[j] + noise * noise_scale).unwrap();
-        }
-    }
-
-    // add correlation structure: groups of dimensions that are linear
-    // combinations of "source" dimensions plus noise
-    let n_correlation_groups = dim / 8;
-    let dims_per_group = 4;
-    let noise_weight = 1.0 - correlation_strength;
-
-    for group in 0..n_correlation_groups {
-        let source_dim = group * 8;
-        if source_dim >= dim {
-            break;
+            let g: f64 = rng.sample(StandardNormal);
+            data[(i, j)] = T::from_f64(centre[j] + g * floor).unwrap();
         }
 
-        // generate random mixing coefficients for this group
-        let coeffs: Vec<f64> = (0..dims_per_group)
-            .map(|_| rng.random_range(-2.0..2.0))
-            .collect();
-
-        for target_offset in 1..=dims_per_group {
-            let target_dim = source_dim + target_offset;
-            if target_dim >= dim {
-                break;
+        for k in 0..corr_rank {
+            let z: f64 = rng.sample(StandardNormal);
+            let amp = T::from_f64(z * global_spec[k] * sg).unwrap();
+            for j in 0..dim {
+                data[(i, j)] = data[(i, j)] + amp * global_basis[(j, k)];
             }
+        }
 
-            for i in 0..n_samples {
-                let source_val = data[(i, source_dim)].to_f64().unwrap();
-                let original_val = data[(i, target_dim)].to_f64().unwrap();
-
-                // correlated value = weighted sum of source + original noise
-                let correlated = source_val * coeffs[target_offset - 1] * correlation_strength
-                    + original_val * noise_weight;
-
-                data[(i, target_dim)] = T::from_f64(correlated).unwrap();
+        let basis = &bases[cluster_idx];
+        let spec = &spectra[cluster_idx];
+        for k in 0..rank {
+            let z: f64 = rng.sample(StandardNormal);
+            let amp = T::from_f64(z * spec[k] * sl).unwrap();
+            for j in 0..dim {
+                data[(i, j)] = data[(i, j)] + amp * basis[(j, k)];
             }
         }
     }
 
-    (data, cluster_assignments)
+    (data, assignments)
 }
 
 /// Generate manifold-based data
@@ -363,117 +435,135 @@ where
 
     let mut rng = StdRng::seed_from_u64(seed);
 
-    // generate well-separated clusters in low-dimensional space
-    let cluster_separation = (intrinsic_dim as f64).sqrt() * 3.0;
-    let mut centres_low_dim = Vec::with_capacity(n_clusters);
+    // hierarchy: roots far apart, leaves clustered tightly around their root
+    let n_roots = (n_clusters as f64).sqrt().ceil().max(1.0) as usize;
+    let root_sep = (intrinsic_dim as f64).sqrt() * 3.0;
+    let leaf_offset = root_sep * 0.25;
 
-    for _ in 0..n_clusters {
-        let centre = loop {
-            let candidate: Vec<f64> = (0..intrinsic_dim)
-                .map(|_| rng.random_range(-cluster_separation..cluster_separation))
-                .collect();
+    let roots: Vec<Vec<f64>> = (0..n_roots)
+        .map(|_| {
+            (0..intrinsic_dim)
+                .map(|_| rng.random_range(-root_sep..root_sep))
+                .collect()
+        })
+        .collect();
 
-            let too_close = centres_low_dim.iter().any(|existing: &Vec<f64>| {
-                let dist_sq: f64 = candidate
-                    .iter()
-                    .zip(existing.iter())
-                    .map(|(a, b)| (a - b).powi(2))
-                    .sum();
-                dist_sq < (cluster_separation * 0.5).powi(2)
-            });
+    let leaf_root: Vec<usize> = (0..n_clusters).map(|l| l % n_roots).collect();
 
-            if !too_close {
-                break candidate;
-            }
-        };
-        centres_low_dim.push(centre);
-    }
+    let centres: Vec<Vec<f64>> = (0..n_clusters)
+        .map(|leaf| {
+            let root = &roots[leaf_root[leaf]];
+            (0..intrinsic_dim)
+                .map(|d| root[d] + rng.sample::<f64, _>(StandardNormal) * leaf_offset)
+                .collect()
+        })
+        .collect();
 
-    // assign samples to clusters
-    let mut cluster_assignments = Vec::new();
-    for cluster_idx in 0..n_clusters {
-        let n_in_cluster = n_samples / n_clusters;
-        cluster_assignments.extend(vec![cluster_idx; n_in_cluster]);
-    }
-    while cluster_assignments.len() < n_samples {
-        cluster_assignments.push(rng.random_range(0..n_clusters));
-    }
-    cluster_assignments.shuffle(&mut rng);
-
-    // generate samples in low-dimensional space
-    let mut data_low_dim = Mat::<T>::zeros(n_samples, intrinsic_dim);
-    let cluster_std = 0.3;
-
-    for (i, &cluster_idx) in cluster_assignments.iter().enumerate() {
-        let centre = &centres_low_dim[cluster_idx];
-        for j in 0..intrinsic_dim {
-            let u1: f64 = rng.random();
-            let u2: f64 = rng.random();
-            let noise = (-2.0 * u1.ln()).sqrt() * (2.0 * std::f64::consts::PI * u2).cos();
-            data_low_dim[(i, j)] = T::from_f64(centre[j] + noise * cluster_std).unwrap();
+    // trajectories: chain leaves within each lineage (state transitions)
+    let mut edges: Vec<(usize, usize)> = Vec::new();
+    for r in 0..n_roots {
+        let members: Vec<usize> = (0..n_clusters).filter(|&l| leaf_root[l] == r).collect();
+        for w in members.windows(2) {
+            edges.push((w[0], w[1]));
         }
     }
 
-    // create random rotation matrix to embed into high-dimensional space
-    let mut rotation = Mat::<T>::zeros(intrinsic_dim, embedding_dim);
+    let n_traj = if edges.is_empty() {
+        0
+    } else {
+        (n_samples as f64 * DEFAULT_TRAJECTORY_FRACTION) as usize
+    };
+    let n_blob = n_samples - n_traj;
 
-    // fill with random Gaussian values
+    let mut assignments = Vec::with_capacity(n_blob);
+    for leaf in 0..n_clusters {
+        assignments.extend(vec![leaf; n_blob / n_clusters]);
+    }
+    while assignments.len() < n_blob {
+        assignments.push(rng.random_range(0..n_clusters));
+    }
+    assignments.shuffle(&mut rng);
+    assignments.truncate(n_blob);
+
+    let mut low = Mat::<T>::zeros(n_samples, intrinsic_dim);
+    let mut labels = Vec::with_capacity(n_samples);
+    let cluster_std = 0.3;
+    let mut row = 0;
+
+    for &leaf in &assignments {
+        let centre = &centres[leaf];
+        for j in 0..intrinsic_dim {
+            let noise: f64 = rng.sample(StandardNormal);
+            low[(row, j)] = T::from_f64(centre[j] + noise * cluster_std).unwrap();
+        }
+        labels.push(leaf);
+        row += 1;
+    }
+
+    // trajectory points: quadratic Bezier with a random control-point bend
+    for _ in 0..n_traj {
+        let (a, b) = edges[rng.random_range(0..edges.len())];
+        let ctrl: Vec<f64> = (0..intrinsic_dim)
+            .map(|d| {
+                0.5 * (centres[a][d] + centres[b][d])
+                    + rng.sample::<f64, _>(StandardNormal) * leaf_offset * 0.5
+            })
+            .collect();
+        let t: f64 = rng.random();
+        let (u, v, w) = ((1.0 - t) * (1.0 - t), 2.0 * (1.0 - t) * t, t * t);
+        for j in 0..intrinsic_dim {
+            let pos = u * centres[a][j] + v * ctrl[j] + w * centres[b][j];
+            let noise: f64 = rng.sample(StandardNormal);
+            low[(row, j)] = T::from_f64(pos + noise * cluster_std).unwrap();
+        }
+        labels.push(if t < 0.5 { a } else { b });
+        row += 1;
+    }
+
+    // isometric embedding: intrinsic_dim orthonormal ROWS in embedding space
+    let mut rotation = Mat::<T>::zeros(intrinsic_dim, embedding_dim);
     for i in 0..intrinsic_dim {
         for j in 0..embedding_dim {
             let val: f64 = rng.sample(StandardNormal);
             rotation[(i, j)] = T::from_f64(val).unwrap();
         }
     }
-
-    // orthonormalise columns via Gram-Schmidt
-    for col in 0..embedding_dim.min(intrinsic_dim) {
-        // orthogonalise against previous columns
-        for prev_col in 0..col {
+    for r in 0..intrinsic_dim {
+        for prev in 0..r {
             let mut dot = T::zero();
-            for row in 0..intrinsic_dim {
-                dot = dot + rotation[(row, col)] * rotation[(row, prev_col)];
+            for c in 0..embedding_dim {
+                dot = dot + rotation[(r, c)] * rotation[(prev, c)];
             }
-            for row in 0..intrinsic_dim {
-                rotation[(row, col)] = rotation[(row, col)] - dot * rotation[(row, prev_col)];
+            for c in 0..embedding_dim {
+                rotation[(r, c)] = rotation[(r, c)] - dot * rotation[(prev, c)];
             }
         }
-
         let mut norm_sq = T::zero();
-        for row in 0..intrinsic_dim {
-            norm_sq = norm_sq + rotation[(row, col)] * rotation[(row, col)];
+        for c in 0..embedding_dim {
+            norm_sq = norm_sq + rotation[(r, c)] * rotation[(r, c)];
         }
         let norm = norm_sq.sqrt();
         if norm > T::epsilon() {
-            for row in 0..intrinsic_dim {
-                rotation[(row, col)] = rotation[(row, col)] / norm;
+            for c in 0..embedding_dim {
+                rotation[(r, c)] = rotation[(r, c)] / norm;
             }
         }
     }
 
-    // project to high-dimensional space: data_high = data_low * rotation
-    let mut data_high_dim = Mat::<T>::zeros(n_samples, embedding_dim);
+    let mut high = Mat::<T>::zeros(n_samples, embedding_dim);
+    let noise_std = 0.01;
     for i in 0..n_samples {
         for j in 0..embedding_dim {
             let mut sum = T::zero();
             for k in 0..intrinsic_dim {
-                sum = sum + data_low_dim[(i, k)] * rotation[(k, j)];
+                sum = sum + low[(i, k)] * rotation[(k, j)];
             }
-            data_high_dim[(i, j)] = sum;
+            let noise: f64 = rng.sample(StandardNormal);
+            high[(i, j)] = sum + T::from_f64(noise * noise_std).unwrap();
         }
     }
 
-    // Add small amount of isotropic noise in the full space
-    let noise_std = 0.01;
-    for i in 0..n_samples {
-        for j in 0..embedding_dim {
-            let u1: f64 = rng.random();
-            let u2: f64 = rng.random();
-            let noise = (-2.0 * u1.ln()).sqrt() * (2.0 * std::f64::consts::PI * u2).cos();
-            data_high_dim[(i, j)] = data_high_dim[(i, j)] + T::from_f64(noise * noise_std).unwrap();
-        }
-    }
-
-    (data_high_dim, cluster_assignments)
+    (high, labels)
 }
 
 /// Random orthogonal matrix via Gram-Schmidt on Gaussian random matrix.
@@ -726,10 +816,6 @@ where
 
 ////////////////
 // Benchmarks //
-////////////////
-
-////////////////
-// Structures //
 ////////////////
 
 /// BenchmarkResult

@@ -5,6 +5,7 @@
 **Features**
 
 - Version bump on cubecl to `"0.10.0"`.
+- More and improved error handling across the board.
 - TurboQuantisation with exhaustive and IVF index implemented
 
 ## 0.3.1

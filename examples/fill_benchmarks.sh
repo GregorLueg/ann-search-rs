@@ -231,6 +231,18 @@ case "$KIND" in
             "rabitq:euclidean:correlated:1024:50000|cargo run --example gridsearch_rabitq --release --features binary -- --data correlated --n-samples 50000 --dim 1024"
             "rabitq:euclidean:lowrank:1024:50000|cargo run --example gridsearch_rabitq --release --features binary -- --data lowrank --n-samples 50000 --dim 1024 --intrinsic-dim 128"
             "rabitq:euclidean:quantisation:1024:50000|cargo run --example gridsearch_rabitq --release --features binary -- --data quantisation --n-samples 50000 --dim 1024 --n-clusters 50"
+
+            "turboquant:euclidean:correlated:256:50000|cargo run --example gridsearch_tq --release --features binary -- --data correlated --n-samples 50000 --dim 256"
+            "turboquant:euclidean:lowrank:256:50000|cargo run --example gridsearch_tq --release --features binary -- --data lowrank --n-samples 50000 --dim 256 --intrinsic-dim 32"
+            "turboquant:euclidean:quantisation:256:50000|cargo run --example gridsearch_tq --release --features binary -- --data quantisation --n-samples 50000 --dim 256 --n-clusters 50"
+
+            "turboquant:euclidean:correlated:512:50000|cargo run --example gridsearch_tq --release --features binary -- --data correlated --n-samples 50000 --dim 512"
+            "turboquant:euclidean:lowrank:512:50000|cargo run --example gridsearch_tq --release --features binary -- --data lowrank --n-samples 50000 --dim 512 --intrinsic-dim 64"
+            "turboquant:euclidean:quantisation:512:50000|cargo run --example gridsearch_tq --release --features binary -- --data quantisation --n-samples 50000 --dim 512 --n-clusters 50"
+
+            "turboquant:euclidean:correlated:1024:50000|cargo run --example gridsearch_tq --release --features binary -- --data correlated --n-samples 50000 --dim 1024"
+            "turboquant:euclidean:lowrank:1024:50000|cargo run --example gridsearch_tq --release --features binary -- --data lowrank --n-samples 50000 --dim 1024 --intrinsic-dim 128"
+            "turboquant:euclidean:quantisation:1024:50000|cargo run --example gridsearch_tq --release --features binary -- --data quantisation --n-samples 50000 --dim 1024 --n-clusters 50"
         )
         ;;
     quantised)
