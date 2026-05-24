@@ -77,8 +77,10 @@ pub struct IvfTurboQuant<T> {
     /// Per-cluster blocked codes for 2/4-bit, one entry per cell. `None` for
     /// 3-bit, which scores through the scalar path instead.
     blocked: Option<Vec<ClusterBlocked>>,
-    /// Per-vector L2 norms in CSR order, pre-cast to f32 for the SIMD kernels.
+    /// Per-vector raw L2 norms in CSR order, pre-cast to f32 for the SIMD kernels.
     norms_f32_csr: Vec<f32>,
+    /// Per-vector dot-correction scalars `1 / <u, x_hat>` in CSR order, pre-cast to f32 for the SIMD kernels.
+    corrections_f32_csr: Vec<f32>,
     /// Number of stored vectors.
     n: usize,
     /// Optional on-disk original vectors for exact re-ranking.
@@ -251,9 +253,16 @@ where
         let quantiser = TurboQuantQuantiser::new(data, &metric, bits, seed as u64)?;
         let bits = quantiser.storage.bits;
 
-        // per-vector norms reordered into CSR slot order for the kernels.
+        // per-vector raw norms and dot-corrections reordered into CSR slot order for the kernels.
         let norms_f32_csr: Vec<f32> = (0..n)
             .map(|s| quantiser.storage.norms[vector_indices[s]].to_f32().unwrap())
+            .collect();
+        let corrections_f32_csr: Vec<f32> = (0..n)
+            .map(|s| {
+                quantiser.storage.corrections[vector_indices[s]]
+                    .to_f32()
+                    .unwrap()
+            })
             .collect();
 
         // Per-cluster blocked layouts for 2/4-bit. 3-bit scores via the scalar
@@ -276,13 +285,15 @@ where
                 }
 
                 // Throwaway storage purely to drive `repack`; only packed_codes,
-                // n, bits, and dim are read, so norms is left empty.
+                // n, bits, and dim are read, so norms and corrections are left empty.
 
                 let norms: Vec<T> = Vec::new();
+                let corrections: Vec<T> = Vec::new();
 
                 let cell = TurboQuantStorage {
                     packed_codes: packed,
                     norms,
+                    corrections,
                     dim,
                     bits,
                     bytes_per_vec,
@@ -313,6 +324,7 @@ where
             vector_indices,
             blocked,
             norms_f32_csr,
+            corrections_f32_csr,
             n,
             vector_store: None,
         })
@@ -478,6 +490,7 @@ where
                 csize,
                 cb.n_blocks,
                 &self.norms_f32_csr[off..end],
+                &self.corrections_f32_csr[off..end],
                 [qn; 4],
                 self.metric,
                 1,
@@ -775,6 +788,7 @@ where
                             csize,
                             cb.n_blocks,
                             &self.norms_f32_csr[off..end],
+                            &self.corrections_f32_csr[off..end],
                             qnorms,
                             self.metric,
                             batch_nq,
@@ -898,6 +912,7 @@ where
             + self.cluster_offsets.capacity() * std::mem::size_of::<usize>()
             + self.vector_indices.capacity() * std::mem::size_of::<usize>()
             + self.norms_f32_csr.capacity() * std::mem::size_of::<f32>()
+            + self.corrections_f32_csr.capacity() * std::mem::size_of::<f32>()
             + blocked
     }
 }
