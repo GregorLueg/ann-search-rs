@@ -840,110 +840,306 @@ pub(crate) unsafe fn fused4_avx2(
         let norms_ptr = norms_f32.as_ptr().add(base_vec);
 
         for qi in 0..batch_nq {
-            let v_scale = _mm256_set1_ps(scales[qi]);
-            let v_bias = _mm256_set1_ps(biases[qi]);
-
-            let mut a0 = accus[qi][0];
-            let a1 = accus[qi][1];
-            let mut a2 = accus[qi][2];
-            let a3 = accus[qi][3];
-            a0 = _mm256_sub_epi16(a0, _mm256_slli_epi16(a1, 8));
-            a2 = _mm256_sub_epi16(a2, _mm256_slli_epi16(a3, 8));
-            let dis0 = _mm256_add_epi16(
-                _mm256_permute2x128_si256(a0, a1, 0x21),
-                _mm256_blend_epi32(a0, a1, 0xF0),
+            epilogue_one_query_avx2(
+                &accus[qi],
+                base_vec,
+                end_lane,
+                norms_f32,
+                scales[qi],
+                biases[qi],
+                query_norms[qi],
+                metric,
+                &mut heaps[qi],
             );
-            let dis1 = _mm256_add_epi16(
-                _mm256_permute2x128_si256(a2, a3, 0x21),
-                _mm256_blend_epi32(a2, a3, 0xF0),
-            );
+        }
+    }
 
-            let f0 = _mm256_cvtepi32_ps(_mm256_cvtepu16_epi32(_mm256_castsi256_si128(dis0)));
-            let f1 = _mm256_cvtepi32_ps(_mm256_cvtepu16_epi32(_mm256_extracti128_si256(dis0, 1)));
-            let f2 = _mm256_cvtepi32_ps(_mm256_cvtepu16_epi32(_mm256_castsi256_si128(dis1)));
-            let f3 = _mm256_cvtepi32_ps(_mm256_cvtepu16_epi32(_mm256_extracti128_si256(dis1, 1)));
+    heaps
+        .into_iter()
+        .enumerate()
+        .take(batch_nq)
+        .map(|(qi, h)| h.into_sorted(query_norms[qi], metric))
+        .collect()
+}
 
-            let ip0 = _mm256_fmadd_ps(v_scale, f0, v_bias);
-            let ip1 = _mm256_fmadd_ps(v_scale, f1, v_bias);
-            let ip2 = _mm256_fmadd_ps(v_scale, f2, v_bias);
-            let ip3 = _mm256_fmadd_ps(v_scale, f3, v_bias);
+/// Per-query block epilogue (AVX2): combine accumulators, convert, apply
+/// the metric key transform, prune, and update one query's heap.
+///
+/// Shared by [`fused4_avx2`] and the AVX-512BW driver (which extracts each
+/// block's 256-bit accumulator half and calls this once per block).
+/// `acc` holds the four interleaved u16 accumulators for a single query
+/// over a single 32-vector block.
+///
+/// ### Safety
+///
+/// Requires AVX2 + FMA. `norms_f32` must be valid for `base_vec + end_lane`.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2", enable = "fma")]
+#[allow(clippy::too_many_arguments)]
+unsafe fn epilogue_one_query_avx2(
+    acc: &[std::arch::x86_64::__m256i; 4],
+    base_vec: usize,
+    end_lane: usize,
+    norms_f32: &[f32],
+    scale: f32,
+    bias: f32,
+    query_norm: f32,
+    metric: Dist,
+    heap: &mut TopK,
+) {
+    use std::arch::x86_64::*;
 
-            // Cosine ranks by ip directly; squared-Euclidean needs the
-            // per-vector norm folded in. Full blocks compute the key in
-            // register; partial blocks defer the key to the scalar tail
-            // (avoids an out-of-bounds norm load on the last block).
-            match metric {
-                Dist::Cosine => {
-                    if end_lane == BLOCK && heaps[qi].is_full() {
-                        let thr = _mm256_set1_ps(heaps[qi].min_key());
-                        let m = _mm256_movemask_ps(_mm256_cmp_ps(ip0, thr, _CMP_GT_OQ))
-                            | _mm256_movemask_ps(_mm256_cmp_ps(ip1, thr, _CMP_GT_OQ))
-                            | _mm256_movemask_ps(_mm256_cmp_ps(ip2, thr, _CMP_GT_OQ))
-                            | _mm256_movemask_ps(_mm256_cmp_ps(ip3, thr, _CMP_GT_OQ));
-                        if m == 0 {
-                            continue;
-                        }
-                    }
-                    let mut buf = [0.0f32; BLOCK];
-                    let bp = buf.as_mut_ptr();
-                    _mm256_storeu_ps(bp, ip0);
-                    _mm256_storeu_ps(bp.add(8), ip1);
-                    _mm256_storeu_ps(bp.add(16), ip2);
-                    _mm256_storeu_ps(bp.add(24), ip3);
-                    for lane in 0..end_lane {
-                        heaps[qi].push(buf[lane], (base_vec + lane) as u32);
-                    }
+    let v_scale = _mm256_set1_ps(scale);
+    let v_bias = _mm256_set1_ps(bias);
+
+    let mut a0 = acc[0];
+    let a1 = acc[1];
+    let mut a2 = acc[2];
+    let a3 = acc[3];
+    a0 = _mm256_sub_epi16(a0, _mm256_slli_epi16(a1, 8));
+    a2 = _mm256_sub_epi16(a2, _mm256_slli_epi16(a3, 8));
+    let dis0 = _mm256_add_epi16(
+        _mm256_permute2x128_si256(a0, a1, 0x21),
+        _mm256_blend_epi32(a0, a1, 0xF0),
+    );
+    let dis1 = _mm256_add_epi16(
+        _mm256_permute2x128_si256(a2, a3, 0x21),
+        _mm256_blend_epi32(a2, a3, 0xF0),
+    );
+
+    let f0 = _mm256_cvtepi32_ps(_mm256_cvtepu16_epi32(_mm256_castsi256_si128(dis0)));
+    let f1 = _mm256_cvtepi32_ps(_mm256_cvtepu16_epi32(_mm256_extracti128_si256(dis0, 1)));
+    let f2 = _mm256_cvtepi32_ps(_mm256_cvtepu16_epi32(_mm256_castsi256_si128(dis1)));
+    let f3 = _mm256_cvtepi32_ps(_mm256_cvtepu16_epi32(_mm256_extracti128_si256(dis1, 1)));
+
+    let ip0 = _mm256_fmadd_ps(v_scale, f0, v_bias);
+    let ip1 = _mm256_fmadd_ps(v_scale, f1, v_bias);
+    let ip2 = _mm256_fmadd_ps(v_scale, f2, v_bias);
+    let ip3 = _mm256_fmadd_ps(v_scale, f3, v_bias);
+
+    let norms_ptr = norms_f32.as_ptr().add(base_vec);
+
+    match metric {
+        Dist::Cosine => {
+            if end_lane == BLOCK && heap.is_full() {
+                let thr = _mm256_set1_ps(heap.min_key());
+                let m = _mm256_movemask_ps(_mm256_cmp_ps(ip0, thr, _CMP_GT_OQ))
+                    | _mm256_movemask_ps(_mm256_cmp_ps(ip1, thr, _CMP_GT_OQ))
+                    | _mm256_movemask_ps(_mm256_cmp_ps(ip2, thr, _CMP_GT_OQ))
+                    | _mm256_movemask_ps(_mm256_cmp_ps(ip3, thr, _CMP_GT_OQ));
+                if m == 0 {
+                    return;
                 }
-                Dist::SquaredEuclidean => {
-                    if end_lane == BLOCK {
-                        let v_two_qn = _mm256_set1_ps(2.0 * query_norms[qi]);
-                        let key_of = |ip: __m256, off: usize| {
-                            let vn = _mm256_loadu_ps(norms_ptr.add(off));
-                            let coef = _mm256_mul_ps(v_two_qn, vn);
-                            let neg_vn2 = _mm256_sub_ps(_mm256_setzero_ps(), _mm256_mul_ps(vn, vn));
-                            _mm256_fmadd_ps(coef, ip, neg_vn2)
-                        };
-                        let k0 = key_of(ip0, 0);
-                        let k1 = key_of(ip1, 8);
-                        let k2 = key_of(ip2, 16);
-                        let k3 = key_of(ip3, 24);
-
-                        if heaps[qi].is_full() {
-                            let thr = _mm256_set1_ps(heaps[qi].min_key());
-                            let m = _mm256_movemask_ps(_mm256_cmp_ps(k0, thr, _CMP_GT_OQ))
-                                | _mm256_movemask_ps(_mm256_cmp_ps(k1, thr, _CMP_GT_OQ))
-                                | _mm256_movemask_ps(_mm256_cmp_ps(k2, thr, _CMP_GT_OQ))
-                                | _mm256_movemask_ps(_mm256_cmp_ps(k3, thr, _CMP_GT_OQ));
-                            if m == 0 {
-                                continue;
-                            }
-                        }
-                        let mut buf = [0.0f32; BLOCK];
-                        let bp = buf.as_mut_ptr();
-                        _mm256_storeu_ps(bp, k0);
-                        _mm256_storeu_ps(bp.add(8), k1);
-                        _mm256_storeu_ps(bp.add(16), k2);
-                        _mm256_storeu_ps(bp.add(24), k3);
-                        for lane in 0..BLOCK {
-                            heaps[qi].push(buf[lane], (base_vec + lane) as u32);
-                        }
-                    } else {
-                        // Partial last block: materialise ip, key in scalar.
-                        let mut buf = [0.0f32; BLOCK];
-                        let bp = buf.as_mut_ptr();
-                        _mm256_storeu_ps(bp, ip0);
-                        _mm256_storeu_ps(bp.add(8), ip1);
-                        _mm256_storeu_ps(bp.add(16), ip2);
-                        _mm256_storeu_ps(bp.add(24), ip3);
-                        for lane in 0..end_lane {
-                            let vi = base_vec + lane;
-                            let key = ip_to_key(buf[lane], query_norms[qi], norms_f32[vi], metric);
-                            heaps[qi].push(key, vi as u32);
-                        }
-                    }
-                }
-                Dist::Manhattan => unreachable!("TurboQuant does not support Manhattan distance"),
             }
+            let mut buf = [0.0f32; BLOCK];
+            let bp = buf.as_mut_ptr();
+            _mm256_storeu_ps(bp, ip0);
+            _mm256_storeu_ps(bp.add(8), ip1);
+            _mm256_storeu_ps(bp.add(16), ip2);
+            _mm256_storeu_ps(bp.add(24), ip3);
+            for lane in 0..end_lane {
+                heap.push(buf[lane], (base_vec + lane) as u32);
+            }
+        }
+        Dist::SquaredEuclidean => {
+            if end_lane == BLOCK {
+                let v_two_qn = _mm256_set1_ps(2.0 * query_norm);
+                let key_of = |ip: __m256, off: usize| {
+                    let vn = _mm256_loadu_ps(norms_ptr.add(off));
+                    let coef = _mm256_mul_ps(v_two_qn, vn);
+                    let neg_vn2 = _mm256_sub_ps(_mm256_setzero_ps(), _mm256_mul_ps(vn, vn));
+                    _mm256_fmadd_ps(coef, ip, neg_vn2)
+                };
+                let k0 = key_of(ip0, 0);
+                let k1 = key_of(ip1, 8);
+                let k2 = key_of(ip2, 16);
+                let k3 = key_of(ip3, 24);
+
+                if heap.is_full() {
+                    let thr = _mm256_set1_ps(heap.min_key());
+                    let m = _mm256_movemask_ps(_mm256_cmp_ps(k0, thr, _CMP_GT_OQ))
+                        | _mm256_movemask_ps(_mm256_cmp_ps(k1, thr, _CMP_GT_OQ))
+                        | _mm256_movemask_ps(_mm256_cmp_ps(k2, thr, _CMP_GT_OQ))
+                        | _mm256_movemask_ps(_mm256_cmp_ps(k3, thr, _CMP_GT_OQ));
+                    if m == 0 {
+                        return;
+                    }
+                }
+                let mut buf = [0.0f32; BLOCK];
+                let bp = buf.as_mut_ptr();
+                _mm256_storeu_ps(bp, k0);
+                _mm256_storeu_ps(bp.add(8), k1);
+                _mm256_storeu_ps(bp.add(16), k2);
+                _mm256_storeu_ps(bp.add(24), k3);
+                for lane in 0..BLOCK {
+                    heap.push(buf[lane], (base_vec + lane) as u32);
+                }
+            } else {
+                let mut buf = [0.0f32; BLOCK];
+                let bp = buf.as_mut_ptr();
+                _mm256_storeu_ps(bp, ip0);
+                _mm256_storeu_ps(bp.add(8), ip1);
+                _mm256_storeu_ps(bp.add(16), ip2);
+                _mm256_storeu_ps(bp.add(24), ip3);
+                for lane in 0..end_lane {
+                    let vi = base_vec + lane;
+                    let key = ip_to_key(buf[lane], query_norm, norms_f32[vi], metric);
+                    heap.push(key, vi as u32);
+                }
+            }
+        }
+        Dist::Manhattan => unreachable!("TurboQuant does not support Manhattan distance"),
+    }
+}
+
+/// AVX-512BW counterpart to [`fused4_avx2`]: scores two 32-vector blocks
+/// per inner iteration (64 vectors) via `_mm512_inserti64x4` + a broadcast
+/// LUT shuffle, then runs [`epilogue_one_query_avx2`] on each block's
+/// extracted 256-bit accumulator half. An odd final block is handled by an
+/// inlined AVX2 accumulation pass. Results are identical to [`fused4_avx2`].
+///
+/// ### Safety
+///
+/// Requires AVX2 + FMA + AVX-512F + AVX-512BW. Same buffer-sizing contract
+/// as [`fused4_avx2`].
+#[cfg(target_arch = "x86_64")]
+#[target_feature(
+    enable = "avx2",
+    enable = "fma",
+    enable = "avx512f",
+    enable = "avx512bw"
+)]
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn fused4_avx512bw(
+    luts: &[&QueryLut; 4],
+    blocked: &[u8],
+    n_vectors: usize,
+    n_blocks: usize,
+    norms_f32: &[f32],
+    query_norms: [f32; 4],
+    metric: Dist,
+    k: usize,
+    batch_nq: usize,
+) -> Vec<(Vec<u32>, Vec<f32>)> {
+    use std::arch::x86_64::*;
+
+    let n_byte_groups = luts[0].n_byte_groups;
+    let scales = [luts[0].scale, luts[1].scale, luts[2].scale, luts[3].scale];
+    let biases = [luts[0].bias, luts[1].bias, luts[2].bias, luts[3].bias];
+
+    let mut heaps: Vec<TopK> = (0..4).map(|_| TopK::new(k.min(n_vectors).max(1))).collect();
+
+    let mask512 = _mm512_set1_epi8(0x0F);
+    let mask256 = _mm256_set1_epi8(0x0F);
+    let codes_base = blocked.as_ptr();
+    let n_block_pairs = n_blocks / 2;
+
+    // Main loop: block pairs (64 vectors per group shuffle).
+    for p in 0..n_block_pairs {
+        let b0 = p * 2;
+        let b1 = b0 + 1;
+
+        // [query][0..4] zmm: low 256 = block b0, high 256 = block b1.
+        let mut accus = [[_mm512_setzero_si512(); 4]; 4];
+
+        for g in 0..n_byte_groups {
+            let cp0 = codes_base.add((b0 * n_byte_groups + g) * BLOCK);
+            let cp1 = codes_base.add((b1 * n_byte_groups + g) * BLOCK);
+            let codes = _mm512_inserti64x4(
+                _mm512_castsi256_si512(_mm256_loadu_si256(cp0 as *const __m256i)),
+                _mm256_loadu_si256(cp1 as *const __m256i),
+                1,
+            );
+            let clo = _mm512_and_si512(codes, mask512);
+            let chi = _mm512_and_si512(_mm512_srli_epi16(codes, 4), mask512);
+
+            for qi in 0..4 {
+                let lut256 =
+                    _mm256_loadu_si256(luts[qi].luts_u8.as_ptr().add(g * 32) as *const __m256i);
+                let lut = _mm512_broadcast_i64x4(lut256);
+                let res_lo = _mm512_shuffle_epi8(lut, clo);
+                let res_hi = _mm512_shuffle_epi8(lut, chi);
+                accus[qi][0] = _mm512_add_epi16(accus[qi][0], res_lo);
+                accus[qi][1] = _mm512_add_epi16(accus[qi][1], _mm512_srli_epi16(res_lo, 8));
+                accus[qi][2] = _mm512_add_epi16(accus[qi][2], res_hi);
+                accus[qi][3] = _mm512_add_epi16(accus[qi][3], _mm512_srli_epi16(res_hi, 8));
+            }
+        }
+
+        // Run the shared epilogue on each block's 256-bit half.
+        for which in 0..2 {
+            let b = b0 + which;
+            let base_vec = b * BLOCK;
+            if base_vec >= n_vectors {
+                break;
+            }
+            let end_lane = (base_vec + BLOCK).min(n_vectors) - base_vec;
+            for qi in 0..batch_nq {
+                let half: [__m256i; 4] = if which == 0 {
+                    [
+                        _mm512_castsi512_si256(accus[qi][0]),
+                        _mm512_castsi512_si256(accus[qi][1]),
+                        _mm512_castsi512_si256(accus[qi][2]),
+                        _mm512_castsi512_si256(accus[qi][3]),
+                    ]
+                } else {
+                    [
+                        _mm512_extracti64x4_epi64(accus[qi][0], 1),
+                        _mm512_extracti64x4_epi64(accus[qi][1], 1),
+                        _mm512_extracti64x4_epi64(accus[qi][2], 1),
+                        _mm512_extracti64x4_epi64(accus[qi][3], 1),
+                    ]
+                };
+                epilogue_one_query_avx2(
+                    &half,
+                    base_vec,
+                    end_lane,
+                    norms_f32,
+                    scales[qi],
+                    biases[qi],
+                    query_norms[qi],
+                    metric,
+                    &mut heaps[qi],
+                );
+            }
+        }
+    }
+
+    // Tail: odd final block via AVX2 accumulation + the same epilogue.
+    if n_block_pairs * 2 < n_blocks {
+        let b = n_block_pairs * 2;
+        let base_vec = b * BLOCK;
+        let end_lane = (base_vec + BLOCK).min(n_vectors) - base_vec;
+
+        let mut accus = [[_mm256_setzero_si256(); 4]; 4];
+        for g in 0..n_byte_groups {
+            let cp = codes_base.add((b * n_byte_groups + g) * BLOCK);
+            let codes_v = _mm256_loadu_si256(cp as *const __m256i);
+            let clo = _mm256_and_si256(codes_v, mask256);
+            let chi = _mm256_and_si256(_mm256_srli_epi16(codes_v, 4), mask256);
+            for qi in 0..4 {
+                let lut =
+                    _mm256_loadu_si256(luts[qi].luts_u8.as_ptr().add(g * 32) as *const __m256i);
+                let res_lo = _mm256_shuffle_epi8(lut, clo);
+                let res_hi = _mm256_shuffle_epi8(lut, chi);
+                accus[qi][0] = _mm256_add_epi16(accus[qi][0], res_lo);
+                accus[qi][1] = _mm256_add_epi16(accus[qi][1], _mm256_srli_epi16(res_lo, 8));
+                accus[qi][2] = _mm256_add_epi16(accus[qi][2], res_hi);
+                accus[qi][3] = _mm256_add_epi16(accus[qi][3], _mm256_srli_epi16(res_hi, 8));
+            }
+        }
+        for qi in 0..batch_nq {
+            epilogue_one_query_avx2(
+                &accus[qi],
+                base_vec,
+                end_lane,
+                norms_f32,
+                scales[qi],
+                biases[qi],
+                query_norms[qi],
+                metric,
+                &mut heaps[qi],
+            );
         }
     }
 
@@ -1527,7 +1723,7 @@ mod tests {
         let encoded: Vec<_> = queries
             .iter()
             .map(|query| {
-                let eq = q.encode_query(query);
+                let eq = q.encode_query(query).unwrap();
                 let (q_rot, levels) = prepare_scalar_scoring(&eq, &q.encoder);
                 (
                     build_query_lut(&q_rot, &levels, bits, dim).unwrap(),
