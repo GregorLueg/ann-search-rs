@@ -1478,4 +1478,144 @@ mod tests {
     fn test_oracle_k_one() {
         assert_oracle_matches_brute(4, 128, BLOCK * 2, 1, Dist::SquaredEuclidean);
     }
+
+    #[cfg(target_arch = "x86_64")]
+    fn assert_fused4_matches_oracle(
+        bits: usize,
+        dim: usize,
+        n: usize,
+        k: usize,
+        metric: Dist,
+        nq: usize,
+    ) {
+        if !is_x86_feature_detected!("avx2") || !is_x86_feature_detected!("fma") {
+            eprintln!("skipping: AVX2/FMA not available");
+            return;
+        }
+
+        let q = TurboQuantQuantiser::new(test_data(n, dim).as_ref(), &metric, bits, 42);
+        let (blocked, n_blocks) = blocked_data(&q);
+
+        // Build nq distinct queries.
+        let queries: Vec<Vec<f32>> = (0..nq)
+            .map(|qi| {
+                (0..dim)
+                    .map(|i| ((i + 3 * qi) as f32 * 0.061 + qi as f32).sin())
+                    .collect()
+            })
+            .collect();
+
+        // Per-query scalar oracle.
+        let mut expected = Vec::new();
+        for query in &queries {
+            let eq = q.encode_query(query);
+            let (q_rot, levels) = prepare_scalar_scoring(&eq, &q.encoder);
+            let lut = build_query_lut(&q_rot, &levels, bits, dim);
+            expected.push(score_query_topk_scalar(
+                &lut,
+                &blocked,
+                n,
+                n_blocks,
+                &q.storage.norms,
+                eq.query_norm,
+                metric,
+                k,
+            ));
+        }
+
+        // Fused kernel, batched in groups of 4 with last-query padding.
+        let encoded: Vec<_> = queries
+            .iter()
+            .map(|query| {
+                let eq = q.encode_query(query);
+                let (q_rot, levels) = prepare_scalar_scoring(&eq, &q.encoder);
+                (build_query_lut(&q_rot, &levels, bits, dim), eq.query_norm)
+            })
+            .collect();
+
+        let mut got = Vec::new();
+        let mut qi = 0;
+        while qi < nq {
+            let batch_nq = (nq - qi).min(4);
+            let pad = qi + batch_nq - 1;
+            let luts: [&QueryLut; 4] = [
+                &encoded[qi].0,
+                &encoded[(qi + 1).min(pad)].0,
+                &encoded[(qi + 2).min(pad)].0,
+                &encoded[(qi + 3).min(pad)].0,
+            ];
+            let qnorms = [
+                encoded[qi].1,
+                encoded[(qi + 1).min(pad)].1,
+                encoded[(qi + 2).min(pad)].1,
+                encoded[(qi + 3).min(pad)].1,
+            ];
+            let batch = unsafe {
+                fused4_avx2(
+                    &luts,
+                    &blocked,
+                    n,
+                    n_blocks,
+                    &q.storage.norms,
+                    qnorms,
+                    metric,
+                    k,
+                    batch_nq,
+                )
+            };
+            got.extend(batch);
+            qi += batch_nq;
+        }
+
+        assert_eq!(got.len(), nq);
+        for (i, ((g_idx, g_dist), (e_idx, e_dist))) in got.iter().zip(expected.iter()).enumerate() {
+            assert_eq!(g_idx, e_idx, "{metric:?} query {i} indices diverge");
+            assert_eq!(g_dist, e_dist, "{metric:?} query {i} distances diverge");
+        }
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn test_fused4_cosine_one_batch() {
+        assert_fused4_matches_oracle(4, 256, BLOCK * 4 + 13, 10, Dist::Cosine, 4);
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn test_fused4_sqeuclidean_one_batch() {
+        assert_fused4_matches_oracle(4, 256, BLOCK * 4 + 13, 10, Dist::SquaredEuclidean, 4);
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn test_fused4_cosine_tail_batch() {
+        // nq = 7 -> one full batch of 4 + a padded batch of 3.
+        assert_fused4_matches_oracle(4, 128, BLOCK * 3 + 5, 8, Dist::Cosine, 7);
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn test_fused4_sqeuclidean_tail_batch() {
+        assert_fused4_matches_oracle(4, 128, BLOCK * 3 + 5, 8, Dist::SquaredEuclidean, 7);
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn test_fused4_2bit() {
+        assert_fused4_matches_oracle(2, 512, BLOCK * 2 + 9, 8, Dist::Cosine, 4);
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn test_fused4_prune_path() {
+        // Large n, small k forces the heap full early so the in-register
+        // prune skips most blocks — exercises that path against the oracle.
+        assert_fused4_matches_oracle(4, 256, BLOCK * 20, 5, Dist::Cosine, 4);
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn test_fused4_high_dim() {
+        assert_fused4_matches_oracle(4, 1536, BLOCK * 5 + 1, 10, Dist::SquaredEuclidean, 4);
+    }
 }
