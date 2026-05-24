@@ -1275,6 +1275,7 @@ pub(crate) unsafe fn score_into_heaps_neon(
 /// the bit-plane path in `tq_dists`. Same persistent heap / `base_index`
 /// contract as [`score_into_heaps_avx2`].
 #[allow(clippy::too_many_arguments)]
+#[allow(dead_code)]
 pub(crate) fn score_into_heaps_scalar(
     luts: &[&QueryLut; 4],
     blocked: &[u8],

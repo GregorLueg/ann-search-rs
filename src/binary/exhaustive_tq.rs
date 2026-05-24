@@ -365,6 +365,179 @@ where
         self.query_reranking(&query_vec, k, rerank_factor)
     }
 
+    /// k nearest neighbours for a batch of queries, with 4-query fusion.
+    ///
+    /// For 2/4-bit, query rows are grouped into batches of 4 so each block's
+    /// codes are loaded once and scored against all four queries (the fused
+    /// SIMD path), parallelised across batches. 3-bit has no fused kernel and
+    /// runs per-query. When `rerank` is set, candidates are re-scored with
+    /// exact distances from the vector store (which must be present); the
+    /// query vectors themselves come from `queries`, so no store lookup is
+    /// needed for the query side.
+    ///
+    /// ### Params
+    ///
+    /// * `queries` - Query matrix (n_queries × dim)
+    /// * `k` - Number of neighbours per query
+    /// * `rerank` - Whether to re-rank with exact distances
+    /// * `rerank_factor` - Candidate multiplier when reranking (defaults to 20)
+    /// * `return_dist` - Whether to return distances
+    /// * `verbose` - Print progress
+    ///
+    /// ### Returns
+    ///
+    /// `(indices, optional distances)`, one row per query, nearest-first.
+    pub fn query_batch(
+        &self,
+        queries: MatRef<T>,
+        k: usize,
+        rerank: bool,
+        rerank_factor: Option<usize>,
+        return_dist: bool,
+        verbose: bool,
+    ) -> KnnOptionResult<T> {
+        let nq = queries.nrows();
+        let bits = self.quantiser.storage.bits;
+        let dim = self.quantiser.storage.dim;
+        let metric = self.quantiser.encoder.metric;
+        let n = self.n;
+
+        if queries.ncols() != dim {
+            return Err(AnnSearchErrors::DimensionMismatch {
+                index_dim: dim,
+                query_dim: queries.ncols(),
+            });
+        }
+
+        // Reranking needs the stored originals; the query side does not.
+        let vector_store = if rerank {
+            Some(
+                self.vector_store
+                    .as_ref()
+                    .ok_or(AnnSearchErrors::VectorStoreNotAvailable)?,
+            )
+        } else {
+            None
+        };
+
+        let k_eff = k.min(n);
+        let k_search = if rerank {
+            (k_eff * rerank_factor.unwrap_or(20)).max(1)
+        } else {
+            k_eff
+        };
+
+        let counter = Arc::new(AtomicUsize::new(0));
+        let report = |counter: &Arc<AtomicUsize>, added: usize| {
+            if verbose {
+                let count = counter.fetch_add(added, Ordering::Relaxed) + added;
+                if count % 100_000 < added {
+                    println!(
+                        "  Processed {} / {} queries.",
+                        count.separate_with_underscores(),
+                        nq.separate_with_underscores()
+                    );
+                }
+            }
+        };
+
+        let results: Vec<(Vec<usize>, Vec<T>)> = if bits == 3 {
+            // No fused kernel for 3-bit: score each query independently.
+            (0..nq)
+                .into_par_iter()
+                .map(|i| {
+                    let qvec: Vec<T> = queries.row(i).iter().cloned().collect();
+                    let out = if rerank {
+                        self.query_reranking(&qvec, k, rerank_factor)?
+                    } else {
+                        self.query(&qvec, k)?
+                    };
+                    report(&counter, 1);
+                    Ok(out)
+                })
+                .collect::<Result<Vec<_>, AnnSearchErrors>>()?
+        } else {
+            let (blocked, n_blocks) = self
+                .blocked
+                .as_ref()
+                .expect("blocked layout present for 2/4-bit");
+
+            let batch_starts: Vec<usize> = (0..nq).step_by(4).collect();
+            let nested: Vec<Vec<(Vec<usize>, Vec<T>)>> = batch_starts
+                .into_par_iter()
+                .map(|start| {
+                    let batch_nq = (nq - start).min(4);
+
+                    // Materialise the batch's query rows (faer rows are not
+                    // contiguous in column-major storage, so copy them).
+                    let qrows: Vec<Vec<T>> = (0..batch_nq)
+                        .map(|qi| queries.row(start + qi).iter().cloned().collect())
+                        .collect();
+
+                    // Encode each query and build its LUT.
+                    let mut luts_owned: Vec<QueryLut> = Vec::with_capacity(batch_nq);
+                    let mut qnorms = [0.0f32; 4];
+                    for qi in 0..batch_nq {
+                        let eq = self.quantiser.encode_query(&qrows[qi])?;
+                        let (q_rot_f32, levels_f32) =
+                            prepare_scalar_scoring(&eq, &self.quantiser.encoder);
+                        luts_owned.push(build_query_lut(&q_rot_f32, &levels_f32, bits, dim)?);
+                        qnorms[qi] = eq.query_norm.to_f32().unwrap();
+                    }
+
+                    let last = batch_nq - 1;
+                    let lut_refs: [&QueryLut; 4] = [
+                        &luts_owned[0.min(last)],
+                        &luts_owned[1.min(last)],
+                        &luts_owned[2.min(last)],
+                        &luts_owned[3.min(last)],
+                    ];
+
+                    let approx = topk_blocked(
+                        &lut_refs,
+                        blocked,
+                        n,
+                        *n_blocks,
+                        &self.norms_f32,
+                        qnorms,
+                        metric,
+                        k_search,
+                        batch_nq,
+                    );
+
+                    let mut out = Vec::with_capacity(batch_nq);
+                    for qi in 0..batch_nq {
+                        if let Some(vs) = vector_store {
+                            let cands: Vec<usize> =
+                                approx[qi].0.iter().map(|&x| x as usize).collect();
+                            out.push(self.rerank_candidates(vs, &qrows[qi], &cands, k));
+                        } else {
+                            let indices = approx[qi].0.iter().map(|&x| x as usize).collect();
+                            let dists = approx[qi]
+                                .1
+                                .iter()
+                                .map(|&d| T::from_f32(d).unwrap())
+                                .collect();
+                            out.push((indices, dists));
+                        }
+                    }
+                    report(&counter, batch_nq);
+                    Ok(out)
+                })
+                .collect::<Result<Vec<_>, AnnSearchErrors>>()?;
+
+            nested.into_iter().flatten().collect()
+        };
+
+        if return_dist {
+            let (indices, distances) = results.into_iter().unzip();
+            Ok((indices, Some(distances)))
+        } else {
+            let indices = results.into_iter().map(|(idx, _)| idx).collect();
+            Ok((indices, None))
+        }
+    }
+
     /// Build the full kNN graph over all stored vectors.
     ///
     /// For 2/4-bit, self-queries are batched in groups of 4 so the fused SIMD
@@ -755,5 +928,98 @@ mod tests {
             let (indices, _) = index.query(&row(&data, t), 1).unwrap();
             assert_eq!(indices[0], t);
         }
+    }
+
+    #[test]
+    fn test_query_batch_matches_single_no_rerank() {
+        // Fused batch (no rerank) must reproduce per-row `query` exactly:
+        // fusion only shares loads, it does not change results.
+        for (bits, dim) in [(4usize, 128usize), (2, 256)] {
+            for metric in [Dist::Cosine, Dist::SquaredEuclidean] {
+                let data = test_data(120, dim);
+                let queries = test_data(7, dim); // 7 -> a full batch of 4 + 3
+                let index = TurboQuantExhaustive::new(data.as_ref(), &metric, bits, 42).unwrap();
+
+                let (batch_idx, batch_dist) = index
+                    .query_batch(queries.as_ref(), 10, false, None, true, false)
+                    .unwrap();
+                let batch_dist = batch_dist.unwrap();
+
+                assert_eq!(batch_idx.len(), 7);
+                for i in 0..7 {
+                    let (si, sd) = index.query(&row(&queries, i), 10).unwrap();
+                    assert_eq!(batch_idx[i], si, "{metric:?} bits {bits} query {i} indices");
+                    assert_eq!(batch_dist[i], sd, "{metric:?} bits {bits} query {i} dists");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_query_batch_matches_single_rerank() {
+        let data = test_data(120, 128);
+        let queries = test_data(6, 128);
+        let dir = TempDir::new().unwrap();
+        let index = TurboQuantExhaustive::new_with_vector_store(
+            data.as_ref(),
+            &Dist::Cosine,
+            4,
+            42,
+            dir.path(),
+        )
+        .unwrap();
+
+        let (batch_idx, batch_dist) = index
+            .query_batch(queries.as_ref(), 10, true, Some(10), true, false)
+            .unwrap();
+        let batch_dist = batch_dist.unwrap();
+
+        for i in 0..6 {
+            let (si, sd) = index
+                .query_reranking(&row(&queries, i), 10, Some(10))
+                .unwrap();
+            assert_eq!(batch_idx[i], si, "query {i} indices");
+            assert_eq!(batch_dist[i], sd, "query {i} dists");
+        }
+    }
+
+    #[test]
+    fn test_query_batch_3bit() {
+        let data = test_data(60, 128);
+        let queries = test_data(5, 128);
+        let index = TurboQuantExhaustive::new(data.as_ref(), &Dist::Cosine, 3, 42).unwrap();
+
+        let (batch_idx, _) = index
+            .query_batch(queries.as_ref(), 8, false, None, false, false)
+            .unwrap();
+        assert_eq!(batch_idx.len(), 5);
+        for i in 0..5 {
+            let (si, _) = index.query(&row(&queries, i), 8).unwrap();
+            assert_eq!(batch_idx[i], si, "3-bit query {i} indices");
+        }
+    }
+
+    #[test]
+    fn test_query_batch_rerank_without_store_errors() {
+        let data = test_data(40, 64);
+        let queries = test_data(4, 64);
+        let index = TurboQuantExhaustive::new(data.as_ref(), &Dist::Cosine, 4, 42).unwrap();
+        let res = index.query_batch(queries.as_ref(), 5, true, Some(5), false, false);
+        assert!(matches!(res, Err(AnnSearchErrors::VectorStoreNotAvailable)));
+    }
+
+    #[test]
+    fn test_query_batch_dimension_mismatch() {
+        let data = test_data(40, 64);
+        let queries = test_data(4, 32); // wrong dim
+        let index = TurboQuantExhaustive::new(data.as_ref(), &Dist::Cosine, 4, 42).unwrap();
+        let res = index.query_batch(queries.as_ref(), 5, false, None, false, false);
+        assert!(matches!(
+            res,
+            Err(AnnSearchErrors::DimensionMismatch {
+                index_dim: 64,
+                query_dim: 32
+            })
+        ));
     }
 }
