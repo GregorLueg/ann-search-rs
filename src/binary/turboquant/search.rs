@@ -8,9 +8,9 @@
 
 use std::cmp::Ordering;
 
-#[cfg(target_arch = "x86_64")]
-use crate::binary::tq_pack::PERM0_INV;
 use crate::binary::turboquant::pack::BLOCK;
+#[cfg(target_arch = "x86_64")]
+use crate::binary::turboquant::pack::PERM0_INV;
 use crate::prelude::*;
 
 ////////////
@@ -1945,15 +1945,10 @@ mod tests {
     #[test]
     fn test_key_distance_roundtrip_matches_reconstruct() {
         // ip_to_key -> key_to_distance must equal tq_dists::reconstruct_distance.
-        for &(qn, vn, corr) in &[
-            (1.0f32, 1.0f32, 1.0f32),
-            (2.0, 0.5, 0.95),
-            (0.3, 1.7, 1.05),
-        ] {
+        for &(qn, vn, corr) in &[(1.0f32, 1.0f32, 1.0f32), (2.0, 0.5, 0.95), (0.3, 1.7, 1.05)] {
             for &ip in &[-1.0f32, -0.3, 0.0, 0.6, 1.0] {
                 for metric in [Dist::Cosine, Dist::SquaredEuclidean] {
-                    let via_key =
-                        key_to_distance(ip_to_key(ip, qn, vn, corr, metric), qn, metric);
+                    let via_key = key_to_distance(ip_to_key(ip, qn, vn, corr, metric), qn, metric);
                     let direct: f32 = reconstruct_distance(ip, qn, vn, corr, metric);
                     assert!(
                         (via_key - direct).abs() <= 1e-5 * (1.0 + direct.abs()),
@@ -2080,6 +2075,7 @@ mod tests {
         usize,
         usize,
         &[f32],
+        &[f32],
         [f32; 4],
         Dist,
         usize,
@@ -2132,7 +2128,6 @@ mod tests {
                 n_blocks,
                 &q.storage.norms,
                 &q.storage.corrections,
-            &q.storage.corrections,
                 eq.query_norm,
                 metric,
                 k,
@@ -2165,8 +2160,6 @@ mod tests {
                     n_blocks,
                     &q.storage.norms,
                     &q.storage.corrections,
-                &q.storage.corrections,
-            &q.storage.corrections,
                     qnorms,
                     metric,
                     k,
