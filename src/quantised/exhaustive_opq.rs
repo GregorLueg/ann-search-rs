@@ -13,7 +13,6 @@ use thousands::*;
 use crate::prelude::*;
 use crate::quantised::quantisers::*;
 use crate::utils::k_means_utils::sample_vectors;
-use crate::utils::*;
 
 /// Exhaustive PQ index
 ///

@@ -12,7 +12,6 @@ use thousands::Separable;
 use crate::prelude::*;
 use crate::quantised::quantisers::*;
 use crate::utils::k_means_utils::*;
-use crate::utils::*;
 
 /// IVF index with bf16 quantisation
 ///

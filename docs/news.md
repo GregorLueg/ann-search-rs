@@ -1,11 +1,14 @@
 # News
 
-## 0.3.2
+## 0.4.0
 
 **Features**
 
-- Version bump on cubecl to `"0.10.0"`.
-- TurboQuantisation with exhaustive and IVF index implemented
+- Version bump on cubecl to `"0.10.0"`. This might introduce *breaking* changes
+  if you are using the package in
+- More and improved error handling across the board.
+- TurboQuantisation with exhaustive and IVF index implemented.
+- Better benchmarking with an cell embedding-like benchmark.
 
 ## 0.3.1
 

@@ -56,7 +56,10 @@ use crate::cpu::{
 use crate::prelude::*;
 
 #[cfg(feature = "binary")]
-use crate::binary::{exhaustive_binary::*, exhaustive_rabitq::*, ivf_binary::*, ivf_rabitq::*};
+use crate::binary::{
+    exhaustive_binary::*, exhaustive_rabitq::*, exhaustive_tq::*, ivf_binary::*, ivf_rabitq::*,
+    ivf_tq::*,
+};
 #[cfg(feature = "gpu")]
 use crate::gpu::{exhaustive_gpu::*, ivf_gpu::*, nndescent_gpu::*};
 #[cfg(feature = "quantised")]
@@ -2909,9 +2912,9 @@ where
     index.generate_knn(k, n_probe, rerank_factor, return_dist, verbose)
 }
 
-/////////////////
-// IVF-RaBitQ  //
-/////////////////
+////////////////
+// IVF-RaBitQ //
+////////////////
 
 #[cfg(feature = "binary")]
 /// Build an IVF-RaBitQ index
@@ -3031,6 +3034,257 @@ where
 /// Tuple of (indices, optional distances)
 pub fn query_ivf_index_rabitq_self<T>(
     index: &IvfIndexRaBitQ<T>,
+    k: usize,
+    nprobe: Option<usize>,
+    rerank_factor: Option<usize>,
+    return_dist: bool,
+    verbose: bool,
+) -> KnnOptionResult<T>
+where
+    T: AnnSearchFloat + Pod,
+{
+    index.generate_knn(k, nprobe, rerank_factor, return_dist, verbose)
+}
+
+///////////////////////////
+// Exhaustive TurboQuant //
+///////////////////////////
+
+#[cfg(feature = "binary")]
+/// Build an exhaustive TurboQuant index
+///
+/// ### Params
+///
+/// * `mat` - The initial matrix with samples × features
+/// * `dist_metric` - Distance metric: "euclidean" or "cosine". "manhattan" is
+///   not supported.
+/// * `bits` - Bits per coordinate (2, 3, or 4)
+/// * `seed` - Random seed
+/// * `save_store` - Whether to save vector store for reranking
+/// * `save_path` - Path to save vector store files (required if save_store is
+///   true)
+///
+/// ### Returns
+///
+/// The initialised `TurboQuantExhaustive`
+pub fn build_exhaustive_index_turboquant<T>(
+    mat: MatRef<T>,
+    dist_metric: &str,
+    bits: usize,
+    seed: usize,
+    save_store: bool,
+    save_path: Option<impl AsRef<Path>>,
+) -> Result<TurboQuantExhaustive<T>, AnnSearchErrors>
+where
+    T: AnnSearchFloat + Pod,
+{
+    let metric = parse_ann_dist(dist_metric).unwrap_or_else(|| {
+        println!("[WARNING] Weird string used for distance metric. Using default squared Euclidean distance");
+        Dist::default()
+    });
+    if save_store {
+        let path = save_path.expect("save_path required when save_store is true");
+        TurboQuantExhaustive::new_with_vector_store(mat, &metric, bits, seed, path)
+    } else {
+        TurboQuantExhaustive::new(mat, &metric, bits, seed)
+    }
+}
+
+#[cfg(feature = "binary")]
+/// Helper function to query a given exhaustive TurboQuant index.
+///
+/// Uses the 4-query fused SIMD path (for 2/4-bit) rather than scoring each
+/// query independently.
+///
+/// ### Params
+///
+/// * `query_mat` - The query matrix containing the samples × features
+/// * `index` - The exhaustive TurboQuant index
+/// * `k` - Number of neighbours to return
+/// * `rerank` - Whether to use exact distance reranking (requires vector store)
+/// * `rerank_factor` - Multiplier for candidate set size (only used if rerank is true)
+/// * `return_dist` - Shall the distances be returned
+/// * `verbose` - Controls verbosity of the function
+///
+/// ### Returns
+///
+/// A tuple of `(knn_indices, optional distances)`
+#[allow(clippy::too_many_arguments)]
+pub fn query_exhaustive_index_turboquant<T>(
+    query_mat: MatRef<T>,
+    index: &TurboQuantExhaustive<T>,
+    k: usize,
+    rerank: bool,
+    rerank_factor: Option<usize>,
+    return_dist: bool,
+    verbose: bool,
+) -> KnnOptionResult<T>
+where
+    T: AnnSearchFloat + Pod,
+{
+    index.query_batch(query_mat, k, rerank, rerank_factor, return_dist, verbose)
+}
+
+#[cfg(feature = "binary")]
+/// Query an exhaustive TurboQuant index against itself
+///
+/// Generates a full kNN graph based on the internal data.
+/// Requires vector store to be available (use save_store=true when building).
+///
+/// ### Params
+///
+/// * `index` - Reference to built index
+/// * `k` - Number of neighbours
+/// * `rerank_factor` - Multiplier for candidate set size
+/// * `return_dist` - Return distances
+/// * `verbose` - Controls verbosity
+///
+/// ### Returns
+///
+/// Tuple of (indices, optional distances)
+pub fn query_exhaustive_index_turboquant_self<T>(
+    index: &TurboQuantExhaustive<T>,
+    k: usize,
+    rerank_factor: Option<usize>,
+    return_dist: bool,
+    verbose: bool,
+) -> KnnOptionResult<T>
+where
+    T: AnnSearchFloat + Pod,
+{
+    index.generate_knn(k, rerank_factor, return_dist, verbose)
+}
+
+////////////////////
+// IVF TurboQuant //
+////////////////////
+
+#[cfg(feature = "binary")]
+/// Build an IVF-TurboQuant index
+///
+/// ### Params
+///
+/// * `mat` - The initial matrix with samples × features
+/// * `nlist` - Number of IVF cells (None for sqrt(n))
+/// * `k_means_params` - Optional k-means training parameters, see
+///   [KMeansTrainingParams]. If not provided, will default to sensible
+///   defaults.
+/// * `dist_metric` - Distance metric: "euclidean" or "cosine". "manhattan" is
+///   not supported.
+/// * `bits` - Bits per coordinate (2, 3, or 4)
+/// * `seed` - Random seed
+/// * `save_store` - Whether to save vector store for reranking
+/// * `save_path` - Path to save vector store files (required if save_store is
+///   true)
+/// * `verbose` - Print progress during build
+///
+/// ### Returns
+///
+/// The initialised `IvfTurboQuant`
+#[allow(clippy::too_many_arguments)]
+pub fn build_ivf_index_turboquant<T>(
+    mat: MatRef<T>,
+    nlist: Option<usize>,
+    k_means_params: Option<KMeansTrainingParams>,
+    dist_metric: &str,
+    bits: usize,
+    seed: usize,
+    save_store: bool,
+    save_path: Option<impl AsRef<Path>>,
+    verbose: bool,
+) -> Result<IvfTurboQuant<T>, AnnSearchErrors>
+where
+    T: AnnSearchFloat + Pod,
+{
+    let metric = parse_ann_dist(dist_metric).unwrap_or_else(|| {
+        println!("[WARNING] Weird string used for distance metric. Using default squared Euclidean distance");
+        Dist::default()
+    });
+
+    if save_store {
+        let path = save_path.expect("save_path required when save_store is true");
+        IvfTurboQuant::build_with_vector_store(
+            mat,
+            metric,
+            nlist,
+            k_means_params,
+            bits,
+            seed,
+            verbose,
+            path,
+        )
+    } else {
+        IvfTurboQuant::build(mat, metric, nlist, k_means_params, bits, seed, verbose)
+    }
+}
+
+#[cfg(feature = "binary")]
+/// Helper function to query a given IVF-TurboQuant index.
+///
+/// Uses the 4-query fused SIMD path (for 2/4-bit) rather than scoring each
+/// query independently. Because batched queries union the probed cells of each
+/// group of four, results may differ slightly from the single-query path.
+///
+/// ### Params
+///
+/// * `query_mat` - The query matrix containing the samples × features
+/// * `index` - The IVF-TurboQuant index
+/// * `k` - Number of neighbours to return
+/// * `nprobe` - Number of IVF cells to probe (None for sqrt(nlist))
+/// * `rerank` - Whether to use exact distance reranking (requires vector store)
+/// * `rerank_factor` - Multiplier for candidate set size (only used if rerank
+///   is true)
+/// * `return_dist` - Shall the distances be returned
+/// * `verbose` - Controls verbosity of the function
+///
+/// ### Returns
+///
+/// A tuple of `(knn_indices, optional distances)`
+#[allow(clippy::too_many_arguments)]
+pub fn query_ivf_index_turboquant<T>(
+    query_mat: MatRef<T>,
+    index: &IvfTurboQuant<T>,
+    k: usize,
+    nprobe: Option<usize>,
+    rerank: bool,
+    rerank_factor: Option<usize>,
+    return_dist: bool,
+    verbose: bool,
+) -> KnnOptionResult<T>
+where
+    T: AnnSearchFloat + Pod,
+{
+    index.query_batch(
+        query_mat,
+        k,
+        nprobe,
+        rerank,
+        rerank_factor,
+        return_dist,
+        verbose,
+    )
+}
+
+#[cfg(feature = "binary")]
+/// Query an IVF-TurboQuant index against itself
+///
+/// Generates a full kNN graph based on the internal data. Requires vector store
+/// to be available (use save_store = true when building).
+///
+/// ### Params
+///
+/// * `index` - Reference to built index
+/// * `k` - Number of neighbours
+/// * `nprobe` - Number of IVF cells to probe (None for sqrt(nlist))
+/// * `rerank_factor` - Multiplier for candidate set size
+/// * `return_dist` - Return distances
+/// * `verbose` - Controls verbosity
+///
+/// ### Returns
+///
+/// Tuple of (indices, optional distances)
+pub fn query_ivf_index_turboquant_self<T>(
+    index: &IvfTurboQuant<T>,
     k: usize,
     nprobe: Option<usize>,
     rerank_factor: Option<usize>,

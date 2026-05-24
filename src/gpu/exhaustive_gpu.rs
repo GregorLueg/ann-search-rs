@@ -8,7 +8,6 @@ use rayon::prelude::*;
 use crate::gpu::dist_gpu::*;
 use crate::gpu::*;
 use crate::prelude::*;
-use crate::utils::*;
 
 ////////////////////////
 // ExhaustiveIndexGpu //

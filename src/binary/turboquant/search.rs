@@ -8,9 +8,9 @@
 
 use std::cmp::Ordering;
 
-use crate::binary::tq_pack::BLOCK;
 #[cfg(target_arch = "x86_64")]
 use crate::binary::tq_pack::PERM0_INV;
+use crate::binary::turboquant::pack::BLOCK;
 use crate::prelude::*;
 
 ////////////
@@ -20,6 +20,7 @@ use crate::prelude::*;
 /// Byte-groups accumulated into u16 lanes before each flush to f32. Tuned so
 /// `FLUSH_EVERY * 2 * 127 < u16::MAX`: each group adds two u8 lookups (each ≤
 /// 127 on NEON), so the u16 lane cannot overflow within a batch.
+#[cfg(target_arch = "aarch64")]
 const FLUSH_EVERY: usize = 256;
 
 /////////
@@ -525,24 +526,35 @@ pub(crate) unsafe fn score_block_avx2(
 
 /// Convert a raw inner product into a higher-is-better ranking key.
 ///
-/// `ip` is the approximate `cos(q, v)`. The key is monotone-decreasing in the
-/// final distance, so the top-k by key is the nearest-k by distance.
+/// `ip` is the approximate `cos(q, v)` shrunk by the per-vector self-overlap
+/// `<u, x̂>`; multiplying by `vec_correction = 1 / <u, x̂>` debiases it. The key
+/// is monotone-decreasing in the final distance, so the top-k by key is the
+/// nearest-k by distance.
 ///
 /// ### Params
 ///
 /// * `ip` - Approximate cosine similarity (raw kernel output)
 /// * `query_norm` - L2 norm of the query
 /// * `vec_norm` - L2 norm of the stored vector
+/// * `vec_correction` - Per-vector debias factor `1 / <u, x̂>`
 /// * `metric` - Distance metric
 ///
 /// ### Returns
 ///
 /// The distance (higher is better)
 #[inline]
-pub fn ip_to_key(ip: f32, query_norm: f32, vec_norm: f32, metric: Dist) -> f32 {
+pub fn ip_to_key(
+    ip: f32,
+    query_norm: f32,
+    vec_norm: f32,
+    vec_correction: f32,
+    metric: Dist,
+) -> f32 {
     match metric {
-        Dist::Cosine => ip,
-        Dist::SquaredEuclidean => (2.0 * query_norm * vec_norm).mul_add(ip, -(vec_norm * vec_norm)),
+        Dist::Cosine => vec_correction * ip,
+        Dist::SquaredEuclidean => {
+            (2.0 * query_norm * vec_norm * vec_correction).mul_add(ip, -(vec_norm * vec_norm))
+        }
         Dist::Manhattan => unreachable!("TurboQuant does not support Manhattan distance"),
     }
 }
@@ -730,6 +742,7 @@ impl TopK {
 /// * `n_vectors` - Number of real (non-padding) vectors
 /// * `n_blocks` - Number of blocks in `blocked`
 /// * `norms_f32` - Per-vector L2 norms (length `n_vectors`), f32
+/// * `corrections_f32` - Per-vector debias factors `1 / <u, x̂>` (length `n_vectors`), f32
 /// * `query_norm` - L2 norm of the query
 /// * `metric` - Distance metric
 /// * `k` - Neighbours to return
@@ -744,6 +757,7 @@ pub fn score_query_topk_scalar(
     n_vectors: usize,
     n_blocks: usize,
     norms_f32: &[f32],
+    corrections_f32: &[f32],
     query_norm: f32,
     metric: Dist,
     k: usize,
@@ -759,7 +773,13 @@ pub fn score_query_topk_scalar(
             if vi >= n_vectors {
                 break;
             }
-            let key = ip_to_key(out[lane], query_norm, norms_f32[vi], metric);
+            let key = ip_to_key(
+                out[lane],
+                query_norm,
+                norms_f32[vi],
+                corrections_f32[vi],
+                metric,
+            );
             heap.push(key, vi as u32);
         }
     }
@@ -797,6 +817,7 @@ pub(crate) unsafe fn fused4_avx2(
     n_vectors: usize,
     n_blocks: usize,
     norms_f32: &[f32],
+    corrections_f32: &[f32],
     query_norms: [f32; 4],
     metric: Dist,
     k: usize,
@@ -809,6 +830,7 @@ pub(crate) unsafe fn fused4_avx2(
         n_vectors,
         n_blocks,
         norms_f32,
+        corrections_f32,
         query_norms,
         metric,
         batch_nq,
@@ -845,6 +867,7 @@ pub(crate) unsafe fn score_into_heaps_avx2(
     n_vectors: usize,
     n_blocks: usize,
     norms_f32: &[f32],
+    corrections_f32: &[f32],
     query_norms: [f32; 4],
     metric: Dist,
     batch_nq: usize,
@@ -888,6 +911,7 @@ pub(crate) unsafe fn score_into_heaps_avx2(
                 base_vec,
                 end_lane,
                 norms_f32,
+                corrections_f32,
                 scales[qi],
                 biases[qi],
                 query_norms[qi],
@@ -909,7 +933,8 @@ pub(crate) unsafe fn score_into_heaps_avx2(
 ///
 /// ### Safety
 ///
-/// Requires AVX2 + FMA. `norms_f32` must be valid for `base_vec + end_lane`.
+/// Requires AVX2 + FMA. `norms_f32` and `corrections_f32` must be valid for
+/// `base_vec + end_lane`.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2", enable = "fma")]
 #[allow(clippy::too_many_arguments)]
@@ -918,6 +943,7 @@ unsafe fn epilogue_one_query_avx2(
     base_vec: usize,
     end_lane: usize,
     norms_f32: &[f32],
+    corrections_f32: &[f32],
     scale: f32,
     bias: f32,
     query_norm: f32,
@@ -956,27 +982,57 @@ unsafe fn epilogue_one_query_avx2(
     let ip3 = _mm256_fmadd_ps(v_scale, f3, v_bias);
 
     let norms_ptr = norms_f32.as_ptr().add(base_vec);
+    let corrections_ptr = corrections_f32.as_ptr().add(base_vec);
 
     match metric {
         Dist::Cosine => {
-            if end_lane == BLOCK && heap.is_full() {
-                let thr = _mm256_set1_ps(heap.min_key());
-                let m = _mm256_movemask_ps(_mm256_cmp_ps(ip0, thr, _CMP_GT_OQ))
-                    | _mm256_movemask_ps(_mm256_cmp_ps(ip1, thr, _CMP_GT_OQ))
-                    | _mm256_movemask_ps(_mm256_cmp_ps(ip2, thr, _CMP_GT_OQ))
-                    | _mm256_movemask_ps(_mm256_cmp_ps(ip3, thr, _CMP_GT_OQ));
-                if m == 0 {
-                    return;
+            if end_lane == BLOCK {
+                let c0 = _mm256_loadu_ps(corrections_ptr);
+                let c1 = _mm256_loadu_ps(corrections_ptr.add(8));
+                let c2 = _mm256_loadu_ps(corrections_ptr.add(16));
+                let c3 = _mm256_loadu_ps(corrections_ptr.add(24));
+                let k0 = _mm256_mul_ps(c0, ip0);
+                let k1 = _mm256_mul_ps(c1, ip1);
+                let k2 = _mm256_mul_ps(c2, ip2);
+                let k3 = _mm256_mul_ps(c3, ip3);
+
+                if heap.is_full() {
+                    let thr = _mm256_set1_ps(heap.min_key());
+                    let m = _mm256_movemask_ps(_mm256_cmp_ps(k0, thr, _CMP_GT_OQ))
+                        | _mm256_movemask_ps(_mm256_cmp_ps(k1, thr, _CMP_GT_OQ))
+                        | _mm256_movemask_ps(_mm256_cmp_ps(k2, thr, _CMP_GT_OQ))
+                        | _mm256_movemask_ps(_mm256_cmp_ps(k3, thr, _CMP_GT_OQ));
+                    if m == 0 {
+                        return;
+                    }
                 }
-            }
-            let mut buf = [0.0f32; BLOCK];
-            let bp = buf.as_mut_ptr();
-            _mm256_storeu_ps(bp, ip0);
-            _mm256_storeu_ps(bp.add(8), ip1);
-            _mm256_storeu_ps(bp.add(16), ip2);
-            _mm256_storeu_ps(bp.add(24), ip3);
-            for lane in 0..end_lane {
-                heap.push(buf[lane], base_index + (base_vec + lane) as u32);
+                let mut buf = [0.0f32; BLOCK];
+                let bp = buf.as_mut_ptr();
+                _mm256_storeu_ps(bp, k0);
+                _mm256_storeu_ps(bp.add(8), k1);
+                _mm256_storeu_ps(bp.add(16), k2);
+                _mm256_storeu_ps(bp.add(24), k3);
+                for lane in 0..BLOCK {
+                    heap.push(buf[lane], base_index + (base_vec + lane) as u32);
+                }
+            } else {
+                let mut buf = [0.0f32; BLOCK];
+                let bp = buf.as_mut_ptr();
+                _mm256_storeu_ps(bp, ip0);
+                _mm256_storeu_ps(bp.add(8), ip1);
+                _mm256_storeu_ps(bp.add(16), ip2);
+                _mm256_storeu_ps(bp.add(24), ip3);
+                for lane in 0..end_lane {
+                    let vi = base_vec + lane;
+                    let key = ip_to_key(
+                        buf[lane],
+                        query_norm,
+                        norms_f32[vi],
+                        corrections_f32[vi],
+                        metric,
+                    );
+                    heap.push(key, base_index + vi as u32);
+                }
             }
         }
         Dist::SquaredEuclidean => {
@@ -984,7 +1040,8 @@ unsafe fn epilogue_one_query_avx2(
                 let v_two_qn = _mm256_set1_ps(2.0 * query_norm);
                 let key_of = |ip: __m256, off: usize| {
                     let vn = _mm256_loadu_ps(norms_ptr.add(off));
-                    let coef = _mm256_mul_ps(v_two_qn, vn);
+                    let corr = _mm256_loadu_ps(corrections_ptr.add(off));
+                    let coef = _mm256_mul_ps(_mm256_mul_ps(v_two_qn, vn), corr);
                     let neg_vn2 = _mm256_sub_ps(_mm256_setzero_ps(), _mm256_mul_ps(vn, vn));
                     _mm256_fmadd_ps(coef, ip, neg_vn2)
                 };
@@ -1021,7 +1078,13 @@ unsafe fn epilogue_one_query_avx2(
                 _mm256_storeu_ps(bp.add(24), ip3);
                 for lane in 0..end_lane {
                     let vi = base_vec + lane;
-                    let key = ip_to_key(buf[lane], query_norm, norms_f32[vi], metric);
+                    let key = ip_to_key(
+                        buf[lane],
+                        query_norm,
+                        norms_f32[vi],
+                        corrections_f32[vi],
+                        metric,
+                    );
                     heap.push(key, base_index + vi as u32);
                 }
             }
@@ -1054,6 +1117,7 @@ pub(crate) unsafe fn fused4_avx512bw(
     n_vectors: usize,
     n_blocks: usize,
     norms_f32: &[f32],
+    corrections_f32: &[f32],
     query_norms: [f32; 4],
     metric: Dist,
     k: usize,
@@ -1066,6 +1130,7 @@ pub(crate) unsafe fn fused4_avx512bw(
         n_vectors,
         n_blocks,
         norms_f32,
+        corrections_f32,
         query_norms,
         metric,
         batch_nq,
@@ -1102,6 +1167,7 @@ pub(crate) unsafe fn score_into_heaps_avx512bw(
     n_vectors: usize,
     n_blocks: usize,
     norms_f32: &[f32],
+    corrections_f32: &[f32],
     query_norms: [f32; 4],
     metric: Dist,
     batch_nq: usize,
@@ -1174,6 +1240,7 @@ pub(crate) unsafe fn score_into_heaps_avx512bw(
                     base_vec,
                     end_lane,
                     norms_f32,
+                    corrections_f32,
                     luts[qi].scale,
                     luts[qi].bias,
                     query_norms[qi],
@@ -1213,6 +1280,7 @@ pub(crate) unsafe fn score_into_heaps_avx512bw(
                 base_vec,
                 end_lane,
                 norms_f32,
+                corrections_f32,
                 luts[qi].scale,
                 luts[qi].bias,
                 query_norms[qi],
@@ -1246,6 +1314,7 @@ pub(crate) unsafe fn score_into_heaps_neon(
     n_vectors: usize,
     n_blocks: usize,
     norms_f32: &[f32],
+    corrections_f32: &[f32],
     query_norms: [f32; 4],
     metric: Dist,
     batch_nq: usize,
@@ -1260,7 +1329,13 @@ pub(crate) unsafe fn score_into_heaps_neon(
             let end_lane = (base_vec + BLOCK).min(n_vectors) - base_vec;
             for lane in 0..end_lane {
                 let vi = base_vec + lane;
-                let key = ip_to_key(out[lane], query_norms[qi], norms_f32[vi], metric);
+                let key = ip_to_key(
+                    out[lane],
+                    query_norms[qi],
+                    norms_f32[vi],
+                    corrections_f32[vi],
+                    metric,
+                );
                 heaps[qi].push(key, base_index + vi as u32);
             }
         }
@@ -1274,12 +1349,14 @@ pub(crate) unsafe fn score_into_heaps_neon(
 /// the bit-plane path in `tq_dists`. Same persistent heap / `base_index`
 /// contract as [`score_into_heaps_avx2`].
 #[allow(clippy::too_many_arguments)]
+#[allow(dead_code)]
 pub(crate) fn score_into_heaps_scalar(
     luts: &[&QueryLut; 4],
     blocked: &[u8],
     n_vectors: usize,
     n_blocks: usize,
     norms_f32: &[f32],
+    corrections_f32: &[f32],
     query_norms: [f32; 4],
     metric: Dist,
     batch_nq: usize,
@@ -1294,7 +1371,13 @@ pub(crate) fn score_into_heaps_scalar(
             let end_lane = (base_vec + BLOCK).min(n_vectors) - base_vec;
             for lane in 0..end_lane {
                 let vi = base_vec + lane;
-                let key = ip_to_key(out[lane], query_norms[qi], norms_f32[vi], metric);
+                let key = ip_to_key(
+                    out[lane],
+                    query_norms[qi],
+                    norms_f32[vi],
+                    corrections_f32[vi],
+                    metric,
+                );
                 heaps[qi].push(key, base_index + vi as u32);
             }
         }
@@ -1319,6 +1402,7 @@ pub(crate) fn score_into_heaps(
     n_vectors: usize,
     n_blocks: usize,
     norms_f32: &[f32],
+    corrections_f32: &[f32],
     query_norms: [f32; 4],
     metric: Dist,
     batch_nq: usize,
@@ -1336,6 +1420,7 @@ pub(crate) fn score_into_heaps(
                     n_vectors,
                     n_blocks,
                     norms_f32,
+                    corrections_f32,
                     query_norms,
                     metric,
                     batch_nq,
@@ -1350,6 +1435,7 @@ pub(crate) fn score_into_heaps(
                     n_vectors,
                     n_blocks,
                     norms_f32,
+                    corrections_f32,
                     query_norms,
                     metric,
                     batch_nq,
@@ -1363,6 +1449,7 @@ pub(crate) fn score_into_heaps(
                 n_vectors,
                 n_blocks,
                 norms_f32,
+                corrections_f32,
                 query_norms,
                 metric,
                 batch_nq,
@@ -1370,7 +1457,6 @@ pub(crate) fn score_into_heaps(
                 heaps,
             ),
         }
-        return;
     }
     #[cfg(target_arch = "aarch64")]
     {
@@ -1382,6 +1468,7 @@ pub(crate) fn score_into_heaps(
                 n_vectors,
                 n_blocks,
                 norms_f32,
+                corrections_f32,
                 query_norms,
                 metric,
                 batch_nq,
@@ -1389,7 +1476,6 @@ pub(crate) fn score_into_heaps(
                 heaps,
             );
         }
-        return;
     }
     #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
     {
@@ -1399,6 +1485,7 @@ pub(crate) fn score_into_heaps(
             n_vectors,
             n_blocks,
             norms_f32,
+            corrections_f32,
             query_norms,
             metric,
             batch_nq,
@@ -1423,6 +1510,7 @@ pub(crate) fn topk_blocked(
     n_vectors: usize,
     n_blocks: usize,
     norms_f32: &[f32],
+    corrections_f32: &[f32],
     query_norms: [f32; 4],
     metric: Dist,
     k: usize,
@@ -1437,6 +1525,7 @@ pub(crate) fn topk_blocked(
         n_vectors,
         n_blocks,
         norms_f32,
+        corrections_f32,
         query_norms,
         metric,
         batch_nq,
@@ -1454,10 +1543,12 @@ pub(crate) fn topk_blocked(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::binary::tq_dists::reconstruct_distance;
-    use crate::binary::tq_dists::{prepare_scalar_scoring, score_ip_scalar};
-    use crate::binary::tq_pack::{repack, BlockedLayout, BLOCK};
-    use crate::binary::tq_quantiser::TurboQuantQuantiser;
+
+    use crate::binary::turboquant::dists::{
+        prepare_scalar_scoring, reconstruct_distance, score_ip_scalar,
+    };
+    use crate::binary::turboquant::pack::{repack, BlockedLayout, BLOCK};
+    use crate::binary::turboquant::quantiser::TurboQuantQuantiser;
     use faer::Mat;
 
     fn test_data(n: usize, dim: usize) -> Mat<f32> {
@@ -1854,14 +1945,19 @@ mod tests {
     #[test]
     fn test_key_distance_roundtrip_matches_reconstruct() {
         // ip_to_key -> key_to_distance must equal tq_dists::reconstruct_distance.
-        for &(qn, vn) in &[(1.0f32, 1.0f32), (2.0, 0.5), (0.3, 1.7)] {
+        for &(qn, vn, corr) in &[
+            (1.0f32, 1.0f32, 1.0f32),
+            (2.0, 0.5, 0.95),
+            (0.3, 1.7, 1.05),
+        ] {
             for &ip in &[-1.0f32, -0.3, 0.0, 0.6, 1.0] {
                 for metric in [Dist::Cosine, Dist::SquaredEuclidean] {
-                    let via_key = key_to_distance(ip_to_key(ip, qn, vn, metric), qn, metric);
-                    let direct: f32 = reconstruct_distance(ip, qn, vn, metric);
+                    let via_key =
+                        key_to_distance(ip_to_key(ip, qn, vn, corr, metric), qn, metric);
+                    let direct: f32 = reconstruct_distance(ip, qn, vn, corr, metric);
                     assert!(
                         (via_key - direct).abs() <= 1e-5 * (1.0 + direct.abs()),
-                        "{metric:?} qn {qn} vn {vn} ip {ip}: key path {via_key} vs direct {direct}"
+                        "{metric:?} qn {qn} vn {vn} corr {corr} ip {ip}: key path {via_key} vs direct {direct}"
                     );
                 }
             }
@@ -1876,6 +1972,7 @@ mod tests {
         n: usize,
         n_blocks: usize,
         norms: &[f32],
+        corrections: &[f32],
         qnorm: f32,
         metric: Dist,
         k: usize,
@@ -1889,7 +1986,10 @@ mod tests {
                 if vi >= n {
                     break;
                 }
-                all.push((ip_to_key(out[lane], qnorm, norms[vi], metric), vi as u32));
+                all.push((
+                    ip_to_key(out[lane], qnorm, norms[vi], corrections[vi], metric),
+                    vi as u32,
+                ));
             }
         }
         all.sort_unstable_by(|a, b| {
@@ -1920,6 +2020,7 @@ mod tests {
             n,
             n_blocks,
             &q.storage.norms,
+            &q.storage.corrections,
             eq.query_norm,
             metric,
             k,
@@ -1930,6 +2031,7 @@ mod tests {
             n,
             n_blocks,
             &q.storage.norms,
+            &q.storage.corrections,
             eq.query_norm,
             metric,
             k,
@@ -2029,6 +2131,8 @@ mod tests {
                 n,
                 n_blocks,
                 &q.storage.norms,
+                &q.storage.corrections,
+            &q.storage.corrections,
                 eq.query_norm,
                 metric,
                 k,
@@ -2060,6 +2164,9 @@ mod tests {
                     n,
                     n_blocks,
                     &q.storage.norms,
+                    &q.storage.corrections,
+                &q.storage.corrections,
+            &q.storage.corrections,
                     qnorms,
                     metric,
                     k,
@@ -2275,6 +2382,7 @@ mod tests {
             n,
             n_blocks,
             &q.storage.norms,
+            &q.storage.corrections,
             eq.query_norm,
             metric,
             k,
@@ -2289,6 +2397,7 @@ mod tests {
             n,
             n_blocks,
             &q.storage.norms,
+            &q.storage.corrections,
             qnorms,
             metric,
             1,
@@ -2362,6 +2471,7 @@ mod tests {
             n0,
             nb0,
             &q0.storage.norms,
+            &q0.storage.corrections,
             qnorms,
             metric,
             1,
@@ -2374,6 +2484,7 @@ mod tests {
             n1,
             nb1,
             &q1.storage.norms,
+            &q1.storage.corrections,
             qnorms,
             metric,
             1,
@@ -2386,12 +2497,27 @@ mod tests {
         let mut all: Vec<(f32, u32)> = Vec::new();
         for i in 0..n0 {
             let ip = score_via_lut_bitplane(&lut, q0.storage.vector_packed(i), bits, dim);
-            all.push((ip_to_key(ip, qnorm, q0.storage.norms[i], metric), i as u32));
+            all.push((
+                ip_to_key(
+                    ip,
+                    qnorm,
+                    q0.storage.norms[i],
+                    q0.storage.corrections[i],
+                    metric,
+                ),
+                i as u32,
+            ));
         }
         for j in 0..n1 {
             let ip = score_via_lut_bitplane(&lut, q1.storage.vector_packed(j), bits, dim);
             all.push((
-                ip_to_key(ip, qnorm, q1.storage.norms[j], metric),
+                ip_to_key(
+                    ip,
+                    qnorm,
+                    q1.storage.norms[j],
+                    q1.storage.corrections[j],
+                    metric,
+                ),
                 (n0 + j) as u32,
             ));
         }

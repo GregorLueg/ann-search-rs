@@ -16,7 +16,7 @@ use rand_distr::StandardNormal;
 use rayon::prelude::*;
 use std::iter::Sum;
 
-use crate::binary::tq_codebook::codebook;
+use crate::binary::turboquant::codebook::codebook;
 use crate::prelude::*;
 
 //////////////////////
@@ -109,21 +109,27 @@ where
     ///
     /// ### Returns
     ///
-    /// `(packed_bit_plane_codes, l2_norm)`
+    /// `(packed_bit_plane_codes, ‖v‖, correction)` where `correction = 1 / <u, x̂>`
+    /// is the per-vector debias factor and `‖v‖` is the raw L2 norm.
     #[inline]
-    pub fn encode_vector(&self, vec: &[T]) -> Result<(Vec<u8>, T), AnnSearchErrors> {
+    pub fn encode_vector(&self, vec: &[T]) -> Result<(Vec<u8>, T, T), AnnSearchErrors> {
         let mut packed = vec![0u8; self.bytes_per_vec];
-        let norm = self.encode_vector_into(vec, &mut packed)?;
-        Ok((packed, norm))
+        let (norm, correction) = self.encode_vector_into(vec, &mut packed)?;
+        Ok((packed, norm, correction))
     }
 
     /// Encode a single vector into a caller-owned buffer.
     ///
     /// ### Returns
     ///
-    /// L2 norm of the input.
+    /// `(‖v‖, correction)` where `correction = 1 / <u, x̂>` is the per-vector
+    /// debias factor and `‖v‖` is the raw L2 norm.
     #[inline]
-    pub fn encode_vector_into(&self, vec: &[T], out: &mut [u8]) -> Result<T, AnnSearchErrors> {
+    pub fn encode_vector_into(
+        &self,
+        vec: &[T],
+        out: &mut [u8],
+    ) -> Result<(T, T), AnnSearchErrors> {
         self.check_dim(vec.len())?;
 
         if out.len() != self.bytes_per_vec {
@@ -146,6 +152,7 @@ where
 
         out.fill(0);
         let bytes_per_plane = self.dim / 8;
+        let mut dot_self = T::zero();
         for d in 0..self.dim {
             // Code = number of boundaries strictly below `rotated[d]`.
             // Boundaries are sorted ascending; linear scan is fine for
@@ -156,6 +163,8 @@ where
                     code += 1;
                 }
             }
+            // Accumulate <u, x̂> using the level we just chose for this coord.
+            dot_self = dot_self + rotated[d] * self.levels[code as usize];
             // Bit-plane layout: bit p of `code` lands in plane p of byte
             // (d/8) at position 7-(d%8). High-bit-first ordering matches
             // what the SIMD re-pack expects.
@@ -168,7 +177,12 @@ where
             }
         }
 
-        Ok(norm)
+        let correction = if norm > T::epsilon() && dot_self > T::epsilon() {
+            T::one() / dot_self
+        } else {
+            T::zero()
+        };
+        Ok((norm, correction))
     }
 
     /// Encode a query: unit-normalise, rotate, retain original norm.
@@ -247,6 +261,8 @@ pub struct TurboQuantStorage<T> {
     pub packed_codes: Vec<u8>,
     /// L2 norms of the original vectors.
     pub norms: Vec<T>,
+    /// Per-vector debias factors `1 / <u, x̂>`.
+    pub corrections: Vec<T>,
     /// Dimensionality.
     pub dim: usize,
     /// Bits per coordinate.
@@ -276,6 +292,7 @@ impl<T: Float + FromPrimitive> TurboQuantStorage<T> {
         std::mem::size_of_val(self)
             + self.packed_codes.capacity()
             + self.norms.capacity() * std::mem::size_of::<T>()
+            + self.corrections.capacity() * std::mem::size_of::<T>()
     }
 }
 
@@ -317,14 +334,18 @@ where
 
         let mut packed_codes = vec![0u8; n * bytes_per_vec];
         let mut norms = vec![T::zero(); n];
+        let mut corrections = vec![T::zero(); n];
 
         packed_codes
             .par_chunks_mut(bytes_per_vec)
             .zip(norms.par_iter_mut())
+            .zip(corrections.par_iter_mut())
             .zip(data_flat.par_chunks(dim))
             .try_for_each(
-                |((packed_slice, norm_out), data_row)| -> Result<(), AnnSearchErrors> {
-                    *norm_out = encoder.encode_vector_into(data_row, packed_slice)?;
+                |(((packed_slice, norm_out), correction_out), data_row)| -> Result<(), AnnSearchErrors> {
+                    let (norm, correction) = encoder.encode_vector_into(data_row, packed_slice)?;
+                    *norm_out = norm;
+                    *correction_out = correction;
                     Ok(())
                 },
             )?;
@@ -332,6 +353,7 @@ where
         let storage = TurboQuantStorage {
             packed_codes,
             norms,
+            corrections,
             dim,
             bits,
             bytes_per_vec,
@@ -412,20 +434,40 @@ mod tests {
     }
 
     #[test]
-    fn test_encode_vector_norm() {
+    fn test_encode_vector_norm_and_correction() {
         let enc = TurboQuantEncoder::<f32>::new(8, 4, Dist::SquaredEuclidean, 42).unwrap();
         let v = vec![3.0_f32, 4.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
-        let (packed, norm) = enc.encode_vector(&v).unwrap();
-        assert_abs_diff_eq!(norm, 5.0, epsilon = 1e-5);
+        let (packed, norm, correction) = enc.encode_vector(&v).unwrap();
         assert_eq!(packed.len(), enc.bytes_per_vec);
+
+        // Raw L2 norm of (3, 4, 0, ..., 0).
+        assert_abs_diff_eq!(norm, 5.0, epsilon = 1e-5);
+
+        // Recompute expected correction = 1 / <u, x̂> by mirroring the encode loop.
+        let raw_norm: f32 = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+        let unit: Vec<f32> = v.iter().map(|x| x / raw_norm).collect();
+        let rotated = enc.apply_rotation(&unit);
+        let mut dot_self = 0.0f32;
+        for d in 0..enc.dim {
+            let mut code: u8 = 0;
+            for &b in &enc.boundaries {
+                if rotated[d] > b {
+                    code += 1;
+                }
+            }
+            dot_self += rotated[d] * enc.levels[code as usize];
+        }
+        let expected = 1.0 / dot_self;
+        assert_abs_diff_eq!(correction, expected, epsilon = 1e-5);
     }
 
     #[test]
     fn test_encode_zero_vector() {
         let enc = TurboQuantEncoder::<f32>::new(8, 4, Dist::SquaredEuclidean, 42).unwrap();
         let v = vec![0.0_f32; 8];
-        let (_, norm) = enc.encode_vector(&v).unwrap();
+        let (_, norm, correction) = enc.encode_vector(&v).unwrap();
         assert_abs_diff_eq!(norm, 0.0, epsilon = 1e-7);
+        assert_abs_diff_eq!(correction, 0.0, epsilon = 1e-7);
     }
 
     #[test]
@@ -465,7 +507,7 @@ mod tests {
             let norm: f32 = v.iter().map(|x| x * x).sum::<f32>().sqrt();
             let unit: Vec<f32> = v.iter().map(|x| x / norm).collect();
 
-            let (packed, _) = enc.encode_vector(&unit).unwrap();
+            let (packed, _, _) = enc.encode_vector(&unit).unwrap();
 
             let rotated_unit = enc.apply_rotation(&unit);
             let mut decoded_rot = vec![0.0f32; dim];
@@ -511,10 +553,11 @@ mod tests {
         assert_eq!(q.storage.bytes_per_vec, 8);
         assert_eq!(q.storage.packed_codes.len(), n * 8);
         assert_eq!(q.storage.norms.len(), n);
+        assert_eq!(q.storage.corrections.len(), n);
     }
 
     #[test]
-    fn test_quantiser_norms_match_input() {
+    fn test_quantiser_norms_and_corrections_match_recomputation() {
         let n = 5;
         let dim = 16;
         let mut data = Mat::<f32>::zeros(n, dim);
@@ -524,11 +567,26 @@ mod tests {
             }
         }
         let q = TurboQuantQuantiser::new(data.as_ref(), &Dist::SquaredEuclidean, 4, 42).unwrap();
+        let enc = &q.encoder;
 
         for i in 0..n {
             let row: Vec<f32> = (0..dim).map(|j| data[(i, j)]).collect();
-            let expected_norm: f32 = row.iter().map(|x| x * x).sum::<f32>().sqrt();
-            assert_abs_diff_eq!(q.storage.norms[i], expected_norm, epsilon = 1e-5);
+            let norm: f32 = row.iter().map(|x| x * x).sum::<f32>().sqrt();
+            let unit: Vec<f32> = row.iter().map(|x| x / norm).collect();
+            let rotated = enc.apply_rotation(&unit);
+            let mut dot_self = 0.0f32;
+            for d in 0..dim {
+                let mut code: u8 = 0;
+                for &b in &enc.boundaries {
+                    if rotated[d] > b {
+                        code += 1;
+                    }
+                }
+                dot_self += rotated[d] * enc.levels[code as usize];
+            }
+            let expected_correction = 1.0 / dot_self;
+            assert_abs_diff_eq!(q.storage.norms[i], norm, epsilon = 1e-5);
+            assert_abs_diff_eq!(q.storage.corrections[i], expected_correction, epsilon = 1e-5);
         }
     }
 

@@ -10,7 +10,7 @@
 //! two bits go into the nibble array and bit 2 lives in a separate plane ->
 //! this matches FAISS's PQ4 trick adapted to a non-power-of-two width.
 
-use crate::binary::tq_quantiser::TurboQuantStorage;
+use crate::binary::turboquant::quantiser::TurboQuantStorage;
 use crate::prelude::*;
 use num_traits::{Float, FromPrimitive};
 
@@ -345,7 +345,7 @@ fn pack_blocked(n: usize, n_blocks: usize, n_byte_groups: usize, codes_flat: &[u
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::binary::tq_quantiser::TurboQuantQuantiser;
+    use crate::binary::turboquant::quantiser::TurboQuantQuantiser;
     use faer::Mat;
 
     /// Decode a single coordinate's code from the bit-plane storage.
