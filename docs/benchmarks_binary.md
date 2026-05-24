@@ -27,6 +27,7 @@ for the quantisation methods.
 
 - [Binarisation](#binary-ivf-and-exhaustive)
 - [RaBitQ](#rabitq-ivf-and-exhaustive)
+- [TurboQuantisation](#)
 
 ### <u>Binary (IVF and exhaustive)</u>
 

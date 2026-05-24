@@ -837,25 +837,6 @@ pub struct BenchmarkResultSize {
     pub index_size_mb: f64,
 }
 
-/// BenchmarkResultPurity - includes cluster purity metric
-pub struct BenchmarkResultPurity {
-    /// Name of the method
-    pub method: String,
-    /// The build time of the index in ms
-    pub build_time_ms: f64,
-    /// The query time of the index in ms
-    pub query_time_ms: f64,
-    ///  Total time the index build & query takes in ms
-    pub total_time_ms: f64,
-    /// Recall@k neighbours against ground truth. Overlap in top k neighbours
-    /// for given k
-    pub recall_at_k: f64,
-    /// Fraction of neighbors from same cluster
-    pub cluster_purity: f64,
-    /// Index size in MB
-    pub index_size_mb: f64,
-}
-
 /////////////
 // Helpers //
 /////////////
@@ -938,34 +919,6 @@ where
     total_ratio / count as f64
 }
 
-/// Calculate cluster purity of kNN graph
-///
-/// Measures what fraction of each point's neighbors belong to the same cluster.
-/// High purity (>0.8) means the method preserves cluster structure well.
-///
-/// ### Params
-///
-/// * `knn_graph` - Neighbor indices for each point
-/// * `cluster_labels` - Ground truth cluster assignment for each point
-///
-/// ### Returns
-///
-/// Average fraction of same-cluster neighbors
-pub fn calculate_cluster_purity(knn_graph: &[Vec<usize>], cluster_labels: &[usize]) -> f64 {
-    let mut total_purity = 0.0;
-
-    for (i, neighbors) in knn_graph.iter().enumerate() {
-        let my_cluster = cluster_labels[i];
-        let same_cluster = neighbors
-            .iter()
-            .filter(|&&idx| cluster_labels[idx] == my_cluster)
-            .count();
-        total_purity += same_cluster as f64 / neighbors.len() as f64;
-    }
-
-    total_purity / knn_graph.len() as f64
-}
-
 ////////////
 // Prints //
 ////////////
@@ -1013,36 +966,4 @@ pub fn print_results_size(config: &str, results: &[BenchmarkResultSize]) {
         );
     }
     println!("{:->131}\n", "");
-}
-
-/// Helper to print results to console
-///
-/// This version prints the cluster purity measure
-///
-/// ### Params
-///
-/// * `config` - Benchmark configuration
-/// * `results` - Benchmark results to print
-pub fn print_results_purity(config: &str, results: &[BenchmarkResultPurity]) {
-    println!("\n{:=>128}", "");
-    println!("Benchmark: {}", config);
-    println!("{:=>128}", "");
-    println!(
-        "{:<50} {:>12} {:>12} {:>12} {:>12} {:>12} {:>12}",
-        "Method", "Build (ms)", "Query (ms)", "Total (ms)", "Recall@k", "Purity", "Size (MB)"
-    );
-    println!("{:->128}", "");
-    for result in results {
-        println!(
-            "{:<50} {:>12} {:>12} {:>12} {:>12.4} {:>12.4} {:>12.2}",
-            result.method,
-            format_with_underscores(result.build_time_ms),
-            format_with_underscores(result.query_time_ms),
-            format_with_underscores(result.total_time_ms),
-            result.recall_at_k,
-            result.cluster_purity,
-            result.index_size_mb
-        );
-    }
-    println!("{:->128}\n", "");
 }
