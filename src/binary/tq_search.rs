@@ -1817,4 +1817,97 @@ mod tests {
     fn test_fused4_high_dim() {
         assert_fused4_matches_oracle(4, 1536, BLOCK * 5 + 1, 10, Dist::SquaredEuclidean, 4);
     }
+
+    #[cfg(target_arch = "x86_64")]
+    type FusedKernel = unsafe fn(
+        &[&QueryLut; 4],
+        &[u8],
+        usize,
+        usize,
+        &[f32],
+        [f32; 4],
+        Dist,
+        usize,
+        usize,
+    ) -> Vec<(Vec<u32>, Vec<f32>)>;
+
+    #[cfg(target_arch = "x86_64")]
+    fn assert_fused_matches_oracle(
+        kernel: FusedKernel,
+        bits: usize,
+        dim: usize,
+        n: usize,
+        k: usize,
+        metric: Dist,
+        nq: usize,
+    ) {
+        let q = TurboQuantQuantiser::new(test_data(n, dim).as_ref(), &metric, bits, 42);
+        let (blocked, n_blocks) = blocked_data(&q);
+
+        let queries: Vec<Vec<f32>> = (0..nq)
+            .map(|qi| {
+                (0..dim)
+                    .map(|i| ((i + 3 * qi) as f32 * 0.061 + qi as f32).sin())
+                    .collect()
+            })
+            .collect();
+
+        let mut expected = Vec::new();
+        let mut encoded = Vec::new();
+        for query in &queries {
+            let eq = q.encode_query(query);
+            let (q_rot, levels) = prepare_scalar_scoring(&eq, &q.encoder);
+            let lut = build_query_lut(&q_rot, &levels, bits, dim);
+            expected.push(score_query_topk_scalar(
+                &lut,
+                &blocked,
+                n,
+                n_blocks,
+                &q.storage.norms,
+                eq.query_norm,
+                metric,
+                k,
+            ));
+            encoded.push((lut, eq.query_norm));
+        }
+
+        let mut got = Vec::new();
+        let mut qi = 0;
+        while qi < nq {
+            let batch_nq = (nq - qi).min(4);
+            let pad = qi + batch_nq - 1;
+            let luts: [&QueryLut; 4] = [
+                &encoded[qi].0,
+                &encoded[(qi + 1).min(pad)].0,
+                &encoded[(qi + 2).min(pad)].0,
+                &encoded[(qi + 3).min(pad)].0,
+            ];
+            let qnorms = [
+                encoded[qi].1,
+                encoded[(qi + 1).min(pad)].1,
+                encoded[(qi + 2).min(pad)].1,
+                encoded[(qi + 3).min(pad)].1,
+            ];
+            got.extend(unsafe {
+                kernel(
+                    &luts,
+                    &blocked,
+                    n,
+                    n_blocks,
+                    &q.storage.norms,
+                    qnorms,
+                    metric,
+                    k,
+                    batch_nq,
+                )
+            });
+            qi += batch_nq;
+        }
+
+        assert_eq!(got.len(), nq);
+        for (i, ((g_idx, g_dist), (e_idx, e_dist))) in got.iter().zip(expected.iter()).enumerate() {
+            assert_eq!(g_idx, e_idx, "{metric:?} query {i} indices diverge");
+            assert_eq!(g_dist, e_dist, "{metric:?} query {i} distances diverge");
+        }
+    }
 }
