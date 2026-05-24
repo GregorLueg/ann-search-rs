@@ -1259,9 +1259,9 @@ mod tests {
 
         let q = build(n, dim, bits);
         let query: Vec<f32> = (0..dim).map(|i| (i as f32 * 0.083 + 0.3).sin()).collect();
-        let eq = q.encode_query(&query);
+        let eq = q.encode_query(&query).unwrap();
         let (q_rot, levels) = prepare_scalar_scoring(&eq, &q.encoder);
-        let lut = build_query_lut(&q_rot, &levels, bits, dim);
+        let lut = build_query_lut(&q_rot, &levels, bits, dim).unwrap();
 
         let (blocked, n_blocks) = blocked_data(&q);
         let mut scalar_out = [0.0f32; BLOCK];
@@ -1493,7 +1493,7 @@ mod tests {
             return;
         }
 
-        let q = TurboQuantQuantiser::new(test_data(n, dim).as_ref(), &metric, bits, 42);
+        let q = TurboQuantQuantiser::new(test_data(n, dim).as_ref(), &metric, bits, 42).unwrap();
         let (blocked, n_blocks) = blocked_data(&q);
 
         // Build nq distinct queries.
@@ -1508,7 +1508,7 @@ mod tests {
         // Per-query scalar oracle.
         let mut expected = Vec::new();
         for query in &queries {
-            let eq = q.encode_query(query);
+            let eq = q.encode_query(query).unwrap();
             let (q_rot, levels) = prepare_scalar_scoring(&eq, &q.encoder);
             let lut = build_query_lut(&q_rot, &levels, bits, dim);
             expected.push(score_query_topk_scalar(

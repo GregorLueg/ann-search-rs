@@ -14,14 +14,18 @@ use crate::binary::tq_quantiser::TurboQuantStorage;
 use crate::prelude::*;
 use num_traits::{Float, FromPrimitive};
 
-/// Vectors per SIMD block. Matches the original TurboQuant crate; the
-/// AVX2 / AVX-512BW / NEON kernels all assume this exact value.
+/// Vectors per SIMD block. Matches the original TurboQuant crate; the AVX2 /
+/// AVX-512BW / NEON kernels all assume this exact value.
 pub const BLOCK: usize = 32;
+
+/// TODO: needs docs
+#[cfg(target_arch = "x86_64")]
+pub const PERM0: [usize; 16] = [0, 8, 1, 9, 2, 10, 3, 11, 4, 12, 5, 13, 6, 14, 7, 15];
 
 /// Inverse of `PERM0`: `PERM0_INV[v]` is the `j` with `PERM0[j] == v`.
 /// Used to recover a lane's code byte from the interleaved x86 layout.
 #[cfg(target_arch = "x86_64")]
-pub(crate) const PERM0_INV: [usize; 16] = [0, 2, 4, 6, 8, 10, 12, 14, 1, 3, 5, 7, 9, 11, 13, 15];
+pub const PERM0_INV: [usize; 16] = [0, 2, 4, 6, 8, 10, 12, 14, 1, 3, 5, 7, 9, 11, 13, 15];
 
 /// Blocked layout for 2-bit and 4-bit codes.
 pub struct BlockedCodes {
