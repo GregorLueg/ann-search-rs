@@ -390,6 +390,14 @@ where
     }
 
     /// Default `nprobe` is `sqrt(nlist)`, clamped to `nlist`.
+    ///
+    /// ### Params
+    ///
+    /// * `nprobe` - Optional number of n_probes
+    ///
+    /// ### Returns
+    ///
+    /// The number of clusters to probe
     #[inline]
     fn resolve_nprobe(&self, nprobe: Option<usize>) -> usize {
         nprobe
@@ -698,6 +706,7 @@ where
 
         let results: Vec<(Vec<usize>, Vec<T>)> = if self.bits == 3 {
             // No fused kernel for 3-bit: score each query independently.
+            // This is sloooooow...
             (0..nq)
                 .into_par_iter()
                 .map(|i| {
@@ -750,8 +759,6 @@ where
                         &luts_owned[3.min(last)],
                     ];
 
-                    // One persistent heap per query, accumulating across the
-                    // union of probed cells.
                     let mut heaps: Vec<TopK> =
                         (0..batch_nq).map(|_| TopK::new(k_search.max(1))).collect();
                     for &c in &probed {
