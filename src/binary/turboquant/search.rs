@@ -8,9 +8,9 @@
 
 use std::cmp::Ordering;
 
-use crate::binary::tq_pack::BLOCK;
 #[cfg(target_arch = "x86_64")]
 use crate::binary::tq_pack::PERM0_INV;
+use crate::binary::turboquant::pack::BLOCK;
 use crate::prelude::*;
 
 ////////////
@@ -20,6 +20,7 @@ use crate::prelude::*;
 /// Byte-groups accumulated into u16 lanes before each flush to f32. Tuned so
 /// `FLUSH_EVERY * 2 * 127 < u16::MAX`: each group adds two u8 lookups (each ≤
 /// 127 on NEON), so the u16 lane cannot overflow within a batch.
+#[cfg(target_arch = "aarch64")]
 const FLUSH_EVERY: usize = 256;
 
 /////////
@@ -1454,10 +1455,12 @@ pub(crate) fn topk_blocked(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::binary::tq_dists::reconstruct_distance;
-    use crate::binary::tq_dists::{prepare_scalar_scoring, score_ip_scalar};
-    use crate::binary::tq_pack::{repack, BlockedLayout, BLOCK};
-    use crate::binary::tq_quantiser::TurboQuantQuantiser;
+
+    use crate::binary::turboquant::dists::{
+        prepare_scalar_scoring, reconstruct_distance, score_ip_scalar,
+    };
+    use crate::binary::turboquant::pack::{repack, BlockedLayout, BLOCK};
+    use crate::binary::turboquant::quantiser::TurboQuantQuantiser;
     use faer::Mat;
 
     fn test_data(n: usize, dim: usize) -> Mat<f32> {

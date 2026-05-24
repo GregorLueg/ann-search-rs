@@ -19,7 +19,6 @@ use crate::binary::rabitq::*;
 use crate::binary::vec_store::*;
 use crate::prelude::*;
 use crate::utils::k_means_utils::*;
-use crate::utils::*;
 
 /// IVF index with RaBitQ quantisation
 ///

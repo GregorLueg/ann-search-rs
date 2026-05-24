@@ -3042,3 +3042,7 @@ where
 {
     index.generate_knn(k, nprobe, rerank_factor, return_dist, verbose)
 }
+
+///////////////////////////
+// Exhaustive TurboQuant //
+///////////////////////////

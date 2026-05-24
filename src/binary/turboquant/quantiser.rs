@@ -16,7 +16,7 @@ use rand_distr::StandardNormal;
 use rayon::prelude::*;
 use std::iter::Sum;
 
-use crate::binary::tq_codebook::codebook;
+use crate::binary::turboquant::codebook::codebook;
 use crate::prelude::*;
 
 //////////////////////

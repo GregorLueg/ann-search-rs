@@ -14,7 +14,6 @@ use crate::gpu::*;
 use crate::prelude::*;
 use crate::utils::dist::Dist;
 use crate::utils::k_means_utils::*;
-use crate::utils::*;
 
 /// Maximum number of queries processed in a single GPU batch to avoid
 /// exhausting VRAM

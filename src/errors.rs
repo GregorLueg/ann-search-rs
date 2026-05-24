@@ -70,6 +70,16 @@ pub enum AnnSearchErrors {
     #[error("Vector store is not available. Use build_with_vector_store() to enable reranking.")]
     VectorStoreNotAvailable,
 
+    /// Size mismatch error for locally stored files
+    #[cfg(feature = "binary")]
+    #[error("Size mismatch: expected {expected} bytes, got {actual} bytes.")]
+    SizeMismatch {
+        /// Expected size of the file
+        expected: usize,
+        /// Actual size of the file
+        actual: usize,
+    },
+
     /// IO error
     #[cfg(feature = "binary")]
     #[error("IO error: {0}")]

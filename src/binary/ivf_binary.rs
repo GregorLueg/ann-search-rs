@@ -16,7 +16,6 @@ use crate::binary::dist_binary::*;
 use crate::binary::vec_store::*;
 use crate::prelude::*;
 use crate::utils::k_means_utils::*;
-use crate::utils::*;
 
 /// IVF index with binary quantisation
 pub struct IvfIndexBinary<T> {

@@ -21,7 +21,6 @@ use crate::gpu::forest_gpu::*;
 use crate::gpu::tensor::*;
 use crate::gpu::*;
 use crate::prelude::*;
-use crate::utils::*;
 
 ///////////
 // Const //

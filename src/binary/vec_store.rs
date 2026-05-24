@@ -73,7 +73,7 @@ where
         norms_path: impl AsRef<Path>,
         dim: usize,
         n: usize,
-    ) -> std::io::Result<Self> {
+    ) -> Result<Self, AnnSearchErrors> {
         let file_vectors = File::open(vectors_path)?;
         let file_norms = File::open(norms_path)?;
 
@@ -87,16 +87,19 @@ where
         let expected_vectors_size = n * dim * std::mem::size_of::<T>();
         let expected_norms_size = n * std::mem::size_of::<T>();
 
-        assert_eq!(
-            mmap_vectors.len(),
-            expected_vectors_size,
-            "Vectors file size mismatch"
-        );
-        assert_eq!(
-            mmap_norms.len(),
-            expected_norms_size,
-            "Norms file size mismatch"
-        );
+        if mmap_vectors.len() != expected_vectors_size {
+            return Err(AnnSearchErrors::SizeMismatch {
+                expected: expected_vectors_size,
+                actual: mmap_vectors.len(),
+            });
+        }
+
+        if mmap_norms.len() != expected_norms_size {
+            return Err(AnnSearchErrors::SizeMismatch {
+                expected: expected_norms_size,
+                actual: mmap_norms.len(),
+            });
+        }
 
         Ok(Self {
             mmap_vectors,
@@ -126,9 +129,20 @@ where
         n: usize,
         vectors_path: impl AsRef<Path>,
         norms_path: impl AsRef<Path>,
-    ) -> std::io::Result<()> {
-        assert_eq!(vectors_flat.len(), n * dim);
-        assert_eq!(norms.len(), n);
+    ) -> Result<(), AnnSearchErrors> {
+        if vectors_flat.len() != n * dim {
+            return Err(AnnSearchErrors::SizeMismatch {
+                expected: n * dim,
+                actual: vectors_flat.len(),
+            });
+        }
+
+        if norms.len() != n {
+            return Err(AnnSearchErrors::SizeMismatch {
+                expected: n,
+                actual: norms.len(),
+            });
+        }
 
         // Write vectors
         let mut writer = BufWriter::new(File::create(vectors_path)?);
@@ -159,6 +173,10 @@ where
         self.dim
     }
 }
+
+/////////////////
+// VectorStore //
+/////////////////
 
 impl<T> VectorStore<T> for MmapVectorStore<T>
 where
@@ -291,7 +309,6 @@ mod tests {
     }
 
     #[test]
-    #[should_panic]
     fn test_wrong_vector_file_size() {
         let vec_file = NamedTempFile::new().unwrap();
         let norm_file = NamedTempFile::new().unwrap();
@@ -299,11 +316,11 @@ mod tests {
         std::fs::write(vec_file.path(), [0u8; 100]).unwrap();
         std::fs::write(norm_file.path(), [0u8; 16]).unwrap();
 
-        let _ = MmapVectorStore::<f32>::new(vec_file.path(), norm_file.path(), 2, 4).unwrap();
+        let result = MmapVectorStore::<f32>::new(vec_file.path(), norm_file.path(), 2, 4);
+        assert!(matches!(result, Err(AnnSearchErrors::SizeMismatch { .. })));
     }
 
     #[test]
-    #[should_panic]
     fn test_wrong_norms_file_size() {
         let vec_file = NamedTempFile::new().unwrap();
         let norm_file = NamedTempFile::new().unwrap();
@@ -311,11 +328,11 @@ mod tests {
         std::fs::write(vec_file.path(), [0u8; 32]).unwrap();
         std::fs::write(norm_file.path(), [0u8; 100]).unwrap();
 
-        let _ = MmapVectorStore::<f32>::new(vec_file.path(), norm_file.path(), 2, 4).unwrap();
+        let result = MmapVectorStore::<f32>::new(vec_file.path(), norm_file.path(), 2, 4);
+        assert!(matches!(result, Err(AnnSearchErrors::SizeMismatch { .. })));
     }
 
     #[test]
-    #[should_panic]
     fn test_save_vectors_length_mismatch() {
         let vectors = vec![1.0f32, 2.0, 3.0];
         let norms = vec![2.24, 5.0];
@@ -323,11 +340,12 @@ mod tests {
         let vec_file = NamedTempFile::new().unwrap();
         let norm_file = NamedTempFile::new().unwrap();
 
-        MmapVectorStore::save(&vectors, &norms, 2, 2, vec_file.path(), norm_file.path()).unwrap();
+        let result =
+            MmapVectorStore::save(&vectors, &norms, 2, 2, vec_file.path(), norm_file.path());
+        assert!(matches!(result, Err(AnnSearchErrors::SizeMismatch { .. })));
     }
 
     #[test]
-    #[should_panic]
     fn test_save_norms_length_mismatch() {
         let vectors = vec![1.0f32, 2.0, 3.0, 4.0];
         let norms = vec![2.24];
@@ -335,7 +353,9 @@ mod tests {
         let vec_file = NamedTempFile::new().unwrap();
         let norm_file = NamedTempFile::new().unwrap();
 
-        MmapVectorStore::save(&vectors, &norms, 2, 2, vec_file.path(), norm_file.path()).unwrap();
+        let result =
+            MmapVectorStore::save(&vectors, &norms, 2, 2, vec_file.path(), norm_file.path());
+        assert!(matches!(result, Err(AnnSearchErrors::SizeMismatch { .. })));
     }
 
     #[test]

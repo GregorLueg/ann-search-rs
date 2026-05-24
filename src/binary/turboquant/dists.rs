@@ -17,7 +17,7 @@
 
 use num_traits::{Float, FromPrimitive, ToPrimitive};
 
-use crate::binary::tq_quantiser::{
+use crate::binary::turboquant::quantiser::{
     TurboQuantEncoder, TurboQuantQuantiser, TurboQuantQuery, TurboQuantStorage,
 };
 use crate::prelude::*;
