@@ -1510,7 +1510,7 @@ mod tests {
         for query in &queries {
             let eq = q.encode_query(query).unwrap();
             let (q_rot, levels) = prepare_scalar_scoring(&eq, &q.encoder);
-            let lut = build_query_lut(&q_rot, &levels, bits, dim);
+            let lut = build_query_lut(&q_rot, &levels, bits, dim).unwrap();
             expected.push(score_query_topk_scalar(
                 &lut,
                 &blocked,
@@ -1529,7 +1529,10 @@ mod tests {
             .map(|query| {
                 let eq = q.encode_query(query);
                 let (q_rot, levels) = prepare_scalar_scoring(&eq, &q.encoder);
-                (build_query_lut(&q_rot, &levels, bits, dim), eq.query_norm)
+                (
+                    build_query_lut(&q_rot, &levels, bits, dim).unwrap(),
+                    eq.query_norm,
+                )
             })
             .collect();
 
