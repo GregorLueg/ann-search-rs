@@ -43,6 +43,8 @@ pub struct TurboQuantExhaustive<T> {
     blocked: Option<(Vec<u8>, usize)>,
     /// Per-vector L2 norms pre-cast to f32 for the SIMD kernels.
     norms_f32: Vec<f32>,
+    /// Per-vector debias factors `1 / <u, x̂>` pre-cast to f32.
+    corrections_f32: Vec<f32>,
     /// Number of stored vectors.
     n: usize,
     /// Optional on-disk original vectors for exact reranking.
@@ -115,11 +117,18 @@ where
             .iter()
             .map(|x| x.to_f32().unwrap())
             .collect();
+        let corrections_f32 = quantiser
+            .storage
+            .corrections
+            .iter()
+            .map(|x| x.to_f32().unwrap())
+            .collect();
 
         Ok(Self {
             quantiser,
             blocked,
             norms_f32,
+            corrections_f32,
             n,
             vector_store: None,
         })
@@ -225,6 +234,7 @@ where
             self.n,
             *n_blocks,
             &self.norms_f32,
+            &self.corrections_f32,
             [qn; 4],
             metric,
             k,
@@ -499,6 +509,7 @@ where
                         n,
                         *n_blocks,
                         &self.norms_f32,
+                        &self.corrections_f32,
                         qnorms,
                         metric,
                         k_search,
@@ -637,6 +648,7 @@ where
                         n,
                         *n_blocks,
                         &self.norms_f32,
+                        &self.corrections_f32,
                         qnorms,
                         metric,
                         k_search,
@@ -677,6 +689,7 @@ where
             + self.quantiser.memory_usage_bytes()
             + self.blocked.as_ref().map_or(0, |(d, _)| d.capacity())
             + self.norms_f32.capacity() * std::mem::size_of::<f32>()
+            + self.corrections_f32.capacity() * std::mem::size_of::<f32>()
     }
 }
 
