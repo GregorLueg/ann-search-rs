@@ -9,6 +9,7 @@ pub mod exhaustive_rabitq;
 pub mod exhaustive_tq;
 pub mod ivf_binary;
 pub mod ivf_rabitq;
+pub mod ivf_tq;
 pub mod rabitq;
 pub mod turboquant;
 pub mod vec_store;

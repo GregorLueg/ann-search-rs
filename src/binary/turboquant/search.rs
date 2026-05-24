@@ -1372,7 +1372,6 @@ pub(crate) fn score_into_heaps(
                 heaps,
             ),
         }
-        return;
     }
     #[cfg(target_arch = "aarch64")]
     {
@@ -1391,7 +1390,6 @@ pub(crate) fn score_into_heaps(
                 heaps,
             );
         }
-        return;
     }
     #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
     {

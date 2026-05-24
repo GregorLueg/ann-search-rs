@@ -487,7 +487,7 @@ where
 
                     let last = batch_nq - 1;
                     let lut_refs: [&QueryLut; 4] = [
-                        &luts_owned[0.min(last)],
+                        &luts_owned[0],
                         &luts_owned[1.min(last)],
                         &luts_owned[2.min(last)],
                         &luts_owned[3.min(last)],
@@ -625,7 +625,7 @@ where
                     // Pad the 4-wide LUT array with the last valid query.
                     let last = batch_nq - 1;
                     let lut_refs: [&QueryLut; 4] = [
-                        &luts_owned[0.min(last)],
+                        &luts_owned[0],
                         &luts_owned[1.min(last)],
                         &luts_owned[2.min(last)],
                         &luts_owned[3.min(last)],
