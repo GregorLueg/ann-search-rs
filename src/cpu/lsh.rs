@@ -611,7 +611,7 @@ where
             }
 
             let mut results: Vec<_> = heap.into_vec();
-            results.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+            results.sort_unstable_by_key(|a| a.0);
 
             let indices = results.iter().map(|&(_, idx)| idx).collect();
             let dists = results.iter().map(|&(OrderedFloat(d), _)| d).collect();

@@ -16,7 +16,7 @@ cargo run --example gridsearch_<INDEX> --release -- --distance cosine
 # --n-clusters 25
 # --k 15
 # --seed 42
-# --distance cosine
+# --distance euclidean
 # --data gaussian
 ```
 

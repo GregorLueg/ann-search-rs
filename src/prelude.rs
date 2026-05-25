@@ -8,6 +8,7 @@ pub use crate::errors::AnnSearchErrors;
 pub use crate::utils::dist::*;
 pub use crate::utils::heap_structs::*;
 pub use crate::utils::k_means_utils::{KMeansInit, KMeansTrainingParams, LloydPath};
+pub use crate::utils::matrix_to_flat;
 pub use crate::utils::parallelism::StripedLocks;
 pub use crate::utils::prefetch_read;
 pub use crate::utils::traits::AnnSearchFloat;

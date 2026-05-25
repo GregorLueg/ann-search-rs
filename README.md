@@ -75,6 +75,7 @@ anticipated. If you want to see what changed, please check this
   - *Binary* (different types of binary quantisations for exhaustive and IVF
     indices.)
   - *RaBitQ* (RaBitQ quantisation for exhaustive and IVF indices.)
+  - *TurboQuant* (Turbo Quantisation for exhaustive and IVF indices.)
 
 ## Installation
 
@@ -82,13 +83,15 @@ Add this to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-ann-search-rs = "0.3.0"
+ann-search-rs = "0.4.0"
 ```
 
 ### Note
 
-With version `"0.3.0"` some breaking API changes were introduced: this harmonise
-several of the functions and avoid panics in favour of errors.
+With version `"0.4.0"` some breaking API changes were introduced: this harmonise
+several of the functions and avoid panics in favour of errors. A key change
+was also the update to cubecl `"0.1.0"` which changes quite a few APIs for the
+GPU-accelerated version.
 
 ## Example Usage
 
@@ -136,42 +139,48 @@ good starting point to understand how the crate works.
 
 **GaussianNoise**
 
-Generates simple Gaussian clusters with variable sizes and standard deviations.
-Each cluster is a blob centred in the full dimensional space. Useful for basic
-benchmarking where clusters are well-separated and occupy the entire ambient
-space.
+Isotropic Gaussian clusters with variable sizes and per-cluster standard
+deviations, centred across the full ambient space. A fraction of points
+(`DEFAULT_BRIDGE_FRACTION`: 20%) are placed on thin Gaussian tubes interpolating
+between each cluster and its nearest neighbour, so clusters are connected rather
+than fully isolated. Useful as a baseline where structure is axis-agnostic and
+mostly well-separated.
 
 **Correlated**
 
-Creates clusters with subspace structure where each cluster only activates a
-subset of dimensions. Additionally introduces explicit correlation patterns
-where groups of dimensions are linear combinations of source dimensions.
-Designed to test methods that exploit inter-dimensional correlations and sparse
-activation patterns.
+Well-separated clusters, each an arbitrarily-oriented ellipsoid with a low-rank
+power-law covariance (cluster-local anisotropy), plus a globally-shared off-axis
+subspace carrying inter-dimension correlation. The structured variance is
+deliberately not aligned with the coordinate axes, so a learned rotation (OPQ)
+can recover it while axis-aligned PQ cannot. `correlation_strength` splits
+variance between the shared global subspace (1.0) and the cluster-local one
+(0.0). Designed to separate rotation-aware from axis-aligned quantisers.
 
 **LowRank**
 
-Generates data that lives in a low-dimensional subspace (intrinsic_dim) and
-embeds it via random rotation into high-dimensional space (embedding_dim).
-Simulates the manifold hypothesis where high-dimensional data actually lies on a
-lower-dimensional manifold. Adds minimal isotropic noise to model measurement
-error.
+Data that genuinely lives in a low-dimensional subspace (`intrinsic_dim`),
+isometrically embedded into the full space (`dim`) via an orthonormal rotation,
+with minimal isotropic noise for measurement error. Clusters follow a two-level
+lineage hierarchy (roots, then leaves around each root), and a fraction of points
+(`DEFAULT_TRAJECTORY_FRACTION`: 15%) lie on quadratic Bezier trajectories
+chaining leaves within a lineage. Models the manifold hypothesis: locally
+low-dimensional, globally curved, so a single global rotation cannot flatten it.
 
-**QuantisationStress**
+**CellEmbedding**
 
-Combines power-law eigenvalue spectrum with norm-stratified clusters, randomly
-rotated out of axis alignment. Variance decays as 1/(i+1)^decay across principal
-components, so most information concentrates in a small subspace. Cluster pairs
-share directions but sit at very different radii (2, 8, 20), meaning points with
-near-identical angular signatures can have wildly different true distances. The
-random rotation ensures no coordinate axis is privileged. Specifically targets
-failure modes of aggressive quantisation: sign binarisation wastes bits on noise
-dimensions and cannot distinguish radially-separated clusters, axis-aligned
-product quantisation mixes informative and uninformative dimensions within
-sub-vectors, and low-bit methods generally lose angular resolution in the
-informative subspace. Use spectral_decay=1.5 for moderate concentration (~80% of
-variance in top 25% of principal components) or 2.0 for aggressive (~90% in top
-15%). Recommended with `dim=128` or `dim=256` and `n_clusters=50+`.
+Approximates the geometry of foundation-model cell embeddings (Geneformer/scGPT
+style) at 256-768 dimensions. Combines five properties, each targeting a distinct
+quantisation failure mode: a strong shared anisotropy cone (large mean offset,
+high pairwise cosine) that defeats cosine- and sign-based methods; a few
+axis-aligned rogue dimensions with outsized variance that dominate dot products
+and starve PQ codebooks; per-cell-type low-rank oriented subspaces whose union is
+full-rank, so no single OPQ rotation fully aligns them; differentiation
+trajectories between related types (curved manifold); and per-cell lognormal norm
+variation standing in for library size/sequencing depth. Recommended with
+dim=256 to dim=768 and n_clusters=25+. Note the constants here are
+plausible rather than fitted to real embeddings — if you have a real
+Geneformer/scGPT matrix, fit the cone, rogue-dim magnitudes and eigenspectrum to
+it before trusting benchmark conclusions.
 
 ### Running the grid searches
 
@@ -285,7 +294,7 @@ If you wish to use these, please add the `"quantised"` feature:
 
 ```toml
 [dependencies]
-ann-search-rs = { version = "0.3.0", features = ["quantised"] }
+ann-search-rs = { version = "0.4.0", features = ["quantised"] }
 ```
 
 ## GPU
@@ -302,7 +311,7 @@ To unlock GPU-acceleration, please use:
 
 ```toml
 [dependencies]
-ann-search-rs = { version = "0.3.0", features = ["gpu"] }
+ann-search-rs = { version = "0.4.0", features = ["gpu"] }
 ```
 
 ## Binarised indices
@@ -314,6 +323,9 @@ are two approaches for binarisation available in the crate:
   hashing or signed-based binarisation.
 - [RaBitQ](https://arxiv.org/abs/2405.12497) binarisation while storing
   additional data for approximate distance calculations.
+- [TurboQuant](https://arxiv.org/abs/2504.19874) a data-oblivious quantiser that
+  randomly rotates each vector and applies a per-coordinate scalar quantiser, so
+  there are no learned codebooks and indexing is near-instant.
 
 These can be used with Exhaustive or IVF indices and you have the option to
 store the original vectors on-disk to allow for subsequent re-ranking. This
@@ -321,7 +333,7 @@ can drastically improve the Recall. To enable the feature, please use:
 
 ```toml
 [dependencies]
-ann-search-rs = { version = "0.3.0", features = ["binary"] }
+ann-search-rs = { version = "0.4.0", features = ["binary"] }
 ```
 
 The benchmarks can be found [here](https://github.com/GregorLueg/ann-search-rs/blob/main/docs/benchmarks_binary.md).

@@ -1,5 +1,20 @@
 # News
 
+## 0.4.0
+
+**Features**
+
+- Version bump on cubecl to `"0.10.0"`. This might introduce *breaking* changes
+  if you are using the package in
+- More and improved error handling across the board.
+- TurboQuantisation with exhaustive and IVF index implemented.
+- Better benchmarking with an cell embedding-like benchmark.
+- Better entry seeds for the CAGRA style graph.
+
+**Fixes**
+
+- Nasty SIMD overflow bug hitting RaBitQ at higher dimensionalities.
+
 ## 0.3.1
 
 **Fix**

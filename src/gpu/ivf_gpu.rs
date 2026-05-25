@@ -14,7 +14,6 @@ use crate::gpu::*;
 use crate::prelude::*;
 use crate::utils::dist::Dist;
 use crate::utils::k_means_utils::*;
-use crate::utils::*;
 
 /// Maximum number of queries processed in a single GPU batch to avoid
 /// exhausting VRAM
@@ -132,7 +131,7 @@ where
 
         let nlist = nlist.unwrap_or((n as f32).sqrt() as usize).max(1);
 
-        let line = LINE_SIZE as usize;
+        let line = LINE_SIZE;
         let dim_padded = dim.next_multiple_of(line);
 
         let n_train = (256 * nlist).min(250_000).min(n).max(1);
@@ -298,7 +297,9 @@ where
         let n_batches = n_queries.div_ceil(nquery);
 
         if n_batches == 1 {
-            return Ok(self.query_batch_internal(queries_flat, n_queries, k, nprobe, client));
+            let res = self.query_batch_internal(queries_flat, n_queries, k, nprobe, client)?;
+
+            return Ok(res);
         }
 
         let mut all_indices = Vec::with_capacity(n_queries);
@@ -319,7 +320,7 @@ where
                 &queries_flat[batch_start * self.dim_padded..batch_end * self.dim_padded];
 
             let (batch_indices, batch_dists) =
-                self.query_batch_internal(batch_queries, batch_size, k, nprobe, client);
+                self.query_batch_internal(batch_queries, batch_size, k, nprobe, client)?;
 
             all_indices.extend(batch_indices);
             all_distances.extend(batch_dists);
@@ -500,8 +501,8 @@ where
         k: usize,
         nprobe: usize,
         client: &ComputeClient<R>,
-    ) -> (Vec<Vec<usize>>, Vec<Vec<T>>) {
-        let vec_size = LINE_SIZE as usize;
+    ) -> KnnResult<T> {
+        let vec_size = LINE_SIZE;
         let dim_lines = self.dim_padded / vec_size;
 
         let query_norms = if self.metric == Dist::Cosine {
@@ -535,57 +536,47 @@ where
 
         match self.metric {
             Dist::SquaredEuclidean => unsafe {
-                let _ = euclidean_tiled::launch_unchecked::<T, R>(
+                euclidean_tiled::launch_unchecked::<T, R>(
                     client,
                     CubeCount::Static(grid_x, grid_y, grid_z),
                     CubeDim::new_2d(WORKGROUP_SIZE_X, WORKGROUP_SIZE_Y),
-                    queries_gpu.clone().into_tensor_arg(vec_size),
-                    self.centroids_gpu.clone().into_tensor_arg(vec_size),
-                    centroid_dists_gpu.into_tensor_arg(1),
-                    ScalarArg { elem: 0u32 },
-                    ScalarArg {
-                        elem: self.nlist as u32,
-                    },
-                    ScalarArg {
-                        elem: n_queries as u32,
-                    },
-                    ScalarArg {
-                        elem: self.nlist as u32,
-                    },
+                    vec_size,
+                    queries_gpu.clone().into_tensor_arg(),
+                    self.centroids_gpu.clone().into_tensor_arg(),
+                    centroid_dists_gpu.into_tensor_arg(),
+                    0u32,
+                    self.nlist as u32,
+                    n_queries as u32,
+                    self.nlist as u32,
                     dim_lines,
                 );
             },
             Dist::Cosine => unsafe {
-                let _ = cosine_tiled::launch_unchecked::<T, R>(
+                cosine_tiled::launch_unchecked::<T, R>(
                     client,
                     CubeCount::Static(grid_x, grid_y, grid_z),
                     CubeDim::new_2d(WORKGROUP_SIZE_X, WORKGROUP_SIZE_Y),
-                    queries_gpu.clone().into_tensor_arg(vec_size),
-                    self.centroids_gpu.clone().into_tensor_arg(vec_size),
-                    query_norms_gpu.as_ref().unwrap().clone().into_tensor_arg(1),
+                    vec_size,
+                    queries_gpu.clone().into_tensor_arg(),
+                    self.centroids_gpu.clone().into_tensor_arg(),
+                    query_norms_gpu.as_ref().unwrap().clone().into_tensor_arg(),
                     self.centroid_norms_gpu
                         .as_ref()
                         .unwrap()
                         .clone()
-                        .into_tensor_arg(1),
-                    centroid_dists_gpu.into_tensor_arg(1),
-                    ScalarArg { elem: 0u32 },
-                    ScalarArg {
-                        elem: self.nlist as u32,
-                    },
-                    ScalarArg {
-                        elem: n_queries as u32,
-                    },
-                    ScalarArg {
-                        elem: self.nlist as u32,
-                    },
+                        .into_tensor_arg(),
+                    centroid_dists_gpu.into_tensor_arg(),
+                    0u32,
+                    self.nlist as u32,
+                    n_queries as u32,
+                    self.nlist as u32,
                     dim_lines,
                 );
             },
             Dist::Manhattan => unreachable!(),
         }
 
-        let centroid_dists = centroid_dists_gpu.read(client);
+        let centroid_dists = centroid_dists_gpu.read(client)?;
 
         let probe_lists: Vec<Vec<usize>> = (0..n_queries)
             .into_par_iter()
@@ -641,7 +632,7 @@ where
 
         let n_tasks = tasks.len();
         if n_tasks == 0 {
-            return (vec![vec![]; n_queries], vec![vec![]; n_queries]);
+            return Ok((vec![vec![]; n_queries], vec![vec![]; n_queries]));
         }
 
         let task_q_idx: Vec<u32> = tasks.iter().map(|t| t.0).collect();
@@ -670,42 +661,40 @@ where
 
         match self.metric {
             Dist::SquaredEuclidean => unsafe {
-                let _ = compute_ivf_mega_euclidean_cached::launch_unchecked::<T, R>(
+                compute_ivf_mega_euclidean_cached::launch_unchecked::<T, R>(
                     client,
                     CubeCount::Static(mega_grid_x, mega_grid_y, mega_grid_z),
                     CubeDim::new_2d(WORKGROUP_SIZE_X, WORKGROUP_SIZE_Y),
-                    queries_gpu.clone().into_tensor_arg(vec_size),
-                    self.vectors_gpu.clone().into_tensor_arg(vec_size),
-                    task_q_idx_gpu.into_tensor_arg(1),
-                    task_db_start_gpu.into_tensor_arg(1),
-                    task_write_offset_gpu.into_tensor_arg(1),
-                    task_db_count_gpu.into_tensor_arg(1),
-                    candidate_dists_gpu.clone().into_tensor_arg(1),
-                    candidate_indices_gpu.clone().into_tensor_arg(1),
-                    ScalarArg {
-                        elem: n_tasks as u32,
-                    },
+                    vec_size,
+                    queries_gpu.clone().into_tensor_arg(),
+                    self.vectors_gpu.clone().into_tensor_arg(),
+                    task_q_idx_gpu.into_tensor_arg(),
+                    task_db_start_gpu.into_tensor_arg(),
+                    task_write_offset_gpu.into_tensor_arg(),
+                    task_db_count_gpu.into_tensor_arg(),
+                    candidate_dists_gpu.clone().into_tensor_arg(),
+                    candidate_indices_gpu.clone().into_tensor_arg(),
+                    n_tasks as u32,
                     dim_lines,
                 );
             },
             Dist::Cosine => unsafe {
-                let _ = compute_ivf_mega_cosine_cached::launch_unchecked::<T, R>(
+                compute_ivf_mega_cosine_cached::launch_unchecked::<T, R>(
                     client,
                     CubeCount::Static(mega_grid_x, mega_grid_y, mega_grid_z),
                     CubeDim::new_2d(WORKGROUP_SIZE_X, WORKGROUP_SIZE_Y),
-                    queries_gpu.clone().into_tensor_arg(vec_size),
-                    self.vectors_gpu.clone().into_tensor_arg(vec_size),
-                    query_norms_gpu.as_ref().unwrap().clone().into_tensor_arg(1),
-                    self.norms_gpu.as_ref().unwrap().clone().into_tensor_arg(1),
-                    task_q_idx_gpu.into_tensor_arg(1),
-                    task_db_start_gpu.into_tensor_arg(1),
-                    task_write_offset_gpu.into_tensor_arg(1),
-                    task_db_count_gpu.into_tensor_arg(1),
-                    candidate_dists_gpu.clone().into_tensor_arg(1),
-                    candidate_indices_gpu.clone().into_tensor_arg(1),
-                    ScalarArg {
-                        elem: n_tasks as u32,
-                    },
+                    vec_size,
+                    queries_gpu.clone().into_tensor_arg(),
+                    self.vectors_gpu.clone().into_tensor_arg(),
+                    query_norms_gpu.as_ref().unwrap().clone().into_tensor_arg(),
+                    self.norms_gpu.as_ref().unwrap().clone().into_tensor_arg(),
+                    task_q_idx_gpu.into_tensor_arg(),
+                    task_db_start_gpu.into_tensor_arg(),
+                    task_write_offset_gpu.into_tensor_arg(),
+                    task_db_count_gpu.into_tensor_arg(),
+                    candidate_dists_gpu.clone().into_tensor_arg(),
+                    candidate_indices_gpu.clone().into_tensor_arg(),
+                    n_tasks as u32,
                     dim_lines,
                 );
             },
@@ -718,22 +707,22 @@ where
         let cpq = GpuTensor::<R, u32>::from_slice(&cpu_write_pointers, vec![n_queries], client);
         let (coal_gx, coal_gy) = grid_2d(n_queries as u32);
         unsafe {
-            let _ = reduce_ivf_topk_coalesced::launch_unchecked::<T, R>(
+            reduce_ivf_topk_coalesced::launch_unchecked::<T, R>(
                 client,
                 CubeCount::Static(coal_gx, coal_gy, 1),
                 CubeDim::new_2d(WORKGROUP_SIZE_X, 1),
-                candidate_dists_gpu.clone().into_tensor_arg(1),
-                candidate_indices_gpu.clone().into_tensor_arg(1),
-                cpq.into_tensor_arg(1),
-                topk_dists.clone().into_tensor_arg(1),
-                topk_indices.clone().into_tensor_arg(1),
-                ScalarArg { elem: k as u32 },
+                candidate_dists_gpu.clone().into_tensor_arg(),
+                candidate_indices_gpu.clone().into_tensor_arg(),
+                cpq.into_tensor_arg(),
+                topk_dists.clone().into_tensor_arg(),
+                topk_indices.clone().into_tensor_arg(),
+                k as u32,
                 k,
             );
         }
 
-        let final_dists = topk_dists.read(client);
-        let final_indices = topk_indices.read(client);
+        let final_dists = topk_dists.read(client)?;
+        let final_indices = topk_indices.read(client)?;
 
         let mut results_indices = Vec::with_capacity(n_queries);
         let mut results_dists = Vec::with_capacity(n_queries);
@@ -755,7 +744,7 @@ where
             results_dists.push(row_dist);
         }
 
-        (results_indices, results_dists)
+        Ok((results_indices, results_dists))
     }
 
     /// Calculate a memory-safe batch size for the Candidate Buffer strategy

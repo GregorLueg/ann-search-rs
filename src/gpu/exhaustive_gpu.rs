@@ -8,7 +8,6 @@ use rayon::prelude::*;
 use crate::gpu::dist_gpu::*;
 use crate::gpu::*;
 use crate::prelude::*;
-use crate::utils::*;
 
 ////////////////////////
 // ExhaustiveIndexGpu //
@@ -77,7 +76,7 @@ where
 
         let (vectors_flat, n, dim) = matrix_to_flat(data);
 
-        let line = LINE_SIZE as usize;
+        let line = LINE_SIZE;
         let dim_padded = dim.next_multiple_of(line);
 
         let vectors_padded = if dim_padded != dim {
@@ -149,7 +148,7 @@ where
         let query_data = BatchData::new(&vectors_query_padded, &query_norms, n_query);
         let db_data = BatchData::new(&self.vectors_flat, &self.norms, self.n);
 
-        Ok(query_batch_gpu::<T, R>(
+        let res = query_batch_gpu::<T, R>(
             k,
             &query_data,
             &db_data,
@@ -157,7 +156,9 @@ where
             &self.metric,
             self.device.clone(),
             verbose,
-        ))
+        )?;
+
+        Ok(res)
     }
 
     /// Generate kNN graph from vectors stored in the index
@@ -175,12 +176,7 @@ where
     ///
     /// Tuple of `(knn_indices, optional distances)` where each row corresponds
     /// to a vector in the index
-    pub fn generate_knn(
-        &self,
-        k: usize,
-        return_dist: bool,
-        verbose: bool,
-    ) -> (Vec<Vec<usize>>, Option<Vec<Vec<T>>>) {
+    pub fn generate_knn(&self, k: usize, return_dist: bool, verbose: bool) -> KnnOptionResult<T> {
         let query_data = BatchData::new(&self.vectors_flat, &self.norms, self.n);
         let db_data = BatchData::new(&self.vectors_flat, &self.norms, self.n);
 
@@ -192,12 +188,12 @@ where
             &self.metric,
             self.device.clone(),
             verbose,
-        );
+        )?;
 
         if return_dist {
-            (indices, Some(distances))
+            Ok((indices, Some(distances)))
         } else {
-            (indices, None)
+            Ok((indices, None))
         }
     }
 
@@ -281,7 +277,7 @@ mod tests {
         )
         .unwrap();
 
-        let (indices, distances) = index.generate_knn(3, true, false);
+        let (indices, distances) = index.generate_knn(3, true, false).unwrap();
 
         assert_eq!(indices.len(), 6);
         assert!(distances.is_some());

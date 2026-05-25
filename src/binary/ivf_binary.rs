@@ -16,7 +16,6 @@ use crate::binary::dist_binary::*;
 use crate::binary::vec_store::*;
 use crate::prelude::*;
 use crate::utils::k_means_utils::*;
-use crate::utils::*;
 
 /// IVF index with binary quantisation
 pub struct IvfIndexBinary<T> {
@@ -211,8 +210,8 @@ where
         let (all_indices, offsets) = build_csr_layout(assignments, n, nlist);
 
         // 5. initialise binariser and encode all vectors
-        let init = parse_binarisation_init(binarisation_init).unwrap_or({
-            eprintln!("Unknown binarisation string provided. Using the default");
+        let init = parse_binarisation_init(binarisation_init).unwrap_or_else(|| {
+            println!("[WARNING] Unknown binarisation string provided. Using the default");
             BinarisationInit::default()
         });
 
@@ -379,8 +378,8 @@ where
         let (all_indices, offsets) = build_csr_layout(assignments, n, nlist);
 
         // 5. initialise binariser and encode all vectors
-        let init = parse_binarisation_init(binarisation_init).unwrap_or({
-            eprintln!("Unknown binarisation string provided. Using the default");
+        let init = parse_binarisation_init(binarisation_init).unwrap_or_else(|| {
+            println!("[WARNING] Unknown binarisation string provided. Using the default");
             BinarisationInit::default()
         });
 

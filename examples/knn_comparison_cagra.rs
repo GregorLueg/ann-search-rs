@@ -160,7 +160,7 @@ fn main() {
             println!("  Self-querying via beam search...");
             let start = Instant::now();
             let (gpu_beam_neighbors, gpu_beam_distances) =
-                query_nndescent_index_gpu_self(&mut gpu_idx, cli.k, None, true);
+                query_nndescent_index_gpu_self(&mut gpu_idx, cli.k, None, true).unwrap();
             let gpu_beam = start.elapsed().as_secs_f64() * 1000.0;
 
             let gpu_beam_recall = calculate_recall(&true_neighbors, &gpu_beam_neighbors, cli.k);

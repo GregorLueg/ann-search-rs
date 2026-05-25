@@ -4,6 +4,9 @@ use thiserror::Error;
 
 use crate::utils::dist::Dist;
 
+#[cfg(feature = "gpu")]
+use cubecl::server::ServerError;
+
 /// All error variants that can occur across `ann-search-rs` operations.
 #[derive(Debug, Error)]
 pub enum AnnSearchErrors {
@@ -23,6 +26,7 @@ pub enum AnnSearchErrors {
     #[error("Distance metric '{0}' is not supported for this method.")]
     DistanceNotSupported(Dist),
 
+    // -- quantisation errors --
     /// Dimension must be divisible by m
     #[error("Dimension ({dim}) must be divisible by m ({m}).")]
     #[cfg(feature = "quantised")]
@@ -66,8 +70,66 @@ pub enum AnnSearchErrors {
     #[error("Vector store is not available. Use build_with_vector_store() to enable reranking.")]
     VectorStoreNotAvailable,
 
+    /// Size mismatch error for locally stored files
+    #[cfg(feature = "binary")]
+    #[error("Size mismatch: expected {expected} bytes, got {actual} bytes.")]
+    SizeMismatch {
+        /// Expected size of the file
+        expected: usize,
+        /// Actual size of the file
+        actual: usize,
+    },
+
     /// IO error
     #[cfg(feature = "binary")]
     #[error("IO error: {0}")]
     IoError(#[from] std::io::Error),
+
+    /// Turbo quant error for invalid number of bits
+    #[cfg(feature = "binary")]
+    #[error("Turbu quantisation only allows bits of 2, 3 or 4. Chosen n of bits {n_bits}")]
+    TQInvalidBits {
+        /// Number of chosen bits
+        n_bits: usize,
+    },
+
+    /// Turbo quant error for invalid dimensionality
+    #[cfg(feature = "binary")]
+    #[error("Turbu quantisation needs a minimum dimensionality of 2. Data set dimensionality is {dims}.")]
+    TQInvalidDim {
+        /// Dimensionality of the data
+        dims: usize,
+    },
+
+    /// Error when dimensionality is not a multiple of 8
+    #[cfg(feature = "binary")]
+    #[error("Turbo quantisation: dimensions must be multiple of 8; dimensionality of the data is {dims}.")]
+    TQDimMustBe8Multiple {
+        /// Dimensionality of the data
+        dims: usize,
+    },
+
+    /// Error when the output buffer is not the length of bytes per vec
+    #[cfg(feature = "binary")]
+    #[error("Turbo quantisation: output buffer must be length bytes_per_vec ({bytes_per_vec}); has length ({len}).")]
+    TQBufferUnequalBytesPerVec {
+        /// Bytes per vec
+        bytes_per_vec: usize,
+        /// Output buffer length
+        len: usize,
+    },
+
+    /// Error when LUT is being attempted with wrong bits
+    #[cfg(feature = "binary")]
+    #[error("Turbo quantisation: LUT scoring supports 2-bit and 4-bit only (chosen bit: {bit}")]
+    TQLutError {
+        /// The chosen bit
+        bit: usize,
+    },
+
+    // -- gpu errors --
+    /// Propagate errors from the CubeCL
+    #[cfg(feature = "gpu")]
+    #[error("Error from the cubecl runtime: {0}")]
+    CubeClServerError(#[from] ServerError),
 }

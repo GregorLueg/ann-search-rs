@@ -403,7 +403,7 @@ where
             OrderedFloat(distance_fn(node_id, new_neighbour)),
             new_neighbour,
         ));
-        candidates.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+        candidates.sort_unstable_by_key(|a| a.0);
 
         let mut selected = Vec::with_capacity(max_n);
         for &(dist, cand_id) in &candidates {
@@ -1071,7 +1071,7 @@ where
             }
         }
 
-        state.scratch_working.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+        state.scratch_working.sort_unstable_by_key(|a| a.0);
 
         let mut result = Vec::with_capacity(max_neighbours);
 

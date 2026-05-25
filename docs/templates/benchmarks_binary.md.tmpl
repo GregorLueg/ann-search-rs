@@ -7,26 +7,40 @@ very aggressive quantisation to (basically) only bits. This has two impacts:
 2. Increased query speed in most cases as the bit-wise operations are very
 fast on modern CPUs.
 3. However, when not using any re-ranking of the top candidates, dramatically
-lower recall (less so for RaBitQ, an excellent way of compressing vectors).
+lower recall (less so for RaBitQ -- an excellent way of compressing vectors --
+and pending the data type TurboQuant).
 
-The benchmarks below show scenarios with and without re-ranking.
+The benchmarks below show scenarios with and without re-ranking. For the simple
+binary versions use:
 
 ```bash
-cargo run --example gridsearch_binary --release --features binary
+cargo run --example gridsearch_binary --release --features binary -- --n-dim 512 --n-samples 50000 --data embedding
+```
+
+For RaBitQ:
+
+```bash
+cargo run --example gridsearch_rabitq --release --features binary -- --n-dim 512 --n-samples 50000 --data embedding
+```
+
+For TurboQuantisation
+
+```bash
+cargo run --example gridsearch_tq --release --features binary -- --n-dim 512 --n-samples 50000 --data embedding
 ```
 
 Similar to the other benchmarks, index building, query against 10% slightly
 different data based on the trainings data and full kNN generation is being
 benchmarked. Index size in memory is also provided. Compared to other
-benchmarks, we will use the `"correlated"`, `"lowrank"` and `"quantisation"`
+benchmarks, we will use the `"correlated"`, `"lowrank"` and `"embedding"`
 with higher dimensionality, but reduced samples (for the sake of fast'ish
-benchmarking). The different synthetic data types pose different challenges
-for the quantisation methods.
+benchmarking).
 
 ## Table of Contents
 
 - [Binarisation](#binary-ivf-and-exhaustive)
 - [RaBitQ](#rabitq-ivf-and-exhaustive)
+- [TurboQuant](#turboquant-ivf-and-exhaustive)
 
 ### <u>Binary (IVF and exhaustive)</u>
 
@@ -107,10 +121,10 @@ and worse.
 ---
 
 <details>
-<summary><b>Correlated data - 1024 dimensions</b>:</summary>
+<summary><b>Correlated data - 768 dimensions</b>:</summary>
 </br>
 <pre><code>
-<!-- BENCH:binary:euclidean:correlated:1024:50000 -->
+<!-- BENCH:binary:euclidean:correlated:768:50000 -->
 </code></pre>
 </details>
 
@@ -137,40 +151,40 @@ and worse.
 ---
 
 <details>
-<summary><b>Lowrank data - 1024 dimensions</b>:</summary>
+<summary><b>Lowrank data - 768 dimensions</b>:</summary>
 </br>
 <pre><code>
-<!-- BENCH:binary:euclidean:lowrank:1024:50000 -->
+<!-- BENCH:binary:euclidean:lowrank:768:50000 -->
 </code></pre>
 </details>
 
-#### Quantisation (stress) data
+#### Cell embeddings
 
 <details>
-<summary><b>Quantisation stress data - 256 dimensions</b>:</summary>
+<summary><b>Cell embedding data - 256 dimensions</b>:</summary>
 </br>
 <pre><code>
-<!-- BENCH:binary:euclidean:quantisation:256:50000 -->
-</code></pre>
-</details>
-
----
-
-<details>
-<summary><b>Quantisation stress data - 512 dimensions</b>:</summary>
-</br>
-<pre><code>
-<!-- BENCH:binary:euclidean:quantisation:512:50000 -->
+<!-- BENCH:binary:euclidean:embedding:256:50000 -->
 </code></pre>
 </details>
 
 ---
 
 <details>
-<summary><b>Quantisation stress data - 1024 dimensions</b>:</summary>
+<summary><b>Cell embedding data - 512 dimensions</b>:</summary>
 </br>
 <pre><code>
-<!-- BENCH:binary:euclidean:quantisation:1024:50000 -->
+<!-- BENCH:binary:euclidean:embedding:512:50000 -->
+</code></pre>
+</details>
+
+---
+
+<details>
+<summary><b>Cell embedding data - 768 dimensions</b>:</summary>
+</br>
+<pre><code>
+<!-- BENCH:binary:euclidean:embedding:768:50000 -->
 </code></pre>
 </details>
 
@@ -226,10 +240,10 @@ distance calculation.
 ---
 
 <details>
-<summary><b>Correlated data - 1024 dimensions</b>:</summary>
+<summary><b>Correlated data - 768 dimensions</b>:</summary>
 </br>
 <pre><code>
-<!-- BENCH:rabitq:euclidean:correlated:1024:50000 -->
+<!-- BENCH:rabitq:euclidean:correlated:768:50000 -->
 </code></pre>
 </details>
 
@@ -256,45 +270,179 @@ distance calculation.
 ---
 
 <details>
-<summary><b>Lowrank data - 1024 dimensions</b>:</summary>
+<summary><b>Lowrank data - 768 dimensions</b>:</summary>
 </br>
 <pre><code>
-<!-- BENCH:rabitq:euclidean:lowrank:1024:50000 -->
+<!-- BENCH:rabitq:euclidean:lowrank:768:50000 -->
 </code></pre>
 </details>
 
-#### Quantisation (stress) data
+#### Cell embeddings
 
 <details>
-<summary><b>Quantisation stress data - 256 dimensions</b>:</summary>
+<summary><b>Cell embedding data - 256 dimensions</b>:</summary>
 </br>
 <pre><code>
-<!-- BENCH:rabitq:euclidean:quantisation:256:50000 -->
-</code></pre>
-</details>
-
----
-
-<details>
-<summary><b>Quantisation stress data - 512 dimensions</b>:</summary>
-</br>
-<pre><code>
-<!-- BENCH:rabitq:euclidean:quantisation:512:50000 -->
+<!-- BENCH:rabitq:euclidean:embedding:256:50000 -->
 </code></pre>
 </details>
 
 ---
 
 <details>
-<summary><b>Quantisation stress data - 1024 dimensions</b>:</summary>
+<summary><b>Cell embedding data - 512 dimensions</b>:</summary>
 </br>
 <pre><code>
-<!-- BENCH:rabitq:euclidean:quantisation:1024:50000 -->
+<!-- BENCH:rabitq:euclidean:embedding:512:50000 -->
+</code></pre>
+</details>
+
+---
+
+<details>
+<summary><b>Cell embedding data - 768 dimensions</b>:</summary>
+</br>
+<pre><code>
+<!-- BENCH:rabitq:euclidean:embedding:768:50000 -->
 </code></pre>
 </details>
 
 Overall, this is a fantastic binary index that massively compresses the data,
 while still allowing for great Recalls. If you need to compress your data
 and reduce memory fingerprint, please, use RaBitQ!
+
+### <u>TurboQuant (IVF and exhaustive)</u>
+
+[TurboQuant](https://arxiv.org/abs/2504.19874) is a scalar quantisation scheme.
+It applies a fixed random orthogonal rotation to each unit-normalised vector,
+which drives every coordinate towards the same Beta distribution, and then
+quantises each rotated coordinate against a Lloyd-Max codebook that is optimal
+for that distribution. Codes are stored in bit-plane format and scored with a
+FAISS PQ4-style fast-scan lookup table, so distance estimation is SIMD-friendly
+and fast.
+
+Encoding is data-oblivious: a single shared rotation and a single shared
+codebook are used for every vector, with no per-cluster residuals. For the
+`ExhaustiveTurboQuant` index every query scans the whole set via the block-fused
+SIMD kernel. For the `IVF-TurboQuant` index the clustering is routing only — the
+same global encoding is reused and vectors are merely bucketed into cells, so
+the IVF centroids do not feed the quantiser (unlike IVF-RaBitQ). As with the
+other indices, the original vectors can be stored on disk for exact re-ranking.
+
+**Key parameters *(TurboQuant)*:**
+
+- *bits*: Bits per coordinate, either 2, 3, or 4. The higher the number, the
+  better the Recall, at the cost of memory. Note that 3-bit has no SIMD kernel
+  and falls back to the scalar scorer, which is markedly slower; prefer 4-bit
+  unless memory forces otherwise. In the benchmarks we show 2-bit and 4-bit.
+- *reranking*: As with the other indices, the original vectors can be stored on
+  disk. Once the TurboQuant approximated distance has identified the most
+  interesting candidates, the on-disk vectors are loaded and the results are
+  re-ranked. The reranking_factor controls how many more vectors are rescored
+  than the desired k, e.g., 10 means `10 * k vectors` are scored and then
+  re-ranked. The more candidates, the better the Recall. The default is `20`.
+
+**Key parameters *(IVF-specific)*:**
+
+- *Number of lists (nl)*: The number of independent k-means clusters to
+  generate. If the structure of the data is unknown, people use `sqrt(n)` as a
+  heuristic.
+- *Number of points (np)*: The number of clusters to probe during search.
+  Numbers here tend to be `sqrt(nlist)` or up to 5% of the nlist.
+
+The self queries (i.e., kNN generation) are done with `reranking_factor = 20`.
+You will quickly appreciate that the performance on strongly clustered data is
+very poor. This index shines especially for large dimensional data that is
+generated by neural networks -- the area this index shines in.
+
+#### Correlated data
+
+<details>
+<summary><b>Correlated data - 256 dimensions</b>:</summary>
+</br>
+<pre><code>
+<!-- BENCH:turboquant:euclidean:correlated:256:50000 -->
+</code></pre>
+</details>
+
+---
+
+<details>
+<summary><b>Correlated data - 512 dimensions</b>:</summary>
+</br>
+<pre><code>
+<!-- BENCH:turboquant:euclidean:correlated:512:50000 -->
+</code></pre>
+</details>
+
+---
+
+<details>
+<summary><b>Correlated data - 768 dimensions</b>:</summary>
+</br>
+<pre><code>
+<!-- BENCH:turboquant:euclidean:correlated:768:50000 -->
+</code></pre>
+</details>
+
+#### Lowrank data
+
+<details>
+<summary><b>Lowrank data - 256 dimensions</b>:</summary>
+</br>
+<pre><code>
+<!-- BENCH:turboquant:euclidean:lowrank:256:50000 -->
+</code></pre>
+</details>
+
+---
+
+<details>
+<summary><b>Lowrank data - 512 dimensions</b>:</summary>
+</br>
+<pre><code>
+<!-- BENCH:turboquant:euclidean:lowrank:512:50000 -->
+</code></pre>
+</details>
+
+---
+
+<details>
+<summary><b>Lowrank data - 768 dimensions</b>:</summary>
+</br>
+<pre><code>
+<!-- BENCH:turboquant:euclidean:lowrank:768:50000 -->
+</code></pre>
+</details>
+
+#### Quantisation (stress) data
+
+<details>
+<summary><b>Cell embedding data - 256 dimensions</b>:</summary>
+</br>
+<pre><code>
+<!-- BENCH:turboquant:euclidean:embedding:256:50000 -->
+</code></pre>
+</details>
+
+---
+
+<details>
+<summary><b>Cell embedding data - 512 dimensions</b>:</summary>
+</br>
+<pre><code>
+<!-- BENCH:turboquant:euclidean:embedding:512:50000 -->
+</code></pre>
+</details>
+
+---
+
+<details>
+<summary><b>Cell embedding data - 768 dimensions</b>:</summary>
+</br>
+<pre><code>
+<!-- BENCH:turboquant:euclidean:embedding:768:50000 -->
+</code></pre>
+</details>
 
 *All benchmarks were run on M1 Max MacBook Pro with 64 GB unified memory.*
