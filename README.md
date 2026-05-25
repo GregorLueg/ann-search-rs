@@ -89,7 +89,9 @@ ann-search-rs = "0.4.0"
 ### Note
 
 With version `"0.4.0"` some breaking API changes were introduced: this harmonise
-several of the functions and avoid panics in favour of errors.
+several of the functions and avoid panics in favour of errors. A key change
+was also the update to cubecl `"0.1.0"` which changes quite a few APIs for the
+GPU-accelerated version.
 
 ## Example Usage
 
@@ -292,7 +294,7 @@ If you wish to use these, please add the `"quantised"` feature:
 
 ```toml
 [dependencies]
-ann-search-rs = { version = "0.3.0", features = ["quantised"] }
+ann-search-rs = { version = "0.4.0", features = ["quantised"] }
 ```
 
 ## GPU
@@ -309,7 +311,7 @@ To unlock GPU-acceleration, please use:
 
 ```toml
 [dependencies]
-ann-search-rs = { version = "0.3.0", features = ["gpu"] }
+ann-search-rs = { version = "0.4.0", features = ["gpu"] }
 ```
 
 ## Binarised indices
@@ -324,7 +326,6 @@ are two approaches for binarisation available in the crate:
 - [TurboQuant](https://arxiv.org/abs/2504.19874) a data-oblivious quantiser that
   randomly rotates each vector and applies a per-coordinate scalar quantiser, so
   there are no learned codebooks and indexing is near-instant.
-
 
 These can be used with Exhaustive or IVF indices and you have the option to
 store the original vectors on-disk to allow for subsequent re-ranking. This
