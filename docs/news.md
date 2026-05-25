@@ -9,6 +9,7 @@
 - More and improved error handling across the board.
 - TurboQuantisation with exhaustive and IVF index implemented.
 - Better benchmarking with an cell embedding-like benchmark.
+- Better entry seeds for the CAGRA style graph.
 
 **Fixes**
 
