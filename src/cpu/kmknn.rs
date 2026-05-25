@@ -174,7 +174,7 @@ where
         let (training_data, _) = sample_vectors(&vectors_flat, dim, n, n_train, seed);
 
         if verbose {
-            println!("  Building kMkNN index with {} clusters.", nlist);
+            println!("Building kMkNN index with {} clusters.", nlist);
         }
 
         // always Euclidean internally
