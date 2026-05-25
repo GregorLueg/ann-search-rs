@@ -2208,9 +2208,6 @@ where
         let client = R::client(&self._device);
         let use_cosine = self.metric == Dist::Cosine;
 
-        // Build entry points from kNN graph: take first N_ENTRY_POINTS
-        // neighbours per node. These are already sorted by distance,
-        // so we get the best-known neighbours as seeds.
         let entry_flat: Vec<u32> = (0..self.n)
             .flat_map(|i| {
                 let row = &self.knn_graph[i * self.k..(i + 1) * self.k];
@@ -2219,11 +2216,12 @@ where
                     .filter(|&&(pid, _)| pid != SENTINEL_PID)
                     .map(|&(pid, _)| pid as u32)
                     .collect();
-                let stride = (valid.len() / n_entry).max(1);
-                let mut entries: Vec<u32> = (0..n_entry)
-                    .filter_map(|j| valid.get(j * stride).copied())
-                    .collect();
-                // Pad with random if fewer than n_entry valid neighbours
+                // Slot 0 is the node itself: guarantees the beam lands on it
+                // (distance 0) and expands its own adjacency list immediately.
+                let remaining = n_entry - 1;
+                let stride = (valid.len() / remaining.max(1)).max(1);
+                let mut entries: Vec<u32> = vec![i as u32];
+                entries.extend((0..remaining).filter_map(|j| valid.get(j * stride).copied()));
                 let mut rng_val = (i as u32) ^ (seed as u32);
                 while entries.len() < n_entry {
                     rng_val = rng_val.wrapping_mul(1664525).wrapping_add(1013904223);
