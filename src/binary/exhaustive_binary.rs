@@ -98,8 +98,8 @@ where
             return Err(AnnSearchErrors::NBitsMustBe8Multiple { n_bits });
         }
 
-        let init = parse_binarisation_init(binarisation_init).unwrap_or({
-            eprintln!("Unknown binarisation string provided. Using the default");
+        let init = parse_binarisation_init(binarisation_init).unwrap_or_else(|| {
+            println!("[WARNING] Unknown binarisation string provided. Using the default");
             BinarisationInit::default()
         });
 

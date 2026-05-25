@@ -3,8 +3,7 @@
 //! Each unit-normalised data vector is rotated by a fixed random orthogonal
 //! matrix and scalar-quantised against the Lloyd-Max codebook for
 //! `Beta((d-1)/2, (d-1)/2)`. Codes are stored in bit-plane format: `bits`
-//! planes of `dim/8` bytes each per vector. The bit-plane layout is later
-//! re-packed for SIMD scoring (see `tq_pack.rs`).
+//! planes of `dim/8` bytes each per vector.
 
 use faer::{Mat, MatRef};
 use faer_traits::ComplexField;
@@ -19,9 +18,9 @@ use std::iter::Sum;
 use crate::binary::turboquant::codebook::codebook;
 use crate::prelude::*;
 
-//////////////////////
+/////////////////////
 // TurboQuantQuery //
-//////////////////////
+/////////////////////
 
 /// Encoded query for TurboQuant scoring.
 ///
@@ -34,9 +33,9 @@ pub struct TurboQuantQuery<T> {
     pub query_norm: T,
 }
 
-////////////////////////
+///////////////////////
 // TurboQuantEncoder //
-////////////////////////
+///////////////////////
 
 /// Pure encoding logic for TurboQuant.
 pub struct TurboQuantEncoder<T> {
@@ -74,7 +73,12 @@ impl<T> TurboQuantEncoder<T>
 where
     T: Float + FromPrimitive + ToPrimitive + ComplexField + SimdDistance,
 {
-    /// Create encoder with random orthogonal rotation and Lloyd-Max codebook.
+    /// Create an encoder with a random orthogonal rotation and Lloyd-Max
+    /// codebook.
+    ///
+    /// Generates a deterministic rotation matrix from `seed` via QR
+    /// decomposition and loads the Lloyd-Max boundaries and levels for the
+    /// given bit width.
     ///
     /// ### Params
     ///
@@ -82,6 +86,11 @@ where
     /// * `bits` - Bits per coordinate (2, 3, or 4)
     /// * `metric` - Distance metric
     /// * `seed` - Random seed for the rotation matrix
+    ///
+    /// ### Returns
+    ///
+    /// The constructed encoder, or an error if `bits` is out of range or `dim`
+    /// is not a multiple of 8.
     pub fn new(dim: usize, bits: usize, metric: Dist, seed: u64) -> Result<Self, AnnSearchErrors> {
         if !(2..=4).contains(&bits) {
             return Err(AnnSearchErrors::TQInvalidBits { n_bits: bits });
@@ -105,12 +114,20 @@ where
         })
     }
 
-    /// Encode a single vector.
+    /// Encode a single vector, allocating the output buffer.
+    ///
+    /// Convenience wrapper around [`encode_vector_into`] that allocates and
+    /// returns the packed code buffer.
+    ///
+    /// ### Params
+    ///
+    /// * `vec` - Input vector (length `dim`)
     ///
     /// ### Returns
     ///
-    /// `(packed_bit_plane_codes, ‖v‖, correction)` where `correction = 1 / <u, x̂>`
-    /// is the per-vector debias factor and `‖v‖` is the raw L2 norm.
+    /// `(packed, ‖v‖, correction)` where `packed` holds the bit-plane codes,
+    /// `‖v‖` is the raw L2 norm, and `correction = 1 / <u, x̂>` is the
+    /// per-vector debias factor.
     #[inline]
     pub fn encode_vector(&self, vec: &[T]) -> Result<(Vec<u8>, T, T), AnnSearchErrors> {
         let mut packed = vec![0u8; self.bytes_per_vec];
@@ -120,16 +137,22 @@ where
 
     /// Encode a single vector into a caller-owned buffer.
     ///
+    /// Unit-normalises the input, applies the rotation, and writes bit-plane
+    /// packed codes into `out`. Also accumulates `<u, x̂>` to compute the
+    /// per-vector debias factor.
+    ///
+    /// ### Params
+    ///
+    /// * `vec` - Input vector (length `dim`)
+    /// * `out` - Output buffer to write packed codes into (length
+    ///   `bytes_per_vec`)
+    ///
     /// ### Returns
     ///
-    /// `(‖v‖, correction)` where `correction = 1 / <u, x̂>` is the per-vector
-    /// debias factor and `‖v‖` is the raw L2 norm.
+    /// `(‖v‖, correction)` where `‖v‖` is the raw L2 norm and
+    /// `correction = 1 / <u, x̂>` is the per-vector debias factor.
     #[inline]
-    pub fn encode_vector_into(
-        &self,
-        vec: &[T],
-        out: &mut [u8],
-    ) -> Result<(T, T), AnnSearchErrors> {
+    pub fn encode_vector_into(&self, vec: &[T], out: &mut [u8]) -> Result<(T, T), AnnSearchErrors> {
         self.check_dim(vec.len())?;
 
         if out.len() != self.bytes_per_vec {
@@ -185,7 +208,19 @@ where
         Ok((norm, correction))
     }
 
-    /// Encode a query: unit-normalise, rotate, retain original norm.
+    /// Encode a query: unit-normalise, rotate, and retain the original L2 norm.
+    ///
+    /// The original norm is preserved so callers can reconstruct Euclidean
+    /// distances from the approximate inner product scores.
+    ///
+    /// ### Params
+    ///
+    /// * `query` - Input query vector (length `dim`)
+    ///
+    /// ### Returns
+    ///
+    /// A [`TurboQuantQuery`] holding the rotated unit query and the original
+    /// norm.
     #[inline]
     pub fn encode_query(&self, query: &[T]) -> Result<TurboQuantQuery<T>, AnnSearchErrors> {
         self.check_dim(query.len())?;
@@ -205,6 +240,14 @@ where
     }
 
     /// Apply the rotation matrix to a vector: `out = R · vec`.
+    ///
+    /// ### Params
+    ///
+    /// * `vec` - Input vector (length `dim`)
+    ///
+    /// ### Returns
+    ///
+    /// The rotated vector (length `dim`).
     #[inline]
     pub fn apply_rotation(&self, vec: &[T]) -> Vec<T> {
         let mut rotated = vec![T::zero(); self.dim];
@@ -215,7 +258,20 @@ where
         rotated
     }
 
-    /// Generate a deterministic random orthogonal matrix via QR.
+    /// Generate a deterministic random orthogonal matrix via QR decomposition.
+    ///
+    /// Fills a `dim × dim` matrix with standard-normal samples seeded by
+    /// `seed`, then extracts the Q factor.
+    ///
+    /// ### Params
+    ///
+    /// * `dim` - Matrix dimension
+    /// * `seed` - RNG seed
+    ///
+    /// ### Returns
+    ///
+    /// Row-major flat representation of the `dim × dim` orthogonal matrix
+    /// (length `dim * dim`).
     fn generate_random_orthogonal(dim: usize, seed: u64) -> Vec<T> {
         let mut rng = StdRng::seed_from_u64(seed);
 
@@ -239,7 +295,12 @@ where
         rotation
     }
 
-    /// Memory usage in bytes.
+    /// Heap memory used by this encoder in bytes.
+    ///
+    /// ### Returns
+    ///
+    /// Total bytes occupied by the encoder's heap allocations plus its
+    /// stack-size footprint.
     pub fn memory_usage_bytes(&self) -> usize {
         std::mem::size_of_val(self)
             + self.rotation.capacity() * std::mem::size_of::<T>()
@@ -248,9 +309,9 @@ where
     }
 }
 
-////////////////////////
+///////////////////////
 // TurboQuantStorage //
-////////////////////////
+///////////////////////
 
 /// Flat (non-clustered) storage of TurboQuant-encoded vectors.
 ///
@@ -274,7 +335,16 @@ pub struct TurboQuantStorage<T> {
 }
 
 impl<T: Float + FromPrimitive> TurboQuantStorage<T> {
-    /// Get the packed codes for vector `idx`.
+    /// Return the packed bit-plane codes for one stored vector.
+    ///
+    /// ### Params
+    ///
+    /// * `idx` - Vector index (`0..n`)
+    ///
+    /// ### Returns
+    ///
+    /// Byte slice of length `bytes_per_vec` containing the bit-plane codes
+    /// for vector `idx`.
     #[inline]
     pub fn vector_packed(&self, idx: usize) -> &[u8] {
         let start = idx * self.bytes_per_vec;
@@ -282,12 +352,21 @@ impl<T: Float + FromPrimitive> TurboQuantStorage<T> {
     }
 
     /// Number of stored vectors.
+    ///
+    /// ### Returns
+    ///
+    /// The count of encoded vectors held in this storage.
     #[inline]
     pub fn n_vectors(&self) -> usize {
         self.n
     }
 
-    /// Memory usage in bytes.
+    /// Heap memory used by this storage in bytes.
+    ///
+    /// ### Returns
+    ///
+    /// Total bytes occupied by the storage's heap allocations plus its
+    /// stack-size footprint.
     pub fn memory_usage_bytes(&self) -> usize {
         std::mem::size_of_val(self)
             + self.packed_codes.capacity()
@@ -296,9 +375,9 @@ impl<T: Float + FromPrimitive> TurboQuantStorage<T> {
     }
 }
 
-//////////////////////////
+/////////////////////////
 // TurboQuantQuantiser //
-//////////////////////////
+/////////////////////////
 
 /// TurboQuant quantiser: encoder + flat storage of the encoded data.
 pub struct TurboQuantQuantiser<T> {
@@ -312,7 +391,23 @@ impl<T> TurboQuantQuantiser<T>
 where
     T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum + ComplexField + SimdDistance,
 {
-    /// Build the quantiser by encoding all rows of `data`.
+    /// Build the quantiser by encoding all rows of `data` in parallel.
+    ///
+    /// Constructs a [`TurboQuantEncoder`] from the given parameters, then
+    /// encodes every row of `data` via Rayon, collecting packed codes, norms,
+    /// and debias corrections into flat storage.
+    ///
+    /// ### Params
+    ///
+    /// * `data` - Input matrix, `n × dim`
+    /// * `metric` - Distance metric
+    /// * `bits` - Bits per coordinate (2, 3, or 4)
+    /// * `seed` - Random seed forwarded to the encoder's rotation matrix
+    ///
+    /// ### Returns
+    ///
+    /// The constructed quantiser, or an error if the encoder cannot be built
+    /// or any row fails to encode.
     pub fn new(
         data: MatRef<T>,
         metric: &Dist,
@@ -363,18 +458,36 @@ where
         Ok(Self { encoder, storage })
     }
 
-    /// Encode a query.
+    /// Encode a query using the quantiser's encoder.
+    ///
+    /// ### Params
+    ///
+    /// * `query` - Input query vector (length `dim`)
+    ///
+    /// ### Returns
+    ///
+    /// A [`TurboQuantQuery`] holding the rotated unit query and the original
+    /// L2 norm.
     #[inline]
     pub fn encode_query(&self, query: &[T]) -> Result<TurboQuantQuery<T>, AnnSearchErrors> {
         self.encoder.encode_query(query)
     }
 
     /// Number of stored vectors.
+    ///
+    /// ### Returns
+    ///
+    /// The count of encoded vectors held in the quantiser's storage.
     pub fn n_vectors(&self) -> usize {
         self.storage.n
     }
 
-    /// Memory usage in bytes.
+    /// Combined heap memory used by the encoder and storage in bytes.
+    ///
+    /// ### Returns
+    ///
+    /// Sum of [`TurboQuantEncoder::memory_usage_bytes`] and
+    /// [`TurboQuantStorage::memory_usage_bytes`].
     pub fn memory_usage_bytes(&self) -> usize {
         self.encoder.memory_usage_bytes() + self.storage.memory_usage_bytes()
     }
@@ -586,7 +699,11 @@ mod tests {
             }
             let expected_correction = 1.0 / dot_self;
             assert_abs_diff_eq!(q.storage.norms[i], norm, epsilon = 1e-5);
-            assert_abs_diff_eq!(q.storage.corrections[i], expected_correction, epsilon = 1e-5);
+            assert_abs_diff_eq!(
+                q.storage.corrections[i],
+                expected_correction,
+                epsilon = 1e-5
+            );
         }
     }
 

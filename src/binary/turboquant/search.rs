@@ -330,11 +330,23 @@ pub fn score_block_scalar(
 
 /// Score one block of `BLOCK` vectors for a single query (NEON).
 ///
-/// Outputs the raw inner product `bias + scale * acc` per lane into `out`.
-/// Norm application and padding-lane masking are the caller's
-/// responsibility — every lane (including padding) gets a defined score.
-/// Bit-width-agnostic: driven entirely by `lut.n_byte_groups` and the
-/// blocked code layout, so it serves both 2-bit and 4-bit.
+/// Bit-width-agnostic: driven entirely by `lut.n_byte_groups` and the blocked
+/// code layout, so it serves both 2-bit and 4-bit. Byte-groups are processed in
+/// batches of up to `FLUSH_EVERY` and accumulated in u16 lanes before flushing
+/// to f32 to avoid overflow; the decode bias is seeded once at the start.
+/// Norm application and padding-lane masking are the caller's responsibility —
+/// every lane (including padding) receives a defined score.
+///
+/// ### Params
+///
+/// * `lut` - Query LUT (2-bit or 4-bit)
+/// * `blocked` - Blocked code layout (`BlockedCodes::data`)
+/// * `block_idx` - Which block to score
+/// * `out` - Per-lane inner-product output slice to write into (length `BLOCK`)
+///
+/// ### Returns
+///
+/// `()` — writes `bias + scale * acc` per lane into `out`.
 ///
 /// ### Safety
 ///
@@ -433,16 +445,24 @@ pub(crate) unsafe fn score_block_neon(
 
 /// Score one block of `BLOCK` vectors for a single query (AVX2 + FMA).
 ///
-/// Outputs the raw inner product `bias + scale * acc` per lane into `out`,
-/// in natural lane order (`out[lane]` is vector `block_idx * BLOCK + lane`).
-/// Norm application and padding masking are the caller's responsibility.
-/// Bit-width-agnostic via `lut.n_byte_groups`.
+/// Bit-width-agnostic via `lut.n_byte_groups`. Accumulates every byte-group
+/// into u16 lanes in a single pass with no intermediate flush, relying on the
+/// x86 branch of `build_query_lut` to cap LUT entries so the per-lane u16 sum
+/// stays below `u16::MAX`. The FAISS even/odd-byte split makes the transient
+/// wrap-around cancel exactly in the epilogue. Outputs the raw inner product
+/// `bias + scale * acc` per lane; norm application and padding masking are the
+/// caller's responsibility.
 ///
-/// Accumulates every byte-group into u16 lanes in a single pass with no
-/// intermediate flush. This relies on the x86 branch of `build_query_lut`,
-/// which caps LUT entries so the recovered per-lane sum stays below
-/// `u16::MAX`; the FAISS even/odd-byte split makes the transient u16
-/// wrap-around cancel exactly in the epilogue.
+/// ### Params
+///
+/// * `lut` - Query LUT (2-bit or 4-bit)
+/// * `blocked` - Blocked code layout (`BlockedCodes::data`)
+/// * `block_idx` - Which block to score
+/// * `out` - Per-lane inner-product output slice to write into (length `BLOCK`)
+///
+/// ### Returns
+///
+/// `()` — writes `bias + scale * acc` per lane into `out` in natural lane order.
 ///
 /// ### Safety
 ///
@@ -541,7 +561,7 @@ pub(crate) unsafe fn score_block_avx2(
 ///
 /// ### Returns
 ///
-/// The distance (higher is better)
+/// The ranking key (higher is better, monotone-decreasing in distance).
 #[inline]
 pub fn ip_to_key(
     ip: f32,
@@ -572,7 +592,7 @@ pub fn ip_to_key(
 ///
 /// ### Returns
 ///
-/// The distance (lower is better)
+/// The true metric distance (lower is better).
 #[inline]
 pub fn key_to_distance(key: f32, query_norm: f32, metric: Dist) -> f32 {
     match metric {
@@ -610,13 +630,16 @@ pub struct TopK {
 impl TopK {
     /// Allocate a new buffer retaining the top `k` candidates.
     ///
+    /// Keys are initialised to `NEG_INFINITY` so all real candidates are
+    /// accepted during the fill phase.
+    ///
     /// ### Params
     ///
-    /// * `k` - Number of candidates to return
+    /// * `k` - Number of candidates to retain
     ///
     /// ### Returns
     ///
-    /// Self
+    /// An empty `TopK` buffer with capacity `k`.
     pub fn new(k: usize) -> Self {
         Self {
             keys: vec![f32::NEG_INFINITY; k],
@@ -631,12 +654,17 @@ impl TopK {
     /// Offer a candidate for inclusion.
     ///
     /// Accepted unconditionally until the buffer is full, then only if `key`
-    /// strictly exceeds the current minimum.
+    /// strictly exceeds the current minimum. When the buffer fills for the
+    /// first time, `recompute_min` is called to establish the running minimum.
     ///
     /// ### Params
     ///
     /// * `key` - Ranking key (higher is better)
     /// * `idx` - Vector index
+    ///
+    /// ### Returns
+    ///
+    /// `()` — updates `self` in place.
     #[inline]
     pub fn push(&mut self, key: f32, idx: u32) {
         if self.size < self.k {
@@ -655,7 +683,12 @@ impl TopK {
 
     /// Recompute `min` and `min_idx` by linear scan over `keys[..k]`.
     ///
-    /// Called after every insertion once the buffer is full.
+    /// Called after every insertion once the buffer is full; keeps the eviction
+    /// slot current so the next replacement overwrites the weakest candidate.
+    ///
+    /// ### Returns
+    ///
+    /// `()` — updates `self.min` and `self.min_idx` in place.
     #[inline]
     fn recompute_min(&mut self) {
         self.min = self.keys[0];
@@ -670,15 +703,19 @@ impl TopK {
 
     /// Drain into `(indices, distances)` sorted nearest-first.
     ///
+    /// Converts ranking keys to metric distances via [`key_to_distance`] and
+    /// sorts descending by key, with ties broken by ascending index for
+    /// reproducibility.
+    ///
     /// ### Params
     ///
-    /// * `query_norm` - L2 norm of the query, used by [`key_to_distance`]
+    /// * `query_norm` - L2 norm of the query, forwarded to [`key_to_distance`]
     /// * `metric` - Distance metric
     ///
     /// ### Returns
     ///
-    /// `(indices, distances)` sorted descending by key, ties broken by
-    /// ascending index for reproducibility.
+    /// `(indices, distances)` sorted nearest-first (ascending distance),
+    /// length `min(k, n_vectors)`.
     pub fn into_sorted(self, query_norm: f32, metric: Dist) -> (Vec<u32>, Vec<f32>) {
         let mut pairs: Vec<(f32, u32)> = self.keys[..self.size]
             .iter()
@@ -699,24 +736,24 @@ impl TopK {
         (indices, dists)
     }
 
-    /// Check if full
+    /// Check whether the buffer holds exactly `k` candidates.
     ///
     /// ### Returns
     ///
-    /// True if full
+    /// `true` if the buffer is full (`size == k`), `false` otherwise.
     #[inline]
     pub fn is_full(&self) -> bool {
         self.size >= self.k
     }
 
-    /// Current minimum key.
+    /// Current minimum ranking key among the retained candidates.
     ///
-    /// Meaningful only once full; before that the kernel never prunes, so the
-    /// sentinel `NEG_INFINITY` is never read.
+    /// Meaningful only once the buffer is full; before that the sentinel
+    /// `NEG_INFINITY` is returned and the kernel never prunes.
     ///
     /// ### Returns
     ///
-    /// Minimum key
+    /// The minimum key in `keys[..k]`.
     #[inline]
     pub fn min_key(&self) -> f32 {
         self.min
@@ -727,25 +764,26 @@ impl TopK {
 // Scalar single-query oracle //
 ////////////////////////////////
 
-/// Single-query top-k over the blocked layout, scalar path.
+/// Single-query exhaustive top-k over the blocked layout, scalar path.
 ///
-/// Reference implementation for the SIMD fused driver: scores every block
-/// with [`score_block_scalar`], converts to ranking keys, and keeps the
-/// top-k. The SIMD kernels must reproduce its `(indices, distances)` for
-/// each query (up to fmadd rounding in the score). 2-bit / 4-bit only —
-/// 3-bit has no LUT and is served by `tq_dists::turboquant_dist`.
+/// Reference implementation for the SIMD fused driver: scores every block with
+/// [`score_block_scalar`], converts raw inner products to ranking keys via
+/// [`ip_to_key`], and keeps the top-k. The SIMD kernels must reproduce its
+/// `(indices, distances)` for each query (up to fmadd rounding in the score).
+/// 2-bit / 4-bit only — 3-bit has no LUT.
 ///
 /// ### Params
 ///
 /// * `lut` - Query LUT
-/// * `blocked` - Blocked code layout
+/// * `blocked` - Blocked code layout (`BlockedCodes::data`)
 /// * `n_vectors` - Number of real (non-padding) vectors
 /// * `n_blocks` - Number of blocks in `blocked`
-/// * `norms_f32` - Per-vector L2 norms (length `n_vectors`), f32
-/// * `corrections_f32` - Per-vector debias factors `1 / <u, x̂>` (length `n_vectors`), f32
+/// * `norms_f32` - Per-vector L2 norms (length `n_vectors`)
+/// * `corrections_f32` - Per-vector debias factors `1 / <u, x̂>` (length
+///   `n_vectors`)
 /// * `query_norm` - L2 norm of the query
 /// * `metric` - Distance metric
-/// * `k` - Neighbours to return
+/// * `k` - Number of neighbours to return
 ///
 /// ### Returns
 ///
@@ -791,18 +829,32 @@ pub fn score_query_topk_scalar(
 /// per-query top-k.
 ///
 /// Loads each block's codes once and scores all `batch_nq` queries against
-/// them, amortising the code load and nibble split across queries — the
-/// core fusion win. Heaps are updated inline; once a heap is full, a block
-/// whose every lane falls at or below the heap minimum is skipped entirely
-/// via an in-register compare (the FAISS fast-scan prune).
+/// them, amortising the code load and nibble split across queries — the core
+/// fusion win. Heaps are updated inline; once a heap is full, a block whose
+/// every lane falls at or below the heap minimum is skipped entirely via an
+/// in-register compare (the FAISS fast-scan prune). Results are bit-identical
+/// to [`score_query_topk_scalar`] per query. Surplus slots beyond `batch_nq`
+/// are scored and discarded; pad them with any valid LUT.
 ///
-/// Results are bit-identical to [`score_query_topk_scalar`] per query: the
-/// integer accumulation matches exactly (the LUT cap keeps the recovered
-/// u16 sums exact) and the f32 epilogue uses the same `mul_add` rounding.
+/// ### Params
 ///
-/// `luts` must hold 4 entries; for `batch_nq < 4` the surplus slots are
-/// scored but their results dropped, so callers pad with any valid LUT.
-/// 2-bit / 4-bit only.
+/// * `luts` - Array of exactly 4 query LUTs; pad unused slots for
+///   `batch_nq < 4`
+/// * `blocked` - Blocked code layout (`BlockedCodes::data`)
+/// * `n_vectors` - Number of real (non-padding) vectors
+/// * `n_blocks` - Number of blocks in `blocked`
+/// * `norms_f32` - Per-vector L2 norms (length `n_vectors`)
+/// * `corrections_f32` - Per-vector debias factors `1 / <u, x̂>` (length
+///   `n_vectors`)
+/// * `query_norms` - L2 norms of the 4 queries
+/// * `metric` - Distance metric
+/// * `k` - Number of neighbours to return per query
+/// * `batch_nq` - Number of active queries (`1..=4`)
+///
+/// ### Returns
+///
+/// One `(indices, distances)` pair per active query, sorted nearest-first,
+/// length `min(k, n_vectors)`.
 ///
 /// ### Safety
 ///
@@ -848,11 +900,30 @@ pub(crate) unsafe fn fused4_avx2(
 /// Score `n_blocks` blocks for up to 4 queries into caller-owned heaps
 /// (AVX2 + FMA).
 ///
-/// The reusable scoring core behind both [`fused4_avx2`] (exhaustive, one
-/// segment, `base_index = 0`) and the IVF path (one call per probed cluster,
+/// Reusable scoring core behind both [`fused4_avx2`] (exhaustive, one segment,
+/// `base_index = 0`) and the IVF path (one call per probed cluster,
 /// `base_index` set to the cluster's global slot offset so pushed indices are
 /// global). Heaps are persistent across calls, so the in-register prune sees
 /// the running minimum across all segments scored so far.
+///
+/// ### Params
+///
+/// * `luts` - Array of exactly 4 query LUTs
+/// * `blocked` - Blocked code layout for this segment
+/// * `n_vectors` - Number of real (non-padding) vectors in this segment
+/// * `n_blocks` - Number of blocks in `blocked`
+/// * `norms_f32` - Per-vector L2 norms for this segment (length `n_vectors`)
+/// * `corrections_f32` - Per-vector debias factors for this segment (length
+///   `n_vectors`)
+/// * `query_norms` - L2 norms of the 4 queries
+/// * `metric` - Distance metric
+/// * `batch_nq` - Number of active queries (`1..=4`)
+/// * `base_index` - Global slot offset added to every index pushed into `heaps`
+/// * `heaps` - Per-query top-k buffers updated in place (length `>= batch_nq`)
+///
+/// ### Returns
+///
+/// `()` — results accumulated into `heaps`.
 ///
 /// ### Safety
 ///
@@ -923,18 +994,38 @@ pub(crate) unsafe fn score_into_heaps_avx2(
     }
 }
 
-/// Per-query block epilogue (AVX2): combine accumulators, convert, apply
-/// the metric key transform, prune, and update one query's heap.
+/// Per-query block epilogue (AVX2): combine accumulators, convert to f32,
+/// apply the metric key transform, prune, and update one query's heap.
 ///
 /// Shared by [`fused4_avx2`] and the AVX-512BW driver (which extracts each
-/// block's 256-bit accumulator half and calls this once per block).
-/// `acc` holds the four interleaved u16 accumulators for a single query
-/// over a single 32-vector block.
+/// block's 256-bit accumulator half and calls this once per block). `acc` holds
+/// the four interleaved u16 accumulators for a single query over a single
+/// 32-vector block. When the heap is full and no lane exceeds the current
+/// minimum, the function returns early without touching the heap.
+///
+/// ### Params
+///
+/// * `acc` - Four interleaved u16 AVX2 accumulators for one query over one
+///   block
+/// * `base_vec` - Index of the first vector in this block (`block_idx * BLOCK`)
+/// * `end_lane` - Number of valid (non-padding) lanes (`<= BLOCK`)
+/// * `norms_f32` - Per-vector L2 norms, valid from index `base_vec`
+/// * `corrections_f32` - Per-vector debias factors, valid from index `base_vec`
+/// * `scale` - LUT dequantisation scale for this query
+/// * `bias` - LUT decode bias for this query
+/// * `query_norm` - L2 norm of the query
+/// * `metric` - Distance metric
+/// * `base_index` - Global slot offset added to every index pushed into `heap`
+/// * `heap` - Top-k buffer for this query, updated in place
+///
+/// ### Returns
+///
+/// `()` — qualifying candidates pushed into `heap`.
 ///
 /// ### Safety
 ///
 /// Requires AVX2 + FMA. `norms_f32` and `corrections_f32` must be valid for
-/// `base_vec + end_lane`.
+/// indices `base_vec..base_vec + end_lane`.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2", enable = "fma")]
 #[allow(clippy::too_many_arguments)]
@@ -1093,11 +1184,34 @@ unsafe fn epilogue_one_query_avx2(
     }
 }
 
-/// AVX-512BW counterpart to [`fused4_avx2`]: scores two 32-vector blocks
-/// per inner iteration (64 vectors) via `_mm512_inserti64x4` + a broadcast
-/// LUT shuffle, then runs [`epilogue_one_query_avx2`] on each block's
-/// extracted 256-bit accumulator half. An odd final block is handled by an
-/// inlined AVX2 accumulation pass. Results are identical to [`fused4_avx2`].
+/// Score all blocks for up to 4 queries at once (AVX-512BW), returning
+/// per-query top-k.
+///
+/// Processes two 32-vector blocks per inner iteration (64 vectors) via
+/// `_mm512_inserti64x4` and a broadcast LUT shuffle, then runs
+/// [`epilogue_one_query_avx2`] on each block's extracted 256-bit accumulator
+/// half. An odd trailing block is handled by an inlined AVX2 accumulation pass.
+/// Results are identical to [`fused4_avx2`]. Surplus slots beyond `batch_nq`
+/// are scored and discarded; pad them with any valid LUT.
+///
+/// ### Params
+///
+/// * `luts` - Array of exactly 4 query LUTs; pad unused slots for `batch_nq < 4`
+/// * `blocked` - Blocked code layout (`BlockedCodes::data`)
+/// * `n_vectors` - Number of real (non-padding) vectors
+/// * `n_blocks` - Number of blocks in `blocked`
+/// * `norms_f32` - Per-vector L2 norms (length `n_vectors`)
+/// * `corrections_f32` - Per-vector debias factors `1 / <u, x̂>` (length
+///   `n_vectors`)
+/// * `query_norms` - L2 norms of the 4 queries
+/// * `metric` - Distance metric
+/// * `k` - Number of neighbours to return per query
+/// * `batch_nq` - Number of active queries (`1..=4`)
+///
+/// ### Returns
+///
+/// One `(indices, distances)` pair per active query, sorted nearest-first,
+/// length `min(k, n_vectors)`.
 ///
 /// ### Safety
 ///
@@ -1145,9 +1259,33 @@ pub(crate) unsafe fn fused4_avx512bw(
         .collect()
 }
 
-/// AVX-512BW scoring core into caller-owned heaps. The block-pair counterpart
-/// to [`score_into_heaps_avx2`]; see [`fused4_avx512bw`] for the algorithm and
-/// [`score_into_heaps_avx2`] for the persistent-heap / `base_index` contract.
+/// Score `n_blocks` blocks for up to 4 queries into caller-owned heaps
+/// (AVX-512BW).
+///
+/// Block-pair counterpart to [`score_into_heaps_avx2`]; see
+/// [`fused4_avx512bw`] for the algorithm. Shares the same persistent-heap /
+/// `base_index` contract as [`score_into_heaps_avx2`]: heaps accumulate across
+/// calls, so IVF can call this once per probed cluster with the cluster's
+/// global slot offset as `base_index`.
+///
+/// ### Params
+///
+/// * `luts` - Array of exactly 4 query LUTs
+/// * `blocked` - Blocked code layout for this segment
+/// * `n_vectors` - Number of real (non-padding) vectors in this segment
+/// * `n_blocks` - Number of blocks in `blocked`
+/// * `norms_f32` - Per-vector L2 norms for this segment (length `n_vectors`)
+/// * `corrections_f32` - Per-vector debias factors for this segment (length
+///   `n_vectors`)
+/// * `query_norms` - L2 norms of the 4 queries
+/// * `metric` - Distance metric
+/// * `batch_nq` - Number of active queries (`1..=4`)
+/// * `base_index` - Global slot offset added to every index pushed into `heaps`
+/// * `heaps` - Per-query top-k buffers updated in place (length `>= batch_nq`)
+///
+/// ### Returns
+///
+/// `()` — results accumulated into `heaps`.
 ///
 /// ### Safety
 ///
@@ -1292,16 +1430,32 @@ pub(crate) unsafe fn score_into_heaps_avx512bw(
     }
 }
 
-///////////
-// Tests //
-///////////
-
-/// NEON scoring core into caller-owned heaps (aarch64).
+/// Score `n_blocks` blocks for up to 4 queries into caller-owned heaps (NEON).
 ///
-/// Per-query single-block kernel ([`score_block_neon`]) looped over the
-/// `batch_nq` queries, then a scalar key transform + heap push. Not 4-query
-/// fused (no NEON fused kernel exists), but still SIMD-scored. Same persistent
-/// heap / `base_index` contract as [`score_into_heaps_avx2`].
+/// Calls the per-query single-block kernel [`score_block_neon`] for each
+/// `(query, block)` pair, then applies a scalar key transform and heap push.
+/// Not 4-query fused (no NEON fused kernel exists), but still SIMD-scored.
+/// Shares the same persistent-heap / `base_index` contract as
+/// [`score_into_heaps_avx2`].
+///
+/// ### Params
+///
+/// * `luts` - Array of exactly 4 query LUTs
+/// * `blocked` - Blocked code layout for this segment
+/// * `n_vectors` - Number of real (non-padding) vectors in this segment
+/// * `n_blocks` - Number of blocks in `blocked`
+/// * `norms_f32` - Per-vector L2 norms for this segment (length `n_vectors`)
+/// * `corrections_f32` - Per-vector debias factors for this segment (length
+///   `n_vectors`)
+/// * `query_norms` - L2 norms of the 4 queries
+/// * `metric` - Distance metric
+/// * `batch_nq` - Number of active queries (`1..=4`)
+/// * `base_index` - Global slot offset added to every index pushed into `heaps`
+/// * `heaps` - Per-query top-k buffers updated in place (length `>= batch_nq`)
+///
+/// ### Returns
+///
+/// `()` — results accumulated into `heaps`.
 ///
 /// ### Safety
 ///
@@ -1342,12 +1496,32 @@ pub(crate) unsafe fn score_into_heaps_neon(
     }
 }
 
-/// Scalar scoring core into caller-owned heaps (portable fallback).
+/// Score `n_blocks` blocks for up to 4 queries into caller-owned heaps
+/// (portable scalar fallback).
 ///
-/// Used on x86 without AVX2/FMA and on architectures without a SIMD kernel.
-/// 2-bit / 4-bit only (it consumes a [`QueryLut`]); 3-bit codes are served by
-/// the bit-plane path in `tq_dists`. Same persistent heap / `base_index`
-/// contract as [`score_into_heaps_avx2`].
+/// Used on x86 without AVX2/FMA and on architectures without a dedicated SIMD
+/// kernel. Consumes a [`QueryLut`], so it handles 2-bit and 4-bit only; 3-bit
+/// codes are served by the bit-plane path in `tq_dists`. Shares the same
+/// persistent-heap / `base_index` contract as [`score_into_heaps_avx2`].
+///
+/// ### Params
+///
+/// * `luts` - Array of exactly 4 query LUTs
+/// * `blocked` - Blocked code layout for this segment
+/// * `n_vectors` - Number of real (non-padding) vectors in this segment
+/// * `n_blocks` - Number of blocks in `blocked`
+/// * `norms_f32` - Per-vector L2 norms for this segment (length `n_vectors`)
+/// * `corrections_f32` - Per-vector debias factors for this segment (length
+///   `n_vectors`)
+/// * `query_norms` - L2 norms of the 4 queries
+/// * `metric` - Distance metric
+/// * `batch_nq` - Number of active queries (`1..=4`)
+/// * `base_index` - Global slot offset added to every index pushed into `heaps`
+/// * `heaps` - Per-query top-k buffers updated in place (length `>= batch_nq`)
+///
+/// ### Returns
+///
+/// `()` — results accumulated into `heaps`.
 #[allow(clippy::too_many_arguments)]
 #[allow(dead_code)]
 pub(crate) fn score_into_heaps_scalar(
@@ -1387,14 +1561,32 @@ pub(crate) fn score_into_heaps_scalar(
 /// Architecture-dispatched scoring of one blocked segment into caller-owned
 /// heaps.
 ///
-/// Picks AVX-512BW / AVX2 / NEON / scalar at runtime and scores `n_blocks`
+/// Selects AVX-512BW / AVX2 / NEON / scalar at runtime and scores `n_blocks`
 /// blocks for `batch_nq` queries, pushing global indices `base_index + slot`
 /// into `heaps`. Heaps persist across calls, so an IVF index can call this
 /// once per probed cluster (with `base_index` set to the cluster's global slot
 /// offset) and the running top-k accumulates across clusters. 2-bit / 4-bit
-/// only.
+/// only. Pad unused `luts` slots for `batch_nq < 4`.
 ///
-/// `luts` must hold 4 entries; pad unused slots for `batch_nq < 4`.
+/// ### Params
+///
+/// * `luts` - Array of exactly 4 query LUTs; pad unused slots for
+///   `batch_nq < 4`
+/// * `blocked` - Blocked code layout for this segment
+/// * `n_vectors` - Number of real (non-padding) vectors in this segment
+/// * `n_blocks` - Number of blocks in `blocked`
+/// * `norms_f32` - Per-vector L2 norms for this segment (length `n_vectors`)
+/// * `corrections_f32` - Per-vector debias factors for this segment (length
+///   `n_vectors`)
+/// * `query_norms` - L2 norms of the 4 queries
+/// * `metric` - Distance metric
+/// * `batch_nq` - Number of active queries (`1..=4`)
+/// * `base_index` - Global slot offset added to every index pushed into `heaps`
+/// * `heaps` - Per-query top-k buffers updated in place (length `>= batch_nq`)
+///
+/// ### Returns
+///
+/// `()` — results accumulated into `heaps`.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn score_into_heaps(
     luts: &[&QueryLut; 4],
@@ -1495,14 +1687,32 @@ pub(crate) fn score_into_heaps(
     }
 }
 
-/// Top-k over a single blocked segment (exhaustive path).
+/// Exhaustive top-k over a single blocked segment, architecture-dispatched.
 ///
 /// Convenience wrapper over [`score_into_heaps`] with `base_index = 0`: builds
-/// the heaps, scores, and returns per-query `(indices, distances)` sorted
-/// nearest-first. The exhaustive index calls this; the IVF index drives
-/// [`score_into_heaps`] directly with persistent heaps.
+/// fresh heaps, scores all blocks, and returns per-query sorted results. The
+/// exhaustive index calls this; the IVF index drives [`score_into_heaps`]
+/// directly with persistent heaps and a per-cluster `base_index`. 2-bit /
+/// 4-bit only. Pad unused `luts` slots for `batch_nq < 4`.
 ///
-/// `luts` must hold 4 entries; pad unused slots for `batch_nq < 4`.
+/// ### Params
+///
+/// * `luts` - Array of exactly 4 query LUTs; pad unused slots for `batch_nq < 4`
+/// * `blocked` - Blocked code layout (`BlockedCodes::data`)
+/// * `n_vectors` - Number of real (non-padding) vectors
+/// * `n_blocks` - Number of blocks in `blocked`
+/// * `norms_f32` - Per-vector L2 norms (length `n_vectors`)
+/// * `corrections_f32` - Per-vector debias factors `1 / <u, x̂>` (length
+///   `n_vectors`)
+/// * `query_norms` - L2 norms of the 4 queries
+/// * `metric` - Distance metric
+/// * `k` - Number of neighbours to return per query
+/// * `batch_nq` - Number of active queries (`1..=4`)
+///
+/// ### Returns
+///
+/// One `(indices, distances)` pair per active query, sorted nearest-first,
+/// length `min(k, n_vectors)`.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn topk_blocked(
     luts: &[&QueryLut; 4],
@@ -1539,6 +1749,10 @@ pub(crate) fn topk_blocked(
         .map(|(qi, h)| h.into_sorted(query_norms[qi], metric))
         .collect()
 }
+
+///////////
+// Tests //
+///////////
 
 #[cfg(test)]
 mod tests {

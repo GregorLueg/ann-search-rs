@@ -8,9 +8,6 @@
 //! cosine similarity `cos(q, v)`. The final metric distance is
 //! reconstructed from that similarity plus the retained L2 norms.
 //!
-//! The SIMD kernels (see `tq_search.rs`) are validated against
-//! [`score_ip_scalar`]; any divergence beyond u8-LUT rounding is a bug.
-//!
 //! **3-bit codes have no SIMD kernel** and always route through the
 //! scalar scorer. They are correct but markedly slower than 2-bit or
 //! 4-bit; prefer 4-bit unless memory forces otherwise.
@@ -121,9 +118,9 @@ where
     }
 }
 
-///////////////////////////////
+//////////////////////////////
 // VectorDistanceTurboQuant //
-///////////////////////////////
+//////////////////////////////
 
 /// Distance computation over TurboQuant storage.
 ///

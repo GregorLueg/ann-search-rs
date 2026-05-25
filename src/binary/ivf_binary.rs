@@ -210,8 +210,8 @@ where
         let (all_indices, offsets) = build_csr_layout(assignments, n, nlist);
 
         // 5. initialise binariser and encode all vectors
-        let init = parse_binarisation_init(binarisation_init).unwrap_or({
-            eprintln!("Unknown binarisation string provided. Using the default");
+        let init = parse_binarisation_init(binarisation_init).unwrap_or_else(|| {
+            println!("[WARNING] Unknown binarisation string provided. Using the default");
             BinarisationInit::default()
         });
 
@@ -378,8 +378,8 @@ where
         let (all_indices, offsets) = build_csr_layout(assignments, n, nlist);
 
         // 5. initialise binariser and encode all vectors
-        let init = parse_binarisation_init(binarisation_init).unwrap_or({
-            eprintln!("Unknown binarisation string provided. Using the default");
+        let init = parse_binarisation_init(binarisation_init).unwrap_or_else(|| {
+            println!("[WARNING] Unknown binarisation string provided. Using the default");
             BinarisationInit::default()
         });
 

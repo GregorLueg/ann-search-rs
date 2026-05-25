@@ -109,7 +109,7 @@ case "$KIND" in
             # hnsw
             "hnsw:euclidean:gaussian:32|cargo run --example gridsearch_hnsw --release -- --distance euclidean"
             "hnsw:cosine:gaussian:32|cargo run --example gridsearch_hnsw --release -- --distance cosine"
-            "hnsw:cosine:manhattan:32|cargo run --example gridsearch_hnsw --release -- --distance manhattan"
+            "hnsw:manhattan:gaussian:32|cargo run --example gridsearch_hnsw --release -- --distance manhattan"
             "hnsw:euclidean:correlated:32|cargo run --example gridsearch_hnsw --release -- --distance euclidean --data correlated"
             "hnsw:euclidean:lowrank:32|cargo run --example gridsearch_hnsw --release -- --distance euclidean --data lowrank"
             "hnsw:euclidean:lowrank:128|cargo run --example gridsearch_hnsw --release -- --distance euclidean --data lowrank --dim 128"
@@ -124,7 +124,7 @@ case "$KIND" in
             # kd_forest
             "kd_forest:euclidean:gaussian:32|cargo run --example gridsearch_kd_forest --release -- --distance euclidean"
             "kd_forest:cosine:gaussian:32|cargo run --example gridsearch_kd_forest --release -- --distance cosine"
-            "kd_forest:cosine:manhattan:32|cargo run --example gridsearch_kd_forest --release -- --distance manhattan"
+            "kd_forest:manhattan:gaussian:32|cargo run --example gridsearch_kd_forest --release -- --distance manhattan"
             "kd_forest:euclidean:correlated:32|cargo run --example gridsearch_kd_forest --release -- --distance euclidean --data correlated"
             "kd_forest:euclidean:lowrank:32|cargo run --example gridsearch_kd_forest --release -- --distance euclidean --data lowrank"
             "kd_forest:euclidean:lowrank:128|cargo run --example gridsearch_kd_forest --release -- --distance euclidean --data lowrank --dim 128"
@@ -146,7 +146,7 @@ case "$KIND" in
             # nndescent
             "nndescent:euclidean:gaussian:32|cargo run --example gridsearch_nndescent --release -- --distance euclidean"
             "nndescent:cosine:gaussian:32|cargo run --example gridsearch_nndescent --release -- --distance cosine"
-            "nndescent:cosine:manhattan:32|cargo run --example gridsearch_nndescent --release -- --distance manhattan"
+            "nndescent:manhattan:gaussian:32|cargo run --example gridsearch_nndescent --release -- --distance manhattan"
             "nndescent:euclidean:correlated:32|cargo run --example gridsearch_nndescent --release -- --distance euclidean --data correlated"
             "nndescent:euclidean:lowrank:32|cargo run --example gridsearch_nndescent --release -- --distance euclidean --data lowrank"
             "nndescent:euclidean:lowrank:128|cargo run --example gridsearch_nndescent --release -- --distance euclidean --data lowrank --dim 128"
@@ -154,7 +154,7 @@ case "$KIND" in
              # vamana
              "vamana:euclidean:gaussian:32|cargo run --example gridsearch_vamana --release -- --distance euclidean"
              "vamana:cosine:gaussian:32|cargo run --example gridsearch_vamana --release -- --distance cosine"
-             "vamana:cosine:manhattan:32|cargo run --example gridsearch_vamana --release -- --distance manhattan"
+             "vamana:manhattan:gaussian:32|cargo run --example gridsearch_vamana --release -- --distance manhattan"
              "vamana:euclidean:correlated:32|cargo run --example gridsearch_vamana --release -- --distance euclidean --data correlated"
              "vamana:euclidean:lowrank:32|cargo run --example gridsearch_vamana --release -- --distance euclidean --data lowrank"
              "vamana:euclidean:lowrank:128|cargo run --example gridsearch_vamana --release -- --distance euclidean --data lowrank --dim 128"
@@ -210,39 +210,39 @@ case "$KIND" in
         BENCHMARKS=(
             "binary:euclidean:correlated:256:50000|cargo run --example gridsearch_binary --release --features binary -- --data correlated --n-samples 50000 --dim 256"
             "binary:euclidean:lowrank:256:50000|cargo run --example gridsearch_binary --release --features binary -- --data lowrank --n-samples 50000 --dim 256 --intrinsic-dim 32"
-            "binary:euclidean:embedding:256:50000|cargo run --example gridsearch_binary --release --features binary -- --data embedding --n-samples 50000 --dim 256 --n-clusters 50"
+            "binary:euclidean:embedding:256:50000|cargo run --example gridsearch_binary --release --features binary -- --data embedding --n-samples 50000 --dim 256"
 
             "binary:euclidean:correlated:512:50000|cargo run --example gridsearch_binary --release --features binary -- --data correlated --n-samples 50000 --dim 512"
             "binary:euclidean:lowrank:512:50000|cargo run --example gridsearch_binary --release --features binary -- --data lowrank --n-samples 50000 --dim 512 --intrinsic-dim 64"
-            "binary:euclidean:embedding:512:50000|cargo run --example gridsearch_binary --release --features binary -- --data embedding --n-samples 50000 --dim 512 --n-clusters 50"
+            "binary:euclidean:embedding:512:50000|cargo run --example gridsearch_binary --release --features binary -- --data embedding --n-samples 50000 --dim 512"
 
             "binary:euclidean:correlated:768:50000|cargo run --example gridsearch_binary --release --features binary -- --data correlated --n-samples 50000 --dim 768"
             "binary:euclidean:lowrank:768:50000|cargo run --example gridsearch_binary --release --features binary -- --data lowrank --n-samples 50000 --dim 768 --intrinsic-dim 128"
-            "binary:euclidean:embedding:768:50000|cargo run --example gridsearch_binary --release --features binary -- --data embedding --n-samples 50000 --dim 768 --n-clusters 50"
+            "binary:euclidean:embedding:768:50000|cargo run --example gridsearch_binary --release --features binary -- --data embedding --n-samples 50000 --dim 768"
 
             "rabitq:euclidean:correlated:256:50000|cargo run --example gridsearch_rabitq --release --features binary -- --data correlated --n-samples 50000 --dim 256"
             "rabitq:euclidean:lowrank:256:50000|cargo run --example gridsearch_rabitq --release --features binary -- --data lowrank --n-samples 50000 --dim 256 --intrinsic-dim 32"
-            "rabitq:euclidean:embedding:256:50000|cargo run --example gridsearch_rabitq --release --features binary -- --data embedding --n-samples 50000 --dim 256 --n-clusters 50"
+            "rabitq:euclidean:embedding:256:50000|cargo run --example gridsearch_rabitq --release --features binary -- --data embedding --n-samples 50000 --dim 256"
 
             "rabitq:euclidean:correlated:512:50000|cargo run --example gridsearch_rabitq --release --features binary -- --data correlated --n-samples 50000 --dim 512"
             "rabitq:euclidean:lowrank:512:50000|cargo run --example gridsearch_rabitq --release --features binary -- --data lowrank --n-samples 50000 --dim 512 --intrinsic-dim 64"
-            "rabitq:euclidean:embedding:512:50000|cargo run --example gridsearch_rabitq --release --features binary -- --data embedding --n-samples 50000 --dim 512 --n-clusters 50"
+            "rabitq:euclidean:embedding:512:50000|cargo run --example gridsearch_rabitq --release --features binary -- --data embedding --n-samples 50000 --dim 512"
 
             "rabitq:euclidean:correlated:768:50000|cargo run --example gridsearch_rabitq --release --features binary -- --data correlated --n-samples 50000 --dim 768"
             "rabitq:euclidean:lowrank:768:50000|cargo run --example gridsearch_rabitq --release --features binary -- --data lowrank --n-samples 50000 --dim 768 --intrinsic-dim 128"
-            "rabitq:euclidean:embedding:768:50000|cargo run --example gridsearch_rabitq --release --features binary -- --data embedding --n-samples 50000 --dim 768 --n-clusters 50"
+            "rabitq:euclidean:embedding:768:50000|cargo run --example gridsearch_rabitq --release --features binary -- --data embedding --n-samples 50000 --dim 768"
 
             "turboquant:euclidean:correlated:256:50000|cargo run --example gridsearch_tq --release --features binary -- --data correlated --n-samples 50000 --dim 256"
             "turboquant:euclidean:lowrank:256:50000|cargo run --example gridsearch_tq --release --features binary -- --data lowrank --n-samples 50000 --dim 256 --intrinsic-dim 32"
-            "turboquant:euclidean:embedding:256:50000|cargo run --example gridsearch_tq --release --features binary -- --data embedding --n-samples 50000 --dim 256 --n-clusters 50"
+            "turboquant:euclidean:embedding:256:50000|cargo run --example gridsearch_tq --release --features binary -- --data embedding --n-samples 50000 --dim 256"
 
             "turboquant:euclidean:correlated:512:50000|cargo run --example gridsearch_tq --release --features binary -- --data correlated --n-samples 50000 --dim 512"
             "turboquant:euclidean:lowrank:512:50000|cargo run --example gridsearch_tq --release --features binary -- --data lowrank --n-samples 50000 --dim 512 --intrinsic-dim 64"
-            "turboquant:euclidean:embedding:512:50000|cargo run --example gridsearch_tq --release --features binary -- --data embedding --n-samples 50000 --dim 512 --n-clusters 50"
+            "turboquant:euclidean:embedding:512:50000|cargo run --example gridsearch_tq --release --features binary -- --data embedding --n-samples 50000 --dim 512"
 
             "turboquant:euclidean:correlated:768:50000|cargo run --example gridsearch_tq --release --features binary -- --data correlated --n-samples 50000 --dim 768"
             "turboquant:euclidean:lowrank:768:50000|cargo run --example gridsearch_tq --release --features binary -- --data lowrank --n-samples 50000 --dim 768 --intrinsic-dim 128"
-            "turboquant:euclidean:embedding:768:50000|cargo run --example gridsearch_tq --release --features binary -- --data embedding --n-samples 50000 --dim 768 --n-clusters 50"
+            "turboquant:euclidean:embedding:768:50000|cargo run --example gridsearch_tq --release --features binary -- --data embedding --n-samples 50000 --dim 768"
         )
         ;;
     quantised)
@@ -261,27 +261,27 @@ case "$KIND" in
 
             "pq:euclidean:correlated:128:50000|cargo run --example gridsearch_pq --release --features quantised -- --data correlated --n-samples 50000 --dim 128"
             "pq:euclidean:lowrank:128:50000|cargo run --example gridsearch_pq --release --features quantised -- --data lowrank --n-samples 50000 --dim 128"
-            "pq:euclidean:embedding:128:50000|cargo run --example gridsearch_pq --release --features quantised -- --data embedding --n-samples 50000 --dim 128 --n-clusters 50"
+            "pq:euclidean:embedding:128:50000|cargo run --example gridsearch_pq --release --features quantised -- --data embedding --n-samples 50000 --dim 128"
 
             "pq:euclidean:correlated:256:50000|cargo run --example gridsearch_pq --release --features quantised -- --data correlated --n-samples 50000 --dim 256"
             "pq:euclidean:lowrank:256:50000|cargo run --example gridsearch_pq --release --features quantised -- --data lowrank --n-samples 50000 --dim 256 --intrinsic-dim 32"
-            "pq:euclidean:embedding:256:50000|cargo run --example gridsearch_pq --release --features quantised -- --data embedding --n-samples 50000 --dim 256 --n-clusters 50"
+            "pq:euclidean:embedding:256:50000|cargo run --example gridsearch_pq --release --features quantised -- --data embedding --n-samples 50000 --dim 256"
 
             "pq:euclidean:correlated:512:50000|cargo run --example gridsearch_pq --release --features quantised -- --data correlated --n-samples 50000 --dim 512"
             "pq:euclidean:lowrank:512:50000|cargo run --example gridsearch_pq --release --features quantised -- --data lowrank --n-samples 50000 --dim 512 --intrinsic-dim 64"
-            "pq:euclidean:embedding:512:50000|cargo run --example gridsearch_pq --release --features quantised -- --data embedding --n-samples 50000 --dim 512 --n-clusters 50"
+            "pq:euclidean:embedding:512:50000|cargo run --example gridsearch_pq --release --features quantised -- --data embedding --n-samples 50000 --dim 512"
 
             "opq:euclidean:correlated:128:50000|cargo run --example gridsearch_opq --release --features quantised -- --data correlated --n-samples 50000 --dim 128"
             "opq:euclidean:lowrank:128:50000|cargo run --example gridsearch_opq --release --features quantised -- --data lowrank --n-samples 50000 --dim 128"
-            "opq:euclidean:embedding:128:50000|cargo run --example gridsearch_opq --release --features quantised -- --data embedding --n-samples 50000 --dim 128 --n-clusters 50"
+            "opq:euclidean:embedding:128:50000|cargo run --example gridsearch_opq --release --features quantised -- --data embedding --n-samples 50000 --dim 128"
 
             "opq:euclidean:correlated:256:50000|cargo run --example gridsearch_opq --release --features quantised -- --data correlated --n-samples 50000 --dim 256"
             "opq:euclidean:lowrank:256:50000|cargo run --example gridsearch_opq --release --features quantised -- --data lowrank --n-samples 50000 --dim 256 --intrinsic-dim 32"
-            "opq:euclidean:embedding:256:50000|cargo run --example gridsearch_opq --release --features quantised -- --data embedding --n-samples 50000 --dim 256 --n-clusters 50"
+            "opq:euclidean:embedding:256:50000|cargo run --example gridsearch_opq --release --features quantised -- --data embedding --n-samples 50000 --dim 256"
 
             "opq:euclidean:correlated:512:50000|cargo run --example gridsearch_opq --release --features quantised -- --data correlated --n-samples 50000 --dim 512"
             "opq:euclidean:lowrank:512:50000|cargo run --example gridsearch_opq --release --features quantised -- --data lowrank --n-samples 50000 --dim 512 --intrinsic-dim 64"
-            "opq:euclidean:embedding:512:50000|cargo run --example gridsearch_opq --release --features quantised -- --data embedding --n-samples 50000 --dim 512 --n-clusters 50"
+            "opq:euclidean:embedding:512:50000|cargo run --example gridsearch_opq --release --features quantised -- --data embedding --n-samples 50000 --dim 512"
 
         )
         ;;
