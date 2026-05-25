@@ -1623,7 +1623,7 @@ IVF-Binary-768-nl316-signed (self)                    27_941.85     3_581.74    
 #### Quantisation (stress) data
 
 <details>
-<summary><b>Quantisation stress data - 256 dimensions</b>:</summary>
+<summary><b>Cell embedding data - 256 dimensions</b>:</summary>
 </br>
 <pre><code>
 ===================================================================================================================================
@@ -1879,7 +1879,7 @@ IVF-Binary-256-nl316-signed (self)                     3_194.09       609.50    
 ---
 
 <details>
-<summary><b>Quantisation stress data - 512 dimensions</b>:</summary>
+<summary><b>Cell embedding data - 512 dimensions</b>:</summary>
 </br>
 <pre><code>
 ===================================================================================================================================
@@ -2135,7 +2135,7 @@ IVF-Binary-512-nl316-signed (self)                    12_087.93     1_744.63    
 ---
 
 <details>
-<summary><b>Quantisation stress data - 768 dimensions</b>:</summary>
+<summary><b>Cell embedding data - 768 dimensions</b>:</summary>
 </br>
 <pre><code>
 ===================================================================================================================================
@@ -2738,7 +2738,7 @@ IVF-RaBitQ-nl316 (self)                                7_677.39    17_350.16    
 #### Quantisation (stress) data
 
 <details>
-<summary><b>Quantisation stress data - 256 dimensions</b>:</summary>
+<summary><b>Cell embedding data - 256 dimensions</b>:</summary>
 </br>
 <pre><code>
 ===================================================================================================================================
@@ -2791,7 +2791,7 @@ IVF-RaBitQ-nl316 (self)                                1_230.38     2_818.14    
 ---
 
 <details>
-<summary><b>Quantisation stress data - 512 dimensions</b>:</summary>
+<summary><b>Cell embedding data - 512 dimensions</b>:</summary>
 </br>
 <pre><code>
 ===================================================================================================================================
@@ -2844,7 +2844,7 @@ IVF-RaBitQ-nl316 (self)                                3_351.69     8_040.12    
 ---
 
 <details>
-<summary><b>Quantisation stress data - 768 dimensions</b>:</summary>
+<summary><b>Cell embedding data - 768 dimensions</b>:</summary>
 </br>
 <pre><code>
 ===================================================================================================================================
@@ -3470,7 +3470,7 @@ IVF-TQ-b4-nl316 (self)                                 3_259.64     2_697.27    
 #### Quantisation (stress) data
 
 <details>
-<summary><b>Quantisation stress data - 256 dimensions</b>:</summary>
+<summary><b>Cell embedding data - 256 dimensions</b>:</summary>
 </br>
 <pre><code>
 ===================================================================================================================================
@@ -3558,7 +3558,7 @@ IVF-TQ-b4-nl316 (self)                                 1_009.68     1_413.57    
 ---
 
 <details>
-<summary><b>Quantisation stress data - 512 dimensions</b>:</summary>
+<summary><b>Cell embedding data - 512 dimensions</b>:</summary>
 </br>
 <pre><code>
 ===================================================================================================================================
@@ -3646,7 +3646,7 @@ IVF-TQ-b4-nl316 (self)                                 1_667.26     2_124.49    
 ---
 
 <details>
-<summary><b>Quantisation stress data - 768 dimensions</b>:</summary>
+<summary><b>Cell embedding data - 768 dimensions</b>:</summary>
 </br>
 <pre><code>
 ===================================================================================================================================

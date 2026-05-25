@@ -33,23 +33,34 @@ use std::arch::x86_64::*;
 ///
 /// The Hamming distance between the two slices
 #[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "avx512f", enable = "avx512bw", enable = "popcnt")]
+#[target_feature(enable = "avx512f", enable = "avx512bw")]
 unsafe fn hamming_avx512(a: &[u8], b: &[u8]) -> u32 {
-    let mut count = 0u64;
     let len = a.len();
     let n_chunks = len / 64;
+
+    let nibble = _mm_setr_epi8(0, 1, 1, 2, 1, 2, 2, 3, 1, 2, 2, 3, 2, 3, 3, 4);
+    let lookup = _mm512_broadcast_i32x4(nibble);
+    let low_mask = _mm512_set1_epi8(0x0f);
+    let zero = _mm512_setzero_si512();
+    let mut acc = _mm512_setzero_si512();
 
     for i in 0..n_chunks {
         let offset = i * 64;
         let va = _mm512_loadu_si512(a.as_ptr().add(offset) as *const __m512i);
         let vb = _mm512_loadu_si512(b.as_ptr().add(offset) as *const __m512i);
-        let xor = _mm512_xor_si512(va, vb);
+        let v = _mm512_xor_si512(va, vb);
 
-        let xor_words = std::mem::transmute::<__m512i, [u64; 8]>(xor);
-        for &word in &xor_words {
-            count += _popcnt64(word as i64) as u64;
-        }
+        let lo = _mm512_and_si512(v, low_mask);
+        let hi = _mm512_and_si512(_mm512_srli_epi16(v, 4), low_mask);
+        let local = _mm512_add_epi8(
+            _mm512_shuffle_epi8(lookup, lo),
+            _mm512_shuffle_epi8(lookup, hi),
+        );
+        acc = _mm512_add_epi64(acc, _mm512_sad_epu8(local, zero));
     }
+
+    let lanes = std::mem::transmute::<__m512i, [u64; 8]>(acc);
+    let mut count: u64 = lanes.iter().sum();
 
     for i in (n_chunks * 64)..len {
         count += (*a.get_unchecked(i) ^ *b.get_unchecked(i)).count_ones() as u64;
@@ -69,23 +80,34 @@ unsafe fn hamming_avx512(a: &[u8], b: &[u8]) -> u32 {
 ///
 /// The Hamming distance between the two slices
 #[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "avx2", enable = "popcnt")]
+#[target_feature(enable = "avx2")]
 unsafe fn hamming_avx2(a: &[u8], b: &[u8]) -> u32 {
-    let mut count = 0u64;
     let len = a.len();
     let n_chunks = len / 32;
+
+    let nibble = _mm_setr_epi8(0, 1, 1, 2, 1, 2, 2, 3, 1, 2, 2, 3, 2, 3, 3, 4);
+    let lookup = _mm256_broadcastsi128_si256(nibble);
+    let low_mask = _mm256_set1_epi8(0x0f);
+    let zero = _mm256_setzero_si256();
+    let mut acc = _mm256_setzero_si256();
 
     for i in 0..n_chunks {
         let offset = i * 32;
         let va = _mm256_loadu_si256(a.as_ptr().add(offset) as *const __m256i);
         let vb = _mm256_loadu_si256(b.as_ptr().add(offset) as *const __m256i);
-        let xor = _mm256_xor_si256(va, vb);
+        let v = _mm256_xor_si256(va, vb);
 
-        let xor_words = std::mem::transmute::<__m256i, [u64; 4]>(xor);
-        for &word in &xor_words {
-            count += _popcnt64(word as i64) as u64;
-        }
+        let lo = _mm256_and_si256(v, low_mask);
+        let hi = _mm256_and_si256(_mm256_srli_epi16(v, 4), low_mask);
+        let local = _mm256_add_epi8(
+            _mm256_shuffle_epi8(lookup, lo),
+            _mm256_shuffle_epi8(lookup, hi),
+        );
+        acc = _mm256_add_epi64(acc, _mm256_sad_epu8(local, zero));
     }
+
+    let lanes = std::mem::transmute::<__m256i, [u64; 4]>(acc);
+    let mut count: u64 = lanes.iter().sum();
 
     for i in (n_chunks * 32)..len {
         count += (*a.get_unchecked(i) ^ *b.get_unchecked(i)).count_ones() as u64;
@@ -107,21 +129,34 @@ unsafe fn hamming_avx2(a: &[u8], b: &[u8]) -> u32 {
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "sse2")]
 unsafe fn hamming_sse2(a: &[u8], b: &[u8]) -> u32 {
-    let mut count = 0u64;
     let len = a.len();
     let n_chunks = len / 16;
+
+    let m1 = _mm_set1_epi8(0x55);
+    let m2 = _mm_set1_epi8(0x33);
+    let m4 = _mm_set1_epi8(0x0f);
+    let zero = _mm_setzero_si128();
+    let mut acc = _mm_setzero_si128();
 
     for i in 0..n_chunks {
         let offset = i * 16;
         let va = _mm_loadu_si128(a.as_ptr().add(offset) as *const __m128i);
         let vb = _mm_loadu_si128(b.as_ptr().add(offset) as *const __m128i);
-        let xor = _mm_xor_si128(va, vb);
+        let mut v = _mm_xor_si128(va, vb);
 
-        let xor_words = std::mem::transmute::<__m128i, [u64; 2]>(xor);
-        for &word in &xor_words {
-            count += _popcnt64(word as i64) as u64;
-        }
+        // SWAR per-byte popcount (16-bit shifts; masks clean cross-byte bits)
+        v = _mm_sub_epi8(v, _mm_and_si128(_mm_srli_epi16(v, 1), m1));
+        v = _mm_add_epi8(
+            _mm_and_si128(v, m2),
+            _mm_and_si128(_mm_srli_epi16(v, 2), m2),
+        );
+        v = _mm_and_si128(_mm_add_epi8(v, _mm_srli_epi16(v, 4)), m4);
+
+        acc = _mm_add_epi64(acc, _mm_sad_epu8(v, zero));
     }
+
+    let lanes = std::mem::transmute::<__m128i, [u64; 2]>(acc);
+    let mut count = lanes[0] + lanes[1];
 
     for i in (n_chunks * 16)..len {
         count += (*a.get_unchecked(i) ^ *b.get_unchecked(i)).count_ones() as u64;
@@ -366,6 +401,7 @@ pub fn dot_query_binary_simd(query: &[u8], binary: &[u8], dim: usize) -> u32 {
     let full_bytes = dim / 8;
     let chunks = full_bytes / 2;
     let mut acc = u8x16::ZERO;
+    let mut wide = [0u32; 16];
 
     for chunk_idx in 0..chunks {
         let byte_offset = chunk_idx * 2;
@@ -380,32 +416,34 @@ pub fn dot_query_binary_simd(query: &[u8], binary: &[u8], dim: usize) -> u32 {
             b0, b0, b0, b0, b0, b0, b0, b0, b1, b1, b1, b1, b1, b1, b1, b1,
         ]);
 
-        // anded is 0 or a power-of-2 (1,2,4,8,16,32,64,128)
         let anded = binary_broadcast & BIT_MASKS_16;
-
-        // min(0, 1) = 0, min(any_power_of_2, 1) = 1
         let zero_or_one = anded.min(ONE_16);
-
-        // 0 - 0 = 0x00, 0 - 1 = 0xFF (wrapping)
         let mask = u8x16::ZERO - zero_or_one;
 
         acc += query_vals & mask;
+
+        if (chunk_idx + 1) % 16 == 0 {
+            let a: [u8; 16] = acc.into();
+            for l in 0..16 {
+                wide[l] += a[l] as u32;
+            }
+            acc = u8x16::ZERO;
+        }
     }
 
-    let mut sum = horizontal_sum_16(acc);
+    let a: [u8; 16] = acc.into();
+    for l in 0..16 {
+        wide[l] += a[l] as u32;
+    }
+    let mut sum: u32 = wide.iter().sum();
 
     // remaining full bytes
     for byte_idx in (chunks * 2)..full_bytes {
         let bits = binary[byte_idx];
         let base = byte_idx * 8;
-        sum += query[base] as u32 * (bits & 1) as u32;
-        sum += query[base + 1] as u32 * ((bits >> 1) & 1) as u32;
-        sum += query[base + 2] as u32 * ((bits >> 2) & 1) as u32;
-        sum += query[base + 3] as u32 * ((bits >> 3) & 1) as u32;
-        sum += query[base + 4] as u32 * ((bits >> 4) & 1) as u32;
-        sum += query[base + 5] as u32 * ((bits >> 5) & 1) as u32;
-        sum += query[base + 6] as u32 * ((bits >> 6) & 1) as u32;
-        sum += query[base + 7] as u32 * ((bits >> 7) & 1) as u32;
+        for bit in 0..8 {
+            sum += query[base + bit] as u32 * ((bits >> bit) & 1) as u32;
+        }
     }
 
     // remaining bits

@@ -259,10 +259,6 @@ case "$KIND" in
             "sq8:euclidean:lowrank:32|cargo run --example gridsearch_sq8 --release --features quantised -- --distance euclidean --data lowrank"
             "sq8:euclidean:lowrank:128|cargo run --example gridsearch_sq8 --release --features quantised -- --distance euclidean --data lowrank --dim 128"
 
-            "pq:euclidean:correlated:128:50000|cargo run --example gridsearch_pq --release --features quantised -- --data correlated --n-samples 50000 --dim 128"
-            "pq:euclidean:lowrank:128:50000|cargo run --example gridsearch_pq --release --features quantised -- --data lowrank --n-samples 50000 --dim 128"
-            "pq:euclidean:embedding:128:50000|cargo run --example gridsearch_pq --release --features quantised -- --data embedding --n-samples 50000 --dim 128"
-
             "pq:euclidean:correlated:256:50000|cargo run --example gridsearch_pq --release --features quantised -- --data correlated --n-samples 50000 --dim 256"
             "pq:euclidean:lowrank:256:50000|cargo run --example gridsearch_pq --release --features quantised -- --data lowrank --n-samples 50000 --dim 256 --intrinsic-dim 32"
             "pq:euclidean:embedding:256:50000|cargo run --example gridsearch_pq --release --features quantised -- --data embedding --n-samples 50000 --dim 256"
@@ -271,9 +267,9 @@ case "$KIND" in
             "pq:euclidean:lowrank:512:50000|cargo run --example gridsearch_pq --release --features quantised -- --data lowrank --n-samples 50000 --dim 512 --intrinsic-dim 64"
             "pq:euclidean:embedding:512:50000|cargo run --example gridsearch_pq --release --features quantised -- --data embedding --n-samples 50000 --dim 512"
 
-            "opq:euclidean:correlated:128:50000|cargo run --example gridsearch_opq --release --features quantised -- --data correlated --n-samples 50000 --dim 128"
-            "opq:euclidean:lowrank:128:50000|cargo run --example gridsearch_opq --release --features quantised -- --data lowrank --n-samples 50000 --dim 128"
-            "opq:euclidean:embedding:128:50000|cargo run --example gridsearch_opq --release --features quantised -- --data embedding --n-samples 50000 --dim 128"
+            "pq:euclidean:correlated:768:50000|cargo run --example gridsearch_pq --release --features quantised -- --data correlated --n-samples 50000 --dim 768"
+            "pq:euclidean:lowrank:768:50000|cargo run --example gridsearch_pq --release --features quantised -- --data lowrank --n-samples 50000 --dim 768 --intrinsic-dim 64"
+            "pq:euclidean:embedding:768:50000|cargo run --example gridsearch_pq --release --features quantised -- --data embedding --n-samples 50000 --dim 768"
 
             "opq:euclidean:correlated:256:50000|cargo run --example gridsearch_opq --release --features quantised -- --data correlated --n-samples 50000 --dim 256"
             "opq:euclidean:lowrank:256:50000|cargo run --example gridsearch_opq --release --features quantised -- --data lowrank --n-samples 50000 --dim 256 --intrinsic-dim 32"
@@ -282,6 +278,10 @@ case "$KIND" in
             "opq:euclidean:correlated:512:50000|cargo run --example gridsearch_opq --release --features quantised -- --data correlated --n-samples 50000 --dim 512"
             "opq:euclidean:lowrank:512:50000|cargo run --example gridsearch_opq --release --features quantised -- --data lowrank --n-samples 50000 --dim 512 --intrinsic-dim 64"
             "opq:euclidean:embedding:512:50000|cargo run --example gridsearch_opq --release --features quantised -- --data embedding --n-samples 50000 --dim 512"
+
+            "opq:euclidean:correlated:768:50000|cargo run --example gridsearch_opq --release --features quantised -- --data correlated --n-samples 50000 --dim 768"
+            "opq:euclidean:lowrank:768:50000|cargo run --example gridsearch_opq --release --features quantised -- --data lowrank --n-samples 50000 --dim 768 --intrinsic-dim 64"
+            "opq:euclidean:embedding:768:50000|cargo run --example gridsearch_opq --release --features quantised -- --data embedding --n-samples 50000 --dim 768"
 
         )
         ;;

@@ -10,6 +10,10 @@
 - TurboQuantisation with exhaustive and IVF index implemented.
 - Better benchmarking with an cell embedding-like benchmark.
 
+**Fixes**
+
+- Nasty SIMD overflow bug hitting RaBitQ at higher dimensionalities.
+
 ## 0.3.1
 
 **Fix**

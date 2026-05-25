@@ -804,7 +804,7 @@ IVF-PQ-nl316-m64 (self)                                3_966.99     8_213.80    
 ##### Quantisation (stress) data
 
 <details>
-<summary><b>Quantisation stress data - 128 dimensions</b>:</summary>
+<summary><b>Cell embedding data - 128 dimensions</b>:</summary>
 </br>
 <pre><code>
 ===================================================================================================================================
@@ -864,7 +864,7 @@ IVF-PQ-nl316-m64 (self)                                2_447.86     8_520.47    
 ---
 
 <details>
-<summary><b>Quantisation stress data - 256 dimensions</b>:</summary>
+<summary><b>Cell embedding data - 256 dimensions</b>:</summary>
 </br>
 <pre><code>
 ===================================================================================================================================
@@ -924,7 +924,7 @@ IVF-PQ-nl316-m64 (self)                                2_696.89     7_559.09    
 ---
 
 <details>
-<summary><b>Quantisation stress data - 512 dimensions</b>:</summary>
+<summary><b>Cell embedding data - 512 dimensions</b>:</summary>
 </br>
 <pre><code>
 ===================================================================================================================================
@@ -1405,7 +1405,7 @@ IVF-OPQ-nl316-m128 (self)                             19_875.57    16_338.90    
 ##### Quantisation (stress) data
 
 <details>
-<summary><b>Quantisation stress data - 128 dimensions</b>:</summary>
+<summary><b>Cell embedding data - 128 dimensions</b>:</summary>
 </br>
 <pre><code>
 ===================================================================================================================================
@@ -1451,7 +1451,7 @@ IVF-OPQ-nl316-m16 (self)                               3_415.70     2_299.14    
 ---
 
 <details>
-<summary><b>Quantisation stress data - 256 dimensions</b>:</summary>
+<summary><b>Cell embedding data - 256 dimensions</b>:</summary>
 </br>
 <pre><code>
 ===================================================================================================================================
@@ -1511,7 +1511,7 @@ IVF-OPQ-nl316-m64 (self)                              10_568.45     8_252.70    
 ---
 
 <details>
-<summary><b>Quantisation stress data - 512 dimensions</b>:</summary>
+<summary><b>Cell embedding data - 512 dimensions</b>:</summary>
 </br>
 <pre><code>
 ===================================================================================================================================

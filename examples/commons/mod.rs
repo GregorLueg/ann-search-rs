@@ -269,6 +269,16 @@ where
 }
 
 /// Random matrix with `rank` orthonormal columns in `dim`-space (Gram-Schmidt).
+///
+/// ### Params
+///
+/// * `dim` - Dimensionality of the data
+/// * `rank` - Rank of the data
+/// * `rng` - Random number generator
+///
+/// ### Returns
+///
+/// The orthonormalised matrix.
 fn random_orthonormal_basis<T>(dim: usize, rank: usize, rng: &mut StdRng) -> Mat<T>
 where
     T: Float + FromPrimitive + ComplexField,

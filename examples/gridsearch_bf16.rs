@@ -5,6 +5,7 @@ use clap::Parser;
 use commons::*;
 use faer::Mat;
 use std::collections::HashSet;
+use std::f64;
 use std::time::Instant;
 use thousands::*;
 
@@ -35,8 +36,8 @@ fn main() {
 
     println!("Querying exhaustive index...");
     let start = Instant::now();
-    let (true_neighbors, true_distances) =
-        query_exhaustive_index(query_data.as_ref(), &exhaustive_idx, cli.k, true, false).unwrap();
+    let (true_neighbors, _) =
+        query_exhaustive_index(query_data.as_ref(), &exhaustive_idx, cli.k, false, false).unwrap();
     let query_time = start.elapsed().as_secs_f64() * 1000.0;
 
     results.push(BenchmarkResultSize {
@@ -52,8 +53,8 @@ fn main() {
     // Exhaustive self-query benchmark
     println!("Self-querying exhaustive index...");
     let start = Instant::now();
-    let (true_neighbors_self, true_distances_self) =
-        query_exhaustive_self(&exhaustive_idx, cli.k, true, false).unwrap();
+    let (true_neighbors_self, _) =
+        query_exhaustive_self(&exhaustive_idx, cli.k, false, false).unwrap();
     let self_query_time = start.elapsed().as_secs_f64() * 1000.0;
 
     results.push(BenchmarkResultSize {
@@ -78,22 +79,17 @@ fn main() {
 
     println!("Querying exhaustive index (BF16 quantised)...");
     let start = Instant::now();
-    let (approx_neighbors, approx_distances) = query_exhaustive_bf16_index(
+    let (approx_neighbors, _) = query_exhaustive_bf16_index(
         query_data.as_ref(),
         &exhaustive_idx_bf16,
         cli.k,
-        true,
+        false,
         false,
     )
     .unwrap();
     let query_time = start.elapsed().as_secs_f64() * 1000.0;
 
     let recall = calculate_recall(&true_neighbors, &approx_neighbors, cli.k);
-    let dist_error = calculate_mean_distance_ratio(
-        true_distances.as_ref().unwrap(),
-        approx_distances.as_ref().unwrap(),
-        cli.k,
-    );
 
     results.push(BenchmarkResultSize {
         method: "Exhaustive-BF16 (query)".to_string(),
@@ -101,23 +97,18 @@ fn main() {
         query_time_ms: query_time,
         total_time_ms: build_time + query_time,
         recall_at_k: recall,
-        mean_dist_rat: dist_error,
+        mean_dist_rat: f64::NAN,
         index_size_mb,
     });
 
     // Exhaustive self-query benchmark
     println!("Self-querying exhaustive index (BF16 quantised)...");
     let start = Instant::now();
-    let (approx_neighbors_self, approx_distances_self) =
-        query_exhaustive_self(&exhaustive_idx, cli.k, true, false).unwrap();
+    let (approx_neighbors_self, _) =
+        query_exhaustive_self(&exhaustive_idx, cli.k, false, false).unwrap();
     let self_query_time = start.elapsed().as_secs_f64() * 1000.0;
 
     let recall = calculate_recall(&true_neighbors_self, &approx_neighbors_self, cli.k);
-    let dist_error = calculate_mean_distance_ratio(
-        true_distances_self.as_ref().unwrap(),
-        approx_distances_self.as_ref().unwrap(),
-        cli.k,
-    );
 
     results.push(BenchmarkResultSize {
         method: "Exhaustive-BF16 (self)".to_string(),
@@ -125,7 +116,7 @@ fn main() {
         query_time_ms: self_query_time,
         total_time_ms: build_time + self_query_time,
         recall_at_k: recall,
-        mean_dist_rat: dist_error,
+        mean_dist_rat: f64::NAN,
         index_size_mb,
     });
 
@@ -176,23 +167,18 @@ fn main() {
                 nlist, nprobe
             );
             let start = Instant::now();
-            let (approx_neighbors, approx_distances) = query_ivf_bf16_index(
+            let (approx_neighbors, _) = query_ivf_bf16_index(
                 query_data.as_ref(),
                 &ivf_bf16_idx,
                 cli.k,
                 Some(*nprobe),
-                true,
+                false,
                 false,
             )
             .unwrap();
             let query_time = start.elapsed().as_secs_f64() * 1000.0;
 
             let recall = calculate_recall(&true_neighbors, &approx_neighbors, cli.k);
-            let dist_error = calculate_mean_distance_ratio(
-                true_distances.as_ref().unwrap(),
-                approx_distances.as_ref().unwrap(),
-                cli.k,
-            );
 
             results.push(BenchmarkResultSize {
                 method: format!("IVF-BF16-nl{}-np{} (query)", nlist, nprobe),
@@ -200,7 +186,7 @@ fn main() {
                 query_time_ms: query_time,
                 total_time_ms: build_time + query_time,
                 recall_at_k: recall,
-                mean_dist_rat: dist_error,
+                mean_dist_rat: f64::NAN,
                 index_size_mb,
             });
         }
@@ -209,16 +195,11 @@ fn main() {
         let nprobe_self = (nlist as f32 * 2.0).sqrt() as usize;
         println!("Self-querying IVF-BF16 index (nprobe={})...", nprobe_self);
         let start = Instant::now();
-        let (approx_neighbors_self, approx_distances_self) =
-            query_ivf_bf16_self(&ivf_bf16_idx, cli.k, Some(nprobe_self), true, false).unwrap();
+        let (approx_neighbors_self, _) =
+            query_ivf_bf16_self(&ivf_bf16_idx, cli.k, Some(nprobe_self), false, false).unwrap();
         let self_query_time = start.elapsed().as_secs_f64() * 1000.0;
 
         let recall_self = calculate_recall(&true_neighbors_self, &approx_neighbors_self, cli.k);
-        let dist_error_self = calculate_mean_distance_ratio(
-            true_distances_self.as_ref().unwrap(),
-            approx_distances_self.as_ref().unwrap(),
-            cli.k,
-        );
 
         results.push(BenchmarkResultSize {
             method: format!("IVF-BF16-nl{} (self)", nlist),
@@ -226,7 +207,7 @@ fn main() {
             query_time_ms: self_query_time,
             total_time_ms: build_time + self_query_time,
             recall_at_k: recall_self,
-            mean_dist_rat: dist_error_self,
+            mean_dist_rat: f64::NAN,
             index_size_mb,
         });
     }
