@@ -3484,7 +3484,7 @@ IVF-TQ-b4-nl316 (self)                                 3_232.44     2_686.13    
 </code></pre>
 </details>
 
-#### Quantisation (stress) data
+#### Cell embeddings data
 
 <details>
 <summary><b>Cell embedding data - 256 dimensions</b>:</summary>
