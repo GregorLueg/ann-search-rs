@@ -1432,11 +1432,9 @@ where
 
     /// Returns the size of the index in bytes
     ///
-    /// Accounts for all heap-allocated data structures.
-    ///
     /// ### Returns
     ///
-    /// Total memory usage in bytes
+    /// Index size `in n bytes`
     pub fn memory_usage_bytes(&self) -> usize {
         std::mem::size_of_val(self)
             + self.vectors_flat.capacity() * std::mem::size_of::<T>()

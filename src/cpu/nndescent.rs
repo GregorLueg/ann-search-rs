@@ -1253,7 +1253,11 @@ where
         }
     }
 
-    /// Total heap memory used by the index, in bytes.
+    /// Returns the size of the index in bytes
+    ///
+    /// ### Returns
+    ///
+    /// Index size `in n bytes`
     pub fn memory_usage_bytes(&self) -> usize {
         let mut total = std::mem::size_of_val(self);
 

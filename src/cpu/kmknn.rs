@@ -174,7 +174,7 @@ where
         let (training_data, _) = sample_vectors(&vectors_flat, dim, n, n_train, seed);
 
         if verbose {
-            println!("  Building kMkNN index with {} clusters.", nlist);
+            println!("Building kMkNN index with {} clusters.", nlist);
         }
 
         // always Euclidean internally
@@ -457,6 +457,10 @@ where
     }
 
     /// Returns the size of the index in bytes
+    ///
+    /// ### Returns
+    ///
+    /// Index size `in n bytes`
     pub fn memory_usage_bytes(&self) -> usize {
         std::mem::size_of_val(self)
             + self.vectors_flat.capacity() * std::mem::size_of::<T>()

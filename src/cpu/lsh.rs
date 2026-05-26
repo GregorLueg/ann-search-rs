@@ -447,7 +447,7 @@ where
     ///
     /// ### Returns
     ///
-    /// Number of bytes used by the index
+    /// Index size `in n bytes`
     pub fn memory_usage_bytes(&self) -> usize {
         let mut total = std::mem::size_of_val(self);
 
