@@ -505,6 +505,8 @@ where
         let vec_size = LINE_SIZE;
         let dim_lines = self.dim_padded / vec_size;
 
+        let safe_worksize_y = pick_wg_y(self.dim_padded)?;
+
         let query_norms = if self.metric == Dist::Cosine {
             (0..n_queries)
                 .into_par_iter()
@@ -532,14 +534,14 @@ where
 
         let centroid_dists_gpu = GpuTensor::<R, T>::empty(vec![n_queries, self.nlist], client);
         let grid_x = (self.nlist as u32).div_ceil(WORKGROUP_SIZE_X);
-        let (grid_y, grid_z) = grid_2d((n_queries as u32).div_ceil(WORKGROUP_SIZE_Y));
+        let (grid_y, grid_z) = grid_2d((n_queries as u32).div_ceil(safe_worksize_y));
 
         match self.metric {
             Dist::SquaredEuclidean => unsafe {
                 euclidean_tiled::launch_unchecked::<T, R>(
                     client,
                     CubeCount::Static(grid_x, grid_y, grid_z),
-                    CubeDim::new_2d(WORKGROUP_SIZE_X, WORKGROUP_SIZE_Y),
+                    CubeDim::new_2d(WORKGROUP_SIZE_X, safe_worksize_y),
                     vec_size,
                     queries_gpu.clone().into_tensor_arg(),
                     self.centroids_gpu.clone().into_tensor_arg(),
@@ -549,13 +551,14 @@ where
                     n_queries as u32,
                     self.nlist as u32,
                     dim_lines,
+                    safe_worksize_y,
                 );
             },
             Dist::Cosine => unsafe {
                 cosine_tiled::launch_unchecked::<T, R>(
                     client,
                     CubeCount::Static(grid_x, grid_y, grid_z),
-                    CubeDim::new_2d(WORKGROUP_SIZE_X, WORKGROUP_SIZE_Y),
+                    CubeDim::new_2d(WORKGROUP_SIZE_X, safe_worksize_y),
                     vec_size,
                     queries_gpu.clone().into_tensor_arg(),
                     self.centroids_gpu.clone().into_tensor_arg(),
@@ -571,6 +574,7 @@ where
                     n_queries as u32,
                     self.nlist as u32,
                     dim_lines,
+                    safe_worksize_y,
                 );
             },
             Dist::Manhattan => unreachable!(),
@@ -657,14 +661,14 @@ where
             GpuTensor::<R, u32>::from_slice(&task_db_count, vec![n_tasks], client);
 
         let mega_grid_x = max_db_count.div_ceil(WORKGROUP_SIZE_X).max(1);
-        let (mega_grid_y, mega_grid_z) = grid_2d((n_tasks as u32).div_ceil(WORKGROUP_SIZE_Y));
+        let (mega_grid_y, mega_grid_z) = grid_2d((n_tasks as u32).div_ceil(safe_worksize_y));
 
         match self.metric {
             Dist::SquaredEuclidean => unsafe {
                 compute_ivf_mega_euclidean_cached::launch_unchecked::<T, R>(
                     client,
                     CubeCount::Static(mega_grid_x, mega_grid_y, mega_grid_z),
-                    CubeDim::new_2d(WORKGROUP_SIZE_X, WORKGROUP_SIZE_Y),
+                    CubeDim::new_2d(WORKGROUP_SIZE_X, safe_worksize_y),
                     vec_size,
                     queries_gpu.clone().into_tensor_arg(),
                     self.vectors_gpu.clone().into_tensor_arg(),
@@ -676,13 +680,14 @@ where
                     candidate_indices_gpu.clone().into_tensor_arg(),
                     n_tasks as u32,
                     dim_lines,
+                    safe_worksize_y,
                 );
             },
             Dist::Cosine => unsafe {
                 compute_ivf_mega_cosine_cached::launch_unchecked::<T, R>(
                     client,
                     CubeCount::Static(mega_grid_x, mega_grid_y, mega_grid_z),
-                    CubeDim::new_2d(WORKGROUP_SIZE_X, WORKGROUP_SIZE_Y),
+                    CubeDim::new_2d(WORKGROUP_SIZE_X, safe_worksize_y),
                     vec_size,
                     queries_gpu.clone().into_tensor_arg(),
                     self.vectors_gpu.clone().into_tensor_arg(),
@@ -696,6 +701,7 @@ where
                     candidate_indices_gpu.clone().into_tensor_arg(),
                     n_tasks as u32,
                     dim_lines,
+                    safe_worksize_y,
                 );
             },
             Dist::Manhattan => unreachable!(),

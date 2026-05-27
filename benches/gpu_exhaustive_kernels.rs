@@ -82,13 +82,13 @@ impl<R: Runtime> Benchmark for DistanceBench<R> {
         let vec_size = LINE_SIZE;
 
         let grid_x = (ndb as u32).div_ceil(WORKGROUP_SIZE_X);
-        let grid_y = (nq as u32).div_ceil(WORKGROUP_SIZE_Y);
+        let grid_y = (nq as u32).div_ceil(4);
 
         unsafe {
             euclidean_tiled::launch_unchecked::<f32, R>(
                 &self.client,
                 CubeCount::Static(grid_x, grid_y, 1),
-                CubeDim::new_2d(WORKGROUP_SIZE_X, WORKGROUP_SIZE_Y),
+                CubeDim::new_2d(WORKGROUP_SIZE_X, 4),
                 vec_size,
                 input.query_gpu.into_tensor_arg(),
                 input.db_gpu.into_tensor_arg(),
@@ -98,6 +98,7 @@ impl<R: Runtime> Benchmark for DistanceBench<R> {
                 nq as u32,
                 ndb as u32,
                 dim_lines,
+                4,
             );
         }
 
@@ -159,14 +160,15 @@ impl<R: Runtime> Benchmark for TopkBench<R> {
         let topk_indices = GpuTensor::<R, u32>::empty(vec![nq, k], &self.client);
 
         let init_gx = (k as u32).div_ceil(WORKGROUP_SIZE_X);
-        let init_gy = (nq as u32).div_ceil(WORKGROUP_SIZE_Y);
+        let init_gy = (nq as u32).div_ceil(4);
         unsafe {
             init_topk::launch_unchecked::<f32, R>(
                 &self.client,
                 CubeCount::Static(init_gx, init_gy, 1),
-                CubeDim::new_2d(WORKGROUP_SIZE_X, WORKGROUP_SIZE_Y),
+                CubeDim::new_2d(WORKGROUP_SIZE_X, 4),
                 topk_dists.clone().into_tensor_arg(),
                 topk_indices.clone().into_tensor_arg(),
+                4,
             );
         }
         future::block_on(self.client.sync()).expect("sync failed");
@@ -312,14 +314,15 @@ impl<R: Runtime> Benchmark for TopkCoalescedBench<R> {
         let topk_indices = GpuTensor::<R, u32>::empty(vec![nq, k], &self.client);
 
         let init_gx = (k as u32).div_ceil(WORKGROUP_SIZE_X);
-        let init_gy = (nq as u32).div_ceil(WORKGROUP_SIZE_Y);
+        let init_gy = (nq as u32).div_ceil(4);
         unsafe {
             init_topk::launch_unchecked::<f32, R>(
                 &self.client,
                 CubeCount::Static(init_gx, init_gy, 1),
-                CubeDim::new_2d(WORKGROUP_SIZE_X, WORKGROUP_SIZE_Y),
+                CubeDim::new_2d(WORKGROUP_SIZE_X, 4),
                 topk_dists.clone().into_tensor_arg(),
                 topk_indices.clone().into_tensor_arg(),
+                4,
             );
         }
         future::block_on(self.client.sync()).expect("sync failed");

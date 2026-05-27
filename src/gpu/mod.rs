@@ -10,6 +10,8 @@ pub mod nndescent_gpu;
 pub mod tensor;
 pub mod traits_gpu;
 
+use crate::prelude::*;
+
 ///////////
 // Const //
 ///////////
@@ -22,9 +24,6 @@ pub const DB_CHUNK_SIZE: usize = 16_384;
 
 /// Work group size in the cubecl cube (X)
 pub const WORKGROUP_SIZE_X: u32 = 32;
-
-/// Work group size in the cubecl cube (Y)
-pub const WORKGROUP_SIZE_Y: u32 = 32;
 
 /// Line size for vectorisations in this crate
 pub const LINE_SIZE: usize = 4;
@@ -73,4 +72,37 @@ pub fn pad_vectors<T: num_traits::Float>(
         dst.copy_from_slice(src);
     }
     padded
+}
+
+/// Pick the largest workgroup Y size that fits within the per-workgroup
+/// shared memory budget for the IVF/exhaustive distance kernels.
+///
+/// Targets a 32 KiB device budget with roughly 2x headroom. Worst-case
+/// footprint is the cosine cached kernel:
+///   smem_bytes = wg_y * (4 * dim + 20)   (f32)
+/// where `4 * dim` is `s_query`, the constant 20 is four u32 task-metadata
+/// arrays plus `s_query_norms` (each contributes `wg_y` slots).
+///
+/// ### Params
+///
+/// * `dim_padded` - Padded embedding dimensionality (multiple of LINE_SIZE)
+///
+/// ### Returns
+///
+/// Chosen workgroup Y size, or `DimensionNotSupported` if `dim_padded`
+/// exceeds the largest dim covered by the table.
+pub fn pick_wg_y(dim_padded: usize) -> Result<u32, AnnSearchErrors> {
+    let wg_y = match dim_padded {
+        0..=128 => 32,
+        129..=256 => 16,
+        257..=512 => 8,
+        513..=1024 => 4,
+        1025..=2048 => 2,
+        _ => {
+            return Err(AnnSearchErrors::DimTooHighForSharedMemory {
+                chosen_dim: dim_padded,
+            })
+        }
+    };
+    Ok(wg_y)
 }

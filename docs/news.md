@@ -1,11 +1,22 @@
 # News
 
+## 0.4.1
+
+**Features**
+
+- Faster convergence criterium for k-means iterations.
+
+**Fixes**
+
+- Collapse of performance of the GPU indices when reaching higher
+  dimensionalities with `SharedMemory::new()`.
+
 ## 0.4.0
 
 **Features**
 
 - Version bump on cubecl to `"0.10.0"`. This might introduce *breaking* changes
-  if you are using the package in
+  if you are using the package with older versions of cubecl.
 - More and improved error handling across the board.
 - TurboQuantisation with exhaustive and IVF index implemented.
 - Better benchmarking with an cell embedding-like benchmark.

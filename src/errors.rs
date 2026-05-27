@@ -132,4 +132,12 @@ pub enum AnnSearchErrors {
     #[cfg(feature = "gpu")]
     #[error("Error from the cubecl runtime: {0}")]
     CubeClServerError(#[from] ServerError),
+
+    /// Error for too high dimensional data that will cause degenerate SharedMemory
+    #[cfg(feature = "gpu")]
+    #[error("Dimensions above 2048 (chosen: {chosen_dim}) is not supported due to constrained in safe SharedMemory on modern GPUs")]
+    DimTooHighForSharedMemory {
+        /// The chosen dimensionality
+        chosen_dim: usize,
+    },
 }
