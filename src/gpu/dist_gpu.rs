@@ -66,6 +66,7 @@ impl<'a, T> BatchData<'a, T> {
 /// * `n_queries` - Total number of query vectors
 /// * `dist_stride` - Column stride of the output distance matrix
 /// * `dim_lines` - Number of `Vector<F, N>` elements per vector row (comptime)
+/// * `size_y` - Safe workgroup size Y for the given dimensionality
 ///
 /// ### Grid mapping
 ///
@@ -81,15 +82,15 @@ pub fn euclidean_tiled<F: Float, N: Size>(
     n_queries: u32,
     dist_stride: u32,
     #[comptime] dim_lines: usize,
+    #[comptime] size_y: u32,
 ) {
     let lanes = LINE_SIZE;
     let db_idx = ABSOLUTE_POS_X as usize;
-    let query_idx =
-        ((CUBE_POS_Z * CUBE_COUNT_Y + CUBE_POS_Y) * WORKGROUP_SIZE_Y + UNIT_POS_Y) as usize;
+    let query_idx = ((CUBE_POS_Z * CUBE_COUNT_Y + CUBE_POS_Y) * size_y + UNIT_POS_Y) as usize;
     let local_y = UNIT_POS_Y as usize;
     let local_x = UNIT_POS_X as usize;
     let dim_scalars = dim_lines * lanes;
-    let wg_y = WORKGROUP_SIZE_Y as usize;
+    let wg_y = size_y as usize;
     // Scalar shared memory only (vectorised shared mem silently broadcasts lane 0)
     let mut s_query = SharedMemory::<F>::new(wg_y * dim_scalars);
     // Cooperative load: all threads in the workgroup fill the query tile
@@ -148,6 +149,7 @@ pub fn euclidean_tiled<F: Float, N: Size>(
 /// * `n_queries` - Total number of query vectors
 /// * `dist_stride` - Column stride of the output distance matrix
 /// * `dim_lines` - Number of `Vector<F, N>` elements per vector row (comptime)
+/// * `size_y` - Safe workgroup size Y for the given dimensionality
 ///
 /// ### Grid mapping
 ///
@@ -165,15 +167,15 @@ pub fn cosine_tiled<F: Float, N: Size>(
     n_queries: u32,
     dist_stride: u32,
     #[comptime] dim_lines: usize,
+    #[comptime] size_y: u32,
 ) {
     let lanes = LINE_SIZE;
     let db_idx = ABSOLUTE_POS_X as usize;
-    let query_idx =
-        ((CUBE_POS_Z * CUBE_COUNT_Y + CUBE_POS_Y) * WORKGROUP_SIZE_Y + UNIT_POS_Y) as usize;
+    let query_idx = ((CUBE_POS_Z * CUBE_COUNT_Y + CUBE_POS_Y) * size_y + UNIT_POS_Y) as usize;
     let local_y = UNIT_POS_Y as usize;
     let local_x = UNIT_POS_X as usize;
     let dim_scalars = dim_lines * lanes;
-    let wg_y = WORKGROUP_SIZE_Y as usize;
+    let wg_y = size_y as usize;
     // Scalar shared memory only (vectorised shared mem silently broadcasts lane 0)
     let mut s_query = SharedMemory::<F>::new(wg_y * dim_scalars);
     // Cooperative load: all threads in the workgroup fill the query tile
@@ -246,10 +248,14 @@ fn prefer_coalesced_topk<R: Runtime>(client: &ComputeClient<R>) -> bool {
 ///
 /// * `ABSOLUTE_POS_X` -> k slot index
 /// * `ABSOLUTE_POS_Y` -> query index
+/// * `size_y` - Safe workgroup size Y for the given dimensionality
 #[cube(launch_unchecked)]
-pub fn init_topk<F: Float>(dists: &mut Tensor<F>, indices: &mut Tensor<u32>) {
-    let query_idx =
-        ((CUBE_POS_Z * CUBE_COUNT_Y + CUBE_POS_Y) * WORKGROUP_SIZE_Y + UNIT_POS_Y) as usize;
+pub fn init_topk<F: Float>(
+    dists: &mut Tensor<F>,
+    indices: &mut Tensor<u32>,
+    #[comptime] size_y: u32,
+) {
+    let query_idx = ((CUBE_POS_Z * CUBE_COUNT_Y + CUBE_POS_Y) * size_y + UNIT_POS_Y) as usize;
     let k_idx = ABSOLUTE_POS_X as usize;
     let k = dists.shape(1);
 
@@ -524,6 +530,7 @@ where
     let client = R::client(&device);
     let vec_size = LINE_SIZE;
     let dim_lines = dim / vec_size;
+    let safe_worksize_y = pick_wg_y(dim)?;
 
     let n_query_chunks = query_data.n.div_ceil(QUERY_CHUNK_SIZE);
     let n_db_chunks = db_data.n.div_ceil(DB_CHUNK_SIZE);
@@ -579,14 +586,15 @@ where
         let topk_indices = GpuTensor::<R, u32>::empty(vec![n_q, k], &client);
 
         let init_gx = (k as u32).div_ceil(WORKGROUP_SIZE_X);
-        let (init_gy, init_gz) = grid_2d((n_q as u32).div_ceil(WORKGROUP_SIZE_Y));
+        let (init_gy, init_gz) = grid_2d((n_q as u32).div_ceil(safe_worksize_y));
         unsafe {
             init_topk::launch_unchecked::<T, R>(
                 &client,
                 CubeCount::Static(init_gx, init_gy, init_gz),
-                CubeDim::new_2d(WORKGROUP_SIZE_X, WORKGROUP_SIZE_Y),
+                CubeDim::new_2d(WORKGROUP_SIZE_X, safe_worksize_y),
                 topk_dists.clone().into_tensor_arg(),
                 topk_indices.clone().into_tensor_arg(),
+                safe_worksize_y,
             );
         }
 
@@ -599,14 +607,14 @@ where
             let n_db = db_end - db_start;
 
             let grid_x = (n_db as u32).div_ceil(WORKGROUP_SIZE_X);
-            let (grid_y, grid_z) = grid_2d((n_q as u32).div_ceil(WORKGROUP_SIZE_Y));
+            let (grid_y, grid_z) = grid_2d((n_q as u32).div_ceil(safe_worksize_y));
 
             match *metric {
                 Dist::SquaredEuclidean => unsafe {
                     euclidean_tiled::launch_unchecked::<T, R>(
                         &client,
                         CubeCount::Static(grid_x, grid_y, grid_z),
-                        CubeDim::new_2d(WORKGROUP_SIZE_X, WORKGROUP_SIZE_Y),
+                        CubeDim::new_2d(WORKGROUP_SIZE_X, safe_worksize_y),
                         vec_size,
                         query_gpu.clone().into_tensor_arg(),
                         db_gpu.clone().into_tensor_arg(),
@@ -616,13 +624,14 @@ where
                         n_q as u32,
                         max_db_chunk as u32,
                         dim_lines,
+                        safe_worksize_y,
                     );
                 },
                 Dist::Cosine => unsafe {
                     cosine_tiled::launch_unchecked::<T, R>(
                         &client,
                         CubeCount::Static(grid_x, grid_y, grid_z),
-                        CubeDim::new_2d(WORKGROUP_SIZE_X, WORKGROUP_SIZE_Y),
+                        CubeDim::new_2d(WORKGROUP_SIZE_X, safe_worksize_y),
                         vec_size,
                         query_gpu.clone().into_tensor_arg(),
                         db_gpu.clone().into_tensor_arg(),
@@ -634,6 +643,7 @@ where
                         n_q as u32,
                         max_db_chunk as u32,
                         dim_lines,
+                        safe_worksize_y,
                     );
                 },
                 Dist::Manhattan => unreachable!(),
@@ -868,6 +878,7 @@ pub fn reduce_ivf_topk_coalesced<F: Float>(
 /// * `task_db_count` - Number of DB vectors in each task's cluster `[n_tasks]`
 /// * `out_dists` - Output candidate distances `[n_queries, max_candidates]`
 /// * `out_indices` - Output candidate DB indices `[n_queries, max_candidates]`
+/// * `size_y` - Safe workgroup size Y for the given dimensionality
 ///
 /// ### Grid mapping
 ///
@@ -883,10 +894,11 @@ pub fn compute_ivf_mega_euclidean<F: Float, N: Size>(
     task_db_count: &Tensor<u32>,
     out_dists: &mut Tensor<F>,
     out_indices: &mut Tensor<u32>,
+    #[comptime] size_y: u32,
 ) {
     let lanes = LINE_SIZE;
     let local_db_idx = ABSOLUTE_POS_X;
-    let task_idx = (CUBE_POS_Z * CUBE_COUNT_Y + CUBE_POS_Y) * WORKGROUP_SIZE_Y + UNIT_POS_Y;
+    let task_idx = (CUBE_POS_Z * CUBE_COUNT_Y + CUBE_POS_Y) * size_y + UNIT_POS_Y;
 
     if task_idx >= task_q_idx.len() as u32 {
         terminate!();
@@ -945,6 +957,7 @@ pub fn compute_ivf_mega_euclidean<F: Float, N: Size>(
 /// * `task_db_count` - Number of DB vectors in each task's cluster `[n_tasks]`
 /// * `out_dists` - Output candidate distances `[n_queries, max_candidates]`
 /// * `out_indices` - Output candidate DB indices `[n_queries, max_candidates]`
+/// * `size_y` - Safe workgroup size Y for the given dimensionality
 ///
 /// ### Grid mapping
 ///
@@ -962,10 +975,11 @@ pub fn compute_ivf_mega_cosine<F: Float, N: Size>(
     task_db_count: &Tensor<u32>,
     out_dists: &mut Tensor<F>,
     out_indices: &mut Tensor<u32>,
+    #[comptime] size_y: u32,
 ) {
     let lanes = LINE_SIZE;
     let local_db_idx = ABSOLUTE_POS_X;
-    let task_idx = (CUBE_POS_Z * CUBE_COUNT_Y + CUBE_POS_Y) * WORKGROUP_SIZE_Y + UNIT_POS_Y;
+    let task_idx = (CUBE_POS_Z * CUBE_COUNT_Y + CUBE_POS_Y) * size_y + UNIT_POS_Y;
 
     if task_idx >= task_q_idx.len() as u32 {
         terminate!();
@@ -1111,6 +1125,7 @@ pub fn reduce_ivf_topk<F: Float>(
 ///   Equal to `dim / N`. Used for all indexing into vector tensors and for
 ///   shared memory sizing. Passed as comptime to avoid reliance on tensor
 ///   metadata.
+/// * `size_y` - Safe workgroup size Y for the given dimensionality
 ///
 /// ### Grid mapping
 ///
@@ -1139,22 +1154,23 @@ pub fn compute_ivf_mega_euclidean_cached<F: Float, N: Size>(
     out_indices: &mut Tensor<u32>,
     n_tasks: u32,
     #[comptime] dim_lines: usize,
+    #[comptime] size_y: u32,
 ) {
     let lanes = LINE_SIZE;
     let local_db_idx = ABSOLUTE_POS_X;
-    let task_idx = (CUBE_POS_Z * CUBE_COUNT_Y + CUBE_POS_Y) * WORKGROUP_SIZE_Y + UNIT_POS_Y;
+    let task_idx = (CUBE_POS_Z * CUBE_COUNT_Y + CUBE_POS_Y) * size_y + UNIT_POS_Y;
     let local_y = UNIT_POS_Y as usize;
     let local_x = UNIT_POS_X as usize;
 
     let dim_scalars = dim_lines * lanes;
-    let wg_y = WORKGROUP_SIZE_Y as usize;
+    let wg_y = size_y as usize;
 
-    // ── Phase 1: Load task metadata into shared memory ──
+    let share_mem_size = size_y as usize;
 
-    let mut s_q_idx = SharedMemory::<u32>::new(32usize);
-    let mut s_db_start = SharedMemory::<u32>::new(32usize);
-    let mut s_write_offset = SharedMemory::<u32>::new(32usize);
-    let mut s_db_count = SharedMemory::<u32>::new(32usize);
+    let mut s_q_idx = SharedMemory::<u32>::new(share_mem_size);
+    let mut s_db_start = SharedMemory::<u32>::new(share_mem_size);
+    let mut s_write_offset = SharedMemory::<u32>::new(share_mem_size);
+    let mut s_db_count = SharedMemory::<u32>::new(share_mem_size);
 
     if local_x == 0usize {
         if task_idx < n_tasks {
@@ -1172,9 +1188,7 @@ pub fn compute_ivf_mega_euclidean_cached<F: Float, N: Size>(
 
     sync_cube();
 
-    // ── Phase 2: Cooperative load of query vectors into scalar smem ──
-
-    let mut s_query = SharedMemory::<F>::new(32 * dim_scalars);
+    let mut s_query = SharedMemory::<F>::new(share_mem_size * dim_scalars);
 
     let thread_id = local_y * WORKGROUP_SIZE_X as usize + local_x;
     let total_threads = WORKGROUP_SIZE_X as usize * wg_y;
@@ -1257,6 +1271,7 @@ pub fn compute_ivf_mega_euclidean_cached<F: Float, N: Size>(
 /// * `out_indices` - Output candidate DB indices `[n_queries, max_candidates]`.
 /// * `n_tasks` - Total number of tasks for bounds checking.
 /// * `dim_lines` - Number of `Vector<F, N>` elements per vector row (comptime).
+/// * `size_y` - Safe workgroup size Y for the given dimensionality
 ///
 /// ### Grid mapping
 ///
@@ -1280,23 +1295,24 @@ pub fn compute_ivf_mega_cosine_cached<F: Float, N: Size>(
     out_indices: &mut Tensor<u32>,
     n_tasks: u32,
     #[comptime] dim_lines: usize,
+    #[comptime] size_y: u32,
 ) {
     let lanes = LINE_SIZE;
     let local_db_idx = ABSOLUTE_POS_X;
-    let task_idx = (CUBE_POS_Z * CUBE_COUNT_Y + CUBE_POS_Y) * WORKGROUP_SIZE_Y + UNIT_POS_Y;
+    let task_idx = (CUBE_POS_Z * CUBE_COUNT_Y + CUBE_POS_Y) * size_y + UNIT_POS_Y;
     let local_y = UNIT_POS_Y as usize;
     let local_x = UNIT_POS_X as usize;
 
+    let share_mem_size = size_y as usize;
+
     let dim_scalars = dim_lines * lanes;
-    let wg_y = WORKGROUP_SIZE_Y as usize;
+    let wg_y = size_y as usize;
 
-    // ── Phase 1: Load task metadata + query norms into shared memory ──
-
-    let mut s_q_idx = SharedMemory::<u32>::new(32usize);
-    let mut s_db_start = SharedMemory::<u32>::new(32usize);
-    let mut s_write_offset = SharedMemory::<u32>::new(32usize);
-    let mut s_db_count = SharedMemory::<u32>::new(32usize);
-    let mut s_query_norms = SharedMemory::<F>::new(32usize);
+    let mut s_q_idx = SharedMemory::<u32>::new(share_mem_size);
+    let mut s_db_start = SharedMemory::<u32>::new(share_mem_size);
+    let mut s_write_offset = SharedMemory::<u32>::new(share_mem_size);
+    let mut s_db_count = SharedMemory::<u32>::new(share_mem_size);
+    let mut s_query_norms = SharedMemory::<F>::new(share_mem_size);
 
     if local_x == 0usize {
         if task_idx < n_tasks {
@@ -1317,9 +1333,7 @@ pub fn compute_ivf_mega_cosine_cached<F: Float, N: Size>(
 
     sync_cube();
 
-    // ── Phase 2: Cooperative load of query vectors into scalar smem ──
-
-    let mut s_query = SharedMemory::<F>::new(32 * dim_scalars);
+    let mut s_query = SharedMemory::<F>::new(share_mem_size * dim_scalars);
 
     let thread_id = local_y * WORKGROUP_SIZE_X as usize + local_x;
     let total_threads = WORKGROUP_SIZE_X as usize * wg_y;
@@ -1340,8 +1354,6 @@ pub fn compute_ivf_mega_cosine_cached<F: Float, N: Size>(
     }
 
     sync_cube();
-
-    // ── Phase 3: Bounds check and compute cosine distance ──
 
     if task_idx >= n_tasks {
         terminate!();
@@ -1822,14 +1834,15 @@ mod tests {
 
         // init_topk
         let init_gx = (k as u32).div_ceil(WORKGROUP_SIZE_X);
-        let (init_gy, init_gz) = grid_2d((n_queries as u32).div_ceil(WORKGROUP_SIZE_Y));
+        let (init_gy, init_gz) = grid_2d((n_queries as u32).div_ceil(4));
         unsafe {
             init_topk::launch_unchecked::<f32, WgpuRuntime>(
                 &client,
                 CubeCount::Static(init_gx, init_gy, init_gz),
-                CubeDim::new_2d(WORKGROUP_SIZE_X, WORKGROUP_SIZE_Y),
+                CubeDim::new_2d(WORKGROUP_SIZE_X, 4),
                 topk_d.clone().into_tensor_arg(),
                 topk_i.clone().into_tensor_arg(),
+                4,
             );
         }
 
@@ -2210,13 +2223,13 @@ mod tests {
         let out_i = GpuTensor::<WgpuRuntime, u32>::empty(vec![n_queries, max_candidates], &client);
         let max_db_count = tasks.iter().map(|t| t.3).max().unwrap_or(0);
         let gx = max_db_count.div_ceil(WORKGROUP_SIZE_X).max(1);
-        let (gy, gz) = grid_2d((n_tasks as u32).div_ceil(WORKGROUP_SIZE_Y));
+        let (gy, gz) = grid_2d((n_tasks as u32).div_ceil(4));
         if use_cached {
             unsafe {
                 compute_ivf_mega_euclidean_cached::launch_unchecked::<f32, WgpuRuntime>(
                     &client,
                     CubeCount::Static(gx, gy, gz),
-                    CubeDim::new_2d(WORKGROUP_SIZE_X, WORKGROUP_SIZE_Y),
+                    CubeDim::new_2d(WORKGROUP_SIZE_X, 4),
                     vec_size,
                     q_gpu.into_tensor_arg(),
                     db_gpu.into_tensor_arg(),
@@ -2228,6 +2241,7 @@ mod tests {
                     out_i.clone().into_tensor_arg(),
                     n_tasks as u32,
                     dim_lines,
+                    4,
                 );
             }
         } else {
@@ -2235,7 +2249,7 @@ mod tests {
                 compute_ivf_mega_euclidean::launch_unchecked::<f32, WgpuRuntime>(
                     &client,
                     CubeCount::Static(gx, gy, gz),
-                    CubeDim::new_2d(WORKGROUP_SIZE_X, WORKGROUP_SIZE_Y),
+                    CubeDim::new_2d(WORKGROUP_SIZE_X, 4),
                     vec_size,
                     q_gpu.into_tensor_arg(),
                     db_gpu.into_tensor_arg(),
@@ -2245,6 +2259,7 @@ mod tests {
                     tdc_gpu.into_tensor_arg(),
                     out_d.clone().into_tensor_arg(),
                     out_i.clone().into_tensor_arg(),
+                    4,
                 );
             }
         }

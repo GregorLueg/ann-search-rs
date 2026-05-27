@@ -238,6 +238,7 @@ fn resolve_path(
     }
 }
 
+#[derive(Debug, Clone, Copy)]
 /// K-means clustering parameters to enable tighter control over the method
 pub struct KMeansTrainingParams {
     /// Number of iterations to run the clustering algorithm for
@@ -1309,7 +1310,9 @@ fn gemm_lloyd<T>(
             .filter(|(a, b)| a != b)
             .count();
 
-        if changed == 0 {
+        let change_floor: usize = (n / 10_000).max(1);
+
+        if changed <= change_floor {
             if verbose {
                 println!("    Converged at iteration {}", iter + 1);
             }
@@ -1397,7 +1400,9 @@ fn parallel_lloyd<T>(
             .filter(|(a, b)| a != b)
             .count();
 
-        if changed == 0 {
+        let change_floor: usize = (n / 10_000).max(1);
+
+        if changed <= change_floor {
             if verbose {
                 println!("    Converged at iteration {}", iter + 1);
             }
