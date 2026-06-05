@@ -1,5 +1,12 @@
 # News
 
+## 0.4.2
+
+**Features**
+
+- Accessor in the Tensor implementation for the handle within the crate for
+  easier sharing across crates.
+
 ## 0.4.1
 
 **Features**
