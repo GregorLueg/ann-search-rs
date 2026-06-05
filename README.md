@@ -83,12 +83,12 @@ Add this to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-ann-search-rs = "0.4.0"
+ann-search-rs = "0.4.2"
 ```
 
 ### Note
 
-With version `"0.4.0"` some breaking API changes were introduced: this harmonise
+With version `"0.4.2"` some breaking API changes were introduced: this harmonise
 several of the functions and avoid panics in favour of errors. A key change
 was also the update to cubecl `"0.1.0"` which changes quite a few APIs for the
 GPU-accelerated version.
@@ -294,7 +294,7 @@ If you wish to use these, please add the `"quantised"` feature:
 
 ```toml
 [dependencies]
-ann-search-rs = { version = "0.4.0", features = ["quantised"] }
+ann-search-rs = { version = "0.4.2", features = ["quantised"] }
 ```
 
 ## GPU
@@ -311,7 +311,7 @@ To unlock GPU-acceleration, please use:
 
 ```toml
 [dependencies]
-ann-search-rs = { version = "0.4.0", features = ["gpu"] }
+ann-search-rs = { version = "0.4.2", features = ["gpu"] }
 ```
 
 ## Binarised indices
@@ -333,7 +333,7 @@ can drastically improve the Recall. To enable the feature, please use:
 
 ```toml
 [dependencies]
-ann-search-rs = { version = "0.4.0", features = ["binary"] }
+ann-search-rs = { version = "0.4.2", features = ["binary"] }
 ```
 
 The benchmarks can be found [here](https://github.com/GregorLueg/ann-search-rs/blob/main/docs/benchmarks_binary.md).

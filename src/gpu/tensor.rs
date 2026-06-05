@@ -126,6 +126,15 @@ impl<R: Runtime, F: Numeric + CubeElement> GpuTensor<R, F> {
     pub fn vram_bytes(&self) -> usize {
         self.shape.iter().product::<usize>() * std::mem::size_of::<F>()
     }
+
+    /// Return the handle of the tensor
+    ///
+    /// ### Returns
+    ///
+    /// A reference to [Handle]
+    pub fn handle(&self) -> &Handle {
+        &self.data
+    }
 }
 
 ///////////
