@@ -4,7 +4,8 @@
 
 **Fixes**
 
-- Nasty SIMD overflow bug hitting RaBitQ at higher dimensionalities.
+- Nasty branch bug in wgpu <> metal interaction that made the NNDescent
+  iterations for the CAGRA-style ANN search not work.
 
 ## 0.4.2
 
