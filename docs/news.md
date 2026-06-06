@@ -1,5 +1,12 @@
 # News
 
+## 0.4.3
+
+**Fixes**
+
+- Nasty branch bug in wgpu <> metal interaction that made the NNDescent
+  iterations for the CAGRA-style ANN search not work.
+
 ## 0.4.2
 
 **Features**
