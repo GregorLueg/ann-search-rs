@@ -1,5 +1,11 @@
 # News
 
+## 0.4.3
+
+**Fixes**
+
+- Nasty SIMD overflow bug hitting RaBitQ at higher dimensionalities.
+
 ## 0.4.2
 
 **Features**

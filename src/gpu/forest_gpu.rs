@@ -137,11 +137,10 @@ fn partition_points<F: AnnSearchGpuFloat>(
     let dot = dot_values[idx as usize];
     let median = medians[pid as usize];
 
-    let new_pid = if dot <= median {
-        pid * 2u32
-    } else {
-        pid * 2u32 + 1u32
-    };
+    let mut new_pid = pid * 2u32 + 1u32;
+    if dot <= median {
+        new_pid = pid * 2u32;
+    }
     partition_id[idx as usize] = new_pid;
 }
 
