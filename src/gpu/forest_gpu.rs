@@ -95,7 +95,7 @@ fn compute_dot_products<F: AnnSearchGpuFloat, N: Size>(
     }
     let lanes = LINE_SIZE;
     let off = idx as usize * dim_lines;
-    let mut sum = F::new(0.0);
+    let mut sum = F::new(0.0_f32);
     for i in 0..dim_lines {
         let v = vectors[off + i];
         let r = random_vec[i];
@@ -293,7 +293,7 @@ pub fn leaf_pairwise_proposals<F: AnnSearchGpuFloat, N: Size>(
         let pid_j = shared_pids[jj];
 
         if pid_i != pid_j && pid_i < n_pts && pid_j < n_pts {
-            let mut sum = F::new(0.0);
+            let mut sum = F::new(0.0_f32);
             let mut s = 0usize;
             while s < dim_scalars {
                 let va = shared_vecs[ii * dim_scalars + s];
@@ -308,7 +308,7 @@ pub fn leaf_pairwise_proposals<F: AnnSearchGpuFloat, N: Size>(
             }
 
             let dist = if use_cosine {
-                F::new(1.0) - (sum / (shared_norms[ii] * shared_norms[jj]))
+                F::new(1.0_f32) - (sum / (shared_norms[ii] * shared_norms[jj]))
             } else {
                 sum
             };

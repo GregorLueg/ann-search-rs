@@ -109,7 +109,7 @@ pub fn euclidean_tiled<F: Float, N: Size>(
             let line_val = query_vectors[q_global * dim_lines + line_idx];
             s_query[load_idx] = line_val[lane];
         } else {
-            s_query[load_idx] = F::new(0.0);
+            s_query[load_idx] = F::new(0.0_f32);
         }
         load_idx += total_threads;
     }
@@ -119,7 +119,7 @@ pub fn euclidean_tiled<F: Float, N: Size>(
     }
     let global_db_idx = db_start as usize + db_idx;
     let q_shared_base = local_y * dim_scalars;
-    let mut sum = F::new(0.0);
+    let mut sum = F::new(0.0_f32);
     for i in 0..dim_lines {
         let d_line = db_vectors[global_db_idx * dim_lines + i];
         let s_off = q_shared_base + i * lanes;
@@ -194,7 +194,7 @@ pub fn cosine_tiled<F: Float, N: Size>(
             let line_val = query_vectors[q_global * dim_lines + line_idx];
             s_query[load_idx] = line_val[lane];
         } else {
-            s_query[load_idx] = F::new(0.0);
+            s_query[load_idx] = F::new(0.0_f32);
         }
         load_idx += total_threads;
     }
@@ -204,7 +204,7 @@ pub fn cosine_tiled<F: Float, N: Size>(
     }
     let global_db_idx = db_start as usize + db_idx;
     let q_shared_base = local_y * dim_scalars;
-    let mut dot = F::new(0.0);
+    let mut dot = F::new(0.0_f32);
     for i in 0..dim_lines {
         let d_line = db_vectors[global_db_idx * dim_lines + i];
         let s_off = q_shared_base + i * lanes;
@@ -215,7 +215,7 @@ pub fn cosine_tiled<F: Float, N: Size>(
     }
     let q_norm = query_norms[query_idx];
     let d_norm = db_norms[global_db_idx];
-    distances[query_idx * dist_stride as usize + db_idx] = F::new(1.0) - (dot / (q_norm * d_norm));
+    distances[query_idx * dist_stride as usize + db_idx] = F::new(1.0_f32) - (dot / (q_norm * d_norm));
 }
 
 /////////////////////
@@ -907,7 +907,7 @@ pub fn compute_ivf_mega_euclidean<F: Float, N: Size>(
     let real_db_idx = db_start + local_db_idx;
     let write_pos = write_offset + local_db_idx;
 
-    let mut sum = F::new(0.0);
+    let mut sum = F::new(0.0_f32);
 
     let dim_lines = query_vectors.shape(1) / lanes;
     let q_offset = q_idx as usize * dim_lines;
@@ -988,7 +988,7 @@ pub fn compute_ivf_mega_cosine<F: Float, N: Size>(
     let real_db_idx = db_start + local_db_idx;
     let write_pos = write_offset + local_db_idx;
 
-    let mut dot = F::new(0.0);
+    let mut dot = F::new(0.0_f32);
 
     let dim_lines = query_vectors.shape(1) / lanes;
     let q_offset = q_idx as usize * dim_lines;
@@ -1009,7 +1009,7 @@ pub fn compute_ivf_mega_cosine<F: Float, N: Size>(
     let d_norm = db_norms[real_db_idx as usize];
 
     let out_offset = q_idx as usize * out_dists.stride(0) + write_pos as usize;
-    out_dists[out_offset] = F::new(1.0) - (dot / (q_norm * d_norm));
+    out_dists[out_offset] = F::new(1.0_f32) - (dot / (q_norm * d_norm));
     out_indices[out_offset] = real_db_idx;
 }
 
@@ -1230,7 +1230,7 @@ pub fn compute_ivf_mega_euclidean_cached<F: Float, N: Size>(
     let q_shared_base = local_y * dim_scalars;
     let d_offset = real_db_idx as usize * dim_lines;
 
-    let mut sum = F::new(0.0);
+    let mut sum = F::new(0.0_f32);
     for i in 0..dim_lines {
         let d_line = db_vectors[d_offset + i];
         let s_off = q_shared_base + i * lanes;
@@ -1326,7 +1326,7 @@ pub fn compute_ivf_mega_cosine_cached<F: Float, N: Size>(
     let mut ds_val = 0u32;
     let mut wo_val = 0u32;
     let mut dc_val = 0u32;
-    let mut qn_val = F::new(1.0);
+    let mut qn_val = F::new(1.0_f32);
     if task_idx < n_tasks {
         let q = task_q_idx[task_idx as usize];
         q_val = q;
@@ -1381,7 +1381,7 @@ pub fn compute_ivf_mega_cosine_cached<F: Float, N: Size>(
     let q_shared_base = local_y * dim_scalars;
     let d_offset = real_db_idx as usize * dim_lines;
 
-    let mut dot = F::new(0.0);
+    let mut dot = F::new(0.0_f32);
     for i in 0..dim_lines {
         let d_line = db_vectors[d_offset + i];
         let s_off = q_shared_base + i * lanes;
@@ -1396,7 +1396,7 @@ pub fn compute_ivf_mega_cosine_cached<F: Float, N: Size>(
 
     let q_idx = s_q_idx[local_y];
     let out_offset = q_idx as usize * out_dists.stride(0) + write_pos as usize;
-    out_dists[out_offset] = F::new(1.0) - (dot / (q_norm * d_norm));
+    out_dists[out_offset] = F::new(1.0_f32) - (dot / (q_norm * d_norm));
     out_indices[out_offset] = real_db_idx;
 }
 

@@ -214,7 +214,7 @@ fn probe_query_distance<F: Float, N: Size>(
         }
 
         // Compute distance: query (shared) vs target (global)
-        let mut sum = F::new(0.0);
+        let mut sum = F::new(0.0_f32);
         let mut s2 = 0usize;
         while s2 < dim_scalars {
             let line_idx = s2 / 4usize;
@@ -456,7 +456,7 @@ pub fn cagra_beam_search<F: Float, N: Size>(
 
     if tx == 0u32 {
         if use_cosine {
-            let mut norm_sq = F::new(0.0);
+            let mut norm_sq = F::new(0.0_f32);
             let mut s = 0usize;
             while s < dim_scalars {
                 let v = sq_vec[s];
@@ -492,7 +492,7 @@ pub fn cagra_beam_search<F: Float, N: Size>(
                 }
 
                 if is_new {
-                    let mut sum = F::new(0.0);
+                    let mut sum = F::new(0.0_f32);
                     for li in 0..dim_lines {
                         let lv = vectors[node_id as usize * dim_lines + li];
                         let s_off = li * lanes;
@@ -510,7 +510,7 @@ pub fn cagra_beam_search<F: Float, N: Size>(
                         }
                     }
                     let dist = if use_cosine {
-                        F::new(1.0) - sum / (s_query_norm[0usize] * norms[node_id as usize])
+                        F::new(1.0_f32) - sum / (s_query_norm[0usize] * norms[node_id as usize])
                     } else {
                         sum
                     };
@@ -661,7 +661,7 @@ pub fn cagra_beam_search<F: Float, N: Size>(
             while ms < total_slots {
                 let nbr = s_nbr_idx[ms];
                 if nbr != sentinel {
-                    let mut sum = F::new(0.0);
+                    let mut sum = F::new(0.0_f32);
                     for li in 0..dim_lines {
                         let lv = vectors[nbr as usize * dim_lines + li];
                         let s_off = li * lanes;
@@ -679,7 +679,7 @@ pub fn cagra_beam_search<F: Float, N: Size>(
                         }
                     }
                     let dist = if use_cosine {
-                        F::new(1.0) - sum / (s_query_norm[0usize] * norms[nbr as usize])
+                        F::new(1.0_f32) - sum / (s_query_norm[0usize] * norms[nbr as usize])
                     } else {
                         sum
                     };
