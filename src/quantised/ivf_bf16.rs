@@ -295,13 +295,15 @@ where
             T::one()
         };
 
-        // 1. find the top `nprobe` centroids
-        let cluster_dists: Vec<(T, usize)> = self.get_centroids_dist(query_vec, query_norm, nprobe);
+        // 1. find the top `nprobe` centroids, expanding to cover >= k reachable.
+        let mut cluster_dists: Vec<(T, usize)> =
+            self.get_centroids_dist(query_vec, query_norm, nprobe);
+        let probed = select_probed_clusters(&mut cluster_dists, &self.offsets, nprobe, k);
 
         // 2. search only those clusters in the CSR layout
         let mut buffer = SortedBuffer::with_capacity(k);
 
-        for &(_, cluster_idx) in cluster_dists.iter().take(nprobe) {
+        for cluster_idx in probed {
             let start = self.offsets[cluster_idx];
             let end = self.offsets[cluster_idx + 1];
 
@@ -461,14 +463,15 @@ where
             T::from_f32(1.0).unwrap()
         };
 
-        // 1. find the top `nprobe` centroids
-        let cluster_dists: Vec<(_, usize)> =
+        // 1. find the top `nprobe` centroids, expanding to cover >= k reachable.
+        let mut cluster_dists: Vec<(_, usize)> =
             self.get_centroids_dist(&query_vec_t, query_norm, nprobe);
+        let probed = select_probed_clusters(&mut cluster_dists, &self.offsets, nprobe, k);
 
         // 2. search only those clusters in the CSR layout
         let mut buffer = SortedBuffer::with_capacity(k);
 
-        for &(_, cluster_idx) in cluster_dists.iter().take(nprobe) {
+        for cluster_idx in probed {
             let start = self.offsets[cluster_idx];
             let end = self.offsets[cluster_idx + 1];
 
@@ -744,5 +747,27 @@ mod tests {
 
         assert!(indices1.len() <= 10);
         assert!(indices2.len() <= 10);
+    }
+
+    #[test]
+    fn test_ivf_bf16_expands_nprobe_when_probed_cells_underfill_k() {
+        // 500 vectors across 100 cells - avg 5 per cell. nprobe=1 cannot
+        // reach k=25; auto-expansion must walk more cells.
+        let data = create_test_data::<f32>(500, 32);
+        let index = IvfIndexBf16::build(
+            data.as_ref(),
+            Dist::SquaredEuclidean,
+            Some(100),
+            get_default_k_means(),
+            42,
+            false,
+        )
+        .unwrap();
+
+        let query: Vec<f32> = (0..32).map(|i| i as f32 * 0.1).collect();
+        let (indices, distances) = index.query(&query, 25, Some(1)).unwrap();
+
+        assert_eq!(indices.len(), 25);
+        assert_eq!(distances.len(), 25);
     }
 }

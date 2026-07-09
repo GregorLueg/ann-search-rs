@@ -477,13 +477,15 @@ where
             T::one()
         };
 
-        // 1. Find nprobe nearest centroids using float distance
-        let cluster_dists = self.get_centroids_dist(query_vec, query_norm, nprobe);
+        // 1. Find nprobe nearest centroids using float distance, expanding to
+        //    cover >= k reachable vectors so the query never short-returns.
+        let mut cluster_dists = self.get_centroids_dist(query_vec, query_norm, nprobe);
+        let probed = select_probed_clusters(&mut cluster_dists, &self.offsets, nprobe, k);
 
         // 2. Search clusters using Hamming distance
         let mut heap: BinaryHeap<(u32, usize)> = BinaryHeap::with_capacity(k + 1);
 
-        for &(_, cluster_idx) in cluster_dists.iter().take(nprobe) {
+        for cluster_idx in probed {
             let start = self.offsets[cluster_idx];
             let end = self.offsets[cluster_idx + 1];
 
@@ -1250,5 +1252,29 @@ mod tests {
         let (indices, _) = index.query(&query, 10, None).unwrap();
 
         assert!(indices.len() <= 10);
+    }
+
+    #[test]
+    fn test_query_expands_nprobe_when_probed_cells_underfill_k() {
+        // 200 vectors across 40 cells - avg 5 per cell. nprobe=1 alone cannot
+        // reach k=25; expansion must walk further cells.
+        let data = create_test_data::<f32>(200, 32);
+        let index = IvfIndexBinary::build(
+            data.as_ref(),
+            "random",
+            64,
+            Dist::Cosine,
+            Some(40),
+            get_default_k_means(),
+            42,
+            false,
+        )
+        .unwrap();
+
+        let query: Vec<f32> = (0..32).map(|i| i as f32 * 0.1).collect();
+        let (indices, distances) = index.query(&query, 25, Some(1)).unwrap();
+
+        assert_eq!(indices.len(), 25);
+        assert_eq!(distances.len(), 25);
     }
 }

@@ -2225,6 +2225,54 @@ pub fn build_csr_layout(
     (all_indices, offsets)
 }
 
+/// Pick IVF cells to probe such that we reach at least `k` reachable vectors.
+///
+/// User-supplied `nprobe` is treated as a floor, never a ceiling: the returned
+/// list always contains at least `nprobe` cells (clamped by `nlist`) AND enough
+/// cells to cover `k` vectors when possible. Empty cells are included by rank
+/// but naturally contribute nothing to the running total, so the walk keeps
+/// going until enough non-empty candidates are reachable.
+///
+/// Without this, IVF queries silently return fewer than `k` neighbours when
+/// the top-`nprobe` cells (or the top-1 landing on an empty cell) don't hold
+/// enough vectors. Small datasets are the usual trigger.
+///
+/// Sorts `cluster_dists` ascending by distance in place.
+///
+/// ### Params
+///
+/// * `cluster_dists` - `(dist, cluster_id)` pairs for every cell in the index
+/// * `offsets` - CSR offsets: cell `c` holds `offsets[c+1] - offsets[c]` vectors
+/// * `nprobe` - Requested number of cells (floor)
+/// * `k` - Required number of reachable vectors
+///
+/// ### Returns
+///
+/// Cell ids in ascending-distance order, capped at `nlist`
+pub fn select_probed_clusters<T>(
+    cluster_dists: &mut [(T, usize)],
+    offsets: &[usize],
+    nprobe: usize,
+    k: usize,
+) -> Vec<usize>
+where
+    T: PartialOrd,
+{
+    cluster_dists
+        .sort_unstable_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+
+    let mut chosen = Vec::with_capacity(nprobe.max(1).min(cluster_dists.len()));
+    let mut reachable = 0usize;
+    for &(_, c) in cluster_dists.iter() {
+        chosen.push(c);
+        reachable += offsets[c + 1] - offsets[c];
+        if chosen.len() >= nprobe && reachable >= k {
+            break;
+        }
+    }
+    chosen
+}
+
 /// Sample random vectors from dataset
 ///
 /// Randomly shuffles indices and selects first n_sample vectors for
@@ -2344,6 +2392,49 @@ mod tests {
         assert_eq!(offsets, vec![0, 2, 2, 3]);
         // Cluster 1 is empty
         assert_eq!(offsets[2] - offsets[1], 0);
+    }
+
+    #[test]
+    fn test_select_probed_clusters_respects_nprobe_floor() {
+        // 4 cells of size 5 each; nprobe=3, k=2 -> return 3 cells even though
+        // 1 would already cover k.
+        let mut dists = vec![(0.5f32, 0), (0.1, 1), (0.9, 2), (0.3, 3)];
+        let offsets = vec![0, 5, 10, 15, 20];
+        let chosen = select_probed_clusters(&mut dists, &offsets, 3, 2);
+        assert_eq!(chosen.len(), 3);
+        // Ascending distance order: 1 (0.1), 3 (0.3), 0 (0.5)
+        assert_eq!(chosen, vec![1, 3, 0]);
+    }
+
+    #[test]
+    fn test_select_probed_clusters_expands_to_reach_k() {
+        // 4 tiny cells of size 2 each; nprobe=1, k=5 -> must expand to 3 cells.
+        let mut dists = vec![(0.5f32, 0), (0.1, 1), (0.9, 2), (0.3, 3)];
+        let offsets = vec![0, 2, 4, 6, 8];
+        let chosen = select_probed_clusters(&mut dists, &offsets, 1, 5);
+        assert_eq!(chosen.len(), 3);
+        assert_eq!(chosen, vec![1, 3, 0]);
+    }
+
+    #[test]
+    fn test_select_probed_clusters_skips_empty_cells() {
+        // Nearest cell is empty; expansion should walk past it.
+        let mut dists = vec![(0.1f32, 0), (0.5, 1), (0.9, 2)];
+        let offsets = vec![0, 0, 3, 6]; // cell 0 empty, cell 1 size 3, cell 2 size 3
+        let chosen = select_probed_clusters(&mut dists, &offsets, 1, 2);
+        // nprobe=1 satisfied by cell 0, but reachable=0 forces expansion to
+        // cell 1 (size 3) which pushes reachable to 3 >= k=2.
+        assert_eq!(chosen, vec![0, 1]);
+    }
+
+    #[test]
+    fn test_select_probed_clusters_caps_at_nlist() {
+        // k larger than the whole index -> return every cell, in order.
+        let mut dists = vec![(0.5f32, 0), (0.1, 1), (0.9, 2)];
+        let offsets = vec![0, 2, 4, 6];
+        let chosen = select_probed_clusters(&mut dists, &offsets, 1, 1000);
+        assert_eq!(chosen.len(), 3);
+        assert_eq!(chosen, vec![1, 0, 2]);
     }
 
     #[test]
