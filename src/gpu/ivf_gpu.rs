@@ -582,6 +582,10 @@ where
 
         let centroid_dists = centroid_dists_gpu.read(client)?;
 
+        // Per-query top-nprobe selection on CPU, expanded until reachable >= k.
+        // The downstream mega-kernel already handles ragged per-query candidate
+        // counts (see `cpu_write_pointers` / `max_candidates`), so variable
+        // probe-list lengths cost us nothing extra there.
         let probe_lists: Vec<Vec<usize>> = (0..n_queries)
             .into_par_iter()
             .map(|q| {
@@ -589,21 +593,12 @@ where
                 let mut cluster_dists: Vec<(T, usize)> = (0..self.nlist)
                     .map(|c| (centroid_dists[row_start + c], c))
                     .collect();
-
-                if nprobe < self.nlist {
-                    cluster_dists.select_nth_unstable_by(nprobe, |a, b| {
-                        a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal)
-                    });
-                    cluster_dists[..nprobe].sort_unstable_by(|a, b| {
-                        a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal)
-                    });
-                } else {
-                    cluster_dists.sort_unstable_by(|a, b| {
-                        a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal)
-                    });
-                }
-
-                cluster_dists[..nprobe].iter().map(|&(_, c)| c).collect()
+                select_probed_clusters(
+                    &mut cluster_dists,
+                    &self.cluster_offsets,
+                    nprobe,
+                    k,
+                )
             })
             .collect();
 
@@ -948,6 +943,34 @@ mod tests {
         assert_eq!(indices.len(), 2);
         assert_eq!(indices[0].len(), 3);
         assert!(distances[0][0] >= 0.0);
+    }
+
+    #[test]
+    fn test_ivf_gpu_expands_nprobe_when_probed_cells_underfill_k() {
+        // 50 vectors across 20 cells -> avg ~2 per cell. nprobe=1 alone cannot
+        // reach k=10; the per-query CPU-side selection must expand.
+        let device = CpuDevice;
+
+        let data = Mat::from_fn(50, 4, |i, j| ((i + j) as f32) / 10.0);
+        let index = IvfIndexGpu::<f32, CpuRuntime>::build(
+            data.as_ref(),
+            Dist::SquaredEuclidean,
+            Some(20),
+            get_default_k_means(),
+            42,
+            false,
+            device,
+        )
+        .unwrap();
+
+        let query = Mat::from_fn(1, 4, |_, _| 0.0_f32);
+        let (indices, distances) = index
+            .query_batch(query.as_ref(), 10, Some(1), None, false)
+            .unwrap();
+
+        assert_eq!(indices.len(), 1);
+        assert_eq!(indices[0].len(), 10);
+        assert_eq!(distances[0].len(), 10);
     }
 
     #[test]

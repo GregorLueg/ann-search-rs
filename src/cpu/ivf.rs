@@ -290,13 +290,17 @@ where
             T::one()
         };
 
-        // 1. find the top `nprobe` centroids
-        let cluster_dists: Vec<(T, usize)> = self.get_centroids_dist(query_vec, query_norm, nprobe);
+        // 1. find the top `nprobe` centroids, expanding to guarantee >= k
+        //    reachable vectors so short-returning is impossible whenever the
+        //    index itself holds >= k vectors.
+        let mut cluster_dists: Vec<(T, usize)> =
+            self.get_centroids_dist(query_vec, query_norm, nprobe);
+        let probed = select_probed_clusters(&mut cluster_dists, &self.offsets, nprobe, k);
 
         // 2. search only those clusters in the CSR layout
         let mut buffer = SortedBuffer::with_capacity(k);
 
-        for &(_, cluster_idx) in cluster_dists.iter().take(nprobe) {
+        for cluster_idx in probed {
             let start = self.offsets[cluster_idx];
             let end = self.offsets[cluster_idx + 1];
 
@@ -746,6 +750,35 @@ mod tests {
         }
         if indices.len() >= 3 {
             assert_relative_eq!(distances[2], 1.0, epsilon = 1e-5);
+        }
+    }
+
+    #[test]
+    fn test_ivf_query_returns_full_k_when_nprobe_underfills() {
+        // 5 distinct points, one cluster each. nprobe=1 lands on a single
+        // singleton cluster. Without the auto-expansion the query would only
+        // return 1 result even though k=3 was requested.
+        let data = create_simple_matrix();
+        let index = IvfIndex::build(
+            data.as_ref(),
+            Dist::SquaredEuclidean,
+            Some(5),
+            None,
+            42,
+            false,
+        )
+        .unwrap();
+
+        let query = vec![1.0, 0.0, 0.0];
+        let (indices, distances) = index.query(&query, 3, Some(1)).unwrap();
+
+        assert_eq!(indices.len(), 3, "expected auto-expanded nprobe to reach k");
+        assert_eq!(distances.len(), 3);
+        // Nearest is the query point itself.
+        assert_eq!(indices[0], 0);
+        // Distances must remain sorted ascending after expansion.
+        for w in distances.windows(2) {
+            assert!(w[1] >= w[0]);
         }
     }
 
