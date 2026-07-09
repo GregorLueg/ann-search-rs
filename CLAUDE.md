@@ -1,0 +1,129 @@
+# CLAUDE.md
+
+This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+
+## Crate
+
+`ann-search-rs`: approximate nearest-neighbour / vector-search algorithms in Rust, focused on high in-memory performance for single-cell and computational-biology workloads. Library crate only, no binaries. Public API is a set of `build_*_index` / `query_*_index` / `query_*_self` free functions in `src/lib.rs` that thinly wrap the per-algorithm structs.
+
+## Commands
+
+Feature-gated modules matter. Most work requires enabling the right flag.
+
+```bash
+# Default (CPU-only) build & tests
+cargo build --release
+cargo test  --release
+
+# Full test suite matching CI (macOS/Linux)
+cargo test --release --features binary,quantised,gpu
+
+# GPU integration tests (needs a working GPU + wgpu backend)
+cargo test --release --features binary,gpu,gpu-tests,quantised
+
+# Single test
+cargo test --release --features quantised -- ivf_pq::tests::name_of_test --exact --nocapture
+
+# Gridsearch examples (one per algorithm; feature-gated ones need the flag)
+cargo run --example gridsearch_hnsw   --release
+cargo run --example gridsearch_ivf    --release -- --n-samples 500000 --dim 128 --distance cosine
+cargo run --example gridsearch_pq     --release --features quantised
+cargo run --example gridsearch_gpu    --release --features gpu
+cargo run --example gridsearch_rabitq --release --features binary
+
+# GPU kernel microbenches (CubeCL Benchmark harness, not criterion)
+cargo bench --bench gpu_ivf_kernels        --features gpu
+cargo bench --bench gpu_exhaustive_kernels --features gpu
+
+# Docs (docs.rs config enables binary + quantised + mimalloc)
+cargo doc --features binary,quantised,mimalloc --no-deps --open
+```
+
+Release profile in `Cargo.toml` sets `lto = true` and `codegen-units = 1`. Release builds are slow, but this is intentional. Do not weaken it for iteration without asking.
+
+## Features
+
+- `quantised`: BF16 / SQ8 / PQ / OPQ. Pulls in `half`.
+- `binary`: bitwise / RaBitQ / TurboQuant, optional on-disk vector store for re-ranking. Pulls in `memmap2`, `tempfile`, `bytemuck`, `statrs`.
+- `gpu`: CubeCL + wgpu backend (agnostic to Metal / Vulkan / DX12 / CPU). Pulls in `cubecl`.
+- `gpu-tests`: enables tests that require a real GPU. CI-only, combined with `gpu`.
+- `mimalloc`: swaps in `mimalloc` as the global allocator.
+
+Every code path under `src/quantised/`, `src/binary/`, `src/gpu/` is behind its cfg. When editing, keep new items behind the correct `#[cfg(feature = "...")]`. The crate must still compile with default features off.
+
+## Architecture
+
+### Layout
+
+```
+src/
+  lib.rs           # public wrapper fns; all `pub fn build_*` / `query_*` live here
+  prelude.rs       # user-facing re-exports (Dist, KMeansTrainingParams, KnnResult, ...)
+  errors.rs        # single AnnSearchErrors enum, thiserror-backed
+  utils/           # SIMD dist, heaps, k-means, tree/graph helpers, traits
+  cpu/             # CPU indices: annoy, ball_tree, exhaustive, hnsw, ivf,
+                   #              kd_forest, kmknn, lsh, nndescent, vamana
+  quantised/       # bf16/sq8/pq/opq × (exhaustive, ivf) + shared k_means & quantisers
+  binary/          # binary/rabitq/tq × (exhaustive, ivf) + binariser, vec_store, turboquant/
+  gpu/             # exhaustive_gpu, ivf_gpu, nndescent_gpu, cagra_gpu_search,
+                   # forest_gpu, tensor, dist_gpu, traits_gpu
+benches/           # GPU kernel microbenches (CubeCL Benchmark trait, not criterion)
+examples/          # gridsearch_*.rs, one per algorithm, share examples/commons/mod.rs
+docs/              # benchmark result tables (markdown) + news.md
+```
+
+### Public API shape
+
+Every index follows the same pattern in `src/lib.rs`:
+
+- `build_<name>_index(mat: MatRef<T>, ..., dist_metric: &str, ...) -> <Result<>>Index<T>`
+- `query_<name>_index(query_mat, &index, k, ..., return_dist, verbose) -> KnnOptionResult<T>` for cross-set queries.
+- `query_<name>_self(&index, k, ..., return_dist, verbose) -> KnnOptionResult<T>` for the full self-kNN graph. These use index-specific fast paths (IVF exploits Voronoi cells, HNSW walks the graph without re-entering).
+
+`KnnOptionResult<T> = Result<(Vec<Vec<usize>>, Option<Vec<Vec<T>>>), AnnSearchErrors>`. Distances are optional so callers can skip storing them when they only need indices.
+
+`dist_metric` is parsed from a string (`"euclidean"|"l2"`, `"cosine"`, `"manhattan"|"l1"`) via `parse_ann_dist`. Unknown strings print a warning and fall back to squared Euclidean rather than erroring. Preserve that behaviour unless changing it deliberately.
+
+### Data & numeric traits
+
+- Vectors are `faer::MatRef<T>` (rows = samples, cols = features). Internally, indices flatten to `Vec<T>` via `utils::matrix_to_flat` for cache-friendly access.
+- `AnnSearchFloat` (in `utils/traits.rs`) is the shared trait bound: `Float + FromPrimitive + ToPrimitive + Send + Sync + Sum + SimdDistance + ComplexField`. `f32` and `f64` both implement it, both are supported end-to-end.
+- BF16-specific ops go through the `Bf16Compatible` bound (quantised feature only).
+- GPU indices also require `AnnSearchGpuFloat` (in `gpu/traits_gpu.rs`).
+
+### Parallelism & SIMD
+
+- Queries fan out over samples using two shared helpers in `lib.rs`: `query_parallel` and `query_parallel_with_flags` (the latter tracks LSH miss rate). Both drive `rayon::into_par_iter` and centralise the verbose-progress counter. New algorithms should reuse these rather than rolling their own par-iters.
+- Distance calculations in `utils/dist.rs` use the `wide` crate for portable SIMD (`f32x4/f32x8/f64x2/f64x4`). Runtime CPU-feature dispatch happens through a `OnceLock`-cached enum, so per-call cost is negligible.
+- Prefetching helper `utils::prefetch_read` inlines `_mm_prefetch` on x86_64 and `prfm pldl1keep` inline-asm on aarch64. Anywhere you're chasing an indirection in a hot loop, keep the prefetch pattern.
+
+### Validation harness
+
+`utils::KnnValidation` is a trait for computing `Recall@k` against ground truth by running a small exhaustive search internally. Indices implement it, and the gridsearch examples rely on it. When adding a new index, wire it up too.
+
+### GPU / CubeCL specifics (`src/gpu/`)
+
+- Everything runs on CubeCL with the wgpu backend, so kernels are cross-platform (Metal/Vulkan/DX12) with a CPU fallback.
+- Constants in `gpu/mod.rs` (`QUERY_CHUNK_SIZE`, `DB_CHUNK_SIZE`, `WORKGROUP_SIZE_X`, `LINE_SIZE`) are load-bearing. Kernels assume them. Vectors are padded to a multiple of `LINE_SIZE` via `pad_vectors`.
+- `pick_wg_y(dim_padded)` picks workgroup Y dims from a shared-memory budget table (targets ~32 KiB). Dims above 2048 return `DimTooHighForSharedMemory`.
+- `grid_2d(total_cubes)` splits a flat dispatch across (x, y) to respect the 65535-per-dim wgpu limit.
+- When touching kernels, be aware of the Metal/wgpu quirk fixed in `fb03735`. Divergence between Metal and other backends is real and needs cross-backend testing.
+
+### Errors
+
+Single `AnnSearchErrors` enum in `src/errors.rs`, `thiserror`-derived. Feature-gated variants carry `#[cfg(feature = "...")]`. When adding a new failure mode, add a variant with the appropriate `#[cfg]` rather than reaching for `anyhow` or `panic!`. The `0.4.2` bump was about replacing panics with typed errors, so keep that direction.
+
+## Conventions & gotchas
+
+- British English throughout (`quantised`, `binarised`, `neighbours`, `optimised`). Match it in new code, docs, and comments.
+- `#![warn(missing_docs)]` is on at the crate root. Every `pub` item needs a doc comment. The existing style uses `### Params` / `### Returns` / `### Note` markdown sections.
+- The `#![allow(clippy::needless_range_loop)]` at the crate root is deliberate. Indexed loops are what you want in numeric kernels here, so don't rewrite them to iterators to appease clippy.
+- CubeCL version is pinned to `0.10.0`. There's a commented-out git-dep block in `Cargo.toml` for when the main branch is needed. `0.4.2` was the API break for CubeCL, keep an eye on that if the version moves again.
+- Do not add new benchmarks under `benches/` without a `harness = false` entry in `Cargo.toml`. They use the CubeCL `Benchmark` trait, not criterion's default harness.
+- Documentation-of-record for results lives in `docs/benchmarks_*.md`. `CHANGELOG.md` at the repo root tracks release-note-style changes.
+
+## What's tracked outside this file
+
+- Full user-facing docs & feature matrix: `README.md`.
+- Change history: `CHANGELOG.md`.
+- Benchmark tables per feature: `docs/benchmarks_standard.md`, `benchmarks_gpu.md`, `benchmarks_quantised.md`, `benchmarks_binary.md`.

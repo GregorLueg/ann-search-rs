@@ -1,5 +1,17 @@
 # News
 
+## 0.4.4
+
+**Features**
+
+- `CLAUDE.md` for agentic engineering.
+
+**Fixes**
+
+- Added a safeguard for not returning enough neighbours to every IVF index
+  in the crate. Enough clusters will be sampled to always return the k
+  demanded neighbours.
+
 ## 0.4.3
 
 **Fixes**

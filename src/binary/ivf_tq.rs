@@ -375,12 +375,14 @@ where
         Ok(index)
     }
 
-    /// Resolve `nprobe` and return the indices of the `nprobe` nearest cells.
+    /// Return the cell ids to probe, ascending-distance ordered.
     ///
     /// Routing uses the float centroids: the query is unit-normalised for
     /// Cosine (raw for Euclidean) to match the stored centroids, then scored
-    /// via [`CentroidDistance::get_centroids_prenorm`].
-    fn probed_clusters(&self, query_vec: &[T], nprobe: usize) -> Vec<usize> {
+    /// via [`CentroidDistance::get_centroids_prenorm`]. `nprobe` is the floor
+    /// and the walk keeps going until `>= k` reachable vectors are covered,
+    /// so the query never short-returns due to small cells.
+    fn probed_clusters(&self, query_vec: &[T], nprobe: usize, k: usize) -> Vec<usize> {
         let query_normalised: Vec<T> = match self.metric {
             Dist::Cosine => {
                 let norm = compute_l2_norm(query_vec);
@@ -394,11 +396,8 @@ where
             Dist::Manhattan => unreachable!("Manhattan rejected at construction"),
         };
 
-        self.get_centroids_prenorm(&query_normalised, nprobe)
-            .into_iter()
-            .take(nprobe)
-            .map(|(_, c)| c)
-            .collect()
+        let mut cluster_dists = self.get_centroids_prenorm(&query_normalised, nprobe);
+        select_probed_clusters(&mut cluster_dists, &self.cluster_offsets, nprobe, k)
     }
 
     /// Default `nprobe` is `sqrt(nlist)`, clamped to `nlist`.
@@ -441,7 +440,7 @@ where
             return Ok((Vec::new(), Vec::new()));
         }
 
-        let probed = self.probed_clusters(query_vec, nprobe);
+        let probed = self.probed_clusters(query_vec, nprobe, k);
 
         let eq = self.quantiser.encode_query(query_vec)?;
         let (q_rot_f32, levels_f32) = prepare_scalar_scoring(&eq, &self.quantiser.encoder);
@@ -761,7 +760,7 @@ where
                             self.dim,
                         )?);
                         qnorms[qi] = eq.query_norm.to_f32().unwrap();
-                        probed.extend(self.probed_clusters(&qrows[qi], nprobe));
+                        probed.extend(self.probed_clusters(&qrows[qi], nprobe, k_search));
                     }
 
                     let last = batch_nq - 1;
@@ -1177,6 +1176,19 @@ mod tests {
         .unwrap();
         let res = index.generate_knn(5, Some(8), Some(5), false, false);
         assert!(matches!(res, Err(AnnSearchErrors::VectorStoreNotAvailable)));
+    }
+
+    #[test]
+    fn test_query_expands_nprobe_when_probed_cells_underfill_k() {
+        // 120 vectors across 30 cells -> avg 4 per cell. nprobe=1 cannot cover
+        // k=20; expansion must walk more cells so the query fills k.
+        let data = test_data(120, 128);
+        let index =
+            IvfTurboQuant::build(data.as_ref(), Dist::Cosine, Some(30), params(), 4, 42, false)
+                .unwrap();
+        let (indices, distances) = index.query(&row(&data, 0), 20, Some(1)).unwrap();
+        assert_eq!(indices.len(), 20);
+        assert_eq!(distances.len(), 20);
     }
 
     #[test]

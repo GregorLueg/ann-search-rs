@@ -99,7 +99,7 @@ fn dist_sq_euclidean<F: Float + CubePrimitive, N: Size>(
     let lanes = LINE_SIZE;
     let off_a = a as usize * dim_lines;
     let off_b = b as usize * dim_lines;
-    let mut sum = F::new(0.0);
+    let mut sum = F::new(0.0_f32);
     for i in 0..dim_lines {
         let va = vectors[off_a + i];
         let vb = vectors[off_b + i];
@@ -140,7 +140,7 @@ fn dist_cosine<F: Float, N: Size>(
     let lanes = LINE_SIZE;
     let off_a = a as usize * dim_lines;
     let off_b = b as usize * dim_lines;
-    let mut dot = F::new(0.0);
+    let mut dot = F::new(0.0_f32);
     for i in 0..dim_lines {
         let va = vectors[off_a + i];
         let vb = vectors[off_b + i];
@@ -150,7 +150,7 @@ fn dist_cosine<F: Float, N: Size>(
             dot += prod[lane];
         }
     }
-    F::new(1.0) - dot / (norms[a as usize] * norms[b as usize])
+    F::new(1.0_f32) - dot / (norms[a as usize] * norms[b as usize])
 }
 
 /////////////
@@ -495,7 +495,7 @@ pub fn local_join_shared<F: Float, N: Size>(
         let pid_j = shared_pids[j];
 
         if (is_new_i || is_new_j) && pid_i != pid_j {
-            let mut sum = F::new(0.0);
+            let mut sum = F::new(0.0_f32);
             let mut s = 0usize;
             while s < dim_scalars {
                 let va = shared_vecs[i * dim_scalars + s];
@@ -511,7 +511,7 @@ pub fn local_join_shared<F: Float, N: Size>(
             }
 
             let dist = if use_cosine {
-                F::new(1.0) - (sum / (shared_norms[i] * shared_norms[j]))
+                F::new(1.0_f32) - (sum / (shared_norms[i] * shared_norms[j]))
             } else {
                 sum
             };
@@ -750,7 +750,7 @@ pub fn two_hop_refinement<F: Float, N: Size>(
                 }
 
                 if !is_dup {
-                    let mut sum = F::new(0.0);
+                    let mut sum = F::new(0.0_f32);
                     let mut s = 0usize;
                     while s < dim_scalars {
                         let va = shared_source[s];
@@ -769,7 +769,7 @@ pub fn two_hop_refinement<F: Float, N: Size>(
                     }
 
                     let dist = if use_cosine {
-                        F::new(1.0) - (sum / (norms[node as usize] * norms[cand_pid as usize]))
+                        F::new(1.0_f32) - (sum / (norms[node as usize] * norms[cand_pid as usize]))
                     } else {
                         sum
                     };
@@ -3407,7 +3407,7 @@ mod kernel_tests {
         sync_cube();
 
         if tx == 0u32 {
-            let mut sum = F::new(0.0);
+            let mut sum = F::new(0.0_f32);
             let mut s = 0usize;
             while s < dim_scalars {
                 let va = shared_vecs[s];
@@ -3422,7 +3422,7 @@ mod kernel_tests {
             }
 
             let dist = if use_cosine {
-                F::new(1.0) - (sum / (shared_norms[0usize] * shared_norms[1usize]))
+                F::new(1.0_f32) - (sum / (shared_norms[0usize] * shared_norms[1usize]))
             } else {
                 sum
             };
@@ -3829,7 +3829,7 @@ mod kernel_tests {
     //                 gate_pass += 1u32;
     //                 let off_i = pid_i as usize * dim_lines;
     //                 let off_j = pid_j as usize * dim_lines;
-    //                 let mut sum = F::new(0.0);
+    //                 let mut sum = F::new(0.0_f32);
     //                 let mut l = 0usize;
     //                 while l < dim_lines {
     //                     let d = vectors[off_i + l] - vectors[off_j + l];

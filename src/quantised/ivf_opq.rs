@@ -348,12 +348,13 @@ where
             .min(self.nlist);
         let k = k.min(self.n);
 
-        // Find top nprobe centroids
-        let cluster_scores: Vec<(T, usize)> = self.get_centroids_prenorm(&query_vec, nprobe);
+        // Find top nprobe centroids, expanding to cover >= k reachable vectors.
+        let mut cluster_scores: Vec<(T, usize)> = self.get_centroids_prenorm(&query_vec, nprobe);
+        let probed = select_probed_clusters(&mut cluster_scores, &self.offsets, nprobe, k);
 
         let mut heap: BinaryHeap<(OrderedFloat<T>, usize)> = BinaryHeap::with_capacity(k + 1);
 
-        for &(_, cluster_idx) in cluster_scores.iter().take(nprobe) {
+        for cluster_idx in probed {
             let lookup_tables = self.build_lookup_tables_residual(&query_vec, cluster_idx);
 
             let start = self.offsets[cluster_idx];
@@ -744,6 +745,31 @@ mod tests {
 
         assert_eq!(indices1.len(), 3);
         assert_eq!(indices2.len(), 3);
+    }
+
+    #[test]
+    fn test_query_expands_nprobe_when_probed_cells_underfill_k() {
+        // 6 vectors split into 3 cells (~2 per cell). nprobe=1 alone cannot
+        // reach k=4 - fix must walk further cells.
+        let data = create_simple_dataset();
+        let index = IvfOpqIndex::build(
+            data.as_ref(),
+            Some(3),
+            8,
+            Dist::SquaredEuclidean,
+            get_default_k_means(),
+            Some(1),
+            Some(4),
+            42,
+            false,
+        )
+        .unwrap();
+
+        let query: Vec<f32> = (0..32).map(|x| x as f32 * 0.01).collect();
+        let (indices, distances) = index.query(&query, 4, Some(1)).unwrap();
+
+        assert_eq!(indices.len(), 4);
+        assert_eq!(distances.len(), 4);
     }
 
     #[test]

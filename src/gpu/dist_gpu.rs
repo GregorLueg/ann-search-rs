@@ -109,7 +109,7 @@ pub fn euclidean_tiled<F: Float, N: Size>(
             let line_val = query_vectors[q_global * dim_lines + line_idx];
             s_query[load_idx] = line_val[lane];
         } else {
-            s_query[load_idx] = F::new(0.0);
+            s_query[load_idx] = F::new(0.0_f32);
         }
         load_idx += total_threads;
     }
@@ -119,7 +119,7 @@ pub fn euclidean_tiled<F: Float, N: Size>(
     }
     let global_db_idx = db_start as usize + db_idx;
     let q_shared_base = local_y * dim_scalars;
-    let mut sum = F::new(0.0);
+    let mut sum = F::new(0.0_f32);
     for i in 0..dim_lines {
         let d_line = db_vectors[global_db_idx * dim_lines + i];
         let s_off = q_shared_base + i * lanes;
@@ -194,7 +194,7 @@ pub fn cosine_tiled<F: Float, N: Size>(
             let line_val = query_vectors[q_global * dim_lines + line_idx];
             s_query[load_idx] = line_val[lane];
         } else {
-            s_query[load_idx] = F::new(0.0);
+            s_query[load_idx] = F::new(0.0_f32);
         }
         load_idx += total_threads;
     }
@@ -204,7 +204,7 @@ pub fn cosine_tiled<F: Float, N: Size>(
     }
     let global_db_idx = db_start as usize + db_idx;
     let q_shared_base = local_y * dim_scalars;
-    let mut dot = F::new(0.0);
+    let mut dot = F::new(0.0_f32);
     for i in 0..dim_lines {
         let d_line = db_vectors[global_db_idx * dim_lines + i];
         let s_off = q_shared_base + i * lanes;
@@ -215,7 +215,7 @@ pub fn cosine_tiled<F: Float, N: Size>(
     }
     let q_norm = query_norms[query_idx];
     let d_norm = db_norms[global_db_idx];
-    distances[query_idx * dist_stride as usize + db_idx] = F::new(1.0) - (dot / (q_norm * d_norm));
+    distances[query_idx * dist_stride as usize + db_idx] = F::new(1.0_f32) - (dot / (q_norm * d_norm));
 }
 
 /////////////////////
@@ -731,56 +731,56 @@ pub fn reduce_ivf_topk_coalesced<F: Float>(
     #[comptime] k: usize,
 ) {
     let q_idx = (CUBE_POS_Y * CUBE_COUNT_X + CUBE_POS_X) as usize;
-    let tx = UNIT_POS_X;
-    let wg = WORKGROUP_SIZE_X;
+    let tx = UNIT_POS_X as usize;
+    let wg = WORKGROUP_SIZE_X as usize;
+    let kr = k_param as usize;
 
     if q_idx >= candidate_dists.shape(0) {
         terminate!();
     }
 
-    let count = candidates_per_query[q_idx];
+    let count = candidates_per_query[q_idx] as usize;
     let in_base = q_idx * candidate_dists.stride(0);
 
     // ── Phase 1: per-thread top-k in registers ──
+    //
+    // Structural pattern mirrors `extract_topk_coalesced`: `usize` counters
+    // and comptime-unrolled `for i in 0..k` loops. cubecl 0.10 has miscompiled
+    // `while init_i < k_param` init loops and short-circuited `while a && !b`
+    // insertion searches with u32 counters on lavapipe/Vulkan, so both are
+    // avoided here even though the algorithm is unchanged.
 
     let mut local_dists = Array::<F>::new(k);
     let mut local_indices = Array::<u32>::new(k);
-
-    let mut init_i = 0u32;
-    while init_i < k_param {
-        local_dists[init_i as usize] = F::new(f32::MAX);
-        local_indices[init_i as usize] = 0u32;
-        init_i += 1u32;
+    for i in 0..k {
+        local_dists[i] = F::new(f32::MAX);
+        local_indices[i] = 0u32;
     }
 
     // Coalesced strided scan: adjacent threads read adjacent columns
-    let mut col: u32 = tx;
+    let mut col = tx;
     while col < count {
-        let dist = candidate_dists[in_base + col as usize];
+        let dist = candidate_dists[in_base + col];
 
-        if dist < local_dists[(k_param - 1u32) as usize] {
-            // Find insertion position
-            let mut pos = 0u32;
-            let mut found: bool = false;
-            while pos < k_param && !found {
-                if dist < local_dists[pos as usize] {
-                    found = true;
-                } else {
-                    pos += 1u32;
+        if dist < local_dists[kr - 1] {
+            // Full comptime-unrolled scan; guarded by `pos == kr - 1` so
+            // only the first match wins. Matches extract_topk_coalesced.
+            let mut pos = kr - 1;
+            for j in 0..k {
+                if dist < local_dists[j] && pos == kr - 1 {
+                    pos = j;
                 }
             }
 
-            // Shift right from end down to pos+1
-            if found {
-                let mut sh = k_param - 1u32;
-                while sh > pos {
-                    local_dists[sh as usize] = local_dists[(sh - 1u32) as usize];
-                    local_indices[sh as usize] = local_indices[(sh - 1u32) as usize];
-                    sh -= 1u32;
-                }
-                local_dists[pos as usize] = dist;
-                local_indices[pos as usize] = candidate_indices[in_base + col as usize];
+            let mut s = kr - 1;
+            while s > pos {
+                local_dists[s] = local_dists[s - 1];
+                local_indices[s] = local_indices[s - 1];
+                s -= 1usize;
             }
+
+            local_dists[pos] = dist;
+            local_indices[pos] = candidate_indices[in_base + col];
         }
 
         col += wg;
@@ -791,68 +791,59 @@ pub fn reduce_ivf_topk_coalesced<F: Float>(
     let mut s_dist = SharedMemory::<F>::new(32 * k);
     let mut s_idx = SharedMemory::<u32>::new(32 * k);
 
-    let s_base = tx as usize * k_param as usize;
-    let mut cp = 0u32;
-    while cp < k_param {
-        s_dist[s_base + cp as usize] = local_dists[cp as usize];
-        s_idx[s_base + cp as usize] = local_indices[cp as usize];
-        cp += 1u32;
+    let s_base = tx * kr;
+    for i in 0..k {
+        s_dist[s_base + i] = local_dists[i];
+        s_idx[s_base + i] = local_indices[i];
     }
 
     sync_cube();
 
     // Thread 0 merges all 32 sorted thread-local lists
-    if tx == 0u32 {
-        let mut t: u32 = 1u32;
+    if tx == 0usize {
+        let mut t = 1usize;
         while t < wg {
-            let t_base = t as usize * k_param as usize;
-            let mut i = 0u32;
-            let mut early_stop = false;
+            let t_base = t * kr;
+            let mut done: u32 = 0u32;
 
-            while i < k_param && !early_stop {
-                let cd = s_dist[t_base + i as usize];
-                let ci = s_idx[t_base + i as usize];
+            // Sorted per-thread list: once cd >= current worst, all remaining
+            // are worse. `done: u32` sentinel matches extract's pattern; a
+            // `bool` here miscompiles on cubecl 0.10 / lavapipe.
+            for i in 0..k {
+                if done == 0u32 {
+                    let cd = s_dist[t_base + i];
+                    let ci = s_idx[t_base + i];
 
-                // This thread's list is sorted; once we exceed the current
-                // worst in merged list, all remaining are worse
-                if cd >= s_dist[(k_param - 1u32) as usize] {
-                    early_stop = true;
-                } else {
-                    // Find insertion position in merged list [0..k_param)
-                    let mut pos = 0u32;
-                    let mut found = false;
-                    while pos < k_param && !found {
-                        if cd < s_dist[pos as usize] {
-                            found = true;
-                        } else {
-                            pos += 1u32;
+                    if cd >= s_dist[kr - 1] {
+                        done = 1u32;
+                    } else {
+                        let mut pos = kr - 1;
+                        for j in 0..k {
+                            if cd < s_dist[j] && pos == kr - 1 {
+                                pos = j;
+                            }
                         }
-                    }
 
-                    if found {
-                        let mut sh = k_param - 1u32;
-                        while sh > pos {
-                            s_dist[sh as usize] = s_dist[(sh - 1u32) as usize];
-                            s_idx[sh as usize] = s_idx[(sh - 1u32) as usize];
-                            sh -= 1u32;
+                        let mut s_i = kr - 1;
+                        while s_i > pos {
+                            s_dist[s_i] = s_dist[s_i - 1];
+                            s_idx[s_i] = s_idx[s_i - 1];
+                            s_i -= 1usize;
                         }
-                        s_dist[pos as usize] = cd;
-                        s_idx[pos as usize] = ci;
-                    }
 
-                    i += 1u32;
+                        s_dist[pos] = cd;
+                        s_idx[pos] = ci;
+                    }
                 }
             }
-            t += 1u32;
+            t += 1usize;
         }
 
         // Write final result
-        let out_base = q_idx * k_param as usize;
-        let mut w = 0u32;
-        while w < k_param {
-            out_dists[out_base + w as usize] = s_dist[w as usize];
-            out_indices[out_base + w as usize] = s_idx[w as usize];
-            w += 1u32;
+        let out_base = q_idx * kr;
+        for i in 0..k {
+            out_dists[out_base + i] = s_dist[i];
+            out_indices[out_base + i] = s_idx[i];
         }
     }
 }
@@ -916,7 +907,7 @@ pub fn compute_ivf_mega_euclidean<F: Float, N: Size>(
     let real_db_idx = db_start + local_db_idx;
     let write_pos = write_offset + local_db_idx;
 
-    let mut sum = F::new(0.0);
+    let mut sum = F::new(0.0_f32);
 
     let dim_lines = query_vectors.shape(1) / lanes;
     let q_offset = q_idx as usize * dim_lines;
@@ -997,7 +988,7 @@ pub fn compute_ivf_mega_cosine<F: Float, N: Size>(
     let real_db_idx = db_start + local_db_idx;
     let write_pos = write_offset + local_db_idx;
 
-    let mut dot = F::new(0.0);
+    let mut dot = F::new(0.0_f32);
 
     let dim_lines = query_vectors.shape(1) / lanes;
     let q_offset = q_idx as usize * dim_lines;
@@ -1018,7 +1009,7 @@ pub fn compute_ivf_mega_cosine<F: Float, N: Size>(
     let d_norm = db_norms[real_db_idx as usize];
 
     let out_offset = q_idx as usize * out_dists.stride(0) + write_pos as usize;
-    out_dists[out_offset] = F::new(1.0) - (dot / (q_norm * d_norm));
+    out_dists[out_offset] = F::new(1.0_f32) - (dot / (q_norm * d_norm));
     out_indices[out_offset] = real_db_idx;
 }
 
@@ -1172,18 +1163,31 @@ pub fn compute_ivf_mega_euclidean_cached<F: Float, N: Size>(
     let mut s_write_offset = SharedMemory::<u32>::new(share_mem_size);
     let mut s_db_count = SharedMemory::<u32>::new(share_mem_size);
 
+    // WORKAROUND: cubecl 0.10 miscompiles expression-position `if/else`
+    // with a runtime condition on wgpu/Metal and lavapipe — it always
+    // returns the else branch. Writing to shared memory in both arms of
+    // a statement-if lets the optimiser fuse the pair into per-assignment
+    // expression-ifs, which then always take the else branch (all zeros).
+    // With `s_db_count` stuck at 0 the whole workgroup terminates below
+    // and the kernel silently becomes a no-op, leaving the candidate
+    // tensors as uninitialised VRAM that the reducer treats as valid
+    // distances/indices — hence the ~1e9 OOB reorg_idx values. Compute
+    // values into locals first, then write shared memory once.
+    let mut q_val = 0u32;
+    let mut ds_val = 0u32;
+    let mut wo_val = 0u32;
+    let mut dc_val = 0u32;
+    if task_idx < n_tasks {
+        q_val = task_q_idx[task_idx as usize];
+        ds_val = task_db_start[task_idx as usize];
+        wo_val = task_write_offset[task_idx as usize];
+        dc_val = task_db_count[task_idx as usize];
+    }
     if local_x == 0usize {
-        if task_idx < n_tasks {
-            s_q_idx[local_y] = task_q_idx[task_idx as usize];
-            s_db_start[local_y] = task_db_start[task_idx as usize];
-            s_write_offset[local_y] = task_write_offset[task_idx as usize];
-            s_db_count[local_y] = task_db_count[task_idx as usize];
-        } else {
-            s_q_idx[local_y] = 0u32;
-            s_db_start[local_y] = 0u32;
-            s_write_offset[local_y] = 0u32;
-            s_db_count[local_y] = 0u32;
-        }
+        s_q_idx[local_y] = q_val;
+        s_db_start[local_y] = ds_val;
+        s_write_offset[local_y] = wo_val;
+        s_db_count[local_y] = dc_val;
     }
 
     sync_cube();
@@ -1226,7 +1230,7 @@ pub fn compute_ivf_mega_euclidean_cached<F: Float, N: Size>(
     let q_shared_base = local_y * dim_scalars;
     let d_offset = real_db_idx as usize * dim_lines;
 
-    let mut sum = F::new(0.0);
+    let mut sum = F::new(0.0_f32);
     for i in 0..dim_lines {
         let d_line = db_vectors[d_offset + i];
         let s_off = q_shared_base + i * lanes;
@@ -1314,21 +1318,29 @@ pub fn compute_ivf_mega_cosine_cached<F: Float, N: Size>(
     let mut s_db_count = SharedMemory::<u32>::new(share_mem_size);
     let mut s_query_norms = SharedMemory::<F>::new(share_mem_size);
 
+    // Same workaround as the Euclidean variant: avoid symmetric writes
+    // in an if/else block that cubecl 0.10 can fuse into per-assignment
+    // expression-ifs (which then always take the else branch on
+    // wgpu/Metal + lavapipe).
+    let mut q_val = 0u32;
+    let mut ds_val = 0u32;
+    let mut wo_val = 0u32;
+    let mut dc_val = 0u32;
+    let mut qn_val = F::new(1.0_f32);
+    if task_idx < n_tasks {
+        let q = task_q_idx[task_idx as usize];
+        q_val = q;
+        ds_val = task_db_start[task_idx as usize];
+        wo_val = task_write_offset[task_idx as usize];
+        dc_val = task_db_count[task_idx as usize];
+        qn_val = query_norms[q as usize];
+    }
     if local_x == 0usize {
-        if task_idx < n_tasks {
-            let q = task_q_idx[task_idx as usize];
-            s_q_idx[local_y] = q;
-            s_db_start[local_y] = task_db_start[task_idx as usize];
-            s_write_offset[local_y] = task_write_offset[task_idx as usize];
-            s_db_count[local_y] = task_db_count[task_idx as usize];
-            s_query_norms[local_y] = query_norms[q as usize];
-        } else {
-            s_q_idx[local_y] = 0u32;
-            s_db_start[local_y] = 0u32;
-            s_write_offset[local_y] = 0u32;
-            s_db_count[local_y] = 0u32;
-            s_query_norms[local_y] = F::new(1.0);
-        }
+        s_q_idx[local_y] = q_val;
+        s_db_start[local_y] = ds_val;
+        s_write_offset[local_y] = wo_val;
+        s_db_count[local_y] = dc_val;
+        s_query_norms[local_y] = qn_val;
     }
 
     sync_cube();
@@ -1369,7 +1381,7 @@ pub fn compute_ivf_mega_cosine_cached<F: Float, N: Size>(
     let q_shared_base = local_y * dim_scalars;
     let d_offset = real_db_idx as usize * dim_lines;
 
-    let mut dot = F::new(0.0);
+    let mut dot = F::new(0.0_f32);
     for i in 0..dim_lines {
         let d_line = db_vectors[d_offset + i];
         let s_off = q_shared_base + i * lanes;
@@ -1384,7 +1396,7 @@ pub fn compute_ivf_mega_cosine_cached<F: Float, N: Size>(
 
     let q_idx = s_q_idx[local_y];
     let out_offset = q_idx as usize * out_dists.stride(0) + write_pos as usize;
-    out_dists[out_offset] = F::new(1.0) - (dot / (q_norm * d_norm));
+    out_dists[out_offset] = F::new(1.0_f32) - (dot / (q_norm * d_norm));
     out_indices[out_offset] = real_db_idx;
 }
 

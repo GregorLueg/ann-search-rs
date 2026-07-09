@@ -429,12 +429,16 @@ where
             Dist::Manhattan => unreachable!(),
         };
 
-        // Use trait method - prenorm version since we've already normalised
-        let cluster_dists = self.get_centroids_prenorm(&query_normalised, nprobe);
+        // Use trait method - prenorm version since we've already normalised.
+        // Expand nprobe to cover >= k reachable vectors so the query never
+        // short-returns due to small/empty cells.
+        let mut cluster_dists = self.get_centroids_prenorm(&query_normalised, nprobe);
+        let probed =
+            select_probed_clusters(&mut cluster_dists, &self.storage.offsets, nprobe, k);
 
         let mut heap: BinaryHeap<(OrderedFloat<T>, usize)> = BinaryHeap::with_capacity(k + 1);
 
-        for &(_, c_idx) in cluster_dists.iter().take(nprobe) {
+        for c_idx in probed {
             let centroid = self.storage.centroid(c_idx);
             let query_encoded = self.encoder.encode_query(&query_normalised, centroid)?;
             let cluster_size = self.storage.cluster_size(c_idx);
@@ -689,6 +693,28 @@ mod tests {
         assert_eq!(index.n, 100);
         assert_eq!(index.storage.nlist, 10);
         assert_eq!(index.storage.n_vectors(), 100);
+    }
+
+    #[test]
+    fn test_ivf_rabitq_expands_nprobe_when_probed_cells_underfill_k() {
+        // 100 vectors across 25 cells -> avg 4 per cell. nprobe=1 alone cannot
+        // reach k=20; expansion must probe more cells.
+        let data = create_test_data::<f32>(100, 32);
+        let index = IvfIndexRaBitQ::build(
+            data.as_ref(),
+            Dist::SquaredEuclidean,
+            Some(25),
+            get_default_k_means(),
+            42,
+            false,
+        )
+        .unwrap();
+
+        let query: Vec<f32> = (0..32).map(|i| i as f32 * 0.1).collect();
+        let (indices, distances) = index.query(&query, 20, Some(1)).unwrap();
+
+        assert_eq!(indices.len(), 20);
+        assert_eq!(distances.len(), 20);
     }
 
     #[test]
