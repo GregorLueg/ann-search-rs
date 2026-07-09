@@ -1014,4 +1014,90 @@ mod tests_wpgu {
         assert!(distances.is_some());
         assert_eq!(distances.unwrap().len(), 30);
     }
+
+    /// Regression test for the tsne_gpu / IVF Linux CI crash.
+    ///
+    /// The original failure was `index out of bounds: the len is 15000
+    /// but the index is 1109321353` inside `original_indices[reorg_idx]`.
+    /// `0x4218E949 = 1109321353` is the f32 bit pattern of ~38.24, i.e.
+    /// a plausible squared Euclidean distance — a distance value was
+    /// leaking into an index slot.
+    ///
+    /// The trigger is the codegen-buggy reducer pattern (runtime `while`
+    /// with u32 counters + `bool` flags on cubecl 0.10 / lavapipe). This
+    /// test exercises the same shape as the production failure at
+    /// CI-friendly scale.
+    #[test]
+    fn test_ivf_generate_knn_clustered() {
+        let Some(device) = try_device() else {
+            eprintln!("Skipping test: no wgpu backend available");
+            return;
+        };
+
+        // Match failure shape: k=31 (perplexity 10 → k = 3 * 10 + 1),
+        // dim=32, planted clusters, SquaredEuclidean, self-query.
+        let n = 2000usize;
+        let dim = 32usize;
+        let n_clusters = 30usize;
+        let k = 31usize;
+
+        // Deterministic per-sample cluster + jitter. Avoid rand crate.
+        let data = Mat::from_fn(n, dim, |i, j| {
+            let cluster = (i % n_clusters) as f32;
+            let jitter_bits = ((i.wrapping_mul(2654435761) ^ j.wrapping_mul(40503)) & 0xffff) as f32;
+            let jitter = (jitter_bits / 65536.0 - 0.5) * 0.3;
+            cluster + jitter
+        });
+
+        let index = IvfIndexGpu::<f32, WgpuRuntime>::build(
+            data.as_ref(),
+            Dist::SquaredEuclidean,
+            Some(40),
+            get_default_k_means(),
+            42,
+            false,
+            device,
+        )
+        .unwrap();
+
+        // Any panic below (OOB, wrong indices) indicates the reducer
+        // regression is back.
+        let (indices, distances) = index
+            .generate_knn(k, Some(6), None, true, false)
+            .unwrap();
+
+        assert_eq!(indices.len(), n);
+        let distances = distances.unwrap();
+        assert_eq!(distances.len(), n);
+
+        for (q, row) in indices.iter().enumerate() {
+            assert!(!row.is_empty(), "query {q} returned zero neighbours");
+            for &idx in row {
+                assert!(
+                    idx < n,
+                    "query {q}: OOB neighbour index {idx} (n = {n})"
+                );
+            }
+        }
+
+        // Sanity check: with 30 planted clusters and k=31, most neighbours
+        // for a given query should share its cluster. Well below the ideal
+        // to stay robust against IVF miss rate, but far above chance.
+        let mut same_cluster = 0usize;
+        let mut total = 0usize;
+        for (q, row) in indices.iter().enumerate() {
+            let q_cluster = q % n_clusters;
+            for &idx in row {
+                if idx % n_clusters == q_cluster {
+                    same_cluster += 1;
+                }
+                total += 1;
+            }
+        }
+        let frac = same_cluster as f32 / total as f32;
+        assert!(
+            frac > 0.5,
+            "same-cluster fraction {frac} too low ({same_cluster}/{total}); reducer likely returning garbage indices"
+        );
+    }
 }

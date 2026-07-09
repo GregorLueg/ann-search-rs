@@ -1,5 +1,12 @@
 # News
 
+## 0.4.4
+
+**Fixes**
+
+- The bug from `0.4.3` could actually also affect the IVF-GPU index in certain
+  cases. This is now fixed.
+
 ## 0.4.3
 
 **Fixes**

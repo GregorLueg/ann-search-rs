@@ -1,5 +1,6 @@
 [![CI](https://github.com/GregorLueg/ann-search-rs/actions/workflows/test.yml/badge.svg)](https://github.com/GregorLueg/ann-search-rs/actions/workflows/test.yml)
 [![Crates.io](https://img.shields.io/crates/v/ann-search-rs.svg)](https://crates.io/crates/ann-search-rs)
+[![docs.rs](https://img.shields.io/docsrs/ann-search-rs)](https://docs.rs/ann-search-rs)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
 # ann-search-rs
@@ -34,7 +35,7 @@ figured out how to design these algorithms and is just an implementation into
 Rust of many of these. Over time, I started getting interested into vector
 searches and implement WAY more indices and new stuff into this than initially
 anticipated. If you want to see what changed, please check this
-[one out](https://github.com/GregorLueg/ann-search-rs/blob/main/docs/news.md)
+[one out](https://github.com/GregorLueg/ann-search-rs/blob/main/CHANGELOG.md)
 
 ## Features
 
