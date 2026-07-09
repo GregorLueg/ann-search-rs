@@ -2,10 +2,15 @@
 
 ## 0.4.4
 
+**Features**
+
+- `CLAUDE.md` for agentic engineering.
+
 **Fixes**
 
-- The bug from `0.4.3` could actually also affect the IVF-GPU index in certain
-  cases. This is now fixed.
+- Added a safeguard for not returning enough neighbours to every IVF index
+  in the crate. Enough clusters will be sampled to always return the k
+  demanded neighbours.
 
 ## 0.4.3
 
