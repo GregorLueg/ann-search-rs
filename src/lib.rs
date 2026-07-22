@@ -51,9 +51,10 @@ use std::path::Path;
 
 use crate::cpu::{
     annoy::*, ball_tree::*, exhaustive::*, hnsw::*, ivf::*, kd_forest::*, kmknn::*, lsh::*,
-    nndescent::*, vamana::*,
+    nndescent::*, nsg::*, rnn_descent::*, vamana::*,
 };
 use crate::prelude::*;
+use crate::utils::nndescent_utils::ApplySortedUpdates;
 
 #[cfg(feature = "binary")]
 use crate::binary::{
@@ -1214,6 +1215,261 @@ pub fn query_vamana_self<T>(
 where
     T: AnnSearchFloat,
     VamanaIndex<T>: VamanaState<T>,
+{
+    index.generate_knn(k, ef_search, return_dist, verbose)
+}
+
+/////////
+// NSG //
+/////////
+
+/// Build an NSG index.
+///
+/// NSG (Navigating Spreading-out Graph) is a directed navigable graph
+/// obtained by MRNG-pruning an approximate kNN graph and patching
+/// connectivity via a DFS from a single navigating node. This entry point
+/// builds the input kNN graph internally via NN-Descent.
+///
+/// ### Params
+///
+/// * `mat` - Data matrix (rows are samples, columns are dimensions)
+/// * `r` - Maximum out-degree of the NSG graph
+/// * `l_build` - Beam width for the per-node candidate search on the input
+///   kNN graph
+/// * `c` - Cap on the candidate-set size before MRNG pruning
+/// * `knn_k` - Degree of the internal kNN graph (fed to NN-Descent)
+/// * `dist_metric` - Distance metric: `"euclidean"`, `"cosine"`, or
+///   `"manhattan"`
+/// * `seed` - Random seed for reproducibility
+/// * `verbose` - Print progress
+///
+/// ### Returns
+///
+/// The built [`NsgIndex`] on success.
+#[allow(clippy::too_many_arguments)]
+pub fn build_nsg_index<T>(
+    mat: MatRef<T>,
+    r: usize,
+    l_build: usize,
+    c: usize,
+    knn_k: usize,
+    dist_metric: &str,
+    seed: usize,
+    verbose: bool,
+) -> Result<NsgIndex<T>, AnnSearchErrors>
+where
+    T: AnnSearchFloat,
+    NsgIndex<T>: NsgState<T>,
+    NNDescent<T>: ApplySortedUpdates<T> + NNDescentQuery<T>,
+{
+    let metric = parse_ann_dist(dist_metric).unwrap_or_else(|| {
+        println!("[WARNING] Weird string used for distance metric. Using default squared Euclidean distance");
+        Dist::default()
+    });
+
+    let params = NsgBuildParams::new(r, l_build, c, knn_k);
+    NsgIndex::build(mat, metric, params, seed, verbose)
+}
+
+/// Build an NSG index reusing an already-built NN-Descent index.
+///
+/// Avoids the cost of a second NN-Descent build when the caller already has
+/// one. The `mat` argument must be the same matrix that was fed to
+/// [`NNDescent::new`]; NSG re-flattens it into its own storage.
+///
+/// ### Params
+///
+/// * `mat` - Original data matrix
+/// * `nndescent_idx` - Reference to a pre-built NN-Descent index
+/// * `r` - Maximum out-degree of the NSG graph
+/// * `l_build` - Beam width for the per-node candidate search
+/// * `c` - Cap on the candidate-set size before MRNG pruning
+/// * `seed` - Random seed for reproducibility
+/// * `verbose` - Print progress
+///
+/// ### Returns
+///
+/// The built [`NsgIndex`] on success.
+#[allow(clippy::too_many_arguments)]
+pub fn build_nsg_from_knn_index<T>(
+    mat: MatRef<T>,
+    nndescent_idx: &NNDescent<T>,
+    r: usize,
+    l_build: usize,
+    c: usize,
+    seed: usize,
+    verbose: bool,
+) -> Result<NsgIndex<T>, AnnSearchErrors>
+where
+    T: AnnSearchFloat,
+    NsgIndex<T>: NsgState<T>,
+    NNDescent<T>: ApplySortedUpdates<T> + NNDescentQuery<T>,
+{
+    let params = NsgBuildParams::new(r, l_build, c, nndescent_idx.k);
+    NsgIndex::build_from_nndescent(mat, nndescent_idx, params, seed, verbose)
+}
+
+/// Query an NSG index with an external query matrix.
+///
+/// ### Params
+///
+/// * `query_mat` - Query matrix (samples x features)
+/// * `index` - Reference to the built index
+/// * `k` - Number of neighbours to return
+/// * `ef_search` - Optional beam width override. Defaults to `100` if `None`
+/// * `return_dist` - Whether to return distances
+/// * `verbose` - Print progress every 100_000 samples
+///
+/// ### Returns
+///
+/// A tuple of `(knn_indices, optional distances)`.
+pub fn query_nsg_index<T>(
+    query_mat: MatRef<T>,
+    index: &NsgIndex<T>,
+    k: usize,
+    ef_search: Option<usize>,
+    return_dist: bool,
+    verbose: bool,
+) -> KnnOptionResult<T>
+where
+    T: AnnSearchFloat,
+    NsgIndex<T>: NsgState<T>,
+{
+    query_parallel(query_mat.nrows(), return_dist, verbose, |i| {
+        index.query_row(query_mat.row(i), k, ef_search)
+    })
+}
+
+/// Self-query an NSG index to generate a full kNN graph.
+///
+/// ### Params
+///
+/// * `index` - Reference to the built index
+/// * `k` - Number of neighbours to return
+/// * `ef_search` - Optional beam width override
+/// * `return_dist` - Whether to return distances
+/// * `verbose` - Print progress every 100_000 samples
+///
+/// ### Returns
+///
+/// A tuple of `(knn_indices, optional distances)`.
+pub fn query_nsg_self<T>(
+    index: &NsgIndex<T>,
+    k: usize,
+    ef_search: Option<usize>,
+    return_dist: bool,
+    verbose: bool,
+) -> KnnOptionResult<T>
+where
+    T: AnnSearchFloat,
+    NsgIndex<T>: NsgState<T>,
+{
+    index.generate_knn(k, ef_search, return_dist, verbose)
+}
+
+/////////////////////////
+// Relative NN-Descent //
+/////////////////////////
+
+/// Build a Relative NN-Descent (RNN-Descent) index.
+///
+/// Folds RNG-style pruning into the NN-Descent update loop so one pass
+/// produces a search-ready graph. Paper defaults: `s=20`, `r=96`, `t1=4`,
+/// `t2=15`.
+///
+/// ### Params
+///
+/// * `mat` - Data matrix (rows are samples, columns are dimensions)
+/// * `s` - Initial out-degree of the random seed graph
+/// * `r` - Maximum per-node adjacency
+/// * `t1` - Outer rounds
+/// * `t2` - UpdateNeighbors passes per outer round
+/// * `dist_metric` - Distance metric: `"euclidean"`, `"cosine"`, or
+///   `"manhattan"`
+/// * `seed` - Random seed for reproducibility
+/// * `verbose` - Print progress
+///
+/// ### Returns
+///
+/// The built [`RnnDescentIndex`] on success.
+#[allow(clippy::too_many_arguments)]
+pub fn build_rnn_descent_index<T>(
+    mat: MatRef<T>,
+    s: usize,
+    r: usize,
+    t1: usize,
+    t2: usize,
+    dist_metric: &str,
+    seed: usize,
+    verbose: bool,
+) -> Result<RnnDescentIndex<T>, AnnSearchErrors>
+where
+    T: AnnSearchFloat,
+    RnnDescentIndex<T>: RnnDescentState<T> + ApplySortedUpdates<T>,
+{
+    let metric = parse_ann_dist(dist_metric).unwrap_or_else(|| {
+        println!("[WARNING] Weird string used for distance metric. Using default squared Euclidean distance");
+        Dist::default()
+    });
+
+    let params = RnnDescentBuildParams::new(s, r, t1, t2);
+    RnnDescentIndex::build(mat, metric, params, seed, verbose)
+}
+
+/// Query an RNN-Descent index with an external query matrix.
+///
+/// ### Params
+///
+/// * `query_mat` - Query matrix (samples x features)
+/// * `index` - Reference to the built index
+/// * `k` - Number of neighbours to return
+/// * `ef_search` - Optional beam width override (defaults to `100`)
+/// * `return_dist` - Whether to return distances
+/// * `verbose` - Print progress every 100_000 samples
+///
+/// ### Returns
+///
+/// A tuple of `(knn_indices, optional distances)`.
+pub fn query_rnn_descent_index<T>(
+    query_mat: MatRef<T>,
+    index: &RnnDescentIndex<T>,
+    k: usize,
+    ef_search: Option<usize>,
+    return_dist: bool,
+    verbose: bool,
+) -> KnnOptionResult<T>
+where
+    T: AnnSearchFloat,
+    RnnDescentIndex<T>: RnnDescentState<T>,
+{
+    query_parallel(query_mat.nrows(), return_dist, verbose, |i| {
+        index.query_row(query_mat.row(i), k, ef_search)
+    })
+}
+
+/// Self-query an RNN-Descent index for a full kNN graph.
+///
+/// ### Params
+///
+/// * `index` - Reference to the built index
+/// * `k` - Number of neighbours to return
+/// * `ef_search` - Optional beam width override
+/// * `return_dist` - Whether to return distances
+/// * `verbose` - Print progress every 100_000 samples
+///
+/// ### Returns
+///
+/// A tuple of `(knn_indices, optional distances)`.
+pub fn query_rnn_descent_self<T>(
+    index: &RnnDescentIndex<T>,
+    k: usize,
+    ef_search: Option<usize>,
+    return_dist: bool,
+    verbose: bool,
+) -> KnnOptionResult<T>
+where
+    T: AnnSearchFloat,
+    RnnDescentIndex<T>: RnnDescentState<T>,
 {
     index.generate_knn(k, ef_search, return_dist, verbose)
 }
@@ -2482,6 +2738,48 @@ where
     } else {
         Ok((indices, None))
     }
+}
+
+#[cfg(feature = "gpu")]
+/// Build an NSG index reusing a GPU NN-Descent index as the input kNN graph.
+///
+/// Skips the CPU NN-Descent build stage; the raw kNN graph is downloaded
+/// once from the GPU NN-Descent index and handed to the standard CPU NSG
+/// build. The GPU CAGRA-optimised graph is deliberately not used because
+/// MRNG pruning wants a true kNN as input, not a navigational graph.
+///
+/// ### Params
+///
+/// * `mat` - Original data matrix
+/// * `nnd_gpu` - Reference to a pre-built GPU NN-Descent index
+/// * `r` - Maximum out-degree of the NSG graph
+/// * `l_build` - Beam width for the per-node candidate search
+/// * `c` - Cap on the candidate-set size before MRNG pruning
+/// * `seed` - Random seed for reproducibility
+/// * `verbose` - Print progress
+///
+/// ### Returns
+///
+/// The built [`NsgIndex`] on success.
+#[allow(clippy::too_many_arguments)]
+pub fn build_nsg_from_gpu_nndescent<T, R>(
+    mat: MatRef<T>,
+    nnd_gpu: &NNDescentGpu<T, R>,
+    r: usize,
+    l_build: usize,
+    c: usize,
+    seed: usize,
+    verbose: bool,
+) -> Result<NsgIndex<T>, AnnSearchErrors>
+where
+    R: Runtime,
+    T: AnnSearchFloat + AnnSearchGpuFloat,
+    NsgIndex<T>: NsgState<T>,
+    NNDescent<T>: ApplySortedUpdates<T> + NNDescentQuery<T>,
+    NNDescentGpu<T, R>: NNDescentQuery<T>,
+{
+    let params = NsgBuildParams::new(r, l_build, c, nnd_gpu.k);
+    NsgIndex::build_from_gpu_nndescent(mat, nnd_gpu, params, seed, verbose)
 }
 
 ////////////
