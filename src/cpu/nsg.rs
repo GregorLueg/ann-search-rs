@@ -61,6 +61,23 @@ use crate::utils::*;
 /// spatial diversity on clustered data without inflating `mrng_prune` cost.
 const MRNG_RANDOM_CANDIDATES_CAP: usize = 64;
 
+/// Lower clamp for the number of query-time entry seeds strided evenly
+/// across the dataset (on top of the navigating node). Single-entry search
+/// from the medoid dead-ends on clustered data at scale: cross-cluster paths
+/// outgrow the beam and a small fraction of queries terminates in the wrong
+/// region. The seed count resolves to `sqrt(n)` clamped to
+/// `[NSG_ENTRY_SEEDS_MIN, NSG_ENTRY_SEEDS_MAX]`; each seed costs one
+/// distance evaluation and far-from-query seeds are never expanded. At 100k
+/// samples (~316 seeds) this raised recall@15 from 0.97 to 0.999 at ef=50
+/// for ~7% query-time cost on clustered cell-embedding data.
+const NSG_ENTRY_SEEDS_MIN: usize = 64;
+
+/// Upper clamp for the query-time entry-seed count. See
+/// [`NSG_ENTRY_SEEDS_MIN`] for the heuristic. Caps the per-query seeding
+/// cost at large `n`, where the graph itself carries more of the
+/// navigation.
+const NSG_ENTRY_SEEDS_MAX: usize = 512;
+
 ///////////////////
 // Thread locals //
 ///////////////////
@@ -1459,8 +1476,12 @@ where
 
     /// Query the index for `k` nearest neighbours.
     ///
-    /// Greedy beam search from the navigating node. `ef_search` sets the
-    /// beam width; if `None`, defaults to `100`.
+    /// Greedy beam search seeded from the navigating node plus a fixed set
+    /// of entry points strided evenly across the dataset. Single-entry search from the medoid dead-ends on clustered
+    /// data once cross-cluster paths get long; the strided seeds guarantee
+    /// the beam starts near every region of the data. Seeds far from the
+    /// query cost one distance evaluation each and are never expanded.
+    /// `ef_search` sets the beam width; if `None`, defaults to `100`.
     ///
     /// ### Params
     ///
@@ -1483,67 +1504,106 @@ where
 
         Self::with_search_state(|state_cell| {
             let mut state = state_cell.borrow_mut();
-            state.reset(self.n);
+            let n_seeds = ((self.n as f64).sqrt() as usize)
+                .clamp(NSG_ENTRY_SEEDS_MIN, NSG_ENTRY_SEEDS_MAX)
+                .min(self.n);
+            let step = (self.n / n_seeds).max(1);
+            let seeds = std::iter::once(self.navigating_node as usize)
+                .chain((0..n_seeds).map(|j| j * step));
+            Ok(self.search_with_seeds(query, k, ef, seeds, &mut state))
+        })
+    }
 
-            let query_norm = if self.metric == Dist::Cosine {
-                T::calculate_l2_norm(query)
-            } else {
-                T::one()
-            };
+    /// Beam-search the graph from a set of entry seeds.
+    ///
+    /// Shared kernel for [`Self::query`] (navigating node + strided global
+    /// seeds) and the self-kNN path (the node itself as the sole seed).
+    ///
+    /// ### Params
+    ///
+    /// * `query` - Query vector
+    /// * `k` - Number of neighbours to return
+    /// * `ef` - Beam width (already resolved and clamped to `>= k`)
+    /// * `seeds` - Entry node ids; duplicates are ignored
+    /// * `state` - Thread-local search state
+    ///
+    /// ### Returns
+    ///
+    /// Tuple of `(indices, distances)` sorted by distance ascending.
+    fn search_with_seeds(
+        &self,
+        query: &[T],
+        k: usize,
+        ef: usize,
+        seeds: impl Iterator<Item = usize>,
+        state: &mut SearchState<T>,
+    ) -> (Vec<usize>, Vec<T>) {
+        state.reset(self.n);
 
-            let entry_node = self.navigating_node as usize;
-            let entry_dist =
-                OrderedFloat(self.compute_query_distance(query, entry_node, query_norm));
+        let query_norm = if self.metric == Dist::Cosine {
+            T::calculate_l2_norm(query)
+        } else {
+            T::one()
+        };
 
+        for entry_node in seeds {
+            if state.is_visited(entry_node) {
+                continue;
+            }
             state.mark_visited(entry_node);
-            state.candidates.push(Reverse((entry_dist, entry_node)));
-            state.working_sorted.insert((entry_dist, entry_node), ef);
+            let d = OrderedFloat(self.compute_query_distance(query, entry_node, query_norm));
+            state.candidates.push(Reverse((d, entry_node)));
+            state.working_sorted.insert((d, entry_node), ef);
+        }
 
-            let mut furthest_dist = entry_dist;
+        let mut furthest_dist = state
+            .working_sorted
+            .top()
+            .map(|(d, _)| *d)
+            .unwrap_or(OrderedFloat(T::infinity()));
 
-            while let Some(Reverse((current_dist, current_id))) = state.candidates.pop() {
-                if current_dist > furthest_dist && state.working_sorted.len() >= ef {
+        while let Some(Reverse((current_dist, current_id))) = state.candidates.pop() {
+            if current_dist > furthest_dist && state.working_sorted.len() >= ef {
+                break;
+            }
+
+            let neighbours = self.get_neighbours_flat(current_id);
+            for &neighbour in neighbours {
+                if neighbour == u32::MAX {
                     break;
                 }
+                let n_idx = neighbour as usize;
+                if state.is_visited(n_idx) {
+                    continue;
+                }
+                state.mark_visited(n_idx);
 
-                let neighbours = self.get_neighbours_flat(current_id);
-                for &neighbour in neighbours {
-                    if neighbour == u32::MAX {
-                        break;
-                    }
-                    let n_idx = neighbour as usize;
-                    if state.is_visited(n_idx) {
-                        continue;
-                    }
-                    state.mark_visited(n_idx);
+                let d = OrderedFloat(self.compute_query_distance(query, n_idx, query_norm));
 
-                    let d = OrderedFloat(self.compute_query_distance(query, n_idx, query_norm));
-
-                    if d < furthest_dist || state.working_sorted.len() < ef {
-                        state.candidates.push(Reverse((d, n_idx)));
-                        if state.working_sorted.insert((d, n_idx), ef)
-                            && state.working_sorted.len() >= ef
-                        {
-                            furthest_dist = state
-                                .working_sorted
-                                .top()
-                                .map(|(d, _)| *d)
-                                .unwrap_or(OrderedFloat(T::infinity()));
-                        }
+                if d < furthest_dist || state.working_sorted.len() < ef {
+                    state.candidates.push(Reverse((d, n_idx)));
+                    if state.working_sorted.insert((d, n_idx), ef)
+                        && state.working_sorted.len() >= ef
+                    {
+                        furthest_dist = state
+                            .working_sorted
+                            .top()
+                            .map(|(d, _)| *d)
+                            .unwrap_or(OrderedFloat(T::infinity()));
                     }
                 }
             }
+        }
 
-            let mut results = state.working_sorted.data().to_vec();
-            results.truncate(k);
+        let mut results = state.working_sorted.data().to_vec();
+        results.truncate(k);
 
-            let (indices, distances): (Vec<usize>, Vec<T>) = results
-                .into_iter()
-                .map(|(OrderedFloat(d), id)| (id, d))
-                .unzip();
+        let (indices, distances): (Vec<usize>, Vec<T>) = results
+            .into_iter()
+            .map(|(OrderedFloat(d), id)| (id, d))
+            .unzip();
 
-            Ok((indices, distances))
-        })
+        (indices, distances)
     }
 
     /// Query using a matrix row reference.
@@ -1614,9 +1674,16 @@ where
                     }
                 }
 
-                self.query(vec, k, ef_search)
+                // Self-kNN: the node itself is the ideal entry seed. Its
+                // adjacency already holds its nearest kNN entries, so the
+                // beam converges locally without the global strided seeds.
+                let ef = ef_search.unwrap_or(100).max(k);
+                Self::with_search_state(|state_cell| {
+                    let mut state = state_cell.borrow_mut();
+                    self.search_with_seeds(vec, k, ef, std::iter::once(i), &mut state)
+                })
             })
-            .collect::<Result<Vec<_>, AnnSearchErrors>>()?;
+            .collect::<Vec<_>>();
 
         if return_dist {
             let (indices, distances) = results.into_iter().unzip();
