@@ -27,16 +27,16 @@ use crate::utils::*;
 ///////////////////
 
 thread_local! {
-    static HEAP_F32: RefCell<BinaryHeap<(OrderedFloat<f32>, usize, bool)>> =
-        const { RefCell::new(BinaryHeap::new()) };
-    static HEAP_F64: RefCell<BinaryHeap<(OrderedFloat<f64>, usize, bool)>> =
-        const { RefCell::new(BinaryHeap::new()) };
-    static PID_SET: RefCell<Vec<bool>> = const { RefCell::new(Vec::new()) };
+    static SORTED_F32: RefCell<SortedBuffer<(OrderedFloat<f32>, u32, bool)>> =
+        RefCell::new(SortedBuffer::new());
+    static SORTED_F64: RefCell<SortedBuffer<(OrderedFloat<f64>, u32, bool)>> =
+        RefCell::new(SortedBuffer::new());
+    static PID_SET: RefCell<FixedBitSet> = const { RefCell::new(FixedBitSet::new()) };
 
-    static SORT_BUF_F32: RefCell<Vec<(f32, usize, bool)>> =
-        const { RefCell::new(Vec::new()) };
-    static SORT_BUF_F64: RefCell<Vec<(f64, usize, bool)>> =
-        const { RefCell::new(Vec::new()) };
+    /// Scratch buffers reused across all `build_candidates` per-node closures
+    /// on this thread, keyed as `(new_temp, old_temp)`.
+    static CAND_SCRATCH: RefCell<CandScratch> =
+        const { RefCell::new((Vec::new(), Vec::new())) };
 
     static QUERY_VISITED: RefCell<FixedBitSet> = const { RefCell::new(FixedBitSet::new()) };
     static QUERY_CANDIDATES_F32: QueryCandF32 =
@@ -58,6 +58,10 @@ pub type QueryCandF32 = RefCell<BinaryHeap<Reverse<(OrderedFloat<f32>, usize)>>>
 
 /// Type alias for the query candidates for f64
 pub type QueryCandF64 = RefCell<BinaryHeap<Reverse<(OrderedFloat<f64>, usize)>>>;
+
+/// Per-thread scratch pair for `build_candidates` phase 1 sampling:
+/// `(new_temp, old_temp)` holding `(priority, pid)` entries.
+type CandScratch = (Vec<(f64, usize)>, Vec<(f64, usize)>);
 
 /////////////
 // Helpers //
@@ -217,6 +221,46 @@ impl<T> RadixKey for Update<T> {
     #[inline]
     fn get_level(&self, level: usize) -> u8 {
         (self.target >> (level * 8)) as u8
+    }
+}
+
+///////////////
+// MetricFn  //
+///////////////
+
+/// Static-dispatch metric selector for the update kernel.
+///
+/// The inner loops in `generate_updates_for_chunk_impl` call
+/// `M::distance(self, p, q)` where `M` is one of the zero-sized types below.
+/// Monomorphisation strips the runtime `Dist` branch out of the hot path.
+trait MetricFn<T: AnnSearchFloat> {
+    /// Distance between vectors at internal indices `a` and `b`.
+    fn distance(idx: &NNDescent<T>, a: usize, b: usize) -> T;
+}
+
+/// Squared Euclidean metric.
+struct SqEuclidMetric;
+/// Cosine metric (assumes pre-computed norms in `NNDescent::norms`).
+struct CosineMetric;
+/// Manhattan (L1) metric.
+struct ManhattanMetric;
+
+impl<T: AnnSearchFloat> MetricFn<T> for SqEuclidMetric {
+    #[inline(always)]
+    fn distance(idx: &NNDescent<T>, a: usize, b: usize) -> T {
+        idx.euclidean_distance(a, b)
+    }
+}
+impl<T: AnnSearchFloat> MetricFn<T> for CosineMetric {
+    #[inline(always)]
+    fn distance(idx: &NNDescent<T>, a: usize, b: usize) -> T {
+        idx.cosine_distance(a, b)
+    }
+}
+impl<T: AnnSearchFloat> MetricFn<T> for ManhattanMetric {
+    #[inline(always)]
+    fn distance(idx: &NNDescent<T>, a: usize, b: usize) -> T {
+        idx.manhattan_distance(a, b)
     }
 }
 
@@ -835,10 +879,6 @@ where
         new_cands_sym: &mut [Vec<usize>],
         old_cands_sym: &mut [Vec<usize>],
     ) {
-        for v in new_cands_sym.iter_mut().chain(old_cands_sym.iter_mut()) {
-            v.clear();
-        }
-
         // Phase 1: Parallel sampling - each thread writes only to its own node
         let n = self.n;
         new_cands
@@ -846,63 +886,89 @@ where
             .zip(old_cands.par_iter_mut())
             .enumerate()
             .for_each(|(i, (new_c, old_c))| {
-                new_c.clear();
-                old_c.clear();
+                CAND_SCRATCH.with(|cell| {
+                    let mut b = cell.borrow_mut();
+                    let (new_temp, old_temp) = &mut *b;
 
-                let mut rng = SmallRng::seed_from_u64(iter_seed.wrapping_add(i as u64));
-                let base = i * k;
+                    new_c.clear();
+                    old_c.clear();
+                    new_temp.clear();
+                    old_temp.clear();
 
-                let mut new_temp: Vec<(f64, usize)> = Vec::new();
-                let mut old_temp: Vec<(f64, usize)> = Vec::new();
+                    let mut rng = SmallRng::seed_from_u64(iter_seed.wrapping_add(i as u64));
+                    let base = i * k;
 
-                for slot in &graph[base..base + k] {
-                    if slot.is_sentinel() {
-                        continue;
+                    for slot in &graph[base..base + k] {
+                        if slot.is_sentinel() {
+                            continue;
+                        }
+                        let j = slot.pid();
+                        if j >= n {
+                            continue;
+                        }
+
+                        let priority = rng.random::<f64>();
+                        if slot.is_new() {
+                            new_temp.push((priority, j));
+                        } else {
+                            old_temp.push((priority, j));
+                        }
                     }
-                    let j = slot.pid();
-                    if j >= n {
-                        continue;
+
+                    // O(n) partial sort instead of O(n log n) full sort
+                    if new_temp.len() > max_candidates {
+                        new_temp.select_nth_unstable_by(max_candidates - 1, |a, b| {
+                            a.0.partial_cmp(&b.0).unwrap()
+                        });
+                        new_temp.truncate(max_candidates);
                     }
+                    new_c.extend(new_temp.iter().map(|&(_, idx)| idx));
 
-                    let priority = rng.random::<f64>();
-                    if slot.is_new() {
-                        new_temp.push((priority, j));
-                    } else {
-                        old_temp.push((priority, j));
+                    if old_temp.len() > max_candidates {
+                        old_temp.select_nth_unstable_by(max_candidates - 1, |a, b| {
+                            a.0.partial_cmp(&b.0).unwrap()
+                        });
+                        old_temp.truncate(max_candidates);
                     }
-                }
-
-                // O(n) partial sort instead of O(n log n) full sort
-                if new_temp.len() > max_candidates {
-                    new_temp.select_nth_unstable_by(max_candidates - 1, |a, b| {
-                        a.0.partial_cmp(&b.0).unwrap()
-                    });
-                    new_temp.truncate(max_candidates);
-                }
-                new_c.extend(new_temp.iter().map(|&(_, idx)| idx));
-
-                if old_temp.len() > max_candidates {
-                    old_temp.select_nth_unstable_by(max_candidates - 1, |a, b| {
-                        a.0.partial_cmp(&b.0).unwrap()
-                    });
-                    old_temp.truncate(max_candidates);
-                }
-                old_c.extend(old_temp.iter().map(|&(_, idx)| idx));
+                    old_c.extend(old_temp.iter().map(|&(_, idx)| idx));
+                });
             });
 
-        // Phase 2: Symmetric candidates (sequential - cross-node writes)
-        for i in 0..self.n {
-            for &j in &new_cands[i] {
-                if j < self.n {
-                    new_cands_sym[j].push(i);
+        // Phase 2: Symmetric candidates via parallel target-chunk scan.
+        //
+        // Each thread owns a disjoint slice of `*_sym` and scans all sources
+        // once, picking up entries whose target lands in its range. This
+        // avoids per-target locking; the cost is that each thread walks the
+        // full source list, but that walk is a linear read of small vecs.
+        let n_threads = rayon::current_num_threads().max(1);
+        let chunk = n.div_ceil(n_threads).max(1);
+        new_cands_sym
+            .par_chunks_mut(chunk)
+            .zip(old_cands_sym.par_chunks_mut(chunk))
+            .enumerate()
+            .for_each(|(ci, (new_sym_chunk, old_sym_chunk))| {
+                for v in new_sym_chunk.iter_mut() {
+                    v.clear();
                 }
-            }
-            for &j in &old_cands[i] {
-                if j < self.n {
-                    old_cands_sym[j].push(i);
+                for v in old_sym_chunk.iter_mut() {
+                    v.clear();
                 }
-            }
-        }
+                let target_start = ci * chunk;
+                let new_end = target_start + new_sym_chunk.len();
+                let old_end = target_start + old_sym_chunk.len();
+                for src_i in 0..n {
+                    for &j in &new_cands[src_i] {
+                        if j >= target_start && j < new_end {
+                            new_sym_chunk[j - target_start].push(src_i);
+                        }
+                    }
+                    for &j in &old_cands[src_i] {
+                        if j >= target_start && j < old_end {
+                            old_sym_chunk[j - target_start].push(src_i);
+                        }
+                    }
+                }
+            });
 
         // Phase 3: Merge symmetric, sort, dedup (parallel, per-node independent)
         new_cands
@@ -933,21 +999,22 @@ where
     /// * `k` - Neighbours per node
     /// * `new_cands` - Sorted new-candidate lists per node
     fn mark_as_old(&self, graph: &mut [Neighbour<T>], k: usize, new_cands: &[Vec<usize>]) {
-        for i in 0..self.n {
-            if new_cands[i].is_empty() {
-                continue;
-            }
-
-            let base = i * k;
-            for slot in &mut graph[base..base + k] {
-                if slot.is_sentinel() {
-                    continue;
+        graph
+            .par_chunks_mut(k)
+            .zip(new_cands.par_iter())
+            .for_each(|(slots, new_c)| {
+                if new_c.is_empty() {
+                    return;
                 }
-                if slot.is_new() && new_cands[i].binary_search(&slot.pid()).is_ok() {
-                    slot.mark_old();
+                for slot in slots.iter_mut() {
+                    if slot.is_sentinel() {
+                        continue;
+                    }
+                    if slot.is_new() && new_c.binary_search(&slot.pid()).is_ok() {
+                        slot.mark_old();
+                    }
                 }
-            }
-        }
+            });
     }
 
     /// Generate distance updates from a chunk of source nodes.
@@ -976,10 +1043,51 @@ where
         chunk_start: usize,
         chunk_end: usize,
     ) -> Vec<Update<T>> {
+        match self.metric {
+            Dist::SquaredEuclidean => self.generate_updates_for_chunk_impl::<SqEuclidMetric>(
+                new_cands,
+                old_cands,
+                graph,
+                k,
+                chunk_start,
+                chunk_end,
+            ),
+            Dist::Cosine => self.generate_updates_for_chunk_impl::<CosineMetric>(
+                new_cands,
+                old_cands,
+                graph,
+                k,
+                chunk_start,
+                chunk_end,
+            ),
+            Dist::Manhattan => self.generate_updates_for_chunk_impl::<ManhattanMetric>(
+                new_cands,
+                old_cands,
+                graph,
+                k,
+                chunk_start,
+                chunk_end,
+            ),
+        }
+    }
+
+    /// Monomorphised inner kernel for chunked update generation.
+    ///
+    /// `M` selects the distance function at compile time so the branch on
+    /// `self.metric` is stripped out of the hot loop entirely.
+    fn generate_updates_for_chunk_impl<M: MetricFn<T>>(
+        &self,
+        new_cands: &[Vec<usize>],
+        old_cands: &[Vec<usize>],
+        graph: &[Neighbour<T>],
+        k: usize,
+        chunk_start: usize,
+        chunk_end: usize,
+    ) -> Vec<Update<T>> {
         (chunk_start..chunk_end)
             .into_par_iter()
             .fold(
-                || Vec::with_capacity(2048),
+                || Vec::with_capacity(16_384),
                 |mut updates, i| {
                     let get_threshold = |idx: usize| -> T { graph[idx * k + k - 1].dist };
 
@@ -996,7 +1104,7 @@ where
                             if q >= self.n || p == q {
                                 continue;
                             }
-                            let d = self.distance(p, q);
+                            let d = M::distance(self, p, q);
                             if d <= p_threshold || d <= get_threshold(q) {
                                 updates.push(Update::new(p, q, d));
                                 updates.push(Update::new(q, p, d));
@@ -1015,7 +1123,7 @@ where
                             if q >= self.n || p == q {
                                 continue;
                             }
-                            let d = self.distance(p, q);
+                            let d = M::distance(self, p, q);
                             if d <= p_threshold || d <= get_threshold(q) {
                                 updates.push(Update::new(p, q, d));
                                 updates.push(Update::new(q, p, d));
@@ -1313,7 +1421,7 @@ fn find_target_boundaries<T>(updates: &[Update<T>]) -> Vec<usize> {
 /// The logic is identical for f32 and f64; only the thread-local storage
 /// keys differ.
 macro_rules! impl_apply_sorted_updates {
-    ($float:ty, $heap_tls:ident, $sort_buf_tls:ident) => {
+    ($float:ty, $sorted_tls:ident) => {
         impl ApplySortedUpdates<$float> for NNDescent<$float> {
             fn apply_sorted_updates(
                 &self,
@@ -1346,93 +1454,74 @@ macro_rules! impl_apply_sorted_updates {
                 segments.par_iter().for_each(|&(target, segment)| {
                     #[allow(clippy::redundant_locals)]
                     let graph_ptr = graph_ptr;
-                    $heap_tls.with(|heap_cell| {
+                    $sorted_tls.with(|sorted_cell| {
                         PID_SET.with(|set_cell| {
-                            $sort_buf_tls.with(|sort_cell| {
-                                let mut heap = heap_cell.borrow_mut();
-                                let mut pid_set = set_cell.borrow_mut();
-                                let mut sort_buf = sort_cell.borrow_mut();
+                            let mut sorted = sorted_cell.borrow_mut();
+                            let mut pid_set = set_cell.borrow_mut();
 
-                                heap.clear();
-                                if pid_set.len() < self.n {
-                                    pid_set.resize(self.n, false);
+                            sorted.clear();
+                            if pid_set.len() < self.n {
+                                pid_set.grow(self.n);
+                            }
+
+                            let start_idx = target * k;
+
+                            // SAFETY: Each thread processes a unique target.
+                            // No two threads alias the same slice.
+                            let target_slice = unsafe {
+                                std::slice::from_raw_parts_mut(graph_ptr.0.add(start_idx), k)
+                            };
+
+                            let mut edge_updates = 0usize;
+
+                            // Load current neighbours in ascending distance order.
+                            for n in target_slice.iter() {
+                                if n.is_sentinel() {
+                                    continue;
                                 }
+                                let pid = n.pid();
+                                sorted.insert((OrderedFloat(n.dist), pid as u32, n.is_new()), k);
+                                pid_set.insert(pid);
+                            }
 
-                                let start_idx = target * k;
-
-                                // SAFETY: Each thread processes a unique target.
-                                // No two threads alias the same slice.
-                                let target_slice = unsafe {
-                                    std::slice::from_raw_parts_mut(graph_ptr.0.add(start_idx), k)
-                                };
-
-                                let mut edge_updates = 0usize;
-
-                                // Load current neighbours into the heap
-                                for n in target_slice.iter() {
-                                    if n.is_sentinel() {
-                                        continue;
-                                    }
-                                    let pid = n.pid();
-                                    heap.push((OrderedFloat(n.dist), pid, n.is_new()));
-                                    pid_set[pid] = true;
+                            // Merge incoming updates.
+                            for update in segment {
+                                if pid_set.contains(update.source) {
+                                    continue;
                                 }
-
-                                // Merge incoming updates
-                                for update in segment {
-                                    if pid_set[update.source] {
-                                        continue;
-                                    }
-
-                                    if heap.len() < k {
-                                        heap.push((OrderedFloat(update.dist), update.source, true));
-                                        pid_set[update.source] = true;
-                                        edge_updates += 1;
-                                    } else if let Some(&(OrderedFloat(worst), _, _)) = heap.peek() {
-                                        if update.dist < worst {
-                                            if let Some((_, old_pid, _)) = heap.pop() {
-                                                pid_set[old_pid] = false;
-                                            }
-                                            heap.push((
-                                                OrderedFloat(update.dist),
-                                                update.source,
-                                                true,
-                                            ));
-                                            pid_set[update.source] = true;
-                                            edge_updates += 1;
-                                        }
-                                    }
-                                }
-
-                                if edge_updates > 0 {
-                                    updates_count.fetch_add(edge_updates, Ordering::Relaxed);
-
-                                    sort_buf.clear();
-                                    sort_buf.extend(heap.drain().map(
-                                        |(OrderedFloat(d), p, is_new)| {
-                                            pid_set[p] = false;
-                                            (d, p, is_new)
-                                        },
-                                    ));
-
-                                    sort_buf
-                                        .sort_unstable_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
-                                    sort_buf.truncate(k);
-
-                                    for (i, &(d, p, is_new)) in sort_buf.iter().enumerate() {
-                                        target_slice[i] = Neighbour::new(p, d, is_new);
-                                    }
-
-                                    for i in sort_buf.len()..k {
-                                        target_slice[i] =
-                                            Neighbour::new(SENTINEL_PID, <$float>::MAX, false);
-                                    }
+                                let evicted_pid: Option<u32> = if sorted.len() == k {
+                                    sorted.top().map(|&(_, pid, _)| pid)
                                 } else {
-                                    for (_, pid, _) in heap.iter() {
-                                        pid_set[*pid] = false;
+                                    None
+                                };
+                                let entry = (OrderedFloat(update.dist), update.source as u32, true);
+                                if sorted.insert(entry, k) {
+                                    if let Some(pid) = evicted_pid {
+                                        pid_set.remove(pid as usize);
                                     }
+                                    pid_set.insert(update.source);
+                                    edge_updates += 1;
                                 }
-                            })
+                            }
+
+                            if edge_updates > 0 {
+                                updates_count.fetch_add(edge_updates, Ordering::Relaxed);
+
+                                for (i, &(OrderedFloat(d), pid, is_new)) in
+                                    sorted.data().iter().enumerate()
+                                {
+                                    target_slice[i] = Neighbour::new(pid as usize, d, is_new);
+                                }
+                                for i in sorted.len()..k {
+                                    target_slice[i] =
+                                        Neighbour::new(SENTINEL_PID, <$float>::MAX, false);
+                                }
+                            }
+
+                            // Clear pid_set entries left in sorted.
+                            for &(_, pid, _) in sorted.data().iter() {
+                                pid_set.remove(pid as usize);
+                            }
                         })
                     })
                 });
@@ -1441,8 +1530,8 @@ macro_rules! impl_apply_sorted_updates {
     };
 }
 
-impl_apply_sorted_updates!(f32, HEAP_F32, SORT_BUF_F32);
-impl_apply_sorted_updates!(f64, HEAP_F64, SORT_BUF_F64);
+impl_apply_sorted_updates!(f32, SORTED_F32);
+impl_apply_sorted_updates!(f64, SORTED_F64);
 
 ////////////////////
 // NNDescentQuery //
