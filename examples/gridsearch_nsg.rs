@@ -66,16 +66,15 @@ fn main() {
 
     println!("-----------------------------");
 
-    // R x L_build grid; C fixed to 500 (paper's default), knn_k fixed to 64
     let build_params: &[(usize, usize)] = &[
-        (32, 50),
-        (32, 100),
+        // (32, 50),
+        // (32, 100),
         (32, 150),
-        (48, 50),
-        (48, 100),
+        // (48, 50),
+        // (48, 100),
         (48, 150),
-        (64, 50),
-        (64, 100),
+        // (64, 50),
+        // (64, 100),
         (64, 150),
     ];
     let c_cap: usize = 500;
@@ -95,7 +94,7 @@ fn main() {
             knn_k,
             &cli.distance,
             cli.seed as usize,
-            false,
+            true,
         )
         .unwrap();
         let build_time = start.elapsed().as_secs_f64() * 1000.0;
