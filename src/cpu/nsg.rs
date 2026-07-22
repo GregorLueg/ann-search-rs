@@ -44,6 +44,7 @@ use crate::prelude::*;
 use crate::utils::dist::{cosine_distance_static, euclidean_distance_static};
 use crate::utils::graph_utils::SearchState;
 use crate::utils::nndescent_utils::{ApplySortedUpdates, SENTINEL_PID};
+use crate::utils::parallelism::StripedLocks;
 use crate::utils::*;
 
 ///////////////////
@@ -180,36 +181,50 @@ impl NsgBuildParams {
 
 /// Concurrent build-time graph.
 ///
-/// Each node owns a `Vec<u32>` of length up to `R`. Step 2 of the build writes
-/// each node's slot exactly once from a parallel per-node loop, so no
-/// synchronisation is required there. Step 3 (DFS connectivity fix) is
-/// sequential, so the `add_or_evict_neighbour` helper does not need locks
-/// either.
-struct NsgConstructionGraph {
-    /// Per-node adjacency lists, each capped at `r` entries
-    nodes: Vec<UnsafeCell<Vec<u32>>>,
-    /// Hard degree cap
+/// Each node owns a `Vec<(u32, T)>` of neighbour ids **with cached distances
+/// from the source node**. Caching the distances keeps the InterInsert step
+/// cheap: an at-capacity re-prune no longer needs to recompute the source's
+/// distances to its existing neighbours before running MRNG.
+///
+/// Concurrent access uses a striped spin-lock (`StripedLocks`). Both the
+/// primary MRNG write for source `v` and the InterInsert writes to targets
+/// `u ∈ neighbours(v)` acquire `locks.lock_guard(node)` before touching a
+/// slot. The DFS connectivity-fix step is sequential and does not need to
+/// lock.
+struct NsgConstructionGraph<T> {
+    /// Per-node adjacency lists as `(neighbour_id, dist_from_source)`.
+    /// Length is soft-capped at `r` during MRNG and InterInsert, but the
+    /// DFS-fix path may push past `r` to guarantee reachability.
+    nodes: Vec<UnsafeCell<Vec<(u32, T)>>>,
+    /// Target out-degree cap
     r: usize,
+    /// Striped spin-locks for concurrent edge updates during construction
+    locks: StripedLocks,
 }
 
-unsafe impl Sync for NsgConstructionGraph {}
+unsafe impl<T> Sync for NsgConstructionGraph<T> {}
 
-impl NsgConstructionGraph {
+impl<T: Copy + PartialOrd> NsgConstructionGraph<T> {
     /// Allocate an empty construction graph.
     ///
     /// ### Params
     ///
     /// * `n` - Number of nodes
-    /// * `r` - Maximum out-degree per node
+    /// * `r` - Maximum out-degree per node (soft cap)
+    /// * `threads` - Expected number of concurrent writers
     ///
     /// ### Returns
     ///
     /// Empty graph with `n` slots pre-allocated to capacity `r`.
-    fn new(n: usize, r: usize) -> Self {
+    fn new(n: usize, r: usize, threads: usize) -> Self {
         let nodes = (0..n)
             .map(|_| UnsafeCell::new(Vec::with_capacity(r)))
             .collect();
-        Self { nodes, r }
+        Self {
+            nodes,
+            r,
+            locks: StripedLocks::new(threads, r),
+        }
     }
 
     /// Read-only view of a node's neighbours.
@@ -222,7 +237,7 @@ impl NsgConstructionGraph {
     ///
     /// Caller must ensure no concurrent write to `nodes[node_id]`.
     #[inline]
-    unsafe fn get_neighbours_slice(&self, node_id: usize) -> &[u32] {
+    unsafe fn get_neighbours_slice(&self, node_id: usize) -> &[(u32, T)] {
         &*self.nodes[node_id].get()
     }
 
@@ -231,83 +246,78 @@ impl NsgConstructionGraph {
     /// ### Params
     ///
     /// * `node_id` - Node index
-    /// * `neighbours` - New adjacency list (must not exceed `R`)
+    /// * `neighbours` - New adjacency list
     ///
     /// ### Safety
     ///
-    /// Caller must hold exclusive access to `nodes[node_id]`.
+    /// Caller must hold exclusive access to `nodes[node_id]` (via the striped
+    /// lock during parallel build, or by construction during the sequential
+    /// DFS-fix step).
     #[inline]
-    unsafe fn set_neighbours(&self, node_id: usize, neighbours: &[u32]) {
+    unsafe fn set_neighbours(&self, node_id: usize, neighbours: &[(u32, T)]) {
         let slot = &mut *self.nodes[node_id].get();
         slot.clear();
         slot.extend_from_slice(neighbours);
     }
 
-    /// Add a neighbour or, if the node is at capacity, evict the farthest.
+    /// Unconditionally append a neighbour to a node's adjacency.
     ///
-    /// Distances are supplied so the eviction step needs no external lookup.
+    /// Used by the DFS connectivity fix. Matches the reference NSG
+    /// `findroot` semantics: the added edge is required to make `new_neighbour`
+    /// reachable, so we accept degree growth beyond `r` rather than silently
+    /// drop the patch. The consequent variable per-row degree is absorbed by
+    /// `into_flat`, which pads every row to the observed maximum.
     ///
     /// ### Params
     ///
     /// * `node_id` - Source node
     /// * `new_neighbour` - Neighbour id to insert
     /// * `new_dist` - Distance from `node_id` to `new_neighbour`
-    /// * `neighbour_dists` - Existing distances (in the same order as the
-    ///   current adjacency list). Must have length equal to the current
-    ///   degree.
     ///
     /// ### Safety
     ///
-    /// Caller must hold exclusive access to `nodes[node_id]`. Only used
-    /// during the sequential DFS-fix step.
+    /// Caller must hold exclusive access to `nodes[node_id]`. In practice
+    /// this is called only from the sequential DFS-fix phase.
     #[inline]
-    unsafe fn add_or_evict_neighbour<T: Copy + PartialOrd>(
-        &self,
-        node_id: usize,
-        new_neighbour: u32,
-        new_dist: T,
-        neighbour_dists: &[T],
-    ) {
+    unsafe fn push_neighbour_unchecked(&self, node_id: usize, new_neighbour: u32, new_dist: T) {
         let slot = &mut *self.nodes[node_id].get();
-        if slot.len() < self.r {
-            slot.push(new_neighbour);
-            return;
-        }
-
-        let mut worst_pos = 0usize;
-        let mut worst_dist = neighbour_dists[0];
-        for (i, &d) in neighbour_dists.iter().enumerate().skip(1) {
-            if d > worst_dist {
-                worst_dist = d;
-                worst_pos = i;
-            }
-        }
-
-        if new_dist < worst_dist {
-            slot[worst_pos] = new_neighbour;
-        }
+        slot.push((new_neighbour, new_dist));
     }
 
-    /// Consume the construction graph into a flat `Vec<u32>`.
+    /// Consume the construction graph into a flat `Vec<u32>` and the stride.
     ///
-    /// Each node contributes exactly `R` entries, tail-padded with [`u32::MAX`]
-    /// sentinels. Reader-friendly for cache-linear beam search.
+    /// The stride is the maximum per-node degree observed across all rows,
+    /// floored at `r`. Shorter rows tail-pad with [`u32::MAX`] so the query
+    /// path can break at the first sentinel. This handles the DFS-fix nodes
+    /// whose degree grew past `r`.
     ///
     /// ### Returns
     ///
-    /// The flattened `n * R` adjacency array.
-    fn into_flat(self) -> Vec<u32> {
+    /// Tuple of `(flat adjacency, stride)`. The flat array is
+    /// `nodes.len() * stride` entries long.
+    fn into_flat(self) -> (Vec<u32>, usize) {
+        let n = self.nodes.len();
         let r = self.r;
-        let mut flat = Vec::with_capacity(self.nodes.len() * r);
+        let stride = self
+            .nodes
+            .iter()
+            .map(|cell| unsafe { (*cell.get()).len() })
+            .max()
+            .unwrap_or(0)
+            .max(r);
+
+        let mut flat = Vec::with_capacity(n * stride);
         for cell in self.nodes {
             let neighbours = cell.into_inner();
             let deg = neighbours.len();
-            flat.extend_from_slice(&neighbours);
-            for _ in deg..r {
+            for (id, _) in &neighbours {
+                flat.push(*id);
+            }
+            for _ in deg..stride {
                 flat.push(u32::MAX);
             }
         }
-        flat
+        (flat, stride)
     }
 }
 
@@ -331,9 +341,14 @@ pub struct NsgIndex<T> {
     pub norms: Vec<T>,
     /// Distance metric
     pub metric: Dist,
-    /// Flat adjacency array of size `n * R`
+    /// Flat adjacency array of size `n * max_degree`
     pub graph: Vec<u32>,
-    /// Maximum out-degree
+    /// Row stride in `graph`. Equal to `r` for the vast majority of nodes;
+    /// occasionally slightly larger when the DFS connectivity-fix pushed
+    /// past `r` to guarantee reachability. Reader-side sentinel scans stop
+    /// at [`u32::MAX`], so the stride only affects the length of each row.
+    pub max_degree: usize,
+    /// Target out-degree cap (`R` in the paper)
     pub r: usize,
     /// Build-time beam width (kept for reference / re-runs)
     pub l_build: usize,
@@ -655,6 +670,7 @@ where
             norms,
             metric,
             graph: Vec::new(),
+            max_degree: params.r,
             r: params.r,
             l_build: params.l_build,
             c: params.c,
@@ -672,13 +688,22 @@ where
             );
         }
 
-        // Step 2: parallel MRNG prune per node
-        let build_graph = NsgConstructionGraph::new(n, params.r);
+        // Step 2a: parallel forward MRNG prune per node.
+        //
+        // Each thread writes its own source slot exactly once, so no lock is
+        // needed in this phase. The result is captured both in the
+        // construction graph AND in a per-source snapshot Vec so phase 2b can
+        // read a source's forward-MRNG selection without racing with
+        // concurrent InterInsert writes into that same slot.
+        let threads = rayon::current_num_threads();
+        let build_graph: NsgConstructionGraph<T> =
+            NsgConstructionGraph::new(n, params.r, threads);
+        let mut forward: Vec<Vec<(u32, T)>> = vec![Vec::new(); n];
         let progress = Arc::new(AtomicUsize::new(0));
-        (0..n).into_par_iter().for_each(|v| {
-            Self::with_build_state(|state_cell| {
+        forward.par_iter_mut().enumerate().for_each(|(v, out)| {
+            let neighbours = Self::with_build_state(|state_cell| {
                 let mut state = state_cell.borrow_mut();
-                let neighbours = index.collect_and_prune_for_node(
+                index.collect_and_prune_for_node(
                     v,
                     np,
                     knn_graph,
@@ -687,13 +712,15 @@ where
                     params.c,
                     params.r,
                     &mut state,
-                );
-                // SAFETY: `v` is unique across the parallel iterator so no
-                // other thread writes to `nodes[v]`.
-                unsafe {
-                    build_graph.set_neighbours(v, &neighbours);
-                }
+                )
             });
+
+            // SAFETY: `v` is unique across the parallel iterator so no other
+            // thread writes to nodes[v] in this phase.
+            unsafe {
+                build_graph.set_neighbours(v, &neighbours);
+            }
+            *out = neighbours;
 
             if verbose {
                 let count = progress.fetch_add(1, Relaxed) + 1;
@@ -707,11 +734,66 @@ where
             }
         });
 
+        // Step 2b: parallel InterInsert (reverse edges).
+        //
+        // For each source v, for each (u, dist_uv) in v's forward MRNG,
+        // insert v into u's adjacency under u's lock. If u is at capacity,
+        // re-run MRNG on the merged pool using u's cached distances so we
+        // never recompute u -> u's-neighbours distances.
+        //
+        // Reading forward[v] is race-free: forward[] is written in phase 2a
+        // and never mutated after. Only construction graph slots are mutated
+        // in this phase, and each is protected by the striped lock.
+        forward.par_iter().enumerate().for_each(|(v, neighbours)| {
+            for &(u_id, dist_uv) in neighbours {
+                let u = u_id as usize;
+                if u == v {
+                    continue;
+                }
+                let _guard = build_graph.locks.lock_guard(u);
+
+                // SAFETY: guard grants exclusive access to nodes[u].
+                let (deg, dup) = unsafe {
+                    let slot = &*build_graph.nodes[u].get();
+                    (slot.len(), slot.iter().any(|&(id, _)| id as usize == v))
+                };
+                if dup {
+                    continue;
+                }
+
+                if deg < params.r {
+                    unsafe {
+                        (*build_graph.nodes[u].get()).push((v as u32, dist_uv));
+                    }
+                    continue;
+                }
+
+                // Merge and re-prune under MRNG using cached distances.
+                let mut pool: Vec<(OrderedFloat<T>, usize)> =
+                    Vec::with_capacity(deg + 1);
+                unsafe {
+                    for &(id, d) in &*build_graph.nodes[u].get() {
+                        pool.push((OrderedFloat(d), id as usize));
+                    }
+                }
+                pool.push((OrderedFloat(dist_uv), v));
+                pool.sort_unstable_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(Ordering::Equal));
+
+                let new_adj = index.mrng_prune(&pool, params.r, u);
+                unsafe {
+                    build_graph.set_neighbours(u, &new_adj);
+                }
+            }
+        });
+        drop(forward);
+
         // Step 3: DFS connectivity fix (sequential)
         index.dfs_connectivity_fix(&build_graph, verbose);
 
         // Step 4: flatten
-        index.graph = build_graph.into_flat();
+        let (flat, stride) = build_graph.into_flat();
+        index.graph = flat;
+        index.max_degree = stride;
 
         Ok(index)
     }
@@ -722,17 +804,17 @@ where
 
     /// Beam-search the input kNN graph toward the centroid.
     ///
-    /// Uses `SearchState` for visited tracking and candidate ordering. The
-    /// entry point is a random node; a single search pass with pool `L` is
-    /// enough because the centroid is a synthetic vector and we only need the
-    /// closest indexed point.
+    /// Uses `SearchState` for visited tracking and candidate ordering.
+    /// Seeds the beam with `l_build` distinct random entry points (matching
+    /// the reference NSG `Init_Center` behaviour) so the search doesn't
+    /// collapse into whichever single cluster a lone random entry lands in.
     ///
     /// ### Params
     ///
     /// * `knn_graph` - Input kNN graph
     /// * `knn_k` - Neighbours per node in `knn_graph`
     /// * `l_build` - Beam width for the search
-    /// * `seed` - Seed for the random entry point
+    /// * `seed` - Seed for the random entry points
     ///
     /// ### Returns
     ///
@@ -746,18 +828,39 @@ where
     ) -> usize {
         let centroid = compute_centroid(&self.vectors_flat, self.n, self.dim);
         let mut rng = SmallRng::seed_from_u64(seed as u64 ^ 0xA5A5_5A5A);
-        let entry = rng.random_range(0..self.n);
+
+        // Seed the beam with l_build distinct random entries.
+        let seed_count = l_build.min(self.n);
+        let mut seeds: Vec<usize> = Vec::with_capacity(seed_count);
+        {
+            let mut chosen = vec![false; self.n];
+            while seeds.len() < seed_count {
+                let cand = rng.random_range(0..self.n);
+                if !chosen[cand] {
+                    chosen[cand] = true;
+                    seeds.push(cand);
+                }
+            }
+        }
 
         Self::with_build_state(|state_cell| {
             let mut state = state_cell.borrow_mut();
             state.reset(self.n);
 
-            let entry_dist = OrderedFloat(self.distance_external(&centroid, entry));
-            state.mark_visited(entry);
-            state.candidates.push(Reverse((entry_dist, entry)));
-            state.working_sorted.insert((entry_dist, entry), l_build);
-
-            let mut furthest_dist = entry_dist;
+            let mut furthest_dist = OrderedFloat(T::infinity());
+            for &s in &seeds {
+                let d = OrderedFloat(self.distance_external(&centroid, s));
+                state.mark_visited(s);
+                state.candidates.push(Reverse((d, s)));
+                state.working_sorted.insert((d, s), l_build);
+            }
+            if state.working_sorted.len() >= l_build {
+                furthest_dist = state
+                    .working_sorted
+                    .top()
+                    .map(|(d, _)| *d)
+                    .unwrap_or(OrderedFloat(T::infinity()));
+            }
 
             while let Some(Reverse((current_dist, current_id))) = state.candidates.pop() {
                 if current_dist > furthest_dist && state.working_sorted.len() >= l_build {
@@ -796,7 +899,7 @@ where
                 .data()
                 .first()
                 .map(|(_, idx)| *idx)
-                .unwrap_or(entry)
+                .unwrap_or_else(|| seeds[0])
         })
     }
 
@@ -807,9 +910,8 @@ where
     /// Collect candidates for node `v` and apply MRNG pruning.
     ///
     /// Beam-searches the kNN graph from `np` toward `v`, records every visited
-    /// node, unions in `v`'s kNN neighbours, sorts by distance ascending, then
-    /// greedily accepts candidates that do not violate the MRNG rule. Returns
-    /// at most `r` outgoing neighbours.
+    /// node, unions in `v`'s kNN neighbours, sorts by distance ascending, caps
+    /// at `c`, then delegates to [`mrng_prune`] for the actual selection.
     ///
     /// ### Params
     ///
@@ -824,7 +926,7 @@ where
     ///
     /// ### Returns
     ///
-    /// Vector of at most `r` neighbour ids for `v`, sorted by distance.
+    /// Vector of at most `r` `(neighbour_id, dist_from_v)` pairs.
     #[allow(clippy::too_many_arguments)]
     fn collect_and_prune_for_node(
         &self,
@@ -836,7 +938,7 @@ where
         c: usize,
         r: usize,
         state: &mut SearchState<T>,
-    ) -> Vec<u32> {
+    ) -> Vec<(u32, T)> {
         state.reset(self.n);
 
         // Beam-search from np toward v, collecting the visited set.
@@ -910,15 +1012,40 @@ where
             state.scratch_working.truncate(c);
         }
 
-        // MRNG prune: for each candidate p (closest first), accept iff no
-        // already-selected r satisfies delta(p, r) < delta(p, v).
-        // scratch_discarded stores (dist_to_v, id) for accepted neighbours
-        // — needed by the acceptance predicate.
-        state.scratch_discarded.clear();
-        let mut accepted: Vec<u32> = Vec::with_capacity(r);
+        self.mrng_prune(&state.scratch_working, r, v)
+    }
 
-        for &(cand_dist, cand_id) in state.scratch_working.iter() {
-            if cand_id == v {
+    /// MRNG selection on a pre-sorted candidate pool.
+    ///
+    /// For each candidate `p` (closest to `base` first), accept iff no
+    /// already-accepted `s` satisfies `d(p, s) < d(p, base)`. Strict `<`
+    /// matches the paper's Algorithm 2 and the ZJULearning reference.
+    ///
+    /// Used by both the forward MRNG pass (candidates from beam search +
+    /// v's kNN) and the InterInsert re-prune (candidates from u's current
+    /// adjacency + the incoming source v).
+    ///
+    /// ### Params
+    ///
+    /// * `candidates` - Pre-sorted ascending by distance to `base`. Not
+    ///   modified; `exclude` filters `base` itself.
+    /// * `r` - Maximum size of the accepted set
+    /// * `exclude` - Node id to skip (typically the base node itself)
+    ///
+    /// ### Returns
+    ///
+    /// Accepted neighbours as `(id, dist_from_base)`, order-preserving w.r.t.
+    /// `candidates`.
+    fn mrng_prune(
+        &self,
+        candidates: &[(OrderedFloat<T>, usize)],
+        r: usize,
+        exclude: usize,
+    ) -> Vec<(u32, T)> {
+        let mut accepted: Vec<(u32, T)> = Vec::with_capacity(r);
+
+        for &(cand_dist, cand_id) in candidates.iter() {
+            if cand_id == exclude {
                 continue;
             }
             if accepted.len() >= r {
@@ -926,11 +1053,8 @@ where
             }
 
             let mut ok = true;
-            for &(_, sel_id) in state.scratch_discarded.iter() {
-                let d_ps = self.distance(cand_id, sel_id);
-                // Strict inequality tie-broken by lower id via the outer
-                // sort order (candidates in scratch_working are ascending
-                // by distance).
+            for &(sel_id, _) in accepted.iter() {
+                let d_ps = self.distance(cand_id, sel_id as usize);
                 if d_ps < cand_dist.0 {
                     ok = false;
                     break;
@@ -938,8 +1062,7 @@ where
             }
 
             if ok {
-                accepted.push(cand_id as u32);
-                state.scratch_discarded.push((cand_dist, cand_id));
+                accepted.push((cand_id as u32, cand_dist.0));
             }
         }
 
@@ -950,65 +1073,77 @@ where
     // Connectivity fix //
     //////////////////////
 
-    /// DFS from `n_p` on the partial NSG; patch every unreachable node.
+    /// Ensure every node is reachable from `n_p` by forward walk.
     ///
-    /// Patches consist of a beam-search on the partial NSG from `n_p`
-    /// toward each unreachable node `u`, then adding the edge `t -> u`
-    /// where `t` is the nearest reachable point in the pool.
+    /// Follows the reference NSG `tree_grow` pattern: interleave DFS with
+    /// per-unreachable-node patching. Persistent `reachable` flags carry
+    /// across DFS restarts, so patching one unreachable `u` and restarting
+    /// DFS from `u` propagates through `u`'s entire subtree in a single
+    /// pass — no re-visiting nodes that a patched ancestor already covered.
     ///
-    /// Each iteration shrinks the unreachable set by at least one node,
-    /// so termination is guaranteed.
+    /// The patch itself is unconditional: `t -> u` is always added (via
+    /// `push_neighbour_unchecked`), even if `t` already has degree `r`.
+    /// Nodes whose degree exceeded `r` after patching are absorbed by
+    /// `into_flat`, which widens the stride to accommodate them.
     ///
     /// ### Params
     ///
     /// * `build_graph` - Partial NSG under construction
     /// * `verbose` - Print progress
-    fn dfs_connectivity_fix(&self, build_graph: &NsgConstructionGraph, verbose: bool) {
+    fn dfs_connectivity_fix(&self, build_graph: &NsgConstructionGraph<T>, verbose: bool) {
         let mut reachable = vec![false; self.n];
         let mut stack: Vec<usize> = Vec::new();
         let np = self.navigating_node as usize;
         reachable[np] = true;
         stack.push(np);
 
-        while let Some(node) = stack.pop() {
-            // SAFETY: no concurrent writes during the sequential DFS phase.
-            let nbrs = unsafe { build_graph.get_neighbours_slice(node) }.to_vec();
-            for &nbr in &nbrs {
-                let n_idx = nbr as usize;
-                if !reachable[n_idx] {
-                    reachable[n_idx] = true;
-                    stack.push(n_idx);
+        let mut patch_count = 0usize;
+        let mut cursor = 0usize;
+
+        loop {
+            // Drain the DFS stack; each pop expands one node's outgoing
+            // edges. Persistent reachable[] means restarts don't retraverse.
+            while let Some(node) = stack.pop() {
+                // SAFETY: sequential phase.
+                let nbrs = unsafe { build_graph.get_neighbours_slice(node) };
+                for &(nbr, _) in nbrs {
+                    let n_idx = nbr as usize;
+                    if !reachable[n_idx] {
+                        reachable[n_idx] = true;
+                        stack.push(n_idx);
+                    }
                 }
             }
-        }
 
-        let unreachable: Vec<usize> = (0..self.n).filter(|&i| !reachable[i]).collect();
-        if verbose && !unreachable.is_empty() {
-            println!(
-                "DFS: patching {} unreachable nodes",
-                unreachable.len().separate_with_underscores()
-            );
-        }
+            // Find the next unreachable node.
+            while cursor < self.n && reachable[cursor] {
+                cursor += 1;
+            }
+            if cursor == self.n {
+                break;
+            }
+            let u = cursor;
 
-        for u in unreachable {
             let t = self.beam_search_on_partial_graph(build_graph, np, u, self.l_build, &reachable);
             let dist_tu = self.distance(t, u);
 
             // SAFETY: sequential phase, no concurrent access.
-            let neighbour_dists: Vec<T> = unsafe {
-                build_graph
-                    .get_neighbours_slice(t)
-                    .iter()
-                    .map(|&nbr| self.distance(t, nbr as usize))
-                    .collect()
-            };
             unsafe {
-                build_graph.add_or_evict_neighbour(t, u as u32, dist_tu, &neighbour_dists);
+                build_graph.push_neighbour_unchecked(t, u as u32, dist_tu);
             }
-            // Adding an edge from a reachable node guarantees u is now
-            // reachable in the next connected component scan; we mark it
-            // eagerly to avoid recomputing DFS.
+
+            // Mark u reachable and restart DFS from u so its outgoing
+            // subtree flood-fills in the next iteration.
             reachable[u] = true;
+            stack.push(u);
+            patch_count += 1;
+        }
+
+        if verbose && patch_count > 0 {
+            println!(
+                "DFS: patched {} unreachable nodes",
+                patch_count.separate_with_underscores()
+            );
         }
     }
 
@@ -1031,7 +1166,7 @@ where
     /// if the beam somehow returned nothing reachable (should not happen).
     fn beam_search_on_partial_graph(
         &self,
-        build_graph: &NsgConstructionGraph,
+        build_graph: &NsgConstructionGraph<T>,
         np: usize,
         u: usize,
         l_build: usize,
@@ -1055,7 +1190,7 @@ where
 
                 // SAFETY: sequential connectivity-fix phase.
                 let nbrs = unsafe { build_graph.get_neighbours_slice(current_id) };
-                for &nbr in nbrs {
+                for &(nbr, _) in nbrs {
                     let n_idx = nbr as usize;
                     if n_idx >= self.n || state.is_visited(n_idx) {
                         continue;
@@ -1106,11 +1241,12 @@ where
     ///
     /// ### Returns
     ///
-    /// Slice of length `R`. Sentinel entries mark unused slots.
+    /// Slice of length `max_degree`. Sentinel entries ([`u32::MAX`]) mark
+    /// unused slots; callers should break on the first sentinel.
     #[inline(always)]
     fn get_neighbours_flat(&self, node_id: usize) -> &[u32] {
-        let start = node_id * self.r;
-        &self.graph[start..start + self.r]
+        let start = node_id * self.max_degree;
+        &self.graph[start..start + self.max_degree]
     }
 
     /// Query the index for `k` nearest neighbours.
@@ -1428,8 +1564,8 @@ mod tests {
         let mat = simple_matrix();
         let idx = build_default(&mat, Dist::SquaredEuclidean);
         for node in 0..idx.n {
-            let base = node * idx.r;
-            for &nbr in &idx.graph[base..base + idx.r] {
+            let base = node * idx.max_degree;
+            for &nbr in &idx.graph[base..base + idx.max_degree] {
                 if nbr == u32::MAX {
                     break;
                 }
@@ -1443,8 +1579,8 @@ mod tests {
         let mat = simple_matrix();
         let idx = build_default(&mat, Dist::SquaredEuclidean);
         for node in 0..idx.n {
-            let base = node * idx.r;
-            for &nbr in &idx.graph[base..base + idx.r] {
+            let base = node * idx.max_degree;
+            for &nbr in &idx.graph[base..base + idx.max_degree] {
                 if nbr == u32::MAX {
                     break;
                 }
@@ -1468,8 +1604,8 @@ mod tests {
         reachable[idx.navigating_node as usize] = true;
 
         while let Some(node) = stack.pop() {
-            let base = node * idx.r;
-            for &nbr in &idx.graph[base..base + idx.r] {
+            let base = node * idx.max_degree;
+            for &nbr in &idx.graph[base..base + idx.max_degree] {
                 if nbr == u32::MAX {
                     break;
                 }
