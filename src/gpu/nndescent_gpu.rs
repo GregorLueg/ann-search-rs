@@ -2335,6 +2335,469 @@ where
     }
 }
 
+/////////////////
+// KnnGraphGpu //
+/////////////////
+
+/// Raw kNN graph built on the GPU, without CAGRA optimisation or query
+/// support.
+///
+/// A slim counterpart to [`NNDescentGpu`] aimed at consumers that only
+/// need a true k-nearest-neighbour graph (NSG feeding, downstream MRNG
+/// pruning, plain kNN extraction) and do not want to pay for CAGRA's
+/// rank-prune + reverse-merge kernels, the CPU distance recomputation
+/// pass, or the second `nav_graph` copy in memory.
+///
+/// The graph is exactly `n * k` `(pid, dist)` pairs. Rows are sorted
+/// ascending by distance and sentinel-padded when NNDescent returned
+/// fewer than `k` valid non-self neighbours for a node.
+///
+/// ### Fields
+pub struct KnnGraphGpu<T> {
+    /// Original (unpadded) vector data, flattened row-major
+    pub vectors_flat: Vec<T>,
+    /// Original embedding dimensionality
+    pub dim: usize,
+    /// Number of vectors
+    pub n: usize,
+    /// Neighbours per node
+    pub k: usize,
+    /// Pre-computed L2 norms (Cosine only; empty for Euclidean)
+    pub norms: Vec<T>,
+    /// Distance metric
+    pub metric: Dist,
+    /// Flat kNN graph of size `n * k`, sorted per row ascending by distance
+    pub knn_graph: Vec<(usize, T)>,
+    /// Whether NNDescent hit the delta convergence threshold
+    pub converged: bool,
+}
+
+/// Build a raw kNN graph on the GPU without touching the CAGRA path.
+///
+/// Reuses every kernel that [`NNDescentGpu::build`] uses for the
+/// NNDescent phase (random init, forest init, mark-all-new,
+/// reset-proposals, reverse-candidates, local-join, merge-proposals,
+/// optional 2-hop refinement) but skips the CAGRA rank-prune,
+/// reverse-merge, and the CPU distance recomputation that follows.
+///
+/// Query methods are deliberately absent: `KnnGraphGpu` is a data
+/// handoff, not a queryable index. Feed it to [`NsgIndex::build_from_gpu_knn`]
+/// for graph-based query, or unpack `knn_graph` directly for raw kNN
+/// consumers.
+///
+/// ### Params
+///
+/// * `data` - Row-major sample matrix
+/// * `metric` - Distance metric (Manhattan is rejected)
+/// * `k` - Neighbours per node in the returned graph. Defaults to 30
+/// * `build_k` - Wider working degree during NNDescent iterations.
+///   Defaults to `max(k, 1.5 * k)`. Larger `build_k` improves final
+///   graph quality at a linear iteration-cost hit
+/// * `max_iters` - Maximum NNDescent iterations. Defaults to
+///   [`DEFAULT_MAX_ITERS`]
+/// * `n_trees` - Trees for GPU forest init. Defaults to a `n^0.25` rule
+/// * `delta` - Convergence threshold (fraction of `n*build_k` edges
+///   updated). Defaults to [`DEFAULT_DELTA`]
+/// * `rho` - Local-join sampling rate. Defaults to [`DEFAULT_RHO`]
+/// * `refine_knn` - Number of 2-hop refinement sweeps after the main
+///   NNDescent loop. Defaults to `0`
+/// * `seed` - RNG seed for reproducibility
+/// * `verbose` - Print per-phase progress
+/// * `device` - CubeCL runtime device
+///
+/// ### Returns
+///
+/// Populated [`KnnGraphGpu`].
+#[allow(clippy::too_many_arguments)]
+pub fn build_knn_graph_gpu<T, R>(
+    data: MatRef<T>,
+    metric: Dist,
+    k: Option<usize>,
+    build_k: Option<usize>,
+    max_iters: Option<usize>,
+    n_trees: Option<usize>,
+    delta: Option<f32>,
+    rho: Option<f32>,
+    refine_knn: Option<usize>,
+    seed: usize,
+    verbose: bool,
+    device: R::Device,
+) -> Result<KnnGraphGpu<T>, AnnSearchErrors>
+where
+    T: AnnSearchFloat + AnnSearchGpuFloat,
+    R: Runtime,
+{
+    if metric == Dist::Manhattan {
+        return Err(AnnSearchErrors::DistanceNotSupported(metric));
+    }
+
+    let (vectors_flat, n, dim) = matrix_to_flat(data);
+    let k = k.unwrap_or(30);
+    let build_k = build_k.unwrap_or((1.5 * k as f32) as usize).max(k);
+    let max_iters = max_iters.unwrap_or(DEFAULT_MAX_ITERS);
+    let delta = delta.unwrap_or(DEFAULT_DELTA);
+    let rho = rho.unwrap_or(DEFAULT_RHO);
+    let rho_thresh = (rho * 65535.0) as u32;
+    let refine_knn = refine_knn.unwrap_or(0);
+
+    let line = LINE_SIZE;
+    let dim_padded = dim.next_multiple_of(line);
+    let dim_vec = dim_padded / line;
+
+    let vectors_padded = if dim_padded != dim {
+        pad_vectors(&vectors_flat, n, dim, dim_padded)
+    } else {
+        vectors_flat.clone()
+    };
+
+    let norms = if metric == Dist::Cosine {
+        (0..n)
+            .into_par_iter()
+            .map(|i| T::calculate_l2_norm(&vectors_flat[i * dim..(i + 1) * dim]))
+            .collect()
+    } else {
+        Vec::new()
+    };
+
+    if verbose {
+        println!(
+            "kNN-Graph-GPU: {} vectors, dim={} (padded to {}), k={}, build_k={}",
+            n.separate_with_underscores(),
+            dim,
+            dim_padded,
+            k,
+            build_k,
+        );
+    }
+
+    let start = Instant::now();
+
+    // ---- GPU setup ----
+
+    let n_trees_forest = n_trees.unwrap_or_else(|| {
+        let calculated = 5 + ((n as f64).powf(0.25)).round() as usize;
+        calculated.min(20)
+    });
+
+    let client = R::client(&device);
+    let use_cosine = metric == Dist::Cosine;
+
+    let vectors_gpu =
+        GpuTensor::<R, T>::from_slice(&vectors_padded, vec![n, dim_padded], &client);
+
+    let norms_gpu = if use_cosine {
+        GpuTensor::<R, T>::from_slice(&norms, vec![n], &client)
+    } else {
+        GpuTensor::<R, T>::from_slice(&[T::zero()], vec![1], &client)
+    };
+
+    let graph_idx_gpu = GpuTensor::<R, u32>::from_slice(
+        &vec![0x7FFFFFFFu32; n * build_k],
+        vec![n, build_k],
+        &client,
+    );
+    let graph_dist_gpu = GpuTensor::<R, T>::from_slice(
+        &vec![<T as num_traits::Float>::max_value(); n * build_k],
+        vec![n, build_k],
+        &client,
+    );
+
+    let max_prop = MAX_PROPOSALS;
+    let prop_idx_gpu = GpuTensor::<R, u32>::empty(vec![n, max_prop], &client);
+    let prop_dist_gpu = GpuTensor::<R, T>::empty(vec![n, max_prop], &client);
+    let prop_count_gpu = GpuTensor::<R, u32>::empty(vec![n], &client);
+    let update_counter_gpu = GpuTensor::<R, u32>::empty(vec![1], &client);
+
+    let (grid_n_x, grid_n_y) = grid_2d((n as u32).div_ceil(WORKGROUP_SIZE_X));
+
+    // ---- Random graph initialisation ----
+
+    if verbose {
+        println!("  Random graph initialisation...");
+    }
+    unsafe {
+        init_random_graph::launch_unchecked::<T, R>(
+            &client,
+            CubeCount::Static(grid_n_x, grid_n_y, 1),
+            CubeDim::new_2d(WORKGROUP_SIZE_X, 1),
+            line,
+            vectors_gpu.clone().into_tensor_arg(),
+            norms_gpu.clone().into_tensor_arg(),
+            graph_idx_gpu.clone().into_tensor_arg(),
+            graph_dist_gpu.clone().into_tensor_arg(),
+            n as u32,
+            seed as u32,
+            use_cosine,
+            dim_vec,
+        );
+    }
+
+    // ---- Forest graph initialisation ----
+
+    let _router = gpu_forest_init(
+        &vectors_gpu,
+        &norms_gpu,
+        &graph_idx_gpu,
+        &graph_dist_gpu,
+        &prop_idx_gpu,
+        &prop_dist_gpu,
+        &prop_count_gpu,
+        &update_counter_gpu,
+        n,
+        dim,
+        dim_padded,
+        n_trees_forest,
+        seed,
+        use_cosine,
+        verbose,
+        &client,
+    )?;
+
+    // ---- Mark all graph entries as new ----
+
+    let total_entries = (n * build_k) as u32;
+    let mark_grid_flat = total_entries.div_ceil(WORKGROUP_SIZE_X);
+    let mark_cubes_x = mark_grid_flat.min(65535);
+    let mark_cubes_y = mark_grid_flat.div_ceil(mark_cubes_x);
+    unsafe {
+        mark_all_new::launch_unchecked::<R>(
+            &client,
+            CubeCount::Static(mark_cubes_x, mark_cubes_y, 1),
+            CubeDim::new_2d(WORKGROUP_SIZE_X, 1),
+            graph_idx_gpu.clone().into_tensor_arg(),
+            total_entries,
+        );
+    }
+
+    // ---- NNDescent iterations ----
+
+    let iter_start = Instant::now();
+    let mut converged = false;
+
+    let reverse_idx_gpu = GpuTensor::<R, u32>::empty(vec![n, build_k], &client);
+    let reverse_count_gpu = GpuTensor::<R, u32>::empty(vec![n], &client);
+
+    for iter in 0..max_iters {
+        let cubes_x = 65535u32;
+        let cubes_y = (n as u32).div_ceil(cubes_x);
+
+        unsafe {
+            reset_proposals::launch_unchecked::<R>(
+                &client,
+                CubeCount::Static(grid_n_x, grid_n_y, 1),
+                CubeDim::new_2d(WORKGROUP_SIZE_X, 1),
+                prop_count_gpu.clone().into_tensor_arg(),
+                update_counter_gpu.clone().into_tensor_arg(),
+                n as u32,
+            );
+
+            reset_proposals::launch_unchecked::<R>(
+                &client,
+                CubeCount::Static(grid_n_x, grid_n_y, 1),
+                CubeDim::new_2d(WORKGROUP_SIZE_X, 1),
+                reverse_count_gpu.clone().into_tensor_arg(),
+                update_counter_gpu.clone().into_tensor_arg(),
+                n as u32,
+            );
+        }
+
+        unsafe {
+            build_reverse_candidates::launch_unchecked::<R>(
+                &client,
+                CubeCount::Static(grid_n_x, grid_n_y, 1),
+                CubeDim::new_2d(WORKGROUP_SIZE_X, 1),
+                graph_idx_gpu.clone().into_tensor_arg(),
+                reverse_idx_gpu.clone().into_tensor_arg(),
+                reverse_count_gpu.clone().into_tensor_arg(),
+                n as u32,
+                build_k as u32,
+            );
+        }
+
+        let iter_seed = seed as u32 ^ (iter as u32).wrapping_mul(0x9E3779B9u32);
+
+        unsafe {
+            local_join_shared::launch_unchecked::<T, R>(
+                &client,
+                CubeCount::Static(cubes_x, cubes_y, 1),
+                CubeDim::new_2d(WORKGROUP_SIZE_X, 1),
+                line,
+                vectors_gpu.clone().into_tensor_arg(),
+                norms_gpu.clone().into_tensor_arg(),
+                graph_idx_gpu.clone().into_tensor_arg(),
+                graph_dist_gpu.clone().into_tensor_arg(),
+                reverse_idx_gpu.clone().into_tensor_arg(),
+                reverse_count_gpu.clone().into_tensor_arg(),
+                prop_idx_gpu.clone().into_tensor_arg(),
+                prop_dist_gpu.clone().into_tensor_arg(),
+                prop_count_gpu.clone().into_tensor_arg(),
+                n as u32,
+                rho_thresh,
+                iter_seed,
+                MAX_PROPOSALS as u32,
+                use_cosine,
+                dim_vec,
+                build_k,
+            );
+        }
+
+        unsafe {
+            merge_proposals::launch_unchecked::<T, R>(
+                &client,
+                CubeCount::Static(grid_n_x, grid_n_y, 1),
+                CubeDim::new_2d(WORKGROUP_SIZE_X, 1),
+                graph_idx_gpu.clone().into_tensor_arg(),
+                graph_dist_gpu.clone().into_tensor_arg(),
+                prop_idx_gpu.clone().into_tensor_arg(),
+                prop_dist_gpu.clone().into_tensor_arg(),
+                prop_count_gpu.clone().into_tensor_arg(),
+                update_counter_gpu.clone().into_tensor_arg(),
+                n as u32,
+                MAX_PROPOSALS as u32,
+            );
+        }
+
+        let counter_data = update_counter_gpu.clone().read(&client)?;
+        let updates = counter_data[0] as f64;
+        let rate = updates / (n * build_k) as f64;
+
+        if verbose {
+            println!(
+                "   Iter {}: {} updates (rate={:.6})",
+                iter + 1,
+                (updates as usize).separate_with_underscores(),
+                rate
+            );
+        }
+
+        if rate < delta as f64 {
+            if verbose {
+                println!("  Converged after {} iterations", iter + 1);
+            }
+            converged = true;
+            break;
+        }
+    }
+
+    if verbose {
+        println!("  NNDescent iterations: {:.2?}", iter_start.elapsed());
+    }
+
+    // ---- Optional 2-hop refinement ----
+
+    if verbose && refine_knn > 0 {
+        println!("  Running 2-Hop Refinement Sweep...");
+    }
+
+    let refinement_start = Instant::now();
+    let cubes_x = 65535u32;
+    let cubes_y = (n as u32).div_ceil(cubes_x);
+
+    for sweep in 0..refine_knn {
+        unsafe {
+            reset_proposals::launch_unchecked::<R>(
+                &client,
+                CubeCount::Static(grid_n_x, grid_n_y, 1),
+                CubeDim::new_2d(WORKGROUP_SIZE_X, 1),
+                prop_count_gpu.clone().into_tensor_arg(),
+                update_counter_gpu.clone().into_tensor_arg(),
+                n as u32,
+            );
+
+            two_hop_refinement::launch_unchecked::<T, R>(
+                &client,
+                CubeCount::Static(cubes_x, cubes_y, 1),
+                CubeDim::new_2d(WORKGROUP_SIZE_X, 1),
+                line,
+                vectors_gpu.clone().into_tensor_arg(),
+                norms_gpu.clone().into_tensor_arg(),
+                graph_idx_gpu.clone().into_tensor_arg(),
+                graph_dist_gpu.clone().into_tensor_arg(),
+                prop_idx_gpu.clone().into_tensor_arg(),
+                prop_dist_gpu.clone().into_tensor_arg(),
+                prop_count_gpu.clone().into_tensor_arg(),
+                n as u32,
+                MAX_PROPOSALS as u32,
+                use_cosine,
+                dim_vec,
+            );
+
+            merge_proposals::launch_unchecked::<T, R>(
+                &client,
+                CubeCount::Static(grid_n_x, grid_n_y, 1),
+                CubeDim::new_2d(WORKGROUP_SIZE_X, 1),
+                graph_idx_gpu.clone().into_tensor_arg(),
+                graph_dist_gpu.clone().into_tensor_arg(),
+                prop_idx_gpu.clone().into_tensor_arg(),
+                prop_dist_gpu.clone().into_tensor_arg(),
+                prop_count_gpu.clone().into_tensor_arg(),
+                update_counter_gpu.clone().into_tensor_arg(),
+                n as u32,
+                MAX_PROPOSALS as u32,
+            );
+        }
+
+        if verbose {
+            let counter_data = update_counter_gpu.clone().read(&client)?;
+            println!(
+                "    2-Hop sweep {}: {} updates",
+                sweep + 1,
+                counter_data[0].separate_with_underscores()
+            );
+        }
+    }
+
+    if verbose && refine_knn > 0 {
+        println!("  Refinement done in: {:.2?}", refinement_start.elapsed());
+    }
+
+    // ---- Download graph and extract top-k per row ----
+
+    let nndescent_idx = graph_idx_gpu.read(&client)?;
+    let nndescent_dist = graph_dist_gpu.read(&client)?;
+    let pid_mask = 0x7FFFFFFFu32;
+    let sentinel = SENTINEL_PID;
+
+    let mut knn_graph = vec![(sentinel, <T as num_traits::Float>::max_value()); n * k];
+
+    knn_graph
+        .par_chunks_mut(k)
+        .enumerate()
+        .for_each(|(i, slot)| {
+            let mut written = 0;
+            for j in 0..build_k {
+                if written >= k {
+                    break;
+                }
+                let raw = nndescent_idx[i * build_k + j];
+                let pid = (raw & pid_mask) as usize;
+                if pid < n && pid != i && pid != sentinel {
+                    let dist = nndescent_dist[i * build_k + j];
+                    slot[written] = (pid, dist);
+                    written += 1;
+                }
+            }
+            slot.sort_unstable_by(|a, b| {
+                a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal)
+            });
+        });
+
+    if verbose {
+        println!("  Total build time: {:.2?}", start.elapsed());
+    }
+
+    Ok(KnnGraphGpu {
+        vectors_flat,
+        dim,
+        n,
+        k,
+        norms,
+        metric,
+        knn_graph,
+        converged,
+    })
+}
+
 ///////////
 // Tests //
 ///////////

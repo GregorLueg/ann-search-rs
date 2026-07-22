@@ -2786,6 +2786,88 @@ where
     NsgIndex::build_from_gpu_nndescent(nnd_gpu, params, seed, verbose)
 }
 
+#[cfg(feature = "gpu")]
+/// Build a raw kNN graph on the GPU without CAGRA optimisation or query
+/// support. Slim counterpart to [`build_nndescent_index_gpu`] aimed at
+/// NSG feeders and raw-kNN consumers.
+///
+/// ### Params
+///
+/// * `mat` - Input matrix (samples x features)
+/// * `dist_metric` - Distance metric string
+/// * `k` - Neighbours per node (default 30)
+/// * `build_k` - Internal NNDescent working degree (default 1.5*k)
+/// * `max_iters` - Maximum NNDescent iterations (default 15)
+/// * `n_trees` - Forest size for GPU init (default auto)
+/// * `delta` - Convergence threshold (default 0.001)
+/// * `rho` - Local-join sampling rate (default 0.5)
+/// * `refine_knn` - 2-hop refinement sweeps after main loop (default 0)
+/// * `seed` - Random seed
+/// * `verbose` - Print progress
+/// * `device` - CubeCL runtime device
+#[allow(clippy::too_many_arguments)]
+pub fn build_knn_graph_gpu<T, R>(
+    mat: MatRef<T>,
+    dist_metric: &str,
+    k: Option<usize>,
+    build_k: Option<usize>,
+    max_iters: Option<usize>,
+    n_trees: Option<usize>,
+    delta: Option<f32>,
+    rho: Option<f32>,
+    refine_knn: Option<usize>,
+    seed: usize,
+    verbose: bool,
+    device: R::Device,
+) -> Result<crate::gpu::nndescent_gpu::KnnGraphGpu<T>, AnnSearchErrors>
+where
+    R: Runtime,
+    T: AnnSearchFloat + AnnSearchGpuFloat,
+{
+    let metric = parse_ann_dist(dist_metric).unwrap_or_else(|| {
+        println!("[WARNING] Weird string used for distance metric. Using default squared Euclidean distance");
+        Dist::default()
+    });
+
+    crate::gpu::nndescent_gpu::build_knn_graph_gpu::<T, R>(
+        mat, metric, k, build_k, max_iters, n_trees, delta, rho, refine_knn, seed, verbose,
+        device,
+    )
+}
+
+#[cfg(feature = "gpu")]
+/// Build an NSG index from a slim GPU-built kNN graph.
+///
+/// Companion to [`build_nsg_from_gpu_nndescent`] for callers that used
+/// [`build_knn_graph_gpu`] instead of the full CAGRA-optimised
+/// [`build_nndescent_index_gpu`]. Cheaper end-to-end: no CAGRA kernels,
+/// no CPU distance recompute, no second graph copy in memory.
+///
+/// ### Params
+///
+/// * `knn_gpu` - Reference to a pre-built [`crate::gpu::nndescent_gpu::KnnGraphGpu`]
+/// * `r` - Maximum out-degree of the NSG graph
+/// * `l_build` - Beam width for the per-node candidate search
+/// * `c` - Cap on the candidate-set size before MRNG pruning
+/// * `seed` - Random seed for reproducibility
+/// * `verbose` - Print progress
+pub fn build_nsg_from_gpu_knn<T>(
+    knn_gpu: &crate::gpu::nndescent_gpu::KnnGraphGpu<T>,
+    r: usize,
+    l_build: usize,
+    c: usize,
+    seed: usize,
+    verbose: bool,
+) -> Result<NsgIndex<T>, AnnSearchErrors>
+where
+    T: AnnSearchFloat,
+    NsgIndex<T>: NsgState<T>,
+    NNDescent<T>: ApplySortedUpdates<T> + NNDescentQuery<T>,
+{
+    let params = NsgBuildParams::new(r, l_build, c, knn_gpu.k);
+    NsgIndex::build_from_gpu_knn(knn_gpu, params, seed, verbose)
+}
+
 ////////////
 // Binary //
 ////////////
