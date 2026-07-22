@@ -14,7 +14,10 @@
 //! 2. In parallel for every node `v`, run a bounded beam-search from `n_p`
 //!    toward `v` on the kNN graph, collect the visited set, union in `v`'s
 //!    kNN neighbours, sort ascending by distance to `v`, and apply the MRNG
-//!    prune to select at most `R` outgoing edges.
+//!    prune to select at most `R` outgoing edges. After reverse-edge
+//!    insertion, top nodes below degree `R` back up with their closest kNN
+//!    entries: on clustered data MRNG occlusion alone collapses to a handful
+//!    of edges, and the resulting sparse graph dead-ends queries.
 //! 3. Sequentially run a DFS from `n_p` on the partial NSG. For each
 //!    unreachable node `u`, find its nearest reachable predecessor `t` and
 //!    add the edge `t -> u`, evicting `t`'s farthest neighbour if it is at
@@ -135,8 +138,11 @@ impl NsgState<f64> for NsgIndex<f64> {
 /// ### Fields
 #[derive(Clone, Copy, Debug)]
 pub struct NsgBuildParams {
-    /// Maximum out-degree of the NSG graph (`R` in the paper). Typical values:
-    /// 32–70 for SIFT-scale, higher for harder datasets.
+    /// Target out-degree of the NSG graph (`R` in the paper). MRNG pruning
+    /// selects at most `r` diversified edges; nodes left below `r` are then
+    /// topped up with their closest kNN entries, so `r` is the actual degree
+    /// for almost every node. Typical values: 32–70 for SIFT-scale, higher
+    /// for harder datasets.
     pub r: usize,
     /// Beam width for the per-node search on the input kNN graph during build
     /// (`L` in the paper). Larger `l_build` yields more candidates per node.
@@ -168,7 +174,7 @@ impl NsgBuildParams {
     ///
     /// ### Params
     ///
-    /// * `r` - Maximum out-degree
+    /// * `r` - Target out-degree
     /// * `l_build` - Build-time beam width
     /// * `c` - Cap on candidate-set size before pruning
     /// * `knn_k` - Degree of the internal kNN graph
@@ -221,7 +227,7 @@ impl<T: Copy + PartialOrd> NsgConstructionGraph<T> {
     /// ### Params
     ///
     /// * `n` - Number of nodes
-    /// * `r` - Maximum out-degree per node (soft cap)
+    /// * `r` - Target out-degree per node (soft cap)
     /// * `threads` - Expected number of concurrent writers
     ///
     /// ### Returns
@@ -854,6 +860,45 @@ where
             );
         }
 
+        // Step 2c: kNN top-up. MRNG occlusion collapses to ~6-8 edges per
+        // node on clustered data, so R never binds and the sparse graph
+        // dead-ends a subset of queries. Fill every node up to degree R with
+        // its closest kNN entries (cached distances, no recompute). Must run
+        // after InterInsert so reverse edges don't hit full nodes, and before
+        // the DFS fix so the denser graph needs fewer patches.
+        let t_topup = Instant::now();
+        let bg = &build_graph;
+        (0..n).into_par_iter().for_each(|v| {
+            // SAFETY: `v` is unique across the parallel iterator and step 2b's
+            // rayon scope has completed, so no other thread touches nodes[v].
+            unsafe {
+                let slot = &mut *bg.nodes[v].get();
+                if slot.len() >= params.r {
+                    return;
+                }
+                let base = v * knn_k;
+                for &(nbr, dist) in &knn_graph[base..base + knn_k] {
+                    if slot.len() >= params.r {
+                        break;
+                    }
+                    if nbr == SENTINEL_PID || nbr >= n || nbr == v {
+                        continue;
+                    }
+                    let nbr_u32 = nbr as u32;
+                    if slot.iter().any(|&(id, _)| id == nbr_u32) {
+                        continue;
+                    }
+                    slot.push((nbr_u32, dist));
+                }
+            }
+        });
+        if verbose {
+            println!(
+                "NSG timing: step 2c (kNN top-up) = {:.1} ms",
+                t_topup.elapsed().as_secs_f64() * 1000.0
+            );
+        }
+
         // Step 3: DFS connectivity
         let t_dfs = Instant::now();
         index.dfs_connectivity_fix(&build_graph, verbose);
@@ -1002,7 +1047,7 @@ where
     /// * `knn_k` - Neighbours per node in `knn_graph`
     /// * `l_build` - Beam pool width
     /// * `c` - Cap on the candidate-set size before pruning
-    /// * `r` - Maximum out-degree of the resulting adjacency
+    /// * `r` - Target out-degree of the resulting adjacency
     /// * `state` - Thread-local search state (reused for visited tracking)
     ///
     /// ### Returns
