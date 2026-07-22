@@ -7,8 +7,23 @@ use faer::Mat;
 use std::time::Instant;
 use thousands::*;
 
+/// Wraps the shared `Cli` and adds an optional `--knn-k` override so the
+/// standalone NN-Descent build can be run at the same `k` NSG uses
+/// internally (default `64`) for like-for-like timing comparisons.
+#[derive(Parser, Clone)]
+struct Args {
+    #[command(flatten)]
+    cli: Cli,
+    /// Override `k` for the NN-Descent build. Defaults to the library's own
+    /// default (currently `30`) when not passed.
+    #[arg(long)]
+    knn_k: Option<usize>,
+}
+
 fn main() {
-    let cli = Cli::parse();
+    let args = Args::parse();
+    let cli = args.cli.clone();
+    let knn_k = args.knn_k;
 
     println!("-----------------------------");
     println!(
@@ -81,9 +96,12 @@ fn main() {
             .map(|i| i.to_string())
             .unwrap_or_else(|| ":auto".to_string());
 
+        let knn_k_str = knn_k
+            .map(|k| k.to_string())
+            .unwrap_or_else(|| ":auto".to_string());
         println!(
-            "Building NNDescent index (n_trees={}, diversify={})...",
-            n_trees_str, diversify_prob
+            "Building NNDescent index (n_trees={}, diversify={}, knn_k={})...",
+            n_trees_str, diversify_prob, knn_k_str
         );
         let start = Instant::now();
         let nndescent_idx = build_nndescent_index(
@@ -91,7 +109,7 @@ fn main() {
             &cli.distance,
             0.001,
             diversify_prob,
-            None,
+            knn_k,
             None,
             None,
             n_trees,
@@ -131,8 +149,8 @@ fn main() {
 
             results.push(BenchmarkResultSize {
                 method: format!(
-                    "NNDescent-nt{}-s{}-dp{} (query)",
-                    n_trees_str, ef_search_str, diversify_prob
+                    "NNDescent-k{}-nt{}-s{}-dp{} (query)",
+                    knn_k_str, n_trees_str, ef_search_str, diversify_prob
                 ),
                 build_time_ms: build_time,
                 query_time_ms: query_time,
@@ -158,7 +176,10 @@ fn main() {
         );
 
         results.push(BenchmarkResultSize {
-            method: format!("NNDescent-nt{}-dp{} (self)", n_trees_str, diversify_prob),
+            method: format!(
+                "NNDescent-k{}-nt{}-dp{} (self)",
+                knn_k_str, n_trees_str, diversify_prob
+            ),
             build_time_ms: build_time,
             query_time_ms: self_query_time,
             total_time_ms: build_time + self_query_time,
