@@ -21,6 +21,7 @@ use crate::gpu::forest_gpu::*;
 use crate::gpu::tensor::*;
 use crate::gpu::*;
 use crate::prelude::*;
+use crate::utils::nndescent_utils::SENTINEL_PID;
 
 ///////////
 // Const //
@@ -1378,6 +1379,40 @@ where
     #[allow(clippy::misnamed_getters)]
     fn dim(&self) -> usize {
         self.dim_padded
+    }
+}
+
+/////////////////////////
+// Lightweight getters //
+/////////////////////////
+
+impl<T, R> NNDescentGpu<T, R>
+where
+    R: Runtime,
+    T: AnnSearchFloat + AnnSearchGpuFloat,
+{
+    /// Distance metric this index was built with.
+    ///
+    /// ### Returns
+    ///
+    /// The [`Dist`] metric embedded at build time.
+    pub fn metric(&self) -> Dist {
+        self.metric
+    }
+
+    /// Borrow the flat kNN graph produced by NN-Descent.
+    ///
+    /// Layout is `n * k` `(pid, distance)` pairs, sorted by distance
+    /// ascending within each node's slot. Sentinel entries mark unused
+    /// slots. This is the graph before the CAGRA rank-prune / reverse-edge
+    /// optimisation is applied. It is the input a downstream index like
+    /// NSG should consume.
+    ///
+    /// ### Returns
+    ///
+    /// A slice view over the raw NN-Descent graph.
+    pub fn knn_graph(&self) -> &[(usize, T)] {
+        &self.knn_graph
     }
 }
 

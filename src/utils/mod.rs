@@ -6,6 +6,7 @@ pub mod dist;
 pub mod graph_utils;
 pub mod heap_structs;
 pub mod k_means_utils;
+pub mod nndescent_utils;
 pub mod parallelism;
 pub mod traits;
 pub mod tree_utils;

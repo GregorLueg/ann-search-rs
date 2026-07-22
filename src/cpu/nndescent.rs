@@ -6,7 +6,6 @@ use faer::{MatRef, RowRef};
 use fixedbitset::FixedBitSet;
 use rand::{rngs::SmallRng, Rng, SeedableRng};
 use rayon::prelude::*;
-use rdst::RadixKey;
 use rdst::RadixSort;
 use std::{
     cell::RefCell,
@@ -20,6 +19,7 @@ use thousands::*;
 use crate::cpu::annoy::*;
 use crate::cpu::kd_forest::*;
 use crate::prelude::*;
+use crate::utils::nndescent_utils::*;
 use crate::utils::*;
 
 ///////////////////
@@ -58,198 +58,6 @@ pub type QueryCandF32 = RefCell<BinaryHeap<Reverse<(OrderedFloat<f32>, usize)>>>
 
 /// Type alias for the query candidates for f64
 pub type QueryCandF64 = RefCell<BinaryHeap<Reverse<(OrderedFloat<f64>, usize)>>>;
-
-/////////////
-// Helpers //
-/////////////
-
-////////////////
-// Neighbours //
-////////////////
-
-/// Neighbour entry in the k-NN graph (build phase only)
-///
-/// Flat structure in C representation for cache locality. The high bit
-/// of `pid_and_flag` stores the is-new flag, leaving 31 bits for the
-/// point id (sufficient for ~2 billion points).
-#[repr(C)]
-#[derive(Clone, Copy, Debug)]
-pub struct Neighbour<T> {
-    /// Point index + new/old flag in the high bit
-    pid_and_flag: u32,
-    /// Distance to the neighbour
-    pub dist: T,
-}
-
-/// Sentinel PID used to mark empty slots in the flat graph.
-pub const SENTINEL_PID: usize = u32::MAX as usize >> 1;
-
-impl<T: Copy> Neighbour<T> {
-    const IS_NEW_MASK: u32 = 1 << 31;
-    const PID_MASK: u32 = !Self::IS_NEW_MASK;
-
-    /// Create a new neighbour entry
-    ///
-    /// The point ID must fit in 31 bits; the 32nd bit is reserved for the
-    /// is-new flag. PIDs up to ~2 billion are supported.
-    ///
-    /// ### Params
-    ///
-    /// * `pid` - Point id (must fit in 31 bits)
-    /// * `dist` - Distance to the neighbour
-    /// * `is_new` - Whether this neighbour has been explored yet
-    ///
-    /// ### Returns
-    ///
-    /// Packed neighbour entry with encoded flag
-    #[inline(always)]
-    pub fn new(pid: usize, dist: T, is_new: bool) -> Self {
-        debug_assert!(pid <= Self::PID_MASK as usize, "PID exceeds 31-bit limit");
-        let flag = if is_new { Self::IS_NEW_MASK } else { 0 };
-        Self {
-            pid_and_flag: (pid as u32) | flag,
-            dist,
-        }
-    }
-
-    /// Whether this neighbour has not yet been explored
-    ///
-    /// New neighbours participate in local joins during the next iteration;
-    /// old ones only contribute to old-new pair generation.
-    ///
-    /// ### Returns
-    ///
-    /// `true` if the high bit is set, `false` otherwise
-    #[inline(always)]
-    pub fn is_new(&self) -> bool {
-        (self.pid_and_flag & Self::IS_NEW_MASK) != 0
-    }
-
-    /// Return the point id with the flag bit masked out
-    ///
-    /// ### Returns
-    ///
-    /// Point index in the range `[0, 2^31)`
-    #[inline(always)]
-    pub fn pid(&self) -> usize {
-        (self.pid_and_flag & Self::PID_MASK) as usize
-    }
-
-    /// Whether this slot is empty (holds the sentinel PID)
-    ///
-    /// ### Returns
-    ///
-    /// `true` if this slot does not hold a valid neighbour
-    #[inline(always)]
-    pub fn is_sentinel(&self) -> bool {
-        self.pid() == SENTINEL_PID
-    }
-
-    /// Mark this neighbour as old (already explored)
-    ///
-    /// Clears the high bit whilst preserving the point id and distance.
-    #[inline(always)]
-    pub fn mark_old(&mut self) {
-        self.pid_and_flag &= Self::PID_MASK;
-    }
-}
-
-///////////////
-// Graph ptr //
-///////////////
-
-/// Unsafe pointer wrapper for lock-free parallel writes to the flat graph.
-///
-/// Safety is guaranteed by the update pattern: segments are grouped by
-/// target node, so no two threads ever write to the same `target * k`
-/// block simultaneously.
-#[derive(Copy, Clone)]
-struct UnsafeGraphPtr<T>(*mut Neighbour<T>);
-
-unsafe impl<T> Send for UnsafeGraphPtr<T> {}
-unsafe impl<T> Sync for UnsafeGraphPtr<T> {}
-
-/////////////
-// Updates //
-/////////////
-
-/// Helper structure for updates with Radix sort
-#[derive(Clone, Copy)]
-pub struct Update<T> {
-    /// Target node id
-    target: usize,
-    /// Source node id
-    source: usize,
-    /// Distance between the two
-    dist: T,
-}
-
-impl<T> Update<T> {
-    /// Create a new update triple
-    ///
-    /// Represents a candidate edge from `source` to `target` with the pre-
-    /// computed distance. Both directions are typically emitted per candidate
-    /// pair so that radix sorting by target groups them for lock-free
-    /// application.
-    ///
-    /// ### Params
-    ///
-    /// * `target` - Node receiving the edge
-    /// * `source` - Node on the other end of the edge
-    /// * `dist` - Distance between the two nodes
-    ///
-    /// ### Returns
-    ///
-    /// Update triple ready for radix sorting
-    pub fn new(target: usize, source: usize, dist: T) -> Self {
-        Self {
-            target,
-            source,
-            dist,
-        }
-    }
-}
-
-/// Implement the RadixKey for target
-impl<T> RadixKey for Update<T> {
-    const LEVELS: usize = 4;
-
-    #[inline]
-    fn get_level(&self, level: usize) -> u8 {
-        (self.target >> (level * 8)) as u8
-    }
-}
-
-/// Apply sorted neighbour updates to the flat graph.
-///
-/// Separated by concrete type (f32/f64) because of thread-local heap
-/// storage. The sorted layout allows lock-free processing since updates
-/// targeting the same node are contiguous.
-pub trait ApplySortedUpdates<T> {
-    /// Apply sorted updates to the flat 1D graph.
-    ///
-    /// ## Algorithm
-    ///
-    /// 1. Find boundaries between different target nodes in the sorted updates.
-    /// 2. Extract each target's update batch as a contiguous slice.
-    /// 3. Process batches in parallel.
-    /// 4. Merge new candidates with existing neighbours via thread-local heaps.
-    /// 5. Write results back to the flat graph via disjoint pointer writes.
-    ///
-    /// ### Params
-    ///
-    /// * `updates` - Must be sorted by target (first element)
-    /// * `graph` - Flat graph of size `n * k`
-    /// * `k` - Neighbours per node
-    /// * `updates_count` - Atomic counter for edge updates
-    fn apply_sorted_updates(
-        &self,
-        updates: &[Update<T>],
-        graph: &mut [Neighbour<T>],
-        k: usize,
-        updates_count: &AtomicUsize,
-    );
-}
 
 ////////////
 // Forest //
@@ -602,6 +410,28 @@ where
     /// Whether the algorithm converged during construction.
     pub fn index_converged(&self) -> bool {
         self.converged
+    }
+
+    /// Distance metric this index was built with.
+    ///
+    /// ### Returns
+    ///
+    /// The [`Dist`] metric embedded at build time.
+    pub fn metric(&self) -> Dist {
+        self.metric
+    }
+
+    /// Borrow the flat kNN graph.
+    ///
+    /// Layout is `n * k` `(pid, distance)` pairs, sorted by distance
+    /// ascending within each node's slot. Unused trailing slots hold
+    /// [`SENTINEL_PID`] and `T::MAX`.
+    ///
+    /// ### Returns
+    ///
+    /// A slice view over the internal graph.
+    pub fn graph(&self) -> &[(usize, T)] {
+        &self.graph
     }
 
     /// Compute chunk size for memory-bounded update processing
@@ -1268,36 +1098,6 @@ where
 
         total
     }
-}
-
-/// Find boundaries between different target nodes in sorted updates
-///
-/// Given a slice sorted by `target`, returns the indices where the target
-/// changes, bracketed by 0 and `updates.len()`. The resulting `windows(2)`
-/// gives per-target slice ranges suitable for lock-free parallel application.
-///
-/// ### Params
-///
-/// * `updates` - Updates sorted by target
-///
-/// ### Returns
-///
-/// Vector of boundary indices of length `num_distinct_targets + 1`
-fn find_target_boundaries<T>(updates: &[Update<T>]) -> Vec<usize> {
-    if updates.is_empty() {
-        return vec![0, 0];
-    }
-
-    let mut boundaries = vec![0];
-
-    for i in 1..updates.len() {
-        if updates[i].target != updates[i - 1].target {
-            boundaries.push(i);
-        }
-    }
-
-    boundaries.push(updates.len());
-    boundaries
 }
 
 ///////////////////////////
