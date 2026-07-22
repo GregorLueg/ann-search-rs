@@ -1,30 +1,8 @@
 //! Relative NN-Descent (RNN-Descent) index.
 //!
-//! RNN-Descent (Ono & Matsui, ACM MM 2023) folds the RNG-style pruning of
-//! NSG into the NN-Descent update loop so a single pass produces a
-//! search-ready graph. Compared to NN-Descent+NSG, no separate kNN graph is
-//! materialised.
-//!
-//! ### Build pipeline
-//!
-//! 1. Random init: each node picks `S` out-neighbours (distinct, not self),
-//!    all edges flagged new.
-//! 2. Outer loop for `T1` rounds:
-//!    - Inner loop for `T2` iterations: run **UpdateNeighbors** (per node in
-//!      parallel). For each node `u`, iterate its adjacency list in ascending
-//!      distance order and greedily accept candidates that pass the RNG
-//!      rule; pruned edges emit a reverse-insert `(w, v, dist)` that
-//!      targets `w`.
-//!    - If not the last round: **AddReverseEdges** — symmetrise, then cap
-//!      each per-node adjacency at top-`R` by distance. Reuses the shared
-//!      [`ApplySortedUpdates`] mechanism for the lock-free merge.
-//!
-//! ### Query
-//!
-//! Beam search from an entry point picked as the nearest of a small random
-//! pool, walking the final `(pid, dist)` graph via [`SearchState`].
-//!
-//! ### References
+//! RNN-Descent (Ono & Matsui, ACM MM 2023) folds the RNG-style pruning of NSG
+//! into the NN-Descent update loop so a single pass produces a search-ready
+//! graph. Compared to NN-Descent + NSG, no separate kNN graph is materialised.
 //!
 //! Ono, N. and Matsui, Y. *Relative NN-Descent: A Fast Index Construction for
 //! Graph-Based Approximate Nearest Neighbor Search.* ACM MM 2023.
@@ -84,8 +62,6 @@ thread_local! {
 /// `accepted` holds the greedy-accepted adjacency being built for the
 /// current source node; `emitted` collects reverse-insert updates that
 /// target other nodes.
-///
-/// ### Fields
 pub struct UpdateScratch<T> {
     /// `(dist, pid, is_new)` in ascending distance order
     pub accepted: Vec<(T, usize, bool)>,
@@ -220,16 +196,14 @@ impl RnnDescentBuildParams {
 
 /// Relative NN-Descent index.
 ///
-/// The final graph is stored as flat `(u32, T)` pairs of size `n * R`,
-/// sorted by distance ascending within each node's slot. Unused trailing
-/// slots hold `(SENTINEL_PID as u32, T::MAX)`.
+/// The final graph is stored as flat `(u32, T)` pairs of size `n * R`, sorted
+/// by distance ascending within each node's slot. Unused trailing slots hold
+/// `(SENTINEL_PID as u32, T::MAX)`.
 ///
 /// A small [`KdTreeIndex`] forest is built alongside the graph and used at
 /// query time to pick a batch of near-query entry points. This mirrors how
 /// NN-Descent seeds its beam search, but with fewer trees since the forest
 /// is only queried once per query (not per node during build).
-///
-/// ### Fields
 pub struct RnnDescentIndex<T> {
     /// Row-major flattened vectors
     pub vectors_flat: Vec<T>,
@@ -282,11 +256,11 @@ impl<T> DimensionValidation for RnnDescentIndex<T> {
 
 /// Macro producing [`ApplySortedUpdates`] impls per concrete float type.
 ///
-/// The logic mirrors NN-Descent's implementation: for each target's
-/// contiguous update segment, load the target's existing neighbours into a
-/// max-heap of size `R`, merge in candidate updates, drop the farthest when
-/// the heap overflows, then write back sorted ascending. `is_new` is
-/// preserved on existing entries and set to `true` on newly-inserted ones.
+/// The logic mirrors NN-Descent's implementation: for each target's contiguous
+/// update segment, load the target's existing neighbours into a max-heap of
+/// size `R`, merge in candidate updates, drop the farthest when the heap
+/// overflows, then write back sorted ascending. `is_new` is preserved on
+/// existing entries and set to `true` on newly-inserted ones.
 macro_rules! impl_apply_sorted_updates {
     ($float:ty, $heap_tls:ident, $sort_buf_tls:ident) => {
         impl ApplySortedUpdates<$float> for RnnDescentIndex<$float> {
@@ -359,11 +333,7 @@ macro_rules! impl_apply_sorted_updates {
                                     }
 
                                     if heap.len() < k {
-                                        heap.push((
-                                            OrderedFloat(update.dist),
-                                            src,
-                                            true,
-                                        ));
+                                        heap.push((OrderedFloat(update.dist), src, true));
                                         pid_set[src] = true;
                                         edge_updates += 1;
                                     } else if let Some(&(OrderedFloat(worst), _, _)) = heap.peek() {
@@ -371,11 +341,7 @@ macro_rules! impl_apply_sorted_updates {
                                             if let Some((_, old_pid, _)) = heap.pop() {
                                                 pid_set[old_pid] = false;
                                             }
-                                            heap.push((
-                                                OrderedFloat(update.dist),
-                                                src,
-                                                true,
-                                            ));
+                                            heap.push((OrderedFloat(update.dist), src, true));
                                             pid_set[src] = true;
                                             edge_updates += 1;
                                         }
@@ -383,8 +349,7 @@ macro_rules! impl_apply_sorted_updates {
                                 }
 
                                 if edge_updates > 0 {
-                                    updates_count
-                                        .fetch_add(edge_updates, AtomicOrdering::Relaxed);
+                                    updates_count.fetch_add(edge_updates, AtomicOrdering::Relaxed);
 
                                     sort_buf.clear();
                                     sort_buf.extend(heap.drain().map(
@@ -511,9 +476,8 @@ where
             Vec::new()
         };
 
-        let n_trees = n_trees.unwrap_or_else(|| {
-            ((n as f64).powf(0.25) / 2.0 + 5.0).min(16.0) as usize
-        });
+        let n_trees =
+            n_trees.unwrap_or_else(|| ((n as f64).powf(0.25) / 2.0 + 5.0).min(16.0) as usize);
 
         // Build the entry-point forest once, before the graph. Query time
         // multi-seeds the beam from `forest.query()` results.
@@ -558,8 +522,7 @@ where
                 }
             }
             if t1 + 1 != params.t1 {
-                let changes =
-                    index.add_reverse_edges_pass(&mut build_graph, params.r);
+                let changes = index.add_reverse_edges_pass(&mut build_graph, params.r);
                 if verbose {
                     println!(
                         "  t1={}: AddReverseEdges applied {} edge updates",
@@ -611,37 +574,34 @@ where
 
         let n = self.n;
         let actual_s = s.min(n.saturating_sub(1));
-        graph
-            .par_chunks_mut(r)
-            .enumerate()
-            .for_each(|(u, slot)| {
-                let mut rng = SmallRng::seed_from_u64((seed as u64).wrapping_add(u as u64));
-                let mut chosen: Vec<usize> = Vec::with_capacity(actual_s);
-                while chosen.len() < actual_s {
-                    let cand = rng.random_range(0..n);
-                    if cand == u || chosen.contains(&cand) {
-                        continue;
-                    }
-                    chosen.push(cand);
+        graph.par_chunks_mut(r).enumerate().for_each(|(u, slot)| {
+            let mut rng = SmallRng::seed_from_u64((seed as u64).wrapping_add(u as u64));
+            let mut chosen: Vec<usize> = Vec::with_capacity(actual_s);
+            while chosen.len() < actual_s {
+                let cand = rng.random_range(0..n);
+                if cand == u || chosen.contains(&cand) {
+                    continue;
                 }
+                chosen.push(cand);
+            }
 
-                let mut with_dist: Vec<(T, usize)> = chosen
-                    .into_iter()
-                    .map(|v| (self.distance(u, v), v))
-                    .collect();
-                with_dist.sort_unstable_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(Ordering::Equal));
+            let mut with_dist: Vec<(T, usize)> = chosen
+                .into_iter()
+                .map(|v| (self.distance(u, v), v))
+                .collect();
+            with_dist.sort_unstable_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(Ordering::Equal));
 
-                for (i, (d, v)) in with_dist.into_iter().enumerate() {
-                    slot[i] = Neighbour::new(v, d, true);
-                }
-            });
+            for (i, (d, v)) in with_dist.into_iter().enumerate() {
+                slot[i] = Neighbour::new(v, d, true);
+            }
+        });
     }
 
     /// One UpdateNeighbors pass.
     ///
     /// Parallel over source nodes; each thread accumulates reinsert updates
-    /// into a per-thread scratch. After the pass, updates are radix-sorted
-    /// by target and applied via [`ApplySortedUpdates`].
+    /// into a per-thread scratch. After the pass, updates are radix-sorted by
+    /// target and applied via [`ApplySortedUpdates`].
     ///
     /// ### Params
     ///
@@ -658,70 +618,64 @@ where
 
         let per_thread_updates: Vec<Vec<Update<T>>> = (0..n)
             .into_par_iter()
-            .fold(
-                Vec::<Update<T>>::new,
-                |mut local_emits, u| {
-                    #[allow(clippy::redundant_locals)]
-                    let graph_ptr = graph_ptr;
-                    Self::with_update_scratch(|scratch_cell| {
-                        let mut scratch_ref = scratch_cell.borrow_mut();
-                        let UpdateScratch { accepted, emitted } = &mut *scratch_ref;
-                        accepted.clear();
-                        emitted.clear();
+            .fold(Vec::<Update<T>>::new, |mut local_emits, u| {
+                #[allow(clippy::redundant_locals)]
+                let graph_ptr = graph_ptr;
+                Self::with_update_scratch(|scratch_cell| {
+                    let mut scratch_ref = scratch_cell.borrow_mut();
+                    let UpdateScratch { accepted, emitted } = &mut *scratch_ref;
+                    accepted.clear();
+                    emitted.clear();
 
-                        // Load u's current sorted adjacency.
-                        // SAFETY: u is unique across the parallel iterator.
-                        let slot = unsafe {
-                            std::slice::from_raw_parts_mut(graph_ptr.0.add(u * r), r)
-                        };
+                    // Load u's current sorted adjacency.
+                    // SAFETY: u is unique across the parallel iterator.
+                    let slot = unsafe { std::slice::from_raw_parts_mut(graph_ptr.0.add(u * r), r) };
 
-                        for entry in slot.iter() {
-                            if entry.is_sentinel() {
+                    for entry in slot.iter() {
+                        if entry.is_sentinel() {
+                            break;
+                        }
+                        accepted.push((entry.dist, entry.pid(), entry.is_new()));
+                    }
+
+                    // Greedy-accept in ascending distance order.
+                    let mut new_accepted: Vec<(T, usize, bool)> =
+                        Vec::with_capacity(accepted.len());
+
+                    for &(v_dist, v, v_new) in accepted.iter() {
+                        let mut pruned = false;
+                        for &(_, w, w_new) in new_accepted.iter() {
+                            if !v_new && !w_new {
+                                continue;
+                            }
+                            let d_vw = self.distance(v, w);
+                            // RNG prune rule from Alg. 4.
+                            if v_dist >= d_vw {
+                                emitted.push(Update::new(w as u32, v as u32, d_vw));
+                                pruned = true;
                                 break;
                             }
-                            accepted.push((entry.dist, entry.pid(), entry.is_new()));
                         }
-
-                        // Greedy-accept in ascending distance order.
-                        let mut new_accepted: Vec<(T, usize, bool)> =
-                            Vec::with_capacity(accepted.len());
-
-                        for &(v_dist, v, v_new) in accepted.iter() {
-                            let mut pruned = false;
-                            for &(_, w, w_new) in new_accepted.iter() {
-                                if !v_new && !w_new {
-                                    continue;
-                                }
-                                let d_vw = self.distance(v, w);
-                                // RNG prune rule from Alg. 4.
-                                if v_dist >= d_vw {
-                                    emitted.push(Update::new(w as u32, v as u32, d_vw));
-                                    pruned = true;
-                                    break;
-                                }
-                            }
-                            if !pruned {
-                                new_accepted.push((v_dist, v, false));
-                            }
+                        if !pruned {
+                            new_accepted.push((v_dist, v, false));
                         }
+                    }
 
-                        // Write back to u's slot (all surviving edges old).
-                        for (i, &(d, pid, _)) in new_accepted.iter().enumerate() {
-                            slot[i] = Neighbour::new(pid, d, false);
-                        }
-                        for i in new_accepted.len()..r {
-                            slot[i] = Neighbour::new(SENTINEL_PID, T::max_value(), false);
-                        }
+                    // Write back to u's slot (all surviving edges old).
+                    for (i, &(d, pid, _)) in new_accepted.iter().enumerate() {
+                        slot[i] = Neighbour::new(pid, d, false);
+                    }
+                    for i in new_accepted.len()..r {
+                        slot[i] = Neighbour::new(SENTINEL_PID, T::max_value(), false);
+                    }
 
-                        local_emits.append(emitted);
-                    });
-                    local_emits
-                },
-            )
+                    local_emits.append(emitted);
+                });
+                local_emits
+            })
             .collect();
 
-        let mut all_updates: Vec<Update<T>> =
-            per_thread_updates.into_iter().flatten().collect();
+        let mut all_updates: Vec<Update<T>> = per_thread_updates.into_iter().flatten().collect();
         if !all_updates.is_empty() {
             all_updates.radix_sort_unstable();
             self.apply_sorted_updates(&all_updates, graph, r, &counter);
@@ -732,9 +686,9 @@ where
 
     /// One AddReverseEdges pass.
     ///
-    /// Emits reverse edges from every current directed edge, then applies
-    /// them via [`ApplySortedUpdates`] with per-target cap `R`. Returns the
-    /// number of edge changes applied.
+    /// Emits reverse edges from every current directed edge, then applies them
+    /// via [`ApplySortedUpdates`] with per-target cap `R`. Returns the number
+    /// of edge changes applied.
     ///
     /// ### Params
     ///
@@ -751,20 +705,17 @@ where
         // Collect reverse-edge updates in parallel.
         let per_thread: Vec<Vec<Update<T>>> = (0..n)
             .into_par_iter()
-            .fold(
-                Vec::<Update<T>>::new,
-                |mut local, u| {
-                    let base = u * r;
-                    for entry in &graph[base..base + r] {
-                        if entry.is_sentinel() {
-                            break;
-                        }
-                        // Reverse edge: target = entry.pid, source = u.
-                        local.push(Update::new(entry.pid() as u32, u as u32, entry.dist));
+            .fold(Vec::<Update<T>>::new, |mut local, u| {
+                let base = u * r;
+                for entry in &graph[base..base + r] {
+                    if entry.is_sentinel() {
+                        break;
                     }
-                    local
-                },
-            )
+                    // Reverse edge: target = entry.pid, source = u.
+                    local.push(Update::new(entry.pid() as u32, u as u32, entry.dist));
+                }
+                local
+            })
             .collect();
 
         let mut updates: Vec<Update<T>> = per_thread.into_iter().flatten().collect();
@@ -801,18 +752,17 @@ where
         &self.graph[base..base + self.r]
     }
 
-
     /// Query the index for `k` nearest neighbours.
     ///
     /// Beam search using [`SearchState`] with pool size `ef` (default 100).
     ///
     /// The paper (Ono & Matsui 2023, Section 4.4, Eq. 4) introduces a
-    /// query-time out-degree cap `K` that limits how many of each node's
-    /// stored `R` neighbours the walk expands per hop. Since neighbours are
-    /// stored sorted ascending by distance from the source, this is a
-    /// `.take(K)` on the sorted slot. Typical values from the paper's
-    /// ablation are `K = 16-64` even when the graph was built with `R = 96`.
-    /// Default here is `min(32, R)`, matching the paper's sweet spot.
+    /// query-time out-degree cap `K` that limits how many of each node's stored
+    /// `R` neighbours the walk expands per hop. Since neighbours are stored
+    /// sorted ascending by distance from the source, this is a `.take(K)` on
+    /// the sorted slot. Typical values from the paper's ablation are
+    /// `K = 16-64` even when the graph was built with `R = 96`. Default here is
+    /// `min(32, R)`, matching the paper's sweet spot.
     ///
     /// ### Params
     ///
@@ -846,11 +796,9 @@ where
                 T::one()
             };
 
-            // Seed the beam from the kd-forest. The forest returns
-            // already-near candidates, so we can safely push all of them
-            // into `working_sorted` — unlike the earlier random-pool
-            // seeding, the resulting `furthest_dist` is a legitimate
-            // frustum bound rather than a random point far from the query.
+            // Seed the beam from the kd-forest. The forest returns already-near
+            // candidates, so we can safely push all of them into
+            // `working_sorted`.
             let init_candidates = (ef / 2).max(2 * k).min(self.n);
             let search_k = init_candidates * 3;
             let (seed_ids, seed_dists) =
@@ -1222,7 +1170,9 @@ mod tests {
         let mut data = vec![0.0_f32; n * dim];
         let mut seed = 0xdead_beef_u64;
         for slot in data.iter_mut() {
-            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            seed = seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
             *slot = ((seed >> 32) as u32 as f32) / (u32::MAX as f32);
         }
         let mat = Mat::from_fn(n, dim, |i, j| data[i * dim + j]);

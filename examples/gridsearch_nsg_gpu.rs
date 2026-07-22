@@ -72,11 +72,7 @@ fn main() {
     let knn_k: usize = 64;
 
     // Build the GPU kNN graph ONCE and reuse it across every (r, l_build)
-    // combination below. This is one of the practical wins of the slim
-    // GPU-kNN path: kNN is metric- and data-dependent, but NSG params are
-    // cheap to sweep once you have the graph. Reported per-row "build" time
-    // is (GPU-kNN build) + (CPU NSG build) so it stays comparable to the
-    // pure-CPU gridsearch_nsg numbers.
+    // combination below.
     println!("Building GPU kNN graph (k={})...", knn_k);
     let knn_start = Instant::now();
     let knn_gpu = build_knn_graph_gpu::<f32, cubecl::wgpu::WgpuRuntime>(

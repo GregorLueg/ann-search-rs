@@ -2747,46 +2747,6 @@ where
 }
 
 #[cfg(feature = "gpu")]
-/// Build an NSG index reusing a GPU NN-Descent index as the input kNN graph.
-///
-/// Skips the CPU NN-Descent build stage; the raw kNN graph is downloaded
-/// once from the GPU NN-Descent index and handed to the standard CPU NSG
-/// build. The GPU CAGRA-optimised graph is deliberately not used because
-/// MRNG pruning wants a true kNN as input, not a navigational graph.
-///
-/// ### Params
-///
-/// * `nnd_gpu` - Reference to a pre-built GPU NN-Descent index
-/// * `r` - Maximum out-degree of the NSG graph
-/// * `l_build` - Beam width for the per-node candidate search
-/// * `c` - Cap on the candidate-set size before MRNG pruning
-/// * `seed` - Random seed for reproducibility
-/// * `verbose` - Print progress
-///
-/// ### Returns
-///
-/// The built [`NsgIndex`] on success.
-#[allow(clippy::too_many_arguments)]
-pub fn build_nsg_from_gpu_nndescent<T, R>(
-    nnd_gpu: &NNDescentGpu<T, R>,
-    r: usize,
-    l_build: usize,
-    c: usize,
-    seed: usize,
-    verbose: bool,
-) -> Result<NsgIndex<T>, AnnSearchErrors>
-where
-    R: Runtime,
-    T: AnnSearchFloat + AnnSearchGpuFloat,
-    NsgIndex<T>: NsgState<T>,
-    NNDescent<T>: ApplySortedUpdates<T> + NNDescentQuery<T>,
-    NNDescentGpu<T, R>: NNDescentQuery<T>,
-{
-    let params = NsgBuildParams::new(r, l_build, c, nnd_gpu.k);
-    NsgIndex::build_from_gpu_nndescent(nnd_gpu, params, seed, verbose)
-}
-
-#[cfg(feature = "gpu")]
 /// Build a raw kNN graph on the GPU without CAGRA optimisation or query
 /// support. Slim counterpart to [`build_nndescent_index_gpu`] aimed at
 /// NSG feeders and raw-kNN consumers.
@@ -2830,8 +2790,7 @@ where
     });
 
     crate::gpu::nndescent_gpu::build_knn_graph_gpu::<T, R>(
-        mat, metric, k, build_k, max_iters, n_trees, delta, rho, refine_knn, seed, verbose,
-        device,
+        mat, metric, k, build_k, max_iters, n_trees, delta, rho, refine_knn, seed, verbose, device,
     )
 }
 

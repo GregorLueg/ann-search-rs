@@ -2342,17 +2342,15 @@ where
 /// Raw kNN graph built on the GPU, without CAGRA optimisation or query
 /// support.
 ///
-/// A slim counterpart to [`NNDescentGpu`] aimed at consumers that only
-/// need a true k-nearest-neighbour graph (NSG feeding, downstream MRNG
-/// pruning, plain kNN extraction) and do not want to pay for CAGRA's
-/// rank-prune + reverse-merge kernels, the CPU distance recomputation
-/// pass, or the second `nav_graph` copy in memory.
+/// A slim counterpart to [`NNDescentGpu`] aimed at consumers that only need a
+/// true k-nearest-neighbour graph (NSG feeding, downstream MRNG pruning, plain
+/// kNN extraction) and do not want to pay for CAGRA's rank-prune +
+/// reverse-merge kernels, the CPU distance recomputation pass, or the second
+/// `nav_graph` copy in memory.
 ///
-/// The graph is exactly `n * k` `(pid, dist)` pairs. Rows are sorted
-/// ascending by distance and sentinel-padded when NNDescent returned
-/// fewer than `k` valid non-self neighbours for a node.
-///
-/// ### Fields
+/// The graph is exactly `n * k` `(pid, dist)` pairs. Rows are sorted ascending
+/// by distance and sentinel-padded when NNDescent returned fewer than `k` valid
+/// non-self neighbours for a node.
 pub struct KnnGraphGpu<T> {
     /// Original (unpadded) vector data, flattened row-major
     pub vectors_flat: Vec<T>,
@@ -2374,16 +2372,13 @@ pub struct KnnGraphGpu<T> {
 
 /// Build a raw kNN graph on the GPU without touching the CAGRA path.
 ///
-/// Reuses every kernel that [`NNDescentGpu::build`] uses for the
-/// NNDescent phase (random init, forest init, mark-all-new,
-/// reset-proposals, reverse-candidates, local-join, merge-proposals,
-/// optional 2-hop refinement) but skips the CAGRA rank-prune,
-/// reverse-merge, and the CPU distance recomputation that follows.
+/// Reuses every kernel that [`NNDescentGpu::build`] uses for the NNDescent
+/// phase but skips the CAGRA rank-prune, reverse-merge, and the CPU distance
+/// recomputation that follows.
 ///
 /// Query methods are deliberately absent: `KnnGraphGpu` is a data
 /// handoff, not a queryable index. Feed it to [`NsgIndex::build_from_gpu_knn`]
-/// for graph-based query, or unpack `knn_graph` directly for raw kNN
-/// consumers.
+/// for graph-based query, or unpack `knn_graph` directly for raw kNN consumers.
 ///
 /// ### Params
 ///
@@ -2482,8 +2477,7 @@ where
     let client = R::client(&device);
     let use_cosine = metric == Dist::Cosine;
 
-    let vectors_gpu =
-        GpuTensor::<R, T>::from_slice(&vectors_padded, vec![n, dim_padded], &client);
+    let vectors_gpu = GpuTensor::<R, T>::from_slice(&vectors_padded, vec![n, dim_padded], &client);
 
     let norms_gpu = if use_cosine {
         GpuTensor::<R, T>::from_slice(&norms, vec![n], &client)

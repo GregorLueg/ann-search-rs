@@ -48,6 +48,16 @@ use crate::utils::nndescent_utils::{ApplySortedUpdates, SENTINEL_PID};
 use crate::utils::parallelism::StripedLocks;
 use crate::utils::*;
 
+///////////
+// Conts //
+///////////
+
+/// Hard cap on the number of random long-range candidates injected into the
+/// MRNG candidate pool per node. Grows with `r` (out-degree) but never exceeds
+/// this cap so the candidate scan stays bounded. 64 empirically gives enough
+/// spatial diversity on clustered data without inflating `mrng_prune` cost.
+const MRNG_RANDOM_CANDIDATES_CAP: usize = 64;
+
 ///////////////////
 // Thread locals //
 ///////////////////
@@ -427,28 +437,15 @@ fn compute_centroid<T: AnnSearchFloat>(vectors_flat: &[T], n: usize, dim: usize)
     centroid
 }
 
-///////////////////
-// Tuning knobs  //
-///////////////////
-
-/// Hard cap on the number of random long-range candidates injected into
-/// the MRNG candidate pool per node. Grows with `r` (out-degree) but never
-/// exceeds this cap so the candidate scan stays bounded. 64 empirically
-/// gives enough spatial diversity on clustered data without inflating
-/// `mrng_prune` cost.
-const MRNG_RANDOM_CANDIDATES_CAP: usize = 64;
-
 ///////////////
 // MetricFn  //
 ///////////////
 
 /// Static-dispatch metric selector for the NSG build kernels.
 ///
-/// `collect_and_prune_for_node` and `mrng_prune` monomorphise over this
-/// trait so the runtime `Dist` branch is stripped out of the two hottest
-/// loops in the build. Each impl hoists the base vector (`vec_p`) and
-/// pre-fetched Cosine norm (`norm_p`) out of the caller's inner loop; the
-/// impl only re-slices `vec_q`.
+/// `collect_and_prune_for_node` and `mrng_prune` monomorphise over this trait
+/// so the runtime `Dist` branch is stripped out of the two hottest loops in the
+/// build.
 trait MetricFn<T: AnnSearchFloat> {
     /// Distance between the hoisted vector `vec_p` (of some node `p`
     /// with pre-fetched norm `norm_p` when Cosine) and the vector at
@@ -499,9 +496,9 @@ where
 {
     /// Distance between two indexed points under the index metric.
     ///
-    /// Runtime metric branch. Retained for cold paths (nav-node beam,
-    /// DFS-fix beam, external-vector callers). Hot build kernels go
-    /// through [`MetricFn::distance_from_vec`] instead.
+    /// Runtime metric branch. Retained for cold paths (nav-node beam, DFS-fix
+    /// beam, external-vector callers). Hot build kernels go through
+    /// [`MetricFn::distance_from_vec`] instead.
     ///
     /// ### Params
     ///
@@ -621,10 +618,6 @@ where
     /// Build an NSG index reusing an already-built NN-Descent index as the
     /// input kNN graph.
     ///
-    /// The `data` must match the matrix that was originally passed to
-    /// [`NNDescent::new`]; NSG re-flattens it for cache locality and does
-    /// not touch the vectors owned by `nnd`.
-    ///
     /// ### Params
     ///
     /// * `data` - Original data matrix
@@ -656,56 +649,7 @@ where
         )
     }
 
-    /// Build an NSG index reusing a GPU-built NN-Descent index.
-    ///
-    /// Downloads the flat kNN graph produced by NN-Descent (before the
-    /// CAGRA rank-prune step) and hands it to the standard CPU NSG build.
-    /// The CAGRA-optimised graph on the GPU is deliberately not used here
-    /// because MRNG pruning wants a true kNN as input, not a navigational
-    /// graph.
-    ///
-    /// ### Params
-    ///
-    /// * `nnd_gpu` - Reference to a pre-built GPU NN-Descent index
-    /// * `params` - Build parameters
-    /// * `seed` - Random seed for reproducibility
-    /// * `verbose` - Print progress
-    ///
-    /// ### Returns
-    ///
-    /// Built `NsgIndex` on success.
-    #[cfg(feature = "gpu")]
-    pub fn build_from_gpu_nndescent<R>(
-        nnd_gpu: &crate::gpu::nndescent_gpu::NNDescentGpu<T, R>,
-        params: NsgBuildParams,
-        seed: usize,
-        verbose: bool,
-    ) -> Result<Self, AnnSearchErrors>
-    where
-        R: cubecl::Runtime,
-        T: crate::gpu::traits_gpu::AnnSearchGpuFloat,
-    {
-        Self::build_from_knn(
-            nnd_gpu.vectors_flat.to_owned(),
-            nnd_gpu.n,
-            nnd_gpu.dim,
-            nnd_gpu.norms.to_owned(),
-            nnd_gpu.metric(),
-            nnd_gpu.knn_graph(),
-            nnd_gpu.k,
-            params,
-            seed,
-            verbose,
-        )
-    }
-
     /// Build an NSG index from the slim GPU-built kNN graph.
-    ///
-    /// Companion to [`Self::build_from_gpu_nndescent`] for callers that
-    /// went through [`build_knn_graph_gpu`] instead of the full
-    /// CAGRA-optimised `NNDescentGpu`. The kNN graph is consumed by
-    /// value at the field level via `to_owned`; the source struct is
-    /// left intact so it can be reused (or dropped for its memory).
     ///
     /// ### Params
     ///
@@ -809,15 +753,8 @@ where
         }
 
         // Step 2a: parallel forward MRNG prune per node.
-        //
-        // Each thread writes its own source slot exactly once, so no lock is
-        // needed in this phase. The result is captured both in the
-        // construction graph AND in a per-source snapshot Vec so phase 2b can
-        // read a source's forward-MRNG selection without racing with
-        // concurrent InterInsert writes into that same slot.
         let threads = rayon::current_num_threads();
-        let build_graph: NsgConstructionGraph<T> =
-            NsgConstructionGraph::new(n, params.r, threads);
+        let build_graph: NsgConstructionGraph<T> = NsgConstructionGraph::new(n, params.r, threads);
         let mut forward: Vec<Vec<(u32, T)>> = vec![Vec::new(); n];
         let progress = Arc::new(AtomicUsize::new(0));
         let t_mrng = Instant::now();
@@ -863,15 +800,6 @@ where
         }
 
         // Step 2b: parallel InterInsert (reverse edges).
-        //
-        // For each source v, for each (u, dist_uv) in v's forward MRNG,
-        // insert v into u's adjacency under u's lock. If u is at capacity,
-        // re-run MRNG on the merged pool using u's cached distances so we
-        // never recompute u -> u's-neighbours distances.
-        //
-        // Reading forward[v] is race-free: forward[] is written in phase 2a
-        // and never mutated after. Only construction graph slots are mutated
-        // in this phase, and each is protected by the striped lock.
         let t_inter = Instant::now();
         let bg = &build_graph;
         forward.par_iter().enumerate().for_each(|(v, neighbours)| {
@@ -899,11 +827,9 @@ where
                     continue;
                 }
 
-                // At capacity: replace u's farthest neighbour with v if
-                // v is closer. MRNG's occlusion rule is too aggressive on
-                // tightly clustered data (see plan §Q2). This keeps u's
-                // degree at exactly `r` and biases toward the R closest
-                // reverse-edge sources.
+                // At capacity: replace u's farthest neighbour with v if v is
+                // closer. MRNG's occlusion rule is too aggressive on tightly
+                // clustered data.
                 unsafe {
                     let slot = &mut *build_graph.nodes[u].get();
                     let mut worst_pos = 0usize;
@@ -928,7 +854,7 @@ where
             );
         }
 
-        // Step 3: DFS connectivity fix (sequential)
+        // Step 3: DFS connectivity
         let t_dfs = Instant::now();
         index.dfs_connectivity_fix(&build_graph, verbose);
         if verbose {
@@ -959,10 +885,9 @@ where
 
     /// Beam-search the input kNN graph toward the centroid.
     ///
-    /// Uses `SearchState` for visited tracking and candidate ordering.
-    /// Seeds the beam with `l_build` distinct random entry points (matching
-    /// the reference NSG `Init_Center` behaviour) so the search doesn't
-    /// collapse into whichever single cluster a lone random entry lands in.
+    /// Uses `SearchState` for visited tracking and candidate ordering. Seeds
+    /// the beam with `l_build` distinct random entry points (matching the
+    /// reference NSG `Init_Center` behaviour).
     ///
     /// ### Params
     ///
@@ -1128,23 +1053,13 @@ where
     ) -> Vec<(u32, T)> {
         state.reset(self.n);
 
-        // Beam-search from np toward v, collecting the visited set.
-        // scratch_working accumulates (dist_to_v, node_id) pairs.
         state.scratch_working.clear();
 
-        // Hoist v's vector and (Cosine) norm once; every subsequent
-        // distance-to-v call in this function re-uses them without
-        // touching self.vectors_flat again on the base side.
         let dim = self.dim;
         let vec_v = &self.vectors_flat[v * dim..(v + 1) * dim];
         let has_norms = !self.norms.is_empty();
         let norm_v = if has_norms { self.norms[v] } else { T::zero() };
 
-        // Seed the beam with np AND np's kNN neighbours from the input graph.
-        // This gives MRNG a spatially diverse candidate pool even for tightly
-        // clustered data (np's kNN spans np's cluster; combined with the
-        // beam's exploration toward v, we cover both regions). Reference
-        // NSG's `get_neighbors` does the equivalent via `final_graph_[ep_]`.
         let mut furthest_dist = OrderedFloat(T::infinity());
         let entry_dist = OrderedFloat(M::distance_from_vec(self, vec_v, norm_v, np));
         state.mark_visited(np);
@@ -1225,15 +1140,17 @@ where
             }
         }
 
-        // Inject long-range random candidates. On clustered data the beam
-        // pool is otherwise entirely v-local (same cluster), and MRNG's
-        // occlusion rule then collapses to ~6-8 accepted edges because
-        // co-cluster candidates mutually occlude. A handful of random
-        // long-range points gives MRNG spatial diversity, mirroring what
-        // Vamana gets for free from its random-init graph.
+        // Inject long-range random candidates. On clustered data the beam pool
+        // is otherwise entirely v-local (same cluster), and MRNG's occlusion
+        // rule then collapses to ~6-8 accepted edges because co-cluster
+        // candidates mutually occlude. A handful of random long-range points
+        // gives MRNG spatial diversity, mirroring what Vamana gets for free
+        // from its random-init graph.
         let n_random = (r * 2).min(MRNG_RANDOM_CANDIDATES_CAP);
         let mut rng = SmallRng::seed_from_u64(
-            (v as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15).wrapping_add(0x1234_5678),
+            (v as u64)
+                .wrapping_mul(0x9E37_79B9_7F4A_7C15)
+                .wrapping_add(0x1234_5678),
         );
         for _ in 0..n_random {
             let cand = rng.random_range(0..self.n);
@@ -1258,18 +1175,9 @@ where
 
     /// MRNG selection on a pre-sorted candidate pool.
     ///
-    /// For each candidate `p` (closest to `base` first), accept iff no
+    /// For each candidate `p` (closest to `base` first), accept if no
     /// already-accepted `s` satisfies `d(p, s) < d(p, base)`. Strict `<`
     /// matches the paper's Algorithm 2 and the ZJULearning reference.
-    ///
-    /// Generic over the metric so the inner occlusion-check loop is
-    /// monomorphised; the candidate vector `vec_cand` and `norm_cand`
-    /// are hoisted per outer candidate, so the inner loop only re-slices
-    /// the accepted `sel_id` side.
-    ///
-    /// Used by both the forward MRNG pass (candidates from beam search +
-    /// v's kNN) and the InterInsert re-prune (candidates from u's current
-    /// adjacency + the incoming source v).
     ///
     /// ### Params
     ///
@@ -1301,12 +1209,15 @@ where
             }
 
             let vec_cand = &self.vectors_flat[cand_id * dim..(cand_id + 1) * dim];
-            let norm_cand = if has_norms { self.norms[cand_id] } else { T::zero() };
+            let norm_cand = if has_norms {
+                self.norms[cand_id]
+            } else {
+                T::zero()
+            };
 
             let mut ok = true;
             for &(sel_id, _) in accepted.iter() {
-                let d_ps =
-                    M::distance_from_vec(self, vec_cand, norm_cand, sel_id as usize);
+                let d_ps = M::distance_from_vec(self, vec_cand, norm_cand, sel_id as usize);
                 if d_ps < cand_dist.0 {
                     ok = false;
                     break;

@@ -1,5 +1,13 @@
 # News
 
+## 0.4.5
+
+**Features**
+
+- Added Navigating Spreading-out Graph (NSG) as an index. The initial kNN
+  generation can happen on CPU or GPU.
+- Added Relative NN-Descent (RNN-Descent) index.
+
 ## 0.4.4
 
 **Features**
