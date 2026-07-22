@@ -70,11 +70,16 @@ type CandScratch = (Vec<(f64, usize)>, Vec<(f64, usize)>);
 /// Static-dispatch metric selector for the update kernel.
 ///
 /// The inner loops in `generate_updates_for_chunk_impl` call
-/// `M::distance(self, p, q)` where `M` is one of the zero-sized types below.
+/// `M::distance_from_vec(idx, vec_p, norm_p, q)` where `M` is one of the
+/// zero-sized types below. `vec_p` (and `norm_p` for Cosine) is hoisted
+/// once per outer `p` iteration so the inner loop never re-slices the
+/// flat vector buffer or re-fetches the cached norm.
 /// Monomorphisation strips the runtime `Dist` branch out of the hot path.
 trait MetricFn<T: AnnSearchFloat> {
-    /// Distance between vectors at internal indices `a` and `b`.
-    fn distance(idx: &NNDescent<T>, a: usize, b: usize) -> T;
+    /// Distance between the hoisted vector `vec_p` (of node `p` with
+    /// pre-fetched norm `norm_p` when Cosine) and the vector at internal
+    /// index `q`.
+    fn distance_from_vec(idx: &NNDescent<T>, vec_p: &[T], norm_p: T, q: usize) -> T;
 }
 
 /// Squared Euclidean metric.
@@ -86,20 +91,27 @@ struct ManhattanMetric;
 
 impl<T: AnnSearchFloat> MetricFn<T> for SqEuclidMetric {
     #[inline(always)]
-    fn distance(idx: &NNDescent<T>, a: usize, b: usize) -> T {
-        idx.euclidean_distance(a, b)
+    fn distance_from_vec(idx: &NNDescent<T>, vec_p: &[T], _norm_p: T, q: usize) -> T {
+        let dim = idx.dim;
+        let vec_q = &idx.vectors_flat[q * dim..(q + 1) * dim];
+        T::euclidean_simd(vec_p, vec_q)
     }
 }
 impl<T: AnnSearchFloat> MetricFn<T> for CosineMetric {
     #[inline(always)]
-    fn distance(idx: &NNDescent<T>, a: usize, b: usize) -> T {
-        idx.cosine_distance(a, b)
+    fn distance_from_vec(idx: &NNDescent<T>, vec_p: &[T], norm_p: T, q: usize) -> T {
+        let dim = idx.dim;
+        let vec_q = &idx.vectors_flat[q * dim..(q + 1) * dim];
+        let dot = T::dot_simd(vec_p, vec_q);
+        T::one() - (dot / (norm_p * idx.norms[q]))
     }
 }
 impl<T: AnnSearchFloat> MetricFn<T> for ManhattanMetric {
     #[inline(always)]
-    fn distance(idx: &NNDescent<T>, a: usize, b: usize) -> T {
-        idx.manhattan_distance(a, b)
+    fn distance_from_vec(idx: &NNDescent<T>, vec_p: &[T], _norm_p: T, q: usize) -> T {
+        let dim = idx.dim;
+        let vec_q = &idx.vectors_flat[q * dim..(q + 1) * dim];
+        T::manhattan_simd(vec_p, vec_q)
     }
 }
 
@@ -914,6 +926,8 @@ where
         chunk_start: usize,
         chunk_end: usize,
     ) -> Vec<Update<T>> {
+        let dim = self.dim;
+        let has_norms = !self.norms.is_empty();
         (chunk_start..chunk_end)
             .into_par_iter()
             .fold(
@@ -921,42 +935,48 @@ where
                 |mut updates, i| {
                     let get_threshold = |idx: usize| -> T { graph[idx * k + k - 1].dist };
 
-                    // new-new pairs
+                    // new-new pairs. Hoist vec_p (and norm_p for Cosine)
+                    // once per outer p so the inner q-loop only re-slices
+                    // vec_q.
                     for j in 0..new_cands[i].len() {
                         let p = new_cands[i][j];
                         if p >= self.n {
                             continue;
                         }
                         let p_threshold = get_threshold(p);
+                        let vec_p = &self.vectors_flat[p * dim..(p + 1) * dim];
+                        let norm_p = if has_norms { self.norms[p] } else { T::zero() };
 
                         for l in (j + 1)..new_cands[i].len() {
                             let q = new_cands[i][l];
                             if q >= self.n || p == q {
                                 continue;
                             }
-                            let d = M::distance(self, p, q);
+                            let d = M::distance_from_vec(self, vec_p, norm_p, q);
                             if d <= p_threshold || d <= get_threshold(q) {
-                                updates.push(Update::new(p, q, d));
-                                updates.push(Update::new(q, p, d));
+                                updates.push(Update::new(p as u32, q as u32, d));
+                                updates.push(Update::new(q as u32, p as u32, d));
                             }
                         }
                     }
 
-                    // new-old pairs
+                    // new-old pairs. Same hoist as above.
                     for &p in &new_cands[i] {
                         if p >= self.n {
                             continue;
                         }
                         let p_threshold = get_threshold(p);
+                        let vec_p = &self.vectors_flat[p * dim..(p + 1) * dim];
+                        let norm_p = if has_norms { self.norms[p] } else { T::zero() };
 
                         for &q in &old_cands[i] {
                             if q >= self.n || p == q {
                                 continue;
                             }
-                            let d = M::distance(self, p, q);
+                            let d = M::distance_from_vec(self, vec_p, norm_p, q);
                             if d <= p_threshold || d <= get_threshold(q) {
-                                updates.push(Update::new(p, q, d));
-                                updates.push(Update::new(q, p, d));
+                                updates.push(Update::new(p as u32, q as u32, d));
+                                updates.push(Update::new(q as u32, p as u32, d));
                             }
                         }
                     }
@@ -1242,7 +1262,7 @@ macro_rules! impl_apply_sorted_updates {
                         let start = w[0];
                         let end = w[1];
                         if start < end {
-                            Some((updates[start].target, &updates[start..end]))
+                            Some((updates[start].target as usize, &updates[start..end]))
                         } else {
                             None
                         }
@@ -1286,7 +1306,8 @@ macro_rules! impl_apply_sorted_updates {
 
                             // Merge incoming updates.
                             for update in segment {
-                                if pid_set.contains(update.source) {
+                                let src = update.source as usize;
+                                if pid_set.contains(src) {
                                     continue;
                                 }
                                 let evicted_pid: Option<u32> = if sorted.len() == k {
@@ -1294,12 +1315,12 @@ macro_rules! impl_apply_sorted_updates {
                                 } else {
                                     None
                                 };
-                                let entry = (OrderedFloat(update.dist), update.source as u32, true);
+                                let entry = (OrderedFloat(update.dist), update.source, true);
                                 if sorted.insert(entry, k) {
                                     if let Some(pid) = evicted_pid {
                                         pid_set.remove(pid as usize);
                                     }
-                                    pid_set.insert(update.source);
+                                    pid_set.insert(src);
                                     edge_updates += 1;
                                 }
                             }

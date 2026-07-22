@@ -308,7 +308,7 @@ macro_rules! impl_apply_sorted_updates {
                         let start = w[0];
                         let end = w[1];
                         if start < end {
-                            Some((updates[start].target, &updates[start..end]))
+                            Some((updates[start].target as usize, &updates[start..end]))
                         } else {
                             None
                         }
@@ -350,20 +350,21 @@ macro_rules! impl_apply_sorted_updates {
                                 }
 
                                 for update in segment {
-                                    if update.source == target {
+                                    let src = update.source as usize;
+                                    if src == target {
                                         continue;
                                     }
-                                    if pid_set[update.source] {
+                                    if pid_set[src] {
                                         continue;
                                     }
 
                                     if heap.len() < k {
                                         heap.push((
                                             OrderedFloat(update.dist),
-                                            update.source,
+                                            src,
                                             true,
                                         ));
-                                        pid_set[update.source] = true;
+                                        pid_set[src] = true;
                                         edge_updates += 1;
                                     } else if let Some(&(OrderedFloat(worst), _, _)) = heap.peek() {
                                         if update.dist < worst {
@@ -372,10 +373,10 @@ macro_rules! impl_apply_sorted_updates {
                                             }
                                             heap.push((
                                                 OrderedFloat(update.dist),
-                                                update.source,
+                                                src,
                                                 true,
                                             ));
-                                            pid_set[update.source] = true;
+                                            pid_set[src] = true;
                                             edge_updates += 1;
                                         }
                                     }
@@ -694,7 +695,7 @@ where
                                 let d_vw = self.distance(v, w);
                                 // RNG prune rule from Alg. 4.
                                 if v_dist >= d_vw {
-                                    emitted.push(Update::new(w, v, d_vw));
+                                    emitted.push(Update::new(w as u32, v as u32, d_vw));
                                     pruned = true;
                                     break;
                                 }
@@ -759,7 +760,7 @@ where
                             break;
                         }
                         // Reverse edge: target = entry.pid, source = u.
-                        local.push(Update::new(entry.pid(), u, entry.dist));
+                        local.push(Update::new(entry.pid() as u32, u as u32, entry.dist));
                     }
                     local
                 },

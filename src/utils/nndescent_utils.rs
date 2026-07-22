@@ -142,12 +142,16 @@ unsafe impl<T> Sync for UnsafeGraphPtr<T> {}
 /// distance. Batches are radix-sorted by `target` so that all updates for a
 /// given destination node are contiguous, enabling lock-free application via
 /// [`ApplySortedUpdates`].
+///
+/// Node ids are stored as `u32` to keep the struct small (12 bytes for
+/// `Update<f32>` before alignment). The 31-bit cap on point ids in
+/// [`Neighbour`] already restricts the id range, so `u32` is sufficient.
 #[derive(Clone, Copy)]
 pub struct Update<T> {
     /// Target node id (the node whose adjacency list receives the edge)
-    pub target: usize,
+    pub target: u32,
     /// Source node id (the node on the other end of the edge)
-    pub source: usize,
+    pub source: u32,
     /// Distance between the two nodes
     pub dist: T,
 }
@@ -165,7 +169,7 @@ impl<T> Update<T> {
     ///
     /// Update triple ready for radix sorting.
     #[inline(always)]
-    pub fn new(target: usize, source: usize, dist: T) -> Self {
+    pub fn new(target: u32, source: u32, dist: T) -> Self {
         Self {
             target,
             source,
@@ -298,7 +302,7 @@ mod tests {
 
     #[test]
     fn find_boundaries_single_target() {
-        let updates: Vec<Update<f32>> = (0..5).map(|i| Update::new(7, i, i as f32)).collect();
+        let updates: Vec<Update<f32>> = (0..5u32).map(|i| Update::new(7, i, i as f32)).collect();
         assert_eq!(find_target_boundaries(&updates), vec![0, 5]);
     }
 
