@@ -1,6 +1,6 @@
 //! NNDescent implementation in ann-search-rs. Uses concepts of the original
 //! implementation, PyNNDescent and EFANNA. Leverages Annoy over Kd forest for
-//! graph initialisation.
+//! graph initialisation (when not using Manhattan distance).
 
 use faer::{MatRef, RowRef};
 use fixedbitset::FixedBitSet;

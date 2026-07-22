@@ -33,8 +33,6 @@ pub const SENTINEL_PID: usize = u32::MAX as usize >> 1;
 /// Flat structure in C representation for cache locality. The high bit of
 /// `pid_and_flag` stores the is-new flag, leaving 31 bits for the point id
 /// (sufficient for ~2 billion points).
-///
-/// ### Fields
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
 pub struct Neighbour<T> {
@@ -120,9 +118,9 @@ impl<T: Copy> Neighbour<T> {
 
 /// Unsafe pointer wrapper for lock-free parallel writes to the flat graph.
 ///
-/// Safety is guaranteed by the update pattern: segments are grouped by
-/// target node, so no two threads ever write to the same `target * k`
-/// block simultaneously.
+/// Safety is guaranteed by the update pattern: segments are grouped by target
+/// node, so no two threads ever write to the same `target * k` block
+/// simultaneously.
 ///
 /// ### Fields
 #[derive(Copy, Clone)]
@@ -144,8 +142,6 @@ unsafe impl<T> Sync for UnsafeGraphPtr<T> {}
 /// distance. Batches are radix-sorted by `target` so that all updates for a
 /// given destination node are contiguous, enabling lock-free application via
 /// [`ApplySortedUpdates`].
-///
-/// ### Fields
 #[derive(Clone, Copy)]
 pub struct Update<T> {
     /// Target node id (the node whose adjacency list receives the edge)
@@ -186,6 +182,7 @@ impl<T> Update<T> {
 impl<T> RadixKey for Update<T> {
     const LEVELS: usize = 4;
 
+    /// Claude TODO: add documentation.
     #[inline]
     fn get_level(&self, level: usize) -> u8 {
         (self.target >> (level * 8)) as u8

@@ -25,7 +25,7 @@
 //! ### References
 //!
 //! Fu, C., Xiang, C., Wang, C. and Cai, D. *Fast Approximate Nearest Neighbor
-//! Search With The Navigating Spreading-out Graph.* PVLDB 12(5), 2019.
+//! Search With The Navigating Spreading-out Graph.* PVLDB 12(5), 2017.
 //! arXiv:1707.00143.
 
 use faer::{MatRef, RowRef};
@@ -33,7 +33,10 @@ use rand::{rngs::SmallRng, Rng, SeedableRng};
 use rayon::prelude::*;
 use std::cell::{RefCell, UnsafeCell};
 use std::cmp::{Ordering, Reverse};
-use std::sync::{atomic::AtomicUsize, Arc};
+use std::sync::{
+    atomic::{AtomicUsize, Ordering::Relaxed},
+    Arc,
+};
 use thousands::*;
 
 use crate::cpu::nndescent::{NNDescent, NNDescentQuery};
@@ -120,23 +123,23 @@ impl NsgState<f64> for NsgIndex<f64> {
 /// ### Fields
 #[derive(Clone, Copy, Debug)]
 pub struct NsgBuildParams {
-    /// Maximum out-degree of the NSG graph (`R` in the paper). Typical
-    /// values: 32–70 for SIFT-scale, higher for harder datasets.
+    /// Maximum out-degree of the NSG graph (`R` in the paper). Typical values:
+    /// 32–70 for SIFT-scale, higher for harder datasets.
     pub r: usize,
-    /// Beam width for the per-node search on the input kNN graph during
-    /// build (`L` in the paper). Larger `l_build` yields more candidates
-    /// per node.
+    /// Beam width for the per-node search on the input kNN graph during build
+    /// (`L` in the paper). Larger `l_build` yields more candidates per node.
     pub l_build: usize,
-    /// Cap on the size of the candidate set `E` before MRNG pruning.
-    /// Absent from the paper but standard in reference implementations
-    /// to bound per-node prune cost. Roughly 500 works across scales.
+    /// Cap on the size of the candidate set `E` before MRNG pruning. Absent
+    /// from the paper but standard in reference implementations to bound
+    /// per-node prune cost. Roughly 500 works across scales.
     pub c: usize,
-    /// Degree of the input kNN graph when NSG builds one internally.
-    /// Larger `knn_k` gives better MRNG candidates but slower NN-Descent.
-    /// Ignored by `build_from_nndescent`.
+    /// Degree of the input kNN graph when NSG builds one internally. Larger
+    /// `knn_k` gives better MRNG candidates but slower NN-Descent. Ignored by
+    /// `build_from_nndescent`.
     pub knn_k: usize,
 }
 
+/// Default implementation of the [NsgBuildParams].
 impl Default for NsgBuildParams {
     fn default() -> Self {
         Self {
@@ -177,13 +180,11 @@ impl NsgBuildParams {
 
 /// Concurrent build-time graph.
 ///
-/// Each node owns a `Vec<u32>` of length up to `R`. Step 2 of the build
-/// writes each node's slot exactly once from a parallel per-node loop, so
-/// no synchronisation is required there. Step 3 (DFS connectivity fix) is
+/// Each node owns a `Vec<u32>` of length up to `R`. Step 2 of the build writes
+/// each node's slot exactly once from a parallel per-node loop, so no
+/// synchronisation is required there. Step 3 (DFS connectivity fix) is
 /// sequential, so the `add_or_evict_neighbour` helper does not need locks
 /// either.
-///
-/// ### Fields
 struct NsgConstructionGraph {
     /// Per-node adjacency lists, each capped at `r` entries
     nodes: Vec<UnsafeCell<Vec<u32>>>,
@@ -289,8 +290,8 @@ impl NsgConstructionGraph {
 
     /// Consume the construction graph into a flat `Vec<u32>`.
     ///
-    /// Each node contributes exactly `R` entries, tail-padded with
-    /// [`u32::MAX`] sentinels. Reader-friendly for cache-linear beam search.
+    /// Each node contributes exactly `R` entries, tail-padded with [`u32::MAX`]
+    /// sentinels. Reader-friendly for cache-linear beam search.
     ///
     /// ### Returns
     ///
@@ -319,8 +320,6 @@ impl NsgConstructionGraph {
 /// The final layout is a flat `n * R` `u32` adjacency array plus a single
 /// entry-point node id (the *navigating node*). Search is a greedy beam
 /// walk over the graph starting from that entry point.
-///
-/// ### Fields
 pub struct NsgIndex<T> {
     /// Row-major flattened vectors
     pub vectors_flat: Vec<T>,
@@ -384,7 +383,7 @@ impl<T> DimensionValidation for NsgIndex<T> {
 /// Compute the centroid (mean vector) of the data.
 ///
 /// Sequential loop; the work is `O(n * dim)` and used exactly once during
-/// build. Parallelising would not pay for itself on typical sizes.
+/// build.
 ///
 /// ### Params
 ///
@@ -468,19 +467,18 @@ where
     fn distance_external(&self, external: &[T], idx: usize) -> T {
         let start = idx * self.dim;
         let vec_i = &self.vectors_flat[start..start + self.dim];
+
         match self.metric {
-            Dist::SquaredEuclidean | Dist::Manhattan => match self.metric {
-                Dist::Manhattan => T::manhattan_simd(vec_i, external),
-                _ => euclidean_distance_static(vec_i, external),
-            },
+            Dist::SquaredEuclidean => euclidean_distance_static(vec_i, external),
+            Dist::Manhattan => T::manhattan_simd(vec_i, external),
             Dist::Cosine => cosine_distance_static(vec_i, external),
         }
     }
 }
 
-////////////
-// Build  //
-////////////
+///////////
+// Build //
+///////////
 
 impl<T> NsgIndex<T>
 where
@@ -512,10 +510,7 @@ where
         verbose: bool,
     ) -> Result<Self, AnnSearchErrors> {
         if verbose {
-            println!(
-                "Building internal NN-Descent graph (k={})...",
-                params.knn_k
-            );
+            println!("Building internal NN-Descent graph (k={})...", params.knn_k);
         }
 
         let nnd = NNDescent::<T>::new(
@@ -531,7 +526,7 @@ where
             verbose,
         )?;
 
-        Self::build_from_nndescent(data, &nnd, params, seed, verbose)
+        Self::build_from_nndescent(&nnd, params, seed, verbose)
     }
 
     /// Build an NSG index reusing an already-built NN-Descent index as the
@@ -553,24 +548,16 @@ where
     ///
     /// Built `NsgIndex` on success.
     pub fn build_from_nndescent(
-        data: MatRef<T>,
         nnd: &NNDescent<T>,
         params: NsgBuildParams,
         seed: usize,
         verbose: bool,
     ) -> Result<Self, AnnSearchErrors> {
-        let (vectors_flat, n, dim) = matrix_to_flat(data);
-        let norms = if metric_needs_norms(nnd.metric()) {
-            precompute_norms(&vectors_flat, n, dim)
-        } else {
-            Vec::new()
-        };
-
         Self::build_from_knn(
-            vectors_flat,
-            n,
-            dim,
-            norms,
+            nnd.vectors_flat.to_owned(),
+            nnd.n,
+            nnd.dim,
+            nnd.norms.to_owned(),
             nnd.metric(),
             nnd.graph(),
             nnd.k,
@@ -590,7 +577,6 @@ where
     ///
     /// ### Params
     ///
-    /// * `data` - Original data matrix
     /// * `nnd_gpu` - Reference to a pre-built GPU NN-Descent index
     /// * `params` - Build parameters
     /// * `seed` - Random seed for reproducibility
@@ -601,7 +587,6 @@ where
     /// Built `NsgIndex` on success.
     #[cfg(feature = "gpu")]
     pub fn build_from_gpu_nndescent<R>(
-        data: MatRef<T>,
         nnd_gpu: &crate::gpu::nndescent_gpu::NNDescentGpu<T, R>,
         params: NsgBuildParams,
         seed: usize,
@@ -611,18 +596,11 @@ where
         R: cubecl::Runtime,
         T: crate::gpu::traits_gpu::AnnSearchGpuFloat,
     {
-        let (vectors_flat, n, dim) = matrix_to_flat(data);
-        let norms = if metric_needs_norms(nnd_gpu.metric()) {
-            precompute_norms(&vectors_flat, n, dim)
-        } else {
-            Vec::new()
-        };
-
         Self::build_from_knn(
-            vectors_flat,
-            n,
-            dim,
-            norms,
+            nnd_gpu.vectors_flat.to_owned(),
+            nnd_gpu.n,
+            nnd_gpu.dim,
+            nnd_gpu.norms.to_owned(),
             nnd_gpu.metric(),
             nnd_gpu.knn_graph(),
             nnd_gpu.k,
@@ -718,7 +696,7 @@ where
             });
 
             if verbose {
-                let count = progress.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                let count = progress.fetch_add(1, Relaxed) + 1;
                 if count.is_multiple_of(100_000) {
                     println!(
                         "  MRNG pruned {} / {} nodes",
@@ -738,16 +716,16 @@ where
         Ok(index)
     }
 
-    ///////////////////////////
-    // Navigating node       //
-    ///////////////////////////
+    /////////////////////
+    // Navigating node //
+    /////////////////////
 
     /// Beam-search the input kNN graph toward the centroid.
     ///
     /// Uses `SearchState` for visited tracking and candidate ordering. The
     /// entry point is a random node; a single search pass with pool `L` is
-    /// enough because the centroid is a synthetic vector and we only need
-    /// the closest indexed point.
+    /// enough because the centroid is a synthetic vector and we only need the
+    /// closest indexed point.
     ///
     /// ### Params
     ///
@@ -822,16 +800,16 @@ where
         })
     }
 
-    ///////////////////////////
-    // Candidate + MRNG      //
-    ///////////////////////////
+    //////////////////////
+    // Candidate + MRNG //
+    //////////////////////
 
     /// Collect candidates for node `v` and apply MRNG pruning.
     ///
-    /// Beam-searches the kNN graph from `np` toward `v`, records every
-    /// visited node, unions in `v`'s kNN neighbours, sorts by distance
-    /// ascending, then greedily accepts candidates that do not violate the
-    /// MRNG rule. Returns at most `r` outgoing neighbours.
+    /// Beam-searches the kNN graph from `np` toward `v`, records every visited
+    /// node, unions in `v`'s kNN neighbours, sorts by distance ascending, then
+    /// greedily accepts candidates that do not violate the MRNG rule. Returns
+    /// at most `r` outgoing neighbours.
     ///
     /// ### Params
     ///
@@ -968,9 +946,9 @@ where
         accepted
     }
 
-    ///////////////////////////
-    // Connectivity fix      //
-    ///////////////////////////
+    //////////////////////
+    // Connectivity fix //
+    //////////////////////
 
     /// DFS from `n_p` on the partial NSG; patch every unreachable node.
     ///
@@ -1352,26 +1330,6 @@ where
     }
 }
 
-///////////////////
-// Small helpers //
-///////////////////
-
-/// Whether a metric requires pre-computed L2 norms in the index.
-fn metric_needs_norms(metric: Dist) -> bool {
-    matches!(metric, Dist::Cosine)
-}
-
-/// Row-wise L2 norms for a flat vector buffer.
-fn precompute_norms<T: AnnSearchFloat>(vectors_flat: &[T], n: usize, dim: usize) -> Vec<T> {
-    (0..n)
-        .map(|i| {
-            let start = i * dim;
-            let end = start + dim;
-            T::calculate_l2_norm(&vectors_flat[start..end])
-        })
-        .collect()
-}
-
 ///////////
 // Tests //
 ///////////
@@ -1553,7 +1511,9 @@ mod tests {
         let mut data = vec![0.0_f32; n * dim];
         let mut seed = 0xdead_beef_u64;
         for slot in data.iter_mut() {
-            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            seed = seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
             *slot = ((seed >> 32) as u32 as f32) / (u32::MAX as f32);
         }
         let mat = Mat::from_fn(n, dim, |i, j| data[i * dim + j]);
@@ -1572,10 +1532,10 @@ mod tests {
         let dim = 4;
         let mat = linear_matrix(n, dim);
         let params = NsgBuildParams::new(16, 40, 150, 24);
-        let a = NsgIndex::<f32>::build(mat.as_ref(), Dist::SquaredEuclidean, params, 7, false)
-            .unwrap();
-        let b = NsgIndex::<f32>::build(mat.as_ref(), Dist::SquaredEuclidean, params, 7, false)
-            .unwrap();
+        let a =
+            NsgIndex::<f32>::build(mat.as_ref(), Dist::SquaredEuclidean, params, 7, false).unwrap();
+        let b =
+            NsgIndex::<f32>::build(mat.as_ref(), Dist::SquaredEuclidean, params, 7, false).unwrap();
         assert_eq!(a.navigating_node, b.navigating_node);
         assert_eq!(a.graph, b.graph);
     }

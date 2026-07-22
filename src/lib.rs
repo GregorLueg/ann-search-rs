@@ -1279,7 +1279,6 @@ where
 ///
 /// ### Params
 ///
-/// * `mat` - Original data matrix
 /// * `nndescent_idx` - Reference to a pre-built NN-Descent index
 /// * `r` - Maximum out-degree of the NSG graph
 /// * `l_build` - Beam width for the per-node candidate search
@@ -1292,7 +1291,6 @@ where
 /// The built [`NsgIndex`] on success.
 #[allow(clippy::too_many_arguments)]
 pub fn build_nsg_from_knn_index<T>(
-    mat: MatRef<T>,
     nndescent_idx: &NNDescent<T>,
     r: usize,
     l_build: usize,
@@ -1306,7 +1304,7 @@ where
     NNDescent<T>: ApplySortedUpdates<T> + NNDescentQuery<T>,
 {
     let params = NsgBuildParams::new(r, l_build, c, nndescent_idx.k);
-    NsgIndex::build_from_nndescent(mat, nndescent_idx, params, seed, verbose)
+    NsgIndex::build_from_nndescent(nndescent_idx, params, seed, verbose)
 }
 
 /// Query an NSG index with an external query matrix.
@@ -2750,7 +2748,6 @@ where
 ///
 /// ### Params
 ///
-/// * `mat` - Original data matrix
 /// * `nnd_gpu` - Reference to a pre-built GPU NN-Descent index
 /// * `r` - Maximum out-degree of the NSG graph
 /// * `l_build` - Beam width for the per-node candidate search
@@ -2763,7 +2760,6 @@ where
 /// The built [`NsgIndex`] on success.
 #[allow(clippy::too_many_arguments)]
 pub fn build_nsg_from_gpu_nndescent<T, R>(
-    mat: MatRef<T>,
     nnd_gpu: &NNDescentGpu<T, R>,
     r: usize,
     l_build: usize,
@@ -2779,7 +2775,7 @@ where
     NNDescentGpu<T, R>: NNDescentQuery<T>,
 {
     let params = NsgBuildParams::new(r, l_build, c, nnd_gpu.k);
-    NsgIndex::build_from_gpu_nndescent(mat, nnd_gpu, params, seed, verbose)
+    NsgIndex::build_from_gpu_nndescent(nnd_gpu, params, seed, verbose)
 }
 
 ////////////
