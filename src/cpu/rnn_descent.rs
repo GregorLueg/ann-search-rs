@@ -31,7 +31,7 @@
 //! arXiv:2310.20419.
 
 use faer::{MatRef, RowRef};
-use rand::{rngs::SmallRng, seq::index::sample as sample_no_dup, Rng, SeedableRng};
+use rand::{rngs::SmallRng, Rng, SeedableRng};
 use rayon::prelude::*;
 use rdst::RadixSort;
 use std::cell::RefCell;
@@ -41,8 +41,10 @@ use std::sync::{
     atomic::{AtomicUsize, Ordering as AtomicOrdering},
     Arc,
 };
+use std::time::Instant;
 use thousands::*;
 
+use crate::cpu::kd_forest::KdTreeIndex;
 use crate::prelude::*;
 use crate::utils::graph_utils::SearchState;
 use crate::utils::nndescent_utils::{
@@ -222,6 +224,11 @@ impl RnnDescentBuildParams {
 /// sorted by distance ascending within each node's slot. Unused trailing
 /// slots hold `(SENTINEL_PID as u32, T::MAX)`.
 ///
+/// A small [`KdTreeIndex`] forest is built alongside the graph and used at
+/// query time to pick a batch of near-query entry points. This mirrors how
+/// NN-Descent seeds its beam search, but with fewer trees since the forest
+/// is only queried once per query (not per node during build).
+///
 /// ### Fields
 pub struct RnnDescentIndex<T> {
     /// Row-major flattened vectors
@@ -238,8 +245,8 @@ pub struct RnnDescentIndex<T> {
     pub norms: Vec<T>,
     /// Flat final graph, `n * R` `(pid, dist)` pairs
     pub graph: Vec<(u32, T)>,
-    /// Small pool of candidate entry points, chosen at build time
-    pub entry_pool: Vec<u32>,
+    /// Kd-tree forest used to pick query entry points
+    pub forest: KdTreeIndex<T>,
     /// Original ids
     original_ids: Vec<usize>,
 }
@@ -478,6 +485,10 @@ where
     /// * `data` - Data matrix (samples x features)
     /// * `metric` - Distance metric
     /// * `params` - Build parameters
+    /// * `n_trees` - Kd-forest size for query entry points. `None` picks a
+    ///   dataset-scaled default `min(5 + n^0.25 / 2, 16)` — half of
+    ///   NN-Descent's rule since the forest is only queried at search time
+    ///   (not per build node), so a lower budget is sufficient.
     /// * `seed` - Random seed for reproducibility
     /// * `verbose` - Print progress
     ///
@@ -488,6 +499,7 @@ where
         data: MatRef<T>,
         metric: Dist,
         params: RnnDescentBuildParams,
+        n_trees: Option<usize>,
         seed: usize,
         verbose: bool,
     ) -> Result<Self, AnnSearchErrors> {
@@ -498,6 +510,22 @@ where
             Vec::new()
         };
 
+        let n_trees = n_trees.unwrap_or_else(|| {
+            ((n as f64).powf(0.25) / 2.0 + 5.0).min(16.0) as usize
+        });
+
+        // Build the entry-point forest once, before the graph. Query time
+        // multi-seeds the beam from `forest.query()` results.
+        let start = Instant::now();
+        let forest = KdTreeIndex::new(data, n_trees, metric, seed);
+        if verbose {
+            println!(
+                "Built KdForest ({} trees): {:.2?}",
+                n_trees,
+                start.elapsed()
+            );
+        }
+
         let mut index = Self {
             vectors_flat,
             dim,
@@ -506,7 +534,7 @@ where
             metric,
             norms,
             graph: Vec::new(),
-            entry_pool: Vec::new(),
+            forest,
             original_ids: (0..n).collect(),
         };
 
@@ -540,12 +568,6 @@ where
                 }
             }
         }
-
-        // Pick entry pool for query.
-        let mut rng = SmallRng::seed_from_u64(seed as u64 ^ 0xBEEF_C0DE);
-        let pool_size = params.r.min(n).max(1);
-        let pool_indices = sample_no_dup(&mut rng, n, pool_size).into_vec();
-        index.entry_pool = pool_indices.into_iter().map(|i| i as u32).collect();
 
         // Flatten to compact (u32, T) storage.
         index.graph = build_graph
@@ -778,30 +800,25 @@ where
         &self.graph[base..base + self.r]
     }
 
-    /// Pick the nearest entry point from the random pool for a given query.
-    fn pick_entry(&self, query: &[T], query_norm: T) -> (usize, OrderedFloat<T>) {
-        let mut best_id = self.entry_pool[0] as usize;
-        let mut best_dist =
-            OrderedFloat(self.compute_query_distance(query, best_id, query_norm));
-        for &cand in self.entry_pool.iter().skip(1) {
-            let d = OrderedFloat(self.compute_query_distance(query, cand as usize, query_norm));
-            if d < best_dist {
-                best_dist = d;
-                best_id = cand as usize;
-            }
-        }
-        (best_id, best_dist)
-    }
 
     /// Query the index for `k` nearest neighbours.
     ///
-    /// Beam search using [`SearchState`] with pool `ef` (default 100).
+    /// Beam search using [`SearchState`] with pool size `ef` (default 100).
+    ///
+    /// The paper (Ono & Matsui 2023, Section 4.4, Eq. 4) introduces a
+    /// query-time out-degree cap `K` that limits how many of each node's
+    /// stored `R` neighbours the walk expands per hop. Since neighbours are
+    /// stored sorted ascending by distance from the source, this is a
+    /// `.take(K)` on the sorted slot. Typical values from the paper's
+    /// ablation are `K = 16-64` even when the graph was built with `R = 96`.
+    /// Default here is `min(32, R)`, matching the paper's sweet spot.
     ///
     /// ### Params
     ///
     /// * `query` - Query vector
     /// * `k` - Number of neighbours to return
-    /// * `ef_search` - Optional beam width override
+    /// * `ef_search` - Optional beam width override (default 100)
+    /// * `k_search` - Optional per-hop out-degree cap (default `min(32, R)`)
     ///
     /// ### Returns
     ///
@@ -811,10 +828,12 @@ where
         query: &[T],
         k: usize,
         ef_search: Option<usize>,
+        k_search: Option<usize>,
     ) -> Result<(Vec<usize>, Vec<T>), AnnSearchErrors> {
         self.check_dim(query.len())?;
 
         let ef = ef_search.unwrap_or(100).max(k);
+        let k_hop = k_search.unwrap_or(32).min(self.r).max(1);
 
         Self::with_search_state(|state_cell| {
             let mut state = state_cell.borrow_mut();
@@ -826,12 +845,31 @@ where
                 T::one()
             };
 
-            let (entry_node, entry_dist) = self.pick_entry(query, query_norm);
-            state.mark_visited(entry_node);
-            state.candidates.push(Reverse((entry_dist, entry_node)));
-            state.working_sorted.insert((entry_dist, entry_node), ef);
+            // Seed the beam from the kd-forest. The forest returns
+            // already-near candidates, so we can safely push all of them
+            // into `working_sorted` — unlike the earlier random-pool
+            // seeding, the resulting `furthest_dist` is a legitimate
+            // frustum bound rather than a random point far from the query.
+            let init_candidates = (ef / 2).max(2 * k).min(self.n);
+            let search_k = init_candidates * 3;
+            let (seed_ids, seed_dists) =
+                self.forest.query(query, init_candidates, Some(search_k))?;
 
-            let mut furthest_dist = entry_dist;
+            for (id, d) in seed_ids.iter().zip(seed_dists.iter()) {
+                if state.is_visited(*id) {
+                    continue;
+                }
+                state.mark_visited(*id);
+                let od = OrderedFloat(*d);
+                state.candidates.push(Reverse((od, *id)));
+                state.working_sorted.insert((od, *id), ef);
+            }
+
+            let mut furthest_dist = state
+                .working_sorted
+                .top()
+                .map(|(d, _)| *d)
+                .unwrap_or(OrderedFloat(T::infinity()));
 
             while let Some(Reverse((current_dist, current_id))) = state.candidates.pop() {
                 if current_dist > furthest_dist && state.working_sorted.len() >= ef {
@@ -839,7 +877,7 @@ where
                 }
 
                 let neighbours = self.get_neighbours_slot(current_id);
-                for &(pid, _) in neighbours {
+                for &(pid, _) in neighbours.iter().take(k_hop) {
                     if pid as usize == SENTINEL_PID {
                         break;
                     }
@@ -885,14 +923,15 @@ where
         query_row: RowRef<T>,
         k: usize,
         ef_search: Option<usize>,
+        k_search: Option<usize>,
     ) -> Result<(Vec<usize>, Vec<T>), AnnSearchErrors> {
         if query_row.col_stride() == 1 {
             let slice =
                 unsafe { std::slice::from_raw_parts(query_row.as_ptr(), query_row.ncols()) };
-            return self.query(slice, k, ef_search);
+            return self.query(slice, k, ef_search, k_search);
         }
         let query_vec: Vec<T> = query_row.iter().cloned().collect();
-        self.query(&query_vec, k, ef_search)
+        self.query(&query_vec, k, ef_search, k_search)
     }
 
     /// Generate the full kNN graph by querying every internal vector.
@@ -901,6 +940,7 @@ where
     ///
     /// * `k` - Number of neighbours per row
     /// * `ef_search` - Optional beam width override
+    /// * `k_search` - Optional per-hop out-degree cap (default `min(32, R)`)
     /// * `return_dist` - Whether to return distances
     /// * `verbose` - Print progress every 100_000 samples
     ///
@@ -911,6 +951,7 @@ where
         &self,
         k: usize,
         ef_search: Option<usize>,
+        k_search: Option<usize>,
         return_dist: bool,
         verbose: bool,
     ) -> KnnOptionResult<T> {
@@ -934,7 +975,7 @@ where
                     }
                 }
 
-                self.query(vec, k, ef_search)
+                self.query(vec, k, ef_search, k_search)
             })
             .collect::<Result<Vec<_>, AnnSearchErrors>>()?;
 
@@ -953,7 +994,7 @@ where
             + self.vectors_flat.capacity() * std::mem::size_of::<T>()
             + self.norms.capacity() * std::mem::size_of::<T>()
             + self.graph.capacity() * std::mem::size_of::<(u32, T)>()
-            + self.entry_pool.capacity() * std::mem::size_of::<u32>()
+            + self.forest.memory_usage_bytes()
     }
 }
 
@@ -971,7 +1012,7 @@ where
         query_vec: &[T],
         k: usize,
     ) -> Result<(Vec<usize>, Vec<T>), AnnSearchErrors> {
-        self.query(query_vec, k, None)
+        self.query(query_vec, k, None, None)
     }
 
     fn n(&self) -> usize {
@@ -1015,7 +1056,7 @@ mod tests {
 
     fn build_default(mat: &Mat<f32>, metric: Dist) -> RnnDescentIndex<f32> {
         let params = RnnDescentBuildParams::new(10, 32, 3, 8);
-        RnnDescentIndex::<f32>::build(mat.as_ref(), metric, params, 42, false).unwrap()
+        RnnDescentIndex::<f32>::build(mat.as_ref(), metric, params, None, 42, false).unwrap()
     }
 
     #[test]
@@ -1035,7 +1076,7 @@ mod tests {
         let mat = simple_matrix();
         let idx = build_default(&mat, Dist::SquaredEuclidean);
         let query = vec![1.0_f32, 0.0, 0.0];
-        let (indices, distances) = idx.query(&query, 1, None).unwrap();
+        let (indices, distances) = idx.query(&query, 1, None, None).unwrap();
         assert_eq!(indices.len(), 1);
         assert_eq!(indices[0], 0);
         assert_relative_eq!(distances[0], 0.0, epsilon = 1e-5);
@@ -1046,7 +1087,7 @@ mod tests {
         let mat = simple_matrix();
         let idx = build_default(&mat, Dist::Cosine);
         let query = vec![1.0_f32, 0.0, 0.0];
-        let (indices, distances) = idx.query(&query, 1, None).unwrap();
+        let (indices, distances) = idx.query(&query, 1, None, None).unwrap();
         assert_eq!(indices[0], 0);
         assert_relative_eq!(distances[0], 0.0, epsilon = 1e-5);
     }
@@ -1056,7 +1097,7 @@ mod tests {
         let mat = simple_matrix();
         let idx = build_default(&mat, Dist::SquaredEuclidean);
         let query = vec![0.5_f32, 0.5, 0.0];
-        let (_, distances) = idx.query(&query, 4, None).unwrap();
+        let (_, distances) = idx.query(&query, 4, None, None).unwrap();
         for i in 1..distances.len() {
             assert!(distances[i] >= distances[i - 1]);
         }
@@ -1068,7 +1109,7 @@ mod tests {
         let idx = build_default(&mat, Dist::SquaredEuclidean);
         let query = vec![0.0_f32, 0.0, 0.0];
         for k in 1..=5 {
-            let (indices, distances) = idx.query(&query, k, None).unwrap();
+            let (indices, distances) = idx.query(&query, k, None, None).unwrap();
             assert_eq!(indices.len(), k);
             assert_eq!(distances.len(), k);
         }
@@ -1084,6 +1125,7 @@ mod tests {
             mat.as_ref(),
             Dist::SquaredEuclidean,
             params,
+            None,
             42,
             false,
         )
@@ -1113,6 +1155,7 @@ mod tests {
             mat.as_ref(),
             Dist::SquaredEuclidean,
             params,
+            None,
             42,
             false,
         )
@@ -1157,13 +1200,14 @@ mod tests {
             mat.as_ref(),
             Dist::SquaredEuclidean,
             params,
+            None,
             42,
             false,
         )
         .unwrap();
 
         let query = vec![0.0_f32; dim];
-        let (indices, _) = idx.query(&query, 5, Some(80)).unwrap();
+        let (indices, _) = idx.query(&query, 5, Some(80), None).unwrap();
         assert_eq!(indices[0], 0);
         let expected: Vec<usize> = (0..5).collect();
         let found = indices.iter().filter(|&&i| expected.contains(&i)).count();
@@ -1187,6 +1231,7 @@ mod tests {
             mat.as_ref(),
             Dist::SquaredEuclidean,
             params,
+            None,
             42,
             false,
         )
@@ -1206,6 +1251,7 @@ mod tests {
             mat.as_ref(),
             Dist::SquaredEuclidean,
             params,
+            None,
             7,
             false,
         )
@@ -1214,11 +1260,17 @@ mod tests {
             mat.as_ref(),
             Dist::SquaredEuclidean,
             params,
+            None,
             7,
             false,
         )
         .unwrap();
         assert_eq!(a.graph, b.graph);
-        assert_eq!(a.entry_pool, b.entry_pool);
+
+        // Same seed → same forest → same query answer.
+        let query = vec![0.5_f32; dim];
+        let (a_ids, _) = a.query(&query, 3, None, None).unwrap();
+        let (b_ids, _) = b.query(&query, 3, None, None).unwrap();
+        assert_eq!(a_ids, b_ids);
     }
 }

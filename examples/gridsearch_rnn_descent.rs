@@ -68,16 +68,15 @@ fn main() {
     // S x R x T1 grid (T2 fixed to 10 for pace)
     let build_params: &[(usize, usize, usize)] = &[
         (20, 64, 3),
-        (20, 64, 4),
-        (20, 96, 3),
         (20, 96, 4),
-        (40, 64, 3),
-        (40, 96, 3),
         (40, 128, 3),
-        (40, 128, 4),
     ];
     let t2: usize = 10;
-    let ef_search_values: &[Option<usize>] = &[Some(50), None, Some(150)];
+
+    // Query-time K sweep (paper Section 4.4). None uses the default min(32, R).
+    // Include Some(r) as a "walk all neighbours" baseline for comparison.
+    let k_search_values: &[Option<usize>] = &[Some(16), None, Some(64), Some(usize::MAX)];
+    let ef_search: Option<usize> = None; // 100 by default, matching the paper
 
     for &(s, r, t1) in build_params {
         println!("Building RNN-Descent (S={}, R={}, T1={}, T2={})...", s, r, t1, t2);
@@ -90,6 +89,7 @@ fn main() {
             t1,
             t2,
             &cli.distance,
+            None,
             cli.seed as usize,
             false,
         )
@@ -98,11 +98,13 @@ fn main() {
 
         let index_size_mb = rnn_idx.memory_usage_bytes() as f64 / (1024.0 * 1024.0);
 
-        for &ef_search in ef_search_values {
-            let ef_label = ef_search
-                .map(|e| e.to_string())
-                .unwrap_or("auto".to_string());
-            println!("Querying RNN-Descent (ef_search={})...", ef_label);
+        for &k_search in k_search_values {
+            let k_label = match k_search {
+                None => "auto".to_string(),
+                Some(v) if v == usize::MAX => format!("R={}", r),
+                Some(v) => v.to_string(),
+            };
+            println!("Querying RNN-Descent (K={})...", k_label);
 
             let start = Instant::now();
             let (approx_neighbors, approx_distances) = query_rnn_descent_index(
@@ -110,6 +112,7 @@ fn main() {
                 &rnn_idx,
                 cli.k,
                 ef_search,
+                k_search,
                 true,
                 false,
             )
@@ -124,7 +127,7 @@ fn main() {
             );
 
             results.push(BenchmarkResultSize {
-                method: format!("RNN-S{}-R{}-T1{}-ef{} (query)", s, r, t1, ef_label),
+                method: format!("RNN-S{}-R{}-T1{}-K{} (query)", s, r, t1, k_label),
                 build_time_ms: build_time,
                 query_time_ms: query_time,
                 total_time_ms: build_time + query_time,
@@ -137,7 +140,7 @@ fn main() {
         println!("Self-querying RNN-Descent...");
         let start = Instant::now();
         let (approx_neighbors_self, approx_distances_self) =
-            query_rnn_descent_self(&rnn_idx, cli.k, None, true, false).unwrap();
+            query_rnn_descent_self(&rnn_idx, cli.k, None, None, true, false).unwrap();
         let self_query_time = start.elapsed().as_secs_f64() * 1000.0;
 
         let recall_self = calculate_recall(&true_neighbors_self, &approx_neighbors_self, cli.k);

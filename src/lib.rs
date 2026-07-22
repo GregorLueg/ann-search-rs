@@ -1384,6 +1384,8 @@ where
 /// * `t2` - UpdateNeighbors passes per outer round
 /// * `dist_metric` - Distance metric: `"euclidean"`, `"cosine"`, or
 ///   `"manhattan"`
+/// * `n_trees` - Kd-forest size for query entry points. `None` picks a
+///   dataset-scaled default `min(5 + n^0.25 / 2, 16)`.
 /// * `seed` - Random seed for reproducibility
 /// * `verbose` - Print progress
 ///
@@ -1398,6 +1400,7 @@ pub fn build_rnn_descent_index<T>(
     t1: usize,
     t2: usize,
     dist_metric: &str,
+    n_trees: Option<usize>,
     seed: usize,
     verbose: bool,
 ) -> Result<RnnDescentIndex<T>, AnnSearchErrors>
@@ -1411,7 +1414,7 @@ where
     });
 
     let params = RnnDescentBuildParams::new(s, r, t1, t2);
-    RnnDescentIndex::build(mat, metric, params, seed, verbose)
+    RnnDescentIndex::build(mat, metric, params, n_trees, seed, verbose)
 }
 
 /// Query an RNN-Descent index with an external query matrix.
@@ -1422,6 +1425,8 @@ where
 /// * `index` - Reference to the built index
 /// * `k` - Number of neighbours to return
 /// * `ef_search` - Optional beam width override (defaults to `100`)
+/// * `k_search` - Optional per-hop out-degree cap (default `min(32, R)`),
+///   the paper's search-time `K` (Ono & Matsui 2023, Section 4.4)
 /// * `return_dist` - Whether to return distances
 /// * `verbose` - Print progress every 100_000 samples
 ///
@@ -1433,6 +1438,7 @@ pub fn query_rnn_descent_index<T>(
     index: &RnnDescentIndex<T>,
     k: usize,
     ef_search: Option<usize>,
+    k_search: Option<usize>,
     return_dist: bool,
     verbose: bool,
 ) -> KnnOptionResult<T>
@@ -1441,7 +1447,7 @@ where
     RnnDescentIndex<T>: RnnDescentState<T>,
 {
     query_parallel(query_mat.nrows(), return_dist, verbose, |i| {
-        index.query_row(query_mat.row(i), k, ef_search)
+        index.query_row(query_mat.row(i), k, ef_search, k_search)
     })
 }
 
@@ -1452,6 +1458,7 @@ where
 /// * `index` - Reference to the built index
 /// * `k` - Number of neighbours to return
 /// * `ef_search` - Optional beam width override
+/// * `k_search` - Optional per-hop out-degree cap (default `min(32, R)`)
 /// * `return_dist` - Whether to return distances
 /// * `verbose` - Print progress every 100_000 samples
 ///
@@ -1462,6 +1469,7 @@ pub fn query_rnn_descent_self<T>(
     index: &RnnDescentIndex<T>,
     k: usize,
     ef_search: Option<usize>,
+    k_search: Option<usize>,
     return_dist: bool,
     verbose: bool,
 ) -> KnnOptionResult<T>
@@ -1469,7 +1477,7 @@ where
     T: AnnSearchFloat,
     RnnDescentIndex<T>: RnnDescentState<T>,
 {
-    index.generate_knn(k, ef_search, return_dist, verbose)
+    index.generate_knn(k, ef_search, k_search, return_dist, verbose)
 }
 
 ///////////////
