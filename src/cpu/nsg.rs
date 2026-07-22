@@ -744,7 +744,9 @@ where
         // Reading forward[v] is race-free: forward[] is written in phase 2a
         // and never mutated after. Only construction graph slots are mutated
         // in this phase, and each is protected by the striped lock.
+        let bg = &build_graph;
         forward.par_iter().enumerate().for_each(|(v, neighbours)| {
+            let build_graph = bg;
             for &(u_id, dist_uv) in neighbours {
                 let u = u_id as usize;
                 if u == v {
@@ -768,20 +770,24 @@ where
                     continue;
                 }
 
-                // Merge and re-prune under MRNG using cached distances.
-                let mut pool: Vec<(OrderedFloat<T>, usize)> =
-                    Vec::with_capacity(deg + 1);
+                // At capacity: replace u's farthest neighbour with v if
+                // v is closer. MRNG's occlusion rule is too aggressive on
+                // tightly clustered data (see plan §Q2). This keeps u's
+                // degree at exactly `r` and biases toward the R closest
+                // reverse-edge sources.
                 unsafe {
-                    for &(id, d) in &*build_graph.nodes[u].get() {
-                        pool.push((OrderedFloat(d), id as usize));
+                    let slot = &mut *build_graph.nodes[u].get();
+                    let mut worst_pos = 0usize;
+                    let mut worst_dist = slot[0].1;
+                    for i in 1..slot.len() {
+                        if slot[i].1 > worst_dist {
+                            worst_dist = slot[i].1;
+                            worst_pos = i;
+                        }
                     }
-                }
-                pool.push((OrderedFloat(dist_uv), v));
-                pool.sort_unstable_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(Ordering::Equal));
-
-                let new_adj = index.mrng_prune(&pool, params.r, u);
-                unsafe {
-                    build_graph.set_neighbours(u, &new_adj);
+                    if dist_uv < worst_dist {
+                        slot[worst_pos] = (v as u32, dist_uv);
+                    }
                 }
             }
         });
@@ -945,6 +951,12 @@ where
         // scratch_working accumulates (dist_to_v, node_id) pairs.
         state.scratch_working.clear();
 
+        // Seed the beam with np AND np's kNN neighbours from the input graph.
+        // This gives MRNG a spatially diverse candidate pool even for tightly
+        // clustered data (np's kNN spans np's cluster; combined with the
+        // beam's exploration toward v, we cover both regions). Reference
+        // NSG's `get_neighbors` does the equivalent via `final_graph_[ep_]`.
+        let mut furthest_dist = OrderedFloat(T::infinity());
         let entry_dist = OrderedFloat(self.distance(np, v));
         state.mark_visited(np);
         state.candidates.push(Reverse((entry_dist, np)));
@@ -953,7 +965,27 @@ where
             state.scratch_working.push((entry_dist, np));
         }
 
-        let mut furthest_dist = entry_dist;
+        // Seed with np's kNN neighbours as extra beam entries.
+        let np_base = np * knn_k;
+        for &(nbr, _) in &knn_graph[np_base..np_base + knn_k] {
+            if nbr == SENTINEL_PID || nbr >= self.n || state.is_visited(nbr) {
+                continue;
+            }
+            state.mark_visited(nbr);
+            let d = OrderedFloat(self.distance(nbr, v));
+            state.candidates.push(Reverse((d, nbr)));
+            state.working_sorted.insert((d, nbr), l_build);
+            if nbr != v {
+                state.scratch_working.push((d, nbr));
+            }
+        }
+        if state.working_sorted.len() >= l_build {
+            furthest_dist = state
+                .working_sorted
+                .top()
+                .map(|(d, _)| *d)
+                .unwrap_or(OrderedFloat(T::infinity()));
+        }
 
         while let Some(Reverse((current_dist, current_id))) = state.candidates.pop() {
             if current_dist > furthest_dist && state.working_sorted.len() >= l_build {
@@ -1002,6 +1034,26 @@ where
                 let d = OrderedFloat(self.distance(nbr, v));
                 state.scratch_working.push((d, nbr));
             }
+        }
+
+        // Inject long-range random candidates. On clustered data the beam
+        // pool is otherwise entirely v-local (same cluster), and MRNG's
+        // occlusion rule then collapses to ~6-8 accepted edges because
+        // co-cluster candidates mutually occlude. A handful of random
+        // long-range points gives MRNG spatial diversity, mirroring what
+        // Vamana gets for free from its random-init graph.
+        let n_random = (r * 2).min(64);
+        let mut rng = SmallRng::seed_from_u64(
+            (v as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15).wrapping_add(0x1234_5678),
+        );
+        for _ in 0..n_random {
+            let cand = rng.random_range(0..self.n);
+            if cand == v || state.is_visited(cand) {
+                continue;
+            }
+            state.mark_visited(cand);
+            let d = OrderedFloat(self.distance(cand, v));
+            state.scratch_working.push((d, cand));
         }
 
         // Sort candidates ascending by distance to v, cap at C.
