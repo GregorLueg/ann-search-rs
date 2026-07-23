@@ -11,7 +11,7 @@ use crate::prelude::*;
 use crate::utils::matrix_to_flat;
 
 /////////////////////
-// Index structure //
+// ExhaustiveIndex //
 /////////////////////
 
 /// Exhaustive (brute-force) nearest neighbour index
@@ -61,18 +61,14 @@ impl<T> DimensionValidation for ExhaustiveIndex<T> {
     }
 }
 
-/////////////////////
-// ExhaustiveIndex //
-/////////////////////
+/////////////////
+// Index build //
+/////////////////
 
 impl<T> ExhaustiveIndex<T>
 where
     T: AnnSearchFloat,
 {
-    //////////////////////
-    // Index generation //
-    //////////////////////
-
     /// Generate a new exhaustive index
     ///
     /// ### Params
@@ -107,10 +103,26 @@ where
         }
     }
 
-    //////////////////
-    // Query (dist) //
-    //////////////////
+    /// Returns the size of the index in bytes
+    ///
+    /// ### Returns
+    ///
+    /// Index size `in n bytes`
+    pub fn memory_usage_bytes(&self) -> usize {
+        std::mem::size_of_val(self)
+            + self.vectors_flat.capacity() * std::mem::size_of::<T>()
+            + self.norms.capacity() * std::mem::size_of::<T>()
+    }
+}
 
+///////////
+// Query //
+///////////
+
+impl<T> ExhaustiveIndex<T>
+where
+    T: AnnSearchFloat,
+{
     /// Query function
     ///
     /// This will do an exhaustive search over the full index (i.e., all samples)
@@ -276,17 +288,6 @@ where
             let indices: Vec<Vec<usize>> = results.into_iter().map(|(idx, _)| idx).collect();
             Ok((indices, None))
         }
-    }
-
-    /// Returns the size of the index in bytes
-    ///
-    /// ### Returns
-    ///
-    /// Index size `in n bytes`
-    pub fn memory_usage_bytes(&self) -> usize {
-        std::mem::size_of_val(self)
-            + self.vectors_flat.capacity() * std::mem::size_of::<T>()
-            + self.norms.capacity() * std::mem::size_of::<T>()
     }
 }
 

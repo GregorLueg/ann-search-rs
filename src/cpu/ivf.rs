@@ -11,6 +11,10 @@ use crate::prelude::*;
 use crate::utils::k_means_utils::*;
 use crate::utils::*;
 
+/////////////
+// IvfIndex//
+/////////////
+
 /// IVF (Inverted File) index for similarity search
 ///
 /// Uses k-means clustering to partition vectors into nlist clusters. Each
@@ -102,18 +106,14 @@ impl<T> DimensionValidation for IvfIndex<T> {
     }
 }
 
-////////////////
-// Main index //
-////////////////
+/////////////////
+// Index build //
+/////////////////
 
 impl<T> IvfIndex<T>
 where
     T: AnnSearchFloat,
 {
-    //////////////////////
-    // Index generation //
-    //////////////////////
-
     /// Build an IVF index with optimised memory layout and parallel training.
     ///
     /// Constructs an inverted file index by clustering vectors with k-means,
@@ -247,10 +247,75 @@ where
         Ok(idx)
     }
 
-    ///////////
-    // Query //
-    ///////////
+    /// Function will optimise memory layout and put vectors sorted by cluster
+    /// id
+    ///
+    /// ### Returns
+    ///
+    /// New to old mapping
+    fn optimise_memory_layout(&mut self) -> Vec<usize> {
+        let mut new_to_old = Vec::with_capacity(self.n);
+        let mut old_to_new = vec![0usize; self.n];
 
+        for cluster in 0..self.nlist {
+            let start = self.offsets[cluster];
+            let end = self.offsets[cluster + 1];
+            for &old_id in &self.all_indices[start..end] {
+                old_to_new[old_id] = new_to_old.len();
+                new_to_old.push(old_id);
+            }
+        }
+
+        let mut new_vectors_flat = Vec::with_capacity(self.vectors_flat.len());
+        let mut new_norms = if self.norms.is_empty() {
+            Vec::new()
+        } else {
+            Vec::with_capacity(self.n)
+        };
+
+        for &old_id in &new_to_old {
+            let start = old_id * self.dim;
+            new_vectors_flat.extend_from_slice(&self.vectors_flat[start..start + self.dim]);
+            if !self.norms.is_empty() {
+                new_norms.push(self.norms[old_id]);
+            }
+        }
+
+        self.vectors_flat = new_vectors_flat;
+        self.norms = new_norms;
+
+        // offsets now directly index vectors_flat — no change needed since
+        // all_indices was already built in cluster order
+        self.all_indices.clear();
+        self.all_indices.shrink_to_fit();
+
+        new_to_old
+    }
+
+    /// Returns the size of the index in bytes
+    ///
+    /// ### Returns
+    ///
+    /// Index size `in n bytes`
+    pub fn memory_usage_bytes(&self) -> usize {
+        std::mem::size_of_val(self)
+            + self.vectors_flat.capacity() * std::mem::size_of::<T>()
+            + self.norms.capacity() * std::mem::size_of::<T>()
+            + self.centroids.capacity() * std::mem::size_of::<T>()
+            + self.centroids_norm.capacity() * std::mem::size_of::<T>()
+            + self.all_indices.capacity() * std::mem::size_of::<usize>()
+            + self.offsets.capacity() * std::mem::size_of::<usize>()
+    }
+}
+
+///////////
+// Query //
+///////////
+
+impl<T> IvfIndex<T>
+where
+    T: AnnSearchFloat,
+{
     /// Query the index for approximate nearest neighbours
     ///
     /// Performs two-stage search: first finds nprobe nearest centroids to the
@@ -420,66 +485,6 @@ where
         }
 
         Ok((final_indices, final_dists))
-    }
-
-    /// Function will optimise memory layout and put vectors sorted by cluster
-    /// id
-    ///
-    /// ### Returns
-    ///
-    /// New to old mapping
-    fn optimise_memory_layout(&mut self) -> Vec<usize> {
-        let mut new_to_old = Vec::with_capacity(self.n);
-        let mut old_to_new = vec![0usize; self.n];
-
-        for cluster in 0..self.nlist {
-            let start = self.offsets[cluster];
-            let end = self.offsets[cluster + 1];
-            for &old_id in &self.all_indices[start..end] {
-                old_to_new[old_id] = new_to_old.len();
-                new_to_old.push(old_id);
-            }
-        }
-
-        let mut new_vectors_flat = Vec::with_capacity(self.vectors_flat.len());
-        let mut new_norms = if self.norms.is_empty() {
-            Vec::new()
-        } else {
-            Vec::with_capacity(self.n)
-        };
-
-        for &old_id in &new_to_old {
-            let start = old_id * self.dim;
-            new_vectors_flat.extend_from_slice(&self.vectors_flat[start..start + self.dim]);
-            if !self.norms.is_empty() {
-                new_norms.push(self.norms[old_id]);
-            }
-        }
-
-        self.vectors_flat = new_vectors_flat;
-        self.norms = new_norms;
-
-        // offsets now directly index vectors_flat — no change needed since
-        // all_indices was already built in cluster order
-        self.all_indices.clear();
-        self.all_indices.shrink_to_fit();
-
-        new_to_old
-    }
-
-    /// Returns the size of the index in bytes
-    ///
-    /// ### Returns
-    ///
-    /// Index size `in n bytes`
-    pub fn memory_usage_bytes(&self) -> usize {
-        std::mem::size_of_val(self)
-            + self.vectors_flat.capacity() * std::mem::size_of::<T>()
-            + self.norms.capacity() * std::mem::size_of::<T>()
-            + self.centroids.capacity() * std::mem::size_of::<T>()
-            + self.centroids_norm.capacity() * std::mem::size_of::<T>()
-            + self.all_indices.capacity() * std::mem::size_of::<usize>()
-            + self.offsets.capacity() * std::mem::size_of::<usize>()
     }
 }
 

@@ -511,9 +511,9 @@ impl HnswState<f64> for HnswIndex<f64> {
     }
 }
 
-////////////////////
-// Main structure //
-////////////////////
+////////////////
+// HNSW index //
+////////////////
 
 /// HNSW (Hierarchical Navigable Small World) graph index
 ///
@@ -589,19 +589,15 @@ where
     }
 }
 
-//////////
-// Main //
-//////////
+/////////////////
+// Index build //
+/////////////////
 
 impl<T> HnswIndex<T>
 where
     T: AnnSearchFloat,
     Self: HnswState<T>,
 {
-    //////////////////////
-    // Index generation //
-    //////////////////////
-
     /// Construct a new HNSW index
     ///
     /// Builds the hierarchical graph structure layer by layer from top to
@@ -1097,10 +1093,39 @@ where
         result
     }
 
-    ///////////
-    // Query //
-    ///////////
+    /// Was extend candidates set to `true`
+    ///
+    /// ### Returns
+    ///
+    /// Boolean
+    pub fn extend_candidates(&self) -> bool {
+        self.extend_candidates
+    }
 
+    /// Returns the size of the index in bytes
+    ///
+    /// ### Returns
+    ///
+    /// Index size `in n bytes`
+    pub fn memory_usage_bytes(&self) -> usize {
+        std::mem::size_of_val(self)
+            + self.vectors_flat.capacity() * std::mem::size_of::<T>()
+            + self.norms.capacity() * std::mem::size_of::<T>()
+            + self.layer_assignments.capacity() * std::mem::size_of::<u8>()
+            + self.neighbours_flat.capacity() * std::mem::size_of::<u32>()
+            + self.neighbour_offsets.capacity() * std::mem::size_of::<usize>()
+    }
+}
+
+///////////
+// Query //
+///////////
+
+impl<T> HnswIndex<T>
+where
+    T: AnnSearchFloat,
+    Self: HnswState<T>,
+{
     /// Query the index for k nearest neighbours
     ///
     /// Performs hierarchical search starting from the entry point, greedily
@@ -1419,29 +1444,6 @@ where
             Dist::Cosine => self.cosine_distance_to_query(idx, query, query_norm),
             Dist::Manhattan => self.manhattan_distance_to_query(idx, query),
         }
-    }
-
-    /// Was extend candidates set to `true`
-    ///
-    /// ### Returns
-    ///
-    /// Boolean
-    pub fn extend_candidates(&self) -> bool {
-        self.extend_candidates
-    }
-
-    /// Returns the size of the index in bytes
-    ///
-    /// ### Returns
-    ///
-    /// Index size `in n bytes`
-    pub fn memory_usage_bytes(&self) -> usize {
-        std::mem::size_of_val(self)
-            + self.vectors_flat.capacity() * std::mem::size_of::<T>()
-            + self.norms.capacity() * std::mem::size_of::<T>()
-            + self.layer_assignments.capacity() * std::mem::size_of::<u8>()
-            + self.neighbours_flat.capacity() * std::mem::size_of::<u32>()
-            + self.neighbour_offsets.capacity() * std::mem::size_of::<usize>()
     }
 }
 

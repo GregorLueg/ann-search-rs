@@ -12,6 +12,10 @@ use thousands::*;
 use crate::prelude::*;
 use crate::utils::*;
 
+//////////////////////////
+// Thread-local buffers //
+//////////////////////////
+
 // Thread-local reusable buffers for parallel query paths. The candidates vec
 // and seen set can grow large (10k+) so reusing them across queries on the
 // same thread avoids allocation churn. The heap is not stored here because
@@ -21,605 +25,11 @@ thread_local! {
     static LSH_SEEN_SET: RefCell<FxHashSet<usize>> = RefCell::new(FxHashSet::default());
 }
 
+///////////
+// Types //
+///////////
+
 type TablesAndHashes = Vec<(FxHashMap<u64, Vec<usize>>, Vec<u64>)>;
-
-////////////////
-// Main index //
-////////////////
-
-/// LSH index for approximate nearest neighbour search
-///
-/// Uses multiple hash tables with random hyperplane projections (SimHash) to
-/// partition the space. Vectors with identical hashes are stored in the same
-/// bucket. Supports multi-probe querying to improve recall without additional
-/// tables.
-///
-/// For Euclidean distance, vectors are L2-normalised before hashing so that
-/// SimHash (an angular hash) provides a reasonable proxy. Actual distance
-/// computations always use the original unnormalised vectors.
-pub struct LSHIndex<T> {
-    /// Original data, flattened row-major for cache efficiency
-    pub vectors_flat: Vec<T>,
-    /// Embedding dimensionality
-    pub dim: usize,
-    /// Number of vectors
-    pub n: usize,
-    /// Pre-computed L2 norms for Cosine distance (empty for Euclidean)
-    norms: Vec<T>,
-    /// Distance metric (Euclidean or Cosine)
-    metric: Dist,
-    /// Maps hash values to vector indices for each table
-    hash_tables: Vec<FxHashMap<u64, Vec<usize>>>,
-    /// Orthogonalised random projection vectors from N(0,1)
-    random_vecs: Vec<T>,
-    /// Number of hash tables
-    num_tables: usize,
-    /// Bits in each hash code (higher = fewer collisions)
-    bits_per_hash: usize,
-    /// Pre-computed hashes per vector per table, layout:
-    /// `[table_idx * n + vec_idx]`. Used to skip re-hashing during self-query.
-    vector_hashes: Vec<u64>,
-    /// Orignal indices
-    original_ids: Vec<usize>,
-}
-
-////////////////////
-// VectorDistance //
-////////////////////
-
-/// VectorDistance trait
-impl<T> VectorDistance<T> for LSHIndex<T>
-where
-    T: AnnSearchFloat,
-{
-    fn vectors_flat(&self) -> &[T] {
-        &self.vectors_flat
-    }
-
-    fn dim(&self) -> usize {
-        self.dim
-    }
-
-    fn norms(&self) -> &[T] {
-        &self.norms
-    }
-}
-
-/////////////////////////
-// DimensionValidation //
-/////////////////////////
-
-impl<T> DimensionValidation for LSHIndex<T> {
-    fn dim(&self) -> usize {
-        self.dim
-    }
-}
-
-//////////
-// Main //
-//////////
-
-impl<T> LSHIndex<T>
-where
-    T: AnnSearchFloat,
-{
-    //////////////////////
-    // Index generation //
-    //////////////////////
-
-    /// Construct a new LSH index
-    ///
-    /// Builds hash tables in parallel. For each table, hashes all vectors using
-    /// a different set of random hyperplane projections and groups them into
-    /// buckets. Stores per-vector hashes for fast self-query (kNN graph
-    /// generation).
-    ///
-    /// For Euclidean mode, vectors are L2-normalised once and reused across all
-    /// tables (avoiding redundant per-table normalisation).
-    ///
-    /// ### Params
-    ///
-    /// * `data` - Data matrix (rows = samples, columns = dimensions)
-    /// * `metric` - Distance metric (Euclidean or Cosine)
-    /// * `num_tables` - Number of hash tables (with multi-probe, 4-8 is
-    ///   typically sufficient)
-    /// * `bits_per_hash` - Bits per hash code (more = fewer collisions, smaller
-    ///   buckets)
-    /// * `seed` - Random seed for reproducibility
-    ///
-    /// ### Returns
-    ///
-    /// Constructed index ready for querying
-    pub fn new(
-        data: MatRef<T>,
-        metric: Dist,
-        num_tables: usize,
-        bits_per_hash: usize,
-        seed: usize,
-    ) -> Result<Self, AnnSearchErrors> {
-        if metric == Dist::Manhattan {
-            return Err(AnnSearchErrors::DistanceNotSupported(metric));
-        }
-
-        let (vectors_flat, n, dim) = matrix_to_flat(data);
-
-        let norms = if metric == Dist::Cosine {
-            (0..n)
-                .map(|i| {
-                    let start = i * dim;
-                    T::calculate_l2_norm(&vectors_flat[start..start + dim])
-                })
-                .collect()
-        } else {
-            Vec::new()
-        };
-
-        // generate random projection vectors from N(0,1)
-        let mut rng = StdRng::seed_from_u64(seed as u64);
-        let total_random_vecs = num_tables * bits_per_hash * dim;
-        let mut random_vecs: Vec<T> = (0..total_random_vecs)
-            .map(|_| {
-                let val: f64 = rng.sample(StandardNormal);
-                T::from_f64(val).unwrap()
-            })
-            .collect();
-
-        orthogonalise_table_projections(&mut random_vecs, num_tables, bits_per_hash, dim);
-
-        // pre-compute L2-normalised vectors for Euclidean hashing
-        let normalised: Vec<T> = if metric == Dist::SquaredEuclidean {
-            let mut buf = vec![T::zero(); n * dim];
-            for i in 0..n {
-                let start = i * dim;
-                let norm = T::calculate_l2_norm(&vectors_flat[start..start + dim]);
-                if norm > T::epsilon() {
-                    for d in 0..dim {
-                        buf[start + d] = vectors_flat[start + d] / norm;
-                    }
-                }
-            }
-            buf
-        } else {
-            Vec::new()
-        };
-
-        let hash_source: &[T] = if metric == Dist::SquaredEuclidean {
-            &normalised
-        } else {
-            &vectors_flat
-        };
-
-        // compute all hashes and build tables in parallel
-        let tables_and_hashes: TablesAndHashes = (0..num_tables)
-            .into_par_iter()
-            .map(|table_idx| {
-                let mut table = FxHashMap::default();
-                let mut hashes = Vec::with_capacity(n);
-
-                for vec_idx in 0..n {
-                    let start = vec_idx * dim;
-                    let vec = &hash_source[start..start + dim];
-                    let hash = compute_hash(vec, table_idx, bits_per_hash, dim, &random_vecs);
-                    hashes.push(hash);
-                    table.entry(hash).or_insert_with(Vec::new).push(vec_idx);
-                }
-
-                (table, hashes)
-            })
-            .collect();
-
-        let mut vector_hashes = vec![0u64; num_tables * n];
-        let mut hash_tables = Vec::with_capacity(num_tables);
-        for (table_idx, (table, hashes)) in tables_and_hashes.into_iter().enumerate() {
-            hash_tables.push(table);
-            let base = table_idx * n;
-            vector_hashes[base..base + n].copy_from_slice(&hashes);
-        }
-
-        Ok(Self {
-            vectors_flat,
-            dim,
-            n,
-            norms,
-            metric,
-            hash_tables,
-            random_vecs,
-            num_tables,
-            bits_per_hash,
-            vector_hashes,
-            original_ids: (0..n).collect(),
-        })
-    }
-
-    ///////////
-    // Query //
-    ///////////
-
-    /// Query the index for approximate nearest neighbours
-    ///
-    /// Hashes the query vector and retrieves candidates from matching buckets
-    /// across all tables. With `n_probes > 0`, also checks neighbouring
-    /// buckets by flipping the most uncertain hash bits (multi-probe LSH).
-    ///
-    /// If no candidates are found across all tables and probes, falls back to
-    /// random sampling.
-    ///
-    /// ### Params
-    ///
-    /// * `query_vec` - Query vector (must match index dimensionality)
-    /// * `k` - Number of neighbours to return
-    /// * `max_cand` - Optional limit on total candidates examined
-    /// * `n_probes` - Number of additional buckets to probe per table (0 =
-    ///   exact hash only). Good default: `bits_per_hash` (all single-bit
-    ///   flips).
-    ///
-    /// ### Returns
-    ///
-    /// Tuple of `(indices, distances, fallback_triggered)` sorted by distance
-    pub fn query(
-        &self,
-        query_vec: &[T],
-        k: usize,
-        max_cand: Option<usize>,
-        n_probes: usize,
-    ) -> Result<(Vec<usize>, Vec<T>, bool), AnnSearchErrors> {
-        self.check_dim(query_vec.len())?;
-
-        // normalise query for hashing if Euclidean
-        let hash_vec;
-        let hash_input = if self.metric == Dist::SquaredEuclidean {
-            let norm = T::calculate_l2_norm(query_vec);
-            hash_vec = if norm > T::epsilon() {
-                query_vec.iter().map(|&v| v / norm).collect::<Vec<T>>()
-            } else {
-                vec![T::zero(); self.dim]
-            };
-            hash_vec.as_slice()
-        } else {
-            query_vec
-        };
-
-        LSH_CANDIDATES.with(|cand_cell| {
-            let mut candidates = cand_cell.borrow_mut();
-            candidates.clear();
-
-            let budget = max_cand.unwrap_or(self.n);
-
-            for table_idx in 0..self.num_tables {
-                if candidates.len() >= budget {
-                    break;
-                }
-
-                let (hash, projections) = compute_hash_with_projections(
-                    hash_input,
-                    table_idx,
-                    self.bits_per_hash,
-                    self.dim,
-                    &self.random_vecs,
-                );
-
-                // exact bucket
-                if let Some(bucket) = self.hash_tables[table_idx].get(&hash) {
-                    candidates.extend_from_slice(bucket);
-                }
-
-                // multi-probe: check neighbouring buckets ordered by uncertainty
-                if n_probes > 0 && candidates.len() < budget {
-                    let probes =
-                        generate_probes_ranked(hash, &projections, self.bits_per_hash, n_probes);
-                    for probe_hash in probes {
-                        if candidates.len() >= budget {
-                            break;
-                        }
-                        if let Some(bucket) = self.hash_tables[table_idx].get(&probe_hash) {
-                            candidates.extend_from_slice(bucket);
-                        }
-                    }
-                }
-            }
-
-            let fallback_triggered = candidates.is_empty();
-            if fallback_triggered {
-                let mut rng = rng();
-                let sample_size = 1000.min(self.n);
-                candidates.extend((0..self.n).choose_multiple(&mut rng, sample_size));
-            }
-
-            let (indices, dists) = self.rank_candidates(query_vec, &candidates, k);
-            Ok((indices, dists, fallback_triggered))
-        })
-    }
-
-    /// Query using a matrix row reference
-    ///
-    /// Optimised path for contiguous memory (stride == 1), otherwise copies to
-    /// a temporary vector.
-    ///
-    /// ### Params
-    ///
-    /// * `query_row` - Row reference to query vector
-    /// * `k` - Number of neighbours to return
-    /// * `max_cand` - Optional candidate limit
-    /// * `n_probes` - Number of multi-probe buckets per table
-    ///
-    /// ### Returns
-    ///
-    /// Tuple of `(indices, distances, fallback_triggered)`
-    pub fn query_row(
-        &self,
-        query_row: RowRef<T>,
-        k: usize,
-        max_cand: Option<usize>,
-        n_probes: usize,
-    ) -> Result<(Vec<usize>, Vec<T>, bool), AnnSearchErrors> {
-        if query_row.col_stride() == 1 {
-            let slice =
-                unsafe { std::slice::from_raw_parts(query_row.as_ptr(), query_row.ncols()) };
-            return self.query(slice, k, max_cand, n_probes);
-        }
-
-        let query_vec: Vec<T> = query_row.iter().cloned().collect();
-        self.query(&query_vec, k, max_cand, n_probes)
-    }
-
-    /// Generate kNN graph from vectors stored in the index
-    ///
-    /// Uses pre-computed per-vector hashes to avoid re-hashing, which is the
-    /// main performance advantage over calling `query()` N times. Multi-probe
-    /// uses uniform bit flipping (all single-bit flips, then pairs) since
-    /// projection magnitudes are not stored per vector.
-    ///
-    /// ### Params
-    ///
-    /// * `k` - Number of neighbours per vector
-    /// * `max_cand` - Optional candidate limit per query
-    /// * `n_probes` - Number of additional buckets to probe per table
-    /// * `return_dist` - Whether to return distances
-    /// * `verbose` - Controls verbosity
-    ///
-    /// ### Returns
-    ///
-    /// Tuple of `(knn_indices, optional distances)` where each row corresponds
-    /// to a vector in the index
-    pub fn generate_knn(
-        &self,
-        k: usize,
-        max_cand: Option<usize>,
-        n_probes: usize,
-        return_dist: bool,
-        verbose: bool,
-    ) -> (Vec<Vec<usize>>, Option<Vec<Vec<T>>>) {
-        use std::sync::{
-            atomic::{AtomicUsize, Ordering},
-            Arc,
-        };
-
-        let counter = Arc::new(AtomicUsize::new(0));
-
-        let results: Vec<(Vec<usize>, Vec<T>, bool)> = (0..self.n)
-            .into_par_iter()
-            .map(|vec_idx| {
-                if verbose {
-                    let count = counter.fetch_add(1, Ordering::Relaxed) + 1;
-                    if count.is_multiple_of(100_000) {
-                        println!(
-                            "  Processed {} / {} samples.",
-                            count.separate_with_underscores(),
-                            self.n.separate_with_underscores()
-                        );
-                    }
-                }
-
-                self.self_query_at(vec_idx, k, max_cand, n_probes)
-            })
-            .collect();
-
-        #[allow(unused_variables)]
-        let mut missed: usize = 0;
-
-        for (_, _, fallback) in &results {
-            if *fallback {
-                missed += 1;
-            }
-        }
-
-        if (missed as f32) / (self.n as f32) >= 0.01 {
-            println!("More than 1% of samples were not represented in the buckets.");
-            println!("Please verify underlying data");
-        }
-
-        if return_dist {
-            let mut indices = Vec::with_capacity(results.len());
-            let mut distances = Vec::with_capacity(results.len());
-
-            for (idx, dist, _) in results {
-                indices.push(idx);
-                distances.push(dist);
-            }
-            (indices, Some(distances))
-        } else {
-            let indices: Vec<Vec<usize>> = results.into_iter().map(|(idx, _, _)| idx).collect();
-            (indices, None)
-        }
-    }
-
-    /// Returns the size of the index in bytes
-    ///
-    /// ### Returns
-    ///
-    /// Index size `in n bytes`
-    pub fn memory_usage_bytes(&self) -> usize {
-        let mut total = std::mem::size_of_val(self);
-
-        total += self.vectors_flat.capacity() * std::mem::size_of::<T>();
-        total += self.norms.capacity() * std::mem::size_of::<T>();
-        total += self.random_vecs.capacity() * std::mem::size_of::<T>();
-        total += self.vector_hashes.capacity() * std::mem::size_of::<u64>();
-
-        // hash_tables outer Vec
-        total += self.hash_tables.capacity() * std::mem::size_of::<FxHashMap<u64, Vec<usize>>>();
-
-        for table in &self.hash_tables {
-            total +=
-                table.capacity() * (std::mem::size_of::<u64>() + std::mem::size_of::<Vec<usize>>());
-
-            for indices in table.values() {
-                total += indices.capacity() * std::mem::size_of::<usize>();
-            }
-        }
-
-        total
-    }
-
-    /// Returns the number of bits used for each hash.
-    pub fn num_bits(&self) -> usize {
-        self.bits_per_hash
-    }
-
-    /////////////////////
-    // Private helpers //
-    /////////////////////
-
-    /// Optimised self-query using pre-computed hashes
-    ///
-    /// Looks up the stored hash for `vec_idx` in each table and collects
-    /// candidates from matching + probed buckets. Avoids all hashing and
-    /// normalisation work.
-    ///
-    /// ### Params
-    ///
-    /// * `vec_idx` - Index of the vector to query.
-    /// * `k` - Number of neighbours to return.
-    /// * `max_cand` - Optional maximum number of candidates.
-    /// * `n_probes` - Number of additional buckets to probe per table
-    ///
-    /// ### Returns
-    ///
-    /// Tuple of `(indices, distances, random_sampling triggered)`
-    fn self_query_at(
-        &self,
-        vec_idx: usize,
-        k: usize,
-        max_cand: Option<usize>,
-        n_probes: usize,
-    ) -> (Vec<usize>, Vec<T>, bool) {
-        LSH_CANDIDATES.with(|cand_cell| {
-            let mut candidates = cand_cell.borrow_mut();
-            candidates.clear();
-
-            let budget = max_cand.unwrap_or(self.n);
-
-            for table_idx in 0..self.num_tables {
-                if candidates.len() >= budget {
-                    break;
-                }
-
-                let hash = self.vector_hashes[table_idx * self.n + vec_idx];
-
-                // exact bucket
-                if let Some(bucket) = self.hash_tables[table_idx].get(&hash) {
-                    candidates.extend_from_slice(bucket);
-                }
-
-                // Multi-probe with uniform bit flipping (no projection magnitudes
-                // available for stored hashes)
-                if n_probes > 0 && candidates.len() < budget {
-                    let probes = generate_probes_uniform(hash, self.bits_per_hash, n_probes);
-                    for probe_hash in probes {
-                        if candidates.len() >= budget {
-                            break;
-                        }
-                        if let Some(bucket) = self.hash_tables[table_idx].get(&probe_hash) {
-                            candidates.extend_from_slice(bucket);
-                        }
-                    }
-                }
-            }
-
-            let fallback_triggered = candidates.is_empty();
-            if fallback_triggered {
-                let mut rng = rng();
-                let sample_size = 1000.min(self.n);
-                candidates.extend((0..self.n).choose_multiple(&mut rng, sample_size));
-            }
-
-            let start = vec_idx * self.dim;
-            let query_vec = &self.vectors_flat[start..start + self.dim];
-
-            let (indices, dists) = self.rank_candidates(query_vec, &candidates, k);
-            (indices, dists, fallback_triggered)
-        })
-    }
-
-    /// Deduplicate candidates, compute distances, and return top-k sorted by
-    /// ascending distance
-    ///
-    /// ### Params
-    ///
-    /// * `query_vec`- The query vector to compare against.
-    /// * `candidates` - The candidate indices to consider.
-    /// * `k` - The number of nearest neighbors to return.
-    ///
-    /// ### Returns
-    ///
-    /// Tuple of `(indices, distances)`
-    fn rank_candidates(
-        &self,
-        query_vec: &[T],
-        candidates: &[usize],
-        k: usize,
-    ) -> (Vec<usize>, Vec<T>) {
-        LSH_SEEN_SET.with(|seen_cell| {
-            let mut seen = seen_cell.borrow_mut();
-            seen.clear();
-
-            let mut heap: BinaryHeap<(OrderedFloat<T>, usize)> = BinaryHeap::with_capacity(k + 1);
-
-            match self.metric {
-                Dist::SquaredEuclidean => {
-                    for &idx in candidates {
-                        if seen.insert(idx) {
-                            let d = self.euclidean_distance_to_query(idx, query_vec);
-                            let item = (OrderedFloat(d), idx);
-
-                            if heap.len() < k {
-                                heap.push(item);
-                            } else if item.0 < heap.peek().unwrap().0 {
-                                heap.pop();
-                                heap.push(item);
-                            }
-                        }
-                    }
-                }
-                Dist::Cosine => {
-                    let query_norm = T::calculate_l2_norm(query_vec);
-                    for &idx in candidates {
-                        if seen.insert(idx) {
-                            let d = self.cosine_distance_to_query(idx, query_vec, query_norm);
-                            let item = (OrderedFloat(d), idx);
-
-                            if heap.len() < k {
-                                heap.push(item);
-                            } else if item.0 < heap.peek().unwrap().0 {
-                                heap.pop();
-                                heap.push(item);
-                            }
-                        }
-                    }
-                }
-                Dist::Manhattan => unreachable!(),
-            }
-
-            let mut results: Vec<_> = heap.into_vec();
-            results.sort_unstable_by_key(|a| a.0);
-
-            let indices = results.iter().map(|&(_, idx)| idx).collect();
-            let dists = results.iter().map(|&(OrderedFloat(d), _)| d).collect();
-
-            (indices, dists)
-        })
-    }
-}
 
 /////////////
 // Helpers //
@@ -859,6 +269,601 @@ fn orthogonalise_table_projections<T>(
                 }
             }
         }
+    }
+}
+
+//////////////
+// LSHIndex //
+//////////////
+
+/// LSH index for approximate nearest neighbour search
+///
+/// Uses multiple hash tables with random hyperplane projections (SimHash) to
+/// partition the space. Vectors with identical hashes are stored in the same
+/// bucket. Supports multi-probe querying to improve recall without additional
+/// tables.
+///
+/// For Euclidean distance, vectors are L2-normalised before hashing so that
+/// SimHash (an angular hash) provides a reasonable proxy. Actual distance
+/// computations always use the original unnormalised vectors.
+pub struct LSHIndex<T> {
+    /// Original data, flattened row-major for cache efficiency
+    pub vectors_flat: Vec<T>,
+    /// Embedding dimensionality
+    pub dim: usize,
+    /// Number of vectors
+    pub n: usize,
+    /// Pre-computed L2 norms for Cosine distance (empty for Euclidean)
+    norms: Vec<T>,
+    /// Distance metric (Euclidean or Cosine)
+    metric: Dist,
+    /// Maps hash values to vector indices for each table
+    hash_tables: Vec<FxHashMap<u64, Vec<usize>>>,
+    /// Orthogonalised random projection vectors from N(0,1)
+    random_vecs: Vec<T>,
+    /// Number of hash tables
+    num_tables: usize,
+    /// Bits in each hash code (higher = fewer collisions)
+    bits_per_hash: usize,
+    /// Pre-computed hashes per vector per table, layout:
+    /// `[table_idx * n + vec_idx]`. Used to skip re-hashing during self-query.
+    vector_hashes: Vec<u64>,
+    /// Orignal indices
+    original_ids: Vec<usize>,
+}
+
+////////////////////
+// VectorDistance //
+////////////////////
+
+/// VectorDistance trait
+impl<T> VectorDistance<T> for LSHIndex<T>
+where
+    T: AnnSearchFloat,
+{
+    fn vectors_flat(&self) -> &[T] {
+        &self.vectors_flat
+    }
+
+    fn dim(&self) -> usize {
+        self.dim
+    }
+
+    fn norms(&self) -> &[T] {
+        &self.norms
+    }
+}
+
+/////////////////////////
+// DimensionValidation //
+/////////////////////////
+
+impl<T> DimensionValidation for LSHIndex<T> {
+    fn dim(&self) -> usize {
+        self.dim
+    }
+}
+
+/////////////////
+// Index build //
+/////////////////
+
+impl<T> LSHIndex<T>
+where
+    T: AnnSearchFloat,
+{
+    /// Construct a new LSH index
+    ///
+    /// Builds hash tables in parallel. For each table, hashes all vectors using
+    /// a different set of random hyperplane projections and groups them into
+    /// buckets. Stores per-vector hashes for fast self-query (kNN graph
+    /// generation).
+    ///
+    /// For Euclidean mode, vectors are L2-normalised once and reused across all
+    /// tables (avoiding redundant per-table normalisation).
+    ///
+    /// ### Params
+    ///
+    /// * `data` - Data matrix (rows = samples, columns = dimensions)
+    /// * `metric` - Distance metric (Euclidean or Cosine)
+    /// * `num_tables` - Number of hash tables (with multi-probe, 4-8 is
+    ///   typically sufficient)
+    /// * `bits_per_hash` - Bits per hash code (more = fewer collisions, smaller
+    ///   buckets)
+    /// * `seed` - Random seed for reproducibility
+    ///
+    /// ### Returns
+    ///
+    /// Constructed index ready for querying
+    pub fn new(
+        data: MatRef<T>,
+        metric: Dist,
+        num_tables: usize,
+        bits_per_hash: usize,
+        seed: usize,
+    ) -> Result<Self, AnnSearchErrors> {
+        if metric == Dist::Manhattan {
+            return Err(AnnSearchErrors::DistanceNotSupported(metric));
+        }
+
+        let (vectors_flat, n, dim) = matrix_to_flat(data);
+
+        let norms = if metric == Dist::Cosine {
+            (0..n)
+                .map(|i| {
+                    let start = i * dim;
+                    T::calculate_l2_norm(&vectors_flat[start..start + dim])
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+
+        // generate random projection vectors from N(0,1)
+        let mut rng = StdRng::seed_from_u64(seed as u64);
+        let total_random_vecs = num_tables * bits_per_hash * dim;
+        let mut random_vecs: Vec<T> = (0..total_random_vecs)
+            .map(|_| {
+                let val: f64 = rng.sample(StandardNormal);
+                T::from_f64(val).unwrap()
+            })
+            .collect();
+
+        orthogonalise_table_projections(&mut random_vecs, num_tables, bits_per_hash, dim);
+
+        // pre-compute L2-normalised vectors for Euclidean hashing
+        let normalised: Vec<T> = if metric == Dist::SquaredEuclidean {
+            let mut buf = vec![T::zero(); n * dim];
+            for i in 0..n {
+                let start = i * dim;
+                let norm = T::calculate_l2_norm(&vectors_flat[start..start + dim]);
+                if norm > T::epsilon() {
+                    for d in 0..dim {
+                        buf[start + d] = vectors_flat[start + d] / norm;
+                    }
+                }
+            }
+            buf
+        } else {
+            Vec::new()
+        };
+
+        let hash_source: &[T] = if metric == Dist::SquaredEuclidean {
+            &normalised
+        } else {
+            &vectors_flat
+        };
+
+        // compute all hashes and build tables in parallel
+        let tables_and_hashes: TablesAndHashes = (0..num_tables)
+            .into_par_iter()
+            .map(|table_idx| {
+                let mut table = FxHashMap::default();
+                let mut hashes = Vec::with_capacity(n);
+
+                for vec_idx in 0..n {
+                    let start = vec_idx * dim;
+                    let vec = &hash_source[start..start + dim];
+                    let hash = compute_hash(vec, table_idx, bits_per_hash, dim, &random_vecs);
+                    hashes.push(hash);
+                    table.entry(hash).or_insert_with(Vec::new).push(vec_idx);
+                }
+
+                (table, hashes)
+            })
+            .collect();
+
+        let mut vector_hashes = vec![0u64; num_tables * n];
+        let mut hash_tables = Vec::with_capacity(num_tables);
+        for (table_idx, (table, hashes)) in tables_and_hashes.into_iter().enumerate() {
+            hash_tables.push(table);
+            let base = table_idx * n;
+            vector_hashes[base..base + n].copy_from_slice(&hashes);
+        }
+
+        Ok(Self {
+            vectors_flat,
+            dim,
+            n,
+            norms,
+            metric,
+            hash_tables,
+            random_vecs,
+            num_tables,
+            bits_per_hash,
+            vector_hashes,
+            original_ids: (0..n).collect(),
+        })
+    }
+
+    /// Returns the size of the index in bytes
+    ///
+    /// ### Returns
+    ///
+    /// Index size `in n bytes`
+    pub fn memory_usage_bytes(&self) -> usize {
+        let mut total = std::mem::size_of_val(self);
+
+        total += self.vectors_flat.capacity() * std::mem::size_of::<T>();
+        total += self.norms.capacity() * std::mem::size_of::<T>();
+        total += self.random_vecs.capacity() * std::mem::size_of::<T>();
+        total += self.vector_hashes.capacity() * std::mem::size_of::<u64>();
+
+        // hash_tables outer Vec
+        total += self.hash_tables.capacity() * std::mem::size_of::<FxHashMap<u64, Vec<usize>>>();
+
+        for table in &self.hash_tables {
+            total +=
+                table.capacity() * (std::mem::size_of::<u64>() + std::mem::size_of::<Vec<usize>>());
+
+            for indices in table.values() {
+                total += indices.capacity() * std::mem::size_of::<usize>();
+            }
+        }
+
+        total
+    }
+
+    /// Returns the number of bits used for each hash.
+    pub fn num_bits(&self) -> usize {
+        self.bits_per_hash
+    }
+}
+
+///////////
+// Query //
+///////////
+
+impl<T> LSHIndex<T>
+where
+    T: AnnSearchFloat,
+{
+    /// Query the index for approximate nearest neighbours
+    ///
+    /// Hashes the query vector and retrieves candidates from matching buckets
+    /// across all tables. With `n_probes > 0`, also checks neighbouring
+    /// buckets by flipping the most uncertain hash bits (multi-probe LSH).
+    ///
+    /// If no candidates are found across all tables and probes, falls back to
+    /// random sampling.
+    ///
+    /// ### Params
+    ///
+    /// * `query_vec` - Query vector (must match index dimensionality)
+    /// * `k` - Number of neighbours to return
+    /// * `max_cand` - Optional limit on total candidates examined
+    /// * `n_probes` - Number of additional buckets to probe per table (0 =
+    ///   exact hash only). Good default: `bits_per_hash` (all single-bit
+    ///   flips).
+    ///
+    /// ### Returns
+    ///
+    /// Tuple of `(indices, distances, fallback_triggered)` sorted by distance
+    pub fn query(
+        &self,
+        query_vec: &[T],
+        k: usize,
+        max_cand: Option<usize>,
+        n_probes: usize,
+    ) -> Result<(Vec<usize>, Vec<T>, bool), AnnSearchErrors> {
+        self.check_dim(query_vec.len())?;
+
+        // normalise query for hashing if Euclidean
+        let hash_vec;
+        let hash_input = if self.metric == Dist::SquaredEuclidean {
+            let norm = T::calculate_l2_norm(query_vec);
+            hash_vec = if norm > T::epsilon() {
+                query_vec.iter().map(|&v| v / norm).collect::<Vec<T>>()
+            } else {
+                vec![T::zero(); self.dim]
+            };
+            hash_vec.as_slice()
+        } else {
+            query_vec
+        };
+
+        LSH_CANDIDATES.with(|cand_cell| {
+            let mut candidates = cand_cell.borrow_mut();
+            candidates.clear();
+
+            let budget = max_cand.unwrap_or(self.n);
+
+            for table_idx in 0..self.num_tables {
+                if candidates.len() >= budget {
+                    break;
+                }
+
+                let (hash, projections) = compute_hash_with_projections(
+                    hash_input,
+                    table_idx,
+                    self.bits_per_hash,
+                    self.dim,
+                    &self.random_vecs,
+                );
+
+                // exact bucket
+                if let Some(bucket) = self.hash_tables[table_idx].get(&hash) {
+                    candidates.extend_from_slice(bucket);
+                }
+
+                // multi-probe: check neighbouring buckets ordered by uncertainty
+                if n_probes > 0 && candidates.len() < budget {
+                    let probes =
+                        generate_probes_ranked(hash, &projections, self.bits_per_hash, n_probes);
+                    for probe_hash in probes {
+                        if candidates.len() >= budget {
+                            break;
+                        }
+                        if let Some(bucket) = self.hash_tables[table_idx].get(&probe_hash) {
+                            candidates.extend_from_slice(bucket);
+                        }
+                    }
+                }
+            }
+
+            let fallback_triggered = candidates.is_empty();
+            if fallback_triggered {
+                let mut rng = rng();
+                let sample_size = 1000.min(self.n);
+                candidates.extend((0..self.n).choose_multiple(&mut rng, sample_size));
+            }
+
+            let (indices, dists) = self.rank_candidates(query_vec, &candidates, k);
+            Ok((indices, dists, fallback_triggered))
+        })
+    }
+
+    /// Query using a matrix row reference
+    ///
+    /// Optimised path for contiguous memory (stride == 1), otherwise copies to
+    /// a temporary vector.
+    ///
+    /// ### Params
+    ///
+    /// * `query_row` - Row reference to query vector
+    /// * `k` - Number of neighbours to return
+    /// * `max_cand` - Optional candidate limit
+    /// * `n_probes` - Number of multi-probe buckets per table
+    ///
+    /// ### Returns
+    ///
+    /// Tuple of `(indices, distances, fallback_triggered)`
+    pub fn query_row(
+        &self,
+        query_row: RowRef<T>,
+        k: usize,
+        max_cand: Option<usize>,
+        n_probes: usize,
+    ) -> Result<(Vec<usize>, Vec<T>, bool), AnnSearchErrors> {
+        if query_row.col_stride() == 1 {
+            let slice =
+                unsafe { std::slice::from_raw_parts(query_row.as_ptr(), query_row.ncols()) };
+            return self.query(slice, k, max_cand, n_probes);
+        }
+
+        let query_vec: Vec<T> = query_row.iter().cloned().collect();
+        self.query(&query_vec, k, max_cand, n_probes)
+    }
+
+    /// Generate kNN graph from vectors stored in the index
+    ///
+    /// Uses pre-computed per-vector hashes to avoid re-hashing, which is the
+    /// main performance advantage over calling `query()` N times. Multi-probe
+    /// uses uniform bit flipping (all single-bit flips, then pairs) since
+    /// projection magnitudes are not stored per vector.
+    ///
+    /// ### Params
+    ///
+    /// * `k` - Number of neighbours per vector
+    /// * `max_cand` - Optional candidate limit per query
+    /// * `n_probes` - Number of additional buckets to probe per table
+    /// * `return_dist` - Whether to return distances
+    /// * `verbose` - Controls verbosity
+    ///
+    /// ### Returns
+    ///
+    /// Tuple of `(knn_indices, optional distances)` where each row corresponds
+    /// to a vector in the index
+    pub fn generate_knn(
+        &self,
+        k: usize,
+        max_cand: Option<usize>,
+        n_probes: usize,
+        return_dist: bool,
+        verbose: bool,
+    ) -> (Vec<Vec<usize>>, Option<Vec<Vec<T>>>) {
+        use std::sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        };
+
+        let counter = Arc::new(AtomicUsize::new(0));
+
+        let results: Vec<(Vec<usize>, Vec<T>, bool)> = (0..self.n)
+            .into_par_iter()
+            .map(|vec_idx| {
+                if verbose {
+                    let count = counter.fetch_add(1, Ordering::Relaxed) + 1;
+                    if count.is_multiple_of(100_000) {
+                        println!(
+                            "  Processed {} / {} samples.",
+                            count.separate_with_underscores(),
+                            self.n.separate_with_underscores()
+                        );
+                    }
+                }
+
+                self.self_query_at(vec_idx, k, max_cand, n_probes)
+            })
+            .collect();
+
+        #[allow(unused_variables)]
+        let mut missed: usize = 0;
+
+        for (_, _, fallback) in &results {
+            if *fallback {
+                missed += 1;
+            }
+        }
+
+        if (missed as f32) / (self.n as f32) >= 0.01 {
+            println!("More than 1% of samples were not represented in the buckets.");
+            println!("Please verify underlying data");
+        }
+
+        if return_dist {
+            let mut indices = Vec::with_capacity(results.len());
+            let mut distances = Vec::with_capacity(results.len());
+
+            for (idx, dist, _) in results {
+                indices.push(idx);
+                distances.push(dist);
+            }
+            (indices, Some(distances))
+        } else {
+            let indices: Vec<Vec<usize>> = results.into_iter().map(|(idx, _, _)| idx).collect();
+            (indices, None)
+        }
+    }
+
+    /// Optimised self-query using pre-computed hashes
+    ///
+    /// Looks up the stored hash for `vec_idx` in each table and collects
+    /// candidates from matching + probed buckets. Avoids all hashing and
+    /// normalisation work.
+    ///
+    /// ### Params
+    ///
+    /// * `vec_idx` - Index of the vector to query.
+    /// * `k` - Number of neighbours to return.
+    /// * `max_cand` - Optional maximum number of candidates.
+    /// * `n_probes` - Number of additional buckets to probe per table
+    ///
+    /// ### Returns
+    ///
+    /// Tuple of `(indices, distances, random_sampling triggered)`
+    fn self_query_at(
+        &self,
+        vec_idx: usize,
+        k: usize,
+        max_cand: Option<usize>,
+        n_probes: usize,
+    ) -> (Vec<usize>, Vec<T>, bool) {
+        LSH_CANDIDATES.with(|cand_cell| {
+            let mut candidates = cand_cell.borrow_mut();
+            candidates.clear();
+
+            let budget = max_cand.unwrap_or(self.n);
+
+            for table_idx in 0..self.num_tables {
+                if candidates.len() >= budget {
+                    break;
+                }
+
+                let hash = self.vector_hashes[table_idx * self.n + vec_idx];
+
+                // exact bucket
+                if let Some(bucket) = self.hash_tables[table_idx].get(&hash) {
+                    candidates.extend_from_slice(bucket);
+                }
+
+                // Multi-probe with uniform bit flipping (no projection magnitudes
+                // available for stored hashes)
+                if n_probes > 0 && candidates.len() < budget {
+                    let probes = generate_probes_uniform(hash, self.bits_per_hash, n_probes);
+                    for probe_hash in probes {
+                        if candidates.len() >= budget {
+                            break;
+                        }
+                        if let Some(bucket) = self.hash_tables[table_idx].get(&probe_hash) {
+                            candidates.extend_from_slice(bucket);
+                        }
+                    }
+                }
+            }
+
+            let fallback_triggered = candidates.is_empty();
+            if fallback_triggered {
+                let mut rng = rng();
+                let sample_size = 1000.min(self.n);
+                candidates.extend((0..self.n).choose_multiple(&mut rng, sample_size));
+            }
+
+            let start = vec_idx * self.dim;
+            let query_vec = &self.vectors_flat[start..start + self.dim];
+
+            let (indices, dists) = self.rank_candidates(query_vec, &candidates, k);
+            (indices, dists, fallback_triggered)
+        })
+    }
+
+    /// Deduplicate candidates, compute distances, and return top-k sorted by
+    /// ascending distance
+    ///
+    /// ### Params
+    ///
+    /// * `query_vec`- The query vector to compare against.
+    /// * `candidates` - The candidate indices to consider.
+    /// * `k` - The number of nearest neighbors to return.
+    ///
+    /// ### Returns
+    ///
+    /// Tuple of `(indices, distances)`
+    fn rank_candidates(
+        &self,
+        query_vec: &[T],
+        candidates: &[usize],
+        k: usize,
+    ) -> (Vec<usize>, Vec<T>) {
+        LSH_SEEN_SET.with(|seen_cell| {
+            let mut seen = seen_cell.borrow_mut();
+            seen.clear();
+
+            let mut heap: BinaryHeap<(OrderedFloat<T>, usize)> = BinaryHeap::with_capacity(k + 1);
+
+            match self.metric {
+                Dist::SquaredEuclidean => {
+                    for &idx in candidates {
+                        if seen.insert(idx) {
+                            let d = self.euclidean_distance_to_query(idx, query_vec);
+                            let item = (OrderedFloat(d), idx);
+
+                            if heap.len() < k {
+                                heap.push(item);
+                            } else if item.0 < heap.peek().unwrap().0 {
+                                heap.pop();
+                                heap.push(item);
+                            }
+                        }
+                    }
+                }
+                Dist::Cosine => {
+                    let query_norm = T::calculate_l2_norm(query_vec);
+                    for &idx in candidates {
+                        if seen.insert(idx) {
+                            let d = self.cosine_distance_to_query(idx, query_vec, query_norm);
+                            let item = (OrderedFloat(d), idx);
+
+                            if heap.len() < k {
+                                heap.push(item);
+                            } else if item.0 < heap.peek().unwrap().0 {
+                                heap.pop();
+                                heap.push(item);
+                            }
+                        }
+                    }
+                }
+                Dist::Manhattan => unreachable!(),
+            }
+
+            let mut results: Vec<_> = heap.into_vec();
+            results.sort_unstable_by_key(|a| a.0);
+
+            let indices = results.iter().map(|&(_, idx)| idx).collect();
+            let dists = results.iter().map(|&(OrderedFloat(d), _)| d).collect();
+
+            (indices, dists)
+        })
     }
 }
 

@@ -94,7 +94,7 @@ fn main() {
             knn_k,
             &cli.distance,
             cli.seed as usize,
-            false,
+            true,
         )
         .unwrap();
         let build_time = start.elapsed().as_secs_f64() * 1000.0;

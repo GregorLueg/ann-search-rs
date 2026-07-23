@@ -63,9 +63,9 @@ enum BuildNode<T> {
     },
 }
 
-////////////////
-// Main index //
-////////////////
+/////////////////
+// Annoy index //
+/////////////////
 
 /// Annoy (Approximate Nearest Neighbours Oh Yeah) index for similarity search
 ///
@@ -128,9 +128,9 @@ impl<T> DimensionValidation for AnnoyIndex<T> {
     }
 }
 
-/////////////////////////
-// Main implementation //
-/////////////////////////
+/////////////////
+// Index build //
+/////////////////
 
 impl<T> AnnoyIndex<T>
 where
@@ -529,10 +529,31 @@ where
         new_to_old
     }
 
-    ///////////
-    // Query //
-    ///////////
+    /// Returns the size of the index in bytes
+    ///
+    /// ### Returns
+    ///
+    /// Index size `in n bytes`
+    pub fn memory_usage_bytes(&self) -> usize {
+        std::mem::size_of_val(self)
+            + self.vectors_flat.capacity() * std::mem::size_of::<T>()
+            + self.norms.capacity() * std::mem::size_of::<T>()
+            + self.nodes.capacity() * std::mem::size_of::<FlatNode>()
+            + self.roots.capacity() * std::mem::size_of::<u32>()
+            + self.split_data.capacity() * std::mem::size_of::<T>()
+            + self.leaf_indices.capacity() * std::mem::size_of::<usize>()
+            + self.original_ids.capacity() * std::mem::size_of::<usize>()
+    }
+}
 
+///////////
+// Query //
+///////////
+
+impl<T> AnnoyIndex<T>
+where
+    T: AnnSearchFloat,
+{
     /// Query the index for approximate nearest neighbours
     ///
     /// Performs best-first search across all trees, greedily descending to
@@ -775,22 +796,6 @@ where
         }
 
         Ok((final_indices, final_dists))
-    }
-
-    /// Returns the size of the index in bytes
-    ///
-    /// ### Returns
-    ///
-    /// Index size `in n bytes`
-    pub fn memory_usage_bytes(&self) -> usize {
-        std::mem::size_of_val(self)
-            + self.vectors_flat.capacity() * std::mem::size_of::<T>()
-            + self.norms.capacity() * std::mem::size_of::<T>()
-            + self.nodes.capacity() * std::mem::size_of::<FlatNode>()
-            + self.roots.capacity() * std::mem::size_of::<u32>()
-            + self.split_data.capacity() * std::mem::size_of::<T>()
-            + self.leaf_indices.capacity() * std::mem::size_of::<usize>()
-            + self.original_ids.capacity() * std::mem::size_of::<usize>()
     }
 }
 

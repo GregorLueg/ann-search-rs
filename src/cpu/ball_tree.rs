@@ -290,18 +290,14 @@ impl<T> DimensionValidation for BallTreeIndex<T> {
     }
 }
 
-/////////////////////////
-// Main implementation //
-/////////////////////////
+/////////////////
+// Index build //
+/////////////////
 
 impl<T> BallTreeIndex<T>
 where
     T: AnnSearchFloat,
 {
-    //////////////////////
-    // Index generation //
-    //////////////////////
-
     /// Generate a new BallTreeIndex
     ///
     /// Builds a BallTree
@@ -763,6 +759,12 @@ where
         base_offset
     }
 
+    /// Offset the left/right child indices of each build node
+    ///
+    /// ### Params
+    ///
+    /// * `nodes` - Subtree nodes to adjust in place
+    /// * `offset` - Amount to add to each child index
     fn adjust_subtree_indices(nodes: &mut [BuildNode<T>], offset: usize) {
         for node in nodes.iter_mut() {
             if let BuildNode::Split { left, right, .. } = node {
@@ -772,10 +774,30 @@ where
         }
     }
 
-    ///////////
-    // Query //
-    ///////////
+    /// Returns the size of the index in bytes
+    ///
+    /// ### Returns
+    ///
+    /// Index size `in n bytes`
+    pub fn memory_usage_bytes(&self) -> usize {
+        std::mem::size_of_val(self)
+            + self.vectors_flat.capacity() * std::mem::size_of::<T>()
+            + self.norms.capacity() * std::mem::size_of::<T>()
+            + self.nodes.capacity() * std::mem::size_of::<BallNode<T>>()
+            + self.centers_data.capacity() * std::mem::size_of::<T>()
+            + self.leaf_indices.capacity() * std::mem::size_of::<usize>()
+            + self.original_ids.capacity() * std::mem::size_of::<usize>()
+    }
+}
 
+///////////
+// Query //
+///////////
+
+impl<T> BallTreeIndex<T>
+where
+    T: AnnSearchFloat,
+{
     /// Query the index
     ///
     /// ### Params
@@ -1024,21 +1046,6 @@ where
             let indices: Vec<Vec<usize>> = results.into_iter().map(|(idx, _)| idx).collect();
             Ok((indices, None))
         }
-    }
-
-    /// Returns the size of the index in bytes
-    ///
-    /// ### Returns
-    ///
-    /// Index size `in n bytes`
-    pub fn memory_usage_bytes(&self) -> usize {
-        std::mem::size_of_val(self)
-            + self.vectors_flat.capacity() * std::mem::size_of::<T>()
-            + self.norms.capacity() * std::mem::size_of::<T>()
-            + self.nodes.capacity() * std::mem::size_of::<BallNode<T>>()
-            + self.centers_data.capacity() * std::mem::size_of::<T>()
-            + self.leaf_indices.capacity() * std::mem::size_of::<usize>()
-            + self.original_ids.capacity() * std::mem::size_of::<usize>()
     }
 }
 

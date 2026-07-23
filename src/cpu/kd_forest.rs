@@ -81,9 +81,9 @@ const TOP_K_DIMS: usize = 3;
 /// computation. Keeps build cost per node O(1) rather than O(n).
 const SUBSAMPLE_SIZE: usize = 128;
 
-////////////////
-// Main index //
-////////////////
+/////////////////
+// KdTreeIndex //
+/////////////////
 
 /// Kd-Tree forest index for approximate nearest neighbour search
 ///
@@ -149,18 +149,14 @@ impl<T> DimensionValidation for KdTreeIndex<T> {
     }
 }
 
-//////////
-// Main //
-//////////
+/////////////////
+// Index build //
+/////////////////
 
 impl<T> KdTreeIndex<T>
 where
     T: AnnSearchFloat,
 {
-    //////////////////////
-    // Index generation //
-    //////////////////////
-
     /// Construct a new Kd-Tree forest index with default overlap
     ///
     /// Builds a forest of randomised Kd-trees in parallel. Uses the
@@ -286,10 +282,6 @@ where
 
         idx
     }
-
-    ////////////////
-    // Tree build //
-    ////////////////
 
     /// Build a single tree recursively
     ///
@@ -480,10 +472,6 @@ where
         spreads
     }
 
-    /////////////////////////
-    // Memory optimisation //
-    /////////////////////////
-
     /// Reorders vectors in memory to match the DFS layout of Tree 0
     ///
     /// Places vectors that co-occur in leaves physically adjacent in memory.
@@ -563,10 +551,30 @@ where
         new_to_old
     }
 
-    ///////////
-    // Query //
-    ///////////
+    /// Returns the size of the index in bytes
+    ///
+    /// ### Returns
+    ///
+    /// Index size `in n bytes`
+    pub fn memory_usage_bytes(&self) -> usize {
+        std::mem::size_of_val(self)
+            + self.vectors_flat.capacity() * std::mem::size_of::<T>()
+            + self.norms.capacity() * std::mem::size_of::<T>()
+            + self.nodes.capacity() * std::mem::size_of::<KdFlatNode<T>>()
+            + self.roots.capacity() * std::mem::size_of::<u32>()
+            + self.leaf_indices.capacity() * std::mem::size_of::<usize>()
+            + self.original_ids.capacity() * std::mem::size_of::<usize>()
+    }
+}
 
+///////////
+// Query //
+///////////
+
+impl<T> KdTreeIndex<T>
+where
+    T: AnnSearchFloat,
+{
     /// Query the index for approximate nearest neighbours
     ///
     /// Traverses all trees using priority-queue-ordered backtracking. Explores
@@ -756,10 +764,6 @@ where
         self.query(&query_vec, k, search_k)
     }
 
-    ///////////////
-    // kNN graph //
-    ///////////////
-
     /// Generate kNN graph from vectors stored in the index
     ///
     /// Queries each vector in the index against itself to build a complete kNN
@@ -827,25 +831,6 @@ where
         }
 
         Ok((final_indices, final_dists))
-    }
-
-    ////////////
-    // Memory //
-    ////////////
-
-    /// Returns the size of the index in bytes
-    ///
-    /// ### Returns
-    ///
-    /// Index size `in n bytes`
-    pub fn memory_usage_bytes(&self) -> usize {
-        std::mem::size_of_val(self)
-            + self.vectors_flat.capacity() * std::mem::size_of::<T>()
-            + self.norms.capacity() * std::mem::size_of::<T>()
-            + self.nodes.capacity() * std::mem::size_of::<KdFlatNode<T>>()
-            + self.roots.capacity() * std::mem::size_of::<u32>()
-            + self.leaf_indices.capacity() * std::mem::size_of::<usize>()
-            + self.original_ids.capacity() * std::mem::size_of::<usize>()
     }
 }
 
