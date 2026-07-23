@@ -66,10 +66,9 @@ fn main() {
 
     println!("-----------------------------");
 
-    // GPU device (WGPU: picks Metal / Vulkan / DX12 depending on platform).
     let device: cubecl::wgpu::WgpuDevice = Default::default();
 
-    let knn_k: usize = 64;
+    let knn_k: usize = 48;
 
     // Build the GPU kNN graph ONCE and reuse it across every (r, l_build)
     // combination below.
@@ -94,7 +93,17 @@ fn main() {
     println!("GPU kNN graph built in {:.2} ms", knn_build_ms);
     println!("-----------------------------");
 
-    let build_params: &[(usize, usize)] = &[(32, 150), (48, 150), (64, 150)];
+    let build_params: &[(usize, usize)] = &[
+        (24, 150),
+        (24, 100),
+        (24, 150),
+        (32, 50),
+        (32, 100),
+        (32, 150),
+        (48, 50),
+        (48, 100),
+        (48, 150),
+    ];
     let c_cap: usize = 500;
     let ef_search_values: &[Option<usize>] = &[Some(50), None, Some(150)];
 

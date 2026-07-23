@@ -67,18 +67,18 @@ fn main() {
     println!("-----------------------------");
 
     let build_params: &[(usize, usize)] = &[
-        // (32, 50),
-        // (32, 100),
+        (24, 50),
+        (24, 100),
+        (24, 150),
+        (32, 50),
+        (32, 100),
         (32, 150),
-        // (48, 50),
-        // (48, 100),
+        (48, 50),
+        (48, 100),
         (48, 150),
-        // (64, 50),
-        // (64, 100),
-        (64, 150),
     ];
     let c_cap: usize = 500;
-    let knn_k: usize = 64;
+    let knn_k: usize = 32;
 
     let ef_search_values: &[Option<usize>] = &[Some(50), None, Some(150)];
 
@@ -94,7 +94,7 @@ fn main() {
             knn_k,
             &cli.distance,
             cli.seed as usize,
-            true,
+            false,
         )
         .unwrap();
         let build_time = start.elapsed().as_secs_f64() * 1000.0;
