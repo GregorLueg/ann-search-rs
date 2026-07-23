@@ -7,6 +7,9 @@
 - Added Navigating Spreading-out Graph (NSG) as an index. The initial kNN
   generation can happen on CPU or GPU.
 - Added Relative NN-Descent (RNN-Descent) index.
+- Updated the diversification in NNDescent to be more useful. Instead of just
+  pruning the graph, it now keeps the desired node degree but yields a better
+  graph.
 
 ## 0.4.4
 
