@@ -526,9 +526,13 @@ exhaustive search)!
   to auto, it defaults to `min(5 + round(n^0.25), 32)`
 - *Search budget (s)*: The search budget for the exploration of the graph during
   querying. Here it defaults to `k * n_trees`.
-- *Diversify probability (dp)*: This is based on the original papers leveraging
-  NNDescent and it is supposed to remove redundant edges from the graph to
-  increase query speed.
+- *Diversify probability (dp)*: Post-descent RNG-rule prune, inspired by
+  PyNNDescent. For each node, the forward k-NN row is merged with reverse
+  edges, then candidates are pruned when closer to an already-kept
+  neighbour than to the origin (Bernoulli coin with probability `dp`).
+  Short rows get topped up from the pruned tail so out-degree stays at
+  `k`. Recovers cross-cluster connectivity on well-clustered data at a
+  small query-time cost; on uniform data it costs a bit of recall too.
 
 <details>
 <summary><b>NNDescent - Euclidean (Gaussian)</b>:</summary>

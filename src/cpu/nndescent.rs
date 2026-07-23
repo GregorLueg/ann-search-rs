@@ -378,7 +378,9 @@ where
     /// * `max_iter` - Maximum iterations
     /// * `n_trees` - Annoy/Kd forest size
     /// * `delta` - Convergence threshold (fraction of edges updated)
-    /// * `diversify_prob` - Probability of pruning redundant edges (0 to disable)
+    /// * `diversify_prob` - Bernoulli probability for the post-descent
+    ///   RNG-rule prune over the forward+reverse candidate pool
+    ///   (0 disables). See [`Self::diversify_graph`] for the exact rule.
     /// * `seed` - Random seed
     /// * `verbose` - Print progress
     #[allow(clippy::too_many_arguments)]
@@ -1014,23 +1016,71 @@ where
         }
     }
 
-    /// Diversify the graph by probabilistically pruning redundant edges
+    /// Build reverse adjacency from the directed k-NN graph.
     ///
-    /// Walks each node's neighbour list in distance order, keeping the closest
-    /// and discarding candidates that are closer to an already-kept neighbour
-    /// than to the query node (with probability `prune_prob`). Operates on the
-    /// final `(pid, dist)` graph. Pruned slots are padded with sentinels.
+    /// For each source node `u`, walks its `k` outgoing neighbours in `graph`
+    /// and pushes `(u, d(u, v))` into `reverse[v]`. Sentinels are skipped.
+    /// Distances are inherited from the forward edge so no extra distance
+    /// computation is performed.
     ///
     /// ### Params
     ///
-    /// * `graph` - Input flat graph
-    /// * `k` - Neighbours per node
-    /// * `prune_prob` - Probability of pruning a redundant edge
-    /// * `seed` - Random seed for per-node pruning decisions
+    /// * `graph` - Flat directed k-NN graph, row `i` at `[i*k..(i+1)*k]`,
+    ///   sorted ascending, sentinel-padded.
+    /// * `k` - Neighbours per node.
     ///
     /// ### Returns
     ///
-    /// New graph with redundant edges replaced by sentinels
+    /// `Vec<Vec<(usize, T)>>` of length `n`. Entry `v` lists `(u, d(u, v))`
+    /// for every source `u` that has `v` in its forward list.
+    fn build_reverse_adjacency(
+        &self,
+        graph: &[(usize, T)],
+        k: usize,
+    ) -> Vec<Vec<(usize, T)>> {
+        let mut reverse: Vec<Vec<(usize, T)>> = (0..self.n).map(|_| Vec::new()).collect();
+        for u in 0..self.n {
+            let row = &graph[u * k..(u + 1) * k];
+            for &(v, d) in row {
+                if v == SENTINEL_PID {
+                    continue;
+                }
+                reverse[v].push((u, d));
+            }
+        }
+        reverse
+    }
+
+    /// Diversify the graph via probabilistic RNG-rule pruning over the
+    /// forward + reverse edge pool.
+    ///
+    /// For each node `u`, the input pool merges `graph[u]` with all nodes
+    /// that have `u` as a forward neighbour, deduplicates by pid, and
+    /// sorts ascending by distance. The RNG rule then prunes an entry
+    /// `v` from the pool if some already-kept neighbour `w` satisfies
+    /// `d(w, v) < d(u, v)` (Bernoulli coin with probability `prune_prob`).
+    /// The output row is filled with up to `k` kept entries; short rows
+    /// are topped up from the pruned-out tail in distance order so
+    /// out-degree does not shrink.
+    ///
+    /// Because iteration is ascending in `d(u, v)`, every already-kept
+    /// `w` satisfies `d(u, w) <= d(u, v)` by construction, so the
+    /// classical two-sided RNG rule collapses to the single check
+    /// `d(w, v) < d(u, v)`.
+    ///
+    /// ### Params
+    ///
+    /// * `graph` - Input flat directed k-NN graph, sentinel-padded.
+    /// * `k` - Neighbours per node.
+    /// * `prune_prob` - Bernoulli probability of applying the RNG rule
+    ///   per candidate/kept pair. Zero disables pruning.
+    /// * `seed` - Base RNG seed. Per-node seed is `seed + i`.
+    ///
+    /// ### Returns
+    ///
+    /// New flat graph of length `n * k`. Sentinel-padded only when the
+    /// merged pool for a row is smaller than `k` (small `n` or
+    /// disconnected components).
     fn diversify_graph(
         &self,
         graph: &[(usize, T)],
@@ -1038,46 +1088,76 @@ where
         prune_prob: T,
         seed: usize,
     ) -> Vec<(usize, T)> {
+        let reverse = self.build_reverse_adjacency(graph, k);
         let mut result = vec![(SENTINEL_PID, T::max_value()); self.n * k];
+        let prune_prob_f64 = prune_prob.to_f64().unwrap();
 
         result
             .par_chunks_mut(k)
             .enumerate()
             .for_each(|(i, out_slot)| {
-                let base = i * k;
-                let neighbours = &graph[base..base + k];
-
-                // Collect non-sentinel neighbours
-                let valid: Vec<(usize, T)> = neighbours
-                    .iter()
-                    .copied()
-                    .filter(|&(pid, _)| pid != SENTINEL_PID)
-                    .collect();
-
-                if valid.is_empty() {
+                let mut pool: Vec<(usize, T)> = Vec::with_capacity(2 * k);
+                for &entry in &graph[i * k..(i + 1) * k] {
+                    if entry.0 != SENTINEL_PID && entry.0 != i {
+                        pool.push(entry);
+                    }
+                }
+                for &entry in &reverse[i] {
+                    if entry.0 != i {
+                        pool.push(entry);
+                    }
+                }
+                if pool.is_empty() {
                     return;
                 }
 
+                // Dedupe by pid, keeping the smallest distance per pid.
+                pool.sort_unstable_by(|a, b| {
+                    a.0.cmp(&b.0).then_with(|| {
+                        a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal)
+                    })
+                });
+                pool.dedup_by_key(|x| x.0);
+
+                // Re-sort by distance ascending for the RNG-rule sweep.
+                pool.sort_unstable_by(|a, b| {
+                    a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal)
+                });
+
                 let mut rng = SmallRng::seed_from_u64((seed as u64).wrapping_add(i as u64));
-                let mut kept = vec![valid[0]];
+                let mut kept: Vec<(usize, T)> = Vec::with_capacity(k);
+                let mut pruned: Vec<(usize, T)> = Vec::new();
 
-                for &(cand_idx, cand_dist) in &valid[1..] {
+                kept.push(pool[0]);
+
+                for &(cand_idx, cand_dist) in &pool[1..] {
                     let mut should_keep = true;
-
-                    for &(kept_idx, kept_dist) in &kept {
+                    for &(kept_idx, _) in &kept {
                         let dist_to_kept = self.distance(cand_idx, kept_idx);
-
-                        if kept_dist > T::from_f32(f32::EPSILON).unwrap()
-                            && dist_to_kept < cand_dist
-                            && rng.random::<f64>() < prune_prob.to_f64().unwrap()
+                        if dist_to_kept < cand_dist
+                            && rng.random::<f64>() < prune_prob_f64
                         {
                             should_keep = false;
                             break;
                         }
                     }
-
                     if should_keep {
                         kept.push((cand_idx, cand_dist));
+                        if kept.len() == k {
+                            break;
+                        }
+                    } else {
+                        pruned.push((cand_idx, cand_dist));
+                    }
+                }
+
+                // Top up short rows from the pruned tail in distance order.
+                if kept.len() < k {
+                    for &entry in &pruned {
+                        if kept.len() == k {
+                            break;
+                        }
+                        kept.push(entry);
                     }
                 }
 

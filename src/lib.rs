@@ -1002,7 +1002,11 @@ where
 /// * `delta` - Early stop criterium for the algorithm.
 /// * `rho` - Sampling rate for the old neighbours. Will adaptively decrease
 ///   over time.
-/// * `diversify_prob` - Probability of pruning redundant edges (1.0 = always prune)
+/// * `diversify_prob` - Bernoulli probability of pruning a redundant edge
+///   per candidate/kept pair, applied post-descent to the forward+reverse
+///   candidate pool per node. `0.0` disables pruning; `1.0` always prunes
+///   when the RNG rule fires. Rows shorter than `k` after pruning are
+///   topped up from the pruned tail so out-degree is preserved.
 /// * `seed` - Random seed for reproducibility
 /// * `verbose` - Controls verbosity of the algorithm
 ///
