@@ -866,6 +866,7 @@ where
                 update_counter_gpu.clone().into_tensor_arg(),
                 n as u32,
                 MAX_PROPOSALS as u32,
+                graph_idx_gpu.shape()[1],
             );
         }
     }

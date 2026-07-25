@@ -118,6 +118,15 @@ impl<R: Runtime, F: Numeric + CubeElement> GpuTensor<R, F> {
         Ok(F::from_bytes(&bytes).to_vec())
     }
 
+    /// Dimensions of the tensor
+    ///
+    /// ### Returns
+    ///
+    /// Slice of the per-dimension extents, outermost first
+    pub fn shape(&self) -> &[usize] {
+        &self.shape
+    }
+
     /// Number of elements the underlying allocation holds
     ///
     /// ### Returns

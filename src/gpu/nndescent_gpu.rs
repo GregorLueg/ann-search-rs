@@ -601,6 +601,7 @@ pub fn merge_proposals<F: Float>(
     update_counter: &Tensor<Atomic<u32>>,
     n: u32,
     #[comptime] max_proposals: u32,
+    #[comptime] k_comp: usize,
 ) {
     let node = (CUBE_POS_Y * CUBE_COUNT_X + CUBE_POS_X) * WORKGROUP_SIZE_X + UNIT_POS_X;
     if node >= n {
@@ -612,9 +613,16 @@ pub fn merge_proposals<F: Float>(
     let is_new_bit = 1u32 << 31;
     let base = node as usize * k;
 
-    // clear new flags on all existing entries
-    for j in 0..k {
-        graph_idx[base + j] = graph_idx[base + j] & pid_mask;
+    // Stage this node's row in registers. Every proposal used to scan the row
+    // twice and shift it once, all against global memory, up to
+    // `max_proposals` times per node: O(max_proposals * 3k) global accesses
+    // where 2k suffices. Loading with the id mask applied also folds in the
+    // separate "clear new flags" pass this replaces.
+    let mut local_idx = Array::<u32>::new(k_comp);
+    let mut local_dist = Array::<F>::new(k_comp);
+    for j in 0..k_comp {
+        local_idx[j] = graph_idx[base + j] & pid_mask;
+        local_dist[j] = graph_dist[base + j];
     }
 
     // read how many proposals this node received (capped at max_proposals)
@@ -629,11 +637,11 @@ pub fn merge_proposals<F: Float>(
             let dist = prop_dist[prop_base + p as usize];
 
             // Only process if better than current worst
-            if dist < graph_dist[base + k - 1] {
+            if dist < local_dist[k - 1] {
                 // Check for duplicates
                 let mut exists: u32 = 0u32;
-                for j in 0..k {
-                    if (graph_idx[base + j] & pid_mask) == candidate {
+                for j in 0..k_comp {
+                    if (local_idx[j] & pid_mask) == candidate {
                         exists = 1u32;
                     }
                 }
@@ -642,29 +650,34 @@ pub fn merge_proposals<F: Float>(
                 if exists == 0u32 && candidate != node {
                     // Find insertion point (first slot where dist < current)
                     let mut insert_pos = k - 1;
-                    for j in 0..k {
-                        if dist < graph_dist[base + j] && insert_pos == k - 1 {
+                    for j in 0..k_comp {
+                        if dist < local_dist[j] && insert_pos == k - 1 {
                             insert_pos = j;
                         }
                     }
 
                     // Shift right from insert_pos to k-2
-                    for j in 0..k - 1 {
+                    for j in 0..k_comp - 1 {
                         let src = k - 2 - j;
                         let dst = k - 1 - j;
                         if src >= insert_pos {
-                            graph_idx[base + dst] = graph_idx[base + src];
-                            graph_dist[base + dst] = graph_dist[base + src];
+                            local_idx[dst] = local_idx[src];
+                            local_dist[dst] = local_dist[src];
                         }
                     }
 
                     // Insert with new flag
-                    graph_idx[base + insert_pos] = candidate | is_new_bit;
-                    graph_dist[base + insert_pos] = dist;
+                    local_idx[insert_pos] = candidate | is_new_bit;
+                    local_dist[insert_pos] = dist;
                     improvements += 1u32;
                 }
             }
         }
+    }
+
+    for j in 0..k_comp {
+        graph_idx[base + j] = local_idx[j];
+        graph_dist[base + j] = local_dist[j];
     }
 
     if improvements > 0u32 {
@@ -1678,6 +1691,7 @@ where
                     update_counter_gpu.clone().into_tensor_arg(),
                     n as u32,
                     MAX_PROPOSALS as u32,
+                    build_k,
                 );
             }
 
@@ -1765,6 +1779,7 @@ where
                     update_counter_gpu.clone().into_tensor_arg(),
                     n as u32,
                     MAX_PROPOSALS as u32,
+                    build_k,
                 );
             }
 
@@ -3073,6 +3088,7 @@ mod kernel_tests {
                 update_counter.clone().into_tensor_arg(),
                 n as u32,
                 MAX_PROPOSALS as u32,
+                k,
             );
         }
 
@@ -3187,6 +3203,7 @@ mod kernel_tests {
                 update_counter2.clone().into_tensor_arg(),
                 n2 as u32,
                 MAX_PROPOSALS as u32,
+                k,
             );
         }
 
