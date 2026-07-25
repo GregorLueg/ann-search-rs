@@ -715,6 +715,7 @@ pub fn two_hop_refinement<F: Float, N: Size>(
     #[comptime] max_proposals: u32,
     #[comptime] use_cosine: bool,
     #[comptime] dim_lines: usize,
+    #[comptime] k_comp: usize,
 ) {
     let node = CUBE_POS_Y * CUBE_COUNT_X + CUBE_POS_X;
     if node >= n_pts {
@@ -730,6 +731,11 @@ pub fn two_hop_refinement<F: Float, N: Size>(
     // Load source vector into shared memory as scalars
     let mut shared_source = SharedMemory::<F>::new(dim_scalars);
     let mut shared_worst_dist = SharedMemory::<F>::new(1usize);
+    // The node's own neighbour ids. The duplicate check below scans this row
+    // once per candidate, and there are k*k candidates, so reading it from
+    // global memory cost k^3 loads per node of a row every thread in the cube
+    // shares.
+    let mut shared_own = SharedMemory::<u32>::new(k_comp);
 
     let mut idx_load = tx as usize;
     while idx_load < dim_scalars {
@@ -741,12 +747,20 @@ pub fn two_hop_refinement<F: Float, N: Size>(
         idx_load += WORKGROUP_SIZE_X as usize;
     }
 
+    let mut own_load = tx as usize;
+    while own_load < k {
+        shared_own[own_load] = graph_idx[graph_base + own_load] & pid_mask;
+        own_load += WORKGROUP_SIZE_X as usize;
+    }
+
     if tx == 0u32 {
         shared_worst_dist[0usize] = graph_dist[graph_base + k - 1usize];
     }
     sync_cube();
 
     let worst_dist = shared_worst_dist[0usize];
+    // Hoisted: was re-read from global for every surviving candidate.
+    let node_norm = norms[node as usize];
     let num_candidates = k * k;
     let mut cand_idx = tx as usize;
 
@@ -765,7 +779,7 @@ pub fn two_hop_refinement<F: Float, N: Size>(
                 let mut is_dup: bool = false;
                 let mut scan_idx = 0usize;
                 while scan_idx < k {
-                    if (graph_idx[graph_base + scan_idx] & pid_mask) == cand_pid {
+                    if shared_own[scan_idx] == cand_pid {
                         is_dup = true;
                     }
                     scan_idx += 1usize;
@@ -773,25 +787,27 @@ pub fn two_hop_refinement<F: Float, N: Size>(
 
                 if !is_dup {
                     let mut sum = F::new(0.0_f32);
-                    let mut s = 0usize;
-                    while s < dim_scalars {
-                        let va = shared_source[s];
-                        let line_idx = s / 4usize;
-                        let lane = s % 4usize;
-                        let line_val = vectors[cand_pid as usize * dim_lines + line_idx];
-                        let vb = line_val[lane];
-
-                        if use_cosine {
-                            sum += va * vb;
-                        } else {
-                            let diff = va - vb;
-                            sum += diff * diff;
+                    // One Vector load per line, lanes unrolled. Indexing by
+                    // scalar and recomputing `s / 4` re-issued the same load
+                    // four times per line.
+                    for li in 0..dim_lines {
+                        let line_val = vectors[cand_pid as usize * dim_lines + li];
+                        let s_off = li * 4usize;
+                        #[unroll]
+                        for lane in 0..4usize {
+                            let va = shared_source[s_off + lane];
+                            let vb = line_val[lane];
+                            if use_cosine {
+                                sum += va * vb;
+                            } else {
+                                let diff = va - vb;
+                                sum += diff * diff;
+                            }
                         }
-                        s += 1usize;
                     }
 
                     let dist = if use_cosine {
-                        F::new(1.0_f32) - (sum / (norms[node as usize] * norms[cand_pid as usize]))
+                        F::new(1.0_f32) - (sum / (node_norm * norms[cand_pid as usize]))
                     } else {
                         sum
                     };
@@ -1732,6 +1748,7 @@ where
                     MAX_PROPOSALS as u32,
                     use_cosine,
                     dim_vec,
+                    build_k,
                 );
             }
 
