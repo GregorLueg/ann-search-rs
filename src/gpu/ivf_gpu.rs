@@ -723,14 +723,20 @@ where
         let task_db_count_gpu =
             GpuTensor::<R, u32>::from_slice(&task_db_count, vec![n_tasks], client);
 
-        // NOT register-tiled, deliberately. Register-tiled variants of these
-        // two kernels were written and measured 1.8x SLOWER (72.97 -> 134.39
-        // ms/launch, profiler attribution over the IVF bench), then removed;
-        // recover them from git history if retrying. An early exit for threads
-        // past the cluster end made no difference, so the cause is not wasted
-        // tail work. The same tiling gives 1.4-2.2x on the exhaustive kernels,
-        // so the difference is this kernel's shape: one *task* per y-row, each
-        // with its own cluster extent. Do not switch without re-measuring.
+        // NOT register-tiled, deliberately, and this has now been measured
+        // twice. Register-tiled variants (TILE_D DB vectors per thread) were
+        // written, measured and removed both times:
+        //
+        //   * before the task list was grouped by cluster: 1.8x SLOWER
+        //     (72.97 -> 134.39 ms/launch, IVF bench)
+        //   * after grouping, when the DB tile is reused across cube rows and
+        //     the same tiling wins 1.4-2.2x on the exhaustive kernels:
+        //     22.60 -> 22.91 ms/launch, i.e. no change (gridsearch, 150k x 32D)
+        //
+        // An early exit for threads past the cluster end made no difference
+        // either, so it is not wasted tail work. Whatever bounds this kernel,
+        // it is not memory-operation issue count. Do not retry without a new
+        // hypothesis and a measurement.
         let mega_grid_x = max_db_count.div_ceil(WORKGROUP_SIZE_X).max(1);
         let (mega_grid_y, mega_grid_z) = grid_2d((n_tasks as u32).div_ceil(safe_worksize_y));
 
