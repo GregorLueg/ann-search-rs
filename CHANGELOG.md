@@ -55,7 +55,7 @@
   several shapes. Single-batch queries cannot benefit; multi-batch self-kNN
   gains a few percent more on top of the cluster grouping.
 
-- Index build is ~1.5x faster at 500k x 64D (5.10s -> 3.40s), from four
+- Index build is ~1.95x faster at 500k x 64D (5.10s -> 2.61s), from five
   kernel fixes:
   - `leaf_pairwise_proposals` and `local_join_shared` walked the candidate
     upper triangle by flat pair index, decoding each one with a serial loop
@@ -74,6 +74,14 @@
   Recall shifts by under 0.001: the traversal order changes which proposals
   survive when a node overflows `MAX_PROPOSALS`, so the graph differs slightly
   by construction.
+  - Forest tree construction projected the data onto one random vector per
+    level, so it read the whole vector matrix `max_depth` times and blocked on
+    a readback after each. The projections never depend on the partitioning,
+    only on the tree seed and level index, so they are now applied in a single
+    kernel writing `[max_depth, n]` level-major, with one readback per tree.
+    Only the median-and-scatter step stays sequential. Tree construction
+    1.11s -> 369ms (3.0x); the dot-product kernel drops from 347ms over 260
+    launches to 36ms over 20.
 - `GpuTensor::shape` and `GpuTensor::len` / `is_empty` accessors.
 
 **Housekeeping**
