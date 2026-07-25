@@ -110,6 +110,17 @@ impl<T: Copy> Neighbour<T> {
     pub fn mark_old(&mut self) {
         self.pid_and_flag &= Self::PID_MASK;
     }
+
+    /// Mark this neighbour as new (eligible for re-exploration).
+    ///
+    /// Sets the high bit whilst preserving the point id and distance. Relative
+    /// NN-Descent re-arms every surviving edge this way between outer rounds,
+    /// otherwise the new/old guard in its prune loop skips every pair and the
+    /// remaining rounds do no work.
+    #[inline(always)]
+    pub fn mark_new(&mut self) {
+        self.pid_and_flag |= Self::IS_NEW_MASK;
+    }
 }
 
 ///////////////
@@ -186,7 +197,7 @@ impl<T> Update<T> {
 impl<T> RadixKey for Update<T> {
     const LEVELS: usize = 4;
 
-    /// Claude TODO: add documentation.
+    /// Extract byte `level` of the `target` field, least-significant first.
     #[inline]
     fn get_level(&self, level: usize) -> u8 {
         (self.target >> (level * 8)) as u8

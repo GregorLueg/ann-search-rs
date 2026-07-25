@@ -65,6 +65,9 @@ thread_local! {
 pub struct UpdateScratch<T> {
     /// `(dist, pid, is_new)` in ascending distance order
     pub accepted: Vec<(T, usize, bool)>,
+    /// Survivors of the RNG prune, ascending. Reused across nodes so the
+    /// per-node pass does not allocate.
+    pub new_accepted: Vec<(T, usize, bool)>,
     /// Updates to be batched and applied via [`ApplySortedUpdates`]
     pub emitted: Vec<Update<T>>,
 }
@@ -78,6 +81,7 @@ impl<T> UpdateScratch<T> {
     pub const fn new() -> Self {
         Self {
             accepted: Vec::new(),
+            new_accepted: Vec::new(),
             emitted: Vec::new(),
         }
     }
@@ -196,9 +200,10 @@ impl RnnDescentBuildParams {
 
 /// Relative NN-Descent index.
 ///
-/// The final graph is stored as flat `(u32, T)` pairs of size `n * R`, sorted
-/// by distance ascending within each node's slot. Unused trailing slots hold
-/// `(SENTINEL_PID as u32, T::MAX)`.
+/// The final graph is stored as a flat `Vec<u32>` of size `n * R`, sorted by
+/// distance ascending within each node's slot. Unused trailing slots hold
+/// `SENTINEL_PID`. Build distances are dropped at compaction: the walk needs
+/// `d(query, neighbour)` and never the stored `d(node, neighbour)`.
 ///
 /// A small [`KdTreeIndex`] forest is built alongside the graph and used at
 /// query time to pick a batch of near-query entry points. This mirrors how
@@ -217,8 +222,12 @@ pub struct RnnDescentIndex<T> {
     pub metric: Dist,
     /// Pre-computed L2 norms (Cosine only; empty otherwise)
     pub norms: Vec<T>,
-    /// Flat final graph, `n * R` `(pid, dist)` pairs
-    pub graph: Vec<(u32, T)>,
+    /// Flat final graph, `n * R` point ids, sentinel-padded.
+    ///
+    /// Ids only: the walk needs `d(query, neighbour)`, never the stored
+    /// `d(node, neighbour)`, so keeping build distances here would double the
+    /// bytes touched per hop for nothing. Matches the reference CSR.
+    pub graph: Vec<u32>,
     /// Kd-tree forest used to pick query entry points
     pub forest: KdTreeIndex<T>,
     /// Original ids
@@ -533,11 +542,12 @@ where
             }
         }
 
-        // Flatten to compact (u32, T) storage.
-        index.graph = build_graph
-            .into_iter()
-            .map(|n| (n.pid() as u32, n.dist))
-            .collect();
+        // Flatten to compact ids-only storage.
+        // `collect` reuses the Neighbour<T> allocation in place (8 bytes/elem
+        // for f32 against 4 for u32), so without the shrink the buffer keeps
+        // twice the capacity it needs and the saving is never released.
+        index.graph = build_graph.into_iter().map(|n| n.pid() as u32).collect();
+        index.graph.shrink_to_fit();
 
         Ok(index)
     }
@@ -623,8 +633,13 @@ where
                 let graph_ptr = graph_ptr;
                 Self::with_update_scratch(|scratch_cell| {
                     let mut scratch_ref = scratch_cell.borrow_mut();
-                    let UpdateScratch { accepted, emitted } = &mut *scratch_ref;
+                    let UpdateScratch {
+                        accepted,
+                        new_accepted,
+                        emitted,
+                    } = &mut *scratch_ref;
                     accepted.clear();
+                    new_accepted.clear();
                     emitted.clear();
 
                     // Load u's current sorted adjacency.
@@ -639,9 +654,6 @@ where
                     }
 
                     // Greedy-accept in ascending distance order.
-                    let mut new_accepted: Vec<(T, usize, bool)> =
-                        Vec::with_capacity(accepted.len());
-
                     for &(v_dist, v, v_new) in accepted.iter() {
                         let mut pruned = false;
                         for &(_, w, w_new) in new_accepted.iter() {
@@ -702,6 +714,17 @@ where
         let counter = AtomicUsize::new(0);
         let n = self.n;
 
+        // Re-arm every surviving edge as new. UpdateNeighbors writes all
+        // survivors back as old, so without this the `!v_new && !w_new` guard
+        // in the prune loop skips essentially every pair from the second outer
+        // round onwards and those rounds compute nothing. Matches the reference
+        // (RNNDescent.cpp, add_reverse_edges).
+        graph.par_iter_mut().for_each(|entry| {
+            if !entry.is_sentinel() {
+                entry.mark_new();
+            }
+        });
+
         // Collect reverse-edge updates in parallel.
         let per_thread: Vec<Vec<Update<T>>> = (0..n)
             .into_par_iter()
@@ -745,9 +768,9 @@ where
     ///
     /// ### Returns
     ///
-    /// Slice of `R` `(pid, dist)` pairs.
+    /// Slice of `R` point ids.
     #[inline(always)]
-    fn get_neighbours_slot(&self, node_id: usize) -> &[(u32, T)] {
+    fn get_neighbours_slot(&self, node_id: usize) -> &[u32] {
         let base = node_id * self.r;
         &self.graph[base..base + self.r]
     }
@@ -826,7 +849,7 @@ where
                 }
 
                 let neighbours = self.get_neighbours_slot(current_id);
-                for &(pid, _) in neighbours.iter().take(k_hop) {
+                for &pid in neighbours.iter().take(k_hop) {
                     if pid as usize == SENTINEL_PID {
                         break;
                     }
@@ -942,7 +965,7 @@ where
         std::mem::size_of_val(self)
             + self.vectors_flat.capacity() * std::mem::size_of::<T>()
             + self.norms.capacity() * std::mem::size_of::<T>()
-            + self.graph.capacity() * std::mem::size_of::<(u32, T)>()
+            + self.graph.capacity() * std::mem::size_of::<u32>()
             + self.forest.memory_usage_bytes()
     }
 }
@@ -1084,7 +1107,7 @@ mod tests {
             let base = node * idx.r;
             let slot = &idx.graph[base..base + idx.r];
             let mut deg = 0;
-            for &(pid, _) in slot {
+            for &pid in slot {
                 if pid as usize == SENTINEL_PID {
                     break;
                 }
@@ -1110,14 +1133,16 @@ mod tests {
         )
         .unwrap();
 
+        // The final graph is ids only, so recompute distances to check ordering.
         for node in 0..idx.n {
             let base = node * idx.r;
             let slot = &idx.graph[base..base + idx.r];
             let mut prev = f32::MIN;
-            for &(pid, d) in slot {
+            for &pid in slot {
                 if pid as usize == SENTINEL_PID {
                     break;
                 }
+                let d = idx.distance(node, pid as usize);
                 assert!(d >= prev, "Distances not ascending at node {}", node);
                 prev = d;
             }
@@ -1130,7 +1155,7 @@ mod tests {
         let idx = build_default(&mat, Dist::SquaredEuclidean);
         for node in 0..idx.n {
             let base = node * idx.r;
-            for &(pid, _) in &idx.graph[base..base + idx.r] {
+            for &pid in &idx.graph[base..base + idx.r] {
                 if pid as usize == SENTINEL_PID {
                     break;
                 }
