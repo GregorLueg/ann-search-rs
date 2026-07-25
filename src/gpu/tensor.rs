@@ -118,6 +118,59 @@ impl<R: Runtime, F: Numeric + CubeElement> GpuTensor<R, F> {
         Ok(F::from_bytes(&bytes).to_vec())
     }
 
+    /// Number of elements the underlying allocation holds
+    ///
+    /// ### Returns
+    ///
+    /// Product of the shape dimensions
+    pub fn len(&self) -> usize {
+        self.shape.iter().product()
+    }
+
+    /// Whether the tensor holds no elements
+    ///
+    /// ### Returns
+    ///
+    /// True if the element count is zero
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Reinterpret an existing allocation under a smaller shape
+    ///
+    /// Shares the underlying buffer rather than allocating, so callers can keep
+    /// one scratch tensor alive across several differently shaped uses. The
+    /// first kernel write to a fresh allocation faults its pages in, which for
+    /// the IVF candidate buffer costs more than the kernel itself, so reuse is
+    /// worth the sharp edge.
+    ///
+    /// ### Params
+    ///
+    /// * `shape` - New shape; its element count must not exceed the current one
+    ///
+    /// ### Returns
+    ///
+    /// A tensor sharing this one's buffer, with row-major strides for `shape`
+    ///
+    /// ### Note
+    ///
+    /// The returned tensor aliases `self`. Writing through both concurrently is
+    /// a data race the type system does not prevent here.
+    pub fn reshaped_view(&self, shape: Vec<usize>) -> Self {
+        debug_assert!(
+            shape.iter().product::<usize>() <= self.len(),
+            "reshaped_view would exceed the allocation"
+        );
+        let strides = row_major_contiguous_strides(&shape).to_vec();
+        Self {
+            data: self.data.clone(),
+            shape,
+            strides,
+            _r: PhantomData,
+            _f: PhantomData,
+        }
+    }
+
     /// Returns the size in bytes on the GPU
     ///
     /// ### Returns

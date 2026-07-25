@@ -20,6 +20,13 @@ use crate::utils::k_means_utils::*;
 const IVF_GPU_QUERY_BATCH_SIZE: usize = 100_000;
 /// Target maximum size for the candidate buffer in megabytes
 const TARGET_BUFFER_MB: usize = 1500;
+/// Divisor setting the slack on the reused candidate scratch buffer.
+///
+/// `max_candidates` drifts by a few percent between query batches, so sizing
+/// the buffer exactly to the first batch makes later ones reallocate and pay
+/// the page-fault cost again. 4 gives 25% headroom, enough to absorb the drift
+/// seen at 150k x 32D without a meaningful VRAM penalty.
+const CANDIDATE_SCRATCH_HEADROOM_DIV: usize = 4;
 
 /// Batched IVF index with GPU acceleration
 ///
@@ -69,6 +76,20 @@ pub struct IvfIndexGpu<T: AnnSearchFloat + AnnSearchGpuFloat, R: Runtime> {
     metric: Dist,
     /// Device runtime for the GPU work
     device: R::Device,
+}
+
+/// Reusable GPU scratch for the IVF candidate buffers
+///
+/// The mega kernel's first write to a fresh allocation faults its pages in,
+/// which measures ~39 ms per call at 15k queries and dominates the kernel's own
+/// ~22 ms. Holding the buffers across batches confines that to the first batch.
+struct CandidateScratch<R: Runtime, T: AnnSearchFloat + AnnSearchGpuFloat> {
+    /// Candidate distances, flat; viewed as `[n_queries, max_candidates]`
+    dists: GpuTensor<R, T>,
+    /// Candidate indices, flat; viewed as `[n_queries, max_candidates]`
+    indices: GpuTensor<R, u32>,
+    /// Element capacity of each buffer
+    capacity: usize,
 }
 
 /////////////////////////
@@ -297,13 +318,16 @@ where
         let n_batches = n_queries.div_ceil(nquery);
 
         if n_batches == 1 {
-            let res = self.query_batch_internal(queries_flat, n_queries, k, nprobe, client)?;
+            let mut scratch = None;
+            let res =
+                self.query_batch_internal(queries_flat, n_queries, k, nprobe, client, &mut scratch)?;
 
             return Ok(res);
         }
 
         let mut all_indices = Vec::with_capacity(n_queries);
         let mut all_distances = Vec::with_capacity(n_queries);
+        let mut scratch: Option<CandidateScratch<R, T>> = None;
 
         for batch_idx in 0..n_batches {
             if verbose
@@ -319,8 +343,14 @@ where
             let batch_queries =
                 &queries_flat[batch_start * self.dim_padded..batch_end * self.dim_padded];
 
-            let (batch_indices, batch_dists) =
-                self.query_batch_internal(batch_queries, batch_size, k, nprobe, client)?;
+            let (batch_indices, batch_dists) = self.query_batch_internal(
+                batch_queries,
+                batch_size,
+                k,
+                nprobe,
+                client,
+                &mut scratch,
+            )?;
 
             all_indices.extend(batch_indices);
             all_distances.extend(batch_dists);
@@ -501,6 +531,7 @@ where
         k: usize,
         nprobe: usize,
         client: &ComputeClient<R>,
+        scratch: &mut Option<CandidateScratch<R, T>>,
     ) -> KnnResult<T> {
         let vec_size = LINE_SIZE;
         let dim_lines = self.dim_padded / vec_size;
@@ -711,9 +742,27 @@ where
             .iter()
             .fold(0, |acc, &x| acc.max(x as usize));
 
-        let candidate_dists_gpu = GpuTensor::<R, T>::empty(vec![n_queries, max_candidates], client);
-        let candidate_indices_gpu =
-            GpuTensor::<R, u32>::empty(vec![n_queries, max_candidates], client);
+        // Reuse the candidate buffers across batches. A fresh allocation costs
+        // ~39 ms per call here (measured: an identical second launch over the
+        // same buffers runs in 22.3 ms against 61.1 ms for the first), because
+        // the kernel's first write faults in ~1.4 GB. Only the first batch
+        // should pay that.
+        let needed = n_queries * max_candidates;
+        let reuse = scratch.as_ref().is_some_and(|s| s.capacity >= needed);
+        if !reuse {
+            // Over-allocate so that the batch-to-batch drift in
+            // `max_candidates` does not force a reallocation, which would
+            // reintroduce the fault this buffer exists to avoid.
+            let capacity = needed + needed / CANDIDATE_SCRATCH_HEADROOM_DIV;
+            *scratch = Some(CandidateScratch {
+                dists: GpuTensor::<R, T>::empty(vec![capacity], client),
+                indices: GpuTensor::<R, u32>::empty(vec![capacity], client),
+                capacity,
+            });
+        }
+        let held = scratch.as_ref().expect("scratch was just populated");
+        let candidate_dists_gpu = held.dists.reshaped_view(vec![n_queries, max_candidates]);
+        let candidate_indices_gpu = held.indices.reshaped_view(vec![n_queries, max_candidates]);
 
         let task_q_idx_gpu = GpuTensor::<R, u32>::from_slice(&task_q_idx, vec![n_tasks], client);
         let task_db_start_gpu =

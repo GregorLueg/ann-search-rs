@@ -46,6 +46,15 @@
   advertised had never run. It runs now, and the coalesced kernel loses by 32%
   on wgpu/Metal. Recorded in the kernel docs so it does not get re-litigated.
 
+- The IVF candidate buffers are reused across query batches instead of being
+  allocated per batch. The mega kernel's first write to a fresh allocation
+  faults in ~1.4 GB at 15k queries: an identical second launch over the same
+  buffers runs in 22.3 ms against 61.1 ms for the first, and the isolated
+  kernel time is 22.6 ms, so nearly two thirds of the apparent cost was paging,
+  not compute. Adds `GpuTensor::reshaped_view` to alias one allocation under
+  several shapes. Single-batch queries cannot benefit; multi-batch self-kNN
+  gains a few percent more on top of the cluster grouping.
+
 **Housekeeping**
 
 - Removed `compute_ivf_mega_cosine` (no call sites, no tests), the unused
