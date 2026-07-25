@@ -156,7 +156,7 @@ fn partition_points<F: AnnSearchGpuFloat>(
 ///
 /// ### Returns
 ///
-/// Maximum number of points per leaf, clamped to `[2, 64]`
+/// Maximum number of points per leaf, clamped to `[2, 256]`
 fn compute_max_leaf_size(dim_padded: usize) -> usize {
     let line = LINE_SIZE;
     let dim_scalars = (dim_padded / line) * 4;

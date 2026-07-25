@@ -535,8 +535,53 @@ where
         let centroid_dists_gpu = GpuTensor::<R, T>::empty(vec![n_queries, self.nlist], client);
         let grid_x = (self.nlist as u32).div_ceil(WORKGROUP_SIZE_X);
         let (grid_y, grid_z) = grid_2d((n_queries as u32).div_ceil(safe_worksize_y));
+        let reg_grid_x = (self.nlist as u32).div_ceil(WORKGROUP_SIZE_X * TILE_D as u32);
 
         match self.metric {
+            Dist::SquaredEuclidean if tile_fits(safe_worksize_y) => unsafe {
+                euclidean_tiled_reg::launch_unchecked::<T, R>(
+                    client,
+                    CubeCount::Static(reg_grid_x, grid_y, grid_z),
+                    CubeDim::new_2d(WORKGROUP_SIZE_X, safe_worksize_y / TILE_Q as u32),
+                    vec_size,
+                    queries_gpu.clone().into_tensor_arg(),
+                    self.centroids_gpu.clone().into_tensor_arg(),
+                    centroid_dists_gpu.into_tensor_arg(),
+                    0u32,
+                    self.nlist as u32,
+                    n_queries as u32,
+                    self.nlist as u32,
+                    dim_lines,
+                    safe_worksize_y,
+                    TILE_D,
+                    TILE_Q,
+                );
+            },
+            Dist::Cosine if tile_fits(safe_worksize_y) => unsafe {
+                cosine_tiled_reg::launch_unchecked::<T, R>(
+                    client,
+                    CubeCount::Static(reg_grid_x, grid_y, grid_z),
+                    CubeDim::new_2d(WORKGROUP_SIZE_X, safe_worksize_y / TILE_Q as u32),
+                    vec_size,
+                    queries_gpu.clone().into_tensor_arg(),
+                    self.centroids_gpu.clone().into_tensor_arg(),
+                    query_norms_gpu.as_ref().unwrap().clone().into_tensor_arg(),
+                    self.centroid_norms_gpu
+                        .as_ref()
+                        .unwrap()
+                        .clone()
+                        .into_tensor_arg(),
+                    centroid_dists_gpu.into_tensor_arg(),
+                    0u32,
+                    self.nlist as u32,
+                    n_queries as u32,
+                    self.nlist as u32,
+                    dim_lines,
+                    safe_worksize_y,
+                    TILE_D,
+                    TILE_Q,
+                );
+            },
             Dist::SquaredEuclidean => unsafe {
                 euclidean_tiled::launch_unchecked::<T, R>(
                     client,
@@ -603,8 +648,20 @@ where
             .collect();
 
         let mut cpu_write_pointers = vec![0u32; n_queries];
-        let mut tasks: Vec<(u32, u32, u32, u32)> = Vec::new();
         let mut max_db_count = 0u32;
+
+        // Build the four device-bound arrays directly rather than a Vec of
+        // tuples plus four map-collect passes. The outer loop runs q_idx
+        // ascending and writes it as the task's query id, so the task list is
+        // already grouped by query: the `sort_unstable_by_key(|t| t.0)` that
+        // used to sit here was a no-op on already-ordered data, and being
+        // unstable it could only permute tasks within a query. Each task
+        // carries its own write offset, so that ordering never mattered.
+        let n_tasks_upper: usize = probe_lists.iter().map(|p| p.len()).sum();
+        let mut task_q_idx: Vec<u32> = Vec::with_capacity(n_tasks_upper);
+        let mut task_db_start: Vec<u32> = Vec::with_capacity(n_tasks_upper);
+        let mut task_write_offset: Vec<u32> = Vec::with_capacity(n_tasks_upper);
+        let mut task_db_count: Vec<u32> = Vec::with_capacity(n_tasks_upper);
 
         for q_idx in 0..n_queries {
             for &c in &probe_lists[q_idx] {
@@ -612,12 +669,10 @@ where
                 let count = self.cluster_offsets[c + 1] - start;
 
                 if count > 0 {
-                    tasks.push((
-                        q_idx as u32,
-                        start as u32,
-                        cpu_write_pointers[q_idx],
-                        count as u32,
-                    ));
+                    task_q_idx.push(q_idx as u32);
+                    task_db_start.push(start as u32);
+                    task_write_offset.push(cpu_write_pointers[q_idx]);
+                    task_db_count.push(count as u32);
 
                     cpu_write_pointers[q_idx] += count as u32;
                     if count as u32 > max_db_count {
@@ -627,17 +682,10 @@ where
             }
         }
 
-        tasks.sort_unstable_by_key(|t| t.0);
-
-        let n_tasks = tasks.len();
+        let n_tasks = task_q_idx.len();
         if n_tasks == 0 {
             return Ok((vec![vec![]; n_queries], vec![vec![]; n_queries]));
         }
-
-        let task_q_idx: Vec<u32> = tasks.iter().map(|t| t.0).collect();
-        let task_db_start: Vec<u32> = tasks.iter().map(|t| t.1).collect();
-        let task_write_offset: Vec<u32> = tasks.iter().map(|t| t.2).collect();
-        let task_db_count: Vec<u32> = tasks.iter().map(|t| t.3).collect();
 
         let max_candidates: usize = cpu_write_pointers
             .iter()
@@ -655,6 +703,14 @@ where
         let task_db_count_gpu =
             GpuTensor::<R, u32>::from_slice(&task_db_count, vec![n_tasks], client);
 
+        // NOT register-tiled, deliberately. Register-tiled variants of these
+        // two kernels were written and measured 1.8x SLOWER (72.97 -> 134.39
+        // ms/launch, profiler attribution over the IVF bench), then removed;
+        // recover them from git history if retrying. An early exit for threads
+        // past the cluster end made no difference, so the cause is not wasted
+        // tail work. The same tiling gives 1.4-2.2x on the exhaustive kernels,
+        // so the difference is this kernel's shape: one *task* per y-row, each
+        // with its own cluster extent. Do not switch without re-measuring.
         let mega_grid_x = max_db_count.div_ceil(WORKGROUP_SIZE_X).max(1);
         let (mega_grid_y, mega_grid_z) = grid_2d((n_tasks as u32).div_ceil(safe_worksize_y));
 

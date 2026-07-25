@@ -129,6 +129,15 @@ impl<R: Runtime, F: Numeric + CubeElement> GpuTensor<R, F> {
 
     /// Return the handle of the tensor
     ///
+    /// Escape hatch for downstream crates that need to hand the raw buffer to
+    /// their own kernels without going through [`GpuTensor::into_tensor_arg`].
+    ///
+    /// ### Note
+    ///
+    /// This has no call site inside `ann-search-rs` itself, but it is public
+    /// API consumed elsewhere. Do not remove it on the strength of an in-repo
+    /// dead-code sweep.
+    ///
     /// ### Returns
     ///
     /// A reference to [Handle]

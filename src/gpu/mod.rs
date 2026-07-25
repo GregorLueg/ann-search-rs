@@ -28,6 +28,29 @@ pub const WORKGROUP_SIZE_X: u32 = 32;
 /// Line size for vectorisations in this crate
 pub const LINE_SIZE: usize = 4;
 
+/// DB vectors per thread in the register-tiled distance kernel.
+///
+/// The untiled kernel issues one vectorised global load plus `LINE_SIZE`
+/// shared loads per `LINE_SIZE` FMAs: 1.25 memory operations per FMA. It
+/// measures a flat 520-580 GFLOP/s across dim=32..512 on an M1 Max, about
+/// 5.5% of f32 peak, while using only ~9% of memory bandwidth, so it is bound
+/// by memory-op issue count rather than by compute or bandwidth.
+///
+/// A `TILE_D x TILE_Q` tile drops the ratio to
+/// `(TILE_D + TILE_Q * LINE_SIZE) / (TILE_D * TILE_Q * LINE_SIZE)`, which is
+/// 0.3125 at 4x4. Measured against the untiled kernel, bit-exact: 2.21x at
+/// dim=32, 1.94x at 64, 1.79x at 128, 1.43x at 512. The gain tapers at high
+/// dim because `pick_wg_y` shrinks the query tile, leaving fewer threads per
+/// cube.
+pub const TILE_D: usize = 4;
+
+/// Query vectors per thread in the register-tiled distance kernel.
+///
+/// `pick_wg_y` must return a multiple of this. At 4 that holds for every tier
+/// up to dim=1024 (wg_y 32/16/8/4) but not for 1025..2048 (wg_y = 2), which
+/// falls back to the untiled kernel via `tile_fits`.
+pub const TILE_Q: usize = 4;
+
 /////////////
 // Helpers //
 /////////////
@@ -45,6 +68,24 @@ pub fn grid_2d(total_cubes: u32) -> (u32, u32) {
     let x = total_cubes.min(65535);
     let y = total_cubes.div_ceil(x);
     (x, y)
+}
+
+/// Whether the register-tiled distance kernel can be used for a given query
+/// tile height.
+///
+/// The tiled kernel assigns `TILE_Q` consecutive shared-memory query rows to
+/// each thread, so the tile height must divide evenly. Callers fall back to the
+/// untiled kernel when this returns false.
+///
+/// ### Params
+///
+/// * `wg_y` - Query tile height as returned by `pick_wg_y`
+///
+/// ### Returns
+///
+/// True if `wg_y` is a multiple of `TILE_Q`
+pub fn tile_fits(wg_y: u32) -> bool {
+    wg_y as usize % TILE_Q == 0
 }
 
 /// Pad vectors to `dim_padded` by appending zeros to each row.
@@ -89,7 +130,7 @@ pub fn pad_vectors<T: num_traits::Float>(
 ///
 /// ### Returns
 ///
-/// Chosen workgroup Y size, or `DimensionNotSupported` if `dim_padded`
+/// Chosen workgroup Y size, or `DimTooHighForSharedMemory` if `dim_padded`
 /// exceeds the largest dim covered by the table.
 pub fn pick_wg_y(dim_padded: usize) -> Result<u32, AnnSearchErrors> {
     let wg_y = match dim_padded {

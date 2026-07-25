@@ -1,5 +1,54 @@
 # News
 
+## Unreleased
+
+**Features**
+
+- Register-tiled distance kernels for the GPU exhaustive path,
+  `euclidean_tiled_reg` and `cosine_tiled_reg`. Each thread computes a 4x4
+  block of the distance matrix instead of a single entry, cutting memory
+  operations per FMA from 1.25 to 0.3125. Measured 2.2x at dim=32, 1.9x at 64,
+  1.8x at 128 and 1.4x at 512 on the kernel, and ~1.7x end to end. Bit-exact
+  against the untiled kernels. The untiled versions stay as the fallback for
+  dim 1025-2048, where the query tile is too short to divide.
+- The GPU benches now report device limits, cross-check every kernel against a
+  reference before timing it, and assert the output is real. Every launch in
+  the crate is `launch_unchecked`, which returns zeros and reports no error
+  when it busts a device limit.
+
+- The IVF centroid probe uses the tiled kernels too: 1.58 -> 1.00 ms/launch
+  Euclidean, 1.50 -> 0.80 ms/launch cosine. The IVF *mega* kernels do not.
+  Tiled variants were written and measured 1.8x slower, so they were dropped;
+  see the note at the launch site. Same technique, opposite result, because
+  those kernels bind one task per y-row with its own cluster extent.
+
+**Fixes**
+
+- `extract_topk` held its running top-k in global memory, so it re-read the
+  k-th distance on every column of the chunk and the whole k-row on every
+  accepted candidate. Now staged in registers and flushed once. 26% off the
+  kernel, 6-13% off the exhaustive pipeline.
+- The IVF task list was sorted by query id every batch, but the loop that
+  builds it already runs queries in ascending order, so the sort was a no-op
+  on ordered data and, being unstable, could only permute tasks within a
+  query. Removed, along with the intermediate `Vec` of tuples and the four
+  map-collect passes that split it.
+- `local_join_shared`, `two_hop_refinement` and `cagra_rank_prune_shared`
+  dispatched a hardcoded 65535 cubes in x regardless of `n`, wasting 6.5x at
+  n=10k and ~31% at n=100k. They use `grid_2d` now, like every other launch.
+- `TopkCoalescedBench` was defined but never constructed, in every revision
+  since it was added, so the coalesced-vs-serial top-k comparison the bench
+  advertised had never run. It runs now, and the coalesced kernel loses by 32%
+  on wgpu/Metal. Recorded in the kernel docs so it does not get re-litigated.
+
+**Housekeeping**
+
+- Removed `compute_ivf_mega_cosine` (no call sites, no tests), the unused
+  `xorshift_search` helper, a duplicate `pad_vectors` shadowing the one in
+  `gpu::mod`, and ~915 lines of commented-out cubecl debug kernels. The
+  findings from that debugging are distilled into four codegen rules in the
+  `nndescent_gpu` module header.
+
 ## 0.4.4
 
 **Features**

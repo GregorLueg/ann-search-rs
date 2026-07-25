@@ -131,28 +131,6 @@ impl Default for CagraGpuSearchParams {
     }
 }
 
-////////////////////
-// Kernel helpers //
-////////////////////
-
-/// Single xorshift step used to generate random node offsets.
-///
-/// ### Params
-///
-/// * `state` - Current RNG state (must be non-zero)
-///
-/// ### Returns
-///
-/// Next RNG state
-#[cube]
-fn xorshift_search(state: u32) -> u32 {
-    let mut x = state;
-    x ^= x << 13;
-    x ^= x >> 17;
-    x ^= x << 5;
-    x
-}
-
 ///////////////////////////
 // Distance probe kernel //
 ///////////////////////////
