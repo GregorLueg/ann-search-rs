@@ -184,6 +184,96 @@ pub fn plan_local_join_staging(
     })
 }
 
+/// Shared-memory merge plan for the coalesced top-k reducers.
+///
+/// Produced by [`plan_topk_merge`] and handed to the kernel as comptime
+/// arguments.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TopkMergePlan {
+    /// Lanes whose private top-k lists are staged per merge round. Always a
+    /// power of two dividing `WORKGROUP_SIZE_X`.
+    pub group: usize,
+    /// Whether every lane fits in a single round, enabling the unchunked fast
+    /// path.
+    pub single_round: bool,
+    /// Number of `k`-element lists held in shared memory. Equals
+    /// `WORKGROUP_SIZE_X` on the single-round path and `group + 1` otherwise,
+    /// the extra list being the running accumulator.
+    pub slots: usize,
+}
+
+/// Plan how the coalesced top-k reducers stage per-lane lists in shared memory.
+///
+/// `reduce_ivf_topk_coalesced` and `extract_topk_coalesced` used to have all
+/// `WORKGROUP_SIZE_X` lanes write their private top-k list into shared memory
+/// at once, costing `WORKGROUP_SIZE_X * k * (size_of::<F>() + 4)` bytes. Nothing
+/// checked that against the device limit (32768 bytes on an M1 Max), so the
+/// dispatch silently did no work above `k = 128` and the host then read
+/// uninitialised VRAM as indices. Measured on that machine before this helper
+/// existed, at 20k samples:
+///
+/// | k   | bytes | outcome                                      |
+/// |-----|-------|----------------------------------------------|
+/// | 100 | 25600 | IVF-GPU recall 0.9605                         |
+/// | 150 | 38400 | panic, index 1151964186 (f32 bits of 1356.63) |
+///
+/// The fix folds the lanes in groups of `group` instead: each round stages that
+/// many lists and merges them into a running accumulator list, so the footprint
+/// is `(group + 1) * k * (size_of::<F>() + 4)` regardless of `k`. `group` is
+/// kept a power of two dividing `WORKGROUP_SIZE_X` so every round is full, which
+/// costs at most a factor two of the budget and removes the partial-group case
+/// entirely. When all lanes fit at once the kernel takes the original path with
+/// its original footprint, so anything up to `k = 128` is unchanged.
+///
+/// ### Params
+///
+/// * `k` - Number of neighbours per query
+/// * `elem_bytes` - Size of the float element type in bytes
+/// * `max_shared_bytes` - Device shared-memory limit per workgroup, read from
+///   `client.properties().hardware.max_shared_memory_size`
+///
+/// ### Returns
+///
+/// A [`TopkMergePlan`], or `KTooHighForSharedMemory` when not even two
+/// `k`-element lists fit in the budget, i.e. `k > 2048` for `f32` against a
+/// 32 KiB limit. Below that the merge is always representable.
+pub fn plan_topk_merge(
+    k: usize,
+    elem_bytes: usize,
+    max_shared_bytes: usize,
+) -> Result<TopkMergePlan, AnnSearchErrors> {
+    let lanes = WORKGROUP_SIZE_X as usize;
+    // One list is `k` distances plus `k` u32 indices.
+    let list_bytes = k * (elem_bytes + 4);
+
+    if lanes * list_bytes <= max_shared_bytes {
+        return Ok(TopkMergePlan {
+            group: lanes,
+            single_round: true,
+            slots: lanes,
+        });
+    }
+
+    // Chunked path: `group` staged lists plus the accumulator live at once.
+    if 2 * list_bytes > max_shared_bytes {
+        return Err(AnnSearchErrors::KTooHighForSharedMemory {
+            k,
+            available: max_shared_bytes,
+        });
+    }
+
+    let mut group = 1usize;
+    while 2 * group < lanes && (2 * group + 1) * list_bytes <= max_shared_bytes {
+        group *= 2;
+    }
+
+    Ok(TopkMergePlan {
+        group,
+        single_round: false,
+        slots: group + 1,
+    })
+}
+
 /// Pad vectors to `dim_padded` by appending zeros to each row.
 ///
 /// ### Params

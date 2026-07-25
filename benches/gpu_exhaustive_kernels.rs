@@ -567,6 +567,12 @@ impl<R: Runtime> Benchmark for TopkCoalescedBench<R> {
         let k = self.cfg.k;
 
         let grid = nq as u32; // one workgroup per query
+        let merge = plan_topk_merge(
+            k,
+            size_of::<f32>(),
+            self.client.properties().hardware.max_shared_memory_size,
+        )
+        .expect("k too large for the device shared-memory budget");
         unsafe {
             extract_topk_coalesced::launch_unchecked::<f32, R>(
                 &self.client,
@@ -580,6 +586,9 @@ impl<R: Runtime> Benchmark for TopkCoalescedBench<R> {
                 ndb as u32,
                 k as u32,
                 k,
+                merge.group,
+                merge.single_round,
+                merge.slots,
             );
         }
 

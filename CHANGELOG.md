@@ -107,6 +107,18 @@
   `forest_gpu` had hardcoded 32768, which is Apple Silicon's limit: wrong in
   both directions on other hardware.
 
+- The IVF and exhaustive top-k reducers staged all 32 per-lane candidate lists
+  in shared memory at once, `WORKGROUP_SIZE_X * k * (size_of::<F>() + 4)` bytes
+  with no bound, so they exceeded the device limit above k=128. The dispatch
+  then silently did nothing, and since the IVF path never initialises those
+  buffers the host read uninitialised VRAM as indices: `k=150` panicked with
+  `index out of bounds: the len is 20000 but the index is 1151964186`, which is
+  the f32 bit pattern of 1356.63, a distance in an index slot. Lanes now
+  contribute in groups sized to the device budget, folding into a running
+  accumulator over several rounds. `k <= 128` keeps an unchanged single-round
+  path; k=15 recall is identical to four decimals, and k=150 and k=200 now
+  complete instead of panicking.
+
 **Housekeeping**
 
 - Removed `compute_ivf_mega_cosine` (no call sites, no tests), the unused

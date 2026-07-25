@@ -838,6 +838,11 @@ where
 
         let cpq = GpuTensor::<R, u32>::from_slice(&cpu_write_pointers, vec![n_queries], client);
         let (coal_gx, coal_gy) = grid_2d(n_queries as u32);
+        let merge = plan_topk_merge(
+            k,
+            size_of::<T>(),
+            client.properties().hardware.max_shared_memory_size,
+        )?;
         unsafe {
             reduce_ivf_topk_coalesced::launch_unchecked::<T, R>(
                 client,
@@ -850,6 +855,9 @@ where
                 topk_indices.clone().into_tensor_arg(),
                 k as u32,
                 k,
+                merge.group,
+                merge.single_round,
+                merge.slots,
             );
         }
 
