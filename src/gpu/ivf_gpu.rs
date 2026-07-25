@@ -20,6 +20,13 @@ use crate::utils::k_means_utils::*;
 const IVF_GPU_QUERY_BATCH_SIZE: usize = 100_000;
 /// Target maximum size for the candidate buffer in megabytes
 const TARGET_BUFFER_MB: usize = 1500;
+/// Divisor setting the slack on the reused candidate scratch buffer.
+///
+/// `max_candidates` drifts by a few percent between query batches, so sizing
+/// the buffer exactly to the first batch makes later ones reallocate and pay
+/// the page-fault cost again. 4 gives 25% headroom, enough to absorb the drift
+/// seen at 150k x 32D without a meaningful VRAM penalty.
+const CANDIDATE_SCRATCH_HEADROOM_DIV: usize = 4;
 
 /// Batched IVF index with GPU acceleration
 ///
@@ -69,6 +76,20 @@ pub struct IvfIndexGpu<T: AnnSearchFloat + AnnSearchGpuFloat, R: Runtime> {
     metric: Dist,
     /// Device runtime for the GPU work
     device: R::Device,
+}
+
+/// Reusable GPU scratch for the IVF candidate buffers
+///
+/// The mega kernel's first write to a fresh allocation faults its pages in,
+/// which measures ~39 ms per call at 15k queries and dominates the kernel's own
+/// ~22 ms. Holding the buffers across batches confines that to the first batch.
+struct CandidateScratch<R: Runtime, T: AnnSearchFloat + AnnSearchGpuFloat> {
+    /// Candidate distances, flat; viewed as `[n_queries, max_candidates]`
+    dists: GpuTensor<R, T>,
+    /// Candidate indices, flat; viewed as `[n_queries, max_candidates]`
+    indices: GpuTensor<R, u32>,
+    /// Element capacity of each buffer
+    capacity: usize,
 }
 
 /////////////////////////
@@ -297,13 +318,16 @@ where
         let n_batches = n_queries.div_ceil(nquery);
 
         if n_batches == 1 {
-            let res = self.query_batch_internal(queries_flat, n_queries, k, nprobe, client)?;
+            let mut scratch = None;
+            let res =
+                self.query_batch_internal(queries_flat, n_queries, k, nprobe, client, &mut scratch)?;
 
             return Ok(res);
         }
 
         let mut all_indices = Vec::with_capacity(n_queries);
         let mut all_distances = Vec::with_capacity(n_queries);
+        let mut scratch: Option<CandidateScratch<R, T>> = None;
 
         for batch_idx in 0..n_batches {
             if verbose
@@ -319,8 +343,14 @@ where
             let batch_queries =
                 &queries_flat[batch_start * self.dim_padded..batch_end * self.dim_padded];
 
-            let (batch_indices, batch_dists) =
-                self.query_batch_internal(batch_queries, batch_size, k, nprobe, client)?;
+            let (batch_indices, batch_dists) = self.query_batch_internal(
+                batch_queries,
+                batch_size,
+                k,
+                nprobe,
+                client,
+                &mut scratch,
+            )?;
 
             all_indices.extend(batch_indices);
             all_distances.extend(batch_dists);
@@ -501,6 +531,7 @@ where
         k: usize,
         nprobe: usize,
         client: &ComputeClient<R>,
+        scratch: &mut Option<CandidateScratch<R, T>>,
     ) -> KnnResult<T> {
         let vec_size = LINE_SIZE;
         let dim_lines = self.dim_padded / vec_size;
@@ -535,8 +566,53 @@ where
         let centroid_dists_gpu = GpuTensor::<R, T>::empty(vec![n_queries, self.nlist], client);
         let grid_x = (self.nlist as u32).div_ceil(WORKGROUP_SIZE_X);
         let (grid_y, grid_z) = grid_2d((n_queries as u32).div_ceil(safe_worksize_y));
+        let reg_grid_x = (self.nlist as u32).div_ceil(WORKGROUP_SIZE_X * TILE_D as u32);
 
         match self.metric {
+            Dist::SquaredEuclidean if tile_fits(safe_worksize_y) => unsafe {
+                euclidean_tiled_reg::launch_unchecked::<T, R>(
+                    client,
+                    CubeCount::Static(reg_grid_x, grid_y, grid_z),
+                    CubeDim::new_2d(WORKGROUP_SIZE_X, safe_worksize_y / TILE_Q as u32),
+                    vec_size,
+                    queries_gpu.clone().into_tensor_arg(),
+                    self.centroids_gpu.clone().into_tensor_arg(),
+                    centroid_dists_gpu.into_tensor_arg(),
+                    0u32,
+                    self.nlist as u32,
+                    n_queries as u32,
+                    self.nlist as u32,
+                    dim_lines,
+                    safe_worksize_y,
+                    TILE_D,
+                    TILE_Q,
+                );
+            },
+            Dist::Cosine if tile_fits(safe_worksize_y) => unsafe {
+                cosine_tiled_reg::launch_unchecked::<T, R>(
+                    client,
+                    CubeCount::Static(reg_grid_x, grid_y, grid_z),
+                    CubeDim::new_2d(WORKGROUP_SIZE_X, safe_worksize_y / TILE_Q as u32),
+                    vec_size,
+                    queries_gpu.clone().into_tensor_arg(),
+                    self.centroids_gpu.clone().into_tensor_arg(),
+                    query_norms_gpu.as_ref().unwrap().clone().into_tensor_arg(),
+                    self.centroid_norms_gpu
+                        .as_ref()
+                        .unwrap()
+                        .clone()
+                        .into_tensor_arg(),
+                    centroid_dists_gpu.into_tensor_arg(),
+                    0u32,
+                    self.nlist as u32,
+                    n_queries as u32,
+                    self.nlist as u32,
+                    dim_lines,
+                    safe_worksize_y,
+                    TILE_D,
+                    TILE_Q,
+                );
+            },
             Dist::SquaredEuclidean => unsafe {
                 euclidean_tiled::launch_unchecked::<T, R>(
                     client,
@@ -603,8 +679,20 @@ where
             .collect();
 
         let mut cpu_write_pointers = vec![0u32; n_queries];
-        let mut tasks: Vec<(u32, u32, u32, u32)> = Vec::new();
         let mut max_db_count = 0u32;
+
+        // Build the four device-bound arrays directly rather than a Vec of
+        // tuples plus four map-collect passes. The outer loop runs q_idx
+        // ascending and writes it as the task's query id, so the task list is
+        // already grouped by query: the `sort_unstable_by_key(|t| t.0)` that
+        // used to sit here was a no-op on already-ordered data, and being
+        // unstable it could only permute tasks within a query. Each task
+        // carries its own write offset, so that ordering never mattered.
+        let n_tasks_upper: usize = probe_lists.iter().map(|p| p.len()).sum();
+        let mut task_q_idx: Vec<u32> = Vec::with_capacity(n_tasks_upper);
+        let mut task_db_start: Vec<u32> = Vec::with_capacity(n_tasks_upper);
+        let mut task_write_offset: Vec<u32> = Vec::with_capacity(n_tasks_upper);
+        let mut task_db_count: Vec<u32> = Vec::with_capacity(n_tasks_upper);
 
         for q_idx in 0..n_queries {
             for &c in &probe_lists[q_idx] {
@@ -612,12 +700,10 @@ where
                 let count = self.cluster_offsets[c + 1] - start;
 
                 if count > 0 {
-                    tasks.push((
-                        q_idx as u32,
-                        start as u32,
-                        cpu_write_pointers[q_idx],
-                        count as u32,
-                    ));
+                    task_q_idx.push(q_idx as u32);
+                    task_db_start.push(start as u32);
+                    task_write_offset.push(cpu_write_pointers[q_idx]);
+                    task_db_count.push(count as u32);
 
                     cpu_write_pointers[q_idx] += count as u32;
                     if count as u32 > max_db_count {
@@ -627,25 +713,56 @@ where
             }
         }
 
-        tasks.sort_unstable_by_key(|t| t.0);
-
-        let n_tasks = tasks.len();
+        let n_tasks = task_q_idx.len();
         if n_tasks == 0 {
             return Ok((vec![vec![]; n_queries], vec![vec![]; n_queries]));
         }
 
-        let task_q_idx: Vec<u32> = tasks.iter().map(|t| t.0).collect();
-        let task_db_start: Vec<u32> = tasks.iter().map(|t| t.1).collect();
-        let task_write_offset: Vec<u32> = tasks.iter().map(|t| t.2).collect();
-        let task_db_count: Vec<u32> = tasks.iter().map(|t| t.3).collect();
+        // Group tasks by cluster, not by query. `UNIT_POS_Y` in the mega kernel
+        // binds one task per row, so a cube's rows read whichever DB regions
+        // their tasks point at. Ordered by query, a cube is one query against
+        // `wg_y` different clusters: every row reads a disjoint DB region and
+        // there is no reuse. Ordered by cluster it is `wg_y` different queries
+        // against one cluster, so the DB tile is read once and reused across
+        // rows, which is what makes `euclidean_tiled` fast.
+        //
+        // Reordering is safe: each task carries its own `task_write_offset`, so
+        // where its results land does not depend on task order.
+        let mut order: Vec<u32> = (0..n_tasks as u32).collect();
+        order.sort_unstable_by_key(|&i| task_db_start[i as usize]);
+        let permute = |src: &[u32]| -> Vec<u32> {
+            order.iter().map(|&i| src[i as usize]).collect()
+        };
+        let task_q_idx = permute(&task_q_idx);
+        let task_db_start = permute(&task_db_start);
+        let task_write_offset = permute(&task_write_offset);
+        let task_db_count = permute(&task_db_count);
 
         let max_candidates: usize = cpu_write_pointers
             .iter()
             .fold(0, |acc, &x| acc.max(x as usize));
 
-        let candidate_dists_gpu = GpuTensor::<R, T>::empty(vec![n_queries, max_candidates], client);
-        let candidate_indices_gpu =
-            GpuTensor::<R, u32>::empty(vec![n_queries, max_candidates], client);
+        // Reuse the candidate buffers across batches. A fresh allocation costs
+        // ~39 ms per call here (measured: an identical second launch over the
+        // same buffers runs in 22.3 ms against 61.1 ms for the first), because
+        // the kernel's first write faults in ~1.4 GB. Only the first batch
+        // should pay that.
+        let needed = n_queries * max_candidates;
+        let reuse = scratch.as_ref().is_some_and(|s| s.capacity >= needed);
+        if !reuse {
+            // Over-allocate so that the batch-to-batch drift in
+            // `max_candidates` does not force a reallocation, which would
+            // reintroduce the fault this buffer exists to avoid.
+            let capacity = needed + needed / CANDIDATE_SCRATCH_HEADROOM_DIV;
+            *scratch = Some(CandidateScratch {
+                dists: GpuTensor::<R, T>::empty(vec![capacity], client),
+                indices: GpuTensor::<R, u32>::empty(vec![capacity], client),
+                capacity,
+            });
+        }
+        let held = scratch.as_ref().expect("scratch was just populated");
+        let candidate_dists_gpu = held.dists.reshaped_view(vec![n_queries, max_candidates]);
+        let candidate_indices_gpu = held.indices.reshaped_view(vec![n_queries, max_candidates]);
 
         let task_q_idx_gpu = GpuTensor::<R, u32>::from_slice(&task_q_idx, vec![n_tasks], client);
         let task_db_start_gpu =
@@ -655,6 +772,20 @@ where
         let task_db_count_gpu =
             GpuTensor::<R, u32>::from_slice(&task_db_count, vec![n_tasks], client);
 
+        // NOT register-tiled, deliberately, and this has now been measured
+        // twice. Register-tiled variants (TILE_D DB vectors per thread) were
+        // written, measured and removed both times:
+        //
+        //   * before the task list was grouped by cluster: 1.8x SLOWER
+        //     (72.97 -> 134.39 ms/launch, IVF bench)
+        //   * after grouping, when the DB tile is reused across cube rows and
+        //     the same tiling wins 1.4-2.2x on the exhaustive kernels:
+        //     22.60 -> 22.91 ms/launch, i.e. no change (gridsearch, 150k x 32D)
+        //
+        // An early exit for threads past the cluster end made no difference
+        // either, so it is not wasted tail work. Whatever bounds this kernel,
+        // it is not memory-operation issue count. Do not retry without a new
+        // hypothesis and a measurement.
         let mega_grid_x = max_db_count.div_ceil(WORKGROUP_SIZE_X).max(1);
         let (mega_grid_y, mega_grid_z) = grid_2d((n_tasks as u32).div_ceil(safe_worksize_y));
 

@@ -131,28 +131,6 @@ impl Default for CagraGpuSearchParams {
     }
 }
 
-////////////////////
-// Kernel helpers //
-////////////////////
-
-/// Single xorshift step used to generate random node offsets.
-///
-/// ### Params
-///
-/// * `state` - Current RNG state (must be non-zero)
-///
-/// ### Returns
-///
-/// Next RNG state
-#[cube]
-fn xorshift_search(state: u32) -> u32 {
-    let mut x = state;
-    x ^= x << 13;
-    x ^= x >> 17;
-    x ^= x << 5;
-    x
-}
-
 ///////////////////////////
 // Distance probe kernel //
 ///////////////////////////
@@ -547,9 +525,13 @@ pub fn cagra_beam_search<F: Float, N: Size>(
 
     let max_iter_u32 = max_iters as u32;
     let mut iter: u32 = 0u32;
+    // Tracked in a register and flushed once after the loop. `out_iters` is a
+    // diagnostic nobody reads back, and writing it per iteration cost a global
+    // store per beam step per query.
+    let mut last_iter: u32 = 0u32;
     while iter < max_iter_u32 {
         if tx == 0u32 {
-            out_iters[q_idx as usize] = iter;
+            last_iter = iter;
             s_active_flag[0usize] = sentinel;
             let nc = s_num_cands[0usize];
             let mut active_count: u32 = 0u32;
@@ -610,30 +592,11 @@ pub fn cagra_beam_search<F: Float, N: Size>(
                 active_count += 1u32;
             }
 
-            // Signal termination only if nothing was claimed.
-            if fc > 0u32 || nc > 0u32 {
-                // at least one iteration of the scan ran; flag based on whether
-                // we found an unexpanded candidate
-                let mut any_unexpanded: bool = false;
-                let mut sc = 0u32;
-                while sc < nc {
-                    if s_cand_expanded[sc as usize] == 0u32 {
-                        any_unexpanded = true;
-                    }
-                    sc += 1u32;
-                }
-                // We expanded `expand_u32 - (expand_u32 - actually_expanded)` this iter.
-                // If we expanded at least one, keep going; the termination check
-                // simply reflects whether we produced any work this iter.
-                if any_unexpanded {
-                    s_active_flag[0usize] = 0u32;
-                } else {
-                    // flag stays sentinel, loop will terminate
-                }
-            }
-
-            // Simpler, correct rule: if we expanded nothing this iter, terminate.
-            // Overwrite based on whether any non-sentinel was written into s_nbr_idx.
+            // Terminate when nothing was expanded this iteration, judged by
+            // whether any non-sentinel landed in `s_nbr_idx`. A preceding scan
+            // over `s_cand_expanded` used to set the same flag here, but every
+            // path below overwrote it, so it was dead work: an `nc`-long serial
+            // scan on one lane, every beam iteration.
             let mut any_real: bool = false;
             let mut ck = 0usize;
             while ck < total_slots {
@@ -761,6 +724,10 @@ pub fn cagra_beam_search<F: Float, N: Size>(
         }
 
         iter += 1u32;
+    }
+
+    if tx == 0u32 {
+        out_iters[q_idx as usize] = last_iter;
     }
 
     sync_cube();

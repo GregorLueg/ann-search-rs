@@ -2,6 +2,30 @@
 //!
 //! All vector data remains GPU-resident throughout construction. The host
 //! loop only downloads a single u32 convergence counter per iteration.
+//!
+//! ## CubeCL 0.10 codegen workarounds
+//!
+//! Several constructs in this file look needlessly roundabout. They are not.
+//! Since cubecl 0.10.0, u32 comparisons and ternary-style `if` *expressions*
+//! miscompile on some backends, and the divergence is backend-specific (Metal
+//! vs lavapipe vs CPU), so the same source gives different answers. Cornered in
+//! `fb03735` and `3c657ee`; the repro harness lived here as ~900 lines of
+//! commented-out debug kernels until it was distilled into the four rules
+//! below. Recover it from git history if the upstream issue needs reopening.
+//!
+//! 1. Never use an `if` expression to select a value. Assign a mutable default
+//!    and overwrite it with a statement-form `if`:
+//!    `let mut p = a * 2 + 1; if d <= m { p = a * 2; }` not
+//!    `let p = if d <= m { a * 2 } else { a * 2 + 1 };`
+//! 2. Prefer bit arithmetic over a comparison where one exists.
+//!    `flag = entry >> 31` not `flag = if entry >= 1 << 31 { 1 } else { 0 }`.
+//! 3. In reducer loops, use `usize` counters and comptime-unrolled `for i in
+//!    0..k`, with a first-match guard like `pos == kr - 1`. A `bool` sentinel
+//!    miscompiles; use a `u32` 0/1 sentinel instead. Symptom when this goes
+//!    wrong: `index out of bounds: the len is 15000 but the index is
+//!    1109321353`, i.e. `0x4218E949`, the f32 bit pattern of ~38.24 -- a
+//!    distance value leaking into an index slot.
+//! 4. `SharedMemory::new` wants kernel scope, never inside a branch.
 
 #![allow(missing_docs)] // complains about cubecl macros...
 
@@ -475,70 +499,68 @@ pub fn local_join_shared<F: Float, N: Size>(
     }
     sync_cube();
 
-    let num_pairs = (total_cands * (total_cands - 1u32)) / 2u32;
-    let mut pair_idx = tx as usize;
+    // Walk the candidate upper triangle by row. The flat-pair-index form this
+    // replaces decoded each index with a `while rem >= step` loop running up to
+    // `total_cands` times *per pair per thread*, which cost more than the
+    // distance computation it was indexing. Row `i` work is hoisted out of the
+    // inner loop as a side benefit: `shared_is_new[i]`, `shared_pids[i]` and the
+    // `graph_dist` threshold were previously re-read for every pair.
+    let mut i = tx as usize;
 
-    while pair_idx < num_pairs as usize {
-        let mut rem = pair_idx;
-        let mut i = 0usize;
-        let mut step = total_cands as usize - 1usize;
-
-        while rem >= step {
-            rem -= step;
-            i += 1usize;
-            step = total_cands as usize - 1usize - i;
-        }
-        let j = i + 1usize + rem;
-
+    while i < total_cands as usize {
         let is_new_i = shared_is_new[i] != 0u32;
-        let is_new_j = shared_is_new[j] != 0u32;
         let pid_i = shared_pids[i];
-        let pid_j = shared_pids[j];
+        let thresh_i = graph_dist[pid_i as usize * k as usize + k as usize - 1usize];
 
-        if (is_new_i || is_new_j) && pid_i != pid_j {
-            let mut sum = F::new(0.0_f32);
-            let mut s = 0usize;
-            while s < dim_scalars {
-                let va = shared_vecs[i * dim_scalars + s];
-                let vb = shared_vecs[j * dim_scalars + s];
+        let mut j = i + 1usize;
+        while j < total_cands as usize {
+            let is_new_j = shared_is_new[j] != 0u32;
+            let pid_j = shared_pids[j];
 
-                if use_cosine {
-                    sum += va * vb;
+            if (is_new_i || is_new_j) && pid_i != pid_j {
+                let mut sum = F::new(0.0_f32);
+                #[unroll]
+                for s in 0..dim_scalars {
+                    let va = shared_vecs[i * dim_scalars + s];
+                    let vb = shared_vecs[j * dim_scalars + s];
+
+                    if use_cosine {
+                        sum += va * vb;
+                    } else {
+                        let diff = va - vb;
+                        sum += diff * diff;
+                    }
+                }
+
+                let dist = if use_cosine {
+                    F::new(1.0_f32) - (sum / (shared_norms[i] * shared_norms[j]))
                 } else {
-                    let diff = va - vb;
-                    sum += diff * diff;
+                    sum
+                };
+
+                let thresh_j = graph_dist[pid_j as usize * k as usize + k as usize - 1usize];
+
+                if dist < thresh_i {
+                    let slot_i = prop_count[pid_i as usize].fetch_add(1u32);
+                    if slot_i < max_proposals {
+                        let off = pid_i as usize * max_proposals as usize + slot_i as usize;
+                        prop_idx[off] = pid_j;
+                        prop_dist[off] = dist;
+                    }
                 }
-                s += 1usize;
-            }
 
-            let dist = if use_cosine {
-                F::new(1.0_f32) - (sum / (shared_norms[i] * shared_norms[j]))
-            } else {
-                sum
-            };
-
-            let thresh_i = graph_dist[pid_i as usize * k as usize + k as usize - 1usize];
-            let thresh_j = graph_dist[pid_j as usize * k as usize + k as usize - 1usize];
-
-            if dist < thresh_i {
-                let slot_i = prop_count[pid_i as usize].fetch_add(1u32);
-                if slot_i < max_proposals {
-                    let off = pid_i as usize * max_proposals as usize + slot_i as usize;
-                    prop_idx[off] = pid_j;
-                    prop_dist[off] = dist;
-                }
-            }
-
-            if dist < thresh_j {
-                let slot_j = prop_count[pid_j as usize].fetch_add(1u32);
-                if slot_j < max_proposals {
-                    let off = pid_j as usize * max_proposals as usize + slot_j as usize;
-                    prop_idx[off] = pid_i;
-                    prop_dist[off] = dist;
+                if dist < thresh_j {
+                    let slot_j = prop_count[pid_j as usize].fetch_add(1u32);
+                    if slot_j < max_proposals {
+                        let off = pid_j as usize * max_proposals as usize + slot_j as usize;
+                        prop_idx[off] = pid_i;
+                        prop_dist[off] = dist;
+                    }
                 }
             }
+            j += 1usize;
         }
-        pair_idx += WORKGROUP_SIZE_X as usize;
+        i += WORKGROUP_SIZE_X as usize;
     }
 }
 
@@ -580,6 +602,7 @@ pub fn merge_proposals<F: Float>(
     update_counter: &Tensor<Atomic<u32>>,
     n: u32,
     #[comptime] max_proposals: u32,
+    #[comptime] k_comp: usize,
 ) {
     let node = (CUBE_POS_Y * CUBE_COUNT_X + CUBE_POS_X) * WORKGROUP_SIZE_X + UNIT_POS_X;
     if node >= n {
@@ -591,9 +614,16 @@ pub fn merge_proposals<F: Float>(
     let is_new_bit = 1u32 << 31;
     let base = node as usize * k;
 
-    // clear new flags on all existing entries
-    for j in 0..k {
-        graph_idx[base + j] = graph_idx[base + j] & pid_mask;
+    // Stage this node's row in registers. Every proposal used to scan the row
+    // twice and shift it once, all against global memory, up to
+    // `max_proposals` times per node: O(max_proposals * 3k) global accesses
+    // where 2k suffices. Loading with the id mask applied also folds in the
+    // separate "clear new flags" pass this replaces.
+    let mut local_idx = Array::<u32>::new(k_comp);
+    let mut local_dist = Array::<F>::new(k_comp);
+    for j in 0..k_comp {
+        local_idx[j] = graph_idx[base + j] & pid_mask;
+        local_dist[j] = graph_dist[base + j];
     }
 
     // read how many proposals this node received (capped at max_proposals)
@@ -608,11 +638,11 @@ pub fn merge_proposals<F: Float>(
             let dist = prop_dist[prop_base + p as usize];
 
             // Only process if better than current worst
-            if dist < graph_dist[base + k - 1] {
+            if dist < local_dist[k - 1] {
                 // Check for duplicates
                 let mut exists: u32 = 0u32;
-                for j in 0..k {
-                    if (graph_idx[base + j] & pid_mask) == candidate {
+                for j in 0..k_comp {
+                    if (local_idx[j] & pid_mask) == candidate {
                         exists = 1u32;
                     }
                 }
@@ -621,29 +651,34 @@ pub fn merge_proposals<F: Float>(
                 if exists == 0u32 && candidate != node {
                     // Find insertion point (first slot where dist < current)
                     let mut insert_pos = k - 1;
-                    for j in 0..k {
-                        if dist < graph_dist[base + j] && insert_pos == k - 1 {
+                    for j in 0..k_comp {
+                        if dist < local_dist[j] && insert_pos == k - 1 {
                             insert_pos = j;
                         }
                     }
 
                     // Shift right from insert_pos to k-2
-                    for j in 0..k - 1 {
+                    for j in 0..k_comp - 1 {
                         let src = k - 2 - j;
                         let dst = k - 1 - j;
                         if src >= insert_pos {
-                            graph_idx[base + dst] = graph_idx[base + src];
-                            graph_dist[base + dst] = graph_dist[base + src];
+                            local_idx[dst] = local_idx[src];
+                            local_dist[dst] = local_dist[src];
                         }
                     }
 
                     // Insert with new flag
-                    graph_idx[base + insert_pos] = candidate | is_new_bit;
-                    graph_dist[base + insert_pos] = dist;
+                    local_idx[insert_pos] = candidate | is_new_bit;
+                    local_dist[insert_pos] = dist;
                     improvements += 1u32;
                 }
             }
         }
+    }
+
+    for j in 0..k_comp {
+        graph_idx[base + j] = local_idx[j];
+        graph_dist[base + j] = local_dist[j];
     }
 
     if improvements > 0u32 {
@@ -694,6 +729,7 @@ pub fn two_hop_refinement<F: Float, N: Size>(
     #[comptime] max_proposals: u32,
     #[comptime] use_cosine: bool,
     #[comptime] dim_lines: usize,
+    #[comptime] k_comp: usize,
 ) {
     let node = CUBE_POS_Y * CUBE_COUNT_X + CUBE_POS_X;
     if node >= n_pts {
@@ -709,6 +745,11 @@ pub fn two_hop_refinement<F: Float, N: Size>(
     // Load source vector into shared memory as scalars
     let mut shared_source = SharedMemory::<F>::new(dim_scalars);
     let mut shared_worst_dist = SharedMemory::<F>::new(1usize);
+    // The node's own neighbour ids. The duplicate check below scans this row
+    // once per candidate, and there are k*k candidates, so reading it from
+    // global memory cost k^3 loads per node of a row every thread in the cube
+    // shares.
+    let mut shared_own = SharedMemory::<u32>::new(k_comp);
 
     let mut idx_load = tx as usize;
     while idx_load < dim_scalars {
@@ -720,12 +761,20 @@ pub fn two_hop_refinement<F: Float, N: Size>(
         idx_load += WORKGROUP_SIZE_X as usize;
     }
 
+    let mut own_load = tx as usize;
+    while own_load < k {
+        shared_own[own_load] = graph_idx[graph_base + own_load] & pid_mask;
+        own_load += WORKGROUP_SIZE_X as usize;
+    }
+
     if tx == 0u32 {
         shared_worst_dist[0usize] = graph_dist[graph_base + k - 1usize];
     }
     sync_cube();
 
     let worst_dist = shared_worst_dist[0usize];
+    // Hoisted: was re-read from global for every surviving candidate.
+    let node_norm = norms[node as usize];
     let num_candidates = k * k;
     let mut cand_idx = tx as usize;
 
@@ -744,7 +793,7 @@ pub fn two_hop_refinement<F: Float, N: Size>(
                 let mut is_dup: bool = false;
                 let mut scan_idx = 0usize;
                 while scan_idx < k {
-                    if (graph_idx[graph_base + scan_idx] & pid_mask) == cand_pid {
+                    if shared_own[scan_idx] == cand_pid {
                         is_dup = true;
                     }
                     scan_idx += 1usize;
@@ -752,25 +801,27 @@ pub fn two_hop_refinement<F: Float, N: Size>(
 
                 if !is_dup {
                     let mut sum = F::new(0.0_f32);
-                    let mut s = 0usize;
-                    while s < dim_scalars {
-                        let va = shared_source[s];
-                        let line_idx = s / 4usize;
-                        let lane = s % 4usize;
-                        let line_val = vectors[cand_pid as usize * dim_lines + line_idx];
-                        let vb = line_val[lane];
-
-                        if use_cosine {
-                            sum += va * vb;
-                        } else {
-                            let diff = va - vb;
-                            sum += diff * diff;
+                    // One Vector load per line, lanes unrolled. Indexing by
+                    // scalar and recomputing `s / 4` re-issued the same load
+                    // four times per line.
+                    for li in 0..dim_lines {
+                        let line_val = vectors[cand_pid as usize * dim_lines + li];
+                        let s_off = li * 4usize;
+                        #[unroll]
+                        for lane in 0..4usize {
+                            let va = shared_source[s_off + lane];
+                            let vb = line_val[lane];
+                            if use_cosine {
+                                sum += va * vb;
+                            } else {
+                                let diff = va - vb;
+                                sum += diff * diff;
+                            }
                         }
-                        s += 1usize;
                     }
 
                     let dist = if use_cosine {
-                        F::new(1.0_f32) - (sum / (norms[node as usize] * norms[cand_pid as usize]))
+                        F::new(1.0_f32) - (sum / (node_norm * norms[cand_pid as usize]))
                     } else {
                         sum
                     };
@@ -1034,32 +1085,6 @@ pub fn cagra_merge_graphs(
         final_idx[(node * d_u32 + final_count) as usize] = 0x7FFFFFFFu32;
         final_count += 1u32;
     }
-}
-
-/////////////
-// Helpers //
-/////////////
-
-/// Pad vectors to `dim_padded` by appending zeros to each row.
-///
-/// ### Params
-///
-/// * `flat` - Flattened row-major vector data of size `n * dim`
-/// * `n` - Number of vectors
-/// * `dim` - Original dimensionality
-/// * `dim_padded` - Target dimensionality (must be >= `dim`)
-///
-/// ### Returns
-///
-/// Padded flat vector of size `n * dim_padded`
-fn pad_vectors<T: Float>(flat: &[T], n: usize, dim: usize, dim_padded: usize) -> Vec<T> {
-    let mut padded = vec![T::zero(); n * dim_padded];
-    for i in 0..n {
-        let src = &flat[i * dim..(i + 1) * dim];
-        let dst = &mut padded[i * dim_padded..i * dim_padded + dim];
-        dst.copy_from_slice(src);
-    }
-    padded
 }
 
 //////////////
@@ -1620,8 +1645,9 @@ where
         let reverse_count_gpu = GpuTensor::<R, u32>::empty(vec![n], &client);
 
         for iter in 0..max_iters {
-            let cubes_x = 65535u32;
-            let cubes_y = (n as u32).div_ceil(cubes_x);
+            // One cube per node. `grid_2d` clamps to the 65535 per-dim limit
+            // without over-dispatching when n is below it.
+            let (cubes_x, cubes_y) = grid_2d(n as u32);
 
             // 1. Reset proposal counts, reverse counts, and update counter
             unsafe {
@@ -1700,6 +1726,7 @@ where
                     update_counter_gpu.clone().into_tensor_arg(),
                     n as u32,
                     MAX_PROPOSALS as u32,
+                    build_k,
                 );
             }
 
@@ -1738,8 +1765,8 @@ where
 
         let refinement_start = Instant::now();
 
-        let cubes_x = 65535u32;
-        let cubes_y = (n as u32).div_ceil(cubes_x);
+        // One cube per node.
+        let (cubes_x, cubes_y) = grid_2d(n as u32);
 
         for sweep in 0..refine_knn {
             unsafe {
@@ -1770,6 +1797,7 @@ where
                     MAX_PROPOSALS as u32,
                     use_cosine,
                     dim_vec,
+                    build_k,
                 );
             }
 
@@ -1786,6 +1814,7 @@ where
                     update_counter_gpu.clone().into_tensor_arg(),
                     n as u32,
                     MAX_PROPOSALS as u32,
+                    build_k,
                 );
             }
 
@@ -1842,8 +1871,8 @@ where
         let reverse_counts_gpu = GpuTensor::<R, u32>::from_slice(&vec![0u32; n], vec![n], &client);
         let final_idx_gpu = GpuTensor::<R, u32>::empty(vec![n, k], &client);
 
-        let cubes_x = 65535u32;
-        let cubes_y = (n as u32).div_ceil(cubes_x);
+        // One cube per node.
+        let (cubes_x, cubes_y) = grid_2d(n as u32);
 
         unsafe {
             cagra_rank_prune_shared::launch_unchecked::<R>(
@@ -2648,6 +2677,7 @@ where
                 update_counter_gpu.clone().into_tensor_arg(),
                 n as u32,
                 MAX_PROPOSALS as u32,
+                build_k,
             );
         }
 
@@ -2714,6 +2744,7 @@ where
                 MAX_PROPOSALS as u32,
                 use_cosine,
                 dim_vec,
+                build_k,
             );
 
             merge_proposals::launch_unchecked::<T, R>(
@@ -2728,6 +2759,7 @@ where
                 update_counter_gpu.clone().into_tensor_arg(),
                 n as u32,
                 MAX_PROPOSALS as u32,
+                build_k,
             );
         }
 
@@ -3551,6 +3583,7 @@ mod kernel_tests {
                 update_counter.clone().into_tensor_arg(),
                 n as u32,
                 MAX_PROPOSALS as u32,
+                k,
             );
         }
 
@@ -3665,6 +3698,7 @@ mod kernel_tests {
                 update_counter2.clone().into_tensor_arg(),
                 n2 as u32,
                 MAX_PROPOSALS as u32,
+                k,
             );
         }
 
@@ -4035,920 +4069,4 @@ mod kernel_tests {
             "Distance mismatch: gpu={gpu_dist}, cpu={cpu_dist}"
         );
     }
-
-    ///////////////
-    // Debugging //
-    ///////////////
-
-    // Note to self, there has been some very weird bugs since cubecl 0.10.0
-    // with comparisons on u32 -> Claude and I are debugged this stuff...
-    // Need to raise with the authors
-
-    // #[test]
-    // fn test_nndescent_iteration_produces_updates() {
-    //     let Some(device) = try_device() else {
-    //         eprintln!("Skipping test: no wgpu backend available");
-    //         return;
-    //     };
-    //     let client = WgpuRuntime::client(&device);
-
-    //     // Mirror the production failure: dim=32, build_k=45, rho=0.5, euclidean.
-    //     let n = 512usize;
-    //     let dim = 32usize;
-    //     let build_k = 45usize;
-    //     let line = LINE_SIZE;
-    //     let dim_padded = dim.next_multiple_of(line);
-    //     let dim_vec = dim_padded / line;
-    //     let seed = 42u32;
-    //     let use_cosine = false;
-    //     let rho_thresh = 65535u32;
-
-    //     let data: Vec<f32> = (0..n * dim_padded)
-    //         .map(|i| {
-    //             let x = (i as u32).wrapping_mul(2654435761) ^ 0x9E3779B9;
-    //             ((x % 1000) as f32) / 1000.0
-    //         })
-    //         .collect();
-
-    //     let vectors_gpu =
-    //         GpuTensor::<WgpuRuntime, f32>::from_slice(&data, vec![n, dim_padded], &client);
-    //     let norms_gpu = GpuTensor::<WgpuRuntime, f32>::from_slice(&[0.0f32], vec![1], &client);
-
-    //     let graph_idx_gpu = GpuTensor::<WgpuRuntime, u32>::from_slice(
-    //         &vec![0x7FFFFFFFu32; n * build_k],
-    //         vec![n, build_k],
-    //         &client,
-    //     );
-    //     let graph_dist_gpu = GpuTensor::<WgpuRuntime, f32>::from_slice(
-    //         &vec![f32::MAX; n * build_k],
-    //         vec![n, build_k],
-    //         &client,
-    //     );
-
-    //     let max_prop = MAX_PROPOSALS;
-    //     let prop_idx_gpu = GpuTensor::<WgpuRuntime, u32>::empty(vec![n, max_prop], &client);
-    //     let prop_dist_gpu = GpuTensor::<WgpuRuntime, f32>::empty(vec![n, max_prop], &client);
-    //     let prop_count_gpu =
-    //         GpuTensor::<WgpuRuntime, u32>::from_slice(&vec![0u32; n], vec![n], &client);
-    //     let update_counter_gpu =
-    //         GpuTensor::<WgpuRuntime, u32>::from_slice(&[0u32], vec![1], &client);
-    //     let reverse_idx_gpu = GpuTensor::<WgpuRuntime, u32>::empty(vec![n, build_k], &client);
-    //     let reverse_count_gpu =
-    //         GpuTensor::<WgpuRuntime, u32>::from_slice(&vec![0u32; n], vec![n], &client);
-
-    //     let (grid_n_x, grid_n_y) = grid_2d((n as u32).div_ceil(WORKGROUP_SIZE_X));
-
-    //     // 1: random init
-    //     unsafe {
-    //         init_random_graph::launch_unchecked::<f32, WgpuRuntime>(
-    //             &client,
-    //             CubeCount::Static(grid_n_x, grid_n_y, 1),
-    //             CubeDim::new_2d(WORKGROUP_SIZE_X, 1),
-    //             line,
-    //             vectors_gpu.clone().into_tensor_arg(),
-    //             norms_gpu.clone().into_tensor_arg(),
-    //             graph_idx_gpu.clone().into_tensor_arg(),
-    //             graph_dist_gpu.clone().into_tensor_arg(),
-    //             n as u32,
-    //             seed,
-    //             use_cosine,
-    //             dim_vec,
-    //         );
-    //     }
-
-    //     // 1c: mark all new (as build() does)
-    //     let total_entries = (n * build_k) as u32;
-    //     let (mark_x, mark_y) = grid_2d(total_entries.div_ceil(WORKGROUP_SIZE_X));
-    //     unsafe {
-    //         mark_all_new::launch_unchecked::<WgpuRuntime>(
-    //             &client,
-    //             CubeCount::Static(mark_x, mark_y, 1),
-    //             CubeDim::new_2d(WORKGROUP_SIZE_X, 1),
-    //             graph_idx_gpu.clone().into_tensor_arg(),
-    //             total_entries,
-    //         );
-    //     }
-
-    //     {
-    //         let g = graph_idx_gpu.clone().read(&client).unwrap();
-    //         let marked = g.iter().filter(|&&e| e >= (1u32 << 31)).count();
-    //         println!("entries with IS_NEW set: {marked} / {}", g.len());
-    //         assert!(marked > 0, "mark_all_new did not set the new flag");
-    //     }
-
-    //     // 2: one iteration -- reset, reverse, local join
-    //     unsafe {
-    //         reset_proposals::launch_unchecked::<WgpuRuntime>(
-    //             &client,
-    //             CubeCount::Static(grid_n_x, grid_n_y, 1),
-    //             CubeDim::new_2d(WORKGROUP_SIZE_X, 1),
-    //             prop_count_gpu.clone().into_tensor_arg(),
-    //             update_counter_gpu.clone().into_tensor_arg(),
-    //             n as u32,
-    //         );
-    //         reset_proposals::launch_unchecked::<WgpuRuntime>(
-    //             &client,
-    //             CubeCount::Static(grid_n_x, grid_n_y, 1),
-    //             CubeDim::new_2d(WORKGROUP_SIZE_X, 1),
-    //             reverse_count_gpu.clone().into_tensor_arg(),
-    //             update_counter_gpu.clone().into_tensor_arg(),
-    //             n as u32,
-    //         );
-    //         build_reverse_candidates::launch_unchecked::<WgpuRuntime>(
-    //             &client,
-    //             CubeCount::Static(grid_n_x, grid_n_y, 1),
-    //             CubeDim::new_2d(WORKGROUP_SIZE_X, 1),
-    //             graph_idx_gpu.clone().into_tensor_arg(),
-    //             reverse_idx_gpu.clone().into_tensor_arg(),
-    //             reverse_count_gpu.clone().into_tensor_arg(),
-    //             n as u32,
-    //             build_k as u32,
-    //         );
-    //     }
-
-    //     let cubes_x = (n as u32).min(65535);
-    //     let cubes_y = (n as u32).div_ceil(cubes_x);
-    //     unsafe {
-    //         local_join_shared::launch_unchecked::<f32, WgpuRuntime>(
-    //             &client,
-    //             CubeCount::Static(cubes_x, cubes_y, 1),
-    //             CubeDim::new_2d(WORKGROUP_SIZE_X, 1),
-    //             line,
-    //             vectors_gpu.clone().into_tensor_arg(),
-    //             norms_gpu.clone().into_tensor_arg(),
-    //             graph_idx_gpu.clone().into_tensor_arg(),
-    //             graph_dist_gpu.clone().into_tensor_arg(),
-    //             reverse_idx_gpu.clone().into_tensor_arg(),
-    //             reverse_count_gpu.clone().into_tensor_arg(),
-    //             prop_idx_gpu.clone().into_tensor_arg(),
-    //             prop_dist_gpu.clone().into_tensor_arg(),
-    //             prop_count_gpu.clone().into_tensor_arg(),
-    //             n as u32,
-    //             rho_thresh,
-    //             seed,
-    //             MAX_PROPOSALS as u32,
-    //             use_cosine,
-    //             dim_vec,
-    //             build_k,
-    //         );
-    //     }
-
-    //     // Stage diagnostics (merge does not touch these, safe to read now)
-    //     let rev_total: u64 = reverse_count_gpu
-    //         .clone()
-    //         .read(&client)
-    //         .unwrap()
-    //         .iter()
-    //         .map(|&c| c as u64)
-    //         .sum();
-    //     let prop_total: u64 = prop_count_gpu
-    //         .clone()
-    //         .read(&client)
-    //         .unwrap()
-    //         .iter()
-    //         .map(|&c| c as u64)
-    //         .sum();
-
-    //     unsafe {
-    //         merge_proposals::launch_unchecked::<f32, WgpuRuntime>(
-    //             &client,
-    //             CubeCount::Static(grid_n_x, grid_n_y, 1),
-    //             CubeDim::new_2d(WORKGROUP_SIZE_X, 1),
-    //             graph_idx_gpu.clone().into_tensor_arg(),
-    //             graph_dist_gpu.clone().into_tensor_arg(),
-    //             prop_idx_gpu.clone().into_tensor_arg(),
-    //             prop_dist_gpu.clone().into_tensor_arg(),
-    //             prop_count_gpu.clone().into_tensor_arg(),
-    //             update_counter_gpu.clone().into_tensor_arg(),
-    //             n as u32,
-    //             MAX_PROPOSALS as u32,
-    //         );
-    //     }
-
-    //     let updates = update_counter_gpu.clone().read(&client).unwrap()[0];
-
-    //     println!("reverse edges total : {rev_total}");
-    //     println!("proposals total     : {prop_total}");
-    //     println!("merge updates       : {updates}");
-
-    //     assert!(
-    //         rev_total > 0,
-    //         "build_reverse_candidates produced no reverse edges"
-    //     );
-    //     assert!(prop_total > 0, "local_join_shared produced no proposals");
-    //     assert!(
-    //         updates > 0,
-    //         "merge_proposals applied no updates on iteration 1"
-    //     );
-    // }
-
-    // #[cube(launch_unchecked)]
-    // fn debug_local_join_node<F: Float, N: Size>(
-    //     vectors: &Tensor<Vector<F, N>>,
-    //     graph_idx: &Tensor<u32>,
-    //     graph_dist: &Tensor<F>,
-    //     reverse_idx: &Tensor<u32>,
-    //     reverse_count: &Tensor<u32>,
-    //     out_u32: &mut Tensor<u32>,
-    //     out_f32: &mut Tensor<F>,
-    //     node: u32,
-    //     rho_thresh: u32,
-    //     iter_seed: u32,
-    //     #[comptime] dim_lines: usize,
-    //     #[comptime] build_k: usize,
-    // ) {
-    //     if UNIT_POS_X != 0u32 {
-    //         terminate!();
-    //     }
-
-    //     let k = graph_idx.shape(1usize) as u32;
-    //     let pid_mask = 0x7FFFFFFFu32;
-    //     let is_new_bit = 1u32 << 31;
-    //     let max_cands = build_k * 2usize;
-
-    //     let mut pids = SharedMemory::<u32>::new(max_cands);
-    //     let mut isnew = SharedMemory::<u32>::new(max_cands);
-
-    //     let rc = reverse_count[node as usize];
-    //     let rev_k = if rc > k { k } else { rc };
-    //     let raw_total = k + rev_k;
-
-    //     let mut t = 0u32;
-    //     while t < raw_total {
-    //         let entry = if t < k {
-    //             graph_idx[(node * k + t) as usize]
-    //         } else {
-    //             reverse_idx[(node * k + t - k) as usize]
-    //         };
-    //         pids[t as usize] = entry & pid_mask;
-    //         isnew[t as usize] = if entry >= is_new_bit { 1u32 } else { 0u32 };
-    //         t += 1u32;
-    //     }
-
-    //     let mut write = 0u32;
-    //     let mut has_new = 0u32;
-    //     let mut read = 0u32;
-    //     while read < raw_total {
-    //         let hash = entry_hash(node, read, iter_seed);
-    //         if (hash & 0xFFFFu32) < rho_thresh {
-    //             pids[write as usize] = pids[read as usize];
-    //             isnew[write as usize] = isnew[read as usize];
-    //             if isnew[read as usize] != 0u32 {
-    //                 has_new = 1u32;
-    //             }
-    //             write += 1u32;
-    //         }
-    //         read += 1u32;
-    //     }
-    //     let total_cands = write;
-
-    //     let mut gate_pass = 0u32;
-    //     let mut below = 0u32;
-    //     let mut min_dist = F::new(3.0e38);
-    //     let mut first_pid_i = 0u32;
-    //     let mut first_pid_j = 0u32;
-    //     let mut first_dist = F::new(-1.0);
-    //     let mut first_ti = F::new(-1.0);
-    //     let mut recorded: u32 = 0u32;
-
-    //     let mut a = 0u32;
-    //     while a < total_cands {
-    //         let mut b = a + 1u32;
-    //         while b < total_cands {
-    //             let pid_i = pids[a as usize];
-    //             let pid_j = pids[b as usize];
-    //             if pid_i != pid_j {
-    //                 gate_pass += 1u32;
-    //                 let off_i = pid_i as usize * dim_lines;
-    //                 let off_j = pid_j as usize * dim_lines;
-    //                 let mut sum = F::new(0.0_f32);
-    //                 let mut l = 0usize;
-    //                 while l < dim_lines {
-    //                     let d = vectors[off_i + l] - vectors[off_j + l];
-    //                     let sq = d * d;
-    //                     #[unroll]
-    //                     for lane in 0..LINE_SIZE {
-    //                         sum += sq[lane];
-    //                     }
-    //                     l += 1usize;
-    //                 }
-    //                 let ti = graph_dist[pid_i as usize * k as usize + k as usize - 1usize];
-    //                 if sum < min_dist {
-    //                     min_dist = sum;
-    //                 }
-    //                 if sum < ti {
-    //                     below += 1u32;
-    //                 }
-    //                 if recorded == 0u32 {
-    //                     first_pid_i = pid_i;
-    //                     first_pid_j = pid_j;
-    //                     first_dist = sum;
-    //                     first_ti = ti;
-    //                     recorded = 1u32;
-    //                 }
-    //             }
-    //             b += 1u32;
-    //         }
-    //         a += 1u32;
-    //     }
-
-    //     out_u32[0usize] = total_cands;
-    //     out_u32[1usize] = raw_total;
-    //     out_u32[2usize] = has_new;
-    //     out_u32[3usize] = gate_pass;
-    //     out_u32[4usize] = below;
-    //     out_u32[5usize] = first_pid_i;
-    //     out_u32[6usize] = first_pid_j;
-    //     out_f32[0usize] = first_dist;
-    //     out_f32[1usize] = first_ti;
-    //     out_f32[2usize] = min_dist;
-    // }
-
-    // #[test]
-    // fn test_debug_local_join_node() {
-    //     let Some(device) = try_device() else {
-    //         eprintln!("Skipping test: no wgpu backend available");
-    //         return;
-    //     };
-    //     let client = WgpuRuntime::client(&device);
-
-    //     let n = 512usize;
-    //     let dim = 32usize;
-    //     let build_k = 45usize;
-    //     let line = LINE_SIZE;
-    //     let dim_padded = dim.next_multiple_of(line);
-    //     let dim_vec = dim_padded / line;
-    //     let seed = 42u32;
-
-    //     let data: Vec<f32> = (0..n * dim_padded)
-    //         .map(|i| {
-    //             let x = (i as u32).wrapping_mul(2654435761) ^ 0x9E3779B9;
-    //             ((x % 1000) as f32) / 1000.0
-    //         })
-    //         .collect();
-
-    //     let vectors_gpu =
-    //         GpuTensor::<WgpuRuntime, f32>::from_slice(&data, vec![n, dim_padded], &client);
-    //     let norms_gpu = GpuTensor::<WgpuRuntime, f32>::from_slice(&[0.0f32], vec![1], &client);
-    //     let graph_idx_gpu = GpuTensor::<WgpuRuntime, u32>::from_slice(
-    //         &vec![0x7FFFFFFFu32; n * build_k],
-    //         vec![n, build_k],
-    //         &client,
-    //     );
-    //     let graph_dist_gpu = GpuTensor::<WgpuRuntime, f32>::from_slice(
-    //         &vec![f32::MAX; n * build_k],
-    //         vec![n, build_k],
-    //         &client,
-    //     );
-    //     let reverse_idx_gpu = GpuTensor::<WgpuRuntime, u32>::empty(vec![n, build_k], &client);
-    //     let reverse_count_gpu =
-    //         GpuTensor::<WgpuRuntime, u32>::from_slice(&vec![0u32; n], vec![n], &client);
-    //     let update_counter_gpu =
-    //         GpuTensor::<WgpuRuntime, u32>::from_slice(&[0u32], vec![1], &client);
-
-    //     let (gx, gy) = grid_2d((n as u32).div_ceil(WORKGROUP_SIZE_X));
-
-    //     unsafe {
-    //         init_random_graph::launch_unchecked::<f32, WgpuRuntime>(
-    //             &client,
-    //             CubeCount::Static(gx, gy, 1),
-    //             CubeDim::new_2d(WORKGROUP_SIZE_X, 1),
-    //             line,
-    //             vectors_gpu.clone().into_tensor_arg(),
-    //             norms_gpu.clone().into_tensor_arg(),
-    //             graph_idx_gpu.clone().into_tensor_arg(),
-    //             graph_dist_gpu.clone().into_tensor_arg(),
-    //             n as u32,
-    //             seed,
-    //             false,
-    //             dim_vec,
-    //         );
-    //         let total_entries = (n * build_k) as u32;
-    //         let (mx, my) = grid_2d(total_entries.div_ceil(WORKGROUP_SIZE_X));
-    //         mark_all_new::launch_unchecked::<WgpuRuntime>(
-    //             &client,
-    //             CubeCount::Static(mx, my, 1),
-    //             CubeDim::new_2d(WORKGROUP_SIZE_X, 1),
-    //             graph_idx_gpu.clone().into_tensor_arg(),
-    //             total_entries,
-    //         );
-    //         reset_proposals::launch_unchecked::<WgpuRuntime>(
-    //             &client,
-    //             CubeCount::Static(gx, gy, 1),
-    //             CubeDim::new_2d(WORKGROUP_SIZE_X, 1),
-    //             reverse_count_gpu.clone().into_tensor_arg(),
-    //             update_counter_gpu.clone().into_tensor_arg(),
-    //             n as u32,
-    //         );
-    //         build_reverse_candidates::launch_unchecked::<WgpuRuntime>(
-    //             &client,
-    //             CubeCount::Static(gx, gy, 1),
-    //             CubeDim::new_2d(WORKGROUP_SIZE_X, 1),
-    //             graph_idx_gpu.clone().into_tensor_arg(),
-    //             reverse_idx_gpu.clone().into_tensor_arg(),
-    //             reverse_count_gpu.clone().into_tensor_arg(),
-    //             n as u32,
-    //             build_k as u32,
-    //         );
-    //     }
-
-    //     for node in [0u32, 1, 7, 100] {
-    //         let out_u32 = GpuTensor::<WgpuRuntime, u32>::from_slice(&[0u32; 7], vec![7], &client);
-    //         let out_f32 = GpuTensor::<WgpuRuntime, f32>::from_slice(&[0.0f32; 3], vec![3], &client);
-    //         unsafe {
-    //             debug_local_join_node::launch_unchecked::<f32, WgpuRuntime>(
-    //                 &client,
-    //                 CubeCount::Static(1, 1, 1),
-    //                 CubeDim::new_2d(WORKGROUP_SIZE_X, 1),
-    //                 line,
-    //                 vectors_gpu.clone().into_tensor_arg(),
-    //                 graph_idx_gpu.clone().into_tensor_arg(),
-    //                 graph_dist_gpu.clone().into_tensor_arg(),
-    //                 reverse_idx_gpu.clone().into_tensor_arg(),
-    //                 reverse_count_gpu.clone().into_tensor_arg(),
-    //                 out_u32.clone().into_tensor_arg(),
-    //                 out_f32.clone().into_tensor_arg(),
-    //                 node,
-    //                 65535u32,
-    //                 seed,
-    //                 dim_vec,
-    //                 build_k,
-    //             );
-    //         }
-    //         let u = out_u32.read(&client).unwrap();
-    //         let f = out_f32.read(&client).unwrap();
-    //         println!(
-    //             "node {node}: total_cands={} raw_total={} has_new={} gate_pass={} below_thresh={} | first pair {}->{} dist={:.4} thresh_i={:.4} min_dist={:.4}",
-    //             u[0], u[1], u[2], u[3], u[4], u[5], u[6], f[0], f[1], f[2]
-    //         );
-    //     }
-    // }
-
-    // #[cube(launch_unchecked)]
-    // fn debug_msb_probe(graph_idx: &Tensor<u32>, out: &mut Tensor<u32>) {
-    //     if UNIT_POS_X != 0u32 {
-    //         terminate!();
-    //     }
-    //     let bit = 1u32 << 31;
-    //     let e0 = graph_idx[0usize];
-    //     let e1 = graph_idx[1usize];
-    //     out[0usize] = bit;
-    //     out[1usize] = e0;
-    //     out[2usize] = e1;
-    //     out[3usize] = e0 & bit;
-    //     out[4usize] = if e0 >= bit { 1u32 } else { 0u32 };
-    //     out[5usize] = if (e0 & bit) != 0u32 { 1u32 } else { 0u32 };
-    // }
-
-    // #[test]
-    // fn test_debug_msb_probe() {
-    //     let Some(device) = try_device() else {
-    //         eprintln!("Skipping: no wgpu backend");
-    //         return;
-    //     };
-    //     let client = WgpuRuntime::client(&device);
-
-    //     let n = 512usize;
-    //     let dim = 32usize;
-    //     let build_k = 45usize;
-    //     let line = LINE_SIZE;
-    //     let dim_padded = dim.next_multiple_of(line);
-    //     let dim_vec = dim_padded / line;
-
-    //     let data: Vec<f32> = (0..n * dim_padded)
-    //         .map(|i| {
-    //             let x = (i as u32).wrapping_mul(2654435761) ^ 0x9E3779B9;
-    //             ((x % 1000) as f32) / 1000.0
-    //         })
-    //         .collect();
-    //     let vectors_gpu =
-    //         GpuTensor::<WgpuRuntime, f32>::from_slice(&data, vec![n, dim_padded], &client);
-    //     let norms_gpu = GpuTensor::<WgpuRuntime, f32>::from_slice(&[0.0f32], vec![1], &client);
-    //     let graph_idx_gpu = GpuTensor::<WgpuRuntime, u32>::from_slice(
-    //         &vec![0x7FFFFFFFu32; n * build_k],
-    //         vec![n, build_k],
-    //         &client,
-    //     );
-    //     let graph_dist_gpu = GpuTensor::<WgpuRuntime, f32>::from_slice(
-    //         &vec![f32::MAX; n * build_k],
-    //         vec![n, build_k],
-    //         &client,
-    //     );
-
-    //     let (gx, gy) = grid_2d((n as u32).div_ceil(WORKGROUP_SIZE_X));
-    //     unsafe {
-    //         init_random_graph::launch_unchecked::<f32, WgpuRuntime>(
-    //             &client,
-    //             CubeCount::Static(gx, gy, 1),
-    //             CubeDim::new_2d(WORKGROUP_SIZE_X, 1),
-    //             line,
-    //             vectors_gpu.clone().into_tensor_arg(),
-    //             norms_gpu.clone().into_tensor_arg(),
-    //             graph_idx_gpu.clone().into_tensor_arg(),
-    //             graph_dist_gpu.clone().into_tensor_arg(),
-    //             n as u32,
-    //             42u32,
-    //             false,
-    //             dim_vec,
-    //         );
-    //         let total = (n * build_k) as u32;
-    //         let (mx, my) = grid_2d(total.div_ceil(WORKGROUP_SIZE_X));
-    //         mark_all_new::launch_unchecked::<WgpuRuntime>(
-    //             &client,
-    //             CubeCount::Static(mx, my, 1),
-    //             CubeDim::new_2d(WORKGROUP_SIZE_X, 1),
-    //             graph_idx_gpu.clone().into_tensor_arg(),
-    //             total,
-    //         );
-    //     }
-
-    //     let host = graph_idx_gpu.clone().read(&client).unwrap();
-    //     let out = GpuTensor::<WgpuRuntime, u32>::from_slice(&[0u32; 6], vec![6], &client);
-    //     unsafe {
-    //         debug_msb_probe::launch_unchecked::<WgpuRuntime>(
-    //             &client,
-    //             CubeCount::Static(1, 1, 1),
-    //             CubeDim::new_2d(WORKGROUP_SIZE_X, 1),
-    //             graph_idx_gpu.clone().into_tensor_arg(),
-    //             out.clone().into_tensor_arg(),
-    //         );
-    //     }
-    //     let o = out.read(&client).unwrap();
-    //     println!("host    graph_idx[0] = 0x{:08X}", host[0]);
-    //     println!("kernel  is_new_bit   = 0x{:08X}", o[0]);
-    //     println!("kernel  graph_idx[0] = 0x{:08X}", o[1]);
-    //     println!("kernel  graph_idx[1] = 0x{:08X}", o[2]);
-    //     println!("kernel  e0 & bit     = 0x{:08X}", o[3]);
-    //     println!("kernel  e0 >= bit    = {}", o[4]);
-    //     println!("kernel  (e0&bit)!=0  = {}", o[5]);
-    // }
-
-    // #[cube(launch_unchecked)]
-    // fn debug_shift_probe(graph_idx: &Tensor<u32>, out: &mut Tensor<u32>) {
-    //     if UNIT_POS_X != 0u32 {
-    //         terminate!();
-    //     }
-    //     let e0 = graph_idx[0usize]; // 0x80000082, MSB set
-    //     let sentinel = graph_idx[1usize]; // 0x7FFFFFFF, MSB clear
-    //     out[0usize] = e0 >> 31;
-    //     out[1usize] = sentinel >> 31;
-    //     out[2usize] = if (e0 >> 31) != 0u32 { 1u32 } else { 0u32 };
-    //     out[3usize] = if (sentinel >> 31) != 0u32 { 1u32 } else { 0u32 };
-    //     out[4usize] = if 1u32 != 0u32 { 1u32 } else { 0u32 };
-    //     out[5usize] = if e0 > 0x7FFFFFFFu32 { 1u32 } else { 0u32 };
-    // }
-
-    // #[test]
-    // fn test_debug_shift_probe() {
-    //     let Some(device) = try_device() else {
-    //         eprintln!("Skipping: no wgpu backend");
-    //         return;
-    //     };
-    //     let client = WgpuRuntime::client(&device);
-    //     let graph_idx_gpu = GpuTensor::<WgpuRuntime, u32>::from_slice(
-    //         &[0x80000082u32, 0x7FFFFFFFu32],
-    //         vec![2],
-    //         &client,
-    //     );
-    //     let out = GpuTensor::<WgpuRuntime, u32>::from_slice(&[0u32; 6], vec![6], &client);
-    //     unsafe {
-    //         debug_shift_probe::launch_unchecked::<WgpuRuntime>(
-    //             &client,
-    //             CubeCount::Static(1, 1, 1),
-    //             CubeDim::new_2d(WORKGROUP_SIZE_X, 1),
-    //             graph_idx_gpu.clone().into_tensor_arg(),
-    //             out.clone().into_tensor_arg(),
-    //         );
-    //     }
-    //     let o = out.read(&client).unwrap();
-    //     println!("e0>>31           = {}  (expect 1)", o[0]);
-    //     println!("sentinel>>31     = {}  (expect 0)", o[1]);
-    //     println!("(e0>>31)!=0      = {}  (expect 1)", o[2]);
-    //     println!("(sentinel>>31)!=0= {}  (expect 0)", o[3]);
-    //     println!("1!=0             = {}  (expect 1)", o[4]);
-    //     println!("e0 > 0x7FFFFFFF  = {}  (expect 1)", o[5]);
-    // }
-
-    // #[cube(launch_unchecked)]
-    // fn debug_flag_idioms(vals: &Tensor<u32>, out: &mut Tensor<u32>) {
-    //     if UNIT_POS_X != 0u32 {
-    //         terminate!();
-    //     }
-    //     let e0 = vals[0usize]; // 0x80000082, new
-    //     let sentinel = vals[1usize]; // 0x7FFFFFFF, old
-
-    //     let mut sh = SharedMemory::<u32>::new(2usize);
-    //     sh[0usize] = e0 >> 31;
-    //     sh[1usize] = sentinel >> 31;
-    //     sync_cube();
-    //     let r0 = sh[0usize];
-    //     let r1 = sh[1usize];
-
-    //     out[0usize] = if r0 != 0u32 { 1u32 } else { 0u32 }; // expect 1
-    //     out[1usize] = if r1 != 0u32 { 1u32 } else { 0u32 }; // expect 0
-    //     out[2usize] = if r0 == 1u32 { 1u32 } else { 0u32 }; // expect 1
-    //     out[3usize] = if r1 == 1u32 { 1u32 } else { 0u32 }; // expect 0
-    //     out[4usize] = r0; // expect 1
-    //     out[5usize] = r1; // expect 0
-    // }
-
-    // #[test]
-    // fn test_debug_flag_idioms() {
-    //     let Some(device) = try_device() else {
-    //         eprintln!("Skipping: no wgpu backend");
-    //         return;
-    //     };
-    //     let client = WgpuRuntime::client(&device);
-    //     let vals = GpuTensor::<WgpuRuntime, u32>::from_slice(
-    //         &[0x80000082u32, 0x7FFFFFFFu32],
-    //         vec![2],
-    //         &client,
-    //     );
-    //     let out = GpuTensor::<WgpuRuntime, u32>::from_slice(&[0u32; 6], vec![6], &client);
-    //     unsafe {
-    //         debug_flag_idioms::launch_unchecked::<WgpuRuntime>(
-    //             &client,
-    //             CubeCount::Static(1, 1, 1),
-    //             CubeDim::new_2d(WORKGROUP_SIZE_X, 1),
-    //             vals.clone().into_tensor_arg(),
-    //             out.clone().into_tensor_arg(),
-    //         );
-    //     }
-    //     let o = out.read(&client).unwrap();
-    //     println!("r0!=0  = {}  (expect 1)", o[0]);
-    //     println!("r1!=0  = {}  (expect 0)", o[1]);
-    //     println!("r0==1  = {}  (expect 1)", o[2]);
-    //     println!("r1==1  = {}  (expect 0)", o[3]);
-    //     println!("r0     = {}  (expect 1)", o[4]);
-    //     println!("r1     = {}  (expect 0)", o[5]);
-    // }
-
-    // #[cube(launch_unchecked)]
-    // fn debug_launder(input: &Tensor<u32>, out: &mut Tensor<u32>) {
-    //     let tx = UNIT_POS_X;
-    //     let mut sh = SharedMemory::<u32>::new(32usize);
-    //     sh[tx as usize] = input[tx as usize] >> 31; // shift-store, no comparison
-    //     sync_cube(); // legal: every thread reaches it
-    //     if tx == 0u32 {
-    //         let r0 = sh[0usize]; // fresh load, from input[0]=0x80000082 -> 1
-    //         let r1 = sh[1usize]; // fresh load, from input[1]=0x7FFFFFFF -> 0
-    //         out[0usize] = r0; // expect 1
-    //         out[1usize] = r1; // expect 0
-    //         out[2usize] = if r0 != 0u32 { 1u32 } else { 0u32 }; // expect 1
-    //         out[3usize] = if r1 != 0u32 { 1u32 } else { 0u32 }; // expect 0
-    //     }
-    // }
-
-    // #[test]
-    // fn test_debug_launder() {
-    //     let Some(device) = try_device() else {
-    //         eprintln!("Skipping: no wgpu backend");
-    //         return;
-    //     };
-    //     let client = WgpuRuntime::client(&device);
-    //     let mut input = vec![0u32; 32];
-    //     input[0] = 0x80000082;
-    //     input[1] = 0x7FFFFFFF;
-    //     let input_gpu = GpuTensor::<WgpuRuntime, u32>::from_slice(&input, vec![32], &client);
-    //     let out = GpuTensor::<WgpuRuntime, u32>::from_slice(&[0u32; 4], vec![4], &client);
-    //     unsafe {
-    //         debug_launder::launch_unchecked::<WgpuRuntime>(
-    //             &client,
-    //             CubeCount::Static(1, 1, 1),
-    //             CubeDim::new_2d(WORKGROUP_SIZE_X, 1),
-    //             input_gpu.clone().into_tensor_arg(),
-    //             out.clone().into_tensor_arg(),
-    //         );
-    //     }
-    //     let o = out.read(&client).unwrap();
-    //     println!("r0      = {}  (expect 1)", o[0]);
-    //     println!("r1      = {}  (expect 0)", o[1]);
-    //     println!("r0!=0   = {}  (expect 1)", o[2]);
-    //     println!("r1!=0   = {}  (expect 0)", o[3]);
-    // }
-
-    // #[cube(launch_unchecked)]
-    // fn debug_arith_gate(input: &Tensor<u32>, out: &mut Tensor<u32>) {
-    //     let tx = UNIT_POS_X;
-    //     let mut sh = SharedMemory::<u32>::new(32usize);
-    //     sh[tx as usize] = input[tx as usize] >> 31;
-    //     sync_cube();
-    //     if tx == 0u32 {
-    //         let f_new = sh[0usize]; // from 0x80000082 -> 1
-    //         let f_old = sh[1usize]; // from 0x7FFFFFFF -> 0
-
-    //         // OR accumulation (has_new pattern)
-    //         let mut acc: u32 = 0u32;
-    //         acc = acc | f_new;
-    //         out[0usize] = acc; // expect 1
-    //         out[1usize] = 0u32 | f_old; // expect 0
-
-    //         // gate as OR of two flags, then used as a count
-    //         let gate_nn = f_new | f_new; // expect 1
-    //         let gate_no = f_new | f_old; // expect 1
-    //         let gate_oo = f_old | f_old; // expect 0
-    //         out[2usize] = gate_nn;
-    //         out[3usize] = gate_no;
-    //         out[4usize] = gate_oo;
-
-    //         // arithmetic selection instead of an if: dist masked by gate
-    //         // (does multiplying a normal int by a tainted 0/1 work?)
-    //         let masked = 7u32 * gate_no; // expect 7
-    //         out[5usize] = masked;
-    //         let masked0 = 7u32 * gate_oo; // expect 0
-    //         out[6usize] = masked0;
-    //     }
-    // }
-
-    // #[test]
-    // fn test_debug_arith_gate() {
-    //     let Some(device) = try_device() else {
-    //         eprintln!("Skipping: no wgpu backend");
-    //         return;
-    //     };
-    //     let client = WgpuRuntime::client(&device);
-    //     let mut input = vec![0u32; 32];
-    //     input[0] = 0x80000082;
-    //     input[1] = 0x7FFFFFFF;
-    //     let input_gpu = GpuTensor::<WgpuRuntime, u32>::from_slice(&input, vec![32], &client);
-    //     let out = GpuTensor::<WgpuRuntime, u32>::from_slice(&[0u32; 7], vec![7], &client);
-    //     unsafe {
-    //         debug_arith_gate::launch_unchecked::<WgpuRuntime>(
-    //             &client,
-    //             CubeCount::Static(1, 1, 1),
-    //             CubeDim::new_2d(WORKGROUP_SIZE_X, 1),
-    //             input_gpu.clone().into_tensor_arg(),
-    //             out.clone().into_tensor_arg(),
-    //         );
-    //     }
-    //     let o = out.read(&client).unwrap();
-    //     println!("acc(0|f_new)     = {}  (expect 1)", o[0]);
-    //     println!("0|f_old          = {}  (expect 0)", o[1]);
-    //     println!("gate new|new     = {}  (expect 1)", o[2]);
-    //     println!("gate new|old     = {}  (expect 1)", o[3]);
-    //     println!("gate old|old     = {}  (expect 0)", o[4]);
-    //     println!("7 * (new|old)    = {}  (expect 7)", o[5]);
-    //     println!("7 * (old|old)    = {}  (expect 0)", o[6]);
-    // }
-
-    // #[cube(launch_unchecked)]
-    // fn debug_fix_constructs(input: &Tensor<u32>, out: &mut Tensor<u32>) {
-    //     let tx = UNIT_POS_X;
-    //     let pid_mask = 0x7FFFFFFFu32;
-    //     let mut sh_pid = SharedMemory::<u32>::new(32usize);
-    //     let mut sh_flag = SharedMemory::<u32>::new(32usize);
-    //     sh_pid[tx as usize] = input[tx as usize] & pid_mask;
-    //     sh_flag[tx as usize] = input[tx as usize] >> 31;
-    //     sync_cube();
-    //     if tx == 0u32 {
-    //         let p0 = sh_pid[0usize]; // 130
-    //         let p1 = sh_pid[1usize]; // 494
-    //         let p2 = sh_pid[2usize]; // 130
-    //         let f0 = sh_flag[0usize]; // 1
-    //         let f3 = sh_flag[3usize]; // 0
-
-    //         // masked-pid comparisons (the gate the fix relies on)
-    //         out[0usize] = if p0 != p1 { 1u32 } else { 0u32 }; // expect 1
-    //         out[1usize] = if p0 != p2 { 1u32 } else { 0u32 }; // expect 0
-
-    //         // branch on OR of flags (optional optimisation, pair gate)
-    //         out[2usize] = if (f0 | f3) != 0u32 { 1u32 } else { 0u32 }; // expect 1
-    //         out[3usize] = if (f3 | f3) != 0u32 { 1u32 } else { 0u32 }; // expect 0
-
-    //         // has_new via OR-accumulation then compare (optional, early exit)
-    //         let mut hn = 0u32;
-    //         hn = hn | f0;
-    //         out[4usize] = if hn == 0u32 { 0u32 } else { 1u32 }; // expect 1
-    //         let mut ho = 0u32;
-    //         ho = ho | f3;
-    //         out[5usize] = if ho == 0u32 { 0u32 } else { 1u32 }; // expect 0
-    //     }
-    // }
-
-    // #[test]
-    // fn test_debug_fix_constructs() {
-    //     let Some(device) = try_device() else {
-    //         eprintln!("Skipping: no wgpu backend");
-    //         return;
-    //     };
-    //     let client = WgpuRuntime::client(&device);
-    //     let mut input = vec![0u32; 32];
-    //     input[0] = 0x80000082; // pid 130, new
-    //     input[1] = 0x800001EE; // pid 494, new
-    //     input[2] = 0x80000082; // pid 130, new
-    //     input[3] = 0x7FFFFFFF; // sentinel, old
-    //     let input_gpu = GpuTensor::<WgpuRuntime, u32>::from_slice(&input, vec![32], &client);
-    //     let out = GpuTensor::<WgpuRuntime, u32>::from_slice(&[0u32; 6], vec![6], &client);
-    //     unsafe {
-    //         debug_fix_constructs::launch_unchecked::<WgpuRuntime>(
-    //             &client,
-    //             CubeCount::Static(1, 1, 1),
-    //             CubeDim::new_2d(WORKGROUP_SIZE_X, 1),
-    //             input_gpu.clone().into_tensor_arg(),
-    //             out.clone().into_tensor_arg(),
-    //         );
-    //     }
-    //     let o = out.read(&client).unwrap();
-    //     println!("p0!=p1   = {}  (expect 1)", o[0]);
-    //     println!("p0!=p2   = {}  (expect 0)", o[1]);
-    //     println!("(f0|f3)!=0 = {}  (expect 1)", o[2]);
-    //     println!("(f3|f3)!=0 = {}  (expect 0)", o[3]);
-    //     println!("hn(OR)!=0  = {}  (expect 1)", o[4]);
-    //     println!("ho(OR)==0  = {}  (expect 0)", o[5]);
-    // }
-
-    // #[cube(launch_unchecked)]
-    // fn repro_ne(input: &Tensor<u32>, out: &mut Tensor<u32>) {
-    //     if UNIT_POS_X != 0u32 {
-    //         terminate!();
-    //     }
-    //     let a = input[0usize]; // 130
-    //     let b = input[1usize]; // 494
-    //     out[0usize] = if a != b { 1u32 } else { 0u32 }; // expect 1
-    //     out[1usize] = if a == b { 1u32 } else { 0u32 }; // expect 0
-    //     out[2usize] = a;
-    //     out[3usize] = b;
-    // }
-
-    // #[test]
-    // fn test_repro_ne() {
-    //     let Some(device) = try_device() else {
-    //         eprintln!("Skipping: no wgpu backend");
-    //         return;
-    //     };
-    //     let client = WgpuRuntime::client(&device);
-    //     let input = GpuTensor::<WgpuRuntime, u32>::from_slice(&[130u32, 494u32], vec![2], &client);
-    //     let out = GpuTensor::<WgpuRuntime, u32>::from_slice(&[0u32; 4], vec![4], &client);
-    //     unsafe {
-    //         repro_ne::launch_unchecked::<WgpuRuntime>(
-    //             &client,
-    //             CubeCount::Static(1, 1, 1),
-    //             CubeDim::new_2d(WORKGROUP_SIZE_X, 1),
-    //             input.clone().into_tensor_arg(),
-    //             out.clone().into_tensor_arg(),
-    //         );
-    //     }
-    //     let o = out.read(&client).unwrap();
-    //     println!("a!=b = {}  (expect 1)", o[0]);
-    //     println!("a==b = {}  (expect 0)", o[1]);
-    //     println!("a    = {}  b = {}", o[2], o[3]);
-    // }
-
-    // #[cube(launch_unchecked)]
-    // fn repro_if_kinds(input: &Tensor<u32>, out: &mut Tensor<u32>) {
-    //     if UNIT_POS_X != 0u32 {
-    //         terminate!();
-    //     }
-    //     let a = input[0usize]; // 130
-    //     let b = input[1usize]; // 494
-
-    //     // statement-if, no else: body should run (a != b is true)
-    //     out[0usize] = 7u32;
-    //     if a != b {
-    //         out[0usize] = 1u32;
-    //     }
-
-    //     // statement-if, condition false: body should NOT run (a == b is false)
-    //     out[1usize] = 7u32;
-    //     if a == b {
-    //         out[1usize] = 1u32;
-    //     }
-
-    //     // expression-if for reference
-    //     out[2usize] = if a != b { 1u32 } else { 0u32 };
-
-    //     // while with runtime bound (expected to work)
-    //     let mut c = 0u32;
-    //     let mut i = 0u32;
-    //     while i < b {
-    //         c += 1u32;
-    //         i += 1u32;
-    //     }
-    //     out[3usize] = c;
-    // }
-
-    // #[test]
-    // fn test_repro_if_kinds() {
-    //     let Some(device) = try_device() else {
-    //         eprintln!("Skipping: no wgpu backend");
-    //         return;
-    //     };
-    //     let client = WgpuRuntime::client(&device);
-    //     let input = GpuTensor::<WgpuRuntime, u32>::from_slice(&[130u32, 494u32], vec![2], &client);
-    //     let out = GpuTensor::<WgpuRuntime, u32>::from_slice(&[0u32; 4], vec![4], &client);
-    //     unsafe {
-    //         repro_if_kinds::launch_unchecked::<WgpuRuntime>(
-    //             &client,
-    //             CubeCount::Static(1, 1, 1),
-    //             CubeDim::new_2d(WORKGROUP_SIZE_X, 1),
-    //             input.clone().into_tensor_arg(),
-    //             out.clone().into_tensor_arg(),
-    //         );
-    //     }
-    //     let o = out.read(&client).unwrap();
-    //     println!("stmt-if true  -> {}  (expect 1, broken if 7)", o[0]);
-    //     println!("stmt-if false -> {}  (expect 7, broken if 1)", o[1]);
-    //     println!("expr-if       -> {}  (expect 1, regression if 0)", o[2]);
-    //     println!("while count   -> {}  (expect 494)", o[3]);
-    // }
 }

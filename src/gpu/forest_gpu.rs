@@ -108,6 +108,77 @@ fn compute_dot_products<F: AnnSearchGpuFloat, N: Size>(
     dot_values[idx as usize] = sum;
 }
 
+/// Project every point onto all of a tree's random vectors in one pass.
+///
+/// The per-level kernel this replaces read the whole vector matrix once per
+/// level, because it computed one projection at a time. The projections do not
+/// depend on the partitioning at all: `random_vec` for a level is derived
+/// purely from the tree seed and the level index, so all `n_levels` of them are
+/// known before the first one is needed. Only the median-and-scatter step is
+/// sequential across levels.
+///
+/// Reading each point's row once and accumulating `n_levels` dot products cuts
+/// vector traffic by `n_levels` and collapses `n_levels` launches and readbacks
+/// into one. The projection rows are read from global rather than staged in
+/// shared memory: every thread reads the same element at the same time, so they
+/// broadcast from cache, and staging would put a `n_levels * dim` ceiling on
+/// the kernel.
+///
+/// ### Params
+///
+/// * `vectors` - Row-major vector matrix `[n_pts, dim/N]` as `Vector<F, N>`
+/// * `projections` - Random projection vectors `[n_levels, dim/N]`
+/// * `dot_values` - Output `[n_levels, n_pts]`, level-major so each level's
+///   block is contiguous and can be sliced for the host-side median pass
+/// * `n_pts` - Number of points
+/// * `dim_lines` - `Vector<F, N>` elements per row (comptime)
+/// * `n_levels` - Tree depth, i.e. number of projections (comptime)
+///
+/// ### Grid mapping
+///
+/// * `ABSOLUTE_POS_X` -> point index
+#[cube(launch_unchecked)]
+fn compute_dot_products_multi<F: AnnSearchGpuFloat, N: Size>(
+    vectors: &Tensor<Vector<F, N>>,
+    projections: &Tensor<Vector<F, N>>,
+    dot_values: &mut Tensor<F>,
+    n_pts: u32,
+    #[comptime] dim_lines: usize,
+    #[comptime] n_levels: usize,
+) {
+    let idx = (CUBE_POS_Y * CUBE_COUNT_X + CUBE_POS_X) * WORKGROUP_SIZE_X + UNIT_POS_X;
+    if idx >= n_pts {
+        terminate!();
+    }
+    let lanes = LINE_SIZE;
+    let off = idx as usize * dim_lines;
+
+    let mut acc = Array::<F>::new(n_levels);
+    #[unroll]
+    for l in 0..n_levels {
+        acc[l] = F::new(0.0_f32);
+    }
+
+    for i in 0..dim_lines {
+        let v = vectors[off + i];
+        #[unroll]
+        for l in 0..n_levels {
+            let r = projections[l * dim_lines + i];
+            let prod = v * r;
+            #[unroll]
+            for lane in 0..lanes {
+                acc[l] += prod[lane];
+            }
+        }
+    }
+
+    // Level-major write: consecutive threads hit consecutive addresses.
+    #[unroll]
+    for l in 0..n_levels {
+        dot_values[l * n_pts as usize + idx as usize] = acc[l];
+    }
+}
+
 /// Partition points by comparing dot products against per-partition medians.
 ///
 /// ### Params
@@ -156,7 +227,7 @@ fn partition_points<F: AnnSearchGpuFloat>(
 ///
 /// ### Returns
 ///
-/// Maximum number of points per leaf, clamped to `[2, 64]`
+/// Maximum number of points per leaf, clamped to `[2, 256]`
 fn compute_max_leaf_size(dim_padded: usize) -> usize {
     let line = LINE_SIZE;
     let dim_scalars = (dim_padded / line) * 4;
@@ -274,81 +345,81 @@ pub fn leaf_pairwise_proposals<F: AnnSearchGpuFloat, N: Size>(
     sync_cube();
 
     let k = graph_dist.shape(1usize);
-    let num_pairs = (leaf_size * (leaf_size - 1u32)) / 2u32;
-    let mut pair_idx = tx;
 
-    while pair_idx < num_pairs {
-        let mut rem = pair_idx as usize;
-        let mut ii = 0usize;
-        let mut step = leaf_size as usize - 1usize;
+    // Walk the upper triangle by row rather than by flat pair index. The old
+    // form decoded a flat index with a `while rem >= step` loop that ran up to
+    // `leaf_size` times *per pair per thread*: at leaf_size 124 that is ~29k
+    // serial steps per thread against ~15k FMAs of actual distance work, so the
+    // indexing cost more than the computation. Striding rows by
+    // WORKGROUP_SIZE_X costs some load imbalance and removes the decode.
+    let mut ii = tx as usize;
 
-        while rem >= step {
-            rem -= step;
-            ii += 1usize;
-            step = leaf_size as usize - 1usize - ii;
-        }
-        let jj = ii + 1usize + rem;
-
+    while ii < leaf_size as usize {
         let pid_i = shared_pids[ii];
-        let pid_j = shared_pids[jj];
+        let thresh_i = graph_dist[pid_i as usize * k + k - 1usize];
 
-        if pid_i != pid_j && pid_i < n_pts && pid_j < n_pts {
-            let mut sum = F::new(0.0_f32);
-            let mut s = 0usize;
-            while s < dim_scalars {
-                let va = shared_vecs[ii * dim_scalars + s];
-                let vb = shared_vecs[jj * dim_scalars + s];
-                if use_cosine {
-                    sum += va * vb;
-                } else {
-                    let diff = va - vb;
-                    sum += diff * diff;
+        let mut jj = ii + 1usize;
+        while jj < leaf_size as usize {
+            let pid_j = shared_pids[jj];
+
+            if pid_i != pid_j && pid_i < n_pts && pid_j < n_pts {
+                let mut sum = F::new(0.0_f32);
+                #[unroll]
+                for s in 0..dim_scalars {
+                    let va = shared_vecs[ii * dim_scalars + s];
+                    let vb = shared_vecs[jj * dim_scalars + s];
+                    if use_cosine {
+                        sum += va * vb;
+                    } else {
+                        let diff = va - vb;
+                        sum += diff * diff;
+                    }
                 }
-                s += 1usize;
-            }
 
-            let dist = if use_cosine {
-                F::new(1.0_f32) - (sum / (shared_norms[ii] * shared_norms[jj]))
-            } else {
-                sum
-            };
-
-            let thresh_i = graph_dist[pid_i as usize * k + k - 1usize];
-            if dist < thresh_i {
-                let slot = prop_count[pid_i as usize].fetch_add(1u32);
-                if slot < max_proposals {
-                    let off = pid_i as usize * max_proposals as usize + slot as usize;
-                    prop_idx[off] = pid_j;
-                    prop_dist[off] = dist;
+                let dist = if use_cosine {
+                    F::new(1.0_f32) - (sum / (shared_norms[ii] * shared_norms[jj]))
                 } else {
-                    let rand = xorshift32(pid_i ^ slot ^ pid_j) % (slot + 1u32);
-                    if rand < max_proposals {
-                        let off = pid_i as usize * max_proposals as usize + rand as usize;
+                    sum
+                };
+
+                if dist < thresh_i {
+                    let slot = prop_count[pid_i as usize].fetch_add(1u32);
+                    if slot < max_proposals {
+                        let off = pid_i as usize * max_proposals as usize + slot as usize;
                         prop_idx[off] = pid_j;
                         prop_dist[off] = dist;
+                    } else {
+                        let rand = xorshift32(pid_i ^ slot ^ pid_j) % (slot + 1u32);
+                        if rand < max_proposals {
+                            let off = pid_i as usize * max_proposals as usize + rand as usize;
+                            prop_idx[off] = pid_j;
+                            prop_dist[off] = dist;
+                        }
                     }
                 }
-            }
 
-            let thresh_j = graph_dist[pid_j as usize * k + k - 1usize];
-            if dist < thresh_j {
-                let slot = prop_count[pid_j as usize].fetch_add(1u32);
-                if slot < max_proposals {
-                    let off = pid_j as usize * max_proposals as usize + slot as usize;
-                    prop_idx[off] = pid_i;
-                    prop_dist[off] = dist;
-                } else {
-                    let rand = xorshift32(pid_j ^ slot ^ pid_i) % (slot + 1u32);
-                    if rand < max_proposals {
-                        let off = pid_j as usize * max_proposals as usize + rand as usize;
+                let thresh_j = graph_dist[pid_j as usize * k + k - 1usize];
+                if dist < thresh_j {
+                    let slot = prop_count[pid_j as usize].fetch_add(1u32);
+                    if slot < max_proposals {
+                        let off = pid_j as usize * max_proposals as usize + slot as usize;
                         prop_idx[off] = pid_i;
                         prop_dist[off] = dist;
+                    } else {
+                        let rand = xorshift32(pid_j ^ slot ^ pid_i) % (slot + 1u32);
+                        if rand < max_proposals {
+                            let off = pid_j as usize * max_proposals as usize + rand as usize;
+                            prop_idx[off] = pid_i;
+                            prop_dist[off] = dist;
+                        }
                     }
                 }
             }
+
+            jj += 1usize;
         }
 
-        pair_idx += WORKGROUP_SIZE_X;
+        ii += WORKGROUP_SIZE_X as usize;
     }
 }
 
@@ -657,9 +728,6 @@ where
     let all_tree_results: TreeResults<T> = (0..n_trees)
         .into_par_iter()
         .map(|tree_idx| {
-            // allocate the GPU buffer inside the parallel closure so each tree
-            // has an isolated buffer, preventing thread contention on the client.
-            let dot_values_gpu = GpuTensor::<R, T>::empty(vec![n], client);
             let tree_seed =
                 (seed as u64).wrapping_add((tree_idx as u64).wrapping_mul(0x9E3779B97F4A7C15u64));
             let save_routing = tree_idx < n_router_trees;
@@ -674,11 +742,16 @@ where
             } else {
                 None
             };
+            // All projections are known upfront: each is a function of the
+            // tree seed and the level index only, never of the partitioning.
+            // So they are generated in one go and applied in a single kernel,
+            // instead of one launch plus one blocking readback per level.
+            let mut projections_flat = vec![T::zero(); max_depth * dim_padded];
+            let mut level_vecs: Vec<Vec<T>> = Vec::with_capacity(max_depth);
             for level in 0..max_depth {
                 let level_seed =
                     tree_seed.wrapping_add((level as u64).wrapping_mul(0x517CC1B727220A95u64));
                 let mut rng = SmallRng::seed_from_u64(level_seed);
-                // generate and normalise random projection vector
                 let mut random_vec = vec![T::zero(); dim];
                 for v in random_vec.iter_mut() {
                     *v = T::from_f64(rng.random_range(-1.0..1.0)).unwrap();
@@ -690,30 +763,40 @@ where
                         *x /= norm;
                     }
                 }
-                // pad to dim_padded for the GPU kernel's vector layout
-                let mut random_vec_padded = vec![T::zero(); dim_padded];
-                random_vec_padded[..dim].copy_from_slice(&random_vec);
-                let random_vec_gpu =
-                    GpuTensor::<R, T>::from_slice(&random_vec_padded, vec![dim_padded], client);
-                // GPU dot products (2.8M threads, ~2ms per launch)
-                unsafe {
-                    compute_dot_products::launch_unchecked::<T, R>(
-                        client,
-                        CubeCount::Static(dot_grid_x, dot_grid_y, 1),
-                        CubeDim::new_2d(WORKGROUP_SIZE_X, 1),
-                        line,
-                        vectors_gpu.clone().into_tensor_arg(),
-                        random_vec_gpu.into_tensor_arg(),
-                        dot_values_gpu.clone().into_tensor_arg(),
-                        n as u32,
-                        dim_vec,
-                    );
-                }
-                // Read back dot values (~11MB, blocking but overlapped by Rayon)
-                let dot_values = dot_values_gpu.clone().read(client)?;
+                projections_flat[level * dim_padded..level * dim_padded + dim]
+                    .copy_from_slice(&random_vec);
+                level_vecs.push(random_vec);
+            }
+
+            let projections_gpu = GpuTensor::<R, T>::from_slice(
+                &projections_flat,
+                vec![max_depth, dim_padded],
+                client,
+            );
+            let all_dots_gpu = GpuTensor::<R, T>::empty(vec![max_depth, n], client);
+            unsafe {
+                compute_dot_products_multi::launch_unchecked::<T, R>(
+                    client,
+                    CubeCount::Static(dot_grid_x, dot_grid_y, 1),
+                    CubeDim::new_2d(WORKGROUP_SIZE_X, 1),
+                    line,
+                    vectors_gpu.clone().into_tensor_arg(),
+                    projections_gpu.into_tensor_arg(),
+                    all_dots_gpu.clone().into_tensor_arg(),
+                    n as u32,
+                    dim_vec,
+                    max_depth,
+                );
+            }
+            // One readback for the whole tree rather than one per level.
+            let all_dots = all_dots_gpu.read(client)?;
+
+            for (level, random_vec) in level_vecs.into_iter().enumerate() {
+                // Level-major layout, so each level's block is contiguous.
+                let dot_values = &all_dots[level * n..(level + 1) * n];
                 // CPU median computation (fast, O(n), parallelised internally)
                 let n_partitions = 1usize << level;
-                let medians = compute_partition_medians(&partition_ids, &dot_values, n_partitions);
+                let medians = compute_partition_medians(&partition_ids, dot_values, n_partitions);
                 // CPU partition update (trivial parallel scatter)
                 partition_ids
                     .par_iter_mut()
@@ -866,6 +949,7 @@ where
                 update_counter_gpu.clone().into_tensor_arg(),
                 n as u32,
                 MAX_PROPOSALS as u32,
+                graph_idx_gpu.shape()[1],
             );
         }
     }
@@ -907,6 +991,76 @@ mod tests {
 
     // For testing the code with 32 dimension
     const MAX_LEAF_SIZE: usize = 128;
+
+    #[test]
+    fn test_dot_products_multi_matches_single() {
+        let Some(device) = try_device() else {
+            eprintln!("Skipping: no wgpu backend");
+            return;
+        };
+        let client = WgpuRuntime::client(&device);
+        let line = LINE_SIZE;
+        let n = 133usize;
+        let dim = 16usize;
+        let dim_vec = dim / line;
+        let n_levels = 5usize;
+
+        let data: Vec<f32> = (0..n * dim).map(|i| ((i * 31 + 7) % 23) as f32 * 0.13).collect();
+        let projections: Vec<f32> = (0..n_levels * dim)
+            .map(|i| ((i * 17 + 3) % 19) as f32 * 0.21 - 1.0)
+            .collect();
+
+        let vectors_gpu = GpuTensor::<WgpuRuntime, f32>::from_slice(&data, vec![n, dim], &client);
+        let proj_gpu =
+            GpuTensor::<WgpuRuntime, f32>::from_slice(&projections, vec![n_levels, dim], &client);
+        let multi_gpu = GpuTensor::<WgpuRuntime, f32>::empty(vec![n_levels, n], &client);
+
+        let grid = (n as u32).div_ceil(WORKGROUP_SIZE_X);
+        unsafe {
+            compute_dot_products_multi::launch_unchecked::<f32, WgpuRuntime>(
+                &client,
+                CubeCount::Static(grid, 1, 1),
+                CubeDim::new_2d(WORKGROUP_SIZE_X, 1),
+                line,
+                vectors_gpu.clone().into_tensor_arg(),
+                proj_gpu.into_tensor_arg(),
+                multi_gpu.clone().into_tensor_arg(),
+                n as u32,
+                dim_vec,
+                n_levels,
+            );
+        }
+        let multi = multi_gpu.read(&client).unwrap();
+
+        // Same projections, one level at a time, through the reference kernel.
+        for level in 0..n_levels {
+            let rvec = projections[level * dim..(level + 1) * dim].to_vec();
+            let rvec_gpu = GpuTensor::<WgpuRuntime, f32>::from_slice(&rvec, vec![dim], &client);
+            let single_gpu = GpuTensor::<WgpuRuntime, f32>::empty(vec![n], &client);
+            unsafe {
+                compute_dot_products::launch_unchecked::<f32, WgpuRuntime>(
+                    &client,
+                    CubeCount::Static(grid, 1, 1),
+                    CubeDim::new_2d(WORKGROUP_SIZE_X, 1),
+                    line,
+                    vectors_gpu.clone().into_tensor_arg(),
+                    rvec_gpu.into_tensor_arg(),
+                    single_gpu.clone().into_tensor_arg(),
+                    n as u32,
+                    dim_vec,
+                );
+            }
+            let single = single_gpu.read(&client).unwrap();
+            for i in 0..n {
+                let a = multi[level * n + i];
+                let b = single[i];
+                assert!(
+                    (a - b).abs() <= 1e-4 * b.abs().max(1.0),
+                    "level {level} point {i}: multi {a}, single {b}"
+                );
+            }
+        }
+    }
 
     #[test]
     fn test_dot_products_basic() {

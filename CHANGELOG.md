@@ -10,6 +10,94 @@
 - Updated the diversification in NNDescent to be more useful. Instead of just
   pruning the graph, it now keeps the desired node degree but yields a better
   graph.
+- Register-tiled distance kernels for the GPU exhaustive path,
+  `euclidean_tiled_reg` and `cosine_tiled_reg`. Each thread computes a 4x4
+  block of the distance matrix instead of a single entry, cutting memory
+  operations per FMA from 1.25 to 0.3125. Measured 2.2x at dim=32, 1.9x at 64,
+  1.8x at 128 and 1.4x at 512 on the kernel, and ~1.7x end to end. Bit-exact
+  against the untiled kernels. The untiled versions stay as the fallback for
+  dim 1025-2048, where the query tile is too short to divide.
+- The GPU benches now report device limits, cross-check every kernel against a
+  reference before timing it, and assert the output is real. Every launch in
+  the crate is `launch_unchecked`, which returns zeros and reports no error
+  when it busts a device limit.
+
+- The IVF centroid probe uses the tiled kernels too: 1.58 -> 1.00 ms/launch
+  Euclidean, 1.50 -> 0.80 ms/launch cosine. The IVF *mega* kernels do not.
+  Tiled variants were written and measured 1.8x slower, so they were dropped;
+  see the note at the launch site. Same technique, opposite result, because
+  those kernels bind one task per y-row with its own cluster extent.
+
+**Fixes**
+
+- `extract_topk` held its running top-k in global memory, so it re-read the
+  k-th distance on every column of the chunk and the whole k-row on every
+  accepted candidate. Now staged in registers and flushed once. 26% off the
+  kernel, 6-13% off the exhaustive pipeline.
+- The IVF task list is now grouped by cluster rather than by query. The mega
+  kernel binds one task per `UNIT_POS_Y` row, so ordered by query a cube was
+  one query against `wg_y` different clusters: every row read a disjoint DB
+  region and nothing was reused. Grouped by cluster it is `wg_y` queries
+  against one cluster, so the DB tile is read once and reused across rows.
+  Mega kernel 4 422 -> 3 057 ms over the gridsearch (1.45x), self-kNN queries
+  1.28-1.38x faster end to end, recall unchanged to four decimal places.
+  The previous `sort_unstable_by_key(|t| t.0)` was a no-op: the build loop
+  already emitted queries in ascending order. Also dropped the intermediate
+  `Vec` of tuples and the four map-collect passes that split it.
+- `local_join_shared`, `two_hop_refinement` and `cagra_rank_prune_shared`
+  dispatched a hardcoded 65535 cubes in x regardless of `n`, wasting 6.5x at
+  n=10k and ~31% at n=100k. They use `grid_2d` now, like every other launch.
+- `TopkCoalescedBench` was defined but never constructed, in every revision
+  since it was added, so the coalesced-vs-serial top-k comparison the bench
+  advertised had never run. It runs now, and the coalesced kernel loses by 32%
+  on wgpu/Metal. Recorded in the kernel docs so it does not get re-litigated.
+
+- The IVF candidate buffers are reused across query batches instead of being
+  allocated per batch. The mega kernel's first write to a fresh allocation
+  faults in ~1.4 GB at 15k queries: an identical second launch over the same
+  buffers runs in 22.3 ms against 61.1 ms for the first, and the isolated
+  kernel time is 22.6 ms, so nearly two thirds of the apparent cost was paging,
+  not compute. Adds `GpuTensor::reshaped_view` to alias one allocation under
+  several shapes. Single-batch queries cannot benefit; multi-batch self-kNN
+  gains a few percent more on top of the cluster grouping.
+
+- Index build is ~1.95x faster at 500k x 64D (5.10s -> 2.61s), from five
+  kernel fixes:
+  - `leaf_pairwise_proposals` and `local_join_shared` walked the candidate
+    upper triangle by flat pair index, decoding each one with a serial loop
+    that ran up to `leaf_size` times *per pair per thread*. At leaf_size 124
+    that is ~29k serial steps against ~15k FMAs, so the indexing cost more
+    than the distance computation it was indexing. Now walked by row.
+    2.2x and 1.4x on those kernels.
+  - `two_hop_refinement` re-read the node's own neighbour row from global
+    memory once per candidate, k^3 loads per node of a row every thread in
+    the cube shares, and re-issued each vector load four times by indexing
+    scalars instead of lines. Row staged in shared memory, loop vectorised,
+    node norm hoisted. 3.7x.
+  - `merge_proposals` scanned and shifted the graph row in global memory for
+    every proposal, up to `MAX_PROPOSALS` times per node. Row staged in
+    registers and flushed once. 1.5x.
+  Recall shifts by under 0.001: the traversal order changes which proposals
+  survive when a node overflows `MAX_PROPOSALS`, so the graph differs slightly
+  by construction.
+  - Forest tree construction projected the data onto one random vector per
+    level, so it read the whole vector matrix `max_depth` times and blocked on
+    a readback after each. The projections never depend on the partitioning,
+    only on the tree seed and level index, so they are now applied in a single
+    kernel writing `[max_depth, n]` level-major, with one readback per tree.
+    Only the median-and-scatter step stays sequential. Tree construction
+    1.11s -> 369ms (3.0x); the dot-product kernel drops from 347ms over 260
+    launches to 36ms over 20.
+- `GpuTensor::shape` and `GpuTensor::len` / `is_empty` accessors.
+
+**Housekeeping**
+
+- Removed `compute_ivf_mega_cosine` (no call sites, no tests), the unused
+  `xorshift_search` helper, a duplicate `pad_vectors` shadowing the one in
+  `gpu::mod`, and ~915 lines of commented-out cubecl debug kernels. The
+  findings from that debugging are distilled into four codegen rules in the
+  `nndescent_gpu` module header.
+
 
 ## 0.4.4
 
