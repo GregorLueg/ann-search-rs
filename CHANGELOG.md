@@ -55,6 +55,27 @@
   several shapes. Single-batch queries cannot benefit; multi-batch self-kNN
   gains a few percent more on top of the cluster grouping.
 
+- Index build is ~1.5x faster at 500k x 64D (5.10s -> 3.40s), from four
+  kernel fixes:
+  - `leaf_pairwise_proposals` and `local_join_shared` walked the candidate
+    upper triangle by flat pair index, decoding each one with a serial loop
+    that ran up to `leaf_size` times *per pair per thread*. At leaf_size 124
+    that is ~29k serial steps against ~15k FMAs, so the indexing cost more
+    than the distance computation it was indexing. Now walked by row.
+    2.2x and 1.4x on those kernels.
+  - `two_hop_refinement` re-read the node's own neighbour row from global
+    memory once per candidate, k^3 loads per node of a row every thread in
+    the cube shares, and re-issued each vector load four times by indexing
+    scalars instead of lines. Row staged in shared memory, loop vectorised,
+    node norm hoisted. 3.7x.
+  - `merge_proposals` scanned and shifted the graph row in global memory for
+    every proposal, up to `MAX_PROPOSALS` times per node. Row staged in
+    registers and flushed once. 1.5x.
+  Recall shifts by under 0.001: the traversal order changes which proposals
+  survive when a node overflows `MAX_PROPOSALS`, so the graph differs slightly
+  by construction.
+- `GpuTensor::shape` and `GpuTensor::len` / `is_empty` accessors.
+
 **Housekeeping**
 
 - Removed `compute_ivf_mega_cosine` (no call sites, no tests), the unused
