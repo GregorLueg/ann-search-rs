@@ -29,19 +29,6 @@ pub const WORKGROUP_SIZE_X: u32 = 32;
 pub const LINE_SIZE: usize = 4;
 
 /// DB vectors per thread in the register-tiled distance kernel.
-///
-/// The untiled kernel issues one vectorised global load plus `LINE_SIZE`
-/// shared loads per `LINE_SIZE` FMAs: 1.25 memory operations per FMA. It
-/// measures a flat 520-580 GFLOP/s across dim=32..512 on an M1 Max, about
-/// 5.5% of f32 peak, while using only ~9% of memory bandwidth, so it is bound
-/// by memory-op issue count rather than by compute or bandwidth.
-///
-/// A `TILE_D x TILE_Q` tile drops the ratio to
-/// `(TILE_D + TILE_Q * LINE_SIZE) / (TILE_D * TILE_Q * LINE_SIZE)`, which is
-/// 0.3125 at 4x4. Measured against the untiled kernel, bit-exact: 2.21x at
-/// dim=32, 1.94x at 64, 1.79x at 128, 1.43x at 512. The gain tapers at high
-/// dim because `pick_wg_y` shrinks the query tile, leaving fewer threads per
-/// cube.
 pub const TILE_D: usize = 4;
 
 /// Query vectors per thread in the register-tiled distance kernel.
@@ -114,27 +101,6 @@ const LOCAL_JOIN_FIXED_BYTES: usize = 3 * 4;
 
 /// Plan how the NNDescent local join stages candidate vectors in shared memory.
 ///
-/// `local_join_shared` used to stage all `2 * build_k` candidate vectors at
-/// once, which costs `2 * build_k * ((dim_padded + 1) * size_of::<T>() + 8)`
-/// bytes. Nothing checked that against the device limit (32768 bytes on an
-/// M1 Max), and a `launch_unchecked` dispatch that busts it does no work,
-/// reports no error and leaves the graph at its forest initialisation. Measured
-/// on that machine before this helper existed:
-///
-/// | k  | dim | build_k | bytes | iteration-1 updates |
-/// |----|-----|---------|-------|---------------------|
-/// | 15 | 160 | 22      | 28688 | 142274              |
-/// | 15 | 192 | 22      | 34320 | 0 (silent no-op)    |
-/// | 30 | 64  | 45      | 24120 | 383725              |
-/// | 30 | 128 | 45      | 47160 | 0 (silent no-op)    |
-///
-/// Since `k` defaults to 30, the default configuration was silently broken from
-/// dim 128 upwards. The fix keeps the candidate metadata staged in full (it is
-/// only `max_cands * (8 + size_of::<T>())` bytes) and blocks the vectors into
-/// two buffers of `block` candidates each, walked as block pairs `(bi, bj)`
-/// with `bi <= bj`. When all candidates fit in one buffer the kernel takes the
-/// original unblocked path and the second buffer is allocated with length 1.
-///
 /// ### Params
 ///
 /// * `dim_padded` - Padded embedding dimensionality (multiple of `LINE_SIZE`)
@@ -203,27 +169,6 @@ pub struct TopkMergePlan {
 }
 
 /// Plan how the coalesced top-k reducers stage per-lane lists in shared memory.
-///
-/// `reduce_ivf_topk_coalesced` and `extract_topk_coalesced` used to have all
-/// `WORKGROUP_SIZE_X` lanes write their private top-k list into shared memory
-/// at once, costing `WORKGROUP_SIZE_X * k * (size_of::<F>() + 4)` bytes. Nothing
-/// checked that against the device limit (32768 bytes on an M1 Max), so the
-/// dispatch silently did no work above `k = 128` and the host then read
-/// uninitialised VRAM as indices. Measured on that machine before this helper
-/// existed, at 20k samples:
-///
-/// | k   | bytes | outcome                                      |
-/// |-----|-------|----------------------------------------------|
-/// | 100 | 25600 | IVF-GPU recall 0.9605                         |
-/// | 150 | 38400 | panic, index 1151964186 (f32 bits of 1356.63) |
-///
-/// The fix folds the lanes in groups of `group` instead: each round stages that
-/// many lists and merges them into a running accumulator list, so the footprint
-/// is `(group + 1) * k * (size_of::<F>() + 4)` regardless of `k`. `group` is
-/// kept a power of two dividing `WORKGROUP_SIZE_X` so every round is full, which
-/// costs at most a factor two of the budget and removes the partial-group case
-/// entirely. When all lanes fit at once the kernel takes the original path with
-/// its original footprint, so anything up to `k = 128` is unchanged.
 ///
 /// ### Params
 ///

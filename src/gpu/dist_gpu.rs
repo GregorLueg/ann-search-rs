@@ -223,24 +223,6 @@ pub fn cosine_tiled<F: Float, N: Size>(
 /// Each thread computes a `tile_q x tile_d` block of the distance matrix
 /// instead of a single entry, so each loaded value feeds several FMAs.
 ///
-/// ### Why this shape
-///
-/// `euclidean_tiled` issues one vectorised global load plus `LINE_SIZE` shared
-/// loads per `LINE_SIZE` FMAs, a ratio of 1.25 memory operations per FMA. It
-/// measures a flat 520-580 GFLOP/s across dim=32..512 on an M1 Max, roughly
-/// 5.5% of f32 peak, while moving only ~36 GB/s of a ~400 GB/s budget. Neither
-/// compute nor bandwidth bound: it is bound by memory-op issue count. Tiling
-/// drops the ratio to `(tile_d + tile_q * LINE_SIZE) / (tile_d * tile_q *
-/// LINE_SIZE)`, which is 0.3125 at 4x4, a 4x reduction.
-///
-/// The DB access pattern is deliberately identical to `euclidean_tiled`: the
-/// `tile_d` rows owned by a thread are strided by `WORKGROUP_SIZE_X`, so
-/// adjacent lanes still touch adjacent rows. The gather was measured as not the
-/// bottleneck, so it is left alone.
-///
-/// Shared memory is also unchanged at `wg_y * dim_scalars`, so `pick_wg_y`
-/// remains valid without modification.
-///
 /// ### Params
 ///
 /// * `query_vectors` - Query vectors `[n_queries, dim / N]` as `Vector<F, N>`
@@ -557,16 +539,6 @@ pub fn init_topk<F: Float>(
 /// the end, so the per-candidate cost is a single global read of the distance
 /// matrix. The buffer must be pre-initialised with `init_topk`.
 ///
-/// ### Note
-///
-/// The thread mapping here is deliberately uncoalesced: adjacent threads are
-/// `dist_stride` floats apart. A coalesced variant exists
-/// (`extract_topk_coalesced`, one cube per query with a strided scan) and
-/// measures **slower** on wgpu/Metal: 22.1 ms against 16.8 ms at
-/// 8192q x 16384db, k=15, flat across dim=32..512. Its 32-way serial merge on
-/// thread 0 costs more than the coalescing saves. Do not swap them over
-/// without re-measuring; the bench cross-checks both for agreement.
-///
 /// ### Params
 ///
 /// * `distances` - Full distance matrix for this chunk
@@ -643,10 +615,9 @@ pub fn extract_topk<F: Float>(
     }
 }
 
-/// Coalesced top-k extraction. One workgroup per query, threads
-/// cooperate by striding through consecutive columns of the distance
-/// row. Memory accesses are coalesced: adjacent threads read adjacent
-/// elements.
+/// Coalesced top-k extraction. One workgroup per query, threads cooperate by
+/// striding through consecutive columns of the distance row. Memory accesses
+/// are coalesced: adjacent threads read adjacent elements.
 ///
 /// Per-thread top-k kept in local Arrays (registers) during the scan,
 /// copied to shared memory only for the final merge.
@@ -735,12 +706,12 @@ pub fn extract_topk_coalesced<F: Float>(
         col += wg as u32;
     }
 
-    // ── Merge phase: copy to shared memory, thread 0 merges ──
     let mut s_dist = SharedMemory::<F>::new(slots * k);
     let mut s_idx = SharedMemory::<u32>::new(slots * k);
 
     if single_round {
-        // ---- Unchunked fast path -------------------------------------------
+        // -- Unchunked fast path --
+        //
         // Every lane's list fits at once, so this is the original kernel
         // verbatim: `slots == WORKGROUP_SIZE_X` and thread 0's own slot doubles
         // as the accumulator, giving exactly the pre-chunking footprint.
@@ -821,7 +792,8 @@ pub fn extract_topk_coalesced<F: Float>(
             }
         }
     } else {
-        // ---- Chunked merge --------------------------------------------------
+        // -- Chunked merge --
+        //
         // `group` lanes stage their lists per round; thread 0 folds each round
         // into the accumulator list held at slot `group`.
         let acc = group * kr;
@@ -1191,16 +1163,6 @@ where
 /// * `group` - Lanes whose lists are staged per merge round (comptime)
 /// * `single_round` - Whether all lanes fit in one round (comptime)
 /// * `slots` - Number of `k`-element lists in shared memory (comptime)
-///
-/// ### Shared memory
-///
-/// Staging all `WORKGROUP_SIZE_X` lists at once costs
-/// `WORKGROUP_SIZE_X * k * (size_of::<F>() + 4)` bytes, which busts a 32 KiB
-/// device limit above `k = 128`; the dispatch then silently does nothing and
-/// the host reads uninitialised VRAM as indices. The merge is therefore chunked
-/// into rounds of `group` lanes folded into a running accumulator list, sized
-/// by `plan_topk_merge`. When every lane fits the kernel takes the original
-/// unchunked path with its original footprint.
 ///
 /// ### Grid mapping
 ///
@@ -1573,13 +1535,13 @@ pub fn reduce_ivf_topk<F: Float>(
 /// Euclidean mega kernel with shared-memory query caching.
 ///
 /// Same task-based architecture as `compute_ivf_mega_euclidean`, but
-/// cooperatively loads query vectors into scalar shared memory so that
-/// all X-threads in a workgroup row (and Y-threads sharing the same
-/// query) read from shared memory instead of global memory.
+/// cooperatively loads query vectors into scalar shared memory so that all
+/// X-threads in a workgroup row (and Y-threads sharing the same query) read
+/// from shared memory instead of global memory.
 ///
-/// Also caches per-task metadata (q_idx, db_start, write_offset,
-/// db_count) in shared memory to avoid redundant global reads across
-/// the 32 X-threads in each row.
+/// Also caches per-task metadata (q_idx, db_start, write_offset, db_count) in
+/// shared memory to avoid redundant global reads across the 32 X-threads in
+/// each row.
 ///
 /// ### Params
 ///
@@ -1892,11 +1854,6 @@ pub fn compute_ivf_mega_cosine_cached<F: Float, N: Size>(
     out_dists[out_offset] = F::new(1.0_f32) - (dot / (q_norm * d_norm));
     out_indices[out_offset] = real_db_idx;
 }
-
-
-////////////////////
-// Main functions //
-////////////////////
 
 ///////////
 // Tests //

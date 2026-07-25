@@ -191,19 +191,19 @@ case "$KIND" in
             "gpu:cosine:gaussian:32|cargo run --example gridsearch_gpu --release --features gpu -- --distance cosine"
             "gpu:euclidean:correlated:32|cargo run --example gridsearch_gpu --release --features gpu -- --distance euclidean --data correlated"
             "gpu:euclidean:lowrank:32|cargo run --example gridsearch_gpu --release --features gpu -- --distance euclidean --data lowrank"
-            "gpu:euclidean:lowrank:128|cargo run --example gridsearch_gpu --release --features gpu -- --distance euclidean --data lowrank --dim 128"
+            "gpu:euclidean:cell:128|cargo run --example gridsearch_gpu --release --features gpu -- --distance euclidean --data cell --dim 128"
 
             # CPU IVF baselines at larger sizes
-            "ivf:euclidean:lowrank:64:250000|cargo run --example gridsearch_ivf --release -- --distance euclidean --data lowrank --n-samples 250000 --dim 64"
-            "ivf:euclidean:lowrank:128:250000|cargo run --example gridsearch_ivf --release -- --distance euclidean --data lowrank --n-samples 250000 --dim 128"
-            "ivf:euclidean:lowrank:64:500000|cargo run --example gridsearch_ivf --release -- --distance euclidean --data lowrank --n-samples 500000 --dim 64"
-            "ivf:euclidean:lowrank:128:500000|cargo run --example gridsearch_ivf --release -- --distance euclidean --data lowrank --n-samples 500000 --dim 128"
+            "ivf:euclidean:cell:64:250000|cargo run --example gridsearch_ivf --release -- --distance euclidean --data cell --n-samples 250000 --dim 64"
+            "ivf:euclidean:cell:128:250000|cargo run --example gridsearch_ivf --release -- --distance euclidean --data cell --n-samples 250000 --dim 128"
+            "ivf:euclidean:cell:64:500000|cargo run --example gridsearch_ivf --release -- --distance euclidean --data cell --n-samples 500000 --dim 64"
+            "ivf:euclidean:cell:128:500000|cargo run --example gridsearch_ivf --release -- --distance euclidean --data cell --n-samples 500000 --dim 128"
 
             # GPU IVF at larger sizes
-            "gpu:euclidean:lowrank:64:250000|cargo run --example gridsearch_gpu --release --features gpu -- --distance euclidean --data lowrank --n-samples 250000 --dim 64"
-            "gpu:euclidean:lowrank:128:250000|cargo run --example gridsearch_gpu --release --features gpu -- --distance euclidean --data lowrank --n-samples 250000 --dim 128"
-            "gpu:euclidean:lowrank:64:500000|cargo run --example gridsearch_gpu --release --features gpu -- --distance euclidean --data lowrank --n-samples 500000 --dim 64"
-            "gpu:euclidean:lowrank:128:500000|cargo run --example gridsearch_gpu --release --features gpu -- --distance euclidean --data lowrank --n-samples 500000 --dim 128"
+            "gpu:euclidean:cell:64:250000|cargo run --example gridsearch_gpu --release --features gpu -- --distance euclidean --data cell --n-samples 250000 --dim 64"
+            "gpu:euclidean:cell:128:250000|cargo run --example gridsearch_gpu --release --features gpu -- --distance euclidean --data cell --n-samples 250000 --dim 128"
+            "gpu:euclidean:cell:64:500000|cargo run --example gridsearch_gpu --release --features gpu -- --distance euclidean --data cell --n-samples 500000 --dim 64"
+            "gpu:euclidean:cell:128:500000|cargo run --example gridsearch_gpu --release --features gpu -- --distance euclidean --data cell --n-samples 500000 --dim 128"
 
             # CAGRA
 
@@ -212,13 +212,13 @@ case "$KIND" in
             "cagra:cosine:gaussian:32|cargo run --example gridsearch_cagra --release --features gpu -- --distance cosine"
             "cagra:euclidean:correlated:32|cargo run --example gridsearch_cagra --release --features gpu -- --distance euclidean --data correlated"
             "cagra:euclidean:lowrank:32|cargo run --example gridsearch_cagra --release --features gpu -- --distance euclidean --data lowrank"
-            "cagra:euclidean:lowrank:128|cargo run --example gridsearch_cagra --release --features gpu -- --distance euclidean --data lowrank --dim 128"
+            "cagra:euclidean:cell:128|cargo run --example gridsearch_cagra --release --features gpu -- --distance euclidean --data cell --dim 128"
 
             # CAGRA at larger sizes
-            "cagra:euclidean:lowrank:64:250000|cargo run --example gridsearch_cagra --release --features gpu -- --distance euclidean --data lowrank --n-samples 250000 --dim 64"
-            "cagra:euclidean:lowrank:128:250000|cargo run --example gridsearch_cagra --release --features gpu -- --distance euclidean --data lowrank --n-samples 250000 --dim 128"
-            "cagra:euclidean:lowrank:64:500000|cargo run --example gridsearch_cagra --release --features gpu -- --distance euclidean --data lowrank --n-samples 500000 --dim 64"
-            "cagra:euclidean:lowrank:128:500000|cargo run --example gridsearch_cagra --release --features gpu -- --distance euclidean --data lowrank --n-samples 500000 --dim 128"
+            "cagra:euclidean:cell:64:250000|cargo run --example gridsearch_cagra --release --features gpu -- --distance euclidean --data cell --n-samples 250000 --dim 64"
+            "cagra:euclidean:cell:128:250000|cargo run --example gridsearch_cagra --release --features gpu -- --distance euclidean --data cell --n-samples 250000 --dim 128"
+            "cagra:euclidean:cell:64:500000|cargo run --example gridsearch_cagra --release --features gpu -- --distance euclidean --data cell --n-samples 500000 --dim 64"
+            "cagra:euclidean:cell:128:500000|cargo run --example gridsearch_cagra --release --features gpu -- --distance euclidean --data cell --n-samples 500000 --dim 128"
 
             # CAGRA kNN
             "cagra_knn:euclidean:lowrank:32:250000|cargo run --example knn_comparison_cagra --release --features gpu -- --distance euclidean --data lowrank --n-samples 250000"

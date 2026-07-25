@@ -76,7 +76,7 @@ lives on the GPU for this version. (Be aware of your VRAM limits!).
 <details>
 <summary><b>GPU - Euclidean (LowRank; 128 dimensions)</b>:</summary>
 <pre><code>
-<!-- BENCH:gpu:euclidean:lowrank:128 -->
+<!-- BENCH:gpu:euclidean:cell:128 -->
 </code></pre>
 </details>
 
@@ -92,7 +92,7 @@ hence, the number of samples was increased to 250_000 and dimensions to 64 or
 <details>
 <summary><b>CPU-IVF (250k samples; 64 dimensions)</b>:</summary>
 <pre><code>
-<!-- BENCH:ivf:euclidean:lowrank:64:250000 -->
+<!-- BENCH:ivf:euclidean:cell:64:250000 -->
 </code></pre>
 </details>
 
@@ -101,7 +101,7 @@ hence, the number of samples was increased to 250_000 and dimensions to 64 or
 <details>
 <summary><b>GPU-IVF (250k samples; 64 dimensions)</b>:</summary>
 <pre><code>
-<!-- BENCH:gpu:euclidean:lowrank:64:250000 -->
+<!-- BENCH:gpu:euclidean:cell:64:250000 -->
 </code></pre>
 </details>
 
@@ -118,7 +118,7 @@ exhaustive search.
 <details>
 <summary><b>CPU-IVF (250k samples; 128 dimensions)</b>:</summary>
 <pre><code>
-<!-- BENCH:ivf:euclidean:lowrank:128:250000 -->
+<!-- BENCH:ivf:euclidean:cell:128:250000 -->
 </code></pre>
 </details>
 
@@ -127,7 +127,7 @@ exhaustive search.
 <details>
 <summary><b>GPU-IVF (250k samples; 128 dimensions)</b>:</summary>
 <pre><code>
-<!-- BENCH:gpu:euclidean:lowrank:128:250000 -->
+<!-- BENCH:gpu:euclidean:cell:128:250000 -->
 </code></pre>
 </details>
 
@@ -145,7 +145,7 @@ advantage of the GPU acceleration.
 <details>
 <summary><b>CPU-IVF (500k samples, 64 dimensions)</b>:</summary>
 <pre><code>
-<!-- BENCH:ivf:euclidean:lowrank:64:500000 -->
+<!-- BENCH:ivf:euclidean:cell:64:500000 -->
 </code></pre>
 </details>
 
@@ -154,7 +154,7 @@ advantage of the GPU acceleration.
 <details>
 <summary><b>GPU-IVF (500k samples, 64 dimensions)</b>:</summary>
 <pre><code>
-<!-- BENCH:gpu:euclidean:lowrank:64:500000 -->
+<!-- BENCH:gpu:euclidean:cell:64:500000 -->
 </code></pre>
 </details>
 
@@ -163,7 +163,7 @@ advantage of the GPU acceleration.
 <details>
 <summary><b>CPU-IVF (500k samples, 128 dimensions)</b>:</summary>
 <pre><code>
-<!-- BENCH:ivf:euclidean:lowrank:128:500000 -->
+<!-- BENCH:ivf:euclidean:cell:128:500000 -->
 </code></pre>
 </details>
 
@@ -172,7 +172,7 @@ advantage of the GPU acceleration.
 <details>
 <summary><b>GPU-IVF (500k samples, 128 dimensions)</b>:</summary>
 <pre><code>
-<!-- BENCH:gpu:euclidean:lowrank:128:500000 -->
+<!-- BENCH:gpu:euclidean:cell:128:500000 -->
 </code></pre>
 </details>
 
@@ -224,9 +224,10 @@ NNDescent convergence).
 
 **Key parameters:**
 
-* `build_k`: Internal NNDescent degree before CAGRA pruning. Defaults to 2 * k.
-  Higher values give CAGRA more edges to select from when building the
-  navigational graph, at the cost of build time. 3 * k shows diminishing returns.
+* `build_k`: Internal NNDescent degree before CAGRA pruning. Defaults to
+  `1.5 * k`. Higher values give CAGRA more edges to select from when building
+  the navigational graph, at the cost of build time. 3 * k shows diminishing
+  returns.
 * `refine_knn`: Number of 2-hop refinement sweeps after NNDescent convergence.
   Each sweep evaluates all neighbours-of-neighbours and merges improvements.
   Defaults to 0. Marginal benefit for beam search recall; primarily improves
@@ -288,7 +289,7 @@ in very well clustered data. It works better in data sets
 <details>
 <summary><b>GPU NNDescent with CAGRA style pruning - Euclidean (LowRank; 128 dimensions)</b>:</summary>
 <pre><code>
-<!-- BENCH:cagra:euclidean:lowrank:128 -->
+<!-- BENCH:cagra:euclidean:cell:128 -->
 </code></pre>
 </details>
 
@@ -299,7 +300,7 @@ Let's test CAGRA similar to IVF GPU on larger data sets.
 <details>
 <summary><b>GPU NNDescent with CAGRA style pruning (250k samples; 64 dimensions)</b>:</summary>
 <pre><code>
-<!-- BENCH:cagra:euclidean:lowrank:64:250000 -->
+<!-- BENCH:cagra:euclidean:cell:64:250000 -->
 </code></pre>
 </details>
 
@@ -308,7 +309,7 @@ Let's test CAGRA similar to IVF GPU on larger data sets.
 <details>
 <summary><b>GPU NNDescent with CAGRA style pruning (250k samples; 128 dimensions)</b>:</summary>
 <pre><code>
-<!-- BENCH:cagra:euclidean:lowrank:128:250000 -->
+<!-- BENCH:cagra:euclidean:cell:128:250000 -->
 </code></pre>
 </details>
 
@@ -317,7 +318,7 @@ Let's test CAGRA similar to IVF GPU on larger data sets.
 <details>
 <summary><b>GPU NNDescent with CAGRA style pruning (500k samples; 64 dimensions)</b>:</summary>
 <pre><code>
-<!-- BENCH:cagra:euclidean:lowrank:64:500000 -->
+<!-- BENCH:cagra:euclidean:cell:64:500000 -->
 </code></pre>
 </details>
 
@@ -326,7 +327,7 @@ Let's test CAGRA similar to IVF GPU on larger data sets.
 <details>
 <summary><b>GPU NNDescent with CAGRA style pruning (500k samples; 128 dimensions)</b>:</summary>
 <pre><code>
-<!-- BENCH:cagra:euclidean:lowrank:128:500000 -->
+<!-- BENCH:cagra:euclidean:cell:128:500000 -->
 </code></pre>
 </details>
 

@@ -554,7 +554,8 @@ pub fn local_join_shared<F: Float, N: Size>(
     }
 
     if single_block {
-        // ---- Unblocked fast path -------------------------------------------
+        // -- Unblocked fast path --
+        //
         // Every candidate vector fits in buffer A, so this is the original
         // kernel verbatim: one staging pass, one row-walk over the full
         // candidate upper triangle. `shared_vecs_b` has length 1 and is never
@@ -577,13 +578,6 @@ pub fn local_join_shared<F: Float, N: Size>(
         }
         sync_cube();
 
-        // Walk the candidate upper triangle by row. The flat-pair-index form
-        // this replaces decoded each index with a `while rem >= step` loop
-        // running up to `total_cands` times *per pair per thread*, which cost
-        // more than the distance computation it was indexing. Row `i` work is
-        // hoisted out of the inner loop as a side benefit: `shared_is_new[i]`,
-        // `shared_pids[i]` and the `graph_dist` threshold were previously
-        // re-read for every pair.
         let mut i = tx as usize;
 
         while i < total_cands as usize {
@@ -635,7 +629,8 @@ pub fn local_join_shared<F: Float, N: Size>(
             i += WORKGROUP_SIZE_X as usize;
         }
     } else {
-        // ---- Blocked staging path ------------------------------------------
+        // -- Blocked staging path --
+        //
         // Vectors are staged `block` candidates at a time into two buffers. The
         // block pairs (bi, bj) with bi <= bj cover every unordered candidate
         // pair exactly once: the diagonal (bi == bj) contributes the upper
@@ -1002,10 +997,7 @@ pub fn two_hop_refinement<F: Float, N: Size>(
     // Load source vector into shared memory as scalars
     let mut shared_source = SharedMemory::<F>::new(dim_scalars);
     let mut shared_worst_dist = SharedMemory::<F>::new(1usize);
-    // The node's own neighbour ids. The duplicate check below scans this row
-    // once per candidate, and there are k*k candidates, so reading it from
-    // global memory cost k^3 loads per node of a row every thread in the cube
-    // shares.
+
     let mut shared_own = SharedMemory::<u32>::new(k_comp);
 
     let mut idx_load = tx as usize;
@@ -1030,7 +1022,6 @@ pub fn two_hop_refinement<F: Float, N: Size>(
     sync_cube();
 
     let worst_dist = shared_worst_dist[0usize];
-    // Hoisted: was re-read from global for every surviving candidate.
     let node_norm = norms[node as usize];
     let num_candidates = k * k;
     let mut cand_idx = tx as usize;
@@ -1794,8 +1785,7 @@ where
 
         let start = Instant::now();
 
-        // ---- 0: GPU setup ----
-
+        // gpu set up
         let n_trees_forest = n_trees.unwrap_or_else(|| {
             let calculated = 5 + ((n as f64).powf(0.25)).round() as usize;
             calculated.min(20)
