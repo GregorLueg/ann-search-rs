@@ -498,70 +498,68 @@ pub fn local_join_shared<F: Float, N: Size>(
     }
     sync_cube();
 
-    let num_pairs = (total_cands * (total_cands - 1u32)) / 2u32;
-    let mut pair_idx = tx as usize;
+    // Walk the candidate upper triangle by row. The flat-pair-index form this
+    // replaces decoded each index with a `while rem >= step` loop running up to
+    // `total_cands` times *per pair per thread*, which cost more than the
+    // distance computation it was indexing. Row `i` work is hoisted out of the
+    // inner loop as a side benefit: `shared_is_new[i]`, `shared_pids[i]` and the
+    // `graph_dist` threshold were previously re-read for every pair.
+    let mut i = tx as usize;
 
-    while pair_idx < num_pairs as usize {
-        let mut rem = pair_idx;
-        let mut i = 0usize;
-        let mut step = total_cands as usize - 1usize;
-
-        while rem >= step {
-            rem -= step;
-            i += 1usize;
-            step = total_cands as usize - 1usize - i;
-        }
-        let j = i + 1usize + rem;
-
+    while i < total_cands as usize {
         let is_new_i = shared_is_new[i] != 0u32;
-        let is_new_j = shared_is_new[j] != 0u32;
         let pid_i = shared_pids[i];
-        let pid_j = shared_pids[j];
+        let thresh_i = graph_dist[pid_i as usize * k as usize + k as usize - 1usize];
 
-        if (is_new_i || is_new_j) && pid_i != pid_j {
-            let mut sum = F::new(0.0_f32);
-            let mut s = 0usize;
-            while s < dim_scalars {
-                let va = shared_vecs[i * dim_scalars + s];
-                let vb = shared_vecs[j * dim_scalars + s];
+        let mut j = i + 1usize;
+        while j < total_cands as usize {
+            let is_new_j = shared_is_new[j] != 0u32;
+            let pid_j = shared_pids[j];
 
-                if use_cosine {
-                    sum += va * vb;
+            if (is_new_i || is_new_j) && pid_i != pid_j {
+                let mut sum = F::new(0.0_f32);
+                #[unroll]
+                for s in 0..dim_scalars {
+                    let va = shared_vecs[i * dim_scalars + s];
+                    let vb = shared_vecs[j * dim_scalars + s];
+
+                    if use_cosine {
+                        sum += va * vb;
+                    } else {
+                        let diff = va - vb;
+                        sum += diff * diff;
+                    }
+                }
+
+                let dist = if use_cosine {
+                    F::new(1.0_f32) - (sum / (shared_norms[i] * shared_norms[j]))
                 } else {
-                    let diff = va - vb;
-                    sum += diff * diff;
+                    sum
+                };
+
+                let thresh_j = graph_dist[pid_j as usize * k as usize + k as usize - 1usize];
+
+                if dist < thresh_i {
+                    let slot_i = prop_count[pid_i as usize].fetch_add(1u32);
+                    if slot_i < max_proposals {
+                        let off = pid_i as usize * max_proposals as usize + slot_i as usize;
+                        prop_idx[off] = pid_j;
+                        prop_dist[off] = dist;
+                    }
                 }
-                s += 1usize;
-            }
 
-            let dist = if use_cosine {
-                F::new(1.0_f32) - (sum / (shared_norms[i] * shared_norms[j]))
-            } else {
-                sum
-            };
-
-            let thresh_i = graph_dist[pid_i as usize * k as usize + k as usize - 1usize];
-            let thresh_j = graph_dist[pid_j as usize * k as usize + k as usize - 1usize];
-
-            if dist < thresh_i {
-                let slot_i = prop_count[pid_i as usize].fetch_add(1u32);
-                if slot_i < max_proposals {
-                    let off = pid_i as usize * max_proposals as usize + slot_i as usize;
-                    prop_idx[off] = pid_j;
-                    prop_dist[off] = dist;
-                }
-            }
-
-            if dist < thresh_j {
-                let slot_j = prop_count[pid_j as usize].fetch_add(1u32);
-                if slot_j < max_proposals {
-                    let off = pid_j as usize * max_proposals as usize + slot_j as usize;
-                    prop_idx[off] = pid_i;
-                    prop_dist[off] = dist;
+                if dist < thresh_j {
+                    let slot_j = prop_count[pid_j as usize].fetch_add(1u32);
+                    if slot_j < max_proposals {
+                        let off = pid_j as usize * max_proposals as usize + slot_j as usize;
+                        prop_idx[off] = pid_i;
+                        prop_dist[off] = dist;
+                    }
                 }
             }
+            j += 1usize;
         }
-        pair_idx += WORKGROUP_SIZE_X as usize;
+        i += WORKGROUP_SIZE_X as usize;
     }
 }
 

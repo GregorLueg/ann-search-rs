@@ -274,81 +274,81 @@ pub fn leaf_pairwise_proposals<F: AnnSearchGpuFloat, N: Size>(
     sync_cube();
 
     let k = graph_dist.shape(1usize);
-    let num_pairs = (leaf_size * (leaf_size - 1u32)) / 2u32;
-    let mut pair_idx = tx;
 
-    while pair_idx < num_pairs {
-        let mut rem = pair_idx as usize;
-        let mut ii = 0usize;
-        let mut step = leaf_size as usize - 1usize;
+    // Walk the upper triangle by row rather than by flat pair index. The old
+    // form decoded a flat index with a `while rem >= step` loop that ran up to
+    // `leaf_size` times *per pair per thread*: at leaf_size 124 that is ~29k
+    // serial steps per thread against ~15k FMAs of actual distance work, so the
+    // indexing cost more than the computation. Striding rows by
+    // WORKGROUP_SIZE_X costs some load imbalance and removes the decode.
+    let mut ii = tx as usize;
 
-        while rem >= step {
-            rem -= step;
-            ii += 1usize;
-            step = leaf_size as usize - 1usize - ii;
-        }
-        let jj = ii + 1usize + rem;
-
+    while ii < leaf_size as usize {
         let pid_i = shared_pids[ii];
-        let pid_j = shared_pids[jj];
+        let thresh_i = graph_dist[pid_i as usize * k + k - 1usize];
 
-        if pid_i != pid_j && pid_i < n_pts && pid_j < n_pts {
-            let mut sum = F::new(0.0_f32);
-            let mut s = 0usize;
-            while s < dim_scalars {
-                let va = shared_vecs[ii * dim_scalars + s];
-                let vb = shared_vecs[jj * dim_scalars + s];
-                if use_cosine {
-                    sum += va * vb;
-                } else {
-                    let diff = va - vb;
-                    sum += diff * diff;
+        let mut jj = ii + 1usize;
+        while jj < leaf_size as usize {
+            let pid_j = shared_pids[jj];
+
+            if pid_i != pid_j && pid_i < n_pts && pid_j < n_pts {
+                let mut sum = F::new(0.0_f32);
+                #[unroll]
+                for s in 0..dim_scalars {
+                    let va = shared_vecs[ii * dim_scalars + s];
+                    let vb = shared_vecs[jj * dim_scalars + s];
+                    if use_cosine {
+                        sum += va * vb;
+                    } else {
+                        let diff = va - vb;
+                        sum += diff * diff;
+                    }
                 }
-                s += 1usize;
-            }
 
-            let dist = if use_cosine {
-                F::new(1.0_f32) - (sum / (shared_norms[ii] * shared_norms[jj]))
-            } else {
-                sum
-            };
-
-            let thresh_i = graph_dist[pid_i as usize * k + k - 1usize];
-            if dist < thresh_i {
-                let slot = prop_count[pid_i as usize].fetch_add(1u32);
-                if slot < max_proposals {
-                    let off = pid_i as usize * max_proposals as usize + slot as usize;
-                    prop_idx[off] = pid_j;
-                    prop_dist[off] = dist;
+                let dist = if use_cosine {
+                    F::new(1.0_f32) - (sum / (shared_norms[ii] * shared_norms[jj]))
                 } else {
-                    let rand = xorshift32(pid_i ^ slot ^ pid_j) % (slot + 1u32);
-                    if rand < max_proposals {
-                        let off = pid_i as usize * max_proposals as usize + rand as usize;
+                    sum
+                };
+
+                if dist < thresh_i {
+                    let slot = prop_count[pid_i as usize].fetch_add(1u32);
+                    if slot < max_proposals {
+                        let off = pid_i as usize * max_proposals as usize + slot as usize;
                         prop_idx[off] = pid_j;
                         prop_dist[off] = dist;
+                    } else {
+                        let rand = xorshift32(pid_i ^ slot ^ pid_j) % (slot + 1u32);
+                        if rand < max_proposals {
+                            let off = pid_i as usize * max_proposals as usize + rand as usize;
+                            prop_idx[off] = pid_j;
+                            prop_dist[off] = dist;
+                        }
                     }
                 }
-            }
 
-            let thresh_j = graph_dist[pid_j as usize * k + k - 1usize];
-            if dist < thresh_j {
-                let slot = prop_count[pid_j as usize].fetch_add(1u32);
-                if slot < max_proposals {
-                    let off = pid_j as usize * max_proposals as usize + slot as usize;
-                    prop_idx[off] = pid_i;
-                    prop_dist[off] = dist;
-                } else {
-                    let rand = xorshift32(pid_j ^ slot ^ pid_i) % (slot + 1u32);
-                    if rand < max_proposals {
-                        let off = pid_j as usize * max_proposals as usize + rand as usize;
+                let thresh_j = graph_dist[pid_j as usize * k + k - 1usize];
+                if dist < thresh_j {
+                    let slot = prop_count[pid_j as usize].fetch_add(1u32);
+                    if slot < max_proposals {
+                        let off = pid_j as usize * max_proposals as usize + slot as usize;
                         prop_idx[off] = pid_i;
                         prop_dist[off] = dist;
+                    } else {
+                        let rand = xorshift32(pid_j ^ slot ^ pid_i) % (slot + 1u32);
+                        if rand < max_proposals {
+                            let off = pid_j as usize * max_proposals as usize + rand as usize;
+                            prop_idx[off] = pid_i;
+                            prop_dist[off] = dist;
+                        }
                     }
                 }
             }
+
+            jj += 1usize;
         }
 
-        pair_idx += WORKGROUP_SIZE_X;
+        ii += WORKGROUP_SIZE_X as usize;
     }
 }
 
