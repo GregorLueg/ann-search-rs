@@ -389,7 +389,7 @@ pub fn cagra_beam_search<F: Float, N: Size>(
     let dim_scalars = dim_lines * lanes;
     let hash_mask = hash_size as u32 - 1u32;
     let sentinel = 0x7FFFFFFFu32;
-    let f_max = F::new(999999999.0);
+    let f_max = F::new(999999999.0_f32);
     let bw = beam_width as u32;
     let bw_last = beam_width - 1usize;
     let total_slots = k_graph * expand_per_iter;

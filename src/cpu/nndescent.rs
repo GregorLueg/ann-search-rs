@@ -380,7 +380,7 @@ where
     /// * `delta` - Convergence threshold (fraction of edges updated)
     /// * `diversify_prob` - Bernoulli probability for the post-descent
     ///   RNG-rule prune over the forward+reverse candidate pool
-    ///   (0 disables). See [`Self::diversify_graph`] for the exact rule.
+    ///   (0 disables).
     /// * `seed` - Random seed
     /// * `verbose` - Print progress
     #[allow(clippy::too_many_arguments)]

@@ -18,10 +18,10 @@ use rdst::RadixKey;
 
 /// Sentinel point id used to mark empty slots in the flat kNN graph.
 ///
-/// The high bit of [`Neighbour::pid_and_flag`] carries the is-new flag, so
-/// only 31 bits are available for the point id. `u32::MAX >> 1` therefore
-/// sits at the top of that range and is guaranteed distinct from any valid
-/// point id up to ~2 billion.
+/// The high bit of `Neighbour` carries the is-new flag, so only 31 bits are
+/// available for the point id. `u32::MAX >> 1` therefore sits at the top of
+/// that range and is guaranteed distinct from any valid point id up to
+/// ~2 billion.
 pub const SENTINEL_PID: usize = u32::MAX as usize >> 1;
 
 ////////////////
