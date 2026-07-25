@@ -55,12 +55,6 @@ use crate::utils::*;
 // Conts //
 ///////////
 
-/// Hard cap on the number of random long-range candidates injected into the
-/// MRNG candidate pool per node. Grows with `r` (out-degree) but never exceeds
-/// this cap so the candidate scan stays bounded. 64 empirically gives enough
-/// spatial diversity on clustered data without inflating `mrng_prune` cost.
-const MRNG_RANDOM_CANDIDATES_CAP: usize = 64;
-
 /// Lower clamp for the number of query-time entry seeds strided evenly
 /// across the dataset (on top of the navigating node). Single-entry search
 /// from the medoid dead-ends on clustered data at scale: cross-cluster paths
@@ -1200,28 +1194,6 @@ where
                 let d = OrderedFloat(M::distance_from_vec(self, vec_v, norm_v, nbr));
                 state.scratch_working.push((d, nbr));
             }
-        }
-
-        // Inject long-range random candidates. On clustered data the beam pool
-        // is otherwise entirely v-local (same cluster), and MRNG's occlusion
-        // rule then collapses to ~6-8 accepted edges because co-cluster
-        // candidates mutually occlude. A handful of random long-range points
-        // gives MRNG spatial diversity, mirroring what Vamana gets for free
-        // from its random-init graph.
-        let n_random = (r * 2).min(MRNG_RANDOM_CANDIDATES_CAP);
-        let mut rng = SmallRng::seed_from_u64(
-            (v as u64)
-                .wrapping_mul(0x9E37_79B9_7F4A_7C15)
-                .wrapping_add(0x1234_5678),
-        );
-        for _ in 0..n_random {
-            let cand = rng.random_range(0..self.n);
-            if cand == v || state.is_visited(cand) {
-                continue;
-            }
-            state.mark_visited(cand);
-            let d = OrderedFloat(M::distance_from_vec(self, vec_v, norm_v, cand));
-            state.scratch_working.push((d, cand));
         }
 
         // Sort candidates ascending by distance to v, cap at C.

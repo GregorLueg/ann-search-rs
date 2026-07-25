@@ -1,6 +1,7 @@
 //! Utility functions shared across the graph-based indices that contain
 //! the search state.
 
+use fixedbitset::FixedBitSet;
 use num_traits::Float;
 use std::cmp::Reverse;
 use std::collections::BinaryHeap;
@@ -8,15 +9,20 @@ use std::iter::Sum;
 
 use crate::prelude::*;
 
-/// Search state for HNSW/Vamana queries and construction
+/// Search state for HNSW/Vamana/NSG queries and construction.
 ///
 /// Maintains visited tracking and candidate management for graph traversal.
 /// Reused across queries to amortise allocation costs.
+///
+/// `visited` is a [`FixedBitSet`] (1 bit per node) rather than an epoch-based
+/// `Vec<usize>`. At n=150k the bitset is ~19 KB and fits in L1, versus 1.2 MB
+/// for the `Vec<usize>` alternative. The per-reset `clear()` cost
+/// (~O(n/64) u64 writes) is negligible compared to the cache-thrashing the
+/// wider array causes during dense per-node build phases (e.g. NSG's MRNG
+/// prune, which resets once per node).
 pub struct SearchState<T> {
-    /// Per-node visit tracking using incrementing IDs
-    pub visited: Vec<usize>,
-    /// Current visit epoch (wraps around, triggers reset)
-    pub visit_id: usize,
+    /// Per-node visit tracking as a bit-per-node bitset.
+    pub visited: FixedBitSet,
     /// Min-heap of nodes to explore, ordered by distance
     pub candidates: BinaryHeap<Reverse<(OrderedFloat<T>, usize)>>,
     /// Sorted buffer of current best candidates
@@ -45,8 +51,7 @@ where
     /// Initialised search state ready for use
     pub fn new(capacity: usize) -> Self {
         Self {
-            visited: vec![0; capacity],
-            visit_id: 1,
+            visited: FixedBitSet::with_capacity(capacity),
             candidates: BinaryHeap::with_capacity(capacity),
             working_sorted: SortedBuffer::with_capacity(capacity),
             scratch_working: Vec::with_capacity(capacity),
@@ -56,22 +61,17 @@ where
 
     /// Reset state for a new query
     ///
-    /// Clears all buffers and advances the visit epoch. If the epoch wraps
-    /// around to zero, performs a full reset of the visited array.
+    /// Grows the visited bitset if needed, clears all bits, and empties
+    /// candidate / scratch buffers.
     ///
     /// ### Params
     ///
     /// * `n` - Number of nodes in the graph (for capacity adjustment)
     pub fn reset(&mut self, n: usize) {
         if self.visited.len() < n {
-            self.visited.resize(n, 0);
+            self.visited.grow(n);
         }
-
-        self.visit_id = self.visit_id.wrapping_add(1);
-        if self.visit_id == 0 {
-            self.visited.fill(0);
-            self.visit_id = 1;
-        }
+        self.visited.clear();
 
         self.candidates.clear();
         self.working_sorted.clear();
@@ -90,7 +90,7 @@ where
     /// `true` if node was already visited, `false` otherwise
     #[inline(always)]
     pub fn is_visited(&self, node: usize) -> bool {
-        self.visited[node] == self.visit_id
+        self.visited.contains(node)
     }
 
     /// Mark a node as visited in the current query
@@ -100,6 +100,6 @@ where
     /// * `node` - Node index to mark
     #[inline(always)]
     pub fn mark_visited(&mut self, node: usize) {
-        self.visited[node] = self.visit_id;
+        self.visited.insert(node);
     }
 }
