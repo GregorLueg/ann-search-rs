@@ -345,6 +345,60 @@ pub fn build_reverse_candidates(
     }
 }
 
+/// Emit a candidate pair as a proposal to both endpoints if it beats their
+/// current worst neighbour.
+///
+/// Split out of `local_join_shared` because the blocked staging path evaluates
+/// pairs at three call sites (unblocked, diagonal block, off-diagonal block).
+///
+/// ### Params
+///
+/// * `graph_dist` - Current kNN graph distances, used for the `pid_j` threshold
+/// * `prop_idx` - Output proposal indices, row-major `[n, max_proposals]`
+/// * `prop_dist` - Output proposal distances, matching layout to `prop_idx`
+/// * `prop_count` - Atomic per-node counter for proposal slots
+/// * `pid_i` - Point id of the first candidate
+/// * `pid_j` - Point id of the second candidate
+/// * `thresh_i` - `pid_i`'s worst current neighbour distance, hoisted by the
+///   caller out of its inner loop
+/// * `dist` - Distance between the two candidates
+/// * `k` - Degree of the build graph
+/// * `max_proposals` - Proposal buffer capacity per node (comptime)
+#[cube]
+#[allow(clippy::too_many_arguments)]
+fn emit_pair<F: Float>(
+    graph_dist: &Tensor<F>,
+    prop_idx: &mut Tensor<u32>,
+    prop_dist: &mut Tensor<F>,
+    prop_count: &Tensor<Atomic<u32>>,
+    pid_i: u32,
+    pid_j: u32,
+    thresh_i: F,
+    dist: F,
+    k: u32,
+    #[comptime] max_proposals: u32,
+) {
+    let thresh_j = graph_dist[pid_j as usize * k as usize + k as usize - 1usize];
+
+    if dist < thresh_i {
+        let slot_i = prop_count[pid_i as usize].fetch_add(1u32);
+        if slot_i < max_proposals {
+            let off = pid_i as usize * max_proposals as usize + slot_i as usize;
+            prop_idx[off] = pid_j;
+            prop_dist[off] = dist;
+        }
+    }
+
+    if dist < thresh_j {
+        let slot_j = prop_count[pid_j as usize].fetch_add(1u32);
+        if slot_j < max_proposals {
+            let off = pid_j as usize * max_proposals as usize + slot_j as usize;
+            prop_idx[off] = pid_i;
+            prop_dist[off] = dist;
+        }
+    }
+}
+
 /// Core NNDescent local join kernel.
 ///
 /// For each node, loads forward and reverse candidates into shared memory,
@@ -370,6 +424,19 @@ pub fn build_reverse_candidates(
 /// * `use_cosine` - Whether to use cosine distance (comptime)
 /// * `dim_lines` - Number of `Line<F>` elements per vector row (comptime)
 /// * `build_k` - Degree of the build graph (comptime)
+/// * `block` - Candidates staged per vector buffer (comptime)
+/// * `single_block` - Whether every candidate fits in one buffer (comptime)
+/// * `vec_buf_a` - Scalar length of the first vector buffer (comptime)
+/// * `vec_buf_b` - Scalar length of the second vector buffer (comptime)
+///
+/// ### Shared memory
+///
+/// Candidate metadata (`shared_pids`, `shared_is_new`, `shared_norms`) is
+/// always staged in full and indexed by absolute candidate id. Only the
+/// vectors are blocked, because they dominate the footprint. Staging all of
+/// them at once busts the device limit past dim 128 at the default k, and the
+/// dispatch then silently does nothing. See `plan_local_join_staging`, which
+/// picks `block` and the buffer lengths.
 ///
 /// ### Grid mapping
 ///
@@ -392,6 +459,10 @@ pub fn local_join_shared<F: Float, N: Size>(
     #[comptime] use_cosine: bool,
     #[comptime] dim_lines: usize,
     #[comptime] build_k: usize,
+    #[comptime] block: usize,
+    #[comptime] single_block: bool,
+    #[comptime] vec_buf_a: usize,
+    #[comptime] vec_buf_b: usize,
 ) {
     let node = CUBE_POS_Y * CUBE_COUNT_X + CUBE_POS_X;
     if node >= n_pts {
@@ -405,7 +476,8 @@ pub fn local_join_shared<F: Float, N: Size>(
     let max_cands_comp = build_k * 2usize;
     let dim_scalars = dim_lines * 4usize;
 
-    let mut shared_vecs = SharedMemory::<F>::new(max_cands_comp * dim_scalars);
+    let mut shared_vecs_a = SharedMemory::<F>::new(vec_buf_a);
+    let mut shared_vecs_b = SharedMemory::<F>::new(vec_buf_b);
     let mut shared_pids = SharedMemory::<u32>::new(max_cands_comp);
     let mut shared_is_new = SharedMemory::<u32>::new(max_cands_comp);
     let mut shared_norms = SharedMemory::<F>::new(max_cands_comp);
@@ -481,86 +553,271 @@ pub fn local_join_shared<F: Float, N: Size>(
         sync_cube();
     }
 
-    let total_scalars = total_cands as usize * dim_scalars;
-    let mut idx_load = tx as usize;
-    while idx_load < total_scalars {
-        let n_idx = idx_load / dim_scalars;
-        let s_idx = idx_load % dim_scalars;
-        let line_idx = s_idx / 4usize;
-        let lane = s_idx % 4usize;
-        let pid = shared_pids[n_idx];
+    if single_block {
+        // ---- Unblocked fast path -------------------------------------------
+        // Every candidate vector fits in buffer A, so this is the original
+        // kernel verbatim: one staging pass, one row-walk over the full
+        // candidate upper triangle. `shared_vecs_b` has length 1 and is never
+        // touched, so the footprint matches the pre-blocking kernel exactly.
+        let total_scalars = total_cands as usize * dim_scalars;
+        let mut idx_load = tx as usize;
+        while idx_load < total_scalars {
+            let n_idx = idx_load / dim_scalars;
+            let s_idx = idx_load % dim_scalars;
+            let line_idx = s_idx / 4usize;
+            let lane = s_idx % 4usize;
+            let pid = shared_pids[n_idx];
 
-        if pid < n_pts {
-            let vec_offset = pid as usize * dim_lines + line_idx;
-            let line_val = vectors[vec_offset];
-            shared_vecs[idx_load] = line_val[lane];
-        }
-        idx_load += WORKGROUP_SIZE_X as usize;
-    }
-    sync_cube();
-
-    // Walk the candidate upper triangle by row. The flat-pair-index form this
-    // replaces decoded each index with a `while rem >= step` loop running up to
-    // `total_cands` times *per pair per thread*, which cost more than the
-    // distance computation it was indexing. Row `i` work is hoisted out of the
-    // inner loop as a side benefit: `shared_is_new[i]`, `shared_pids[i]` and the
-    // `graph_dist` threshold were previously re-read for every pair.
-    let mut i = tx as usize;
-
-    while i < total_cands as usize {
-        let is_new_i = shared_is_new[i] != 0u32;
-        let pid_i = shared_pids[i];
-        let thresh_i = graph_dist[pid_i as usize * k as usize + k as usize - 1usize];
-
-        let mut j = i + 1usize;
-        while j < total_cands as usize {
-            let is_new_j = shared_is_new[j] != 0u32;
-            let pid_j = shared_pids[j];
-
-            if (is_new_i || is_new_j) && pid_i != pid_j {
-                let mut sum = F::new(0.0_f32);
-                #[unroll]
-                for s in 0..dim_scalars {
-                    let va = shared_vecs[i * dim_scalars + s];
-                    let vb = shared_vecs[j * dim_scalars + s];
-
-                    if use_cosine {
-                        sum += va * vb;
-                    } else {
-                        let diff = va - vb;
-                        sum += diff * diff;
-                    }
-                }
-
-                let dist = if use_cosine {
-                    F::new(1.0_f32) - (sum / (shared_norms[i] * shared_norms[j]))
-                } else {
-                    sum
-                };
-
-                let thresh_j = graph_dist[pid_j as usize * k as usize + k as usize - 1usize];
-
-                if dist < thresh_i {
-                    let slot_i = prop_count[pid_i as usize].fetch_add(1u32);
-                    if slot_i < max_proposals {
-                        let off = pid_i as usize * max_proposals as usize + slot_i as usize;
-                        prop_idx[off] = pid_j;
-                        prop_dist[off] = dist;
-                    }
-                }
-
-                if dist < thresh_j {
-                    let slot_j = prop_count[pid_j as usize].fetch_add(1u32);
-                    if slot_j < max_proposals {
-                        let off = pid_j as usize * max_proposals as usize + slot_j as usize;
-                        prop_idx[off] = pid_i;
-                        prop_dist[off] = dist;
-                    }
-                }
+            if pid < n_pts {
+                let vec_offset = pid as usize * dim_lines + line_idx;
+                let line_val = vectors[vec_offset];
+                shared_vecs_a[idx_load] = line_val[lane];
             }
-            j += 1usize;
+            idx_load += WORKGROUP_SIZE_X as usize;
         }
-        i += WORKGROUP_SIZE_X as usize;
+        sync_cube();
+
+        // Walk the candidate upper triangle by row. The flat-pair-index form
+        // this replaces decoded each index with a `while rem >= step` loop
+        // running up to `total_cands` times *per pair per thread*, which cost
+        // more than the distance computation it was indexing. Row `i` work is
+        // hoisted out of the inner loop as a side benefit: `shared_is_new[i]`,
+        // `shared_pids[i]` and the `graph_dist` threshold were previously
+        // re-read for every pair.
+        let mut i = tx as usize;
+
+        while i < total_cands as usize {
+            let is_new_i = shared_is_new[i] != 0u32;
+            let pid_i = shared_pids[i];
+            let thresh_i = graph_dist[pid_i as usize * k as usize + k as usize - 1usize];
+
+            let mut j = i + 1usize;
+            while j < total_cands as usize {
+                let is_new_j = shared_is_new[j] != 0u32;
+                let pid_j = shared_pids[j];
+
+                if (is_new_i || is_new_j) && pid_i != pid_j {
+                    let mut sum = F::new(0.0_f32);
+                    #[unroll]
+                    for s in 0..dim_scalars {
+                        let va = shared_vecs_a[i * dim_scalars + s];
+                        let vb = shared_vecs_a[j * dim_scalars + s];
+
+                        if use_cosine {
+                            sum += va * vb;
+                        } else {
+                            let diff = va - vb;
+                            sum += diff * diff;
+                        }
+                    }
+
+                    let dist = if use_cosine {
+                        F::new(1.0_f32) - (sum / (shared_norms[i] * shared_norms[j]))
+                    } else {
+                        sum
+                    };
+
+                    emit_pair::<F>(
+                        graph_dist,
+                        prop_idx,
+                        prop_dist,
+                        prop_count,
+                        pid_i,
+                        pid_j,
+                        thresh_i,
+                        dist,
+                        k,
+                        max_proposals,
+                    );
+                }
+                j += 1usize;
+            }
+            i += WORKGROUP_SIZE_X as usize;
+        }
+    } else {
+        // ---- Blocked staging path ------------------------------------------
+        // Vectors are staged `block` candidates at a time into two buffers. The
+        // block pairs (bi, bj) with bi <= bj cover every unordered candidate
+        // pair exactly once: the diagonal (bi == bj) contributes the upper
+        // triangle inside a block, the off-diagonal (bi < bj) contributes the
+        // full cross product, and base_i + block <= base_j guarantees the
+        // absolute ordering i < j there. Block bi is staged once per outer
+        // iteration, not once per pair.
+        let total_us = total_cands as usize;
+        let n_blocks = (total_us + block - 1usize) / block;
+
+        let mut bi = 0usize;
+        while bi < n_blocks {
+            let base_i = bi * block;
+            let mut len_i = block.runtime();
+            if base_i + block > total_us {
+                len_i = total_us - base_i;
+            }
+
+            let scalars_i = len_i * dim_scalars;
+            let mut idx_a = tx as usize;
+            while idx_a < scalars_i {
+                let n_idx = idx_a / dim_scalars;
+                let s_idx = idx_a % dim_scalars;
+                let line_idx = s_idx / 4usize;
+                let lane = s_idx % 4usize;
+                let pid = shared_pids[base_i + n_idx];
+
+                if pid < n_pts {
+                    let vec_offset = pid as usize * dim_lines + line_idx;
+                    let line_val = vectors[vec_offset];
+                    shared_vecs_a[idx_a] = line_val[lane];
+                }
+                idx_a += WORKGROUP_SIZE_X as usize;
+            }
+            sync_cube();
+
+            // Diagonal block: upper triangle within block bi, both operands in
+            // buffer A.
+            let mut ii = tx as usize;
+            while ii < len_i {
+                let abs_i = base_i + ii;
+                let is_new_i = shared_is_new[abs_i] != 0u32;
+                let pid_i = shared_pids[abs_i];
+                let thresh_i = graph_dist[pid_i as usize * k as usize + k as usize - 1usize];
+
+                let mut jj = ii + 1usize;
+                while jj < len_i {
+                    let abs_j = base_i + jj;
+                    let is_new_j = shared_is_new[abs_j] != 0u32;
+                    let pid_j = shared_pids[abs_j];
+
+                    if (is_new_i || is_new_j) && pid_i != pid_j {
+                        let mut sum = F::new(0.0_f32);
+                        #[unroll]
+                        for s in 0..dim_scalars {
+                            let va = shared_vecs_a[ii * dim_scalars + s];
+                            let vb = shared_vecs_a[jj * dim_scalars + s];
+
+                            if use_cosine {
+                                sum += va * vb;
+                            } else {
+                                let diff = va - vb;
+                                sum += diff * diff;
+                            }
+                        }
+
+                        let dist = if use_cosine {
+                            F::new(1.0_f32) - (sum / (shared_norms[abs_i] * shared_norms[abs_j]))
+                        } else {
+                            sum
+                        };
+
+                        emit_pair::<F>(
+                            graph_dist,
+                            prop_idx,
+                            prop_dist,
+                            prop_count,
+                            pid_i,
+                            pid_j,
+                            thresh_i,
+                            dist,
+                            k,
+                            max_proposals,
+                        );
+                    }
+                    jj += 1usize;
+                }
+                ii += WORKGROUP_SIZE_X as usize;
+            }
+
+            let mut bj = bi + 1usize;
+            while bj < n_blocks {
+                let base_j = bj * block;
+                let mut len_j = block.runtime();
+                if base_j + block > total_us {
+                    len_j = total_us - base_j;
+                }
+
+                // Guards buffer B against being restaged while the previous
+                // block pair is still reading it.
+                sync_cube();
+
+                let scalars_j = len_j * dim_scalars;
+                let mut idx_b = tx as usize;
+                while idx_b < scalars_j {
+                    let n_idx = idx_b / dim_scalars;
+                    let s_idx = idx_b % dim_scalars;
+                    let line_idx = s_idx / 4usize;
+                    let lane = s_idx % 4usize;
+                    let pid = shared_pids[base_j + n_idx];
+
+                    if pid < n_pts {
+                        let vec_offset = pid as usize * dim_lines + line_idx;
+                        let line_val = vectors[vec_offset];
+                        shared_vecs_b[idx_b] = line_val[lane];
+                    }
+                    idx_b += WORKGROUP_SIZE_X as usize;
+                }
+                sync_cube();
+
+                // Off-diagonal: every pair between block bi (buffer A) and
+                // block bj (buffer B).
+                let mut oi = tx as usize;
+                while oi < len_i {
+                    let abs_i = base_i + oi;
+                    let is_new_i = shared_is_new[abs_i] != 0u32;
+                    let pid_i = shared_pids[abs_i];
+                    let thresh_i = graph_dist[pid_i as usize * k as usize + k as usize - 1usize];
+
+                    let mut oj = 0usize;
+                    while oj < len_j {
+                        let abs_j = base_j + oj;
+                        let is_new_j = shared_is_new[abs_j] != 0u32;
+                        let pid_j = shared_pids[abs_j];
+
+                        if (is_new_i || is_new_j) && pid_i != pid_j {
+                            let mut sum = F::new(0.0_f32);
+                            #[unroll]
+                            for s in 0..dim_scalars {
+                                let va = shared_vecs_a[oi * dim_scalars + s];
+                                let vb = shared_vecs_b[oj * dim_scalars + s];
+
+                                if use_cosine {
+                                    sum += va * vb;
+                                } else {
+                                    let diff = va - vb;
+                                    sum += diff * diff;
+                                }
+                            }
+
+                            let dist = if use_cosine {
+                                F::new(1.0_f32)
+                                    - (sum / (shared_norms[abs_i] * shared_norms[abs_j]))
+                            } else {
+                                sum
+                            };
+
+                            emit_pair::<F>(
+                                graph_dist,
+                                prop_idx,
+                                prop_dist,
+                                prop_count,
+                                pid_i,
+                                pid_j,
+                                thresh_i,
+                                dist,
+                                k,
+                                max_proposals,
+                            );
+                        }
+                        oj += 1usize;
+                    }
+                    oi += WORKGROUP_SIZE_X as usize;
+                }
+                bj += 1usize;
+            }
+
+            // Guards buffer A against being restaged for block bi + 1 while the
+            // last block pair is still reading it.
+            sync_cube();
+            bi += 1usize;
+        }
     }
 }
 
@@ -1579,6 +1836,13 @@ where
 
         let (grid_n_x, grid_n_y) = grid_2d((n as u32).div_ceil(WORKGROUP_SIZE_X));
 
+        let staging = plan_local_join_staging(
+            dim_padded,
+            build_k * 2,
+            size_of::<T>(),
+            client.properties().hardware.max_shared_memory_size,
+        )?;
+
         // 1: random graph initialisation (baseline for NNDescent)
         if verbose {
             println!("  Random graph initialisation...");
@@ -1709,6 +1973,10 @@ where
                     use_cosine,
                     dim_vec,
                     build_k,
+                    staging.block,
+                    staging.single_block,
+                    staging.buf_a_len,
+                    staging.buf_b_len,
                 );
             }
 
@@ -2533,6 +2801,13 @@ where
 
     let (grid_n_x, grid_n_y) = grid_2d((n as u32).div_ceil(WORKGROUP_SIZE_X));
 
+    let staging = plan_local_join_staging(
+        dim_padded,
+        build_k * 2,
+        size_of::<T>(),
+        client.properties().hardware.max_shared_memory_size,
+    )?;
+
     // ---- Random graph initialisation ----
 
     if verbose {
@@ -2661,6 +2936,10 @@ where
                 use_cosine,
                 dim_vec,
                 build_k,
+                staging.block,
+                staging.single_block,
+                staging.buf_a_len,
+                staging.buf_b_len,
             );
         }
 
@@ -3440,6 +3719,14 @@ mod kernel_tests {
 
         let rho_thresh = 65535u32; // rho=1.0, accept all pairs
 
+        let staging = plan_local_join_staging(
+            dim,
+            build_k * 2,
+            size_of::<f32>(),
+            client.properties().hardware.max_shared_memory_size,
+        )
+        .unwrap();
+
         unsafe {
             local_join_shared::launch_unchecked::<f32, WgpuRuntime>(
                 &client,
@@ -3462,6 +3749,10 @@ mod kernel_tests {
                 true, // use_cosine
                 dim_vec,
                 build_k,
+                staging.block,
+                staging.single_block,
+                staging.buf_a_len,
+                staging.buf_b_len,
             );
         }
 

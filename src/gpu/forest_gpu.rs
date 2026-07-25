@@ -21,13 +21,6 @@ use crate::gpu::tensor::*;
 use crate::gpu::*;
 use crate::prelude::*;
 
-///////////
-// Const //
-///////////
-
-/// Shared memory budget in bytes (conservative for Apple Silicon / older GPUs)
-const SMEM_BUDGET: usize = 32_768;
-
 /// Result of parallel tree construction for a single tree.
 ///
 /// Each element is a tuple of:
@@ -224,16 +217,20 @@ fn partition_points<F: AnnSearchGpuFloat>(
 /// ### Params
 ///
 /// * `dim_padded` - Vector dimensionality padded to a multiple of `LINE_SIZE`
+/// * `max_shared_bytes` - Device shared-memory limit per workgroup, read from
+///   `client.properties().hardware.max_shared_memory_size`. Apple Silicon
+///   reports 32768, which is the low end; other backends report more and the
+///   budget must not be hardcoded to the smallest one.
 ///
 /// ### Returns
 ///
 /// Maximum number of points per leaf, clamped to `[2, 256]`
-fn compute_max_leaf_size(dim_padded: usize) -> usize {
+fn compute_max_leaf_size(dim_padded: usize, max_shared_bytes: usize) -> usize {
     let line = LINE_SIZE;
     let dim_scalars = (dim_padded / line) * 4;
     let per_point = dim_scalars * std::mem::size_of::<f32>() + 4 + 4;
     let overhead = 8; // shared_leaf_start + shared_leaf_size
-    let available = SMEM_BUDGET.saturating_sub(overhead);
+    let available = max_shared_bytes.saturating_sub(overhead);
     (available / per_point).clamp(2, 256)
 }
 
@@ -695,7 +692,10 @@ where
     let dim_vec = dim_padded / line;
     let (grid_n_x, grid_n_y) = grid_2d((n as u32).div_ceil(WORKGROUP_SIZE_X));
 
-    let max_leaf_size = compute_max_leaf_size(dim_padded);
+    let max_leaf_size = compute_max_leaf_size(
+        dim_padded,
+        client.properties().hardware.max_shared_memory_size,
+    );
 
     // cecouple the depth calculation to target leaves of ~64
     let target_leaf_size = 64.0;

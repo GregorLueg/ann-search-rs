@@ -90,6 +90,23 @@
     launches to 36ms over 20.
 - `GpuTensor::shape` and `GpuTensor::len` / `is_empty` accessors.
 
+- NNDescent's `local_join_shared` staged all `2 * build_k` candidate vectors in
+  shared memory with no bound. Past the device limit the `launch_unchecked`
+  dispatch silently did nothing, so NNDescent reported zero updates every
+  iteration and the graph never improved on the forest initialisation, with no
+  error anywhere. The default k of 30 was affected from dim 192 upward, and
+  k=15 from dim 512, which is a routine embedding size. Vectors are now staged
+  in blocks that fit the device budget, iterating block pairs so every
+  candidate pair is still evaluated exactly once. Configurations that already
+  fitted take an unchanged single-block path with an identical footprint:
+  measured at 500k x 64D, `LocalJoinShared` is 57.17 ms/launch against 57.18
+  before. Previously-broken cases now build, e.g. k=30 at dim=512 goes from 0
+  to 759 408 updates on the first iteration.
+- Shared-memory budgets are read from
+  `client.properties().hardware.max_shared_memory_size` rather than assumed.
+  `forest_gpu` had hardcoded 32768, which is Apple Silicon's limit: wrong in
+  both directions on other hardware.
+
 **Housekeeping**
 
 - Removed `compute_ivf_mega_cosine` (no call sites, no tests), the unused
