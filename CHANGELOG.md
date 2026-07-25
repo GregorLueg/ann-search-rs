@@ -28,11 +28,16 @@
   k-th distance on every column of the chunk and the whole k-row on every
   accepted candidate. Now staged in registers and flushed once. 26% off the
   kernel, 6-13% off the exhaustive pipeline.
-- The IVF task list was sorted by query id every batch, but the loop that
-  builds it already runs queries in ascending order, so the sort was a no-op
-  on ordered data and, being unstable, could only permute tasks within a
-  query. Removed, along with the intermediate `Vec` of tuples and the four
-  map-collect passes that split it.
+- The IVF task list is now grouped by cluster rather than by query. The mega
+  kernel binds one task per `UNIT_POS_Y` row, so ordered by query a cube was
+  one query against `wg_y` different clusters: every row read a disjoint DB
+  region and nothing was reused. Grouped by cluster it is `wg_y` queries
+  against one cluster, so the DB tile is read once and reused across rows.
+  Mega kernel 4 422 -> 3 057 ms over the gridsearch (1.45x), self-kNN queries
+  1.28-1.38x faster end to end, recall unchanged to four decimal places.
+  The previous `sort_unstable_by_key(|t| t.0)` was a no-op: the build loop
+  already emitted queries in ascending order. Also dropped the intermediate
+  `Vec` of tuples and the four map-collect passes that split it.
 - `local_join_shared`, `two_hop_refinement` and `cagra_rank_prune_shared`
   dispatched a hardcoded 65535 cubes in x regardless of `n`, wasting 6.5x at
   n=10k and ~31% at n=100k. They use `grid_2d` now, like every other launch.

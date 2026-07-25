@@ -687,6 +687,26 @@ where
             return Ok((vec![vec![]; n_queries], vec![vec![]; n_queries]));
         }
 
+        // Group tasks by cluster, not by query. `UNIT_POS_Y` in the mega kernel
+        // binds one task per row, so a cube's rows read whichever DB regions
+        // their tasks point at. Ordered by query, a cube is one query against
+        // `wg_y` different clusters: every row reads a disjoint DB region and
+        // there is no reuse. Ordered by cluster it is `wg_y` different queries
+        // against one cluster, so the DB tile is read once and reused across
+        // rows, which is what makes `euclidean_tiled` fast.
+        //
+        // Reordering is safe: each task carries its own `task_write_offset`, so
+        // where its results land does not depend on task order.
+        let mut order: Vec<u32> = (0..n_tasks as u32).collect();
+        order.sort_unstable_by_key(|&i| task_db_start[i as usize]);
+        let permute = |src: &[u32]| -> Vec<u32> {
+            order.iter().map(|&i| src[i as usize]).collect()
+        };
+        let task_q_idx = permute(&task_q_idx);
+        let task_db_start = permute(&task_db_start);
+        let task_write_offset = permute(&task_write_offset);
+        let task_db_count = permute(&task_db_count);
+
         let max_candidates: usize = cpu_write_pointers
             .iter()
             .fold(0, |acc, &x| acc.max(x as usize));
