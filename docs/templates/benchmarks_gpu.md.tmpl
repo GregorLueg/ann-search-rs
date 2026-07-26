@@ -13,6 +13,13 @@ For the CAGRA style search, use:
 cargo run --example gridsearch_cagra --features gpu --release
 ```
 
+If you wish to run the Navigating Spread-out Graph (NSG) version where the
+initial kNN is generated on the GPU, you can test this via:
+
+```bash
+cargo run --example gridsearch_nsg gpu --features gpu --release
+```
+
 Similar to the other benchmarks, index building, query against 10% slightly
 different data based on the trainings data and full kNN generation is being
 benchmarked. Index size in memory is also provided (however, GPU memory is not
@@ -425,6 +432,48 @@ data, NNDescent will have to do quite a few iterations. The Annoy
 initialisations are already very good, so the CPU version basically has no
 need for refining the kNN graph. On real data, the GPU outperforms more
 substantially.
+
+### Navigating Spread-out Graph (NSG) with GPU-accelerated kNN generation
+
+NSG needs an initial kNN graph to run the NSG optimisation on top. The standard
+CPU version is using NNDescent; however, you can also use the NNDescent
+algorithm that is used for CAGRA to initialise the kNN. This does make a
+difference on larger and larger data sets with higher and higher
+dimensionality.
+
+<details>
+<summary><b>NSG with CPU initialisation</b>:</summary>
+<pre><code>
+<!-- BENCH:nsg_cpu:euclidean:cell:128:250000 -->
+</code></pre>
+</details>
+
+---
+
+<details>
+<summary><b>NSG with GPU initialisation</b>:</summary>
+<pre><code>
+<!-- BENCH:nsg_gpu:euclidean:cell:128:250000 -->
+</code></pre>
+</details>
+
+---
+
+<details>
+<summary><b>NSG with CPU initialisation (more samples)</b>:</summary>
+<pre><code>
+<!-- BENCH:nsg_cpu:euclidean:cell:128:500000 -->
+</code></pre>
+</details>
+
+---
+
+<details>
+<summary><b>NSG with GPU initialisation (more samples)</b>:</summary>
+<pre><code>
+<!-- BENCH:nsg_gpu:euclidean:cell:128:500000 -->
+</code></pre>
+</details>
 
 ## Conclusions
 
