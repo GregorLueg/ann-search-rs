@@ -72,7 +72,7 @@ pub fn grid_2d(total_cubes: u32) -> (u32, u32) {
 ///
 /// True if `wg_y` is a multiple of `TILE_Q`
 pub fn tile_fits(wg_y: u32) -> bool {
-    wg_y as usize % TILE_Q == 0
+    (wg_y as usize).is_multiple_of(TILE_Q)
 }
 
 /// Shared-memory staging plan for the NNDescent local-join kernel.

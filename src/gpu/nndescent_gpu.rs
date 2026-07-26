@@ -639,7 +639,7 @@ pub fn local_join_shared<F: Float, N: Size>(
         // absolute ordering i < j there. Block bi is staged once per outer
         // iteration, not once per pair.
         let total_us = total_cands as usize;
-        let n_blocks = (total_us + block - 1usize) / block;
+        let n_blocks = total_us.div_ceil(block);
 
         let mut bi = 0usize;
         while bi < n_blocks {

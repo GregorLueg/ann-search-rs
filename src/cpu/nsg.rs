@@ -454,9 +454,9 @@ fn compute_centroid<T: AnnSearchFloat>(vectors_flat: &[T], n: usize, dim: usize)
     centroid
 }
 
-///////////////
-// MetricFn  //
-///////////////
+//////////////
+// MetricFn //
+//////////////
 
 /// Static-dispatch metric selector for the NSG build kernels.
 ///
@@ -472,12 +472,20 @@ trait MetricFn<T: AnnSearchFloat> {
 
 /// Squared Euclidean metric.
 struct SqEuclidMetric;
-/// Cosine metric (uses `NsgIndex::norms`).
-struct CosineMetric;
-/// Manhattan (L1) metric.
-struct ManhattanMetric;
 
 impl<T: AnnSearchFloat> MetricFn<T> for SqEuclidMetric {
+    /// Calculate squared Euclidean
+    ///
+    /// ### Params
+    ///
+    /// * `idx` - The [NsgIndex] index.
+    /// * `vec_p` - The query vector.
+    /// * `_norm_p` - The norm of the query (unused)
+    /// * `q` - Index of the DB vector
+    ///
+    /// ### Returns
+    ///
+    /// The squared Euclidean distance between idx and vec_p
     #[inline(always)]
     fn distance_from_vec(idx: &NsgIndex<T>, vec_p: &[T], _norm_p: T, q: usize) -> T {
         let dim = idx.dim;
@@ -485,7 +493,23 @@ impl<T: AnnSearchFloat> MetricFn<T> for SqEuclidMetric {
         T::euclidean_simd(vec_p, vec_q)
     }
 }
+
+/// Cosine metric (uses `NsgIndex::norms`).
+struct CosineMetric;
+
 impl<T: AnnSearchFloat> MetricFn<T> for CosineMetric {
+    /// Calculate Cosine distance
+    ///
+    /// ### Params
+    ///
+    /// * `idx` - The [NsgIndex] index.
+    /// * `vec_p` - The query vector.
+    /// * `norm_p` - The norm of the query
+    /// * `q` - Index of the DB vector
+    ///
+    /// ### Returns
+    ///
+    /// The Cosine distance between idx and vec_p
     #[inline(always)]
     fn distance_from_vec(idx: &NsgIndex<T>, vec_p: &[T], norm_p: T, q: usize) -> T {
         let dim = idx.dim;
@@ -494,7 +518,23 @@ impl<T: AnnSearchFloat> MetricFn<T> for CosineMetric {
         T::one() - (dot / (norm_p * idx.norms[q]))
     }
 }
+
+/// Manhattan (L1) metric.
+struct ManhattanMetric;
+
 impl<T: AnnSearchFloat> MetricFn<T> for ManhattanMetric {
+    /// Calculate Manhattan
+    ///
+    /// ### Params
+    ///
+    /// * `idx` - The [NsgIndex] index.
+    /// * `vec_p` - The query vector.
+    /// * `_norm_p` - The norm of the query (unused)
+    /// * `q` - Index of the DB vector
+    ///
+    /// ### Returns
+    ///
+    /// The Manhattan distance between idx and vec_p
     #[inline(always)]
     fn distance_from_vec(idx: &NsgIndex<T>, vec_p: &[T], _norm_p: T, q: usize) -> T {
         let dim = idx.dim;

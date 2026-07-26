@@ -194,9 +194,9 @@ impl RnnDescentBuildParams {
     }
 }
 
-////////////
-// Index  //
-////////////
+/////////////////////
+// RnnDescentIndex //
+/////////////////////
 
 /// Relative NN-Descent index.
 ///
@@ -749,6 +749,15 @@ where
 
         counter.load(AtomicOrdering::Relaxed)
     }
+
+    /// Memory usage in bytes.
+    pub fn memory_usage_bytes(&self) -> usize {
+        std::mem::size_of_val(self)
+            + self.vectors_flat.capacity() * std::mem::size_of::<T>()
+            + self.norms.capacity() * std::mem::size_of::<T>()
+            + self.graph.capacity() * std::mem::size_of::<u32>()
+            + self.forest.memory_usage_bytes()
+    }
 }
 
 ///////////
@@ -960,14 +969,7 @@ where
         }
     }
 
-    /// Memory usage in bytes.
-    pub fn memory_usage_bytes(&self) -> usize {
-        std::mem::size_of_val(self)
-            + self.vectors_flat.capacity() * std::mem::size_of::<T>()
-            + self.norms.capacity() * std::mem::size_of::<T>()
-            + self.graph.capacity() * std::mem::size_of::<u32>()
-            + self.forest.memory_usage_bytes()
-    }
+
 }
 
 ///////////////////

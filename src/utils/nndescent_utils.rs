@@ -233,9 +233,9 @@ pub fn find_target_boundaries<T>(updates: &[Update<T>]) -> Vec<usize> {
     boundaries
 }
 
-////////////
-// Trait  //
-////////////
+///////////
+// Trait //
+///////////
 
 /// Apply sorted neighbour updates to the flat kNN graph.
 ///
