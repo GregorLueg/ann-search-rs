@@ -2589,7 +2589,6 @@ pub fn build_nndescent_index_gpu<T, R>(
 where
     R: Runtime,
     T: AnnSearchFloat + AnnSearchGpuFloat,
-    NNDescentGpu<T, R>: NNDescentQuery<T>,
 {
     let metric = parse_ann_dist(dist_metric).unwrap_or_else(|| {
         println!("[WARNING] Weird string used for distance metric. Using default squared Euclidean distance");
@@ -2610,8 +2609,8 @@ where
 /// * `query_mat` - Query matrix [samples, features]
 /// * `index` - Reference to built index
 /// * `k` - Number of neighbours
-/// * `ef_search` - Beam width (default auto)
-/// * `query_params` - Optional GPU beam search parameters
+/// * `query_params` - Optional GPU beam search parameters. Pass
+///   `CagraGpuSearchParams::new(Some(ef), None, None, None)` to widen the beam.
 /// * `return_dist` - Return distances
 /// * `verbose` - Print progress
 ///
@@ -2622,7 +2621,6 @@ pub fn query_nndescent_index_gpu<T, R>(
     query_mat: MatRef<T>,
     index: &mut NNDescentGpu<T, R>,
     k: usize,
-    ef_search: Option<usize>,
     query_params: Option<CagraGpuSearchParams>,
     return_dist: bool,
     verbose: bool,
@@ -2630,60 +2628,31 @@ pub fn query_nndescent_index_gpu<T, R>(
 where
     R: Runtime,
     T: AnnSearchFloat + AnnSearchGpuFloat,
-    NNDescentGpu<T, R>: NNDescentQuery<T>,
 {
-    use rayon::prelude::*;
-
     let n_queries = query_mat.nrows();
-    let gpu_batch_threshold = 32;
 
-    if n_queries >= gpu_batch_threshold && ef_search.is_none() {
-        if verbose {
-            println!("  GPU batch query: {} vectors, k={}...", n_queries, k);
-        }
+    if verbose {
+        println!("  GPU batch query: {} vectors, k={}...", n_queries, k);
+    }
 
-        let queries_flat: Vec<T> = (0..n_queries)
-            .flat_map(|i| {
-                let row = query_mat.row(i);
-                if row.col_stride() == 1 {
-                    unsafe { std::slice::from_raw_parts(row.as_ptr(), row.ncols()) }.to_vec()
-                } else {
-                    row.iter().cloned().collect()
-                }
-            })
-            .collect();
+    let queries_flat: Vec<T> = (0..n_queries)
+        .flat_map(|i| {
+            let row = query_mat.row(i);
+            if row.col_stride() == 1 {
+                unsafe { std::slice::from_raw_parts(row.as_ptr(), row.ncols()) }.to_vec()
+            } else {
+                row.iter().cloned().collect()
+            }
+        })
+        .collect();
 
-        let (indices, distances) =
-            index.query_batch_gpu(&queries_flat, n_queries, query_params, k, 42)?;
+    let (indices, distances) =
+        index.query_batch_gpu(&queries_flat, n_queries, query_params, k, 42)?;
 
-        if return_dist {
-            Ok((indices, Some(distances)))
-        } else {
-            Ok((indices, None))
-        }
+    if return_dist {
+        Ok((indices, Some(distances)))
     } else {
-        if verbose {
-            println!(
-                "  CPU beam search: {} vectors (ef={:?})...",
-                n_queries, ef_search
-            );
-        }
-
-        let results: Vec<(Vec<usize>, Vec<T>)> = (0..n_queries)
-            .into_par_iter()
-            .map(|i| {
-                let row = query_mat.row(i);
-                index.query_row(row, k, ef_search)
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-
-        if return_dist {
-            let (indices, distances) = results.into_iter().unzip();
-            Ok((indices, Some(distances)))
-        } else {
-            let indices = results.into_iter().map(|(idx, _)| idx).collect();
-            Ok((indices, None))
-        }
+        Ok((indices, None))
     }
 }
 
@@ -2708,7 +2677,6 @@ pub fn extract_nndescent_knn_gpu<T, R>(
 where
     R: Runtime,
     T: AnnSearchFloat + AnnSearchGpuFloat,
-    NNDescentGpu<T, R>: NNDescentQuery<T>,
 {
     index.extract_knn(return_dist)
 }
@@ -2739,7 +2707,6 @@ pub fn query_nndescent_index_gpu_self<T, R>(
 where
     R: Runtime,
     T: AnnSearchFloat + AnnSearchGpuFloat,
-    NNDescentGpu<T, R>: NNDescentQuery<T>,
 {
     let (indices, distances) = index.self_query_gpu(k, query_params, 42)?;
 
@@ -2803,8 +2770,8 @@ where
 ///
 /// Companion to [`build_nsg_from_gpu_nndescent`] for callers that used
 /// [`build_knn_graph_gpu`] instead of the full CAGRA-optimised
-/// [`build_nndescent_index_gpu`]. Cheaper end-to-end: no CAGRA kernels,
-/// no CPU distance recompute, no second graph copy in memory.
+/// [`build_nndescent_index_gpu`]. Cheaper end-to-end: no CAGRA kernels and
+/// no second graph copy in memory.
 ///
 /// ### Params
 ///

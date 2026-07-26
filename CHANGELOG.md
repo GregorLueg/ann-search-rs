@@ -14,6 +14,14 @@
 - **GPU improvements:**
   - Improved speed for exhaustive, IVF and CAGRA GPU indices. Up to 2x faster
     on Apple Silicon via better kernel design.
+  - Dropped the CPU beam-search fallback from the CAGRA GPU index. Every query
+    batch now goes through the GPU beam search. `query_nndescent_index_gpu`
+    loses its `ef_search` parameter; use
+    `CagraGpuSearchParams::new(Some(ef), None, None, None)` instead.
+  - The CAGRA build no longer recomputes the navigational graph distances on
+    the CPU. Those distances were only ever read by the removed fallback, so
+    this drops an `O(n * k * dim)` host pass and shrinks the navigational graph
+    from 16 to 4 bytes per edge.
 
 ## 0.4.4
 

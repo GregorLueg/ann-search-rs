@@ -31,14 +31,11 @@
 
 use cubecl::frontend::{Atomic, CubePrimitive, Float, SharedMemory};
 use cubecl::prelude::*;
-use faer::{MatRef, RowRef};
-use fixedbitset::FixedBitSet;
+use faer::MatRef;
 use rayon::prelude::*;
 use std::time::Instant;
-use std::{cell::RefCell, cmp::Reverse, collections::BinaryHeap};
 use thousands::*;
 
-use crate::cpu::nndescent::*;
 use crate::cpu::vamana::compute_medoid;
 use crate::gpu::cagra_gpu_search::*;
 use crate::gpu::forest_gpu::*;
@@ -1335,238 +1332,6 @@ pub fn cagra_merge_graphs(
     }
 }
 
-//////////////
-// Querying //
-//////////////
-
-thread_local! {
-static QUERY_VISITED: RefCell<FixedBitSet> = const { RefCell::new(FixedBitSet::new()) };
-static QUERY_CANDIDATES_F32: QueryCandF32 =
-    const { RefCell::new(BinaryHeap::new()) };
-static QUERY_CANDIDATES_F64: QueryCandF64 =
-    const { RefCell::new(BinaryHeap::new()) };
-static QUERY_RESULTS_F32: RefCell<BinaryHeap<(OrderedFloat<f32>, usize)>> =
-    const { RefCell::new(BinaryHeap::new()) };
-static QUERY_RESULTS_F64: RefCell<BinaryHeap<(OrderedFloat<f64>, usize)>> =
-    const { RefCell::new(BinaryHeap::new()) };
-}
-
-/// Generates the `NNDescentQuery` impl for a concrete float type.
-macro_rules! impl_nndescent_gpu_query {
-    ($float:ty, $cand_tls:ident, $res_tls:ident) => {
-        impl<R: Runtime> NNDescentQuery<$float> for NNDescentGpu<$float, R> {
-            fn query_internal(
-                &self,
-                query_vec: &[$float],
-                query_norm: $float,
-                k: usize,
-                ef: usize,
-            ) -> Result<(Vec<usize>, Vec<$float>), AnnSearchErrors> {
-                QUERY_VISITED.with(|visited_cell| {
-                    $cand_tls.with(|cand_cell| {
-                        $res_tls.with(|res_cell| {
-                            let mut visited = visited_cell.borrow_mut();
-                            let mut candidates = cand_cell.borrow_mut();
-                            let mut results = res_cell.borrow_mut();
-
-                            visited.clear();
-                            visited.grow(self.n);
-                            candidates.clear();
-                            results.clear();
-
-                            match self.metric {
-                                Dist::SquaredEuclidean => self.query_euclidean(
-                                    query_vec,
-                                    k,
-                                    ef,
-                                    &mut visited,
-                                    &mut candidates,
-                                    &mut results,
-                                ),
-                                Dist::Cosine => self.query_cosine(
-                                    query_vec,
-                                    query_norm,
-                                    k,
-                                    ef,
-                                    &mut visited,
-                                    &mut candidates,
-                                    &mut results,
-                                ),
-                                Dist::Manhattan => unreachable!(),
-                            }
-                        })
-                    })
-                })
-            }
-
-            #[inline(always)]
-            fn query_euclidean(
-                &self,
-                query_vec: &[$float],
-                k: usize,
-                ef: usize,
-                visited: &mut FixedBitSet,
-                candidates: &mut BinaryHeap<Reverse<(OrderedFloat<$float>, usize)>>,
-                results: &mut BinaryHeap<(OrderedFloat<$float>, usize)>,
-            ) -> Result<(Vec<usize>, Vec<$float>), AnnSearchErrors> {
-                let init_indices = self
-                    .router
-                    .find_entry_points(query_vec, (ef / 2).max(2 * k).min(self.n));
-
-                for &entry_idx in &init_indices {
-                    if entry_idx >= self.n || visited.contains(entry_idx) {
-                        continue;
-                    }
-                    visited.insert(entry_idx);
-                    let dist = self.euclidean_distance_to_query(entry_idx, query_vec);
-                    candidates.push(Reverse((OrderedFloat(dist), entry_idx)));
-                    results.push((OrderedFloat(dist), entry_idx));
-                }
-
-                while results.len() > ef {
-                    results.pop();
-                }
-
-                let mut lower_bound = if results.len() >= ef {
-                    results.peek().unwrap().0 .0
-                } else {
-                    <$float>::MAX
-                };
-
-                while let Some(Reverse((OrderedFloat(curr_dist), curr_idx))) = candidates.pop() {
-                    if curr_dist > lower_bound {
-                        break;
-                    }
-
-                    for &(nbr_idx, _) in self.graph_neighbours(curr_idx) {
-                        if nbr_idx == SENTINEL_PID || visited.contains(nbr_idx) {
-                            continue;
-                        }
-                        visited.insert(nbr_idx);
-
-                        let dist = self.euclidean_distance_to_query(nbr_idx, query_vec);
-
-                        if dist < lower_bound || results.len() < ef {
-                            candidates.push(Reverse((OrderedFloat(dist), nbr_idx)));
-
-                            if results.len() < ef {
-                                results.push((OrderedFloat(dist), nbr_idx));
-                                if results.len() == ef {
-                                    lower_bound = results.peek().unwrap().0 .0;
-                                }
-                            } else if dist < lower_bound {
-                                results.pop();
-                                results.push((OrderedFloat(dist), nbr_idx));
-                                lower_bound = results.peek().unwrap().0 .0;
-                            }
-                        }
-                    }
-                }
-
-                let mut final_results: Vec<_> = results.drain().collect();
-                final_results.sort_unstable_by(|a, b| a.0.cmp(&b.0));
-                final_results.truncate(k);
-
-                Ok(final_results
-                    .into_iter()
-                    .map(|(OrderedFloat(d), i)| (i, d))
-                    .unzip())
-            }
-
-            #[inline(always)]
-            fn query_cosine(
-                &self,
-                query_vec: &[$float],
-                query_norm: $float,
-                k: usize,
-                ef: usize,
-                visited: &mut FixedBitSet,
-                candidates: &mut BinaryHeap<Reverse<(OrderedFloat<$float>, usize)>>,
-                results: &mut BinaryHeap<(OrderedFloat<$float>, usize)>,
-            ) -> Result<(Vec<usize>, Vec<$float>), AnnSearchErrors> {
-                let init_indices = self
-                    .router
-                    .find_entry_points(query_vec, (ef / 2).max(2 * k).min(self.n));
-
-                for &entry_idx in &init_indices {
-                    if entry_idx >= self.n || visited.contains(entry_idx) {
-                        continue;
-                    }
-                    visited.insert(entry_idx);
-                    let dist = self.cosine_distance_to_query(entry_idx, query_vec, query_norm);
-                    candidates.push(Reverse((OrderedFloat(dist), entry_idx)));
-                    results.push((OrderedFloat(dist), entry_idx));
-                }
-
-                while results.len() > ef {
-                    results.pop();
-                }
-
-                let mut lower_bound = if results.len() >= ef {
-                    results.peek().unwrap().0 .0
-                } else {
-                    <$float>::MAX
-                };
-
-                while let Some(Reverse((OrderedFloat(curr_dist), curr_idx))) = candidates.pop() {
-                    if curr_dist > lower_bound {
-                        break;
-                    }
-
-                    for &(nbr_idx, _) in self.graph_neighbours(curr_idx) {
-                        if nbr_idx == SENTINEL_PID || visited.contains(nbr_idx) {
-                            continue;
-                        }
-                        visited.insert(nbr_idx);
-
-                        let dist = self.cosine_distance_to_query(nbr_idx, query_vec, query_norm);
-
-                        if dist < lower_bound || results.len() < ef {
-                            candidates.push(Reverse((OrderedFloat(dist), nbr_idx)));
-
-                            if results.len() < ef {
-                                results.push((OrderedFloat(dist), nbr_idx));
-                                if results.len() == ef {
-                                    lower_bound = results.peek().unwrap().0 .0;
-                                }
-                            } else if dist < lower_bound {
-                                results.pop();
-                                results.push((OrderedFloat(dist), nbr_idx));
-                                lower_bound = results.peek().unwrap().0 .0;
-                            }
-                        }
-                    }
-                }
-
-                let mut final_results: Vec<_> = results.drain().collect();
-                final_results.sort_unstable_by(|a, b| a.0.cmp(&b.0));
-                final_results.truncate(k);
-
-                Ok(final_results
-                    .into_iter()
-                    .map(|(OrderedFloat(d), i)| (i, d))
-                    .unzip())
-            }
-
-            #[inline(always)]
-            fn query_manhattan(
-                &self,
-                _query_vec: &[$float],
-                _k: usize,
-                _ef: usize,
-                _visited: &mut FixedBitSet,
-                _candidates: &mut BinaryHeap<Reverse<(OrderedFloat<$float>, usize)>>,
-                _results: &mut BinaryHeap<(OrderedFloat<$float>, usize)>,
-            ) -> Result<(Vec<usize>, Vec<$float>), AnnSearchErrors> {
-                unreachable!("NNDescentGpu does not support Manhattan distance")
-            }
-        }
-    };
-}
-
-impl_nndescent_gpu_query!(f32, QUERY_CANDIDATES_F32, QUERY_RESULTS_F32);
-impl_nndescent_gpu_query!(f64, QUERY_CANDIDATES_F64, QUERY_RESULTS_F64);
-
 //////////////////
 // NNDescentGpu //
 //////////////////
@@ -1598,9 +1363,11 @@ pub struct NNDescentGpu<T: AnnSearchFloat + AnnSearchGpuFloat, R: Runtime> {
     /// True kNN graph of size n * k, sorted by distance per row.
     /// Extracted from NNDescent output before CAGRA pruning.
     knn_graph: Vec<(usize, T)>,
-    /// CAGRA navigational graph of size n * k, used for beam search.
-    /// NOT a faithful kNN graph -- edges are reordered for reachability.
-    nav_graph: Vec<(usize, T)>,
+    /// CAGRA navigational graph of size n * k, used for GPU beam search.
+    /// Raw node IDs with `0x7FFFFFFF` sentinels in unfilled slots, in the
+    /// order the CAGRA kernels emitted them. NOT a faithful kNN graph --
+    /// edges are reordered for reachability and carry no distances.
+    nav_graph: Vec<u32>,
     /// Whether NNDescent hit the delta threshold
     converged: bool,
     /// Forest router for query entry points (replaces Annoy)
@@ -1697,7 +1464,6 @@ impl<T, R> NNDescentGpu<T, R>
 where
     R: Runtime,
     T: AnnSearchFloat + cubecl::frontend::Float + cubecl::CubeElement,
-    Self: NNDescentQuery<T>,
 {
     /// Build a kNN graph on the GPU via NNDescent + CAGRA optimisation.
     ///
@@ -2172,41 +1938,13 @@ where
             println!("  CAGRA optimisation: {:.2?}", cagra_start.elapsed());
         }
 
-        // ---- 6: Download CAGRA graph and compute CPU distances ----
+        // ---- 6: Download the CAGRA graph ----
+        // Node IDs only, stored verbatim. `cagra_rank_prune_shared` already
+        // strips the new-edge flag bit and `cagra_merge_graphs` pads with the
+        // sentinel, so this is byte-identical to what the beam search kernel
+        // reads from `final_idx_gpu` on the retained-GPU path.
 
-        let final_idx = final_idx_gpu.clone().read(&client)?;
-        let pid_mask = 0x7FFFFFFFu32;
-        let sentinel = 0x7FFFFFFFusize;
-
-        let mut cagra_graph = vec![(sentinel, <T as num_traits::Float>::max_value()); n * k];
-
-        cagra_graph
-            .par_chunks_mut(k)
-            .enumerate()
-            .for_each(|(i, slot)| {
-                for j in 0..k {
-                    let raw = final_idx[i * k + j];
-                    let pid = (raw & pid_mask) as usize;
-
-                    if pid < n && pid != sentinel {
-                        let a = &vectors_flat[i * dim..(i + 1) * dim];
-                        let b = &vectors_flat[pid * dim..(pid + 1) * dim];
-                        let dist = match metric {
-                            Dist::SquaredEuclidean => T::euclidean_simd(a, b),
-                            Dist::Cosine => {
-                                let dot = T::dot_simd(a, b);
-                                T::one() - dot / (norms[i] * norms[pid])
-                            }
-                            Dist::Manhattan => unreachable!(),
-                        };
-                        slot[j] = (pid, dist);
-                    }
-                }
-
-                slot.sort_unstable_by(|a, b| {
-                    a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal)
-                });
-            });
+        let cagra_graph = final_idx_gpu.clone().read(&client)?;
 
         if verbose {
             println!("  Total build time: {:.2?}", start.elapsed());
@@ -2242,72 +1980,11 @@ where
     // Query //
     ///////////
 
-    /// Query for k nearest neighbours using beam search.
-    ///
-    /// ### Params
-    ///
-    /// * `query_vec` - Query vector (must match index dimensionality)
-    /// * `k` - Number of neighbours to return
-    /// * `ef_search` - Beam width. Higher values improve recall at the
-    ///   cost of latency. Defaults to `max(2*k, 50)` clamped to 200.
-    ///
-    /// ### Returns
-    ///
-    /// `(indices, distances)` sorted by distance ascending
-    pub fn query(
-        &self,
-        query_vec: &[T],
-        k: usize,
-        ef_search: Option<usize>,
-    ) -> Result<(Vec<usize>, Vec<T>), AnnSearchErrors> {
-        let k = k.min(self.n);
-        let ef = ef_search.unwrap_or_else(|| (k * 2).clamp(50, 200)).max(k);
-
-        let query_norm = if self.metric == Dist::Cosine {
-            num_traits::Float::sqrt(query_vec.iter().map(|x| *x * *x).sum::<T>())
-        } else {
-            T::one()
-        };
-
-        self.query_internal(query_vec, query_norm, k, ef)
-    }
-
-    /// Query using a matrix row reference.
-    ///
-    /// Uses a zero-copy path when stride is 1, otherwise copies to a
-    /// temporary vector.
-    ///
-    /// ### Params
-    ///
-    /// * `query_row` - Row reference into a faer matrix
-    /// * `k` - Number of neighbours to return
-    /// * `ef_search` - Beam width; see `query` for details
-    ///
-    /// ### Returns
-    ///
-    /// `(indices, distances)` sorted by distance ascending
-    #[inline]
-    pub fn query_row(
-        &self,
-        query_row: RowRef<T>,
-        k: usize,
-        ef_search: Option<usize>,
-    ) -> Result<(Vec<usize>, Vec<T>), AnnSearchErrors> {
-        if query_row.col_stride() == 1 {
-            let slice =
-                unsafe { std::slice::from_raw_parts(query_row.as_ptr(), query_row.ncols()) };
-            return self.query(slice, k, ef_search);
-        }
-
-        let query_vec: Vec<T> = query_row.iter().cloned().collect();
-        self.query(&query_vec, k, ef_search)
-    }
-
     /// Batch query via GPU beam search on the CAGRA navigational graph.
     ///
     /// Re-uploads tensors if they were not retained during build.
-    /// For small batch sizes (< ~32), the CPU path may be faster due
-    /// to kernel launch overhead.
+    /// Small batches (< ~32 queries) are dominated by kernel launch
+    /// overhead rather than search cost.
     ///
     /// ### Params
     ///
@@ -2418,19 +2095,6 @@ where
     // Utils //
     ///////////
 
-    /// Return the CAGRA navigational neighbours of node `idx`.
-    ///
-    /// ### Params
-    ///
-    /// * `idx` - Node index
-    ///
-    /// ### Returns
-    ///
-    /// Slice of `(neighbour_index, distance)` pairs, length `k`
-    fn graph_neighbours(&self, idx: usize) -> &[(usize, T)] {
-        &self.nav_graph[idx * self.k..(idx + 1) * self.k]
-    }
-
     /// Whether NNDescent reached the convergence threshold during construction.
     ///
     /// ### Returns
@@ -2453,7 +2117,7 @@ where
         std::mem::size_of_val(self)
             + self.vectors_flat.capacity() * std::mem::size_of::<T>()
             + self.norms.capacity() * std::mem::size_of::<T>()
-            + self.nav_graph.capacity() * std::mem::size_of::<(usize, T)>()
+            + self.nav_graph.capacity() * std::mem::size_of::<u32>()
             + self.knn_graph.capacity() * std::mem::size_of::<(usize, T)>()
     }
 
@@ -2613,9 +2277,8 @@ where
             GpuTensor::<R, T>::from_slice(&[T::zero()], vec![1], &client)
         });
 
-        let nav_flat: Vec<u32> = self.nav_graph.iter().map(|&(pid, _)| pid as u32).collect();
         self.nav_graph_gpu = Some(GpuTensor::<R, u32>::from_slice(
-            &nav_flat,
+            &self.nav_graph,
             vec![self.n, self.k],
             &client,
         ));
@@ -2632,8 +2295,7 @@ where
 /// A slim counterpart to [`NNDescentGpu`] aimed at consumers that only need a
 /// true k-nearest-neighbour graph (NSG feeding, downstream MRNG pruning, plain
 /// kNN extraction) and do not want to pay for CAGRA's rank-prune +
-/// reverse-merge kernels, the CPU distance recomputation pass, or the second
-/// `nav_graph` copy in memory.
+/// reverse-merge kernels or the second `nav_graph` copy in memory.
 ///
 /// The graph is exactly `n * k` `(pid, dist)` pairs. Rows are sorted ascending
 /// by distance and sentinel-padded when NNDescent returned fewer than `k` valid
@@ -2660,8 +2322,7 @@ pub struct KnnGraphGpu<T> {
 /// Build a raw kNN graph on the GPU without touching the CAGRA path.
 ///
 /// Reuses every kernel that [`NNDescentGpu::build`] uses for the NNDescent
-/// phase but skips the CAGRA rank-prune, reverse-merge, and the CPU distance
-/// recomputation that follows.
+/// phase but skips the CAGRA rank-prune and reverse-merge that follow.
 ///
 /// Query methods are deliberately absent: `KnnGraphGpu` is a data
 /// handoff, not a queryable index. Feed it to [`NsgIndex::build_from_gpu_knn`]
@@ -3144,12 +2805,8 @@ mod tests {
         .unwrap();
 
         assert_eq!(index.nav_graph.len(), 20 * 5);
-        for i in 0..20 {
-            let nbrs = index.graph_neighbours(i);
-            assert_eq!(nbrs.len(), 5);
-            for w in nbrs.windows(2) {
-                assert!(w[1].1 >= w[0].1);
-            }
+        for &pid in &index.nav_graph {
+            assert!(pid < 20 || pid == 0x7FFFFFFF, "bogus node ID {pid}");
         }
     }
 
