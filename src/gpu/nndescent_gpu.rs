@@ -556,10 +556,10 @@ pub fn local_join_shared<F: Float, N: Size>(
     if single_block {
         // -- Unblocked fast path --
         //
-        // Every candidate vector fits in buffer A, so this is the original
-        // kernel verbatim: one staging pass, one row-walk over the full
-        // candidate upper triangle. `shared_vecs_b` has length 1 and is never
-        // touched, so the footprint matches the pre-blocking kernel exactly.
+        // Every candidate vector fits in buffer A, so one row-walk over the
+        // full candidate upper triangle. `shared_vecs_b` has length 1 and is
+        // never touched, so the footprint matches the pre-blocking kernel
+        // exactly.
         let total_scalars = total_cands as usize * dim_scalars;
         let mut idx_load = tx as usize;
         while idx_load < total_scalars {
@@ -878,7 +878,7 @@ pub fn merge_proposals<F: Float>(
         local_dist[j] = graph_dist[base + j];
     }
 
-    // read how many proposals this node received (capped at max_proposals)
+    // Read how many proposals this node received (capped at max_proposals)
     let raw_count = prop_count[node as usize];
     let prop_base = node as usize * max_proposals as usize;
     let mut improvements = 0u32;
