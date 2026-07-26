@@ -51,9 +51,10 @@ use std::path::Path;
 
 use crate::cpu::{
     annoy::*, ball_tree::*, exhaustive::*, hnsw::*, ivf::*, kd_forest::*, kmknn::*, lsh::*,
-    nndescent::*, vamana::*,
+    nndescent::*, nsg::*, rnn_descent::*, vamana::*,
 };
 use crate::prelude::*;
+use crate::utils::nndescent_utils::ApplySortedUpdates;
 
 #[cfg(feature = "binary")]
 use crate::binary::{
@@ -1001,7 +1002,11 @@ where
 /// * `delta` - Early stop criterium for the algorithm.
 /// * `rho` - Sampling rate for the old neighbours. Will adaptively decrease
 ///   over time.
-/// * `diversify_prob` - Probability of pruning redundant edges (1.0 = always prune)
+/// * `diversify_prob` - Bernoulli probability of pruning a redundant edge
+///   per candidate/kept pair, applied post-descent to the forward+reverse
+///   candidate pool per node. `0.0` disables pruning; `1.0` always prunes
+///   when the RNG rule fires. Rows shorter than `k` after pruning are
+///   topped up from the pruned tail so out-degree is preserved.
 /// * `seed` - Random seed for reproducibility
 /// * `verbose` - Controls verbosity of the algorithm
 ///
@@ -1216,6 +1221,267 @@ where
     VamanaIndex<T>: VamanaState<T>,
 {
     index.generate_knn(k, ef_search, return_dist, verbose)
+}
+
+/////////
+// NSG //
+/////////
+
+/// Build an NSG index.
+///
+/// NSG (Navigating Spreading-out Graph) is a directed navigable graph
+/// obtained by MRNG-pruning an approximate kNN graph and patching
+/// connectivity via a DFS from a single navigating node. This entry point
+/// builds the input kNN graph internally via NN-Descent.
+///
+/// ### Params
+///
+/// * `mat` - Data matrix (rows are samples, columns are dimensions)
+/// * `r` - Maximum out-degree of the NSG graph
+/// * `l_build` - Beam width for the per-node candidate search on the input
+///   kNN graph
+/// * `c` - Cap on the candidate-set size before MRNG pruning
+/// * `knn_k` - Degree of the internal kNN graph (fed to NN-Descent)
+/// * `dist_metric` - Distance metric: `"euclidean"`, `"cosine"`, or
+///   `"manhattan"`
+/// * `seed` - Random seed for reproducibility
+/// * `verbose` - Print progress
+///
+/// ### Returns
+///
+/// The built [`NsgIndex`] on success.
+#[allow(clippy::too_many_arguments)]
+pub fn build_nsg_index<T>(
+    mat: MatRef<T>,
+    r: usize,
+    l_build: usize,
+    c: usize,
+    knn_k: usize,
+    dist_metric: &str,
+    seed: usize,
+    verbose: bool,
+) -> Result<NsgIndex<T>, AnnSearchErrors>
+where
+    T: AnnSearchFloat,
+    NsgIndex<T>: NsgState<T>,
+    NNDescent<T>: ApplySortedUpdates<T> + NNDescentQuery<T>,
+{
+    let metric = parse_ann_dist(dist_metric).unwrap_or_else(|| {
+        println!("[WARNING] Weird string used for distance metric. Using default squared Euclidean distance");
+        Dist::default()
+    });
+
+    let params = NsgBuildParams::new(r, l_build, c, knn_k);
+    NsgIndex::build(mat, metric, params, seed, verbose)
+}
+
+/// Build an NSG index reusing an already-built NN-Descent index.
+///
+/// Avoids the cost of a second NN-Descent build when the caller already has
+/// one. The `mat` argument must be the same matrix that was fed to
+/// [`NNDescent::new`]; NSG re-flattens it into its own storage.
+///
+/// ### Params
+///
+/// * `nndescent_idx` - Reference to a pre-built NN-Descent index
+/// * `r` - Maximum out-degree of the NSG graph
+/// * `l_build` - Beam width for the per-node candidate search
+/// * `c` - Cap on the candidate-set size before MRNG pruning
+/// * `seed` - Random seed for reproducibility
+/// * `verbose` - Print progress
+///
+/// ### Returns
+///
+/// The built [`NsgIndex`] on success.
+#[allow(clippy::too_many_arguments)]
+pub fn build_nsg_from_knn_index<T>(
+    nndescent_idx: &NNDescent<T>,
+    r: usize,
+    l_build: usize,
+    c: usize,
+    seed: usize,
+    verbose: bool,
+) -> Result<NsgIndex<T>, AnnSearchErrors>
+where
+    T: AnnSearchFloat,
+    NsgIndex<T>: NsgState<T>,
+    NNDescent<T>: ApplySortedUpdates<T> + NNDescentQuery<T>,
+{
+    let params = NsgBuildParams::new(r, l_build, c, nndescent_idx.k);
+    NsgIndex::build_from_nndescent(nndescent_idx, params, seed, verbose)
+}
+
+/// Query an NSG index with an external query matrix.
+///
+/// ### Params
+///
+/// * `query_mat` - Query matrix (samples x features)
+/// * `index` - Reference to the built index
+/// * `k` - Number of neighbours to return
+/// * `ef_search` - Optional beam width override. Defaults to `100` if `None`
+/// * `return_dist` - Whether to return distances
+/// * `verbose` - Print progress every 100_000 samples
+///
+/// ### Returns
+///
+/// A tuple of `(knn_indices, optional distances)`.
+pub fn query_nsg_index<T>(
+    query_mat: MatRef<T>,
+    index: &NsgIndex<T>,
+    k: usize,
+    ef_search: Option<usize>,
+    return_dist: bool,
+    verbose: bool,
+) -> KnnOptionResult<T>
+where
+    T: AnnSearchFloat,
+    NsgIndex<T>: NsgState<T>,
+{
+    query_parallel(query_mat.nrows(), return_dist, verbose, |i| {
+        index.query_row(query_mat.row(i), k, ef_search)
+    })
+}
+
+/// Self-query an NSG index to generate a full kNN graph.
+///
+/// ### Params
+///
+/// * `index` - Reference to the built index
+/// * `k` - Number of neighbours to return
+/// * `ef_search` - Optional beam width override
+/// * `return_dist` - Whether to return distances
+/// * `verbose` - Print progress every 100_000 samples
+///
+/// ### Returns
+///
+/// A tuple of `(knn_indices, optional distances)`.
+pub fn query_nsg_self<T>(
+    index: &NsgIndex<T>,
+    k: usize,
+    ef_search: Option<usize>,
+    return_dist: bool,
+    verbose: bool,
+) -> KnnOptionResult<T>
+where
+    T: AnnSearchFloat,
+    NsgIndex<T>: NsgState<T>,
+{
+    index.generate_knn(k, ef_search, return_dist, verbose)
+}
+
+/////////////////////////
+// Relative NN-Descent //
+/////////////////////////
+
+/// Build a Relative NN-Descent (RNN-Descent) index.
+///
+/// Folds RNG-style pruning into the NN-Descent update loop so one pass
+/// produces a search-ready graph. Paper defaults: `s=20`, `r=96`, `t1=4`,
+/// `t2=15`.
+///
+/// ### Params
+///
+/// * `mat` - Data matrix (rows are samples, columns are dimensions)
+/// * `s` - Initial out-degree of the random seed graph
+/// * `r` - Maximum per-node adjacency
+/// * `t1` - Outer rounds
+/// * `t2` - UpdateNeighbors passes per outer round
+/// * `dist_metric` - Distance metric: `"euclidean"`, `"cosine"`, or
+///   `"manhattan"`
+/// * `n_trees` - Kd-forest size for query entry points. `None` picks a
+///   dataset-scaled default `min(5 + n^0.25 / 2, 16)`.
+/// * `seed` - Random seed for reproducibility
+/// * `verbose` - Print progress
+///
+/// ### Returns
+///
+/// The built [`RnnDescentIndex`] on success.
+#[allow(clippy::too_many_arguments)]
+pub fn build_rnn_descent_index<T>(
+    mat: MatRef<T>,
+    s: usize,
+    r: usize,
+    t1: usize,
+    t2: usize,
+    dist_metric: &str,
+    n_trees: Option<usize>,
+    seed: usize,
+    verbose: bool,
+) -> Result<RnnDescentIndex<T>, AnnSearchErrors>
+where
+    T: AnnSearchFloat,
+    RnnDescentIndex<T>: RnnDescentState<T> + ApplySortedUpdates<T>,
+{
+    let metric = parse_ann_dist(dist_metric).unwrap_or_else(|| {
+        println!("[WARNING] Weird string used for distance metric. Using default squared Euclidean distance");
+        Dist::default()
+    });
+
+    let params = RnnDescentBuildParams::new(s, r, t1, t2);
+    RnnDescentIndex::build(mat, metric, params, n_trees, seed, verbose)
+}
+
+/// Query an RNN-Descent index with an external query matrix.
+///
+/// ### Params
+///
+/// * `query_mat` - Query matrix (samples x features)
+/// * `index` - Reference to the built index
+/// * `k` - Number of neighbours to return
+/// * `ef_search` - Optional beam width override (defaults to `100`)
+/// * `k_search` - Optional per-hop out-degree cap (default `min(32, R)`),
+///   the paper's search-time `K` (Ono & Matsui 2023, Section 4.4)
+/// * `return_dist` - Whether to return distances
+/// * `verbose` - Print progress every 100_000 samples
+///
+/// ### Returns
+///
+/// A tuple of `(knn_indices, optional distances)`.
+pub fn query_rnn_descent_index<T>(
+    query_mat: MatRef<T>,
+    index: &RnnDescentIndex<T>,
+    k: usize,
+    ef_search: Option<usize>,
+    k_search: Option<usize>,
+    return_dist: bool,
+    verbose: bool,
+) -> KnnOptionResult<T>
+where
+    T: AnnSearchFloat,
+    RnnDescentIndex<T>: RnnDescentState<T>,
+{
+    query_parallel(query_mat.nrows(), return_dist, verbose, |i| {
+        index.query_row(query_mat.row(i), k, ef_search, k_search)
+    })
+}
+
+/// Self-query an RNN-Descent index for a full kNN graph.
+///
+/// ### Params
+///
+/// * `index` - Reference to the built index
+/// * `k` - Number of neighbours to return
+/// * `ef_search` - Optional beam width override
+/// * `k_search` - Optional per-hop out-degree cap (default `min(32, R)`)
+/// * `return_dist` - Whether to return distances
+/// * `verbose` - Print progress every 100_000 samples
+///
+/// ### Returns
+///
+/// A tuple of `(knn_indices, optional distances)`.
+pub fn query_rnn_descent_self<T>(
+    index: &RnnDescentIndex<T>,
+    k: usize,
+    ef_search: Option<usize>,
+    k_search: Option<usize>,
+    return_dist: bool,
+    verbose: bool,
+) -> KnnOptionResult<T>
+where
+    T: AnnSearchFloat,
+    RnnDescentIndex<T>: RnnDescentState<T>,
+{
+    index.generate_knn(k, ef_search, k_search, return_dist, verbose)
 }
 
 ///////////////
@@ -2323,7 +2589,6 @@ pub fn build_nndescent_index_gpu<T, R>(
 where
     R: Runtime,
     T: AnnSearchFloat + AnnSearchGpuFloat,
-    NNDescentGpu<T, R>: NNDescentQuery<T>,
 {
     let metric = parse_ann_dist(dist_metric).unwrap_or_else(|| {
         println!("[WARNING] Weird string used for distance metric. Using default squared Euclidean distance");
@@ -2344,8 +2609,8 @@ where
 /// * `query_mat` - Query matrix [samples, features]
 /// * `index` - Reference to built index
 /// * `k` - Number of neighbours
-/// * `ef_search` - Beam width (default auto)
-/// * `query_params` - Optional GPU beam search parameters
+/// * `query_params` - Optional GPU beam search parameters. Pass
+///   `CagraGpuSearchParams::new(Some(ef), None, None, None)` to widen the beam.
 /// * `return_dist` - Return distances
 /// * `verbose` - Print progress
 ///
@@ -2356,7 +2621,6 @@ pub fn query_nndescent_index_gpu<T, R>(
     query_mat: MatRef<T>,
     index: &mut NNDescentGpu<T, R>,
     k: usize,
-    ef_search: Option<usize>,
     query_params: Option<CagraGpuSearchParams>,
     return_dist: bool,
     verbose: bool,
@@ -2364,60 +2628,31 @@ pub fn query_nndescent_index_gpu<T, R>(
 where
     R: Runtime,
     T: AnnSearchFloat + AnnSearchGpuFloat,
-    NNDescentGpu<T, R>: NNDescentQuery<T>,
 {
-    use rayon::prelude::*;
-
     let n_queries = query_mat.nrows();
-    let gpu_batch_threshold = 32;
 
-    if n_queries >= gpu_batch_threshold && ef_search.is_none() {
-        if verbose {
-            println!("  GPU batch query: {} vectors, k={}...", n_queries, k);
-        }
+    if verbose {
+        println!("  GPU batch query: {} vectors, k={}...", n_queries, k);
+    }
 
-        let queries_flat: Vec<T> = (0..n_queries)
-            .flat_map(|i| {
-                let row = query_mat.row(i);
-                if row.col_stride() == 1 {
-                    unsafe { std::slice::from_raw_parts(row.as_ptr(), row.ncols()) }.to_vec()
-                } else {
-                    row.iter().cloned().collect()
-                }
-            })
-            .collect();
+    let queries_flat: Vec<T> = (0..n_queries)
+        .flat_map(|i| {
+            let row = query_mat.row(i);
+            if row.col_stride() == 1 {
+                unsafe { std::slice::from_raw_parts(row.as_ptr(), row.ncols()) }.to_vec()
+            } else {
+                row.iter().cloned().collect()
+            }
+        })
+        .collect();
 
-        let (indices, distances) =
-            index.query_batch_gpu(&queries_flat, n_queries, query_params, k, 42)?;
+    let (indices, distances) =
+        index.query_batch_gpu(&queries_flat, n_queries, query_params, k, 42)?;
 
-        if return_dist {
-            Ok((indices, Some(distances)))
-        } else {
-            Ok((indices, None))
-        }
+    if return_dist {
+        Ok((indices, Some(distances)))
     } else {
-        if verbose {
-            println!(
-                "  CPU beam search: {} vectors (ef={:?})...",
-                n_queries, ef_search
-            );
-        }
-
-        let results: Vec<(Vec<usize>, Vec<T>)> = (0..n_queries)
-            .into_par_iter()
-            .map(|i| {
-                let row = query_mat.row(i);
-                index.query_row(row, k, ef_search)
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-
-        if return_dist {
-            let (indices, distances) = results.into_iter().unzip();
-            Ok((indices, Some(distances)))
-        } else {
-            let indices = results.into_iter().map(|(idx, _)| idx).collect();
-            Ok((indices, None))
-        }
+        Ok((indices, None))
     }
 }
 
@@ -2442,7 +2677,6 @@ pub fn extract_nndescent_knn_gpu<T, R>(
 where
     R: Runtime,
     T: AnnSearchFloat + AnnSearchGpuFloat,
-    NNDescentGpu<T, R>: NNDescentQuery<T>,
 {
     index.extract_knn(return_dist)
 }
@@ -2473,7 +2707,6 @@ pub fn query_nndescent_index_gpu_self<T, R>(
 where
     R: Runtime,
     T: AnnSearchFloat + AnnSearchGpuFloat,
-    NNDescentGpu<T, R>: NNDescentQuery<T>,
 {
     let (indices, distances) = index.self_query_gpu(k, query_params, 42)?;
 
@@ -2482,6 +2715,87 @@ where
     } else {
         Ok((indices, None))
     }
+}
+
+#[cfg(feature = "gpu")]
+/// Build a raw kNN graph on the GPU without CAGRA optimisation or query
+/// support. Slim counterpart to [`build_nndescent_index_gpu`] aimed at
+/// NSG feeders and raw-kNN consumers.
+///
+/// ### Params
+///
+/// * `mat` - Input matrix (samples x features)
+/// * `dist_metric` - Distance metric string
+/// * `k` - Neighbours per node (default 30)
+/// * `build_k` - Internal NNDescent working degree (default 1.5*k)
+/// * `max_iters` - Maximum NNDescent iterations (default 15)
+/// * `n_trees` - Forest size for GPU init (default auto)
+/// * `delta` - Convergence threshold (default 0.001)
+/// * `rho` - Local-join sampling rate (default 0.5)
+/// * `refine_knn` - 2-hop refinement sweeps after main loop (default 0)
+/// * `seed` - Random seed
+/// * `verbose` - Print progress
+/// * `device` - CubeCL runtime device
+#[allow(clippy::too_many_arguments)]
+pub fn build_knn_graph_gpu<T, R>(
+    mat: MatRef<T>,
+    dist_metric: &str,
+    k: Option<usize>,
+    build_k: Option<usize>,
+    max_iters: Option<usize>,
+    n_trees: Option<usize>,
+    delta: Option<f32>,
+    rho: Option<f32>,
+    refine_knn: Option<usize>,
+    seed: usize,
+    verbose: bool,
+    device: R::Device,
+) -> Result<crate::gpu::nndescent_gpu::KnnGraphGpu<T>, AnnSearchErrors>
+where
+    R: Runtime,
+    T: AnnSearchFloat + AnnSearchGpuFloat,
+{
+    let metric = parse_ann_dist(dist_metric).unwrap_or_else(|| {
+        println!("[WARNING] Weird string used for distance metric. Using default squared Euclidean distance");
+        Dist::default()
+    });
+
+    crate::gpu::nndescent_gpu::build_knn_graph_gpu::<T, R>(
+        mat, metric, k, build_k, max_iters, n_trees, delta, rho, refine_knn, seed, verbose, device,
+    )
+}
+
+#[cfg(feature = "gpu")]
+/// Build an NSG index from a slim GPU-built kNN graph.
+///
+/// Companion to [`build_nsg_from_gpu_nndescent`] for callers that used
+/// [`build_knn_graph_gpu`] instead of the full CAGRA-optimised
+/// [`build_nndescent_index_gpu`]. Cheaper end-to-end: no CAGRA kernels and
+/// no second graph copy in memory.
+///
+/// ### Params
+///
+/// * `knn_gpu` - Reference to a pre-built [`crate::gpu::nndescent_gpu::KnnGraphGpu`]
+/// * `r` - Maximum out-degree of the NSG graph
+/// * `l_build` - Beam width for the per-node candidate search
+/// * `c` - Cap on the candidate-set size before MRNG pruning
+/// * `seed` - Random seed for reproducibility
+/// * `verbose` - Print progress
+pub fn build_nsg_from_gpu_knn<T>(
+    knn_gpu: &crate::gpu::nndescent_gpu::KnnGraphGpu<T>,
+    r: usize,
+    l_build: usize,
+    c: usize,
+    seed: usize,
+    verbose: bool,
+) -> Result<NsgIndex<T>, AnnSearchErrors>
+where
+    T: AnnSearchFloat,
+    NsgIndex<T>: NsgState<T>,
+    NNDescent<T>: ApplySortedUpdates<T> + NNDescentQuery<T>,
+{
+    let params = NsgBuildParams::new(r, l_build, c, knn_gpu.k);
+    NsgIndex::build_from_gpu_knn(knn_gpu, params, seed, verbose)
 }
 
 ////////////

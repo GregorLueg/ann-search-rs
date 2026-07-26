@@ -14,9 +14,9 @@ use crate::utils::dist::*;
 use crate::utils::k_means_utils::*;
 use crate::utils::*;
 
-/////////////////////
-// Index structure //
-/////////////////////
+////////////////
+// KmknnIndex //
+////////////////
 
 /// kMkNN (k-means nearest neighbour) index
 ///
@@ -114,18 +114,14 @@ impl<T> DimensionValidation for KmknnIndex<T> {
     }
 }
 
-////////////////
-// Main index //
-////////////////
+/////////////////
+// Index build //
+/////////////////
 
 impl<T> KmknnIndex<T>
 where
     T: AnnSearchFloat,
 {
-    //////////////////////
-    // Index generation //
-    //////////////////////
-
     /// Build a kMkNN index.
     ///
     /// For Cosine, vectors are L2-normalised and the index operates on
@@ -254,10 +250,30 @@ where
         })
     }
 
-    ///////////
-    // Query //
-    ///////////
+    /// Returns the size of the index in bytes
+    ///
+    /// ### Returns
+    ///
+    /// Index size `in n bytes`
+    pub fn memory_usage_bytes(&self) -> usize {
+        std::mem::size_of_val(self)
+            + self.vectors_flat.capacity() * std::mem::size_of::<T>()
+            + self.centroids.capacity() * std::mem::size_of::<T>()
+            + self.offsets.capacity() * std::mem::size_of::<usize>()
+            + self.original_ids.capacity() * std::mem::size_of::<usize>()
+            + self.point_to_centroid_sq.capacity() * std::mem::size_of::<T>()
+            + self.cluster_radii_sq.capacity() * std::mem::size_of::<T>()
+    }
+}
 
+///////////
+// Query //
+///////////
+
+impl<T> KmknnIndex<T>
+where
+    T: AnnSearchFloat,
+{
     /// Core search loop. Assumes `q` is already in the correct space (i.e.
     /// L2-normalised if the index is in Cosine mode). Output conversion
     /// (squared Euclidean → Cosine via `d²/2`) still applies.
@@ -454,21 +470,6 @@ where
         }
 
         Ok((final_indices, final_dists))
-    }
-
-    /// Returns the size of the index in bytes
-    ///
-    /// ### Returns
-    ///
-    /// Index size `in n bytes`
-    pub fn memory_usage_bytes(&self) -> usize {
-        std::mem::size_of_val(self)
-            + self.vectors_flat.capacity() * std::mem::size_of::<T>()
-            + self.centroids.capacity() * std::mem::size_of::<T>()
-            + self.offsets.capacity() * std::mem::size_of::<usize>()
-            + self.original_ids.capacity() * std::mem::size_of::<usize>()
-            + self.point_to_centroid_sq.capacity() * std::mem::size_of::<T>()
-            + self.cluster_radii_sq.capacity() * std::mem::size_of::<T>()
     }
 }
 

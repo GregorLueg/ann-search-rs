@@ -1,12 +1,11 @@
 //! NNDescent implementation in ann-search-rs. Uses concepts of the original
 //! implementation, PyNNDescent and EFANNA. Leverages Annoy over Kd forest for
-//! graph initialisation.
+//! graph initialisation (when not using Manhattan distance).
 
 use faer::{MatRef, RowRef};
 use fixedbitset::FixedBitSet;
 use rand::{rngs::SmallRng, Rng, SeedableRng};
 use rayon::prelude::*;
-use rdst::RadixKey;
 use rdst::RadixSort;
 use std::{
     cell::RefCell,
@@ -20,6 +19,7 @@ use thousands::*;
 use crate::cpu::annoy::*;
 use crate::cpu::kd_forest::*;
 use crate::prelude::*;
+use crate::utils::nndescent_utils::*;
 use crate::utils::*;
 
 ///////////////////
@@ -27,16 +27,16 @@ use crate::utils::*;
 ///////////////////
 
 thread_local! {
-    static HEAP_F32: RefCell<BinaryHeap<(OrderedFloat<f32>, usize, bool)>> =
-        const { RefCell::new(BinaryHeap::new()) };
-    static HEAP_F64: RefCell<BinaryHeap<(OrderedFloat<f64>, usize, bool)>> =
-        const { RefCell::new(BinaryHeap::new()) };
-    static PID_SET: RefCell<Vec<bool>> = const { RefCell::new(Vec::new()) };
+    static SORTED_F32: RefCell<SortedBuffer<(OrderedFloat<f32>, u32, bool)>> =
+        RefCell::new(SortedBuffer::new());
+    static SORTED_F64: RefCell<SortedBuffer<(OrderedFloat<f64>, u32, bool)>> =
+        RefCell::new(SortedBuffer::new());
+    static PID_SET: RefCell<FixedBitSet> = const { RefCell::new(FixedBitSet::new()) };
 
-    static SORT_BUF_F32: RefCell<Vec<(f32, usize, bool)>> =
-        const { RefCell::new(Vec::new()) };
-    static SORT_BUF_F64: RefCell<Vec<(f64, usize, bool)>> =
-        const { RefCell::new(Vec::new()) };
+    /// Scratch buffers reused across all `build_candidates` per-node closures
+    /// on this thread, keyed as `(new_temp, old_temp)`.
+    static CAND_SCRATCH: RefCell<CandScratch> =
+        const { RefCell::new((Vec::new(), Vec::new())) };
 
     static QUERY_VISITED: RefCell<FixedBitSet> = const { RefCell::new(FixedBitSet::new()) };
     static QUERY_CANDIDATES_F32: QueryCandF32 =
@@ -59,196 +59,60 @@ pub type QueryCandF32 = RefCell<BinaryHeap<Reverse<(OrderedFloat<f32>, usize)>>>
 /// Type alias for the query candidates for f64
 pub type QueryCandF64 = RefCell<BinaryHeap<Reverse<(OrderedFloat<f64>, usize)>>>;
 
-/////////////
-// Helpers //
-/////////////
-
-////////////////
-// Neighbours //
-////////////////
-
-/// Neighbour entry in the k-NN graph (build phase only)
-///
-/// Flat structure in C representation for cache locality. The high bit
-/// of `pid_and_flag` stores the is-new flag, leaving 31 bits for the
-/// point id (sufficient for ~2 billion points).
-#[repr(C)]
-#[derive(Clone, Copy, Debug)]
-pub struct Neighbour<T> {
-    /// Point index + new/old flag in the high bit
-    pid_and_flag: u32,
-    /// Distance to the neighbour
-    pub dist: T,
-}
-
-/// Sentinel PID used to mark empty slots in the flat graph.
-pub const SENTINEL_PID: usize = u32::MAX as usize >> 1;
-
-impl<T: Copy> Neighbour<T> {
-    const IS_NEW_MASK: u32 = 1 << 31;
-    const PID_MASK: u32 = !Self::IS_NEW_MASK;
-
-    /// Create a new neighbour entry
-    ///
-    /// The point ID must fit in 31 bits; the 32nd bit is reserved for the
-    /// is-new flag. PIDs up to ~2 billion are supported.
-    ///
-    /// ### Params
-    ///
-    /// * `pid` - Point id (must fit in 31 bits)
-    /// * `dist` - Distance to the neighbour
-    /// * `is_new` - Whether this neighbour has been explored yet
-    ///
-    /// ### Returns
-    ///
-    /// Packed neighbour entry with encoded flag
-    #[inline(always)]
-    pub fn new(pid: usize, dist: T, is_new: bool) -> Self {
-        debug_assert!(pid <= Self::PID_MASK as usize, "PID exceeds 31-bit limit");
-        let flag = if is_new { Self::IS_NEW_MASK } else { 0 };
-        Self {
-            pid_and_flag: (pid as u32) | flag,
-            dist,
-        }
-    }
-
-    /// Whether this neighbour has not yet been explored
-    ///
-    /// New neighbours participate in local joins during the next iteration;
-    /// old ones only contribute to old-new pair generation.
-    ///
-    /// ### Returns
-    ///
-    /// `true` if the high bit is set, `false` otherwise
-    #[inline(always)]
-    pub fn is_new(&self) -> bool {
-        (self.pid_and_flag & Self::IS_NEW_MASK) != 0
-    }
-
-    /// Return the point id with the flag bit masked out
-    ///
-    /// ### Returns
-    ///
-    /// Point index in the range `[0, 2^31)`
-    #[inline(always)]
-    pub fn pid(&self) -> usize {
-        (self.pid_and_flag & Self::PID_MASK) as usize
-    }
-
-    /// Whether this slot is empty (holds the sentinel PID)
-    ///
-    /// ### Returns
-    ///
-    /// `true` if this slot does not hold a valid neighbour
-    #[inline(always)]
-    pub fn is_sentinel(&self) -> bool {
-        self.pid() == SENTINEL_PID
-    }
-
-    /// Mark this neighbour as old (already explored)
-    ///
-    /// Clears the high bit whilst preserving the point id and distance.
-    #[inline(always)]
-    pub fn mark_old(&mut self) {
-        self.pid_and_flag &= Self::PID_MASK;
-    }
-}
+/// Per-thread scratch pair for `build_candidates` phase 1 sampling:
+/// `(new_temp, old_temp)` holding `(priority, pid)` entries.
+type CandScratch = (Vec<(f64, usize)>, Vec<(f64, usize)>);
 
 ///////////////
-// Graph ptr //
+// MetricFn  //
 ///////////////
 
-/// Unsafe pointer wrapper for lock-free parallel writes to the flat graph.
+/// Static-dispatch metric selector for the update kernel.
 ///
-/// Safety is guaranteed by the update pattern: segments are grouped by
-/// target node, so no two threads ever write to the same `target * k`
-/// block simultaneously.
-#[derive(Copy, Clone)]
-struct UnsafeGraphPtr<T>(*mut Neighbour<T>);
-
-unsafe impl<T> Send for UnsafeGraphPtr<T> {}
-unsafe impl<T> Sync for UnsafeGraphPtr<T> {}
-
-/////////////
-// Updates //
-/////////////
-
-/// Helper structure for updates with Radix sort
-#[derive(Clone, Copy)]
-pub struct Update<T> {
-    /// Target node id
-    target: usize,
-    /// Source node id
-    source: usize,
-    /// Distance between the two
-    dist: T,
+/// The inner loops in `generate_updates_for_chunk_impl` call
+/// `M::distance_from_vec(idx, vec_p, norm_p, q)` where `M` is one of the
+/// zero-sized types below. `vec_p` (and `norm_p` for Cosine) is hoisted
+/// once per outer `p` iteration so the inner loop never re-slices the
+/// flat vector buffer or re-fetches the cached norm.
+/// Monomorphisation strips the runtime `Dist` branch out of the hot path.
+trait MetricFn<T: AnnSearchFloat> {
+    /// Distance between the hoisted vector `vec_p` (of node `p` with
+    /// pre-fetched norm `norm_p` when Cosine) and the vector at internal
+    /// index `q`.
+    fn distance_from_vec(idx: &NNDescent<T>, vec_p: &[T], norm_p: T, q: usize) -> T;
 }
 
-impl<T> Update<T> {
-    /// Create a new update triple
-    ///
-    /// Represents a candidate edge from `source` to `target` with the pre-
-    /// computed distance. Both directions are typically emitted per candidate
-    /// pair so that radix sorting by target groups them for lock-free
-    /// application.
-    ///
-    /// ### Params
-    ///
-    /// * `target` - Node receiving the edge
-    /// * `source` - Node on the other end of the edge
-    /// * `dist` - Distance between the two nodes
-    ///
-    /// ### Returns
-    ///
-    /// Update triple ready for radix sorting
-    pub fn new(target: usize, source: usize, dist: T) -> Self {
-        Self {
-            target,
-            source,
-            dist,
-        }
+/// Squared Euclidean metric.
+struct SqEuclidMetric;
+/// Cosine metric (assumes pre-computed norms in `NNDescent::norms`).
+struct CosineMetric;
+/// Manhattan (L1) metric.
+struct ManhattanMetric;
+
+impl<T: AnnSearchFloat> MetricFn<T> for SqEuclidMetric {
+    #[inline(always)]
+    fn distance_from_vec(idx: &NNDescent<T>, vec_p: &[T], _norm_p: T, q: usize) -> T {
+        let dim = idx.dim;
+        let vec_q = &idx.vectors_flat[q * dim..(q + 1) * dim];
+        T::euclidean_simd(vec_p, vec_q)
     }
 }
-
-/// Implement the RadixKey for target
-impl<T> RadixKey for Update<T> {
-    const LEVELS: usize = 4;
-
-    #[inline]
-    fn get_level(&self, level: usize) -> u8 {
-        (self.target >> (level * 8)) as u8
+impl<T: AnnSearchFloat> MetricFn<T> for CosineMetric {
+    #[inline(always)]
+    fn distance_from_vec(idx: &NNDescent<T>, vec_p: &[T], norm_p: T, q: usize) -> T {
+        let dim = idx.dim;
+        let vec_q = &idx.vectors_flat[q * dim..(q + 1) * dim];
+        let dot = T::dot_simd(vec_p, vec_q);
+        T::one() - (dot / (norm_p * idx.norms[q]))
     }
 }
-
-/// Apply sorted neighbour updates to the flat graph.
-///
-/// Separated by concrete type (f32/f64) because of thread-local heap
-/// storage. The sorted layout allows lock-free processing since updates
-/// targeting the same node are contiguous.
-pub trait ApplySortedUpdates<T> {
-    /// Apply sorted updates to the flat 1D graph.
-    ///
-    /// ## Algorithm
-    ///
-    /// 1. Find boundaries between different target nodes in the sorted updates.
-    /// 2. Extract each target's update batch as a contiguous slice.
-    /// 3. Process batches in parallel.
-    /// 4. Merge new candidates with existing neighbours via thread-local heaps.
-    /// 5. Write results back to the flat graph via disjoint pointer writes.
-    ///
-    /// ### Params
-    ///
-    /// * `updates` - Must be sorted by target (first element)
-    /// * `graph` - Flat graph of size `n * k`
-    /// * `k` - Neighbours per node
-    /// * `updates_count` - Atomic counter for edge updates
-    fn apply_sorted_updates(
-        &self,
-        updates: &[Update<T>],
-        graph: &mut [Neighbour<T>],
-        k: usize,
-        updates_count: &AtomicUsize,
-    );
+impl<T: AnnSearchFloat> MetricFn<T> for ManhattanMetric {
+    #[inline(always)]
+    fn distance_from_vec(idx: &NNDescent<T>, vec_p: &[T], _norm_p: T, q: usize) -> T {
+        let dim = idx.dim;
+        let vec_q = &idx.vectors_flat[q * dim..(q + 1) * dim];
+        T::manhattan_simd(vec_p, vec_q)
+    }
 }
 
 ////////////
@@ -514,7 +378,9 @@ where
     /// * `max_iter` - Maximum iterations
     /// * `n_trees` - Annoy/Kd forest size
     /// * `delta` - Convergence threshold (fraction of edges updated)
-    /// * `diversify_prob` - Probability of pruning redundant edges (0 to disable)
+    /// * `diversify_prob` - Bernoulli probability for the post-descent
+    ///   RNG-rule prune over the forward+reverse candidate pool
+    ///   (0 disables).
     /// * `seed` - Random seed
     /// * `verbose` - Print progress
     #[allow(clippy::too_many_arguments)]
@@ -602,6 +468,28 @@ where
     /// Whether the algorithm converged during construction.
     pub fn index_converged(&self) -> bool {
         self.converged
+    }
+
+    /// Distance metric this index was built with.
+    ///
+    /// ### Returns
+    ///
+    /// The [`Dist`] metric embedded at build time.
+    pub fn metric(&self) -> Dist {
+        self.metric
+    }
+
+    /// Borrow the flat kNN graph.
+    ///
+    /// Layout is `n * k` `(pid, distance)` pairs, sorted by distance
+    /// ascending within each node's slot. Unused trailing slots hold
+    /// [`SENTINEL_PID`] and `T::MAX`.
+    ///
+    /// ### Returns
+    ///
+    /// A slice view over the internal graph.
+    pub fn graph(&self) -> &[(usize, T)] {
+        &self.graph
     }
 
     /// Compute chunk size for memory-bounded update processing
@@ -835,10 +723,6 @@ where
         new_cands_sym: &mut [Vec<usize>],
         old_cands_sym: &mut [Vec<usize>],
     ) {
-        for v in new_cands_sym.iter_mut().chain(old_cands_sym.iter_mut()) {
-            v.clear();
-        }
-
         // Phase 1: Parallel sampling - each thread writes only to its own node
         let n = self.n;
         new_cands
@@ -846,63 +730,89 @@ where
             .zip(old_cands.par_iter_mut())
             .enumerate()
             .for_each(|(i, (new_c, old_c))| {
-                new_c.clear();
-                old_c.clear();
+                CAND_SCRATCH.with(|cell| {
+                    let mut b = cell.borrow_mut();
+                    let (new_temp, old_temp) = &mut *b;
 
-                let mut rng = SmallRng::seed_from_u64(iter_seed.wrapping_add(i as u64));
-                let base = i * k;
+                    new_c.clear();
+                    old_c.clear();
+                    new_temp.clear();
+                    old_temp.clear();
 
-                let mut new_temp: Vec<(f64, usize)> = Vec::new();
-                let mut old_temp: Vec<(f64, usize)> = Vec::new();
+                    let mut rng = SmallRng::seed_from_u64(iter_seed.wrapping_add(i as u64));
+                    let base = i * k;
 
-                for slot in &graph[base..base + k] {
-                    if slot.is_sentinel() {
-                        continue;
+                    for slot in &graph[base..base + k] {
+                        if slot.is_sentinel() {
+                            continue;
+                        }
+                        let j = slot.pid();
+                        if j >= n {
+                            continue;
+                        }
+
+                        let priority = rng.random::<f64>();
+                        if slot.is_new() {
+                            new_temp.push((priority, j));
+                        } else {
+                            old_temp.push((priority, j));
+                        }
                     }
-                    let j = slot.pid();
-                    if j >= n {
-                        continue;
+
+                    // O(n) partial sort instead of O(n log n) full sort
+                    if new_temp.len() > max_candidates {
+                        new_temp.select_nth_unstable_by(max_candidates - 1, |a, b| {
+                            a.0.partial_cmp(&b.0).unwrap()
+                        });
+                        new_temp.truncate(max_candidates);
                     }
+                    new_c.extend(new_temp.iter().map(|&(_, idx)| idx));
 
-                    let priority = rng.random::<f64>();
-                    if slot.is_new() {
-                        new_temp.push((priority, j));
-                    } else {
-                        old_temp.push((priority, j));
+                    if old_temp.len() > max_candidates {
+                        old_temp.select_nth_unstable_by(max_candidates - 1, |a, b| {
+                            a.0.partial_cmp(&b.0).unwrap()
+                        });
+                        old_temp.truncate(max_candidates);
                     }
-                }
-
-                // O(n) partial sort instead of O(n log n) full sort
-                if new_temp.len() > max_candidates {
-                    new_temp.select_nth_unstable_by(max_candidates - 1, |a, b| {
-                        a.0.partial_cmp(&b.0).unwrap()
-                    });
-                    new_temp.truncate(max_candidates);
-                }
-                new_c.extend(new_temp.iter().map(|&(_, idx)| idx));
-
-                if old_temp.len() > max_candidates {
-                    old_temp.select_nth_unstable_by(max_candidates - 1, |a, b| {
-                        a.0.partial_cmp(&b.0).unwrap()
-                    });
-                    old_temp.truncate(max_candidates);
-                }
-                old_c.extend(old_temp.iter().map(|&(_, idx)| idx));
+                    old_c.extend(old_temp.iter().map(|&(_, idx)| idx));
+                });
             });
 
-        // Phase 2: Symmetric candidates (sequential - cross-node writes)
-        for i in 0..self.n {
-            for &j in &new_cands[i] {
-                if j < self.n {
-                    new_cands_sym[j].push(i);
+        // Phase 2: Symmetric candidates via parallel target-chunk scan.
+        //
+        // Each thread owns a disjoint slice of `*_sym` and scans all sources
+        // once, picking up entries whose target lands in its range. This
+        // avoids per-target locking; the cost is that each thread walks the
+        // full source list, but that walk is a linear read of small vecs.
+        let n_threads = rayon::current_num_threads().max(1);
+        let chunk = n.div_ceil(n_threads).max(1);
+        new_cands_sym
+            .par_chunks_mut(chunk)
+            .zip(old_cands_sym.par_chunks_mut(chunk))
+            .enumerate()
+            .for_each(|(ci, (new_sym_chunk, old_sym_chunk))| {
+                for v in new_sym_chunk.iter_mut() {
+                    v.clear();
                 }
-            }
-            for &j in &old_cands[i] {
-                if j < self.n {
-                    old_cands_sym[j].push(i);
+                for v in old_sym_chunk.iter_mut() {
+                    v.clear();
                 }
-            }
-        }
+                let target_start = ci * chunk;
+                let new_end = target_start + new_sym_chunk.len();
+                let old_end = target_start + old_sym_chunk.len();
+                for src_i in 0..n {
+                    for &j in &new_cands[src_i] {
+                        if j >= target_start && j < new_end {
+                            new_sym_chunk[j - target_start].push(src_i);
+                        }
+                    }
+                    for &j in &old_cands[src_i] {
+                        if j >= target_start && j < old_end {
+                            old_sym_chunk[j - target_start].push(src_i);
+                        }
+                    }
+                }
+            });
 
         // Phase 3: Merge symmetric, sort, dedup (parallel, per-node independent)
         new_cands
@@ -933,21 +843,22 @@ where
     /// * `k` - Neighbours per node
     /// * `new_cands` - Sorted new-candidate lists per node
     fn mark_as_old(&self, graph: &mut [Neighbour<T>], k: usize, new_cands: &[Vec<usize>]) {
-        for i in 0..self.n {
-            if new_cands[i].is_empty() {
-                continue;
-            }
-
-            let base = i * k;
-            for slot in &mut graph[base..base + k] {
-                if slot.is_sentinel() {
-                    continue;
+        graph
+            .par_chunks_mut(k)
+            .zip(new_cands.par_iter())
+            .for_each(|(slots, new_c)| {
+                if new_c.is_empty() {
+                    return;
                 }
-                if slot.is_new() && new_cands[i].binary_search(&slot.pid()).is_ok() {
-                    slot.mark_old();
+                for slot in slots.iter_mut() {
+                    if slot.is_sentinel() {
+                        continue;
+                    }
+                    if slot.is_new() && new_c.binary_search(&slot.pid()).is_ok() {
+                        slot.mark_old();
+                    }
                 }
-            }
-        }
+            });
     }
 
     /// Generate distance updates from a chunk of source nodes.
@@ -976,49 +887,98 @@ where
         chunk_start: usize,
         chunk_end: usize,
     ) -> Vec<Update<T>> {
+        match self.metric {
+            Dist::SquaredEuclidean => self.generate_updates_for_chunk_impl::<SqEuclidMetric>(
+                new_cands,
+                old_cands,
+                graph,
+                k,
+                chunk_start,
+                chunk_end,
+            ),
+            Dist::Cosine => self.generate_updates_for_chunk_impl::<CosineMetric>(
+                new_cands,
+                old_cands,
+                graph,
+                k,
+                chunk_start,
+                chunk_end,
+            ),
+            Dist::Manhattan => self.generate_updates_for_chunk_impl::<ManhattanMetric>(
+                new_cands,
+                old_cands,
+                graph,
+                k,
+                chunk_start,
+                chunk_end,
+            ),
+        }
+    }
+
+    /// Monomorphised inner kernel for chunked update generation.
+    ///
+    /// `M` selects the distance function at compile time so the branch on
+    /// `self.metric` is stripped out of the hot loop entirely.
+    fn generate_updates_for_chunk_impl<M: MetricFn<T>>(
+        &self,
+        new_cands: &[Vec<usize>],
+        old_cands: &[Vec<usize>],
+        graph: &[Neighbour<T>],
+        k: usize,
+        chunk_start: usize,
+        chunk_end: usize,
+    ) -> Vec<Update<T>> {
+        let dim = self.dim;
+        let has_norms = !self.norms.is_empty();
         (chunk_start..chunk_end)
             .into_par_iter()
             .fold(
-                || Vec::with_capacity(2048),
+                || Vec::with_capacity(16_384),
                 |mut updates, i| {
                     let get_threshold = |idx: usize| -> T { graph[idx * k + k - 1].dist };
 
-                    // new-new pairs
+                    // new-new pairs. Hoist vec_p (and norm_p for Cosine)
+                    // once per outer p so the inner q-loop only re-slices
+                    // vec_q.
                     for j in 0..new_cands[i].len() {
                         let p = new_cands[i][j];
                         if p >= self.n {
                             continue;
                         }
                         let p_threshold = get_threshold(p);
+                        let vec_p = &self.vectors_flat[p * dim..(p + 1) * dim];
+                        let norm_p = if has_norms { self.norms[p] } else { T::zero() };
 
                         for l in (j + 1)..new_cands[i].len() {
                             let q = new_cands[i][l];
                             if q >= self.n || p == q {
                                 continue;
                             }
-                            let d = self.distance(p, q);
+                            let d = M::distance_from_vec(self, vec_p, norm_p, q);
                             if d <= p_threshold || d <= get_threshold(q) {
-                                updates.push(Update::new(p, q, d));
-                                updates.push(Update::new(q, p, d));
+                                updates.push(Update::new(p as u32, q as u32, d));
+                                updates.push(Update::new(q as u32, p as u32, d));
                             }
                         }
                     }
 
-                    // new-old pairs
+                    // new-old pairs. Same hoist as above.
                     for &p in &new_cands[i] {
                         if p >= self.n {
                             continue;
                         }
                         let p_threshold = get_threshold(p);
+                        let vec_p = &self.vectors_flat[p * dim..(p + 1) * dim];
+                        let norm_p = if has_norms { self.norms[p] } else { T::zero() };
 
                         for &q in &old_cands[i] {
                             if q >= self.n || p == q {
                                 continue;
                             }
-                            let d = self.distance(p, q);
+                            let d = M::distance_from_vec(self, vec_p, norm_p, q);
                             if d <= p_threshold || d <= get_threshold(q) {
-                                updates.push(Update::new(p, q, d));
-                                updates.push(Update::new(q, p, d));
+                                updates.push(Update::new(p as u32, q as u32, d));
+                                updates.push(Update::new(q as u32, p as u32, d));
                             }
                         }
                     }
@@ -1056,23 +1016,71 @@ where
         }
     }
 
-    /// Diversify the graph by probabilistically pruning redundant edges
+    /// Build reverse adjacency from the directed k-NN graph.
     ///
-    /// Walks each node's neighbour list in distance order, keeping the closest
-    /// and discarding candidates that are closer to an already-kept neighbour
-    /// than to the query node (with probability `prune_prob`). Operates on the
-    /// final `(pid, dist)` graph. Pruned slots are padded with sentinels.
+    /// For each source node `u`, walks its `k` outgoing neighbours in `graph`
+    /// and pushes `(u, d(u, v))` into `reverse[v]`. Sentinels are skipped.
+    /// Distances are inherited from the forward edge so no extra distance
+    /// computation is performed.
     ///
     /// ### Params
     ///
-    /// * `graph` - Input flat graph
-    /// * `k` - Neighbours per node
-    /// * `prune_prob` - Probability of pruning a redundant edge
-    /// * `seed` - Random seed for per-node pruning decisions
+    /// * `graph` - Flat directed k-NN graph, row `i` at `[i*k..(i+1)*k]`,
+    ///   sorted ascending, sentinel-padded.
+    /// * `k` - Neighbours per node.
     ///
     /// ### Returns
     ///
-    /// New graph with redundant edges replaced by sentinels
+    /// `Vec<Vec<(usize, T)>>` of length `n`. Entry `v` lists `(u, d(u, v))`
+    /// for every source `u` that has `v` in its forward list.
+    fn build_reverse_adjacency(
+        &self,
+        graph: &[(usize, T)],
+        k: usize,
+    ) -> Vec<Vec<(usize, T)>> {
+        let mut reverse: Vec<Vec<(usize, T)>> = (0..self.n).map(|_| Vec::new()).collect();
+        for u in 0..self.n {
+            let row = &graph[u * k..(u + 1) * k];
+            for &(v, d) in row {
+                if v == SENTINEL_PID {
+                    continue;
+                }
+                reverse[v].push((u, d));
+            }
+        }
+        reverse
+    }
+
+    /// Diversify the graph via probabilistic RNG-rule pruning over the
+    /// forward + reverse edge pool.
+    ///
+    /// For each node `u`, the input pool merges `graph[u]` with all nodes
+    /// that have `u` as a forward neighbour, deduplicates by pid, and
+    /// sorts ascending by distance. The RNG rule then prunes an entry
+    /// `v` from the pool if some already-kept neighbour `w` satisfies
+    /// `d(w, v) < d(u, v)` (Bernoulli coin with probability `prune_prob`).
+    /// The output row is filled with up to `k` kept entries; short rows
+    /// are topped up from the pruned-out tail in distance order so
+    /// out-degree does not shrink.
+    ///
+    /// Because iteration is ascending in `d(u, v)`, every already-kept
+    /// `w` satisfies `d(u, w) <= d(u, v)` by construction, so the
+    /// classical two-sided RNG rule collapses to the single check
+    /// `d(w, v) < d(u, v)`.
+    ///
+    /// ### Params
+    ///
+    /// * `graph` - Input flat directed k-NN graph, sentinel-padded.
+    /// * `k` - Neighbours per node.
+    /// * `prune_prob` - Bernoulli probability of applying the RNG rule
+    ///   per candidate/kept pair. Zero disables pruning.
+    /// * `seed` - Base RNG seed. Per-node seed is `seed + i`.
+    ///
+    /// ### Returns
+    ///
+    /// New flat graph of length `n * k`. Sentinel-padded only when the
+    /// merged pool for a row is smaller than `k` (small `n` or
+    /// disconnected components).
     fn diversify_graph(
         &self,
         graph: &[(usize, T)],
@@ -1080,46 +1088,76 @@ where
         prune_prob: T,
         seed: usize,
     ) -> Vec<(usize, T)> {
+        let reverse = self.build_reverse_adjacency(graph, k);
         let mut result = vec![(SENTINEL_PID, T::max_value()); self.n * k];
+        let prune_prob_f64 = prune_prob.to_f64().unwrap();
 
         result
             .par_chunks_mut(k)
             .enumerate()
             .for_each(|(i, out_slot)| {
-                let base = i * k;
-                let neighbours = &graph[base..base + k];
-
-                // Collect non-sentinel neighbours
-                let valid: Vec<(usize, T)> = neighbours
-                    .iter()
-                    .copied()
-                    .filter(|&(pid, _)| pid != SENTINEL_PID)
-                    .collect();
-
-                if valid.is_empty() {
+                let mut pool: Vec<(usize, T)> = Vec::with_capacity(2 * k);
+                for &entry in &graph[i * k..(i + 1) * k] {
+                    if entry.0 != SENTINEL_PID && entry.0 != i {
+                        pool.push(entry);
+                    }
+                }
+                for &entry in &reverse[i] {
+                    if entry.0 != i {
+                        pool.push(entry);
+                    }
+                }
+                if pool.is_empty() {
                     return;
                 }
 
+                // Dedupe by pid, keeping the smallest distance per pid.
+                pool.sort_unstable_by(|a, b| {
+                    a.0.cmp(&b.0).then_with(|| {
+                        a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal)
+                    })
+                });
+                pool.dedup_by_key(|x| x.0);
+
+                // Re-sort by distance ascending for the RNG-rule sweep.
+                pool.sort_unstable_by(|a, b| {
+                    a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal)
+                });
+
                 let mut rng = SmallRng::seed_from_u64((seed as u64).wrapping_add(i as u64));
-                let mut kept = vec![valid[0]];
+                let mut kept: Vec<(usize, T)> = Vec::with_capacity(k);
+                let mut pruned: Vec<(usize, T)> = Vec::new();
 
-                for &(cand_idx, cand_dist) in &valid[1..] {
+                kept.push(pool[0]);
+
+                for &(cand_idx, cand_dist) in &pool[1..] {
                     let mut should_keep = true;
-
-                    for &(kept_idx, kept_dist) in &kept {
+                    for &(kept_idx, _) in &kept {
                         let dist_to_kept = self.distance(cand_idx, kept_idx);
-
-                        if kept_dist > T::from_f32(f32::EPSILON).unwrap()
-                            && dist_to_kept < cand_dist
-                            && rng.random::<f64>() < prune_prob.to_f64().unwrap()
+                        if dist_to_kept < cand_dist
+                            && rng.random::<f64>() < prune_prob_f64
                         {
                             should_keep = false;
                             break;
                         }
                     }
-
                     if should_keep {
                         kept.push((cand_idx, cand_dist));
+                        if kept.len() == k {
+                            break;
+                        }
+                    } else {
+                        pruned.push((cand_idx, cand_dist));
+                    }
+                }
+
+                // Top up short rows from the pruned tail in distance order.
+                if kept.len() < k {
+                    for &entry in &pruned {
+                        if kept.len() == k {
+                            break;
+                        }
+                        kept.push(entry);
                     }
                 }
 
@@ -1270,36 +1308,6 @@ where
     }
 }
 
-/// Find boundaries between different target nodes in sorted updates
-///
-/// Given a slice sorted by `target`, returns the indices where the target
-/// changes, bracketed by 0 and `updates.len()`. The resulting `windows(2)`
-/// gives per-target slice ranges suitable for lock-free parallel application.
-///
-/// ### Params
-///
-/// * `updates` - Updates sorted by target
-///
-/// ### Returns
-///
-/// Vector of boundary indices of length `num_distinct_targets + 1`
-fn find_target_boundaries<T>(updates: &[Update<T>]) -> Vec<usize> {
-    if updates.is_empty() {
-        return vec![0, 0];
-    }
-
-    let mut boundaries = vec![0];
-
-    for i in 1..updates.len() {
-        if updates[i].target != updates[i - 1].target {
-            boundaries.push(i);
-        }
-    }
-
-    boundaries.push(updates.len());
-    boundaries
-}
-
 ///////////////////////////
 // Trait implementations //
 ///////////////////////////
@@ -1313,7 +1321,7 @@ fn find_target_boundaries<T>(updates: &[Update<T>]) -> Vec<usize> {
 /// The logic is identical for f32 and f64; only the thread-local storage
 /// keys differ.
 macro_rules! impl_apply_sorted_updates {
-    ($float:ty, $heap_tls:ident, $sort_buf_tls:ident) => {
+    ($float:ty, $sorted_tls:ident) => {
         impl ApplySortedUpdates<$float> for NNDescent<$float> {
             fn apply_sorted_updates(
                 &self,
@@ -1334,7 +1342,7 @@ macro_rules! impl_apply_sorted_updates {
                         let start = w[0];
                         let end = w[1];
                         if start < end {
-                            Some((updates[start].target, &updates[start..end]))
+                            Some((updates[start].target as usize, &updates[start..end]))
                         } else {
                             None
                         }
@@ -1346,93 +1354,75 @@ macro_rules! impl_apply_sorted_updates {
                 segments.par_iter().for_each(|&(target, segment)| {
                     #[allow(clippy::redundant_locals)]
                     let graph_ptr = graph_ptr;
-                    $heap_tls.with(|heap_cell| {
+                    $sorted_tls.with(|sorted_cell| {
                         PID_SET.with(|set_cell| {
-                            $sort_buf_tls.with(|sort_cell| {
-                                let mut heap = heap_cell.borrow_mut();
-                                let mut pid_set = set_cell.borrow_mut();
-                                let mut sort_buf = sort_cell.borrow_mut();
+                            let mut sorted = sorted_cell.borrow_mut();
+                            let mut pid_set = set_cell.borrow_mut();
 
-                                heap.clear();
-                                if pid_set.len() < self.n {
-                                    pid_set.resize(self.n, false);
+                            sorted.clear();
+                            if pid_set.len() < self.n {
+                                pid_set.grow(self.n);
+                            }
+
+                            let start_idx = target * k;
+
+                            // SAFETY: Each thread processes a unique target.
+                            // No two threads alias the same slice.
+                            let target_slice = unsafe {
+                                std::slice::from_raw_parts_mut(graph_ptr.0.add(start_idx), k)
+                            };
+
+                            let mut edge_updates = 0usize;
+
+                            // Load current neighbours in ascending distance order.
+                            for n in target_slice.iter() {
+                                if n.is_sentinel() {
+                                    continue;
                                 }
+                                let pid = n.pid();
+                                sorted.insert((OrderedFloat(n.dist), pid as u32, n.is_new()), k);
+                                pid_set.insert(pid);
+                            }
 
-                                let start_idx = target * k;
-
-                                // SAFETY: Each thread processes a unique target.
-                                // No two threads alias the same slice.
-                                let target_slice = unsafe {
-                                    std::slice::from_raw_parts_mut(graph_ptr.0.add(start_idx), k)
-                                };
-
-                                let mut edge_updates = 0usize;
-
-                                // Load current neighbours into the heap
-                                for n in target_slice.iter() {
-                                    if n.is_sentinel() {
-                                        continue;
-                                    }
-                                    let pid = n.pid();
-                                    heap.push((OrderedFloat(n.dist), pid, n.is_new()));
-                                    pid_set[pid] = true;
+                            // Merge incoming updates.
+                            for update in segment {
+                                let src = update.source as usize;
+                                if pid_set.contains(src) {
+                                    continue;
                                 }
-
-                                // Merge incoming updates
-                                for update in segment {
-                                    if pid_set[update.source] {
-                                        continue;
-                                    }
-
-                                    if heap.len() < k {
-                                        heap.push((OrderedFloat(update.dist), update.source, true));
-                                        pid_set[update.source] = true;
-                                        edge_updates += 1;
-                                    } else if let Some(&(OrderedFloat(worst), _, _)) = heap.peek() {
-                                        if update.dist < worst {
-                                            if let Some((_, old_pid, _)) = heap.pop() {
-                                                pid_set[old_pid] = false;
-                                            }
-                                            heap.push((
-                                                OrderedFloat(update.dist),
-                                                update.source,
-                                                true,
-                                            ));
-                                            pid_set[update.source] = true;
-                                            edge_updates += 1;
-                                        }
-                                    }
-                                }
-
-                                if edge_updates > 0 {
-                                    updates_count.fetch_add(edge_updates, Ordering::Relaxed);
-
-                                    sort_buf.clear();
-                                    sort_buf.extend(heap.drain().map(
-                                        |(OrderedFloat(d), p, is_new)| {
-                                            pid_set[p] = false;
-                                            (d, p, is_new)
-                                        },
-                                    ));
-
-                                    sort_buf
-                                        .sort_unstable_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
-                                    sort_buf.truncate(k);
-
-                                    for (i, &(d, p, is_new)) in sort_buf.iter().enumerate() {
-                                        target_slice[i] = Neighbour::new(p, d, is_new);
-                                    }
-
-                                    for i in sort_buf.len()..k {
-                                        target_slice[i] =
-                                            Neighbour::new(SENTINEL_PID, <$float>::MAX, false);
-                                    }
+                                let evicted_pid: Option<u32> = if sorted.len() == k {
+                                    sorted.top().map(|&(_, pid, _)| pid)
                                 } else {
-                                    for (_, pid, _) in heap.iter() {
-                                        pid_set[*pid] = false;
+                                    None
+                                };
+                                let entry = (OrderedFloat(update.dist), update.source, true);
+                                if sorted.insert(entry, k) {
+                                    if let Some(pid) = evicted_pid {
+                                        pid_set.remove(pid as usize);
                                     }
+                                    pid_set.insert(src);
+                                    edge_updates += 1;
                                 }
-                            })
+                            }
+
+                            if edge_updates > 0 {
+                                updates_count.fetch_add(edge_updates, Ordering::Relaxed);
+
+                                for (i, &(OrderedFloat(d), pid, is_new)) in
+                                    sorted.data().iter().enumerate()
+                                {
+                                    target_slice[i] = Neighbour::new(pid as usize, d, is_new);
+                                }
+                                for i in sorted.len()..k {
+                                    target_slice[i] =
+                                        Neighbour::new(SENTINEL_PID, <$float>::MAX, false);
+                                }
+                            }
+
+                            // Clear pid_set entries left in sorted.
+                            for &(_, pid, _) in sorted.data().iter() {
+                                pid_set.remove(pid as usize);
+                            }
                         })
                     })
                 });
@@ -1441,8 +1431,8 @@ macro_rules! impl_apply_sorted_updates {
     };
 }
 
-impl_apply_sorted_updates!(f32, HEAP_F32, SORT_BUF_F32);
-impl_apply_sorted_updates!(f64, HEAP_F64, SORT_BUF_F64);
+impl_apply_sorted_updates!(f32, SORTED_F32);
+impl_apply_sorted_updates!(f64, SORTED_F64);
 
 ////////////////////
 // NNDescentQuery //

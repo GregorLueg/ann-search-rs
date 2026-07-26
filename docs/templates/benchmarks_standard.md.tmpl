@@ -38,6 +38,8 @@ distance.
 - [Kd forest](#kd-forest)
 - [KmKnn](#kmknn)
 - [NNDescent](#nndescent)
+- [NSG](#nsg)
+- [Relative NNDescent](#relative-nndescent)
 - [Vamana](#vamana)
 
 ### Annoy
@@ -97,9 +99,9 @@ Self is queried with the default search budget.
 ---
 
 <details>
-<summary><b>Annoy - Euclidean (LowRank; more dimensions)</b>:</summary>
+<summary><b>Annoy - Euclidean (NN embeddings; more dimensions)</b>:</summary>
 <pre><code>
-<!-- BENCH:annoy:euclidean:lowrank:128 -->
+<!-- BENCH:annoy:euclidean:cell:128 -->
 </code></pre>
 </details>
 
@@ -157,10 +159,10 @@ Self is queried with the default search budget.
 ---
 
 <details>
-<summary><b>BallTree - Euclidean (LowRank; more dimensions)</b>:</summary>
+<summary><b>BallTree - Euclidean (NN embeddings; more dimensions)</b>:</summary>
 </br>
 <pre><code>
-<!-- BENCH:balltree:euclidean:lowrank:128 -->
+<!-- BENCH:balltree:euclidean:cell:128 -->
 </code></pre>
 </details>
 
@@ -230,10 +232,10 @@ Self is queried with `s=100`.
 ---
 
 <details>
-<summary><b>HNSW - Euclidean (LowRank; more dimensions)</b>:</summary>
+<summary><b>HNSW - Euclidean (NN embeddings; more dimensions)</b>:</summary>
 </br>
 <pre><code>
-<!-- BENCH:hnsw:euclidean:lowrank:128 -->
+<!-- BENCH:hnsw:euclidean:cell:128 -->
 </code></pre>
 </details>
 
@@ -292,10 +294,10 @@ Self query was done with `2 * sqrt(nlist)`.
 ---
 
 <details>
-<summary><b>IVF - Euclidean (LowRank; more dimensions)</b>:</summary>
+<summary><b>IVF - Euclidean (NN embeddings; more dimensions)</b>:</summary>
 </br>
 <pre><code>
-<!-- BENCH:ivf:euclidean:lowrank:128 -->
+<!-- BENCH:ivf:euclidean:cell:128 -->
 </code></pre>
 </details>
 
@@ -367,9 +369,9 @@ Self is queried with the default search budget.
 ---
 
 <details>
-<summary><b>Kd forest - Euclidean (LowRank; more dimensions)</b>:</summary>
+<summary><b>Kd forest - Euclidean (NN embeddings; more dimensions)</b>:</summary>
 <pre><code>
-<!-- BENCH:kd_forest:euclidean:lowrank:128 -->
+<!-- BENCH:kd_forest:euclidean:cell:128 -->
 </code></pre>
 </details>
 
@@ -437,10 +439,10 @@ monotone in Cosine distance), which keeps the triangle inequality valid.
 ---
 
 <details>
-<summary><b>kMkNN - Euclidean (LowRank; more dimensions)</b>:</summary>
+<summary><b>kMkNN - Euclidean (NN embeddings; more dimensions)</b>:</summary>
 </br>
 <pre><code>
-<!-- BENCH:kmknn:euclidean:lowrank:128 -->
+<!-- BENCH:kmknn:euclidean:cell:128 -->
 </code></pre>
 </details>
 
@@ -503,10 +505,10 @@ tables, the memory fingerprint does increase.
 ---
 
 <details>
-<summary><b>LSH - Euclidean (LowRank; more dimensions)</b>:</summary>
+<summary><b>LSH - Euclidean (NN embeddings; more dimensions)</b>:</summary>
 </br>
 <pre><code>
-<!-- BENCH:lsh:euclidean:lowrank:128 -->
+<!-- BENCH:lsh:euclidean:cell:128 -->
 </code></pre>
 </details>
 
@@ -526,9 +528,13 @@ exhaustive search)!
   to auto, it defaults to `min(5 + round(n^0.25), 32)`
 - *Search budget (s)*: The search budget for the exploration of the graph during
   querying. Here it defaults to `k * n_trees`.
-- *Diversify probability (dp)*: This is based on the original papers leveraging
-  NNDescent and it is supposed to remove redundant edges from the graph to
-  increase query speed.
+- *Diversify probability (dp)*: Post-descent RNG-rule prune, inspired by
+  PyNNDescent. For each node, the forward k-NN row is merged with reverse
+  edges, then candidates are pruned when closer to an already-kept
+  neighbour than to the origin (Bernoulli coin with probability `dp`).
+  Short rows get topped up from the pruned tail so out-degree stays at
+  `k`. Recovers cross-cluster connectivity on well-clustered data at a
+  small query-time cost; on uniform data it costs a bit of recall too.
 
 <details>
 <summary><b>NNDescent - Euclidean (Gaussian)</b>:</summary>
@@ -581,10 +587,190 @@ exhaustive search)!
 ---
 
 <details>
-<summary><b>NNDescent - Euclidean (LowRank; more dimensions)</b>:</summary>
+<summary><b>NNDescent - Euclidean (NN embeddings; more dimensions)</b>:</summary>
 </br>
 <pre><code>
-<!-- BENCH:nndescent:euclidean:lowrank:128 -->
+<!-- BENCH:nndescent:euclidean:cell:128 -->
+</code></pre>
+</details>
+
+### NSG
+
+`Navigating Spreading-out Graph`. Takes an approximate kNN graph, built here
+internally by NNDescent, and thins it with the MRNG rule: a candidate edge is
+dropped if some already-kept neighbour sits closer to it than the origin does.
+That leaves each node with a spread-out set of directions rather than a cluster
+of near-duplicates pointing the same way. Pruning alone can strand nodes, so a
+DFS from a single navigating node (the data point closest to the centroid) walks
+the graph afterwards and wires any unreachable node back to its nearest reachable
+predecessor. Queries are a greedy beam search. See
+[Fu et al., PVLDB 12(5), 2017](https://arxiv.org/abs/1707.00143).
+
+**Key parameters:**
+
+- *Max degree (R)*: Out-degree cap after MRNG pruning. On clustered data the
+  occlusion rule alone can collapse a node down to a handful of edges, so nodes
+  left short get topped back up from their nearest kNN entries. `R` is therefore
+  the real degree for nearly every node, not just a ceiling.
+- *Build beam width (L_build)*: Beam for the per-node candidate search over the
+  input kNN graph. Wider gives the prune more to choose from and costs build
+  time.
+- *Candidate cap (C)*: Ceiling on the candidate set before pruning, which bounds
+  the per-node prune cost. Fixed at `500` here and rarely worth touching.
+- *kNN graph degree (knn_k)*: Degree of the internal NNDescent graph. Fixed at
+  `32` here. Ignored if you hand NSG a kNN index you already built.
+- *EF search (ef)*: Beam width at query time. `auto` is `100`.
+
+One entry point is not enough at scale. On clustered data a single-seed walk from
+the navigating node runs out of beam crossing between clusters and a slice of
+queries terminates in the wrong region entirely. So on top of the navigating node
+the query seeds `sqrt(n)` entry points strided across the dataset, clamped to
+`[64, 512]`. Each seed costs one distance evaluation and the far ones never get
+expanded.
+
+Self is queried with the default `ef_search` (100).
+
+<details>
+<summary><b>NSG - Euclidean (Gaussian)</b>:</summary>
+</br>
+<pre><code>
+<!-- BENCH:nsg:euclidean:gaussian:32 -->
+</code></pre>
+</details>
+
+---
+
+<details>
+<summary><b>NSG - Cosine (Gaussian)</b>:</summary>
+</br>
+<pre><code>
+<!-- BENCH:nsg:cosine:gaussian:32 -->
+</code></pre>
+</details>
+
+---
+
+<details>
+<summary><b>NSG - Manhattan (Gaussian)</b>:</summary>
+</br>
+<pre><code>
+<!-- BENCH:nsg:manhattan:gaussian:32 -->
+</code></pre>
+</details>
+
+---
+
+<details>
+<summary><b>NSG - Euclidean (Correlated)</b>:</summary>
+</br>
+<pre><code>
+<!-- BENCH:nsg:euclidean:correlated:32 -->
+</code></pre>
+</details>
+
+---
+
+<details>
+<summary><b>NSG - Euclidean (LowRank)</b>:</summary>
+</br>
+<pre><code>
+<!-- BENCH:nsg:euclidean:lowrank:32 -->
+</code></pre>
+</details>
+
+---
+
+<details>
+<summary><b>NSG - Euclidean (NN embeddings; more dimensions)</b>:</summary>
+</br>
+<pre><code>
+<!-- BENCH:nsg:euclidean:cell:128 -->
+</code></pre>
+</details>
+
+### Relative NNDescent
+
+RNN-Descent folds the RNG prune straight into the NNDescent update loop, so a
+single pass hands you a graph that's already search-ready. Where NSG needs a full
+kNN graph materialised first and then a second pass over it, this never builds
+one. Start from a random graph of out-degree `S`, then alternate: prune each
+node's adjacency by the RNG rule, add the surviving reverse edges back, repeat.
+Query-time entry points come from a small kd-forest built alongside the graph,
+`min(5 + n^0.25 / 2, 16)` trees by default, queried once per query rather than
+per hop. See
+[Ono & Matsui, ACM MM 2023](https://arxiv.org/abs/2310.20419).
+
+**Key parameters:**
+
+- *Seed degree (S)*: Out-degree of the initial random graph.
+- *Max degree (R)*: Per-node adjacency cap once reverse edges are folded in.
+- *Outer rounds (T1)* and *inner passes (T2)*: `T1` rounds of `T2` update passes
+  each. Paper defaults are `T1=4`, `T2=15`; the grid here runs `T2=10` to keep
+  build times sensible.
+- *Search degree (K)*: How many of a node's neighbours get expanded per hop at
+  query time. This is the knob most worth sweeping. `auto` is `min(32, R)`;
+  setting it to `R` walks the whole adjacency and buys recall at the cost of
+  query speed.
+- *EF search*: Beam width at query time, `100` by default and left there across
+  the whole grid so the `K` sweep is the only thing moving.
+
+Self is queried with the default `ef_search` and `K`.
+
+<details>
+<summary><b>Relative NNDescent - Euclidean (Gaussian)</b>:</summary>
+</br>
+<pre><code>
+<!-- BENCH:rnn_descent:euclidean:gaussian:32 -->
+</code></pre>
+</details>
+
+---
+
+<details>
+<summary><b>Relative NNDescent - Cosine (Gaussian)</b>:</summary>
+</br>
+<pre><code>
+<!-- BENCH:rnn_descent:cosine:gaussian:32 -->
+</code></pre>
+</details>
+
+---
+
+<details>
+<summary><b>Relative NNDescent - Manhattan (Gaussian)</b>:</summary>
+</br>
+<pre><code>
+<!-- BENCH:rnn_descent:manhattan:gaussian:32 -->
+</code></pre>
+</details>
+
+---
+
+<details>
+<summary><b>Relative NNDescent - Euclidean (Correlated)</b>:</summary>
+</br>
+<pre><code>
+<!-- BENCH:rnn_descent:euclidean:correlated:32 -->
+</code></pre>
+</details>
+
+---
+
+<details>
+<summary><b>Relative NNDescent - Euclidean (LowRank)</b>:</summary>
+</br>
+<pre><code>
+<!-- BENCH:rnn_descent:euclidean:lowrank:32 -->
+</code></pre>
+</details>
+
+---
+
+<details>
+<summary><b>Relative NNDescent - Euclidean (NN embeddings; more dimensions)</b>:</summary>
+</br>
+<pre><code>
+<!-- BENCH:rnn_descent:euclidean:cell:128 -->
 </code></pre>
 </details>
 
@@ -656,9 +842,9 @@ Self is queried with `ef_search=75` (default value).
 ---
 
 <details>
-<summary><b>Vamana - Euclidean (LowRank; more dimensions)</b>:</summary>
+<summary><b>Vamana - Euclidean (NN embeddings; more dimensions)</b>:</summary>
 <pre><code>
-<!-- BENCH:vamana:euclidean:lowrank:128 -->
+<!-- BENCH:vamana:euclidean:cell:128 -->
 </code></pre>
 </details>
 

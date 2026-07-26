@@ -19,4 +19,6 @@ pub mod kd_forest;
 pub mod kmknn;
 pub mod lsh;
 pub mod nndescent;
+pub mod nsg;
+pub mod rnn_descent;
 pub mod vamana;

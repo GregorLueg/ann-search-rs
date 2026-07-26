@@ -160,7 +160,6 @@ fn main() {
         &mut gpu_nndescent_idx,
         cli.k,
         None,
-        None,
         true,
         false,
     )
@@ -223,7 +222,6 @@ fn main() {
             query_data.as_ref(),
             &mut gpu_nndescent_idx,
             cli.k,
-            None,
             Some(params),
             true,
             false,

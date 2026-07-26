@@ -31,7 +31,11 @@ if [ "$KIND" = "all" ]; then
             "$0" --kind "$k"
         fi
     done
-    echo "Generated all benchmark docs"
+    if $DRY_RUN; then
+        echo "Dry run complete for all kinds, no docs written"
+    else
+        echo "Generated all benchmark docs"
+    fi
     exit 0
 fi
 
@@ -43,7 +47,11 @@ if [ ! -f "$TEMPLATE" ]; then
     exit 1
 fi
 
-cp "$TEMPLATE" "$OUTPUT"
+# Only clobber the generated doc when we are actually going to refill it. A
+# dry-run must leave $OUTPUT untouched.
+if ! $DRY_RUN; then
+    cp "$TEMPLATE" "$OUTPUT"
+fi
 
 run_and_replace() {
     local tag="$1"
@@ -97,14 +105,14 @@ case "$KIND" in
             "annoy:cosine:gaussian:32|cargo run --example gridsearch_annoy --release -- --distance cosine"
             "annoy:euclidean:correlated:32|cargo run --example gridsearch_annoy --release -- --distance euclidean --data correlated"
             "annoy:euclidean:lowrank:32|cargo run --example gridsearch_annoy --release -- --distance euclidean --data lowrank"
-            "annoy:euclidean:lowrank:128|cargo run --example gridsearch_annoy --release -- --distance euclidean --data lowrank --dim 128"
+            "annoy:euclidean:cell:128|cargo run --example gridsearch_annoy --release -- --distance euclidean --data cell --dim 128"
 
             # balltree
             "balltree:euclidean:gaussian:32|cargo run --example gridsearch_balltree --release -- --distance euclidean"
             "balltree:cosine:gaussian:32|cargo run --example gridsearch_balltree --release -- --distance cosine"
             "balltree:euclidean:correlated:32|cargo run --example gridsearch_balltree --release -- --distance euclidean --data correlated"
             "balltree:euclidean:lowrank:32|cargo run --example gridsearch_balltree --release -- --distance euclidean --data lowrank"
-            "balltree:euclidean:lowrank:128|cargo run --example gridsearch_balltree --release -- --distance euclidean --data lowrank --dim 128"
+            "balltree:euclidean:cell:128|cargo run --example gridsearch_balltree --release -- --distance euclidean --data cell --dim 128"
 
             # hnsw
             "hnsw:euclidean:gaussian:32|cargo run --example gridsearch_hnsw --release -- --distance euclidean"
@@ -112,14 +120,14 @@ case "$KIND" in
             "hnsw:manhattan:gaussian:32|cargo run --example gridsearch_hnsw --release -- --distance manhattan"
             "hnsw:euclidean:correlated:32|cargo run --example gridsearch_hnsw --release -- --distance euclidean --data correlated"
             "hnsw:euclidean:lowrank:32|cargo run --example gridsearch_hnsw --release -- --distance euclidean --data lowrank"
-            "hnsw:euclidean:lowrank:128|cargo run --example gridsearch_hnsw --release -- --distance euclidean --data lowrank --dim 128"
+            "hnsw:euclidean:cell:128|cargo run --example gridsearch_hnsw --release -- --distance euclidean --data cell --dim 128"
 
             # ivf
             "ivf:euclidean:gaussian:32|cargo run --example gridsearch_ivf --release -- --distance euclidean"
             "ivf:cosine:gaussian:32|cargo run --example gridsearch_ivf --release -- --distance cosine"
             "ivf:euclidean:correlated:32|cargo run --example gridsearch_ivf --release -- --distance euclidean --data correlated"
             "ivf:euclidean:lowrank:32|cargo run --example gridsearch_ivf --release -- --distance euclidean --data lowrank"
-            "ivf:euclidean:lowrank:128|cargo run --example gridsearch_ivf --release -- --distance euclidean --data lowrank --dim 128"
+            "ivf:euclidean:cell:128|cargo run --example gridsearch_ivf --release -- --distance euclidean --data cell --dim 128"
 
             # kd_forest
             "kd_forest:euclidean:gaussian:32|cargo run --example gridsearch_kd_forest --release -- --distance euclidean"
@@ -127,21 +135,21 @@ case "$KIND" in
             "kd_forest:manhattan:gaussian:32|cargo run --example gridsearch_kd_forest --release -- --distance manhattan"
             "kd_forest:euclidean:correlated:32|cargo run --example gridsearch_kd_forest --release -- --distance euclidean --data correlated"
             "kd_forest:euclidean:lowrank:32|cargo run --example gridsearch_kd_forest --release -- --distance euclidean --data lowrank"
-            "kd_forest:euclidean:lowrank:128|cargo run --example gridsearch_kd_forest --release -- --distance euclidean --data lowrank --dim 128"
+            "kd_forest:euclidean:cell:128|cargo run --example gridsearch_kd_forest --release -- --distance euclidean --data cell --dim 128"
 
             # kmknn
             "kmknn:euclidean:gaussian:32|cargo run --example gridsearch_kmknn --release -- --distance euclidean"
             "kmknn:cosine:gaussian:32|cargo run --example gridsearch_kmknn --release -- --distance cosine"
             "kmknn:euclidean:correlated:32|cargo run --example gridsearch_kmknn --release -- --distance euclidean --data correlated"
             "kmknn:euclidean:lowrank:32|cargo run --example gridsearch_kmknn --release -- --distance euclidean --data lowrank"
-            "kmknn:euclidean:lowrank:128|cargo run --example gridsearch_kmknn --release -- --distance euclidean --data lowrank --dim 128"
+            "kmknn:euclidean:cell:128|cargo run --example gridsearch_kmknn --release -- --distance euclidean --data cell --dim 128"
 
             # lsh
             "lsh:euclidean:gaussian:32|cargo run --example gridsearch_lsh --release -- --distance euclidean"
             "lsh:cosine:gaussian:32|cargo run --example gridsearch_lsh --release -- --distance cosine"
             "lsh:euclidean:correlated:32|cargo run --example gridsearch_lsh --release -- --distance euclidean --data correlated"
             "lsh:euclidean:lowrank:32|cargo run --example gridsearch_lsh --release -- --distance euclidean --data lowrank"
-            "lsh:euclidean:lowrank:128|cargo run --example gridsearch_lsh --release -- --distance euclidean --data lowrank --dim 128"
+            "lsh:euclidean:cell:128|cargo run --example gridsearch_lsh --release -- --distance euclidean --data cell --dim 128"
 
             # nndescent
             "nndescent:euclidean:gaussian:32|cargo run --example gridsearch_nndescent --release -- --distance euclidean"
@@ -149,7 +157,23 @@ case "$KIND" in
             "nndescent:manhattan:gaussian:32|cargo run --example gridsearch_nndescent --release -- --distance manhattan"
             "nndescent:euclidean:correlated:32|cargo run --example gridsearch_nndescent --release -- --distance euclidean --data correlated"
             "nndescent:euclidean:lowrank:32|cargo run --example gridsearch_nndescent --release -- --distance euclidean --data lowrank"
-            "nndescent:euclidean:lowrank:128|cargo run --example gridsearch_nndescent --release -- --distance euclidean --data lowrank --dim 128"
+            "nndescent:euclidean:cell:128|cargo run --example gridsearch_nndescent --release -- --distance euclidean --data cell --dim 128"
+
+            # nsg
+            "nsg:euclidean:gaussian:32|cargo run --example gridsearch_nsg --release -- --distance euclidean"
+            "nsg:cosine:gaussian:32|cargo run --example gridsearch_nsg --release -- --distance cosine"
+            "nsg:manhattan:gaussian:32|cargo run --example gridsearch_nsg --release -- --distance manhattan"
+            "nsg:euclidean:correlated:32|cargo run --example gridsearch_nsg --release -- --distance euclidean --data correlated"
+            "nsg:euclidean:lowrank:32|cargo run --example gridsearch_nsg --release -- --distance euclidean --data lowrank"
+            "nsg:euclidean:cell:128|cargo run --example gridsearch_nsg --release -- --distance euclidean --data cell --dim 128"
+
+            # rnn_descent
+            "rnn_descent:euclidean:gaussian:32|cargo run --example gridsearch_rnn_descent --release -- --distance euclidean"
+            "rnn_descent:cosine:gaussian:32|cargo run --example gridsearch_rnn_descent --release -- --distance cosine"
+            "rnn_descent:manhattan:gaussian:32|cargo run --example gridsearch_rnn_descent --release -- --distance manhattan"
+            "rnn_descent:euclidean:correlated:32|cargo run --example gridsearch_rnn_descent --release -- --distance euclidean --data correlated"
+            "rnn_descent:euclidean:lowrank:32|cargo run --example gridsearch_rnn_descent --release -- --distance euclidean --data lowrank"
+            "rnn_descent:euclidean:cell:128|cargo run --example gridsearch_rnn_descent --release -- --distance euclidean --data cell --dim 128"
 
              # vamana
              "vamana:euclidean:gaussian:32|cargo run --example gridsearch_vamana --release -- --distance euclidean"
@@ -157,7 +181,7 @@ case "$KIND" in
              "vamana:manhattan:gaussian:32|cargo run --example gridsearch_vamana --release -- --distance manhattan"
              "vamana:euclidean:correlated:32|cargo run --example gridsearch_vamana --release -- --distance euclidean --data correlated"
              "vamana:euclidean:lowrank:32|cargo run --example gridsearch_vamana --release -- --distance euclidean --data lowrank"
-             "vamana:euclidean:lowrank:128|cargo run --example gridsearch_vamana --release -- --distance euclidean --data lowrank --dim 128"
+             "vamana:euclidean:cell:128|cargo run --example gridsearch_vamana --release -- --distance euclidean --data cell --dim 128"
         )
         ;;
     gpu)
@@ -167,19 +191,19 @@ case "$KIND" in
             "gpu:cosine:gaussian:32|cargo run --example gridsearch_gpu --release --features gpu -- --distance cosine"
             "gpu:euclidean:correlated:32|cargo run --example gridsearch_gpu --release --features gpu -- --distance euclidean --data correlated"
             "gpu:euclidean:lowrank:32|cargo run --example gridsearch_gpu --release --features gpu -- --distance euclidean --data lowrank"
-            "gpu:euclidean:lowrank:128|cargo run --example gridsearch_gpu --release --features gpu -- --distance euclidean --data lowrank --dim 128"
+            "gpu:euclidean:cell:128|cargo run --example gridsearch_gpu --release --features gpu -- --distance euclidean --data cell --dim 128"
 
             # CPU IVF baselines at larger sizes
-            "ivf:euclidean:lowrank:64:250000|cargo run --example gridsearch_ivf --release -- --distance euclidean --data lowrank --n-samples 250000 --dim 64"
-            "ivf:euclidean:lowrank:128:250000|cargo run --example gridsearch_ivf --release -- --distance euclidean --data lowrank --n-samples 250000 --dim 128"
-            "ivf:euclidean:lowrank:64:500000|cargo run --example gridsearch_ivf --release -- --distance euclidean --data lowrank --n-samples 500000 --dim 64"
-            "ivf:euclidean:lowrank:128:500000|cargo run --example gridsearch_ivf --release -- --distance euclidean --data lowrank --n-samples 500000 --dim 128"
+            "ivf:euclidean:cell:64:250000|cargo run --example gridsearch_ivf --release -- --distance euclidean --data cell --n-samples 250000 --dim 64"
+            "ivf:euclidean:cell:128:250000|cargo run --example gridsearch_ivf --release -- --distance euclidean --data cell --n-samples 250000 --dim 128"
+            "ivf:euclidean:cell:64:500000|cargo run --example gridsearch_ivf --release -- --distance euclidean --data cell --n-samples 500000 --dim 64"
+            "ivf:euclidean:cell:128:500000|cargo run --example gridsearch_ivf --release -- --distance euclidean --data cell --n-samples 500000 --dim 128"
 
             # GPU IVF at larger sizes
-            "gpu:euclidean:lowrank:64:250000|cargo run --example gridsearch_gpu --release --features gpu -- --distance euclidean --data lowrank --n-samples 250000 --dim 64"
-            "gpu:euclidean:lowrank:128:250000|cargo run --example gridsearch_gpu --release --features gpu -- --distance euclidean --data lowrank --n-samples 250000 --dim 128"
-            "gpu:euclidean:lowrank:64:500000|cargo run --example gridsearch_gpu --release --features gpu -- --distance euclidean --data lowrank --n-samples 500000 --dim 64"
-            "gpu:euclidean:lowrank:128:500000|cargo run --example gridsearch_gpu --release --features gpu -- --distance euclidean --data lowrank --n-samples 500000 --dim 128"
+            "gpu:euclidean:cell:64:250000|cargo run --example gridsearch_gpu --release --features gpu -- --distance euclidean --data cell --n-samples 250000 --dim 64"
+            "gpu:euclidean:cell:128:250000|cargo run --example gridsearch_gpu --release --features gpu -- --distance euclidean --data cell --n-samples 250000 --dim 128"
+            "gpu:euclidean:cell:64:500000|cargo run --example gridsearch_gpu --release --features gpu -- --distance euclidean --data cell --n-samples 500000 --dim 64"
+            "gpu:euclidean:cell:128:500000|cargo run --example gridsearch_gpu --release --features gpu -- --distance euclidean --data cell --n-samples 500000 --dim 128"
 
             # CAGRA
 
@@ -188,13 +212,13 @@ case "$KIND" in
             "cagra:cosine:gaussian:32|cargo run --example gridsearch_cagra --release --features gpu -- --distance cosine"
             "cagra:euclidean:correlated:32|cargo run --example gridsearch_cagra --release --features gpu -- --distance euclidean --data correlated"
             "cagra:euclidean:lowrank:32|cargo run --example gridsearch_cagra --release --features gpu -- --distance euclidean --data lowrank"
-            "cagra:euclidean:lowrank:128|cargo run --example gridsearch_cagra --release --features gpu -- --distance euclidean --data lowrank --dim 128"
+            "cagra:euclidean:cell:128|cargo run --example gridsearch_cagra --release --features gpu -- --distance euclidean --data cell --dim 128"
 
             # CAGRA at larger sizes
-            "cagra:euclidean:lowrank:64:250000|cargo run --example gridsearch_cagra --release --features gpu -- --distance euclidean --data lowrank --n-samples 250000 --dim 64"
-            "cagra:euclidean:lowrank:128:250000|cargo run --example gridsearch_cagra --release --features gpu -- --distance euclidean --data lowrank --n-samples 250000 --dim 128"
-            "cagra:euclidean:lowrank:64:500000|cargo run --example gridsearch_cagra --release --features gpu -- --distance euclidean --data lowrank --n-samples 500000 --dim 64"
-            "cagra:euclidean:lowrank:128:500000|cargo run --example gridsearch_cagra --release --features gpu -- --distance euclidean --data lowrank --n-samples 500000 --dim 128"
+            "cagra:euclidean:cell:64:250000|cargo run --example gridsearch_cagra --release --features gpu -- --distance euclidean --data cell --n-samples 250000 --dim 64"
+            "cagra:euclidean:cell:128:250000|cargo run --example gridsearch_cagra --release --features gpu -- --distance euclidean --data cell --n-samples 250000 --dim 128"
+            "cagra:euclidean:cell:64:500000|cargo run --example gridsearch_cagra --release --features gpu -- --distance euclidean --data cell --n-samples 500000 --dim 64"
+            "cagra:euclidean:cell:128:500000|cargo run --example gridsearch_cagra --release --features gpu -- --distance euclidean --data cell --n-samples 500000 --dim 128"
 
             # CAGRA kNN
             "cagra_knn:euclidean:lowrank:32:250000|cargo run --example knn_comparison_cagra --release --features gpu -- --distance euclidean --data lowrank --n-samples 250000"
@@ -298,4 +322,8 @@ for entry in "${BENCHMARKS[@]}"; do
     run_and_replace "$tag" $cmd
 done
 
-echo "Generated: $OUTPUT"
+if $DRY_RUN; then
+    echo "Dry run complete, $OUTPUT untouched"
+else
+    echo "Generated: $OUTPUT"
+fi

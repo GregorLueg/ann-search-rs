@@ -6,6 +6,7 @@ pub mod dist;
 pub mod graph_utils;
 pub mod heap_structs;
 pub mod k_means_utils;
+pub mod nndescent_utils;
 pub mod parallelism;
 pub mod traits;
 pub mod tree_utils;
@@ -43,13 +44,24 @@ where
 {
     let n = mat.nrows();
     let dim = mat.ncols();
+    let len = n * dim;
 
-    let mut vectors_flat = Vec::with_capacity(n * dim);
-    for i in 0..n {
-        vectors_flat.extend(mat.row(i).iter().cloned());
+    let mut out = Vec::<T>::with_capacity(len);
+    let ptr = out.as_mut_ptr();
+
+    for j in 0..dim {
+        let col = mat.col(j);
+        for i in 0..n {
+            unsafe {
+                ptr.add(i * dim + j).write(col[i]);
+            }
+        }
+    }
+    unsafe {
+        out.set_len(len);
     }
 
-    (vectors_flat, n, dim)
+    (out, n, dim)
 }
 
 ////////////////

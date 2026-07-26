@@ -1,6 +1,6 @@
 [package]
 name = "ann-search-rs"
-version = "0.4.4"
+version = "0.4.5"
 edition = "2021"
 authors = ["Gregor Lueg <gregorlueg@me.com>"]
 license = "MIT"
@@ -99,6 +99,10 @@ required-features = ["gpu"]
 
 [[example]]
 name = "gridsearch_cagra"
+required-features = ["gpu"]
+
+[[example]]
+name = "gridsearch_nsg_gpu"
 required-features = ["gpu"]
 
 [[example]]

@@ -35,9 +35,21 @@ cargo run --example gridsearch_rabitq --release --features binary
 cargo bench --bench gpu_ivf_kernels        --features gpu
 cargo bench --bench gpu_exhaustive_kernels --features gpu
 
+# Per-kernel GPU profile (no code changes needed; filter the WGSL dumps out)
+CUBECL_DEBUG_OPTION=profile-medium CUBECL_DEBUG_LOG=stdout \
+  cargo bench --bench gpu_exhaustive_kernels --features gpu 2>&1 | grep -v wgsl
+
 # Docs (docs.rs config enables binary + quantised + mimalloc)
 cargo doc --features binary,quantised,mimalloc --no-deps --open
 ```
+
+The profiler emits one `| 15.675584ms | KernelName | WgpuRuntime |` line per launch;
+aggregate by kernel name for an attribution breakdown. Other levels: `profile`,
+`profile-full`, `debug`, `debug-full`. Note it inserts syncs, so it measures *isolated*
+kernel cost, whereas deleting a kernel and re-timing measures a *pipelined* queue. The two
+disagree, sometimes sharply. Use the profiler to attribute cost and ablation only to answer
+"what is the ceiling if this disappears entirely". Profile before optimising: reasoning
+about memory traffic on paper has a poor track record here.
 
 Release profile in `Cargo.toml` sets `lto = true` and `codegen-units = 1`. Release builds are slow, but this is intentional. Do not weaken it for iteration without asking.
 
@@ -107,7 +119,10 @@ Every index follows the same pattern in `src/lib.rs`:
 - Constants in `gpu/mod.rs` (`QUERY_CHUNK_SIZE`, `DB_CHUNK_SIZE`, `WORKGROUP_SIZE_X`, `LINE_SIZE`) are load-bearing. Kernels assume them. Vectors are padded to a multiple of `LINE_SIZE` via `pad_vectors`.
 - `pick_wg_y(dim_padded)` picks workgroup Y dims from a shared-memory budget table (targets ~32 KiB). Dims above 2048 return `DimTooHighForSharedMemory`.
 - `grid_2d(total_cubes)` splits a flat dispatch across (x, y) to respect the 65535-per-dim wgpu limit.
-- When touching kernels, be aware of the Metal/wgpu quirk fixed in `fb03735`. Divergence between Metal and other backends is real and needs cross-backend testing.
+- When touching kernels, be aware of the Metal/wgpu quirk fixed in `fb03735` and the IVF reducer variant in `3c657ee`. Divergence between Metal and other backends is real and needs cross-backend testing. The four distilled codegen rules (no `if` expressions for value selection, bit arithmetic over comparisons, `usize` counters plus `u32` sentinels in reducers, `SharedMemory::new` at kernel scope) are documented in the module header of `src/gpu/nndescent_gpu.rs`.
+- Every launch in the crate is `launch_unchecked`. A dispatch that busts a device limit does no work, returns zeros and reports **no error** (the panic happens on a cubecl background thread). Two ceilings disagree: your own VRAM budget, and the per-*binding* limit `client.properties().memory.max_page_size` (4 GiB on an M1 Max). Benches must checksum their output before reporting a timing; an implausible speedup is the signature of a kernel that did nothing.
+- `WORKGROUP_SIZE_X` is 32 and Apple Silicon reports plane size exactly 32, so on that backend the cube *is* the plane. Any plane primitive must be gated on `plane_size_min == plane_size_max == WORKGROUP_SIZE_X`, with the existing kernel kept as the fallback arm: a workgroup straddling two planes gives silently wrong answers.
+- `grid_2d` hardcodes the 65535 per-dim limit; the device's real value is `properties().hardware.max_cube_count`.
 
 ### Errors
 

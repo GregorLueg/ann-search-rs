@@ -7,23 +7,8 @@ use faer::Mat;
 use std::time::Instant;
 use thousands::*;
 
-/// Wraps the shared `Cli` and adds an optional `--knn-k` override so the
-/// standalone NN-Descent build can be run at the same `k` NSG uses
-/// internally (default `64`) for like-for-like timing comparisons.
-#[derive(Parser, Clone)]
-struct Args {
-    #[command(flatten)]
-    cli: Cli,
-    /// Override `k` for the NN-Descent build. Defaults to the library's own
-    /// default (currently `30`) when not passed.
-    #[arg(long)]
-    knn_k: Option<usize>,
-}
-
 fn main() {
-    let args = Args::parse();
-    let cli = args.cli.clone();
-    let knn_k = args.knn_k;
+    let cli = Cli::parse();
 
     println!("-----------------------------");
     println!(
@@ -39,7 +24,7 @@ fn main() {
     let query_data = subsample_with_noise(&data, DEFAULT_N_QUERY, cli.seed + 1);
     let mut results = Vec::new();
 
-    // Exhaustive query benchmark
+    // Exhaustive baseline
     println!("Building exhaustive index...");
     let start = Instant::now();
     let exhaustive_idx = build_exhaustive_index(data.as_ref(), &cli.distance);
@@ -63,7 +48,6 @@ fn main() {
         index_size_mb,
     });
 
-    // Exhaustive self-query benchmark
     println!("Self-querying exhaustive index...");
     let start = Instant::now();
     let (true_neighbors_self, true_distances_self) =
@@ -82,62 +66,71 @@ fn main() {
 
     println!("-----------------------------");
 
-    let build_params = [
-        (Some(12), 0.0, vec![None]),
-        (Some(24), 0.0, vec![None]),
-        (None, 0.0, vec![Some(75), Some(100), None]),
-        (None, 0.25, vec![None]),
-        (None, 0.5, vec![None]),
-        (None, 1.0, vec![None]),
+    let device: cubecl::wgpu::WgpuDevice = Default::default();
+
+    let knn_k: usize = 48;
+
+    // Build the GPU kNN graph ONCE and reuse it across every (r, l_build)
+    // combination below.
+    println!("Building GPU kNN graph (k={})...", knn_k);
+    let knn_start = Instant::now();
+    let knn_gpu = build_knn_graph_gpu::<f32, cubecl::wgpu::WgpuRuntime>(
+        data.as_ref(),
+        &cli.distance,
+        Some(knn_k),
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        cli.seed as usize,
+        true,
+        device,
+    )
+    .unwrap();
+    let knn_build_ms = knn_start.elapsed().as_secs_f64() * 1000.0;
+    println!("GPU kNN graph built in {:.2} ms", knn_build_ms);
+    println!("-----------------------------");
+
+    let build_params: &[(usize, usize)] = &[
+        (24, 50),
+        (24, 100),
+        (24, 150),
+        (32, 50),
+        (32, 100),
+        (32, 150),
+        (48, 50),
+        (48, 100),
+        (48, 150),
     ];
+    let c_cap: usize = 500;
+    let ef_search_values: &[Option<usize>] = &[Some(50), None, Some(150)];
 
-    for (n_trees, diversify_prob, ef_search_values) in build_params {
-        let n_trees_str = n_trees
-            .map(|i| i.to_string())
-            .unwrap_or_else(|| ":auto".to_string());
-
-        let knn_k_str = knn_k
-            .map(|k| k.to_string())
-            .unwrap_or_else(|| ":auto".to_string());
+    for &(r, l_build) in build_params {
         println!(
-            "Building NNDescent index (n_trees={}, diversify={}, knn_k={})...",
-            n_trees_str, diversify_prob, knn_k_str
+            "Building NSG index from GPU kNN (R={}, L_build={})...",
+            r, l_build
         );
+
         let start = Instant::now();
-        let nndescent_idx = build_nndescent_index(
-            data.as_ref(),
-            &cli.distance,
-            0.001,
-            diversify_prob,
-            knn_k,
-            None,
-            None,
-            n_trees,
-            cli.seed as usize,
-            false,
-        )
-        .unwrap();
-        let build_time = start.elapsed().as_secs_f64() * 1000.0;
+        let nsg_idx =
+            build_nsg_from_gpu_knn(&knn_gpu, r, l_build, c_cap, cli.seed as usize, true).unwrap();
+        let nsg_build_ms = start.elapsed().as_secs_f64() * 1000.0;
+        let build_time = knn_build_ms + nsg_build_ms;
 
-        let index_size_mb = nndescent_idx.memory_usage_bytes() as f64 / (1024.0 * 1024.0);
+        let index_size_mb = nsg_idx.memory_usage_bytes() as f64 / (1024.0 * 1024.0);
 
-        // Query benchmarks
-        for ef_search in &ef_search_values {
-            let ef_search_str = ef_search
-                .map(|i| i.to_string())
-                .unwrap_or_else(|| ":auto".to_string());
+        for &ef_search in ef_search_values {
+            let ef_label = ef_search
+                .map(|e| e.to_string())
+                .unwrap_or("auto".to_string());
+            println!("Querying NSG index (ef_search={})...", ef_label);
 
-            println!("Querying NNDescent index (ef_search={})...", ef_search_str);
             let start = Instant::now();
-            let (approx_neighbors, approx_distances) = query_nndescent_index(
-                query_data.as_ref(),
-                &nndescent_idx,
-                cli.k,
-                *ef_search,
-                true,
-                false,
-            )
-            .unwrap();
+            let (approx_neighbors, approx_distances) =
+                query_nsg_index(query_data.as_ref(), &nsg_idx, cli.k, ef_search, true, false)
+                    .unwrap();
             let query_time = start.elapsed().as_secs_f64() * 1000.0;
 
             let recall = calculate_recall(&true_neighbors, &approx_neighbors, cli.k);
@@ -148,10 +141,7 @@ fn main() {
             );
 
             results.push(BenchmarkResultSize {
-                method: format!(
-                    "NNDescent-k{}-nt{}-s{}-dp{} (query)",
-                    knn_k_str, n_trees_str, ef_search_str, diversify_prob
-                ),
+                method: format!("NSG-GPU-R{}-L{}-ef{} (query)", r, l_build, ef_label),
                 build_time_ms: build_time,
                 query_time_ms: query_time,
                 total_time_ms: build_time + query_time,
@@ -161,11 +151,10 @@ fn main() {
             });
         }
 
-        // Self-query benchmark
-        println!("Self-querying NNDescent index...");
+        println!("Self-querying NSG index...");
         let start = Instant::now();
         let (approx_neighbors_self, approx_distances_self) =
-            query_nndescent_self(&nndescent_idx, cli.k, None, true, false).unwrap();
+            query_nsg_self(&nsg_idx, cli.k, None, true, false).unwrap();
         let self_query_time = start.elapsed().as_secs_f64() * 1000.0;
 
         let recall_self = calculate_recall(&true_neighbors_self, &approx_neighbors_self, cli.k);
@@ -176,10 +165,7 @@ fn main() {
         );
 
         results.push(BenchmarkResultSize {
-            method: format!(
-                "NNDescent-k{}-nt{}-dp{} (self)",
-                knn_k_str, n_trees_str, diversify_prob
-            ),
+            method: format!("NSG-GPU-R{}-L{} (self)", r, l_build),
             build_time_ms: build_time,
             query_time_ms: self_query_time,
             total_time_ms: build_time + self_query_time,

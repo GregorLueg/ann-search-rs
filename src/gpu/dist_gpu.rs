@@ -218,6 +218,270 @@ pub fn cosine_tiled<F: Float, N: Size>(
     distances[query_idx * dist_stride as usize + db_idx] = F::new(1.0_f32) - (dot / (q_norm * d_norm));
 }
 
+/// Register-tiled Euclidean distance kernel
+///
+/// Each thread computes a `tile_q x tile_d` block of the distance matrix
+/// instead of a single entry, so each loaded value feeds several FMAs.
+///
+/// ### Params
+///
+/// * `query_vectors` - Query vectors `[n_queries, dim / N]` as `Vector<F, N>`
+/// * `db_vectors` - Database vectors `[n_db, dim / N]` as `Vector<F, N>`
+/// * `distances` - Output distance matrix `[n_queries, dist_stride]`
+/// * `db_start` - Global offset into `db_vectors` for this chunk
+/// * `n_db_chunk` - Number of DB vectors in this chunk
+/// * `n_queries` - Total number of query vectors
+/// * `dist_stride` - Column stride of the output distance matrix
+/// * `dim_lines` - Number of `Vector<F, N>` elements per vector row (comptime)
+/// * `size_y` - Number of query rows staged in shared memory (comptime).
+///   Must be divisible by `tile_q`
+/// * `tile_d` - DB vectors per thread (comptime)
+/// * `tile_q` - Query vectors per thread (comptime)
+///
+/// ### Grid mapping
+///
+/// * `CUBE_POS_X` -> block of `WORKGROUP_SIZE_X * tile_d` DB vectors
+/// * `UNIT_POS_X` -> lane within that block
+/// * `UNIT_POS_Y` -> block of `tile_q` query rows within the shared tile
+#[cube(launch_unchecked)]
+pub fn euclidean_tiled_reg<F: Float, N: Size>(
+    query_vectors: &Tensor<Vector<F, N>>,
+    db_vectors: &Tensor<Vector<F, N>>,
+    distances: &mut Tensor<F>,
+    db_start: u32,
+    n_db_chunk: u32,
+    n_queries: u32,
+    dist_stride: u32,
+    #[comptime] dim_lines: usize,
+    #[comptime] size_y: u32,
+    #[comptime] tile_d: usize,
+    #[comptime] tile_q: usize,
+) {
+    let lanes = LINE_SIZE;
+    let dim_scalars = dim_lines * lanes;
+    let wg_y = size_y as usize;
+    let local_x = UNIT_POS_X as usize;
+    let local_y = UNIT_POS_Y as usize;
+
+    // Scalar shared memory only (vectorised shared mem silently broadcasts lane 0)
+    let mut s_query = SharedMemory::<F>::new(wg_y * dim_scalars);
+
+    // Locals at kernel scope, never inside a branch or loop.
+    let mut acc = Array::<F>::new(tile_q * tile_d);
+    let mut d_scalars = Array::<F>::new(tile_d * lanes);
+
+    let threads_y = wg_y / tile_q;
+    let thread_id = local_y * WORKGROUP_SIZE_X as usize + local_x;
+    let total_threads = WORKGROUP_SIZE_X as usize * threads_y;
+    let total_elems = wg_y * dim_scalars;
+
+    // First query row owned by this cube.
+    let q_tile_base = ((CUBE_POS_Z * CUBE_COUNT_Y + CUBE_POS_Y) as usize) * wg_y;
+
+    let mut load_idx = thread_id;
+    while load_idx < total_elems {
+        let q_local = load_idx / dim_scalars;
+        let elem = load_idx % dim_scalars;
+        let q_global = q_tile_base + q_local;
+        if q_global < n_queries as usize {
+            let line_idx = elem / lanes;
+            let lane = elem % lanes;
+            let line_val = query_vectors[q_global * dim_lines + line_idx];
+            s_query[load_idx] = line_val[lane];
+        } else {
+            s_query[load_idx] = F::new(0.0_f32);
+        }
+        load_idx += total_threads;
+    }
+    sync_cube();
+
+    #[unroll]
+    for a in 0..tile_q * tile_d {
+        acc[a] = F::new(0.0_f32);
+    }
+
+    let db_tile_base = (CUBE_POS_X as usize) * (WORKGROUP_SIZE_X as usize) * tile_d;
+    let q_row_base = local_y * tile_q;
+
+    for i in 0..dim_lines {
+        // Stage this thread's tile_d DB lines as scalars.
+        #[unroll]
+        for r in 0..tile_d {
+            let db_local = db_tile_base + local_x + r * WORKGROUP_SIZE_X as usize;
+            // Clamp out-of-range rows to row 0; the result is masked on write.
+            let mut idx = 0usize;
+            if db_local < n_db_chunk as usize {
+                idx = (db_start as usize + db_local) * dim_lines + i;
+            }
+            let line_val = db_vectors[idx];
+            #[unroll]
+            for lane in 0..lanes {
+                d_scalars[r * lanes + lane] = line_val[lane];
+            }
+        }
+
+        #[unroll]
+        for t in 0..tile_q {
+            let s_off = (q_row_base + t) * dim_scalars + i * lanes;
+            #[unroll]
+            for lane in 0..lanes {
+                let qv = s_query[s_off + lane];
+                #[unroll]
+                for r in 0..tile_d {
+                    let diff = qv - d_scalars[r * lanes + lane];
+                    acc[t * tile_d + r] += diff * diff;
+                }
+            }
+        }
+    }
+
+    #[unroll]
+    for t in 0..tile_q {
+        let q_global = q_tile_base + q_row_base + t;
+        #[unroll]
+        for r in 0..tile_d {
+            let db_local = db_tile_base + local_x + r * WORKGROUP_SIZE_X as usize;
+            if q_global < n_queries as usize && db_local < n_db_chunk as usize {
+                distances[q_global * dist_stride as usize + db_local] = acc[t * tile_d + r];
+            }
+        }
+    }
+}
+
+/// Register-tiled cosine distance kernel
+///
+/// Same tiling strategy as `euclidean_tiled_reg` but accumulates dot products
+/// and normalises on writeback, computing `1 - dot(q, d) / (||q|| * ||d||)`.
+///
+/// ### Params
+///
+/// * `query_vectors` - Query vectors `[n_queries, dim / N]` as `Vector<F, N>`
+/// * `db_vectors` - Database vectors `[n_db, dim / N]` as `Vector<F, N>`
+/// * `query_norms` - Pre-computed L2 norms `[n_queries]`
+/// * `db_norms` - Pre-computed L2 norms `[n_db]`
+/// * `distances` - Output distance matrix `[n_queries, dist_stride]`
+/// * `db_start` - Global offset into `db_vectors` for this chunk
+/// * `n_db_chunk` - Number of DB vectors in this chunk
+/// * `n_queries` - Total number of query vectors
+/// * `dist_stride` - Column stride of the output distance matrix
+/// * `dim_lines` - Number of `Vector<F, N>` elements per vector row (comptime)
+/// * `size_y` - Number of query rows staged in shared memory (comptime).
+///   Must be divisible by `tile_q`
+/// * `tile_d` - DB vectors per thread (comptime)
+/// * `tile_q` - Query vectors per thread (comptime)
+///
+/// ### Grid mapping
+///
+/// * `CUBE_POS_X` -> block of `WORKGROUP_SIZE_X * tile_d` DB vectors
+/// * `UNIT_POS_X` -> lane within that block
+/// * `UNIT_POS_Y` -> block of `tile_q` query rows within the shared tile
+#[cube(launch_unchecked)]
+pub fn cosine_tiled_reg<F: Float, N: Size>(
+    query_vectors: &Tensor<Vector<F, N>>,
+    db_vectors: &Tensor<Vector<F, N>>,
+    query_norms: &Tensor<F>,
+    db_norms: &Tensor<F>,
+    distances: &mut Tensor<F>,
+    db_start: u32,
+    n_db_chunk: u32,
+    n_queries: u32,
+    dist_stride: u32,
+    #[comptime] dim_lines: usize,
+    #[comptime] size_y: u32,
+    #[comptime] tile_d: usize,
+    #[comptime] tile_q: usize,
+) {
+    let lanes = LINE_SIZE;
+    let dim_scalars = dim_lines * lanes;
+    let wg_y = size_y as usize;
+    let local_x = UNIT_POS_X as usize;
+    let local_y = UNIT_POS_Y as usize;
+
+    // Scalar shared memory only (vectorised shared mem silently broadcasts lane 0)
+    let mut s_query = SharedMemory::<F>::new(wg_y * dim_scalars);
+
+    // Locals at kernel scope, never inside a branch or loop.
+    let mut acc = Array::<F>::new(tile_q * tile_d);
+    let mut d_scalars = Array::<F>::new(tile_d * lanes);
+
+    let threads_y = wg_y / tile_q;
+    let thread_id = local_y * WORKGROUP_SIZE_X as usize + local_x;
+    let total_threads = WORKGROUP_SIZE_X as usize * threads_y;
+    let total_elems = wg_y * dim_scalars;
+
+    let q_tile_base = ((CUBE_POS_Z * CUBE_COUNT_Y + CUBE_POS_Y) as usize) * wg_y;
+
+    let mut load_idx = thread_id;
+    while load_idx < total_elems {
+        let q_local = load_idx / dim_scalars;
+        let elem = load_idx % dim_scalars;
+        let q_global = q_tile_base + q_local;
+        if q_global < n_queries as usize {
+            let line_idx = elem / lanes;
+            let lane = elem % lanes;
+            let line_val = query_vectors[q_global * dim_lines + line_idx];
+            s_query[load_idx] = line_val[lane];
+        } else {
+            s_query[load_idx] = F::new(0.0_f32);
+        }
+        load_idx += total_threads;
+    }
+    sync_cube();
+
+    #[unroll]
+    for a in 0..tile_q * tile_d {
+        acc[a] = F::new(0.0_f32);
+    }
+
+    let db_tile_base = (CUBE_POS_X as usize) * (WORKGROUP_SIZE_X as usize) * tile_d;
+    let q_row_base = local_y * tile_q;
+
+    for i in 0..dim_lines {
+        #[unroll]
+        for r in 0..tile_d {
+            let db_local = db_tile_base + local_x + r * WORKGROUP_SIZE_X as usize;
+            // Clamp out-of-range rows to row 0; the result is masked on write.
+            let mut idx = 0usize;
+            if db_local < n_db_chunk as usize {
+                idx = (db_start as usize + db_local) * dim_lines + i;
+            }
+            let line_val = db_vectors[idx];
+            #[unroll]
+            for lane in 0..lanes {
+                d_scalars[r * lanes + lane] = line_val[lane];
+            }
+        }
+
+        #[unroll]
+        for t in 0..tile_q {
+            let s_off = (q_row_base + t) * dim_scalars + i * lanes;
+            #[unroll]
+            for lane in 0..lanes {
+                let qv = s_query[s_off + lane];
+                #[unroll]
+                for r in 0..tile_d {
+                    acc[t * tile_d + r] += qv * d_scalars[r * lanes + lane];
+                }
+            }
+        }
+    }
+
+    #[unroll]
+    for t in 0..tile_q {
+        let q_global = q_tile_base + q_row_base + t;
+        #[unroll]
+        for r in 0..tile_d {
+            let db_local = db_tile_base + local_x + r * WORKGROUP_SIZE_X as usize;
+            if q_global < n_queries as usize && db_local < n_db_chunk as usize {
+                let q_norm = query_norms[q_global];
+                let d_norm = db_norms[db_start as usize + db_local];
+                distances[q_global * dist_stride as usize + db_local] =
+                    F::new(1.0_f32) - (acc[t * tile_d + r] / (q_norm * d_norm));
+            }
+        }
+    }
+}
+
 /////////////////////
 // Top-k selection //
 /////////////////////
@@ -270,9 +534,10 @@ pub fn init_topk<F: Float>(
 
 /// Extract top-k smallest distances per query via insertion sort
 ///
-/// One thread per query, serial scan of the distance row. Writes directly
-/// into the running top-k buffer, so no separate merge step is needed.
-/// The buffer must be pre-initialised with `init_topk`.
+/// One thread per query, serial scan of the distance row. The running top-k
+/// is held in registers for the duration of the scan and flushed back once at
+/// the end, so the per-candidate cost is a single global read of the distance
+/// matrix. The buffer must be pre-initialised with `init_topk`.
 ///
 /// ### Params
 ///
@@ -282,6 +547,8 @@ pub fn init_topk<F: Float>(
 /// * `out_indices` - Running top-k index buffer `[n_queries, k]`
 /// * `chunk_offset` - Global DB index corresponding to column 0 of this chunk
 /// * `actual_chunk_size` - Number of valid columns in this chunk
+/// * `k_param` - Runtime value of k (must equal comptime `k`)
+/// * `k` - Comptime top-k count; must match `k_param` at launch (comptime)
 ///
 /// ### Grid mapping
 ///
@@ -293,6 +560,8 @@ pub fn extract_topk<F: Float>(
     out_indices: &mut Tensor<u32>,
     chunk_offset: u32,
     actual_chunk_size: u32,
+    k_param: u32,
+    #[comptime] k: usize,
 ) {
     let query_idx =
         ((CUBE_POS_Y * CUBE_COUNT_X + CUBE_POS_X) * WORKGROUP_SIZE_X + UNIT_POS_X) as usize;
@@ -301,42 +570,54 @@ pub fn extract_topk<F: Float>(
         terminate!();
     }
 
-    let k = out_dists.shape(1);
+    let kr = k_param as usize;
     let dist_offset = query_idx * distances.stride(0);
     let out_offset = query_idx * out_dists.stride(0);
+
+    // Stage the running top-k in registers. The previous version re-read
+    // `out_dists[out_offset + k - 1]` from global on every column of the chunk,
+    // and re-read the whole k-row on every accepted candidate.
+    let mut local_dists = Array::<F>::new(k);
+    let mut local_indices = Array::<u32>::new(k);
+    for i in 0..k {
+        local_dists[i] = out_dists[out_offset + i];
+        local_indices[i] = out_indices[out_offset + i];
+    }
 
     for i in 0..actual_chunk_size {
         let dist = distances[dist_offset + i as usize];
 
-        if dist < out_dists[out_offset + k - 1] {
-            // Find insertion point
-            let mut insert_pos: usize = k - 1;
+        if dist < local_dists[kr - 1] {
+            // First-match guard rather than a `bool` sentinel: see the codegen
+            // rules in the `nndescent_gpu` module header.
+            let mut pos = kr - 1;
             for j in 0..k {
-                if dist < out_dists[out_offset + j] && insert_pos == k - 1 {
-                    insert_pos = j;
+                if dist < local_dists[j] && pos == kr - 1 {
+                    pos = j;
                 }
             }
 
-            // Shift right
-            for j in 0..k - 1 {
-                let src = k - 2 - j;
-                let dst = k - 1 - j;
-                if src >= insert_pos {
-                    out_dists[out_offset + dst] = out_dists[out_offset + src];
-                    out_indices[out_offset + dst] = out_indices[out_offset + src];
-                }
+            let mut s = kr - 1;
+            while s > pos {
+                local_dists[s] = local_dists[s - 1];
+                local_indices[s] = local_indices[s - 1];
+                s -= 1usize;
             }
 
-            out_dists[out_offset + insert_pos] = dist;
-            out_indices[out_offset + insert_pos] = chunk_offset + i;
+            local_dists[pos] = dist;
+            local_indices[pos] = chunk_offset + i;
         }
+    }
+
+    for i in 0..k {
+        out_dists[out_offset + i] = local_dists[i];
+        out_indices[out_offset + i] = local_indices[i];
     }
 }
 
-/// Coalesced top-k extraction. One workgroup per query, threads
-/// cooperate by striding through consecutive columns of the distance
-/// row. Memory accesses are coalesced: adjacent threads read adjacent
-/// elements.
+/// Coalesced top-k extraction. One workgroup per query, threads cooperate by
+/// striding through consecutive columns of the distance row. Memory accesses
+/// are coalesced: adjacent threads read adjacent elements.
 ///
 /// Per-thread top-k kept in local Arrays (registers) during the scan,
 /// copied to shared memory only for the final merge.
@@ -352,6 +633,15 @@ pub fn extract_topk<F: Float>(
 /// * `dist_stride` - Column stride of the distance matrix
 /// * `k_param` - Runtime value of k (must equal comptime `k`)
 /// * `k` - Comptime top-k count; must match `k_param` at launch (comptime)
+/// * `group` - Lanes staged per merge round (comptime)
+/// * `single_round` - Whether all lanes fit in one round (comptime)
+/// * `slots` - Number of `k`-element lists in shared memory (comptime)
+///
+/// ### Shared memory
+///
+/// The merge staging is chunked to the device budget by `plan_topk_merge`;
+/// see [`reduce_ivf_topk_coalesced`] for the reasoning, the two kernels share
+/// the scheme.
 ///
 /// ### Grid mapping
 ///
@@ -367,6 +657,9 @@ pub fn extract_topk_coalesced<F: Float>(
     dist_stride: u32,
     k_param: u32,
     #[comptime] k: usize,
+    #[comptime] group: usize,
+    #[comptime] single_round: bool,
+    #[comptime] slots: usize,
 ) {
     let query_idx = CUBE_POS_X as usize;
     let tx = UNIT_POS_X as usize;
@@ -413,84 +706,191 @@ pub fn extract_topk_coalesced<F: Float>(
         col += wg as u32;
     }
 
-    // ── Merge phase: copy to shared memory, thread 0 merges ──
-    let mut s_dist = SharedMemory::<F>::new(32 * k);
-    let mut s_idx = SharedMemory::<u32>::new(32 * k);
+    let mut s_dist = SharedMemory::<F>::new(slots * k);
+    let mut s_idx = SharedMemory::<u32>::new(slots * k);
 
-    let s_base = tx * kr;
-    for i in 0..k {
-        s_dist[s_base + i] = local_dists[i];
-        s_idx[s_base + i] = local_indices[i];
-    }
+    if single_round {
+        // -- Unchunked fast path --
+        //
+        // Every lane's list fits at once, so this is the original kernel
+        // verbatim: `slots == WORKGROUP_SIZE_X` and thread 0's own slot doubles
+        // as the accumulator, giving exactly the pre-chunking footprint.
+        let s_base = tx * kr;
+        for i in 0..k {
+            s_dist[s_base + i] = local_dists[i];
+            s_idx[s_base + i] = local_indices[i];
+        }
 
-    sync_cube();
+        sync_cube();
 
-    if tx == 0usize {
-        // Merge threads 1..31 into thread 0's list
-        let mut t = 1usize;
-        while t < wg {
-            let t_base = t * kr;
-            let mut done: u32 = 0u32;
+        if tx == 0usize {
+            // Merge threads 1..31 into thread 0's list
+            let mut t = 1usize;
+            while t < wg {
+                let t_base = t * kr;
+                let mut done: u32 = 0u32;
+                for i in 0..k {
+                    if done == 0u32 {
+                        let cd = s_dist[t_base + i];
+                        let ci = s_idx[t_base + i];
+
+                        if cd >= s_dist[kr - 1] {
+                            done = 1u32;
+                        } else {
+                            let mut pos = kr - 1;
+                            for j in 0..k {
+                                if cd < s_dist[j] && pos == kr - 1 {
+                                    pos = j;
+                                }
+                            }
+
+                            let mut s_i = kr - 1;
+                            while s_i > pos {
+                                s_dist[s_i] = s_dist[s_i - 1];
+                                s_idx[s_i] = s_idx[s_i - 1];
+                                s_i -= 1usize;
+                            }
+
+                            s_dist[pos] = cd;
+                            s_idx[pos] = ci;
+                        }
+                    }
+                }
+                t += 1usize;
+            }
+
+            // Merge with running top-k from previous chunks
+            let out_base = query_idx * kr;
             for i in 0..k {
-                if done == 0u32 {
-                    let cd = s_dist[t_base + i];
-                    let ci = s_idx[t_base + i];
+                let running_dist = out_dists[out_base + i];
+                let running_idx = out_indices[out_base + i];
 
-                    if cd >= s_dist[kr - 1] {
-                        done = 1u32;
-                    } else {
-                        let mut pos = kr - 1;
-                        for j in 0..k {
-                            if cd < s_dist[j] && pos == kr - 1 {
-                                pos = j;
+                if running_dist < s_dist[kr - 1] {
+                    let mut pos = kr - 1;
+                    for j in 0..k {
+                        if running_dist < s_dist[j] && pos == kr - 1 {
+                            pos = j;
+                        }
+                    }
+
+                    let mut s_i = kr - 1;
+                    while s_i > pos {
+                        s_dist[s_i] = s_dist[s_i - 1];
+                        s_idx[s_i] = s_idx[s_i - 1];
+                        s_i -= 1usize;
+                    }
+
+                    s_dist[pos] = running_dist;
+                    s_idx[pos] = running_idx;
+                }
+            }
+
+            // Write final result
+            for i in 0..k {
+                out_dists[out_base + i] = s_dist[i];
+                out_indices[out_base + i] = s_idx[i];
+            }
+        }
+    } else {
+        // -- Chunked merge --
+        //
+        // `group` lanes stage their lists per round; thread 0 folds each round
+        // into the accumulator list held at slot `group`.
+        let acc = group * kr;
+
+        if tx == 0usize {
+            for i in 0..k {
+                s_dist[acc + i] = F::new(f32::MAX);
+                s_idx[acc + i] = 0u32;
+            }
+        }
+        sync_cube();
+
+        let n_rounds = wg / group;
+        let mut round = 0usize;
+        while round < n_rounds {
+            if tx / group == round {
+                let s_base = (tx % group) * kr;
+                for i in 0..k {
+                    s_dist[s_base + i] = local_dists[i];
+                    s_idx[s_base + i] = local_indices[i];
+                }
+            }
+            sync_cube();
+
+            if tx == 0usize {
+                let mut t = 0usize;
+                while t < group {
+                    let t_base = t * kr;
+                    let mut done: u32 = 0u32;
+                    for i in 0..k {
+                        if done == 0u32 {
+                            let cd = s_dist[t_base + i];
+                            let ci = s_idx[t_base + i];
+
+                            if cd >= s_dist[acc + kr - 1] {
+                                done = 1u32;
+                            } else {
+                                let mut pos = kr - 1;
+                                for j in 0..k {
+                                    if cd < s_dist[acc + j] && pos == kr - 1 {
+                                        pos = j;
+                                    }
+                                }
+
+                                let mut s_i = kr - 1;
+                                while s_i > pos {
+                                    s_dist[acc + s_i] = s_dist[acc + s_i - 1];
+                                    s_idx[acc + s_i] = s_idx[acc + s_i - 1];
+                                    s_i -= 1usize;
+                                }
+
+                                s_dist[acc + pos] = cd;
+                                s_idx[acc + pos] = ci;
                             }
                         }
+                    }
+                    t += 1usize;
+                }
+            }
+            // Thread 0 must finish reading the staged slots before the next
+            // round's lanes overwrite them.
+            sync_cube();
+            round += 1usize;
+        }
 
-                        let mut s_i = kr - 1;
-                        while s_i > pos {
-                            s_dist[s_i] = s_dist[s_i - 1];
-                            s_idx[s_i] = s_idx[s_i - 1];
-                            s_i -= 1usize;
+        if tx == 0usize {
+            // Merge with running top-k from previous chunks
+            let out_base = query_idx * kr;
+            for i in 0..k {
+                let running_dist = out_dists[out_base + i];
+                let running_idx = out_indices[out_base + i];
+
+                if running_dist < s_dist[acc + kr - 1] {
+                    let mut pos = kr - 1;
+                    for j in 0..k {
+                        if running_dist < s_dist[acc + j] && pos == kr - 1 {
+                            pos = j;
                         }
-
-                        s_dist[pos] = cd;
-                        s_idx[pos] = ci;
                     }
+
+                    let mut s_i = kr - 1;
+                    while s_i > pos {
+                        s_dist[acc + s_i] = s_dist[acc + s_i - 1];
+                        s_idx[acc + s_i] = s_idx[acc + s_i - 1];
+                        s_i -= 1usize;
+                    }
+
+                    s_dist[acc + pos] = running_dist;
+                    s_idx[acc + pos] = running_idx;
                 }
             }
-            t += 1usize;
-        }
 
-        // Merge with running top-k from previous chunks
-        let out_base = query_idx * kr;
-        for i in 0..k {
-            let running_dist = out_dists[out_base + i];
-            let running_idx = out_indices[out_base + i];
-
-            if running_dist < s_dist[kr - 1] {
-                let mut pos = kr - 1;
-                for j in 0..k {
-                    if running_dist < s_dist[j] && pos == kr - 1 {
-                        pos = j;
-                    }
-                }
-
-                let mut s_i = kr - 1;
-                while s_i > pos {
-                    s_dist[s_i] = s_dist[s_i - 1];
-                    s_idx[s_i] = s_idx[s_i - 1];
-                    s_i -= 1usize;
-                }
-
-                s_dist[pos] = running_dist;
-                s_idx[pos] = running_idx;
+            // Write final result
+            for i in 0..k {
+                out_dists[out_base + i] = s_dist[acc + i];
+                out_indices[out_base + i] = s_idx[acc + i];
             }
-        }
-
-        // Write final result
-        for i in 0..k {
-            out_dists[out_base + i] = s_dist[i];
-            out_indices[out_base + i] = s_idx[i];
         }
     }
 }
@@ -610,6 +1010,29 @@ where
             let (grid_y, grid_z) = grid_2d((n_q as u32).div_ceil(safe_worksize_y));
 
             match *metric {
+                // Register-tiled path where the tile divides the query tile
+                // height; roughly 1.4x to 2.2x over the untiled kernel and
+                // bit-exact against it. See `TILE_D` for the measurements.
+                Dist::SquaredEuclidean if tile_fits(safe_worksize_y) => unsafe {
+                    let reg_grid_x = (n_db as u32).div_ceil(WORKGROUP_SIZE_X * TILE_D as u32);
+                    euclidean_tiled_reg::launch_unchecked::<T, R>(
+                        &client,
+                        CubeCount::Static(reg_grid_x, grid_y, grid_z),
+                        CubeDim::new_2d(WORKGROUP_SIZE_X, safe_worksize_y / TILE_Q as u32),
+                        vec_size,
+                        query_gpu.clone().into_tensor_arg(),
+                        db_gpu.clone().into_tensor_arg(),
+                        distances_gpu.clone().into_tensor_arg(),
+                        db_start as u32,
+                        n_db as u32,
+                        n_q as u32,
+                        max_db_chunk as u32,
+                        dim_lines,
+                        safe_worksize_y,
+                        TILE_D,
+                        TILE_Q,
+                    );
+                },
                 Dist::SquaredEuclidean => unsafe {
                     euclidean_tiled::launch_unchecked::<T, R>(
                         &client,
@@ -625,6 +1048,28 @@ where
                         max_db_chunk as u32,
                         dim_lines,
                         safe_worksize_y,
+                    );
+                },
+                Dist::Cosine if tile_fits(safe_worksize_y) => unsafe {
+                    let reg_grid_x = (n_db as u32).div_ceil(WORKGROUP_SIZE_X * TILE_D as u32);
+                    cosine_tiled_reg::launch_unchecked::<T, R>(
+                        &client,
+                        CubeCount::Static(reg_grid_x, grid_y, grid_z),
+                        CubeDim::new_2d(WORKGROUP_SIZE_X, safe_worksize_y / TILE_Q as u32),
+                        vec_size,
+                        query_gpu.clone().into_tensor_arg(),
+                        db_gpu.clone().into_tensor_arg(),
+                        query_norms_gpu.as_ref().unwrap().clone().into_tensor_arg(),
+                        db_norms_gpu.as_ref().unwrap().clone().into_tensor_arg(),
+                        distances_gpu.clone().into_tensor_arg(),
+                        db_start as u32,
+                        n_db as u32,
+                        n_q as u32,
+                        max_db_chunk as u32,
+                        dim_lines,
+                        safe_worksize_y,
+                        TILE_D,
+                        TILE_Q,
                     );
                 },
                 Dist::Cosine => unsafe {
@@ -661,6 +1106,8 @@ where
                     topk_indices.clone().into_tensor_arg(),
                     db_start as u32,
                     n_db as u32,
+                    k as u32,
+                    k,
                 );
             }
         }
@@ -713,6 +1160,9 @@ where
 ///   because CubeCL comptime values cannot be used in runtime assignments.
 /// * `k` - Number of nearest neighbours to extract per query (comptime).
 ///   Used only for `Array::new` and `SharedMemory::new` sizing.
+/// * `group` - Lanes whose lists are staged per merge round (comptime)
+/// * `single_round` - Whether all lanes fit in one round (comptime)
+/// * `slots` - Number of `k`-element lists in shared memory (comptime)
 ///
 /// ### Grid mapping
 ///
@@ -729,6 +1179,9 @@ pub fn reduce_ivf_topk_coalesced<F: Float>(
     out_indices: &mut Tensor<u32>,
     k_param: u32,
     #[comptime] k: usize,
+    #[comptime] group: usize,
+    #[comptime] single_round: bool,
+    #[comptime] slots: usize,
 ) {
     let q_idx = (CUBE_POS_Y * CUBE_COUNT_X + CUBE_POS_X) as usize;
     let tx = UNIT_POS_X as usize;
@@ -788,62 +1241,146 @@ pub fn reduce_ivf_topk_coalesced<F: Float>(
 
     // ── Phase 2: shared memory merge ──
 
-    let mut s_dist = SharedMemory::<F>::new(32 * k);
-    let mut s_idx = SharedMemory::<u32>::new(32 * k);
+    let mut s_dist = SharedMemory::<F>::new(slots * k);
+    let mut s_idx = SharedMemory::<u32>::new(slots * k);
 
-    let s_base = tx * kr;
-    for i in 0..k {
-        s_dist[s_base + i] = local_dists[i];
-        s_idx[s_base + i] = local_indices[i];
-    }
+    if single_round {
+        // ---- Unchunked fast path -------------------------------------------
+        // Every lane's list fits at once, so this is the original kernel
+        // verbatim: `slots == WORKGROUP_SIZE_X` and thread 0's own slot doubles
+        // as the accumulator, giving exactly the pre-chunking footprint.
+        let s_base = tx * kr;
+        for i in 0..k {
+            s_dist[s_base + i] = local_dists[i];
+            s_idx[s_base + i] = local_indices[i];
+        }
 
-    sync_cube();
+        sync_cube();
 
-    // Thread 0 merges all 32 sorted thread-local lists
-    if tx == 0usize {
-        let mut t = 1usize;
-        while t < wg {
-            let t_base = t * kr;
-            let mut done: u32 = 0u32;
+        // Thread 0 merges all 32 sorted thread-local lists
+        if tx == 0usize {
+            let mut t = 1usize;
+            while t < wg {
+                let t_base = t * kr;
+                let mut done: u32 = 0u32;
 
-            // Sorted per-thread list: once cd >= current worst, all remaining
-            // are worse. `done: u32` sentinel matches extract's pattern; a
-            // `bool` here miscompiles on cubecl 0.10 / lavapipe.
-            for i in 0..k {
-                if done == 0u32 {
-                    let cd = s_dist[t_base + i];
-                    let ci = s_idx[t_base + i];
+                // Sorted per-thread list: once cd >= current worst, all
+                // remaining are worse. `done: u32` sentinel matches extract's
+                // pattern; a `bool` here miscompiles on cubecl 0.10 / lavapipe.
+                for i in 0..k {
+                    if done == 0u32 {
+                        let cd = s_dist[t_base + i];
+                        let ci = s_idx[t_base + i];
 
-                    if cd >= s_dist[kr - 1] {
-                        done = 1u32;
-                    } else {
-                        let mut pos = kr - 1;
-                        for j in 0..k {
-                            if cd < s_dist[j] && pos == kr - 1 {
-                                pos = j;
+                        if cd >= s_dist[kr - 1] {
+                            done = 1u32;
+                        } else {
+                            let mut pos = kr - 1;
+                            for j in 0..k {
+                                if cd < s_dist[j] && pos == kr - 1 {
+                                    pos = j;
+                                }
                             }
-                        }
 
-                        let mut s_i = kr - 1;
-                        while s_i > pos {
-                            s_dist[s_i] = s_dist[s_i - 1];
-                            s_idx[s_i] = s_idx[s_i - 1];
-                            s_i -= 1usize;
-                        }
+                            let mut s_i = kr - 1;
+                            while s_i > pos {
+                                s_dist[s_i] = s_dist[s_i - 1];
+                                s_idx[s_i] = s_idx[s_i - 1];
+                                s_i -= 1usize;
+                            }
 
-                        s_dist[pos] = cd;
-                        s_idx[pos] = ci;
+                            s_dist[pos] = cd;
+                            s_idx[pos] = ci;
+                        }
                     }
                 }
+                t += 1usize;
             }
-            t += 1usize;
+
+            // Write final result
+            let out_base = q_idx * kr;
+            for i in 0..k {
+                out_dists[out_base + i] = s_dist[i];
+                out_indices[out_base + i] = s_idx[i];
+            }
+        }
+    } else {
+        // ---- Chunked merge --------------------------------------------------
+        // `group` lanes stage their lists per round; thread 0 folds each round
+        // into the accumulator list held at slot `group`. Lanes are visited in
+        // ascending order exactly as on the fast path, so ties resolve the same
+        // way.
+        let acc = group * kr;
+
+        if tx == 0usize {
+            for i in 0..k {
+                s_dist[acc + i] = F::new(f32::MAX);
+                s_idx[acc + i] = 0u32;
+            }
+        }
+        sync_cube();
+
+        let n_rounds = wg / group;
+        let mut round = 0usize;
+        while round < n_rounds {
+            if tx / group == round {
+                let s_base = (tx % group) * kr;
+                for i in 0..k {
+                    s_dist[s_base + i] = local_dists[i];
+                    s_idx[s_base + i] = local_indices[i];
+                }
+            }
+            sync_cube();
+
+            if tx == 0usize {
+                let mut t = 0usize;
+                while t < group {
+                    let t_base = t * kr;
+                    let mut done: u32 = 0u32;
+
+                    for i in 0..k {
+                        if done == 0u32 {
+                            let cd = s_dist[t_base + i];
+                            let ci = s_idx[t_base + i];
+
+                            if cd >= s_dist[acc + kr - 1] {
+                                done = 1u32;
+                            } else {
+                                let mut pos = kr - 1;
+                                for j in 0..k {
+                                    if cd < s_dist[acc + j] && pos == kr - 1 {
+                                        pos = j;
+                                    }
+                                }
+
+                                let mut s_i = kr - 1;
+                                while s_i > pos {
+                                    s_dist[acc + s_i] = s_dist[acc + s_i - 1];
+                                    s_idx[acc + s_i] = s_idx[acc + s_i - 1];
+                                    s_i -= 1usize;
+                                }
+
+                                s_dist[acc + pos] = cd;
+                                s_idx[acc + pos] = ci;
+                            }
+                        }
+                    }
+                    t += 1usize;
+                }
+            }
+            // Thread 0 must finish reading the staged slots before the next
+            // round's lanes overwrite them.
+            sync_cube();
+            round += 1usize;
         }
 
         // Write final result
-        let out_base = q_idx * kr;
-        for i in 0..k {
-            out_dists[out_base + i] = s_dist[i];
-            out_indices[out_base + i] = s_idx[i];
+        if tx == 0usize {
+            let out_base = q_idx * kr;
+            for i in 0..k {
+                out_dists[out_base + i] = s_dist[acc + i];
+                out_indices[out_base + i] = s_idx[acc + i];
+            }
         }
     }
 }
@@ -930,89 +1467,6 @@ pub fn compute_ivf_mega_euclidean<F: Float, N: Size>(
     out_indices[out_offset] = real_db_idx;
 }
 
-/// Compute cosine distances using a flattened IVF task list
-///
-/// Same structure as `compute_ivf_mega_euclidean` but computes
-/// `1 - dot(q, d) / (||q|| * ||d||)`.
-///
-/// ### Params
-///
-/// * `query_vectors` - Query vectors `[n_queries, dim / N]` as `Vector<F, N>`
-/// * `db_vectors` - Full database vectors `[n_db, dim / N]` as `Vector<F, N>`
-/// * `query_norms` - Pre-computed L2 norms `[n_queries]`
-/// * `db_norms` - Pre-computed L2 norms `[n_db]`
-/// * `task_q_idx` - Query index for each task `[n_tasks]`
-/// * `task_db_start` - Global DB start index for each task `[n_tasks]`
-/// * `task_write_offset` - Write offset into the candidate row for each task
-///   `[n_tasks]`
-/// * `task_db_count` - Number of DB vectors in each task's cluster `[n_tasks]`
-/// * `out_dists` - Output candidate distances `[n_queries, max_candidates]`
-/// * `out_indices` - Output candidate DB indices `[n_queries, max_candidates]`
-/// * `size_y` - Safe workgroup size Y for the given dimensionality
-///
-/// ### Grid mapping
-///
-/// * `ABSOLUTE_POS_X` -> vector index within the task's cluster (`0..db_count`)
-/// * `ABSOLUTE_POS_Y` -> task index (`0..n_tasks`)
-#[cube(launch_unchecked)]
-pub fn compute_ivf_mega_cosine<F: Float, N: Size>(
-    query_vectors: &Tensor<Vector<F, N>>,
-    db_vectors: &Tensor<Vector<F, N>>,
-    query_norms: &Tensor<F>,
-    db_norms: &Tensor<F>,
-    task_q_idx: &Tensor<u32>,
-    task_db_start: &Tensor<u32>,
-    task_write_offset: &Tensor<u32>,
-    task_db_count: &Tensor<u32>,
-    out_dists: &mut Tensor<F>,
-    out_indices: &mut Tensor<u32>,
-    #[comptime] size_y: u32,
-) {
-    let lanes = LINE_SIZE;
-    let local_db_idx = ABSOLUTE_POS_X;
-    let task_idx = (CUBE_POS_Z * CUBE_COUNT_Y + CUBE_POS_Y) * size_y + UNIT_POS_Y;
-
-    if task_idx >= task_q_idx.len() as u32 {
-        terminate!();
-    }
-
-    let db_count = task_db_count[task_idx as usize];
-    if local_db_idx >= db_count {
-        terminate!();
-    }
-
-    let q_idx = task_q_idx[task_idx as usize];
-    let db_start = task_db_start[task_idx as usize];
-    let write_offset = task_write_offset[task_idx as usize];
-
-    let real_db_idx = db_start + local_db_idx;
-    let write_pos = write_offset + local_db_idx;
-
-    let mut dot = F::new(0.0_f32);
-
-    let dim_lines = query_vectors.shape(1) / lanes;
-    let q_offset = q_idx as usize * dim_lines;
-    let d_offset = real_db_idx as usize * dim_lines;
-
-    for i in 0..dim_lines {
-        let q_line = query_vectors[q_offset + i];
-        let d_line = db_vectors[d_offset + i];
-        let prod = q_line * d_line;
-
-        #[unroll]
-        for lane in 0..lanes {
-            dot += prod[lane];
-        }
-    }
-
-    let q_norm = query_norms[q_idx as usize];
-    let d_norm = db_norms[real_db_idx as usize];
-
-    let out_offset = q_idx as usize * out_dists.stride(0) + write_pos as usize;
-    out_dists[out_offset] = F::new(1.0_f32) - (dot / (q_norm * d_norm));
-    out_indices[out_offset] = real_db_idx;
-}
-
 /// In-place top-k reduction for the IVF variable-length candidate buffer
 ///
 /// One thread per query. Performs insertion-sort over the variable-length
@@ -1081,13 +1535,13 @@ pub fn reduce_ivf_topk<F: Float>(
 /// Euclidean mega kernel with shared-memory query caching.
 ///
 /// Same task-based architecture as `compute_ivf_mega_euclidean`, but
-/// cooperatively loads query vectors into scalar shared memory so that
-/// all X-threads in a workgroup row (and Y-threads sharing the same
-/// query) read from shared memory instead of global memory.
+/// cooperatively loads query vectors into scalar shared memory so that all
+/// X-threads in a workgroup row (and Y-threads sharing the same query) read
+/// from shared memory instead of global memory.
 ///
-/// Also caches per-task metadata (q_idx, db_start, write_offset,
-/// db_count) in shared memory to avoid redundant global reads across
-/// the 32 X-threads in each row.
+/// Also caches per-task metadata (q_idx, db_start, write_offset, db_count) in
+/// shared memory to avoid redundant global reads across the 32 X-threads in
+/// each row.
 ///
 /// ### Params
 ///
@@ -1247,6 +1701,7 @@ pub fn compute_ivf_mega_euclidean_cached<F: Float, N: Size>(
     out_indices[out_offset] = real_db_idx;
 }
 
+
 /// Cosine mega kernel with shared-memory query caching.
 ///
 /// Same shared-memory caching strategy as
@@ -1399,10 +1854,6 @@ pub fn compute_ivf_mega_cosine_cached<F: Float, N: Size>(
     out_dists[out_offset] = F::new(1.0_f32) - (dot / (q_norm * d_norm));
     out_indices[out_offset] = real_db_idx;
 }
-
-////////////////////
-// Main functions //
-////////////////////
 
 ///////////
 // Tests //
@@ -1908,6 +2359,12 @@ mod tests {
         let topk_i = GpuTensor::<WgpuRuntime, u32>::empty(vec![n_queries, k], &client);
 
         let (rgx, rgy) = grid_2d(n_queries as u32);
+        let merge = plan_topk_merge(
+            k,
+            size_of::<f32>(),
+            client.properties().hardware.max_shared_memory_size,
+        )
+        .unwrap();
         unsafe {
             reduce_ivf_topk_coalesced::launch_unchecked::<f32, WgpuRuntime>(
                 &client,
@@ -1920,6 +2377,9 @@ mod tests {
                 topk_i.clone().into_tensor_arg(),
                 k as u32,
                 k,
+                merge.group,
+                merge.single_round,
+                merge.slots,
             );
         }
 
@@ -2026,6 +2486,85 @@ mod tests {
         println!("Merge test: dists={:?}, indices={:?}", dists, indices);
         assert_eq!(dists, vec![1.0, 2.0, 3.0, 4.0, 5.0]);
         assert_eq!(indices, vec![3, 35, 64, 100, 129]);
+    }
+
+    // Large k forces the chunked merge arm, where the 32 per-lane lists no
+    // longer fit in shared memory at once. Cross-checked against the serial
+    // reducer, which has no shared-memory merge at all. Without this the
+    // chunked path has no unit coverage: every other reducer test uses a small
+    // k and so only ever exercises the single-round arm.
+    #[test]
+    fn test_coalesced_reduce_chunked_matches_serial() {
+        let Some(device) = try_device() else { return };
+
+        // k = 200 needs 32 * 200 * 8 = 51 200 bytes for a single-round merge,
+        // over the 32 KiB budget, so this must take the chunked path.
+        let k = 200usize;
+        let n_queries = 3usize;
+        let max_candidates = 1024usize;
+
+        let mut candidate_dists = vec![0.0f32; n_queries * max_candidates];
+        let mut candidate_indices = vec![0u32; n_queries * max_candidates];
+        for q in 0..n_queries {
+            for c in 0..max_candidates {
+                let i = q * max_candidates + c;
+                // Deterministic, non-monotonic, with distinct values so the
+                // ordering is unambiguous.
+                candidate_dists[i] = (((c * 7919 + q * 104_729) % 10_007) as f32) * 0.01;
+                candidate_indices[i] = c as u32;
+            }
+        }
+        let candidates_per_query = vec![max_candidates as u32; n_queries];
+
+        let (coal_d, coal_i) = run_coalesced_reduce(
+            &candidate_dists,
+            &candidate_indices,
+            &candidates_per_query,
+            n_queries,
+            max_candidates,
+            k,
+            &device,
+        );
+        let (ser_d, ser_i) = run_serial_reduce(
+            &candidate_dists,
+            &candidate_indices,
+            &candidates_per_query,
+            n_queries,
+            max_candidates,
+            k,
+            &device,
+        );
+
+        // A no-op dispatch leaves the output untouched, so guard against the
+        // silent-failure mode this kernel was fixed for.
+        assert!(
+            coal_d.iter().any(|d| *d != 0.0),
+            "chunked reduce produced all zeros: the dispatch almost certainly did no work"
+        );
+
+        for q in 0..n_queries {
+            for i in 0..k {
+                let idx = q * k + i;
+                assert!(
+                    (coal_d[idx] - ser_d[idx]).abs() <= 1e-5,
+                    "query {q} slot {i}: chunked {} vs serial {}",
+                    coal_d[idx],
+                    ser_d[idx]
+                );
+                assert_eq!(
+                    coal_i[idx], ser_i[idx],
+                    "query {q} slot {i}: index {} vs {}",
+                    coal_i[idx], ser_i[idx]
+                );
+            }
+            // Each row must come back sorted ascending.
+            for i in 1..k {
+                assert!(
+                    coal_d[q * k + i - 1] <= coal_d[q * k + i],
+                    "query {q} not sorted at slot {i}"
+                );
+            }
+        }
     }
 
     // Test 4: A/B comparison with serial kernel on random-ish data.
