@@ -122,7 +122,8 @@ where
     /// ### Params
     ///
     /// * `data` - Matrix reference with vectors as rows (n × dim)
-    /// * `binarisation_init` - Initialisation method ("itq" or "random")
+    /// * `binarisation_init` - Initialisation method (`"random"`, `"pca"`, or
+    ///   `"sign"`)
     /// * `n_bits` - Number of bits per binary code (must be multiple of 8).
     ///   Ignored by sign-based binarisation, which always emits `dim` bits.
     /// * `metric` - Distance metric for centroid routing
@@ -278,7 +279,8 @@ where
     /// ### Params
     ///
     /// * `data` - Matrix reference with vectors as rows (n × dim)
-    /// * `binarisation_init` - Initialisation method ("itq" or "random")
+    /// * `binarisation_init` - Initialisation method (`"random"`, `"pca"`, or
+    ///   `"sign"`)
     /// * `n_bits` - Number of bits per binary code (must be multiple of 8).
     ///   Ignored by sign-based binarisation, which always emits `dim` bits.
     /// * `metric` - Distance metric for centroid routing and reranking
@@ -969,6 +971,9 @@ where
 /////////////
 
 #[cfg(feature = "serialise")]
+use crate::utils::staging::StagedFiles;
+
+#[cfg(feature = "serialise")]
 impl<T> IndexIo for IvfIndexBinary<T>
 where
     T: AnnSearchFloat,
@@ -977,14 +982,17 @@ where
 
     const KIND: &'static str = "ivf_binary";
 
-    fn save_aux(&self, dir: &Path) -> Result<(), AnnSearchErrors> {
+    fn stage_aux(&self, dir: &Path, staged: &mut StagedFiles) -> Result<(), AnnSearchErrors> {
         match &self.vector_store {
-            Some(store) => store.copy_to_dir(dir),
+            Some(store) => store.stage_copy_into(dir, staged),
             None => Ok(()),
         }
     }
 
     fn load_aux(&mut self, dir: &Path) -> Result<(), AnnSearchErrors> {
+        if let Some(meta) = self.store_meta {
+            meta.check(self.n, self.dim)?;
+        }
         self.vector_store = MmapVectorStore::open_in_dir(dir, self.store_meta)?;
 
         Ok(())
@@ -1008,6 +1016,31 @@ mod tests {
         data
     }
 
+    /// Deterministic data with both signs present
+    ///
+    /// `create_test_data` ramps upwards from zero, so every sign-based code
+    /// comes out as all ones, every Hamming distance is 0 and any assertion on
+    /// neighbour identity is vacuous. Anything testing the sign path needs
+    /// this instead.
+    ///
+    /// ### Params
+    ///
+    /// * `n` - Rows
+    /// * `dim` - Columns
+    /// * `seed` - Seed for reproducibility
+    ///
+    /// ### Returns
+    ///
+    /// An `n` x `dim` matrix of uniform values in `[-1, 1)`.
+    fn create_signed_test_data(n: usize, dim: usize, seed: u64) -> Mat<f32> {
+        use rand::rngs::StdRng;
+        use rand::{Rng, SeedableRng};
+
+        let mut rng = StdRng::seed_from_u64(seed);
+
+        Mat::from_fn(n, dim, |_, _| rng.random::<f32>() * 2.0 - 1.0)
+    }
+
     fn get_default_k_means() -> Option<KMeansTrainingParams> {
         Some(KMeansTrainingParams::new(10, None, None))
     }
@@ -1018,8 +1051,8 @@ mod tests {
     /// `vectors_flat_binarised` whenever `n_bits != dim`.
     #[test]
     fn test_sign_based_stride_ignores_n_bits() {
-        let dim = 32;
-        let data = create_test_data::<f32>(128, dim);
+        let (n, dim) = (128, 32);
+        let data = create_signed_test_data(n, dim, 7);
 
         for n_bits in [8, 32, 64, 128] {
             let index = IvfIndexBinary::build(
@@ -1037,9 +1070,47 @@ mod tests {
             assert_eq!(index.n_bytes, dim / 8, "stride tracked n_bits = {}", n_bits);
             assert_eq!(index.vectors_flat_binarised.len(), index.n * index.n_bytes);
 
-            let query: Vec<f32> = (0..dim).map(|j| j as f32 * 0.1).collect();
-            let (indices, _) = index.query(&query, 5, Some(4)).unwrap();
-            assert_eq!(indices.len(), 5);
+            // With mixed signs every code is distinct, so a stored vector must
+            // find itself at Hamming distance 0 before anything else. A wrong
+            // but in-bounds stride reads a neighbour's bytes and fails here
+            for row in [0, 17, 63, 127] {
+                let query: Vec<f32> = data.row(row).iter().cloned().collect();
+                let (indices, dists) = index.query(&query, 5, Some(4)).unwrap();
+
+                assert_eq!(indices.len(), 5);
+                assert_eq!(indices[0], row, "self-retrieval failed, n_bits = {n_bits}");
+                assert_eq!(dists[0], 0);
+            }
+        }
+    }
+
+    /// A `dim` that is not a multiple of 8 leaves a partial last byte. The
+    /// padding bits are zero-filled on both sides, so they XOR away, but
+    /// nothing pinned that.
+    #[test]
+    fn test_sign_based_handles_partial_last_byte() {
+        for dim in [30, 31, 32] {
+            let data = create_signed_test_data(96, dim, 7);
+            let index = IvfIndexBinary::build(
+                data.as_ref(),
+                "sign",
+                32,
+                Dist::Cosine,
+                Some(4),
+                get_default_k_means(),
+                42,
+                false,
+            )
+            .unwrap();
+
+            assert_eq!(index.n_bytes, dim.div_ceil(8));
+            assert_eq!(index.vectors_flat_binarised.len(), index.n * index.n_bytes);
+
+            let query: Vec<f32> = data.row(5).iter().cloned().collect();
+            let (indices, dists) = index.query(&query, 3, Some(4)).unwrap();
+
+            assert_eq!(indices[0], 5, "self-retrieval failed at dim = {dim}");
+            assert_eq!(dists[0], 0);
         }
     }
 

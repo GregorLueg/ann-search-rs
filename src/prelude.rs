@@ -21,6 +21,8 @@ pub use crate::gpu::traits_gpu::AnnSearchGpuFloat;
 
 #[cfg(feature = "serialise")]
 pub use crate::serialise::IndexIo;
+#[cfg(feature = "serialise")]
+pub use crate::utils::staging::StagedFiles;
 
 ///////////
 // Types //

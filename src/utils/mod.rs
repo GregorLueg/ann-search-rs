@@ -11,6 +11,9 @@ pub mod parallelism;
 pub mod traits;
 pub mod tree_utils;
 
+#[cfg(any(feature = "binary", feature = "serialise"))]
+pub mod staging;
+
 use faer::MatRef;
 use num_traits::{Float, FromPrimitive, ToPrimitive};
 use rand::rngs::StdRng;

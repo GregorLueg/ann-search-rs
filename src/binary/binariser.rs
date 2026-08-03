@@ -337,7 +337,9 @@ fn encode_sign_based<T: Float>(vec: &[T], dim: usize) -> Vec<u8> {
 /// Supports three binarisation methods:
 ///
 /// - **SimHash**: Random orthogonalised projections
-/// - **ITQ**: PCA followed by Iterative Quantisation
+/// - **PcaHashing**: Signs of the top principal components, padded with random
+///   orthogonal directions when `n_bits > dim`. No rotation learning, so this
+///   is plain PCA hashing rather than ITQ.
 /// - **SignBased**: Simple sign binarisation (no training required)
 #[cfg_attr(feature = "serialise", derive(serde::Serialize, serde::Deserialize))]
 pub struct Binariser<T> {

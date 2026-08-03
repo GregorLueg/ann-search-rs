@@ -348,7 +348,7 @@ ann-search-rs = { version = "*", features = ["serialise"] }
 ```
 
 ```rust
-use ann_search_rs::prelude::*;
+use ann_search_rs::cpu::hnsw::HnswIndex;
 use ann_search_rs::{build_hnsw_index, load_index, save_index};
 
 let index = build_hnsw_index(mat.as_ref(), 16, 200, "cosine", 42, false);
@@ -357,15 +357,20 @@ save_index(&index, "my_index")?;
 let index: HnswIndex<f32> = load_index("my_index")?;
 ```
 
-The trait is also in scope from the prelude, so `index.save_index("my_index")`
-and `HnswIndex::<f32>::load_index("my_index")` work directly.
+The `IndexIo` trait is in the prelude, so with
+`use ann_search_rs::prelude::*;` the method form
+`index.save_index("my_index")` and `HnswIndex::<f32>::load_index("my_index")`
+works directly. The index types themselves live in their own modules, not the
+prelude.
 
 An index is a *directory*, not a single file. `index.bin` holds the payload
 (serde plus bincode, little-endian, variable-length integers so the file moves
 between 32- and 64-bit machines). The binary indices additionally carry their
 on-disk re-ranking store into the same directory, so a saved index is
 self-contained and can be moved. Saving into the directory the store already
-lives in skips the copy.
+lives in skips the copy. Note the store files are raw native-endian dumps, so a
+bundle carrying one does not survive a move between a little- and a big-endian
+machine, even though `index.bin` on its own would.
 
 ```
 my_index/
@@ -377,6 +382,12 @@ my_index/
 `index.bin` opens with a header recording the format version, the index kind and
 the float width. Loading an HNSW index as an IVF one, or an `f32` index as
 `f64`, gives you a typed error rather than garbage.
+
+Saving is atomic in the sense that matters: every file goes to a temporary name
+first, and `index.bin` is the last thing renamed into place. A save that dies
+half way leaves the previous bundle alone, or leaves no `index.bin` and fails
+loudly on the next load. It never leaves a directory that loads clean and
+answers wrongly.
 
 The GPU indices are not covered. They hold live device handles, and
 `IvfIndexGpu` keeps its centroids on the GPU with no host copy, so persisting

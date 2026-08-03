@@ -8,7 +8,12 @@ use crate::utils::dist::Dist;
 use cubecl::server::ServerError;
 
 /// All error variants that can occur across `ann-search-rs` operations.
+///
+/// Marked `#[non_exhaustive]`: variants appear and disappear with the optional
+/// features, so a downstream exhaustive `match` would break every time a
+/// feature flag moves. Match on the variants you care about and keep a `_` arm.
 #[derive(Debug, Error)]
+#[non_exhaustive]
 pub enum AnnSearchErrors {
     // -- general errors --
     /// Dimension mismatch error between index and query.
@@ -82,6 +87,34 @@ pub enum AnnSearchErrors {
         expected: usize,
         /// Actual size of the file
         actual: usize,
+    },
+
+    /// A store file could not be opened
+    #[cfg(feature = "binary")]
+    #[error("Could not open the vector store file '{path}': {source}")]
+    StoreFileUnavailable {
+        /// The file that was being opened
+        path: String,
+        /// The underlying IO error
+        #[source]
+        source: std::io::Error,
+    },
+
+    /// The store found on disk does not have the shape the index recorded
+    #[cfg(feature = "binary")]
+    #[error(
+        "The vector store holds {store_n} x {store_dim} vectors, but the index holds \
+         {index_n} x {index_dim}."
+    )]
+    StoreShapeMismatch {
+        /// Number of samples the index holds
+        index_n: usize,
+        /// Dimensionality the index holds
+        index_dim: usize,
+        /// Number of samples recorded for the store
+        store_n: usize,
+        /// Dimensionality recorded for the store
+        store_dim: usize,
     },
 
     /// Turbo quant error for invalid number of bits
@@ -158,6 +191,22 @@ pub enum AnnSearchErrors {
     #[cfg(feature = "serialise")]
     #[error("'{path}' is not an ann-search-rs index file.")]
     NotAnIndexFile {
+        /// The file that was read
+        path: String,
+    },
+
+    /// The file carries the magic bytes but ends inside the header
+    #[cfg(feature = "serialise")]
+    #[error("'{path}' is an ann-search-rs index file, but it is truncated.")]
+    TruncatedIndexFile {
+        /// The file that was read
+        path: String,
+    },
+
+    /// The payload decoded, but the file carries on past its end
+    #[cfg(feature = "serialise")]
+    #[error("'{path}' has trailing bytes after the index payload.")]
+    TrailingBytes {
         /// The file that was read
         path: String,
     },

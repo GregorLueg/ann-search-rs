@@ -676,6 +676,9 @@ where
 /////////////
 
 #[cfg(feature = "serialise")]
+use crate::utils::staging::StagedFiles;
+
+#[cfg(feature = "serialise")]
 impl<T> IndexIo for IvfIndexRaBitQ<T>
 where
     T: AnnSearchFloat,
@@ -684,14 +687,17 @@ where
 
     const KIND: &'static str = "ivf_rabitq";
 
-    fn save_aux(&self, dir: &Path) -> Result<(), AnnSearchErrors> {
+    fn stage_aux(&self, dir: &Path, staged: &mut StagedFiles) -> Result<(), AnnSearchErrors> {
         match &self.vector_store {
-            Some(store) => store.copy_to_dir(dir),
+            Some(store) => store.stage_copy_into(dir, staged),
             None => Ok(()),
         }
     }
 
     fn load_aux(&mut self, dir: &Path) -> Result<(), AnnSearchErrors> {
+        if let Some(meta) = self.store_meta {
+            meta.check(self.n, self.storage.dim)?;
+        }
         self.vector_store = MmapVectorStore::open_in_dir(dir, self.store_meta)?;
 
         Ok(())

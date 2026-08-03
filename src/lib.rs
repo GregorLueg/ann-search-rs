@@ -2869,9 +2869,10 @@ where
 /// ### Params
 ///
 /// * `mat` - The initial matrix with samples x features
-/// * `n_bits` - Number of bits per binary code (must be multiple of 8)
+/// * `n_bits` - Number of bits per binary code (must be multiple of 8).
+///   Ignored by "sign", which always emits `dim` bits.
 /// * `seed` - Random seed for binariser
-/// * `binary_init` - Initialisation method ("itq" or "random")
+/// * `binary_init` - Initialisation method: "random", "pca" or "sign"
 /// * `dist_metric` - Distance metric: "euclidean" or "cosine". "manhatten" is
 ///   not supported.
 /// * `save_store` - Whether to save vector store for reranking
@@ -3007,7 +3008,7 @@ where
 /// ### Params
 ///
 /// * `mat` - Data matrix [samples, features]
-/// * `binarisation_init` - "itq", "random" or "sign"
+/// * `binarisation_init` - "random", "pca" or "sign"
 /// * `n_bits` - Number of bits per code (multiple of 8). Ignored by "sign",
 ///   which always emits `dim` bits.
 /// * `nlist` - Number of clusters (defaults to √n)

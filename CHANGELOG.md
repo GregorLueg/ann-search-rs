@@ -1,6 +1,25 @@
 # News
 
-## Unreleased
+## 0.5.0
+
+**Breaking changes**
+
+- `AnnSearchErrors` is now `#[non_exhaustive]`. Variants come and go with the
+  optional features, so a downstream exhaustive `match` was never going to hold
+  across a feature-flag change. Add a `_` arm.
+- `AnnSearchErrors::IoError` is no longer gated behind `binary`, and the
+  `From<std::io::Error>` impl is now unconditional. Under default features that
+  is a variant which did not exist before; `serialise` adds six more.
+- New variants: `StoreFileUnavailable`, `StoreShapeMismatch` (both `binary`),
+  `TruncatedIndexFile` and `TrailingBytes` (both `serialise`).
+- `MmapVectorStore::copy_to_dir` is gone, replaced by
+  `MmapVectorStore::stage_copy_into`, which writes under temporary names and
+  hands the rename to the caller. The `IndexIo::save_aux` hook becomes
+  `IndexIo::stage_aux` for the same reason.
+- With `serialise` on, `AnnSearchFloat` gains `Serialize + DeserializeOwned`.
+  Cargo unifies features across the graph, so one crate anywhere enabling
+  `serialise` adds that bound for every other consumer. `f32` and `f64` are
+  unaffected; a downstream custom float type is not.
 
 **Features**
 
@@ -12,31 +31,67 @@
     indices copy their on-disk re-ranking store alongside it, so a saved index
     is self-contained and can be moved. Saving into the directory the store
     already occupies skips the copy.
+  - Every file is written under a temporary name and renamed into place at the
+    end, `index.bin` last. A save that fails part-way leaves the previous bundle
+    untouched, or leaves no `index.bin` and fails loudly on the next load. It
+    never leaves a directory that loads clean and re-ranks against the wrong
+    vectors.
   - `index.bin` carries a header with a magic number, format version, index kind
     and float width. Loading the wrong index type or the wrong float type is a
-    typed error rather than silent garbage.
-  - Integers are varint-encoded, so a saved index moves between 32- and 64-bit
-    machines. Floats are stored at native width and native endianness.
+    typed error rather than silent garbage. Truncated files and trailing bytes
+    are both rejected.
+  - Integers are varint-encoded and floats are little-endian, so `index.bin`
+    moves between 32- and 64-bit machines and between endiannesses. The binary
+    indices' store files are raw native-endian dumps and do not, so a bundle
+    carrying one is little-endian only in practice.
   - GPU indices are not covered yet. They hold live device handles, and
     `IvfIndexGpu` keeps its centroids GPU-side with no host mirror.
 
 **Fixes**
 
-- `build_ivf_index_binary` corrupted its code layout with sign-based
-  binarisation whenever `n_bits != dim`. Sign-based always emits `dim` bits, but
-  the index took its stride from the caller's `n_bits`, so the flattened code
-  array was read at the wrong offsets and `optimise_memory_layout` indexed out
-  of bounds. The stride now comes from the binariser via a new
-  `Binariser::n_bytes`. `n_bits` is documented as ignored on that path.
+- Both binary indices corrupted their code layout with sign-based binarisation
+  whenever `n_bits != dim`. Sign-based always emits `dim` bits, but
+  `build_ivf_index_binary` and `build_exhaustive_index_binary` took their stride
+  from the caller's `n_bits`, so the flattened code array was read at the wrong
+  offsets: out-of-bounds slices in the distance kernel, and an out-of-bounds
+  index in `optimise_memory_layout` on the IVF side. The stride now comes from
+  the binariser via a new `Binariser::n_bytes`. `n_bits` is documented as
+  ignored on that path.
+- Asymmetric queries on both binary indices kept the *worst* candidates.
+  `asymmetric_binary_dot` is a similarity, higher meaning more similar, and the
+  candidate funnel sorted it ascending before truncating. `ExhaustiveIndexBinary`
+  had it worse still: it sorted on the candidate id rather than the score. Both
+  now sort descending, which is what makes a sign-based query find the query's
+  own vector first. Affects `query_asymmetric`, `query_row_asymmetric` and the
+  sign-based path through `query_reranking`.
+- `MmapVectorStore::save` truncated its destinations in place, which corrupts a
+  live mapping of the same files: building an index into a directory another
+  index is mapped to handed that index the new vectors, with no error, and a
+  concurrent query in the truncation window is a `SIGBUS`. It now writes to
+  temporary files and renames.
 - `MmapVectorStore::save` relied on `Drop` to flush its writers, which discarded
   any flush error. Both writers are now flushed explicitly.
+- Temporary files left by a failed store copy are removed, and their names carry
+  a unique suffix so two concurrent saves into one directory cannot race on the
+  same path.
+- A store built with a relative or empty `save_path` could not be copied: the
+  path was kept verbatim, so a `chdir` between build and save resolved the wrong
+  directory and an empty parent resolved nothing at all. Store paths are
+  canonicalised when the store is opened.
+- `load_index` cross-checks the recorded store shape against the index's own
+  `n` and `dim`, so a store belonging to a differently sized dataset is rejected
+  instead of silently re-ranking against it.
+- A missing store file now names the file it wanted rather than reporting a bare
+  "No such file or directory".
+- `"itq"` was documented as a valid binarisation string on five call sites. It
+  never was; the parser accepts `"pca"`, `"random"` and `"sign"` and falls back
+  to random projections for anything else.
 
 **Chore**
 
 - `tempfile` moved from the `binary` feature to `[dev-dependencies]`. It was
   only ever used by tests and the gridsearch examples, so `binary` no longer
   drags it into normal builds.
-- `AnnSearchErrors::IoError` is no longer gated behind `binary`.
 - A handful of impl blocks in `binary/` spelled out `AnnSearchFloat`'s bounds
   longhand; they now name the trait.
 
