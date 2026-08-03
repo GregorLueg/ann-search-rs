@@ -196,6 +196,7 @@ where
 /// * `center_idx` - Index into split_data (only used for split nodes)
 #[derive(Clone, Copy, Debug)]
 #[repr(C)]
+#[cfg_attr(feature = "serialise", derive(serde::Serialize, serde::Deserialize))]
 struct BallNode<T> {
     n_descendants: u32,
     child_a: u32,
@@ -233,6 +234,7 @@ enum BuildNode<T> {
 /// BallTreeIndex
 ///
 /// Structure that contains the BallTree index.
+#[cfg_attr(feature = "serialise", derive(serde::Serialize, serde::Deserialize))]
 pub struct BallTreeIndex<T> {
     /// Original vector data, flattened for cache locality
     pub vectors_flat: Vec<T>,
@@ -1086,6 +1088,20 @@ where
 ///////////
 // Tests //
 ///////////
+
+/////////////
+// IndexIo //
+/////////////
+
+#[cfg(feature = "serialise")]
+impl<T> IndexIo for BallTreeIndex<T>
+where
+    T: AnnSearchFloat,
+{
+    type Elem = T;
+
+    const KIND: &'static str = "ball_tree";
+}
 
 #[cfg(test)]
 mod tests {

@@ -1,5 +1,45 @@
 # News
 
+## Unreleased
+
+**Features**
+
+- New `serialise` feature: indices can be saved to disk and loaded back in.
+  Covers all CPU, quantised and binary indices via a new `IndexIo` trait, plus
+  `save_index` / `load_index` wrappers in the crate root. Backed by `serde` and
+  `bincode`, both optional and only pulled in with the feature.
+  - An index is saved as a directory. `index.bin` holds the payload; the binary
+    indices copy their on-disk re-ranking store alongside it, so a saved index
+    is self-contained and can be moved. Saving into the directory the store
+    already occupies skips the copy.
+  - `index.bin` carries a header with a magic number, format version, index kind
+    and float width. Loading the wrong index type or the wrong float type is a
+    typed error rather than silent garbage.
+  - Integers are varint-encoded, so a saved index moves between 32- and 64-bit
+    machines. Floats are stored at native width and native endianness.
+  - GPU indices are not covered yet. They hold live device handles, and
+    `IvfIndexGpu` keeps its centroids GPU-side with no host mirror.
+
+**Fixes**
+
+- `build_ivf_index_binary` corrupted its code layout with sign-based
+  binarisation whenever `n_bits != dim`. Sign-based always emits `dim` bits, but
+  the index took its stride from the caller's `n_bits`, so the flattened code
+  array was read at the wrong offsets and `optimise_memory_layout` indexed out
+  of bounds. The stride now comes from the binariser via a new
+  `Binariser::n_bytes`. `n_bits` is documented as ignored on that path.
+- `MmapVectorStore::save` relied on `Drop` to flush its writers, which discarded
+  any flush error. Both writers are now flushed explicitly.
+
+**Chore**
+
+- `tempfile` moved from the `binary` feature to `[dev-dependencies]`. It was
+  only ever used by tests and the gridsearch examples, so `binary` no longer
+  drags it into normal builds.
+- `AnnSearchErrors::IoError` is no longer gated behind `binary`.
+- A handful of impl blocks in `binary/` spelled out `AnnSearchFloat`'s bounds
+  longhand; they now name the trait.
+
 ## 0.4.5
 
 **Features**

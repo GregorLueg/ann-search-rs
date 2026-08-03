@@ -24,6 +24,13 @@ use crate::utils::k_means_utils::*;
 ///
 /// Two-stage search: IVF routing using float centroids, then RaBitQ
 /// distance estimation within probed clusters.
+// `bound` is pinned because the skipped `vector_store` field makes serde
+// infer a spurious `T: Default`
+#[cfg_attr(
+    feature = "serialise",
+    derive(serde::Serialize, serde::Deserialize),
+    serde(bound = "T: AnnSearchFloat")
+)]
 pub struct IvfIndexRaBitQ<T> {
     /// The RabitQ encoder
     encoder: RaBitQEncoder<T>,
@@ -32,7 +39,13 @@ pub struct IvfIndexRaBitQ<T> {
     /// Number of vectors in the structure
     n: usize,
     /// Optional vector store that is saved in binary on disk
+    #[cfg_attr(feature = "serialise", serde(skip))]
     vector_store: Option<MmapVectorStore<T>>,
+    /// Shape of `vector_store`, so it can be re-opened after a load. Only
+    /// read by the `serialise` feature; the field is kept unconditionally so
+    /// the constructors stay free of `cfg`.
+    #[cfg_attr(not(feature = "serialise"), allow(dead_code))]
+    store_meta: Option<StoreMeta>,
 }
 
 //////////////////////////
@@ -231,6 +244,7 @@ where
             storage,
             n,
             vector_store: None,
+            store_meta: None,
         })
     }
 
@@ -378,8 +392,7 @@ where
         // Save vector store
         std::fs::create_dir_all(&save_path)?;
 
-        let vectors_path = save_path.as_ref().join("vectors_flat.bin");
-        let norms_path = save_path.as_ref().join("norms.bin");
+        let (vectors_path, norms_path) = MmapVectorStore::<T>::paths_in(&save_path);
 
         MmapVectorStore::save(&vectors_flat, &norms, dim, n, &vectors_path, &norms_path)?;
         let vector_store = MmapVectorStore::new(vectors_path, norms_path, dim, n)?;
@@ -389,6 +402,7 @@ where
             storage,
             n,
             vector_store: Some(vector_store),
+            store_meta: Some(StoreMeta { dim, n }),
         })
     }
 
@@ -656,6 +670,33 @@ where
 ///////////
 // Tests //
 ///////////
+
+/////////////
+// IndexIo //
+/////////////
+
+#[cfg(feature = "serialise")]
+impl<T> IndexIo for IvfIndexRaBitQ<T>
+where
+    T: AnnSearchFloat,
+{
+    type Elem = T;
+
+    const KIND: &'static str = "ivf_rabitq";
+
+    fn save_aux(&self, dir: &Path) -> Result<(), AnnSearchErrors> {
+        match &self.vector_store {
+            Some(store) => store.copy_to_dir(dir),
+            None => Ok(()),
+        }
+    }
+
+    fn load_aux(&mut self, dir: &Path) -> Result<(), AnnSearchErrors> {
+        self.vector_store = MmapVectorStore::open_in_dir(dir, self.store_meta)?;
+
+        Ok(())
+    }
+}
 
 #[cfg(test)]
 mod tests {

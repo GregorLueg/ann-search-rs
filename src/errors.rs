@@ -26,6 +26,10 @@ pub enum AnnSearchErrors {
     #[error("Distance metric '{0}' is not supported for this method.")]
     DistanceNotSupported(Dist),
 
+    /// IO error
+    #[error("IO error: {0}")]
+    IoError(#[from] std::io::Error),
+
     // -- quantisation errors --
     /// Dimension must be divisible by m
     #[error("Dimension ({dim}) must be divisible by m ({m}).")]
@@ -79,11 +83,6 @@ pub enum AnnSearchErrors {
         /// Actual size of the file
         actual: usize,
     },
-
-    /// IO error
-    #[cfg(feature = "binary")]
-    #[error("IO error: {0}")]
-    IoError(#[from] std::io::Error),
 
     /// Turbo quant error for invalid number of bits
     #[cfg(feature = "binary")]
@@ -153,4 +152,55 @@ pub enum AnnSearchErrors {
         /// Shared memory the device reports, in bytes
         available: usize,
     },
+
+    // -- serialisation errors --
+    /// The file does not carry the `ann-search-rs` magic bytes
+    #[cfg(feature = "serialise")]
+    #[error("'{path}' is not an ann-search-rs index file.")]
+    NotAnIndexFile {
+        /// The file that was read
+        path: String,
+    },
+
+    /// The file was written by an incompatible version of the format
+    #[cfg(feature = "serialise")]
+    #[error(
+        "Index format version {found} is not supported; this build reads version {supported}."
+    )]
+    UnsupportedFormatVersion {
+        /// Version tag found in the file
+        found: u32,
+        /// Version tag this build understands
+        supported: u32,
+    },
+
+    /// The file holds a different index type than the one being loaded into
+    #[cfg(feature = "serialise")]
+    #[error("Index file holds a '{found}' index, but a '{expected}' index was requested.")]
+    IndexKindMismatch {
+        /// Index kind the caller asked for
+        expected: &'static str,
+        /// Index kind stored in the file
+        found: String,
+    },
+
+    /// The file was written with a different float type
+    #[cfg(feature = "serialise")]
+    #[error("Index file was written with a {found}-byte float, but a {expected}-byte float was requested.")]
+    FloatWidthMismatch {
+        /// Size in bytes of the float the caller asked for
+        expected: usize,
+        /// Size in bytes of the float stored in the file
+        found: usize,
+    },
+
+    /// Encoding the index failed
+    #[cfg(feature = "serialise")]
+    #[error("Failed to encode the index: {0}")]
+    EncodeError(String),
+
+    /// Decoding the index failed
+    #[cfg(feature = "serialise")]
+    #[error("Failed to decode the index: {0}")]
+    DecodeError(String),
 }

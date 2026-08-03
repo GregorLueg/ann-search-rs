@@ -42,6 +42,7 @@ use crate::prelude::*;
 use crate::utils::k_means_utils::*;
 
 /// One cluster's blocked SIMD layout (2-bit / 4-bit only).
+#[cfg_attr(feature = "serialise", derive(serde::Serialize, serde::Deserialize))]
 struct ClusterBlocked {
     /// Packed nibble bytes in block-major order for this cluster's vectors.
     data: Vec<u8>,
@@ -53,6 +54,13 @@ struct ClusterBlocked {
 ///
 /// Build once, then query, re-rank, or generate a full kNN graph. Immutable
 /// after construction.
+// `bound` is pinned because the skipped `vector_store` field makes serde
+// infer a spurious `T: Default`
+#[cfg_attr(
+    feature = "serialise",
+    derive(serde::Serialize, serde::Deserialize),
+    serde(bound = "T: AnnSearchFloat")
+)]
 pub struct IvfTurboQuant<T> {
     /// Encoder plus global bit-plane storage. The encoder is shared across all
     /// cells; the global storage is the scoring source for 3-bit cells and the
@@ -84,7 +92,13 @@ pub struct IvfTurboQuant<T> {
     /// Number of stored vectors.
     n: usize,
     /// Optional on-disk original vectors for exact re-ranking.
+    #[cfg_attr(feature = "serialise", serde(skip))]
     vector_store: Option<MmapVectorStore<T>>,
+    /// Shape of `vector_store`, so it can be re-opened after a load. Only
+    /// read by the `serialise` feature; the field is kept unconditionally so
+    /// the constructors stay free of `cfg`.
+    #[cfg_attr(not(feature = "serialise"), allow(dead_code))]
+    store_meta: Option<StoreMeta>,
 }
 
 //////////////////////////////
@@ -327,6 +341,7 @@ where
             corrections_f32_csr,
             n,
             vector_store: None,
+            store_meta: None,
         })
     }
 
@@ -366,11 +381,11 @@ where
             .collect();
 
         std::fs::create_dir_all(&save_path)?;
-        let vectors_path = save_path.as_ref().join("vectors_flat.bin");
-        let norms_path = save_path.as_ref().join("norms.bin");
+        let (vectors_path, norms_path) = MmapVectorStore::<T>::paths_in(&save_path);
 
         MmapVectorStore::save(&vectors_flat, &norms, dim, n, &vectors_path, &norms_path)?;
         index.vector_store = Some(MmapVectorStore::new(vectors_path, norms_path, dim, n)?);
+        index.store_meta = Some(StoreMeta { dim, n });
 
         Ok(index)
     }
@@ -919,6 +934,33 @@ where
 ///////////
 // Tests //
 ///////////
+
+/////////////
+// IndexIo //
+/////////////
+
+#[cfg(feature = "serialise")]
+impl<T> IndexIo for IvfTurboQuant<T>
+where
+    T: AnnSearchFloat,
+{
+    type Elem = T;
+
+    const KIND: &'static str = "ivf_tq";
+
+    fn save_aux(&self, dir: &Path) -> Result<(), AnnSearchErrors> {
+        match &self.vector_store {
+            Some(store) => store.copy_to_dir(dir),
+            None => Ok(()),
+        }
+    }
+
+    fn load_aux(&mut self, dir: &Path) -> Result<(), AnnSearchErrors> {
+        self.vector_store = MmapVectorStore::open_in_dir(dir, self.store_meta)?;
+
+        Ok(())
+    }
+}
 
 #[cfg(test)]
 mod tests {

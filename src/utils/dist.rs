@@ -25,6 +25,7 @@ use std::arch::x86_64::*;
 
 /// Enum for the Distance metric to use
 #[derive(Clone, Debug, Copy, PartialEq, Default)]
+#[cfg_attr(feature = "serialise", derive(serde::Serialize, serde::Deserialize))]
 pub enum Dist {
     /// Euclidean distance
     #[default]

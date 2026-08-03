@@ -21,7 +21,7 @@ codegen-units = 1
 
 [features]
 ## Enables binary index support with optional memory-mapped files for on-disk vector storage
-binary = ["memmap2", "tempfile", "bytemuck", "statrs"]
+binary = ["memmap2", "bytemuck", "statrs"]
 ## Enables GPU-accelerated indices via the CubeCL backend
 gpu = ["cubecl"]
 ## Enables GPU integration tests (requires 'wgpu' and a GPU on the machine). This is for CI/CD
@@ -30,10 +30,17 @@ gpu-tests = ["gpu"]
 quantised = ["half"]
 ## Enables mimalloc as the global allocator for improved performance
 mimalloc = ["dep:mimalloc"]
+## Enables saving indices to disk and loading them back in
+serialise = ["dep:serde", "dep:bincode", "half?/serde"]
 
 # Dependecies
 [dependencies]
 approx = "0.5.1"
+bincode = {
+    version = "2.0.1",
+    features = ["serde", "std"],
+    optional = true
+}
 bytemuck = {
     version = "1.24.0",
     features = ["derive"],
@@ -77,17 +84,25 @@ rand_distr = "0.5.1"
 rayon = "1.11.0"
 rdst = "0.20.14"
 rustc-hash = "2.1.1"
+serde = {
+    version = "1.0.228",
+    features = ["derive"],
+    optional = true
+}
 statrs = {
     version = "0.18.0",
     optional = true
 }
-tempfile = { version = "3.24.0", optional = true }
 thiserror = "2.0.18"
 thousands = "0.2.0"
 wide = "1.4.0"
 
+# Only ever used by the inline tests and the gridsearch examples
+[dev-dependencies]
+tempfile = "3.24.0"
+
 [package.metadata.docs.rs]
-features = ["binary", "quantised", "mimalloc"]
+features = ["binary", "quantised", "mimalloc", "serialise"]
 
 ################
 # Gridsearches #

@@ -19,6 +19,9 @@ pub use crate::gpu::cagra_gpu_search::CagraGpuSearchParams;
 #[cfg(feature = "gpu")]
 pub use crate::gpu::traits_gpu::AnnSearchGpuFloat;
 
+#[cfg(feature = "serialise")]
+pub use crate::serialise::IndexIo;
+
 ///////////
 // Types //
 ///////////

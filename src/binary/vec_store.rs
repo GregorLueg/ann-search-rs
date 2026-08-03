@@ -8,9 +8,16 @@ use std::io::BufWriter;
 use std::io::Write;
 use std::iter::Sum;
 use std::marker::PhantomData;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use crate::prelude::*;
+
+/// Filename the flat vectors are always written under, inside whichever
+/// directory the caller nominates.
+pub const VECTORS_FILE: &str = "vectors_flat.bin";
+
+/// Filename the norms are always written under.
+pub const NORMS_FILE: &str = "norms.bin";
 
 /// Trait for vector storage backends
 pub trait VectorStore<T>
@@ -43,14 +50,58 @@ where
 // VectorStore //
 /////////////////
 
+/// Resolve a path to a comparable absolute form.
+///
+/// `canonicalize` needs the whole path to exist, and the destination of a copy
+/// generally does not, so only the parent directory is resolved and the
+/// filename is re-joined afterwards.
+///
+/// ### Params
+///
+/// * `path` - Path to resolve; its parent directory must exist
+///
+/// ### Returns
+///
+/// The resolved path, comparable against another resolved path.
+fn resolve(path: &Path) -> Result<PathBuf, AnnSearchErrors> {
+    let dir = path.parent().unwrap_or(Path::new("."));
+    let name = path.file_name().unwrap_or_default();
+
+    Ok(std::fs::canonicalize(dir)?.join(name))
+}
+
+/// Shape of a persisted vector store.
+///
+/// The store itself is two live memory maps and cannot survive a round trip
+/// through `serde`, so an index records this instead and re-opens the maps on
+/// load. `Option<StoreMeta>` doubles as the "was there a store at all?" flag,
+/// which is otherwise lost.
+#[cfg_attr(feature = "serialise", derive(serde::Serialize, serde::Deserialize))]
+#[derive(Clone, Copy, Debug)]
+pub struct StoreMeta {
+    /// Vector dimensionality
+    pub dim: usize,
+    /// Number of vectors
+    pub n: usize,
+}
+
 /// Memory-mapped vector storage
 ///
 /// Stores vectors and norms in binary files and memory-maps them.
 pub struct MmapVectorStore<T> {
+    /// Mapped flat vectors, `n * dim * size_of::<T>()` bytes
     mmap_vectors: Mmap,
+    /// Mapped norms, `n * size_of::<T>()` bytes
     mmap_norms: Mmap,
+    /// Where `mmap_vectors` came from, needed to copy the store elsewhere
+    vectors_path: PathBuf,
+    /// Where `mmap_norms` came from
+    norms_path: PathBuf,
+    /// Vector dimensionality
     dim: usize,
+    /// Number of vectors
     n: usize,
+    /// Marker for the float type the raw bytes are interpreted as
     _phantom: PhantomData<T>,
 }
 
@@ -74,8 +125,11 @@ where
         dim: usize,
         n: usize,
     ) -> Result<Self, AnnSearchErrors> {
-        let file_vectors = File::open(vectors_path)?;
-        let file_norms = File::open(norms_path)?;
+        let vectors_path = vectors_path.as_ref().to_path_buf();
+        let norms_path = norms_path.as_ref().to_path_buf();
+
+        let file_vectors = File::open(&vectors_path)?;
+        let file_norms = File::open(&norms_path)?;
 
         let mmap_vectors = unsafe { Mmap::map(&file_vectors)? };
 
@@ -104,10 +158,89 @@ where
         Ok(Self {
             mmap_vectors,
             mmap_norms,
+            vectors_path,
+            norms_path,
             dim,
             n,
             _phantom: PhantomData,
         })
+    }
+
+    /// The two filenames a store occupies inside `dir`
+    ///
+    /// ### Params
+    ///
+    /// * `dir` - Directory holding, or about to hold, a store
+    ///
+    /// ### Returns
+    ///
+    /// Tuple of `(vectors_path, norms_path)`
+    pub fn paths_in(dir: impl AsRef<Path>) -> (PathBuf, PathBuf) {
+        let dir = dir.as_ref();
+        (dir.join(VECTORS_FILE), dir.join(NORMS_FILE))
+    }
+
+    /// Re-open a store that lives in `dir`
+    ///
+    /// ### Params
+    ///
+    /// * `dir` - Directory holding the two store files
+    /// * `meta` - Shape recorded when the owning index was saved; `None` means
+    ///   the index never had a store, and no files are touched
+    ///
+    /// ### Returns
+    ///
+    /// The re-opened store, or `None` when `meta` is `None`.
+    pub fn open_in_dir(
+        dir: impl AsRef<Path>,
+        meta: Option<StoreMeta>,
+    ) -> Result<Option<Self>, AnnSearchErrors> {
+        let Some(meta) = meta else {
+            return Ok(None);
+        };
+
+        let (vectors_path, norms_path) = Self::paths_in(dir);
+
+        Ok(Some(Self::new(vectors_path, norms_path, meta.dim, meta.n)?))
+    }
+
+    /// Copy the store into `dir`, leaving the original in place
+    ///
+    /// Used when an index is saved somewhere other than the directory its store
+    /// already lives in. Copying into the store's own directory is a no-op.
+    ///
+    /// ### Note
+    ///
+    /// The copy goes to a temporary file and is then renamed over the
+    /// destination. Writing into the destination directly would truncate it,
+    /// and the destination may be mapped by another live store, where
+    /// truncation is a `SIGBUS` rather than an `Err`. Renaming leaves the old
+    /// inode alive for anyone still holding it.
+    ///
+    /// ### Params
+    ///
+    /// * `dir` - Directory to copy into. Must already exist.
+    ///
+    /// ### Returns
+    ///
+    /// `Ok(())`, or the underlying IO error.
+    pub fn copy_to_dir(&self, dir: impl AsRef<Path>) -> Result<(), AnnSearchErrors> {
+        let (dst_vectors, dst_norms) = Self::paths_in(dir);
+
+        for (src, dst) in [
+            (&self.vectors_path, dst_vectors),
+            (&self.norms_path, dst_norms),
+        ] {
+            if resolve(src)? == resolve(&dst)? {
+                continue;
+            }
+
+            let tmp = dst.with_extension("bin.tmp");
+            std::fs::copy(src, &tmp)?;
+            std::fs::rename(&tmp, &dst)?;
+        }
+
+        Ok(())
     }
 
     /// Save vectors and norms to binary files
@@ -153,6 +286,8 @@ where
             )
         };
         writer.write_all(vectors_bytes)?;
+        // BufWriter flushes on Drop but swallows the error; surface it instead
+        writer.flush()?;
 
         // Write norms
         let mut writer = BufWriter::new(File::create(norms_path)?);
@@ -160,6 +295,7 @@ where
             std::slice::from_raw_parts(norms.as_ptr() as *const u8, std::mem::size_of_val(norms))
         };
         writer.write_all(norms_bytes)?;
+        writer.flush()?;
 
         Ok(())
     }

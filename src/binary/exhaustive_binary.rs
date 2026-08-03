@@ -21,6 +21,13 @@ use crate::prelude::*;
 /// Exhaustive (brute-force) binary nearest neighbour index
 ///
 /// Stores vectors as binary codes and uses Hamming distance for queries.
+// `bound` is pinned because the skipped `vector_store` field makes serde
+// infer a spurious `T: Default`
+#[cfg_attr(
+    feature = "serialise",
+    derive(serde::Serialize, serde::Deserialize),
+    serde(bound = "T: AnnSearchFloat")
+)]
 pub struct ExhaustiveIndexBinary<T> {
     /// Binary codes, flattened (n * n_bytes)
     pub vectors_flat_binarised: Vec<u8>,
@@ -37,7 +44,13 @@ pub struct ExhaustiveIndexBinary<T> {
     /// Binariser
     binariser: Binariser<T>,
     /// Optional vector store that is saved in binary on disk
+    #[cfg_attr(feature = "serialise", serde(skip))]
     vector_store: Option<MmapVectorStore<T>>,
+    /// Shape of `vector_store`, so it can be re-opened after a load. Only
+    /// read by the `serialise` feature; the field is kept unconditionally so
+    /// the constructors stay free of `cfg`.
+    #[cfg_attr(not(feature = "serialise"), allow(dead_code))]
+    store_meta: Option<StoreMeta>,
 }
 
 //////////////////////////
@@ -128,6 +141,7 @@ where
             binariser,
             binarisation_type: init,
             vector_store: None,
+            store_meta: None,
             metric: Dist::Cosine,
         })
     }
@@ -194,8 +208,7 @@ where
             })
             .collect();
 
-        let vectors_path = save_path.as_ref().join("vectors_flat.bin");
-        let norms_path = save_path.as_ref().join("norms.bin");
+        let (vectors_path, norms_path) = MmapVectorStore::<T>::paths_in(&save_path);
 
         MmapVectorStore::save(&vectors_flat, &norms, dim, n, &vectors_path, &norms_path)?;
 
@@ -209,6 +222,7 @@ where
             binariser,
             binarisation_type: init,
             vector_store: Some(vector_store),
+            store_meta: Some(StoreMeta { dim, n }),
             metric,
         })
     }
@@ -632,6 +646,33 @@ where
 ///////////
 // Tests //
 ///////////
+
+/////////////
+// IndexIo //
+/////////////
+
+#[cfg(feature = "serialise")]
+impl<T> IndexIo for ExhaustiveIndexBinary<T>
+where
+    T: AnnSearchFloat,
+{
+    type Elem = T;
+
+    const KIND: &'static str = "exhaustive_binary";
+
+    fn save_aux(&self, dir: &Path) -> Result<(), AnnSearchErrors> {
+        match &self.vector_store {
+            Some(store) => store.copy_to_dir(dir),
+            None => Ok(()),
+        }
+    }
+
+    fn load_aux(&mut self, dir: &Path) -> Result<(), AnnSearchErrors> {
+        self.vector_store = MmapVectorStore::open_in_dir(dir, self.store_meta)?;
+
+        Ok(())
+    }
+}
 
 #[cfg(test)]
 mod tests {

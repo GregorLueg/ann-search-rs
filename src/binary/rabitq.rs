@@ -49,6 +49,7 @@ pub struct RaBitQQuery<T> {
 pub type VecEncoding<T> = (Vec<u8>, T, T, u32);
 
 /// Pure encoding logic for RaBitQ
+#[cfg_attr(feature = "serialise", derive(serde::Serialize, serde::Deserialize))]
 pub struct RaBitQEncoder<T> {
     /// The rotation matrix
     pub rotation: Vec<T>,
@@ -303,6 +304,7 @@ where
 /// locality and reduced misses
 #[repr(C)]
 #[derive(Clone)]
+#[cfg_attr(feature = "serialise", derive(serde::Serialize, serde::Deserialize))]
 pub struct RaBitQPackedVector<T> {
     /// Distance to centroid
     pub dist_to_centroid: T,
@@ -325,6 +327,7 @@ impl<T> RaBitQPackedVector<T> {
 }
 
 /// CSR-layout storage for RaBitQ encoded vectors
+#[cfg_attr(feature = "serialise", derive(serde::Serialize, serde::Deserialize))]
 pub struct RaBitQStorage<T> {
     /// The centroids of the data, nlist * dim, flattened
     pub centroids: Vec<T>,
@@ -659,6 +662,7 @@ where
 /////////////////////
 
 /// RaBitQ quantiser using CSR storage
+#[cfg_attr(feature = "serialise", derive(serde::Serialize, serde::Deserialize))]
 pub struct RaBitQQuantiser<T> {
     /// The RaBitQ encoder structure
     pub encoder: RaBitQEncoder<T>,
@@ -668,7 +672,7 @@ pub struct RaBitQQuantiser<T> {
 
 impl<T> RaBitQQuantiser<T>
 where
-    T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum + ComplexField + SimdDistance,
+    T: AnnSearchFloat,
 {
     /// Create a new RaBitQ quantiser
     ///

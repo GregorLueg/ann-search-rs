@@ -19,6 +19,7 @@ const MAX_SAMPLES_PCA: usize = 100_000;
 
 /// Initialisation of the binariser
 #[derive(Default, Eq, PartialEq)]
+#[cfg_attr(feature = "serialise", derive(serde::Serialize, serde::Deserialize))]
 pub enum BinarisationInit {
     /// Random projection with orthogonalisation
     #[default]
@@ -52,6 +53,7 @@ pub fn parse_binarisation_init(s: &str) -> Option<BinarisationInit> {
 /////////////
 
 /// Enum representing different binarisation methods
+#[cfg_attr(feature = "serialise", derive(serde::Serialize, serde::Deserialize))]
 pub enum BinarisationMethod<T> {
     /// SimHash with random orthogonalised projections
     SimHash {
@@ -337,6 +339,7 @@ fn encode_sign_based<T: Float>(vec: &[T], dim: usize) -> Vec<u8> {
 /// - **SimHash**: Random orthogonalised projections
 /// - **ITQ**: PCA followed by Iterative Quantisation
 /// - **SignBased**: Simple sign binarisation (no training required)
+#[cfg_attr(feature = "serialise", derive(serde::Serialize, serde::Deserialize))]
 pub struct Binariser<T> {
     /// The binarisation method and its parameters
     pub method: BinarisationMethod<T>,

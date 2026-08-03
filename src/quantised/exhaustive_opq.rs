@@ -23,6 +23,7 @@ use crate::utils::k_means_utils::sample_vectors;
 /// * `n` - Number of samples in the index
 /// * `metric` - Distance metric
 /// * `codebook` - Product quantiser with M codebooks
+#[cfg_attr(feature = "serialise", derive(serde::Serialize, serde::Deserialize))]
 pub struct ExhaustiveOpqIndex<T> {
     quantised_codes: Vec<u8>,
     dim: usize,
@@ -301,6 +302,20 @@ where
 ///////////
 // Tests //
 ///////////
+
+/////////////
+// IndexIo //
+/////////////
+
+#[cfg(feature = "serialise")]
+impl<T> IndexIo for ExhaustiveOpqIndex<T>
+where
+    T: AnnSearchFloat,
+{
+    type Elem = T;
+
+    const KIND: &'static str = "exhaustive_opq";
+}
 
 #[cfg(test)]
 mod tests {

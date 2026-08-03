@@ -25,6 +25,7 @@ use crate::utils::*;
 /// L2-normalised at build time and the index operates in Euclidean space
 /// internally (squared Euclidean on the unit sphere is monotone in Cosine
 /// distance).
+#[cfg_attr(feature = "serialise", derive(serde::Serialize, serde::Deserialize))]
 pub struct KmknnIndex<T> {
     /// Vector data in cluster-sorted order. For Cosine, L2-normalised.
     pub vectors_flat: Vec<T>,
@@ -509,6 +510,20 @@ where
 ///////////
 // Tests //
 ///////////
+
+/////////////
+// IndexIo //
+/////////////
+
+#[cfg(feature = "serialise")]
+impl<T> IndexIo for KmknnIndex<T>
+where
+    T: AnnSearchFloat,
+{
+    type Elem = T;
+
+    const KIND: &'static str = "kmknn";
+}
 
 #[cfg(test)]
 mod tests {

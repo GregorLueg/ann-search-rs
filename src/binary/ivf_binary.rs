@@ -18,6 +18,13 @@ use crate::prelude::*;
 use crate::utils::k_means_utils::*;
 
 /// IVF index with binary quantisation
+// `bound` is pinned because the skipped `vector_store` field makes serde
+// infer a spurious `T: Default`
+#[cfg_attr(
+    feature = "serialise",
+    derive(serde::Serialize, serde::Deserialize),
+    serde(bound = "T: AnnSearchFloat")
+)]
 pub struct IvfIndexBinary<T> {
     /// Binary codes, flattened (n * n_bytes)
     pub vectors_flat_binarised: Vec<u8>,
@@ -46,7 +53,13 @@ pub struct IvfIndexBinary<T> {
     /// Number of clusters/lists in this index
     nlist: usize,
     /// Optional vector store that is saved in binary on disk
+    #[cfg_attr(feature = "serialise", serde(skip))]
     vector_store: Option<MmapVectorStore<T>>,
+    /// Shape of `vector_store`, so it can be re-opened after a load. Only
+    /// read by the `serialise` feature; the field is kept unconditionally so
+    /// the constructors stay free of `cfg`.
+    #[cfg_attr(not(feature = "serialise"), allow(dead_code))]
+    store_meta: Option<StoreMeta>,
     /// New to old mapping
     original_ids: Vec<usize>,
     /// Old to new mapping
@@ -246,6 +259,7 @@ where
             offsets,
             nlist,
             vector_store: None,
+            store_meta: None,
             original_ids: Vec::new(),
             old_to_new: Vec::new(),
         };
@@ -417,8 +431,7 @@ where
             })
             .collect();
 
-        let vectors_path = save_path.as_ref().join("vectors_flat.bin");
-        let norms_path = save_path.as_ref().join("norms.bin");
+        let (vectors_path, norms_path) = MmapVectorStore::<T>::paths_in(&save_path);
 
         MmapVectorStore::save(&vectors_flat, &norms, dim, n, &vectors_path, &norms_path)?;
 
@@ -438,6 +451,7 @@ where
             offsets,
             nlist,
             vector_store: Some(vector_store),
+            store_meta: Some(StoreMeta { dim, n }),
             original_ids: Vec::new(),
             old_to_new: Vec::new(),
         };
@@ -949,6 +963,33 @@ where
 // Tests //
 ///////////
 
+/////////////
+// IndexIo //
+/////////////
+
+#[cfg(feature = "serialise")]
+impl<T> IndexIo for IvfIndexBinary<T>
+where
+    T: AnnSearchFloat,
+{
+    type Elem = T;
+
+    const KIND: &'static str = "ivf_binary";
+
+    fn save_aux(&self, dir: &Path) -> Result<(), AnnSearchErrors> {
+        match &self.vector_store {
+            Some(store) => store.copy_to_dir(dir),
+            None => Ok(()),
+        }
+    }
+
+    fn load_aux(&mut self, dir: &Path) -> Result<(), AnnSearchErrors> {
+        self.vector_store = MmapVectorStore::open_in_dir(dir, self.store_meta)?;
+
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -973,7 +1014,7 @@ mod tests {
     /// Sign-based binarisation ignores `n_bits` and emits `dim` bits, so the
     /// code stride must come from the binariser. Taking it from `n_bits`
     /// instead used to walk `optimise_memory_layout` off the end of
-    /// `vectors_flat_binarised`.
+    /// `vectors_flat_binarised` whenever `n_bits != dim`.
     #[test]
     fn test_sign_based_stride_ignores_n_bits() {
         let dim = 32;

@@ -30,6 +30,9 @@ pub mod quantised;
 #[cfg(feature = "binary")]
 pub mod binary;
 
+#[cfg(feature = "serialise")]
+pub mod serialise;
+
 use faer::MatRef;
 use rayon::prelude::*;
 
@@ -46,8 +49,11 @@ use std::ops::AddAssign;
 
 #[cfg(feature = "binary")]
 use bytemuck::Pod;
-#[cfg(feature = "binary")]
+#[cfg(any(feature = "binary", feature = "serialise"))]
 use std::path::Path;
+
+#[cfg(feature = "serialise")]
+use crate::serialise::IndexIo;
 
 use crate::cpu::{
     annoy::*, ball_tree::*, exhaustive::*, hnsw::*, ivf::*, kd_forest::*, kmknn::*, lsh::*,
@@ -197,6 +203,54 @@ where
     } else {
         Ok((indices, None))
     }
+}
+
+///////////////////////
+// Saving & loading //
+///////////////////////
+
+/// Save an index to disk
+///
+/// The index is written into `dir` as a self-contained bundle: the payload
+/// lands in `index.bin`, and the binary indices additionally copy their on-disk
+/// re-ranking store alongside it. The directory is created if it does not
+/// exist, and an index already saved there is overwritten.
+///
+/// ### Params
+///
+/// * `index` - The index to save
+/// * `dir` - Target directory
+///
+/// ### Returns
+///
+/// `Ok(())`, or an IO / encoding error.
+#[cfg(feature = "serialise")]
+pub fn save_index<I>(index: &I, dir: impl AsRef<Path>) -> Result<(), AnnSearchErrors>
+where
+    I: IndexIo,
+{
+    index.save_index(dir)
+}
+
+/// Load an index from disk
+///
+/// Reads a directory written by [`save_index`]. The index type and the float
+/// type must match what was saved; both are checked against the file header
+/// before anything is decoded.
+///
+/// ### Params
+///
+/// * `dir` - Directory holding `index.bin`
+///
+/// ### Returns
+///
+/// The reconstructed index, or the first mismatch / IO / decoding error.
+#[cfg(feature = "serialise")]
+pub fn load_index<I>(dir: impl AsRef<Path>) -> Result<I, AnnSearchErrors>
+where
+    I: IndexIo,
+{
+    I::load_index(dir)
 }
 
 ////////////////

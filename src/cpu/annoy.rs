@@ -34,6 +34,7 @@ use crate::utils::*;
 /// * `split_idx` - Index into split_data (only used for split nodes)
 #[derive(Clone, Copy, Debug)]
 #[repr(C)]
+#[cfg_attr(feature = "serialise", derive(serde::Serialize, serde::Deserialize))]
 struct FlatNode {
     n_descendants: u32,
     child_a: u32,
@@ -72,6 +73,7 @@ enum BuildNode<T> {
 /// Uses a forest of random projection trees to partition the space. Each tree
 /// recursively splits the data using random hyperplanes until reaching leaves
 /// of size ≤ 64 items.
+#[cfg_attr(feature = "serialise", derive(serde::Serialize, serde::Deserialize))]
 pub struct AnnoyIndex<T> {
     /// Original vector data, flattened for cache locality
     pub vectors_flat: Vec<T>,
@@ -836,6 +838,20 @@ where
 ///////////
 // Tests //
 ///////////
+
+/////////////
+// IndexIo //
+/////////////
+
+#[cfg(feature = "serialise")]
+impl<T> IndexIo for AnnoyIndex<T>
+where
+    T: AnnSearchFloat,
+{
+    type Elem = T;
+
+    const KIND: &'static str = "annoy";
+}
 
 #[cfg(test)]
 mod tests {

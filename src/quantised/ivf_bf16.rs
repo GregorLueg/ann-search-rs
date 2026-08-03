@@ -20,6 +20,7 @@ use crate::utils::k_means_utils::*;
 /// Queries search only the nprobe nearest clusters, trading perfect recall
 /// for speed. This version leverages `bf16` quantisation under the hood,
 /// reducing memory fingerprint and query speed at cost of precision.
+#[cfg_attr(feature = "serialise", derive(serde::Serialize, serde::Deserialize))]
 pub struct IvfIndexBf16<T> {
     /// Original vector data, flattened for cache locality and quantised
     /// to bf16
@@ -560,6 +561,20 @@ where
 ///////////
 // Tests //
 ///////////
+
+/////////////
+// IndexIo //
+/////////////
+
+#[cfg(feature = "serialise")]
+impl<T> IndexIo for IvfIndexBf16<T>
+where
+    T: AnnSearchFloat,
+{
+    type Elem = T;
+
+    const KIND: &'static str = "ivf_bf16";
+}
 
 #[cfg(test)]
 mod tests {

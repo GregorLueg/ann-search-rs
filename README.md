@@ -7,9 +7,9 @@
 
 Various approximate nearest neighbour/vector searches implemented in Rust (with
 focus on computational biology applications, very specifically single cell). The
-search algorithms are designed for high in-memory performance. Longer term,
-I might add the option to add/remove vectors from some of the indices and
-persistent on-disk storage.
+search algorithms are designed for high in-memory performance. Indices can be
+saved to disk and loaded back in via the `serialise` feature. Longer term, I
+might add the option to add/remove vectors from some of the indices.
 
 ## Table of Contents
 
@@ -21,6 +21,7 @@ persistent on-disk storage.
 - [FEATURE: quantisation](#quantised-indices)
 - [FEATURE: GPU acceleration](#gpu)
 - [FEATURE: Binary indices](#binarised-indices)
+- [FEATURE: Saving and loading](#saving-and-loading-indices)
 
 ## Description
 
@@ -334,6 +335,52 @@ ann-search-rs = { version = "*", features = ["binary"] }
 ```
 
 The benchmarks can be found [here](https://github.com/GregorLueg/ann-search-rs/blob/main/docs/benchmarks_binary.md).
+
+## Saving and loading indices
+
+Building an index over a few million cells takes minutes. Doing it again on
+every process start gets old fast. The `serialise` feature adds `save_index` and
+`load_index` to every CPU, quantised and binary index:
+
+```toml
+[dependencies]
+ann-search-rs = { version = "*", features = ["serialise"] }
+```
+
+```rust
+use ann_search_rs::prelude::*;
+use ann_search_rs::{build_hnsw_index, load_index, save_index};
+
+let index = build_hnsw_index(mat.as_ref(), 16, 200, "cosine", 42, false);
+save_index(&index, "my_index")?;
+
+let index: HnswIndex<f32> = load_index("my_index")?;
+```
+
+The trait is also in scope from the prelude, so `index.save_index("my_index")`
+and `HnswIndex::<f32>::load_index("my_index")` work directly.
+
+An index is a *directory*, not a single file. `index.bin` holds the payload
+(serde plus bincode, little-endian, variable-length integers so the file moves
+between 32- and 64-bit machines). The binary indices additionally carry their
+on-disk re-ranking store into the same directory, so a saved index is
+self-contained and can be moved. Saving into the directory the store already
+lives in skips the copy.
+
+```
+my_index/
+  index.bin
+  vectors_flat.bin   # binary indices with a re-ranking store
+  norms.bin
+```
+
+`index.bin` opens with a header recording the format version, the index kind and
+the float width. Loading an HNSW index as an IVF one, or an `f32` index as
+`f64`, gives you a typed error rather than garbage.
+
+The GPU indices are not covered. They hold live device handles, and
+`IvfIndexGpu` keeps its centroids on the GPU with no host copy, so persisting
+them needs more than a derive. Watch this space.
 
 ## Licence
 

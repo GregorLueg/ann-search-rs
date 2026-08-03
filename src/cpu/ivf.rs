@@ -21,6 +21,7 @@ use crate::utils::*;
 /// cluster maintains an inverted list of vector indices assigned to it.
 /// Queries search only the nprobe nearest clusters, trading perfect recall
 /// for speed.
+#[cfg_attr(feature = "serialise", derive(serde::Serialize, serde::Deserialize))]
 pub struct IvfIndex<T> {
     /// Original vector data, flattened for cache locality
     pub vectors_flat: Vec<T>,
@@ -524,6 +525,20 @@ where
 ///////////
 // Tests //
 ///////////
+
+/////////////
+// IndexIo //
+/////////////
+
+#[cfg(feature = "serialise")]
+impl<T> IndexIo for IvfIndex<T>
+where
+    T: AnnSearchFloat,
+{
+    type Elem = T;
+
+    const KIND: &'static str = "ivf";
+}
 
 #[cfg(test)]
 mod tests {
