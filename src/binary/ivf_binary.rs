@@ -582,11 +582,9 @@ where
     ///
     /// ### Returns
     ///
-    /// Tuple of `(indices, distances)` where distances are Hamming distances
-    ///
-    /// ### Panic
-    ///
-    /// Panics if the binarisation type is not sign-based.
+    /// Tuple of `(indices, scores)` where the score is the asymmetric dot
+    /// product, sorted descending: higher means more similar. Errors when the
+    /// binarisation type is not sign-based.
     #[inline]
     pub fn query_asymmetric(
         &self,
@@ -616,7 +614,10 @@ where
             })
             .collect();
 
-        scored.sort_unstable_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
+        // `asymmetric_binary_dot` is a similarity, not a distance: the query's
+        // own code maximises it. Descending, or the funnel keeps the k
+        // *least* similar candidates
+        scored.sort_unstable_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
         scored.truncate(k);
 
         let mut indices: Vec<usize> = Vec::with_capacity(k);
