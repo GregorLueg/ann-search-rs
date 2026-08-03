@@ -2953,8 +2953,9 @@ where
 /// ### Params
 ///
 /// * `mat` - Data matrix [samples, features]
-/// * `binarisation_init` - "itq" or "random"
-/// * `n_bits` - Number of bits per code (multiple of 8)
+/// * `binarisation_init` - "itq", "random" or "sign"
+/// * `n_bits` - Number of bits per code (multiple of 8). Ignored by "sign",
+///   which always emits `dim` bits.
 /// * `nlist` - Number of clusters (defaults to √n)
 /// * `k_means_params` - Optional k-means trainings parameters, see
 ///   [KMeansTrainingParams]. If not provided, will default to sensible

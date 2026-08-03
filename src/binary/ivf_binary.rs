@@ -21,7 +21,8 @@ use crate::utils::k_means_utils::*;
 pub struct IvfIndexBinary<T> {
     /// Binary codes, flattened (n * n_bytes)
     pub vectors_flat_binarised: Vec<u8>,
-    /// Bytes per vector (n_bits / 8)
+    /// Bytes per vector, taken from the binariser. Equals `n_bits / 8` for the
+    /// projection-based methods; sign-based ignores `n_bits` and uses `dim`.
     pub n_bytes: usize,
     /// Number of samples in the index
     pub n: usize,
@@ -109,7 +110,8 @@ where
     ///
     /// * `data` - Matrix reference with vectors as rows (n × dim)
     /// * `binarisation_init` - Initialisation method ("itq" or "random")
-    /// * `n_bits` - Number of bits per binary code (must be multiple of 8)
+    /// * `n_bits` - Number of bits per binary code (must be multiple of 8).
+    ///   Ignored by sign-based binarisation, which always emits `dim` bits.
     /// * `metric` - Distance metric for centroid routing
     /// * `nlist` - Optional number of clusters (defaults to sqrt(n))
     /// * `k_means_params` - Optional k-means trainings parameters, see
@@ -141,7 +143,6 @@ where
 
         let n = data.nrows();
         let dim = data.ncols();
-        let n_bytes = n_bits / 8;
 
         let (vectors_flat, _, _) = matrix_to_flat(data);
 
@@ -221,6 +222,10 @@ where
             BinarisationInit::SignBased => Binariser::new_sign_based(dim),
         };
 
+        // Ask the binariser, do not derive from `n_bits`: sign-based ignores
+        // that argument and emits `dim` bits
+        let n_bytes = binariser.n_bytes();
+
         let mut vectors_flat_binarised: Vec<u8> = Vec::with_capacity(n * n_bytes);
         for i in 0..n {
             let original: Vec<T> = data.row(i).iter().cloned().collect();
@@ -260,7 +265,8 @@ where
     ///
     /// * `data` - Matrix reference with vectors as rows (n × dim)
     /// * `binarisation_init` - Initialisation method ("itq" or "random")
-    /// * `n_bits` - Number of bits per binary code (must be multiple of 8)
+    /// * `n_bits` - Number of bits per binary code (must be multiple of 8).
+    ///   Ignored by sign-based binarisation, which always emits `dim` bits.
     /// * `metric` - Distance metric for centroid routing and reranking
     /// * `nlist` - Optional number of clusters (defaults to sqrt(n))
     /// * `k_means_params` - Optional k-means trainings parameters, see
@@ -294,7 +300,6 @@ where
 
         let n = data.nrows();
         let dim = data.ncols();
-        let n_bytes = n_bits / 8;
 
         let (vectors_flat, _, _) = matrix_to_flat(data);
 
@@ -388,6 +393,10 @@ where
             BinarisationInit::RandomProjections => Binariser::new_simhash(dim, n_bits, seed)?,
             BinarisationInit::SignBased => Binariser::new_sign_based(dim),
         };
+
+        // Ask the binariser, do not derive from `n_bits`: sign-based ignores
+        // that argument and emits `dim` bits
+        let n_bytes = binariser.n_bytes();
 
         let mut vectors_flat_binarised: Vec<u8> = Vec::with_capacity(n * n_bytes);
         for i in 0..n {
@@ -959,6 +968,60 @@ mod tests {
 
     fn get_default_k_means() -> Option<KMeansTrainingParams> {
         Some(KMeansTrainingParams::new(10, None, None))
+    }
+
+    /// Sign-based binarisation ignores `n_bits` and emits `dim` bits, so the
+    /// code stride must come from the binariser. Taking it from `n_bits`
+    /// instead used to walk `optimise_memory_layout` off the end of
+    /// `vectors_flat_binarised`.
+    #[test]
+    fn test_sign_based_stride_ignores_n_bits() {
+        let dim = 32;
+        let data = create_test_data::<f32>(128, dim);
+
+        for n_bits in [8, 32, 64, 128] {
+            let index = IvfIndexBinary::build(
+                data.as_ref(),
+                "sign",
+                n_bits,
+                Dist::Cosine,
+                Some(4),
+                get_default_k_means(),
+                42,
+                false,
+            )
+            .unwrap();
+
+            assert_eq!(index.n_bytes, dim / 8, "stride tracked n_bits = {}", n_bits);
+            assert_eq!(index.vectors_flat_binarised.len(), index.n * index.n_bytes);
+
+            let query: Vec<f32> = (0..dim).map(|j| j as f32 * 0.1).collect();
+            let (indices, _) = index.query(&query, 5, Some(4)).unwrap();
+            assert_eq!(indices.len(), 5);
+        }
+    }
+
+    /// The projection-based methods still take their stride from `n_bits`.
+    #[test]
+    fn test_projection_stride_follows_n_bits() {
+        let data = create_test_data::<f32>(128, 32);
+
+        for n_bits in [16, 64] {
+            let index = IvfIndexBinary::build(
+                data.as_ref(),
+                "random",
+                n_bits,
+                Dist::Cosine,
+                Some(4),
+                get_default_k_means(),
+                42,
+                false,
+            )
+            .unwrap();
+
+            assert_eq!(index.n_bytes, n_bits / 8);
+            assert_eq!(index.vectors_flat_binarised.len(), index.n * index.n_bytes);
+        }
     }
 
     #[test]

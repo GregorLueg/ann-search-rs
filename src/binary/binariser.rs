@@ -432,6 +432,21 @@ where
         }
     }
 
+    /// Length of the codes this binariser emits
+    ///
+    /// This is the only correct stride for a flattened code array. It is *not*
+    /// derivable from the `n_bits` a caller passed to a `build_*` function:
+    /// sign-based binarisation ignores that argument and always produces `dim`
+    /// bits, so taking the stride from the argument corrupts the layout
+    /// whenever `n_bits != dim`.
+    ///
+    /// ### Returns
+    ///
+    /// Bytes per encoded vector.
+    pub fn n_bytes(&self) -> usize {
+        self.n_bits.div_ceil(8)
+    }
+
     /// Encode a vector to binary
     ///
     /// ### Params
