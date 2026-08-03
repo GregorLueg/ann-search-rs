@@ -49,43 +49,17 @@
 
 **Fixes**
 
-- Both binary indices corrupted their code layout with sign-based binarisation
-  whenever `n_bits != dim`. Sign-based always emits `dim` bits, but
-  `build_ivf_index_binary` and `build_exhaustive_index_binary` took their stride
-  from the caller's `n_bits`, so the flattened code array was read at the wrong
-  offsets: out-of-bounds slices in the distance kernel, and an out-of-bounds
-  index in `optimise_memory_layout` on the IVF side. The stride now comes from
-  the binariser via a new `Binariser::n_bytes`. `n_bits` is documented as
-  ignored on that path.
-- Asymmetric queries on both binary indices kept the *worst* candidates.
-  `asymmetric_binary_dot` is a similarity, higher meaning more similar, and the
-  candidate funnel sorted it ascending before truncating. `ExhaustiveIndexBinary`
-  had it worse still: it sorted on the candidate id rather than the score. Both
-  now sort descending, which is what makes a sign-based query find the query's
-  own vector first. Affects `query_asymmetric`, `query_row_asymmetric` and the
-  sign-based path through `query_reranking`.
-- `MmapVectorStore::save` truncated its destinations in place, which corrupts a
-  live mapping of the same files: building an index into a directory another
-  index is mapped to handed that index the new vectors, with no error, and a
-  concurrent query in the truncation window is a `SIGBUS`. It now writes to
-  temporary files and renames.
-- `MmapVectorStore::save` relied on `Drop` to flush its writers, which discarded
-  any flush error. Both writers are now flushed explicitly.
-- Temporary files left by a failed store copy are removed, and their names carry
-  a unique suffix so two concurrent saves into one directory cannot race on the
-  same path.
-- A store built with a relative or empty `save_path` could not be copied: the
-  path was kept verbatim, so a `chdir` between build and save resolved the wrong
-  directory and an empty parent resolved nothing at all. Store paths are
-  canonicalised when the store is opened.
-- `load_index` cross-checks the recorded store shape against the index's own
-  `n` and `dim`, so a store belonging to a differently sized dataset is rejected
-  instead of silently re-ranking against it.
-- A missing store file now names the file it wanted rather than reporting a bare
-  "No such file or directory".
-- `"itq"` was documented as a valid binarisation string on five call sites. It
-  never was; the parser accepts `"pca"`, `"random"` and `"sign"` and falls back
-  to random projections for anything else.
+- The sign-based binariser was not behaving. Two bugs, one related to wrong
+  indexing and another bug affecting the asymmetric queries. Both were fixed
+  now.
+- The sign-based index was never properly benchmarked, why the bugs persisted
+  that long. Also fixed.
+
+**Documentation**
+
+- `"itq"` was documented as a valid binarisation string on five call sites (old
+  method that was removed). The parser accepts `"pca"`, `"random"` and `"sign"`
+  and falls back to random projections for anything else.
 
 **Chore**
 
