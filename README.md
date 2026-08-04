@@ -318,7 +318,12 @@ For the most extreme compression needs, binary indices are also provided. There
 are two approaches for binarisation available in the crate:
 
 - Bitwise binarisation either leveraging a SimHash random projection, PCA
-  hashing or signed-based binarisation.
+  hashing or sign-based binarisation. Sign bits taken in the global frame tell
+  you which cluster a point sits in, not where it sits inside that cluster, and
+  the latter is what a kNN search needs. SimHash and PCA hashing centre on a
+  per-feature mean; sign-based centres only on an IVF index, where it takes the
+  residual against each vector's own cell centroid. Both are trades rather than
+  free wins, see `CHANGELOG.md` for the regimes where each helps and hurts.
 - [RaBitQ](https://arxiv.org/abs/2405.12497) binarisation while storing
   additional data for approximate distance calculations.
 - [TurboQuant](https://arxiv.org/abs/2504.19874) a data-oblivious quantiser that

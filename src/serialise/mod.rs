@@ -704,6 +704,39 @@ mod tests {
             ))
         );
 
+        // Sign-based IVF stores codes relative to each cell's centroid, so the
+        // `residual_codes` flag and the centroids have to survive the payload
+        // or the loaded index answers in a different frame than it was built
+        // in. `random_matrix` is all-positive, which makes raw sign codes
+        // degenerate and the residual codes meaningful.
+        round_trip!(
+            test_round_trip_ivf_binary_sign,
+            IvfIndexBinary<f32>,
+            |m| build_ivf_index_binary(
+                m,
+                "sign",
+                N_BITS,
+                Some(NLIST),
+                None,
+                "cosine",
+                1,
+                false,
+                NO_PATH,
+                false
+            )
+            .unwrap(),
+            |i, q| unwrap_knn(query_ivf_index_binary(
+                q,
+                i,
+                K,
+                Some(NLIST),
+                false,
+                None,
+                true,
+                false
+            ))
+        );
+
         round_trip!(
             test_round_trip_exhaustive_rabitq,
             ExhaustiveIndexRaBitQ<f32>,

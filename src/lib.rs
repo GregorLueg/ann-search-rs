@@ -3008,7 +3008,10 @@ where
 /// ### Params
 ///
 /// * `mat` - Data matrix [samples, features]
-/// * `binarisation_init` - "random", "pca" or "sign"
+/// * `binarisation_init` - "random", "pca" or "sign". "sign" encodes the
+///   residual against each vector's assigned centroid rather than the raw
+///   vector, so its codes are only comparable within a Voronoi cell; see
+///   [`IvfIndexBinary::query`].
 /// * `n_bits` - Number of bits per code (multiple of 8). Ignored by "sign",
 ///   which always emits `dim` bits.
 /// * `nlist` - Number of clusters (defaults to √n)
@@ -3136,6 +3139,14 @@ where
 /// Query an IVF binary index against itself
 ///
 /// Generates a full kNN graph based on the internal data.
+///
+/// ### Note
+///
+/// A `"sign"` index stores codes relative to each cell's centroid, which are
+/// only comparable within a cell, so building the graph needs the float
+/// vectors. Without a vector store this returns
+/// [`AnnSearchErrors::ResidualCodesRequireVectorStore`] rather than a quietly
+/// degraded graph. Build with `save_store = true`.
 ///
 /// ### Params
 ///

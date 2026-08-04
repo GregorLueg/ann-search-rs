@@ -66,6 +66,20 @@ pub enum AnnSearchErrors {
     #[error("Only sign-based binarisation is supported for asymmetric queries")]
     AsymmetricQueryMisMatch,
 
+    /// Residual encoding is only defined for sign-based binarisation
+    #[cfg(feature = "binary")]
+    #[error("Only sign-based binarisation supports residual encoding")]
+    ResidualEncodingUnsupported,
+
+    /// Residual codes cannot be compared across Voronoi cells
+    #[cfg(feature = "binary")]
+    #[error(
+        "A sign-based IVF binary index stores codes relative to each cell's centroid, so \
+         they are only comparable within a cell. Building a full kNN graph from it needs \
+         the float vectors: build the index with build_with_vector_store()."
+    )]
+    ResidualCodesRequireVectorStore,
+
     /// Error when n-bits is not a multiple of 8
     #[cfg(feature = "binary")]
     #[error("n_bits must be multiple of 8; chosen n_bits is {n_bits}.")]

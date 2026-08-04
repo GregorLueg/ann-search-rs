@@ -10,8 +10,16 @@
 - `AnnSearchErrors::IoError` is no longer gated behind `binary`, and the
   `From<std::io::Error>` impl is now unconditional. Under default features that
   is a variant which did not exist before; `serialise` adds six more.
-- New variants: `StoreFileUnavailable`, `StoreShapeMismatch` (both `binary`),
-  `TruncatedIndexFile` and `TrailingBytes` (both `serialise`).
+- New variants: `StoreFileUnavailable`, `StoreShapeMismatch`,
+  `ResidualEncodingUnsupported`, `ResidualCodesRequireVectorStore` (all
+  `binary`), `TruncatedIndexFile` and `TrailingBytes` (both `serialise`).
+- `Binariser::new_simhash` takes the data matrix as its first argument. It needs
+  it to fit the centring mean.
+- `IvfIndexBinary::generate_knn` returns `ResidualCodesRequireVectorStore` for a
+  sign-based index built without a vector store. Its codes are relative to each
+  cell's centroid and only comparable within a cell, but that path scans every
+  cluster, so it would have returned a quietly degraded graph. Build with
+  `build_with_vector_store()`.
 - `MmapVectorStore::copy_to_dir` is gone, replaced by
   `MmapVectorStore::stage_copy_into`, which writes under temporary names and
   hands the rename to the caller. The `IndexIo::save_aux` hook becomes
@@ -46,6 +54,33 @@
     carrying one is little-endian only in practice.
   - GPU indices are not covered yet. They hold live device handles, and
     `IvfIndexGpu` keeps its centroids GPU-side with no host mirror.
+- Sign-based IVF binary indices encode the residual against the assigned cell's
+  centroid rather than the raw vector. A cluster far from the origin puts every
+  member on the same side of every coordinate plane, so a global sign code
+  identifies the cluster and says nothing about position inside it, which is the
+  resolution kNN works at. For Cosine the residual is taken between unit-length
+  vectors, expressed without a division as a scale pair, since neither the data
+  nor the centroids are normalised at build time.
+  - **This is a trade, not a free win.** Measured on 8 blobs at dim 32 with
+    32-bit codes, recall@10, residual against the previous global coding:
+
+    | rerank_factor | nprobe | residual | global |
+    |---------------|--------|----------|--------|
+    | 5             | 8      | **0.553**| 0.337  |
+    | 10            | 8      | **0.739**| 0.584  |
+    | 25            | 8      | 0.950    |**1.000**|
+    | 50            | 8      | 0.997    |**1.000**|
+    | 10            | 16     | 0.542    |**0.584**|
+
+    It wins below `rerank_factor` ≈ 15 and costs a few points above it. The
+    global coding was insensitive to `nprobe`; this one degrades as `nprobe`
+    grows, because Hamming distances are only strictly comparable *within* a
+    cell: every vector in a distant cell shares a direction from that cell's
+    centroid, so their residual signs agree with the query's spuriously. The
+    cross-cell term is currently normalised away rather than corrected for, so
+    there is a known repair outstanding. Prefer narrow pools, or reach for
+    `IvfIndexRaBitQ`, which carries the per-vector correction terms this index
+    deliberately does not. Documented on `IvfIndexBinary::query`.
 
 **Fixes**
 
@@ -54,6 +89,24 @@
   now.
 - The sign-based index was never properly benchmarked, why the bugs persisted
   that long. Also fixed.
+- Re-ranking on the sign-based path could never improve recall. `query_reranking`
+  passed `k` as the *k* argument to `query_asymmetric`, which truncates to that
+  argument internally, so the exact-distance stage received exactly `k`
+  candidates and could only reorder what the binary stages had already picked.
+  The funnel was `k*2*rf -> k -> k`; it is now `k*2*rf -> k*rf -> k`. Affected
+  both the exhaustive and the IVF binary indices. The projection methods were
+  never affected.
+- SimHash never centred the data. Its hyperplanes pass through the origin, so on
+  data whose mean sits away from it nearly every point landed on the same side
+  of nearly every plane and the codes carried almost no information. It now fits
+  a per-feature mean like PCA hashing does. **This changes results on
+  previously-valid input and is also a trade**: centring breaks SimHash's scale
+  invariance, so `encode(v)` and `encode(50v)` no longer agree even though their
+  cosine distance is zero. On non-negative data with magnitudes spread over two
+  decades, cosine recall@10 measured 0.206 centred against 0.318 uncentred,
+  while on fixed-magnitude off-origin data centring wins. Single-cell count
+  matrices with varying library size fall in the losing regime; L2-normalising
+  rows before indexing sidesteps it.
 
 **Documentation**
 

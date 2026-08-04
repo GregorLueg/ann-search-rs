@@ -123,7 +123,7 @@ where
 
         let binariser = match init {
             BinarisationInit::PcaHashing => Binariser::new_pca_hashing(data, dim, n_bits, seed)?,
-            BinarisationInit::RandomProjections => Binariser::new_simhash(dim, n_bits, seed)?,
+            BinarisationInit::RandomProjections => Binariser::new_simhash(data, dim, n_bits, seed)?,
             BinarisationInit::SignBased => Binariser::new_sign_based(dim),
         };
 
@@ -188,7 +188,7 @@ where
 
         let binariser = match init {
             BinarisationInit::PcaHashing => Binariser::new_pca_hashing(data, dim, n_bits, seed)?,
-            BinarisationInit::RandomProjections => Binariser::new_simhash(dim, n_bits, seed)?,
+            BinarisationInit::RandomProjections => Binariser::new_simhash(data, dim, n_bits, seed)?,
             BinarisationInit::SignBased => Binariser::new_sign_based(dim),
         };
 
@@ -441,8 +441,12 @@ where
             .as_ref()
             .ok_or(AnnSearchErrors::VectorStoreNotAvailable)?;
 
+        // `query_asymmetric` truncates to its own `k`, so it has to be asked for
+        // `k * rerank_factor` candidates, not `k`. Passing `k` collapses the
+        // funnel to `k -> k` and the exact stage can only reorder what the
+        // binary stages already picked, never recover a dropped neighbour.
         let candidates = if matches!(self.binarisation_type, BinarisationInit::SignBased) {
-            let (idx, _) = self.query_asymmetric(query_vec, k, Some(2 * rerank_factor))?;
+            let (idx, _) = self.query_asymmetric(query_vec, k * rerank_factor, Some(2))?;
             idx
         } else {
             let (idx, _) = self.query(query_vec, k * rerank_factor)?;
@@ -788,6 +792,130 @@ mod tests {
         }
     }
 
+    /// Brute-force top-k by squared Euclidean distance
+    ///
+    /// Ground truth for the recall assertions below.
+    ///
+    /// ### Params
+    ///
+    /// * `data` - Index matrix
+    /// * `query` - Query vector
+    /// * `k` - Number of neighbours
+    ///
+    /// ### Returns
+    ///
+    /// The `k` nearest row indices, nearest first.
+    fn brute_force(data: &Mat<f32>, query: &[f32], k: usize) -> Vec<usize> {
+        let mut scored: Vec<(usize, f32)> = (0..data.nrows())
+            .map(|i| {
+                let d: f32 = (0..data.ncols())
+                    .map(|j| (data[(i, j)] - query[j]).powi(2))
+                    .sum();
+                (i, d)
+            })
+            .collect();
+
+        scored.sort_unstable_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
+        scored.truncate(k);
+
+        scored.into_iter().map(|(i, _)| i).collect()
+    }
+
+    /// `query_reranking` used to pass `k` as the *k* argument to
+    /// `query_asymmetric`, which truncates to that argument internally. The
+    /// exact stage was then handed exactly `k` candidates and could only
+    /// reorder them, never recover a neighbour the binary stages had dropped,
+    /// so re-ranking was a no-op for recall. It must see `k * rerank_factor`.
+    #[test]
+    fn test_reranking_widens_the_candidate_pool() {
+        let (n, dim, k, rerank_factor) = (512, 32, 10, 8);
+        let data = create_signed_test_data(n, dim, 3);
+        let temp_dir = TempDir::new().unwrap();
+
+        let index = ExhaustiveIndexBinary::new_with_vector_store(
+            data.as_ref(),
+            "sign",
+            dim,
+            Dist::SquaredEuclidean,
+            42,
+            temp_dir.path(),
+        )
+        .unwrap();
+
+        let mut differs = 0;
+        let mut hits_rerank = 0;
+        let mut hits_asym = 0;
+
+        for row in (0..n).step_by(37) {
+            let query: Vec<f32> = data.row(row).iter().cloned().collect();
+            let truth = brute_force(&data, &query, k);
+
+            // Exactly what the exact stage used to be handed
+            let (asym, _) = index
+                .query_asymmetric(&query, k, Some(2 * rerank_factor))
+                .unwrap();
+            let (rerank, _) = index
+                .query_reranking(&query, k, Some(rerank_factor))
+                .unwrap();
+
+            if rerank.iter().any(|i| !asym.contains(i)) {
+                differs += 1;
+            }
+            hits_asym += asym.iter().filter(|i| truth.contains(i)).count();
+            hits_rerank += rerank.iter().filter(|i| truth.contains(i)).count();
+        }
+
+        assert!(
+            differs > 0,
+            "re-ranking returned a permutation of the asymmetric top-k on every \
+             query, so the exact stage never saw a wider pool"
+        );
+        assert!(
+            hits_rerank > hits_asym,
+            "re-ranking did not improve recall: {hits_rerank} vs {hits_asym} hits"
+        );
+    }
+
+    /// Recall floor for the sign path on origin-centred data
+    ///
+    /// This is the regime sign binarisation is designed for: coordinates are
+    /// roughly zero-mean, so each bit is balanced and Hamming distance tracks
+    /// angle. There is no cell structure to take a residual against here, so
+    /// this is as good as the exhaustive binary index gets.
+    #[test]
+    fn test_reranking_recall_on_centred_data() {
+        let (n, dim, k) = (2000, 32, 10);
+        let data = create_signed_test_data(n, dim, 21);
+        let temp_dir = TempDir::new().unwrap();
+
+        let index = ExhaustiveIndexBinary::new_with_vector_store(
+            data.as_ref(),
+            "sign",
+            dim,
+            Dist::SquaredEuclidean,
+            42,
+            temp_dir.path(),
+        )
+        .unwrap();
+
+        let mut hits = 0;
+        let mut total = 0;
+
+        for row in (0..n).step_by(53) {
+            let query: Vec<f32> = data.row(row).iter().cloned().collect();
+            let truth = brute_force(&data, &query, k);
+
+            let (got, _) = index.query_reranking(&query, k, Some(25)).unwrap();
+
+            hits += got.iter().filter(|i| truth.contains(i)).count();
+            total += k;
+        }
+
+        let recall = hits as f64 / total as f64;
+
+        assert!(recall > 0.9, "recall@{k} collapsed to {recall:.3}");
+    }
+
     /// A `dim` that is not a multiple of 8 leaves a partial last byte. The
     /// padding bits are zero-filled on both sides, so they XOR away.
     #[test]
@@ -868,7 +996,10 @@ mod tests {
 
     #[test]
     fn test_exhaustive_binary_query_row() {
-        let data = create_test_data::<f32>(100, 32);
+        // `create_test_data` ramps along a straight line, so once SimHash
+        // centres on the training mean a whole block of rows shares one code
+        // and self-retrieval is a coin flip between ties at Hamming 0
+        let data = create_signed_test_data(100, 32, 5);
         let index = ExhaustiveIndexBinary::new(data.as_ref(), "random", 64, 42).unwrap();
 
         let (indices1, distances1) = index.query_row(data.as_ref().row(0), 10).unwrap();
