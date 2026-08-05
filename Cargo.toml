@@ -23,7 +23,7 @@ codegen-units = 1
 ## Enables binary index support with optional memory-mapped files for on-disk vector storage
 binary = ["memmap2", "bytemuck", "statrs"]
 ## Enables GPU-accelerated indices via the CubeCL backend
-gpu = ["cubecl"]
+gpu = ["cubecl", "cubecl-utils-rs"]
 ## Enables GPU integration tests (requires 'wgpu' and a GPU on the machine). This is for CI/CD
 gpu-tests = ["gpu"]
 ## Enables quantised indices with different quantisations (BF16, SQ8, PQ, OPQ)
@@ -60,6 +60,14 @@ cubecl = {
     version = "0.10.0",
     # branch = "main",
     features = ["wgpu", "cpu"],
+    optional = true
+}
+# TEMPORARY: path dep so this branch builds before cubecl-utils-rs is
+# published. Must become `version = "0.0.1"` before merge. The path is relative
+# to the worktree this was developed in and will not resolve from the main
+# checkout, which is deliberate: a wrong path fails loudly.
+cubecl-utils-rs = {
+    path = "../../../../cubecl-utils-rs",
     optional = true
 }
 document-features = "0.2.12"

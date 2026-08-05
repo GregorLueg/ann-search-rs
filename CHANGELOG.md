@@ -4,6 +4,61 @@
 
 **Breaking changes**
 
+- The shared GPU primitives now live in `cubecl-utils-rs`, which the `gpu`
+  feature pulls in. `ann_search_rs::gpu::tensor::GpuTensor`,
+  `ann_search_rs::gpu::grid_2d`, `pad_vectors` and `LINE_SIZE` are gone from
+  this crate; import them from `cubecl_utils_rs::prelude` instead. There are no
+  compatibility re-exports.
+- `AnnSearchGpuFloat` is renamed `CubeclFloat` and now comes from
+  `cubecl-utils-rs`. It is still re-exported from `ann_search_rs::prelude`.
+- `GpuTensor::empty` and `GpuTensor::from_slice` are fallible, and check the
+  requested allocation against the device's per-binding limit before asking for
+  it. `GpuTensor::read` now truncates to the tensor's shape, which only changes
+  behaviour for a `reshaped_view` whose parent allocation is larger.
+- `pick_wg_y` takes the element size and a `GpuLimits`. `grid_2d` takes a
+  `GpuLimits` and returns a `Result`. `plan_local_join_staging` and
+  `plan_topk_merge` take a `GpuLimits` in place of a raw byte budget.
+- `AnnSearchErrors::DimTooHighForSharedMemory` carries `required` and
+  `available` alongside `chosen_dim`. New variant `CubeclUtils` wraps
+  `cubecl_utils_rs::CubeclUtilsErrors`.
+
+**Fixes**
+
+- Several device limits were assumed rather than queried, all of them matching
+  what Apple Silicon reports. A kernel that busts a limit does no work and
+  returns zeros without reporting anything, so these were silent-wrong-answer
+  bugs on any smaller device rather than tuning misses.
+- `pick_wg_y` was a fixed `dim -> wg_y` table sized for 32 KiB of shared memory
+  and `f32`. It now starts from that table as an upper bound and shrinks until
+  the staging fits the device's shared memory, unit-per-cube and cube-dimension
+  limits. On a 32 KiB device with `f32` it returns exactly what it did before.
+- `CubeDim::new_2d(32, 32)` at `dim_padded <= 128` is 1024 units per cube,
+  which was never checked against `max_units_per_cube`.
+- The CAGRA beam search allocated a fixed 8 KiB visited-node hash table plus
+  `4 * dim_padded` with no budget check at all. `plan_beam_search_staging`
+  shrinks the hash table instead, which costs revisits rather than correctness.
+- `two_hop_refinement` and `cagra_rank_prune_shared` had unbounded
+  shared-memory allocations.
+- `compute_max_leaf_size` clamped its lower bound to two rather than failing, so
+  above roughly `dim_padded = 4096` it returned a leaf size whose staging did
+  not fit. It now errors, and accounts for the element size instead of assuming
+  `f32`.
+- `grid_2d` panicked on a cube count of zero, and only ever bounded its x
+  dimension, so `y` could exceed the device limit past `max_dim^2`.
+- Four hand-rolled copies of the 65535 clamp replaced with `grid_2d`.
+  `build_knn_graph_gpu` dispatched a flat 65535 cubes in x regardless of `n`,
+  which at `n = 10_000` launched 55_535 cubes that did nothing, on every
+  iteration and every refinement sweep.
+- Grid dimensions that scale with `k`, the cluster count or the largest
+  cluster's size now go through `checked_cube_count`, so an oversized value is
+  a typed error rather than a zero-filled result.
+- The exhaustive path held an `n_q * db_chunk` transient of 512 MiB for `f32`,
+  sized from two flat constants. The DB chunk now shrinks to the device's
+  binding limit.
+- `calculate_safe_batch_size` hardcoded eight bytes per candidate and never
+  consulted the device; it now uses the element size and caps its target
+  against the binding limit.
+
 - `AnnSearchErrors` is now `#[non_exhaustive]`. Variants come and go with the
   optional features, so a downstream exhaustive `match` was never going to hold
   across a feature-flag change. Add a `_` arm.

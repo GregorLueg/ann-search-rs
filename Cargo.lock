@@ -68,6 +68,7 @@ dependencies = [
  "bytemuck",
  "clap",
  "cubecl",
+ "cubecl-utils-rs",
  "document-features",
  "faer",
  "faer-traits",
@@ -986,6 +987,15 @@ dependencies = [
  "serde",
  "spin",
  "variadics_please",
+]
+
+[[package]]
+name = "cubecl-utils-rs"
+version = "0.0.1"
+dependencies = [
+ "cubecl",
+ "num-traits",
+ "thiserror 2.0.18",
 ]
 
 [[package]]

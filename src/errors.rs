@@ -179,12 +179,28 @@ pub enum AnnSearchErrors {
     #[error("Error from the cubecl runtime: {0}")]
     CubeClServerError(#[from] ServerError),
 
-    /// Error for too high dimensional data that will cause degenerate SharedMemory
+    /// Propagate device-limit errors from `cubecl-utils-rs`
+    ///
+    /// Covers cube counts, per-binding allocation sizes and the generic
+    /// shared-memory budget check. The variants below are the ones specific to
+    /// this crate's own kernels.
     #[cfg(feature = "gpu")]
-    #[error("Dimensions above 2048 (chosen: {chosen_dim}) is not supported due to constrained in safe SharedMemory on modern GPUs")]
+    #[error("{0}")]
+    CubeclUtils(#[from] cubecl_utils_rs::CubeclUtilsErrors),
+
+    /// Error for a dimensionality whose per-workgroup staging cannot fit
+    #[cfg(feature = "gpu")]
+    #[error(
+        "A padded dimensionality of {chosen_dim} needs {required} bytes of shared memory per \
+         workgroup, but this device offers only {available}. Reduce the dimensionality."
+    )]
     DimTooHighForSharedMemory {
-        /// The chosen dimensionality
+        /// The chosen padded dimensionality
         chosen_dim: usize,
+        /// Bytes the smallest viable staging plan would need
+        required: usize,
+        /// Shared memory the device reports, in bytes
+        available: usize,
     },
 
     /// Error for a neighbour count whose top-k merge cannot fit in shared memory

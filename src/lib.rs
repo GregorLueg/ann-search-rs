@@ -2419,7 +2419,7 @@ pub fn build_exhaustive_index_gpu<T, R>(
     device: R::Device,
 ) -> Result<ExhaustiveIndexGpu<T, R>, AnnSearchErrors>
 where
-    T: AnnSearchGpuFloat + AnnSearchFloat,
+    T: CubeclFloat + AnnSearchFloat,
     R: Runtime,
 {
     let metric = parse_ann_dist(dist_metric).unwrap_or_else(|| {
@@ -2450,7 +2450,7 @@ pub fn query_exhaustive_index_gpu<T, R>(
     verbose: bool,
 ) -> KnnOptionResult<T>
 where
-    T: AnnSearchGpuFloat + AnnSearchFloat,
+    T: CubeclFloat + AnnSearchFloat,
     R: Runtime,
 {
     let (indices, distances) = index.query_batch(query_mat, k, verbose)?;
@@ -2484,7 +2484,7 @@ pub fn query_exhaustive_index_gpu_self<T, R>(
     verbose: bool,
 ) -> KnnOptionResult<T>
 where
-    T: AnnSearchGpuFloat + AnnSearchFloat,
+    T: CubeclFloat + AnnSearchFloat,
     R: Runtime,
 {
     let res = index.generate_knn(k, return_dist, verbose)?;
@@ -2522,7 +2522,7 @@ pub fn build_ivf_index_gpu<T, R>(
 ) -> Result<IvfIndexGpu<T, R>, AnnSearchErrors>
 where
     R: Runtime,
-    T: AnnSearchFloat + AnnSearchGpuFloat,
+    T: AnnSearchFloat + CubeclFloat,
 {
     let metric = parse_ann_dist(dist_metric).unwrap_or_else(|| {
         println!("[WARNING] Weird string used for distance metric. Using default squared Euclidean distance");
@@ -2558,7 +2558,7 @@ pub fn query_ivf_index_gpu<T, R>(
 ) -> KnnOptionResult<T>
 where
     R: Runtime,
-    T: AnnSearchFloat + AnnSearchGpuFloat,
+    T: AnnSearchFloat + CubeclFloat,
 {
     let (indices, distances) = index.query_batch(query_mat, k, nprobe, nquery, verbose)?;
 
@@ -2597,7 +2597,7 @@ pub fn query_ivf_index_gpu_self<T, R>(
 ) -> KnnOptionResult<T>
 where
     R: Runtime,
-    T: AnnSearchFloat + AnnSearchGpuFloat,
+    T: AnnSearchFloat + CubeclFloat,
 {
     index.generate_knn(k, nprobe, nquery, return_dist, verbose)
 }
@@ -2642,7 +2642,7 @@ pub fn build_nndescent_index_gpu<T, R>(
 ) -> Result<NNDescentGpu<T, R>, AnnSearchErrors>
 where
     R: Runtime,
-    T: AnnSearchFloat + AnnSearchGpuFloat,
+    T: AnnSearchFloat + CubeclFloat,
 {
     let metric = parse_ann_dist(dist_metric).unwrap_or_else(|| {
         println!("[WARNING] Weird string used for distance metric. Using default squared Euclidean distance");
@@ -2681,7 +2681,7 @@ pub fn query_nndescent_index_gpu<T, R>(
 ) -> KnnOptionResult<T>
 where
     R: Runtime,
-    T: AnnSearchFloat + AnnSearchGpuFloat,
+    T: AnnSearchFloat + CubeclFloat,
 {
     let n_queries = query_mat.nrows();
 
@@ -2730,7 +2730,7 @@ pub fn extract_nndescent_knn_gpu<T, R>(
 ) -> (Vec<Vec<usize>>, Option<Vec<Vec<T>>>)
 where
     R: Runtime,
-    T: AnnSearchFloat + AnnSearchGpuFloat,
+    T: AnnSearchFloat + CubeclFloat,
 {
     index.extract_knn(return_dist)
 }
@@ -2760,7 +2760,7 @@ pub fn query_nndescent_index_gpu_self<T, R>(
 ) -> KnnOptionResult<T>
 where
     R: Runtime,
-    T: AnnSearchFloat + AnnSearchGpuFloat,
+    T: AnnSearchFloat + CubeclFloat,
 {
     let (indices, distances) = index.self_query_gpu(k, query_params, 42)?;
 
@@ -2807,7 +2807,7 @@ pub fn build_knn_graph_gpu<T, R>(
 ) -> Result<crate::gpu::nndescent_gpu::KnnGraphGpu<T>, AnnSearchErrors>
 where
     R: Runtime,
-    T: AnnSearchFloat + AnnSearchGpuFloat,
+    T: AnnSearchFloat + CubeclFloat,
 {
     let metric = parse_ann_dist(dist_metric).unwrap_or_else(|| {
         println!("[WARNING] Weird string used for distance metric. Using default squared Euclidean distance");

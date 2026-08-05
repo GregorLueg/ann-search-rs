@@ -12,9 +12,9 @@ use cubecl::future;
 use cubecl::prelude::*;
 
 use ann_search_rs::gpu::dist_gpu::*;
-use ann_search_rs::gpu::tensor::GpuTensor;
 use ann_search_rs::gpu::*;
 use ann_search_rs::utils::dist::Dist;
+use cubecl_utils_rs::prelude::*;
 
 /// Shared config so all benchmarks use identical data
 #[derive(Clone)]
@@ -62,12 +62,16 @@ impl BenchConfig {
 
 /// Deterministic synthetic query data, matching the original bench generator.
 fn make_queries(n: usize, dim: usize) -> Vec<f32> {
-    (0..n * dim).map(|i| ((i * 13 + 7) % 29) as f32 * 0.1).collect()
+    (0..n * dim)
+        .map(|i| ((i * 13 + 7) % 29) as f32 * 0.1)
+        .collect()
 }
 
 /// Deterministic synthetic database data, matching the original bench generator.
 fn make_db(n: usize, dim: usize) -> Vec<f32> {
-    (0..n * dim).map(|i| ((i * 17 + 3) % 31) as f32 * 0.1).collect()
+    (0..n * dim)
+        .map(|i| ((i * 17 + 3) % 31) as f32 * 0.1)
+        .collect()
 }
 
 /// Row-wise L2 norms, needed by the cosine kernel.
@@ -120,16 +124,25 @@ impl<R: Runtime> Benchmark for DistanceBench<R> {
         let queries = make_queries(nq, dim);
         let db = make_db(ndb, dim);
 
-        let query_gpu = GpuTensor::<R, f32>::from_slice(&queries, vec![nq, dim], &self.client);
-        let db_gpu = GpuTensor::<R, f32>::from_slice(&db, vec![ndb, dim], &self.client);
-        let distances_gpu = GpuTensor::<R, f32>::empty(vec![nq, ndb], &self.client);
+        let query_gpu = GpuTensor::<R, f32>::from_slice(&queries, vec![nq, dim], &self.client)
+            .expect("GPU allocation exceeds the device binding limit");
+        let db_gpu = GpuTensor::<R, f32>::from_slice(&db, vec![ndb, dim], &self.client)
+            .expect("GPU allocation exceeds the device binding limit");
+        let distances_gpu = GpuTensor::<R, f32>::empty(vec![nq, ndb], &self.client)
+            .expect("GPU allocation exceeds the device binding limit");
 
         let (query_norms_gpu, db_norms_gpu) = if self.cfg.metric == Dist::Cosine {
             let qn = l2_norms(&queries, dim);
             let dn = l2_norms(&db, dim);
             (
-                Some(GpuTensor::<R, f32>::from_slice(&qn, vec![nq], &self.client)),
-                Some(GpuTensor::<R, f32>::from_slice(&dn, vec![ndb], &self.client)),
+                Some(
+                    GpuTensor::<R, f32>::from_slice(&qn, vec![nq], &self.client)
+                        .expect("GPU allocation exceeds the device binding limit"),
+                ),
+                Some(
+                    GpuTensor::<R, f32>::from_slice(&dn, vec![ndb], &self.client)
+                        .expect("GPU allocation exceeds the device binding limit"),
+                ),
             )
         } else {
             (None, None)
@@ -152,10 +165,13 @@ impl<R: Runtime> Benchmark for DistanceBench<R> {
 
         // Use the production heuristic rather than a hardcoded 4, so the
         // shared-memory budget tiers actually get exercised by the sweep.
-        let wg_y = pick_wg_y(self.cfg.dim).expect("dim outside pick_wg_y table");
+        let limits = GpuLimits::from_client(&self.client);
+        let wg_y = pick_wg_y(self.cfg.dim, size_of::<f32>(), &limits)
+            .expect("dim outside pick_wg_y table");
 
         let grid_x = (ndb as u32).div_ceil(WORKGROUP_SIZE_X);
-        let (grid_y, grid_z) = grid_2d((nq as u32).div_ceil(wg_y));
+        let (grid_y, grid_z) =
+            grid_2d((nq as u32).div_ceil(wg_y), &limits).expect("grid too large");
 
         match self.cfg.metric {
             Dist::Cosine => unsafe {
@@ -249,14 +265,17 @@ impl<R: Runtime> Benchmark for DistanceRegBench<R> {
         let dim_lines = self.cfg.dim / LINE_SIZE;
         let vec_size = LINE_SIZE;
 
-        let wg_y = pick_wg_y(self.cfg.dim).expect("dim outside pick_wg_y table");
+        let limits = GpuLimits::from_client(&self.client);
+        let wg_y = pick_wg_y(self.cfg.dim, size_of::<f32>(), &limits)
+            .expect("dim outside pick_wg_y table");
         if !tile_fits(wg_y) {
             return Err(format!("wg_y {wg_y} not divisible by TILE_Q {TILE_Q}"));
         }
         let threads_y = wg_y / TILE_Q as u32;
 
         let grid_x = (ndb as u32).div_ceil(WORKGROUP_SIZE_X * TILE_D as u32);
-        let (grid_y, grid_z) = grid_2d((nq as u32).div_ceil(wg_y));
+        let (grid_y, grid_z) =
+            grid_2d((nq as u32).div_ceil(wg_y), &limits).expect("grid too large");
 
         match self.cfg.metric {
             Dist::Cosine => unsafe {
@@ -367,9 +386,12 @@ impl<R: Runtime> Benchmark for TopkBench<R> {
             .map(|i| ((i * 7 + 13) % 1000) as f32 * 0.01)
             .collect();
 
-        let distances_gpu = GpuTensor::<R, f32>::from_slice(&dists, vec![nq, ndb], &self.client);
-        let topk_dists = GpuTensor::<R, f32>::empty(vec![nq, k], &self.client);
-        let topk_indices = GpuTensor::<R, u32>::empty(vec![nq, k], &self.client);
+        let distances_gpu = GpuTensor::<R, f32>::from_slice(&dists, vec![nq, ndb], &self.client)
+            .expect("GPU allocation exceeds the device binding limit");
+        let topk_dists = GpuTensor::<R, f32>::empty(vec![nq, k], &self.client)
+            .expect("GPU allocation exceeds the device binding limit");
+        let topk_indices = GpuTensor::<R, u32>::empty(vec![nq, k], &self.client)
+            .expect("GPU allocation exceeds the device binding limit");
 
         let init_gx = (k as u32).div_ceil(WORKGROUP_SIZE_X);
         let init_gy = (nq as u32).div_ceil(4);
@@ -536,9 +558,12 @@ impl<R: Runtime> Benchmark for TopkCoalescedBench<R> {
             .map(|i| ((i * 7 + 13) % 1000) as f32 * 0.01)
             .collect();
 
-        let distances_gpu = GpuTensor::<R, f32>::from_slice(&dists, vec![nq, ndb], &self.client);
-        let topk_dists = GpuTensor::<R, f32>::empty(vec![nq, k], &self.client);
-        let topk_indices = GpuTensor::<R, u32>::empty(vec![nq, k], &self.client);
+        let distances_gpu = GpuTensor::<R, f32>::from_slice(&dists, vec![nq, ndb], &self.client)
+            .expect("GPU allocation exceeds the device binding limit");
+        let topk_dists = GpuTensor::<R, f32>::empty(vec![nq, k], &self.client)
+            .expect("GPU allocation exceeds the device binding limit");
+        let topk_indices = GpuTensor::<R, u32>::empty(vec![nq, k], &self.client)
+            .expect("GPU allocation exceeds the device binding limit");
 
         let init_gx = (k as u32).div_ceil(WORKGROUP_SIZE_X);
         let init_gy = (nq as u32).div_ceil(4);
@@ -567,12 +592,9 @@ impl<R: Runtime> Benchmark for TopkCoalescedBench<R> {
         let k = self.cfg.k;
 
         let grid = nq as u32; // one workgroup per query
-        let merge = plan_topk_merge(
-            k,
-            size_of::<f32>(),
-            self.client.properties().hardware.max_shared_memory_size,
-        )
-        .expect("k too large for the device shared-memory budget");
+        let limits = GpuLimits::from_client(&self.client);
+        let merge = plan_topk_merge(k, size_of::<f32>(), &limits)
+            .expect("k too large for the device shared-memory budget");
         unsafe {
             extract_topk_coalesced::launch_unchecked::<f32, R>(
                 &self.client,
@@ -671,7 +693,9 @@ fn validate_topk<R: Runtime>(cfg: &BenchConfig, client: &ComputeClient<R>) {
     let s_dists = s_in.topk_dists.read(client).expect("read failed");
 
     let c_in = coalesced.prepare();
-    coalesced.execute(c_in.clone()).expect("coalesced topk failed");
+    coalesced
+        .execute(c_in.clone())
+        .expect("coalesced topk failed");
     coalesced.sync();
     let c_dists = c_in.topk_dists.read(client).expect("read failed");
 
@@ -699,7 +723,11 @@ fn validate_topk<R: Runtime>(cfg: &BenchConfig, client: &ComputeClient<R>) {
 
     // The two kernels must agree on the selected distances. Indices may differ
     // on ties, distances must not.
-    for (row, (s, c)) in s_dists.chunks_exact(k).zip(c_dists.chunks_exact(k)).enumerate() {
+    for (row, (s, c)) in s_dists
+        .chunks_exact(k)
+        .zip(c_dists.chunks_exact(k))
+        .enumerate()
+    {
         for (j, (sd, cd)) in s.iter().zip(c.iter()).enumerate() {
             assert!(
                 (sd - cd).abs() <= 1e-6 * sd.abs().max(1.0),
@@ -708,7 +736,10 @@ fn validate_topk<R: Runtime>(cfg: &BenchConfig, client: &ComputeClient<R>) {
         }
     }
 
-    println!("topk validation passed ({} queries, k={})", cfg.n_queries, k);
+    println!(
+        "topk validation passed ({} queries, k={})",
+        cfg.n_queries, k
+    );
 }
 
 /// Cross-check the register-tiled distance kernel against the 1x1 kernel.
