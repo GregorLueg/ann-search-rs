@@ -62,12 +62,8 @@ cubecl = {
     features = ["wgpu", "cpu"],
     optional = true
 }
-# TEMPORARY: path dep so this branch builds before cubecl-utils-rs is
-# published. Must become `version = "0.0.1"` before merge. The path is relative
-# to the worktree this was developed in and will not resolve from the main
-# checkout, which is deliberate: a wrong path fails loudly.
 cubecl-utils-rs = {
-    path = "../../../../cubecl-utils-rs",
+    version = "0.1.0",
     optional = true
 }
 document-features = "0.2.12"

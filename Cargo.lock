@@ -991,7 +991,9 @@ dependencies = [
 
 [[package]]
 name = "cubecl-utils-rs"
-version = "0.0.1"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "26e6098494722dab3d8243707faded9dcea26f3d6dd77d816b8c995343f3a90a"
 dependencies = [
  "cubecl",
  "num-traits",
