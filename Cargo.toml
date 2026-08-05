@@ -50,12 +50,6 @@ clap = {
     version = "4.5.53",
     features = ["derive"]
 }
-# cubecl = {
-#     git = "https://github.com/tracel-ai/cubecl.git",
-#     branch = "main",
-#     features = ["wgpu", "cpu"],
-#     optional = true
-# }
 cubecl = {
     version = "0.10.0",
     # branch = "main",
