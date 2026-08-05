@@ -2,180 +2,53 @@
 
 ## 0.5.0
 
-**Breaking changes**
-
-- The shared GPU primitives now live in `cubecl-utils-rs`, which the `gpu`
-  feature pulls in. `ann_search_rs::gpu::tensor::GpuTensor`,
-  `ann_search_rs::gpu::grid_2d`, `pad_vectors` and `LINE_SIZE` are gone from
-  this crate; import them from `cubecl_utils_rs::prelude` instead. There are no
-  compatibility re-exports.
-- `AnnSearchGpuFloat` is renamed `CubeclFloat` and now comes from
-  `cubecl-utils-rs`. It is still re-exported from `ann_search_rs::prelude`.
-- `GpuTensor::empty` and `GpuTensor::from_slice` are fallible, and check the
-  requested allocation against the device's per-binding limit before asking for
-  it. `GpuTensor::read` now truncates to the tensor's shape, which only changes
-  behaviour for a `reshaped_view` whose parent allocation is larger.
-- `pick_wg_y` takes the element size and a `GpuLimits`. `grid_2d` takes a
-  `GpuLimits` and returns a `Result`. `plan_local_join_staging` and
-  `plan_topk_merge` take a `GpuLimits` in place of a raw byte budget.
-- `AnnSearchErrors::DimTooHighForSharedMemory` carries `required` and
-  `available` alongside `chosen_dim`. New variant `CubeclUtils` wraps
-  `cubecl_utils_rs::CubeclUtilsErrors`.
-
-**Fixes**
-
-- Several device limits were assumed rather than queried, all of them matching
-  what Apple Silicon reports. A kernel that busts a limit does no work and
-  returns zeros without reporting anything, so these were silent-wrong-answer
-  bugs on any smaller device rather than tuning misses.
-- `pick_wg_y` was a fixed `dim -> wg_y` table sized for 32 KiB of shared memory
-  and `f32`. It now starts from that table as an upper bound and shrinks until
-  the staging fits the device's shared memory, unit-per-cube and cube-dimension
-  limits. On a 32 KiB device with `f32` it returns exactly what it did before.
-- `CubeDim::new_2d(32, 32)` at `dim_padded <= 128` is 1024 units per cube,
-  which was never checked against `max_units_per_cube`.
-- The CAGRA beam search allocated a fixed 8 KiB visited-node hash table plus
-  `4 * dim_padded` with no budget check at all. `plan_beam_search_staging`
-  shrinks the hash table instead, which costs revisits rather than correctness.
-- `two_hop_refinement` and `cagra_rank_prune_shared` had unbounded
-  shared-memory allocations.
-- `compute_max_leaf_size` clamped its lower bound to two rather than failing, so
-  above roughly `dim_padded = 4096` it returned a leaf size whose staging did
-  not fit. It now errors, and accounts for the element size instead of assuming
-  `f32`.
-- `grid_2d` panicked on a cube count of zero, and only ever bounded its x
-  dimension, so `y` could exceed the device limit past `max_dim^2`.
-- Four hand-rolled copies of the 65535 clamp replaced with `grid_2d`.
-  `build_knn_graph_gpu` dispatched a flat 65535 cubes in x regardless of `n`,
-  which at `n = 10_000` launched 55_535 cubes that did nothing, on every
-  iteration and every refinement sweep.
-- Grid dimensions that scale with `k`, the cluster count or the largest
-  cluster's size now go through `checked_cube_count`, so an oversized value is
-  a typed error rather than a zero-filled result.
-- The exhaustive path held an `n_q * db_chunk` transient of 512 MiB for `f32`,
-  sized from two flat constants. The DB chunk now shrinks to the device's
-  binding limit.
-- `calculate_safe_batch_size` hardcoded eight bytes per candidate and never
-  consulted the device; it now uses the element size and caps its target
-  against the binding limit.
-
-- `AnnSearchErrors` is now `#[non_exhaustive]`. Variants come and go with the
-  optional features, so a downstream exhaustive `match` was never going to hold
-  across a feature-flag change. Add a `_` arm.
-- `AnnSearchErrors::IoError` is no longer gated behind `binary`, and the
-  `From<std::io::Error>` impl is now unconditional. Under default features that
-  is a variant which did not exist before; `serialise` adds six more.
-- New variants: `StoreFileUnavailable`, `StoreShapeMismatch`,
-  `ResidualEncodingUnsupported`, `ResidualCodesRequireVectorStore` (all
-  `binary`), `TruncatedIndexFile` and `TrailingBytes` (both `serialise`).
-- `Binariser::new_simhash` takes the data matrix as its first argument. It needs
-  it to fit the centring mean.
-- `IvfIndexBinary::generate_knn` returns `ResidualCodesRequireVectorStore` for a
-  sign-based index built without a vector store. Its codes are relative to each
-  cell's centroid and only comparable within a cell, but that path scans every
-  cluster, so it would have returned a quietly degraded graph. Build with
-  `build_with_vector_store()`.
-- `MmapVectorStore::copy_to_dir` is gone, replaced by
-  `MmapVectorStore::stage_copy_into`, which writes under temporary names and
-  hands the rename to the caller. The `IndexIo::save_aux` hook becomes
-  `IndexIo::stage_aux` for the same reason.
-- With `serialise` on, `AnnSearchFloat` gains `Serialize + DeserializeOwned`.
-  Cargo unifies features across the graph, so one crate anywhere enabling
-  `serialise` adds that bound for every other consumer. `f32` and `f64` are
-  unaffected; a downstream custom float type is not.
-
 **Features**
 
-- New `serialise` feature: indices can be saved to disk and loaded back in.
-  Covers all CPU, quantised and binary indices via a new `IndexIo` trait, plus
-  `save_index` / `load_index` wrappers in the crate root. Backed by `serde` and
-  `bincode`, both optional and only pulled in with the feature.
-  - An index is saved as a directory. `index.bin` holds the payload; the binary
-    indices copy their on-disk re-ranking store alongside it, so a saved index
-    is self-contained and can be moved. Saving into the directory the store
-    already occupies skips the copy.
-  - Every file is written under a temporary name and renamed into place at the
-    end, `index.bin` last. A save that fails part-way leaves the previous bundle
-    untouched, or leaves no `index.bin` and fails loudly on the next load. It
-    never leaves a directory that loads clean and re-ranks against the wrong
-    vectors.
-  - `index.bin` carries a header with a magic number, format version, index kind
-    and float width. Loading the wrong index type or the wrong float type is a
-    typed error rather than silent garbage. Truncated files and trailing bytes
-    are both rejected.
-  - Integers are varint-encoded and floats are little-endian, so `index.bin`
-    moves between 32- and 64-bit machines and between endiannesses. The binary
-    indices' store files are raw native-endian dumps and do not, so a bundle
-    carrying one is little-endian only in practice.
-  - GPU indices are not covered yet. They hold live device handles, and
-    `IvfIndexGpu` keeps its centroids GPU-side with no host mirror.
-- Sign-based IVF binary indices encode the residual against the assigned cell's
-  centroid rather than the raw vector. A cluster far from the origin puts every
-  member on the same side of every coordinate plane, so a global sign code
-  identifies the cluster and says nothing about position inside it, which is the
-  resolution kNN works at. For Cosine the residual is taken between unit-length
-  vectors, expressed without a division as a scale pair, since neither the data
-  nor the centroids are normalised at build time.
-  - **This is a trade, not a free win.** Measured on 8 blobs at dim 32 with
-    32-bit codes, recall@10, residual against the previous global coding:
-
-    | rerank_factor | nprobe | residual | global |
-    |---------------|--------|----------|--------|
-    | 5             | 8      | **0.553**| 0.337  |
-    | 10            | 8      | **0.739**| 0.584  |
-    | 25            | 8      | 0.950    |**1.000**|
-    | 50            | 8      | 0.997    |**1.000**|
-    | 10            | 16     | 0.542    |**0.584**|
-
-    It wins below `rerank_factor` ≈ 15 and costs a few points above it. The
-    global coding was insensitive to `nprobe`; this one degrades as `nprobe`
-    grows, because Hamming distances are only strictly comparable *within* a
-    cell: every vector in a distant cell shares a direction from that cell's
-    centroid, so their residual signs agree with the query's spuriously. The
-    cross-cell term is currently normalised away rather than corrected for, so
-    there is a known repair outstanding. Prefer narrow pools, or reach for
-    `IvfIndexRaBitQ`, which carries the per-vector correction terms this index
-    deliberately does not. Documented on `IvfIndexBinary::query`.
+- New `serialise` feature: save indices to disk and load them back. Covers all
+  CPU, quantised and binary indices via the `IndexIo` trait plus `save_index` /
+  `load_index`. GPU indices are not covered yet.
+- Sign-based IVF binary indices now encode the residual against the assigned
+  cell's centroid instead of the raw vector. A trade, not a free win: better
+  recall at low `rerank_factor`, worse above roughly 15. Documented on
+  `IvfIndexBinary::query`.
 
 **Fixes**
 
-- The sign-based binariser was not behaving. Two bugs, one related to wrong
-  indexing and another bug affecting the asymmetric queries. Both were fixed
-  now.
-- The sign-based index was never properly benchmarked, why the bugs persisted
-  that long. Also fixed.
-- Re-ranking on the sign-based path could never improve recall. `query_reranking`
-  passed `k` as the *k* argument to `query_asymmetric`, which truncates to that
-  argument internally, so the exact-distance stage received exactly `k`
-  candidates and could only reorder what the binary stages had already picked.
-  The funnel was `k*2*rf -> k -> k`; it is now `k*2*rf -> k*rf -> k`. Affected
-  both the exhaustive and the IVF binary indices. The projection methods were
-  never affected.
-- SimHash never centred the data. Its hyperplanes pass through the origin, so on
-  data whose mean sits away from it nearly every point landed on the same side
-  of nearly every plane and the codes carried almost no information. It now fits
-  a per-feature mean like PCA hashing does. **This changes results on
-  previously-valid input and is also a trade**: centring breaks SimHash's scale
-  invariance, so `encode(v)` and `encode(50v)` no longer agree even though their
-  cosine distance is zero. On non-negative data with magnitudes spread over two
-  decades, cosine recall@10 measured 0.206 centred against 0.318 uncentred,
-  while on fixed-magnitude off-origin data centring wins. Single-cell count
-  matrices with varying library size fall in the losing regime; L2-normalising
-  rows before indexing sidesteps it.
+- Fixed the sign-based binariser, which was not working properly. Bad indexing
+  plus a broken asymmetric query path. It now has proper benchmarks, which is
+  why the bugs survived this long.
+- Fixed the re-ranking funnel on the sign-based path, which could never improve
+  recall because the exact stage only ever saw `k` candidates.
+- SimHash now centres the data. Without it, off-origin data put nearly every
+  point on the same side of nearly every plane. Note this breaks scale
+  invariance, so L2-normalise rows if your magnitudes vary a lot.
+- A pile of GPU device limits were assumed rather than queried, all matching
+  Apple Silicon. A kernel that busts a limit silently returns zeros, so these
+  were wrong-answer bugs on smaller devices. All staging plans and grid
+  dispatches now derive from the queried `GpuLimits`.
 
-**Documentation**
+**Breaking changes**
 
-- `"itq"` was documented as a valid binarisation string on five call sites (old
-  method that was removed). The parser accepts `"pca"`, `"random"` and `"sign"`
-  and falls back to random projections for anything else.
+- Shared GPU primitives moved to `cubecl-utils-rs`. `GpuTensor`, `grid_2d`,
+  `pad_vectors` and `LINE_SIZE` are gone from this crate; import them from
+  `cubecl_utils_rs::prelude`. `AnnSearchGpuFloat` is now `CubeclFloat`, still
+  re-exported from the prelude.
+- `GpuTensor::empty` / `from_slice` are fallible. `pick_wg_y`, `grid_2d` and the
+  staging planners take a `GpuLimits`.
+- `AnnSearchErrors` is `#[non_exhaustive]`; add a `_` arm. Several new variants
+  for the store and serialisation paths.
+- `Binariser::new_simhash` takes the data matrix first, to fit the centring mean.
+- `MmapVectorStore::copy_to_dir` is replaced by `stage_copy_into`, and
+  `IndexIo::save_aux` by `IndexIo::stage_aux`.
+- With `serialise` on, `AnnSearchFloat` gains `Serialize + DeserializeOwned`.
+  `f32` and `f64` are unaffected; a custom float type is not.
 
 **Chore**
 
-- `tempfile` moved from the `binary` feature to `[dev-dependencies]`. It was
-  only ever used by tests and the gridsearch examples, so `binary` no longer
-  drags it into normal builds.
-- A handful of impl blocks in `binary/` spelled out `AnnSearchFloat`'s bounds
-  longhand; they now name the trait.
+- `tempfile` moved to `[dev-dependencies]`, so `binary` no longer drags it into
+  normal builds.
+- `"itq"` was still documented as a valid binarisation string in five places.
+  The parser takes `"pca"`, `"random"` and `"sign"`.
 
 ## 0.4.5
 
