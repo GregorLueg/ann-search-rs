@@ -100,6 +100,7 @@ where
 ///
 /// * `scales` - The maximum absolute values across each dimensions for
 ///   renormalisation.
+#[cfg_attr(feature = "serialise", derive(serde::Serialize, serde::Deserialize))]
 pub struct ScalarQuantiser<T> {
     /// The maximum absolute values across each dimensions for renormalisation.
     pub scales: Vec<T>,
@@ -210,6 +211,7 @@ pub const OPQ_ITER: usize = 3;
 /// * `m` - Number of subspaces
 /// * `subvec_dim` - Dimension of each subvector (dim / m)
 /// * `n_centroids` - Number of centroids that were used to train the quantiser.
+#[cfg_attr(feature = "serialise", derive(serde::Serialize, serde::Deserialize))]
 pub struct ProductQuantiser<T> {
     codebooks: Vec<Vec<T>>,
     m: usize,
@@ -474,6 +476,7 @@ where
 /// * `rotation_matrix` - Orthogonal rotation matrix (dim × dim, row-major)
 /// * `pq` - Standard product quantiser applied after rotation
 /// * `dim` - Dimension of vectors
+#[cfg_attr(feature = "serialise", derive(serde::Serialize, serde::Deserialize))]
 pub struct OptimisedProductQuantiser<T> {
     rotation_matrix: Vec<T>,
     pq: ProductQuantiser<T>,

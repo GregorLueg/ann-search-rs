@@ -363,6 +363,7 @@ impl VamanaState<f64> for VamanaIndex<f64> {
 ////////////////
 
 /// Vamana graph index for approximate nearest neighbour search.
+#[cfg_attr(feature = "serialise", derive(serde::Serialize, serde::Deserialize))]
 pub struct VamanaIndex<T> {
     /// Flattened vector data for cache locality
     pub vectors_flat: Vec<T>,
@@ -1015,6 +1016,20 @@ where
 ///////////
 // Tests //
 ///////////
+
+/////////////
+// IndexIo //
+/////////////
+
+#[cfg(feature = "serialise")]
+impl<T> IndexIo for VamanaIndex<T>
+where
+    T: AnnSearchFloat,
+{
+    type Elem = T;
+
+    const KIND: &'static str = "vamana";
+}
 
 #[cfg(test)]
 mod tests {

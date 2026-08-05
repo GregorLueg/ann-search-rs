@@ -69,13 +69,15 @@ fn main() {
 
     // Binary exhaustive benchmarks - increase bits if higher dimensionality
     // is used
-    let n_bits_values = if cli.dim <= 64 {
+    // `sign` always emits `dim` bits and ignores the value passed alongside it,
+    // so it is reported next to the projection methods rather than swept
+    let n_bits_values = if cli.dim <= 128 {
         vec![
             (256, "random"),
             (256, "pca"),
             (512, "random"),
             (512, "pca"),
-            (cli.dim, "signed"),
+            (cli.dim, "sign"),
         ]
     } else {
         vec![
@@ -85,7 +87,7 @@ fn main() {
             (512, "pca"),
             (1024, "random"),
             (1024, "pca"),
-            (cli.dim, "signed"),
+            (cli.dim, "sign"),
         ]
     };
     let rerank_factors = [10, 20];

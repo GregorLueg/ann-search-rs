@@ -34,6 +34,7 @@ use crate::utils::matrix_to_flat;
 /// * `n` - Number of samples
 /// * `metric` - The type of distance the index is designed for
 /// * `codebook` - The codebook that contains the information of the quantisation
+#[cfg_attr(feature = "serialise", derive(serde::Serialize, serde::Deserialize))]
 pub struct ExhaustiveSq8Index<T> {
     quantised_vectors: Vec<i8>,
     quantised_norms: Vec<i32>,
@@ -354,6 +355,20 @@ where
 ///////////
 // Tests //
 ///////////
+
+/////////////
+// IndexIo //
+/////////////
+
+#[cfg(feature = "serialise")]
+impl<T> IndexIo for ExhaustiveSq8Index<T>
+where
+    T: AnnSearchFloat,
+{
+    type Elem = T;
+
+    const KIND: &'static str = "exhaustive_sq8";
+}
 
 #[cfg(test)]
 mod tests {

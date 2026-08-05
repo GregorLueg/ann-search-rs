@@ -17,7 +17,12 @@ pub use crate::utils::DimensionValidation;
 #[cfg(feature = "gpu")]
 pub use crate::gpu::cagra_gpu_search::CagraGpuSearchParams;
 #[cfg(feature = "gpu")]
-pub use crate::gpu::traits_gpu::AnnSearchGpuFloat;
+pub use cubecl_utils_rs::CubeclFloat;
+
+#[cfg(feature = "serialise")]
+pub use crate::serialise::IndexIo;
+#[cfg(feature = "serialise")]
+pub use crate::utils::staging::StagedFiles;
 
 ///////////
 // Types //

@@ -9,8 +9,8 @@
 use cubecl::frontend::{Float, SharedMemory};
 use cubecl::prelude::*;
 use rand::{rngs::SmallRng, Rng, SeedableRng};
+use cubecl_utils_rs::prelude::*;
 
-use crate::gpu::tensor::*;
 use crate::gpu::*;
 use crate::prelude::*;
 
@@ -801,8 +801,9 @@ pub fn cagra_search_batch_gpu<T, R>(
 ) -> KnnResult<T>
 where
     R: Runtime,
-    T: AnnSearchGpuFloat + num_traits::Float,
+    T: CubeclFloat + num_traits::Float,
 {
+    let limits = GpuLimits::from_client(client);
     let line = LINE_SIZE;
     let dim_padded = dim.next_multiple_of(line);
     let dim_vec = dim_padded / line;
@@ -823,7 +824,7 @@ where
     };
 
     let queries_gpu =
-        GpuTensor::<R, T>::from_slice(&queries_padded, vec![n_queries, dim_padded], client);
+        GpuTensor::<R, T>::from_slice(&queries_padded, vec![n_queries, dim_padded], client)?;
 
     // Entry points: use provided or fall back to random
     let entry_flat = match entry_points {
@@ -838,16 +839,27 @@ where
                 .collect()
         }
     };
-    let entry_gpu = GpuTensor::<R, u32>::from_slice(&entry_flat, vec![n_queries, n_entry], client);
+    let entry_gpu = GpuTensor::<R, u32>::from_slice(&entry_flat, vec![n_queries, n_entry], client)?;
 
     // Output tensors
-    let out_idx_gpu = GpuTensor::<R, u32>::empty(vec![n_queries, k_out], client);
-    let out_dist_gpu = GpuTensor::<R, T>::empty(vec![n_queries, k_out], client);
-    let out_iters_gpu = GpuTensor::<R, u32>::empty(vec![n_queries], client);
+    let out_idx_gpu = GpuTensor::<R, u32>::empty(vec![n_queries, k_out], client)?;
+    let out_dist_gpu = GpuTensor::<R, T>::empty(vec![n_queries, k_out], client)?;
+    let out_iters_gpu = GpuTensor::<R, u32>::empty(vec![n_queries], client)?;
 
     // 2D grid for large query counts
-    let cubes_x = (n_queries as u32).min(65535);
-    let cubes_y = (n_queries as u32).div_ceil(cubes_x);
+    let (cubes_x, cubes_y) = grid_2d(n_queries as u32, &limits)?;
+
+    // The hash table is the only elastic term in the kernel's shared-memory
+    // footprint; it shrinks on a device that cannot hold the preferred size.
+    let staging = plan_beam_search_staging(
+        dim_padded,
+        k_graph,
+        width,
+        expand,
+        HASH_SIZE,
+        size_of::<T>(),
+        &limits,
+    )?;
 
     unsafe {
         cagra_beam_search::launch_unchecked::<T, R>(
@@ -869,7 +881,7 @@ where
             use_cosine,
             dim_vec,
             width,
-            HASH_SIZE,
+            staging.hash_size,
             iters,
             n_entry,
             expand,
@@ -947,11 +959,15 @@ mod tests {
 
         let query: Vec<f32> = (0..dim).map(|j| j as f32 + 0.5).collect();
 
-        let vectors_gpu = GpuTensor::<WgpuRuntime, f32>::from_slice(&data, vec![n, dim], &client);
-        let query_gpu = GpuTensor::<WgpuRuntime, f32>::from_slice(&query, vec![dim], &client);
-        let out_dist = GpuTensor::<WgpuRuntime, f32>::from_slice(&[0.0f32; 1], vec![1], &client);
+        let vectors_gpu =
+            GpuTensor::<WgpuRuntime, f32>::from_slice(&data, vec![n, dim], &client).unwrap();
+        let query_gpu =
+            GpuTensor::<WgpuRuntime, f32>::from_slice(&query, vec![dim], &client).unwrap();
+        let out_dist =
+            GpuTensor::<WgpuRuntime, f32>::from_slice(&[0.0f32; 1], vec![1], &client).unwrap();
         let out_shared =
-            GpuTensor::<WgpuRuntime, f32>::from_slice(&vec![0.0f32; dim], vec![dim], &client);
+            GpuTensor::<WgpuRuntime, f32>::from_slice(&vec![0.0f32; dim], vec![dim], &client)
+                .unwrap();
 
         let target_node = 3u32;
 
@@ -1022,11 +1038,15 @@ mod tests {
 
         let query: Vec<f32> = (0..dim).map(|j| j as f32 + 0.5).collect();
 
-        let vectors_gpu = GpuTensor::<WgpuRuntime, f32>::from_slice(&data, vec![n, dim], &client);
-        let query_gpu = GpuTensor::<WgpuRuntime, f32>::from_slice(&query, vec![dim], &client);
-        let out_dist = GpuTensor::<WgpuRuntime, f32>::from_slice(&[0.0f32; 1], vec![1], &client);
+        let vectors_gpu =
+            GpuTensor::<WgpuRuntime, f32>::from_slice(&data, vec![n, dim], &client).unwrap();
+        let query_gpu =
+            GpuTensor::<WgpuRuntime, f32>::from_slice(&query, vec![dim], &client).unwrap();
+        let out_dist =
+            GpuTensor::<WgpuRuntime, f32>::from_slice(&[0.0f32; 1], vec![1], &client).unwrap();
         let out_shared =
-            GpuTensor::<WgpuRuntime, f32>::from_slice(&vec![0.0f32; dim], vec![dim], &client);
+            GpuTensor::<WgpuRuntime, f32>::from_slice(&vec![0.0f32; dim], vec![dim], &client)
+                .unwrap();
 
         let target_node = 5u32;
 
@@ -1074,14 +1094,17 @@ mod tests {
         let expected = [1u32, 1, 0, 1, 0, 1, 0];
 
         let insert_gpu =
-            GpuTensor::<WgpuRuntime, u32>::from_slice(&insert_ids, vec![insert_ids.len()], &client);
+            GpuTensor::<WgpuRuntime, u32>::from_slice(&insert_ids, vec![insert_ids.len()], &client)
+                .unwrap();
         let probe_gpu =
-            GpuTensor::<WgpuRuntime, u32>::from_slice(&probe_ids, vec![probe_ids.len()], &client);
+            GpuTensor::<WgpuRuntime, u32>::from_slice(&probe_ids, vec![probe_ids.len()], &client)
+                .unwrap();
         let results_gpu = GpuTensor::<WgpuRuntime, u32>::from_slice(
             &vec![0u32; probe_ids.len()],
             vec![probe_ids.len()],
             &client,
-        );
+        )
+        .unwrap();
 
         unsafe {
             probe_hash_table::launch_unchecked::<WgpuRuntime>(
@@ -1122,14 +1145,17 @@ mod tests {
         let expected = [1u32, 1, 1, 1, 0];
 
         let insert_gpu =
-            GpuTensor::<WgpuRuntime, u32>::from_slice(&insert_ids, vec![insert_ids.len()], &client);
+            GpuTensor::<WgpuRuntime, u32>::from_slice(&insert_ids, vec![insert_ids.len()], &client)
+                .unwrap();
         let probe_gpu =
-            GpuTensor::<WgpuRuntime, u32>::from_slice(&probe_ids, vec![probe_ids.len()], &client);
+            GpuTensor::<WgpuRuntime, u32>::from_slice(&probe_ids, vec![probe_ids.len()], &client)
+                .unwrap();
         let results_gpu = GpuTensor::<WgpuRuntime, u32>::from_slice(
             &vec![0u32; probe_ids.len()],
             vec![probe_ids.len()],
             &client,
-        );
+        )
+        .unwrap();
 
         unsafe {
             probe_hash_table::launch_unchecked::<WgpuRuntime>(
@@ -1169,14 +1195,17 @@ mod tests {
         let expected = [1u32, 1, 0];
 
         let insert_gpu =
-            GpuTensor::<WgpuRuntime, u32>::from_slice(&insert_ids, vec![insert_ids.len()], &client);
+            GpuTensor::<WgpuRuntime, u32>::from_slice(&insert_ids, vec![insert_ids.len()], &client)
+                .unwrap();
         let probe_gpu =
-            GpuTensor::<WgpuRuntime, u32>::from_slice(&probe_ids, vec![probe_ids.len()], &client);
+            GpuTensor::<WgpuRuntime, u32>::from_slice(&probe_ids, vec![probe_ids.len()], &client)
+                .unwrap();
         let results_gpu = GpuTensor::<WgpuRuntime, u32>::from_slice(
             &vec![0u32; probe_ids.len()],
             vec![probe_ids.len()],
             &client,
-        );
+        )
+        .unwrap();
 
         unsafe {
             probe_hash_table::launch_unchecked::<WgpuRuntime>(
@@ -1225,10 +1254,13 @@ mod tests {
 
         let graph_flat = build_brute_force_graph(&data, n, dim, k_graph);
 
-        let vectors_gpu = GpuTensor::<WgpuRuntime, f32>::from_slice(&data, vec![n, dim], &client);
-        let norms_gpu = GpuTensor::<WgpuRuntime, f32>::from_slice(&[0.0f32], vec![1], &client);
+        let vectors_gpu =
+            GpuTensor::<WgpuRuntime, f32>::from_slice(&data, vec![n, dim], &client).unwrap();
+        let norms_gpu =
+            GpuTensor::<WgpuRuntime, f32>::from_slice(&[0.0f32], vec![1], &client).unwrap();
         let graph_gpu =
-            GpuTensor::<WgpuRuntime, u32>::from_slice(&graph_flat, vec![n, k_graph], &client);
+            GpuTensor::<WgpuRuntime, u32>::from_slice(&graph_flat, vec![n, k_graph], &client)
+                .unwrap();
 
         let query = vec![0.0f32; dim];
 
@@ -1301,10 +1333,13 @@ mod tests {
             }
         }
 
-        let vectors_gpu = GpuTensor::<WgpuRuntime, f32>::from_slice(&data, vec![n, dim], &client);
-        let norms_gpu = GpuTensor::<WgpuRuntime, f32>::from_slice(&[0.0f32], vec![1], &client);
+        let vectors_gpu =
+            GpuTensor::<WgpuRuntime, f32>::from_slice(&data, vec![n, dim], &client).unwrap();
+        let norms_gpu =
+            GpuTensor::<WgpuRuntime, f32>::from_slice(&[0.0f32], vec![1], &client).unwrap();
         let graph_gpu =
-            GpuTensor::<WgpuRuntime, u32>::from_slice(&graph_flat, vec![n, k_graph], &client);
+            GpuTensor::<WgpuRuntime, u32>::from_slice(&graph_flat, vec![n, k_graph], &client)
+                .unwrap();
 
         let (gpu_indices, _) = cagra_search_batch_gpu(
             &queries,

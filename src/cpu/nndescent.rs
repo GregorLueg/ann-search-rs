@@ -124,6 +124,7 @@ impl<T: AnnSearchFloat> MetricFn<T> for ManhattanMetric {
 /// Annoy gives better init quality but can't handle Manhattan; KdForest
 /// handles all three metrics including Manhattan. Selection is automatic
 /// based on the metric.
+#[cfg_attr(feature = "serialise", derive(serde::Serialize, serde::Deserialize))]
 enum Forest<T> {
     /// Annoy version
     Annoy(AnnoyIndex<T>),
@@ -298,6 +299,7 @@ pub trait NNDescentQuery<T> {
 /// `O(chunk_size * max_candidates)` rather than `O(n * max_candidates)`.
 /// Each chunk emits both edge directions, sorts by target, and applies
 /// updates lock-free via disjoint pointer writes.
+#[cfg_attr(feature = "serialise", derive(serde::Serialize, serde::Deserialize))]
 pub struct NNDescent<T> {
     /// Original vectors, flattened row-major
     pub vectors_flat: Vec<T>,
@@ -1767,6 +1769,20 @@ where
 ///////////
 // Tests //
 ///////////
+
+/////////////
+// IndexIo //
+/////////////
+
+#[cfg(feature = "serialise")]
+impl<T> IndexIo for NNDescent<T>
+where
+    T: AnnSearchFloat,
+{
+    type Elem = T;
+
+    const KIND: &'static str = "nndescent";
+}
 
 #[cfg(test)]
 mod tests {

@@ -20,6 +20,7 @@ use crate::utils::k_means_utils::*;
 ////////////////
 
 /// IVF index with optimised product quantisation
+#[cfg_attr(feature = "serialise", derive(serde::Serialize, serde::Deserialize))]
 pub struct IvfOpqIndex<T> {
     ///Encoded vectors (M u8 codes per vector)
     quantised_codes: Vec<u8>,
@@ -558,6 +559,20 @@ where
 ///////////
 // Tests //
 ///////////
+
+/////////////
+// IndexIo //
+/////////////
+
+#[cfg(feature = "serialise")]
+impl<T> IndexIo for IvfOpqIndex<T>
+where
+    T: AnnSearchFloat,
+{
+    type Elem = T;
+
+    const KIND: &'static str = "ivf_opq";
+}
 
 #[cfg(test)]
 mod tests {

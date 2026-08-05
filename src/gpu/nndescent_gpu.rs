@@ -35,11 +35,11 @@ use faer::MatRef;
 use rayon::prelude::*;
 use std::time::Instant;
 use thousands::*;
+use cubecl_utils_rs::prelude::*;
 
 use crate::cpu::vamana::compute_medoid;
 use crate::gpu::cagra_gpu_search::*;
 use crate::gpu::forest_gpu::*;
-use crate::gpu::tensor::*;
 use crate::gpu::*;
 use crate::prelude::*;
 use crate::utils::nndescent_utils::SENTINEL_PID;
@@ -1345,7 +1345,7 @@ pub fn cagra_merge_graphs(
 /// The final graph has exactly `k` neighbours per node (the user-requested
 /// degree). Internally, NNDescent runs at a higher degree (`build_k`, default
 /// `2*k`) which CAGRA then prunes down to `k`.
-pub struct NNDescentGpu<T: AnnSearchFloat + AnnSearchGpuFloat, R: Runtime> {
+pub struct NNDescentGpu<T: AnnSearchFloat + CubeclFloat, R: Runtime> {
     /// Original (unpadded) vector data, flattened row-major
     pub vectors_flat: Vec<T>,
     /// Original embedding dimensionality
@@ -1391,7 +1391,7 @@ pub struct NNDescentGpu<T: AnnSearchFloat + AnnSearchGpuFloat, R: Runtime> {
 /// VectorDistance implementation for NNDescentGPU
 impl<T, R> VectorDistance<T> for NNDescentGpu<T, R>
 where
-    T: AnnSearchFloat + AnnSearchGpuFloat,
+    T: AnnSearchFloat + CubeclFloat,
     R: Runtime,
 {
     fn vectors_flat(&self) -> &[T] {
@@ -1412,7 +1412,7 @@ where
 impl<T, R> DimensionValidation for NNDescentGpu<T, R>
 where
     R: Runtime,
-    T: AnnSearchGpuFloat + AnnSearchFloat,
+    T: CubeclFloat + AnnSearchFloat,
 {
     // needs to be allowed here, because dim_padded is the relevant dim for GPU
     // indices
@@ -1429,7 +1429,7 @@ where
 impl<T, R> NNDescentGpu<T, R>
 where
     R: Runtime,
-    T: AnnSearchFloat + AnnSearchGpuFloat,
+    T: AnnSearchFloat + CubeclFloat,
 {
     /// Distance metric this index was built with.
     ///
@@ -1558,17 +1558,18 @@ where
         });
 
         let client = R::client(&device);
+        let limits = GpuLimits::from_client(&client);
         let use_cosine = metric == Dist::Cosine;
 
         // upload vectors (stays resident for the entire build)
         let vectors_gpu =
-            GpuTensor::<R, T>::from_slice(&vectors_padded, vec![n, dim_padded], &client);
+            GpuTensor::<R, T>::from_slice(&vectors_padded, vec![n, dim_padded], &client)?;
 
         // norms tensor (dummy scalar if Euclidean to avoid Option in kernel args)
         let norms_gpu = if use_cosine {
-            GpuTensor::<R, T>::from_slice(&norms, vec![n], &client)
+            GpuTensor::<R, T>::from_slice(&norms, vec![n], &client)?
         } else {
-            GpuTensor::<R, T>::from_slice(&[T::zero()], vec![1], &client)
+            GpuTensor::<R, T>::from_slice(&[T::zero()], vec![1], &client)?
         };
 
         // Pre-allocate graph with sentinels
@@ -1576,28 +1577,23 @@ where
             &vec![0x7FFFFFFFu32; n * build_k],
             vec![n, build_k],
             &client,
-        );
+        )?;
         let graph_dist_gpu = GpuTensor::<R, T>::from_slice(
             &vec![<T as num_traits::Float>::max_value(); n * build_k],
             vec![n, build_k],
             &client,
-        );
+        )?;
 
         // Proposal buffers (shared between forest init and NNDescent iterations)
         let max_prop = MAX_PROPOSALS;
-        let prop_idx_gpu = GpuTensor::<R, u32>::empty(vec![n, max_prop], &client);
-        let prop_dist_gpu = GpuTensor::<R, T>::empty(vec![n, max_prop], &client);
-        let prop_count_gpu = GpuTensor::<R, u32>::empty(vec![n], &client);
-        let update_counter_gpu = GpuTensor::<R, u32>::empty(vec![1], &client);
+        let prop_idx_gpu = GpuTensor::<R, u32>::empty(vec![n, max_prop], &client)?;
+        let prop_dist_gpu = GpuTensor::<R, T>::empty(vec![n, max_prop], &client)?;
+        let prop_count_gpu = GpuTensor::<R, u32>::empty(vec![n], &client)?;
+        let update_counter_gpu = GpuTensor::<R, u32>::empty(vec![1], &client)?;
 
-        let (grid_n_x, grid_n_y) = grid_2d((n as u32).div_ceil(WORKGROUP_SIZE_X));
+        let (grid_n_x, grid_n_y) = grid_2d((n as u32).div_ceil(WORKGROUP_SIZE_X), &limits)?;
 
-        let staging = plan_local_join_staging(
-            dim_padded,
-            build_k * 2,
-            size_of::<T>(),
-            client.properties().hardware.max_shared_memory_size,
-        )?;
+        let staging = plan_local_join_staging(dim_padded, build_k * 2, size_of::<T>(), &limits)?;
 
         // 1: random graph initialisation (baseline for NNDescent)
         if verbose {
@@ -1644,8 +1640,7 @@ where
         // 1c: Mark all graph entries as new for NNDescent
         let total_entries = (n * build_k) as u32;
         let mark_grid_flat = total_entries.div_ceil(WORKGROUP_SIZE_X);
-        let mark_cubes_x = mark_grid_flat.min(65535);
-        let mark_cubes_y = mark_grid_flat.div_ceil(mark_cubes_x);
+        let (mark_cubes_x, mark_cubes_y) = grid_2d(mark_grid_flat, &limits)?;
         unsafe {
             mark_all_new::launch_unchecked::<R>(
                 &client,
@@ -1661,13 +1656,13 @@ where
         let iter_start = Instant::now();
         let mut converged = false;
 
-        let reverse_idx_gpu = GpuTensor::<R, u32>::empty(vec![n, build_k], &client);
-        let reverse_count_gpu = GpuTensor::<R, u32>::empty(vec![n], &client);
+        let reverse_idx_gpu = GpuTensor::<R, u32>::empty(vec![n, build_k], &client)?;
+        let reverse_count_gpu = GpuTensor::<R, u32>::empty(vec![n], &client)?;
 
         for iter in 0..max_iters {
             // One cube per node. `grid_2d` clamps to the 65535 per-dim limit
             // without over-dispatching when n is below it.
-            let (cubes_x, cubes_y) = grid_2d(n as u32);
+            let (cubes_x, cubes_y) = grid_2d(n as u32, &limits)?;
 
             // 1. Reset proposal counts, reverse counts, and update counter
             unsafe {
@@ -1789,8 +1784,16 @@ where
 
         let refinement_start = Instant::now();
 
+        // `shared_source` stages one padded vector, `shared_worst_dist` one
+        // scalar and `shared_own` the node's own `build_k` neighbour ids.
+        fits_shared_memory(
+            "two_hop_refinement",
+            dim_padded * size_of::<T>() + size_of::<T>() + build_k * 4,
+            &limits,
+        )?;
+
         // One cube per node.
-        let (cubes_x, cubes_y) = grid_2d(n as u32);
+        let (cubes_x, cubes_y) = grid_2d(n as u32, &limits)?;
 
         for sweep in 0..refine_knn {
             unsafe {
@@ -1890,13 +1893,16 @@ where
 
         let cagra_start = Instant::now();
 
-        let pruned_idx_gpu = GpuTensor::<R, u32>::empty(vec![n, k], &client);
-        let reverse_idx_gpu = GpuTensor::<R, u32>::empty(vec![n, k], &client);
-        let reverse_counts_gpu = GpuTensor::<R, u32>::from_slice(&vec![0u32; n], vec![n], &client);
-        let final_idx_gpu = GpuTensor::<R, u32>::empty(vec![n, k], &client);
+        let pruned_idx_gpu = GpuTensor::<R, u32>::empty(vec![n, k], &client)?;
+        let reverse_idx_gpu = GpuTensor::<R, u32>::empty(vec![n, k], &client)?;
+        let reverse_counts_gpu = GpuTensor::<R, u32>::from_slice(&vec![0u32; n], vec![n], &client)?;
+        let final_idx_gpu = GpuTensor::<R, u32>::empty(vec![n, k], &client)?;
+
+        // `shared_neighbors` and `shared_detours`, one u32 each per neighbour.
+        fits_shared_memory("cagra_rank_prune_shared", 2 * k * 4, &limits)?;
 
         // One cube per node.
-        let (cubes_x, cubes_y) = grid_2d(n as u32);
+        let (cubes_x, cubes_y) = grid_2d(n as u32, &limits)?;
 
         unsafe {
             cagra_rank_prune_shared::launch_unchecked::<R>(
@@ -2007,7 +2013,7 @@ where
         seed: usize,
     ) -> KnnResult<T>
     where
-        T: AnnSearchGpuFloat + num_traits::Float,
+        T: CubeclFloat + num_traits::Float,
     {
         let dim_query = queries_flat.len() / n_queries;
 
@@ -2016,7 +2022,7 @@ where
         let query_params =
             query_params.unwrap_or_else(|| CagraGpuSearchParams::from_graph(k, self.k));
         let n_entry = query_params.get_n_entry();
-        self.ensure_gpu_tensors();
+        self.ensure_gpu_tensors()?;
         let client = R::client(&self._device);
         let use_cosine = self.metric == Dist::Cosine;
 
@@ -2187,9 +2193,9 @@ where
         seed: usize,
     ) -> KnnResult<T>
     where
-        T: AnnSearchGpuFloat + AnnSearchFloat,
+        T: CubeclFloat + AnnSearchFloat,
     {
-        self.ensure_gpu_tensors();
+        self.ensure_gpu_tensors()?;
 
         let query_params =
             query_params.unwrap_or_else(|| CagraGpuSearchParams::from_graph(k, self.k));
@@ -2252,9 +2258,14 @@ where
     ///
     /// * `&mut self` - Mutates `vectors_gpu`, `norms_gpu`, and `nav_graph_gpu`
     ///   in place if they are `None`
-    fn ensure_gpu_tensors(&mut self) {
+    ///
+    /// ### Returns
+    ///
+    /// `Ok(())`, or `BindingTooLarge` when the re-upload does not fit one
+    /// binding on this device.
+    fn ensure_gpu_tensors(&mut self) -> Result<(), AnnSearchErrors> {
         if self.nav_graph_gpu.is_some() {
-            return;
+            return Ok(());
         }
 
         let client = R::client(&self._device);
@@ -2269,19 +2280,21 @@ where
             &vectors_padded,
             vec![self.n, dim_padded],
             &client,
-        ));
+        )?);
 
         self.norms_gpu = Some(if self.metric == Dist::Cosine {
-            GpuTensor::<R, T>::from_slice(&self.norms, vec![self.n], &client)
+            GpuTensor::<R, T>::from_slice(&self.norms, vec![self.n], &client)?
         } else {
-            GpuTensor::<R, T>::from_slice(&[T::zero()], vec![1], &client)
+            GpuTensor::<R, T>::from_slice(&[T::zero()], vec![1], &client)?
         });
 
         self.nav_graph_gpu = Some(GpuTensor::<R, u32>::from_slice(
             &self.nav_graph,
             vec![self.n, self.k],
             &client,
-        ));
+        )?);
+
+        Ok(())
     }
 }
 
@@ -2367,7 +2380,7 @@ pub fn build_knn_graph_gpu<T, R>(
     device: R::Device,
 ) -> Result<KnnGraphGpu<T>, AnnSearchErrors>
 where
-    T: AnnSearchFloat + AnnSearchGpuFloat,
+    T: AnnSearchFloat + CubeclFloat,
     R: Runtime,
 {
     if metric == Dist::Manhattan {
@@ -2423,41 +2436,37 @@ where
     });
 
     let client = R::client(&device);
+    let limits = GpuLimits::from_client(&client);
     let use_cosine = metric == Dist::Cosine;
 
-    let vectors_gpu = GpuTensor::<R, T>::from_slice(&vectors_padded, vec![n, dim_padded], &client);
+    let vectors_gpu = GpuTensor::<R, T>::from_slice(&vectors_padded, vec![n, dim_padded], &client)?;
 
     let norms_gpu = if use_cosine {
-        GpuTensor::<R, T>::from_slice(&norms, vec![n], &client)
+        GpuTensor::<R, T>::from_slice(&norms, vec![n], &client)?
     } else {
-        GpuTensor::<R, T>::from_slice(&[T::zero()], vec![1], &client)
+        GpuTensor::<R, T>::from_slice(&[T::zero()], vec![1], &client)?
     };
 
     let graph_idx_gpu = GpuTensor::<R, u32>::from_slice(
         &vec![0x7FFFFFFFu32; n * build_k],
         vec![n, build_k],
         &client,
-    );
+    )?;
     let graph_dist_gpu = GpuTensor::<R, T>::from_slice(
         &vec![<T as num_traits::Float>::max_value(); n * build_k],
         vec![n, build_k],
         &client,
-    );
+    )?;
 
     let max_prop = MAX_PROPOSALS;
-    let prop_idx_gpu = GpuTensor::<R, u32>::empty(vec![n, max_prop], &client);
-    let prop_dist_gpu = GpuTensor::<R, T>::empty(vec![n, max_prop], &client);
-    let prop_count_gpu = GpuTensor::<R, u32>::empty(vec![n], &client);
-    let update_counter_gpu = GpuTensor::<R, u32>::empty(vec![1], &client);
+    let prop_idx_gpu = GpuTensor::<R, u32>::empty(vec![n, max_prop], &client)?;
+    let prop_dist_gpu = GpuTensor::<R, T>::empty(vec![n, max_prop], &client)?;
+    let prop_count_gpu = GpuTensor::<R, u32>::empty(vec![n], &client)?;
+    let update_counter_gpu = GpuTensor::<R, u32>::empty(vec![1], &client)?;
 
-    let (grid_n_x, grid_n_y) = grid_2d((n as u32).div_ceil(WORKGROUP_SIZE_X));
+    let (grid_n_x, grid_n_y) = grid_2d((n as u32).div_ceil(WORKGROUP_SIZE_X), &limits)?;
 
-    let staging = plan_local_join_staging(
-        dim_padded,
-        build_k * 2,
-        size_of::<T>(),
-        client.properties().hardware.max_shared_memory_size,
-    )?;
+    let staging = plan_local_join_staging(dim_padded, build_k * 2, size_of::<T>(), &limits)?;
 
     // ---- Random graph initialisation ----
 
@@ -2506,8 +2515,7 @@ where
 
     let total_entries = (n * build_k) as u32;
     let mark_grid_flat = total_entries.div_ceil(WORKGROUP_SIZE_X);
-    let mark_cubes_x = mark_grid_flat.min(65535);
-    let mark_cubes_y = mark_grid_flat.div_ceil(mark_cubes_x);
+    let (mark_cubes_x, mark_cubes_y) = grid_2d(mark_grid_flat, &limits)?;
     unsafe {
         mark_all_new::launch_unchecked::<R>(
             &client,
@@ -2523,12 +2531,11 @@ where
     let iter_start = Instant::now();
     let mut converged = false;
 
-    let reverse_idx_gpu = GpuTensor::<R, u32>::empty(vec![n, build_k], &client);
-    let reverse_count_gpu = GpuTensor::<R, u32>::empty(vec![n], &client);
+    let reverse_idx_gpu = GpuTensor::<R, u32>::empty(vec![n, build_k], &client)?;
+    let reverse_count_gpu = GpuTensor::<R, u32>::empty(vec![n], &client)?;
 
     for iter in 0..max_iters {
-        let cubes_x = 65535u32;
-        let cubes_y = (n as u32).div_ceil(cubes_x);
+        let (cubes_x, cubes_y) = grid_2d(n as u32, &limits)?;
 
         unsafe {
             reset_proposals::launch_unchecked::<R>(
@@ -2644,8 +2651,16 @@ where
     }
 
     let refinement_start = Instant::now();
-    let cubes_x = 65535u32;
-    let cubes_y = (n as u32).div_ceil(cubes_x);
+
+    // `shared_source` stages one padded vector, `shared_worst_dist` one scalar
+    // and `shared_own` the node's own `build_k` neighbour ids.
+    fits_shared_memory(
+        "two_hop_refinement",
+        dim_padded * size_of::<T>() + size_of::<T>() + build_k * 4,
+        &limits,
+    )?;
+
+    let (cubes_x, cubes_y) = grid_2d(n as u32, &limits)?;
 
     for sweep in 0..refine_knn {
         unsafe {
@@ -2963,8 +2978,9 @@ mod kernel_tests {
         let data: Vec<f32> = (0..n * dim_padded).map(|i| i as f32).collect();
 
         let vectors_gpu =
-            GpuTensor::<WgpuRuntime, f32>::from_slice(&data, vec![n, dim_padded], &client);
-        let out_gpu = GpuTensor::<WgpuRuntime, u32>::from_slice(&[0u32; 4], vec![4], &client);
+            GpuTensor::<WgpuRuntime, f32>::from_slice(&data, vec![n, dim_padded], &client).unwrap();
+        let out_gpu =
+            GpuTensor::<WgpuRuntime, u32>::from_slice(&[0u32; 4], vec![4], &client).unwrap();
 
         unsafe {
             probe_stride::launch_unchecked::<f32, WgpuRuntime>(
@@ -3042,13 +3058,15 @@ mod kernel_tests {
             }
         }
 
-        let vectors_gpu = GpuTensor::<WgpuRuntime, f32>::from_slice(&data, vec![n, dim], &client);
+        let vectors_gpu =
+            GpuTensor::<WgpuRuntime, f32>::from_slice(&data, vec![n, dim], &client).unwrap();
 
         // Read each row and verify
         for row in 0..n {
             // Reset output
             let out_gpu =
-                GpuTensor::<WgpuRuntime, f32>::from_slice(&vec![-1.0f32; dim], vec![dim], &client);
+                GpuTensor::<WgpuRuntime, f32>::from_slice(&vec![-1.0f32; dim], vec![dim], &client)
+                    .unwrap();
 
             unsafe {
                 read_vector_via_stride::launch_unchecked::<f32, WgpuRuntime>(
@@ -3135,18 +3153,22 @@ mod kernel_tests {
 
         let n_pairs = n * (n - 1) / 2; // 6
 
-        let vectors_gpu = GpuTensor::<WgpuRuntime, f32>::from_slice(&data, vec![n, dim], &client);
-        let norms_gpu = GpuTensor::<WgpuRuntime, f32>::from_slice(&[0.0f32], vec![1], &client);
+        let vectors_gpu =
+            GpuTensor::<WgpuRuntime, f32>::from_slice(&data, vec![n, dim], &client).unwrap();
+        let norms_gpu =
+            GpuTensor::<WgpuRuntime, f32>::from_slice(&[0.0f32], vec![1], &client).unwrap();
         let out_euclid = GpuTensor::<WgpuRuntime, f32>::from_slice(
             &vec![0.0f32; n_pairs],
             vec![n_pairs],
             &client,
-        );
+        )
+        .unwrap();
         let out_cosine = GpuTensor::<WgpuRuntime, f32>::from_slice(
             &vec![0.0f32; n_pairs],
             vec![n_pairs],
             &client,
-        );
+        )
+        .unwrap();
 
         unsafe {
             compute_pairwise_dist::launch_unchecked::<f32, WgpuRuntime>(
@@ -3224,18 +3246,22 @@ mod kernel_tests {
         // norms = [1.0, 1.0, sqrt(2), 1.0]
 
         let n_pairs = n * (n - 1) / 2;
-        let vectors_gpu = GpuTensor::<WgpuRuntime, f32>::from_slice(&data, vec![n, dim], &client);
-        let norms_gpu = GpuTensor::<WgpuRuntime, f32>::from_slice(&norms, vec![n], &client);
+        let vectors_gpu =
+            GpuTensor::<WgpuRuntime, f32>::from_slice(&data, vec![n, dim], &client).unwrap();
+        let norms_gpu =
+            GpuTensor::<WgpuRuntime, f32>::from_slice(&norms, vec![n], &client).unwrap();
         let out_euclid = GpuTensor::<WgpuRuntime, f32>::from_slice(
             &vec![0.0f32; n_pairs],
             vec![n_pairs],
             &client,
-        );
+        )
+        .unwrap();
         let out_cosine = GpuTensor::<WgpuRuntime, f32>::from_slice(
             &vec![0.0f32; n_pairs],
             vec![n_pairs],
             &client,
-        );
+        )
+        .unwrap();
 
         unsafe {
             compute_pairwise_dist::launch_unchecked::<f32, WgpuRuntime>(
@@ -3299,6 +3325,7 @@ mod kernel_tests {
         };
 
         let client = WgpuRuntime::client(&device);
+        let limits = GpuLimits::from_client(&client);
         let line: usize = LINE_SIZE;
 
         let n = 8usize;
@@ -3342,37 +3369,38 @@ mod kernel_tests {
             }
         }
 
-        let vectors_gpu = GpuTensor::<WgpuRuntime, f32>::from_slice(&data, vec![n, dim], &client);
-        let norms_gpu = GpuTensor::<WgpuRuntime, f32>::from_slice(&norms, vec![n], &client);
+        let vectors_gpu =
+            GpuTensor::<WgpuRuntime, f32>::from_slice(&data, vec![n, dim], &client).unwrap();
+        let norms_gpu =
+            GpuTensor::<WgpuRuntime, f32>::from_slice(&norms, vec![n], &client).unwrap();
         let graph_idx_gpu =
-            GpuTensor::<WgpuRuntime, u32>::from_slice(&graph_idx, vec![n, build_k], &client);
+            GpuTensor::<WgpuRuntime, u32>::from_slice(&graph_idx, vec![n, build_k], &client)
+                .unwrap();
         let graph_dist_gpu =
-            GpuTensor::<WgpuRuntime, f32>::from_slice(&graph_dist, vec![n, build_k], &client);
+            GpuTensor::<WgpuRuntime, f32>::from_slice(&graph_dist, vec![n, build_k], &client)
+                .unwrap();
 
         // Empty reverse edges (no reverse pass for this test)
         let reverse_idx_gpu = GpuTensor::<WgpuRuntime, u32>::from_slice(
             &vec![0u32; n * build_k],
             vec![n, build_k],
             &client,
-        );
+        )
+        .unwrap();
         let reverse_count_gpu =
-            GpuTensor::<WgpuRuntime, u32>::from_slice(&vec![0u32; n], vec![n], &client);
+            GpuTensor::<WgpuRuntime, u32>::from_slice(&vec![0u32; n], vec![n], &client).unwrap();
 
         let max_prop = MAX_PROPOSALS;
-        let prop_idx_gpu = GpuTensor::<WgpuRuntime, u32>::empty(vec![n, max_prop], &client);
-        let prop_dist_gpu = GpuTensor::<WgpuRuntime, f32>::empty(vec![n, max_prop], &client);
+        let prop_idx_gpu =
+            GpuTensor::<WgpuRuntime, u32>::empty(vec![n, max_prop], &client).unwrap();
+        let prop_dist_gpu =
+            GpuTensor::<WgpuRuntime, f32>::empty(vec![n, max_prop], &client).unwrap();
         let prop_count_gpu =
-            GpuTensor::<WgpuRuntime, u32>::from_slice(&vec![0u32; n], vec![n], &client);
+            GpuTensor::<WgpuRuntime, u32>::from_slice(&vec![0u32; n], vec![n], &client).unwrap();
 
         let rho_thresh = 65535u32; // rho=1.0, accept all pairs
 
-        let staging = plan_local_join_staging(
-            dim,
-            build_k * 2,
-            size_of::<f32>(),
-            client.properties().hardware.max_shared_memory_size,
-        )
-        .unwrap();
+        let staging = plan_local_join_staging(dim, build_k * 2, size_of::<f32>(), &limits).unwrap();
 
         unsafe {
             local_join_shared::launch_unchecked::<f32, WgpuRuntime>(
@@ -3495,16 +3523,21 @@ mod kernel_tests {
         prop_count[0] = 2;
 
         let graph_idx_gpu =
-            GpuTensor::<WgpuRuntime, u32>::from_slice(&graph_idx_data, vec![n, k], &client);
+            GpuTensor::<WgpuRuntime, u32>::from_slice(&graph_idx_data, vec![n, k], &client)
+                .unwrap();
         let graph_dist_gpu =
-            GpuTensor::<WgpuRuntime, f32>::from_slice(&graph_dist_data, vec![n, k], &client);
+            GpuTensor::<WgpuRuntime, f32>::from_slice(&graph_dist_data, vec![n, k], &client)
+                .unwrap();
         let prop_idx_gpu =
-            GpuTensor::<WgpuRuntime, u32>::from_slice(&prop_idx, vec![n, MAX_PROPOSALS], &client);
+            GpuTensor::<WgpuRuntime, u32>::from_slice(&prop_idx, vec![n, MAX_PROPOSALS], &client)
+                .unwrap();
         let prop_dist_gpu =
-            GpuTensor::<WgpuRuntime, f32>::from_slice(&prop_dist, vec![n, MAX_PROPOSALS], &client);
+            GpuTensor::<WgpuRuntime, f32>::from_slice(&prop_dist, vec![n, MAX_PROPOSALS], &client)
+                .unwrap();
         let prop_count_gpu =
-            GpuTensor::<WgpuRuntime, u32>::from_slice(&prop_count, vec![n], &client);
-        let update_counter = GpuTensor::<WgpuRuntime, u32>::from_slice(&[0u32], vec![1], &client);
+            GpuTensor::<WgpuRuntime, u32>::from_slice(&prop_count, vec![n], &client).unwrap();
+        let update_counter =
+            GpuTensor::<WgpuRuntime, u32>::from_slice(&[0u32], vec![1], &client).unwrap();
 
         let grid_n = (n as u32).div_ceil(WORKGROUP_SIZE_X);
 
@@ -3607,19 +3640,24 @@ mod kernel_tests {
         prop_count2[0] = 1;
 
         let graph_idx_gpu2 =
-            GpuTensor::<WgpuRuntime, u32>::from_slice(&graph_idx_data2, vec![n2, k2], &client);
+            GpuTensor::<WgpuRuntime, u32>::from_slice(&graph_idx_data2, vec![n2, k2], &client)
+                .unwrap();
         let graph_dist_gpu2 =
-            GpuTensor::<WgpuRuntime, f32>::from_slice(&graph_dist_data2, vec![n2, k2], &client);
+            GpuTensor::<WgpuRuntime, f32>::from_slice(&graph_dist_data2, vec![n2, k2], &client)
+                .unwrap();
         let prop_idx_gpu2 =
-            GpuTensor::<WgpuRuntime, u32>::from_slice(&prop_idx2, vec![n2, MAX_PROPOSALS], &client);
+            GpuTensor::<WgpuRuntime, u32>::from_slice(&prop_idx2, vec![n2, MAX_PROPOSALS], &client)
+                .unwrap();
         let prop_dist_gpu2 = GpuTensor::<WgpuRuntime, f32>::from_slice(
             &prop_dist2,
             vec![n2, MAX_PROPOSALS],
             &client,
-        );
+        )
+        .unwrap();
         let prop_count_gpu2 =
-            GpuTensor::<WgpuRuntime, u32>::from_slice(&prop_count2, vec![n2], &client);
-        let update_counter2 = GpuTensor::<WgpuRuntime, u32>::from_slice(&[0u32], vec![1], &client);
+            GpuTensor::<WgpuRuntime, u32>::from_slice(&prop_count2, vec![n2], &client).unwrap();
+        let update_counter2 =
+            GpuTensor::<WgpuRuntime, u32>::from_slice(&[0u32], vec![1], &client).unwrap();
 
         let grid_n2 = (n2 as u32).div_ceil(WORKGROUP_SIZE_X);
 
@@ -3768,8 +3806,10 @@ mod kernel_tests {
             .map(|i| ((i % 7) as f32) * 0.1 + (i / dim) as f32)
             .collect();
 
-        let vectors_gpu = GpuTensor::<WgpuRuntime, f32>::from_slice(&data, vec![n, dim], &client);
-        let norms_gpu = GpuTensor::<WgpuRuntime, f32>::from_slice(&[0.0f32], vec![1], &client);
+        let vectors_gpu =
+            GpuTensor::<WgpuRuntime, f32>::from_slice(&data, vec![n, dim], &client).unwrap();
+        let norms_gpu =
+            GpuTensor::<WgpuRuntime, f32>::from_slice(&[0.0f32], vec![1], &client).unwrap();
 
         // Compute dist(0, 1) on GPU via dist_sq_euclidean
         // We need a tiny wrapper kernel:
@@ -3780,12 +3820,14 @@ mod kernel_tests {
             &vec![0.0f32; n_pairs],
             vec![n_pairs],
             &client,
-        );
+        )
+        .unwrap();
         let out_cos = GpuTensor::<WgpuRuntime, f32>::from_slice(
             &vec![0.0f32; n_pairs],
             vec![n_pairs],
             &client,
-        );
+        )
+        .unwrap();
 
         unsafe {
             compute_pairwise_dist::launch_unchecked::<f32, WgpuRuntime>(
@@ -3937,14 +3979,18 @@ mod kernel_tests {
             })
             .collect();
 
-        let vectors_gpu = GpuTensor::<WgpuRuntime, f32>::from_slice(&data, vec![n, dim], &client);
-        let norms_gpu = GpuTensor::<WgpuRuntime, f32>::from_slice(&norms, vec![n], &client);
-        let out_dist = GpuTensor::<WgpuRuntime, f32>::from_slice(&[0.0f32; 4], vec![4], &client);
+        let vectors_gpu =
+            GpuTensor::<WgpuRuntime, f32>::from_slice(&data, vec![n, dim], &client).unwrap();
+        let norms_gpu =
+            GpuTensor::<WgpuRuntime, f32>::from_slice(&norms, vec![n], &client).unwrap();
+        let out_dist =
+            GpuTensor::<WgpuRuntime, f32>::from_slice(&[0.0f32; 4], vec![4], &client).unwrap();
         let out_raw = GpuTensor::<WgpuRuntime, f32>::from_slice(
             &vec![0.0f32; 2 * dim],
             vec![2 * dim],
             &client,
-        );
+        )
+        .unwrap();
 
         // Test distance between rows 0 and 1
         let pid_a = 0u32;

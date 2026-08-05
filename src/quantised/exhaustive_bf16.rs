@@ -20,6 +20,7 @@ use crate::utils::matrix_to_flat;
 ///
 /// Uses under the hood bf16 quantisation for reduced memory finger print and
 /// increased query speed at cost of precision.
+#[cfg_attr(feature = "serialise", derive(serde::Serialize, serde::Deserialize))]
 pub struct ExhaustiveIndexBf16<T> {
     /// Original vector data for distance calculations. Flattened for better
     /// cache locality and quantised to bf16
@@ -364,6 +365,20 @@ where
 ///////////
 // Tests //
 ///////////
+
+/////////////
+// IndexIo //
+/////////////
+
+#[cfg(feature = "serialise")]
+impl<T> IndexIo for ExhaustiveIndexBf16<T>
+where
+    T: AnnSearchFloat,
+{
+    type Elem = T;
+
+    const KIND: &'static str = "exhaustive_bf16";
+}
 
 #[cfg(test)]
 mod tests {

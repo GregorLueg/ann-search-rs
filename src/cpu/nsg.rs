@@ -358,6 +358,7 @@ impl<T: Copy + PartialOrd> NsgConstructionGraph<T> {
 /// The final layout is a flat `n * R` `u32` adjacency array plus a single
 /// entry-point node id (the *navigating node*). Search is a greedy beam
 /// walk over the graph starting from that entry point.
+#[cfg_attr(feature = "serialise", derive(serde::Serialize, serde::Deserialize))]
 pub struct NsgIndex<T> {
     /// Row-major flattened vectors
     pub vectors_flat: Vec<T>,
@@ -1756,6 +1757,20 @@ where
 ///////////
 // Tests //
 ///////////
+
+/////////////
+// IndexIo //
+/////////////
+
+#[cfg(feature = "serialise")]
+impl<T> IndexIo for NsgIndex<T>
+where
+    T: AnnSearchFloat,
+{
+    type Elem = T;
+
+    const KIND: &'static str = "nsg";
+}
 
 #[cfg(test)]
 mod tests {

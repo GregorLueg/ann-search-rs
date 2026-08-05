@@ -7,9 +7,9 @@ use num_traits::Float;
 use rayon::prelude::*;
 use std::iter::Sum;
 use thousands::*;
+use cubecl_utils_rs::prelude::*;
 
 use crate::gpu::dist_gpu::*;
-use crate::gpu::tensor::*;
 use crate::gpu::*;
 use crate::prelude::*;
 use crate::utils::dist::Dist;
@@ -48,7 +48,7 @@ const CANDIDATE_SCRATCH_HEADROOM_DIV: usize = 4;
 ///
 /// * `T` - Float type (f32 or f64)
 /// * `R` - CubeCL runtime
-pub struct IvfIndexGpu<T: AnnSearchFloat + AnnSearchGpuFloat, R: Runtime> {
+pub struct IvfIndexGpu<T: AnnSearchFloat + CubeclFloat, R: Runtime> {
     /// All vectors reorganised by cluster, resident on GPU
     vectors_gpu: GpuTensor<R, T>,
     /// All norms reorganised by cluster, resident on GPU (Cosine only)
@@ -83,7 +83,7 @@ pub struct IvfIndexGpu<T: AnnSearchFloat + AnnSearchGpuFloat, R: Runtime> {
 /// The mega kernel's first write to a fresh allocation faults its pages in,
 /// which measures ~39 ms per call at 15k queries and dominates the kernel's own
 /// ~22 ms. Holding the buffers across batches confines that to the first batch.
-struct CandidateScratch<R: Runtime, T: AnnSearchFloat + AnnSearchGpuFloat> {
+struct CandidateScratch<R: Runtime, T: AnnSearchFloat + CubeclFloat> {
     /// Candidate distances, flat; viewed as `[n_queries, max_candidates]`
     dists: GpuTensor<R, T>,
     /// Candidate indices, flat; viewed as `[n_queries, max_candidates]`
@@ -99,7 +99,7 @@ struct CandidateScratch<R: Runtime, T: AnnSearchFloat + AnnSearchGpuFloat> {
 impl<T, R> DimensionValidation for IvfIndexGpu<T, R>
 where
     R: Runtime,
-    T: AnnSearchGpuFloat + AnnSearchFloat,
+    T: CubeclFloat + AnnSearchFloat,
 {
     // needs to be allowed here, because dim_padded is the relevant dim for GPU
     // indices
@@ -116,7 +116,7 @@ where
 impl<T, R> IvfIndexGpu<T, R>
 where
     R: Runtime,
-    T: AnnSearchFloat + AnnSearchGpuFloat,
+    T: AnnSearchFloat + CubeclFloat,
 {
     /// Build a batched IVF index
     ///
@@ -226,27 +226,27 @@ where
         let vectors_cpu = vectors_padded.clone();
 
         let vectors_gpu =
-            GpuTensor::<R, T>::from_slice(&vectors_padded, vec![n, dim_padded], &client);
+            GpuTensor::<R, T>::from_slice(&vectors_padded, vec![n, dim_padded], &client)?;
 
         let norms_gpu = if metric == Dist::Cosine {
             Some(GpuTensor::<R, T>::from_slice(
                 &norms_by_cluster,
                 vec![n],
                 &client,
-            ))
+            )?)
         } else {
             None
         };
 
         let centroids_gpu =
-            GpuTensor::<R, T>::from_slice(&centroids_padded, vec![nlist, dim_padded], &client);
+            GpuTensor::<R, T>::from_slice(&centroids_padded, vec![nlist, dim_padded], &client)?;
 
         let centroid_norms_gpu = if metric == Dist::Cosine {
             Some(GpuTensor::<R, T>::from_slice(
                 &centroid_norms,
                 vec![nlist],
                 &client,
-            ))
+            )?)
         } else {
             None
         };
@@ -319,8 +319,14 @@ where
 
         if n_batches == 1 {
             let mut scratch = None;
-            let res =
-                self.query_batch_internal(queries_flat, n_queries, k, nprobe, client, &mut scratch)?;
+            let res = self.query_batch_internal(
+                queries_flat,
+                n_queries,
+                k,
+                nprobe,
+                client,
+                &mut scratch,
+            )?;
 
             return Ok(res);
         }
@@ -386,8 +392,10 @@ where
 
         let client: ComputeClient<R> = R::client(&self.device);
 
+        let limits = GpuLimits::from_client(&client);
         let nprobe_val = nprobe.unwrap_or(((self.nlist as f32).sqrt() as usize).max(1));
-        let batch_size = nquery.unwrap_or_else(|| self.calculate_safe_batch_size(nprobe_val));
+        let batch_size =
+            nquery.unwrap_or_else(|| self.calculate_safe_batch_size(nprobe_val, &limits));
 
         let queries_padded = if self.dim_padded != self.dim {
             pad_vectors(&queries_flat, n_queries, self.dim, self.dim_padded)
@@ -440,7 +448,7 @@ where
         let nprobe = nprobe.unwrap_or(((self.nlist as f32).sqrt() as usize).max(1));
 
         let batch_size = nquery.unwrap_or_else(|| {
-            let safe = self.calculate_safe_batch_size(nprobe);
+            let safe = self.calculate_safe_batch_size(nprobe, &GpuLimits::from_client(&client));
             if verbose {
                 println!("  Auto-tuned batch size to {} (based on density)", safe);
             }
@@ -536,7 +544,8 @@ where
         let vec_size = LINE_SIZE;
         let dim_lines = self.dim_padded / vec_size;
 
-        let safe_worksize_y = pick_wg_y(self.dim_padded)?;
+        let limits = GpuLimits::from_client(client);
+        let safe_worksize_y = pick_wg_y(self.dim_padded, size_of::<T>(), &limits)?;
 
         let query_norms = if self.metric == Dist::Cosine {
             (0..n_queries)
@@ -551,28 +560,41 @@ where
         };
 
         let queries_gpu =
-            GpuTensor::<R, T>::from_slice(queries_flat, vec![n_queries, self.dim_padded], client);
+            GpuTensor::<R, T>::from_slice(queries_flat, vec![n_queries, self.dim_padded], client)?;
 
         let query_norms_gpu = if self.metric == Dist::Cosine {
             Some(GpuTensor::<R, T>::from_slice(
                 &query_norms,
                 vec![n_queries],
                 client,
-            ))
+            )?)
         } else {
             None
         };
 
-        let centroid_dists_gpu = GpuTensor::<R, T>::empty(vec![n_queries, self.nlist], client);
+        let centroid_dists_gpu = GpuTensor::<R, T>::empty(vec![n_queries, self.nlist], client)?;
+        // The cluster axis has no free grid dimension to flatten into: x is
+        // the clusters, y and z already carry the query axis. So it is checked
+        // rather than decomposed, and an implausible `nlist` errors instead of
+        // silently returning zeros.
         let grid_x = (self.nlist as u32).div_ceil(WORKGROUP_SIZE_X);
-        let (grid_y, grid_z) = grid_2d((n_queries as u32).div_ceil(safe_worksize_y));
+        let (grid_y, grid_z) = grid_2d((n_queries as u32).div_ceil(safe_worksize_y), &limits)?;
         let reg_grid_x = (self.nlist as u32).div_ceil(WORKGROUP_SIZE_X * TILE_D as u32);
+        let tiled_count =
+            checked_cube_count("ivf_centroid_tiled", grid_x, grid_y, grid_z, &limits)?;
+        let reg_count = checked_cube_count(
+            "ivf_centroid_tiled_reg",
+            reg_grid_x,
+            grid_y,
+            grid_z,
+            &limits,
+        )?;
 
         match self.metric {
             Dist::SquaredEuclidean if tile_fits(safe_worksize_y) => unsafe {
                 euclidean_tiled_reg::launch_unchecked::<T, R>(
                     client,
-                    CubeCount::Static(reg_grid_x, grid_y, grid_z),
+                    reg_count.clone(),
                     CubeDim::new_2d(WORKGROUP_SIZE_X, safe_worksize_y / TILE_Q as u32),
                     vec_size,
                     queries_gpu.clone().into_tensor_arg(),
@@ -591,7 +613,7 @@ where
             Dist::Cosine if tile_fits(safe_worksize_y) => unsafe {
                 cosine_tiled_reg::launch_unchecked::<T, R>(
                     client,
-                    CubeCount::Static(reg_grid_x, grid_y, grid_z),
+                    reg_count.clone(),
                     CubeDim::new_2d(WORKGROUP_SIZE_X, safe_worksize_y / TILE_Q as u32),
                     vec_size,
                     queries_gpu.clone().into_tensor_arg(),
@@ -616,7 +638,7 @@ where
             Dist::SquaredEuclidean => unsafe {
                 euclidean_tiled::launch_unchecked::<T, R>(
                     client,
-                    CubeCount::Static(grid_x, grid_y, grid_z),
+                    tiled_count.clone(),
                     CubeDim::new_2d(WORKGROUP_SIZE_X, safe_worksize_y),
                     vec_size,
                     queries_gpu.clone().into_tensor_arg(),
@@ -633,7 +655,7 @@ where
             Dist::Cosine => unsafe {
                 cosine_tiled::launch_unchecked::<T, R>(
                     client,
-                    CubeCount::Static(grid_x, grid_y, grid_z),
+                    tiled_count.clone(),
                     CubeDim::new_2d(WORKGROUP_SIZE_X, safe_worksize_y),
                     vec_size,
                     queries_gpu.clone().into_tensor_arg(),
@@ -669,12 +691,7 @@ where
                 let mut cluster_dists: Vec<(T, usize)> = (0..self.nlist)
                     .map(|c| (centroid_dists[row_start + c], c))
                     .collect();
-                select_probed_clusters(
-                    &mut cluster_dists,
-                    &self.cluster_offsets,
-                    nprobe,
-                    k,
-                )
+                select_probed_clusters(&mut cluster_dists, &self.cluster_offsets, nprobe, k)
             })
             .collect();
 
@@ -730,9 +747,8 @@ where
         // where its results land does not depend on task order.
         let mut order: Vec<u32> = (0..n_tasks as u32).collect();
         order.sort_unstable_by_key(|&i| task_db_start[i as usize]);
-        let permute = |src: &[u32]| -> Vec<u32> {
-            order.iter().map(|&i| src[i as usize]).collect()
-        };
+        let permute =
+            |src: &[u32]| -> Vec<u32> { order.iter().map(|&i| src[i as usize]).collect() };
         let task_q_idx = permute(&task_q_idx);
         let task_db_start = permute(&task_db_start);
         let task_write_offset = permute(&task_write_offset);
@@ -755,8 +771,8 @@ where
             // reintroduce the fault this buffer exists to avoid.
             let capacity = needed + needed / CANDIDATE_SCRATCH_HEADROOM_DIV;
             *scratch = Some(CandidateScratch {
-                dists: GpuTensor::<R, T>::empty(vec![capacity], client),
-                indices: GpuTensor::<R, u32>::empty(vec![capacity], client),
+                dists: GpuTensor::<R, T>::empty(vec![capacity], client)?,
+                indices: GpuTensor::<R, u32>::empty(vec![capacity], client)?,
                 capacity,
             });
         }
@@ -764,13 +780,13 @@ where
         let candidate_dists_gpu = held.dists.reshaped_view(vec![n_queries, max_candidates]);
         let candidate_indices_gpu = held.indices.reshaped_view(vec![n_queries, max_candidates]);
 
-        let task_q_idx_gpu = GpuTensor::<R, u32>::from_slice(&task_q_idx, vec![n_tasks], client);
+        let task_q_idx_gpu = GpuTensor::<R, u32>::from_slice(&task_q_idx, vec![n_tasks], client)?;
         let task_db_start_gpu =
-            GpuTensor::<R, u32>::from_slice(&task_db_start, vec![n_tasks], client);
+            GpuTensor::<R, u32>::from_slice(&task_db_start, vec![n_tasks], client)?;
         let task_write_offset_gpu =
-            GpuTensor::<R, u32>::from_slice(&task_write_offset, vec![n_tasks], client);
+            GpuTensor::<R, u32>::from_slice(&task_write_offset, vec![n_tasks], client)?;
         let task_db_count_gpu =
-            GpuTensor::<R, u32>::from_slice(&task_db_count, vec![n_tasks], client);
+            GpuTensor::<R, u32>::from_slice(&task_db_count, vec![n_tasks], client)?;
 
         // NOT register-tiled, deliberately, and this has now been measured
         // twice. Register-tiled variants (TILE_D DB vectors per thread) were
@@ -786,14 +802,24 @@ where
         // either, so it is not wasted tail work. Whatever bounds this kernel,
         // it is not memory-operation issue count. Do not retry without a new
         // hypothesis and a measurement.
+        // `max_db_count` is the largest cluster's point count, and like the
+        // cluster axis above it has nowhere to flatten into.
         let mega_grid_x = max_db_count.div_ceil(WORKGROUP_SIZE_X).max(1);
-        let (mega_grid_y, mega_grid_z) = grid_2d((n_tasks as u32).div_ceil(safe_worksize_y));
+        let (mega_grid_y, mega_grid_z) =
+            grid_2d((n_tasks as u32).div_ceil(safe_worksize_y), &limits)?;
+        let mega_count = checked_cube_count(
+            "compute_ivf_mega_cached",
+            mega_grid_x,
+            mega_grid_y,
+            mega_grid_z,
+            &limits,
+        )?;
 
         match self.metric {
             Dist::SquaredEuclidean => unsafe {
                 compute_ivf_mega_euclidean_cached::launch_unchecked::<T, R>(
                     client,
-                    CubeCount::Static(mega_grid_x, mega_grid_y, mega_grid_z),
+                    mega_count.clone(),
                     CubeDim::new_2d(WORKGROUP_SIZE_X, safe_worksize_y),
                     vec_size,
                     queries_gpu.clone().into_tensor_arg(),
@@ -812,7 +838,7 @@ where
             Dist::Cosine => unsafe {
                 compute_ivf_mega_cosine_cached::launch_unchecked::<T, R>(
                     client,
-                    CubeCount::Static(mega_grid_x, mega_grid_y, mega_grid_z),
+                    mega_count.clone(),
                     CubeDim::new_2d(WORKGROUP_SIZE_X, safe_worksize_y),
                     vec_size,
                     queries_gpu.clone().into_tensor_arg(),
@@ -833,16 +859,12 @@ where
             Dist::Manhattan => unreachable!(),
         }
 
-        let topk_dists = GpuTensor::<R, T>::empty(vec![n_queries, k], client);
-        let topk_indices = GpuTensor::<R, u32>::empty(vec![n_queries, k], client);
+        let topk_dists = GpuTensor::<R, T>::empty(vec![n_queries, k], client)?;
+        let topk_indices = GpuTensor::<R, u32>::empty(vec![n_queries, k], client)?;
 
-        let cpq = GpuTensor::<R, u32>::from_slice(&cpu_write_pointers, vec![n_queries], client);
-        let (coal_gx, coal_gy) = grid_2d(n_queries as u32);
-        let merge = plan_topk_merge(
-            k,
-            size_of::<T>(),
-            client.properties().hardware.max_shared_memory_size,
-        )?;
+        let cpq = GpuTensor::<R, u32>::from_slice(&cpu_write_pointers, vec![n_queries], client)?;
+        let (coal_gx, coal_gy) = grid_2d(n_queries as u32, &limits)?;
+        let merge = plan_topk_merge(k, size_of::<T>(), &limits)?;
         unsafe {
             reduce_ivf_topk_coalesced::launch_unchecked::<T, R>(
                 client,
@@ -899,19 +921,25 @@ where
     /// ### Returns
     ///
     /// The batch size
-    fn calculate_safe_batch_size(&self, nprobe: usize) -> usize {
-        // f32 dist + u32 index
-        const BYTES_PER_CANDIDATE: usize = 8;
+    fn calculate_safe_batch_size(&self, nprobe: usize, limits: &GpuLimits) -> usize {
         // To account for variable cluster sizes
         const SAFETY_MARGIN: f32 = 1.5;
+
+        // One distance plus one u32 index per candidate. Reading the element
+        // size rather than assuming f32 keeps the estimate honest for f64.
+        let bytes_per_candidate = size_of::<T>() + 4;
 
         let avg_cluster_size = self.n as f32 / self.nlist as f32;
         let candidates_per_query = nprobe as f32 * avg_cluster_size * SAFETY_MARGIN;
 
-        let bytes_per_query = candidates_per_query * BYTES_PER_CANDIDATE as f32;
+        let bytes_per_query = candidates_per_query * bytes_per_candidate as f32;
+
+        // The target is a tuning knob, but it cannot exceed what the device
+        // binds in one go: the candidate buffer is a single binding.
+        let budget = ((TARGET_BUFFER_MB * 1024 * 1024) as u64).min(limits.max_binding_bytes);
 
         // calculate how many queries fit in the target memory
-        let safe_batch = ((TARGET_BUFFER_MB * 1024 * 1024) as f32 / bytes_per_query) as usize;
+        let safe_batch = (budget as f32 / bytes_per_query) as usize;
 
         // clamp between 100 (sanity min) and 20k (sanity max)
         safe_batch.clamp(100, 20_000)
@@ -1206,7 +1234,8 @@ mod tests_wpgu {
         // Deterministic per-sample cluster + jitter. Avoid rand crate.
         let data = Mat::from_fn(n, dim, |i, j| {
             let cluster = (i % n_clusters) as f32;
-            let jitter_bits = ((i.wrapping_mul(2654435761) ^ j.wrapping_mul(40503)) & 0xffff) as f32;
+            let jitter_bits =
+                ((i.wrapping_mul(2654435761) ^ j.wrapping_mul(40503)) & 0xffff) as f32;
             let jitter = (jitter_bits / 65536.0 - 0.5) * 0.3;
             cluster + jitter
         });
@@ -1224,9 +1253,7 @@ mod tests_wpgu {
 
         // Any panic below (OOB, wrong indices) indicates the reducer
         // regression is back.
-        let (indices, distances) = index
-            .generate_knn(k, Some(6), None, true, false)
-            .unwrap();
+        let (indices, distances) = index.generate_knn(k, Some(6), None, true, false).unwrap();
 
         assert_eq!(indices.len(), n);
         let distances = distances.unwrap();
@@ -1235,10 +1262,7 @@ mod tests_wpgu {
         for (q, row) in indices.iter().enumerate() {
             assert!(!row.is_empty(), "query {q} returned zero neighbours");
             for &idx in row {
-                assert!(
-                    idx < n,
-                    "query {q}: OOB neighbour index {idx} (n = {n})"
-                );
+                assert!(idx < n, "query {q}: OOB neighbour index {idx} (n = {n})");
             }
         }
 

@@ -209,6 +209,7 @@ impl RnnDescentBuildParams {
 /// query time to pick a batch of near-query entry points. This mirrors how
 /// NN-Descent seeds its beam search, but with fewer trees since the forest
 /// is only queried once per query (not per node during build).
+#[cfg_attr(feature = "serialise", derive(serde::Serialize, serde::Deserialize))]
 pub struct RnnDescentIndex<T> {
     /// Row-major flattened vectors
     pub vectors_flat: Vec<T>,
@@ -1006,6 +1007,20 @@ where
 ///////////
 // Tests //
 ///////////
+
+/////////////
+// IndexIo //
+/////////////
+
+#[cfg(feature = "serialise")]
+impl<T> IndexIo for RnnDescentIndex<T>
+where
+    T: AnnSearchFloat,
+{
+    type Elem = T;
+
+    const KIND: &'static str = "rnn_descent";
+}
 
 #[cfg(test)]
 mod tests {

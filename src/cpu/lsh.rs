@@ -286,6 +286,7 @@ fn orthogonalise_table_projections<T>(
 /// For Euclidean distance, vectors are L2-normalised before hashing so that
 /// SimHash (an angular hash) provides a reasonable proxy. Actual distance
 /// computations always use the original unnormalised vectors.
+#[cfg_attr(feature = "serialise", derive(serde::Serialize, serde::Deserialize))]
 pub struct LSHIndex<T> {
     /// Original data, flattened row-major for cache efficiency
     pub vectors_flat: Vec<T>,
@@ -904,6 +905,20 @@ where
 ///////////
 // Tests //
 ///////////
+
+/////////////
+// IndexIo //
+/////////////
+
+#[cfg(feature = "serialise")]
+impl<T> IndexIo for LSHIndex<T>
+where
+    T: AnnSearchFloat,
+{
+    type Elem = T;
+
+    const KIND: &'static str = "lsh";
+}
 
 #[cfg(test)]
 mod tests {

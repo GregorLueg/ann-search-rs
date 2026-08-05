@@ -18,10 +18,18 @@ use crate::prelude::*;
 use crate::utils::k_means_utils::*;
 
 /// IVF index with binary quantisation
+// `bound` is pinned because the skipped `vector_store` field makes serde
+// infer a spurious `T: Default`
+#[cfg_attr(
+    feature = "serialise",
+    derive(serde::Serialize, serde::Deserialize),
+    serde(bound = "T: AnnSearchFloat")
+)]
 pub struct IvfIndexBinary<T> {
     /// Binary codes, flattened (n * n_bytes)
     pub vectors_flat_binarised: Vec<u8>,
-    /// Bytes per vector (n_bits / 8)
+    /// Bytes per vector, taken from the binariser. Equals `n_bits / 8` for the
+    /// projection-based methods; sign-based ignores `n_bits` and uses `dim`.
     pub n_bytes: usize,
     /// Number of samples in the index
     pub n: usize,
@@ -45,11 +53,24 @@ pub struct IvfIndexBinary<T> {
     /// Number of clusters/lists in this index
     nlist: usize,
     /// Optional vector store that is saved in binary on disk
+    #[cfg_attr(feature = "serialise", serde(skip))]
     vector_store: Option<MmapVectorStore<T>>,
+    /// Shape of `vector_store`, so it can be re-opened after a load. Only
+    /// read by the `serialise` feature; the field is kept unconditionally so
+    /// the constructors stay free of `cfg`.
+    #[cfg_attr(not(feature = "serialise"), allow(dead_code))]
+    store_meta: Option<StoreMeta>,
     /// New to old mapping
     original_ids: Vec<usize>,
     /// Old to new mapping
     old_to_new: Vec<usize>,
+    /// Whether `vectors_flat_binarised` holds signs of the residual against the
+    /// assigned cell's centroid rather than signs of the raw vector. Only ever
+    /// `true` for [`BinarisationInit::SignBased`]; the projection methods keep
+    /// their global frame. Must stay the last field: serde emits in declaration
+    /// order, so appending is what keeps older payloads decodable-or-loud
+    /// rather than silently misread.
+    residual_codes: bool,
 }
 
 //////////////////////////
@@ -108,8 +129,10 @@ where
     /// ### Params
     ///
     /// * `data` - Matrix reference with vectors as rows (n × dim)
-    /// * `binarisation_init` - Initialisation method ("itq" or "random")
-    /// * `n_bits` - Number of bits per binary code (must be multiple of 8)
+    /// * `binarisation_init` - Initialisation method (`"random"`, `"pca"`, or
+    ///   `"sign"`)
+    /// * `n_bits` - Number of bits per binary code (must be multiple of 8).
+    ///   Ignored by sign-based binarisation, which always emits `dim` bits.
     /// * `metric` - Distance metric for centroid routing
     /// * `nlist` - Optional number of clusters (defaults to sqrt(n))
     /// * `k_means_params` - Optional k-means trainings parameters, see
@@ -141,7 +164,6 @@ where
 
         let n = data.nrows();
         let dim = data.ncols();
-        let n_bytes = n_bits / 8;
 
         let (vectors_flat, _, _) = matrix_to_flat(data);
 
@@ -206,8 +228,9 @@ where
             &metric,
         );
 
-        // 4. build CSR layout
-        let (all_indices, offsets) = build_csr_layout(assignments, n, nlist);
+        // 4. build CSR layout. `assignments` is still needed for the residual
+        //    encode below, so it cannot be moved into the layout builder
+        let (all_indices, offsets) = build_csr_layout(assignments.clone(), n, nlist);
 
         // 5. initialise binariser and encode all vectors
         let init = parse_binarisation_init(binarisation_init).unwrap_or_else(|| {
@@ -217,15 +240,28 @@ where
 
         let binariser = match init {
             BinarisationInit::PcaHashing => Binariser::new_pca_hashing(data, dim, n_bits, seed)?,
-            BinarisationInit::RandomProjections => Binariser::new_simhash(dim, n_bits, seed)?,
+            BinarisationInit::RandomProjections => Binariser::new_simhash(data, dim, n_bits, seed)?,
             BinarisationInit::SignBased => Binariser::new_sign_based(dim),
         };
 
-        let mut vectors_flat_binarised: Vec<u8> = Vec::with_capacity(n * n_bytes);
-        for i in 0..n {
-            let original: Vec<T> = data.row(i).iter().cloned().collect();
-            vectors_flat_binarised.extend(binariser.encode(&original)?);
-        }
+        // Ask the binariser, do not derive from `n_bits`: sign-based ignores
+        // that argument and emits `dim` bits
+        let n_bytes = binariser.n_bytes();
+        let residual_codes = matches!(init, BinarisationInit::SignBased);
+
+        let vectors_flat_binarised = Self::encode_all(
+            data,
+            &binariser,
+            residual_codes,
+            &assignments,
+            &centroids_float,
+            &centroids_norm,
+            &data_norms,
+            metric,
+            dim,
+            n,
+            n_bytes,
+        )?;
 
         let mut idx = Self {
             vectors_flat_binarised,
@@ -241,8 +277,10 @@ where
             offsets,
             nlist,
             vector_store: None,
+            store_meta: None,
             original_ids: Vec::new(),
             old_to_new: Vec::new(),
+            residual_codes,
         };
 
         let new_to_old = idx.optimise_memory_layout();
@@ -259,8 +297,10 @@ where
     /// ### Params
     ///
     /// * `data` - Matrix reference with vectors as rows (n × dim)
-    /// * `binarisation_init` - Initialisation method ("itq" or "random")
-    /// * `n_bits` - Number of bits per binary code (must be multiple of 8)
+    /// * `binarisation_init` - Initialisation method (`"random"`, `"pca"`, or
+    ///   `"sign"`)
+    /// * `n_bits` - Number of bits per binary code (must be multiple of 8).
+    ///   Ignored by sign-based binarisation, which always emits `dim` bits.
     /// * `metric` - Distance metric for centroid routing and reranking
     /// * `nlist` - Optional number of clusters (defaults to sqrt(n))
     /// * `k_means_params` - Optional k-means trainings parameters, see
@@ -294,7 +334,6 @@ where
 
         let n = data.nrows();
         let dim = data.ncols();
-        let n_bytes = n_bits / 8;
 
         let (vectors_flat, _, _) = matrix_to_flat(data);
 
@@ -374,8 +413,9 @@ where
             &metric,
         );
 
-        // 4. build CSR layout
-        let (all_indices, offsets) = build_csr_layout(assignments, n, nlist);
+        // 4. build CSR layout. `assignments` is still needed for the residual
+        //    encode below, so it cannot be moved into the layout builder
+        let (all_indices, offsets) = build_csr_layout(assignments.clone(), n, nlist);
 
         // 5. initialise binariser and encode all vectors
         let init = parse_binarisation_init(binarisation_init).unwrap_or_else(|| {
@@ -385,15 +425,28 @@ where
 
         let binariser = match init {
             BinarisationInit::PcaHashing => Binariser::new_pca_hashing(data, dim, n_bits, seed)?,
-            BinarisationInit::RandomProjections => Binariser::new_simhash(dim, n_bits, seed)?,
+            BinarisationInit::RandomProjections => Binariser::new_simhash(data, dim, n_bits, seed)?,
             BinarisationInit::SignBased => Binariser::new_sign_based(dim),
         };
 
-        let mut vectors_flat_binarised: Vec<u8> = Vec::with_capacity(n * n_bytes);
-        for i in 0..n {
-            let original: Vec<T> = data.row(i).iter().cloned().collect();
-            vectors_flat_binarised.extend(binariser.encode(&original)?);
-        }
+        // Ask the binariser, do not derive from `n_bits`: sign-based ignores
+        // that argument and emits `dim` bits
+        let n_bytes = binariser.n_bytes();
+        let residual_codes = matches!(init, BinarisationInit::SignBased);
+
+        let vectors_flat_binarised = Self::encode_all(
+            data,
+            &binariser,
+            residual_codes,
+            &assignments,
+            &centroids_float,
+            &centroids_norm,
+            &data_norms,
+            metric,
+            dim,
+            n,
+            n_bytes,
+        )?;
 
         // Save vector store
         std::fs::create_dir_all(&save_path)?;
@@ -408,8 +461,7 @@ where
             })
             .collect();
 
-        let vectors_path = save_path.as_ref().join("vectors_flat.bin");
-        let norms_path = save_path.as_ref().join("norms.bin");
+        let (vectors_path, norms_path) = MmapVectorStore::<T>::paths_in(&save_path);
 
         MmapVectorStore::save(&vectors_flat, &norms, dim, n, &vectors_path, &norms_path)?;
 
@@ -429,14 +481,217 @@ where
             offsets,
             nlist,
             vector_store: Some(vector_store),
+            store_meta: Some(StoreMeta { dim, n }),
             original_ids: Vec::new(),
             old_to_new: Vec::new(),
+            residual_codes,
         };
 
         let new_to_old = idx.optimise_memory_layout();
         idx.original_ids = new_to_old;
 
         Ok(idx)
+    }
+
+    /// Encode every vector into one flat code array, in original row order
+    ///
+    /// Writing at `i * n_bytes` rather than appending keeps
+    /// [`Self::optimise_memory_layout`] free to permute afterwards, so the
+    /// encode and the layout stay independent.
+    ///
+    /// Sign-based codes are taken against the assigned cell's centroid; the
+    /// projection methods keep their global frame and ignore the assignment.
+    ///
+    /// ### Params
+    ///
+    /// * `data` - Data matrix (n × dim)
+    /// * `binariser` - Trained binariser
+    /// * `residual_codes` - Whether to encode residuals against the centroids
+    /// * `assignments` - Cell assignment per row, length `n`
+    /// * `centroids_float` - Flat centroids (nlist × dim)
+    /// * `centroids_norm` - Centroid L2 norms, empty unless Cosine
+    /// * `data_norms` - Row L2 norms, all ones unless Cosine
+    /// * `metric` - Distance metric
+    /// * `dim` - Dimensionality
+    /// * `n` - Number of rows
+    /// * `n_bytes` - Code stride, from [`Binariser::n_bytes`]
+    ///
+    /// ### Returns
+    ///
+    /// Flat code array of `n * n_bytes` bytes.
+    #[allow(clippy::too_many_arguments)]
+    fn encode_all(
+        data: MatRef<T>,
+        binariser: &Binariser<T>,
+        residual_codes: bool,
+        assignments: &[usize],
+        centroids_float: &[T],
+        centroids_norm: &[T],
+        data_norms: &[T],
+        metric: Dist,
+        dim: usize,
+        n: usize,
+        n_bytes: usize,
+    ) -> Result<Vec<u8>, AnnSearchErrors> {
+        let mut codes = vec![0u8; n * n_bytes];
+
+        if !residual_codes {
+            for i in 0..n {
+                let row: Vec<T> = data.row(i).iter().cloned().collect();
+                codes[i * n_bytes..(i + 1) * n_bytes]
+                    .copy_from_slice(&binariser.encode(&row)?);
+            }
+
+            return Ok(codes);
+        }
+
+        codes
+            .par_chunks_mut(n_bytes)
+            .enumerate()
+            .for_each(|(i, out)| {
+                let cell = assignments[i];
+                let centroid = &centroids_float[cell * dim..(cell + 1) * dim];
+
+                // Mirrors `residual_scales`, which cannot be called before the
+                // index exists
+                let scale = if metric == Dist::Cosine
+                    && centroids_norm[cell] > T::epsilon()
+                    && data_norms[i] > T::epsilon()
+                {
+                    (centroids_norm[cell], data_norms[i])
+                } else {
+                    (T::one(), T::one())
+                };
+
+                let row: Vec<T> = data.row(i).iter().cloned().collect();
+                encode_sign_residual_into(&row, centroid, scale, dim, out);
+            });
+
+        Ok(codes)
+    }
+
+    //////////////
+    // Residual //
+    //////////////
+
+    /// Cell that owns a physical slot
+    ///
+    /// [`Self::optimise_memory_layout`] sorts the codes by cell, so `offsets`
+    /// partitions the physical index space and slot `p` sits in the last cell
+    /// whose offset does not exceed it. Empty cells share an offset with their
+    /// successor and are never returned, because the run of equal offsets ends
+    /// on the owner.
+    ///
+    /// ### Params
+    ///
+    /// * `physical` - Slot in `vectors_flat_binarised`, must be `< n`
+    ///
+    /// ### Returns
+    ///
+    /// The cell id owning that slot.
+    #[inline]
+    fn cell_of(&self, physical: usize) -> usize {
+        self.offsets.partition_point(|&o| o <= physical) - 1
+    }
+
+    /// Centroid of a cell as a flat slice
+    ///
+    /// ### Params
+    ///
+    /// * `cell` - Cell id, must be `< nlist`
+    ///
+    /// ### Returns
+    ///
+    /// The centroid, length `dim`.
+    #[inline]
+    fn centroid_of(&self, cell: usize) -> &[T] {
+        &self.centroids_float[cell * self.dim..(cell + 1) * self.dim]
+    }
+
+    /// Scale pair for the residual comparison in a given cell
+    ///
+    /// Squared Euclidean compares the raw residual; Cosine compares unit-length
+    /// vectors, and scaling by `‖vec‖ * ‖centroid‖` expresses that without a
+    /// division. Neither the data nor the centroids are normalised at build
+    /// time, so for Cosine the plain residual would be dominated by the
+    /// magnitude gap and would degenerate back towards the raw vector.
+    /// Degenerate norms fall back to the unscaled comparison.
+    ///
+    /// ### Params
+    ///
+    /// * `vec_norm` - L2 norm of the vector or query being encoded
+    /// * `cell` - Cell whose centroid the residual is taken against
+    ///
+    /// ### Returns
+    ///
+    /// `(vector scale, centroid scale)`, both strictly positive.
+    #[inline]
+    fn residual_scales(&self, vec_norm: T, cell: usize) -> (T, T) {
+        if self.metric != Dist::Cosine {
+            return (T::one(), T::one());
+        }
+
+        let centroid_norm = self.centroids_norm[cell];
+        if centroid_norm <= T::epsilon() || vec_norm <= T::epsilon() {
+            return (T::one(), T::one());
+        }
+
+        (centroid_norm, vec_norm)
+    }
+
+    /// Encode a vector against one cell's centroid into a reused buffer
+    ///
+    /// ### Params
+    ///
+    /// * `vec` - Vector to encode, length `dim`
+    /// * `vec_norm` - Its L2 norm, only read for Cosine
+    /// * `cell` - Cell whose centroid to take the residual against
+    /// * `out` - Destination code, length `n_bytes`
+    #[inline]
+    fn encode_for_cell(&self, vec: &[T], vec_norm: T, cell: usize, out: &mut [u8]) {
+        let scale = self.residual_scales(vec_norm, cell);
+        encode_sign_residual_into(vec, self.centroid_of(cell), scale, self.dim, out);
+    }
+
+    /// Query residual against one cell's centroid, normalised to unit length
+    ///
+    /// Used as the float side of the asymmetric dot product. The raw residual's
+    /// magnitude grows with the query's distance from the centroid, so without
+    /// this candidates in further cells would score higher purely because their
+    /// query residual is longer and the descending sort would invert. Within a
+    /// single cell it is a positive rescale and changes no ordering.
+    ///
+    /// The scale pair matches [`Self::encode_for_cell`]: the two sides must
+    /// agree on the frame or the dot is taken against a different code than the
+    /// one stored.
+    ///
+    /// ### Params
+    ///
+    /// * `query_vec` - Query vector, length `dim`
+    /// * `query_norm` - Its L2 norm, only read for Cosine
+    /// * `cell` - Cell whose centroid to take the residual against
+    ///
+    /// ### Returns
+    ///
+    /// The unit-length residual, or all zeros when it degenerates.
+    fn unit_query_residual(&self, query_vec: &[T], query_norm: T, cell: usize) -> Vec<T> {
+        let (a, b) = self.residual_scales(query_norm, cell);
+        let centroid = self.centroid_of(cell);
+
+        let mut residual: Vec<T> = (0..self.dim)
+            .map(|d| a * query_vec[d] - b * centroid[d])
+            .collect();
+
+        let norm = T::calculate_l2_norm(&residual);
+        if norm <= T::epsilon() {
+            return vec![T::zero(); self.dim];
+        }
+
+        for v in residual.iter_mut() {
+            *v = *v / norm;
+        }
+
+        residual
     }
 
     ///////////
@@ -447,6 +702,16 @@ where
     ///
     /// Two-stage search: finds nprobe nearest centroids using float distance,
     /// then searches those clusters using Hamming distance on binary codes.
+    ///
+    /// ### Note
+    ///
+    /// Sign-based indices store codes relative to each cell's centroid, so the
+    /// query is re-encoded once per probed cell. Those Hamming distances are
+    /// only strictly comparable *within* a cell: every vector in a distant cell
+    /// shares a direction from that cell's centroid, so their residual signs
+    /// agree with the query's spuriously. With `nprobe > 1` the merged ordering
+    /// is a rougher funnel than the per-cell one. Prefer
+    /// [`Self::query_reranking`], which resolves it against the float vectors.
     ///
     /// ### Params
     ///
@@ -469,13 +734,20 @@ where
             .min(self.nlist);
         let k = k.min(self.n);
 
-        let query_binary = self.binariser.encode(query_vec)?;
-
         let query_norm = if matches!(self.metric, Dist::Cosine) {
             T::calculate_l2_norm(query_vec)
         } else {
             T::one()
         };
+
+        // Residual codes live in their own cell's frame, so the query has to be
+        // re-encoded per probed cell. One scratch buffer, reused
+        let global_code = if self.residual_codes {
+            Vec::new()
+        } else {
+            self.binariser.encode(query_vec)?
+        };
+        let mut cell_code = vec![0u8; self.n_bytes];
 
         // 1. Find nprobe nearest centroids using float distance, expanding to
         //    cover >= k reachable vectors so the query never short-returns.
@@ -486,11 +758,18 @@ where
         let mut heap: BinaryHeap<(u32, usize)> = BinaryHeap::with_capacity(k + 1);
 
         for cluster_idx in probed {
+            let query_binary: &[u8] = if self.residual_codes {
+                self.encode_for_cell(query_vec, query_norm, cluster_idx, &mut cell_code);
+                &cell_code
+            } else {
+                &global_code
+            };
+
             let start = self.offsets[cluster_idx];
             let end = self.offsets[cluster_idx + 1];
 
             for vec_idx in start..end {
-                let dist = self.hamming_distance_query(&query_binary, vec_idx);
+                let dist = self.hamming_distance_query(query_binary, vec_idx);
 
                 if heap.len() < k {
                     heap.push((dist, vec_idx));
@@ -559,11 +838,9 @@ where
     ///
     /// ### Returns
     ///
-    /// Tuple of `(indices, distances)` where distances are Hamming distances
-    ///
-    /// ### Panic
-    ///
-    /// Panics if the binarisation type is not sign-based.
+    /// Tuple of `(indices, scores)` where the score is the asymmetric dot
+    /// product, sorted descending: higher means more similar. Errors when the
+    /// binarisation type is not sign-based.
     #[inline]
     pub fn query_asymmetric(
         &self,
@@ -579,21 +856,52 @@ where
 
         let (candidates, _) = self.query(query_vec, k * rerank_factor, nprobe)?;
 
-        let mut scored: Vec<(usize, T)> = candidates
+        let query_norm = if matches!(self.metric, Dist::Cosine) {
+            T::calculate_l2_norm(query_vec)
+        } else {
+            T::one()
+        };
+
+        // Grouping by cell means the query residual is rebuilt once per cell
+        // rather than once per candidate
+        let mut by_cell: Vec<(usize, usize, usize)> = candidates
             .iter()
             .map(|&idx| {
                 let physical = self.old_to_new[idx];
-                let start_i = physical * self.n_bytes;
-                let vec_i = unsafe {
-                    self.vectors_flat_binarised
-                        .get_unchecked(start_i..start_i + self.n_bytes)
-                };
-                let dist_i = asymmetric_binary_dot(query_vec, vec_i, self.dim);
-                (idx, dist_i)
+                (self.cell_of(physical), physical, idx)
             })
             .collect();
+        by_cell.sort_unstable_by_key(|&(cell, _, _)| cell);
 
-        scored.sort_unstable_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
+        let mut scored: Vec<(usize, T)> = Vec::with_capacity(by_cell.len());
+        let mut current_cell = usize::MAX;
+        let mut residual: Vec<T> = Vec::new();
+
+        for (cell, physical, idx) in by_cell {
+            if self.residual_codes && cell != current_cell {
+                residual = self.unit_query_residual(query_vec, query_norm, cell);
+                current_cell = cell;
+            }
+
+            let float_side: &[T] = if self.residual_codes {
+                &residual
+            } else {
+                query_vec
+            };
+
+            let start_i = physical * self.n_bytes;
+            let vec_i = unsafe {
+                self.vectors_flat_binarised
+                    .get_unchecked(start_i..start_i + self.n_bytes)
+            };
+
+            scored.push((idx, asymmetric_binary_dot(float_side, vec_i, self.dim)));
+        }
+
+        // `asymmetric_binary_dot` is a similarity, not a distance: the query's
+        // own code maximises it. Descending, or the funnel keeps the k
+        // *least* similar candidates
+        scored.sort_unstable_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
         scored.truncate(k);
 
         let mut indices: Vec<usize> = Vec::with_capacity(k);
@@ -671,8 +979,13 @@ where
             .ok_or(AnnSearchErrors::VectorStoreNotAvailable)?;
         let rerank_factor = rerank_factor.unwrap_or(20);
 
+        // `query_asymmetric` truncates to its own `k`, so it has to be asked for
+        // `k * rerank_factor` candidates, not `k`. Passing `k` collapses the
+        // funnel to `k -> k` and the exact stage can only reorder what the
+        // binary stages already picked, never recover a dropped neighbour.
         let candidates = if matches!(self.binarisation_type, BinarisationInit::SignBased) {
-            let (idx, _) = self.query_asymmetric(query_vec, k, nprobe, Some(2 * rerank_factor))?;
+            let (idx, _) =
+                self.query_asymmetric(query_vec, k * rerank_factor, nprobe, Some(2))?;
             idx
         } else {
             let (idx, _) = self.query(query_vec, k * rerank_factor, nprobe)?;
@@ -809,6 +1122,13 @@ where
             }
 
             Ok((final_indices, final_dists))
+        } else if self.residual_codes {
+            // The binary-only fallback below uses each stored code as a query
+            // and scans every cluster. Residual codes live in their own cell's
+            // frame, so a Hamming distance between two cells is meaningless and
+            // the graph would degrade with nothing to show for it. Recovering
+            // the float vectors is the only fix, and that needs the store
+            Err(AnnSearchErrors::ResidualCodesRequireVectorStore)
         } else {
             let unordered_results: Vec<(usize, Vec<usize>, Vec<u32>)> = (0..self.n)
                 .into_par_iter()
@@ -940,6 +1260,39 @@ where
 // Tests //
 ///////////
 
+/////////////
+// IndexIo //
+/////////////
+
+#[cfg(feature = "serialise")]
+use crate::utils::staging::StagedFiles;
+
+#[cfg(feature = "serialise")]
+impl<T> IndexIo for IvfIndexBinary<T>
+where
+    T: AnnSearchFloat,
+{
+    type Elem = T;
+
+    const KIND: &'static str = "ivf_binary";
+
+    fn stage_aux(&self, dir: &Path, staged: &mut StagedFiles) -> Result<(), AnnSearchErrors> {
+        match &self.vector_store {
+            Some(store) => store.stage_copy_into(dir, staged),
+            None => Ok(()),
+        }
+    }
+
+    fn load_aux(&mut self, dir: &Path) -> Result<(), AnnSearchErrors> {
+        if let Some(meta) = self.store_meta {
+            meta.check(self.n, self.dim)?;
+        }
+        self.vector_store = MmapVectorStore::open_in_dir(dir, self.store_meta)?;
+
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -957,8 +1310,468 @@ mod tests {
         data
     }
 
+    /// Deterministic data with both signs present
+    ///
+    /// `create_test_data` ramps upwards from zero, so every sign-based code
+    /// comes out as all ones, every Hamming distance is 0 and any assertion on
+    /// neighbour identity is vacuous. Anything testing the sign path needs
+    /// this instead.
+    ///
+    /// ### Params
+    ///
+    /// * `n` - Rows
+    /// * `dim` - Columns
+    /// * `seed` - Seed for reproducibility
+    ///
+    /// ### Returns
+    ///
+    /// An `n` x `dim` matrix of uniform values in `[-1, 1)`.
+    fn create_signed_test_data(n: usize, dim: usize, seed: u64) -> Mat<f32> {
+        use rand::rngs::StdRng;
+        use rand::{Rng, SeedableRng};
+
+        let mut rng = StdRng::seed_from_u64(seed);
+
+        Mat::from_fn(n, dim, |_, _| rng.random::<f32>() * 2.0 - 1.0)
+    }
+
     fn get_default_k_means() -> Option<KMeansTrainingParams> {
         Some(KMeansTrainingParams::new(10, None, None))
+    }
+
+    /// Sign-based binarisation ignores `n_bits` and emits `dim` bits, so the
+    /// code stride must come from the binariser. Taking it from `n_bits`
+    /// instead used to walk `optimise_memory_layout` off the end of
+    /// `vectors_flat_binarised` whenever `n_bits != dim`.
+    #[test]
+    fn test_sign_based_stride_ignores_n_bits() {
+        let (n, dim) = (128, 32);
+        let data = create_signed_test_data(n, dim, 7);
+
+        for n_bits in [8, 32, 64, 128] {
+            let index = IvfIndexBinary::build(
+                data.as_ref(),
+                "sign",
+                n_bits,
+                Dist::Cosine,
+                Some(4),
+                get_default_k_means(),
+                42,
+                false,
+            )
+            .unwrap();
+
+            assert_eq!(index.n_bytes, dim / 8, "stride tracked n_bits = {}", n_bits);
+            assert_eq!(index.vectors_flat_binarised.len(), index.n * index.n_bytes);
+
+            // With mixed signs every code is distinct, so a stored vector must
+            // find itself at Hamming distance 0 before anything else. A wrong
+            // but in-bounds stride reads a neighbour's bytes and fails here
+            for row in [0, 17, 63, 127] {
+                let query: Vec<f32> = data.row(row).iter().cloned().collect();
+                let (indices, dists) = index.query(&query, 5, Some(4)).unwrap();
+
+                assert_eq!(indices.len(), 5);
+                assert_eq!(indices[0], row, "self-retrieval failed, n_bits = {n_bits}");
+                assert_eq!(dists[0], 0);
+            }
+        }
+    }
+
+    /// `offsets` partitions the physical index space, and empty cells share an
+    /// offset with their successor. `cell_of` must land on the owner, never on
+    /// an empty cell.
+    #[test]
+    fn test_cell_of_skips_empty_cells() {
+        let data = create_signed_test_data(8, 8, 1);
+        let mut index = IvfIndexBinary::build(
+            data.as_ref(),
+            "sign",
+            8,
+            Dist::SquaredEuclidean,
+            Some(3),
+            get_default_k_means(),
+            42,
+            false,
+        )
+        .unwrap();
+
+        // Cell 1 empty, cell 0 holds slots 0-1, cell 2 holds slot 2
+        index.offsets = vec![0, 2, 2, 3];
+
+        assert_eq!(index.cell_of(0), 0);
+        assert_eq!(index.cell_of(1), 0);
+        assert_eq!(index.cell_of(2), 2);
+    }
+
+    /// The acceptance criterion for residual coding: re-encoding a stored
+    /// vector against its own cell must reproduce the stored code byte for
+    /// byte. If the build and query sides ever disagree on the scale pair, the
+    /// asymmetric dot is taken against a different code than the one stored and
+    /// recall degrades with nothing else failing.
+    #[test]
+    fn test_residual_codes_round_trip_through_the_encoder() {
+        for metric in [Dist::SquaredEuclidean, Dist::Cosine] {
+            for dim in [30, 31, 32] {
+                let n = 96;
+                let data = create_signed_test_data(n, dim, 13);
+
+                let index = IvfIndexBinary::build(
+                    data.as_ref(),
+                    "sign",
+                    32,
+                    metric,
+                    Some(4),
+                    get_default_k_means(),
+                    42,
+                    false,
+                )
+                .unwrap();
+
+                assert!(index.residual_codes, "sign-based must encode residuals");
+
+                let mut scratch = vec![0u8; index.n_bytes];
+
+                for row in [0, 1, 17, 48, 95] {
+                    let vec: Vec<f32> = data.row(row).iter().cloned().collect();
+                    let norm = f32::calculate_l2_norm(&vec);
+
+                    let physical = index.old_to_new[row];
+                    let cell = index.cell_of(physical);
+
+                    index.encode_for_cell(&vec, norm, cell, &mut scratch);
+
+                    let stored = &index.vectors_flat_binarised
+                        [physical * index.n_bytes..(physical + 1) * index.n_bytes];
+
+                    assert_eq!(
+                        scratch, stored,
+                        "frame mismatch at row {row}, dim {dim}, metric {metric:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Residual codes only make sense inside a cell, so the binary-only kNN
+    /// graph, which scans every cluster, has to refuse rather than return a
+    /// quietly degraded graph.
+    #[test]
+    fn test_knn_graph_without_store_rejects_residual_codes() {
+        let data = create_signed_test_data(64, 16, 4);
+        let index = IvfIndexBinary::build(
+            data.as_ref(),
+            "sign",
+            16,
+            Dist::SquaredEuclidean,
+            Some(4),
+            get_default_k_means(),
+            42,
+            false,
+        )
+        .unwrap();
+
+        assert!(matches!(
+            index.generate_knn(5, Some(4), None, true, false),
+            Err(AnnSearchErrors::ResidualCodesRequireVectorStore)
+        ));
+
+        // The projection methods keep a global frame, so they still work
+        let projection = IvfIndexBinary::build(
+            data.as_ref(),
+            "random",
+            16,
+            Dist::SquaredEuclidean,
+            Some(4),
+            get_default_k_means(),
+            42,
+            false,
+        )
+        .unwrap();
+
+        assert!(projection.generate_knn(5, Some(4), None, true, false).is_ok());
+    }
+
+    /// An all-zero row has no direction, so the Cosine scale pair degenerates.
+    /// It must fall back rather than emit NaN or an all-ones code.
+    #[test]
+    fn test_residual_codes_survive_zero_norm_rows() {
+        let dim = 16;
+        let mut data = create_signed_test_data(64, dim, 6);
+        for j in 0..dim {
+            data[(7, j)] = 0.0;
+        }
+
+        let index = IvfIndexBinary::build(
+            data.as_ref(),
+            "sign",
+            16,
+            Dist::Cosine,
+            Some(4),
+            get_default_k_means(),
+            42,
+            false,
+        )
+        .unwrap();
+
+        let zero = vec![0.0f32; dim];
+        let (indices, dists) = index.query(&zero, 5, Some(4)).unwrap();
+
+        assert_eq!(indices.len(), 5);
+        assert!(dists.iter().all(|d| *d <= (dim as u32)));
+
+        // and the all-zero row's own code must not be degenerate
+        let physical = index.old_to_new[7];
+        let code =
+            &index.vectors_flat_binarised[physical * index.n_bytes..(physical + 1) * index.n_bytes];
+        let set: u32 = code.iter().map(|b| b.count_ones()).sum();
+
+        assert!(set > 0 && set < dim as u32, "degenerate code: {set} bits set");
+    }
+
+    /// Brute-force top-k by squared Euclidean distance
+    ///
+    /// Ground truth for the recall assertions below.
+    ///
+    /// ### Params
+    ///
+    /// * `data` - Index matrix
+    /// * `query` - Query vector
+    /// * `k` - Number of neighbours
+    ///
+    /// ### Returns
+    ///
+    /// The `k` nearest row indices, nearest first.
+    fn brute_force(data: &Mat<f32>, query: &[f32], k: usize) -> Vec<usize> {
+        let mut scored: Vec<(usize, f32)> = (0..data.nrows())
+            .map(|i| {
+                let d: f32 = (0..data.ncols())
+                    .map(|j| (data[(i, j)] - query[j]).powi(2))
+                    .sum();
+                (i, d)
+            })
+            .collect();
+
+        scored.sort_unstable_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
+        scored.truncate(k);
+
+        scored.into_iter().map(|(i, _)| i).collect()
+    }
+
+    /// Gaussian blobs whose centres sit far from the origin
+    ///
+    /// The regime that defeats raw sign binarisation: the cluster offset
+    /// dominates the within-cluster spread, so every member of a cluster shares
+    /// almost every sign bit and the code identifies the cluster rather than
+    /// the point.
+    ///
+    /// ### Params
+    ///
+    /// * `n` - Rows
+    /// * `dim` - Columns
+    /// * `n_clusters` - Number of blobs
+    /// * `seed` - Seed for reproducibility
+    ///
+    /// ### Returns
+    ///
+    /// An `n` x `dim` matrix.
+    fn create_clustered_test_data(
+        n: usize,
+        dim: usize,
+        n_clusters: usize,
+        seed: u64,
+    ) -> Mat<f32> {
+        use rand::rngs::StdRng;
+        use rand::{Rng, SeedableRng};
+
+        let mut rng = StdRng::seed_from_u64(seed);
+
+        let centres: Vec<Vec<f32>> = (0..n_clusters)
+            .map(|_| (0..dim).map(|_| rng.random_range(-7.5..7.5)).collect())
+            .collect();
+
+        Mat::from_fn(n, dim, |i, j| {
+            centres[i % n_clusters][j] + (rng.random::<f32>() * 2.0 - 1.0)
+        })
+    }
+
+    /// Recall on clustered data, which is the regime residual coding exists for
+    ///
+    /// Codes taken in the global frame carry the cluster label and nothing
+    /// else, so the Hamming stage orders within-cluster candidates by noise and
+    /// recall collapses towards chance. Against the cell centroid the bits
+    /// carry within-cluster structure instead.
+    ///
+    /// Measured on this fixture, 8 blobs at dim 32 with 32-bit codes:
+    ///
+    /// | rerank_factor | nprobe | recall@10 |
+    /// |---------------|--------|-----------|
+    /// | 5             | 8      | 0.553     |
+    /// | 10            | 8      | 0.739     |
+    /// | 25            | 8      | 0.950     |
+    /// | 50            | 8      | 0.997     |
+    /// | 10            | 16     | 0.542     |
+    /// | 50            | 16     | 0.950     |
+    ///
+    /// Raw sign coding scored 0.584 where residual coding scores 0.739. Two
+    /// things to read off: recall is bought with pool width, because 32 sign
+    /// bits are a coarse ordering, and a *wider* nprobe at fixed pool width is
+    /// worse, because the extra cells contribute candidates in other frames
+    /// that crowd out the true neighbours. See [`IvfIndexBinary::query`].
+    #[test]
+    fn test_reranking_recall_on_clustered_data() {
+        let (n, dim, k) = (2000, 32, 10);
+        let data = create_clustered_test_data(n, dim, 8, 21);
+        let temp_dir = TempDir::new().unwrap();
+
+        let index = IvfIndexBinary::build_with_vector_store(
+            data.as_ref(),
+            "sign",
+            dim,
+            Dist::SquaredEuclidean,
+            Some(16),
+            get_default_k_means(),
+            42,
+            false,
+            temp_dir.path(),
+        )
+        .unwrap();
+
+        let mut hits = 0;
+        let mut total = 0;
+
+        for row in (0..n).step_by(53) {
+            let query: Vec<f32> = data.row(row).iter().cloned().collect();
+            let truth = brute_force(&data, &query, k);
+
+            // rerank_factor 10, not 25: at 25 the Hamming stage already returns
+            // a quarter of the corpus and pool geometry alone forces ~1.0, so
+            // the assertion would pass with the codes disabled entirely
+            let (got, _) = index.query_reranking(&query, k, Some(8), Some(10)).unwrap();
+
+            hits += got.iter().filter(|i| truth.contains(i)).count();
+            total += k;
+        }
+
+        let recall = hits as f64 / total as f64;
+
+        // Global sign coding scores 0.584 here, residual coding 0.739. The floor
+        // sits between them so reverting the residual frame fails this test
+        assert!(
+            recall > 0.65,
+            "recall@{k} on clustered data collapsed to {recall:.3}"
+        );
+    }
+
+    /// `query_reranking` used to pass `k` as the *k* argument to
+    /// `query_asymmetric`, which truncates to that argument internally. The
+    /// exact stage was then handed exactly `k` candidates and could only
+    /// reorder them, never recover a neighbour the binary stages had dropped,
+    /// so re-ranking was a no-op for recall. It must see `k * rerank_factor`.
+    #[test]
+    fn test_reranking_widens_the_candidate_pool() {
+        let (n, dim, k, rerank_factor) = (512, 32, 10, 8);
+        let data = create_signed_test_data(n, dim, 3);
+        let temp_dir = TempDir::new().unwrap();
+
+        let index = IvfIndexBinary::build_with_vector_store(
+            data.as_ref(),
+            "sign",
+            dim,
+            Dist::SquaredEuclidean,
+            Some(8),
+            get_default_k_means(),
+            42,
+            false,
+            temp_dir.path(),
+        )
+        .unwrap();
+
+        let mut differs = 0;
+        let mut hits_rerank = 0;
+        let mut hits_asym = 0;
+
+        for row in (0..n).step_by(37) {
+            let query: Vec<f32> = data.row(row).iter().cloned().collect();
+            let truth = brute_force(&data, &query, k);
+
+            // Exactly what the exact stage used to be handed
+            let (asym, _) = index
+                .query_asymmetric(&query, k, Some(8), Some(2 * rerank_factor))
+                .unwrap();
+            let (rerank, _) = index
+                .query_reranking(&query, k, Some(8), Some(rerank_factor))
+                .unwrap();
+
+            if rerank.iter().any(|i| !asym.contains(i)) {
+                differs += 1;
+            }
+            hits_asym += asym.iter().filter(|i| truth.contains(i)).count();
+            hits_rerank += rerank.iter().filter(|i| truth.contains(i)).count();
+        }
+
+        assert!(
+            differs > 0,
+            "re-ranking returned a permutation of the asymmetric top-k on every \
+             query, so the exact stage never saw a wider pool"
+        );
+        assert!(
+            hits_rerank > hits_asym,
+            "re-ranking did not improve recall: {hits_rerank} vs {hits_asym} hits"
+        );
+    }
+
+    /// A `dim` that is not a multiple of 8 leaves a partial last byte. The
+    /// padding bits are zero-filled on both sides, so they XOR away, but
+    /// nothing pinned that.
+    #[test]
+    fn test_sign_based_handles_partial_last_byte() {
+        for dim in [30, 31, 32] {
+            let data = create_signed_test_data(96, dim, 7);
+            let index = IvfIndexBinary::build(
+                data.as_ref(),
+                "sign",
+                32,
+                Dist::Cosine,
+                Some(4),
+                get_default_k_means(),
+                42,
+                false,
+            )
+            .unwrap();
+
+            assert_eq!(index.n_bytes, dim.div_ceil(8));
+            assert_eq!(index.vectors_flat_binarised.len(), index.n * index.n_bytes);
+
+            let query: Vec<f32> = data.row(5).iter().cloned().collect();
+            let (indices, dists) = index.query(&query, 3, Some(4)).unwrap();
+
+            assert_eq!(indices[0], 5, "self-retrieval failed at dim = {dim}");
+            assert_eq!(dists[0], 0);
+        }
+    }
+
+    /// The projection-based methods still take their stride from `n_bits`.
+    #[test]
+    fn test_projection_stride_follows_n_bits() {
+        let data = create_test_data::<f32>(128, 32);
+
+        for n_bits in [16, 64] {
+            let index = IvfIndexBinary::build(
+                data.as_ref(),
+                "random",
+                n_bits,
+                Dist::Cosine,
+                Some(4),
+                get_default_k_means(),
+                42,
+                false,
+            )
+            .unwrap();
+
+            assert_eq!(index.n_bytes, n_bits / 8);
+            assert_eq!(index.vectors_flat_binarised.len(), index.n * index.n_bytes);
+        }
     }
 
     #[test]

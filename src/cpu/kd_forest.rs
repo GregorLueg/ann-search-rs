@@ -36,6 +36,7 @@ use crate::utils::*;
 /// through a separate array.
 #[derive(Clone, Copy, Debug)]
 #[repr(C)]
+#[cfg_attr(feature = "serialise", derive(serde::Serialize, serde::Deserialize))]
 struct KdFlatNode<T> {
     /// `1` for leaf, `2` for split node
     n_descendants: u32,
@@ -94,6 +95,7 @@ const SUBSAMPLE_SIZE: usize = 128;
 /// For Cosine metric, trees are built on normalised vectors so that
 /// axis-aligned splits respect angular geometry. The normalised copy is
 /// discarded after construction; only the raw vectors are stored.
+#[cfg_attr(feature = "serialise", derive(serde::Serialize, serde::Deserialize))]
 pub struct KdTreeIndex<T> {
     /// Original vector data, flattened for cache locality
     pub vectors_flat: Vec<T>,
@@ -870,6 +872,20 @@ where
 ///////////
 // Tests //
 ///////////
+
+/////////////
+// IndexIo //
+/////////////
+
+#[cfg(feature = "serialise")]
+impl<T> IndexIo for KdTreeIndex<T>
+where
+    T: AnnSearchFloat,
+{
+    type Elem = T;
+
+    const KIND: &'static str = "kd_forest";
+}
 
 #[cfg(test)]
 mod tests {

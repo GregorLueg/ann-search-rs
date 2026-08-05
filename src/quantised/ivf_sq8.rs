@@ -24,6 +24,7 @@ use crate::utils::k_means_utils::*;
 ////////////////
 
 /// IVF index quantised to scalar 8 bits
+#[cfg_attr(feature = "serialise", derive(serde::Serialize, serde::Deserialize))]
 pub struct IvfSq8Index<T> {
     /// The original vectors quantised to `i8`.
     quantised_vectors: Vec<i8>,
@@ -575,6 +576,20 @@ where
 ///////////
 // Tests //
 ///////////
+
+/////////////
+// IndexIo //
+/////////////
+
+#[cfg(feature = "serialise")]
+impl<T> IndexIo for IvfSq8Index<T>
+where
+    T: AnnSearchFloat,
+{
+    type Elem = T;
+
+    const KIND: &'static str = "ivf_sq8";
+}
 
 #[cfg(test)]
 mod tests {

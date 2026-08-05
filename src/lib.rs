@@ -30,6 +30,9 @@ pub mod quantised;
 #[cfg(feature = "binary")]
 pub mod binary;
 
+#[cfg(feature = "serialise")]
+pub mod serialise;
+
 use faer::MatRef;
 use rayon::prelude::*;
 
@@ -46,8 +49,11 @@ use std::ops::AddAssign;
 
 #[cfg(feature = "binary")]
 use bytemuck::Pod;
-#[cfg(feature = "binary")]
+#[cfg(any(feature = "binary", feature = "serialise"))]
 use std::path::Path;
+
+#[cfg(feature = "serialise")]
+use crate::serialise::IndexIo;
 
 use crate::cpu::{
     annoy::*, ball_tree::*, exhaustive::*, hnsw::*, ivf::*, kd_forest::*, kmknn::*, lsh::*,
@@ -197,6 +203,54 @@ where
     } else {
         Ok((indices, None))
     }
+}
+
+///////////////////////
+// Saving & loading //
+///////////////////////
+
+/// Save an index to disk
+///
+/// The index is written into `dir` as a self-contained bundle: the payload
+/// lands in `index.bin`, and the binary indices additionally copy their on-disk
+/// re-ranking store alongside it. The directory is created if it does not
+/// exist, and an index already saved there is overwritten.
+///
+/// ### Params
+///
+/// * `index` - The index to save
+/// * `dir` - Target directory
+///
+/// ### Returns
+///
+/// `Ok(())`, or an IO / encoding error.
+#[cfg(feature = "serialise")]
+pub fn save_index<I>(index: &I, dir: impl AsRef<Path>) -> Result<(), AnnSearchErrors>
+where
+    I: IndexIo,
+{
+    index.save_index(dir)
+}
+
+/// Load an index from disk
+///
+/// Reads a directory written by [`save_index`]. The index type and the float
+/// type must match what was saved; both are checked against the file header
+/// before anything is decoded.
+///
+/// ### Params
+///
+/// * `dir` - Directory holding `index.bin`
+///
+/// ### Returns
+///
+/// The reconstructed index, or the first mismatch / IO / decoding error.
+#[cfg(feature = "serialise")]
+pub fn load_index<I>(dir: impl AsRef<Path>) -> Result<I, AnnSearchErrors>
+where
+    I: IndexIo,
+{
+    I::load_index(dir)
 }
 
 ////////////////
@@ -2365,7 +2419,7 @@ pub fn build_exhaustive_index_gpu<T, R>(
     device: R::Device,
 ) -> Result<ExhaustiveIndexGpu<T, R>, AnnSearchErrors>
 where
-    T: AnnSearchGpuFloat + AnnSearchFloat,
+    T: CubeclFloat + AnnSearchFloat,
     R: Runtime,
 {
     let metric = parse_ann_dist(dist_metric).unwrap_or_else(|| {
@@ -2396,7 +2450,7 @@ pub fn query_exhaustive_index_gpu<T, R>(
     verbose: bool,
 ) -> KnnOptionResult<T>
 where
-    T: AnnSearchGpuFloat + AnnSearchFloat,
+    T: CubeclFloat + AnnSearchFloat,
     R: Runtime,
 {
     let (indices, distances) = index.query_batch(query_mat, k, verbose)?;
@@ -2430,7 +2484,7 @@ pub fn query_exhaustive_index_gpu_self<T, R>(
     verbose: bool,
 ) -> KnnOptionResult<T>
 where
-    T: AnnSearchGpuFloat + AnnSearchFloat,
+    T: CubeclFloat + AnnSearchFloat,
     R: Runtime,
 {
     let res = index.generate_knn(k, return_dist, verbose)?;
@@ -2468,7 +2522,7 @@ pub fn build_ivf_index_gpu<T, R>(
 ) -> Result<IvfIndexGpu<T, R>, AnnSearchErrors>
 where
     R: Runtime,
-    T: AnnSearchFloat + AnnSearchGpuFloat,
+    T: AnnSearchFloat + CubeclFloat,
 {
     let metric = parse_ann_dist(dist_metric).unwrap_or_else(|| {
         println!("[WARNING] Weird string used for distance metric. Using default squared Euclidean distance");
@@ -2504,7 +2558,7 @@ pub fn query_ivf_index_gpu<T, R>(
 ) -> KnnOptionResult<T>
 where
     R: Runtime,
-    T: AnnSearchFloat + AnnSearchGpuFloat,
+    T: AnnSearchFloat + CubeclFloat,
 {
     let (indices, distances) = index.query_batch(query_mat, k, nprobe, nquery, verbose)?;
 
@@ -2543,7 +2597,7 @@ pub fn query_ivf_index_gpu_self<T, R>(
 ) -> KnnOptionResult<T>
 where
     R: Runtime,
-    T: AnnSearchFloat + AnnSearchGpuFloat,
+    T: AnnSearchFloat + CubeclFloat,
 {
     index.generate_knn(k, nprobe, nquery, return_dist, verbose)
 }
@@ -2588,7 +2642,7 @@ pub fn build_nndescent_index_gpu<T, R>(
 ) -> Result<NNDescentGpu<T, R>, AnnSearchErrors>
 where
     R: Runtime,
-    T: AnnSearchFloat + AnnSearchGpuFloat,
+    T: AnnSearchFloat + CubeclFloat,
 {
     let metric = parse_ann_dist(dist_metric).unwrap_or_else(|| {
         println!("[WARNING] Weird string used for distance metric. Using default squared Euclidean distance");
@@ -2627,7 +2681,7 @@ pub fn query_nndescent_index_gpu<T, R>(
 ) -> KnnOptionResult<T>
 where
     R: Runtime,
-    T: AnnSearchFloat + AnnSearchGpuFloat,
+    T: AnnSearchFloat + CubeclFloat,
 {
     let n_queries = query_mat.nrows();
 
@@ -2676,7 +2730,7 @@ pub fn extract_nndescent_knn_gpu<T, R>(
 ) -> (Vec<Vec<usize>>, Option<Vec<Vec<T>>>)
 where
     R: Runtime,
-    T: AnnSearchFloat + AnnSearchGpuFloat,
+    T: AnnSearchFloat + CubeclFloat,
 {
     index.extract_knn(return_dist)
 }
@@ -2706,7 +2760,7 @@ pub fn query_nndescent_index_gpu_self<T, R>(
 ) -> KnnOptionResult<T>
 where
     R: Runtime,
-    T: AnnSearchFloat + AnnSearchGpuFloat,
+    T: AnnSearchFloat + CubeclFloat,
 {
     let (indices, distances) = index.self_query_gpu(k, query_params, 42)?;
 
@@ -2753,7 +2807,7 @@ pub fn build_knn_graph_gpu<T, R>(
 ) -> Result<crate::gpu::nndescent_gpu::KnnGraphGpu<T>, AnnSearchErrors>
 where
     R: Runtime,
-    T: AnnSearchFloat + AnnSearchGpuFloat,
+    T: AnnSearchFloat + CubeclFloat,
 {
     let metric = parse_ann_dist(dist_metric).unwrap_or_else(|| {
         println!("[WARNING] Weird string used for distance metric. Using default squared Euclidean distance");
@@ -2815,9 +2869,10 @@ where
 /// ### Params
 ///
 /// * `mat` - The initial matrix with samples x features
-/// * `n_bits` - Number of bits per binary code (must be multiple of 8)
+/// * `n_bits` - Number of bits per binary code (must be multiple of 8).
+///   Ignored by "sign", which always emits `dim` bits.
 /// * `seed` - Random seed for binariser
-/// * `binary_init` - Initialisation method ("itq" or "random")
+/// * `binary_init` - Initialisation method: "random", "pca" or "sign"
 /// * `dist_metric` - Distance metric: "euclidean" or "cosine". "manhatten" is
 ///   not supported.
 /// * `save_store` - Whether to save vector store for reranking
@@ -2953,8 +3008,12 @@ where
 /// ### Params
 ///
 /// * `mat` - Data matrix [samples, features]
-/// * `binarisation_init` - "itq" or "random"
-/// * `n_bits` - Number of bits per code (multiple of 8)
+/// * `binarisation_init` - "random", "pca" or "sign". "sign" encodes the
+///   residual against each vector's assigned centroid rather than the raw
+///   vector, so its codes are only comparable within a Voronoi cell; see
+///   [`IvfIndexBinary::query`].
+/// * `n_bits` - Number of bits per code (multiple of 8). Ignored by "sign",
+///   which always emits `dim` bits.
 /// * `nlist` - Number of clusters (defaults to √n)
 /// * `k_means_params` - Optional k-means trainings parameters, see
 ///   [KMeansTrainingParams]. If not provided, will default to sensible
@@ -3080,6 +3139,14 @@ where
 /// Query an IVF binary index against itself
 ///
 /// Generates a full kNN graph based on the internal data.
+///
+/// ### Note
+///
+/// A `"sign"` index stores codes relative to each cell's centroid, which are
+/// only comparable within a cell, so building the graph needs the float
+/// vectors. Without a vector store this returns
+/// [`AnnSearchErrors::ResidualCodesRequireVectorStore`] rather than a quietly
+/// degraded graph. Build with `save_store = true`.
 ///
 /// ### Params
 ///

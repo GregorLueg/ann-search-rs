@@ -7,9 +7,9 @@
 
 Various approximate nearest neighbour/vector searches implemented in Rust (with
 focus on computational biology applications, very specifically single cell). The
-search algorithms are designed for high in-memory performance. Longer term,
-I might add the option to add/remove vectors from some of the indices and
-persistent on-disk storage.
+search algorithms are designed for high in-memory performance. Indices can be
+saved to disk and loaded back in via the `serialise` feature. Longer term, I
+might add the option to add/remove vectors from some of the indices.
 
 ## Table of Contents
 
@@ -21,6 +21,7 @@ persistent on-disk storage.
 - [FEATURE: quantisation](#quantised-indices)
 - [FEATURE: GPU acceleration](#gpu)
 - [FEATURE: Binary indices](#binarised-indices)
+- [FEATURE: Saving and loading](#saving-and-loading-indices)
 
 ## Description
 
@@ -317,7 +318,12 @@ For the most extreme compression needs, binary indices are also provided. There
 are two approaches for binarisation available in the crate:
 
 - Bitwise binarisation either leveraging a SimHash random projection, PCA
-  hashing or signed-based binarisation.
+  hashing or sign-based binarisation. Sign bits taken in the global frame tell
+  you which cluster a point sits in, not where it sits inside that cluster, and
+  the latter is what a kNN search needs. SimHash and PCA hashing centre on a
+  per-feature mean; sign-based centres only on an IVF index, where it takes the
+  residual against each vector's own cell centroid. Both are trades rather than
+  free wins, see `CHANGELOG.md` for the regimes where each helps and hurts.
 - [RaBitQ](https://arxiv.org/abs/2405.12497) binarisation while storing
   additional data for approximate distance calculations.
 - [TurboQuant](https://arxiv.org/abs/2504.19874) a data-oblivious quantiser that
@@ -334,6 +340,63 @@ ann-search-rs = { version = "*", features = ["binary"] }
 ```
 
 The benchmarks can be found [here](https://github.com/GregorLueg/ann-search-rs/blob/main/docs/benchmarks_binary.md).
+
+## Saving and loading indices
+
+Building an index over a few million cells takes minutes. Doing it again on
+every process start gets old fast. The `serialise` feature adds `save_index` and
+`load_index` to every CPU, quantised and binary index:
+
+```toml
+[dependencies]
+ann-search-rs = { version = "*", features = ["serialise"] }
+```
+
+```rust
+use ann_search_rs::cpu::hnsw::HnswIndex;
+use ann_search_rs::{build_hnsw_index, load_index, save_index};
+
+let index = build_hnsw_index(mat.as_ref(), 16, 200, "cosine", 42, false);
+save_index(&index, "my_index")?;
+
+let index: HnswIndex<f32> = load_index("my_index")?;
+```
+
+The `IndexIo` trait is in the prelude, so with
+`use ann_search_rs::prelude::*;` the method form
+`index.save_index("my_index")` and `HnswIndex::<f32>::load_index("my_index")`
+works directly. The index types themselves live in their own modules, not the
+prelude.
+
+An index is a *directory*, not a single file. `index.bin` holds the payload
+(serde plus bincode, little-endian, variable-length integers so the file moves
+between 32- and 64-bit machines). The binary indices additionally carry their
+on-disk re-ranking store into the same directory, so a saved index is
+self-contained and can be moved. Saving into the directory the store already
+lives in skips the copy. Note the store files are raw native-endian dumps, so a
+bundle carrying one does not survive a move between a little- and a big-endian
+machine, even though `index.bin` on its own would.
+
+```
+my_index/
+  index.bin
+  vectors_flat.bin   # binary indices with a re-ranking store
+  norms.bin
+```
+
+`index.bin` opens with a header recording the format version, the index kind and
+the float width. Loading an HNSW index as an IVF one, or an `f32` index as
+`f64`, gives you a typed error rather than garbage.
+
+Saving is atomic in the sense that matters: every file goes to a temporary name
+first, and `index.bin` is the last thing renamed into place. A save that dies
+half way leaves the previous bundle alone, or leaves no `index.bin` and fails
+loudly on the next load. It never leaves a directory that loads clean and
+answers wrongly.
+
+The GPU indices are not covered. They hold live device handles, and
+`IvfIndexGpu` keeps its centroids on the GPU with no host copy, so persisting
+them needs more than a derive. Watch this space.
 
 ## Licence
 

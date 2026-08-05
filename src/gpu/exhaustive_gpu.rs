@@ -4,9 +4,9 @@ use cubecl::prelude::*;
 use faer::MatRef;
 use num_traits::Float;
 use rayon::prelude::*;
+use cubecl_utils_rs::prelude::*;
 
 use crate::gpu::dist_gpu::*;
-use crate::gpu::*;
 use crate::prelude::*;
 
 ////////////////////////
@@ -39,7 +39,7 @@ pub struct ExhaustiveIndexGpu<T: Float, R: Runtime> {
 impl<T, R> DimensionValidation for ExhaustiveIndexGpu<T, R>
 where
     R: Runtime,
-    T: AnnSearchGpuFloat + AnnSearchFloat,
+    T: CubeclFloat + AnnSearchFloat,
 {
     // needs to be allowed here, because dim_padded is the relevant dim for GPU
     // indices
@@ -56,7 +56,7 @@ where
 impl<T, R> ExhaustiveIndexGpu<T, R>
 where
     R: Runtime,
-    T: AnnSearchGpuFloat + AnnSearchFloat,
+    T: CubeclFloat + AnnSearchFloat,
 {
     /// Generate a new exhaustive index (on the GPU)
     ///

@@ -520,6 +520,14 @@ impl HnswState<f64> for HnswIndex<f64> {
 /// Implements the HNSW algorithm with multi-layer neighbour storage. Each node
 /// maintains separate neighbour lists for each layer it appears in, enabling
 /// efficient hierarchical search.
+// `bound = ""` because the struct already carries `T: AnnSearchFloat`, which
+// implies the serde bounds; letting the derive add its own on top makes `T:
+// Deserialize` ambiguous
+#[cfg_attr(
+    feature = "serialise",
+    derive(serde::Serialize, serde::Deserialize),
+    serde(bound = "")
+)]
 pub struct HnswIndex<T>
 where
     T: AnnSearchFloat,
@@ -1484,6 +1492,20 @@ where
 ///////////
 // Tests //
 ///////////
+
+/////////////
+// IndexIo //
+/////////////
+
+#[cfg(feature = "serialise")]
+impl<T> IndexIo for HnswIndex<T>
+where
+    T: AnnSearchFloat,
+{
+    type Elem = T;
+
+    const KIND: &'static str = "hnsw";
+}
 
 #[cfg(test)]
 mod tests {

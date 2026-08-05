@@ -1,5 +1,55 @@
 # News
 
+## 0.5.0
+
+**Features**
+
+- New `serialise` feature: save indices to disk and load them back. Covers all
+  CPU, quantised and binary indices via the `IndexIo` trait plus `save_index` /
+  `load_index`. GPU indices are not covered yet.
+- Sign-based IVF binary indices now encode the residual against the assigned
+  cell's centroid instead of the raw vector. A trade, not a free win: better
+  recall at low `rerank_factor`, worse above roughly 15. Documented on
+  `IvfIndexBinary::query`.
+
+**Fixes**
+
+- Fixed the sign-based binariser, which was not working properly. Bad indexing
+  plus a broken asymmetric query path. It now has proper benchmarks, which is
+  why the bugs survived this long.
+- Fixed the re-ranking funnel on the sign-based path, which could never improve
+  recall because the exact stage only ever saw `k` candidates.
+- SimHash now centres the data. Without it, off-origin data put nearly every
+  point on the same side of nearly every plane. Note this breaks scale
+  invariance, so L2-normalise rows if your magnitudes vary a lot.
+- A pile of GPU device limits were assumed rather than queried, all matching
+  Apple Silicon. A kernel that busts a limit silently returns zeros, so these
+  were wrong-answer bugs on smaller devices. All staging plans and grid
+  dispatches now derive from the queried `GpuLimits`.
+
+**Breaking changes**
+
+- Shared GPU primitives moved to `cubecl-utils-rs`. `GpuTensor`, `grid_2d`,
+  `pad_vectors` and `LINE_SIZE` are gone from this crate; import them from
+  `cubecl_utils_rs::prelude`. `AnnSearchGpuFloat` is now `CubeclFloat`, still
+  re-exported from the prelude.
+- `GpuTensor::empty` / `from_slice` are fallible. `pick_wg_y`, `grid_2d` and the
+  staging planners take a `GpuLimits`.
+- `AnnSearchErrors` is `#[non_exhaustive]`; add a `_` arm. Several new variants
+  for the store and serialisation paths.
+- `Binariser::new_simhash` takes the data matrix first, to fit the centring mean.
+- `MmapVectorStore::copy_to_dir` is replaced by `stage_copy_into`, and
+  `IndexIo::save_aux` by `IndexIo::stage_aux`.
+- With `serialise` on, `AnnSearchFloat` gains `Serialize + DeserializeOwned`.
+  `f32` and `f64` are unaffected; a custom float type is not.
+
+**Chore**
+
+- `tempfile` moved to `[dev-dependencies]`, so `binary` no longer drags it into
+  normal builds.
+- `"itq"` was still documented as a valid binarisation string in five places.
+  The parser takes `"pca"`, `"random"` and `"sign"`.
+
 ## 0.4.5
 
 **Features**

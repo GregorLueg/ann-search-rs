@@ -6,8 +6,8 @@
 
 use cubecl::prelude::*;
 use std::iter::Sum;
+use cubecl_utils_rs::prelude::*;
 
-use crate::gpu::tensor::*;
 use crate::gpu::*;
 use crate::prelude::KnnResult;
 use crate::utils::dist::Dist;
@@ -215,7 +215,8 @@ pub fn cosine_tiled<F: Float, N: Size>(
     }
     let q_norm = query_norms[query_idx];
     let d_norm = db_norms[global_db_idx];
-    distances[query_idx * dist_stride as usize + db_idx] = F::new(1.0_f32) - (dot / (q_norm * d_norm));
+    distances[query_idx * dist_stride as usize + db_idx] =
+        F::new(1.0_f32) - (dot / (q_norm * d_norm));
 }
 
 /// Register-tiled Euclidean distance kernel
@@ -928,22 +929,26 @@ where
     T: Float + Sum + cubecl::CubeElement + num_traits::Float + num_traits::FromPrimitive,
 {
     let client = R::client(&device);
+    let limits = GpuLimits::from_client(&client);
     let vec_size = LINE_SIZE;
     let dim_lines = dim / vec_size;
-    let safe_worksize_y = pick_wg_y(dim)?;
+    let safe_worksize_y = pick_wg_y(dim, size_of::<T>(), &limits)?;
 
     let n_query_chunks = query_data.n.div_ceil(QUERY_CHUNK_SIZE);
-    let n_db_chunks = db_data.n.div_ceil(DB_CHUNK_SIZE);
+    // The DB chunk shrinks when the distance transient would not fit one
+    // binding on this device. On a 4 GiB binding limit it is the full chunk.
+    let db_chunk = plan_db_chunk(QUERY_CHUNK_SIZE.min(query_data.n), size_of::<T>(), &limits);
+    let n_db_chunks = db_data.n.div_ceil(db_chunk);
 
     // Single DB upload for the entire query
-    let db_gpu = GpuTensor::<R, T>::from_slice(db_data.data, vec![db_data.n, dim], &client);
+    let db_gpu = GpuTensor::<R, T>::from_slice(db_data.data, vec![db_data.n, dim], &client)?;
 
     let db_norms_gpu = if *metric == Dist::Cosine {
         Some(GpuTensor::<R, T>::from_slice(
             db_data.norm,
             vec![db_data.n],
             &client,
-        ))
+        )?)
     } else {
         None
     };
@@ -951,7 +956,7 @@ where
     let mut all_indices = Vec::with_capacity(query_data.n);
     let mut all_distances = Vec::with_capacity(query_data.n);
 
-    let max_db_chunk = DB_CHUNK_SIZE.min(db_data.n);
+    let max_db_chunk = db_chunk.min(db_data.n);
 
     for query_chunk_idx in 0..n_query_chunks {
         if verbose && query_chunk_idx % 10 == 0 {
@@ -969,28 +974,31 @@ where
             &query_data.data[query_start * dim..query_end * dim],
             vec![n_q, dim],
             &client,
-        );
+        )?;
 
         let query_norms_gpu = if *metric == Dist::Cosine {
             Some(GpuTensor::<R, T>::from_slice(
                 &query_data.norm[query_start..query_end],
                 vec![n_q],
                 &client,
-            ))
+            )?)
         } else {
             None
         };
 
         // Running top-k buffer (no ping-pong needed)
-        let topk_dists = GpuTensor::<R, T>::empty(vec![n_q, k], &client);
-        let topk_indices = GpuTensor::<R, u32>::empty(vec![n_q, k], &client);
+        let topk_dists = GpuTensor::<R, T>::empty(vec![n_q, k], &client)?;
+        let topk_indices = GpuTensor::<R, u32>::empty(vec![n_q, k], &client)?;
 
+        // The x axis is the neighbour count, with y and z already carrying the
+        // query axis, so there is nothing to flatten into. Check it instead.
         let init_gx = (k as u32).div_ceil(WORKGROUP_SIZE_X);
-        let (init_gy, init_gz) = grid_2d((n_q as u32).div_ceil(safe_worksize_y));
+        let (init_gy, init_gz) = grid_2d((n_q as u32).div_ceil(safe_worksize_y), &limits)?;
+        let init_count = checked_cube_count("init_topk", init_gx, init_gy, init_gz, &limits)?;
         unsafe {
             init_topk::launch_unchecked::<T, R>(
                 &client,
-                CubeCount::Static(init_gx, init_gy, init_gz),
+                init_count,
                 CubeDim::new_2d(WORKGROUP_SIZE_X, safe_worksize_y),
                 topk_dists.clone().into_tensor_arg(),
                 topk_indices.clone().into_tensor_arg(),
@@ -999,15 +1007,15 @@ where
         }
 
         // Reusable distance buffer sized for the largest possible chunk
-        let distances_gpu = GpuTensor::<R, T>::empty(vec![n_q, max_db_chunk], &client);
+        let distances_gpu = GpuTensor::<R, T>::empty(vec![n_q, max_db_chunk], &client)?;
 
         for db_chunk_idx in 0..n_db_chunks {
-            let db_start = db_chunk_idx * DB_CHUNK_SIZE;
-            let db_end = (db_start + DB_CHUNK_SIZE).min(db_data.n);
+            let db_start = db_chunk_idx * db_chunk;
+            let db_end = (db_start + db_chunk).min(db_data.n);
             let n_db = db_end - db_start;
 
             let grid_x = (n_db as u32).div_ceil(WORKGROUP_SIZE_X);
-            let (grid_y, grid_z) = grid_2d((n_q as u32).div_ceil(safe_worksize_y));
+            let (grid_y, grid_z) = grid_2d((n_q as u32).div_ceil(safe_worksize_y), &limits)?;
 
             match *metric {
                 // Register-tiled path where the tile divides the query tile
@@ -1095,7 +1103,8 @@ where
             }
 
             // Extract directly into the running top-k buffer
-            let (extract_grid_x, extract_grid_y) = grid_2d((n_q as u32).div_ceil(WORKGROUP_SIZE_X));
+            let (extract_grid_x, extract_grid_y) =
+                grid_2d((n_q as u32).div_ceil(WORKGROUP_SIZE_X), &limits)?;
             unsafe {
                 extract_topk::launch_unchecked::<T, R>(
                     &client,
@@ -1701,7 +1710,6 @@ pub fn compute_ivf_mega_euclidean_cached<F: Float, N: Size>(
     out_indices[out_offset] = real_db_idx;
 }
 
-
 /// Cosine mega kernel with shared-memory query caching.
 ///
 /// Same shared-memory caching strategy as
@@ -2275,29 +2283,33 @@ mod tests {
         device: &WgpuDevice,
     ) -> (Vec<f32>, Vec<u32>) {
         let client = WgpuRuntime::client(device);
+        let limits = GpuLimits::from_client(&client);
 
         let cd_gpu = GpuTensor::<WgpuRuntime, f32>::from_slice(
             candidate_dists,
             vec![n_queries, max_candidates],
             &client,
-        );
+        )
+        .unwrap();
         let ci_gpu = GpuTensor::<WgpuRuntime, u32>::from_slice(
             candidate_indices,
             vec![n_queries, max_candidates],
             &client,
-        );
+        )
+        .unwrap();
         let cpq_gpu = GpuTensor::<WgpuRuntime, u32>::from_slice(
             candidates_per_query,
             vec![n_queries],
             &client,
-        );
+        )
+        .unwrap();
 
-        let topk_d = GpuTensor::<WgpuRuntime, f32>::empty(vec![n_queries, k], &client);
-        let topk_i = GpuTensor::<WgpuRuntime, u32>::empty(vec![n_queries, k], &client);
+        let topk_d = GpuTensor::<WgpuRuntime, f32>::empty(vec![n_queries, k], &client).unwrap();
+        let topk_i = GpuTensor::<WgpuRuntime, u32>::empty(vec![n_queries, k], &client).unwrap();
 
         // init_topk
         let init_gx = (k as u32).div_ceil(WORKGROUP_SIZE_X);
-        let (init_gy, init_gz) = grid_2d((n_queries as u32).div_ceil(4));
+        let (init_gy, init_gz) = grid_2d((n_queries as u32).div_ceil(4), &limits).unwrap();
         unsafe {
             init_topk::launch_unchecked::<f32, WgpuRuntime>(
                 &client,
@@ -2310,7 +2322,7 @@ mod tests {
         }
 
         // serial reduce
-        let (rgx, rgy) = grid_2d((n_queries as u32).div_ceil(WORKGROUP_SIZE_X));
+        let (rgx, rgy) = grid_2d((n_queries as u32).div_ceil(WORKGROUP_SIZE_X), &limits).unwrap();
         unsafe {
             reduce_ivf_topk::launch_unchecked::<f32, WgpuRuntime>(
                 &client,
@@ -2338,33 +2350,32 @@ mod tests {
         device: &WgpuDevice,
     ) -> (Vec<f32>, Vec<u32>) {
         let client = WgpuRuntime::client(device);
+        let limits = GpuLimits::from_client(&client);
 
         let cd_gpu = GpuTensor::<WgpuRuntime, f32>::from_slice(
             candidate_dists,
             vec![n_queries, max_candidates],
             &client,
-        );
+        )
+        .unwrap();
         let ci_gpu = GpuTensor::<WgpuRuntime, u32>::from_slice(
             candidate_indices,
             vec![n_queries, max_candidates],
             &client,
-        );
+        )
+        .unwrap();
         let cpq_gpu = GpuTensor::<WgpuRuntime, u32>::from_slice(
             candidates_per_query,
             vec![n_queries],
             &client,
-        );
-
-        let topk_d = GpuTensor::<WgpuRuntime, f32>::empty(vec![n_queries, k], &client);
-        let topk_i = GpuTensor::<WgpuRuntime, u32>::empty(vec![n_queries, k], &client);
-
-        let (rgx, rgy) = grid_2d(n_queries as u32);
-        let merge = plan_topk_merge(
-            k,
-            size_of::<f32>(),
-            client.properties().hardware.max_shared_memory_size,
         )
         .unwrap();
+
+        let topk_d = GpuTensor::<WgpuRuntime, f32>::empty(vec![n_queries, k], &client).unwrap();
+        let topk_i = GpuTensor::<WgpuRuntime, u32>::empty(vec![n_queries, k], &client).unwrap();
+
+        let (rgx, rgy) = grid_2d(n_queries as u32, &limits).unwrap();
+        let merge = plan_topk_merge(k, size_of::<f32>(), &limits).unwrap();
         unsafe {
             reduce_ivf_topk_coalesced::launch_unchecked::<f32, WgpuRuntime>(
                 &client,
@@ -2756,25 +2767,34 @@ mod tests {
         use_cached: bool,
     ) -> (Vec<f32>, Vec<u32>) {
         let client = WgpuRuntime::client(device);
+        let limits = GpuLimits::from_client(&client);
         let vec_size = LINE_SIZE;
         let dim_lines = dim / vec_size;
         let n_tasks = tasks.len();
         let q_gpu =
-            GpuTensor::<WgpuRuntime, f32>::from_slice(queries, vec![n_queries, dim], &client);
-        let db_gpu = GpuTensor::<WgpuRuntime, f32>::from_slice(db, vec![n_db, dim], &client);
+            GpuTensor::<WgpuRuntime, f32>::from_slice(queries, vec![n_queries, dim], &client)
+                .unwrap();
+        let db_gpu =
+            GpuTensor::<WgpuRuntime, f32>::from_slice(db, vec![n_db, dim], &client).unwrap();
         let task_q: Vec<u32> = tasks.iter().map(|t| t.0).collect();
         let task_db_s: Vec<u32> = tasks.iter().map(|t| t.1).collect();
         let task_wo: Vec<u32> = tasks.iter().map(|t| t.2).collect();
         let task_dc: Vec<u32> = tasks.iter().map(|t| t.3).collect();
-        let tq_gpu = GpuTensor::<WgpuRuntime, u32>::from_slice(&task_q, vec![n_tasks], &client);
-        let tds_gpu = GpuTensor::<WgpuRuntime, u32>::from_slice(&task_db_s, vec![n_tasks], &client);
-        let two_gpu = GpuTensor::<WgpuRuntime, u32>::from_slice(&task_wo, vec![n_tasks], &client);
-        let tdc_gpu = GpuTensor::<WgpuRuntime, u32>::from_slice(&task_dc, vec![n_tasks], &client);
-        let out_d = GpuTensor::<WgpuRuntime, f32>::empty(vec![n_queries, max_candidates], &client);
-        let out_i = GpuTensor::<WgpuRuntime, u32>::empty(vec![n_queries, max_candidates], &client);
+        let tq_gpu =
+            GpuTensor::<WgpuRuntime, u32>::from_slice(&task_q, vec![n_tasks], &client).unwrap();
+        let tds_gpu =
+            GpuTensor::<WgpuRuntime, u32>::from_slice(&task_db_s, vec![n_tasks], &client).unwrap();
+        let two_gpu =
+            GpuTensor::<WgpuRuntime, u32>::from_slice(&task_wo, vec![n_tasks], &client).unwrap();
+        let tdc_gpu =
+            GpuTensor::<WgpuRuntime, u32>::from_slice(&task_dc, vec![n_tasks], &client).unwrap();
+        let out_d =
+            GpuTensor::<WgpuRuntime, f32>::empty(vec![n_queries, max_candidates], &client).unwrap();
+        let out_i =
+            GpuTensor::<WgpuRuntime, u32>::empty(vec![n_queries, max_candidates], &client).unwrap();
         let max_db_count = tasks.iter().map(|t| t.3).max().unwrap_or(0);
         let gx = max_db_count.div_ceil(WORKGROUP_SIZE_X).max(1);
-        let (gy, gz) = grid_2d((n_tasks as u32).div_ceil(4));
+        let (gy, gz) = grid_2d((n_tasks as u32).div_ceil(4), &limits).unwrap();
         if use_cached {
             unsafe {
                 compute_ivf_mega_euclidean_cached::launch_unchecked::<f32, WgpuRuntime>(

@@ -12,11 +12,9 @@
 
 use bytemuck::Pod;
 use faer::{MatRef, RowRef};
-use faer_traits::ComplexField;
 use num_traits::{Float, FromPrimitive, ToPrimitive};
 use rayon::prelude::*;
 use std::collections::BinaryHeap;
-use std::iter::Sum;
 use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -35,6 +33,13 @@ use crate::prelude::*;
 ///
 /// Build once, then query or generate a full kNN graph. Immutable after
 /// construction — no add/remove.
+// `bound` is pinned because the skipped `vector_store` field makes serde
+// infer a spurious `T: Default`
+#[cfg_attr(
+    feature = "serialise",
+    derive(serde::Serialize, serde::Deserialize),
+    serde(bound = "T: AnnSearchFloat")
+)]
 pub struct TurboQuantExhaustive<T> {
     /// Encoder + flat bit-plane storage.
     quantiser: TurboQuantQuantiser<T>,
@@ -48,7 +53,13 @@ pub struct TurboQuantExhaustive<T> {
     /// Number of stored vectors.
     n: usize,
     /// Optional on-disk original vectors for exact reranking.
+    #[cfg_attr(feature = "serialise", serde(skip))]
     vector_store: Option<MmapVectorStore<T>>,
+    /// Shape of `vector_store`, so it can be re-opened after a load. Only
+    /// read by the `serialise` feature; the field is kept unconditionally so
+    /// the constructors stay free of `cfg`.
+    #[cfg_attr(not(feature = "serialise"), allow(dead_code))]
+    store_meta: Option<StoreMeta>,
 }
 
 //////////////////////////////
@@ -70,7 +81,7 @@ where
 
 impl<T> TurboQuantExhaustive<T>
 where
-    T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum + ComplexField + SimdDistance + Pod,
+    T: AnnSearchFloat + Pod,
 {
     /// Build an exhaustive TurboQuant index.
     ///
@@ -131,6 +142,7 @@ where
             corrections_f32,
             n,
             vector_store: None,
+            store_meta: None,
         })
     }
 
@@ -163,11 +175,11 @@ where
             .collect();
 
         std::fs::create_dir_all(&save_path)?;
-        let vectors_path = save_path.as_ref().join("vectors_flat.bin");
-        let norms_path = save_path.as_ref().join("norms.bin");
+        let (vectors_path, norms_path) = MmapVectorStore::<T>::paths_in(&save_path);
 
         MmapVectorStore::save(&vectors_flat, &norms, dim, n, &vectors_path, &norms_path)?;
         index.vector_store = Some(MmapVectorStore::new(vectors_path, norms_path, dim, n)?);
+        index.store_meta = Some(StoreMeta { dim, n });
 
         Ok(index)
     }
@@ -696,6 +708,39 @@ where
 ///////////
 // Tests //
 ///////////
+
+/////////////
+// IndexIo //
+/////////////
+
+#[cfg(feature = "serialise")]
+use crate::utils::staging::StagedFiles;
+
+#[cfg(feature = "serialise")]
+impl<T> IndexIo for TurboQuantExhaustive<T>
+where
+    T: AnnSearchFloat,
+{
+    type Elem = T;
+
+    const KIND: &'static str = "exhaustive_tq";
+
+    fn stage_aux(&self, dir: &Path, staged: &mut StagedFiles) -> Result<(), AnnSearchErrors> {
+        match &self.vector_store {
+            Some(store) => store.stage_copy_into(dir, staged),
+            None => Ok(()),
+        }
+    }
+
+    fn load_aux(&mut self, dir: &Path) -> Result<(), AnnSearchErrors> {
+        if let Some(meta) = self.store_meta {
+            meta.check(self.n, self.quantiser.storage.dim)?;
+        }
+        self.vector_store = MmapVectorStore::open_in_dir(dir, self.store_meta)?;
+
+        Ok(())
+    }
+}
 
 #[cfg(test)]
 mod tests {

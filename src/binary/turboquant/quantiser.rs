@@ -13,7 +13,6 @@ use rand::Rng;
 use rand::SeedableRng;
 use rand_distr::StandardNormal;
 use rayon::prelude::*;
-use std::iter::Sum;
 
 use crate::binary::turboquant::codebook::codebook;
 use crate::prelude::*;
@@ -38,6 +37,7 @@ pub struct TurboQuantQuery<T> {
 ///////////////////////
 
 /// Pure encoding logic for TurboQuant.
+#[cfg_attr(feature = "serialise", derive(serde::Serialize, serde::Deserialize))]
 pub struct TurboQuantEncoder<T> {
     /// Rotation matrix, dim × dim, row-major.
     pub rotation: Vec<T>,
@@ -317,6 +317,7 @@ where
 ///
 /// Codes are stored in bit-plane format, vectors in original order.
 /// Cluster-aware storage for IVF lives in `tq_ivf.rs`.
+#[cfg_attr(feature = "serialise", derive(serde::Serialize, serde::Deserialize))]
 pub struct TurboQuantStorage<T> {
     /// Bit-plane packed codes, `n × bytes_per_vec` bytes total.
     pub packed_codes: Vec<u8>,
@@ -380,6 +381,7 @@ impl<T: Float + FromPrimitive> TurboQuantStorage<T> {
 /////////////////////////
 
 /// TurboQuant quantiser: encoder + flat storage of the encoded data.
+#[cfg_attr(feature = "serialise", derive(serde::Serialize, serde::Deserialize))]
 pub struct TurboQuantQuantiser<T> {
     /// The TurboQuant encoder
     pub encoder: TurboQuantEncoder<T>,
@@ -389,7 +391,7 @@ pub struct TurboQuantQuantiser<T> {
 
 impl<T> TurboQuantQuantiser<T>
 where
-    T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum + ComplexField + SimdDistance,
+    T: AnnSearchFloat,
 {
     /// Build the quantiser by encoding all rows of `data` in parallel.
     ///

@@ -15,6 +15,7 @@ use crate::utils::matrix_to_flat;
 /////////////////////
 
 /// Exhaustive (brute-force) nearest neighbour index
+#[cfg_attr(feature = "serialise", derive(serde::Serialize, serde::Deserialize))]
 pub struct ExhaustiveIndex<T> {
     /// Original vector data for distance calculations. Flattened for better
     /// cache locality
@@ -294,6 +295,20 @@ where
 ///////////
 // Tests //
 ///////////
+
+/////////////
+// IndexIo //
+/////////////
+
+#[cfg(feature = "serialise")]
+impl<T> IndexIo for ExhaustiveIndex<T>
+where
+    T: AnnSearchFloat,
+{
+    type Elem = T;
+
+    const KIND: &'static str = "exhaustive";
+}
 
 #[cfg(test)]
 mod tests {

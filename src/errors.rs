@@ -8,7 +8,12 @@ use crate::utils::dist::Dist;
 use cubecl::server::ServerError;
 
 /// All error variants that can occur across `ann-search-rs` operations.
+///
+/// Marked `#[non_exhaustive]`: variants appear and disappear with the optional
+/// features, so a downstream exhaustive `match` would break every time a
+/// feature flag moves. Match on the variants you care about and keep a `_` arm.
 #[derive(Debug, Error)]
+#[non_exhaustive]
 pub enum AnnSearchErrors {
     // -- general errors --
     /// Dimension mismatch error between index and query.
@@ -25,6 +30,10 @@ pub enum AnnSearchErrors {
     /// Distance type not supported
     #[error("Distance metric '{0}' is not supported for this method.")]
     DistanceNotSupported(Dist),
+
+    /// IO error
+    #[error("IO error: {0}")]
+    IoError(#[from] std::io::Error),
 
     // -- quantisation errors --
     /// Dimension must be divisible by m
@@ -57,6 +66,20 @@ pub enum AnnSearchErrors {
     #[error("Only sign-based binarisation is supported for asymmetric queries")]
     AsymmetricQueryMisMatch,
 
+    /// Residual encoding is only defined for sign-based binarisation
+    #[cfg(feature = "binary")]
+    #[error("Only sign-based binarisation supports residual encoding")]
+    ResidualEncodingUnsupported,
+
+    /// Residual codes cannot be compared across Voronoi cells
+    #[cfg(feature = "binary")]
+    #[error(
+        "A sign-based IVF binary index stores codes relative to each cell's centroid, so \
+         they are only comparable within a cell. Building a full kNN graph from it needs \
+         the float vectors: build the index with build_with_vector_store()."
+    )]
+    ResidualCodesRequireVectorStore,
+
     /// Error when n-bits is not a multiple of 8
     #[cfg(feature = "binary")]
     #[error("n_bits must be multiple of 8; chosen n_bits is {n_bits}.")]
@@ -80,10 +103,33 @@ pub enum AnnSearchErrors {
         actual: usize,
     },
 
-    /// IO error
+    /// A store file could not be opened
     #[cfg(feature = "binary")]
-    #[error("IO error: {0}")]
-    IoError(#[from] std::io::Error),
+    #[error("Could not open the vector store file '{path}': {source}")]
+    StoreFileUnavailable {
+        /// The file that was being opened
+        path: String,
+        /// The underlying IO error
+        #[source]
+        source: std::io::Error,
+    },
+
+    /// The store found on disk does not have the shape the index recorded
+    #[cfg(feature = "binary")]
+    #[error(
+        "The vector store holds {store_n} x {store_dim} vectors, but the index holds \
+         {index_n} x {index_dim}."
+    )]
+    StoreShapeMismatch {
+        /// Number of samples the index holds
+        index_n: usize,
+        /// Dimensionality the index holds
+        index_dim: usize,
+        /// Number of samples recorded for the store
+        store_n: usize,
+        /// Dimensionality recorded for the store
+        store_dim: usize,
+    },
 
     /// Turbo quant error for invalid number of bits
     #[cfg(feature = "binary")]
@@ -133,12 +179,28 @@ pub enum AnnSearchErrors {
     #[error("Error from the cubecl runtime: {0}")]
     CubeClServerError(#[from] ServerError),
 
-    /// Error for too high dimensional data that will cause degenerate SharedMemory
+    /// Propagate device-limit errors from `cubecl-utils-rs`
+    ///
+    /// Covers cube counts, per-binding allocation sizes and the generic
+    /// shared-memory budget check. The variants below are the ones specific to
+    /// this crate's own kernels.
     #[cfg(feature = "gpu")]
-    #[error("Dimensions above 2048 (chosen: {chosen_dim}) is not supported due to constrained in safe SharedMemory on modern GPUs")]
+    #[error("{0}")]
+    CubeclUtils(#[from] cubecl_utils_rs::CubeclUtilsErrors),
+
+    /// Error for a dimensionality whose per-workgroup staging cannot fit
+    #[cfg(feature = "gpu")]
+    #[error(
+        "A padded dimensionality of {chosen_dim} needs {required} bytes of shared memory per \
+         workgroup, but this device offers only {available}. Reduce the dimensionality."
+    )]
     DimTooHighForSharedMemory {
-        /// The chosen dimensionality
+        /// The chosen padded dimensionality
         chosen_dim: usize,
+        /// Bytes the smallest viable staging plan would need
+        required: usize,
+        /// Shared memory the device reports, in bytes
+        available: usize,
     },
 
     /// Error for a neighbour count whose top-k merge cannot fit in shared memory
@@ -153,4 +215,71 @@ pub enum AnnSearchErrors {
         /// Shared memory the device reports, in bytes
         available: usize,
     },
+
+    // -- serialisation errors --
+    /// The file does not carry the `ann-search-rs` magic bytes
+    #[cfg(feature = "serialise")]
+    #[error("'{path}' is not an ann-search-rs index file.")]
+    NotAnIndexFile {
+        /// The file that was read
+        path: String,
+    },
+
+    /// The file carries the magic bytes but ends inside the header
+    #[cfg(feature = "serialise")]
+    #[error("'{path}' is an ann-search-rs index file, but it is truncated.")]
+    TruncatedIndexFile {
+        /// The file that was read
+        path: String,
+    },
+
+    /// The payload decoded, but the file carries on past its end
+    #[cfg(feature = "serialise")]
+    #[error("'{path}' has trailing bytes after the index payload.")]
+    TrailingBytes {
+        /// The file that was read
+        path: String,
+    },
+
+    /// The file was written by an incompatible version of the format
+    #[cfg(feature = "serialise")]
+    #[error(
+        "Index format version {found} is not supported; this build reads version {supported}."
+    )]
+    UnsupportedFormatVersion {
+        /// Version tag found in the file
+        found: u32,
+        /// Version tag this build understands
+        supported: u32,
+    },
+
+    /// The file holds a different index type than the one being loaded into
+    #[cfg(feature = "serialise")]
+    #[error("Index file holds a '{found}' index, but a '{expected}' index was requested.")]
+    IndexKindMismatch {
+        /// Index kind the caller asked for
+        expected: &'static str,
+        /// Index kind stored in the file
+        found: String,
+    },
+
+    /// The file was written with a different float type
+    #[cfg(feature = "serialise")]
+    #[error("Index file was written with a {found}-byte float, but a {expected}-byte float was requested.")]
+    FloatWidthMismatch {
+        /// Size in bytes of the float the caller asked for
+        expected: usize,
+        /// Size in bytes of the float stored in the file
+        found: usize,
+    },
+
+    /// Encoding the index failed
+    #[cfg(feature = "serialise")]
+    #[error("Failed to encode the index: {0}")]
+    EncodeError(String),
+
+    /// Decoding the index failed
+    #[cfg(feature = "serialise")]
+    #[error("Failed to decode the index: {0}")]
+    DecodeError(String),
 }

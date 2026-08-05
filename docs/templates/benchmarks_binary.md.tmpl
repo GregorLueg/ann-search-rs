@@ -14,19 +14,19 @@ The benchmarks below show scenarios with and without re-ranking. For the simple
 binary versions use:
 
 ```bash
-cargo run --example gridsearch_binary --release --features binary -- --n-dim 512 --n-samples 50000 --data embedding
+cargo run --example gridsearch_binary --release --features binary -- --dim 512 --n-samples 50000 --data embedding
 ```
 
 For RaBitQ:
 
 ```bash
-cargo run --example gridsearch_rabitq --release --features binary -- --n-dim 512 --n-samples 50000 --data embedding
+cargo run --example gridsearch_rabitq --release --features binary -- --dim 512 --n-samples 50000 --data embedding
 ```
 
 For TurboQuantisation
 
 ```bash
-cargo run --example gridsearch_tq --release --features binary -- --n-dim 512 --n-samples 50000 --data embedding
+cargo run --example gridsearch_tq --release --features binary -- --dim 512 --n-samples 50000 --data embedding
 ```
 
 Similar to the other benchmarks, index building, query against 10% slightly
