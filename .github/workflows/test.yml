@@ -1,65 +1,23 @@
 name: Test the package
+
 on:
   push:
-    branches: [main, dev]
+    branches: [ main ]
   pull_request:
-    branches: [main, dev]
-jobs:
-  test-cpu:
-    name: CPU tests on ${{ matrix.os }}
-    strategy:
-      matrix:
-        include:
-          - os: ubuntu-latest
-            features: binary,quantised,gpu
-          - os: macos-latest
-            features: binary,quantised,gpu
-          - os: windows-latest
-            features: binary,quantised
-    runs-on: ${{ matrix.os }}
-    steps:
-      - uses: actions/checkout@v5
-      - uses: dtolnay/rust-toolchain@stable
-      - name: Cache cargo
-        uses: actions/cache@v5
-        with:
-          path: |
-            ~/.cargo/bin/
-            ~/.cargo/registry/index/
-            ~/.cargo/registry/cache/
-            ~/.cargo/git/db/
-            target/
-          key: ${{ runner.os }}-cargo-cpu-${{ github.sha }}
-          restore-keys: |
-            ${{ runner.os }}-cargo-cpu-
-      - run: cargo test --release --features ${{ matrix.features }}
+    branches: [ main ]
 
-  test-gpu:
-    name: GPU tests on ${{ matrix.os }}
-    strategy:
-      matrix:
-        os: [ubuntu-latest, macos-latest]
-    runs-on: ${{ matrix.os }}
-    steps:
-      - uses: actions/checkout@v5
-      - uses: dtolnay/rust-toolchain@stable
-      - name: Cache cargo
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cargo/bin/
-            ~/.cargo/registry/index/
-            ~/.cargo/registry/cache/
-            ~/.cargo/git/db/
-            target/
-          key: ${{ runner.os }}-cargo-gpu-${{ github.sha }}
-          restore-keys: |
-            ${{ runner.os }}-cargo-gpu-
-      - name: Install Vulkan (Linux)
-        if: runner.os == 'Linux'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y libvulkan1 mesa-vulkan-drivers libgl1-mesa-dri
-          echo "WGPU_BACKEND=vulkan" >> $GITHUB_ENV
-        # gpu-tests uses GPU backends for shared memory -> not behaving on windows
-      - run: cargo test --release --features binary,gpu,gpu-tests,quantised
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    uses: GregorLueg/personal-actions/.github/workflows/rust-test.yml@v1
+    with:
+      cpu-args: '--release --features binary,quantised,gpu'
+      # Windows drops gpu.
+      windows-cpu-args: '--release --features binary,quantised'
+      # gpu-tests uses GPU backends for shared memory, which does not behave on
+      # Windows, so the GPU lane is Linux and macOS only.
+      gpu-args: '--release --features binary,gpu,gpu-tests,quantised'
+    secrets: inherit
