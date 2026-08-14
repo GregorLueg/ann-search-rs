@@ -78,7 +78,7 @@ src/
   quantised/       # bf16/sq8/pq/opq × (exhaustive, ivf) + shared k_means & quantisers
   binary/          # binary/rabitq/tq × (exhaustive, ivf) + binariser, vec_store, turboquant/
   gpu/             # exhaustive_gpu, ivf_gpu, nndescent_gpu, cagra_gpu_search,
-                   # forest_gpu, tensor, dist_gpu, traits_gpu
+                   # forest_gpu, dist_gpu, topk_gpu
 benches/           # GPU kernel microbenches (CubeCL Benchmark trait, not criterion)
 examples/          # gridsearch_*.rs, one per algorithm, share examples/commons/mod.rs
 docs/              # benchmark result tables (markdown) + news.md
@@ -101,7 +101,7 @@ Every index follows the same pattern in `src/lib.rs`:
 - Vectors are `faer::MatRef<T>` (rows = samples, cols = features). Internally, indices flatten to `Vec<T>` via `utils::matrix_to_flat` for cache-friendly access.
 - `AnnSearchFloat` (in `utils/traits.rs`) is the shared trait bound: `Float + FromPrimitive + ToPrimitive + Send + Sync + Sum + SimdDistance + ComplexField`. `f32` and `f64` both implement it, both are supported end-to-end.
 - BF16-specific ops go through the `Bf16Compatible` bound (quantised feature only).
-- GPU indices also require `AnnSearchGpuFloat` (in `gpu/traits_gpu.rs`).
+- GPU indices also require `CubeclFloat` (re-exported from `cubecl-utils-rs`).
 
 ### Parallelism & SIMD
 
@@ -117,7 +117,8 @@ Every index follows the same pattern in `src/lib.rs`:
 
 - Everything runs on CubeCL with the wgpu backend, so kernels are cross-platform (Metal/Vulkan/DX12) with a CPU fallback.
 - **Tensors, device limits and dispatch geometry live in `cubecl-utils-rs`**, not here: `GpuTensor`, `GpuLimits`, `grid_2d`, `checked_cube_count`, `fits_shared_memory`, `fits_binding`, `resolve_workgroup_size`, `pad_vectors`, `LINE_SIZE`, `CubeclFloat`. `bixverse-rs` and `manifolds-rs` consume the same crate. Changes to those primitives belong upstream there, not in a local copy here.
-- What stays in `gpu/mod.rs` are the staging plans, which model *this crate's* kernel footprints: `pick_wg_y`, `tile_fits`, `plan_local_join_staging`, `plan_topk_merge`, `plan_beam_search_staging`, `plan_db_chunk`, plus `QUERY_CHUNK_SIZE`, `DB_CHUNK_SIZE`, `WORKGROUP_SIZE_X`, `TILE_D`, `TILE_Q`.
+- What stays in `gpu/mod.rs` are the staging plans, which model *this crate's* kernel footprints: `pick_wg_y`, `tile_fits`, `plan_local_join_staging`, `plan_beam_search_staging`, `plan_db_chunk`, plus `QUERY_CHUNK_SIZE`, `DB_CHUNK_SIZE`, `WORKGROUP_SIZE_X`, `TILE_D`, `TILE_Q`.
+- `gpu/topk_gpu.rs` carries its own footprint function, `radix_select_smem_bytes`, next to the kernels it sizes. The exhaustive and IVF paths dispatch to radix select via `radix_select_usable`, and the exhaustive path additionally gates on `RADIX_SELECT_MIN_K`; both fall back to the insertion-sort reducers in `dist_gpu.rs` (`extract_topk`, `reduce_ivf_topk`) otherwise.
 - **Every device-limit decision is a pure function of `GpuLimits`.** Read the limits once per entry point with `GpuLimits::from_client(&client)` and pass them down; do not reach for `client.properties()` deeper in. That is what makes the smaller-device behaviour testable here, and every staging plan has host-only tests at synthetic budgets (16 KiB, 32 KiB, 48 KiB, 64 KiB against 4- and 8-byte elements).
 - `pick_wg_y(dim_padded, elem_bytes, &limits)` starts from a table tuned for 32 KiB and `f32` and **shrinks** until the staging fits the device. It never grows: the Apple result is a regression-tested invariant (`test_pick_wg_y_apple_table_is_unchanged`). If you retune the table, that test is the thing that has to change deliberately.
 - When touching kernels, be aware of the Metal/wgpu quirk fixed in `fb03735` and the IVF reducer variant in `3c657ee`. Divergence between Metal and other backends is real and needs cross-backend testing. The four distilled codegen rules (no `if` expressions for value selection, bit arithmetic over comparisons, `usize` counters plus `u32` sentinels in reducers, `SharedMemory::new` at kernel scope) are documented in the module header of `src/gpu/nndescent_gpu.rs`.

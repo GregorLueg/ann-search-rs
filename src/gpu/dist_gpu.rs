@@ -1,13 +1,17 @@
 //! GPU-accelerated distance calculations and top-k selection for GPU-based
 //! indices. Contains kernels for both the exhaustive search pipeline and the
 //! IVF fire-and-forget pipeline.
+//!
+//! The insertion-sort reducers here are the fallback arms; the radix-select
+//! reducers that serve the common case live in [`crate::gpu::topk_gpu`].
 
 #![allow(missing_docs)]
 
 use cubecl::prelude::*;
-use std::iter::Sum;
 use cubecl_utils_rs::prelude::*;
+use std::iter::Sum;
 
+use crate::gpu::topk_gpu::{radix_select_topk, radix_select_usable, RADIX_SELECT_MIN_K};
 use crate::gpu::*;
 use crate::prelude::KnnResult;
 use crate::utils::dist::Dist;
@@ -487,21 +491,6 @@ pub fn cosine_tiled_reg<F: Float, N: Size>(
 // Top-k selection //
 /////////////////////
 
-/// Returns true if the runtime benefits from coalesced top-k extraction.
-/// Discrete GPUs (CUDA, Vulkan) have strict coalescing requirements.
-/// Unified memory architectures (Metal/Apple) are largely indifferent.
-///
-/// ### Returns
-///
-/// True if not metal
-#[allow(dead_code)]
-fn prefer_coalesced_topk<R: Runtime>(client: &ComputeClient<R>) -> bool {
-    let name = R::name(client).to_lowercase();
-    // Metal on Apple Silicon handles both patterns equally well.
-    // CUDA, Vulkan, and OpenCL benefit significantly from coalescing.
-    !name.contains("metal")
-}
-
 /// Initialise top-k buffers to sentinel values (`f32::MAX` / `0`)
 ///
 /// ### Params
@@ -539,6 +528,13 @@ pub fn init_topk<F: Float>(
 /// is held in registers for the duration of the scan and flushed back once at
 /// the end, so the per-candidate cost is a single global read of the distance
 /// matrix. The buffer must be pre-initialised with `init_topk`.
+///
+/// This is the low-`k` arm of the exhaustive path: `query_batch_gpu` dispatches
+/// here below [`RADIX_SELECT_MIN_K`], and also whenever [`radix_select_usable`]
+/// says the radix reducer cannot serve the configuration, i.e. non-f32 elements
+/// or a runtime without `u32` atomics. Its acceptance test is a strict `<` while
+/// scanning columns upwards, so among bit-identical distances the earliest
+/// candidate wins; the radix reducer selects under the same total order.
 ///
 /// ### Params
 ///
@@ -616,291 +612,13 @@ pub fn extract_topk<F: Float>(
     }
 }
 
-/// Coalesced top-k extraction. One workgroup per query, threads cooperate by
-/// striding through consecutive columns of the distance row. Memory accesses
-/// are coalesced: adjacent threads read adjacent elements.
-///
-/// Per-thread top-k kept in local Arrays (registers) during the scan,
-/// copied to shared memory only for the final merge.
-///
-/// ### Params
-///
-/// * `distances` - Full distance matrix for this chunk
-///   `[n_queries, dist_stride]`
-/// * `out_dists` - Running top-k distance buffer `[n_queries, k]`
-/// * `out_indices` - Running top-k index buffer `[n_queries, k]`
-/// * `chunk_offset` - Global DB index corresponding to column 0 of this chunk
-/// * `actual_chunk_size` - Number of valid columns in this chunk
-/// * `dist_stride` - Column stride of the distance matrix
-/// * `k_param` - Runtime value of k (must equal comptime `k`)
-/// * `k` - Comptime top-k count; must match `k_param` at launch (comptime)
-/// * `group` - Lanes staged per merge round (comptime)
-/// * `single_round` - Whether all lanes fit in one round (comptime)
-/// * `slots` - Number of `k`-element lists in shared memory (comptime)
-///
-/// ### Shared memory
-///
-/// The merge staging is chunked to the device budget by `plan_topk_merge`;
-/// see [`reduce_ivf_topk_coalesced`] for the reasoning, the two kernels share
-/// the scheme.
-///
-/// ### Grid mapping
-///
-/// * `CUBE_POS_X` -> query index
-/// * `UNIT_POS_X` -> thread within workgroup (32 threads)
-#[cube(launch_unchecked)]
-pub fn extract_topk_coalesced<F: Float>(
-    distances: &Tensor<F>,
-    out_dists: &mut Tensor<F>,
-    out_indices: &mut Tensor<u32>,
-    chunk_offset: u32,
-    actual_chunk_size: u32,
-    dist_stride: u32,
-    k_param: u32,
-    #[comptime] k: usize,
-    #[comptime] group: usize,
-    #[comptime] single_round: bool,
-    #[comptime] slots: usize,
-) {
-    let query_idx = CUBE_POS_X as usize;
-    let tx = UNIT_POS_X as usize;
-    let wg = WORKGROUP_SIZE_X as usize;
-    let kr = k_param as usize;
-
-    if query_idx >= out_dists.shape(0) {
-        terminate!();
-    }
-
-    // Per-thread top-k in registers
-    let mut local_dists = Array::<F>::new(k);
-    let mut local_indices = Array::<u32>::new(k);
-    for i in 0..k {
-        local_dists[i] = F::new(f32::MAX);
-        local_indices[i] = 0u32;
-    }
-
-    // Coalesced strided scan: adjacent threads read adjacent columns
-    let dist_base = query_idx * dist_stride as usize;
-    let mut col = tx as u32;
-    while col < actual_chunk_size {
-        let dist = distances[dist_base + col as usize];
-
-        if dist < local_dists[kr - 1] {
-            let mut pos = kr - 1;
-            for j in 0..k {
-                if dist < local_dists[j] && pos == kr - 1 {
-                    pos = j;
-                }
-            }
-
-            let mut s = kr - 1;
-            while s > pos {
-                local_dists[s] = local_dists[s - 1];
-                local_indices[s] = local_indices[s - 1];
-                s -= 1usize;
-            }
-
-            local_dists[pos] = dist;
-            local_indices[pos] = chunk_offset + col;
-        }
-
-        col += wg as u32;
-    }
-
-    let mut s_dist = SharedMemory::<F>::new(slots * k);
-    let mut s_idx = SharedMemory::<u32>::new(slots * k);
-
-    if single_round {
-        // -- Unchunked fast path --
-        //
-        // Every lane's list fits at once, so this is the original kernel
-        // verbatim: `slots == WORKGROUP_SIZE_X` and thread 0's own slot doubles
-        // as the accumulator, giving exactly the pre-chunking footprint.
-        let s_base = tx * kr;
-        for i in 0..k {
-            s_dist[s_base + i] = local_dists[i];
-            s_idx[s_base + i] = local_indices[i];
-        }
-
-        sync_cube();
-
-        if tx == 0usize {
-            // Merge threads 1..31 into thread 0's list
-            let mut t = 1usize;
-            while t < wg {
-                let t_base = t * kr;
-                let mut done: u32 = 0u32;
-                for i in 0..k {
-                    if done == 0u32 {
-                        let cd = s_dist[t_base + i];
-                        let ci = s_idx[t_base + i];
-
-                        if cd >= s_dist[kr - 1] {
-                            done = 1u32;
-                        } else {
-                            let mut pos = kr - 1;
-                            for j in 0..k {
-                                if cd < s_dist[j] && pos == kr - 1 {
-                                    pos = j;
-                                }
-                            }
-
-                            let mut s_i = kr - 1;
-                            while s_i > pos {
-                                s_dist[s_i] = s_dist[s_i - 1];
-                                s_idx[s_i] = s_idx[s_i - 1];
-                                s_i -= 1usize;
-                            }
-
-                            s_dist[pos] = cd;
-                            s_idx[pos] = ci;
-                        }
-                    }
-                }
-                t += 1usize;
-            }
-
-            // Merge with running top-k from previous chunks
-            let out_base = query_idx * kr;
-            for i in 0..k {
-                let running_dist = out_dists[out_base + i];
-                let running_idx = out_indices[out_base + i];
-
-                if running_dist < s_dist[kr - 1] {
-                    let mut pos = kr - 1;
-                    for j in 0..k {
-                        if running_dist < s_dist[j] && pos == kr - 1 {
-                            pos = j;
-                        }
-                    }
-
-                    let mut s_i = kr - 1;
-                    while s_i > pos {
-                        s_dist[s_i] = s_dist[s_i - 1];
-                        s_idx[s_i] = s_idx[s_i - 1];
-                        s_i -= 1usize;
-                    }
-
-                    s_dist[pos] = running_dist;
-                    s_idx[pos] = running_idx;
-                }
-            }
-
-            // Write final result
-            for i in 0..k {
-                out_dists[out_base + i] = s_dist[i];
-                out_indices[out_base + i] = s_idx[i];
-            }
-        }
-    } else {
-        // -- Chunked merge --
-        //
-        // `group` lanes stage their lists per round; thread 0 folds each round
-        // into the accumulator list held at slot `group`.
-        let acc = group * kr;
-
-        if tx == 0usize {
-            for i in 0..k {
-                s_dist[acc + i] = F::new(f32::MAX);
-                s_idx[acc + i] = 0u32;
-            }
-        }
-        sync_cube();
-
-        let n_rounds = wg / group;
-        let mut round = 0usize;
-        while round < n_rounds {
-            if tx / group == round {
-                let s_base = (tx % group) * kr;
-                for i in 0..k {
-                    s_dist[s_base + i] = local_dists[i];
-                    s_idx[s_base + i] = local_indices[i];
-                }
-            }
-            sync_cube();
-
-            if tx == 0usize {
-                let mut t = 0usize;
-                while t < group {
-                    let t_base = t * kr;
-                    let mut done: u32 = 0u32;
-                    for i in 0..k {
-                        if done == 0u32 {
-                            let cd = s_dist[t_base + i];
-                            let ci = s_idx[t_base + i];
-
-                            if cd >= s_dist[acc + kr - 1] {
-                                done = 1u32;
-                            } else {
-                                let mut pos = kr - 1;
-                                for j in 0..k {
-                                    if cd < s_dist[acc + j] && pos == kr - 1 {
-                                        pos = j;
-                                    }
-                                }
-
-                                let mut s_i = kr - 1;
-                                while s_i > pos {
-                                    s_dist[acc + s_i] = s_dist[acc + s_i - 1];
-                                    s_idx[acc + s_i] = s_idx[acc + s_i - 1];
-                                    s_i -= 1usize;
-                                }
-
-                                s_dist[acc + pos] = cd;
-                                s_idx[acc + pos] = ci;
-                            }
-                        }
-                    }
-                    t += 1usize;
-                }
-            }
-            // Thread 0 must finish reading the staged slots before the next
-            // round's lanes overwrite them.
-            sync_cube();
-            round += 1usize;
-        }
-
-        if tx == 0usize {
-            // Merge with running top-k from previous chunks
-            let out_base = query_idx * kr;
-            for i in 0..k {
-                let running_dist = out_dists[out_base + i];
-                let running_idx = out_indices[out_base + i];
-
-                if running_dist < s_dist[acc + kr - 1] {
-                    let mut pos = kr - 1;
-                    for j in 0..k {
-                        if running_dist < s_dist[acc + j] && pos == kr - 1 {
-                            pos = j;
-                        }
-                    }
-
-                    let mut s_i = kr - 1;
-                    while s_i > pos {
-                        s_dist[acc + s_i] = s_dist[acc + s_i - 1];
-                        s_idx[acc + s_i] = s_idx[acc + s_i - 1];
-                        s_i -= 1usize;
-                    }
-
-                    s_dist[acc + pos] = running_dist;
-                    s_idx[acc + pos] = running_idx;
-                }
-            }
-
-            // Write final result
-            for i in 0..k {
-                out_dists[out_base + i] = s_dist[acc + i];
-                out_indices[out_base + i] = s_idx[acc + i];
-            }
-        }
-    }
-}
-
 /// Run batch kNN queries on the GPU
 ///
 /// Uses tiled distance kernels with shared-memory query caching, a single
-/// DB upload, and serial insertion-sort top-k extraction directly into a
-/// running buffer (no ping-pong or merge step).
+/// DB upload, and radix-select top-k extraction directly into a running buffer
+/// (no ping-pong or merge step). Falls back to the serial insertion-sort
+/// `extract_topk` for element types whose bits the radix key cannot
+/// reinterpret.
 ///
 /// ### Params
 ///
@@ -1102,22 +820,55 @@ where
                 Dist::Manhattan => unreachable!(),
             }
 
-            // Extract directly into the running top-k buffer
-            let (extract_grid_x, extract_grid_y) =
-                grid_2d((n_q as u32).div_ceil(WORKGROUP_SIZE_X), &limits)?;
-            unsafe {
-                extract_topk::launch_unchecked::<T, R>(
-                    &client,
-                    CubeCount::Static(extract_grid_x, extract_grid_y, 1),
-                    CubeDim::new_2d(WORKGROUP_SIZE_X, 1),
-                    distances_gpu.clone().into_tensor_arg(),
-                    topk_dists.clone().into_tensor_arg(),
-                    topk_indices.clone().into_tensor_arg(),
-                    db_start as u32,
-                    n_db as u32,
-                    k as u32,
-                    k,
-                );
+            // Extract directly into the running top-k buffer.
+            //
+            // Radix select above `RADIX_SELECT_MIN_K`, the serial insertion sort
+            // below it. See that constant for the end-to-end measurement and for
+            // why the crossover exists: this path is chunked, and `extract_topk`
+            // becomes nearly free on every chunk after the first because a tight
+            // running top-k rejects almost all candidates, which radix select has
+            // no way to exploit.
+            //
+            // `extract_topk` is also the fallback for element types whose bits
+            // the key transform cannot reinterpret, and for runtimes without
+            // `u32` atomics.
+            let wg = WORKGROUP_SIZE_X as usize;
+            if k >= RADIX_SELECT_MIN_K
+                && radix_select_usable(&client, k, size_of::<T>(), wg, &limits)
+            {
+                let (rx, ry) = grid_2d(n_q as u32, &limits)?;
+                unsafe {
+                    radix_select_topk::launch_unchecked::<T, R>(
+                        &client,
+                        CubeCount::Static(rx, ry, 1),
+                        CubeDim::new_2d(WORKGROUP_SIZE_X, 1),
+                        distances_gpu.clone().into_tensor_arg(),
+                        topk_dists.clone().into_tensor_arg(),
+                        topk_indices.clone().into_tensor_arg(),
+                        db_start as u32,
+                        n_db as u32,
+                        k as u32,
+                        k,
+                        wg,
+                    );
+                }
+            } else {
+                let (extract_grid_x, extract_grid_y) =
+                    grid_2d((n_q as u32).div_ceil(WORKGROUP_SIZE_X), &limits)?;
+                unsafe {
+                    extract_topk::launch_unchecked::<T, R>(
+                        &client,
+                        CubeCount::Static(extract_grid_x, extract_grid_y, 1),
+                        CubeDim::new_2d(WORKGROUP_SIZE_X, 1),
+                        distances_gpu.clone().into_tensor_arg(),
+                        topk_dists.clone().into_tensor_arg(),
+                        topk_indices.clone().into_tensor_arg(),
+                        db_start as u32,
+                        n_db as u32,
+                        k as u32,
+                        k,
+                    );
+                }
             }
         }
 
@@ -1144,255 +895,6 @@ where
 /////////////////////////////////
 // Fire-and-Forget IVF kernels //
 /////////////////////////////////
-
-/// Coalesced top-k reduction for the IVF variable-length candidate buffer.
-///
-/// One workgroup (32 threads) per query. Threads cooperatively stride through
-/// the candidate slice, each maintaining a thread-local sorted top-k in
-/// registers. After the scan, per-thread results are written to shared memory
-/// and thread 0 merges all 32 sorted lists into the final top-k output.
-///
-/// ### Params
-///
-/// * `candidate_dists` - Candidate distances `[n_queries, max_candidates]`.
-///   Each row contains the distances produced by the mega distance kernel,
-///   of which only the first `candidates_per_query[q]` entries are valid.
-/// * `candidate_indices` - Candidate DB indices `[n_queries, max_candidates]`.
-///   Layout mirrors `candidate_dists`.
-/// * `candidates_per_query` - Number of valid candidates per query
-///   `[n_queries]`. Entries beyond this count in each row are ignored.
-/// * `out_dists` - Output top-k distances `[n_queries, k]`. Written only by
-///   thread 0 of each workgroup after the merge phase.
-/// * `out_indices` - Output top-k DB indices `[n_queries, k]`. Written only
-///   by thread 0 of each workgroup after the merge phase.
-/// * `k_param` - Runtime value of k (must equal comptime `k`). Required
-///   because CubeCL comptime values cannot be used in runtime assignments.
-/// * `k` - Number of nearest neighbours to extract per query (comptime).
-///   Used only for `Array::new` and `SharedMemory::new` sizing.
-/// * `group` - Lanes whose lists are staged per merge round (comptime)
-/// * `single_round` - Whether all lanes fit in one round (comptime)
-/// * `slots` - Number of `k`-element lists in shared memory (comptime)
-///
-/// ### Grid mapping
-///
-/// * `CUBE_POS_Y * CUBE_COUNT_X + CUBE_POS_X` -> query index (one cube per
-///   query)
-/// * `UNIT_POS_X` -> thread within workgroup (`0..WORKGROUP_SIZE_X`), used
-///   for strided candidate scanning and cooperative merge
-#[cube(launch_unchecked)]
-pub fn reduce_ivf_topk_coalesced<F: Float>(
-    candidate_dists: &Tensor<F>,
-    candidate_indices: &Tensor<u32>,
-    candidates_per_query: &Tensor<u32>,
-    out_dists: &mut Tensor<F>,
-    out_indices: &mut Tensor<u32>,
-    k_param: u32,
-    #[comptime] k: usize,
-    #[comptime] group: usize,
-    #[comptime] single_round: bool,
-    #[comptime] slots: usize,
-) {
-    let q_idx = (CUBE_POS_Y * CUBE_COUNT_X + CUBE_POS_X) as usize;
-    let tx = UNIT_POS_X as usize;
-    let wg = WORKGROUP_SIZE_X as usize;
-    let kr = k_param as usize;
-
-    if q_idx >= candidate_dists.shape(0) {
-        terminate!();
-    }
-
-    let count = candidates_per_query[q_idx] as usize;
-    let in_base = q_idx * candidate_dists.stride(0);
-
-    // ── Phase 1: per-thread top-k in registers ──
-    //
-    // Structural pattern mirrors `extract_topk_coalesced`: `usize` counters
-    // and comptime-unrolled `for i in 0..k` loops. cubecl 0.10 has miscompiled
-    // `while init_i < k_param` init loops and short-circuited `while a && !b`
-    // insertion searches with u32 counters on lavapipe/Vulkan, so both are
-    // avoided here even though the algorithm is unchanged.
-
-    let mut local_dists = Array::<F>::new(k);
-    let mut local_indices = Array::<u32>::new(k);
-    for i in 0..k {
-        local_dists[i] = F::new(f32::MAX);
-        local_indices[i] = 0u32;
-    }
-
-    // Coalesced strided scan: adjacent threads read adjacent columns
-    let mut col = tx;
-    while col < count {
-        let dist = candidate_dists[in_base + col];
-
-        if dist < local_dists[kr - 1] {
-            // Full comptime-unrolled scan; guarded by `pos == kr - 1` so
-            // only the first match wins. Matches extract_topk_coalesced.
-            let mut pos = kr - 1;
-            for j in 0..k {
-                if dist < local_dists[j] && pos == kr - 1 {
-                    pos = j;
-                }
-            }
-
-            let mut s = kr - 1;
-            while s > pos {
-                local_dists[s] = local_dists[s - 1];
-                local_indices[s] = local_indices[s - 1];
-                s -= 1usize;
-            }
-
-            local_dists[pos] = dist;
-            local_indices[pos] = candidate_indices[in_base + col];
-        }
-
-        col += wg;
-    }
-
-    // ── Phase 2: shared memory merge ──
-
-    let mut s_dist = SharedMemory::<F>::new(slots * k);
-    let mut s_idx = SharedMemory::<u32>::new(slots * k);
-
-    if single_round {
-        // ---- Unchunked fast path -------------------------------------------
-        // Every lane's list fits at once, so this is the original kernel
-        // verbatim: `slots == WORKGROUP_SIZE_X` and thread 0's own slot doubles
-        // as the accumulator, giving exactly the pre-chunking footprint.
-        let s_base = tx * kr;
-        for i in 0..k {
-            s_dist[s_base + i] = local_dists[i];
-            s_idx[s_base + i] = local_indices[i];
-        }
-
-        sync_cube();
-
-        // Thread 0 merges all 32 sorted thread-local lists
-        if tx == 0usize {
-            let mut t = 1usize;
-            while t < wg {
-                let t_base = t * kr;
-                let mut done: u32 = 0u32;
-
-                // Sorted per-thread list: once cd >= current worst, all
-                // remaining are worse. `done: u32` sentinel matches extract's
-                // pattern; a `bool` here miscompiles on cubecl 0.10 / lavapipe.
-                for i in 0..k {
-                    if done == 0u32 {
-                        let cd = s_dist[t_base + i];
-                        let ci = s_idx[t_base + i];
-
-                        if cd >= s_dist[kr - 1] {
-                            done = 1u32;
-                        } else {
-                            let mut pos = kr - 1;
-                            for j in 0..k {
-                                if cd < s_dist[j] && pos == kr - 1 {
-                                    pos = j;
-                                }
-                            }
-
-                            let mut s_i = kr - 1;
-                            while s_i > pos {
-                                s_dist[s_i] = s_dist[s_i - 1];
-                                s_idx[s_i] = s_idx[s_i - 1];
-                                s_i -= 1usize;
-                            }
-
-                            s_dist[pos] = cd;
-                            s_idx[pos] = ci;
-                        }
-                    }
-                }
-                t += 1usize;
-            }
-
-            // Write final result
-            let out_base = q_idx * kr;
-            for i in 0..k {
-                out_dists[out_base + i] = s_dist[i];
-                out_indices[out_base + i] = s_idx[i];
-            }
-        }
-    } else {
-        // ---- Chunked merge --------------------------------------------------
-        // `group` lanes stage their lists per round; thread 0 folds each round
-        // into the accumulator list held at slot `group`. Lanes are visited in
-        // ascending order exactly as on the fast path, so ties resolve the same
-        // way.
-        let acc = group * kr;
-
-        if tx == 0usize {
-            for i in 0..k {
-                s_dist[acc + i] = F::new(f32::MAX);
-                s_idx[acc + i] = 0u32;
-            }
-        }
-        sync_cube();
-
-        let n_rounds = wg / group;
-        let mut round = 0usize;
-        while round < n_rounds {
-            if tx / group == round {
-                let s_base = (tx % group) * kr;
-                for i in 0..k {
-                    s_dist[s_base + i] = local_dists[i];
-                    s_idx[s_base + i] = local_indices[i];
-                }
-            }
-            sync_cube();
-
-            if tx == 0usize {
-                let mut t = 0usize;
-                while t < group {
-                    let t_base = t * kr;
-                    let mut done: u32 = 0u32;
-
-                    for i in 0..k {
-                        if done == 0u32 {
-                            let cd = s_dist[t_base + i];
-                            let ci = s_idx[t_base + i];
-
-                            if cd >= s_dist[acc + kr - 1] {
-                                done = 1u32;
-                            } else {
-                                let mut pos = kr - 1;
-                                for j in 0..k {
-                                    if cd < s_dist[acc + j] && pos == kr - 1 {
-                                        pos = j;
-                                    }
-                                }
-
-                                let mut s_i = kr - 1;
-                                while s_i > pos {
-                                    s_dist[acc + s_i] = s_dist[acc + s_i - 1];
-                                    s_idx[acc + s_i] = s_idx[acc + s_i - 1];
-                                    s_i -= 1usize;
-                                }
-
-                                s_dist[acc + pos] = cd;
-                                s_idx[acc + pos] = ci;
-                            }
-                        }
-                    }
-                    t += 1usize;
-                }
-            }
-            // Thread 0 must finish reading the staged slots before the next
-            // round's lanes overwrite them.
-            sync_cube();
-            round += 1usize;
-        }
-
-        // Write final result
-        if tx == 0usize {
-            let out_base = q_idx * kr;
-            for i in 0..k {
-                out_dists[out_base + i] = s_dist[acc + i];
-                out_indices[out_base + i] = s_idx[acc + i];
-            }
-        }
-    }
-}
 
 //////////////////////////////
 // IVF mega kernel variants //
@@ -1481,6 +983,13 @@ pub fn compute_ivf_mega_euclidean<F: Float, N: Size>(
 /// One thread per query. Performs insertion-sort over the variable-length
 /// candidate slice produced by the distance kernels and writes the k
 /// smallest results into the output buffers.
+///
+/// The IVF fallback arm, taken whenever [`radix_select_usable`] says the radix
+/// reducer cannot serve the configuration, i.e. non-f32 elements or a runtime
+/// without `u32` atomics. Unlike the radix reducer it inserts straight into the
+/// output buffers rather than writing every slot, so the call site must seed
+/// them with `init_topk` first; omitting that produces garbage rather than an
+/// error.
 ///
 /// ### Params
 ///
@@ -2267,481 +1776,6 @@ mod tests {
 
         assert_eq!(idx[0][0], 0);
         assert!((dist[0][0] - 64.0).abs() < 1e-3);
-    }
-
-    // ── Diagnostic tests for reduce_ivf_topk_coalesced ──
-
-    /// Helper: run the OLD serial reduce_ivf_topk on known data and return
-    /// (dists, indices). Provides the ground truth to compare against.
-    fn run_serial_reduce(
-        candidate_dists: &[f32],
-        candidate_indices: &[u32],
-        candidates_per_query: &[u32],
-        n_queries: usize,
-        max_candidates: usize,
-        k: usize,
-        device: &WgpuDevice,
-    ) -> (Vec<f32>, Vec<u32>) {
-        let client = WgpuRuntime::client(device);
-        let limits = GpuLimits::from_client(&client);
-
-        let cd_gpu = GpuTensor::<WgpuRuntime, f32>::from_slice(
-            candidate_dists,
-            vec![n_queries, max_candidates],
-            &client,
-        )
-        .unwrap();
-        let ci_gpu = GpuTensor::<WgpuRuntime, u32>::from_slice(
-            candidate_indices,
-            vec![n_queries, max_candidates],
-            &client,
-        )
-        .unwrap();
-        let cpq_gpu = GpuTensor::<WgpuRuntime, u32>::from_slice(
-            candidates_per_query,
-            vec![n_queries],
-            &client,
-        )
-        .unwrap();
-
-        let topk_d = GpuTensor::<WgpuRuntime, f32>::empty(vec![n_queries, k], &client).unwrap();
-        let topk_i = GpuTensor::<WgpuRuntime, u32>::empty(vec![n_queries, k], &client).unwrap();
-
-        // init_topk
-        let init_gx = (k as u32).div_ceil(WORKGROUP_SIZE_X);
-        let (init_gy, init_gz) = grid_2d((n_queries as u32).div_ceil(4), &limits).unwrap();
-        unsafe {
-            init_topk::launch_unchecked::<f32, WgpuRuntime>(
-                &client,
-                CubeCount::Static(init_gx, init_gy, init_gz),
-                CubeDim::new_2d(WORKGROUP_SIZE_X, 4),
-                topk_d.clone().into_tensor_arg(),
-                topk_i.clone().into_tensor_arg(),
-                4,
-            );
-        }
-
-        // serial reduce
-        let (rgx, rgy) = grid_2d((n_queries as u32).div_ceil(WORKGROUP_SIZE_X), &limits).unwrap();
-        unsafe {
-            reduce_ivf_topk::launch_unchecked::<f32, WgpuRuntime>(
-                &client,
-                CubeCount::Static(rgx, rgy, 1),
-                CubeDim::new_2d(WORKGROUP_SIZE_X, 1),
-                cd_gpu.into_tensor_arg(),
-                ci_gpu.into_tensor_arg(),
-                cpq_gpu.into_tensor_arg(),
-                topk_d.clone().into_tensor_arg(),
-                topk_i.clone().into_tensor_arg(),
-            );
-        }
-
-        (topk_d.read(&client).unwrap(), topk_i.read(&client).unwrap())
-    }
-
-    /// Helper: run the NEW coalesced reduce on the same data.
-    fn run_coalesced_reduce(
-        candidate_dists: &[f32],
-        candidate_indices: &[u32],
-        candidates_per_query: &[u32],
-        n_queries: usize,
-        max_candidates: usize,
-        k: usize,
-        device: &WgpuDevice,
-    ) -> (Vec<f32>, Vec<u32>) {
-        let client = WgpuRuntime::client(device);
-        let limits = GpuLimits::from_client(&client);
-
-        let cd_gpu = GpuTensor::<WgpuRuntime, f32>::from_slice(
-            candidate_dists,
-            vec![n_queries, max_candidates],
-            &client,
-        )
-        .unwrap();
-        let ci_gpu = GpuTensor::<WgpuRuntime, u32>::from_slice(
-            candidate_indices,
-            vec![n_queries, max_candidates],
-            &client,
-        )
-        .unwrap();
-        let cpq_gpu = GpuTensor::<WgpuRuntime, u32>::from_slice(
-            candidates_per_query,
-            vec![n_queries],
-            &client,
-        )
-        .unwrap();
-
-        let topk_d = GpuTensor::<WgpuRuntime, f32>::empty(vec![n_queries, k], &client).unwrap();
-        let topk_i = GpuTensor::<WgpuRuntime, u32>::empty(vec![n_queries, k], &client).unwrap();
-
-        let (rgx, rgy) = grid_2d(n_queries as u32, &limits).unwrap();
-        let merge = plan_topk_merge(k, size_of::<f32>(), &limits).unwrap();
-        unsafe {
-            reduce_ivf_topk_coalesced::launch_unchecked::<f32, WgpuRuntime>(
-                &client,
-                CubeCount::Static(rgx, rgy, 1),
-                CubeDim::new_2d(WORKGROUP_SIZE_X, 1),
-                cd_gpu.into_tensor_arg(),
-                ci_gpu.into_tensor_arg(),
-                cpq_gpu.into_tensor_arg(),
-                topk_d.clone().into_tensor_arg(),
-                topk_i.clone().into_tensor_arg(),
-                k as u32,
-                k,
-                merge.group,
-                merge.single_round,
-                merge.slots,
-            );
-        }
-
-        (topk_d.read(&client).unwrap(), topk_i.read(&client).unwrap())
-    }
-
-    // Test 1: Trivial case. 1 query, 5 candidates, k=3.
-    // Candidates are in reverse order so we know sorting matters.
-    #[test]
-    fn test_coalesced_reduce_trivial() {
-        let Some(device) = try_device() else { return };
-
-        let k = 3usize;
-        let n_queries = 1usize;
-        let max_candidates = 5usize;
-
-        // Distances: 50, 40, 30, 20, 10 -- indices: 100, 101, 102, 103, 104
-        // Expected top-3: dist=[10, 20, 30], idx=[104, 103, 102]
-        let candidate_dists = vec![50.0f32, 40.0, 30.0, 20.0, 10.0];
-        let candidate_indices = vec![100u32, 101, 102, 103, 104];
-        let candidates_per_query = vec![5u32];
-
-        let (dists, indices) = run_coalesced_reduce(
-            &candidate_dists,
-            &candidate_indices,
-            &candidates_per_query,
-            n_queries,
-            max_candidates,
-            k,
-            &device,
-        );
-
-        println!("Trivial: dists={:?}, indices={:?}", dists, indices);
-        assert_eq!(indices, vec![104, 103, 102], "Wrong indices");
-        assert_eq!(dists, vec![10.0, 20.0, 30.0], "Wrong distances");
-    }
-
-    // Test 2: Verify thread 0 alone finds the right answer when
-    // candidates <= 32 (single thread's stride covers everything).
-    #[test]
-    fn test_coalesced_reduce_single_stride() {
-        let Some(device) = try_device() else { return };
-
-        let k = 3usize;
-        let n_queries = 1usize;
-        let max_candidates = 20usize;
-
-        // 20 candidates, distances = 20, 19, ..., 1
-        let candidate_dists: Vec<f32> = (0..20).rev().map(|i| (i + 1) as f32).collect();
-        let candidate_indices: Vec<u32> = (0..20).map(|i| i as u32 + 200).collect();
-        let candidates_per_query = vec![20u32];
-
-        let (dists, indices) = run_coalesced_reduce(
-            &candidate_dists,
-            &candidate_indices,
-            &candidates_per_query,
-            n_queries,
-            max_candidates,
-            k,
-            &device,
-        );
-
-        println!("Single stride: dists={:?}, indices={:?}", dists, indices);
-        // Smallest dists are 1.0, 2.0, 3.0 at positions 19, 18, 17
-        assert_eq!(dists, vec![1.0, 2.0, 3.0]);
-        assert_eq!(indices, vec![219, 218, 217]);
-    }
-
-    // Test 3: Multi-thread merge required. 200 candidates forces multiple
-    // threads to each hold partial top-k that must be merged correctly.
-    #[test]
-    fn test_coalesced_reduce_needs_merge() {
-        let Some(device) = try_device() else { return };
-
-        let k = 5usize;
-        let n_queries = 1usize;
-        let max_candidates = 200usize;
-
-        // Plant known winners at positions that land on DIFFERENT threads.
-        // Thread assignment = position % 32.
-        // Best 5: pos 3 (thread 3), pos 35 (thread 3), pos 64 (thread 0),
-        //         pos 100 (thread 4), pos 129 (thread 1)
-        let mut candidate_dists = vec![999.0f32; max_candidates];
-        let candidate_indices: Vec<u32> = (0..max_candidates as u32).collect();
-
-        candidate_dists[3] = 1.0; // thread 3
-        candidate_dists[35] = 2.0; // thread 3
-        candidate_dists[64] = 3.0; // thread 0
-        candidate_dists[100] = 4.0; // thread 4
-        candidate_dists[129] = 5.0; // thread 1
-
-        let candidates_per_query = vec![max_candidates as u32];
-
-        let (dists, indices) = run_coalesced_reduce(
-            &candidate_dists,
-            &candidate_indices,
-            &candidates_per_query,
-            n_queries,
-            max_candidates,
-            k,
-            &device,
-        );
-
-        println!("Merge test: dists={:?}, indices={:?}", dists, indices);
-        assert_eq!(dists, vec![1.0, 2.0, 3.0, 4.0, 5.0]);
-        assert_eq!(indices, vec![3, 35, 64, 100, 129]);
-    }
-
-    // Large k forces the chunked merge arm, where the 32 per-lane lists no
-    // longer fit in shared memory at once. Cross-checked against the serial
-    // reducer, which has no shared-memory merge at all. Without this the
-    // chunked path has no unit coverage: every other reducer test uses a small
-    // k and so only ever exercises the single-round arm.
-    #[test]
-    fn test_coalesced_reduce_chunked_matches_serial() {
-        let Some(device) = try_device() else { return };
-
-        // k = 200 needs 32 * 200 * 8 = 51 200 bytes for a single-round merge,
-        // over the 32 KiB budget, so this must take the chunked path.
-        let k = 200usize;
-        let n_queries = 3usize;
-        let max_candidates = 1024usize;
-
-        let mut candidate_dists = vec![0.0f32; n_queries * max_candidates];
-        let mut candidate_indices = vec![0u32; n_queries * max_candidates];
-        for q in 0..n_queries {
-            for c in 0..max_candidates {
-                let i = q * max_candidates + c;
-                // Deterministic, non-monotonic, with distinct values so the
-                // ordering is unambiguous.
-                candidate_dists[i] = (((c * 7919 + q * 104_729) % 10_007) as f32) * 0.01;
-                candidate_indices[i] = c as u32;
-            }
-        }
-        let candidates_per_query = vec![max_candidates as u32; n_queries];
-
-        let (coal_d, coal_i) = run_coalesced_reduce(
-            &candidate_dists,
-            &candidate_indices,
-            &candidates_per_query,
-            n_queries,
-            max_candidates,
-            k,
-            &device,
-        );
-        let (ser_d, ser_i) = run_serial_reduce(
-            &candidate_dists,
-            &candidate_indices,
-            &candidates_per_query,
-            n_queries,
-            max_candidates,
-            k,
-            &device,
-        );
-
-        // A no-op dispatch leaves the output untouched, so guard against the
-        // silent-failure mode this kernel was fixed for.
-        assert!(
-            coal_d.iter().any(|d| *d != 0.0),
-            "chunked reduce produced all zeros: the dispatch almost certainly did no work"
-        );
-
-        for q in 0..n_queries {
-            for i in 0..k {
-                let idx = q * k + i;
-                assert!(
-                    (coal_d[idx] - ser_d[idx]).abs() <= 1e-5,
-                    "query {q} slot {i}: chunked {} vs serial {}",
-                    coal_d[idx],
-                    ser_d[idx]
-                );
-                assert_eq!(
-                    coal_i[idx], ser_i[idx],
-                    "query {q} slot {i}: index {} vs {}",
-                    coal_i[idx], ser_i[idx]
-                );
-            }
-            // Each row must come back sorted ascending.
-            for i in 1..k {
-                assert!(
-                    coal_d[q * k + i - 1] <= coal_d[q * k + i],
-                    "query {q} not sorted at slot {i}"
-                );
-            }
-        }
-    }
-
-    // Test 4: A/B comparison with serial kernel on random-ish data.
-    // If this fails but tests 1-3 pass, the bug is scale-dependent.
-    #[test]
-    fn test_coalesced_vs_serial_random() {
-        let Some(device) = try_device() else { return };
-
-        let k = 10usize;
-        let n_queries = 8usize;
-        let max_candidates = 500usize;
-
-        // Deterministic pseudo-random distances
-        let mut candidate_dists = vec![0.0f32; n_queries * max_candidates];
-        let mut candidate_indices = vec![0u32; n_queries * max_candidates];
-        for q in 0..n_queries {
-            for c in 0..max_candidates {
-                let idx = q * max_candidates + c;
-                candidate_dists[idx] = ((idx * 17 + 31) % 9973) as f32 * 0.1;
-                candidate_indices[idx] = (q * 10000 + c) as u32;
-            }
-        }
-        let candidates_per_query = vec![max_candidates as u32; n_queries];
-
-        let (serial_d, serial_i) = run_serial_reduce(
-            &candidate_dists,
-            &candidate_indices,
-            &candidates_per_query,
-            n_queries,
-            max_candidates,
-            k,
-            &device,
-        );
-
-        let (coal_d, coal_i) = run_coalesced_reduce(
-            &candidate_dists,
-            &candidate_indices,
-            &candidates_per_query,
-            n_queries,
-            max_candidates,
-            k,
-            &device,
-        );
-
-        for q in 0..n_queries {
-            let s = q * k;
-            let e = s + k;
-            let sd = &serial_d[s..e];
-            let cd = &coal_d[s..e];
-            let si = &serial_i[s..e];
-            let ci = &coal_i[s..e];
-
-            for i in 0..k {
-                assert!(
-                    (sd[i] - cd[i]).abs() < 1e-4,
-                    "Query {} rank {}: serial dist {} != coalesced dist {}",
-                    q,
-                    i,
-                    sd[i],
-                    cd[i]
-                );
-                assert_eq!(
-                    si[i], ci[i],
-                    "Query {} rank {}: serial idx {} != coalesced idx {}",
-                    q, i, si[i], ci[i]
-                );
-            }
-        }
-    }
-
-    // Test 5: Multiple queries to verify q_idx indexing is correct
-    // (catches stride/offset bugs in the output write)
-    #[test]
-    fn test_coalesced_reduce_multi_query() {
-        let Some(device) = try_device() else { return };
-
-        let k = 3usize;
-        let n_queries = 4usize;
-        let max_candidates = 10usize;
-
-        let mut candidate_dists = vec![f32::MAX; n_queries * max_candidates];
-        let mut candidate_indices = vec![0u32; n_queries * max_candidates];
-
-        // Each query has a unique planted winner
-        for q in 0..n_queries {
-            let base = q * max_candidates;
-            for c in 0..max_candidates {
-                candidate_dists[base + c] = 100.0 + c as f32;
-                candidate_indices[base + c] = (q * 1000 + c) as u32;
-            }
-            // Plant winner at different position per query
-            candidate_dists[base + q + 1] = 0.5 + q as f32 * 0.1;
-        }
-
-        let candidates_per_query = vec![max_candidates as u32; n_queries];
-
-        let (dists, indices) = run_coalesced_reduce(
-            &candidate_dists,
-            &candidate_indices,
-            &candidates_per_query,
-            n_queries,
-            max_candidates,
-            k,
-            &device,
-        );
-
-        for q in 0..n_queries {
-            let s = q * k;
-            let best_dist = dists[s];
-            let best_idx = indices[s];
-            let expected_dist = 0.5 + q as f32 * 0.1;
-            let expected_idx = (q * 1000 + q + 1) as u32;
-
-            assert!(
-                (best_dist - expected_dist).abs() < 1e-4,
-                "Query {}: best dist {} != expected {}",
-                q,
-                best_dist,
-                expected_dist
-            );
-            assert_eq!(
-                best_idx, expected_idx,
-                "Query {}: best idx {} != expected {}",
-                q, best_idx, expected_idx
-            );
-        }
-    }
-
-    // Test 6: Candidates fewer than k -- output should contain only
-    // valid entries, rest should remain f32::MAX / 0
-    #[test]
-    fn test_coalesced_reduce_fewer_than_k() {
-        let Some(device) = try_device() else { return };
-
-        let k = 5usize;
-        let n_queries = 1usize;
-        let max_candidates = 10usize;
-
-        let mut candidate_dists = vec![f32::MAX; max_candidates];
-        let mut candidate_indices = vec![0u32; max_candidates];
-
-        // Only 2 valid candidates
-        candidate_dists[0] = 5.0;
-        candidate_dists[1] = 3.0;
-        candidate_indices[0] = 42;
-        candidate_indices[1] = 99;
-
-        let candidates_per_query = vec![2u32];
-
-        let (dists, indices) = run_coalesced_reduce(
-            &candidate_dists,
-            &candidate_indices,
-            &candidates_per_query,
-            n_queries,
-            max_candidates,
-            k,
-            &device,
-        );
-
-        println!("Fewer than k: dists={:?}, indices={:?}", dists, indices);
-        assert!((dists[0] - 3.0).abs() < 1e-4, "First should be 3.0");
-        assert!((dists[1] - 5.0).abs() < 1e-4, "Second should be 5.0");
-        assert_eq!(indices[0], 99);
-        assert_eq!(indices[1], 42);
-        // Remaining should be sentinel
-        assert!(dists[2] >= f32::MAX / 2.0, "Slot 2 should be sentinel");
     }
 
     /// Helper: build synthetic IVF task data and run a mega kernel,

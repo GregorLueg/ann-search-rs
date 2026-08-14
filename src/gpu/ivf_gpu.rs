@@ -2,14 +2,15 @@
 //! data around.
 
 use cubecl::prelude::*;
+use cubecl_utils_rs::prelude::*;
 use faer::MatRef;
 use num_traits::Float;
 use rayon::prelude::*;
 use std::iter::Sum;
 use thousands::*;
-use cubecl_utils_rs::prelude::*;
 
 use crate::gpu::dist_gpu::*;
+use crate::gpu::topk_gpu::{radix_select_ivf_topk, radix_select_usable};
 use crate::gpu::*;
 use crate::prelude::*;
 use crate::utils::dist::Dist;
@@ -864,23 +865,66 @@ where
 
         let cpq = GpuTensor::<R, u32>::from_slice(&cpu_write_pointers, vec![n_queries], client)?;
         let (coal_gx, coal_gy) = grid_2d(n_queries as u32, &limits)?;
-        let merge = plan_topk_merge(k, size_of::<T>(), &limits)?;
-        unsafe {
-            reduce_ivf_topk_coalesced::launch_unchecked::<T, R>(
-                client,
-                CubeCount::Static(coal_gx, coal_gy, 1),
-                CubeDim::new_2d(WORKGROUP_SIZE_X, 1),
-                candidate_dists_gpu.clone().into_tensor_arg(),
-                candidate_indices_gpu.clone().into_tensor_arg(),
-                cpq.into_tensor_arg(),
-                topk_dists.clone().into_tensor_arg(),
-                topk_indices.clone().into_tensor_arg(),
-                k as u32,
-                k,
-                merge.group,
-                merge.single_round,
-                merge.slots,
-            );
+        let wg = WORKGROUP_SIZE_X as usize;
+
+        // Radix select is flat in `k` where the insertion-sort reducers are
+        // quadratic in it: measured on an M1 Max over 8192 queries x 2048
+        // candidates, the old merge reducer went 8.9 ms at k=15 to 3521 ms at
+        // k=250 while radix stays inside 1.4-7.7 ms. It wins at every `k` here,
+        // so there is no threshold on this path.
+        //
+        // The exhaustive path does carry one, and the difference is chunking
+        // rather than anything intrinsic: this reducer runs once over a complete
+        // candidate buffer, so it never meets a warm output the way a
+        // chunk-accumulating reducer does. See `RADIX_SELECT_MIN_K`.
+        //
+        // The fallback covers non-f32 elements and runtimes without `u32`
+        // atomics. It is the plain serial reducer, which unlike radix select
+        // inserts straight into global memory and therefore needs the sentinel
+        // seeding that the radix path does not.
+        if radix_select_usable(client, k, size_of::<T>(), wg, &limits) {
+            unsafe {
+                radix_select_ivf_topk::launch_unchecked::<T, R>(
+                    client,
+                    CubeCount::Static(coal_gx, coal_gy, 1),
+                    CubeDim::new_2d(WORKGROUP_SIZE_X, 1),
+                    candidate_dists_gpu.clone().into_tensor_arg(),
+                    candidate_indices_gpu.clone().into_tensor_arg(),
+                    cpq.into_tensor_arg(),
+                    topk_dists.clone().into_tensor_arg(),
+                    topk_indices.clone().into_tensor_arg(),
+                    k as u32,
+                    k,
+                    wg,
+                );
+            }
+        } else {
+            let init_gx = (k as u32).div_ceil(WORKGROUP_SIZE_X);
+            let (init_gy, init_gz) = grid_2d((n_queries as u32).div_ceil(4), &limits)?;
+            unsafe {
+                init_topk::launch_unchecked::<T, R>(
+                    client,
+                    CubeCount::Static(init_gx, init_gy, init_gz),
+                    CubeDim::new_2d(WORKGROUP_SIZE_X, 4),
+                    topk_dists.clone().into_tensor_arg(),
+                    topk_indices.clone().into_tensor_arg(),
+                    4,
+                );
+            }
+
+            let (ser_gx, ser_gy) = grid_2d((n_queries as u32).div_ceil(WORKGROUP_SIZE_X), &limits)?;
+            unsafe {
+                reduce_ivf_topk::launch_unchecked::<T, R>(
+                    client,
+                    CubeCount::Static(ser_gx, ser_gy, 1),
+                    CubeDim::new_2d(WORKGROUP_SIZE_X, 1),
+                    candidate_dists_gpu.clone().into_tensor_arg(),
+                    candidate_indices_gpu.clone().into_tensor_arg(),
+                    cpq.into_tensor_arg(),
+                    topk_dists.clone().into_tensor_arg(),
+                    topk_indices.clone().into_tensor_arg(),
+                );
+            }
         }
 
         let final_dists = topk_dists.read(client)?;

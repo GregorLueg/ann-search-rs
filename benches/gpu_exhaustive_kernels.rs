@@ -3,15 +3,18 @@
 //!
 //! Run with: cargo bench --bench gpu_exhaustive_kernels --features gpu
 //!
-//! Note: no `#![allow(dead_code)]` here on purpose. It previously masked the
-//! fact that `TopkCoalescedBench` was defined but never constructed, so the
-//! coalesced-vs-serial top-k comparison the runner advertised never ran.
+//! Note: no `#![allow(dead_code)]` here on purpose. It previously masked a
+//! bench struct that was defined but never constructed, so a comparison the
+//! runner advertised never actually ran. Let the compiler complain instead.
 
 use cubecl::benchmark::{Benchmark, TimingMethod};
 use cubecl::future;
 use cubecl::prelude::*;
 
 use ann_search_rs::gpu::dist_gpu::*;
+use ann_search_rs::gpu::topk_gpu::{
+    radix_select_smem_bytes, radix_select_topk, radix_select_usable, SURV_ARRAYS_DENSE,
+};
 use ann_search_rs::gpu::*;
 use ann_search_rs::utils::dist::Dist;
 use cubecl_utils_rs::prelude::*;
@@ -79,6 +82,92 @@ fn l2_norms(flat: &[f32], dim: usize) -> Vec<f32> {
     flat.chunks_exact(dim)
         .map(|row| row.iter().map(|v| v * v).sum::<f32>().sqrt())
         .collect()
+}
+
+/// Seed the top-k output buffers with the `f32::MAX` / `0` sentinel.
+///
+/// Called from the timed `execute`, not from `prepare`, and that placement is
+/// deliberate. `Benchmark::run` calls `prepare` once and clones the input for
+/// every iteration, so seeding there leaves iterations 2..n reducing into an
+/// already-populated top-k, where the `dist < local[k - 1]` acceptance test
+/// rejects nearly every candidate. Those iterations do far less work than the
+/// first, and the gap widens with `k`, which flattens exactly the curve a `k`
+/// sweep is trying to measure.
+///
+/// The cost is `O(n_queries * k)` writes against the reducer's
+/// `O(n_queries * n_db)` reads, and it is paid identically by every arm.
+///
+/// ### Params
+///
+/// * `client` - Compute client
+/// * `dists` - Top-k distance buffer `[n_queries, k]`
+/// * `indices` - Top-k index buffer `[n_queries, k]`
+/// * `nq` - Number of queries
+/// * `k` - Number of neighbours
+fn seed_topk<R: Runtime>(
+    client: &ComputeClient<R>,
+    dists: &GpuTensor<R, f32>,
+    indices: &GpuTensor<R, u32>,
+    nq: usize,
+    k: usize,
+) {
+    let init_gx = (k as u32).div_ceil(WORKGROUP_SIZE_X);
+    let init_gy = (nq as u32).div_ceil(4);
+    unsafe {
+        init_topk::launch_unchecked::<f32, R>(
+            client,
+            CubeCount::Static(init_gx, init_gy, 1),
+            CubeDim::new_2d(WORKGROUP_SIZE_X, 4),
+            dists.clone().into_tensor_arg(),
+            indices.clone().into_tensor_arg(),
+            4,
+        );
+    }
+}
+
+/// Allocate the shared top-k bench input: a synthetic distance matrix plus the
+/// two output buffers.
+///
+/// The distance values are a deterministic sawtooth in `[0, 10)`. It is not a
+/// real distance matrix, it only has to be reducible.
+///
+/// ### Params
+///
+/// * `client` - Compute client
+/// * `nq` - Number of queries
+/// * `ndb` - Number of database candidates per query
+/// * `k` - Number of neighbours
+///
+/// ### Returns
+///
+/// The populated [`TopkInput`].
+fn make_topk_input<R: Runtime>(
+    client: &ComputeClient<R>,
+    nq: usize,
+    ndb: usize,
+    k: usize,
+) -> TopkInput<R> {
+    // High-entropy values on purpose. The original generator cycled through
+    // only 1000 distinct distances, so at large `n_db` every value had dozens of
+    // exact duplicates. That is not what a real distance matrix looks like, and
+    // it biases the comparison in both directions at once: ties are rejected by
+    // the serial kernel's strict `<` acceptance test, so they cheapen it, while
+    // they force the radix descent into its position tie-break passes.
+    let dists: Vec<f32> = (0..nq * ndb)
+        .map(|i| {
+            let h = (i as u64).wrapping_mul(2_654_435_761) % 16_777_213;
+            h as f32 * 1e-4
+        })
+        .collect();
+
+    TopkInput {
+        distances_gpu: GpuTensor::<R, f32>::from_slice(&dists, vec![nq, ndb], client)
+            .expect("GPU allocation exceeds the device binding limit"),
+        topk_dists: GpuTensor::<R, f32>::empty(vec![nq, k], client)
+            .expect("GPU allocation exceeds the device binding limit"),
+        topk_indices: GpuTensor::<R, u32>::empty(vec![nq, k], client)
+            .expect("GPU allocation exceeds the device binding limit"),
+    }
 }
 
 // ──────────────────────────────────────────────
@@ -378,45 +467,20 @@ impl<R: Runtime> Benchmark for TopkBench<R> {
     type Output = ();
 
     fn prepare(&self) -> Self::Input {
-        let nq = self.cfg.n_queries;
-        let ndb = self.cfg.n_db;
-        let k = self.cfg.k;
-
-        let dists: Vec<f32> = (0..nq * ndb)
-            .map(|i| ((i * 7 + 13) % 1000) as f32 * 0.01)
-            .collect();
-
-        let distances_gpu = GpuTensor::<R, f32>::from_slice(&dists, vec![nq, ndb], &self.client)
-            .expect("GPU allocation exceeds the device binding limit");
-        let topk_dists = GpuTensor::<R, f32>::empty(vec![nq, k], &self.client)
-            .expect("GPU allocation exceeds the device binding limit");
-        let topk_indices = GpuTensor::<R, u32>::empty(vec![nq, k], &self.client)
-            .expect("GPU allocation exceeds the device binding limit");
-
-        let init_gx = (k as u32).div_ceil(WORKGROUP_SIZE_X);
-        let init_gy = (nq as u32).div_ceil(4);
-        unsafe {
-            init_topk::launch_unchecked::<f32, R>(
-                &self.client,
-                CubeCount::Static(init_gx, init_gy, 1),
-                CubeDim::new_2d(WORKGROUP_SIZE_X, 4),
-                topk_dists.clone().into_tensor_arg(),
-                topk_indices.clone().into_tensor_arg(),
-                4,
-            );
-        }
-        future::block_on(self.client.sync()).expect("sync failed");
-
-        TopkInput {
-            distances_gpu,
-            topk_dists,
-            topk_indices,
-        }
+        make_topk_input(&self.client, self.cfg.n_queries, self.cfg.n_db, self.cfg.k)
     }
 
     fn execute(&self, input: Self::Input) -> Result<Self::Output, String> {
         let nq = self.cfg.n_queries;
         let ndb = self.cfg.n_db;
+
+        seed_topk(
+            &self.client,
+            &input.topk_dists,
+            &input.topk_indices,
+            nq,
+            self.cfg.k,
+        );
 
         let extract_grid = (nq as u32).div_ceil(WORKGROUP_SIZE_X);
         unsafe {
@@ -528,62 +592,24 @@ impl<R: Runtime> Benchmark for FullPipelineBench<R> {
 }
 
 // ──────────────────────────────────────────────
-// 4. TopK Coalesced kernel
+// 2b. Radix-select top-k
 // ──────────────────────────────────────────────
 
-struct TopkCoalescedBench<R: Runtime> {
+/// Times `radix_select_topk`, the replacement for `extract_topk`.
+///
+/// Same input, same sentinel seeding inside the timed region, so the two arms
+/// are directly comparable.
+struct TopkRadixBench<R: Runtime> {
     cfg: BenchConfig,
     client: ComputeClient<R>,
 }
 
-impl<R: Runtime> Clone for TopkCoalescedBench<R> {
-    fn clone(&self) -> Self {
-        Self {
-            cfg: self.cfg.clone(),
-            client: self.client.clone(),
-        }
-    }
-}
-
-impl<R: Runtime> Benchmark for TopkCoalescedBench<R> {
+impl<R: Runtime> Benchmark for TopkRadixBench<R> {
     type Input = TopkInput<R>;
     type Output = ();
 
     fn prepare(&self) -> Self::Input {
-        let nq = self.cfg.n_queries;
-        let ndb = self.cfg.n_db;
-        let k = self.cfg.k;
-
-        let dists: Vec<f32> = (0..nq * ndb)
-            .map(|i| ((i * 7 + 13) % 1000) as f32 * 0.01)
-            .collect();
-
-        let distances_gpu = GpuTensor::<R, f32>::from_slice(&dists, vec![nq, ndb], &self.client)
-            .expect("GPU allocation exceeds the device binding limit");
-        let topk_dists = GpuTensor::<R, f32>::empty(vec![nq, k], &self.client)
-            .expect("GPU allocation exceeds the device binding limit");
-        let topk_indices = GpuTensor::<R, u32>::empty(vec![nq, k], &self.client)
-            .expect("GPU allocation exceeds the device binding limit");
-
-        let init_gx = (k as u32).div_ceil(WORKGROUP_SIZE_X);
-        let init_gy = (nq as u32).div_ceil(4);
-        unsafe {
-            init_topk::launch_unchecked::<f32, R>(
-                &self.client,
-                CubeCount::Static(init_gx, init_gy, 1),
-                CubeDim::new_2d(WORKGROUP_SIZE_X, 4),
-                topk_dists.clone().into_tensor_arg(),
-                topk_indices.clone().into_tensor_arg(),
-                4,
-            );
-        }
-        future::block_on(self.client.sync()).expect("sync failed");
-
-        TopkInput {
-            distances_gpu,
-            topk_dists,
-            topk_indices,
-        }
+        make_topk_input(&self.client, self.cfg.n_queries, self.cfg.n_db, self.cfg.k)
     }
 
     fn execute(&self, input: Self::Input) -> Result<Self::Output, String> {
@@ -591,26 +617,28 @@ impl<R: Runtime> Benchmark for TopkCoalescedBench<R> {
         let ndb = self.cfg.n_db;
         let k = self.cfg.k;
 
-        let grid = nq as u32; // one workgroup per query
+        seed_topk(&self.client, &input.topk_dists, &input.topk_indices, nq, k);
+
         let limits = GpuLimits::from_client(&self.client);
-        let merge = plan_topk_merge(k, size_of::<f32>(), &limits)
-            .expect("k too large for the device shared-memory budget");
+        let wg = WORKGROUP_SIZE_X as usize;
+        if !radix_select_usable(&self.client, k, size_of::<f32>(), wg, &limits) {
+            return Err(format!("radix select unusable at k={k}"));
+        }
+        let (gx, gy) = grid_2d(nq as u32, &limits).map_err(|e| e.to_string())?;
+
         unsafe {
-            extract_topk_coalesced::launch_unchecked::<f32, R>(
+            radix_select_topk::launch_unchecked::<f32, R>(
                 &self.client,
-                CubeCount::Static(grid, 1, 1),
-                CubeDim::new_2d(32, 1),
+                CubeCount::Static(gx, gy, 1),
+                CubeDim::new_2d(WORKGROUP_SIZE_X, 1),
                 input.distances_gpu.into_tensor_arg(),
                 input.topk_dists.into_tensor_arg(),
                 input.topk_indices.into_tensor_arg(),
                 0u32,
                 ndb as u32,
-                ndb as u32,
                 k as u32,
                 k,
-                merge.group,
-                merge.single_round,
-                merge.slots,
+                wg,
             );
         }
 
@@ -619,7 +647,7 @@ impl<R: Runtime> Benchmark for TopkCoalescedBench<R> {
 
     fn name(&self) -> String {
         format!(
-            "topk_coalesced_{}q_{}db_k{}",
+            "topk_radix_{}q_{}db_k{}",
             self.cfg.n_queries, self.cfg.n_db, self.cfg.k
         )
     }
@@ -658,88 +686,6 @@ fn report_device_limits<R: Runtime>(client: &ComputeClient<R>) {
     println!("max cube dim     : {:?}", hw.max_cube_dim);
     println!("max units/cube   : {}", hw.max_units_per_cube);
     println!();
-}
-
-/// Validate the top-k kernels once, before any timing runs.
-///
-/// Every launch in this crate is `launch_unchecked`. A dispatch that busts a
-/// device limit does no work, returns zeros, reports no error, and looks like
-/// an enormous speedup. So we check the output is real before believing any
-/// number, and we cross-check the two top-k kernels against each other, which
-/// is the comparison the runner previously claimed to make but never did.
-///
-/// ### Params
-///
-/// * `cfg` - Config to validate against
-/// * `client` - GPU compute client
-///
-/// ### Returns
-///
-/// Panics with a diagnostic if either kernel produced implausible output or
-/// the two disagree.
-fn validate_topk<R: Runtime>(cfg: &BenchConfig, client: &ComputeClient<R>) {
-    let serial = TopkBench::<R> {
-        cfg: cfg.clone(),
-        client: client.clone(),
-    };
-    let coalesced = TopkCoalescedBench::<R> {
-        cfg: cfg.clone(),
-        client: client.clone(),
-    };
-
-    let s_in = serial.prepare();
-    serial.execute(s_in.clone()).expect("serial topk failed");
-    serial.sync();
-    let s_dists = s_in.topk_dists.read(client).expect("read failed");
-
-    let c_in = coalesced.prepare();
-    coalesced
-        .execute(c_in.clone())
-        .expect("coalesced topk failed");
-    coalesced.sync();
-    let c_dists = c_in.topk_dists.read(client).expect("read failed");
-
-    let k = cfg.k;
-
-    // A kernel that did nothing leaves the init_topk sentinel in place.
-    let untouched = s_dists.iter().filter(|d| **d >= f32::MAX).count();
-    assert_eq!(
-        untouched, 0,
-        "serial topk left {untouched} sentinel entries: the kernel almost certainly did no work"
-    );
-    let untouched_c = c_dists.iter().filter(|d| **d >= f32::MAX).count();
-    assert_eq!(
-        untouched_c, 0,
-        "coalesced topk left {untouched_c} sentinel entries: the kernel almost certainly did no work"
-    );
-
-    // Each row must be sorted ascending.
-    for (row, chunk) in s_dists.chunks_exact(k).enumerate() {
-        assert!(
-            chunk.windows(2).all(|w| w[0] <= w[1]),
-            "serial topk row {row} is not sorted: {chunk:?}"
-        );
-    }
-
-    // The two kernels must agree on the selected distances. Indices may differ
-    // on ties, distances must not.
-    for (row, (s, c)) in s_dists
-        .chunks_exact(k)
-        .zip(c_dists.chunks_exact(k))
-        .enumerate()
-    {
-        for (j, (sd, cd)) in s.iter().zip(c.iter()).enumerate() {
-            assert!(
-                (sd - cd).abs() <= 1e-6 * sd.abs().max(1.0),
-                "topk kernels disagree at row {row} slot {j}: serial={sd} coalesced={cd}"
-            );
-        }
-    }
-
-    println!(
-        "topk validation passed ({} queries, k={})",
-        cfg.n_queries, k
-    );
 }
 
 /// Cross-check the register-tiled distance kernel against the 1x1 kernel.
@@ -839,7 +785,8 @@ fn run_exhaustive_suite<R: Runtime>(device: &R::Device) {
     ];
 
     println!("====== Correctness gate ======");
-    validate_topk::<R>(&kernel_configs[0], &client);
+    // The top-k arms are gated per configuration inside `run_topk_pair`, which
+    // covers every `k` in the sweep rather than one sample of it.
     for cfg in &kernel_configs {
         validate_distance_reg::<R>(cfg, &client);
     }
@@ -864,26 +811,38 @@ fn run_exhaustive_suite<R: Runtime>(device: &R::Device) {
             cfg: cfg.clone(),
             client: client.clone(),
         };
-        let topk_bench = TopkBench::<R> {
-            cfg: cfg.clone(),
-            client: client.clone(),
-        };
-        let topk_coalesced_bench = TopkCoalescedBench::<R> {
-            cfg: cfg.clone(),
-            client: client.clone(),
-        };
-
         println!("{}", dist_bench.name());
         println!("{:?}", dist_bench.run(TimingMethod::System));
 
         println!("{}", dist_reg_bench.name());
         println!("{:?}", dist_reg_bench.run(TimingMethod::System));
+    }
 
-        println!("{}", topk_bench.name());
-        println!("{:?}", topk_bench.run(TimingMethod::System));
+    // ── Top-k reducer sweeps ──
+    //
+    // The reducers ignore dim and metric entirely, so running them inside the
+    // loop above measured k=15 five times over and never touched the chunked
+    // merge arm. k and n_db are the two axes that do move them, and they are
+    // swept separately: without the n_db axis, "cost rises with k" cannot be
+    // told apart from "cost rises with work".
 
-        println!("{}", topk_coalesced_bench.name());
-        println!("{:?}", topk_coalesced_bench.run(TimingMethod::System));
+    println!("\n====== Top-k reducers: k sweep (8192q x 16384db) ======");
+    // Fine granularity below 50: radix select is linear in n_db where the serial
+    // kernel is sublinear, so the crossover is expected somewhere in the teens
+    // to thirties and needs resolving rather than guessing.
+    for k in [10usize, 15, 20, 25, 30, 40, 50, 100, 150, 250] {
+        run_topk_pair::<R>(&BenchConfig::euclidean(8192, 16_384, 32, k), &client);
+    }
+
+    // Two axes rather than one. Radix select is linear in n_db while the serial
+    // kernel is sublinear in it, so radix's worst corner is small k with large
+    // n_db, and that corner is what decides whether a dispatch threshold is
+    // needed at all.
+    println!("\n====== Top-k reducers: n_db x k corners (4096q) ======");
+    for ndb in [4096usize, 16_384, 65_536] {
+        for k in [10usize, 50] {
+            run_topk_pair::<R>(&BenchConfig::euclidean(4096, ndb, 32, k), &client);
+        }
     }
 
     // ── Pipeline-level benchmarks (realistic workloads) ──
@@ -899,8 +858,20 @@ fn run_exhaustive_suite<R: Runtime>(device: &R::Device) {
         BenchConfig::cosine(50_000, 50_000, 128, 15),
     ];
 
+    // Sweep `k` at one shape to locate the dispatch crossover. This has to be
+    // measured end to end rather than on the isolated reducer: with n_db=50000
+    // the pipeline runs four DB chunks, and `extract_topk` becomes nearly free
+    // after the first because a tight running top-k rejects almost every
+    // candidate at its `dist < local[k - 1]` test. Radix select pays full price
+    // on every chunk. The isolated bench only ever measures the cold chunk, so
+    // it reports radix winning at every `k` while the pipeline does not.
+    let crossover_configs: Vec<BenchConfig> = [15usize, 30, 50, 75, 100, 150]
+        .into_iter()
+        .map(|k| BenchConfig::euclidean(50_000, 50_000, 32, k))
+        .collect();
+
     println!("\n====== Full pipeline ======");
-    for cfg in pipeline_configs {
+    for cfg in pipeline_configs.into_iter().chain(crossover_configs) {
         println!(
             "\n--- {}q x {}db, dim={}, k={}, {} ---\n",
             cfg.n_queries,
@@ -919,6 +890,113 @@ fn run_exhaustive_suite<R: Runtime>(device: &R::Device) {
         println!("{}", full_bench.name());
         println!("{:?}", full_bench.run(TimingMethod::System));
     }
+}
+
+/// Gate the serial and radix arms against each other at this exact config
+/// before either is timed.
+///
+/// Every launch here is `launch_unchecked`, so a kernel that busts a device
+/// limit does no work, returns whatever was in the buffer and reports no error.
+/// Radix select is the fast arm, so an unguarded timing is precisely where that
+/// failure would look like a triumph.
+///
+/// ### Params
+///
+/// * `cfg` - Configuration under test
+/// * `client` - Compute client
+fn validate_topk_arms<R: Runtime>(cfg: &BenchConfig, client: &ComputeClient<R>) {
+    let serial = TopkBench::<R> {
+        cfg: cfg.clone(),
+        client: client.clone(),
+    };
+    let radix = TopkRadixBench::<R> {
+        cfg: cfg.clone(),
+        client: client.clone(),
+    };
+
+    let s_in = serial.prepare();
+    serial.execute(s_in.clone()).expect("serial topk failed");
+    serial.sync();
+    let sd = s_in.topk_dists.read(client).expect("read failed");
+    let si = s_in.topk_indices.read(client).expect("read failed");
+
+    let r_in = radix.prepare();
+    radix.execute(r_in.clone()).expect("radix topk failed");
+    radix.sync();
+    let rd = r_in.topk_dists.read(client).expect("read failed");
+    let ri = r_in.topk_indices.read(client).expect("read failed");
+
+    let untouched = rd.iter().filter(|d| **d >= f32::MAX).count();
+    assert_eq!(
+        untouched, 0,
+        "radix k={}: {untouched} sentinels survived, the kernel almost certainly did no work",
+        cfg.k
+    );
+
+    // Bit-exact on distances and equal on indices: the radix kernel selects
+    // under the same total order the serial one produces, so there is no tie
+    // slack to allow for.
+    for (slot, ((a, b), (x, y))) in sd
+        .iter()
+        .zip(rd.iter())
+        .zip(si.iter().zip(ri.iter()))
+        .enumerate()
+    {
+        assert_eq!(
+            a.to_bits(),
+            b.to_bits(),
+            "k={} slot {slot}: serial={a} radix={b}",
+            cfg.k
+        );
+        assert_eq!(
+            x, y,
+            "k={} slot {slot}: serial idx={x} radix idx={y}",
+            cfg.k
+        );
+    }
+}
+
+/// Run the top-k reducers on one config, printing the shared-memory budget the
+/// radix arm is working against alongside the timings.
+///
+/// Residency is the quantity the high-k diagnosis predicts falls off a cliff, so
+/// it is printed next to the timing rather than reconstructed afterwards. It
+/// describes the radix arm only: the serial `extract_topk` uses no shared
+/// memory at all and is bounded by its per-thread register arrays instead.
+///
+/// ### Params
+///
+/// * `cfg` - Configuration to run
+/// * `client` - Compute client
+fn run_topk_pair<R: Runtime>(cfg: &BenchConfig, client: &ComputeClient<R>) {
+    let limits = GpuLimits::from_client(client);
+    let radix_smem = radix_select_smem_bytes(cfg.k, WORKGROUP_SIZE_X as usize, SURV_ARRAYS_DENSE);
+
+    println!(
+        "\n--- k={} | {}q x {}db | radix smem={}B resident={} ---\n",
+        cfg.k,
+        cfg.n_queries,
+        cfg.n_db,
+        radix_smem,
+        resident_workgroups(radix_smem, &limits),
+    );
+
+    validate_topk_arms::<R>(cfg, client);
+
+    let serial = TopkBench::<R> {
+        cfg: cfg.clone(),
+        client: client.clone(),
+    };
+    let radix = TopkRadixBench::<R> {
+        cfg: cfg.clone(),
+        client: client.clone(),
+    };
+
+    println!("{}", serial.name());
+    println!("{:?}", serial.run(TimingMethod::System));
+
+    println!("{}", radix.name());
+    println!("{:?}", radix.run(TimingMethod::System));
 }
 
 fn main() {
