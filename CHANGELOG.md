@@ -1,5 +1,12 @@
 # News
 
+## 0.5.1
+
+**Features**
+
+- Radix seach for GPU-accelerated exhaustive and IVF search. In the former case,
+  faster at high k, in the latter case always faster.
+
 ## 0.5.0
 
 **Features**
