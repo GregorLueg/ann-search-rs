@@ -203,19 +203,6 @@ pub enum AnnSearchErrors {
         available: usize,
     },
 
-    /// Error for a neighbour count whose top-k merge cannot fit in shared memory
-    #[cfg(feature = "gpu")]
-    #[error(
-        "The top-k merge needs room for at least two {k}-element candidate lists in shared \
-         memory, but this device offers only {available} bytes. Lower k."
-    )]
-    KTooHighForSharedMemory {
-        /// Requested number of neighbours
-        k: usize,
-        /// Shared memory the device reports, in bytes
-        available: usize,
-    },
-
     // -- serialisation errors --
     /// The file does not carry the `ann-search-rs` magic bytes
     #[cfg(feature = "serialise")]

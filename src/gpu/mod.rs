@@ -12,6 +12,7 @@ pub mod exhaustive_gpu;
 pub mod forest_gpu;
 pub mod ivf_gpu;
 pub mod nndescent_gpu;
+pub mod topk_gpu;
 
 use cubecl_utils_rs::prelude::*;
 
@@ -246,75 +247,6 @@ pub fn plan_local_join_staging(
     })
 }
 
-/// Shared-memory merge plan for the coalesced top-k reducers.
-///
-/// Produced by [`plan_topk_merge`] and handed to the kernel as comptime
-/// arguments.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct TopkMergePlan {
-    /// Lanes whose private top-k lists are staged per merge round. Always a
-    /// power of two dividing `WORKGROUP_SIZE_X`.
-    pub group: usize,
-    /// Whether every lane fits in a single round, enabling the unchunked fast
-    /// path.
-    pub single_round: bool,
-    /// Number of `k`-element lists held in shared memory. Equals
-    /// `WORKGROUP_SIZE_X` on the single-round path and `group + 1` otherwise,
-    /// the extra list being the running accumulator.
-    pub slots: usize,
-}
-
-/// Plan how the coalesced top-k reducers stage per-lane lists in shared memory.
-///
-/// ### Params
-///
-/// * `k` - Number of neighbours per query
-/// * `elem_bytes` - Size of the float element type in bytes
-/// * `limits` - Device limits from `GpuLimits::from_client`
-///
-/// ### Returns
-///
-/// A [`TopkMergePlan`], or `KTooHighForSharedMemory` when not even two
-/// `k`-element lists fit in the budget, i.e. `k > 2048` for `f32` against a
-/// 32 KiB limit. Below that the merge is always representable.
-pub fn plan_topk_merge(
-    k: usize,
-    elem_bytes: usize,
-    limits: &GpuLimits,
-) -> Result<TopkMergePlan, AnnSearchErrors> {
-    let max_shared_bytes = limits.max_shared_bytes;
-    let lanes = WORKGROUP_SIZE_X as usize;
-    // One list is `k` distances plus `k` u32 indices.
-    let list_bytes = k * (elem_bytes + 4);
-
-    if lanes * list_bytes <= max_shared_bytes {
-        return Ok(TopkMergePlan {
-            group: lanes,
-            single_round: true,
-            slots: lanes,
-        });
-    }
-
-    // Chunked path: `group` staged lists plus the accumulator live at once.
-    if 2 * list_bytes > max_shared_bytes {
-        return Err(AnnSearchErrors::KTooHighForSharedMemory {
-            k,
-            available: max_shared_bytes,
-        });
-    }
-
-    let mut group = 1usize;
-    while 2 * group < lanes && (2 * group + 1) * list_bytes <= max_shared_bytes {
-        group *= 2;
-    }
-
-    Ok(TopkMergePlan {
-        group,
-        single_round: false,
-        slots: group + 1,
-    })
-}
-
 /// Shared-memory staging plan for the CAGRA beam-search kernel.
 ///
 /// Produced by [`plan_beam_search_staging`] and handed to the kernel as
@@ -544,14 +476,5 @@ mod tests {
         // A 4096-wide f32 row alone is 16 KiB; against 16 KiB total there is
         // nothing left for the beam, the neighbour slots or the hash table.
         assert!(plan_beam_search_staging(4096, 32, 16, 3, 2048, 4, &small()).is_err());
-    }
-
-    #[test]
-    fn test_plan_topk_merge_boundary() {
-        let l = apple();
-        // 32 lanes * 128 * 8 bytes = 32768, exactly the budget.
-        assert!(plan_topk_merge(128, 4, &l).unwrap().single_round);
-        assert!(!plan_topk_merge(129, 4, &l).unwrap().single_round);
-        assert!(plan_topk_merge(4096, 4, &l).is_err());
     }
 }

@@ -16,15 +16,20 @@ cargo build --release
 cargo test  --release
 
 # Full test suite matching CI (macOS/Linux)
-cargo test --release --features binary,quantised,gpu
+cargo test --release --features binary,quantised,gpu,serialise
 
 # GPU integration tests (needs a working GPU + wgpu backend)
-cargo test --release --features binary,gpu,gpu-tests,quantised
+cargo test --release --features binary,gpu,gpu-tests,quantised,serialise
 
 # Single test
 cargo test --release --features quantised -- ivf_pq::tests::name_of_test --exact --nocapture
 
 # Gridsearch examples (one per algorithm; feature-gated ones need the flag)
+# CPU:       annoy, balltree, hnsw, ivf, kd_forest, kmknn, lsh, nndescent, nsg,
+#            rnn_descent, vamana
+# quantised: bf16, sq8, pq, opq
+# binary:    binary, rabitq, tq
+# gpu:       gpu, cagra, nsg_gpu (plus the knn_comparison_cagra example)
 cargo run --example gridsearch_hnsw   --release
 cargo run --example gridsearch_ivf    --release -- --n-samples 500000 --dim 128 --distance cosine
 cargo run --example gridsearch_pq     --release --features quantised
@@ -39,8 +44,8 @@ cargo bench --bench gpu_exhaustive_kernels --features gpu
 CUBECL_DEBUG_OPTION=profile-medium CUBECL_DEBUG_LOG=stdout \
   cargo bench --bench gpu_exhaustive_kernels --features gpu 2>&1 | grep -v wgsl
 
-# Docs (docs.rs config enables binary + quantised + mimalloc)
-cargo doc --features binary,quantised,mimalloc --no-deps --open
+# Docs (docs.rs config enables binary + quantised + mimalloc + serialise)
+cargo doc --features binary,quantised,mimalloc,serialise --no-deps --open
 ```
 
 The profiler emits one `| 15.675584ms | KernelName | WgpuRuntime |` line per launch;
@@ -56,12 +61,13 @@ Release profile in `Cargo.toml` sets `lto = true` and `codegen-units = 1`. Relea
 ## Features
 
 - `quantised`: BF16 / SQ8 / PQ / OPQ. Pulls in `half`.
-- `binary`: bitwise / RaBitQ / TurboQuant, optional on-disk vector store for re-ranking. Pulls in `memmap2`, `tempfile`, `bytemuck`, `statrs`.
-- `gpu`: CubeCL + wgpu backend (agnostic to Metal / Vulkan / DX12 / CPU). Pulls in `cubecl`.
+- `binary`: bitwise / RaBitQ / TurboQuant, optional on-disk vector store for re-ranking. Pulls in `memmap2`, `bytemuck`, `statrs`. (`tempfile` is a dev-dependency only, used by tests and examples.)
+- `gpu`: CubeCL + wgpu backend (agnostic to Metal / Vulkan / DX12 / CPU). Pulls in `cubecl` and `cubecl-utils-rs`.
 - `gpu-tests`: enables tests that require a real GPU. CI-only, combined with `gpu`.
+- `serialise`: save indices to disk and load them back (`IndexIo`, `save_index` / `load_index`). Pulls in `serde`, `bincode`, and `half?/serde`. Covers the CPU, quantised and binary indices; GPU indices are not covered.
 - `mimalloc`: swaps in `mimalloc` as the global allocator.
 
-Every code path under `src/quantised/`, `src/binary/`, `src/gpu/` is behind its cfg. When editing, keep new items behind the correct `#[cfg(feature = "...")]`. The crate must still compile with default features off.
+Every code path under `src/quantised/`, `src/binary/`, `src/gpu/`, `src/serialise/` is behind its cfg. When editing, keep new items behind the correct `#[cfg(feature = "...")]`. The crate must still compile with default features off.
 
 ## Architecture
 
@@ -72,17 +78,23 @@ src/
   lib.rs           # public wrapper fns; all `pub fn build_*` / `query_*` live here
   prelude.rs       # user-facing re-exports (Dist, KMeansTrainingParams, KnnResult, ...)
   errors.rs        # single AnnSearchErrors enum, thiserror-backed
-  utils/           # SIMD dist, heaps, k-means, tree/graph helpers, traits
+  utils/           # SIMD dist, heaps, k-means, tree/graph/nndescent helpers,
+                   # traits, striped locks (parallelism.rs), file staging
   cpu/             # CPU indices: annoy, ball_tree, exhaustive, hnsw, ivf,
-                   #              kd_forest, kmknn, lsh, nndescent, vamana
+                   #              kd_forest, kmknn, lsh, nndescent, nsg,
+                   #              rnn_descent, vamana
   quantised/       # bf16/sq8/pq/opq × (exhaustive, ivf) + shared k_means & quantisers
   binary/          # binary/rabitq/tq × (exhaustive, ivf) + binariser, vec_store, turboquant/
   gpu/             # exhaustive_gpu, ivf_gpu, nndescent_gpu, cagra_gpu_search,
-                   # forest_gpu, tensor, dist_gpu, traits_gpu
+                   # forest_gpu, dist_gpu, topk_gpu
+  serialise/       # IndexIo trait, save_index / load_index, bundle header
 benches/           # GPU kernel microbenches (CubeCL Benchmark trait, not criterion)
-examples/          # gridsearch_*.rs, one per algorithm, share examples/commons/mod.rs
-docs/              # benchmark result tables (markdown) + news.md
+examples/          # gridsearch_*.rs, one per algorithm, share examples/commons/mod.rs;
+                   # fill_benchmarks.sh regenerates docs/ from docs/templates/
+docs/              # benchmark result tables (markdown) + the templates they fill
 ```
+
+Saving is a *directory*, not a file: `index.bin` plus any aux files (currently only the binary indices' mmap store). Everything is written under a temporary name and renamed at the end with `index.bin` last, so `index.bin` is the commit point. `utils/staging.rs` owns that dance, and it exists partly because truncating a mapped file is a `SIGBUS` waiting to happen. Do not replace it with a plain `File::create`.
 
 ### Public API shape
 
@@ -92,6 +104,8 @@ Every index follows the same pattern in `src/lib.rs`:
 - `query_<name>_index(query_mat, &index, k, ..., return_dist, verbose) -> KnnOptionResult<T>` for cross-set queries.
 - `query_<name>_self(&index, k, ..., return_dist, verbose) -> KnnOptionResult<T>` for the full self-kNN graph. These use index-specific fast paths (IVF exploits Voronoi cells, HNSW walks the graph without re-entering).
 
+NSG is the exception: it builds from an existing kNN graph, so alongside `build_nsg_index` there are `build_nsg_from_knn_index` and `build_nsg_from_gpu_knn`.
+
 `KnnOptionResult<T> = Result<(Vec<Vec<usize>>, Option<Vec<Vec<T>>>), AnnSearchErrors>`. Distances are optional so callers can skip storing them when they only need indices.
 
 `dist_metric` is parsed from a string (`"euclidean"|"l2"`, `"cosine"`, `"manhattan"|"l1"`) via `parse_ann_dist`. Unknown strings print a warning and fall back to squared Euclidean rather than erroring. Preserve that behaviour unless changing it deliberately.
@@ -99,9 +113,9 @@ Every index follows the same pattern in `src/lib.rs`:
 ### Data & numeric traits
 
 - Vectors are `faer::MatRef<T>` (rows = samples, cols = features). Internally, indices flatten to `Vec<T>` via `utils::matrix_to_flat` for cache-friendly access.
-- `AnnSearchFloat` (in `utils/traits.rs`) is the shared trait bound: `Float + FromPrimitive + ToPrimitive + Send + Sync + Sum + SimdDistance + ComplexField`. `f32` and `f64` both implement it, both are supported end-to-end.
+- `AnnSearchFloat` (in `utils/traits.rs`) is the shared trait bound: `Float + FromPrimitive + ToPrimitive + Send + Sync + Sum + SimdDistance + ComplexField`, **plus `Serialize + DeserializeOwned` when `serialise` is on**. There are two `#[cfg]`-gated definitions of the trait; edit both. `f32` and `f64` are unaffected either way, and both are supported end-to-end.
 - BF16-specific ops go through the `Bf16Compatible` bound (quantised feature only).
-- GPU indices also require `AnnSearchGpuFloat` (in `gpu/traits_gpu.rs`).
+- GPU indices also require `CubeclFloat` (re-exported from `cubecl-utils-rs`).
 
 ### Parallelism & SIMD
 
@@ -116,8 +130,9 @@ Every index follows the same pattern in `src/lib.rs`:
 ### GPU / CubeCL specifics (`src/gpu/`)
 
 - Everything runs on CubeCL with the wgpu backend, so kernels are cross-platform (Metal/Vulkan/DX12) with a CPU fallback.
-- **Tensors, device limits and dispatch geometry live in `cubecl-utils-rs`**, not here: `GpuTensor`, `GpuLimits`, `grid_2d`, `checked_cube_count`, `fits_shared_memory`, `fits_binding`, `resolve_workgroup_size`, `pad_vectors`, `LINE_SIZE`, `CubeclFloat`. `bixverse-rs` and `manifolds-rs` consume the same crate. Changes to those primitives belong upstream there, not in a local copy here.
-- What stays in `gpu/mod.rs` are the staging plans, which model *this crate's* kernel footprints: `pick_wg_y`, `tile_fits`, `plan_local_join_staging`, `plan_topk_merge`, `plan_beam_search_staging`, `plan_db_chunk`, plus `QUERY_CHUNK_SIZE`, `DB_CHUNK_SIZE`, `WORKGROUP_SIZE_X`, `TILE_D`, `TILE_Q`.
+- **Tensors, device limits and dispatch geometry live in `cubecl-utils-rs`** (pinned to `0.1.0`), not here. Its prelude is the whole surface: `GpuTensor`, `GpuLimits`, `grid_2d`, `grid_2d_limited`, `checked_cube_count`, `fits_shared_memory`, `fits_binding`, `resolve_workgroup_size`, `resident_workgroups`, `plane_uniform`, `plane_partitions`, `pad_vectors`, `padded_dim`, `LINE_SIZE`, `CubeclFloat`, `CubeclUtilsErrors`. `bixverse-rs` and `manifolds-rs` consume the same crate. Changes to those primitives belong upstream there, not in a local copy here.
+- What stays in `gpu/mod.rs` are the staging plans, which model *this crate's* kernel footprints: `pick_wg_y`, `tile_fits`, `mega_smem_bytes`, `plan_local_join_staging`, `plan_beam_search_staging`, `plan_db_chunk`, plus `QUERY_CHUNK_SIZE`, `DB_CHUNK_SIZE`, `WORKGROUP_SIZE_X`, `TILE_D`, `TILE_Q`.
+- `gpu/topk_gpu.rs` carries its own footprint function, `radix_select_smem_bytes`, next to the kernels it sizes. The exhaustive and IVF paths dispatch to radix select via `radix_select_usable`, and the exhaustive path additionally gates on `RADIX_SELECT_MIN_K`; both fall back to the insertion-sort reducers in `dist_gpu.rs` (`extract_topk`, `reduce_ivf_topk`) otherwise.
 - **Every device-limit decision is a pure function of `GpuLimits`.** Read the limits once per entry point with `GpuLimits::from_client(&client)` and pass them down; do not reach for `client.properties()` deeper in. That is what makes the smaller-device behaviour testable here, and every staging plan has host-only tests at synthetic budgets (16 KiB, 32 KiB, 48 KiB, 64 KiB against 4- and 8-byte elements).
 - `pick_wg_y(dim_padded, elem_bytes, &limits)` starts from a table tuned for 32 KiB and `f32` and **shrinks** until the staging fits the device. It never grows: the Apple result is a regression-tested invariant (`test_pick_wg_y_apple_table_is_unchanged`). If you retune the table, that test is the thing that has to change deliberately.
 - When touching kernels, be aware of the Metal/wgpu quirk fixed in `fb03735` and the IVF reducer variant in `3c657ee`. Divergence between Metal and other backends is real and needs cross-backend testing. The four distilled codegen rules (no `if` expressions for value selection, bit arithmetic over comparisons, `usize` counters plus `u32` sentinels in reducers, `SharedMemory::new` at kernel scope) are documented in the module header of `src/gpu/nndescent_gpu.rs`.
@@ -127,7 +142,7 @@ Every index follows the same pattern in `src/lib.rs`:
 
 ### Errors
 
-Single `AnnSearchErrors` enum in `src/errors.rs`, `thiserror`-derived. Feature-gated variants carry `#[cfg(feature = "...")]`. When adding a new failure mode, add a variant with the appropriate `#[cfg]` rather than reaching for `anyhow` or `panic!`. The `0.4.2` bump was about replacing panics with typed errors, so keep that direction.
+Single `AnnSearchErrors` enum in `src/errors.rs`, `thiserror`-derived and `#[non_exhaustive]` (variants come and go with the feature flags, so downstream matches need a `_` arm). Feature-gated variants carry `#[cfg(feature = "...")]`. `cubecl_utils_rs::CubeclUtilsErrors` and `cubecl::server::ServerError` both arrive through `#[from]` under `gpu`. When adding a new failure mode, add a variant with the appropriate `#[cfg]` rather than reaching for `anyhow` or `panic!`. The `0.4.2` bump was about replacing panics with typed errors, so keep that direction.
 
 ## Conventions & gotchas
 
