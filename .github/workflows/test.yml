@@ -14,10 +14,10 @@ jobs:
   test:
     uses: GregorLueg/personal-actions/.github/workflows/rust-test.yml@v1
     with:
-      cpu-args: '--release --features binary,quantised,gpu'
+      cpu-args: '--release --features binary,quantised,gpu,serialise'
       # Windows drops gpu.
-      windows-cpu-args: '--release --features binary,quantised'
+      windows-cpu-args: '--release --features binary,quantised,serialise'
       # gpu-tests uses GPU backends for shared memory, which does not behave on
       # Windows, so the GPU lane is Linux and macOS only.
-      gpu-args: '--release --features binary,gpu,gpu-tests,quantised'
+      gpu-args: '--release --features binary,gpu,gpu-tests,quantised,serialise'
     secrets: inherit
