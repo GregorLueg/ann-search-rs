@@ -8,6 +8,8 @@
   data sets into smaller data sets that fit into GPU-accelerated NNDescent
   approaches.
 - GPU-accelerated k-means for the IVF index. Faster initial clustering.
+- Improved LSH index that is substantially faster and uses better hashing
+  functions.
 
 **Fix**
 

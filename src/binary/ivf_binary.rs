@@ -17,6 +17,10 @@ use crate::binary::vec_store::*;
 use crate::prelude::*;
 use crate::utils::k_means_utils::*;
 
+////////////////////
+// IvfIndexBinary //
+////////////////////
+
 /// IVF index with binary quantisation
 // `bound` is pinned because the skipped `vector_store` field makes serde
 // infer a spurious `T: Default`

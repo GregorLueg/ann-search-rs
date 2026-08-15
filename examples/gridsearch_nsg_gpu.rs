@@ -68,7 +68,7 @@ fn main() {
 
     let device: cubecl::wgpu::WgpuDevice = Default::default();
 
-    let knn_k: usize = 48;
+    let knn_k: usize = 32;
 
     // Build the GPU kNN graph ONCE and reuse it across every (r, l_build)
     // combination below.
@@ -78,7 +78,7 @@ fn main() {
         data.as_ref(),
         &cli.distance,
         Some(knn_k),
-        None,
+        Some(knn_k),
         None,
         None,
         None,
