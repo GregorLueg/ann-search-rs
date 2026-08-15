@@ -9,13 +9,13 @@
 
 use cubecl::frontend::{Atomic, SharedMemory};
 use cubecl::prelude::*;
+use cubecl_utils_rs::prelude::*;
 use rand::rngs::SmallRng;
 use rand::{Rng, SeedableRng};
 use rayon::prelude::*;
 use std::cmp::Reverse;
 use std::collections::BinaryHeap;
 use std::time::Instant;
-use cubecl_utils_rs::prelude::*;
 
 use crate::gpu::nndescent_gpu::{merge_proposals, reset_proposals, MAX_PROPOSALS};
 use crate::gpu::*;
@@ -206,12 +206,6 @@ fn partition_points<F: CubeclFloat>(
 /// Maximum points per leaf, capped at 256, or `DimTooHighForSharedMemory` when
 /// fewer than two points fit. Two is the floor because the kernel computes
 /// pairwise distances and a leaf of one has no pairs.
-///
-/// ### Note
-///
-/// This used to clamp the lower bound to two rather than failing, which meant
-/// that above roughly `dim_padded = 4096` on a 32 KiB device it returned a leaf
-/// size whose staging did not fit. The kernel then silently did no work.
 fn compute_max_leaf_size(
     dim_padded: usize,
     elem_bytes: usize,
@@ -348,12 +342,6 @@ pub fn leaf_pairwise_proposals<F: CubeclFloat, N: Size>(
 
     let k = graph_dist.shape(1usize);
 
-    // Walk the upper triangle by row rather than by flat pair index. The old
-    // form decoded a flat index with a `while rem >= step` loop that ran up to
-    // `leaf_size` times *per pair per thread*: at leaf_size 124 that is ~29k
-    // serial steps per thread against ~15k FMAs of actual distance work, so the
-    // indexing cost more than the computation. Striding rows by
-    // WORKGROUP_SIZE_X costs some load imbalance and removes the decode.
     let mut ii = tx as usize;
 
     while ii < leaf_size as usize {
@@ -737,10 +725,7 @@ where
             } else {
                 None
             };
-            // All projections are known upfront: each is a function of the
-            // tree seed and the level index only, never of the partitioning.
-            // So they are generated in one go and applied in a single kernel,
-            // instead of one launch plus one blocking readback per level.
+
             let mut projections_flat = vec![T::zero(); max_depth * dim_padded];
             let mut level_vecs: Vec<Vec<T>> = Vec::with_capacity(max_depth);
             for level in 0..max_depth {

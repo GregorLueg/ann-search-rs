@@ -94,17 +94,6 @@ pub const RADIX_BINS: usize = 1 << RADIX_BITS;
 /// buffer, so there is no warm-chunk effect and radix wins at every `k`.
 pub const RADIX_SELECT_MIN_K: usize = 80;
 
-// The descent is eight passes: four fix the 32-bit distance key, four more fix
-// the 32-bit position that breaks ties between bit-identical distances. The tie
-// passes are guarded by a runtime flag and skipped whenever the boundary bucket
-// already holds exactly the slots remaining, which is the usual case.
-//
-// There is deliberately no `RADIX_PASSES` constant. The passes are written out
-// by hand at each call site with literal comptime shifts (24, 16, 8, 0), because
-// an `#[unroll]` loop index is not usable in comptime position on cubecl 0.10, so
-// a constant here would be decorative and could drift away from the shifts it
-// claimed to describe.
-
 /// Shared-memory footprint of the radix reducers, in bytes.
 ///
 /// Counts every `SharedMemory` the kernels allocate: the histogram, the per-lane
@@ -243,9 +232,9 @@ pub fn radix_select_usable<R: Runtime>(
     radix_select_fits(k, elem_bytes, wg, limits) && atomic_u32_add_supported(client)
 }
 
-/////////////////////
+///////////////////
 // Key transform //
-/////////////////////
+///////////////////
 
 /// Order-preserving map from an IEEE-754 binary32 value to a `u32` sort key.
 ///
@@ -464,28 +453,28 @@ pub fn find_bucket(
     sync_cube();
 }
 
-////////////////////////
+/////////////////////////
 // Descent state slots //
-////////////////////////
-
-// The radix prefix lives in shared memory rather than registers so a `#[cube]`
-// helper can advance it: cubecl has no `&mut u32` parameter, and returning a
-// tuple of six updated values per pass is worse than six shared slots. Every
-// lane reads the same values, so the branch on `ST_DONE` stays cube-uniform and
-// the `sync_cube` calls inside a pass are safe.
+/////////////////////////
 
 /// Resolved bits of the distance key.
 pub const ST_PK: usize = 0;
+
 /// Mask of resolved distance-key bits.
 pub const ST_MK: usize = 1;
+
 /// Resolved bits of the position tie-break.
 pub const ST_PP: usize = 2;
+
 /// Mask of resolved position bits.
 pub const ST_MP: usize = 3;
+
 /// Candidates known to sort below the prefix.
 pub const ST_N_LESS: usize = 4;
+
 /// Set to 1 once the boundary is resolved and later passes can be skipped.
 pub const ST_DONE: usize = 5;
+
 /// Slots in the descent state block.
 pub const ST_SLOTS: usize = 8;
 
@@ -793,9 +782,9 @@ pub fn radix_select_ivf_topk<F: Float>(
     }
     sync_cube();
 
-    // Positions are unique, so the `(key, position)` composite is unique and the
-    // descent must converge on exactly `k` within eight passes. The clamp is a
-    // guard against that reasoning being wrong: without it a non-converged
+    // Positions are unique, so the `(key, position)` composite is unique and
+    // the descent must converge on exactly `k` within eight passes. The clamp
+    // is a guard against that reasoning being wrong: without it a non-converged
     // descent would read past the survivor buffer and corrupt neighbouring
     // shared memory rather than simply returning a wrong answer.
     let mut n_found = found[0usize].load();
@@ -885,12 +874,6 @@ pub fn dense_key<F: Float>(
     p: u32,
     kr: u32,
 ) -> u32 {
-    // Two guarded loads rather than a default-then-overwrite. Rule 1 forbids an
-    // `if` expression selecting a value, but seeding the default with the
-    // `out_dists` load reads `out_base + p` for every `p` up to `kr + chunk`,
-    // which runs past the end of the k-element row and, for the last cube, past
-    // the end of the tensor. It also costs a global load per candidate per pass
-    // that is thrown away on the chunk arm.
     let mut v = F::new(f32::MAX);
     if p < kr {
         v = out_dists[(out_base + p) as usize];
@@ -1253,12 +1236,9 @@ pub fn radix_select_topk<F: Float>(
     }
 }
 
-//////////////////////////
+///////////////////////////
 // Mechanism smoke tests //
-//////////////////////////
-
-// These kernels exist only to pin down cubecl 0.10 behaviour the real kernels
-// depend on. Each one is cheap, and each one changes the design if it fails.
+///////////////////////////
 
 /// S3: a `#[cube]` helper that writes through a shared-memory reference.
 ///

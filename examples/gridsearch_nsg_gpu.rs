@@ -85,7 +85,7 @@ fn main() {
         None,
         None,
         cli.seed as usize,
-        true,
+        false,
         device,
     )
     .unwrap();

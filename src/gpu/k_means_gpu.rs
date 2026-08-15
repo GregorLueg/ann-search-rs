@@ -43,13 +43,6 @@ const SEGMENT_UNROLL: usize = 8;
 
 /// Shared-memory length of [`segmented_centroid_update`], in elements of the
 /// accumulator type.
-///
-/// Deliberately the whole workgroup rather than the `n_sub * dim_eff` slots the
-/// reduction reads back. `n_sub` truncates, so any `dim_eff` that does not
-/// divide the workgroup leaves threads with `sub == n_sub` whose store index
-/// `sub * dim_eff + e0` collapses to `tx`. They are never read, but they do
-/// store, so the buffer has to span `0..WORKGROUP_128`. 512 bytes at fp32,
-/// against a 32 KiB budget, so it costs no occupancy.
 const SEGMENTED_SMEM_LEN: usize = WORKGROUP_128 as usize;
 
 /// Centroids scored per unrolled step in the assignment kernels.
@@ -89,12 +82,6 @@ pub struct KMeansGpuParams {
     /// `shader-f16` on the wgpu adapter; the caller type `T` should be f32.
     pub quantise_to_f16: bool,
     /// Reseed starved centroids each iteration, RAFT-style.
-    ///
-    /// Off by default: it changes the partition, so turning it on shifts the
-    /// results of anything built on top of this k-means. Worth setting when
-    /// cluster sizes drive a memory footprint rather than only quantisation
-    /// error. Costs one `k + 1` readback per iteration, which also forces the
-    /// otherwise readback-free `fixed` path to synchronise once per iteration.
     pub balanced: bool,
 }
 
@@ -1438,21 +1425,6 @@ pub fn segmented_centroid_update<S: Float, A: Float>(
             p += subs;
         }
 
-        // Reduce the sub-stripes.
-        //
-        // The barriers are comptime-gated on `n_sub > 1`, and that is a
-        // correctness requirement rather than an optimisation. `n_sub > 1` only
-        // happens when `dim_eff == dim`, in which case this loop runs exactly
-        // once for every thread and the barriers are uniform. As soon as
-        // `dim > WORKGROUP_128` the trip count stops being uniform -- at
-        // `dim = 200` threads with `tx < 72` run twice and the rest run once --
-        // which would make an unguarded `sync_cube()` a barrier that some lanes
-        // reach a different number of times. That is undefined, and WGSL
-        // uniformity analysis is entitled to reject the shader outright, which
-        // under `launch_unchecked` means a kernel that does nothing and says
-        // nothing. It is safe to drop them there because `dim > WORKGROUP_128`
-        // forces `n_sub == 1`, so the shared-memory round-trip is thread-local
-        // and there is nothing to synchronise.
         s_part[sub as usize * dim_eff + e0] = acc;
         if comptime!(n_sub > 1) {
             sync_cube();

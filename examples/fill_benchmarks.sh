@@ -228,6 +228,13 @@ case "$KIND" in
             "cagra_knn:euclidean:lowrank:32:1000000|cargo run --example knn_comparison_cagra --release --features gpu -- --distance euclidean --data lowrank --n-samples 1000000"
             "cagra_knn:euclidean:lowrank:64:1000000|cargo run --example knn_comparison_cagra --release --features gpu -- --distance euclidean --data lowrank --n-samples 1000000 --dim 64"
             "cagra_knn:euclidean:lowrank:32:2500000|cargo run --example knn_comparison_cagra --release --features gpu -- --distance euclidean --data lowrank --n-samples 2500000"
+
+            # NSG CPU/GPU
+            "nsg_cpu:euclidean:cell:128:250000|cargo run --example gridsearch_nsg --release -- --distance euclidean --data cell --n-samples 250000 --dim 128"
+            "nsg_gpu:euclidean:cell:128:250000|cargo run --example gridsearch_nsg_gpu --features gpu --release -- --distance euclidean --data cell --n-samples 250000 --dim 128"
+            "nsg_cpu:euclidean:cell:128:500000|cargo run --example gridsearch_nsg --release -- --distance euclidean --data cell --n-samples 500000 --dim 128"
+            "nsg_gpu:euclidean:cell:128:500000|cargo run --example gridsearch_nsg_gpu --features gpu --release -- --distance euclidean --data cell --n-samples 500000 --dim 128"
+
         )
         ;;
     binary)

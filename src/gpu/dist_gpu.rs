@@ -822,12 +822,8 @@ where
 
             // Extract directly into the running top-k buffer.
             //
-            // Radix select above `RADIX_SELECT_MIN_K`, the serial insertion sort
-            // below it. See that constant for the end-to-end measurement and for
-            // why the crossover exists: this path is chunked, and `extract_topk`
-            // becomes nearly free on every chunk after the first because a tight
-            // running top-k rejects almost all candidates, which radix select has
-            // no way to exploit.
+            // Radix select above `RADIX_SELECT_MIN_K`, the serial insertion
+            // sort below it.
             //
             // `extract_topk` is also the fallback for element types whose bits
             // the key transform cannot reinterpret, and for runtimes without
@@ -1135,16 +1131,6 @@ pub fn compute_ivf_mega_euclidean_cached<F: Float, N: Size>(
     let mut s_write_offset = SharedMemory::<u32>::new(share_mem_size);
     let mut s_db_count = SharedMemory::<u32>::new(share_mem_size);
 
-    // WORKAROUND: cubecl 0.10 miscompiles expression-position `if/else`
-    // with a runtime condition on wgpu/Metal and lavapipe — it always
-    // returns the else branch. Writing to shared memory in both arms of
-    // a statement-if lets the optimiser fuse the pair into per-assignment
-    // expression-ifs, which then always take the else branch (all zeros).
-    // With `s_db_count` stuck at 0 the whole workgroup terminates below
-    // and the kernel silently becomes a no-op, leaving the candidate
-    // tensors as uninitialised VRAM that the reducer treats as valid
-    // distances/indices — hence the ~1e9 OOB reorg_idx values. Compute
-    // values into locals first, then write shared memory once.
     let mut q_val = 0u32;
     let mut ds_val = 0u32;
     let mut wo_val = 0u32;
@@ -1290,10 +1276,6 @@ pub fn compute_ivf_mega_cosine_cached<F: Float, N: Size>(
     let mut s_db_count = SharedMemory::<u32>::new(share_mem_size);
     let mut s_query_norms = SharedMemory::<F>::new(share_mem_size);
 
-    // Same workaround as the Euclidean variant: avoid symmetric writes
-    // in an if/else block that cubecl 0.10 can fuse into per-assignment
-    // expression-ifs (which then always take the else branch on
-    // wgpu/Metal + lavapipe).
     let mut q_val = 0u32;
     let mut ds_val = 0u32;
     let mut wo_val = 0u32;

@@ -1,5 +1,19 @@
 # News
 
+## 0.5.2
+
+**Features**
+
+- Clustered NNDescent implementation that uses k-means clusters to split large
+  data sets into smaller data sets that fit into GPU-accelerated NNDescent
+  approaches.
+- GPU-accelerated k-means for the IVF index. Faster initial clustering.
+
+**Fix**
+
+- Race condition in the random initialisation of for the GPU-accelerated
+  NNDescent kNN generation. This degraded the kNN graphs' quality.
+
 ## 0.5.1
 
 **Features**

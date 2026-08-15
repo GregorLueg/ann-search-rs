@@ -10,6 +10,12 @@ use faer::Mat;
 use std::time::Instant;
 use thousands::*;
 
+// Modified bench compared to the others as other things are being tested here
+
+////////////
+// Consts //
+////////////
+
 /// Cluster counts swept over the batched build.
 const CLUSTER_SWEEP: &[usize] = &[1, 2, 4, 8, 16];
 
@@ -23,6 +29,10 @@ const N_ASSIGN: usize = 2;
 /// Fill ratio below which the graph is treated as broken rather than merely
 /// sparse.
 const FILL_WARN_THRESHOLD: f64 = 0.99;
+
+////////////////////
+// ClusterResults //
+////////////////////
 
 /// One row of the sweep table.
 struct ClusterResult {
@@ -39,6 +49,10 @@ struct ClusterResult {
     /// Entries the graph would hold if every slot were populated (`n * k`)
     expected: usize,
 }
+
+/////////////
+// Helpers //
+/////////////
 
 /// Strip self-matches from an exhaustive self-query and trim to `k`.
 ///
@@ -151,21 +165,21 @@ fn check_graph(label: &str, graph: &KnnGraphGpu<f32>) -> (usize, usize) {
 /// * `config` - Benchmark configuration
 /// * `results` - Rows to print
 fn print_cluster_results(config: &str, results: &[ClusterResult]) {
-    println!("\n{:=>105}", "");
+    println!("\n{:=>115}", "");
     println!("Benchmark: {}", config);
-    println!("{:=>105}", "");
+    println!("{:=>115}", "");
     println!(
-        "{:<32} {:>10} {:>14} {:>12} {:>18} {:>10}",
+        "{:<32} {:>10} {:>14} {:>12} {:>28} {:>10}",
         "Method", "Clusters", "Build (ms)", "Recall@k", "Filled", "Fill (%)"
     );
-    println!("{:->105}", "");
+    println!("{:->115}", "");
     for result in results {
         let clusters = result
             .n_clusters
             .map(|c| c.to_string())
             .unwrap_or("-".to_string());
         println!(
-            "{:<32} {:>10} {:>14.2} {:>12.4} {:>18} {:>10.2}",
+            "{:<32} {:>10} {:>14.2} {:>12.4} {:>28} {:>10.2}",
             result.method,
             clusters,
             result.build_time_ms,
@@ -178,8 +192,12 @@ fn print_cluster_results(config: &str, results: &[ClusterResult]) {
             result.filled as f64 / result.expected as f64 * 100.0
         );
     }
-    println!("{:->105}\n", "");
+    println!("{:->115}\n", "");
 }
+
+///////////
+// Bench //
+///////////
 
 fn main() {
     let cli = Cli::parse();

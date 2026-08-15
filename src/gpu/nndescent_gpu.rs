@@ -35,11 +35,11 @@
 
 use cubecl::frontend::{Atomic, CubePrimitive, Float, SharedMemory};
 use cubecl::prelude::*;
+use cubecl_utils_rs::prelude::*;
 use faer::MatRef;
 use rayon::prelude::*;
 use std::time::Instant;
 use thousands::*;
-use cubecl_utils_rs::prelude::*;
 
 use crate::cpu::vamana::compute_medoid;
 use crate::gpu::cagra_gpu_search::*;
@@ -867,11 +867,6 @@ pub fn merge_proposals<F: Float>(
     let is_new_bit = 1u32 << 31;
     let base = node as usize * k;
 
-    // Stage this node's row in registers. Every proposal used to scan the row
-    // twice and shift it once, all against global memory, up to
-    // `max_proposals` times per node: O(max_proposals * 3k) global accesses
-    // where 2k suffices. Loading with the id mask applied also folds in the
-    // separate "clear new flags" pass this replaces.
     let mut local_idx = Array::<u32>::new(k_comp);
     let mut local_dist = Array::<F>::new(k_comp);
     for j in 0..k_comp {
@@ -2650,13 +2645,6 @@ where
         client,
     )?;
 
-    // All four are left uninitialised deliberately. `gpu_forest_init` launches
-    // `reset_proposals` before its first `leaf_pairwise_proposals`, and the
-    // iteration loop does the same, so the counters are zeroed before anything
-    // reads them; the proposal slots themselves are written before they are
-    // read, up to the count. These are the largest transients the build
-    // allocates, so zero-filling them would cost a host allocation and an
-    // upload per build for nothing.
     let max_prop = MAX_PROPOSALS;
     let prop_idx_gpu = GpuTensor::<R, u32>::empty(vec![n, max_prop], client)?;
     let prop_dist_gpu = GpuTensor::<R, T>::empty(vec![n, max_prop], client)?;

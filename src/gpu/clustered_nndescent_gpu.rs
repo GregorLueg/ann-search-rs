@@ -12,20 +12,6 @@
 //! on one cluster at a time, and each subgraph is merged into a global graph on
 //! the host. Only one cluster is device-resident at a time, so the binding
 //! ceiling applies to the cluster rather than the dataset.
-//!
-//! ### What this buys, and what it does not
-//!
-//! Scalability, not speed. NN-Descent is roughly `O(n^1.14)`, so `C` clusters
-//! with 2x overlap do about `2^1.14 * C^-0.14` times the distance work of a
-//! single graph: around 2x at `C = 2`, still 1.35x at `C = 32`. Whenever a
-//! single NN-Descent fits the device it will be faster, and `C = 1` therefore
-//! dispatches straight to the unbatched path.
-//!
-//! ### References
-//!
-//! Park, Becker & Nolet, *Even Faster and More Scalable UMAP on the GPU with
-//! NVIDIA cuML*, NVIDIA Technical Blog, 2024. The batching scheme there is in
-//! turn adapted from the DiskANN literature.
 
 use cubecl::prelude::*;
 use cubecl_utils_rs::prelude::*;
@@ -51,32 +37,20 @@ use crate::utils::nndescent_utils::SENTINEL_PID;
 
 /// Headroom left on the per-cluster device footprint when choosing `C`.
 ///
-/// Cluster sizes are not uniform even after balancing, so sizing `C` off the
-/// mean would leave the largest cluster over budget. 0.6 tolerates a largest
-/// cluster two thirds above the mean before anything busts, which is well
-/// clear of what balanced k-means produces in practice.
+/// `0.6` tolerates a largest cluster two thirds above the mean before anything
+/// busts, which is well clear of what balanced k-means produces in practice.
 const CLUSTER_BUDGET_FRACTION: f64 = 0.6;
 
 /// Largest `C` the planner will propose.
-///
-/// A cap on pathology rather than a tuning knob: past this the per-cluster
-/// graphs are small enough that the 2x overlap tax dominates, and a dataset
-/// needing more clusters than this on a given device is better served by a
-/// smaller `build_k` or a quantised index.
 const MAX_CLUSTERS: usize = 4096;
 
 /// Default fraction of the dataset used to train the cluster centroids.
 ///
 /// The cuML batching scheme uses 10% and notes that is normally enough to
-/// recover a usable set of centres. The centroids only decide the partition,
-/// not the graph, so a rough set costs recall at the seams and nothing else.
+/// recover a usable set of centres.
 const DEFAULT_SAMPLE_FRAC: f32 = 0.1;
 
 /// Clusters each point joins by default.
-///
-/// Two, per the cuML scheme: the overlap is what stops a point sitting near a
-/// cell boundary from losing the half of its neighbourhood that fell the other
-/// side of the cut.
 const DEFAULT_N_ASSIGN: usize = 2;
 
 ////////////
@@ -93,11 +67,6 @@ pub struct ClusteredBuildParams {
     /// via [`plan_cluster_count`].
     pub n_clusters: Option<usize>,
     /// Fraction of the dataset used to train the centroids.
-    ///
-    /// The subsample is uploaded as one binding, so it is capped at whatever
-    /// the device can bind regardless of what is asked for here. Centroids only
-    /// decide the partition, so a capped subsample costs a little recall at the
-    /// cell seams and nothing else.
     pub sample_frac: f32,
     /// Clusters each point joins. 1 disables the overlap.
     pub n_assign: usize,
@@ -142,9 +111,9 @@ impl Default for ClusteredBuildParams {
     }
 }
 
-///////////////
-// Planning  //
-///////////////
+//////////////
+// Planning //
+//////////////
 
 /// Bytes one binding of the NN-Descent working set needs for `m` points.
 ///
@@ -273,27 +242,6 @@ unsafe impl<T> Sync for UnsafeRowPtr<T> {}
 /// so one linear pass removes it. A point that joined two clusters really does
 /// produce repeats.
 ///
-/// ### On trusting the device's distances
-///
-/// This merge ranks candidates *across* two independently built subgraphs, so
-/// unlike the unbatched compaction, which just takes each row in the order the
-/// device already sorted it, it is sensitive to a distance that does not match
-/// its id: a wrong distance promotes a wrong neighbour, and merging two graphs
-/// then scores worse than either.
-///
-/// That was not hypothetical. `leaf_pairwise_proposals` used to reservoir-sample
-/// on proposal-buffer overflow, writing into a slot another thread owned, and
-/// since a proposal is an `(index, distance)` pair written as two separate
-/// stores the two halves tore apart. The corrupted entries carried
-/// *understated* distances, so they sorted to the front of each row and
-/// concentrated in whatever top-`k` window the caller asked for: measured at
-/// under 1% of entries at `k = 16` of `build_k = 32`, but around 30% at
-/// `k = 5` of `build_k = 20`. This function used to recompute every candidate
-/// on the host to sidestep it. The race is fixed at source now, so the device
-/// values are trusted again and the host pass is gone; the device tests still
-/// assert that every returned distance matches its pair, which is what would
-/// catch a recurrence.
-///
 /// ### Params
 ///
 /// * `global` - Global graph `n * k`, updated in place
@@ -317,19 +265,10 @@ fn merge_cluster_into_global<T>(
     let base = UnsafeRowPtr(global.as_mut_ptr());
 
     (0..m).into_par_iter().for_each(|local| {
-        // Rebound rather than used through `base.0` directly: Rust 2021
-        // closures capture disjoint fields, so naming the field would capture
-        // the bare `*mut` and bypass the Send/Sync impls on the wrapper.
         let rows = base;
         let g = members[local] as usize;
 
-        // Soundness guard, not an optimisation. The disjoint-write argument
-        // below needs every global id in this cluster to be distinct. That
-        // holds by construction, but it holds because of an invariant three
-        // functions upstream, and getting it wrong is undefined behaviour
-        // rather than a wrong answer. Members are ascending within a cluster,
-        // so any duplicate is adjacent and dropping the second occurrence
-        // restores the invariant locally at the cost of one comparison.
+        // Soundness guard, not an optimisation.
         if local > 0 && members[local - 1] == members[local] {
             return;
         }
@@ -358,14 +297,7 @@ fn merge_cluster_into_global<T>(
             }
         }
 
-        // Deduplicate by id, then order by distance. Doing it in one pass off a
-        // distance sort would rely on the same pair carrying a bit-identical
-        // distance in both subgraphs, and that is an assumption about float
-        // accumulation order across two different kernels rather than a
-        // guarantee: `leaf_pairwise_proposals` accumulates over `dim` in a
-        // scalar shared-memory loop while `local_join_shared` is line
-        // vectorised. A last-ulp disagreement would leave the repeat
-        // non-adjacent and it would survive into the row.
+        // Deduplicate by id, then order by distance.
         merged.sort_unstable_by(|a, b| {
             a.0.cmp(&b.0)
                 .then(a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))
