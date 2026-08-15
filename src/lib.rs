@@ -944,10 +944,16 @@ where
 /// * `mat` - The initial matrix with samples x features
 /// * `dist_metric` - Distance metric: "euclidean" or "cosine". "manhatten" is
 ///   not supported.
-/// * `num_tables` - Number of HashMaps to use (usually something 20 to 100)
-/// * `bits_per_hash` - How many bits per hash. Lower values (8) usually yield
-///   better Recall with higher query time; higher values (16) have worse Recall
-///   but faster query time
+/// * `num_tables` - Number of hash tables to use (with multi-probe, 4 to 8 is
+///   usually enough)
+/// * `bits_per_hash` - How many bits per hash, at most
+///   [`crate::cpu::lsh::MAX_BITS_PER_HASH`]. Lower values (8)
+///   usually yield better Recall with higher query time; higher values (16) have
+///   worse Recall but faster query time
+/// * `slot_bits` - How many bits each quantised projection contributes.
+///   `None` picks 1 for cosine (sign of the projection, i.e. SimHash against
+///   the median) and 2 for squared Euclidean, which needs more than a sign to
+///   see vector magnitude.
 /// * `seed` - Random seed for reproducibility
 ///
 /// ### Returns
@@ -958,6 +964,7 @@ pub fn build_lsh_index<T>(
     dist_metric: &str,
     num_tables: usize,
     bits_per_hash: usize,
+    slot_bits: Option<usize>,
     seed: usize,
 ) -> Result<LSHIndex<T>, AnnSearchErrors>
 where
@@ -968,7 +975,7 @@ where
         Dist::default()
     });
 
-    LSHIndex::new(mat, metric, num_tables, bits_per_hash, seed)
+    LSHIndex::new(mat, metric, num_tables, bits_per_hash, slot_bits, seed)
 }
 
 /// Helper function to query a given LSH index
@@ -980,10 +987,11 @@ where
 /// * `query_mat` - The query matrix containing the samples × features
 /// * `index` - The LSH index
 /// * `k` - Number of neighbours to return
-/// * `max_candidates` - Optional number to limit the candidate selection per
-///   given table. Makes the querying faster at cost of Recall.
-/// * `nprobe` - Number of additional buckets to probe per table. Will identify
-///   the closest hash tables and use bit flipping to investigate these.
+/// * `max_candidates` - Optional cap on the number of unique candidates scored
+///   per query, across all tables and probes. Makes the querying faster at cost
+///   of Recall.
+/// * `nprobe` - Number of additional buckets to probe per table, ordered by how
+///   close the query sits to each slot boundary.
 /// * `return_dist` - Shall the distances be returned
 /// * `verbose` - Controls verbosity of the function
 ///
@@ -1013,11 +1021,13 @@ where
 ///
 /// * `index` - The LSH index
 /// * `k` - Number of neighbours to return
-/// * `max_candidates` - Optional number to limit the candidate selection per
-///   given table. Makes the querying faster at cost of Recall.
-/// * `n_probe` - Optional number of additional buckets to probe per table. Will
-///   identify the closest hash tables and use bit flipping to investigate
-///   these. Defaults to half the number of bits.
+/// * `max_candidates` - Optional cap on the number of unique candidates scored
+///   per query, across all tables and probes. Makes the querying faster at cost
+///   of Recall.
+/// * `n_probe` - Optional number of additional buckets to probe per table.
+///   Probes are ordered by how close the vector sits to each slot boundary.
+///   Defaults to the number of projections per table, which is half of the
+///   `2 * n_proj` single-slot shifts available.
 /// * `return_dist` - Shall the distances be returned
 /// * `verbose` - Controls verbosity of the function
 ///
@@ -1035,7 +1045,7 @@ pub fn query_lsh_self<T>(
 where
     T: AnnSearchFloat,
 {
-    let n_probe = n_probe.unwrap_or(index.num_bits() / 2);
+    let n_probe = n_probe.unwrap_or(index.num_projections());
 
     Ok(index.generate_knn(k, max_candidates, n_probe, return_dist, verbose))
 }

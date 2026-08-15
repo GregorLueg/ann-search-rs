@@ -67,29 +67,32 @@ fn main() {
 
     println!("-----------------------------");
 
+    // (num_tables, bits_per_hash, slot_bits). `None` lets the index pick:
+    // 1 bit per projection for cosine, 2 for squared Euclidean.
     let build_params = [
-        (2, 8),
-        (4, 8),
-        (8, 8),
-        (2, 10),
-        (4, 10),
-        (8, 10),
-        (12, 10),
-        (2, 12),
-        (4, 12),
-        (8, 12),
-        (12, 12),
-        (2, 16),
-        (4, 16),
-        (6, 16),
-        (8, 16),
-        (12, 16),
+        (2, 8, None),
+        (4, 8, None),
+        (8, 8, None),
+        (2, 12, None),
+        (4, 12, None),
+        (8, 12, None),
+        (12, 12, None),
+        (2, 16, None),
+        (4, 16, None),
+        (8, 16, None),
+        (12, 16, None),
+        (4, 12, Some(1)),
+        (4, 12, Some(2)),
+        (4, 12, Some(4)),
+        (4, 16, Some(1)),
+        (4, 16, Some(2)),
+        (4, 16, Some(4)),
     ];
 
-    for (num_tables, bits_per_hash) in build_params {
+    for (num_tables, bits_per_hash, slot_bits) in build_params {
         println!(
-            "Building LSH index (num_tab={}, bits={})...",
-            num_tables, bits_per_hash
+            "Building LSH index (num_tab={}, bits={}, slot_bits={:?})...",
+            num_tables, bits_per_hash, slot_bits
         );
         let start = Instant::now();
         let lsh_index = build_lsh_index(
@@ -97,24 +100,28 @@ fn main() {
             &cli.distance,
             num_tables,
             bits_per_hash,
+            slot_bits,
             cli.seed as usize,
         )
         .unwrap();
         let build_time = start.elapsed().as_secs_f64() * 1000.0;
 
         let index_size_mb = lsh_index.memory_usage_bytes() as f64 / (1024.0 * 1024.0);
+        let n_proj = lsh_index.num_projections();
+        let q_label = lsh_index.slot_bits();
 
-        // Query benchmarks
+        // `max_cand` now caps unique candidates across all tables and probes,
+        // so a budget below the bucket size is finally meaningful.
         let search_budgets = [
             (None, "auto", 0),
+            (None, "auto", 1),
             (None, "auto", 2),
-            (None, "auto", 4),
-            (Some(5000), "5k", 0),
-            (Some(5000), "5k", 2),
-            (Some(5000), "5k", 4),
+            (Some(5000), "5k", 1),
+            (Some(1000), "1k", 1),
+            (Some(1000), "1k", 2),
         ];
-        for (max_cand, cand_label, probes) in search_budgets {
-            let n_probe = (bits_per_hash as i32 - probes) as usize;
+        for (max_cand, cand_label, probe_mult) in search_budgets {
+            let n_probe = n_proj * probe_mult;
 
             println!(
                 "Querying LSH index (cand={}, probes={})...",
@@ -142,8 +149,8 @@ fn main() {
 
             results.push(BenchmarkResultSize {
                 method: format!(
-                    "LSH-nt{}-nb{}-s:{}-n{} (query)",
-                    num_tables, bits_per_hash, cand_label, n_probe
+                    "LSH-nt{}-nb{}-q{}-s:{}-n{} (query)",
+                    num_tables, bits_per_hash, q_label, cand_label, n_probe
                 ),
                 build_time_ms: build_time,
                 query_time_ms: query_time,
@@ -169,7 +176,10 @@ fn main() {
         );
 
         results.push(BenchmarkResultSize {
-            method: format!("LSH-nt{}-nb{} (self)", num_tables, bits_per_hash),
+            method: format!(
+                "LSH-nt{}-nb{}-q{} (self)",
+                num_tables, bits_per_hash, q_label
+            ),
             build_time_ms: build_time,
             query_time_ms: self_query_time,
             total_time_ms: build_time + self_query_time,
