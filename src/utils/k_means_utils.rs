@@ -143,6 +143,32 @@ const SIMD_HAMERLY_K_THRESHOLD: usize = 100;
 /// updating bounds outweighs the saved distance work.
 const SIMD_HAMERLY_DIM_MIN: usize = 64;
 
+/// Fraction of the average cluster size below which a centroid is reseeded by
+/// [`adjust_centers`].
+///
+/// Matches the `balancing_threshold` default of RAFT's balanced k-means: only
+/// clusters that have collapsed to under a quarter of their fair share get
+/// touched, so a merely uneven partition is left alone. Raising it balances
+/// harder at the cost of dragging centroids out of genuinely dense regions.
+///
+/// Shared with the GPU k-means, which runs the same policy on device.
+pub(crate) const BALANCE_THRESHOLD: f64 = 0.25;
+
+/// Weight the existing centroid keeps when pulled toward a donor point.
+///
+/// The reseeded centroid is `(c * w + x) / (w + 1)` with `w = min(count, this)`,
+/// so an empty cluster (`count == 0`) jumps onto the donor outright while a
+/// merely small one edges toward it over successive iterations. Matches RAFT's
+/// `balancing_pullback`.
+pub(crate) const BALANCE_PULLBACK: usize = 5;
+
+/// Stride used to walk the dataset when hunting for a donor point.
+///
+/// A prime, so the walk visits every index before repeating for any `n` that is
+/// not a multiple of it. Striding rather than scanning sequentially stops
+/// several starved centroids from all landing in the same neighbourhood.
+pub(crate) const BALANCE_DONOR_STRIDE: usize = 715_827_883;
+
 ///////////////////
 // Enums, Params //
 ///////////////////
@@ -247,10 +273,18 @@ pub struct KMeansTrainingParams {
     pub init: Option<KMeansInit>,
     /// Optional [LloydPath] to control
     pub path: Option<LloydPath>,
+    /// Reseed starved centroids each iteration via [`adjust_centers`].
+    ///
+    /// Off by default: it changes the partition, so turning it on shifts the
+    /// results of every index built on top of this k-means.
+    pub balanced: bool,
 }
 
 impl KMeansTrainingParams {
     /// Generate a new instance of self
+    ///
+    /// Balancing is off. Chain [`KMeansTrainingParams::with_balancing`] to turn
+    /// it on.
     ///
     /// ### Params
     ///
@@ -264,7 +298,30 @@ impl KMeansTrainingParams {
     ///
     /// [KMeansTrainingParams]
     pub fn new(iters: usize, init: Option<KMeansInit>, path: Option<LloydPath>) -> Self {
-        Self { iters, init, path }
+        Self {
+            iters,
+            init,
+            path,
+            balanced: false,
+        }
+    }
+
+    /// Turn size balancing on or off
+    ///
+    /// See [`adjust_centers`] for what balancing does and what it does not
+    /// promise. Worth setting when the cluster sizes drive a downstream memory
+    /// footprint rather than only quantisation error.
+    ///
+    /// ### Params
+    ///
+    /// * `balanced` - Whether to reseed starved centroids each iteration
+    ///
+    /// ### Returns
+    ///
+    /// `self` with the flag set, for chaining off `new` or `default`.
+    pub fn with_balancing(mut self, balanced: bool) -> Self {
+        self.balanced = balanced;
+        self
     }
 }
 
@@ -859,6 +916,103 @@ fn gemm_reassign_dirty<T>(
 // Centroid update utilities //
 ///////////////////////////////
 
+/// Reseed starved centroids from points in over-full clusters
+///
+/// The balancing step of RAFT's balanced k-means. Plain Lloyd's has no notion
+/// of cluster size, so on skewed data it happily produces one cluster holding
+/// most of the dataset and several holding almost nothing. That is fine for
+/// pure quantisation error but ruinous when the cluster sizes decide a memory
+/// footprint, which is exactly the case for the batched NN-Descent build where
+/// a cluster has to fit one GPU binding.
+///
+/// Each centroid whose cluster has fallen below `BALANCE_THRESHOLD` of the
+/// average size is pulled toward a point drawn from a cluster that is above
+/// average, weighted by `BALANCE_PULLBACK`. An empty cluster has weight zero
+/// and therefore jumps onto the donor outright, which also gives empty-cluster
+/// reseeding for free -- otherwise `update_centroids` leaves a dead centroid
+/// parked where it was forever.
+///
+/// This is a soft guarantee: it steers the partition toward balance over
+/// successive iterations, it does not cap any cluster's size. Callers that need
+/// a hard bound must still enforce one.
+///
+/// ### Params
+///
+/// * `centroids` - In/out: centroids, flattened row-major `k * dim`
+/// * `dim` - Embedding dimensions
+/// * `k` - Number of centroids
+/// * `data` - All vectors, flattened row-major `n * dim`
+/// * `n` - Number of vectors
+/// * `assignments` - Cluster assignment per vector, length `n`
+/// * `counts` - Points per cluster, length `k`
+/// * `seed` - Seeds the offset the donor walk starts from
+///
+/// ### Returns
+///
+/// Number of centroids that were reseeded. Zero means the partition was
+/// already balanced enough to leave alone.
+///
+/// ### References
+///
+/// Adapted from `adjust_centers` in RAFT's `kmeans_balanced`
+/// (NVIDIA RAPIDS), as used by cuVS IVF training.
+#[allow(clippy::too_many_arguments)]
+pub fn adjust_centers<T>(
+    centroids: &mut [T],
+    dim: usize,
+    k: usize,
+    data: &[T],
+    n: usize,
+    assignments: &[usize],
+    counts: &[usize],
+    seed: usize,
+) -> usize
+where
+    T: Float,
+{
+    if k == 0 || n == 0 {
+        return 0;
+    }
+
+    let average = n as f64 / k as f64;
+    let floor = average * BALANCE_THRESHOLD;
+    let mut adjusted = 0usize;
+    // Carried across clusters so two starved centroids never start their walk
+    // from the same index and pick the same donor.
+    let mut cursor = seed % n;
+
+    for c in 0..k {
+        if (counts[c] as f64) > floor {
+            continue;
+        }
+
+        // Walk for a donor: a point whose own cluster is above average and is
+        // not the cluster we are trying to rescue. Bounded by `n` so a
+        // pathological partition cannot spin here.
+        let mut donor = None;
+        for _ in 0..n {
+            cursor = (cursor + BALANCE_DONOR_STRIDE) % n;
+            let owner = assignments[cursor];
+            if owner != c && (counts[owner] as f64) > average {
+                donor = Some(cursor);
+                break;
+            }
+        }
+
+        let Some(j) = donor else { continue };
+
+        let w = T::from(counts[c].min(BALANCE_PULLBACK)).unwrap();
+        let denom = w + T::one();
+        let (c_off, j_off) = (c * dim, j * dim);
+        for d in 0..dim {
+            centroids[c_off + d] = (centroids[c_off + d] * w + data[j_off + d]) / denom;
+        }
+        adjusted += 1;
+    }
+
+    adjusted
+}
+
 /// Recompute centroids as the mean of their assigned vectors
 ///
 /// Uses parallel reduction with per-thread accumulators to sum vectors
@@ -875,6 +1029,8 @@ fn gemm_reassign_dirty<T>(
 /// * `centroid_norms` - In/out: ||c||^2 for Euclidean, ||c|| for Cosine
 /// * `k` - Number of centroids
 /// * `metric` - Distance metric
+/// * `balanced` - Run [`adjust_centers`] before recomputing the norms
+/// * `seed` - Seeds the donor walk when `balanced` is set
 #[allow(clippy::too_many_arguments)]
 fn update_centroids<T>(
     data: &[T],
@@ -885,6 +1041,8 @@ fn update_centroids<T>(
     centroid_norms: &mut [T],
     k: usize,
     metric: &Dist,
+    balanced: bool,
+    seed: usize,
 ) where
     T: Float + Send + Sync + SimdDistance,
 {
@@ -928,6 +1086,15 @@ fn update_centroids<T>(
                 centroids[offset + d] = new_sums[offset + d] / count_t;
             }
         }
+    }
+
+    // Balancing has to land between the means and the norms: it moves
+    // centroids, so norms computed before it would be stale.
+    if balanced {
+        adjust_centers(centroids, dim, k, data, n, assignments, &counts, seed);
+    }
+
+    for c in 0..k {
         let cent = &centroids[c * dim..(c + 1) * dim];
         centroid_norms[c] = match metric {
             Dist::SquaredEuclidean => T::dot_simd(cent, cent), // ||c||^2
@@ -1110,6 +1277,8 @@ where
 /// * `centroid_norms_sq` - In/out: per-centroid ||c||^2
 /// * `k` - Number of centroids
 /// * `max_iters` - Maximum number of Lloyd's iterations
+/// * `balanced` - Reseed starved centroids each iteration via [`adjust_centers`]
+/// * `seed` - Seeds the donor walk when `balanced` is set
 /// * `verbose` - Print convergence diagnostics
 #[allow(clippy::too_many_arguments)]
 fn hamerly_lloyd<T>(
@@ -1121,6 +1290,8 @@ fn hamerly_lloyd<T>(
     centroid_norms_sq: &mut [T],
     k: usize,
     max_iters: usize,
+    balanced: bool,
+    seed: usize,
     verbose: bool,
 ) where
     T: Float + Send + Sync + SimdDistance + faer_traits::ComplexField + FromPrimitive,
@@ -1163,6 +1334,8 @@ fn hamerly_lloyd<T>(
             centroid_norms_sq,
             k,
             &Dist::SquaredEuclidean,
+            balanced,
+            seed.wrapping_add(iter),
         );
 
         compute_centroid_drift(&old_centroids, centroids, dim, k, &mut deltas);
@@ -1269,6 +1442,8 @@ fn hamerly_lloyd<T>(
 /// * `centroid_norms` - In/out: per-centroid ||c|| (L2 norms)
 /// * `k` - Number of centroids
 /// * `max_iters` - Maximum number of Lloyd's iterations
+/// * `balanced` - Reseed starved centroids each iteration via [`adjust_centers`]
+/// * `seed` - Seeds the donor walk when `balanced` is set
 /// * `verbose` - Print convergence diagnostics
 #[allow(clippy::too_many_arguments)]
 fn gemm_lloyd<T>(
@@ -1281,6 +1456,8 @@ fn gemm_lloyd<T>(
     k: usize,
     metric: &Dist,
     max_iters: usize,
+    balanced: bool,
+    seed: usize,
     verbose: bool,
 ) where
     T: Float + Send + Sync + SimdDistance + faer_traits::ComplexField,
@@ -1328,6 +1505,8 @@ fn gemm_lloyd<T>(
             centroid_norms,
             k,
             metric,
+            balanced,
+            seed.wrapping_add(iter),
         );
 
         std::mem::swap(&mut prev_assignments, &mut assignments);
@@ -1351,6 +1530,12 @@ fn gemm_lloyd<T>(
 /// centroid positions. Uses Rayon for parallel assignment and
 /// fold-reduce for centroid updates.
 ///
+/// The only Lloyd path that inlines its own centroid update rather than
+/// calling [`update_centroids`], so the balancing hook is repeated in the body
+/// rather than inherited. It also tests convergence *before* the update, which
+/// is why the test additionally requires that the previous iteration reseeded
+/// nothing.
+///
 /// ### Params
 ///
 /// * `data` - Training vectors (flattened)
@@ -1358,10 +1543,14 @@ fn gemm_lloyd<T>(
 /// * `dim` - Embedding dimensions
 /// * `n` - Number of training vectors
 /// * `centroids` - Current centroids (modified in-place)
-/// * `centroid_norms` - Current centroid norms (modified in-place)
+/// * `centroid_norms` - Current centroid norms (modified in-place); for cosine
+///   these are refreshed for every centroid each iteration, including the ones
+///   whose cluster came out empty
 /// * `k` - Number of clusters
 /// * `metric` - Distance metric
 /// * `max_iters` - Maximum iterations
+/// * `balanced` - Reseed starved centroids each iteration via [`adjust_centers`]
+/// * `seed` - Seeds the donor walk when `balanced` is set
 /// * `verbose` - Print iteration progress
 #[allow(clippy::too_many_arguments)]
 fn parallel_lloyd<T>(
@@ -1374,6 +1563,8 @@ fn parallel_lloyd<T>(
     k: usize,
     metric: &Dist,
     max_iters: usize,
+    balanced: bool,
+    seed: usize,
     verbose: bool,
 ) where
     T: Float + Send + Sync + SimdDistance + ComplexField,
@@ -1381,6 +1572,13 @@ fn parallel_lloyd<T>(
     let mut prev_assignments: Vec<usize> = vec![usize::MAX; n];
     let num_threads = rayon::current_num_threads();
     let chunk_size = (n + num_threads - 1) / num_threads.max(1);
+    // Reseeds performed by the previous iteration. This path tests convergence
+    // before the centroid update, so a starved cluster that only gets rescued
+    // in the update half would otherwise never be rescued at all: assignments
+    // settle, the loop breaks, and the balancing never runs. Staying in until
+    // balancing has nothing left to do closes that. Pinned at zero whenever
+    // `balanced` is off, so the unbalanced path keeps its exact old behaviour.
+    let mut last_adjusted = 0usize;
 
     for iter in 0..max_iters {
         let mut assignments = assign_all_parallel(
@@ -1402,7 +1600,7 @@ fn parallel_lloyd<T>(
 
         let change_floor: usize = (n / 10_000).max(1);
 
-        if changed <= change_floor {
+        if changed <= change_floor && last_adjusted == 0 {
             if verbose {
                 println!("    Converged at iteration {}", iter + 1);
             }
@@ -1448,11 +1646,29 @@ fn parallel_lloyd<T>(
                 for d in 0..dim {
                     centroids[cluster_offset + d] = new_sums[cluster_offset + d] / count_t;
                 }
+            }
+        }
 
-                if matches!(metric, Dist::Cosine) {
-                    let cent = &centroids[cluster_offset..cluster_offset + dim];
-                    centroid_norms[c] = T::calculate_l2_norm(cent);
-                }
+        // This path inlines its own update rather than calling
+        // `update_centroids`, so the balancing hook is repeated here. It must
+        // land before the norms for the same reason: it moves centroids.
+        if balanced {
+            last_adjusted = adjust_centers(
+                centroids,
+                dim,
+                k,
+                data,
+                n,
+                &assignments,
+                &counts,
+                seed.wrapping_add(iter),
+            );
+        }
+
+        if matches!(metric, Dist::Cosine) {
+            for c in 0..k {
+                let cent = &centroids[c * dim..(c + 1) * dim];
+                centroid_norms[c] = T::calculate_l2_norm(cent);
             }
         }
 
@@ -1657,6 +1873,8 @@ where
 ///   `update_centroids`; not used for assignment on the SIMD path)
 /// * `k` - Number of centroids
 /// * `max_iters` - Maximum number of Lloyd's iterations
+/// * `balanced` - Reseed starved centroids each iteration via [`adjust_centers`]
+/// * `seed` - Seeds the donor walk when `balanced` is set
 /// * `verbose` - Print convergence diagnostics
 #[allow(clippy::too_many_arguments)]
 fn hamerly_lloyd_simd<T>(
@@ -1667,6 +1885,8 @@ fn hamerly_lloyd_simd<T>(
     centroid_norms: &mut [T],
     k: usize,
     max_iters: usize,
+    balanced: bool,
+    seed: usize,
     verbose: bool,
 ) where
     T: Float + Send + Sync + SimdDistance + FromPrimitive,
@@ -1699,6 +1919,8 @@ fn hamerly_lloyd_simd<T>(
             centroid_norms,
             k,
             &Dist::SquaredEuclidean,
+            balanced,
+            seed.wrapping_add(iter),
         );
 
         compute_centroid_drift(&old_centroids, centroids, dim, k, &mut deltas);
@@ -2002,6 +2224,156 @@ where
     }
 }
 
+/// Assign every point to its `m` closest centroids
+///
+/// Multi-assignment counterpart to [`assign_all_parallel`], for partitioning
+/// schemes that want overlapping cells. The batched NN-Descent build uses
+/// `m = 2`: giving every point membership of its two nearest clusters means a
+/// point near a boundary still has most of its true neighbours inside at least
+/// one of the batches it belongs to, which is what keeps recall up when the
+/// graph is built per batch and merged.
+///
+/// Deliberately a plain scan rather than dispatching to the GEMM path like
+/// [`assign_all_parallel`] does: the caller here partitions into a handful of
+/// clusters, not `sqrt(n)` of them, so the tiled GEMM setup costs more than the
+/// `O(n * k * dim)` it saves. It is also deliberately host-side, because the
+/// whole point of the batched build is that the dataset need not fit on the
+/// device.
+///
+/// ### Params
+///
+/// * `data` - All vectors, flattened row-major `n * dim`
+/// * `data_norms` - L2 norms per point; only read for cosine, so it may be
+///   empty for any other metric
+/// * `dim` - Embedding dimensions
+/// * `n` - Number of vectors
+/// * `centroids` - Centroids, flattened row-major `k * dim`
+/// * `centroid_norms` - L2 norms per centroid; only read for cosine
+/// * `k` - Number of centroids
+/// * `m` - Clusters each point joins; clamped into `1..=k`
+/// * `metric` - Distance metric; `Manhattan` is not supported
+///
+/// ### Returns
+///
+/// `n * m` cluster ids, row `i` at `[i * m, (i + 1) * m)`, ascending by
+/// distance so column 0 matches what [`assign_all_parallel`] would give.
+#[allow(clippy::too_many_arguments)]
+pub fn assign_all_parallel_top_m<T>(
+    data: &[T],
+    data_norms: &[T],
+    dim: usize,
+    n: usize,
+    centroids: &[T],
+    centroid_norms: &[T],
+    k: usize,
+    m: usize,
+    metric: &Dist,
+) -> Vec<u32>
+where
+    T: Float + Send + Sync + SimdDistance,
+{
+    let m = m.min(k).max(1);
+    let mut out = vec![0u32; n * m];
+
+    out.par_chunks_mut(m).enumerate().for_each(|(i, slot)| {
+        let vec = &data[i * dim..(i + 1) * dim];
+
+        // Tiny sorted insertion buffer: `m` is 2 in practice, so a heap would
+        // cost more than it saves.
+        //
+        // Seeded with *distinct* cluster ids rather than zeros. Nothing is
+        // inserted when every candidate distance comes back `+inf`, which a
+        // non-finite coordinate or an f32 overflow will do, and an all-zero
+        // seed then returns the same cluster `m` times. Callers treat the row
+        // as `m` distinct memberships -- the batched NN-Descent merge relies on
+        // it for the soundness of an unsafe disjoint-write -- so the degenerate
+        // case has to stay distinct. `m <= k`, so these are all valid ids.
+        let mut best_d = vec![T::infinity(); m];
+        let mut best_c: Vec<u32> = (0..m as u32).collect();
+
+        for c in 0..k {
+            let cent = &centroids[c * dim..(c + 1) * dim];
+            let d = match metric {
+                Dist::Cosine => {
+                    let denom = data_norms[i] * centroid_norms[c];
+                    if denom > T::zero() {
+                        T::one() - T::dot_simd(vec, cent) / denom
+                    } else {
+                        T::one()
+                    }
+                }
+                _ => T::euclidean_simd(vec, cent),
+            };
+
+            if d >= best_d[m - 1] {
+                continue;
+            }
+            let mut pos = m - 1;
+            while pos > 0 && best_d[pos - 1] > d {
+                best_d[pos] = best_d[pos - 1];
+                best_c[pos] = best_c[pos - 1];
+                pos -= 1;
+            }
+            best_d[pos] = d;
+            best_c[pos] = c as u32;
+        }
+
+        slot.copy_from_slice(&best_c);
+    });
+
+    out
+}
+
+/// Invert a multi-assignment into per-cluster member lists
+///
+/// Counting-sort inverse of [`assign_all_parallel_top_m`], the multi-assignment
+/// analogue of [`build_csr_layout`]. Each point appears once per cluster it
+/// joined, so the member list holds `n * m` entries rather than `n`.
+///
+/// ### Params
+///
+/// * `assignments` - `n * m` cluster ids from [`assign_all_parallel_top_m`]
+/// * `n` - Number of vectors
+/// * `m` - Clusters each point joined
+/// * `k` - Number of clusters
+///
+/// ### Returns
+///
+/// `(members, offsets)` where cluster `c` owns
+/// `members[offsets[c]..offsets[c + 1]]` and `offsets` has `k + 1` entries.
+/// Members within a cluster are in ascending point order.
+///
+/// ### Panics
+///
+/// If `assignments` is shorter than `n * m`. `m` must be the same value
+/// [`assign_all_parallel_top_m`] clamped to, not the caller's requested one.
+pub fn invert_assignments_csr(
+    assignments: &[u32],
+    n: usize,
+    m: usize,
+    k: usize,
+) -> (Vec<u32>, Vec<usize>) {
+    let mut offsets = vec![0usize; k + 1];
+    for &c in &assignments[..n * m] {
+        offsets[c as usize + 1] += 1;
+    }
+    for c in 0..k {
+        offsets[c + 1] += offsets[c];
+    }
+
+    let mut cursor = offsets.clone();
+    let mut members = vec![0u32; n * m];
+    for i in 0..n {
+        for j in 0..m {
+            let c = assignments[i * m + j] as usize;
+            members[cursor[c]] = i as u32;
+            cursor[c] += 1;
+        }
+    }
+
+    (members, offsets)
+}
+
 //////////
 // Main //
 //////////
@@ -2020,14 +2392,14 @@ where
 /// * `n_centroids` - Number of centroids to identify
 /// * `metric` - Distance metric to use
 /// * `params_k_means` - An option for [KMeansTrainingParams]. This gives you
-///   control over the maximum iterations, initialisation and path. If not
-///   provided, will default to sensible heuristics.
+///   control over the maximum iterations, initialisation, path and size
+///   balancing. If not provided, will default to sensible heuristics.
 /// * `seed` - Seed for reproducibility
 /// * `verbose` - Controls verbosity of the function
 ///
 /// ### Returns
 ///
-/// Centroid assignment
+/// Flat `n_centroids * dim` row-major centroid buffer.
 #[allow(clippy::too_many_arguments)]
 pub fn train_centroids<T>(
     data: &[T],
@@ -2126,6 +2498,8 @@ where
                 &mut centroid_norms,
                 n_centroids,
                 params.iters,
+                params.balanced,
+                seed,
                 verbose,
             );
         }
@@ -2141,6 +2515,8 @@ where
                 &mut centroid_norms,
                 n_centroids,
                 params.iters,
+                params.balanced,
+                seed,
                 verbose,
             );
         }
@@ -2158,6 +2534,8 @@ where
                 n_centroids,
                 metric,
                 params.iters,
+                params.balanced,
+                seed,
                 verbose,
             );
         }
@@ -2175,6 +2553,8 @@ where
                 n_centroids,
                 metric,
                 params.iters,
+                params.balanced,
+                seed,
                 verbose,
             );
         }
@@ -2353,6 +2733,219 @@ pub fn print_cluster_summary(assignments: &[usize], nlist: usize) {
 mod tests {
     use super::*;
     use approx::assert_relative_eq;
+
+    #[test]
+    fn test_adjust_centers_leaves_balanced_partition_alone() {
+        // Two clusters of two. Nothing is under a quarter of the average, so
+        // the whole pass must be a no-op, centroids included.
+        let data = vec![0.0_f32, 0.0, 0.1, 0.1, 10.0, 10.0, 10.1, 10.1];
+        let assignments = vec![0, 0, 1, 1];
+        let counts = vec![2usize, 2];
+        let mut centroids = vec![0.05_f32, 0.05, 10.05, 10.05];
+        let before = centroids.clone();
+
+        let adjusted = adjust_centers(&mut centroids, 2, 2, &data, 4, &assignments, &counts, 0);
+
+        assert_eq!(adjusted, 0);
+        assert_eq!(centroids, before);
+    }
+
+    #[test]
+    fn test_adjust_centers_reseeds_empty_cluster_onto_donor() {
+        // Cluster 1 is empty, so its weight is zero and the centroid must land
+        // exactly on a donor point rather than merely drifting toward one.
+        let data = vec![0.0_f32, 1.0, 2.0, 3.0];
+        let assignments = vec![0, 0, 0, 0];
+        let counts = vec![4usize, 0];
+        let mut centroids = vec![1.5_f32, -99.0];
+
+        let adjusted = adjust_centers(&mut centroids, 1, 2, &data, 4, &assignments, &counts, 0);
+
+        assert_eq!(adjusted, 1);
+        assert_eq!(centroids[0], 1.5, "the healthy centroid must not move");
+        assert!(
+            data.contains(&centroids[1]),
+            "an empty cluster jumps onto the donor point, got {}",
+            centroids[1]
+        );
+    }
+
+    #[test]
+    fn test_adjust_centers_pulls_starved_cluster_halfway() {
+        // Nine points against one: cluster 1 is starved but not empty, so its
+        // weight is 1 and the new centroid is the midpoint of the old one and
+        // the donor.
+        let data: Vec<f32> = (0..10).map(|i| i as f32).collect();
+        let mut assignments = vec![0usize; 10];
+        assignments[9] = 1;
+        let counts = vec![9usize, 1];
+        let mut centroids = vec![4.0_f32, 100.0];
+
+        let adjusted = adjust_centers(&mut centroids, 1, 2, &data, 10, &assignments, &counts, 0);
+
+        assert_eq!(adjusted, 1);
+        // (100 + donor) / 2 for some donor in 0..=8, so strictly between.
+        assert!(
+            centroids[1] > 50.0 && centroids[1] < 55.0,
+            "expected a midpoint pull, got {}",
+            centroids[1]
+        );
+        let donor = centroids[1] * 2.0 - 100.0;
+        assert!(
+            data[..9].contains(&donor),
+            "recovered donor {} is not a point of the over-full cluster",
+            donor
+        );
+    }
+
+    #[test]
+    fn test_adjust_centers_without_donors_is_a_noop() {
+        // Every cluster sits exactly at the average, so nothing is above it and
+        // there is no donor to draw from. Must bail rather than pick a victim.
+        let data = vec![0.0_f32, 1.0, 2.0, 3.0];
+        let assignments = vec![0, 1, 2, 3];
+        let counts = vec![1usize, 1, 1, 1];
+        let mut centroids = vec![0.0_f32, 1.0, 2.0, 3.0];
+        let before = centroids.clone();
+
+        let adjusted = adjust_centers(&mut centroids, 1, 4, &data, 4, &assignments, &counts, 0);
+
+        assert_eq!(adjusted, 0);
+        assert_eq!(centroids, before);
+    }
+
+    #[test]
+    fn test_balanced_training_evens_out_a_skewed_partition() {
+        // 200 points in one tight blob plus 3 far outliers. k-means|| is
+        // D^2-weighted, so it seeds onto the outliers by construction, and
+        // plain Lloyd's then parks three centroids on singletons and leaves the
+        // fourth holding the entire blob. Balancing has to pull them back in.
+        //
+        // The outliers are what make this test able to fail: without them,
+        // random init lands every centroid inside the blob, no cluster is ever
+        // starved, and the assertion passes for the wrong reason.
+        let (n, dim, k) = (203usize, 2usize, 4usize);
+        let mut data = Vec::with_capacity(n * dim);
+        for i in 0..200 {
+            data.push((i % 20) as f32 * 0.01);
+            data.push((i / 20) as f32 * 0.01);
+        }
+        for i in 0..3 {
+            data.push(1000.0 * (i + 1) as f32);
+            data.push(-1000.0 * (i + 1) as f32);
+        }
+
+        let largest_cluster = |params: KMeansTrainingParams| {
+            let centroids = train_centroids(
+                &data,
+                dim,
+                n,
+                k,
+                &Dist::SquaredEuclidean,
+                Some(params),
+                7,
+                false,
+            )
+            .unwrap();
+            let norms: Vec<f32> = (0..k)
+                .map(|c| {
+                    let cent = &centroids[c * dim..(c + 1) * dim];
+                    f32::dot_simd(cent, cent)
+                })
+                .collect();
+            let assignments = assign_all_parallel(
+                &data,
+                &vec![0.0f32; n],
+                dim,
+                n,
+                &centroids,
+                &norms,
+                k,
+                &Dist::SquaredEuclidean,
+            );
+            let mut counts = vec![0usize; k];
+            for &a in &assignments {
+                counts[a] += 1;
+            }
+            *counts.iter().max().unwrap()
+        };
+
+        let params = KMeansTrainingParams::new(30, Some(KMeansInit::KMeansParallel), None);
+        let plain = largest_cluster(params);
+        let balanced = largest_cluster(params.with_balancing(true));
+
+        assert_eq!(plain, 200, "the unbalanced baseline is not the skewed case");
+        assert!(
+            balanced < plain,
+            "balancing did not shrink the largest cluster: {} vs {}",
+            balanced,
+            plain
+        );
+    }
+
+    #[test]
+    fn test_assign_top_m_stays_distinct_when_every_distance_is_infinite() {
+        // A non-finite coordinate makes every candidate distance `+inf`, so the
+        // insertion buffer never fires and the row is whatever it was seeded
+        // with. That row has to be `m` *distinct* clusters: the batched
+        // NN-Descent merge derives the soundness of an unsafe disjoint write
+        // from it, so a repeat here is undefined behaviour downstream, not a
+        // quality regression.
+        let (n, dim, k, m) = (1usize, 2usize, 4usize, 2usize);
+        let data = vec![f32::INFINITY, 0.0];
+        let centroids: Vec<f32> = (0..k * dim).map(|i| i as f32).collect();
+        let norms = vec![1.0f32; k.max(n)];
+
+        let got = assign_all_parallel_top_m(
+            &data,
+            &norms,
+            dim,
+            n,
+            &centroids,
+            &norms,
+            k,
+            m,
+            &Dist::SquaredEuclidean,
+        );
+
+        assert_eq!(got.len(), n * m);
+        assert_ne!(
+            got[0], got[1],
+            "a point must not join the same cluster twice"
+        );
+        assert!(got.iter().all(|&c| (c as usize) < k));
+    }
+
+    #[test]
+    fn test_invert_assignments_handles_the_clamped_width() {
+        // `assign_all_parallel_top_m` clamps `m` to `k`. A caller that asks for
+        // more assignments than there are clusters must feed the *clamped*
+        // width here, or the inversion indexes past the end of the buffer.
+        let (n, k) = (4usize, 2usize);
+        let requested = 3usize;
+        let data: Vec<f32> = (0..n * 2).map(|i| i as f32).collect();
+        let centroids = vec![0.0f32, 0.0, 100.0, 100.0];
+        let norms = vec![1.0f32; n.max(k)];
+
+        let assignments = assign_all_parallel_top_m(
+            &data,
+            &norms,
+            2,
+            n,
+            &centroids,
+            &norms,
+            k,
+            requested,
+            &Dist::SquaredEuclidean,
+        );
+
+        let effective = assignments.len() / n;
+        assert_eq!(effective, k, "m must have been clamped to k");
+
+        let (members, offsets) = invert_assignments_csr(&assignments, n, effective, k);
+        assert_eq!(offsets[k], n * effective);
+        assert_eq!(members.len(), n * effective);
+    }
 
     #[test]
     fn test_build_csr_layout() {
@@ -2755,6 +3348,8 @@ mod tests {
             &mut centroid_norms,
             2,
             20,
+            false,
+            0,
             false,
         );
 

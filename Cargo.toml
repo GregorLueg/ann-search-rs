@@ -23,7 +23,7 @@ codegen-units = 1
 ## Enables binary index support with optional memory-mapped files for on-disk vector storage
 binary = ["memmap2", "bytemuck", "statrs"]
 ## Enables GPU-accelerated indices via the CubeCL backend
-gpu = ["cubecl", "cubecl-utils-rs"]
+gpu = ["cubecl", "cubecl-utils-rs", "half"]
 ## Enables GPU integration tests (requires 'wgpu' and a GPU on the machine). This is for CI/CD
 gpu-tests = ["gpu"]
 ## Enables quantised indices with different quantisations (BF16, SQ8, PQ, OPQ)

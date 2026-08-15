@@ -7,10 +7,12 @@
 //! reusable outside them.
 
 pub mod cagra_gpu_search;
+pub mod clustered_nndescent_gpu;
 pub mod dist_gpu;
 pub mod exhaustive_gpu;
 pub mod forest_gpu;
 pub mod ivf_gpu;
+pub mod k_means_gpu;
 pub mod nndescent_gpu;
 pub mod topk_gpu;
 
@@ -41,6 +43,15 @@ pub const DB_CHUNK_SIZE: usize = 16_384;
 /// computes the same answers. It matching Apple Silicon's plane size of 32 is
 /// coincidence.
 pub const WORKGROUP_SIZE_X: u32 = 32;
+
+/// Wide workgroup used by the k-means kernels.
+///
+/// The search kernels want 32 because they run one cube per query or per node
+/// and a wider cube would leave most lanes idle. The k-means assignment and
+/// segmented-reduction kernels are the opposite shape: one thread per point
+/// over the whole dataset, where the wider cube hides memory latency and the
+/// segmented centroid update needs enough lanes to cover `dim` in one pass.
+pub const WORKGROUP_128: u32 = 128;
 
 /// DB vectors per thread in the register-tiled distance kernel.
 pub const TILE_D: usize = 4;

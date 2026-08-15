@@ -10,6 +10,7 @@ use std::iter::Sum;
 use thousands::*;
 
 use crate::gpu::dist_gpu::*;
+use crate::gpu::k_means_gpu::{assign_all_gpu, train_centroids_gpu, KMeansGpuParams};
 use crate::gpu::topk_gpu::{radix_select_ivf_topk, radix_select_usable};
 use crate::gpu::*;
 use crate::prelude::*;
@@ -126,12 +127,20 @@ where
     /// * `data` - Database vectors [n, dim]
     /// * `metric` - Distance metric
     /// * `nlist` - Number of clusters (defaults to `sqrt(n)`)
-    /// * `k_means_params` - Optional k-means trainings parameters, see
-    ///   [KMeansTrainingParams]. If not provided, will default to sensible
-    ///   defaults.
+    /// * `k_means_params` - Optional k-means training parameters, see
+    ///   [KMeansGpuParams]. If not provided, will default to sensible defaults.
     /// * `seed` - Random seed
     /// * `verbose` - Print progress
     /// * `device` - GPU device
+    ///
+    /// ### Note
+    ///
+    /// Both halves of the partitioning run on device: the centroids train on a
+    /// subsample via [`train_centroids_gpu`], and the full dataset is assigned
+    /// against them via [`assign_all_gpu`]. The assignment pass in particular
+    /// used to be the largest non-kernel cost of this build, an
+    /// `O(n * nlist * dim)` host scan performed after the training had already
+    /// finished.
     ///
     /// ### Returns
     ///
@@ -140,7 +149,7 @@ where
         data: MatRef<T>,
         metric: Dist,
         nlist: Option<usize>,
-        k_means_params: Option<KMeansTrainingParams>,
+        k_means_params: Option<KMeansGpuParams>,
         seed: usize,
         verbose: bool,
         device: R::Device,
@@ -163,7 +172,11 @@ where
             println!("  Generating IVF index with {} Voronoi cells.", nlist);
         }
 
-        let centroids = train_centroids(
+        // Hoisted above the k-means so training, assignment and the index
+        // upload all share one device context and its buffer pool.
+        let client = R::client(&device);
+
+        let centroids = train_centroids_gpu::<T, R>(
             &training_data,
             dim,
             n_train,
@@ -171,19 +184,16 @@ where
             &metric,
             k_means_params,
             seed,
+            &client,
             verbose,
         )?;
 
-        // Norms on original (unpadded) data
-        let data_norms = if metric == Dist::Cosine {
-            (0..n)
-                .map(|i| T::calculate_l2_norm(&vectors_flat[i * dim..(i + 1) * dim]))
-                .collect()
-        } else {
-            vec![T::one(); n]
-        };
+        let assignments =
+            assign_all_gpu::<T, R>(&vectors_flat, dim, n, &centroids, nlist, &metric, &client)?;
 
-        let centroid_norms = if metric == Dist::Cosine {
+        // Query time compares against these on device, so they are computed on
+        // the unpadded centroids exactly as before.
+        let centroid_norms: Vec<T> = if metric == Dist::Cosine {
             (0..nlist)
                 .map(|i| T::calculate_l2_norm(&centroids[i * dim..(i + 1) * dim]))
                 .collect()
@@ -191,25 +201,12 @@ where
             vec![T::one(); nlist]
         };
 
-        let assignments = assign_all_parallel(
-            &vectors_flat,
-            &data_norms,
-            dim,
-            n,
-            &centroids,
-            &centroid_norms,
-            nlist,
-            &metric,
-        );
-
         let (vectors_by_cluster, original_indices, cluster_offsets, norms_by_cluster) =
             reorganise_by_cluster(&vectors_flat, dim, n, &assignments, nlist, &metric);
 
         if verbose {
             println!("  Uploading all vectors to GPU");
         }
-
-        let client = R::client(&device);
 
         // Pad vectors and centroids for GPU
         let vectors_padded = if dim_padded != dim {
@@ -1073,8 +1070,8 @@ mod tests {
     use cubecl::cpu::CpuRuntime;
     use faer::Mat;
 
-    fn get_default_k_means() -> Option<KMeansTrainingParams> {
-        Some(KMeansTrainingParams::new(10, None, None))
+    fn get_default_k_means() -> Option<KMeansGpuParams> {
+        Some(KMeansGpuParams::new(10, None, true, false))
     }
 
     #[test]
@@ -1210,8 +1207,8 @@ mod tests_wpgu {
     use cubecl::wgpu::WgpuRuntime;
     use faer::Mat;
 
-    fn get_default_k_means() -> Option<KMeansTrainingParams> {
-        Some(KMeansTrainingParams::new(10, None, None))
+    fn get_default_k_means() -> Option<KMeansGpuParams> {
+        Some(KMeansGpuParams::new(10, None, true, false))
     }
 
     fn try_device() -> Option<WgpuDevice> {

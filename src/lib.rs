@@ -2503,9 +2503,11 @@ where
 ///
 /// * `mat` - Data matrix [samples, features]
 /// * `nlist` - Number of clusters (defaults to √n)
-/// * `k_means_params` - Optional k-means trainings parameters, see
-///   [KMeansTrainingParams]. If not provided, will default to sensible
-///   defaults.
+/// * `k_means_params` - Optional k-means training parameters, see
+///   [`crate::gpu::k_means_gpu::KMeansGpuParams`]. If not provided, will
+///   default to sensible defaults. Note this takes the GPU parameter struct,
+///   not the CPU [KMeansTrainingParams]: both halves of the partitioning run on
+///   device.
 /// * `dist_metric` - Distance metric: "euclidean" or "cosine". "manhatten" is
 ///   not supported.
 /// * `seed` - Random seed
@@ -2514,7 +2516,7 @@ where
 pub fn build_ivf_index_gpu<T, R>(
     mat: MatRef<T>,
     nlist: Option<usize>,
-    k_means_params: Option<KMeansTrainingParams>,
+    k_means_params: Option<crate::gpu::k_means_gpu::KMeansGpuParams>,
     dist_metric: &str,
     seed: usize,
     verbose: bool,
@@ -2776,6 +2778,10 @@ where
 /// support. Slim counterpart to [`build_nndescent_index_gpu`] aimed at
 /// NSG feeders and raw-kNN consumers.
 ///
+/// The whole dataset is uploaded as one tensor and held for the build, so it
+/// is bounded by the device's per-binding limit. Use
+/// [`build_clustered_knn_graph_gpu`] for datasets past that ceiling.
+///
 /// ### Params
 ///
 /// * `mat` - Input matrix (samples x features)
@@ -2790,6 +2796,10 @@ where
 /// * `seed` - Random seed
 /// * `verbose` - Print progress
 /// * `device` - CubeCL runtime device
+///
+/// ### Returns
+///
+/// Populated [`crate::gpu::nndescent_gpu::KnnGraphGpu`].
 #[allow(clippy::too_many_arguments)]
 pub fn build_knn_graph_gpu<T, R>(
     mat: MatRef<T>,
@@ -2820,10 +2830,89 @@ where
 }
 
 #[cfg(feature = "gpu")]
+/// Build a raw kNN graph on the GPU in balanced batches.
+///
+/// Batched counterpart to [`build_knn_graph_gpu`], for datasets whose working
+/// set does not fit a single GPU binding. Partitions with balanced k-means on a
+/// subsample, gives every point membership of its two nearest clusters, runs
+/// NN-Descent one cluster at a time and merges the subgraphs into a global
+/// graph. Only one cluster is device-resident at a time.
+///
+/// ### Params
+///
+/// * `mat` - Input matrix (samples x features)
+/// * `dist_metric` - Distance metric string
+/// * `k` - Neighbours per node (default 30)
+/// * `build_k` - Internal NNDescent working degree (default 1.5*k)
+/// * `max_iters` - Maximum NNDescent iterations per cluster (default 15)
+/// * `n_trees` - Forest size for GPU init; sized per cluster when `None`
+/// * `delta` - Convergence threshold (default 0.001)
+/// * `rho` - Local-join sampling rate (default 0.5)
+/// * `refine_knn` - 2-hop refinement sweeps per cluster (default 0)
+/// * `cluster_params` - Optional [`crate::gpu::clustered_nndescent_gpu::ClusteredBuildParams`];
+///   `None` plans the cluster count from the device limits
+/// * `seed` - Random seed
+/// * `verbose` - Print progress
+/// * `device` - CubeCL runtime device
+///
+/// ### Returns
+///
+/// Populated [`crate::gpu::nndescent_gpu::KnnGraphGpu`], identical in shape to
+/// the unbatched path.
+///
+/// ### Note
+///
+/// This trades speed for reach. NN-Descent is roughly `O(n^1.14)`, so `C`
+/// clusters with 2x overlap do more total distance work than one graph would,
+/// around 2x at `C = 2`. Whenever the dataset already fits, this falls through
+/// to [`build_knn_graph_gpu`] rather than paying that for nothing.
+#[allow(clippy::too_many_arguments)]
+pub fn build_clustered_knn_graph_gpu<T, R>(
+    mat: MatRef<T>,
+    dist_metric: &str,
+    k: Option<usize>,
+    build_k: Option<usize>,
+    max_iters: Option<usize>,
+    n_trees: Option<usize>,
+    delta: Option<f32>,
+    rho: Option<f32>,
+    refine_knn: Option<usize>,
+    cluster_params: Option<crate::gpu::clustered_nndescent_gpu::ClusteredBuildParams>,
+    seed: usize,
+    verbose: bool,
+    device: R::Device,
+) -> Result<crate::gpu::nndescent_gpu::KnnGraphGpu<T>, AnnSearchErrors>
+where
+    R: Runtime,
+    T: AnnSearchFloat + CubeclFloat,
+{
+    let metric = parse_ann_dist(dist_metric).unwrap_or_else(|| {
+        println!("[WARNING] Weird string used for distance metric. Using default squared Euclidean distance");
+        Dist::default()
+    });
+
+    crate::gpu::clustered_nndescent_gpu::build_clustered_knn_graph_gpu::<T, R>(
+        mat,
+        metric,
+        k,
+        build_k,
+        max_iters,
+        n_trees,
+        delta,
+        rho,
+        refine_knn,
+        cluster_params,
+        seed,
+        verbose,
+        device,
+    )
+}
+
+#[cfg(feature = "gpu")]
 /// Build an NSG index from a slim GPU-built kNN graph.
 ///
-/// Companion to [`build_nsg_from_gpu_nndescent`] for callers that used
-/// [`build_knn_graph_gpu`] instead of the full CAGRA-optimised
+/// For callers that used [`build_knn_graph_gpu`] or
+/// [`build_clustered_knn_graph_gpu`] instead of the full CAGRA-optimised
 /// [`build_nndescent_index_gpu`]. Cheaper end-to-end: no CAGRA kernels and
 /// no second graph copy in memory.
 ///

@@ -3,6 +3,10 @@
 //! All vector data remains GPU-resident throughout construction. The host
 //! loop only downloads a single u32 convergence counter per iteration.
 //!
+//! [`build_knn_graph_gpu`] is a thin wrapper over [`nndescent_core`], which
+//! owns that loop. The split exists so [`crate::gpu::clustered_nndescent_gpu`]
+//! can run the same loop once per cluster against a shared client.
+//!
 //! ## CubeCL 0.10 codegen workarounds
 //!
 //! Several constructs in this file look needlessly roundabout. They are not.
@@ -51,11 +55,11 @@ use crate::utils::nndescent_utils::SENTINEL_PID;
 /// Max proposals per node per iteration. Overflow is silently dropped.
 pub const MAX_PROPOSALS: usize = 128;
 /// Default maximum number of NNDescent iterations
-const DEFAULT_MAX_ITERS: usize = 15;
+pub(crate) const DEFAULT_MAX_ITERS: usize = 15;
 /// Default convergence threshold (fraction of k*n edges updated)
-const DEFAULT_DELTA: f32 = 0.001;
+pub(crate) const DEFAULT_DELTA: f32 = 0.001;
 /// Default sampling rate for the local join
-const DEFAULT_RHO: f32 = 0.5;
+pub(crate) const DEFAULT_RHO: f32 = 0.5;
 
 ////////////////////
 // Kernel helpers //
@@ -940,7 +944,9 @@ pub fn merge_proposals<F: Float>(
 /// Runs after NNDescent convergence. For each node, evaluates the k^2
 /// second-degree neighbours. Filters aggressively against duplicates and
 /// the current worst distance before pushing to the proposal buffer.
-/// Overflow beyond `max_proposals` is handled via reservoir sampling.
+/// Overflow beyond `max_proposals` is dropped, for the reason documented on
+/// `leaf_pairwise_proposals`: only the atomic slot claim keeps a proposal's
+/// index and distance stores paired.
 ///
 /// ### Params
 ///
@@ -1077,14 +1083,6 @@ pub fn two_hop_refinement<F: Float, N: Size>(
                             let off = node as usize * max_proposals as usize + slot as usize;
                             prop_idx[off] = cand_pid;
                             prop_dist[off] = dist;
-                        } else {
-                            let rand_val = xorshift(node ^ slot ^ cand_pid) % (slot + 1u32);
-                            if rand_val < max_proposals {
-                                let off =
-                                    node as usize * max_proposals as usize + rand_val as usize;
-                                prop_idx[off] = cand_pid;
-                                prop_dist[off] = dist;
-                            }
                         }
                     }
                 }
@@ -2337,8 +2335,15 @@ pub struct KnnGraphGpu<T> {
 /// Reuses every kernel that [`NNDescentGpu::build`] uses for the NNDescent
 /// phase but skips the CAGRA rank-prune and reverse-merge that follow.
 ///
-/// Query methods are deliberately absent: `KnnGraphGpu` is a data
-/// handoff, not a queryable index. Feed it to [`NsgIndex::build_from_gpu_knn`]
+/// A thin wrapper: it resolves the defaults, pads the vectors, opens the device
+/// context and then hands the whole device-resident loop to [`nndescent_core`],
+/// compacting its output with [`compact_knn_rows`] on the way back. The split
+/// is what lets [`crate::gpu::clustered_nndescent_gpu`] drive the same loop
+/// once per cluster against a shared client.
+///
+/// Query methods are deliberately absent: `KnnGraphGpu` is a data handoff, not
+/// a queryable index. Feed it to
+/// [`NsgIndex::build_from_gpu_knn`](crate::cpu::nsg::NsgIndex::build_from_gpu_knn)
 /// for graph-based query, or unpack `knn_graph` directly for raw kNN consumers.
 ///
 /// ### Params
@@ -2349,12 +2354,12 @@ pub struct KnnGraphGpu<T> {
 /// * `build_k` - Wider working degree during NNDescent iterations.
 ///   Defaults to `max(k, 1.5 * k)`. Larger `build_k` improves final
 ///   graph quality at a linear iteration-cost hit
-/// * `max_iters` - Maximum NNDescent iterations. Defaults to
-///   [`DEFAULT_MAX_ITERS`]
-/// * `n_trees` - Trees for GPU forest init. Defaults to a `n^0.25` rule
+/// * `max_iters` - Maximum NNDescent iterations. Defaults to 15
+/// * `n_trees` - Trees for GPU forest init. Defaults to
+///   [`default_forest_trees`]
 /// * `delta` - Convergence threshold (fraction of `n*build_k` edges
-///   updated). Defaults to [`DEFAULT_DELTA`]
-/// * `rho` - Local-join sampling rate. Defaults to [`DEFAULT_RHO`]
+///   updated). Defaults to 0.001
+/// * `rho` - Local-join sampling rate. Defaults to 0.5
 /// * `refine_knn` - Number of 2-hop refinement sweeps after the main
 ///   NNDescent loop. Defaults to `0`
 /// * `seed` - RNG seed for reproducibility
@@ -2396,9 +2401,7 @@ where
     let rho_thresh = (rho * 65535.0) as u32;
     let refine_knn = refine_knn.unwrap_or(0);
 
-    let line = LINE_SIZE;
-    let dim_padded = dim.next_multiple_of(line);
-    let dim_vec = dim_padded / line;
+    let dim_padded = dim.next_multiple_of(LINE_SIZE);
 
     let vectors_padded = if dim_padded != dim {
         pad_vectors(&vectors_flat, n, dim, dim_padded)
@@ -2428,45 +2431,241 @@ where
 
     let start = Instant::now();
 
-    // ---- GPU setup ----
-
-    let n_trees_forest = n_trees.unwrap_or_else(|| {
-        let calculated = 5 + ((n as f64).powf(0.25)).round() as usize;
-        calculated.min(20)
-    });
-
     let client = R::client(&device);
     let limits = GpuLimits::from_client(&client);
-    let use_cosine = metric == Dist::Cosine;
 
-    let vectors_gpu = GpuTensor::<R, T>::from_slice(&vectors_padded, vec![n, dim_padded], &client)?;
+    let cfg = NnDescentCfg {
+        build_k,
+        max_iters,
+        n_trees: n_trees.unwrap_or_else(|| default_forest_trees(n)),
+        delta,
+        rho_thresh,
+        refine_knn,
+        seed,
+        use_cosine: metric == Dist::Cosine,
+    };
+
+    let (graph_idx, graph_dist, converged) = nndescent_core::<T, R>(
+        &vectors_padded,
+        &norms,
+        n,
+        dim,
+        dim_padded,
+        &cfg,
+        &client,
+        &limits,
+        verbose,
+    )?;
+
+    let knn_graph = compact_knn_rows(&graph_idx, &graph_dist, n, k, build_k);
+
+    if verbose {
+        println!("  Total build time: {:.2?}", start.elapsed());
+    }
+
+    Ok(KnnGraphGpu {
+        vectors_flat,
+        dim,
+        n,
+        k,
+        norms,
+        metric,
+        knn_graph,
+        converged,
+    })
+}
+
+/// Default forest size for the NNDescent graph initialisation.
+///
+/// An `n^0.25` rule, capped at 20. Sits in its own function because the
+/// clustered driver recomputes it per cluster rather than once for the whole
+/// dataset: a cluster of `2n/C` points wants the forest its own size implies,
+/// not the one the full dataset would.
+///
+/// ### Params
+///
+/// * `n` - Number of vectors the forest will index
+///
+/// ### Returns
+///
+/// Number of random-projection trees to build.
+pub fn default_forest_trees(n: usize) -> usize {
+    (5 + ((n as f64).powf(0.25)).round() as usize).min(20)
+}
+
+/// Compact the wide NNDescent working graph down to `k` neighbours per node.
+///
+/// The device keeps `build_k` slots per node so the descent has room to
+/// manoeuvre; callers want `k`. Drops self-edges, sentinels and out-of-range
+/// ids, keeps the first `k` survivors, and sorts each row ascending by
+/// distance.
+///
+/// ### Params
+///
+/// * `graph_idx` - Raw packed ids from the device, `n * build_k`; the top bit
+///   is the is-new flag and is masked off here
+/// * `graph_dist` - Matching distances, `n * build_k`
+/// * `n` - Number of nodes
+/// * `k` - Neighbours to keep per node
+/// * `build_k` - Working degree the device ran at
+///
+/// ### Returns
+///
+/// Flat `n * k` graph, row `i` at `[i * k, (i + 1) * k)`, unfilled slots left
+/// as `(SENTINEL_PID, T::max_value())`.
+pub fn compact_knn_rows<T>(
+    graph_idx: &[u32],
+    graph_dist: &[T],
+    n: usize,
+    k: usize,
+    build_k: usize,
+) -> Vec<(usize, T)>
+where
+    T: AnnSearchFloat,
+{
+    let pid_mask = 0x7FFFFFFFu32;
+    let sentinel = SENTINEL_PID;
+
+    let mut knn_graph = vec![(sentinel, <T as num_traits::Float>::max_value()); n * k];
+
+    knn_graph
+        .par_chunks_mut(k)
+        .enumerate()
+        .for_each(|(i, slot)| {
+            let mut written = 0;
+            for j in 0..build_k {
+                if written >= k {
+                    break;
+                }
+                let pid = (graph_idx[i * build_k + j] & pid_mask) as usize;
+                if pid < n && pid != i && pid != sentinel {
+                    slot[written] = (pid, graph_dist[i * build_k + j]);
+                    written += 1;
+                }
+            }
+            slot.sort_unstable_by(|a, b| {
+                a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal)
+            });
+        });
+
+    knn_graph
+}
+
+/// Resolved NNDescent knobs, shared by the single-shot and clustered drivers.
+#[derive(Clone, Copy, Debug)]
+pub struct NnDescentCfg {
+    /// Working degree the device runs at, wider than the returned `k`
+    pub build_k: usize,
+    /// Iteration cap for the main descent loop
+    pub max_iters: usize,
+    /// Random-projection trees used to seed the graph
+    pub n_trees: usize,
+    /// Convergence threshold as a fraction of `n * build_k` edges updated
+    pub delta: f32,
+    /// Local-join sampling rate, pre-scaled to the kernel's `u32` domain
+    pub rho_thresh: u32,
+    /// Two-hop refinement sweeps after the main loop
+    pub refine_knn: usize,
+    /// RNG seed
+    pub seed: usize,
+    /// Whether to score with cosine rather than squared Euclidean
+    pub use_cosine: bool,
+}
+
+/// Run the device-resident NNDescent loop and read the raw graph back.
+///
+/// Everything between the data upload and the download, with no argument
+/// resolution, no padding and no compaction: allocate, seed the graph from a
+/// random draw plus a random-projection forest, iterate local joins until the
+/// update rate falls below `delta`, optionally refine, download.
+///
+/// Split out of [`build_knn_graph_gpu`] so the clustered driver can call it
+/// once per cluster against a borrowed client, rather than rebuilding a device
+/// context and its buffer pool for every cluster.
+///
+/// ### Params
+///
+/// * `vectors_padded` - Row-major vectors padded to `dim_padded`, `n` rows
+/// * `norms` - L2 norms per row; only read when `cfg.use_cosine`, and may be
+///   empty otherwise
+/// * `n` - Number of vectors
+/// * `dim` - Original embedding dimensionality, needed by the forest init
+/// * `dim_padded` - Padded dimensionality, a multiple of `LINE_SIZE`
+/// * `cfg` - Resolved knobs, see [`NnDescentCfg`]
+/// * `client` - CubeCL compute client, borrowed for the call
+/// * `limits` - Device limits read once by the caller
+/// * `verbose` - Print per-phase progress
+///
+/// ### Returns
+///
+/// `(graph_idx, graph_dist, converged)`. Both buffers are `n * build_k`; ids
+/// still carry the is-new flag in the top bit, so run them through
+/// [`compact_knn_rows`] before use.
+#[allow(clippy::too_many_arguments)]
+pub fn nndescent_core<T, R>(
+    vectors_padded: &[T],
+    norms: &[T],
+    n: usize,
+    dim: usize,
+    dim_padded: usize,
+    cfg: &NnDescentCfg,
+    client: &ComputeClient<R>,
+    limits: &GpuLimits,
+    verbose: bool,
+) -> Result<(Vec<u32>, Vec<T>, bool), AnnSearchErrors>
+where
+    T: AnnSearchFloat + CubeclFloat,
+    R: Runtime,
+{
+    let NnDescentCfg {
+        build_k,
+        max_iters,
+        n_trees: n_trees_forest,
+        delta,
+        rho_thresh,
+        refine_knn,
+        seed,
+        use_cosine,
+    } = *cfg;
+
+    let line = LINE_SIZE;
+    let dim_vec = dim_padded / line;
+
+    let vectors_gpu = GpuTensor::<R, T>::from_slice(vectors_padded, vec![n, dim_padded], client)?;
 
     let norms_gpu = if use_cosine {
-        GpuTensor::<R, T>::from_slice(&norms, vec![n], &client)?
+        GpuTensor::<R, T>::from_slice(norms, vec![n], client)?
     } else {
-        GpuTensor::<R, T>::from_slice(&[T::zero()], vec![1], &client)?
+        GpuTensor::<R, T>::from_slice(&[T::zero()], vec![1], client)?
     };
 
     let graph_idx_gpu = GpuTensor::<R, u32>::from_slice(
         &vec![0x7FFFFFFFu32; n * build_k],
         vec![n, build_k],
-        &client,
+        client,
     )?;
     let graph_dist_gpu = GpuTensor::<R, T>::from_slice(
         &vec![<T as num_traits::Float>::max_value(); n * build_k],
         vec![n, build_k],
-        &client,
+        client,
     )?;
 
+    // All four are left uninitialised deliberately. `gpu_forest_init` launches
+    // `reset_proposals` before its first `leaf_pairwise_proposals`, and the
+    // iteration loop does the same, so the counters are zeroed before anything
+    // reads them; the proposal slots themselves are written before they are
+    // read, up to the count. These are the largest transients the build
+    // allocates, so zero-filling them would cost a host allocation and an
+    // upload per build for nothing.
     let max_prop = MAX_PROPOSALS;
-    let prop_idx_gpu = GpuTensor::<R, u32>::empty(vec![n, max_prop], &client)?;
-    let prop_dist_gpu = GpuTensor::<R, T>::empty(vec![n, max_prop], &client)?;
-    let prop_count_gpu = GpuTensor::<R, u32>::empty(vec![n], &client)?;
-    let update_counter_gpu = GpuTensor::<R, u32>::empty(vec![1], &client)?;
+    let prop_idx_gpu = GpuTensor::<R, u32>::empty(vec![n, max_prop], client)?;
+    let prop_dist_gpu = GpuTensor::<R, T>::empty(vec![n, max_prop], client)?;
+    let prop_count_gpu = GpuTensor::<R, u32>::empty(vec![n], client)?;
+    let update_counter_gpu = GpuTensor::<R, u32>::empty(vec![1], client)?;
 
-    let (grid_n_x, grid_n_y) = grid_2d((n as u32).div_ceil(WORKGROUP_SIZE_X), &limits)?;
+    let (grid_n_x, grid_n_y) = grid_2d((n as u32).div_ceil(WORKGROUP_SIZE_X), limits)?;
 
-    let staging = plan_local_join_staging(dim_padded, build_k * 2, size_of::<T>(), &limits)?;
+    let staging = plan_local_join_staging(dim_padded, build_k * 2, size_of::<T>(), limits)?;
 
     // ---- Random graph initialisation ----
 
@@ -2475,7 +2674,7 @@ where
     }
     unsafe {
         init_random_graph::launch_unchecked::<T, R>(
-            &client,
+            client,
             CubeCount::Static(grid_n_x, grid_n_y, 1),
             CubeDim::new_2d(WORKGROUP_SIZE_X, 1),
             line,
@@ -2508,17 +2707,17 @@ where
         seed,
         use_cosine,
         verbose,
-        &client,
+        client,
     )?;
 
     // ---- Mark all graph entries as new ----
 
     let total_entries = (n * build_k) as u32;
     let mark_grid_flat = total_entries.div_ceil(WORKGROUP_SIZE_X);
-    let (mark_cubes_x, mark_cubes_y) = grid_2d(mark_grid_flat, &limits)?;
+    let (mark_cubes_x, mark_cubes_y) = grid_2d(mark_grid_flat, limits)?;
     unsafe {
         mark_all_new::launch_unchecked::<R>(
-            &client,
+            client,
             CubeCount::Static(mark_cubes_x, mark_cubes_y, 1),
             CubeDim::new_2d(WORKGROUP_SIZE_X, 1),
             graph_idx_gpu.clone().into_tensor_arg(),
@@ -2531,15 +2730,15 @@ where
     let iter_start = Instant::now();
     let mut converged = false;
 
-    let reverse_idx_gpu = GpuTensor::<R, u32>::empty(vec![n, build_k], &client)?;
-    let reverse_count_gpu = GpuTensor::<R, u32>::empty(vec![n], &client)?;
+    let reverse_idx_gpu = GpuTensor::<R, u32>::empty(vec![n, build_k], client)?;
+    let reverse_count_gpu = GpuTensor::<R, u32>::empty(vec![n], client)?;
 
     for iter in 0..max_iters {
-        let (cubes_x, cubes_y) = grid_2d(n as u32, &limits)?;
+        let (cubes_x, cubes_y) = grid_2d(n as u32, limits)?;
 
         unsafe {
             reset_proposals::launch_unchecked::<R>(
-                &client,
+                client,
                 CubeCount::Static(grid_n_x, grid_n_y, 1),
                 CubeDim::new_2d(WORKGROUP_SIZE_X, 1),
                 prop_count_gpu.clone().into_tensor_arg(),
@@ -2548,7 +2747,7 @@ where
             );
 
             reset_proposals::launch_unchecked::<R>(
-                &client,
+                client,
                 CubeCount::Static(grid_n_x, grid_n_y, 1),
                 CubeDim::new_2d(WORKGROUP_SIZE_X, 1),
                 reverse_count_gpu.clone().into_tensor_arg(),
@@ -2559,7 +2758,7 @@ where
 
         unsafe {
             build_reverse_candidates::launch_unchecked::<R>(
-                &client,
+                client,
                 CubeCount::Static(grid_n_x, grid_n_y, 1),
                 CubeDim::new_2d(WORKGROUP_SIZE_X, 1),
                 graph_idx_gpu.clone().into_tensor_arg(),
@@ -2574,7 +2773,7 @@ where
 
         unsafe {
             local_join_shared::launch_unchecked::<T, R>(
-                &client,
+                client,
                 CubeCount::Static(cubes_x, cubes_y, 1),
                 CubeDim::new_2d(WORKGROUP_SIZE_X, 1),
                 line,
@@ -2603,7 +2802,7 @@ where
 
         unsafe {
             merge_proposals::launch_unchecked::<T, R>(
-                &client,
+                client,
                 CubeCount::Static(grid_n_x, grid_n_y, 1),
                 CubeDim::new_2d(WORKGROUP_SIZE_X, 1),
                 graph_idx_gpu.clone().into_tensor_arg(),
@@ -2618,7 +2817,7 @@ where
             );
         }
 
-        let counter_data = update_counter_gpu.clone().read(&client)?;
+        let counter_data = update_counter_gpu.clone().read(client)?;
         let updates = counter_data[0] as f64;
         let rate = updates / (n * build_k) as f64;
 
@@ -2657,15 +2856,15 @@ where
     fits_shared_memory(
         "two_hop_refinement",
         dim_padded * size_of::<T>() + size_of::<T>() + build_k * 4,
-        &limits,
+        limits,
     )?;
 
-    let (cubes_x, cubes_y) = grid_2d(n as u32, &limits)?;
+    let (cubes_x, cubes_y) = grid_2d(n as u32, limits)?;
 
     for sweep in 0..refine_knn {
         unsafe {
             reset_proposals::launch_unchecked::<R>(
-                &client,
+                client,
                 CubeCount::Static(grid_n_x, grid_n_y, 1),
                 CubeDim::new_2d(WORKGROUP_SIZE_X, 1),
                 prop_count_gpu.clone().into_tensor_arg(),
@@ -2674,7 +2873,7 @@ where
             );
 
             two_hop_refinement::launch_unchecked::<T, R>(
-                &client,
+                client,
                 CubeCount::Static(cubes_x, cubes_y, 1),
                 CubeDim::new_2d(WORKGROUP_SIZE_X, 1),
                 line,
@@ -2693,7 +2892,7 @@ where
             );
 
             merge_proposals::launch_unchecked::<T, R>(
-                &client,
+                client,
                 CubeCount::Static(grid_n_x, grid_n_y, 1),
                 CubeDim::new_2d(WORKGROUP_SIZE_X, 1),
                 graph_idx_gpu.clone().into_tensor_arg(),
@@ -2709,7 +2908,7 @@ where
         }
 
         if verbose {
-            let counter_data = update_counter_gpu.clone().read(&client)?;
+            let counter_data = update_counter_gpu.clone().read(client)?;
             println!(
                 "    2-Hop sweep {}: {} updates",
                 sweep + 1,
@@ -2722,51 +2921,12 @@ where
         println!("  Refinement done in: {:.2?}", refinement_start.elapsed());
     }
 
-    // ---- Download graph and extract top-k per row ----
+    // ---- Download the raw graph ----
 
-    let nndescent_idx = graph_idx_gpu.read(&client)?;
-    let nndescent_dist = graph_dist_gpu.read(&client)?;
-    let pid_mask = 0x7FFFFFFFu32;
-    let sentinel = SENTINEL_PID;
+    let graph_idx = graph_idx_gpu.read(client)?;
+    let graph_dist = graph_dist_gpu.read(client)?;
 
-    let mut knn_graph = vec![(sentinel, <T as num_traits::Float>::max_value()); n * k];
-
-    knn_graph
-        .par_chunks_mut(k)
-        .enumerate()
-        .for_each(|(i, slot)| {
-            let mut written = 0;
-            for j in 0..build_k {
-                if written >= k {
-                    break;
-                }
-                let raw = nndescent_idx[i * build_k + j];
-                let pid = (raw & pid_mask) as usize;
-                if pid < n && pid != i && pid != sentinel {
-                    let dist = nndescent_dist[i * build_k + j];
-                    slot[written] = (pid, dist);
-                    written += 1;
-                }
-            }
-            slot.sort_unstable_by(|a, b| {
-                a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal)
-            });
-        });
-
-    if verbose {
-        println!("  Total build time: {:.2?}", start.elapsed());
-    }
-
-    Ok(KnnGraphGpu {
-        vectors_flat,
-        dim,
-        n,
-        k,
-        norms,
-        metric,
-        knn_graph,
-        converged,
-    })
+    Ok((graph_idx, graph_dist, converged))
 }
 
 ///////////
@@ -4052,5 +4212,72 @@ mod kernel_tests {
             (gpu_dist - cpu_dist).abs() < 1e-2,
             "Distance mismatch: gpu={gpu_dist}, cpu={cpu_dist}"
         );
+    }
+
+    /// Every returned distance must belong to the id it is filed under.
+    ///
+    /// A proposal is an (index, distance) pair written as two separate stores
+    /// into a slot claimed by one atomic increment. Anything that writes a slot
+    /// it did not claim lets two threads interleave and files one thread's id
+    /// under the other's distance. That used to happen in the forest init's
+    /// overflow path and desynced ~29% of the graph here.
+    ///
+    /// Well-separated blobs make it unmistakable: cross-blob squared distances
+    /// are ~1600+, within-blob ones ~0-50, so a mispaired entry is off by two
+    /// orders of magnitude rather than by a rounding error.
+    #[test]
+    fn test_knn_graph_gpu_distances_match_ids() {
+        let Some(device) = try_device() else {
+            eprintln!("Skipping test: no wgpu backend available");
+            return;
+        };
+
+        let (n_blobs, per_blob, dim) = (8usize, 60usize, 8usize);
+        let n = n_blobs * per_blob;
+        let k = 5usize;
+
+        let flat: Vec<f32> = (0..n * dim)
+            .map(|e| {
+                let (row, col) = (e / dim, e % dim);
+                let blob = row / per_blob;
+                let jitter = (((row * 31 + col * 17) % 101) as f32) / 101.0 - 0.5;
+                jitter + if col == blob % dim { 40.0 } else { 0.0 }
+            })
+            .collect();
+        let data = Mat::from_fn(n, dim, |i, j| flat[i * dim + j]);
+
+        let graph = build_knn_graph_gpu::<f32, WgpuRuntime>(
+            data.as_ref(),
+            Dist::SquaredEuclidean,
+            Some(k),
+            None,
+            Some(15),
+            None,
+            Some(0.001),
+            Some(0.5),
+            None,
+            42,
+            false,
+            device,
+        )
+        .unwrap();
+
+        for i in 0..n {
+            for &(pid, stored) in &graph.knn_graph[i * k..(i + 1) * k] {
+                if pid >= n {
+                    continue;
+                }
+                let truth: f32 = (0..dim)
+                    .map(|c| {
+                        let d = flat[i * dim + c] - flat[pid * dim + c];
+                        d * d
+                    })
+                    .sum();
+                assert!(
+                    (stored - truth).abs() <= 1e-2 * truth.max(1.0),
+                    "desynced entry: i={i} j={pid} stored={stored} true={truth}"
+                );
+            }
+        }
     }
 }
