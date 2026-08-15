@@ -81,12 +81,6 @@ fn main() {
         (4, 16, None),
         (8, 16, None),
         (12, 16, None),
-        (4, 12, Some(1)),
-        (4, 12, Some(2)),
-        (4, 12, Some(4)),
-        (4, 16, Some(1)),
-        (4, 16, Some(2)),
-        (4, 16, Some(4)),
     ];
 
     for (num_tables, bits_per_hash, slot_bits) in build_params {
@@ -110,15 +104,14 @@ fn main() {
         let n_proj = lsh_index.num_projections();
         let q_label = lsh_index.slot_bits();
 
-        // `max_cand` now caps unique candidates across all tables and probes,
-        // so a budget below the bucket size is finally meaningful.
         let search_budgets = [
             (None, "auto", 0),
             (None, "auto", 1),
             (None, "auto", 2),
             (Some(5000), "5k", 1),
-            (Some(1000), "1k", 1),
-            (Some(1000), "1k", 2),
+            (Some(2000), "2k", 1),
+            (Some(5000), "5k", 2),
+            (Some(2000), "2k", 2),
         ];
         for (max_cand, cand_label, probe_mult) in search_budgets {
             let n_probe = n_proj * probe_mult;

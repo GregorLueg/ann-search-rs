@@ -445,20 +445,6 @@ dimensionality.
 </code></pre>
 </details>
 
-## Conclusions
-
-GPU acceleration in the setting of the `wgpu` backend only starts making sense
-with large indices and large dimensionality (assuming you can hold the data
-in VRAM or unified memory for Apple Silicon). With smaller dimensionalities and
-less samples, the overhead of launching the GPU kernels does not give
-substantial performance benefits over the highly optimised CPU code. Exhaustive
-searches over larger data sets however become more viable with GPU acceleration
-and it here where some of the biggest gains can be observed. To note, these
-implemetations are not designed (and cannot) compete with what is possible
-on data centre GPUs with cuBLAS under the hood! They serve as an acceleration
-in specific situations and were designed to enable fast kNN generation for
-1m to 10m sample situations with lower dimensions (think single cell).
-
 ### Runtime info
 
 *All benchmarks were run on M1 Max MacBook Pro with 64 GB unified memory.*

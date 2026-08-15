@@ -47,17 +47,16 @@ use thousands::*;
 use crate::prelude::*;
 use crate::utils::*;
 
-///////////////
-// Constants //
-///////////////
+////////////
+// Consts //
+////////////
 
 /// Largest supported `bits_per_hash`.
 ///
 /// The bucket table is directly addressed, so a table costs
 /// `(1 << bits_per_hash) + 1` `u32` offsets. 20 bits is ~4 MB per table, which
 /// is the point where the offsets array stops fitting any sensible cache
-/// budget. It is also far past useful: at 20 bits every bucket is a singleton
-/// long before a realistic dataset fills the code space.
+/// budget.
 pub const MAX_BITS_PER_HASH: usize = 20;
 
 /// Number of vectors sampled when fitting the quantile boundaries.
