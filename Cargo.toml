@@ -6,6 +6,13 @@ authors = ["Gregor Lueg <gregorlueg@me.com>"]
 license = "MIT"
 repository = "https://github.com/GregorLueg/ann-search-rs"
 description = "Various vector search algorithms in Rust. Designed specifically for single cell & computational biology applications."
+keywords = ["vector-search", "nearest-neighbor", "knn", "hnsw", "similarity-search"]
+categories = [
+    "algorithms",
+    "data-structures",
+    "science::bioinformatics",
+    "science::computational-biology",
+]
 
 [lib]
 name = "ann_search_rs"
