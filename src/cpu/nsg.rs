@@ -711,7 +711,8 @@ where
     ///
     /// ### Params
     ///
-    /// * `knn_gpu` - Reference to a pre-built [`KnnGraphGpu`]
+    /// * `knn_gpu` - Reference to a pre-built
+    ///   [`KnnGraphGpu`](crate::gpu::nndescent_gpu::KnnGraphGpu)
     /// * `params` - Build parameters
     /// * `seed` - Random seed for reproducibility
     /// * `verbose` - Print progress
@@ -719,8 +720,6 @@ where
     /// ### Returns
     ///
     /// Built `NsgIndex` on success.
-    ///
-    /// [`build_knn_graph_gpu`]: crate::gpu::nndescent_gpu::build_knn_graph_gpu
     #[cfg(feature = "gpu")]
     pub fn build_from_gpu_knn(
         knn_gpu: &crate::gpu::nndescent_gpu::KnnGraphGpu<T>,

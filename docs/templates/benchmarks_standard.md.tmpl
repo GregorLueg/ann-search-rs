@@ -451,18 +451,38 @@ monotone in Cosine distance), which keeps the triangle inequality valid.
 Locality sensitive hashing. Can be a very fast index, but with increasing
 tables, the memory fingerprint does increase.
 
+Each table holds `nb / q` orthogonalised random projections. A projection is
+turned into a slot by binary-searching quantile boundaries fitted on a
+subsample of the data, and the code is the concatenation of those slots. Fitting
+the boundaries to the data is what keeps buckets balanced: plain SimHash puts
+every hyperplane through the origin, so on data carrying a large shared mean
+offset (foundation-model cell embeddings being the obvious case) the sign is
+decided by the offset and nearly everything lands in one bucket.
+
 **Key parameters:**
 
 - *Number of tables (nt)*: The number of independent hash tables to generate.
   More tables improve recall at the cost of query time and memory.
-- *Number of bits (nb)*: The bit resolution of the hash functions. Higher values
-  create finer partitions but may reduce collision rates.
-- *Number probes (n)*: How many additional buckets to explore per given
-  hash table. A good heuristic tends to be `number of bits / 2` to
-  `number of bits`.
-- *Max candidates (s)*: The search budget limiting the number of candidates
-  examined. Set to 'auto' for full search or a fixed value (e.g., 5k) for faster
-  queries with lower recall.
+- *Number of bits (nb)*: The bit resolution of the hash functions, so `2^nb`
+  addressable buckets per table. Higher values create finer partitions but may
+  reduce collision rates. Capped at 20, since the bucket table is directly
+  addressed.
+- *Slot bits (q)*: How many bits each quantised projection contributes, which
+  fixes the projections per table at `nb / q`. At `q=1` a projection is a single
+  bit, the sign against its median, which is the angular family cosine wants. At
+  `q>=2` it is quantised into `2^q` levels instead, which makes the hash
+  sensitive to vector magnitude. Squared Euclidean needs that, because distance
+  on unnormalised vectors is driven by magnitude as much as by direction.
+  Defaults to 1 for cosine and 2 for Euclidean. Pushing it higher is usually a
+  loss: it starves multi-probe of projections to perturb.
+- *Number probes (n)*: How many additional buckets to explore per hash table.
+  A probe shifts one projection into an adjacent slot, ordered by how close the
+  query sits to the boundary it crosses, so the most uncertain projection moves
+  first. There are `2 * nb / q` single-slot shifts available; anything past that
+  starts combining pairs. `nb / q` is a good starting point.
+- *Max candidates (s)*: The search budget, counted as unique candidates scored
+  across all tables and probes. Set to 'auto' for full search or a fixed value
+  (e.g., 2k) for faster queries with lower recall.
 
 <details>
 <summary><b>LSH - Euclidean (Gaussian)</b>:</summary>
@@ -847,24 +867,6 @@ Self is queried with `ef_search=75` (default value).
 <!-- BENCH:vamana:euclidean:cell:128 -->
 </code></pre>
 </details>
-
-## Conclusions
-
-In terms of choice of the index, it really depends on your use case, underlying
-data and the constraints you are facing. The tree-based version tend to work
-well in typical small data cases with ≤500,000 samples and lower dimensionality.
-They build fast and can query fast here. With more dimensions, they suffer more
-from the curse of dimensionality. LSH is overall one of the weaker indices
-here. Build times are very fast, but pending underlying structure of your data,
-a lot of candidates might have to be evaluated. IVF is excellent and it is not
-surprising that it is often used and can also be very easily combined with
-different quantisations. The graph-based ones are overall excellent. HNSW
-struggles with strongly clustered data, but shines with other data structures.
-Vamana and HNSW can take longer when increasing the edge numbers to build for
-more precision. If you are more interested in high fidelity queries with high
-speed, these are great choices. The NNDescent version provided in the crate was
-designed to be fast in index building and leverages Annoy under the hood over
-a Kd forest for better initialisation.
 
 ### Runtime info
 

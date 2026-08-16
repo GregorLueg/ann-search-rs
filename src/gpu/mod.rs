@@ -7,10 +7,12 @@
 //! reusable outside them.
 
 pub mod cagra_gpu_search;
+pub mod clustered_nndescent_gpu;
 pub mod dist_gpu;
 pub mod exhaustive_gpu;
 pub mod forest_gpu;
 pub mod ivf_gpu;
+pub mod k_means_gpu;
 pub mod nndescent_gpu;
 pub mod topk_gpu;
 
@@ -41,6 +43,19 @@ pub const DB_CHUNK_SIZE: usize = 16_384;
 /// computes the same answers. It matching Apple Silicon's plane size of 32 is
 /// coincidence.
 pub const WORKGROUP_SIZE_X: u32 = 32;
+
+/// Wide workgroup used by the k-means kernels.
+///
+/// The k-means assignment and segmented-reduction kernels are one thread per
+/// point over the whole dataset, where a wide cube hides memory latency and the
+/// segmented centroid update needs enough lanes to cover `dim` in one pass.
+///
+/// Most search kernels stay at [`WORKGROUP_SIZE_X`] because they run one cube
+/// per query and the work per cube does not fill more. The local join is the
+/// exception and sizes its own cube through `pick_local_join_cube`: idle
+/// lanes turned out to be free there, and widening it was worth roughly 2x.
+/// Treat "search kernels want 32" as a default, not a rule.
+pub const WORKGROUP_128: u32 = 128;
 
 /// DB vectors per thread in the register-tiled distance kernel.
 pub const TILE_D: usize = 4;
@@ -180,12 +195,164 @@ pub struct LocalJoinStaging {
     /// Whether every candidate fits in a single buffer, enabling the unblocked
     /// fast path.
     pub single_block: bool,
-    /// Scalar length of the first vector staging buffer.
-    pub buf_a_len: usize,
-    /// Scalar length of the second vector staging buffer. `1` (never touched)
-    /// on the single-block path.
-    pub buf_b_len: usize,
+    /// Length of the first vector staging buffer in `Vector<F, N>` elements,
+    /// i.e. `block * row_lines`. Lines, not scalars: the buffers are
+    /// vectorised, and a scalar count here would over-allocate by `LINE_SIZE`
+    /// and silently bust the shared-memory budget.
+    pub buf_a_lines: usize,
+    /// Length of the second vector staging buffer in `Vector<F, N>` elements.
+    /// `1` (never touched) on the single-block path.
+    pub buf_b_lines: usize,
+    /// Stride between staged candidate rows, in `Vector<F, N>` elements. This
+    /// is `dim_padded / LINE_SIZE` plus whatever `resolve_row_pad` adds to
+    /// offset consecutive rows across shared-memory banks.
+    pub row_lines: usize,
+    /// Length of the candidate-norm buffer: `max_cands` under cosine, `1`
+    /// otherwise. Euclidean never reads it, so allocating it at full width
+    /// would spend shared memory the vector staging wants.
+    pub norm_buf_len: usize,
+    /// Lines the pair-distance loop processes per unrolled step, and therefore
+    /// how many independent accumulator chains it keeps in flight.
+    pub line_unroll: usize,
+    /// Cube extent along the candidate-`j` axis.
+    pub cube_x: u32,
+    /// Cube extent along the candidate-`i` axis.
+    pub cube_y: u32,
 }
+
+/// Cube shape for the local join.
+///
+/// The kernel is latency bound and its shared footprint sits near the whole
+/// device budget, so exactly one cube is resident per core and the cube width
+/// *is* the resident thread count. Shared memory is per cube, so widening costs
+/// no footprint.
+///
+/// The shape is deliberately **not** a function of `block`. The obvious rule,
+/// never dispatch more threads than the `block * block` pair slab has slots,
+/// was measured and is wrong: 128 threads wins at dim 1024 where the slab holds
+/// nine slots and 119 of 128 lanes retire immediately. Idle lanes are free; the
+/// SIMD groups they sit in are what hides memory latency.
+///
+/// ### Params
+///
+/// * `limits` - Device limits from `GpuLimits::from_client`
+///
+/// ### Returns
+///
+/// Cube extent as `(x, y)`, candidate `j` on x and candidate `i` on y. Normally
+/// `x >= y`, so one plane spans few distinct rows of the `i` operand; a device
+/// with a small `max_cube_dim.0` can invert that when x is clamped, which costs
+/// locality but stays legal and correct.
+fn pick_local_join_cube(limits: &GpuLimits) -> (u32, u32) {
+    // Round the device's unit budget down to a power of two so the squarish
+    // split below stays exact.
+    let mut unit_cap = limits.max_units_per_cube.max(1);
+    if !unit_cap.is_power_of_two() {
+        unit_cap = unit_cap.next_power_of_two() / 2;
+    }
+    let threads = (LOCAL_JOIN_THREADS as u32)
+        .min(unit_cap)
+        .max(WORKGROUP_SIZE_X.min(unit_cap));
+
+    let mut x = 1u32;
+    while x * x < threads {
+        x *= 2;
+    }
+    let x = x.min(limits.max_cube_dim.0).max(1);
+    let y = (threads / x).min(limits.max_cube_dim.1).max(1);
+    (x, y)
+}
+
+/// Threads per local-join cube.
+///
+/// Swept on an M1 Max at n=25k, `build_k=45`, min-of-15, in milliseconds:
+///
+/// | dim | 8x4 (32) | 8x8 (64) | 16x8 (128) | 16x16 (256) |
+/// |---|---|---|---|---|
+/// | 128 | 55.9 | 35.7 | **28.4** | 38.9 |
+/// | 256 | 98.0 | 59.4 | **49.1** | 61.8 |
+/// | 512 | 224.2 | 127.7 | **117.3** | 175.3 |
+/// | 1024 | 862.7 | 690.1 | **627.2** | 1100 |
+///
+/// 128 wins at every width and 256 regresses, which is the register-pressure
+/// edge again: each thread carries [`LOCAL_JOIN_LINE_UNROLL`] vector
+/// accumulators and that does not shrink as the cube grows.
+const LOCAL_JOIN_THREADS: usize = 128;
+
+/// Unroll depth for the local join's pair-distance loop.
+///
+/// The kernel is latency bound, so this is a real lever rather than a tidiness
+/// knob: it sets how many loads are in flight per thread. Both extremes were
+/// measured on an M1 Max at n=25k and both lose. Unrolling the whole row emits
+/// `dim_padded` statements at each of three call sites and costs ~20% at dim
+/// 1024; not unrolling at all costs ~20% at dim 64.
+///
+/// Sweep this rather than inheriting it. The knee has moved between kernels in
+/// this crate before.
+///
+/// ### Params
+///
+/// * `dim_lines` - Number of `Vector<F, N>` elements per vector row
+///
+/// ### Returns
+///
+/// Lines per unrolled step, at least 1 and never more than the row length.
+fn resolve_line_unroll(dim_lines: usize) -> usize {
+    LOCAL_JOIN_LINE_UNROLL.min(dim_lines).max(1)
+}
+
+/// Padding for the local join's shared row stride, in `Vector<F, N>` elements.
+///
+/// Threads holding different candidate rows read the same line at the same
+/// time, so an unpadded stride puts them all in the same shared-memory bank
+/// group. One line of padding walks consecutive rows across banks instead.
+///
+/// It only pays while there are enough rows staged to conflict, which is why
+/// this is a function of the row length rather than a constant. Measured on an
+/// M1 Max at n=25k, min-of-15, padded against unpadded:
+///
+/// | dim | block | build_k 45 | build_k 64 |
+/// |---|---|---|---|
+/// | 128 | 29 | -4.7% | -0.6% |
+/// | 256 | 15 | -7.1% | **-15.3%** |
+/// | 512 | 7 | +1.8% | +3.0% |
+/// | 1024 | 3 | **+29.4%** | **+33.0%** |
+///
+/// Past dim 256 the shared budget holds so few candidates that there is little
+/// conflict left to remove, and the odd stride costs more than it saves.
+///
+/// ### Params
+///
+/// * `dim_lines` - Number of `Vector<F, N>` elements per vector row
+///
+/// ### Returns
+///
+/// Lines of padding to add to the row stride.
+fn resolve_row_pad(dim_lines: usize) -> usize {
+    if dim_lines <= LOCAL_JOIN_PAD_MAX_LINES {
+        1
+    } else {
+        0
+    }
+}
+
+/// Longest row, in lines, that still benefits from `resolve_row_pad`.
+const LOCAL_JOIN_PAD_MAX_LINES: usize = 64;
+
+/// Default unroll depth handed to `resolve_line_unroll`.
+///
+/// Swept on an M1 Max at n=25k, `build_k=45`, min-of-15, in milliseconds:
+///
+/// | dim | 1 | 2 | 4 | 8 | 16 |
+/// |---|---|---|---|---|---|
+/// | 64 | 68.7 | 58.5 | 51.3 | **47.9** | 51.3 |
+/// | 128 | 114.2 | 88.6 | 81.6 | **74.0** | 141.3 |
+/// | 1024 | 3652 | 2398 | 1956 | **1575** | 3661 |
+///
+/// 8 wins at every width. 16 falls off a cliff at dim 128 and above, which is
+/// the register-pressure edge: 16 `Vector<F, N>` accumulators plus their
+/// in-flight operands spill, and a spilled register array is global memory.
+const LOCAL_JOIN_LINE_UNROLL: usize = 8;
 
 /// Per-cube shared-memory overhead of the local-join kernel that is *not* the
 /// staged vectors.
@@ -193,13 +360,65 @@ pub struct LocalJoinStaging {
 /// `shared_compact` holds two u32s, `shared_rev_count` one.
 const LOCAL_JOIN_FIXED_BYTES: usize = 3 * 4;
 
+/// Per-cube shared-memory footprint of the local-join kernel.
+///
+/// One formula, so the kernel, the planner, the tests and the benches cannot
+/// drift apart. A footprint over the device budget makes the dispatch do
+/// nothing and report no error, so this is the number every one of them has to
+/// agree on.
+///
+/// ### Params
+///
+/// * `plan` - Staging plan under test
+/// * `max_cands` - Maximum candidates per node, i.e. `2 * build_k`
+/// * `elem_bytes` - Size of the float element type in bytes
+///
+/// ### Returns
+///
+/// Total bytes of shared memory one cube allocates.
+pub fn local_join_smem_bytes(
+    plan: &LocalJoinStaging,
+    max_cands: usize,
+    elem_bytes: usize,
+) -> usize {
+    local_join_meta_bytes(max_cands, plan.norm_buf_len, elem_bytes)
+        + (plan.buf_a_lines + plan.buf_b_lines) * LINE_SIZE * elem_bytes
+}
+
+/// Shared-memory the local join spends on per-candidate scalars.
+///
+/// `shared_pids` and `shared_is_new` hold a u32 each, `shared_thresh` a float,
+/// and `shared_norms` a float per candidate under cosine only. All four are
+/// indexed by absolute candidate id and are therefore never blocked.
+///
+/// ### Params
+///
+/// * `max_cands` - Maximum candidates per node, i.e. `2 * build_k`
+/// * `norm_buf_len` - Length of the candidate-norm buffer
+/// * `elem_bytes` - Size of the float element type in bytes
+///
+/// ### Returns
+///
+/// Bytes of shared memory the non-vector staging occupies.
+fn local_join_meta_bytes(max_cands: usize, norm_buf_len: usize, elem_bytes: usize) -> usize {
+    max_cands * (2 * 4 + elem_bytes) + norm_buf_len * elem_bytes + LOCAL_JOIN_FIXED_BYTES
+}
+
 /// Plan how the NNDescent local join stages candidate vectors in shared memory.
+///
+/// Also picks the launch geometry and the two tuning knobs that go with it, so
+/// every device-dependent decision the kernel makes lives in one pure function
+/// of [`GpuLimits`]: the cube shape (`pick_local_join_cube`), the pair-loop
+/// unroll depth (`resolve_line_unroll`) and the shared row padding
+/// (`resolve_row_pad`).
 ///
 /// ### Params
 ///
 /// * `dim_padded` - Padded embedding dimensionality (multiple of `LINE_SIZE`)
 /// * `max_cands` - Maximum candidates per node, i.e. `2 * build_k`
 /// * `elem_bytes` - Size of the float element type in bytes
+/// * `use_cosine` - Whether the kernel takes its cosine arm, which is the only
+///   one that stages candidate norms
 /// * `limits` - Device limits from `GpuLimits::from_client`
 ///
 /// ### Returns
@@ -210,14 +429,16 @@ pub fn plan_local_join_staging(
     dim_padded: usize,
     max_cands: usize,
     elem_bytes: usize,
+    use_cosine: bool,
     limits: &GpuLimits,
 ) -> Result<LocalJoinStaging, AnnSearchErrors> {
     let max_shared_bytes = limits.max_shared_bytes;
 
-    // shared_pids + shared_is_new (u32 each) + shared_norms (F), all indexed by
-    // absolute candidate id and therefore never blocked.
-    let metadata_bytes = max_cands * (2 * 4 + elem_bytes) + LOCAL_JOIN_FIXED_BYTES;
-    let vec_bytes = dim_padded * elem_bytes;
+    let norm_buf_len = if use_cosine { max_cands } else { 1 };
+    let metadata_bytes = local_join_meta_bytes(max_cands, norm_buf_len, elem_bytes);
+    let dim_lines = dim_padded / LINE_SIZE;
+    let row_lines = dim_lines + resolve_row_pad(dim_lines);
+    let vec_bytes = row_lines * LINE_SIZE * elem_bytes;
 
     let avail = max_shared_bytes.saturating_sub(metadata_bytes);
     if avail < 2 * vec_bytes {
@@ -228,22 +449,39 @@ pub fn plan_local_join_staging(
         });
     }
 
-    if max_cands * vec_bytes <= avail {
+    // The dummy `buf_b_lines: 1` below is still an allocation, so it has to be
+    // admitted here too. It is one line rather than one scalar now that the
+    // buffers are vectorised, and an unbudgeted allocation is a dispatch that
+    // silently does nothing.
+    let dummy_b_bytes = LINE_SIZE * elem_bytes;
+    if max_cands * vec_bytes + dummy_b_bytes <= avail {
+        let (cube_x, cube_y) = pick_local_join_cube(limits);
         return Ok(LocalJoinStaging {
             block: max_cands,
             single_block: true,
-            buf_a_len: max_cands * dim_padded,
-            buf_b_len: 1,
+            buf_a_lines: max_cands * row_lines,
+            buf_b_lines: 1,
+            row_lines,
+            norm_buf_len,
+            line_unroll: resolve_line_unroll(dim_lines),
+            cube_x,
+            cube_y,
         });
     }
 
     // Two buffers live simultaneously on the blocked path.
     let block = (avail / (2 * vec_bytes)).min(max_cands).max(1);
+    let (cube_x, cube_y) = pick_local_join_cube(limits);
     Ok(LocalJoinStaging {
         block,
         single_block: false,
-        buf_a_len: block * dim_padded,
-        buf_b_len: block * dim_padded,
+        buf_a_lines: block * row_lines,
+        buf_b_lines: block * row_lines,
+        row_lines,
+        norm_buf_len,
+        line_unroll: resolve_line_unroll(dim_lines),
+        cube_x,
+        cube_y,
     })
 }
 
@@ -451,14 +689,152 @@ mod tests {
                     max_shared_bytes: shared,
                     ..apple()
                 };
-                for dim in [32usize, 128, 512] {
-                    let plan = plan_local_join_staging(dim, 90, elem, &l).unwrap();
-                    let meta = 90 * (2 * 4 + elem) + LOCAL_JOIN_FIXED_BYTES;
-                    let used = meta + (plan.buf_a_len + plan.buf_b_len) * elem;
-                    assert!(used <= shared, "over budget: {shared}/{elem}/{dim}");
+                for dim in [32usize, 64, 128, 256, 512, 1024, 2048] {
+                    for max_cands in [60usize, 90, 128] {
+                        for cosine in [false, true] {
+                            let Ok(plan) =
+                                plan_local_join_staging(dim, max_cands, elem, cosine, &l)
+                            else {
+                                continue;
+                            };
+                            let tag = format!("{shared}/{elem}/{dim}/{max_cands}/{cosine}");
+
+                            assert!(
+                                local_join_smem_bytes(&plan, max_cands, elem) <= shared,
+                                "over budget: {tag}"
+                            );
+
+                            // Lengths are in lines, not scalars. Mixing the two
+                            // up over-allocates by LINE_SIZE, which busts the
+                            // budget and makes the dispatch silently do
+                            // nothing, so assert the unit and not just the
+                            // total.
+                            assert_eq!(plan.buf_a_lines % plan.row_lines, 0, "ragged buf_a: {tag}");
+                            assert_eq!(
+                                plan.buf_a_lines / plan.row_lines,
+                                plan.block,
+                                "buf_a rows: {tag}"
+                            );
+                            assert!(
+                                plan.row_lines >= dim / LINE_SIZE,
+                                "row stride shorter than the row: {tag}"
+                            );
+                            assert!(plan.block >= 1 && plan.block <= max_cands, "block: {tag}");
+
+                            assert_eq!(
+                                plan.single_block,
+                                plan.block == max_cands,
+                                "flag disagrees with block: {tag}"
+                            );
+                            assert_eq!(
+                                plan.buf_b_lines == 1,
+                                plan.single_block,
+                                "buf_b must be the dummy iff single-block: {tag}"
+                            );
+
+                            assert_eq!(
+                                plan.norm_buf_len,
+                                if cosine { max_cands } else { 1 },
+                                "norm buffer: {tag}"
+                            );
+
+                            // A cube over a device limit is a dispatch that
+                            // does nothing and reports no error.
+                            let threads = plan.cube_x * plan.cube_y;
+                            assert!(threads <= l.max_units_per_cube, "cube units: {tag}");
+                            assert!(plan.cube_x <= l.max_cube_dim.0, "cube x: {tag}");
+                            assert!(plan.cube_y <= l.max_cube_dim.1, "cube y: {tag}");
+                            // x-major except when x itself is clamped by a
+                            // narrow device, which is the one legal inversion.
+                            assert!(
+                                plan.cube_x >= plan.cube_y || plan.cube_x == l.max_cube_dim.0,
+                                "cube not x-major: {tag}"
+                            );
+                            assert!(threads.is_power_of_two(), "cube not a power of two: {tag}");
+
+                            assert!(plan.line_unroll >= 1, "unroll: {tag}");
+                            assert!(
+                                plan.line_unroll <= dim / LINE_SIZE,
+                                "unroll past the row: {tag}"
+                            );
+                        }
+                    }
                 }
             }
         }
+    }
+
+    #[test]
+    fn test_plan_local_join_shrinks_monotonically() {
+        // Anything that makes a candidate more expensive must never buy a
+        // bigger block. These are the directions a retune could silently
+        // invert.
+        for dim in [128usize, 256, 512, 1024] {
+            let big = plan_local_join_staging(dim, 90, 4, false, &apple()).unwrap();
+
+            let half = GpuLimits {
+                max_shared_bytes: apple().max_shared_bytes / 2,
+                ..apple()
+            };
+            let smaller = plan_local_join_staging(dim, 90, 4, false, &half).unwrap();
+            assert!(
+                smaller.block <= big.block,
+                "half budget grew block at {dim}"
+            );
+
+            let f64_plan = plan_local_join_staging(dim, 90, 8, false, &apple()).unwrap();
+            assert!(f64_plan.block <= big.block, "f64 grew block at {dim}");
+
+            let cos = plan_local_join_staging(dim, 90, 4, true, &apple()).unwrap();
+            assert!(cos.block <= big.block, "cosine grew block at {dim}");
+        }
+    }
+
+    #[test]
+    fn test_plan_local_join_apple_table_is_unchanged() {
+        // The block sizes and launch geometry the kernel's measured speedups
+        // were scored against. Changing them is a deliberate retune, not a
+        // drive-by: the cube width and unroll depth were each swept, and both
+        // regress by ~2x one step past the chosen value.
+        for (dim, block, single) in [
+            (64usize, 90usize, true),
+            (128, 29, false),
+            (256, 15, false),
+            (512, 7, false),
+            (1024, 3, false),
+        ] {
+            let plan = plan_local_join_staging(dim, 90, 4, false, &apple()).unwrap();
+            assert_eq!(plan.block, block, "block moved at dim {dim}");
+            assert_eq!(plan.single_block, single, "path moved at dim {dim}");
+            assert_eq!(
+                (plan.cube_x, plan.cube_y),
+                (16, 8),
+                "cube moved at dim {dim}"
+            );
+            assert_eq!(plan.line_unroll, 8, "unroll moved at dim {dim}");
+        }
+    }
+
+    #[test]
+    fn test_plan_local_join_cube_shrinks_on_a_narrow_device() {
+        // A device that cannot host 128 units per cube must get a legal cube,
+        // not a dispatch that silently does nothing.
+        let narrow = GpuLimits {
+            max_units_per_cube: 64,
+            max_cube_dim: (64, 64, 64),
+            ..apple()
+        };
+        let plan = plan_local_join_staging(128, 90, 4, false, &narrow).unwrap();
+        assert!(plan.cube_x * plan.cube_y <= 64);
+        assert!(plan.cube_x >= plan.cube_y);
+    }
+
+    #[test]
+    fn test_plan_local_join_errors_only_past_the_boundary() {
+        // Two f32 vectors plus the metadata have to fit. At 32 KiB and 90
+        // candidates, 2048 is the last width that does and 4096 is not.
+        assert!(plan_local_join_staging(2048, 90, 4, false, &apple()).is_ok());
+        assert!(plan_local_join_staging(4096, 90, 4, false, &apple()).is_err());
     }
 
     #[test]

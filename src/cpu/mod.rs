@@ -4,7 +4,8 @@
 //! Provides:
 //!
 //! - Three tree-based versions: Annoy (memory-based), Kd Forest and BallTree.
-//! - Two clustering-based versions: IVF and LSH (multi-probe) version
+//! - Three clustering-based versions: IVF, SOAR (IVF with spilling) and LSH
+//!   (multi-probe) version
 //! - Three graph-based versions: Vanama (memory-based version), HNSW and
 //!   NNDescent
 //!
@@ -21,4 +22,5 @@ pub mod lsh;
 pub mod nndescent;
 pub mod nsg;
 pub mod rnn_descent;
+pub mod soar;
 pub mod vamana;

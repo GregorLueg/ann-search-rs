@@ -9,13 +9,13 @@
 
 use cubecl::frontend::{Atomic, SharedMemory};
 use cubecl::prelude::*;
+use cubecl_utils_rs::prelude::*;
 use rand::rngs::SmallRng;
 use rand::{Rng, SeedableRng};
 use rayon::prelude::*;
 use std::cmp::Reverse;
 use std::collections::BinaryHeap;
 use std::time::Instant;
-use cubecl_utils_rs::prelude::*;
 
 use crate::gpu::nndescent_gpu::{merge_proposals, reset_proposals, MAX_PROPOSALS};
 use crate::gpu::*;
@@ -37,25 +37,6 @@ type TreeResults<T> = Vec<(Vec<u32>, Option<Vec<Vec<T>>>, Option<Vec<Vec<T>>>)>;
 ////////////////////
 // Kernel helpers //
 ////////////////////
-
-/// Single xorshift step used to generate random node offsets during
-/// reservoir sampling.
-///
-/// ### Params
-///
-/// * `state` - Current RNG state (must be non-zero)
-///
-/// ### Returns
-///
-/// Next RNG state
-#[cube]
-fn xorshift32(state: u32) -> u32 {
-    let mut x = state;
-    x ^= x << 13;
-    x ^= x >> 17;
-    x ^= x << 5;
-    x
-}
 
 /////////////
 // Kernels //
@@ -225,12 +206,6 @@ fn partition_points<F: CubeclFloat>(
 /// Maximum points per leaf, capped at 256, or `DimTooHighForSharedMemory` when
 /// fewer than two points fit. Two is the floor because the kernel computes
 /// pairwise distances and a leaf of one has no pairs.
-///
-/// ### Note
-///
-/// This used to clamp the lower bound to two rather than failing, which meant
-/// that above roughly `dim_padded = 4096` on a 32 KiB device it returned a leaf
-/// size whose staging did not fit. The kernel then silently did no work.
 fn compute_max_leaf_size(
     dim_padded: usize,
     elem_bytes: usize,
@@ -258,7 +233,11 @@ fn compute_max_leaf_size(
 ///
 /// One workgroup per leaf. Loads leaf vectors into scalar shared memory,
 /// computes C(leaf_size, 2) pairwise distances, and writes proposals via
-/// atomics. Overflow beyond `max_proposals` is handled via reservoir sampling.
+/// atomics. Overflow beyond `max_proposals` is dropped: a proposal is an
+/// (index, distance) pair written as two separate stores, so a reservoir
+/// sample that overwrites an already-claimed slot lets two threads interleave
+/// their stores and pair one thread's index with the other's distance. The
+/// atomic slot claim is the only thing that keeps the two halves together.
 ///
 /// ### Params
 ///
@@ -363,12 +342,6 @@ pub fn leaf_pairwise_proposals<F: CubeclFloat, N: Size>(
 
     let k = graph_dist.shape(1usize);
 
-    // Walk the upper triangle by row rather than by flat pair index. The old
-    // form decoded a flat index with a `while rem >= step` loop that ran up to
-    // `leaf_size` times *per pair per thread*: at leaf_size 124 that is ~29k
-    // serial steps per thread against ~15k FMAs of actual distance work, so the
-    // indexing cost more than the computation. Striding rows by
-    // WORKGROUP_SIZE_X costs some load imbalance and removes the decode.
     let mut ii = tx as usize;
 
     while ii < leaf_size as usize {
@@ -405,13 +378,6 @@ pub fn leaf_pairwise_proposals<F: CubeclFloat, N: Size>(
                         let off = pid_i as usize * max_proposals as usize + slot as usize;
                         prop_idx[off] = pid_j;
                         prop_dist[off] = dist;
-                    } else {
-                        let rand = xorshift32(pid_i ^ slot ^ pid_j) % (slot + 1u32);
-                        if rand < max_proposals {
-                            let off = pid_i as usize * max_proposals as usize + rand as usize;
-                            prop_idx[off] = pid_j;
-                            prop_dist[off] = dist;
-                        }
                     }
                 }
 
@@ -422,13 +388,6 @@ pub fn leaf_pairwise_proposals<F: CubeclFloat, N: Size>(
                         let off = pid_j as usize * max_proposals as usize + slot as usize;
                         prop_idx[off] = pid_i;
                         prop_dist[off] = dist;
-                    } else {
-                        let rand = xorshift32(pid_j ^ slot ^ pid_i) % (slot + 1u32);
-                        if rand < max_proposals {
-                            let off = pid_j as usize * max_proposals as usize + rand as usize;
-                            prop_idx[off] = pid_i;
-                            prop_dist[off] = dist;
-                        }
                     }
                 }
             }
@@ -656,10 +615,13 @@ impl<T: AnnSearchFloat> ForestRouter<T> {
 
 /// Build the initial kNN graph via GPU random partition forest.
 ///
-/// Tree construction (dot products + partitioning) runs entirely on CPU
-/// with rayon parallelism. Only the expensive leaf pairwise distance
-/// computation and proposal merge runs on GPU. This eliminates all per-level
-/// GPU sync overhead.
+/// Split host/device. Every level's random projection is a function of the
+/// tree seed and the level index alone, so all `max_depth` projections are
+/// generated upfront and their dot products come off the device in one
+/// `compute_dot_products_multi` launch per tree: one readback per tree rather
+/// than one launch plus one blocking readback per level. Medians and the
+/// partition scatter then run on the host under rayon, and the leaf pairwise
+/// distances plus the proposal merge go back to the device.
 ///
 /// ### Params
 ///
@@ -673,8 +635,6 @@ impl<T: AnnSearchFloat> ForestRouter<T> {
 /// * `prop_count_gpu` - Atomic proposal counter scratch buffer `[n]`
 /// * `update_counter_gpu` - Global update counter used by
 ///   `merge_proposals` `[1]`
-/// * `vectors_flat` - CPU-side flattened vector data `[n * dim]`; used for
-///   dot product and median computation during tree construction
 /// * `n` - Number of points
 /// * `dim` - Original (unpadded) vector dimensionality
 /// * `dim_padded` - Vector dimensionality padded to a multiple of `LINE_SIZE`
@@ -685,6 +645,12 @@ impl<T: AnnSearchFloat> ForestRouter<T> {
 ///   Euclidean
 /// * `verbose` - Print timing information for each phase
 /// * `client` - GPU compute client
+///
+/// ### Returns
+///
+/// A [`ForestRouter`] holding the projections and medians of the first few
+/// trees, for query-time entry-point routing. The graph itself lands in
+/// `graph_idx_gpu` / `graph_dist_gpu` in place.
 #[allow(clippy::too_many_arguments)]
 pub fn gpu_forest_init<T, R>(
     vectors_gpu: &GpuTensor<R, T>,
@@ -715,7 +681,7 @@ where
 
     let max_leaf_size = compute_max_leaf_size(dim_padded, size_of::<T>(), &limits)?;
 
-    // cecouple the depth calculation to target leaves of ~64
+    // Decouple the depth calculation to target leaves of ~64
     let target_leaf_size = 64.0;
     let max_depth = if n as f64 <= target_leaf_size {
         0
@@ -742,7 +708,6 @@ where
     let (dot_grid_x, dot_grid_y) = grid_2d(dot_grid, &limits)?;
 
     // parallelise the outer tree loop to overlap GPU execution with CPU memory reads
-    // parallelise the outer tree loop to overlap GPU execution with CPU memory reads
     let all_tree_results: TreeResults<T> = (0..n_trees)
         .into_par_iter()
         .map(|tree_idx| {
@@ -760,10 +725,7 @@ where
             } else {
                 None
             };
-            // All projections are known upfront: each is a function of the
-            // tree seed and the level index only, never of the partitioning.
-            // So they are generated in one go and applied in a single kernel,
-            // instead of one launch plus one blocking readback per level.
+
             let mut projections_flat = vec![T::zero(); max_depth * dim_padded];
             let mut level_vecs: Vec<Vec<T>> = Vec::with_capacity(max_depth);
             for level in 0..max_depth {

@@ -169,6 +169,10 @@ where
     /// from query subvectors to all centroids, then computes distances
     /// via table lookups. Performs exhaustive search over all vectors.
     ///
+    /// The query is rotated by the learned OPQ rotation first, because the
+    /// codes and codebooks live in that space. `R` is orthogonal, so
+    /// `||q - x|| == ||R q - R x||`, but only when both sides are rotated.
+    ///
     /// ### Params
     ///
     /// * `query_vec` - Query vector
@@ -189,7 +193,10 @@ where
             normalise_vector(&mut query_vec);
         }
 
-        let lookup_tables = self.build_lookup_tables_direct(&query_vec);
+        // Codes are OPQ-encoded, so the codebooks live in the rotated space and
+        // the lookup table has to be built there too. R is orthogonal, so
+        // ||q - x|| == ||R q - R x||, but only if both sides are rotated.
+        let lookup_tables = self.build_lookup_tables_direct(&self.codebook.rotate(&query_vec));
 
         let mut heap: BinaryHeap<(OrderedFloat<T>, usize)> = BinaryHeap::with_capacity(k + 1);
 
@@ -321,6 +328,8 @@ where
 mod tests {
     use super::*;
     use faer::Mat;
+    use rand::rngs::StdRng;
+    use rand::{Rng, SeedableRng};
 
     fn create_simple_dataset() -> Mat<f32> {
         let mut data = Vec::new();
@@ -528,10 +537,73 @@ mod tests {
         .unwrap();
 
         let query: Vec<f32> = (0..32).map(|x| x as f32 * 0.01).collect();
-        let table = index.build_lookup_tables_direct(&query);
+        // Rotated, as the query path does: the codebooks live in R-space.
+        let table = index.build_lookup_tables_direct(&index.codebook.rotate(&query));
 
         // M * n_centroids = 8 * 4
         assert_eq!(table.len(), 32);
+    }
+
+    /// `query` must build its lookup table in the rotated space.
+    ///
+    /// Codes are `PQ(R x)`, so a table built from the *unrotated* query scores
+    /// in the wrong basis. That still yields non-negative distances of the right
+    /// length, which is why the shape assertions elsewhere in this module cannot
+    /// catch it. This goes through the public query path and asserts a stored
+    /// vector retrieves itself: under the unrotated table the per-subspace
+    /// distances are meaningless and self-retrieval collapses.
+    #[test]
+    fn test_opq_query_scores_in_the_rotated_space() {
+        // Spread points rather than tight blobs, and a codebook fine enough to
+        // tell them apart. With coarse codes every point in a cluster shares a
+        // code and top-1 is chance, which would make this test meaningless
+        // whichever basis the table is built in.
+        let (n, dim) = (300usize, 32usize);
+        let mut rng = StdRng::seed_from_u64(7);
+        let flat: Vec<f32> = (0..n * dim).map(|_| rng.random_range(-1.0..1.0)).collect();
+        let data = Mat::from_fn(n, dim, |i, j| flat[i * dim + j]);
+
+        let index = ExhaustiveOpqIndex::build(
+            data.as_ref(),
+            8,
+            Dist::SquaredEuclidean,
+            Some(128),
+            Some(2),
+            42,
+            false,
+        )
+        .unwrap();
+
+        // Only meaningful if training actually moved R off the identity.
+        let probe: Vec<f32> = (0..dim).map(|x| x as f32 * 0.03).collect();
+        let moved = index
+            .codebook
+            .rotate(&probe)
+            .iter()
+            .zip(probe.iter())
+            .any(|(a, b)| (a - b).abs() > 1e-6);
+        assert!(moved, "rotation is the identity, test proves nothing");
+
+        let hits = (0..n)
+            .filter(|&i| {
+                let q = &flat[i * dim..(i + 1) * dim];
+                index
+                    .query(q, 1)
+                    .map(|(ids, _)| ids[0] == i)
+                    .unwrap_or(false)
+            })
+            .count();
+
+        // Measured on this fixture: 169/300 with the rotation, 11/300 without.
+        // 40% sits clear of both, so this fails loudly if the rotation is
+        // dropped from the query path again.
+        assert!(
+            hits * 10 >= n * 4,
+            "only {}/{} vectors retrieved themselves; the lookup table is \
+             probably being built in the unrotated basis",
+            hits,
+            n
+        );
     }
 
     #[test]
@@ -549,7 +621,8 @@ mod tests {
         .unwrap();
 
         let query: Vec<f32> = (0..32).map(|x| x as f32 * 0.01).collect();
-        let table = index.build_lookup_tables_direct(&query);
+        // Rotated, as the query path does: the codebooks live in R-space.
+        let table = index.build_lookup_tables_direct(&index.codebook.rotate(&query));
 
         let dist = index.compute_distance_adc(0, &table);
 

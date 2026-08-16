@@ -3,6 +3,10 @@
 //! All vector data remains GPU-resident throughout construction. The host
 //! loop only downloads a single u32 convergence counter per iteration.
 //!
+//! [`build_knn_graph_gpu`] is a thin wrapper over [`nndescent_core`], which
+//! owns that loop. The split exists so [`crate::gpu::clustered_nndescent_gpu`]
+//! can run the same loop once per cluster against a shared client.
+//!
 //! ## CubeCL 0.10 codegen workarounds
 //!
 //! Several constructs in this file look needlessly roundabout. They are not.
@@ -31,11 +35,11 @@
 
 use cubecl::frontend::{Atomic, CubePrimitive, Float, SharedMemory};
 use cubecl::prelude::*;
+use cubecl_utils_rs::prelude::*;
 use faer::MatRef;
 use rayon::prelude::*;
 use std::time::Instant;
 use thousands::*;
-use cubecl_utils_rs::prelude::*;
 
 use crate::cpu::vamana::compute_medoid;
 use crate::gpu::cagra_gpu_search::*;
@@ -51,11 +55,11 @@ use crate::utils::nndescent_utils::SENTINEL_PID;
 /// Max proposals per node per iteration. Overflow is silently dropped.
 pub const MAX_PROPOSALS: usize = 128;
 /// Default maximum number of NNDescent iterations
-const DEFAULT_MAX_ITERS: usize = 15;
+pub(crate) const DEFAULT_MAX_ITERS: usize = 15;
 /// Default convergence threshold (fraction of k*n edges updated)
-const DEFAULT_DELTA: f32 = 0.001;
+pub(crate) const DEFAULT_DELTA: f32 = 0.001;
 /// Default sampling rate for the local join
-const DEFAULT_RHO: f32 = 0.5;
+pub(crate) const DEFAULT_RHO: f32 = 0.5;
 
 ////////////////////
 // Kernel helpers //
@@ -175,6 +179,112 @@ fn dist_cosine<F: Float, N: Size>(
     F::new(1.0_f32) - dot / (norms[a as usize] * norms[b as usize])
 }
 
+/// Distance between two candidate rows already staged in shared memory.
+///
+/// Accumulates into `Vector<F, N>` lanes and reduces horizontally once per
+/// pair, rather than once per line. The obvious inner loop reduces every
+/// iteration, which throws the vectorisation away and leaves a
+/// `dim_padded`-long serial FP dependency chain the cube has too few threads to
+/// hide.
+///
+/// The line loop is unrolled `unroll` deep into that many independent
+/// accumulators. Both extremes measured badly. Unrolling the whole row, which
+/// is what this kernel did originally, emits `dim_padded` statements at each of
+/// three call sites and costs ~20% at dim 1024. Not unrolling at all leaves too
+/// few loads in flight for a latency-bound kernel and costs ~20% at dim 64. See
+/// [`resolve_line_unroll`] for the chosen depth.
+///
+/// ### Params
+///
+/// * `vecs_a` - Staging buffer holding the first row
+/// * `vecs_b` - Staging buffer holding the second row. The same buffer as
+///   `vecs_a` on the unblocked and diagonal paths
+/// * `norms` - Staged candidate norms, only read under cosine
+/// * `row_a` - Line offset of the first row within `vecs_a`
+/// * `row_b` - Line offset of the second row within `vecs_b`
+/// * `cand_a` - Absolute candidate id of the first row, for its norm
+/// * `cand_b` - Absolute candidate id of the second row, for its norm
+/// * `use_cosine` - Whether to compute cosine rather than squared Euclidean
+///   distance (comptime)
+/// * `dim_lines` - Number of `Vector<F, N>` elements per vector row (comptime)
+/// * `unroll` - Lines processed per unrolled step, and therefore the number of
+///   independent accumulators (comptime)
+///
+/// ### Returns
+///
+/// Squared Euclidean distance, or cosine distance in the range [0, 2].
+#[cube]
+#[allow(clippy::too_many_arguments)]
+fn staged_pair_dist<F: Float, N: Size>(
+    vecs_a: &SharedMemory<Vector<F, N>>,
+    vecs_b: &SharedMemory<Vector<F, N>>,
+    norms: &SharedMemory<F>,
+    row_a: usize,
+    row_b: usize,
+    cand_a: usize,
+    cand_b: usize,
+    #[comptime] use_cosine: bool,
+    #[comptime] dim_lines: usize,
+    #[comptime] unroll: usize,
+) -> F {
+    let lanes = LINE_SIZE;
+    let chunks = dim_lines / unroll;
+    let tail = dim_lines % unroll;
+
+    let mut accs = Array::<Vector<F, N>>::new(unroll);
+    #[unroll]
+    for u in 0..unroll {
+        accs[u] = Vector::<F, N>::new(F::new(0.0_f32));
+    }
+
+    for c in 0..chunks {
+        let base = c * unroll;
+        #[unroll]
+        for u in 0..unroll {
+            let va = vecs_a[row_a + base + u];
+            let vb = vecs_b[row_b + base + u];
+            if use_cosine {
+                accs[u] += va * vb;
+            } else {
+                let diff = va - vb;
+                accs[u] += diff * diff;
+            }
+        }
+    }
+
+    // Comptime tail for a row length that is not a whole number of steps.
+    #[unroll]
+    for t in 0..tail {
+        let off = chunks * unroll + t;
+        let va = vecs_a[row_a + off];
+        let vb = vecs_b[row_b + off];
+        if use_cosine {
+            accs[t] += va * vb;
+        } else {
+            let diff = va - vb;
+            accs[t] += diff * diff;
+        }
+    }
+
+    let mut total = Vector::<F, N>::new(F::new(0.0_f32));
+    #[unroll]
+    for u in 0..unroll {
+        total += accs[u];
+    }
+
+    let mut sum = F::new(0.0_f32);
+    #[unroll]
+    for lane in 0..lanes {
+        sum += total[lane];
+    }
+
+    let mut dist = sum;
+    if use_cosine {
+        dist = F::new(1.0_f32) - sum / (norms[cand_a] * norms[cand_b]);
+    }
+    dist
+}
+
 /////////////
 // Kernels //
 /////////////
@@ -197,7 +307,7 @@ fn dist_cosine<F: Float, N: Size>(
 /// * `n_pts` - Number of vectors
 /// * `seed` - Random seed for neighbour generation
 /// * `use_cosine` - Whether to use cosine distance instead of squared Euclidean
-/// * `dim_lines` - Number of `Line<F>` elements per vector row (comptime)
+/// * `dim_lines` - Number of `Vector<F, N>` elements per vector row (comptime)
 ///
 /// ### Returns
 ///
@@ -208,7 +318,7 @@ fn dist_cosine<F: Float, N: Size>(
 ///
 /// * `ABSOLUTE_POS_X` -> node index
 #[cube(launch_unchecked)]
-fn init_random_graph<F: Float, N: Size>(
+pub fn init_random_graph<F: Float, N: Size>(
     vectors: &Tensor<Vector<F, N>>,
     norms: &Tensor<F>,
     graph_idx: &mut Tensor<u32>,
@@ -348,35 +458,35 @@ pub fn build_reverse_candidates(
 /// Split out of `local_join_shared` because the blocked staging path evaluates
 /// pairs at three call sites (unblocked, diagonal block, off-diagonal block).
 ///
+/// Both thresholds arrive pre-read from `shared_thresh`. Fetching `pid_j`'s
+/// from global here instead would be one random global read per candidate pair,
+/// paid even by pairs the threshold test then rejects, on a kernel whose
+/// bottleneck is memory latency rather than traffic.
+///
 /// ### Params
 ///
-/// * `graph_dist` - Current kNN graph distances, used for the `pid_j` threshold
 /// * `prop_idx` - Output proposal indices, row-major `[n, max_proposals]`
 /// * `prop_dist` - Output proposal distances, matching layout to `prop_idx`
 /// * `prop_count` - Atomic per-node counter for proposal slots
 /// * `pid_i` - Point id of the first candidate
 /// * `pid_j` - Point id of the second candidate
-/// * `thresh_i` - `pid_i`'s worst current neighbour distance, hoisted by the
-///   caller out of its inner loop
+/// * `thresh_i` - `pid_i`'s worst current neighbour distance
+/// * `thresh_j` - `pid_j`'s worst current neighbour distance
 /// * `dist` - Distance between the two candidates
-/// * `k` - Degree of the build graph
 /// * `max_proposals` - Proposal buffer capacity per node (comptime)
 #[cube]
 #[allow(clippy::too_many_arguments)]
 fn emit_pair<F: Float>(
-    graph_dist: &Tensor<F>,
     prop_idx: &mut Tensor<u32>,
     prop_dist: &mut Tensor<F>,
     prop_count: &Tensor<Atomic<u32>>,
     pid_i: u32,
     pid_j: u32,
     thresh_i: F,
+    thresh_j: F,
     dist: F,
-    k: u32,
     #[comptime] max_proposals: u32,
 ) {
-    let thresh_j = graph_dist[pid_j as usize * k as usize + k as usize - 1usize];
-
     if dist < thresh_i {
         let slot_i = prop_count[pid_i as usize].fetch_add(1u32);
         if slot_i < max_proposals {
@@ -408,36 +518,54 @@ fn emit_pair<F: Float>(
 /// * `vectors` - Row-major vector matrix, line-vectorised along the feature dimension
 /// * `norms` - Pre-computed L2 norms (ignored when `use_cosine` is false)
 /// * `graph_idx` - Current kNN graph indices (with IS_NEW flag in MSB)
-/// * `graph_dist` - Current kNN graph distances (used for threshold filtering)
+/// * `graph_dist` - Current kNN graph distances. Each candidate's worst
+///   neighbour distance is staged into `shared_thresh` once per node and the
+///   pair loop reads it from there
 /// * `reverse_idx` - Reverse edge buffer from `build_reverse_candidates`
 /// * `reverse_count` - Number of valid reverse edges per node
 /// * `prop_idx` - Output proposal indices, row-major `[n, max_proposals]`
 /// * `prop_dist` - Output proposal distances, matching layout to `prop_idx`
 /// * `prop_count` - Atomic per-node counter for proposal slots
-/// * `n` - Number of nodes
+/// * `n_pts` - Number of nodes
 /// * `rho_thresh` - Sampling threshold (scaled to 16-bit range)
 /// * `iter_seed` - Per-iteration seed for deterministic sampling
 /// * `max_proposals` - Proposal buffer capacity per node (comptime)
 /// * `use_cosine` - Whether to use cosine distance (comptime)
-/// * `dim_lines` - Number of `Line<F>` elements per vector row (comptime)
+/// * `dim_lines` - Number of `Vector<F, N>` elements per vector row (comptime)
+/// * `row_lines` - Stride between staged rows in lines, i.e. `dim_lines` plus
+///   the bank-conflict padding (comptime)
 /// * `build_k` - Degree of the build graph (comptime)
 /// * `block` - Candidates staged per vector buffer (comptime)
 /// * `single_block` - Whether every candidate fits in one buffer (comptime)
-/// * `vec_buf_a` - Scalar length of the first vector buffer (comptime)
-/// * `vec_buf_b` - Scalar length of the second vector buffer (comptime)
+/// * `vec_buf_a` - Length of the first vector buffer in lines (comptime)
+/// * `vec_buf_b` - Length of the second vector buffer in lines (comptime)
+/// * `norm_buf_len` - Length of the candidate-norm buffer: `2 * build_k` under
+///   cosine, `1` otherwise (comptime)
+/// * `line_unroll` - Lines the pair-distance loop processes per unrolled step
+///   (comptime)
 ///
 /// ### Shared memory
 ///
-/// Candidate metadata (`shared_pids`, `shared_is_new`, `shared_norms`) is
-/// always staged in full and indexed by absolute candidate id. Only the
-/// vectors are blocked, because they dominate the footprint. Staging all of
-/// them at once busts the device limit past dim 128 at the default k, and the
-/// dispatch then silently does nothing. See `plan_local_join_staging`, which
-/// picks `block` and the buffer lengths.
+/// Candidate metadata (`shared_pids`, `shared_is_new`, `shared_thresh`, plus
+/// `shared_norms` under cosine) is always staged in full and indexed by
+/// absolute candidate id. Only the vectors are blocked, because they dominate
+/// the footprint. Staging all of them at once busts the device limit past dim
+/// 128 at the default k, and the dispatch then silently does nothing. See
+/// `plan_local_join_staging`, which picks `block` and the buffer lengths.
 ///
 /// ### Grid mapping
 ///
 /// * One workgroup (cube) per node
+/// * `UNIT_POS_X` -> candidate `j`, striding by `CUBE_DIM_X`
+/// * `UNIT_POS_Y` -> candidate `i`, striding by `CUBE_DIM_Y`
+/// * `UNIT_POS` -> flat id for the staging and metadata loops, which have no
+///   pair structure
+///
+/// The pair loops are two-dimensional rather than a walk over rows. At high
+/// `dim` the shared budget holds fewer candidates than the cube has threads
+/// (three at dim 1024 against 128 threads), so binding one thread to one row
+/// leaves almost every lane idle. `plan_local_join_staging` owns the cube
+/// shape.
 #[cube(launch_unchecked)]
 pub fn local_join_shared<F: Float, N: Size>(
     vectors: &Tensor<Vector<F, N>>,
@@ -455,35 +583,38 @@ pub fn local_join_shared<F: Float, N: Size>(
     #[comptime] max_proposals: u32,
     #[comptime] use_cosine: bool,
     #[comptime] dim_lines: usize,
+    #[comptime] row_lines: usize,
     #[comptime] build_k: usize,
     #[comptime] block: usize,
     #[comptime] single_block: bool,
     #[comptime] vec_buf_a: usize,
     #[comptime] vec_buf_b: usize,
+    #[comptime] norm_buf_len: usize,
+    #[comptime] line_unroll: usize,
 ) {
     let node = CUBE_POS_Y * CUBE_COUNT_X + CUBE_POS_X;
     if node >= n_pts {
         terminate!();
     }
 
-    let tx = UNIT_POS_X;
+    let tflat = UNIT_POS;
     let k = graph_idx.shape(1usize) as u32;
     let pid_mask = 0x7FFFFFFFu32;
 
     let max_cands_comp = build_k * 2usize;
-    let dim_scalars = dim_lines * 4usize;
 
-    let mut shared_vecs_a = SharedMemory::<F>::new(vec_buf_a);
-    let mut shared_vecs_b = SharedMemory::<F>::new(vec_buf_b);
+    let mut shared_vecs_a = SharedMemory::<Vector<F, N>>::new(vec_buf_a);
+    let mut shared_vecs_b = SharedMemory::<Vector<F, N>>::new(vec_buf_b);
     let mut shared_pids = SharedMemory::<u32>::new(max_cands_comp);
     let mut shared_is_new = SharedMemory::<u32>::new(max_cands_comp);
-    let mut shared_norms = SharedMemory::<F>::new(max_cands_comp);
+    let mut shared_norms = SharedMemory::<F>::new(norm_buf_len);
+    let mut shared_thresh = SharedMemory::<F>::new(max_cands_comp);
 
     // Compacted candidate count and whether any new candidates exist
     let mut shared_compact = SharedMemory::<u32>::new(2usize);
 
     let mut shared_rev_count = SharedMemory::<u32>::new(1usize);
-    if tx == 0u32 {
+    if tflat == 0u32 {
         let rc = reverse_count[node as usize];
         let mut clamped = rc;
         if rc > k {
@@ -496,7 +627,7 @@ pub fn local_join_shared<F: Float, N: Size>(
     let rev_k = shared_rev_count[0usize];
     let raw_total = k + rev_k;
 
-    let mut i_load = tx;
+    let mut i_load = tflat;
     while i_load < raw_total {
         #[allow(unused_assignments)]
         let mut entry = 0u32;
@@ -508,11 +639,11 @@ pub fn local_join_shared<F: Float, N: Size>(
 
         shared_pids[i_load as usize] = entry & pid_mask;
         shared_is_new[i_load as usize] = entry >> 31;
-        i_load += WORKGROUP_SIZE_X;
+        i_load += CUBE_DIM;
     }
     sync_cube();
 
-    if tx == 0u32 {
+    if tflat == 0u32 {
         let mut write = 0u32;
         let mut has_new = 0u32;
         let mut read = 0u32;
@@ -541,89 +672,80 @@ pub fn local_join_shared<F: Float, N: Size>(
         terminate!();
     }
 
-    if use_cosine {
-        let mut i_norm = tx;
-        while i_norm < total_cands {
-            shared_norms[i_norm as usize] = norms[shared_pids[i_norm as usize] as usize];
-            i_norm += WORKGROUP_SIZE_X;
+    let mut i_meta = tflat;
+    while i_meta < total_cands {
+        let pid = shared_pids[i_meta as usize];
+        shared_thresh[i_meta as usize] =
+            graph_dist[pid as usize * k as usize + k as usize - 1usize];
+        if use_cosine {
+            shared_norms[i_meta as usize] = norms[pid as usize];
         }
-        sync_cube();
+        i_meta += CUBE_DIM;
     }
+    sync_cube();
 
     if single_block {
         // -- Unblocked fast path --
         //
-        // Every candidate vector fits in buffer A, so one row-walk over the
-        // full candidate upper triangle. `shared_vecs_b` has length 1 and is
-        // never touched, so the footprint matches the pre-blocking kernel
-        // exactly.
-        let total_scalars = total_cands as usize * dim_scalars;
-        let mut idx_load = tx as usize;
-        while idx_load < total_scalars {
-            let n_idx = idx_load / dim_scalars;
-            let s_idx = idx_load % dim_scalars;
-            let line_idx = s_idx / 4usize;
-            let lane = s_idx % 4usize;
+        // Every candidate vector fits in buffer A, so the whole candidate upper
+        // triangle is walked in one pass with both operands read from A.
+        // `shared_vecs_b` is one line long and never touched.
+        let total_lines = total_cands as usize * dim_lines;
+        let mut idx_load = tflat as usize;
+        while idx_load < total_lines {
+            let n_idx = idx_load / dim_lines;
+            let line_idx = idx_load - n_idx * dim_lines;
             let pid = shared_pids[n_idx];
 
             if pid < n_pts {
-                let vec_offset = pid as usize * dim_lines + line_idx;
-                let line_val = vectors[vec_offset];
-                shared_vecs_a[idx_load] = line_val[lane];
+                shared_vecs_a[n_idx * row_lines + line_idx] =
+                    vectors[pid as usize * dim_lines + line_idx];
             }
-            idx_load += WORKGROUP_SIZE_X as usize;
+            idx_load += CUBE_DIM as usize;
         }
         sync_cube();
 
-        let mut i = tx as usize;
+        let mut i = UNIT_POS_Y as usize;
 
         while i < total_cands as usize {
             let is_new_i = shared_is_new[i] != 0u32;
             let pid_i = shared_pids[i];
-            let thresh_i = graph_dist[pid_i as usize * k as usize + k as usize - 1usize];
+            let thresh_i = shared_thresh[i];
 
-            let mut j = i + 1usize;
+            let mut j = i + 1usize + UNIT_POS_X as usize;
             while j < total_cands as usize {
                 let is_new_j = shared_is_new[j] != 0u32;
                 let pid_j = shared_pids[j];
 
                 if (is_new_i || is_new_j) && pid_i != pid_j {
-                    let mut sum = F::new(0.0_f32);
-                    #[unroll]
-                    for s in 0..dim_scalars {
-                        let va = shared_vecs_a[i * dim_scalars + s];
-                        let vb = shared_vecs_a[j * dim_scalars + s];
-
-                        if use_cosine {
-                            sum += va * vb;
-                        } else {
-                            let diff = va - vb;
-                            sum += diff * diff;
-                        }
-                    }
-
-                    let dist = if use_cosine {
-                        F::new(1.0_f32) - (sum / (shared_norms[i] * shared_norms[j]))
-                    } else {
-                        sum
-                    };
+                    let dist = staged_pair_dist::<F, N>(
+                        &shared_vecs_a,
+                        &shared_vecs_a,
+                        &shared_norms,
+                        i * row_lines,
+                        j * row_lines,
+                        i,
+                        j,
+                        use_cosine,
+                        dim_lines,
+                        line_unroll,
+                    );
 
                     emit_pair::<F>(
-                        graph_dist,
                         prop_idx,
                         prop_dist,
                         prop_count,
                         pid_i,
                         pid_j,
                         thresh_i,
+                        shared_thresh[j],
                         dist,
-                        k,
                         max_proposals,
                     );
                 }
-                j += 1usize;
+                j += CUBE_DIM_X as usize;
             }
-            i += WORKGROUP_SIZE_X as usize;
+            i += CUBE_DIM_Y as usize;
         }
     } else {
         // -- Blocked staging path --
@@ -646,76 +768,65 @@ pub fn local_join_shared<F: Float, N: Size>(
                 len_i = total_us - base_i;
             }
 
-            let scalars_i = len_i * dim_scalars;
-            let mut idx_a = tx as usize;
-            while idx_a < scalars_i {
-                let n_idx = idx_a / dim_scalars;
-                let s_idx = idx_a % dim_scalars;
-                let line_idx = s_idx / 4usize;
-                let lane = s_idx % 4usize;
+            let lines_i = len_i * dim_lines;
+            let mut idx_a = tflat as usize;
+            while idx_a < lines_i {
+                let n_idx = idx_a / dim_lines;
+                let line_idx = idx_a - n_idx * dim_lines;
                 let pid = shared_pids[base_i + n_idx];
 
                 if pid < n_pts {
-                    let vec_offset = pid as usize * dim_lines + line_idx;
-                    let line_val = vectors[vec_offset];
-                    shared_vecs_a[idx_a] = line_val[lane];
+                    shared_vecs_a[n_idx * row_lines + line_idx] =
+                        vectors[pid as usize * dim_lines + line_idx];
                 }
-                idx_a += WORKGROUP_SIZE_X as usize;
+                idx_a += CUBE_DIM as usize;
             }
             sync_cube();
 
             // Diagonal block: upper triangle within block bi, both operands in
             // buffer A.
-            let mut ii = tx as usize;
+            let mut ii = UNIT_POS_Y as usize;
             while ii < len_i {
                 let abs_i = base_i + ii;
                 let is_new_i = shared_is_new[abs_i] != 0u32;
                 let pid_i = shared_pids[abs_i];
-                let thresh_i = graph_dist[pid_i as usize * k as usize + k as usize - 1usize];
+                let thresh_i = shared_thresh[abs_i];
 
-                let mut jj = ii + 1usize;
+                let mut jj = ii + 1usize + UNIT_POS_X as usize;
                 while jj < len_i {
                     let abs_j = base_i + jj;
                     let is_new_j = shared_is_new[abs_j] != 0u32;
                     let pid_j = shared_pids[abs_j];
 
                     if (is_new_i || is_new_j) && pid_i != pid_j {
-                        let mut sum = F::new(0.0_f32);
-                        #[unroll]
-                        for s in 0..dim_scalars {
-                            let va = shared_vecs_a[ii * dim_scalars + s];
-                            let vb = shared_vecs_a[jj * dim_scalars + s];
-
-                            if use_cosine {
-                                sum += va * vb;
-                            } else {
-                                let diff = va - vb;
-                                sum += diff * diff;
-                            }
-                        }
-
-                        let dist = if use_cosine {
-                            F::new(1.0_f32) - (sum / (shared_norms[abs_i] * shared_norms[abs_j]))
-                        } else {
-                            sum
-                        };
+                        let dist = staged_pair_dist::<F, N>(
+                            &shared_vecs_a,
+                            &shared_vecs_a,
+                            &shared_norms,
+                            ii * row_lines,
+                            jj * row_lines,
+                            abs_i,
+                            abs_j,
+                            use_cosine,
+                            dim_lines,
+                            line_unroll,
+                        );
 
                         emit_pair::<F>(
-                            graph_dist,
                             prop_idx,
                             prop_dist,
                             prop_count,
                             pid_i,
                             pid_j,
                             thresh_i,
+                            shared_thresh[abs_j],
                             dist,
-                            k,
                             max_proposals,
                         );
                     }
-                    jj += 1usize;
+                    jj += CUBE_DIM_X as usize;
                 }
-                ii += WORKGROUP_SIZE_X as usize;
+                ii += CUBE_DIM_Y as usize;
             }
 
             let mut bj = bi + 1usize;
@@ -730,77 +841,65 @@ pub fn local_join_shared<F: Float, N: Size>(
                 // block pair is still reading it.
                 sync_cube();
 
-                let scalars_j = len_j * dim_scalars;
-                let mut idx_b = tx as usize;
-                while idx_b < scalars_j {
-                    let n_idx = idx_b / dim_scalars;
-                    let s_idx = idx_b % dim_scalars;
-                    let line_idx = s_idx / 4usize;
-                    let lane = s_idx % 4usize;
+                let lines_j = len_j * dim_lines;
+                let mut idx_b = tflat as usize;
+                while idx_b < lines_j {
+                    let n_idx = idx_b / dim_lines;
+                    let line_idx = idx_b - n_idx * dim_lines;
                     let pid = shared_pids[base_j + n_idx];
 
                     if pid < n_pts {
-                        let vec_offset = pid as usize * dim_lines + line_idx;
-                        let line_val = vectors[vec_offset];
-                        shared_vecs_b[idx_b] = line_val[lane];
+                        shared_vecs_b[n_idx * row_lines + line_idx] =
+                            vectors[pid as usize * dim_lines + line_idx];
                     }
-                    idx_b += WORKGROUP_SIZE_X as usize;
+                    idx_b += CUBE_DIM as usize;
                 }
                 sync_cube();
 
                 // Off-diagonal: every pair between block bi (buffer A) and
                 // block bj (buffer B).
-                let mut oi = tx as usize;
+                let mut oi = UNIT_POS_Y as usize;
                 while oi < len_i {
                     let abs_i = base_i + oi;
                     let is_new_i = shared_is_new[abs_i] != 0u32;
                     let pid_i = shared_pids[abs_i];
-                    let thresh_i = graph_dist[pid_i as usize * k as usize + k as usize - 1usize];
+                    let thresh_i = shared_thresh[abs_i];
 
-                    let mut oj = 0usize;
+                    let mut oj = UNIT_POS_X as usize;
                     while oj < len_j {
                         let abs_j = base_j + oj;
                         let is_new_j = shared_is_new[abs_j] != 0u32;
                         let pid_j = shared_pids[abs_j];
 
                         if (is_new_i || is_new_j) && pid_i != pid_j {
-                            let mut sum = F::new(0.0_f32);
-                            #[unroll]
-                            for s in 0..dim_scalars {
-                                let va = shared_vecs_a[oi * dim_scalars + s];
-                                let vb = shared_vecs_b[oj * dim_scalars + s];
-
-                                if use_cosine {
-                                    sum += va * vb;
-                                } else {
-                                    let diff = va - vb;
-                                    sum += diff * diff;
-                                }
-                            }
-
-                            let dist = if use_cosine {
-                                F::new(1.0_f32)
-                                    - (sum / (shared_norms[abs_i] * shared_norms[abs_j]))
-                            } else {
-                                sum
-                            };
+                            let dist = staged_pair_dist::<F, N>(
+                                &shared_vecs_a,
+                                &shared_vecs_b,
+                                &shared_norms,
+                                oi * row_lines,
+                                oj * row_lines,
+                                abs_i,
+                                abs_j,
+                                use_cosine,
+                                dim_lines,
+                                line_unroll,
+                            );
 
                             emit_pair::<F>(
-                                graph_dist,
                                 prop_idx,
                                 prop_dist,
                                 prop_count,
                                 pid_i,
                                 pid_j,
                                 thresh_i,
+                                shared_thresh[abs_j],
                                 dist,
-                                k,
                                 max_proposals,
                             );
                         }
-                        oj += 1usize;
+                        oj += CUBE_DIM_X as usize;
                     }
-                    oi += WORKGROUP_SIZE_X as usize;
+                    oi += CUBE_DIM_Y as usize;
                 }
                 bj += 1usize;
             }
@@ -863,11 +962,6 @@ pub fn merge_proposals<F: Float>(
     let is_new_bit = 1u32 << 31;
     let base = node as usize * k;
 
-    // Stage this node's row in registers. Every proposal used to scan the row
-    // twice and shift it once, all against global memory, up to
-    // `max_proposals` times per node: O(max_proposals * 3k) global accesses
-    // where 2k suffices. Loading with the id mask applied also folds in the
-    // separate "clear new flags" pass this replaces.
     let mut local_idx = Array::<u32>::new(k_comp);
     let mut local_dist = Array::<F>::new(k_comp);
     for j in 0..k_comp {
@@ -940,7 +1034,9 @@ pub fn merge_proposals<F: Float>(
 /// Runs after NNDescent convergence. For each node, evaluates the k^2
 /// second-degree neighbours. Filters aggressively against duplicates and
 /// the current worst distance before pushing to the proposal buffer.
-/// Overflow beyond `max_proposals` is handled via reservoir sampling.
+/// Overflow beyond `max_proposals` is dropped, for the reason documented on
+/// `leaf_pairwise_proposals`: only the atomic slot claim keeps a proposal's
+/// index and distance stores paired.
 ///
 /// ### Params
 ///
@@ -955,7 +1051,7 @@ pub fn merge_proposals<F: Float>(
 /// * `n` - Number of nodes
 /// * `max_proposals` - Proposal buffer capacity per node (comptime)
 /// * `use_cosine` - Whether to use cosine distance (comptime)
-/// * `dim_lines` - Number of `Line<F>` elements per vector row (comptime)
+/// * `dim_lines` - Number of `Vector<F, N>` elements per vector row (comptime)
 ///
 /// ### Returns
 ///
@@ -1077,14 +1173,6 @@ pub fn two_hop_refinement<F: Float, N: Size>(
                             let off = node as usize * max_proposals as usize + slot as usize;
                             prop_idx[off] = cand_pid;
                             prop_dist[off] = dist;
-                        } else {
-                            let rand_val = xorshift(node ^ slot ^ cand_pid) % (slot + 1u32);
-                            if rand_val < max_proposals {
-                                let off =
-                                    node as usize * max_proposals as usize + rand_val as usize;
-                                prop_idx[off] = cand_pid;
-                                prop_dist[off] = dist;
-                            }
                         }
                     }
                 }
@@ -1593,7 +1681,8 @@ where
 
         let (grid_n_x, grid_n_y) = grid_2d((n as u32).div_ceil(WORKGROUP_SIZE_X), &limits)?;
 
-        let staging = plan_local_join_staging(dim_padded, build_k * 2, size_of::<T>(), &limits)?;
+        let staging =
+            plan_local_join_staging(dim_padded, build_k * 2, size_of::<T>(), use_cosine, &limits)?;
 
         // 1: random graph initialisation (baseline for NNDescent)
         if verbose {
@@ -1706,7 +1795,7 @@ where
                 local_join_shared::launch_unchecked::<T, R>(
                     &client,
                     CubeCount::Static(cubes_x, cubes_y, 1),
-                    CubeDim::new_2d(WORKGROUP_SIZE_X, 1),
+                    CubeDim::new_2d(staging.cube_x, staging.cube_y),
                     line,
                     vectors_gpu.clone().into_tensor_arg(),
                     norms_gpu.clone().into_tensor_arg(),
@@ -1723,11 +1812,14 @@ where
                     MAX_PROPOSALS as u32,
                     use_cosine,
                     dim_vec,
+                    staging.row_lines,
                     build_k,
                     staging.block,
                     staging.single_block,
-                    staging.buf_a_len,
-                    staging.buf_b_len,
+                    staging.buf_a_lines,
+                    staging.buf_b_lines,
+                    staging.norm_buf_len,
+                    staging.line_unroll,
                 );
             }
 
@@ -2302,6 +2394,27 @@ where
 // KnnGraphGpu //
 /////////////////
 
+/// Resolved NNDescent knobs, shared by the single-shot and clustered drivers.
+#[derive(Clone, Copy, Debug)]
+pub struct NnDescentCfg {
+    /// Working degree the device runs at, wider than the returned `k`
+    pub build_k: usize,
+    /// Iteration cap for the main descent loop
+    pub max_iters: usize,
+    /// Random-projection trees used to seed the graph
+    pub n_trees: usize,
+    /// Convergence threshold as a fraction of `n * build_k` edges updated
+    pub delta: f32,
+    /// Local-join sampling rate, pre-scaled to the kernel's `u32` domain
+    pub rho_thresh: u32,
+    /// Two-hop refinement sweeps after the main loop
+    pub refine_knn: usize,
+    /// RNG seed
+    pub seed: usize,
+    /// Whether to score with cosine rather than squared Euclidean
+    pub use_cosine: bool,
+}
+
 /// Raw kNN graph built on the GPU, without CAGRA optimisation or query
 /// support.
 ///
@@ -2337,8 +2450,15 @@ pub struct KnnGraphGpu<T> {
 /// Reuses every kernel that [`NNDescentGpu::build`] uses for the NNDescent
 /// phase but skips the CAGRA rank-prune and reverse-merge that follow.
 ///
-/// Query methods are deliberately absent: `KnnGraphGpu` is a data
-/// handoff, not a queryable index. Feed it to [`NsgIndex::build_from_gpu_knn`]
+/// A thin wrapper: it resolves the defaults, pads the vectors, opens the device
+/// context and then hands the whole device-resident loop to [`nndescent_core`],
+/// compacting its output with [`compact_knn_rows`] on the way back. The split
+/// is what lets [`crate::gpu::clustered_nndescent_gpu`] drive the same loop
+/// once per cluster against a shared client.
+///
+/// Query methods are deliberately absent: `KnnGraphGpu` is a data handoff, not
+/// a queryable index. Feed it to
+/// [`NsgIndex::build_from_gpu_knn`](crate::cpu::nsg::NsgIndex::build_from_gpu_knn)
 /// for graph-based query, or unpack `knn_graph` directly for raw kNN consumers.
 ///
 /// ### Params
@@ -2349,12 +2469,12 @@ pub struct KnnGraphGpu<T> {
 /// * `build_k` - Wider working degree during NNDescent iterations.
 ///   Defaults to `max(k, 1.5 * k)`. Larger `build_k` improves final
 ///   graph quality at a linear iteration-cost hit
-/// * `max_iters` - Maximum NNDescent iterations. Defaults to
-///   [`DEFAULT_MAX_ITERS`]
-/// * `n_trees` - Trees for GPU forest init. Defaults to a `n^0.25` rule
+/// * `max_iters` - Maximum NNDescent iterations. Defaults to 15
+/// * `n_trees` - Trees for GPU forest init. Defaults to
+///   [`default_forest_trees`]
 /// * `delta` - Convergence threshold (fraction of `n*build_k` edges
-///   updated). Defaults to [`DEFAULT_DELTA`]
-/// * `rho` - Local-join sampling rate. Defaults to [`DEFAULT_RHO`]
+///   updated). Defaults to 0.001
+/// * `rho` - Local-join sampling rate. Defaults to 0.5
 /// * `refine_knn` - Number of 2-hop refinement sweeps after the main
 ///   NNDescent loop. Defaults to `0`
 /// * `seed` - RNG seed for reproducibility
@@ -2396,9 +2516,7 @@ where
     let rho_thresh = (rho * 65535.0) as u32;
     let refine_knn = refine_knn.unwrap_or(0);
 
-    let line = LINE_SIZE;
-    let dim_padded = dim.next_multiple_of(line);
-    let dim_vec = dim_padded / line;
+    let dim_padded = dim.next_multiple_of(LINE_SIZE);
 
     let vectors_padded = if dim_padded != dim {
         pad_vectors(&vectors_flat, n, dim, dim_padded)
@@ -2428,45 +2546,211 @@ where
 
     let start = Instant::now();
 
-    // ---- GPU setup ----
-
-    let n_trees_forest = n_trees.unwrap_or_else(|| {
-        let calculated = 5 + ((n as f64).powf(0.25)).round() as usize;
-        calculated.min(20)
-    });
-
     let client = R::client(&device);
     let limits = GpuLimits::from_client(&client);
-    let use_cosine = metric == Dist::Cosine;
 
-    let vectors_gpu = GpuTensor::<R, T>::from_slice(&vectors_padded, vec![n, dim_padded], &client)?;
+    let cfg = NnDescentCfg {
+        build_k,
+        max_iters,
+        n_trees: n_trees.unwrap_or_else(|| default_forest_trees(n)),
+        delta,
+        rho_thresh,
+        refine_knn,
+        seed,
+        use_cosine: metric == Dist::Cosine,
+    };
+
+    let (graph_idx, graph_dist, converged) = nndescent_core::<T, R>(
+        &vectors_padded,
+        &norms,
+        n,
+        dim,
+        dim_padded,
+        &cfg,
+        &client,
+        &limits,
+        verbose,
+    )?;
+
+    let knn_graph = compact_knn_rows(&graph_idx, &graph_dist, n, k, build_k);
+
+    if verbose {
+        println!("  Total build time: {:.2?}", start.elapsed());
+    }
+
+    Ok(KnnGraphGpu {
+        vectors_flat,
+        dim,
+        n,
+        k,
+        norms,
+        metric,
+        knn_graph,
+        converged,
+    })
+}
+
+/// Default forest size for the NNDescent graph initialisation.
+///
+/// An `n^0.25` rule, capped at 20. Sits in its own function because the
+/// clustered driver recomputes it per cluster rather than once for the whole
+/// dataset: a cluster of `2n/C` points wants the forest its own size implies,
+/// not the one the full dataset would.
+///
+/// ### Params
+///
+/// * `n` - Number of vectors the forest will index
+///
+/// ### Returns
+///
+/// Number of random-projection trees to build.
+pub fn default_forest_trees(n: usize) -> usize {
+    (5 + ((n as f64).powf(0.25)).round() as usize).min(20)
+}
+
+/// Compact the wide NNDescent working graph down to `k` neighbours per node.
+///
+/// The device keeps `build_k` slots per node so the descent has room to
+/// manoeuvre; callers want `k`. Drops self-edges, sentinels and out-of-range
+/// ids, keeps the first `k` survivors, and sorts each row ascending by
+/// distance.
+///
+/// ### Params
+///
+/// * `graph_idx` - Raw packed ids from the device, `n * build_k`; the top bit
+///   is the is-new flag and is masked off here
+/// * `graph_dist` - Matching distances, `n * build_k`
+/// * `n` - Number of nodes
+/// * `k` - Neighbours to keep per node
+/// * `build_k` - Working degree the device ran at
+///
+/// ### Returns
+///
+/// Flat `n * k` graph, row `i` at `[i * k, (i + 1) * k)`, unfilled slots left
+/// as `(SENTINEL_PID, T::max_value())`.
+pub fn compact_knn_rows<T>(
+    graph_idx: &[u32],
+    graph_dist: &[T],
+    n: usize,
+    k: usize,
+    build_k: usize,
+) -> Vec<(usize, T)>
+where
+    T: AnnSearchFloat,
+{
+    let pid_mask = 0x7FFFFFFFu32;
+    let sentinel = SENTINEL_PID;
+
+    let mut knn_graph = vec![(sentinel, <T as num_traits::Float>::max_value()); n * k];
+
+    knn_graph
+        .par_chunks_mut(k)
+        .enumerate()
+        .for_each(|(i, slot)| {
+            let mut written = 0;
+            for j in 0..build_k {
+                if written >= k {
+                    break;
+                }
+                let pid = (graph_idx[i * build_k + j] & pid_mask) as usize;
+                if pid < n && pid != i && pid != sentinel {
+                    slot[written] = (pid, graph_dist[i * build_k + j]);
+                    written += 1;
+                }
+            }
+            slot.sort_unstable_by(|a, b| {
+                a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal)
+            });
+        });
+
+    knn_graph
+}
+
+
+/// Run the device-resident NNDescent loop and read the raw graph back.
+///
+/// Everything between the data upload and the download, with no argument
+/// resolution, no padding and no compaction: allocate, seed the graph from a
+/// random draw plus a random-projection forest, iterate local joins until the
+/// update rate falls below `delta`, optionally refine, download.
+///
+/// ### Params
+///
+/// * `vectors_padded` - Row-major vectors padded to `dim_padded`, `n` rows
+/// * `norms` - L2 norms per row; only read when `cfg.use_cosine`, and may be
+///   empty otherwise
+/// * `n` - Number of vectors
+/// * `dim` - Original embedding dimensionality, needed by the forest init
+/// * `dim_padded` - Padded dimensionality, a multiple of `LINE_SIZE`
+/// * `cfg` - Resolved knobs, see [`NnDescentCfg`]
+/// * `client` - CubeCL compute client, borrowed for the call
+/// * `limits` - Device limits read once by the caller
+/// * `verbose` - Print per-phase progress
+///
+/// ### Returns
+///
+/// `(graph_idx, graph_dist, converged)`. Both buffers are `n * build_k`; ids
+/// still carry the is-new flag in the top bit, so run them through
+/// [`compact_knn_rows`] before use.
+#[allow(clippy::too_many_arguments)]
+pub fn nndescent_core<T, R>(
+    vectors_padded: &[T],
+    norms: &[T],
+    n: usize,
+    dim: usize,
+    dim_padded: usize,
+    cfg: &NnDescentCfg,
+    client: &ComputeClient<R>,
+    limits: &GpuLimits,
+    verbose: bool,
+) -> Result<(Vec<u32>, Vec<T>, bool), AnnSearchErrors>
+where
+    T: AnnSearchFloat + CubeclFloat,
+    R: Runtime,
+{
+    let NnDescentCfg {
+        build_k,
+        max_iters,
+        n_trees: n_trees_forest,
+        delta,
+        rho_thresh,
+        refine_knn,
+        seed,
+        use_cosine,
+    } = *cfg;
+
+    let line = LINE_SIZE;
+    let dim_vec = dim_padded / line;
+
+    let vectors_gpu = GpuTensor::<R, T>::from_slice(vectors_padded, vec![n, dim_padded], client)?;
 
     let norms_gpu = if use_cosine {
-        GpuTensor::<R, T>::from_slice(&norms, vec![n], &client)?
+        GpuTensor::<R, T>::from_slice(norms, vec![n], client)?
     } else {
-        GpuTensor::<R, T>::from_slice(&[T::zero()], vec![1], &client)?
+        GpuTensor::<R, T>::from_slice(&[T::zero()], vec![1], client)?
     };
 
     let graph_idx_gpu = GpuTensor::<R, u32>::from_slice(
         &vec![0x7FFFFFFFu32; n * build_k],
         vec![n, build_k],
-        &client,
+        client,
     )?;
     let graph_dist_gpu = GpuTensor::<R, T>::from_slice(
         &vec![<T as num_traits::Float>::max_value(); n * build_k],
         vec![n, build_k],
-        &client,
+        client,
     )?;
 
     let max_prop = MAX_PROPOSALS;
-    let prop_idx_gpu = GpuTensor::<R, u32>::empty(vec![n, max_prop], &client)?;
-    let prop_dist_gpu = GpuTensor::<R, T>::empty(vec![n, max_prop], &client)?;
-    let prop_count_gpu = GpuTensor::<R, u32>::empty(vec![n], &client)?;
-    let update_counter_gpu = GpuTensor::<R, u32>::empty(vec![1], &client)?;
+    let prop_idx_gpu = GpuTensor::<R, u32>::empty(vec![n, max_prop], client)?;
+    let prop_dist_gpu = GpuTensor::<R, T>::empty(vec![n, max_prop], client)?;
+    let prop_count_gpu = GpuTensor::<R, u32>::empty(vec![n], client)?;
+    let update_counter_gpu = GpuTensor::<R, u32>::empty(vec![1], client)?;
 
-    let (grid_n_x, grid_n_y) = grid_2d((n as u32).div_ceil(WORKGROUP_SIZE_X), &limits)?;
+    let (grid_n_x, grid_n_y) = grid_2d((n as u32).div_ceil(WORKGROUP_SIZE_X), limits)?;
 
-    let staging = plan_local_join_staging(dim_padded, build_k * 2, size_of::<T>(), &limits)?;
+    let staging =
+        plan_local_join_staging(dim_padded, build_k * 2, size_of::<T>(), use_cosine, limits)?;
 
     // ---- Random graph initialisation ----
 
@@ -2475,7 +2759,7 @@ where
     }
     unsafe {
         init_random_graph::launch_unchecked::<T, R>(
-            &client,
+            client,
             CubeCount::Static(grid_n_x, grid_n_y, 1),
             CubeDim::new_2d(WORKGROUP_SIZE_X, 1),
             line,
@@ -2508,17 +2792,17 @@ where
         seed,
         use_cosine,
         verbose,
-        &client,
+        client,
     )?;
 
     // ---- Mark all graph entries as new ----
 
     let total_entries = (n * build_k) as u32;
     let mark_grid_flat = total_entries.div_ceil(WORKGROUP_SIZE_X);
-    let (mark_cubes_x, mark_cubes_y) = grid_2d(mark_grid_flat, &limits)?;
+    let (mark_cubes_x, mark_cubes_y) = grid_2d(mark_grid_flat, limits)?;
     unsafe {
         mark_all_new::launch_unchecked::<R>(
-            &client,
+            client,
             CubeCount::Static(mark_cubes_x, mark_cubes_y, 1),
             CubeDim::new_2d(WORKGROUP_SIZE_X, 1),
             graph_idx_gpu.clone().into_tensor_arg(),
@@ -2531,15 +2815,15 @@ where
     let iter_start = Instant::now();
     let mut converged = false;
 
-    let reverse_idx_gpu = GpuTensor::<R, u32>::empty(vec![n, build_k], &client)?;
-    let reverse_count_gpu = GpuTensor::<R, u32>::empty(vec![n], &client)?;
+    let reverse_idx_gpu = GpuTensor::<R, u32>::empty(vec![n, build_k], client)?;
+    let reverse_count_gpu = GpuTensor::<R, u32>::empty(vec![n], client)?;
 
     for iter in 0..max_iters {
-        let (cubes_x, cubes_y) = grid_2d(n as u32, &limits)?;
+        let (cubes_x, cubes_y) = grid_2d(n as u32, limits)?;
 
         unsafe {
             reset_proposals::launch_unchecked::<R>(
-                &client,
+                client,
                 CubeCount::Static(grid_n_x, grid_n_y, 1),
                 CubeDim::new_2d(WORKGROUP_SIZE_X, 1),
                 prop_count_gpu.clone().into_tensor_arg(),
@@ -2548,7 +2832,7 @@ where
             );
 
             reset_proposals::launch_unchecked::<R>(
-                &client,
+                client,
                 CubeCount::Static(grid_n_x, grid_n_y, 1),
                 CubeDim::new_2d(WORKGROUP_SIZE_X, 1),
                 reverse_count_gpu.clone().into_tensor_arg(),
@@ -2559,7 +2843,7 @@ where
 
         unsafe {
             build_reverse_candidates::launch_unchecked::<R>(
-                &client,
+                client,
                 CubeCount::Static(grid_n_x, grid_n_y, 1),
                 CubeDim::new_2d(WORKGROUP_SIZE_X, 1),
                 graph_idx_gpu.clone().into_tensor_arg(),
@@ -2574,9 +2858,9 @@ where
 
         unsafe {
             local_join_shared::launch_unchecked::<T, R>(
-                &client,
+                client,
                 CubeCount::Static(cubes_x, cubes_y, 1),
-                CubeDim::new_2d(WORKGROUP_SIZE_X, 1),
+                CubeDim::new_2d(staging.cube_x, staging.cube_y),
                 line,
                 vectors_gpu.clone().into_tensor_arg(),
                 norms_gpu.clone().into_tensor_arg(),
@@ -2593,17 +2877,20 @@ where
                 MAX_PROPOSALS as u32,
                 use_cosine,
                 dim_vec,
+                staging.row_lines,
                 build_k,
                 staging.block,
                 staging.single_block,
-                staging.buf_a_len,
-                staging.buf_b_len,
+                staging.buf_a_lines,
+                staging.buf_b_lines,
+                staging.norm_buf_len,
+                staging.line_unroll,
             );
         }
 
         unsafe {
             merge_proposals::launch_unchecked::<T, R>(
-                &client,
+                client,
                 CubeCount::Static(grid_n_x, grid_n_y, 1),
                 CubeDim::new_2d(WORKGROUP_SIZE_X, 1),
                 graph_idx_gpu.clone().into_tensor_arg(),
@@ -2618,7 +2905,7 @@ where
             );
         }
 
-        let counter_data = update_counter_gpu.clone().read(&client)?;
+        let counter_data = update_counter_gpu.clone().read(client)?;
         let updates = counter_data[0] as f64;
         let rate = updates / (n * build_k) as f64;
 
@@ -2657,15 +2944,15 @@ where
     fits_shared_memory(
         "two_hop_refinement",
         dim_padded * size_of::<T>() + size_of::<T>() + build_k * 4,
-        &limits,
+        limits,
     )?;
 
-    let (cubes_x, cubes_y) = grid_2d(n as u32, &limits)?;
+    let (cubes_x, cubes_y) = grid_2d(n as u32, limits)?;
 
     for sweep in 0..refine_knn {
         unsafe {
             reset_proposals::launch_unchecked::<R>(
-                &client,
+                client,
                 CubeCount::Static(grid_n_x, grid_n_y, 1),
                 CubeDim::new_2d(WORKGROUP_SIZE_X, 1),
                 prop_count_gpu.clone().into_tensor_arg(),
@@ -2674,7 +2961,7 @@ where
             );
 
             two_hop_refinement::launch_unchecked::<T, R>(
-                &client,
+                client,
                 CubeCount::Static(cubes_x, cubes_y, 1),
                 CubeDim::new_2d(WORKGROUP_SIZE_X, 1),
                 line,
@@ -2693,7 +2980,7 @@ where
             );
 
             merge_proposals::launch_unchecked::<T, R>(
-                &client,
+                client,
                 CubeCount::Static(grid_n_x, grid_n_y, 1),
                 CubeDim::new_2d(WORKGROUP_SIZE_X, 1),
                 graph_idx_gpu.clone().into_tensor_arg(),
@@ -2709,7 +2996,7 @@ where
         }
 
         if verbose {
-            let counter_data = update_counter_gpu.clone().read(&client)?;
+            let counter_data = update_counter_gpu.clone().read(client)?;
             println!(
                 "    2-Hop sweep {}: {} updates",
                 sweep + 1,
@@ -2722,56 +3009,203 @@ where
         println!("  Refinement done in: {:.2?}", refinement_start.elapsed());
     }
 
-    // ---- Download graph and extract top-k per row ----
+    // ---- Download the raw graph ----
 
-    let nndescent_idx = graph_idx_gpu.read(&client)?;
-    let nndescent_dist = graph_dist_gpu.read(&client)?;
-    let pid_mask = 0x7FFFFFFFu32;
-    let sentinel = SENTINEL_PID;
+    let graph_idx = graph_idx_gpu.read(client)?;
+    let graph_dist = graph_dist_gpu.read(client)?;
 
-    let mut knn_graph = vec![(sentinel, <T as num_traits::Float>::max_value()); n * k];
-
-    knn_graph
-        .par_chunks_mut(k)
-        .enumerate()
-        .for_each(|(i, slot)| {
-            let mut written = 0;
-            for j in 0..build_k {
-                if written >= k {
-                    break;
-                }
-                let raw = nndescent_idx[i * build_k + j];
-                let pid = (raw & pid_mask) as usize;
-                if pid < n && pid != i && pid != sentinel {
-                    let dist = nndescent_dist[i * build_k + j];
-                    slot[written] = (pid, dist);
-                    written += 1;
-                }
-            }
-            slot.sort_unstable_by(|a, b| {
-                a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal)
-            });
-        });
-
-    if verbose {
-        println!("  Total build time: {:.2?}", start.elapsed());
-    }
-
-    Ok(KnnGraphGpu {
-        vectors_flat,
-        dim,
-        n,
-        k,
-        norms,
-        metric,
-        knn_graph,
-        converged,
-    })
+    Ok((graph_idx, graph_dist, converged))
 }
 
 ///////////
 // Tests //
 ///////////
+
+#[cfg(test)]
+mod pair_coverage_tests {
+    //! Host-only replay of `local_join_shared`'s pair loops.
+    //!
+    //! The kernel's whole contract is that it evaluates every unordered
+    //! candidate pair exactly once. Nothing about that needs a GPU: the loop
+    //! bounds are pure arithmetic over the cube shape, the block size and the
+    //! candidate count. Replaying them here pins the invariant that a retune of
+    //! the cube shape or the staging plan could otherwise break silently, since
+    //! a dropped pair only shows up as slightly worse recall and a doubled one
+    //! only as wasted atomics.
+
+    use std::collections::HashMap;
+
+    /// Emit every `(i, j)` the single-block arm evaluates, across all threads.
+    ///
+    /// ### Params
+    ///
+    /// * `total` - Compacted candidate count
+    /// * `cube_x` - Cube extent on the candidate-`j` axis
+    /// * `cube_y` - Cube extent on the candidate-`i` axis
+    ///
+    /// ### Returns
+    ///
+    /// Every emitted pair, including duplicates if the mapping produces any.
+    fn single_block_pairs(total: usize, cube_x: usize, cube_y: usize) -> Vec<(usize, usize)> {
+        let mut out = Vec::new();
+        for ty in 0..cube_y {
+            for tx in 0..cube_x {
+                let mut i = ty;
+                while i < total {
+                    let mut j = i + 1 + tx;
+                    while j < total {
+                        out.push((i, j));
+                        j += cube_x;
+                    }
+                    i += cube_y;
+                }
+            }
+        }
+        out
+    }
+
+    /// Emit every `(i, j)` the blocked arm evaluates, across all threads.
+    ///
+    /// Mirrors the diagonal and off-diagonal loops in order, including the
+    /// ragged last block.
+    ///
+    /// ### Params
+    ///
+    /// * `total` - Compacted candidate count
+    /// * `block` - Candidates staged per buffer
+    /// * `cube_x` - Cube extent on the candidate-`j` axis
+    /// * `cube_y` - Cube extent on the candidate-`i` axis
+    ///
+    /// ### Returns
+    ///
+    /// Every emitted pair, including duplicates if the mapping produces any.
+    fn blocked_pairs(
+        total: usize,
+        block: usize,
+        cube_x: usize,
+        cube_y: usize,
+    ) -> Vec<(usize, usize)> {
+        let mut out = Vec::new();
+        let n_blocks = total.div_ceil(block);
+
+        for ty in 0..cube_y {
+            for tx in 0..cube_x {
+                for bi in 0..n_blocks {
+                    let base_i = bi * block;
+                    let len_i = block.min(total - base_i);
+
+                    // Diagonal: upper triangle within block bi.
+                    let mut ii = ty;
+                    while ii < len_i {
+                        let mut jj = ii + 1 + tx;
+                        while jj < len_i {
+                            out.push((base_i + ii, base_i + jj));
+                            jj += cube_x;
+                        }
+                        ii += cube_y;
+                    }
+
+                    // Off-diagonal: full cross product against every later block.
+                    for bj in (bi + 1)..n_blocks {
+                        let base_j = bj * block;
+                        let len_j = block.min(total - base_j);
+
+                        let mut oi = ty;
+                        while oi < len_i {
+                            let mut oj = tx;
+                            while oj < len_j {
+                                out.push((base_i + oi, base_j + oj));
+                                oj += cube_x;
+                            }
+                            oi += cube_y;
+                        }
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    /// Assert the emitted pairs are exactly the upper triangle, each once.
+    ///
+    /// ### Params
+    ///
+    /// * `pairs` - Emitted pairs
+    /// * `total` - Compacted candidate count
+    /// * `tag` - Context string for the failure message
+    fn assert_is_upper_triangle(pairs: &[(usize, usize)], total: usize, tag: &str) {
+        let mut counts: HashMap<(usize, usize), usize> = HashMap::new();
+        for p in pairs {
+            assert!(p.0 < p.1, "{tag}: pair {p:?} is not ordered i < j");
+            assert!(p.1 < total, "{tag}: pair {p:?} runs past total {total}");
+            *counts.entry(*p).or_insert(0) += 1;
+        }
+
+        let expected = total * total.saturating_sub(1) / 2;
+        assert_eq!(pairs.len(), expected, "{tag}: pair count");
+
+        for i in 0..total {
+            for j in (i + 1)..total {
+                assert_eq!(
+                    counts.get(&(i, j)).copied().unwrap_or(0),
+                    1,
+                    "{tag}: pair ({i}, {j}) not evaluated exactly once"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_single_block_covers_the_upper_triangle_exactly_once() {
+        for total in [2usize, 3, 5, 16, 29, 32, 33, 60, 90, 128] {
+            for (cube_x, cube_y) in [(16usize, 8usize), (8, 4), (32, 1), (1, 32), (16, 16)] {
+                let pairs = single_block_pairs(total, cube_x, cube_y);
+                assert_is_upper_triangle(
+                    &pairs,
+                    total,
+                    &format!("single {total}/{cube_x}x{cube_y}"),
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_blocked_covers_the_upper_triangle_exactly_once() {
+        // Includes the shapes the Apple staging table produces (block 3, 7, 15,
+        // 29) and totals that leave a ragged last block.
+        for total in [2usize, 3, 5, 17, 29, 45, 90, 128] {
+            for block in [1usize, 2, 3, 7, 15, 29, 30] {
+                if block > total {
+                    continue;
+                }
+                for (cube_x, cube_y) in [(16usize, 8usize), (8, 4), (32, 1), (1, 32)] {
+                    let pairs = blocked_pairs(total, block, cube_x, cube_y);
+                    assert_is_upper_triangle(
+                        &pairs,
+                        total,
+                        &format!("blocked {total}/b{block}/{cube_x}x{cube_y}"),
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_blocked_and_single_block_agree() {
+        // A single block covering everything must produce the same pair set as
+        // the unblocked arm, which is what makes `single_block` a pure fast
+        // path rather than a different algorithm.
+        for total in [2usize, 9, 29, 90] {
+            let a = single_block_pairs(total, 16, 8);
+            let b = blocked_pairs(total, total, 16, 8);
+            let mut a = a.clone();
+            let mut b = b.clone();
+            a.sort_unstable();
+            b.sort_unstable();
+            assert_eq!(a, b, "arms disagree at total {total}");
+        }
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -3400,13 +3834,14 @@ mod kernel_tests {
 
         let rho_thresh = 65535u32; // rho=1.0, accept all pairs
 
-        let staging = plan_local_join_staging(dim, build_k * 2, size_of::<f32>(), &limits).unwrap();
+        let staging =
+            plan_local_join_staging(dim, build_k * 2, size_of::<f32>(), true, &limits).unwrap();
 
         unsafe {
             local_join_shared::launch_unchecked::<f32, WgpuRuntime>(
                 &client,
                 CubeCount::Static(n as u32, 1, 1),
-                CubeDim::new_2d(WORKGROUP_SIZE_X, 1),
+                CubeDim::new_2d(staging.cube_x, staging.cube_y),
                 line,
                 vectors_gpu.into_tensor_arg(),
                 norms_gpu.into_tensor_arg(),
@@ -3423,11 +3858,14 @@ mod kernel_tests {
                 MAX_PROPOSALS as u32,
                 true, // use_cosine
                 dim_vec,
+                staging.row_lines,
                 build_k,
                 staging.block,
                 staging.single_block,
-                staging.buf_a_len,
-                staging.buf_b_len,
+                staging.buf_a_lines,
+                staging.buf_b_lines,
+                staging.norm_buf_len,
+                staging.line_unroll,
             );
         }
 
@@ -4052,5 +4490,250 @@ mod kernel_tests {
             (gpu_dist - cpu_dist).abs() < 1e-2,
             "Distance mismatch: gpu={gpu_dist}, cpu={cpu_dist}"
         );
+    }
+
+    /// Every returned distance must belong to the id it is filed under.
+    ///
+    /// A proposal is an (index, distance) pair written as two separate stores
+    /// into a slot claimed by one atomic increment. Anything that writes a slot
+    /// it did not claim lets two threads interleave and files one thread's id
+    /// under the other's distance. That used to happen in the forest init's
+    /// overflow path and desynced ~29% of the graph here.
+    ///
+    /// Well-separated blobs make it unmistakable: cross-blob squared distances
+    /// are ~1600+, within-blob ones ~0-50, so a mispaired entry is off by two
+    /// orders of magnitude rather than by a rounding error.
+    #[test]
+    fn test_knn_graph_gpu_distances_match_ids() {
+        let Some(device) = try_device() else {
+            eprintln!("Skipping test: no wgpu backend available");
+            return;
+        };
+
+        let (n_blobs, per_blob, dim) = (8usize, 60usize, 8usize);
+        let n = n_blobs * per_blob;
+        let k = 5usize;
+
+        let flat: Vec<f32> = (0..n * dim)
+            .map(|e| {
+                let (row, col) = (e / dim, e % dim);
+                let blob = row / per_blob;
+                let jitter = (((row * 31 + col * 17) % 101) as f32) / 101.0 - 0.5;
+                jitter + if col == blob % dim { 40.0 } else { 0.0 }
+            })
+            .collect();
+        let data = Mat::from_fn(n, dim, |i, j| flat[i * dim + j]);
+
+        let graph = build_knn_graph_gpu::<f32, WgpuRuntime>(
+            data.as_ref(),
+            Dist::SquaredEuclidean,
+            Some(k),
+            None,
+            Some(15),
+            None,
+            Some(0.001),
+            Some(0.5),
+            None,
+            42,
+            false,
+            device,
+        )
+        .unwrap();
+
+        for i in 0..n {
+            for &(pid, stored) in &graph.knn_graph[i * k..(i + 1) * k] {
+                if pid >= n {
+                    continue;
+                }
+                let truth: f32 = (0..dim)
+                    .map(|c| {
+                        let d = flat[i * dim + c] - flat[pid * dim + c];
+                        d * d
+                    })
+                    .sum();
+                assert!(
+                    (stored - truth).abs() <= 1e-2 * truth.max(1.0),
+                    "desynced entry: i={i} j={pid} stored={stored} true={truth}"
+                );
+            }
+        }
+    }
+    /// Drive `local_join_shared` on a shape that forces the blocked staging
+    /// path, and cross-check every emitted proposal against a host recompute.
+    ///
+    /// The blocked arm has its own diagonal and off-diagonal index mapping and
+    /// its own ragged-last-block handling, none of which the dim-8 tests reach:
+    /// those all take the single-block path. A wrong offset there produces a
+    /// plausible-looking distance filed against the wrong candidate, which no
+    /// end-to-end recall number would catch.
+    ///
+    /// ### Params
+    ///
+    /// * `n` - Number of points
+    /// * `dim` - Embedding dimensionality, large enough to force blocking
+    /// * `build_k` - Graph degree
+    fn run_blocked_local_join_case(n: usize, dim: usize, build_k: usize) {
+        let Some(device) = try_device() else {
+            eprintln!("Skipping: no wgpu backend");
+            return;
+        };
+
+        let client = WgpuRuntime::client(&device);
+        let limits = GpuLimits::from_client(&client);
+        let line: usize = LINE_SIZE;
+        let dim_vec = dim / line;
+
+        let staging =
+            plan_local_join_staging(dim, build_k * 2, size_of::<f32>(), false, &limits).unwrap();
+        assert!(
+            !staging.single_block,
+            "n={n} dim={dim} build_k={build_k} did not force the blocked path; \
+             this test would silently cover nothing"
+        );
+        assert!(
+            staging.block < 2 * build_k,
+            "expected more than one block at dim {dim}"
+        );
+
+        // Distinct pseudo-random coordinates, so no two pairs share a distance
+        // and a mispaired entry cannot coincidentally match.
+        let data: Vec<f32> = (0..n * dim)
+            .map(|i| {
+                let h = (i as u64).wrapping_mul(2_654_435_761) % 16_777_213;
+                h as f32 / 16_777_213.0
+            })
+            .collect();
+
+        // Forward neighbours are the next `build_k` ids and reverse edges the
+        // previous `build_k`, so the compacted candidate list is the full
+        // `2 * build_k` and spans several blocks.
+        let is_new_bit = 1u32 << 31;
+        let mut graph_idx = vec![0u32; n * build_k];
+        let mut reverse_idx = vec![0u32; n * build_k];
+        for i in 0..n {
+            for j in 0..build_k {
+                graph_idx[i * build_k + j] = (((i + j + 1) % n) as u32) | is_new_bit;
+                reverse_idx[i * build_k + j] = (((i + n - j - 1) % n) as u32) | is_new_bit;
+            }
+        }
+        // `f32::MAX` thresholds so every evaluated pair is emitted, which is
+        // what makes this a coverage test of the index mapping.
+        let graph_dist = vec![f32::MAX; n * build_k];
+
+        let vectors_gpu =
+            GpuTensor::<WgpuRuntime, f32>::from_slice(&data, vec![n, dim], &client).unwrap();
+        let norms_gpu =
+            GpuTensor::<WgpuRuntime, f32>::from_slice(&[0.0f32], vec![1], &client).unwrap();
+        let graph_idx_gpu =
+            GpuTensor::<WgpuRuntime, u32>::from_slice(&graph_idx, vec![n, build_k], &client)
+                .unwrap();
+        let graph_dist_gpu =
+            GpuTensor::<WgpuRuntime, f32>::from_slice(&graph_dist, vec![n, build_k], &client)
+                .unwrap();
+        let reverse_idx_gpu =
+            GpuTensor::<WgpuRuntime, u32>::from_slice(&reverse_idx, vec![n, build_k], &client)
+                .unwrap();
+        let reverse_count_gpu =
+            GpuTensor::<WgpuRuntime, u32>::from_slice(&vec![build_k as u32; n], vec![n], &client)
+                .unwrap();
+
+        let max_prop = MAX_PROPOSALS;
+        let prop_idx_gpu =
+            GpuTensor::<WgpuRuntime, u32>::empty(vec![n, max_prop], &client).unwrap();
+        let prop_dist_gpu =
+            GpuTensor::<WgpuRuntime, f32>::empty(vec![n, max_prop], &client).unwrap();
+        let prop_count_gpu =
+            GpuTensor::<WgpuRuntime, u32>::from_slice(&vec![0u32; n], vec![n], &client).unwrap();
+
+        unsafe {
+            local_join_shared::launch_unchecked::<f32, WgpuRuntime>(
+                &client,
+                CubeCount::Static(n as u32, 1, 1),
+                CubeDim::new_2d(staging.cube_x, staging.cube_y),
+                line,
+                vectors_gpu.into_tensor_arg(),
+                norms_gpu.into_tensor_arg(),
+                graph_idx_gpu.into_tensor_arg(),
+                graph_dist_gpu.into_tensor_arg(),
+                reverse_idx_gpu.into_tensor_arg(),
+                reverse_count_gpu.into_tensor_arg(),
+                prop_idx_gpu.clone().into_tensor_arg(),
+                prop_dist_gpu.clone().into_tensor_arg(),
+                prop_count_gpu.clone().into_tensor_arg(),
+                n as u32,
+                65535u32,
+                42u32,
+                MAX_PROPOSALS as u32,
+                false,
+                dim_vec,
+                staging.row_lines,
+                build_k,
+                staging.block,
+                staging.single_block,
+                staging.buf_a_lines,
+                staging.buf_b_lines,
+                staging.norm_buf_len,
+                staging.line_unroll,
+            );
+        }
+
+        let p_idx = prop_idx_gpu.read(&client).unwrap();
+        let p_dist = prop_dist_gpu.read(&client).unwrap();
+        let p_count = prop_count_gpu.read(&client).unwrap();
+
+        let total: usize = p_count.iter().map(|c| (*c as usize).min(max_prop)).sum();
+        assert!(
+            total > n,
+            "dim={dim} build_k={build_k}: only {total} proposals over {n} nodes, \
+             the dispatch almost certainly did no work"
+        );
+
+        // Recompute each stored distance from its stored id. This is the check
+        // that catches a mispaired index-and-value, which comparing distances
+        // against a reference cannot.
+        let mut checked = 0usize;
+        for node in 0..n {
+            let count = (p_count[node] as usize).min(max_prop);
+            for slot in 0..count {
+                let cand = p_idx[node * max_prop + slot] as usize;
+                assert!(
+                    cand < n,
+                    "dim={dim}: node {node} slot {slot} holds out-of-range id {cand}"
+                );
+                assert_ne!(cand, node, "dim={dim}: node {node} proposed itself");
+
+                let stored = p_dist[node * max_prop + slot];
+                let truth: f32 = data[node * dim..(node + 1) * dim]
+                    .iter()
+                    .zip(&data[cand * dim..(cand + 1) * dim])
+                    .map(|(a, b)| (a - b) * (a - b))
+                    .sum();
+                assert!(
+                    (stored - truth).abs() <= 1e-3 * truth.max(1.0),
+                    "dim={dim} build_k={build_k}: node {node} slot {slot} \
+                     candidate {cand} stored={stored} recomputed={truth}"
+                );
+                checked += 1;
+            }
+        }
+        assert!(checked > 0, "dim={dim}: nothing verified");
+        println!(
+            "blocked local join dim={dim} build_k={build_k}: block={} blocks={} \
+             cube={}x{}, verified {checked} proposals",
+            staging.block,
+            (2 * build_k).div_ceil(staging.block),
+            staging.cube_x,
+            staging.cube_y,
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "gpu-tests")]
+    fn test_local_join_blocked_path_distances() {
+        // dim 256 leaves a ragged last block; dim 512 and 1024 shrink `block`
+        // to 7 and 3, which is where the 2-D thread mapping does the most work.
+        run_blocked_local_join_case(64, 256, 20);
+        run_blocked_local_join_case(64, 512, 16);
+        run_blocked_local_join_case(64, 1024, 12);
     }
 }

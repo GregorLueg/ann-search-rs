@@ -35,6 +35,29 @@ pub enum AnnSearchErrors {
     #[error("IO error: {0}")]
     IoError(#[from] std::io::Error),
 
+    // -- lsh errors --
+    /// Requested hash width exceeds what a directly addressed bucket table can
+    /// hold.
+    #[error(
+        "bits_per_hash ({bits_per_hash}) must be between 1 and {max}; the LSH bucket table is directly addressed."
+    )]
+    InvalidLshBits {
+        /// Requested number of bits per hash code
+        bits_per_hash: usize,
+        /// Largest supported number of bits per hash code
+        max: usize,
+    },
+
+    /// Dataset is too large for the `u32` bucket identifiers used by the LSH
+    /// CSR layout.
+    #[error("The LSH index stores bucket members as u32; {n} samples exceeds the limit of {max}.")]
+    LshTooManySamples {
+        /// Number of samples handed to the index
+        n: usize,
+        /// Largest supported number of samples
+        max: usize,
+    },
+
     // -- quantisation errors --
     /// Dimension must be divisible by m
     #[error("Dimension ({dim}) must be divisible by m ({m}).")]
@@ -58,6 +81,17 @@ pub enum AnnSearchErrors {
     TooManyCentroidsForPQ {
         /// Chosen number of centroids
         n_centroids: usize,
+    },
+    /// Fewer training vectors than centroids to seed
+    #[error(
+        "Cannot train {n_centroids} centroids from {n_samples} vectors; \
+         there must be at least as many vectors as centroids."
+    )]
+    TooFewSamplesForCentroids {
+        /// Chosen number of centroids
+        n_centroids: usize,
+        /// Vectors available for training
+        n_samples: usize,
     },
 
     // -- binary errors --

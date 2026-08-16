@@ -243,6 +243,15 @@ where
     /// ### Returns
     ///
     /// Trained ProductQuantiser
+    ///
+    /// ### Errors
+    ///
+    /// * `DimensionNotDivisibleByM` if `m` does not divide `dim`
+    /// * `DimensionTooSmallForPQ` if `dim < 32`
+    /// * `TooManyCentroidsForPQ` if `n_centroids > 256`, the `u8` code limit
+    /// * `TooFewSamplesForCentroids` if there are fewer training vectors than
+    ///   centroids. Seeding draws distinct rows, so it cannot fill the codebook.
+    ///   Small datasets hit this with the default of 256.
     #[allow(clippy::too_many_arguments)]
     pub fn train(
         vectors_flat: &[T],
@@ -269,6 +278,16 @@ where
         // function body
         let subvec_dim = dim / m;
         let n = vectors_flat.len() / dim;
+
+        // Seeding samples `n_centroids` *distinct* training rows, so fewer rows
+        // than centroids indexes past the end of the shuffled index list. Small
+        // datasets hit this with the default codebook size of 256.
+        if n_centroids > n {
+            return Err(AnnSearchErrors::TooFewSamplesForCentroids {
+                n_centroids,
+                n_samples: n,
+            });
+        }
 
         let codebooks: Vec<Vec<T>> = (0..m)
             .map(|subspace| {

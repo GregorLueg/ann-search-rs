@@ -57,7 +57,7 @@ use crate::serialise::IndexIo;
 
 use crate::cpu::{
     annoy::*, ball_tree::*, exhaustive::*, hnsw::*, ivf::*, kd_forest::*, kmknn::*, lsh::*,
-    nndescent::*, nsg::*, rnn_descent::*, vamana::*,
+    nndescent::*, nsg::*, rnn_descent::*, soar::*, vamana::*,
 };
 use crate::prelude::*;
 use crate::utils::nndescent_utils::ApplySortedUpdates;
@@ -72,7 +72,7 @@ use crate::gpu::{exhaustive_gpu::*, ivf_gpu::*, nndescent_gpu::*};
 #[cfg(feature = "quantised")]
 use crate::quantised::{
     exhaustive_bf16::*, exhaustive_opq::*, exhaustive_pq::*, exhaustive_sq8::*, ivf_bf16::*,
-    ivf_opq::*, ivf_pq::*, ivf_sq8::*,
+    ivf_opq::*, ivf_pq::*, ivf_sq8::*, soar_opq::*, soar_pq::*,
 };
 
 ////////////
@@ -837,6 +837,135 @@ where
     index.generate_knn(k, nprobe, return_dist, verbose)
 }
 
+//////////
+// SOAR //
+//////////
+
+/// Build a SOAR index
+///
+/// An IVF index in which every point is stored in two Voronoi cells rather than
+/// one, with the second cell picked so it fails on different queries than the
+/// first. See [`SoarRule`] for the available rules and what each is derived
+/// for.
+///
+/// ### Params
+///
+/// * `mat` - The data matrix. Rows represent the samples, columns represent
+///   the embedding dimensions
+/// * `nlist` - Number of clusters to create. Defaults to `sqrt(n)`. Spilling
+///   pays off in the fine-cell regime, so larger values are worth trying here
+///   in a way they are not for [`build_ivf_index`].
+/// * `rule` - Optional secondary-assignment rule. Defaults to the
+///   metric-appropriate choice: the published quadratic loss under cosine, the
+///   shifted-point rule under squared Euclidean.
+/// * `k_means_params` - Optional k-means trainings parameters, see
+///   [KMeansTrainingParams]. If not provided, will default to sensible
+///   defaults.
+/// * `dist_metric` - Distance metric: "euclidean" or "cosine". "manhatten" is
+///   not supported.
+/// * `seed` - Random seed for reproducibility
+/// * `verbose` - Print progress information during index construction
+///
+/// ### Return
+///
+/// The `SoarIndex`.
+///
+/// ### References
+///
+/// Sun, Simcha, Simcha, Chern & Guo, arXiv:2404.00774, 2024 (SOAR)
+pub fn build_soar_index<T>(
+    mat: MatRef<T>,
+    nlist: Option<usize>,
+    rule: Option<SoarRule>,
+    k_means_params: Option<KMeansTrainingParams>,
+    dist_metric: &str,
+    seed: usize,
+    verbose: bool,
+) -> Result<SoarIndex<T>, AnnSearchErrors>
+where
+    T: AnnSearchFloat,
+{
+    let metric = parse_ann_dist(dist_metric).unwrap_or_else(|| {
+        println!("[WARNING] Weird string used for distance metric. Using default squared Euclidean distance");
+        Dist::default()
+    });
+
+    SoarIndex::build(mat, metric, nlist, rule, k_means_params, seed, verbose)
+}
+
+/// Helper function to query a given SOAR index
+///
+/// ### Params
+///
+/// * `query_mat` - The query matrix containing the samples x features
+/// * `index` - Reference to the built SOAR index
+/// * `k` - Number of neighbours to return
+/// * `nprobe` - Number of clusters to search. Higher values improve recall at
+///   the cost of speed
+/// * `return_dist` - Shall the distances between the different points be
+///   returned
+/// * `verbose` - Print progress information
+///
+/// ### Returns
+///
+/// A tuple of `(knn_indices, optional distances)`
+///
+/// ### Note
+///
+/// The distance metric is determined at index build time and cannot be changed
+/// during querying.
+pub fn query_soar_index<T>(
+    query_mat: MatRef<T>,
+    index: &SoarIndex<T>,
+    k: usize,
+    nprobe: Option<usize>,
+    return_dist: bool,
+    verbose: bool,
+) -> KnnOptionResult<T>
+where
+    T: AnnSearchFloat,
+{
+    query_parallel(query_mat.nrows(), return_dist, verbose, |i| {
+        index.query_row(query_mat.row(i), k, nprobe)
+    })
+}
+
+/// Helper function to self query a SOAR index
+///
+/// This function will generate a full kNN graph based on the internal data,
+/// using the same Voronoi-cell fast path as the plain IVF version.
+///
+/// ### Params
+///
+/// * `index` - Reference to the built SOAR index
+/// * `k` - Number of neighbours to return
+/// * `nprobe` - Number of clusters to search. Higher values improve recall at
+///   the cost of speed
+/// * `return_dist` - Shall the distances between the different points be
+///   returned
+/// * `verbose` - Print progress information
+///
+/// ### Returns
+///
+/// A tuple of `(knn_indices, optional distances)`
+///
+/// ### Note
+///
+/// The distance metric is determined at index build time and cannot be changed
+/// during querying.
+pub fn query_soar_self<T>(
+    index: &SoarIndex<T>,
+    k: usize,
+    nprobe: Option<usize>,
+    return_dist: bool,
+    verbose: bool,
+) -> KnnOptionResult<T>
+where
+    T: AnnSearchFloat,
+{
+    index.generate_knn(k, nprobe, return_dist, verbose)
+}
+
 ////////////
 // KdTree //
 ////////////
@@ -944,10 +1073,16 @@ where
 /// * `mat` - The initial matrix with samples x features
 /// * `dist_metric` - Distance metric: "euclidean" or "cosine". "manhatten" is
 ///   not supported.
-/// * `num_tables` - Number of HashMaps to use (usually something 20 to 100)
-/// * `bits_per_hash` - How many bits per hash. Lower values (8) usually yield
-///   better Recall with higher query time; higher values (16) have worse Recall
-///   but faster query time
+/// * `num_tables` - Number of hash tables to use (with multi-probe, 4 to 8 is
+///   usually enough)
+/// * `bits_per_hash` - How many bits per hash, at most
+///   [`crate::cpu::lsh::MAX_BITS_PER_HASH`]. Lower values (8)
+///   usually yield better Recall with higher query time; higher values (16) have
+///   worse Recall but faster query time
+/// * `slot_bits` - How many bits each quantised projection contributes.
+///   `None` picks 1 for cosine (sign of the projection, i.e. SimHash against
+///   the median) and 2 for squared Euclidean, which needs more than a sign to
+///   see vector magnitude.
 /// * `seed` - Random seed for reproducibility
 ///
 /// ### Returns
@@ -958,6 +1093,7 @@ pub fn build_lsh_index<T>(
     dist_metric: &str,
     num_tables: usize,
     bits_per_hash: usize,
+    slot_bits: Option<usize>,
     seed: usize,
 ) -> Result<LSHIndex<T>, AnnSearchErrors>
 where
@@ -968,7 +1104,7 @@ where
         Dist::default()
     });
 
-    LSHIndex::new(mat, metric, num_tables, bits_per_hash, seed)
+    LSHIndex::new(mat, metric, num_tables, bits_per_hash, slot_bits, seed)
 }
 
 /// Helper function to query a given LSH index
@@ -980,10 +1116,11 @@ where
 /// * `query_mat` - The query matrix containing the samples × features
 /// * `index` - The LSH index
 /// * `k` - Number of neighbours to return
-/// * `max_candidates` - Optional number to limit the candidate selection per
-///   given table. Makes the querying faster at cost of Recall.
-/// * `nprobe` - Number of additional buckets to probe per table. Will identify
-///   the closest hash tables and use bit flipping to investigate these.
+/// * `max_candidates` - Optional cap on the number of unique candidates scored
+///   per query, across all tables and probes. Makes the querying faster at cost
+///   of Recall.
+/// * `nprobe` - Number of additional buckets to probe per table, ordered by how
+///   close the query sits to each slot boundary.
 /// * `return_dist` - Shall the distances be returned
 /// * `verbose` - Controls verbosity of the function
 ///
@@ -1013,11 +1150,13 @@ where
 ///
 /// * `index` - The LSH index
 /// * `k` - Number of neighbours to return
-/// * `max_candidates` - Optional number to limit the candidate selection per
-///   given table. Makes the querying faster at cost of Recall.
-/// * `n_probe` - Optional number of additional buckets to probe per table. Will
-///   identify the closest hash tables and use bit flipping to investigate
-///   these. Defaults to half the number of bits.
+/// * `max_candidates` - Optional cap on the number of unique candidates scored
+///   per query, across all tables and probes. Makes the querying faster at cost
+///   of Recall.
+/// * `n_probe` - Optional number of additional buckets to probe per table.
+///   Probes are ordered by how close the vector sits to each slot boundary.
+///   Defaults to the number of projections per table, which is half of the
+///   `2 * n_proj` single-slot shifts available.
 /// * `return_dist` - Shall the distances be returned
 /// * `verbose` - Controls verbosity of the function
 ///
@@ -1035,7 +1174,7 @@ pub fn query_lsh_self<T>(
 where
     T: AnnSearchFloat,
 {
-    let n_probe = n_probe.unwrap_or(index.num_bits() / 2);
+    let n_probe = n_probe.unwrap_or(index.num_projections());
 
     Ok(index.generate_knn(k, max_candidates, n_probe, return_dist, verbose))
 }
@@ -2207,6 +2346,264 @@ where
 }
 
 #[cfg(feature = "quantised")]
+/// Build a SOAR-PQ index
+///
+/// An IVF-PQ index in which every point is encoded twice, once as a residual
+/// against each of the two Voronoi cells it belongs to. Product quantisation
+/// rebuilds its ADC lookup table per probed cell, so drawing twice the
+/// candidates out of one cell is cheaper than the same candidates out of two.
+/// That is the asymmetry spilling exploits, and it does not exist for exact
+/// full-vector search.
+///
+/// Costs `2 * n * m` code bytes rather than `n * m`, so the fair comparison is
+/// against [`build_ivf_pq_index`] with twice the subspaces.
+///
+/// ### Params
+///
+/// * `mat` - The data matrix. Rows represent the samples, columns represent
+///   the embedding dimensions
+/// * `nlist` - Number of clusters to create. Defaults to `sqrt(n)`.
+/// * `m` - Number of PQ subspaces; must divide the embedding dimension
+/// * `rule` - Optional secondary-assignment rule, see [`SoarRule`]. Defaults to
+///   the metric-appropriate choice.
+/// * `k_means_params` - Optional k-means trainings parameters, see
+///   [KMeansTrainingParams]
+/// * `n_pq_centroids` - Optional codebook size, defaults to 256
+/// * `dist_metric` - Distance metric: "euclidean" or "cosine". "manhatten" is
+///   not supported.
+/// * `seed` - Random seed for reproducibility
+/// * `verbose` - Print progress information during index construction
+///
+/// ### Return
+///
+/// The `SoarPqIndex`.
+///
+/// ### References
+///
+/// Sun, Simcha, Simcha, Chern & Guo, arXiv:2404.00774, 2024 (SOAR)
+#[allow(clippy::too_many_arguments)]
+pub fn build_soar_pq_index<T>(
+    mat: MatRef<T>,
+    nlist: Option<usize>,
+    m: usize,
+    rule: Option<SoarRule>,
+    k_means_params: Option<KMeansTrainingParams>,
+    n_pq_centroids: Option<usize>,
+    dist_metric: &str,
+    seed: usize,
+    verbose: bool,
+) -> Result<SoarPqIndex<T>, AnnSearchErrors>
+where
+    T: AnnSearchFloat,
+{
+    let metric = parse_ann_dist(dist_metric).unwrap_or_else(|| {
+        println!("[WARNING] Weird string used for distance metric. Using default squared Euclidean distance");
+        Dist::default()
+    });
+
+    SoarPqIndex::build(
+        mat,
+        nlist,
+        m,
+        metric,
+        rule,
+        k_means_params,
+        n_pq_centroids,
+        seed,
+        verbose,
+    )
+}
+
+#[cfg(feature = "quantised")]
+/// Build a SOAR-OPQ index
+///
+/// The OPQ counterpart of [`build_soar_pq_index`]: every point is encoded twice
+/// as a rotated residual, once against each of the two Voronoi cells it belongs
+/// to. See [`build_soar_pq_index`] for why the per-cell ADC lookup table is what
+/// makes spilling pay under quantisation.
+///
+/// ### Params
+///
+/// * `mat` - The data matrix. Rows represent the samples, columns represent
+///   the embedding dimensions
+/// * `nlist` - Number of clusters to create. Defaults to `sqrt(n)`.
+/// * `m` - Number of PQ subspaces; must divide the embedding dimension
+/// * `rule` - Optional secondary-assignment rule, see [`SoarRule`]
+/// * `k_means_params` - Optional k-means trainings parameters, see
+///   [KMeansTrainingParams]
+/// * `n_opq_centroids` - Optional codebook size, defaults to 256
+/// * `opq_iter` - Optional number of rotation-refinement iterations
+/// * `dist_metric` - Distance metric: "euclidean" or "cosine". "manhatten" is
+///   not supported.
+/// * `seed` - Random seed for reproducibility
+/// * `verbose` - Print progress information during index construction
+///
+/// ### Return
+///
+/// The `SoarOpqIndex`.
+#[allow(clippy::too_many_arguments)]
+pub fn build_soar_opq_index<T>(
+    mat: MatRef<T>,
+    nlist: Option<usize>,
+    m: usize,
+    rule: Option<SoarRule>,
+    k_means_params: Option<KMeansTrainingParams>,
+    n_opq_centroids: Option<usize>,
+    opq_iter: Option<usize>,
+    dist_metric: &str,
+    seed: usize,
+    verbose: bool,
+) -> Result<SoarOpqIndex<T>, AnnSearchErrors>
+where
+    T: AnnSearchFloat + AddAssign,
+{
+    let metric = parse_ann_dist(dist_metric).unwrap_or_else(|| {
+        println!("[WARNING] Weird string used for distance metric. Using default squared Euclidean distance");
+        Dist::default()
+    });
+
+    SoarOpqIndex::build(
+        mat,
+        nlist,
+        m,
+        metric,
+        rule,
+        k_means_params,
+        n_opq_centroids,
+        opq_iter,
+        seed,
+        verbose,
+    )
+}
+
+#[cfg(feature = "quantised")]
+/// Helper function to query a given SOAR-OPQ index
+///
+/// ### Params
+///
+/// * `query_mat` - The query matrix containing the samples x features
+/// * `index` - Reference to the built SOAR-OPQ index
+/// * `k` - Number of neighbours to return
+/// * `nprobe` - Number of clusters to search
+/// * `return_dist` - Shall the distances between the different points be
+///   returned
+/// * `verbose` - Print progress information
+///
+/// ### Returns
+///
+/// A tuple of `(knn_indices, optional distances)`
+pub fn query_soar_opq_index<T>(
+    query_mat: MatRef<T>,
+    index: &SoarOpqIndex<T>,
+    k: usize,
+    nprobe: Option<usize>,
+    return_dist: bool,
+    verbose: bool,
+) -> KnnOptionResult<T>
+where
+    T: AnnSearchFloat + AddAssign,
+{
+    query_parallel(query_mat.nrows(), return_dist, verbose, |i| {
+        index.query_row(query_mat.row(i), k, nprobe)
+    })
+}
+
+#[cfg(feature = "quantised")]
+/// Helper function to self query a SOAR-OPQ index
+///
+/// Generates a full kNN graph from the stored codes. Each point is
+/// reconstructed from its primary copy, which carries the smaller residual.
+///
+/// ### Params
+///
+/// * `index` - Reference to the built SOAR-OPQ index
+/// * `k` - Number of neighbours to return
+/// * `nprobe` - Number of clusters to search
+/// * `return_dist` - Shall the distances between the different points be
+///   returned
+/// * `verbose` - Print progress information
+///
+/// ### Returns
+///
+/// A tuple of `(knn_indices, optional distances)`
+pub fn query_soar_opq_index_self<T>(
+    index: &SoarOpqIndex<T>,
+    k: usize,
+    nprobe: Option<usize>,
+    return_dist: bool,
+    verbose: bool,
+) -> KnnOptionResult<T>
+where
+    T: AnnSearchFloat + AddAssign,
+{
+    index.generate_knn(k, nprobe, return_dist, verbose)
+}
+
+#[cfg(feature = "quantised")]
+/// Helper function to query a given SOAR-PQ index
+///
+/// ### Params
+///
+/// * `query_mat` - The query matrix containing the samples x features
+/// * `index` - Reference to the built SOAR-PQ index
+/// * `k` - Number of neighbours to return
+/// * `nprobe` - Number of clusters to search
+/// * `return_dist` - Shall the distances between the different points be
+///   returned
+/// * `verbose` - Print progress information
+///
+/// ### Returns
+///
+/// A tuple of `(knn_indices, optional distances)`
+pub fn query_soar_pq_index<T>(
+    query_mat: MatRef<T>,
+    index: &SoarPqIndex<T>,
+    k: usize,
+    nprobe: Option<usize>,
+    return_dist: bool,
+    verbose: bool,
+) -> KnnOptionResult<T>
+where
+    T: AnnSearchFloat,
+{
+    query_parallel(query_mat.nrows(), return_dist, verbose, |i| {
+        index.query_row(query_mat.row(i), k, nprobe)
+    })
+}
+
+#[cfg(feature = "quantised")]
+/// Helper function to self query a SOAR-PQ index
+///
+/// Generates a full kNN graph from the stored codes. Each point is
+/// reconstructed from its primary copy, which carries the smaller residual and
+/// so the lower quantisation error.
+///
+/// ### Params
+///
+/// * `index` - Reference to the built SOAR-PQ index
+/// * `k` - Number of neighbours to return
+/// * `nprobe` - Number of clusters to search
+/// * `return_dist` - Shall the distances between the different points be
+///   returned
+/// * `verbose` - Print progress information
+///
+/// ### Returns
+///
+/// A tuple of `(knn_indices, optional distances)`
+pub fn query_soar_pq_index_self<T>(
+    index: &SoarPqIndex<T>,
+    k: usize,
+    nprobe: Option<usize>,
+    return_dist: bool,
+    verbose: bool,
+) -> KnnOptionResult<T>
+where
+    T: AnnSearchFloat,
+{
+    index.generate_knn(k, nprobe, return_dist, verbose)
+}
+
+#[cfg(feature = "quantised")]
 /// Helper function to query a given IVF-PQ index
 ///
 /// ### Params
@@ -2503,9 +2900,11 @@ where
 ///
 /// * `mat` - Data matrix [samples, features]
 /// * `nlist` - Number of clusters (defaults to √n)
-/// * `k_means_params` - Optional k-means trainings parameters, see
-///   [KMeansTrainingParams]. If not provided, will default to sensible
-///   defaults.
+/// * `k_means_params` - Optional k-means training parameters, see
+///   [`crate::gpu::k_means_gpu::KMeansGpuParams`]. If not provided, will
+///   default to sensible defaults. Note this takes the GPU parameter struct,
+///   not the CPU [KMeansTrainingParams]: both halves of the partitioning run on
+///   device.
 /// * `dist_metric` - Distance metric: "euclidean" or "cosine". "manhatten" is
 ///   not supported.
 /// * `seed` - Random seed
@@ -2514,7 +2913,7 @@ where
 pub fn build_ivf_index_gpu<T, R>(
     mat: MatRef<T>,
     nlist: Option<usize>,
-    k_means_params: Option<KMeansTrainingParams>,
+    k_means_params: Option<crate::gpu::k_means_gpu::KMeansGpuParams>,
     dist_metric: &str,
     seed: usize,
     verbose: bool,
@@ -2776,6 +3175,10 @@ where
 /// support. Slim counterpart to [`build_nndescent_index_gpu`] aimed at
 /// NSG feeders and raw-kNN consumers.
 ///
+/// The whole dataset is uploaded as one tensor and held for the build, so it
+/// is bounded by the device's per-binding limit. Use
+/// [`build_clustered_knn_graph_gpu`] for datasets past that ceiling.
+///
 /// ### Params
 ///
 /// * `mat` - Input matrix (samples x features)
@@ -2790,6 +3193,10 @@ where
 /// * `seed` - Random seed
 /// * `verbose` - Print progress
 /// * `device` - CubeCL runtime device
+///
+/// ### Returns
+///
+/// Populated [`crate::gpu::nndescent_gpu::KnnGraphGpu`].
 #[allow(clippy::too_many_arguments)]
 pub fn build_knn_graph_gpu<T, R>(
     mat: MatRef<T>,
@@ -2820,10 +3227,89 @@ where
 }
 
 #[cfg(feature = "gpu")]
+/// Build a raw kNN graph on the GPU in balanced batches.
+///
+/// Batched counterpart to [`build_knn_graph_gpu`], for datasets whose working
+/// set does not fit a single GPU binding. Partitions with balanced k-means on a
+/// subsample, gives every point membership of its two nearest clusters, runs
+/// NN-Descent one cluster at a time and merges the subgraphs into a global
+/// graph. Only one cluster is device-resident at a time.
+///
+/// ### Params
+///
+/// * `mat` - Input matrix (samples x features)
+/// * `dist_metric` - Distance metric string
+/// * `k` - Neighbours per node (default 30)
+/// * `build_k` - Internal NNDescent working degree (default 1.5*k)
+/// * `max_iters` - Maximum NNDescent iterations per cluster (default 15)
+/// * `n_trees` - Forest size for GPU init; sized per cluster when `None`
+/// * `delta` - Convergence threshold (default 0.001)
+/// * `rho` - Local-join sampling rate (default 0.5)
+/// * `refine_knn` - 2-hop refinement sweeps per cluster (default 0)
+/// * `cluster_params` - Optional [`crate::gpu::clustered_nndescent_gpu::ClusteredBuildParams`];
+///   `None` plans the cluster count from the device limits
+/// * `seed` - Random seed
+/// * `verbose` - Print progress
+/// * `device` - CubeCL runtime device
+///
+/// ### Returns
+///
+/// Populated [`crate::gpu::nndescent_gpu::KnnGraphGpu`], identical in shape to
+/// the unbatched path.
+///
+/// ### Note
+///
+/// This trades speed for reach. NN-Descent is roughly `O(n^1.14)`, so `C`
+/// clusters with 2x overlap do more total distance work than one graph would,
+/// around 2x at `C = 2`. Whenever the dataset already fits, this falls through
+/// to [`build_knn_graph_gpu`] rather than paying that for nothing.
+#[allow(clippy::too_many_arguments)]
+pub fn build_clustered_knn_graph_gpu<T, R>(
+    mat: MatRef<T>,
+    dist_metric: &str,
+    k: Option<usize>,
+    build_k: Option<usize>,
+    max_iters: Option<usize>,
+    n_trees: Option<usize>,
+    delta: Option<f32>,
+    rho: Option<f32>,
+    refine_knn: Option<usize>,
+    cluster_params: Option<crate::gpu::clustered_nndescent_gpu::ClusteredBuildParams>,
+    seed: usize,
+    verbose: bool,
+    device: R::Device,
+) -> Result<crate::gpu::nndescent_gpu::KnnGraphGpu<T>, AnnSearchErrors>
+where
+    R: Runtime,
+    T: AnnSearchFloat + CubeclFloat,
+{
+    let metric = parse_ann_dist(dist_metric).unwrap_or_else(|| {
+        println!("[WARNING] Weird string used for distance metric. Using default squared Euclidean distance");
+        Dist::default()
+    });
+
+    crate::gpu::clustered_nndescent_gpu::build_clustered_knn_graph_gpu::<T, R>(
+        mat,
+        metric,
+        k,
+        build_k,
+        max_iters,
+        n_trees,
+        delta,
+        rho,
+        refine_knn,
+        cluster_params,
+        seed,
+        verbose,
+        device,
+    )
+}
+
+#[cfg(feature = "gpu")]
 /// Build an NSG index from a slim GPU-built kNN graph.
 ///
-/// Companion to [`build_nsg_from_gpu_nndescent`] for callers that used
-/// [`build_knn_graph_gpu`] instead of the full CAGRA-optimised
+/// For callers that used [`build_knn_graph_gpu`] or
+/// [`build_clustered_knn_graph_gpu`] instead of the full CAGRA-optimised
 /// [`build_nndescent_index_gpu`]. Cheaper end-to-end: no CAGRA kernels and
 /// no second graph copy in memory.
 ///

@@ -8,8 +8,8 @@
 
 use cubecl::frontend::{Float, SharedMemory};
 use cubecl::prelude::*;
-use rand::{rngs::SmallRng, Rng, SeedableRng};
 use cubecl_utils_rs::prelude::*;
+use rand::{rngs::SmallRng, Rng, SeedableRng};
 
 use crate::gpu::*;
 use crate::prelude::*;
@@ -525,9 +525,6 @@ pub fn cagra_beam_search<F: Float, N: Size>(
 
     let max_iter_u32 = max_iters as u32;
     let mut iter: u32 = 0u32;
-    // Tracked in a register and flushed once after the loop. `out_iters` is a
-    // diagnostic nobody reads back, and writing it per iteration cost a global
-    // store per beam step per query.
     let mut last_iter: u32 = 0u32;
     while iter < max_iter_u32 {
         if tx == 0u32 {
@@ -593,10 +590,7 @@ pub fn cagra_beam_search<F: Float, N: Size>(
             }
 
             // Terminate when nothing was expanded this iteration, judged by
-            // whether any non-sentinel landed in `s_nbr_idx`. A preceding scan
-            // over `s_cand_expanded` used to set the same flag here, but every
-            // path below overwrote it, so it was dead work: an `nc`-long serial
-            // scan on one lane, every beam iteration.
+            // whether any non-sentinel landed in `s_nbr_idx`.
             let mut any_real: bool = false;
             let mut ck = 0usize;
             while ck < total_slots {

@@ -68,30 +68,28 @@ fn main() {
 
     let device: cubecl::wgpu::WgpuDevice = Default::default();
 
-    let knn_k: usize = 48;
+    let knn_k: usize = 32;
 
-    // Build the GPU kNN graph ONCE and reuse it across every (r, l_build)
-    // combination below.
     println!("Building GPU kNN graph (k={})...", knn_k);
     let knn_start = Instant::now();
     let knn_gpu = build_knn_graph_gpu::<f32, cubecl::wgpu::WgpuRuntime>(
         data.as_ref(),
         &cli.distance,
         Some(knn_k),
-        None,
+        Some(knn_k),
         None,
         None,
         None,
         None,
         None,
         cli.seed as usize,
-        true,
+        false,
         device,
     )
     .unwrap();
     let knn_build_ms = knn_start.elapsed().as_secs_f64() * 1000.0;
-    println!("GPU kNN graph built in {:.2} ms", knn_build_ms);
-    println!("-----------------------------");
+    // println!("GPU kNN graph built in {:.2} ms", knn_build_ms);
+    // println!("-----------------------------");
 
     let build_params: &[(usize, usize)] = &[
         (24, 50),
@@ -115,7 +113,7 @@ fn main() {
 
         let start = Instant::now();
         let nsg_idx =
-            build_nsg_from_gpu_knn(&knn_gpu, r, l_build, c_cap, cli.seed as usize, true).unwrap();
+            build_nsg_from_gpu_knn(&knn_gpu, r, l_build, c_cap, cli.seed as usize, false).unwrap();
         let nsg_build_ms = start.elapsed().as_secs_f64() * 1000.0;
         let build_time = knn_build_ms + nsg_build_ms;
 

@@ -17,7 +17,7 @@ If you wish to run the Navigating Spread-out Graph (NSG) version where the
 initial kNN is generated on the GPU, you can test this via:
 
 ```bash
-cargo run --example gridsearch_nsg gpu --features gpu --release
+cargo run --example gridsearch_nsg_gpu --features gpu --release
 ```
 
 Similar to the other benchmarks, index building, query against 10% slightly
@@ -36,13 +36,7 @@ Other backends like cuda might provide even more speed benefits.
 
 ### GPU-accelerated exhaustive and IVF vs CPU exhaustive
 
-The GPU acceleration is particularly notable for the exhaustive index. The
-IVF-GPU reaches very fast speeds here, but not much faster actually than the
-IVF-CPU version (or exhaustive GPU index). The advantages for the IVF-GPU index
-become more apparent in larger data sets (more to that below). Also to note is
-that the data is kept on the GPU for easier access and less frequent transfer
-between CPU and GPU, hence, the apparent reduced memory footprint. The data
-lives on the GPU for this version. (Be aware of your VRAM limits!).
+The GPU acceleration is particularly notable for the exhaustive index.
 
 <details>
 <summary><b>GPU - Euclidean (Gaussian)</b>:</summary>
@@ -114,14 +108,6 @@ hence, the number of samples was increased to 250_000 and dimensions to 64 or
 
 ---
 
-The results here are more favourable of the GPU acceleration. We go from ~90
-seconds with exhaustive search on CPU to ~20 seconds on GPU for full kNN
-generation; with the IVF variants, we can go from 10 seconds for the CPU based
-version to ~7 seconds on the GPU one, a smaller effect than on for the
-exhaustive search.
-
----
-
 <details>
 <summary><b>CPU-IVF (250k samples; 128 dimensions)</b>:</summary>
 <pre><code>
@@ -137,12 +123,6 @@ exhaustive search.
 <!-- BENCH:gpu:euclidean:cell:128:250000 -->
 </code></pre>
 </details>
-
-The exhaustive kNN search on the CPU takes ~200 seconds (3+ minutes). Leveraging
-the GPU, we cut this down to 30 seconds, a 4x speedup. The IVF CPU as a highly
-optimised version takes 15 seconds, we can cut this down to 10 seconds. In
-this case, the acceleration is more modest (similar as before) – the exhaustiv
-search benefits from the large volume of data.
 
 #### Increasing the number of samples
 
@@ -183,13 +163,6 @@ advantage of the GPU acceleration.
 </code></pre>
 </details>
 
----
-
-The overall trends hold true. The exhaustive search becomes much faster on the
-GPU, the IVF-based version gets a decent 2x bonus here. In this case, the
-dimensionality starts being large enough that the GPU has enough data to
-churn through and the difference with CPU versions becomes more apparent.
-
 ### CAGRA-type querying
 
 The crate also offers a [CAGRA-style index](https://arxiv.org/abs/2308.15136),
@@ -218,10 +191,7 @@ Querying uses a GPU beam search kernel: one workgroup per query, with the query
 vector in shared memory, a sorted candidate queue, and a linear-probing hash
 table for visited-node deduplication. Beam width and iteration limits are
 scaled automatically based on `k` and the graph degree via
-`CagraGpuSearchParams::from_graph()`. For small individual queries, a CPU
-path is used that doesn't have the overhead of the GPU kernel launches.
-Generally speaking, this index does not perform too well on very well separated
-data. However, it does perform well on low-rank data.
+`CagraGpuSearchParams::from_graph()`.
 
 #### Parameter guidance
 
@@ -474,20 +444,6 @@ dimensionality.
 <!-- BENCH:nsg_gpu:euclidean:cell:128:500000 -->
 </code></pre>
 </details>
-
-## Conclusions
-
-GPU acceleration in the setting of the `wgpu` backend only starts making sense
-with large indices and large dimensionality (assuming you can hold the data
-in VRAM or unified memory for Apple Silicon). With smaller dimensionalities and
-less samples, the overhead of launching the GPU kernels does not give
-substantial performance benefits over the highly optimised CPU code. Exhaustive
-searches over larger data sets however become more viable with GPU acceleration
-and it here where some of the biggest gains can be observed. To note, these
-implemetations are not designed (and cannot) compete with what is possible
-on data centre GPUs with cuBLAS under the hood! They serve as an acceleration
-in specific situations and were designed to enable fast kNN generation for
-1m to 10m sample situations with lower dimensions (think single cell).
 
 ### Runtime info
 

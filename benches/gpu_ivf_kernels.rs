@@ -4,7 +4,7 @@
 //!
 //! Run with: cargo bench --bench gpu_ivf_kernels --features gpu
 
-use ann_search_rs::prelude::KMeansTrainingParams;
+use ann_search_rs::gpu::k_means_gpu::KMeansGpuParams;
 use cubecl::benchmark::{Benchmark, TimingMethod};
 use cubecl::future;
 use cubecl::prelude::*;
@@ -39,8 +39,8 @@ struct IvfBuildInput {
     dim: usize,
 }
 
-fn default_k_means_params() -> Option<KMeansTrainingParams> {
-    Some(KMeansTrainingParams::new(10, None, None))
+fn default_k_means_params() -> Option<KMeansGpuParams> {
+    Some(KMeansGpuParams::new(10, None, true, false))
 }
 
 impl<R: Runtime> Benchmark for IvfBuildBench<R> {
