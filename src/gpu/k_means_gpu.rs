@@ -2428,6 +2428,17 @@ where
         return Err(AnnSearchErrors::DistanceNotSupported(*metric));
     }
 
+    // `fast_random_init` draws `n_centroids` distinct rows, so fewer rows than
+    // centroids indexes past the end of its shuffled list. `train_centroids`
+    // guards the CPU path; this entry point reaches the same seeding directly,
+    // and `resolve_init` picks the random path for every `n_centroids > 200`.
+    if n_centroids > n {
+        return Err(AnnSearchErrors::TooFewSamplesForCentroids {
+            n_centroids,
+            n_samples: n,
+        });
+    }
+
     // The Lloyd loop rebuilds a CSR every iteration through a privatised
     // histogram, which is entirely `Atomic::fetch_add`. On a runtime without
     // u32 atomics -- the CubeCL CPU runtime is the one that matters here, since

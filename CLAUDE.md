@@ -26,8 +26,8 @@ cargo test --release --features quantised -- ivf_pq::tests::name_of_test --exact
 
 # Gridsearch examples (one per algorithm; feature-gated ones need the flag)
 # CPU:       annoy, balltree, hnsw, ivf, kd_forest, kmknn, lsh, nndescent, nsg,
-#            rnn_descent, vamana
-# quantised: bf16, sq8, pq, opq
+#            rnn_descent, soar, vamana
+# quantised: bf16, sq8, pq, opq, soar_pq, soar_opq
 # binary:    binary, rabitq, tq
 # gpu:       gpu, cagra, nsg_gpu, clustered_nndescent (plus the
 #            knn_comparison_cagra example)
@@ -83,8 +83,9 @@ src/
                    # traits, striped locks (parallelism.rs), file staging
   cpu/             # CPU indices: annoy, ball_tree, exhaustive, hnsw, ivf,
                    #              kd_forest, kmknn, lsh, nndescent, nsg,
-                   #              rnn_descent, vamana
-  quantised/       # bf16/sq8/pq/opq × (exhaustive, ivf) + shared k_means & quantisers
+                   #              rnn_descent, soar, vamana
+  quantised/       # bf16/sq8/pq/opq × (exhaustive, ivf) + soar_pq, soar_opq
+                   # (IVF-PQ/OPQ with SOAR spilling) + shared k_means & quantisers
   binary/          # binary/rabitq/tq × (exhaustive, ivf) + binariser, vec_store, turboquant/
   gpu/             # exhaustive_gpu, ivf_gpu, nndescent_gpu, cagra_gpu_search,
                    # clustered_nndescent_gpu, forest_gpu, k_means_gpu,

@@ -2375,6 +2375,394 @@ pub fn invert_assignments_csr(
 }
 
 //////////
+// SOAR //
+//////////
+
+/// Rule picking the second cluster a point joins under SOAR spilling
+///
+/// Spilling puts every point in two inverted lists so a query that misses the
+/// first still has a chance at the second. Which second list is chosen is the
+/// whole game: the useful one is the list that fails on *different* queries
+/// than the first does, not simply the next-closest one.
+///
+/// The three arms differ only in the cost minimised over candidate centroids,
+/// writing `r' = x - c` for the candidate residual and `r_1 = x - c_1` for the
+/// primary one. For `Cosine` all of this happens on the unit sphere, since that
+/// is the geometry the routing decision lives in.
+///
+/// ### References
+///
+/// Sun, Simcha, Simcha, Chern & Guo, arXiv:2404.00774, 2024 (SOAR)
+#[derive(Clone, Copy, Debug, PartialEq)]
+#[cfg_attr(feature = "serialise", derive(serde::Serialize, serde::Deserialize))]
+pub enum SoarRule {
+    /// Plain second-nearest centroid, minimising `||r'||^2`
+    ///
+    /// The baseline the other two have to beat. Redundant by construction: for
+    /// a point sitting at the edge of its cell, the second-nearest centroid is
+    /// usually the one just behind the first, so it fails on the same queries.
+    Nearest,
+    /// Nearest centroid to the shifted point `x + mu * (x - c_1)`
+    ///
+    /// Derived for squared Euclidean. Conditioning on the queries that make the
+    /// primary cell look bad gives a *signed* penalty `2*eps*gamma*<r_hat_1, r'>`
+    /// rather than the published squared one, and completing the square turns
+    /// the whole objective back into a plain nearest-centroid lookup against a
+    /// point pushed away from its own centroid. `mu = 0` degenerates to
+    /// [`SoarRule::Nearest`]. Negative values are clamped to zero.
+    Shifted {
+        /// Shift as a multiple of the primary residual. Sensible range 0.2-1.0.
+        mu: f64,
+    },
+    /// Published SOAR loss, `||r'||^2 + lambda * (r' . r_hat_1)^2`
+    ///
+    /// Derived for MIPS under a uniform query distribution on the unit sphere,
+    /// so it applies unchanged to cosine, where the ranking is the same problem.
+    /// Under squared Euclidean the premise does not hold: the symmetric penalty
+    /// discards the anti-aligned candidates that are in fact the good ones,
+    /// which [`SoarRule::Shifted`] keeps. That difference is real in the
+    /// geometry (see the collinear unit test) but has not shown up as a recall
+    /// difference on any dataset measured so far, where all three rules land
+    /// within noise of each other. Reported lambda: 1.0 on Glove-1M, 1.5 at
+    /// billion scale. Negative values are clamped to zero.
+    Orthogonal {
+        /// Weight on the parallel component of the candidate residual.
+        lambda: f64,
+    },
+}
+
+/// Default shift for [`SoarRule::Shifted`] under squared Euclidean.
+///
+/// The derived shift is `eps * gamma`, with `eps` the local kNN radius and
+/// `gamma` the mean alignment over the failure cap, neither of which is known
+/// at build time. Expressed as a multiple of the primary residual it lands in
+/// the low fractions, and 0.5 is the middle of the 0.2-1.0 band the gridsearch
+/// sweeps. Points deep inside a cell have a small residual and so a small
+/// shift, which is wanted: they do not need complementary spilling.
+pub const DEFAULT_SHIFT_MU: f64 = 0.5;
+
+/// Default weight for [`SoarRule::Orthogonal`] under cosine.
+///
+/// The SOAR paper reports 1.0 on Glove-1M and 1.5 at billion scale. Datasets
+/// here sit far closer to the former.
+pub const DEFAULT_ORTHOGONAL_LAMBDA: f64 = 1.0;
+
+/// Reciprocal that yields zero instead of infinity on a zero input
+///
+/// ### Params
+///
+/// * `x` - Value to invert
+///
+/// ### Returns
+/// `1 / x`, or zero when `x` is not strictly positive.
+#[inline(always)]
+fn safe_recip<T: Float>(x: T) -> T {
+    if x > T::zero() {
+        x.recip()
+    } else {
+        T::zero()
+    }
+}
+
+/// Nearest centroid to a point, skipping one cluster
+///
+/// Repair path for the rare case where a spilling rule lands back on the
+/// primary cluster, which would waste the point's second list slot.
+///
+/// ### Params
+///
+/// * `point` - The point, `dim` elements
+/// * `point_norm` - Its L2 norm; only read for cosine
+/// * `centroids` - Centroids, flattened row-major `k * dim`
+/// * `centroid_norms` - L2 norms per centroid; only read for cosine
+/// * `dim` - Embedding dimensions
+/// * `k` - Number of centroids
+/// * `exclude` - Cluster to skip
+/// * `metric` - Distance metric
+///
+/// ### Returns
+///
+/// Nearest cluster id other than `exclude`, or `exclude` itself when `k < 2`.
+/// Seeded with a valid non-excluded id rather than with `exclude`, so a scan in
+/// which every distance comes back non-finite still returns a distinct cluster.
+#[allow(clippy::too_many_arguments)]
+fn nearest_excluding<T>(
+    point: &[T],
+    point_norm: T,
+    centroids: &[T],
+    centroid_norms: &[T],
+    dim: usize,
+    k: usize,
+    exclude: usize,
+    metric: &Dist,
+) -> u32
+where
+    T: AnnSearchFloat,
+{
+    if k < 2 {
+        return exclude as u32;
+    }
+    let mut best = if exclude == 0 { 1u32 } else { 0u32 };
+    let mut best_d = T::infinity();
+    for c in 0..k {
+        if c == exclude {
+            continue;
+        }
+        let cent = &centroids[c * dim..(c + 1) * dim];
+        let d = match metric {
+            Dist::Cosine => {
+                let denom = point_norm * centroid_norms[c];
+                if denom > T::zero() {
+                    T::one() - T::dot_simd(point, cent) / denom
+                } else {
+                    T::one()
+                }
+            }
+            _ => T::euclidean_simd(point, cent),
+        };
+        if d < best_d {
+            best_d = d;
+            best = c as u32;
+        }
+    }
+    best
+}
+
+/// Assign every point a second cluster under a SOAR spilling rule
+///
+/// Companion to [`assign_all_parallel`], which produces the primary assignment
+/// this builds on. Returns one extra cluster per point, so the two together put
+/// each point in exactly two inverted lists.
+///
+/// [`SoarRule::Shifted`] deliberately reuses [`assign_all_parallel`] on a
+/// shifted copy of the data rather than introducing a scoring kernel of its
+/// own, which means it inherits the tiled GEMM path for free. The other two
+/// arms are plain `O(n * k * dim)` scans with no GEMM path. Measured, that has
+/// not been the build bottleneck at the sizes tried, because k-means training
+/// dominates; it becomes one at `dim >= GEMM_DIM_THRESHOLD`, where the primary
+/// assignment gets faer and these arms do not. The fix, tiling the distance
+/// matrix and `C * R_hat^T` through faer, is deferred until it shows up.
+///
+/// ### Params
+///
+/// * `data` - All vectors, flattened row-major `n * dim`
+/// * `data_norms` - L2 norms per point; only read for cosine
+/// * `dim` - Embedding dimensions
+/// * `n` - Number of vectors
+/// * `centroids` - Centroids, flattened row-major `k * dim`
+/// * `centroid_norms` - L2 norms per centroid; only read for cosine
+/// * `k` - Number of centroids
+/// * `primary` - Primary assignment from [`assign_all_parallel`], `n` entries
+/// * `rule` - Which secondary-assignment cost to minimise
+/// * `metric` - Distance metric; `Manhattan` is not supported
+///
+/// ### Returns
+///
+/// `n` cluster ids, guaranteed different from `primary` whenever `k >= 2`. With
+/// `k < 2` there is no second cluster to give, so `primary` is echoed back and
+/// the caller ends up with a plain non-spilled index.
+#[allow(clippy::too_many_arguments)]
+pub fn assign_secondary_soar<T>(
+    data: &[T],
+    data_norms: &[T],
+    dim: usize,
+    n: usize,
+    centroids: &[T],
+    centroid_norms: &[T],
+    k: usize,
+    primary: &[usize],
+    rule: &SoarRule,
+    metric: &Dist,
+) -> Vec<u32>
+where
+    T: AnnSearchFloat,
+{
+    if k < 2 {
+        return primary.iter().map(|&c| c as u32).collect();
+    }
+
+    let cosine = matches!(metric, Dist::Cosine);
+
+    match rule {
+        SoarRule::Nearest => {
+            let top = assign_all_parallel_top_m(
+                data,
+                data_norms,
+                dim,
+                n,
+                centroids,
+                centroid_norms,
+                k,
+                2,
+                metric,
+            );
+            // Take column 0 when it is not already the primary. Column 0 of the
+            // top-2 scan and `assign_all_parallel` can disagree on ties, since
+            // they are different implementations; taking column 1 blindly then
+            // leaves the point's *actual* nearest cell holding neither copy,
+            // which is a pure recall loss.
+            let mut out: Vec<u32> = (0..n)
+                .map(|i| {
+                    if top[i * 2] as usize != primary[i] {
+                        top[i * 2]
+                    } else {
+                        top[i * 2 + 1]
+                    }
+                })
+                .collect();
+            // Can still collide when both columns tie with the primary.
+            out.par_iter_mut().enumerate().for_each(|(i, slot)| {
+                if *slot as usize == primary[i] {
+                    *slot = nearest_excluding(
+                        &data[i * dim..(i + 1) * dim],
+                        if cosine { data_norms[i] } else { T::one() },
+                        centroids,
+                        centroid_norms,
+                        dim,
+                        k,
+                        primary[i],
+                        metric,
+                    );
+                }
+            });
+            out
+        }
+
+        SoarRule::Shifted { mu } => {
+            let mu = T::from_f64(mu.max(0.0)).unwrap_or_else(T::zero);
+            let one_plus_mu = T::one() + mu;
+
+            // x_tilde = (1 + mu) * x - mu * c_1, on the unit sphere for cosine.
+            let mut shifted = vec![T::zero(); n * dim];
+            shifted
+                .par_chunks_mut(dim)
+                .enumerate()
+                .for_each(|(i, out)| {
+                    let c1 = primary[i];
+                    let vec = &data[i * dim..(i + 1) * dim];
+                    let cent = &centroids[c1 * dim..(c1 + 1) * dim];
+                    let (inv_v, inv_c) = if cosine {
+                        (safe_recip(data_norms[i]), safe_recip(centroid_norms[c1]))
+                    } else {
+                        (T::one(), T::one())
+                    };
+                    for d in 0..dim {
+                        out[d] = one_plus_mu * (vec[d] * inv_v) - mu * (cent[d] * inv_c);
+                    }
+                });
+
+            let shifted_norms: Vec<T> = if cosine {
+                shifted
+                    .par_chunks(dim)
+                    .map(|v| T::calculate_l2_norm(v))
+                    .collect()
+            } else {
+                vec![T::one(); n]
+            };
+
+            let assigned = assign_all_parallel(
+                &shifted,
+                &shifted_norms,
+                dim,
+                n,
+                centroids,
+                centroid_norms,
+                k,
+                metric,
+            );
+
+            let mut out: Vec<u32> = assigned.into_iter().map(|c| c as u32).collect();
+            // The shift moves away from `c_1`, so collisions thin out as `mu`
+            // grows, but at small `mu` they are common. Repair against the
+            // shifted point, which is what the rule actually ranks.
+            out.par_iter_mut().enumerate().for_each(|(i, slot)| {
+                if *slot as usize == primary[i] {
+                    *slot = nearest_excluding(
+                        &shifted[i * dim..(i + 1) * dim],
+                        shifted_norms[i],
+                        centroids,
+                        centroid_norms,
+                        dim,
+                        k,
+                        primary[i],
+                        metric,
+                    );
+                }
+            });
+            out
+        }
+
+        SoarRule::Orthogonal { lambda } => {
+            let lambda = T::from_f64(lambda.max(0.0)).unwrap_or_else(T::zero);
+            let two = T::one() + T::one();
+            let mut out = vec![0u32; n];
+
+            out.par_iter_mut().enumerate().for_each_init(
+                || vec![T::zero(); dim],
+                |r1_hat, (i, slot)| {
+                    let c1 = primary[i];
+                    let vec = &data[i * dim..(i + 1) * dim];
+                    let cent1 = &centroids[c1 * dim..(c1 + 1) * dim];
+                    let (inv_v, inv_c1) = if cosine {
+                        (safe_recip(data_norms[i]), safe_recip(centroid_norms[c1]))
+                    } else {
+                        (T::one(), T::one())
+                    };
+
+                    for d in 0..dim {
+                        r1_hat[d] = vec[d] * inv_v - cent1[d] * inv_c1;
+                    }
+                    // A point sitting exactly on its centroid has no residual
+                    // direction; `safe_recip` zeroes `r1_hat`, the penalty term
+                    // vanishes and the arm falls back to nearest-excluding.
+                    let inv_r1 = safe_recip(T::calculate_l2_norm(r1_hat.as_slice()));
+                    for v in r1_hat.iter_mut() {
+                        *v = *v * inv_r1;
+                    }
+
+                    // <x, r_hat_1> does not depend on the candidate, so hoist it
+                    // and pay only one extra dot product per centroid.
+                    let x_proj = T::dot_simd(vec, r1_hat.as_slice()) * inv_v;
+
+                    // Seeded with a valid non-primary id, so an all-infinite
+                    // scan still yields a distinct second cluster. `k >= 2` is
+                    // guaranteed by the early return above.
+                    let mut best = if c1 == 0 { 1u32 } else { 0u32 };
+                    let mut best_cost = T::infinity();
+                    for c in 0..k {
+                        if c == c1 {
+                            continue;
+                        }
+                        let cent = &centroids[c * dim..(c + 1) * dim];
+                        let (base, proj) = if cosine {
+                            let inv_c = safe_recip(centroid_norms[c]);
+                            // ||x_hat - c_hat||^2 = 2 - 2 cos(x, c)
+                            let cos = T::dot_simd(vec, cent) * inv_v * inv_c;
+                            (
+                                two - two * cos,
+                                x_proj - T::dot_simd(cent, r1_hat.as_slice()) * inv_c,
+                            )
+                        } else {
+                            (
+                                T::euclidean_simd(vec, cent),
+                                x_proj - T::dot_simd(cent, r1_hat.as_slice()),
+                            )
+                        };
+                        let cost = base + lambda * proj * proj;
+                        if cost < best_cost {
+                            best_cost = cost;
+                            best = c as u32;
+                        }
+                    }
+                    *slot = best;
+                },
+            );
+            out
+        }
+    }
+}
+
+//////////
 // Main //
 //////////
 
@@ -2400,6 +2788,13 @@ pub fn invert_assignments_csr(
 /// ### Returns
 ///
 /// Flat `n_centroids * dim` row-major centroid buffer.
+///
+/// ### Errors
+///
+/// * `DistanceNotSupported` for `Manhattan`
+/// * `TooFewSamplesForCentroids` if `n_centroids > n`. The random seeding path
+///   draws distinct rows and would index past the end; k-means|| tolerates it
+///   but only by emitting duplicate centroids.
 #[allow(clippy::too_many_arguments)]
 pub fn train_centroids<T>(
     data: &[T],
@@ -2416,6 +2811,23 @@ where
 {
     if *metric == Dist::Manhattan {
         return Err(AnnSearchErrors::DistanceNotSupported(*metric));
+    }
+
+    // `fast_random_init` draws `n_centroids` *distinct* rows, so fewer rows than
+    // centroids reads past the end of its shuffled index list and panics.
+    // `kmeans_parallel_init` samples with replacement and survives, but only by
+    // emitting duplicate centroids, which is not a useful index either. Caught
+    // here rather than in `fast_random_init`, which stays infallible.
+    //
+    // Note this is stricter than the old behaviour for `n_centroids <= 200`,
+    // where `resolve_init` picks k-means|| and the build previously succeeded
+    // degenerately. Erroring is deliberate: more clusters than points is a
+    // caller mistake, not something to paper over.
+    if n_centroids > n {
+        return Err(AnnSearchErrors::TooFewSamplesForCentroids {
+            n_centroids,
+            n_samples: n,
+        });
     }
 
     let params = params_k_means.unwrap_or_default();

@@ -139,6 +139,14 @@ name = "gridsearch_pq"
 required-features = ["quantised"]
 
 [[example]]
+name = "gridsearch_soar_pq"
+required-features = ["quantised"]
+
+[[example]]
+name = "gridsearch_soar_opq"
+required-features = ["quantised"]
+
+[[example]]
 name = "gridsearch_binary"
 required-features = ["binary"]
 

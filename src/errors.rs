@@ -82,6 +82,17 @@ pub enum AnnSearchErrors {
         /// Chosen number of centroids
         n_centroids: usize,
     },
+    /// Fewer training vectors than centroids to seed
+    #[error(
+        "Cannot train {n_centroids} centroids from {n_samples} vectors; \
+         there must be at least as many vectors as centroids."
+    )]
+    TooFewSamplesForCentroids {
+        /// Chosen number of centroids
+        n_centroids: usize,
+        /// Vectors available for training
+        n_samples: usize,
+    },
 
     // -- binary errors --
     /// Asymmetric queries are only supported with sign-based binarisation

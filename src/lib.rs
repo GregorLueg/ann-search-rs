@@ -57,7 +57,7 @@ use crate::serialise::IndexIo;
 
 use crate::cpu::{
     annoy::*, ball_tree::*, exhaustive::*, hnsw::*, ivf::*, kd_forest::*, kmknn::*, lsh::*,
-    nndescent::*, nsg::*, rnn_descent::*, vamana::*,
+    nndescent::*, nsg::*, rnn_descent::*, soar::*, vamana::*,
 };
 use crate::prelude::*;
 use crate::utils::nndescent_utils::ApplySortedUpdates;
@@ -72,7 +72,7 @@ use crate::gpu::{exhaustive_gpu::*, ivf_gpu::*, nndescent_gpu::*};
 #[cfg(feature = "quantised")]
 use crate::quantised::{
     exhaustive_bf16::*, exhaustive_opq::*, exhaustive_pq::*, exhaustive_sq8::*, ivf_bf16::*,
-    ivf_opq::*, ivf_pq::*, ivf_sq8::*,
+    ivf_opq::*, ivf_pq::*, ivf_sq8::*, soar_opq::*, soar_pq::*,
 };
 
 ////////////
@@ -826,6 +826,135 @@ where
 /// during querying.
 pub fn query_ivf_self<T>(
     index: &IvfIndex<T>,
+    k: usize,
+    nprobe: Option<usize>,
+    return_dist: bool,
+    verbose: bool,
+) -> KnnOptionResult<T>
+where
+    T: AnnSearchFloat,
+{
+    index.generate_knn(k, nprobe, return_dist, verbose)
+}
+
+//////////
+// SOAR //
+//////////
+
+/// Build a SOAR index
+///
+/// An IVF index in which every point is stored in two Voronoi cells rather than
+/// one, with the second cell picked so it fails on different queries than the
+/// first. See [`SoarRule`] for the available rules and what each is derived
+/// for.
+///
+/// ### Params
+///
+/// * `mat` - The data matrix. Rows represent the samples, columns represent
+///   the embedding dimensions
+/// * `nlist` - Number of clusters to create. Defaults to `sqrt(n)`. Spilling
+///   pays off in the fine-cell regime, so larger values are worth trying here
+///   in a way they are not for [`build_ivf_index`].
+/// * `rule` - Optional secondary-assignment rule. Defaults to the
+///   metric-appropriate choice: the published quadratic loss under cosine, the
+///   shifted-point rule under squared Euclidean.
+/// * `k_means_params` - Optional k-means trainings parameters, see
+///   [KMeansTrainingParams]. If not provided, will default to sensible
+///   defaults.
+/// * `dist_metric` - Distance metric: "euclidean" or "cosine". "manhatten" is
+///   not supported.
+/// * `seed` - Random seed for reproducibility
+/// * `verbose` - Print progress information during index construction
+///
+/// ### Return
+///
+/// The `SoarIndex`.
+///
+/// ### References
+///
+/// Sun, Simcha, Simcha, Chern & Guo, arXiv:2404.00774, 2024 (SOAR)
+pub fn build_soar_index<T>(
+    mat: MatRef<T>,
+    nlist: Option<usize>,
+    rule: Option<SoarRule>,
+    k_means_params: Option<KMeansTrainingParams>,
+    dist_metric: &str,
+    seed: usize,
+    verbose: bool,
+) -> Result<SoarIndex<T>, AnnSearchErrors>
+where
+    T: AnnSearchFloat,
+{
+    let metric = parse_ann_dist(dist_metric).unwrap_or_else(|| {
+        println!("[WARNING] Weird string used for distance metric. Using default squared Euclidean distance");
+        Dist::default()
+    });
+
+    SoarIndex::build(mat, metric, nlist, rule, k_means_params, seed, verbose)
+}
+
+/// Helper function to query a given SOAR index
+///
+/// ### Params
+///
+/// * `query_mat` - The query matrix containing the samples x features
+/// * `index` - Reference to the built SOAR index
+/// * `k` - Number of neighbours to return
+/// * `nprobe` - Number of clusters to search. Higher values improve recall at
+///   the cost of speed
+/// * `return_dist` - Shall the distances between the different points be
+///   returned
+/// * `verbose` - Print progress information
+///
+/// ### Returns
+///
+/// A tuple of `(knn_indices, optional distances)`
+///
+/// ### Note
+///
+/// The distance metric is determined at index build time and cannot be changed
+/// during querying.
+pub fn query_soar_index<T>(
+    query_mat: MatRef<T>,
+    index: &SoarIndex<T>,
+    k: usize,
+    nprobe: Option<usize>,
+    return_dist: bool,
+    verbose: bool,
+) -> KnnOptionResult<T>
+where
+    T: AnnSearchFloat,
+{
+    query_parallel(query_mat.nrows(), return_dist, verbose, |i| {
+        index.query_row(query_mat.row(i), k, nprobe)
+    })
+}
+
+/// Helper function to self query a SOAR index
+///
+/// This function will generate a full kNN graph based on the internal data,
+/// using the same Voronoi-cell fast path as the plain IVF version.
+///
+/// ### Params
+///
+/// * `index` - Reference to the built SOAR index
+/// * `k` - Number of neighbours to return
+/// * `nprobe` - Number of clusters to search. Higher values improve recall at
+///   the cost of speed
+/// * `return_dist` - Shall the distances between the different points be
+///   returned
+/// * `verbose` - Print progress information
+///
+/// ### Returns
+///
+/// A tuple of `(knn_indices, optional distances)`
+///
+/// ### Note
+///
+/// The distance metric is determined at index build time and cannot be changed
+/// during querying.
+pub fn query_soar_self<T>(
+    index: &SoarIndex<T>,
     k: usize,
     nprobe: Option<usize>,
     return_dist: bool,
@@ -2214,6 +2343,264 @@ where
         seed,
         verbose,
     )
+}
+
+#[cfg(feature = "quantised")]
+/// Build a SOAR-PQ index
+///
+/// An IVF-PQ index in which every point is encoded twice, once as a residual
+/// against each of the two Voronoi cells it belongs to. Product quantisation
+/// rebuilds its ADC lookup table per probed cell, so drawing twice the
+/// candidates out of one cell is cheaper than the same candidates out of two.
+/// That is the asymmetry spilling exploits, and it does not exist for exact
+/// full-vector search.
+///
+/// Costs `2 * n * m` code bytes rather than `n * m`, so the fair comparison is
+/// against [`build_ivf_pq_index`] with twice the subspaces.
+///
+/// ### Params
+///
+/// * `mat` - The data matrix. Rows represent the samples, columns represent
+///   the embedding dimensions
+/// * `nlist` - Number of clusters to create. Defaults to `sqrt(n)`.
+/// * `m` - Number of PQ subspaces; must divide the embedding dimension
+/// * `rule` - Optional secondary-assignment rule, see [`SoarRule`]. Defaults to
+///   the metric-appropriate choice.
+/// * `k_means_params` - Optional k-means trainings parameters, see
+///   [KMeansTrainingParams]
+/// * `n_pq_centroids` - Optional codebook size, defaults to 256
+/// * `dist_metric` - Distance metric: "euclidean" or "cosine". "manhatten" is
+///   not supported.
+/// * `seed` - Random seed for reproducibility
+/// * `verbose` - Print progress information during index construction
+///
+/// ### Return
+///
+/// The `SoarPqIndex`.
+///
+/// ### References
+///
+/// Sun, Simcha, Simcha, Chern & Guo, arXiv:2404.00774, 2024 (SOAR)
+#[allow(clippy::too_many_arguments)]
+pub fn build_soar_pq_index<T>(
+    mat: MatRef<T>,
+    nlist: Option<usize>,
+    m: usize,
+    rule: Option<SoarRule>,
+    k_means_params: Option<KMeansTrainingParams>,
+    n_pq_centroids: Option<usize>,
+    dist_metric: &str,
+    seed: usize,
+    verbose: bool,
+) -> Result<SoarPqIndex<T>, AnnSearchErrors>
+where
+    T: AnnSearchFloat,
+{
+    let metric = parse_ann_dist(dist_metric).unwrap_or_else(|| {
+        println!("[WARNING] Weird string used for distance metric. Using default squared Euclidean distance");
+        Dist::default()
+    });
+
+    SoarPqIndex::build(
+        mat,
+        nlist,
+        m,
+        metric,
+        rule,
+        k_means_params,
+        n_pq_centroids,
+        seed,
+        verbose,
+    )
+}
+
+#[cfg(feature = "quantised")]
+/// Build a SOAR-OPQ index
+///
+/// The OPQ counterpart of [`build_soar_pq_index`]: every point is encoded twice
+/// as a rotated residual, once against each of the two Voronoi cells it belongs
+/// to. See [`build_soar_pq_index`] for why the per-cell ADC lookup table is what
+/// makes spilling pay under quantisation.
+///
+/// ### Params
+///
+/// * `mat` - The data matrix. Rows represent the samples, columns represent
+///   the embedding dimensions
+/// * `nlist` - Number of clusters to create. Defaults to `sqrt(n)`.
+/// * `m` - Number of PQ subspaces; must divide the embedding dimension
+/// * `rule` - Optional secondary-assignment rule, see [`SoarRule`]
+/// * `k_means_params` - Optional k-means trainings parameters, see
+///   [KMeansTrainingParams]
+/// * `n_opq_centroids` - Optional codebook size, defaults to 256
+/// * `opq_iter` - Optional number of rotation-refinement iterations
+/// * `dist_metric` - Distance metric: "euclidean" or "cosine". "manhatten" is
+///   not supported.
+/// * `seed` - Random seed for reproducibility
+/// * `verbose` - Print progress information during index construction
+///
+/// ### Return
+///
+/// The `SoarOpqIndex`.
+#[allow(clippy::too_many_arguments)]
+pub fn build_soar_opq_index<T>(
+    mat: MatRef<T>,
+    nlist: Option<usize>,
+    m: usize,
+    rule: Option<SoarRule>,
+    k_means_params: Option<KMeansTrainingParams>,
+    n_opq_centroids: Option<usize>,
+    opq_iter: Option<usize>,
+    dist_metric: &str,
+    seed: usize,
+    verbose: bool,
+) -> Result<SoarOpqIndex<T>, AnnSearchErrors>
+where
+    T: AnnSearchFloat + AddAssign,
+{
+    let metric = parse_ann_dist(dist_metric).unwrap_or_else(|| {
+        println!("[WARNING] Weird string used for distance metric. Using default squared Euclidean distance");
+        Dist::default()
+    });
+
+    SoarOpqIndex::build(
+        mat,
+        nlist,
+        m,
+        metric,
+        rule,
+        k_means_params,
+        n_opq_centroids,
+        opq_iter,
+        seed,
+        verbose,
+    )
+}
+
+#[cfg(feature = "quantised")]
+/// Helper function to query a given SOAR-OPQ index
+///
+/// ### Params
+///
+/// * `query_mat` - The query matrix containing the samples x features
+/// * `index` - Reference to the built SOAR-OPQ index
+/// * `k` - Number of neighbours to return
+/// * `nprobe` - Number of clusters to search
+/// * `return_dist` - Shall the distances between the different points be
+///   returned
+/// * `verbose` - Print progress information
+///
+/// ### Returns
+///
+/// A tuple of `(knn_indices, optional distances)`
+pub fn query_soar_opq_index<T>(
+    query_mat: MatRef<T>,
+    index: &SoarOpqIndex<T>,
+    k: usize,
+    nprobe: Option<usize>,
+    return_dist: bool,
+    verbose: bool,
+) -> KnnOptionResult<T>
+where
+    T: AnnSearchFloat + AddAssign,
+{
+    query_parallel(query_mat.nrows(), return_dist, verbose, |i| {
+        index.query_row(query_mat.row(i), k, nprobe)
+    })
+}
+
+#[cfg(feature = "quantised")]
+/// Helper function to self query a SOAR-OPQ index
+///
+/// Generates a full kNN graph from the stored codes. Each point is
+/// reconstructed from its primary copy, which carries the smaller residual.
+///
+/// ### Params
+///
+/// * `index` - Reference to the built SOAR-OPQ index
+/// * `k` - Number of neighbours to return
+/// * `nprobe` - Number of clusters to search
+/// * `return_dist` - Shall the distances between the different points be
+///   returned
+/// * `verbose` - Print progress information
+///
+/// ### Returns
+///
+/// A tuple of `(knn_indices, optional distances)`
+pub fn query_soar_opq_index_self<T>(
+    index: &SoarOpqIndex<T>,
+    k: usize,
+    nprobe: Option<usize>,
+    return_dist: bool,
+    verbose: bool,
+) -> KnnOptionResult<T>
+where
+    T: AnnSearchFloat + AddAssign,
+{
+    index.generate_knn(k, nprobe, return_dist, verbose)
+}
+
+#[cfg(feature = "quantised")]
+/// Helper function to query a given SOAR-PQ index
+///
+/// ### Params
+///
+/// * `query_mat` - The query matrix containing the samples x features
+/// * `index` - Reference to the built SOAR-PQ index
+/// * `k` - Number of neighbours to return
+/// * `nprobe` - Number of clusters to search
+/// * `return_dist` - Shall the distances between the different points be
+///   returned
+/// * `verbose` - Print progress information
+///
+/// ### Returns
+///
+/// A tuple of `(knn_indices, optional distances)`
+pub fn query_soar_pq_index<T>(
+    query_mat: MatRef<T>,
+    index: &SoarPqIndex<T>,
+    k: usize,
+    nprobe: Option<usize>,
+    return_dist: bool,
+    verbose: bool,
+) -> KnnOptionResult<T>
+where
+    T: AnnSearchFloat,
+{
+    query_parallel(query_mat.nrows(), return_dist, verbose, |i| {
+        index.query_row(query_mat.row(i), k, nprobe)
+    })
+}
+
+#[cfg(feature = "quantised")]
+/// Helper function to self query a SOAR-PQ index
+///
+/// Generates a full kNN graph from the stored codes. Each point is
+/// reconstructed from its primary copy, which carries the smaller residual and
+/// so the lower quantisation error.
+///
+/// ### Params
+///
+/// * `index` - Reference to the built SOAR-PQ index
+/// * `k` - Number of neighbours to return
+/// * `nprobe` - Number of clusters to search
+/// * `return_dist` - Shall the distances between the different points be
+///   returned
+/// * `verbose` - Print progress information
+///
+/// ### Returns
+///
+/// A tuple of `(knn_indices, optional distances)`
+pub fn query_soar_pq_index_self<T>(
+    index: &SoarPqIndex<T>,
+    k: usize,
+    nprobe: Option<usize>,
+    return_dist: bool,
+    verbose: bool,
+) -> KnnOptionResult<T>
+where
+    T: AnnSearchFloat,
+{
+    index.generate_knn(k, nprobe, return_dist, verbose)
 }
 
 #[cfg(feature = "quantised")]

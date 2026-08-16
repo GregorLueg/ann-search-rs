@@ -339,7 +339,7 @@ mod tests {
 
     use crate::cpu::{
         annoy::*, ball_tree::*, exhaustive::*, hnsw::*, ivf::*, kd_forest::*, kmknn::*, lsh::*,
-        nndescent::*, nsg::*, rnn_descent::*, vamana::*,
+        nndescent::*, nsg::*, rnn_descent::*, soar::*, vamana::*,
     };
     use crate::*;
 
@@ -487,6 +487,13 @@ mod tests {
     );
 
     round_trip!(
+        test_round_trip_soar,
+        SoarIndex<f32>,
+        |m| build_soar_index(m, Some(NLIST), None, None, "euclidean", 1, false).unwrap(),
+        |i, q| unwrap_knn(query_soar_index(q, i, K, Some(NLIST), true, false))
+    );
+
+    round_trip!(
         test_round_trip_kd_forest,
         KdTreeIndex<f32>,
         |m| build_kd_tree_index(m, "euclidean", 4, 1),
@@ -548,7 +555,7 @@ mod tests {
 
         use crate::quantised::{
             exhaustive_bf16::*, exhaustive_opq::*, exhaustive_pq::*, exhaustive_sq8::*,
-            ivf_bf16::*, ivf_opq::*, ivf_pq::*, ivf_sq8::*,
+            ivf_bf16::*, ivf_opq::*, ivf_pq::*, ivf_sq8::*, soar_opq::*, soar_pq::*,
         };
 
         /// Subspaces for the product-quantised fixtures. `DIM` must be
@@ -609,6 +616,43 @@ mod tests {
             )
             .unwrap(),
             |i, q| unwrap_knn(query_ivf_pq_index(q, i, K, Some(NLIST), true, false))
+        );
+
+        round_trip!(
+            test_round_trip_soar_pq,
+            SoarPqIndex<f32>,
+            |m| build_soar_pq_index(
+                m,
+                Some(NLIST),
+                M,
+                None,
+                None,
+                Some(N_CENTROIDS),
+                "euclidean",
+                1,
+                false
+            )
+            .unwrap(),
+            |i, q| unwrap_knn(query_soar_pq_index(q, i, K, Some(NLIST), true, false))
+        );
+
+        round_trip!(
+            test_round_trip_soar_opq,
+            SoarOpqIndex<f32>,
+            |m| build_soar_opq_index(
+                m,
+                Some(NLIST),
+                M,
+                None,
+                None,
+                Some(N_CENTROIDS),
+                None,
+                "euclidean",
+                1,
+                false
+            )
+            .unwrap(),
+            |i, q| unwrap_knn(query_soar_opq_index(q, i, K, Some(NLIST), true, false))
         );
 
         round_trip!(
@@ -1722,6 +1766,7 @@ mod tests {
             <BallTreeIndex<f32> as IndexIo>::KIND,
             <HnswIndex<f32> as IndexIo>::KIND,
             <IvfIndex<f32> as IndexIo>::KIND,
+            <SoarIndex<f32> as IndexIo>::KIND,
             <KdTreeIndex<f32> as IndexIo>::KIND,
             <LSHIndex<f32> as IndexIo>::KIND,
             <NNDescent<f32> as IndexIo>::KIND,
@@ -1734,10 +1779,12 @@ mod tests {
         {
             use crate::quantised::{
                 exhaustive_bf16::*, exhaustive_opq::*, exhaustive_pq::*, exhaustive_sq8::*,
-                ivf_bf16::*, ivf_opq::*, ivf_pq::*, ivf_sq8::*,
+                ivf_bf16::*, ivf_opq::*, ivf_pq::*, ivf_sq8::*, soar_opq::*, soar_pq::*,
             };
 
             kinds.extend([
+                <SoarPqIndex<f32> as IndexIo>::KIND,
+                <SoarOpqIndex<f32> as IndexIo>::KIND,
                 <ExhaustiveIndexBf16<f32> as IndexIo>::KIND,
                 <IvfIndexBf16<f32> as IndexIo>::KIND,
                 <ExhaustiveSq8Index<f32> as IndexIo>::KIND,
