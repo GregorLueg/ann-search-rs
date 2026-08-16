@@ -317,12 +317,6 @@ where
             &metric,
         );
 
-        // Trained on *primary* residuals only, deliberately. Including the
-        // spilled residuals fits the codebook to a broader distribution, since
-        // a spill residual is taken against a not-nearest centroid and so is
-        // systematically larger. That degrades the primary codes, and the dedup
-        // rule means a point is scored from its primary copy whenever its own
-        // cell is probed at all.
         if verbose {
             println!("  Computing primary residuals for OPQ training");
         }

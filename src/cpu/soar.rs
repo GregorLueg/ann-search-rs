@@ -18,25 +18,6 @@
 //! and the two indices are directly comparable. Only the spilled entries, a
 //! minority of every scan, go through a member array.
 //!
-//! ### When to use this
-//!
-//! Probably not, on exact full-vector search. Measured against
-//! [`crate::cpu::ivf::IvfIndex`] on four datasets at 150k x 32D, plain IVF wins
-//! at every matched query time. The clean comparison is `nprobe = 1` here
-//! against `nprobe = 2` there, where both scan `2n/nlist` candidates and no
-//! dedup is possible: spilling returns *worse* recall per candidate, because at
-//! low `nprobe` the second-nearest cell's genuine residents beat the nearest
-//! cell's spilled entries. Spilled entries also cost ~1.55x more to scan, being
-//! a gather rather than a contiguous walk.
-//!
-//! Probing one more cell is free in exact search, which is what makes "just
-//! raise `nprobe`" the stronger move. Under product quantisation it is not
-//! free, because each probed cell rebuilds an ADC lookup table, and there
-//! spilling does pay. See [`crate::quantised::soar_pq::SoarPqIndex`].
-//!
-//! Kept public so the comparison stays runnable, and because the balance may
-//! differ on data with a different boundary structure.
-//!
 //! ### References
 //!
 //! Sun, Simcha, Simcha, Chern & Guo, arXiv:2404.00774, 2024 (SOAR)
@@ -53,15 +34,14 @@ use crate::prelude::*;
 use crate::utils::k_means_utils::*;
 use crate::utils::*;
 
-//////////////////////
+//////////////////////////
 // Thread-local buffers //
 //////////////////////////
 
 // Marks which cells the current query probes. A spilled entry is a duplicate of
 // a primary one exactly when the point's primary cell is also being probed, so
 // this is all the dedup state needed: `nlist` bits rather than `n`, reset in
-// O(nprobe) by walking the probe list back. Kept thread-local because queries
-// fan out over rayon and the mask would otherwise be a per-query allocation.
+// O(nprobe) by walking the probe list back.
 thread_local! {
     static SOAR_PROBED: RefCell<FixedBitSet> = const { RefCell::new(FixedBitSet::new()) };
 }
@@ -339,8 +319,8 @@ where
         let (all_indices, offsets) = build_csr_layout(assignments, n, nlist);
 
         // Reorder vectors into primary-cluster order. `new_to_old` doubles as
-        // `original_ids`; nothing needs the inverse map, because the spill lists
-        // are built by walking the new order directly.
+        // `original_ids`; nothing needs the inverse map, because the spill
+        // lists are built by walking the new order directly.
         let mut new_to_old: Vec<usize> = Vec::with_capacity(n);
         for cluster in 0..nlist {
             new_to_old.extend_from_slice(&all_indices[offsets[cluster]..offsets[cluster + 1]]);

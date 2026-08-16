@@ -11,26 +11,6 @@
 //! scanning the cell it serves, so twice the candidates out of *one* cell is
 //! much cheaper than the same candidates out of two.
 //!
-//! Two further differences from the exact index:
-//!
-//! - Codes live per CSR position, so a spilled entry gets its own contiguous
-//!   code row. The scan stays sequential and there is no gather penalty, which
-//!   was the other half of why spilling lost on full vectors.
-//! - `||r'||^2` in the SOAR loss stops being purely a routing term and starts
-//!   controlling quantisation error, because a spilled copy is encoded against
-//!   a deliberately not-nearest centroid and so has a larger residual. That
-//!   suggested the rules might separate here where they do not on exact search.
-//!   Measured on 50k x 512 cell embeddings, they do not: all of
-//!   [`SoarRule::Nearest`], [`SoarRule::Shifted`] and [`SoarRule::Orthogonal`]
-//!   land within 0.005 recall of each other and converge to an identical
-//!   plateau. The win comes from spilling itself, not from the choice of second
-//!   cell. The rules are kept because one synthetic dataset is thin evidence
-//!   for removing a knob, not because anything here justifies them.
-//!
-//! The cost is memory: `2 * n * m` code bytes rather than `n * m`. The fair
-//! comparison is therefore against an [`crate::quantised::ivf_pq::IvfPqIndex`]
-//! with twice the subspaces, not the same number.
-//!
 //! ### References
 //!
 //! Sun, Simcha, Simcha, Chern & Guo, arXiv:2404.00774, 2024 (SOAR);

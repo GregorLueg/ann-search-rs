@@ -18,6 +18,25 @@ use crate::prelude::AnnSearchFloat;
 use crate::utils::dist::*;
 use crate::utils::Dist;
 
+////////////
+// Consts //
+////////////
+
+/// Default shift for [`SoarRule::Shifted`] under squared Euclidean.
+///
+/// The derived shift is `eps * gamma`, with `eps` the local kNN radius and
+/// `gamma` the mean alignment over the failure cap, neither of which is known
+/// at build time. Expressed as a multiple of the primary residual it lands in
+/// the low fractions, and 0.5 is the middle of the 0.2-1.0 band the gridsearch
+/// sweeps.
+pub const DEFAULT_SHIFT_MU: f64 = 0.5;
+
+/// Default weight for [`SoarRule::Orthogonal`] under cosine.
+///
+/// The SOAR paper reports 1.0 on Glove-1M and 1.5 at billion scale. Datasets
+/// here sit far closer to the former.
+pub const DEFAULT_ORTHOGONAL_LAMBDA: f64 = 1.0;
+
 //////////////////////
 // CentroidDistance //
 //////////////////////
@@ -986,9 +1005,6 @@ where
             continue;
         }
 
-        // Walk for a donor: a point whose own cluster is above average and is
-        // not the cluster we are trying to rescue. Bounded by `n` so a
-        // pathological partition cannot spin here.
         let mut donor = None;
         for _ in 0..n {
             cursor = (cursor + BALANCE_DONOR_STRIDE) % n;
@@ -1256,9 +1272,9 @@ where
     dist_sq.max(T::zero()).sqrt()
 }
 
-//////////////////////////////
-// Hamerly's Lloyd's (Eucl) //
-//////////////////////////////
+///////////////////////////////////
+// Hamerly's Lloyd's (Euclidean) //
+///////////////////////////////////
 
 /// Hamerly's accelerated k-means for Euclidean distance
 ///
@@ -2045,7 +2061,7 @@ where
             .map(|i| T::calculate_l2_norm(&data[i * dim..(i + 1) * dim]))
             .collect(),
         Dist::Manhattan => {
-            unreachable!()
+            unreachable!("Manhatten is not reachable for GEMM.")
         }
     };
     let centroid_norms: Vec<T> = match metric {
@@ -2059,7 +2075,7 @@ where
             .map(|c| T::calculate_l2_norm(&centroids[c * dim..(c + 1) * dim]))
             .collect(),
         Dist::Manhattan => {
-            unreachable!()
+            unreachable!("Manhatten is not reachable for GEMM.")
         }
     };
 
@@ -2133,7 +2149,7 @@ where
             })
             .collect(),
         Dist::Manhattan => {
-            unreachable!()
+            unreachable!("Manhatten is not reachable for direct assign.")
         }
     };
 
@@ -2173,7 +2189,7 @@ where
             })
             .collect(),
         Dist::Manhattan => {
-            unreachable!()
+            unreachable!("Manhatten is not reachable for direct assign.")
         }
     }
 }
@@ -2277,17 +2293,6 @@ where
 
     out.par_chunks_mut(m).enumerate().for_each(|(i, slot)| {
         let vec = &data[i * dim..(i + 1) * dim];
-
-        // Tiny sorted insertion buffer: `m` is 2 in practice, so a heap would
-        // cost more than it saves.
-        //
-        // Seeded with *distinct* cluster ids rather than zeros. Nothing is
-        // inserted when every candidate distance comes back `+inf`, which a
-        // non-finite coordinate or an f32 overflow will do, and an all-zero
-        // seed then returns the same cluster `m` times. Callers treat the row
-        // as `m` distinct memberships -- the batched NN-Descent merge relies on
-        // it for the soundness of an unsafe disjoint-write -- so the degenerate
-        // case has to stay distinct. `m <= k`, so these are all valid ids.
         let mut best_d = vec![T::infinity(); m];
         let mut best_c: Vec<u32> = (0..m as u32).collect();
 
@@ -2397,19 +2402,16 @@ pub fn invert_assignments_csr(
 #[cfg_attr(feature = "serialise", derive(serde::Serialize, serde::Deserialize))]
 pub enum SoarRule {
     /// Plain second-nearest centroid, minimising `||r'||^2`
-    ///
-    /// The baseline the other two have to beat. Redundant by construction: for
-    /// a point sitting at the edge of its cell, the second-nearest centroid is
-    /// usually the one just behind the first, so it fails on the same queries.
     Nearest,
     /// Nearest centroid to the shifted point `x + mu * (x - c_1)`
     ///
     /// Derived for squared Euclidean. Conditioning on the queries that make the
-    /// primary cell look bad gives a *signed* penalty `2*eps*gamma*<r_hat_1, r'>`
-    /// rather than the published squared one, and completing the square turns
-    /// the whole objective back into a plain nearest-centroid lookup against a
-    /// point pushed away from its own centroid. `mu = 0` degenerates to
-    /// [`SoarRule::Nearest`]. Negative values are clamped to zero.
+    /// primary cell look bad gives a *signed* penalty
+    /// `2*eps*gamma*<r_hat_1, r'>` rather than the published squared one, and
+    /// completing the square turns the whole objective back into a plain
+    /// nearest-centroid lookup against a point pushed away from its own
+    /// centroid. `mu = 0` degenerates to [`SoarRule::Nearest`]. Negative values
+    /// are clamped to zero.
     Shifted {
         /// Shift as a multiple of the primary residual. Sensible range 0.2-1.0.
         mu: f64,
@@ -2417,35 +2419,13 @@ pub enum SoarRule {
     /// Published SOAR loss, `||r'||^2 + lambda * (r' . r_hat_1)^2`
     ///
     /// Derived for MIPS under a uniform query distribution on the unit sphere,
-    /// so it applies unchanged to cosine, where the ranking is the same problem.
-    /// Under squared Euclidean the premise does not hold: the symmetric penalty
-    /// discards the anti-aligned candidates that are in fact the good ones,
-    /// which [`SoarRule::Shifted`] keeps. That difference is real in the
-    /// geometry (see the collinear unit test) but has not shown up as a recall
-    /// difference on any dataset measured so far, where all three rules land
-    /// within noise of each other. Reported lambda: 1.0 on Glove-1M, 1.5 at
-    /// billion scale. Negative values are clamped to zero.
+    /// so it applies unchanged to cosine, where the ranking is the same
+    /// problem.
     Orthogonal {
         /// Weight on the parallel component of the candidate residual.
         lambda: f64,
     },
 }
-
-/// Default shift for [`SoarRule::Shifted`] under squared Euclidean.
-///
-/// The derived shift is `eps * gamma`, with `eps` the local kNN radius and
-/// `gamma` the mean alignment over the failure cap, neither of which is known
-/// at build time. Expressed as a multiple of the primary residual it lands in
-/// the low fractions, and 0.5 is the middle of the 0.2-1.0 band the gridsearch
-/// sweeps. Points deep inside a cell have a small residual and so a small
-/// shift, which is wanted: they do not need complementary spilling.
-pub const DEFAULT_SHIFT_MU: f64 = 0.5;
-
-/// Default weight for [`SoarRule::Orthogonal`] under cosine.
-///
-/// The SOAR paper reports 1.0 on Glove-1M and 1.5 at billion scale. Datasets
-/// here sit far closer to the former.
-pub const DEFAULT_ORTHOGONAL_LAMBDA: f64 = 1.0;
 
 /// Reciprocal that yields zero instead of infinity on a zero input
 ///
@@ -2537,11 +2517,7 @@ where
 /// [`SoarRule::Shifted`] deliberately reuses [`assign_all_parallel`] on a
 /// shifted copy of the data rather than introducing a scoring kernel of its
 /// own, which means it inherits the tiled GEMM path for free. The other two
-/// arms are plain `O(n * k * dim)` scans with no GEMM path. Measured, that has
-/// not been the build bottleneck at the sizes tried, because k-means training
-/// dominates; it becomes one at `dim >= GEMM_DIM_THRESHOLD`, where the primary
-/// assignment gets faer and these arms do not. The fix, tiling the distance
-/// matrix and `C * R_hat^T` through faer, is deferred until it shows up.
+/// arms are plain `O(n * k * dim)` scans with no GEMM path.
 ///
 /// ### Params
 ///
@@ -2596,11 +2572,7 @@ where
                 2,
                 metric,
             );
-            // Take column 0 when it is not already the primary. Column 0 of the
-            // top-2 scan and `assign_all_parallel` can disagree on ties, since
-            // they are different implementations; taking column 1 blindly then
-            // leaves the point's *actual* nearest cell holding neither copy,
-            // which is a pure recall loss.
+
             let mut out: Vec<u32> = (0..n)
                 .map(|i| {
                     if top[i * 2] as usize != primary[i] {
@@ -2610,7 +2582,7 @@ where
                     }
                 })
                 .collect();
-            // Can still collide when both columns tie with the primary.
+
             out.par_iter_mut().enumerate().for_each(|(i, slot)| {
                 if *slot as usize == primary[i] {
                     *slot = nearest_excluding(
@@ -2813,16 +2785,6 @@ where
         return Err(AnnSearchErrors::DistanceNotSupported(*metric));
     }
 
-    // `fast_random_init` draws `n_centroids` *distinct* rows, so fewer rows than
-    // centroids reads past the end of its shuffled index list and panics.
-    // `kmeans_parallel_init` samples with replacement and survives, but only by
-    // emitting duplicate centroids, which is not a useful index either. Caught
-    // here rather than in `fast_random_init`, which stays infallible.
-    //
-    // Note this is stricter than the old behaviour for `n_centroids <= 200`,
-    // where `resolve_init` picks k-means|| and the build previously succeeded
-    // degenerately. Erroring is deliberate: more clusters than points is a
-    // caller mistake, not something to paper over.
     if n_centroids > n {
         return Err(AnnSearchErrors::TooFewSamplesForCentroids {
             n_centroids,
@@ -2845,7 +2807,7 @@ where
             .map(|i| T::calculate_l2_norm(&data[i * dim..(i + 1) * dim]))
             .collect(),
         Dist::Manhattan => {
-            unreachable!()
+            unreachable!("Manhattan distance not reachable for train_centroids().")
         }
     };
 
@@ -2868,7 +2830,7 @@ where
                     .collect(),
                 Dist::Cosine => data_norms.clone(),
                 Dist::Manhattan => {
-                    unreachable!()
+                    unreachable!("Manhattan distance not reachable for train_centroids().")
                 }
             };
             kmeans_parallel_init(data, &init_norms, dim, n, n_centroids, metric, seed)
@@ -2886,7 +2848,7 @@ where
             .map(|i| T::calculate_l2_norm(&centroids[i * dim..(i + 1) * dim]))
             .collect(),
         Dist::Manhattan => {
-            unreachable!()
+            unreachable!("Manhattan distance not reachable for train_centroids().")
         }
     };
 
@@ -3034,7 +2996,8 @@ pub fn build_csr_layout(
 /// ### Params
 ///
 /// * `cluster_dists` - `(dist, cluster_id)` pairs for every cell in the index
-/// * `offsets` - CSR offsets: cell `c` holds `offsets[c+1] - offsets[c]` vectors
+/// * `offsets` - CSR offsets: cell `c` holds `offsets[c+1] - offsets[c]`
+///   vectors
 /// * `nprobe` - Requested number of cells (floor)
 /// * `k` - Required number of reachable vectors
 ///

@@ -17,7 +17,7 @@ If you wish to run the Navigating Spread-out Graph (NSG) version where the
 initial kNN is generated on the GPU, you can test this via:
 
 ```bash
-cargo run --example gridsearch_nsg --features gpu --release
+cargo run --example gridsearch_nsg-gpu --features gpu --release
 ```
 
 Similar to the other benchmarks, index building, query against 10% slightly

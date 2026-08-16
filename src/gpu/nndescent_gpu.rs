@@ -597,21 +597,12 @@ pub fn local_join_shared<F: Float, N: Size>(
         terminate!();
     }
 
-    // The cube is 2-D: candidate `j` runs along x, candidate `i` along y. The
-    // pair loops need that split, because at high dim the shared budget holds
-    // fewer candidates than the cube has threads, and a one-thread-per-row walk
-    // then leaves most lanes idle for the whole kernel. Staging and metadata
-    // loops have no such structure and use the flat id.
     let tflat = UNIT_POS;
     let k = graph_idx.shape(1usize) as u32;
     let pid_mask = 0x7FFFFFFFu32;
 
     let max_cands_comp = build_k * 2usize;
 
-    // Staged as lines, not scalars. Indexing a `Vector<F, N>` tensor by scalar
-    // re-issues the whole line load once per lane, and a scalar accumulator in
-    // the pair loop below serialises the whole row into one FP dependency
-    // chain. Both are what this kernel could least afford.
     let mut shared_vecs_a = SharedMemory::<Vector<F, N>>::new(vec_buf_a);
     let mut shared_vecs_b = SharedMemory::<Vector<F, N>>::new(vec_buf_b);
     let mut shared_pids = SharedMemory::<u32>::new(max_cands_comp);
@@ -681,10 +672,6 @@ pub fn local_join_shared<F: Float, N: Size>(
         terminate!();
     }
 
-    // One pass over the compacted candidates for every per-candidate scalar the
-    // pair loop needs. The threshold is what `emit_pair` used to fetch from
-    // global once per pair; staged here it is read `total_cands` times per node
-    // instead of `total_cands^2 / 2` times.
     let mut i_meta = tflat;
     while i_meta < total_cands {
         let pid = shared_pids[i_meta as usize];
@@ -2407,6 +2394,27 @@ where
 // KnnGraphGpu //
 /////////////////
 
+/// Resolved NNDescent knobs, shared by the single-shot and clustered drivers.
+#[derive(Clone, Copy, Debug)]
+pub struct NnDescentCfg {
+    /// Working degree the device runs at, wider than the returned `k`
+    pub build_k: usize,
+    /// Iteration cap for the main descent loop
+    pub max_iters: usize,
+    /// Random-projection trees used to seed the graph
+    pub n_trees: usize,
+    /// Convergence threshold as a fraction of `n * build_k` edges updated
+    pub delta: f32,
+    /// Local-join sampling rate, pre-scaled to the kernel's `u32` domain
+    pub rho_thresh: u32,
+    /// Two-hop refinement sweeps after the main loop
+    pub refine_knn: usize,
+    /// RNG seed
+    pub seed: usize,
+    /// Whether to score with cosine rather than squared Euclidean
+    pub use_cosine: bool,
+}
+
 /// Raw kNN graph built on the GPU, without CAGRA optimisation or query
 /// support.
 ///
@@ -2658,26 +2666,6 @@ where
     knn_graph
 }
 
-/// Resolved NNDescent knobs, shared by the single-shot and clustered drivers.
-#[derive(Clone, Copy, Debug)]
-pub struct NnDescentCfg {
-    /// Working degree the device runs at, wider than the returned `k`
-    pub build_k: usize,
-    /// Iteration cap for the main descent loop
-    pub max_iters: usize,
-    /// Random-projection trees used to seed the graph
-    pub n_trees: usize,
-    /// Convergence threshold as a fraction of `n * build_k` edges updated
-    pub delta: f32,
-    /// Local-join sampling rate, pre-scaled to the kernel's `u32` domain
-    pub rho_thresh: u32,
-    /// Two-hop refinement sweeps after the main loop
-    pub refine_knn: usize,
-    /// RNG seed
-    pub seed: usize,
-    /// Whether to score with cosine rather than squared Euclidean
-    pub use_cosine: bool,
-}
 
 /// Run the device-resident NNDescent loop and read the raw graph back.
 ///
@@ -2685,10 +2673,6 @@ pub struct NnDescentCfg {
 /// resolution, no padding and no compaction: allocate, seed the graph from a
 /// random draw plus a random-projection forest, iterate local joins until the
 /// update rate falls below `delta`, optionally refine, download.
-///
-/// Split out of [`build_knn_graph_gpu`] so the clustered driver can call it
-/// once per cluster against a borrowed client, rather than rebuilding a device
-/// context and its buffer pool for every cluster.
 ///
 /// ### Params
 ///
