@@ -32,6 +32,13 @@ pub struct IvfOpqIndex<T> {
     metric: Dist,
     /// K-means cluster centroids
     centroids: Vec<T>,
+    /// Centroids pre-rotated into the OPQ codebook space, `nlist * dim`.
+    ///
+    /// The ADC table has to be built from `R * (q - c)`. Rotating that residual
+    /// per probed cell would cost `O(nprobe * dim^2)` scalar work per query,
+    /// several times the table build it feeds at dim 512. `R` is linear, so
+    /// `R(q - c) == R q - R c`: rotate the query once and subtract these.
+    centroids_rotated: Vec<T>,
     /// Norms of the centroids - not relevant for this index.
     centroids_norm: Vec<T>,
     /// Vector indices for each cluster (CSR format)
@@ -294,9 +301,17 @@ where
             println!("  (Optimised) Quantisation complete");
         }
 
+        // Pre-rotate once at build so the query path never pays `dim^2` per
+        // probed cell.
+        let centroids_rotated: Vec<T> = centroids
+            .chunks_exact(dim)
+            .flat_map(|c| codebook.rotate(c))
+            .collect();
+
         let mut idx = Self {
             quantised_codes,
             centroids,
+            centroids_rotated,
             all_indices,
             offsets,
             codebook,
@@ -319,6 +334,11 @@ where
     /// Uses asymmetric distance computation (ADC): builds lookup tables
     /// from query subvectors to all centroids, then computes distances
     /// via table lookups.
+    ///
+    /// The query residual is rotated by the learned OPQ rotation before the
+    /// table is built, because the codes and codebooks live in that space. `R`
+    /// is orthogonal, so `||q_r - r|| == ||R q_r - R r||`, but only when both
+    /// sides are rotated.
     ///
     /// ### Params
     ///
@@ -355,8 +375,18 @@ where
 
         let mut heap: BinaryHeap<(OrderedFloat<T>, usize)> = BinaryHeap::with_capacity(k + 1);
 
+        // Codes are OPQ-encoded, so the codebooks live in the rotated space and
+        // the lookup table has to be built there too: R is orthogonal, so
+        // ||q_r - r|| == ||R q_r - R r||, but only if both sides are rotated.
+        // Rotate the query once here rather than the residual per cell, and
+        // subtract the pre-rotated centroid: R(q - c) == R q - R c.
+        let query_rotated = self.codebook.rotate(&query_vec);
+
         for cluster_idx in probed {
-            let lookup_tables = self.build_lookup_tables_residual(&query_vec, cluster_idx);
+            let centroid_rot =
+                &self.centroids_rotated[cluster_idx * self.dim..(cluster_idx + 1) * self.dim];
+            let residual_rot = T::subtract_simd(&query_rotated, centroid_rot);
+            let lookup_tables = self.build_lookup_tables_direct(&residual_rot);
 
             let start = self.offsets[cluster_idx];
             let end = self.offsets[cluster_idx + 1];
@@ -516,6 +546,7 @@ where
         std::mem::size_of_val(self)
             + self.quantised_codes.capacity() * std::mem::size_of::<u8>()
             + self.centroids.capacity() * std::mem::size_of::<T>()
+            + self.centroids_rotated.capacity() * std::mem::size_of::<T>()
             + self.centroids_norm.capacity() * std::mem::size_of::<T>()
             + self.all_indices.capacity() * std::mem::size_of::<usize>()
             + self.offsets.capacity() * std::mem::size_of::<usize>()
@@ -876,7 +907,11 @@ mod tests {
         .unwrap();
 
         let query: Vec<f32> = (0..32).map(|x| x as f32 * 0.01).collect();
-        let table = index.build_lookup_tables_residual(&query, 0);
+        // Rotated residual, as the query path does: the codebooks live in
+        // R-space, so a table built from the unrotated residual scores in the
+        // wrong basis.
+        let residual = f32::subtract_simd(&query, &index.centroids[0..32]);
+        let table = index.build_lookup_tables_direct(&index.codebook.rotate(&residual));
 
         assert_eq!(table.len(), 32);
     }
@@ -898,7 +933,11 @@ mod tests {
         .unwrap();
 
         let query: Vec<f32> = (0..32).map(|x| x as f32 * 0.01).collect();
-        let table = index.build_lookup_tables_residual(&query, 0);
+        // Rotated residual, as the query path does: the codebooks live in
+        // R-space, so a table built from the unrotated residual scores in the
+        // wrong basis.
+        let residual = f32::subtract_simd(&query, &index.centroids[0..32]);
+        let table = index.build_lookup_tables_direct(&index.codebook.rotate(&residual));
 
         let dist = index.compute_distance_adc(0, &table);
 
