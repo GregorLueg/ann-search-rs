@@ -449,10 +449,6 @@ where
             T::one()
         };
 
-        // Reachability is counted over the primary lists only. Those partition
-        // the dataset, so every entry counted is a distinct point and `>= k`
-        // reachable really does mean `>= k` unique candidates. Counting the
-        // spill lists too would over-count duplicates and could short-return.
         let mut cluster_dists: Vec<(T, usize)> =
             self.get_centroids_dist(query_vec, query_norm, nprobe);
         let probed = select_probed_clusters(&mut cluster_dists, &self.offsets, nprobe, k);

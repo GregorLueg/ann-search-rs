@@ -311,16 +311,7 @@ where
             nlist,
             &metric,
         );
-        // Trained on *primary* residuals only, deliberately. Including the
-        // spilled residuals fits the codebook to a broader distribution, since
-        // a spill residual is taken against a not-nearest centroid and so is
-        // systematically larger. That degrades the primary codes, and the dedup
-        // rule means a point is scored from its primary copy whenever its own
-        // cell is probed at all.
-        //
-        // Spilled residuals are then encoded slightly outside the codebook's
-        // fitted range. That is the intended trade: they are only ever scored
-        // when a point's primary cell was not probed.
+
         if verbose {
             println!("  Computing primary residuals for PQ training");
         }
@@ -406,14 +397,6 @@ where
                 chunk.copy_from_slice(&codebook.encode(&residual));
             });
 
-        // Tag exactly one position per point as its primary. `seen_primary`
-        // matters when nlist == 1, where the secondary assignment degenerates
-        // to the primary and both positions would otherwise claim the tag.
-        //
-        // Reachability for `select_probed_clusters` counts primary entries
-        // only: those are one per point, so `>= k` reachable really is `>= k`
-        // distinct candidates. Counting spilled entries too would over-count
-        // duplicates and could stop the probe walk short of `k`.
         let mut primary_pos = vec![0u32; n];
         let mut dedup_key = vec![0u32; n_entries];
         let mut primary_counts = vec![0usize; nlist];
