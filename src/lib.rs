@@ -204,9 +204,9 @@ where
     }
 }
 
-///////////////////////
+//////////////////////
 // Saving & loading //
-///////////////////////
+//////////////////////
 
 /// Save an index to disk
 ///
@@ -3572,10 +3572,9 @@ where
             })?
         } else {
             // path where asymmetric queries are not sensible/possible
-            let (indices, distances_u32) =
-                query_parallel(nq, return_dist, verbose, |i| {
-                    index.query(&queries[i * dim..(i + 1) * dim], k)
-                })?;
+            let (indices, distances_u32) = query_parallel(nq, return_dist, verbose, |i| {
+                index.query(&queries[i * dim..(i + 1) * dim], k)
+            })?;
             let distances_t = distances_u32.map(|dists| {
                 dists
                     .into_iter()
@@ -3749,10 +3748,9 @@ where
                 index.query_asymmetric(&queries[i * dim..(i + 1) * dim], k, nprobe, rerank_factor)
             })?
         } else {
-            let (indices, distances_u32) =
-                query_parallel(nq, return_dist, verbose, |i| {
-                    index.query(&queries[i * dim..(i + 1) * dim], k, nprobe)
-                })?;
+            let (indices, distances_u32) = query_parallel(nq, return_dist, verbose, |i| {
+                index.query(&queries[i * dim..(i + 1) * dim], k, nprobe)
+            })?;
             let distances_t = distances_u32.map(|dists| {
                 dists
                     .into_iter()

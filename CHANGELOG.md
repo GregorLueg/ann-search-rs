@@ -1,5 +1,12 @@
 # News
 
+## 0.6.0
+
+**Features**
+
+- More inputs accepted: flat arrays, ndarray with 2-dimensional structures.
+  First step for a full Python wrapping release of the package.
+
 ## 0.5.2
 
 **Features**

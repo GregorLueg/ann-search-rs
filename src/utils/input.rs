@@ -22,8 +22,8 @@ use ndarray::{Array2, ArrayView2};
 /// samples-by-features matrix.
 ///
 /// The contract is orientation, not layout: rows are samples, columns are
-/// features, and [`AnnMatrix::into_row_major`] must hand back a row-major buffer.
-/// Implementations are zero-copy where the source already agrees
+/// features, and [`AnnMatrix::into_row_major`] must hand back a row-major
+/// buffer. Implementations are zero-copy where the source already agrees
 /// ([`FlattenData`] and a standard-layout owned `Array2`) and copy where it
 /// does not (faer stores column-major, so `MatRef` transposes on the way out).
 ///
@@ -83,9 +83,9 @@ where
     }
 }
 
-///////////
-// faer  //
-///////////
+//////////
+// faer //
+//////////
 
 impl<T> AnnMatrix<T> for MatRef<'_, T>
 where
@@ -127,13 +127,8 @@ where
 {
     fn into_row_major(self) -> FlattenData<T> {
         let (n, dim) = (self.nrows(), self.ncols());
-        // `as_slice` returns Some only for standard (row-major) layout. Do not
-        // reach for `as_slice_memory_order`: on an F-order array it hands back
-        // the column-major buffer, which would be written out as row-major.
         match self.as_slice() {
             Some(slice) => (slice.to_vec(), n, dim),
-            // `iter` visits in logical order, rightmost index fastest, which is
-            // row-major whatever the strides say.
             None => (self.iter().copied().collect(), n, dim),
         }
     }
@@ -161,10 +156,6 @@ where
             return (self.iter().copied().collect(), n, dim);
         }
 
-        // Standard layout: hand over the allocation. The check has to come
-        // first, `into_raw_vec_and_offset` consumes self and there is no way
-        // back. What it returns is the whole allocation, and a sliced array can
-        // sit at a non-zero offset with trailing slack.
         let (mut data, offset) = self.into_raw_vec_and_offset();
         let offset = offset.unwrap_or(0);
         if offset != 0 {
@@ -353,8 +344,7 @@ mod tests {
             // A transposed view describes the same matrix but reaches the
             // strided fallback, so it must land in the same place.
             let arr_t = Array2::from_shape_fn((dim, n), |(j, i)| flat[i * dim + j]);
-            let (t_idx, _) =
-                query_hnsw_index(arr_t.t(), &nd_index, 5, 50, true, false).unwrap();
+            let (t_idx, _) = query_hnsw_index(arr_t.t(), &nd_index, 5, 50, true, false).unwrap();
             assert_eq!(faer_idx, t_idx);
         }
     }
