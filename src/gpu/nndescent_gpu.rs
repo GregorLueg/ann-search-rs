@@ -36,7 +36,6 @@
 use cubecl::frontend::{Atomic, CubePrimitive, Float, SharedMemory};
 use cubecl::prelude::*;
 use cubecl_utils_rs::prelude::*;
-use faer::MatRef;
 use rayon::prelude::*;
 use std::time::Instant;
 use thousands::*;
@@ -1577,7 +1576,7 @@ where
     /// Initialised struct with the completed kNN and CAGRA navigational graphs
     #[allow(clippy::too_many_arguments)]
     pub fn build(
-        data: MatRef<T>,
+        data: impl AnnMatrix<T>,
         metric: Dist,
         k: Option<usize>,
         build_k: Option<usize>,
@@ -1595,7 +1594,7 @@ where
             return Err(AnnSearchErrors::DistanceNotSupported(metric));
         }
 
-        let (vectors_flat, n, dim) = matrix_to_flat(data);
+        let (vectors_flat, n, dim) = data.into_row_major();
         let k = k.unwrap_or(30);
         let build_k = build_k.unwrap_or((1.5 * k as f32) as usize).max(k);
         let max_iters = max_iters.unwrap_or(DEFAULT_MAX_ITERS);
@@ -2486,7 +2485,7 @@ pub struct KnnGraphGpu<T> {
 /// Populated [`KnnGraphGpu`].
 #[allow(clippy::too_many_arguments)]
 pub fn build_knn_graph_gpu<T, R>(
-    data: MatRef<T>,
+    data: impl AnnMatrix<T>,
     metric: Dist,
     k: Option<usize>,
     build_k: Option<usize>,
@@ -2507,7 +2506,7 @@ where
         return Err(AnnSearchErrors::DistanceNotSupported(metric));
     }
 
-    let (vectors_flat, n, dim) = matrix_to_flat(data);
+    let (vectors_flat, n, dim) = data.into_row_major();
     let k = k.unwrap_or(30);
     let build_k = build_k.unwrap_or((1.5 * k as f32) as usize).max(k);
     let max_iters = max_iters.unwrap_or(DEFAULT_MAX_ITERS);

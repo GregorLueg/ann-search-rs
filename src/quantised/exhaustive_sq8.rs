@@ -1,7 +1,7 @@
 //! Exhaustive SQ8 index: quantises the original data to scalar quantisation
 //! to 8 bit (i8).
 
-use faer::{MatRef, RowRef};
+use faer::{RowRef};
 use num_traits::{Float, FromPrimitive, ToPrimitive};
 use rayon::prelude::*;
 use std::{
@@ -16,7 +16,6 @@ use thousands::*;
 
 use crate::prelude::*;
 use crate::quantised::quantisers::*;
-use crate::utils::matrix_to_flat;
 
 /////////////////////
 // Index structure //
@@ -101,12 +100,12 @@ where
     /// ### Returns
     ///
     /// Initialised exhaustive quantised index
-    pub fn new(data: MatRef<T>, metric: Dist) -> Result<Self, AnnSearchErrors> {
+    pub fn new(data: impl AnnMatrix<T>, metric: Dist) -> Result<Self, AnnSearchErrors> {
         if metric == Dist::Manhattan {
             return Err(AnnSearchErrors::DistanceNotSupported(metric));
         }
 
-        let (mut vectors_flat, n, dim) = matrix_to_flat(data);
+        let (mut vectors_flat, n, dim) = data.into_row_major();
 
         // Normalise for cosine distance
         if metric == Dist::Cosine {

@@ -1,7 +1,7 @@
 //! Annoy implementation in ann-search-rs. This is an in-memory implementation
 //! of Annoy in Rust.
 
-use faer::{MatRef, RowRef};
+use faer::{RowRef};
 use fixedbitset::FixedBitSet;
 use rand::{rngs::StdRng, Rng, SeedableRng};
 use rayon::prelude::*;
@@ -160,7 +160,7 @@ where
     ///
     /// Constructed index ready for querying
     pub fn new(
-        data: MatRef<T>,
+        data: impl AnnMatrix<T>,
         n_trees: usize,
         metric: Dist,
         seed: usize,
@@ -170,7 +170,7 @@ where
         }
         let mut rng = StdRng::seed_from_u64(seed as u64);
 
-        let (vectors_flat, n, dim) = matrix_to_flat(data);
+        let (vectors_flat, n, dim) = data.into_row_major();
 
         // Compute norms for Cosine distance
         let norms = if metric == Dist::Cosine {

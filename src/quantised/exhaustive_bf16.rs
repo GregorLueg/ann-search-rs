@@ -1,7 +1,7 @@
 //! Exhaustive bf16 index: quantises the original data to bf16 (keeps the
 //! norms).
 
-use faer::{MatRef, RowRef};
+use faer::{RowRef};
 use half::bf16;
 use rayon::prelude::*;
 use std::collections::BinaryHeap;
@@ -10,7 +10,6 @@ use thousands::*;
 
 use crate::prelude::*;
 use crate::quantised::quantisers::*;
-use crate::utils::matrix_to_flat;
 
 /////////////////////
 // Index structure //
@@ -91,12 +90,12 @@ where
     /// ### Returns
     ///
     /// Initialised exhaustive index
-    pub fn new(data: MatRef<T>, metric: Dist) -> Result<Self, AnnSearchErrors> {
+    pub fn new(data: impl AnnMatrix<T>, metric: Dist) -> Result<Self, AnnSearchErrors> {
         if metric == Dist::Manhattan {
             return Err(AnnSearchErrors::DistanceNotSupported(metric));
         }
 
-        let (vectors_flat, n, dim) = matrix_to_flat(data);
+        let (vectors_flat, n, dim) = data.into_row_major();
 
         let norms = if metric == Dist::Cosine {
             (0..n)

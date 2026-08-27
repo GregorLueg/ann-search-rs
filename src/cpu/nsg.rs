@@ -31,7 +31,7 @@
 //! Search With The Navigating Spreading-out Graph.* PVLDB 12(5), 2017.
 //! arXiv:1707.00143.
 
-use faer::{MatRef, RowRef};
+use faer::{RowRef};
 use rand::{rngs::SmallRng, Rng, SeedableRng};
 use rayon::prelude::*;
 use std::cell::{RefCell, UnsafeCell};
@@ -640,7 +640,7 @@ where
     ///
     /// Built `NsgIndex` on success.
     pub fn build(
-        data: MatRef<T>,
+        data: impl AnnMatrix<T>,
         metric: Dist,
         params: NsgBuildParams,
         seed: usize,

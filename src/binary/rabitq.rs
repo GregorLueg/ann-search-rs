@@ -3,13 +3,14 @@
 //! "RaBitQ: Quantizing High-Dimensional Vectors with a Theoretical Error Bound
 //! for Approximate Nearest Neighbor Search" (Gao and Long, 2024).
 
-use faer::{Mat, MatRef};
+use faer::Mat;
 use faer_traits::ComplexField;
 use num_traits::{Float, FromPrimitive, ToPrimitive};
 use rand::rngs::StdRng;
 use rand::Rng;
 use rand::SeedableRng;
 use rand_distr::StandardNormal;
+use rayon::prelude::*;
 use std::iter::Sum;
 
 use crate::binary::dist_binary::*;
@@ -688,7 +689,7 @@ where
     ///
     /// Initialised self
     pub fn new(
-        data: MatRef<T>,
+        data: impl AnnMatrix<T>,
         metric: &Dist,
         n_clusters: Option<usize>,
         seed: usize,
@@ -696,40 +697,33 @@ where
         if *metric == Dist::Manhattan {
             return Err(AnnSearchErrors::DistanceNotSupported(*metric));
         }
-        let n = data.nrows();
-        let dim = data.ncols();
+
+        let (mut data_flat, n, dim) = data.into_row_major();
 
         let k = n_clusters
             .unwrap_or_else(|| ((n as f64).sqrt() * 0.5).ceil() as usize)
             .max(1)
             .min(n);
 
-        // Flatten data, normalise for cosine
-        let mut data_flat = Vec::with_capacity(n * dim);
-        let mut data_norms = Vec::with_capacity(n);
+        // Norms are captured before any rescaling. The cosine path normalises
+        // the rows in place, but the Euclidean path needs the originals for
+        // `cluster_norms` below.
+        let mut data_norms = vec![T::zero(); n];
+        let normalise = *metric == Dist::Cosine;
 
-        for i in 0..n {
-            let row = data.row(i);
-            let vec: Vec<T> = row.iter().cloned().collect();
-            let norm = compute_l2_norm(&vec);
-            data_norms.push(norm);
+        data_flat
+            .par_chunks_mut(dim)
+            .zip(data_norms.par_iter_mut())
+            .for_each(|(row, norm_out)| {
+                let norm = compute_l2_norm(row);
+                *norm_out = norm;
 
-            match metric {
-                Dist::Cosine => {
-                    if norm > T::epsilon() {
-                        data_flat.extend(vec.iter().map(|&x| x / norm));
-                    } else {
-                        data_flat.extend(vec);
-                    }
+                if normalise && norm > T::epsilon() {
+                    row.iter_mut().for_each(|x| *x = *x / norm);
                 }
-                Dist::SquaredEuclidean => {
-                    data_flat.extend(vec);
-                }
-                Dist::Manhattan => unreachable!(),
-            }
-        }
+            });
 
-        let cluster_norms = if matches!(metric, Dist::Cosine) {
+        let cluster_norms = if normalise {
             vec![T::one(); n]
         } else {
             data_norms

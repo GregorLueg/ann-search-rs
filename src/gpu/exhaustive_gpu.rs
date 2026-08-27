@@ -1,7 +1,6 @@
 //! Exhaustive (flat) GPU-accelerated index.
 
 use cubecl::prelude::*;
-use faer::MatRef;
 use num_traits::Float;
 use rayon::prelude::*;
 use cubecl_utils_rs::prelude::*;
@@ -69,12 +68,12 @@ where
     /// ### Returns
     ///
     /// Initialised exhaustive index (on GPU)
-    pub fn new(data: MatRef<T>, metric: Dist, device: R::Device) -> Result<Self, AnnSearchErrors> {
+    pub fn new(data: impl AnnMatrix<T>, metric: Dist, device: R::Device) -> Result<Self, AnnSearchErrors> {
         if metric == Dist::Manhattan {
             return Err(AnnSearchErrors::DistanceNotSupported(metric));
         }
 
-        let (vectors_flat, n, dim) = matrix_to_flat(data);
+        let (vectors_flat, n, dim) = data.into_row_major();
 
         let line = LINE_SIZE;
         let dim_padded = dim.next_multiple_of(line);
@@ -121,8 +120,8 @@ where
     /// ### Returns
     ///
     /// A tuple of `(Vec<indices>, Vec<distances>)`
-    pub fn query_batch(&self, query_mat: MatRef<T>, k: usize, verbose: bool) -> KnnResult<T> {
-        let (vectors_query, n_query, dim_query) = matrix_to_flat(query_mat);
+    pub fn query_batch(&self, query_mat: impl AnnMatrix<T>, k: usize, verbose: bool) -> KnnResult<T> {
+        let (vectors_query, n_query, dim_query) = query_mat.into_row_major();
         self.check_dim(dim_query)?;
 
         let dim_padded = self.dim_padded;

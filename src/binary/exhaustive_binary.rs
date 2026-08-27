@@ -2,7 +2,7 @@
 //! exhaustive searches against query vectors.
 
 use bytemuck::Pod;
-use faer::{MatRef, RowRef};
+use faer::{RowRef};
 use faer_traits::ComplexField;
 use rayon::prelude::*;
 use std::collections::BinaryHeap;
@@ -104,7 +104,7 @@ where
     ///
     /// Initialised exhaustive binary index
     pub fn new(
-        data: MatRef<T>,
+        data: impl AnnMatrix<T>,
         binarisation_init: &str,
         n_bits: usize,
         seed: usize,
@@ -118,12 +118,15 @@ where
             BinarisationInit::default()
         });
 
-        let n = data.nrows();
-        let dim = data.ncols();
+        let (vectors_flat, n, dim) = data.into_row_major();
 
         let binariser = match init {
-            BinarisationInit::PcaHashing => Binariser::new_pca_hashing(data, dim, n_bits, seed)?,
-            BinarisationInit::RandomProjections => Binariser::new_simhash(data, dim, n_bits, seed)?,
+            BinarisationInit::PcaHashing => {
+                Binariser::new_pca_hashing(&vectors_flat, n, dim, n_bits, seed)?
+            }
+            BinarisationInit::RandomProjections => {
+                Binariser::new_simhash(&vectors_flat, n, dim, n_bits, seed)?
+            }
             BinarisationInit::SignBased => Binariser::new_sign_based(dim),
         };
 
@@ -133,9 +136,8 @@ where
 
         let mut vectors_flat_binarised: Vec<u8> = Vec::with_capacity(n * n_bytes);
 
-        for i in 0..n {
-            let original: Vec<T> = data.row(i).iter().cloned().collect();
-            vectors_flat_binarised.extend(binariser.encode(&original)?);
+        for row in vectors_flat.chunks_exact(dim) {
+            vectors_flat_binarised.extend(binariser.encode(row)?);
         }
 
         Ok(Self {
@@ -170,7 +172,7 @@ where
     ///
     /// Initialised exhaustive binary index with vector store
     pub fn new_with_vector_store(
-        data: MatRef<T>,
+        data: impl AnnMatrix<T>,
         binarisation_init: &str,
         n_bits: usize,
         metric: Dist,
@@ -183,12 +185,15 @@ where
 
         let init = parse_binarisation_init(binarisation_init).unwrap_or_default();
 
-        let n = data.nrows();
-        let dim = data.ncols();
+        let (vectors_flat, n, dim) = data.into_row_major();
 
         let binariser = match init {
-            BinarisationInit::PcaHashing => Binariser::new_pca_hashing(data, dim, n_bits, seed)?,
-            BinarisationInit::RandomProjections => Binariser::new_simhash(data, dim, n_bits, seed)?,
+            BinarisationInit::PcaHashing => {
+                Binariser::new_pca_hashing(&vectors_flat, n, dim, n_bits, seed)?
+            }
+            BinarisationInit::RandomProjections => {
+                Binariser::new_simhash(&vectors_flat, n, dim, n_bits, seed)?
+            }
             BinarisationInit::SignBased => Binariser::new_sign_based(dim),
         };
 
@@ -198,24 +203,16 @@ where
 
         let mut vectors_flat_binarised: Vec<u8> = Vec::with_capacity(n * n_bytes);
 
-        for i in 0..n {
-            let original: Vec<T> = data.row(i).iter().cloned().collect();
-            vectors_flat_binarised.extend(binariser.encode(&original)?);
+        for row in vectors_flat.chunks_exact(dim) {
+            vectors_flat_binarised.extend(binariser.encode(row)?);
         }
 
         // Save vector store
         std::fs::create_dir_all(&save_path)?;
 
-        let vectors_flat: Vec<T> = (0..n).flat_map(|i| data.row(i).iter().cloned()).collect();
-
-        let norms: Vec<T> = (0..n)
-            .map(|i| {
-                data.row(i)
-                    .iter()
-                    .map(|&x| x * x)
-                    .fold(T::zero(), |a, b| a + b)
-                    .sqrt()
-            })
+        let norms: Vec<T> = vectors_flat
+            .chunks_exact(dim)
+            .map(|row| row.iter().map(|&x| x * x).fold(T::zero(), |a, b| a + b).sqrt())
             .collect();
 
         let (vectors_path, norms_path) = MmapVectorStore::<T>::paths_in(&save_path);

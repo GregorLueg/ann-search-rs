@@ -23,7 +23,7 @@
 //! Sun, Simcha, Simcha, Chern & Guo, arXiv:2404.00774, 2024 (SOAR);
 //! Ge, He, Ke & Sun, CVPR, 2013 (optimised product quantisation)
 
-use faer::{MatRef, RowRef};
+use faer::{RowRef};
 use fixedbitset::FixedBitSet;
 use rayon::prelude::*;
 use std::cell::RefCell;
@@ -250,7 +250,7 @@ where
     /// every point land in the same cell and the dedup pass discards one.
     #[allow(clippy::too_many_arguments)]
     pub fn build(
-        data: MatRef<T>,
+        data: impl AnnMatrix<T>,
         nlist: Option<usize>,
         m: usize,
         metric: Dist,
@@ -265,7 +265,7 @@ where
             return Err(AnnSearchErrors::DistanceNotSupported(metric));
         }
 
-        let (mut vectors_flat, n, dim) = matrix_to_flat(data);
+        let (mut vectors_flat, n, dim) = data.into_row_major();
 
         let nlist = nlist.unwrap_or((n as f32).sqrt() as usize).max(1);
         let rule = resolve_soar_opq_rule(rule, &metric);

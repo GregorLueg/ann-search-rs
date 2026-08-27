@@ -1,7 +1,7 @@
 //! Exhaustive OPQ index: quantises the original data via optimised product
 //! quantisation.
 
-use faer::{MatRef, RowRef};
+use faer::{RowRef};
 use rayon::prelude::*;
 use std::collections::BinaryHeap;
 use std::ops::AddAssign;
@@ -104,7 +104,7 @@ where
     ///
     /// Index ready for querying
     pub fn build(
-        data: MatRef<T>,
+        data: impl AnnMatrix<T>,
         m: usize,
         metric: Dist,
         max_iters: Option<usize>,
@@ -116,7 +116,7 @@ where
             return Err(AnnSearchErrors::DistanceNotSupported(metric));
         }
 
-        let (mut vectors_flat, n, dim) = matrix_to_flat(data);
+        let (mut vectors_flat, n, dim) = data.into_row_major();
         let max_iters = max_iters.unwrap_or(30);
 
         if metric == Dist::Cosine {

@@ -1,7 +1,7 @@
 //! Inverted file index. Leverages k-means clustering to partition data into
 //! Voronoi cells that are being searched during querying.
 
-use faer::{MatRef, RowRef};
+use faer::{RowRef};
 use rayon::prelude::*;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -143,7 +143,7 @@ where
     ///
     /// Constructed index ready for querying
     pub fn build(
-        data: MatRef<T>,
+        data: impl AnnMatrix<T>,
         metric: Dist,
         nlist: Option<usize>,
         k_means_params: Option<KMeansTrainingParams>,
@@ -154,7 +154,7 @@ where
             return Err(AnnSearchErrors::DistanceNotSupported(metric));
         }
 
-        let (vectors_flat, n, dim) = matrix_to_flat(data);
+        let (vectors_flat, n, dim) = data.into_row_major();
 
         // Compute norms for Cosine distance
         let norms = if metric == Dist::Cosine {

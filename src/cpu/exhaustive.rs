@@ -1,14 +1,13 @@
 //! Exhaustive (flat) implementation for nearest neighbour searches in
 //! ann-search-rs.
 
-use faer::{MatRef, RowRef};
+use faer::{RowRef};
 
 use rayon::prelude::*;
 use std::collections::BinaryHeap;
 use thousands::*;
 
 use crate::prelude::*;
-use crate::utils::matrix_to_flat;
 
 /////////////////////
 // ExhaustiveIndex //
@@ -80,8 +79,8 @@ where
     /// ### Returns
     ///
     /// Initialised exhaustive index
-    pub fn new(data: MatRef<T>, metric: Dist) -> Self {
-        let (vectors_flat, n, dim) = matrix_to_flat(data);
+    pub fn new(data: impl AnnMatrix<T>, metric: Dist) -> Self {
+        let (vectors_flat, n, dim) = data.into_row_major();
 
         let norms = if metric == Dist::Cosine {
             (0..n)

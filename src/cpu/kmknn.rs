@@ -2,7 +2,7 @@
 //! that leverages k-means clustering and the triangle inequality to prune
 //! distance computations.
 
-use faer::{MatRef, RowRef};
+use faer::{RowRef};
 use rayon::prelude::*;
 use std::collections::BinaryHeap;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -144,7 +144,7 @@ where
     ///
     /// Constructed index ready for querying
     pub fn build(
-        data: MatRef<T>,
+        data: impl AnnMatrix<T>,
         metric: Dist,
         nlist: Option<usize>,
         k_means_params: Option<KMeansTrainingParams>,
@@ -155,7 +155,7 @@ where
             return Err(AnnSearchErrors::DistanceNotSupported(metric));
         }
 
-        let (mut vectors_flat, n, dim) = matrix_to_flat(data);
+        let (mut vectors_flat, n, dim) = data.into_row_major();
 
         // Cosine: normalise in place and proceed in Euclidean space
         if metric == Dist::Cosine {

@@ -1,7 +1,7 @@
 //! HNSW implementation in ann-search-rs. Uses parallel updates during
 //! construction of the index which comes at the cost of determinism.
 
-use faer::{MatRef, RowRef};
+use faer::{RowRef};
 use num_traits::{Float, FromPrimitive};
 use rand::{rngs::SmallRng, Rng, SeedableRng};
 use rayon::prelude::*;
@@ -625,14 +625,14 @@ where
     ///
     /// Constructed index ready for querying
     pub fn build(
-        data: MatRef<T>,
+        data: impl AnnMatrix<T>,
         m: usize,
         ef_construction: usize,
         metric: &Dist,
         seed: usize,
         verbose: bool,
     ) -> Self {
-        let (vectors_flat, n, dim) = matrix_to_flat(data);
+        let (vectors_flat, n, dim) = data.into_row_major();
 
         if verbose {
             println!(

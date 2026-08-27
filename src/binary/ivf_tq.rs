@@ -23,7 +23,7 @@
 //! are not guaranteed identical to per-row `query` results.
 
 use bytemuck::Pod;
-use faer::{MatRef, RowRef};
+use faer::{RowRef};
 use rayon::prelude::*;
 use std::collections::{BTreeSet, BinaryHeap};
 use std::path::Path;
@@ -168,7 +168,7 @@ where
     /// Initialised index, or `DistanceNotSupported` for `Manhattan`.
     #[allow(clippy::too_many_arguments)]
     pub fn build(
-        data: MatRef<T>,
+        data: impl AnnMatrix<T>,
         metric: Dist,
         nlist: Option<usize>,
         k_means_params: Option<KMeansTrainingParams>,
@@ -180,7 +180,7 @@ where
             return Err(AnnSearchErrors::DistanceNotSupported(metric));
         }
 
-        let (vectors_flat, n, dim) = matrix_to_flat(data);
+        let (vectors_flat, n, dim) = data.into_row_major();
 
         // original L2 norms; used for cluster assignment (Cosine) and routing.
         let norms: Vec<T> = (0..n)
@@ -264,7 +264,8 @@ where
         let (vector_indices, cluster_offsets) = build_csr_layout(assignments, n, nlist);
 
         // global, data-oblivious TurboQuant encoding of every vector.
-        let quantiser = TurboQuantQuantiser::new(data, &metric, bits, seed as u64)?;
+        let quantiser =
+            TurboQuantQuantiser::new((&vectors_flat[..], n, dim), &metric, bits, seed as u64)?;
         let bits = quantiser.storage.bits;
 
         // per-vector raw norms and dot-corrections reordered into CSR slot order for the kernels.
@@ -364,7 +365,7 @@ where
     /// Initialised index with re-ranking enabled.
     #[allow(clippy::too_many_arguments)]
     pub fn build_with_vector_store(
-        data: MatRef<T>,
+        data: impl AnnMatrix<T>,
         metric: Dist,
         nlist: Option<usize>,
         k_means_params: Option<KMeansTrainingParams>,
@@ -373,12 +374,19 @@ where
         verbose: bool,
         save_path: impl AsRef<Path>,
     ) -> Result<Self, AnnSearchErrors> {
-        let mut index = Self::build(data, metric, nlist, k_means_params, bits, seed, verbose)?;
+        // One walk of the caller's matrix, shared by the index and the store.
+        let (vectors_flat, n, dim) = data.into_row_major();
+        let mut index = Self::build(
+            (&vectors_flat[..], n, dim),
+            metric,
+            nlist,
+            k_means_params,
+            bits,
+            seed,
+            verbose,
+        )?;
 
-        let (vectors_flat, n, dim) = matrix_to_flat(data);
-        let norms: Vec<T> = (0..n)
-            .map(|i| compute_l2_norm(&vectors_flat[i * dim..(i + 1) * dim]))
-            .collect();
+        let norms: Vec<T> = vectors_flat.chunks_exact(dim).map(compute_l2_norm).collect();
 
         std::fs::create_dir_all(&save_path)?;
         let (vectors_path, norms_path) = MmapVectorStore::<T>::paths_in(&save_path);
@@ -682,7 +690,7 @@ where
     #[allow(clippy::too_many_arguments)]
     pub fn query_batch(
         &self,
-        queries: MatRef<T>,
+        queries: impl AnnMatrix<T>,
         k: usize,
         nprobe: Option<usize>,
         rerank: bool,
@@ -690,12 +698,12 @@ where
         return_dist: bool,
         verbose: bool,
     ) -> KnnOptionResult<T> {
-        let nq = queries.nrows();
+        let (queries_flat, nq, query_dim) = queries.into_row_major();
 
-        if queries.ncols() != self.dim {
+        if query_dim != self.dim {
             return Err(AnnSearchErrors::DimensionMismatch {
                 index_dim: self.dim,
-                query_dim: queries.ncols(),
+                query_dim,
             });
         }
 
@@ -737,11 +745,11 @@ where
             (0..nq)
                 .into_par_iter()
                 .map(|i| {
-                    let qvec: Vec<T> = queries.row(i).iter().cloned().collect();
+                    let qvec = &queries_flat[i * self.dim..(i + 1) * self.dim];
                     let out = if rerank {
-                        self.query_reranking(&qvec, k, Some(nprobe), rerank_factor)?
+                        self.query_reranking(qvec, k, Some(nprobe), rerank_factor)?
                     } else {
-                        self.query(&qvec, k, Some(nprobe))?
+                        self.query(qvec, k, Some(nprobe))?
                     };
                     report(&counter, 1);
                     Ok(out)
@@ -756,8 +764,11 @@ where
                 .map(|start| {
                     let batch_nq = (nq - start).min(4);
 
-                    let qrows: Vec<Vec<T>> = (0..batch_nq)
-                        .map(|qi| queries.row(start + qi).iter().cloned().collect())
+                    let qrows: Vec<&[T]> = (0..batch_nq)
+                        .map(|qi| {
+                            let q = start + qi;
+                            &queries_flat[q * self.dim..(q + 1) * self.dim]
+                        })
                         .collect();
 
                     // Encode each query, build its LUT, and union its probe set.
@@ -765,7 +776,7 @@ where
                     let mut qnorms = [0.0f32; 4];
                     let mut probed: BTreeSet<usize> = BTreeSet::new();
                     for qi in 0..batch_nq {
-                        let eq = self.quantiser.encode_query(&qrows[qi])?;
+                        let eq = self.quantiser.encode_query(qrows[qi])?;
                         let (q_rot_f32, levels_f32) =
                             prepare_scalar_scoring(&eq, &self.quantiser.encoder);
                         luts_owned.push(build_query_lut(
@@ -775,7 +786,7 @@ where
                             self.dim,
                         )?);
                         qnorms[qi] = eq.query_norm.to_f32().unwrap();
-                        probed.extend(self.probed_clusters(&qrows[qi], nprobe, k_search));
+                        probed.extend(self.probed_clusters(qrows[qi], nprobe, k_search));
                     }
 
                     let last = batch_nq - 1;
@@ -819,7 +830,7 @@ where
                             .map(|&s| self.vector_indices[s as usize])
                             .collect();
                         if let Some(vs) = vector_store {
-                            out.push(self.rerank_candidates(vs, &qrows[qi], &cands, k));
+                            out.push(self.rerank_candidates(vs, qrows[qi], &cands, k));
                         } else {
                             let dists =
                                 dists_f32.iter().map(|&d| T::from_f32(d).unwrap()).collect();

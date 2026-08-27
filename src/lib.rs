@@ -33,7 +33,6 @@ pub mod binary;
 #[cfg(feature = "serialise")]
 pub mod serialise;
 
-use faer::MatRef;
 use rayon::prelude::*;
 
 use std::sync::{
@@ -261,13 +260,15 @@ where
 ///
 /// ### Params
 ///
-/// * `mat` - The initial matrix with samples x features
+/// * `mat` - Input data as samples x features. Accepts a faer matrix, an
+///   ndarray 2-D array (with the `ndarray` feature) or a row-major
+///   `(&[T], n_samples, n_features)` tuple. See [`AnnMatrix`].
 /// * `dist_metric` - Distance metric: "euclidean", "cosine" or "manhattan"
 ///
 /// ### Returns
 ///
 /// The initialised `ExhausiveIndex`
-pub fn build_exhaustive_index<T>(mat: MatRef<T>, dist_metric: &str) -> ExhaustiveIndex<T>
+pub fn build_exhaustive_index<T>(mat: impl AnnMatrix<T>, dist_metric: &str) -> ExhaustiveIndex<T>
 where
     T: AnnSearchFloat,
 {
@@ -283,7 +284,9 @@ where
 ///
 /// ### Params
 ///
-/// * `query_mat` - The query matrix containing the samples × features
+/// * `query_mat` - Query data as samples x features. Accepts a faer matrix,
+///   an ndarray 2-D array (with the `ndarray` feature) or a row-major
+///   `(&[T], n_queries, n_features)` tuple. See [`AnnMatrix`].
 /// * `index` - The exhaustive index
 /// * `k` - Number of neighbours to return
 /// * `return_dist` - Shall the distances be returned
@@ -293,7 +296,7 @@ where
 ///
 /// A tuple of `(knn_indices, optional distances)`
 pub fn query_exhaustive_index<T>(
-    query_mat: MatRef<T>,
+    query_mat: impl AnnMatrix<T>,
     index: &ExhaustiveIndex<T>,
     k: usize,
     return_dist: bool,
@@ -302,8 +305,10 @@ pub fn query_exhaustive_index<T>(
 where
     T: AnnSearchFloat,
 {
-    query_parallel(query_mat.nrows(), return_dist, verbose, |i| {
-        index.query_row(query_mat.row(i), k)
+    let (queries, nq, dim) = query_mat.into_row_major();
+
+    query_parallel(nq, return_dist, verbose, |i| {
+        index.query(&queries[i * dim..(i + 1) * dim], k)
     })
 }
 
@@ -341,7 +346,9 @@ where
 ///
 /// ### Params
 ///
-/// * `mat` - The initial matrix with samples x features
+/// * `mat` - Input data as samples x features. Accepts a faer matrix, an
+///   ndarray 2-D array (with the `ndarray` feature) or a row-major
+///   `(&[T], n_samples, n_features)` tuple. See [`AnnMatrix`].
 /// * `dist_metric` - Distance metric: "euclidean" or "cosine". "manhatten" is
 ///   not supported.
 /// * `nlist` - Optional number of clusters. Defaults to sqrt(n).
@@ -355,7 +362,7 @@ where
 ///
 /// The initialised `KmknnIndex`
 pub fn build_kmknn_index<T>(
-    mat: MatRef<T>,
+    mat: impl AnnMatrix<T>,
     dist_metric: &str,
     nlist: Option<usize>,
     k_means_params: Option<KMeansTrainingParams>,
@@ -376,7 +383,9 @@ where
 ///
 /// ### Params
 ///
-/// * `query_mat` - The query matrix containing the samples × features
+/// * `query_mat` - Query data as samples x features. Accepts a faer matrix,
+///   an ndarray 2-D array (with the `ndarray` feature) or a row-major
+///   `(&[T], n_queries, n_features)` tuple. See [`AnnMatrix`].
 /// * `index` - The kMkNN index
 /// * `k` - Number of neighbours to return
 /// * `return_dist` - Shall the distances be returned
@@ -386,7 +395,7 @@ where
 ///
 /// A tuple of `(knn_indices, optional distances)`
 pub fn query_kmknn_index<T>(
-    query_mat: MatRef<T>,
+    query_mat: impl AnnMatrix<T>,
     index: &KmknnIndex<T>,
     k: usize,
     return_dist: bool,
@@ -395,8 +404,10 @@ pub fn query_kmknn_index<T>(
 where
     T: AnnSearchFloat,
 {
-    query_parallel(query_mat.nrows(), return_dist, verbose, |i| {
-        index.query_row(query_mat.row(i), k)
+    let (queries, nq, dim) = query_mat.into_row_major();
+
+    query_parallel(nq, return_dist, verbose, |i| {
+        index.query(&queries[i * dim..(i + 1) * dim], k)
     })
 }
 
@@ -434,8 +445,9 @@ where
 ///
 /// ### Params
 ///
-/// * `mat` - The data matrix. Rows represent the samples, columns represent
-///   the embedding dimensions
+/// * `mat` - Input data as samples x features. Accepts a faer matrix, an
+///   ndarray 2-D array (with the `ndarray` feature) or a row-major
+///   `(&[T], n_samples, n_features)` tuple. See [`AnnMatrix`].
 /// * `dist_metric` - Distance metric: "euclidean" or "cosine". "manhatten" is
 ///   not supported.
 /// * `n_trees` - Number of trees to use to build the index
@@ -445,7 +457,7 @@ where
 ///
 /// The `AnnoyIndex`.
 pub fn build_annoy_index<T>(
-    mat: MatRef<T>,
+    mat: impl AnnMatrix<T>,
     dist_metric: &str,
     n_trees: usize,
     seed: usize,
@@ -465,7 +477,9 @@ where
 ///
 /// ### Params
 ///
-/// * `query_mat` - The query matrix containing the samples x features
+/// * `query_mat` - Query data as samples x features. Accepts a faer matrix,
+///   an ndarray 2-D array (with the `ndarray` feature) or a row-major
+///   `(&[T], n_queries, n_features)` tuple. See [`AnnMatrix`].
 /// * `k` - Number of neighbours to return
 /// * `index` - The AnnoyIndex to query.
 /// * `search_budget` - Search budget per tree
@@ -477,7 +491,7 @@ where
 ///
 /// A tuple of `(knn_indices, optional distances)`
 pub fn query_annoy_index<T>(
-    query_mat: MatRef<T>,
+    query_mat: impl AnnMatrix<T>,
     index: &AnnoyIndex<T>,
     k: usize,
     search_budget: Option<usize>,
@@ -487,8 +501,10 @@ pub fn query_annoy_index<T>(
 where
     T: AnnSearchFloat,
 {
-    query_parallel(query_mat.nrows(), return_dist, verbose, |i| {
-        index.query_row(query_mat.row(i), k, search_budget)
+    let (queries, nq, dim) = query_mat.into_row_major();
+
+    query_parallel(nq, return_dist, verbose, |i| {
+        index.query(&queries[i * dim..(i + 1) * dim], k, search_budget)
     })
 }
 
@@ -529,8 +545,9 @@ where
 ///
 /// ### Params
 ///
-/// * `mat` - The data matrix. Rows represent the samples, columns represent
-///   the embedding dimensions
+/// * `mat` - Input data as samples x features. Accepts a faer matrix, an
+///   ndarray 2-D array (with the `ndarray` feature) or a row-major
+///   `(&[T], n_samples, n_features)` tuple. See [`AnnMatrix`].
 /// * `dist_metric` - Distance metric: "euclidean" or "cosine". "manhatten" is
 ///   not supported.
 /// * `seed` - Random seed for reproducibility
@@ -539,7 +556,7 @@ where
 ///
 /// The `BallTreeIndex`.
 pub fn build_balltree_index<T>(
-    mat: MatRef<T>,
+    mat: impl AnnMatrix<T>,
     dist_metric: &str,
     seed: usize,
 ) -> Result<BallTreeIndex<T>, AnnSearchErrors>
@@ -557,7 +574,9 @@ where
 ///
 /// ### Params
 ///
-/// * `query_mat` - The query matrix containing the samples x features
+/// * `query_mat` - Query data as samples x features. Accepts a faer matrix,
+///   an ndarray 2-D array (with the `ndarray` feature) or a row-major
+///   `(&[T], n_queries, n_features)` tuple. See [`AnnMatrix`].
 /// * `k` - Number of neighbours to return
 /// * `index` - The BallTreeIndex to query
 /// * `search_budget` - Search budget (number of items to examine)
@@ -569,7 +588,7 @@ where
 ///
 /// A tuple of `(knn_indices, optional distances)`
 pub fn query_balltree_index<T>(
-    query_mat: MatRef<T>,
+    query_mat: impl AnnMatrix<T>,
     index: &BallTreeIndex<T>,
     k: usize,
     search_budget: Option<usize>,
@@ -579,8 +598,10 @@ pub fn query_balltree_index<T>(
 where
     T: AnnSearchFloat,
 {
-    query_parallel(query_mat.nrows(), return_dist, verbose, |i| {
-        index.query_row(query_mat.row(i), k, search_budget)
+    let (queries, nq, dim) = query_mat.into_row_major();
+
+    query_parallel(nq, return_dist, verbose, |i| {
+        index.query(&queries[i * dim..(i + 1) * dim], k, search_budget)
     })
 }
 
@@ -621,8 +642,9 @@ where
 ///
 /// ### Params
 ///
-/// * `mat` - The data matrix. Rows represent the samples, columns represent
-///   the embedding dimensions.
+/// * `mat` - Input data as samples x features. Accepts a faer matrix, an
+///   ndarray 2-D array (with the `ndarray` feature) or a row-major
+///   `(&[T], n_samples, n_features)` tuple. See [`AnnMatrix`].
 /// * `m` - Number of bidirectional connections per layer.
 /// * `ef_construction` - Size of candidate list during construction.
 /// * `dist_metric` - Distance metric: "euclidean", "cosine" or "manhatten".
@@ -632,7 +654,7 @@ where
 ///
 /// The `HnswIndex`.
 pub fn build_hnsw_index<T>(
-    mat: MatRef<T>,
+    mat: impl AnnMatrix<T>,
     m: usize,
     ef_construction: usize,
     dist_metric: &str,
@@ -655,7 +677,9 @@ where
 ///
 /// ### Params
 ///
-/// * `query_mat` - The query matrix containing the samples x features
+/// * `query_mat` - Query data as samples x features. Accepts a faer matrix,
+///   an ndarray 2-D array (with the `ndarray` feature) or a row-major
+///   `(&[T], n_queries, n_features)` tuple. See [`AnnMatrix`].
 /// * `index` - Reference to the built HNSW index
 /// * `k` - Number of neighbours to return
 /// * `ef_search` - Size of candidate list during search (higher = better
@@ -673,7 +697,7 @@ where
 /// The distance metric is determined at index build time and cannot be changed
 /// during querying.
 pub fn query_hnsw_index<T>(
-    query_mat: MatRef<T>,
+    query_mat: impl AnnMatrix<T>,
     index: &HnswIndex<T>,
     k: usize,
     ef_search: usize,
@@ -684,8 +708,10 @@ where
     T: AnnSearchFloat,
     HnswIndex<T>: HnswState<T>,
 {
-    query_parallel(query_mat.nrows(), return_dist, verbose, |i| {
-        index.query_row(query_mat.row(i), k, ef_search)
+    let (queries, nq, dim) = query_mat.into_row_major();
+
+    query_parallel(nq, return_dist, verbose, |i| {
+        index.query(&queries[i * dim..(i + 1) * dim], k, ef_search)
     })
 }
 
@@ -729,8 +755,9 @@ where
 ///
 /// ### Params
 ///
-/// * `mat` - The data matrix. Rows represent the samples, columns represent
-///   the embedding dimensions
+/// * `mat` - Input data as samples x features. Accepts a faer matrix, an
+///   ndarray 2-D array (with the `ndarray` feature) or a row-major
+///   `(&[T], n_samples, n_features)` tuple. See [`AnnMatrix`].
 /// * `nlist` - Number of clusters to create
 /// * `k_means_params` - Optional k-means trainings parameters, see
 ///   [KMeansTrainingParams]. If not provided, will default to sensible
@@ -744,7 +771,7 @@ where
 ///
 /// The `IvfIndex`.
 pub fn build_ivf_index<T>(
-    mat: MatRef<T>,
+    mat: impl AnnMatrix<T>,
     nlist: Option<usize>,
     k_means_params: Option<KMeansTrainingParams>,
     dist_metric: &str,
@@ -766,7 +793,9 @@ where
 ///
 /// ### Params
 ///
-/// * `query_mat` - The query matrix containing the samples x features
+/// * `query_mat` - Query data as samples x features. Accepts a faer matrix,
+///   an ndarray 2-D array (with the `ndarray` feature) or a row-major
+///   `(&[T], n_queries, n_features)` tuple. See [`AnnMatrix`].
 /// * `index` - Reference to the built IVF index
 /// * `k` - Number of neighbours to return
 /// * `nprobe` - Number of clusters to search (defaults to min(nlist/10, 10))
@@ -784,7 +813,7 @@ where
 /// The distance metric is determined at index build time and cannot be changed
 /// during querying.
 pub fn query_ivf_index<T>(
-    query_mat: MatRef<T>,
+    query_mat: impl AnnMatrix<T>,
     index: &IvfIndex<T>,
     k: usize,
     nprobe: Option<usize>,
@@ -794,8 +823,10 @@ pub fn query_ivf_index<T>(
 where
     T: AnnSearchFloat,
 {
-    query_parallel(query_mat.nrows(), return_dist, verbose, |i| {
-        index.query_row(query_mat.row(i), k, nprobe)
+    let (queries, nq, dim) = query_mat.into_row_major();
+
+    query_parallel(nq, return_dist, verbose, |i| {
+        index.query(&queries[i * dim..(i + 1) * dim], k, nprobe)
     })
 }
 
@@ -807,7 +838,9 @@ where
 ///
 /// ### Params
 ///
-/// * `query_mat` - The query matrix containing the samples x features
+/// * `query_mat` - Query data as samples x features. Accepts a faer matrix,
+///   an ndarray 2-D array (with the `ndarray` feature) or a row-major
+///   `(&[T], n_queries, n_features)` tuple. See [`AnnMatrix`].
 /// * `index` - Reference to the built IVF index
 /// * `k` - Number of neighbours to return
 /// * `nprobe` - Number of clusters to search (defaults to min(nlist/10, 10))
@@ -850,8 +883,9 @@ where
 ///
 /// ### Params
 ///
-/// * `mat` - The data matrix. Rows represent the samples, columns represent
-///   the embedding dimensions
+/// * `mat` - Input data as samples x features. Accepts a faer matrix, an
+///   ndarray 2-D array (with the `ndarray` feature) or a row-major
+///   `(&[T], n_samples, n_features)` tuple. See [`AnnMatrix`].
 /// * `nlist` - Number of clusters to create. Defaults to `sqrt(n)`. Spilling
 ///   pays off in the fine-cell regime, so larger values are worth trying here
 ///   in a way they are not for [`build_ivf_index`].
@@ -874,7 +908,7 @@ where
 ///
 /// Sun, Simcha, Simcha, Chern & Guo, arXiv:2404.00774, 2024 (SOAR)
 pub fn build_soar_index<T>(
-    mat: MatRef<T>,
+    mat: impl AnnMatrix<T>,
     nlist: Option<usize>,
     rule: Option<SoarRule>,
     k_means_params: Option<KMeansTrainingParams>,
@@ -897,7 +931,9 @@ where
 ///
 /// ### Params
 ///
-/// * `query_mat` - The query matrix containing the samples x features
+/// * `query_mat` - Query data as samples x features. Accepts a faer matrix,
+///   an ndarray 2-D array (with the `ndarray` feature) or a row-major
+///   `(&[T], n_queries, n_features)` tuple. See [`AnnMatrix`].
 /// * `index` - Reference to the built SOAR index
 /// * `k` - Number of neighbours to return
 /// * `nprobe` - Number of clusters to search. Higher values improve recall at
@@ -915,7 +951,7 @@ where
 /// The distance metric is determined at index build time and cannot be changed
 /// during querying.
 pub fn query_soar_index<T>(
-    query_mat: MatRef<T>,
+    query_mat: impl AnnMatrix<T>,
     index: &SoarIndex<T>,
     k: usize,
     nprobe: Option<usize>,
@@ -925,8 +961,10 @@ pub fn query_soar_index<T>(
 where
     T: AnnSearchFloat,
 {
-    query_parallel(query_mat.nrows(), return_dist, verbose, |i| {
-        index.query_row(query_mat.row(i), k, nprobe)
+    let (queries, nq, dim) = query_mat.into_row_major();
+
+    query_parallel(nq, return_dist, verbose, |i| {
+        index.query(&queries[i * dim..(i + 1) * dim], k, nprobe)
     })
 }
 
@@ -974,8 +1012,9 @@ where
 ///
 /// ### Params
 ///
-/// * `mat` - The data matrix. Rows represent the samples, columns represent
-///   the embedding dimensions
+/// * `mat` - Input data as samples x features. Accepts a faer matrix, an
+///   ndarray 2-D array (with the `ndarray` feature) or a row-major
+///   `(&[T], n_samples, n_features)` tuple. See [`AnnMatrix`].
 /// * `dist_metric` - Distance metric: "euclidean", "cosine" or "manhatten".
 /// * `n_trees` - Number of trees to use to build the index
 /// * `seed` - Random seed for reproducibility
@@ -986,7 +1025,7 @@ where
 ///
 /// The `KdTreeIndex`.
 pub fn build_kd_tree_index<T>(
-    mat: MatRef<T>,
+    mat: impl AnnMatrix<T>,
     dist_metric: &str,
     n_trees: usize,
     seed: usize,
@@ -1006,7 +1045,9 @@ where
 ///
 /// ### Params
 ///
-/// * `query_mat` - The query matrix containing the samples x features
+/// * `query_mat` - Query data as samples x features. Accepts a faer matrix,
+///   an ndarray 2-D array (with the `ndarray` feature) or a row-major
+///   `(&[T], n_queries, n_features)` tuple. See [`AnnMatrix`].
 /// * `index` - The KdTreeIndex to query
 /// * `k` - Number of neighbours to return
 /// * `search_budget` - Search budget (total items to examine)
@@ -1018,7 +1059,7 @@ where
 ///
 /// A tuple of `(knn_indices, optional distances)`
 pub fn query_kd_tree_index<T>(
-    query_mat: MatRef<T>,
+    query_mat: impl AnnMatrix<T>,
     index: &KdTreeIndex<T>,
     k: usize,
     search_budget: Option<usize>,
@@ -1028,8 +1069,10 @@ pub fn query_kd_tree_index<T>(
 where
     T: AnnSearchFloat,
 {
-    query_parallel(query_mat.nrows(), return_dist, verbose, |i| {
-        index.query_row(query_mat.row(i), k, search_budget)
+    let (queries, nq, dim) = query_mat.into_row_major();
+
+    query_parallel(nq, return_dist, verbose, |i| {
+        index.query(&queries[i * dim..(i + 1) * dim], k, search_budget)
     })
 }
 
@@ -1070,7 +1113,9 @@ where
 ///
 /// ### Params
 ///
-/// * `mat` - The initial matrix with samples x features
+/// * `mat` - Input data as samples x features. Accepts a faer matrix, an
+///   ndarray 2-D array (with the `ndarray` feature) or a row-major
+///   `(&[T], n_samples, n_features)` tuple. See [`AnnMatrix`].
 /// * `dist_metric` - Distance metric: "euclidean" or "cosine". "manhatten" is
 ///   not supported.
 /// * `num_tables` - Number of hash tables to use (with multi-probe, 4 to 8 is
@@ -1089,7 +1134,7 @@ where
 ///
 /// The ready LSH index for querying
 pub fn build_lsh_index<T>(
-    mat: MatRef<T>,
+    mat: impl AnnMatrix<T>,
     dist_metric: &str,
     num_tables: usize,
     bits_per_hash: usize,
@@ -1113,7 +1158,9 @@ where
 ///
 /// ### Params
 ///
-/// * `query_mat` - The query matrix containing the samples × features
+/// * `query_mat` - Query data as samples x features. Accepts a faer matrix,
+///   an ndarray 2-D array (with the `ndarray` feature) or a row-major
+///   `(&[T], n_queries, n_features)` tuple. See [`AnnMatrix`].
 /// * `index` - The LSH index
 /// * `k` - Number of neighbours to return
 /// * `max_candidates` - Optional cap on the number of unique candidates scored
@@ -1128,7 +1175,7 @@ where
 ///
 /// A tuple of `(knn_indices, optional distances)`
 pub fn query_lsh_index<T>(
-    query_mat: MatRef<T>,
+    query_mat: impl AnnMatrix<T>,
     index: &LSHIndex<T>,
     k: usize,
     n_probe: usize,
@@ -1139,8 +1186,10 @@ pub fn query_lsh_index<T>(
 where
     T: AnnSearchFloat,
 {
-    query_parallel_with_flags(query_mat.nrows(), return_dist, verbose, |i| {
-        index.query_row(query_mat.row(i), k, max_candidates, n_probe)
+    let (queries, nq, dim) = query_mat.into_row_major();
+
+    query_parallel_with_flags(nq, return_dist, verbose, |i| {
+        index.query(&queries[i * dim..(i + 1) * dim], k, max_candidates, n_probe)
     })
 }
 
@@ -1187,8 +1236,9 @@ where
 ///
 /// ### Params
 ///
-/// * `mat` - The data matrix. Rows represent the samples, columns represent
-///   the embedding dimensions.
+/// * `mat` - Input data as samples x features. Accepts a faer matrix, an
+///   ndarray 2-D array (with the `ndarray` feature) or a row-major
+///   `(&[T], n_samples, n_features)` tuple. See [`AnnMatrix`].
 /// * `k` - Number of neighbours for the k-NN graph.
 /// * `dist_metric` - Distance metric: "euclidean", "cosine" or "manhatten".
 /// * `max_iter` - Maximum iterations for the algorithm.
@@ -1208,7 +1258,7 @@ where
 /// The `NNDescent` index.
 #[allow(clippy::too_many_arguments)]
 pub fn build_nndescent_index<T>(
-    mat: MatRef<T>,
+    mat: impl AnnMatrix<T>,
     dist_metric: &str,
     delta: T,
     diversify_prob: T,
@@ -1247,7 +1297,9 @@ where
 ///
 /// ### Params
 ///
-/// * `query_mat` - The query matrix containing the samples x features
+/// * `query_mat` - Query data as samples x features. Accepts a faer matrix,
+///   an ndarray 2-D array (with the `ndarray` feature) or a row-major
+///   `(&[T], n_queries, n_features)` tuple. See [`AnnMatrix`].
 /// * `index` - Reference to the built NNDescent index
 /// * `k` - Number of neighbours to return
 /// * `ef_search` -
@@ -1264,7 +1316,7 @@ where
 /// The distance metric is determined at index build time and cannot be changed
 /// during querying.
 pub fn query_nndescent_index<T>(
-    query_mat: MatRef<T>,
+    query_mat: impl AnnMatrix<T>,
     index: &NNDescent<T>,
     k: usize,
     ef_search: Option<usize>,
@@ -1276,8 +1328,10 @@ where
     NNDescent<T>: ApplySortedUpdates<T>,
     NNDescent<T>: NNDescentQuery<T>,
 {
-    query_parallel(query_mat.nrows(), return_dist, verbose, |i| {
-        index.query_row(query_mat.row(i), k, ef_search)
+    let (queries, nq, dim) = query_mat.into_row_major();
+
+    query_parallel(nq, return_dist, verbose, |i| {
+        index.query(&queries[i * dim..(i + 1) * dim], k, ef_search)
     })
 }
 
@@ -1325,7 +1379,9 @@ where
 ///
 /// ### Params
 ///
-/// * `mat` - The data matrix. Rows are samples, columns are dimensions.
+/// * `mat` - Input data as samples x features. Accepts a faer matrix, an
+///   ndarray 2-D array (with the `ndarray` feature) or a row-major
+///   `(&[T], n_samples, n_features)` tuple. See [`AnnMatrix`].
 /// * `r` - Maximum out-degree (edges per node).
 /// * `l_build` - Beam width during construction.
 /// * `alpha_pass1` - Pruning alpha for pass 1 (typically 1.0).
@@ -1337,7 +1393,7 @@ where
 ///
 /// The built `VamanaIndex`.
 pub fn build_vamana_index<T>(
-    mat: MatRef<T>,
+    mat: impl AnnMatrix<T>,
     r: usize,
     l_build: usize,
     alpha_pass1: f32,
@@ -1361,7 +1417,9 @@ where
 ///
 /// ### Params
 ///
-/// * `query_mat` - Query matrix (samples × features).
+/// * `query_mat` - Query data as samples x features. Accepts a faer matrix,
+///   an ndarray 2-D array (with the `ndarray` feature) or a row-major
+///   `(&[T], n_queries, n_features)` tuple. See [`AnnMatrix`].
 /// * `index` - Reference to the built index.
 /// * `k` - Number of neighbours to return.
 /// * `ef_search` - Optional beam width override. Defaults to 100 inside the
@@ -1373,7 +1431,7 @@ where
 ///
 /// A tuple of `(knn_indices, optional distances)`.
 pub fn query_vamana_index<T>(
-    query_mat: MatRef<T>,
+    query_mat: impl AnnMatrix<T>,
     index: &VamanaIndex<T>,
     k: usize,
     ef_search: Option<usize>,
@@ -1384,8 +1442,10 @@ where
     T: AnnSearchFloat,
     VamanaIndex<T>: VamanaState<T>,
 {
-    query_parallel(query_mat.nrows(), return_dist, verbose, |i| {
-        index.query_row(query_mat.row(i), k, ef_search)
+    let (queries, nq, dim) = query_mat.into_row_major();
+
+    query_parallel(nq, return_dist, verbose, |i| {
+        index.query(&queries[i * dim..(i + 1) * dim], k, ef_search)
     })
 }
 
@@ -1429,7 +1489,9 @@ where
 ///
 /// ### Params
 ///
-/// * `mat` - Data matrix (rows are samples, columns are dimensions)
+/// * `mat` - Input data as samples x features. Accepts a faer matrix, an
+///   ndarray 2-D array (with the `ndarray` feature) or a row-major
+///   `(&[T], n_samples, n_features)` tuple. See [`AnnMatrix`].
 /// * `r` - Maximum out-degree of the NSG graph
 /// * `l_build` - Beam width for the per-node candidate search on the input
 ///   kNN graph
@@ -1445,7 +1507,7 @@ where
 /// The built [`NsgIndex`] on success.
 #[allow(clippy::too_many_arguments)]
 pub fn build_nsg_index<T>(
-    mat: MatRef<T>,
+    mat: impl AnnMatrix<T>,
     r: usize,
     l_build: usize,
     c: usize,
@@ -1508,7 +1570,9 @@ where
 ///
 /// ### Params
 ///
-/// * `query_mat` - Query matrix (samples x features)
+/// * `query_mat` - Query data as samples x features. Accepts a faer matrix,
+///   an ndarray 2-D array (with the `ndarray` feature) or a row-major
+///   `(&[T], n_queries, n_features)` tuple. See [`AnnMatrix`].
 /// * `index` - Reference to the built index
 /// * `k` - Number of neighbours to return
 /// * `ef_search` - Optional beam width override. Defaults to `100` if `None`
@@ -1519,7 +1583,7 @@ where
 ///
 /// A tuple of `(knn_indices, optional distances)`.
 pub fn query_nsg_index<T>(
-    query_mat: MatRef<T>,
+    query_mat: impl AnnMatrix<T>,
     index: &NsgIndex<T>,
     k: usize,
     ef_search: Option<usize>,
@@ -1530,8 +1594,10 @@ where
     T: AnnSearchFloat,
     NsgIndex<T>: NsgState<T>,
 {
-    query_parallel(query_mat.nrows(), return_dist, verbose, |i| {
-        index.query_row(query_mat.row(i), k, ef_search)
+    let (queries, nq, dim) = query_mat.into_row_major();
+
+    query_parallel(nq, return_dist, verbose, |i| {
+        index.query(&queries[i * dim..(i + 1) * dim], k, ef_search)
     })
 }
 
@@ -1574,7 +1640,9 @@ where
 ///
 /// ### Params
 ///
-/// * `mat` - Data matrix (rows are samples, columns are dimensions)
+/// * `mat` - Input data as samples x features. Accepts a faer matrix, an
+///   ndarray 2-D array (with the `ndarray` feature) or a row-major
+///   `(&[T], n_samples, n_features)` tuple. See [`AnnMatrix`].
 /// * `s` - Initial out-degree of the random seed graph
 /// * `r` - Maximum per-node adjacency
 /// * `t1` - Outer rounds
@@ -1591,7 +1659,7 @@ where
 /// The built [`RnnDescentIndex`] on success.
 #[allow(clippy::too_many_arguments)]
 pub fn build_rnn_descent_index<T>(
-    mat: MatRef<T>,
+    mat: impl AnnMatrix<T>,
     s: usize,
     r: usize,
     t1: usize,
@@ -1618,7 +1686,9 @@ where
 ///
 /// ### Params
 ///
-/// * `query_mat` - Query matrix (samples x features)
+/// * `query_mat` - Query data as samples x features. Accepts a faer matrix,
+///   an ndarray 2-D array (with the `ndarray` feature) or a row-major
+///   `(&[T], n_queries, n_features)` tuple. See [`AnnMatrix`].
 /// * `index` - Reference to the built index
 /// * `k` - Number of neighbours to return
 /// * `ef_search` - Optional beam width override (defaults to `100`)
@@ -1631,7 +1701,7 @@ where
 ///
 /// A tuple of `(knn_indices, optional distances)`.
 pub fn query_rnn_descent_index<T>(
-    query_mat: MatRef<T>,
+    query_mat: impl AnnMatrix<T>,
     index: &RnnDescentIndex<T>,
     k: usize,
     ef_search: Option<usize>,
@@ -1643,8 +1713,10 @@ where
     T: AnnSearchFloat,
     RnnDescentIndex<T>: RnnDescentState<T>,
 {
-    query_parallel(query_mat.nrows(), return_dist, verbose, |i| {
-        index.query_row(query_mat.row(i), k, ef_search, k_search)
+    let (queries, nq, dim) = query_mat.into_row_major();
+
+    query_parallel(nq, return_dist, verbose, |i| {
+        index.query(&queries[i * dim..(i + 1) * dim], k, ef_search, k_search)
     })
 }
 
@@ -1690,8 +1762,9 @@ where
 ///
 /// ### Params
 ///
-/// * `mat` - The data matrix. Rows represent the samples, columns represent
-///   the embedding dimensions
+/// * `mat` - Input data as samples x features. Accepts a faer matrix, an
+///   ndarray 2-D array (with the `ndarray` feature) or a row-major
+///   `(&[T], n_samples, n_features)` tuple. See [`AnnMatrix`].
 /// * `dist_metric` - Distance metric: "euclidean" or "cosine". "manhatten" is
 ///   not supported.
 /// * `verbose` - Print progress information during index construction
@@ -1700,7 +1773,7 @@ where
 ///
 /// The `ExhaustiveIndexBf16`.
 pub fn build_exhaustive_bf16_index<T>(
-    mat: MatRef<T>,
+    mat: impl AnnMatrix<T>,
     dist_metric: &str,
     verbose: bool,
 ) -> Result<ExhaustiveIndexBf16<T>, AnnSearchErrors>
@@ -1712,13 +1785,12 @@ where
         Dist::default()
     });
 
+    let (vectors_flat, n, dim) = mat.into_row_major();
+
     if verbose {
-        println!(
-            "Building exhaustive BF16 index with {} samples",
-            mat.nrows()
-        );
+        println!("Building exhaustive BF16 index with {} samples", n);
     }
-    ExhaustiveIndexBf16::new(mat, metric)
+    ExhaustiveIndexBf16::new((vectors_flat, n, dim), metric)
 }
 
 #[cfg(feature = "quantised")]
@@ -1726,7 +1798,9 @@ where
 ///
 /// ### Params
 ///
-/// * `query_mat` - The query matrix containing the samples x features
+/// * `query_mat` - Query data as samples x features. Accepts a faer matrix,
+///   an ndarray 2-D array (with the `ndarray` feature) or a row-major
+///   `(&[T], n_queries, n_features)` tuple. See [`AnnMatrix`].
 /// * `index` - Reference to the built Exhaustive-BF16 index
 /// * `k` - Number of neighbours to return
 /// * `return_dist` - Shall the distances be returned
@@ -1736,7 +1810,7 @@ where
 ///
 /// A tuple of `(knn_indices, optional distances)`
 pub fn query_exhaustive_bf16_index<T>(
-    query_mat: MatRef<T>,
+    query_mat: impl AnnMatrix<T>,
     index: &ExhaustiveIndexBf16<T>,
     k: usize,
     return_dist: bool,
@@ -1745,8 +1819,10 @@ pub fn query_exhaustive_bf16_index<T>(
 where
     T: AnnSearchFloat + Bf16Compatible,
 {
-    query_parallel(query_mat.nrows(), return_dist, verbose, |i| {
-        index.query_row(query_mat.row(i), k)
+    let (queries, nq, dim) = query_mat.into_row_major();
+
+    query_parallel(nq, return_dist, verbose, |i| {
+        index.query(&queries[i * dim..(i + 1) * dim], k)
     })
 }
 
@@ -1786,8 +1862,9 @@ where
 ///
 /// ### Params
 ///
-/// * `mat` - The data matrix. Rows represent the samples, columns represent
-///   the embedding dimensions
+/// * `mat` - Input data as samples x features. Accepts a faer matrix, an
+///   ndarray 2-D array (with the `ndarray` feature) or a row-major
+///   `(&[T], n_samples, n_features)` tuple. See [`AnnMatrix`].
 /// * `dist_metric` - Distance metric: "euclidean" or "cosine". "manhatten" is
 ///   not supported.
 /// * `verbose` - Print progress information during index construction
@@ -1796,7 +1873,7 @@ where
 ///
 /// The `ExhaustiveSq8Index`.
 pub fn build_exhaustive_sq8_index<T>(
-    mat: MatRef<T>,
+    mat: impl AnnMatrix<T>,
     dist_metric: &str,
     verbose: bool,
 ) -> Result<ExhaustiveSq8Index<T>, AnnSearchErrors>
@@ -1808,10 +1885,12 @@ where
         Dist::default()
     });
 
+    let (vectors_flat, n, dim) = mat.into_row_major();
+
     if verbose {
-        println!("Building exhaustive SQ8 index with {} samples", mat.nrows());
+        println!("Building exhaustive SQ8 index with {} samples", n);
     }
-    ExhaustiveSq8Index::new(mat, metric)
+    ExhaustiveSq8Index::new((vectors_flat, n, dim), metric)
 }
 
 #[cfg(feature = "quantised")]
@@ -1819,7 +1898,9 @@ where
 ///
 /// ### Params
 ///
-/// * `query_mat` - The query matrix containing the samples x features
+/// * `query_mat` - Query data as samples x features. Accepts a faer matrix,
+///   an ndarray 2-D array (with the `ndarray` feature) or a row-major
+///   `(&[T], n_queries, n_features)` tuple. See [`AnnMatrix`].
 /// * `index` - Reference to the built Exhaustive-SQ8 index
 /// * `k` - Number of neighbours to return
 /// * `return_dist` - Shall the distances be returned
@@ -1829,7 +1910,7 @@ where
 ///
 /// A tuple of `(knn_indices, optional distances)`
 pub fn query_exhaustive_sq8_index<T>(
-    query_mat: MatRef<T>,
+    query_mat: impl AnnMatrix<T>,
     index: &ExhaustiveSq8Index<T>,
     k: usize,
     return_dist: bool,
@@ -1838,8 +1919,10 @@ pub fn query_exhaustive_sq8_index<T>(
 where
     T: AnnSearchFloat,
 {
-    query_parallel(query_mat.nrows(), return_dist, verbose, |i| {
-        index.query_row(query_mat.row(i), k)
+    let (queries, nq, dim) = query_mat.into_row_major();
+
+    query_parallel(nq, return_dist, verbose, |i| {
+        index.query(&queries[i * dim..(i + 1) * dim], k)
     })
 }
 
@@ -1879,8 +1962,9 @@ where
 ///
 /// ### Params
 ///
-/// * `mat` - The data matrix. Rows represent the samples, columns represent
-///   the embedding dimensions
+/// * `mat` - Input data as samples x features. Accepts a faer matrix, an
+///   ndarray 2-D array (with the `ndarray` feature) or a row-major
+///   `(&[T], n_samples, n_features)` tuple. See [`AnnMatrix`].
 /// * `m` - Number of subspaces for product quantisation (dim must be divisible
 ///   by m)
 /// * `max_iters` - Maximum k-means iterations (defaults to 30 if None)
@@ -1895,7 +1979,7 @@ where
 /// The `ExhaustivePqIndex`.
 #[allow(clippy::too_many_arguments)]
 pub fn build_exhaustive_pq_index<T>(
-    mat: MatRef<T>,
+    mat: impl AnnMatrix<T>,
     m: usize,
     max_iters: Option<usize>,
     n_pq_centroids: Option<usize>,
@@ -1919,7 +2003,9 @@ where
 ///
 /// ### Params
 ///
-/// * `query_mat` - The query matrix containing the samples x features
+/// * `query_mat` - Query data as samples x features. Accepts a faer matrix,
+///   an ndarray 2-D array (with the `ndarray` feature) or a row-major
+///   `(&[T], n_queries, n_features)` tuple. See [`AnnMatrix`].
 /// * `index` - Reference to the built Exhaustive-PQ index
 /// * `k` - Number of neighbours to return
 /// * `return_dist` - Shall the distances be returned
@@ -1929,7 +2015,7 @@ where
 ///
 /// A tuple of `(knn_indices, optional distances)`
 pub fn query_exhaustive_pq_index<T>(
-    query_mat: MatRef<T>,
+    query_mat: impl AnnMatrix<T>,
     index: &ExhaustivePqIndex<T>,
     k: usize,
     return_dist: bool,
@@ -1938,8 +2024,10 @@ pub fn query_exhaustive_pq_index<T>(
 where
     T: AnnSearchFloat,
 {
-    query_parallel(query_mat.nrows(), return_dist, verbose, |i| {
-        index.query_row(query_mat.row(i), k)
+    let (queries, nq, dim) = query_mat.into_row_major();
+
+    query_parallel(nq, return_dist, verbose, |i| {
+        index.query(&queries[i * dim..(i + 1) * dim], k)
     })
 }
 
@@ -1981,8 +2069,9 @@ where
 ///
 /// ### Params
 ///
-/// * `mat` - The data matrix. Rows represent the samples, columns represent
-///   the embedding dimensions
+/// * `mat` - Input data as samples x features. Accepts a faer matrix, an
+///   ndarray 2-D array (with the `ndarray` feature) or a row-major
+///   `(&[T], n_samples, n_features)` tuple. See [`AnnMatrix`].
 /// * `m` - Number of subspaces for product quantisation (dim must be divisible
 ///   by m)
 /// * `max_iters` - Maximum k-means iterations (defaults to 30 if None)
@@ -1997,7 +2086,7 @@ where
 /// The `ExhaustivePqIndex`.
 #[allow(clippy::too_many_arguments)]
 pub fn build_exhaustive_opq_index<T>(
-    mat: MatRef<T>,
+    mat: impl AnnMatrix<T>,
     m: usize,
     max_iters: Option<usize>,
     n_pq_centroids: Option<usize>,
@@ -2020,7 +2109,9 @@ where
 ///
 /// ### Params
 ///
-/// * `query_mat` - The query matrix containing the samples x features
+/// * `query_mat` - Query data as samples x features. Accepts a faer matrix,
+///   an ndarray 2-D array (with the `ndarray` feature) or a row-major
+///   `(&[T], n_queries, n_features)` tuple. See [`AnnMatrix`].
 /// * `index` - Reference to the built Exhaustive-PQ index
 /// * `k` - Number of neighbours to return
 /// * `return_dist` - Shall the distances be returned
@@ -2030,7 +2121,7 @@ where
 ///
 /// A tuple of `(knn_indices, optional distances)`
 pub fn query_exhaustive_opq_index<T>(
-    query_mat: MatRef<T>,
+    query_mat: impl AnnMatrix<T>,
     index: &ExhaustiveOpqIndex<T>,
     k: usize,
     return_dist: bool,
@@ -2039,8 +2130,10 @@ pub fn query_exhaustive_opq_index<T>(
 where
     T: AnnSearchFloat + AddAssign,
 {
-    query_parallel(query_mat.nrows(), return_dist, verbose, |i| {
-        index.query_row(query_mat.row(i), k)
+    let (queries, nq, dim) = query_mat.into_row_major();
+
+    query_parallel(nq, return_dist, verbose, |i| {
+        index.query(&queries[i * dim..(i + 1) * dim], k)
     })
 }
 
@@ -2082,8 +2175,9 @@ where
 ///
 /// ### Params
 ///
-/// * `mat` - The data matrix. Rows represent the samples, columns represent
-///   the embedding dimensions
+/// * `mat` - Input data as samples x features. Accepts a faer matrix, an
+///   ndarray 2-D array (with the `ndarray` feature) or a row-major
+///   `(&[T], n_samples, n_features)` tuple. See [`AnnMatrix`].
 /// * `nlist` - Optional number of cells to create. If not provided, defaults
 ///   to `sqrt(n)`.
 /// * `k_means_params` - Optional k-means trainings parameters, see
@@ -2098,7 +2192,7 @@ where
 ///
 /// The `IvfIndexBf16`.
 pub fn build_ivf_bf16_index<T>(
-    mat: MatRef<T>,
+    mat: impl AnnMatrix<T>,
     nlist: Option<usize>,
     k_means_params: Option<KMeansTrainingParams>,
     dist_metric: &str,
@@ -2121,7 +2215,9 @@ where
 ///
 /// ### Params
 ///
-/// * `query_mat` - The query matrix containing the samples x features
+/// * `query_mat` - Query data as samples x features. Accepts a faer matrix,
+///   an ndarray 2-D array (with the `ndarray` feature) or a row-major
+///   `(&[T], n_queries, n_features)` tuple. See [`AnnMatrix`].
 /// * `index` - Reference to the built IVF-BF16 index
 /// * `k` - Number of neighbours to return
 /// * `nprobe` - Number of clusters to search (defaults to 20% of nlist)
@@ -2133,7 +2229,7 @@ where
 ///
 /// A tuple of `(knn_indices, optional inner_product_scores)`
 pub fn query_ivf_bf16_index<T>(
-    query_mat: MatRef<T>,
+    query_mat: impl AnnMatrix<T>,
     index: &IvfIndexBf16<T>,
     k: usize,
     nprobe: Option<usize>,
@@ -2143,8 +2239,10 @@ pub fn query_ivf_bf16_index<T>(
 where
     T: AnnSearchFloat + Bf16Compatible,
 {
-    query_parallel(query_mat.nrows(), return_dist, verbose, |i| {
-        index.query_row(query_mat.row(i), k, nprobe)
+    let (queries, nq, dim) = query_mat.into_row_major();
+
+    query_parallel(nq, return_dist, verbose, |i| {
+        index.query(&queries[i * dim..(i + 1) * dim], k, nprobe)
     })
 }
 
@@ -2190,8 +2288,9 @@ where
 ///
 /// ### Params
 ///
-/// * `mat` - The data matrix. Rows represent the samples, columns represent
-///   the embedding dimensions
+/// * `mat` - Input data as samples x features. Accepts a faer matrix, an
+///   ndarray 2-D array (with the `ndarray` feature) or a row-major
+///   `(&[T], n_samples, n_features)` tuple. See [`AnnMatrix`].
 /// * `nlist` - Optional number of cells to create. If not provided, defaults
 ///   to `sqrt(n)`.
 /// * `k_means_params` - Optional k-means trainings parameters, see
@@ -2206,7 +2305,7 @@ where
 ///
 /// The `IvfSq8Index`.
 pub fn build_ivf_sq8_index<T>(
-    mat: MatRef<T>,
+    mat: impl AnnMatrix<T>,
     nlist: Option<usize>,
     k_means_params: Option<KMeansTrainingParams>,
     dist_metric: &str,
@@ -2229,7 +2328,9 @@ where
 ///
 /// ### Params
 ///
-/// * `query_mat` - The query matrix containing the samples x features
+/// * `query_mat` - Query data as samples x features. Accepts a faer matrix,
+///   an ndarray 2-D array (with the `ndarray` feature) or a row-major
+///   `(&[T], n_queries, n_features)` tuple. See [`AnnMatrix`].
 /// * `index` - Reference to the built IVF-SQ8 index
 /// * `k` - Number of neighbours to return
 /// * `nprobe` - Number of clusters to search (defaults to 20% of nlist)
@@ -2241,7 +2342,7 @@ where
 ///
 /// A tuple of `(knn_indices, optional distances)`
 pub fn query_ivf_sq8_index<T>(
-    query_mat: MatRef<T>,
+    query_mat: impl AnnMatrix<T>,
     index: &IvfSq8Index<T>,
     k: usize,
     nprobe: Option<usize>,
@@ -2251,8 +2352,10 @@ pub fn query_ivf_sq8_index<T>(
 where
     T: AnnSearchFloat,
 {
-    query_parallel(query_mat.nrows(), return_dist, verbose, |i| {
-        index.query_row(query_mat.row(i), k, nprobe)
+    let (queries, nq, dim) = query_mat.into_row_major();
+
+    query_parallel(nq, return_dist, verbose, |i| {
+        index.query(&queries[i * dim..(i + 1) * dim], k, nprobe)
     })
 }
 
@@ -2298,8 +2401,9 @@ where
 ///
 /// ### Params
 ///
-/// * `mat` - The data matrix. Rows represent the samples, columns represent
-///   the embedding dimensions
+/// * `mat` - Input data as samples x features. Accepts a faer matrix, an
+///   ndarray 2-D array (with the `ndarray` feature) or a row-major
+///   `(&[T], n_samples, n_features)` tuple. See [`AnnMatrix`].
 /// * `nlist` - Number of IVF clusters to create
 /// * `m` - Number of subspaces for product quantisation (dim must be divisible
 ///   by m)
@@ -2316,7 +2420,7 @@ where
 /// The `IvfPqIndex`.
 #[allow(clippy::too_many_arguments)]
 pub fn build_ivf_pq_index<T>(
-    mat: MatRef<T>,
+    mat: impl AnnMatrix<T>,
     nlist: Option<usize>,
     m: usize,
     k_means_params: Option<KMeansTrainingParams>,
@@ -2360,8 +2464,9 @@ where
 ///
 /// ### Params
 ///
-/// * `mat` - The data matrix. Rows represent the samples, columns represent
-///   the embedding dimensions
+/// * `mat` - Input data as samples x features. Accepts a faer matrix, an
+///   ndarray 2-D array (with the `ndarray` feature) or a row-major
+///   `(&[T], n_samples, n_features)` tuple. See [`AnnMatrix`].
 /// * `nlist` - Number of clusters to create. Defaults to `sqrt(n)`.
 /// * `m` - Number of PQ subspaces; must divide the embedding dimension
 /// * `rule` - Optional secondary-assignment rule, see [`SoarRule`]. Defaults to
@@ -2383,7 +2488,7 @@ where
 /// Sun, Simcha, Simcha, Chern & Guo, arXiv:2404.00774, 2024 (SOAR)
 #[allow(clippy::too_many_arguments)]
 pub fn build_soar_pq_index<T>(
-    mat: MatRef<T>,
+    mat: impl AnnMatrix<T>,
     nlist: Option<usize>,
     m: usize,
     rule: Option<SoarRule>,
@@ -2424,8 +2529,9 @@ where
 ///
 /// ### Params
 ///
-/// * `mat` - The data matrix. Rows represent the samples, columns represent
-///   the embedding dimensions
+/// * `mat` - Input data as samples x features. Accepts a faer matrix, an
+///   ndarray 2-D array (with the `ndarray` feature) or a row-major
+///   `(&[T], n_samples, n_features)` tuple. See [`AnnMatrix`].
 /// * `nlist` - Number of clusters to create. Defaults to `sqrt(n)`.
 /// * `m` - Number of PQ subspaces; must divide the embedding dimension
 /// * `rule` - Optional secondary-assignment rule, see [`SoarRule`]
@@ -2443,7 +2549,7 @@ where
 /// The `SoarOpqIndex`.
 #[allow(clippy::too_many_arguments)]
 pub fn build_soar_opq_index<T>(
-    mat: MatRef<T>,
+    mat: impl AnnMatrix<T>,
     nlist: Option<usize>,
     m: usize,
     rule: Option<SoarRule>,
@@ -2481,7 +2587,9 @@ where
 ///
 /// ### Params
 ///
-/// * `query_mat` - The query matrix containing the samples x features
+/// * `query_mat` - Query data as samples x features. Accepts a faer matrix,
+///   an ndarray 2-D array (with the `ndarray` feature) or a row-major
+///   `(&[T], n_queries, n_features)` tuple. See [`AnnMatrix`].
 /// * `index` - Reference to the built SOAR-OPQ index
 /// * `k` - Number of neighbours to return
 /// * `nprobe` - Number of clusters to search
@@ -2493,7 +2601,7 @@ where
 ///
 /// A tuple of `(knn_indices, optional distances)`
 pub fn query_soar_opq_index<T>(
-    query_mat: MatRef<T>,
+    query_mat: impl AnnMatrix<T>,
     index: &SoarOpqIndex<T>,
     k: usize,
     nprobe: Option<usize>,
@@ -2503,8 +2611,10 @@ pub fn query_soar_opq_index<T>(
 where
     T: AnnSearchFloat + AddAssign,
 {
-    query_parallel(query_mat.nrows(), return_dist, verbose, |i| {
-        index.query_row(query_mat.row(i), k, nprobe)
+    let (queries, nq, dim) = query_mat.into_row_major();
+
+    query_parallel(nq, return_dist, verbose, |i| {
+        index.query(&queries[i * dim..(i + 1) * dim], k, nprobe)
     })
 }
 
@@ -2544,7 +2654,9 @@ where
 ///
 /// ### Params
 ///
-/// * `query_mat` - The query matrix containing the samples x features
+/// * `query_mat` - Query data as samples x features. Accepts a faer matrix,
+///   an ndarray 2-D array (with the `ndarray` feature) or a row-major
+///   `(&[T], n_queries, n_features)` tuple. See [`AnnMatrix`].
 /// * `index` - Reference to the built SOAR-PQ index
 /// * `k` - Number of neighbours to return
 /// * `nprobe` - Number of clusters to search
@@ -2556,7 +2668,7 @@ where
 ///
 /// A tuple of `(knn_indices, optional distances)`
 pub fn query_soar_pq_index<T>(
-    query_mat: MatRef<T>,
+    query_mat: impl AnnMatrix<T>,
     index: &SoarPqIndex<T>,
     k: usize,
     nprobe: Option<usize>,
@@ -2566,8 +2678,10 @@ pub fn query_soar_pq_index<T>(
 where
     T: AnnSearchFloat,
 {
-    query_parallel(query_mat.nrows(), return_dist, verbose, |i| {
-        index.query_row(query_mat.row(i), k, nprobe)
+    let (queries, nq, dim) = query_mat.into_row_major();
+
+    query_parallel(nq, return_dist, verbose, |i| {
+        index.query(&queries[i * dim..(i + 1) * dim], k, nprobe)
     })
 }
 
@@ -2608,7 +2722,9 @@ where
 ///
 /// ### Params
 ///
-/// * `query_mat` - The query matrix containing the samples x features
+/// * `query_mat` - Query data as samples x features. Accepts a faer matrix,
+///   an ndarray 2-D array (with the `ndarray` feature) or a row-major
+///   `(&[T], n_queries, n_features)` tuple. See [`AnnMatrix`].
 /// * `index` - Reference to the built IVF-PQ index
 /// * `k` - Number of neighbours to return
 /// * `nprobe` - Number of clusters to search (defaults to 15% of nlist)
@@ -2620,7 +2736,7 @@ where
 ///
 /// A tuple of `(knn_indices, optional distances)`
 pub fn query_ivf_pq_index<T>(
-    query_mat: MatRef<T>,
+    query_mat: impl AnnMatrix<T>,
     index: &IvfPqIndex<T>,
     k: usize,
     nprobe: Option<usize>,
@@ -2630,8 +2746,10 @@ pub fn query_ivf_pq_index<T>(
 where
     T: AnnSearchFloat,
 {
-    query_parallel(query_mat.nrows(), return_dist, verbose, |i| {
-        index.query_row(query_mat.row(i), k, nprobe)
+    let (queries, nq, dim) = query_mat.into_row_major();
+
+    query_parallel(nq, return_dist, verbose, |i| {
+        index.query(&queries[i * dim..(i + 1) * dim], k, nprobe)
     })
 }
 
@@ -2676,8 +2794,9 @@ where
 ///
 /// ### Params
 ///
-/// * `mat` - The data matrix. Rows represent the samples, columns represent
-///   the embedding dimensions
+/// * `mat` - Input data as samples x features. Accepts a faer matrix, an
+///   ndarray 2-D array (with the `ndarray` feature) or a row-major
+///   `(&[T], n_samples, n_features)` tuple. See [`AnnMatrix`].
 /// * `nlist` - Number of IVF clusters to create
 /// * `m` - Number of subspaces for product quantisation (dim must be divisible
 ///   by m)
@@ -2694,7 +2813,7 @@ where
 /// The `IvfOpqIndex`.
 #[allow(clippy::too_many_arguments)]
 pub fn build_ivf_opq_index<T>(
-    mat: MatRef<T>,
+    mat: impl AnnMatrix<T>,
     nlist: Option<usize>,
     m: usize,
     k_means_params: Option<KMeansTrainingParams>,
@@ -2730,7 +2849,9 @@ where
 ///
 /// ### Params
 ///
-/// * `query_mat` - The query matrix containing the samples x features
+/// * `query_mat` - Query data as samples x features. Accepts a faer matrix,
+///   an ndarray 2-D array (with the `ndarray` feature) or a row-major
+///   `(&[T], n_queries, n_features)` tuple. See [`AnnMatrix`].
 /// * `index` - Reference to the built IVF-OPQ index
 /// * `k` - Number of neighbours to return
 /// * `nprobe` - Number of clusters to search (defaults to 15% of nlist)
@@ -2742,7 +2863,7 @@ where
 ///
 /// A tuple of `(knn_indices, optional distances)`
 pub fn query_ivf_opq_index<T>(
-    query_mat: MatRef<T>,
+    query_mat: impl AnnMatrix<T>,
     index: &IvfOpqIndex<T>,
     k: usize,
     nprobe: Option<usize>,
@@ -2752,8 +2873,10 @@ pub fn query_ivf_opq_index<T>(
 where
     T: AnnSearchFloat + AddAssign,
 {
-    query_parallel(query_mat.nrows(), return_dist, verbose, |i| {
-        index.query_row(query_mat.row(i), k, nprobe)
+    let (queries, nq, dim) = query_mat.into_row_major();
+
+    query_parallel(nq, return_dist, verbose, |i| {
+        index.query(&queries[i * dim..(i + 1) * dim], k, nprobe)
     })
 }
 
@@ -2802,7 +2925,9 @@ where
 ///
 /// ### Params
 ///
-/// * `mat` - The initial matrix with samples x features
+/// * `mat` - Input data as samples x features. Accepts a faer matrix, an
+///   ndarray 2-D array (with the `ndarray` feature) or a row-major
+///   `(&[T], n_samples, n_features)` tuple. See [`AnnMatrix`].
 /// * `dist_metric` - Distance metric: "euclidean" or "cosine". "manhatten" is
 ///   not supported.
 /// * `device` - The GPU device to use
@@ -2811,7 +2936,7 @@ where
 ///
 /// The initialised `ExhaustiveIndexGpu`
 pub fn build_exhaustive_index_gpu<T, R>(
-    mat: MatRef<T>,
+    mat: impl AnnMatrix<T>,
     dist_metric: &str,
     device: R::Device,
 ) -> Result<ExhaustiveIndexGpu<T, R>, AnnSearchErrors>
@@ -2831,7 +2956,9 @@ where
 ///
 /// ### Params
 ///
-/// * `query_mat` - The query matrix containing the samples × features
+/// * `query_mat` - Query data as samples x features. Accepts a faer matrix,
+///   an ndarray 2-D array (with the `ndarray` feature) or a row-major
+///   `(&[T], n_queries, n_features)` tuple. See [`AnnMatrix`].
 /// * `index` - The exhaustive GPU index
 /// * `k` - Number of neighbours to return
 /// * `return_dist` - Shall the distances be returned
@@ -2840,7 +2967,7 @@ where
 ///
 /// A tuple of `(knn_indices, optional distances)`
 pub fn query_exhaustive_index_gpu<T, R>(
-    query_mat: MatRef<T>,
+    query_mat: impl AnnMatrix<T>,
     index: &ExhaustiveIndexGpu<T, R>,
     k: usize,
     return_dist: bool,
@@ -2866,7 +2993,9 @@ where
 ///
 /// ### Params
 ///
-/// * `query_mat` - The query matrix containing the samples × features
+/// * `query_mat` - Query data as samples x features. Accepts a faer matrix,
+///   an ndarray 2-D array (with the `ndarray` feature) or a row-major
+///   `(&[T], n_queries, n_features)` tuple. See [`AnnMatrix`].
 /// * `index` - The exhaustive GPU index
 /// * `k` - Number of neighbours to return
 /// * `return_dist` - Shall the distances be returned
@@ -2898,7 +3027,9 @@ where
 ///
 /// ### Params
 ///
-/// * `mat` - Data matrix [samples, features]
+/// * `mat` - Input data as samples x features. Accepts a faer matrix, an
+///   ndarray 2-D array (with the `ndarray` feature) or a row-major
+///   `(&[T], n_samples, n_features)` tuple. See [`AnnMatrix`].
 /// * `nlist` - Number of clusters (defaults to √n)
 /// * `k_means_params` - Optional k-means training parameters, see
 ///   [`crate::gpu::k_means_gpu::KMeansGpuParams`]. If not provided, will
@@ -2911,7 +3042,7 @@ where
 /// * `verbose` - Print progress
 /// * `device` - GPU device
 pub fn build_ivf_index_gpu<T, R>(
-    mat: MatRef<T>,
+    mat: impl AnnMatrix<T>,
     nlist: Option<usize>,
     k_means_params: Option<crate::gpu::k_means_gpu::KMeansGpuParams>,
     dist_metric: &str,
@@ -2935,7 +3066,9 @@ where
 ///
 /// ### Params
 ///
-/// * `query_mat` - Query matrix [samples, features]
+/// * `query_mat` - Query data as samples x features. Accepts a faer matrix,
+///   an ndarray 2-D array (with the `ndarray` feature) or a row-major
+///   `(&[T], n_queries, n_features)` tuple. See [`AnnMatrix`].
 /// * `index` - Reference to built index
 /// * `k` - Number of neighbours
 /// * `nprobe` - Clusters to search (defaults to √nlist)
@@ -2947,7 +3080,7 @@ where
 ///
 /// Tuple of (indices, optional distances)
 pub fn query_ivf_index_gpu<T, R>(
-    query_mat: MatRef<T>,
+    query_mat: impl AnnMatrix<T>,
     index: &IvfIndexGpu<T, R>,
     k: usize,
     nprobe: Option<usize>,
@@ -2975,7 +3108,9 @@ where
 ///
 /// ### Params
 ///
-/// * `query_mat` - Query matrix [samples, features]
+/// * `query_mat` - Query data as samples x features. Accepts a faer matrix,
+///   an ndarray 2-D array (with the `ndarray` feature) or a row-major
+///   `(&[T], n_queries, n_features)` tuple. See [`AnnMatrix`].
 /// * `index` - Reference to built index
 /// * `k` - Number of neighbours
 /// * `nprobe` - Clusters to search (defaults to √nlist)
@@ -3011,7 +3146,9 @@ where
 ///
 /// ### Params
 ///
-/// * `mat` - Data matrix [samples, features]
+/// * `mat` - Input data as samples x features. Accepts a faer matrix, an
+///   ndarray 2-D array (with the `ndarray` feature) or a row-major
+///   `(&[T], n_samples, n_features)` tuple. See [`AnnMatrix`].
 /// * `dist_metric` - Distance metric: "euclidean" or "cosine". "manhatten" is
 ///   not supported.
 /// * `k` - Final neighbours per node (default 30)
@@ -3025,7 +3162,7 @@ where
 /// * `device` - GPU device
 #[allow(clippy::too_many_arguments)]
 pub fn build_nndescent_index_gpu<T, R>(
-    mat: MatRef<T>,
+    mat: impl AnnMatrix<T>,
     dist_metric: &str,
     k: Option<usize>,
     build_k: Option<usize>,
@@ -3059,7 +3196,9 @@ where
 ///
 /// ### Params
 ///
-/// * `query_mat` - Query matrix [samples, features]
+/// * `query_mat` - Query data as samples x features. Accepts a faer matrix,
+///   an ndarray 2-D array (with the `ndarray` feature) or a row-major
+///   `(&[T], n_queries, n_features)` tuple. See [`AnnMatrix`].
 /// * `index` - Reference to built index
 /// * `k` - Number of neighbours
 /// * `query_params` - Optional GPU beam search parameters. Pass
@@ -3071,7 +3210,7 @@ where
 ///
 /// Tuple of (indices, optional distances)
 pub fn query_nndescent_index_gpu<T, R>(
-    query_mat: MatRef<T>,
+    query_mat: impl AnnMatrix<T>,
     index: &mut NNDescentGpu<T, R>,
     k: usize,
     query_params: Option<CagraGpuSearchParams>,
@@ -3082,22 +3221,11 @@ where
     R: Runtime,
     T: AnnSearchFloat + CubeclFloat,
 {
-    let n_queries = query_mat.nrows();
+    let (queries_flat, n_queries, _) = query_mat.into_row_major();
 
     if verbose {
         println!("  GPU batch query: {} vectors, k={}...", n_queries, k);
     }
-
-    let queries_flat: Vec<T> = (0..n_queries)
-        .flat_map(|i| {
-            let row = query_mat.row(i);
-            if row.col_stride() == 1 {
-                unsafe { std::slice::from_raw_parts(row.as_ptr(), row.ncols()) }.to_vec()
-            } else {
-                row.iter().cloned().collect()
-            }
-        })
-        .collect();
 
     let (indices, distances) =
         index.query_batch_gpu(&queries_flat, n_queries, query_params, k, 42)?;
@@ -3181,7 +3309,9 @@ where
 ///
 /// ### Params
 ///
-/// * `mat` - Input matrix (samples x features)
+/// * `mat` - Input data as samples x features. Accepts a faer matrix, an
+///   ndarray 2-D array (with the `ndarray` feature) or a row-major
+///   `(&[T], n_samples, n_features)` tuple. See [`AnnMatrix`].
 /// * `dist_metric` - Distance metric string
 /// * `k` - Neighbours per node (default 30)
 /// * `build_k` - Internal NNDescent working degree (default 1.5*k)
@@ -3199,7 +3329,7 @@ where
 /// Populated [`crate::gpu::nndescent_gpu::KnnGraphGpu`].
 #[allow(clippy::too_many_arguments)]
 pub fn build_knn_graph_gpu<T, R>(
-    mat: MatRef<T>,
+    mat: impl AnnMatrix<T>,
     dist_metric: &str,
     k: Option<usize>,
     build_k: Option<usize>,
@@ -3237,7 +3367,9 @@ where
 ///
 /// ### Params
 ///
-/// * `mat` - Input matrix (samples x features)
+/// * `mat` - Input data as samples x features. Accepts a faer matrix, an
+///   ndarray 2-D array (with the `ndarray` feature) or a row-major
+///   `(&[T], n_samples, n_features)` tuple. See [`AnnMatrix`].
 /// * `dist_metric` - Distance metric string
 /// * `k` - Neighbours per node (default 30)
 /// * `build_k` - Internal NNDescent working degree (default 1.5*k)
@@ -3265,7 +3397,7 @@ where
 /// to [`build_knn_graph_gpu`] rather than paying that for nothing.
 #[allow(clippy::too_many_arguments)]
 pub fn build_clustered_knn_graph_gpu<T, R>(
-    mat: MatRef<T>,
+    mat: impl AnnMatrix<T>,
     dist_metric: &str,
     k: Option<usize>,
     build_k: Option<usize>,
@@ -3354,7 +3486,9 @@ where
 ///
 /// ### Params
 ///
-/// * `mat` - The initial matrix with samples x features
+/// * `mat` - Input data as samples x features. Accepts a faer matrix, an
+///   ndarray 2-D array (with the `ndarray` feature) or a row-major
+///   `(&[T], n_samples, n_features)` tuple. See [`AnnMatrix`].
 /// * `n_bits` - Number of bits per binary code (must be multiple of 8).
 ///   Ignored by "sign", which always emits `dim` bits.
 /// * `seed` - Random seed for binariser
@@ -3369,7 +3503,7 @@ where
 ///
 /// The initialised `ExhaustiveIndexBinary`
 pub fn build_exhaustive_index_binary<T>(
-    mat: MatRef<T>,
+    mat: impl AnnMatrix<T>,
     n_bits: usize,
     seed: usize,
     binary_init: &str,
@@ -3398,7 +3532,9 @@ where
 ///
 /// ### Params
 ///
-/// * `query_mat` - The query matrix containing the samples × features
+/// * `query_mat` - Query data as samples x features. Accepts a faer matrix,
+///   an ndarray 2-D array (with the `ndarray` feature) or a row-major
+///   `(&[T], n_queries, n_features)` tuple. See [`AnnMatrix`].
 /// * `index` - The exhaustive binary index
 /// * `k` - Number of neighbours to return
 /// * `rerank` - Whether to use exact distance reranking (requires vector store)
@@ -3411,7 +3547,7 @@ where
 ///
 /// A tuple of `(knn_indices, optional distances)` where distances are Hamming (u32 converted to T) or exact distances (T)
 pub fn query_exhaustive_index_binary<T>(
-    query_mat: MatRef<T>,
+    query_mat: impl AnnMatrix<T>,
     index: &ExhaustiveIndexBinary<T>,
     k: usize,
     rerank: bool,
@@ -3422,21 +3558,23 @@ pub fn query_exhaustive_index_binary<T>(
 where
     T: AnnSearchFloat + Pod,
 {
+    let (queries, nq, dim) = query_mat.into_row_major();
+
     if rerank {
-        query_parallel(query_mat.nrows(), return_dist, verbose, |i| {
-            index.query_row_reranking(query_mat.row(i), k, rerank_factor)
+        query_parallel(nq, return_dist, verbose, |i| {
+            index.query_reranking(&queries[i * dim..(i + 1) * dim], k, rerank_factor)
         })
     } else {
         let (indices, dist) = if index.use_asymmetric() {
             // path where asymmetric queries are sensible
-            query_parallel(query_mat.nrows(), return_dist, verbose, |i| {
-                index.query_row_asymmetric(query_mat.row(i), k, rerank_factor)
+            query_parallel(nq, return_dist, verbose, |i| {
+                index.query_asymmetric(&queries[i * dim..(i + 1) * dim], k, rerank_factor)
             })?
         } else {
             // path where asymmetric queries are not sensible/possible
             let (indices, distances_u32) =
-                query_parallel(query_mat.nrows(), return_dist, verbose, |i| {
-                    index.query_row(query_mat.row(i), k)
+                query_parallel(nq, return_dist, verbose, |i| {
+                    index.query(&queries[i * dim..(i + 1) * dim], k)
                 })?;
             let distances_t = distances_u32.map(|dists| {
                 dists
@@ -3493,7 +3631,9 @@ where
 ///
 /// ### Params
 ///
-/// * `mat` - Data matrix [samples, features]
+/// * `mat` - Input data as samples x features. Accepts a faer matrix, an
+///   ndarray 2-D array (with the `ndarray` feature) or a row-major
+///   `(&[T], n_samples, n_features)` tuple. See [`AnnMatrix`].
 /// * `binarisation_init` - "random", "pca" or "sign". "sign" encodes the
 ///   residual against each vector's assigned centroid rather than the raw
 ///   vector, so its codes are only comparable within a Voronoi cell; see
@@ -3517,7 +3657,7 @@ where
 /// Built IVF binary index
 #[allow(clippy::too_many_arguments)]
 pub fn build_ivf_index_binary<T>(
-    mat: MatRef<T>,
+    mat: impl AnnMatrix<T>,
     binarisation_init: &str,
     n_bits: usize,
     nlist: Option<usize>,
@@ -3568,7 +3708,9 @@ where
 ///
 /// ### Params
 ///
-/// * `query_mat` - Query matrix [samples, features]
+/// * `query_mat` - Query data as samples x features. Accepts a faer matrix,
+///   an ndarray 2-D array (with the `ndarray` feature) or a row-major
+///   `(&[T], n_queries, n_features)` tuple. See [`AnnMatrix`].
 /// * `index` - Reference to built index
 /// * `k` - Number of neighbours
 /// * `nprobe` - Clusters to search (defaults to √nlist)
@@ -3583,7 +3725,7 @@ where
 /// Tuple of (indices, optional distances)
 #[allow(clippy::too_many_arguments)]
 pub fn query_ivf_index_binary<T>(
-    query_mat: MatRef<T>,
+    query_mat: impl AnnMatrix<T>,
     index: &IvfIndexBinary<T>,
     k: usize,
     nprobe: Option<usize>,
@@ -3595,19 +3737,21 @@ pub fn query_ivf_index_binary<T>(
 where
     T: AnnSearchFloat + Pod,
 {
+    let (queries, nq, dim) = query_mat.into_row_major();
+
     if rerank {
-        query_parallel(query_mat.nrows(), return_dist, verbose, |i| {
-            index.query_row_reranking(query_mat.row(i), k, nprobe, rerank_factor)
+        query_parallel(nq, return_dist, verbose, |i| {
+            index.query_reranking(&queries[i * dim..(i + 1) * dim], k, nprobe, rerank_factor)
         })
     } else {
         let (indices, dist) = if index.use_asymmetric() {
-            query_parallel(query_mat.nrows(), return_dist, verbose, |i| {
-                index.query_row_asymmetric(query_mat.row(i), k, nprobe, rerank_factor)
+            query_parallel(nq, return_dist, verbose, |i| {
+                index.query_asymmetric(&queries[i * dim..(i + 1) * dim], k, nprobe, rerank_factor)
             })?
         } else {
             let (indices, distances_u32) =
-                query_parallel(query_mat.nrows(), return_dist, verbose, |i| {
-                    index.query_row(query_mat.row(i), k, nprobe)
+                query_parallel(nq, return_dist, verbose, |i| {
+                    index.query(&queries[i * dim..(i + 1) * dim], k, nprobe)
                 })?;
             let distances_t = distances_u32.map(|dists| {
                 dists
@@ -3669,7 +3813,9 @@ where
 ///
 /// ### Params
 ///
-/// * `mat` - The initial matrix with samples x features
+/// * `mat` - Input data as samples x features. Accepts a faer matrix, an
+///   ndarray 2-D array (with the `ndarray` feature) or a row-major
+///   `(&[T], n_samples, n_features)` tuple. See [`AnnMatrix`].
 /// * `n_clust_rabitq` - Number of clusters (None for automatic)
 /// * `dist_metric` - Distance metric: "euclidean" or "cosine". "manhatten" is
 ///   not supported.
@@ -3682,7 +3828,7 @@ where
 ///
 /// The initialised `ExhaustiveIndexRaBitQ`
 pub fn build_exhaustive_index_rabitq<T>(
-    mat: MatRef<T>,
+    mat: impl AnnMatrix<T>,
     n_clust_rabitq: Option<usize>,
     dist_metric: &str,
     seed: usize,
@@ -3710,7 +3856,9 @@ where
 ///
 /// ### Params
 ///
-/// * `query_mat` - The query matrix containing the samples × features
+/// * `query_mat` - Query data as samples x features. Accepts a faer matrix,
+///   an ndarray 2-D array (with the `ndarray` feature) or a row-major
+///   `(&[T], n_queries, n_features)` tuple. See [`AnnMatrix`].
 /// * `index` - The exhaustive RaBitQ index
 /// * `k` - Number of neighbours to return
 /// * `n_probe` - Number of clusters to search (None for default 20%)
@@ -3724,7 +3872,7 @@ where
 /// A tuple of `(knn_indices, optional distances)`
 #[allow(clippy::too_many_arguments)]
 pub fn query_exhaustive_index_rabitq<T>(
-    query_mat: MatRef<T>,
+    query_mat: impl AnnMatrix<T>,
     index: &ExhaustiveIndexRaBitQ<T>,
     k: usize,
     n_probe: Option<usize>,
@@ -3736,13 +3884,15 @@ pub fn query_exhaustive_index_rabitq<T>(
 where
     T: AnnSearchFloat + Pod,
 {
+    let (queries, nq, dim) = query_mat.into_row_major();
+
     if rerank {
-        query_parallel(query_mat.nrows(), return_dist, verbose, |i| {
-            index.query_row_reranking(query_mat.row(i), k, n_probe, rerank_factor)
+        query_parallel(nq, return_dist, verbose, |i| {
+            index.query_reranking(&queries[i * dim..(i + 1) * dim], k, n_probe, rerank_factor)
         })
     } else {
-        query_parallel(query_mat.nrows(), return_dist, verbose, |i| {
-            index.query_row(query_mat.row(i), k, n_probe)
+        query_parallel(nq, return_dist, verbose, |i| {
+            index.query(&queries[i * dim..(i + 1) * dim], k, n_probe)
         })
     }
 }
@@ -3788,7 +3938,9 @@ where
 ///
 /// ### Params
 ///
-/// * `mat` - The initial matrix with samples x features
+/// * `mat` - Input data as samples x features. Accepts a faer matrix, an
+///   ndarray 2-D array (with the `ndarray` feature) or a row-major
+///   `(&[T], n_samples, n_features)` tuple. See [`AnnMatrix`].
 /// * `nlist` - Number of IVF cells (None for sqrt(n))
 /// * `k_means_params` - Optional k-means trainings parameters, see
 ///   [KMeansTrainingParams]. If not provided, will default to sensible
@@ -3806,7 +3958,7 @@ where
 /// The initialised `IvfIndexRaBitQ`
 #[allow(clippy::too_many_arguments)]
 pub fn build_ivf_index_rabitq<T>(
-    mat: MatRef<T>,
+    mat: impl AnnMatrix<T>,
     nlist: Option<usize>,
     k_means_params: Option<KMeansTrainingParams>,
     dist_metric: &str,
@@ -3844,7 +3996,9 @@ where
 ///
 /// ### Params
 ///
-/// * `query_mat` - The query matrix containing the samples × features
+/// * `query_mat` - Query data as samples x features. Accepts a faer matrix,
+///   an ndarray 2-D array (with the `ndarray` feature) or a row-major
+///   `(&[T], n_queries, n_features)` tuple. See [`AnnMatrix`].
 /// * `index` - The IVF-RaBitQ index
 /// * `k` - Number of neighbours to return
 /// * `nprobe` - Number of IVF cells to probe (None for sqrt(nlist))
@@ -3858,7 +4012,7 @@ where
 /// A tuple of `(knn_indices, optional distances)`
 #[allow(clippy::too_many_arguments)]
 pub fn query_ivf_index_rabitq<T>(
-    query_mat: MatRef<T>,
+    query_mat: impl AnnMatrix<T>,
     index: &IvfIndexRaBitQ<T>,
     k: usize,
     nprobe: Option<usize>,
@@ -3870,13 +4024,15 @@ pub fn query_ivf_index_rabitq<T>(
 where
     T: AnnSearchFloat + Pod,
 {
+    let (queries, nq, dim) = query_mat.into_row_major();
+
     if rerank {
-        query_parallel(query_mat.nrows(), return_dist, verbose, |i| {
-            index.query_row_reranking(query_mat.row(i), k, nprobe, rerank_factor)
+        query_parallel(nq, return_dist, verbose, |i| {
+            index.query_reranking(&queries[i * dim..(i + 1) * dim], k, nprobe, rerank_factor)
         })
     } else {
-        query_parallel(query_mat.nrows(), return_dist, verbose, |i| {
-            index.query_row(query_mat.row(i), k, nprobe)
+        query_parallel(nq, return_dist, verbose, |i| {
+            index.query(&queries[i * dim..(i + 1) * dim], k, nprobe)
         })
     }
 }
@@ -3922,7 +4078,9 @@ where
 ///
 /// ### Params
 ///
-/// * `mat` - The initial matrix with samples × features
+/// * `mat` - Input data as samples x features. Accepts a faer matrix, an
+///   ndarray 2-D array (with the `ndarray` feature) or a row-major
+///   `(&[T], n_samples, n_features)` tuple. See [`AnnMatrix`].
 /// * `dist_metric` - Distance metric: "euclidean" or "cosine". "manhattan" is
 ///   not supported.
 /// * `bits` - Bits per coordinate (2, 3, or 4)
@@ -3935,7 +4093,7 @@ where
 ///
 /// The initialised `TurboQuantExhaustive`
 pub fn build_exhaustive_index_turboquant<T>(
-    mat: MatRef<T>,
+    mat: impl AnnMatrix<T>,
     dist_metric: &str,
     bits: usize,
     seed: usize,
@@ -3965,7 +4123,9 @@ where
 ///
 /// ### Params
 ///
-/// * `query_mat` - The query matrix containing the samples × features
+/// * `query_mat` - Query data as samples x features. Accepts a faer matrix,
+///   an ndarray 2-D array (with the `ndarray` feature) or a row-major
+///   `(&[T], n_queries, n_features)` tuple. See [`AnnMatrix`].
 /// * `index` - The exhaustive TurboQuant index
 /// * `k` - Number of neighbours to return
 /// * `rerank` - Whether to use exact distance reranking (requires vector store)
@@ -3978,7 +4138,7 @@ where
 /// A tuple of `(knn_indices, optional distances)`
 #[allow(clippy::too_many_arguments)]
 pub fn query_exhaustive_index_turboquant<T>(
-    query_mat: MatRef<T>,
+    query_mat: impl AnnMatrix<T>,
     index: &TurboQuantExhaustive<T>,
     k: usize,
     rerank: bool,
@@ -4031,7 +4191,9 @@ where
 ///
 /// ### Params
 ///
-/// * `mat` - The initial matrix with samples × features
+/// * `mat` - Input data as samples x features. Accepts a faer matrix, an
+///   ndarray 2-D array (with the `ndarray` feature) or a row-major
+///   `(&[T], n_samples, n_features)` tuple. See [`AnnMatrix`].
 /// * `nlist` - Number of IVF cells (None for sqrt(n))
 /// * `k_means_params` - Optional k-means training parameters, see
 ///   [KMeansTrainingParams]. If not provided, will default to sensible
@@ -4050,7 +4212,7 @@ where
 /// The initialised `IvfTurboQuant`
 #[allow(clippy::too_many_arguments)]
 pub fn build_ivf_index_turboquant<T>(
-    mat: MatRef<T>,
+    mat: impl AnnMatrix<T>,
     nlist: Option<usize>,
     k_means_params: Option<KMeansTrainingParams>,
     dist_metric: &str,
@@ -4094,7 +4256,9 @@ where
 ///
 /// ### Params
 ///
-/// * `query_mat` - The query matrix containing the samples × features
+/// * `query_mat` - Query data as samples x features. Accepts a faer matrix,
+///   an ndarray 2-D array (with the `ndarray` feature) or a row-major
+///   `(&[T], n_queries, n_features)` tuple. See [`AnnMatrix`].
 /// * `index` - The IVF-TurboQuant index
 /// * `k` - Number of neighbours to return
 /// * `nprobe` - Number of IVF cells to probe (None for sqrt(nlist))
@@ -4109,7 +4273,7 @@ where
 /// A tuple of `(knn_indices, optional distances)`
 #[allow(clippy::too_many_arguments)]
 pub fn query_ivf_index_turboquant<T>(
-    query_mat: MatRef<T>,
+    query_mat: impl AnnMatrix<T>,
     index: &IvfTurboQuant<T>,
     k: usize,
     nprobe: Option<usize>,

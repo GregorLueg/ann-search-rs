@@ -2,7 +2,7 @@
 //! leverages Voronoi cells to reduce the search space.
 
 use bytemuck::Pod;
-use faer::{MatRef, RowRef};
+use faer::{RowRef};
 use faer_traits::ComplexField;
 use num_traits::{Float, FromPrimitive};
 use rayon::prelude::*;
@@ -118,7 +118,7 @@ where
     /// Initialised self
     #[allow(clippy::too_many_arguments)]
     pub fn build(
-        data: MatRef<T>,
+        data: impl AnnMatrix<T>,
         metric: Dist,
         nlist: Option<usize>,
         k_means_params: Option<KMeansTrainingParams>,
@@ -128,7 +128,7 @@ where
         if metric == Dist::Manhattan {
             return Err(AnnSearchErrors::DistanceNotSupported(metric));
         }
-        let (vectors_flat, n, dim) = matrix_to_flat(data);
+        let (vectors_flat, n, dim) = data.into_row_major();
 
         // compute norms for Cosine distance
         let norms = if metric == Dist::Cosine {
@@ -269,7 +269,7 @@ where
     /// Initialised self
     #[allow(clippy::too_many_arguments)]
     pub fn build_with_vector_store(
-        data: MatRef<T>,
+        data: impl AnnMatrix<T>,
         metric: Dist,
         nlist: Option<usize>,
         k_means_params: Option<KMeansTrainingParams>,
@@ -280,7 +280,7 @@ where
         if metric == Dist::Manhattan {
             return Err(AnnSearchErrors::DistanceNotSupported(metric));
         }
-        let (vectors_flat, n, dim) = matrix_to_flat(data);
+        let (vectors_flat, n, dim) = data.into_row_major();
 
         // compute norms for Cosine distance
         let norms: Vec<T> = (0..n)

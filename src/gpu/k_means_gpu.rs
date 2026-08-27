@@ -22,7 +22,7 @@
 
 use cubecl::prelude::*;
 use cubecl_utils_rs::prelude::*;
-use faer::{Mat, MatRef};
+use faer::{Mat};
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 use std::iter::Sum;
@@ -32,7 +32,6 @@ use crate::gpu::topk_gpu::atomic_u32_add_supported;
 use crate::gpu::{WORKGROUP_128, WORKGROUP_SIZE_X};
 use crate::prelude::*;
 use crate::utils::k_means_utils::*;
-use crate::utils::matrix_to_flat;
 
 ////////////
 // Consts //
@@ -2259,7 +2258,7 @@ where
 ///   or an upload busts the per-binding size limit, or a read-back fails.
 #[allow(clippy::too_many_arguments)]
 pub fn k_means_clusters_gpu<T, R>(
-    data: MatRef<T>,
+    data: impl AnnMatrix<T>,
     dist: &str,
     n_centroids: usize,
     kmeans_params: Option<KMeansGpuParams>,
@@ -2279,7 +2278,7 @@ where
         Dist::default()
     });
 
-    let (data_flat, n, dim) = matrix_to_flat(data);
+    let (data_flat, n, dim) = data.into_row_major();
     let client = R::client(&device);
 
     let (centroids, assignments) = k_means_gpu_flat::<T, R>(

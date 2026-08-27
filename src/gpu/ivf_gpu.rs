@@ -3,7 +3,6 @@
 
 use cubecl::prelude::*;
 use cubecl_utils_rs::prelude::*;
-use faer::MatRef;
 use num_traits::Float;
 use rayon::prelude::*;
 use std::iter::Sum;
@@ -232,7 +231,7 @@ where
     ///
     /// Initialised `IvfIndexGpu` with all vectors and centroids resident on GPU
     pub fn build(
-        data: MatRef<T>,
+        data: impl AnnMatrix<T>,
         metric: Dist,
         nlist: Option<usize>,
         k_means_params: Option<KMeansGpuParams>,
@@ -244,7 +243,7 @@ where
             return Err(AnnSearchErrors::DistanceNotSupported(metric));
         }
 
-        let (vectors_flat, n, dim) = matrix_to_flat(data);
+        let (vectors_flat, n, dim) = data.into_row_major();
 
         let nlist = nlist.unwrap_or((n as f32).sqrt() as usize).max(1);
 
@@ -465,13 +464,13 @@ where
     /// Tuple of `(Vec<indices>, Vec<dist>)` for the queries.
     pub fn query_batch(
         &self,
-        query_mat: MatRef<T>,
+        query_mat: impl AnnMatrix<T>,
         k: usize,
         nprobe: Option<usize>,
         nquery: Option<usize>,
         verbose: bool,
     ) -> KnnResult<T> {
-        let (queries_flat, n_queries, dim_query) = matrix_to_flat(query_mat);
+        let (queries_flat, n_queries, dim_query) = query_mat.into_row_major();
         self.check_dim(dim_query)?;
 
         let client: ComputeClient<R> = R::client(&self.device);
