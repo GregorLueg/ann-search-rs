@@ -16,10 +16,10 @@ cargo build --release
 cargo test  --release
 
 # Full test suite matching CI (macOS/Linux)
-cargo test --release --features binary,quantised,gpu,serialise
+cargo test --release --features binary,quantised,gpu,ndarray,serialise
 
 # GPU integration tests (needs a working GPU + wgpu backend)
-cargo test --release --features binary,gpu,gpu-tests,quantised,serialise
+cargo test --release --features binary,gpu,gpu-tests,ndarray,quantised,serialise
 
 # Single test
 cargo test --release --features quantised -- ivf_pq::tests::name_of_test --exact --nocapture
@@ -45,8 +45,8 @@ cargo bench --bench gpu_exhaustive_kernels --features gpu
 CUBECL_DEBUG_OPTION=profile-medium CUBECL_DEBUG_LOG=stdout \
   cargo bench --bench gpu_exhaustive_kernels --features gpu 2>&1 | grep -v wgsl
 
-# Docs (docs.rs config enables binary + quantised + mimalloc + serialise)
-cargo doc --features binary,quantised,mimalloc,serialise --no-deps --open
+# Docs (docs.rs config enables binary + quantised + mimalloc + ndarray + serialise)
+cargo doc --features binary,quantised,mimalloc,ndarray,serialise --no-deps --open
 ```
 
 The profiler emits one `| 15.675584ms | KernelName | WgpuRuntime |` line per launch;
@@ -66,6 +66,7 @@ Release profile in `Cargo.toml` sets `lto = true` and `codegen-units = 1`. Relea
 - `gpu`: CubeCL + wgpu backend (agnostic to Metal / Vulkan / DX12 / CPU). Pulls in `cubecl`, `cubecl-utils-rs` and `half` (the GPU k-means can hold its data buffer at fp16).
 - `gpu-tests`: enables tests that require a real GPU. CI-only, combined with `gpu`.
 - `serialise`: save indices to disk and load them back (`IndexIo`, `save_index` / `load_index`). Pulls in `serde`, `bincode`, and `half?/serde`. Covers the CPU, quantised and binary indices; GPU indices are not covered.
+- `ndarray`: accept `ndarray` 2-D arrays as input alongside faer matrices. Pulls in `ndarray` (range dep, `>=0.16, <0.18`). This makes `ndarray` a *public* dependency, which is why it is off by default: a downstream on a different major gets two incompatible `ArrayView2` types. The `(&[T], n, dim)` input works on any version without the feature.
 - `mimalloc`: swaps in `mimalloc` as the global allocator.
 
 Every code path under `src/quantised/`, `src/binary/`, `src/gpu/`, `src/serialise/` is behind its cfg. When editing, keep new items behind the correct `#[cfg(feature = "...")]`. The crate must still compile with default features off.
@@ -80,7 +81,8 @@ src/
   prelude.rs       # user-facing re-exports (Dist, KMeansTrainingParams, KnnResult, ...)
   errors.rs        # single AnnSearchErrors enum, thiserror-backed
   utils/           # SIMD dist, heaps, k-means, tree/graph/nndescent helpers,
-                   # traits, striped locks (parallelism.rs), file staging
+                   # traits, input conversion (input.rs), striped locks
+                   # (parallelism.rs), file staging
   cpu/             # CPU indices: annoy, ball_tree, exhaustive, hnsw, ivf,
                    #              kd_forest, kmknn, lsh, nndescent, nsg,
                    #              rnn_descent, soar, vamana
@@ -103,7 +105,7 @@ Saving is a *directory*, not a file: `index.bin` plus any aux files (currently o
 
 Every index follows the same pattern in `src/lib.rs`:
 
-- `build_<name>_index(mat: MatRef<T>, ..., dist_metric: &str, ...) -> <Result<>>Index<T>`
+- `build_<name>_index(mat: impl AnnMatrix<T>, ..., dist_metric: &str, ...) -> <Result<>>Index<T>`
 - `query_<name>_index(query_mat, &index, k, ..., return_dist, verbose) -> KnnOptionResult<T>` for cross-set queries.
 - `query_<name>_self(&index, k, ..., return_dist, verbose) -> KnnOptionResult<T>` for the full self-kNN graph. These use index-specific fast paths (IVF exploits Voronoi cells, HNSW walks the graph without re-entering).
 
@@ -117,7 +119,7 @@ NSG is the exception: it builds from an existing kNN graph, so alongside `build_
 
 ### Data & numeric traits
 
-- Vectors are `faer::MatRef<T>` (rows = samples, cols = features). Internally, indices flatten to `Vec<T>` via `utils::matrix_to_flat` for cache-friendly access.
+- Inputs go through the `AnnMatrix<T>` trait (`utils/input.rs`): rows = samples, cols = features, always. It is implemented for `MatRef`/`Mat`/`&Mat`, `FlattenData<T>` (identity), `(&[T], n, dim)`, and behind the `ndarray` feature `ArrayView2`/`Array2`/`&Array2`. Indices flatten to a row-major `Vec<T>` on construction and work on slices from there.
 - `AnnSearchFloat` (in `utils/traits.rs`) is the shared trait bound: `Float + FromPrimitive + ToPrimitive + Send + Sync + Sum + SimdDistance + ComplexField`, **plus `Serialize + DeserializeOwned` when `serialise` is on**. There are two `#[cfg]`-gated definitions of the trait; edit both. `f32` and `f64` are unaffected either way, and both are supported end-to-end.
 - BF16-specific ops go through the `Bf16Compatible` bound (quantised feature only).
 - GPU indices also require `CubeclFloat` (re-exported from `cubecl-utils-rs`).
@@ -156,6 +158,9 @@ Single `AnnSearchErrors` enum in `src/errors.rs`, `thiserror`-derived and `#[non
 - British English throughout (`quantised`, `binarised`, `neighbours`, `optimised`). Match it in new code, docs, and comments.
 - `#![warn(missing_docs)]` is on at the crate root. Every `pub` item needs a doc comment. The existing style uses `### Params` / `### Returns` / `### Note` markdown sections.
 - The `#![allow(clippy::needless_range_loop)]` at the crate root is deliberate. Indexed loops are what you want in numeric kernels here, so don't rewrite them to iterators to appease clippy.
+- Matrix inputs are always `data: impl AnnMatrix<T>`, never a named `<T, M>` parameter. Partial turbofish does not exist for functions, so a named `M` breaks every turbofished call site (`build_clustered_knn_graph_gpu::<f32, WgpuRuntime>`, the four `k_means_clusters_gpu::<f32, WgpuRuntime>` in `gpu/k_means_gpu.rs`) with E0107. Argument-position `impl Trait` does not count towards the explicit generic argument list, so it keeps them all compiling.
+- The `lib.rs` shims must **flatten**, not forward: `Index::build(mat.into_row_major(), ...)`. `FlattenData<T>` implements `AnnMatrix` by identity, so this collapses the index constructors to one instantiation. Forwarding the input type instead re-monomorphises every constructor body per input type, and rustc does not run LLVM's `MergeFunctions` to dedupe them.
+- The trait method is `into_row_major`, not `into_flat`. `ndarray` has an inherent `into_flat` on `ArrayBase` and inherent methods beat trait methods, so `arr.into_flat()` would silently resolve to ndarray's and hand back a 1-D array.
 - CubeCL version is pinned to `0.10.0`. There's a commented-out git-dep block in `Cargo.toml` for when the main branch is needed. `0.4.2` was the API break for CubeCL, keep an eye on that if the version moves again.
 - Do not add new benchmarks under `benches/` without a `harness = false` entry in `Cargo.toml`. They use the CubeCL `Benchmark` trait, not criterion's default harness.
 - Documentation-of-record for results lives in `docs/benchmarks_*.md`. `CHANGELOG.md` at the repo root tracks release-note-style changes.
