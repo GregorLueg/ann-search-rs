@@ -64,6 +64,10 @@ anticipated. If you want to see what changed, please check this
 - **High performance**: Optimised implementations with SIMD, heavy
   multi-threading were possible and optimised structures for memory access.
 
+- **Flexible inputs**: every `build_*` and `query_*` function takes a faer
+  matrix, an `ndarray` 2-D array (optional feature) or a plain row-major slice
+  with its shape. Rows are always samples, columns are always features.
+
 - **Quantised indices** (optional feature):
   - *BF16* (brain floating point 16 quantisation for exhaustive and IVF)
   - *SQ8* (int8 quantisation for exhaustive and IVF)
@@ -97,6 +101,10 @@ several of the functions and avoid panics in favour of errors. A key change
 was also the update to cubecl `"0.1.0"` which changes quite a few APIs for the
 GPU-accelerated version.
 
+Version `"0.6.0"` opened up the inputs via the `AnnMatrix` trait. Existing code
+passing faer matrices keeps working unchanged, but a few of the lower-level
+binariser and quantiser constructors now take flat slices instead of a `MatRef`.
+
 ## Example Usage
 
 Below shows an example on how to use for example the HNSW index and query it.
@@ -110,7 +118,7 @@ use faer::Mat;
 // Build the HNSW index
 let data = Mat::from_fn(1000, 128, |_, _| rand::random::<f32>());
 let hnsw_idx = build_hnsw_index(
-  mat.as_ref(),
+  data.as_ref(),
   16,             // m
   100,            // ef_construction
   "euclidean",    // distance metric
@@ -122,7 +130,7 @@ let hnsw_idx = build_hnsw_index(
 // In this case we are doing a full self query
 let query = Mat::from_fn(10, 128, |_, _| rand::random::<f32>());
 let (hnsw_indices, hnsw_dists) = query_hnsw_index(
-  mat.as_ref(),
+  query.as_ref(),
   &hnsw_idx,
   15,             // k
   200,            // ef_search
@@ -130,6 +138,17 @@ let (hnsw_indices, hnsw_dists) = query_hnsw_index(
   false           // verbosity
 );
 ```
+
+The input does not have to be a faer matrix. Every `build_*` and `query_*`
+function accepts anything implementing `AnnMatrix`, so an `ndarray` view (with
+the `ndarray` feature) or a row-major slice with its shape work just as well:
+
+```rust
+let hnsw_idx = build_hnsw_index(arr.view(), 16, 100, "euclidean", 42, false);
+let hnsw_idx = build_hnsw_index((flat.as_slice(), 1000, 128), 16, 100, "euclidean", 42, false);
+```
+
+Orientation is fixed throughout: rows are samples, columns are features.
 
 The package provides a number of different approximate nearest neighbour
 searches. The overall design is very similar and if you wish details on usage,
