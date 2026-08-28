@@ -10,6 +10,7 @@
 //! The GPU NN-Descent module also reads [`SENTINEL_PID`] to detect empty
 //! neighbour slots downloaded from device.
 
+use rayon::prelude::*;
 use rdst::RadixKey;
 
 ///////////////
@@ -120,6 +121,80 @@ impl<T: Copy> Neighbour<T> {
     #[inline(always)]
     pub fn mark_new(&mut self) {
         self.pid_and_flag |= Self::IS_NEW_MASK;
+    }
+}
+
+////////////////////
+// Graph unpacking //
+////////////////////
+
+/// Unpack a flat sentinel-padded kNN graph into per-node rows.
+///
+/// The flat `n * k` layout is what every NN-Descent-derived index stores and
+/// what a downstream index like NSG consumes directly. This is the adapter for
+/// callers who want plain kNN output instead: it hands back the graph exactly
+/// as it was built, with no beam-search re-query.
+///
+/// Rows are already sorted by distance ascending, so `k_out` truncates from
+/// the front. Sentinel slots are dropped, which means a row can come back
+/// **shorter than `k`** where the descent never filled it (small `n`,
+/// disconnected components). That is the one behavioural difference from the
+/// `query_*_self` functions, which always return exactly `k`.
+///
+/// ### Params
+///
+/// * `graph` - Flat graph of `n * k` `(pid, distance)` pairs, row `i` at
+///   `[i*k .. (i+1)*k]`, sentinel-padded.
+/// * `n` - Number of nodes.
+/// * `k` - Neighbours per node in `graph`.
+/// * `k_out` - Truncate each row to this many neighbours. `None` keeps all.
+/// * `return_dist` - Whether to materialise the distances.
+///
+/// ### Returns
+///
+/// `(indices, distances)` with one row per node. Distances are `None` when
+/// `return_dist` is false.
+pub fn unpack_knn_graph<T: Copy + Send + Sync>(
+    graph: &[(usize, T)],
+    n: usize,
+    k: usize,
+    k_out: Option<usize>,
+    return_dist: bool,
+) -> (Vec<Vec<usize>>, Option<Vec<Vec<T>>>) {
+    let take = k_out.unwrap_or(k).min(k);
+
+    // One pass over each row builds both outputs; splitting it walks the graph
+    // twice for no reason.
+    let rows: Vec<(Vec<usize>, Vec<T>)> = (0..n)
+        .into_par_iter()
+        .map(|i| {
+            let mut ids = Vec::with_capacity(take);
+            let mut dists = if return_dist {
+                Vec::with_capacity(take)
+            } else {
+                Vec::new()
+            };
+            for &(pid, dist) in &graph[i * k..(i + 1) * k] {
+                if pid == SENTINEL_PID {
+                    continue;
+                }
+                if ids.len() == take {
+                    break;
+                }
+                ids.push(pid);
+                if return_dist {
+                    dists.push(dist);
+                }
+            }
+            (ids, dists)
+        })
+        .collect();
+
+    if return_dist {
+        let (indices, distances) = rows.into_iter().unzip();
+        (indices, Some(distances))
+    } else {
+        (rows.into_iter().map(|(ids, _)| ids).collect(), None)
     }
 }
 
@@ -342,5 +417,52 @@ mod tests {
         updates.radix_sort_unstable();
         let targets: Vec<_> = updates.iter().map(|u| u.target).collect();
         assert_eq!(targets, vec![1, 2, 300, 70_000]);
+    }
+
+    /// Two-node graph at `k = 3` with the last slot of each row empty.
+    fn padded_graph() -> Vec<(usize, f32)> {
+        vec![
+            (1, 0.5),
+            (2, 1.5),
+            (SENTINEL_PID, f32::MAX),
+            (0, 0.5),
+            (2, 2.5),
+            (SENTINEL_PID, f32::MAX),
+        ]
+    }
+
+    #[test]
+    fn test_unpack_drops_sentinels() {
+        let (ids, dists) = unpack_knn_graph(&padded_graph(), 2, 3, None, true);
+        assert_eq!(ids, vec![vec![1, 2], vec![0, 2]]);
+        assert_eq!(dists.unwrap(), vec![vec![0.5, 1.5], vec![0.5, 2.5]]);
+    }
+
+    #[test]
+    fn test_unpack_honours_k_out() {
+        let (ids, dists) = unpack_knn_graph(&padded_graph(), 2, 3, Some(1), true);
+        assert_eq!(ids, vec![vec![1], vec![0]]);
+        assert_eq!(dists.unwrap(), vec![vec![0.5], vec![0.5]]);
+    }
+
+    #[test]
+    fn test_unpack_k_out_above_k_is_clamped() {
+        let (ids, _) = unpack_knn_graph(&padded_graph(), 2, 3, Some(99), false);
+        assert_eq!(ids, vec![vec![1, 2], vec![0, 2]]);
+    }
+
+    #[test]
+    fn test_unpack_skips_distances_when_not_asked() {
+        let (ids, dists) = unpack_knn_graph(&padded_graph(), 2, 3, None, false);
+        assert_eq!(ids.len(), 2);
+        assert!(dists.is_none());
+    }
+
+    #[test]
+    fn test_unpack_all_sentinel_row_is_empty() {
+        let graph = vec![(SENTINEL_PID, f32::MAX); 4];
+        let (ids, dists) = unpack_knn_graph(&graph, 2, 2, None, true);
+        assert_eq!(ids, vec![Vec::<usize>::new(), Vec::new()]);
+        assert_eq!(dists.unwrap(), vec![Vec::<f32>::new(), Vec::new()]);
     }
 }

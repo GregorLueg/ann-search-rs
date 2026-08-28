@@ -71,7 +71,7 @@ use crate::binary::{
     ivf_tq::*,
 };
 #[cfg(feature = "gpu")]
-use crate::gpu::{exhaustive_gpu::*, ivf_gpu::*, nndescent_gpu::*};
+use crate::gpu::{exhaustive_gpu::*, ivf_gpu::*};
 #[cfg(feature = "quantised")]
 use crate::quantised::{
     exhaustive_bf16::*, exhaustive_opq::*, exhaustive_pq::*, exhaustive_sq8::*, ivf_bf16::*,
@@ -1366,6 +1366,41 @@ where
     NNDescent<T>: NNDescentQuery<T>,
 {
     index.generate_knn(k, ef_search, return_dist, verbose)
+}
+
+/// Extract the kNN graph NN-Descent already built.
+///
+/// No search is performed: this reshapes the graph produced during
+/// construction. [`query_nndescent_self`] runs a beam search per point instead,
+/// which lifts recall at orders of magnitude more cost.
+///
+/// ### Params
+///
+/// * `index` - Reference to the built index
+/// * `k` - Truncate each row to this many neighbours. `None` keeps the
+///   build-time `k`.
+/// * `return_dist` - Return distances
+///
+/// ### Returns
+///
+/// A tuple of `(knn_indices, optional distances)`, sorted by distance
+/// ascending.
+///
+/// ### Note
+///
+/// Rows can be shorter than `k` where the descent never filled them, which the
+/// query-based functions never produce.
+pub fn extract_nndescent_knn<T>(
+    index: &NNDescent<T>,
+    k: Option<usize>,
+    return_dist: bool,
+) -> KnnOptionResult<T>
+where
+    T: AnnSearchFloat,
+    NNDescent<T>: ApplySortedUpdates<T>,
+    NNDescent<T>: NNDescentQuery<T>,
+{
+    Ok(index.extract_knn(k, return_dist))
 }
 
 ////////////
@@ -3243,6 +3278,8 @@ where
 /// ### Params
 ///
 /// * `index` - Reference to built index
+/// * `k` - Truncate each row to this many neighbours. `None` keeps the
+///   build-time `k`.
 /// * `return_dist` - Return distances
 ///
 /// ### Returns
@@ -3250,13 +3287,43 @@ where
 /// Tuple of (indices, optional distances)
 pub fn extract_nndescent_knn_gpu<T, R>(
     index: &NNDescentGpu<T, R>,
+    k: Option<usize>,
     return_dist: bool,
-) -> (Vec<Vec<usize>>, Option<Vec<Vec<T>>>)
+) -> KnnOptionResult<T>
 where
     R: Runtime,
     T: AnnSearchFloat + CubeclFloat,
 {
-    index.extract_knn(return_dist)
+    Ok(index.extract_knn(k, return_dist))
+}
+
+#[cfg(feature = "gpu")]
+/// Extract the kNN graph from a raw GPU kNN handoff.
+///
+/// [`build_knn_graph_gpu`] and [`build_clustered_knn_graph_gpu`] return a
+/// [`KnnGraphGpu`] with no query functions, since their job is to feed a
+/// downstream index like NSG. This is the way out for a caller who wanted
+/// plain kNN output from that cheaper path.
+///
+/// ### Params
+///
+/// * `graph` - The kNN graph handoff
+/// * `k` - Truncate each row to this many neighbours. `None` keeps the
+///   build-time `k`.
+/// * `return_dist` - Return distances
+///
+/// ### Returns
+///
+/// Tuple of (indices, optional distances), sorted by distance ascending.
+pub fn extract_knn_graph_gpu<T>(
+    graph: &KnnGraphGpu<T>,
+    k: Option<usize>,
+    return_dist: bool,
+) -> KnnOptionResult<T>
+where
+    T: AnnSearchFloat,
+{
+    Ok(graph.extract_knn(k, return_dist))
 }
 
 #[cfg(feature = "gpu")]
@@ -3323,7 +3390,7 @@ where
 ///
 /// ### Returns
 ///
-/// Populated [`crate::gpu::nndescent_gpu::KnnGraphGpu`].
+/// Populated [`KnnGraphGpu`].
 #[allow(clippy::too_many_arguments)]
 pub fn build_knn_graph_gpu<T, R>(
     mat: impl AnnMatrix<T>,
@@ -3338,7 +3405,7 @@ pub fn build_knn_graph_gpu<T, R>(
     seed: usize,
     verbose: bool,
     device: R::Device,
-) -> Result<crate::gpu::nndescent_gpu::KnnGraphGpu<T>, AnnSearchErrors>
+) -> Result<KnnGraphGpu<T>, AnnSearchErrors>
 where
     R: Runtime,
     T: AnnSearchFloat + CubeclFloat,
@@ -3383,7 +3450,7 @@ where
 ///
 /// ### Returns
 ///
-/// Populated [`crate::gpu::nndescent_gpu::KnnGraphGpu`], identical in shape to
+/// Populated [`KnnGraphGpu`], identical in shape to
 /// the unbatched path.
 ///
 /// ### Note
@@ -3407,7 +3474,7 @@ pub fn build_clustered_knn_graph_gpu<T, R>(
     seed: usize,
     verbose: bool,
     device: R::Device,
-) -> Result<crate::gpu::nndescent_gpu::KnnGraphGpu<T>, AnnSearchErrors>
+) -> Result<KnnGraphGpu<T>, AnnSearchErrors>
 where
     R: Runtime,
     T: AnnSearchFloat + CubeclFloat,
@@ -3444,14 +3511,14 @@ where
 ///
 /// ### Params
 ///
-/// * `knn_gpu` - Reference to a pre-built [`crate::gpu::nndescent_gpu::KnnGraphGpu`]
+/// * `knn_gpu` - Reference to a pre-built [`KnnGraphGpu`]
 /// * `r` - Maximum out-degree of the NSG graph
 /// * `l_build` - Beam width for the per-node candidate search
 /// * `c` - Cap on the candidate-set size before MRNG pruning
 /// * `seed` - Random seed for reproducibility
 /// * `verbose` - Print progress
 pub fn build_nsg_from_gpu_knn<T>(
-    knn_gpu: &crate::gpu::nndescent_gpu::KnnGraphGpu<T>,
+    knn_gpu: &KnnGraphGpu<T>,
     r: usize,
     l_build: usize,
     c: usize,

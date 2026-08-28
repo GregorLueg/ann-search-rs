@@ -136,7 +136,7 @@ fn main() {
             // Extract kNN graph
             println!("  Extracting kNN graph...");
             let start = Instant::now();
-            let (gpu_neighbors, gpu_distances) = extract_nndescent_knn_gpu(&gpu_idx, true);
+            let (gpu_neighbors, gpu_distances) = extract_nndescent_knn_gpu(&gpu_idx, None, true).unwrap();
             let gpu_extract = start.elapsed().as_secs_f64() * 1000.0;
 
             let gpu_recall = calculate_recall(&true_neighbors, &gpu_neighbors, cli.k);

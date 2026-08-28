@@ -45,7 +45,7 @@ use crate::gpu::cagra_gpu_search::*;
 use crate::gpu::forest_gpu::*;
 use crate::gpu::*;
 use crate::prelude::*;
-use crate::utils::nndescent_utils::SENTINEL_PID;
+use crate::utils::nndescent_utils::{unpack_knn_graph, SENTINEL_PID};
 
 ///////////
 // Const //
@@ -1956,8 +1956,8 @@ where
 
         let nndescent_idx = graph_idx_gpu.clone().read(&client)?;
         let nndescent_dist = graph_dist_gpu.clone().read(&client)?;
-        let pid_mask = 0x7FFFFFFFu32;
-        let sentinel = 0x7FFFFFFFusize;
+        let pid_mask = SENTINEL_PID as u32;
+        let sentinel = SENTINEL_PID;
 
         let mut knn_graph = vec![(sentinel, <T as num_traits::Float>::max_value()); n * k];
 
@@ -2225,43 +2225,21 @@ where
     ///
     /// ### Params
     ///
+    /// * `k` - Truncate each row to this many neighbours. `None` keeps the
+    ///   full build-time `k`.
     /// * `return_dist` - Whether to include distances in the output
     ///
     /// ### Returns
     ///
-    /// `(knn_indices, optional distances)` where each inner Vec has
-    /// length `k`, sorted by distance ascending. Sentinel entries
-    /// (unfilled slots) are excluded.
-    pub fn extract_knn(&self, return_dist: bool) -> (Vec<Vec<usize>>, Option<Vec<Vec<T>>>) {
-        let sentinel = 0x7FFFFFFFusize;
-
-        let indices: Vec<Vec<usize>> = (0..self.n)
-            .map(|i| {
-                self.knn_graph[i * self.k..(i + 1) * self.k]
-                    .iter()
-                    .filter(|&&(pid, _)| pid != sentinel)
-                    .map(|&(pid, _)| pid)
-                    .collect()
-            })
-            .collect();
-
-        let distances = if return_dist {
-            Some(
-                (0..self.n)
-                    .map(|i| {
-                        self.knn_graph[i * self.k..(i + 1) * self.k]
-                            .iter()
-                            .filter(|&&(pid, _)| pid != sentinel)
-                            .map(|&(_, dist)| dist)
-                            .collect()
-                    })
-                    .collect(),
-            )
-        } else {
-            None
-        };
-
-        (indices, distances)
+    /// `(knn_indices, optional distances)`, sorted by distance ascending.
+    /// Sentinel entries (unfilled slots) are excluded, so a row can be shorter
+    /// than `k`.
+    pub fn extract_knn(
+        &self,
+        k: Option<usize>,
+        return_dist: bool,
+    ) -> (Vec<Vec<usize>>, Option<Vec<Vec<T>>>) {
+        unpack_knn_graph(&self.knn_graph, self.n, self.k, k, return_dist)
     }
 
     /// Self-query: run GPU beam search for every vector in the index.
@@ -2442,6 +2420,36 @@ pub struct KnnGraphGpu<T> {
     pub knn_graph: Vec<(usize, T)>,
     /// Whether NNDescent hit the delta convergence threshold
     pub converged: bool,
+}
+
+impl<T> KnnGraphGpu<T>
+where
+    T: AnnSearchFloat,
+{
+    /// Hand back the kNN graph as per-node rows.
+    ///
+    /// This type has no query functions by design, so this is how a caller who
+    /// only wanted plain kNN output gets it without reaching into
+    /// [`Self::knn_graph`] and filtering sentinels themselves. Feeding NSG
+    /// still goes through the flat graph directly.
+    ///
+    /// ### Params
+    ///
+    /// * `k` - Truncate each row to this many neighbours. `None` keeps the
+    ///   full build-time `k`.
+    /// * `return_dist` - Whether to materialise the distances
+    ///
+    /// ### Returns
+    ///
+    /// `(knn_indices, optional distances)`, sorted by distance ascending.
+    /// Sentinel slots are dropped, so a row can be shorter than `k`.
+    pub fn extract_knn(
+        &self,
+        k: Option<usize>,
+        return_dist: bool,
+    ) -> (Vec<Vec<usize>>, Option<Vec<Vec<T>>>) {
+        unpack_knn_graph(&self.knn_graph, self.n, self.k, k, return_dist)
+    }
 }
 
 /// Build a raw kNN graph on the GPU without touching the CAGRA path.
@@ -2637,7 +2645,7 @@ pub fn compact_knn_rows<T>(
 where
     T: AnnSearchFloat,
 {
-    let pid_mask = 0x7FFFFFFFu32;
+    let pid_mask = SENTINEL_PID as u32;
     let sentinel = SENTINEL_PID;
 
     let mut knn_graph = vec![(sentinel, <T as num_traits::Float>::max_value()); n * k];
@@ -3343,7 +3351,7 @@ mod tests {
         )
         .unwrap();
 
-        let (indices, Some(distances)) = index.extract_knn(true) else {
+        let (indices, Some(distances)) = index.extract_knn(None, true) else {
             panic!("Expected distances");
         };
 
@@ -3357,7 +3365,7 @@ mod tests {
         }
 
         // Without distances
-        let (indices, dists) = index.extract_knn(false);
+        let (indices, dists) = index.extract_knn(None, false);
         assert_eq!(indices.len(), 20);
         assert!(dists.is_none());
     }
