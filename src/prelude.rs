@@ -43,3 +43,8 @@ pub type KnnOptionResult<T> = Result<(Vec<Vec<usize>>, Option<Vec<Vec<T>>>), Ann
 
 /// Results type for large approximate nearest neighbour searches.
 pub type KnnResult<T> = Result<(Vec<Vec<usize>>, Vec<Vec<T>>), AnnSearchErrors>;
+
+/// Per-query results before they are packed into a [`KnnOptionResult`].
+///
+/// One `(indices, distances)` pair per query, in query order.
+pub type KnnBatchResult<T> = Result<Vec<(Vec<usize>, Vec<T>)>, AnnSearchErrors>;

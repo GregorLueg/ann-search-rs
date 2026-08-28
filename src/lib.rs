@@ -63,6 +63,7 @@ use crate::cpu::{
 };
 use crate::prelude::*;
 use crate::utils::nndescent_utils::ApplySortedUpdates;
+use crate::utils::pack_knn_results;
 
 #[cfg(feature = "binary")]
 use crate::binary::{
@@ -124,13 +125,7 @@ where
         })
         .collect::<Result<Vec<_>, AnnSearchErrors>>()?;
 
-    if return_dist {
-        let (indices, distances) = results.into_iter().unzip();
-        Ok((indices, Some(distances)))
-    } else {
-        let indices: Vec<Vec<usize>> = results.into_iter().map(|(idx, _)| idx).collect();
-        Ok((indices, None))
-    }
+    Ok(pack_knn_results(results, return_dist))
 }
 
 /// Helper function to execute parallel queries with boolean flags
@@ -308,11 +303,10 @@ pub fn query_exhaustive_index<T>(
 where
     T: AnnSearchFloat,
 {
-    let (queries, nq, dim) = query_mat.into_row_major();
+    let (queries, nq, _) = query_mat.into_row_major();
+    let results = index.query_batch(&queries, nq, k, None, verbose)?;
 
-    query_parallel(nq, return_dist, verbose, |i| {
-        index.query(&queries[i * dim..(i + 1) * dim], k)
-    })
+    Ok(pack_knn_results(results, return_dist))
 }
 
 /// Helper function to self query an exhaustive index

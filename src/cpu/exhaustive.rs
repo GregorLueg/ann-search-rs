@@ -1,13 +1,121 @@
 //! Exhaustive (flat) implementation for nearest neighbour searches in
 //! ann-search-rs.
 
-use faer::RowRef;
+use faer::{linalg::matmul::matmul, Accum, Mat, MatRef, Par, RowRef};
 
 use rayon::prelude::*;
-use std::collections::BinaryHeap;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use thousands::*;
 
 use crate::prelude::*;
+use crate::utils::pack_knn_results;
+
+////////////////////////
+// Constants & tuning //
+////////////////////////
+
+/// Queries per thread below which the fused scan beats the blocked GEMM path.
+///
+/// The GEMM path pays an O(n_queries * n_samples) cost for materialising the
+/// dot products and buys reuse of each database tile across the queries
+/// sharing it. Batch size decides that trade, not dimension: the crossover
+/// held between 96 and 128 queries across `dim` 32 and 128 and `n` from 10k to
+/// 200k, a 20-fold range in database size.
+///
+/// It is stated per thread because the scan fans out one query per core while
+/// the GEMM path can only fan out whole blocks, so a batch too small to fill
+/// the machine with blocks loses however favourable the arithmetic is.
+/// Measured crossovers were under 32 queries at 2 threads, 58 at 4 and 110 at
+/// 10, so 11 to 16 queries per thread; the upper end is taken so the threshold
+/// sits on a measured win rather than on the margin.
+///
+/// Note this is *not* the crossover `k_means_utils` measures for its own GEMM
+/// assignment. There the database side is the centroid set, small enough to
+/// stay cache-resident on its own, so blocking adds little and the crossover
+/// lands in dimension instead.
+const GEMM_MIN_QUERIES_PER_THREAD: usize = 16;
+
+/// Largest number of queries per GEMM block.
+///
+/// With [`GEMM_DB_TILE`] this caps the dot-product tile at 256 * 1024 elements,
+/// so roughly 1 MB at `f32`. Sized to sit in L2 alongside the two operand
+/// blocks, since every thread holds its own tile.
+const GEMM_QUERY_TILE: usize = 256;
+
+/// Smallest number of queries per GEMM block.
+///
+/// The block loop is the only source of parallelism on the GEMM path, so the
+/// tile shrinks below [`GEMM_QUERY_TILE`] to keep every thread fed on a small
+/// batch. It stops here because a block narrower than this reuses a database
+/// tile too few times to pay for materialising the dot products.
+const GEMM_QUERY_TILE_MIN: usize = 32;
+
+/// Blocks to aim for per thread when sizing the query tile.
+///
+/// One block per thread balances badly on an asymmetric machine: a block that
+/// lands on an efficiency core holds up the whole batch. Cutting finer gives
+/// rayon something to steal, at the cost of reusing each database tile across
+/// fewer queries.
+const GEMM_BLOCKS_PER_THREAD: usize = 4;
+
+/// Database vectors per GEMM block.
+///
+/// The block is re-read by all [`GEMM_QUERY_TILE`] queries, so it wants to stay
+/// resident: 1024 rows is 512 KB at `dim = 128` and `f32`.
+const GEMM_DB_TILE: usize = 1024;
+
+/////////////
+// Helpers //
+/////////////
+
+/// Report scan progress every 100,000 queries.
+///
+/// Takes the batch size so the block-at-a-time GEMM path reports on the same
+/// cadence as the one-at-a-time scan.
+///
+/// ### Params
+///
+/// * `counter` - Shared count of queries completed so far
+/// * `delta` - Number of queries this call completed
+/// * `total` - Total number of queries in the batch
+fn report_progress(counter: &AtomicUsize, delta: usize, total: usize) {
+    let before = counter.fetch_add(delta, Ordering::Relaxed);
+    let after = before + delta;
+    if before / 100_000 != after / 100_000 {
+        println!(
+            "  Processed {} / {} samples.",
+            after.separate_with_underscores(),
+            total.separate_with_underscores()
+        );
+    }
+}
+
+/// Scan every candidate once, retaining the `k` nearest in a bounded heap.
+///
+/// The distance function is monomorphised per call site and inlines, so the
+/// metric branch is hoisted out of the scan rather than tested per candidate.
+///
+/// ### Params
+///
+/// * `n` - Number of candidates to scan
+/// * `k` - Number of neighbours to retain
+/// * `dist_fn` - Distance from the query to the candidate at a given index
+///
+/// ### Returns
+///
+/// A heap holding the `k` nearest candidates
+#[inline(always)]
+fn scan_into_heap<T, F>(n: usize, k: usize, dist_fn: F) -> BoundedMaxHeap<T>
+where
+    T: AnnSearchFloat,
+    F: Fn(usize) -> T,
+{
+    let mut heap = BoundedMaxHeap::new(k);
+    for idx in 0..n {
+        heap.push(dist_fn(idx), idx);
+    }
+    heap
+}
 
 /////////////////////
 // ExhaustiveIndex //
@@ -148,62 +256,22 @@ where
         let n_vectors = self.vectors_flat.len() / self.dim;
         let k = k.min(n_vectors);
 
-        let mut heap: BinaryHeap<(OrderedFloat<T>, usize)> = BinaryHeap::with_capacity(k + 1);
-
-        match self.metric {
-            Dist::SquaredEuclidean => {
-                for idx in 0..n_vectors {
-                    let dist = self.euclidean_distance_to_query(idx, query_vec);
-
-                    if heap.len() < k {
-                        heap.push((OrderedFloat(dist), idx));
-                    } else if dist < heap.peek().unwrap().0 .0 {
-                        heap.pop();
-                        heap.push((OrderedFloat(dist), idx));
-                    }
-                }
-            }
+        let heap = match self.metric {
+            Dist::SquaredEuclidean => scan_into_heap(n_vectors, k, |idx| {
+                self.euclidean_distance_to_query(idx, query_vec)
+            }),
             Dist::Cosine => {
-                let query_norm = query_vec
-                    .iter()
-                    .map(|v| *v * *v)
-                    .fold(T::zero(), |a, b| a + b)
-                    .sqrt();
-
-                for idx in 0..n_vectors {
-                    let dist = self.cosine_distance_to_query(idx, query_vec, query_norm);
-
-                    if heap.len() < k {
-                        heap.push((OrderedFloat(dist), idx));
-                    } else if dist < heap.peek().unwrap().0 .0 {
-                        heap.pop();
-                        heap.push((OrderedFloat(dist), idx));
-                    }
-                }
+                let query_norm = T::calculate_l2_norm(query_vec);
+                scan_into_heap(n_vectors, k, |idx| {
+                    self.cosine_distance_to_query(idx, query_vec, query_norm)
+                })
             }
-            Dist::Manhattan => {
-                for idx in 0..n_vectors {
-                    let dist = self.manhattan_distance_to_query(idx, query_vec);
+            Dist::Manhattan => scan_into_heap(n_vectors, k, |idx| {
+                self.manhattan_distance_to_query(idx, query_vec)
+            }),
+        };
 
-                    if heap.len() < k {
-                        heap.push((OrderedFloat(dist), idx));
-                    } else if dist < heap.peek().unwrap().0 .0 {
-                        heap.pop();
-                        heap.push((OrderedFloat(dist), idx));
-                    }
-                }
-            }
-        }
-
-        let mut results: Vec<_> = heap.into_iter().collect();
-        results.sort_unstable_by_key(|&(dist, _)| dist);
-
-        let (distances, indices): (Vec<_>, Vec<_>) = results
-            .into_iter()
-            .map(|(OrderedFloat(dist), idx)| (dist, idx))
-            .unzip();
-
-        Ok((indices, distances))
+        Ok(heap.into_sorted())
     }
 
     /// Query function for row references
@@ -239,7 +307,8 @@ where
     /// Generate kNN graph from vectors stored in the index
     ///
     /// Queries each vector in the index against itself to build a complete
-    /// kNN graph.
+    /// kNN graph. Every point is its own nearest neighbour, so the first
+    /// column is the point itself.
     ///
     /// ### Params
     ///
@@ -252,42 +321,255 @@ where
     /// Tuple of `(knn_indices, optional distances)` where each row corresponds
     /// to a vector in the index
     pub fn generate_knn(&self, k: usize, return_dist: bool, verbose: bool) -> KnnOptionResult<T> {
-        use std::sync::{
-            atomic::{AtomicUsize, Ordering},
-            Arc,
-        };
+        let results = self.query_batch(&self.vectors_flat, self.n, k, None, verbose)?;
+        Ok(pack_knn_results(results, return_dist))
+    }
 
-        let counter = Arc::new(AtomicUsize::new(0));
+    /// Query a batch of vectors against the index
+    ///
+    /// Dispatches between the fused per-query scan and a blocked GEMM path.
+    /// The scan keeps each accumulation in registers but re-reads the whole
+    /// database for every query; the GEMM path blocks both axes so a database
+    /// tile is reused across a tile of queries, paying for that with a
+    /// materialised dot-product tile.
+    ///
+    /// ### Params
+    ///
+    /// * `queries` - Query vectors, flattened row-major (`nq * dim` elements)
+    /// * `nq` - Number of queries
+    /// * `k` - Number of neighbours to return
+    /// * `use_gemm` - Force the GEMM path on or off. `None` picks by batch
+    ///   size relative to the thread count, see
+    ///   [`GEMM_MIN_QUERIES_PER_THREAD`]. Both paths return exact distances,
+    ///   so this is a performance knob only.
+    /// * `verbose` - Controls verbosity
+    ///
+    /// ### Returns
+    ///
+    /// Per-query tuples of `(indices, distances)`
+    pub fn query_batch(
+        &self,
+        queries: &[T],
+        nq: usize,
+        k: usize,
+        use_gemm: Option<bool>,
+        verbose: bool,
+    ) -> KnnBatchResult<T> {
+        if nq == 0 {
+            return Ok(Vec::new());
+        }
+        self.check_dim(queries.len() / nq)?;
 
-        let results: Vec<(Vec<usize>, Vec<T>)> = (0..self.n)
+        if self.gemm_applies(nq, use_gemm) {
+            return self.query_batch_gemm(queries, nq, k.min(self.n), verbose);
+        }
+
+        let counter = AtomicUsize::new(0);
+        (0..nq)
             .into_par_iter()
             .map(|i| {
-                let start = i * self.dim;
-                let end = start + self.dim;
-                let vec = &self.vectors_flat[start..end];
-
                 if verbose {
-                    let count = counter.fetch_add(1, Ordering::Relaxed) + 1;
-                    if count.is_multiple_of(100_000) {
-                        println!(
-                            "  Processed {} / {} samples.",
-                            count.separate_with_underscores(),
-                            self.n.separate_with_underscores()
-                        );
+                    report_progress(&counter, 1, nq);
+                }
+                self.query(&queries[i * self.dim..(i + 1) * self.dim], k)
+            })
+            .collect()
+    }
+
+    /// Whether the blocked GEMM path applies to this batch
+    ///
+    /// ### Params
+    ///
+    /// * `nq` - Number of queries in the batch
+    /// * `requested` - Explicit override, or `None` for the heuristic
+    ///
+    /// ### Returns
+    ///
+    /// `true` if the GEMM path should be taken
+    fn gemm_applies(&self, nq: usize, requested: Option<bool>) -> bool {
+        // The dot-product expansion has no analogue under Manhattan, so an
+        // explicit request is refused rather than answering a different metric.
+        if self.metric == Dist::Manhattan || self.n == 0 {
+            return false;
+        }
+
+        requested.unwrap_or(nq >= rayon::current_num_threads().max(1) * GEMM_MIN_QUERIES_PER_THREAD)
+    }
+
+    /// Blocked GEMM nearest neighbour search over a batch of queries
+    ///
+    /// Both axes are tiled. For each tile pair a single GEMM produces the dot
+    /// products, which become distances through the expansion
+    /// `||x||^2 - 2<x,y> + ||y||^2` for Euclidean, or
+    /// `1 - <x,y> / (||x|| ||y||)` for cosine. Each query keeps one heap
+    /// across all database tiles.
+    ///
+    /// The Euclidean expansion cancels catastrophically once the distance is
+    /// small relative to `||x||`, which is exactly the regime of the
+    /// neighbours being returned, so the retained `k` are recomputed with the
+    /// fused kernel before being handed back. Selection still happens on the
+    /// expanded values, but every distance the caller sees is exact and the
+    /// ordering within the `k` is correct.
+    ///
+    /// ### Params
+    ///
+    /// * `queries` - Query vectors, flattened row-major (`nq * dim` elements)
+    /// * `nq` - Number of queries
+    /// * `k` - Number of neighbours to return, already clamped to `n`
+    /// * `verbose` - Controls verbosity
+    ///
+    /// ### Returns
+    ///
+    /// Per-query tuples of `(indices, distances)`
+    fn query_batch_gemm(
+        &self,
+        queries: &[T],
+        nq: usize,
+        k: usize,
+        verbose: bool,
+    ) -> KnnBatchResult<T> {
+        let dim = self.dim;
+        let n = self.n;
+        let two = T::one() + T::one();
+        let cosine = self.metric == Dist::Cosine;
+
+        // Database norms are recomputed per batch rather than stored on the
+        // index: O(n * dim) against the O(nq * n * dim) of the search itself,
+        // and it leaves the serialised layout alone.
+        let db_norms: Vec<T> = if cosine {
+            self.norms.clone()
+        } else {
+            (0..n)
+                .into_par_iter()
+                .map(|j| {
+                    let y = &self.vectors_flat[j * dim..(j + 1) * dim];
+                    T::dot_simd(y, y)
+                })
+                .collect()
+        };
+
+        let q_norms: Vec<T> = (0..nq)
+            .into_par_iter()
+            .map(|i| {
+                let x = &queries[i * dim..(i + 1) * dim];
+                if cosine {
+                    T::calculate_l2_norm(x)
+                } else {
+                    T::dot_simd(x, x)
+                }
+            })
+            .collect();
+
+        let counter = AtomicUsize::new(0);
+
+        // The block loop carries all the parallelism, so a batch that would
+        // fit in one block has to be split anyway or the whole search runs on
+        // a single thread.
+        let query_tile = nq
+            .div_ceil((rayon::current_num_threads() * GEMM_BLOCKS_PER_THREAD).max(1))
+            .clamp(GEMM_QUERY_TILE_MIN, GEMM_QUERY_TILE);
+
+        let blocks: Vec<Vec<(Vec<usize>, Vec<T>)>> = (0..nq.div_ceil(query_tile))
+            .into_par_iter()
+            .map_init(Mat::<T>::new, |dots, block| {
+                let i0 = block * query_tile;
+                let i1 = (i0 + query_tile).min(nq);
+                let bq = i1 - i0;
+
+                let mut heaps: Vec<BoundedMaxHeap<T>> =
+                    (0..bq).map(|_| BoundedMaxHeap::new(k)).collect();
+
+                let x_block = MatRef::from_row_major_slice(&queries[i0 * dim..i1 * dim], bq, dim);
+
+                for j0 in (0..n).step_by(GEMM_DB_TILE) {
+                    let j1 = (j0 + GEMM_DB_TILE).min(n);
+                    let bd = j1 - j0;
+
+                    let y_block = MatRef::from_row_major_slice(
+                        &self.vectors_flat[j0 * dim..j1 * dim],
+                        bd,
+                        dim,
+                    );
+
+                    if dots.nrows() != bq || dots.ncols() != bd {
+                        *dots = Mat::<T>::zeros(bq, bd);
+                    }
+
+                    // Inner GEMM stays sequential: the outer rayon iterator
+                    // already owns every core.
+                    matmul(
+                        dots.as_mut(),
+                        Accum::Replace,
+                        x_block,
+                        y_block.transpose(),
+                        T::one(),
+                        Par::Seq,
+                    );
+
+                    // Metric branch is hoisted out of the inner scan.
+                    if cosine {
+                        for li in 0..bq {
+                            let xn = q_norms[i0 + li];
+                            let heap = &mut heaps[li];
+                            for lj in 0..bd {
+                                let denom = xn * db_norms[j0 + lj];
+                                let dist = if denom > T::zero() {
+                                    T::one() - dots[(li, lj)] / denom
+                                } else {
+                                    T::one()
+                                };
+                                heap.push(dist, j0 + lj);
+                            }
+                        }
+                    } else {
+                        for li in 0..bq {
+                            let xn = q_norms[i0 + li];
+                            let heap = &mut heaps[li];
+                            for lj in 0..bd {
+                                // Roundoff can push identical vectors below
+                                // zero; clamp before it reaches the heap.
+                                let dist =
+                                    (xn + db_norms[j0 + lj] - two * dots[(li, lj)]).max(T::zero());
+                                heap.push(dist, j0 + lj);
+                            }
+                        }
                     }
                 }
 
-                self.query(vec, k)
-            })
-            .collect::<Result<Vec<_>, _>>()?;
+                if verbose {
+                    report_progress(&counter, bq, nq);
+                }
 
-        if return_dist {
-            let (indices, distances) = results.into_iter().unzip();
-            Ok((indices, Some(distances)))
-        } else {
-            let indices: Vec<Vec<usize>> = results.into_iter().map(|(idx, _)| idx).collect();
-            Ok((indices, None))
-        }
+                heaps
+                    .into_iter()
+                    .enumerate()
+                    .map(|(li, heap)| {
+                        let (ids, _) = heap.into_sorted();
+                        let x = &queries[(i0 + li) * dim..(i0 + li + 1) * dim];
+
+                        let mut exact: Vec<(OrderedFloat<T>, usize)> = ids
+                            .into_iter()
+                            .map(|j| {
+                                let dist = if cosine {
+                                    self.cosine_distance_to_query(j, x, q_norms[i0 + li])
+                                } else {
+                                    self.euclidean_distance_to_query(j, x)
+                                };
+                                (OrderedFloat(dist), j)
+                            })
+                            .collect();
+                        exact.sort_unstable();
+
+                        exact
+                            .into_iter()
+                            .map(|(OrderedFloat(dist), j)| (j, dist))
+                            .unzip()
+                    })
+                    .collect()
+            })
+            .collect();
+
+        Ok(blocks.into_iter().flatten().collect())
     }
 }
 
@@ -555,6 +837,202 @@ mod tests {
 
         let dist_self = index.cosine_distance(0, 0);
         assert_relative_eq!(dist_self, 0.0, epsilon = 1e-5);
+    }
+
+    /// Clustered points, distinct and non-degenerate.
+    ///
+    /// The jitter period (97) is coprime with the cluster count over the sizes
+    /// used here, so every row is unique and "each point is its own nearest
+    /// neighbour" holds strictly. The offset keeps every norm non-zero so the
+    /// cosine metric stays defined. Spread is comparable to the cluster
+    /// separation, so distances stay resolvable at `f32`.
+    fn clustered_matrix(n: usize, dim: usize) -> Mat<f32> {
+        Mat::from_fn(n, dim, |i, j| {
+            let cluster = (i % 5) as f32 * 40.0;
+            let jitter = ((i * 7 + j * 13) % 97) as f32 * 0.5;
+            1.0 + cluster + jitter
+        })
+    }
+
+    /// Clusters packed far tighter than `f32` can resolve through the
+    /// expansion, for pinning down what survives catastrophic cancellation.
+    fn cancellation_matrix(n: usize, dim: usize) -> Mat<f32> {
+        Mat::from_fn(n, dim, |i, j| {
+            1000.0 + ((i * 7 + j * 13) % 23) as f32 * 1e-3 + i as f32 * 1e-4
+        })
+    }
+
+    /// Compare the two paths on the property that actually holds.
+    ///
+    /// Selection on the GEMM path happens against the expanded distances, so a
+    /// candidate sitting on the boundary of the retained set can swap with the
+    /// one just outside it. What must hold is that the distances handed back
+    /// are the exact ones, sorted, and no worse than the scan's.
+    fn assert_paths_agree(index: &ExhaustiveIndex<f32>, queries: &[f32], nq: usize, k: usize) {
+        let scan = index
+            .query_batch(queries, nq, k, Some(false), false)
+            .unwrap();
+        let gemm = index
+            .query_batch(queries, nq, k, Some(true), false)
+            .unwrap();
+
+        let mut matched = 0usize;
+        let mut total = 0usize;
+
+        for ((s_ids, s_dist), (g_ids, g_dist)) in scan.iter().zip(gemm.iter()) {
+            assert!(g_dist.windows(2).all(|w| w[0] <= w[1]), "not sorted");
+
+            for (a, b) in s_dist.iter().zip(g_dist.iter()) {
+                assert_relative_eq!(a, b, epsilon = 1e-4);
+            }
+
+            let retained: std::collections::HashSet<_> = g_ids.iter().collect();
+            matched += s_ids.iter().filter(|i| retained.contains(i)).count();
+            total += s_ids.len();
+        }
+
+        // Boundary swaps are permitted, wholesale disagreement is not.
+        let agreement = matched as f64 / total as f64;
+        assert!(agreement > 0.99, "agreement {agreement} too low");
+    }
+
+    #[test]
+    fn test_gemm_and_scan_agree_euclidean() {
+        let mat = clustered_matrix(400, 24);
+        let index = ExhaustiveIndex::new(mat.as_ref(), Dist::SquaredEuclidean);
+        let (queries, nq, _) = mat.as_ref().into_row_major();
+
+        assert_paths_agree(&index, &queries, nq, 10);
+    }
+
+    #[test]
+    fn test_gemm_and_scan_agree_cosine() {
+        let mat = clustered_matrix(400, 24);
+        let index = ExhaustiveIndex::new(mat.as_ref(), Dist::Cosine);
+        let (queries, nq, _) = mat.as_ref().into_row_major();
+
+        assert_paths_agree(&index, &queries, nq, 10);
+    }
+
+    #[test]
+    fn test_gemm_returns_exact_zero_for_self_match() {
+        // The expansion cancels hardest on coincident vectors; the re-rank is
+        // what keeps the reported distance exact rather than merely clamped.
+        let mat = clustered_matrix(300, 16);
+        let index = ExhaustiveIndex::new(mat.as_ref(), Dist::SquaredEuclidean);
+        let (queries, nq, _) = mat.as_ref().into_row_major();
+
+        let gemm = index
+            .query_batch(&queries, nq, 3, Some(true), false)
+            .unwrap();
+        for (i, (ids, dists)) in gemm.iter().enumerate() {
+            assert_eq!(ids[0], i);
+            assert_eq!(dists[0], 0.0);
+        }
+    }
+
+    #[test]
+    fn test_gemm_distances_stay_exact_under_cancellation() {
+        // Norms near 1e6 against separations near 1e-3: the expansion cannot
+        // resolve these, so which candidates get selected genuinely wobbles.
+        // The re-rank is what guarantees that whatever comes back carries its
+        // exact distance, in the right order. That is the contract.
+        let mat = cancellation_matrix(300, 16);
+        let index = ExhaustiveIndex::new(mat.as_ref(), Dist::SquaredEuclidean);
+        let (queries, nq, dim) = mat.as_ref().into_row_major();
+
+        let gemm = index
+            .query_batch(&queries, nq, 8, Some(true), false)
+            .unwrap();
+
+        for (i, (ids, dists)) in gemm.iter().enumerate() {
+            let q = &queries[i * dim..(i + 1) * dim];
+            for (&id, &d) in ids.iter().zip(dists.iter()) {
+                assert_eq!(d, index.euclidean_distance_to_query(id, q));
+            }
+            assert!(dists.windows(2).all(|w| w[0] <= w[1]));
+        }
+    }
+
+    #[test]
+    fn test_gemm_handles_coincident_vectors() {
+        // Three exact copies of each point. The expansion cancels to a
+        // negative number here, so this is what the clamp and the re-rank are
+        // for: distance exactly zero, and the tie broken on the lower index.
+        let mat = Mat::from_fn(300, 12, |i, j| {
+            ((i / 3) as f32 + 1.0) * (j as f32 + 1.0) * 0.5
+        });
+        let index = ExhaustiveIndex::new(mat.as_ref(), Dist::SquaredEuclidean);
+        let (queries, nq, _) = mat.as_ref().into_row_major();
+
+        let scan = index
+            .query_batch(&queries, nq, 3, Some(false), false)
+            .unwrap();
+        let gemm = index
+            .query_batch(&queries, nq, 3, Some(true), false)
+            .unwrap();
+
+        for (i, (ids, dists)) in gemm.iter().enumerate() {
+            let group = i / 3;
+            assert_eq!(ids, &vec![group * 3, group * 3 + 1, group * 3 + 2]);
+            assert_eq!(dists, &vec![0.0, 0.0, 0.0]);
+        }
+        assert_eq!(scan, gemm);
+    }
+
+    #[test]
+    fn test_gemm_path_refused_for_manhattan() {
+        let mat = clustered_matrix(300, 16);
+        let index = ExhaustiveIndex::new(mat.as_ref(), Dist::Manhattan);
+
+        // Even when explicitly asked for, since the expansion has no analogue.
+        assert!(!index.gemm_applies(1_000, Some(true)));
+        assert!(!index.gemm_applies(1_000, None));
+    }
+
+    /// Batch size at which the default heuristic flips to the GEMM path.
+    fn gemm_floor() -> usize {
+        rayon::current_num_threads().max(1) * GEMM_MIN_QUERIES_PER_THREAD
+    }
+
+    #[test]
+    fn test_gemm_dispatch_follows_batch_size() {
+        let mat = clustered_matrix(300, 16);
+        let index = ExhaustiveIndex::new(mat.as_ref(), Dist::SquaredEuclidean);
+
+        assert!(!index.gemm_applies(gemm_floor() - 1, None));
+        assert!(index.gemm_applies(gemm_floor(), None));
+        assert!(index.gemm_applies(1, Some(true)));
+        assert!(!index.gemm_applies(100_000, Some(false)));
+    }
+
+    #[test]
+    fn test_gemm_handles_k_larger_than_dataset() {
+        let mat = clustered_matrix(200, 8);
+        let index = ExhaustiveIndex::new(mat.as_ref(), Dist::SquaredEuclidean);
+        let (queries, nq, _) = mat.as_ref().into_row_major();
+
+        let gemm = index
+            .query_batch(&queries, nq, 500, Some(true), false)
+            .unwrap();
+        assert!(gemm.iter().all(|(ids, _)| ids.len() == 200));
+    }
+
+    #[test]
+    fn test_gemm_handles_ragged_final_block() {
+        // A batch that is not a multiple of the query tile still returns one
+        // result per query, in order.
+        let mat = clustered_matrix(257, 12);
+        let index = ExhaustiveIndex::new(mat.as_ref(), Dist::SquaredEuclidean);
+        let (queries, nq, _) = mat.as_ref().into_row_major();
+
+        let gemm = index
+            .query_batch(&queries, nq, 5, Some(true), false)
+            .unwrap();
+        assert_eq!(gemm.len(), 257);
+        for (i, (ids, _)) in gemm.iter().enumerate() {
+            assert_eq!(ids[0], i);
+        }
     }
 
     #[test]
