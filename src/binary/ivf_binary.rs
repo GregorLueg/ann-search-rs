@@ -2,7 +2,7 @@
 //! leverages Voronoi cells to reduce the search space.
 
 use bytemuck::Pod;
-use faer::{MatRef, RowRef};
+use faer::{RowRef};
 use faer_traits::ComplexField;
 use rayon::prelude::*;
 use std::collections::BinaryHeap;
@@ -150,7 +150,7 @@ where
     /// Constructed index
     #[allow(clippy::too_many_arguments)]
     pub fn build(
-        data: MatRef<T>,
+        data: impl AnnMatrix<T>,
         binarisation_init: &str,
         n_bits: usize,
         metric: Dist,
@@ -166,10 +166,7 @@ where
             return Err(AnnSearchErrors::DistanceNotSupported(metric));
         }
 
-        let n = data.nrows();
-        let dim = data.ncols();
-
-        let (vectors_flat, _, _) = matrix_to_flat(data);
+        let (vectors_flat, n, dim) = data.into_row_major();
 
         let nlist = nlist.unwrap_or((n as f32).sqrt() as usize).max(1);
 
@@ -243,8 +240,12 @@ where
         });
 
         let binariser = match init {
-            BinarisationInit::PcaHashing => Binariser::new_pca_hashing(data, dim, n_bits, seed)?,
-            BinarisationInit::RandomProjections => Binariser::new_simhash(data, dim, n_bits, seed)?,
+            BinarisationInit::PcaHashing => {
+                Binariser::new_pca_hashing(&vectors_flat, n, dim, n_bits, seed)?
+            }
+            BinarisationInit::RandomProjections => {
+                Binariser::new_simhash(&vectors_flat, n, dim, n_bits, seed)?
+            }
             BinarisationInit::SignBased => Binariser::new_sign_based(dim),
         };
 
@@ -254,7 +255,7 @@ where
         let residual_codes = matches!(init, BinarisationInit::SignBased);
 
         let vectors_flat_binarised = Self::encode_all(
-            data,
+            &vectors_flat,
             &binariser,
             residual_codes,
             &assignments,
@@ -319,7 +320,7 @@ where
     /// Constructed index with vector store
     #[allow(clippy::too_many_arguments)]
     pub fn build_with_vector_store(
-        data: MatRef<T>,
+        data: impl AnnMatrix<T>,
         binarisation_init: &str,
         n_bits: usize,
         metric: Dist,
@@ -336,10 +337,7 @@ where
             return Err(AnnSearchErrors::DistanceNotSupported(metric));
         }
 
-        let n = data.nrows();
-        let dim = data.ncols();
-
-        let (vectors_flat, _, _) = matrix_to_flat(data);
+        let (vectors_flat, n, dim) = data.into_row_major();
 
         let nlist = nlist.unwrap_or((n as f32).sqrt() as usize).max(1);
 
@@ -428,8 +426,12 @@ where
         });
 
         let binariser = match init {
-            BinarisationInit::PcaHashing => Binariser::new_pca_hashing(data, dim, n_bits, seed)?,
-            BinarisationInit::RandomProjections => Binariser::new_simhash(data, dim, n_bits, seed)?,
+            BinarisationInit::PcaHashing => {
+                Binariser::new_pca_hashing(&vectors_flat, n, dim, n_bits, seed)?
+            }
+            BinarisationInit::RandomProjections => {
+                Binariser::new_simhash(&vectors_flat, n, dim, n_bits, seed)?
+            }
             BinarisationInit::SignBased => Binariser::new_sign_based(dim),
         };
 
@@ -439,7 +441,7 @@ where
         let residual_codes = matches!(init, BinarisationInit::SignBased);
 
         let vectors_flat_binarised = Self::encode_all(
-            data,
+            &vectors_flat,
             &binariser,
             residual_codes,
             &assignments,
@@ -455,14 +457,9 @@ where
         // Save vector store
         std::fs::create_dir_all(&save_path)?;
 
-        let norms: Vec<T> = (0..n)
-            .map(|i| {
-                data.row(i)
-                    .iter()
-                    .map(|&x| x * x)
-                    .fold(T::zero(), |a, b| a + b)
-                    .sqrt()
-            })
+        let norms: Vec<T> = vectors_flat
+            .chunks_exact(dim)
+            .map(|row| row.iter().map(|&x| x * x).fold(T::zero(), |a, b| a + b).sqrt())
             .collect();
 
         let (vectors_path, norms_path) = MmapVectorStore::<T>::paths_in(&save_path);
@@ -508,7 +505,7 @@ where
     ///
     /// ### Params
     ///
-    /// * `data` - Data matrix (n × dim)
+    /// * `data` - Data, row-major, `n * dim`
     /// * `binariser` - Trained binariser
     /// * `residual_codes` - Whether to encode residuals against the centroids
     /// * `assignments` - Cell assignment per row, length `n`
@@ -525,7 +522,7 @@ where
     /// Flat code array of `n * n_bytes` bytes.
     #[allow(clippy::too_many_arguments)]
     fn encode_all(
-        data: MatRef<T>,
+        data: &[T],
         binariser: &Binariser<T>,
         residual_codes: bool,
         assignments: &[usize],
@@ -540,10 +537,8 @@ where
         let mut codes = vec![0u8; n * n_bytes];
 
         if !residual_codes {
-            for i in 0..n {
-                let row: Vec<T> = data.row(i).iter().cloned().collect();
-                codes[i * n_bytes..(i + 1) * n_bytes]
-                    .copy_from_slice(&binariser.encode(&row)?);
+            for (i, row) in data.chunks_exact(dim).enumerate() {
+                codes[i * n_bytes..(i + 1) * n_bytes].copy_from_slice(&binariser.encode(row)?);
             }
 
             return Ok(codes);
@@ -567,8 +562,8 @@ where
                     (T::one(), T::one())
                 };
 
-                let row: Vec<T> = data.row(i).iter().cloned().collect();
-                encode_sign_residual_into(&row, centroid, scale, dim, out);
+                let row = &data[i * dim..(i + 1) * dim];
+                encode_sign_residual_into(row, centroid, scale, dim, out);
             });
 
         Ok(codes)

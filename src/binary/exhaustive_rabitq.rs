@@ -2,7 +2,7 @@
 //! exhaustive searches against query vectors.
 
 use bytemuck::Pod;
-use faer::{MatRef, RowRef};
+use faer::{RowRef};
 use faer_traits::ComplexField;
 use num_traits::{Float, FromPrimitive};
 use rayon::prelude::*;
@@ -90,7 +90,7 @@ where
     ///
     /// Initialised index
     pub fn new(
-        data: MatRef<T>,
+        data: impl AnnMatrix<T>,
         metric: &Dist,
         n_clusters: Option<usize>,
         seed: usize,
@@ -99,8 +99,8 @@ where
             return Err(AnnSearchErrors::DistanceNotSupported(*metric));
         }
 
-        let n = data.nrows();
-        let quantiser = RaBitQQuantiser::new(data, metric, n_clusters, seed)?;
+        let (vectors_flat, n, dim) = data.into_row_major();
+        let quantiser = RaBitQQuantiser::new((&vectors_flat[..], n, dim), metric, n_clusters, seed)?;
         Ok(Self {
             quantiser,
             n,
@@ -123,7 +123,7 @@ where
     ///
     /// Initialised index
     pub fn new_with_vector_store(
-        data: MatRef<T>,
+        data: impl AnnMatrix<T>,
         metric: &Dist,
         n_clusters: Option<usize>,
         seed: usize,
@@ -133,15 +133,17 @@ where
             return Err(AnnSearchErrors::DistanceNotSupported(*metric));
         }
 
-        let n = data.nrows();
-        let dim = data.ncols();
-        let quantiser = RaBitQQuantiser::new(data, metric, n_clusters, seed)?;
+        // One walk of the caller's matrix. The quantiser normalises its own
+        // copy for cosine; the store needs the raw vectors for exact
+        // re-ranking, so `vectors_flat` must stay untouched here.
+        let (vectors_flat, n, dim) = data.into_row_major();
+        let quantiser = RaBitQQuantiser::new((&vectors_flat[..], n, dim), metric, n_clusters, seed)?;
 
         std::fs::create_dir_all(&save_path)?;
 
-        let (vectors_flat, _, _) = matrix_to_flat(data);
-        let norms: Vec<T> = (0..n)
-            .map(|i| compute_l2_norm(&vectors_flat[i * dim..(i + 1) * dim]))
+        let norms: Vec<T> = vectors_flat
+            .chunks_exact(dim)
+            .map(compute_l2_norm)
             .collect();
 
         let (vectors_path, norms_path) = MmapVectorStore::<T>::paths_in(&save_path);

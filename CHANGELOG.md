@@ -1,5 +1,21 @@
 # News
 
+## 0.6.0
+
+**Features**
+
+- More inputs accepted: flat arrays, ndarray with 2-dimensional structures.
+  First step for a full Python wrapping release of the package.
+
+**Breaking changes**
+
+- Code passing faer matrices to `build_*` / `query_*` is unaffected. Below that
+  line, the binariser and quantiser constructors take flat row-major slices
+  instead of a `MatRef`: `Binariser::new_simhash` and
+  `Binariser::new_pca_hashing` now take `(data, n, dim)`, and
+  `RaBitQQuantiser::new` and `TurboQuantQuantiser::new` take anything
+  implementing `AnnMatrix`.
+
 ## 0.5.2
 
 **Features**

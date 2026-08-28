@@ -16,7 +16,7 @@
 //! Sun, Simcha, Simcha, Chern & Guo, arXiv:2404.00774, 2024 (SOAR);
 //! Guo, Sun, Lindgren, Geng, Simcha, Chern & Kumar, ICML, 2020 (ScaNN)
 
-use faer::{MatRef, RowRef};
+use faer::{RowRef};
 use fixedbitset::FixedBitSet;
 use rayon::prelude::*;
 use std::cell::RefCell;
@@ -244,7 +244,7 @@ where
     /// them. The index still answers correctly, it just wastes half its codes.
     #[allow(clippy::too_many_arguments)]
     pub fn build(
-        data: MatRef<T>,
+        data: impl AnnMatrix<T>,
         nlist: Option<usize>,
         m: usize,
         metric: Dist,
@@ -258,7 +258,7 @@ where
             return Err(AnnSearchErrors::DistanceNotSupported(metric));
         }
 
-        let (mut vectors_flat, n, dim) = matrix_to_flat(data);
+        let (mut vectors_flat, n, dim) = data.into_row_major();
 
         let nlist = nlist.unwrap_or((n as f32).sqrt() as usize).max(1);
         let rule = resolve_soar_pq_rule(rule, &metric);

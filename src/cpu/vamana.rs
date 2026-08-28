@@ -2,7 +2,7 @@
 //! search that powers DiskANN. This version is the in-memory version of that
 //! algorithm for fast querying.
 
-use faer::{MatRef, RowRef};
+use faer::{RowRef};
 use rand::{rng, rngs::SmallRng, seq::SliceRandom, Rng, SeedableRng};
 use rayon::prelude::*;
 use std::cell::{RefCell, UnsafeCell};
@@ -444,7 +444,7 @@ where
     ///
     /// Initialised and built self
     pub fn build(
-        data: MatRef<T>,
+        data: impl AnnMatrix<T>,
         metric: Dist,
         r: usize,
         l_build: usize,
@@ -452,7 +452,7 @@ where
         alpha_pass2: f32,
         seed: usize,
     ) -> Self {
-        let (vectors_flat, n, dim) = matrix_to_flat(data);
+        let (vectors_flat, n, dim) = data.into_row_major();
 
         let medoid = compute_medoid(&vectors_flat, n, dim, metric);
 

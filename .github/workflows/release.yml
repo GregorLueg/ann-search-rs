@@ -14,5 +14,5 @@ jobs:
   release:
     uses: GregorLueg/personal-actions/.github/workflows/rust-release.yml@v1
     with:
-      publish-args: '--features binary,gpu,quantised,serialise'
+      publish-args: '--features binary,gpu,ndarray,quantised,serialise'
     secrets: inherit

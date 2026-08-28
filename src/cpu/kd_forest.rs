@@ -8,7 +8,7 @@
 //! boundary are placed into both children, allowing the query to find
 //! neighbours that a hard partition would miss.
 
-use faer::{MatRef, RowRef};
+use faer::{RowRef};
 use fixedbitset::FixedBitSet;
 use rand::{rngs::StdRng, Rng, SeedableRng};
 use rayon::prelude::*;
@@ -175,9 +175,9 @@ where
     /// ### Returns
     ///
     /// Constructed index ready for querying
-    pub fn new(data: MatRef<T>, n_trees: usize, metric: Dist, seed: usize) -> Self {
+    pub fn new(data: impl AnnMatrix<T>, n_trees: usize, metric: Dist, seed: usize) -> Self {
         let mut rng = StdRng::seed_from_u64(seed as u64);
-        let (vectors_flat, n, dim) = matrix_to_flat(data);
+        let (vectors_flat, n, dim) = data.into_row_major();
 
         // compute norms for Cosine distance
         let norms = if metric == Dist::Cosine {

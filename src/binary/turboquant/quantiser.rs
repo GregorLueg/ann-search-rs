@@ -5,7 +5,7 @@
 //! `Beta((d-1)/2, (d-1)/2)`. Codes are stored in bit-plane format: `bits`
 //! planes of `dim/8` bytes each per vector.
 
-use faer::{Mat, MatRef};
+use faer::Mat;
 use faer_traits::ComplexField;
 use num_traits::{Float, FromPrimitive, ToPrimitive};
 use rand::rngs::StdRng;
@@ -401,7 +401,7 @@ where
     ///
     /// ### Params
     ///
-    /// * `data` - Input matrix, `n × dim`
+    /// * `data` - Input data as samples x features, see [`AnnMatrix`]
     /// * `metric` - Distance metric
     /// * `bits` - Bits per coordinate (2, 3, or 4)
     /// * `seed` - Random seed forwarded to the encoder's rotation matrix
@@ -411,20 +411,12 @@ where
     /// The constructed quantiser, or an error if the encoder cannot be built
     /// or any row fails to encode.
     pub fn new(
-        data: MatRef<T>,
+        data: impl AnnMatrix<T>,
         metric: &Dist,
         bits: usize,
         seed: u64,
     ) -> Result<Self, AnnSearchErrors> {
-        let n = data.nrows();
-        let dim = data.ncols();
-
-        let mut data_flat = Vec::with_capacity(n * dim);
-        for i in 0..n {
-            for j in 0..dim {
-                data_flat.push(data[(i, j)]);
-            }
-        }
+        let (data_flat, n, dim) = data.into_row_major();
 
         let encoder = TurboQuantEncoder::new(dim, bits, *metric, seed)?;
         let bytes_per_vec = encoder.bytes_per_vec;

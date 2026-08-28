@@ -666,7 +666,7 @@ where
     ///
     /// Constructed index ready for querying
     pub fn new(
-        data: MatRef<T>,
+        data: impl AnnMatrix<T>,
         metric: Dist,
         num_tables: usize,
         bits_per_hash: usize,
@@ -682,14 +682,14 @@ where
                 max: MAX_BITS_PER_HASH,
             });
         }
-        if data.nrows() > u32::MAX as usize {
+        let (vectors_flat, n, dim) = data.into_row_major();
+
+        if n > u32::MAX as usize {
             return Err(AnnSearchErrors::LshTooManySamples {
-                n: data.nrows(),
+                n,
                 max: u32::MAX as usize,
             });
         }
-
-        let (vectors_flat, n, dim) = matrix_to_flat(data);
 
         let slot_bits = resolve_slot_bits(slot_bits, metric, bits_per_hash);
         let n_proj = bits_per_hash / slot_bits;

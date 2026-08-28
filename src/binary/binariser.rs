@@ -1,6 +1,6 @@
 //! Contains the binarisers
 
-use faer::{Mat, MatRef};
+use faer::Mat;
 use faer_traits::ComplexField;
 use num_traits::{Float, FromPrimitive, ToPrimitive};
 use rand::rngs::StdRng;
@@ -181,22 +181,23 @@ fn training_sample_indices(n: usize, seed: usize) -> Vec<usize> {
 ///
 /// ### Params
 ///
-/// * `data` - Training data matrix (n_samples x dim)
+/// * `data` - Training data, row-major, `n_samples * dim`
+/// * `dim` - Feature dimensionality
 /// * `sample_indices` - Rows to average over, must be non-empty
 ///
 /// ### Returns
 ///
 /// The mean of each feature, length `dim`.
-fn feature_mean<T>(data: MatRef<T>, sample_indices: &[usize]) -> Vec<T>
+fn feature_mean<T>(data: &[T], dim: usize, sample_indices: &[usize]) -> Vec<T>
 where
     T: Float + FromPrimitive + ToPrimitive + ComplexField,
 {
-    let dim = data.ncols();
     let mut mean = vec![T::zero(); dim];
 
     for &idx in sample_indices {
+        let row = &data[idx * dim..(idx + 1) * dim];
         for d in 0..dim {
-            mean[d] = mean[d] + data[(idx, d)];
+            mean[d] = mean[d] + row[d];
         }
     }
 
@@ -235,8 +236,10 @@ where
 ///
 /// ### Params
 ///
-/// * `data` - Training data matrix (n_samples x dim). Automatically
-///   downsampled if n_samples exceeds MAX_SAMPLES_PCA
+/// * `data` - Training data, row-major, `n * dim`. Automatically downsampled
+///   if `n` exceeds MAX_SAMPLES_PCA
+/// * `n` - Number of samples
+/// * `dim` - Feature dimensionality
 /// * `n_bits` - Number of bits in output
 /// * `seed` - Random seed for reproducibility (used for subsampling and
 ///   fallback random projections)
@@ -245,23 +248,28 @@ where
 ///
 /// Tuple of (projections, mean) where projections is flattened
 /// (n_bits x dim) and mean is the per-feature mean (length dim)
-fn prepare_pca_projections<T>(data: MatRef<T>, n_bits: usize, seed: usize) -> (Vec<T>, Vec<T>)
+fn prepare_pca_projections<T>(
+    data: &[T],
+    n: usize,
+    dim: usize,
+    n_bits: usize,
+    seed: usize,
+) -> (Vec<T>, Vec<T>)
 where
     T: Float + FromPrimitive + ToPrimitive + ComplexField,
 {
-    let n = data.nrows();
-    let dim = data.ncols();
     let effective_bits = n_bits.min(dim);
 
     let sample_indices = training_sample_indices(n, seed);
     let n_samples = sample_indices.len();
-    let mean = feature_mean(data, &sample_indices);
+    let mean = feature_mean(data, dim, &sample_indices);
 
     // centre data
     let mut centered = Mat::<T>::zeros(n_samples, dim);
     for (i, &idx) in sample_indices.iter().enumerate() {
+        let row = &data[idx * dim..(idx + 1) * dim];
         for d in 0..dim {
-            centered[(i, d)] = data[(idx, d)] - mean[d];
+            centered[(i, d)] = row[d] - mean[d];
         }
     }
 
@@ -446,9 +454,10 @@ where
     ///
     /// ### Params
     ///
-    /// * `data` - Training data matrix (n_samples x dim), used only to fit the
-    ///   centring mean. Automatically downsampled if n_samples exceeds
+    /// * `data` - Training data, row-major, `n * dim`, used only to fit the
+    ///   centring mean. Automatically downsampled if `n` exceeds
     ///   MAX_SAMPLES_PCA
+    /// * `n` - Number of samples
     /// * `dim` - Input vector dimensionality
     /// * `n_bits` - Number of bits in output (must be multiple of 8)
     /// * `seed` - Random seed for reproducibility
@@ -457,7 +466,8 @@ where
     ///
     /// Initialised binariser
     pub fn new_simhash(
-        data: MatRef<T>,
+        data: &[T],
+        n: usize,
         dim: usize,
         n_bits: usize,
         seed: usize,
@@ -467,7 +477,7 @@ where
         }
 
         let projections = prepare_simhash_projections(dim, n_bits, seed);
-        let mean = feature_mean(data, &training_sample_indices(data.nrows(), seed));
+        let mean = feature_mean(data, dim, &training_sample_indices(n, seed));
 
         Ok(Self {
             method: BinarisationMethod::SimHash { projections, mean },
@@ -484,7 +494,8 @@ where
     ///
     /// ### Params
     ///
-    /// * `data` - Training data matrix (n_samples x dim)
+    /// * `data` - Training data, row-major, `n * dim`
+    /// * `n` - Number of samples
     /// * `dim` - Input vector dimensionality
     /// * `n_bits` - Number of bits in output (must be multiple of 8)
     /// * `seed` - Random seed for reproducibility
@@ -493,7 +504,8 @@ where
     ///
     /// Initialised binariser with PCA projections
     pub fn new_pca_hashing(
-        data: MatRef<T>,
+        data: &[T],
+        n: usize,
         dim: usize,
         n_bits: usize,
         seed: usize,
@@ -502,7 +514,7 @@ where
             return Err(AnnSearchErrors::NBitsMustBe8Multiple { n_bits });
         }
 
-        let (projections, mean) = prepare_pca_projections(data, n_bits, seed);
+        let (projections, mean) = prepare_pca_projections(data, n, dim, n_bits, seed);
 
         Ok(Self {
             method: BinarisationMethod::PcaHashing { projections, mean },
@@ -659,7 +671,7 @@ mod tests {
         let n_bits = 256;
         let zero_mean = Mat::<f64>::zeros(8, dim);
         let binariser =
-            Binariser::<f64>::new_simhash(zero_mean.as_ref(), dim, n_bits, 42).unwrap();
+            Binariser::<f64>::new_simhash(&matrix_to_flat(zero_mean.as_ref()).0, zero_mean.nrows(), dim, n_bits, 42).unwrap();
 
         let vec1: Vec<f64> = (0..dim).map(|i| (i as f64) / (dim as f64)).collect();
         let binary = binariser.encode(&vec1).unwrap();
@@ -673,7 +685,7 @@ mod tests {
         let n_bits = 128;
         let zero_mean = Mat::<f64>::zeros(8, dim);
         let binariser =
-            Binariser::<f64>::new_simhash(zero_mean.as_ref(), dim, n_bits, 42).unwrap();
+            Binariser::<f64>::new_simhash(&matrix_to_flat(zero_mean.as_ref()).0, zero_mean.nrows(), dim, n_bits, 42).unwrap();
 
         let vec1: Vec<f64> = (0..dim).map(|i| i as f64).collect();
         let vec2: Vec<f64> = (0..dim).map(|i| i as f64 + 0.1).collect();
@@ -705,7 +717,7 @@ mod tests {
             }
         }
 
-        let binariser = Binariser::<f64>::new_pca_hashing(data.as_ref(), dim, n_bits, 42).unwrap();
+        let binariser = Binariser::<f64>::new_pca_hashing(&matrix_to_flat(data.as_ref()).0, data.nrows(), dim, n_bits, 42).unwrap();
 
         let vec1: Vec<f64> = (0..dim).map(|i| (i as f64).sin()).collect();
         let binary = binariser.encode(&vec1).unwrap();
@@ -726,7 +738,7 @@ mod tests {
             }
         }
 
-        let binariser = Binariser::<f64>::new_pca_hashing(data.as_ref(), dim, n_bits, 42).unwrap();
+        let binariser = Binariser::<f64>::new_pca_hashing(&matrix_to_flat(data.as_ref()).0, data.nrows(), dim, n_bits, 42).unwrap();
 
         if let BinarisationMethod::PcaHashing { projections, .. } = &binariser.method {
             for i in 0..n_bits.min(dim) {
@@ -776,7 +788,7 @@ mod tests {
             }
         }
 
-        let binariser = Binariser::<f64>::new_pca_hashing(data.as_ref(), dim, n_bits, 42).unwrap();
+        let binariser = Binariser::<f64>::new_pca_hashing(&matrix_to_flat(data.as_ref()).0, data.nrows(), dim, n_bits, 42).unwrap();
 
         if let BinarisationMethod::PcaHashing { mean, .. } = &binariser.method {
             for d in 0..dim {
@@ -844,9 +856,9 @@ mod tests {
 
         let zero_mean = Mat::<f64>::zeros(8, dim);
         let binariser1 =
-            Binariser::<f64>::new_simhash(zero_mean.as_ref(), dim, n_bits, 42).unwrap();
+            Binariser::<f64>::new_simhash(&matrix_to_flat(zero_mean.as_ref()).0, zero_mean.nrows(), dim, n_bits, 42).unwrap();
         let binariser2 =
-            Binariser::<f64>::new_simhash(zero_mean.as_ref(), dim, n_bits, 42).unwrap();
+            Binariser::<f64>::new_simhash(&matrix_to_flat(zero_mean.as_ref()).0, zero_mean.nrows(), dim, n_bits, 42).unwrap();
 
         let vec: Vec<f64> = (0..dim).map(|i| i as f64).collect();
         let bin1 = binariser1.encode(&vec).unwrap();
@@ -887,7 +899,7 @@ mod tests {
     #[test]
     fn test_invalid_n_bits_simhash() {
         let zero_mean = Mat::<f64>::zeros(8, 64);
-        let result = Binariser::<f64>::new_simhash(zero_mean.as_ref(), 64, 123, 42);
+        let result = Binariser::<f64>::new_simhash(&matrix_to_flat(zero_mean.as_ref()).0, zero_mean.nrows(), 64, 123, 42);
         assert!(matches!(
             result,
             Err(AnnSearchErrors::NBitsMustBe8Multiple { n_bits: 123 })
@@ -897,7 +909,7 @@ mod tests {
     #[test]
     fn test_invalid_n_bits_pca_hashing() {
         let data = Mat::<f64>::zeros(100, 64);
-        let result = Binariser::<f64>::new_pca_hashing(data.as_ref(), 64, 123, 42);
+        let result = Binariser::<f64>::new_pca_hashing(&matrix_to_flat(data.as_ref()).0, data.nrows(), 64, 123, 42);
         assert!(matches!(
             result,
             Err(AnnSearchErrors::NBitsMustBe8Multiple { n_bits: 123 })
@@ -908,7 +920,7 @@ mod tests {
     fn test_dimension_mismatch() {
         let zero_mean = Mat::<f64>::zeros(8, 64);
         let binariser =
-            Binariser::<f64>::new_simhash(zero_mean.as_ref(), 64, 128, 42).unwrap();
+            Binariser::<f64>::new_simhash(&matrix_to_flat(zero_mean.as_ref()).0, zero_mean.nrows(), 64, 128, 42).unwrap();
         let result = binariser.encode(&vec![0.0; 32]);
         assert!(matches!(
             result,
@@ -936,7 +948,7 @@ mod tests {
         let data = Mat::<f64>::from_fn(n, dim, |_, _| 50.0 + rng.random::<f64>() * 2.0 - 1.0);
 
         let binariser =
-            Binariser::<f64>::new_simhash(data.as_ref(), dim, n_bits, 42).unwrap();
+            Binariser::<f64>::new_simhash(&matrix_to_flat(data.as_ref()).0, data.nrows(), dim, n_bits, 42).unwrap();
 
         let codes: Vec<Vec<u8>> = (0..n)
             .map(|i| {
@@ -1022,8 +1034,8 @@ mod tests {
         let zero_mean = Mat::<f64>::zeros(8, dim);
 
         let simhash =
-            Binariser::<f64>::new_simhash(zero_mean.as_ref(), dim, 64, 42).unwrap();
-        let pca = Binariser::<f64>::new_pca_hashing(zero_mean.as_ref(), dim, 64, 42).unwrap();
+            Binariser::<f64>::new_simhash(&matrix_to_flat(zero_mean.as_ref()).0, zero_mean.nrows(), dim, 64, 42).unwrap();
+        let pca = Binariser::<f64>::new_pca_hashing(&matrix_to_flat(zero_mean.as_ref()).0, zero_mean.nrows(), dim, 64, 42).unwrap();
 
         let vec = vec![1.0; dim];
         let centroid = vec![0.5; dim];
@@ -1062,7 +1074,7 @@ mod tests {
 
         let zero_mean = Mat::<f64>::zeros(8, dim);
         let simhash =
-            Binariser::<f64>::new_simhash(zero_mean.as_ref(), dim, n_bits, 42).unwrap();
+            Binariser::<f64>::new_simhash(&matrix_to_flat(zero_mean.as_ref()).0, zero_mean.nrows(), dim, n_bits, 42).unwrap();
         let simhash_mem = simhash.memory_usage_bytes();
         assert!(simhash_mem > 0);
 

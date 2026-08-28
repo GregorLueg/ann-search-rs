@@ -8,7 +8,7 @@
 //! Graph-Based Approximate Nearest Neighbor Search.* ACM MM 2023.
 //! arXiv:2310.20419.
 
-use faer::{MatRef, RowRef};
+use faer::{RowRef};
 use rand::{rngs::SmallRng, Rng, SeedableRng};
 use rayon::prelude::*;
 use rdst::RadixSort;
@@ -472,14 +472,14 @@ where
     ///
     /// The built index on success.
     pub fn build(
-        data: MatRef<T>,
+        data: impl AnnMatrix<T>,
         metric: Dist,
         params: RnnDescentBuildParams,
         n_trees: Option<usize>,
         seed: usize,
         verbose: bool,
     ) -> Result<Self, AnnSearchErrors> {
-        let (vectors_flat, n, dim) = matrix_to_flat(data);
+        let (vectors_flat, n, dim) = data.into_row_major();
         let norms = if metric_needs_norms(metric) {
             precompute_norms(&vectors_flat, n, dim)
         } else {
@@ -492,7 +492,7 @@ where
         // Build the entry-point forest once, before the graph. Query time
         // multi-seeds the beam from `forest.query()` results.
         let start = Instant::now();
-        let forest = KdTreeIndex::new(data, n_trees, metric, seed);
+        let forest = KdTreeIndex::new((&vectors_flat[..], n, dim), n_trees, metric, seed);
         if verbose {
             println!(
                 "Built KdForest ({} trees): {:.2?}",

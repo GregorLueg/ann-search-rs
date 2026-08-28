@@ -2,7 +2,7 @@
 //! quantisation and uses Voronoi cells to identify the most interesting
 //! candidates.
 
-use faer::{MatRef, RowRef};
+use faer::{RowRef};
 use rayon::prelude::*;
 use std::collections::BinaryHeap;
 use std::sync::atomic::AtomicUsize;
@@ -150,7 +150,7 @@ where
     /// Index ready for querying
     #[allow(clippy::too_many_arguments)]
     pub fn build(
-        data: MatRef<T>,
+        data: impl AnnMatrix<T>,
         nlist: Option<usize>,
         m: usize,
         metric: Dist,
@@ -163,7 +163,7 @@ where
             return Err(AnnSearchErrors::DistanceNotSupported(metric));
         }
 
-        let (mut vectors_flat, n, dim) = matrix_to_flat(data);
+        let (mut vectors_flat, n, dim) = data.into_row_major();
 
         let nlist = nlist.unwrap_or((n as f32).sqrt() as usize).max(1);
 

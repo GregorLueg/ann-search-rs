@@ -11,7 +11,7 @@
 //! so candidates can be re-ranked with exact distances.
 
 use bytemuck::Pod;
-use faer::{MatRef, RowRef};
+use faer::RowRef;
 use num_traits::{Float, FromPrimitive, ToPrimitive};
 use rayon::prelude::*;
 use std::collections::BinaryHeap;
@@ -96,7 +96,7 @@ where
     ///
     /// Initialised index, or `DistanceNotSupported` for `Manhattan`.
     pub fn new(
-        data: MatRef<T>,
+        data: impl AnnMatrix<T>,
         metric: &Dist,
         bits: usize,
         seed: usize,
@@ -161,18 +161,17 @@ where
     ///
     /// Initialised index with reranking enabled.
     pub fn new_with_vector_store(
-        data: MatRef<T>,
+        data: impl AnnMatrix<T>,
         metric: &Dist,
         bits: usize,
         seed: usize,
         save_path: impl AsRef<Path>,
     ) -> Result<Self, AnnSearchErrors> {
-        let mut index = Self::new(data, metric, bits, seed)?;
+        // One walk of the caller's matrix, shared by the index and the store.
+        let (vectors_flat, n, dim) = data.into_row_major();
+        let mut index = Self::new((&vectors_flat[..], n, dim), metric, bits, seed)?;
 
-        let (vectors_flat, n, dim) = matrix_to_flat(data);
-        let norms: Vec<T> = (0..n)
-            .map(|i| compute_l2_norm(&vectors_flat[i * dim..(i + 1) * dim]))
-            .collect();
+        let norms: Vec<T> = vectors_flat.chunks_exact(dim).map(compute_l2_norm).collect();
 
         std::fs::create_dir_all(&save_path)?;
         let (vectors_path, norms_path) = MmapVectorStore::<T>::paths_in(&save_path);
@@ -411,23 +410,24 @@ where
     /// `(indices, optional distances)`, one row per query, nearest-first.
     pub fn query_batch(
         &self,
-        queries: MatRef<T>,
+        queries: impl AnnMatrix<T>,
         k: usize,
         rerank: bool,
         rerank_factor: Option<usize>,
         return_dist: bool,
         verbose: bool,
     ) -> KnnOptionResult<T> {
-        let nq = queries.nrows();
         let bits = self.quantiser.storage.bits;
         let dim = self.quantiser.storage.dim;
         let metric = self.quantiser.encoder.metric;
         let n = self.n;
 
-        if queries.ncols() != dim {
+        let (queries_flat, nq, query_dim) = queries.into_row_major();
+
+        if query_dim != dim {
             return Err(AnnSearchErrors::DimensionMismatch {
                 index_dim: dim,
-                query_dim: queries.ncols(),
+                query_dim,
             });
         }
 
@@ -468,11 +468,11 @@ where
             (0..nq)
                 .into_par_iter()
                 .map(|i| {
-                    let qvec: Vec<T> = queries.row(i).iter().cloned().collect();
+                    let qvec = &queries_flat[i * dim..(i + 1) * dim];
                     let out = if rerank {
-                        self.query_reranking(&qvec, k, rerank_factor)?
+                        self.query_reranking(qvec, k, rerank_factor)?
                     } else {
-                        self.query(&qvec, k)?
+                        self.query(qvec, k)?
                     };
                     report(&counter, 1);
                     Ok(out)
@@ -490,17 +490,14 @@ where
                 .map(|start| {
                     let batch_nq = (nq - start).min(4);
 
-                    // Materialise the batch's query rows (faer rows are not
-                    // contiguous in column-major storage, so copy them).
-                    let qrows: Vec<Vec<T>> = (0..batch_nq)
-                        .map(|qi| queries.row(start + qi).iter().cloned().collect())
-                        .collect();
-
                     // Encode each query and build its LUT.
                     let mut luts_owned: Vec<QueryLut> = Vec::with_capacity(batch_nq);
                     let mut qnorms = [0.0f32; 4];
                     for qi in 0..batch_nq {
-                        let eq = self.quantiser.encode_query(&qrows[qi])?;
+                        let q = start + qi;
+                        let eq = self
+                            .quantiser
+                            .encode_query(&queries_flat[q * dim..(q + 1) * dim])?;
                         let (q_rot_f32, levels_f32) =
                             prepare_scalar_scoring(&eq, &self.quantiser.encoder);
                         luts_owned.push(build_query_lut(&q_rot_f32, &levels_f32, bits, dim)?);
@@ -533,7 +530,13 @@ where
                         if let Some(vs) = vector_store {
                             let cands: Vec<usize> =
                                 approx[qi].0.iter().map(|&x| x as usize).collect();
-                            out.push(self.rerank_candidates(vs, &qrows[qi], &cands, k));
+                            let q = start + qi;
+                            out.push(self.rerank_candidates(
+                                vs,
+                                &queries_flat[q * dim..(q + 1) * dim],
+                                &cands,
+                                k,
+                            ));
                         } else {
                             let indices = approx[qi].0.iter().map(|&x| x as usize).collect();
                             let dists = approx[qi]

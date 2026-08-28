@@ -2,7 +2,7 @@
 //! bf16 (keeps the norms) and uses Voronoi cells to identify the most
 //! interesting candidates.
 
-use faer::{MatRef, RowRef};
+use faer::{RowRef};
 use half::*;
 use rayon::prelude::*;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -148,7 +148,7 @@ where
     ///
     /// Constructed index ready for querying
     pub fn build(
-        data: MatRef<T>,
+        data: impl AnnMatrix<T>,
         metric: Dist,
         nlist: Option<usize>,
         k_means_params: Option<KMeansTrainingParams>,
@@ -159,7 +159,7 @@ where
             return Err(AnnSearchErrors::DistanceNotSupported(metric));
         }
 
-        let (vectors_flat, n, dim) = matrix_to_flat(data);
+        let (vectors_flat, n, dim) = data.into_row_major();
 
         // Compute norms for Cosine distance
         let norms = if metric == Dist::Cosine {

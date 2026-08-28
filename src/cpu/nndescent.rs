@@ -2,7 +2,7 @@
 //! implementation, PyNNDescent and EFANNA. Leverages Annoy over Kd forest for
 //! graph initialisation (when not using Manhattan distance).
 
-use faer::{MatRef, RowRef};
+use faer::{RowRef};
 use fixedbitset::FixedBitSet;
 use rand::{rngs::SmallRng, Rng, SeedableRng};
 use rayon::prelude::*;
@@ -149,7 +149,7 @@ where
     ///
     /// The [Forest].
     fn new(
-        data: MatRef<T>,
+        data: impl AnnMatrix<T>,
         n_trees: usize,
         metric: Dist,
         seed: usize,
@@ -387,7 +387,7 @@ where
     /// * `verbose` - Print progress
     #[allow(clippy::too_many_arguments)]
     pub fn new(
-        data: MatRef<T>,
+        data: impl AnnMatrix<T>,
         metric: Dist,
         k: Option<usize>,
         max_candidates: Option<usize>,
@@ -398,7 +398,7 @@ where
         seed: usize,
         verbose: bool,
     ) -> Result<Self, AnnSearchErrors> {
-        let (vectors_flat, n, dim) = matrix_to_flat(data);
+        let (vectors_flat, n, dim) = data.into_row_major();
 
         let norms = if metric == Dist::Cosine {
             (0..n)
@@ -426,7 +426,9 @@ where
         let max_candidates = max_candidates.unwrap_or(k.min(60));
 
         let start = Instant::now();
-        let forest = Forest::new(data, n_trees, metric, seed)?;
+        // Feed the forest the buffer we already flattened. Handing it the
+        // caller's matrix again would walk the whole thing a second time.
+        let forest = Forest::new((&vectors_flat[..], n, dim), n_trees, metric, seed)?;
         if verbose {
             println!("Built forest: {:.2?}", start.elapsed());
         }

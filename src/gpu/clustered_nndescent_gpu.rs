@@ -15,7 +15,6 @@
 
 use cubecl::prelude::*;
 use cubecl_utils_rs::prelude::*;
-use faer::MatRef;
 use rayon::prelude::*;
 use std::time::Instant;
 use thousands::*;
@@ -366,7 +365,7 @@ fn merge_cluster_into_global<T>(
 /// Park, Becker & Nolet, NVIDIA Technical Blog, 2024
 #[allow(clippy::too_many_arguments)]
 pub fn build_clustered_knn_graph_gpu<T, R>(
-    data: MatRef<T>,
+    data: impl AnnMatrix<T>,
     metric: Dist,
     k: Option<usize>,
     build_k: Option<usize>,
@@ -393,7 +392,7 @@ where
     let build_k = build_k.unwrap_or((1.5 * k as f32) as usize).max(k);
     let n_assign = params.n_assign.max(1);
 
-    let (vectors_flat, n, dim) = matrix_to_flat(data);
+    let (vectors_flat, n, dim) = data.into_row_major();
     let dim_padded = dim.next_multiple_of(LINE_SIZE);
 
     let client = R::client(&device);
@@ -419,8 +418,10 @@ where
         if verbose {
             println!("Clustered kNN-Graph-GPU: dataset fits one batch, building directly.");
         }
+        // Hand over the buffer we already flattened. `FlattenData` converts by
+        // identity, so this costs nothing.
         return crate::gpu::nndescent_gpu::build_knn_graph_gpu::<T, R>(
-            data,
+            (vectors_flat, n, dim),
             metric,
             Some(k),
             Some(build_k),
