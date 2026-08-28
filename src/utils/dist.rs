@@ -19,6 +19,20 @@ use std::arch::aarch64::*;
 #[cfg(all(feature = "quantised", target_arch = "x86_64"))]
 use std::arch::x86_64::*;
 
+////////////////////
+// Tuning knobs //
+////////////////////
+
+/// Number of independent accumulator chains in the SIMD reduction loops.
+///
+/// A single accumulator makes every iteration wait on the previous add, so
+/// throughput is capped at one vector operation per FP-add latency regardless
+/// of vector width. That is roughly an eighth of what two AVX512 FMA ports can
+/// retire and about a twelfth of Apple's four FP pipes. Four independent chains
+/// recover most of the gap without spilling registers on any supported ISA;
+/// eight only pays on AVX512 and costs on the narrower paths.
+const SIMD_ACCUMULATORS: usize = 4;
+
 ////////////
 // Helper //
 ////////////
@@ -268,26 +282,51 @@ fn euclidean_f32_scalar(a: &[f32], b: &[f32]) -> f32 {
 #[inline(always)]
 fn euclidean_f32_sse(a: &[f32], b: &[f32]) -> f32 {
     let len = a.len();
-    let chunks = len / 4;
-    let mut acc = f32x4::ZERO;
+    let block = 4 * SIMD_ACCUMULATORS;
+
+    let mut acc0 = f32x4::ZERO;
+    let mut acc1 = f32x4::ZERO;
+    let mut acc2 = f32x4::ZERO;
+    let mut acc3 = f32x4::ZERO;
+
+    let mut offset = 0;
 
     unsafe {
         let a_ptr = a.as_ptr();
         let b_ptr = b.as_ptr();
 
-        for i in 0..chunks {
-            let offset = i * 4;
-            let va = f32x4::from(*(a_ptr.add(offset) as *const [f32; 4]));
-            let vb = f32x4::from(*(b_ptr.add(offset) as *const [f32; 4]));
-            let diff = va - vb;
-            acc += diff * diff;
+        // Four independent chains, so the loop is bound by FP throughput
+        // rather than by the latency of one accumulator.
+        while offset + block <= len {
+            let d0 = f32x4::from(*(a_ptr.add(offset) as *const [f32; 4]))
+                - f32x4::from(*(b_ptr.add(offset) as *const [f32; 4]));
+            let d1 = f32x4::from(*(a_ptr.add(offset + 4) as *const [f32; 4]))
+                - f32x4::from(*(b_ptr.add(offset + 4) as *const [f32; 4]));
+            let d2 = f32x4::from(*(a_ptr.add(offset + 8) as *const [f32; 4]))
+                - f32x4::from(*(b_ptr.add(offset + 8) as *const [f32; 4]));
+            let d3 = f32x4::from(*(a_ptr.add(offset + 12) as *const [f32; 4]))
+                - f32x4::from(*(b_ptr.add(offset + 12) as *const [f32; 4]));
+
+            acc0 += d0 * d0;
+            acc1 += d1 * d1;
+            acc2 += d2 * d2;
+            acc3 += d3 * d3;
+            offset += block;
+        }
+
+        // Whole vectors that did not fill a block.
+        while offset + 4 <= len {
+            let d = f32x4::from(*(a_ptr.add(offset) as *const [f32; 4]))
+                - f32x4::from(*(b_ptr.add(offset) as *const [f32; 4]));
+            acc0 += d * d;
+            offset += 4;
         }
     }
 
-    let mut sum = acc.reduce_add();
-    for i in (chunks * 4)..len {
-        let diff = a[i] - b[i];
-        sum += diff * diff;
+    let mut sum = ((acc0 + acc1) + (acc2 + acc3)).reduce_add();
+    for i in offset..len {
+        let d = a[i] - b[i];
+        sum += d * d;
     }
     sum
 }
@@ -305,26 +344,51 @@ fn euclidean_f32_sse(a: &[f32], b: &[f32]) -> f32 {
 #[inline(always)]
 fn euclidean_f32_avx2(a: &[f32], b: &[f32]) -> f32 {
     let len = a.len();
-    let chunks = len / 8;
-    let mut acc = f32x8::ZERO;
+    let block = 8 * SIMD_ACCUMULATORS;
+
+    let mut acc0 = f32x8::ZERO;
+    let mut acc1 = f32x8::ZERO;
+    let mut acc2 = f32x8::ZERO;
+    let mut acc3 = f32x8::ZERO;
+
+    let mut offset = 0;
 
     unsafe {
         let a_ptr = a.as_ptr();
         let b_ptr = b.as_ptr();
 
-        for i in 0..chunks {
-            let offset = i * 8;
-            let va = f32x8::from(*(a_ptr.add(offset) as *const [f32; 8]));
-            let vb = f32x8::from(*(b_ptr.add(offset) as *const [f32; 8]));
-            let diff = va - vb;
-            acc += diff * diff;
+        // Four independent chains, so the loop is bound by FP throughput
+        // rather than by the latency of one accumulator.
+        while offset + block <= len {
+            let d0 = f32x8::from(*(a_ptr.add(offset) as *const [f32; 8]))
+                - f32x8::from(*(b_ptr.add(offset) as *const [f32; 8]));
+            let d1 = f32x8::from(*(a_ptr.add(offset + 8) as *const [f32; 8]))
+                - f32x8::from(*(b_ptr.add(offset + 8) as *const [f32; 8]));
+            let d2 = f32x8::from(*(a_ptr.add(offset + 16) as *const [f32; 8]))
+                - f32x8::from(*(b_ptr.add(offset + 16) as *const [f32; 8]));
+            let d3 = f32x8::from(*(a_ptr.add(offset + 24) as *const [f32; 8]))
+                - f32x8::from(*(b_ptr.add(offset + 24) as *const [f32; 8]));
+
+            acc0 += d0 * d0;
+            acc1 += d1 * d1;
+            acc2 += d2 * d2;
+            acc3 += d3 * d3;
+            offset += block;
+        }
+
+        // Whole vectors that did not fill a block.
+        while offset + 8 <= len {
+            let d = f32x8::from(*(a_ptr.add(offset) as *const [f32; 8]))
+                - f32x8::from(*(b_ptr.add(offset) as *const [f32; 8]));
+            acc0 += d * d;
+            offset += 8;
         }
     }
 
-    let mut sum = acc.reduce_add();
-    for i in (chunks * 8)..len {
-        let diff = a[i] - b[i];
-        sum += diff * diff;
+    let mut sum = ((acc0 + acc1) + (acc2 + acc3)).reduce_add();
+    for i in offset..len {
+        let d = a[i] - b[i];
+        sum += d * d;
     }
     sum
 }
@@ -345,24 +409,58 @@ fn euclidean_f32_avx512(a: &[f32], b: &[f32]) -> f32 {
     use std::arch::x86_64::*;
 
     let len = a.len();
-    let chunks = len / 16;
+    let block = 16 * SIMD_ACCUMULATORS;
+    let mut offset = 0;
 
     unsafe {
-        let mut acc = _mm512_setzero_ps();
+        let mut acc0 = _mm512_setzero_ps();
+        let mut acc1 = _mm512_setzero_ps();
+        let mut acc2 = _mm512_setzero_ps();
+        let mut acc3 = _mm512_setzero_ps();
 
-        for i in 0..chunks {
-            let va = _mm512_loadu_ps(a.as_ptr().add(i * 16));
-            let vb = _mm512_loadu_ps(b.as_ptr().add(i * 16));
-            let diff = _mm512_sub_ps(va, vb);
-            acc = _mm512_fmadd_ps(diff, diff, acc);
+        // Four independent chains: an FMA has four-cycle latency against two
+        // issue ports, so one accumulator would use an eighth of the unit.
+        while offset + block <= len {
+            let d0 = _mm512_sub_ps(
+                _mm512_loadu_ps(a.as_ptr().add(offset)),
+                _mm512_loadu_ps(b.as_ptr().add(offset)),
+            );
+            let d1 = _mm512_sub_ps(
+                _mm512_loadu_ps(a.as_ptr().add(offset + 16)),
+                _mm512_loadu_ps(b.as_ptr().add(offset + 16)),
+            );
+            let d2 = _mm512_sub_ps(
+                _mm512_loadu_ps(a.as_ptr().add(offset + 32)),
+                _mm512_loadu_ps(b.as_ptr().add(offset + 32)),
+            );
+            let d3 = _mm512_sub_ps(
+                _mm512_loadu_ps(a.as_ptr().add(offset + 48)),
+                _mm512_loadu_ps(b.as_ptr().add(offset + 48)),
+            );
+
+            acc0 = _mm512_fmadd_ps(d0, d0, acc0);
+            acc1 = _mm512_fmadd_ps(d1, d1, acc1);
+            acc2 = _mm512_fmadd_ps(d2, d2, acc2);
+            acc3 = _mm512_fmadd_ps(d3, d3, acc3);
+            offset += block;
         }
 
+        // Whole vectors that did not fill a block.
+        while offset + 16 <= len {
+            let d = _mm512_sub_ps(
+                _mm512_loadu_ps(a.as_ptr().add(offset)),
+                _mm512_loadu_ps(b.as_ptr().add(offset)),
+            );
+            acc0 = _mm512_fmadd_ps(d, d, acc0);
+            offset += 16;
+        }
+
+        let acc = _mm512_add_ps(_mm512_add_ps(acc0, acc1), _mm512_add_ps(acc2, acc3));
         let mut sum = _mm512_reduce_add_ps(acc);
 
-        // Remainder
-        for i in (chunks * 16)..len {
-            let diff = a[i] - b[i];
-            sum += diff * diff;
+        for i in offset..len {
+            let d = a[i] - b[i];
+            sum += d * d;
         }
         sum
     }
@@ -413,27 +511,51 @@ fn euclidean_f64_scalar(a: &[f64], b: &[f64]) -> f64 {
 #[inline(always)]
 fn euclidean_f64_sse(a: &[f64], b: &[f64]) -> f64 {
     let len = a.len();
-    let chunks = len / 2;
-    let mut acc = f64x2::ZERO;
+    let block = 2 * SIMD_ACCUMULATORS;
 
-    // to avoid trait bound blabla -> unsafe
+    let mut acc0 = f64x2::ZERO;
+    let mut acc1 = f64x2::ZERO;
+    let mut acc2 = f64x2::ZERO;
+    let mut acc3 = f64x2::ZERO;
+
+    let mut offset = 0;
+
     unsafe {
         let a_ptr = a.as_ptr();
         let b_ptr = b.as_ptr();
 
-        for i in 0..chunks {
-            let offset = i * 2;
-            let va = f64x2::from(*(a_ptr.add(offset) as *const [f64; 2]));
-            let vb = f64x2::from(*(b_ptr.add(offset) as *const [f64; 2]));
-            let diff = va - vb;
-            acc += diff * diff;
+        // Four independent chains, so the loop is bound by FP throughput
+        // rather than by the latency of one accumulator.
+        while offset + block <= len {
+            let d0 = f64x2::from(*(a_ptr.add(offset) as *const [f64; 2]))
+                - f64x2::from(*(b_ptr.add(offset) as *const [f64; 2]));
+            let d1 = f64x2::from(*(a_ptr.add(offset + 2) as *const [f64; 2]))
+                - f64x2::from(*(b_ptr.add(offset + 2) as *const [f64; 2]));
+            let d2 = f64x2::from(*(a_ptr.add(offset + 4) as *const [f64; 2]))
+                - f64x2::from(*(b_ptr.add(offset + 4) as *const [f64; 2]));
+            let d3 = f64x2::from(*(a_ptr.add(offset + 6) as *const [f64; 2]))
+                - f64x2::from(*(b_ptr.add(offset + 6) as *const [f64; 2]));
+
+            acc0 += d0 * d0;
+            acc1 += d1 * d1;
+            acc2 += d2 * d2;
+            acc3 += d3 * d3;
+            offset += block;
+        }
+
+        // Whole vectors that did not fill a block.
+        while offset + 2 <= len {
+            let d = f64x2::from(*(a_ptr.add(offset) as *const [f64; 2]))
+                - f64x2::from(*(b_ptr.add(offset) as *const [f64; 2]));
+            acc0 += d * d;
+            offset += 2;
         }
     }
 
-    let mut sum = acc.reduce_add();
-    if len % 2 == 1 {
-        let diff = a[len - 1] - b[len - 1];
-        sum += diff * diff;
+    let mut sum = ((acc0 + acc1) + (acc2 + acc3)).reduce_add();
+    for i in offset..len {
+        let d = a[i] - b[i];
+        sum += d * d;
     }
     sum
 }
@@ -451,26 +573,51 @@ fn euclidean_f64_sse(a: &[f64], b: &[f64]) -> f64 {
 #[inline(always)]
 fn euclidean_f64_avx2(a: &[f64], b: &[f64]) -> f64 {
     let len = a.len();
-    let chunks = len / 4;
-    let mut acc = f64x4::ZERO;
+    let block = 4 * SIMD_ACCUMULATORS;
+
+    let mut acc0 = f64x4::ZERO;
+    let mut acc1 = f64x4::ZERO;
+    let mut acc2 = f64x4::ZERO;
+    let mut acc3 = f64x4::ZERO;
+
+    let mut offset = 0;
 
     unsafe {
         let a_ptr = a.as_ptr();
         let b_ptr = b.as_ptr();
 
-        for i in 0..chunks {
-            let offset = i * 4;
-            let va = f64x4::from(*(a_ptr.add(offset) as *const [f64; 4]));
-            let vb = f64x4::from(*(b_ptr.add(offset) as *const [f64; 4]));
-            let diff = va - vb;
-            acc += diff * diff;
+        // Four independent chains, so the loop is bound by FP throughput
+        // rather than by the latency of one accumulator.
+        while offset + block <= len {
+            let d0 = f64x4::from(*(a_ptr.add(offset) as *const [f64; 4]))
+                - f64x4::from(*(b_ptr.add(offset) as *const [f64; 4]));
+            let d1 = f64x4::from(*(a_ptr.add(offset + 4) as *const [f64; 4]))
+                - f64x4::from(*(b_ptr.add(offset + 4) as *const [f64; 4]));
+            let d2 = f64x4::from(*(a_ptr.add(offset + 8) as *const [f64; 4]))
+                - f64x4::from(*(b_ptr.add(offset + 8) as *const [f64; 4]));
+            let d3 = f64x4::from(*(a_ptr.add(offset + 12) as *const [f64; 4]))
+                - f64x4::from(*(b_ptr.add(offset + 12) as *const [f64; 4]));
+
+            acc0 += d0 * d0;
+            acc1 += d1 * d1;
+            acc2 += d2 * d2;
+            acc3 += d3 * d3;
+            offset += block;
+        }
+
+        // Whole vectors that did not fill a block.
+        while offset + 4 <= len {
+            let d = f64x4::from(*(a_ptr.add(offset) as *const [f64; 4]))
+                - f64x4::from(*(b_ptr.add(offset) as *const [f64; 4]));
+            acc0 += d * d;
+            offset += 4;
         }
     }
 
-    let mut sum = acc.reduce_add();
-    for i in (chunks * 4)..len {
-        let diff = a[i] - b[i];
-        sum += diff * diff;
+    let mut sum = ((acc0 + acc1) + (acc2 + acc3)).reduce_add();
+    for i in offset..len {
+        let d = a[i] - b[i];
+        sum += d * d;
     }
     sum
 }
@@ -491,23 +638,58 @@ fn euclidean_f64_avx512(a: &[f64], b: &[f64]) -> f64 {
     use std::arch::x86_64::*;
 
     let len = a.len();
-    let chunks = len / 8;
+    let block = 8 * SIMD_ACCUMULATORS;
+    let mut offset = 0;
 
     unsafe {
-        let mut acc = _mm512_setzero_pd();
+        let mut acc0 = _mm512_setzero_pd();
+        let mut acc1 = _mm512_setzero_pd();
+        let mut acc2 = _mm512_setzero_pd();
+        let mut acc3 = _mm512_setzero_pd();
 
-        for i in 0..chunks {
-            let va = _mm512_loadu_pd(a.as_ptr().add(i * 8));
-            let vb = _mm512_loadu_pd(b.as_ptr().add(i * 8));
-            let diff = _mm512_sub_pd(va, vb);
-            acc = _mm512_fmadd_pd(diff, diff, acc);
+        // Four independent chains: an FMA has four-cycle latency against two
+        // issue ports, so one accumulator would use an eighth of the unit.
+        while offset + block <= len {
+            let d0 = _mm512_sub_pd(
+                _mm512_loadu_pd(a.as_ptr().add(offset)),
+                _mm512_loadu_pd(b.as_ptr().add(offset)),
+            );
+            let d1 = _mm512_sub_pd(
+                _mm512_loadu_pd(a.as_ptr().add(offset + 8)),
+                _mm512_loadu_pd(b.as_ptr().add(offset + 8)),
+            );
+            let d2 = _mm512_sub_pd(
+                _mm512_loadu_pd(a.as_ptr().add(offset + 16)),
+                _mm512_loadu_pd(b.as_ptr().add(offset + 16)),
+            );
+            let d3 = _mm512_sub_pd(
+                _mm512_loadu_pd(a.as_ptr().add(offset + 24)),
+                _mm512_loadu_pd(b.as_ptr().add(offset + 24)),
+            );
+
+            acc0 = _mm512_fmadd_pd(d0, d0, acc0);
+            acc1 = _mm512_fmadd_pd(d1, d1, acc1);
+            acc2 = _mm512_fmadd_pd(d2, d2, acc2);
+            acc3 = _mm512_fmadd_pd(d3, d3, acc3);
+            offset += block;
         }
 
+        // Whole vectors that did not fill a block.
+        while offset + 8 <= len {
+            let d = _mm512_sub_pd(
+                _mm512_loadu_pd(a.as_ptr().add(offset)),
+                _mm512_loadu_pd(b.as_ptr().add(offset)),
+            );
+            acc0 = _mm512_fmadd_pd(d, d, acc0);
+            offset += 8;
+        }
+
+        let acc = _mm512_add_pd(_mm512_add_pd(acc0, acc1), _mm512_add_pd(acc2, acc3));
         let mut sum = _mm512_reduce_add_pd(acc);
 
-        for i in (chunks * 8)..len {
-            let diff = a[i] - b[i];
-            sum += diff * diff;
+        for i in offset..len {
+            let d = a[i] - b[i];
+            sum += d * d;
         }
         sum
     }
@@ -551,23 +733,48 @@ fn dot_f32_scalar(a: &[f32], b: &[f32]) -> f32 {
 #[inline(always)]
 fn dot_f32_sse(a: &[f32], b: &[f32]) -> f32 {
     let len = a.len();
-    let chunks = len / 4;
-    let mut acc = f32x4::ZERO;
+    let block = 4 * SIMD_ACCUMULATORS;
+
+    let mut acc0 = f32x4::ZERO;
+    let mut acc1 = f32x4::ZERO;
+    let mut acc2 = f32x4::ZERO;
+    let mut acc3 = f32x4::ZERO;
+
+    let mut offset = 0;
 
     unsafe {
         let a_ptr = a.as_ptr();
         let b_ptr = b.as_ptr();
 
-        for i in 0..chunks {
-            let offset = i * 4;
-            let va = f32x4::from(*(a_ptr.add(offset) as *const [f32; 4]));
-            let vb = f32x4::from(*(b_ptr.add(offset) as *const [f32; 4]));
-            acc += va * vb;
+        // Four independent chains, so the loop is bound by FP throughput
+        // rather than by the latency of one accumulator.
+        while offset + block <= len {
+            let a0 = f32x4::from(*(a_ptr.add(offset) as *const [f32; 4]));
+            let b0 = f32x4::from(*(b_ptr.add(offset) as *const [f32; 4]));
+            let a1 = f32x4::from(*(a_ptr.add(offset + 4) as *const [f32; 4]));
+            let b1 = f32x4::from(*(b_ptr.add(offset + 4) as *const [f32; 4]));
+            let a2 = f32x4::from(*(a_ptr.add(offset + 8) as *const [f32; 4]));
+            let b2 = f32x4::from(*(b_ptr.add(offset + 8) as *const [f32; 4]));
+            let a3 = f32x4::from(*(a_ptr.add(offset + 12) as *const [f32; 4]));
+            let b3 = f32x4::from(*(b_ptr.add(offset + 12) as *const [f32; 4]));
+
+            acc0 += a0 * b0;
+            acc1 += a1 * b1;
+            acc2 += a2 * b2;
+            acc3 += a3 * b3;
+            offset += block;
+        }
+
+        // Whole vectors that did not fill a block.
+        while offset + 4 <= len {
+            acc0 += f32x4::from(*(a_ptr.add(offset) as *const [f32; 4]))
+                * f32x4::from(*(b_ptr.add(offset) as *const [f32; 4]));
+            offset += 4;
         }
     }
 
-    let mut sum = acc.reduce_add();
-    for i in (chunks * 4)..len {
+    let mut sum = ((acc0 + acc1) + (acc2 + acc3)).reduce_add();
+    for i in offset..len {
         sum += a[i] * b[i];
     }
     sum
@@ -586,23 +793,48 @@ fn dot_f32_sse(a: &[f32], b: &[f32]) -> f32 {
 #[inline(always)]
 fn dot_f32_avx2(a: &[f32], b: &[f32]) -> f32 {
     let len = a.len();
-    let chunks = len / 8;
-    let mut acc = f32x8::ZERO;
+    let block = 8 * SIMD_ACCUMULATORS;
+
+    let mut acc0 = f32x8::ZERO;
+    let mut acc1 = f32x8::ZERO;
+    let mut acc2 = f32x8::ZERO;
+    let mut acc3 = f32x8::ZERO;
+
+    let mut offset = 0;
 
     unsafe {
         let a_ptr = a.as_ptr();
         let b_ptr = b.as_ptr();
 
-        for i in 0..chunks {
-            let offset = i * 8;
-            let va = f32x8::from(*(a_ptr.add(offset) as *const [f32; 8]));
-            let vb = f32x8::from(*(b_ptr.add(offset) as *const [f32; 8]));
-            acc += va * vb;
+        // Four independent chains, so the loop is bound by FP throughput
+        // rather than by the latency of one accumulator.
+        while offset + block <= len {
+            let a0 = f32x8::from(*(a_ptr.add(offset) as *const [f32; 8]));
+            let b0 = f32x8::from(*(b_ptr.add(offset) as *const [f32; 8]));
+            let a1 = f32x8::from(*(a_ptr.add(offset + 8) as *const [f32; 8]));
+            let b1 = f32x8::from(*(b_ptr.add(offset + 8) as *const [f32; 8]));
+            let a2 = f32x8::from(*(a_ptr.add(offset + 16) as *const [f32; 8]));
+            let b2 = f32x8::from(*(b_ptr.add(offset + 16) as *const [f32; 8]));
+            let a3 = f32x8::from(*(a_ptr.add(offset + 24) as *const [f32; 8]));
+            let b3 = f32x8::from(*(b_ptr.add(offset + 24) as *const [f32; 8]));
+
+            acc0 += a0 * b0;
+            acc1 += a1 * b1;
+            acc2 += a2 * b2;
+            acc3 += a3 * b3;
+            offset += block;
+        }
+
+        // Whole vectors that did not fill a block.
+        while offset + 8 <= len {
+            acc0 += f32x8::from(*(a_ptr.add(offset) as *const [f32; 8]))
+                * f32x8::from(*(b_ptr.add(offset) as *const [f32; 8]));
+            offset += 8;
         }
     }
 
-    let mut sum = acc.reduce_add();
-    for i in (chunks * 8)..len {
+    let mut sum = ((acc0 + acc1) + (acc2 + acc3)).reduce_add();
+    for i in offset..len {
         sum += a[i] * b[i];
     }
     sum
@@ -624,19 +856,48 @@ fn dot_f32_avx512(a: &[f32], b: &[f32]) -> f32 {
     use std::arch::x86_64::*;
 
     let len = a.len();
-    let chunks = len / 16;
+    let block = 16 * SIMD_ACCUMULATORS;
+    let mut offset = 0;
 
     unsafe {
-        let mut acc = _mm512_setzero_ps();
+        let mut acc0 = _mm512_setzero_ps();
+        let mut acc1 = _mm512_setzero_ps();
+        let mut acc2 = _mm512_setzero_ps();
+        let mut acc3 = _mm512_setzero_ps();
 
-        for i in 0..chunks {
-            let va = _mm512_loadu_ps(a.as_ptr().add(i * 16));
-            let vb = _mm512_loadu_ps(b.as_ptr().add(i * 16));
-            acc = _mm512_fmadd_ps(va, vb, acc);
+        // Four independent chains: an FMA has four-cycle latency against two
+        // issue ports, so one accumulator would use an eighth of the unit.
+        while offset + block <= len {
+            let a0 = _mm512_loadu_ps(a.as_ptr().add(offset));
+            let b0 = _mm512_loadu_ps(b.as_ptr().add(offset));
+            let a1 = _mm512_loadu_ps(a.as_ptr().add(offset + 16));
+            let b1 = _mm512_loadu_ps(b.as_ptr().add(offset + 16));
+            let a2 = _mm512_loadu_ps(a.as_ptr().add(offset + 32));
+            let b2 = _mm512_loadu_ps(b.as_ptr().add(offset + 32));
+            let a3 = _mm512_loadu_ps(a.as_ptr().add(offset + 48));
+            let b3 = _mm512_loadu_ps(b.as_ptr().add(offset + 48));
+
+            acc0 = _mm512_fmadd_ps(a0, b0, acc0);
+            acc1 = _mm512_fmadd_ps(a1, b1, acc1);
+            acc2 = _mm512_fmadd_ps(a2, b2, acc2);
+            acc3 = _mm512_fmadd_ps(a3, b3, acc3);
+            offset += block;
         }
 
+        // Whole vectors that did not fill a block.
+        while offset + 16 <= len {
+            acc0 = _mm512_fmadd_ps(
+                _mm512_loadu_ps(a.as_ptr().add(offset)),
+                _mm512_loadu_ps(b.as_ptr().add(offset)),
+                acc0,
+            );
+            offset += 16;
+        }
+
+        let acc = _mm512_add_ps(_mm512_add_ps(acc0, acc1), _mm512_add_ps(acc2, acc3));
         let mut sum = _mm512_reduce_add_ps(acc);
-        for i in (chunks * 16)..len {
+
+        for i in offset..len {
             sum += a[i] * b[i];
         }
         sum
@@ -681,25 +942,49 @@ fn dot_f64_scalar(a: &[f64], b: &[f64]) -> f64 {
 #[inline(always)]
 fn dot_f64_sse(a: &[f64], b: &[f64]) -> f64 {
     let len = a.len();
-    let chunks = len / 2;
-    let mut acc = f64x2::ZERO;
+    let block = 2 * SIMD_ACCUMULATORS;
 
-    // unsafe again to avoid trait errors
+    let mut acc0 = f64x2::ZERO;
+    let mut acc1 = f64x2::ZERO;
+    let mut acc2 = f64x2::ZERO;
+    let mut acc3 = f64x2::ZERO;
+
+    let mut offset = 0;
+
     unsafe {
         let a_ptr = a.as_ptr();
         let b_ptr = b.as_ptr();
 
-        for i in 0..chunks {
-            let offset = i * 2;
-            let va = f64x2::from(*(a_ptr.add(offset) as *const [f64; 2]));
-            let vb = f64x2::from(*(b_ptr.add(offset) as *const [f64; 2]));
-            acc += va * vb;
+        // Four independent chains, so the loop is bound by FP throughput
+        // rather than by the latency of one accumulator.
+        while offset + block <= len {
+            let a0 = f64x2::from(*(a_ptr.add(offset) as *const [f64; 2]));
+            let b0 = f64x2::from(*(b_ptr.add(offset) as *const [f64; 2]));
+            let a1 = f64x2::from(*(a_ptr.add(offset + 2) as *const [f64; 2]));
+            let b1 = f64x2::from(*(b_ptr.add(offset + 2) as *const [f64; 2]));
+            let a2 = f64x2::from(*(a_ptr.add(offset + 4) as *const [f64; 2]));
+            let b2 = f64x2::from(*(b_ptr.add(offset + 4) as *const [f64; 2]));
+            let a3 = f64x2::from(*(a_ptr.add(offset + 6) as *const [f64; 2]));
+            let b3 = f64x2::from(*(b_ptr.add(offset + 6) as *const [f64; 2]));
+
+            acc0 += a0 * b0;
+            acc1 += a1 * b1;
+            acc2 += a2 * b2;
+            acc3 += a3 * b3;
+            offset += block;
+        }
+
+        // Whole vectors that did not fill a block.
+        while offset + 2 <= len {
+            acc0 += f64x2::from(*(a_ptr.add(offset) as *const [f64; 2]))
+                * f64x2::from(*(b_ptr.add(offset) as *const [f64; 2]));
+            offset += 2;
         }
     }
 
-    let mut sum = acc.reduce_add();
-    if len % 2 == 1 {
-        sum += a[len - 1] * b[len - 1];
+    let mut sum = ((acc0 + acc1) + (acc2 + acc3)).reduce_add();
+    for i in offset..len {
+        sum += a[i] * b[i];
     }
     sum
 }
@@ -717,23 +1002,48 @@ fn dot_f64_sse(a: &[f64], b: &[f64]) -> f64 {
 #[inline(always)]
 fn dot_f64_avx2(a: &[f64], b: &[f64]) -> f64 {
     let len = a.len();
-    let chunks = len / 4;
-    let mut acc = f64x4::ZERO;
+    let block = 4 * SIMD_ACCUMULATORS;
+
+    let mut acc0 = f64x4::ZERO;
+    let mut acc1 = f64x4::ZERO;
+    let mut acc2 = f64x4::ZERO;
+    let mut acc3 = f64x4::ZERO;
+
+    let mut offset = 0;
 
     unsafe {
         let a_ptr = a.as_ptr();
         let b_ptr = b.as_ptr();
 
-        for i in 0..chunks {
-            let offset = i * 4;
-            let va = f64x4::from(*(a_ptr.add(offset) as *const [f64; 4]));
-            let vb = f64x4::from(*(b_ptr.add(offset) as *const [f64; 4]));
-            acc += va * vb;
+        // Four independent chains, so the loop is bound by FP throughput
+        // rather than by the latency of one accumulator.
+        while offset + block <= len {
+            let a0 = f64x4::from(*(a_ptr.add(offset) as *const [f64; 4]));
+            let b0 = f64x4::from(*(b_ptr.add(offset) as *const [f64; 4]));
+            let a1 = f64x4::from(*(a_ptr.add(offset + 4) as *const [f64; 4]));
+            let b1 = f64x4::from(*(b_ptr.add(offset + 4) as *const [f64; 4]));
+            let a2 = f64x4::from(*(a_ptr.add(offset + 8) as *const [f64; 4]));
+            let b2 = f64x4::from(*(b_ptr.add(offset + 8) as *const [f64; 4]));
+            let a3 = f64x4::from(*(a_ptr.add(offset + 12) as *const [f64; 4]));
+            let b3 = f64x4::from(*(b_ptr.add(offset + 12) as *const [f64; 4]));
+
+            acc0 += a0 * b0;
+            acc1 += a1 * b1;
+            acc2 += a2 * b2;
+            acc3 += a3 * b3;
+            offset += block;
+        }
+
+        // Whole vectors that did not fill a block.
+        while offset + 4 <= len {
+            acc0 += f64x4::from(*(a_ptr.add(offset) as *const [f64; 4]))
+                * f64x4::from(*(b_ptr.add(offset) as *const [f64; 4]));
+            offset += 4;
         }
     }
 
-    let mut sum = acc.reduce_add();
-    for i in (chunks * 4)..len {
+    let mut sum = ((acc0 + acc1) + (acc2 + acc3)).reduce_add();
+    for i in offset..len {
         sum += a[i] * b[i];
     }
     sum
@@ -755,19 +1065,48 @@ fn dot_f64_avx512(a: &[f64], b: &[f64]) -> f64 {
     use std::arch::x86_64::*;
 
     let len = a.len();
-    let chunks = len / 8;
+    let block = 8 * SIMD_ACCUMULATORS;
+    let mut offset = 0;
 
     unsafe {
-        let mut acc = _mm512_setzero_pd();
+        let mut acc0 = _mm512_setzero_pd();
+        let mut acc1 = _mm512_setzero_pd();
+        let mut acc2 = _mm512_setzero_pd();
+        let mut acc3 = _mm512_setzero_pd();
 
-        for i in 0..chunks {
-            let va = _mm512_loadu_pd(a.as_ptr().add(i * 8));
-            let vb = _mm512_loadu_pd(b.as_ptr().add(i * 8));
-            acc = _mm512_fmadd_pd(va, vb, acc);
+        // Four independent chains: an FMA has four-cycle latency against two
+        // issue ports, so one accumulator would use an eighth of the unit.
+        while offset + block <= len {
+            let a0 = _mm512_loadu_pd(a.as_ptr().add(offset));
+            let b0 = _mm512_loadu_pd(b.as_ptr().add(offset));
+            let a1 = _mm512_loadu_pd(a.as_ptr().add(offset + 8));
+            let b1 = _mm512_loadu_pd(b.as_ptr().add(offset + 8));
+            let a2 = _mm512_loadu_pd(a.as_ptr().add(offset + 16));
+            let b2 = _mm512_loadu_pd(b.as_ptr().add(offset + 16));
+            let a3 = _mm512_loadu_pd(a.as_ptr().add(offset + 24));
+            let b3 = _mm512_loadu_pd(b.as_ptr().add(offset + 24));
+
+            acc0 = _mm512_fmadd_pd(a0, b0, acc0);
+            acc1 = _mm512_fmadd_pd(a1, b1, acc1);
+            acc2 = _mm512_fmadd_pd(a2, b2, acc2);
+            acc3 = _mm512_fmadd_pd(a3, b3, acc3);
+            offset += block;
         }
 
+        // Whole vectors that did not fill a block.
+        while offset + 8 <= len {
+            acc0 = _mm512_fmadd_pd(
+                _mm512_loadu_pd(a.as_ptr().add(offset)),
+                _mm512_loadu_pd(b.as_ptr().add(offset)),
+                acc0,
+            );
+            offset += 8;
+        }
+
+        let acc = _mm512_add_pd(_mm512_add_pd(acc0, acc1), _mm512_add_pd(acc2, acc3));
         let mut sum = _mm512_reduce_add_pd(acc);
-        for i in (chunks * 8)..len {
+
+        for i in offset..len {
             sum += a[i] * b[i];
         }
         sum
