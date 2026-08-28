@@ -1,0 +1,39 @@
+[package]
+name = "ann-search-py"
+version = "0.6.1"
+edition = "2021"
+authors = ["Gregor Lueg <gregorlueg@me.com>"]
+license = "MIT"
+description = "Python bindings for ann-search-rs"
+publish = false
+
+# Own workspace root. The repo root has no `[workspace]` table, so cargo would
+# walk past it today, but that is accidental rather than intended.
+[workspace]
+
+[lib]
+name = "_ann_search"
+crate-type = ["cdylib"]
+
+[dependencies]
+ann-search-rs = { path = "..", default-features = false, features = ["serialise", "synthetic"] }
+num-traits = "0.2"
+faer = "0.23.2"
+numpy = "0.29"
+pyo3 = { version = "0.29", features = ["extension-module", "abi3-py310"] }
+rayon = "1.11"
+tempfile = "3.24"
+
+# Profiles are only read from the workspace root, and this is its own workspace,
+# so the library crate's `lto = true, codegen-units = 1` does not reach here.
+# Thin LTO gets nearly all of the win: the hot SIMD kernels are already inlined
+# within their own crate, and the pyo3 shim is not hot.
+[profile.release]
+lto = "thin"
+codegen-units = 1
+# Must stay unwind. pyo3 catches panics at the FFI boundary.
+panic = "unwind"
+
+# `maturin develop` builds dev by default, and a debug-speed index is useless.
+[profile.dev]
+opt-level = 2

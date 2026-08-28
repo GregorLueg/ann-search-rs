@@ -1,0 +1,143 @@
+# ann-search
+
+Python bindings for [`ann-search-rs`](https://github.com/GregorLueg/ann-search-rs):
+approximate nearest-neighbour search built for single-cell and computational
+biology workloads. The Rust crate does the work. This is a thin scikit-learn
+shaped layer over it.
+
+## Install
+
+```bash
+uv pip install ann-search           # numpy only
+uv pip install "ann-search[sparse]" # adds scipy, for kneighbors_graph
+```
+
+## Use
+
+Every index is a scikit-learn style estimator. Parameters go in the constructor,
+data goes into `fit`, results come out of `kneighbors`.
+
+```python
+import numpy as np
+import ann_search as ann
+
+X = np.random.default_rng(0).standard_normal((50_000, 50)).astype(np.float32)
+
+index = ann.HnswIndex(n_neighbors=15, metric="cosine").fit(X)
+
+distances, indices = index.kneighbors()  # self-kNN graph, fast path
+distances, indices = index.kneighbors(X[:1000])  # cross-set query
+graph = index.kneighbors_graph()  # scipy CSR
+```
+
+`kneighbors` returns distances first, matching scikit-learn and FAISS.
+
+The estimators implement `get_params`, `set_params`, `fit` and `transform`, so
+they drop into scikit-learn pipelines and anywhere a `KNeighborsTransformer` is
+expected, scanpy included. scikit-learn isn't an install requirement for any of
+that.
+
+## Indices
+
+| Class | Notes |
+| --- | --- |
+| `ExhaustiveIndex` | Exact brute force. Ground truth. |
+| `KmknnIndex` | Exact, k-means pruned. No Manhattan. |
+| `AnnoyIndex` | Random projection forest. No Manhattan. |
+| `HnswIndex` | Hierarchical small-world graph. The usual first choice. |
+| `IvfIndex` | Inverted file over k-means cells. |
+| `NNDescentIndex` | Fastest route to a full self-kNN graph. |
+| `VamanaIndex` | DiskANN-style flat graph. |
+| `NsgIndex` | Navigating spreading-out graph. |
+
+The quantised, binary and GPU indices in the Rust crate aren't bound yet. They
+follow the same pattern when they land.
+
+## Synthetic data
+
+Uniform Gaussian noise is a bad ANN benchmark. Past a few dozen dimensions every
+point sits at roughly the same distance from every other, so recall stops
+telling you anything. Four generators with structure real single-cell data has:
+
+```python
+from ann_search import datasets
+
+X, labels = datasets.make_clustered(50_000, dim=32, n_clusters=25, seed=42)
+Q = datasets.subsample_queries(X, 5_000, seed=42)
+```
+
+| Generator | What it stresses |
+| --- | --- |
+| `make_clustered` | Separated blobs with inter-cluster bridges. The baseline. |
+| `make_correlated` | Local anisotropy plus a shared off-axis subspace. Where OPQ and PQ pull apart. |
+| `make_low_rank` | A low-dimensional manifold in a high-dimensional space, with trajectories. |
+| `make_cell_embeddings` | Geneformer/scGPT flavoured: heavy tails, rogue dimensions, anisotropy cone. Gets painful for quantised indices. |
+
+Each returns `(X, labels)`, so ground-truth cluster labels come free. Output is
+float32.
+
+These are the same generators, same seeds, behind the benchmark tables in the
+Rust crate's `docs/`. A Python benchmark and a `cargo run --example
+gridsearch_hnsw` run see identical points, and the test suite pins checksums on
+both sides to keep it that way.
+
+`subsample_queries` matters more than it looks. Querying an index with rows it
+was built from flatters it: every query has an exact hit at distance zero.
+
+## Metrics
+
+`"euclidean"` / `"l2"`, `"sqeuclidean"`, `"cosine"`, `"manhattan"` / `"l1"`.
+
+The Rust core computes squared Euclidean distances. `"euclidean"` and `"l2"`
+take the square root on the way out so the numbers match scikit-learn and scipy;
+`"sqeuclidean"` hands back the raw squared values and skips that.
+
+An unknown metric raises `ValueError`. The Rust core would quietly fall back to
+squared Euclidean and warn to a stdout you can't see, which is a much worse
+failure across FFI than a loud one.
+
+## Padding
+
+Approximate indices can return fewer than `k` neighbours for a query. Those
+slots come back as index `-1` and distance `inf`. Mask on `indices >= 0` before
+you slice with them. `kneighbors_graph` already drops them.
+
+## Threads
+
+```python
+ann.set_num_threads(8)  # 0 restores the default pool
+ann.num_threads()
+```
+
+The default pool honours `RAYON_NUM_THREADS`. Rayon worker threads don't survive
+`fork`, so use the `spawn` start method for `multiprocessing`.
+
+## Persistence
+
+```python
+index.save("my_index")  # a directory, not a file
+index = ann.HnswIndex.load("my_index")
+
+import pickle
+
+blob = pickle.dumps(index)  # works with joblib and multiprocessing
+```
+
+## Caveats
+
+- `verbose=True` writes to the process stdout, not `sys.stdout`. In Jupyter that
+  lands in the terminal running the kernel, not in the cell.
+- Ctrl-C can't interrupt an index build. Python signal handlers only run while
+  the GIL is held, and the build releases it.
+- `return_distance=False` saves the copy into numpy but not the distance
+  computation, which happens either way.
+- Indices are immutable. There's no incremental `add`, so rebuild instead.
+
+## Development
+
+```bash
+uv venv
+uv pip install "maturin>=1.15,<2" numpy scipy pytest scikit-learn beartype
+maturin develop --release   # --release matters, the tests build real indices
+pytest tests -q
+```

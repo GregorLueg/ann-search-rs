@@ -11,3 +11,11 @@ target
 *.tmp
 
 .claude/worktrees/*
+
+# Python bindings
+python/.venv
+python/ann_search/*.so
+python/ann_search/*.pyd
+__pycache__/
+.pytest_cache/
+.ruff_cache/
