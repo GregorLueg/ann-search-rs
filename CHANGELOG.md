@@ -1,5 +1,21 @@
 # News
 
+## 0.6.1
+
+**Features**
+
+- Python bindings under `python/`, built with PyO3 and maturin. scikit-learn
+  shaped estimators over the CPU indices, plus the synthetic generators below.
+  Not published yet.
+- New `synthetic` feature: the four dataset generators that produce the
+  benchmark tables now live in `src/synthetic/` instead of `examples/commons/`,
+  so the published numbers are reproducible outside this repository. Gridsearch
+  commands are unchanged.
+
+**Fixes**
+
+- `clap` and `approx` moved to dev-dependencies.
+
 ## 0.6.0
 
 **Features**

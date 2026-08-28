@@ -33,6 +33,9 @@ pub mod binary;
 #[cfg(feature = "serialise")]
 pub mod serialise;
 
+#[cfg(feature = "synthetic")]
+pub mod synthetic;
+
 use rayon::prelude::*;
 
 use std::sync::{

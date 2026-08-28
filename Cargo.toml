@@ -1,6 +1,6 @@
 [package]
 name = "ann-search-rs"
-version = "0.6.0"
+version = "0.6.1"
 edition = "2021"
 authors = ["Gregor Lueg <gregorlueg@me.com>"]
 license = "MIT"
@@ -47,10 +47,12 @@ mimalloc = ["dep:mimalloc"]
 ndarray = ["dep:ndarray"]
 ## Enables saving indices to disk and loading them back in
 serialise = ["dep:serde", "dep:bincode", "half?/serde"]
+## Synthetic dataset generators with realistic single-cell structure, used by
+## the gridsearch examples and the published benchmark tables.
+synthetic = []
 
 # Dependecies
 [dependencies]
-approx = "0.5.1"
 bincode = {
     version = "2.0.1",
     features = ["serde", "std"],
@@ -60,10 +62,6 @@ bytemuck = {
     version = "1.24.0",
     features = ["derive"],
     optional = true
-}
-clap = {
-    version = "4.5.53",
-    features = ["derive"]
 }
 cubecl = {
     version = "0.10.0",
@@ -114,12 +112,24 @@ thiserror = "2.0.18"
 thousands = "0.2.0"
 wide = "1.4.0"
 
-# Only ever used by the inline tests and the gridsearch examples
+# Only ever used by the inline tests and the gridsearch examples. `clap` drives
+# the example CLIs and `approx` the float assertions; neither is reachable from
+# the library, so as hard dependencies they cost every downstream consumer a
+# build for nothing.
 [dev-dependencies]
+approx = "0.5.1"
+clap = {
+    version = "4.5.53",
+    features = ["derive"]
+}
 tempfile = "3.24.0"
+# Self dev-dependency so examples and tests see `synthetic` without it being a
+# default feature. Keeps `cargo run --example ...` working unchanged while
+# normal downstream builds skip the generators entirely.
+ann-search-rs = { path = ".", features = ["synthetic"] }
 
 [package.metadata.docs.rs]
-features = ["binary", "quantised", "mimalloc", "ndarray", "serialise"]
+features = ["binary", "quantised", "mimalloc", "ndarray", "serialise", "synthetic"]
 
 ################
 # Gridsearches #
