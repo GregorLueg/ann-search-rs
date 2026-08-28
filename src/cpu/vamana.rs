@@ -2,7 +2,7 @@
 //! search that powers DiskANN. This version is the in-memory version of that
 //! algorithm for fast querying.
 
-use faer::{RowRef};
+use faer::RowRef;
 use rand::{rng, rngs::SmallRng, seq::SliceRandom, Rng, SeedableRng};
 use rayon::prelude::*;
 use std::cell::{RefCell, UnsafeCell};

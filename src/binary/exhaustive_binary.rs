@@ -2,7 +2,7 @@
 //! exhaustive searches against query vectors.
 
 use bytemuck::Pod;
-use faer::{RowRef};
+use faer::RowRef;
 use faer_traits::ComplexField;
 use rayon::prelude::*;
 use std::collections::BinaryHeap;
@@ -212,7 +212,12 @@ where
 
         let norms: Vec<T> = vectors_flat
             .chunks_exact(dim)
-            .map(|row| row.iter().map(|&x| x * x).fold(T::zero(), |a, b| a + b).sqrt())
+            .map(|row| {
+                row.iter()
+                    .map(|&x| x * x)
+                    .fold(T::zero(), |a, b| a + b)
+                    .sqrt()
+            })
             .collect();
 
         let (vectors_path, norms_path) = MmapVectorStore::<T>::paths_in(&save_path);

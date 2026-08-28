@@ -109,8 +109,7 @@ where
         Dist::Cosine => T::one() - vec_correction * ip_t,
         Dist::SquaredEuclidean => {
             let two = T::one() + T::one();
-            let d2 = query_norm * query_norm
-                + vec_norm * vec_norm
+            let d2 = query_norm * query_norm + vec_norm * vec_norm
                 - two * query_norm * vec_norm * vec_correction * ip_t;
             d2.max(T::zero())
         }
@@ -489,8 +488,7 @@ mod tests {
         }
 
         let metric = Dist::Cosine;
-        let q =
-            TurboQuantQuantiser::new(data.as_ref(), &metric, bits, 42).unwrap();
+        let q = TurboQuantQuantiser::new(data.as_ref(), &metric, bits, 42).unwrap();
 
         // Queries: each near a cluster centre with a small offset.
         let queries: Vec<Vec<f32>> = (0..n_queries)

@@ -1,7 +1,7 @@
 //! Exhaustive (flat) implementation for nearest neighbour searches in
 //! ann-search-rs.
 
-use faer::{RowRef};
+use faer::RowRef;
 
 use rayon::prelude::*;
 use std::collections::BinaryHeap;

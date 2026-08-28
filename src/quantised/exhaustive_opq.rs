@@ -1,7 +1,7 @@
 //! Exhaustive OPQ index: quantises the original data via optimised product
 //! quantisation.
 
-use faer::{RowRef};
+use faer::RowRef;
 use rayon::prelude::*;
 use std::collections::BinaryHeap;
 use std::ops::AddAssign;

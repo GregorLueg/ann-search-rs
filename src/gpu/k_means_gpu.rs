@@ -22,7 +22,7 @@
 
 use cubecl::prelude::*;
 use cubecl_utils_rs::prelude::*;
-use faer::{Mat};
+use faer::Mat;
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 use std::iter::Sum;

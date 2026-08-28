@@ -1,7 +1,7 @@
 //! Annoy implementation in ann-search-rs. This is an in-memory implementation
 //! of Annoy in Rust.
 
-use faer::{RowRef};
+use faer::RowRef;
 use fixedbitset::FixedBitSet;
 use rand::{rngs::StdRng, Rng, SeedableRng};
 use rayon::prelude::*;

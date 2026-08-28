@@ -2,7 +2,7 @@
 //! exhaustive searches against query vectors.
 
 use bytemuck::Pod;
-use faer::{RowRef};
+use faer::RowRef;
 use faer_traits::ComplexField;
 use num_traits::{Float, FromPrimitive};
 use rayon::prelude::*;
@@ -100,7 +100,8 @@ where
         }
 
         let (vectors_flat, n, dim) = data.into_row_major();
-        let quantiser = RaBitQQuantiser::new((&vectors_flat[..], n, dim), metric, n_clusters, seed)?;
+        let quantiser =
+            RaBitQQuantiser::new((&vectors_flat[..], n, dim), metric, n_clusters, seed)?;
         Ok(Self {
             quantiser,
             n,
@@ -137,7 +138,8 @@ where
         // copy for cosine; the store needs the raw vectors for exact
         // re-ranking, so `vectors_flat` must stay untouched here.
         let (vectors_flat, n, dim) = data.into_row_major();
-        let quantiser = RaBitQQuantiser::new((&vectors_flat[..], n, dim), metric, n_clusters, seed)?;
+        let quantiser =
+            RaBitQQuantiser::new((&vectors_flat[..], n, dim), metric, n_clusters, seed)?;
 
         std::fs::create_dir_all(&save_path)?;
 

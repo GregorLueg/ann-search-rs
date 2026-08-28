@@ -8,7 +8,7 @@
 //! boundary are placed into both children, allowing the query to find
 //! neighbours that a hard partition would miss.
 
-use faer::{RowRef};
+use faer::RowRef;
 use fixedbitset::FixedBitSet;
 use rand::{rngs::StdRng, Rng, SeedableRng};
 use rayon::prelude::*;

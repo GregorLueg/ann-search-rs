@@ -1,7 +1,7 @@
 //! Exhaustive bf16 index: quantises the original data to bf16 (keeps the
 //! norms).
 
-use faer::{RowRef};
+use faer::RowRef;
 use half::bf16;
 use rayon::prelude::*;
 use std::collections::BinaryHeap;

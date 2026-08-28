@@ -2,7 +2,7 @@
 //! leverages Voronoi cells to reduce the search space.
 
 use bytemuck::Pod;
-use faer::{RowRef};
+use faer::RowRef;
 use faer_traits::ComplexField;
 use num_traits::{Float, FromPrimitive};
 use rayon::prelude::*;
@@ -447,8 +447,7 @@ where
         // Expand nprobe to cover >= k reachable vectors so the query never
         // short-returns due to small/empty cells.
         let mut cluster_dists = self.get_centroids_prenorm(&query_normalised, nprobe);
-        let probed =
-            select_probed_clusters(&mut cluster_dists, &self.storage.offsets, nprobe, k);
+        let probed = select_probed_clusters(&mut cluster_dists, &self.storage.offsets, nprobe, k);
 
         let mut heap: BinaryHeap<(OrderedFloat<T>, usize)> = BinaryHeap::with_capacity(k + 1);
 

@@ -2,7 +2,7 @@
 //! bf16 (keeps the norms) and uses Voronoi cells to identify the most
 //! interesting candidates.
 
-use faer::{RowRef};
+use faer::RowRef;
 use half::*;
 use rayon::prelude::*;
 use std::sync::atomic::{AtomicUsize, Ordering};

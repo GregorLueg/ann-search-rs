@@ -2,7 +2,7 @@
 //! quantisation and uses Voronoi cells to identify the most interesting
 //! candidates.
 
-use faer::{RowRef};
+use faer::RowRef;
 use rayon::prelude::*;
 use std::collections::BinaryHeap;
 use std::ops::AddAssign;

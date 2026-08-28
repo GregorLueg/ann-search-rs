@@ -23,7 +23,7 @@
 //! are not guaranteed identical to per-row `query` results.
 
 use bytemuck::Pod;
-use faer::{RowRef};
+use faer::RowRef;
 use rayon::prelude::*;
 use std::collections::{BTreeSet, BinaryHeap};
 use std::path::Path;
@@ -386,7 +386,10 @@ where
             verbose,
         )?;
 
-        let norms: Vec<T> = vectors_flat.chunks_exact(dim).map(compute_l2_norm).collect();
+        let norms: Vec<T> = vectors_flat
+            .chunks_exact(dim)
+            .map(compute_l2_norm)
+            .collect();
 
         std::fs::create_dir_all(&save_path)?;
         let (vectors_path, norms_path) = MmapVectorStore::<T>::paths_in(&save_path);
@@ -1242,9 +1245,16 @@ mod tests {
         // 120 vectors across 30 cells -> avg 4 per cell. nprobe=1 cannot cover
         // k=20; expansion must walk more cells so the query fills k.
         let data = test_data(120, 128);
-        let index =
-            IvfTurboQuant::build(data.as_ref(), Dist::Cosine, Some(30), params(), 4, 42, false)
-                .unwrap();
+        let index = IvfTurboQuant::build(
+            data.as_ref(),
+            Dist::Cosine,
+            Some(30),
+            params(),
+            4,
+            42,
+            false,
+        )
+        .unwrap();
         let (indices, distances) = index.query(&row(&data, 0), 20, Some(1)).unwrap();
         assert_eq!(indices.len(), 20);
         assert_eq!(distances.len(), 20);

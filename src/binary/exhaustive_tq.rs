@@ -171,7 +171,10 @@ where
         let (vectors_flat, n, dim) = data.into_row_major();
         let mut index = Self::new((&vectors_flat[..], n, dim), metric, bits, seed)?;
 
-        let norms: Vec<T> = vectors_flat.chunks_exact(dim).map(compute_l2_norm).collect();
+        let norms: Vec<T> = vectors_flat
+            .chunks_exact(dim)
+            .map(compute_l2_norm)
+            .collect();
 
         std::fs::create_dir_all(&save_path)?;
         let (vectors_path, norms_path) = MmapVectorStore::<T>::paths_in(&save_path);

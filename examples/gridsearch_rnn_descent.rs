@@ -66,11 +66,7 @@ fn main() {
     println!("-----------------------------");
 
     // S x R x T1 grid (T2 fixed to 10 for pace)
-    let build_params: &[(usize, usize, usize)] = &[
-        (20, 64, 3),
-        (20, 96, 4),
-        (40, 128, 3),
-    ];
+    let build_params: &[(usize, usize, usize)] = &[(20, 64, 3), (20, 96, 4), (40, 128, 3)];
     let t2: usize = 10;
 
     // Query-time K sweep (paper Section 4.4). None uses the default min(32, R).
@@ -79,7 +75,10 @@ fn main() {
     let ef_search: Option<usize> = None; // 100 by default, matching the paper
 
     for &(s, r, t1) in build_params {
-        println!("Building RNN-Descent (S={}, R={}, T1={}, T2={})...", s, r, t1, t2);
+        println!(
+            "Building RNN-Descent (S={}, R={}, T1={}, T2={})...",
+            s, r, t1, t2
+        );
 
         let start = Instant::now();
         let rnn_idx = build_rnn_descent_index(

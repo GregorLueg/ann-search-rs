@@ -2665,7 +2665,6 @@ where
     knn_graph
 }
 
-
 /// Run the device-resident NNDescent loop and read the raw graph back.
 ///
 /// Everything between the data upload and the download, with no argument

@@ -8,7 +8,7 @@
 //! Graph-Based Approximate Nearest Neighbor Search.* ACM MM 2023.
 //! arXiv:2310.20419.
 
-use faer::{RowRef};
+use faer::RowRef;
 use rand::{rngs::SmallRng, Rng, SeedableRng};
 use rayon::prelude::*;
 use rdst::RadixSort;
@@ -969,8 +969,6 @@ where
             Ok((indices, None))
         }
     }
-
-
 }
 
 ///////////////////

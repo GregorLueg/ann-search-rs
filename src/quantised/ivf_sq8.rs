@@ -2,7 +2,7 @@
 //! to 8 bit (i8) and uses Voronoi cells to identify the most interesting
 //! candidates.
 
-use faer::{RowRef};
+use faer::RowRef;
 use num_traits::{Float, FromPrimitive, ToPrimitive};
 use rayon::prelude::*;
 use std::{

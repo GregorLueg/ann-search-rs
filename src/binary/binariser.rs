@@ -670,8 +670,14 @@ mod tests {
         let dim = 128;
         let n_bits = 256;
         let zero_mean = Mat::<f64>::zeros(8, dim);
-        let binariser =
-            Binariser::<f64>::new_simhash(&matrix_to_flat(zero_mean.as_ref()).0, zero_mean.nrows(), dim, n_bits, 42).unwrap();
+        let binariser = Binariser::<f64>::new_simhash(
+            &matrix_to_flat(zero_mean.as_ref()).0,
+            zero_mean.nrows(),
+            dim,
+            n_bits,
+            42,
+        )
+        .unwrap();
 
         let vec1: Vec<f64> = (0..dim).map(|i| (i as f64) / (dim as f64)).collect();
         let binary = binariser.encode(&vec1).unwrap();
@@ -684,8 +690,14 @@ mod tests {
         let dim = 64;
         let n_bits = 128;
         let zero_mean = Mat::<f64>::zeros(8, dim);
-        let binariser =
-            Binariser::<f64>::new_simhash(&matrix_to_flat(zero_mean.as_ref()).0, zero_mean.nrows(), dim, n_bits, 42).unwrap();
+        let binariser = Binariser::<f64>::new_simhash(
+            &matrix_to_flat(zero_mean.as_ref()).0,
+            zero_mean.nrows(),
+            dim,
+            n_bits,
+            42,
+        )
+        .unwrap();
 
         let vec1: Vec<f64> = (0..dim).map(|i| i as f64).collect();
         let vec2: Vec<f64> = (0..dim).map(|i| i as f64 + 0.1).collect();
@@ -717,7 +729,14 @@ mod tests {
             }
         }
 
-        let binariser = Binariser::<f64>::new_pca_hashing(&matrix_to_flat(data.as_ref()).0, data.nrows(), dim, n_bits, 42).unwrap();
+        let binariser = Binariser::<f64>::new_pca_hashing(
+            &matrix_to_flat(data.as_ref()).0,
+            data.nrows(),
+            dim,
+            n_bits,
+            42,
+        )
+        .unwrap();
 
         let vec1: Vec<f64> = (0..dim).map(|i| (i as f64).sin()).collect();
         let binary = binariser.encode(&vec1).unwrap();
@@ -738,7 +757,14 @@ mod tests {
             }
         }
 
-        let binariser = Binariser::<f64>::new_pca_hashing(&matrix_to_flat(data.as_ref()).0, data.nrows(), dim, n_bits, 42).unwrap();
+        let binariser = Binariser::<f64>::new_pca_hashing(
+            &matrix_to_flat(data.as_ref()).0,
+            data.nrows(),
+            dim,
+            n_bits,
+            42,
+        )
+        .unwrap();
 
         if let BinarisationMethod::PcaHashing { projections, .. } = &binariser.method {
             for i in 0..n_bits.min(dim) {
@@ -788,7 +814,14 @@ mod tests {
             }
         }
 
-        let binariser = Binariser::<f64>::new_pca_hashing(&matrix_to_flat(data.as_ref()).0, data.nrows(), dim, n_bits, 42).unwrap();
+        let binariser = Binariser::<f64>::new_pca_hashing(
+            &matrix_to_flat(data.as_ref()).0,
+            data.nrows(),
+            dim,
+            n_bits,
+            42,
+        )
+        .unwrap();
 
         if let BinarisationMethod::PcaHashing { mean, .. } = &binariser.method {
             for d in 0..dim {
@@ -855,10 +888,22 @@ mod tests {
         let n_bits = 64;
 
         let zero_mean = Mat::<f64>::zeros(8, dim);
-        let binariser1 =
-            Binariser::<f64>::new_simhash(&matrix_to_flat(zero_mean.as_ref()).0, zero_mean.nrows(), dim, n_bits, 42).unwrap();
-        let binariser2 =
-            Binariser::<f64>::new_simhash(&matrix_to_flat(zero_mean.as_ref()).0, zero_mean.nrows(), dim, n_bits, 42).unwrap();
+        let binariser1 = Binariser::<f64>::new_simhash(
+            &matrix_to_flat(zero_mean.as_ref()).0,
+            zero_mean.nrows(),
+            dim,
+            n_bits,
+            42,
+        )
+        .unwrap();
+        let binariser2 = Binariser::<f64>::new_simhash(
+            &matrix_to_flat(zero_mean.as_ref()).0,
+            zero_mean.nrows(),
+            dim,
+            n_bits,
+            42,
+        )
+        .unwrap();
 
         let vec: Vec<f64> = (0..dim).map(|i| i as f64).collect();
         let bin1 = binariser1.encode(&vec).unwrap();
@@ -899,7 +944,13 @@ mod tests {
     #[test]
     fn test_invalid_n_bits_simhash() {
         let zero_mean = Mat::<f64>::zeros(8, 64);
-        let result = Binariser::<f64>::new_simhash(&matrix_to_flat(zero_mean.as_ref()).0, zero_mean.nrows(), 64, 123, 42);
+        let result = Binariser::<f64>::new_simhash(
+            &matrix_to_flat(zero_mean.as_ref()).0,
+            zero_mean.nrows(),
+            64,
+            123,
+            42,
+        );
         assert!(matches!(
             result,
             Err(AnnSearchErrors::NBitsMustBe8Multiple { n_bits: 123 })
@@ -909,7 +960,13 @@ mod tests {
     #[test]
     fn test_invalid_n_bits_pca_hashing() {
         let data = Mat::<f64>::zeros(100, 64);
-        let result = Binariser::<f64>::new_pca_hashing(&matrix_to_flat(data.as_ref()).0, data.nrows(), 64, 123, 42);
+        let result = Binariser::<f64>::new_pca_hashing(
+            &matrix_to_flat(data.as_ref()).0,
+            data.nrows(),
+            64,
+            123,
+            42,
+        );
         assert!(matches!(
             result,
             Err(AnnSearchErrors::NBitsMustBe8Multiple { n_bits: 123 })
@@ -919,8 +976,14 @@ mod tests {
     #[test]
     fn test_dimension_mismatch() {
         let zero_mean = Mat::<f64>::zeros(8, 64);
-        let binariser =
-            Binariser::<f64>::new_simhash(&matrix_to_flat(zero_mean.as_ref()).0, zero_mean.nrows(), 64, 128, 42).unwrap();
+        let binariser = Binariser::<f64>::new_simhash(
+            &matrix_to_flat(zero_mean.as_ref()).0,
+            zero_mean.nrows(),
+            64,
+            128,
+            42,
+        )
+        .unwrap();
         let result = binariser.encode(&vec![0.0; 32]);
         assert!(matches!(
             result,
@@ -947,8 +1010,14 @@ mod tests {
         let mut rng = StdRng::seed_from_u64(19);
         let data = Mat::<f64>::from_fn(n, dim, |_, _| 50.0 + rng.random::<f64>() * 2.0 - 1.0);
 
-        let binariser =
-            Binariser::<f64>::new_simhash(&matrix_to_flat(data.as_ref()).0, data.nrows(), dim, n_bits, 42).unwrap();
+        let binariser = Binariser::<f64>::new_simhash(
+            &matrix_to_flat(data.as_ref()).0,
+            data.nrows(),
+            dim,
+            n_bits,
+            42,
+        )
+        .unwrap();
 
         let codes: Vec<Vec<u8>> = (0..n)
             .map(|i| {
@@ -990,13 +1059,17 @@ mod tests {
         let dim = 24;
         let binariser = Binariser::<f64>::new_sign_based(dim);
 
-        let vec: Vec<f64> = (0..dim).map(|i| (i as f64 * 0.7).sin() * 3.0 + 1.0).collect();
+        let vec: Vec<f64> = (0..dim)
+            .map(|i| (i as f64 * 0.7).sin() * 3.0 + 1.0)
+            .collect();
         let centroid: Vec<f64> = (0..dim).map(|i| (i as f64 * 0.3).cos()).collect();
 
         let residual: Vec<f64> = vec.iter().zip(&centroid).map(|(v, c)| v - c).collect();
 
         assert_eq!(
-            binariser.encode_residual(&vec, &centroid, (1.0, 1.0)).unwrap(),
+            binariser
+                .encode_residual(&vec, &centroid, (1.0, 1.0))
+                .unwrap(),
             encode_sign_based(&residual, dim)
         );
     }
@@ -1008,7 +1081,9 @@ mod tests {
         let dim = 24;
         let binariser = Binariser::<f64>::new_sign_based(dim);
 
-        let vec: Vec<f64> = (0..dim).map(|i| (i as f64 * 0.7).sin() * 3.0 + 1.0).collect();
+        let vec: Vec<f64> = (0..dim)
+            .map(|i| (i as f64 * 0.7).sin() * 3.0 + 1.0)
+            .collect();
         let centroid: Vec<f64> = (0..dim).map(|i| (i as f64 * 0.3).cos()).collect();
 
         let vn = vec.iter().map(|x| x * x).sum::<f64>().sqrt();
@@ -1021,7 +1096,9 @@ mod tests {
             .collect();
 
         assert_eq!(
-            binariser.encode_residual(&vec, &centroid, (cn, vn)).unwrap(),
+            binariser
+                .encode_residual(&vec, &centroid, (cn, vn))
+                .unwrap(),
             encode_sign_based(&residual, dim)
         );
     }
@@ -1033,9 +1110,22 @@ mod tests {
         let dim = 32;
         let zero_mean = Mat::<f64>::zeros(8, dim);
 
-        let simhash =
-            Binariser::<f64>::new_simhash(&matrix_to_flat(zero_mean.as_ref()).0, zero_mean.nrows(), dim, 64, 42).unwrap();
-        let pca = Binariser::<f64>::new_pca_hashing(&matrix_to_flat(zero_mean.as_ref()).0, zero_mean.nrows(), dim, 64, 42).unwrap();
+        let simhash = Binariser::<f64>::new_simhash(
+            &matrix_to_flat(zero_mean.as_ref()).0,
+            zero_mean.nrows(),
+            dim,
+            64,
+            42,
+        )
+        .unwrap();
+        let pca = Binariser::<f64>::new_pca_hashing(
+            &matrix_to_flat(zero_mean.as_ref()).0,
+            zero_mean.nrows(),
+            dim,
+            64,
+            42,
+        )
+        .unwrap();
 
         let vec = vec![1.0; dim];
         let centroid = vec![0.5; dim];
@@ -1058,7 +1148,9 @@ mod tests {
             // All residuals positive, so every real bit is set
             let vec = vec![1.0; dim];
             let centroid = vec![0.0; dim];
-            let code = binariser.encode_residual(&vec, &centroid, (1.0, 1.0)).unwrap();
+            let code = binariser
+                .encode_residual(&vec, &centroid, (1.0, 1.0))
+                .unwrap();
 
             assert_eq!(code.len(), dim.div_ceil(8));
 
@@ -1073,8 +1165,14 @@ mod tests {
         let n_bits = 64;
 
         let zero_mean = Mat::<f64>::zeros(8, dim);
-        let simhash =
-            Binariser::<f64>::new_simhash(&matrix_to_flat(zero_mean.as_ref()).0, zero_mean.nrows(), dim, n_bits, 42).unwrap();
+        let simhash = Binariser::<f64>::new_simhash(
+            &matrix_to_flat(zero_mean.as_ref()).0,
+            zero_mean.nrows(),
+            dim,
+            n_bits,
+            42,
+        )
+        .unwrap();
         let simhash_mem = simhash.memory_usage_bytes();
         assert!(simhash_mem > 0);
 

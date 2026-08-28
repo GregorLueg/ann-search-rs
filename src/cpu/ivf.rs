@@ -1,7 +1,7 @@
 //! Inverted file index. Leverages k-means clustering to partition data into
 //! Voronoi cells that are being searched during querying.
 
-use faer::{RowRef};
+use faer::RowRef;
 use rayon::prelude::*;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;

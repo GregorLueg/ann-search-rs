@@ -2,7 +2,7 @@
 //! leverages Voronoi cells to reduce the search space.
 
 use bytemuck::Pod;
-use faer::{RowRef};
+use faer::RowRef;
 use faer_traits::ComplexField;
 use rayon::prelude::*;
 use std::collections::BinaryHeap;
@@ -459,7 +459,12 @@ where
 
         let norms: Vec<T> = vectors_flat
             .chunks_exact(dim)
-            .map(|row| row.iter().map(|&x| x * x).fold(T::zero(), |a, b| a + b).sqrt())
+            .map(|row| {
+                row.iter()
+                    .map(|&x| x * x)
+                    .fold(T::zero(), |a, b| a + b)
+                    .sqrt()
+            })
             .collect();
 
         let (vectors_path, norms_path) = MmapVectorStore::<T>::paths_in(&save_path);
@@ -983,8 +988,7 @@ where
         // funnel to `k -> k` and the exact stage can only reorder what the
         // binary stages already picked, never recover a dropped neighbour.
         let candidates = if matches!(self.binarisation_type, BinarisationInit::SignBased) {
-            let (idx, _) =
-                self.query_asymmetric(query_vec, k * rerank_factor, nprobe, Some(2))?;
+            let (idx, _) = self.query_asymmetric(query_vec, k * rerank_factor, nprobe, Some(2))?;
             idx
         } else {
             let (idx, _) = self.query(query_vec, k * rerank_factor, nprobe)?;
@@ -1488,7 +1492,9 @@ mod tests {
         )
         .unwrap();
 
-        assert!(projection.generate_knn(5, Some(4), None, true, false).is_ok());
+        assert!(projection
+            .generate_knn(5, Some(4), None, true, false)
+            .is_ok());
     }
 
     /// An all-zero row has no direction, so the Cosine scale pair degenerates.
@@ -1525,7 +1531,10 @@ mod tests {
             &index.vectors_flat_binarised[physical * index.n_bytes..(physical + 1) * index.n_bytes];
         let set: u32 = code.iter().map(|b| b.count_ones()).sum();
 
-        assert!(set > 0 && set < dim as u32, "degenerate code: {set} bits set");
+        assert!(
+            set > 0 && set < dim as u32,
+            "degenerate code: {set} bits set"
+        );
     }
 
     /// Brute-force top-k by squared Euclidean distance
@@ -1574,12 +1583,7 @@ mod tests {
     /// ### Returns
     ///
     /// An `n` x `dim` matrix.
-    fn create_clustered_test_data(
-        n: usize,
-        dim: usize,
-        n_clusters: usize,
-        seed: u64,
-    ) -> Mat<f32> {
+    fn create_clustered_test_data(n: usize, dim: usize, n_clusters: usize, seed: u64) -> Mat<f32> {
         use rand::rngs::StdRng;
         use rand::{Rng, SeedableRng};
 

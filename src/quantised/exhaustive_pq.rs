@@ -1,6 +1,6 @@
 //! Exhaustive PQ index: quantises the original data via product quantisation.
 
-use faer::{RowRef};
+use faer::RowRef;
 use rayon::prelude::*;
 use std::collections::BinaryHeap;
 use std::sync::atomic::AtomicUsize;

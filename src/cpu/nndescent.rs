@@ -2,7 +2,7 @@
 //! implementation, PyNNDescent and EFANNA. Leverages Annoy over Kd forest for
 //! graph initialisation (when not using Manhattan distance).
 
-use faer::{RowRef};
+use faer::RowRef;
 use fixedbitset::FixedBitSet;
 use rand::{rngs::SmallRng, Rng, SeedableRng};
 use rayon::prelude::*;
@@ -1037,11 +1037,7 @@ where
     ///
     /// `Vec<Vec<(usize, T)>>` of length `n`. Entry `v` lists `(u, d(u, v))`
     /// for every source `u` that has `v` in its forward list.
-    fn build_reverse_adjacency(
-        &self,
-        graph: &[(usize, T)],
-        k: usize,
-    ) -> Vec<Vec<(usize, T)>> {
+    fn build_reverse_adjacency(&self, graph: &[(usize, T)], k: usize) -> Vec<Vec<(usize, T)>> {
         let mut reverse: Vec<Vec<(usize, T)>> = (0..self.n).map(|_| Vec::new()).collect();
         for u in 0..self.n {
             let row = &graph[u * k..(u + 1) * k];
@@ -1117,9 +1113,8 @@ where
 
                 // Dedupe by pid, keeping the smallest distance per pid.
                 pool.sort_unstable_by(|a, b| {
-                    a.0.cmp(&b.0).then_with(|| {
-                        a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal)
-                    })
+                    a.0.cmp(&b.0)
+                        .then_with(|| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))
                 });
                 pool.dedup_by_key(|x| x.0);
 
@@ -1138,9 +1133,7 @@ where
                     let mut should_keep = true;
                     for &(kept_idx, _) in &kept {
                         let dist_to_kept = self.distance(cand_idx, kept_idx);
-                        if dist_to_kept < cand_dist
-                            && rng.random::<f64>() < prune_prob_f64
-                        {
+                        if dist_to_kept < cand_dist && rng.random::<f64>() < prune_prob_f64 {
                             should_keep = false;
                             break;
                         }
