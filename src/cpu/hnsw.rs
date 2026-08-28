@@ -3,7 +3,7 @@
 
 use faer::RowRef;
 use num_traits::{Float, FromPrimitive};
-use rand::{rngs::SmallRng, Rng, SeedableRng};
+use rand::{rngs::SmallRng, seq::SliceRandom, Rng, SeedableRng};
 use rayon::prelude::*;
 use std::cell::RefCell;
 use std::{cell::UnsafeCell, cmp::Reverse, iter::Sum, marker::PhantomData, time::Instant};
@@ -12,6 +12,22 @@ use thousands::*;
 use crate::prelude::*;
 use crate::utils::graph_utils::*;
 use crate::utils::*;
+
+////////////
+// Consts //
+////////////
+
+/// Highest layer a node may be assigned to. Layers are stored as `u8` and the
+/// draw is geometric with ratio `1/M`, so anything past this is unreachable in
+/// practice: at M = 16 the probability of layer 15 is under 2^-60.
+const MAX_LAYER: usize = 15;
+
+/// Level buckets at or below this size are inserted sequentially rather than
+/// under rayon. The topmost buckets hold a handful of nodes whose links form
+/// the navigation highway; inserting them concurrently means they cannot see
+/// each other and the upper layers come out near-empty. FAISS guards the same
+/// way with `#pragma omp parallel if (i1 > i0 + 100)`.
+const PARALLEL_BUCKET_THRESHOLD: usize = 100;
 
 /////////////
 // Helpers //
@@ -298,8 +314,13 @@ where
         }
 
         // Full list: compute pruning outside the lock
-        let selected =
-            self.compute_pruned(&snapshot[..degree], new_neighbour, node_id, &distance_fn);
+        let selected = self.compute_pruned(
+            &snapshot[..degree],
+            new_neighbour,
+            node_id,
+            max_n,
+            &distance_fn,
+        );
 
         // Reacquire to write, validate snapshot is still current
         let _guard = self.locks.lock_guard(node_id);
@@ -352,7 +373,8 @@ where
         F: Fn(usize, usize) -> T,
     {
         let degree = slot.iter().position(|&e| e == u32::MAX).unwrap_or(max_n);
-        let selected = self.compute_pruned(&slot[..degree], new_neighbour, node_id, distance_fn);
+        let selected =
+            self.compute_pruned(&slot[..degree], new_neighbour, node_id, max_n, distance_fn);
         for i in 0..max_n {
             slot[i] = if i < selected.len() {
                 selected[i] as u32
@@ -367,30 +389,38 @@ where
     /// Collects the current neighbours plus the new candidate, sorts by
     /// distance to `node_id`, then applies the HNSW diversity heuristic: a
     /// candidate is included only if no already-selected neighbour is closer
-    /// to it than the query node is. Caller is responsible for persisting the
-    /// result to the neighbour slot.
+    /// to it than the query node is. The list is then back-filled from the
+    /// rejects, nearest first, up to `max_n`, matching the forward pass in
+    /// [`HnswIndex::select_neighbours_heuristic`]. Caller is responsible for
+    /// persisting the result to the neighbour slot.
+    ///
+    /// The cap is `max_n`, not `existing.len()`: on the stale-snapshot path a
+    /// concurrent writer may have left the list below capacity, and capping at
+    /// the observed degree would make degrees monotonically non-increasing and
+    /// silently drop the incoming reverse link.
     ///
     /// ### Params
     ///
     /// * `existing` - Current neighbour IDs (excluding sentinels)
     /// * `new_neighbour` - Candidate neighbour to consider
     /// * `node_id` - Node whose neighbourhood is being pruned
+    /// * `max_n` - Slot capacity for the layer being pruned
     /// * `distance_fn` - Function to compute distances between nodes
     ///
     /// ### Returns
     ///
-    /// Pruned neighbour list of length at most `max_neighbours(layer)`
+    /// Pruned neighbour list of length at most `max_n`
     fn compute_pruned<F>(
         &self,
         existing: &[u32],
         new_neighbour: usize,
         node_id: usize,
+        max_n: usize,
         distance_fn: &F,
     ) -> Vec<usize>
     where
         F: Fn(usize, usize) -> T,
     {
-        let max_n = existing.len() + 1;
         let mut candidates: Vec<(OrderedFloat<T>, usize)> = existing
             .iter()
             .map(|&n| {
@@ -406,18 +436,29 @@ where
         candidates.sort_unstable_by_key(|a| a.0);
 
         let mut selected = Vec::with_capacity(max_n);
+        let mut discarded = Vec::new();
         for &(dist, cand_id) in &candidates {
-            if selected.len() >= existing.len() {
+            if selected.len() >= max_n {
                 break;
             }
             let dominated = selected.iter().any(|&sel_id| {
                 let dist_to_selected = OrderedFloat(distance_fn(cand_id, sel_id));
                 dist_to_selected < dist
             });
-            if !dominated {
+            if dominated {
+                discarded.push(cand_id);
+            } else {
                 selected.push(cand_id);
             }
         }
+
+        for cand_id in discarded {
+            if selected.len() >= max_n {
+                break;
+            }
+            selected.push(cand_id);
+        }
+
         selected
     }
 
@@ -657,15 +698,22 @@ where
             Vec::new()
         };
 
-        // Assign layers using exponential distribution
-        let ml = T::one() / T::from_usize(m).unwrap().ln();
+        // Assign layers using exponential distribution. Kept in f64 regardless
+        // of T: drawing in f32 gives an f32 index a different layer assignment
+        // from an f64 one built with the same seed. `rng.random()` samples
+        // [0, 1), so a zero draw makes the level infinite rather than large.
+        let ml = 1.0 / (m as f64).ln();
         let mut rng = SmallRng::seed_from_u64(seed as u64);
 
         let layer_assignments: Vec<u8> = (0..n)
             .map(|_| {
                 let uniform: f64 = rng.random();
-                let uniform_t = T::from_f64(uniform).unwrap();
-                ((-uniform_t.ln() * ml).floor().to_u8().unwrap()).min(15)
+                let level = (-uniform.ln() * ml).floor();
+                if level.is_finite() {
+                    (level as usize).min(MAX_LAYER) as u8
+                } else {
+                    MAX_LAYER as u8
+                }
             })
             .collect();
 
@@ -705,7 +753,7 @@ where
         };
 
         // Build the graph layer by layer, from TOP to BOTTOM
-        index.build_graph(&construction_graph, verbose);
+        index.build_graph(&construction_graph, seed, verbose);
 
         // Convert construction graph to flat layout
         let (neighbours_flat, neighbour_offsets, _) = construction_graph.into_flat();
@@ -721,22 +769,29 @@ where
 
     /// Build the graph structure layer by layer (top to bottom)
     ///
-    /// Constructs upper layers first to create "highways" that lower layers
-    /// can use during their construction, improving connectivity.
+    /// Nodes are bucketed by their own top layer and inserted highest bucket
+    /// first, so a node descending through the layers above its own always
+    /// reads a completed bucket. Within a bucket the order is permuted: node
+    /// ids follow dataset order, and generators tend to emit whole populations
+    /// in blocks, which biases the graph if inserted in sequence. Buckets past
+    /// [`PARALLEL_BUCKET_THRESHOLD`] go through rayon; concurrent writes to a
+    /// neighbour list are covered by the construction graph's striped locks.
     ///
     /// ### Params
     ///
     /// * `graph` - Construction graph to populate
+    /// * `seed` - Random seed for the within-bucket permutation
     /// * `verbose` - Whether to print progress
-    fn build_graph(&self, graph: &ConstructionGraph<T>, verbose: bool) {
-        // Sort nodes: highest layer first, then by node id for determinism
-        // within a layer.
-        let mut insertion_order: Vec<usize> = (0..self.n).collect();
-        insertion_order.sort_unstable_by(|&a, &b| {
-            self.layer_assignments[b]
-                .cmp(&self.layer_assignments[a])
-                .then(a.cmp(&b))
-        });
+    fn build_graph(&self, graph: &ConstructionGraph<T>, seed: usize, verbose: bool) {
+        // The entry point acquires its edges through reverse links only: it is
+        // the first node any insertion descends to, so inserting it against an
+        // empty graph would be a no-op.
+        let ep = self.entry_point as usize;
+
+        let mut buckets: Vec<Vec<usize>> = vec![Vec::new(); self.max_layer as usize + 1];
+        for node in (0..self.n).filter(|&id| id != ep) {
+            buckets[self.layer_assignments[node] as usize].push(node);
+        }
 
         if verbose {
             println!(
@@ -746,56 +801,40 @@ where
         }
 
         let start = Instant::now();
+        let mut rng = SmallRng::seed_from_u64(seed as u64);
 
-        // Insert the entry point first (it's the highest-layer node, so it
-        // should be first in our sorted order, but let's be explicit)
-        let ep = self.entry_point as usize;
+        for layer in (0..=self.max_layer as usize).rev() {
+            let bucket = &mut buckets[layer];
+            bucket.shuffle(&mut rng);
 
-        // First phase: Insert upper-layer nodes sequentially
-        // These are few in number and form the critical highway structure.
-        // Sequential insertion ensures they see each other's connections.
-        let (upper_nodes, base_only_nodes): (Vec<usize>, Vec<usize>) = insertion_order
-            .into_iter()
-            .filter(|&id| id != ep)
-            .partition(|&id| self.layer_assignments[id] > 0);
+            let bucket_start = Instant::now();
+            let parallel = bucket.len() > PARALLEL_BUCKET_THRESHOLD;
 
-        if verbose {
-            println!(
-                "  Phase 1: {} upper-layer nodes (sequential)",
-                upper_nodes.len().separate_with_underscores()
-            );
+            let insert = |node: usize| {
+                Self::with_build_state(|state_cell| {
+                    let mut state = state_cell.borrow_mut();
+                    self.insert_node(node, graph, &mut state);
+                });
+            };
+
+            if parallel {
+                bucket.par_iter().for_each(|&node| insert(node));
+            } else {
+                bucket.iter().for_each(|&node| insert(node));
+            }
+
+            if verbose {
+                println!(
+                    "  Layer {}: {} nodes ({}) in {:.2?}",
+                    layer,
+                    bucket.len().separate_with_underscores(),
+                    if parallel { "parallel" } else { "sequential" },
+                    bucket_start.elapsed()
+                );
+            }
         }
 
-        for &node in &upper_nodes {
-            Self::with_build_state(|state_cell| {
-                let mut state = state_cell.borrow_mut();
-                self.insert_node(node, graph, &mut state);
-            });
-        }
-
         if verbose {
-            println!("  Phase 1 done in {:.2?}", start.elapsed());
-            println!(
-                "  Phase 2: {} base-layer nodes (parallel)",
-                base_only_nodes.len().separate_with_underscores()
-            );
-        }
-
-        let phase2_start = Instant::now();
-
-        // Phase 2: Insert base-only nodes in parallel
-        // The upper layers are now fully built, so these nodes can find good
-        // entry points via greedy descent. Concurrent insertions at layer 0
-        // are protected by per-node locks.
-        base_only_nodes.par_iter().for_each(|&node| {
-            Self::with_build_state(|state_cell| {
-                let mut state = state_cell.borrow_mut();
-                self.insert_node(node, graph, &mut state);
-            });
-        });
-
-        if verbose {
-            println!("  Phase 2 done in {:.2?}", phase2_start.elapsed());
             println!("  Total build in {:.2?}", start.elapsed());
         }
     }
@@ -1048,6 +1087,13 @@ where
     /// candidates that are closer to the query than to already-selected
     /// neighbours, promoting diversity whilst maintaining proximity.
     ///
+    /// `keepPrunedConnections` is on: once the diversity pass is done the list
+    /// is back-filled, nearest first, from the candidates it rejected until it
+    /// reaches `max_neighbours`. Without it the out-degree at layer 0 is
+    /// whatever the diversity rule happened to allow, typically well under
+    /// `2 * m`, and recall suffers for it. The fill costs no distance
+    /// computations, every candidate distance to `node` is already in hand.
+    ///
     /// ### Params
     ///
     /// * `node` - Query node
@@ -1065,9 +1111,10 @@ where
         layer: u8,
         state: &mut SearchState<T>,
     ) -> Vec<(OrderedFloat<T>, usize)> {
-        let max_neighbours = if layer == 0 { self.m * 2 } else { self.m };
+        let max_neighbours = self.max_neighbours_for_layer(layer);
 
         state.scratch_working.clear();
+        state.scratch_discarded.clear();
 
         for &(dist, id) in candidates {
             if id != node {
@@ -1095,7 +1142,17 @@ where
 
             if is_good {
                 result.push((cand_dist, cand_id));
+            } else {
+                state.scratch_discarded.push((cand_dist, cand_id));
             }
+        }
+
+        // scratch_working was sorted, so the rejects are already ascending
+        for &(dist, id) in &state.scratch_discarded {
+            if result.len() >= max_neighbours {
+                break;
+            }
+            result.push((dist, id));
         }
 
         result
@@ -1728,5 +1785,45 @@ mod tests {
 
             assert_eq!(indices.len(), 10, "Failed with m = {}", m);
         }
+    }
+
+    #[test]
+    fn test_hnsw_layer_zero_degree_is_saturated() {
+        // keepPrunedConnections: with more candidates than slots, every node's
+        // layer-0 list should come out full at 2*m. Without the back-fill the
+        // diversity heuristic leaves it well short.
+        let (n, dim, m) = (400, 8, 4);
+        let data: Vec<f32> = (0..n * dim)
+            .map(|i| ((i * 7919 % 1013) as f32) / 1013.0)
+            .collect();
+        let mat = Mat::from_fn(n, dim, |i, j| data[i * dim + j]);
+
+        let index =
+            HnswIndex::<f32>::build(mat.as_ref(), m, 100, &Dist::SquaredEuclidean, 42, false);
+
+        for node in 0..n {
+            let degree = index
+                .get_neighbours_at_layer(node, 0)
+                .iter()
+                .take_while(|&&id| id != u32::MAX)
+                .count();
+            assert_eq!(degree, m * 2, "node {} has degree {}", node, degree);
+        }
+    }
+
+    #[test]
+    fn test_hnsw_layer_assignment_matches_across_float_types() {
+        // The level draw runs in f64 regardless of T, so the same seed gives
+        // the same hierarchy for an f32 and an f64 index.
+        let (n, dim) = (500, 4);
+        let mat32 = Mat::<f32>::from_fn(n, dim, |i, j| ((i + j) as f32) * 0.01);
+        let mat64 = Mat::<f64>::from_fn(n, dim, |i, j| ((i + j) as f64) * 0.01);
+
+        let index32 =
+            HnswIndex::<f32>::build(mat32.as_ref(), 16, 50, &Dist::SquaredEuclidean, 7, false);
+        let index64 =
+            HnswIndex::<f64>::build(mat64.as_ref(), 16, 50, &Dist::SquaredEuclidean, 7, false);
+
+        assert_eq!(index32.layer_assignments, index64.layer_assignments);
     }
 }
