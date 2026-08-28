@@ -30,6 +30,28 @@ use crate::prelude::*;
 // Helpers //
 /////////////
 
+/// Pack per-query results into the crate's `KnnOptionResult` shape
+///
+/// ### Params
+///
+/// * `results` - Per-query `(indices, distances)` pairs
+/// * `return_dist` - Whether the distances are kept
+///
+/// ### Returns
+///
+/// A tuple of `(knn_indices, optional distances)`
+pub(crate) fn pack_knn_results<T>(
+    results: Vec<(Vec<usize>, Vec<T>)>,
+    return_dist: bool,
+) -> (Vec<Vec<usize>>, Option<Vec<Vec<T>>>) {
+    if return_dist {
+        let (indices, distances) = results.into_iter().unzip();
+        (indices, Some(distances))
+    } else {
+        (results.into_iter().map(|(idx, _)| idx).collect(), None)
+    }
+}
+
 /// Type alias for flattened structure
 pub type FlattenData<T> = (Vec<T>, usize, usize);
 
