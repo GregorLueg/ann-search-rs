@@ -164,22 +164,27 @@ impl ReverseCsr {
     }
 }
 
-/// Forward-plus-reverse candidate lists for one NN-Descent iteration.
+/// Forward samples plus their reverse adjacency for one NN-Descent iteration.
 ///
-/// Both lists live in fixed-stride flat buffers of `n * stride` `u32` ids
-/// rather than `n` growable `Vec`s. The stride is `max_candidates`, which the
-/// merge step enforces as a hard cap on the merged list, so the whole structure
-/// is `O(n * max_candidates)` with no per-node allocation and no hub-degree
-/// tail. `new` and `old` are merged **in place** over the forward sample, so
-/// the reverse CSRs are the only extra buffers.
+/// The forward lists live in fixed-stride flat buffers of `n * max_candidates`
+/// `u32` ids rather than `n` growable `Vec`s, and the reverse edges in CSR. The
+/// total reverse entry count equals the total forward count by construction, so
+/// the whole structure is `O(n * max_candidates)` with no per-node allocation.
+///
+/// The **merged** list a node's local join actually runs over is not
+/// materialised here. It is assembled per node into thread-local scratch inside
+/// the join instead, because capping it to keep it in a fixed stride costs real
+/// recall: the reverse in-degree distribution is broad rather than a clippable
+/// tail, so a cap anywhere loses neighbours the descent needed.
 struct CandidateSets {
-    /// Slots per node in each flat buffer (equals `max_candidates`)
+    /// Slots per node in each forward buffer (equals `max_candidates`)
     stride: usize,
-    /// New candidates, `n * stride`; node `i` owns `[i*stride..i*stride+new_len[i]]`
+    /// New forward sample, `n * stride`; node `i` owns
+    /// `[i*stride .. i*stride + new_len[i]]`, sorted ascending by id
     new_cands: Vec<u32>,
     /// Valid entries per node in `new_cands`
     new_len: Vec<u32>,
-    /// Old candidates, same layout as `new_cands`
+    /// Old forward sample, same layout as `new_cands`
     old_cands: Vec<u32>,
     /// Valid entries per node in `old_cands`
     old_len: Vec<u32>,
@@ -212,18 +217,42 @@ impl CandidateSets {
         }
     }
 
-    /// New candidates of node `i`, sorted ascending by id.
+    /// New forward sample of node `i`, sorted ascending by id.
     #[inline]
-    fn new_list(&self, i: usize) -> &[u32] {
+    fn new_forward(&self, i: usize) -> &[u32] {
         let base = i * self.stride;
         &self.new_cands[base..base + self.new_len[i] as usize]
     }
 
-    /// Old candidates of node `i`, sorted ascending by id.
+    /// Old forward sample of node `i`, sorted ascending by id.
     #[inline]
-    fn old_list(&self, i: usize) -> &[u32] {
+    fn old_forward(&self, i: usize) -> &[u32] {
         let base = i * self.stride;
         &self.old_cands[base..base + self.old_len[i] as usize]
+    }
+
+    /// Merge node `i`'s forward sample with its reverse edges into `out`.
+    ///
+    /// Sorted ascending and deduplicated, which is what the pair loop and the
+    /// tile gather both want. Deliberately unbounded: see the type docs.
+    ///
+    /// ### Params
+    ///
+    /// * `i` - Node whose candidate list is wanted
+    /// * `new` - Whether to merge the new lists or the old ones
+    /// * `out` - Destination scratch, cleared on entry
+    fn merged_into(&self, i: usize, new: bool, out: &mut Vec<u32>) {
+        let (fwd, rev) = if new {
+            (self.new_forward(i), self.new_rev.segment(i))
+        } else {
+            (self.old_forward(i), self.old_rev.segment(i))
+        };
+        out.clear();
+        out.reserve(fwd.len() + rev.len());
+        out.extend_from_slice(fwd);
+        out.extend_from_slice(rev);
+        out.sort_unstable();
+        out.dedup();
     }
 }
 
@@ -396,55 +425,6 @@ fn take_lowest_priority(temp: &mut Vec<(u64, u32)>, cap: usize, out: &mut [u32])
     len as u32
 }
 
-/// Merge a node's forward candidate sample with its reverse edges, in place.
-///
-/// Deduplicates by id, caps the result at `cap` by edge priority, and leaves
-/// `slot` sorted ascending so `mark_as_old` can binary-search it.
-///
-/// Writing back over `slot` is safe because the reverse edges arrive through
-/// an already-materialised CSR, so no other node's forward sample is read
-/// during this pass.
-///
-/// ### Params
-///
-/// * `slot` - Node's stride slice, holding the forward sample on entry
-/// * `fwd_len` - Valid forward entries in `slot`
-/// * `rev` - Reverse edges of this node from the CSR
-/// * `node` - Node id, one endpoint of every edge priority
-/// * `iter_seed` - Per-iteration seed
-/// * `cap` - Maximum entries to keep
-/// * `temp` - Thread-local scratch, cleared on entry
-///
-/// ### Returns
-///
-/// Number of ids written into `slot`.
-#[allow(clippy::too_many_arguments)]
-fn merge_capped(
-    slot: &mut [u32],
-    fwd_len: usize,
-    rev: &[u32],
-    node: u32,
-    iter_seed: u64,
-    cap: usize,
-    temp: &mut Vec<(u64, u32)>,
-) -> u32 {
-    temp.clear();
-    temp.reserve(fwd_len + rev.len());
-    for &id in &slot[..fwd_len] {
-        temp.push((edge_priority(iter_seed, node, id), id));
-    }
-    for &id in rev {
-        temp.push((edge_priority(iter_seed, node, id), id));
-    }
-
-    // Duplicates carry the same priority (it is a pure function of the
-    // unordered pair), so which copy survives does not matter.
-    temp.sort_unstable_by_key(|&(_, id)| id);
-    temp.dedup_by_key(|e| e.1);
-
-    take_lowest_priority(temp, cap, slot)
-}
-
 /////////////////
 // JoinScratch //
 /////////////////
@@ -460,6 +440,10 @@ fn merge_capped(
 /// Buffers are reused across every node the thread handles, so the allocations
 /// settle after the first few nodes.
 struct JoinScratch<T> {
+    /// Merged new candidates for this node
+    new_ids: Vec<u32>,
+    /// Merged old candidates for this node
+    old_ids: Vec<u32>,
     /// Candidate ids, new list followed by old list
     ids: Vec<u32>,
     /// Distance of each candidate's current worst neighbour
@@ -478,6 +462,8 @@ impl<T: AnnSearchFloat> JoinScratch<T> {
     /// Empty scratch. Buffers grow to fit on the first gather.
     fn new() -> Self {
         Self {
+            new_ids: Vec::new(),
+            old_ids: Vec::new(),
             ids: Vec::new(),
             thresh: Vec::new(),
             norms: Vec::new(),
@@ -487,16 +473,22 @@ impl<T: AnnSearchFloat> JoinScratch<T> {
         }
     }
 
-    /// Gather node `node`'s candidate vectors, thresholds and norms.
+    /// Merge node `node`'s candidate lists, then gather their vectors,
+    /// thresholds and norms.
     ///
     /// ### Params
     ///
     /// * `idx` - Index owning the vectors and norms
     /// * `graph` - Current flat k-NN graph, read for the eviction thresholds
     /// * `k` - Neighbours per node in `graph`
-    /// * `cands` - Merged candidate lists
+    /// * `cands` - Forward samples and reverse adjacency
     /// * `node` - Source node
     /// * `cosine` - Whether norms are meaningful for this metric
+    ///
+    /// ### Returns
+    ///
+    /// Length of the new-candidate list, which is where the tile switches from
+    /// new to old.
     fn gather(
         &mut self,
         idx: &NNDescent<T>,
@@ -505,12 +497,15 @@ impl<T: AnnSearchFloat> JoinScratch<T> {
         cands: &CandidateSets,
         node: usize,
         cosine: bool,
-    ) {
+    ) -> usize {
         let dim = idx.dim;
 
+        cands.merged_into(node, true, &mut self.new_ids);
+        cands.merged_into(node, false, &mut self.old_ids);
+
         self.ids.clear();
-        self.ids.extend_from_slice(cands.new_list(node));
-        self.ids.extend_from_slice(cands.old_list(node));
+        self.ids.extend_from_slice(&self.new_ids);
+        self.ids.extend_from_slice(&self.old_ids);
 
         let total = self.ids.len();
         self.thresh.clear();
@@ -528,6 +523,8 @@ impl<T: AnnSearchFloat> JoinScratch<T> {
             self.tile
                 .extend_from_slice(&idx.vectors_flat[p * dim..(p + 1) * dim]);
         }
+
+        self.new_ids.len()
     }
 
     /// Fill `dots` with the `n_new x n_total` dot-product block of the tile.
@@ -975,9 +972,11 @@ where
     ///
     /// Number of source nodes to process in the first chunk.
     fn initial_chunk_size(&self, max_candidates: usize) -> usize {
-        // Merged new and old lists are each capped at max_candidates, so the
-        // unified pair loop runs over at most mc * (2mc - 1) / 2 * ... pairs.
-        let pairs_per_source = max_candidates * max_candidates * 3 / 2;
+        // Mean reverse in-degree equals mean forward out-degree, so a merged
+        // list runs about twice `max_candidates` on average and the unified
+        // pair loop covers roughly 6 * mc^2 pairs. Only the opening guess: the
+        // rescale below is what actually holds the budget.
+        let pairs_per_source = 6 * max_candidates * max_candidates;
         let updates_per_source =
             ((pairs_per_source * 2) as f64 * ASSUMED_ACCEPT_RATE).ceil() as usize;
 
@@ -1181,28 +1180,26 @@ where
         Ok((res, converged))
     }
 
-    /// Build the merged candidate lists for the local join step.
+    /// Sample the forward candidate lists and build their reverse adjacency.
     ///
-    /// Three passes:
+    /// Two passes:
     ///
     /// 1. Sample up to `max_candidates` new and old neighbours per node from
     ///    its graph row, keeping the lowest-priority entries.
     /// 2. Build the reverse adjacency of both samples as CSR
     ///    ([`build_reverse_csr`]).
-    /// 3. Merge forward and reverse per node, dedup, cap at `max_candidates`
-    ///    by the same edge priority, and sort by id. The merge writes **back
-    ///    over the forward sample**, so no third buffer is needed.
     ///
-    /// The cap in step 3 is what bounds the local join: without it a hub node
-    /// accumulates an unbounded reverse in-degree and the pair loop goes
-    /// quadratic in that. It is also what PyNNDescent does, where both
-    /// directions push into one bounded heap.
+    /// The merge of the two is deliberately left to the join, which assembles
+    /// it per node into thread-local scratch. Materialising it here would mean
+    /// capping it to fit a fixed stride, and a cap costs recall wherever it is
+    /// put: the reverse in-degree distribution is broad rather than a tail that
+    /// can be clipped for free.
     ///
     /// ### Params
     ///
     /// * `graph` - Current flat k-NN graph
     /// * `k` - Neighbours per node
-    /// * `max_candidates` - Cap on each merged candidate list
+    /// * `max_candidates` - Cap on the forward sample
     /// * `iter_seed` - Per-iteration seed for reproducible sampling
     /// * `cands` - Candidate sets, overwritten in place
     fn build_candidates(
@@ -1269,44 +1266,6 @@ where
             n,
             &mut cands.old_rev,
         );
-
-        // Phase 3: merge each node's forward sample with its reverse edges,
-        // in place. The CSRs were materialised in phase 2, so overwriting the
-        // forward buffer here cannot disturb another node's merge.
-        let new_rev = &cands.new_rev;
-        let old_rev = &cands.old_rev;
-        cands
-            .new_cands
-            .par_chunks_mut(stride)
-            .zip(cands.old_cands.par_chunks_mut(stride))
-            .zip(cands.new_len.par_iter_mut())
-            .zip(cands.old_len.par_iter_mut())
-            .enumerate()
-            .for_each(|(i, (((new_slot, old_slot), new_len), old_len))| {
-                CAND_SCRATCH.with(|cell| {
-                    let mut b = cell.borrow_mut();
-                    let (new_temp, old_temp) = &mut *b;
-
-                    *new_len = merge_capped(
-                        new_slot,
-                        *new_len as usize,
-                        new_rev.segment(i),
-                        i as u32,
-                        iter_seed,
-                        max_candidates,
-                        new_temp,
-                    );
-                    *old_len = merge_capped(
-                        old_slot,
-                        *old_len as usize,
-                        old_rev.segment(i),
-                        i as u32,
-                        iter_seed,
-                        max_candidates,
-                        old_temp,
-                    );
-                });
-            });
     }
 
     /// Mark neighbours as old if they were sampled into the new-candidate list
@@ -1315,22 +1274,27 @@ where
     /// list will have been explored during this iteration's local joins, so
     /// flip its flag and let subsequent iterations treat it as old.
     ///
+    /// The merged list is never materialised, but membership in it does not
+    /// need it: `j` is in `i`'s merged new list exactly when `j` is in `i`'s
+    /// forward sample or `i` is in `j`'s, the second case being the reverse
+    /// edge. Both samples are sorted, so this is two binary searches.
+    ///
     /// ### Params
     ///
     /// * `graph` - Current flat k-NN graph (mutated in place)
     /// * `k` - Neighbours per node
-    /// * `cands` - Merged candidate lists, sorted ascending by id
+    /// * `cands` - Forward samples, sorted ascending by id
     fn mark_as_old(&self, graph: &mut [Neighbour<T>], k: usize, cands: &CandidateSets) {
         graph.par_chunks_mut(k).enumerate().for_each(|(i, slots)| {
-            let list = cands.new_list(i);
-            if list.is_empty() {
-                return;
-            }
+            let fwd_i = cands.new_forward(i);
             for slot in slots.iter_mut() {
                 if slot.is_sentinel() || !slot.is_new() {
                     continue;
                 }
-                if list.binary_search(&(slot.pid() as u32)).is_ok() {
+                let j = slot.pid();
+                if fwd_i.binary_search(&(j as u32)).is_ok()
+                    || cands.new_forward(j).binary_search(&(i as u32)).is_ok()
+                {
                     slot.mark_old();
                 }
             }
@@ -1443,13 +1407,11 @@ where
                     )
                 },
                 |(mut updates, mut scratch), i| {
-                    let n_new = cands.new_list(i).len();
-                    let n_total = n_new + cands.old_list(i).len();
+                    let n_new = scratch.gather(self, graph, k, cands, i, cosine);
+                    let n_total = scratch.ids.len();
                     if n_new == 0 || n_total < 2 {
                         return (updates, scratch);
                     }
-
-                    scratch.gather(self, graph, k, cands, i, cosine);
 
                     let use_gemm = self.gemm_join_applies(n_total);
                     if use_gemm {
@@ -2769,28 +2731,12 @@ mod tests {
     }
 
     #[test]
-    fn test_merge_capped_dedups_and_caps() {
-        let cap = 3;
-        let mut slot = vec![5u32, 9, 0, 0];
-        let rev = [9u32, 11, 12, 13, 5];
-        let mut temp = Vec::new();
-
-        let len = merge_capped(&mut slot, 2, &rev, 4, 42, cap, &mut temp) as usize;
-
-        assert_eq!(len, cap);
-        let kept = &slot[..len];
-        assert!(kept.windows(2).all(|w| w[0] < w[1]), "not sorted or deduped");
-        for &id in kept {
-            assert!([5u32, 9, 11, 12, 13].contains(&id));
-        }
-    }
-
-    #[test]
-    fn test_merged_candidates_respect_max_candidates() {
-        // A hub-heavy layout: every point sits close to the origin cluster, so
-        // the reverse in-degree piles onto a handful of nodes. Without the cap
-        // in `build_candidates` the merged lists would run far past
-        // `max_candidates` and the local join would go quadratic in that.
+    fn test_forward_sample_respects_max_candidates() {
+        // The forward sample is the only capped list. The merged list the join
+        // runs over is deliberately uncapped: capping it costs recall, since
+        // the reverse in-degree distribution is broad rather than a clippable
+        // tail. This pins the forward cap and the sorted-deduped invariant both
+        // `mark_as_old` and `merged_into` rely on.
         let n = 200;
         let dim = 4;
         let mat = Mat::from_fn(n, dim, |i, j| {
@@ -2824,19 +2770,30 @@ mod tests {
             .collect();
         index.build_candidates(&graph, index.k, max_candidates, 42, &mut cands);
 
+        let mut merged = Vec::new();
         for i in 0..index.n {
-            let new_list = cands.new_list(i);
-            let old_list = cands.old_list(i);
-            assert!(new_list.len() <= max_candidates, "new list {i} over cap");
-            assert!(old_list.len() <= max_candidates, "old list {i} over cap");
+            let new_fwd = cands.new_forward(i);
+            let old_fwd = cands.old_forward(i);
+            assert!(new_fwd.len() <= max_candidates, "new sample {i} over cap");
+            assert!(old_fwd.len() <= max_candidates, "old sample {i} over cap");
             assert!(
-                new_list.windows(2).all(|w| w[0] < w[1]),
-                "new list {i} not sorted and deduped"
+                new_fwd.windows(2).all(|w| w[0] < w[1]),
+                "new sample {i} not sorted and deduped"
             );
             assert!(
-                old_list.windows(2).all(|w| w[0] < w[1]),
-                "old list {i} not sorted and deduped"
+                old_fwd.windows(2).all(|w| w[0] < w[1]),
+                "old sample {i} not sorted and deduped"
             );
+
+            // The merged list must be the sorted union of the two directions.
+            cands.merged_into(i, true, &mut merged);
+            assert!(merged.windows(2).all(|w| w[0] < w[1]));
+            for &j in new_fwd {
+                assert!(merged.binary_search(&j).is_ok(), "merged {i} lost {j}");
+            }
+            for &src in cands.new_rev.segment(i) {
+                assert!(merged.binary_search(&src).is_ok(), "merged {i} lost {src}");
+            }
         }
     }
 
