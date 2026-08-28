@@ -389,8 +389,8 @@ where
     /// Collects the current neighbours plus the new candidate, sorts by
     /// distance to `node_id`, then applies the HNSW diversity heuristic: a
     /// candidate is included only if no already-selected neighbour is closer
-    /// to it than the query node is. The list is then back-filled from the
-    /// rejects, nearest first, up to `max_n`, matching the forward pass in
+    /// to it than the query node is. Rejects are dropped rather than used to
+    /// fill the remaining slots, matching the forward pass in
     /// [`HnswIndex::select_neighbours_heuristic`]. Caller is responsible for
     /// persisting the result to the neighbour slot.
     ///
@@ -436,7 +436,6 @@ where
         candidates.sort_unstable_by_key(|a| a.0);
 
         let mut selected = Vec::with_capacity(max_n);
-        let mut discarded = Vec::new();
         for &(dist, cand_id) in &candidates {
             if selected.len() >= max_n {
                 break;
@@ -445,20 +444,10 @@ where
                 let dist_to_selected = OrderedFloat(distance_fn(cand_id, sel_id));
                 dist_to_selected < dist
             });
-            if dominated {
-                discarded.push(cand_id);
-            } else {
+            if !dominated {
                 selected.push(cand_id);
             }
         }
-
-        for cand_id in discarded {
-            if selected.len() >= max_n {
-                break;
-            }
-            selected.push(cand_id);
-        }
-
         selected
     }
 
@@ -1087,12 +1076,13 @@ where
     /// candidates that are closer to the query than to already-selected
     /// neighbours, promoting diversity whilst maintaining proximity.
     ///
-    /// `keepPrunedConnections` is on: once the diversity pass is done the list
-    /// is back-filled, nearest first, from the candidates it rejected until it
-    /// reaches `max_neighbours`. Without it the out-degree at layer 0 is
-    /// whatever the diversity rule happened to allow, typically well under
-    /// `2 * m`, and recall suffers for it. The fill costs no distance
-    /// computations, every candidate distance to `node` is already in hand.
+    /// `keepPrunedConnections` is deliberately **not** implemented. Filling the
+    /// remaining slots with the nearest rejected candidates was measured at
+    /// 150k x 128D and lost on both axes: build time went up 2-3x because
+    /// saturated lists send every reverse link through the O(max_n^2)
+    /// [`HnswIndex::compute_pruned`] path instead of a free append, and recall
+    /// stopped responding to `ef_construction` at all because the short edges
+    /// crowd out the long-range ones on subsequent reverse-link pruning.
     ///
     /// ### Params
     ///
@@ -1114,7 +1104,6 @@ where
         let max_neighbours = self.max_neighbours_for_layer(layer);
 
         state.scratch_working.clear();
-        state.scratch_discarded.clear();
 
         for &(dist, id) in candidates {
             if id != node {
@@ -1142,17 +1131,7 @@ where
 
             if is_good {
                 result.push((cand_dist, cand_id));
-            } else {
-                state.scratch_discarded.push((cand_dist, cand_id));
             }
-        }
-
-        // scratch_working was sorted, so the rejects are already ascending
-        for &(dist, id) in &state.scratch_discarded {
-            if result.len() >= max_neighbours {
-                break;
-            }
-            result.push((dist, id));
         }
 
         result
@@ -1788,10 +1767,11 @@ mod tests {
     }
 
     #[test]
-    fn test_hnsw_layer_zero_degree_is_saturated() {
-        // keepPrunedConnections: with more candidates than slots, every node's
-        // layer-0 list should come out full at 2*m. Without the back-fill the
-        // diversity heuristic leaves it well short.
+    fn test_hnsw_layer_zero_degree_stays_under_budget() {
+        // The diversity heuristic leaves layer-0 lists short of 2*m, and that
+        // slack is load-bearing: filling it with the nearest rejects saturates
+        // every list, pushes each reverse link through the O(max_n^2) pruning
+        // path and costs both build time and recall.
         let (n, dim, m) = (400, 8, 4);
         let data: Vec<f32> = (0..n * dim)
             .map(|i| ((i * 7919 % 1013) as f32) / 1013.0)
@@ -1801,14 +1781,19 @@ mod tests {
         let index =
             HnswIndex::<f32>::build(mat.as_ref(), m, 100, &Dist::SquaredEuclidean, 42, false);
 
-        for node in 0..n {
-            let degree = index
-                .get_neighbours_at_layer(node, 0)
-                .iter()
-                .take_while(|&&id| id != u32::MAX)
-                .count();
-            assert_eq!(degree, m * 2, "node {} has degree {}", node, degree);
-        }
+        let degrees: Vec<usize> = (0..n)
+            .map(|node| {
+                index
+                    .get_neighbours_at_layer(node, 0)
+                    .iter()
+                    .take_while(|&&id| id != u32::MAX)
+                    .count()
+            })
+            .collect();
+
+        assert!(degrees.iter().all(|&d| d <= m * 2));
+        let mean = degrees.iter().sum::<usize>() as f64 / n as f64;
+        assert!(mean < (m * 2) as f64, "mean layer-0 degree {}", mean);
     }
 
     #[test]
