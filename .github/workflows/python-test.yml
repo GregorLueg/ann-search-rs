@@ -75,3 +75,44 @@ jobs:
 
       - name: Test
         run: uv run pytest tests -q
+
+  # `gpu` is a default feature, so the matrix above already builds it. Hosted
+  # runners have no adapter, which means `gpu_available()` is False and the GPU
+  # tests skip there: that job proves the feature compiles and that a GPU wheel
+  # degrades cleanly on a machine without a device, not that the kernels are
+  # correct. Kernel correctness needs a runner with a GPU.
+  #
+  # This job covers the other direction: the CPU-only wheel still has to build
+  # and pass, since `--no-default-features` is the lean-install escape hatch.
+  cpu-only:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: python
+          key: cpu-only
+
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      - name: Set up the environment
+        run: |
+          uv venv --python 3.12
+          uv pip install "maturin>=1.15,<2" numpy scipy pytest scikit-learn beartype
+
+      - name: Lint Rust
+        run: cargo clippy --all-targets --no-default-features -- -D warnings
+
+      - name: Test Rust
+        run: cargo test --no-default-features
+
+      - name: Build
+        run: uv run maturin develop --release --no-default-features
+
+      - name: Test
+        run: uv run pytest tests -q

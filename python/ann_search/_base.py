@@ -59,6 +59,12 @@ class BaseAnnIndex:
     #: Constructor parameters that are search-time knobs, so `kneighbors` can
     #: take a per-call override for each without a hook per subclass.
     _SEARCH_KNOBS: ClassVar[tuple[str, ...]] = ()
+    #: Element type to force on `fit`, or ``None`` to keep the caller's. The GPU
+    #: indices pin float32: WGSL has no float64.
+    _FORCE_DTYPE: ClassVar[np.dtype | None] = None
+    #: Whether the compiled handle can be written to disk. False for the GPU
+    #: indices, which sit outside the crate's `serialise` feature.
+    _SERIALISABLE: ClassVar[bool] = True
 
     # Every subclass takes these three in its `__init__`. Annotated but not
     # assigned, so they stay out of the class dict and `get_params` still reads
@@ -152,7 +158,7 @@ class BaseAnnIndex:
         Returns:
             self.
         """
-        arr = check_matrix(X)
+        arr = check_matrix(X, dtype=self._FORCE_DTYPE)
         self._core_metric, self._sqrt = resolve_metric(
             self.metric, self._SUPPORTED_METRICS
         )
@@ -304,6 +310,20 @@ class BaseAnnIndex:
     # Persistence #
     ###############
 
+    @classmethod
+    def _require_serialisable(cls, what: str) -> None:
+        """Refuse persistence on the indices that cannot support it.
+
+        Args:
+            what: Past participle of the attempted operation, for the message.
+        """
+        if not cls._SERIALISABLE:
+            raise NotImplementedError(
+                f"{cls.__name__} cannot be {what}: it holds GPU-resident buffers "
+                f"and is outside the crate's serialise feature. Rebuild it with "
+                f"fit() instead."
+            )
+
     def save(self, path: str | Path) -> None:
         """Write the fitted index to a directory.
 
@@ -313,7 +333,13 @@ class BaseAnnIndex:
 
         Args:
             path: Target directory. Created if it does not exist.
+
+        Raises:
+            NotImplementedError: If this index cannot be serialised. The GPU
+                indices hold device buffers and sit outside the crate's
+                `serialise` feature, so rebuilding is the only route.
         """
+        self._require_serialisable("saved")
         handle = self._fitted_handle()
         target = Path(path)
         handle.save(target)
@@ -338,7 +364,9 @@ class BaseAnnIndex:
 
         Raises:
             ValueError: If the directory was written by a different index type.
+            NotImplementedError: If this index cannot be serialised.
         """
+        cls._require_serialisable("loaded")
         source = Path(path)
         meta = json.loads((source / _PARAMS_FILE).read_text())
         if meta["class"] != cls.__name__:
@@ -354,6 +382,7 @@ class BaseAnnIndex:
     def __getstate__(self) -> dict[str, Any]:
         state: dict[str, Any] = {"params": self.get_params(), "fitted": None}
         if self._handle is not None:
+            self._require_serialisable("pickled")
             state["fitted"] = {
                 "handle": self._handle.__getstate__(),
                 "dtype": str(self._dtype),

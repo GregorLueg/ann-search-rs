@@ -20,6 +20,15 @@ from . import _ann_search as _core
 from ._base import BaseAnnIndex
 from ._metrics import NO_MANHATTAN
 
+###########
+# Globals #
+###########
+
+#: SOAR spilling rules. Validated here for the same reason metric names are: an
+#: unrecognised value would otherwise reach the core, which only complains via
+#: `println!` to the process stdout.
+SOAR_RULES: frozenset[str] = frozenset({"nearest", "orthogonal", "shifted"})
+
 
 class ExhaustiveIndex(BaseAnnIndex):
     """Brute-force exact search.
@@ -348,6 +357,234 @@ class NsgIndex(BaseAnnIndex):
             l_build=self.l_build,
             c=self.c,
             knn_k=self.knn_k,
+            seed=self.seed,
+            verbose=self.verbose,
+        )
+
+
+class BallTreeIndex(BaseAnnIndex):
+    """Metric tree of nested hyperspheres.
+
+    Prunes by the triangle inequality, which pays off when the data has genuine
+    cluster structure and the dimensionality is moderate. `search_budget`
+    defaults to 5% of the indexed points, so the defaults are approximate;
+    raise it for recall. Manhattan is not supported.
+    """
+
+    _HANDLE: ClassVar[type] = _core.BallTree
+    _SUPPORTED_METRICS: ClassVar[frozenset[str]] = NO_MANHATTAN
+    _SEARCH_KNOBS: ClassVar[tuple[str, ...]] = ("search_budget",)
+
+    @beartype
+    def __init__(
+        self,
+        n_neighbors: int = 15,
+        metric: str = "euclidean",
+        search_budget: int | None = None,
+        seed: int = 42,
+        verbose: bool = False,
+    ) -> None:
+        self.n_neighbors = n_neighbors
+        self.metric = metric
+        self.search_budget = search_budget
+        self.seed = seed
+        self.verbose = verbose
+
+    def _build(self, x: np.ndarray) -> Any:
+        return _core.BallTree.build(x, metric=self._core_metric, seed=self.seed)
+
+
+class KdTreeIndex(BaseAnnIndex):
+    """Forest of randomised kd spill-trees.
+
+    Same trade as Annoy, with axis-aligned splits instead of random
+    hyperplanes: more trees means better recall and a larger index. The one
+    tree index here that supports Manhattan.
+    """
+
+    _HANDLE: ClassVar[type] = _core.KdTree
+    _SEARCH_KNOBS: ClassVar[tuple[str, ...]] = ("search_budget",)
+
+    @beartype
+    def __init__(
+        self,
+        n_neighbors: int = 15,
+        metric: str = "euclidean",
+        n_trees: int = 25,
+        search_budget: int | None = None,
+        seed: int = 42,
+        verbose: bool = False,
+    ) -> None:
+        self.n_neighbors = n_neighbors
+        self.metric = metric
+        self.n_trees = n_trees
+        self.search_budget = search_budget
+        self.seed = seed
+        self.verbose = verbose
+
+    def _build(self, x: np.ndarray) -> Any:
+        return _core.KdTree.build(
+            x, metric=self._core_metric, n_trees=self.n_trees, seed=self.seed
+        )
+
+
+class LshIndex(BaseAnnIndex):
+    """Multi-probe locality-sensitive hashing over random projections.
+
+    The cheapest index to build here, and the weakest on recall. Lower
+    `bits_per_hash` widens the buckets, trading query time for recall;
+    `num_tables` trades index size for recall. `n_probe` defaults to one probe
+    per projection. Manhattan is not supported.
+    """
+
+    _HANDLE: ClassVar[type] = _core.Lsh
+    _SUPPORTED_METRICS: ClassVar[frozenset[str]] = NO_MANHATTAN
+    _SEARCH_KNOBS: ClassVar[tuple[str, ...]] = ("n_probe", "max_candidates")
+
+    @beartype
+    def __init__(
+        self,
+        n_neighbors: int = 15,
+        metric: str = "euclidean",
+        num_tables: int = 8,
+        bits_per_hash: int = 12,
+        slot_bits: int | None = None,
+        n_probe: int | None = None,
+        max_candidates: int | None = None,
+        seed: int = 42,
+        verbose: bool = False,
+    ) -> None:
+        self.n_neighbors = n_neighbors
+        self.metric = metric
+        self.num_tables = num_tables
+        self.bits_per_hash = bits_per_hash
+        self.slot_bits = slot_bits
+        self.n_probe = n_probe
+        self.max_candidates = max_candidates
+        self.seed = seed
+        self.verbose = verbose
+
+    def _build(self, x: np.ndarray) -> Any:
+        return _core.Lsh.build(
+            x,
+            metric=self._core_metric,
+            num_tables=self.num_tables,
+            bits_per_hash=self.bits_per_hash,
+            slot_bits=self.slot_bits,
+            seed=self.seed,
+        )
+
+
+class SoarIndex(BaseAnnIndex):
+    """IVF with spilling, as in Google's SOAR.
+
+    Every point also lands in a second cell, picked by a rule that accounts for
+    the residual it already carries in its primary cell. That buys recall at a
+    given `nprobe` over plain IVF, for roughly twice the posting-list size.
+
+    `rule` is one of ``"nearest"``, ``"shifted"`` or ``"orthogonal"``, and
+    ``None`` lets the core choose per metric: orthogonal for cosine, shifted
+    otherwise. `rule_param` is ``mu`` for shifted and ``lambda`` for
+    orthogonal, and ``None`` takes the core's own value. Manhattan is not
+    supported.
+    """
+
+    _HANDLE: ClassVar[type] = _core.Soar
+    _SUPPORTED_METRICS: ClassVar[frozenset[str]] = NO_MANHATTAN
+    _SEARCH_KNOBS: ClassVar[tuple[str, ...]] = ("nprobe",)
+
+    @beartype
+    def __init__(
+        self,
+        n_neighbors: int = 15,
+        metric: str = "euclidean",
+        nlist: int | None = None,
+        nprobe: int | None = None,
+        rule: str | None = None,
+        rule_param: float | None = None,
+        kmeans_iters: int | None = None,
+        kmeans_balanced: bool = False,
+        seed: int = 42,
+        verbose: bool = False,
+    ) -> None:
+        self.n_neighbors = n_neighbors
+        self.metric = metric
+        self.nlist = nlist
+        self.nprobe = nprobe
+        self.rule = rule
+        self.rule_param = rule_param
+        self.kmeans_iters = kmeans_iters
+        self.kmeans_balanced = kmeans_balanced
+        self.seed = seed
+        self.verbose = verbose
+
+    def _build(self, x: np.ndarray) -> Any:
+        if self.rule is not None and self.rule not in SOAR_RULES:
+            allowed = ", ".join(sorted(SOAR_RULES))
+            raise ValueError(
+                f"unknown SOAR rule {self.rule!r}; expected one of: {allowed}"
+            )
+        return _core.Soar.build(
+            x,
+            metric=self._core_metric,
+            nlist=self.nlist,
+            rule=self.rule,
+            rule_param=self.rule_param,
+            kmeans_iters=self.kmeans_iters,
+            kmeans_balanced=self.kmeans_balanced,
+            seed=self.seed,
+            verbose=self.verbose,
+        )
+
+
+class RnnDescentIndex(BaseAnnIndex):
+    """Relative NN-Descent graph.
+
+    Builds and prunes in one pass, reaching a sparse navigable graph without
+    the separate NSG-style refinement step, so it is the cheapest route to a
+    graph index. `r` caps the out-degree and is the main size knob; `ef_search`
+    is the main recall knob.
+    """
+
+    _HANDLE: ClassVar[type] = _core.RnnDescent
+    _SEARCH_KNOBS: ClassVar[tuple[str, ...]] = ("ef_search", "k_search")
+
+    @beartype
+    def __init__(
+        self,
+        n_neighbors: int = 15,
+        metric: str = "euclidean",
+        s: int = 20,
+        r: int = 96,
+        t1: int = 4,
+        t2: int = 15,
+        n_trees: int | None = None,
+        ef_search: int | None = None,
+        k_search: int | None = None,
+        seed: int = 42,
+        verbose: bool = False,
+    ) -> None:
+        self.n_neighbors = n_neighbors
+        self.metric = metric
+        self.s = s
+        self.r = r
+        self.t1 = t1
+        self.t2 = t2
+        self.n_trees = n_trees
+        self.ef_search = ef_search
+        self.k_search = k_search
+        self.seed = seed
+        self.verbose = verbose
+
+    def _build(self, x: np.ndarray) -> Any:
+        return _core.RnnDescent.build(
+            x,
+            metric=self._core_metric,
+            s=self.s,
+            r=self.r,
+            t1=self.t1,
+            t2=self.t2,
+            n_trees=self.n_trees,
             seed=self.seed,
             verbose=self.verbose,
         )

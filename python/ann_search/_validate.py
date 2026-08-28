@@ -14,7 +14,9 @@ _NATIVE_DTYPES = (np.float32, np.float64)
 
 
 @beartype
-def check_matrix(x: Any, *, name: str = "X") -> np.ndarray:
+def check_matrix(
+    x: Any, *, name: str = "X", dtype: np.dtype | None = None
+) -> np.ndarray:
     """Coerce an array-like into something the Rust core can borrow directly.
 
     float32 and float64 pass through untouched. Any other numeric type is
@@ -25,9 +27,12 @@ def check_matrix(x: Any, *, name: str = "X") -> np.ndarray:
     Args:
         x: Array-like of shape ``(n_samples, n_features)``.
         name: Argument name, used in error messages.
+        dtype: Element type to force, overriding the promotion rule above. The
+            GPU indices set this to float32, since WGSL has no float64 and the
+            alternative is a failure deep inside a kernel.
 
     Returns:
-        A C-contiguous 2-D float32 or float64 array.
+        A C-contiguous 2-D array, of `dtype` when one was given.
 
     Raises:
         ValueError: If the input is not 2-D, is empty, or holds non-finite
@@ -39,7 +44,9 @@ def check_matrix(x: Any, *, name: str = "X") -> np.ndarray:
 
     if arr.dtype.kind not in "fiub":
         raise TypeError(f"{name} must hold numbers, got dtype {arr.dtype}")
-    if arr.dtype.type not in _NATIVE_DTYPES:
+    if dtype is not None:
+        arr = arr.astype(dtype, copy=False)
+    elif arr.dtype.type not in _NATIVE_DTYPES:
         arr = arr.astype(np.float64)
 
     if arr.ndim != 2:

@@ -44,14 +44,76 @@ that.
 | `ExhaustiveIndex` | Exact brute force. Ground truth. |
 | `KmknnIndex` | Exact, k-means pruned. No Manhattan. |
 | `AnnoyIndex` | Random projection forest. No Manhattan. |
+| `KdTreeIndex` | Randomised kd spill-tree forest. Axis-aligned splits. |
+| `BallTreeIndex` | Metric tree of nested hyperspheres. No Manhattan. |
 | `HnswIndex` | Hierarchical small-world graph. The usual first choice. |
 | `IvfIndex` | Inverted file over k-means cells. |
+| `SoarIndex` | IVF with spilling. Better recall per `nprobe`, twice the lists. No Manhattan. |
+| `LshIndex` | Multi-probe LSH. Cheapest build, weakest recall. No Manhattan. |
 | `NNDescentIndex` | Fastest route to a full self-kNN graph. |
+| `RnnDescentIndex` | Builds and prunes in one pass. Cheapest graph index. |
 | `VamanaIndex` | DiskANN-style flat graph. |
 | `NsgIndex` | Navigating spreading-out graph. |
 
-The quantised, binary and GPU indices in the Rust crate aren't bound yet. They
-follow the same pattern when they land.
+`BallTreeIndex` defaults its `search_budget` to 5% of the indexed points, which
+is the crate's own heuristic. That is thin on small datasets: raise it to 10% if
+recall matters more than query time.
+
+The quantised and binary indices in the Rust crate aren't bound yet. They follow
+the same pattern when they land.
+
+## GPU
+
+Three more estimators. They ship in the ordinary wheel — there is no separate
+package and no extra to ask for:
+
+| Class | Notes |
+| --- | --- |
+| `ExhaustiveGpuIndex` | Brute force on the device. Exact, and cheap ground truth. |
+| `IvfGpuIndex` | k-means and vectors both resident. Bounded by device memory. |
+| `CagraGpuIndex` | NN-Descent on device, pruned to a CAGRA graph, beam-searched. |
+
+```python
+import ann_search as ann
+
+if ann.gpu_available():
+    index = ann.CagraGpuIndex(n_neighbors=15).fit(X)
+```
+
+`gpu_available()` answers the only question worth asking: is there an adapter on
+this machine. The backend is wgpu, so that means Metal on macOS and Vulkan or
+DX12 elsewhere — there is no CUDA runtime to install, and nothing extra to
+`pip install`. On a box with no GPU it returns False and the CPU estimators are
+unaffected.
+
+Three differences from the CPU estimators, all forced by the backend:
+
+- **float32 only.** WGSL has no float64, so `fit` narrows rather than failing
+  inside a kernel. It is the only silent narrowing this package does.
+- **No persistence.** These hold device buffers and sit outside the crate's
+  `serialise` feature, so `save`, `load` and pickle raise `NotImplementedError`.
+  Rebuild instead.
+- **No Manhattan**, on any of the three.
+
+A fitted `CagraGpuIndex` is also the one index here that is not safe to query
+from two threads at once: the beam search memoises its graph upload behind a
+mutable borrow, so concurrent calls serialise.
+
+### A CPU-only build
+
+GPU support is compiled in by default, which costs about 3 MB of wheel: 4.9 MB
+against 1.7 MB. That seemed the better trade than a second distribution, since
+wgpu has no driver runtime to ship and the alternative is a version pin between
+two packages that can drift.
+
+If the megabytes matter, build without it:
+
+```bash
+maturin develop --release --no-default-features
+```
+
+`gpu_available()` then returns False on any machine, and `import ann_search.gpu`
+raises with an explanation. Everything on the CPU side is untouched.
 
 ## Synthetic data
 

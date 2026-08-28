@@ -25,24 +25,44 @@ use pyo3::prelude::*;
 mod convert;
 mod dispatch;
 mod error;
+mod gpu_probe;
 mod handle;
 mod kmeans;
 mod pool;
 mod state;
+
+#[cfg(feature = "gpu")]
+mod gpu_handle;
 
 /////////////
 // Indices //
 /////////////
 
 mod annoy;
+mod ball_tree;
 mod datasets;
 mod exhaustive;
 mod hnsw;
 mod ivf;
+mod kd_tree;
 mod kmknn;
+mod lsh;
 mod nndescent;
 mod nsg;
+mod rnn_descent;
+mod soar;
 mod vamana;
+
+/////////////////
+// GPU indices //
+/////////////////
+
+#[cfg(feature = "gpu")]
+mod cagra_gpu;
+#[cfg(feature = "gpu")]
+mod exhaustive_gpu;
+#[cfg(feature = "gpu")]
+mod ivf_gpu;
 
 ////////////
 // Module //
@@ -66,6 +86,7 @@ fn _ann_search(m: &Bound<'_, PyModule>) -> PyResult<()> {
 
     m.add_function(wrap_pyfunction!(pool::set_num_threads, m)?)?;
     m.add_function(wrap_pyfunction!(pool::num_threads, m)?)?;
+    m.add_function(wrap_pyfunction!(gpu_probe::gpu_available, m)?)?;
 
     m.add_function(wrap_pyfunction!(datasets::make_clustered, m)?)?;
     m.add_function(wrap_pyfunction!(datasets::make_correlated, m)?)?;
@@ -74,13 +95,25 @@ fn _ann_search(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(datasets::subsample_queries, m)?)?;
 
     m.add_class::<annoy::PyAnnoy>()?;
+    m.add_class::<ball_tree::PyBallTree>()?;
     m.add_class::<exhaustive::PyExhaustive>()?;
     m.add_class::<hnsw::PyHnsw>()?;
     m.add_class::<ivf::PyIvf>()?;
+    m.add_class::<kd_tree::PyKdTree>()?;
     m.add_class::<kmknn::PyKmknn>()?;
+    m.add_class::<lsh::PyLsh>()?;
     m.add_class::<nndescent::PyNnDescent>()?;
     m.add_class::<nsg::PyNsg>()?;
+    m.add_class::<rnn_descent::PyRnnDescent>()?;
+    m.add_class::<soar::PySoar>()?;
     m.add_class::<vamana::PyVamana>()?;
+
+    #[cfg(feature = "gpu")]
+    {
+        m.add_class::<cagra_gpu::PyCagraGpu>()?;
+        m.add_class::<exhaustive_gpu::PyExhaustiveGpu>()?;
+        m.add_class::<ivf_gpu::PyIvfGpu>()?;
+    }
 
     Ok(())
 }

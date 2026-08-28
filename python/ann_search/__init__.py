@@ -16,41 +16,62 @@ and infinite distances, and `kneighbors_graph` drops those slots.
 Indices are immutable. There's no incremental ``add``, so rebuild instead.
 """
 
-from . import datasets
+from . import _ann_search, datasets
 from ._ann_search import (
     AnnSearchError,
     IndexIoError,
     __version__,
+    gpu_available,
     num_threads,
     set_num_threads,
 )
 from ._base import BaseAnnIndex, NotFittedError
 from .indices import (
     AnnoyIndex,
+    BallTreeIndex,
     ExhaustiveIndex,
     HnswIndex,
     IvfIndex,
+    KdTreeIndex,
     KmknnIndex,
+    LshIndex,
     NNDescentIndex,
     NsgIndex,
+    RnnDescentIndex,
+    SoarIndex,
     VamanaIndex,
 )
 
 __all__ = [
     "AnnSearchError",
     "AnnoyIndex",
+    "BallTreeIndex",
     "BaseAnnIndex",
     "ExhaustiveIndex",
     "HnswIndex",
     "IndexIoError",
     "IvfIndex",
+    "KdTreeIndex",
     "KmknnIndex",
+    "LshIndex",
     "NNDescentIndex",
     "NotFittedError",
     "NsgIndex",
+    "RnnDescentIndex",
+    "SoarIndex",
     "VamanaIndex",
     "__version__",
     "datasets",
+    "gpu_available",
     "num_threads",
     "set_num_threads",
 ]
+
+# The GPU estimators exist only when the extension was built with them, which is
+# fixed at wheel-build time. They are re-exported at the top level when present
+# so `ann.IvfGpuIndex` works, and `ann_search.gpu` stays importable either way
+# for anyone who wants the ImportError to say why.
+if hasattr(_ann_search, "ExhaustiveGpu"):  # pragma: no cover - build-dependent
+    from .gpu import CagraGpuIndex, ExhaustiveGpuIndex, IvfGpuIndex
+
+    __all__ += ["CagraGpuIndex", "ExhaustiveGpuIndex", "IvfGpuIndex"]

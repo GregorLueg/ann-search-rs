@@ -65,3 +65,14 @@ def test_query_before_fit(data):
 def test_unknown_search_knob_rejected(data):
     with pytest.raises(TypeError, match="unexpected search argument"):
         ann.HnswIndex().fit(data).kneighbors(data[:5], nprobe=3)
+
+
+def test_unknown_soar_rule_rejected(data):
+    with pytest.raises(ValueError, match="unknown SOAR rule"):
+        ann.SoarIndex(rule="nonsense").fit(data)
+
+
+@pytest.mark.parametrize("rule", ["nearest", "orthogonal", "shifted"])
+def test_soar_rules_all_build(rule, data):
+    idx = ann.SoarIndex(n_neighbors=5, rule=rule).fit(data)
+    assert idx.kneighbors()[1].shape == (len(data), 5)

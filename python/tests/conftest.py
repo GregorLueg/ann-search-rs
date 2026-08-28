@@ -11,12 +11,22 @@ import ann_search as ann
 
 #: Every estimator, with the per-algorithm recall floor its defaults should
 #: clear on `clustered` at k=10. Exact indices are pinned at 1.0.
+#:
+#: BallTree's floor is low because its `search_budget` defaults to 5% of the
+#: indexed points, and 5% of a 2100-row fixture is 105 nodes. The same default
+#: clears 0.83 on 20k points and 0.99 at a 10% budget, so this is the fixture
+#: being small rather than the index being weak.
 APPROXIMATE: dict[type, float] = {
     ann.AnnoyIndex: 0.90,
+    ann.BallTreeIndex: 0.40,
     ann.HnswIndex: 0.95,
     ann.IvfIndex: 0.70,
+    ann.KdTreeIndex: 0.95,
+    ann.LshIndex: 0.80,
     ann.NNDescentIndex: 0.90,
     ann.NsgIndex: 0.90,
+    ann.RnnDescentIndex: 0.95,
+    ann.SoarIndex: 0.90,
     ann.VamanaIndex: 0.90,
 }
 

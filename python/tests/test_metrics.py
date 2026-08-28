@@ -45,7 +45,30 @@ def test_unknown_metric_raises_rather_than_falling_back(data):
         ann.HnswIndex(metric="jaccard").fit(data)
 
 
-@pytest.mark.parametrize("cls", [ann.KmknnIndex, ann.AnnoyIndex])
+@pytest.mark.parametrize(
+    "cls",
+    [
+        ann.AnnoyIndex,
+        ann.BallTreeIndex,
+        ann.KmknnIndex,
+        ann.LshIndex,
+        ann.SoarIndex,
+    ],
+    ids=lambda c: c.__name__,
+)
 def test_manhattan_rejected_where_unsupported(cls, data):
     with pytest.raises(ValueError, match="unsupported metric"):
         cls(metric="manhattan").fit(data)
+
+
+@pytest.mark.parametrize(
+    "cls", [ann.KdTreeIndex, ann.RnnDescentIndex], ids=lambda c: c.__name__
+)
+def test_manhattan_accepted_where_supported(cls, data):
+    ours = cls(n_neighbors=5, metric="manhattan").fit(data)
+    ref = sklearn_neighbors.NearestNeighbors(
+        n_neighbors=5, metric="manhattan", algorithm="brute"
+    ).fit(data)
+    # Both are approximate, so compare the distances they did find rather than
+    # demanding the same neighbour sets.
+    assert ours.kneighbors(data[:50])[0].mean() >= ref.kneighbors(data[:50])[0].mean()

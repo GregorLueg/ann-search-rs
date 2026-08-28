@@ -15,8 +15,22 @@ publish = false
 name = "_ann_search"
 crate-type = ["cdylib"]
 
+[features]
+## On by default. The published wheel carries the GPU indices, because the
+## backend is wgpu rather than CUDA: there is no driver runtime to ship, and the
+## whole thing costs about 3 MB. Splitting it into a second distribution buys
+## nothing at that price.
+default = ["gpu"]
+
+## Bind the CubeCL/wgpu GPU indices alongside the CPU ones. Fixed at wheel-build
+## time: a Python extra cannot switch it, since extras only add Python
+## requirements and never change the compiled artefact. Build with
+## `--no-default-features` for a CPU-only wheel roughly a third the size.
+gpu = ["ann-search-rs/gpu", "dep:cubecl"]
+
 [dependencies]
 ann-search-rs = { path = "..", default-features = false, features = ["serialise", "synthetic"] }
+cubecl = { version = "0.10.0", features = ["wgpu", "cpu"], optional = true }
 num-traits = "0.2"
 faer = "0.23.2"
 numpy = "0.29"
