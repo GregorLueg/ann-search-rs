@@ -7,6 +7,7 @@ use faer::RowRef;
 use num_traits::Float;
 use std::fmt::Display;
 use std::iter::Sum;
+#[cfg(target_arch = "x86_64")]
 use std::sync::OnceLock;
 use wide::{f32x4, f32x8, f64x2, f64x4, CmpEq};
 
@@ -104,36 +105,63 @@ pub enum SimdLevel {
     Avx512,
 }
 
+#[cfg(target_arch = "x86_64")]
 static SIMD_LEVEL: OnceLock<SimdLevel> = OnceLock::new();
 
 /// Function to detect which SIMD implementation to use
+///
+/// Only x86-64 needs a runtime probe, and it must keep one: a shipped crate
+/// cannot assume AVX2 without an illegal-instruction crash on older hardware.
+/// Every other target resolves at compile time, which matters more than it
+/// looks. Behind the `OnceLock` the level is opaque to the optimiser, so the
+/// dispatch `match` and the kernel call survive into the inner loop; as a
+/// constant they both fold away and the kernel inlines. At `dim = 32` the
+/// kernel is only a couple of dozen SIMD instructions, so that overhead was a
+/// significant fraction of it.
+///
+/// ### Returns
+///
+/// The widest SIMD level available on this target.
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
 pub fn detect_simd_level() -> SimdLevel {
     *SIMD_LEVEL.get_or_init(|| {
-        #[cfg(target_arch = "x86_64")]
-        {
-            if is_x86_feature_detected!("avx512f") {
-                return SimdLevel::Avx512;
-            }
-            if is_x86_feature_detected!("avx2") {
-                return SimdLevel::Avx2;
-            }
-            if is_x86_feature_detected!("sse4.1") {
-                return SimdLevel::Sse;
-            }
-            return SimdLevel::Scalar;
+        if is_x86_feature_detected!("avx512f") {
+            return SimdLevel::Avx512;
         }
-
-        #[cfg(target_arch = "aarch64")]
-        {
-            // NEON is always available on aarch64
-            SimdLevel::Sse
+        if is_x86_feature_detected!("avx2") {
+            return SimdLevel::Avx2;
         }
-
-        #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
-        {
-            SimdLevel::Scalar
+        if is_x86_feature_detected!("sse4.1") {
+            return SimdLevel::Sse;
         }
+        SimdLevel::Scalar
     })
+}
+
+/// Function to detect which SIMD implementation to use
+///
+/// NEON is part of the aarch64 baseline, so this is a constant and the whole
+/// dispatch folds away at compile time.
+///
+/// ### Returns
+///
+/// [`SimdLevel::Sse`], the 128-bit path, which is what NEON provides.
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+pub const fn detect_simd_level() -> SimdLevel {
+    SimdLevel::Sse
+}
+
+/// Function to detect which SIMD implementation to use
+///
+/// ### Returns
+///
+/// [`SimdLevel::Scalar`] on targets with no supported vector path.
+#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+#[inline(always)]
+pub const fn detect_simd_level() -> SimdLevel {
+    SimdLevel::Scalar
 }
 
 /// Trait for SIMD-optimised operations

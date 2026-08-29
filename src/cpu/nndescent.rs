@@ -12,7 +12,7 @@ use std::{
     cmp::Reverse,
     collections::BinaryHeap,
     sync::atomic::{AtomicU32, AtomicUsize, Ordering},
-    time::Instant,
+    time::{Duration, Instant},
 };
 use thousands::*;
 
@@ -107,6 +107,161 @@ const NND_GEMM_MIN_DIM: usize = 128;
 /// A short candidate list makes the matmul too skinny to amortise its own
 /// setup, and the gather then buys nothing.
 const NND_GEMM_MIN_CANDIDATES: usize = 32;
+
+////////////////////
+// Build timings  //
+////////////////////
+
+/// Merged candidate-list size statistics, accumulated inside the local join.
+///
+/// The join is `O(|C_new| * |C_total|)` per node, so the distribution of
+/// `|C_total|` is what sets its cost. Since `2e866da` dropped the cap on the
+/// merged forward+reverse list, that distribution is driven by the reverse
+/// in-degree tail, which is fat on hub-heavy data. Three integer ops per node
+/// against a quadratic distance loop, so this is always on rather than gated.
+#[derive(Default, Clone, Copy)]
+struct CandStats {
+    /// Merged list lengths summed over the nodes seen
+    sum: usize,
+    /// Nodes seen
+    count: usize,
+    /// Longest merged list seen
+    max: usize,
+    /// Candidate pairs whose distance was evaluated
+    pairs: u64,
+}
+
+impl CandStats {
+    /// Record one node's merged candidate list length.
+    ///
+    /// ### Params
+    ///
+    /// * `n_total` - Length of the merged new + old candidate list
+    #[inline(always)]
+    fn record(&mut self, n_total: usize) {
+        self.sum += n_total;
+        self.count += 1;
+        if n_total > self.max {
+            self.max = n_total;
+        }
+    }
+
+    /// Combine two thread-local accumulators.
+    ///
+    /// ### Params
+    ///
+    /// * `other` - Accumulator to fold in
+    ///
+    /// ### Returns
+    ///
+    /// The combined statistics.
+    fn merge(self, other: Self) -> Self {
+        Self {
+            sum: self.sum + other.sum,
+            count: self.count + other.count,
+            max: self.max.max(other.max),
+            pairs: self.pairs + other.pairs,
+        }
+    }
+}
+
+/// Per-phase wall-clock breakdown of a build, accumulated across iterations.
+///
+/// Only populated when `verbose` is set. Every phase is timed from the driving
+/// loop rather than from inside the parallel closures, so the cost is a handful
+/// of `Instant::now()` calls per iteration and nothing in the inner loops.
+///
+/// The phases partition the build: `forest` and `seed` are initialisation,
+/// the remaining four are the descent, and they sum to roughly the total.
+#[derive(Default, Clone, Copy)]
+struct BuildTimings {
+    /// RP-forest construction (Annoy, or Kd for Manhattan)
+    forest: Duration,
+    /// Seeding the flat graph by querying the forest once per node
+    seed: Duration,
+    /// Sampling forward candidates and building their reverse CSR
+    candidates: Duration,
+    /// Retiring the is-new flags of sampled edges
+    mark_old: Duration,
+    /// The local join itself: candidate gather plus pairwise distances
+    join: Duration,
+    /// Radix sorting each chunk's update batch by target
+    sort: Duration,
+    /// Merging sorted updates back into the graph rows
+    apply: Duration,
+    /// Updates emitted by the join, before deduplication or heap rejection
+    updates_emitted: usize,
+    /// Updates that actually changed a graph row
+    updates_accepted: usize,
+    /// Merged candidate list lengths summed over every node and iteration
+    cand_len_sum: usize,
+    /// Nodes contributing to `cand_len_sum`
+    cand_len_count: usize,
+    /// Longest merged candidate list seen
+    cand_len_max: usize,
+    /// Candidate pairs whose distance was evaluated
+    pairs: u64,
+}
+
+impl BuildTimings {
+    /// Total time attributed to the descent iterations.
+    fn descent(&self) -> Duration {
+        self.candidates + self.mark_old + self.join + self.sort + self.apply
+    }
+
+    /// Print the breakdown as a table, each phase against its share of the total.
+    ///
+    /// ### Params
+    ///
+    /// * `n` - Number of samples, for the per-node figures
+    /// * `k` - Neighbours per node
+    fn report(&self, n: usize, k: usize) {
+        let total = self.forest + self.seed + self.descent();
+        let secs = total.as_secs_f64().max(f64::MIN_POSITIVE);
+        let row = |name: &str, d: Duration| {
+            println!(
+                "  {:<22} {:>9.3} s  {:>5.1}%",
+                name,
+                d.as_secs_f64(),
+                100.0 * d.as_secs_f64() / secs
+            );
+        };
+
+        println!("\nNN-Descent build breakdown (n={n}, k={k}):");
+        row("forest build", self.forest);
+        row("graph seeding", self.seed);
+        row("candidates", self.candidates);
+        row("mark old", self.mark_old);
+        row("local join", self.join);
+        row("radix sort", self.sort);
+        row("apply updates", self.apply);
+        println!("  {:<22} {:>9.3} s", "total", total.as_secs_f64());
+
+        let accept = if self.updates_emitted > 0 {
+            100.0 * self.updates_accepted as f64 / self.updates_emitted as f64
+        } else {
+            0.0
+        };
+        println!(
+            "  updates: {} emitted, {} accepted ({:.2}%)",
+            self.updates_emitted.separate_with_underscores(),
+            self.updates_accepted.separate_with_underscores(),
+            accept
+        );
+
+        if self.cand_len_count > 0 {
+            println!(
+                "  merged candidate list: mean {:.1}, max {}",
+                self.cand_len_sum as f64 / self.cand_len_count as f64,
+                self.cand_len_max
+            );
+            println!(
+                "  candidate pairs evaluated: {}",
+                self.pairs.separate_with_underscores()
+            );
+        }
+    }
+}
 
 ////////////////
 // Raw writes //
@@ -234,7 +389,14 @@ impl CandidateSets {
     /// Merge node `i`'s forward sample with its reverse edges into `out`.
     ///
     /// Sorted ascending and deduplicated, which is what the pair loop and the
-    /// tile gather both want. Deliberately unbounded: see the type docs.
+    /// tile gather both want.
+    ///
+    /// Deliberately unbounded: see the type docs. Capping it was measured on a
+    /// 500k x 32 real embedding and does not pay. Clipping the list to twice
+    /// `max_candidates` drops 17% of candidate pairs for no wall-clock change,
+    /// because the in-degree tail is rare rather than dominant; clipping to
+    /// `max_candidates` itself buys 16% but costs recall, which is the trade
+    /// `2e866da` already rejected.
     ///
     /// ### Params
     ///
@@ -278,7 +440,8 @@ impl CandidateSets {
 #[inline(always)]
 fn edge_priority(seed: u64, u: u32, v: u32) -> u64 {
     let (lo, hi) = if u < v { (u, v) } else { (v, u) };
-    let mut z = ((hi as u64) << 32 | lo as u64).wrapping_add(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15));
+    let mut z =
+        ((hi as u64) << 32 | lo as u64).wrapping_add(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15));
     z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
     z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
     z ^ (z >> 31)
@@ -645,6 +808,40 @@ where
         }
     }
 
+    /// Query into reusable scratch, leaving `(distance, id)` pairs sorted
+    /// nearest-first in `scratch.candidates`.
+    ///
+    /// Only the Annoy arm has an allocation-free form; the Kd arm falls back to
+    /// the allocating query and copies its result across, which keeps Manhattan
+    /// working without a second scratch type for a path that is not the default.
+    ///
+    /// ### Params
+    ///
+    /// * `query_vec` - The query vector
+    /// * `k` - Number of neighbours to return
+    /// * `search_k` - The budget
+    /// * `scratch` - Reusable buffers, reset on entry
+    ///
+    /// ### Returns
+    ///
+    /// `Ok(())`, with results left in `scratch.candidates`.
+    fn query_into(
+        &self,
+        query_vec: &[T],
+        k: usize,
+        search_k: Option<usize>,
+        scratch: &mut AnnoyScratch<T>,
+    ) -> Result<(), AnnSearchErrors> {
+        match self {
+            Forest::Annoy(f) => f.query_into(query_vec, k, search_k, scratch),
+            Forest::Kd(f) => {
+                let (ids, dists) = f.query(query_vec, k, search_k)?;
+                scratch.set_candidates(ids.into_iter().zip(dists).map(|(i, d)| (d, i)));
+                Ok(())
+            }
+        }
+    }
+
     /// Memory footprint in bytes.
     ///
     /// ### Returns
@@ -861,9 +1058,14 @@ where
             Vec::new()
         };
 
+        // Capped at 12, matching PyNNDescent. Measured on a 500k x 32 real
+        // single-cell PCA embedding, raw recall@30 is flat at 0.9990 from 6
+        // trees to 32 while build time runs 7.0 s to 9.0 s, so everything past
+        // the cap is paid twice: once building the forest and again in the
+        // per-node search budget, which scales with `n_trees`.
         let n_trees = n_trees.unwrap_or_else(|| {
             let calculated = 5 + ((n as f64).powf(0.25)).round() as usize;
-            calculated.min(32)
+            calculated.min(12)
         });
 
         let max_iter = max_iter.unwrap_or_else(|| {
@@ -878,8 +1080,9 @@ where
         // Feed the forest the buffer we already flattened. Handing it the
         // caller's matrix again would walk the whole thing a second time.
         let forest = Forest::new((&vectors_flat[..], n, dim), n_trees, metric, seed)?;
+        let forest_time = start.elapsed();
         if verbose {
-            println!("Built forest: {:.2?}", start.elapsed());
+            println!("Built forest: {forest_time:.2?}");
         }
 
         let builder = NNDescent {
@@ -895,8 +1098,15 @@ where
             original_ids: (0..n).collect(),
         };
 
-        let (build_graph, converged) =
-            builder.generate_index(k, max_iter, delta, max_candidates, seed, verbose)?;
+        let (build_graph, converged) = builder.generate_index(
+            k,
+            max_iter,
+            delta,
+            max_candidates,
+            seed,
+            forest_time,
+            verbose,
+        )?;
 
         let graph = if diversify_prob > T::zero() {
             builder.diversify_graph(&build_graph, k, diversify_prob, seed)
@@ -1034,18 +1244,18 @@ where
     fn init_with_forest(&self, k: usize) -> Result<Vec<Neighbour<T>>, AnnSearchErrors> {
         let sentinel = Neighbour::new(SENTINEL_PID, T::max_value(), false);
         let mut graph = vec![sentinel; self.n * k];
-        graph.par_chunks_mut(k).enumerate().try_for_each(
-            |(i, slot)| -> Result<(), AnnSearchErrors> {
+        let search_k = k * self.forest.n_trees();
+
+        // One query per node, so the scratch is reused across a whole rayon
+        // job rather than reallocated per node. A fresh visited bitset here
+        // cost `n` allocations of `n / 8` zeroed bytes.
+        graph.par_chunks_mut(k).enumerate().try_for_each_init(
+            AnnoyScratch::<T>::new,
+            |scratch, (i, slot)| -> Result<(), AnnSearchErrors> {
                 let query = &self.vectors_flat[i * self.dim..(i + 1) * self.dim];
-                let search_k = k * self.forest.n_trees();
-                let (indices, distances) = self.forest.query(query, k + 1, Some(search_k))?;
-                for (j, (idx, dist)) in indices
-                    .into_iter()
-                    .zip(distances)
-                    .skip(1)
-                    .take(k)
-                    .enumerate()
-                {
+                self.forest
+                    .query_into(query, k + 1, Some(search_k), scratch)?;
+                for (j, &(dist, idx)) in scratch.results().iter().skip(1).take(k).enumerate() {
                     slot[j] = Neighbour::new(idx, dist, true);
                 }
                 Ok(())
@@ -1069,11 +1279,15 @@ where
     /// * `delta` - Convergence threshold (fraction of edges updated)
     /// * `max_candidates` - Max candidates sampled per node per iteration
     /// * `seed` - Random seed for per-iteration sampling
+    /// * `forest_time` - Time already spent building the RP forest, so the
+    ///   verbose breakdown can account for the whole build rather than just
+    ///   the part after the forest
     /// * `verbose` - Print progress information
     ///
     /// ### Returns
     ///
     /// Tuple of (flat graph as `(pid, dist)` pairs, converged flag)
+    #[allow(clippy::too_many_arguments)]
     fn generate_index(
         &self,
         k: usize,
@@ -1081,6 +1295,7 @@ where
         delta: T,
         max_candidates: usize,
         seed: usize,
+        forest_time: Duration,
         verbose: bool,
     ) -> Result<(Vec<(usize, T)>, bool), AnnSearchErrors> {
         if verbose {
@@ -1093,11 +1308,17 @@ where
 
         let mut converged = false;
 
+        let mut timings = BuildTimings {
+            forest: forest_time,
+            ..Default::default()
+        };
+
         let start = Instant::now();
         let mut graph = self.init_with_forest(k)?;
+        timings.seed = start.elapsed();
 
         if verbose {
-            println!("Queried Annoy index: {:.2?}", start.elapsed());
+            println!("Seeded graph from forest: {:.2?}", timings.seed);
         }
 
         let mut chunk_size = self.initial_chunk_size(max_candidates);
@@ -1119,9 +1340,13 @@ where
             if verbose {
                 println!(" Preparing candidates for iter {}", iter + 1);
             }
+            let t = Instant::now();
             self.build_candidates(&graph, k, max_candidates, iter_seed, &mut cands);
+            timings.candidates += t.elapsed();
 
+            let t = Instant::now();
             self.mark_as_old(&mut graph, k, &cands);
+            timings.mark_old += t.elapsed();
 
             if verbose {
                 println!(" Processing updates for iter {}", iter + 1);
@@ -1132,15 +1357,29 @@ where
             while chunk_start < self.n {
                 let chunk_end = (chunk_start + chunk_size).min(self.n);
 
-                let mut chunk_updates =
+                let t = Instant::now();
+                let (mut chunk_updates, stats) =
                     self.generate_updates_for_chunk(&cands, &graph, k, chunk_start, chunk_end);
+                timings.join += t.elapsed();
+                timings.updates_emitted += chunk_updates.len();
+                timings.cand_len_sum += stats.sum;
+                timings.cand_len_count += stats.count;
+                timings.cand_len_max = timings.cand_len_max.max(stats.max);
+                timings.pairs += stats.pairs;
 
+                let t = Instant::now();
                 chunk_updates.radix_sort_unstable();
+                timings.sort += t.elapsed();
 
+                let t = Instant::now();
                 self.apply_sorted_updates(&chunk_updates, &mut graph, k, &updates_count);
+                timings.apply += t.elapsed();
 
-                chunk_size =
-                    self.rescale_chunk_size(chunk_size, chunk_end - chunk_start, chunk_updates.len());
+                chunk_size = self.rescale_chunk_size(
+                    chunk_size,
+                    chunk_end - chunk_start,
+                    chunk_updates.len(),
+                );
                 chunk_start = chunk_end;
                 n_chunks += 1;
             }
@@ -1150,6 +1389,7 @@ where
             }
 
             let update_count = updates_count.load(Ordering::Relaxed);
+            timings.updates_accepted += update_count;
             let update_rate = T::from_usize(update_count).unwrap()
                 / T::from_usize(self.n * max_candidates).unwrap();
 
@@ -1172,7 +1412,7 @@ where
         }
 
         if verbose {
-            println!("Total time: {:.2?}", start.elapsed());
+            timings.report(self.n, k);
         }
 
         let res = graph.into_iter().map(|n| (n.pid(), n.dist)).collect();
@@ -1324,7 +1564,7 @@ where
         k: usize,
         chunk_start: usize,
         chunk_end: usize,
-    ) -> Vec<Update<T>> {
+    ) -> (Vec<Update<T>>, CandStats) {
         match self.metric {
             Dist::SquaredEuclidean => self.generate_updates_for_chunk_impl::<SqEuclidMetric>(
                 cands,
@@ -1392,7 +1632,7 @@ where
         k: usize,
         chunk_start: usize,
         chunk_end: usize,
-    ) -> Vec<Update<T>> {
+    ) -> (Vec<Update<T>>, CandStats) {
         let dim = self.dim;
         let cosine = self.metric == Dist::Cosine;
         let two = T::one() + T::one();
@@ -1404,13 +1644,15 @@ where
                     (
                         Vec::<Update<T>>::with_capacity(16_384),
                         JoinScratch::<T>::new(),
+                        CandStats::default(),
                     )
                 },
-                |(mut updates, mut scratch), i| {
+                |(mut updates, mut scratch, mut stats), i| {
                     let n_new = scratch.gather(self, graph, k, cands, i, cosine);
                     let n_total = scratch.ids.len();
+                    stats.record(n_total);
                     if n_new == 0 || n_total < 2 {
-                        return (updates, scratch);
+                        return (updates, scratch, stats);
                     }
 
                     let use_gemm = self.gemm_join_applies(n_total);
@@ -1418,6 +1660,7 @@ where
                         scratch.compute_dots(n_new, n_total, dim);
                     }
 
+                    stats.pairs += (n_new * n_total - n_new * (n_new + 1) / 2) as u64;
                     for a in 0..n_new {
                         let pa = scratch.ids[a];
                         let ta = scratch.thresh[a];
@@ -1450,7 +1693,8 @@ where
                                 )
                             };
 
-                            if d > ta && d > scratch.thresh[b] {
+                            let tb = scratch.thresh[b];
+                            if d > ta && d > tb {
                                 continue;
                             }
 
@@ -1470,24 +1714,38 @@ where
                                 d
                             };
 
-                            updates.push(Update::new(pa, pb, d));
-                            updates.push(Update::new(pb, pa, d));
+                            // Emit each direction only if it clears that
+                            // endpoint's own threshold. Rows only ever improve,
+                            // so an update failing its target's current worst
+                            // distance here is certain to be rejected at apply
+                            // time; carrying it costs a sort key and an apply
+                            // scan for nothing.
+                            if d <= ta {
+                                updates.push(Update::new(pa, pb, d));
+                            }
+                            if d <= tb {
+                                updates.push(Update::new(pb, pa, d));
+                            }
                         }
                     }
 
-                    (updates, scratch)
+                    (updates, scratch, stats)
                 },
             )
-            .map(|(updates, _)| updates)
-            .reduce(Vec::new, |mut a, mut b| {
-                if a.len() >= b.len() {
-                    a.extend_from_slice(&b);
-                    a
-                } else {
-                    b.extend_from_slice(&a);
-                    b
-                }
-            })
+            .map(|(updates, _, stats)| (updates, stats))
+            .reduce(
+                || (Vec::new(), CandStats::default()),
+                |(mut a, sa), (mut b, sb)| {
+                    let merged = sa.merge(sb);
+                    if a.len() >= b.len() {
+                        a.extend_from_slice(&b);
+                        (a, merged)
+                    } else {
+                        b.extend_from_slice(&a);
+                        (b, merged)
+                    }
+                },
+            )
     }
 
     /// Calculate distance between two indexed points under the index metric
@@ -1842,128 +2100,95 @@ where
 // ApplySortedUpdates //
 ////////////////////////
 
-/// Generates the `ApplySortedUpdates` impl for a concrete float type.
+/// In-place merge of a target's sorted update segment into its graph row.
 ///
-/// The logic is identical for f32 and f64; only the thread-local storage
-/// keys differ.
-macro_rules! impl_apply_sorted_updates {
-    ($float:ty, $sorted_tls:ident) => {
-        impl ApplySortedUpdates<$float> for NNDescent<$float> {
-            fn apply_sorted_updates(
-                &self,
-                updates: &[Update<$float>],
-                graph: &mut [Neighbour<$float>],
-                k: usize,
-                updates_count: &AtomicUsize,
-            ) {
-                if updates.is_empty() {
+/// The row is already the sorted structure this needs: `k` entries ascending by
+/// distance, sentinel-padded. Merging directly into it drops the previous
+/// approach's per-target rebuild of a thread-local `SortedBuffer` and its
+/// `n`-bit duplicate set, both of which cost the full `k` even when a single
+/// update landed. Duplicate detection is a linear scan of the row, which for
+/// realistic `k` is a couple of contiguous cache lines against the bitset's
+/// scattered reads over `n / 8` bytes.
+impl<T: AnnSearchFloat> ApplySortedUpdates<T> for NNDescent<T> {
+    fn apply_sorted_updates(
+        &self,
+        updates: &[Update<T>],
+        graph: &mut [Neighbour<T>],
+        k: usize,
+        updates_count: &AtomicUsize,
+    ) {
+        if updates.is_empty() || k == 0 {
+            return;
+        }
+
+        let graph_ptr = UnsafeGraphPtr(graph.as_mut_ptr());
+
+        // `par_chunk_by` splits the sorted batch on target boundaries directly,
+        // which saves a sequential boundary scan plus the Vec of segment
+        // descriptors it used to feed.
+        updates
+            .par_chunk_by(|a, b| a.target == b.target)
+            .for_each(|segment| {
+                let target = segment[0].target as usize;
+
+                #[allow(clippy::redundant_locals)]
+                let graph_ptr = graph_ptr;
+
+                // SAFETY: each segment covers one target, and the batch is
+                // sorted by target, so this thread owns the row for the whole
+                // call and no other thread aliases it.
+                let row = unsafe { std::slice::from_raw_parts_mut(graph_ptr.0.add(target * k), k) };
+
+                // Most segments change nothing once the graph settles, so bail
+                // before touching the row if not one update can beat its
+                // current worst neighbour. Sentinel-padded rows hold MAX, so
+                // short rows always pass.
+                let mut cutoff = row[k - 1].dist;
+                if segment.iter().all(|u| u.dist > cutoff) {
                     return;
                 }
 
-                let graph_ptr = UnsafeGraphPtr(graph.as_mut_ptr());
+                let mut edge_updates = 0usize;
 
-                // `par_chunk_by` splits the sorted batch on target boundaries
-                // directly, which saves a sequential boundary scan plus the
-                // Vec of segment descriptors it used to feed.
-                updates
-                    .par_chunk_by(|a, b| a.target == b.target)
-                    .for_each(|segment| {
-                    let target = segment[0].target as usize;
+                for update in segment {
+                    let d = update.dist;
+                    if d > cutoff {
+                        continue;
+                    }
+                    let src = update.source as usize;
 
-                    #[allow(clippy::redundant_locals)]
-                    let graph_ptr = graph_ptr;
-
-                    // Most segments change nothing once the graph settles, so
-                    // bail before touching the heap or the bitset if not one
-                    // update can beat the target's current worst neighbour.
-                    // Sentinel-padded rows hold MAX, so short rows always pass.
-                    // SAFETY: this thread owns target's row for the whole call,
-                    // so nothing else writes the slot being read.
-                    let cutoff =
-                        unsafe { (*graph_ptr.0.add(target * k + k - 1)).dist };
-                    if segment.iter().all(|u| u.dist > cutoff) {
-                        return;
+                    // One pass finds both the duplicate and the insertion
+                    // point. The scan must run to the end regardless, since a
+                    // duplicate can sit past the insertion point.
+                    let mut pos = k;
+                    let mut duplicate = false;
+                    for (i, slot) in row.iter().enumerate() {
+                        let pid = slot.pid();
+                        if pid == src {
+                            duplicate = true;
+                            break;
+                        }
+                        if pos == k && (d < slot.dist || (d == slot.dist && src < pid)) {
+                            pos = i;
+                        }
                     }
 
-                    $sorted_tls.with(|sorted_cell| {
-                        PID_SET.with(|set_cell| {
-                            let mut sorted = sorted_cell.borrow_mut();
-                            let mut pid_set = set_cell.borrow_mut();
+                    if duplicate || pos == k {
+                        continue;
+                    }
 
-                            sorted.clear();
-                            if pid_set.len() < self.n {
-                                pid_set.grow(self.n);
-                            }
+                    row.copy_within(pos..k - 1, pos + 1);
+                    row[pos] = Neighbour::new(src, d, true);
+                    cutoff = row[k - 1].dist;
+                    edge_updates += 1;
+                }
 
-                            let start_idx = target * k;
-
-                            // SAFETY: Each thread processes a unique target.
-                            // No two threads alias the same slice.
-                            let target_slice = unsafe {
-                                std::slice::from_raw_parts_mut(graph_ptr.0.add(start_idx), k)
-                            };
-
-                            let mut edge_updates = 0usize;
-
-                            // Load current neighbours in ascending distance order.
-                            for n in target_slice.iter() {
-                                if n.is_sentinel() {
-                                    continue;
-                                }
-                                let pid = n.pid();
-                                sorted.insert((OrderedFloat(n.dist), pid as u32, n.is_new()), k);
-                                pid_set.insert(pid);
-                            }
-
-                            // Merge incoming updates.
-                            for update in segment {
-                                let src = update.source as usize;
-                                if pid_set.contains(src) {
-                                    continue;
-                                }
-                                let evicted_pid: Option<u32> = if sorted.len() == k {
-                                    sorted.top().map(|&(_, pid, _)| pid)
-                                } else {
-                                    None
-                                };
-                                let entry = (OrderedFloat(update.dist), update.source, true);
-                                if sorted.insert(entry, k) {
-                                    if let Some(pid) = evicted_pid {
-                                        pid_set.remove(pid as usize);
-                                    }
-                                    pid_set.insert(src);
-                                    edge_updates += 1;
-                                }
-                            }
-
-                            if edge_updates > 0 {
-                                updates_count.fetch_add(edge_updates, Ordering::Relaxed);
-
-                                for (i, &(OrderedFloat(d), pid, is_new)) in
-                                    sorted.data().iter().enumerate()
-                                {
-                                    target_slice[i] = Neighbour::new(pid as usize, d, is_new);
-                                }
-                                for i in sorted.len()..k {
-                                    target_slice[i] =
-                                        Neighbour::new(SENTINEL_PID, <$float>::MAX, false);
-                                }
-                            }
-
-                            // Clear pid_set entries left in sorted.
-                            for &(_, pid, _) in sorted.data().iter() {
-                                pid_set.remove(pid as usize);
-                            }
-                        })
-                    })
-                });
-            }
-        }
-    };
+                if edge_updates > 0 {
+                    updates_count.fetch_add(edge_updates, Ordering::Relaxed);
+                }
+            });
+    }
 }
-
-impl_apply_sorted_updates!(f32, SORTED_F32);
-impl_apply_sorted_updates!(f64, SORTED_F64);
 
 ////////////////////
 // NNDescentQuery //
@@ -2980,7 +3205,10 @@ mod tests {
         )
         .unwrap();
 
-        assert!(!index.gemm_join_applies(1_000), "test data took the GEMM path");
+        assert!(
+            !index.gemm_join_applies(1_000),
+            "test data took the GEMM path"
+        );
 
         let dim = index.dim;
         for i in 0..index.n {
