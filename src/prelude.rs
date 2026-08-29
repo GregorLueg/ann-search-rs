@@ -12,6 +12,7 @@ pub use crate::utils::k_means_utils::{KMeansInit, KMeansTrainingParams, LloydPat
 pub use crate::utils::matrix_to_flat;
 pub use crate::utils::parallelism::StripedLocks;
 pub use crate::utils::prefetch_read;
+pub use crate::utils::graph_utils::ThreadLocalSearchState;
 pub use crate::utils::traits::AnnSearchFloat;
 pub use crate::utils::DimensionValidation;
 pub use crate::utils::FlattenData;
@@ -33,6 +34,9 @@ pub use crate::gpu::k_means_gpu::KMeansGpuParams;
 pub use crate::gpu::nndescent_gpu::{KnnGraphGpu, NNDescentGpu};
 #[cfg(feature = "gpu")]
 pub use cubecl_utils_rs::CubeclFloat;
+
+#[cfg(feature = "quantised")]
+pub use crate::quantised::uniform_quant::UniformQuantParams;
 
 #[cfg(feature = "serialise")]
 pub use crate::serialise::IndexIo;

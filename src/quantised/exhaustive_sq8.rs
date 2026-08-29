@@ -1,12 +1,10 @@
-//! Exhaustive SQ8 index: quantises the original data to scalar quantisation
-//! to 8 bit (i8).
+//! Exhaustive SQ8 index: stores the vectors as uniformly quantised 8-bit
+//! codes and scans them with the integer kernel.
 
 use faer::RowRef;
-use num_traits::{Float, FromPrimitive, ToPrimitive};
 use rayon::prelude::*;
 use std::{
     collections::BinaryHeap,
-    iter::Sum,
     sync::{
         atomic::{AtomicUsize, Ordering},
         Arc,
@@ -15,60 +13,59 @@ use std::{
 use thousands::*;
 
 use crate::prelude::*;
-use crate::quantised::quantisers::*;
+use crate::quantised::hnsw_quantised::codec::GraphCodec;
+use crate::quantised::sq8u_codec::*;
+use crate::quantised::uniform_quant::*;
 
 /////////////////////
 // Index structure //
 /////////////////////
 
-/// Exhaustive (brute-force) nearest neighbour index with scalar 8-bit quantisation
+/// Exhaustive (brute-force) nearest neighbour index with scalar 8-bit
+/// quantisation
+///
+/// ### Note
+///
+/// The quantisation shares one scale across every dimension. That is what
+/// makes the integer distance between two codes preserve the ordering of the
+/// float distance exactly, so the scan can stay in integer arithmetic. A
+/// per-dimension scale would be finer-grained but would not cancel in a
+/// code-to-code distance, which silently computes a reweighted metric instead
+/// of the requested one.
 ///
 /// ### Fields
 ///
-/// * `quantised_vectors` - Original vector data quantised to `i8`. Flattened
-///   for better cache locality
-/// * `quantised_norms` - Pre-calculated quantised norms per sample if distance
-///   is set to Cosine
+/// * `codec` - Uniformly quantised storage and its distance arithmetic
 /// * `dim` - Embedding dimensions
 /// * `n` - Number of samples
 /// * `metric` - The type of distance the index is designed for
-/// * `codebook` - The codebook that contains the information of the quantisation
-#[cfg_attr(feature = "serialise", derive(serde::Serialize, serde::Deserialize))]
-pub struct ExhaustiveSq8Index<T> {
-    quantised_vectors: Vec<i8>,
-    quantised_norms: Vec<i32>,
-    dim: usize,
-    n: usize,
-    metric: Dist,
-    codebook: ScalarQuantiser<T>,
-}
-
-//////////////////////
-// VectorDistanceSq //
-//////////////////////
-
-impl<T> VectorDistanceSq8<T> for ExhaustiveSq8Index<T>
+#[cfg_attr(
+    feature = "serialise",
+    derive(serde::Serialize, serde::Deserialize),
+    serde(bound = "")
+)]
+pub struct ExhaustiveSq8Index<T>
 where
-    T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum,
+    T: AnnSearchFloat,
 {
-    fn vectors_flat_quantised(&self) -> &[i8] {
-        &self.quantised_vectors
-    }
-
-    fn dim(&self) -> usize {
-        self.dim
-    }
-
-    fn norms_quantised(&self) -> &[i32] {
-        &self.quantised_norms
-    }
+    /// Uniformly quantised storage and its distance arithmetic.
+    codec: Sq8uCodec<T>,
+    /// Embedding dimensions.
+    dim: usize,
+    /// Number of samples.
+    n: usize,
+    /// The distance metric this index was built for.
+    metric: Dist,
 }
 
 /////////////////////////
 // DimensionValidation //
 /////////////////////////
 
-impl<T> DimensionValidation for ExhaustiveSq8Index<T> {
+impl<T> DimensionValidation for ExhaustiveSq8Index<T>
+where
+    T: AnnSearchFloat,
+{
     fn dim(&self) -> usize {
         self.dim
     }
@@ -88,64 +85,31 @@ where
 
     /// Generate a new exhaustive index with scalar 8-bit quantisation
     ///
-    /// Constructs an exhaustive index with all vectors quantised to i8 using
-    /// a global codebook. Reduces memory by 4x (for f32) whilst maintaining
-    /// reasonable recall through learned quantisation bounds.
+    /// Reduces memory by roughly 4x against `f32` whilst keeping the scan in
+    /// integer arithmetic.
     ///
     /// ### Params
     ///
     /// * `data` - The data for which to generate the index. Samples x features
     /// * `metric` - Which distance metric the index shall be generated for
+    /// * `quant_params` - Optional calibration settings, see
+    ///   [`UniformQuantParams`]. Defaults trim 0.1% from each tail.
     ///
     /// ### Returns
     ///
     /// Initialised exhaustive quantised index
-    pub fn new(data: impl AnnMatrix<T>, metric: Dist) -> Result<Self, AnnSearchErrors> {
-        if metric == Dist::Manhattan {
-            return Err(AnnSearchErrors::DistanceNotSupported(metric));
-        }
-
-        let (mut vectors_flat, n, dim) = data.into_row_major();
-
-        // Normalise for cosine distance
-        if metric == Dist::Cosine {
-            vectors_flat
-                .par_chunks_mut(dim)
-                .for_each(|chunk| normalise_vector(chunk));
-        }
-
-        // Train codebook on all data
-        let codebook = ScalarQuantiser::train(&vectors_flat, dim);
-
-        // Quantise all vectors
-        let mut quantised_vectors = vec![0i8; n * dim];
-        quantised_vectors
-            .par_chunks_mut(dim)
-            .enumerate()
-            .for_each(|(vec_idx, chunk)| {
-                let vec_start = vec_idx * dim;
-                let vec = &vectors_flat[vec_start..vec_start + dim];
-                let quantised = codebook.encode(vec);
-                chunk.copy_from_slice(&quantised);
-            });
-
-        // Calculate quantised norms for cosine
-        let quantised_norms = match metric {
-            Dist::Cosine => quantised_vectors
-                .par_chunks(dim)
-                .map(|chunk| chunk.iter().map(|&v| v as i32 * v as i32).sum())
-                .collect(),
-            Dist::SquaredEuclidean => Vec::new(),
-            Dist::Manhattan => unreachable!(),
-        };
-
+    pub fn new(
+        data: impl AnnMatrix<T>,
+        metric: Dist,
+        quant_params: Option<UniformQuantParams>,
+    ) -> Result<Self, AnnSearchErrors> {
+        let (flat, n, dim) = data.into_row_major();
+        let codec = Sq8uCodec::new(&flat, n, dim, metric, quant_params)?;
         Ok(Self {
-            quantised_vectors,
-            quantised_norms,
+            codec,
             dim,
             n,
             metric,
-            codebook,
         })
     }
 
@@ -153,11 +117,43 @@ where
     // Query (dist) //
     //////////////////
 
+    /// Scan every stored vector and keep the `k` nearest
+    ///
+    /// ### Params
+    ///
+    /// * `encoded` - The prepared query
+    /// * `k` - Number of nearest neighbours to return
+    ///
+    /// ### Returns
+    ///
+    /// A tuple of `(indices, distances)`, nearest first
+    fn scan(&self, encoded: &Sq8uQuery<T>, k: usize) -> (Vec<usize>, Vec<T>) {
+        let k = k.min(self.n);
+        let mut heap: BinaryHeap<(OrderedFloat<T>, usize)> = BinaryHeap::with_capacity(k + 1);
+
+        for idx in 0..self.n {
+            let score = self.codec.score(encoded, idx);
+            if heap.len() < k {
+                heap.push((OrderedFloat(score), idx));
+            } else if score < heap.peek().unwrap().0 .0 {
+                heap.pop();
+                heap.push((OrderedFloat(score), idx));
+            }
+        }
+
+        let mut out: Vec<(OrderedFloat<T>, usize)> = heap.into_vec();
+        out.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
+        out.into_iter()
+            .map(|(OrderedFloat(s), i)| (i, self.codec.finalise(s)))
+            .unzip()
+    }
+
     /// Query function
     ///
-    /// This will do an exhaustive search over the full index (i.e., all samples)
-    /// during querying using quantised distance calculations. To note, this
-    /// becomes prohibitively computationally expensive on large data sets!
+    /// This will do an exhaustive search over the full index (i.e., all
+    /// samples) during querying using quantised distance calculations. To
+    /// note, this becomes prohibitively computationally expensive on large
+    /// data sets!
     ///
     /// ### Params
     ///
@@ -173,59 +169,8 @@ where
         query_vec: &[T],
         k: usize,
     ) -> Result<(Vec<usize>, Vec<T>), AnnSearchErrors> {
-        self.check_dim(query_vec.len())?;
-
-        let mut query_vec = query_vec.to_vec();
-        let k = k.min(self.n);
-
-        // Normalise query for cosine
-        if self.metric == Dist::Cosine {
-            normalise_vector(&mut query_vec);
-        }
-
-        // Encode query
-        let query_i8 = self.codebook.encode(&query_vec);
-        let query_norm_sq: i32 = query_i8.iter().map(|&q| q as i32 * q as i32).sum();
-
-        let mut heap: BinaryHeap<(OrderedFloat<T>, usize)> = BinaryHeap::with_capacity(k + 1);
-
-        match self.metric {
-            Dist::SquaredEuclidean => {
-                for idx in 0..self.n {
-                    let dist = self.euclidean_distance_i8(idx, &query_i8);
-
-                    if heap.len() < k {
-                        heap.push((OrderedFloat(dist), idx));
-                    } else if dist < heap.peek().unwrap().0 .0 {
-                        heap.pop();
-                        heap.push((OrderedFloat(dist), idx));
-                    }
-                }
-            }
-            Dist::Cosine => {
-                for idx in 0..self.n {
-                    let dist = self.cosine_distance_i8(idx, &query_i8, query_norm_sq);
-
-                    if heap.len() < k {
-                        heap.push((OrderedFloat(dist), idx));
-                    } else if dist < heap.peek().unwrap().0 .0 {
-                        heap.pop();
-                        heap.push((OrderedFloat(dist), idx));
-                    }
-                }
-            }
-            Dist::Manhattan => unreachable!(),
-        }
-
-        let mut results: Vec<_> = heap.into_iter().collect();
-        results.sort_unstable_by_key(|&(dist, _)| dist);
-
-        let (distances, indices): (Vec<_>, Vec<_>) = results
-            .into_iter()
-            .map(|(OrderedFloat(dist), idx)| (dist, idx))
-            .unzip();
-
-        Ok((indices, distances))
+        let encoded = self.codec.encode_query(query_vec)?;
+        Ok(self.scan(&encoded, k))
     }
 
     /// Query function for row references
@@ -258,16 +203,16 @@ where
         self.query(&query_vec, k)
     }
 
-    /// Generate kNN graph from vectors stored in the index
+    /// Generate the kNN graph over the stored vectors
     ///
-    /// Queries each vector in the index against itself to build a complete
-    /// kNN graph. Uses pre-quantised vectors directly, avoiding encode overhead.
+    /// Every row queries through its own code, so no re-encoding happens and
+    /// each point finds itself.
     ///
     /// ### Params
     ///
     /// * `k` - Number of neighbours per vector
     /// * `return_dist` - Whether to return distances
-    /// * `verbose` - Controls verbosity
+    /// * `verbose` - Print progress information
     ///
     /// ### Returns
     ///
@@ -280,19 +225,11 @@ where
         verbose: bool,
     ) -> (Vec<Vec<usize>>, Option<Vec<Vec<T>>>) {
         let counter = Arc::new(AtomicUsize::new(0));
+        let k = k.min(self.n);
 
         let results: Vec<(Vec<usize>, Vec<T>)> = (0..self.n)
             .into_par_iter()
             .map(|i| {
-                let start = i * self.dim;
-                let end = start + self.dim;
-                let query_i8 = &self.quantised_vectors[start..end];
-                let query_norm_sq = if self.metric == Dist::Cosine {
-                    self.quantised_norms[i]
-                } else {
-                    0
-                };
-
                 if verbose {
                     let count = counter.fetch_add(1, Ordering::Relaxed) + 1;
                     if count.is_multiple_of(100_000) {
@@ -306,26 +243,21 @@ where
 
                 let mut heap: BinaryHeap<(OrderedFloat<T>, usize)> =
                     BinaryHeap::with_capacity(k + 1);
-
                 for idx in 0..self.n {
-                    let dist = match self.metric {
-                        Dist::SquaredEuclidean => self.euclidean_distance_i8(idx, query_i8),
-                        Dist::Cosine => self.cosine_distance_i8(idx, query_i8, query_norm_sq),
-                        Dist::Manhattan => unreachable!(),
-                    };
-
+                    let score = self.codec.score_sym(i, idx);
                     if heap.len() < k {
-                        heap.push((OrderedFloat(dist), idx));
-                    } else if dist < heap.peek().unwrap().0 .0 {
+                        heap.push((OrderedFloat(score), idx));
+                    } else if score < heap.peek().unwrap().0 .0 {
                         heap.pop();
-                        heap.push((OrderedFloat(dist), idx));
+                        heap.push((OrderedFloat(score), idx));
                     }
                 }
 
-                let mut results: Vec<_> = heap.into_iter().collect();
-                results.sort_unstable_by_key(|&(dist, _)| dist);
-                let (distances, indices) = results.into_iter().map(|(d, i)| (d.0, i)).unzip();
-                (indices, distances)
+                let mut out: Vec<(OrderedFloat<T>, usize)> = heap.into_vec();
+                out.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
+                out.into_iter()
+                    .map(|(OrderedFloat(s), idx)| (idx, self.codec.finalise(s)))
+                    .unzip()
             })
             .collect();
 
@@ -333,9 +265,17 @@ where
             let (indices, distances) = results.into_iter().unzip();
             (indices, Some(distances))
         } else {
-            let indices: Vec<Vec<usize>> = results.into_iter().map(|(idx, _)| idx).collect();
-            (indices, None)
+            (results.into_iter().map(|(idx, _)| idx).collect(), None)
         }
+    }
+
+    /// The distance metric this index was built for
+    ///
+    /// ### Returns
+    ///
+    /// The metric, see [`Dist`]
+    pub fn metric(&self) -> Dist {
+        self.metric
     }
 
     /// Returns the size of the index in bytes
@@ -344,10 +284,7 @@ where
     ///
     /// Number of bytes used by the index
     pub fn memory_usage_bytes(&self) -> usize {
-        std::mem::size_of_val(self)
-            + self.quantised_vectors.capacity() * std::mem::size_of::<i8>()
-            + self.quantised_norms.capacity() * std::mem::size_of::<i32>()
-            + self.codebook.memory_usage_bytes()
+        std::mem::size_of_val(self) + self.codec.memory_usage_bytes()
     }
 }
 
@@ -389,29 +326,27 @@ mod tests {
     #[test]
     fn test_exhaustive_sq8_index_creation_euclidean() {
         let mat = create_simple_matrix();
-        let index = ExhaustiveSq8Index::new(mat.as_ref(), Dist::SquaredEuclidean).unwrap();
+        let index = ExhaustiveSq8Index::new(mat.as_ref(), Dist::SquaredEuclidean, None).unwrap();
 
         assert_eq!(index.n, 5);
         assert_eq!(index.dim, 3);
-        assert_eq!(index.quantised_vectors.len(), 15);
-        assert!(index.quantised_norms.is_empty());
+        assert_eq!(index.metric(), Dist::SquaredEuclidean);
     }
 
     #[test]
     fn test_exhaustive_sq8_index_creation_cosine() {
         let mat = create_simple_matrix();
-        let index = ExhaustiveSq8Index::new(mat.as_ref(), Dist::Cosine).unwrap();
+        let index = ExhaustiveSq8Index::new(mat.as_ref(), Dist::Cosine, None).unwrap();
 
         assert_eq!(index.n, 5);
         assert_eq!(index.dim, 3);
-        assert_eq!(index.quantised_vectors.len(), 15);
-        assert_eq!(index.quantised_norms.len(), 5);
+        assert_eq!(index.metric(), Dist::Cosine);
     }
 
     #[test]
     fn test_exhaustive_sq8_query_finds_self_euclidean() {
         let mat = create_simple_matrix();
-        let index = ExhaustiveSq8Index::new(mat.as_ref(), Dist::SquaredEuclidean).unwrap();
+        let index = ExhaustiveSq8Index::new(mat.as_ref(), Dist::SquaredEuclidean, None).unwrap();
 
         let query = vec![1.0, 0.0, 0.0];
         let (indices, distances) = index.query(&query, 1).unwrap();
@@ -424,7 +359,7 @@ mod tests {
     #[test]
     fn test_exhaustive_sq8_query_finds_self_cosine() {
         let mat = create_simple_matrix();
-        let index = ExhaustiveSq8Index::new(mat.as_ref(), Dist::Cosine).unwrap();
+        let index = ExhaustiveSq8Index::new(mat.as_ref(), Dist::Cosine, None).unwrap();
 
         let query = vec![1.0, 0.0, 0.0];
         let (indices, _distances) = index.query(&query, 1).unwrap();
@@ -435,7 +370,7 @@ mod tests {
     #[test]
     fn test_exhaustive_sq8_query_euclidean_multiple() {
         let mat = create_simple_matrix();
-        let index = ExhaustiveSq8Index::new(mat.as_ref(), Dist::SquaredEuclidean).unwrap();
+        let index = ExhaustiveSq8Index::new(mat.as_ref(), Dist::SquaredEuclidean, None).unwrap();
 
         let query = vec![1.0, 0.0, 0.0];
         let (indices, distances) = index.query(&query, 3).unwrap();
@@ -450,7 +385,7 @@ mod tests {
     #[test]
     fn test_exhaustive_sq8_query_cosine_orthogonal() {
         let mat = create_simple_matrix();
-        let index = ExhaustiveSq8Index::new(mat.as_ref(), Dist::Cosine).unwrap();
+        let index = ExhaustiveSq8Index::new(mat.as_ref(), Dist::Cosine, None).unwrap();
 
         let query = vec![1.0, 0.0, 0.0];
         let (indices, distances) = index.query(&query, 5).unwrap();
@@ -466,7 +401,7 @@ mod tests {
     #[test]
     fn test_exhaustive_sq8_query_k_larger_than_dataset() {
         let mat = create_simple_matrix();
-        let index = ExhaustiveSq8Index::new(mat.as_ref(), Dist::SquaredEuclidean).unwrap();
+        let index = ExhaustiveSq8Index::new(mat.as_ref(), Dist::SquaredEuclidean, None).unwrap();
 
         let query = vec![1.0, 0.0, 0.0];
         let (indices, _) = index.query(&query, 10).unwrap();
@@ -477,7 +412,7 @@ mod tests {
     #[test]
     fn test_exhaustive_sq8_query_row() {
         let mat = create_simple_matrix();
-        let index = ExhaustiveSq8Index::new(mat.as_ref(), Dist::SquaredEuclidean).unwrap();
+        let index = ExhaustiveSq8Index::new(mat.as_ref(), Dist::SquaredEuclidean, None).unwrap();
 
         let (indices, distances) = index.query_row(mat.row(0), 1).unwrap();
 
@@ -488,7 +423,7 @@ mod tests {
     #[test]
     fn test_exhaustive_sq8_euclidean_distances() {
         let mat = create_simple_matrix();
-        let index = ExhaustiveSq8Index::new(mat.as_ref(), Dist::SquaredEuclidean).unwrap();
+        let index = ExhaustiveSq8Index::new(mat.as_ref(), Dist::SquaredEuclidean, None).unwrap();
 
         let query = vec![1.0, 0.0, 0.0];
         let (indices, distances) = index.query(&query, 5).unwrap();
@@ -504,7 +439,7 @@ mod tests {
     #[test]
     fn test_exhaustive_sq8_all_points_found() {
         let mat = create_simple_matrix();
-        let index = ExhaustiveSq8Index::new(mat.as_ref(), Dist::SquaredEuclidean).unwrap();
+        let index = ExhaustiveSq8Index::new(mat.as_ref(), Dist::SquaredEuclidean, None).unwrap();
 
         let query = vec![0.5, 0.5, 0.5];
         let (indices, _) = index.query(&query, 5).unwrap();
@@ -529,7 +464,7 @@ mod tests {
         }
 
         let mat = Mat::from_fn(n, dim, |i, j| data[i * dim + j]);
-        let index = ExhaustiveSq8Index::new(mat.as_ref(), Dist::SquaredEuclidean).unwrap();
+        let index = ExhaustiveSq8Index::new(mat.as_ref(), Dist::SquaredEuclidean, None).unwrap();
 
         let query: Vec<f32> = (0..dim).map(|_| 0.0).collect();
         let (indices, _) = index.query(&query, 5).unwrap();
@@ -546,7 +481,7 @@ mod tests {
             -2.0, 1.0, 0.0, // Vector 2
         ];
         let mat = Mat::from_fn(3, 3, |i, j| data[i * 3 + j]);
-        let index = ExhaustiveSq8Index::new(mat.as_ref(), Dist::Cosine).unwrap();
+        let index = ExhaustiveSq8Index::new(mat.as_ref(), Dist::Cosine, None).unwrap();
 
         let query = vec![1.0, 2.0, 3.0];
         let (indices, distances) = index.query(&query, 3).unwrap();
@@ -559,40 +494,56 @@ mod tests {
     }
 
     #[test]
-    fn test_exhaustive_sq8_implements_vector_distance() {
+    fn test_exhaustive_sq8_scores_the_matching_vector_lowest() {
         let mat = create_simple_matrix();
-        let index = ExhaustiveSq8Index::new(mat.as_ref(), Dist::SquaredEuclidean).unwrap();
+        let index = ExhaustiveSq8Index::new(mat.as_ref(), Dist::SquaredEuclidean, None).unwrap();
 
         let query = vec![1.0, 0.0, 0.0];
-        let query_i8 = index.codebook.encode(&query);
+        let encoded = index.codec.encode_query(&query).unwrap();
 
-        let dist = index.euclidean_distance_i8(0, &query_i8);
-        assert!(dist < 1.0);
+        let dist = index.codec.score(&encoded, 0);
+        let dist_other = index.codec.score(&encoded, 1);
+        assert!(dist_other > dist, "{dist_other} should exceed {dist}");
+    }
 
-        let dist_other = index.euclidean_distance_i8(1, &query_i8);
+    #[test]
+    fn test_exhaustive_sq8_cosine_scores_the_matching_vector_lowest() {
+        let mat = create_simple_matrix();
+        let index = ExhaustiveSq8Index::new(mat.as_ref(), Dist::Cosine, None).unwrap();
+
+        let query = vec![1.0, 0.0, 0.0];
+        let encoded = index.codec.encode_query(&query).unwrap();
+
+        // Row 0 is the query direction; row 1 is orthogonal to it.
+        let dist = index.codec.finalise(index.codec.score(&encoded, 0));
+        let dist_other = index.codec.finalise(index.codec.score(&encoded, 1));
+        assert!(dist < 0.1, "self distance {dist}");
         assert!(dist_other > dist);
     }
 
     #[test]
-    fn test_exhaustive_sq8_cosine_implements_vector_distance() {
+    fn test_exhaustive_sq8_symmetric_and_asymmetric_scores_agree() {
+        // A stored vector used as a query must reproduce the symmetric score,
+        // which is what lets `generate_knn` skip the re-encode.
         let mat = create_simple_matrix();
-        let index = ExhaustiveSq8Index::new(mat.as_ref(), Dist::Cosine).unwrap();
-
-        let query = vec![1.0, 0.0, 0.0];
-        let query_i8 = index.codebook.encode(&query);
-        let query_norm_sq: i32 = query_i8.iter().map(|&q| q as i32 * q as i32).sum();
-
-        let dist = index.cosine_distance_i8(0, &query_i8, query_norm_sq);
-        assert!(dist < 0.1);
-
-        let dist_self = index.cosine_distance_i8(0, &query_i8, query_norm_sq);
-        assert!(dist_self < 0.1);
+        for metric in [Dist::SquaredEuclidean, Dist::Cosine] {
+            let index = ExhaustiveSq8Index::new(mat.as_ref(), metric, None).unwrap();
+            let row: Vec<f32> = mat.row(0).iter().copied().collect();
+            let encoded = index.codec.encode_query(&row).unwrap();
+            for j in 0..5 {
+                assert_relative_eq!(
+                    index.codec.score(&encoded, j),
+                    index.codec.score_sym(0, j),
+                    max_relative = 1e-6
+                );
+            }
+        }
     }
 
     #[test]
     fn test_exhaustive_sq8_query_consistency() {
         let mat = create_simple_matrix();
-        let index = ExhaustiveSq8Index::new(mat.as_ref(), Dist::SquaredEuclidean).unwrap();
+        let index = ExhaustiveSq8Index::new(mat.as_ref(), Dist::SquaredEuclidean, None).unwrap();
 
         let query_vec = vec![1.0, 0.0, 0.0];
         let (indices1, distances1) = index.query(&query_vec, 3).unwrap();
@@ -607,7 +558,7 @@ mod tests {
     #[test]
     fn test_exhaustive_sq8_generate_knn() {
         let mat = create_simple_matrix();
-        let index = ExhaustiveSq8Index::new(mat.as_ref(), Dist::SquaredEuclidean).unwrap();
+        let index = ExhaustiveSq8Index::new(mat.as_ref(), Dist::SquaredEuclidean, None).unwrap();
 
         let (knn_indices, knn_distances) = index.generate_knn(2, true, false);
 
@@ -628,7 +579,7 @@ mod tests {
     #[test]
     fn test_exhaustive_sq8_memory_usage() {
         let mat = create_simple_matrix();
-        let index = ExhaustiveSq8Index::new(mat.as_ref(), Dist::SquaredEuclidean).unwrap();
+        let index = ExhaustiveSq8Index::new(mat.as_ref(), Dist::SquaredEuclidean, None).unwrap();
 
         let memory = index.memory_usage_bytes();
         assert!(memory > 0);

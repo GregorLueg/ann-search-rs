@@ -150,6 +150,10 @@ name = "gridsearch_sq8"
 required-features = ["quantised"]
 
 [[example]]
+name = "gridsearch_hnsw_quantised"
+required-features = ["quantised"]
+
+[[example]]
 name = "gridsearch_bf16"
 required-features = ["quantised"]
 

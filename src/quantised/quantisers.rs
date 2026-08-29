@@ -1,4 +1,8 @@
-//! Module contains the different quantisers
+//! Product and optimised-product quantisers, plus the BF16 helpers.
+//!
+//! Scalar 8-bit quantisation lives in [`crate::quantised::uniform_quant`]: it
+//! shares one scale across every dimension, which is what lets a code-to-code
+//! distance stay faithful to the metric the caller asked for.
 
 use faer::{Mat, Scale};
 use half::bf16;
@@ -88,108 +92,6 @@ where
         .sqrt();
 
     T::from_f32(res).unwrap()
-}
-
-/////////////////////////
-// Scalar quantisation //
-/////////////////////////
-
-/// ScalarQuantiser
-///
-/// ### Fields
-///
-/// * `scales` - The maximum absolute values across each dimensions for
-///   renormalisation.
-#[cfg_attr(feature = "serialise", derive(serde::Serialize, serde::Deserialize))]
-pub struct ScalarQuantiser<T> {
-    /// The maximum absolute values across each dimensions for renormalisation.
-    pub scales: Vec<T>,
-}
-
-impl<T> ScalarQuantiser<T>
-where
-    T: Float + FromPrimitive + ToPrimitive + Send + Sync,
-{
-    /// Train the scalar quantiser on a flat vector
-    ///
-    /// ### Params
-    ///
-    /// * `vec` - Flat slice of the values to quantise
-    /// * `dim` - Number features in the vector
-    ///
-    /// ### Returns
-    ///
-    /// Initialised self
-    pub fn train(vec: &[T], dim: usize) -> Self {
-        let scales = (0..dim)
-            .into_par_iter()
-            .map(|d| {
-                vec.chunks_exact(dim)
-                    .map(|chunk| chunk[d].abs())
-                    .fold(T::zero(), |max, val| max.max(val))
-            })
-            .map(|scale| {
-                if scale <= T::zero() {
-                    T::one()
-                } else {
-                    scale / T::from_f32(128.0).unwrap()
-                }
-            })
-            .collect();
-
-        Self { scales }
-    }
-
-    /// Encode a vector
-    ///
-    /// ### Params
-    ///
-    /// * `vec` - Vector to encode
-    ///
-    /// ### Returns
-    ///
-    /// The quantised vector
-    #[inline]
-    pub fn encode(&self, vec: &[T]) -> Vec<i8> {
-        vec.iter()
-            .enumerate()
-            .map(|(d, &val)| {
-                let scaled = val / self.scales[d];
-                let rounded = scaled + T::from_f32(0.5).unwrap() * scaled.signum();
-                let clamped = rounded
-                    .min(T::from_i8(127).unwrap())
-                    .max(T::from_i8(-128).unwrap());
-                clamped.to_i8().unwrap_or(0)
-            })
-            .collect()
-    }
-
-    /// Decode a vector
-    ///
-    /// ### Params
-    ///
-    /// * `quantised` - The quantised vector
-    ///
-    /// ### Returns
-    ///
-    /// Original decompressed vector
-    #[inline]
-    pub fn decode(&self, quantised: &[i8]) -> Vec<T> {
-        quantised
-            .iter()
-            .enumerate()
-            .map(|(d, &val)| T::from_i8(val).unwrap() * self.scales[d])
-            .collect()
-    }
-
-    /// Returns the size of the quantiser
-    ///
-    /// ### Returns
-    ///
-    /// Number of bytes used by the index
-    pub fn memory_usage_bytes(&self) -> usize {
-        std::mem::size_of_val(self) + self.scales.capacity() * std::mem::size_of::<T>()
-    }
 }
 
 //////////////////////
@@ -875,7 +777,6 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use approx::assert_relative_eq;
 
     #[test]
     fn test_encode_bf16_empty() {
@@ -975,66 +876,6 @@ mod tests {
         let data = vec![0.0_f32];
         let encoded = encode_bf16_quantisation(&data);
         assert_eq!(encoded[0].to_f32(), 0.0);
-    }
-
-    #[test]
-    fn test_scalar_quantiser_train() {
-        let mut data = Vec::new();
-        for i in 0..4 {
-            for j in 0..32 {
-                data.push((i * 32 + j) as f32);
-            }
-        }
-
-        let pq =
-            ProductQuantiser::train(&data, 32, 2, Some(2), &Dist::SquaredEuclidean, 5, 42, false)
-                .unwrap();
-
-        assert_eq!(pq.m(), 2);
-        assert_eq!(pq.subvec_dim(), 16);
-        assert_eq!(pq.n_centroids(), 2);
-        assert_eq!(pq.codebooks().len(), 2);
-        assert_eq!(pq.codebooks()[0].len(), 32); // 2 centroids * 16 dims
-        assert_eq!(pq.codebooks()[1].len(), 32);
-    }
-
-    #[test]
-    fn test_scalar_quantiser_encode_decode() {
-        let data = vec![127.0, 0.0, -127.0, 63.5, 0.0, -63.5];
-        let sq = ScalarQuantiser::train(&data, 3);
-
-        let vec = vec![100.0, -25.0, 50.0];
-        let encoded = sq.encode(&vec);
-        let decoded = sq.decode(&encoded);
-
-        assert_eq!(encoded.len(), 3);
-        assert_eq!(decoded.len(), 3);
-
-        // Check values are reasonably close
-        for (orig, dec) in vec.iter().zip(decoded.iter()) {
-            assert!((orig - dec).abs() < orig.abs() * 0.02);
-        }
-    }
-
-    #[test]
-    fn test_scalar_quantiser_clamping() {
-        let data = vec![1.0, 1.0];
-        let sq = ScalarQuantiser::train(&data, 2);
-
-        let vec = vec![200.0, -200.0];
-        let encoded = sq.encode(&vec);
-
-        assert_eq!(encoded[0], 127);
-        assert_eq!(encoded[1], -128);
-    }
-
-    #[test]
-    fn test_scalar_quantiser_zero_scale() {
-        let data = vec![0.0, 10.0, 0.0, 20.0];
-        let sq = ScalarQuantiser::train(&data, 2);
-
-        // First dimension is all zeros, should default to 1.0
-        assert_relative_eq!(sq.scales[0], 1.0, epsilon = 1e-5);
     }
 
     #[test]

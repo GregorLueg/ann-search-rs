@@ -71,7 +71,7 @@ fn main() {
     println!("Building exhaustive SQ8 index...");
     let start = Instant::now();
     let exhaustive_sq8_idx =
-        build_exhaustive_sq8_index(data.as_ref(), &cli.distance, false).unwrap();
+        build_exhaustive_sq8_index(data.as_ref(), &cli.distance, None, false).unwrap();
     let build_time_sq8 = start.elapsed().as_secs_f64() * 1000.0;
 
     let index_size_mb_sq8 = exhaustive_sq8_idx.memory_usage_bytes() as f64 / (1024.0 * 1024.0);
@@ -136,6 +136,7 @@ fn main() {
             None,
             &cli.distance,
             cli.seed as usize,
+            None,
             false,
         )
         .unwrap();

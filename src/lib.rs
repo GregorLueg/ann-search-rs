@@ -74,7 +74,8 @@ use crate::binary::{
 use crate::gpu::{exhaustive_gpu::*, ivf_gpu::*};
 #[cfg(feature = "quantised")]
 use crate::quantised::{
-    exhaustive_bf16::*, exhaustive_opq::*, exhaustive_pq::*, exhaustive_sq8::*, ivf_bf16::*,
+    exhaustive_bf16::*, exhaustive_opq::*, exhaustive_pq::*, exhaustive_sq8::*,
+    uniform_quant::UniformQuantParams, hnsw_quantised::index::*, ivf_bf16::*,
     ivf_opq::*, ivf_pq::*, ivf_sq8::*, soar_opq::*, soar_pq::*,
 };
 
@@ -1899,6 +1900,8 @@ where
 ///   `(&[T], n_samples, n_features)` tuple. See [`AnnMatrix`].
 /// * `dist_metric` - Distance metric: "euclidean" or "cosine". "manhatten" is
 ///   not supported.
+/// * `quant_params` - Optional calibration settings, see
+///   [`UniformQuantParams`]. Defaults trim 0.1% from each tail.
 /// * `verbose` - Print progress information during index construction
 ///
 /// ### Return
@@ -1907,6 +1910,7 @@ where
 pub fn build_exhaustive_sq8_index<T>(
     mat: impl AnnMatrix<T>,
     dist_metric: &str,
+    quant_params: Option<UniformQuantParams>,
     verbose: bool,
 ) -> Result<ExhaustiveSq8Index<T>, AnnSearchErrors>
 where
@@ -1922,7 +1926,7 @@ where
     if verbose {
         println!("Building exhaustive SQ8 index with {} samples", n);
     }
-    ExhaustiveSq8Index::new((vectors_flat, n, dim), metric)
+    ExhaustiveSq8Index::new((vectors_flat, n, dim), metric, quant_params)
 }
 
 #[cfg(feature = "quantised")]
@@ -2331,17 +2335,21 @@ where
 /// * `dist_metric` - Distance metric: "euclidean" or "cosine". "manhatten" is
 ///   not supported.
 /// * `seed` - Random seed for reproducibility
+/// * `quant_params` - Optional calibration settings, see
+///   [`UniformQuantParams`]. Defaults trim 0.1% from each tail.
 /// * `verbose` - Print progress information during index construction
 ///
 /// ### Return
 ///
 /// The `IvfSq8Index`.
+#[allow(clippy::too_many_arguments)]
 pub fn build_ivf_sq8_index<T>(
     mat: impl AnnMatrix<T>,
     nlist: Option<usize>,
     k_means_params: Option<KMeansTrainingParams>,
     dist_metric: &str,
     seed: usize,
+    quant_params: Option<UniformQuantParams>,
     verbose: bool,
 ) -> Result<IvfSq8Index<T>, AnnSearchErrors>
 where
@@ -2352,7 +2360,7 @@ where
         Dist::default()
     });
 
-    IvfSq8Index::build(mat, nlist, metric, k_means_params, seed, verbose)
+    IvfSq8Index::build(mat, nlist, metric, k_means_params, seed, quant_params, verbose)
 }
 
 #[cfg(feature = "quantised")]
@@ -2422,6 +2430,130 @@ where
     T: AnnSearchFloat,
 {
     Ok(index.generate_knn(k, nprobe, return_dist, verbose))
+}
+
+////////////////
+// HNSW-SQ8U //
+////////////////
+
+#[cfg(feature = "quantised")]
+/// Build an HNSW index over uniformly quantised 8-bit vectors
+///
+/// The graph is built and searched entirely on quantised distances, so
+/// construction sees the same distances the queries will.
+///
+/// ### Params
+///
+/// * `mat` - Input data as samples x features. Accepts a faer matrix, an
+///   ndarray 2-D array (with the `ndarray` feature) or a row-major
+///   `(&[T], n_samples, n_features)` tuple. See [`AnnMatrix`].
+/// * `m` - Base connectivity parameter. Layer 0 gets `2 * m` slots
+/// * `ef_construction` - Beam width during construction
+/// * `dist_metric` - Distance metric: "euclidean" or "cosine". "manhattan" is
+///   not supported.
+/// * `seed` - Random seed for reproducibility
+/// * `quant_params` - Optional calibration settings, see
+///   [`UniformQuantParams`]. Defaults trim 0.1% from each tail.
+/// * `verbose` - Print progress information during index construction
+///
+/// ### Returns
+///
+/// The `HnswSq8uIndex`, or an error on an unsupported metric or invalid
+/// calibration settings.
+///
+/// ### Note
+///
+/// The float vectors are not retained. Returned distances are estimates from
+/// the codes, so a caller that needs exact distances must re-rank against the
+/// originals itself.
+#[allow(clippy::too_many_arguments)]
+pub fn build_hnsw_sq8u_index<T>(
+    mat: impl AnnMatrix<T>,
+    m: usize,
+    ef_construction: usize,
+    dist_metric: &str,
+    seed: usize,
+    quant_params: Option<UniformQuantParams>,
+    verbose: bool,
+) -> Result<HnswSq8uIndex<T>, AnnSearchErrors>
+where
+    T: AnnSearchFloat + ThreadLocalSearchState,
+{
+    let metric = parse_ann_dist(dist_metric).unwrap_or_else(|| {
+        println!("[WARNING] Weird string used for distance metric. Using default squared Euclidean distance");
+        Dist::default()
+    });
+
+    HnswSq8uIndex::build(mat, m, ef_construction, &metric, seed, quant_params, verbose)
+}
+
+#[cfg(feature = "quantised")]
+/// Helper function to query a given HNSW-SQ8U index
+///
+/// ### Params
+///
+/// * `query_mat` - Query data as samples x features. Accepts a faer matrix,
+///   an ndarray 2-D array (with the `ndarray` feature) or a row-major
+///   `(&[T], n_queries, n_features)` tuple. See [`AnnMatrix`].
+/// * `index` - Reference to the built HNSW-SQ8U index
+/// * `k` - Number of neighbours to return
+/// * `ef_search` - Size of candidate list during search (higher = better
+///   recall, slower)
+/// * `return_dist` - Shall the distances between the different points be
+///   returned
+/// * `verbose` - Print progress information
+///
+/// ### Returns
+///
+/// A tuple of `(knn_indices, optional distances)`
+pub fn query_hnsw_sq8u_index<T>(
+    query_mat: impl AnnMatrix<T>,
+    index: &HnswSq8uIndex<T>,
+    k: usize,
+    ef_search: usize,
+    return_dist: bool,
+    verbose: bool,
+) -> KnnOptionResult<T>
+where
+    T: AnnSearchFloat + ThreadLocalSearchState,
+{
+    let (queries, nq, dim) = query_mat.into_row_major();
+
+    query_parallel(nq, return_dist, verbose, |i| {
+        index.query(&queries[i * dim..(i + 1) * dim], k, ef_search)
+    })
+}
+
+#[cfg(feature = "quantised")]
+/// Helper function to self query the HNSW-SQ8U index
+///
+/// This function will generate a full kNN graph based on the internal data.
+/// Stored vectors query through their own codes, so no re-encoding happens.
+///
+/// ### Params
+///
+/// * `index` - Reference to the built HNSW-SQ8U index
+/// * `k` - Number of neighbours to return
+/// * `ef_search` - Size of candidate list during search (higher = better
+///   recall, slower)
+/// * `return_dist` - Shall the distances between the different points be
+///   returned
+/// * `verbose` - Print progress information
+///
+/// ### Returns
+///
+/// A tuple of `(knn_indices, optional distances)`
+pub fn query_hnsw_sq8u_self<T>(
+    index: &HnswSq8uIndex<T>,
+    k: usize,
+    ef_search: usize,
+    return_dist: bool,
+    verbose: bool,
+) -> KnnOptionResult<T>
+where
+    T: AnnSearchFloat + ThreadLocalSearchState,
+{
+    index.generate_knn(k, ef_search, return_dist, verbose)
 }
 
 ////////////

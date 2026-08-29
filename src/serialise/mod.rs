@@ -582,14 +582,14 @@ mod tests {
         round_trip!(
             test_round_trip_exhaustive_sq8,
             ExhaustiveSq8Index<f32>,
-            |m| build_exhaustive_sq8_index(m, "euclidean", false).unwrap(),
+            |m| build_exhaustive_sq8_index(m, "euclidean", None, false).unwrap(),
             |i, q| unwrap_knn(query_exhaustive_sq8_index(q, i, K, true, false))
         );
 
         round_trip!(
             test_round_trip_ivf_sq8,
             IvfSq8Index<f32>,
-            |m| build_ivf_sq8_index(m, Some(NLIST), None, "euclidean", 1, false).unwrap(),
+            |m| build_ivf_sq8_index(m, Some(NLIST), None, "euclidean", 1, None, false).unwrap(),
             |i, q| unwrap_knn(query_ivf_sq8_index(q, i, K, Some(NLIST), true, false))
         );
 

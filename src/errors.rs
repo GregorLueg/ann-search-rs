@@ -93,6 +93,22 @@ pub enum AnnSearchErrors {
         /// Vectors available for training
         n_samples: usize,
     },
+    /// Tail-trim fraction outside the permitted range
+    #[cfg(feature = "quantised")]
+    #[error("The drop ratio ({drop_ratio}) must be a finite value in [0, 0.5).")]
+    InvalidDropRatio {
+        /// Chosen fraction trimmed from each tail
+        drop_ratio: f64,
+    },
+    /// Quantiser calibration was handed an empty dataset
+    #[cfg(feature = "quantised")]
+    #[error("Cannot calibrate a quantiser on {n} vectors of dimensionality {dim}.")]
+    EmptyCalibrationSet {
+        /// Number of vectors supplied
+        n: usize,
+        /// Dimensionality supplied
+        dim: usize,
+    },
 
     // -- binary errors --
     /// Asymmetric queries are only supported with sign-based binarisation
