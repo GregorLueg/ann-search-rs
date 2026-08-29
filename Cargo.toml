@@ -195,6 +195,10 @@ required-features = ["binary"]
 name = "knn_comparison_cagra"
 required-features = ["gpu"]
 
+[[example]]
+name = "profile_nndescent_gpu"
+required-features = ["gpu"]
+
 ###########
 # Benches #
 ###########
