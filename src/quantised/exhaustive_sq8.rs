@@ -581,7 +581,7 @@ mod tests {
         let memory = index.memory_usage_bytes();
         assert!(memory > 0);
 
-        let expected_min = 5 * 3; // 5 vectors * 3 dims * 1 byte (i8)
+        let expected_min = 5 * 3; // 5 vectors * 3 dims * 1 byte (u8)
         assert!(memory >= expected_min);
     }
 }

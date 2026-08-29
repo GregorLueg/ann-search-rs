@@ -16,7 +16,7 @@ might add the option to add/remove vectors from some of the indices.
 - [Description](#description)
 - [Features](#features)
 - [Installation](#installation)
-- [Roadmap](#roadmap)
+- [Example usage](#example-usage)
 - [Gridsearches and performance](#running-the-grid-searches)
 - [FEATURE: quantisation](#quantised-indices)
 - [FEATURE: GPU acceleration](#gpu)
@@ -53,7 +53,8 @@ anticipated. If you want to see what changed, please check this
   (heavily inspired by [PyNNDescent](https://github.com/lmcinnes/pynndescent)).
   - *Navigating Spread-out Graph (NSG)*
   - *Relative NN-Descent*
-  - *Vanama (the graph powering DiskANN)*
+  - *SOAR (IVF with spilled secondary assignments)*
+  - *Vamana (the graph powering DiskANN)*
 
 - **Distance metrics**:
   - Euclidean
@@ -69,15 +70,22 @@ anticipated. If you want to see what changed, please check this
   with its shape. Rows are always samples, columns are always features.
 
 - **Quantised indices** (optional feature):
-  - *BF16* (brain floating point 16 quantisation for exhaustive and IVF)
-  - *SQ8* (int8 quantisation for exhaustive and IVF)
-  - *PQ* (product quantisation for IVF)
-  - *OPQ* (optimised product quantisation for IVF)
+  - *BF16* (brain float 16 storage for exhaustive and IVF)
+  - *SQ8* (uniform 8-bit quantisation for exhaustive, IVF and HNSW)
+  - *PQ* (product quantisation for exhaustive and IVF)
+  - *OPQ* (optimised product quantisation for exhaustive and IVF)
+  - *SOAR-PQ* and *SOAR-OPQ* (the above with spilled secondary assignments)
 
 - **GPU-accelerated indices** (optional feature):
   - *Exhaustive flat index with GPU acceleration*
   - *IVF (Inverted File index) with GPU acceleration*
   - *CAGRA style index*
+  - *NN-Descent kNN-graph builders, plain and clustered for datasets past the
+    device's per-binding limit*
+
+- **Self-kNN graph generation**: NN-Descent on CPU and GPU hands back the graph
+  it built during construction, no search pass needed. See the
+  [kNN-graph benchmarks](https://github.com/GregorLueg/ann-search-rs/blob/main/docs/benchmarks_knn_graph.md).
 
 - **(Near) Binarised indices** (optional feature):
   - *Binary* (different types of binary quantisations for exhaustive and IVF
@@ -98,12 +106,19 @@ ann-search-rs = "*"
 
 With version `"0.4.2"` some breaking API changes were introduced: this harmonise
 several of the functions and avoid panics in favour of errors. A key change
-was also the update to cubecl `"0.1.0"` which changes quite a few APIs for the
+was also the cubecl version bump, which changes quite a few APIs for the
 GPU-accelerated version.
 
 Version `"0.6.0"` opened up the inputs via the `AnnMatrix` trait. Existing code
 passing faer matrices keeps working unchanged, but a few of the lower-level
 binariser and quantiser constructors now take flat slices instead of a `MatRef`.
+
+The SQ8 indices were rebuilt on a shared-scale `u8` quantiser. The old
+per-dimension scales did not cancel in a code-to-code distance, so the index was
+ranking by the wrong quantity: recall@10 on 128-D synthetic cell embeddings goes
+0.26 to 0.95, and the exhaustive scan is now faster than `f32` rather than
+slower. `build_exhaustive_sq8_index` and `build_ivf_sq8_index` gained an
+`Option<UniformQuantParams>`; `ScalarQuantiser` is gone.
 
 ## Example Usage
 
@@ -223,8 +238,9 @@ cargo run --example gridsearch_annoy --release -- --n-samples 500000 --dim 32 --
 # --n-clusters 25
 # --k 15
 # --seed 42
-# --distance cosine
+# --distance euclidean
 # --data gaussian
+# --intrinsic-dim 16   (lowrank data only)
 ```
 
 Every index is trained on 150k samples with 32 dimensions distance and 25 distinct
@@ -290,20 +306,23 @@ re-ranking on the full vectors (yet) for these quantised indices.
   quantisation. In this case the `f32` or `f64` are transformed during storage
   into `bf16` floats. These keep the range of `f32`; however, they reduce
   precision.
-- *SQ8*: A scalar quantisation to `i8`. Exhaustive and IVF indices are provided.
-  For each dimensions in the data, the min and max values are being computed and
-  the respective data points are projected to integers between `-128` to `127`.
-  This enables fast integer math; however, this comes at cost of recall of the
-  real nearest neighbours.
+- *SQ8*: Uniform scalar quantisation to `u8`, with a per-dimension offset and a
+  **single scale shared across every dimension**. That shared scale is what makes
+  the integer distance between two codes preserve the ordering of the float one,
+  so one kernel serves both index construction and query. 4x smaller than `f32`
+  and faster to scan, since the arithmetic is integer. Exhaustive, IVF and HNSW
+  indices are provided.
 - *PQ*: Uses product quantisation. Useful when the dimensions of the vectors
   are incredibly large and one needs to compress the index in memory even
   further. Only useful when dim ≥ 128 in most cases and ideal for very large
   dimensions. Exhaustive and IVF are available with product quantisation.
   Exhaustive PQ is not recommend due to worse performance across the board
   compared to IVF-PQ – the index was added for completeness.
-- *OPQ*: Uses optimised product quantisation. Tries to de-correlate the
-  residuals and can in times improve the Recall. Please see the benchmarks.
-  Same indices available as for PQ.
+- *OPQ*: Optimised product quantisation. Learns a rotation to de-correlate the
+  residuals before the subvector split. Same indices as for PQ.
+- *SOAR-PQ / SOAR-OPQ*: IVF-PQ and IVF-OPQ where each vector is written into two
+  cells rather than one. PQ has to rebuild an ADC lookup table per probed cell,
+  so pulling twice the candidates out of one cell can beat probing two.
 
 The benchmarks can be found
 [here](https://github.com/GregorLueg/ann-search-rs/blob/main/docs/benchmarks_quantised.md).
@@ -316,14 +335,18 @@ ann-search-rs = { version = "*", features = ["quantised"] }
 
 ## GPU
 
-Three indices are also implemented in GPU-accelerated versions. A
-GPU-accelerated exhaustive and IVF index. And a new addition with release
-`0.2.6` a [CAGRA-style index](https://arxiv.org/abs/2308.15136). Under the hood,
-this use [cubecl](https://github.com/tracel-ai/cubecl) with wgpu backend (which
-makes them largely agnostic to the type of hardware), for details please check
-[here](https://burn.dev/books/cubecl/getting-started/installation.html)). The
-benchmarks can be found
-[here](https://github.com/GregorLueg/ann-search-rs/blob/main/docs/benchmarks_gpu.md).
+GPU-accelerated exhaustive and IVF indices, a
+[CAGRA-style index](https://arxiv.org/abs/2308.15136) added in `0.2.6`, and two
+raw kNN-graph builders: `build_knn_graph_gpu` for anything that fits the
+device's per-binding limit, and `build_clustered_knn_graph_gpu` for anything
+past it. Under the hood this uses
+[cubecl](https://github.com/tracel-ai/cubecl) with the wgpu backend, which makes
+it largely agnostic to the hardware; see
+[the cubecl docs](https://burn.dev/books/cubecl/getting-started/installation.html)
+for details. Benchmarks are
+[here](https://github.com/GregorLueg/ann-search-rs/blob/main/docs/benchmarks_gpu.md),
+with the kNN-graph paths split out
+[here](https://github.com/GregorLueg/ann-search-rs/blob/main/docs/benchmarks_knn_graph.md).
 To unlock GPU-acceleration, please use:
 
 ```toml

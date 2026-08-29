@@ -1,6 +1,5 @@
-//! Inverted file SQ8 index: quantises the original data to scalar quantisation
-//! to 8 bit (i8) and uses Voronoi cells to identify the most interesting
-//! candidates.
+//! Inverted file SQ8 index: quantises the original data to uniform 8-bit codes
+//! and uses Voronoi cells to identify the most interesting candidates.
 
 use faer::RowRef;
 use rayon::prelude::*;
@@ -107,11 +106,11 @@ where
 {
     /// Build an IVF index with scalar 8-bit quantisation.
     ///
-    /// Constructs an inverted file index with all vectors quantised to i8 using
-    /// a global codebook. Reduces memory by 4x (for f32) whilst maintaining
-    /// reasonable recall through learned quantisation bounds. Also, enables
-    /// fast querying via `i8` symmetric transformations (at the cost of
-    /// Recall).
+    /// Constructs an inverted file index with all vectors quantised to `u8`
+    /// against a single shared scale, so the integer code distance preserves
+    /// the ordering of the float one. Reduces memory by 4x (for f32) whilst
+    /// maintaining reasonable recall, and the symmetric integer kernels make
+    /// the scan faster than the `f32` one rather than slower.
     ///
     /// ### Workflow
     ///
@@ -255,7 +254,7 @@ where
     /// Query the index for approximate nearest neighbours.
     ///
     /// Performs two-stage search using quantised vectors: first finds nprobe
-    /// nearest centroids, then computes distances in quantised space (`i8`
+    /// nearest centroids, then computes distances in code space (`u8` integer
     /// arithmetic) for all vectors in those clusters. Normalises query if
     /// using Cosine distance.
     ///
@@ -329,7 +328,7 @@ where
 
     /// Query using an already-quantised internal vector
     ///
-    /// Skips the encode step since the vector is already in i8 format.
+    /// Skips the encode step since the vector is already in code space.
     /// Only decodes for centroid search (which is O(nlist), small).
     /// Scan the probed cells and keep the `k` best
     ///
