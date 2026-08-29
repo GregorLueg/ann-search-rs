@@ -6,25 +6,6 @@
 //! navigating node. Query time is a greedy beam search from that navigating
 //! node.
 //!
-//! ### Build pipeline
-//!
-//! 1. Compute the centroid of the data, snap it to the nearest data point
-//!    via one beam-search hop on the input kNN graph. That data point is the
-//!    navigating node `n_p`.
-//! 2. In parallel for every node `v`, run a bounded beam-search from `n_p`
-//!    toward `v` on the kNN graph, collect the visited set, union in `v`'s
-//!    kNN neighbours, sort ascending by distance to `v`, and apply the MRNG
-//!    prune to select at most `R` outgoing edges. After reverse-edge
-//!    insertion, top nodes below degree `R` back up with their closest kNN
-//!    entries: on clustered data MRNG occlusion alone collapses to a handful
-//!    of edges, and the resulting sparse graph dead-ends queries.
-//! 3. Sequentially run a DFS from `n_p` on the partial NSG. For each
-//!    unreachable node `u`, find its nearest reachable predecessor `t` and
-//!    add the edge `t -> u`, evicting `t`'s farthest neighbour if it is at
-//!    the degree cap.
-//! 4. Flatten the adjacency into a contiguous `Vec<u32>` for cache-friendly
-//!    query traversal.
-//!
 //! ### References
 //!
 //! Fu, C., Xiang, C., Wang, C. and Cai, D. *Fast Approximate Nearest Neighbor

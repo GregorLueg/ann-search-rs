@@ -48,26 +48,25 @@ struct ConstructionGraph<T> {
     /// in node order. Layout within a node's block: [layer0 (M*2 slots),
     /// layer1 (M slots), ...]. Sentinels (u32::MAX) mark unused slots; valid
     /// IDs are packed at the front of each layer block.
-    ///
-    /// One allocation rather than one per node: the construction search chases
-    /// a different node's block on every hop, and scattered per-node `Vec`s put
-    /// each hop in an unrelated malloc block behind a second dependent load.
-    /// Never resized after construction, so the buffer pointer is stable for
-    /// the whole build.
     nodes: UnsafeCell<Vec<u32>>,
+
     /// Start of each node's block within `nodes`.
     ///
     /// Identical to the `neighbour_offsets` the finished index carries, which
     /// is what lets [`ConstructionGraph::into_flat`] hand the buffer over by
     /// move instead of copying it out node by node.
     offsets: Vec<usize>,
+
     /// Striped spin-locks for thread-safe writes. Stripe count is independent
     /// of graph size, so memory overhead stays constant as the index grows.
     locks: StripedLocks,
+
     /// Maximum layer each node appears in
     node_levels: Vec<u8>,
+
     /// Base connectivity parameter
     m: usize,
+
     /// Phantom data for type parameter
     _phantom: PhantomData<T>,
 }
@@ -120,12 +119,6 @@ where
     /// ### Returns
     ///
     /// Pointer to slot zero, valid for the lifetime of the graph
-    ///
-    /// ### Note
-    ///
-    /// The `Vec` is sized once in [`ConstructionGraph::new`] and never grows,
-    /// so the buffer address is stable and concurrent callers only ever read
-    /// the `Vec` header.
     #[inline]
     fn data_ptr(&self) -> *mut u32 {
         unsafe { (*self.nodes.get()).as_mut_ptr() }
@@ -201,7 +194,7 @@ where
     ///
     /// ### Returns
     ///
-    /// 2*M for layer 0, M for upper layers
+    /// 2 * M for layer 0, M for upper layers
     #[inline]
     fn max_neighbours(&self, layer: u8) -> usize {
         if layer == 0 {
@@ -369,8 +362,6 @@ where
                 slot[current_degree] = new_neighbour as u32;
                 return;
             }
-            // List filled up between snapshot and write; fall through to
-            // the pruning path below, still under lock.
             self.prune_and_write(slot, max_n, new_neighbour, node_id, &distance_fn);
             return;
         }
@@ -454,11 +445,6 @@ where
     /// fill the remaining slots, matching the forward pass in
     /// [`HnswIndex::select_neighbours_heuristic`]. Caller is responsible for
     /// persisting the result to the neighbour slot.
-    ///
-    /// The cap is `max_n`, not `existing.len()`: on the stale-snapshot path a
-    /// concurrent writer may have left the list below capacity, and capping at
-    /// the observed degree would make degrees monotonically non-increasing and
-    /// silently drop the incoming reverse link.
     ///
     /// ### Params
     ///
@@ -601,9 +587,6 @@ impl HnswState<f64> for HnswIndex<f64> {
 /// Implements the HNSW algorithm with multi-layer neighbour storage. Each node
 /// maintains separate neighbour lists for each layer it appears in, enabling
 /// efficient hierarchical search.
-// `bound = ""` because the struct already carries `T: AnnSearchFloat`, which
-// implies the serde bounds; letting the derive add its own on top makes `T:
-// Deserialize` ambiguous
 #[cfg_attr(
     feature = "serialise",
     derive(serde::Serialize, serde::Deserialize),
@@ -738,10 +721,6 @@ where
             Vec::new()
         };
 
-        // Assign layers using exponential distribution. Kept in f64 regardless
-        // of T: drawing in f32 gives an f32 index a different layer assignment
-        // from an f64 one built with the same seed. `rng.random()` samples
-        // [0, 1), so a zero draw makes the level infinite rather than large.
         let ml = 1.0 / (m as f64).ln();
         let mut rng = SmallRng::seed_from_u64(seed as u64);
 
@@ -884,6 +863,10 @@ where
     /// Performs greedy descent from the entry point through upper layers,
     /// then does ef_construction search and connects the node at each
     /// layer it belongs to, from its highest layer down to layer 0.
+    ///
+    /// ### Params
+    ///
+    /// TODO: Claude
     fn insert_node(&self, node: usize, graph: &ConstructionGraph<T>, state: &mut SearchState<T>) {
         let node_level = self.layer_assignments[node];
         let mut current_node = self.entry_point as usize;
@@ -900,10 +883,6 @@ where
             while changed {
                 changed = false;
 
-                // SAFETY: lock-free read of fixed-size sentinel-padded slots.
-                // Benign torn reads are acceptable during greedy descent; a
-                // stale or partial neighbour list may slow convergence but
-                // cannot produce incorrect final results.
                 let neighbours = unsafe { graph.get_neighbours_slice(current_node, layer) };
 
                 for &neighbour in neighbours {
@@ -948,9 +927,6 @@ where
                 state,
             );
 
-            // Hand the candidates to the heuristic already sorted and with the
-            // query node dropped, so the selection pass neither copies nor
-            // re-sorts them.
             state.results.sort();
             state.scratch_working.clear();
             let (dists, ids) = (state.results.dists(), state.results.ids());
@@ -1134,14 +1110,6 @@ where
     /// Applies the "keep closest and diverse" strategy: iteratively adds
     /// candidates that are closer to the query than to already-selected
     /// neighbours, promoting diversity whilst maintaining proximity.
-    ///
-    /// `keepPrunedConnections` is deliberately **not** implemented. Filling the
-    /// remaining slots with the nearest rejected candidates was measured at
-    /// 150k x 128D and lost on both axes: build time went up 2-3x because
-    /// saturated lists send every reverse link through the O(max_n^2)
-    /// [`HnswIndex::compute_pruned`] path instead of a free append, and recall
-    /// stopped responding to `ef_construction` at all because the short edges
-    /// crowd out the long-range ones on subsequent reverse-link pruning.
     ///
     /// ### Params
     ///

@@ -82,11 +82,6 @@ const MIN_CHUNK_NODES: usize = 1_024;
 
 /// Fraction of candidate pairs assumed to clear the distance threshold when
 /// sizing the *first* chunk.
-///
-/// The opening iteration accepts nearly everything and later ones almost
-/// nothing, so no single figure is right. This one only has to stop the first
-/// chunk overshooting; from then on the size is rescaled against what was
-/// actually emitted.
 const ASSUMED_ACCEPT_RATE: f64 = 0.25;
 
 /// Cap on how much the adaptive chunk size may grow in one step.
@@ -95,12 +90,7 @@ const ASSUMED_ACCEPT_RATE: f64 = 0.25;
 const CHUNK_GROWTH_LIMIT: usize = 8;
 
 /// Dimensionality below which the blocked GEMM local join is not taken.
-///
-/// The GEMM path pays for a gather of the candidate tile, a norm expansion, and
-/// an exact recomputation of every accepted pair, so it only wins once `dim` is
-/// large enough for the matmul to dominate. Set deliberately high: the fused
-/// SIMD kernels stay the default until the crossover is measured on real data.
-const NND_GEMM_MIN_DIM: usize = 128;
+const NND_GEMM_MIN_DIM: usize = 96;
 
 /// Candidate-count below which the blocked GEMM local join is not taken.
 ///
@@ -108,9 +98,9 @@ const NND_GEMM_MIN_DIM: usize = 128;
 /// setup, and the gather then buys nothing.
 const NND_GEMM_MIN_CANDIDATES: usize = 32;
 
-////////////////////
-// Build timings  //
-////////////////////
+///////////////////
+// Build timings //
+///////////////////
 
 /// Merged candidate-list size statistics, accumulated inside the local join.
 ///
@@ -278,9 +268,9 @@ struct UnsafeU32Ptr(*mut u32);
 unsafe impl Send for UnsafeU32Ptr {}
 unsafe impl Sync for UnsafeU32Ptr {}
 
-/////////////////////
-// Candidate sets  //
-/////////////////////
+////////////////////
+// Candidate sets //
+////////////////////
 
 /// Reverse (in-edge) adjacency of one forward candidate sample, in CSR form.
 ///
@@ -325,12 +315,6 @@ impl ReverseCsr {
 /// `u32` ids rather than `n` growable `Vec`s, and the reverse edges in CSR. The
 /// total reverse entry count equals the total forward count by construction, so
 /// the whole structure is `O(n * max_candidates)` with no per-node allocation.
-///
-/// The **merged** list a node's local join actually runs over is not
-/// materialised here. It is assembled per node into thread-local scratch inside
-/// the join instead, because capping it to keep it in a fixed stride costs real
-/// recall: the reverse in-degree distribution is broad rather than a clippable
-/// tail, so a cap anywhere loses neighbours the descent needed.
 struct CandidateSets {
     /// Slots per node in each forward buffer (equals `max_candidates`)
     stride: usize,
@@ -390,13 +374,6 @@ impl CandidateSets {
     ///
     /// Sorted ascending and deduplicated, which is what the pair loop and the
     /// tile gather both want.
-    ///
-    /// Deliberately unbounded: see the type docs. Capping it was measured on a
-    /// 500k x 32 real embedding and does not pay. Clipping the list to twice
-    /// `max_candidates` drops 17% of candidate pairs for no wall-clock change,
-    /// because the in-degree tail is rare rather than dominant; clipping to
-    /// `max_candidates` itself buys 16% but costs recall, which is the trade
-    /// `2e866da` already rejected.
     ///
     /// ### Params
     ///
@@ -507,9 +484,9 @@ fn build_reverse_csr(fwd: &[u32], lens: &[u32], stride: usize, n: usize, out: &m
     });
 }
 
-///////////////
-// MetricFn  //
-///////////////
+//////////////
+// MetricFn //
+//////////////
 
 /// Static-dispatch metric selector for the update kernel.
 ///
@@ -539,6 +516,7 @@ impl<T: AnnSearchFloat> MetricFn<T> for SqEuclidMetric {
         T::euclidean_simd(vec_a, vec_b)
     }
 }
+
 impl<T: AnnSearchFloat> MetricFn<T> for CosineMetric {
     #[inline(always)]
     fn distance_from_tile(vec_a: &[T], norm_a: T, vec_b: &[T], norm_b: T) -> T {
@@ -550,6 +528,7 @@ impl<T: AnnSearchFloat> MetricFn<T> for CosineMetric {
         }
     }
 }
+
 impl<T: AnnSearchFloat> MetricFn<T> for ManhattanMetric {
     #[inline(always)]
     fn distance_from_tile(vec_a: &[T], _norm_a: T, vec_b: &[T], _norm_b: T) -> T {
@@ -813,7 +792,8 @@ where
     ///
     /// Only the Annoy arm has an allocation-free form; the Kd arm falls back to
     /// the allocating query and copies its result across, which keeps Manhattan
-    /// working without a second scratch type for a path that is not the default.
+    /// working without a second scratch type for a path that is not the
+    /// default.
     ///
     /// ### Params
     ///
@@ -1058,11 +1038,7 @@ where
             Vec::new()
         };
 
-        // Capped at 12, matching PyNNDescent. Measured on a 500k x 32 real
-        // single-cell PCA embedding, raw recall@30 is flat at 0.9990 from 6
-        // trees to 32 while build time runs 7.0 s to 9.0 s, so everything past
-        // the cap is paid twice: once building the forest and again in the
-        // per-node search budget, which scales with `n_trees`.
+        // based on PyNNDescent... 12 seems to be good for the initialisation
         let n_trees = n_trees.unwrap_or_else(|| {
             let calculated = 5 + ((n as f64).powf(0.25)).round() as usize;
             calculated.min(12)
@@ -1077,8 +1053,6 @@ where
         let max_candidates = max_candidates.unwrap_or(k.min(60));
 
         let start = Instant::now();
-        // Feed the forest the buffer we already flattened. Handing it the
-        // caller's matrix again would walk the whole thing a second time.
         let forest = Forest::new((&vectors_flat[..], n, dim), n_trees, metric, seed)?;
         let forest_time = start.elapsed();
         if verbose {
@@ -1182,10 +1156,6 @@ where
     ///
     /// Number of source nodes to process in the first chunk.
     fn initial_chunk_size(&self, max_candidates: usize) -> usize {
-        // Mean reverse in-degree equals mean forward out-degree, so a merged
-        // list runs about twice `max_candidates` on average and the unified
-        // pair loop covers roughly 6 * mc^2 pairs. Only the opening guess: the
-        // rescale below is what actually holds the budget.
         let pairs_per_source = 6 * max_candidates * max_candidates;
         let updates_per_source =
             ((pairs_per_source * 2) as f64 * ASSUMED_ACCEPT_RATE).ceil() as usize;
@@ -1246,9 +1216,6 @@ where
         let mut graph = vec![sentinel; self.n * k];
         let search_k = k * self.forest.n_trees();
 
-        // One query per node, so the scratch is reused across a whole rayon
-        // job rather than reallocated per node. A fresh visited bitset here
-        // cost `n` allocations of `n / 8` zeroed bytes.
         graph.par_chunks_mut(k).enumerate().try_for_each_init(
             AnnoyScratch::<T>::new,
             |scratch, (i, slot)| -> Result<(), AnnSearchErrors> {
@@ -1430,10 +1397,7 @@ where
     ///    ([`build_reverse_csr`]).
     ///
     /// The merge of the two is deliberately left to the join, which assembles
-    /// it per node into thread-local scratch. Materialising it here would mean
-    /// capping it to fit a fixed stride, and a cap costs recall wherever it is
-    /// put: the reverse in-degree distribution is broad rather than a tail that
-    /// can be clipped for free.
+    /// it per node into thread-local scratch.
     ///
     /// ### Params
     ///
@@ -1698,11 +1662,6 @@ where
                                 continue;
                             }
 
-                            // The Euclidean expansion cancels catastrophically
-                            // exactly where the accepted pairs live, and these
-                            // distances go into the graph and get compared
-                            // across iterations, so the accepted few are
-                            // recomputed with the fused kernel.
                             let d = if use_gemm {
                                 M::distance_from_tile(
                                     &scratch.tile[a * dim..(a + 1) * dim],
@@ -1714,12 +1673,6 @@ where
                                 d
                             };
 
-                            // Emit each direction only if it clears that
-                            // endpoint's own threshold. Rows only ever improve,
-                            // so an update failing its target's current worst
-                            // distance here is certain to be rejected at apply
-                            // time; carrying it costs a sort key and an apply
-                            // scan for nothing.
                             if d <= ta {
                                 updates.push(Update::new(pa, pb, d));
                             }
@@ -1905,10 +1858,6 @@ where
                     }
                 }
 
-                // A topped-up entry can sit closer than a kept one, so the row
-                // has to be re-sorted: the whole crate treats a graph row as
-                // ascending, and truncating one from the front (as the kNN
-                // extraction does) is only correct if it actually is.
                 kept.sort_unstable_by(|a, b| {
                     a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal)
                 });
