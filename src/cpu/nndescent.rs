@@ -1647,6 +1647,14 @@ where
                     }
                 }
 
+                // A topped-up entry can sit closer than a kept one, so the row
+                // has to be re-sorted: the whole crate treats a graph row as
+                // ascending, and truncating one from the front (as the kNN
+                // extraction does) is only correct if it actually is.
+                kept.sort_unstable_by(|a, b| {
+                    a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal)
+                });
+
                 for (j, &entry) in kept.iter().enumerate() {
                     out_slot[j] = entry;
                 }
@@ -3054,6 +3062,52 @@ mod tests {
         let (short, none) = index.extract_knn(Some(1), false);
         assert!(none.is_none());
         assert!(short.iter().all(|r| r.len() <= 1));
+    }
+
+    #[test]
+    fn test_diversified_rows_stay_distance_sorted() {
+        // The RNG-rule prune tops short rows up from the pruned tail, and a
+        // topped-up entry can sit closer than a kept one. Every consumer, and
+        // `extract_knn` truncating from the front in particular, needs the row
+        // ascending regardless.
+        let n = 150;
+        let mat = Mat::from_fn(n, 6, |i, j| ((i * 11 + j * 7) % 17) as f32 * 0.3);
+
+        for prune_prob in [0.25f32, 0.5, 1.0] {
+            let index = NNDescent::<f32>::new(
+                mat.as_ref(),
+                Dist::SquaredEuclidean,
+                Some(10),
+                None,
+                Some(6),
+                None,
+                0.0,
+                prune_prob,
+                42,
+                false,
+            )
+            .unwrap();
+
+            for i in 0..index.n {
+                let row: Vec<f32> = index.graph[i * index.k..(i + 1) * index.k]
+                    .iter()
+                    .filter(|&&(pid, _)| pid != SENTINEL_PID)
+                    .map(|&(_, d)| d)
+                    .collect();
+                assert!(
+                    row.windows(2).all(|w| w[0] <= w[1]),
+                    "row {i} unsorted at prune_prob={prune_prob}: {row:?}"
+                );
+            }
+
+            // Extraction truncates from the front, so it must hand back the
+            // closest entries and nothing further out.
+            let (_, dists) = index.extract_knn(Some(3), true);
+            for row in dists.unwrap() {
+                assert!(row.windows(2).all(|w| w[0] <= w[1]));
+                assert!(row.len() <= 3);
+            }
+        }
     }
 
     #[test]
