@@ -4,7 +4,9 @@
 
 use clap::Parser;
 use faer::Mat;
+use ann_search_rs::prelude::{matrix_to_flat, parse_ann_dist, Dist, SimdDistance};
 use num_traits::{Float, ToPrimitive};
+use rayon::prelude::*;
 use rustc_hash::FxHashSet;
 use thousands::*;
 
@@ -198,6 +200,99 @@ pub fn calculate_recall(
     }
 
     total_recall / true_neighbors.len() as f64
+}
+
+/// Recompute exact `f32` distances to the neighbours an index returned
+///
+/// Quantised indices report the *codec's estimate* of the distance, not the
+/// distance itself. Feeding those straight into
+/// [`calculate_mean_distance_ratio`] conflates two different errors: the
+/// retrieved neighbours being worse than the true ones, and the reported
+/// number being a biased estimate of how far away they are. The second can
+/// push the ratio below 1.0, which reads as "better than optimal" and is
+/// nothing of the sort. This recomputes the distances in full precision from
+/// the original vectors, so the ratio measures retrieval quality alone and is
+/// directly comparable to an unquantised index's.
+///
+/// The distance definitions match the exhaustive index exactly: squared
+/// Euclidean, `1 - cosine similarity`, or L1.
+///
+/// ### Params
+///
+/// * `data` - The indexed vectors, samples x features
+/// * `queries` - The query vectors, samples x features. Pass `data` again for
+///   a self-query
+/// * `neighbours` - Indices returned by the index, one vec per query, holding
+///   row numbers into `data`
+/// * `distance` - Metric name, as handed to the index builder
+///
+/// ### Returns
+///
+/// Exact distances in the same layout as `neighbours`. Any index outside
+/// `data`'s row range yields `f32::INFINITY` rather than panicking, so a
+/// broken index shows up as a bad ratio instead of a crash.
+pub fn exact_distances(
+    data: &Mat<f32>,
+    queries: &Mat<f32>,
+    neighbours: &[Vec<usize>],
+    distance: &str,
+) -> Vec<Vec<f32>> {
+    let metric = parse_ann_dist(distance).unwrap_or_default();
+
+    // faer matrices are column-major, so rows are strided and the SIMD kernels
+    // cannot see them. Flatten once here rather than per distance.
+    let (data_flat, n, dim) = matrix_to_flat(data.as_ref());
+    let (query_flat, n_queries, query_dim) = matrix_to_flat(queries.as_ref());
+    assert_eq!(dim, query_dim, "query and data dimensionality differ");
+    assert_eq!(
+        n_queries,
+        neighbours.len(),
+        "one neighbour list per query expected"
+    );
+
+    // Only the cosine path needs norms, and it needs them for every candidate.
+    let data_norms: Vec<f32> = if metric == Dist::Cosine {
+        (0..n)
+            .into_par_iter()
+            .map(|i| f32::calculate_l2_norm(&data_flat[i * dim..(i + 1) * dim]))
+            .collect()
+    } else {
+        Vec::new()
+    };
+
+    neighbours
+        .par_iter()
+        .enumerate()
+        .map(|(q, ids)| {
+            let query = &query_flat[q * dim..(q + 1) * dim];
+            let query_norm = if metric == Dist::Cosine {
+                f32::calculate_l2_norm(query)
+            } else {
+                1.0
+            };
+
+            ids.iter()
+                .map(|&id| {
+                    if id >= n {
+                        return f32::INFINITY;
+                    }
+                    let vec = &data_flat[id * dim..(id + 1) * dim];
+                    match metric {
+                        Dist::SquaredEuclidean => f32::euclidean_simd(vec, query),
+                        Dist::Manhattan => f32::manhattan_simd(vec, query),
+                        Dist::Cosine => {
+                            let denom = query_norm * data_norms[id];
+                            if denom > 0.0 {
+                                1.0 - f32::dot_simd(vec, query) / denom
+                            } else {
+                                1.0
+                            }
+                        }
+                    }
+                })
+                .collect()
+        })
+        .collect()
 }
 
 /// Calculate mean distance ratio across queries

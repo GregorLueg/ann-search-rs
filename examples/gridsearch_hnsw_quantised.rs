@@ -4,9 +4,10 @@
 //! Both indices are built and queried over the same data with the same
 //! `(M, ef_construction, ef_search)` grid, so the columns differ only by what
 //! the graph stores and how it measures distance. Recall is against an
-//! exhaustive search, and `DistRat` is the ratio of reported to true distance,
-//! which for the quantised index is its distance distortion rather than a
-//! search error.
+//! exhaustive search. `DistRat` compares the *exact* distance to whatever the
+//! index returned against the exact distance to the true neighbours, so the
+//! quantised rows measure retrieval quality on the same footing as the float
+//! ones rather than the codec's distance bias.
 
 mod commons;
 
@@ -100,7 +101,11 @@ fn main() {
         query_time_ms: query_time_sq8,
         total_time_ms: build_time_sq8 + query_time_sq8,
         recall_at_k: calculate_recall(&true_neighbors, &sq8_neighbors, cli.k),
-        mean_dist_rat: f64::NAN,
+        mean_dist_rat: calculate_mean_distance_ratio(
+            true_distances.as_ref().unwrap(),
+            &exact_distances(&data, &query_data, &sq8_neighbors, &cli.distance),
+            cli.k,
+        ),
         index_size_mb: size_sq8,
     });
 
@@ -196,12 +201,14 @@ fn main() {
         for ef_search in ef_search_values {
             println!("Querying HNSW-SQ8U index (ef_search={ef_search})...");
             let start = Instant::now();
-            let (approx_neighbors, approx_distances) = query_hnsw_sq8u_index(
+            // Distances are recomputed exactly below, so there is no point
+            // asking the index to report its estimates.
+            let (approx_neighbors, _) = query_hnsw_sq8u_index(
                 query_data.as_ref(),
                 &idx,
                 cli.k,
                 ef_search,
-                true,
+                false,
                 false,
             )
             .unwrap();
@@ -215,7 +222,7 @@ fn main() {
                 recall_at_k: calculate_recall(&true_neighbors, &approx_neighbors, cli.k),
                 mean_dist_rat: calculate_mean_distance_ratio(
                     true_distances.as_ref().unwrap(),
-                    approx_distances.as_ref().unwrap(),
+                    &exact_distances(&data, &query_data, &approx_neighbors, &cli.distance),
                     cli.k,
                 ),
                 index_size_mb,
@@ -224,8 +231,7 @@ fn main() {
 
         println!("Self-querying HNSW-SQ8U index...");
         let start = Instant::now();
-        let (approx_self, approx_dists_self) =
-            query_hnsw_sq8u_self(&idx, cli.k, 100, true, false).unwrap();
+        let (approx_self, _) = query_hnsw_sq8u_self(&idx, cli.k, 100, false, false).unwrap();
         let self_query_time = start.elapsed().as_secs_f64() * 1000.0;
 
         results.push(BenchmarkResultSize {
@@ -236,7 +242,7 @@ fn main() {
             recall_at_k: calculate_recall(&true_neighbors_self, &approx_self, cli.k),
             mean_dist_rat: calculate_mean_distance_ratio(
                 true_distances_self.as_ref().unwrap(),
-                approx_dists_self.as_ref().unwrap(),
+                &exact_distances(&data, &data, &approx_self, &cli.distance),
                 cli.k,
             ),
             index_size_mb,
@@ -268,8 +274,8 @@ fn main() {
         let index_size_mb = idx.memory_usage_bytes() as f64 / (1024.0 * 1024.0);
 
         let start = Instant::now();
-        let (approx_neighbors, approx_distances) =
-            query_hnsw_sq8u_index(query_data.as_ref(), &idx, cli.k, 100, true, false).unwrap();
+        let (approx_neighbors, _) =
+            query_hnsw_sq8u_index(query_data.as_ref(), &idx, cli.k, 100, false, false).unwrap();
         let query_time = start.elapsed().as_secs_f64() * 1000.0;
 
         results.push(BenchmarkResultSize {
@@ -280,7 +286,7 @@ fn main() {
             recall_at_k: calculate_recall(&true_neighbors, &approx_neighbors, cli.k),
             mean_dist_rat: calculate_mean_distance_ratio(
                 true_distances.as_ref().unwrap(),
-                approx_distances.as_ref().unwrap(),
+                &exact_distances(&data, &query_data, &approx_neighbors, &cli.distance),
                 cli.k,
             ),
             index_size_mb,
