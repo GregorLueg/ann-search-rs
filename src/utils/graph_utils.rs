@@ -27,6 +27,15 @@ pub struct SearchState<T> {
     pub candidates: BinaryHeap<Reverse<(OrderedFloat<T>, usize)>>,
     /// Sorted buffer of current best candidates
     pub working_sorted: SortedBuffer<(OrderedFloat<T>, usize)>,
+    /// Bounded max-heap of current best candidates.
+    ///
+    /// Serves the same purpose as `working_sorted` but at `O(log ef)` per
+    /// accepted candidate instead of the `O(ef)` memmove `Vec::insert` costs.
+    /// The two coexist because the buffer's tail is only worth the swap where
+    /// `ef` is large: HNSW construction runs at `ef_construction` in the
+    /// hundreds, whereas NSG and Vamana prune against lists an order of
+    /// magnitude shorter.
+    pub results: BoundedMaxHeap<T>,
     /// Temporary storage for heuristic selection
     pub scratch_working: Vec<(OrderedFloat<T>, usize)>,
     /// Temporary storage for pruned candidates
@@ -54,6 +63,7 @@ where
             visited: FixedBitSet::with_capacity(capacity),
             candidates: BinaryHeap::with_capacity(capacity),
             working_sorted: SortedBuffer::with_capacity(capacity),
+            results: BoundedMaxHeap::new(capacity),
             scratch_working: Vec::with_capacity(capacity),
             scratch_discarded: Vec::with_capacity(capacity),
         }
@@ -75,6 +85,7 @@ where
 
         self.candidates.clear();
         self.working_sorted.clear();
+        self.results.clear();
         self.scratch_working.clear();
         self.scratch_discarded.clear();
     }

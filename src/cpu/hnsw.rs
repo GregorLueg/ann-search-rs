@@ -897,8 +897,19 @@ where
                 state,
             );
 
-            let candidates: Vec<(OrderedFloat<T>, usize)> = state.working_sorted.data().to_vec();
-            let selected = self.select_neighbours_heuristic(node, &candidates, layer, state);
+            // Hand the candidates to the heuristic already sorted and with the
+            // query node dropped, so the selection pass neither copies nor
+            // re-sorts them.
+            state.results.sort();
+            state.scratch_working.clear();
+            let (dists, ids) = (state.results.dists(), state.results.ids());
+            for i in 0..dists.len() {
+                if ids[i] != node {
+                    state.scratch_working.push((OrderedFloat(dists[i]), ids[i]));
+                }
+            }
+
+            let selected = self.select_neighbours_heuristic(layer, state);
 
             // set this node's outgoing neighbours
             graph.set_neighbours(node, layer, &selected);
@@ -987,9 +998,10 @@ where
 
     /// Search layer during construction
     ///
-    /// Returns ef closest nodes at the target layer. During construction,
-    /// traverses all available connections but only considers nodes that
-    /// exist at the target layer or higher.
+    /// Leaves the `ef` closest nodes at the target layer in `state.results`,
+    /// heap-ordered rather than sorted. During construction, traverses all
+    /// available connections but only considers nodes that exist at the target
+    /// layer or higher.
     ///
     /// ### Params
     ///
@@ -998,11 +1010,8 @@ where
     /// * `entry_node` - Starting point for search
     /// * `ef` - Size of candidate list
     /// * `graph` - Construction graph
-    /// * `state` - Mutable reference to search state
-    ///
-    /// ### Returns
-    ///
-    /// Vector of (distance, id) pairs for closest candidates
+    /// * `state` - Mutable reference to search state; the result set is left
+    ///   in its `results` heap
     fn search_layer_construction(
         &self,
         query_node: usize,
@@ -1012,23 +1021,28 @@ where
         graph: &ConstructionGraph<T>,
         state: &mut SearchState<T>,
     ) {
-        state.working_sorted.clear();
+        state.results.reset(ef);
         state.candidates.clear();
 
-        let entry_dist = OrderedFloat(match self.metric {
+        let entry_dist = match self.metric {
             Dist::SquaredEuclidean => self.euclidean_distance(query_node, entry_node),
             Dist::Cosine => self.cosine_distance(query_node, entry_node),
             Dist::Manhattan => self.manhattan_distance(query_node, entry_node),
-        });
+        };
 
         state.mark_visited(entry_node);
-        state.candidates.push(Reverse((entry_dist, entry_node)));
-        state.working_sorted.insert((entry_dist, entry_node), ef);
+        state
+            .candidates
+            .push(Reverse((OrderedFloat(entry_dist), entry_node)));
+        state.results.push(entry_dist, entry_node);
 
-        let mut furthest_dist = entry_dist;
+        // `threshold()` is infinity until the heap fills, which is what makes
+        // the "or the result set is not yet full" arm of both tests below
+        // redundant: nothing is farther than infinity.
+        let mut furthest = state.results.threshold();
 
         while let Some(Reverse((current_dist, current_id))) = state.candidates.pop() {
-            if current_dist > furthest_dist && state.working_sorted.len() >= ef {
+            if current_dist.0 > furthest {
                 break;
             }
 
@@ -1047,24 +1061,18 @@ where
                 }
                 state.mark_visited(neighbour_id);
 
-                let dist = OrderedFloat(match self.metric {
+                let dist = match self.metric {
                     Dist::SquaredEuclidean => self.euclidean_distance(query_node, neighbour_id),
                     Dist::Cosine => self.cosine_distance(query_node, neighbour_id),
                     Dist::Manhattan => self.manhattan_distance(query_node, neighbour_id),
-                });
+                };
 
-                if dist < furthest_dist || state.working_sorted.len() < ef {
-                    state.candidates.push(Reverse((dist, neighbour_id)));
-
-                    if state.working_sorted.insert((dist, neighbour_id), ef)
-                        && state.working_sorted.len() >= ef
-                    {
-                        furthest_dist = state
-                            .working_sorted
-                            .top()
-                            .map(|(d, _)| *d)
-                            .unwrap_or(OrderedFloat(T::infinity()));
-                    }
+                if dist < furthest {
+                    state
+                        .candidates
+                        .push(Reverse((OrderedFloat(dist), neighbour_id)));
+                    state.results.push(dist, neighbour_id);
+                    furthest = state.results.threshold();
                 }
             }
         }
@@ -1086,32 +1094,19 @@ where
     ///
     /// ### Params
     ///
-    /// * `node` - Query node
-    /// * `candidates` - Candidate neighbours with distances
     /// * `layer` - Layer being constructed
-    /// * `state` - Search state with scratch buffers
+    /// * `state` - Search state whose `scratch_working` holds the candidates,
+    ///   ascending by distance and with the query node already dropped
     ///
     /// ### Returns
     ///
     /// Pruned neighbour list respecting max_neighbours constraint
     fn select_neighbours_heuristic(
         &self,
-        node: usize,
-        candidates: &[(OrderedFloat<T>, usize)],
         layer: u8,
-        state: &mut SearchState<T>,
+        state: &SearchState<T>,
     ) -> Vec<(OrderedFloat<T>, usize)> {
         let max_neighbours = self.max_neighbours_for_layer(layer);
-
-        state.scratch_working.clear();
-
-        for &(dist, id) in candidates {
-            if id != node {
-                state.scratch_working.push((dist, id));
-            }
-        }
-
-        state.scratch_working.sort_unstable_by_key(|a| a.0);
 
         let mut result = Vec::with_capacity(max_neighbours);
 

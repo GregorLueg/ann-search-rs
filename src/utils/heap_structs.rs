@@ -278,6 +278,63 @@ impl<T: Float> BoundedMaxHeap<T> {
         self.threshold
     }
 
+    /// Empty the heap, retaining its allocation and its `k`
+    pub fn clear(&mut self) {
+        self.dists.clear();
+        self.ids.clear();
+        self.threshold = T::infinity();
+    }
+
+    /// Empty the heap and set the number of entries it retains to `k`
+    ///
+    /// Keeps the existing allocation when it is already large enough, so a
+    /// heap held in a thread-local scratch buffer allocates once per thread
+    /// rather than once per search.
+    ///
+    /// ### Params
+    ///
+    /// * `k` - Maximum number of entries to retain from now on
+    pub fn reset(&mut self, k: usize) {
+        self.clear();
+        self.dists.reserve(k.saturating_sub(self.dists.capacity()));
+        self.ids.reserve(k.saturating_sub(self.ids.capacity()));
+        self.k = k;
+    }
+
+    /// Retained distances, ascending only after [`BoundedMaxHeap::sort`]
+    ///
+    /// ### Returns
+    ///
+    /// The distance array in whatever order the heap currently holds it
+    #[inline]
+    pub fn dists(&self) -> &[T] {
+        &self.dists
+    }
+
+    /// Retained sample indices, permuted in lockstep with [`BoundedMaxHeap::dists`]
+    ///
+    /// ### Returns
+    ///
+    /// The index array in whatever order the heap currently holds it
+    #[inline]
+    pub fn ids(&self) -> &[usize] {
+        &self.ids
+    }
+
+    /// Sort the retained entries ascending by `(distance, index)` in place
+    ///
+    /// Heapsorts: repeatedly swaps the root to the back of the live region and
+    /// shrinks it, which leaves both arrays ascending. Leaves the heap
+    /// invariant broken, so the only valid operations afterwards are reading
+    /// the arrays, [`BoundedMaxHeap::clear`] or [`BoundedMaxHeap::reset`].
+    pub fn sort(&mut self) {
+        for end in (1..self.dists.len()).rev() {
+            self.dists.swap(0, end);
+            self.ids.swap(0, end);
+            self.sift_down(end);
+        }
+    }
+
     /// Number of retained entries
     ///
     /// ### Returns
@@ -374,11 +431,7 @@ impl<T: Float> BoundedMaxHeap<T> {
     ///
     /// A tuple of `(indices, distances)`
     pub fn into_sorted(mut self) -> (Vec<usize>, Vec<T>) {
-        for end in (1..self.dists.len()).rev() {
-            self.dists.swap(0, end);
-            self.ids.swap(0, end);
-            self.sift_down(end);
-        }
+        self.sort();
         (self.ids, self.dists)
     }
 }
