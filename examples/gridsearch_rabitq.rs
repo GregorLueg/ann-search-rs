@@ -109,7 +109,11 @@ fn main() {
         query_time_ms: query_time,
         total_time_ms: build_time + query_time,
         recall_at_k: recall,
-        mean_dist_rat: f64::NAN,
+        mean_dist_rat: calculate_mean_distance_ratio(
+            true_distances.as_ref().unwrap(),
+            &exact_distances(&data, &query_data, &rabitq_neighbors, &cli.distance),
+            cli.k,
+        ),
         index_size_mb,
     });
 
@@ -119,14 +123,14 @@ fn main() {
             rerank_factor
         );
         let start = Instant::now();
-        let (rabitq_neighbors, rabitq_distances) = query_exhaustive_index_rabitq(
+        let (rabitq_neighbors, _) = query_exhaustive_index_rabitq(
             query_data.as_ref(),
             &rabitq_idx,
             cli.k,
             None,
             true,
             Some(rerank_factor),
-            true,
+            false,
             false,
         )
         .unwrap();
@@ -135,7 +139,7 @@ fn main() {
         let recall = calculate_recall(&true_neighbors, &rabitq_neighbors, cli.k);
         let dist_error = calculate_mean_distance_ratio(
             true_distances.as_ref().unwrap(),
-            rabitq_distances.as_ref().unwrap(),
+            &exact_distances(&data, &query_data, &rabitq_neighbors, &cli.distance),
             cli.k,
         );
 
@@ -152,15 +156,15 @@ fn main() {
 
     println!("Self-querying RaBitQ exhaustive index...");
     let start = Instant::now();
-    let (rabitq_neighbors_self, rabitq_distances_self) =
-        query_exhaustive_index_rabitq_self(&rabitq_idx, cli.k, None, Some(10), true, false)
+    let (rabitq_neighbors_self, _) =
+        query_exhaustive_index_rabitq_self(&rabitq_idx, cli.k, None, Some(10), false, false)
             .unwrap();
     let self_query_time = start.elapsed().as_secs_f64() * 1000.0;
 
     let recall_self = calculate_recall(&true_neighbors_self, &rabitq_neighbors_self, cli.k);
     let dist_error_self = calculate_mean_distance_ratio(
         true_distances_self.as_ref().unwrap(),
-        rabitq_distances_self.as_ref().unwrap(),
+        &exact_distances(&data, &data, &rabitq_neighbors_self, &cli.distance),
         cli.k,
     );
 
@@ -248,7 +252,11 @@ fn main() {
                 query_time_ms: query_time,
                 total_time_ms: build_time + query_time,
                 recall_at_k: recall,
-                mean_dist_rat: f64::NAN,
+                mean_dist_rat: calculate_mean_distance_ratio(
+                    true_distances.as_ref().unwrap(),
+                    &exact_distances(&data, &query_data, &approx_neighbors, &cli.distance),
+                    cli.k,
+                ),
                 index_size_mb,
             });
         }
@@ -265,14 +273,14 @@ fn main() {
                     nlist, nprobe, rerank_factor
                 );
                 let start = Instant::now();
-                let (approx_neighbors, approx_distances) = query_ivf_index_rabitq(
+                let (approx_neighbors, _) = query_ivf_index_rabitq(
                     query_data.as_ref(),
                     &ivf_rabitq_idx,
                     cli.k,
                     Some(*nprobe),
                     true,
                     Some(rerank_factor),
-                    true,
+                    false,
                     false,
                 )
                 .unwrap();
@@ -281,7 +289,7 @@ fn main() {
                 let recall = calculate_recall(&true_neighbors, &approx_neighbors, cli.k);
                 let dist_error = calculate_mean_distance_ratio(
                     true_distances.as_ref().unwrap(),
-                    approx_distances.as_ref().unwrap(),
+                    &exact_distances(&data, &query_data, &approx_neighbors, &cli.distance),
                     cli.k,
                 );
 
@@ -307,12 +315,12 @@ fn main() {
             nprobe_self
         );
         let start = Instant::now();
-        let (approx_neighbors_self, approx_distances_self) = query_ivf_index_rabitq_self(
+        let (approx_neighbors_self, _) = query_ivf_index_rabitq_self(
             &ivf_rabitq_idx,
             cli.k,
             Some(nprobe_self),
             None,
-            true,
+            false,
             false,
         )
         .unwrap();
@@ -321,7 +329,7 @@ fn main() {
         let recall_self = calculate_recall(&true_neighbors_self, &approx_neighbors_self, cli.k);
         let dist_error_self = calculate_mean_distance_ratio(
             true_distances_self.as_ref().unwrap(),
-            approx_distances_self.as_ref().unwrap(),
+            &exact_distances(&data, &data, &approx_neighbors_self, &cli.distance),
             cli.k,
         );
 

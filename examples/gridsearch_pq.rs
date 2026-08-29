@@ -34,8 +34,8 @@ fn main() {
 
     println!("Querying exhaustive index...");
     let start = Instant::now();
-    let (true_neighbours, _) =
-        query_exhaustive_index(query_data.as_ref(), &exhaustive_idx, cli.k, false, false).unwrap();
+    let (true_neighbours, true_distances) =
+        query_exhaustive_index(query_data.as_ref(), &exhaustive_idx, cli.k, true, false).unwrap();
     let query_time = start.elapsed().as_secs_f64() * 1000.0;
 
     results.push(BenchmarkResultSize {
@@ -51,8 +51,8 @@ fn main() {
     // Exhaustive self-query benchmark
     println!("Self-querying exhaustive index...");
     let start = Instant::now();
-    let (true_neighbours_self, _) =
-        query_exhaustive_self(&exhaustive_idx, cli.k, false, false).unwrap();
+    let (true_neighbours_self, true_distances_self) =
+        query_exhaustive_self(&exhaustive_idx, cli.k, true, false).unwrap();
     let self_query_time = start.elapsed().as_secs_f64() * 1000.0;
 
     results.push(BenchmarkResultSize {
@@ -112,7 +112,11 @@ fn main() {
             query_time_ms: query_time,
             total_time_ms: build_time + query_time,
             recall_at_k: recall,
-            mean_dist_rat: f64::NAN,
+            mean_dist_rat: calculate_mean_distance_ratio(
+                true_distances.as_ref().unwrap(),
+                &exact_distances(&data, &query_data, &approx_neighbours, &cli.distance),
+                cli.k,
+            ),
             index_size_mb,
         });
 
@@ -131,7 +135,11 @@ fn main() {
             query_time_ms: self_query_time,
             total_time_ms: build_time + self_query_time,
             recall_at_k: recall_self,
-            mean_dist_rat: f64::NAN,
+            mean_dist_rat: calculate_mean_distance_ratio(
+                true_distances_self.as_ref().unwrap(),
+                &exact_distances(&data, &data, &approx_neighbours_self, &cli.distance),
+                cli.k,
+            ),
             index_size_mb,
         });
     }
@@ -210,7 +218,11 @@ fn main() {
                     query_time_ms: query_time,
                     total_time_ms: build_time + query_time,
                     recall_at_k: recall,
-                    mean_dist_rat: f64::NAN,
+                    mean_dist_rat: calculate_mean_distance_ratio(
+                        true_distances.as_ref().unwrap(),
+                        &exact_distances(&data, &query_data, &approx_neighbours, &cli.distance),
+                        cli.k,
+                    ),
                     index_size_mb,
                 });
             }
@@ -233,7 +245,11 @@ fn main() {
                 query_time_ms: self_query_time,
                 total_time_ms: build_time + self_query_time,
                 recall_at_k: recall_self,
-                mean_dist_rat: f64::NAN,
+                mean_dist_rat: calculate_mean_distance_ratio(
+                    true_distances_self.as_ref().unwrap(),
+                    &exact_distances(&data, &data, &approx_neighbours_self, &cli.distance),
+                    cli.k,
+                ),
                 index_size_mb,
             });
         }

@@ -2,9 +2,9 @@
 #![allow(dead_code)]
 #![allow(unused_imports)]
 
+use ann_search_rs::prelude::{matrix_to_flat, parse_ann_dist, Dist, SimdDistance};
 use clap::Parser;
 use faer::Mat;
-use ann_search_rs::prelude::{matrix_to_flat, parse_ann_dist, Dist, SimdDistance};
 use num_traits::{Float, ToPrimitive};
 use rayon::prelude::*;
 use rustc_hash::FxHashSet;
