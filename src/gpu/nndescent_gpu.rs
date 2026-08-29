@@ -57,8 +57,16 @@ pub const MAX_PROPOSALS: usize = 128;
 pub(crate) const DEFAULT_MAX_ITERS: usize = 15;
 /// Default convergence threshold (fraction of k*n edges updated)
 pub(crate) const DEFAULT_DELTA: f32 = 0.001;
-/// Default sampling rate for the local join
-pub(crate) const DEFAULT_RHO: f32 = 0.5;
+/// Default sampling rate for the local join.
+///
+/// 1.0 means no sampling: every candidate pair in a node's neighbourhood is
+/// joined. Measured on a 500k x 32 real single-cell PCA embedding, sampling at
+/// 0.5 was buying its speed with recall rather than earning it, and closing the
+/// gap by widening `build_k` instead costs more for less. At k=30 the two
+/// settings run 2.00 s at recall 0.9751 against 2.65 s at 0.9944; at k=15,
+/// 1.13 s at 0.9171 against 1.29 s at 0.9857. The sampled default was a poor
+/// point on that trade, so the full join is the default.
+pub(crate) const DEFAULT_RHO: f32 = 1.0;
 
 ////////////////////
 // Kernel helpers //
@@ -307,11 +315,21 @@ fn staged_pair_dist<F: Float, N: Size>(
 /// * `seed` - Random seed for neighbour generation
 /// * `use_cosine` - Whether to use cosine distance instead of squared Euclidean
 /// * `dim_lines` - Number of `Vector<F, N>` elements per vector row (comptime)
+/// * `k_comp` - Graph degree, i.e. `graph_idx.shape(1)`, as a comptime value so
+///   the working list can be a fixed-size local array (comptime)
 ///
 /// ### Returns
 ///
 /// Writes an initialised sorted kNN graph into `graph_idx` and `graph_dist`.
 /// All entries are flagged as new (MSB set).
+///
+/// ### Note
+///
+/// The insertion sort runs over thread-local arrays, not over the graph
+/// tensors. Sorting in place in global memory costs `O(k^2)` scattered
+/// read-modify-writes per node against `O(k)` here, and at `n = 500k`,
+/// `k = 45` that was 201 ms of a 1.76 s build, more than any other single
+/// launch.
 ///
 /// ### Grid mapping
 ///
@@ -326,19 +344,22 @@ pub fn init_random_graph<F: Float, N: Size>(
     seed: u32,
     #[comptime] use_cosine: bool,
     #[comptime] dim_lines: usize,
+    #[comptime] k_comp: usize,
 ) {
     let node = (CUBE_POS_Y * CUBE_COUNT_X + CUBE_POS_X) * WORKGROUP_SIZE_X + UNIT_POS_X;
     if node >= n_pts {
         terminate!();
     }
 
-    let k = graph_idx.shape(1);
     let is_new_bit = 1u32 << 31;
-    let base = node as usize * k;
+    let base = node as usize * k_comp;
+
+    let mut local_idx = Array::<u32>::new(k_comp);
+    let mut local_dist = Array::<F>::new(k_comp);
 
     let mut rng = xorshift(node ^ seed ^ 0xDEADBEEFu32);
 
-    for slot in 0..k {
+    for slot in 0..k_comp {
         rng = xorshift(rng);
         let mut pid = rng % n_pts;
         if pid == node {
@@ -355,7 +376,7 @@ pub fn init_random_graph<F: Float, N: Size>(
         // find the first position where dist < existing, scanning left to right.
         let mut insert_pos = slot;
         for j in 0..slot {
-            if dist < graph_dist[base + j] && insert_pos == slot {
+            if dist < local_dist[j] && insert_pos == slot {
                 insert_pos = j;
             }
         }
@@ -365,13 +386,18 @@ pub fn init_random_graph<F: Float, N: Size>(
             let src = slot - 1 - j;
             let dst = slot - j;
             if src >= insert_pos {
-                graph_idx[base + dst] = graph_idx[base + src];
-                graph_dist[base + dst] = graph_dist[base + src];
+                local_idx[dst] = local_idx[src];
+                local_dist[dst] = local_dist[src];
             }
         }
 
-        graph_idx[base + insert_pos] = pid | is_new_bit;
-        graph_dist[base + insert_pos] = dist;
+        local_idx[insert_pos] = pid;
+        local_dist[insert_pos] = dist;
+    }
+
+    for j in 0..k_comp {
+        graph_idx[base + j] = local_idx[j] | is_new_bit;
+        graph_dist[base + j] = local_dist[j];
     }
 }
 
@@ -1566,7 +1592,7 @@ where
     /// * `n_trees` - Number of Annoy trees for graph initialisation.
     ///   Defaults to `5 + n^0.25`, capped at 32.
     /// * `delta` - Convergence threshold as fraction of n*k (default `0.001`)
-    /// * `rho` - Sampling rate for the local join (default `0.5`)
+    /// * `rho` - Sampling rate for the local join (default `1.0`, no sampling)
     /// * `seed` - Random seed
     /// * `verbose` - Print progress
     /// * `device` - CubeCL runtime device
@@ -1702,6 +1728,7 @@ where
                 seed as u32,
                 use_cosine,
                 dim_vec,
+                build_k,
             );
         }
 
@@ -2481,7 +2508,7 @@ where
 ///   [`default_forest_trees`]
 /// * `delta` - Convergence threshold (fraction of `n*build_k` edges
 ///   updated). Defaults to 0.001
-/// * `rho` - Local-join sampling rate. Defaults to 0.5
+/// * `rho` - Local-join sampling rate. Defaults to 1.0, meaning no sampling
 /// * `refine_knn` - Number of 2-hop refinement sweeps after the main
 ///   NNDescent loop. Defaults to `0`
 /// * `seed` - RNG seed for reproducibility
@@ -2777,6 +2804,7 @@ where
             seed as u32,
             use_cosine,
             dim_vec,
+            build_k,
         );
     }
 
@@ -4213,7 +4241,7 @@ mod kernel_tests {
         )
         .unwrap();
 
-        let (knn_indices, _) = index.extract_knn(false);
+        let (knn_indices, _) = index.extract_knn(None, false);
 
         let mut total_hits = 0;
         let total_possible = n * k;

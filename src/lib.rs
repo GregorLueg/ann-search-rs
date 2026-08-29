@@ -3188,7 +3188,7 @@ where
 /// * `max_iters` - Maximum NNDescent iterations (default 15)
 /// * `n_trees` - Annoy forest size (default auto)
 /// * `delta` - Convergence threshold (default 0.001)
-/// * `rho` - Sampling rate (default 0.5)
+/// * `rho` - Sampling rate (default 1.0, meaning no sampling)
 /// * `seed` - Random seed
 /// * `verbose` - Print progress
 /// * `device` - GPU device
@@ -3382,7 +3382,7 @@ where
 /// * `max_iters` - Maximum NNDescent iterations (default 15)
 /// * `n_trees` - Forest size for GPU init (default auto)
 /// * `delta` - Convergence threshold (default 0.001)
-/// * `rho` - Local-join sampling rate (default 0.5)
+/// * `rho` - Local-join sampling rate (default 1.0, meaning no sampling)
 /// * `refine_knn` - 2-hop refinement sweeps after main loop (default 0)
 /// * `seed` - Random seed
 /// * `verbose` - Print progress
@@ -3440,7 +3440,7 @@ where
 /// * `max_iters` - Maximum NNDescent iterations per cluster (default 15)
 /// * `n_trees` - Forest size for GPU init; sized per cluster when `None`
 /// * `delta` - Convergence threshold (default 0.001)
-/// * `rho` - Local-join sampling rate (default 0.5)
+/// * `rho` - Local-join sampling rate (default 1.0, meaning no sampling)
 /// * `refine_knn` - 2-hop refinement sweeps per cluster (default 0)
 /// * `cluster_params` - Optional [`crate::gpu::clustered_nndescent_gpu::ClusteredBuildParams`];
 ///   `None` plans the cluster count from the device limits
