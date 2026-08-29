@@ -53,19 +53,14 @@ use crate::utils::nndescent_utils::{unpack_knn_graph, SENTINEL_PID};
 
 /// Max proposals per node per iteration. Overflow is silently dropped.
 pub const MAX_PROPOSALS: usize = 128;
+
 /// Default maximum number of NNDescent iterations
 pub(crate) const DEFAULT_MAX_ITERS: usize = 15;
+
 /// Default convergence threshold (fraction of k*n edges updated)
 pub(crate) const DEFAULT_DELTA: f32 = 0.001;
+
 /// Default sampling rate for the local join.
-///
-/// 1.0 means no sampling: every candidate pair in a node's neighbourhood is
-/// joined. Measured on a 500k x 32 real single-cell PCA embedding, sampling at
-/// 0.5 was buying its speed with recall rather than earning it, and closing the
-/// gap by widening `build_k` instead costs more for less. At k=30 the two
-/// settings run 2.00 s at recall 0.9751 against 2.65 s at 0.9944; at k=15,
-/// 1.13 s at 0.9171 against 1.29 s at 0.9857. The sampled default was a poor
-/// point on that trade, so the full join is the default.
 pub(crate) const DEFAULT_RHO: f32 = 1.0;
 
 ////////////////////

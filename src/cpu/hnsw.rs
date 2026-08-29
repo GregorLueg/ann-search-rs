@@ -165,6 +165,7 @@ where
     /// Caller must hold this node's stripe lock. Blocks belonging to different
     /// nodes are disjoint, so concurrent writers under their own locks never
     /// alias.
+    #[allow(clippy::mut_from_ref)]
     #[inline]
     unsafe fn slots_mut(&self, node_id: usize, layer: u8) -> &mut [u32] {
         let (start, len) = self.slot_range(node_id, layer);

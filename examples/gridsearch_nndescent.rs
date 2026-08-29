@@ -89,8 +89,8 @@ fn main() {
     println!("-----------------------------");
 
     let build_params = [
-        (Some(12), 0.0, vec![None]),
-        (Some(24), 0.0, vec![None]),
+        (Some(4), 0.0, vec![None]),
+        (Some(8), 0.0, vec![None]),
         (None, 0.0, vec![Some(75), Some(100), None]),
         (None, 0.25, vec![None]),
         (None, 0.5, vec![None]),

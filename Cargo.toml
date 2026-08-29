@@ -38,12 +38,6 @@ quantised = ["half"]
 ## Enables mimalloc as the global allocator for improved performance
 mimalloc = ["dep:mimalloc"]
 ## Accept `ndarray` 2-D arrays wherever a faer matrix is accepted.
-##
-## This makes `ndarray` a public dependency, so a downstream crate pinned to a
-## different major version ends up with two incompatible `ArrayView2` types in
-## the graph. If that bites, leave the feature off and pass
-## `(arr.as_slice().unwrap(), arr.nrows(), arr.ncols())` instead, which works on
-## any `ndarray` version.
 ndarray = ["dep:ndarray"]
 ## Enables saving indices to disk and loading them back in
 serialise = ["dep:serde", "dep:bincode", "half?/serde"]
@@ -193,10 +187,6 @@ required-features = ["binary"]
 
 [[example]]
 name = "knn_comparison_cagra"
-required-features = ["gpu"]
-
-[[example]]
-name = "profile_nndescent_gpu"
 required-features = ["gpu"]
 
 ###########
