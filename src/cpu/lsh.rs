@@ -744,7 +744,7 @@ where
 
         let (bucket_offsets, bucket_ids) = build_bucket_csr(&codes, n, num_tables, n_buckets);
 
-        Ok(Self {
+        let mut idx = Self {
             vectors_flat,
             dim,
             n,
@@ -759,8 +759,78 @@ where
             n_proj,
             slot_bits,
             n_buckets,
-            original_ids: (0..n).collect(),
-        })
+            original_ids: Vec::new(),
+        };
+
+        let new_to_old = idx.optimise_memory_layout();
+        idx.original_ids = new_to_old;
+
+        Ok(idx)
+    }
+
+    /// Reorder the stored vectors into table 0's bucket order
+    ///
+    /// The candidate scan is a random gather into `vectors_flat` driven by
+    /// `bucket_ids`: it fetches `dim * size_of::<T>()` bytes to do `dim` FMAs,
+    /// so it is bound by memory rather than by arithmetic and the layout is
+    /// what decides its cost. Laying the vectors out in table 0's bucket order
+    /// turns that table's scan into a sequential read, the same trick IVF
+    /// plays with its cells and Annoy with tree 0.
+    ///
+    /// The remaining tables keep their gather, but it does not stay uniformly
+    /// random: buckets are proximity groups, so points sharing a table-0
+    /// bucket tend to share buckets elsewhere too and their gathers come out
+    /// clustered. How much that is worth depends on how correlated the tables
+    /// are on the data at hand.
+    ///
+    /// Table 0's CSR is a permutation of `0..n` by construction, since
+    /// [`build_bucket_csr`] writes every id exactly once per table. No
+    /// unreachable-id safeguard is needed, unlike the Annoy equivalent where a
+    /// tree need not contain every item.
+    ///
+    /// ### Returns
+    ///
+    /// New-to-old id mapping, to be stored as `original_ids`.
+    fn optimise_memory_layout(&mut self) -> Vec<usize> {
+        if self.n == 0 {
+            return Vec::new();
+        }
+
+        let new_to_old: Vec<usize> = self.bucket_ids[..self.n]
+            .iter()
+            .map(|&id| id as usize)
+            .collect();
+
+        let mut old_to_new = vec![0u32; self.n];
+        for (new_id, &old_id) in new_to_old.iter().enumerate() {
+            old_to_new[old_id] = new_id as u32;
+        }
+
+        let mut new_vectors_flat = Vec::with_capacity(self.vectors_flat.len());
+        let mut new_norms = if self.norms.is_empty() {
+            Vec::new()
+        } else {
+            Vec::with_capacity(self.n)
+        };
+
+        for &old_id in &new_to_old {
+            let start = old_id * self.dim;
+            new_vectors_flat.extend_from_slice(&self.vectors_flat[start..start + self.dim]);
+            if !self.norms.is_empty() {
+                new_norms.push(self.norms[old_id]);
+            }
+        }
+
+        // Every table, table 0 included: its entries become `0..n` in order,
+        // which is exactly what makes that scan sequential.
+        for id in self.bucket_ids.iter_mut() {
+            *id = old_to_new[*id as usize];
+        }
+
+        self.vectors_flat = new_vectors_flat;
+        self.norms = new_norms;
+
+        new_to_old
     }
 
     /// Returns the size of the index in bytes
@@ -1107,8 +1177,8 @@ where
     ///
     /// ### Returns
     ///
-    /// Tuple of `(knn_indices, optional distances)` where each row corresponds
-    /// to a vector in the index
+    /// Tuple of `(knn_indices, optional distances)` where row `i` corresponds
+    /// to the caller's row `i`, not to the index's internal ordering.
     pub fn generate_knn(
         &self,
         k: usize,
@@ -1124,7 +1194,7 @@ where
 
         let counter = Arc::new(AtomicUsize::new(0));
 
-        let results: Vec<(Vec<usize>, Vec<T>, bool)> = (0..self.n)
+        let results: Vec<(usize, Vec<usize>, Vec<T>, bool)> = (0..self.n)
             .into_par_iter()
             .map(|vec_idx| {
                 if verbose {
@@ -1138,31 +1208,39 @@ where
                     }
                 }
 
-                self.self_query_at(vec_idx, k, max_cand, n_probes)
+                let (indices, dists, fallback) = self.self_query_at(vec_idx, k, max_cand, n_probes);
+                (self.original_ids[vec_idx], indices, dists, fallback)
             })
             .collect();
 
         if verbose {
-            let missed = results.iter().filter(|(_, _, fallback)| *fallback).count();
+            let missed = results
+                .iter()
+                .filter(|(_, _, _, fallback)| *fallback)
+                .count();
             if (missed as f32) / (self.n as f32) >= 0.01 {
                 println!("More than 1% of samples were not represented in the buckets.");
                 println!("Please verify underlying data");
             }
         }
 
-        if return_dist {
-            let mut indices = Vec::with_capacity(results.len());
-            let mut distances = Vec::with_capacity(results.len());
-
-            for (idx, dist, _) in results {
-                indices.push(idx);
-                distances.push(dist);
-            }
-            (indices, Some(distances))
+        // Rows come back in internal order, so they are scattered into the
+        // caller's order rather than pushed in the order they were produced.
+        let mut final_indices = vec![Vec::new(); self.n];
+        let mut final_dists = if return_dist {
+            Some(vec![Vec::new(); self.n])
         } else {
-            let indices: Vec<Vec<usize>> = results.into_iter().map(|(idx, _, _)| idx).collect();
-            (indices, None)
+            None
+        };
+
+        for (orig_id, idx, dist, _) in results {
+            final_indices[orig_id] = idx;
+            if let Some(dists) = final_dists.as_mut() {
+                dists[orig_id] = dist;
+            }
         }
+
+        (final_indices, final_dists)
     }
 
     /// Self-query for a vector already stored in the index
@@ -1469,8 +1547,16 @@ mod tests {
 
         let index = LSHIndex::new(mat.as_ref(), Dist::SquaredEuclidean, 1, 8, Some(4), 3).unwrap();
 
-        let short = &index.vectors_flat[0..dim];
-        let long = &index.vectors_flat[(n - 1) * dim..n * dim];
+        let internal = |orig: usize| {
+            index
+                .original_ids
+                .iter()
+                .position(|&o| o == orig)
+                .expect("every original id is present")
+        };
+        let (lo, hi) = (internal(0), internal(n - 1));
+        let short = &index.vectors_flat[lo * dim..(lo + 1) * dim];
+        let long = &index.vectors_flat[hi * dim..(hi + 1) * dim];
 
         let proj_short = index.project_one(short, 1.0);
         let proj_long = index.project_one(long, 1.0);
@@ -1772,6 +1858,72 @@ mod tests {
     }
 
     #[test]
+    fn test_layout_reorder_is_a_permutation() {
+        let n = 2000;
+        let dim = 16;
+        let mat = offset_data(n, dim);
+        let index = LSHIndex::new(mat.as_ref(), Dist::SquaredEuclidean, 4, 8, None, 11).unwrap();
+
+        // `original_ids` must be a bijection, else results map back wrongly.
+        let mut seen = vec![false; n];
+        for &old in &index.original_ids {
+            assert!(!seen[old], "original id {old} appeared twice");
+            seen[old] = true;
+        }
+        assert!(seen.iter().all(|&hit| hit));
+
+        // Every stored row must still be the vector its original id names.
+        for (new_id, &old_id) in index.original_ids.iter().enumerate() {
+            let stored = &index.vectors_flat[new_id * dim..(new_id + 1) * dim];
+            for (j, &v) in stored.iter().enumerate() {
+                assert_eq!(v, mat[(old_id, j)], "row {old_id} moved but changed");
+            }
+        }
+    }
+
+    #[test]
+    fn test_table_zero_scan_is_sequential_after_reorder() {
+        let mat = offset_data(2000, 16);
+        let index = LSHIndex::new(mat.as_ref(), Dist::SquaredEuclidean, 4, 8, None, 11).unwrap();
+
+        // The whole point of the reorder: table 0's CSR becomes the identity,
+        // so its candidate scan walks `vectors_flat` front to back.
+        let table_zero = &index.bucket_ids[..index.n];
+        assert!(
+            table_zero
+                .iter()
+                .enumerate()
+                .all(|(pos, &id)| id as usize == pos),
+            "table 0 is not in identity order, the sequential scan is lost"
+        );
+    }
+
+    #[test]
+    fn test_generate_knn_rows_are_in_caller_order() {
+        let n = 500;
+        let dim = 16;
+        let mat = offset_data(n, dim);
+        let index = LSHIndex::new(mat.as_ref(), Dist::SquaredEuclidean, 4, 8, None, 5).unwrap();
+
+        let (knn, _) = index.generate_knn(3, None, index.n_proj, false, false);
+
+        assert_eq!(knn.len(), n);
+
+        // Row i is row i of the caller's matrix, so its own id should be its
+        // nearest neighbour. Rows the buckets missed entirely fall back to a
+        // random sample, so this is a share rather than an all.
+        let found_self = knn
+            .iter()
+            .enumerate()
+            .filter(|(i, row)| row.contains(i))
+            .count();
+        assert!(
+            found_self as f32 / n as f32 > 0.95,
+            "only {found_self}/{n} rows found themselves, rows are likely permuted"
+        );
+    }
+
+    #[test]
     fn test_self_query_finds_self() {
         let mat = simple_test_data();
         let index = LSHIndex::new(mat.as_ref(), Dist::SquaredEuclidean, 4, 8, None, 42).unwrap();
@@ -1781,7 +1933,7 @@ mod tests {
         assert!(!indices.is_empty());
         assert!(indices.len() <= 3);
         assert_eq!(indices.len(), distances.len());
-        assert!(indices.contains(&0));
+        assert!(indices.contains(&index.original_ids[0]));
     }
 
     #[test]
