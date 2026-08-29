@@ -44,11 +44,23 @@ impl<T: Ord> Default for SortedBuffer<T> {
 
 /// Construction-time neighbour storage
 struct ConstructionGraph<T> {
-    /// Flat storage: each layer is a fixed-size block padded with u32::MAX.
-    /// Layout per node: [layer0 (M*2 slots), layer1 (M slots), ...].
-    /// Sentinels (u32::MAX) mark unused slots; valid IDs are packed at the
-    /// front of each layer block.
-    nodes: Vec<UnsafeCell<Vec<u32>>>,
+    /// One contiguous slot array for the whole graph, node blocks concatenated
+    /// in node order. Layout within a node's block: [layer0 (M*2 slots),
+    /// layer1 (M slots), ...]. Sentinels (u32::MAX) mark unused slots; valid
+    /// IDs are packed at the front of each layer block.
+    ///
+    /// One allocation rather than one per node: the construction search chases
+    /// a different node's block on every hop, and scattered per-node `Vec`s put
+    /// each hop in an unrelated malloc block behind a second dependent load.
+    /// Never resized after construction, so the buffer pointer is stable for
+    /// the whole build.
+    nodes: UnsafeCell<Vec<u32>>,
+    /// Start of each node's block within `nodes`.
+    ///
+    /// Identical to the `neighbour_offsets` the finished index carries, which
+    /// is what lets [`ConstructionGraph::into_flat`] hand the buffer over by
+    /// move instead of copying it out node by node.
+    offsets: Vec<usize>,
     /// Striped spin-locks for thread-safe writes. Stripe count is independent
     /// of graph size, so memory overhead stays constant as the index grows.
     locks: StripedLocks,
@@ -86,21 +98,77 @@ where
     ///
     /// Initialised construction graph with sentinel-filled neighbour slots
     fn new(n: usize, layer_assignments: &[u8], m: usize, threads: usize) -> Self {
-        let nodes = (0..n)
-            .map(|i| {
-                let level = layer_assignments[i] as usize;
-                let total_slots = m * 2 + level * m;
-                UnsafeCell::new(vec![u32::MAX; total_slots])
-            })
-            .collect();
+        let mut offsets = Vec::with_capacity(n);
+        let mut total = 0usize;
+        for &level in layer_assignments.iter().take(n) {
+            offsets.push(total);
+            total += m * 2 + level as usize * m;
+        }
 
         Self {
-            nodes,
+            nodes: UnsafeCell::new(vec![u32::MAX; total]),
+            offsets,
             locks: StripedLocks::new(threads, m),
             node_levels: layer_assignments.to_vec(),
             m,
             _phantom: PhantomData,
         }
+    }
+
+    /// Base pointer of the contiguous slot array
+    ///
+    /// ### Returns
+    ///
+    /// Pointer to slot zero, valid for the lifetime of the graph
+    ///
+    /// ### Note
+    ///
+    /// The `Vec` is sized once in [`ConstructionGraph::new`] and never grows,
+    /// so the buffer address is stable and concurrent callers only ever read
+    /// the `Vec` header.
+    #[inline]
+    fn data_ptr(&self) -> *mut u32 {
+        unsafe { (*self.nodes.get()).as_mut_ptr() }
+    }
+
+    /// Locate a node's slot range for one layer within the flat array
+    ///
+    /// ### Params
+    ///
+    /// * `node_id` - Node index
+    /// * `layer` - Layer number
+    ///
+    /// ### Returns
+    ///
+    /// `(start, len)` into the flat slot array
+    #[inline]
+    fn slot_range(&self, node_id: usize, layer: u8) -> (usize, usize) {
+        (
+            self.offsets[node_id] + self.layer_offset(layer),
+            self.max_neighbours(layer),
+        )
+    }
+
+    /// Mutable view of a node's slot range for one layer
+    ///
+    /// ### Params
+    ///
+    /// * `node_id` - Node index
+    /// * `layer` - Layer number
+    ///
+    /// ### Returns
+    ///
+    /// The layer's slot range as a mutable slice
+    ///
+    /// ### Safety
+    ///
+    /// Caller must hold this node's stripe lock. Blocks belonging to different
+    /// nodes are disjoint, so concurrent writers under their own locks never
+    /// alias.
+    #[inline]
+    unsafe fn slots_mut(&self, node_id: usize, layer: u8) -> &mut [u32] {
+        let (start, len) = self.slot_range(node_id, layer);
+        std::slice::from_raw_parts_mut(self.data_ptr().add(start), len)
     }
 
     /// Compute the offset within a node's flat slot array for a given layer
@@ -187,10 +255,8 @@ where
         if layer > node_level {
             return &[];
         }
-        let flat = &*self.nodes[node_id].get();
-        let offset = self.layer_offset(layer);
-        let count = self.max_neighbours(layer);
-        &flat[offset..offset + count]
+        let (start, len) = self.slot_range(node_id, layer);
+        std::slice::from_raw_parts(self.data_ptr().add(start), len)
     }
 
     /// Set neighbours for a node at a specific layer
@@ -215,9 +281,7 @@ where
 
         let _guard = self.locks.lock_guard(node_id);
         let max_n = self.max_neighbours(layer);
-        let flat = unsafe { &mut *self.nodes[node_id].get() };
-        let offset = self.layer_offset(layer);
-        let slot = &mut flat[offset..offset + max_n];
+        let slot = unsafe { self.slots_mut(node_id, layer) };
 
         let mut i = 0;
         for &(_, neighbour_id) in neighbours.iter().take(max_n) {
@@ -269,13 +333,11 @@ where
         }
 
         let max_n = self.max_neighbours(layer);
-        let offset = self.layer_offset(layer);
 
         // Fast path: snapshot under lock, compute outside, write under lock
         let snapshot: Vec<u32> = {
             let _guard = self.locks.lock_guard(node_id);
-            let flat = unsafe { &*self.nodes[node_id].get() };
-            flat[offset..offset + max_n].to_vec()
+            unsafe { self.slots_mut(node_id, layer) }.to_vec()
         };
 
         let degree = snapshot
@@ -293,8 +355,7 @@ where
         // Room available: try to append directly
         if degree < max_n {
             let _guard = self.locks.lock_guard(node_id);
-            let flat = unsafe { &mut *self.nodes[node_id].get() };
-            let slot = &mut flat[offset..offset + max_n];
+            let slot = unsafe { self.slots_mut(node_id, layer) };
             let current_degree = slot.iter().position(|&e| e == u32::MAX).unwrap_or(max_n);
             // Re-check presence in case another thread added it meanwhile
             if slot[..current_degree]
@@ -324,8 +385,7 @@ where
 
         // Reacquire to write, validate snapshot is still current
         let _guard = self.locks.lock_guard(node_id);
-        let flat = unsafe { &mut *self.nodes[node_id].get() };
-        let slot = &mut flat[offset..offset + max_n];
+        let slot = unsafe { self.slots_mut(node_id, layer) };
         let current_degree = slot.iter().position(|&e| e == u32::MAX).unwrap_or(max_n);
 
         if current_degree == degree && slot[..degree] == snapshot[..degree] {
@@ -451,28 +511,18 @@ where
         selected
     }
 
-    /// Convert to flat layout for queries
+    /// Hand the flat layout over to the finished index
     ///
-    /// Consumes the construction graph and produces a flattened neighbour
-    /// array suitable for cache-friendly query traversal. Each node's layers
-    /// are stored contiguously, preserving the fixed-size sentinel-padded
-    /// layout. The offset array records where each node's data begins.
+    /// The construction layout is already the query layout, so this is a move
+    /// rather than a copy: node blocks sit contiguously in node order with the
+    /// fixed-size sentinel padding intact, and the offset array records where
+    /// each node's block begins.
     ///
     /// ### Returns
     ///
     /// Tuple of (flat neighbours, per-node offsets, level assignments)
     fn into_flat(self) -> (Vec<u32>, Vec<usize>, Vec<u8>) {
-        let n = self.nodes.len();
-        let mut neighbours_flat = Vec::new();
-        let mut neighbour_offsets = Vec::with_capacity(n);
-        let node_levels = self.node_levels.clone();
-
-        for node_cell in self.nodes {
-            neighbour_offsets.push(neighbours_flat.len());
-            neighbours_flat.extend(node_cell.into_inner());
-        }
-
-        (neighbours_flat, neighbour_offsets, node_levels)
+        (self.nodes.into_inner(), self.offsets, self.node_levels)
     }
 }
 
