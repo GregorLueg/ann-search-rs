@@ -19,9 +19,9 @@ use crate::quantised::sq8u_codec::*;
 use crate::quantised::uniform_quant::*;
 use crate::utils::k_means_utils::*;
 
-////////////////
-// Main index //
-////////////////
+/////////////////
+// IvfSq8Index //
+/////////////////
 
 /// IVF index quantised to scalar 8 bits
 #[cfg_attr(
@@ -54,9 +54,6 @@ where
     /// Original indices
     original_ids: Vec<usize>,
 }
-
-//////////////////////
-// VectorDistanceSq //
 
 /////////////////////////
 // DimensionValidation //
@@ -334,7 +331,6 @@ where
     ///
     /// Skips the encode step since the vector is already in i8 format.
     /// Only decodes for centroid search (which is O(nlist), small).
-    #[inline]
     /// Scan the probed cells and keep the `k` best
     ///
     /// ### Params
@@ -346,6 +342,7 @@ where
     /// ### Returns
     ///
     /// Tuple of `(original indices, distances)`, nearest first
+    #[inline]
     fn scan_clusters<F>(&self, probed: &[usize], k: usize, score: F) -> (Vec<usize>, Vec<T>)
     where
         F: Fn(usize) -> T,
@@ -403,12 +400,14 @@ where
     /// Generate kNN graph from vectors stored in the index
     ///
     /// Queries each vector in the index against itself to build a complete
-    /// kNN graph. Uses pre-quantised vectors directly, avoiding encode overhead.
+    /// kNN graph. Uses pre-quantised vectors directly, avoiding encode
+    /// overhead.
     ///
     /// ### Params
     ///
     /// * `k` - Number of neighbours per vector
-    /// * `nprobe` - Number of clusters to search (defaults to sqrt(nlist) if None)
+    /// * `nprobe` - Number of clusters to search (defaults to sqrt(nlist) if
+    ///   None)
     /// * `return_dist` - Whether to return distances
     /// * `verbose` - Controls verbosity
     ///

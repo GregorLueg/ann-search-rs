@@ -11,9 +11,9 @@
 
 use crate::prelude::*;
 
-//////////////
+////////////////
 // GraphCodec //
-//////////////
+////////////////
 
 /// How the graph index stores vectors and measures distance between them.
 ///

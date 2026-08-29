@@ -8,14 +8,14 @@
 use rayon::prelude::*;
 
 use crate::prelude::*;
-use crate::quantised::int_kernels::*;
 use crate::quantised::hnsw_quantised::codec::GraphCodec;
+use crate::quantised::int_kernels::*;
 use crate::quantised::uniform_quant::*;
 use crate::utils::validate_dim;
 
-////////////
+///////////////
 // Sq8uQuery //
-////////////////
+///////////////
 
 /// Query state for [`Sq8uCodec`]: the query in the same code space as the
 /// database, plus whichever precomputed term its metric needs.
@@ -130,7 +130,10 @@ where
             codes.par_chunks(dim).map(norm_sq_u8).collect()
         };
         let offset_dots: Vec<T> = if cosine {
-            codes.par_chunks(dim).map(|c| quantiser.offset_dot(c)).collect()
+            codes
+                .par_chunks(dim)
+                .map(|c| quantiser.offset_dot(c))
+                .collect()
         } else {
             Vec::new()
         };
@@ -158,8 +161,7 @@ where
     #[inline(always)]
     fn code(&self, id: usize) -> &[u8] {
         let start = id * self.dim;
-        // SAFETY: `id < n` holds for every caller; ids come from the graph,
-        // which only ever holds indices this codec was built over.
+
         unsafe { self.codes.get_unchecked(start..start + self.dim) }
     }
 
@@ -203,9 +205,9 @@ where
     }
 }
 
-//////////////////////////
+/////////////////////////
 // GraphCodec for Sq8u //
-//////////////////////////
+/////////////////////////
 
 impl<T> GraphCodec<T> for Sq8uCodec<T>
 where
@@ -269,12 +271,8 @@ where
                 ip.neg()
             }
             _ => {
-                let d = sq_dist_from_dot(
-                    &query.code,
-                    self.code(id),
-                    query.norm,
-                    self.code_norms[id],
-                );
+                let d =
+                    sq_dist_from_dot(&query.code, self.code(id), query.norm, self.code_norms[id]);
                 T::from_i64(d).unwrap()
             }
         }
@@ -382,10 +380,8 @@ mod tests {
             let q = codec.encode_query(&data[i * dim..(i + 1) * dim]).unwrap();
             for j in [1usize, 50, 200] {
                 let got = codec.finalise(codec.score(&q, j));
-                let want = exact_sq_l2(
-                    &data[i * dim..(i + 1) * dim],
-                    &data[j * dim..(j + 1) * dim],
-                );
+                let want =
+                    exact_sq_l2(&data[i * dim..(i + 1) * dim], &data[j * dim..(j + 1) * dim]);
                 assert!(
                     (got - want).abs() <= floor + 0.05 * want,
                     "l2 {i}->{j}: got {got}, want {want}, tol {}",
@@ -411,10 +407,8 @@ mod tests {
             let q = codec.encode_query(&data[i * dim..(i + 1) * dim]).unwrap();
             for j in [3usize, 90, 210] {
                 let got = codec.finalise(codec.score(&q, j));
-                let want = exact_cosine(
-                    &data[i * dim..(i + 1) * dim],
-                    &data[j * dim..(j + 1) * dim],
-                );
+                let want =
+                    exact_cosine(&data[i * dim..(i + 1) * dim], &data[j * dim..(j + 1) * dim]);
                 assert!(
                     (got - want).abs() <= tol,
                     "cosine {i}->{j}: got {got}, want {want}, tol {tol}"
@@ -433,9 +427,10 @@ mod tests {
             for i in [0usize, 42, 199] {
                 let q = codec.encode_query(&data[i * dim..(i + 1) * dim]).unwrap();
                 let self_score = codec.score(&q, i);
-                let best = (0..n)
-                    .map(|j| codec.score(&q, j))
-                    .fold(f32::MAX, |a, b| if b < a { b } else { a });
+                let best =
+                    (0..n)
+                        .map(|j| codec.score(&q, j))
+                        .fold(f32::MAX, |a, b| if b < a { b } else { a });
                 // Self need not win outright. Two rows less than a
                 // quantisation step apart encode to identical codes, and then
                 // nothing can separate them. The tolerance is that step.
@@ -508,8 +503,16 @@ mod tests {
 
         let mut r32: Vec<usize> = (0..n).collect();
         let mut r64: Vec<usize> = (0..n).collect();
-        r32.sort_by(|&a, &b| c32.score(&q32, a).total_cmp(&c32.score(&q32, b)).then(a.cmp(&b)));
-        r64.sort_by(|&a, &b| c64.score(&q64, a).total_cmp(&c64.score(&q64, b)).then(a.cmp(&b)));
+        r32.sort_by(|&a, &b| {
+            c32.score(&q32, a)
+                .total_cmp(&c32.score(&q32, b))
+                .then(a.cmp(&b))
+        });
+        r64.sort_by(|&a, &b| {
+            c64.score(&q64, a)
+                .total_cmp(&c64.score(&q64, b))
+                .then(a.cmp(&b))
+        });
         assert_eq!(r32, r64);
     }
 }

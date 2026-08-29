@@ -28,10 +28,7 @@ use crate::quantised::uniform_quant::*;
 ///
 /// The quantisation shares one scale across every dimension. That is what
 /// makes the integer distance between two codes preserve the ordering of the
-/// float distance exactly, so the scan can stay in integer arithmetic. A
-/// per-dimension scale would be finer-grained but would not cancel in a
-/// code-to-code distance, which silently computes a reweighted metric instead
-/// of the requested one.
+/// float distance exactly, so the scan can stay in integer arithmetic.
 ///
 /// ### Fields
 ///
@@ -71,9 +68,9 @@ where
     }
 }
 
-/////////////////////////
+////////////////////////
 // ExhaustiveSq8Index //
-/////////////////////////
+////////////////////////
 
 impl<T> ExhaustiveSq8Index<T>
 where
@@ -288,10 +285,6 @@ where
     }
 }
 
-///////////
-// Tests //
-///////////
-
 /////////////
 // IndexIo //
 /////////////
@@ -305,6 +298,10 @@ where
 
     const KIND: &'static str = "exhaustive_sq8";
 }
+
+///////////
+// Tests //
+///////////
 
 #[cfg(test)]
 mod tests {

@@ -5,14 +5,6 @@
 //! it is going to be searched in. It shares the crate-internal construction
 //! graph, which owns the striped locks and the sentinel slot layout, and
 //! reimplements only the driver on top.
-//!
-//! ### Note
-//!
-//! The driver duplicates the one in `cpu::hnsw`. That is deliberate for now:
-//! this path is not yet validated against the tuned one, and a shared driver
-//! would have to be introduced by refactoring a working index. Once the
-//! quantised index has recall numbers behind it, `HnswIndex::build` should move
-//! onto this function with a full-precision closure.
 
 use rand::{rngs::SmallRng, seq::SliceRandom, Rng, SeedableRng};
 use rayon::prelude::*;
@@ -40,9 +32,9 @@ const PARALLEL_BUCKET_THRESHOLD: usize = 100;
 /// Initial capacity of a thread's reusable search state.
 const SEARCH_STATE_CAPACITY: usize = 1000;
 
-///////////////////////
+//////////////////////
 // GraphBuildParams //
-///////////////////////
+//////////////////////
 
 /// Construction settings for [`build_hierarchical_graph`].
 #[derive(Clone, Copy, Debug)]
@@ -426,9 +418,9 @@ impl InsertContext<'_> {
             if result.len() >= max_neighbours {
                 break;
             }
-            let dominated = result.iter().any(|&(_, selected_id)| {
-                OrderedFloat(dist(cand_id, selected_id)) < cand_dist
-            });
+            let dominated = result
+                .iter()
+                .any(|&(_, selected_id)| OrderedFloat(dist(cand_id, selected_id)) < cand_dist);
             if !dominated {
                 result.push((cand_dist, cand_id));
             }
@@ -464,7 +456,10 @@ mod tests {
 
         assert_eq!(graph.n(), n);
         assert_eq!(graph.degree(), 16);
-        assert!(hierarchy.max_level() >= 1, "hierarchy collapsed to one layer");
+        assert!(
+            hierarchy.max_level() >= 1,
+            "hierarchy collapsed to one layer"
+        );
         assert!((hierarchy.entry_point() as usize) < n);
     }
 

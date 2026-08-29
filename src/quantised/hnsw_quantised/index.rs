@@ -22,9 +22,9 @@ use crate::quantised::uniform_quant::*;
 use crate::utils::graph_utils::*;
 use crate::utils::pack_knn_results;
 
-/////////////////////////
+////////////////////////
 // HnswQuantisedIndex //
-/////////////////////////
+////////////////////////
 
 /// HNSW over quantised vectors.
 ///
@@ -510,7 +510,6 @@ where
             + self.hierarchy.memory_usage_bytes()
             + self.original_ids.capacity() * std::mem::size_of::<usize>()
     }
-
 }
 
 ///////////
@@ -569,9 +568,16 @@ mod tests {
         let (n, dim) = (1000, 16);
         let data = clustered(n, dim, 5);
         let mat = matrix(&data, n, dim);
-        let index =
-            HnswSq8uIndex::<f32>::build(mat.as_ref(), 16, 100, &Dist::SquaredEuclidean, 42, None, false)
-                .unwrap();
+        let index = HnswSq8uIndex::<f32>::build(
+            mat.as_ref(),
+            16,
+            100,
+            &Dist::SquaredEuclidean,
+            42,
+            None,
+            false,
+        )
+        .unwrap();
 
         for i in [0usize, 250, 999] {
             let (ids, dists) = index.query(&data[i * dim..(i + 1) * dim], 5, 64).unwrap();
@@ -589,9 +595,16 @@ mod tests {
         let (n, dim, k) = (2000, 24, 10);
         let data = clustered(n, dim, 8);
         let mat = matrix(&data, n, dim);
-        let index =
-            HnswSq8uIndex::<f32>::build(mat.as_ref(), 16, 200, &Dist::SquaredEuclidean, 7, None, false)
-                .unwrap();
+        let index = HnswSq8uIndex::<f32>::build(
+            mat.as_ref(),
+            16,
+            200,
+            &Dist::SquaredEuclidean,
+            7,
+            None,
+            false,
+        )
+        .unwrap();
 
         let mut hits = 0usize;
         let queries = 100;
@@ -672,9 +685,8 @@ mod tests {
             let (n, dim, k) = (1500, 24, 10);
             let data = clustered(n, dim, 6);
             let mat = matrix(&data, n, dim);
-            let index =
-                HnswSq8uIndex::<f32>::build(mat.as_ref(), 16, 200, &metric, 7, None, false)
-                    .unwrap();
+            let index = HnswSq8uIndex::<f32>::build(mat.as_ref(), 16, 200, &metric, 7, None, false)
+                .unwrap();
 
             let mut hits = 0usize;
             let queries = 60;
@@ -699,9 +711,16 @@ mod tests {
         let (n, dim, k) = (1500, 20, 10);
         let data = clustered(n, dim, 6);
         let mat = matrix(&data, n, dim);
-        let index =
-            HnswSq8uIndex::<f32>::build(mat.as_ref(), 16, 200, &Dist::SquaredEuclidean, 3, None, false)
-                .unwrap();
+        let index = HnswSq8uIndex::<f32>::build(
+            mat.as_ref(),
+            16,
+            200,
+            &Dist::SquaredEuclidean,
+            3,
+            None,
+            false,
+        )
+        .unwrap();
 
         let recall_at = |ef: usize| {
             let mut hits = 0usize;
@@ -716,7 +735,10 @@ mod tests {
 
         let low = recall_at(16);
         let high = recall_at(256);
-        assert!(high >= low, "recall fell from {low} at ef=16 to {high} at ef=256");
+        assert!(
+            high >= low,
+            "recall fell from {low} at ef=16 to {high} at ef=256"
+        );
     }
 
     #[test]
@@ -724,9 +746,16 @@ mod tests {
         let (n, dim, k) = (600, 16, 8);
         let data = clustered(n, dim, 4);
         let mat = matrix(&data, n, dim);
-        let index =
-            HnswSq8uIndex::<f32>::build(mat.as_ref(), 12, 100, &Dist::SquaredEuclidean, 11, None, false)
-                .unwrap();
+        let index = HnswSq8uIndex::<f32>::build(
+            mat.as_ref(),
+            12,
+            100,
+            &Dist::SquaredEuclidean,
+            11,
+            None,
+            false,
+        )
+        .unwrap();
 
         let (ids, dists) = index.generate_knn(k, 64, true, false).unwrap();
         assert_eq!(ids.len(), n);
@@ -744,9 +773,16 @@ mod tests {
         let (n, dim) = (800, 16);
         let data = clustered(n, dim, 5);
         let mat = matrix(&data, n, dim);
-        let index =
-            HnswSq8uIndex::<f32>::build(mat.as_ref(), 16, 150, &Dist::SquaredEuclidean, 5, None, false)
-                .unwrap();
+        let index = HnswSq8uIndex::<f32>::build(
+            mat.as_ref(),
+            16,
+            150,
+            &Dist::SquaredEuclidean,
+            5,
+            None,
+            false,
+        )
+        .unwrap();
 
         for i in [0usize, 77, 400] {
             let (a, _) = index.query(&data[i * dim..(i + 1) * dim], 10, 100).unwrap();
@@ -760,9 +796,16 @@ mod tests {
         let (n, dim) = (20_000, 32);
         let data = clustered(n, dim, 8);
         let mat = matrix(&data, n, dim);
-        let index =
-            HnswSq8uIndex::<f32>::build(mat.as_ref(), 16, 100, &Dist::SquaredEuclidean, 1, None, false)
-                .unwrap();
+        let index = HnswSq8uIndex::<f32>::build(
+            mat.as_ref(),
+            16,
+            100,
+            &Dist::SquaredEuclidean,
+            1,
+            None,
+            false,
+        )
+        .unwrap();
 
         let vectors_as_f32 = n * dim * std::mem::size_of::<f32>();
         let graph_bytes = n * 2 * 16 * std::mem::size_of::<u32>();
@@ -789,9 +832,16 @@ mod tests {
         let (n, dim) = (200, 12);
         let data = clustered(n, dim, 4);
         let mat = matrix(&data, n, dim);
-        let index =
-            HnswSq8uIndex::<f32>::build(mat.as_ref(), 8, 50, &Dist::SquaredEuclidean, 1, None, false)
-                .unwrap();
+        let index = HnswSq8uIndex::<f32>::build(
+            mat.as_ref(),
+            8,
+            50,
+            &Dist::SquaredEuclidean,
+            1,
+            None,
+            false,
+        )
+        .unwrap();
         assert!(index.query(&vec![0.0f32; dim + 1], 5, 32).is_err());
     }
 
@@ -800,9 +850,16 @@ mod tests {
         let (n, dim) = (40, 8);
         let data = clustered(n, dim, 2);
         let mat = matrix(&data, n, dim);
-        let index =
-            HnswSq8uIndex::<f32>::build(mat.as_ref(), 8, 50, &Dist::SquaredEuclidean, 1, None, false)
-                .unwrap();
+        let index = HnswSq8uIndex::<f32>::build(
+            mat.as_ref(),
+            8,
+            50,
+            &Dist::SquaredEuclidean,
+            1,
+            None,
+            false,
+        )
+        .unwrap();
         let (ids, _) = index.query(&data[..dim], 500, 500).unwrap();
         assert!(ids.len() <= n);
         assert!(!ids.is_empty());
@@ -814,9 +871,16 @@ mod tests {
         let data32 = clustered(n, dim, 4);
         let data: Vec<f64> = data32.iter().map(|&x| x as f64).collect();
         let mat = Mat::<f64>::from_fn(n, dim, |i, j| data[i * dim + j]);
-        let index =
-            HnswSq8uIndex::<f64>::build(mat.as_ref(), 12, 100, &Dist::SquaredEuclidean, 9, None, false)
-                .unwrap();
+        let index = HnswSq8uIndex::<f64>::build(
+            mat.as_ref(),
+            12,
+            100,
+            &Dist::SquaredEuclidean,
+            9,
+            None,
+            false,
+        )
+        .unwrap();
 
         let (ids, _) = index.query(&data[..dim], 5, 64).unwrap();
         assert_eq!(ids[0], 0);

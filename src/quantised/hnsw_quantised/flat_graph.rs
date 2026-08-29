@@ -87,9 +87,9 @@ impl FlatGraph {
     }
 }
 
-////////////////////
+///////////////////
 // HnswHierarchy //
-////////////////////
+///////////////////
 
 /// The layers above 0, kept only to seed the base-layer search.
 #[cfg_attr(feature = "serialise", derive(serde::Serialize, serde::Deserialize))]
@@ -314,9 +314,16 @@ mod tests {
         // Node 0: 4 base slots + 2 slots at level 1.
         // Node 1: 4 base slots.
         let nodes = vec![
-            1, u32::MAX, u32::MAX, u32::MAX, // node 0, layer 0
-            1, u32::MAX, // node 0, layer 1
-            0, u32::MAX, u32::MAX, u32::MAX, // node 1, layer 0
+            1,
+            u32::MAX,
+            u32::MAX,
+            u32::MAX, // node 0, layer 0
+            1,
+            u32::MAX, // node 0, layer 1
+            0,
+            u32::MAX,
+            u32::MAX,
+            u32::MAX, // node 1, layer 0
         ];
         let offsets = vec![0, base + m];
         let levels = vec![1u8, 0];
