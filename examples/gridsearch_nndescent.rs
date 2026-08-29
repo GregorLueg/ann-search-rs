@@ -10,6 +10,12 @@ use thousands::*;
 /// Wraps the shared `Cli` and adds an optional `--knn-k` override so the
 /// standalone NN-Descent build can be run at the same `k` NSG uses
 /// internally (default `64`) for like-for-like timing comparisons.
+///
+/// Each build reports three rows: `(query)` for held-out queries, `(self)` for
+/// the full self-kNN via beam search, and `(extract)` for the descent graph
+/// handed back as-is. The last one costs one pass and is the honest measure of
+/// how good the built graph is before any search refines it, so the gap between
+/// `(self)` and `(extract)` is exactly what the beam search buys.
 #[derive(Parser, Clone)]
 struct Args {
     #[command(flatten)]
@@ -185,6 +191,58 @@ fn main() {
             total_time_ms: build_time + self_query_time,
             recall_at_k: recall_self,
             mean_dist_rat: dist_error_self,
+            index_size_mb,
+        });
+
+        // Graph extraction: the descent's own output, no beam search. Against
+        // the same ground truth as the self-query row, the gap between the two
+        // is what the beam search is buying on top of the graph, and the
+        // extract row on its own is the graph quality.
+        if nndescent_idx.k + 1 < cli.k {
+            println!(
+                "  note: index built with k={}, so extraction cannot fill k={}",
+                nndescent_idx.k, cli.k
+            );
+        }
+
+        println!("Extracting NNDescent kNN graph (no beam search)...");
+        let start = Instant::now();
+        let (mut extract_neighbors, extract_distances) =
+            extract_nndescent_knn(&nndescent_idx, Some(cli.k.saturating_sub(1)), true).unwrap();
+        let extract_time = start.elapsed().as_secs_f64() * 1000.0;
+
+        // The self-query rows and the ground truth both count a point as its
+        // own nearest neighbour at distance zero. A kNN graph does not store
+        // that trivial edge, so it is added back here rather than letting the
+        // extract row lose a fixed 1/k against every other row and every other
+        // gridsearch example.
+        let mut extract_distances = extract_distances.unwrap();
+        for (i, (ids, dists)) in extract_neighbors
+            .iter_mut()
+            .zip(extract_distances.iter_mut())
+            .enumerate()
+        {
+            ids.insert(0, i);
+            dists.insert(0, 0.0);
+        }
+
+        let recall_extract = calculate_recall(&true_neighbors_self, &extract_neighbors, cli.k);
+        let dist_error_extract = calculate_mean_distance_ratio(
+            true_distances_self.as_ref().unwrap(),
+            &extract_distances,
+            cli.k,
+        );
+
+        results.push(BenchmarkResultSize {
+            method: format!(
+                "NNDescent-k{}-nt{}-dp{} (extract)",
+                knn_k_str, n_trees_str, diversify_prob
+            ),
+            build_time_ms: build_time,
+            query_time_ms: extract_time,
+            total_time_ms: build_time + extract_time,
+            recall_at_k: recall_extract,
+            mean_dist_rat: dist_error_extract,
             index_size_mb,
         });
     }
