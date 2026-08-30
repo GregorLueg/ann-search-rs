@@ -75,8 +75,8 @@ use crate::gpu::{exhaustive_gpu::*, ivf_gpu::*};
 #[cfg(feature = "quantised")]
 use crate::quantised::{
     exhaustive_bf16::*, exhaustive_opq::*, exhaustive_pq::*, exhaustive_sq8::*,
-    uniform_quant::UniformQuantParams, hnsw_quantised::index::*, ivf_bf16::*,
-    ivf_opq::*, ivf_pq::*, ivf_sq8::*, soar_opq::*, soar_pq::*,
+    hnsw_quantised::index::*, ivf_bf16::*, ivf_opq::*, ivf_pq::*, ivf_sq8::*, soar_opq::*,
+    soar_pq::*, uniform_quant::UniformQuantParams,
 };
 
 ////////////
@@ -1237,17 +1237,20 @@ where
 /// * `mat` - Input data as samples x features. Accepts a faer matrix, an
 ///   ndarray 2-D array (with the `ndarray` feature) or a row-major
 ///   `(&[T], n_samples, n_features)` tuple. See [`AnnMatrix`].
-/// * `k` - Number of neighbours for the k-NN graph.
 /// * `dist_metric` - Distance metric: "euclidean", "cosine" or "manhatten".
-/// * `max_iter` - Maximum iterations for the algorithm.
 /// * `delta` - Early stop criterium for the algorithm.
-/// * `rho` - Sampling rate for the old neighbours. Will adaptively decrease
-///   over time.
 /// * `diversify_prob` - Bernoulli probability of pruning a redundant edge
 ///   per candidate/kept pair, applied post-descent to the forward+reverse
 ///   candidate pool per node. `0.0` disables pruning; `1.0` always prunes
 ///   when the RNG rule fires. Rows shorter than `k` after pruning are
 ///   topped up from the pruned tail so out-degree is preserved.
+/// * `k` - Number of neighbours for the k-NN graph (default 30).
+/// * `max_iter` - Maximum iterations for the algorithm (default
+///   `log2(n).round().max(5)`).
+/// * `max_candidates` - Cap on sampled candidates per node per iteration
+///   (default `k.min(60)`).
+/// * `n_tree` - Random-projection trees seeding the graph (default
+///   `5 + n^0.25`, capped at 12).
 /// * `seed` - Random seed for reproducibility
 /// * `verbose` - Controls verbosity of the algorithm
 ///
@@ -1378,8 +1381,12 @@ where
 /// ### Params
 ///
 /// * `index` - Reference to the built index
-/// * `k` - Truncate each row to this many neighbours. `None` keeps the
-///   build-time `k`.
+/// * `k` - Truncate each row to this **total** length, self-edge included when
+///   `include_self` is set. `None` keeps the build-time `k`.
+/// * `include_self` - Prepend `(i, 0)` to row `i`. Every `query_*_self` in the
+///   crate and any exhaustive ground truth count a point as its own nearest
+///   neighbour, but a kNN graph stores no such edge. Set this to compare
+///   like for like; leave it unset for true neighbours only.
 /// * `return_dist` - Return distances
 ///
 /// ### Returns
@@ -1394,6 +1401,7 @@ where
 pub fn extract_nndescent_knn<T>(
     index: &NNDescent<T>,
     k: Option<usize>,
+    include_self: bool,
     return_dist: bool,
 ) -> KnnOptionResult<T>
 where
@@ -1401,7 +1409,7 @@ where
     NNDescent<T>: ApplySortedUpdates<T>,
     NNDescent<T>: NNDescentQuery<T>,
 {
-    Ok(index.extract_knn(k, return_dist))
+    Ok(index.extract_knn(k, include_self, return_dist))
 }
 
 ////////////
@@ -2360,7 +2368,15 @@ where
         Dist::default()
     });
 
-    IvfSq8Index::build(mat, nlist, metric, k_means_params, seed, quant_params, verbose)
+    IvfSq8Index::build(
+        mat,
+        nlist,
+        metric,
+        k_means_params,
+        seed,
+        quant_params,
+        verbose,
+    )
 }
 
 #[cfg(feature = "quantised")]
@@ -2484,7 +2500,15 @@ where
         Dist::default()
     });
 
-    HnswSq8uIndex::build(mat, m, ef_construction, &metric, seed, quant_params, verbose)
+    HnswSq8uIndex::build(
+        mat,
+        m,
+        ef_construction,
+        &metric,
+        seed,
+        quant_params,
+        verbose,
+    )
 }
 
 #[cfg(feature = "quantised")]
@@ -3316,13 +3340,17 @@ where
 /// * `dist_metric` - Distance metric: "euclidean" or "cosine". "manhatten" is
 ///   not supported.
 /// * `k` - Final neighbours per node (default 30)
-/// * `build_k` - Internal NNDescent degree before CAGRA pruning (default 2*k)
+/// * `build_k` - Internal NNDescent degree before CAGRA pruning
+///   (default `1.5*k`)
 /// * `max_iters` - Maximum NNDescent iterations (default 15)
-/// * `n_trees` - Annoy forest size (default auto)
+/// * `n_trees` - Forest size for GPU init (default `5 + n^0.25`, capped at 20)
 /// * `delta` - Convergence threshold (default 0.001)
 /// * `rho` - Sampling rate (default 1.0, meaning no sampling)
+/// * `refine_knn` - 2-hop refinement sweeps after the main loop (default 0)
 /// * `seed` - Random seed
 /// * `verbose` - Print progress
+/// * `retain_gpu` - Keep the vectors device-resident after the build, so a
+///   later GPU beam search does not re-upload them
 /// * `device` - GPU device
 #[allow(clippy::too_many_arguments)]
 pub fn build_nndescent_index_gpu<T, R>(
@@ -3410,8 +3438,12 @@ where
 /// ### Params
 ///
 /// * `index` - Reference to built index
-/// * `k` - Truncate each row to this many neighbours. `None` keeps the
-///   build-time `k`.
+/// * `k` - Truncate each row to this **total** length, self-edge included when
+///   `include_self` is set. `None` keeps the build-time `k`.
+/// * `include_self` - Prepend `(i, 0)` to row `i`. Every `query_*_self` in the
+///   crate and any exhaustive ground truth count a point as its own nearest
+///   neighbour, but a kNN graph stores no such edge. Set this to compare
+///   like for like; leave it unset for true neighbours only.
 /// * `return_dist` - Return distances
 ///
 /// ### Returns
@@ -3420,13 +3452,14 @@ where
 pub fn extract_nndescent_knn_gpu<T, R>(
     index: &NNDescentGpu<T, R>,
     k: Option<usize>,
+    include_self: bool,
     return_dist: bool,
 ) -> KnnOptionResult<T>
 where
     R: Runtime,
     T: AnnSearchFloat + CubeclFloat,
 {
-    Ok(index.extract_knn(k, return_dist))
+    Ok(index.extract_knn(k, include_self, return_dist))
 }
 
 #[cfg(feature = "gpu")]
@@ -3440,8 +3473,12 @@ where
 /// ### Params
 ///
 /// * `graph` - The kNN graph handoff
-/// * `k` - Truncate each row to this many neighbours. `None` keeps the
-///   build-time `k`.
+/// * `k` - Truncate each row to this **total** length, self-edge included when
+///   `include_self` is set. `None` keeps the build-time `k`.
+/// * `include_self` - Prepend `(i, 0)` to row `i`. Every `query_*_self` in the
+///   crate and any exhaustive ground truth count a point as its own nearest
+///   neighbour, but a kNN graph stores no such edge. Set this to compare
+///   like for like; leave it unset for true neighbours only.
 /// * `return_dist` - Return distances
 ///
 /// ### Returns
@@ -3450,12 +3487,13 @@ where
 pub fn extract_knn_graph_gpu<T>(
     graph: &KnnGraphGpu<T>,
     k: Option<usize>,
+    include_self: bool,
     return_dist: bool,
 ) -> KnnOptionResult<T>
 where
     T: AnnSearchFloat,
 {
-    Ok(graph.extract_knn(k, return_dist))
+    Ok(graph.extract_knn(k, include_self, return_dist))
 }
 
 #[cfg(feature = "gpu")]

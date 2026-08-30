@@ -64,7 +64,6 @@ pub const DEFAULT_DATA: &str = "gaussian";
 /// * `data` - The data to use. One of `"gaussian"`, `"correlated"`, `"lowrank"`
 ///   or `"cell"`.
 /// * `intrinsic_dim` - True dimensionality for the `"lowrank"` manifold data.
-/// * `spectral_decay` - Currently unused (was the quantisation-stress decay exponent).
 #[derive(Parser, Clone)]
 pub struct Cli {
     #[arg(long, default_value_t = DEFAULT_N_SAMPLES)]
@@ -162,8 +161,12 @@ pub struct BenchmarkResultSize {
     /// Recall@k neighbours against ground truth. Overlap in top k neighbours
     /// for given k
     pub recall_at_k: f64,
-    /// Mean distance ratio
+    /// Mean distance ratio. Sensitive to the tail, so it is the channel that
+    /// reports a neighbour pulled from a completely different neighbourhood.
     pub mean_dist_rat: f64,
+    /// Median distance ratio. Robust to the tail, so it reports whether the
+    /// typical query got the neighbourhood it asked for.
+    pub median_dist_rat: f64,
     /// Size of the index
     pub index_size_mb: f64,
 }
@@ -329,18 +332,85 @@ pub fn calculate_mean_distance_ratio<T>(
 where
     T: Float + ToPrimitive,
 {
-    let mut total_ratio = 0.0;
-    let mut count = 0usize;
+    let ratios = distance_ratios(true_dist, approx_dist, k);
+    ratios.iter().sum::<f64>() / ratios.len() as f64
+}
+
+/// Median of the per-query distance ratios.
+///
+/// The companion to [`calculate_mean_distance_ratio`], and the two are only
+/// interesting together. The mean is an unclipped average of unbounded ratios,
+/// so it is dominated by the tail: it answers "did anything land in a
+/// completely different neighbourhood". The median ignores that tail and
+/// answers "is the typical query getting the neighbours it should".
+///
+/// The pair separates two failures that a single number conflates. Median 1.00
+/// with a large mean is a handful of catastrophic misses on an otherwise
+/// healthy index, which is the case that matters downstream: one spurious edge
+/// between two cell populations is enough to merge them under Leiden or drag
+/// them together in a UMAP. Both numbers drifting up together is uniform
+/// degradation, which is the benign, tune-`ef` case.
+///
+/// ### Params
+///
+/// * `true_dist` - Slice of true distances to the neighbours (one vec per
+///   query)
+/// * `approx_dist` - Slice of approximate distances to the neighbours (one vec
+///   per query)
+/// * `k` - Number of neighbours to consider per query
+///
+/// ### Returns
+///
+/// The median distance ratio (1.0 = the typical query is perfect).
+/// Returns `NaN` if no queries have a non-negligible true distance sum.
+pub fn calculate_median_distance_ratio<T>(
+    true_dist: &[Vec<T>],
+    approx_dist: &[Vec<T>],
+    k: usize,
+) -> f64
+where
+    T: Float + ToPrimitive,
+{
+    let mut ratios = distance_ratios(true_dist, approx_dist, k);
+    if ratios.is_empty() {
+        return f64::NAN;
+    }
+    ratios.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let mid = ratios.len() / 2;
+    if ratios.len().is_multiple_of(2) {
+        (ratios[mid - 1] + ratios[mid]) / 2.0
+    } else {
+        ratios[mid]
+    }
+}
+
+/// Per-query distance ratios, the shared basis of the mean and median.
+///
+/// ### Params
+///
+/// * `true_dist` - Slice of true distances to the neighbours (one vec per
+///   query)
+/// * `approx_dist` - Slice of approximate distances to the neighbours (one vec
+///   per query)
+/// * `k` - Number of neighbours to consider per query
+///
+/// ### Returns
+///
+/// One ratio per query, skipping queries whose true distance sum is negligible.
+fn distance_ratios<T>(true_dist: &[Vec<T>], approx_dist: &[Vec<T>], k: usize) -> Vec<f64>
+where
+    T: Float + ToPrimitive,
+{
+    let mut ratios = Vec::with_capacity(true_dist.len());
     for (td, ad) in true_dist.iter().zip(approx_dist.iter()) {
         let n = k.min(td.len()).min(ad.len());
         let sum_true: f64 = td[..n].iter().map(|v| v.to_f64().unwrap()).sum();
         let sum_approx: f64 = ad[..n].iter().map(|v| v.to_f64().unwrap()).sum();
         if sum_true > 1e-12 {
-            total_ratio += sum_approx / sum_true;
-            count += 1;
+            ratios.push(sum_approx / sum_true);
         }
     }
-    total_ratio / count as f64
+    ratios
 }
 
 ////////////
@@ -363,31 +433,33 @@ fn format_with_underscores(value: f64) -> String {
 /// * `config` - Benchmark configuration
 /// * `results` - Benchmark results to print
 pub fn print_results_size(config: &str, results: &[BenchmarkResultSize]) {
-    println!("\n{:=>131}", "");
+    println!("\n{:=>149}", "");
     println!("Benchmark: {}", config);
-    println!("{:=>131}", "");
+    println!("{:=>149}", "");
     println!(
-        "{:<50} {:>12} {:>12} {:>12} {:>12} {:>15} {:>12}",
+        "{:<50} {:>12} {:>12} {:>12} {:>12} {:>15} {:>17} {:>12}",
         "Method",
         "Build (ms)",
         "Query (ms)",
         "Total (ms)",
         "Recall@k",
         "Mean dist ratio",
+        "Median dist ratio",
         "Size (MB)"
     );
-    println!("{:->131}", "");
+    println!("{:->149}", "");
     for result in results {
         println!(
-            "{:<50} {:>12} {:>12} {:>12} {:>12.4} {:>15.4} {:>12.2}",
+            "{:<50} {:>12} {:>12} {:>12} {:>12.4} {:>15.4} {:>17.4} {:>12.2}",
             result.method,
             format_with_underscores(result.build_time_ms),
             format_with_underscores(result.query_time_ms),
             format_with_underscores(result.total_time_ms),
             result.recall_at_k,
             result.mean_dist_rat,
+            result.median_dist_rat,
             result.index_size_mb
         );
     }
-    println!("{:->131}\n", "");
+    println!("{:->149}\n", "");
 }

@@ -69,8 +69,14 @@ run_and_replace() {
     local err_file
     err_file=$(mktemp)
 
+    # `<details>` is a CommonMark HTML block, which ends at the first blank
+    # line. A blank line inside the captured table would therefore close the
+    # block early and hand the rest of the output to the Markdown parser, where
+    # a line of `-----` under text becomes a setext heading. Strip them: the
+    # `=====` and `-----` rulers already separate the tables.
     "${cmd[@]}" 2>"$err_file" \
-        | sed -n '/^=\{10,\}/,$p' > "$result_file" || true
+        | sed -n '/^=\{10,\}/,$p' \
+        | sed '/^[[:space:]]*$/d' > "$result_file" || true
 
     if [ ! -s "$result_file" ]; then
         echo "WARNING: no table output for ${tag}" >&2
@@ -339,13 +345,13 @@ case "$KIND" in
             "nndescent:euclidean:cell:128|cargo run --example gridsearch_nndescent --release -- --distance euclidean --data cell --dim 128"
 
             # GPU NN-Descent / CAGRA: extract vs self-beam
-            "cagra_knn:euclidean:lowrank:32:250000|cargo run --example knn_comparison_cagra --release --features gpu -- --distance euclidean --data lowrank --n-samples 250000"
-            "cagra_knn:euclidean:lowrank:64:250000|cargo run --example knn_comparison_cagra --release --features gpu -- --distance euclidean --data lowrank --n-samples 250000 --dim 64"
-            "cagra_knn:euclidean:lowrank:32:500000|cargo run --example knn_comparison_cagra --release --features gpu -- --distance euclidean --data lowrank --n-samples 500000"
-            "cagra_knn:euclidean:lowrank:64:500000|cargo run --example knn_comparison_cagra --release --features gpu -- --distance euclidean --data lowrank --n-samples 500000 --dim 64"
-            "cagra_knn:euclidean:lowrank:32:1000000|cargo run --example knn_comparison_cagra --release --features gpu -- --distance euclidean --data lowrank --n-samples 1000000"
-            "cagra_knn:euclidean:lowrank:64:1000000|cargo run --example knn_comparison_cagra --release --features gpu -- --distance euclidean --data lowrank --n-samples 1000000 --dim 64"
-            "cagra_knn:euclidean:lowrank:32:2500000|cargo run --example knn_comparison_cagra --release --features gpu -- --distance euclidean --data lowrank --n-samples 2500000"
+            "gpu_knn:euclidean:lowrank:32:250000|cargo run --example knn_comparison_gpu --release --features gpu -- --distance euclidean --data lowrank --n-samples 250000"
+            "gpu_knn:euclidean:lowrank:64:250000|cargo run --example knn_comparison_gpu --release --features gpu -- --distance euclidean --data lowrank --n-samples 250000 --dim 64"
+            "gpu_knn:euclidean:lowrank:32:500000|cargo run --example knn_comparison_gpu --release --features gpu -- --distance euclidean --data lowrank --n-samples 500000"
+            "gpu_knn:euclidean:lowrank:64:500000|cargo run --example knn_comparison_gpu --release --features gpu -- --distance euclidean --data lowrank --n-samples 500000 --dim 64"
+            "gpu_knn:euclidean:lowrank:32:1000000|cargo run --example knn_comparison_gpu --release --features gpu -- --distance euclidean --data lowrank --n-samples 1000000"
+            "gpu_knn:euclidean:lowrank:64:1000000|cargo run --example knn_comparison_gpu --release --features gpu -- --distance euclidean --data lowrank --n-samples 1000000 --dim 64"
+            "gpu_knn:euclidean:lowrank:32:2500000|cargo run --example knn_comparison_gpu --release --features gpu -- --distance euclidean --data lowrank --n-samples 2500000"
 
             # Clustered GPU NN-Descent. Ground truth is a CPU exhaustive
             # self-query here, so these stop lower than the CAGRA runs above.

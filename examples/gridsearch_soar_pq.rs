@@ -146,6 +146,7 @@ fn main() {
         total_time_ms: exhaustive_build_ms + exhaustive_query_ms,
         recall_at_k: 1.0,
         mean_dist_rat: 1.0,
+        median_dist_rat: 1.0,
         index_size_mb: exhaustive_size_mb,
     };
 
@@ -240,6 +241,11 @@ fn main() {
                     &exact_distances(&data, &query_data, &nb, &cli.distance),
                     cli.k,
                 ),
+                median_dist_rat: calculate_median_distance_ratio(
+                    true_distances.as_ref().unwrap(),
+                    &exact_distances(&data, &query_data, &nb, &cli.distance),
+                    cli.k,
+                ),
                 index_size_mb: pq_size_mb,
             });
 
@@ -265,6 +271,11 @@ fn main() {
                     &exact_distances(&data, &query_data, &nb, &cli.distance),
                     cli.k,
                 ),
+                median_dist_rat: calculate_median_distance_ratio(
+                    true_distances.as_ref().unwrap(),
+                    &exact_distances(&data, &query_data, &nb, &cli.distance),
+                    cli.k,
+                ),
                 index_size_mb: pq2_size_mb,
             });
 
@@ -286,6 +297,11 @@ fn main() {
                 total_time_ms: soar_build_ms + q_ms,
                 recall_at_k: calculate_recall(&true_neighbors, &nb, cli.k),
                 mean_dist_rat: calculate_mean_distance_ratio(
+                    true_distances.as_ref().unwrap(),
+                    &exact_distances(&data, &query_data, &nb, &cli.distance),
+                    cli.k,
+                ),
+                median_dist_rat: calculate_median_distance_ratio(
                     true_distances.as_ref().unwrap(),
                     &exact_distances(&data, &query_data, &nb, &cli.distance),
                     cli.k,
@@ -350,6 +366,11 @@ fn main() {
                 total_time_ms: build_ms + q_ms,
                 recall_at_k: calculate_recall(&true_neighbors, &nb, cli.k),
                 mean_dist_rat: calculate_mean_distance_ratio(
+                    true_distances.as_ref().unwrap(),
+                    &exact_distances(&data, &query_data, &nb, &cli.distance),
+                    cli.k,
+                ),
+                median_dist_rat: calculate_median_distance_ratio(
                     true_distances.as_ref().unwrap(),
                     &exact_distances(&data, &query_data, &nb, &cli.distance),
                     cli.k,

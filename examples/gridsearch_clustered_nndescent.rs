@@ -87,7 +87,7 @@ fn drop_self_matches(neighbours: &[Vec<usize>], k: usize) -> Vec<Vec<usize>> {
 ///
 /// One neighbour vector per node, sentinel slots removed.
 fn graph_to_rows(graph: &KnnGraphGpu<f32>) -> Vec<Vec<usize>> {
-    graph.extract_knn(None, false).0
+    graph.extract_knn(None, false, false).0
 }
 
 /// Count the populated entries of the flat graph.

@@ -128,6 +128,7 @@ fn main() {
         total_time_ms: exhaustive_build_ms + query_ms,
         recall_at_k: 1.0,
         mean_dist_rat: 1.0,
+        median_dist_rat: 1.0,
         index_size_mb: exhaustive_size_mb,
     };
 
@@ -203,6 +204,11 @@ fn main() {
                     ivf_d.as_ref().unwrap(),
                     cli.k,
                 ),
+                median_dist_rat: calculate_median_distance_ratio(
+                    true_distances.as_ref().unwrap(),
+                    ivf_d.as_ref().unwrap(),
+                    cli.k,
+                ),
                 index_size_mb: ivf_size_mb,
             });
 
@@ -225,6 +231,11 @@ fn main() {
                 total_time_ms: soar_build_ms + soar_query_ms,
                 recall_at_k: calculate_recall(&true_neighbors, &soar_nb, cli.k),
                 mean_dist_rat: calculate_mean_distance_ratio(
+                    true_distances.as_ref().unwrap(),
+                    soar_d.as_ref().unwrap(),
+                    cli.k,
+                ),
+                median_dist_rat: calculate_median_distance_ratio(
                     true_distances.as_ref().unwrap(),
                     soar_d.as_ref().unwrap(),
                     cli.k,
@@ -287,6 +298,11 @@ fn main() {
                 total_time_ms: build_ms + query_ms,
                 recall_at_k: calculate_recall(&true_neighbors, &nb, cli.k),
                 mean_dist_rat: calculate_mean_distance_ratio(
+                    true_distances.as_ref().unwrap(),
+                    d.as_ref().unwrap(),
+                    cli.k,
+                ),
+                median_dist_rat: calculate_median_distance_ratio(
                     true_distances.as_ref().unwrap(),
                     d.as_ref().unwrap(),
                     cli.k,

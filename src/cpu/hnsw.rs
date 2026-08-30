@@ -41,7 +41,6 @@ impl<T: Ord> Default for SortedBuffer<T> {
     }
 }
 
-
 //////////////////////////
 // Thread-local buffers //
 //////////////////////////
@@ -149,8 +148,6 @@ where
     m: usize,
     /// Size of dynamic candidate list during construction
     ef_construction: usize,
-    ///  Whether to extend candidate pool (unused)
-    extend_candidates: bool,
     /// Original indices - for trait purposes
     original_ids: Vec<usize>,
 }
@@ -296,7 +293,6 @@ where
             max_layer,
             m,
             ef_construction,
-            extend_candidates: false,
             original_ids: (0..n).collect(),
         };
 
@@ -678,15 +674,6 @@ where
         }
 
         result
-    }
-
-    /// Was extend candidates set to `true`
-    ///
-    /// ### Returns
-    ///
-    /// Boolean
-    pub fn extend_candidates(&self) -> bool {
-        self.extend_candidates
     }
 
     /// Returns the size of the index in bytes

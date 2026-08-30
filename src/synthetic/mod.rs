@@ -289,6 +289,12 @@ where
 /// PQ cannot. `correlation_strength` splits structured variance between the
 /// shared global subspace (1.0) and the cluster-local one (0.0).
 ///
+/// [`DEFAULT_BRIDGE_FRACTION`] of the points sit on thin tubes between
+/// nearest-neighbour cluster pairs, as in [`generate_clustered_data`]. Blobs
+/// this well separated are otherwise mutually unreachable, which turns the
+/// dataset into a graph-connectivity test rather than the correlation test it
+/// is meant to be.
+///
 /// ### Params
 ///
 /// * `n_samples` - Number of samples
@@ -362,18 +368,56 @@ where
     let sg = correlation_strength.clamp(0.0, 1.0).sqrt();
     let sl = (1.0 - correlation_strength.clamp(0.0, 1.0)).sqrt();
 
-    // variable cluster sizes
+    // Bridge edges: connect each cluster to its nearest neighbour, dedup.
+    // Without these the blobs are mutually unreachable, and a graph index
+    // whose greedy descent commits to the wrong blob has no path back. The
+    // other generators all carry connectivity of some kind, so this one had no
+    // business being the exception.
+    let mut edges: Vec<(usize, usize)> = Vec::new();
+    if n_clusters >= 2 {
+        for a in 0..n_clusters {
+            let mut best = usize::MAX;
+            let mut best_d = f64::INFINITY;
+            for b in 0..n_clusters {
+                if a == b {
+                    continue;
+                }
+                let d: f64 = centres[a]
+                    .iter()
+                    .zip(&centres[b])
+                    .map(|(x, y)| (x - y).powi(2))
+                    .sum();
+                if d < best_d {
+                    best_d = d;
+                    best = b;
+                }
+            }
+            let edge = (a.min(best), a.max(best));
+            if !edges.contains(&edge) {
+                edges.push(edge);
+            }
+        }
+    }
+
+    let n_bridge = if edges.is_empty() {
+        0
+    } else {
+        (n_samples as f64 * DEFAULT_BRIDGE_FRACTION) as usize
+    };
+    let n_blob = n_samples - n_bridge;
+
+    // variable cluster sizes over the blob budget
     let mut assignments = Vec::new();
     for cluster_idx in 0..n_clusters {
         let weight = rng.random_range(0.5..2.5);
-        let n_in_cluster = ((n_samples as f64 * weight) / (n_clusters as f64 * 1.25)) as usize;
+        let n_in_cluster = ((n_blob as f64 * weight) / (n_clusters as f64 * 1.25)) as usize;
         assignments.extend(vec![cluster_idx; n_in_cluster]);
     }
-    while assignments.len() < n_samples {
+    while assignments.len() < n_blob {
         assignments.push(rng.random_range(0..n_clusters));
     }
     assignments.shuffle(&mut rng);
-    assignments.truncate(n_samples);
+    assignments.truncate(n_blob);
 
     // sample = centre + isotropic floor + shared global component + cluster-local component
     for (i, &cluster_idx) in assignments.iter().enumerate() {
@@ -400,6 +444,29 @@ where
                 data[(i, j)] = data[(i, j)] + amp * basis[(j, k)];
             }
         }
+    }
+
+    // Bridge points: thin tube interpolating between connected centres, still
+    // carrying the shared global off-axis component so they sit on the same
+    // correlated structure as everything else. The cluster-local bases are not
+    // blended: a point between two ellipsoids belongs to neither.
+    for row in n_blob..n_samples {
+        let (a, b) = edges[rng.random_range(0..edges.len())];
+        let t: f64 = rng.random();
+        let tube = (spectra[a][0] + spectra[b][0]) * 0.5 * 0.3;
+        for j in 0..dim {
+            let mid = (1.0 - t) * centres[a][j] + t * centres[b][j];
+            let noise: f64 = rng.sample(StandardNormal);
+            data[(row, j)] = T::from_f64(mid + noise * tube).unwrap();
+        }
+        for k in 0..corr_rank {
+            let z: f64 = rng.sample(StandardNormal);
+            let amp = T::from_f64(z * global_spec[k] * sg).unwrap();
+            for j in 0..dim {
+                data[(row, j)] = data[(row, j)] + amp * global_basis[(j, k)];
+            }
+        }
+        assignments.push(if t < 0.5 { a } else { b });
     }
 
     (data, assignments)
@@ -852,6 +919,48 @@ mod tests {
             assert_eq!(labels.len(), 300);
             assert!(labels.iter().all(|&l| l < 5));
         }
+    }
+
+    #[test]
+    fn test_correlated_bridges_close_the_gap_between_blobs() {
+        // Without bridge points the nearest out-of-cluster point sits a full
+        // centre separation away, which is what made this dataset a graph
+        // reachability test. With them, some points sit far closer to another
+        // cluster's members than a blob radius.
+        let (data, labels) = generate_clustered_data_high_dim::<f64>(1500, 16, 4, 0.5, 3);
+        let (n, dim) = data.shape();
+
+        let dist = |a: usize, b: usize| -> f64 {
+            (0..dim)
+                .map(|j| (data[(a, j)] - data[(b, j)]).powi(2))
+                .sum()
+        };
+
+        // Within-cluster scale, taken as the median nearest same-cluster
+        // distance, so the threshold is not tied to the generator constants.
+        let mut same: Vec<f64> = (0..n)
+            .map(|i| {
+                (0..n)
+                    .filter(|&j| j != i && labels[j] == labels[i])
+                    .map(|j| dist(i, j))
+                    .fold(f64::INFINITY, f64::min)
+            })
+            .collect();
+        same.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        let within = same[same.len() / 2];
+
+        let close_to_other = (0..n)
+            .filter(|&i| {
+                (0..n)
+                    .filter(|&j| labels[j] != labels[i])
+                    .any(|j| dist(i, j) < within * 10.0)
+            })
+            .count();
+
+        assert!(
+            close_to_other > 0,
+            "no point sits near another cluster: the blobs are disconnected"
+        );
     }
 
     #[test]

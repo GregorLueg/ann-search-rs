@@ -46,6 +46,7 @@ fn main() {
         total_time_ms: build_time + query_time,
         recall_at_k: 1.0,
         mean_dist_rat: 1.0,
+        median_dist_rat: 1.0,
         index_size_mb,
     });
 
@@ -62,6 +63,7 @@ fn main() {
         total_time_ms: build_time + self_query_time,
         recall_at_k: 1.0,
         mean_dist_rat: 1.0,
+        median_dist_rat: 1.0,
         index_size_mb,
     });
 
@@ -144,6 +146,11 @@ fn main() {
                 &exact_distances(&data, &query_data, &binary_neighbors, &cli.distance),
                 cli.k,
             ),
+            median_dist_rat: calculate_median_distance_ratio(
+                true_distances.as_ref().unwrap(),
+                &exact_distances(&data, &query_data, &binary_neighbors, &cli.distance),
+                cli.k,
+            ),
             index_size_mb,
         });
 
@@ -172,6 +179,11 @@ fn main() {
                 &exact_distances(&data, &query_data, &binary_neighbors, &cli.distance),
                 cli.k,
             );
+            let dist_error_median = calculate_median_distance_ratio(
+                true_distances.as_ref().unwrap(),
+                &exact_distances(&data, &query_data, &binary_neighbors, &cli.distance),
+                cli.k,
+            );
 
             results.push(BenchmarkResultSize {
                 method: format!(
@@ -183,6 +195,7 @@ fn main() {
                 total_time_ms: build_time + query_time,
                 recall_at_k: recall,
                 mean_dist_rat: dist_error,
+                median_dist_rat: dist_error_median,
                 index_size_mb,
             });
         }
@@ -202,6 +215,11 @@ fn main() {
             &exact_distances(&data, &data, &binary_neighbors_self, &cli.distance),
             cli.k,
         );
+        let dist_error_self_median = calculate_median_distance_ratio(
+            true_distances_self.as_ref().unwrap(),
+            &exact_distances(&data, &data, &binary_neighbors_self, &cli.distance),
+            cli.k,
+        );
 
         results.push(BenchmarkResultSize {
             method: format!("ExhaustiveBinary-{}-{} (self)", n_bits, init),
@@ -210,6 +228,7 @@ fn main() {
             total_time_ms: build_time + self_query_time,
             recall_at_k: recall_self,
             mean_dist_rat: dist_error_self,
+            median_dist_rat: dist_error_self_median,
             index_size_mb,
         });
     }
@@ -300,6 +319,11 @@ fn main() {
                         &exact_distances(&data, &query_data, &ivf_binary_neighbors, &cli.distance),
                         cli.k,
                     ),
+                    median_dist_rat: calculate_median_distance_ratio(
+                        true_distances.as_ref().unwrap(),
+                        &exact_distances(&data, &query_data, &ivf_binary_neighbors, &cli.distance),
+                        cli.k,
+                    ),
                     index_size_mb,
                 });
             }
@@ -335,6 +359,11 @@ fn main() {
                         &exact_distances(&data, &query_data, &ivf_binary_neighbors, &cli.distance),
                         cli.k,
                     );
+                    let dist_error_median = calculate_median_distance_ratio(
+                        true_distances.as_ref().unwrap(),
+                        &exact_distances(&data, &query_data, &ivf_binary_neighbors, &cli.distance),
+                        cli.k,
+                    );
 
                     results.push(BenchmarkResultSize {
                         method: format!(
@@ -346,6 +375,7 @@ fn main() {
                         total_time_ms: build_time + query_time,
                         recall_at_k: recall,
                         mean_dist_rat: dist_error,
+                        median_dist_rat: dist_error_median,
                         index_size_mb,
                     });
                 }
@@ -374,6 +404,11 @@ fn main() {
                 &exact_distances(&data, &data, &ivf_binary_neighbors_self, &cli.distance),
                 cli.k,
             );
+            let dist_error_self_median = calculate_median_distance_ratio(
+                true_distances_self.as_ref().unwrap(),
+                &exact_distances(&data, &data, &ivf_binary_neighbors_self, &cli.distance),
+                cli.k,
+            );
 
             results.push(BenchmarkResultSize {
                 method: format!("IVF-Binary-{}-nl{}-{} (self)", n_bits, nlist, init),
@@ -382,6 +417,7 @@ fn main() {
                 total_time_ms: build_time + self_query_time,
                 recall_at_k: recall_self,
                 mean_dist_rat: dist_error_self,
+                median_dist_rat: dist_error_self_median,
                 index_size_mb,
             });
         }

@@ -190,7 +190,7 @@ required-features = ["binary"]
 ##################
 
 [[example]]
-name = "knn_comparison_cagra"
+name = "knn_comparison_gpu"
 required-features = ["gpu"]
 
 ###########

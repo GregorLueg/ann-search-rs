@@ -61,6 +61,7 @@ fn main() {
         total_time_ms: build_time + query_time,
         recall_at_k: 1.0,
         mean_dist_rat: 1.0,
+        median_dist_rat: 1.0,
         index_size_mb,
     });
 
@@ -77,6 +78,7 @@ fn main() {
         total_time_ms: build_time + self_query_time,
         recall_at_k: 1.0,
         mean_dist_rat: 1.0,
+        median_dist_rat: 1.0,
         index_size_mb,
     });
 
@@ -102,6 +104,11 @@ fn main() {
         total_time_ms: build_time_sq8 + query_time_sq8,
         recall_at_k: calculate_recall(&true_neighbors, &sq8_neighbors, cli.k),
         mean_dist_rat: calculate_mean_distance_ratio(
+            true_distances.as_ref().unwrap(),
+            &exact_distances(&data, &query_data, &sq8_neighbors, &cli.distance),
+            cli.k,
+        ),
+        median_dist_rat: calculate_median_distance_ratio(
             true_distances.as_ref().unwrap(),
             &exact_distances(&data, &query_data, &sq8_neighbors, &cli.distance),
             cli.k,
@@ -154,6 +161,11 @@ fn main() {
                     approx_distances.as_ref().unwrap(),
                     cli.k,
                 ),
+                median_dist_rat: calculate_median_distance_ratio(
+                    true_distances.as_ref().unwrap(),
+                    approx_distances.as_ref().unwrap(),
+                    cli.k,
+                ),
                 index_size_mb,
             });
         }
@@ -171,6 +183,11 @@ fn main() {
             total_time_ms: build_time + self_query_time,
             recall_at_k: calculate_recall(&true_neighbors_self, &approx_self, cli.k),
             mean_dist_rat: calculate_mean_distance_ratio(
+                true_distances_self.as_ref().unwrap(),
+                approx_dists_self.as_ref().unwrap(),
+                cli.k,
+            ),
+            median_dist_rat: calculate_median_distance_ratio(
                 true_distances_self.as_ref().unwrap(),
                 approx_dists_self.as_ref().unwrap(),
                 cli.k,
@@ -203,15 +220,9 @@ fn main() {
             let start = Instant::now();
             // Distances are recomputed exactly below, so there is no point
             // asking the index to report its estimates.
-            let (approx_neighbors, _) = query_hnsw_sq8u_index(
-                query_data.as_ref(),
-                &idx,
-                cli.k,
-                ef_search,
-                false,
-                false,
-            )
-            .unwrap();
+            let (approx_neighbors, _) =
+                query_hnsw_sq8u_index(query_data.as_ref(), &idx, cli.k, ef_search, false, false)
+                    .unwrap();
             let query_time = start.elapsed().as_secs_f64() * 1000.0;
 
             results.push(BenchmarkResultSize {
@@ -221,6 +232,11 @@ fn main() {
                 total_time_ms: build_time + query_time,
                 recall_at_k: calculate_recall(&true_neighbors, &approx_neighbors, cli.k),
                 mean_dist_rat: calculate_mean_distance_ratio(
+                    true_distances.as_ref().unwrap(),
+                    &exact_distances(&data, &query_data, &approx_neighbors, &cli.distance),
+                    cli.k,
+                ),
+                median_dist_rat: calculate_median_distance_ratio(
                     true_distances.as_ref().unwrap(),
                     &exact_distances(&data, &query_data, &approx_neighbors, &cli.distance),
                     cli.k,
@@ -241,6 +257,11 @@ fn main() {
             total_time_ms: build_time + self_query_time,
             recall_at_k: calculate_recall(&true_neighbors_self, &approx_self, cli.k),
             mean_dist_rat: calculate_mean_distance_ratio(
+                true_distances_self.as_ref().unwrap(),
+                &exact_distances(&data, &data, &approx_self, &cli.distance),
+                cli.k,
+            ),
+            median_dist_rat: calculate_median_distance_ratio(
                 true_distances_self.as_ref().unwrap(),
                 &exact_distances(&data, &data, &approx_self, &cli.distance),
                 cli.k,
@@ -285,6 +306,11 @@ fn main() {
             total_time_ms: build_time + query_time,
             recall_at_k: calculate_recall(&true_neighbors, &approx_neighbors, cli.k),
             mean_dist_rat: calculate_mean_distance_ratio(
+                true_distances.as_ref().unwrap(),
+                &exact_distances(&data, &query_data, &approx_neighbors, &cli.distance),
+                cli.k,
+            ),
+            median_dist_rat: calculate_median_distance_ratio(
                 true_distances.as_ref().unwrap(),
                 &exact_distances(&data, &query_data, &approx_neighbors, &cli.distance),
                 cli.k,
