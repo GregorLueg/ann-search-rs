@@ -455,9 +455,13 @@ where
         // it only needs applying to the k survivors.
         let mut block = [T::zero(); RABITQ_BLOCK];
 
+        // One rotation per query, not one per probed cluster
+        let q_rot = self.encoder.apply_rotation(&query_normalised);
+
         for c_idx in probed {
-            let centroid = self.storage.centroid(c_idx);
-            let query_encoded = self.encoder.encode_query(&query_normalised, centroid)?;
+            let query_encoded = self
+                .encoder
+                .encode_query_prerotated(&q_rot, self.storage.centroid_rotated(c_idx));
             let cluster_size = self.storage.cluster_size(c_idx);
             let indices = self.storage.cluster_vector_indices(c_idx);
 

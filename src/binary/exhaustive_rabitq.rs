@@ -209,8 +209,11 @@ where
         // it only needs applying to the k survivors.
         let mut block = [T::zero(); RABITQ_BLOCK];
 
+        // One rotation per query, not one per probed cluster
+        let q_rot = self.quantiser.encoder.apply_rotation(&query_normalised);
+
         for &(_, c_idx) in cluster_dists.iter().take(n_probe) {
-            let query_encoded = self.quantiser.encode_query(&query_normalised, c_idx)?;
+            let query_encoded = self.quantiser.encode_query_prerotated(&q_rot, c_idx);
             let cluster_size = self.storage().cluster_size(c_idx);
             let indices = self.storage().cluster_vector_indices(c_idx);
 
