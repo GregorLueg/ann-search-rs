@@ -451,28 +451,46 @@ where
 
         let mut heap: BinaryHeap<(OrderedFloat<T>, usize)> = BinaryHeap::with_capacity(k + 1);
 
+        // The heap ranks on *squared* distance: the square root is monotone, so
+        // it only needs applying to the k survivors.
+        let mut block = [T::zero(); RABITQ_BLOCK];
+
         for c_idx in probed {
             let centroid = self.storage.centroid(c_idx);
             let query_encoded = self.encoder.encode_query(&query_normalised, centroid)?;
             let cluster_size = self.storage.cluster_size(c_idx);
+            let indices = self.storage.cluster_vector_indices(c_idx);
 
-            for local_idx in 0..cluster_size {
-                let dist = self.rabitq_dist(&query_encoded, c_idx, local_idx);
-                let global_idx = self.storage.cluster_vector_indices(c_idx)[local_idx];
+            let mut local_idx = 0;
+            while local_idx < cluster_size {
+                let take = RABITQ_BLOCK.min(cluster_size - local_idx);
+                let block_min =
+                    self.rabitq_block_sq(&query_encoded, c_idx, local_idx, &mut block[..take]);
 
-                if heap.len() < k {
-                    heap.push((OrderedFloat(dist), global_idx));
-                } else if dist < heap.peek().unwrap().0 .0 {
-                    heap.pop();
-                    heap.push((OrderedFloat(dist), global_idx));
+                if heap.len() < k || block_min < heap.peek().unwrap().0 .0 {
+                    for (j, &dist) in block[..take].iter().enumerate() {
+                        let global_idx = indices[local_idx + j];
+
+                        if heap.len() < k {
+                            heap.push((OrderedFloat(dist), global_idx));
+                        } else if dist < heap.peek().unwrap().0 .0 {
+                            heap.pop();
+                            heap.push((OrderedFloat(dist), global_idx));
+                        }
+                    }
                 }
+
+                local_idx += take;
             }
         }
 
         let mut results: Vec<_> = heap.into_iter().collect();
         results.sort_unstable();
 
-        Ok(results.into_iter().map(|(d, i)| (i, d.0)).unzip())
+        Ok(results
+            .into_iter()
+            .map(|(d, i)| (i, d.0.sqrt()))
+            .unzip())
     }
 
     /// Query using a row reference

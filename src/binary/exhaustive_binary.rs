@@ -269,16 +269,28 @@ where
         let k = k.min(self.n);
 
         let mut heap: BinaryHeap<(u32, usize)> = BinaryHeap::with_capacity(k + 1);
+        let mut block = [0u32; HAMMING_BLOCK];
 
-        for idx in 0..self.n {
-            let dist = self.hamming_distance_query(&query_binary, idx);
+        let mut idx = 0;
+        while idx < self.n {
+            let take = HAMMING_BLOCK.min(self.n - idx);
+            let codes = &self.vectors_flat_binarised
+                [idx * self.n_bytes..(idx + take) * self.n_bytes];
+            let block_min =
+                hamming_block(&query_binary, codes, self.n_bytes, &mut block[..take]);
 
-            if heap.len() < k {
-                heap.push((dist, idx));
-            } else if dist < heap.peek().unwrap().0 {
-                heap.pop();
-                heap.push((dist, idx));
+            if heap.len() < k || block_min < heap.peek().unwrap().0 {
+                for (j, &dist) in block[..take].iter().enumerate() {
+                    if heap.len() < k {
+                        heap.push((dist, idx + j));
+                    } else if dist < heap.peek().unwrap().0 {
+                        heap.pop();
+                        heap.push((dist, idx + j));
+                    }
+                }
             }
+
+            idx += take;
         }
 
         let mut results: Vec<_> = heap.into_iter().collect();
@@ -323,6 +335,9 @@ where
 
         let (candidates, _) = self.query(query_vec, k * rerank_factor)?;
 
+        // One pass over the query, not one per candidate
+        let query_sum = query_vec.iter().fold(T::zero(), |acc, &x| acc + x);
+
         let mut scored: Vec<(usize, T)> = candidates
             .iter()
             .map(|&idx| {
@@ -332,7 +347,8 @@ where
                         .get_unchecked(start_i..start_i + self.n_bytes)
                 };
 
-                let dist_i = asymmetric_binary_dot(query_vec, vec_i, self.dim);
+                let dist_i =
+                    asymmetric_binary_dot_presummed(query_vec, query_sum, vec_i, self.dim);
                 (idx, dist_i)
             })
             .collect();
@@ -599,16 +615,28 @@ where
 
                     let k = k.min(self.n);
                     let mut heap: BinaryHeap<(u32, usize)> = BinaryHeap::with_capacity(k + 1);
+                    let mut block = [0u32; HAMMING_BLOCK];
 
-                    for idx in 0..self.n {
-                        let dist = self.hamming_distance_query(query_binary, idx);
+                    let mut idx = 0;
+                    while idx < self.n {
+                        let take = HAMMING_BLOCK.min(self.n - idx);
+                        let codes = &self.vectors_flat_binarised
+                            [idx * self.n_bytes..(idx + take) * self.n_bytes];
+                        let block_min =
+                            hamming_block(query_binary, codes, self.n_bytes, &mut block[..take]);
 
-                        if heap.len() < k {
-                            heap.push((dist, idx));
-                        } else if dist < heap.peek().unwrap().0 {
-                            heap.pop();
-                            heap.push((dist, idx));
+                        if heap.len() < k || block_min < heap.peek().unwrap().0 {
+                            for (j, &dist) in block[..take].iter().enumerate() {
+                                if heap.len() < k {
+                                    heap.push((dist, idx + j));
+                                } else if dist < heap.peek().unwrap().0 {
+                                    heap.pop();
+                                    heap.push((dist, idx + j));
+                                }
+                            }
                         }
+
+                        idx += take;
                     }
 
                     let mut results: Vec<(u32, usize)> = heap.into_iter().collect();

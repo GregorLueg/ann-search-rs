@@ -30,8 +30,11 @@ const RABITQ_K_MEANS_ITER: usize = 30;
 /// Encoded query for RaBitQ distance estimation
 #[repr(C)]
 pub struct RaBitQQuery<T> {
-    /// Int4 quantised values (one per dimension, stored as u8)
-    pub quantised: Vec<u8>,
+    /// Bit-planes of the int4 quantised values, `RABITQ_QUERY_PLANES` planes
+    /// of `n_bytes` each. See [`build_query_planes`] for the layout.
+    pub planes: Vec<u8>,
+    /// Bytes per plane, `dim.div_ceil(8)`
+    pub n_bytes: usize,
     /// Distance from query to centroid
     pub dist_to_centroid: T,
     /// Lower bound used in quantisation
@@ -104,7 +107,7 @@ where
     ///
     /// ### Returns
     ///
-    /// The `(binarised code, dist to centroid, correction for the dot product)`
+    /// The `(binarised code, dist to centroid, inverse dot correction, popcount)`
     #[inline]
     pub fn encode_vector(
         &self,
@@ -138,10 +141,18 @@ where
             }
         }
 
-        // Dot correction: L1 norm of rotated unit residual
-        let dot_correction: T = compute_l1_norm(&v_c_rotated);
+        // Dot correction: L1 norm of the rotated unit residual, stored
+        // inverted so the query path multiplies instead of dividing. Zero
+        // stands in for "underflowed", which the query path reads as a zero
+        // estimated cosine, matching the old guarded divide.
+        let l1: T = compute_l1_norm(&v_c_rotated);
+        let dot_correction_inv = if l1 > T::from_f32(1e-6).unwrap() {
+            T::one() / l1
+        } else {
+            T::zero()
+        };
 
-        Ok((binary, dist_to_centroid, dot_correction, popcount))
+        Ok((binary, dist_to_centroid, dot_correction_inv, popcount))
     }
 
     /// Encode a query vector relative to a specific cluster
@@ -223,7 +234,8 @@ where
         }
 
         Ok(RaBitQQuery {
-            quantised,
+            planes: build_query_planes(&quantised, self.dim, self.n_bytes),
+            n_bytes: self.n_bytes,
             dist_to_centroid,
             lower,
             width,
@@ -309,8 +321,9 @@ where
 pub struct RaBitQPackedVector<T> {
     /// Distance to centroid
     pub dist_to_centroid: T,
-    /// Dot correction
-    pub dot_correction: T,
+    /// Inverse of the dot correction (`1 / L1 norm` of the rotated unit
+    /// residual), or zero when that norm underflowed
+    pub dot_correction_inv: T,
     /// Popcount
     pub popcount: u32,
 }
@@ -506,7 +519,7 @@ impl<T: Float + FromPrimitive + Clone> RaBitQStorage<T> {
     pub fn cluster_dot_corrections(&self, cluster_idx: usize) -> impl Iterator<Item = T> + '_ {
         self.cluster_packed_data(cluster_idx)
             .iter()
-            .map(|v| v.dot_correction)
+            .map(|v| v.dot_correction_inv)
     }
 
     /// Get vector indices for cluster
@@ -619,7 +632,7 @@ where
         packed_vectors: vec![
             RaBitQPackedVector {
                 dist_to_centroid: T::zero(),
-                dot_correction: T::zero(),
+                dot_correction_inv: T::zero(),
                 popcount: 0,
             };
             n
@@ -648,7 +661,7 @@ where
 
         storage.packed_vectors[pos] = RaBitQPackedVector {
             dist_to_centroid: dist,
-            dot_correction: dot_corr,
+            dot_correction_inv: dot_corr,
             popcount,
         };
 
@@ -947,14 +960,15 @@ mod tests {
         let centroid = vec![0.0; 8];
 
         let encoded = encoder.encode_query(&query, &centroid).unwrap();
+        let quantised = unpack_query_planes(&encoded.planes, 8, encoded.n_bytes);
 
-        assert_eq!(encoded.quantised.len(), 8);
-        for &val in &encoded.quantised {
+        assert_eq!(quantised.len(), 8);
+        for &val in &quantised {
             assert!(val <= 15); // int4 max value
         }
         assert_eq!(
             encoded.sum_quantised,
-            encoded.quantised.iter().map(|&x| x as u32).sum::<u32>()
+            quantised.iter().map(|&x| x as u32).sum::<u32>()
         );
     }
 
@@ -1060,7 +1074,7 @@ mod tests {
         let query = vec![0.8, 0.2];
         let encoded = quantiser.encode_query(&query, 0).unwrap();
 
-        assert_eq!(encoded.quantised.len(), 2);
+        assert_eq!(unpack_query_planes(&encoded.planes, 2, encoded.n_bytes).len(), 2);
         assert!(encoded.dist_to_centroid >= 0.0);
         assert!(encoded.sum_quantised <= 30); // 2 dims * 15 max
     }

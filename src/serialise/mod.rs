@@ -40,7 +40,7 @@ const MAGIC: &[u8; 8] = b"ANNSRS\0\0";
 /// retyping a field in any persisted struct needs a bump here; *appending* a
 /// field is safe because the old file runs out of bytes and the decode errors.
 /// Nothing checks this automatically.
-const FORMAT_VERSION: u32 = 3;
+const FORMAT_VERSION: u32 = 4;
 
 /// Name of the bincode payload inside an index directory.
 const INDEX_FILE: &str = "index.bin";
