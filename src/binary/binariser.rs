@@ -1,6 +1,6 @@
 //! Contains the binarisers
 
-use faer::Mat;
+use faer::{Mat, MatRef};
 use faer_traits::ComplexField;
 use num_traits::{Float, FromPrimitive, ToPrimitive};
 use rand::rngs::StdRng;
@@ -16,6 +16,20 @@ use crate::prelude::*;
 ///////////////
 
 const MAX_SAMPLES_PCA: usize = 100_000;
+
+/// Rows used to fit the ITQ rotation.
+///
+/// The rotation has `k^2` free parameters and is fitted by plain Procrustes,
+/// so it settles on far fewer rows than the PCA itself wants. Each iteration
+/// costs two `n * k * k` products, so this bound is what keeps the ITQ stage
+/// from dominating index construction.
+const MAX_SAMPLES_ITQ: usize = 10_000;
+
+/// ITQ alternating-minimisation iterations.
+///
+/// Gong and Lazebnik run 50. The objective is essentially flat well before
+/// that, so 30 is where further iterations stop paying for their two GEMMs.
+const ITQ_ITERATIONS: usize = 30;
 
 /// Initialisation of the binariser
 #[derive(Default, Eq, PartialEq)]
@@ -209,6 +223,98 @@ where
     mean
 }
 
+/// Learn an ITQ rotation over PCA loadings and fold it into them
+///
+/// PCA orders components by variance, so the sign bit of a low-variance
+/// component is close to noise while still weighing exactly as much in a
+/// Hamming distance as the leading component's. Taking `k = dim` bits is the
+/// worst case: the trailing components have almost no variance left and their
+/// bits are decided by rounding.
+///
+/// ITQ (Gong and Lazebnik, CVPR 2011) rotates the projected space to minimise
+/// the quantisation loss `||B - V R||_F` with `B = sign(VR)`, which spreads
+/// variance across the bits. Alternating minimisation: fixing `R` gives `B` by
+/// taking signs, and fixing `B` is an orthogonal Procrustes problem solved by
+/// the SVD of `V^T B`.
+///
+/// The rotation is linear, so it folds straight back into the projections and
+/// query-time encoding cost is unchanged.
+///
+/// ### Params
+///
+/// * `centred` - Centred training data, `n_samples * dim`
+/// * `projections` - The `k` PCA loadings, row-major `k * dim`, rotated in place
+/// * `k` - Number of PCA components
+/// * `dim` - Feature dimensionality
+/// * `seed` - Random seed for the initial rotation
+///
+/// ### References
+///
+/// Gong and Lazebnik, "Iterative Quantization: A Procrustean Approach to
+/// Learning Binary Codes", CVPR 2011
+fn itq_rotate_projections<T>(
+    centred: MatRef<T>,
+    projections: &mut [T],
+    k: usize,
+    dim: usize,
+    seed: usize,
+) where
+    T: Float + FromPrimitive + ToPrimitive + ComplexField,
+{
+    if k == 0 {
+        return;
+    }
+
+    let n_itq = centred.nrows().min(MAX_SAMPLES_ITQ);
+
+    // PCA scores of the ITQ subsample: V = centred * loadings, n_itq x k.
+    // `training_sample_indices` already shuffled, so the leading rows are a
+    // random subset and no second draw is needed.
+    let loadings = Mat::<T>::from_fn(dim, k, |d, j| projections[j * dim + d]);
+    let sample = Mat::<T>::from_fn(n_itq, dim, |i, d| centred[(i, d)]);
+    let scores = sample * loadings;
+
+    // Random orthogonal k x k start. The Gram-Schmidt helper returns k
+    // orthonormal rows of length k, which is exactly that.
+    let r_flat = prepare_simhash_projections::<T>(k, k, seed);
+    let mut rotation = Mat::<T>::from_fn(k, k, |i, j| r_flat[i * k + j]);
+
+    for _ in 0..ITQ_ITERATIONS {
+        // B = sign(V R), with zero mapped to +1 so no entry is dropped
+        let rotated = scores.as_ref() * rotation.as_ref();
+        let b = Mat::<T>::from_fn(n_itq, k, |i, j| {
+            if rotated[(i, j)] >= T::zero() {
+                T::one()
+            } else {
+                -T::one()
+            }
+        });
+
+        // Orthogonal Procrustes: argmin ||B - V R|| is U W^T for V^T B = U S W^T
+        let m = scores.transpose() * b;
+        let svd = match m.as_ref().thin_svd() {
+            Ok(svd) => svd,
+            // A degenerate cross-product leaves the current rotation in place;
+            // the codes stay valid, they just miss the balancing.
+            Err(_) => return,
+        };
+        rotation = svd.U() * svd.V().transpose();
+    }
+
+    // Fold the rotation back into the loadings: bit j reads the direction
+    // `sum_l R[l][j] * loading_l`.
+    let original = projections[..k * dim].to_vec();
+    for j in 0..k {
+        for d in 0..dim {
+            let mut acc = T::zero();
+            for l in 0..k {
+                acc = acc + rotation[(l, j)] * original[l * dim + d];
+            }
+            projections[j * dim + d] = acc;
+        }
+    }
+}
+
 /// Initialise binariser using PCA hashing
 ///
 /// Learns a projection from the top principal components of the training
@@ -221,18 +327,20 @@ where
 ///
 /// 1. Sample and centre training data
 /// 2. Compute thin SVD to obtain the top-k right singular vectors (loadings)
-/// 3. Use the loadings directly as projection directions
+/// 3. Rotate the loadings with ITQ so variance is spread evenly across bits
+///
+/// Step 3 is not optional in practice. Raw PCA loadings put nearly all the
+/// variance in the leading components, so the trailing sign bits are decided
+/// by rounding noise yet count for just as much in a Hamming distance. See
+/// [`itq_rotate_projections`] for the fix and the reference.
 ///
 /// ### Limitations
 ///
 /// PCA hashing can only produce `min(n_bits, dim)` meaningful bits. If
 /// `n_bits > dim`, the excess bits are filled with random orthogonal
 /// projections, as there are no additional variance directions to capture.
-///
-/// The top principal components tend to carry disproportionately more
-/// variance than lower ones, so not all bits are equally informative.
-/// This is a known trade-off compared to methods like ITQ which attempt
-/// to balance variance across bits via rotation.
+/// Those padding bits are left out of the ITQ rotation, which only spans the
+/// PCA block.
 ///
 /// ### Params
 ///
@@ -285,6 +393,10 @@ where
             projections.push(v_full[(i, j)]);
         }
     }
+
+    // Balance variance across the PCA bits before any padding is appended, so
+    // the rotation spans exactly the PCA block.
+    itq_rotate_projections(centered.as_ref(), &mut projections, k, dim, seed);
 
     // pad with random projections if n_bits > effective rank
     if n_bits > k {
@@ -742,6 +854,71 @@ mod tests {
         let binary = binariser.encode(&vec1).unwrap();
 
         assert_eq!(binary.len(), n_bits / 8);
+    }
+
+    /// The property ITQ exists to deliver: after the rotation, no bit should
+    /// be reading a direction with orders of magnitude less variance than
+    /// another. The fixture's coordinate `j` has standard deviation `2^-j`, so
+    /// the raw PCA loadings would give per-bit variances spanning the full
+    /// `4^-(dim-1)` range, roughly nine orders of magnitude at dim 16. A bit
+    /// sitting at the bottom of that range is decided by rounding noise but
+    /// still counts for one unit of Hamming distance.
+    #[test]
+    fn test_itq_balances_variance_across_bits() {
+        let n_samples = 2000;
+        let dim = 16;
+        let n_bits = 16; // every bit is a PCA bit, the worst case for balance
+
+        let mut data = Mat::<f64>::zeros(n_samples, dim);
+        for i in 0..n_samples {
+            for j in 0..dim {
+                let mut x = (i as u64)
+                    .wrapping_mul(0x9E37_79B9_7F4A_7C15)
+                    .wrapping_add((j as u64).wrapping_mul(0xC2B2_AE3D_27D4_EB4F));
+                x ^= x >> 33;
+                x = x.wrapping_mul(0xFF51_AFD7_ED55_8CCD);
+                x ^= x >> 33;
+                let unit = (x as f64 / u64::MAX as f64) * 2.0 - 1.0;
+                data[(i, j)] = unit * 2.0_f64.powi(-(j as i32));
+            }
+        }
+
+        let flat = matrix_to_flat(data.as_ref()).0;
+        let binariser =
+            Binariser::<f64>::new_pca_hashing(&flat, n_samples, dim, n_bits, 42).unwrap();
+
+        let BinarisationMethod::PcaHashing { projections, mean } = &binariser.method else {
+            panic!("Expected PcaHashing method");
+        };
+
+        // Per-bit variance of the projected scores
+        let mut variances = vec![0.0f64; n_bits];
+        for (b, var) in variances.iter_mut().enumerate() {
+            let proj = &projections[b * dim..(b + 1) * dim];
+            let mut sum = 0.0;
+            let mut sum_sq = 0.0;
+            for i in 0..n_samples {
+                let score: f64 = (0..dim)
+                    .map(|d| proj[d] * (data[(i, d)] - mean[d]))
+                    .sum();
+                sum += score;
+                sum_sq += score * score;
+            }
+            let n = n_samples as f64;
+            *var = sum_sq / n - (sum / n).powi(2);
+        }
+
+        let max = variances.iter().cloned().fold(f64::MIN, f64::max);
+        let min = variances.iter().cloned().fold(f64::MAX, f64::min);
+
+        // Raw PCA loadings on this fixture spread over ~1e9; ITQ must pull that
+        // in by orders of magnitude. The bound is deliberately loose: ITQ
+        // minimises quantisation loss, it does not equalise variance exactly.
+        assert!(
+            max / min < 1e3,
+            "ITQ left the bit variances spread over {:e} (max {max:e}, min {min:e})",
+            max / min
+        );
     }
 
     #[test]
