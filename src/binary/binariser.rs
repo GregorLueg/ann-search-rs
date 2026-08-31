@@ -1,4 +1,5 @@
-//! Contains the binarisers
+//! Contains the binarisers for pure binary indices, i.e., RandomProjections,
+//! ITQ-PCA hashing and sign-based binarisation.
 
 use faer::linalg::matmul::matmul;
 use faer::{Accum, Col, ColRef, Mat, MatRef, Par, Side};
@@ -46,13 +47,8 @@ const PCA_VARIANCE_EXPLAINED: f64 = 0.9;
 /// because no small prefix explains 90% of anything. That is the case this cap
 /// exists for: past the genuinely structured directions a PCA bit is worse than
 /// a random one, since a random hyperplane preserves angular distance by
-/// construction and a low-variance loading does not.
-///
-/// Measured at dim 256 across the four synthetic generators, this is best or
-/// tied on every row; loosening it to 0.125 costs ~0.01 recall on the flat
-/// (gaussian) fixture and changes nothing on the structured ones, where the
-/// cumulative rule stops well short of the cap anyway.
-const PCA_MAX_COMPONENT_SHARE: f64 = 0.0625;
+/// construction and a low-variance loading does not. Set to 10%.
+const PCA_MAX_COMPONENT_SHARE: f64 = 0.1;
 
 /// Target footprint of the projection GEMM's output tile.
 ///
@@ -106,7 +102,7 @@ pub fn parse_binarisation_init(s: &str) -> Option<BinarisationInit> {
     match s.to_lowercase().as_str() {
         "pca" | "pca_hashing" => Some(BinarisationInit::PcaHashing),
         "random" | "random_projections" => Some(BinarisationInit::RandomProjections),
-        "sign" | "sign_based" => Some(BinarisationInit::SignBased),
+        "sign" | "signed" | "sign_based" => Some(BinarisationInit::SignBased),
         _ => None,
     }
 }
@@ -138,7 +134,7 @@ pub enum BinarisationMethod<T> {
     SignBased,
 }
 
-// Generate random projections and orthogonalise them
+/// Generate random projections and orthogonalise them
 ///
 /// Creates orthonormal random hyperplanes for better hash quality.
 /// Orthogonalisation via Gram-Schmidt ensures projections are independent.
@@ -362,7 +358,8 @@ where
 ///
 /// ### Params
 ///
-/// * `singular_values` - Singular values of the centred training data, descending
+/// * `singular_values` - Singular values of the centred training data,
+///   descending.
 /// * `max_k` - Upper bound from the bit budget and the matrix rank
 /// * `cap` - Hard ceiling, see [`PCA_MAX_COMPONENT_SHARE`]
 ///
@@ -377,8 +374,6 @@ where
         return 0;
     }
 
-    // Total over every available component, not just the first `max_k`, so the
-    // denominator is the data's actual variance rather than the budget's share.
     let mut total = T::zero();
     for j in 0..singular_values.nrows() {
         let s = singular_values[j];
@@ -451,15 +446,9 @@ fn itq_rotate_projections<T>(
     let n_rows = sample_indices.len();
     let n_itq = n_rows.min(MAX_SAMPLES_ITQ);
 
-    // Draw the ITQ rows at random. `training_sample_indices` leaves the rows in
-    // dataset order whenever `n <= MAX_SAMPLES_PCA`, and matrices arriving here
-    // are routinely ordered by batch, donor or cluster label, so taking a
-    // contiguous prefix would fit the rotation on one batch.
     let itq_rows: Vec<usize> = if n_itq == n_rows {
         (0..n_rows).collect()
     } else {
-        // Offset so this draw is independent of the one `training_sample_indices`
-        // makes from the same seed.
         let mut rng = StdRng::seed_from_u64(seed as u64 ^ 0x9E37_79B9);
         let mut idx: Vec<usize> = (0..n_rows).collect();
         idx.shuffle(&mut rng);
@@ -467,10 +456,6 @@ fn itq_rotate_projections<T>(
         idx
     };
 
-    // Only the rows the rotation reads get centred, not the whole PCA sample.
-    // Row-major matters here: `Mat::from_fn` fills column-major, so building
-    // this as a faer matrix touches one scattered element per source row per
-    // column over a working set well past L2.
     let mut sample_flat = Vec::with_capacity(n_itq * dim);
     for &i in &itq_rows {
         let row = &data[sample_indices[i] * dim..(sample_indices[i] + 1) * dim];
@@ -490,16 +475,8 @@ fn itq_rotate_projections<T>(
         Par::Seq,
     );
 
-    // Random orthogonal k x k start. The Gram-Schmidt helper returns k
-    // orthonormal rows of length k, which is exactly that.
     let r_flat = prepare_simhash_projections::<T>(k, k, seed);
     let mut rotation = Mat::<T>::from_fn(k, k, |i, j| r_flat[i * k + j]);
-
-    // Reused across iterations: faer's operators allocated four matrices per
-    // pass, which is what the loop was actually spending its time on. The GEMMs
-    // stay `Par::Seq` because `k` is capped at `n_bits / 16`, small enough that
-    // rayon dispatch costs about what the work does; threading them measured as
-    // no change.
     let mut rotated = Mat::<T>::zeros(n_itq, k);
     let mut b = Mat::<T>::zeros(n_itq, k);
     let mut m = Mat::<T>::zeros(k, k);
@@ -630,8 +607,6 @@ where
     let n_samples = sample_indices.len();
     let mean = feature_mean(data, dim, &sample_indices);
 
-    // Below the cap the sample is the dataset in order, so the raw slice is
-    // already the contiguous block the GEMM wants and no gather is needed.
     let gathered: Option<Vec<T>> = if n_samples == n {
         None
     } else {
@@ -642,21 +617,13 @@ where
         Some(buf)
     };
     let sample: &[T] = gathered.as_deref().unwrap_or(&data[..n_samples * dim]);
-
-    // The loadings are the eigenvectors of the centred covariance, reached
-    // through the `dim x dim` Gram matrix rather than an SVD of an
-    // `n_samples x dim` centred copy of the data.
     let gram = gram_matrix(sample, &mean, dim);
 
     let eigen = match gram.as_ref().self_adjoint_eigen(Side::Lower) {
         Ok(eigen) => eigen,
-        // No usable spectrum means no usable loadings. Random hyperplanes are a
-        // valid binariser, so spend every bit on one rather than panicking.
         Err(_) => return (prepare_simhash_projections(dim, n_bits, seed), mean),
     };
 
-    // faer orders eigenvalues nondecreasing; PCA wants the leading directions
-    // first, so everything below indexes from the far end.
     let eigenvalues = eigen.S().column_vector();
     let n_eig = eigenvalues.nrows();
     let singular = Col::<T>::from_fn(n_eig, |j| {
@@ -676,20 +643,8 @@ where
         }
     }
 
-    // Balance variance across the PCA bits before any padding is appended, so
-    // the rotation spans exactly the retained block and never mixes the noise
-    // subspace back into every bit.
-    itq_rotate_projections(
-        data,
-        &sample_indices,
-        &mean,
-        &mut projections,
-        k,
-        dim,
-        seed,
-    );
+    itq_rotate_projections(data, &sample_indices, &mean, &mut projections, k, dim, seed);
 
-    // Spend the remaining bits on random hyperplanes
     if n_bits > k {
         let extra = prepare_simhash_projections::<T>(dim, n_bits - k, seed + 1);
         projections.extend(extra);
@@ -845,9 +800,6 @@ fn encode_all_with_projections<T>(
                 // Load-bearing: the packing loop below only ORs
                 codes.fill(0);
 
-                // Bit index outer: faer is column-major, so a fixed bit is one
-                // contiguous column of the tile. The natural row-outer order
-                // reads it with stride `rows` and thrashes.
                 for j in 0..n_bits {
                     let byte = j / 8;
                     let mask = 1u8 << (j % 8);
@@ -2103,9 +2055,7 @@ mod tests {
         let mean = feature_mean(&data, dim, &indices);
 
         // Reference: centre in f64 first, so no cancellation anywhere
-        let centred = Mat::<f64>::from_fn(n, dim, |i, d| {
-            data[i * dim + d] as f64 - mean[d] as f64
-        });
+        let centred = Mat::<f64>::from_fn(n, dim, |i, d| data[i * dim + d] as f64 - mean[d] as f64);
         let mut reference = Mat::<f64>::zeros(dim, dim);
         matmul(
             reference.as_mut(),
@@ -2128,7 +2078,9 @@ mod tests {
         // so compare the subspace the block spans rather than each direction:
         // every retained loading must lie in the span of the reference's
         // leading `k` eigenvectors.
-        let k = ((n_bits as f64 * PCA_MAX_COMPONENT_SHARE) as usize).max(1).min(dim);
+        let k = ((n_bits as f64 * PCA_MAX_COMPONENT_SHARE) as usize)
+            .max(1)
+            .min(dim);
         assert!(
             k < dim,
             "with k == dim the reference subspace is the whole space and this \

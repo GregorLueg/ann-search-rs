@@ -10,9 +10,6 @@ use rayon::prelude::*;
 use rustc_hash::FxHashSet;
 use thousands::*;
 
-// The generators moved into the library so the benchmark tables are
-// reproducible outside this repository. Re-exported here so every gridsearch
-// keeps its unqualified names.
 pub use ann_search_rs::synthetic::{
     generate_cell_embeddings, generate_clustered_data, generate_clustered_data_high_dim,
     generate_low_rank_rotated_data, parse_data, subsample_with_noise, SyntheticData,
@@ -242,8 +239,6 @@ pub fn exact_distances(
 ) -> Vec<Vec<f32>> {
     let metric = parse_ann_dist(distance).unwrap_or_default();
 
-    // faer matrices are column-major, so rows are strided and the SIMD kernels
-    // cannot see them. Flatten once here rather than per distance.
     let (data_flat, n, dim) = matrix_to_flat(data.as_ref());
     let (query_flat, n_queries, query_dim) = matrix_to_flat(queries.as_ref());
     assert_eq!(dim, query_dim, "query and data dimensionality differ");
@@ -348,8 +343,7 @@ where
 /// with a large mean is a handful of catastrophic misses on an otherwise
 /// healthy index, which is the case that matters downstream: one spurious edge
 /// between two cell populations is enough to merge them under Leiden or drag
-/// them together in a UMAP. Both numbers drifting up together is uniform
-/// degradation, which is the benign, tune-`ef` case.
+/// them together in a UMAP.
 ///
 /// ### Params
 ///

@@ -1,6 +1,6 @@
 # News
 
-## Unreleased
+## 0.7.0
 
 **Features**
 
@@ -9,42 +9,6 @@
   dimensions is what makes the integer code distance preserve the ordering of
   the float one, so a single kernel serves construction and query.
   `build_hnsw_sq8u_index` / `query_hnsw_sq8u_index` / `query_hnsw_sq8u_self`.
-- New `docs/benchmarks_knn_graph.md`, covering the self-kNN-graph paths: CPU
-  NN-Descent extract vs self-beam, the GPU/CAGRA equivalents, and the clustered
-  GPU builder. The CAGRA kNN-generation section moved here out of
-  `benchmarks_gpu.md`.
-- SOAR, SOAR-PQ, SOAR-OPQ and the quantised HNSW now have benchmark sections and
-  entries in `fill_benchmarks.sh`. `--kind knn_graph` is the fifth kind.
-
-**Breaking changes**
-
-- `ExhaustiveSq8Index` and `IvfSq8Index` rebuilt on the shared-scale `u8`
-  quantiser. Their per-dimension scales did not cancel in a code-to-code
-  distance, so they were ranking by `sum_d (x_d - y_d)^2 / scale_d^2` rather
-  than the requested metric: recall@10 on 128-D synthetic cell embeddings goes
-  0.26 to 0.95, and the exhaustive scan is now faster than `f32` rather than
-  slower. `build_exhaustive_sq8_index` and `build_ivf_sq8_index` gain an
-  `Option<UniformQuantParams>`. `ScalarQuantiser` and `VectorDistanceSq8` are
-  gone.
-
-**Fixes**
-
-- The "Mean dist ratio" column in the quantised and binary gridsearches was
-  either `NaN` or the codec's own distance estimate. The latter conflates
-  retrieval quality with the estimator's bias and can land below 1.0, reading as
-  "better than optimal". Every quantising example now recomputes exact `f32`
-  distances from the original vectors via `exact_distances`, so the column
-  measures retrieval quality alone and is comparable across quantised and
-  unquantised indices.
-- The BF16 gridsearch's `Exhaustive-BF16 (self)` row queried the full-precision
-  index rather than the BF16 one, so it always reported recall 1.0.
-- All published benchmark tables regenerated. Stale parameter descriptions and
-  measurement claims removed from the templates.
-
-## 0.6.1
-
-**Features**
-
 - Python bindings under `python/`, built with PyO3 and maturin. scikit-learn
   shaped estimators over the CPU indices, plus the synthetic generators below.
   Not published yet.
@@ -52,10 +16,24 @@
   benchmark tables now live in `src/synthetic/` instead of `examples/commons/`,
   so the published numbers are reproducible outside this repository. Gridsearch
   commands are unchanged.
-
-**Fixes**
-
 - `clap` and `approx` moved to dev-dependencies.
+
+**Docs**
+
+- All published benchmark tables regenerated. Stale parameter descriptions and
+  measurement claims removed from the templates.
+- New `docs/benchmarks_knn_graph.md`, covering the self-kNN-graph paths: CPU
+  NN-Descent extract vs self-beam, the GPU/CAGRA equivalents, and the clustered
+  GPU builder.
+- SOAR, SOAR-PQ, SOAR-OPQ and the quantised HNSW now have benchmark sections and
+  entries in `fill_benchmarks.sh`. `--kind knn_graph` is the fifth kind.
+
+**Breaking changes**
+
+- `ExhaustiveSq8Index` and `IvfSq8Index` rebuilt on the shared-scale `u8`
+  quantiser. `build_exhaustive_sq8_index` and `build_ivf_sq8_index` gain an
+  `Option<UniformQuantParams>`. `ScalarQuantiser` and `VectorDistanceSq8` are
+  gone.
 
 ## 0.6.0
 
