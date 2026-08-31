@@ -2137,8 +2137,7 @@ where
 
         self.check_dim(dim_query)?;
 
-        let query_params =
-            query_params.unwrap_or_else(|| CagraGpuSearchParams::from_graph(k, self.k));
+        let query_params = query_params.unwrap_or_else(|| CagraGpuSearchParams::from_k(k));
         let n_entry = query_params.get_n_entry();
         self.ensure_gpu_tensors()?;
         let client = R::client(&self._device);
@@ -2304,8 +2303,7 @@ where
     {
         self.ensure_gpu_tensors()?;
 
-        let query_params =
-            query_params.unwrap_or_else(|| CagraGpuSearchParams::from_graph(k, self.k));
+        let query_params = query_params.unwrap_or_else(|| CagraGpuSearchParams::from_k(k));
         let n_entry = query_params.get_n_entry();
 
         let client = R::client(&self._device);

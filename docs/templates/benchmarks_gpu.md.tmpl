@@ -181,8 +181,8 @@ a linear-probing hash table for visited-node deduplication.
   Defaults to 5 + n^0.25, capped at 20. More trees raise the raw graph quality
   ceiling but increase build time linearly.
 * `beam_width`: Number of active candidates maintained during beam search.
-  Defaults to 2 * max(k_out, k_graph). Wider beams improve recall at the cost
-  of query latency. Auto-scaled when using CagraGpuSearchParams::from_graph().
+  Defaults to 2 * max(k_out, 16). Wider beams improve recall at the cost of
+  query latency. Auto-scaled when using CagraGpuSearchParams::from_k().
 * `max_beam_iters`: Safety cap on beam search iterations. Defaults to
   3 * beam_width. Most queries terminate naturally well before this limit; it
   only fires for pathological cases where the search keeps discovering better

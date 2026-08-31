@@ -24,7 +24,7 @@ import numpy as np
 from beartype import beartype
 
 from . import _ann_search as _core
-from ._base import BaseAnnIndex
+from ._base import BaseAnnIndex, ExtractKnnMixin
 from ._metrics import NO_MANHATTAN
 
 if not hasattr(_core, "ExhaustiveGpu"):  # pragma: no cover - build-dependent
@@ -129,16 +129,21 @@ class IvfGpuIndex(_BaseGpuIndex):
         )
 
 
-class CagraGpuIndex(_BaseGpuIndex):
+class CagraGpuIndex(ExtractKnnMixin, _BaseGpuIndex):
     """CAGRA graph: NN-Descent on the device, pruned, then beam-searched.
 
     The fastest route to a kNN graph here when a GPU is present. `beam_width` is
-    the recall knob; leaving it ``None`` lets the library size the beam from `k`
-    and the graph degree, which is usually the right answer.
+    the recall knob; leaving it ``None`` sizes the beam as ``2 * max(k, 16)``,
+    which is usually the right answer.
+
+    `extract_knn` hands back the kNN graph the descent converged on, taken
+    before the CAGRA prune. No kernel runs, and it is capped by `graph_degree`
+    rather than by the beam.
 
     Unlike every other index in this package, a fitted handle is not safe to
     query from two threads at once: the beam search memoises its upload of the
     navigational graph behind a mutable borrow, so concurrent calls serialise.
+    `extract_knn` is exempt.
     """
 
     _HANDLE: ClassVar[type] = _core.CagraGpu

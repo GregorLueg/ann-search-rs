@@ -1,6 +1,6 @@
 [package]
 name = "ann-search-py"
-version = "0.0.1"
+version = "0.7.0"
 edition = "2021"
 authors = ["Gregor Lueg <gregorlueg@me.com>"]
 license = "MIT"
