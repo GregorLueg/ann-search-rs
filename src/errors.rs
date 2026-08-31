@@ -143,6 +143,16 @@ pub enum AnnSearchErrors {
     #[error("Vector store is not available. Use build_with_vector_store() to enable reranking.")]
     VectorStoreNotAvailable,
 
+    /// An output buffer handed to a batch encoder is the wrong length
+    #[cfg(feature = "binary")]
+    #[error("Buffer must hold {expected} elements; it holds {actual}.")]
+    BufferLengthMismatch {
+        /// Length the callee requires
+        expected: usize,
+        /// Length the caller supplied
+        actual: usize,
+    },
+
     /// Size mismatch error for locally stored files
     #[cfg(feature = "binary")]
     #[error("Size mismatch: expected {expected} bytes, got {actual} bytes.")]

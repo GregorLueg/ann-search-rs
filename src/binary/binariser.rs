@@ -1,13 +1,14 @@
 //! Contains the binarisers
 
-use faer::{ColRef, Mat, MatRef};
-use faer_traits::ComplexField;
-use num_traits::{Float, FromPrimitive, ToPrimitive};
+use faer::linalg::matmul::matmul;
+use faer::{Accum, Col, ColRef, Mat, MatRef, Par, Side};
+use num_traits::{Float, FromPrimitive};
 use rand::rngs::StdRng;
 use rand::seq::SliceRandom;
 use rand::Rng;
 use rand::SeedableRng;
 use rand_distr::StandardNormal;
+use rayon::prelude::*;
 
 use crate::prelude::*;
 
@@ -52,6 +53,32 @@ const PCA_VARIANCE_EXPLAINED: f64 = 0.9;
 /// (gaussian) fixture and changes nothing on the structured ones, where the
 /// cumulative rule stops well short of the cap anyway.
 const PCA_MAX_COMPONENT_SHARE: f64 = 0.0625;
+
+/// Target footprint of the projection GEMM's output tile.
+///
+/// The tile holds `rows * n_bits` scores and the sign-packing pass that follows
+/// walks it one bit-column at a time, so it wants to stay resident in L2. The
+/// row count is derived from this rather than fixed, because `n_bits` reaches
+/// 512 and a flat 4096-row tile would be 8 MiB of `f32`.
+const ENCODE_TILE_BYTES: usize = 2 << 20;
+
+/// Floor on the projection tile's row count.
+///
+/// Below this the GEMM has too little work per rayon task to amortise the
+/// dispatch, whatever `n_bits` says.
+const ENCODE_TILE_MIN_ROWS: usize = 256;
+
+/// Ceiling on the projection tile's row count.
+///
+/// Matches the tile `cpu::lsh` uses for the same shape of work.
+const ENCODE_TILE_MAX_ROWS: usize = 4096;
+
+/// Rows per tile of the parallel reductions over the training sample.
+///
+/// Shared by the mean and the Gram accumulation. Only has to be large enough
+/// that the per-tile work dominates the rayon dispatch; fixing it also fixes
+/// the reduction order, which is what keeps a seed reproducible.
+const REDUCTION_ROW_TILE: usize = 4096;
 
 /// Initialisation of the binariser
 #[derive(Default, Eq, PartialEq)]
@@ -226,23 +253,95 @@ fn training_sample_indices(n: usize, seed: usize) -> Vec<usize> {
 /// The mean of each feature, length `dim`.
 fn feature_mean<T>(data: &[T], dim: usize, sample_indices: &[usize]) -> Vec<T>
 where
-    T: Float + FromPrimitive + ToPrimitive + ComplexField,
+    T: AnnSearchFloat,
 {
-    let mut mean = vec![T::zero(); dim];
+    // Fixed chunks summed in index order, for the reason on `gram_matrix`
+    let partials: Vec<Vec<T>> = sample_indices
+        .par_chunks(REDUCTION_ROW_TILE)
+        .map(|chunk| {
+            let mut acc = vec![T::zero(); dim];
+            for &idx in chunk {
+                T::add_assign_simd(&mut acc, &data[idx * dim..(idx + 1) * dim]);
+            }
+            acc
+        })
+        .collect();
 
-    for &idx in sample_indices {
-        let row = &data[idx * dim..(idx + 1) * dim];
-        for d in 0..dim {
-            mean[d] = mean[d] + row[d];
-        }
+    let mut mean = vec![T::zero(); dim];
+    for partial in &partials {
+        T::add_assign_simd(&mut mean, partial);
     }
 
     let n_t = T::from_usize(sample_indices.len().max(1)).unwrap();
-    for d in 0..dim {
-        mean[d] = mean[d] / n_t;
+    for m in mean.iter_mut() {
+        *m = *m / n_t;
     }
 
     mean
+}
+
+/// Centred Gram matrix `X_c^T X_c` of a row-major block
+///
+/// Rows are centred as they are copied into the tile, so the GEMM only ever
+/// sees mean-zero data. Accumulating `X^T X` and subtracting `n * mean mean^T`
+/// afterwards would be one pass cheaper, but it computes the covariance by
+/// cancellation: the accumulated magnitude is `n * mean^2` while the signal is
+/// `n * Var`, so at `T = f32` on data sitting far from the origin the leading
+/// digits cancel and the loadings come back as noise. The tile copy is
+/// `rows * dim` and cache resident, against a `rows * dim * dim` GEMM.
+///
+/// Tiles are reduced in index order rather than by `fold`/`reduce`, whose
+/// split points follow work stealing: float addition is not associative, and
+/// the crate promises a given seed reproduces a given index.
+///
+/// ### Params
+///
+/// * `data` - Rows, row-major, a multiple of `dim` long
+/// * `mean` - Per-feature mean to centre against, length `dim`
+/// * `dim` - Feature dimensionality
+///
+/// ### Returns
+///
+/// The `dim x dim` symmetric product of the centred rows.
+fn gram_matrix<T>(data: &[T], mean: &[T], dim: usize) -> Mat<f64>
+where
+    T: AnnSearchFloat,
+{
+    let partials: Vec<Mat<f64>> = data
+        .par_chunks(REDUCTION_ROW_TILE * dim)
+        .map(|rows_flat| {
+            let rows = rows_flat.len() / dim;
+
+            let mut centred = Vec::with_capacity(rows * dim);
+            for row in rows_flat.chunks_exact(dim) {
+                centred.extend(row.iter().zip(mean).map(|(&v, &m)| v - m));
+            }
+
+            let tile = MatRef::from_row_major_slice(&centred, rows, dim);
+            let mut local = Mat::<T>::zeros(dim, dim);
+            matmul(
+                local.as_mut(),
+                Accum::Replace,
+                tile.transpose(),
+                tile,
+                T::one(),
+                Par::Seq,
+            );
+
+            Mat::<f64>::from_fn(dim, dim, |i, j| local[(i, j)].to_f64().unwrap())
+        })
+        .collect();
+
+    let mut gram = Mat::<f64>::zeros(dim, dim);
+    for partial in &partials {
+        for j in 0..dim {
+            for i in 0..dim {
+                gram[(i, j)] += partial[(i, j)];
+            }
+        }
+    }
+
+    gram
 }
 
 /// Number of principal components worth spending bits on
@@ -322,7 +421,9 @@ where
 ///
 /// ### Params
 ///
-/// * `centred` - Centred training data, `n_samples * dim`
+/// * `data` - Training data, row-major, uncentred
+/// * `sample_indices` - Rows of `data` the PCA was fitted on
+/// * `mean` - Per-feature mean, length `dim`
 /// * `projections` - The `k` PCA loadings, row-major `k * dim`, rotated in place
 /// * `k` - Number of PCA components
 /// * `dim` - Feature dimensionality
@@ -333,19 +434,21 @@ where
 /// Gong and Lazebnik, "Iterative Quantization: A Procrustean Approach to
 /// Learning Binary Codes", CVPR 2011
 fn itq_rotate_projections<T>(
-    centred: MatRef<T>,
+    data: &[T],
+    sample_indices: &[usize],
+    mean: &[T],
     projections: &mut [T],
     k: usize,
     dim: usize,
     seed: usize,
 ) where
-    T: Float + FromPrimitive + ToPrimitive + ComplexField,
+    T: AnnSearchFloat,
 {
     if k == 0 {
         return;
     }
 
-    let n_rows = centred.nrows();
+    let n_rows = sample_indices.len();
     let n_itq = n_rows.min(MAX_SAMPLES_ITQ);
 
     // Draw the ITQ rows at random. `training_sample_indices` leaves the rows in
@@ -364,36 +467,86 @@ fn itq_rotate_projections<T>(
         idx
     };
 
+    // Only the rows the rotation reads get centred, not the whole PCA sample.
+    // Row-major matters here: `Mat::from_fn` fills column-major, so building
+    // this as a faer matrix touches one scattered element per source row per
+    // column over a working set well past L2.
+    let mut sample_flat = Vec::with_capacity(n_itq * dim);
+    for &i in &itq_rows {
+        let row = &data[sample_indices[i] * dim..(sample_indices[i] + 1) * dim];
+        sample_flat.extend(row.iter().zip(mean).map(|(&v, &m)| v - m));
+    }
+    let sample = MatRef::from_row_major_slice(&sample_flat, n_itq, dim);
+
     // PCA scores of the ITQ subsample: V = centred * loadings, n_itq x k.
     let loadings = Mat::<T>::from_fn(dim, k, |d, j| projections[j * dim + d]);
-    let sample = Mat::<T>::from_fn(n_itq, dim, |i, d| centred[(itq_rows[i], d)]);
-    let scores = sample * loadings;
+    let mut scores = Mat::<T>::zeros(n_itq, k);
+    matmul(
+        scores.as_mut(),
+        Accum::Replace,
+        sample,
+        loadings.as_ref(),
+        T::one(),
+        Par::Seq,
+    );
 
     // Random orthogonal k x k start. The Gram-Schmidt helper returns k
     // orthonormal rows of length k, which is exactly that.
     let r_flat = prepare_simhash_projections::<T>(k, k, seed);
     let mut rotation = Mat::<T>::from_fn(k, k, |i, j| r_flat[i * k + j]);
 
+    // Reused across iterations: faer's operators allocated four matrices per
+    // pass, which is what the loop was actually spending its time on. The GEMMs
+    // stay `Par::Seq` because `k` is capped at `n_bits / 16`, small enough that
+    // rayon dispatch costs about what the work does; threading them measured as
+    // no change.
+    let mut rotated = Mat::<T>::zeros(n_itq, k);
+    let mut b = Mat::<T>::zeros(n_itq, k);
+    let mut m = Mat::<T>::zeros(k, k);
+
     for _ in 0..ITQ_ITERATIONS {
         // B = sign(V R), with zero mapped to +1 so no entry is dropped
-        let rotated = scores.as_ref() * rotation.as_ref();
-        let b = Mat::<T>::from_fn(n_itq, k, |i, j| {
-            if rotated[(i, j)] >= T::zero() {
-                T::one()
-            } else {
-                -T::one()
+        matmul(
+            rotated.as_mut(),
+            Accum::Replace,
+            scores.as_ref(),
+            rotation.as_ref(),
+            T::one(),
+            Par::Seq,
+        );
+        for j in 0..k {
+            for i in 0..n_itq {
+                b[(i, j)] = if rotated[(i, j)] >= T::zero() {
+                    T::one()
+                } else {
+                    -T::one()
+                };
             }
-        });
+        }
 
         // Orthogonal Procrustes: argmin ||B - V R|| is U W^T for V^T B = U S W^T
-        let m = scores.transpose() * b;
+        matmul(
+            m.as_mut(),
+            Accum::Replace,
+            scores.as_ref().transpose(),
+            b.as_ref(),
+            T::one(),
+            Par::Seq,
+        );
         let svd = match m.as_ref().thin_svd() {
             Ok(svd) => svd,
             // A degenerate cross-product leaves the current rotation in place;
             // the codes stay valid, they just miss the balancing.
             Err(_) => return,
         };
-        rotation = svd.U() * svd.V().transpose();
+        matmul(
+            rotation.as_mut(),
+            Accum::Replace,
+            svd.U(),
+            svd.V().transpose(),
+            T::one(),
+            Par::Seq,
+        );
     }
 
     // Fold the rotation back into the loadings: bit j reads the direction
@@ -420,9 +573,19 @@ fn itq_rotate_projections<T>(
 ///
 /// ### Algorithm
 ///
-/// 1. Sample and centre training data
-/// 2. Compute thin SVD to obtain the top-k right singular vectors (loadings)
+/// 1. Sample the training data and take its per-feature mean
+/// 2. Accumulate the centred Gram matrix `X^T X - n * mean mean^T` and take its
+///    eigendecomposition; the leading eigenvectors are the loadings. Going
+///    through the `dim x dim` Gram matrix rather than an SVD of a centred copy
+///    of the data avoids materialising that copy at all.
 /// 3. Rotate the loadings with ITQ so variance is spread evenly across bits
+///
+/// Eigenvector signs are arbitrary, so the loadings are not reproducible
+/// against an implementation that takes the SVD instead. On the raw loadings a
+/// sign flip would be a relabelling, flipping bit `j` for data and query alike
+/// and leaving Hamming distances untouched, but ITQ runs afterwards from a
+/// fixed initial rotation that does not flip with them, so the codes really do
+/// differ. Recall parity is therefore a measurement, not a proof.
 ///
 /// Step 3 is not optional in practice. Raw PCA loadings put nearly all the
 /// variance in the leading components, so the trailing sign bits are decided
@@ -459,7 +622,7 @@ fn prepare_pca_projections<T>(
     seed: usize,
 ) -> (Vec<T>, Vec<T>)
 where
-    T: Float + FromPrimitive + ToPrimitive + ComplexField,
+    T: AnnSearchFloat,
 {
     let effective_bits = n_bits.min(dim);
 
@@ -467,37 +630,64 @@ where
     let n_samples = sample_indices.len();
     let mean = feature_mean(data, dim, &sample_indices);
 
-    // centre data
-    let mut centered = Mat::<T>::zeros(n_samples, dim);
-    for (i, &idx) in sample_indices.iter().enumerate() {
-        let row = &data[idx * dim..(idx + 1) * dim];
-        for d in 0..dim {
-            centered[(i, d)] = row[d] - mean[d];
+    // Below the cap the sample is the dataset in order, so the raw slice is
+    // already the contiguous block the GEMM wants and no gather is needed.
+    let gathered: Option<Vec<T>> = if n_samples == n {
+        None
+    } else {
+        let mut buf = Vec::with_capacity(n_samples * dim);
+        for &idx in &sample_indices {
+            buf.extend_from_slice(&data[idx * dim..(idx + 1) * dim]);
         }
-    }
+        Some(buf)
+    };
+    let sample: &[T] = gathered.as_deref().unwrap_or(&data[..n_samples * dim]);
 
-    // thin SVD to obtain loadings
-    let svd = centered.as_ref().thin_svd().unwrap();
-    let v_full = svd.V(); // dim x min(n_samples, dim)
+    // The loadings are the eigenvectors of the centred covariance, reached
+    // through the `dim x dim` Gram matrix rather than an SVD of an
+    // `n_samples x dim` centred copy of the data.
+    let gram = gram_matrix(sample, &mean, dim);
+
+    let eigen = match gram.as_ref().self_adjoint_eigen(Side::Lower) {
+        Ok(eigen) => eigen,
+        // No usable spectrum means no usable loadings. Random hyperplanes are a
+        // valid binariser, so spend every bit on one rather than panicking.
+        Err(_) => return (prepare_simhash_projections(dim, n_bits, seed), mean),
+    };
+
+    // faer orders eigenvalues nondecreasing; PCA wants the leading directions
+    // first, so everything below indexes from the far end.
+    let eigenvalues = eigen.S().column_vector();
+    let n_eig = eigenvalues.nrows();
+    let singular = Col::<T>::from_fn(n_eig, |j| {
+        let lambda = eigenvalues[n_eig - 1 - j].max(0.0);
+        T::from_f64(lambda.sqrt()).unwrap()
+    });
 
     let cap = ((n_bits as f64 * PCA_MAX_COMPONENT_SHARE) as usize).max(1);
-    let k = retained_components(
-        svd.S().column_vector(),
-        effective_bits.min(v_full.ncols()),
-        cap,
-    );
+    let k = retained_components(singular.as_ref(), effective_bits.min(n_eig), cap);
 
+    let u = eigen.U();
     let mut projections = Vec::with_capacity(n_bits * dim);
     for j in 0..k {
+        let col = n_eig - 1 - j;
         for i in 0..dim {
-            projections.push(v_full[(i, j)]);
+            projections.push(T::from_f64(u[(i, col)]).unwrap());
         }
     }
 
     // Balance variance across the PCA bits before any padding is appended, so
     // the rotation spans exactly the retained block and never mixes the noise
     // subspace back into every bit.
-    itq_rotate_projections(centered.as_ref(), &mut projections, k, dim, seed);
+    itq_rotate_projections(
+        data,
+        &sample_indices,
+        &mean,
+        &mut projections,
+        k,
+        dim,
+        seed,
+    );
 
     // Spend the remaining bits on random hyperplanes
     if n_bits > k {
@@ -533,7 +723,7 @@ fn encode_with_projections<T>(
     dim: usize,
 ) -> Result<Vec<u8>, AnnSearchErrors>
 where
-    T: Float,
+    T: AnnSearchFloat,
 {
     if vec.len() != dim {
         return Err(AnnSearchErrors::DimensionMismatch {
@@ -542,20 +732,20 @@ where
         });
     }
 
-    let n_bytes = n_bits / 8;
+    let n_bytes = n_bits.div_ceil(8);
     let mut binary = vec![0u8; n_bytes];
 
+    // Centre once, not once per bit: the subtraction used to sit in the
+    // innermost loop and ran `n_bits` times for every dimension.
+    let centred: Vec<T> = if mean.is_empty() {
+        Vec::new()
+    } else {
+        vec.iter().zip(mean).map(|(&v, &m)| v - m).collect()
+    };
+    let row = if mean.is_empty() { vec } else { &centred };
+
     for bit_idx in 0..n_bits {
-        let proj_base = bit_idx * dim;
-        let mut dot = T::zero();
-        for d in 0..dim {
-            let centered = if mean.is_empty() {
-                vec[d]
-            } else {
-                vec[d] - mean[d]
-            };
-            dot = dot + centered * projections[proj_base + d];
-        }
+        let dot = T::dot_simd(&projections[bit_idx * dim..(bit_idx + 1) * dim], row);
 
         if dot >= T::zero() {
             let byte_idx = bit_idx / 8;
@@ -565,6 +755,111 @@ where
     }
 
     Ok(binary)
+}
+
+/// Rows per tile of the projection GEMM
+///
+/// Derived from [`ENCODE_TILE_BYTES`] so the intermediate stays cache resident
+/// whatever `n_bits` is, then clamped to [`ENCODE_TILE_MIN_ROWS`] and
+/// [`ENCODE_TILE_MAX_ROWS`].
+///
+/// ### Params
+///
+/// * `n_bits` - Number of bits the binariser emits
+///
+/// ### Returns
+///
+/// Number of rows per tile.
+fn encode_tile_rows<T>(n_bits: usize) -> usize {
+    let per_row = n_bits.max(1) * std::mem::size_of::<T>();
+    (ENCODE_TILE_BYTES / per_row.max(1)).clamp(ENCODE_TILE_MIN_ROWS, ENCODE_TILE_MAX_ROWS)
+}
+
+/// Encode every row against a set of hyperplanes, tiled and in parallel
+///
+/// The scalar counterpart, [`encode_with_projections`], is an `n_bits * dim`
+/// dot-product loop per vector; over the whole dataset that is a dense
+/// `(n x dim) * (dim x n_bits)` product, so it goes through faer instead. Outer
+/// parallelism is rayon over row tiles, hence `Par::Seq` on the GEMM itself.
+///
+/// Rows are centred into a scratch buffer rather than folding the mean into a
+/// per-bit threshold. The threshold form saves the copy and is algebraically
+/// identical, but `dot(v, p) >= dot(mean, p)` and `dot(v - mean, p) >= 0` are
+/// not identical in floating point. Queries go through the scalar encoder, so
+/// the two must agree bit for bit or a vector in the index stops matching
+/// itself at Hamming distance zero.
+///
+/// ### Params
+///
+/// * `data` - Rows to encode, row-major, `n * dim`
+/// * `projections` - Hyperplanes, row-major `n_bits * dim`
+/// * `mean` - Per-feature mean, empty when the method does not centre
+/// * `n_bits` - Number of bits
+/// * `dim` - Feature dimensionality
+/// * `out` - Destination codes, `n * n_bits.div_ceil(8)` bytes, overwritten
+fn encode_all_with_projections<T>(
+    data: &[T],
+    projections: &[T],
+    mean: &[T],
+    n_bits: usize,
+    dim: usize,
+    out: &mut [u8],
+) where
+    T: AnnSearchFloat,
+{
+    let n_bytes = n_bits.div_ceil(8);
+    let tile_rows = encode_tile_rows::<T>(n_bits);
+    let proj = MatRef::from_row_major_slice(projections, n_bits, dim);
+
+    data.par_chunks(tile_rows * dim)
+        .zip(out.par_chunks_mut(tile_rows * n_bytes))
+        .for_each_init(
+            || (Mat::<T>::zeros(0, 0), Vec::<T>::new()),
+            |(tile, centred), (rows_flat, codes)| {
+                let rows = rows_flat.len() / dim;
+
+                let rows_ref = if mean.is_empty() {
+                    MatRef::from_row_major_slice(rows_flat, rows, dim)
+                } else {
+                    centred.clear();
+                    centred.reserve(rows * dim);
+                    for row in rows_flat.chunks_exact(dim) {
+                        centred.extend(row.iter().zip(mean).map(|(&v, &m)| v - m));
+                    }
+                    MatRef::from_row_major_slice(centred, rows, dim)
+                };
+
+                if tile.nrows() != rows || tile.ncols() != n_bits {
+                    *tile = Mat::<T>::zeros(rows, n_bits);
+                }
+
+                matmul(
+                    tile.as_mut(),
+                    Accum::Replace,
+                    rows_ref,
+                    proj.transpose(),
+                    T::one(),
+                    Par::Seq,
+                );
+
+                // Load-bearing: the packing loop below only ORs
+                codes.fill(0);
+
+                // Bit index outer: faer is column-major, so a fixed bit is one
+                // contiguous column of the tile. The natural row-outer order
+                // reads it with stride `rows` and thrashes.
+                for j in 0..n_bits {
+                    let byte = j / 8;
+                    let mask = 1u8 << (j % 8);
+
+                    for r in 0..rows {
+                        if tile[(r, j)] >= T::zero() {
+                            codes[r * n_bytes + byte] |= mask;
+                        }
+                    }
+                }
+            },
+        );
 }
 
 /// Encode a vector to binary using sign-based binarisation
@@ -581,18 +876,30 @@ where
 ///
 /// Binary code as Vec<u8> (length = (dim + 7) / 8)
 fn encode_sign_based<T: Float>(vec: &[T], dim: usize) -> Vec<u8> {
-    let n_bytes = dim.div_ceil(8);
-    let mut binary = vec![0u8; n_bytes];
+    let mut binary = vec![0u8; dim.div_ceil(8)];
+    encode_sign_based_into(vec, &mut binary);
+
+    binary
+}
+
+/// Sign-encode a vector into a caller-owned buffer
+///
+/// The allocation-free half of [`encode_sign_based`], so the batch encoder can
+/// write straight into the flat code array.
+///
+/// ### Params
+///
+/// * `vec` - Input vector
+/// * `out` - Destination code, `vec.len().div_ceil(8)` bytes. Zeroed on entry.
+fn encode_sign_based_into<T: Float>(vec: &[T], out: &mut [u8]) {
+    // Load-bearing: the bit loop only ORs, so a reused buffer keeps stale bits
+    out.fill(0);
 
     for (bit_idx, &val) in vec.iter().enumerate() {
         if val >= T::zero() {
-            let byte_idx = bit_idx / 8;
-            let bit_pos = bit_idx % 8;
-            binary[byte_idx] |= 1u8 << bit_pos;
+            out[bit_idx / 8] |= 1u8 << (bit_idx % 8);
         }
     }
-
-    binary
 }
 
 /// Sign-encode the residual of `vec` against `centroid`, in place
@@ -657,7 +964,7 @@ pub struct Binariser<T> {
 
 impl<T> Binariser<T>
 where
-    T: Float + FromPrimitive + ToPrimitive + ComplexField,
+    T: AnnSearchFloat,
 {
     /// Create a new binariser using random projections (SimHash)
     ///
@@ -799,6 +1106,55 @@ where
             }
             BinarisationMethod::SignBased => Ok(encode_sign_based(vec, self.dim)),
         }
+    }
+
+    /// Encode a whole dataset in one go
+    ///
+    /// The projection methods go through a tiled, rayon-parallel GEMM rather
+    /// than `n` calls to [`Self::encode`]: encoding the dataset *is* a dense
+    /// `(n x dim) * (dim x n_bits)` product, and doing it one row at a time
+    /// costs both the arithmetic and a heap allocation per vector. Sign-based
+    /// codes have no projection to batch, so they simply fan out over rows.
+    ///
+    /// ### Params
+    ///
+    /// * `data` - Rows to encode, row-major, `n * dim`
+    /// * `n` - Number of rows
+    /// * `out` - Destination, `n * self.n_bytes()` bytes. Overwritten in full.
+    ///
+    /// ### Returns
+    ///
+    /// `Ok(())`, or [`AnnSearchErrors::BufferLengthMismatch`] when `data` is
+    /// not `n * dim` long or `out` is not `n * self.n_bytes()` long.
+    pub fn encode_all(&self, data: &[T], n: usize, out: &mut [u8]) -> Result<(), AnnSearchErrors> {
+        if data.len() != n * self.dim {
+            return Err(AnnSearchErrors::BufferLengthMismatch {
+                expected: n * self.dim,
+                actual: data.len(),
+            });
+        }
+
+        let n_bytes = self.n_bytes();
+        if out.len() != n * n_bytes {
+            return Err(AnnSearchErrors::BufferLengthMismatch {
+                expected: n * n_bytes,
+                actual: out.len(),
+            });
+        }
+
+        match &self.method {
+            BinarisationMethod::SimHash { projections, mean }
+            | BinarisationMethod::PcaHashing { projections, mean } => {
+                encode_all_with_projections(data, projections, mean, self.n_bits, self.dim, out);
+            }
+            BinarisationMethod::SignBased => {
+                out.par_chunks_mut(n_bytes)
+                    .zip(data.par_chunks(self.dim))
+                    .for_each(|(code, row)| encode_sign_based_into(row, code));
+            }
+        }
+
+        Ok(())
     }
 
     /// Encode a vector as the sign of its residual against a centroid
@@ -1539,6 +1895,373 @@ mod tests {
 
             let set: u32 = code.iter().map(|b| b.count_ones()).sum();
             assert_eq!(set, dim as u32, "padding bits leaked at dim = {dim}");
+        }
+    }
+
+    /// `encode_all` is the only encoder the build path uses now, so it has to
+    /// agree with the per-vector one exactly. `dim` is deliberately not a
+    /// multiple of the SIMD width and `n` not a multiple of the tile, so the
+    /// remainder handling in both is exercised.
+    #[test]
+    fn test_encode_all_matches_per_vector_encode() {
+        let n = 9_001;
+        let dim = 37;
+        let n_bits = 128;
+
+        let mut data = vec![0.0f64; n * dim];
+        for (i, v) in data.iter_mut().enumerate() {
+            *v = ((i as f64) * 0.7).sin() * 3.0 + ((i % 17) as f64) - 8.0;
+        }
+
+        let simhash = Binariser::<f64>::new_simhash(&data, n, dim, n_bits, 42).unwrap();
+        let pca = Binariser::<f64>::new_pca_hashing(&data, n, dim, n_bits, 42).unwrap();
+        let sign = Binariser::<f64>::new_sign_based(dim);
+
+        for binariser in [simhash, pca, sign] {
+            let n_bytes = binariser.n_bytes();
+            let mut batched = vec![0u8; n * n_bytes];
+            binariser.encode_all(&data, n, &mut batched).unwrap();
+
+            for i in 0..n {
+                let one = binariser.encode(&data[i * dim..(i + 1) * dim]).unwrap();
+                assert_eq!(
+                    &batched[i * n_bytes..(i + 1) * n_bytes],
+                    &one[..],
+                    "row {i} disagrees at n_bits {}",
+                    binariser.n_bits
+                );
+            }
+        }
+    }
+
+    /// Length mistakes are the easy way to corrupt a flat code array, so they
+    /// have to be errors rather than a panic or a silent partial write.
+    #[test]
+    fn test_encode_all_rejects_bad_lengths() {
+        let (n, dim, n_bits) = (16, 8, 32);
+        let data = vec![0.5f64; n * dim];
+        let binariser = Binariser::<f64>::new_simhash(&data, n, dim, n_bits, 42).unwrap();
+
+        let mut out = vec![0u8; n * binariser.n_bytes()];
+        assert!(matches!(
+            binariser.encode_all(&data[..(n - 1) * dim], n, &mut out),
+            Err(AnnSearchErrors::BufferLengthMismatch { .. })
+        ));
+
+        let mut short = vec![0u8; n * binariser.n_bytes() - 1];
+        assert!(matches!(
+            binariser.encode_all(&data, n, &mut short),
+            Err(AnnSearchErrors::BufferLengthMismatch { .. })
+        ));
+    }
+
+    /// The Gram path replaced a `thin_svd` of the centred data. It has to
+    /// recover the same principal subspace and the same spectrum; only the sign
+    /// of each eigenvector is free, and a sign flip flips one bit for every
+    /// vector alike, so it leaves Hamming distances untouched.
+    #[test]
+    fn test_gram_matches_thin_svd_loadings() {
+        let (n, dim) = (600, 12);
+
+        let mut data = vec![0.0f64; n * dim];
+        for i in 0..n {
+            for j in 0..dim {
+                let mut x = (i as u64)
+                    .wrapping_mul(0x9E37_79B9_7F4A_7C15)
+                    .wrapping_add((j as u64).wrapping_mul(0xC2B2_AE3D_27D4_EB4F));
+                x ^= x >> 33;
+                x = x.wrapping_mul(0xFF51_AFD7_ED55_8CCD);
+                x ^= x >> 33;
+                let unit = (x as f64 / u64::MAX as f64) * 2.0 - 1.0;
+                data[i * dim + j] = unit * (1.0 + j as f64) + 4.0;
+            }
+        }
+
+        let indices: Vec<usize> = (0..n).collect();
+        let mean = feature_mean(&data, dim, &indices);
+
+        // Reference: SVD of the explicitly centred matrix
+        let centred = Mat::<f64>::from_fn(n, dim, |i, d| data[i * dim + d] - mean[d]);
+        let svd = centred.as_ref().thin_svd().unwrap();
+
+        // Under test: eigendecomposition of the centred Gram matrix
+        let gram = gram_matrix(&data, &mean, dim);
+        let eigen = gram.as_ref().self_adjoint_eigen(Side::Lower).unwrap();
+        let eigenvalues = eigen.S().column_vector();
+
+        for j in 0..dim {
+            let from_gram = eigenvalues[dim - 1 - j].max(0.0).sqrt();
+            approx::assert_relative_eq!(from_gram, svd.S()[j], epsilon = 1e-6, max_relative = 1e-6);
+
+            // Same direction up to sign
+            let dot: f64 = (0..dim)
+                .map(|i| eigen.U()[(i, dim - 1 - j)] * svd.V()[(i, j)])
+                .sum();
+            approx::assert_relative_eq!(dot.abs(), 1.0, epsilon = 1e-6);
+        }
+    }
+
+    /// The tiled accumulation must agree with the obvious double loop, and it
+    /// has to handle a row count that is not a multiple of the tile.
+    #[test]
+    fn test_gram_matrix_matches_direct_accumulation() {
+        let (n, dim) = (REDUCTION_ROW_TILE + 137, 5);
+
+        let mut data = vec![0.0f32; n * dim];
+        for (i, v) in data.iter_mut().enumerate() {
+            *v = ((i % 23) as f32) * 0.25 - 2.0;
+        }
+
+        let mean = feature_mean(&data, dim, &(0..n).collect::<Vec<_>>());
+        let gram = gram_matrix(&data, &mean, dim);
+
+        for a in 0..dim {
+            for b in 0..dim {
+                let direct: f64 = (0..n)
+                    .map(|i| {
+                        (data[i * dim + a] - mean[a]) as f64 * (data[i * dim + b] - mean[b]) as f64
+                    })
+                    .sum();
+                approx::assert_relative_eq!(gram[(a, b)], direct, max_relative = 1e-4);
+            }
+        }
+    }
+
+    /// The reason `gram_matrix` centres on the way in rather than accumulating
+    /// `X^T X` and subtracting `n * mean mean^T` afterwards. The correction form
+    /// computes the covariance by cancellation: accumulated magnitude is
+    /// `n * mean^2` while the signal is `n * Var`, so at `f32` on data far from
+    /// the origin the leading digits cancel and the loadings come back as noise.
+    /// This is the crate's off-origin shape pushed out to 500.
+    #[test]
+    fn test_gram_matrix_survives_large_mean_at_f32() {
+        let (n, dim) = (60_000, 8);
+
+        let mut data = vec![0.0f32; n * dim];
+        for i in 0..n {
+            for j in 0..dim {
+                let mut x = (i as u64)
+                    .wrapping_mul(0x9E37_79B9_7F4A_7C15)
+                    .wrapping_add((j as u64).wrapping_mul(0xC2B2_AE3D_27D4_EB4F));
+                x ^= x >> 33;
+                x = x.wrapping_mul(0xFF51_AFD7_ED55_8CCD);
+                x ^= x >> 33;
+                let unit = (x as f32 / u64::MAX as f32) * 2.0 - 1.0;
+                data[i * dim + j] = 500.0 + unit;
+            }
+        }
+
+        let mean = feature_mean(&data, dim, &(0..n).collect::<Vec<_>>());
+        let gram = gram_matrix(&data, &mean, dim);
+
+        // Reference in f64, centred on the same f32 mean, so only the
+        // accumulation precision is under test.
+        for a in 0..dim {
+            for b in 0..dim {
+                let direct: f64 = (0..n)
+                    .map(|i| {
+                        (data[i * dim + a] - mean[a]) as f64 * (data[i * dim + b] - mean[b]) as f64
+                    })
+                    .sum();
+                let scale = (n as f64) / 3.0;
+                assert!(
+                    (gram[(a, b)] - direct).abs() < 0.02 * scale,
+                    "entry ({a}, {b}) is {} against {direct}; cancellation is back",
+                    gram[(a, b)]
+                );
+            }
+        }
+    }
+
+    /// PCA hashing end to end on off-origin `f32` data.
+    ///
+    /// Asserts the recovered loadings against an `f64` reference eigen-
+    /// decomposition of the explicitly centred data, because that is what
+    /// actually degrades. Bit balance is not a usable proxy here: ITQ rotates
+    /// the retained block to spread variance evenly, so the bits come out
+    /// balanced whether or not the loadings are directions in the data.
+    #[test]
+    fn test_pca_hashing_off_origin_f32() {
+        let (n, dim, n_bits) = (40_000, 32, 256);
+
+        let mut data = vec![0.0f32; n * dim];
+        for i in 0..n {
+            for j in 0..dim {
+                let mut x = (i as u64)
+                    .wrapping_mul(0x9E37_79B9_7F4A_7C15)
+                    .wrapping_add((j as u64).wrapping_mul(0xD6E8_FEB8_6659_FD93));
+                x ^= x >> 33;
+                x = x.wrapping_mul(0xFF51_AFD7_ED55_8CCD);
+                x ^= x >> 33;
+                let unit = (x as f32 / u64::MAX as f32) * 2.0 - 1.0;
+                // Structure worth finding, sitting 500 away from the origin
+                data[i * dim + j] = 500.0 + unit * (1.0 + (j % 4) as f32);
+            }
+        }
+
+        let indices: Vec<usize> = (0..n).collect();
+        let mean = feature_mean(&data, dim, &indices);
+
+        // Reference: centre in f64 first, so no cancellation anywhere
+        let centred = Mat::<f64>::from_fn(n, dim, |i, d| {
+            data[i * dim + d] as f64 - mean[d] as f64
+        });
+        let mut reference = Mat::<f64>::zeros(dim, dim);
+        matmul(
+            reference.as_mut(),
+            Accum::Replace,
+            centred.as_ref().transpose(),
+            centred.as_ref(),
+            1.0,
+            Par::Seq,
+        );
+        let want = reference.as_ref().self_adjoint_eigen(Side::Lower).unwrap();
+
+        let binariser = Binariser::<f32>::new_pca_hashing(&data, n, dim, n_bits, 42).unwrap();
+        let BinarisationMethod::PcaHashing { projections, .. } = &binariser.method else {
+            panic!("Expected PcaHashing method");
+        };
+        assert_eq!(projections.len(), n_bits * dim);
+
+        // `k` retained loadings, then random padding. The cap is
+        // `n_bits * PCA_MAX_COMPONENT_SHARE`, and ITQ mixes within that block,
+        // so compare the subspace the block spans rather than each direction:
+        // every retained loading must lie in the span of the reference's
+        // leading `k` eigenvectors.
+        let k = ((n_bits as f64 * PCA_MAX_COMPONENT_SHARE) as usize).max(1).min(dim);
+        assert!(
+            k < dim,
+            "with k == dim the reference subspace is the whole space and this \
+             assertion is vacuous"
+        );
+
+        for b in 0..k {
+            let loading = &projections[b * dim..(b + 1) * dim];
+
+            let norm: f32 = loading.iter().map(|x| x * x).sum::<f32>().sqrt();
+            assert!(
+                (norm - 1.0).abs() < 1e-4,
+                "loading {b} is not a unit hyperplane: {norm}"
+            );
+
+            let captured: f64 = (0..k)
+                .map(|j| {
+                    let col = dim - 1 - j;
+                    let dot: f64 = (0..dim)
+                        .map(|i| loading[i] as f64 * want.U()[(i, col)])
+                        .sum();
+                    dot * dot
+                })
+                .sum();
+
+            assert!(
+                captured > 0.99,
+                "loading {b} lies mostly outside the true leading subspace \
+                 (captured {captured:.4}); the covariance is noise"
+            );
+        }
+    }
+
+    /// `encode_all` and `encode` must agree at `f32`, the precision that
+    /// actually separates centring the rows from folding the mean into a
+    /// per-bit threshold.
+    #[test]
+    fn test_encode_all_matches_per_vector_encode_f32() {
+        let n = 5_003;
+        let dim = 24;
+        let n_bits = 64;
+
+        let mut data = vec![0.0f32; n * dim];
+        for (i, v) in data.iter_mut().enumerate() {
+            *v = 200.0 + ((i as f32) * 0.13).sin() * 2.0;
+        }
+
+        for binariser in [
+            Binariser::<f32>::new_simhash(&data, n, dim, n_bits, 7).unwrap(),
+            Binariser::<f32>::new_pca_hashing(&data, n, dim, n_bits, 7).unwrap(),
+        ] {
+            let n_bytes = binariser.n_bytes();
+            let mut batched = vec![0u8; n * n_bytes];
+            binariser.encode_all(&data, n, &mut batched).unwrap();
+
+            for i in 0..n {
+                let one = binariser.encode(&data[i * dim..(i + 1) * dim]).unwrap();
+                assert_eq!(
+                    &batched[i * n_bytes..(i + 1) * n_bytes],
+                    &one[..],
+                    "row {i} disagrees"
+                );
+            }
+        }
+    }
+
+    /// A given seed has to reproduce a given index. The parallel reductions in
+    /// `feature_mean` and `gram_matrix` are the risk: `fold`/`reduce` splits on
+    /// work stealing and float addition is not associative. Unlike
+    /// `test_deterministic` this fixture is not all zeros, so the partial sums
+    /// have something to disagree about.
+    #[test]
+    fn test_pca_fit_is_reproducible_across_runs() {
+        let (n, dim, n_bits) = (30_000, 12, 64);
+
+        let mut data = vec![0.0f32; n * dim];
+        for (i, v) in data.iter_mut().enumerate() {
+            let mut x = (i as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+            x ^= x >> 33;
+            x = x.wrapping_mul(0xFF51_AFD7_ED55_8CCD);
+            x ^= x >> 33;
+            *v = 30.0 + (x as f32 / u64::MAX as f32) * 4.0;
+        }
+
+        let first = Binariser::<f32>::new_pca_hashing(&data, n, dim, n_bits, 11).unwrap();
+        let second = Binariser::<f32>::new_pca_hashing(&data, n, dim, n_bits, 11).unwrap();
+
+        let (
+            BinarisationMethod::PcaHashing {
+                projections: p1,
+                mean: m1,
+            },
+            BinarisationMethod::PcaHashing {
+                projections: p2,
+                mean: m2,
+            },
+        ) = (&first.method, &second.method)
+        else {
+            panic!("Expected PcaHashing method");
+        };
+
+        assert_eq!(m1, m2, "the fitted mean is not reproducible");
+        assert_eq!(p1, p2, "the fitted projections are not reproducible");
+    }
+
+    /// A fit with fewer rows than features has a null space, and a null-space
+    /// eigenvector is not a direction in the data. Every emitted bit still has
+    /// to be a usable unit hyperplane.
+    #[test]
+    fn test_fewer_samples_than_features() {
+        let (n, dim, n_bits) = (20, 64, 128);
+
+        let mut data = vec![0.0f64; n * dim];
+        for (i, v) in data.iter_mut().enumerate() {
+            *v = ((i as f64) * 0.37).cos();
+        }
+
+        let binariser = Binariser::<f64>::new_pca_hashing(&data, n, dim, n_bits, 3).unwrap();
+        let BinarisationMethod::PcaHashing { projections, .. } = &binariser.method else {
+            panic!("Expected PcaHashing method");
+        };
+        assert_eq!(projections.len(), n_bits * dim);
+
+        for i in 0..n_bits {
+            let norm: f64 = projections[i * dim..(i + 1) * dim]
+                .iter()
+                .map(|x| x * x)
+                .sum::<f64>()
+                .sqrt();
+            assert!(
+                (norm - 1.0).abs() < 1e-6,
+                "projection {i} is not a unit hyperplane: {norm}"
+            );
         }
     }
 

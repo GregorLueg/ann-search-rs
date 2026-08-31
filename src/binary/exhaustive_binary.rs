@@ -134,11 +134,8 @@ where
         // that argument and emits `dim` bits
         let n_bytes = binariser.n_bytes();
 
-        let mut vectors_flat_binarised: Vec<u8> = Vec::with_capacity(n * n_bytes);
-
-        for row in vectors_flat.chunks_exact(dim) {
-            vectors_flat_binarised.extend(binariser.encode(row)?);
-        }
+        let mut vectors_flat_binarised = vec![0u8; n * n_bytes];
+        binariser.encode_all(&vectors_flat, n, &mut vectors_flat_binarised)?;
 
         Ok(Self {
             vectors_flat_binarised,
@@ -201,23 +198,15 @@ where
         // that argument and emits `dim` bits
         let n_bytes = binariser.n_bytes();
 
-        let mut vectors_flat_binarised: Vec<u8> = Vec::with_capacity(n * n_bytes);
-
-        for row in vectors_flat.chunks_exact(dim) {
-            vectors_flat_binarised.extend(binariser.encode(row)?);
-        }
+        let mut vectors_flat_binarised = vec![0u8; n * n_bytes];
+        binariser.encode_all(&vectors_flat, n, &mut vectors_flat_binarised)?;
 
         // Save vector store
         std::fs::create_dir_all(&save_path)?;
 
         let norms: Vec<T> = vectors_flat
-            .chunks_exact(dim)
-            .map(|row| {
-                row.iter()
-                    .map(|&x| x * x)
-                    .fold(T::zero(), |a, b| a + b)
-                    .sqrt()
-            })
+            .par_chunks_exact(dim)
+            .map(T::calculate_l2_norm)
             .collect();
 
         let (vectors_path, norms_path) = MmapVectorStore::<T>::paths_in(&save_path);

@@ -50,18 +50,36 @@ Three binarisations are offered in this crate:
 
 - **SimHash**: Projects vectors onto random hyperplanes and encodes the sign of
   each projection as a bit. The random planes are orthogonalised to improve
-  coverage of the vector space.
-- **PCA Hashing**: Uses PCA to find the axes of maximum variance in the data,
-  then binarises by taking the sign of each data point's projection onto the
-  top principal components. More expensive to build than SimHash but tends to
-  yield better recall as the projections are data-adapted rather than random.
-  If the number of requested bits exceeds the dimensionality, the excess bits
-  are filled with random orthogonal projections.
-- **Signed**: Simply encodes the sign of each embedding dimension directly as
-  a bit, meaning n_bits is fixed to the number of dimensions. Straightforward
-  but only sensible for high-dimensional data; at low dimensionality the recall
-  degrades dramatically. In the IVF version, the signed version is based on
-  the sign of the residual of the centroid to increase performance.
+  coverage of the vector space. The training data is only used to fit a
+  per-feature mean: the hyperplanes pass through the origin, so on data sitting
+  far from it every bit would otherwise land on the same side of every plane.
+- **PCA Hashing**: Fits PCA on the (centred) training data and takes the sign of
+  each point's score on a principal component as a bit. Only the leading
+  components that cumulatively explain 90% of the variance are kept, and that
+  count is capped at a sixteenth of the bit budget. The retained block is then
+  rotated by ITQ (Gong and Lazebnik, "Iterative Quantization: A Procrustean
+  Approach to Learning Binary Codes", CVPR 2011), which spreads variance evenly
+  across those bits: raw PCA loadings pile nearly all of it into the first few
+  components, leaving the trailing sign bits decided by rounding noise while
+  they still count for a full unit of Hamming distance.
+
+  Every bit past the retained block is a random orthogonal hyperplane, and that
+  padding is the normal case rather than an edge case. At 512 bits at most 32
+  are PCA bits, whatever the dimensionality. The cap is deliberate: past the
+  genuinely structured directions a random hyperplane beats a PCA one, because
+  it preserves angular distance by construction and a low-variance loading does
+  not.
+
+  More expensive to build than SimHash. Whether the data-adapted bits actually
+  buy recall depends on the spectrum, so read it off the tables below rather
+  than assuming they do.
+- **Sign-based**: Simply encodes the sign of each embedding dimension directly
+  as a bit, meaning `n_bits` is fixed to the number of dimensions.
+  Straightforward but only sensible for high-dimensional data; at low
+  dimensionality the recall degrades dramatically. In the IVF version it encodes
+  the sign of the residual against each vector's own cell centroid instead,
+  because a global sign bit tells you which cluster a point is in rather than
+  where it sits inside that cluster.
 
 These indices can keep the original vectors in a `VecStore` on disk for
 re-ranking. Recommended if you want the recall to stay usable. Their home ground
@@ -70,14 +88,17 @@ is very high-dimensional data where memory is the binding constraint.
 **Tunable parameters *(general)*:**
 
 - *n_bits*: How many bits to encode each vector into. More bits, better recall,
-  bigger index.
-- *binarisation_init*: Three options are provided in the crate. `"random"` that
-  generates random planes that are subsequently orthogonalised, `"pca"` that
-  leverages PCA to identify axis of maximum variation or `"signed"` that just
-  uses the sign of the respective embedding dimensions (or residual for the
-  IVF). In this case, `n_bits` is set automatically to `n_dim`. Signed only
-  really makes sense if you have a lot of dimensions; otherwise, the performance
-  is not great (at all).
+  bigger index. For `"pca"` it also sets how many principal components can be
+  spent, since the retained count is capped at `n_bits / 16`.
+- *binarisation_init*: Three options are provided in the crate. `"random"` for
+  random planes that are subsequently orthogonalised, `"pca"` to identify axes
+  of maximum variation, or `"sign"` to just use the sign of the respective
+  embedding dimensions (or the residual, for the IVF). In that last case
+  `n_bits` is set automatically to `n_dim`. Sign-based only really makes sense
+  if you have a lot of dimensions; otherwise the performance is not great (at
+  all). Unrecognised strings print a warning and fall back to `"random"`, so
+  watch the spelling: `"random_projections"`, `"pca_hashing"` and `"sign_based"`
+  are the accepted long forms, and `"signed"` is not one of them.
 - *reranking_factor*: Hamming distance picks the candidates, then the on-disk
   vectors are loaded and the candidates re-scored exactly. The factor is how
   many more than `k` get re-scored, so `10` means `10 * k` vectors. More

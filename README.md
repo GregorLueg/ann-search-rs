@@ -357,7 +357,7 @@ ann-search-rs = { version = "*", features = ["gpu"] }
 ## Binarised indices
 
 For the most extreme compression needs, binary indices are also provided. There
-are two approaches for binarisation available in the crate:
+are three approaches for binarisation available in the crate:
 
 - Bitwise binarisation either leveraging a SimHash random projection, PCA
   hashing or sign-based binarisation. Sign bits taken in the global frame tell

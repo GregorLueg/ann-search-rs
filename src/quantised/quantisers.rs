@@ -4,16 +4,24 @@
 //! shares one scale across every dimension, which is what lets a code-to-code
 //! distance stay faithful to the metric the caller asked for.
 
-use faer::{Mat, Scale};
+use faer::linalg::matmul::matmul;
+use faer::{Accum, Mat, MatMut, MatRef, Par, Scale};
 use half::bf16;
 use num_traits::{Float, FromPrimitive, ToPrimitive};
 use rayon::prelude::*;
 
+use std::num::NonZero;
 use std::ops::AddAssign;
 
 use crate::prelude::*;
 use crate::quantised::k_means::*;
 use crate::utils::k_means_utils::*;
+
+/// Rows per tile of the OPQ rotation GEMM.
+///
+/// Bounds the intermediate to `ROTATION_ROW_TILE * dim` elements. Matches the
+/// tile the k-means assignment path uses for the same shape of work.
+const ROTATION_ROW_TILE: usize = 4096;
 
 ///////////////////////
 // Bf16 quantisation //
@@ -623,31 +631,28 @@ where
     ///
     /// Flat rotated vectors (length = n * dim)
     fn apply_rotation(vectors: &[T], rotation: &[T], dim: usize, n: usize) -> Vec<T> {
-        // Build faer matrices
-        let mut x = Mat::<f32>::zeros(n, dim);
-        let mut r = Mat::<f32>::zeros(dim, dim);
-
-        for i in 0..n {
-            for j in 0..dim {
-                x[(i, j)] = vectors[i * dim + j].to_f32().unwrap();
-            }
-        }
-
-        for i in 0..dim {
-            for j in 0..dim {
-                r[(i, j)] = rotation[i * dim + j].to_f32().unwrap();
-            }
-        }
-
-        let x_r = x * r.transpose();
-
-        // Convert back
         let mut out = vec![T::zero(); n * dim];
-        for i in 0..n {
-            for j in 0..dim {
-                out[i * dim + j] = T::from_f32(x_r[(i, j)]).unwrap();
-            }
-        }
+        let r = MatRef::from_row_major_slice(rotation, dim, dim);
+
+        // Tiled and rayon-parallel, writing straight into `out`. The input and
+        // output slices are already the row-major layout faer wants, so nothing
+        // is copied on the way in or out.
+        vectors
+            .par_chunks(ROTATION_ROW_TILE * dim)
+            .zip(out.par_chunks_mut(ROTATION_ROW_TILE * dim))
+            .for_each(|(rows_flat, out_tile)| {
+                let rows = rows_flat.len() / dim;
+                let mut dst = MatMut::from_row_major_slice_mut(out_tile, rows, dim);
+
+                matmul(
+                    dst.as_mut(),
+                    Accum::Replace,
+                    MatRef::from_row_major_slice(rows_flat, rows, dim),
+                    r.transpose(),
+                    T::one(),
+                    Par::Seq,
+                );
+            });
 
         out
     }
@@ -669,29 +674,28 @@ where
     ///
     /// Updated rotation matrix (dim × dim, row-major)
     fn compute_rotation(x_original: &[T], x_recon: &[T], dim: usize, n: usize) -> Vec<T> {
-        // Build matrices
-        let mut x = Mat::<f32>::zeros(n, dim);
-        let mut y = Mat::<f32>::zeros(n, dim);
+        let x = MatRef::from_row_major_slice(x_original, n, dim);
+        let y = MatRef::from_row_major_slice(x_recon, n, dim);
 
-        for i in 0..n {
-            for j in 0..dim {
-                x[(i, j)] = x_original[i * dim + j].to_f32().unwrap();
-                y[(i, j)] = x_recon[i * dim + j].to_f32().unwrap();
-            }
-        }
+        // One `dim x dim` GEMM with no outer parallelism, so faer gets the
+        // threads. Both operands are already row-major, so neither is copied.
+        let mut c = Mat::<T>::zeros(dim, dim);
+        matmul(
+            c.as_mut(),
+            Accum::Replace,
+            x.transpose(),
+            y,
+            T::one(),
+            Par::Rayon(NonZero::new(rayon::current_num_threads().max(1)).unwrap()),
+        );
 
-        let c = x.transpose() * y;
-
-        // rest stays the same
-        let svd = c.thin_svd().unwrap();
-        let u = svd.U();
-        let v = svd.V();
-        let r = v * u.transpose();
+        let svd = c.as_ref().thin_svd().unwrap();
+        let r = svd.V() * svd.U().transpose();
 
         let mut rotation = vec![T::zero(); dim * dim];
         for i in 0..dim {
             for j in 0..dim {
-                rotation[i * dim + j] = T::from_f32(r[(i, j)]).unwrap();
+                rotation[i * dim + j] = r[(i, j)];
             }
         }
         rotation
@@ -776,6 +780,54 @@ where
 
 #[cfg(test)]
 mod tests {
+
+    /// The tiled GEMM replaced a whole-matrix rotation that materialised three
+    /// copies of the data. It has to agree with the per-vector path, including
+    /// on a row count that straddles the tile boundary.
+    #[test]
+    fn test_apply_rotation_matches_per_vector() {
+        let dim = 16;
+        let n = ROTATION_ROW_TILE + 53;
+
+        // Orthogonal rotation from a QR of a deterministic pseudo-random matrix
+        let mut raw = vec![0.0f64; dim * dim];
+        for (i, v) in raw.iter_mut().enumerate() {
+            let mut x = (i as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+            x ^= x >> 33;
+            x = x.wrapping_mul(0xFF51_AFD7_ED55_8CCD);
+            x ^= x >> 33;
+            *v = (x as f64 / u64::MAX as f64) * 2.0 - 1.0;
+        }
+        let q = Mat::<f64>::from_fn(dim, dim, |i, j| raw[i * dim + j])
+            .as_ref()
+            .qr()
+            .compute_Q();
+        let rotation: Vec<f64> = (0..dim * dim).map(|i| q[(i / dim, i % dim)]).collect();
+
+        let mut data = vec![0.0f64; n * dim];
+        for (i, v) in data.iter_mut().enumerate() {
+            *v = ((i as f64) * 0.31).sin() * 2.0 - 0.4;
+        }
+
+        let batched =
+            OptimisedProductQuantiser::<f64>::apply_rotation(&data, &rotation, dim, n);
+
+        for i in 0..n {
+            let one = OptimisedProductQuantiser::<f64>::rotate_vector(
+                &data[i * dim..(i + 1) * dim],
+                &rotation,
+                dim,
+            );
+            for j in 0..dim {
+                approx::assert_relative_eq!(
+                    batched[i * dim + j],
+                    one[j],
+                    epsilon = 1e-12,
+                    max_relative = 1e-12
+                );
+            }
+        }
+    }
     use super::*;
 
     #[test]
