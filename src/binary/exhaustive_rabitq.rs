@@ -185,19 +185,7 @@ where
             .max(1);
         let k = k.min(self.n);
 
-        // Normalise for cosine
-        let query_normalised: Vec<T> = match self.quantiser.encoder.metric {
-            Dist::Cosine => {
-                let norm = compute_l2_norm(query_vec);
-                if norm > T::epsilon() {
-                    query_vec.iter().map(|&x| x / norm).collect()
-                } else {
-                    query_vec.to_vec()
-                }
-            }
-            Dist::SquaredEuclidean => query_vec.to_vec(),
-            Dist::Manhattan => unreachable!(),
-        };
+        let query_normalised = self.quantiser.encoder.normalise_query(query_vec);
 
         let cluster_dists = self
             .quantiser

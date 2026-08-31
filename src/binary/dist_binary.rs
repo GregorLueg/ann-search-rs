@@ -32,8 +32,12 @@ pub const HAMMING_BLOCK: usize = 32;
 pub const RABITQ_BLOCK: usize = 32;
 
 /// Code length at or below which the scalar `u64` path is used on x86_64.
-/// `POPCNT` is single-cycle there, so for short codes the horizontal reduction
-/// the vector kernels need costs more than the popcounts themselves.
+///
+/// Only taken when the CPU actually has `POPCNT`, which is *not* in the
+/// x86_64 baseline (`rustc --print cfg` gives fxsr, sse, sse2 and nothing
+/// else). Without it `u64::count_ones` lowers to a SWAR sequence that loses to
+/// the SSE2 kernel, which is why the dispatch gates on runtime detection rather
+/// than length alone.
 #[cfg(target_arch = "x86_64")]
 const SCALAR_POPCNT_MAX_BYTES: usize = 32;
 
@@ -53,6 +57,41 @@ const NEON_POPCNT_FLUSH: usize = 31;
 /// popcount kernels; every other dispatch in the crate is unaffected by it.
 #[cfg(target_arch = "x86_64")]
 static HAS_VPOPCNTDQ: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+
+/// Cached scalar `POPCNT` availability.
+#[cfg(target_arch = "x86_64")]
+static HAS_POPCNT: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+
+/// Whether the CPU has the scalar `POPCNT` instruction
+///
+/// ### Returns
+///
+/// `true` when `u64::count_ones` lowers to a single instruction
+#[cfg(target_arch = "x86_64")]
+#[inline]
+fn has_popcnt() -> bool {
+    *HAS_POPCNT.get_or_init(|| is_x86_feature_detected!("popcnt"))
+}
+
+/// [`hamming_u64`] compiled with `POPCNT` enabled
+///
+/// The generic body cannot carry `#[target_feature]` because it is also the
+/// portable fallback on targets that have no such feature, so the x86 fast path
+/// goes through this wrapper and inlines the body under the enabled feature.
+///
+/// ### Params
+///
+/// * `a` - Slice of u8 to use
+/// * `b` - Slice of u8 to use, same length as `a`
+///
+/// ### Returns
+///
+/// The Hamming distance between the two slices
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "popcnt")]
+unsafe fn hamming_u64_popcnt(a: &[u8], b: &[u8]) -> u32 {
+    hamming_u64(a, b)
+}
 
 /// Whether the CPU has AVX-512 VPOPCNTDQ
 ///
@@ -335,24 +374,6 @@ unsafe fn hamming_neon(a: &[u8], b: &[u8]) -> u32 {
     count
 }
 
-/// Hamming distance - scalar fall back
-///
-/// ### Params
-///
-/// * `a` - Slice of u8 to use
-/// * `b` - Slice of u8 to use
-///
-/// ### Returns
-///
-/// The Hamming distance between the two slices
-#[inline(always)]
-unsafe fn hamming_scalar(a: &[u8], b: &[u8]) -> u32 {
-    a.iter()
-        .zip(b.iter())
-        .map(|(x, y)| (x ^ y).count_ones())
-        .sum()
-}
-
 /// Hamming distance - SIMD dispatcher
 ///
 /// ### Params
@@ -367,8 +388,8 @@ unsafe fn hamming_scalar(a: &[u8], b: &[u8]) -> u32 {
 unsafe fn hamming_simd(a: &[u8], b: &[u8]) -> u32 {
     #[cfg(target_arch = "x86_64")]
     {
-        if a.len() <= SCALAR_POPCNT_MAX_BYTES {
-            return hamming_u64(a, b);
+        if a.len() <= SCALAR_POPCNT_MAX_BYTES && has_popcnt() {
+            return hamming_u64_popcnt(a, b);
         }
         if has_vpopcntdq() {
             return hamming_avx512_vpopcnt(a, b);
@@ -377,7 +398,7 @@ unsafe fn hamming_simd(a: &[u8], b: &[u8]) -> u32 {
             SimdLevel::Avx512 => hamming_avx512(a, b),
             SimdLevel::Avx2 => hamming_avx2(a, b),
             SimdLevel::Sse => hamming_sse2(a, b),
-            SimdLevel::Scalar => hamming_scalar(a, b),
+            SimdLevel::Scalar => hamming_u64(a, b),
         }
     }
 
@@ -410,8 +431,9 @@ unsafe fn hamming_simd(a: &[u8], b: &[u8]) -> u32 {
 /// The minimum distance written into `out`, or `u32::MAX` when `out` is empty
 #[inline]
 pub fn hamming_block(query: &[u8], codes: &[u8], n_bytes: usize, out: &mut [u32]) -> u32 {
-    debug_assert_eq!(query.len(), n_bytes);
-    debug_assert!(codes.len() >= out.len() * n_bytes);
+    // Hard asserts, not debug: this is a safe `pub fn` that indexes unchecked
+    assert_eq!(query.len(), n_bytes);
+    assert!(codes.len() >= out.len() * n_bytes);
 
     let mut min = u32::MAX;
     for (j, slot) in out.iter_mut().enumerate() {
@@ -496,6 +518,10 @@ pub trait VectorDistanceBinary {
 /// Two accumulators and a conditional-move per bit, so nothing branches on the
 /// (effectively random) code bits and nothing is allocated.
 ///
+/// Private: it indexes `query_vec` and `binary_code` unchecked up to `dim`, and
+/// the length check that makes that sound lives in
+/// [`asymmetric_binary_dot_presummed`].
+///
 /// ### Params
 ///
 /// * `query_vec` - Float query vector, `dim` long
@@ -506,7 +532,7 @@ pub trait VectorDistanceBinary {
 ///
 /// `sum over d where bit d is set of query_vec[d]`
 #[inline]
-pub fn masked_query_sum<T>(query_vec: &[T], binary_code: &[u8], dim: usize) -> T
+fn masked_query_sum<T>(query_vec: &[T], binary_code: &[u8], dim: usize) -> T
 where
     T: Float,
 {
@@ -790,8 +816,10 @@ unsafe fn dot_planes_neon(planes: &[u8], binary: &[u8], n_bytes: usize) -> u32 {
 /// The dot product of the quantised query and the binary vector
 #[inline(always)]
 pub fn dot_query_binary_planes(planes: &[u8], binary: &[u8], n_bytes: usize) -> u32 {
-    debug_assert_eq!(planes.len(), RABITQ_QUERY_PLANES * n_bytes);
-    debug_assert_eq!(binary.len(), n_bytes);
+    // Hard asserts, not debug: this is a safe `pub fn` and both kernels below
+    // read unchecked over `RABITQ_QUERY_PLANES * n_bytes` and `n_bytes`
+    assert_eq!(planes.len(), RABITQ_QUERY_PLANES * n_bytes);
+    assert_eq!(binary.len(), n_bytes);
 
     #[cfg(target_arch = "aarch64")]
     {
@@ -804,7 +832,11 @@ pub fn dot_query_binary_planes(planes: &[u8], binary: &[u8], n_bytes: usize) -> 
     }
 }
 
-/// Scalar fallback for dot product computation
+/// Dense-query reference for the bit-plane dot product
+///
+/// Walks the code a bit at a time against a dense int4 query. Superseded on the
+/// scan path by [`dot_query_binary_planes`]; kept as the oracle that kernel is
+/// validated against.
 ///
 /// ### Params
 ///

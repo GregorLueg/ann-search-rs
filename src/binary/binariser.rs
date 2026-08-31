@@ -327,13 +327,28 @@ fn itq_rotate_projections<T>(
         return;
     }
 
-    let n_itq = centred.nrows().min(MAX_SAMPLES_ITQ);
+    let n_rows = centred.nrows();
+    let n_itq = n_rows.min(MAX_SAMPLES_ITQ);
+
+    // Draw the ITQ rows at random. `training_sample_indices` leaves the rows in
+    // dataset order whenever `n <= MAX_SAMPLES_PCA`, and matrices arriving here
+    // are routinely ordered by batch, donor or cluster label, so taking a
+    // contiguous prefix would fit the rotation on one batch.
+    let itq_rows: Vec<usize> = if n_itq == n_rows {
+        (0..n_rows).collect()
+    } else {
+        // Offset so this draw is independent of the one `training_sample_indices`
+        // makes from the same seed.
+        let mut rng = StdRng::seed_from_u64(seed as u64 ^ 0x9E37_79B9);
+        let mut idx: Vec<usize> = (0..n_rows).collect();
+        idx.shuffle(&mut rng);
+        idx.truncate(n_itq);
+        idx
+    };
 
     // PCA scores of the ITQ subsample: V = centred * loadings, n_itq x k.
-    // `training_sample_indices` already shuffled, so the leading rows are a
-    // random subset and no second draw is needed.
     let loadings = Mat::<T>::from_fn(dim, k, |d, j| projections[j * dim + d]);
-    let sample = Mat::<T>::from_fn(n_itq, dim, |i, d| centred[(i, d)]);
+    let sample = Mat::<T>::from_fn(n_itq, dim, |i, d| centred[(itq_rows[i], d)]);
     let scores = sample * loadings;
 
     // Random orthogonal k x k start. The Gram-Schmidt helper returns k
@@ -604,9 +619,11 @@ pub(crate) fn encode_sign_residual_into<T: Float>(
 /// Supports three binarisation methods:
 ///
 /// - **SimHash**: Random orthogonalised projections
-/// - **PcaHashing**: Signs of the top principal components, padded with random
-///   orthogonal directions when `n_bits > dim`. No rotation learning, so this
-///   is plain PCA hashing rather than ITQ.
+/// - **PcaHashing**: Signs of the principal components that clear
+///   [`PCA_VARIANCE_FLOOR`], rotated by ITQ so variance is spread evenly across
+///   the bits, with every remaining bit filled by a random orthogonal
+///   direction. The padding is the common case, not an edge case: on real data
+///   only a few dozen components typically clear the floor.
 /// - **SignBased**: Simple sign binarisation (no training required)
 #[cfg_attr(feature = "serialise", derive(serde::Serialize, serde::Deserialize))]
 pub struct Binariser<T> {
@@ -985,6 +1002,37 @@ mod tests {
             "ITQ left the bit variances spread over {:e} (max {max:e}, min {min:e})",
             max / min
         );
+    }
+
+    /// `retained_components` is the whole point of the variance floor, so pin
+    /// its cut directly rather than inferring it from downstream recall.
+    #[test]
+    fn test_retained_components_cuts_at_the_variance_floor() {
+        use faer::Col;
+
+        // sigma_j = 1, 0.5, 0.2, 0.05, 0.01. Relative variances against
+        // sigma_0 are 1, 0.25, 0.04, 0.0025, 0.0001, so with a 1e-2 floor the
+        // first three survive and the scan stops at the fourth.
+        let s = Col::<f64>::from_fn(5, |i| [1.0, 0.5, 0.2, 0.05, 0.01][i]);
+        assert_eq!(retained_components(s.as_ref(), 5), 3);
+
+        // The bit budget still caps it.
+        assert_eq!(retained_components(s.as_ref(), 2), 2);
+
+        // A flat spectrum drops nothing.
+        let flat = Col::<f64>::from_fn(6, |_| 1.0);
+        assert_eq!(retained_components(flat.as_ref(), 6), 6);
+
+        // One dominant direction collapses the cut to a single component. This
+        // is the degenerate case the floor's relative rule cannot distinguish
+        // from genuine rank 1; see the note on PCA_VARIANCE_FLOOR.
+        let spiked = Col::<f64>::from_fn(4, |i| if i == 0 { 100.0 } else { 1.0 });
+        assert_eq!(retained_components(spiked.as_ref(), 4), 1);
+
+        // Degenerate inputs: no budget, and an all-zero spectrum.
+        assert_eq!(retained_components(s.as_ref(), 0), 0);
+        let zeros = Col::<f64>::from_fn(3, |_| 0.0);
+        assert_eq!(retained_components(zeros.as_ref(), 3), 1);
     }
 
     /// Data on a 4-dimensional subspace of a 32-dimensional space. Only four

@@ -599,7 +599,7 @@ impl<T: Float + FromPrimitive + Clone> RaBitQStorage<T> {
             .map(|v| v.dist_to_centroid)
     }
 
-    /// Get dot_corrections slice for cluster
+    /// Get inverse dot_corrections slice for cluster
     ///
     /// ### Params
     ///
@@ -607,7 +607,7 @@ impl<T: Float + FromPrimitive + Clone> RaBitQStorage<T> {
     ///
     /// ### Returns
     ///
-    /// The dot corrections for every vector in this cluster
+    /// The inverse dot corrections for every vector in this cluster
     #[inline]
     pub fn cluster_dot_corrections(&self, cluster_idx: usize) -> impl Iterator<Item = T> + '_ {
         self.cluster_packed_data(cluster_idx)
