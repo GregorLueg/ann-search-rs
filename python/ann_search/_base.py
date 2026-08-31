@@ -15,7 +15,7 @@ from __future__ import annotations
 import inspect
 import json
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, ClassVar
+from typing import TYPE_CHECKING, Any, ClassVar, cast
 
 import numpy as np
 from beartype import beartype
@@ -26,7 +26,7 @@ from ._validate import check_matrix, check_query
 if TYPE_CHECKING:
     # Shape of the compiled handles, declared in `_ann_search.pyi`. It has no
     # runtime existence, which is why the import is guarded.
-    from ._ann_search import _Handle
+    from ._ann_search import _ExtractHandle, _Handle
 
 ###########
 # Globals #
@@ -408,3 +408,61 @@ class BaseAnnIndex:
     def __repr__(self) -> str:
         args = ", ".join(f"{k}={v!r}" for k, v in sorted(self.get_params().items()))
         return f"{type(self).__name__}({args})"
+
+
+class ExtractKnnMixin:
+    """Read-back of a graph the index already built, for the descent indices.
+
+    NN-Descent and its GPU counterpart converge on a kNN graph and keep it, so
+    `kneighbors(None)` searches for something already sitting in the handle.
+    No other index here has such a graph, hence a mixin rather than a method on
+    `BaseAnnIndex`.
+    """
+
+    if TYPE_CHECKING:
+        # Borrowed from `BaseAnnIndex`. Signatures match the base exactly:
+        # narrowing the return would be an incompatible override, so the cast
+        # happens at the call site.
+        _sqrt: bool
+
+        def _fitted_handle(self) -> _Handle: ...
+
+    @beartype
+    def extract_knn(
+        self,
+        n_neighbors: int | None = None,
+        *,
+        include_self: bool = True,
+        return_distance: bool = True,
+    ) -> tuple[np.ndarray, np.ndarray] | np.ndarray:
+        """Return the graph the descent built, without searching it.
+
+        Args:
+            n_neighbors: Total row length, the self-edge included when
+                `include_self` is set. ``None`` keeps the build-time degree,
+                which is the ceiling. Note this differs from `kneighbors`,
+                where ``None`` means ``self.n_neighbors``.
+            include_self: Whether row ``i`` starts with ``i`` at distance zero.
+                A kNN graph stores no such edge, but `kneighbors` and any
+                exhaustive ground truth do, so the default keeps the two
+                comparable.
+            return_distance: Whether to return distances alongside indices.
+
+        Returns:
+            ``(distances, indices)``, or just ``indices`` when
+            `return_distance` is False. Rows the descent never filled are
+            padded with ``-1`` indices and infinite distances, which the search
+            paths never produce.
+        """
+        # Only the two descent handles carry `extract_knn`.
+        handle = cast("_ExtractHandle", self._fitted_handle())
+        ind, dist = handle.extract_knn(
+            n_neighbors,
+            include_self=include_self,
+            return_distance=return_distance,
+        )
+        if dist is None:
+            return ind
+        if self._sqrt:
+            np.sqrt(dist, out=dist)
+        return dist, ind

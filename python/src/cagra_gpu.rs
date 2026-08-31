@@ -13,7 +13,8 @@
 use ann_search_rs::gpu::cagra_gpu_search::CagraGpuSearchParams;
 use ann_search_rs::gpu::nndescent_gpu::NNDescentGpu;
 use ann_search_rs::{
-    build_nndescent_index_gpu, query_nndescent_index_gpu, query_nndescent_index_gpu_self,
+    build_nndescent_index_gpu, extract_nndescent_knn_gpu, query_nndescent_index_gpu,
+    query_nndescent_index_gpu_self,
 };
 use pyo3::prelude::*;
 
@@ -31,8 +32,8 @@ use crate::gpu_handle::{default_device, f32_array, gpu_handle, Rt};
 ///
 /// ### Returns
 ///
-/// `None` when no knob was touched, so the library sizes the beam from `k` and
-/// the graph degree instead of taking a half-specified struct.
+/// `None` when no knob was touched, so the library sizes the beam from `k`
+/// instead of taking a half-specified struct.
 fn cagra_params(
     beam_width: Option<usize>,
     max_beam_iters: Option<usize>,
@@ -225,6 +226,46 @@ gpu_handle!(PyCagraGpu, NNDescentGpu, "CagraGpu", {
             .map_err(crate::error::AnnErr)?;
         drop(guard);
         crate::dispatch::pack(py, ids, dists, k)
+    }
+
+    /// Read the descent graph back without searching it.
+    ///
+    /// Returns the kNN graph NN-Descent produced, held alongside the
+    /// navigational one and taken before the CAGRA prune. Nothing is
+    /// dispatched to the device.
+    ///
+    /// ### Params
+    ///
+    /// * `k` - Total row length, self-edge included when `include_self` is
+    ///   set. `None` keeps the build-time degree, which is the ceiling.
+    /// * `include_self` - Prepend `(i, 0)` to row `i`. A kNN graph stores no
+    ///   such edge, but every `query_self` and any exhaustive ground truth
+    ///   counts a point as its own nearest neighbour.
+    /// * `return_distance` - Skips the copy into numpy, not the computation.
+    ///
+    /// ### Returns
+    ///
+    /// `(indices, distances)` for every indexed point. Rows the descent never
+    /// filled come back padded, which the search paths never produce. See
+    /// [`QueryOut`].
+    #[pyo3(signature = (k = None, *, include_self = true, return_distance = true))]
+    fn extract_knn<'py>(
+        &self,
+        py: Python<'py>,
+        k: Option<usize>,
+        include_self: bool,
+        return_distance: bool,
+    ) -> PyResult<QueryOut<'py>> {
+        let idx = &self.inner;
+        let kk = k.unwrap_or(idx.k);
+        let (ids, dists) = py
+            .detach(|| {
+                crate::pool::run(|| {
+                    extract_nndescent_knn_gpu(idx, k, include_self, return_distance)
+                })
+            })
+            .map_err(crate::error::AnnErr)?;
+        crate::dispatch::pack(py, ids, dists, kk)
     }
 });
 

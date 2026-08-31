@@ -185,19 +185,7 @@ where
             .max(1);
         let k = k.min(self.n);
 
-        // Normalise for cosine
-        let query_normalised: Vec<T> = match self.quantiser.encoder.metric {
-            Dist::Cosine => {
-                let norm = compute_l2_norm(query_vec);
-                if norm > T::epsilon() {
-                    query_vec.iter().map(|&x| x / norm).collect()
-                } else {
-                    query_vec.to_vec()
-                }
-            }
-            Dist::SquaredEuclidean => query_vec.to_vec(),
-            Dist::Manhattan => unreachable!(),
-        };
+        let query_normalised = self.quantiser.encoder.normalise_query(query_vec);
 
         let cluster_dists = self
             .quantiser
@@ -205,20 +193,38 @@ where
 
         let mut heap: BinaryHeap<(OrderedFloat<T>, usize)> = BinaryHeap::with_capacity(k + 1);
 
+        // The heap ranks on *squared* distance: the square root is monotone, so
+        // it only needs applying to the k survivors.
+        let mut block = [T::zero(); RABITQ_BLOCK];
+
+        // One rotation per query, not one per probed cluster
+        let q_rot = self.quantiser.encoder.apply_rotation(&query_normalised);
+
         for &(_, c_idx) in cluster_dists.iter().take(n_probe) {
-            let query_encoded = self.quantiser.encode_query(&query_normalised, c_idx)?;
+            let query_encoded = self.quantiser.encode_query_prerotated(&q_rot, c_idx);
             let cluster_size = self.storage().cluster_size(c_idx);
+            let indices = self.storage().cluster_vector_indices(c_idx);
 
-            for local_idx in 0..cluster_size {
-                let dist = self.rabitq_dist(&query_encoded, c_idx, local_idx);
-                let global_idx = self.storage().cluster_vector_indices(c_idx)[local_idx];
+            let mut local_idx = 0;
+            while local_idx < cluster_size {
+                let take = RABITQ_BLOCK.min(cluster_size - local_idx);
+                let block_min =
+                    self.rabitq_block_sq(&query_encoded, c_idx, local_idx, &mut block[..take]);
 
-                if heap.len() < k {
-                    heap.push((OrderedFloat(dist), global_idx));
-                } else if dist < heap.peek().unwrap().0 .0 {
-                    heap.pop();
-                    heap.push((OrderedFloat(dist), global_idx));
+                if heap.len() < k || block_min < heap.peek().unwrap().0 .0 {
+                    for (j, &dist) in block[..take].iter().enumerate() {
+                        let global_idx = indices[local_idx + j];
+
+                        if heap.len() < k {
+                            heap.push((OrderedFloat(dist), global_idx));
+                        } else if dist < heap.peek().unwrap().0 .0 {
+                            heap.pop();
+                            heap.push((OrderedFloat(dist), global_idx));
+                        }
+                    }
                 }
+
+                local_idx += take;
             }
         }
 
@@ -226,7 +232,7 @@ where
         results.sort_unstable();
 
         let (distances, indices): (Vec<T>, Vec<usize>) =
-            results.into_iter().map(|(d, i)| (d.0, i)).unzip();
+            results.into_iter().map(|(d, i)| (d.0.sqrt(), i)).unzip();
 
         Ok((indices, distances))
     }

@@ -6,7 +6,9 @@
 //! makes the cast infallible.
 
 use ann_search_rs::cpu::nndescent::NNDescent;
-use ann_search_rs::{build_nndescent_index, query_nndescent_index, query_nndescent_self};
+use ann_search_rs::{
+    build_nndescent_index, extract_nndescent_knn, query_nndescent_index, query_nndescent_self,
+};
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 
@@ -153,6 +155,57 @@ ann_handle!(PyNnDescent, NnDescentInner, NNDescent, "NnDescent", {
                 return_distance,
                 verbose
             )),
+        }
+    }
+
+    /// Read the descent graph back without searching it.
+    ///
+    /// `query_self` beam-searches every point and so refines the graph; this
+    /// reshapes what the descent already built. An index with
+    /// `diversify_prob > 0` has lost the pruned edges here, so it wants
+    /// `query_self` instead.
+    ///
+    /// ### Params
+    ///
+    /// * `k` - Total row length, self-edge included when `include_self` is
+    ///   set. `None` keeps the build-time degree, which is the ceiling.
+    /// * `include_self` - Prepend `(i, 0)` to row `i`. A kNN graph stores no
+    ///   such edge, but every `query_self` and any exhaustive ground truth
+    ///   counts a point as its own nearest neighbour.
+    /// * `return_distance` - Skips the copy into numpy, not the computation.
+    ///
+    /// ### Returns
+    ///
+    /// `(indices, distances)` for every indexed point. Rows the descent never
+    /// filled come back padded, which the search paths never produce. See
+    /// [`QueryOut`].
+    #[pyo3(signature = (k = None, *, include_self = true, return_distance = true))]
+    fn extract_knn<'py>(
+        &self,
+        py: Python<'py>,
+        k: Option<usize>,
+        include_self: bool,
+        return_distance: bool,
+    ) -> PyResult<QueryOut<'py>> {
+        match &self.inner {
+            NnDescentInner::F32(idx) => {
+                let kk = k.unwrap_or(idx.k);
+                self_arm!(py, kk, || extract_nndescent_knn(
+                    idx,
+                    k,
+                    include_self,
+                    return_distance
+                ))
+            }
+            NnDescentInner::F64(idx) => {
+                let kk = k.unwrap_or(idx.k);
+                self_arm!(py, kk, || extract_nndescent_knn(
+                    idx,
+                    k,
+                    include_self,
+                    return_distance
+                ))
+            }
         }
     }
 });

@@ -5,7 +5,7 @@ TEMPLATE_DIR="docs/templates"
 OUTPUT_DIR="docs"
 
 usage() {
-    echo "Usage: $0 --kind <standard|gpu|binary|quantised|all> [--dry-run]"
+    echo "Usage: $0 --kind <standard|gpu|binary|quantised|knn_graph|all> [--dry-run]"
     exit 1
 }
 
@@ -23,7 +23,7 @@ done
 [ -z "$KIND" ] && usage
 
 if [ "$KIND" = "all" ]; then
-    for k in standard gpu binary quantised; do
+    for k in standard gpu binary quantised knn_graph; do
         echo "===== Running kind: $k =====" >&2
         if $DRY_RUN; then
             "$0" --kind "$k" --dry-run
@@ -69,8 +69,14 @@ run_and_replace() {
     local err_file
     err_file=$(mktemp)
 
+    # `<details>` is a CommonMark HTML block, which ends at the first blank
+    # line. A blank line inside the captured table would therefore close the
+    # block early and hand the rest of the output to the Markdown parser, where
+    # a line of `-----` under text becomes a setext heading. Strip them: the
+    # `=====` and `-----` rulers already separate the tables.
     "${cmd[@]}" 2>"$err_file" \
-        | sed -n '/^=\{10,\}/,$p' > "$result_file" || true
+        | sed -n '/^=\{10,\}/,$p' \
+        | sed '/^[[:space:]]*$/d' > "$result_file" || true
 
     if [ ! -s "$result_file" ]; then
         echo "WARNING: no table output for ${tag}" >&2
@@ -159,6 +165,14 @@ case "$KIND" in
             "nndescent:euclidean:lowrank:32|cargo run --example gridsearch_nndescent --release -- --distance euclidean --data lowrank"
             "nndescent:euclidean:cell:128|cargo run --example gridsearch_nndescent --release -- --distance euclidean --data cell --dim 128"
 
+            # soar
+            "soar:euclidean:gaussian:32|cargo run --example gridsearch_soar --release -- --distance euclidean"
+            "soar:cosine:gaussian:32|cargo run --example gridsearch_soar --release -- --distance cosine"
+            "soar:euclidean:correlated:32|cargo run --example gridsearch_soar --release -- --distance euclidean --data correlated"
+            "soar:euclidean:lowrank:32|cargo run --example gridsearch_soar --release -- --distance euclidean --data lowrank"
+            "soar:euclidean:cell:128|cargo run --example gridsearch_soar --release -- --distance euclidean --data cell --dim 128"
+            "soar:cosine:cell:128|cargo run --example gridsearch_soar --release -- --distance cosine --data cell --dim 128"
+
             # nsg
             "nsg:euclidean:gaussian:32|cargo run --example gridsearch_nsg --release -- --distance euclidean"
             "nsg:cosine:gaussian:32|cargo run --example gridsearch_nsg --release -- --distance cosine"
@@ -219,15 +233,6 @@ case "$KIND" in
             "cagra:euclidean:cell:128:250000|cargo run --example gridsearch_cagra --release --features gpu -- --distance euclidean --data cell --n-samples 250000 --dim 128"
             "cagra:euclidean:cell:64:500000|cargo run --example gridsearch_cagra --release --features gpu -- --distance euclidean --data cell --n-samples 500000 --dim 64"
             "cagra:euclidean:cell:128:500000|cargo run --example gridsearch_cagra --release --features gpu -- --distance euclidean --data cell --n-samples 500000 --dim 128"
-
-            # CAGRA kNN
-            "cagra_knn:euclidean:lowrank:32:250000|cargo run --example knn_comparison_cagra --release --features gpu -- --distance euclidean --data lowrank --n-samples 250000"
-            "cagra_knn:euclidean:lowrank:64:250000|cargo run --example knn_comparison_cagra --release --features gpu -- --distance euclidean --data lowrank --n-samples 250000 --dim 64"
-            "cagra_knn:euclidean:lowrank:32:500000|cargo run --example knn_comparison_cagra --release --features gpu -- --distance euclidean --data lowrank --n-samples 500000"
-            "cagra_knn:euclidean:lowrank:64:500000|cargo run --example knn_comparison_cagra --release --features gpu -- --distance euclidean --data lowrank --n-samples 500000 --dim 64"
-            "cagra_knn:euclidean:lowrank:32:1000000|cargo run --example knn_comparison_cagra --release --features gpu -- --distance euclidean --data lowrank --n-samples 1000000"
-            "cagra_knn:euclidean:lowrank:64:1000000|cargo run --example knn_comparison_cagra --release --features gpu -- --distance euclidean --data lowrank --n-samples 1000000 --dim 64"
-            "cagra_knn:euclidean:lowrank:32:2500000|cargo run --example knn_comparison_cagra --release --features gpu -- --distance euclidean --data lowrank --n-samples 2500000"
 
             # NSG CPU/GPU
             "nsg_cpu:euclidean:cell:128:250000|cargo run --example gridsearch_nsg --release -- --distance euclidean --data cell --n-samples 250000 --dim 128"
@@ -290,6 +295,13 @@ case "$KIND" in
             "sq8:euclidean:lowrank:32|cargo run --example gridsearch_sq8 --release --features quantised -- --distance euclidean --data lowrank"
             "sq8:euclidean:lowrank:128|cargo run --example gridsearch_sq8 --release --features quantised -- --distance euclidean --data lowrank --dim 128"
 
+            "hnsw_sq8u:euclidean:gaussian:32|cargo run --example gridsearch_hnsw_quantised --release --features quantised -- --distance euclidean"
+            "hnsw_sq8u:cosine:gaussian:32|cargo run --example gridsearch_hnsw_quantised --release --features quantised -- --distance cosine"
+            "hnsw_sq8u:euclidean:correlated:32|cargo run --example gridsearch_hnsw_quantised --release --features quantised -- --distance euclidean --data correlated"
+            "hnsw_sq8u:euclidean:lowrank:32|cargo run --example gridsearch_hnsw_quantised --release --features quantised -- --distance euclidean --data lowrank"
+            "hnsw_sq8u:euclidean:cell:128|cargo run --example gridsearch_hnsw_quantised --release --features quantised -- --distance euclidean --data cell --dim 128"
+            "hnsw_sq8u:cosine:cell:128|cargo run --example gridsearch_hnsw_quantised --release --features quantised -- --distance cosine --data cell --dim 128"
+
             "pq:euclidean:correlated:256:50000|cargo run --example gridsearch_pq --release --features quantised -- --data correlated --n-samples 50000 --dim 256"
             "pq:euclidean:lowrank:256:50000|cargo run --example gridsearch_pq --release --features quantised -- --data lowrank --n-samples 50000 --dim 256 --intrinsic-dim 32"
             "pq:euclidean:embedding:256:50000|cargo run --example gridsearch_pq --release --features quantised -- --data embedding --n-samples 50000 --dim 256"
@@ -314,6 +326,38 @@ case "$KIND" in
             "opq:euclidean:lowrank:768:50000|cargo run --example gridsearch_opq --release --features quantised -- --data lowrank --n-samples 50000 --dim 768 --intrinsic-dim 64"
             "opq:euclidean:embedding:768:50000|cargo run --example gridsearch_opq --release --features quantised -- --data embedding --n-samples 50000 --dim 768"
 
+            "soar_pq:euclidean:correlated:512:50000|cargo run --example gridsearch_soar_pq --release --features quantised -- --data correlated --n-samples 50000 --dim 512"
+            "soar_pq:euclidean:lowrank:512:50000|cargo run --example gridsearch_soar_pq --release --features quantised -- --data lowrank --n-samples 50000 --dim 512 --intrinsic-dim 64"
+            "soar_pq:euclidean:embedding:512:50000|cargo run --example gridsearch_soar_pq --release --features quantised -- --data embedding --n-samples 50000 --dim 512"
+            "soar_pq:cosine:embedding:512:50000|cargo run --example gridsearch_soar_pq --release --features quantised -- --distance cosine --data embedding --n-samples 50000 --dim 512"
+
+            "soar_opq:euclidean:correlated:512:50000|cargo run --example gridsearch_soar_opq --release --features quantised -- --data correlated --n-samples 50000 --dim 512"
+            "soar_opq:euclidean:lowrank:512:50000|cargo run --example gridsearch_soar_opq --release --features quantised -- --data lowrank --n-samples 50000 --dim 512 --intrinsic-dim 64"
+            "soar_opq:euclidean:embedding:512:50000|cargo run --example gridsearch_soar_opq --release --features quantised -- --data embedding --n-samples 50000 --dim 512"
+            "soar_opq:cosine:embedding:512:50000|cargo run --example gridsearch_soar_opq --release --features quantised -- --distance cosine --data embedding --n-samples 50000 --dim 512"
+        )
+        ;;
+    knn_graph)
+        BENCHMARKS=(
+            # CPU NN-Descent: (query), (self) and (extract) rows in one table
+            "nndescent:euclidean:gaussian:32|cargo run --example gridsearch_nndescent --release -- --distance euclidean"
+            "nndescent:euclidean:lowrank:32|cargo run --example gridsearch_nndescent --release -- --distance euclidean --data lowrank"
+            "nndescent:euclidean:cell:128|cargo run --example gridsearch_nndescent --release -- --distance euclidean --data cell --dim 128"
+
+            # GPU NN-Descent / CAGRA: extract vs self-beam
+            "gpu_knn:euclidean:lowrank:32:250000|cargo run --example knn_comparison_gpu --release --features gpu -- --distance euclidean --data lowrank --n-samples 250000"
+            "gpu_knn:euclidean:lowrank:64:250000|cargo run --example knn_comparison_gpu --release --features gpu -- --distance euclidean --data lowrank --n-samples 250000 --dim 64"
+            "gpu_knn:euclidean:lowrank:32:500000|cargo run --example knn_comparison_gpu --release --features gpu -- --distance euclidean --data lowrank --n-samples 500000"
+            "gpu_knn:euclidean:lowrank:64:500000|cargo run --example knn_comparison_gpu --release --features gpu -- --distance euclidean --data lowrank --n-samples 500000 --dim 64"
+            "gpu_knn:euclidean:lowrank:32:1000000|cargo run --example knn_comparison_gpu --release --features gpu -- --distance euclidean --data lowrank --n-samples 1000000"
+            "gpu_knn:euclidean:lowrank:64:1000000|cargo run --example knn_comparison_gpu --release --features gpu -- --distance euclidean --data lowrank --n-samples 1000000 --dim 64"
+            "gpu_knn:euclidean:lowrank:32:2500000|cargo run --example knn_comparison_gpu --release --features gpu -- --distance euclidean --data lowrank --n-samples 2500000"
+
+            # Clustered GPU NN-Descent. Ground truth is a CPU exhaustive
+            # self-query here, so these stop lower than the CAGRA runs above.
+            "clustered_nnd:euclidean:lowrank:32:250000|cargo run --example gridsearch_clustered_nndescent --release --features gpu -- --distance euclidean --data lowrank --n-samples 250000"
+            "clustered_nnd:euclidean:lowrank:64:250000|cargo run --example gridsearch_clustered_nndescent --release --features gpu -- --distance euclidean --data lowrank --n-samples 250000 --dim 64"
+            "clustered_nnd:euclidean:lowrank:32:500000|cargo run --example gridsearch_clustered_nndescent --release --features gpu -- --distance euclidean --data lowrank --n-samples 500000"
         )
         ;;
     *)

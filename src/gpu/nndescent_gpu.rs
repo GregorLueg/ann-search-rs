@@ -1452,7 +1452,7 @@ pub fn cagra_merge_graphs(
 ///
 /// The final graph has exactly `k` neighbours per node (the user-requested
 /// degree). Internally, NNDescent runs at a higher degree (`build_k`, default
-/// `2*k`) which CAGRA then prunes down to `k`.
+/// `1.5*k`) which CAGRA then prunes down to `k`.
 pub struct NNDescentGpu<T: AnnSearchFloat + CubeclFloat, R: Runtime> {
     /// Original (unpadded) vector data, flattened row-major
     pub vectors_flat: Vec<T>,
@@ -1585,11 +1585,16 @@ where
     ///   Defaults to `1.5 * k`. Must be >= `k`.
     /// * `max_iters` - Maximum NNDescent iterations (default 15)
     /// * `n_trees` - Number of Annoy trees for graph initialisation.
-    ///   Defaults to `5 + n^0.25`, capped at 32.
+    ///   Defaults to `5 + n^0.25`, capped at 20.
     /// * `delta` - Convergence threshold as fraction of n*k (default `0.001`)
     /// * `rho` - Sampling rate for the local join (default `1.0`, no sampling)
+    /// * `refine_knn` - 2-hop refinement sweeps after the main NNDescent loop
+    ///   (default `0`)
     /// * `seed` - Random seed
     /// * `verbose` - Print progress
+    /// * `retain_gpu` - Keep the vectors, norms and navigational graph
+    ///   device-resident after the build so a later beam search does not
+    ///   re-upload them
     /// * `device` - CubeCL runtime device
     ///
     /// ### Returns
@@ -2132,8 +2137,7 @@ where
 
         self.check_dim(dim_query)?;
 
-        let query_params =
-            query_params.unwrap_or_else(|| CagraGpuSearchParams::from_graph(k, self.k));
+        let query_params = query_params.unwrap_or_else(|| CagraGpuSearchParams::from_k(k));
         let n_entry = query_params.get_n_entry();
         self.ensure_gpu_tensors()?;
         let client = R::client(&self._device);
@@ -2247,8 +2251,11 @@ where
     ///
     /// ### Params
     ///
-    /// * `k` - Truncate each row to this many neighbours. `None` keeps the
-    ///   full build-time `k`.
+    /// * `k` - Truncate each row to this **total** length, self-edge included
+    ///   when `include_self` is set. `None` keeps the full build-time `k`.
+    /// * `include_self` - Prepend `(i, 0)` to row `i`, matching what every
+    ///   `query_*_self` and an exhaustive ground truth return. Leave unset for
+    ///   true neighbours only.
     /// * `return_dist` - Whether to include distances in the output
     ///
     /// ### Returns
@@ -2259,9 +2266,17 @@ where
     pub fn extract_knn(
         &self,
         k: Option<usize>,
+        include_self: bool,
         return_dist: bool,
     ) -> (Vec<Vec<usize>>, Option<Vec<Vec<T>>>) {
-        unpack_knn_graph(&self.knn_graph, self.n, self.k, k, return_dist)
+        unpack_knn_graph(
+            &self.knn_graph,
+            self.n,
+            self.k,
+            k,
+            include_self,
+            return_dist,
+        )
     }
 
     /// Self-query: run GPU beam search for every vector in the index.
@@ -2288,8 +2303,7 @@ where
     {
         self.ensure_gpu_tensors()?;
 
-        let query_params =
-            query_params.unwrap_or_else(|| CagraGpuSearchParams::from_graph(k, self.k));
+        let query_params = query_params.unwrap_or_else(|| CagraGpuSearchParams::from_k(k));
         let n_entry = query_params.get_n_entry();
 
         let client = R::client(&self._device);
@@ -2457,8 +2471,11 @@ where
     ///
     /// ### Params
     ///
-    /// * `k` - Truncate each row to this many neighbours. `None` keeps the
-    ///   full build-time `k`.
+    /// * `k` - Truncate each row to this **total** length, self-edge included
+    ///   when `include_self` is set. `None` keeps the full build-time `k`.
+    /// * `include_self` - Prepend `(i, 0)` to row `i`, matching what every
+    ///   `query_*_self` and an exhaustive ground truth return. Leave unset for
+    ///   true neighbours only.
     /// * `return_dist` - Whether to materialise the distances
     ///
     /// ### Returns
@@ -2468,9 +2485,32 @@ where
     pub fn extract_knn(
         &self,
         k: Option<usize>,
+        include_self: bool,
         return_dist: bool,
     ) -> (Vec<Vec<usize>>, Option<Vec<Vec<T>>>) {
-        unpack_knn_graph(&self.knn_graph, self.n, self.k, k, return_dist)
+        unpack_knn_graph(
+            &self.knn_graph,
+            self.n,
+            self.k,
+            k,
+            include_self,
+            return_dist,
+        )
+    }
+
+    /// Returns the CPU-side memory footprint of the graph in bytes.
+    ///
+    /// Does not account for any GPU-resident tensors; the build releases them
+    /// before returning.
+    ///
+    /// ### Returns
+    ///
+    /// Total bytes allocated on the CPU for this struct and its owned Vecs.
+    pub fn memory_usage_bytes(&self) -> usize {
+        std::mem::size_of_val(self)
+            + self.vectors_flat.capacity() * std::mem::size_of::<T>()
+            + self.norms.capacity() * std::mem::size_of::<T>()
+            + self.knn_graph.capacity() * std::mem::size_of::<(usize, T)>()
     }
 }
 
@@ -3374,7 +3414,7 @@ mod tests {
         )
         .unwrap();
 
-        let (indices, Some(distances)) = index.extract_knn(None, true) else {
+        let (indices, Some(distances)) = index.extract_knn(None, false, true) else {
             panic!("Expected distances");
         };
 
@@ -3388,7 +3428,7 @@ mod tests {
         }
 
         // Without distances
-        let (indices, dists) = index.extract_knn(None, false);
+        let (indices, dists) = index.extract_knn(None, false, false);
         assert_eq!(indices.len(), 20);
         assert!(dists.is_none());
     }
@@ -4236,7 +4276,7 @@ mod kernel_tests {
         )
         .unwrap();
 
-        let (knn_indices, _) = index.extract_knn(None, false);
+        let (knn_indices, _) = index.extract_knn(None, false, false);
 
         let mut total_hits = 0;
         let total_possible = n * k;

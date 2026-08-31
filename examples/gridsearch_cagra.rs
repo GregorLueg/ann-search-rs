@@ -48,6 +48,7 @@ fn main() {
         total_time_ms: cpu_ex_build + cpu_ex_query,
         recall_at_k: 1.0,
         mean_dist_rat: 1.0,
+        median_dist_rat: 1.0,
         index_size_mb: cpu_ex_size,
     });
 
@@ -64,6 +65,7 @@ fn main() {
         total_time_ms: cpu_ex_build + cpu_ex_self,
         recall_at_k: 1.0,
         mean_dist_rat: 1.0,
+        median_dist_rat: 1.0,
         index_size_mb: cpu_ex_size,
     });
 
@@ -94,6 +96,11 @@ fn main() {
         gpu_ex_distances.as_ref().unwrap(),
         cli.k,
     );
+    let dist_err_median = calculate_median_distance_ratio(
+        true_distances.as_ref().unwrap(),
+        gpu_ex_distances.as_ref().unwrap(),
+        cli.k,
+    );
 
     results.push(BenchmarkResultSize {
         method: "GPU-Exhaustive (query)".to_string(),
@@ -102,6 +109,7 @@ fn main() {
         total_time_ms: gpu_ex_build + gpu_ex_query,
         recall_at_k: recall,
         mean_dist_rat: dist_err,
+        median_dist_rat: dist_err_median,
         index_size_mb: gpu_ex_size,
     });
 
@@ -117,6 +125,11 @@ fn main() {
         gpu_ex_self_distances.as_ref().unwrap(),
         cli.k,
     );
+    let dist_err_self_median = calculate_median_distance_ratio(
+        true_distances_self.as_ref().unwrap(),
+        gpu_ex_self_distances.as_ref().unwrap(),
+        cli.k,
+    );
 
     results.push(BenchmarkResultSize {
         method: "GPU-Exhaustive (self)".to_string(),
@@ -125,6 +138,7 @@ fn main() {
         total_time_ms: gpu_ex_build + gpu_ex_self,
         recall_at_k: recall_self,
         mean_dist_rat: dist_err_self,
+        median_dist_rat: dist_err_self_median,
         index_size_mb: gpu_ex_size,
     });
 
@@ -172,6 +186,11 @@ fn main() {
         cagra_distances.as_ref().unwrap(),
         cli.k,
     );
+    let dist_err_median = calculate_median_distance_ratio(
+        true_distances.as_ref().unwrap(),
+        cagra_distances.as_ref().unwrap(),
+        cli.k,
+    );
 
     results.push(BenchmarkResultSize {
         method: "CAGRA-auto (query)".to_string(),
@@ -180,6 +199,7 @@ fn main() {
         total_time_ms: cagra_build + cagra_query,
         recall_at_k: recall,
         mean_dist_rat: dist_err,
+        median_dist_rat: dist_err_median,
         index_size_mb: cagra_size,
     });
 
@@ -195,6 +215,11 @@ fn main() {
         cagra_self_distances.as_ref().unwrap(),
         cli.k,
     );
+    let dist_err_self_median = calculate_median_distance_ratio(
+        true_distances_self.as_ref().unwrap(),
+        cagra_self_distances.as_ref().unwrap(),
+        cli.k,
+    );
 
     results.push(BenchmarkResultSize {
         method: "CAGRA-auto (self)".to_string(),
@@ -203,6 +228,7 @@ fn main() {
         total_time_ms: cagra_build + cagra_self,
         recall_at_k: recall_self,
         mean_dist_rat: dist_err_self,
+        median_dist_rat: dist_err_self_median,
         index_size_mb: cagra_size,
     });
 
@@ -235,6 +261,11 @@ fn main() {
             cagra_distances.as_ref().unwrap(),
             cli.k,
         );
+        let dist_err_median = calculate_median_distance_ratio(
+            true_distances.as_ref().unwrap(),
+            cagra_distances.as_ref().unwrap(),
+            cli.k,
+        );
 
         results.push(BenchmarkResultSize {
             method: format!("CAGRA-bw{} (query)", bw),
@@ -243,6 +274,7 @@ fn main() {
             total_time_ms: cagra_build + cagra_query,
             recall_at_k: recall,
             mean_dist_rat: dist_err,
+            median_dist_rat: dist_err_median,
             index_size_mb: cagra_size,
         });
 
@@ -262,6 +294,11 @@ fn main() {
             cagra_self_distances.as_ref().unwrap(),
             cli.k,
         );
+        let dist_err_self_median = calculate_median_distance_ratio(
+            true_distances_self.as_ref().unwrap(),
+            cagra_self_distances.as_ref().unwrap(),
+            cli.k,
+        );
 
         results.push(BenchmarkResultSize {
             method: format!("CAGRA-bw{} (self)", bw),
@@ -270,6 +307,7 @@ fn main() {
             total_time_ms: cagra_build + cagra_self,
             recall_at_k: recall_self,
             mean_dist_rat: dist_err_self,
+            median_dist_rat: dist_err_self_median,
             index_size_mb: cagra_size,
         });
     }

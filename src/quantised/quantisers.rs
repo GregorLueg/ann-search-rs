@@ -1,15 +1,27 @@
-//! Module contains the different quantisers
+//! Product and optimised-product quantisers, plus the BF16 helpers.
+//!
+//! Scalar 8-bit quantisation lives in [`crate::quantised::uniform_quant`]: it
+//! shares one scale across every dimension, which is what lets a code-to-code
+//! distance stay faithful to the metric the caller asked for.
 
-use faer::{Mat, Scale};
+use faer::linalg::matmul::matmul;
+use faer::{Accum, Mat, MatMut, MatRef, Par, Scale};
 use half::bf16;
 use num_traits::{Float, FromPrimitive, ToPrimitive};
 use rayon::prelude::*;
 
+use std::num::NonZero;
 use std::ops::AddAssign;
 
 use crate::prelude::*;
 use crate::quantised::k_means::*;
 use crate::utils::k_means_utils::*;
+
+/// Rows per tile of the OPQ rotation GEMM.
+///
+/// Bounds the intermediate to `ROTATION_ROW_TILE * dim` elements. Matches the
+/// tile the k-means assignment path uses for the same shape of work.
+const ROTATION_ROW_TILE: usize = 4096;
 
 ///////////////////////
 // Bf16 quantisation //
@@ -88,108 +100,6 @@ where
         .sqrt();
 
     T::from_f32(res).unwrap()
-}
-
-/////////////////////////
-// Scalar quantisation //
-/////////////////////////
-
-/// ScalarQuantiser
-///
-/// ### Fields
-///
-/// * `scales` - The maximum absolute values across each dimensions for
-///   renormalisation.
-#[cfg_attr(feature = "serialise", derive(serde::Serialize, serde::Deserialize))]
-pub struct ScalarQuantiser<T> {
-    /// The maximum absolute values across each dimensions for renormalisation.
-    pub scales: Vec<T>,
-}
-
-impl<T> ScalarQuantiser<T>
-where
-    T: Float + FromPrimitive + ToPrimitive + Send + Sync,
-{
-    /// Train the scalar quantiser on a flat vector
-    ///
-    /// ### Params
-    ///
-    /// * `vec` - Flat slice of the values to quantise
-    /// * `dim` - Number features in the vector
-    ///
-    /// ### Returns
-    ///
-    /// Initialised self
-    pub fn train(vec: &[T], dim: usize) -> Self {
-        let scales = (0..dim)
-            .into_par_iter()
-            .map(|d| {
-                vec.chunks_exact(dim)
-                    .map(|chunk| chunk[d].abs())
-                    .fold(T::zero(), |max, val| max.max(val))
-            })
-            .map(|scale| {
-                if scale <= T::zero() {
-                    T::one()
-                } else {
-                    scale / T::from_f32(128.0).unwrap()
-                }
-            })
-            .collect();
-
-        Self { scales }
-    }
-
-    /// Encode a vector
-    ///
-    /// ### Params
-    ///
-    /// * `vec` - Vector to encode
-    ///
-    /// ### Returns
-    ///
-    /// The quantised vector
-    #[inline]
-    pub fn encode(&self, vec: &[T]) -> Vec<i8> {
-        vec.iter()
-            .enumerate()
-            .map(|(d, &val)| {
-                let scaled = val / self.scales[d];
-                let rounded = scaled + T::from_f32(0.5).unwrap() * scaled.signum();
-                let clamped = rounded
-                    .min(T::from_i8(127).unwrap())
-                    .max(T::from_i8(-128).unwrap());
-                clamped.to_i8().unwrap_or(0)
-            })
-            .collect()
-    }
-
-    /// Decode a vector
-    ///
-    /// ### Params
-    ///
-    /// * `quantised` - The quantised vector
-    ///
-    /// ### Returns
-    ///
-    /// Original decompressed vector
-    #[inline]
-    pub fn decode(&self, quantised: &[i8]) -> Vec<T> {
-        quantised
-            .iter()
-            .enumerate()
-            .map(|(d, &val)| T::from_i8(val).unwrap() * self.scales[d])
-            .collect()
-    }
-
-    /// Returns the size of the quantiser
-    ///
-    /// ### Returns
-    ///
-    /// Number of bytes used by the index
-    pub fn memory_usage_bytes(&self) -> usize {
-        std::mem::size_of_val(self) + self.scales.capacity() * std::mem::size_of::<T>()
-    }
 }
 
 //////////////////////
@@ -721,31 +631,28 @@ where
     ///
     /// Flat rotated vectors (length = n * dim)
     fn apply_rotation(vectors: &[T], rotation: &[T], dim: usize, n: usize) -> Vec<T> {
-        // Build faer matrices
-        let mut x = Mat::<f32>::zeros(n, dim);
-        let mut r = Mat::<f32>::zeros(dim, dim);
-
-        for i in 0..n {
-            for j in 0..dim {
-                x[(i, j)] = vectors[i * dim + j].to_f32().unwrap();
-            }
-        }
-
-        for i in 0..dim {
-            for j in 0..dim {
-                r[(i, j)] = rotation[i * dim + j].to_f32().unwrap();
-            }
-        }
-
-        let x_r = x * r.transpose();
-
-        // Convert back
         let mut out = vec![T::zero(); n * dim];
-        for i in 0..n {
-            for j in 0..dim {
-                out[i * dim + j] = T::from_f32(x_r[(i, j)]).unwrap();
-            }
-        }
+        let r = MatRef::from_row_major_slice(rotation, dim, dim);
+
+        // Tiled and rayon-parallel, writing straight into `out`. The input and
+        // output slices are already the row-major layout faer wants, so nothing
+        // is copied on the way in or out.
+        vectors
+            .par_chunks(ROTATION_ROW_TILE * dim)
+            .zip(out.par_chunks_mut(ROTATION_ROW_TILE * dim))
+            .for_each(|(rows_flat, out_tile)| {
+                let rows = rows_flat.len() / dim;
+                let mut dst = MatMut::from_row_major_slice_mut(out_tile, rows, dim);
+
+                matmul(
+                    dst.as_mut(),
+                    Accum::Replace,
+                    MatRef::from_row_major_slice(rows_flat, rows, dim),
+                    r.transpose(),
+                    T::one(),
+                    Par::Seq,
+                );
+            });
 
         out
     }
@@ -767,29 +674,28 @@ where
     ///
     /// Updated rotation matrix (dim × dim, row-major)
     fn compute_rotation(x_original: &[T], x_recon: &[T], dim: usize, n: usize) -> Vec<T> {
-        // Build matrices
-        let mut x = Mat::<f32>::zeros(n, dim);
-        let mut y = Mat::<f32>::zeros(n, dim);
+        let x = MatRef::from_row_major_slice(x_original, n, dim);
+        let y = MatRef::from_row_major_slice(x_recon, n, dim);
 
-        for i in 0..n {
-            for j in 0..dim {
-                x[(i, j)] = x_original[i * dim + j].to_f32().unwrap();
-                y[(i, j)] = x_recon[i * dim + j].to_f32().unwrap();
-            }
-        }
+        // One `dim x dim` GEMM with no outer parallelism, so faer gets the
+        // threads. Both operands are already row-major, so neither is copied.
+        let mut c = Mat::<T>::zeros(dim, dim);
+        matmul(
+            c.as_mut(),
+            Accum::Replace,
+            x.transpose(),
+            y,
+            T::one(),
+            Par::Rayon(NonZero::new(rayon::current_num_threads().max(1)).unwrap()),
+        );
 
-        let c = x.transpose() * y;
-
-        // rest stays the same
-        let svd = c.thin_svd().unwrap();
-        let u = svd.U();
-        let v = svd.V();
-        let r = v * u.transpose();
+        let svd = c.as_ref().thin_svd().unwrap();
+        let r = svd.V() * svd.U().transpose();
 
         let mut rotation = vec![T::zero(); dim * dim];
         for i in 0..dim {
             for j in 0..dim {
-                rotation[i * dim + j] = T::from_f32(r[(i, j)]).unwrap();
+                rotation[i * dim + j] = r[(i, j)];
             }
         }
         rotation
@@ -874,8 +780,55 @@ where
 
 #[cfg(test)]
 mod tests {
+
+    /// The tiled GEMM replaced a whole-matrix rotation that materialised three
+    /// copies of the data. It has to agree with the per-vector path, including
+    /// on a row count that straddles the tile boundary.
+    #[test]
+    fn test_apply_rotation_matches_per_vector() {
+        let dim = 16;
+        let n = ROTATION_ROW_TILE + 53;
+
+        // Orthogonal rotation from a QR of a deterministic pseudo-random matrix
+        let mut raw = vec![0.0f64; dim * dim];
+        for (i, v) in raw.iter_mut().enumerate() {
+            let mut x = (i as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+            x ^= x >> 33;
+            x = x.wrapping_mul(0xFF51_AFD7_ED55_8CCD);
+            x ^= x >> 33;
+            *v = (x as f64 / u64::MAX as f64) * 2.0 - 1.0;
+        }
+        let q = Mat::<f64>::from_fn(dim, dim, |i, j| raw[i * dim + j])
+            .as_ref()
+            .qr()
+            .compute_Q();
+        let rotation: Vec<f64> = (0..dim * dim).map(|i| q[(i / dim, i % dim)]).collect();
+
+        let mut data = vec![0.0f64; n * dim];
+        for (i, v) in data.iter_mut().enumerate() {
+            *v = ((i as f64) * 0.31).sin() * 2.0 - 0.4;
+        }
+
+        let batched =
+            OptimisedProductQuantiser::<f64>::apply_rotation(&data, &rotation, dim, n);
+
+        for i in 0..n {
+            let one = OptimisedProductQuantiser::<f64>::rotate_vector(
+                &data[i * dim..(i + 1) * dim],
+                &rotation,
+                dim,
+            );
+            for j in 0..dim {
+                approx::assert_relative_eq!(
+                    batched[i * dim + j],
+                    one[j],
+                    epsilon = 1e-12,
+                    max_relative = 1e-12
+                );
+            }
+        }
+    }
     use super::*;
-    use approx::assert_relative_eq;
 
     #[test]
     fn test_encode_bf16_empty() {
@@ -975,66 +928,6 @@ mod tests {
         let data = vec![0.0_f32];
         let encoded = encode_bf16_quantisation(&data);
         assert_eq!(encoded[0].to_f32(), 0.0);
-    }
-
-    #[test]
-    fn test_scalar_quantiser_train() {
-        let mut data = Vec::new();
-        for i in 0..4 {
-            for j in 0..32 {
-                data.push((i * 32 + j) as f32);
-            }
-        }
-
-        let pq =
-            ProductQuantiser::train(&data, 32, 2, Some(2), &Dist::SquaredEuclidean, 5, 42, false)
-                .unwrap();
-
-        assert_eq!(pq.m(), 2);
-        assert_eq!(pq.subvec_dim(), 16);
-        assert_eq!(pq.n_centroids(), 2);
-        assert_eq!(pq.codebooks().len(), 2);
-        assert_eq!(pq.codebooks()[0].len(), 32); // 2 centroids * 16 dims
-        assert_eq!(pq.codebooks()[1].len(), 32);
-    }
-
-    #[test]
-    fn test_scalar_quantiser_encode_decode() {
-        let data = vec![127.0, 0.0, -127.0, 63.5, 0.0, -63.5];
-        let sq = ScalarQuantiser::train(&data, 3);
-
-        let vec = vec![100.0, -25.0, 50.0];
-        let encoded = sq.encode(&vec);
-        let decoded = sq.decode(&encoded);
-
-        assert_eq!(encoded.len(), 3);
-        assert_eq!(decoded.len(), 3);
-
-        // Check values are reasonably close
-        for (orig, dec) in vec.iter().zip(decoded.iter()) {
-            assert!((orig - dec).abs() < orig.abs() * 0.02);
-        }
-    }
-
-    #[test]
-    fn test_scalar_quantiser_clamping() {
-        let data = vec![1.0, 1.0];
-        let sq = ScalarQuantiser::train(&data, 2);
-
-        let vec = vec![200.0, -200.0];
-        let encoded = sq.encode(&vec);
-
-        assert_eq!(encoded[0], 127);
-        assert_eq!(encoded[1], -128);
-    }
-
-    #[test]
-    fn test_scalar_quantiser_zero_scale() {
-        let data = vec![0.0, 10.0, 0.0, 20.0];
-        let sq = ScalarQuantiser::train(&data, 2);
-
-        // First dimension is all zeros, should default to 1.0
-        assert_relative_eq!(sq.scales[0], 1.0, epsilon = 1e-5);
     }
 
     #[test]

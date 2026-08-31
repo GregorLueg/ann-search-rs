@@ -17,7 +17,7 @@ import numpy as np
 from beartype import beartype
 
 from . import _ann_search as _core
-from ._base import BaseAnnIndex
+from ._base import BaseAnnIndex, ExtractKnnMixin
 from ._metrics import NO_MANHATTAN
 
 ###########
@@ -216,7 +216,7 @@ class IvfIndex(BaseAnnIndex):
         )
 
 
-class NNDescentIndex(BaseAnnIndex):
+class NNDescentIndex(ExtractKnnMixin, BaseAnnIndex):
     """NN-Descent kNN graph.
 
     Builds the neighbour graph directly by iterative local join, which makes it
@@ -225,6 +225,11 @@ class NNDescentIndex(BaseAnnIndex):
 
     `diversify_prob` prunes redundant edges after descent: ``0.0`` disables it,
     ``1.0`` prunes whenever the rule fires.
+
+    `extract_knn` hands back the converged graph instead of searching for it
+    again, which is far cheaper than ``kneighbors(None)``. It reads the
+    post-pruning graph, so leave ``diversify_prob`` at 0 if extraction is the
+    point.
     """
 
     _HANDLE: ClassVar[type] = _core.NnDescent

@@ -1955,8 +1955,11 @@ where
     ///
     /// ### Params
     ///
-    /// * `k` - Truncate each row to this many neighbours. `None` keeps the
-    ///   full build-time `k`.
+    /// * `k` - Truncate each row to this **total** length, self-edge included
+    ///   when `include_self` is set. `None` keeps the full build-time `k`.
+    /// * `include_self` - Prepend `(i, 0)` to row `i`, matching what every
+    ///   `query_*_self` and an exhaustive ground truth return. Leave unset for
+    ///   true neighbours only.
     /// * `return_dist` - Whether to materialise the distances
     ///
     /// ### Returns
@@ -1965,9 +1968,10 @@ where
     pub fn extract_knn(
         &self,
         k: Option<usize>,
+        include_self: bool,
         return_dist: bool,
     ) -> (Vec<Vec<usize>>, Option<Vec<Vec<T>>>) {
-        unpack_knn_graph(&self.graph, self.n, self.k, k, return_dist)
+        unpack_knn_graph(&self.graph, self.n, self.k, k, include_self, return_dist)
     }
 
     /// Generate a kNN graph by querying every vector in the index.
@@ -3116,7 +3120,7 @@ mod tests {
         // which is what the join itself is responsible for.
         let k = index.k;
         let dim = index.dim;
-        let rows = index.extract_knn(None, false).0;
+        let rows = index.extract_knn(None, false, false).0;
         let mut hits = 0usize;
         let mut total = 0usize;
         for i in 0..index.n {
@@ -3223,7 +3227,7 @@ mod tests {
         )
         .unwrap();
 
-        let (ids, dists) = index.extract_knn(None, true);
+        let (ids, dists) = index.extract_knn(None, false, true);
         let dists = dists.unwrap();
 
         assert_eq!(ids.len(), index.n);
@@ -3236,7 +3240,7 @@ mod tests {
 
         // No re-query, so it must not agree with the beam-search path by
         // construction; it only has to be a subset of the stored rows.
-        let (short, none) = index.extract_knn(Some(1), false);
+        let (short, none) = index.extract_knn(Some(1), false, false);
         assert!(none.is_none());
         assert!(short.iter().all(|r| r.len() <= 1));
     }
@@ -3279,7 +3283,7 @@ mod tests {
 
             // Extraction truncates from the front, so it must hand back the
             // closest entries and nothing further out.
-            let (_, dists) = index.extract_knn(Some(3), true);
+            let (_, dists) = index.extract_knn(Some(3), false, true);
             for row in dists.unwrap() {
                 assert!(row.windows(2).all(|w| w[0] <= w[1]));
                 assert!(row.len() <= 3);

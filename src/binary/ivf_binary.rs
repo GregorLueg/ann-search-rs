@@ -207,12 +207,9 @@ where
 
         // 3. assign all vectors to centroids in float space
         let data_norms = if metric == Dist::Cosine {
-            (0..n)
-                .map(|i| {
-                    let start = i * dim;
-                    let end = start + dim;
-                    T::calculate_l2_norm(&vectors_flat[start..end])
-                })
+            vectors_flat
+                .par_chunks_exact(dim)
+                .map(T::calculate_l2_norm)
                 .collect()
         } else {
             vec![T::one(); n]
@@ -348,7 +345,12 @@ where
             );
         }
 
-        // 1. subsample for training if needed
+        // 1. subsample for training if needed.
+        //
+        // Deliberately *not* `build`'s `min(256 * nlist, 250k)` rule, even
+        // though the disagreement between the two entry points is ugly. This
+        // path's codes are sign residuals against the centroids, so centroid
+        // quality feeds straight into them and the cheaper sample costs recall.
         let (training_data, n_train) = if n > 500_000 {
             if verbose {
                 println!("  Sampling 250k vectors for training");
@@ -372,33 +374,19 @@ where
         )?;
 
         let centroids_norm = if metric == Dist::Cosine {
-            (0..nlist)
-                .map(|i| {
-                    let start = i * dim;
-                    let end = start + dim;
-                    centroids_float[start..end]
-                        .iter()
-                        .map(|x| *x * *x)
-                        .fold(T::zero(), |a, b| a + b)
-                        .sqrt()
-                })
+            centroids_float
+                .chunks_exact(dim)
+                .map(T::calculate_l2_norm)
                 .collect()
         } else {
             Vec::new()
         };
 
         // 3. assign all vectors to centroids in float space
-        let data_norms = if metric == Dist::Cosine {
-            (0..n)
-                .map(|i| {
-                    let start = i * dim;
-                    let end = start + dim;
-                    vectors_flat[start..end]
-                        .iter()
-                        .map(|x| *x * *x)
-                        .fold(T::zero(), |a, b| a + b)
-                        .sqrt()
-                })
+        let data_norms: Vec<T> = if metric == Dist::Cosine {
+            vectors_flat
+                .par_chunks_exact(dim)
+                .map(T::calculate_l2_norm)
                 .collect()
         } else {
             vec![T::one(); n]
@@ -457,15 +445,16 @@ where
         // Save vector store
         std::fs::create_dir_all(&save_path)?;
 
-        let norms: Vec<T> = vectors_flat
-            .chunks_exact(dim)
-            .map(|row| {
-                row.iter()
-                    .map(|&x| x * x)
-                    .fold(T::zero(), |a, b| a + b)
-                    .sqrt()
-            })
-            .collect();
+        // Cosine already computed exactly these for the assignment step; the
+        // other metrics filled `data_norms` with ones and need the real thing.
+        let norms: Vec<T> = if metric == Dist::Cosine {
+            data_norms
+        } else {
+            vectors_flat
+                .par_chunks_exact(dim)
+                .map(T::calculate_l2_norm)
+                .collect()
+        };
 
         let (vectors_path, norms_path) = MmapVectorStore::<T>::paths_in(&save_path);
 
@@ -542,9 +531,7 @@ where
         let mut codes = vec![0u8; n * n_bytes];
 
         if !residual_codes {
-            for (i, row) in data.chunks_exact(dim).enumerate() {
-                codes[i * n_bytes..(i + 1) * n_bytes].copy_from_slice(&binariser.encode(row)?);
-            }
+            binariser.encode_all(data, n, &mut codes)?;
 
             return Ok(codes);
         }
@@ -760,6 +747,7 @@ where
 
         // 2. Search clusters using Hamming distance
         let mut heap: BinaryHeap<(u32, usize)> = BinaryHeap::with_capacity(k + 1);
+        let mut block = [0u32; HAMMING_BLOCK];
 
         for cluster_idx in probed {
             let query_binary: &[u8] = if self.residual_codes {
@@ -772,15 +760,26 @@ where
             let start = self.offsets[cluster_idx];
             let end = self.offsets[cluster_idx + 1];
 
-            for vec_idx in start..end {
-                let dist = self.hamming_distance_query(query_binary, vec_idx);
+            let mut vec_idx = start;
+            while vec_idx < end {
+                let take = HAMMING_BLOCK.min(end - vec_idx);
+                let codes = &self.vectors_flat_binarised
+                    [vec_idx * self.n_bytes..(vec_idx + take) * self.n_bytes];
+                let block_min =
+                    hamming_block(query_binary, codes, self.n_bytes, &mut block[..take]);
 
-                if heap.len() < k {
-                    heap.push((dist, vec_idx));
-                } else if dist < heap.peek().unwrap().0 {
-                    heap.pop();
-                    heap.push((dist, vec_idx));
+                if heap.len() < k || block_min < heap.peek().unwrap().0 {
+                    for (j, &dist) in block[..take].iter().enumerate() {
+                        if heap.len() < k {
+                            heap.push((dist, vec_idx + j));
+                        } else if dist < heap.peek().unwrap().0 {
+                            heap.pop();
+                            heap.push((dist, vec_idx + j));
+                        }
+                    }
                 }
+
+                vec_idx += take;
             }
         }
 
@@ -881,9 +880,18 @@ where
         let mut current_cell = usize::MAX;
         let mut residual: Vec<T> = Vec::new();
 
+        // One pass over the float side per cell, not one per candidate. Without
+        // residual codes the float side is the query itself and never changes.
+        let mut float_sum = if self.residual_codes {
+            T::zero()
+        } else {
+            query_vec.iter().fold(T::zero(), |acc, &x| acc + x)
+        };
+
         for (cell, physical, idx) in by_cell {
             if self.residual_codes && cell != current_cell {
                 residual = self.unit_query_residual(query_vec, query_norm, cell);
+                float_sum = residual.iter().fold(T::zero(), |acc, &x| acc + x);
                 current_cell = cell;
             }
 
@@ -899,7 +907,10 @@ where
                     .get_unchecked(start_i..start_i + self.n_bytes)
             };
 
-            scored.push((idx, asymmetric_binary_dot(float_side, vec_i, self.dim)));
+            scored.push((
+                idx,
+                asymmetric_binary_dot_presummed(float_side, float_sum, vec_i, self.dim),
+            ));
         }
 
         // `asymmetric_binary_dot` is a similarity, not a distance: the query's
@@ -1153,20 +1164,36 @@ where
                     }
 
                     let mut heap: BinaryHeap<(u32, usize)> = BinaryHeap::with_capacity(k + 1);
+                    let mut block = [0u32; HAMMING_BLOCK];
 
                     for cluster_idx in 0..self.nlist {
                         let start_idx = self.offsets[cluster_idx];
                         let end_idx = self.offsets[cluster_idx + 1];
 
-                        for vec_idx in start_idx..end_idx {
-                            let dist = self.hamming_distance_query(query_binary, vec_idx);
+                        let mut vec_idx = start_idx;
+                        while vec_idx < end_idx {
+                            let take = HAMMING_BLOCK.min(end_idx - vec_idx);
+                            let codes = &self.vectors_flat_binarised
+                                [vec_idx * self.n_bytes..(vec_idx + take) * self.n_bytes];
+                            let block_min = hamming_block(
+                                query_binary,
+                                codes,
+                                self.n_bytes,
+                                &mut block[..take],
+                            );
 
-                            if heap.len() < k {
-                                heap.push((dist, vec_idx));
-                            } else if dist < heap.peek().unwrap().0 {
-                                heap.pop();
-                                heap.push((dist, vec_idx));
+                            if heap.len() < k || block_min < heap.peek().unwrap().0 {
+                                for (j, &dist) in block[..take].iter().enumerate() {
+                                    if heap.len() < k {
+                                        heap.push((dist, vec_idx + j));
+                                    } else if dist < heap.peek().unwrap().0 {
+                                        heap.pop();
+                                        heap.push((dist, vec_idx + j));
+                                    }
+                                }
                             }
+
+                            vec_idx += take;
                         }
                     }
 
@@ -1243,12 +1270,15 @@ where
             }
         }
 
-        let mut new_binarised = Vec::with_capacity(self.vectors_flat_binarised.len());
-        for &old_id in &new_to_old {
-            let start = old_id * self.n_bytes;
-            new_binarised
-                .extend_from_slice(&self.vectors_flat_binarised[start..start + self.n_bytes]);
-        }
+        let n_bytes = self.n_bytes;
+        let mut new_binarised = vec![0u8; self.vectors_flat_binarised.len()];
+        new_binarised
+            .par_chunks_mut(n_bytes)
+            .zip(new_to_old.par_iter())
+            .for_each(|(slot, &old_id)| {
+                let start = old_id * n_bytes;
+                slot.copy_from_slice(&self.vectors_flat_binarised[start..start + n_bytes]);
+            });
 
         self.vectors_flat_binarised = new_binarised;
         self.old_to_new = old_to_new;

@@ -1,9 +1,8 @@
 ## Quantised indices benchmarks and parameter gridsearch
 
-Quantised indices compress the data stored in the index structure itself via
-quantisation. This can also in some cases accelerated substantially the query
-speed. The core idea is to trade in Recall for reduction in memory finger
-print. If you wish to run the examples, below is how you launch it.
+Quantised indices compress the vectors the index stores, trading recall for a
+smaller memory footprint. In several cases the query gets faster too, because
+integer kernels beat float ones. Below is how to run each example.
 
 **BF16:**
 
@@ -29,36 +28,55 @@ cargo run --example gridsearch_pq --release --features quantised -- --dim 512 --
 cargo run --example gridsearch_opq --release --features quantised -- --dim 512 --data embedding --n-samples 50000
 ```
 
-Similar to the other benchmarks, index building, query against 10% slightly
-different data based on the trainings data and full kNN generation is being
-benchmarked. Index size in memory is also provided. Compared to other
-benchmarks, we will use the `"correlated"`, `"lowrank"` and `"embedding"`
-with higher dimensionality, but reduced samples (for the sake of fast'ish
-benchmarking). The different synthetic data types pose different challenges
-for the quantisation methods.
+**HNSW on SQ8 codes:**
+
+```bash
+cargo run --example gridsearch_hnsw_quantised --release --features quantised -- --dim 128 --data cell
+```
+
+**SOAR-PQ and SOAR-OPQ:**
+
+```bash
+cargo run --example gridsearch_soar_pq  --release --features quantised -- --dim 512 --data embedding --n-samples 50000
+cargo run --example gridsearch_soar_opq --release --features quantised -- --dim 512 --data embedding --n-samples 50000
+```
+
+As with the other benchmarks: index build, query against a 10% subsample with
+noise added, and full self-kNN generation, plus the in-memory index size. The
+PQ-family runs use `"correlated"`, `"lowrank"` and `"embedding"` at higher
+dimensionality with fewer samples, since that is the regime these methods are
+for.
+
+**On the distance-ratio column.** A quantised index reports the codec's
+*estimate* of a distance, not the distance. Feeding that straight into the ratio
+conflates two errors and can push it below 1.0, which reads as "better than
+optimal" and is nothing of the sort. Every ratio here is recomputed in `f32`
+from the original vectors against the neighbours the index returned, so it
+measures retrieval quality alone and is directly comparable to an unquantised
+index's.
 
 ## Table of Contents
 
 - [BF16 quantisation](#bf16-ivf-and-exhaustive)
 - [SQ8 quantisation](#sq8-ivf-and-exhaustive)
+- [HNSW on SQ8 codes](#hnsw-on-sq8-codes)
 - [Product quantisation](#product-quantisation-exhaustive-and-ivf)
 - [Optimised product quantisation](#optimised-product-quantisation-exhaustive-and-ivf)
+- [SOAR-PQ and SOAR-OPQ](#soar-pq-and-soar-opq)
 
 ### BF16 (IVF and exhaustive)
 
-The BF16 quantisation reduces the floats to `bf16` which keeps the range of
-`f32`, but loses precision in the digits from ~3 onwards. The actual distance
-calculations in the index happen in `f32`; however, due to lossy compression
-to `bf16` there is some Recall loss. This is compensated with drastically
-reduced memory fingerprint (nearly halved for f32). The precision loss is
-higher for Cosine compared to Euclidean distance.
+Storage drops to `bf16`, which keeps the exponent range of `f32` and throws
+away mantissa bits from roughly the third digit on. Distances are still computed
+in `f32`, so the only loss is the stored value. Memory nearly halves for `f32`
+input. Cosine loses more precision than Euclidean.
 
-**Key parameters:**
+**Tunable parameters:**
 
-- *Number of lists (nl)*: The number of independent k-means cluster to generate.
-  If the structure of the data is unknown, people use `sqrt(n)` as a heuristic.
-- *Number of points (np)*: The number of clusters to probe during search.
-  Numbers here tend to be `sqrt(nlist)` or up to 5% of the nlist.
+- *Number of lists (nl)*: Number of k-means clusters. `sqrt(n)` is the usual
+  heuristic when the structure is unknown.
+- *Number of probes (np)*: Clusters probed at query time, typically
+  `sqrt(nlist)` or up to 5% of `nlist`.
 
 <details>
 <summary><b>BF16 quantisations - Euclidean (Gaussian)</b>:</summary>
@@ -110,25 +128,39 @@ higher for Cosine compared to Euclidean distance.
 
 ### SQ8 (IVF and exhaustive)
 
-This index uses scalar quantisation to 8-bits. It projects every dimensions
-onto an `i8`. This also causes a reduction of the memory finger print. In the
-case of 96 dimensions in f32 per vector, we go from *96 x 32 bits = 384 bytes*
-to *96 x 8 bits = 96 bytes per vector*, a **4x reduction in memory per vector**
-(with overhead of the codebook). Additionally, the querying becomes much faster
-due to integer math.
+Uniform scalar quantisation to 8-bit codes: a per-dimension offset plus a
+**single scale shared across every dimension**. That shared scale is the
+load-bearing part. With `x_j = s * c_j + b_j`, a difference is
+`x_j - y_j = s * (c_j - d_j)`, so the offsets cancel and the scale factors out.
+The integer distance between two codes therefore preserves the exact ordering of
+the float distance, which is what lets one kernel serve both index construction
+and query. Per-dimension *scales* would break that; the offsets are free.
 
-**Key parameters:**
+At 96 dimensions a vector goes from *96 x 32 bits = 384 bytes* to
+*96 x 8 bits = 96 bytes*, a **4x reduction** plus the codebook. The integer
+kernels also make the scan faster than the `f32` one rather than slower.
 
-- *Number of lists (nl)*: The number of independent k-means cluster to generate.
-  If the structure of the data is unknown, people use `sqrt(n)` as a heuristic.
-- *Number of points (np)*: The number of clusters to probe during search.
-  Numbers here tend to be `sqrt(nlist)` or up to 5% of the nlist.
+Ranking is exact whilst the code-space squared distance stays inside the float's
+integer range: for `f32` that means `255^2 * dim <= 2^24`, so up to 258
+dimensions. Past that, distances differing by one least-significant unit out of
+millions can tie. `f64` covers any realistic dimensionality, and PCA or latent
+spaces sit well inside the `f32` bound anyway.
+
+**Tunable parameters:**
+
+- *Drop ratio*: Fraction trimmed from **each** tail of every dimension before
+  the range is fixed; values outside clamp to the end codes. With one shared
+  scale the widest dimension sets the resolution for all of them, so a single
+  heavy-tailed dimension would otherwise starve the rest. Exposed via
+  `UniformQuantParams`.
+- *Calibration sample rows*: Rows sampled to estimate the tails. Auto-picks,
+  capped at the dataset size.
+- *Number of lists (nl)*: IVF only. Number of k-means clusters, `sqrt(n)` as a
+  default.
+- *Number of probes (np)*: IVF only. Typically `sqrt(nlist)` or up to 5% of
+  `nlist`.
 
 #### With 32 dimensions
-
-The quantisation performs well on GaussianNoise data; however, the it loses
-information for the correlated and also low rank data, indicating that complex
-structure is lost during the lossy compression (at least in lower dimensions).
 
 <details>
 <summary><b>SQ8 quantisations - Euclidean (Gaussian)</b>:</summary>
@@ -170,9 +202,6 @@ structure is lost during the lossy compression (at least in lower dimensions).
 
 #### More dimensions
 
-With higher dimensions, the Recall in more structured, correlated data does
-become better again.
-
 <details>
 <summary><b>SQ8 quantisations - Euclidean (LowRank - more dimensions)</b>:</summary>
 <pre><code>
@@ -180,75 +209,135 @@ become better again.
 </code></pre>
 </details>
 
+### HNSW on SQ8 codes
+
+An HNSW built **and** searched entirely on the uniform 8-bit codes described
+above, inspired by [pyglass](https://github.com/zilliztech/pyglass). Because the
+shared scale makes the integer code distance order-preserving, one kernel serves
+graph construction and query alike: the graph never sees a float. Memory drops
+4x against a plain HNSW and the build gets faster, since the construction search
+is doing integer arithmetic.
+
+The grid runs the full-precision HNSW at matched `(M, ef_construction,
+ef_search)` alongside it, plus an exhaustive scan over the same codec. The
+exhaustive-SQ8 row is the ceiling the graph rows work against: whatever they
+lose up to it is the codec, whatever they lose beyond it is the graph.
+
+**Tunable parameters:**
+
+- *M (m)*: Connections per node per layer.
+- *EF construction (ef)*: Candidate budget while wiring the graph.
+- *EF search (s)*: Candidate budget at query time.
+- *Drop ratio*: Tail trim on the quantiser calibration, swept separately at a
+  fixed `(M=16, ef=200)`. `0.0` is the pyglass default; the non-zero settings
+  are what a shared scale wants when a handful of points sit far out in one
+  dimension. Sweep runs `0.0`, `1e-3` and `1e-2`.
+
+Self is queried with `s=100`.
+
+<details>
+<summary><b>HNSW-SQ8U - Euclidean (Gaussian)</b>:</summary>
+</br>
+<pre><code>
+<!-- BENCH:hnsw_sq8u:euclidean:gaussian:32 -->
+</code></pre>
+</details>
+
+---
+
+<details>
+<summary><b>HNSW-SQ8U - Cosine (Gaussian)</b>:</summary>
+</br>
+<pre><code>
+<!-- BENCH:hnsw_sq8u:cosine:gaussian:32 -->
+</code></pre>
+</details>
+
+---
+
+<details>
+<summary><b>HNSW-SQ8U - Euclidean (Correlated)</b>:</summary>
+</br>
+<pre><code>
+<!-- BENCH:hnsw_sq8u:euclidean:correlated:32 -->
+</code></pre>
+</details>
+
+---
+
+<details>
+<summary><b>HNSW-SQ8U - Euclidean (LowRank)</b>:</summary>
+</br>
+<pre><code>
+<!-- BENCH:hnsw_sq8u:euclidean:lowrank:32 -->
+</code></pre>
+</details>
+
+---
+
+<details>
+<summary><b>HNSW-SQ8U - Euclidean (NN embeddings; more dimensions)</b>:</summary>
+</br>
+<pre><code>
+<!-- BENCH:hnsw_sq8u:euclidean:cell:128 -->
+</code></pre>
+</details>
+
+---
+
+<details>
+<summary><b>HNSW-SQ8U - Cosine (NN embeddings; more dimensions)</b>:</summary>
+</br>
+<pre><code>
+<!-- BENCH:hnsw_sq8u:cosine:cell:128 -->
+</code></pre>
+</details>
+
 ### Product quantisations
 
-Product quantisation methods (PQ, OPQ) compress vectors far more aggressively
-than BF16 or SQ8 by dividing each vector into subvectors and encoding each with
-a small codebook. Compared to the previous benchmarks, we use higher
-dimensionality (128, 256, 512) with reduced sample counts (50k - for faster
-bench marking) to reflect the regime where these methods are most relevant:
-large vectors under memory pressure. We benchmark against three synthetic data
-types of increasing difficulty:
+PQ and OPQ compress far harder than BF16 or SQ8: each vector is split into
+subvectors and every subvector is replaced by a codebook index. These runs use
+256, 512 and 768 dimensions at 50k samples, the regime these methods exist for.
+Three synthetic types of increasing difficulty:
 
-- `"correlated"` data with subspace-clustered activation patterns.
-- `"lowrank"` data embedded from a lower-dimensional manifold.
-- Lastly, `"quantisation"` stress data that combines power-law spectral decay
-  with norm-stratified clusters: specifically designed to expose failure modes
-  of aggressive quantisation such as sign binarisation, axis-aligned sub-vector
-  splits, and low-bit angular resolution loss.
+- `"correlated"`: subspace-clustered activation patterns.
+- `"lowrank"`: embedded from a lower-dimensional manifold.
+- `"embedding"`: foundation-model cell embeddings, which combine a shared
+  anisotropy cone, a few rogue high-variance axes and per-cell-type oriented
+  subspaces. Between them those break sign binarisation, axis-aligned subvector
+  splits and any single global rotation.
 
 #### Product quantisation (Exhaustive and IVF)
 
-This index uses product quantisation. To note, the quantisation is quite harsh
-and hence, reduces the Recall quite substantially. In the case of 192
-dimensions, each vector gets reduced to
-from *192 x 32 bits (192 x f32) = 768 bytes* to for
-*m = 32 (32 sub vectors) to 32 x u8 = 32 bytes*, a
-**24x reduction in memory usage** (of course with overhead from the cook book).
-However, it can still be useful in situation where good enough works and you
-have VERY large scale data and memory constraints start biting.
+Harsh compression. At 192 dimensions with `m = 32` a vector goes from
+*192 x f32 = 768 bytes* to *32 x u8 = 32 bytes*, a **24x reduction** plus the
+codebook. Worth it when good enough is good enough and memory is the binding
+constraint.
 
-**Key parameters:**
+**Tunable parameters:**
 
-- *Number of lists (nl)*: The number of independent k-means cluster to generate.
-  If the structure of the data is unknown, people use `sqrt(n)` as a heuristic.
-- *Number of points (np)*: The number of clusters to probe during search.
-  Numbers here tend to be `sqrt(nlist)` or up to 5% of the nlist.
-- *Number of subvectors (m)*: In how many subvectors to divide the given main
-  vector. The initial dimensionality needs to be divisable by m.
+- *Number of subvectors (m)*: How many subvectors to split each vector into.
+  The dimensionality must be divisible by `m`. Each subvector becomes one `u8`,
+  so `m` sets the compressed size directly.
+- *Number of lists (nl)*: IVF only. Number of k-means clusters, `sqrt(n)` as a
+  default.
+- *Number of probes (np)*: IVF only. Typically `sqrt(nlist)` or up to 5% of
+  `nlist`. The self queries default to `sqrt(nlist)`.
 
-The self queries here run on the compressed indices stored in the structure
-itself. We can appreciate that the lossy compression affects the recall here. If
-you wish to get great kNN graphs from these indices, you need to re-supply the
-non-compressed data (at cost of memory!). Similar to `SQ8`-indices, the
-distances are difficult to interpret/compare against original vectors due to
-the heavy quantisation, thus, are not reported. The self queries default
-to `sqrt(nlist)`.
+The self queries run against the compressed vectors held in the index. If you
+want a high-quality kNN graph out of one of these, re-supply the uncompressed
+data, at the obvious memory cost.
 
-#### Why IVF massively outperforms Exhaustive PQ
+#### Why the IVF variant beats the exhaustive one
 
-A key observation is the large outperformance of the IVF index over the
-exhaustive index. This is not incidental - it is fundamental to how PQ works.
+PQ's error is driven by the **variance** of whatever it is asked to encode:
+lower variance lets 256 centroids per subspace tile the space more densely.
+IVF-PQ clusters first and encodes **residuals** against the cell centroid, which
+are small and tightly distributed. Exhaustive-PQ encodes raw vectors, so the
+whole dataset's diversity competes for the same 256 centroids per subspace.
 
-Product quantisation divides each vector into m subvectors and quantises each
-to one of 256 centroids. The quality of this approximation depends critically
-on the **variance** of the data being quantised: lower variance means the 256
-centroids can tile the space more densely, yielding smaller quantisation error.
-
-**IVF-PQ** first clusters the dataset, then encodes **residuals** (vector minus
-cluster centroid) rather than raw vectors. Vectors within a cluster are similar,
-so their residuals are small, tightly distributed around zero, and share
-correlated structure. The PQ codebooks can represent these local patterns
-efficiently.
-
-**Exhaustive-PQ** must encode raw vectors directly. The codebooks must represent
-the entire dataset's diversity - wildly different vectors compete for the same
-256 centroids per subspace. This leads to fundamentally higher quantisation
-error.
-
-In short: IVF's clustering creates **locality**, and locality is what PQ needs
-to quantise accurately. Mean-centering or rotations (OPQ) do not create this
-locality - they shift or rotate the data but do not reduce its intrinsic
+Clustering creates locality, and locality is what PQ needs. Mean-centring or a
+rotation (OPQ) does not: it moves the data without reducing its intrinsic
 spread. The clustering step is not optional for high-recall PQ search.
 
 ##### Correlated data
@@ -348,66 +437,20 @@ such as GeneFormer, scGPT, etc.
 </code></pre>
 </details>
 
-Especially for the data with more internal structure, we can appreciate that
-the Recalls reach ≥0.7 while providing a massive reduction in memory
-fingerprint.
-
 #### Optimised product quantisation (Exhaustive and IVF)
 
-This index uses optimised product quantisation - this substantially increases
-the build time. Similar to IVF-PQ, the quantisation is quite harsh and hence,
-reduces the recall quite substantially compared to exhaustive search. Each
-vector gets reduced to from *192 x 32 bits (192 x f32) = 768 bytes* to for
-*m = 32 (32 sub vectors) to 32 x u8 = 32 bytes*, a
-**24x reduction in memory usage** (of course with overhead from the cook book).
-However, it can still be useful in situation where good enough works and you
-have VERY large scale data. The theoretical benefits at least in this
-synthetic data do not translate very well. IVF-PQ is usually more than enough,
-outside of cases in which a specific correlation structure can be exploited
-by the optimised PQ. If in doubt, use the IVF-PQ index.
+PQ with a learned rotation applied first, so the subvector splits land on axes
+that carry independent variance. Same compression ratio as PQ, substantially
+longer build. Worth reaching for when the data has a correlation structure a
+single global rotation can actually align.
 
-**Key parameters:**
+**Tunable parameters:** identical to [PQ](#product-quantisation-exhaustive-and-ivf),
+with the rotation learned during the build rather than exposed as a knob.
 
-- *Number of lists (nl)*: The number of independent k-means cluster to generate.
-  If the structure of the data is unknown, people use `sqrt(n)` as a heuristic.
-- *Number of points (np)*: The number of clusters to probe during search.
-  Numbers here tend to be `sqrt(nlist)` or up to 5% of the nlist.
-- *Number of subvectors (m)*: In how many subvectors to divide the given main
-  vector. The initial dimensionality needs to be divisable by m.
-
-Similar to IVF-OP, the self kNN generation is run on the compressed indices,
-with the same loss of Recall due to the severe compression. Again, similar to
-`IVF-SQ8` the distances are difficult to interpret/compare against original
-vectors due to the heavy quantisation (plus rotation), thus, are not reported.
-
-##### Why IVF massively outperforms Exhaustive OPQ
-
-A key observation is the large outperformance of the IVF index over the
-exhaustive index. This is not incidental - it is fundamental to how PQ works,
-and OPQ does not change this.
-
-Product quantisation divides each vector into m subvectors and quantises each
-to one of 256 centroids. The quality of this approximation depends critically
-on the variance of the data being quantised: lower variance means the 256
-centroids can tile the space more densely, yielding smaller quantisation error.
-
-**IVF-OPQ** first clusters the dataset, then encodes residuals (vector minus
-cluster centroid) rather than raw vectors. Vectors within a cluster are similar,
-so their residuals are small, tightly distributed around zero, and share
-correlated structure. The OPQ codebooks can represent these local patterns
-efficiently.
-
-**Exhaustive-OPQ** must encode raw vectors directly. Whilst OPQ learns a rotation
-to make subspaces more independent (reducing cross-subspace correlation), it
-does not reduce the overall spread of the data. The codebooks must still
-represent the entire dataset's diversity - wildly different vectors compete for
-the same 256 centroids per subspace. This leads to fundamentally higher
-quantisation error.
-
-In short: IVF's clustering creates locality, and locality is what PQ needs
-to quantise accurately. OPQ's rotation improves subspace independence but does
-not create locality - it transforms the data without reducing its intrinsic
-spread. The clustering step is not optional for high-recall quantised search.
+The [locality argument](#why-the-ivf-variant-beats-the-exhaustive-one) from PQ
+applies unchanged. OPQ's rotation improves subspace independence but does not
+create locality: it transforms the data without reducing its intrinsic spread,
+so the clustering step is still not optional.
 
 ##### Correlated data
 
@@ -503,6 +546,122 @@ single cell models.
 </br>
 <pre><code>
 <!-- BENCH:opq:euclidean:embedding:768:50000 -->
+</code></pre>
+</details>
+
+### SOAR-PQ and SOAR-OPQ
+
+[SOAR](benchmarks_standard.md#soar) spilling on top of IVF-PQ and IVF-OPQ. On
+exact full-vector search spilling loses, because probing one more cell there
+costs nothing fixed. PQ changes the arithmetic: codes are residuals against a
+cell centroid, so every probed cell has to rebuild the ADC lookup table at
+`n_pq_centroids * dim` operations before it scores a single candidate. At 512
+dimensions that table build is over an order of magnitude more expensive than
+scanning the cell it serves, so pulling twice the candidates out of *one* cell
+should beat pulling them out of two.
+
+Spilling costs `2 * n * m` code bytes instead of `n * m`. The comparison that
+matters is therefore against an IVF-PQ index with **twice the subspaces**, which
+is the third column in sweep A. Beating IVF-PQ at the same `m` whilst using
+twice the memory would prove nothing.
+
+OPQ adds a learned rotation on top: codes are `PQ(R * r)`, and the lookup table
+is built from the *rotated* query residual. `R` is orthogonal, so distances hold
+only when both sides are rotated.
+
+**Tunable parameters:**
+
+- *Subvector width*: Fixed at 16 here, so `m = dim / 16` and the equal-memory
+  column runs `2 * m`, which stays a divisor of `dim` for any `dim` that is a
+  multiple of 16.
+- *Number of lists (nl)*: Skewed lower than the exact-search SOAR sweep, since
+  per-query cost is dominated by the per-cell table rebuild rather than by the
+  candidate scan.
+- *Number of probes (np)*: As SOAR, skewed low. Read recall against query time,
+  not against `nprobe`.
+- *Rule*: The three secondary-assignment rules from
+  [SOAR](benchmarks_standard.md#soar), swept in the second table.
+
+Default target is 50k cell embeddings at 512 dimensions, the foundation-model
+regime where PQ earns its place.
+
+#### SOAR-PQ
+
+<details>
+<summary><b>SOAR-PQ - Euclidean (Correlated, 512D)</b>:</summary>
+</br>
+<pre><code>
+<!-- BENCH:soar_pq:euclidean:correlated:512:50000 -->
+</code></pre>
+</details>
+
+---
+
+<details>
+<summary><b>SOAR-PQ - Euclidean (LowRank, 512D)</b>:</summary>
+</br>
+<pre><code>
+<!-- BENCH:soar_pq:euclidean:lowrank:512:50000 -->
+</code></pre>
+</details>
+
+---
+
+<details>
+<summary><b>SOAR-PQ - Euclidean (Cell embeddings, 512D)</b>:</summary>
+</br>
+<pre><code>
+<!-- BENCH:soar_pq:euclidean:embedding:512:50000 -->
+</code></pre>
+</details>
+
+---
+
+<details>
+<summary><b>SOAR-PQ - Cosine (Cell embeddings, 512D)</b>:</summary>
+</br>
+<pre><code>
+<!-- BENCH:soar_pq:cosine:embedding:512:50000 -->
+</code></pre>
+</details>
+
+#### SOAR-OPQ
+
+<details>
+<summary><b>SOAR-OPQ - Euclidean (Correlated, 512D)</b>:</summary>
+</br>
+<pre><code>
+<!-- BENCH:soar_opq:euclidean:correlated:512:50000 -->
+</code></pre>
+</details>
+
+---
+
+<details>
+<summary><b>SOAR-OPQ - Euclidean (LowRank, 512D)</b>:</summary>
+</br>
+<pre><code>
+<!-- BENCH:soar_opq:euclidean:lowrank:512:50000 -->
+</code></pre>
+</details>
+
+---
+
+<details>
+<summary><b>SOAR-OPQ - Euclidean (Cell embeddings, 512D)</b>:</summary>
+</br>
+<pre><code>
+<!-- BENCH:soar_opq:euclidean:embedding:512:50000 -->
+</code></pre>
+</details>
+
+---
+
+<details>
+<summary><b>SOAR-OPQ - Cosine (Cell embeddings, 512D)</b>:</summary>
+</br>
+<pre><code>
+<!-- BENCH:soar_opq:cosine:embedding:512:50000 -->
 </code></pre>
 </details>
 

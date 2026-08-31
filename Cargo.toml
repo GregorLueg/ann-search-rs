@@ -1,6 +1,6 @@
 [package]
 name = "ann-search-rs"
-version = "0.6.1"
+version = "0.7.0"
 edition = "2021"
 authors = ["Gregor Lueg <gregorlueg@me.com>"]
 license = "MIT"
@@ -150,6 +150,10 @@ name = "gridsearch_sq8"
 required-features = ["quantised"]
 
 [[example]]
+name = "gridsearch_hnsw_quantised"
+required-features = ["quantised"]
+
+[[example]]
 name = "gridsearch_bf16"
 required-features = ["quantised"]
 
@@ -186,7 +190,7 @@ required-features = ["binary"]
 ##################
 
 [[example]]
-name = "knn_comparison_cagra"
+name = "knn_comparison_gpu"
 required-features = ["gpu"]
 
 ###########

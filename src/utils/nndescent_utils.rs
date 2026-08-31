@@ -141,44 +141,63 @@ impl<T: Copy> Neighbour<T> {
 /// disconnected components). That is the one behavioural difference from the
 /// `query_*_self` functions, which always return exactly `k`.
 ///
+/// A kNN graph stores no `i -> i` edge, but every `query_*_self` in the crate
+/// returns a point as its own nearest neighbour at distance zero, and so does
+/// an exhaustive ground truth. `include_self` closes that gap: set it and row
+/// `i` starts with `(i, 0)`, so the row is directly comparable to a self-query
+/// at the same `k`. Leave it unset for a graph of true neighbours only. Getting
+/// this wrong costs a silent, flat `1/k` against anything scored the other way.
+///
 /// ### Params
 ///
 /// * `graph` - Flat graph of `n * k` `(pid, distance)` pairs, row `i` at
 ///   `[i*k .. (i+1)*k]`, sentinel-padded.
 /// * `n` - Number of nodes.
 /// * `k` - Neighbours per node in `graph`.
-/// * `k_out` - Truncate each row to this many neighbours. `None` keeps all.
+/// * `k_out` - Truncate each row to this **total** length, self-edge included
+///   when `include_self` is set. `None` keeps the whole row and still prepends
+///   the self-edge, giving `k + 1` entries.
+/// * `include_self` - Prepend `(i, 0)` to row `i`.
 /// * `return_dist` - Whether to materialise the distances.
 ///
 /// ### Returns
 ///
 /// `(indices, distances)` with one row per node. Distances are `None` when
 /// `return_dist` is false.
-pub fn unpack_knn_graph<T: Copy + Send + Sync>(
+pub fn unpack_knn_graph<T: Copy + Send + Sync + num_traits::Zero>(
     graph: &[(usize, T)],
     n: usize,
     k: usize,
     k_out: Option<usize>,
+    include_self: bool,
     return_dist: bool,
 ) -> (Vec<Vec<usize>>, Option<Vec<Vec<T>>>) {
-    let take = k_out.unwrap_or(k).min(k);
+    let self_slot = usize::from(include_self);
+    let total = k_out.unwrap_or(k + self_slot).max(self_slot);
+    let take = (total - self_slot).min(k);
 
     // One pass over each row builds both outputs; splitting it walks the graph
     // twice for no reason.
     let rows: Vec<(Vec<usize>, Vec<T>)> = (0..n)
         .into_par_iter()
         .map(|i| {
-            let mut ids = Vec::with_capacity(take);
+            let mut ids = Vec::with_capacity(take + self_slot);
             let mut dists = if return_dist {
-                Vec::with_capacity(take)
+                Vec::with_capacity(take + self_slot)
             } else {
                 Vec::new()
             };
+            if include_self {
+                ids.push(i);
+                if return_dist {
+                    dists.push(T::zero());
+                }
+            }
             for &(pid, dist) in &graph[i * k..(i + 1) * k] {
                 if pid == SENTINEL_PID {
                     continue;
                 }
-                if ids.len() == take {
+                if ids.len() == take + self_slot {
                     break;
                 }
                 ids.push(pid);
@@ -433,27 +452,27 @@ mod tests {
 
     #[test]
     fn test_unpack_drops_sentinels() {
-        let (ids, dists) = unpack_knn_graph(&padded_graph(), 2, 3, None, true);
+        let (ids, dists) = unpack_knn_graph(&padded_graph(), 2, 3, None, false, true);
         assert_eq!(ids, vec![vec![1, 2], vec![0, 2]]);
         assert_eq!(dists.unwrap(), vec![vec![0.5, 1.5], vec![0.5, 2.5]]);
     }
 
     #[test]
     fn test_unpack_honours_k_out() {
-        let (ids, dists) = unpack_knn_graph(&padded_graph(), 2, 3, Some(1), true);
+        let (ids, dists) = unpack_knn_graph(&padded_graph(), 2, 3, Some(1), false, true);
         assert_eq!(ids, vec![vec![1], vec![0]]);
         assert_eq!(dists.unwrap(), vec![vec![0.5], vec![0.5]]);
     }
 
     #[test]
     fn test_unpack_k_out_above_k_is_clamped() {
-        let (ids, _) = unpack_knn_graph(&padded_graph(), 2, 3, Some(99), false);
+        let (ids, _) = unpack_knn_graph(&padded_graph(), 2, 3, Some(99), false, false);
         assert_eq!(ids, vec![vec![1, 2], vec![0, 2]]);
     }
 
     #[test]
     fn test_unpack_skips_distances_when_not_asked() {
-        let (ids, dists) = unpack_knn_graph(&padded_graph(), 2, 3, None, false);
+        let (ids, dists) = unpack_knn_graph(&padded_graph(), 2, 3, None, false, false);
         assert_eq!(ids.len(), 2);
         assert!(dists.is_none());
     }
@@ -461,8 +480,35 @@ mod tests {
     #[test]
     fn test_unpack_all_sentinel_row_is_empty() {
         let graph = vec![(SENTINEL_PID, f32::MAX); 4];
-        let (ids, dists) = unpack_knn_graph(&graph, 2, 2, None, true);
+        let (ids, dists) = unpack_knn_graph(&graph, 2, 2, None, false, true);
         assert_eq!(ids, vec![Vec::<usize>::new(), Vec::new()]);
         assert_eq!(dists.unwrap(), vec![Vec::<f32>::new(), Vec::new()]);
+    }
+
+    #[test]
+    fn test_unpack_include_self_prepends_zero_edge() {
+        let (ids, dists) = unpack_knn_graph(&padded_graph(), 2, 3, None, true, true);
+        assert_eq!(ids, vec![vec![0, 1, 2], vec![1, 0, 2]]);
+        assert_eq!(
+            dists.unwrap(),
+            vec![vec![0.0, 0.5, 1.5], vec![0.0, 0.5, 2.5]]
+        );
+    }
+
+    #[test]
+    fn test_unpack_include_self_counts_towards_k_out() {
+        // `k_out` is the total row length, so asking for 2 with the self edge
+        // gives self plus one true neighbour, matching a `query_*_self` at k=2.
+        let (ids, dists) = unpack_knn_graph(&padded_graph(), 2, 3, Some(2), true, true);
+        assert_eq!(ids, vec![vec![0, 1], vec![1, 0]]);
+        assert_eq!(dists.unwrap(), vec![vec![0.0, 0.5], vec![0.0, 0.5]]);
+    }
+
+    #[test]
+    fn test_unpack_include_self_on_an_empty_row_returns_only_self() {
+        let graph = vec![(SENTINEL_PID, f32::MAX); 4];
+        let (ids, dists) = unpack_knn_graph(&graph, 2, 2, None, true, true);
+        assert_eq!(ids, vec![vec![0], vec![1]]);
+        assert_eq!(dists.unwrap(), vec![vec![0.0], vec![0.0]]);
     }
 }

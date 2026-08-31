@@ -66,6 +66,7 @@ fn main() {
         total_time_ms: build_time + query_time,
         recall_at_k: 1.0,
         mean_dist_rat: 1.0,
+        median_dist_rat: 1.0,
         index_size_mb,
     });
 
@@ -83,6 +84,7 @@ fn main() {
         total_time_ms: build_time + self_query_time,
         recall_at_k: 1.0,
         mean_dist_rat: 1.0,
+        median_dist_rat: 1.0,
         index_size_mb,
     });
 
@@ -152,6 +154,11 @@ fn main() {
                 approx_distances.as_ref().unwrap(),
                 cli.k,
             );
+            let dist_error_median = calculate_median_distance_ratio(
+                true_distances.as_ref().unwrap(),
+                approx_distances.as_ref().unwrap(),
+                cli.k,
+            );
 
             results.push(BenchmarkResultSize {
                 method: format!(
@@ -163,6 +170,7 @@ fn main() {
                 total_time_ms: build_time + query_time,
                 recall_at_k: recall,
                 mean_dist_rat: dist_error,
+                median_dist_rat: dist_error_median,
                 index_size_mb,
             });
         }
@@ -180,6 +188,11 @@ fn main() {
             approx_distances_self.as_ref().unwrap(),
             cli.k,
         );
+        let dist_error_self_median = calculate_median_distance_ratio(
+            true_distances_self.as_ref().unwrap(),
+            approx_distances_self.as_ref().unwrap(),
+            cli.k,
+        );
 
         results.push(BenchmarkResultSize {
             method: format!(
@@ -191,6 +204,7 @@ fn main() {
             total_time_ms: build_time + self_query_time,
             recall_at_k: recall_self,
             mean_dist_rat: dist_error_self,
+            median_dist_rat: dist_error_self_median,
             index_size_mb,
         });
 
@@ -205,29 +219,25 @@ fn main() {
             );
         }
 
-        println!("Extracting NNDescent kNN graph (no beam search)...");
-        let start = Instant::now();
-        let (mut extract_neighbors, extract_distances) =
-            extract_nndescent_knn(&nndescent_idx, Some(cli.k.saturating_sub(1)), true).unwrap();
-        let extract_time = start.elapsed().as_secs_f64() * 1000.0;
-
         // The self-query rows and the ground truth both count a point as its
         // own nearest neighbour at distance zero. A kNN graph does not store
-        // that trivial edge, so it is added back here rather than letting the
-        // extract row lose a fixed 1/k against every other row and every other
-        // gridsearch example.
-        let mut extract_distances = extract_distances.unwrap();
-        for (i, (ids, dists)) in extract_neighbors
-            .iter_mut()
-            .zip(extract_distances.iter_mut())
-            .enumerate()
-        {
-            ids.insert(0, i);
-            dists.insert(0, 0.0);
-        }
+        // that trivial edge, so `include_self` puts it back rather than letting
+        // the extract row lose a fixed 1/k against every other row and every
+        // other gridsearch example.
+        println!("Extracting NNDescent kNN graph (no beam search)...");
+        let start = Instant::now();
+        let (extract_neighbors, extract_distances) =
+            extract_nndescent_knn(&nndescent_idx, Some(cli.k), true, true).unwrap();
+        let extract_time = start.elapsed().as_secs_f64() * 1000.0;
+        let extract_distances = extract_distances.unwrap();
 
         let recall_extract = calculate_recall(&true_neighbors_self, &extract_neighbors, cli.k);
         let dist_error_extract = calculate_mean_distance_ratio(
+            true_distances_self.as_ref().unwrap(),
+            &extract_distances,
+            cli.k,
+        );
+        let dist_error_extract_median = calculate_median_distance_ratio(
             true_distances_self.as_ref().unwrap(),
             &extract_distances,
             cli.k,
@@ -243,6 +253,7 @@ fn main() {
             total_time_ms: build_time + extract_time,
             recall_at_k: recall_extract,
             mean_dist_rat: dist_error_extract,
+            median_dist_rat: dist_error_extract_median,
             index_size_mb,
         });
     }

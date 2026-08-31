@@ -1,13 +1,10 @@
-//! Inverted file SQ8 index: quantises the original data to scalar quantisation
-//! to 8 bit (i8) and uses Voronoi cells to identify the most interesting
-//! candidates.
+//! Inverted file SQ8 index: quantises the original data to uniform 8-bit codes
+//! and uses Voronoi cells to identify the most interesting candidates.
 
 use faer::RowRef;
-use num_traits::{Float, FromPrimitive, ToPrimitive};
 use rayon::prelude::*;
 use std::{
     collections::BinaryHeap,
-    iter::Sum,
     sync::{
         atomic::{AtomicUsize, Ordering},
         Arc,
@@ -16,20 +13,27 @@ use std::{
 use thousands::*;
 
 use crate::prelude::*;
-use crate::quantised::quantisers::*;
+use crate::quantised::hnsw_quantised::codec::GraphCodec;
+use crate::quantised::sq8u_codec::*;
+use crate::quantised::uniform_quant::*;
 use crate::utils::k_means_utils::*;
 
-////////////////
-// Main index //
-////////////////
+/////////////////
+// IvfSq8Index //
+/////////////////
 
 /// IVF index quantised to scalar 8 bits
-#[cfg_attr(feature = "serialise", derive(serde::Serialize, serde::Deserialize))]
-pub struct IvfSq8Index<T> {
-    /// The original vectors quantised to `i8`.
-    quantised_vectors: Vec<i8>,
-    /// The quantised norms (if metric is set to cosine).
-    quantised_norms: Vec<i32>,
+#[cfg_attr(
+    feature = "serialise",
+    derive(serde::Serialize, serde::Deserialize),
+    serde(bound = "")
+)]
+pub struct IvfSq8Index<T>
+where
+    T: AnnSearchFloat,
+{
+    /// Uniformly quantised storage and its distance arithmetic.
+    codec: Sq8uCodec<T>,
     /// The original dimensions
     dim: usize,
     /// Number of samples in the index
@@ -44,43 +48,20 @@ pub struct IvfSq8Index<T> {
     all_indices: Vec<usize>,
     /// Offsets of the elements of each inverted list.
     offsets: Vec<usize>,
-    /// The codebook that contains the information of the quantisation.
-    codebook: ScalarQuantiser<T>,
     /// Number of k-means clusters.
     nlist: usize,
     /// Original indices
     original_ids: Vec<usize>,
 }
 
-//////////////////////
-// VectorDistanceSq //
-//////////////////////
-
-impl<T> VectorDistanceSq8<T> for IvfSq8Index<T>
-where
-    T: Float + FromPrimitive + ToPrimitive + Send + Sync + Sum,
-{
-    /// Return the flat vectors (quantised)
-    fn vectors_flat_quantised(&self) -> &[i8] {
-        &self.quantised_vectors
-    }
-
-    /// Return the original dimensions
-    fn dim(&self) -> usize {
-        self.dim
-    }
-
-    /// Return the normalised values (quantised) for the Cosine calculation
-    fn norms_quantised(&self) -> &[i32] {
-        &self.quantised_norms
-    }
-}
-
 /////////////////////////
 // DimensionValidation //
 /////////////////////////
 
-impl<T> DimensionValidation for IvfSq8Index<T> {
+impl<T> DimensionValidation for IvfSq8Index<T>
+where
+    T: AnnSearchFloat,
+{
     fn dim(&self) -> usize {
         self.dim
     }
@@ -125,11 +106,11 @@ where
 {
     /// Build an IVF index with scalar 8-bit quantisation.
     ///
-    /// Constructs an inverted file index with all vectors quantised to i8 using
-    /// a global codebook. Reduces memory by 4x (for f32) whilst maintaining
-    /// reasonable recall through learned quantisation bounds. Also, enables
-    /// fast querying via `i8` symmetric transformations (at the cost of
-    /// Recall).
+    /// Constructs an inverted file index with all vectors quantised to `u8`
+    /// against a single shared scale, so the integer code distance preserves
+    /// the ordering of the float one. Reduces memory by 4x (for f32) whilst
+    /// maintaining reasonable recall, and the symmetric integer kernels make
+    /// the scan faster than the `f32` one rather than slower.
     ///
     /// ### Workflow
     ///
@@ -150,17 +131,21 @@ where
     ///   [KMeansTrainingParams]. If not provided, will default to sensible
     ///   defaults.
     /// * `seed` - Random seed for reproducibility
+    /// * `quant_params` - Optional calibration settings, see
+    ///   [`UniformQuantParams`]. Defaults trim 0.1% from each tail.
     /// * `verbose` - Print training progress
     ///
     /// ### Returns
     ///
     /// Constructed quantised index ready for querying
+    #[allow(clippy::too_many_arguments)]
     pub fn build(
         data: impl AnnMatrix<T>,
         nlist: Option<usize>,
         metric: Dist,
         k_means_params: Option<KMeansTrainingParams>,
         seed: usize,
+        quant_params: Option<UniformQuantParams>,
         verbose: bool,
     ) -> Result<Self, AnnSearchErrors> {
         if metric == Dist::Manhattan {
@@ -211,13 +196,7 @@ where
                 .for_each(|chunk| normalise_vector(chunk));
         }
 
-        // 3. train global codebook
-        if verbose {
-            println!("  Training global codebook");
-        }
-        let codebook = ScalarQuantiser::train(&training_data, dim);
-
-        // 4. assign vectors to clusters
+        // 3. assign vectors to clusters
         let data_norms = vec![T::one(); n];
         let centroid_norms = vec![T::one(); nlist];
         let assignments = assign_all_parallel(
@@ -233,60 +212,49 @@ where
 
         let (all_indices, offsets) = build_csr_layout(assignments, n, nlist);
 
-        // 5. quantise all vectors with global codebook
+        // 4. reorder into cluster order *before* encoding, so a probed cell is
+        // one contiguous run of codes. Doing it afterwards would mean
+        // permuting the codes and every precomputed per-vector term with them.
+        let mut original_ids = Vec::with_capacity(n);
+        for cluster in 0..nlist {
+            original_ids.extend_from_slice(&all_indices[offsets[cluster]..offsets[cluster + 1]]);
+        }
+
+        let mut reordered = Vec::with_capacity(n * dim);
+        for &old_id in &original_ids {
+            reordered.extend_from_slice(&vectors_flat[old_id * dim..(old_id + 1) * dim]);
+        }
+        drop(vectors_flat);
+
+        // 5. quantise
         if verbose {
             println!("  Quantising vectors");
         }
-        let mut quantised_vectors = vec![0i8; n * dim];
-
-        quantised_vectors
-            .par_chunks_mut(dim)
-            .enumerate()
-            .for_each(|(vec_idx, chunk)| {
-                let vec_start = vec_idx * dim;
-                let vec = &vectors_flat[vec_start..vec_start + dim];
-                let quantised = codebook.encode(vec);
-                chunk.copy_from_slice(&quantised);
-            });
-
-        let quantised_norms: Vec<i32> = if metric == Dist::Cosine {
-            quantised_vectors
-                .par_chunks(dim)
-                .map(|chunk| chunk.iter().map(|&v| v as i32 * v as i32).sum())
-                .collect()
-        } else {
-            Vec::new()
-        };
+        let codec = Sq8uCodec::new(&reordered, n, dim, metric, quant_params)?;
+        drop(reordered);
 
         if verbose {
             println!("  Quantisation complete");
         }
 
-        let mut idx = Self {
-            quantised_vectors,
+        Ok(Self {
+            codec,
             centroids,
-            all_indices,
+            all_indices: Vec::new(),
             offsets,
-            codebook,
             dim,
-            quantised_norms,
             n,
             nlist,
             metric,
             centroids_norm: Vec::new(),
-            original_ids: Vec::new(),
-        };
-
-        let new_to_old = idx.optimise_memory_layout();
-        idx.original_ids = new_to_old;
-
-        Ok(idx)
+            original_ids,
+        })
     }
 
     /// Query the index for approximate nearest neighbours.
     ///
     /// Performs two-stage search using quantised vectors: first finds nprobe
-    /// nearest centroids, then computes distances in quantised space (`i8`
+    /// nearest centroids, then computes distances in code space (`u8` integer
     /// arithmetic) for all vectors in those clusters. Normalises query if
     /// using Cosine distance.
     ///
@@ -323,39 +291,8 @@ where
         let mut cluster_scores: Vec<(T, usize)> = self.get_centroids_prenorm(&query_vec, nprobe);
         let probed = select_probed_clusters(&mut cluster_scores, &self.offsets, nprobe, k);
 
-        let query_i8 = self.codebook.encode(&query_vec);
-        let query_norm_sq: i32 = query_i8.iter().map(|&q| q as i32 * q as i32).sum();
-
-        let mut heap: BinaryHeap<(OrderedFloat<T>, usize)> = BinaryHeap::with_capacity(k + 1);
-
-        for cluster_idx in probed {
-            let start = self.offsets[cluster_idx];
-            let end = self.offsets[cluster_idx + 1];
-
-            for vec_idx in start..end {
-                let dist = match self.metric {
-                    Dist::Cosine => self.cosine_distance_i8(vec_idx, &query_i8, query_norm_sq),
-                    Dist::SquaredEuclidean => self.euclidean_distance_i8(vec_idx, &query_i8),
-                    Dist::Manhattan => unreachable!(),
-                };
-
-                if heap.len() < k {
-                    heap.push((OrderedFloat(dist), vec_idx));
-                } else if dist < heap.peek().unwrap().0 .0 {
-                    heap.pop();
-                    heap.push((OrderedFloat(dist), vec_idx));
-                }
-            }
-        }
-
-        let mut results: Vec<_> = heap.into_iter().collect();
-        results.sort_unstable_by_key(|&(dist, _)| dist);
-        let (distances, indices) = results
-            .into_iter()
-            .map(|(d, i)| (d.0, self.original_ids[i]))
-            .unzip();
-
-        Ok((indices, distances))
+        let encoded = self.codec.encode_query(&query_vec)?;
+        Ok(self.scan_clusters(&probed, k, |idx| self.codec.score(&encoded, idx)))
     }
 
     /// Query using a matrix row reference.
@@ -391,67 +328,85 @@ where
 
     /// Query using an already-quantised internal vector
     ///
-    /// Skips the encode step since the vector is already in i8 format.
+    /// Skips the encode step since the vector is already in code space.
     /// Only decodes for centroid search (which is O(nlist), small).
+    /// Scan the probed cells and keep the `k` best
+    ///
+    /// ### Params
+    ///
+    /// * `probed` - Cluster ids to scan
+    /// * `k` - Number of neighbours to return
+    /// * `score` - Scoring closure over an internal vector index
+    ///
+    /// ### Returns
+    ///
+    /// Tuple of `(original indices, distances)`, nearest first
     #[inline]
-    fn query_quantised(
-        &self,
-        query_i8: &[i8],
-        query_norm_sq: i32,
-        k: usize,
-        nprobe: Option<usize>,
-    ) -> (Vec<usize>, Vec<T>) {
+    fn scan_clusters<F>(&self, probed: &[usize], k: usize, score: F) -> (Vec<usize>, Vec<T>)
+    where
+        F: Fn(usize) -> T,
+    {
+        let mut heap: BinaryHeap<(OrderedFloat<T>, usize)> = BinaryHeap::with_capacity(k + 1);
+
+        for &cluster_idx in probed {
+            for vec_idx in self.offsets[cluster_idx]..self.offsets[cluster_idx + 1] {
+                let s = score(vec_idx);
+                if heap.len() < k {
+                    heap.push((OrderedFloat(s), vec_idx));
+                } else if s < heap.peek().unwrap().0 .0 {
+                    heap.pop();
+                    heap.push((OrderedFloat(s), vec_idx));
+                }
+            }
+        }
+
+        let mut out: Vec<(OrderedFloat<T>, usize)> = heap.into_vec();
+        out.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
+        out.into_iter()
+            .map(|(OrderedFloat(s), i)| (self.original_ids[i], self.codec.finalise(s)))
+            .unzip()
+    }
+
+    /// Query using a vector already stored in the index
+    ///
+    /// Skips the encode: the stored code is already in the query's code space,
+    /// so the symmetric score is exactly what the asymmetric one would give.
+    /// The centroid search still needs floats, so the code is dequantised for
+    /// that step alone, which is `O(nlist)` and off the hot path.
+    ///
+    /// ### Params
+    ///
+    /// * `id` - Internal index of the stored vector
+    /// * `k` - Number of neighbours to return
+    /// * `nprobe` - Number of clusters to search
+    ///
+    /// ### Returns
+    ///
+    /// Tuple of `(original indices, distances)`, nearest first
+    fn query_stored(&self, id: usize, k: usize, nprobe: Option<usize>) -> (Vec<usize>, Vec<T>) {
         let nprobe = nprobe
             .unwrap_or_else(|| ((self.nlist as f64).sqrt() as usize).max(1))
             .min(self.nlist);
         let k = k.min(self.n);
 
-        // Decode only for centroid search (O(nlist) - cheap)
-        let query_float = self.codebook.decode(query_i8);
-        let mut cluster_scores: Vec<(T, usize)> = self.get_centroids_prenorm(&query_float, nprobe);
+        let as_float = self.codec.decode(id);
+        let mut cluster_scores: Vec<(T, usize)> = self.get_centroids_prenorm(&as_float, nprobe);
         let probed = select_probed_clusters(&mut cluster_scores, &self.offsets, nprobe, k);
 
-        let mut heap: BinaryHeap<(OrderedFloat<T>, usize)> = BinaryHeap::with_capacity(k + 1);
-
-        for cluster_idx in probed {
-            let start = self.offsets[cluster_idx];
-            let end = self.offsets[cluster_idx + 1];
-
-            for vec_idx in start..end {
-                let dist = match self.metric {
-                    Dist::Cosine => self.cosine_distance_i8(vec_idx, query_i8, query_norm_sq),
-                    Dist::SquaredEuclidean => self.euclidean_distance_i8(vec_idx, query_i8),
-                    Dist::Manhattan => unreachable!(),
-                };
-
-                if heap.len() < k {
-                    heap.push((OrderedFloat(dist), vec_idx));
-                } else if dist < heap.peek().unwrap().0 .0 {
-                    heap.pop();
-                    heap.push((OrderedFloat(dist), vec_idx));
-                }
-            }
-        }
-
-        let mut results: Vec<_> = heap.into_iter().collect();
-        results.sort_unstable_by_key(|&(dist, _)| dist);
-        let (distances, indices) = results
-            .into_iter()
-            .map(|(d, i)| (d.0, self.original_ids[i]))
-            .unzip();
-
-        (indices, distances)
+        self.scan_clusters(&probed, k, |idx| self.codec.score_sym(id, idx))
     }
 
     /// Generate kNN graph from vectors stored in the index
     ///
     /// Queries each vector in the index against itself to build a complete
-    /// kNN graph. Uses pre-quantised vectors directly, avoiding encode overhead.
+    /// kNN graph. Uses pre-quantised vectors directly, avoiding encode
+    /// overhead.
     ///
     /// ### Params
     ///
     /// * `k` - Number of neighbours per vector
-    /// * `nprobe` - Number of clusters to search (defaults to sqrt(nlist) if None)
+    /// * `nprobe` - Number of clusters to search (defaults to sqrt(nlist) if
+    ///   None)
     /// * `return_dist` - Whether to return distances
     /// * `verbose` - Controls verbosity
     ///
@@ -471,14 +426,6 @@ where
         let unordered_results: Vec<(usize, Vec<usize>, Vec<T>)> = (0..self.n)
             .into_par_iter()
             .map(|i| {
-                let start = i * self.dim;
-                let end = start + self.dim;
-                let query_i8 = &self.quantised_vectors[start..end];
-                let query_norm_sq = if self.metric == Dist::Cosine {
-                    self.quantised_norms[i]
-                } else {
-                    0
-                };
                 let orig_id = self.original_ids[i];
 
                 if verbose {
@@ -492,7 +439,7 @@ where
                     }
                 }
 
-                let (indices, dists) = self.query_quantised(query_i8, query_norm_sq, k, nprobe);
+                let (indices, dists) = self.query_stored(i, k, nprobe);
                 (orig_id, indices, dists)
             })
             .collect();
@@ -521,55 +468,12 @@ where
     /// Number of bytes used by the index
     pub fn memory_usage_bytes(&self) -> usize {
         std::mem::size_of_val(self)
-            + self.quantised_vectors.capacity() * std::mem::size_of::<i8>()
-            + self.quantised_norms.capacity() * std::mem::size_of::<i32>()
+            + self.codec.memory_usage_bytes()
             + self.centroids.capacity() * std::mem::size_of::<T>()
             + self.centroids_norm.capacity() * std::mem::size_of::<T>()
             + self.all_indices.capacity() * std::mem::size_of::<usize>()
             + self.offsets.capacity() * std::mem::size_of::<usize>()
-            + self.codebook.memory_usage_bytes()
-    }
-
-    /// Function will optimise memory layout and put vectors sorted by cluster
-    /// id
-    ///
-    /// ### Returns
-    ///
-    /// New to old mapping
-    fn optimise_memory_layout(&mut self) -> Vec<usize> {
-        let mut new_to_old = Vec::with_capacity(self.n);
-        let mut old_to_new = vec![0usize; self.n];
-
-        for cluster in 0..self.nlist {
-            let start = self.offsets[cluster];
-            let end = self.offsets[cluster + 1];
-            for &old_id in &self.all_indices[start..end] {
-                old_to_new[old_id] = new_to_old.len();
-                new_to_old.push(old_id);
-            }
-        }
-
-        let mut new_vectors = Vec::with_capacity(self.quantised_vectors.len());
-        let mut new_norms = if self.quantised_norms.is_empty() {
-            Vec::new()
-        } else {
-            Vec::with_capacity(self.n)
-        };
-
-        for &old_id in &new_to_old {
-            let start = old_id * self.dim;
-            new_vectors.extend_from_slice(&self.quantised_vectors[start..start + self.dim]);
-            if !self.quantised_norms.is_empty() {
-                new_norms.push(self.quantised_norms[old_id]);
-            }
-        }
-
-        self.quantised_vectors = new_vectors;
-        self.quantised_norms = new_norms;
-        self.all_indices.clear();
-        self.all_indices.shrink_to_fit();
-
-        new_to_old
+            + self.original_ids.capacity() * std::mem::size_of::<usize>()
     }
 }
 
@@ -627,6 +531,7 @@ mod tests {
             Dist::SquaredEuclidean,
             get_default_k_means(),
             42,
+            None,
             false,
         )
         .unwrap();
@@ -635,7 +540,6 @@ mod tests {
         assert_eq!(index.n, 6);
         assert_eq!(index.nlist, 2);
         assert_eq!(index.metric, Dist::SquaredEuclidean);
-        assert_eq!(index.quantised_vectors.len(), 192);
         assert_eq!(index.centroids.len(), 64);
         assert_eq!(index.offsets.len(), 3);
     }
@@ -649,12 +553,13 @@ mod tests {
             Dist::Cosine,
             get_default_k_means(),
             42,
+            None,
             false,
         )
         .unwrap();
 
         assert_eq!(index.metric, Dist::Cosine);
-        assert_eq!(index.quantised_norms.len(), 6);
+        assert_eq!(index.n, 6);
     }
 
     #[test]
@@ -666,6 +571,7 @@ mod tests {
             Dist::SquaredEuclidean,
             get_default_k_means(),
             42,
+            None,
             false,
         )
         .unwrap();
@@ -686,6 +592,7 @@ mod tests {
             Dist::SquaredEuclidean,
             get_default_k_means(),
             42,
+            None,
             false,
         )
         .unwrap();
@@ -705,6 +612,7 @@ mod tests {
             Dist::SquaredEuclidean,
             get_default_k_means(),
             42,
+            None,
             false,
         )
         .unwrap();
@@ -728,6 +636,7 @@ mod tests {
             Dist::Cosine,
             get_default_k_means(),
             42,
+            None,
             false,
         )
         .unwrap();
@@ -748,6 +657,7 @@ mod tests {
             Dist::SquaredEuclidean,
             get_default_k_means(),
             42,
+            None,
             false,
         )
         .unwrap();
@@ -770,6 +680,7 @@ mod tests {
             Dist::SquaredEuclidean,
             get_default_k_means(),
             42,
+            None,
             false,
         )
         .unwrap();
@@ -794,6 +705,7 @@ mod tests {
             Dist::SquaredEuclidean,
             get_default_k_means(),
             42,
+            None,
             false,
         )
         .unwrap();
@@ -814,6 +726,7 @@ mod tests {
             Dist::SquaredEuclidean,
             get_default_k_means(),
             42,
+            None,
             false,
         )
         .unwrap();
@@ -837,6 +750,7 @@ mod tests {
             Dist::SquaredEuclidean,
             get_default_k_means(),
             42,
+            None,
             false,
         )
         .unwrap();
@@ -854,6 +768,7 @@ mod tests {
             Dist::SquaredEuclidean,
             get_default_k_means(),
             42,
+            None,
             false,
         )
         .unwrap();

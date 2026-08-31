@@ -146,6 +146,7 @@ fn main() {
         total_time_ms: exhaustive_build_ms + exhaustive_query_ms,
         recall_at_k: 1.0,
         mean_dist_rat: 1.0,
+        median_dist_rat: 1.0,
         index_size_mb: exhaustive_size_mb,
     };
 
@@ -219,12 +220,12 @@ fn main() {
             println!("  Querying nlist={}, nprobe={}...", nlist, nprobe);
 
             let start = Instant::now();
-            let (nb, d) = query_ivf_pq_index(
+            let (nb, _) = query_ivf_pq_index(
                 query_data.as_ref(),
                 &pq_idx,
                 cli.k,
                 Some(nprobe),
-                true,
+                false,
                 false,
             )
             .unwrap();
@@ -237,19 +238,24 @@ fn main() {
                 recall_at_k: calculate_recall(&true_neighbors, &nb, cli.k),
                 mean_dist_rat: calculate_mean_distance_ratio(
                     true_distances.as_ref().unwrap(),
-                    d.as_ref().unwrap(),
+                    &exact_distances(&data, &query_data, &nb, &cli.distance),
+                    cli.k,
+                ),
+                median_dist_rat: calculate_median_distance_ratio(
+                    true_distances.as_ref().unwrap(),
+                    &exact_distances(&data, &query_data, &nb, &cli.distance),
                     cli.k,
                 ),
                 index_size_mb: pq_size_mb,
             });
 
             let start = Instant::now();
-            let (nb, d) = query_ivf_pq_index(
+            let (nb, _) = query_ivf_pq_index(
                 query_data.as_ref(),
                 &pq2_idx,
                 cli.k,
                 Some(nprobe),
-                true,
+                false,
                 false,
             )
             .unwrap();
@@ -262,19 +268,24 @@ fn main() {
                 recall_at_k: calculate_recall(&true_neighbors, &nb, cli.k),
                 mean_dist_rat: calculate_mean_distance_ratio(
                     true_distances.as_ref().unwrap(),
-                    d.as_ref().unwrap(),
+                    &exact_distances(&data, &query_data, &nb, &cli.distance),
+                    cli.k,
+                ),
+                median_dist_rat: calculate_median_distance_ratio(
+                    true_distances.as_ref().unwrap(),
+                    &exact_distances(&data, &query_data, &nb, &cli.distance),
                     cli.k,
                 ),
                 index_size_mb: pq2_size_mb,
             });
 
             let start = Instant::now();
-            let (nb, d) = query_soar_pq_index(
+            let (nb, _) = query_soar_pq_index(
                 query_data.as_ref(),
                 &soar_idx,
                 cli.k,
                 Some(nprobe),
-                true,
+                false,
                 false,
             )
             .unwrap();
@@ -287,7 +298,12 @@ fn main() {
                 recall_at_k: calculate_recall(&true_neighbors, &nb, cli.k),
                 mean_dist_rat: calculate_mean_distance_ratio(
                     true_distances.as_ref().unwrap(),
-                    d.as_ref().unwrap(),
+                    &exact_distances(&data, &query_data, &nb, &cli.distance),
+                    cli.k,
+                ),
+                median_dist_rat: calculate_median_distance_ratio(
+                    true_distances.as_ref().unwrap(),
+                    &exact_distances(&data, &query_data, &nb, &cli.distance),
                     cli.k,
                 ),
                 index_size_mb: soar_size_mb,
@@ -338,8 +354,8 @@ fn main() {
         for nprobe in nprobe_values(nlist) {
             println!("  Querying rule={}, nprobe={}...", tag, nprobe);
             let start = Instant::now();
-            let (nb, d) =
-                query_soar_pq_index(query_data.as_ref(), &idx, cli.k, Some(nprobe), true, false)
+            let (nb, _) =
+                query_soar_pq_index(query_data.as_ref(), &idx, cli.k, Some(nprobe), false, false)
                     .unwrap();
             let q_ms = start.elapsed().as_secs_f64() * 1000.0;
 
@@ -351,7 +367,12 @@ fn main() {
                 recall_at_k: calculate_recall(&true_neighbors, &nb, cli.k),
                 mean_dist_rat: calculate_mean_distance_ratio(
                     true_distances.as_ref().unwrap(),
-                    d.as_ref().unwrap(),
+                    &exact_distances(&data, &query_data, &nb, &cli.distance),
+                    cli.k,
+                ),
+                median_dist_rat: calculate_median_distance_ratio(
+                    true_distances.as_ref().unwrap(),
+                    &exact_distances(&data, &query_data, &nb, &cli.distance),
                     cli.k,
                 ),
                 index_size_mb: size_mb,
