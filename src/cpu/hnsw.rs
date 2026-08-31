@@ -602,6 +602,9 @@ where
             // construction search, same rationale as Vamana.
             let neighbours = unsafe { graph.get_neighbours_slice(current_id, target_layer) };
 
+            let mut buf = [0usize; 4];
+            let mut buffered = 0;
+
             for &neighbour in neighbours {
                 if neighbour == u32::MAX {
                     continue;
@@ -613,19 +616,25 @@ where
                 }
                 state.mark_visited(neighbour_id);
 
-                let dist = match self.metric {
-                    Dist::SquaredEuclidean => self.euclidean_distance(query_node, neighbour_id),
-                    Dist::Cosine => self.cosine_distance(query_node, neighbour_id),
-                    Dist::Manhattan => self.manhattan_distance(query_node, neighbour_id),
-                };
+                buf[buffered] = neighbour_id;
+                buffered += 1;
 
-                if dist < furthest {
-                    state
-                        .candidates
-                        .push(Reverse((OrderedFloat(dist), neighbour_id)));
-                    state.results.push(dist, neighbour_id);
-                    furthest = state.results.threshold();
+                if buffered == 4 {
+                    let dists = self.node_distances_4(query_node, buf);
+                    for k in 0..4 {
+                        Self::offer(state, dists[k], buf[k], &mut furthest);
+                    }
+                    buffered = 0;
                 }
+            }
+
+            for k in 0..buffered {
+                let dist = match self.metric {
+                    Dist::SquaredEuclidean => self.euclidean_distance(query_node, buf[k]),
+                    Dist::Cosine => self.cosine_distance(query_node, buf[k]),
+                    Dist::Manhattan => self.manhattan_distance(query_node, buf[k]),
+                };
+                Self::offer(state, dist, buf[k], &mut furthest);
             }
         }
     }
@@ -651,6 +660,16 @@ where
         state: &SearchState<T>,
     ) -> Vec<(OrderedFloat<T>, usize)> {
         let max_neighbours = self.max_neighbours_for_layer(layer);
+
+        // Nothing to choose between: the beam found no more candidates than the
+        // layer can hold, so pruning can only throw away edges we have room for.
+        // Matches FAISS `shrink_neighbor_list_inner` (HNSW.cpp:355). Only fires
+        // when `ef_construction` is at or below the layer budget, i.e. the
+        // high-M/low-ef regime; at M16/ef200 the beam always overflows and the
+        // diversity rule runs exactly as before.
+        if state.scratch_working.len() < max_neighbours {
+            return state.scratch_working.clone();
+        }
 
         let mut result = Vec::with_capacity(max_neighbours);
 
@@ -726,7 +745,6 @@ where
 
         Self::with_search_state(|state_cell| {
             let mut state = state_cell.borrow_mut();
-            state.reset(self.n);
 
             let query_norm = if self.metric == Dist::Cosine {
                 query
@@ -749,7 +767,7 @@ where
 
             // full search at base layer
             state.reset(self.n);
-            let mut candidates = self.search_layer_query(
+            self.search_layer_query(
                 query,
                 query_norm,
                 0,
@@ -758,14 +776,13 @@ where
                 &mut state,
             );
 
-            candidates.truncate(k);
+            state.results.sort();
+            let take = k.min(state.results.len());
 
-            let (indices, distances): (Vec<usize>, Vec<T>) = candidates
-                .into_iter()
-                .map(|(OrderedFloat(d), id)| (id, d))
-                .unzip();
-
-            Ok((indices, distances))
+            Ok((
+                state.results.ids()[..take].to_vec(),
+                state.results.dists()[..take].to_vec(),
+            ))
         })
     }
 
@@ -843,7 +860,8 @@ where
     ///
     /// ### Returns
     ///
-    /// Vector of (distance, id) pairs for closest candidates
+    /// Nothing. The `ef` closest candidates are left in `state.results`, which
+    /// the caller sorts and reads in place.
     fn search_layer_query(
         &self,
         query: &[T],
@@ -852,24 +870,34 @@ where
         entry_node: usize,
         ef: usize,
         state: &mut SearchState<T>,
-    ) -> Vec<(OrderedFloat<T>, usize)> {
-        state.working_sorted.clear();
+    ) {
+        state.results.reset(ef);
         state.candidates.clear();
 
-        let entry_dist = OrderedFloat(self.compute_query_distance(query, entry_node, query_norm));
+        let entry_dist = self.compute_query_distance(query, entry_node, query_norm);
 
         state.mark_visited(entry_node);
-        state.candidates.push(Reverse((entry_dist, entry_node)));
-        state.working_sorted.insert((entry_dist, entry_node), ef);
+        state
+            .candidates
+            .push(Reverse((OrderedFloat(entry_dist), entry_node)));
+        state.results.push(entry_dist, entry_node);
 
-        let mut furthest_dist = entry_dist;
+        // `threshold()` is infinity until the heap fills, so the "or the result
+        // set is not yet full" arm the sorted buffer needed is redundant here.
+        let mut furthest = state.results.threshold();
 
         while let Some(Reverse((current_dist, current_id))) = state.candidates.pop() {
-            if current_dist > furthest_dist && state.working_sorted.len() >= ef {
+            if current_dist.0 > furthest {
                 break;
             }
 
             let neighbours = self.get_neighbours_at_layer(current_id, layer);
+
+            // Collect unvisited neighbours in fours and score them together.
+            // Visited marking stays eager, so a node cannot enter the buffer
+            // twice from a later expansion.
+            let mut buf = [0usize; 4];
+            let mut buffered = 0;
 
             for &neighbour in neighbours {
                 if neighbour == u32::MAX {
@@ -886,26 +914,23 @@ where
                 }
                 state.mark_visited(neighbour_id);
 
-                let dist =
-                    OrderedFloat(self.compute_query_distance(query, neighbour_id, query_norm));
+                buf[buffered] = neighbour_id;
+                buffered += 1;
 
-                if dist < furthest_dist || state.working_sorted.len() < ef {
-                    state.candidates.push(Reverse((dist, neighbour_id)));
-
-                    if state.working_sorted.insert((dist, neighbour_id), ef)
-                        && state.working_sorted.len() >= ef
-                    {
-                        furthest_dist = state
-                            .working_sorted
-                            .top()
-                            .map(|(d, _)| *d)
-                            .unwrap_or(OrderedFloat(T::infinity()));
+                if buffered == 4 {
+                    let dists = self.query_distances_4(query, buf, query_norm);
+                    for k in 0..4 {
+                        Self::offer(state, dists[k], buf[k], &mut furthest);
                     }
+                    buffered = 0;
                 }
             }
-        }
 
-        state.working_sorted.data().to_vec()
+            for k in 0..buffered {
+                let dist = self.compute_query_distance(query, buf[k], query_norm);
+                Self::offer(state, dist, buf[k], &mut furthest);
+            }
+        }
     }
 
     /// Query using a matrix row reference
@@ -1017,6 +1042,110 @@ where
             Dist::SquaredEuclidean => self.euclidean_distance_to_query(idx, query),
             Dist::Cosine => self.cosine_distance_to_query(idx, query, query_norm),
             Dist::Manhattan => self.manhattan_distance_to_query(idx, query),
+        }
+    }
+
+    /// Borrow four indexed rows at once.
+    ///
+    /// ### Params
+    ///
+    /// * `ids` - Four row indices
+    ///
+    /// ### Returns
+    ///
+    /// The four row slices, in input order.
+    #[inline(always)]
+    fn rows_4(&self, ids: [usize; 4]) -> [&[T]; 4] {
+        let dim = self.dim;
+        let flat = &self.vectors_flat;
+        [
+            &flat[ids[0] * dim..ids[0] * dim + dim],
+            &flat[ids[1] * dim..ids[1] * dim + dim],
+            &flat[ids[2] * dim..ids[2] * dim + dim],
+            &flat[ids[3] * dim..ids[3] * dim + dim],
+        ]
+    }
+
+    /// Distance from a query vector to four indexed rows at once.
+    ///
+    /// Same arithmetic as [`Self::compute_query_distance`], four candidates per
+    /// pass. Cosine still pays its divide per candidate; only the dot product
+    /// batches.
+    ///
+    /// ### Params
+    ///
+    /// * `query` - Query vector
+    /// * `ids` - Four database row indices
+    /// * `query_norm` - Pre-computed query norm (Cosine only)
+    ///
+    /// ### Returns
+    ///
+    /// The four distances, in input order.
+    #[inline(always)]
+    fn query_distances_4(&self, query: &[T], ids: [usize; 4], query_norm: T) -> [T; 4] {
+        let rows = self.rows_4(ids);
+        match self.metric {
+            Dist::SquaredEuclidean => T::euclidean_simd_batch_4(query, rows),
+            Dist::Manhattan => T::manhattan_simd_batch_4(query, rows),
+            Dist::Cosine => {
+                let dots = T::dot_simd_batch_4(query, rows);
+                let mut out = [T::zero(); 4];
+                for k in 0..4 {
+                    out[k] = T::one() - (dots[k] / (query_norm * self.norms[ids[k]]));
+                }
+                out
+            }
+        }
+    }
+
+    /// Distance from one indexed row to four others at once.
+    ///
+    /// The construction-time twin of [`Self::query_distances_4`].
+    ///
+    /// ### Params
+    ///
+    /// * `node` - Row the distances are measured from
+    /// * `ids` - Four database row indices
+    ///
+    /// ### Returns
+    ///
+    /// The four distances, in input order.
+    #[inline(always)]
+    fn node_distances_4(&self, node: usize, ids: [usize; 4]) -> [T; 4] {
+        let start = node * self.dim;
+        let src = &self.vectors_flat[start..start + self.dim];
+        let rows = self.rows_4(ids);
+        match self.metric {
+            Dist::SquaredEuclidean => T::euclidean_simd_batch_4(src, rows),
+            Dist::Manhattan => T::manhattan_simd_batch_4(src, rows),
+            Dist::Cosine => {
+                let dots = T::dot_simd_batch_4(src, rows);
+                let mut out = [T::zero(); 4];
+                for k in 0..4 {
+                    out[k] = T::one() - (dots[k] / (self.norms[node] * self.norms[ids[k]]));
+                }
+                out
+            }
+        }
+    }
+
+    /// Offer one scored candidate to the beam.
+    ///
+    /// Shared by the batched and tail paths of both search loops so the accept
+    /// rule lives in one place.
+    ///
+    /// ### Params
+    ///
+    /// * `state` - Search state holding the frontier and the result heap
+    /// * `dist` - Distance from the query to `id`
+    /// * `id` - Candidate row index
+    /// * `furthest` - Current beam threshold, updated in place on acceptance
+    #[inline(always)]
+    fn offer(state: &mut SearchState<T>, dist: T, id: usize, furthest: &mut T) {
+        if dist < *furthest {
+            state.candidates.push(Reverse((OrderedFloat(dist), id)));
+            state.results.push(dist, id);
+            *furthest = state.results.threshold();
         }
     }
 }

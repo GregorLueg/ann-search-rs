@@ -34,9 +34,9 @@ pub struct SearchState<T> {
     /// Serves the same purpose as `working_sorted` but at `O(log ef)` per
     /// accepted candidate instead of the `O(ef)` memmove `Vec::insert` costs.
     /// The two coexist because the buffer's tail is only worth the swap where
-    /// `ef` is large: HNSW construction runs at `ef_construction` in the
-    /// hundreds, whereas NSG and Vamana prune against lists an order of
-    /// magnitude shorter.
+    /// `ef` is large: HNSW runs at `ef_construction` / `ef_search` in the
+    /// hundreds for both build and query, whereas NSG and Vamana prune against
+    /// lists an order of magnitude shorter.
     pub results: BoundedMaxHeap<T>,
     /// Temporary storage for heuristic selection
     pub scratch_working: Vec<(OrderedFloat<T>, usize)>,

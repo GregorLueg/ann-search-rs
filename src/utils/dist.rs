@@ -205,6 +205,81 @@ pub trait SimdDistance: Sized + Copy {
     /// Manhattan distance
     fn manhattan_simd(a: &[Self], b: &[Self]) -> Self;
 
+    /// Squared Euclidean distance against four rows at once
+    ///
+    /// Scoring four candidates in one pass keeps four independent accumulator
+    /// chains and four outstanding row loads in flight, which matters on a
+    /// graph walk where the neighbour rows are a gather. Callers that cannot
+    /// fill a group of four should use [`SimdDistance::euclidean_simd`] for the
+    /// remainder rather than padding.
+    ///
+    /// The default implementation is four separate calls, which is correct but
+    /// buys nothing; override it where the batching pays.
+    ///
+    /// ### Params
+    ///
+    /// * `q` - Query row
+    /// * `y` - Four candidate rows, each the same length as `q`
+    ///
+    /// ### Returns
+    ///
+    /// The four squared distances, in input order.
+    #[inline]
+    fn euclidean_simd_batch_4(q: &[Self], y: [&[Self]; 4]) -> [Self; 4] {
+        [
+            Self::euclidean_simd(q, y[0]),
+            Self::euclidean_simd(q, y[1]),
+            Self::euclidean_simd(q, y[2]),
+            Self::euclidean_simd(q, y[3]),
+        ]
+    }
+
+    /// Dot product against four rows at once
+    ///
+    /// See [`SimdDistance::euclidean_simd_batch_4`] for the rationale and the
+    /// tail-handling contract.
+    ///
+    /// ### Params
+    ///
+    /// * `q` - Query row
+    /// * `y` - Four candidate rows, each the same length as `q`
+    ///
+    /// ### Returns
+    ///
+    /// The four dot products, in input order.
+    #[inline]
+    fn dot_simd_batch_4(q: &[Self], y: [&[Self]; 4]) -> [Self; 4] {
+        [
+            Self::dot_simd(q, y[0]),
+            Self::dot_simd(q, y[1]),
+            Self::dot_simd(q, y[2]),
+            Self::dot_simd(q, y[3]),
+        ]
+    }
+
+    /// Manhattan distance against four rows at once
+    ///
+    /// See [`SimdDistance::euclidean_simd_batch_4`] for the rationale and the
+    /// tail-handling contract.
+    ///
+    /// ### Params
+    ///
+    /// * `q` - Query row
+    /// * `y` - Four candidate rows, each the same length as `q`
+    ///
+    /// ### Returns
+    ///
+    /// The four distances, in input order.
+    #[inline]
+    fn manhattan_simd_batch_4(q: &[Self], y: [&[Self]; 4]) -> [Self; 4] {
+        [
+            Self::manhattan_simd(q, y[0]),
+            Self::manhattan_simd(q, y[1]),
+            Self::manhattan_simd(q, y[2]),
+            Self::manhattan_simd(q, y[3]),
+        ]
+    }
+
     /// Calculate Canberra distance via SIMD
     ///
     /// ### Params
@@ -3142,6 +3217,843 @@ fn compute_l1_norm_f64_avx512(a: &[f64]) -> f64 {
     compute_l1_norm_f64_avx2(a)
 }
 
+///////////////////////////
+// Batch-4 f32 distances //
+///////////////////////////
+
+// One query against four candidate rows in a single pass. The four accumulator
+// chains are independent, so their horizontal reductions overlap instead of
+// serialising, and the four candidate rows are in flight together rather than
+// one at a time. On a graph walk the second effect dominates: scoring a
+// neighbour list is gather-bound, and four outstanding row loads hide more
+// latency than one. The query is loaded once per block and reused.
+
+/// Squared Euclidean against four rows, scalar fallback.
+///
+/// ### Params
+///
+/// * `q` - Query row
+/// * `y` - Four candidate rows, each the same length as `q`
+///
+/// ### Returns
+///
+/// The four squared distances, in input order.
+#[inline(always)]
+fn euclidean_f32_batch4_scalar(q: &[f32], y: [&[f32]; 4]) -> [f32; 4] {
+    let mut out = [0.0f32; 4];
+    for (k, row) in y.iter().enumerate() {
+        out[k] = euclidean_f32_scalar(q, row);
+    }
+    out
+}
+
+/// Squared Euclidean against four rows, 128-bit lanes (SSE / NEON).
+///
+/// ### Params
+///
+/// * `q` - Query row
+/// * `y` - Four candidate rows, each the same length as `q`
+///
+/// ### Returns
+///
+/// The four squared distances, in input order.
+#[inline(always)]
+fn euclidean_f32_batch4_sse(q: &[f32], y: [&[f32]; 4]) -> [f32; 4] {
+    let len = q.len();
+
+    let mut acc0 = f32x4::ZERO;
+    let mut acc1 = f32x4::ZERO;
+    let mut acc2 = f32x4::ZERO;
+    let mut acc3 = f32x4::ZERO;
+
+    let mut offset = 0;
+
+    unsafe {
+        let qp = q.as_ptr();
+        let p0 = y[0].as_ptr();
+        let p1 = y[1].as_ptr();
+        let p2 = y[2].as_ptr();
+        let p3 = y[3].as_ptr();
+
+        while offset + 4 <= len {
+            let qv = f32x4::from(*(qp.add(offset) as *const [f32; 4]));
+
+            let d0 = qv - f32x4::from(*(p0.add(offset) as *const [f32; 4]));
+            let d1 = qv - f32x4::from(*(p1.add(offset) as *const [f32; 4]));
+            let d2 = qv - f32x4::from(*(p2.add(offset) as *const [f32; 4]));
+            let d3 = qv - f32x4::from(*(p3.add(offset) as *const [f32; 4]));
+
+            acc0 += d0 * d0;
+            acc1 += d1 * d1;
+            acc2 += d2 * d2;
+            acc3 += d3 * d3;
+
+            offset += 4;
+        }
+    }
+
+    let mut out = [
+        acc0.reduce_add(),
+        acc1.reduce_add(),
+        acc2.reduce_add(),
+        acc3.reduce_add(),
+    ];
+
+    for i in offset..len {
+        for (k, row) in y.iter().enumerate() {
+            let d = q[i] - row[i];
+            out[k] += d * d;
+        }
+    }
+
+    out
+}
+
+/// Squared Euclidean against four rows, 256-bit lanes.
+///
+/// Also serves AVX-512 builds: the wider path would need a fifth set of
+/// accumulators to pay for itself and the gather, not the arithmetic, is the
+/// binding constraint here.
+///
+/// ### Params
+///
+/// * `q` - Query row
+/// * `y` - Four candidate rows, each the same length as `q`
+///
+/// ### Returns
+///
+/// The four squared distances, in input order.
+#[inline(always)]
+fn euclidean_f32_batch4_avx2(q: &[f32], y: [&[f32]; 4]) -> [f32; 4] {
+    let len = q.len();
+
+    let mut acc0 = f32x8::ZERO;
+    let mut acc1 = f32x8::ZERO;
+    let mut acc2 = f32x8::ZERO;
+    let mut acc3 = f32x8::ZERO;
+
+    let mut offset = 0;
+
+    unsafe {
+        let qp = q.as_ptr();
+        let p0 = y[0].as_ptr();
+        let p1 = y[1].as_ptr();
+        let p2 = y[2].as_ptr();
+        let p3 = y[3].as_ptr();
+
+        while offset + 8 <= len {
+            let qv = f32x8::from(*(qp.add(offset) as *const [f32; 8]));
+
+            let d0 = qv - f32x8::from(*(p0.add(offset) as *const [f32; 8]));
+            let d1 = qv - f32x8::from(*(p1.add(offset) as *const [f32; 8]));
+            let d2 = qv - f32x8::from(*(p2.add(offset) as *const [f32; 8]));
+            let d3 = qv - f32x8::from(*(p3.add(offset) as *const [f32; 8]));
+
+            acc0 += d0 * d0;
+            acc1 += d1 * d1;
+            acc2 += d2 * d2;
+            acc3 += d3 * d3;
+
+            offset += 8;
+        }
+    }
+
+    let mut out = [
+        acc0.reduce_add(),
+        acc1.reduce_add(),
+        acc2.reduce_add(),
+        acc3.reduce_add(),
+    ];
+
+    for i in offset..len {
+        for (k, row) in y.iter().enumerate() {
+            let d = q[i] - row[i];
+            out[k] += d * d;
+        }
+    }
+
+    out
+}
+
+/// Dot product against four rows, scalar fallback.
+///
+/// ### Params
+///
+/// * `q` - Query row
+/// * `y` - Four candidate rows, each the same length as `q`
+///
+/// ### Returns
+///
+/// The four dot products, in input order.
+#[inline(always)]
+fn dot_f32_batch4_scalar(q: &[f32], y: [&[f32]; 4]) -> [f32; 4] {
+    let mut out = [0.0f32; 4];
+    for (k, row) in y.iter().enumerate() {
+        out[k] = dot_f32_scalar(q, row);
+    }
+    out
+}
+
+/// Dot product against four rows, 128-bit lanes (SSE / NEON).
+///
+/// ### Params
+///
+/// * `q` - Query row
+/// * `y` - Four candidate rows, each the same length as `q`
+///
+/// ### Returns
+///
+/// The four dot products, in input order.
+#[inline(always)]
+fn dot_f32_batch4_sse(q: &[f32], y: [&[f32]; 4]) -> [f32; 4] {
+    let len = q.len();
+
+    let mut acc0 = f32x4::ZERO;
+    let mut acc1 = f32x4::ZERO;
+    let mut acc2 = f32x4::ZERO;
+    let mut acc3 = f32x4::ZERO;
+
+    let mut offset = 0;
+
+    unsafe {
+        let qp = q.as_ptr();
+        let p0 = y[0].as_ptr();
+        let p1 = y[1].as_ptr();
+        let p2 = y[2].as_ptr();
+        let p3 = y[3].as_ptr();
+
+        while offset + 4 <= len {
+            let qv = f32x4::from(*(qp.add(offset) as *const [f32; 4]));
+
+            acc0 += qv * f32x4::from(*(p0.add(offset) as *const [f32; 4]));
+            acc1 += qv * f32x4::from(*(p1.add(offset) as *const [f32; 4]));
+            acc2 += qv * f32x4::from(*(p2.add(offset) as *const [f32; 4]));
+            acc3 += qv * f32x4::from(*(p3.add(offset) as *const [f32; 4]));
+
+            offset += 4;
+        }
+    }
+
+    let mut out = [
+        acc0.reduce_add(),
+        acc1.reduce_add(),
+        acc2.reduce_add(),
+        acc3.reduce_add(),
+    ];
+
+    for i in offset..len {
+        for (k, row) in y.iter().enumerate() {
+            out[k] += q[i] * row[i];
+        }
+    }
+
+    out
+}
+
+/// Dot product against four rows, 256-bit lanes.
+///
+/// ### Params
+///
+/// * `q` - Query row
+/// * `y` - Four candidate rows, each the same length as `q`
+///
+/// ### Returns
+///
+/// The four dot products, in input order.
+#[inline(always)]
+fn dot_f32_batch4_avx2(q: &[f32], y: [&[f32]; 4]) -> [f32; 4] {
+    let len = q.len();
+
+    let mut acc0 = f32x8::ZERO;
+    let mut acc1 = f32x8::ZERO;
+    let mut acc2 = f32x8::ZERO;
+    let mut acc3 = f32x8::ZERO;
+
+    let mut offset = 0;
+
+    unsafe {
+        let qp = q.as_ptr();
+        let p0 = y[0].as_ptr();
+        let p1 = y[1].as_ptr();
+        let p2 = y[2].as_ptr();
+        let p3 = y[3].as_ptr();
+
+        while offset + 8 <= len {
+            let qv = f32x8::from(*(qp.add(offset) as *const [f32; 8]));
+
+            acc0 += qv * f32x8::from(*(p0.add(offset) as *const [f32; 8]));
+            acc1 += qv * f32x8::from(*(p1.add(offset) as *const [f32; 8]));
+            acc2 += qv * f32x8::from(*(p2.add(offset) as *const [f32; 8]));
+            acc3 += qv * f32x8::from(*(p3.add(offset) as *const [f32; 8]));
+
+            offset += 8;
+        }
+    }
+
+    let mut out = [
+        acc0.reduce_add(),
+        acc1.reduce_add(),
+        acc2.reduce_add(),
+        acc3.reduce_add(),
+    ];
+
+    for i in offset..len {
+        for (k, row) in y.iter().enumerate() {
+            out[k] += q[i] * row[i];
+        }
+    }
+
+    out
+}
+
+/// Manhattan distance against four rows, scalar fallback.
+///
+/// ### Params
+///
+/// * `q` - Query row
+/// * `y` - Four candidate rows, each the same length as `q`
+///
+/// ### Returns
+///
+/// The four results, in input order.
+#[inline(always)]
+fn manhattan_f32_batch4_scalar(q: &[f32], y: [&[f32]; 4]) -> [f32; 4] {
+    let mut out = [0.0f32; 4];
+    for (k, row) in y.iter().enumerate() {
+        out[k] = manhattan_f32_scalar(q, row);
+    }
+    out
+}
+
+/// Manhattan distance against four rows, 128-bit lanes.
+///
+/// ### Params
+///
+/// * `q` - Query row
+/// * `y` - Four candidate rows, each the same length as `q`
+///
+/// ### Returns
+///
+/// The four results, in input order.
+#[inline(always)]
+fn manhattan_f32_batch4_sse(q: &[f32], y: [&[f32]; 4]) -> [f32; 4] {
+    let len = q.len();
+
+    let mut acc0 = f32x4::ZERO;
+    let mut acc1 = f32x4::ZERO;
+    let mut acc2 = f32x4::ZERO;
+    let mut acc3 = f32x4::ZERO;
+
+    let mut offset = 0;
+
+    unsafe {
+        let qp = q.as_ptr();
+        let p0 = y[0].as_ptr();
+        let p1 = y[1].as_ptr();
+        let p2 = y[2].as_ptr();
+        let p3 = y[3].as_ptr();
+
+        while offset + 4 <= len {
+            let qv = f32x4::from(*(qp.add(offset) as *const [f32; 4]));
+
+            acc0 += (qv - f32x4::from(*(p0.add(offset) as *const [f32; 4]))).abs();
+            acc1 += (qv - f32x4::from(*(p1.add(offset) as *const [f32; 4]))).abs();
+            acc2 += (qv - f32x4::from(*(p2.add(offset) as *const [f32; 4]))).abs();
+            acc3 += (qv - f32x4::from(*(p3.add(offset) as *const [f32; 4]))).abs();
+
+            offset += 4;
+        }
+    }
+
+    let mut out = [
+        acc0.reduce_add(),
+        acc1.reduce_add(),
+        acc2.reduce_add(),
+        acc3.reduce_add(),
+    ];
+
+    for i in offset..len {
+        for (k, row) in y.iter().enumerate() {
+            out[k] += (q[i] - row[i]).abs();
+        }
+    }
+
+    out
+}
+
+/// Manhattan distance against four rows, 256-bit lanes.
+///
+/// Also serves AVX-512 builds: the gather, not the arithmetic, is the
+/// binding constraint, so a wider lane buys little here.
+///
+/// ### Params
+///
+/// * `q` - Query row
+/// * `y` - Four candidate rows, each the same length as `q`
+///
+/// ### Returns
+///
+/// The four results, in input order.
+#[inline(always)]
+fn manhattan_f32_batch4_avx2(q: &[f32], y: [&[f32]; 4]) -> [f32; 4] {
+    let len = q.len();
+
+    let mut acc0 = f32x8::ZERO;
+    let mut acc1 = f32x8::ZERO;
+    let mut acc2 = f32x8::ZERO;
+    let mut acc3 = f32x8::ZERO;
+
+    let mut offset = 0;
+
+    unsafe {
+        let qp = q.as_ptr();
+        let p0 = y[0].as_ptr();
+        let p1 = y[1].as_ptr();
+        let p2 = y[2].as_ptr();
+        let p3 = y[3].as_ptr();
+
+        while offset + 8 <= len {
+            let qv = f32x8::from(*(qp.add(offset) as *const [f32; 8]));
+
+            acc0 += (qv - f32x8::from(*(p0.add(offset) as *const [f32; 8]))).abs();
+            acc1 += (qv - f32x8::from(*(p1.add(offset) as *const [f32; 8]))).abs();
+            acc2 += (qv - f32x8::from(*(p2.add(offset) as *const [f32; 8]))).abs();
+            acc3 += (qv - f32x8::from(*(p3.add(offset) as *const [f32; 8]))).abs();
+
+            offset += 8;
+        }
+    }
+
+    let mut out = [
+        acc0.reduce_add(),
+        acc1.reduce_add(),
+        acc2.reduce_add(),
+        acc3.reduce_add(),
+    ];
+
+    for i in offset..len {
+        for (k, row) in y.iter().enumerate() {
+            out[k] += (q[i] - row[i]).abs();
+        }
+    }
+
+    out
+}
+
+/// Squared Euclidean against four rows, scalar fallback.
+///
+/// ### Params
+///
+/// * `q` - Query row
+/// * `y` - Four candidate rows, each the same length as `q`
+///
+/// ### Returns
+///
+/// The four results, in input order.
+#[inline(always)]
+fn euclidean_f64_batch4_scalar(q: &[f64], y: [&[f64]; 4]) -> [f64; 4] {
+    let mut out = [0.0f64; 4];
+    for (k, row) in y.iter().enumerate() {
+        out[k] = euclidean_f64_scalar(q, row);
+    }
+    out
+}
+
+/// Squared Euclidean against four rows, 128-bit lanes.
+///
+/// ### Params
+///
+/// * `q` - Query row
+/// * `y` - Four candidate rows, each the same length as `q`
+///
+/// ### Returns
+///
+/// The four results, in input order.
+#[inline(always)]
+fn euclidean_f64_batch4_sse(q: &[f64], y: [&[f64]; 4]) -> [f64; 4] {
+    let len = q.len();
+
+    let mut acc0 = f64x2::ZERO;
+    let mut acc1 = f64x2::ZERO;
+    let mut acc2 = f64x2::ZERO;
+    let mut acc3 = f64x2::ZERO;
+
+    let mut offset = 0;
+
+    unsafe {
+        let qp = q.as_ptr();
+        let p0 = y[0].as_ptr();
+        let p1 = y[1].as_ptr();
+        let p2 = y[2].as_ptr();
+        let p3 = y[3].as_ptr();
+
+        while offset + 2 <= len {
+            let qv = f64x2::from(*(qp.add(offset) as *const [f64; 2]));
+
+            let d0 = qv - f64x2::from(*(p0.add(offset) as *const [f64; 2]));
+            let d1 = qv - f64x2::from(*(p1.add(offset) as *const [f64; 2]));
+            let d2 = qv - f64x2::from(*(p2.add(offset) as *const [f64; 2]));
+            let d3 = qv - f64x2::from(*(p3.add(offset) as *const [f64; 2]));
+
+            acc0 += d0 * d0;
+            acc1 += d1 * d1;
+            acc2 += d2 * d2;
+            acc3 += d3 * d3;
+
+            offset += 2;
+        }
+    }
+
+    let mut out = [
+        acc0.reduce_add(),
+        acc1.reduce_add(),
+        acc2.reduce_add(),
+        acc3.reduce_add(),
+    ];
+
+    for i in offset..len {
+        for (k, row) in y.iter().enumerate() {
+            let d = q[i] - row[i];
+            out[k] += d * d;
+        }
+    }
+
+    out
+}
+
+/// Squared Euclidean against four rows, 256-bit lanes.
+///
+/// Also serves AVX-512 builds: the gather, not the arithmetic, is the
+/// binding constraint, so a wider lane buys little here.
+///
+/// ### Params
+///
+/// * `q` - Query row
+/// * `y` - Four candidate rows, each the same length as `q`
+///
+/// ### Returns
+///
+/// The four results, in input order.
+#[inline(always)]
+fn euclidean_f64_batch4_avx2(q: &[f64], y: [&[f64]; 4]) -> [f64; 4] {
+    let len = q.len();
+
+    let mut acc0 = f64x4::ZERO;
+    let mut acc1 = f64x4::ZERO;
+    let mut acc2 = f64x4::ZERO;
+    let mut acc3 = f64x4::ZERO;
+
+    let mut offset = 0;
+
+    unsafe {
+        let qp = q.as_ptr();
+        let p0 = y[0].as_ptr();
+        let p1 = y[1].as_ptr();
+        let p2 = y[2].as_ptr();
+        let p3 = y[3].as_ptr();
+
+        while offset + 4 <= len {
+            let qv = f64x4::from(*(qp.add(offset) as *const [f64; 4]));
+
+            let d0 = qv - f64x4::from(*(p0.add(offset) as *const [f64; 4]));
+            let d1 = qv - f64x4::from(*(p1.add(offset) as *const [f64; 4]));
+            let d2 = qv - f64x4::from(*(p2.add(offset) as *const [f64; 4]));
+            let d3 = qv - f64x4::from(*(p3.add(offset) as *const [f64; 4]));
+
+            acc0 += d0 * d0;
+            acc1 += d1 * d1;
+            acc2 += d2 * d2;
+            acc3 += d3 * d3;
+
+            offset += 4;
+        }
+    }
+
+    let mut out = [
+        acc0.reduce_add(),
+        acc1.reduce_add(),
+        acc2.reduce_add(),
+        acc3.reduce_add(),
+    ];
+
+    for i in offset..len {
+        for (k, row) in y.iter().enumerate() {
+            let d = q[i] - row[i];
+            out[k] += d * d;
+        }
+    }
+
+    out
+}
+
+/// Dot product against four rows, scalar fallback.
+///
+/// ### Params
+///
+/// * `q` - Query row
+/// * `y` - Four candidate rows, each the same length as `q`
+///
+/// ### Returns
+///
+/// The four results, in input order.
+#[inline(always)]
+fn dot_f64_batch4_scalar(q: &[f64], y: [&[f64]; 4]) -> [f64; 4] {
+    let mut out = [0.0f64; 4];
+    for (k, row) in y.iter().enumerate() {
+        out[k] = dot_f64_scalar(q, row);
+    }
+    out
+}
+
+/// Dot product against four rows, 128-bit lanes.
+///
+/// ### Params
+///
+/// * `q` - Query row
+/// * `y` - Four candidate rows, each the same length as `q`
+///
+/// ### Returns
+///
+/// The four results, in input order.
+#[inline(always)]
+fn dot_f64_batch4_sse(q: &[f64], y: [&[f64]; 4]) -> [f64; 4] {
+    let len = q.len();
+
+    let mut acc0 = f64x2::ZERO;
+    let mut acc1 = f64x2::ZERO;
+    let mut acc2 = f64x2::ZERO;
+    let mut acc3 = f64x2::ZERO;
+
+    let mut offset = 0;
+
+    unsafe {
+        let qp = q.as_ptr();
+        let p0 = y[0].as_ptr();
+        let p1 = y[1].as_ptr();
+        let p2 = y[2].as_ptr();
+        let p3 = y[3].as_ptr();
+
+        while offset + 2 <= len {
+            let qv = f64x2::from(*(qp.add(offset) as *const [f64; 2]));
+
+            acc0 += qv * f64x2::from(*(p0.add(offset) as *const [f64; 2]));
+            acc1 += qv * f64x2::from(*(p1.add(offset) as *const [f64; 2]));
+            acc2 += qv * f64x2::from(*(p2.add(offset) as *const [f64; 2]));
+            acc3 += qv * f64x2::from(*(p3.add(offset) as *const [f64; 2]));
+
+            offset += 2;
+        }
+    }
+
+    let mut out = [
+        acc0.reduce_add(),
+        acc1.reduce_add(),
+        acc2.reduce_add(),
+        acc3.reduce_add(),
+    ];
+
+    for i in offset..len {
+        for (k, row) in y.iter().enumerate() {
+            out[k] += q[i] * row[i];
+        }
+    }
+
+    out
+}
+
+/// Dot product against four rows, 256-bit lanes.
+///
+/// Also serves AVX-512 builds: the gather, not the arithmetic, is the
+/// binding constraint, so a wider lane buys little here.
+///
+/// ### Params
+///
+/// * `q` - Query row
+/// * `y` - Four candidate rows, each the same length as `q`
+///
+/// ### Returns
+///
+/// The four results, in input order.
+#[inline(always)]
+fn dot_f64_batch4_avx2(q: &[f64], y: [&[f64]; 4]) -> [f64; 4] {
+    let len = q.len();
+
+    let mut acc0 = f64x4::ZERO;
+    let mut acc1 = f64x4::ZERO;
+    let mut acc2 = f64x4::ZERO;
+    let mut acc3 = f64x4::ZERO;
+
+    let mut offset = 0;
+
+    unsafe {
+        let qp = q.as_ptr();
+        let p0 = y[0].as_ptr();
+        let p1 = y[1].as_ptr();
+        let p2 = y[2].as_ptr();
+        let p3 = y[3].as_ptr();
+
+        while offset + 4 <= len {
+            let qv = f64x4::from(*(qp.add(offset) as *const [f64; 4]));
+
+            acc0 += qv * f64x4::from(*(p0.add(offset) as *const [f64; 4]));
+            acc1 += qv * f64x4::from(*(p1.add(offset) as *const [f64; 4]));
+            acc2 += qv * f64x4::from(*(p2.add(offset) as *const [f64; 4]));
+            acc3 += qv * f64x4::from(*(p3.add(offset) as *const [f64; 4]));
+
+            offset += 4;
+        }
+    }
+
+    let mut out = [
+        acc0.reduce_add(),
+        acc1.reduce_add(),
+        acc2.reduce_add(),
+        acc3.reduce_add(),
+    ];
+
+    for i in offset..len {
+        for (k, row) in y.iter().enumerate() {
+            out[k] += q[i] * row[i];
+        }
+    }
+
+    out
+}
+
+/// Manhattan distance against four rows, scalar fallback.
+///
+/// ### Params
+///
+/// * `q` - Query row
+/// * `y` - Four candidate rows, each the same length as `q`
+///
+/// ### Returns
+///
+/// The four results, in input order.
+#[inline(always)]
+fn manhattan_f64_batch4_scalar(q: &[f64], y: [&[f64]; 4]) -> [f64; 4] {
+    let mut out = [0.0f64; 4];
+    for (k, row) in y.iter().enumerate() {
+        out[k] = manhattan_f64_scalar(q, row);
+    }
+    out
+}
+
+/// Manhattan distance against four rows, 128-bit lanes.
+///
+/// ### Params
+///
+/// * `q` - Query row
+/// * `y` - Four candidate rows, each the same length as `q`
+///
+/// ### Returns
+///
+/// The four results, in input order.
+#[inline(always)]
+fn manhattan_f64_batch4_sse(q: &[f64], y: [&[f64]; 4]) -> [f64; 4] {
+    let len = q.len();
+
+    let mut acc0 = f64x2::ZERO;
+    let mut acc1 = f64x2::ZERO;
+    let mut acc2 = f64x2::ZERO;
+    let mut acc3 = f64x2::ZERO;
+
+    let mut offset = 0;
+
+    unsafe {
+        let qp = q.as_ptr();
+        let p0 = y[0].as_ptr();
+        let p1 = y[1].as_ptr();
+        let p2 = y[2].as_ptr();
+        let p3 = y[3].as_ptr();
+
+        while offset + 2 <= len {
+            let qv = f64x2::from(*(qp.add(offset) as *const [f64; 2]));
+
+            acc0 += (qv - f64x2::from(*(p0.add(offset) as *const [f64; 2]))).abs();
+            acc1 += (qv - f64x2::from(*(p1.add(offset) as *const [f64; 2]))).abs();
+            acc2 += (qv - f64x2::from(*(p2.add(offset) as *const [f64; 2]))).abs();
+            acc3 += (qv - f64x2::from(*(p3.add(offset) as *const [f64; 2]))).abs();
+
+            offset += 2;
+        }
+    }
+
+    let mut out = [
+        acc0.reduce_add(),
+        acc1.reduce_add(),
+        acc2.reduce_add(),
+        acc3.reduce_add(),
+    ];
+
+    for i in offset..len {
+        for (k, row) in y.iter().enumerate() {
+            out[k] += (q[i] - row[i]).abs();
+        }
+    }
+
+    out
+}
+
+/// Manhattan distance against four rows, 256-bit lanes.
+///
+/// Also serves AVX-512 builds: the gather, not the arithmetic, is the
+/// binding constraint, so a wider lane buys little here.
+///
+/// ### Params
+///
+/// * `q` - Query row
+/// * `y` - Four candidate rows, each the same length as `q`
+///
+/// ### Returns
+///
+/// The four results, in input order.
+#[inline(always)]
+fn manhattan_f64_batch4_avx2(q: &[f64], y: [&[f64]; 4]) -> [f64; 4] {
+    let len = q.len();
+
+    let mut acc0 = f64x4::ZERO;
+    let mut acc1 = f64x4::ZERO;
+    let mut acc2 = f64x4::ZERO;
+    let mut acc3 = f64x4::ZERO;
+
+    let mut offset = 0;
+
+    unsafe {
+        let qp = q.as_ptr();
+        let p0 = y[0].as_ptr();
+        let p1 = y[1].as_ptr();
+        let p2 = y[2].as_ptr();
+        let p3 = y[3].as_ptr();
+
+        while offset + 4 <= len {
+            let qv = f64x4::from(*(qp.add(offset) as *const [f64; 4]));
+
+            acc0 += (qv - f64x4::from(*(p0.add(offset) as *const [f64; 4]))).abs();
+            acc1 += (qv - f64x4::from(*(p1.add(offset) as *const [f64; 4]))).abs();
+            acc2 += (qv - f64x4::from(*(p2.add(offset) as *const [f64; 4]))).abs();
+            acc3 += (qv - f64x4::from(*(p3.add(offset) as *const [f64; 4]))).abs();
+
+            offset += 4;
+        }
+    }
+
+    let mut out = [
+        acc0.reduce_add(),
+        acc1.reduce_add(),
+        acc2.reduce_add(),
+        acc3.reduce_add(),
+    ];
+
+    for i in offset..len {
+        for (k, row) in y.iter().enumerate() {
+            out[k] += (q[i] - row[i]).abs();
+        }
+    }
+
+    out
+}
+
 //////////////////////////////////
 // SimdDistance implementations //
 //////////////////////////////////
@@ -3168,6 +4080,33 @@ impl SimdDistance for f32 {
             SimdLevel::Avx2 => dot_f32_avx2(a, b),
             SimdLevel::Sse => dot_f32_sse(a, b),
             SimdLevel::Scalar => dot_f32_scalar(a, b),
+        }
+    }
+
+    #[inline]
+    fn euclidean_simd_batch_4(q: &[f32], y: [&[f32]; 4]) -> [f32; 4] {
+        match detect_simd_level() {
+            SimdLevel::Avx512 | SimdLevel::Avx2 => euclidean_f32_batch4_avx2(q, y),
+            SimdLevel::Sse => euclidean_f32_batch4_sse(q, y),
+            SimdLevel::Scalar => euclidean_f32_batch4_scalar(q, y),
+        }
+    }
+
+    #[inline]
+    fn dot_simd_batch_4(q: &[f32], y: [&[f32]; 4]) -> [f32; 4] {
+        match detect_simd_level() {
+            SimdLevel::Avx512 | SimdLevel::Avx2 => dot_f32_batch4_avx2(q, y),
+            SimdLevel::Sse => dot_f32_batch4_sse(q, y),
+            SimdLevel::Scalar => dot_f32_batch4_scalar(q, y),
+        }
+    }
+
+    #[inline]
+    fn manhattan_simd_batch_4(q: &[f32], y: [&[f32]; 4]) -> [f32; 4] {
+        match detect_simd_level() {
+            SimdLevel::Avx512 | SimdLevel::Avx2 => manhattan_f32_batch4_avx2(q, y),
+            SimdLevel::Sse => manhattan_f32_batch4_sse(q, y),
+            SimdLevel::Scalar => manhattan_f32_batch4_scalar(q, y),
         }
     }
 
@@ -3264,6 +4203,33 @@ impl SimdDistance for f64 {
             SimdLevel::Avx2 => dot_f64_avx2(a, b),
             SimdLevel::Sse => dot_f64_sse(a, b),
             SimdLevel::Scalar => dot_f64_scalar(a, b),
+        }
+    }
+
+    #[inline]
+    fn euclidean_simd_batch_4(q: &[f64], y: [&[f64]; 4]) -> [f64; 4] {
+        match detect_simd_level() {
+            SimdLevel::Avx512 | SimdLevel::Avx2 => euclidean_f64_batch4_avx2(q, y),
+            SimdLevel::Sse => euclidean_f64_batch4_sse(q, y),
+            SimdLevel::Scalar => euclidean_f64_batch4_scalar(q, y),
+        }
+    }
+
+    #[inline]
+    fn dot_simd_batch_4(q: &[f64], y: [&[f64]; 4]) -> [f64; 4] {
+        match detect_simd_level() {
+            SimdLevel::Avx512 | SimdLevel::Avx2 => dot_f64_batch4_avx2(q, y),
+            SimdLevel::Sse => dot_f64_batch4_sse(q, y),
+            SimdLevel::Scalar => dot_f64_batch4_scalar(q, y),
+        }
+    }
+
+    #[inline]
+    fn manhattan_simd_batch_4(q: &[f64], y: [&[f64]; 4]) -> [f64; 4] {
+        match detect_simd_level() {
+            SimdLevel::Avx512 | SimdLevel::Avx2 => manhattan_f64_batch4_avx2(q, y),
+            SimdLevel::Sse => manhattan_f64_batch4_sse(q, y),
+            SimdLevel::Scalar => manhattan_f64_batch4_scalar(q, y),
         }
     }
 
@@ -6446,4 +7412,88 @@ mod tests {
         }
     }
 
+    /// The batch-4 kernels must agree with the single-row kernels they replace.
+    ///
+    /// Dimensions deliberately straddle the lane widths (2, 4 and 8) so the
+    /// vector body, the remainder loop and the empty-body case are all
+    /// exercised. A transposed row pointer inside a batch kernel is invisible
+    /// any other way: the result is still plausible, just attached to the wrong
+    /// candidate.
+    #[test]
+    fn test_batch4_agrees_with_single_kernels() {
+        for dim in [1usize, 2, 3, 4, 7, 8, 15, 16, 32, 33, 128] {
+            let q32: Vec<f32> = (0..dim).map(|i| (i as f32) * 0.37 - 1.5).collect();
+            let rows32: Vec<Vec<f32>> = (0..4)
+                .map(|r| {
+                    (0..dim)
+                        .map(|i| ((i * 7 + r * 13) % 11) as f32 * 0.29 - 1.1)
+                        .collect()
+                })
+                .collect();
+            let y32 = [
+                rows32[0].as_slice(),
+                rows32[1].as_slice(),
+                rows32[2].as_slice(),
+                rows32[3].as_slice(),
+            ];
+
+            let got = f32::euclidean_simd_batch_4(&q32, y32);
+            let got_dot = f32::dot_simd_batch_4(&q32, y32);
+            let got_l1 = f32::manhattan_simd_batch_4(&q32, y32);
+            for k in 0..4 {
+                assert_relative_eq!(got[k], f32::euclidean_simd(&q32, y32[k]), epsilon = 1e-4);
+                assert_relative_eq!(got_dot[k], f32::dot_simd(&q32, y32[k]), epsilon = 1e-4);
+                assert_relative_eq!(got_l1[k], f32::manhattan_simd(&q32, y32[k]), epsilon = 1e-4);
+            }
+
+            let q64: Vec<f64> = q32.iter().map(|&x| x as f64).collect();
+            let rows64: Vec<Vec<f64>> = rows32
+                .iter()
+                .map(|r| r.iter().map(|&x| x as f64).collect())
+                .collect();
+            let y64 = [
+                rows64[0].as_slice(),
+                rows64[1].as_slice(),
+                rows64[2].as_slice(),
+                rows64[3].as_slice(),
+            ];
+
+            let got = f64::euclidean_simd_batch_4(&q64, y64);
+            let got_dot = f64::dot_simd_batch_4(&q64, y64);
+            let got_l1 = f64::manhattan_simd_batch_4(&q64, y64);
+            for k in 0..4 {
+                assert_relative_eq!(got[k], f64::euclidean_simd(&q64, y64[k]), epsilon = 1e-12);
+                assert_relative_eq!(got_dot[k], f64::dot_simd(&q64, y64[k]), epsilon = 1e-12);
+                assert_relative_eq!(
+                    got_l1[k],
+                    f64::manhattan_simd(&q64, y64[k]),
+                    epsilon = 1e-12
+                );
+            }
+        }
+    }
+
+    /// Each batch slot must carry its own row, not a neighbour's.
+    ///
+    /// Uses four rows at wildly different distances so any permutation of the
+    /// outputs shows up as an ordering failure rather than a rounding one.
+    #[test]
+    fn test_batch4_keeps_rows_in_order() {
+        let dim = 16;
+        let q: Vec<f32> = vec![0.0; dim];
+        let rows: Vec<Vec<f32>> = (0..4).map(|r| vec![(r + 1) as f32; dim]).collect();
+        let y = [
+            rows[0].as_slice(),
+            rows[1].as_slice(),
+            rows[2].as_slice(),
+            rows[3].as_slice(),
+        ];
+
+        let got = f32::euclidean_simd_batch_4(&q, y);
+        for k in 0..4 {
+            let expected = dim as f32 * ((k + 1) as f32).powi(2);
+            assert_relative_eq!(got[k], expected, epsilon = 1e-4);
+        }
+        assert!(got[0] < got[1] && got[1] < got[2] && got[2] < got[3]);
+    }
 }
