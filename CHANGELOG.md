@@ -17,6 +17,11 @@
   so the published numbers are reproducible outside this repository. Gridsearch
   commands are unchanged.
 - `clap` and `approx` moved to dev-dependencies.
+- PCAHashing has now ITQ which improves it performance.
+- Improved speed for a large number of indices:
+  * Exhaustive uses GEMM now
+  * Binary build times massively reduced
+  * RaBitQ has faster querying times.
 
 **Docs**
 
