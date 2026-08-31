@@ -722,9 +722,8 @@ where
     // small and this is a build-time one-off, so it stays sequential.
     let mut centroids_rotated = Vec::with_capacity(nlist * dim);
     for c in 0..nlist {
-        centroids_rotated.extend_from_slice(
-            &encoder.apply_rotation(&centroids[c * dim..(c + 1) * dim]),
-        );
+        centroids_rotated
+            .extend_from_slice(&encoder.apply_rotation(&centroids[c * dim..(c + 1) * dim]));
     }
 
     // Allocate storage
@@ -1067,11 +1066,7 @@ mod tests {
 
                 // R is orthogonal, so the residual norm survives the change of
                 // frame; everything downstream is derived from it.
-                assert_abs_diff_eq!(
-                    slow.dist_to_centroid,
-                    fast.dist_to_centroid,
-                    epsilon = 1e-4
-                );
+                assert_abs_diff_eq!(slow.dist_to_centroid, fast.dist_to_centroid, epsilon = 1e-4);
                 assert_abs_diff_eq!(slow.lower, fast.lower, epsilon = 1e-4);
                 assert_abs_diff_eq!(slow.width, fast.width, epsilon = 1e-5);
 
@@ -1259,7 +1254,10 @@ mod tests {
         let query = vec![0.8, 0.2];
         let encoded = quantiser.encode_query(&query, 0).unwrap();
 
-        assert_eq!(unpack_query_planes(&encoded.planes, 2, encoded.n_bytes).len(), 2);
+        assert_eq!(
+            unpack_query_planes(&encoded.planes, 2, encoded.n_bytes).len(),
+            2
+        );
         assert!(encoded.dist_to_centroid >= 0.0);
         assert!(encoded.sum_quantised <= 30); // 2 dims * 15 max
     }

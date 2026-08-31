@@ -566,7 +566,11 @@ where
         let base = full_bytes * 8;
         for bit_pos in 0..remaining {
             let q = query_vec[base + bit_pos];
-            a0 = if (bits >> bit_pos) & 1 == 1 { a0 + q } else { a0 };
+            a0 = if (bits >> bit_pos) & 1 == 1 {
+                a0 + q
+            } else {
+                a0
+            };
         }
     }
 
@@ -777,8 +781,14 @@ unsafe fn dot_planes_neon(planes: &[u8], binary: &[u8], n_bytes: usize) -> u32 {
             let vb = vld1q_u8(b.add(off));
             a0 = vaddq_u8(a0, vcntq_u8(vandq_u8(vld1q_u8(p.add(off)), vb)));
             a1 = vaddq_u8(a1, vcntq_u8(vandq_u8(vld1q_u8(p.add(n_bytes + off)), vb)));
-            a2 = vaddq_u8(a2, vcntq_u8(vandq_u8(vld1q_u8(p.add(2 * n_bytes + off)), vb)));
-            a3 = vaddq_u8(a3, vcntq_u8(vandq_u8(vld1q_u8(p.add(3 * n_bytes + off)), vb)));
+            a2 = vaddq_u8(
+                a2,
+                vcntq_u8(vandq_u8(vld1q_u8(p.add(2 * n_bytes + off)), vb)),
+            );
+            a3 = vaddq_u8(
+                a3,
+                vcntq_u8(vandq_u8(vld1q_u8(p.add(3 * n_bytes + off)), vb)),
+            );
             chunk += 1;
         }
 
@@ -1052,8 +1062,11 @@ where
         for (j, slot) in out.iter_mut().enumerate() {
             let g = global_start + j;
             let packed = unsafe { storage.packed_vectors.get_unchecked(g) };
-            let binary =
-                unsafe { storage.binary_codes.get_unchecked(g * n_bytes..(g + 1) * n_bytes) };
+            let binary = unsafe {
+                storage
+                    .binary_codes
+                    .get_unchecked(g * n_bytes..(g + 1) * n_bytes)
+            };
 
             let qr = T::from_u32(dot_query_binary_planes(&query.planes, binary, n_bytes)).unwrap();
             let popcount = T::from_u32(packed.popcount).unwrap();
@@ -1101,9 +1114,9 @@ pub fn hamming_distance(a: &[u8], b: &[u8]) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use approx::assert_abs_diff_eq;
     use crate::binary::rabitq::RaBitQQuantiser;
     use crate::utils::dist::Dist;
+    use approx::assert_abs_diff_eq;
     use faer::Mat;
     use faer_traits::ComplexField;
 
@@ -1563,8 +1576,7 @@ mod tests {
     #[test]
     fn test_rabitq_block_offset_run() {
         let data = create_test_data::<f32>(120, 32);
-        let quantiser =
-            RaBitQQuantiser::new(data.as_ref(), &Dist::Cosine, Some(3), 7).unwrap();
+        let quantiser = RaBitQQuantiser::new(data.as_ref(), &Dist::Cosine, Some(3), 7).unwrap();
 
         let query = vec![0.5f32; 32];
         let c_idx = 0;

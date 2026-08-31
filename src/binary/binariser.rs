@@ -31,24 +31,27 @@ const MAX_SAMPLES_ITQ: usize = 10_000;
 /// that, so 30 is where further iterations stop paying for their two GEMMs.
 const ITQ_ITERATIONS: usize = 30;
 
-/// Relative variance floor for retaining a principal component.
+/// Share of total variance the retained components must explain.
 ///
-/// A component is kept while `sigma_j^2 >= PCA_VARIANCE_FLOOR * sigma_0^2`,
-/// i.e. while its standard deviation is at least 10% of the leading
-/// component's. Below that the direction carries little signal and its sign bit
-/// is close to being decided by rounding, yet it still counts for a full unit
-/// of Hamming distance.
+/// Judging each component against `sigma_0` alone cannot separate genuine rank
+/// one from a long informative tail sitting under one dominant axis, which is
+/// the normal shape for an embedding carrying a depth or library-size
+/// direction. A cumulative rule reads the whole spectrum instead.
+const PCA_VARIANCE_EXPLAINED: f64 = 0.9;
+
+/// Ceiling on retained components, as a share of the bit budget.
 ///
-/// The surplus bits are better spent on random hyperplanes: for data lying on a
-/// k-dimensional subspace, a random hyperplane in the ambient space restricts to
-/// a random hyperplane within that subspace, so those bits stay fully
-/// informative. Taking every component instead is what made PCA hashing spend
-/// hundreds of bits on a noise floor.
+/// On a flat, noisy spectrum the cumulative rule wants nearly every component,
+/// because no small prefix explains 90% of anything. That is the case this cap
+/// exists for: past the genuinely structured directions a PCA bit is worse than
+/// a random one, since a random hyperplane preserves angular distance by
+/// construction and a low-variance loading does not.
 ///
-/// Measured across the four synthetic generators at dim 256, recall is flat
-/// between `1e-2` and `1e-1` (within 0.004) and degrades sharply below `1e-4`,
-/// so this does not want fine tuning.
-const PCA_VARIANCE_FLOOR: f64 = 1e-2;
+/// Measured at dim 256 across the four synthetic generators, this is best or
+/// tied on every row; loosening it to 0.125 costs ~0.01 recall on the flat
+/// (gaussian) fixture and changes nothing on the structured ones, where the
+/// cumulative rule stops well short of the cap anyway.
+const PCA_MAX_COMPONENT_SHARE: f64 = 0.0625;
 
 /// Initialisation of the binariser
 #[derive(Default, Eq, PartialEq)]
@@ -244,21 +247,30 @@ where
 
 /// Number of principal components worth spending bits on
 ///
-/// Keeps component `j` while `sigma_j^2 >= PCA_VARIANCE_FLOOR * sigma_0^2`.
-/// Past that the direction is indistinguishable from the noise floor: its sign
-/// bit is decided by rounding, yet it still counts for a full unit of Hamming
-/// distance. The singular values come out of the SVD in descending order, so
-/// the scan stops at the first component below the floor.
+/// Keeps the leading components until they explain [`PCA_VARIANCE_EXPLAINED`]
+/// of the total variance, then clamps to `cap`.
+///
+/// The cumulative rule is what makes this robust on real spectra: judging each
+/// component against `sigma_0` alone cannot tell genuine rank one apart from a
+/// long tail sitting under one dominant axis, which is the normal shape for an
+/// embedding with a depth or library-size direction in it.
+///
+/// The cap carries the opposite case. On a flat, noisy spectrum the cumulative
+/// rule wants nearly every component, which is precisely the failure the whole
+/// variance cut exists to prevent: past the genuinely structured directions a
+/// PCA bit is worse than a random one, because a random hyperplane preserves
+/// angular distance by construction and a low-variance loading does not.
 ///
 /// ### Params
 ///
-/// * `singular_values` - Singular values of the centred training data
+/// * `singular_values` - Singular values of the centred training data, descending
 /// * `max_k` - Upper bound from the bit budget and the matrix rank
+/// * `cap` - Hard ceiling, see [`PCA_MAX_COMPONENT_SHARE`]
 ///
 /// ### Returns
 ///
-/// Number of components to retain, at least one
-fn retained_components<T>(singular_values: ColRef<T>, max_k: usize) -> usize
+/// Number of components to retain, at least one unless `max_k` is zero
+fn retained_components<T>(singular_values: ColRef<T>, max_k: usize, cap: usize) -> usize
 where
     T: Float + FromPrimitive,
 {
@@ -266,23 +278,29 @@ where
         return 0;
     }
 
-    let leading = singular_values[0];
-    if leading <= T::zero() {
+    // Total over every available component, not just the first `max_k`, so the
+    // denominator is the data's actual variance rather than the budget's share.
+    let mut total = T::zero();
+    for j in 0..singular_values.nrows() {
+        let s = singular_values[j];
+        total = total + s * s;
+    }
+
+    if total <= T::zero() {
         return 1;
     }
 
-    let floor = leading * leading * T::from_f64(PCA_VARIANCE_FLOOR).unwrap();
+    let target = total * T::from_f64(PCA_VARIANCE_EXPLAINED).unwrap();
 
+    let mut acc = T::zero();
     let mut k = 0;
-    while k < max_k {
+    while k < max_k && acc < target {
         let s = singular_values[k];
-        if s * s < floor {
-            break;
-        }
+        acc = acc + s * s;
         k += 1;
     }
 
-    k.max(1)
+    k.clamp(1, cap.max(1)).min(max_k)
 }
 
 /// Learn an ITQ rotation over PCA loadings and fold it into them
@@ -462,9 +480,11 @@ where
     let svd = centered.as_ref().thin_svd().unwrap();
     let v_full = svd.V(); // dim x min(n_samples, dim)
 
+    let cap = ((n_bits as f64 * PCA_MAX_COMPONENT_SHARE) as usize).max(1);
     let k = retained_components(
         svd.S().column_vector(),
         effective_bits.min(v_full.ncols()),
+        cap,
     );
 
     let mut projections = Vec::with_capacity(n_bits * dim);
@@ -620,7 +640,7 @@ pub(crate) fn encode_sign_residual_into<T: Float>(
 ///
 /// - **SimHash**: Random orthogonalised projections
 /// - **PcaHashing**: Signs of the principal components that clear
-///   [`PCA_VARIANCE_FLOOR`], rotated by ITQ so variance is spread evenly across
+///   [`PCA_VARIANCE_EXPLAINED`], rotated by ITQ so variance is spread evenly across
 ///   the bits, with every remaining bit filled by a random orthogonal
 ///   direction. The padding is the common case, not an edge case: on real data
 ///   only a few dozen components typically clear the floor.
@@ -981,9 +1001,7 @@ mod tests {
             let mut sum = 0.0;
             let mut sum_sq = 0.0;
             for i in 0..n_samples {
-                let score: f64 = (0..dim)
-                    .map(|d| proj[d] * (data[(i, d)] - mean[d]))
-                    .sum();
+                let score: f64 = (0..dim).map(|d| proj[d] * (data[(i, d)] - mean[d])).sum();
                 sum += score;
                 sum_sq += score * score;
             }
@@ -1004,35 +1022,37 @@ mod tests {
         );
     }
 
-    /// `retained_components` is the whole point of the variance floor, so pin
-    /// its cut directly rather than inferring it from downstream recall.
+    /// `retained_components` is the whole point of the variance cut, so pin its
+    /// behaviour directly rather than inferring it from downstream recall.
     #[test]
-    fn test_retained_components_cuts_at_the_variance_floor() {
+    fn test_retained_components_cumulative_rule() {
         use faer::Col;
 
-        // sigma_j = 1, 0.5, 0.2, 0.05, 0.01. Relative variances against
-        // sigma_0 are 1, 0.25, 0.04, 0.0025, 0.0001, so with a 1e-2 floor the
-        // first three survive and the scan stops at the fourth.
-        let s = Col::<f64>::from_fn(5, |i| [1.0, 0.5, 0.2, 0.05, 0.01][i]);
-        assert_eq!(retained_components(s.as_ref(), 5), 3);
+        // Variances 100, 10, 1, 0.1 sum to 111.1; 90% is 99.99, which the
+        // leading component alone clears.
+        let decaying = Col::<f64>::from_fn(4, |i| [10.0, 3.1623, 1.0, 0.3162][i]);
+        assert_eq!(retained_components(decaying.as_ref(), 4, 4), 1);
 
-        // The bit budget still caps it.
-        assert_eq!(retained_components(s.as_ref(), 2), 2);
-
-        // A flat spectrum drops nothing.
+        // Flat spectrum: 90% of six equal components needs six of them, so the
+        // cap is the only thing standing between this and spending every bit on
+        // a noise direction.
         let flat = Col::<f64>::from_fn(6, |_| 1.0);
-        assert_eq!(retained_components(flat.as_ref(), 6), 6);
+        assert_eq!(retained_components(flat.as_ref(), 6, 6), 6);
+        assert_eq!(retained_components(flat.as_ref(), 6, 2), 2);
 
-        // One dominant direction collapses the cut to a single component. This
-        // is the degenerate case the floor's relative rule cannot distinguish
-        // from genuine rank 1; see the note on PCA_VARIANCE_FLOOR.
-        let spiked = Col::<f64>::from_fn(4, |i| if i == 0 { 100.0 } else { 1.0 });
-        assert_eq!(retained_components(spiked.as_ref(), 4), 1);
+        // One dominant axis over an informative tail. The old ratio-to-sigma_0
+        // rule returned 1 here; the cumulative rule keeps the tail.
+        let spiked = Col::<f64>::from_fn(21, |i| if i == 0 { 10.0 } else { 1.0 });
+        assert!(
+            retained_components(spiked.as_ref(), 21, 21) > 1,
+            "a long tail under one dominant axis must not collapse to rank one"
+        );
 
-        // Degenerate inputs: no budget, and an all-zero spectrum.
-        assert_eq!(retained_components(s.as_ref(), 0), 0);
+        // The bit budget still caps it, and degenerate inputs stay sane.
+        assert_eq!(retained_components(flat.as_ref(), 3, 6), 3);
+        assert_eq!(retained_components(flat.as_ref(), 0, 6), 0);
         let zeros = Col::<f64>::from_fn(3, |_| 0.0);
-        assert_eq!(retained_components(zeros.as_ref(), 3), 1);
+        assert_eq!(retained_components(zeros.as_ref(), 3, 3), 1);
     }
 
     /// Data on a 4-dimensional subspace of a 32-dimensional space. Only four
@@ -1064,9 +1084,14 @@ mod tests {
             }
         }
 
-        let binariser =
-            Binariser::<f64>::new_pca_hashing(&matrix_to_flat(data.as_ref()).0, n_samples, dim, n_bits, 42)
-                .unwrap();
+        let binariser = Binariser::<f64>::new_pca_hashing(
+            &matrix_to_flat(data.as_ref()).0,
+            n_samples,
+            dim,
+            n_bits,
+            42,
+        )
+        .unwrap();
 
         let BinarisationMethod::PcaHashing { projections, .. } = &binariser.method else {
             panic!("Expected PcaHashing method");
@@ -1097,14 +1122,13 @@ mod tests {
     fn test_pca_hashing_orthogonality() {
         let n_samples = 500;
         let dim = 32;
-        let n_bits = 128;
+        let n_bits = 64;
+        let rank = 4;
 
-        // Isotropic data on purpose: the spectrum stays flat enough that every
-        // component clears `PCA_VARIANCE_FLOOR`, so all `dim` projections are
-        // genuine loadings and the orthonormality below is the right assertion.
-        // On rank-deficient data the trailing bits are random padding instead,
-        // which is only orthogonal within itself. See
-        // `test_rank_deficient_data_falls_back_to_random_bits`.
+        // Exactly `rank` equal-variance directions plus a negligible floor. The
+        // variances are equal, so 90% of the total needs all four and the
+        // cumulative rule retains exactly `rank` loadings; rows past that are
+        // random padding, which is deliberately not orthogonal to the block.
         let mut data = Mat::<f64>::zeros(n_samples, dim);
         for i in 0..n_samples {
             for j in 0..dim {
@@ -1114,7 +1138,8 @@ mod tests {
                 x ^= x >> 33;
                 x = x.wrapping_mul(0xFF51_AFD7_ED55_8CCD);
                 x ^= x >> 33;
-                data[(i, j)] = (x as f64 / u64::MAX as f64) * 2.0 - 1.0;
+                let unit = (x as f64 / u64::MAX as f64) * 2.0 - 1.0;
+                data[(i, j)] = if j < rank { unit } else { unit * 1e-6 };
             }
         }
 
@@ -1127,38 +1152,35 @@ mod tests {
         )
         .unwrap();
 
-        if let BinarisationMethod::PcaHashing { projections, .. } = &binariser.method {
-            for i in 0..n_bits.min(dim) {
-                let i_base = i * dim;
-                let mut norm_sq = 0.0;
-                for d in 0..dim {
-                    norm_sq += projections[i_base + d] * projections[i_base + d];
-                }
-                let norm = norm_sq.sqrt();
-                assert!(
-                    (norm - 1.0).abs() < 1e-6,
-                    "Projection {} not normalised: {}",
-                    i,
-                    norm
-                );
-
-                for j in (i + 1)..n_bits.min(dim) {
-                    let j_base = j * dim;
-                    let mut dot = 0.0;
-                    for d in 0..dim {
-                        dot += projections[i_base + d] * projections[j_base + d];
-                    }
-                    assert!(
-                        dot.abs() < 1e-6,
-                        "Projections {} and {} not orthogonal: {}",
-                        i,
-                        j,
-                        dot
-                    );
-                }
-            }
-        } else {
+        let BinarisationMethod::PcaHashing { projections, .. } = &binariser.method else {
             panic!("Expected PcaHashing method");
+        };
+
+        // Every hyperplane, loading or padding, must be usable.
+        for i in 0..n_bits {
+            let base = i * dim;
+            let norm: f64 = projections[base..base + dim]
+                .iter()
+                .map(|x| x * x)
+                .sum::<f64>()
+                .sqrt();
+            assert!(
+                (norm - 1.0).abs() < 1e-6,
+                "projection {i} not normalised: {norm}"
+            );
+        }
+
+        // The retained loadings stay mutually orthogonal through the ITQ fold.
+        for i in 0..rank {
+            for j in (i + 1)..rank {
+                let dot: f64 = (0..dim)
+                    .map(|d| projections[i * dim + d] * projections[j * dim + d])
+                    .sum();
+                assert!(
+                    dot.abs() < 1e-6,
+                    "loadings {i} and {j} not orthogonal: {dot}"
+                );
+            }
         }
     }
 

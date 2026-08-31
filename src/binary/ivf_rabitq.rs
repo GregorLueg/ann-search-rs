@@ -491,10 +491,7 @@ where
         let mut results: Vec<_> = heap.into_iter().collect();
         results.sort_unstable();
 
-        Ok(results
-            .into_iter()
-            .map(|(d, i)| (i, d.0.sqrt()))
-            .unzip())
+        Ok(results.into_iter().map(|(d, i)| (i, d.0.sqrt())).unzip())
     }
 
     /// Query using a row reference

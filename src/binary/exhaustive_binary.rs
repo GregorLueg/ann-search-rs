@@ -274,10 +274,9 @@ where
         let mut idx = 0;
         while idx < self.n {
             let take = HAMMING_BLOCK.min(self.n - idx);
-            let codes = &self.vectors_flat_binarised
-                [idx * self.n_bytes..(idx + take) * self.n_bytes];
-            let block_min =
-                hamming_block(&query_binary, codes, self.n_bytes, &mut block[..take]);
+            let codes =
+                &self.vectors_flat_binarised[idx * self.n_bytes..(idx + take) * self.n_bytes];
+            let block_min = hamming_block(&query_binary, codes, self.n_bytes, &mut block[..take]);
 
             if heap.len() < k || block_min < heap.peek().unwrap().0 {
                 for (j, &dist) in block[..take].iter().enumerate() {
@@ -347,8 +346,7 @@ where
                         .get_unchecked(start_i..start_i + self.n_bytes)
                 };
 
-                let dist_i =
-                    asymmetric_binary_dot_presummed(query_vec, query_sum, vec_i, self.dim);
+                let dist_i = asymmetric_binary_dot_presummed(query_vec, query_sum, vec_i, self.dim);
                 (idx, dist_i)
             })
             .collect();
