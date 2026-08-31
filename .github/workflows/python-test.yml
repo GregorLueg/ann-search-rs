@@ -81,9 +81,6 @@ jobs:
   # tests skip there: that job proves the feature compiles and that a GPU wheel
   # degrades cleanly on a machine without a device, not that the kernels are
   # correct. Kernel correctness needs a runner with a GPU.
-  #
-  # This job covers the other direction: the CPU-only wheel still has to build
-  # and pass, since `--no-default-features` is the lean-install escape hatch.
   cpu-only:
     runs-on: ubuntu-latest
     steps:
