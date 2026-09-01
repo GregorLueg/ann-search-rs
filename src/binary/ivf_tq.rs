@@ -40,6 +40,7 @@ use crate::binary::turboquant::search::{build_query_lut, score_into_heaps, Query
 use crate::binary::vec_store::*;
 use crate::prelude::*;
 use crate::utils::k_means_utils::*;
+use crate::utils::pack_knn_results;
 
 /// One cluster's blocked SIMD layout (2-bit / 4-bit only).
 #[cfg_attr(feature = "serialise", derive(serde::Serialize, serde::Deserialize))]
@@ -848,13 +849,7 @@ where
             nested.into_iter().flatten().collect()
         };
 
-        if return_dist {
-            let (indices, distances) = results.into_iter().unzip();
-            Ok((indices, Some(distances)))
-        } else {
-            let indices = results.into_iter().map(|(idx, _)| idx).collect();
-            Ok((indices, None))
-        }
+        Ok(pack_knn_results(results, return_dist))
     }
 
     /// Build the full kNN graph over all stored vectors via re-ranked queries.
@@ -908,13 +903,7 @@ where
             })
             .collect::<Result<Vec<_>, _>>()?;
 
-        if return_dist {
-            let (indices, distances) = results.into_iter().unzip();
-            Ok((indices, Some(distances)))
-        } else {
-            let indices = results.into_iter().map(|(idx, _)| idx).collect();
-            Ok((indices, None))
-        }
+        Ok(pack_knn_results(results, return_dist))
     }
 
     /// Number of stored vectors.

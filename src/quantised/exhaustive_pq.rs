@@ -11,6 +11,7 @@ use thousands::*;
 use crate::prelude::*;
 use crate::quantised::quantisers::*;
 use crate::utils::k_means_utils::sample_vectors;
+use crate::utils::pack_knn_results;
 
 /// Exhaustive PQ index
 ///
@@ -277,13 +278,7 @@ where
             })
             .collect::<Result<Vec<_>, _>>()?;
 
-        if return_dist {
-            let (indices, distances) = results.into_iter().unzip();
-            Ok((indices, Some(distances)))
-        } else {
-            let indices = results.into_iter().map(|(idx, _)| idx).collect();
-            Ok((indices, None))
-        }
+        Ok(pack_knn_results(results, return_dist))
     }
 
     /// Returns the size of the index in bytes

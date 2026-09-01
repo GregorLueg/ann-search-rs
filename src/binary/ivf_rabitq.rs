@@ -19,6 +19,7 @@ use crate::binary::rabitq::*;
 use crate::binary::vec_store::*;
 use crate::prelude::*;
 use crate::utils::k_means_utils::*;
+use crate::utils::pack_knn_results;
 
 /// IVF index with RaBitQ quantisation
 ///
@@ -664,13 +665,7 @@ where
             })
             .collect::<Result<Vec<_>, _>>()?;
 
-        if return_dist {
-            let (indices, distances) = results.into_iter().unzip();
-            Ok((indices, Some(distances)))
-        } else {
-            let indices = results.into_iter().map(|(idx, _)| idx).collect();
-            Ok((indices, None))
-        }
+        Ok(pack_knn_results(results, return_dist))
     }
 
     /// Returns the size of the index in bytes

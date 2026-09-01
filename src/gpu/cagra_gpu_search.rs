@@ -895,6 +895,7 @@ where
         })
         .collect();
 
+    // Cosine can round a self-distance to just under zero.
     let distances: Vec<Vec<T>> = (0..n_queries)
         .map(|i| {
             (0..k_out)
@@ -902,7 +903,14 @@ where
                     let pid = (idx_flat[i * k_out + j] & 0x7FFFFFFFu32) as usize;
                     pid < n && pid != sentinel_usize
                 })
-                .map(|j| dist_flat[i * k_out + j])
+                .map(|j| {
+                    let d = dist_flat[i * k_out + j];
+                    if d < T::zero() {
+                        T::zero()
+                    } else {
+                        d
+                    }
+                })
                 .collect()
         })
         .collect();

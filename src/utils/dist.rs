@@ -33,6 +33,48 @@ const SIMD_ACCUMULATORS: usize = 4;
 // Helper //
 ////////////
 
+/// Clamp negative distances to zero, in place.
+///
+/// Every metric in this crate has a non-negative range, so a value below zero
+/// is always roundoff rather than a real distance and no metric check is needed
+/// to decide that. Cosine is the one that produces them: `1 - dot / (|x| |y|)`
+/// for a point against itself rounds the ratio just above 1 and lands one `f32`
+/// ulp under zero. The GPU reductions drift a little further than the CPU ones.
+///
+/// The scan is over the `k` values a query returns, against the `n` distances
+/// the search computed to find them, so it costs nothing worth measuring.
+/// Doing it here rather than inside the distance kernels keeps it out of the
+/// hot loop.
+///
+/// Worth keeping: one negative entry makes scikit-learn reject an entire
+/// precomputed distance matrix, so a kNN graph handed to `DBSCAN` or a
+/// `KNeighborsTransformer` is invalid without this.
+///
+/// Query paths that build their results as `Vec<(Vec<usize>, Vec<T>)>` should
+/// call [`crate::utils::pack_knn_results`] instead, which applies this on the
+/// way through. This one is for the paths that scatter results back into
+/// original positions and already hold an `Option<Vec<Vec<T>>>`.
+///
+/// ### Params
+///
+/// * `distances` - Per-query distance rows, or `None` when the caller asked
+///   for indices only
+pub(crate) fn fix_neg_dist<T>(distances: &mut Option<Vec<Vec<T>>>)
+where
+    T: num_traits::Zero + PartialOrd,
+{
+    let Some(rows) = distances else {
+        return;
+    };
+    for row in rows.iter_mut() {
+        for d in row.iter_mut() {
+            if *d < T::zero() {
+                *d = T::zero();
+            }
+        }
+    }
+}
+
 /// Enum for the Distance metric to use
 #[derive(Clone, Debug, Copy, PartialEq, Default)]
 #[cfg_attr(feature = "serialise", derive(serde::Serialize, serde::Deserialize))]

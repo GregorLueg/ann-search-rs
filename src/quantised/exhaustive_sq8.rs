@@ -16,6 +16,7 @@ use crate::prelude::*;
 use crate::quantised::hnsw_quantised::codec::GraphCodec;
 use crate::quantised::sq8u_codec::*;
 use crate::quantised::uniform_quant::*;
+use crate::utils::pack_knn_results;
 
 /////////////////////
 // Index structure //
@@ -258,12 +259,7 @@ where
             })
             .collect();
 
-        if return_dist {
-            let (indices, distances) = results.into_iter().unzip();
-            (indices, Some(distances))
-        } else {
-            (results.into_iter().map(|(idx, _)| idx).collect(), None)
-        }
+        pack_knn_results(results, return_dist)
     }
 
     /// The distance metric this index was built for

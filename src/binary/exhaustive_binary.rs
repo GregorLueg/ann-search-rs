@@ -13,6 +13,7 @@ use crate::binary::binariser::*;
 use crate::binary::dist_binary::*;
 use crate::binary::vec_store::*;
 use crate::prelude::*;
+use crate::utils::pack_knn_results;
 
 ///////////////////////////
 // ExhaustiveIndexBinary //
@@ -574,13 +575,7 @@ where
                 })
                 .collect::<Result<Vec<_>, _>>()?;
 
-            if return_dist {
-                let (indices, distances) = results.into_iter().unzip();
-                Ok((indices, Some(distances)))
-            } else {
-                let indices: Vec<Vec<usize>> = results.into_iter().map(|(idx, _)| idx).collect();
-                Ok((indices, None))
-            }
+            Ok(pack_knn_results(results, return_dist))
         } else {
             // Fallback to binary-only search
             let results: Vec<(Vec<usize>, Vec<u32>)> = (0..self.n)

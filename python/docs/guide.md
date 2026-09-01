@@ -49,8 +49,9 @@ negative can never turn into a silent NaN.
 
 Padding is untouched: missing slots stay at `inf`.
 
-If you use the Rust crate directly rather than through this package, note the
-clamp is not yet applied on every one of its return paths.
+The Rust crate applies the same clamp at its own packing boundary, so this is
+not a Python-only guarantee. The one place it does not reach is an index's
+inherent single-row `query` method, which is below that boundary.
 
 ## Threads
 

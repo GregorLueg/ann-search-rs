@@ -1240,6 +1240,7 @@ where
             }
         }
 
+        fix_neg_dist(&mut final_dists);
         (final_indices, final_dists)
     }
 

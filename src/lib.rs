@@ -205,7 +205,9 @@ where
     }
 
     if return_dist {
-        Ok((indices, Some(distances)))
+        let mut distances = Some(distances);
+        fix_neg_dist(&mut distances);
+        Ok((indices, distances))
     } else {
         Ok((indices, None))
     }

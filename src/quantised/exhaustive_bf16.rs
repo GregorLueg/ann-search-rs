@@ -10,6 +10,7 @@ use thousands::*;
 
 use crate::prelude::*;
 use crate::quantised::quantisers::*;
+use crate::utils::pack_knn_results;
 
 /////////////////////
 // Index structure //
@@ -340,13 +341,7 @@ where
             })
             .collect();
 
-        if return_dist {
-            let (indices, distances) = results.into_iter().unzip();
-            (indices, Some(distances))
-        } else {
-            let indices: Vec<Vec<usize>> = results.into_iter().map(|(idx, _)| idx).collect();
-            (indices, None)
-        }
+        pack_knn_results(results, return_dist)
     }
 
     /// Returns the size of the index in bytes

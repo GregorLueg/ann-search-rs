@@ -164,7 +164,7 @@ impl<T: Copy> Neighbour<T> {
 ///
 /// `(indices, distances)` with one row per node. Distances are `None` when
 /// `return_dist` is false.
-pub fn unpack_knn_graph<T: Copy + Send + Sync + num_traits::Zero>(
+pub fn unpack_knn_graph<T: Copy + Send + Sync + num_traits::Zero + PartialOrd>(
     graph: &[(usize, T)],
     n: usize,
     k: usize,
@@ -209,12 +209,7 @@ pub fn unpack_knn_graph<T: Copy + Send + Sync + num_traits::Zero>(
         })
         .collect();
 
-    if return_dist {
-        let (indices, distances) = rows.into_iter().unzip();
-        (indices, Some(distances))
-    } else {
-        (rows.into_iter().map(|(ids, _)| ids).collect(), None)
-    }
+    crate::utils::pack_knn_results(rows, return_dist)
 }
 
 ///////////////

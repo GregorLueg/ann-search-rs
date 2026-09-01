@@ -885,6 +885,17 @@ where
         }
     }
 
+    // Cosine can round a self-distance to just under zero; clamp once here
+    // rather than in the kernel, since this runs once per query, not per
+    // candidate.
+    for row in all_distances.iter_mut() {
+        for d in row.iter_mut() {
+            if *d < T::zero() {
+                *d = T::zero();
+            }
+        }
+    }
+
     Ok((all_indices, all_distances))
 }
 

@@ -966,7 +966,8 @@ where
                 if d < T::from_f32(f32::MAX).unwrap() {
                     let reorg_idx = final_indices[start + i] as usize;
                     row_idx.push(self.original_indices[reorg_idx]);
-                    row_dist.push(d);
+                    // Cosine can round a self-distance to just under zero.
+                    row_dist.push(if d < T::zero() { T::zero() } else { d });
                 }
             }
             results_indices.push(row_idx);

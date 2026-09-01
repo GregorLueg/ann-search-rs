@@ -841,6 +841,7 @@ where
                 }
             }
 
+            fix_neg_dist(&mut final_dists);
             Ok((final_indices, final_dists))
         } else {
             let unordered_results: Vec<(usize, Vec<usize>, Vec<u32>)> = (0..self.n)

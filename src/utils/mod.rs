@@ -32,20 +32,10 @@ use crate::prelude::*;
 
 /// Pack per-query results into the crate's `KnnOptionResult` shape
 ///
-/// Clamps negative distances to zero on the way out. Every metric here has a
-/// non-negative range, so a negative value is always roundoff rather than a
-/// real distance, and no metric check is needed to decide that. Cosine is the
-/// one that actually produces them: `1 - dot / (|x| |y|)` for a point against
-/// itself rounds the ratio just above 1 and lands one `f32` ulp below zero.
-/// Squared Euclidean is already clamped where it is computed.
-///
-/// The scan is over `k` values per query, against the `n` distances the search
-/// already computed to find them, so it is free. Doing it here rather than in
-/// the distance kernels keeps it out of the hot loop.
-///
-/// Worth keeping: anything validating a precomputed distance matrix as
-/// non-negative rejects the whole thing on one negative entry, which is how
-/// `DBSCAN(metric="precomputed")` used to fail on a cosine graph.
+/// Applies [`fix_neg_dist`] on the way through, so every query path funnelling
+/// through here returns non-negative distances. Paths that scatter results back
+/// into original positions cannot use this and should call `fix_neg_dist`
+/// directly.
 ///
 /// ### Params
 ///
@@ -63,15 +53,10 @@ where
     T: num_traits::Zero + PartialOrd,
 {
     if return_dist {
-        let (indices, mut distances): (Vec<Vec<usize>>, Vec<Vec<T>>) = results.into_iter().unzip();
-        for row in &mut distances {
-            for d in row.iter_mut() {
-                if *d < T::zero() {
-                    *d = T::zero();
-                }
-            }
-        }
-        (indices, Some(distances))
+        let (indices, distances): (Vec<Vec<usize>>, Vec<Vec<T>>) = results.into_iter().unzip();
+        let mut distances = Some(distances);
+        fix_neg_dist(&mut distances);
+        (indices, distances)
     } else {
         (results.into_iter().map(|(idx, _)| idx).collect(), None)
     }
