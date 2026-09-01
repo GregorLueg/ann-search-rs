@@ -14,6 +14,21 @@ on:
     branches: [ main ]
     types: [ completed ]
   workflow_dispatch:
+    inputs:
+      publish:
+        description: Upload the wheels. Off by default, so a dispatch only builds.
+        type: boolean
+        default: false
+      repository-url:
+        description: >-
+          Index to upload to. Leave blank for real PyPI. Use
+          https://test.pypi.org/legacy/ to rehearse.
+        type: string
+        default: ''
+      tag:
+        description: Create the py-v tag and the GitHub release.
+        type: boolean
+        default: false
 
 permissions:
   contents: write
@@ -25,15 +40,15 @@ jobs:
   release:
     uses: GregorLueg/personal-actions/.github/workflows/python-maturin-release.yml@feat/python-workflows
     with:
-      # SAFETY CATCH, both flipped to true when the first release is ready.
+      # A dispatch takes what the form asked for. Anything else, meaning the
+      # automatic run after a green test on main, takes the constants below.
       #
-      # `workflow_dispatch` only works for workflows on the default branch, so
-      # this file has to be on main before it can be dispatched even once. With
-      # both off it is inert on every push and still dispatchable for the wheel
-      # rehearsal, which is the only way to prove a manylinux container can
-      # compile the wgpu stack before a tag or an upload exists.
-      tag: false
-      publish: false
+      # SAFETY CATCH: those constants are both false until the first release is
+      # ready, so an ordinary push builds wheels and writes nothing. Flipping
+      # them to true is the commit that arms automatic releases.
+      publish: ${{ github.event_name == 'workflow_dispatch' && inputs.publish || false }}
+      tag: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || false }}
+      repository-url: ${{ github.event_name == 'workflow_dispatch' && inputs.repository-url || '' }}
 
       # The sdist would carry a `path` dependency on the parent crate, which is
       # not known to round-trip. Wheels only until `maturin sdist` plus a clean
