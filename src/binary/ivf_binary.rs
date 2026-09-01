@@ -246,8 +246,6 @@ where
             BinarisationInit::SignBased => Binariser::new_sign_based(dim),
         };
 
-        // Ask the binariser, do not derive from `n_bits`: sign-based ignores
-        // that argument and emits `dim` bits
         let n_bytes = binariser.n_bytes();
         let residual_codes = matches!(init, BinarisationInit::SignBased);
 
@@ -346,20 +344,8 @@ where
         }
 
         // 1. subsample for training if needed.
-        //
-        // Deliberately *not* `build`'s `min(256 * nlist, 250k)` rule, even
-        // though the disagreement between the two entry points is ugly. This
-        // path's codes are sign residuals against the centroids, so centroid
-        // quality feeds straight into them and the cheaper sample costs recall.
-        let (training_data, n_train) = if n > 500_000 {
-            if verbose {
-                println!("  Sampling 250k vectors for training");
-            }
-            let (data, _) = sample_vectors(&vectors_flat, dim, n, 250_000, seed);
-            (data, 250_000)
-        } else {
-            (vectors_flat.clone(), n)
-        };
+        let n_train = (256 * nlist).min(250_000).min(n).max(1);
+        let (training_data, _) = sample_vectors(&vectors_flat, dim, n, n_train, seed);
 
         // 2. train float centroids
         let centroids_float = train_centroids(
