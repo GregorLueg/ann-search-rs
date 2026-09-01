@@ -19,12 +19,13 @@ on:
         description: Upload the wheels. Off by default, so a dispatch only builds.
         type: boolean
         default: false
-      repository-url:
-        description: >-
-          Index to upload to. Leave blank for real PyPI. Use
-          https://test.pypi.org/legacy/ to rehearse.
-        type: string
-        default: ''
+      index:
+        description: Which index to upload to.
+        type: choice
+        options:
+          - testpypi
+          - pypi
+        default: testpypi
       tag:
         description: Create the py-v tag and the GitHub release.
         type: boolean
@@ -48,7 +49,10 @@ jobs:
       # them to true is the commit that arms automatic releases.
       publish: ${{ github.event_name == 'workflow_dispatch' && inputs.publish || false }}
       tag: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || false }}
-      repository-url: ${{ github.event_name == 'workflow_dispatch' && inputs.repository-url || '' }}
+      # A choice rather than a free-text URL: the first rehearsal went ten
+      # minutes into the wheel matrix before dying on a branch name pasted into
+      # a text box. There are only ever two answers here.
+      repository-url: ${{ (github.event_name == 'workflow_dispatch' && inputs.index == 'testpypi') && 'https://test.pypi.org/legacy/' || '' }}
 
       # The sdist would carry a `path` dependency on the parent crate, which is
       # not known to round-trip. Wheels only until `maturin sdist` plus a clean
