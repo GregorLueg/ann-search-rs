@@ -3867,10 +3867,8 @@ where
 /// * `mat` - Input data as samples x features. Accepts a faer matrix, an
 ///   ndarray 2-D array (with the `ndarray` feature) or a row-major
 ///   `(&[T], n_samples, n_features)` tuple. See [`AnnMatrix`].
-/// * `binarisation_init` - "random", "pca" or "sign". "sign" encodes the
-///   residual against each vector's assigned centroid rather than the raw
-///   vector, so its codes are only comparable within a Voronoi cell; see
-///   [`IvfIndexBinary::query`].
+/// * `binarisation_init` - "random", "pca" or "sign". "sign" unlocks the
+///   asymmetric query path; see [`IvfIndexBinary::query_asymmetric`].
 /// * `n_bits` - Number of bits per code (multiple of 8). Ignored by "sign",
 ///   which always emits `dim` bits.
 /// * `nlist` - Number of clusters (defaults to √n)
@@ -4002,13 +4000,8 @@ where
 ///
 /// Generates a full kNN graph based on the internal data.
 ///
-/// ### Note
-///
-/// A `"sign"` index stores codes relative to each cell's centroid, which are
-/// only comparable within a cell, so building the graph needs the float
-/// vectors. Without a vector store this returns
-/// [`AnnSearchErrors::ResidualCodesRequireVectorStore`] rather than a quietly
-/// degraded graph. Build with `save_store = true`.
+/// With a vector store the graph is reranked against the float vectors;
+/// without one it falls back to Hamming distances alone.
 ///
 /// ### Params
 ///
