@@ -25,6 +25,7 @@
   * Exhaustive uses GEMM now
   * Binary build times massively reduced
   * RaBitQ has faster querying times.
+  * Improved HNSW and IVF in terms of speed.
 
 **Docs**
 
@@ -49,9 +50,14 @@
   `ivf_binary.rs`) but made Hamming distances incomparable across cells, so
   widening `nprobe` *cost* recall, every query paid a re-encode per probed cell,
   and a kNN graph could not be built without a vector store at all. The
-  asymmetric query path covers the same ground for less. `Binariser::encode_residual`,
+  asymmetric query path covers the same ground for less.
+  `Binariser::encode_residual`,
   `AnnSearchErrors::ResidualEncodingUnsupported` and
-  `AnnSearchErrors::ResidualCodesRequireVectorStore` are gone.
+  `AnnSearchErrors::ResidualCodesRequireVectorStore` are all gone.
+
+**Fixes**
+
+- The indices cannot return distances < 0 due to rounding imprecisions anymore.
 
 ## 0.6.0
 
