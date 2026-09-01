@@ -1,6 +1,11 @@
 [package]
+# Versioned independently of `ann-search-rs`, on purpose. Coupling the two
+# means a docstring fix here forces a crates.io release of a crate whose Rust
+# source did not change, and that version number is permanent. The wheel
+# reports the core version it vendored as `__core_version__` instead, which is
+# the question lockstep was actually answering.
 name = "ann-search-py"
-version = "0.7.0"
+version = "0.1.0"
 edition = "2021"
 authors = ["Gregor Lueg <gregorlueg@me.com>"]
 license = "MIT"

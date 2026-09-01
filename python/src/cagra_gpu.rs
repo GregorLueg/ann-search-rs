@@ -63,11 +63,11 @@ gpu_handle!(PyCagraGpu, NNDescentGpu, "CagraGpu", {
     /// * `x` - Samples by features, C-contiguous float32.
     /// * `metric` - Already validated by the Python layer.
     /// * `k` - Final neighbours per node, or `None` for the library's 30.
-    /// * `build_k` - Working degree before pruning, or `None` for `2 * k`.
+    /// * `build_k` - Working degree before pruning, or `None` for `1.5 * k`.
     /// * `max_iters` - NN-Descent iteration cap, or `None` for 15.
     /// * `n_trees` - Forest size for the initial graph, or `None` for auto.
     /// * `delta` - Convergence threshold, or `None` for 0.001.
-    /// * `rho` - Local-join sampling rate, or `None` for 0.5.
+    /// * `rho` - Local-join sampling rate, or `None` for 1.0.
     /// * `refine_knn` - Two-hop refinement sweeps after the main loop.
     /// * `retain_gpu` - Upload the navigational graph at build time. On by
     ///   default: the first query would otherwise pay for it.

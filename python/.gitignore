@@ -1,1 +1,4 @@
 notebooks/*
+
+# mkdocs build output
+site/

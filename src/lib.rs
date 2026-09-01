@@ -16,6 +16,14 @@ use mimalloc::MiMalloc;
 #[global_allocator]
 static GLOBAL: MiMalloc = MiMalloc;
 
+/// Version of this crate.
+///
+/// Exposed so a dependent can report which version of the numerics it was
+/// built against. The Python bindings version independently of this crate and
+/// vendor its source through a path dependency, so their own version number
+/// says nothing about what is inside the wheel; this does.
+pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+
 pub mod cpu;
 pub mod errors;
 pub mod prelude;
@@ -796,7 +804,8 @@ where
 ///   `(&[T], n_queries, n_features)` tuple. See [`AnnMatrix`].
 /// * `index` - Reference to the built IVF index
 /// * `k` - Number of neighbours to return
-/// * `nprobe` - Number of clusters to search (defaults to min(nlist/10, 10))
+/// * `nprobe` - Number of clusters to search (defaults to √nlist, capped
+///   at nlist)
 ///   Higher values improve recall at the cost of speed
 /// * `return_dist` - Shall the distances between the different points be
 ///   returned
@@ -841,7 +850,8 @@ where
 ///   `(&[T], n_queries, n_features)` tuple. See [`AnnMatrix`].
 /// * `index` - Reference to the built IVF index
 /// * `k` - Number of neighbours to return
-/// * `nprobe` - Number of clusters to search (defaults to min(nlist/10, 10))
+/// * `nprobe` - Number of clusters to search (defaults to √nlist, capped
+///   at nlist)
 ///   Higher values improve recall at the cost of speed
 /// * `return_dist` - Shall the distances between the different points be
 ///   returned
@@ -2264,7 +2274,8 @@ where
 ///   `(&[T], n_queries, n_features)` tuple. See [`AnnMatrix`].
 /// * `index` - Reference to the built IVF-BF16 index
 /// * `k` - Number of neighbours to return
-/// * `nprobe` - Number of clusters to search (defaults to 20% of nlist)
+/// * `nprobe` - Number of clusters to search (defaults to √nlist, capped
+///   at nlist)
 ///   Higher values improve recall at the cost of speed
 /// * `return_dist` - Shall the inner product scores be returned
 /// * `verbose` - Print progress information
@@ -2302,7 +2313,8 @@ where
 ///
 /// * `index` - Reference to the built IVF-SQ8 index
 /// * `k` - Number of neighbours to return
-/// * `nprobe` - Number of clusters to search (defaults to 20% of nlist)
+/// * `nprobe` - Number of clusters to search (defaults to √nlist, capped
+///   at nlist)
 ///   Higher values improve recall at the cost of speed
 /// * `return_dist` - Shall the inner product scores be returned
 /// * `verbose` - Print progress information
@@ -2389,7 +2401,8 @@ where
 ///   `(&[T], n_queries, n_features)` tuple. See [`AnnMatrix`].
 /// * `index` - Reference to the built IVF-SQ8 index
 /// * `k` - Number of neighbours to return
-/// * `nprobe` - Number of clusters to search (defaults to 20% of nlist)
+/// * `nprobe` - Number of clusters to search (defaults to √nlist, capped
+///   at nlist)
 ///   Higher values improve recall at the cost of speed
 /// * `return_dist` - Shall the inner product scores be returned
 /// * `verbose` - Print progress information
@@ -2427,7 +2440,8 @@ where
 ///
 /// * `index` - Reference to the built IVF-SQ8 index
 /// * `k` - Number of neighbours to return
-/// * `nprobe` - Number of clusters to search (defaults to 20% of nlist)
+/// * `nprobe` - Number of clusters to search (defaults to √nlist, capped
+///   at nlist)
 ///   Higher values improve recall at the cost of speed
 /// * `return_dist` - Shall the inner product scores be returned
 /// * `verbose` - Print progress information
@@ -2915,7 +2929,8 @@ where
 ///   `(&[T], n_queries, n_features)` tuple. See [`AnnMatrix`].
 /// * `index` - Reference to the built IVF-PQ index
 /// * `k` - Number of neighbours to return
-/// * `nprobe` - Number of clusters to search (defaults to 15% of nlist)
+/// * `nprobe` - Number of clusters to search (defaults to √nlist, capped
+///   at nlist)
 ///   Higher values improve recall at the cost of speed
 /// * `return_dist` - Shall the distances be returned
 /// * `verbose` - Print progress information
@@ -2952,7 +2967,8 @@ where
 ///
 /// * `index` - Reference to the built IVF-PQ index
 /// * `k` - Number of neighbours to return
-/// * `nprobe` - Number of clusters to search (defaults to 15% of nlist)
+/// * `nprobe` - Number of clusters to search (defaults to √nlist, capped
+///   at nlist)
 ///   Higher values improve recall at the cost of speed
 /// * `return_dist` - Shall the distances be returned
 /// * `verbose` - Print progress information
@@ -3042,7 +3058,8 @@ where
 ///   `(&[T], n_queries, n_features)` tuple. See [`AnnMatrix`].
 /// * `index` - Reference to the built IVF-OPQ index
 /// * `k` - Number of neighbours to return
-/// * `nprobe` - Number of clusters to search (defaults to 15% of nlist)
+/// * `nprobe` - Number of clusters to search (defaults to √nlist, capped
+///   at nlist)
 ///   Higher values improve recall at the cost of speed
 /// * `return_dist` - Shall the distances be returned
 /// * `verbose` - Print progress information
@@ -3079,7 +3096,8 @@ where
 ///
 /// * `index` - Reference to the built IVF-OPQ index
 /// * `k` - Number of neighbours to return
-/// * `nprobe` - Number of clusters to search (defaults to 15% of nlist)
+/// * `nprobe` - Number of clusters to search (defaults to √nlist, capped
+///   at nlist)
 ///   Higher values improve recall at the cost of speed
 /// * `return_dist` - Shall the distances be returned
 /// * `verbose` - Print progress information

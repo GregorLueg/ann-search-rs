@@ -20,6 +20,7 @@ from . import _ann_search, datasets
 from ._ann_search import (
     AnnSearchError,
     IndexIoError,
+    __core_version__,
     __version__,
     gpu_available,
     num_threads,
@@ -60,6 +61,7 @@ __all__ = [
     "RnnDescentIndex",
     "SoarIndex",
     "VamanaIndex",
+    "__core_version__",
     "__version__",
     "datasets",
     "gpu_available",

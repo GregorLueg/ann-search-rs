@@ -5,6 +5,8 @@ approximate nearest-neighbour search built for single-cell and computational
 biology workloads. The Rust crate does the work. This is a thin scikit-learn
 shaped layer over it.
 
+**Documentation: <https://gregorlueg.github.io/ann-search-rs/>**
+
 ## Install
 
 ```bash
@@ -41,7 +43,7 @@ that.
 
 | Class | Notes |
 | --- | --- |
-| `ExhaustiveIndex` | Exact brute force. Ground truth. |
+| `ExhaustiveIndex` | Exact. Blocked GEMM on large batches, not a naive scan. Ground truth. |
 | `KmknnIndex` | Exact, k-means pruned. No Manhattan. |
 | `AnnoyIndex` | Random projection forest. No Manhattan. |
 | `KdTreeIndex` | Randomised kd spill-tree forest. Axis-aligned splits. |

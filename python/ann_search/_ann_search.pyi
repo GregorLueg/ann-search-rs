@@ -12,6 +12,7 @@ from typing import Any
 import numpy as np
 
 __version__: str
+__core_version__: str
 
 class AnnSearchError(Exception):
     """Base class for every error raised by the Rust core."""

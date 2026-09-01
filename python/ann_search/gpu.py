@@ -60,6 +60,13 @@ class ExhaustiveGpuIndex(_BaseGpuIndex):
     Recall is 1 by construction, and on a dataset too large to score on the CPU
     this is the cheapest way to get ground truth. No build-time knobs: the data
     goes up, the norms get recorded, and that is the index.
+
+    Args:
+        n_neighbors: Neighbours per query, and the default ``k`` for
+            `kneighbors`.
+        metric: ``"euclidean"``/``"l2"``, ``"sqeuclidean"`` or ``"cosine"``.
+        verbose: Progress to the process stdout, not ``sys.stdout``. In Jupyter
+            that lands in the terminal running the kernel.
     """
 
     _HANDLE: ClassVar[type] = _core.ExhaustiveGpu
@@ -86,6 +93,32 @@ class IvfGpuIndex(_BaseGpuIndex):
     also what bounds it: the reordered vectors stay resident, so the dataset has
     to fit in device memory. `nquery` caps how many queries stage per batch if
     the upload is what does not fit.
+
+    Args:
+        n_neighbors: Neighbours per query, and the default ``k`` for
+            `kneighbors`.
+        metric: ``"euclidean"``/``"l2"``, ``"sqeuclidean"`` or ``"cosine"``.
+        nlist: Number of Voronoi cells to cut the space into. ``None`` defaults
+            to ``sqrt(n)``.
+        nprobe: Cells visited per query, the recall knob. ``None`` defaults to
+            ``sqrt(nlist)``. Search-time: override it per call as
+            ``index.kneighbors(nprobe=32)``.
+        nquery: Queries staged on the device per batch. ``None`` sizes the
+            batch from `nprobe`, the average cell size and the device's
+            maximum binding, clamped into ``100..=20_000``. Lower it if a
+            large `nprobe` overruns the candidate buffer. Search-time.
+        kmeans_iters: Lloyd iterations when training the cells. ``None``
+            defaults to 50, which is the GPU default and higher than the CPU
+            side's 30: the iterations are cheap once the data is resident.
+        kmeans_balanced: Reseed starved centroids each iteration, RAFT-style.
+            Evens out the posting lists, which matters more here than on the
+            CPU because a straggler cell serialises its whole workgroup.
+        quantise_to_f16: Hold the resident data buffer at fp16. Halves its
+            memory and lifts effective bandwidth on the assignment kernels, at
+            the cost of needing ``shader-f16`` on the adapter.
+        seed: Fixes k-means initialisation.
+        verbose: Progress to the process stdout, not ``sys.stdout``. In Jupyter
+            that lands in the terminal running the kernel.
     """
 
     _HANDLE: ClassVar[type] = _core.IvfGpu
@@ -144,6 +177,48 @@ class CagraGpuIndex(ExtractKnnMixin, _BaseGpuIndex):
     query from two threads at once: the beam search memoises its upload of the
     navigational graph behind a mutable borrow, so concurrent calls serialise.
     `extract_knn` is exempt.
+
+    Args:
+        n_neighbors: Neighbours per query, and the default ``k`` for
+            `kneighbors`. Not the graph degree, which is `graph_degree`.
+        metric: ``"euclidean"``/``"l2"``, ``"sqeuclidean"`` or ``"cosine"``.
+        graph_degree: Neighbours stored per node in the final graph. ``None``
+            defaults to 30. The memory knob, and the ceiling on what
+            `extract_knn` can return.
+        build_k: Working degree the descent keeps before pruning. ``None``
+            defaults to ``1.5 * graph_degree``. Room to manoeuvre, so above
+            `graph_degree` is the point.
+        max_iters: Descent iteration cap. ``None`` defaults to 15.
+        n_trees: Random projection trees used to seed the initial graph.
+            ``None`` defaults to ``min(5 + round(n ** 0.25), 20)``.
+        delta: Convergence threshold. Descent stops once the fraction of
+            updated edges falls below it. ``None`` defaults to 0.001.
+        rho: Local-join sampling rate. ``None`` defaults to 1.0, i.e. no
+            sampling. Lower it to trade graph quality for build time.
+        refine_knn: Two-hop refinement sweeps after the main loop. ``None``
+            defaults to 0, so refinement is off.
+        retain_gpu: Upload the navigational graph at build time rather than on
+            the first query. On by default, because the first query would
+            otherwise pay for it.
+        beam_width: Beam width at query time, the recall knob. Search-time.
+        max_beam_iters: Iteration cap on the beam search. Search-time.
+        n_entry_points: Entry points into the graph per query. Search-time.
+        expand_per_iter: Extra neighbours explored per beam iteration, usually
+            1 to 4. Search-time.
+        seed: Fixes the seed graph and the sampling.
+        verbose: Progress to the process stdout, not ``sys.stdout``. In Jupyter
+            that lands in the terminal running the kernel.
+
+    Note:
+        The four beam parameters are all-or-nothing. Leave every one of them
+        ``None`` and the beam is sized from ``k``: ``beam_width =
+        2 * max(k, 16)`` and ``max_beam_iters = 3 * beam_width``, with 8 entry
+        points and 3 expansions per iteration. Set **any** one of them and that
+        scaling is off for all four, and the ones still ``None`` fall back to
+        flat constants: ``beam_width = 16``, ``max_beam_iters = 48``,
+        ``n_entry_points = 8``, ``expand_per_iter = 3``. So asking for
+        ``n_entry_points=16`` alone on a ``k=50`` query quietly narrows the beam
+        from 100 to 16. If you touch one, set `beam_width` too.
     """
 
     _HANDLE: ClassVar[type] = _core.CagraGpu

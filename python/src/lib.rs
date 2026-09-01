@@ -79,7 +79,12 @@ mod ivf_gpu;
 /// Nothing, or the first registration error.
 #[pymodule]
 fn _ann_search(m: &Bound<'_, PyModule>) -> PyResult<()> {
+    // Two versions, deliberately. The bindings version on their own line, so a
+    // docstring fix does not force a crates.io release; the core version comes
+    // from the crate the wheel vendored, which is the only thing that says
+    // which numerics are actually inside it.
     m.add("__version__", env!("CARGO_PKG_VERSION"))?;
+    m.add("__core_version__", ann_search_rs::VERSION)?;
 
     m.add("AnnSearchError", m.py().get_type::<error::AnnSearchError>())?;
     m.add("IndexIoError", m.py().get_type::<error::IndexIoError>())?;
