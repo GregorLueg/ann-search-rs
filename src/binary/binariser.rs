@@ -2073,14 +2073,24 @@ mod tests {
         };
         assert_eq!(projections.len(), n_bits * dim);
 
-        // `k` retained loadings, then random padding. The cap is
-        // `n_bits * PCA_MAX_COMPONENT_SHARE`, and ITQ mixes within that block,
-        // so compare the subspace the block spans rather than each direction:
-        // every retained loading must lie in the span of the reference's
-        // leading `k` eigenvectors.
-        let k = ((n_bits as f64 * PCA_MAX_COMPONENT_SHARE) as usize)
-            .max(1)
-            .min(dim);
+        // `k` retained loadings, then random padding. ITQ mixes within the
+        // retained block, so compare the subspace the block spans rather than
+        // each direction: every retained loading must lie in the span of the
+        // reference's leading `k` eigenvectors.
+        //
+        // `k` is what the cumulative rule keeps, not the cap: the cap is only
+        // an upper bound and on this fixture the rule stops well short of it,
+        // so reading `k` off the cap grades random padding bits against the PCA
+        // subspace. Driven by the reference's `f64` spectrum, so the `f32` path
+        // is not choosing its own comparison.
+        let reference_singular = Col::<f64>::from_fn(dim, |j| {
+            want.S().column_vector()[dim - 1 - j].max(0.0).sqrt()
+        });
+        let k = retained_components(
+            reference_singular.as_ref(),
+            n_bits.min(dim),
+            ((n_bits as f64 * PCA_MAX_COMPONENT_SHARE) as usize).max(1),
+        );
         assert!(
             k < dim,
             "with k == dim the reference subspace is the whole space and this \
