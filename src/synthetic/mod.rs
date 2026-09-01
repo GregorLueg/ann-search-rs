@@ -57,7 +57,7 @@ pub const DEFAULT_COR_STRENGTH: f64 = 0.5;
 pub const DEFAULT_BRIDGE_FRACTION: f64 = 0.2;
 
 /// Fraction of `LowRank` samples placed along differentiation trajectories.
-pub const DEFAULT_TRAJECTORY_FRACTION: f64 = 0.15;
+pub const DEFAULT_TRAJECTORY_FRACTION: f64 = 0.2;
 
 /// Strong directions per cluster (local anisotropy) in the `Correlated`
 /// modality.
