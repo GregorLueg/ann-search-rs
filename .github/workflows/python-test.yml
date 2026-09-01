@@ -1,5 +1,8 @@
 name: Test the Python bindings
 
+# The name matters. python-release.yml keys its workflow_run trigger off it,
+# so renaming this silently stops every release.
+
 on:
   push:
     branches: [ main ]
@@ -20,96 +23,16 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
-defaults:
-  run:
-    working-directory: python
-
 jobs:
   test:
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-latest, macos-latest]
-    runs-on: ${{ matrix.os }}
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: dtolnay/rust-toolchain@stable
-
-      # The bindings are their own workspace, so the cache key follows
-      # python/Cargo.lock rather than the library's.
-      - uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: python
-
-      - uses: astral-sh/setup-uv@v5
-        with:
-          enable-cache: true
-
-      - name: Set up the environment
-        run: |
-          uv venv --python 3.12
-          uv pip install "maturin>=1.15,<2" numpy scipy pytest scikit-learn beartype
-
-      - name: Lint Rust
-        run: |
-          cargo fmt --check
-          cargo clippy --all-targets -- -D warnings
-
-      - name: Test Rust
-        run: cargo test
-
-      - name: Lint Python
-        run: |
-          uvx ruff check .
-          uvx ruff format --check .
-
-      - name: Type check
-        run: uvx ty check ann_search
-
-      # --release is not optional: the recall assertions run real index builds,
-      # and a debug build of the numerics is roughly an order of magnitude
-      # slower.
-      - name: Build
-        run: uv run maturin develop --release
-
-      - name: Test
-        run: uv run pytest tests -q
-
-  # `gpu` is a default feature, so the matrix above already builds it. Hosted
-  # runners have no adapter, which means `gpu_available()` is False and the GPU
-  # tests skip there: that job proves the feature compiles and that a GPU wheel
-  # degrades cleanly on a machine without a device, not that the kernels are
-  # correct. Kernel correctness needs a runner with a GPU.
-  cpu-only:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: dtolnay/rust-toolchain@stable
-
-      - uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: python
-          key: cpu-only
-
-      - uses: astral-sh/setup-uv@v5
-        with:
-          enable-cache: true
-
-      - name: Set up the environment
-        run: |
-          uv venv --python 3.12
-          uv pip install "maturin>=1.15,<2" numpy scipy pytest scikit-learn beartype
-
-      - name: Lint Rust
-        run: cargo clippy --all-targets --no-default-features -- -D warnings
-
-      - name: Test Rust
-        run: cargo test --no-default-features
-
-      - name: Build
-        run: uv run maturin develop --release --no-default-features
-
-      - name: Test
-        run: uv run pytest tests -q
+    uses: GregorLueg/personal-actions/.github/workflows/python-maturin-test.yml@v1
+    with:
+      package: ann_search
+      # scipy arrives via `--all-extras`; scikit-learn is test-only.
+      extra-deps: 'scikit-learn'
+      # `gpu` is a default feature, so the matrix above builds it. Hosted
+      # runners have no adapter, so `gpu_available()` is False and the GPU
+      # tests skip: this proves the feature compiles and that a GPU wheel
+      # degrades cleanly on a machine without a device, not that the kernels
+      # are correct. Kernel correctness needs a runner with a GPU.
+      cpu-only-args: '--no-default-features'

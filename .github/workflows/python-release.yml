@@ -1,0 +1,32 @@
+name: Release the Python bindings
+
+# Triggered by a completed test run, not by a push, so a broken build can never
+# be published. `workflows:` must match the `name:` of python-test.yml.
+#
+# The tag prefix is `py-v`, not `v`: release.yml already owns `v$version` for
+# the crate. The two versions are independent lines, so a Python patch release
+# and a crate release never collide and never imply each other. The wheel
+# reports which crate it vendored as `ann_search.__core_version__`.
+
+on:
+  workflow_run:
+    workflows: ["Test the Python bindings"]
+    branches: [ main ]
+    types: [ completed ]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  # PyPI trusted publishing. A called workflow's permissions are capped by the
+  # caller's token, so leaving this out makes the publish 403.
+  id-token: write
+
+jobs:
+  release:
+    uses: GregorLueg/personal-actions/.github/workflows/python-maturin-release.yml@v1
+    with:
+      # The sdist would carry a `path` dependency on the parent crate, which is
+      # not known to round-trip. Wheels only until `maturin sdist` plus a clean
+      # install has been shown to work.
+      sdist: false
+      environment: pypi
