@@ -809,8 +809,7 @@ mod tests {
             *v = ((i as f64) * 0.31).sin() * 2.0 - 0.4;
         }
 
-        let batched =
-            OptimisedProductQuantiser::<f64>::apply_rotation(&data, &rotation, dim, n);
+        let batched = OptimisedProductQuantiser::<f64>::apply_rotation(&data, &rotation, dim, n);
 
         for i in 0..n {
             let one = OptimisedProductQuantiser::<f64>::rotate_vector(

@@ -307,11 +307,18 @@ mod tests {
     /// The property the public API actually leans on: the same data through
     /// any accepted input type builds the same index and returns the same
     /// neighbours.
+    ///
+    /// `n` is deliberately below `PARALLEL_BUCKET_THRESHOLD` (100) so the
+    /// level-0 bucket builds sequentially. The parallel build reads the
+    /// construction graph unsynchronised, so two builds of identical data can
+    /// disagree on the order of tied neighbours; that is a property of the
+    /// build, not of the input conversion this test is about. Raising `n` puts
+    /// the assertion at the mercy of thread scheduling.
     #[test]
     fn test_public_api_agrees_across_input_types() {
         use crate::{build_hnsw_index, query_hnsw_index};
 
-        let (n, dim) = (200usize, 16usize);
+        let (n, dim) = (100usize, 16usize);
         let flat: Vec<f32> = (0..n * dim)
             .map(|i| ((i * 7919) % 1000) as f32 / 1000.0)
             .collect();

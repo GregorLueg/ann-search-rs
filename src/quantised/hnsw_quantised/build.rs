@@ -412,6 +412,14 @@ impl InsertContext<'_> {
         F: Fn(usize, usize) -> T + Sync,
     {
         let max_neighbours = self.max_neighbours(layer);
+
+        // Nothing to choose between: the beam found no more candidates than the
+        // layer can hold, so pruning can only throw away edges we have room for.
+        // Only fires when `ef_construction` is at or below the layer budget.
+        if state.scratch_working.len() < max_neighbours {
+            return state.scratch_working.clone();
+        }
+
         let mut result = Vec::with_capacity(max_neighbours);
 
         for &(cand_dist, cand_id) in &state.scratch_working {

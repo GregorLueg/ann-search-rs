@@ -699,7 +699,9 @@ mod tests {
         let (n, dim) = (64, 4);
         let data = pca_like::<f32>(n, dim);
         let q = UniformQuantiser::train(&data, n, dim, None).unwrap();
-        let code = q.encode(&[f32::NAN, f32::INFINITY, f32::NEG_INFINITY, 0.0]).unwrap();
+        let code = q
+            .encode(&[f32::NAN, f32::INFINITY, f32::NEG_INFINITY, 0.0])
+            .unwrap();
         assert_eq!(code[0], 0);
         assert_eq!(code[1], MAX_LEVEL);
         assert_eq!(code[2], 0);
