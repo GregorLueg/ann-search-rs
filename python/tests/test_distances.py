@@ -12,24 +12,20 @@ from conftest import ALL_INDICES
 
 import ann_search as ann
 
-GPU_INDICES = (
-    [ann.ExhaustiveGpuIndex, ann.IvfGpuIndex, ann.CagraGpuIndex]
-    if hasattr(ann, "ExhaustiveGpuIndex")
-    else []
-)
+# Two separate skips, as in test_gpu.py. `hasattr` answers "was the extension
+# built with the gpu feature", which is not the same question as "does this
+# machine have an adapter". A hosted CI runner answers yes to the first and no
+# to the second, and dispatching a kernel there panics inside cubecl rather
+# than failing gracefully.
+GPU_INDICES = [
+    getattr(ann, name, None)
+    for name in ("ExhaustiveGpuIndex", "IvfGpuIndex", "CagraGpuIndex")
+]
+GPU_INDICES = [c for c in GPU_INDICES if c is not None]
 
 
-@pytest.mark.parametrize(
-    "cls", list(ALL_INDICES) + GPU_INDICES, ids=lambda v: getattr(v, "__name__", v)
-)
-def test_cosine_distances_are_non_negative(cls, clustered):
-    """No index leaks a negative or NaN distance on any of its three paths."""
-    if "cosine" not in cls._SUPPORTED_METRICS:
-        pytest.skip(f"{cls.__name__} does not support cosine")
-
-    index = cls(n_neighbors=10, metric="cosine").fit(clustered)
-    queries = clustered[:200]
-
+def check_non_negative(index, queries):
+    """No negative or NaN distance on any of an index's three paths."""
     for name, dist in [
         ("self", index.kneighbors()[0]),
         ("cross", index.kneighbors(queries)[0]),
@@ -42,6 +38,28 @@ def test_cosine_distances_are_non_negative(cls, clustered):
             f"{name} produced {(finite < 0).sum()} negative distances, "
             f"min {finite.min():.3e}"
         )
+
+
+@pytest.mark.parametrize(
+    "cls", list(ALL_INDICES), ids=lambda v: getattr(v, "__name__", v)
+)
+def test_cosine_distances_are_non_negative(cls, clustered):
+    """No CPU index leaks a negative or NaN distance."""
+    if "cosine" not in cls._SUPPORTED_METRICS:
+        pytest.skip(f"{cls.__name__} does not support cosine")
+    index = cls(n_neighbors=10, metric="cosine").fit(clustered)
+    check_non_negative(index, clustered[:200])
+
+
+@pytest.mark.skipif(
+    not ann.gpu_available(),
+    reason="no GPU support compiled in, or no adapter on this machine",
+)
+@pytest.mark.parametrize("cls", GPU_INDICES, ids=lambda v: getattr(v, "__name__", v))
+def test_gpu_cosine_distances_are_non_negative(cls, clustered):
+    """Same contract for the device-resident indices."""
+    index = cls(n_neighbors=10, metric="cosine").fit(clustered)
+    check_non_negative(index, clustered[:200])
 
 
 def test_euclidean_survives_the_clamp(clustered):

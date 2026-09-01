@@ -7524,10 +7524,32 @@ mod tests {
             let got = f32::euclidean_simd_batch_4(&q32, y32);
             let got_dot = f32::dot_simd_batch_4(&q32, y32);
             let got_l1 = f32::manhattan_simd_batch_4(&q32, y32);
+            // `epsilon` alone leaves `max_relative` at f32::EPSILON, which is
+            // about one ulp: too tight for two different summation orders over
+            // the same data. At a dot product of ~1000 an f32 ulp is already
+            // 6e-5, so the absolute bound was under two of them, and the x86
+            // 8-wide path and the aarch64 4-wide path disagree by more than
+            // that while both being correct. A real kernel bug is orders of
+            // magnitude larger than 1e-5 relative.
             for k in 0..4 {
-                assert_relative_eq!(got[k], f32::euclidean_simd(&q32, y32[k]), epsilon = 1e-4);
-                assert_relative_eq!(got_dot[k], f32::dot_simd(&q32, y32[k]), epsilon = 1e-4);
-                assert_relative_eq!(got_l1[k], f32::manhattan_simd(&q32, y32[k]), epsilon = 1e-4);
+                assert_relative_eq!(
+                    got[k],
+                    f32::euclidean_simd(&q32, y32[k]),
+                    epsilon = 1e-4,
+                    max_relative = 1e-5
+                );
+                assert_relative_eq!(
+                    got_dot[k],
+                    f32::dot_simd(&q32, y32[k]),
+                    epsilon = 1e-4,
+                    max_relative = 1e-5
+                );
+                assert_relative_eq!(
+                    got_l1[k],
+                    f32::manhattan_simd(&q32, y32[k]),
+                    epsilon = 1e-4,
+                    max_relative = 1e-5
+                );
             }
 
             let q64: Vec<f64> = q32.iter().map(|&x| x as f64).collect();
