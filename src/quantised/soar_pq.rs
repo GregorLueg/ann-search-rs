@@ -16,7 +16,7 @@
 //! Sun, Simcha, Simcha, Chern & Guo, arXiv:2404.00774, 2024 (SOAR);
 //! Guo, Sun, Lindgren, Geng, Simcha, Chern & Kumar, ICML, 2020 (ScaNN)
 
-use faer::{RowRef};
+use faer::RowRef;
 use fixedbitset::FixedBitSet;
 use rayon::prelude::*;
 use std::cell::RefCell;
@@ -670,6 +670,7 @@ where
             }
         }
 
+        fix_neg_dist(&mut final_dists);
         Ok((final_indices, final_dists))
     }
 }

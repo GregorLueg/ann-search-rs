@@ -2,7 +2,7 @@
 //! that leverages k-means clustering and the triangle inequality to prune
 //! distance computations.
 
-use faer::{RowRef};
+use faer::RowRef;
 use rayon::prelude::*;
 use std::collections::BinaryHeap;
 use std::sync::atomic::{AtomicUsize, Ordering};

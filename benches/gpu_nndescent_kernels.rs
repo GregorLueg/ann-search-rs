@@ -303,6 +303,7 @@ impl<R: Runtime> Benchmark for LocalJoinBench<R> {
                 42u32,
                 use_cosine,
                 dim_vec,
+                build_k,
             );
         }
 

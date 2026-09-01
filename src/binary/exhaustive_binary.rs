@@ -2,7 +2,7 @@
 //! exhaustive searches against query vectors.
 
 use bytemuck::Pod;
-use faer::{RowRef};
+use faer::RowRef;
 use faer_traits::ComplexField;
 use rayon::prelude::*;
 use std::collections::BinaryHeap;
@@ -13,6 +13,7 @@ use crate::binary::binariser::*;
 use crate::binary::dist_binary::*;
 use crate::binary::vec_store::*;
 use crate::prelude::*;
+use crate::utils::pack_knn_results;
 
 ///////////////////////////
 // ExhaustiveIndexBinary //
@@ -134,11 +135,8 @@ where
         // that argument and emits `dim` bits
         let n_bytes = binariser.n_bytes();
 
-        let mut vectors_flat_binarised: Vec<u8> = Vec::with_capacity(n * n_bytes);
-
-        for row in vectors_flat.chunks_exact(dim) {
-            vectors_flat_binarised.extend(binariser.encode(row)?);
-        }
+        let mut vectors_flat_binarised = vec![0u8; n * n_bytes];
+        binariser.encode_all(&vectors_flat, n, &mut vectors_flat_binarised)?;
 
         Ok(Self {
             vectors_flat_binarised,
@@ -201,18 +199,15 @@ where
         // that argument and emits `dim` bits
         let n_bytes = binariser.n_bytes();
 
-        let mut vectors_flat_binarised: Vec<u8> = Vec::with_capacity(n * n_bytes);
-
-        for row in vectors_flat.chunks_exact(dim) {
-            vectors_flat_binarised.extend(binariser.encode(row)?);
-        }
+        let mut vectors_flat_binarised = vec![0u8; n * n_bytes];
+        binariser.encode_all(&vectors_flat, n, &mut vectors_flat_binarised)?;
 
         // Save vector store
         std::fs::create_dir_all(&save_path)?;
 
         let norms: Vec<T> = vectors_flat
-            .chunks_exact(dim)
-            .map(|row| row.iter().map(|&x| x * x).fold(T::zero(), |a, b| a + b).sqrt())
+            .par_chunks_exact(dim)
+            .map(T::calculate_l2_norm)
             .collect();
 
         let (vectors_path, norms_path) = MmapVectorStore::<T>::paths_in(&save_path);
@@ -264,16 +259,27 @@ where
         let k = k.min(self.n);
 
         let mut heap: BinaryHeap<(u32, usize)> = BinaryHeap::with_capacity(k + 1);
+        let mut block = [0u32; HAMMING_BLOCK];
 
-        for idx in 0..self.n {
-            let dist = self.hamming_distance_query(&query_binary, idx);
+        let mut idx = 0;
+        while idx < self.n {
+            let take = HAMMING_BLOCK.min(self.n - idx);
+            let codes =
+                &self.vectors_flat_binarised[idx * self.n_bytes..(idx + take) * self.n_bytes];
+            let block_min = hamming_block(&query_binary, codes, self.n_bytes, &mut block[..take]);
 
-            if heap.len() < k {
-                heap.push((dist, idx));
-            } else if dist < heap.peek().unwrap().0 {
-                heap.pop();
-                heap.push((dist, idx));
+            if heap.len() < k || block_min < heap.peek().unwrap().0 {
+                for (j, &dist) in block[..take].iter().enumerate() {
+                    if heap.len() < k {
+                        heap.push((dist, idx + j));
+                    } else if dist < heap.peek().unwrap().0 {
+                        heap.pop();
+                        heap.push((dist, idx + j));
+                    }
+                }
             }
+
+            idx += take;
         }
 
         let mut results: Vec<_> = heap.into_iter().collect();
@@ -318,6 +324,9 @@ where
 
         let (candidates, _) = self.query(query_vec, k * rerank_factor)?;
 
+        // One pass over the query, not one per candidate
+        let query_sum = query_vec.iter().fold(T::zero(), |acc, &x| acc + x);
+
         let mut scored: Vec<(usize, T)> = candidates
             .iter()
             .map(|&idx| {
@@ -327,7 +336,7 @@ where
                         .get_unchecked(start_i..start_i + self.n_bytes)
                 };
 
-                let dist_i = asymmetric_binary_dot(query_vec, vec_i, self.dim);
+                let dist_i = asymmetric_binary_dot_presummed(query_vec, query_sum, vec_i, self.dim);
                 (idx, dist_i)
             })
             .collect();
@@ -566,13 +575,7 @@ where
                 })
                 .collect::<Result<Vec<_>, _>>()?;
 
-            if return_dist {
-                let (indices, distances) = results.into_iter().unzip();
-                Ok((indices, Some(distances)))
-            } else {
-                let indices: Vec<Vec<usize>> = results.into_iter().map(|(idx, _)| idx).collect();
-                Ok((indices, None))
-            }
+            Ok(pack_knn_results(results, return_dist))
         } else {
             // Fallback to binary-only search
             let results: Vec<(Vec<usize>, Vec<u32>)> = (0..self.n)
@@ -594,16 +597,28 @@ where
 
                     let k = k.min(self.n);
                     let mut heap: BinaryHeap<(u32, usize)> = BinaryHeap::with_capacity(k + 1);
+                    let mut block = [0u32; HAMMING_BLOCK];
 
-                    for idx in 0..self.n {
-                        let dist = self.hamming_distance_query(query_binary, idx);
+                    let mut idx = 0;
+                    while idx < self.n {
+                        let take = HAMMING_BLOCK.min(self.n - idx);
+                        let codes = &self.vectors_flat_binarised
+                            [idx * self.n_bytes..(idx + take) * self.n_bytes];
+                        let block_min =
+                            hamming_block(query_binary, codes, self.n_bytes, &mut block[..take]);
 
-                        if heap.len() < k {
-                            heap.push((dist, idx));
-                        } else if dist < heap.peek().unwrap().0 {
-                            heap.pop();
-                            heap.push((dist, idx));
+                        if heap.len() < k || block_min < heap.peek().unwrap().0 {
+                            for (j, &dist) in block[..take].iter().enumerate() {
+                                if heap.len() < k {
+                                    heap.push((dist, idx + j));
+                                } else if dist < heap.peek().unwrap().0 {
+                                    heap.pop();
+                                    heap.push((dist, idx + j));
+                                }
+                            }
                         }
+
+                        idx += take;
                     }
 
                     let mut results: Vec<(u32, usize)> = heap.into_iter().collect();

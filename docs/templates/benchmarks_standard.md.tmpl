@@ -18,15 +18,14 @@ cargo run --example gridsearch_<INDEX> --release -- --distance cosine
 # --seed 42
 # --distance euclidean
 # --data gaussian
+# --intrinsic-dim 16   (lowrank data only)
 ```
 
-To note, the data sets are just there for testing and get an idea on the
-behaviour with different types of structure in the data. You should not
-extrapolate from the results here what the ideal parameters are for your
-specific problem. Also, this is a single run. There is some variation in terms
-of exact times, but the overall trends should reproduce on your system with
-your specific specifications. Some of the indices also support now Manhattan
-distance.
+The data sets are there to give a feel for how each index behaves against
+different kinds of structure. Don't extrapolate ideal parameters for your own
+problem from them. This is a single run, so exact times vary, but the trends
+should reproduce on your hardware. A subset of the indices also supports
+Manhattan distance.
 
 ## Table of Contents
 
@@ -40,17 +39,16 @@ distance.
 - [NNDescent](#nndescent)
 - [NSG](#nsg)
 - [Relative NNDescent](#relative-nndescent)
+- [SOAR](#soar)
 - [Vamana](#vamana)
 
 ### Annoy
 
-`Approximate nearest neighbours Oh Yeah`. A tree-based method for vector
-searches. Fast index building and good query speed. The size of the index
-however increases quite drastically the increased number of trees. This version
-does not support the on-disk querying of the original and is designed as a
-pure in-memory index.
+`Approximate nearest neighbours Oh Yeah`. A forest of random-projection trees.
+Index size scales with the number of trees. This version drops the original's
+on-disk querying and is a pure in-memory index.
 
-**Key parameters:**
+**Tunable parameters:**
 
 - *Number of trees (nt)*: The number of trees to generate in the forest
 - *Search budget (s)*: The search budget per tree. If set to auto it uses
@@ -107,12 +105,11 @@ Self is queried with the default search budget.
 
 ### BallTree
 
-A metric tree data structure that partitions data points into nested
-hyperspheres. Unlike Annoy, which relies on random projections, BallTree uses
-the triangle inequality to prune the search space efficiently. This means
-instead of a forest it can just use a single tree.
+A metric tree partitioning points into nested hyperspheres. Where Annoy leans
+on random projections, BallTree prunes with the triangle inequality, so a single
+tree does the job of a forest.
 
-**Key parameters:**
+**Tunable parameters:**
 
 * *Search budget (s)*: The percentage of the total nodes/points to inspect
   during the query. If not provided, it will default to `5%`.
@@ -168,11 +165,10 @@ Self is queried with the default search budget.
 
 ### HNSW
 
-Hierarchical navigatable small worlds. A graph-based index that needs more time
-to build the index. However, fast query speed and compared to some other
-approximate indices limited memory finger print.
+Hierarchical navigable small worlds. A layered proximity graph: expensive to
+build, fast to query, and modest in memory for what it gives you.
 
-**Key parameters:**
+**Tunable parameters:**
 
 - *M (m)*: The number of connections between layers
 - *EF construction (ef)*: The budget to generate good connections during
@@ -241,15 +237,20 @@ Self is queried with `s=100`.
 
 ### IVF
 
-Inverted file index. Uses Voronoi cells to sub-partition the original data.
-Very small index size in memory.
+Inverted file index. k-means Voronoi cells over the data, with the query
+scanning only the cells nearest to it. Smallest in-memory footprint of the
+unquantised indices.
 
-**Key parameters:**
+**Tunable parameters:**
 
-- *Number of lists (nl)*: The number of independent k-means cluster to generate.
-  If the structure of the data is unknown, people use `sqrt(n)` as a heuristic.
-- *Number of points (np)*: The number of clusters to probe during search.
+- *Number of lists (nl)*: The number of independent k-means clusters to
+  generate. If the structure of the data is unknown, `sqrt(n)` is the usual
+  heuristic.
+- *Number of probes (np)*: The number of clusters to probe during search.
   Numbers here tend to be `sqrt(nlist)` or up to 5% of the nlist.
+- *k-means training (`KMeansTrainingParams`)*: The clustering step itself is
+  tunable (iterations, subsample size, initialisation). Left at its defaults
+  across this grid.
 
 Self query was done with `2 * sqrt(nlist)`.
 
@@ -303,14 +304,12 @@ Self query was done with `2 * sqrt(nlist)`.
 
 ### Kd forest
 
-A forest of randomised Kd-trees for approximate nearest neighbour search. Each
-tree splits along coordinate axes selected randomly from the top highest-spread
-dimensions, providing diversity across trees. Split decisions are cheap (single
-coordinate comparison rather than a full dot product), which makes tree
-traversal fast and build times low. Quality tends to be lower than Annoy however
-and you might need more trees for similar performance.
+A forest of randomised Kd-trees. Each tree splits on a coordinate axis drawn at
+random from the highest-spread dimensions, which is what keeps the trees
+diverse. A split is one coordinate comparison rather than a full dot product, so
+traversal and build are both cheap.
 
-**Key parameters:**
+**Tunable parameters:**
 
 - *Number of trees (nt)*: The number of trees to generate in the forest
 - *Search budget (s)*: The search budget per tree. If set to auto it uses
@@ -377,26 +376,28 @@ Self is queried with the default search budget.
 
 ### kMkNN
 
-k-means nearest neighbour index. Partitions the data into Voronoi cells via
-k-means and uses the triangle inequality to prune distance computations
-during search. Unlike IVF, kMkNN is an **exact** method; it returns the
-same neighbours as a brute-force scan, so recall is always 1.0.
+k-means nearest neighbour index. Voronoi cells like IVF, but the triangle
+inequality prunes distance computations rather than the search skipping cells
+outright, so this one is **exact**: it returns what a brute-force scan returns
+and recall is always 1.0.
 
-Works best in low-to-moderate dimensionality (roughly 20-100) where distances
-still have meaningful spread and cluster structure is informative. On
-high-dimensional isotropic data the pruning bounds become slack and performance
-collapses towards exhaustive search.
+Its home ground is low-to-moderate dimensionality (roughly 20-100), where
+distances still have spread and cluster structure means something. On
+high-dimensional isotropic data the bounds go slack and it degenerates towards
+an exhaustive scan.
 
-For Cosine distance, vectors are L2-normalised at build time and the index
-operates internally in Euclidean space (squared Euclidean on the unit sphere is
-monotone in Cosine distance), which keeps the triangle inequality valid.
+Cosine distance L2-normalises at build time and runs internally in Euclidean
+space. Squared Euclidean on the unit sphere is monotone in cosine distance, so
+the triangle inequality stays valid.
 
-**Key parameters:**
+**Tunable parameters:**
 
 - *Number of lists (nl)*: The number of k-means clusters to generate. As with
   IVF, `sqrt(n)` is a reasonable default. Fewer clusters means larger cluster
-  radii and weaker pruning; more clusters tightens bounds but increases the
-  centroid-scan cost at query time.
+  radii and weaker pruning; more clusters tightens the bounds but grows the
+  centroid scan at query time.
+- *k-means training (`KMeansTrainingParams`)*: Same knob as IVF, left at its
+  defaults here.
 
 <details>
 <summary><b>kMkNN - Euclidean (Gaussian)</b>:</summary>
@@ -448,8 +449,8 @@ monotone in Cosine distance), which keeps the triangle inequality valid.
 
 ### LSH
 
-Locality sensitive hashing. Can be a very fast index, but with increasing
-tables, the memory fingerprint does increase.
+Locality sensitive hashing. Fast, with a memory footprint that grows with the
+table count.
 
 Each table holds `nb / q` orthogonalised random projections. A projection is
 turned into a slot by binary-searching quantile boundaries fitted on a
@@ -459,7 +460,7 @@ every hyperplane through the origin, so on data carrying a large shared mean
 offset (foundation-model cell embeddings being the obvious case) the sign is
 decided by the offset and nearly everything lands in one bucket.
 
-**Key parameters:**
+**Tunable parameters:**
 
 - *Number of tables (nt)*: The number of independent hash tables to generate.
   More tables improve recall at the cost of query time and memory.
@@ -534,20 +535,29 @@ decided by the offset and nearly everything lands in one bucket.
 
 ### NNDescent
 
-The NNDescent implementation in this crate, heavily inspired by the amazing
-[PyNNDescent](https://github.com/lmcinnes/pynndescent), shows a very good
-compromise between index building and fast querying. It's a great arounder
-that reaches easily performance of ≥0.98 Recalls@k neighbours. You can even
-heavily short cut the initialisation of the index with only 12 trees (instead
-of 32) and get in 4 seconds to a recall ≥0.9 (compared to 48 seconds for
-exhaustive search)!
+NN-Descent, heavily inspired by the excellent
+[PyNNDescent](https://github.com/lmcinnes/pynndescent). A random-projection
+forest seeds a kNN graph, then local joins over neighbours-of-neighbours refine
+it until the improvement rate falls below `delta`. Good all-rounder, and the
+only CPU index here that hands back a self-kNN graph without a search pass. See
+[the kNN-graph benchmarks](benchmarks_knn_graph.md) for that path.
 
-**Key parameters:**
+Three rows per configuration: `(query)` for the beam search against held-out
+data, `(self)` for the full self-kNN via beam search, and `(extract)` for the
+descent's own graph handed back as-is. The gap between `(self)` and `(extract)`
+is exactly what the beam search buys on top of the graph.
 
-- *Number of trees (nt)*: Number of trees to use for the initialisation. If set
-  to auto, it defaults to `min(5 + round(n^0.25), 32)`
-- *Search budget (s)*: The search budget for the exploration of the graph during
-  querying. Here it defaults to `k * n_trees`.
+**Tunable parameters:**
+
+- *Graph degree (k)*: Neighbours per node in the built graph. Defaults to `30`.
+  Also the ceiling on what `(extract)` can return.
+- *Number of trees (nt)*: Trees used for the initialisation. Auto defaults to
+  `min(5 + round(n^0.25), 12)`.
+- *Search budget (s)*: Budget for the graph exploration at query time. Defaults
+  to `k * n_trees`.
+- *Delta*: Early-stop threshold on the fraction of edges still improving.
+- *Max iterations* and *max candidates*: Hard caps on the descent loop and on
+  the per-node candidate pool. Left at their defaults across this grid.
 - *Diversify probability (dp)*: Post-descent RNG-rule prune, inspired by
   PyNNDescent. For each node, the forward k-NN row is merged with reverse
   edges, then candidates are pruned when closer to an already-kept
@@ -626,7 +636,7 @@ the graph afterwards and wires any unreachable node back to its nearest reachabl
 predecessor. Queries are a greedy beam search. See
 [Fu et al., PVLDB 12(5), 2017](https://arxiv.org/abs/1707.00143).
 
-**Key parameters:**
+**Tunable parameters:**
 
 - *Max degree (R)*: Out-degree cap after MRNG pruning. On clustered data the
   occlusion rule alone can collapse a node down to a handful of edges, so nodes
@@ -720,7 +730,7 @@ Query-time entry points come from a small kd-forest built alongside the graph,
 per hop. See
 [Ono & Matsui, ACM MM 2023](https://arxiv.org/abs/2310.20419).
 
-**Key parameters:**
+**Tunable parameters:**
 
 - *Seed degree (S)*: Out-degree of the initial random graph.
 - *Max degree (R)*: Per-node adjacency cap once reverse edges are folded in.
@@ -794,20 +804,118 @@ Self is queried with the default `ef_search` and `K`.
 </code></pre>
 </details>
 
+### SOAR
+
+`Spilling with Orthogonality-Amplified Residuals`. An IVF index where every
+vector is written into two cells rather than one: its nearest centroid, and a
+second chosen so its residual points somewhere the first one does not. Cover a
+point from two directions and a query approaching from either side finds it
+without probing wider. See
+[Sun et al., NeurIPS 2023](https://arxiv.org/abs/2404.00774).
+
+Read these tables by recall against **query time**, not against `nprobe`. At a
+fixed `nprobe` a spilled index scans roughly twice the candidates, so a
+recall-versus-`nprobe` reading flatters it and answers nothing. Sweep A varies
+`nlist` against plain IVF at the same `nlist`; sweep B holds `nlist` and varies
+the rule.
+
+**Tunable parameters:**
+
+- *Number of lists (nl)*: As IVF. The sweep runs `0.5x`, `1x`, `2x` and `4x`
+  `sqrt(n)`, wider than the plain IVF grid: modelling query cost as
+  `nlist*dim + nprobe*(n/nlist)*dim` puts the optimum near `sqrt(nprobe * n)`,
+  and spilling pays in the fine-cell regime above it.
+- *Number of probes (np)*: As IVF, but skewed low here. `np=1` is the fairest
+  head-to-head, since a spilled index at `np=1` scans about the same candidate
+  count as a plain one at `np=2` over a different set of points.
+- *Rule*: How the second cell is picked.
+  - `Nearest`: plain second-nearest centroid. The control.
+  - `Shifted { mu }`: nearest centroid to `x + mu * (x - c_1)`. Derived for
+    squared Euclidean; `mu = 0` degenerates to `Nearest`. Sensible range
+    `0.2-1.0`.
+  - `Orthogonal { lambda }`: the published loss
+    `||r'||^2 + lambda * (r' . r_hat_1)^2`. Derived for MIPS on the unit
+    sphere, so cosine is its home ground.
+- *k-means training (`KMeansTrainingParams`)*: As IVF, left at defaults.
+
+The self-query path is not benchmarked here. Its ground truth is an
+`O(n^2 * dim)` exhaustive self-query and it does not discriminate between the
+rules, which is what both sweeps are for. `query_soar_self` is covered by the
+unit tests instead.
+
+<details>
+<summary><b>SOAR - Euclidean (Gaussian)</b>:</summary>
+</br>
+<pre><code>
+<!-- BENCH:soar:euclidean:gaussian:32 -->
+</code></pre>
+</details>
+
+---
+
+<details>
+<summary><b>SOAR - Cosine (Gaussian)</b>:</summary>
+</br>
+<pre><code>
+<!-- BENCH:soar:cosine:gaussian:32 -->
+</code></pre>
+</details>
+
+---
+
+<details>
+<summary><b>SOAR - Euclidean (Correlated)</b>:</summary>
+</br>
+<pre><code>
+<!-- BENCH:soar:euclidean:correlated:32 -->
+</code></pre>
+</details>
+
+---
+
+<details>
+<summary><b>SOAR - Euclidean (LowRank)</b>:</summary>
+</br>
+<pre><code>
+<!-- BENCH:soar:euclidean:lowrank:32 -->
+</code></pre>
+</details>
+
+---
+
+<details>
+<summary><b>SOAR - Euclidean (NN embeddings; more dimensions)</b>:</summary>
+</br>
+<pre><code>
+<!-- BENCH:soar:euclidean:cell:128 -->
+</code></pre>
+</details>
+
+---
+
+<details>
+<summary><b>SOAR - Cosine (NN embeddings; more dimensions)</b>:</summary>
+</br>
+<pre><code>
+<!-- BENCH:soar:cosine:cell:128 -->
+</code></pre>
+</details>
+
 ### Vamana
 
-`Disk Approximate Nearest Neighbors`. A graph-based method for vector searches
-that powers DiskANN. Builds a directed navigable graph initialised with random
-long-range edges, then refines it over two passes using a beam search and a
-robust pruning heuristic (alpha-pruning). The entry point is the dataset medoid.
-This is the in-memory variant.
+The graph behind DiskANN. A directed navigable graph seeded with random
+long-range edges, refined over two passes with a beam search and alpha-pruning.
+The entry point is the dataset medoid. This is the in-memory variant.
 
-**Key parameters:**
+**Tunable parameters:**
 
-- *Max degree (R)*: Maximum out-degree per node in the graph
-- *Build list size (L_build)*: Beam width during index construction
+- *Max degree (R)*: Maximum out-degree per node in the graph.
+- *Build list size (L_build)*: Beam width during construction.
+- *Alpha pass 1 / pass 2*: Pruning slack per refinement pass. Pass 1 is
+  typically `1.0` (plain RNG rule); pass 2 goes above it to keep longer edges
+  that the strict rule would occlude. Fixed across this grid.
 - *Search list size (ef_search)*: Candidate list size at query time. Defaults
-  to `75` if not set.
+  to `75`.
 
 Self is queried with `ef_search=75` (default value).
 

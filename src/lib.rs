@@ -16,6 +16,14 @@ use mimalloc::MiMalloc;
 #[global_allocator]
 static GLOBAL: MiMalloc = MiMalloc;
 
+/// Version of this crate.
+///
+/// Exposed so a dependent can report which version of the numerics it was
+/// built against. The Python bindings version independently of this crate and
+/// vendor its source through a path dependency, so their own version number
+/// says nothing about what is inside the wheel; this does.
+pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+
 pub mod cpu;
 pub mod errors;
 pub mod prelude;
@@ -32,6 +40,9 @@ pub mod binary;
 
 #[cfg(feature = "serialise")]
 pub mod serialise;
+
+#[cfg(feature = "synthetic")]
+pub mod synthetic;
 
 use rayon::prelude::*;
 
@@ -60,6 +71,7 @@ use crate::cpu::{
 };
 use crate::prelude::*;
 use crate::utils::nndescent_utils::ApplySortedUpdates;
+use crate::utils::pack_knn_results;
 
 #[cfg(feature = "binary")]
 use crate::binary::{
@@ -67,11 +79,12 @@ use crate::binary::{
     ivf_tq::*,
 };
 #[cfg(feature = "gpu")]
-use crate::gpu::{exhaustive_gpu::*, ivf_gpu::*, nndescent_gpu::*};
+use crate::gpu::{exhaustive_gpu::*, ivf_gpu::*};
 #[cfg(feature = "quantised")]
 use crate::quantised::{
-    exhaustive_bf16::*, exhaustive_opq::*, exhaustive_pq::*, exhaustive_sq8::*, ivf_bf16::*,
-    ivf_opq::*, ivf_pq::*, ivf_sq8::*, soar_opq::*, soar_pq::*,
+    exhaustive_bf16::*, exhaustive_opq::*, exhaustive_pq::*, exhaustive_sq8::*,
+    hnsw_quantised::index::*, ivf_bf16::*, ivf_opq::*, ivf_pq::*, ivf_sq8::*, soar_opq::*,
+    soar_pq::*, uniform_quant::UniformQuantParams,
 };
 
 ////////////
@@ -98,7 +111,7 @@ fn query_parallel<T, F>(
     query_fn: F,
 ) -> KnnOptionResult<T>
 where
-    T: Send,
+    T: Send + num_traits::Zero + PartialOrd,
     F: Fn(usize) -> Result<(Vec<usize>, Vec<T>), AnnSearchErrors> + Sync,
 {
     let counter = Arc::new(AtomicUsize::new(0));
@@ -121,13 +134,7 @@ where
         })
         .collect::<Result<Vec<_>, AnnSearchErrors>>()?;
 
-    if return_dist {
-        let (indices, distances) = results.into_iter().unzip();
-        Ok((indices, Some(distances)))
-    } else {
-        let indices: Vec<Vec<usize>> = results.into_iter().map(|(idx, _)| idx).collect();
-        Ok((indices, None))
-    }
+    Ok(pack_knn_results(results, return_dist))
 }
 
 /// Helper function to execute parallel queries with boolean flags
@@ -157,7 +164,7 @@ fn query_parallel_with_flags<T, F>(
     query_fn: F,
 ) -> KnnOptionResult<T>
 where
-    T: Send,
+    T: Send + num_traits::Zero + PartialOrd,
     F: Fn(usize) -> Result<(Vec<usize>, Vec<T>, bool), AnnSearchErrors> + Sync,
 {
     let counter = Arc::new(AtomicUsize::new(0));
@@ -198,7 +205,9 @@ where
     }
 
     if return_dist {
-        Ok((indices, Some(distances)))
+        let mut distances = Some(distances);
+        fix_neg_dist(&mut distances);
+        Ok((indices, distances))
     } else {
         Ok((indices, None))
     }
@@ -305,11 +314,10 @@ pub fn query_exhaustive_index<T>(
 where
     T: AnnSearchFloat,
 {
-    let (queries, nq, dim) = query_mat.into_row_major();
+    let (queries, nq, _) = query_mat.into_row_major();
+    let results = index.query_batch(&queries, nq, k, None, verbose)?;
 
-    query_parallel(nq, return_dist, verbose, |i| {
-        index.query(&queries[i * dim..(i + 1) * dim], k)
-    })
+    Ok(pack_knn_results(results, return_dist))
 }
 
 /// Helper function to self query an exhaustive index
@@ -798,7 +806,8 @@ where
 ///   `(&[T], n_queries, n_features)` tuple. See [`AnnMatrix`].
 /// * `index` - Reference to the built IVF index
 /// * `k` - Number of neighbours to return
-/// * `nprobe` - Number of clusters to search (defaults to min(nlist/10, 10))
+/// * `nprobe` - Number of clusters to search (defaults to √nlist, capped
+///   at nlist)
 ///   Higher values improve recall at the cost of speed
 /// * `return_dist` - Shall the distances between the different points be
 ///   returned
@@ -843,7 +852,8 @@ where
 ///   `(&[T], n_queries, n_features)` tuple. See [`AnnMatrix`].
 /// * `index` - Reference to the built IVF index
 /// * `k` - Number of neighbours to return
-/// * `nprobe` - Number of clusters to search (defaults to min(nlist/10, 10))
+/// * `nprobe` - Number of clusters to search (defaults to √nlist, capped
+///   at nlist)
 ///   Higher values improve recall at the cost of speed
 /// * `return_dist` - Shall the distances between the different points be
 ///   returned
@@ -1239,17 +1249,20 @@ where
 /// * `mat` - Input data as samples x features. Accepts a faer matrix, an
 ///   ndarray 2-D array (with the `ndarray` feature) or a row-major
 ///   `(&[T], n_samples, n_features)` tuple. See [`AnnMatrix`].
-/// * `k` - Number of neighbours for the k-NN graph.
 /// * `dist_metric` - Distance metric: "euclidean", "cosine" or "manhatten".
-/// * `max_iter` - Maximum iterations for the algorithm.
 /// * `delta` - Early stop criterium for the algorithm.
-/// * `rho` - Sampling rate for the old neighbours. Will adaptively decrease
-///   over time.
 /// * `diversify_prob` - Bernoulli probability of pruning a redundant edge
 ///   per candidate/kept pair, applied post-descent to the forward+reverse
 ///   candidate pool per node. `0.0` disables pruning; `1.0` always prunes
 ///   when the RNG rule fires. Rows shorter than `k` after pruning are
 ///   topped up from the pruned tail so out-degree is preserved.
+/// * `k` - Number of neighbours for the k-NN graph (default 30).
+/// * `max_iter` - Maximum iterations for the algorithm (default
+///   `log2(n).round().max(5)`).
+/// * `max_candidates` - Cap on sampled candidates per node per iteration
+///   (default `k.min(60)`).
+/// * `n_tree` - Random-projection trees seeding the graph (default
+///   `5 + n^0.25`, capped at 12).
 /// * `seed` - Random seed for reproducibility
 /// * `verbose` - Controls verbosity of the algorithm
 ///
@@ -1369,6 +1382,46 @@ where
     NNDescent<T>: NNDescentQuery<T>,
 {
     index.generate_knn(k, ef_search, return_dist, verbose)
+}
+
+/// Extract the kNN graph NN-Descent already built.
+///
+/// No search is performed: this reshapes the graph produced during
+/// construction. [`query_nndescent_self`] runs a beam search per point instead,
+/// which lifts recall at orders of magnitude more cost.
+///
+/// ### Params
+///
+/// * `index` - Reference to the built index
+/// * `k` - Truncate each row to this **total** length, self-edge included when
+///   `include_self` is set. `None` keeps the build-time `k`.
+/// * `include_self` - Prepend `(i, 0)` to row `i`. Every `query_*_self` in the
+///   crate and any exhaustive ground truth count a point as its own nearest
+///   neighbour, but a kNN graph stores no such edge. Set this to compare
+///   like for like; leave it unset for true neighbours only.
+/// * `return_dist` - Return distances
+///
+/// ### Returns
+///
+/// A tuple of `(knn_indices, optional distances)`, sorted by distance
+/// ascending.
+///
+/// ### Note
+///
+/// Rows can be shorter than `k` where the descent never filled them, which the
+/// query-based functions never produce.
+pub fn extract_nndescent_knn<T>(
+    index: &NNDescent<T>,
+    k: Option<usize>,
+    include_self: bool,
+    return_dist: bool,
+) -> KnnOptionResult<T>
+where
+    T: AnnSearchFloat,
+    NNDescent<T>: ApplySortedUpdates<T>,
+    NNDescent<T>: NNDescentQuery<T>,
+{
+    Ok(index.extract_knn(k, include_self, return_dist))
 }
 
 ////////////
@@ -1867,6 +1920,8 @@ where
 ///   `(&[T], n_samples, n_features)` tuple. See [`AnnMatrix`].
 /// * `dist_metric` - Distance metric: "euclidean" or "cosine". "manhatten" is
 ///   not supported.
+/// * `quant_params` - Optional calibration settings, see
+///   [`UniformQuantParams`]. Defaults trim 0.1% from each tail.
 /// * `verbose` - Print progress information during index construction
 ///
 /// ### Return
@@ -1875,6 +1930,7 @@ where
 pub fn build_exhaustive_sq8_index<T>(
     mat: impl AnnMatrix<T>,
     dist_metric: &str,
+    quant_params: Option<UniformQuantParams>,
     verbose: bool,
 ) -> Result<ExhaustiveSq8Index<T>, AnnSearchErrors>
 where
@@ -1890,7 +1946,7 @@ where
     if verbose {
         println!("Building exhaustive SQ8 index with {} samples", n);
     }
-    ExhaustiveSq8Index::new((vectors_flat, n, dim), metric)
+    ExhaustiveSq8Index::new((vectors_flat, n, dim), metric, quant_params)
 }
 
 #[cfg(feature = "quantised")]
@@ -2220,7 +2276,8 @@ where
 ///   `(&[T], n_queries, n_features)` tuple. See [`AnnMatrix`].
 /// * `index` - Reference to the built IVF-BF16 index
 /// * `k` - Number of neighbours to return
-/// * `nprobe` - Number of clusters to search (defaults to 20% of nlist)
+/// * `nprobe` - Number of clusters to search (defaults to √nlist, capped
+///   at nlist)
 ///   Higher values improve recall at the cost of speed
 /// * `return_dist` - Shall the inner product scores be returned
 /// * `verbose` - Print progress information
@@ -2258,7 +2315,8 @@ where
 ///
 /// * `index` - Reference to the built IVF-SQ8 index
 /// * `k` - Number of neighbours to return
-/// * `nprobe` - Number of clusters to search (defaults to 20% of nlist)
+/// * `nprobe` - Number of clusters to search (defaults to √nlist, capped
+///   at nlist)
 ///   Higher values improve recall at the cost of speed
 /// * `return_dist` - Shall the inner product scores be returned
 /// * `verbose` - Print progress information
@@ -2299,17 +2357,21 @@ where
 /// * `dist_metric` - Distance metric: "euclidean" or "cosine". "manhatten" is
 ///   not supported.
 /// * `seed` - Random seed for reproducibility
+/// * `quant_params` - Optional calibration settings, see
+///   [`UniformQuantParams`]. Defaults trim 0.1% from each tail.
 /// * `verbose` - Print progress information during index construction
 ///
 /// ### Return
 ///
 /// The `IvfSq8Index`.
+#[allow(clippy::too_many_arguments)]
 pub fn build_ivf_sq8_index<T>(
     mat: impl AnnMatrix<T>,
     nlist: Option<usize>,
     k_means_params: Option<KMeansTrainingParams>,
     dist_metric: &str,
     seed: usize,
+    quant_params: Option<UniformQuantParams>,
     verbose: bool,
 ) -> Result<IvfSq8Index<T>, AnnSearchErrors>
 where
@@ -2320,7 +2382,15 @@ where
         Dist::default()
     });
 
-    IvfSq8Index::build(mat, nlist, metric, k_means_params, seed, verbose)
+    IvfSq8Index::build(
+        mat,
+        nlist,
+        metric,
+        k_means_params,
+        seed,
+        quant_params,
+        verbose,
+    )
 }
 
 #[cfg(feature = "quantised")]
@@ -2333,7 +2403,8 @@ where
 ///   `(&[T], n_queries, n_features)` tuple. See [`AnnMatrix`].
 /// * `index` - Reference to the built IVF-SQ8 index
 /// * `k` - Number of neighbours to return
-/// * `nprobe` - Number of clusters to search (defaults to 20% of nlist)
+/// * `nprobe` - Number of clusters to search (defaults to √nlist, capped
+///   at nlist)
 ///   Higher values improve recall at the cost of speed
 /// * `return_dist` - Shall the inner product scores be returned
 /// * `verbose` - Print progress information
@@ -2371,7 +2442,8 @@ where
 ///
 /// * `index` - Reference to the built IVF-SQ8 index
 /// * `k` - Number of neighbours to return
-/// * `nprobe` - Number of clusters to search (defaults to 20% of nlist)
+/// * `nprobe` - Number of clusters to search (defaults to √nlist, capped
+///   at nlist)
 ///   Higher values improve recall at the cost of speed
 /// * `return_dist` - Shall the inner product scores be returned
 /// * `verbose` - Print progress information
@@ -2390,6 +2462,138 @@ where
     T: AnnSearchFloat,
 {
     Ok(index.generate_knn(k, nprobe, return_dist, verbose))
+}
+
+////////////////
+// HNSW-SQ8U //
+////////////////
+
+#[cfg(feature = "quantised")]
+/// Build an HNSW index over uniformly quantised 8-bit vectors
+///
+/// The graph is built and searched entirely on quantised distances, so
+/// construction sees the same distances the queries will.
+///
+/// ### Params
+///
+/// * `mat` - Input data as samples x features. Accepts a faer matrix, an
+///   ndarray 2-D array (with the `ndarray` feature) or a row-major
+///   `(&[T], n_samples, n_features)` tuple. See [`AnnMatrix`].
+/// * `m` - Base connectivity parameter. Layer 0 gets `2 * m` slots
+/// * `ef_construction` - Beam width during construction
+/// * `dist_metric` - Distance metric: "euclidean" or "cosine". "manhattan" is
+///   not supported.
+/// * `seed` - Random seed for reproducibility
+/// * `quant_params` - Optional calibration settings, see
+///   [`UniformQuantParams`]. Defaults trim 0.1% from each tail.
+/// * `verbose` - Print progress information during index construction
+///
+/// ### Returns
+///
+/// The `HnswSq8uIndex`, or an error on an unsupported metric or invalid
+/// calibration settings.
+///
+/// ### Note
+///
+/// The float vectors are not retained. Returned distances are estimates from
+/// the codes, so a caller that needs exact distances must re-rank against the
+/// originals itself.
+#[allow(clippy::too_many_arguments)]
+pub fn build_hnsw_sq8u_index<T>(
+    mat: impl AnnMatrix<T>,
+    m: usize,
+    ef_construction: usize,
+    dist_metric: &str,
+    seed: usize,
+    quant_params: Option<UniformQuantParams>,
+    verbose: bool,
+) -> Result<HnswSq8uIndex<T>, AnnSearchErrors>
+where
+    T: AnnSearchFloat + ThreadLocalSearchState,
+{
+    let metric = parse_ann_dist(dist_metric).unwrap_or_else(|| {
+        println!("[WARNING] Weird string used for distance metric. Using default squared Euclidean distance");
+        Dist::default()
+    });
+
+    HnswSq8uIndex::build(
+        mat,
+        m,
+        ef_construction,
+        &metric,
+        seed,
+        quant_params,
+        verbose,
+    )
+}
+
+#[cfg(feature = "quantised")]
+/// Helper function to query a given HNSW-SQ8U index
+///
+/// ### Params
+///
+/// * `query_mat` - Query data as samples x features. Accepts a faer matrix,
+///   an ndarray 2-D array (with the `ndarray` feature) or a row-major
+///   `(&[T], n_queries, n_features)` tuple. See [`AnnMatrix`].
+/// * `index` - Reference to the built HNSW-SQ8U index
+/// * `k` - Number of neighbours to return
+/// * `ef_search` - Size of candidate list during search (higher = better
+///   recall, slower)
+/// * `return_dist` - Shall the distances between the different points be
+///   returned
+/// * `verbose` - Print progress information
+///
+/// ### Returns
+///
+/// A tuple of `(knn_indices, optional distances)`
+pub fn query_hnsw_sq8u_index<T>(
+    query_mat: impl AnnMatrix<T>,
+    index: &HnswSq8uIndex<T>,
+    k: usize,
+    ef_search: usize,
+    return_dist: bool,
+    verbose: bool,
+) -> KnnOptionResult<T>
+where
+    T: AnnSearchFloat + ThreadLocalSearchState,
+{
+    let (queries, nq, dim) = query_mat.into_row_major();
+
+    query_parallel(nq, return_dist, verbose, |i| {
+        index.query(&queries[i * dim..(i + 1) * dim], k, ef_search)
+    })
+}
+
+#[cfg(feature = "quantised")]
+/// Helper function to self query the HNSW-SQ8U index
+///
+/// This function will generate a full kNN graph based on the internal data.
+/// Stored vectors query through their own codes, so no re-encoding happens.
+///
+/// ### Params
+///
+/// * `index` - Reference to the built HNSW-SQ8U index
+/// * `k` - Number of neighbours to return
+/// * `ef_search` - Size of candidate list during search (higher = better
+///   recall, slower)
+/// * `return_dist` - Shall the distances between the different points be
+///   returned
+/// * `verbose` - Print progress information
+///
+/// ### Returns
+///
+/// A tuple of `(knn_indices, optional distances)`
+pub fn query_hnsw_sq8u_self<T>(
+    index: &HnswSq8uIndex<T>,
+    k: usize,
+    ef_search: usize,
+    return_dist: bool,
+    verbose: bool,
+) -> KnnOptionResult<T>
+where
+    T: AnnSearchFloat + ThreadLocalSearchState,
+{
+    index.generate_knn(k, ef_search, return_dist, verbose)
 }
 
 ////////////
@@ -2727,7 +2931,8 @@ where
 ///   `(&[T], n_queries, n_features)` tuple. See [`AnnMatrix`].
 /// * `index` - Reference to the built IVF-PQ index
 /// * `k` - Number of neighbours to return
-/// * `nprobe` - Number of clusters to search (defaults to 15% of nlist)
+/// * `nprobe` - Number of clusters to search (defaults to √nlist, capped
+///   at nlist)
 ///   Higher values improve recall at the cost of speed
 /// * `return_dist` - Shall the distances be returned
 /// * `verbose` - Print progress information
@@ -2764,7 +2969,8 @@ where
 ///
 /// * `index` - Reference to the built IVF-PQ index
 /// * `k` - Number of neighbours to return
-/// * `nprobe` - Number of clusters to search (defaults to 15% of nlist)
+/// * `nprobe` - Number of clusters to search (defaults to √nlist, capped
+///   at nlist)
 ///   Higher values improve recall at the cost of speed
 /// * `return_dist` - Shall the distances be returned
 /// * `verbose` - Print progress information
@@ -2854,7 +3060,8 @@ where
 ///   `(&[T], n_queries, n_features)` tuple. See [`AnnMatrix`].
 /// * `index` - Reference to the built IVF-OPQ index
 /// * `k` - Number of neighbours to return
-/// * `nprobe` - Number of clusters to search (defaults to 15% of nlist)
+/// * `nprobe` - Number of clusters to search (defaults to √nlist, capped
+///   at nlist)
 ///   Higher values improve recall at the cost of speed
 /// * `return_dist` - Shall the distances be returned
 /// * `verbose` - Print progress information
@@ -2891,7 +3098,8 @@ where
 ///
 /// * `index` - Reference to the built IVF-OPQ index
 /// * `k` - Number of neighbours to return
-/// * `nprobe` - Number of clusters to search (defaults to 15% of nlist)
+/// * `nprobe` - Number of clusters to search (defaults to √nlist, capped
+///   at nlist)
 ///   Higher values improve recall at the cost of speed
 /// * `return_dist` - Shall the distances be returned
 /// * `verbose` - Print progress information
@@ -3152,13 +3360,17 @@ where
 /// * `dist_metric` - Distance metric: "euclidean" or "cosine". "manhatten" is
 ///   not supported.
 /// * `k` - Final neighbours per node (default 30)
-/// * `build_k` - Internal NNDescent degree before CAGRA pruning (default 2*k)
+/// * `build_k` - Internal NNDescent degree before CAGRA pruning
+///   (default `1.5*k`)
 /// * `max_iters` - Maximum NNDescent iterations (default 15)
-/// * `n_trees` - Annoy forest size (default auto)
+/// * `n_trees` - Forest size for GPU init (default `5 + n^0.25`, capped at 20)
 /// * `delta` - Convergence threshold (default 0.001)
-/// * `rho` - Sampling rate (default 0.5)
+/// * `rho` - Sampling rate (default 1.0, meaning no sampling)
+/// * `refine_knn` - 2-hop refinement sweeps after the main loop (default 0)
 /// * `seed` - Random seed
 /// * `verbose` - Print progress
+/// * `retain_gpu` - Keep the vectors device-resident after the build, so a
+///   later GPU beam search does not re-upload them
 /// * `device` - GPU device
 #[allow(clippy::too_many_arguments)]
 pub fn build_nndescent_index_gpu<T, R>(
@@ -3246,6 +3458,12 @@ where
 /// ### Params
 ///
 /// * `index` - Reference to built index
+/// * `k` - Truncate each row to this **total** length, self-edge included when
+///   `include_self` is set. `None` keeps the build-time `k`.
+/// * `include_self` - Prepend `(i, 0)` to row `i`. Every `query_*_self` in the
+///   crate and any exhaustive ground truth count a point as its own nearest
+///   neighbour, but a kNN graph stores no such edge. Set this to compare
+///   like for like; leave it unset for true neighbours only.
 /// * `return_dist` - Return distances
 ///
 /// ### Returns
@@ -3253,13 +3471,49 @@ where
 /// Tuple of (indices, optional distances)
 pub fn extract_nndescent_knn_gpu<T, R>(
     index: &NNDescentGpu<T, R>,
+    k: Option<usize>,
+    include_self: bool,
     return_dist: bool,
-) -> (Vec<Vec<usize>>, Option<Vec<Vec<T>>>)
+) -> KnnOptionResult<T>
 where
     R: Runtime,
     T: AnnSearchFloat + CubeclFloat,
 {
-    index.extract_knn(return_dist)
+    Ok(index.extract_knn(k, include_self, return_dist))
+}
+
+#[cfg(feature = "gpu")]
+/// Extract the kNN graph from a raw GPU kNN handoff.
+///
+/// [`build_knn_graph_gpu`] and [`build_clustered_knn_graph_gpu`] return a
+/// [`KnnGraphGpu`] with no query functions, since their job is to feed a
+/// downstream index like NSG. This is the way out for a caller who wanted
+/// plain kNN output from that cheaper path.
+///
+/// ### Params
+///
+/// * `graph` - The kNN graph handoff
+/// * `k` - Truncate each row to this **total** length, self-edge included when
+///   `include_self` is set. `None` keeps the build-time `k`.
+/// * `include_self` - Prepend `(i, 0)` to row `i`. Every `query_*_self` in the
+///   crate and any exhaustive ground truth count a point as its own nearest
+///   neighbour, but a kNN graph stores no such edge. Set this to compare
+///   like for like; leave it unset for true neighbours only.
+/// * `return_dist` - Return distances
+///
+/// ### Returns
+///
+/// Tuple of (indices, optional distances), sorted by distance ascending.
+pub fn extract_knn_graph_gpu<T>(
+    graph: &KnnGraphGpu<T>,
+    k: Option<usize>,
+    include_self: bool,
+    return_dist: bool,
+) -> KnnOptionResult<T>
+where
+    T: AnnSearchFloat,
+{
+    Ok(graph.extract_knn(k, include_self, return_dist))
 }
 
 #[cfg(feature = "gpu")]
@@ -3318,7 +3572,7 @@ where
 /// * `max_iters` - Maximum NNDescent iterations (default 15)
 /// * `n_trees` - Forest size for GPU init (default auto)
 /// * `delta` - Convergence threshold (default 0.001)
-/// * `rho` - Local-join sampling rate (default 0.5)
+/// * `rho` - Local-join sampling rate (default 1.0, meaning no sampling)
 /// * `refine_knn` - 2-hop refinement sweeps after main loop (default 0)
 /// * `seed` - Random seed
 /// * `verbose` - Print progress
@@ -3326,7 +3580,7 @@ where
 ///
 /// ### Returns
 ///
-/// Populated [`crate::gpu::nndescent_gpu::KnnGraphGpu`].
+/// Populated [`KnnGraphGpu`].
 #[allow(clippy::too_many_arguments)]
 pub fn build_knn_graph_gpu<T, R>(
     mat: impl AnnMatrix<T>,
@@ -3341,7 +3595,7 @@ pub fn build_knn_graph_gpu<T, R>(
     seed: usize,
     verbose: bool,
     device: R::Device,
-) -> Result<crate::gpu::nndescent_gpu::KnnGraphGpu<T>, AnnSearchErrors>
+) -> Result<KnnGraphGpu<T>, AnnSearchErrors>
 where
     R: Runtime,
     T: AnnSearchFloat + CubeclFloat,
@@ -3376,7 +3630,7 @@ where
 /// * `max_iters` - Maximum NNDescent iterations per cluster (default 15)
 /// * `n_trees` - Forest size for GPU init; sized per cluster when `None`
 /// * `delta` - Convergence threshold (default 0.001)
-/// * `rho` - Local-join sampling rate (default 0.5)
+/// * `rho` - Local-join sampling rate (default 1.0, meaning no sampling)
 /// * `refine_knn` - 2-hop refinement sweeps per cluster (default 0)
 /// * `cluster_params` - Optional [`crate::gpu::clustered_nndescent_gpu::ClusteredBuildParams`];
 ///   `None` plans the cluster count from the device limits
@@ -3386,7 +3640,7 @@ where
 ///
 /// ### Returns
 ///
-/// Populated [`crate::gpu::nndescent_gpu::KnnGraphGpu`], identical in shape to
+/// Populated [`KnnGraphGpu`], identical in shape to
 /// the unbatched path.
 ///
 /// ### Note
@@ -3410,7 +3664,7 @@ pub fn build_clustered_knn_graph_gpu<T, R>(
     seed: usize,
     verbose: bool,
     device: R::Device,
-) -> Result<crate::gpu::nndescent_gpu::KnnGraphGpu<T>, AnnSearchErrors>
+) -> Result<KnnGraphGpu<T>, AnnSearchErrors>
 where
     R: Runtime,
     T: AnnSearchFloat + CubeclFloat,
@@ -3447,14 +3701,14 @@ where
 ///
 /// ### Params
 ///
-/// * `knn_gpu` - Reference to a pre-built [`crate::gpu::nndescent_gpu::KnnGraphGpu`]
+/// * `knn_gpu` - Reference to a pre-built [`KnnGraphGpu`]
 /// * `r` - Maximum out-degree of the NSG graph
 /// * `l_build` - Beam width for the per-node candidate search
 /// * `c` - Cap on the candidate-set size before MRNG pruning
 /// * `seed` - Random seed for reproducibility
 /// * `verbose` - Print progress
 pub fn build_nsg_from_gpu_knn<T>(
-    knn_gpu: &crate::gpu::nndescent_gpu::KnnGraphGpu<T>,
+    knn_gpu: &KnnGraphGpu<T>,
     r: usize,
     l_build: usize,
     c: usize,
@@ -3633,10 +3887,8 @@ where
 /// * `mat` - Input data as samples x features. Accepts a faer matrix, an
 ///   ndarray 2-D array (with the `ndarray` feature) or a row-major
 ///   `(&[T], n_samples, n_features)` tuple. See [`AnnMatrix`].
-/// * `binarisation_init` - "random", "pca" or "sign". "sign" encodes the
-///   residual against each vector's assigned centroid rather than the raw
-///   vector, so its codes are only comparable within a Voronoi cell; see
-///   [`IvfIndexBinary::query`].
+/// * `binarisation_init` - "random", "pca" or "sign". "sign" unlocks the
+///   asymmetric query path; see [`IvfIndexBinary::query_asymmetric`].
 /// * `n_bits` - Number of bits per code (multiple of 8). Ignored by "sign",
 ///   which always emits `dim` bits.
 /// * `nlist` - Number of clusters (defaults to √n)
@@ -3768,13 +4020,8 @@ where
 ///
 /// Generates a full kNN graph based on the internal data.
 ///
-/// ### Note
-///
-/// A `"sign"` index stores codes relative to each cell's centroid, which are
-/// only comparable within a cell, so building the graph needs the float
-/// vectors. Without a vector store this returns
-/// [`AnnSearchErrors::ResidualCodesRequireVectorStore`] rather than a quietly
-/// degraded graph. Build with `save_store = true`.
+/// With a vector store the graph is reranked against the float vectors;
+/// without one it falls back to Hamming distances alone.
 ///
 /// ### Params
 ///

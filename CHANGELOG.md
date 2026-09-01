@@ -1,5 +1,64 @@
 # News
 
+## 0.7.0
+
+**Python**
+
+- Python bindings under `python/`, built with PyO3 and maturin. scikit-learn
+  shaped estimators over the CPU indices, plus the synthetic generators below.
+  Not published yet, but installable from the repo.
+
+**Features**
+
+- `HnswQuantisedIndex`: an HNSW built and searched entirely on uniformly
+  quantised 8-bit codes, inspired by pyglass. One scale shared across all
+  dimensions is what makes the integer code distance preserve the ordering of
+  the float one, so a single kernel serves construction and query.
+  `build_hnsw_sq8u_index` / `query_hnsw_sq8u_index` / `query_hnsw_sq8u_self`.
+- New `synthetic` feature: the four dataset generators that produce the
+  benchmark tables now live in `src/synthetic/` instead of `examples/commons/`,
+  so the published numbers are reproducible outside this repository. Gridsearch
+  commands are unchanged.
+- `clap` and `approx` moved to dev-dependencies.
+- PCAHashing has now ITQ which improves it performance.
+- Improved speed for a large number of indices:
+  * Exhaustive uses GEMM now
+  * Binary build times massively reduced
+  * RaBitQ has faster querying times.
+  * Improved HNSW and IVF in terms of speed.
+
+**Docs**
+
+- All published benchmark tables regenerated. Stale parameter descriptions and
+  measurement claims removed from the templates. Some of the performances have
+  changed substantially compared to prior releases.
+- New `docs/benchmarks_knn_graph.md`, covering the self-kNN-graph paths: CPU
+  NN-Descent extract vs self-beam, the GPU/CAGRA equivalents, and the clustered
+  GPU builder.
+- SOAR, SOAR-PQ, SOAR-OPQ and the quantised HNSW now have benchmark sections and
+  entries in `fill_benchmarks.sh`. `--kind knn_graph` is the fifth kind.
+
+**Breaking changes**
+
+- `ExhaustiveSq8Index` and `IvfSq8Index` rebuilt on the shared-scale `u8`
+  quantiser. `build_exhaustive_sq8_index` and `build_ivf_sq8_index` gain an
+  `Option<UniformQuantParams>`. `ScalarQuantiser` and `VectorDistanceSq8` are
+  gone.
+- Sign-based IVF binary indices drop the per-cell residual frame added in 0.5.0
+  and go back to global sign codes. The residual frame bought recall at low
+  `rerank_factor` on clustered data (0.739 vs 0.579 on the fixture in
+  `ivf_binary.rs`) but made Hamming distances incomparable across cells, so
+  widening `nprobe` *cost* recall, every query paid a re-encode per probed cell,
+  and a kNN graph could not be built without a vector store at all. The
+  asymmetric query path covers the same ground for less.
+  `Binariser::encode_residual`,
+  `AnnSearchErrors::ResidualEncodingUnsupported` and
+  `AnnSearchErrors::ResidualCodesRequireVectorStore` are all gone.
+
+**Fixes**
+
+- The indices cannot return distances < 0 due to rounding imprecisions anymore.
+
 ## 0.6.0
 
 **Features**
@@ -51,7 +110,7 @@
 - Sign-based IVF binary indices now encode the residual against the assigned
   cell's centroid instead of the raw vector. A trade, not a free win: better
   recall at low `rerank_factor`, worse above roughly 15. Documented on
-  `IvfIndexBinary::query`.
+  `IvfIndexBinary::query`. Reverted in 0.7.0.
 
 **Fixes**
 

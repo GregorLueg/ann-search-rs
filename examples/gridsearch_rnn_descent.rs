@@ -44,6 +44,7 @@ fn main() {
         total_time_ms: build_time + query_time,
         recall_at_k: 1.0,
         mean_dist_rat: 1.0,
+        median_dist_rat: 1.0,
         index_size_mb,
     });
 
@@ -60,17 +61,14 @@ fn main() {
         total_time_ms: build_time + self_query_time,
         recall_at_k: 1.0,
         mean_dist_rat: 1.0,
+        median_dist_rat: 1.0,
         index_size_mb,
     });
 
     println!("-----------------------------");
 
     // S x R x T1 grid (T2 fixed to 10 for pace)
-    let build_params: &[(usize, usize, usize)] = &[
-        (20, 64, 3),
-        (20, 96, 4),
-        (40, 128, 3),
-    ];
+    let build_params: &[(usize, usize, usize)] = &[(20, 64, 3), (20, 96, 4), (40, 128, 3)];
     let t2: usize = 10;
 
     // Query-time K sweep (paper Section 4.4). None uses the default min(32, R).
@@ -79,7 +77,10 @@ fn main() {
     let ef_search: Option<usize> = None; // 100 by default, matching the paper
 
     for &(s, r, t1) in build_params {
-        println!("Building RNN-Descent (S={}, R={}, T1={}, T2={})...", s, r, t1, t2);
+        println!(
+            "Building RNN-Descent (S={}, R={}, T1={}, T2={})...",
+            s, r, t1, t2
+        );
 
         let start = Instant::now();
         let rnn_idx = build_rnn_descent_index(
@@ -125,6 +126,11 @@ fn main() {
                 approx_distances.as_ref().unwrap(),
                 cli.k,
             );
+            let dist_error_median = calculate_median_distance_ratio(
+                true_distances.as_ref().unwrap(),
+                approx_distances.as_ref().unwrap(),
+                cli.k,
+            );
 
             results.push(BenchmarkResultSize {
                 method: format!("RNN-S{}-R{}-T1{}-K{} (query)", s, r, t1, k_label),
@@ -133,6 +139,7 @@ fn main() {
                 total_time_ms: build_time + query_time,
                 recall_at_k: recall,
                 mean_dist_rat: dist_error,
+                median_dist_rat: dist_error_median,
                 index_size_mb,
             });
         }
@@ -149,6 +156,11 @@ fn main() {
             approx_distances_self.as_ref().unwrap(),
             cli.k,
         );
+        let dist_error_self_median = calculate_median_distance_ratio(
+            true_distances_self.as_ref().unwrap(),
+            approx_distances_self.as_ref().unwrap(),
+            cli.k,
+        );
 
         results.push(BenchmarkResultSize {
             method: format!("RNN-S{}-R{}-T1{} (self)", s, r, t1),
@@ -157,6 +169,7 @@ fn main() {
             total_time_ms: build_time + self_query_time,
             recall_at_k: recall_self,
             mean_dist_rat: dist_error_self,
+            median_dist_rat: dist_error_self_median,
             index_size_mb,
         });
     }

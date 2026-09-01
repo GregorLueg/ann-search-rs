@@ -1,0 +1,58 @@
+[package]
+# Versioned independently of `ann-search-rs`, on purpose. Coupling the two
+# means a docstring fix here forces a crates.io release of a crate whose Rust
+# source did not change, and that version number is permanent. The wheel
+# reports the core version it vendored as `__core_version__` instead, which is
+# the question lockstep was actually answering.
+name = "ann-search-py"
+version = "0.1.0"
+edition = "2021"
+authors = ["Gregor Lueg <gregorlueg@me.com>"]
+license = "MIT"
+description = "Python bindings for ann-search-rs"
+publish = false
+
+# Own workspace root. The repo root has no `[workspace]` table, so cargo would
+# walk past it today, but that is accidental rather than intended.
+[workspace]
+
+[lib]
+name = "_ann_search"
+crate-type = ["cdylib"]
+
+[features]
+## On by default. The published wheel carries the GPU indices, because the
+## backend is wgpu rather than CUDA: there is no driver runtime to ship, and the
+## whole thing costs about 3 MB. Splitting it into a second distribution buys
+## nothing at that price.
+default = ["gpu"]
+
+## Bind the CubeCL/wgpu GPU indices alongside the CPU ones. Fixed at wheel-build
+## time: a Python extra cannot switch it, since extras only add Python
+## requirements and never change the compiled artefact. Build with
+## `--no-default-features` for a CPU-only wheel roughly a third the size.
+gpu = ["ann-search-rs/gpu", "dep:cubecl"]
+
+[dependencies]
+ann-search-rs = { path = "..", default-features = false, features = ["serialise", "synthetic"] }
+cubecl = { version = "0.10.0", features = ["wgpu", "cpu"], optional = true }
+num-traits = "0.2"
+faer = "0.23.2"
+numpy = "0.29"
+pyo3 = { version = "0.29", features = ["extension-module", "abi3-py310"] }
+rayon = "1.11"
+tempfile = "3.24"
+
+# Profiles are only read from the workspace root, and this is its own workspace,
+# so the library crate's `lto = true, codegen-units = 1` does not reach here.
+# Thin LTO gets nearly all of the win: the hot SIMD kernels are already inlined
+# within their own crate, and the pyo3 shim is not hot.
+[profile.release]
+lto = "thin"
+codegen-units = 1
+# Must stay unwind. pyo3 catches panics at the FFI boundary.
+panic = "unwind"
+
+# `maturin develop` builds dev by default, and a debug-speed index is useless.
+[profile.dev]
+opt-level = 2

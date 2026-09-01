@@ -30,6 +30,38 @@ use crate::prelude::*;
 // Helpers //
 /////////////
 
+/// Pack per-query results into the crate's `KnnOptionResult` shape
+///
+/// Applies [`fix_neg_dist`] on the way through, so every query path funnelling
+/// through here returns non-negative distances. Paths that scatter results back
+/// into original positions cannot use this and should call `fix_neg_dist`
+/// directly.
+///
+/// ### Params
+///
+/// * `results` - Per-query `(indices, distances)` pairs
+/// * `return_dist` - Whether the distances are kept
+///
+/// ### Returns
+///
+/// A tuple of `(knn_indices, optional distances)`
+pub(crate) fn pack_knn_results<T>(
+    results: Vec<(Vec<usize>, Vec<T>)>,
+    return_dist: bool,
+) -> (Vec<Vec<usize>>, Option<Vec<Vec<T>>>)
+where
+    T: num_traits::Zero + PartialOrd,
+{
+    if return_dist {
+        let (indices, distances): (Vec<Vec<usize>>, Vec<Vec<T>>) = results.into_iter().unzip();
+        let mut distances = Some(distances);
+        fix_neg_dist(&mut distances);
+        (indices, distances)
+    } else {
+        (results.into_iter().map(|(idx, _)| idx).collect(), None)
+    }
+}
+
 /// Type alias for flattened structure
 pub type FlattenData<T> = (Vec<T>, usize, usize);
 

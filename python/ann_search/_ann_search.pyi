@@ -1,0 +1,141 @@
+"""Type stubs for the compiled core.
+
+Every handle exposes the same shape, so the surface is described once on
+`_Handle` and the concrete classes just alias it with their own `build`.
+`build` differs per algorithm and is left untyped here rather than repeated
+thirteen times; the estimator classes in `indices.py` are the typed surface.
+"""
+
+from pathlib import Path
+from typing import Any
+
+import numpy as np
+
+__version__: str
+__core_version__: str
+
+class AnnSearchError(Exception):
+    """Base class for every error raised by the Rust core."""
+
+class IndexIoError(AnnSearchError):
+    """An index bundle is missing, truncated, or of the wrong kind or dtype."""
+
+def set_num_threads(n: int, /) -> None: ...
+def num_threads() -> int: ...
+def gpu_available() -> bool: ...
+def make_clustered(
+    n_samples: int, dim: int, n_clusters: int, seed: int, /
+) -> tuple[np.ndarray, np.ndarray]: ...
+def make_correlated(
+    n_samples: int, dim: int, n_clusters: int, seed: int, cor_strength: float | None, /
+) -> tuple[np.ndarray, np.ndarray]: ...
+def make_low_rank(
+    n_samples: int, dim: int, n_clusters: int, intrinsic_dim: int, seed: int, /
+) -> tuple[np.ndarray, np.ndarray]: ...
+def make_cell_embeddings(
+    n_samples: int, dim: int, n_clusters: int, seed: int, /
+) -> tuple[np.ndarray, np.ndarray]: ...
+def subsample_queries(x: np.ndarray, n_samples: int, seed: int, /) -> np.ndarray: ...
+
+class _Handle:
+    @property
+    def dtype(self) -> str: ...
+    @property
+    def n_samples(self) -> int: ...
+    @property
+    def dim(self) -> int: ...
+    @staticmethod
+    def build(x: np.ndarray, **kwargs: Any) -> Any: ...
+    def query(
+        self,
+        q: np.ndarray,
+        k: int,
+        *,
+        return_distance: bool = ...,
+        verbose: bool = ...,
+        **kwargs: Any,
+    ) -> tuple[np.ndarray, np.ndarray | None]: ...
+    def query_self(
+        self,
+        k: int,
+        *,
+        return_distance: bool = ...,
+        verbose: bool = ...,
+        **kwargs: Any,
+    ) -> tuple[np.ndarray, np.ndarray | None]: ...
+    def save(self, path: Path, /) -> None: ...
+    @staticmethod
+    def load(path: Path, /) -> Any: ...
+    def __getstate__(self) -> bytes: ...
+    @staticmethod
+    def from_bytes(state: bytes, /) -> Any: ...
+
+class _ExtractHandle:
+    """Read-back of a graph the index already holds.
+
+    Only the two descent handles converge on a kNN graph and keep it, so this
+    sits apart from `_Handle` rather than on it.
+    """
+
+    def extract_knn(
+        self,
+        k: int | None = ...,
+        *,
+        include_self: bool = ...,
+        return_distance: bool = ...,
+    ) -> tuple[np.ndarray, np.ndarray | None]: ...
+
+class Annoy(_Handle): ...
+class BallTree(_Handle): ...
+class Exhaustive(_Handle): ...
+class Hnsw(_Handle): ...
+class Ivf(_Handle): ...
+class KdTree(_Handle): ...
+class Kmknn(_Handle): ...
+
+class Lsh(_Handle):
+    @property
+    def num_projections(self) -> int: ...
+    @property
+    def slot_bits(self) -> int: ...
+
+class NnDescent(_Handle, _ExtractHandle): ...
+class Nsg(_Handle): ...
+class RnnDescent(_Handle): ...
+class Soar(_Handle): ...
+class Vamana(_Handle): ...
+
+# GPU handles. Present only in a build with the Rust `gpu` feature, hence the
+# guard in `__init__.py`. They share the query surface but not the persistence
+# one: no `save`, `load`, `__getstate__` or `from_bytes`.
+
+class _GpuHandle:
+    @property
+    def dtype(self) -> str: ...
+    @property
+    def n_samples(self) -> int: ...
+    @property
+    def dim(self) -> int: ...
+    @staticmethod
+    def build(x: np.ndarray, **kwargs: Any) -> Any: ...
+    def query(
+        self,
+        q: np.ndarray,
+        k: int,
+        *,
+        return_distance: bool = ...,
+        verbose: bool = ...,
+        **kwargs: Any,
+    ) -> tuple[np.ndarray, np.ndarray | None]: ...
+    def query_self(
+        self,
+        k: int,
+        *,
+        return_distance: bool = ...,
+        verbose: bool = ...,
+        **kwargs: Any,
+    ) -> tuple[np.ndarray, np.ndarray | None]: ...
+
+class CagraGpu(_GpuHandle, _ExtractHandle): ...
+class ExhaustiveGpu(_GpuHandle): ...
+class IvfGpu(_GpuHandle): ...

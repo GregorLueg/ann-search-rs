@@ -2,7 +2,7 @@
 //! quantisation and uses Voronoi cells to identify the most interesting
 //! candidates.
 
-use faer::{RowRef};
+use faer::RowRef;
 use rayon::prelude::*;
 use std::collections::BinaryHeap;
 use std::sync::atomic::AtomicUsize;
@@ -498,6 +498,7 @@ where
             }
         }
 
+        fix_neg_dist(&mut final_dists);
         Ok((final_indices, final_dists))
     }
 

@@ -16,7 +16,7 @@ might add the option to add/remove vectors from some of the indices.
 - [Description](#description)
 - [Features](#features)
 - [Installation](#installation)
-- [Roadmap](#roadmap)
+- [Example usage](#example-usage)
 - [Gridsearches and performance](#running-the-grid-searches)
 - [FEATURE: quantisation](#quantised-indices)
 - [FEATURE: GPU acceleration](#gpu)
@@ -53,7 +53,8 @@ anticipated. If you want to see what changed, please check this
   (heavily inspired by [PyNNDescent](https://github.com/lmcinnes/pynndescent)).
   - *Navigating Spread-out Graph (NSG)*
   - *Relative NN-Descent*
-  - *Vanama (the graph powering DiskANN)*
+  - *SOAR (IVF with spilled secondary assignments)*
+  - *Vamana (the graph powering DiskANN)*
 
 - **Distance metrics**:
   - Euclidean
@@ -69,15 +70,22 @@ anticipated. If you want to see what changed, please check this
   with its shape. Rows are always samples, columns are always features.
 
 - **Quantised indices** (optional feature):
-  - *BF16* (brain floating point 16 quantisation for exhaustive and IVF)
-  - *SQ8* (int8 quantisation for exhaustive and IVF)
-  - *PQ* (product quantisation for IVF)
-  - *OPQ* (optimised product quantisation for IVF)
+  - *BF16* (brain float 16 storage for exhaustive and IVF)
+  - *SQ8* (uniform 8-bit quantisation for exhaustive, IVF and HNSW)
+  - *PQ* (product quantisation for exhaustive and IVF)
+  - *OPQ* (optimised product quantisation for exhaustive and IVF)
+  - *SOAR-PQ* and *SOAR-OPQ* (the above with spilled secondary assignments)
 
 - **GPU-accelerated indices** (optional feature):
   - *Exhaustive flat index with GPU acceleration*
   - *IVF (Inverted File index) with GPU acceleration*
   - *CAGRA style index*
+  - *NN-Descent kNN-graph builders, plain and clustered for datasets past the
+    device's per-binding limit*
+
+- **Self-kNN graph generation**: NN-Descent on CPU and GPU hands back the graph
+  it built during construction, no search pass needed. See the
+  [kNN-graph benchmarks](https://github.com/GregorLueg/ann-search-rs/blob/main/docs/benchmarks_knn_graph.md).
 
 - **(Near) Binarised indices** (optional feature):
   - *Binary* (different types of binary quantisations for exhaustive and IVF
@@ -98,12 +106,19 @@ ann-search-rs = "*"
 
 With version `"0.4.2"` some breaking API changes were introduced: this harmonise
 several of the functions and avoid panics in favour of errors. A key change
-was also the update to cubecl `"0.1.0"` which changes quite a few APIs for the
+was also the cubecl version bump, which changes quite a few APIs for the
 GPU-accelerated version.
 
 Version `"0.6.0"` opened up the inputs via the `AnnMatrix` trait. Existing code
 passing faer matrices keeps working unchanged, but a few of the lower-level
 binariser and quantiser constructors now take flat slices instead of a `MatRef`.
+
+The SQ8 indices were rebuilt on a shared-scale `u8` quantiser. The old
+per-dimension scales did not cancel in a code-to-code distance, so the index was
+ranking by the wrong quantity: recall@10 on 128-D synthetic cell embeddings goes
+0.26 to 0.95, and the exhaustive scan is now faster than `f32` rather than
+slower. `build_exhaustive_sq8_index` and `build_ivf_sq8_index` gained an
+`Option<UniformQuantParams>`; `ScalarQuantiser` is gone.
 
 ## Example Usage
 
@@ -223,8 +238,9 @@ cargo run --example gridsearch_annoy --release -- --n-samples 500000 --dim 32 --
 # --n-clusters 25
 # --k 15
 # --seed 42
-# --distance cosine
+# --distance euclidean
 # --data gaussian
+# --intrinsic-dim 16   (lowrank data only)
 ```
 
 Every index is trained on 150k samples with 32 dimensions distance and 25 distinct
@@ -234,42 +250,42 @@ generation. Below are the results shown for `Annoy` with the GaussianNoise
 data sets.
 
 ```
-===================================================================================================================================
+=====================================================================================================================================================
 Benchmark: 150k samples, 32D
-===================================================================================================================================
-Method                                               Build (ms)   Query (ms)   Total (ms)     Recall@k Mean dist ratio    Size (MB)
------------------------------------------------------------------------------------------------------------------------------------
-Exhaustive (query)                                         3.07     1_512.56     1_515.63       1.0000          1.0000        18.31
-Exhaustive (self)                                          3.07    15_883.64    15_886.71       1.0000          1.0000        18.31
-Annoy-nt5-s:auto (query)                                  81.78        63.93       145.71       0.7410          1.0235        31.96
-Annoy-nt5-s:10x (query)                                   81.78        39.44       121.22       0.5881          1.0505        31.96
-Annoy-nt5-s:5x (query)                                    81.78        24.35       106.13       0.4530          1.0933        31.96
-Annoy-nt5 (self)                                          81.78       350.63       432.41       0.7393          1.0237        31.96
-Annoy-nt10-s:auto (query)                                117.23       112.86       230.09       0.8963          1.0068        44.46
-Annoy-nt10-s:10x (query)                                 117.23        76.48       193.71       0.7595          1.0205        44.46
-Annoy-nt10-s:5x (query)                                  117.23        46.14       163.37       0.6031          1.0464        44.46
-Annoy-nt10 (self)                                        117.23       690.51       807.74       0.8954          1.0068        44.46
-Annoy-nt15-s:auto (query)                                170.86       158.72       329.59       0.9552          1.0024        60.83
-Annoy-nt15-s:10x (query)                                 170.86       106.63       277.50       0.8532          1.0101        60.83
-Annoy-nt15-s:5x (query)                                  170.86        68.97       239.83       0.7026          1.0278        60.83
-Annoy-nt15 (self)                                        170.86     1_040.97     1_211.83       0.9537          1.0025        60.83
-Annoy-nt25-s:auto (query)                                258.99       253.76       512.74       0.9895          1.0005        70.08
-Annoy-nt25-s:10x (query)                                 258.99       169.26       428.24       0.9386          1.0033        70.08
-Annoy-nt25-s:5x (query)                                  258.99       111.95       370.93       0.8206          1.0128        70.08
-Annoy-nt25 (self)                                        258.99     1_690.02     1_949.00       0.9891          1.0005        70.08
-Annoy-nt50-s:auto (query)                                510.87       458.09       968.96       0.9994          1.0000       120.71
-Annoy-nt50-s:10x (query)                                 510.87       313.73       824.60       0.9890          1.0004       120.71
-Annoy-nt50-s:5x (query)                                  510.87       218.49       729.36       0.9364          1.0032       120.71
-Annoy-nt50 (self)                                        510.87     3_246.34     3_757.21       0.9994          1.0000       120.71
-Annoy-nt75-s:auto (query)                                714.24       723.99     1_438.22       0.9999          1.0000       218.84
-Annoy-nt75-s:10x (query)                                 714.24       548.36     1_262.59       0.9974          1.0001       218.84
-Annoy-nt75-s:5x (query)                                  714.24       437.78     1_152.01       0.9725          1.0012       218.84
-Annoy-nt75 (self)                                        714.24     5_215.59     5_929.82       1.0000          1.0000       218.84
-Annoy-nt100-s:auto (query)                               912.43       905.49     1_817.92       1.0000          1.0000       221.97
-Annoy-nt100-s:10x (query)                                912.43       662.54     1_574.97       0.9993          1.0000       221.97
-Annoy-nt100-s:5x (query)                                 912.43       567.15     1_479.58       0.9868          1.0005       221.97
-Annoy-nt100 (self)                                       912.43     7_335.82     8_248.24       1.0000          1.0000       221.97
------------------------------------------------------------------------------------------------------------------------------------
+=====================================================================================================================================================
+Method                                               Build (ms)   Query (ms)   Total (ms)     Recall@k Mean dist ratio Median dist ratio    Size (MB)
+-----------------------------------------------------------------------------------------------------------------------------------------------------
+Exhaustive (query)                                        11.76       740.41       752.18       1.0000          1.0000            1.0000        18.31
+Exhaustive (self)                                         11.76     6_801.54     6_813.30       1.0000          1.0000            1.0000        18.31
+Annoy-nt5-s:auto (query)                                  93.50        64.67       158.17       0.7410          1.0235            1.0183        31.96
+Annoy-nt5-s:10x (query)                                   93.50        41.78       135.27       0.5881          1.0505            1.0460        31.96
+Annoy-nt5-s:5x (query)                                    93.50        26.80       120.30       0.4530          1.0933            1.0883        31.96
+Annoy-nt5 (self)                                          93.50       354.42       447.92       0.7393          1.0237            1.0186        31.96
+Annoy-nt10-s:auto (query)                                120.16       122.36       242.51       0.8963          1.0068            1.0027        44.46
+Annoy-nt10-s:10x (query)                                 120.16        76.11       196.27       0.7595          1.0205            1.0158        44.46
+Annoy-nt10-s:5x (query)                                  120.16        48.27       168.43       0.6031          1.0464            1.0419        44.46
+Annoy-nt10 (self)                                        120.16       735.72       855.87       0.8954          1.0068            1.0027        44.46
+Annoy-nt15-s:auto (query)                                174.82       182.52       357.34       0.9552          1.0024            1.0000        60.83
+Annoy-nt15-s:10x (query)                                 174.82       114.65       289.48       0.8532          1.0101            1.0059        60.83
+Annoy-nt15-s:5x (query)                                  174.82        73.67       248.49       0.7026          1.0278            1.0234        60.83
+Annoy-nt15 (self)                                        174.82     1_089.35     1_264.18       0.9537          1.0025            1.0000        60.83
+Annoy-nt25-s:auto (query)                                277.58       272.40       549.98       0.9895          1.0005            1.0000        70.08
+Annoy-nt25-s:10x (query)                                 277.58       195.64       473.22       0.9386          1.0033            1.0000        70.08
+Annoy-nt25-s:5x (query)                                  277.58       119.14       396.72       0.8206          1.0128            1.0086        70.08
+Annoy-nt25 (self)                                        277.58     1_805.05     2_082.63       0.9891          1.0005            1.0000        70.08
+Annoy-nt50-s:auto (query)                                523.89       515.63     1_039.52       0.9994          1.0000            1.0000       120.71
+Annoy-nt50-s:10x (query)                                 523.89       368.84       892.74       0.9890          1.0004            1.0000       120.71
+Annoy-nt50-s:5x (query)                                  523.89       248.16       772.05       0.9364          1.0032            1.0000       120.71
+Annoy-nt50 (self)                                        523.89     3_624.74     4_148.63       0.9994          1.0000            1.0000       120.71
+Annoy-nt75-s:auto (query)                                786.99       782.68     1_569.67       0.9999          1.0000            1.0000       218.84
+Annoy-nt75-s:10x (query)                                 786.99       528.93     1_315.92       0.9974          1.0001            1.0000       218.84
+Annoy-nt75-s:5x (query)                                  786.99       371.86     1_158.85       0.9725          1.0012            1.0000       218.84
+Annoy-nt75 (self)                                        786.99     5_078.66     5_865.64       1.0000          1.0000            1.0000       218.84
+Annoy-nt100-s:auto (query)                               965.92       943.70     1_909.63       1.0000          1.0000            1.0000       221.97
+Annoy-nt100-s:10x (query)                                965.92       641.75     1_607.67       0.9993          1.0000            1.0000       221.97
+Annoy-nt100-s:5x (query)                                 965.92       418.09     1_384.01       0.9868          1.0005            1.0000       221.97
+Annoy-nt100 (self)                                       965.92     6_843.80     7_809.73       1.0000          1.0000            1.0000       221.97
+-----------------------------------------------------------------------------------------------------------------------------------------------------
 ```
 
 Detailed benchmarks on all the "standard" CPU-based indices can be found
@@ -290,20 +306,23 @@ re-ranking on the full vectors (yet) for these quantised indices.
   quantisation. In this case the `f32` or `f64` are transformed during storage
   into `bf16` floats. These keep the range of `f32`; however, they reduce
   precision.
-- *SQ8*: A scalar quantisation to `i8`. Exhaustive and IVF indices are provided.
-  For each dimensions in the data, the min and max values are being computed and
-  the respective data points are projected to integers between `-128` to `127`.
-  This enables fast integer math; however, this comes at cost of recall of the
-  real nearest neighbours.
+- *SQ8*: Uniform scalar quantisation to `u8`, with a per-dimension offset and a
+  **single scale shared across every dimension**. That shared scale is what makes
+  the integer distance between two codes preserve the ordering of the float one,
+  so one kernel serves both index construction and query. 4x smaller than `f32`
+  and faster to scan, since the arithmetic is integer. Exhaustive, IVF and HNSW
+  indices are provided.
 - *PQ*: Uses product quantisation. Useful when the dimensions of the vectors
   are incredibly large and one needs to compress the index in memory even
   further. Only useful when dim ≥ 128 in most cases and ideal for very large
   dimensions. Exhaustive and IVF are available with product quantisation.
   Exhaustive PQ is not recommend due to worse performance across the board
   compared to IVF-PQ – the index was added for completeness.
-- *OPQ*: Uses optimised product quantisation. Tries to de-correlate the
-  residuals and can in times improve the Recall. Please see the benchmarks.
-  Same indices available as for PQ.
+- *OPQ*: Optimised product quantisation. Learns a rotation to de-correlate the
+  residuals before the subvector split. Same indices as for PQ.
+- *SOAR-PQ / SOAR-OPQ*: IVF-PQ and IVF-OPQ where each vector is written into two
+  cells rather than one. PQ has to rebuild an ADC lookup table per probed cell,
+  so pulling twice the candidates out of one cell can beat probing two.
 
 The benchmarks can be found
 [here](https://github.com/GregorLueg/ann-search-rs/blob/main/docs/benchmarks_quantised.md).
@@ -316,14 +335,18 @@ ann-search-rs = { version = "*", features = ["quantised"] }
 
 ## GPU
 
-Three indices are also implemented in GPU-accelerated versions. A
-GPU-accelerated exhaustive and IVF index. And a new addition with release
-`0.2.6` a [CAGRA-style index](https://arxiv.org/abs/2308.15136). Under the hood,
-this use [cubecl](https://github.com/tracel-ai/cubecl) with wgpu backend (which
-makes them largely agnostic to the type of hardware), for details please check
-[here](https://burn.dev/books/cubecl/getting-started/installation.html)). The
-benchmarks can be found
-[here](https://github.com/GregorLueg/ann-search-rs/blob/main/docs/benchmarks_gpu.md).
+GPU-accelerated exhaustive and IVF indices, a
+[CAGRA-style index](https://arxiv.org/abs/2308.15136) added in `0.2.6`, and two
+raw kNN-graph builders: `build_knn_graph_gpu` for anything that fits the
+device's per-binding limit, and `build_clustered_knn_graph_gpu` for anything
+past it. Under the hood this uses
+[cubecl](https://github.com/tracel-ai/cubecl) with the wgpu backend, which makes
+it largely agnostic to the hardware; see
+[the cubecl docs](https://burn.dev/books/cubecl/getting-started/installation.html)
+for details. Benchmarks are
+[here](https://github.com/GregorLueg/ann-search-rs/blob/main/docs/benchmarks_gpu.md),
+with the kNN-graph paths split out
+[here](https://github.com/GregorLueg/ann-search-rs/blob/main/docs/benchmarks_knn_graph.md).
 To unlock GPU-acceleration, please use:
 
 ```toml
@@ -334,15 +357,14 @@ ann-search-rs = { version = "*", features = ["gpu"] }
 ## Binarised indices
 
 For the most extreme compression needs, binary indices are also provided. There
-are two approaches for binarisation available in the crate:
+are three approaches for binarisation available in the crate:
 
 - Bitwise binarisation either leveraging a SimHash random projection, PCA
-  hashing or sign-based binarisation. Sign bits taken in the global frame tell
-  you which cluster a point sits in, not where it sits inside that cluster, and
-  the latter is what a kNN search needs. SimHash and PCA hashing centre on a
-  per-feature mean; sign-based centres only on an IVF index, where it takes the
-  residual against each vector's own cell centroid. Both are trades rather than
-  free wins, see `CHANGELOG.md` for the regimes where each helps and hurts.
+  hashing or sign-based binarisation. SimHash and PCA hashing centre on a
+  per-feature mean; sign-based does not centre at all, so it wants
+  high-dimensional data with mixed signs. A sign-based index unlocks the
+  asymmetric query path, which re-sorts the Hamming candidates on a float query
+  against the binary codes before anything touches disk.
 - [RaBitQ](https://arxiv.org/abs/2405.12497) binarisation while storing
   additional data for approximate distance calculations.
 - [TurboQuant](https://arxiv.org/abs/2504.19874) a data-oblivious quantiser that

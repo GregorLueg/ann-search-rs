@@ -93,26 +93,28 @@ pub enum AnnSearchErrors {
         /// Vectors available for training
         n_samples: usize,
     },
+    /// Tail-trim fraction outside the permitted range
+    #[cfg(feature = "quantised")]
+    #[error("The drop ratio ({drop_ratio}) must be a finite value in [0, 0.5).")]
+    InvalidDropRatio {
+        /// Chosen fraction trimmed from each tail
+        drop_ratio: f64,
+    },
+    /// Quantiser calibration was handed an empty dataset
+    #[cfg(feature = "quantised")]
+    #[error("Cannot calibrate a quantiser on {n} vectors of dimensionality {dim}.")]
+    EmptyCalibrationSet {
+        /// Number of vectors supplied
+        n: usize,
+        /// Dimensionality supplied
+        dim: usize,
+    },
 
     // -- binary errors --
     /// Asymmetric queries are only supported with sign-based binarisation
     #[cfg(feature = "binary")]
     #[error("Only sign-based binarisation is supported for asymmetric queries")]
     AsymmetricQueryMisMatch,
-
-    /// Residual encoding is only defined for sign-based binarisation
-    #[cfg(feature = "binary")]
-    #[error("Only sign-based binarisation supports residual encoding")]
-    ResidualEncodingUnsupported,
-
-    /// Residual codes cannot be compared across Voronoi cells
-    #[cfg(feature = "binary")]
-    #[error(
-        "A sign-based IVF binary index stores codes relative to each cell's centroid, so \
-         they are only comparable within a cell. Building a full kNN graph from it needs \
-         the float vectors: build the index with build_with_vector_store()."
-    )]
-    ResidualCodesRequireVectorStore,
 
     /// Error when n-bits is not a multiple of 8
     #[cfg(feature = "binary")]
@@ -126,6 +128,16 @@ pub enum AnnSearchErrors {
     #[cfg(feature = "binary")]
     #[error("Vector store is not available. Use build_with_vector_store() to enable reranking.")]
     VectorStoreNotAvailable,
+
+    /// An output buffer handed to a batch encoder is the wrong length
+    #[cfg(feature = "binary")]
+    #[error("Buffer must hold {expected} elements; it holds {actual}.")]
+    BufferLengthMismatch {
+        /// Length the callee requires
+        expected: usize,
+        /// Length the caller supplied
+        actual: usize,
+    },
 
     /// Size mismatch error for locally stored files
     #[cfg(feature = "binary")]

@@ -2,7 +2,7 @@
 //! leverages Voronoi cells to reduce the search space.
 
 use bytemuck::Pod;
-use faer::{RowRef};
+use faer::RowRef;
 use faer_traits::ComplexField;
 use num_traits::{Float, FromPrimitive};
 use rayon::prelude::*;
@@ -19,6 +19,7 @@ use crate::binary::rabitq::*;
 use crate::binary::vec_store::*;
 use crate::prelude::*;
 use crate::utils::k_means_utils::*;
+use crate::utils::pack_knn_results;
 
 /// IVF index with RaBitQ quantisation
 ///
@@ -447,33 +448,51 @@ where
         // Expand nprobe to cover >= k reachable vectors so the query never
         // short-returns due to small/empty cells.
         let mut cluster_dists = self.get_centroids_prenorm(&query_normalised, nprobe);
-        let probed =
-            select_probed_clusters(&mut cluster_dists, &self.storage.offsets, nprobe, k);
+        let probed = select_probed_clusters(&mut cluster_dists, &self.storage.offsets, nprobe, k);
 
         let mut heap: BinaryHeap<(OrderedFloat<T>, usize)> = BinaryHeap::with_capacity(k + 1);
 
+        // The heap ranks on *squared* distance: the square root is monotone, so
+        // it only needs applying to the k survivors.
+        let mut block = [T::zero(); RABITQ_BLOCK];
+
+        // One rotation per query, not one per probed cluster
+        let q_rot = self.encoder.apply_rotation(&query_normalised);
+
         for c_idx in probed {
-            let centroid = self.storage.centroid(c_idx);
-            let query_encoded = self.encoder.encode_query(&query_normalised, centroid)?;
+            let query_encoded = self
+                .encoder
+                .encode_query_prerotated(&q_rot, self.storage.centroid_rotated(c_idx));
             let cluster_size = self.storage.cluster_size(c_idx);
+            let indices = self.storage.cluster_vector_indices(c_idx);
 
-            for local_idx in 0..cluster_size {
-                let dist = self.rabitq_dist(&query_encoded, c_idx, local_idx);
-                let global_idx = self.storage.cluster_vector_indices(c_idx)[local_idx];
+            let mut local_idx = 0;
+            while local_idx < cluster_size {
+                let take = RABITQ_BLOCK.min(cluster_size - local_idx);
+                let block_min =
+                    self.rabitq_block_sq(&query_encoded, c_idx, local_idx, &mut block[..take]);
 
-                if heap.len() < k {
-                    heap.push((OrderedFloat(dist), global_idx));
-                } else if dist < heap.peek().unwrap().0 .0 {
-                    heap.pop();
-                    heap.push((OrderedFloat(dist), global_idx));
+                if heap.len() < k || block_min < heap.peek().unwrap().0 .0 {
+                    for (j, &dist) in block[..take].iter().enumerate() {
+                        let global_idx = indices[local_idx + j];
+
+                        if heap.len() < k {
+                            heap.push((OrderedFloat(dist), global_idx));
+                        } else if dist < heap.peek().unwrap().0 .0 {
+                            heap.pop();
+                            heap.push((OrderedFloat(dist), global_idx));
+                        }
+                    }
                 }
+
+                local_idx += take;
             }
         }
 
         let mut results: Vec<_> = heap.into_iter().collect();
         results.sort_unstable();
 
-        Ok(results.into_iter().map(|(d, i)| (i, d.0)).unzip())
+        Ok(results.into_iter().map(|(d, i)| (i, d.0.sqrt())).unzip())
     }
 
     /// Query using a row reference
@@ -646,13 +665,7 @@ where
             })
             .collect::<Result<Vec<_>, _>>()?;
 
-        if return_dist {
-            let (indices, distances) = results.into_iter().unzip();
-            Ok((indices, Some(distances)))
-        } else {
-            let indices = results.into_iter().map(|(idx, _)| idx).collect();
-            Ok((indices, None))
-        }
+        Ok(pack_knn_results(results, return_dist))
     }
 
     /// Returns the size of the index in bytes

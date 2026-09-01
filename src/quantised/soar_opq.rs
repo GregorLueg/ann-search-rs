@@ -23,7 +23,7 @@
 //! Sun, Simcha, Simcha, Chern & Guo, arXiv:2404.00774, 2024 (SOAR);
 //! Ge, He, Ke & Sun, CVPR, 2013 (optimised product quantisation)
 
-use faer::{RowRef};
+use faer::RowRef;
 use fixedbitset::FixedBitSet;
 use rayon::prelude::*;
 use std::cell::RefCell;
@@ -689,6 +689,7 @@ where
             }
         }
 
+        fix_neg_dist(&mut final_dists);
         Ok((final_indices, final_dists))
     }
 }

@@ -23,7 +23,7 @@
 //! are not guaranteed identical to per-row `query` results.
 
 use bytemuck::Pod;
-use faer::{RowRef};
+use faer::RowRef;
 use rayon::prelude::*;
 use std::collections::{BTreeSet, BinaryHeap};
 use std::path::Path;
@@ -40,6 +40,7 @@ use crate::binary::turboquant::search::{build_query_lut, score_into_heaps, Query
 use crate::binary::vec_store::*;
 use crate::prelude::*;
 use crate::utils::k_means_utils::*;
+use crate::utils::pack_knn_results;
 
 /// One cluster's blocked SIMD layout (2-bit / 4-bit only).
 #[cfg_attr(feature = "serialise", derive(serde::Serialize, serde::Deserialize))]
@@ -386,7 +387,10 @@ where
             verbose,
         )?;
 
-        let norms: Vec<T> = vectors_flat.chunks_exact(dim).map(compute_l2_norm).collect();
+        let norms: Vec<T> = vectors_flat
+            .chunks_exact(dim)
+            .map(compute_l2_norm)
+            .collect();
 
         std::fs::create_dir_all(&save_path)?;
         let (vectors_path, norms_path) = MmapVectorStore::<T>::paths_in(&save_path);
@@ -845,13 +849,7 @@ where
             nested.into_iter().flatten().collect()
         };
 
-        if return_dist {
-            let (indices, distances) = results.into_iter().unzip();
-            Ok((indices, Some(distances)))
-        } else {
-            let indices = results.into_iter().map(|(idx, _)| idx).collect();
-            Ok((indices, None))
-        }
+        Ok(pack_knn_results(results, return_dist))
     }
 
     /// Build the full kNN graph over all stored vectors via re-ranked queries.
@@ -905,13 +903,7 @@ where
             })
             .collect::<Result<Vec<_>, _>>()?;
 
-        if return_dist {
-            let (indices, distances) = results.into_iter().unzip();
-            Ok((indices, Some(distances)))
-        } else {
-            let indices = results.into_iter().map(|(idx, _)| idx).collect();
-            Ok((indices, None))
-        }
+        Ok(pack_knn_results(results, return_dist))
     }
 
     /// Number of stored vectors.
@@ -1242,9 +1234,16 @@ mod tests {
         // 120 vectors across 30 cells -> avg 4 per cell. nprobe=1 cannot cover
         // k=20; expansion must walk more cells so the query fills k.
         let data = test_data(120, 128);
-        let index =
-            IvfTurboQuant::build(data.as_ref(), Dist::Cosine, Some(30), params(), 4, 42, false)
-                .unwrap();
+        let index = IvfTurboQuant::build(
+            data.as_ref(),
+            Dist::Cosine,
+            Some(30),
+            params(),
+            4,
+            42,
+            false,
+        )
+        .unwrap();
         let (indices, distances) = index.query(&row(&data, 0), 20, Some(1)).unwrap();
         assert_eq!(indices.len(), 20);
         assert_eq!(distances.len(), 20);

@@ -1,9 +1,9 @@
 //! Exhaustive (flat) GPU-accelerated index.
 
 use cubecl::prelude::*;
+use cubecl_utils_rs::prelude::*;
 use num_traits::Float;
 use rayon::prelude::*;
-use cubecl_utils_rs::prelude::*;
 
 use crate::gpu::dist_gpu::*;
 use crate::prelude::*;
@@ -68,7 +68,11 @@ where
     /// ### Returns
     ///
     /// Initialised exhaustive index (on GPU)
-    pub fn new(data: impl AnnMatrix<T>, metric: Dist, device: R::Device) -> Result<Self, AnnSearchErrors> {
+    pub fn new(
+        data: impl AnnMatrix<T>,
+        metric: Dist,
+        device: R::Device,
+    ) -> Result<Self, AnnSearchErrors> {
         if metric == Dist::Manhattan {
             return Err(AnnSearchErrors::DistanceNotSupported(metric));
         }
@@ -120,7 +124,12 @@ where
     /// ### Returns
     ///
     /// A tuple of `(Vec<indices>, Vec<distances>)`
-    pub fn query_batch(&self, query_mat: impl AnnMatrix<T>, k: usize, verbose: bool) -> KnnResult<T> {
+    pub fn query_batch(
+        &self,
+        query_mat: impl AnnMatrix<T>,
+        k: usize,
+        verbose: bool,
+    ) -> KnnResult<T> {
         let (vectors_query, n_query, dim_query) = query_mat.into_row_major();
         self.check_dim(dim_query)?;
 

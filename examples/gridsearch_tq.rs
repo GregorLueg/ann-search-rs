@@ -48,6 +48,7 @@ fn main() {
         total_time_ms: build_time + query_time,
         recall_at_k: 1.0,
         mean_dist_rat: 1.0,
+        median_dist_rat: 1.0,
         index_size_mb,
     });
 
@@ -64,6 +65,7 @@ fn main() {
         total_time_ms: build_time + self_query_time,
         recall_at_k: 1.0,
         mean_dist_rat: 1.0,
+        median_dist_rat: 1.0,
         index_size_mb,
     });
 
@@ -118,7 +120,16 @@ fn main() {
             query_time_ms: query_time,
             total_time_ms: build_time + query_time,
             recall_at_k: recall,
-            mean_dist_rat: f64::NAN,
+            mean_dist_rat: calculate_mean_distance_ratio(
+                true_distances.as_ref().unwrap(),
+                &exact_distances(&data, &query_data, &tq_neighbors, &cli.distance),
+                cli.k,
+            ),
+            median_dist_rat: calculate_median_distance_ratio(
+                true_distances.as_ref().unwrap(),
+                &exact_distances(&data, &query_data, &tq_neighbors, &cli.distance),
+                cli.k,
+            ),
             index_size_mb,
         });
 
@@ -129,13 +140,13 @@ fn main() {
                 bits, rerank_factor
             );
             let start = Instant::now();
-            let (tq_neighbors, tq_distances) = query_exhaustive_index_turboquant(
+            let (tq_neighbors, _) = query_exhaustive_index_turboquant(
                 query_data.as_ref(),
                 &tq_idx,
                 cli.k,
                 true,
                 Some(rerank_factor),
-                true,
+                false,
                 false,
             )
             .unwrap();
@@ -144,7 +155,12 @@ fn main() {
             let recall = calculate_recall(&true_neighbors, &tq_neighbors, cli.k);
             let dist_error = calculate_mean_distance_ratio(
                 true_distances.as_ref().unwrap(),
-                tq_distances.as_ref().unwrap(),
+                &exact_distances(&data, &query_data, &tq_neighbors, &cli.distance),
+                cli.k,
+            );
+            let dist_error_median = calculate_median_distance_ratio(
+                true_distances.as_ref().unwrap(),
+                &exact_distances(&data, &query_data, &tq_neighbors, &cli.distance),
                 cli.k,
             );
 
@@ -155,6 +171,7 @@ fn main() {
                 total_time_ms: build_time + query_time,
                 recall_at_k: recall,
                 mean_dist_rat: dist_error,
+                median_dist_rat: dist_error_median,
                 index_size_mb,
             });
         }
@@ -165,14 +182,19 @@ fn main() {
             bits
         );
         let start = Instant::now();
-        let (tq_neighbors_self, tq_distances_self) =
-            query_exhaustive_index_turboquant_self(&tq_idx, cli.k, Some(20), true, false).unwrap();
+        let (tq_neighbors_self, _) =
+            query_exhaustive_index_turboquant_self(&tq_idx, cli.k, Some(20), false, false).unwrap();
         let self_query_time = start.elapsed().as_secs_f64() * 1000.0;
 
         let recall_self = calculate_recall(&true_neighbors_self, &tq_neighbors_self, cli.k);
         let dist_error_self = calculate_mean_distance_ratio(
             true_distances_self.as_ref().unwrap(),
-            tq_distances_self.as_ref().unwrap(),
+            &exact_distances(&data, &data, &tq_neighbors_self, &cli.distance),
+            cli.k,
+        );
+        let dist_error_self_median = calculate_median_distance_ratio(
+            true_distances_self.as_ref().unwrap(),
+            &exact_distances(&data, &data, &tq_neighbors_self, &cli.distance),
             cli.k,
         );
 
@@ -183,6 +205,7 @@ fn main() {
             total_time_ms: build_time + self_query_time,
             recall_at_k: recall_self,
             mean_dist_rat: dist_error_self,
+            median_dist_rat: dist_error_self_median,
             index_size_mb,
         });
 
@@ -268,7 +291,16 @@ fn main() {
                     query_time_ms: query_time,
                     total_time_ms: build_time + query_time,
                     recall_at_k: recall,
-                    mean_dist_rat: f64::NAN,
+                    mean_dist_rat: calculate_mean_distance_ratio(
+                        true_distances.as_ref().unwrap(),
+                        &exact_distances(&data, &query_data, &approx_neighbors, &cli.distance),
+                        cli.k,
+                    ),
+                    median_dist_rat: calculate_median_distance_ratio(
+                        true_distances.as_ref().unwrap(),
+                        &exact_distances(&data, &query_data, &approx_neighbors, &cli.distance),
+                        cli.k,
+                    ),
                     index_size_mb,
                 });
             }
@@ -285,14 +317,14 @@ fn main() {
                         bits, nlist, nprobe, rerank_factor
                     );
                     let start = Instant::now();
-                    let (approx_neighbors, approx_distances) = query_ivf_index_turboquant(
+                    let (approx_neighbors, _) = query_ivf_index_turboquant(
                         query_data.as_ref(),
                         &ivf_tq_idx,
                         cli.k,
                         Some(*nprobe),
                         true,
                         Some(rerank_factor),
-                        true,
+                        false,
                         false,
                     )
                     .unwrap();
@@ -301,7 +333,12 @@ fn main() {
                     let recall = calculate_recall(&true_neighbors, &approx_neighbors, cli.k);
                     let dist_error = calculate_mean_distance_ratio(
                         true_distances.as_ref().unwrap(),
-                        approx_distances.as_ref().unwrap(),
+                        &exact_distances(&data, &query_data, &approx_neighbors, &cli.distance),
+                        cli.k,
+                    );
+                    let dist_error_median = calculate_median_distance_ratio(
+                        true_distances.as_ref().unwrap(),
+                        &exact_distances(&data, &query_data, &approx_neighbors, &cli.distance),
                         cli.k,
                     );
 
@@ -315,6 +352,7 @@ fn main() {
                         total_time_ms: build_time + query_time,
                         recall_at_k: recall,
                         mean_dist_rat: dist_error,
+                        median_dist_rat: dist_error_median,
                         index_size_mb,
                     });
                 }
@@ -327,12 +365,12 @@ fn main() {
                 bits, nprobe_self
             );
             let start = Instant::now();
-            let (approx_neighbors_self, approx_distances_self) = query_ivf_index_turboquant_self(
+            let (approx_neighbors_self, _) = query_ivf_index_turboquant_self(
                 &ivf_tq_idx,
                 cli.k,
                 Some(nprobe_self),
                 None,
-                true,
+                false,
                 false,
             )
             .unwrap();
@@ -341,7 +379,12 @@ fn main() {
             let recall_self = calculate_recall(&true_neighbors_self, &approx_neighbors_self, cli.k);
             let dist_error_self = calculate_mean_distance_ratio(
                 true_distances_self.as_ref().unwrap(),
-                approx_distances_self.as_ref().unwrap(),
+                &exact_distances(&data, &data, &approx_neighbors_self, &cli.distance),
+                cli.k,
+            );
+            let dist_error_self_median = calculate_median_distance_ratio(
+                true_distances_self.as_ref().unwrap(),
+                &exact_distances(&data, &data, &approx_neighbors_self, &cli.distance),
                 cli.k,
             );
 
@@ -352,6 +395,7 @@ fn main() {
                 total_time_ms: build_time + self_query_time,
                 recall_at_k: recall_self,
                 mean_dist_rat: dist_error_self,
+                median_dist_rat: dist_error_self_median,
                 index_size_mb,
             });
 

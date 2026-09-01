@@ -45,7 +45,7 @@ use crate::gpu::cagra_gpu_search::*;
 use crate::gpu::forest_gpu::*;
 use crate::gpu::*;
 use crate::prelude::*;
-use crate::utils::nndescent_utils::SENTINEL_PID;
+use crate::utils::nndescent_utils::{unpack_knn_graph, SENTINEL_PID};
 
 ///////////
 // Const //
@@ -53,12 +53,15 @@ use crate::utils::nndescent_utils::SENTINEL_PID;
 
 /// Max proposals per node per iteration. Overflow is silently dropped.
 pub const MAX_PROPOSALS: usize = 128;
+
 /// Default maximum number of NNDescent iterations
 pub(crate) const DEFAULT_MAX_ITERS: usize = 15;
+
 /// Default convergence threshold (fraction of k*n edges updated)
 pub(crate) const DEFAULT_DELTA: f32 = 0.001;
-/// Default sampling rate for the local join
-pub(crate) const DEFAULT_RHO: f32 = 0.5;
+
+/// Default sampling rate for the local join.
+pub(crate) const DEFAULT_RHO: f32 = 1.0;
 
 ////////////////////
 // Kernel helpers //
@@ -307,11 +310,21 @@ fn staged_pair_dist<F: Float, N: Size>(
 /// * `seed` - Random seed for neighbour generation
 /// * `use_cosine` - Whether to use cosine distance instead of squared Euclidean
 /// * `dim_lines` - Number of `Vector<F, N>` elements per vector row (comptime)
+/// * `k_comp` - Graph degree, i.e. `graph_idx.shape(1)`, as a comptime value so
+///   the working list can be a fixed-size local array (comptime)
 ///
 /// ### Returns
 ///
 /// Writes an initialised sorted kNN graph into `graph_idx` and `graph_dist`.
 /// All entries are flagged as new (MSB set).
+///
+/// ### Note
+///
+/// The insertion sort runs over thread-local arrays, not over the graph
+/// tensors. Sorting in place in global memory costs `O(k^2)` scattered
+/// read-modify-writes per node against `O(k)` here, and at `n = 500k`,
+/// `k = 45` that was 201 ms of a 1.76 s build, more than any other single
+/// launch.
 ///
 /// ### Grid mapping
 ///
@@ -326,19 +339,22 @@ pub fn init_random_graph<F: Float, N: Size>(
     seed: u32,
     #[comptime] use_cosine: bool,
     #[comptime] dim_lines: usize,
+    #[comptime] k_comp: usize,
 ) {
     let node = (CUBE_POS_Y * CUBE_COUNT_X + CUBE_POS_X) * WORKGROUP_SIZE_X + UNIT_POS_X;
     if node >= n_pts {
         terminate!();
     }
 
-    let k = graph_idx.shape(1);
     let is_new_bit = 1u32 << 31;
-    let base = node as usize * k;
+    let base = node as usize * k_comp;
+
+    let mut local_idx = Array::<u32>::new(k_comp);
+    let mut local_dist = Array::<F>::new(k_comp);
 
     let mut rng = xorshift(node ^ seed ^ 0xDEADBEEFu32);
 
-    for slot in 0..k {
+    for slot in 0..k_comp {
         rng = xorshift(rng);
         let mut pid = rng % n_pts;
         if pid == node {
@@ -355,7 +371,7 @@ pub fn init_random_graph<F: Float, N: Size>(
         // find the first position where dist < existing, scanning left to right.
         let mut insert_pos = slot;
         for j in 0..slot {
-            if dist < graph_dist[base + j] && insert_pos == slot {
+            if dist < local_dist[j] && insert_pos == slot {
                 insert_pos = j;
             }
         }
@@ -365,13 +381,18 @@ pub fn init_random_graph<F: Float, N: Size>(
             let src = slot - 1 - j;
             let dst = slot - j;
             if src >= insert_pos {
-                graph_idx[base + dst] = graph_idx[base + src];
-                graph_dist[base + dst] = graph_dist[base + src];
+                local_idx[dst] = local_idx[src];
+                local_dist[dst] = local_dist[src];
             }
         }
 
-        graph_idx[base + insert_pos] = pid | is_new_bit;
-        graph_dist[base + insert_pos] = dist;
+        local_idx[insert_pos] = pid;
+        local_dist[insert_pos] = dist;
+    }
+
+    for j in 0..k_comp {
+        graph_idx[base + j] = local_idx[j] | is_new_bit;
+        graph_dist[base + j] = local_dist[j];
     }
 }
 
@@ -1431,7 +1452,7 @@ pub fn cagra_merge_graphs(
 ///
 /// The final graph has exactly `k` neighbours per node (the user-requested
 /// degree). Internally, NNDescent runs at a higher degree (`build_k`, default
-/// `2*k`) which CAGRA then prunes down to `k`.
+/// `1.5*k`) which CAGRA then prunes down to `k`.
 pub struct NNDescentGpu<T: AnnSearchFloat + CubeclFloat, R: Runtime> {
     /// Original (unpadded) vector data, flattened row-major
     pub vectors_flat: Vec<T>,
@@ -1564,11 +1585,16 @@ where
     ///   Defaults to `1.5 * k`. Must be >= `k`.
     /// * `max_iters` - Maximum NNDescent iterations (default 15)
     /// * `n_trees` - Number of Annoy trees for graph initialisation.
-    ///   Defaults to `5 + n^0.25`, capped at 32.
+    ///   Defaults to `5 + n^0.25`, capped at 20.
     /// * `delta` - Convergence threshold as fraction of n*k (default `0.001`)
-    /// * `rho` - Sampling rate for the local join (default `0.5`)
+    /// * `rho` - Sampling rate for the local join (default `1.0`, no sampling)
+    /// * `refine_knn` - 2-hop refinement sweeps after the main NNDescent loop
+    ///   (default `0`)
     /// * `seed` - Random seed
     /// * `verbose` - Print progress
+    /// * `retain_gpu` - Keep the vectors, norms and navigational graph
+    ///   device-resident after the build so a later beam search does not
+    ///   re-upload them
     /// * `device` - CubeCL runtime device
     ///
     /// ### Returns
@@ -1702,6 +1728,7 @@ where
                 seed as u32,
                 use_cosine,
                 dim_vec,
+                build_k,
             );
         }
 
@@ -1956,8 +1983,8 @@ where
 
         let nndescent_idx = graph_idx_gpu.clone().read(&client)?;
         let nndescent_dist = graph_dist_gpu.clone().read(&client)?;
-        let pid_mask = 0x7FFFFFFFu32;
-        let sentinel = 0x7FFFFFFFusize;
+        let pid_mask = SENTINEL_PID as u32;
+        let sentinel = SENTINEL_PID;
 
         let mut knn_graph = vec![(sentinel, <T as num_traits::Float>::max_value()); n * k];
 
@@ -2110,8 +2137,7 @@ where
 
         self.check_dim(dim_query)?;
 
-        let query_params =
-            query_params.unwrap_or_else(|| CagraGpuSearchParams::from_graph(k, self.k));
+        let query_params = query_params.unwrap_or_else(|| CagraGpuSearchParams::from_k(k));
         let n_entry = query_params.get_n_entry();
         self.ensure_gpu_tensors()?;
         let client = R::client(&self._device);
@@ -2225,43 +2251,32 @@ where
     ///
     /// ### Params
     ///
+    /// * `k` - Truncate each row to this **total** length, self-edge included
+    ///   when `include_self` is set. `None` keeps the full build-time `k`.
+    /// * `include_self` - Prepend `(i, 0)` to row `i`, matching what every
+    ///   `query_*_self` and an exhaustive ground truth return. Leave unset for
+    ///   true neighbours only.
     /// * `return_dist` - Whether to include distances in the output
     ///
     /// ### Returns
     ///
-    /// `(knn_indices, optional distances)` where each inner Vec has
-    /// length `k`, sorted by distance ascending. Sentinel entries
-    /// (unfilled slots) are excluded.
-    pub fn extract_knn(&self, return_dist: bool) -> (Vec<Vec<usize>>, Option<Vec<Vec<T>>>) {
-        let sentinel = 0x7FFFFFFFusize;
-
-        let indices: Vec<Vec<usize>> = (0..self.n)
-            .map(|i| {
-                self.knn_graph[i * self.k..(i + 1) * self.k]
-                    .iter()
-                    .filter(|&&(pid, _)| pid != sentinel)
-                    .map(|&(pid, _)| pid)
-                    .collect()
-            })
-            .collect();
-
-        let distances = if return_dist {
-            Some(
-                (0..self.n)
-                    .map(|i| {
-                        self.knn_graph[i * self.k..(i + 1) * self.k]
-                            .iter()
-                            .filter(|&&(pid, _)| pid != sentinel)
-                            .map(|&(_, dist)| dist)
-                            .collect()
-                    })
-                    .collect(),
-            )
-        } else {
-            None
-        };
-
-        (indices, distances)
+    /// `(knn_indices, optional distances)`, sorted by distance ascending.
+    /// Sentinel entries (unfilled slots) are excluded, so a row can be shorter
+    /// than `k`.
+    pub fn extract_knn(
+        &self,
+        k: Option<usize>,
+        include_self: bool,
+        return_dist: bool,
+    ) -> (Vec<Vec<usize>>, Option<Vec<Vec<T>>>) {
+        unpack_knn_graph(
+            &self.knn_graph,
+            self.n,
+            self.k,
+            k,
+            include_self,
+            return_dist,
+        )
     }
 
     /// Self-query: run GPU beam search for every vector in the index.
@@ -2288,8 +2303,7 @@ where
     {
         self.ensure_gpu_tensors()?;
 
-        let query_params =
-            query_params.unwrap_or_else(|| CagraGpuSearchParams::from_graph(k, self.k));
+        let query_params = query_params.unwrap_or_else(|| CagraGpuSearchParams::from_k(k));
         let n_entry = query_params.get_n_entry();
 
         let client = R::client(&self._device);
@@ -2444,6 +2458,62 @@ pub struct KnnGraphGpu<T> {
     pub converged: bool,
 }
 
+impl<T> KnnGraphGpu<T>
+where
+    T: AnnSearchFloat,
+{
+    /// Hand back the kNN graph as per-node rows.
+    ///
+    /// This type has no query functions by design, so this is how a caller who
+    /// only wanted plain kNN output gets it without reaching into
+    /// [`Self::knn_graph`] and filtering sentinels themselves. Feeding NSG
+    /// still goes through the flat graph directly.
+    ///
+    /// ### Params
+    ///
+    /// * `k` - Truncate each row to this **total** length, self-edge included
+    ///   when `include_self` is set. `None` keeps the full build-time `k`.
+    /// * `include_self` - Prepend `(i, 0)` to row `i`, matching what every
+    ///   `query_*_self` and an exhaustive ground truth return. Leave unset for
+    ///   true neighbours only.
+    /// * `return_dist` - Whether to materialise the distances
+    ///
+    /// ### Returns
+    ///
+    /// `(knn_indices, optional distances)`, sorted by distance ascending.
+    /// Sentinel slots are dropped, so a row can be shorter than `k`.
+    pub fn extract_knn(
+        &self,
+        k: Option<usize>,
+        include_self: bool,
+        return_dist: bool,
+    ) -> (Vec<Vec<usize>>, Option<Vec<Vec<T>>>) {
+        unpack_knn_graph(
+            &self.knn_graph,
+            self.n,
+            self.k,
+            k,
+            include_self,
+            return_dist,
+        )
+    }
+
+    /// Returns the CPU-side memory footprint of the graph in bytes.
+    ///
+    /// Does not account for any GPU-resident tensors; the build releases them
+    /// before returning.
+    ///
+    /// ### Returns
+    ///
+    /// Total bytes allocated on the CPU for this struct and its owned Vecs.
+    pub fn memory_usage_bytes(&self) -> usize {
+        std::mem::size_of_val(self)
+            + self.vectors_flat.capacity() * std::mem::size_of::<T>()
+            + self.norms.capacity() * std::mem::size_of::<T>()
+            + self.knn_graph.capacity() * std::mem::size_of::<(usize, T)>()
+    }
+}
+
 /// Build a raw kNN graph on the GPU without touching the CAGRA path.
 ///
 /// Reuses every kernel that [`NNDescentGpu::build`] uses for the NNDescent
@@ -2473,7 +2543,7 @@ pub struct KnnGraphGpu<T> {
 ///   [`default_forest_trees`]
 /// * `delta` - Convergence threshold (fraction of `n*build_k` edges
 ///   updated). Defaults to 0.001
-/// * `rho` - Local-join sampling rate. Defaults to 0.5
+/// * `rho` - Local-join sampling rate. Defaults to 1.0, meaning no sampling
 /// * `refine_knn` - Number of 2-hop refinement sweeps after the main
 ///   NNDescent loop. Defaults to `0`
 /// * `seed` - RNG seed for reproducibility
@@ -2637,7 +2707,7 @@ pub fn compact_knn_rows<T>(
 where
     T: AnnSearchFloat,
 {
-    let pid_mask = 0x7FFFFFFFu32;
+    let pid_mask = SENTINEL_PID as u32;
     let sentinel = SENTINEL_PID;
 
     let mut knn_graph = vec![(sentinel, <T as num_traits::Float>::max_value()); n * k];
@@ -2664,7 +2734,6 @@ where
 
     knn_graph
 }
-
 
 /// Run the device-resident NNDescent loop and read the raw graph back.
 ///
@@ -2770,6 +2839,7 @@ where
             seed as u32,
             use_cosine,
             dim_vec,
+            build_k,
         );
     }
 
@@ -3344,7 +3414,7 @@ mod tests {
         )
         .unwrap();
 
-        let (indices, Some(distances)) = index.extract_knn(true) else {
+        let (indices, Some(distances)) = index.extract_knn(None, false, true) else {
             panic!("Expected distances");
         };
 
@@ -3358,7 +3428,7 @@ mod tests {
         }
 
         // Without distances
-        let (indices, dists) = index.extract_knn(false);
+        let (indices, dists) = index.extract_knn(None, false, false);
         assert_eq!(indices.len(), 20);
         assert!(dists.is_none());
     }
@@ -4206,7 +4276,7 @@ mod kernel_tests {
         )
         .unwrap();
 
-        let (knn_indices, _) = index.extract_knn(false);
+        let (knn_indices, _) = index.extract_knn(None, false, false);
 
         let mut total_hits = 0;
         let total_possible = n * k;

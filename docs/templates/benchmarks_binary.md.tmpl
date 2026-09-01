@@ -1,16 +1,14 @@
 ## Binarised indices benchmarks and parameter
 
-Binarised indices compress the data stored in the index structure itself via
-very aggressive quantisation to (basically) only bits. This has two impacts:
+Binarised indices push the compression to (roughly) bits. Three consequences:
 
-1. Drastic reduction in memory fingerprint of the index itself.
-2. Increased query speed in most cases as the bit-wise operations are very
-fast on modern CPUs.
-3. However, when not using any re-ranking of the top candidates, dramatically
-lower recall (less so for RaBitQ -- an excellent way of compressing vectors --
-and pending the data type TurboQuant).
+1. The index footprint collapses.
+2. Queries usually get faster, because bitwise operations are cheap on modern
+   CPUs.
+3. Without re-ranking the top candidates, recall drops hard. Less so for RaBitQ,
+   and for TurboQuant it depends on the data.
 
-The benchmarks below show scenarios with and without re-ranking. For the simple
+The benchmarks below show both, with and without re-ranking. For the simple
 binary versions use:
 
 ```bash
@@ -29,12 +27,16 @@ For TurboQuantisation
 cargo run --example gridsearch_tq --release --features binary -- --dim 512 --n-samples 50000 --data embedding
 ```
 
-Similar to the other benchmarks, index building, query against 10% slightly
-different data based on the trainings data and full kNN generation is being
-benchmarked. Index size in memory is also provided. Compared to other
-benchmarks, we will use the `"correlated"`, `"lowrank"` and `"embedding"`
-with higher dimensionality, but reduced samples (for the sake of fast'ish
-benchmarking).
+As with the other benchmarks: index build, query against a 10% subsample with
+noise added, and full self-kNN generation, plus the in-memory index size. These
+runs use `"correlated"`, `"lowrank"` and `"embedding"` at higher dimensionality
+with fewer samples, since that is where binarisation belongs.
+
+**On the distance-ratio column.** A binarised index reports an approximate
+distance, not the distance. Every ratio here is recomputed in `f32` from the
+original vectors against the neighbours the index returned, so it measures
+retrieval quality alone and the re-ranked and non-re-ranked rows sit on the same
+footing.
 
 ## Table of Contents
 
@@ -48,57 +50,66 @@ Three binarisations are offered in this crate:
 
 - **SimHash**: Projects vectors onto random hyperplanes and encodes the sign of
   each projection as a bit. The random planes are orthogonalised to improve
-  coverage of the vector space.
-- **PCA Hashing**: Uses PCA to find the axes of maximum variance in the data,
-  then binarises by taking the sign of each data point's projection onto the
-  top principal components. More expensive to build than SimHash but tends to
-  yield better recall as the projections are data-adapted rather than random.
-  If the number of requested bits exceeds the dimensionality, the excess bits
-  are filled with random orthogonal projections.
-- **Signed**: Simply encodes the sign of each embedding dimension directly as
-  a bit, meaning n_bits is fixed to the number of dimensions. Straightforward
-  but only sensible for high-dimensional data; at low dimensionality the recall
-  degrades dramatically. In the IVF version, the signed version is based on
-  the sign of the residual of the centroid to increase performance.
+  coverage of the vector space. The training data is only used to fit a
+  per-feature mean: the hyperplanes pass through the origin, so on data sitting
+  far from it every bit would otherwise land on the same side of every plane.
+- **PCA Hashing**: Fits PCA on the (centred) training data and takes the sign of
+  each point's score on a principal component as a bit. Only the leading
+  components that cumulatively explain 90% of the variance are kept, and that
+  count is capped at a sixteenth of the bit budget. The retained block is then
+  rotated by ITQ (Gong and Lazebnik, "Iterative Quantization: A Procrustean
+  Approach to Learning Binary Codes", CVPR 2011), which spreads variance evenly
+  across those bits: raw PCA loadings pile nearly all of it into the first few
+  components, leaving the trailing sign bits decided by rounding noise while
+  they still count for a full unit of Hamming distance.
 
-These indices have the option to use a VecStore that saves the original data on
-disk for fast retrieval and re-ranking. This is recommended if you wish to
-maintain reasonable recall. Generally speaking, these indices shine in very
-high-dimensional data where memory requirements become constraining.
+  Every bit past the retained block is a random orthogonal hyperplane, and that
+  padding is the normal case rather than an edge case. At 512 bits at most 32
+  are PCA bits, whatever the dimensionality. The cap is deliberate: past the
+  genuinely structured directions a random hyperplane beats a PCA one, because
+  it preserves angular distance by construction and a low-variance loading does
+  not.
 
-**Key parameters *(general)*:**
+  More expensive to build than SimHash. Whether the data-adapted bits actually
+  buy recall depends on the spectrum, so read it off the tables below rather
+  than assuming they do.
+- **Sign-based**: Simply encodes the sign of each embedding dimension directly
+  as a bit, meaning `n_bits` is fixed to the number of dimensions.
+  Straightforward but only sensible for high-dimensional data; at low
+  dimensionality the recall degrades dramatically. Codes live in one global
+  frame, on the IVF index too, so Hamming distances compare across Voronoi
+  cells and widening `nprobe` can only add candidates.
 
-- *n_bits*: Into how many bits to encode the data. The binariser has two
-  different options here to generate the bits (more on that later). As one
-  can appreciate the higher the number, the better the Recall.
-- *binarisation_init*: Three options are provided in the crate. `"random"` that
-  generates random planes that are subsequently orthogonalised, `"pca"` that
-  leverages PCA to identify axis of maximum variation or `"signed"` that just
-  uses the sign of the respective embedding dimensions (or residual for the
-  IVF). In this case, `n_bits` is set automatically to `n_dim`. Signed only
-  really makes sense if you have a lot of dimensions; otherwise, the performance
-  is not great (at all).
-- *reranking*: The Binary indices have the option to store the original vectors
-  on disk. Once Hamming distance has been leveraged to identify the most
-  interesting potential neighbours, the on-disk vectors are loaded in and the
-  results are re-ranked. A key parameter here is the reranking_factor, i.e.,
-  how many more vectors are reranked than the desired k. For example 10 means
-  that `10 * k vectors` are scored and then re-ranked. The more candidates you
-  allow here, the better the Recall. The default is `20`. In the benchmarks, we
-  will show lower versions to explore the impact here.
+These indices can keep the original vectors in a `VecStore` on disk for
+re-ranking. Recommended if you want the recall to stay usable. Their home ground
+is very high-dimensional data where memory is the binding constraint.
 
-**Key parameters *(IVF-specific)*:**
+**Tunable parameters *(general)*:**
 
-- *Number of lists (nl)*: The number of independent k-means cluster to generate.
-  If the structure of the data is unknown, people use `sqrt(n)` as a heuristic.
-- *Number of points (np)*: The number of clusters to probe during search.
-  Numbers here tend to be `sqrt(nlist)` or up to 5% of the nlist.
+- *n_bits*: How many bits to encode each vector into. More bits, better recall,
+  bigger index. For `"pca"` it also sets how many principal components can be
+  spent, since the retained count is capped at `n_bits / 16`.
+- *binarisation_init*: Three options are provided in the crate. `"random"` for
+  random planes that are subsequently orthogonalised, `"pca"` to identify axes
+  of maximum variation, or `"sign"` to just use the sign of the respective
+  embedding dimensions. In that last case
+  `n_bits` is set automatically to `n_dim`. Sign-based only really makes sense
+  if you have a lot of dimensions; otherwise the performance is not great (at
+  all). Unrecognised strings print a warning and fall back to `"random"`, so
+  watch the spelling: `"random_projections"`, `"pca_hashing"` and `"sign_based"`
+  are the accepted long forms, and `"signed"` is not one of them.
+- *reranking_factor*: Hamming distance picks the candidates, then the on-disk
+  vectors are loaded and the candidates re-scored exactly. The factor is how
+  many more than `k` get re-scored, so `10` means `10 * k` vectors. More
+  candidates, better recall. Default `20`; the grid runs lower values to show
+  what that costs.
 
-The self queries (i.e., kNN generation ) are done with `reranking_factor = 10`.
-The performance of the binarisation is very dependent on the underlying
-data. For some of the datasets we still reach decent Recalls of ≥0.8 in some
-configurations; for others not at all and the Recall rapidly drops to ~0.5
-and worse.
+**Tunable parameters *(IVF-specific)*:**
+
+- *Number of lists (nl)*: Number of k-means clusters, `sqrt(n)` as a default.
+- *Number of probes (np)*: Typically `sqrt(nlist)` or up to 5% of `nlist`.
+
+Self queries run with `reranking_factor = 10`.
 
 #### Correlated data
 
@@ -192,32 +203,23 @@ and worse.
 
 ### <u>RaBitQ (IVF and exhaustive)</u>
 
-[RaBitQ](https://arxiv.org/abs/2405.12497) is an very powerful
-quantisation that combines strong compression with excellent Recalls (even
-without re-ranking!). It works better on higher dimensions. In the case of the
-`ExhaustiveRaBitQ`, the quantiser itself generates a smaller number of centroids
-for quantisation purposes (`sqrt(n)` centroids in this case). On the other
-hand for the `IVF-RaBitQ` index, the IVF centroids are directly used for
-centroid calculations in the quantiser. The only disadvantage over the binary
-quantiser is the reduced query speed due to the more complex approximate
-distance calculation.
+[RaBitQ](https://arxiv.org/abs/2405.12497) binarises against a centroid and
+keeps enough side information to reconstruct an unbiased distance estimate, so
+it holds up without re-ranking where plain sign bits do not. Better the higher
+the dimensionality. `ExhaustiveRaBitQ` trains its own `sqrt(n)` centroids;
+`IVF-RaBitQ` reuses the IVF centroids directly. The price against a plain binary
+index is query speed, since the approximate distance is more work than a popcount.
 
-**Key parameters *(RaBitQ)*:**
+**Tunable parameters *(RaBitQ)*:**
 
-- *reranking*: The RaBitQ indices have the option to store the original vectors
-  on disk. Once the RaBitQ-specific approximated distance has been leveraged to
-  identify the most interesting potential neighbours, the on-disk vectors are
-  loaded in and the results are re-ranked. A key parameter here is the
-  reranking_factor, i.e., how many more vectors are reranked than the desired k.
-  For example 10 means that `10 * k vectors` are scored and then re-ranked. The
-  more candidates you allow here, the better the Recall.
+- *reranking_factor*: As for the binary indices. The RaBitQ estimate picks the
+  candidates, then the on-disk vectors are loaded and re-scored exactly. `10`
+  means `10 * k` vectors get re-scored.
 
-**Key parameters *(IVF-specific)*:**
+**Tunable parameters *(IVF-specific)*:**
 
-- *Number of lists (nl)*: The number of independent k-means cluster to generate.
-  If the structure of the data is unknown, people use `sqrt(n)` as a heuristic.
-- *Number of points (np)*: The number of clusters to probe during search.
-  Numbers here tend to be `sqrt(nlist)` or up to 5% of the nlist.
+- *Number of lists (nl)*: Number of k-means clusters, `sqrt(n)` as a default.
+- *Number of probes (np)*: Typically `sqrt(nlist)` or up to 5% of `nlist`.
 
 #### Correlated data
 
@@ -309,10 +311,6 @@ distance calculation.
 </code></pre>
 </details>
 
-Overall, this is a fantastic binary index that massively compresses the data,
-while still allowing for great Recalls. If you need to compress your data
-and reduce memory fingerprint, please, use RaBitQ!
-
 ### <u>TurboQuant (IVF and exhaustive)</u>
 
 [TurboQuant](https://arxiv.org/abs/2504.19874) is a scalar quantisation scheme.
@@ -331,32 +329,22 @@ same global encoding is reused and vectors are merely bucketed into cells, so
 the IVF centroids do not feed the quantiser (unlike IVF-RaBitQ). As with the
 other indices, the original vectors can be stored on disk for exact re-ranking.
 
-**Key parameters *(TurboQuant)*:**
+**Tunable parameters *(TurboQuant)*:**
 
-- *bits*: Bits per coordinate, either 2, 3, or 4. The higher the number, the
-  better the Recall, at the cost of memory. Note that 3-bit has no SIMD kernel
-  and falls back to the scalar scorer, which is markedly slower; prefer 4-bit
-  unless memory forces otherwise. In the benchmarks we show 2-bit and 4-bit.
-- *reranking*: As with the other indices, the original vectors can be stored on
-  disk. Once the TurboQuant approximated distance has identified the most
-  interesting candidates, the on-disk vectors are loaded and the results are
-  re-ranked. The reranking_factor controls how many more vectors are rescored
-  than the desired k, e.g., 10 means `10 * k vectors` are scored and then
-  re-ranked. The more candidates, the better the Recall. The default is `20`.
+- *bits*: Bits per coordinate, 2, 3 or 4. More bits, better recall, more memory.
+  3-bit has no SIMD kernel and falls back to the scalar scorer, which is
+  markedly slower, so prefer 4-bit unless memory forces otherwise. The grid runs
+  2-bit and 4-bit.
+- *reranking_factor*: As for the other indices. Default `20`.
 
-**Key parameters *(IVF-specific)*:**
+**Tunable parameters *(IVF-specific)*:**
 
-- *Number of lists (nl)*: The number of independent k-means clusters to
-  generate. If the structure of the data is unknown, people use `sqrt(n)` as a
-  heuristic.
-- *Number of points (np)*: The number of clusters to probe during search.
-  Numbers here tend to be `sqrt(nlist)` or up to 5% of the nlist.
+- *Number of lists (nl)*: Number of k-means clusters, `sqrt(n)` as a default.
+- *Number of probes (np)*: Typically `sqrt(nlist)` or up to 5% of `nlist`.
 
-The self queries (i.e., kNN generation) are done with `reranking_factor = 20`.
-You will quickly appreciate that the performance on strongly clustered data is
-very poor. This index shines especially for large dimensional data that is
-generated by neural networks: the area this index shines in and was designed
-for.
+Self queries run with `reranking_factor = 20`. The encoding is data-oblivious,
+so this one was designed for high-dimensional neural-network output rather than
+for strongly clustered data.
 
 #### Correlated data
 
@@ -447,5 +435,7 @@ for.
 <!-- BENCH:turboquant:euclidean:embedding:768:50000 -->
 </code></pre>
 </details>
+
+### Runtime info
 
 *All benchmarks were run on M1 Max MacBook Pro with 64 GB unified memory.*

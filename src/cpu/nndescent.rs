@@ -2,7 +2,7 @@
 //! implementation, PyNNDescent and EFANNA. Leverages Annoy over Kd forest for
 //! graph initialisation (when not using Manhattan distance).
 
-use faer::{RowRef};
+use faer::{linalg::matmul::matmul, Accum, MatMut, MatRef, Par, RowRef};
 use fixedbitset::FixedBitSet;
 use rand::{rngs::SmallRng, Rng, SeedableRng};
 use rayon::prelude::*;
@@ -11,8 +11,8 @@ use std::{
     cell::RefCell,
     cmp::Reverse,
     collections::BinaryHeap,
-    sync::atomic::{AtomicUsize, Ordering},
-    time::Instant,
+    sync::atomic::{AtomicU32, AtomicUsize, Ordering},
+    time::{Duration, Instant},
 };
 use thousands::*;
 
@@ -59,27 +59,448 @@ pub type QueryCandF32 = RefCell<BinaryHeap<Reverse<(OrderedFloat<f32>, usize)>>>
 /// Type alias for the query candidates for f64
 pub type QueryCandF64 = RefCell<BinaryHeap<Reverse<(OrderedFloat<f64>, usize)>>>;
 
-/// Per-thread scratch pair for `build_candidates` phase 1 sampling:
+/// Per-thread scratch pair for `build_candidates` sampling and merging:
 /// `(new_temp, old_temp)` holding `(priority, pid)` entries.
-type CandScratch = (Vec<(f64, usize)>, Vec<(f64, usize)>);
+type CandScratch = (Vec<(u64, u32)>, Vec<(u64, u32)>);
 
 ///////////////
-// MetricFn  //
+// Constants //
 ///////////////
+
+/// Target byte budget for one chunk's update batch.
+///
+/// `radix_sort_unstable` allocates a scratch buffer the same size as the batch,
+/// so the live footprint while sorting is twice this figure.
+const UPDATE_TARGET_BYTES: usize = 200 * 1024 * 1024;
+
+/// Floor on the number of source nodes per chunk.
+///
+/// Below this the per-chunk fixed costs (radix sort setup, the parallel fan-out
+/// over target segments) start to outweigh the local join itself, so the byte
+/// budget gives way.
+const MIN_CHUNK_NODES: usize = 1_024;
+
+/// Fraction of candidate pairs assumed to clear the distance threshold when
+/// sizing the *first* chunk.
+const ASSUMED_ACCEPT_RATE: f64 = 0.25;
+
+/// Cap on how much the adaptive chunk size may grow in one step.
+///
+/// One unusually quiet chunk should not blow the budget on the next.
+const CHUNK_GROWTH_LIMIT: usize = 8;
+
+/// Dimensionality below which the blocked GEMM local join is not taken.
+const NND_GEMM_MIN_DIM: usize = 96;
+
+/// Candidate-count below which the blocked GEMM local join is not taken.
+///
+/// A short candidate list makes the matmul too skinny to amortise its own
+/// setup, and the gather then buys nothing.
+const NND_GEMM_MIN_CANDIDATES: usize = 32;
+
+///////////////////
+// Build timings //
+///////////////////
+
+/// Merged candidate-list size statistics, accumulated inside the local join.
+///
+/// The join is `O(|C_new| * |C_total|)` per node, so the distribution of
+/// `|C_total|` is what sets its cost. Since `2e866da` dropped the cap on the
+/// merged forward+reverse list, that distribution is driven by the reverse
+/// in-degree tail, which is fat on hub-heavy data. Three integer ops per node
+/// against a quadratic distance loop, so this is always on rather than gated.
+#[derive(Default, Clone, Copy)]
+struct CandStats {
+    /// Merged list lengths summed over the nodes seen
+    sum: usize,
+    /// Nodes seen
+    count: usize,
+    /// Longest merged list seen
+    max: usize,
+    /// Candidate pairs whose distance was evaluated
+    pairs: u64,
+}
+
+impl CandStats {
+    /// Record one node's merged candidate list length.
+    ///
+    /// ### Params
+    ///
+    /// * `n_total` - Length of the merged new + old candidate list
+    #[inline(always)]
+    fn record(&mut self, n_total: usize) {
+        self.sum += n_total;
+        self.count += 1;
+        if n_total > self.max {
+            self.max = n_total;
+        }
+    }
+
+    /// Combine two thread-local accumulators.
+    ///
+    /// ### Params
+    ///
+    /// * `other` - Accumulator to fold in
+    ///
+    /// ### Returns
+    ///
+    /// The combined statistics.
+    fn merge(self, other: Self) -> Self {
+        Self {
+            sum: self.sum + other.sum,
+            count: self.count + other.count,
+            max: self.max.max(other.max),
+            pairs: self.pairs + other.pairs,
+        }
+    }
+}
+
+/// Per-phase wall-clock breakdown of a build, accumulated across iterations.
+///
+/// Only populated when `verbose` is set. Every phase is timed from the driving
+/// loop rather than from inside the parallel closures, so the cost is a handful
+/// of `Instant::now()` calls per iteration and nothing in the inner loops.
+///
+/// The phases partition the build: `forest` and `seed` are initialisation,
+/// the remaining four are the descent, and they sum to roughly the total.
+#[derive(Default, Clone, Copy)]
+struct BuildTimings {
+    /// RP-forest construction (Annoy, or Kd for Manhattan)
+    forest: Duration,
+    /// Seeding the flat graph by querying the forest once per node
+    seed: Duration,
+    /// Sampling forward candidates and building their reverse CSR
+    candidates: Duration,
+    /// Retiring the is-new flags of sampled edges
+    mark_old: Duration,
+    /// The local join itself: candidate gather plus pairwise distances
+    join: Duration,
+    /// Radix sorting each chunk's update batch by target
+    sort: Duration,
+    /// Merging sorted updates back into the graph rows
+    apply: Duration,
+    /// Updates emitted by the join, before deduplication or heap rejection
+    updates_emitted: usize,
+    /// Updates that actually changed a graph row
+    updates_accepted: usize,
+    /// Merged candidate list lengths summed over every node and iteration
+    cand_len_sum: usize,
+    /// Nodes contributing to `cand_len_sum`
+    cand_len_count: usize,
+    /// Longest merged candidate list seen
+    cand_len_max: usize,
+    /// Candidate pairs whose distance was evaluated
+    pairs: u64,
+}
+
+impl BuildTimings {
+    /// Total time attributed to the descent iterations.
+    fn descent(&self) -> Duration {
+        self.candidates + self.mark_old + self.join + self.sort + self.apply
+    }
+
+    /// Print the breakdown as a table, each phase against its share of the total.
+    ///
+    /// ### Params
+    ///
+    /// * `n` - Number of samples, for the per-node figures
+    /// * `k` - Neighbours per node
+    fn report(&self, n: usize, k: usize) {
+        let total = self.forest + self.seed + self.descent();
+        let secs = total.as_secs_f64().max(f64::MIN_POSITIVE);
+        let row = |name: &str, d: Duration| {
+            println!(
+                "  {:<22} {:>9.3} s  {:>5.1}%",
+                name,
+                d.as_secs_f64(),
+                100.0 * d.as_secs_f64() / secs
+            );
+        };
+
+        println!("\nNN-Descent build breakdown (n={n}, k={k}):");
+        row("forest build", self.forest);
+        row("graph seeding", self.seed);
+        row("candidates", self.candidates);
+        row("mark old", self.mark_old);
+        row("local join", self.join);
+        row("radix sort", self.sort);
+        row("apply updates", self.apply);
+        println!("  {:<22} {:>9.3} s", "total", total.as_secs_f64());
+
+        let accept = if self.updates_emitted > 0 {
+            100.0 * self.updates_accepted as f64 / self.updates_emitted as f64
+        } else {
+            0.0
+        };
+        println!(
+            "  updates: {} emitted, {} accepted ({:.2}%)",
+            self.updates_emitted.separate_with_underscores(),
+            self.updates_accepted.separate_with_underscores(),
+            accept
+        );
+
+        if self.cand_len_count > 0 {
+            println!(
+                "  merged candidate list: mean {:.1}, max {}",
+                self.cand_len_sum as f64 / self.cand_len_count as f64,
+                self.cand_len_max
+            );
+            println!(
+                "  candidate pairs evaluated: {}",
+                self.pairs.separate_with_underscores()
+            );
+        }
+    }
+}
+
+////////////////
+// Raw writes //
+////////////////
+
+/// Raw pointer wrapper for the lock-free CSR scatter in [`build_reverse_csr`].
+///
+/// Safety rests on the counting sort: every `fetch_add` on the cursor hands out
+/// a slot that no other thread can be handed, and the per-target segments
+/// partition the buffer, so no two writes ever alias.
+#[derive(Copy, Clone)]
+struct UnsafeU32Ptr(*mut u32);
+
+unsafe impl Send for UnsafeU32Ptr {}
+unsafe impl Sync for UnsafeU32Ptr {}
+
+////////////////////
+// Candidate sets //
+////////////////////
+
+/// Reverse (in-edge) adjacency of one forward candidate sample, in CSR form.
+///
+/// Built by counting sort rather than by scanning every source list once per
+/// thread, which is what the previous `Vec<Vec<usize>>` layout forced.
+struct ReverseCsr {
+    /// Row offsets, length `n + 1`
+    offsets: Vec<u32>,
+    /// Source ids grouped by target; target `i` owns `offsets[i]..offsets[i+1]`
+    data: Vec<u32>,
+}
+
+impl ReverseCsr {
+    /// Empty CSR with no rows.
+    fn new() -> Self {
+        Self {
+            offsets: Vec::new(),
+            data: Vec::new(),
+        }
+    }
+
+    /// Sources that sampled `i` into their forward candidate list.
+    ///
+    /// ### Params
+    ///
+    /// * `i` - Target node
+    ///
+    /// ### Returns
+    ///
+    /// Slice of source ids, in unspecified order.
+    #[inline]
+    fn segment(&self, i: usize) -> &[u32] {
+        let start = self.offsets[i] as usize;
+        let end = self.offsets[i + 1] as usize;
+        &self.data[start..end]
+    }
+}
+
+/// Forward samples plus their reverse adjacency for one NN-Descent iteration.
+///
+/// The forward lists live in fixed-stride flat buffers of `n * max_candidates`
+/// `u32` ids rather than `n` growable `Vec`s, and the reverse edges in CSR. The
+/// total reverse entry count equals the total forward count by construction, so
+/// the whole structure is `O(n * max_candidates)` with no per-node allocation.
+struct CandidateSets {
+    /// Slots per node in each forward buffer (equals `max_candidates`)
+    stride: usize,
+    /// New forward sample, `n * stride`; node `i` owns
+    /// `[i*stride .. i*stride + new_len[i]]`, sorted ascending by id
+    new_cands: Vec<u32>,
+    /// Valid entries per node in `new_cands`
+    new_len: Vec<u32>,
+    /// Old forward sample, same layout as `new_cands`
+    old_cands: Vec<u32>,
+    /// Valid entries per node in `old_cands`
+    old_len: Vec<u32>,
+    /// Reverse edges of the new forward sample
+    new_rev: ReverseCsr,
+    /// Reverse edges of the old forward sample
+    old_rev: ReverseCsr,
+}
+
+impl CandidateSets {
+    /// Allocate the flat buffers for `n` nodes at `stride` candidates each.
+    ///
+    /// ### Params
+    ///
+    /// * `n` - Number of nodes
+    /// * `stride` - Candidates per node (`max_candidates`)
+    ///
+    /// ### Returns
+    ///
+    /// Zeroed candidate sets, ready for the first `build_candidates` call.
+    fn new(n: usize, stride: usize) -> Self {
+        Self {
+            stride,
+            new_cands: vec![0u32; n * stride],
+            new_len: vec![0u32; n],
+            old_cands: vec![0u32; n * stride],
+            old_len: vec![0u32; n],
+            new_rev: ReverseCsr::new(),
+            old_rev: ReverseCsr::new(),
+        }
+    }
+
+    /// New forward sample of node `i`, sorted ascending by id.
+    #[inline]
+    fn new_forward(&self, i: usize) -> &[u32] {
+        let base = i * self.stride;
+        &self.new_cands[base..base + self.new_len[i] as usize]
+    }
+
+    /// Old forward sample of node `i`, sorted ascending by id.
+    #[inline]
+    fn old_forward(&self, i: usize) -> &[u32] {
+        let base = i * self.stride;
+        &self.old_cands[base..base + self.old_len[i] as usize]
+    }
+
+    /// Merge node `i`'s forward sample with its reverse edges into `out`.
+    ///
+    /// Sorted ascending and deduplicated, which is what the pair loop and the
+    /// tile gather both want.
+    ///
+    /// ### Params
+    ///
+    /// * `i` - Node whose candidate list is wanted
+    /// * `new` - Whether to merge the new lists or the old ones
+    /// * `out` - Destination scratch, cleared on entry
+    fn merged_into(&self, i: usize, new: bool, out: &mut Vec<u32>) {
+        let (fwd, rev) = if new {
+            (self.new_forward(i), self.new_rev.segment(i))
+        } else {
+            (self.old_forward(i), self.old_rev.segment(i))
+        };
+        out.clear();
+        out.reserve(fwd.len() + rev.len());
+        out.extend_from_slice(fwd);
+        out.extend_from_slice(rev);
+        out.sort_unstable();
+        out.dedup();
+    }
+}
+
+/// Deterministic random priority for the undirected edge `(u, v)`.
+///
+/// The forward sample and the reverse edge it induces have to agree on a
+/// priority, otherwise the two directions of the same edge compete on different
+/// coin flips and the cap becomes asymmetric. Deriving it from the unordered
+/// pair by hash rather than storing it alongside every reverse entry keeps the
+/// CSR down to bare ids.
+///
+/// SplitMix64 finaliser over the packed pair, mixed with the iteration seed.
+///
+/// ### Params
+///
+/// * `seed` - Per-iteration seed
+/// * `u` - One endpoint
+/// * `v` - The other endpoint
+///
+/// ### Returns
+///
+/// Uniformly distributed 64-bit priority, symmetric in `u` and `v`.
+#[inline(always)]
+fn edge_priority(seed: u64, u: u32, v: u32) -> u64 {
+    let (lo, hi) = if u < v { (u, v) } else { (v, u) };
+    let mut z =
+        ((hi as u64) << 32 | lo as u64).wrapping_add(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15));
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    z ^ (z >> 31)
+}
+
+/// Build the reverse adjacency of a fixed-stride forward candidate sample.
+///
+/// Two-pass counting sort: a parallel count into relaxed atomics, an exclusive
+/// prefix sum, then a parallel scatter through the same array reused as a write
+/// cursor. Cost is `O(total_entries)` regardless of thread count, where the
+/// previous target-range partitioning cost `O(n_threads * total_entries)`.
+///
+/// Order within a target's segment is unspecified (it depends on the atomic
+/// interleaving), which is fine because every consumer sorts the merged list
+/// before use.
+///
+/// ### Params
+///
+/// * `fwd` - Flat forward sample, `n * stride` ids
+/// * `lens` - Valid entries per node in `fwd`
+/// * `stride` - Slots per node in `fwd`
+/// * `n` - Number of nodes
+/// * `out` - CSR to overwrite
+fn build_reverse_csr(fwd: &[u32], lens: &[u32], stride: usize, n: usize, out: &mut ReverseCsr) {
+    let counts: Vec<AtomicU32> = (0..n).map(|_| AtomicU32::new(0)).collect();
+
+    (0..n).into_par_iter().for_each(|i| {
+        let base = i * stride;
+        for &j in &fwd[base..base + lens[i] as usize] {
+            counts[j as usize].fetch_add(1, Ordering::Relaxed);
+        }
+    });
+
+    out.offsets.clear();
+    out.offsets.reserve(n + 1);
+    out.offsets.push(0);
+    let mut acc: u32 = 0;
+    for c in counts.iter() {
+        acc += c.load(Ordering::Relaxed);
+        out.offsets.push(acc);
+    }
+
+    out.data.clear();
+    out.data.resize(acc as usize, 0);
+
+    // Reuse the count array as the per-target write cursor.
+    for (i, c) in counts.iter().enumerate() {
+        c.store(out.offsets[i], Ordering::Relaxed);
+    }
+
+    let data_ptr = UnsafeU32Ptr(out.data.as_mut_ptr());
+    (0..n).into_par_iter().for_each(|i| {
+        #[allow(clippy::redundant_locals)]
+        let data_ptr = data_ptr;
+        let base = i * stride;
+        for &j in &fwd[base..base + lens[i] as usize] {
+            let pos = counts[j as usize].fetch_add(1, Ordering::Relaxed) as usize;
+            // SAFETY: the cursor for target `j` starts at its segment offset
+            // and is bumped once per write, so every thread gets a distinct
+            // slot inside a segment that no other target touches.
+            unsafe { *data_ptr.0.add(pos) = i as u32 };
+        }
+    });
+}
+
+//////////////
+// MetricFn //
+//////////////
 
 /// Static-dispatch metric selector for the update kernel.
 ///
-/// The inner loops in `generate_updates_for_chunk_impl` call
-/// `M::distance_from_vec(idx, vec_p, norm_p, q)` where `M` is one of the
-/// zero-sized types below. `vec_p` (and `norm_p` for Cosine) is hoisted
-/// once per outer `p` iteration so the inner loop never re-slices the
-/// flat vector buffer or re-fetches the cached norm.
+/// The inner loop in `generate_updates_for_chunk_impl` calls
+/// `M::distance_from_tile` where `M` is one of the zero-sized types below.
+/// Both operands are rows of the gathered candidate tile, so the kernel never
+/// re-slices `vectors_flat` or re-fetches a cached norm inside the loop.
 /// Monomorphisation strips the runtime `Dist` branch out of the hot path.
 trait MetricFn<T: AnnSearchFloat> {
-    /// Distance between the hoisted vector `vec_p` (of node `p` with
-    /// pre-fetched norm `norm_p` when Cosine) and the vector at internal
-    /// index `q`.
-    fn distance_from_vec(idx: &NNDescent<T>, vec_p: &[T], norm_p: T, q: usize) -> T;
+    /// Distance between two rows of the gathered candidate tile.
+    ///
+    /// `norm_a` and `norm_b` are the pre-fetched L2 norms, meaningful for
+    /// Cosine only.
+    fn distance_from_tile(vec_a: &[T], norm_a: T, vec_b: &[T], norm_b: T) -> T;
 }
 
 /// Squared Euclidean metric.
@@ -91,27 +512,197 @@ struct ManhattanMetric;
 
 impl<T: AnnSearchFloat> MetricFn<T> for SqEuclidMetric {
     #[inline(always)]
-    fn distance_from_vec(idx: &NNDescent<T>, vec_p: &[T], _norm_p: T, q: usize) -> T {
-        let dim = idx.dim;
-        let vec_q = &idx.vectors_flat[q * dim..(q + 1) * dim];
-        T::euclidean_simd(vec_p, vec_q)
+    fn distance_from_tile(vec_a: &[T], _norm_a: T, vec_b: &[T], _norm_b: T) -> T {
+        T::euclidean_simd(vec_a, vec_b)
     }
 }
+
 impl<T: AnnSearchFloat> MetricFn<T> for CosineMetric {
     #[inline(always)]
-    fn distance_from_vec(idx: &NNDescent<T>, vec_p: &[T], norm_p: T, q: usize) -> T {
-        let dim = idx.dim;
-        let vec_q = &idx.vectors_flat[q * dim..(q + 1) * dim];
-        let dot = T::dot_simd(vec_p, vec_q);
-        T::one() - (dot / (norm_p * idx.norms[q]))
+    fn distance_from_tile(vec_a: &[T], norm_a: T, vec_b: &[T], norm_b: T) -> T {
+        let denom = norm_a * norm_b;
+        if denom > T::zero() {
+            T::one() - (T::dot_simd(vec_a, vec_b) / denom)
+        } else {
+            T::one()
+        }
     }
 }
+
 impl<T: AnnSearchFloat> MetricFn<T> for ManhattanMetric {
     #[inline(always)]
-    fn distance_from_vec(idx: &NNDescent<T>, vec_p: &[T], _norm_p: T, q: usize) -> T {
+    fn distance_from_tile(vec_a: &[T], _norm_a: T, vec_b: &[T], _norm_b: T) -> T {
+        T::manhattan_simd(vec_a, vec_b)
+    }
+}
+
+/// Keep the `cap` lowest-priority entries of `temp` and write their ids into
+/// `out`, sorted ascending.
+///
+/// `select_nth_unstable_by_key` gives the `O(len)` partial selection the full
+/// sort would not.
+///
+/// ### Params
+///
+/// * `temp` - `(priority, id)` entries, consumed and reordered
+/// * `cap` - Maximum entries to keep
+/// * `out` - Destination stride slice, at least `cap` long
+///
+/// ### Returns
+///
+/// Number of ids written into `out`.
+fn take_lowest_priority(temp: &mut Vec<(u64, u32)>, cap: usize, out: &mut [u32]) -> u32 {
+    if cap == 0 {
+        return 0;
+    }
+    if temp.len() > cap {
+        temp.select_nth_unstable_by_key(cap - 1, |&(p, _)| p);
+        temp.truncate(cap);
+    }
+    for (slot, &(_, id)) in out.iter_mut().zip(temp.iter()) {
+        *slot = id;
+    }
+    let len = temp.len().min(out.len());
+    out[..len].sort_unstable();
+    len as u32
+}
+
+/////////////////
+// JoinScratch //
+/////////////////
+
+/// Per-thread scratch for one source node's local join.
+///
+/// Everything the pair loop touches is gathered here first: the candidate
+/// vectors into one contiguous tile, and their eviction thresholds and norms
+/// into flat arrays. That turns `|C|^2 / 2` strided reads of `vectors_flat`
+/// and random reads of the graph into `|C|` of each, and gives the GEMM path
+/// the row-major operand it needs.
+///
+/// Buffers are reused across every node the thread handles, so the allocations
+/// settle after the first few nodes.
+struct JoinScratch<T> {
+    /// Merged new candidates for this node
+    new_ids: Vec<u32>,
+    /// Merged old candidates for this node
+    old_ids: Vec<u32>,
+    /// Candidate ids, new list followed by old list
+    ids: Vec<u32>,
+    /// Distance of each candidate's current worst neighbour
+    thresh: Vec<T>,
+    /// L2 norms (Cosine only; zero-filled otherwise)
+    norms: Vec<T>,
+    /// Squared L2 norms, filled only on the GEMM path
+    sq: Vec<T>,
+    /// Candidate vectors, row-major `ids.len() * dim`
+    tile: Vec<T>,
+    /// Dot products, row-major `n_new * n_total`, filled only on the GEMM path
+    dots: Vec<T>,
+}
+
+impl<T: AnnSearchFloat> JoinScratch<T> {
+    /// Empty scratch. Buffers grow to fit on the first gather.
+    fn new() -> Self {
+        Self {
+            new_ids: Vec::new(),
+            old_ids: Vec::new(),
+            ids: Vec::new(),
+            thresh: Vec::new(),
+            norms: Vec::new(),
+            sq: Vec::new(),
+            tile: Vec::new(),
+            dots: Vec::new(),
+        }
+    }
+
+    /// Merge node `node`'s candidate lists, then gather their vectors,
+    /// thresholds and norms.
+    ///
+    /// ### Params
+    ///
+    /// * `idx` - Index owning the vectors and norms
+    /// * `graph` - Current flat k-NN graph, read for the eviction thresholds
+    /// * `k` - Neighbours per node in `graph`
+    /// * `cands` - Forward samples and reverse adjacency
+    /// * `node` - Source node
+    /// * `cosine` - Whether norms are meaningful for this metric
+    ///
+    /// ### Returns
+    ///
+    /// Length of the new-candidate list, which is where the tile switches from
+    /// new to old.
+    fn gather(
+        &mut self,
+        idx: &NNDescent<T>,
+        graph: &[Neighbour<T>],
+        k: usize,
+        cands: &CandidateSets,
+        node: usize,
+        cosine: bool,
+    ) -> usize {
         let dim = idx.dim;
-        let vec_q = &idx.vectors_flat[q * dim..(q + 1) * dim];
-        T::manhattan_simd(vec_p, vec_q)
+
+        cands.merged_into(node, true, &mut self.new_ids);
+        cands.merged_into(node, false, &mut self.old_ids);
+
+        self.ids.clear();
+        self.ids.extend_from_slice(&self.new_ids);
+        self.ids.extend_from_slice(&self.old_ids);
+
+        let total = self.ids.len();
+        self.thresh.clear();
+        self.norms.clear();
+        self.tile.clear();
+        self.thresh.reserve(total);
+        self.norms.reserve(total);
+        self.tile.reserve(total * dim);
+
+        for t in 0..total {
+            let p = self.ids[t] as usize;
+            self.thresh.push(graph[p * k + k - 1].dist);
+            self.norms
+                .push(if cosine { idx.norms[p] } else { T::zero() });
+            self.tile
+                .extend_from_slice(&idx.vectors_flat[p * dim..(p + 1) * dim]);
+        }
+
+        self.new_ids.len()
+    }
+
+    /// Fill `dots` with the `n_new x n_total` dot-product block of the tile.
+    ///
+    /// Squared norms are computed here too, since only this path needs them.
+    /// The matmul stays `Par::Seq`: the chunk's rayon iterator already owns
+    /// every core.
+    ///
+    /// ### Params
+    ///
+    /// * `n_new` - Rows, the length of the new-candidate list
+    /// * `n_total` - Columns, the full candidate count
+    /// * `dim` - Vector dimensionality
+    fn compute_dots(&mut self, n_new: usize, n_total: usize, dim: usize) {
+        self.sq.clear();
+        self.sq.reserve(n_total);
+        for t in 0..n_total {
+            let v = &self.tile[t * dim..(t + 1) * dim];
+            self.sq.push(T::dot_simd(v, v));
+        }
+
+        self.dots.clear();
+        self.dots.resize(n_new * n_total, T::zero());
+
+        let lhs = MatRef::from_row_major_slice(&self.tile[..n_new * dim], n_new, dim);
+        let rhs = MatRef::from_row_major_slice(&self.tile[..n_total * dim], n_total, dim);
+        let mut out = MatMut::from_row_major_slice_mut(&mut self.dots[..], n_new, n_total);
+
+        matmul(
+            out.as_mut(),
+            Accum::Replace,
+            lhs,
+            rhs.transpose(),
+            T::one(),
+            Par::Seq,
+        );
     }
 }
 
@@ -193,6 +784,41 @@ where
         match self {
             Forest::Annoy(f) => f.query(query_vec, k, search_k),
             Forest::Kd(f) => f.query(query_vec, k, search_k),
+        }
+    }
+
+    /// Query into reusable scratch, leaving `(distance, id)` pairs sorted
+    /// nearest-first in `scratch.candidates`.
+    ///
+    /// Only the Annoy arm has an allocation-free form; the Kd arm falls back to
+    /// the allocating query and copies its result across, which keeps Manhattan
+    /// working without a second scratch type for a path that is not the
+    /// default.
+    ///
+    /// ### Params
+    ///
+    /// * `query_vec` - The query vector
+    /// * `k` - Number of neighbours to return
+    /// * `search_k` - The budget
+    /// * `scratch` - Reusable buffers, reset on entry
+    ///
+    /// ### Returns
+    ///
+    /// `Ok(())`, with results left in `scratch.candidates`.
+    fn query_into(
+        &self,
+        query_vec: &[T],
+        k: usize,
+        search_k: Option<usize>,
+        scratch: &mut AnnoyScratch<T>,
+    ) -> Result<(), AnnSearchErrors> {
+        match self {
+            Forest::Annoy(f) => f.query_into(query_vec, k, search_k, scratch),
+            Forest::Kd(f) => {
+                let (ids, dists) = f.query(query_vec, k, search_k)?;
+                scratch.set_candidates(ids.into_iter().zip(dists).map(|(i, d)| (d, i)));
+                Ok(())
+            }
         }
     }
 
@@ -412,9 +1038,10 @@ where
             Vec::new()
         };
 
+        // based on PyNNDescent... 12 seems to be good for the initialisation
         let n_trees = n_trees.unwrap_or_else(|| {
             let calculated = 5 + ((n as f64).powf(0.25)).round() as usize;
-            calculated.min(32)
+            calculated.min(12)
         });
 
         let max_iter = max_iter.unwrap_or_else(|| {
@@ -426,11 +1053,10 @@ where
         let max_candidates = max_candidates.unwrap_or(k.min(60));
 
         let start = Instant::now();
-        // Feed the forest the buffer we already flattened. Handing it the
-        // caller's matrix again would walk the whole thing a second time.
         let forest = Forest::new((&vectors_flat[..], n, dim), n_trees, metric, seed)?;
+        let forest_time = start.elapsed();
         if verbose {
-            println!("Built forest: {:.2?}", start.elapsed());
+            println!("Built forest: {forest_time:.2?}");
         }
 
         let builder = NNDescent {
@@ -446,8 +1072,15 @@ where
             original_ids: (0..n).collect(),
         };
 
-        let (build_graph, converged) =
-            builder.generate_index(k, max_iter, delta, max_candidates, seed, verbose)?;
+        let (build_graph, converged) = builder.generate_index(
+            k,
+            max_iter,
+            delta,
+            max_candidates,
+            seed,
+            forest_time,
+            verbose,
+        )?;
 
         let graph = if diversify_prob > T::zero() {
             builder.diversify_graph(&build_graph, k, diversify_prob, seed)
@@ -496,30 +1129,72 @@ where
         &self.graph
     }
 
-    /// Compute chunk size for memory-bounded update processing
-    ///
-    /// Targets roughly 200 MB of update storage per chunk based on the size
-    /// of an `Update<T>` and the expected number of updates per source node.
-    /// Clamped to at least 10k nodes (or the full dataset if smaller) and at
-    /// most the total number of nodes.
-    ///
-    /// ### Params
-    ///
-    /// * `max_candidates` - Maximum candidates sampled per node per iteration
+    /// Number of updates that fit in the per-chunk byte budget.
     ///
     /// ### Returns
     ///
-    /// Number of source nodes to process per chunk
-    fn compute_chunk_size(&self, max_candidates: usize) -> usize {
-        const TARGET_BYTES: usize = 200 * 1024 * 1024;
-        const BYTES_PER_UPDATE: usize = 24;
+    /// [`UPDATE_TARGET_BYTES`] divided by the real size of an `Update<T>`.
+    #[inline]
+    fn target_updates_per_chunk() -> usize {
+        UPDATE_TARGET_BYTES / std::mem::size_of::<Update<T>>()
+    }
 
-        let updates_per_source = max_candidates * 2;
-        let bytes_per_source = updates_per_source * BYTES_PER_UPDATE;
+    /// Opening guess at the number of source nodes per chunk.
+    ///
+    /// A source node emits one update per direction for every candidate pair
+    /// that clears the distance threshold, so the count scales with
+    /// `|C_new| * |C_total|`, not with `max_candidates`. Getting that wrong is
+    /// what let the nominal memory bound be exceeded by two orders of
+    /// magnitude; it is only a starting point regardless, since
+    /// [`Self::rescale_chunk_size`] corrects it from the second chunk on.
+    ///
+    /// ### Params
+    ///
+    /// * `max_candidates` - Cap on the merged candidate list per node
+    ///
+    /// ### Returns
+    ///
+    /// Number of source nodes to process in the first chunk.
+    fn initial_chunk_size(&self, max_candidates: usize) -> usize {
+        let pairs_per_source = 6 * max_candidates * max_candidates;
+        let updates_per_source =
+            ((pairs_per_source * 2) as f64 * ASSUMED_ACCEPT_RATE).ceil() as usize;
 
-        let chunk_size = TARGET_BYTES / bytes_per_source.max(1);
-        let min_chunk = 10_000.min(self.n);
-        chunk_size.clamp(min_chunk, self.n)
+        let lo = MIN_CHUNK_NODES.min(self.n);
+        let chunk = Self::target_updates_per_chunk() / updates_per_source.max(1);
+        chunk.clamp(lo, self.n.max(lo))
+    }
+
+    /// Rescale the chunk size against what the last chunk actually emitted.
+    ///
+    /// This is what makes the memory bound real: the accept rate falls by
+    /// orders of magnitude between the first iteration and convergence, so a
+    /// static estimate is either wildly conservative or wildly over budget.
+    ///
+    /// ### Params
+    ///
+    /// * `current` - Chunk size just used
+    /// * `sources` - Source nodes in that chunk
+    /// * `emitted` - Updates the chunk produced
+    ///
+    /// ### Returns
+    ///
+    /// Chunk size for the next chunk, clamped to
+    /// `[MIN_CHUNK_NODES, n]` and to [`CHUNK_GROWTH_LIMIT`] times `current`.
+    fn rescale_chunk_size(&self, current: usize, sources: usize, emitted: usize) -> usize {
+        let lo = MIN_CHUNK_NODES.min(self.n);
+        let hi = current
+            .saturating_mul(CHUNK_GROWTH_LIMIT)
+            .min(self.n)
+            .max(lo);
+
+        if sources == 0 || emitted == 0 {
+            return hi;
+        }
+
+        let per_source = emitted as f64 / sources as f64;
+        let next = (Self::target_updates_per_chunk() as f64 / per_source) as usize;
+        next.clamp(lo, hi)
     }
 
     /// Initialise the flat k-NN graph using the Annoy forest
@@ -539,18 +1214,15 @@ where
     fn init_with_forest(&self, k: usize) -> Result<Vec<Neighbour<T>>, AnnSearchErrors> {
         let sentinel = Neighbour::new(SENTINEL_PID, T::max_value(), false);
         let mut graph = vec![sentinel; self.n * k];
-        graph.par_chunks_mut(k).enumerate().try_for_each(
-            |(i, slot)| -> Result<(), AnnSearchErrors> {
+        let search_k = k * self.forest.n_trees();
+
+        graph.par_chunks_mut(k).enumerate().try_for_each_init(
+            AnnoyScratch::<T>::new,
+            |scratch, (i, slot)| -> Result<(), AnnSearchErrors> {
                 let query = &self.vectors_flat[i * self.dim..(i + 1) * self.dim];
-                let search_k = k * self.forest.n_trees();
-                let (indices, distances) = self.forest.query(query, k + 1, Some(search_k))?;
-                for (j, (idx, dist)) in indices
-                    .into_iter()
-                    .zip(distances)
-                    .skip(1)
-                    .take(k)
-                    .enumerate()
-                {
+                self.forest
+                    .query_into(query, k + 1, Some(search_k), scratch)?;
+                for (j, &(dist, idx)) in scratch.results().iter().skip(1).take(k).enumerate() {
                     slot[j] = Neighbour::new(idx, dist, true);
                 }
                 Ok(())
@@ -574,11 +1246,15 @@ where
     /// * `delta` - Convergence threshold (fraction of edges updated)
     /// * `max_candidates` - Max candidates sampled per node per iteration
     /// * `seed` - Random seed for per-iteration sampling
+    /// * `forest_time` - Time already spent building the RP forest, so the
+    ///   verbose breakdown can account for the whole build rather than just
+    ///   the part after the forest
     /// * `verbose` - Print progress information
     ///
     /// ### Returns
     ///
     /// Tuple of (flat graph as `(pid, dist)` pairs, converged flag)
+    #[allow(clippy::too_many_arguments)]
     fn generate_index(
         &self,
         k: usize,
@@ -586,6 +1262,7 @@ where
         delta: T,
         max_candidates: usize,
         seed: usize,
+        forest_time: Duration,
         verbose: bool,
     ) -> Result<(Vec<(usize, T)>, bool), AnnSearchErrors> {
         if verbose {
@@ -598,28 +1275,30 @@ where
 
         let mut converged = false;
 
+        let mut timings = BuildTimings {
+            forest: forest_time,
+            ..Default::default()
+        };
+
         let start = Instant::now();
         let mut graph = self.init_with_forest(k)?;
+        timings.seed = start.elapsed();
 
         if verbose {
-            println!("Queried Annoy index: {:.2?}", start.elapsed());
+            println!("Seeded graph from forest: {:.2?}", timings.seed);
         }
 
-        let chunk_size = self.compute_chunk_size(max_candidates);
-        let n_chunks = self.n.div_ceil(chunk_size);
+        let mut chunk_size = self.initial_chunk_size(max_candidates);
 
         if verbose {
             println!(
-                " Using chunk size {} ({} chunks) for memory-efficient updates",
+                " Starting chunk size {} for memory-bounded updates ({} MiB budget)",
                 chunk_size.separate_with_underscores(),
-                n_chunks
+                UPDATE_TARGET_BYTES / (1024 * 1024)
             );
         }
 
-        let mut new_cands = vec![Vec::with_capacity(max_candidates * 2); self.n];
-        let mut old_cands = vec![Vec::with_capacity(max_candidates * 2); self.n];
-        let mut new_cands_sym = vec![Vec::with_capacity(max_candidates); self.n];
-        let mut old_cands_sym = vec![Vec::with_capacity(max_candidates); self.n];
+        let mut cands = CandidateSets::new(self.n, max_candidates);
 
         for iter in 0..max_iter {
             let updates_count = AtomicUsize::new(0);
@@ -628,46 +1307,56 @@ where
             if verbose {
                 println!(" Preparing candidates for iter {}", iter + 1);
             }
-            self.build_candidates(
-                &graph,
-                k,
-                max_candidates,
-                iter_seed,
-                &mut new_cands,
-                &mut old_cands,
-                &mut new_cands_sym,
-                &mut old_cands_sym,
-            );
+            let t = Instant::now();
+            self.build_candidates(&graph, k, max_candidates, iter_seed, &mut cands);
+            timings.candidates += t.elapsed();
 
-            self.mark_as_old(&mut graph, k, &new_cands);
+            let t = Instant::now();
+            self.mark_as_old(&mut graph, k, &cands);
+            timings.mark_old += t.elapsed();
 
             if verbose {
-                println!(
-                    " Processing updates for iter {} ({} chunks)",
-                    iter + 1,
-                    n_chunks
-                );
+                println!(" Processing updates for iter {}", iter + 1);
             }
 
-            for chunk_idx in 0..n_chunks {
-                let chunk_start = chunk_idx * chunk_size;
+            let mut chunk_start = 0usize;
+            let mut n_chunks = 0usize;
+            while chunk_start < self.n {
                 let chunk_end = (chunk_start + chunk_size).min(self.n);
 
-                let mut chunk_updates = self.generate_updates_for_chunk(
-                    &new_cands,
-                    &old_cands,
-                    &graph,
-                    k,
-                    chunk_start,
-                    chunk_end,
-                );
+                let t = Instant::now();
+                let (mut chunk_updates, stats) =
+                    self.generate_updates_for_chunk(&cands, &graph, k, chunk_start, chunk_end);
+                timings.join += t.elapsed();
+                timings.updates_emitted += chunk_updates.len();
+                timings.cand_len_sum += stats.sum;
+                timings.cand_len_count += stats.count;
+                timings.cand_len_max = timings.cand_len_max.max(stats.max);
+                timings.pairs += stats.pairs;
 
+                let t = Instant::now();
                 chunk_updates.radix_sort_unstable();
+                timings.sort += t.elapsed();
 
+                let t = Instant::now();
                 self.apply_sorted_updates(&chunk_updates, &mut graph, k, &updates_count);
+                timings.apply += t.elapsed();
+
+                chunk_size = self.rescale_chunk_size(
+                    chunk_size,
+                    chunk_end - chunk_start,
+                    chunk_updates.len(),
+                );
+                chunk_start = chunk_end;
+                n_chunks += 1;
+            }
+
+            if verbose {
+                println!("  {} chunks, next chunk size {}", n_chunks, chunk_size);
             }
 
             let update_count = updates_count.load(Ordering::Relaxed);
+            timings.updates_accepted += update_count;
             let update_rate = T::from_usize(update_count).unwrap()
                 / T::from_usize(self.n * max_candidates).unwrap();
 
@@ -690,7 +1379,7 @@ where
         }
 
         if verbose {
-            println!("Total time: {:.2?}", start.elapsed());
+            timings.report(self.n, k);
         }
 
         let res = graph.into_iter().map(|n| (n.pid(), n.dist)).collect();
@@ -698,54 +1387,53 @@ where
         Ok((res, converged))
     }
 
-    /// Build candidate lists for the local join step.
+    /// Sample the forward candidate lists and build their reverse adjacency.
     ///
-    /// For each node, samples up to `max_candidates` new and old neighbours,
-    /// then adds symmetric reverse candidates to ensure connectivity.
+    /// Two passes:
+    ///
+    /// 1. Sample up to `max_candidates` new and old neighbours per node from
+    ///    its graph row, keeping the lowest-priority entries.
+    /// 2. Build the reverse adjacency of both samples as CSR
+    ///    ([`build_reverse_csr`]).
+    ///
+    /// The merge of the two is deliberately left to the join, which assembles
+    /// it per node into thread-local scratch.
     ///
     /// ### Params
     ///
     /// * `graph` - Current flat k-NN graph
     /// * `k` - Neighbours per node
-    /// * `max_candidates` - Maximum candidates to sample per node
+    /// * `max_candidates` - Cap on the forward sample
     /// * `iter_seed` - Per-iteration seed for reproducible sampling
-    /// * `new_cands` - Output: sampled new (unexplored) neighbours per node
-    /// * `old_cands` - Output: sampled old (explored) neighbours per node
-    /// * `new_cands_sym` - Output: reverse edges into `new_cands` (cleared and
-    ///   repopulated)
-    /// * `old_cands_sym` - Output: reverse edges into `old_cands` (cleared and
-    ///   repopulated)
-    #[allow(clippy::too_many_arguments)]
+    /// * `cands` - Candidate sets, overwritten in place
     fn build_candidates(
         &self,
         graph: &[Neighbour<T>],
         k: usize,
         max_candidates: usize,
         iter_seed: u64,
-        new_cands: &mut [Vec<usize>],
-        old_cands: &mut [Vec<usize>],
-        new_cands_sym: &mut [Vec<usize>],
-        old_cands_sym: &mut [Vec<usize>],
+        cands: &mut CandidateSets,
     ) {
-        // Phase 1: Parallel sampling - each thread writes only to its own node
         let n = self.n;
-        new_cands
-            .par_iter_mut()
-            .zip(old_cands.par_iter_mut())
+        let stride = cands.stride;
+
+        // Phase 1: sample the forward lists. Each node writes only its own
+        // stride slice, so this is embarrassingly parallel.
+        cands
+            .new_cands
+            .par_chunks_mut(stride)
+            .zip(cands.old_cands.par_chunks_mut(stride))
+            .zip(cands.new_len.par_iter_mut())
+            .zip(cands.old_len.par_iter_mut())
             .enumerate()
-            .for_each(|(i, (new_c, old_c))| {
+            .for_each(|(i, (((new_slot, old_slot), new_len), old_len))| {
                 CAND_SCRATCH.with(|cell| {
                     let mut b = cell.borrow_mut();
                     let (new_temp, old_temp) = &mut *b;
-
-                    new_c.clear();
-                    old_c.clear();
                     new_temp.clear();
                     old_temp.clear();
 
-                    let mut rng = SmallRng::seed_from_u64(iter_seed.wrapping_add(i as u64));
                     let base = i * k;
-
                     for slot in &graph[base..base + k] {
                         if slot.is_sentinel() {
                             continue;
@@ -754,115 +1442,67 @@ where
                         if j >= n {
                             continue;
                         }
-
-                        let priority = rng.random::<f64>();
+                        let entry = (edge_priority(iter_seed, i as u32, j as u32), j as u32);
                         if slot.is_new() {
-                            new_temp.push((priority, j));
+                            new_temp.push(entry);
                         } else {
-                            old_temp.push((priority, j));
+                            old_temp.push(entry);
                         }
                     }
 
-                    // O(n) partial sort instead of O(n log n) full sort
-                    if new_temp.len() > max_candidates {
-                        new_temp.select_nth_unstable_by(max_candidates - 1, |a, b| {
-                            a.0.partial_cmp(&b.0).unwrap()
-                        });
-                        new_temp.truncate(max_candidates);
-                    }
-                    new_c.extend(new_temp.iter().map(|&(_, idx)| idx));
-
-                    if old_temp.len() > max_candidates {
-                        old_temp.select_nth_unstable_by(max_candidates - 1, |a, b| {
-                            a.0.partial_cmp(&b.0).unwrap()
-                        });
-                        old_temp.truncate(max_candidates);
-                    }
-                    old_c.extend(old_temp.iter().map(|&(_, idx)| idx));
+                    *new_len = take_lowest_priority(new_temp, max_candidates, new_slot);
+                    *old_len = take_lowest_priority(old_temp, max_candidates, old_slot);
                 });
             });
 
-        // Phase 2: Symmetric candidates via parallel target-chunk scan.
-        //
-        // Each thread owns a disjoint slice of `*_sym` and scans all sources
-        // once, picking up entries whose target lands in its range. This
-        // avoids per-target locking; the cost is that each thread walks the
-        // full source list, but that walk is a linear read of small vecs.
-        let n_threads = rayon::current_num_threads().max(1);
-        let chunk = n.div_ceil(n_threads).max(1);
-        new_cands_sym
-            .par_chunks_mut(chunk)
-            .zip(old_cands_sym.par_chunks_mut(chunk))
-            .enumerate()
-            .for_each(|(ci, (new_sym_chunk, old_sym_chunk))| {
-                for v in new_sym_chunk.iter_mut() {
-                    v.clear();
-                }
-                for v in old_sym_chunk.iter_mut() {
-                    v.clear();
-                }
-                let target_start = ci * chunk;
-                let new_end = target_start + new_sym_chunk.len();
-                let old_end = target_start + old_sym_chunk.len();
-                for src_i in 0..n {
-                    for &j in &new_cands[src_i] {
-                        if j >= target_start && j < new_end {
-                            new_sym_chunk[j - target_start].push(src_i);
-                        }
-                    }
-                    for &j in &old_cands[src_i] {
-                        if j >= target_start && j < old_end {
-                            old_sym_chunk[j - target_start].push(src_i);
-                        }
-                    }
-                }
-            });
-
-        // Phase 3: Merge symmetric, sort, dedup (parallel, per-node independent)
-        new_cands
-            .par_iter_mut()
-            .zip(old_cands.par_iter_mut())
-            .zip(new_cands_sym.par_iter())
-            .zip(old_cands_sym.par_iter())
-            .for_each(|(((new_c, old_c), new_sym), old_sym)| {
-                new_c.extend_from_slice(new_sym);
-                new_c.sort_unstable();
-                new_c.dedup();
-
-                old_c.extend_from_slice(old_sym);
-                old_c.sort_unstable();
-                old_c.dedup();
-            });
+        // Phase 2: reverse adjacency of both samples.
+        build_reverse_csr(
+            &cands.new_cands,
+            &cands.new_len,
+            stride,
+            n,
+            &mut cands.new_rev,
+        );
+        build_reverse_csr(
+            &cands.old_cands,
+            &cands.old_len,
+            stride,
+            n,
+            &mut cands.old_rev,
+        );
     }
 
     /// Mark neighbours as old if they were sampled into the new-candidate list
     ///
-    /// After sampling, any neighbour that survived into `new_cands[i]` will
-    /// have been "explored" during this iteration's local joins, so flip its
-    /// flag so subsequent iterations treat it as old.
+    /// After sampling, any neighbour that survived into node `i`'s merged new
+    /// list will have been explored during this iteration's local joins, so
+    /// flip its flag and let subsequent iterations treat it as old.
+    ///
+    /// The merged list is never materialised, but membership in it does not
+    /// need it: `j` is in `i`'s merged new list exactly when `j` is in `i`'s
+    /// forward sample or `i` is in `j`'s, the second case being the reverse
+    /// edge. Both samples are sorted, so this is two binary searches.
     ///
     /// ### Params
     ///
     /// * `graph` - Current flat k-NN graph (mutated in place)
     /// * `k` - Neighbours per node
-    /// * `new_cands` - Sorted new-candidate lists per node
-    fn mark_as_old(&self, graph: &mut [Neighbour<T>], k: usize, new_cands: &[Vec<usize>]) {
-        graph
-            .par_chunks_mut(k)
-            .zip(new_cands.par_iter())
-            .for_each(|(slots, new_c)| {
-                if new_c.is_empty() {
-                    return;
+    /// * `cands` - Forward samples, sorted ascending by id
+    fn mark_as_old(&self, graph: &mut [Neighbour<T>], k: usize, cands: &CandidateSets) {
+        graph.par_chunks_mut(k).enumerate().for_each(|(i, slots)| {
+            let fwd_i = cands.new_forward(i);
+            for slot in slots.iter_mut() {
+                if slot.is_sentinel() || !slot.is_new() {
+                    continue;
                 }
-                for slot in slots.iter_mut() {
-                    if slot.is_sentinel() {
-                        continue;
-                    }
-                    if slot.is_new() && new_c.binary_search(&slot.pid()).is_ok() {
-                        slot.mark_old();
-                    }
+                let j = slot.pid();
+                if fwd_i.binary_search(&(j as u32)).is_ok()
+                    || cands.new_forward(j).binary_search(&(i as u32)).is_ok()
+                {
+                    slot.mark_old();
                 }
-            });
+            }
+        });
     }
 
     /// Generate distance updates from a chunk of source nodes.
@@ -872,8 +1512,7 @@ where
     ///
     /// ### Params
     ///
-    /// * `new_cands` - New (unexplored) candidate lists per node
-    /// * `old_cands` - Old (explored) candidate lists per node
+    /// * `cands` - Merged candidate lists per node
     /// * `graph` - Current flat k-NN graph
     /// * `k` - Neighbours per node
     /// * `chunk_start` - First source node index (inclusive)
@@ -884,33 +1523,29 @@ where
     /// Unsorted list of `(target, source, distance)` update triples
     fn generate_updates_for_chunk(
         &self,
-        new_cands: &[Vec<usize>],
-        old_cands: &[Vec<usize>],
+        cands: &CandidateSets,
         graph: &[Neighbour<T>],
         k: usize,
         chunk_start: usize,
         chunk_end: usize,
-    ) -> Vec<Update<T>> {
+    ) -> (Vec<Update<T>>, CandStats) {
         match self.metric {
             Dist::SquaredEuclidean => self.generate_updates_for_chunk_impl::<SqEuclidMetric>(
-                new_cands,
-                old_cands,
+                cands,
                 graph,
                 k,
                 chunk_start,
                 chunk_end,
             ),
             Dist::Cosine => self.generate_updates_for_chunk_impl::<CosineMetric>(
-                new_cands,
-                old_cands,
+                cands,
                 graph,
                 k,
                 chunk_start,
                 chunk_end,
             ),
             Dist::Manhattan => self.generate_updates_for_chunk_impl::<ManhattanMetric>(
-                new_cands,
-                old_cands,
+                cands,
                 graph,
                 k,
                 chunk_start,
@@ -919,86 +1554,151 @@ where
         }
     }
 
+    /// Whether the blocked GEMM local join applies to this index.
+    ///
+    /// Manhattan has no inner-product form, and below the dimensionality and
+    /// candidate-count thresholds the gather plus expansion plus exact
+    /// re-ranking costs more than the fused SIMD kernels save.
+    ///
+    /// ### Params
+    ///
+    /// * `n_cands` - Length of the merged candidate list for this node
+    ///
+    /// ### Returns
+    ///
+    /// `true` if the GEMM path should be taken.
+    #[inline]
+    fn gemm_join_applies(&self, n_cands: usize) -> bool {
+        self.metric != Dist::Manhattan
+            && self.dim >= NND_GEMM_MIN_DIM
+            && n_cands >= NND_GEMM_MIN_CANDIDATES
+    }
+
     /// Monomorphised inner kernel for chunked update generation.
     ///
     /// `M` selects the distance function at compile time so the branch on
     /// `self.metric` is stripped out of the hot loop entirely.
+    ///
+    /// Per source node the candidate vectors, their eviction thresholds and
+    /// their norms are gathered into contiguous thread-local scratch before the
+    /// pair loop. The threshold then costs `|C|` random reads of the graph
+    /// amortised over `|C|^2 / 2` pair tests rather than one read per pair, and
+    /// the tile turns the strided reads of `vectors_flat` into a sequential
+    /// walk of a buffer that stays hot for the whole node.
+    ///
+    /// New and old lists are concatenated into one tile, so the single loop
+    /// `a in 0..n_new`, `b in a+1..n_total` covers the new-new upper triangle
+    /// and the full new-old rectangle exactly once each.
     fn generate_updates_for_chunk_impl<M: MetricFn<T>>(
         &self,
-        new_cands: &[Vec<usize>],
-        old_cands: &[Vec<usize>],
+        cands: &CandidateSets,
         graph: &[Neighbour<T>],
         k: usize,
         chunk_start: usize,
         chunk_end: usize,
-    ) -> Vec<Update<T>> {
+    ) -> (Vec<Update<T>>, CandStats) {
         let dim = self.dim;
-        let has_norms = !self.norms.is_empty();
+        let cosine = self.metric == Dist::Cosine;
+        let two = T::one() + T::one();
+
         (chunk_start..chunk_end)
             .into_par_iter()
             .fold(
-                || Vec::with_capacity(16_384),
-                |mut updates, i| {
-                    let get_threshold = |idx: usize| -> T { graph[idx * k + k - 1].dist };
+                || {
+                    (
+                        Vec::<Update<T>>::with_capacity(16_384),
+                        JoinScratch::<T>::new(),
+                        CandStats::default(),
+                    )
+                },
+                |(mut updates, mut scratch, mut stats), i| {
+                    let n_new = scratch.gather(self, graph, k, cands, i, cosine);
+                    let n_total = scratch.ids.len();
+                    stats.record(n_total);
+                    if n_new == 0 || n_total < 2 {
+                        return (updates, scratch, stats);
+                    }
 
-                    // new-new pairs. Hoist vec_p (and norm_p for Cosine)
-                    // once per outer p so the inner q-loop only re-slices
-                    // vec_q.
-                    for j in 0..new_cands[i].len() {
-                        let p = new_cands[i][j];
-                        if p >= self.n {
-                            continue;
-                        }
-                        let p_threshold = get_threshold(p);
-                        let vec_p = &self.vectors_flat[p * dim..(p + 1) * dim];
-                        let norm_p = if has_norms { self.norms[p] } else { T::zero() };
+                    let use_gemm = self.gemm_join_applies(n_total);
+                    if use_gemm {
+                        scratch.compute_dots(n_new, n_total, dim);
+                    }
 
-                        for l in (j + 1)..new_cands[i].len() {
-                            let q = new_cands[i][l];
-                            if q >= self.n || p == q {
+                    stats.pairs += (n_new * n_total - n_new * (n_new + 1) / 2) as u64;
+                    for a in 0..n_new {
+                        let pa = scratch.ids[a];
+                        let ta = scratch.thresh[a];
+                        let na = scratch.norms[a];
+
+                        for b in (a + 1)..n_total {
+                            let pb = scratch.ids[b];
+                            if pa == pb {
                                 continue;
                             }
-                            let d = M::distance_from_vec(self, vec_p, norm_p, q);
-                            if d <= p_threshold || d <= get_threshold(q) {
-                                updates.push(Update::new(p as u32, q as u32, d));
-                                updates.push(Update::new(q as u32, p as u32, d));
+
+                            let d = if use_gemm {
+                                let dot = scratch.dots[a * n_total + b];
+                                if cosine {
+                                    let denom = na * scratch.norms[b];
+                                    if denom > T::zero() {
+                                        T::one() - dot / denom
+                                    } else {
+                                        T::one()
+                                    }
+                                } else {
+                                    (scratch.sq[a] + scratch.sq[b] - two * dot).max(T::zero())
+                                }
+                            } else {
+                                M::distance_from_tile(
+                                    &scratch.tile[a * dim..(a + 1) * dim],
+                                    na,
+                                    &scratch.tile[b * dim..(b + 1) * dim],
+                                    scratch.norms[b],
+                                )
+                            };
+
+                            let tb = scratch.thresh[b];
+                            if d > ta && d > tb {
+                                continue;
+                            }
+
+                            let d = if use_gemm {
+                                M::distance_from_tile(
+                                    &scratch.tile[a * dim..(a + 1) * dim],
+                                    na,
+                                    &scratch.tile[b * dim..(b + 1) * dim],
+                                    scratch.norms[b],
+                                )
+                            } else {
+                                d
+                            };
+
+                            if d <= ta {
+                                updates.push(Update::new(pa, pb, d));
+                            }
+                            if d <= tb {
+                                updates.push(Update::new(pb, pa, d));
                             }
                         }
                     }
 
-                    // new-old pairs. Same hoist as above.
-                    for &p in &new_cands[i] {
-                        if p >= self.n {
-                            continue;
-                        }
-                        let p_threshold = get_threshold(p);
-                        let vec_p = &self.vectors_flat[p * dim..(p + 1) * dim];
-                        let norm_p = if has_norms { self.norms[p] } else { T::zero() };
-
-                        for &q in &old_cands[i] {
-                            if q >= self.n || p == q {
-                                continue;
-                            }
-                            let d = M::distance_from_vec(self, vec_p, norm_p, q);
-                            if d <= p_threshold || d <= get_threshold(q) {
-                                updates.push(Update::new(p as u32, q as u32, d));
-                                updates.push(Update::new(q as u32, p as u32, d));
-                            }
-                        }
-                    }
-
-                    updates
+                    (updates, scratch, stats)
                 },
             )
-            .reduce(Vec::new, |mut a, mut b| {
-                if a.len() >= b.len() {
-                    a.extend_from_slice(&b);
-                    a
-                } else {
-                    b.extend_from_slice(&a);
-                    b
-                }
-            })
+            .map(|(updates, _, stats)| (updates, stats))
+            .reduce(
+                || (Vec::new(), CandStats::default()),
+                |(mut a, sa), (mut b, sb)| {
+                    let merged = sa.merge(sb);
+                    if a.len() >= b.len() {
+                        a.extend_from_slice(&b);
+                        (a, merged)
+                    } else {
+                        b.extend_from_slice(&a);
+                        (b, merged)
+                    }
+                },
+            )
     }
 
     /// Calculate distance between two indexed points under the index metric
@@ -1037,11 +1737,7 @@ where
     ///
     /// `Vec<Vec<(usize, T)>>` of length `n`. Entry `v` lists `(u, d(u, v))`
     /// for every source `u` that has `v` in its forward list.
-    fn build_reverse_adjacency(
-        &self,
-        graph: &[(usize, T)],
-        k: usize,
-    ) -> Vec<Vec<(usize, T)>> {
+    fn build_reverse_adjacency(&self, graph: &[(usize, T)], k: usize) -> Vec<Vec<(usize, T)>> {
         let mut reverse: Vec<Vec<(usize, T)>> = (0..self.n).map(|_| Vec::new()).collect();
         for u in 0..self.n {
             let row = &graph[u * k..(u + 1) * k];
@@ -1117,9 +1813,8 @@ where
 
                 // Dedupe by pid, keeping the smallest distance per pid.
                 pool.sort_unstable_by(|a, b| {
-                    a.0.cmp(&b.0).then_with(|| {
-                        a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal)
-                    })
+                    a.0.cmp(&b.0)
+                        .then_with(|| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))
                 });
                 pool.dedup_by_key(|x| x.0);
 
@@ -1138,9 +1833,7 @@ where
                     let mut should_keep = true;
                     for &(kept_idx, _) in &kept {
                         let dist_to_kept = self.distance(cand_idx, kept_idx);
-                        if dist_to_kept < cand_dist
-                            && rng.random::<f64>() < prune_prob_f64
-                        {
+                        if dist_to_kept < cand_dist && rng.random::<f64>() < prune_prob_f64 {
                             should_keep = false;
                             break;
                         }
@@ -1164,6 +1857,10 @@ where
                         kept.push(entry);
                     }
                 }
+
+                kept.sort_unstable_by(|a, b| {
+                    a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal)
+                });
 
                 for (j, &entry) in kept.iter().enumerate() {
                     out_slot[j] = entry;
@@ -1245,7 +1942,43 @@ where
         self.query(&query_vec, k, ef_search)
     }
 
+    /// Hand back the kNN graph exactly as NN-Descent built it.
+    ///
+    /// No re-query: this is the descent's own output, so it costs one pass over
+    /// the graph. [`Self::generate_knn`] runs a beam search per point instead,
+    /// which lifts recall but is orders of magnitude more expensive. Reach for
+    /// this one when the graph you asked for is the graph you want.
+    ///
+    /// Rows can come back **shorter than `k`** where the descent never filled
+    /// them (small `n`, disconnected components), which `generate_knn` never
+    /// does.
+    ///
+    /// ### Params
+    ///
+    /// * `k` - Truncate each row to this **total** length, self-edge included
+    ///   when `include_self` is set. `None` keeps the full build-time `k`.
+    /// * `include_self` - Prepend `(i, 0)` to row `i`, matching what every
+    ///   `query_*_self` and an exhaustive ground truth return. Leave unset for
+    ///   true neighbours only.
+    /// * `return_dist` - Whether to materialise the distances
+    ///
+    /// ### Returns
+    ///
+    /// `(knn_indices, optional distances)`, sorted by distance ascending.
+    pub fn extract_knn(
+        &self,
+        k: Option<usize>,
+        include_self: bool,
+        return_dist: bool,
+    ) -> (Vec<Vec<usize>>, Option<Vec<Vec<T>>>) {
+        unpack_knn_graph(&self.graph, self.n, self.k, k, include_self, return_dist)
+    }
+
     /// Generate a kNN graph by querying every vector in the index.
+    ///
+    /// Each point runs a fresh beam search, so this refines the built graph
+    /// rather than reading it back. See [`Self::extract_knn`] for the cheap
+    /// path.
     ///
     /// ### Returns
     ///
@@ -1286,13 +2019,7 @@ where
             })
             .collect::<Result<Vec<_>, AnnSearchErrors>>()?;
 
-        if return_dist {
-            let (indices, distances) = results.into_iter().unzip();
-            Ok((indices, Some(distances)))
-        } else {
-            let indices: Vec<Vec<usize>> = results.into_iter().map(|(idx, _)| idx).collect();
-            Ok((indices, None))
-        }
+        Ok(pack_knn_results(results, return_dist))
     }
 
     /// Returns the size of the index in bytes
@@ -1320,123 +2047,95 @@ where
 // ApplySortedUpdates //
 ////////////////////////
 
-/// Generates the `ApplySortedUpdates` impl for a concrete float type.
+/// In-place merge of a target's sorted update segment into its graph row.
 ///
-/// The logic is identical for f32 and f64; only the thread-local storage
-/// keys differ.
-macro_rules! impl_apply_sorted_updates {
-    ($float:ty, $sorted_tls:ident) => {
-        impl ApplySortedUpdates<$float> for NNDescent<$float> {
-            fn apply_sorted_updates(
-                &self,
-                updates: &[Update<$float>],
-                graph: &mut [Neighbour<$float>],
-                k: usize,
-                updates_count: &AtomicUsize,
-            ) {
-                if updates.is_empty() {
+/// The row is already the sorted structure this needs: `k` entries ascending by
+/// distance, sentinel-padded. Merging directly into it drops the previous
+/// approach's per-target rebuild of a thread-local `SortedBuffer` and its
+/// `n`-bit duplicate set, both of which cost the full `k` even when a single
+/// update landed. Duplicate detection is a linear scan of the row, which for
+/// realistic `k` is a couple of contiguous cache lines against the bitset's
+/// scattered reads over `n / 8` bytes.
+impl<T: AnnSearchFloat> ApplySortedUpdates<T> for NNDescent<T> {
+    fn apply_sorted_updates(
+        &self,
+        updates: &[Update<T>],
+        graph: &mut [Neighbour<T>],
+        k: usize,
+        updates_count: &AtomicUsize,
+    ) {
+        if updates.is_empty() || k == 0 {
+            return;
+        }
+
+        let graph_ptr = UnsafeGraphPtr(graph.as_mut_ptr());
+
+        // `par_chunk_by` splits the sorted batch on target boundaries directly,
+        // which saves a sequential boundary scan plus the Vec of segment
+        // descriptors it used to feed.
+        updates
+            .par_chunk_by(|a, b| a.target == b.target)
+            .for_each(|segment| {
+                let target = segment[0].target as usize;
+
+                #[allow(clippy::redundant_locals)]
+                let graph_ptr = graph_ptr;
+
+                // SAFETY: each segment covers one target, and the batch is
+                // sorted by target, so this thread owns the row for the whole
+                // call and no other thread aliases it.
+                let row = unsafe { std::slice::from_raw_parts_mut(graph_ptr.0.add(target * k), k) };
+
+                // Most segments change nothing once the graph settles, so bail
+                // before touching the row if not one update can beat its
+                // current worst neighbour. Sentinel-padded rows hold MAX, so
+                // short rows always pass.
+                let mut cutoff = row[k - 1].dist;
+                if segment.iter().all(|u| u.dist > cutoff) {
                     return;
                 }
 
-                let boundaries = find_target_boundaries(updates);
+                let mut edge_updates = 0usize;
 
-                let segments: Vec<(usize, &[Update<$float>])> = boundaries
-                    .windows(2)
-                    .filter_map(|w| {
-                        let start = w[0];
-                        let end = w[1];
-                        if start < end {
-                            Some((updates[start].target as usize, &updates[start..end]))
-                        } else {
-                            None
+                for update in segment {
+                    let d = update.dist;
+                    if d > cutoff {
+                        continue;
+                    }
+                    let src = update.source as usize;
+
+                    // One pass finds both the duplicate and the insertion
+                    // point. The scan must run to the end regardless, since a
+                    // duplicate can sit past the insertion point.
+                    let mut pos = k;
+                    let mut duplicate = false;
+                    for (i, slot) in row.iter().enumerate() {
+                        let pid = slot.pid();
+                        if pid == src {
+                            duplicate = true;
+                            break;
                         }
-                    })
-                    .collect();
+                        if pos == k && (d < slot.dist || (d == slot.dist && src < pid)) {
+                            pos = i;
+                        }
+                    }
 
-                let graph_ptr = UnsafeGraphPtr(graph.as_mut_ptr());
+                    if duplicate || pos == k {
+                        continue;
+                    }
 
-                segments.par_iter().for_each(|&(target, segment)| {
-                    #[allow(clippy::redundant_locals)]
-                    let graph_ptr = graph_ptr;
-                    $sorted_tls.with(|sorted_cell| {
-                        PID_SET.with(|set_cell| {
-                            let mut sorted = sorted_cell.borrow_mut();
-                            let mut pid_set = set_cell.borrow_mut();
+                    row.copy_within(pos..k - 1, pos + 1);
+                    row[pos] = Neighbour::new(src, d, true);
+                    cutoff = row[k - 1].dist;
+                    edge_updates += 1;
+                }
 
-                            sorted.clear();
-                            if pid_set.len() < self.n {
-                                pid_set.grow(self.n);
-                            }
-
-                            let start_idx = target * k;
-
-                            // SAFETY: Each thread processes a unique target.
-                            // No two threads alias the same slice.
-                            let target_slice = unsafe {
-                                std::slice::from_raw_parts_mut(graph_ptr.0.add(start_idx), k)
-                            };
-
-                            let mut edge_updates = 0usize;
-
-                            // Load current neighbours in ascending distance order.
-                            for n in target_slice.iter() {
-                                if n.is_sentinel() {
-                                    continue;
-                                }
-                                let pid = n.pid();
-                                sorted.insert((OrderedFloat(n.dist), pid as u32, n.is_new()), k);
-                                pid_set.insert(pid);
-                            }
-
-                            // Merge incoming updates.
-                            for update in segment {
-                                let src = update.source as usize;
-                                if pid_set.contains(src) {
-                                    continue;
-                                }
-                                let evicted_pid: Option<u32> = if sorted.len() == k {
-                                    sorted.top().map(|&(_, pid, _)| pid)
-                                } else {
-                                    None
-                                };
-                                let entry = (OrderedFloat(update.dist), update.source, true);
-                                if sorted.insert(entry, k) {
-                                    if let Some(pid) = evicted_pid {
-                                        pid_set.remove(pid as usize);
-                                    }
-                                    pid_set.insert(src);
-                                    edge_updates += 1;
-                                }
-                            }
-
-                            if edge_updates > 0 {
-                                updates_count.fetch_add(edge_updates, Ordering::Relaxed);
-
-                                for (i, &(OrderedFloat(d), pid, is_new)) in
-                                    sorted.data().iter().enumerate()
-                                {
-                                    target_slice[i] = Neighbour::new(pid as usize, d, is_new);
-                                }
-                                for i in sorted.len()..k {
-                                    target_slice[i] =
-                                        Neighbour::new(SENTINEL_PID, <$float>::MAX, false);
-                                }
-                            }
-
-                            // Clear pid_set entries left in sorted.
-                            for &(_, pid, _) in sorted.data().iter() {
-                                pid_set.remove(pid as usize);
-                            }
-                        })
-                    })
-                });
-            }
-        }
-    };
+                if edge_updates > 0 {
+                    updates_count.fetch_add(edge_updates, Ordering::Relaxed);
+                }
+            });
+    }
 }
-
-impl_apply_sorted_updates!(f32, SORTED_F32);
-impl_apply_sorted_updates!(f64, SORTED_F64);
 
 ////////////////////
 // NNDescentQuery //
@@ -1789,6 +2488,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use approx::assert_relative_eq;
     use faer::Mat;
 
     fn create_simple_matrix() -> Mat<f32> {
@@ -2123,6 +2823,496 @@ mod tests {
         assert_eq!(index.graph.len(), 5 * 3);
         for i in 0..5 {
             assert!(!neighbours(&index, i).is_empty());
+        }
+    }
+    ///////////////////////
+    // Candidate sets    //
+    ///////////////////////
+
+    /// Naive reverse adjacency, for the CSR to be checked against.
+    fn naive_reverse(fwd: &[u32], lens: &[u32], stride: usize, n: usize) -> Vec<Vec<u32>> {
+        let mut rev = vec![Vec::new(); n];
+        for i in 0..n {
+            for &j in &fwd[i * stride..i * stride + lens[i] as usize] {
+                rev[j as usize].push(i as u32);
+            }
+        }
+        rev
+    }
+
+    #[test]
+    fn test_reverse_csr_matches_naive() {
+        let n = 64;
+        let stride = 5;
+        let mut fwd = vec![0u32; n * stride];
+        let mut lens = vec![0u32; n];
+
+        // Deterministic ragged fan-out, including a hub every node points at.
+        for i in 0..n {
+            let len = i % (stride + 1);
+            lens[i] = len as u32;
+            for s in 0..len {
+                fwd[i * stride + s] = if s == 0 {
+                    7
+                } else {
+                    ((i * 13 + s * 29) % n) as u32
+                };
+            }
+        }
+
+        let mut csr = ReverseCsr::new();
+        build_reverse_csr(&fwd, &lens, stride, n, &mut csr);
+
+        let naive = naive_reverse(&fwd, &lens, stride, n);
+        assert_eq!(csr.offsets.len(), n + 1);
+        assert_eq!(csr.data.len(), naive.iter().map(|v| v.len()).sum::<usize>());
+
+        for i in 0..n {
+            let mut got: Vec<u32> = csr.segment(i).to_vec();
+            let mut want = naive[i].clone();
+            got.sort_unstable();
+            want.sort_unstable();
+            assert_eq!(got, want, "reverse segment {i} disagrees");
+        }
+    }
+
+    #[test]
+    fn test_reverse_csr_handles_empty_forward() {
+        let n = 8;
+        let stride = 4;
+        let fwd = vec![0u32; n * stride];
+        let lens = vec![0u32; n];
+
+        let mut csr = ReverseCsr::new();
+        build_reverse_csr(&fwd, &lens, stride, n, &mut csr);
+
+        assert!(csr.data.is_empty());
+        assert!((0..n).all(|i| csr.segment(i).is_empty()));
+    }
+
+    #[test]
+    fn test_edge_priority_is_symmetric() {
+        for (u, v) in [(0u32, 1u32), (17, 4), (99, 99), (1_000_000, 3)] {
+            assert_eq!(edge_priority(7, u, v), edge_priority(7, v, u));
+        }
+        // Different seeds must not collapse onto the same ordering.
+        assert_ne!(edge_priority(1, 3, 9), edge_priority(2, 3, 9));
+    }
+
+    #[test]
+    fn test_take_lowest_priority_caps_and_sorts() {
+        let mut temp: Vec<(u64, u32)> = vec![(9, 40), (1, 10), (5, 30), (3, 20)];
+        let mut out = vec![0u32; 2];
+        let len = take_lowest_priority(&mut temp, 2, &mut out);
+
+        assert_eq!(len, 2);
+        // Priorities 1 and 3 win, and the ids come back sorted.
+        assert_eq!(out, vec![10, 20]);
+    }
+
+    #[test]
+    fn test_forward_sample_respects_max_candidates() {
+        // The forward sample is the only capped list. The merged list the join
+        // runs over is deliberately uncapped: capping it costs recall, since
+        // the reverse in-degree distribution is broad rather than a clippable
+        // tail. This pins the forward cap and the sorted-deduped invariant both
+        // `mark_as_old` and `merged_into` rely on.
+        let n = 200;
+        let dim = 4;
+        let mat = Mat::from_fn(n, dim, |i, j| {
+            if i < 20 {
+                (i as f32) * 0.001 + (j as f32) * 0.002
+            } else {
+                ((i * 7 + j * 13) % 50) as f32
+            }
+        });
+
+        let max_candidates = 6;
+        let index = NNDescent::<f32>::new(
+            mat.as_ref(),
+            Dist::SquaredEuclidean,
+            Some(10),
+            Some(max_candidates),
+            Some(4),
+            None,
+            0.0,
+            0.0,
+            42,
+            false,
+        )
+        .unwrap();
+
+        let mut cands = CandidateSets::new(index.n, max_candidates);
+        let graph: Vec<Neighbour<f32>> = index
+            .graph
+            .iter()
+            .map(|&(pid, d)| Neighbour::new(pid, d, true))
+            .collect();
+        index.build_candidates(&graph, index.k, max_candidates, 42, &mut cands);
+
+        let mut merged = Vec::new();
+        for i in 0..index.n {
+            let new_fwd = cands.new_forward(i);
+            let old_fwd = cands.old_forward(i);
+            assert!(new_fwd.len() <= max_candidates, "new sample {i} over cap");
+            assert!(old_fwd.len() <= max_candidates, "old sample {i} over cap");
+            assert!(
+                new_fwd.windows(2).all(|w| w[0] < w[1]),
+                "new sample {i} not sorted and deduped"
+            );
+            assert!(
+                old_fwd.windows(2).all(|w| w[0] < w[1]),
+                "old sample {i} not sorted and deduped"
+            );
+
+            // The merged list must be the sorted union of the two directions.
+            cands.merged_into(i, true, &mut merged);
+            assert!(merged.windows(2).all(|w| w[0] < w[1]));
+            for &j in new_fwd {
+                assert!(merged.binary_search(&j).is_ok(), "merged {i} lost {j}");
+            }
+            for &src in cands.new_rev.segment(i) {
+                assert!(merged.binary_search(&src).is_ok(), "merged {i} lost {src}");
+            }
+        }
+    }
+
+    ///////////////////////
+    // Chunk sizing      //
+    ///////////////////////
+
+    #[test]
+    fn test_chunk_sizing_stays_inside_the_byte_budget() {
+        let mat = create_simple_matrix();
+        let index = NNDescent::<f32>::new(
+            mat.as_ref(),
+            Dist::SquaredEuclidean,
+            Some(3),
+            None,
+            Some(5),
+            None,
+            0.001,
+            0.0,
+            42,
+            false,
+        )
+        .unwrap();
+
+        let budget = NNDescent::<f32>::target_updates_per_chunk();
+        assert_eq!(
+            budget,
+            UPDATE_TARGET_BYTES / std::mem::size_of::<Update<f32>>()
+        );
+
+        // A chunk that emitted its full budget must not grow.
+        let next = index.rescale_chunk_size(1_000, 1_000, budget);
+        assert!(next <= 1_000, "chunk grew past a saturated budget");
+
+        // A chunk that emitted almost nothing grows, but only by the limit.
+        let next = index.rescale_chunk_size(2, 2, 1);
+        assert!(next <= 2 * CHUNK_GROWTH_LIMIT);
+
+        // A chunk that emitted nothing at all still grows rather than stalling.
+        assert!(index.rescale_chunk_size(1, 1, 0) >= 1);
+    }
+
+    #[test]
+    fn test_initial_chunk_size_is_bounded_by_n() {
+        let mat = create_simple_matrix();
+        let index = NNDescent::<f32>::new(
+            mat.as_ref(),
+            Dist::SquaredEuclidean,
+            Some(3),
+            None,
+            Some(5),
+            None,
+            0.001,
+            0.0,
+            42,
+            false,
+        )
+        .unwrap();
+
+        assert!(index.initial_chunk_size(30) <= index.n);
+        assert!(index.initial_chunk_size(30) >= 1);
+    }
+
+    ///////////////////////
+    // Join paths        //
+    ///////////////////////
+
+    /// Clustered data wide enough to put the build on the GEMM join path.
+    fn gemm_width_matrix(n: usize) -> Mat<f32> {
+        let dim = NND_GEMM_MIN_DIM + 8;
+        Mat::from_fn(n, dim, |i, j| {
+            let cluster = (i % 5) as f32;
+            cluster * 10.0 + ((i * 31 + j * 17) % 13) as f32 * 0.1
+        })
+    }
+
+    #[test]
+    fn test_gemm_join_distances_are_exact() {
+        // On the GEMM path selection happens against the norm expansion, which
+        // cancels catastrophically on close pairs. Every accepted pair is
+        // therefore recomputed with the fused kernel, so the distances stored
+        // in the graph must match `euclidean_simd` exactly.
+        let n = 300;
+        let mat = gemm_width_matrix(n);
+        let index = NNDescent::<f32>::new(
+            mat.as_ref(),
+            Dist::SquaredEuclidean,
+            Some(10),
+            Some(NND_GEMM_MIN_CANDIDATES + 8),
+            Some(6),
+            None,
+            0.0,
+            0.0,
+            42,
+            false,
+        )
+        .unwrap();
+
+        assert!(
+            index.gemm_join_applies(NND_GEMM_MIN_CANDIDATES),
+            "test data does not reach the GEMM path"
+        );
+
+        let dim = index.dim;
+        for i in 0..index.n {
+            for &(pid, d) in &index.graph[i * index.k..(i + 1) * index.k] {
+                if pid == SENTINEL_PID {
+                    continue;
+                }
+                let exact = f32::euclidean_simd(
+                    &index.vectors_flat[i * dim..(i + 1) * dim],
+                    &index.vectors_flat[pid * dim..(pid + 1) * dim],
+                );
+                assert_eq!(d, exact, "stored distance for ({i}, {pid}) is not exact");
+            }
+        }
+    }
+
+    #[test]
+    fn test_gemm_join_reaches_high_recall() {
+        let n = 300;
+        let mat = gemm_width_matrix(n);
+        let index = NNDescent::<f32>::new(
+            mat.as_ref(),
+            Dist::SquaredEuclidean,
+            Some(10),
+            Some(NND_GEMM_MIN_CANDIDATES + 8),
+            Some(8),
+            None,
+            0.0,
+            0.0,
+            42,
+            false,
+        )
+        .unwrap();
+
+        // Recall of the raw descent graph against exhaustive ground truth,
+        // which is what the join itself is responsible for.
+        let k = index.k;
+        let dim = index.dim;
+        let rows = index.extract_knn(None, false, false).0;
+        let mut hits = 0usize;
+        let mut total = 0usize;
+        for i in 0..index.n {
+            let query = &index.vectors_flat[i * dim..(i + 1) * dim];
+            let (truth, _) = index.exhaustive_query(query, k + 1).unwrap();
+            let truth: Vec<usize> = truth.into_iter().filter(|&j| j != i).take(k).collect();
+            for t in &truth {
+                if rows[i].contains(t) {
+                    hits += 1;
+                }
+            }
+            total += truth.len();
+        }
+        let recall = hits as f64 / total as f64;
+        assert!(recall > 0.8, "GEMM join recall too low: {recall}");
+    }
+
+    #[test]
+    fn test_simd_join_distances_are_exact() {
+        // The counterpart at a dimensionality below the GEMM threshold, so the
+        // fused kernels carry the whole join.
+        let n = 200;
+        let mat = Mat::from_fn(n, 8, |i, j| ((i * 17 + j * 5) % 23) as f32 * 0.5);
+        let index = NNDescent::<f32>::new(
+            mat.as_ref(),
+            Dist::SquaredEuclidean,
+            Some(8),
+            None,
+            Some(6),
+            None,
+            0.0,
+            0.0,
+            7,
+            false,
+        )
+        .unwrap();
+
+        assert!(
+            !index.gemm_join_applies(1_000),
+            "test data took the GEMM path"
+        );
+
+        let dim = index.dim;
+        for i in 0..index.n {
+            for &(pid, d) in &index.graph[i * index.k..(i + 1) * index.k] {
+                if pid == SENTINEL_PID {
+                    continue;
+                }
+                let exact = f32::euclidean_simd(
+                    &index.vectors_flat[i * dim..(i + 1) * dim],
+                    &index.vectors_flat[pid * dim..(pid + 1) * dim],
+                );
+                assert_eq!(d, exact);
+            }
+        }
+    }
+
+    ///////////////////////
+    // Extraction / NSG  //
+    ///////////////////////
+
+    #[test]
+    fn test_graph_stays_flat_and_sentinel_padded() {
+        // NSG consumes the flat graph directly and asserts `len == n * knn_k`,
+        // so the layout is load-bearing beyond this module.
+        let mat = create_simple_matrix();
+        let index = NNDescent::<f32>::new(
+            mat.as_ref(),
+            Dist::SquaredEuclidean,
+            Some(4),
+            None,
+            Some(5),
+            None,
+            0.001,
+            0.0,
+            42,
+            false,
+        )
+        .unwrap();
+
+        assert_eq!(index.graph().len(), index.n * index.k);
+        // Five points at k = 4 cannot fill every row without self-edges, so at
+        // least one sentinel has to survive the build.
+        assert!(index
+            .graph()
+            .iter()
+            .any(|&(pid, _)| pid == SENTINEL_PID || pid < index.n));
+    }
+
+    #[test]
+    fn test_extract_knn_matches_the_stored_graph() {
+        let mat = create_simple_matrix();
+        let index = NNDescent::<f32>::new(
+            mat.as_ref(),
+            Dist::SquaredEuclidean,
+            Some(3),
+            None,
+            Some(5),
+            None,
+            0.001,
+            0.0,
+            42,
+            false,
+        )
+        .unwrap();
+
+        let (ids, dists) = index.extract_knn(None, false, true);
+        let dists = dists.unwrap();
+
+        assert_eq!(ids.len(), index.n);
+        for i in 0..index.n {
+            let want = neighbours(&index, i);
+            assert_eq!(ids[i], want.iter().map(|e| e.0).collect::<Vec<_>>());
+            assert_eq!(dists[i], want.iter().map(|e| e.1).collect::<Vec<_>>());
+            assert!(dists[i].windows(2).all(|w| w[0] <= w[1]));
+        }
+
+        // No re-query, so it must not agree with the beam-search path by
+        // construction; it only has to be a subset of the stored rows.
+        let (short, none) = index.extract_knn(Some(1), false, false);
+        assert!(none.is_none());
+        assert!(short.iter().all(|r| r.len() <= 1));
+    }
+
+    #[test]
+    fn test_diversified_rows_stay_distance_sorted() {
+        // The RNG-rule prune tops short rows up from the pruned tail, and a
+        // topped-up entry can sit closer than a kept one. Every consumer, and
+        // `extract_knn` truncating from the front in particular, needs the row
+        // ascending regardless.
+        let n = 150;
+        let mat = Mat::from_fn(n, 6, |i, j| ((i * 11 + j * 7) % 17) as f32 * 0.3);
+
+        for prune_prob in [0.25f32, 0.5, 1.0] {
+            let index = NNDescent::<f32>::new(
+                mat.as_ref(),
+                Dist::SquaredEuclidean,
+                Some(10),
+                None,
+                Some(6),
+                None,
+                0.0,
+                prune_prob,
+                42,
+                false,
+            )
+            .unwrap();
+
+            for i in 0..index.n {
+                let row: Vec<f32> = index.graph[i * index.k..(i + 1) * index.k]
+                    .iter()
+                    .filter(|&&(pid, _)| pid != SENTINEL_PID)
+                    .map(|&(_, d)| d)
+                    .collect();
+                assert!(
+                    row.windows(2).all(|w| w[0] <= w[1]),
+                    "row {i} unsorted at prune_prob={prune_prob}: {row:?}"
+                );
+            }
+
+            // Extraction truncates from the front, so it must hand back the
+            // closest entries and nothing further out.
+            let (_, dists) = index.extract_knn(Some(3), false, true);
+            for row in dists.unwrap() {
+                assert!(row.windows(2).all(|w| w[0] <= w[1]));
+                assert!(row.len() <= 3);
+            }
+        }
+    }
+
+    #[test]
+    fn test_compute_dots_matches_the_simd_kernel() {
+        // The GEMM block is the one piece of the join with no fallback cross
+        // check at build time, so pin it against `dot_simd` directly.
+        let dim = 12;
+        let n_new = 3;
+        let n_total = 5;
+
+        let mut scratch = JoinScratch::<f32>::new();
+        scratch.tile = (0..n_total * dim)
+            .map(|t| ((t * 7 % 19) as f32) * 0.25 - 2.0)
+            .collect();
+        scratch.compute_dots(n_new, n_total, dim);
+
+        for a in 0..n_new {
+            for b in 0..n_total {
+                let want = f32::dot_simd(
+                    &scratch.tile[a * dim..(a + 1) * dim],
+                    &scratch.tile[b * dim..(b + 1) * dim],
+                );
+                assert_relative_eq!(scratch.dots[a * n_total + b], want, epsilon = 1e-4);
+            }
+        }
+
+        // Squared norms come out of the same call and feed the expansion.
+        for t in 0..n_total {
+            let v = &scratch.tile[t * dim..(t + 1) * dim];
+            assert_relative_eq!(scratch.sq[t], f32::dot_simd(v, v), epsilon = 1e-4);
         }
     }
 }

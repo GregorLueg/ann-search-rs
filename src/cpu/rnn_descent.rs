@@ -8,7 +8,7 @@
 //! Graph-Based Approximate Nearest Neighbor Search.* ACM MM 2023.
 //! arXiv:2310.20419.
 
-use faer::{RowRef};
+use faer::RowRef;
 use rand::{rngs::SmallRng, Rng, SeedableRng};
 use rayon::prelude::*;
 use rdst::RadixSort;
@@ -961,16 +961,8 @@ where
             })
             .collect::<Result<Vec<_>, AnnSearchErrors>>()?;
 
-        if return_dist {
-            let (indices, distances) = results.into_iter().unzip();
-            Ok((indices, Some(distances)))
-        } else {
-            let indices: Vec<Vec<usize>> = results.into_iter().map(|(idx, _)| idx).collect();
-            Ok((indices, None))
-        }
+        Ok(pack_knn_results(results, return_dist))
     }
-
-
 }
 
 ///////////////////

@@ -1,0 +1,67 @@
+[build-system]
+requires = ["maturin>=1.15,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "ann-search"
+description = "Vector search for single-cell and computational biology, in Rust."
+readme = "README.md"
+license = { text = "MIT" }
+authors = [{ name = "Gregor Lueg", email = "gregorlueg@me.com" }]
+requires-python = ">=3.10"
+dependencies = ["numpy>=1.23", "beartype>=0.19"]
+dynamic = ["version"]
+classifiers = [
+    "Programming Language :: Rust",
+    "Programming Language :: Python :: Implementation :: CPython",
+    "Topic :: Scientific/Engineering :: Bio-Informatics",
+]
+
+[project.urls]
+Documentation = "https://gregorlueg.github.io/ann-search-rs/"
+Repository = "https://github.com/GregorLueg/ann-search-rs"
+Changelog = "https://github.com/GregorLueg/ann-search-rs/blob/main/CHANGELOG.md"
+
+[project.optional-dependencies]
+# `kneighbors_graph` / `transform` only. Everything else runs on numpy alone.
+sparse = ["scipy>=1.9"]
+
+[dependency-groups]
+dev = [
+    "maturin>=1.15,<2.0",
+    "pytest>=8",
+    "ruff>=0.9",
+    "ty>=0.0.1",
+    "scipy>=1.9",
+    "scikit-learn>=1.4",
+]
+# mkdocstrings reads the installed package, so a docs build needs the compiled
+# extension present: `maturin develop --release` before `mkdocs build`.
+docs = [
+    "mkdocs>=1.6",
+    "mkdocs-material>=9.5",
+    "mkdocstrings[python]>=0.27",
+]
+
+[tool.maturin]
+manifest-path = "Cargo.toml"
+module-name = "ann_search._ann_search"
+python-source = "."
+strip = true
+include = ["ann_search/py.typed", "ann_search/*.pyi"]
+
+[tool.ruff]
+line-length = 88
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "N", "UP", "B", "SIM", "RUF"]
+# `X` for the design matrix is the scikit-learn convention these estimators are
+# deliberately matching.
+ignore = ["N803"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["ann_search"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

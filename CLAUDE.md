@@ -30,7 +30,7 @@ cargo test --release --features quantised -- ivf_pq::tests::name_of_test --exact
 # quantised: bf16, sq8, pq, opq, soar_pq, soar_opq
 # binary:    binary, rabitq, tq
 # gpu:       gpu, cagra, nsg_gpu, clustered_nndescent (plus the
-#            knn_comparison_cagra example)
+#            knn_comparison_gpu example)
 cargo run --example gridsearch_hnsw   --release
 cargo run --example gridsearch_ivf    --release -- --n-samples 500000 --dim 128 --distance cosine
 cargo run --example gridsearch_pq     --release --features quantised

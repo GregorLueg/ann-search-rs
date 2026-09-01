@@ -20,11 +20,13 @@ initial kNN is generated on the GPU, you can test this via:
 cargo run --example gridsearch_nsg_gpu --features gpu --release
 ```
 
-Similar to the other benchmarks, index building, query against 10% slightly
-different data based on the trainings data and full kNN generation is being
-benchmarked. Index size in memory is also provided (however, GPU memory is not
-reported). To note also, every benchmark here is run on the wgpu backend.
-Other backends like cuda might provide even more speed benefits.
+As with the other benchmarks: index build, query against a 10% subsample with
+noise added, and full self-kNN generation, plus the in-memory index size (GPU
+memory is not reported). Everything here runs on the wgpu backend; other
+backends such as CUDA may do better still.
+
+Looking for the self-kNN-graph paths (NN-Descent extract, self-beam, clustered)?
+Those live in [the kNN-graph benchmarks](benchmarks_knn_graph.md).
 
 ## Table of Contents
 
@@ -32,11 +34,9 @@ Other backends like cuda might provide even more speed benefits.
 - [Comparison on larger data sets against the CPU](#comparison-against-ivf-cpu)
 - [CAGRA style index](#cagra-type-querying)
 - [CAGRA index on larger data](#larger-data-sets)
-- [CAGRA for kNN generation](#two-tier-knn-generation)
+- [NSG with GPU-accelerated kNN generation](#navigating-spread-out-graph-nsg-with-gpu-accelerated-knn-generation)
 
 ### GPU-accelerated exhaustive and IVF vs CPU exhaustive
-
-The GPU acceleration is particularly notable for the exhaustive index.
 
 <details>
 <summary><b>GPU - Euclidean (Gaussian)</b>:</summary>
@@ -83,10 +83,9 @@ The GPU acceleration is particularly notable for the exhaustive index.
 
 ### Comparison against IVF CPU
 
-In this case, the IVF CPU implementation is being compared against the GPU
-version. GPU acceleration shines with larger data sets and larger dimensions,
-hence, the number of samples was increased to 250_000 and dimensions to 64 or
-128 for these benchmarks.
+The CPU IVF implementation against the GPU one. The GPU pays a fixed setup
+cost, so the sample count is raised to 250k and the dimensionality to 64 or 128
+for these runs.
 
 #### With 250k samples and 64 dimensions
 
@@ -126,9 +125,6 @@ hence, the number of samples was increased to 250_000 and dimensions to 64 or
 
 #### Increasing the number of samples
 
-Results are becoming more pronounced with more samples and showing the
-advantage of the GPU acceleration.
-
 <details>
 <summary><b>CPU-IVF (500k samples, 64 dimensions)</b>:</summary>
 <pre><code>
@@ -165,56 +161,28 @@ advantage of the GPU acceleration.
 
 ### CAGRA-type querying
 
-The crate also offers a [CAGRA-style index](https://arxiv.org/abs/2308.15136),
-combining GPU-accelerated NNDescent graph construction with CAGRA navigational
-graph optimisation and beam search. The index is built in four phases:
+A [CAGRA-style index](https://arxiv.org/abs/2308.15136): NN-Descent runs
+entirely on the GPU (random init, then a random-partition forest, then local
+joins until convergence), and the resulting graph is pruned to degree `k` by
+rank-based detour counting into a directed navigational graph. Queries are a GPU
+beam search, one workgroup per query, with the query vector in shared memory and
+a linear-probing hash table for visited-node deduplication.
 
-1. **Random graph initialisation**: each node gets `build_k` random neighbours
-   with computed distances, providing a baseline graph even before the forest
-   runs.
-2. **GPU forest initialisation**: a shallow random partition forest (default 20
-   trees) groups nearby points into leaves. All-pairs distances within each
-   leaf are computed on the GPU and merged into the graph via a proposal
-   buffer. Leaf sizes are dynamically capped to fit within the GPU's shared
-   memory budget (32 KB), so this scales correctly to high dimensions.
-3. **GPU NNDescent iterations**: the standard local join loop runs entirely on
-   the GPU. Each iteration builds reverse edges, evaluates (new, new) and
-   (new, old) candidate pairs in shared memory, and merges proposals into the
-   sorted graph. Convergence is checked by downloading a single `u32` counter
-   per iteration. Typically converges in 4-6 iterations.
-4. **CAGRA graph optimisation**: the NNDescent graph (at degree `build_k`) is
-   pruned to degree `k` using rank-based detour counting, reverse edge
-   construction, and forward/reverse merge. This produces a directed
-   navigational graph with improved long-range reachability for beam search.
-
-Querying uses a GPU beam search kernel: one workgroup per query, with the query
-vector in shared memory, a sorted candidate queue, and a linear-probing hash
-table for visited-node deduplication. Beam width and iteration limits are
-scaled automatically based on `k` and the graph degree via
-`CagraGpuSearchParams::from_graph()`.
-
-#### Parameter guidance
-
-The two key build parameters are `build_k` (internal NNDescent degree before
-CAGRA pruning) and `refine_knn` (number of 2-hop refinement sweeps after
-NNDescent convergence).
-
-**Key parameters:**
+**Tunable parameters:**
 
 * `build_k`: Internal NNDescent degree before CAGRA pruning. Defaults to
-  `1.5 * k`. Higher values give CAGRA more edges to select from when building
-  the navigational graph, at the cost of build time. 3 * k shows diminishing
-  returns.
+  `1.5 * k`. Higher values give CAGRA more edges to choose from when building
+  the navigational graph, at the cost of build time.
 * `refine_knn`: Number of 2-hop refinement sweeps after NNDescent convergence.
   Each sweep evaluates all neighbours-of-neighbours and merges improvements.
-  Defaults to 0. Marginal benefit for beam search recall; primarily improves
-  extract graph quality up to the forest ceiling.
+  Defaults to 0. Mostly a lever on the extracted graph rather than on beam
+  search recall.
 * `n_trees`: Number of random partition trees for forest initialisation.
   Defaults to 5 + n^0.25, capped at 20. More trees raise the raw graph quality
   ceiling but increase build time linearly.
 * `beam_width`: Number of active candidates maintained during beam search.
-  Defaults to 2 * max(k_out, k_graph). Wider beams improve recall at the cost
-  of query latency. Auto-scaled when using CagraGpuSearchParams::from_graph().
+  Defaults to 2 * max(k_out, 16). Wider beams improve recall at the cost of
+  query latency. Auto-scaled when using CagraGpuSearchParams::from_k().
 * `max_beam_iters`: Safety cap on beam search iterations. Defaults to
   3 * beam_width. Most queries terminate naturally well before this limit; it
   only fires for pathological cases where the search keeps discovering better
@@ -222,10 +190,6 @@ NNDescent convergence).
 * `n_entry_points`: Number of seed nodes per query for beam search. Defaults
   to 8. Entry points are sourced from a small Annoy forest (external queries)
   or from the kNN graph's closest neighbours (self-query).
-
-Generally speaking CAGRA allows for very fast querying; however, the generation
-of the index takes a bit more time compared to IVF for example. Also, it "fails"
-in very well clustered data. It works better in data sets
 
 <details>
 <summary><b>GPU NNDescent with CAGRA style pruning - Euclidean (Gaussian)</b>:</summary>
@@ -272,8 +236,6 @@ in very well clustered data. It works better in data sets
 
 #### Larger data sets
 
-Let's test CAGRA similar to IVF GPU on larger data sets.
-
 <details>
 <summary><b>GPU NNDescent with CAGRA style pruning (250k samples; 64 dimensions)</b>:</summary>
 <pre><code>
@@ -308,108 +270,11 @@ Let's test CAGRA similar to IVF GPU on larger data sets.
 </code></pre>
 </details>
 
-#### Two-tier kNN generation
-
-For downstream tasks that require a full kNN graph (e.g. BBKNN, MNN, UMAP,
-Leiden clustering), the index offers three paths with different speed/accuracy
-trade-offs:
-
-| Method | Mechanism | Typical recall | Use case |
-|--------|-----------|---------------|----------|
-| **Extract** | Direct reshape of the NNDescent graph. No search performed. | ~0.9 | Fast, however, lowever precision. |
-| **Self-beam** | GPU beam search over the CAGRA navigational graph for every vector in the index. | 0.99 | Production kNN graphs for all types of applications. |
-
-Below are examples of kNN generation. The dimensions are specifically kept
-quite low to mimic single cell situations. This is where the CAGRA-style part
-is quite performant and can be used to quickly generate kNN graphs from the
-data... To run these, you can use:
-
-```bash
-cargo run --example knn_comparison_cagra --features gpu --release
-```
-
-The application idea here is to use these for large single cell data sets in
-which the kNN can be further accelerated.
-
-<details>
-<summary><b>Generation of a kNN graph with CAGRA (250k samples; 32 dimensions)</b>:</summary>
-<pre><code>
-<!-- BENCH:cagra_knn:euclidean:lowrank:32:250000 -->
-</code></pre>
-</details>
-
----
-
-<details>
-<summary><b>Generation of a kNN graph with CAGRA (250k samples; 64 dimensions)</b>:</summary>
-<pre><code>
-<!-- BENCH:cagra_knn:euclidean:lowrank:64:250000 -->
-</code></pre>
-</details>
-
----
-
-<details>
-<summary><b>Generation of a kNN graph with CAGRA (500k samples; 32 dimensions)</b>:</summary>
-<pre><code>
-<!-- BENCH:cagra_knn:euclidean:lowrank:32:500000 -->
-</code></pre>
-</details>
-
----
-
-<details>
-<summary><b>Generation of a kNN graph with CAGRA (500k samples; 64 dimensions)</b>:</summary>
-<pre><code>
-<!-- BENCH:cagra_knn:euclidean:lowrank:64:500000 -->
-</code></pre>
-</details>
-
----
-
-<details>
-<summary><b>Generation of a kNN graph with CAGRA (1m samples; 32 dimensions)</b>:</summary>
-<pre><code>
-<!-- BENCH:cagra_knn:euclidean:lowrank:32:1000000 -->
-</code></pre>
-</details>
-
----
-
-<details>
-<summary><b>Generation of a kNN graph with CAGRA (1m samples; 64 dimensions)</b>:</summary>
-<pre><code>
-<!-- BENCH:cagra_knn:euclidean:lowrank:64:1000000 -->
-</code></pre>
-</details>
-
-Let's do one large data set with 2.5m samples at 32 dimensions and see what
-happens ... ?
-
-<details>
-<summary><b>Generation of a kNN graph with CAGRA (2.5m samples; 32 dimensions)</b>:</summary>
-<pre><code>
-<!-- BENCH:cagra_knn:euclidean:lowrank:32:2500000 -->
-</code></pre>
-</details>
-
-Especially on larger data sets, we can accelerate the queries substantially
-and get up to 2x to 3x speed increases to generate the full kNN graph with
-Recall@k of ≥0.99. If you are okay with a graph that has Recall ≥0.9 you
-can do that in <10 seconds on a million samples or ~30 seconds on 2.5 million
-samples (with n_dim = 32 dim). Also, the data is very contrived here... On real
-data, NNDescent will have to do quite a few iterations. The Annoy
-initialisations are already very good, so the CPU version basically has no
-need for refining the kNN graph. On real data, the GPU outperforms more
-substantially.
-
 ### Navigating Spread-out Graph (NSG) with GPU-accelerated kNN generation
 
-NSG needs an initial kNN graph to run the NSG optimisation on top. The standard
-CPU version is using NNDescent; however, you can also use the NNDescent
-algorithm that is used for CAGRA to initialise the kNN. This does make a
-difference on larger and larger data sets with higher and higher
-dimensionality.
+NSG builds on top of an existing kNN graph. The CPU path uses NN-Descent; the
+GPU path swaps in the same NN-Descent that feeds CAGRA. The two columns below
+differ only in that initialisation step.
 
 <details>
 <summary><b>NSG with CPU initialisation</b>:</summary>

@@ -28,6 +28,7 @@ use crate::binary::turboquant::{
 };
 use crate::binary::vec_store::*;
 use crate::prelude::*;
+use crate::utils::pack_knn_results;
 
 /// Exhaustive TurboQuant index.
 ///
@@ -171,7 +172,10 @@ where
         let (vectors_flat, n, dim) = data.into_row_major();
         let mut index = Self::new((&vectors_flat[..], n, dim), metric, bits, seed)?;
 
-        let norms: Vec<T> = vectors_flat.chunks_exact(dim).map(compute_l2_norm).collect();
+        let norms: Vec<T> = vectors_flat
+            .chunks_exact(dim)
+            .map(compute_l2_norm)
+            .collect();
 
         std::fs::create_dir_all(&save_path)?;
         let (vectors_path, norms_path) = MmapVectorStore::<T>::paths_in(&save_path);
@@ -555,13 +559,7 @@ where
             nested.into_iter().flatten().collect()
         };
 
-        if return_dist {
-            let (indices, distances) = results.into_iter().unzip();
-            Ok((indices, Some(distances)))
-        } else {
-            let indices = results.into_iter().map(|(idx, _)| idx).collect();
-            Ok((indices, None))
-        }
+        Ok(pack_knn_results(results, return_dist))
     }
 
     /// Build the full kNN graph over all stored vectors.
@@ -684,13 +682,7 @@ where
             nested.into_iter().flatten().collect()
         };
 
-        if return_dist {
-            let (indices, distances) = results.into_iter().unzip();
-            Ok((indices, Some(distances)))
-        } else {
-            let indices = results.into_iter().map(|(idx, _)| idx).collect();
-            Ok((indices, None))
-        }
+        Ok(pack_knn_results(results, return_dist))
     }
 
     /// Number of stored vectors.
@@ -1010,6 +1002,9 @@ mod tests {
                 for i in 0..7 {
                     let (si, sd) = index.query(&row(&queries, i), 10).unwrap();
                     assert_eq!(batch_idx[i], si, "{metric:?} bits {bits} query {i} indices");
+                    // query_batch clamps negative distances at the packing
+                    // boundary; the single-row `query` below it does not.
+                    let sd: Vec<f32> = sd.into_iter().map(|d| d.max(0.0)).collect();
                     assert_eq!(batch_dist[i], sd, "{metric:?} bits {bits} query {i} dists");
                 }
             }
@@ -1040,6 +1035,9 @@ mod tests {
                 .query_reranking(&row(&queries, i), 10, Some(10))
                 .unwrap();
             assert_eq!(batch_idx[i], si, "query {i} indices");
+            // query_batch clamps negative distances at the packing boundary;
+            // the single-row `query_reranking` below it does not.
+            let sd: Vec<f32> = sd.into_iter().map(|d| d.max(0.0)).collect();
             assert_eq!(batch_dist[i], sd, "query {i} dists");
         }
     }

@@ -6,15 +6,16 @@
 
 pub use crate::errors::AnnSearchErrors;
 pub use crate::utils::dist::*;
+pub use crate::utils::graph_utils::ThreadLocalSearchState;
 pub use crate::utils::heap_structs::*;
-pub use crate::utils::k_means_utils::{KMeansInit, KMeansTrainingParams, LloydPath, SoarRule};
 pub use crate::utils::input::AnnMatrix;
+pub use crate::utils::k_means_utils::{KMeansInit, KMeansTrainingParams, LloydPath, SoarRule};
 pub use crate::utils::matrix_to_flat;
-pub use crate::utils::FlattenData;
 pub use crate::utils::parallelism::StripedLocks;
 pub use crate::utils::prefetch_read;
 pub use crate::utils::traits::AnnSearchFloat;
 pub use crate::utils::DimensionValidation;
+pub use crate::utils::FlattenData;
 
 #[cfg(feature = "gpu")]
 pub use crate::gpu::cagra_gpu_search::CagraGpuSearchParams;
@@ -25,8 +26,17 @@ pub use crate::gpu::cagra_gpu_search::CagraGpuSearchParams;
 pub use crate::gpu::clustered_nndescent_gpu::ClusteredBuildParams;
 #[cfg(feature = "gpu")]
 pub use crate::gpu::k_means_gpu::KMeansGpuParams;
+// The two GPU NN-Descent result types. `KnnGraphGpu` in particular appears in
+// the signatures of `build_knn_graph_gpu`, `build_nsg_from_gpu_knn` and
+// `extract_knn_graph_gpu`, so leaving it out forces callers to name the module
+// path by hand.
+#[cfg(feature = "gpu")]
+pub use crate::gpu::nndescent_gpu::{KnnGraphGpu, NNDescentGpu};
 #[cfg(feature = "gpu")]
 pub use cubecl_utils_rs::CubeclFloat;
+
+#[cfg(feature = "quantised")]
+pub use crate::quantised::uniform_quant::UniformQuantParams;
 
 #[cfg(feature = "serialise")]
 pub use crate::serialise::IndexIo;
@@ -43,3 +53,8 @@ pub type KnnOptionResult<T> = Result<(Vec<Vec<usize>>, Option<Vec<Vec<T>>>), Ann
 
 /// Results type for large approximate nearest neighbour searches.
 pub type KnnResult<T> = Result<(Vec<Vec<usize>>, Vec<Vec<T>>), AnnSearchErrors>;
+
+/// Per-query results before they are packed into a [`KnnOptionResult`].
+///
+/// One `(indices, distances)` pair per query, in query order.
+pub type KnnBatchResult<T> = Result<Vec<(Vec<usize>, Vec<T>)>, AnnSearchErrors>;

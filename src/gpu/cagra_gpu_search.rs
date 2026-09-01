@@ -102,18 +102,17 @@ impl CagraGpuSearchParams {
         self.n_entry_points.unwrap_or(N_ENTRY_POINTS)
     }
 
-    /// Create params with defaults scaled to the graph and query parameters.
+    /// Create params with the beam scaled to the requested `k`.
     ///
     /// ### Params
     ///
     /// * `k_out` - Number of neighbours to return per query
-    /// * `k_graph` - Degree of the navigational graph
     ///
     /// ### Returns
     ///
     /// Params with beam width and iterations scaled appropriately
-    pub fn from_graph(k_out: usize, k_graph: usize) -> Self {
-        let beam_width = k_out.max(k_graph).max(16) * 2;
+    pub fn from_k(k_out: usize) -> Self {
+        let beam_width = k_out.max(BEAM_WIDTH) * 2;
         let max_beam_iters = beam_width * 3;
         Self {
             beam_width: Some(beam_width),
@@ -896,6 +895,7 @@ where
         })
         .collect();
 
+    // Cosine can round a self-distance to just under zero.
     let distances: Vec<Vec<T>> = (0..n_queries)
         .map(|i| {
             (0..k_out)
@@ -903,7 +903,14 @@ where
                     let pid = (idx_flat[i * k_out + j] & 0x7FFFFFFFu32) as usize;
                     pid < n && pid != sentinel_usize
                 })
-                .map(|j| dist_flat[i * k_out + j])
+                .map(|j| {
+                    let d = dist_flat[i * k_out + j];
+                    if d < T::zero() {
+                        T::zero()
+                    } else {
+                        d
+                    }
+                })
                 .collect()
         })
         .collect();

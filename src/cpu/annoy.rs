@@ -1,7 +1,7 @@
 //! Annoy implementation in ann-search-rs. This is an in-memory implementation
 //! of Annoy in Rust.
 
-use faer::{RowRef};
+use faer::RowRef;
 use fixedbitset::FixedBitSet;
 use rand::{rngs::StdRng, Rng, SeedableRng};
 use rayon::prelude::*;
@@ -552,6 +552,68 @@ where
 // Query //
 ///////////
 
+/// Reusable per-query scratch for [`AnnoyIndex::query_into`].
+///
+/// A tree search allocates nothing on its own: `init_with_forest` issues one
+/// query per node, so a fresh bitset per call meant `n` allocations of `n / 8`
+/// zeroed bytes, which is quadratic in memset traffic and dominated graph
+/// seeding.
+///
+/// `visited` is cleared by unsetting only the bits the last query touched,
+/// which is bounded by the search budget rather than by `n`. Every visited item
+/// also lands in `candidates`, so that buffer is the list of bits to clear.
+pub struct AnnoyScratch<T> {
+    /// One bit per item, marking what the current query has already scored
+    visited: FixedBitSet,
+    /// `(distance, item)` for every item scored by the current query
+    candidates: Vec<(T, usize)>,
+    /// Backtracking frontier over unexplored branches
+    pq: BinaryHeap<BacktrackEntry>,
+}
+
+impl<T> Default for AnnoyScratch<T> {
+    fn default() -> Self {
+        Self {
+            visited: FixedBitSet::new(),
+            candidates: Vec::new(),
+            pq: BinaryHeap::new(),
+        }
+    }
+}
+
+impl<T> AnnoyScratch<T> {
+    /// Create empty scratch. Buffers size themselves on first use.
+    ///
+    /// ### Returns
+    ///
+    /// Scratch with no allocation yet.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Results of the last query as `(distance, original_id)`, nearest first.
+    ///
+    /// ### Returns
+    ///
+    /// The sorted top-`k` left by [`AnnoyIndex::query_into`].
+    pub fn results(&self) -> &[(T, usize)] {
+        &self.candidates
+    }
+
+    /// Overwrite the results buffer.
+    ///
+    /// Only used by the Kd fallback in the NN-Descent forest, which has no
+    /// allocation-free search of its own.
+    ///
+    /// ### Params
+    ///
+    /// * `items` - `(distance, original_id)` pairs, nearest first
+    pub fn set_candidates(&mut self, items: impl Iterator<Item = (T, usize)>) {
+        self.candidates.clear();
+        self.candidates.extend(items);
+    }
+}
+
 impl<T> AnnoyIndex<T>
 where
     T: AnnSearchFloat,
@@ -580,14 +642,48 @@ where
         k: usize,
         search_k: Option<usize>,
     ) -> Result<(Vec<usize>, Vec<T>), AnnSearchErrors> {
+        let mut scratch = AnnoyScratch::new();
+        self.query_into(query_vec, k, search_k, &mut scratch)?;
+
+        Ok(scratch.candidates.into_iter().map(|(d, i)| (i, d)).unzip())
+    }
+
+    /// Search into caller-owned scratch, leaving the sorted top-`k` in
+    /// `scratch.candidates` as `(distance, original_id)` pairs.
+    ///
+    /// This is the allocation-free form. [`Self::query`] wraps it and pays for
+    /// the two output `Vec`s; callers issuing one query per point should use
+    /// this directly.
+    ///
+    /// ### Params
+    ///
+    /// * `query_vec` - Query vector (must match index dimensionality)
+    /// * `k` - Number of neighbours to return
+    /// * `search_k` - Budget of items to examine, defaults to `k * n_trees * 20`
+    /// * `scratch` - Reusable buffers, reset on entry
+    ///
+    /// ### Returns
+    ///
+    /// `Ok(())`, with results left in `scratch.candidates`.
+    pub fn query_into(
+        &self,
+        query_vec: &[T],
+        k: usize,
+        search_k: Option<usize>,
+        scratch: &mut AnnoyScratch<T>,
+    ) -> Result<(), AnnSearchErrors> {
         self.check_dim(query_vec.len())?;
 
         let limit = search_k.unwrap_or(k * self.n_trees * 20);
         let mut visited_count = 0;
 
-        // FixedBitSet is < 20KB for 150k nodes. L1 Cache loves this.
-        // (If you use thread locals, keep this in a RefCell to avoid the alloc)
-        let mut visited = FixedBitSet::with_capacity(self.n);
+        if scratch.visited.len() < self.n {
+            scratch.visited.grow(self.n);
+        }
+        scratch.candidates.clear();
+        scratch.candidates.reserve(limit);
+        scratch.pq.clear();
+        scratch.pq.reserve(self.n_trees * 2);
 
         let query_norm = if self.metric == Dist::Cosine {
             query_vec
@@ -599,11 +695,11 @@ where
             T::one()
         };
 
-        // Replace the heap with a flat vector sized exactly to our search budget
-        let mut candidates: Vec<(T, usize)> = Vec::with_capacity(limit);
-
-        // We still need the PQ for tree traversal, but this is much lower volume
-        let mut pq = BinaryHeap::with_capacity(self.n_trees * 2);
+        let AnnoyScratch {
+            visited,
+            candidates,
+            pq,
+        } = scratch;
 
         for &root in &self.roots {
             pq.push(BacktrackEntry {
@@ -675,6 +771,14 @@ where
             }
         }
 
+        // Clear the visited bits before truncating: every scored item is in
+        // `candidates`, so this is bounded by the search budget rather than by
+        // `n`, which is the whole point of reusing the bitset.
+        for &(_, item) in candidates.iter() {
+            visited.remove(item);
+        }
+        pq.clear();
+
         // O(N) selection of the top K elements
         if candidates.len() > k {
             candidates.select_nth_unstable_by(k - 1, |a, b| {
@@ -687,14 +791,11 @@ where
         candidates
             .sort_unstable_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
 
-        Ok(candidates
-            .into_iter()
-            .map(|(dist, idx)| {
-                // remap
-                let original_idx = self.original_ids[idx];
-                (original_idx, dist)
-            })
-            .unzip())
+        for entry in candidates.iter_mut() {
+            entry.1 = self.original_ids[entry.1];
+        }
+
+        Ok(())
     }
 
     /// Query using a matrix row reference
@@ -797,6 +898,7 @@ where
             }
         }
 
+        fix_neg_dist(&mut final_dists);
         Ok((final_indices, final_dists))
     }
 }

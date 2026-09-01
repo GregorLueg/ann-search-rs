@@ -1,6 +1,6 @@
 //! BallTree implementation in ann-search-rs.
 
-use faer::{RowRef};
+use faer::RowRef;
 use num_traits::Float;
 use rand::{rngs::StdRng, Rng, SeedableRng};
 use rayon::prelude::*;
@@ -313,7 +313,11 @@ where
     /// ### Returns
     ///
     /// Index ready for querying
-    pub fn new(data: impl AnnMatrix<T>, metric: Dist, seed: usize) -> Result<Self, AnnSearchErrors> {
+    pub fn new(
+        data: impl AnnMatrix<T>,
+        metric: Dist,
+        seed: usize,
+    ) -> Result<Self, AnnSearchErrors> {
         if metric == Dist::Manhattan {
             return Err(AnnSearchErrors::DistanceNotSupported(metric));
         }
@@ -1041,13 +1045,7 @@ where
             })
             .collect::<Result<Vec<_>, AnnSearchErrors>>()?;
 
-        if return_dist {
-            let (indices, distances) = results.into_iter().unzip();
-            Ok((indices, Some(distances)))
-        } else {
-            let indices: Vec<Vec<usize>> = results.into_iter().map(|(idx, _)| idx).collect();
-            Ok((indices, None))
-        }
+        Ok(pack_knn_results(results, return_dist))
     }
 }
 

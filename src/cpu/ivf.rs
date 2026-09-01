@@ -1,7 +1,7 @@
 //! Inverted file index. Leverages k-means clustering to partition data into
 //! Voronoi cells that are being searched during querying.
 
-use faer::{RowRef};
+use faer::RowRef;
 use rayon::prelude::*;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -363,28 +363,55 @@ where
             self.get_centroids_dist(query_vec, query_norm, nprobe);
         let probed = select_probed_clusters(&mut cluster_dists, &self.offsets, nprobe, k);
 
-        // 2. search only those clusters in the CSR layout
-        let mut buffer = SortedBuffer::with_capacity(k);
+        // 2. search only those clusters in the CSR layout.
+        //
+        // `optimise_memory_layout` sorted the rows by cell, so a cell is one
+        // contiguous slab and the scan can take four rows at a time with no
+        // gather. The metric is resolved once per query rather than per row.
+        let mut heap = BoundedMaxHeap::new(k);
 
         for cluster_idx in probed {
             let start = self.offsets[cluster_idx];
             let end = self.offsets[cluster_idx + 1];
+            let tail = start + (end - start) / 4 * 4;
 
-            for vec_idx in start..end {
-                let dist = match self.metric {
-                    Dist::SquaredEuclidean => self.euclidean_distance_to_query(vec_idx, query_vec),
-                    Dist::Cosine => self.cosine_distance_to_query(vec_idx, query_vec, query_norm),
-                    Dist::Manhattan => unreachable!(),
-                };
-                buffer.insert((OrderedFloat(dist), vec_idx), k);
+            match self.metric {
+                Dist::SquaredEuclidean => {
+                    for base in (start..tail).step_by(4) {
+                        let dists = self.euclidean_distance_to_query_4(base, query_vec);
+                        for k_off in 0..4 {
+                            heap.push(dists[k_off], base + k_off);
+                        }
+                    }
+                    for vec_idx in tail..end {
+                        heap.push(
+                            self.euclidean_distance_to_query(vec_idx, query_vec),
+                            vec_idx,
+                        );
+                    }
+                }
+                Dist::Cosine => {
+                    for base in (start..tail).step_by(4) {
+                        let dists = self.cosine_distance_to_query_4(base, query_vec, query_norm);
+                        for k_off in 0..4 {
+                            heap.push(dists[k_off], base + k_off);
+                        }
+                    }
+                    for vec_idx in tail..end {
+                        heap.push(
+                            self.cosine_distance_to_query(vec_idx, query_vec, query_norm),
+                            vec_idx,
+                        );
+                    }
+                }
+                Dist::Manhattan => unreachable!(),
             }
         }
 
-        let (distances, indices) = buffer
-            .data()
-            .iter()
-            .map(|(d, i)| (d.0, self.original_ids[*i]))
-            .unzip();
+        heap.sort();
+
+        let distances = heap.dists().to_vec();
+        let indices = heap.ids().iter().map(|i| self.original_ids[*i]).collect();
 
         Ok((indices, distances))
     }
@@ -485,6 +512,7 @@ where
             }
         }
 
+        fix_neg_dist(&mut final_dists);
         Ok((final_indices, final_dists))
     }
 }
