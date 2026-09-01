@@ -38,16 +38,18 @@ permissions:
   id-token: write
 
 jobs:
-  release:
+  # Version check, tag, GitHub release and the wheel matrix. Leaves the built
+  # wheels as `dist-*` artefacts.
+  build:
     uses: GregorLueg/personal-actions/.github/workflows/python-maturin-release.yml@feat/python-workflows
     with:
-      # A dispatch takes what the form asked for. Anything else, meaning the
-      # automatic run after a green test on main, takes the constants below.
-      #
-      # SAFETY CATCH: those constants are both false until the first release is
-      # ready, so an ordinary push builds wheels and writes nothing. Flipping
-      # them to true is the commit that arms automatic releases.
-      publish: ${{ github.event_name == 'workflow_dispatch' && inputs.publish || false }}
+      # Always true, and it does not mean "upload". It only decides whether the
+      # version is checked against the index before anything is built, so an
+      # already-published version costs one cheap job instead of three wheel
+      # builds. Whether an upload happens is the `publish` job's `if:` below.
+      publish: true
+
+      # SAFETY CATCH, flipped to true to arm automatic tagging.
       tag: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || false }}
       # A choice rather than a free-text URL: the first rehearsal went ten
       # minutes into the wheel matrix before dying on a branch name pasted into
@@ -58,4 +60,43 @@ jobs:
       # not known to round-trip. Wheels only until `maturin sdist` plus a clean
       # install has been shown to work.
       sdist: false
-      environment: pypi
+
+  # The upload lives here rather than in the reusable workflow, and has to.
+  # PyPI's trusted publishing matches the OIDC token's `job_workflow_ref`, which
+  # for a reusable workflow points at the *other* repository, and the publisher
+  # form cannot express that (pypi/warehouse#11096). Running it here makes
+  # `job_workflow_ref` this file, which is what the PyPI publisher names.
+  #
+  # So the trusted publisher on PyPI must be configured as:
+  #   owner GregorLueg, repo ann-search-rs, workflow python-release.yml,
+  #   environment pypi
+  publish:
+    name: Publish to PyPI
+    needs: build
+    # SAFETY CATCH: the `false` on the last line is the arming switch. Flip it
+    # to true and a green test on main publishes on its own; until then only a
+    # deliberate dispatch with `publish` ticked uploads anything.
+    if: >-
+      needs.build.outputs.should-build == 'true' &&
+      (github.event_name == 'workflow_dispatch' && inputs.publish
+       || github.event_name != 'workflow_dispatch' && false)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    environment: pypi
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: dist-*
+          merge-multiple: true
+          path: dist
+
+      - name: List what is about to be uploaded
+        run: ls -la dist
+
+      - uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: dist
+          repository-url: ${{ inputs.index == 'testpypi' && 'https://test.pypi.org/legacy/' || 'https://upload.pypi.org/legacy/' }}
+          print-hash: true
