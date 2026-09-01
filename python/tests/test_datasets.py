@@ -17,8 +17,12 @@ from ann_search import datasets
 #: `cargo test --release --features synthetic synthetic:: -- --nocapture`.
 RUST_CHECKSUMS: dict[str, float] = {
     "clustered": -31.3424437950,
-    "correlated": -10.5021020907,
-    "low_rank": 24.9665956914,
+    # Re-pinned 2026-09-01 from `test_print_cross_language_checksums`. Both
+    # drifted from deliberate generator changes, not from a regression:
+    # `correlated` when bridging was added to it in 771c6ae, `low_rank` when
+    # DEFAULT_TRAJECTORY_FRACTION went 0.15 -> 0.2.
+    "correlated": -9.4556382021,
+    "low_rank": 14.4048010631,
     "cell": 199.4125903296,
 }
 

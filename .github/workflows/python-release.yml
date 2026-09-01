@@ -23,8 +23,18 @@ permissions:
 
 jobs:
   release:
-    uses: GregorLueg/personal-actions/.github/workflows/python-maturin-release.yml@v1
+    uses: GregorLueg/personal-actions/.github/workflows/python-maturin-release.yml@feat/python-workflows
     with:
+      # SAFETY CATCH, both flipped to true when the first release is ready.
+      #
+      # `workflow_dispatch` only works for workflows on the default branch, so
+      # this file has to be on main before it can be dispatched even once. With
+      # both off it is inert on every push and still dispatchable for the wheel
+      # rehearsal, which is the only way to prove a manylinux container can
+      # compile the wgpu stack before a tag or an upload exists.
+      tag: false
+      publish: false
+
       # The sdist would carry a `path` dependency on the parent crate, which is
       # not known to round-trip. Wheels only until `maturin sdist` plus a clean
       # install has been shown to work.

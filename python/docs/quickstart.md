@@ -64,7 +64,14 @@ for ef in (50, 100, 200):
     print(f"ef_search={ef:>3}  recall={recall(found, truth):.4f}")
 ```
 
-Recall climbs with `ef_search` and so does query time. Where you stop is a
+```text
+ef_search= 50  recall=0.9883
+ef_search=100  recall=0.9946
+ef_search=200  recall=0.9967
+```
+
+Recall climbs with `ef_search` and so does query time. On an M1 Max that sweep
+is 0.13s, 0.20s and 0.37s, against a 0.39s build. Where you stop is a
 judgement about your problem, not something the library can decide. Build-time
 knobs (`m`, `ef_construction`) need a refit to change, which is why the sweep
 above only moves the one that doesn't.
@@ -78,6 +85,13 @@ nnd = ann.NNDescentIndex(n_neighbors=15, max_candidates=30).fit(X)
 found = nnd.extract_knn(return_distance=False)
 print(f"extract_knn  recall={recall(found, truth):.4f}")
 ```
+
+```text
+extract_knn  recall=0.9975
+```
+
+Worth noticing: that beats HNSW at `ef_search=200` on the same data, off a build
+of comparable cost. `kneighbors()` on the same index reaches 0.9987.
 
 `extract_knn` reads the graph the descent already built. `kneighbors()` on the
 same index runs a beam search over it instead, which costs more and usually
@@ -103,6 +117,12 @@ for nprobe in (4, 16, 64):
     print(f"nprobe={nprobe:>3}  recall={recall(found, truth_q):.4f}")
 ```
 
+```text
+nprobe=  4  recall=0.8219
+nprobe= 16  recall=0.9995
+nprobe= 64  recall=1.0000
+```
+
 `IvfIndex` leaves both `nlist` and `nprobe` at `None` here, so the crate picks
 `sqrt(n)` cells and probes `sqrt(nlist)` of them. The sweep overrides only the
 query-time half.
@@ -122,8 +142,10 @@ neighbour_labels = np.full(indices.shape, -1, dtype=labels.dtype)
 neighbour_labels[mask] = labels[indices[mask]]
 ```
 
-`np.take` on a `-1` will happily wrap around to the last row and hand you a
-plausible wrong answer, which is the failure mode worth guarding against.
+On this data nothing comes back short, which is the normal case. Do the check
+anyway: `np.take` on a `-1` wraps around to the last row and hands you a
+plausible wrong answer rather than an error, which is the failure mode worth
+guarding against.
 
 ## 3. A sparse graph, and keeping it
 
@@ -147,16 +169,32 @@ The estimators implement `get_params`, `set_params`, `fit` and `transform`, so
 the same object drops in wherever a `KNeighborsTransformer` is expected:
 
 ```python
+from sklearn.model_selection import cross_val_score
+from sklearn.neighbors import KNeighborsClassifier
 from sklearn.pipeline import make_pipeline
-from sklearn.cluster import DBSCAN
+
+X, y = datasets.make_clustered(n_samples=5_000, dim=32, n_clusters=8, seed=1)
 
 pipe = make_pipeline(
-    ann.HnswIndex(n_neighbors=15, metric="cosine"),
-    DBSCAN(metric="precomputed", eps=0.3, min_samples=5),
+    ann.HnswIndex(n_neighbors=15, metric="euclidean"),
+    KNeighborsClassifier(n_neighbors=10, metric="precomputed"),
 )
+print(cross_val_score(pipe, X, y, cv=3))
+```
+
+```text
+[1.     0.9988 0.9196]
 ```
 
 scikit-learn isn't an install requirement for any of that; it's duck-typing.
+
+Two things to know when handing the graph to scikit-learn. It warns that the
+rows aren't sorted by value, which is cosmetic: pass the graph through
+`sklearn.neighbors.sort_graph_by_row_values` to silence it. And anything that
+validates a precomputed matrix as non-negative, `DBSCAN` included, will reject a
+**cosine** graph, because cosine distances can land one float32 ulp below zero
+(`-2.4e-07`) for a point against itself. Clip with
+`graph.data.clip(0, out=graph.data)` or use a Euclidean graph.
 
 Building an index is the expensive part, so keep it:
 

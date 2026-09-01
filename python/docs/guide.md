@@ -34,6 +34,21 @@ labels_out[mask] = labels[indices[mask]]
 `kneighbors_graph` already drops them, so rows there can hold fewer than `k`
 entries.
 
+## A cosine wart
+
+Cosine distance is computed as `1 - dot / (|x| |y|)`, and for a point against
+itself that ratio can round to just above 1, so the distance lands one float32
+ulp below zero (`-2.4e-07`). Harmless for ordering, but anything validating a
+precomputed distance matrix as non-negative rejects it. `DBSCAN` and friends do.
+Clip before handing a cosine graph over:
+
+```python
+graph = index.kneighbors_graph()
+graph.data.clip(0, out=graph.data)
+```
+
+Euclidean is unaffected; it's already clamped at zero.
+
 ## Input types
 
 `fit` takes anything `np.asarray` handles at shape `(n_samples, n_features)`.

@@ -64,6 +64,26 @@ const GEMM_BLOCKS_PER_THREAD: usize = 4;
 /// resident: 1024 rows is 512 KB at `dim = 128` and `f32`.
 const GEMM_DB_TILE: usize = 1024;
 
+/// Over-fetch for the GEMM path's candidate selection, as a fraction of `k`.
+///
+/// The GEMM path scores with `|x|^2 + |y|^2 - 2x.y`, which cancels: the
+/// subtraction loses roughly `log10(|y|^2 / d^2)` digits, and at `f32` that is
+/// enough to rank a true neighbour just outside the top `k` when its distance
+/// differs from the k-th by about one part in 1e6. The exact re-rank below
+/// cannot recover such a point, because the heap never selected it, so the
+/// scan keeps `k * 3/2` candidates and the re-rank truncates.
+///
+/// Measured: with no over-fetch, 1 to 3 rows per 2000 queries disagree with
+/// the fused scan on 20k x 64 clustered and cell-embedding data at `k` of 10,
+/// 15 and 50. At `3/2` the disagreement is zero across all six.
+///
+/// The reject path in `BoundedMaxHeap::push` short-circuits on one float
+/// comparison, so a wider heap barely touches the inner scan. What it costs is
+/// that many more exact distance computations per query, against `n`
+/// approximate ones.
+const GEMM_RERANK_NUM: usize = 3;
+const GEMM_RERANK_DEN: usize = 2;
+
 /////////////
 // Helpers //
 /////////////
@@ -432,6 +452,12 @@ where
         let n = self.n;
         let two = T::one() + T::one();
         let cosine = self.metric == Dist::Cosine;
+        // Over-fetch on the approximate scores, then let the exact re-rank
+        // decide. See `GEMM_RERANK_NUM`.
+        let rerank_k = k
+            .saturating_mul(GEMM_RERANK_NUM)
+            .div_ceil(GEMM_RERANK_DEN)
+            .min(n);
 
         // Database norms are recomputed per batch rather than stored on the
         // index: O(n * dim) against the O(nq * n * dim) of the search itself,
@@ -477,7 +503,7 @@ where
                 let bq = i1 - i0;
 
                 let mut heaps: Vec<BoundedMaxHeap<T>> =
-                    (0..bq).map(|_| BoundedMaxHeap::new(k)).collect();
+                    (0..bq).map(|_| BoundedMaxHeap::new(rerank_k)).collect();
 
                 let x_block = MatRef::from_row_major_slice(&queries[i0 * dim..i1 * dim], bq, dim);
 
@@ -562,6 +588,7 @@ where
 
                         exact
                             .into_iter()
+                            .take(k)
                             .map(|(OrderedFloat(dist), j)| (j, dist))
                             .unzip()
                     })
