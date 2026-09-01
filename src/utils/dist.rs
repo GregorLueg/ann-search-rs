@@ -26,12 +26,7 @@ use std::arch::x86_64::*;
 
 /// Number of independent accumulator chains in the SIMD reduction loops.
 ///
-/// A single accumulator makes every iteration wait on the previous add, so
-/// throughput is capped at one vector operation per FP-add latency regardless
-/// of vector width. That is roughly an eighth of what two AVX512 FMA ports can
-/// retire and about a twelfth of Apple's four FP pipes. Four independent chains
-/// recover most of the gap without spilling registers on any supported ISA;
-/// eight only pays on AVX512 and costs on the narrower paths.
+/// Heuristic and other libraries tend to use 4 here, too.
 const SIMD_ACCUMULATORS: usize = 4;
 
 ////////////
@@ -398,8 +393,6 @@ fn euclidean_f32_sse(a: &[f32], b: &[f32]) -> f32 {
         let a_ptr = a.as_ptr();
         let b_ptr = b.as_ptr();
 
-        // Four independent chains, so the loop is bound by FP throughput
-        // rather than by the latency of one accumulator.
         while offset + block <= len {
             let d0 = f32x4::from(*(a_ptr.add(offset) as *const [f32; 4]))
                 - f32x4::from(*(b_ptr.add(offset) as *const [f32; 4]));
@@ -460,8 +453,6 @@ fn euclidean_f32_avx2(a: &[f32], b: &[f32]) -> f32 {
         let a_ptr = a.as_ptr();
         let b_ptr = b.as_ptr();
 
-        // Four independent chains, so the loop is bound by FP throughput
-        // rather than by the latency of one accumulator.
         while offset + block <= len {
             let d0 = f32x8::from(*(a_ptr.add(offset) as *const [f32; 8]))
                 - f32x8::from(*(b_ptr.add(offset) as *const [f32; 8]));
@@ -521,8 +512,6 @@ fn euclidean_f32_avx512(a: &[f32], b: &[f32]) -> f32 {
         let mut acc2 = _mm512_setzero_ps();
         let mut acc3 = _mm512_setzero_ps();
 
-        // Four independent chains: an FMA has four-cycle latency against two
-        // issue ports, so one accumulator would use an eighth of the unit.
         while offset + block <= len {
             let d0 = _mm512_sub_ps(
                 _mm512_loadu_ps(a.as_ptr().add(offset)),
@@ -627,8 +616,6 @@ fn euclidean_f64_sse(a: &[f64], b: &[f64]) -> f64 {
         let a_ptr = a.as_ptr();
         let b_ptr = b.as_ptr();
 
-        // Four independent chains, so the loop is bound by FP throughput
-        // rather than by the latency of one accumulator.
         while offset + block <= len {
             let d0 = f64x2::from(*(a_ptr.add(offset) as *const [f64; 2]))
                 - f64x2::from(*(b_ptr.add(offset) as *const [f64; 2]));
@@ -689,8 +676,6 @@ fn euclidean_f64_avx2(a: &[f64], b: &[f64]) -> f64 {
         let a_ptr = a.as_ptr();
         let b_ptr = b.as_ptr();
 
-        // Four independent chains, so the loop is bound by FP throughput
-        // rather than by the latency of one accumulator.
         while offset + block <= len {
             let d0 = f64x4::from(*(a_ptr.add(offset) as *const [f64; 4]))
                 - f64x4::from(*(b_ptr.add(offset) as *const [f64; 4]));
@@ -750,8 +735,6 @@ fn euclidean_f64_avx512(a: &[f64], b: &[f64]) -> f64 {
         let mut acc2 = _mm512_setzero_pd();
         let mut acc3 = _mm512_setzero_pd();
 
-        // Four independent chains: an FMA has four-cycle latency against two
-        // issue ports, so one accumulator would use an eighth of the unit.
         while offset + block <= len {
             let d0 = _mm512_sub_pd(
                 _mm512_loadu_pd(a.as_ptr().add(offset)),
@@ -849,8 +832,6 @@ fn dot_f32_sse(a: &[f32], b: &[f32]) -> f32 {
         let a_ptr = a.as_ptr();
         let b_ptr = b.as_ptr();
 
-        // Four independent chains, so the loop is bound by FP throughput
-        // rather than by the latency of one accumulator.
         while offset + block <= len {
             let a0 = f32x4::from(*(a_ptr.add(offset) as *const [f32; 4]));
             let b0 = f32x4::from(*(b_ptr.add(offset) as *const [f32; 4]));
@@ -909,8 +890,6 @@ fn dot_f32_avx2(a: &[f32], b: &[f32]) -> f32 {
         let a_ptr = a.as_ptr();
         let b_ptr = b.as_ptr();
 
-        // Four independent chains, so the loop is bound by FP throughput
-        // rather than by the latency of one accumulator.
         while offset + block <= len {
             let a0 = f32x8::from(*(a_ptr.add(offset) as *const [f32; 8]));
             let b0 = f32x8::from(*(b_ptr.add(offset) as *const [f32; 8]));
@@ -968,8 +947,6 @@ fn dot_f32_avx512(a: &[f32], b: &[f32]) -> f32 {
         let mut acc2 = _mm512_setzero_ps();
         let mut acc3 = _mm512_setzero_ps();
 
-        // Four independent chains: an FMA has four-cycle latency against two
-        // issue ports, so one accumulator would use an eighth of the unit.
         while offset + block <= len {
             let a0 = _mm512_loadu_ps(a.as_ptr().add(offset));
             let b0 = _mm512_loadu_ps(b.as_ptr().add(offset));
@@ -1058,8 +1035,6 @@ fn dot_f64_sse(a: &[f64], b: &[f64]) -> f64 {
         let a_ptr = a.as_ptr();
         let b_ptr = b.as_ptr();
 
-        // Four independent chains, so the loop is bound by FP throughput
-        // rather than by the latency of one accumulator.
         while offset + block <= len {
             let a0 = f64x2::from(*(a_ptr.add(offset) as *const [f64; 2]));
             let b0 = f64x2::from(*(b_ptr.add(offset) as *const [f64; 2]));
@@ -1118,8 +1093,6 @@ fn dot_f64_avx2(a: &[f64], b: &[f64]) -> f64 {
         let a_ptr = a.as_ptr();
         let b_ptr = b.as_ptr();
 
-        // Four independent chains, so the loop is bound by FP throughput
-        // rather than by the latency of one accumulator.
         while offset + block <= len {
             let a0 = f64x4::from(*(a_ptr.add(offset) as *const [f64; 4]));
             let b0 = f64x4::from(*(b_ptr.add(offset) as *const [f64; 4]));
@@ -1177,8 +1150,6 @@ fn dot_f64_avx512(a: &[f64], b: &[f64]) -> f64 {
         let mut acc2 = _mm512_setzero_pd();
         let mut acc3 = _mm512_setzero_pd();
 
-        // Four independent chains: an FMA has four-cycle latency against two
-        // issue ports, so one accumulator would use an eighth of the unit.
         while offset + block <= len {
             let a0 = _mm512_loadu_pd(a.as_ptr().add(offset));
             let b0 = _mm512_loadu_pd(b.as_ptr().add(offset));
@@ -1860,9 +1831,9 @@ fn canberra_f64_avx512(a: &[f64], b: &[f64]) -> f64 {
 // Vector subtractions //
 /////////////////////////
 
-///////////////////
-// f32 Subtract  //
-///////////////////
+//////////////////
+// f32 Subtract //
+//////////////////
 
 /// Vector subtraction - f32, scalar
 ///
@@ -2009,9 +1980,9 @@ fn subtract_f32_avx512(a: &[f32], b: &[f32]) -> Vec<f32> {
     subtract_f32_avx2(a, b)
 }
 
-///////////////////
-// f64 Subtract  //
-///////////////////
+//////////////////
+// f64 Subtract //
+//////////////////
 
 /// Vector subtraction - f64, scalar
 ///
