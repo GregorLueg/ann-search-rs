@@ -14,10 +14,14 @@ jobs:
   test:
     uses: GregorLueg/personal-actions/.github/workflows/rust-test.yml@v1
     with:
-      cpu-args: '--release --features binary,quantised,gpu,ndarray,serialise'
+      # gpu-cpu adds CubeCL's software CPU runtime, which the kernel tests drive
+      # on runners with no adapter. It is not a default feature because it pulls
+      # a prebuilt LLVM that no manylinux container can load, so the wheel build
+      # must not have it; CI opts in so the coverage is not lost.
+      cpu-args: '--release --features binary,quantised,gpu,gpu-cpu,ndarray,serialise'
       # Windows drops gpu.
       windows-cpu-args: '--release --features binary,ndarray,quantised,serialise'
       # gpu-tests uses GPU backends for shared memory, which does not behave on
       # Windows, so the GPU lane is Linux and macOS only.
-      gpu-args: '--release --features binary,gpu,gpu-tests,ndarray,quantised,serialise'
+      gpu-args: '--release --features binary,gpu,gpu-cpu,gpu-tests,ndarray,quantised,serialise'
     secrets: inherit

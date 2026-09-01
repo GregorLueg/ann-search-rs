@@ -35,7 +35,10 @@ gpu = ["ann-search-rs/gpu", "dep:cubecl"]
 
 [dependencies]
 ann-search-rs = { path = "..", default-features = false, features = ["serialise", "synthetic"] }
-cubecl = { version = "0.10.0", features = ["wgpu", "cpu"], optional = true }
+# `cpu` is deliberately absent. CubeCL's software CPU runtime is test-only and
+# pulls a prebuilt LLVM needing glibc 2.33+, which no manylinux container has,
+# so a wheel carrying it cannot be built for Linux. Nothing here calls it.
+cubecl = { version = "0.10.0", features = ["wgpu"], optional = true }
 num-traits = "0.2"
 faer = "0.23.2"
 numpy = "0.29"

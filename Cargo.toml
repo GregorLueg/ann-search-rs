@@ -33,6 +33,13 @@ binary = ["memmap2", "bytemuck", "statrs"]
 gpu = ["cubecl", "cubecl-utils-rs", "half"]
 ## Enables GPU integration tests (requires 'wgpu' and a GPU on the machine). This is for CI/CD
 gpu-tests = ["gpu"]
+## CubeCL's software CPU runtime, for tests only. It drives the same kernels on
+## a machine with no adapter and has caught out-of-bounds writes that wgpu
+## silently absorbed, so CI wants it. Off by default because it pulls a
+## prebuilt LLVM (`tracel-llvm-bundler`) needing glibc 2.33+, which no
+## manylinux container has: a wheel carrying it cannot be built for Linux, and
+## nothing outside `#[cfg(test)]` ever calls it.
+gpu-cpu = ["gpu", "cubecl/cpu"]
 ## Enables quantised indices with different quantisations (BF16, SQ8, PQ, OPQ)
 quantised = ["half"]
 ## Enables mimalloc as the global allocator for improved performance
@@ -60,7 +67,8 @@ bytemuck = {
 cubecl = {
     version = "0.10.0",
     # branch = "main",
-    features = ["wgpu", "cpu"],
+    # `cpu` is deliberately absent: see the `gpu-cpu` feature.
+    features = ["wgpu"],
     optional = true
 }
 cubecl-utils-rs = {
