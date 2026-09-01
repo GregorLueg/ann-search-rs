@@ -188,13 +188,11 @@ print(cross_val_score(pipe, X, y, cv=3))
 
 scikit-learn isn't an install requirement for any of that; it's duck-typing.
 
-Two things to know when handing the graph to scikit-learn. It warns that the
-rows aren't sorted by value, which is cosmetic: pass the graph through
-`sklearn.neighbors.sort_graph_by_row_values` to silence it. And anything that
-validates a precomputed matrix as non-negative, `DBSCAN` included, will reject a
-**cosine** graph, because cosine distances can land one float32 ulp below zero
-(`-2.4e-07`) for a point against itself. Clip with
-`graph.data.clip(0, out=graph.data)` or use a Euclidean graph.
+One thing to know when handing the graph to scikit-learn: it warns that the rows
+aren't sorted by value. That's cosmetic, and
+`sklearn.neighbors.sort_graph_by_row_values` silences it. Distances are already
+guaranteed non-negative, so `DBSCAN(metric="precomputed")` and anything else
+that validates a precomputed matrix will take a cosine graph directly.
 
 Building an index is the expensive part, so keep it:
 

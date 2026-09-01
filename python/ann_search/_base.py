@@ -205,10 +205,17 @@ class BaseAnnIndex:
                 q, k, return_distance=return_distance, verbose=self.verbose, **kwargs
             )
 
-        if dist is not None and self._sqrt:
-            # The core returns squared Euclidean; sqrt(inf) is inf, so the
-            # padding survives untouched.
-            np.sqrt(dist, out=dist)
+        if dist is not None:
+            # Clamp before the sqrt, not after: a negative would come back NaN
+            # otherwise. Every metric here is non-negative, so anything below
+            # zero is roundoff. Cosine is the one that produces it, at one f32
+            # ulp for a point against itself, and one negative entry is enough
+            # for scikit-learn to reject a whole precomputed matrix. The GPU
+            # paths drift a little further than the CPU ones. `inf` padding is
+            # untouched by both operations.
+            np.maximum(dist, 0.0, out=dist)
+            if self._sqrt:
+                np.sqrt(dist, out=dist)
         return dist, ind
 
     def kneighbors(
@@ -463,6 +470,7 @@ class ExtractKnnMixin:
         )
         if dist is None:
             return ind
+        np.maximum(dist, 0.0, out=dist)
         if self._sqrt:
             np.sqrt(dist, out=dist)
         return dist, ind

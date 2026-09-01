@@ -34,33 +34,23 @@ labels_out[mask] = labels[indices[mask]]
 `kneighbors_graph` already drops them, so rows there can hold fewer than `k`
 entries.
 
-## A cosine wart
+## Non-negative distances
 
-Cosine distance is computed as `1 - dot / (|x| |y|)`, and for a point against
-itself that ratio can round to just above 1, so the distance lands one float32
-ulp below zero (`-2.4e-07`). Harmless for ordering, but anything validating a
-precomputed distance matrix as non-negative rejects it. `DBSCAN` and friends do.
-Clip before handing a cosine graph over:
+Every metric here has a non-negative range, and the Python layer guarantees it
+on the way out. That matters because cosine distance is computed as
+`1 - dot / (|x| |y|)`, and for a point against itself the ratio can round just
+above 1, putting the raw value one float32 ulp below zero. The GPU paths drift a
+little further than the CPU ones.
 
-```python
-graph = index.kneighbors_graph()
-graph.data.clip(0, out=graph.data)
-```
+One negative entry is enough for scikit-learn to reject an entire precomputed
+matrix, so `kneighbors`, `kneighbors_graph` and `extract_knn` all clamp at zero
+before returning. The clamp runs before the square root for `"euclidean"`, so a
+negative can never turn into a silent NaN.
 
-Euclidean is unaffected; it's already clamped at zero.
+Padding is untouched: missing slots stay at `inf`.
 
-## Input types
-
-`fit` takes anything `np.asarray` handles at shape `(n_samples, n_features)`.
-float32 and float64 pass through untouched; any other numeric type is promoted
-to float64 rather than narrowed, so precision is never silently lost. The result
-is made C-contiguous because the core borrows the buffer rather than copying it.
-
-Non-finite values raise. The core doesn't check, and would build a silently
-useless index.
-
-The GPU estimators are the exception: they force float32, since WGSL has no
-float64.
+If you use the Rust crate directly rather than through this package, note the
+clamp is not yet applied on every one of its return paths.
 
 ## Threads
 

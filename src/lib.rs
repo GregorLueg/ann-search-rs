@@ -111,7 +111,7 @@ fn query_parallel<T, F>(
     query_fn: F,
 ) -> KnnOptionResult<T>
 where
-    T: Send,
+    T: Send + num_traits::Zero + PartialOrd,
     F: Fn(usize) -> Result<(Vec<usize>, Vec<T>), AnnSearchErrors> + Sync,
 {
     let counter = Arc::new(AtomicUsize::new(0));
@@ -164,7 +164,7 @@ fn query_parallel_with_flags<T, F>(
     query_fn: F,
 ) -> KnnOptionResult<T>
 where
-    T: Send,
+    T: Send + num_traits::Zero + PartialOrd,
     F: Fn(usize) -> Result<(Vec<usize>, Vec<T>, bool), AnnSearchErrors> + Sync,
 {
     let counter = Arc::new(AtomicUsize::new(0));
