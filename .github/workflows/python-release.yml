@@ -41,7 +41,7 @@ jobs:
   # Version check, tag, GitHub release and the wheel matrix. Leaves the built
   # wheels as `dist-*` artefacts.
   build:
-    uses: GregorLueg/personal-actions/.github/workflows/python-maturin-release.yml@feat/python-workflows
+    uses: GregorLueg/personal-actions/.github/workflows/python-maturin-release.yml@v1
     with:
       # Always true, and it does not mean "upload". It only decides whether the
       # version is checked against the index before anything is built, so an
@@ -49,8 +49,9 @@ jobs:
       # builds. Whether an upload happens is the `publish` job's `if:` below.
       publish: true
 
-      # SAFETY CATCH, flipped to true to arm automatic tagging.
-      tag: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || false }}
+      # ARMED. A dispatch still takes the form's value, so a rehearsal can opt
+      # out; anything else tags, which is what a version bump on main should do.
+      tag: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || true }}
       # A choice rather than a free-text URL: the first rehearsal went ten
       # minutes into the wheel matrix before dying on a branch name pasted into
       # a text box. There are only ever two answers here.
@@ -73,13 +74,14 @@ jobs:
   publish:
     name: Publish to PyPI
     needs: build
-    # SAFETY CATCH: the `false` on the last line is the arming switch. Flip it
-    # to true and a green test on main publishes on its own; until then only a
-    # deliberate dispatch with `publish` ticked uploads anything.
+    # ARMED. `should-build` is false when the version is already on PyPI, so an
+    # ordinary push to main reaches here, finds nothing to do and stops. A
+    # version bump is what makes this fire. The `pypi` environment still holds
+    # it for a review before the upload, which is the last reversible moment.
     if: >-
       needs.build.outputs.should-build == 'true' &&
       (github.event_name == 'workflow_dispatch' && inputs.publish
-       || github.event_name != 'workflow_dispatch' && false)
+       || github.event_name != 'workflow_dispatch')
     runs-on: ubuntu-latest
     timeout-minutes: 20
     environment: pypi
