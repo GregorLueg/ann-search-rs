@@ -65,6 +65,13 @@ Release profile in `Cargo.toml` sets `lto = true` and `codegen-units = 1`. Relea
 - `binary`: bitwise / RaBitQ / TurboQuant, optional on-disk vector store for re-ranking. Pulls in `memmap2`, `bytemuck`, `statrs`. (`tempfile` is a dev-dependency only, used by tests and examples.)
 - `gpu`: CubeCL + wgpu backend (agnostic to Metal / Vulkan / DX12 / CPU). Pulls in `cubecl`, `cubecl-utils-rs` and `half` (the GPU k-means can hold its data buffer at fp16).
 - `gpu-tests`: enables tests that require a real GPU. CI-only, combined with `gpu`.
+- `gpu-cpu`: CubeCL's software CPU runtime, for tests only. Drives the same
+  kernels with no adapter present and has caught out-of-bounds writes wgpu
+  absorbed silently, so both CI test lanes enable it. **Never enable it for a
+  distributed artefact.** It pulls `tracel-llvm-bundler`, a prebuilt LLVM
+  needing glibc 2.33+, which no manylinux container has, so a Python wheel
+  carrying it cannot be built for Linux. Nothing outside `#[cfg(test)]` calls
+  it.
 - `serialise`: save indices to disk and load them back (`IndexIo`, `save_index` / `load_index`). Pulls in `serde`, `bincode`, and `half?/serde`. Covers the CPU, quantised and binary indices; GPU indices are not covered.
 - `ndarray`: accept `ndarray` 2-D arrays as input alongside faer matrices. Pulls in `ndarray` (range dep, `>=0.16, <0.18`). This makes `ndarray` a *public* dependency, which is why it is off by default: a downstream on a different major gets two incompatible `ArrayView2` types. The `(&[T], n, dim)` input works on any version without the feature.
 - `mimalloc`: swaps in `mimalloc` as the global allocator.

@@ -2732,7 +2732,7 @@ where
 /// the plain `gpu` feature. The IVF GPU build drives this k-means on
 /// `CpuRuntime` in CI, which is a different code path from the wgpu tests
 /// below and has caught real out-of-bounds writes that wgpu silently absorbed.
-#[cfg(test)]
+#[cfg(all(test, feature = "gpu-cpu"))]
 mod cpu_runtime_tests {
     use super::*;
     use cubecl::cpu::{CpuDevice, CpuRuntime};

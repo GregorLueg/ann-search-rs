@@ -1018,7 +1018,10 @@ where
 // Tests //
 ///////////
 
-#[cfg(test)]
+// Drives the kernels on CubeCL's software CPU runtime, so it needs no
+// adapter. Behind `gpu-cpu` because that runtime pulls a prebuilt LLVM the
+// shipped wheel must not carry.
+#[cfg(all(test, feature = "gpu-cpu"))]
 mod tests {
     use super::*;
     use cubecl::cpu::CpuDevice;

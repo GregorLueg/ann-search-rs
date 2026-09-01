@@ -1587,6 +1587,10 @@ mod gpu_smoke {
     /// a capability query and not an assumption, and why it is asserted here
     /// rather than trusted: this test failing is the difference between the
     /// exhaustive path falling back correctly and returning garbage.
+    // Compares the capability query across runtimes, so it needs the CubeCL
+    // software CPU backend. The rest of this module is host-only and stays on
+    // the plain `gpu` feature.
+    #[cfg(feature = "gpu-cpu")]
     #[test]
     fn test_atomic_capability_query_matches_runtimes() {
         use cubecl::cpu::{CpuDevice, CpuRuntime};
