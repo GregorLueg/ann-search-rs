@@ -4378,6 +4378,77 @@ where
         T::one() - (dot / (query_norm * self.norms()[internal_idx]))
     }
 
+    //////////////////
+    // Batched rows //
+    //////////////////
+
+    /// Four consecutive internal rows against the query, squared Euclidean
+    ///
+    /// `base` is a starting row rather than four ids: this is for scans over a
+    /// contiguous block, such as an IVF Voronoi cell, where the four rows are
+    /// one `4 * dim` slab. See [`SimdDistance::euclidean_simd_batch_4`] for why
+    /// batching pays. Callers handle a tail of fewer than four rows with
+    /// [`Self::euclidean_distance_to_query`].
+    ///
+    /// ### Params
+    ///
+    /// * `base` - First of the four rows; `base + 4` must not exceed the row count
+    /// * `query` - Query vector slice, length `dim`
+    ///
+    /// ### Returns
+    ///
+    /// The four squared distances, for rows `base ..= base + 3`.
+    #[inline(always)]
+    fn euclidean_distance_to_query_4(&self, base: usize, query: &[T]) -> [T; 4] {
+        T::euclidean_simd_batch_4(query, self.rows_4(base))
+    }
+
+    /// Four consecutive internal rows against the query, Cosine
+    ///
+    /// Only the dot product batches; the divide is still paid per row.
+    ///
+    /// ### Params
+    ///
+    /// * `base` - First of the four rows; `base + 4` must not exceed the row count
+    /// * `query` - Query vector slice, length `dim`
+    /// * `query_norm` - Pre-computed norm of the query vector
+    ///
+    /// ### Returns
+    ///
+    /// The four Cosine distances, for rows `base ..= base + 3`.
+    #[inline(always)]
+    fn cosine_distance_to_query_4(&self, base: usize, query: &[T], query_norm: T) -> [T; 4] {
+        let dots = T::dot_simd_batch_4(query, self.rows_4(base));
+        let norms = self.norms();
+        let mut out = [T::zero(); 4];
+        for k in 0..4 {
+            out[k] = T::one() - (dots[k] / (query_norm * norms[base + k]));
+        }
+        out
+    }
+
+    /// Borrow four consecutive rows out of the flat store
+    ///
+    /// ### Params
+    ///
+    /// * `base` - First of the four rows; `base + 4` must not exceed the row count
+    ///
+    /// ### Returns
+    ///
+    /// The four row slices, each of length `dim`.
+    #[inline(always)]
+    fn rows_4(&self, base: usize) -> [&[T]; 4] {
+        let dim = self.dim();
+        let flat = self.vectors_flat();
+        let s = base * dim;
+        [
+            &flat[s..s + dim],
+            &flat[s + dim..s + 2 * dim],
+            &flat[s + 2 * dim..s + 3 * dim],
+            &flat[s + 3 * dim..s + 4 * dim],
+        ]
+    }
+
     ///////////////
     // Manhattan //
     ///////////////
@@ -7466,5 +7537,70 @@ mod tests {
             assert_relative_eq!(got[k], expected, epsilon = 1e-4);
         }
         assert!(got[0] < got[1] && got[1] < got[2] && got[2] < got[3]);
+    }
+
+    /// Minimal [`VectorDistance`] carrier, so the trait's batched row scan can
+    /// be tested without standing up a whole index.
+    struct FlatRows {
+        /// Row-major store, `n * dim`
+        data: Vec<f32>,
+        /// Row width
+        dim: usize,
+        /// Per-row L2 norms
+        norms: Vec<f32>,
+    }
+
+    impl VectorDistance<f32> for FlatRows {
+        fn vectors_flat(&self) -> &[f32] {
+            &self.data
+        }
+
+        fn dim(&self) -> usize {
+            self.dim
+        }
+
+        fn norms(&self) -> &[f32] {
+            &self.norms
+        }
+    }
+
+    /// The batched row scan must agree with the single-row one it replaces in
+    /// the IVF cluster walk, and must not transpose rows.
+    ///
+    /// `dim` is deliberately not a multiple of any lane width, so the scalar
+    /// remainder inside each kernel is exercised on every call.
+    #[test]
+    fn test_vector_distance_batch_4_agrees_with_single_rows() {
+        for dim in [1, 3, 8, 13, 37] {
+            let n = 12;
+            // The `+ 0.5` keeps every row off the origin: a zero-norm row makes
+            // Cosine 0/0 on both sides and the comparison becomes NaN vs NaN
+            let data: Vec<f32> = (0..n * dim)
+                .map(|i| ((i * 37 % 23) as f32 - 11.0) / 4.0 + 0.5)
+                .collect();
+            let norms: Vec<f32> = data.chunks_exact(dim).map(f32::calculate_l2_norm).collect();
+            let index = FlatRows { data, dim, norms };
+
+            let query: Vec<f32> = (0..dim).map(|j| (j as f32) / 3.0 - 1.5).collect();
+            let query_norm = f32::calculate_l2_norm(&query);
+
+            for base in (0..n).step_by(4) {
+                let batched = index.euclidean_distance_to_query_4(base, &query);
+                let batched_cos = index.cosine_distance_to_query_4(base, &query, query_norm);
+
+                for k in 0..4 {
+                    assert_relative_eq!(
+                        batched[k],
+                        index.euclidean_distance_to_query(base + k, &query),
+                        epsilon = 1e-5
+                    );
+                    assert_relative_eq!(
+                        batched_cos[k],
+                        index.cosine_distance_to_query(base + k, &query, query_norm),
+                        epsilon = 1e-5
+                    );
+                }
+            }
+        }
     }
 }
