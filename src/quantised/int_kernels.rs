@@ -180,7 +180,10 @@ mod tests {
         let na = norm_sq_u8(&a);
         let nb = norm_sq_u8(&b);
         assert_eq!(na, 255u32 * 255 * dim as u32);
-        assert_eq!(sq_dist_from_dot(&a, &b, na, nb), (255i64 * 255) * dim as i64);
+        assert_eq!(
+            sq_dist_from_dot(&a, &b, na, nb),
+            (255i64 * 255) * dim as i64
+        );
     }
 
     #[test]

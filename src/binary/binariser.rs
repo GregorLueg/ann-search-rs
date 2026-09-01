@@ -854,45 +854,6 @@ fn encode_sign_based_into<T: Float>(vec: &[T], out: &mut [u8]) {
     }
 }
 
-/// Sign-encode the residual of `vec` against `centroid`, in place
-///
-/// Bit `d` is set when `scale.0 * vec[d] - scale.1 * centroid[d] >= 0`.
-///
-/// The scale pair exists so Cosine can compare unit-length vectors without
-/// dividing. Since `‖vec‖ * ‖centroid‖ > 0`,
-///
-/// ```text
-/// [vec_d/‖vec‖ - c_d/‖c‖ >= 0]  ==  [‖c‖ * vec_d - ‖vec‖ * c_d >= 0]
-/// ```
-///
-/// so passing `(‖centroid‖, ‖vec‖)` scales the comparison by a positive
-/// constant and leaves every sign untouched. Squared Euclidean passes `(1, 1)`
-/// and gets the plain residual.
-///
-/// ### Params
-///
-/// * `vec` - Input vector, length `dim`
-/// * `centroid` - Centroid of the vector's assigned cell, length `dim`
-/// * `scale` - `(vector scale, centroid scale)`, both strictly positive
-/// * `dim` - Dimensionality
-/// * `out` - Destination code, length `dim.div_ceil(8)`. Zeroed on entry.
-pub(crate) fn encode_sign_residual_into<T: Float>(
-    vec: &[T],
-    centroid: &[T],
-    scale: (T, T),
-    dim: usize,
-    out: &mut [u8],
-) {
-    // Load-bearing: the bit loop only ORs, so a reused buffer keeps stale bits
-    out.fill(0);
-
-    for bit_idx in 0..dim {
-        if scale.0 * vec[bit_idx] - scale.1 * centroid[bit_idx] >= T::zero() {
-            out[bit_idx / 8] |= 1u8 << (bit_idx % 8);
-        }
-    }
-}
-
 /// Binariser for converting float vectors to binary codes
 ///
 /// Supports three binarisation methods:
@@ -1107,53 +1068,6 @@ where
         }
 
         Ok(())
-    }
-
-    /// Encode a vector as the sign of its residual against a centroid
-    ///
-    /// Sign bits taken in the global frame encode which cluster a point sits
-    /// in, not where it sits inside that cluster, because a cluster far from
-    /// the origin puts every one of its members on the same side of every
-    /// coordinate plane. Taking the residual against the cluster's own centroid
-    /// moves the frame to the cluster, so the bits carry the within-cluster
-    /// structure the search funnel actually needs.
-    ///
-    /// Codes produced this way are only comparable against other codes taken
-    /// against the *same* centroid.
-    ///
-    /// ### Params
-    ///
-    /// * `vec` - Input vector (length must equal `dim`)
-    /// * `centroid` - Centroid to take the residual against (length must equal
-    ///   `dim`)
-    /// * `scale` - `(vector scale, centroid scale)`, see
-    ///   [`encode_sign_residual_into`]
-    ///
-    /// ### Returns
-    ///
-    /// Binary code as `Vec<u8>`, or
-    /// [`AnnSearchErrors::ResidualEncodingUnsupported`] for the projection-based
-    /// methods, which carry a frame of their own.
-    pub fn encode_residual(
-        &self,
-        vec: &[T],
-        centroid: &[T],
-        scale: (T, T),
-    ) -> Result<Vec<u8>, AnnSearchErrors> {
-        if vec.len() != self.dim {
-            return Err(AnnSearchErrors::DimensionMismatch {
-                index_dim: self.dim,
-                query_dim: vec.len(),
-            });
-        }
-        if !matches!(self.method, BinarisationMethod::SignBased) {
-            return Err(AnnSearchErrors::ResidualEncodingUnsupported);
-        }
-
-        let mut out = vec![0u8; self.n_bytes()];
-        encode_sign_residual_into(vec, centroid, scale, self.dim, &mut out);
-
-        Ok(out)
     }
 
     /// Returns memory usage in bytes
@@ -1743,113 +1657,6 @@ mod tests {
             unique.len()
         );
     }
-
-    /// The `(1, 1)` scale pair is the plain residual.
-    #[test]
-    fn test_encode_residual_squared_euclidean_matches_plain_sign() {
-        let dim = 24;
-        let binariser = Binariser::<f64>::new_sign_based(dim);
-
-        let vec: Vec<f64> = (0..dim)
-            .map(|i| (i as f64 * 0.7).sin() * 3.0 + 1.0)
-            .collect();
-        let centroid: Vec<f64> = (0..dim).map(|i| (i as f64 * 0.3).cos()).collect();
-
-        let residual: Vec<f64> = vec.iter().zip(&centroid).map(|(v, c)| v - c).collect();
-
-        assert_eq!(
-            binariser
-                .encode_residual(&vec, &centroid, (1.0, 1.0))
-                .unwrap(),
-            encode_sign_based(&residual, dim)
-        );
-    }
-
-    /// The `(‖c‖, ‖v‖)` pair is the residual between unit-length vectors, which
-    /// is what Cosine wants, expressed without a division.
-    #[test]
-    fn test_encode_residual_cosine_matches_normalised_sign() {
-        let dim = 24;
-        let binariser = Binariser::<f64>::new_sign_based(dim);
-
-        let vec: Vec<f64> = (0..dim)
-            .map(|i| (i as f64 * 0.7).sin() * 3.0 + 1.0)
-            .collect();
-        let centroid: Vec<f64> = (0..dim).map(|i| (i as f64 * 0.3).cos()).collect();
-
-        let vn = vec.iter().map(|x| x * x).sum::<f64>().sqrt();
-        let cn = centroid.iter().map(|x| x * x).sum::<f64>().sqrt();
-
-        let residual: Vec<f64> = vec
-            .iter()
-            .zip(&centroid)
-            .map(|(v, c)| v / vn - c / cn)
-            .collect();
-
-        assert_eq!(
-            binariser
-                .encode_residual(&vec, &centroid, (cn, vn))
-                .unwrap(),
-            encode_sign_based(&residual, dim)
-        );
-    }
-
-    /// The projection methods carry a learned or random frame of their own, so
-    /// a per-cell threshold shift is a different method, not a variant.
-    #[test]
-    fn test_encode_residual_rejects_projection_methods() {
-        let dim = 32;
-        let zero_mean = Mat::<f64>::zeros(8, dim);
-
-        let simhash = Binariser::<f64>::new_simhash(
-            &matrix_to_flat(zero_mean.as_ref()).0,
-            zero_mean.nrows(),
-            dim,
-            64,
-            42,
-        )
-        .unwrap();
-        let pca = Binariser::<f64>::new_pca_hashing(
-            &matrix_to_flat(zero_mean.as_ref()).0,
-            zero_mean.nrows(),
-            dim,
-            64,
-            42,
-        )
-        .unwrap();
-
-        let vec = vec![1.0; dim];
-        let centroid = vec![0.5; dim];
-
-        for binariser in [simhash, pca] {
-            assert!(matches!(
-                binariser.encode_residual(&vec, &centroid, (1.0, 1.0)),
-                Err(AnnSearchErrors::ResidualEncodingUnsupported)
-            ));
-        }
-    }
-
-    /// A `dim` that is not a multiple of 8 leaves padding bits, which must stay
-    /// zero so they XOR away in the Hamming kernels.
-    #[test]
-    fn test_encode_residual_zeroes_padding_bits() {
-        for dim in [30, 31, 32] {
-            let binariser = Binariser::<f64>::new_sign_based(dim);
-
-            // All residuals positive, so every real bit is set
-            let vec = vec![1.0; dim];
-            let centroid = vec![0.0; dim];
-            let code = binariser
-                .encode_residual(&vec, &centroid, (1.0, 1.0))
-                .unwrap();
-
-            assert_eq!(code.len(), dim.div_ceil(8));
-
-            let set: u32 = code.iter().map(|b| b.count_ones()).sum();
-            assert_eq!(set, dim as u32, "padding bits leaked at dim = {dim}");
-        }
-    }
-
     /// `encode_all` is the only encoder the build path uses now, so it has to
     /// agree with the per-vector one exactly. `dim` is deliberately not a
     /// multiple of the SIMD width and `n` not a multiple of the tile, so the
@@ -2073,14 +1880,24 @@ mod tests {
         };
         assert_eq!(projections.len(), n_bits * dim);
 
-        // `k` retained loadings, then random padding. The cap is
-        // `n_bits * PCA_MAX_COMPONENT_SHARE`, and ITQ mixes within that block,
-        // so compare the subspace the block spans rather than each direction:
-        // every retained loading must lie in the span of the reference's
-        // leading `k` eigenvectors.
-        let k = ((n_bits as f64 * PCA_MAX_COMPONENT_SHARE) as usize)
-            .max(1)
-            .min(dim);
+        // `k` retained loadings, then random padding. ITQ mixes within the
+        // retained block, so compare the subspace the block spans rather than
+        // each direction: every retained loading must lie in the span of the
+        // reference's leading `k` eigenvectors.
+        //
+        // `k` is what the cumulative rule keeps, not the cap: the cap is only
+        // an upper bound and on this fixture the rule stops well short of it,
+        // so reading `k` off the cap grades random padding bits against the PCA
+        // subspace. Driven by the reference's `f64` spectrum, so the `f32` path
+        // is not choosing its own comparison.
+        let reference_singular = Col::<f64>::from_fn(dim, |j| {
+            want.S().column_vector()[dim - 1 - j].max(0.0).sqrt()
+        });
+        let k = retained_components(
+            reference_singular.as_ref(),
+            n_bits.min(dim),
+            ((n_bits as f64 * PCA_MAX_COMPONENT_SHARE) as usize).max(1),
+        );
         assert!(
             k < dim,
             "with k == dim the reference subspace is the whole space and this \

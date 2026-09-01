@@ -3,8 +3,8 @@
 
 use fixedbitset::FixedBitSet;
 use num_traits::{Float, FromPrimitive};
-use std::cmp::Reverse;
 use std::cell::{RefCell, UnsafeCell};
+use std::cmp::Reverse;
 use std::collections::BinaryHeap;
 use std::iter::Sum;
 use std::marker::PhantomData;
@@ -350,7 +350,12 @@ where
     /// * `node_id` - Node to update
     /// * `layer` - Layer to update
     /// * `neighbours` - New neighbour list as (distance, id) pairs
-    pub(crate) fn set_neighbours(&self, node_id: usize, layer: u8, neighbours: &[(OrderedFloat<T>, usize)]) {
+    pub(crate) fn set_neighbours(
+        &self,
+        node_id: usize,
+        layer: u8,
+        neighbours: &[(OrderedFloat<T>, usize)],
+    ) {
         let node_level = self.node_levels[node_id];
         if layer > node_level {
             return;

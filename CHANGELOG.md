@@ -43,6 +43,15 @@
   quantiser. `build_exhaustive_sq8_index` and `build_ivf_sq8_index` gain an
   `Option<UniformQuantParams>`. `ScalarQuantiser` and `VectorDistanceSq8` are
   gone.
+- Sign-based IVF binary indices drop the per-cell residual frame added in 0.5.0
+  and go back to global sign codes. The residual frame bought recall at low
+  `rerank_factor` on clustered data (0.739 vs 0.579 on the fixture in
+  `ivf_binary.rs`) but made Hamming distances incomparable across cells, so
+  widening `nprobe` *cost* recall, every query paid a re-encode per probed cell,
+  and a kNN graph could not be built without a vector store at all. The
+  asymmetric query path covers the same ground for less. `Binariser::encode_residual`,
+  `AnnSearchErrors::ResidualEncodingUnsupported` and
+  `AnnSearchErrors::ResidualCodesRequireVectorStore` are gone.
 
 ## 0.6.0
 
@@ -95,7 +104,7 @@
 - Sign-based IVF binary indices now encode the residual against the assigned
   cell's centroid instead of the raw vector. A trade, not a free win: better
   recall at low `rerank_factor`, worse above roughly 15. Documented on
-  `IvfIndexBinary::query`.
+  `IvfIndexBinary::query`. Reverted in 0.7.0.
 
 **Fixes**
 

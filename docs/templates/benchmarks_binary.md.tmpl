@@ -76,10 +76,9 @@ Three binarisations are offered in this crate:
 - **Sign-based**: Simply encodes the sign of each embedding dimension directly
   as a bit, meaning `n_bits` is fixed to the number of dimensions.
   Straightforward but only sensible for high-dimensional data; at low
-  dimensionality the recall degrades dramatically. In the IVF version it encodes
-  the sign of the residual against each vector's own cell centroid instead,
-  because a global sign bit tells you which cluster a point is in rather than
-  where it sits inside that cluster.
+  dimensionality the recall degrades dramatically. Codes live in one global
+  frame, on the IVF index too, so Hamming distances compare across Voronoi
+  cells and widening `nprobe` can only add candidates.
 
 These indices can keep the original vectors in a `VecStore` on disk for
 re-ranking. Recommended if you want the recall to stay usable. Their home ground
@@ -93,7 +92,7 @@ is very high-dimensional data where memory is the binding constraint.
 - *binarisation_init*: Three options are provided in the crate. `"random"` for
   random planes that are subsequently orthogonalised, `"pca"` to identify axes
   of maximum variation, or `"sign"` to just use the sign of the respective
-  embedding dimensions (or the residual, for the IVF). In that last case
+  embedding dimensions. In that last case
   `n_bits` is set automatically to `n_dim`. Sign-based only really makes sense
   if you have a lot of dimensions; otherwise the performance is not great (at
   all). Unrecognised strings print a warning and fall back to `"random"`, so

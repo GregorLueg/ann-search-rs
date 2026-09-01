@@ -74,28 +74,97 @@ where
     ///
     /// The distance to the different clusters
     fn get_centroids_dist(&self, query_vec: &[T], query_norm: T, nprobe: usize) -> Vec<(T, usize)> {
-        let mut cluster_dists: Vec<(T, usize)> = (0..self.nlist())
-            .map(|c| {
-                let cent = &self.centroids()[c * self.dim()..(c + 1) * self.dim()];
-                let dist = match self.metric() {
-                    Dist::SquaredEuclidean => euclidean_distance_static(query_vec, cent),
-                    Dist::Cosine => {
-                        let c_norm = &self.centroids_norm()[c];
-                        cosine_distance_static_norm(query_vec, cent, &query_norm, c_norm)
-                    }
-                    Dist::Manhattan => {
-                        unreachable!()
-                    }
-                };
-                (dist, c)
-            })
-            .collect();
+        let mut cluster_dists: Vec<(T, usize)> = Vec::with_capacity(self.nlist());
+        self.scan_centroids(query_vec, query_norm, false, &mut cluster_dists);
 
         if nprobe < self.nlist() {
             cluster_dists.select_nth_unstable_by(nprobe, |a, b| a.0.partial_cmp(&b.0).unwrap());
         }
 
         cluster_dists
+    }
+
+    /// Score every centroid against the query, four rows at a time
+    ///
+    /// Centroids are contiguous, so a cell is one `4 * dim` slab and the scan
+    /// needs no gather. The metric is resolved once per query rather than once
+    /// per centroid, which matters because this runs `nlist` times before any
+    /// inverted list is touched.
+    ///
+    /// ### Params
+    ///
+    /// * `query_vec` - The slice of the query
+    /// * `query_norm` - The norm of the query. Ignored when `prenorm` is set.
+    /// * `prenorm` - Whether the centroids and the query are already unit
+    ///   length, in which case Cosine is `1 - dot` with no divide
+    /// * `out` - Destination, cleared on entry and filled with `(distance, cell)`
+    #[inline]
+    fn scan_centroids(
+        &self,
+        query_vec: &[T],
+        query_norm: T,
+        prenorm: bool,
+        out: &mut Vec<(T, usize)>,
+    ) {
+        let (nlist, dim) = (self.nlist(), self.dim());
+        let centroids = self.centroids();
+        let tail = nlist / 4 * 4;
+
+        out.clear();
+        out.reserve(nlist);
+
+        let rows_4 = |base: usize| {
+            let s = base * dim;
+            [
+                &centroids[s..s + dim],
+                &centroids[s + dim..s + 2 * dim],
+                &centroids[s + 2 * dim..s + 3 * dim],
+                &centroids[s + 3 * dim..s + 4 * dim],
+            ]
+        };
+
+        match (self.metric(), prenorm) {
+            (Dist::SquaredEuclidean, _) => {
+                for base in (0..tail).step_by(4) {
+                    let d = T::euclidean_simd_batch_4(query_vec, rows_4(base));
+                    for k in 0..4 {
+                        out.push((d[k], base + k));
+                    }
+                }
+                for c in tail..nlist {
+                    let cent = &centroids[c * dim..(c + 1) * dim];
+                    out.push((T::euclidean_simd(query_vec, cent), c));
+                }
+            }
+            (Dist::Cosine, false) => {
+                let norms = self.centroids_norm();
+                for base in (0..tail).step_by(4) {
+                    let dots = T::dot_simd_batch_4(query_vec, rows_4(base));
+                    for k in 0..4 {
+                        let c = base + k;
+                        out.push((T::one() - (dots[k] / (query_norm * norms[c])), c));
+                    }
+                }
+                for c in tail..nlist {
+                    let cent = &centroids[c * dim..(c + 1) * dim];
+                    let dot = T::dot_simd(query_vec, cent);
+                    out.push((T::one() - (dot / (query_norm * norms[c])), c));
+                }
+            }
+            (Dist::Cosine, true) => {
+                for base in (0..tail).step_by(4) {
+                    let dots = T::dot_simd_batch_4(query_vec, rows_4(base));
+                    for k in 0..4 {
+                        out.push((T::one() - dots[k], base + k));
+                    }
+                }
+                for c in tail..nlist {
+                    let cent = &centroids[c * dim..(c + 1) * dim];
+                    out.push((T::one() - T::dot_simd(query_vec, cent), c));
+                }
+            }
+            (Dist::Manhattan, _) => unreachable!(),
+        }
     }
 
     /// Special version that assumes pre-normalised vectors for Cosine
@@ -110,19 +179,8 @@ where
     /// The distance to the different clusters
     fn get_centroids_prenorm(&self, query_vec: &[T], nprobe: usize) -> Vec<(T, usize)> {
         // find top nprobe centroids
-        let mut cluster_dists: Vec<(T, usize)> = (0..self.nlist())
-            .map(|c| {
-                let cent = &self.centroids()[c * self.dim()..(c + 1) * self.dim()];
-                let dist = match self.metric() {
-                    Dist::Cosine => T::one() - T::dot_simd(query_vec, cent),
-                    Dist::SquaredEuclidean => T::euclidean_simd(query_vec, cent),
-                    Dist::Manhattan => {
-                        unreachable!()
-                    }
-                };
-                (dist, c)
-            })
-            .collect();
+        let mut cluster_dists: Vec<(T, usize)> = Vec::with_capacity(self.nlist());
+        self.scan_centroids(query_vec, T::one(), true, &mut cluster_dists);
 
         let nprobe = nprobe.min(self.nlist());
         if nprobe < self.nlist() {
@@ -2991,7 +3049,11 @@ pub fn build_csr_layout(
 /// the top-`nprobe` cells (or the top-1 landing on an empty cell) don't hold
 /// enough vectors. Small datasets are the usual trigger.
 ///
-/// Sorts `cluster_dists` ascending by distance in place.
+/// Only the first `nprobe` entries are ordered, since only they are normally
+/// read: at `nlist = 1000, nprobe = 32` that is an O(nlist) partition plus a
+/// 32-element sort rather than a 1000-element one. The tail is ordered lazily,
+/// on the rare query whose prefix cannot reach `k`. `cluster_dists` is left
+/// partitioned at `nprobe` either way, not fully sorted.
 ///
 /// ### Params
 ///
@@ -3013,12 +3075,32 @@ pub fn select_probed_clusters<T>(
 where
     T: PartialOrd,
 {
-    cluster_dists
-        .sort_unstable_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+    let asc =
+        |a: &(T, usize), b: &(T, usize)| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal);
 
-    let mut chosen = Vec::with_capacity(nprobe.max(1).min(cluster_dists.len()));
+    // Partition here rather than trusting the caller. The centroid scans
+    // already do this, but the redundant O(nlist) pass is worth not making a
+    // public function silently wrong on an unordered input.
+    let split = nprobe.min(cluster_dists.len());
+    if split < cluster_dists.len() {
+        cluster_dists.select_nth_unstable_by(split, asc);
+    }
+    cluster_dists[..split].sort_unstable_by(asc);
+
+    let mut chosen = Vec::with_capacity(split.max(1));
     let mut reachable = 0usize;
-    for &(_, c) in cluster_dists.iter() {
+    for &(_, c) in cluster_dists[..split].iter() {
+        chosen.push(c);
+        reachable += offsets[c + 1] - offsets[c];
+    }
+
+    if chosen.len() >= nprobe && reachable >= k {
+        return chosen;
+    }
+
+    // The prefix underfilled, so the tail has to be ordered too
+    cluster_dists[split..].sort_unstable_by(asc);
+    for &(_, c) in cluster_dists[split..].iter() {
         chosen.push(c);
         reachable += offsets[c + 1] - offsets[c];
         if chosen.len() >= nprobe && reachable >= k {
