@@ -1,5 +1,11 @@
 # News
 
+## 0.8.0
+
+- `gpu` no longer pulls CubeCL's CPU runtime and its prebuilt LLVM; it moved to
+  a new test-only `gpu-cpu` feature. **Breaking** if you relied on
+  `ann-search-rs/gpu` enabling `cubecl/cpu`.
+
 ## 0.7.0
 
 **Python**

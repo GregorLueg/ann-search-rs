@@ -1,6 +1,6 @@
 [package]
 name = "ann-search-rs"
-version = "0.7.0"
+version = "0.8.0"
 edition = "2021"
 authors = ["Gregor Lueg <gregorlueg@me.com>"]
 license = "MIT"
@@ -33,12 +33,7 @@ binary = ["memmap2", "bytemuck", "statrs"]
 gpu = ["cubecl", "cubecl-utils-rs", "half"]
 ## Enables GPU integration tests (requires 'wgpu' and a GPU on the machine). This is for CI/CD
 gpu-tests = ["gpu"]
-## CubeCL's software CPU runtime, for tests only. It drives the same kernels on
-## a machine with no adapter and has caught out-of-bounds writes that wgpu
-## silently absorbed, so CI wants it. Off by default because it pulls a
-## prebuilt LLVM (`tracel-llvm-bundler`) needing glibc 2.33+, which no
-## manylinux container has: a wheel carrying it cannot be built for Linux, and
-## nothing outside `#[cfg(test)]` ever calls it.
+## CubeCL's software CPU runtime, for tests only.
 gpu-cpu = ["gpu", "cubecl/cpu"]
 ## Enables quantised indices with different quantisations (BF16, SQ8, PQ, OPQ)
 quantised = ["half"]
@@ -114,10 +109,7 @@ thiserror = "2.0.18"
 thousands = "0.2.0"
 wide = "1.4.0"
 
-# Only ever used by the inline tests and the gridsearch examples. `clap` drives
-# the example CLIs and `approx` the float assertions; neither is reachable from
-# the library, so as hard dependencies they cost every downstream consumer a
-# build for nothing.
+
 [dev-dependencies]
 approx = "0.5.1"
 clap = {
@@ -125,9 +117,6 @@ clap = {
     features = ["derive"]
 }
 tempfile = "3.24.0"
-# Self dev-dependency so examples and tests see `synthetic` without it being a
-# default feature. Keeps `cargo run --example ...` working unchanged while
-# normal downstream builds skip the generators entirely.
 ann-search-rs = { path = ".", features = ["synthetic"] }
 
 [package.metadata.docs.rs]
