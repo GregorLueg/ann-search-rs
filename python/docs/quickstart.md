@@ -51,7 +51,9 @@ Start with ground truth:
 truth = ann.ExhaustiveIndex(n_neighbors=15).fit(X).kneighbors(return_distance=False)
 ```
 
-`ExhaustiveIndex` is exact, so that's the target. On 50k x 32 it's a few seconds.
+`ExhaustiveIndex` is exact, so that's the target. It is not a naive scan either:
+the self-kNN graph is the largest batch there is, which is where the blocked
+GEMM path wins.
 
 Now sweep the recall knob. `ef_search` is a search-time parameter, so one fitted
 index answers the whole sweep:
@@ -70,11 +72,11 @@ ef_search=100  recall=0.9946
 ef_search=200  recall=0.9967
 ```
 
-Recall climbs with `ef_search` and so does query time. On an M1 Max that sweep
-is 0.13s, 0.20s and 0.37s, against a 0.39s build. Where you stop is a
-judgement about your problem, not something the library can decide. Build-time
-knobs (`m`, `ef_construction`) need a refit to change, which is why the sweep
-above only moves the one that doesn't.
+Recall climbs with `ef_search`, and so does query time, roughly in step. Where
+you stop is a judgement about your problem, not something the library can
+decide, so time the sweep as well as scoring it. Build-time knobs (`m`,
+`ef_construction`) need a refit to change, which is why the sweep above only
+moves the one that doesn't.
 
 If a self-kNN graph is the actual deliverable rather than a queryable index,
 `NNDescentIndex` converges on one directly and hands it back without a search
