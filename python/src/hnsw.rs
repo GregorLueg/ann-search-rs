@@ -11,7 +11,7 @@ use pyo3::prelude::*;
 use crate::dispatch::{build_dispatch, query_arm, self_arm, QueryOut};
 use crate::handle::ann_handle;
 
-ann_handle!(PyHnsw, HnswInner, HnswIndex, "Hnsw", {
+ann_handle!(PyHnsw, HnswInner, HnswIndex, "Hnsw", field, {
     /// Build the graph.
     ///
     /// ### Params

@@ -5,7 +5,7 @@
 # reports the core version it vendored as `__core_version__` instead, which is
 # the question lockstep was actually answering.
 name = "ann-search-py"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 authors = ["Gregor Lueg <gregorlueg@me.com>"]
 license = "MIT"
@@ -34,7 +34,7 @@ default = ["gpu"]
 gpu = ["ann-search-rs/gpu", "dep:cubecl"]
 
 [dependencies]
-ann-search-rs = { path = "..", default-features = false, features = ["serialise", "synthetic"] }
+ann-search-rs = { path = "..", default-features = false, features = ["quantised", "serialise", "synthetic"] }
 # `cpu` is deliberately absent. CubeCL's software CPU runtime is test-only and
 # pulls a prebuilt LLVM needing glibc 2.33+, which no manylinux container has,
 # so a wheel carrying it cannot be built for Linux. Nothing here calls it.

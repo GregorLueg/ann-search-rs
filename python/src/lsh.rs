@@ -15,7 +15,7 @@ use pyo3::prelude::*;
 use crate::dispatch::{build_dispatch, query_arm, self_arm, QueryOut};
 use crate::handle::ann_handle;
 
-ann_handle!(PyLsh, LshInner, LSHIndex, "Lsh", {
+ann_handle!(PyLsh, LshInner, LSHIndex, "Lsh", field, {
     /// Number of random projections per table.
     ///
     /// The natural unit for `n_probe`, and its default: each table offers

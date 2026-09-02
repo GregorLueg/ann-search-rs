@@ -15,6 +15,7 @@ ann_handle!(
     RnnDescentInner,
     RnnDescentIndex,
     "RnnDescent",
+    field,
     {
         /// Build and prune the graph.
         ///

@@ -15,6 +15,31 @@
 //! Handles are `#[pyclass(frozen)]`. Every index is a plain `Vec`-of-POD with
 //! no interior mutability, so this is sound, it drops pyo3's runtime borrow
 //! flag, and it lets two Python threads query one index at once.
+//!
+//! One wrinkle: `n` and `dim` are public fields on the CPU indices and private
+//! ones behind accessors on the quantised indices. Rather than churn the
+//! library's structs, the macro takes a `field` / `method` token and
+//! [`read_shape!`] expands to whichever spelling applies.
+
+/// Read `n` or `dim` off an index, whichever way that index exposes it.
+///
+/// ### Params
+///
+/// * `field` / `method` - How this index exposes its shape.
+/// * `$i` - The index.
+/// * `$f` - `n` or `dim`.
+///
+/// ### Returns
+///
+/// The value, as `usize`.
+macro_rules! read_shape {
+    (field, $i:expr, $f:ident) => {
+        $i.$f
+    };
+    (method, $i:expr, $f:ident) => {
+        $i.$f()
+    };
+}
 
 /// Generate the opaque handle for one index type.
 ///
@@ -24,11 +49,13 @@
 /// * `$inner` - Name of the generated float-dispatch enum.
 /// * `$index` - The library's index type, generic over its float.
 /// * `$name` - Name Python sees, also used in reprs and error messages.
+/// * `$shape` - `field` when the index exposes `n` and `dim` as public fields,
+///   `method` when it exposes them as accessors. See [`read_shape!`].
 /// * `$extra` - The per-algorithm `build`, `query` and `query_self`, spliced
 ///   into the same `#[pymethods]` block because only one such block per class
 ///   is allowed without pyo3's `multiple-pymethods` feature.
 macro_rules! ann_handle {
-    ($cls:ident, $inner:ident, $index:ident, $name:literal, { $($extra:tt)* }) => {
+    ($cls:ident, $inner:ident, $index:ident, $name:literal, $shape:ident, { $($extra:tt)* }) => {
         /// Float-type dispatch for the handle below.
         pub(crate) enum $inner {
             /// Index built over `f32` samples.
@@ -66,8 +93,8 @@ macro_rules! ann_handle {
             #[getter]
             fn n_samples(&self) -> usize {
                 match &self.inner {
-                    $inner::F32(i) => i.n,
-                    $inner::F64(i) => i.n,
+                    $inner::F32(i) => crate::handle::read_shape!($shape, i, n),
+                    $inner::F64(i) => crate::handle::read_shape!($shape, i, n),
                 }
             }
 
@@ -79,8 +106,8 @@ macro_rules! ann_handle {
             #[getter]
             fn dim(&self) -> usize {
                 match &self.inner {
-                    $inner::F32(i) => i.dim,
-                    $inner::F64(i) => i.dim,
+                    $inner::F32(i) => crate::handle::read_shape!($shape, i, dim),
+                    $inner::F64(i) => crate::handle::read_shape!($shape, i, dim),
                 }
             }
 
@@ -237,4 +264,4 @@ macro_rules! ann_handle {
     };
 }
 
-pub(crate) use ann_handle;
+pub(crate) use {ann_handle, read_shape};

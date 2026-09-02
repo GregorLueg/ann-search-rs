@@ -12,7 +12,7 @@ use pyo3::prelude::*;
 use crate::dispatch::{build_dispatch, query_arm, self_arm, QueryOut};
 use crate::handle::ann_handle;
 
-ann_handle!(PyNsg, NsgInner, NsgIndex, "Nsg", {
+ann_handle!(PyNsg, NsgInner, NsgIndex, "Nsg", field, {
     /// Build the kNN graph, then refine it into the navigating spreading-out
     /// graph.
     ///

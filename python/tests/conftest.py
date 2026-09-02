@@ -30,12 +30,35 @@ APPROXIMATE: dict[type, float] = {
     ann.VamanaIndex: 0.90,
 }
 
+#: The quantised estimators, split out because their floors need reading
+#: differently: the loss is the codec's, not the search's.
+#:
+#: The PQ family sits at 0.53 to 0.63 here, which looks alarming next to the
+#: rest and is the fixture rather than the method. Product quantisation is for
+#: high-dimensional embedding spaces; on 32 well-separated dimensions there is
+#: nothing for it to exploit and SQ8 beats it on both memory and recall. The
+#: floors are set below what the fixture actually produces, so they still catch
+#: a codec that has genuinely broken, which drops recall to near zero.
+QUANTISED: dict[type, float] = {
+    ann.ExhaustiveBf16Index: 0.95,
+    ann.IvfBf16Index: 0.70,
+    ann.ExhaustiveSq8Index: 0.90,
+    ann.IvfSq8Index: 0.70,
+    ann.HnswSq8uIndex: 0.90,
+    ann.ExhaustivePqIndex: 0.45,
+    ann.IvfPqIndex: 0.50,
+    ann.ExhaustiveOpqIndex: 0.45,
+    ann.IvfOpqIndex: 0.50,
+    ann.SoarPqIndex: 0.55,
+    ann.SoarOpqIndex: 0.55,
+}
+
 EXACT: dict[type, float] = {
     ann.ExhaustiveIndex: 1.0,
     ann.KmknnIndex: 1.0,
 }
 
-ALL_INDICES: dict[type, float] = {**EXACT, **APPROXIMATE}
+ALL_INDICES: dict[type, float] = {**EXACT, **APPROXIMATE, **QUANTISED}
 
 
 @pytest.fixture(scope="session")

@@ -12,7 +12,7 @@ use crate::dispatch::{build_dispatch, query_arm, self_arm, QueryOut};
 use crate::handle::ann_handle;
 use crate::kmeans::kmeans_params;
 
-ann_handle!(PyKmknn, KmknnInner, KmknnIndex, "Kmknn", {
+ann_handle!(PyKmknn, KmknnInner, KmknnIndex, "Kmknn", field, {
     /// Partition the data and build the pruning bounds.
     ///
     /// ### Params

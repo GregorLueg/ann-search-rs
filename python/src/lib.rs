@@ -29,6 +29,7 @@ mod gpu_probe;
 mod handle;
 mod kmeans;
 mod pool;
+mod quant;
 mod state;
 
 #[cfg(feature = "gpu")]
@@ -52,6 +53,26 @@ mod nsg;
 mod rnn_descent;
 mod soar;
 mod vamana;
+
+///////////////////////
+// Quantised indices //
+///////////////////////
+
+// Unconditional, unlike the GPU block below: `quantised` costs the wheel one
+// dependency it already carries, so there is no build lane where these are
+// absent and no `hasattr` guard on the Python side.
+
+mod exhaustive_bf16;
+mod exhaustive_opq;
+mod exhaustive_pq;
+mod exhaustive_sq8;
+mod hnsw_sq8u;
+mod ivf_bf16;
+mod ivf_opq;
+mod ivf_pq;
+mod ivf_sq8;
+mod soar_opq;
+mod soar_pq;
 
 /////////////////
 // GPU indices //
@@ -112,6 +133,18 @@ fn _ann_search(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<rnn_descent::PyRnnDescent>()?;
     m.add_class::<soar::PySoar>()?;
     m.add_class::<vamana::PyVamana>()?;
+
+    m.add_class::<exhaustive_bf16::PyExhaustiveBf16>()?;
+    m.add_class::<exhaustive_opq::PyExhaustiveOpq>()?;
+    m.add_class::<exhaustive_pq::PyExhaustivePq>()?;
+    m.add_class::<exhaustive_sq8::PyExhaustiveSq8>()?;
+    m.add_class::<hnsw_sq8u::PyHnswSq8u>()?;
+    m.add_class::<ivf_bf16::PyIvfBf16>()?;
+    m.add_class::<ivf_opq::PyIvfOpq>()?;
+    m.add_class::<ivf_pq::PyIvfPq>()?;
+    m.add_class::<ivf_sq8::PyIvfSq8>()?;
+    m.add_class::<soar_opq::PySoarOpq>()?;
+    m.add_class::<soar_pq::PySoarPq>()?;
 
     #[cfg(feature = "gpu")]
     {
