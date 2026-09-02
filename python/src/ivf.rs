@@ -11,7 +11,7 @@ use crate::dispatch::{build_dispatch, query_arm, self_arm, QueryOut};
 use crate::handle::ann_handle;
 use crate::kmeans::kmeans_params;
 
-ann_handle!(PyIvf, IvfInner, IvfIndex, "Ivf", field, {
+ann_handle!(PyIvf, IvfInner, IvfIndex, "Ivf", {
     /// Cluster the data into the inverted lists.
     ///
     /// ### Params

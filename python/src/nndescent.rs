@@ -15,7 +15,7 @@ use pyo3::prelude::*;
 use crate::dispatch::{build_dispatch, query_arm, self_arm, QueryOut};
 use crate::handle::ann_handle;
 
-ann_handle!(PyNnDescent, NnDescentInner, NNDescent, "NnDescent", field, {
+ann_handle!(PyNnDescent, NnDescentInner, NNDescent, "NnDescent", {
     /// Descend to a kNN graph by iterative local join.
     ///
     /// ### Params

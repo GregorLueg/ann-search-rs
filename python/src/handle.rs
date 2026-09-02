@@ -50,11 +50,19 @@ macro_rules! read_shape {
 /// * `$index` - The library's index type, generic over its float.
 /// * `$name` - Name Python sees, also used in reprs and error messages.
 /// * `$shape` - `field` when the index exposes `n` and `dim` as public fields,
-///   `method` when it exposes them as accessors. See [`read_shape!`].
+///   `method` when it exposes them as accessors. Optional, defaulting to
+///   `field`. See [`read_shape!`].
 /// * `$extra` - The per-algorithm `build`, `query` and `query_self`, spliced
 ///   into the same `#[pymethods]` block because only one such block per class
 ///   is allowed without pyo3's `multiple-pymethods` feature.
 macro_rules! ann_handle {
+    // Field access is the common case, so it is the default. Spelling it out at
+    // every CPU call site would push each invocation past rustfmt's single-line
+    // threshold and reindent thirteen files for nothing.
+    ($cls:ident, $inner:ident, $index:ident, $name:literal, { $($extra:tt)* }) => {
+        crate::handle::ann_handle!($cls, $inner, $index, $name, field, { $($extra)* });
+    };
+
     ($cls:ident, $inner:ident, $index:ident, $name:literal, $shape:ident, { $($extra:tt)* }) => {
         /// Float-type dispatch for the handle below.
         pub(crate) enum $inner {
