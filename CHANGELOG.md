@@ -38,8 +38,7 @@
 
 **Breaking changes**
 
-Shipped in a patch deliberately. All three fall out of the bug fixes above, and
-nothing outside this repository consumes them yet.
+Shipped in a patch deliberately.
 
 - `ExhaustiveIndexBinary::new` takes a `metric: Dist` argument, after `n_bits`,
   matching `new_with_vector_store` and `IvfIndexBinary::build`. The free
