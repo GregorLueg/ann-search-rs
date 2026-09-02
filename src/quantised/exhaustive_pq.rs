@@ -724,7 +724,9 @@ mod tests {
             ExhaustivePqIndex::build(data.as_ref(), 8, Dist::Cosine, Some(50), Some(6), 42, false)
                 .unwrap();
 
-        let query: Vec<f32> = (0..32).map(|j| if j % 6 == 2 { 1.0 } else { 0.03 }).collect();
+        let query: Vec<f32> = (0..32)
+            .map(|j| if j % 6 == 2 { 1.0 } else { 0.03 })
+            .collect();
         let (indices, distances) = index.query(&query, 3).unwrap();
 
         let q_norm = f32::calculate_l2_norm(&query);

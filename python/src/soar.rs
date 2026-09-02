@@ -39,7 +39,10 @@ use crate::kmeans::kmeans_params;
 /// plain `cargo test`. The test binary is not linked against libpython, so
 /// touching `PyValueError` from one aborts on a flat-namespace symbol lookup at
 /// load time.
-pub(crate) fn soar_rule(rule: Option<&str>, param: Option<f64>) -> Result<Option<SoarRule>, String> {
+pub(crate) fn soar_rule(
+    rule: Option<&str>,
+    param: Option<f64>,
+) -> Result<Option<SoarRule>, String> {
     match rule {
         None => Ok(None),
         Some("nearest") => Ok(Some(SoarRule::Nearest)),
@@ -55,7 +58,7 @@ pub(crate) fn soar_rule(rule: Option<&str>, param: Option<f64>) -> Result<Option
     }
 }
 
-ann_handle!(PySoar, SoarInner, SoarIndex, "Soar", field, {
+ann_handle!(PySoar, SoarInner, SoarIndex, "Soar", {
     /// Cluster the data and spill every point into a second cell.
     ///
     /// ### Params

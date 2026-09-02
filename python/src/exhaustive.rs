@@ -16,7 +16,6 @@ ann_handle!(
     ExhaustiveInner,
     ExhaustiveIndex,
     "Exhaustive",
-    field,
     {
         /// Store the vectors.
         ///
