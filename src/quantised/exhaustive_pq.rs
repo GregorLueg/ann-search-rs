@@ -63,6 +63,10 @@ where
         &self.quantised_codes
     }
 
+    fn metric(&self) -> Dist {
+        self.metric
+    }
+
     fn codebooks(&self) -> &[Vec<T>] {
         self.codebook.codebooks()
     }
@@ -314,6 +318,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use approx::assert_relative_eq;
     use faer::Mat;
 
     fn create_simple_dataset() -> Mat<f32> {
@@ -676,5 +681,53 @@ mod tests {
         .unwrap();
         assert_eq!(index_16.codebook.m(), 16);
         assert_eq!(index_16.codebook.subvec_dim(), 4);
+    }
+
+    /// ADC works in the normalised space, so its raw sum estimates
+    /// `||q - v||^2 = 2 (1 - cos)`. The lookup table is halved to bring it back
+    /// onto the cosine scale the rest of the crate reports.
+    ///
+    /// The vectors are deliberately spread across directions rather than reused
+    /// from `create_simple_dataset`, whose rows are near-parallel: at
+    /// `cos ~ 0.999` the true and doubled distances are both ~0 and the
+    /// assertion would pass either way.
+    #[test]
+    fn test_cosine_distances_are_on_the_cosine_scale() {
+        // Each row leans on a different pair of dimensions, so the cosines
+        // between them span a useful range instead of clustering at 1.
+        let data = Mat::from_fn(6, 32, |i, j| {
+            if j % 6 == i {
+                1.0f32
+            } else {
+                0.05 * ((i + j) % 4) as f32
+            }
+        });
+
+        let index =
+            ExhaustivePqIndex::build(data.as_ref(), 8, Dist::Cosine, Some(50), Some(6), 42, false)
+                .unwrap();
+
+        let query: Vec<f32> = (0..32).map(|j| if j % 6 == 2 { 1.0 } else { 0.03 }).collect();
+        let (indices, distances) = index.query(&query, 3).unwrap();
+
+        let q_norm = f32::calculate_l2_norm(&query);
+        let mut saw_a_real_distance = false;
+
+        for (&idx, &got) in indices.iter().zip(distances.iter()) {
+            let row: Vec<f32> = (0..32).map(|j| data[(idx, j)]).collect();
+            let dot: f32 = row.iter().zip(query.iter()).map(|(a, b)| a * b).sum();
+            let expected = 1.0 - dot / (q_norm * f32::calculate_l2_norm(&row));
+
+            // Guards the test itself: at `expected ~ 0` the doubled value is
+            // also ~0 and the comparison below proves nothing.
+            saw_a_real_distance |= expected > 0.05;
+
+            assert_relative_eq!(got, expected, epsilon = 1e-3);
+        }
+
+        assert!(
+            saw_a_real_distance,
+            "fixture is degenerate: every neighbour sits at cosine distance ~0"
+        );
     }
 }

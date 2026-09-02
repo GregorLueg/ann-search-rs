@@ -106,6 +106,10 @@ where
         &self.quantised_codes
     }
 
+    fn metric(&self) -> Dist {
+        self.metric
+    }
+
     fn codebooks(&self) -> &[Vec<T>] {
         self.codebook.codebooks()
     }
