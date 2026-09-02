@@ -16,7 +16,7 @@
         <link rel="prev" href="../choosing/">
       
       
-        <link rel="next" href="../gpu/">
+        <link rel="next" href="../quantised/">
       
       
         
@@ -456,6 +456,33 @@
   
   
     <li class="md-nav__item">
+      <a href="../quantised/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Quantised
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    <li class="md-nav__item">
       <a href="../gpu/" class="md-nav__link">
         
   
@@ -523,10 +550,10 @@
       
         
         
-        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_6" >
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_7" >
         
           
-          <label class="md-nav__link" for="__nav_6" id="__nav_6_label" tabindex="">
+          <label class="md-nav__link" for="__nav_7" id="__nav_7_label" tabindex="">
             
   
   
@@ -544,8 +571,8 @@
             <span class="md-nav__icon md-icon"></span>
           </label>
         
-        <nav class="md-nav" data-md-level="1" aria-labelledby="__nav_6_label" aria-expanded="false">
-          <label class="md-nav__title" for="__nav_6">
+        <nav class="md-nav" data-md-level="1" aria-labelledby="__nav_7_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_7">
             <span class="md-nav__icon md-icon"></span>
             
   
@@ -598,6 +625,34 @@
     
   
     Indices
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../api/quantised/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Quantised indices
   
 
     
@@ -855,7 +910,9 @@ than re-entering the index from outside with its own points.</p>
 <p>Start with ground truth:</p>
 <div class="highlight"><pre><span></span><code><a id="__codelineno-2-1" name="__codelineno-2-1" href="#__codelineno-2-1"></a><span class="n">truth</span> <span class="o">=</span> <span class="n">ann</span><span class="o">.</span><span class="n">ExhaustiveIndex</span><span class="p">(</span><span class="n">n_neighbors</span><span class="o">=</span><span class="mi">15</span><span class="p">)</span><span class="o">.</span><span class="n">fit</span><span class="p">(</span><span class="n">X</span><span class="p">)</span><span class="o">.</span><span class="n">kneighbors</span><span class="p">(</span><span class="n">return_distance</span><span class="o">=</span><span class="kc">False</span><span class="p">)</span>
 </code></pre></div>
-<p><code>ExhaustiveIndex</code> is exact, so that's the target. On 50k x 32 it's a few seconds.</p>
+<p><code>ExhaustiveIndex</code> is exact, so that's the target. It is not a naive scan either:
+the self-kNN graph is the largest batch there is, which is where the blocked
+GEMM path wins.</p>
 <p>Now sweep the recall knob. <code>ef_search</code> is a search-time parameter, so one fitted
 index answers the whole sweep:</p>
 <div class="highlight"><pre><span></span><code><a id="__codelineno-3-1" name="__codelineno-3-1" href="#__codelineno-3-1"></a><span class="n">index</span> <span class="o">=</span> <span class="n">ann</span><span class="o">.</span><span class="n">HnswIndex</span><span class="p">(</span><span class="n">n_neighbors</span><span class="o">=</span><span class="mi">15</span><span class="p">,</span> <span class="n">m</span><span class="o">=</span><span class="mi">16</span><span class="p">,</span> <span class="n">ef_construction</span><span class="o">=</span><span class="mi">200</span><span class="p">)</span><span class="o">.</span><span class="n">fit</span><span class="p">(</span><span class="n">X</span><span class="p">)</span>
@@ -868,11 +925,11 @@ index answers the whole sweep:</p>
 <a id="__codelineno-4-2" name="__codelineno-4-2" href="#__codelineno-4-2"></a>ef_search=100  recall=0.9946
 <a id="__codelineno-4-3" name="__codelineno-4-3" href="#__codelineno-4-3"></a>ef_search=200  recall=0.9967
 </code></pre></div>
-<p>Recall climbs with <code>ef_search</code> and so does query time. On an M1 Max that sweep
-is 0.13s, 0.20s and 0.37s, against a 0.39s build. Where you stop is a
-judgement about your problem, not something the library can decide. Build-time
-knobs (<code>m</code>, <code>ef_construction</code>) need a refit to change, which is why the sweep
-above only moves the one that doesn't.</p>
+<p>Recall climbs with <code>ef_search</code>, and so does query time, roughly in step. Where
+you stop is a judgement about your problem, not something the library can
+decide, so time the sweep as well as scoring it. Build-time knobs (<code>m</code>,
+<code>ef_construction</code>) need a refit to change, which is why the sweep above only
+moves the one that doesn't.</p>
 <p>If a self-kNN graph is the actual deliverable rather than a queryable index,
 <code>NNDescentIndex</code> converges on one directly and hands it back without a search
 pass:</p>

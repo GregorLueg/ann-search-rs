@@ -16,7 +16,7 @@
         <link rel="prev" href="../toplevel/">
       
       
-        <link rel="next" href="../gpu/">
+        <link rel="next" href="../quantised/">
       
       
         
@@ -343,6 +343,33 @@
   
   
     <li class="md-nav__item">
+      <a href="../../quantised/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Quantised
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    <li class="md-nav__item">
       <a href="../../gpu/" class="md-nav__link">
         
   
@@ -412,10 +439,10 @@
       
         
         
-        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_6" checked>
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_7" checked>
         
           
-          <label class="md-nav__link" for="__nav_6" id="__nav_6_label" tabindex="">
+          <label class="md-nav__link" for="__nav_7" id="__nav_7_label" tabindex="">
             
   
   
@@ -433,8 +460,8 @@
             <span class="md-nav__icon md-icon"></span>
           </label>
         
-        <nav class="md-nav" data-md-level="1" aria-labelledby="__nav_6_label" aria-expanded="true">
-          <label class="md-nav__title" for="__nav_6">
+        <nav class="md-nav" data-md-level="1" aria-labelledby="__nav_7_label" aria-expanded="true">
+          <label class="md-nav__title" for="__nav_7">
             <span class="md-nav__icon md-icon"></span>
             
   
@@ -702,6 +729,34 @@
   
 </nav>
       
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../quantised/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Quantised indices
+  
+
+    
+  </span>
+  
+  
+
+      </a>
     </li>
   
 
@@ -1010,8 +1065,8 @@
 
 
 <h1 id="indices">Indices<a class="headerlink" href="#indices" title="Permanent link">&para;</a></h1>
-<p>The thirteen CPU estimators. Every one takes its parameters in the constructor,
-its data in <code>fit</code>, and hands results back from <code>kneighbors</code>.</p>
+<p>The uncompressed CPU estimators. Every one takes its parameters in the
+constructor, its data in <code>fit</code>, and hands results back from <code>kneighbors</code>.</p>
 <p>Parameters described as search-time can be overridden per call, so
 <code>index.kneighbors(X, ef_search=200)</code> leaves the fitted index alone. Everything
 else is fixed at build time and changing it means refitting.</p>

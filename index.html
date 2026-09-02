@@ -421,6 +421,33 @@
   
   
     <li class="md-nav__item">
+      <a href="quantised/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Quantised
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    <li class="md-nav__item">
       <a href="gpu/" class="md-nav__link">
         
   
@@ -488,10 +515,10 @@
       
         
         
-        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_6" >
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_7" >
         
           
-          <label class="md-nav__link" for="__nav_6" id="__nav_6_label" tabindex="">
+          <label class="md-nav__link" for="__nav_7" id="__nav_7_label" tabindex="">
             
   
   
@@ -509,8 +536,8 @@
             <span class="md-nav__icon md-icon"></span>
           </label>
         
-        <nav class="md-nav" data-md-level="1" aria-labelledby="__nav_6_label" aria-expanded="false">
-          <label class="md-nav__title" for="__nav_6">
+        <nav class="md-nav" data-md-level="1" aria-labelledby="__nav_7_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_7">
             <span class="md-nav__icon md-icon"></span>
             
   
@@ -563,6 +590,34 @@
     
   
     Indices
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="api/quantised/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Quantised indices
   
 
     
@@ -755,9 +810,10 @@
 <p>Approximate nearest-neighbour search built for single-cell and computational
 biology workloads. The <a href="https://github.com/GregorLueg/ann-search-rs">Rust crate</a>
 does the work. This is a thin scikit-learn shaped layer over it.</p>
-<p>Sixteen indices, thirteen on the CPU and three on the GPU, all behind the same
-four-method surface. No CUDA runtime to install: the GPU backend is wgpu, so it
-runs on Metal, Vulkan or DX12 and ships in the ordinary wheel.</p>
+<p>Twenty-seven indices, all behind the same four-method surface: thirteen on the
+CPU, eleven over quantised storage, three on the GPU. No CUDA runtime to
+install, since the GPU backend is wgpu, so it runs on Metal, Vulkan or DX12 and
+ships in the ordinary wheel.</p>
 <h2 id="install">Install<a class="headerlink" href="#install" title="Permanent link">&para;</a></h2>
 <div class="highlight"><pre><span></span><code><a id="__codelineno-0-1" name="__codelineno-0-1" href="#__codelineno-0-1"></a>uv<span class="w"> </span>pip<span class="w"> </span>install<span class="w"> </span>ann-search<span class="w">           </span><span class="c1"># numpy only</span>
 <a id="__codelineno-0-2" name="__codelineno-0-2" href="#__codelineno-0-2"></a>uv<span class="w"> </span>pip<span class="w"> </span>install<span class="w"> </span><span class="s2">"ann-search[sparse]"</span><span class="w"> </span><span class="c1"># adds scipy, for kneighbors_graph</span>
@@ -784,9 +840,12 @@ that.</p>
 <h2 id="where-to-go-next">Where to go next<a class="headerlink" href="#where-to-go-next" title="Permanent link">&para;</a></h2>
 <ul>
 <li><a href="choosing/">Choosing an index</a> if you don't already know which one you
-  want. Sixteen is a lot of choice and most of them are wrong for your problem.</li>
+  want. Twenty-seven is a lot of choice and most of them are wrong for your
+  problem.</li>
 <li><a href="quickstart/">Quickstart</a> for worked examples over the synthetic
   generators, including how to measure your own recall.</li>
+<li><a href="quantised/">Quantised</a> for the eleven compressed indices, when memory is
+  what's binding.</li>
 <li><a href="gpu/">GPU</a> for the three device-resident indices and what they cost you.</li>
 <li><a href="guide/">Guide</a> for metrics, padding, threads, persistence and the sharp
   edges.</li>

@@ -343,6 +343,33 @@
   
   
     <li class="md-nav__item">
+      <a href="../quantised/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Quantised
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    <li class="md-nav__item">
       <a href="../gpu/" class="md-nav__link">
         
   
@@ -434,6 +461,17 @@
     <span class="md-ellipsis">
       
         Metrics
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#distances-from-a-quantised-index-are-estimates" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Distances from a quantised index are estimates
       
     </span>
   </a>
@@ -556,10 +594,10 @@
       
         
         
-        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_6" >
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_7" >
         
           
-          <label class="md-nav__link" for="__nav_6" id="__nav_6_label" tabindex="">
+          <label class="md-nav__link" for="__nav_7" id="__nav_7_label" tabindex="">
             
   
   
@@ -577,8 +615,8 @@
             <span class="md-nav__icon md-icon"></span>
           </label>
         
-        <nav class="md-nav" data-md-level="1" aria-labelledby="__nav_6_label" aria-expanded="false">
-          <label class="md-nav__title" for="__nav_6">
+        <nav class="md-nav" data-md-level="1" aria-labelledby="__nav_7_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_7">
             <span class="md-nav__icon md-icon"></span>
             
   
@@ -631,6 +669,34 @@
     
   
     Indices
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../api/quantised/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Quantised indices
   
 
     
@@ -773,6 +839,17 @@
 </li>
       
         <li class="md-nav__item">
+  <a href="#distances-from-a-quantised-index-are-estimates" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Distances from a quantised index are estimates
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
   <a href="#padding" class="md-nav__link">
     <span class="md-ellipsis">
       
@@ -897,8 +974,16 @@ is free and preserves ordering.</p>
 squared Euclidean and warn to a stdout you can't see, which is a much worse
 failure across FFI than a loud one. Nothing in this package sends the core a
 string it hasn't already validated.</p>
-<p>Seven indices don't support Manhattan. See the
-<a href="../choosing/#the-table">table</a>; asking for it raises rather than falling back.</p>
+<p>Nineteen indices don't support Manhattan, the eleven quantised ones included:
+every codec there is built on inner products, which is what makes the integer
+arithmetic work. See the <a href="../choosing/#the-table">table</a>; asking for it raises
+rather than falling back.</p>
+<h2 id="distances-from-a-quantised-index-are-estimates">Distances from a quantised index are estimates<a class="headerlink" href="#distances-from-a-quantised-index-are-estimates" title="Permanent link">&para;</a></h2>
+<p>The eleven <a href="../quantised/">quantised</a> estimators report the codec's estimate of
+a distance, not the distance. Close enough to rank on, which is what an index
+is for, and not something to feed anywhere the absolute value matters without
+checking it against <code>ExhaustiveIndex</code> first. Recall is the honest way to
+compare two of them.</p>
 <h2 id="padding">Padding<a class="headerlink" href="#padding" title="Permanent link">&para;</a></h2>
 <p>Approximate indices can return fewer than <code>k</code> neighbours for a query. Those
 slots come back as index <code>-1</code> and distance <code>inf</code>. Mask on <code>indices &gt;= 0</code> before

@@ -10,13 +10,13 @@
       
       
       
-        <link rel="canonical" href="https://gregorlueg.github.io/ann-search-rs/choosing/">
+        <link rel="canonical" href="https://gregorlueg.github.io/ann-search-rs/quantised/">
       
       
-        <link rel="prev" href="..">
+        <link rel="prev" href="../quickstart/">
       
       
-        <link rel="next" href="../quickstart/">
+        <link rel="next" href="../gpu/">
       
       
         
@@ -27,7 +27,7 @@
     
     
       
-        <title>Choosing an index - ann-search</title>
+        <title>Quantised - ann-search</title>
       
     
     
@@ -80,7 +80,7 @@
     <div data-md-component="skip">
       
         
-        <a href="#choosing-an-index" class="md-skip">
+        <a href="#quantised-indices" class="md-skip">
           Skip to content
         </a>
       
@@ -116,7 +116,7 @@
         <div class="md-header__topic" data-md-component="header-topic">
           <span class="md-ellipsis">
             
-              Choosing an index
+              Quantised
             
           </span>
         </div>
@@ -286,37 +286,10 @@
       
   
   
-    
   
   
-  
-    <li class="md-nav__item md-nav__item--active">
-      
-      <input class="md-nav__toggle md-toggle" type="checkbox" id="__toc">
-      
-      
-        
-      
-      
-        <label class="md-nav__link md-nav__link--active" for="__toc">
-          
-  
-  
-  <span class="md-ellipsis">
-    
-  
-    Choosing an index
-  
-
-    
-  </span>
-  
-  
-
-          <span class="md-nav__icon md-icon"></span>
-        </label>
-      
-      <a href="./" class="md-nav__link md-nav__link--active">
+    <li class="md-nav__item">
+      <a href="../choosing/" class="md-nav__link">
         
   
   
@@ -332,131 +305,6 @@
   
 
       </a>
-      
-        
-
-<nav class="md-nav md-nav--secondary" aria-label="Table of contents">
-  
-  
-  
-    
-  
-  
-    <label class="md-nav__title" for="__toc">
-      <span class="md-nav__icon md-icon"></span>
-      Table of contents
-    </label>
-    <ul class="md-nav__list" data-md-component="toc" data-md-scrollfix>
-      
-        <li class="md-nav__item">
-  <a href="#start-here" class="md-nav__link">
-    <span class="md-ellipsis">
-      
-        Start here
-      
-    </span>
-  </a>
-  
-</li>
-      
-        <li class="md-nav__item">
-  <a href="#the-table" class="md-nav__link">
-    <span class="md-ellipsis">
-      
-        The table
-      
-    </span>
-  </a>
-  
-</li>
-      
-        <li class="md-nav__item">
-  <a href="#what-each-one-is-good-and-bad-at" class="md-nav__link">
-    <span class="md-ellipsis">
-      
-        What each one is good and bad at
-      
-    </span>
-  </a>
-  
-    <nav class="md-nav" aria-label="What each one is good and bad at">
-      <ul class="md-nav__list">
-        
-          <li class="md-nav__item">
-  <a href="#graph-indices" class="md-nav__link">
-    <span class="md-ellipsis">
-      
-        Graph indices
-      
-    </span>
-  </a>
-  
-</li>
-        
-          <li class="md-nav__item">
-  <a href="#partition-indices" class="md-nav__link">
-    <span class="md-ellipsis">
-      
-        Partition indices
-      
-    </span>
-  </a>
-  
-</li>
-        
-          <li class="md-nav__item">
-  <a href="#tree-indices" class="md-nav__link">
-    <span class="md-ellipsis">
-      
-        Tree indices
-      
-    </span>
-  </a>
-  
-</li>
-        
-          <li class="md-nav__item">
-  <a href="#exact-search" class="md-nav__link">
-    <span class="md-ellipsis">
-      
-        Exact search
-      
-    </span>
-  </a>
-  
-</li>
-        
-          <li class="md-nav__item">
-  <a href="#quantised" class="md-nav__link">
-    <span class="md-ellipsis">
-      
-        Quantised
-      
-    </span>
-  </a>
-  
-</li>
-        
-      </ul>
-    </nav>
-  
-</li>
-      
-        <li class="md-nav__item">
-  <a href="#measuring-rather-than-guessing" class="md-nav__link">
-    <span class="md-ellipsis">
-      
-        Measuring rather than guessing
-      
-    </span>
-  </a>
-  
-</li>
-      
-    </ul>
-  
-</nav>
-      
     </li>
   
 
@@ -492,10 +340,37 @@
       
   
   
+    
   
   
-    <li class="md-nav__item">
-      <a href="../quantised/" class="md-nav__link">
+  
+    <li class="md-nav__item md-nav__item--active">
+      
+      <input class="md-nav__toggle md-toggle" type="checkbox" id="__toc">
+      
+      
+        
+      
+      
+        <label class="md-nav__link md-nav__link--active" for="__toc">
+          
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Quantised
+  
+
+    
+  </span>
+  
+  
+
+          <span class="md-nav__icon md-icon"></span>
+        </label>
+      
+      <a href="./" class="md-nav__link md-nav__link--active">
         
   
   
@@ -511,6 +386,98 @@
   
 
       </a>
+      
+        
+
+<nav class="md-nav md-nav--secondary" aria-label="Table of contents">
+  
+  
+  
+    
+  
+  
+    <label class="md-nav__title" for="__toc">
+      <span class="md-nav__icon md-icon"></span>
+      Table of contents
+    </label>
+    <ul class="md-nav__list" data-md-component="toc" data-md-scrollfix>
+      
+        <li class="md-nav__item">
+  <a href="#the-one-thing-to-internalise" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        The one thing to internalise
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#what-each-codec-does" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        What each codec does
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="What each codec does">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#bf16" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        BF16
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#sq8" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        SQ8
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#pq-and-opq" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        PQ and OPQ
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#picking-one" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Picking one
+      
+    </span>
+  </a>
+  
+</li>
+      
+    </ul>
+  
+</nav>
+      
     </li>
   
 
@@ -823,10 +790,10 @@
     <ul class="md-nav__list" data-md-component="toc" data-md-scrollfix>
       
         <li class="md-nav__item">
-  <a href="#start-here" class="md-nav__link">
+  <a href="#the-one-thing-to-internalise" class="md-nav__link">
     <span class="md-ellipsis">
       
-        Start here
+        The one thing to internalise
       
     </span>
   </a>
@@ -834,33 +801,22 @@
 </li>
       
         <li class="md-nav__item">
-  <a href="#the-table" class="md-nav__link">
+  <a href="#what-each-codec-does" class="md-nav__link">
     <span class="md-ellipsis">
       
-        The table
+        What each codec does
       
     </span>
   </a>
   
-</li>
-      
-        <li class="md-nav__item">
-  <a href="#what-each-one-is-good-and-bad-at" class="md-nav__link">
-    <span class="md-ellipsis">
-      
-        What each one is good and bad at
-      
-    </span>
-  </a>
-  
-    <nav class="md-nav" aria-label="What each one is good and bad at">
+    <nav class="md-nav" aria-label="What each codec does">
       <ul class="md-nav__list">
         
           <li class="md-nav__item">
-  <a href="#graph-indices" class="md-nav__link">
+  <a href="#bf16" class="md-nav__link">
     <span class="md-ellipsis">
       
-        Graph indices
+        BF16
       
     </span>
   </a>
@@ -868,10 +824,10 @@
 </li>
         
           <li class="md-nav__item">
-  <a href="#partition-indices" class="md-nav__link">
+  <a href="#sq8" class="md-nav__link">
     <span class="md-ellipsis">
       
-        Partition indices
+        SQ8
       
     </span>
   </a>
@@ -879,32 +835,10 @@
 </li>
         
           <li class="md-nav__item">
-  <a href="#tree-indices" class="md-nav__link">
+  <a href="#pq-and-opq" class="md-nav__link">
     <span class="md-ellipsis">
       
-        Tree indices
-      
-    </span>
-  </a>
-  
-</li>
-        
-          <li class="md-nav__item">
-  <a href="#exact-search" class="md-nav__link">
-    <span class="md-ellipsis">
-      
-        Exact search
-      
-    </span>
-  </a>
-  
-</li>
-        
-          <li class="md-nav__item">
-  <a href="#quantised" class="md-nav__link">
-    <span class="md-ellipsis">
-      
-        Quantised
+        PQ and OPQ
       
     </span>
   </a>
@@ -917,10 +851,10 @@
 </li>
       
         <li class="md-nav__item">
-  <a href="#measuring-rather-than-guessing" class="md-nav__link">
+  <a href="#picking-one" class="md-nav__link">
     <span class="md-ellipsis">
       
-        Measuring rather than guessing
+        Picking one
       
     </span>
   </a>
@@ -944,7 +878,7 @@
 
 
   
-    <a href="https://github.com/GregorLueg/ann-search-rs/edit/main/python/docs/choosing.md" title="Edit this page" class="md-content__button md-icon" rel="edit">
+    <a href="https://github.com/GregorLueg/ann-search-rs/edit/main/python/docs/quantised.md" title="Edit this page" class="md-content__button md-icon" rel="edit">
       
       <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M10 20H6V4h7v5h5v3.1l2-2V8l-6-6H6c-1.1 0-2 .9-2 2v16c0 1.1.9 2 2 2h4zm10.2-7c.1 0 .3.1.4.2l1.3 1.3c.2.2.2.6 0 .8l-1 1-2.1-2.1 1-1c.1-.1.2-.2.4-.2m0 3.9L14.1 23H12v-2.1l6.1-6.1z"/></svg>
     </a>
@@ -952,332 +886,91 @@
   
 
 
-<h1 id="choosing-an-index">Choosing an index<a class="headerlink" href="#choosing-an-index" title="Permanent link">&para;</a></h1>
-<p>Twenty-seven indices is a lot of choice, and for any given problem most of them
-are the wrong answer. This page is the short version.</p>
-<h2 id="start-here">Start here<a class="headerlink" href="#start-here" title="Permanent link">&para;</a></h2>
-<p>If you want one answer and no reading: <strong><code>HnswIndex</code></strong>. High recall at low query
-latency, works on every metric, and the defaults are sensible. Everything below
-is about when it isn't the right call.</p>
-<p>Beyond that:</p>
-<ul>
-<li><strong>On a small dataset</strong>, use <code>ExhaustiveIndex</code>. It's exact, and on a large
-  batch it runs a blocked GEMM rather than a naive scan, so the point where
-  building an approximate index starts paying for itself is further out than
-  you'd guess. Measure it on your data rather than assuming.</li>
-<li><strong>You want the full self-kNN graph</strong>, as for UMAP or a scanpy neighbourhood
-  graph: <code>NNDescentIndex</code>, then <code>extract_knn()</code>. It converges on the graph
-  directly instead of searching for something it already has.</li>
-<li><strong>You need exactness but brute force is too slow</strong>: <code>KmknnIndex</code>. Recall is 1
-  by construction. Its home ground is 20 to 100 dimensions; above that the
-  triangle-inequality bounds go slack and it degenerates towards a full scan.</li>
-<li><strong>Memory is the binding constraint</strong>: <code>HnswSq8uIndex</code>, which is the usual
-  first choice at a quarter of the vector memory. See
-  <a href="../quantised/">Quantised</a>. Staying uncompressed, <code>IvfIndex</code> is the smallest
-  of the approximate indices and the two knobs (<code>nlist</code>, <code>nprobe</code>) are easy to
-  reason about.</li>
-<li><strong>You have a GPU and n is large</strong>: <code>CagraGpuIndex</code>. See <a href="../gpu/">GPU</a>.</li>
-<li><strong>You need Manhattan</strong>: that rules out nineteen of them. See the table.</li>
-</ul>
-<h2 id="the-table">The table<a class="headerlink" href="#the-table" title="Permanent link">&para;</a></h2>
-<table>
-<thead>
-<tr>
-<th>Index</th>
-<th>Exact</th>
-<th>Structure</th>
-<th>Manhattan</th>
-<th>Main recall knob</th>
-</tr>
-</thead>
-<tbody>
-<tr>
-<td><code>ExhaustiveIndex</code></td>
-<td>yes</td>
-<td>none</td>
-<td>yes</td>
-<td>none, recall is 1</td>
-</tr>
-<tr>
-<td><code>KmknnIndex</code></td>
-<td>yes</td>
-<td>k-means cells, triangle-inequality pruning</td>
-<td>no</td>
-<td>none, recall is 1</td>
-</tr>
-<tr>
-<td><code>HnswIndex</code></td>
-<td>no</td>
-<td>layered proximity graph</td>
-<td>yes</td>
-<td><code>ef_search</code></td>
-</tr>
-<tr>
-<td><code>VamanaIndex</code></td>
-<td>no</td>
-<td>flat navigable graph</td>
-<td>yes</td>
-<td><code>ef_search</code></td>
-</tr>
-<tr>
-<td><code>NsgIndex</code></td>
-<td>no</td>
-<td>pruned monotonic graph</td>
-<td>yes</td>
-<td><code>ef_search</code></td>
-</tr>
-<tr>
-<td><code>RnnDescentIndex</code></td>
-<td>no</td>
-<td>graph, pruned during descent</td>
-<td>yes</td>
-<td><code>ef_search</code></td>
-</tr>
-<tr>
-<td><code>NNDescentIndex</code></td>
-<td>no</td>
-<td>kNN graph</td>
-<td>yes</td>
-<td><code>ef_search</code></td>
-</tr>
-<tr>
-<td><code>IvfIndex</code></td>
-<td>no</td>
-<td>k-means Voronoi cells</td>
-<td>yes</td>
-<td><code>nprobe</code></td>
-</tr>
-<tr>
-<td><code>SoarIndex</code></td>
-<td>no</td>
-<td>Voronoi cells with spilling</td>
-<td>no</td>
-<td><code>nprobe</code></td>
-</tr>
-<tr>
-<td><code>AnnoyIndex</code></td>
-<td>no</td>
-<td>random-projection forest</td>
-<td>no</td>
-<td><code>search_budget</code></td>
-</tr>
-<tr>
-<td><code>KdTreeIndex</code></td>
-<td>no</td>
-<td>randomised kd spill-tree forest</td>
-<td>yes</td>
-<td><code>search_budget</code></td>
-</tr>
-<tr>
-<td><code>BallTreeIndex</code></td>
-<td>no</td>
-<td>nested hyperspheres</td>
-<td>no</td>
-<td><code>search_budget</code></td>
-</tr>
-<tr>
-<td><code>LshIndex</code></td>
-<td>no</td>
-<td>multi-probe LSH</td>
-<td>no</td>
-<td><code>n_probe</code></td>
-</tr>
-<tr>
-<td><code>ExhaustiveGpuIndex</code></td>
-<td>yes</td>
-<td>none, on device</td>
-<td>no</td>
-<td>none, recall is 1</td>
-</tr>
-<tr>
-<td><code>IvfGpuIndex</code></td>
-<td>no</td>
-<td>Voronoi cells, on device</td>
-<td>no</td>
-<td><code>nprobe</code></td>
-</tr>
-<tr>
-<td><code>CagraGpuIndex</code></td>
-<td>no</td>
-<td>CAGRA graph, on device</td>
-<td>no</td>
-<td><code>beam_width</code></td>
-</tr>
-<tr>
-<td><code>ExhaustiveBf16Index</code></td>
-<td>no</td>
-<td>none, <code>bf16</code> storage</td>
-<td>no</td>
-<td>none</td>
-</tr>
-<tr>
-<td><code>IvfBf16Index</code></td>
-<td>no</td>
-<td>Voronoi cells, <code>bf16</code> storage</td>
-<td>no</td>
-<td><code>nprobe</code></td>
-</tr>
-<tr>
-<td><code>ExhaustiveSq8Index</code></td>
-<td>no</td>
-<td>none, 8-bit codes</td>
-<td>no</td>
-<td>none</td>
-</tr>
-<tr>
-<td><code>IvfSq8Index</code></td>
-<td>no</td>
-<td>Voronoi cells, 8-bit codes</td>
-<td>no</td>
-<td><code>nprobe</code></td>
-</tr>
-<tr>
-<td><code>HnswSq8uIndex</code></td>
-<td>no</td>
-<td>layered graph over 8-bit codes</td>
-<td>no</td>
-<td><code>ef_search</code></td>
-</tr>
-<tr>
-<td><code>ExhaustivePqIndex</code></td>
-<td>no</td>
-<td>none, product codes</td>
-<td>no</td>
-<td>none</td>
-</tr>
-<tr>
-<td><code>IvfPqIndex</code></td>
-<td>no</td>
-<td>Voronoi cells, product codes</td>
-<td>no</td>
-<td><code>nprobe</code></td>
-</tr>
-<tr>
-<td><code>ExhaustiveOpqIndex</code></td>
-<td>no</td>
-<td>none, rotated product codes</td>
-<td>no</td>
-<td>none</td>
-</tr>
-<tr>
-<td><code>IvfOpqIndex</code></td>
-<td>no</td>
-<td>Voronoi cells, rotated product codes</td>
-<td>no</td>
-<td><code>nprobe</code></td>
-</tr>
-<tr>
-<td><code>SoarPqIndex</code></td>
-<td>no</td>
-<td>spilled cells, product codes</td>
-<td>no</td>
-<td><code>nprobe</code></td>
-</tr>
-<tr>
-<td><code>SoarOpqIndex</code></td>
-<td>no</td>
-<td>spilled cells, rotated product codes</td>
-<td>no</td>
-<td><code>nprobe</code></td>
-</tr>
-</tbody>
-</table>
-<h2 id="what-each-one-is-good-and-bad-at">What each one is good and bad at<a class="headerlink" href="#what-each-one-is-good-and-bad-at" title="Permanent link">&para;</a></h2>
-<h3 id="graph-indices">Graph indices<a class="headerlink" href="#graph-indices" title="Permanent link">&para;</a></h3>
-<p><strong><code>HnswIndex</code></strong> is a layered proximity graph: fast to build, fast to query, and
-modest in memory for what it gives you. Raise <code>ef_search</code> for recall at query
-time, <code>ef_construction</code> for a better graph at build time. It is the cheapest of
-the graph indices here to build, by a factor of two to four, on every
-distribution in the benchmark tables. The thing to watch is <code>ef_construction</code>,
-which is what that build cost is actually sensitive to.</p>
-<p><strong><code>VamanaIndex</code></strong> is the graph behind DiskANN, in its in-memory variant. A
-single flat graph rather than a layered one, refined over two alpha-pruning
-passes. It builds slower than HNSW rather than faster, so reach for it when you
-want the flat structure and the smaller index, not for the build time.</p>
-<p><strong><code>NsgIndex</code></strong> thins a kNN graph with the MRNG rule, so each node ends up with
-edges pointing in spread-out directions instead of a cluster of near-duplicates.
-It has to materialise a full kNN graph first (<code>knn_k</code> sizes it), so the build
-pays twice. Sparse and fast once built.</p>
-<p><strong><code>RnnDescentIndex</code></strong> folds the pruning into the descent loop, so one pass hands
-back a graph that's already search-ready and no intermediate kNN graph is ever
-materialised. That saves it the double build NSG pays, though HNSW still gets
-there first. <code>r</code> caps the out-degree and is the size knob.</p>
-<p><strong><code>NNDescentIndex</code></strong> is the odd one out: <code>n_neighbors</code> is a build parameter, not
-just a query one, and <code>extract_knn()</code> hands back the converged graph without
-searching. That is its whole argument, and it is a real one when the graph <em>is</em>
-the deliverable rather than a queryable index. It is not, though, the fastest
-route to a self-kNN graph: on the benchmark shapes the partition indices' self
-paths get there sooner at equal or better recall, <code>KmknnIndex</code> exactly. Measure
-both on your data.</p>
-<h3 id="partition-indices">Partition indices<a class="headerlink" href="#partition-indices" title="Permanent link">&para;</a></h3>
-<p><strong><code>IvfIndex</code></strong> cuts the space into <code>nlist</code> k-means cells and scans the <code>nprobe</code>
-nearest ones. Cheap to build, easy to tune, and the smallest of the approximate
-unquantised indices: it stores the vectors and a permutation, and little else.
-Recall degrades when a true neighbour sits just over a cell boundary, which is
-exactly what SOAR fixes.</p>
-<p><strong><code>SoarIndex</code></strong> writes every vector into two cells: its nearest centroid, and a
-second chosen so its residual points somewhere the first one doesn't. Better
-recall per <code>nprobe</code> than plain IVF, for roughly twice the posting-list size.
-Read the trade against <strong>query time</strong>, not against <code>nprobe</code>: at a fixed <code>nprobe</code>
-a spilled index scans about twice the candidates, so comparing at equal <code>nprobe</code>
+<h1 id="quantised-indices">Quantised indices<a class="headerlink" href="#quantised-indices" title="Permanent link">&para;</a></h1>
+<p>Eleven more estimators, all of them the same indices you already have over
+compressed vectors. They exist for one reason: memory. A float32 index stores
+<code>dim</code> floats per vector, and on a few million cells at 512 dimensions that
+stops being a rounding error.</p>
+<p>Nothing about the surface changes. Same <code>fit</code> / <code>kneighbors</code> / <code>save</code>, same
+padding rules, float32 and float64 both supported.</p>
+<h2 id="the-one-thing-to-internalise">The one thing to internalise<a class="headerlink" href="#the-one-thing-to-internalise" title="Permanent link">&para;</a></h2>
+<p><strong>A quantised index reports the codec's estimate of a distance, not the
+distance.</strong> It's close enough to rank on, which is what an index is for. It is
+not something to feed anywhere the absolute value matters without checking it
+against <code>ExhaustiveIndex</code> first.</p>
+<p>This also means recall is the only honest way to compare two of them. A
+distance-ratio comparison between a quantised index and an exact one conflates
+the retrieval error with the codec's, and the crate's own benchmark tables
+recompute every ratio from the original vectors for exactly that reason.</p>
+<p>The other constraint: <strong>none of them support Manhattan</strong>. Every codec here is
+built on inner products, which is what makes the integer arithmetic work.
+Asking for it raises rather than falling back.</p>
+<h2 id="what-each-codec-does">What each codec does<a class="headerlink" href="#what-each-codec-does" title="Permanent link">&para;</a></h2>
+<h3 id="bf16">BF16<a class="headerlink" href="#bf16" title="Permanent link">&para;</a></h3>
+<p><code>ExhaustiveBf16Index</code>, <code>IvfBf16Index</code>.</p>
+<p>Storage drops to <code>bf16</code>, which keeps float32's exponent range and throws away
+mantissa bits from roughly the third significant digit on. Half the memory, no
+overflow traps, and nothing else in the index changes. The cheapest
+quantisation to reason about and the one with the least to go wrong, which also
+makes it the smallest saving.</p>
+<h3 id="sq8">SQ8<a class="headerlink" href="#sq8" title="Permanent link">&para;</a></h3>
+<p><code>ExhaustiveSq8Index</code>, <code>IvfSq8Index</code>, <code>HnswSq8uIndex</code>.</p>
+<p>One byte per dimension, with per-dimension offsets and a single scale shared
+across all of them. The shared scale is the whole trick: it makes the integer
+code distance preserve the ordering of the float one, so the scan runs entirely
+on <code>u8</code> kernels. A quarter of the memory, and the query usually comes out
+<em>faster</em> than the float version rather than slower.</p>
+<p><code>HnswSq8uIndex</code> is the interesting one. The graph is built and searched
+entirely on codes, so there's no float copy sitting around for re-ranking and
+no mismatch between the edges and the distances that traverse them. If you want
+one quantised index and no further reading, take this one.</p>
+<p>Two knobs worth knowing. <code>quant_drop_ratio</code> trims a fraction from each tail of
+every dimension before the range is fixed, so a handful of outliers can't
+stretch the range and waste code levels. <code>quant_sample_rows</code> caps how many rows
+the calibration looks at.</p>
+<h3 id="pq-and-opq">PQ and OPQ<a class="headerlink" href="#pq-and-opq" title="Permanent link">&para;</a></h3>
+<p><code>ExhaustivePqIndex</code>, <code>IvfPqIndex</code>, <code>ExhaustiveOpqIndex</code>, <code>IvfOpqIndex</code>,
+<code>SoarPqIndex</code>, <code>SoarOpqIndex</code>.</p>
+<p>Each vector is cut into <code>m</code> subvectors, and each subvector is replaced by the
+id of its nearest sub-codebook centroid. A vector costs <code>m</code> bytes. At <code>dim=512</code>
+and <code>m=64</code> that's 64 bytes against 2 KB, and the recall reflects it.</p>
+<p>This is a method for high-dimensional embedding spaces. On a 30-dimensional PCA
+<code>ExhaustiveSq8Index</code> will beat it on both memory and recall, because there is
+nothing left to exploit once the dimensions are already decorrelated and few.</p>
+<p><code>m</code> has to divide <code>dim</code>. <code>n_pq_centroids</code> defaults to 256, which is what makes
+a code fit in a byte, and cannot exceed your sample count, so a small dataset
+needs it lowered.</p>
+<p><strong>OPQ</strong> adds a learned orthogonal rotation before the split. Plain PQ splits on
+whatever axis order the data arrived in, so a space with variance concentrated
+in a few coordinates gets subspaces of wildly unequal difficulty. The rotation
+spreads it. Costs more at build time (<code>opq_iters</code> is the knob) and nothing at
+query time, since the rotation folds into the query once. Worth it on a raw
+embedding space, rarely worth it after a PCA has already done the rotating.</p>
+<p><strong>The IVF variants</strong> learn the codes on the residual from the cell centroid
+rather than on the vector, so the sub-codebooks only have to cover within-cell
+spread. That's why <code>IvfPqIndex</code> reaches better recall than <code>ExhaustivePqIndex</code>
+at the same <code>m</code>, on top of scanning fewer candidates.</p>
+<p><strong>The SOAR variants</strong> spill every vector into a second cell chosen so its
+residual points somewhere the first one doesn't, fixing IVF's main failure of a
+true neighbour sitting just over a cell boundary. Roughly twice the
+posting-list size, which is exactly what quantisation makes affordable. Read
+that trade against query time, not against <code>nprobe</code>: at a fixed <code>nprobe</code> a
+spilled index scans about twice the candidates, so comparing at equal <code>nprobe</code>
 flatters it and answers nothing.</p>
-<p><strong><code>KmknnIndex</code></strong> uses the same Voronoi structure but prunes with the triangle
-inequality instead of skipping cells outright, which is what makes it exact.
-Cosine normalises at build time and runs in Euclidean space internally.</p>
-<h3 id="tree-indices">Tree indices<a class="headerlink" href="#tree-indices" title="Permanent link">&para;</a></h3>
-<p><strong><code>AnnoyIndex</code></strong> is a forest of random-projection trees. More trees means better
-recall and a larger index, and that's essentially the whole tuning story.</p>
-<p><strong><code>KdTreeIndex</code></strong> is the same trade with axis-aligned splits. A split is one
-coordinate comparison rather than a full dot product, so traversal and build are
-both cheaper than Annoy's. It's also the only tree index here that supports
-Manhattan.</p>
-<p><strong><code>BallTreeIndex</code></strong> prunes with the triangle inequality over nested
-hyperspheres, so one tree does the job of a forest. It pays off when the data
-has genuine cluster structure and the dimensionality is moderate. The default
-<code>search_budget</code> of 5% is fine at 32 dimensions, where it reaches 0.98 to 0.99
-recall on all four benchmark distributions, and thin in high dimensions, where
-it drops to 0.91 and 10% is the better starting point. Past 10% recall plateaus
-and query time doesn't fall, so there's no reason to go higher.</p>
-<p><strong><code>LshIndex</code></strong> is the cheapest index here to build and the weakest on recall.
-The projections are orthogonalised and the quantile boundaries are fitted to a
-subsample rather than passing through the origin, which matters on data carrying
-a large shared mean offset. Foundation-model cell embeddings are exactly that
-case, and plain SimHash collapses on them.</p>
-<h3 id="exact-search">Exact search<a class="headerlink" href="#exact-search" title="Permanent link">&para;</a></h3>
-<p><strong><code>ExhaustiveIndex</code></strong> scores every query against every point, so recall is 1 by
-construction. It is not a naive scan: the core dispatches on batch size between
-a fused per-query SIMD scan, which keeps each accumulation in registers but
-re-reads the whole database per query, and a blocked GEMM path that blocks both
-axes so a database tile is reused across a tile of queries. The self-kNN graph
-is the largest batch there is, which is exactly where the GEMM path wins.</p>
-<p>Its main job is still ground truth: build one, measure your approximate index
-against it, and only then decide whether the recall you're getting is the recall
-you need. But check the timings while you're there. Beating a blocked GEMM is a
-higher bar than beating brute force.</p>
-<h3 id="quantised">Quantised<a class="headerlink" href="#quantised" title="Permanent link">&para;</a></h3>
-<p>Eleven more estimators, covered on their own page: <a href="../quantised/">Quantised</a>.
-The short version is that they store compressed vectors instead of floats, so
-they trade recall for memory, and that the distances they hand back are the
-codec's estimate rather than the distance.</p>
-<p>Reach for one when memory is what's binding. <code>HnswSq8uIndex</code> is the default
-answer: the usual first choice at a quarter of the vector memory, with the same
-<code>ef_search</code> knob. <code>IvfSq8Index</code> if you were already on <code>IvfIndex</code>. The PQ family
-when a quarter isn't enough of a saving, which in practice means a
-high-dimensional embedding space rather than a 30-dimensional PCA.</p>
-<h2 id="measuring-rather-than-guessing">Measuring rather than guessing<a class="headerlink" href="#measuring-rather-than-guessing" title="Permanent link">&para;</a></h2>
-<p>None of the above tells you what recall you'll get on your data. The crate's
-benchmark tables sweep every index over four synthetic distributions with hard
-numbers for build time, query time, recall and index size:</p>
-<ul>
-<li><a href="https://github.com/GregorLueg/ann-search-rs/blob/main/docs/benchmarks_standard.md">Standard indices</a></li>
-<li><a href="https://github.com/GregorLueg/ann-search-rs/blob/main/docs/benchmarks_knn_graph.md">kNN graph construction</a></li>
-<li><a href="https://github.com/GregorLueg/ann-search-rs/blob/main/docs/benchmarks_gpu.md">GPU indices</a></li>
-</ul>
-<p>Those runs use the same generators and seeds as
-<a href="../api/datasets/"><code>ann_search.datasets</code></a>, so a Python measurement and a
-<code>cargo run --example gridsearch_hnsw</code> run see identical points.</p>
-<p>Don't extrapolate ideal parameters for your own problem from them. Do the
-measurement: <a href="../quickstart/">Quickstart</a> has the recipe.</p>
+<h2 id="picking-one">Picking one<a class="headerlink" href="#picking-one" title="Permanent link">&para;</a></h2>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-0-1" name="__codelineno-0-1" href="#__codelineno-0-1"></a><span class="kn">import</span><span class="w"> </span><span class="nn">ann_search</span><span class="w"> </span><span class="k">as</span><span class="w"> </span><span class="nn">ann</span>
+<a id="__codelineno-0-2" name="__codelineno-0-2" href="#__codelineno-0-2"></a>
+<a id="__codelineno-0-3" name="__codelineno-0-3" href="#__codelineno-0-3"></a><span class="n">index</span> <span class="o">=</span> <span class="n">ann</span><span class="o">.</span><span class="n">HnswSq8uIndex</span><span class="p">(</span><span class="n">n_neighbors</span><span class="o">=</span><span class="mi">15</span><span class="p">,</span> <span class="n">metric</span><span class="o">=</span><span class="s2">"cosine"</span><span class="p">)</span><span class="o">.</span><span class="n">fit</span><span class="p">(</span><span class="n">X</span><span class="p">)</span>
+<a id="__codelineno-0-4" name="__codelineno-0-4" href="#__codelineno-0-4"></a><span class="n">distances</span><span class="p">,</span> <span class="n">indices</span> <span class="o">=</span> <span class="n">index</span><span class="o">.</span><span class="n">kneighbors</span><span class="p">()</span>
+</code></pre></div>
+<p>Then measure. The recipe in <a href="../quickstart/">Quickstart</a> works unchanged: build
+an <code>ExhaustiveIndex</code> for ground truth, and compare recall rather than
+distances.</p>
+<p>The crate's <a href="https://github.com/GregorLueg/ann-search-rs/blob/main/docs/benchmarks_quantised.md">benchmark tables</a> sweep every codec over the synthetic
+generators with build time, query time, recall and index size. The PQ-family
+runs are at higher dimensionality with fewer samples, since that's the regime
+those methods are for. Don't extrapolate parameters for your own problem from
+them.</p>
 
 
 
