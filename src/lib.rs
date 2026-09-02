@@ -3735,8 +3735,9 @@ where
 #[cfg(feature = "binary")]
 /// Build an exhaustive binary index
 ///
-/// This one can be only used for Cosine distance. There is no good hash
-/// function that translates Euclidean distance to Hamming distance!
+/// The Hamming stage is always angular: there is no good hash function that
+/// translates Euclidean distance to Hamming distance. `dist_metric` only
+/// governs the exact re-ranking stage, which needs `save_store`.
 ///
 /// ### Params
 ///
@@ -3777,7 +3778,7 @@ where
         let path = save_path.expect("save_path required when save_store is true");
         ExhaustiveIndexBinary::new_with_vector_store(mat, binary_init, n_bits, metric, seed, path)
     } else {
-        ExhaustiveIndexBinary::new(mat, binary_init, n_bits, seed)
+        ExhaustiveIndexBinary::new(mat, binary_init, n_bits, metric, seed)
     }
 }
 
