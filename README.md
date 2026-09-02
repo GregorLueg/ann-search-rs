@@ -2,6 +2,7 @@
 [![Crates.io](https://img.shields.io/crates/v/ann-search-rs.svg)](https://crates.io/crates/ann-search-rs)
 [![docs.rs](https://img.shields.io/docsrs/ann-search-rs)](https://docs.rs/ann-search-rs)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+[![PyPI](https://img.shields.io/pypi/v/ann-search.svg)](https://pypi.org/project/ann-search/)
 
 # ann-search-rs
 
@@ -9,7 +10,9 @@ Various approximate nearest neighbour/vector searches implemented in Rust (with
 focus on computational biology applications, very specifically single cell). The
 search algorithms are designed for high in-memory performance. Indices can be
 saved to disk and loaded back in via the `serialise` feature. Longer term, I
-might add the option to add/remove vectors from some of the indices.
+might add the option to add/remove vectors from some of the indices. The
+package also has an evolving thin wrapper for [Python](https://pypi.org/project/ann-search/)
+now, too.
 
 ## Table of Contents
 

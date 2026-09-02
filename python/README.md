@@ -1,3 +1,7 @@
+[![PyPI](https://img.shields.io/pypi/v/ann-search.svg)](https://pypi.org/project/ann-search/)
+[![Docs](https://img.shields.io/badge/docs-latest-blue.svg)](https://gregorlueg.github.io/ann-search-rs/api/indices/)
+[![CI](https://github.com/GregorLueg/ann-search-rs/actions/workflows/python-test.yml/badge.svg)](https://github.com/GregorLueg/ann-search-rs/actions/workflows/python-test.yml)
+
 # ann-search
 
 Python bindings for [`ann-search-rs`](https://github.com/GregorLueg/ann-search-rs):
