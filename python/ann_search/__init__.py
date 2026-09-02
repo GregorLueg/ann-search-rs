@@ -16,7 +16,7 @@ and infinite distances, and `kneighbors_graph` drops those slots.
 Indices are immutable. There's no incremental ``add``, so rebuild instead.
 """
 
-from . import _ann_search, datasets
+from . import _ann_search, datasets, quantised
 from ._ann_search import (
     AnnSearchError,
     IndexIoError,
@@ -42,16 +42,38 @@ from .indices import (
     SoarIndex,
     VamanaIndex,
 )
+from .quantised import (
+    ExhaustiveBf16Index,
+    ExhaustiveOpqIndex,
+    ExhaustivePqIndex,
+    ExhaustiveSq8Index,
+    HnswSq8uIndex,
+    IvfBf16Index,
+    IvfOpqIndex,
+    IvfPqIndex,
+    IvfSq8Index,
+    SoarOpqIndex,
+    SoarPqIndex,
+)
 
 __all__ = [
     "AnnSearchError",
     "AnnoyIndex",
     "BallTreeIndex",
     "BaseAnnIndex",
+    "ExhaustiveBf16Index",
     "ExhaustiveIndex",
+    "ExhaustiveOpqIndex",
+    "ExhaustivePqIndex",
+    "ExhaustiveSq8Index",
     "HnswIndex",
+    "HnswSq8uIndex",
     "IndexIoError",
+    "IvfBf16Index",
     "IvfIndex",
+    "IvfOpqIndex",
+    "IvfPqIndex",
+    "IvfSq8Index",
     "KdTreeIndex",
     "KmknnIndex",
     "LshIndex",
@@ -60,12 +82,15 @@ __all__ = [
     "NsgIndex",
     "RnnDescentIndex",
     "SoarIndex",
+    "SoarOpqIndex",
+    "SoarPqIndex",
     "VamanaIndex",
     "__core_version__",
     "__version__",
     "datasets",
     "gpu_available",
     "num_threads",
+    "quantised",
     "set_num_threads",
 ]
 

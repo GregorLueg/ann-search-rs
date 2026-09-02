@@ -16,8 +16,18 @@ squared Euclidean and warn to a stdout you can't see, which is a much worse
 failure across FFI than a loud one. Nothing in this package sends the core a
 string it hasn't already validated.
 
-Seven indices don't support Manhattan. See the
-[table](choosing.md#the-table); asking for it raises rather than falling back.
+Nineteen indices don't support Manhattan, the eleven quantised ones included:
+every codec there is built on inner products, which is what makes the integer
+arithmetic work. See the [table](choosing.md#the-table); asking for it raises
+rather than falling back.
+
+## Distances from a quantised index are estimates
+
+The eleven [quantised](quantised.md) estimators report the codec's estimate of
+a distance, not the distance. Close enough to rank on, which is what an index
+is for, and not something to feed anywhere the absolute value matters without
+checking it against `ExhaustiveIndex` first. Recall is the honest way to
+compare two of them.
 
 ## Padding
 

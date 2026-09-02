@@ -67,6 +67,26 @@ where
     }
 }
 
+///////////
+// Shape //
+///////////
+
+impl<T> IvfSq8Index<T>
+where
+    T: AnnSearchFloat,
+{
+    /// Number of indexed samples.
+    ///
+    /// ### Returns
+    ///
+    /// The row count the index was built from. Pairs with
+    /// [`DimensionValidation::dim`] so every index exposes its shape the same
+    /// way, which is what the Python bindings' handle macro reads.
+    pub fn n(&self) -> usize {
+        self.n
+    }
+}
+
 //////////////////////
 // CentroidDistance //
 //////////////////////

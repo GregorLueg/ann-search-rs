@@ -6420,6 +6420,13 @@ where
     /// Get the quantised codes
     fn quantised_codes(&self) -> &[u8];
 
+    /// The metric the index was built for
+    ///
+    /// Needed because the ADC sum is a squared Euclidean distance whatever the
+    /// metric is, and under [`Dist::Cosine`] that has to be rescaled to a
+    /// cosine distance. See [`VectorDistanceAdc::build_lookup_tables_impl`].
+    fn metric(&self) -> Dist;
+
     /// For IVF variants - query residual against PQ centroids
     ///
     /// ### Params
@@ -6460,6 +6467,16 @@ where
 
     /// Shared implementation
     ///
+    /// ### Note
+    ///
+    /// The table entries are squared Euclidean sub-distances whatever the
+    /// index metric is. Under [`Dist::Cosine`] both the data and the query are
+    /// unit-normalised before they reach here, so the ADC sum estimates
+    /// `||q - v||^2 = 2 (1 - cos)`, which is twice the cosine distance. The
+    /// halving is applied to the table rather than to each candidate: it is
+    /// exact, since `sum(0.5 * t_i) == 0.5 * sum(t_i)`, and costs
+    /// `m * n_centroids` multiplies per query instead of one per candidate.
+    ///
     /// ### Params
     ///
     /// * `query_vec`: The query vector to build the lookup tables for.
@@ -6479,6 +6496,11 @@ where
     ) -> Vec<T> {
         let mut table = vec![T::zero(); m * n_cents];
 
+        let scale = match self.metric() {
+            Dist::Cosine => T::one() / (T::one() + T::one()),
+            _ => T::one(),
+        };
+
         for subspace in 0..m {
             let query_sub = &query_vec[subspace * subvec_dim..(subspace + 1) * subvec_dim];
             let table_offset = subspace * n_cents;
@@ -6489,7 +6511,7 @@ where
                     &self.codebooks()[subspace][centroid_start..centroid_start + subvec_dim];
 
                 let dist = T::euclidean_simd(query_sub, pq_centroid);
-                table[table_offset + centroid_idx] = dist;
+                table[table_offset + centroid_idx] = dist * scale;
             }
         }
 

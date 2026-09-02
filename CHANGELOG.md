@@ -1,5 +1,53 @@
 # News
 
+## 0.8.1
+
+**Python**
+
+- The eleven quantised indices are now bound: `ExhaustiveBf16Index`,
+  `IvfBf16Index`, `ExhaustiveSq8Index`, `IvfSq8Index`, `HnswSq8uIndex`,
+  `ExhaustivePqIndex`, `IvfPqIndex`, `ExhaustiveOpqIndex`, `IvfOpqIndex`,
+  `SoarPqIndex`, `SoarOpqIndex`. Same four-method surface as the rest, save /
+  load / pickle included, float32 and float64 both supported. Shipped as
+  `ann-search` 0.2.0. The binary indices are not bound yet.
+- Python docs corrected against the regenerated benchmark tables. HNSW is now
+  the cheapest graph index to build rather than the most expensive, which
+  reversed three separate claims in `choosing.md`.
+
+**Fixes**
+
+- The PQ family (`ExhaustivePqIndex`, `IvfPqIndex`, `ExhaustiveOpqIndex`,
+  `IvfOpqIndex`, `SoarPqIndex`, `SoarOpqIndex`) returned **twice** the cosine
+  distance under `Dist::Cosine`. They normalise the data and the query, then
+  run ADC in that space, where the sum estimates `||q - v||^2 = 2 (1 - cos)`,
+  and nothing rescaled it. Now halved at the lookup table, which is exact and
+  costs `m * n_centroids` multiplies per query rather than one per candidate.
+  Rank order is untouched, so recall and every published benchmark number are
+  unaffected; only callers reading the distances see a change.
+- `ExhaustiveIndexBinary::new` hardcoded `Dist::Cosine` and silently discarded
+  the metric `build_exhaustive_index_binary` had just parsed, and neither
+  constructor validated it, so a Manhattan build plus `rerank = true` hit an
+  `unreachable!()` and panicked instead of erroring.
+
+**Features**
+
+- `HnswSq8uIndex` implements `IndexIo`, so the quantised HNSW can be saved and
+  loaded like every other index.
+- `pub fn n()` on the ten quantised index structs, pairing with the existing
+  `DimensionValidation::dim()` so every index exposes its shape the same way.
+
+**Breaking changes**
+
+Shipped in a patch deliberately.
+
+- `ExhaustiveIndexBinary::new` takes a `metric: Dist` argument, after `n_bits`,
+  matching `new_with_vector_store` and `IvfIndexBinary::build`. The free
+  function `build_exhaustive_index_binary` is unchanged.
+- Both `ExhaustiveIndexBinary` constructors now reject `Dist::Manhattan` with
+  `DistanceNotSupported`, as `IvfIndexBinary` already did.
+- `VectorDistanceAdc` gains a required `metric()` method. Only matters if you
+  implement the trait outside this crate.
+
 ## 0.8.0
 
 - `gpu` no longer pulls CubeCL's CPU runtime and its prebuilt LLVM; it moved to

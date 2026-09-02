@@ -31,6 +31,20 @@ use crate::utils::pack_knn_results;
 /// The hierarchy seeds the entry point, then one beam search runs over the
 /// dense base layer. Every distance goes through the codec, so swapping the
 /// codec swaps the storage and the arithmetic without touching the graph.
+///
+/// ### Note
+///
+/// The serde bounds are stated by hand because the derive would otherwise
+/// demand `T: Serialize` off the back of the `PhantomData<T>` alone. Only the
+/// codec actually carries data, so only the codec is constrained.
+#[cfg_attr(
+    feature = "serialise",
+    derive(serde::Serialize, serde::Deserialize),
+    serde(bound(
+        serialize = "C: serde::Serialize",
+        deserialize = "C: serde::de::DeserializeOwned"
+    ))
+)]
 pub struct HnswQuantisedIndex<T, C>
 where
     T: AnnSearchFloat,
@@ -510,6 +524,20 @@ where
             + self.hierarchy.memory_usage_bytes()
             + self.original_ids.capacity() * std::mem::size_of::<usize>()
     }
+}
+
+/////////////
+// IndexIo //
+/////////////
+
+#[cfg(feature = "serialise")]
+impl<T> IndexIo for HnswSq8uIndex<T>
+where
+    T: AnnSearchFloat,
+{
+    type Elem = T;
+
+    const KIND: &'static str = "hnsw_sq8u";
 }
 
 ///////////

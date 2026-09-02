@@ -159,6 +159,10 @@ where
         &self.quantised_codes
     }
 
+    fn metric(&self) -> Dist {
+        self.metric
+    }
+
     fn codebooks(&self) -> &[Vec<T>] {
         self.codebook.codebooks()
     }
@@ -171,6 +175,23 @@ where
 impl<T> DimensionValidation for SoarPqIndex<T> {
     fn dim(&self) -> usize {
         self.dim
+    }
+}
+
+///////////
+// Shape //
+///////////
+
+impl<T> SoarPqIndex<T> {
+    /// Number of indexed samples.
+    ///
+    /// ### Returns
+    ///
+    /// The row count the index was built from. Pairs with
+    /// [`DimensionValidation::dim`] so every index exposes its shape the same
+    /// way, which is what the Python bindings' handle macro reads.
+    pub fn n(&self) -> usize {
+        self.n
     }
 }
 

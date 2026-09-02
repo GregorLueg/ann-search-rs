@@ -11,7 +11,12 @@ import ann_search as ann
 
 @pytest.fixture(scope="module")
 def data() -> np.ndarray:
-    return np.random.default_rng(3).standard_normal((400, 16)).astype(np.float32)
+    """400 points in 32 dimensions.
+
+    32 rather than something smaller because it is the minimum product
+    quantisation accepts, and it divides by every default `m`.
+    """
+    return np.random.default_rng(3).standard_normal((400, 32)).astype(np.float32)
 
 
 ###############

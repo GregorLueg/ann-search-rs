@@ -1,7 +1,7 @@
 # Choosing an index
 
-Sixteen indices is a lot of choice, and for any given problem most of them are
-the wrong answer. This page is the short version.
+Twenty-seven indices is a lot of choice, and for any given problem most of them
+are the wrong answer. This page is the short version.
 
 ## Start here
 
@@ -21,11 +21,13 @@ Beyond that:
 - **You need exactness but brute force is too slow**: `KmknnIndex`. Recall is 1
   by construction. Its home ground is 20 to 100 dimensions; above that the
   triangle-inequality bounds go slack and it degenerates towards a full scan.
-- **Memory is the binding constraint**: `IvfIndex`. Smallest footprint of the
-  unquantised indices, and the two knobs (`nlist`, `nprobe`) are easy to reason
-  about.
+- **Memory is the binding constraint**: `HnswSq8uIndex`, which is the usual
+  first choice at a quarter of the vector memory. See
+  [Quantised](quantised.md). Staying uncompressed, `IvfIndex` is the smallest
+  of the approximate indices and the two knobs (`nlist`, `nprobe`) are easy to
+  reason about.
 - **You have a GPU and n is large**: `CagraGpuIndex`. See [GPU](gpu.md).
-- **You need Manhattan**: that rules out seven of them. See the table.
+- **You need Manhattan**: that rules out nineteen of them. See the table.
 
 ## The table
 
@@ -47,20 +49,33 @@ Beyond that:
 | `ExhaustiveGpuIndex` | yes | none, on device | no | none, recall is 1 |
 | `IvfGpuIndex` | no | Voronoi cells, on device | no | `nprobe` |
 | `CagraGpuIndex` | no | CAGRA graph, on device | no | `beam_width` |
+| `ExhaustiveBf16Index` | no | none, `bf16` storage | no | none |
+| `IvfBf16Index` | no | Voronoi cells, `bf16` storage | no | `nprobe` |
+| `ExhaustiveSq8Index` | no | none, 8-bit codes | no | none |
+| `IvfSq8Index` | no | Voronoi cells, 8-bit codes | no | `nprobe` |
+| `HnswSq8uIndex` | no | layered graph over 8-bit codes | no | `ef_search` |
+| `ExhaustivePqIndex` | no | none, product codes | no | none |
+| `IvfPqIndex` | no | Voronoi cells, product codes | no | `nprobe` |
+| `ExhaustiveOpqIndex` | no | none, rotated product codes | no | none |
+| `IvfOpqIndex` | no | Voronoi cells, rotated product codes | no | `nprobe` |
+| `SoarPqIndex` | no | spilled cells, product codes | no | `nprobe` |
+| `SoarOpqIndex` | no | spilled cells, rotated product codes | no | `nprobe` |
 
 ## What each one is good and bad at
 
 ### Graph indices
 
-**`HnswIndex`** is a layered proximity graph: expensive to build, fast to query,
-and modest in memory for what it gives you. Raise `ef_search` for recall at
-query time, `ef_construction` for a better graph at build time. The build cost
-is the thing to watch: it's the slowest of the graph indices here.
+**`HnswIndex`** is a layered proximity graph: fast to build, fast to query, and
+modest in memory for what it gives you. Raise `ef_search` for recall at query
+time, `ef_construction` for a better graph at build time. It is the cheapest of
+the graph indices here to build, by a factor of two to four, on every
+distribution in the benchmark tables. The thing to watch is `ef_construction`,
+which is what that build cost is actually sensitive to.
 
 **`VamanaIndex`** is the graph behind DiskANN, in its in-memory variant. A
 single flat graph rather than a layered one, refined over two alpha-pruning
-passes. Builds faster than HNSW at comparable recall, which is the reason to
-reach for it.
+passes. It builds slower than HNSW rather than faster, so reach for it when you
+want the flat structure and the smaller index, not for the build time.
 
 **`NsgIndex`** thins a kNN graph with the MRNG rule, so each node ends up with
 edges pointing in spread-out directions instead of a cluster of near-duplicates.
@@ -69,20 +84,24 @@ pays twice. Sparse and fast once built.
 
 **`RnnDescentIndex`** folds the pruning into the descent loop, so one pass hands
 back a graph that's already search-ready and no intermediate kNN graph is ever
-materialised. The cheapest route to a graph index. `r` caps the out-degree and
-is the size knob.
+materialised. That saves it the double build NSG pays, though HNSW still gets
+there first. `r` caps the out-degree and is the size knob.
 
 **`NNDescentIndex`** is the odd one out: `n_neighbors` is a build parameter, not
 just a query one, and `extract_knn()` hands back the converged graph without
-searching. If a self-kNN graph is the deliverable, this is the fastest route to
-it on the CPU. As a queryable index it's fine but not special.
+searching. That is its whole argument, and it is a real one when the graph *is*
+the deliverable rather than a queryable index. It is not, though, the fastest
+route to a self-kNN graph: on the benchmark shapes the partition indices' self
+paths get there sooner at equal or better recall, `KmknnIndex` exactly. Measure
+both on your data.
 
 ### Partition indices
 
 **`IvfIndex`** cuts the space into `nlist` k-means cells and scans the `nprobe`
-nearest ones. Cheap to build, easy to tune, smallest in-memory footprint of the
-unquantised indices. Recall degrades when a true neighbour sits just over a cell
-boundary, which is exactly what SOAR fixes.
+nearest ones. Cheap to build, easy to tune, and the smallest of the approximate
+unquantised indices: it stores the vectors and a permutation, and little else.
+Recall degrades when a true neighbour sits just over a cell boundary, which is
+exactly what SOAR fixes.
 
 **`SoarIndex`** writes every vector into two cells: its nearest centroid, and a
 second chosen so its residual points somewhere the first one doesn't. Better
@@ -107,9 +126,11 @@ Manhattan.
 
 **`BallTreeIndex`** prunes with the triangle inequality over nested
 hyperspheres, so one tree does the job of a forest. It pays off when the data
-has genuine cluster structure and the dimensionality is moderate. Watch the
-default `search_budget`: 5% of the indexed points is thin on small datasets, and
-10% is often the better starting point.
+has genuine cluster structure and the dimensionality is moderate. The default
+`search_budget` of 5% is fine at 32 dimensions, where it reaches 0.98 to 0.99
+recall on all four benchmark distributions, and thin in high dimensions, where
+it drops to 0.91 and 10% is the better starting point. Past 10% recall plateaus
+and query time doesn't fall, so there's no reason to go higher.
 
 **`LshIndex`** is the cheapest index here to build and the weakest on recall.
 The projections are orthogonalised and the quantile boundaries are fitted to a
@@ -130,6 +151,19 @@ Its main job is still ground truth: build one, measure your approximate index
 against it, and only then decide whether the recall you're getting is the recall
 you need. But check the timings while you're there. Beating a blocked GEMM is a
 higher bar than beating brute force.
+
+### Quantised
+
+Eleven more estimators, covered on their own page: [Quantised](quantised.md).
+The short version is that they store compressed vectors instead of floats, so
+they trade recall for memory, and that the distances they hand back are the
+codec's estimate rather than the distance.
+
+Reach for one when memory is what's binding. `HnswSq8uIndex` is the default
+answer: the usual first choice at a quarter of the vector memory, with the same
+`ef_search` knob. `IvfSq8Index` if you were already on `IvfIndex`. The PQ family
+when a quarter isn't enough of a saving, which in practice means a
+high-dimensional embedding space rather than a 30-dimensional PCA.
 
 ## Measuring rather than guessing
 

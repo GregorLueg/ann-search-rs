@@ -553,6 +553,7 @@ mod tests {
     mod quantised_round_trips {
         use super::*;
 
+        use crate::quantised::hnsw_quantised::index::HnswSq8uIndex;
         use crate::quantised::{
             exhaustive_bf16::*, exhaustive_opq::*, exhaustive_pq::*, exhaustive_sq8::*,
             ivf_bf16::*, ivf_opq::*, ivf_pq::*, ivf_sq8::*, soar_opq::*, soar_pq::*,
@@ -679,6 +680,13 @@ mod tests {
             )
             .unwrap(),
             |i, q| unwrap_knn(query_ivf_opq_index(q, i, K, Some(NLIST), true, false))
+        );
+
+        round_trip!(
+            test_round_trip_hnsw_sq8u,
+            HnswSq8uIndex<f32>,
+            |m| build_hnsw_sq8u_index(m, 8, 32, "euclidean", 1, None, false).unwrap(),
+            |i, q| unwrap_knn(query_hnsw_sq8u_index(q, i, K, 32, true, false))
         );
     }
 
@@ -1755,6 +1763,14 @@ mod tests {
         |i| query_hnsw_self(i, K, 32, false, false).unwrap().0
     );
 
+    #[cfg(feature = "quantised")]
+    self_round_trip!(
+        test_self_round_trip_hnsw_sq8u,
+        crate::quantised::hnsw_quantised::index::HnswSq8uIndex<f32>,
+        |m| build_hnsw_sq8u_index(m, 8, 32, "euclidean", 1, None, false).unwrap(),
+        |i| query_hnsw_sq8u_self(i, K, 32, false, false).unwrap().0
+    );
+
     /// Two indices sharing a `KIND` would cross-load straight past the header
     /// check, so the tags have to stay distinct.
     #[test]
@@ -1777,12 +1793,14 @@ mod tests {
 
         #[cfg(feature = "quantised")]
         {
+            use crate::quantised::hnsw_quantised::index::HnswSq8uIndex;
             use crate::quantised::{
                 exhaustive_bf16::*, exhaustive_opq::*, exhaustive_pq::*, exhaustive_sq8::*,
                 ivf_bf16::*, ivf_opq::*, ivf_pq::*, ivf_sq8::*, soar_opq::*, soar_pq::*,
             };
 
             kinds.extend([
+                <HnswSq8uIndex<f32> as IndexIo>::KIND,
                 <SoarPqIndex<f32> as IndexIo>::KIND,
                 <SoarOpqIndex<f32> as IndexIo>::KIND,
                 <ExhaustiveIndexBf16<f32> as IndexIo>::KIND,

@@ -52,17 +52,38 @@ that.
 | `IvfIndex` | Inverted file over k-means cells. |
 | `SoarIndex` | IVF with spilling. Better recall per `nprobe`, twice the lists. No Manhattan. |
 | `LshIndex` | Multi-probe LSH. Cheapest build, weakest recall. No Manhattan. |
-| `NNDescentIndex` | Fastest route to a full self-kNN graph. |
-| `RnnDescentIndex` | Builds and prunes in one pass. Cheapest graph index. |
+| `NNDescentIndex` | Hands back the graph it built, without a search pass. |
+| `RnnDescentIndex` | Builds and prunes in one pass, no intermediate kNN graph. |
 | `VamanaIndex` | DiskANN-style flat graph. |
 | `NsgIndex` | Navigating spreading-out graph. |
 
 `BallTreeIndex` defaults its `search_budget` to 5% of the indexed points, which
-is the crate's own heuristic. That is thin on small datasets: raise it to 10% if
-recall matters more than query time.
+is the crate's own heuristic. That holds up at moderate dimensionality and gets
+thin in high dimensions: raise it to 10% there if recall matters more than
+query time.
 
-The quantised and binary indices in the Rust crate aren't bound yet. They follow
-the same pattern when they land.
+## Quantised
+
+Eleven more estimators over compressed vectors, for when memory is the binding
+constraint. Distances from these are the codec's estimate rather than the
+distance, and none of them support Manhattan.
+
+| Class | Notes |
+| --- | --- |
+| `ExhaustiveBf16Index` | Brute force at `bf16`. Half the memory, nothing else changes. |
+| `IvfBf16Index` | `IvfIndex` with `bf16` posting lists. |
+| `ExhaustiveSq8Index` | Brute force on 8-bit codes. Quarter the memory, integer kernels. |
+| `IvfSq8Index` | `IvfIndex` on 8-bit codes. |
+| `HnswSq8uIndex` | HNSW built *and* searched on 8-bit codes. The one to reach for. |
+| `ExhaustivePqIndex` | Product quantisation, `m` bytes per vector. |
+| `IvfPqIndex` | IVF plus PQ, codes learned on the cell residual. |
+| `ExhaustiveOpqIndex` | PQ with a learned rotation in front. |
+| `IvfOpqIndex` | IVF-PQ with the rotation. |
+| `SoarPqIndex` | IVF-PQ with SOAR spilling. |
+| `SoarOpqIndex` | The most compressed, and the slowest to build. |
+
+The binary indices in the Rust crate aren't bound yet. They follow the same
+pattern when they land.
 
 ## GPU
 

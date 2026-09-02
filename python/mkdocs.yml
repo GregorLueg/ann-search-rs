@@ -35,11 +35,13 @@ nav:
   - Home: index.md
   - Choosing an index: choosing.md
   - Quickstart: quickstart.md
+  - Quantised: quantised.md
   - GPU: gpu.md
   - Guide: guide.md
   - API reference:
       - Top level: api/toplevel.md
       - Indices: api/indices.md
+      - Quantised indices: api/quantised.md
       - GPU indices: api/gpu.md
       - Estimator base: api/base.md
       - Synthetic data: api/datasets.md

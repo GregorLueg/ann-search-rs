@@ -90,7 +90,7 @@ where
     /// Generate a new exhaustive binary index
     ///
     /// Binarises all vectors using the specified hash function and stores them
-    /// as compact binary codes. This works solely for Cosine distance!
+    /// as compact binary codes.
     ///
     /// ### Params
     ///
@@ -99,6 +99,7 @@ where
     ///   `"sign"`)
     /// * `n_bits` - Number of bits per binary code (must be multiple of 8).
     ///   Ignored by sign-based binarisation, which always emits `dim` bits.
+    /// * `metric` - Distance metric. Manhattan is not supported.
     /// * `seed` - Random seed for binariser
     ///
     /// ### Returns
@@ -108,10 +109,14 @@ where
         data: impl AnnMatrix<T>,
         binarisation_init: &str,
         n_bits: usize,
+        metric: Dist,
         seed: usize,
     ) -> Result<Self, AnnSearchErrors> {
         if !n_bits.is_multiple_of(8) {
             return Err(AnnSearchErrors::NBitsMustBe8Multiple { n_bits });
+        }
+        if metric == Dist::Manhattan {
+            return Err(AnnSearchErrors::DistanceNotSupported(metric));
         }
 
         let init = parse_binarisation_init(binarisation_init).unwrap_or_else(|| {
@@ -147,7 +152,7 @@ where
             binarisation_type: init,
             vector_store: None,
             store_meta: None,
-            metric: Dist::Cosine,
+            metric,
         })
     }
 
@@ -162,7 +167,7 @@ where
     ///   `"sign"`)
     /// * `n_bits` - Number of bits per binary code (must be multiple of 8).
     ///   Ignored by sign-based binarisation, which always emits `dim` bits.
-    /// * `metric` - Distance metric for reranking
+    /// * `metric` - Distance metric for reranking. Manhattan is not supported.
     /// * `seed` - Random seed for binariser
     /// * `save_path` - Directory to save vector store files
     ///
@@ -179,6 +184,9 @@ where
     ) -> Result<Self, AnnSearchErrors> {
         if !n_bits.is_multiple_of(8) {
             return Err(AnnSearchErrors::NBitsMustBe8Multiple { n_bits });
+        }
+        if metric == Dist::Manhattan {
+            return Err(AnnSearchErrors::DistanceNotSupported(metric));
         }
 
         let init = parse_binarisation_init(binarisation_init).unwrap_or_default();
@@ -459,23 +467,23 @@ where
             idx
         };
 
-        let query_norm = match self.metric {
-            Dist::Cosine => T::calculate_l2_norm(query_vec),
-            Dist::SquaredEuclidean => T::one(),
-            Dist::Manhattan => unreachable!(),
+        // Both constructors reject Manhattan, so the metric is either Cosine or
+        // squared Euclidean by construction
+        let cosine = self.metric == Dist::Cosine;
+
+        let query_norm = if cosine {
+            T::calculate_l2_norm(query_vec)
+        } else {
+            T::one()
         };
 
         let mut scored: Vec<_> = candidates
             .iter()
             .map(|&idx| {
-                let dist = match self.metric {
-                    Dist::Cosine => {
-                        vector_store.cosine_distance_to_query(idx, query_vec, query_norm)
-                    }
-                    Dist::SquaredEuclidean => {
-                        vector_store.euclidean_distance_to_query(idx, query_vec)
-                    }
-                    Dist::Manhattan => unreachable!(),
+                let dist = if cosine {
+                    vector_store.cosine_distance_to_query(idx, query_vec, query_norm)
+                } else {
+                    vector_store.euclidean_distance_to_query(idx, query_vec)
                 };
                 (idx, dist)
             })
@@ -754,7 +762,8 @@ mod tests {
         let data = create_signed_test_data(n, dim, 7);
 
         for n_bits in [8, 32, 64, 128] {
-            let index = ExhaustiveIndexBinary::new(data.as_ref(), "sign", n_bits, 42).unwrap();
+            let index = ExhaustiveIndexBinary::new(data.as_ref(), "sign", n_bits, Dist::Cosine, 42)
+                .unwrap();
 
             assert_eq!(index.n_bytes, dim / 8, "stride tracked n_bits = {}", n_bits);
             assert_eq!(index.vectors_flat_binarised.len(), n * index.n_bytes);
@@ -934,7 +943,8 @@ mod tests {
     fn test_sign_based_handles_partial_last_byte() {
         for dim in [30, 31, 32] {
             let data = create_signed_test_data(64, dim, 7);
-            let index = ExhaustiveIndexBinary::new(data.as_ref(), "sign", 32, 42).unwrap();
+            let index =
+                ExhaustiveIndexBinary::new(data.as_ref(), "sign", 32, Dist::Cosine, 42).unwrap();
 
             assert_eq!(index.n_bytes, dim.div_ceil(8));
             assert_eq!(index.vectors_flat_binarised.len(), 64 * index.n_bytes);
@@ -953,7 +963,9 @@ mod tests {
         let data = create_signed_test_data(64, 32, 7);
 
         for n_bits in [16, 64] {
-            let index = ExhaustiveIndexBinary::new(data.as_ref(), "random", n_bits, 42).unwrap();
+            let index =
+                ExhaustiveIndexBinary::new(data.as_ref(), "random", n_bits, Dist::Cosine, 42)
+                    .unwrap();
 
             assert_eq!(index.n_bytes, n_bits / 8);
             assert_eq!(index.vectors_flat_binarised.len(), 64 * index.n_bytes);
@@ -963,7 +975,8 @@ mod tests {
     #[test]
     fn test_exhaustive_binary_construction() {
         let data = create_test_data::<f32>(100, 32);
-        let index = ExhaustiveIndexBinary::new(data.as_ref(), "random", 64, 42).unwrap();
+        let index =
+            ExhaustiveIndexBinary::new(data.as_ref(), "random", 64, Dist::Cosine, 42).unwrap();
 
         assert_eq!(index.n, 100);
         assert_eq!(index.n_bytes, 8);
@@ -973,7 +986,8 @@ mod tests {
     #[test]
     fn test_exhaustive_binary_query_returns_k_results() {
         let data = create_test_data::<f32>(100, 32);
-        let index = ExhaustiveIndexBinary::new(data.as_ref(), "random", 64, 42).unwrap();
+        let index =
+            ExhaustiveIndexBinary::new(data.as_ref(), "random", 64, Dist::Cosine, 42).unwrap();
 
         let query: Vec<f32> = (0..32).map(|i| i as f32 * 0.1).collect();
         let (indices, distances) = index.query(&query, 10).unwrap();
@@ -985,7 +999,8 @@ mod tests {
     #[test]
     fn test_exhaustive_binary_query_sorted() {
         let data = create_test_data::<f32>(100, 32);
-        let index = ExhaustiveIndexBinary::new(data.as_ref(), "random", 64, 42).unwrap();
+        let index =
+            ExhaustiveIndexBinary::new(data.as_ref(), "random", 64, Dist::Cosine, 42).unwrap();
 
         let query: Vec<f32> = (0..32).map(|i| i as f32 * 0.1).collect();
         let (_, distances) = index.query(&query, 10).unwrap();
@@ -998,7 +1013,8 @@ mod tests {
     #[test]
     fn test_exhaustive_binary_query_k_exceeds_n() {
         let data = create_test_data::<f32>(50, 32);
-        let index = ExhaustiveIndexBinary::new(data.as_ref(), "random", 64, 42).unwrap();
+        let index =
+            ExhaustiveIndexBinary::new(data.as_ref(), "random", 64, Dist::Cosine, 42).unwrap();
 
         let query: Vec<f32> = (0..32).map(|i| i as f32 * 0.1).collect();
         let (indices, _) = index.query(&query, 100).unwrap();
@@ -1012,7 +1028,8 @@ mod tests {
         // centres on the training mean a whole block of rows shares one code
         // and self-retrieval is a coin flip between ties at Hamming 0
         let data = create_signed_test_data(100, 32, 5);
-        let index = ExhaustiveIndexBinary::new(data.as_ref(), "random", 64, 42).unwrap();
+        let index =
+            ExhaustiveIndexBinary::new(data.as_ref(), "random", 64, Dist::Cosine, 42).unwrap();
 
         let (indices1, distances1) = index.query_row(data.as_ref().row(0), 10).unwrap();
 
@@ -1024,7 +1041,8 @@ mod tests {
     #[test]
     fn test_exhaustive_binary_knn_graph_no_vector_store() {
         let data = create_test_data::<f32>(50, 32);
-        let index = ExhaustiveIndexBinary::new(data.as_ref(), "random", 64, 42).unwrap();
+        let index =
+            ExhaustiveIndexBinary::new(data.as_ref(), "random", 64, Dist::Cosine, 42).unwrap();
 
         let (knn_indices, knn_distances) = index.generate_knn(5, None, true, false).unwrap();
 
@@ -1040,7 +1058,8 @@ mod tests {
     #[test]
     fn test_hamming_distances_in_valid_range() {
         let data = create_test_data::<f32>(100, 32);
-        let index = ExhaustiveIndexBinary::new(data.as_ref(), "random", 64, 42).unwrap();
+        let index =
+            ExhaustiveIndexBinary::new(data.as_ref(), "random", 64, Dist::Cosine, 42).unwrap();
 
         let query: Vec<f32> = (0..32).map(|i| i as f32 * 0.1).collect();
         let (_, distances) = index.query(&query, 20).unwrap();
@@ -1151,12 +1170,76 @@ mod tests {
     #[test]
     fn test_query_reranking_without_vector_store() {
         let data = create_test_data::<f32>(50, 32);
-        let index = ExhaustiveIndexBinary::new(data.as_ref(), "random", 64, 42).unwrap();
+        let index =
+            ExhaustiveIndexBinary::new(data.as_ref(), "random", 64, Dist::Cosine, 42).unwrap();
         let query: Vec<f32> = (0..32).map(|i| i as f32 * 0.1).collect();
         let result = index.query_reranking(&query, 10, Some(5));
         assert!(matches!(
             result,
             Err(AnnSearchErrors::VectorStoreNotAvailable)
+        ));
+    }
+
+    /// `new` used to hardcode `Dist::Cosine` and drop the caller's choice on the
+    /// floor, so an index asked for Euclidean silently re-ranked by cosine. The
+    /// free function parses the string and hands it down, so both layers are
+    /// checked here.
+    #[test]
+    fn test_new_honours_euclidean_metric() {
+        let data = create_test_data::<f32>(50, 32);
+
+        let index =
+            ExhaustiveIndexBinary::new(data.as_ref(), "random", 64, Dist::SquaredEuclidean, 42)
+                .unwrap();
+
+        assert_eq!(index.metric, Dist::SquaredEuclidean);
+
+        let via_wrapper = crate::build_exhaustive_index_binary(
+            data.as_ref(),
+            64,
+            42,
+            "random",
+            "euclidean",
+            false,
+            None::<&Path>,
+        )
+        .unwrap();
+
+        assert_eq!(via_wrapper.metric, Dist::SquaredEuclidean);
+    }
+
+    /// Hamming distance has no Manhattan analogue, so the constructor has to
+    /// reject it. It used to sail through and panic in `query_reranking`, which
+    /// is an abort across an FFI boundary.
+    #[test]
+    fn test_new_rejects_manhattan() {
+        let data = create_test_data::<f32>(50, 32);
+        let result = ExhaustiveIndexBinary::new(data.as_ref(), "random", 64, Dist::Manhattan, 42);
+
+        assert!(matches!(
+            result,
+            Err(AnnSearchErrors::DistanceNotSupported(Dist::Manhattan))
+        ));
+    }
+
+    /// The store-backed constructor took a metric but never validated it.
+    #[test]
+    fn test_new_with_vector_store_rejects_manhattan() {
+        let data = create_test_data::<f32>(50, 32);
+        let temp_dir = TempDir::new().unwrap();
+
+        let result = ExhaustiveIndexBinary::new_with_vector_store(
+            data.as_ref(),
+            "random",
+            64,
+            Dist::Manhattan,
+            42,
+            temp_dir.path(),
+        );
+
+        assert!(matches!(
+            result,
+            Err(AnnSearchErrors::DistanceNotSupported(Dist::Manhattan))
         ));
     }
 }
