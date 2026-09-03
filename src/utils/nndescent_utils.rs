@@ -12,6 +12,7 @@
 
 use rayon::prelude::*;
 use rdst::RadixKey;
+use std::sync::atomic::{AtomicU32, Ordering};
 
 ///////////////
 // Sentinels //
@@ -216,21 +217,25 @@ pub fn unpack_knn_graph<T: Copy + Send + Sync + num_traits::Zero + PartialOrd>(
 // Graph ptr //
 ///////////////
 
-/// Unsafe pointer wrapper for lock-free parallel writes to the flat graph.
+/// Unsafe pointer wrapper for lock-free parallel writes to a flat buffer.
 ///
-/// Safety is guaranteed by the update pattern: segments are grouped by target
-/// node, so no two threads ever write to the same `target * k` block
-/// simultaneously.
+/// Safety rests on the caller partitioning the buffer: the graph writes are
+/// grouped by target node so no two threads touch the same `target * k` block,
+/// and the counting-sort scatter in [`UpdateGrouper::group`] hands out each
+/// slot exactly once.
 ///
 /// ### Fields
 #[derive(Copy, Clone)]
-pub struct UnsafeGraphPtr<T>(
-    /// Raw mutable pointer to the flat neighbour buffer
-    pub *mut Neighbour<T>,
+pub struct UnsafeMutPtr<E>(
+    /// Raw mutable pointer to the buffer
+    pub *mut E,
 );
 
-unsafe impl<T> Send for UnsafeGraphPtr<T> {}
-unsafe impl<T> Sync for UnsafeGraphPtr<T> {}
+unsafe impl<E> Send for UnsafeMutPtr<E> {}
+unsafe impl<E> Sync for UnsafeMutPtr<E> {}
+
+/// Flat neighbour buffer pointer, the shape the graph writers use.
+pub type UnsafeGraphPtr<T> = UnsafeMutPtr<Neighbour<T>>;
 
 /////////////
 // Updates //
@@ -290,6 +295,150 @@ impl<T> RadixKey for Update<T> {
     #[inline]
     fn get_level(&self, level: usize) -> u8 {
         (self.target >> (level * 8)) as u8
+    }
+}
+
+///////////////////
+// Update grouper //
+///////////////////
+
+/// Reusable scratch for grouping an update batch by target node.
+///
+/// A build runs one grouping per pass, so the cursor array and the output
+/// buffer are held here and reused rather than allocated each time.
+///
+/// ### Fields
+pub struct UpdateGrouper<T> {
+    /// Per-target counts, converted in place into write cursors
+    cursors: Vec<AtomicU32>,
+    /// Grouped updates, target-contiguous
+    data: Vec<Update<T>>,
+}
+
+impl<T: Copy + Send + Sync> Default for UpdateGrouper<T> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl<T: Copy + Send + Sync> UpdateGrouper<T> {
+    /// Create an empty grouper.
+    ///
+    /// ### Returns
+    ///
+    /// Grouper holding no scratch; the first [`UpdateGrouper::group`] sizes it.
+    pub fn new() -> Self {
+        Self {
+            cursors: Vec::new(),
+            data: Vec::new(),
+        }
+    }
+
+    /// Zero the per-target counters, growing the array if needed.
+    ///
+    /// Call before the pass that emits updates, so it can count them through
+    /// [`UpdateGrouper::counts`].
+    ///
+    /// ### Params
+    ///
+    /// * `n` - Number of nodes
+    pub fn reset_counts(&mut self, n: usize) {
+        if self.cursors.len() < n {
+            self.cursors = (0..n).map(|_| AtomicU32::new(0)).collect();
+        } else {
+            for c in self.cursors[..n].iter() {
+                c.store(0, Ordering::Relaxed);
+            }
+        }
+    }
+
+    /// Per-target counters, to be incremented once per emitted update.
+    ///
+    /// Counting where the updates are produced folds the histogram into a pass
+    /// that already holds the target in a register, which is worth more than it
+    /// looks: as a separate pass the counting is a stream of relaxed increments
+    /// at random offsets, sixteen counters to a cache line, so the line bounces
+    /// between cores and the pass costs the same on eight threads as on one.
+    /// Inside the producing loop the same increments overlap the work already in
+    /// flight.
+    ///
+    /// ### Params
+    ///
+    /// * `n` - Number of nodes
+    ///
+    /// ### Returns
+    ///
+    /// The counter slice, one entry per node.
+    #[inline]
+    pub fn counts(&self, n: usize) -> &[AtomicU32] {
+        &self.cursors[..n]
+    }
+
+    /// Group per-task update batches whose targets are already counted.
+    ///
+    /// Turns the counts from [`UpdateGrouper::counts`] into write cursors with
+    /// one serial `O(n)` pass, then scatters every update into its target's
+    /// segment. That is one read-and-write of the batch, against the several
+    /// full passes a radix sort makes over 12-byte elements, its same-size
+    /// scratch allocation, and the flattening copy needed to hand it one
+    /// contiguous slice in the first place.
+    ///
+    /// The result is grouped, **not** sorted within a group: a target's updates
+    /// arrive in whatever order the parallel scatter produced. That is enough
+    /// for [`ApplySortedUpdates`], whose merge is a bounded insertion sort under
+    /// a total order and so reaches the same row whatever the arrival order, and
+    /// it is what lets the sort go away.
+    ///
+    /// ### Params
+    ///
+    /// * `batches` - Per-task update batches, read but not consumed
+    /// * `n` - Number of nodes, bounding the target ids
+    ///
+    /// ### Returns
+    ///
+    /// The grouped batch, with every target's updates contiguous.
+    pub fn group_counted(&mut self, batches: &[Vec<Update<T>>], n: usize) -> &[Update<T>] {
+        let total: usize = batches.iter().map(|b| b.len()).sum();
+        self.data.clear();
+        if total == 0 {
+            return &self.data;
+        }
+        debug_assert!(
+            total <= u32::MAX as usize,
+            "update batch exceeds u32 cursors"
+        );
+
+        let cursors = &self.cursors[..n];
+
+        // Counts become write cursors in one pass: each slot takes the running
+        // total of everything before it, which is its segment start.
+        let mut acc: u32 = 0;
+        for c in cursors.iter() {
+            let count = c.load(Ordering::Relaxed);
+            c.store(acc, Ordering::Relaxed);
+            acc += count;
+        }
+        debug_assert_eq!(acc as usize, total);
+
+        self.data.reserve(total);
+        let out = UnsafeMutPtr(self.data.as_mut_ptr());
+        batches.par_iter().for_each(|batch| {
+            #[allow(clippy::redundant_locals)]
+            let out = out;
+            for u in batch.iter() {
+                let pos = cursors[u.target as usize].fetch_add(1, Ordering::Relaxed) as usize;
+                // SAFETY: the cursor for a target starts at its segment offset
+                // and is bumped once per write, so every thread gets a distinct
+                // slot inside a segment no other target touches. The segments
+                // partition `0..total`, so every slot below is written exactly
+                // once before `set_len` publishes it.
+                unsafe { *out.0.add(pos) = *u };
+            }
+        });
+        // SAFETY: the scatter above wrote every slot in `0..total`.
+        unsafe { self.data.set_len(total) };
+
+        &self.data
     }
 }
 
