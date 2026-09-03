@@ -46,15 +46,11 @@ thread_local! {
 
 /// Per-thread scratch for the parallel UpdateNeighbors pass.
 ///
-/// `accepted` holds the greedy-accepted adjacency being built for the
-/// current source node; `emitted` collects reverse-insert updates that
-/// target other nodes.
+/// Only the emit buffer needs to survive between nodes. The candidate list and
+/// the surviving list used to be held here too; the prune now compacts the
+/// node's adjacency in place, since survivors are written at an index that
+/// never passes the read index.
 pub struct UpdateScratch<T> {
-    /// `(dist, pid, is_new)` in ascending distance order
-    pub accepted: Vec<(T, usize, bool)>,
-    /// Survivors of the RNG prune, ascending. Reused across nodes so the
-    /// per-node pass does not allocate.
-    pub new_accepted: Vec<(T, usize, bool)>,
     /// Updates to be batched and applied via [`ApplySortedUpdates`]
     pub emitted: Vec<Update<T>>,
 }
@@ -67,8 +63,6 @@ impl<T> UpdateScratch<T> {
     /// Empty [`UpdateScratch`].
     pub const fn new() -> Self {
         Self {
-            accepted: Vec::new(),
-            new_accepted: Vec::new(),
             emitted: Vec::new(),
         }
     }
@@ -149,6 +143,8 @@ struct PruneStats {
     deg_count: u64,
     /// Longest adjacency seen
     deg_max: u32,
+    /// Nodes skipped because their adjacency held no new edge
+    skipped: u64,
 }
 
 impl PruneStats {
@@ -166,6 +162,7 @@ impl PruneStats {
             deg_sum: self.deg_sum + other.deg_sum,
             deg_count: self.deg_count + other.deg_count,
             deg_max: self.deg_max.max(other.deg_max),
+            skipped: self.skipped + other.skipped,
         }
     }
 }
@@ -249,6 +246,12 @@ impl BuildTimings {
                 "  adjacency: mean {:.1}, max {}",
                 st.deg_sum as f64 / st.deg_count as f64,
                 st.deg_max
+            );
+            println!(
+                "  node passes: {} of {} skipped as all-old ({:.1}%)",
+                st.skipped.separate_with_underscores(),
+                st.deg_count.separate_with_underscores(),
+                100.0 * st.skipped as f64 / st.deg_count as f64
             );
         }
     }
@@ -521,6 +524,35 @@ where
         }
     }
 
+    /// Distance between two rows that the caller has already sliced.
+    ///
+    /// Same arithmetic as [`Self::distance`], but the metric and the row
+    /// slices are lifted out of the caller's loop. Going through
+    /// [`Self::distance`] re-read `self.metric` and re-sliced both rows on
+    /// every one of the hundred-million-odd pairs a default build evaluates,
+    /// and the source row is invariant across the whole inner loop.
+    ///
+    /// ### Params
+    ///
+    /// * `a` - First row, length `dim`
+    /// * `b` - Second row, length `dim`
+    /// * `norms` - Pre-computed L2 norms (Cosine only)
+    /// * `a_id` - Row index of `a`, for its norm
+    /// * `b_id` - Row index of `b`, for its norm
+    /// * `metric` - Distance metric
+    ///
+    /// ### Returns
+    ///
+    /// The distance between the two rows.
+    #[inline(always)]
+    fn row_distance(a: &[T], b: &[T], norms: &[T], a_id: usize, b_id: usize, metric: Dist) -> T {
+        match metric {
+            Dist::SquaredEuclidean => T::euclidean_simd(a, b),
+            Dist::Cosine => T::one() - (T::dot_simd(a, b) / (norms[a_id] * norms[b_id])),
+            Dist::Manhattan => T::manhattan_simd(a, b),
+        }
+    }
+
     /// Distance from external query to an indexed point.
     #[inline(always)]
     fn compute_query_distance(&self, query: &[T], idx: usize, query_norm: T) -> T {
@@ -753,13 +785,7 @@ where
                     let graph_ptr = graph_ptr;
                     Self::with_update_scratch(|scratch_cell| {
                         let mut scratch_ref = scratch_cell.borrow_mut();
-                        let UpdateScratch {
-                            accepted,
-                            new_accepted,
-                            emitted,
-                        } = &mut *scratch_ref;
-                        accepted.clear();
-                        new_accepted.clear();
+                        let UpdateScratch { emitted } = &mut *scratch_ref;
                         emitted.clear();
 
                         // Load u's current sorted adjacency.
@@ -767,18 +793,41 @@ where
                         let slot =
                             unsafe { std::slice::from_raw_parts_mut(graph_ptr.0.add(u * r), r) };
 
+                        let mut degree = 0usize;
+                        let mut any_new = false;
                         for entry in slot.iter() {
                             if entry.is_sentinel() {
                                 break;
                             }
-                            accepted.push((entry.dist, entry.pid(), entry.is_new()));
+                            any_new |= entry.is_new();
+                            degree += 1;
                         }
 
-                        stats.deg_sum += accepted.len() as u64;
+                        stats.deg_sum += degree as u64;
                         stats.deg_count += 1;
-                        stats.deg_max = stats.deg_max.max(accepted.len() as u32);
+                        stats.deg_max = stats.deg_max.max(degree as u32);
 
-                        // Greedy-accept in ascending distance order.
+                        // Every survivor is written back old, so the paper's
+                        // `!v_new && !w_new` guard has an always-false right
+                        // half and reduces to `v_new`. An all-old adjacency
+                        // therefore keeps every candidate in order, emits
+                        // nothing and writes back exactly what it read, so the
+                        // whole node is a no-op.
+                        if !any_new {
+                            stats.skipped += 1;
+                            return;
+                        }
+
+                        let dim = self.dim;
+                        let metric = self.metric;
+                        let flat = &self.vectors_flat;
+                        let norms = &self.norms;
+
+                        // Greedy-accept in ascending distance order, compacting
+                        // in place: a survivor is written at `j <= i`, so the
+                        // write never passes the read and the entry is copied
+                        // out first. `slot[..j]` is the surviving list the RNG
+                        // rule tests against.
                         //
                         // Batching four survivors per distance call was tried
                         // and reverted: the mean is 1.6 distances per candidate,
@@ -788,13 +837,24 @@ where
                         // what the batch would have helped: shrinking `n` until
                         // the whole vector store fits L2 moves the per-pair cost
                         // by 9%.
-                        for &(v_dist, v, v_new) in accepted.iter() {
+                        let mut j = 0usize;
+                        for i in 0..degree {
+                            let entry = slot[i];
+                            let v_dist = entry.dist;
+                            let v = entry.pid();
+
+                            if !entry.is_new() {
+                                slot[j] = Neighbour::new(v, v_dist, false);
+                                j += 1;
+                                continue;
+                            }
+
+                            let v_row = &flat[v * dim..v * dim + dim];
                             let mut pruned = false;
-                            for &(_, w, w_new) in new_accepted.iter() {
-                                if !v_new && !w_new {
-                                    continue;
-                                }
-                                let d_vw = self.distance(v, w);
+                            for t in 0..j {
+                                let w = slot[t].pid();
+                                let w_row = &flat[w * dim..w * dim + dim];
+                                let d_vw = Self::row_distance(v_row, w_row, norms, v, w, metric);
                                 // RNG prune rule from Alg. 4.
                                 if v_dist >= d_vw {
                                     emitted.push(Update::new(w as u32, v as u32, d_vw));
@@ -803,21 +863,19 @@ where
                                     break;
                                 }
                             }
+
                             if !pruned {
-                                new_accepted.push((v_dist, v, false));
+                                slot[j] = Neighbour::new(v, v_dist, false);
+                                j += 1;
                             }
                         }
 
-                        // Write back to u's slot (all surviving edges old).
-                        for (i, &(d, pid, _)) in new_accepted.iter().enumerate() {
-                            slot[i] = Neighbour::new(pid, d, false);
-                        }
                         // Only the range the prune just vacated needs clearing.
                         // Everything from the old degree onwards is already
                         // sentinel, and mean degree runs far below `r`, so
                         // filling the whole slot rewrites sentinels with
                         // sentinels.
-                        for i in new_accepted.len()..accepted.len() {
+                        for i in j..degree {
                             slot[i] = Neighbour::new(SENTINEL_PID, T::max_value(), false);
                         }
 
