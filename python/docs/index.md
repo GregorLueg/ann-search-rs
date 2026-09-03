@@ -16,8 +16,7 @@ uv pip install ann-search           # numpy only
 uv pip install "ann-search[sparse]" # adds scipy, for kneighbors_graph
 ```
 
-Wheels are built for Linux x86_64 and macOS on both architectures, against
-Python 3.10 and up.
+Wheels target Python 3.10 and up, on Linux and macOS.
 
 ## Thirty seconds
 

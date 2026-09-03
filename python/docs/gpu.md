@@ -23,10 +23,27 @@ DX12 elsewhere. There's no CUDA runtime to install and nothing extra to
 `pip install`. On a box with no GPU it returns False and the CPU estimators are
 unaffected.
 
+## When CAGRA is worth the build
+
+The graph costs 1.3 to 3.2 seconds to build on the benchmark shapes, and that
+dominates until the dataset is large. For one query batch of 250k points at 128
+dimensions `ExhaustiveGpuIndex` finishes the whole job in 2.4 s against CAGRA's
+3.2 s, so the exact index wins outright. By 500k at 64 dimensions it reverses,
+3.7 s against 5.4 s. Recall moves with size too: 0.95 to 0.97 at 150k in 32
+dimensions, against 0.9999 at 250k in 64.
+
+The graph is also not small. It holds 2 to 3x the memory of the raw vectors,
+on top of the vectors themselves.
+
+Build it when you're querying repeatedly, or when `n` is past a few hundred
+thousand. For a single ground-truth pass, use `ExhaustiveGpuIndex`.
+
 ## Three differences, all forced by the backend
 
 **float32 only.** WGSL has no float64, so `fit` narrows rather than failing
-somewhere inside a kernel. It's the only silent narrowing this package does.
+somewhere inside a kernel. Note it isn't the only narrowing in the package: a
+float64 query against a float32 index is narrowed too, on every index. See the
+[Guide](guide.md#dtypes).
 
 **No persistence.** These hold device buffers and sit outside the crate's
 `serialise` feature, so `save`, `load` and pickle raise `NotImplementedError`.
@@ -38,8 +55,13 @@ Rebuild instead.
 
 A fitted `CagraGpuIndex` is the one index here that isn't safe to query from two
 threads at once. The beam search memoises its upload of the navigational graph
-behind a mutable borrow, so concurrent calls serialise. `extract_knn` is exempt,
-and the other two GPU indices are fine.
+behind a mutable borrow, and the GIL is released while the kernel runs, so a
+second thread entering `kneighbors` doesn't queue behind the first: it raises.
+Give each thread its own handle.
+
+`extract_knn` takes a shared borrow, so it never causes the conflict, though it
+can still hit one raised by a concurrent query. The other two GPU indices are
+fine.
 
 ## Getting ground truth cheaply
 
@@ -47,6 +69,11 @@ and the other two GPU indices are fine.
 all: the data goes up, the norms get recorded, and that's the index. On a
 dataset too large to score on the CPU it's the cheapest route to the truth you
 need for a recall measurement.
+
+Don't expect an order of magnitude out of it. On the M1 Max the benchmarks ran
+on it comes out around 1.7x faster than the CPU exhaustive path (250k points at
+64 dimensions: 1.44 s against 2.41 s). On Apple Silicon the GPU rarely blows
+the CPU out of the water. A discrete card with real bandwidth will do better.
 
 ```python
 truth = ann.ExhaustiveGpuIndex(n_neighbors=15).fit(X).kneighbors(return_distance=False)
@@ -83,10 +110,10 @@ index.kneighbors(Q, n_entry_points=16)
 
 ## A CPU-only build
 
-GPU support is compiled in by default and costs about 3 MB of wheel, 4.9 MB
-against 1.7 MB. That seemed the better trade than a second distribution: wgpu
-has no driver runtime to ship, and the alternative is a version pin between two
-packages that can drift.
+GPU support is compiled in by default and costs roughly 3 MB of wheel. That
+seemed the better trade than a second distribution: wgpu has no driver runtime
+to ship, and the alternative is a version pin between two packages that can
+drift.
 
 It's fixed at wheel-build time, so a Python extra can't switch it. Extras only
 add Python requirements; they never change the compiled artefact. If the

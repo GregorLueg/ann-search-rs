@@ -16,7 +16,7 @@ squared Euclidean and warn to a stdout you can't see, which is a much worse
 failure across FFI than a loud one. Nothing in this package sends the core a
 string it hasn't already validated.
 
-Nineteen indices don't support Manhattan, the eleven quantised ones included:
+Twenty indices don't support Manhattan, the eleven quantised ones included:
 every codec there is built on inner products, which is what makes the integer
 arithmetic work. See the [table](choosing.md#the-table); asking for it raises
 rather than falling back.
@@ -28,6 +28,16 @@ a distance, not the distance. Close enough to rank on, which is what an index
 is for, and not something to feed anywhere the absolute value matters without
 checking it against `ExhaustiveIndex` first. Recall is the honest way to
 compare two of them.
+
+## Dtypes
+
+`fit` keeps float32 and float64 as they come, and the index remembers which it
+got. A query array in the other precision is converted to match, quietly: query
+a float32 index with float64 and the queries are narrowed. It costs precision
+in the distances, not correctness in the ranking, but nothing warns you.
+
+The three GPU indices narrow at `fit` as well, since WGSL has no float64. That
+one is unavoidable rather than a convenience.
 
 ## Padding
 

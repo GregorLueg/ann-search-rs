@@ -51,9 +51,11 @@ Start with ground truth:
 truth = ann.ExhaustiveIndex(n_neighbors=15).fit(X).kneighbors(return_distance=False)
 ```
 
-`ExhaustiveIndex` is exact, so that's the target. It is not a naive scan either:
-the self-kNN graph is the largest batch there is, which is where the blocked
-GEMM path wins.
+`ExhaustiveIndex` is exact, so that's the target. It is not a naive scan
+either: past a batch-size threshold it switches from a fused per-query SIMD
+scan to a blocked GEMM that reuses each database tile across a tile of queries.
+The self-kNN graph is the largest batch there is, so it always takes that
+path.
 
 Now sweep the recall knob. `ef_search` is a search-time parameter, so one fitted
 index answers the whole sweep:
@@ -96,9 +98,14 @@ Worth noticing: that beats HNSW at `ef_search=200` on the same data, off a build
 of comparable cost. `kneighbors()` on the same index reaches 0.9987.
 
 `extract_knn` reads the graph the descent already built. `kneighbors()` on the
-same index runs a beam search over it instead, which costs more and usually
-recovers a little recall. The gap between the two is exactly what the search
-buys you.
+same index runs a beam search over it instead, which costs more and recovers a
+little recall. The gap between the two is exactly what the search buys you.
+
+One thing that makes the comparison above honest: a kNN graph stores no
+self-edge, but `ExhaustiveIndex` counts a point as its own nearest neighbour at
+distance zero. `extract_knn` defaults to `include_self=True` so both sides use
+a slot for it. Pass `include_self=False` and recall against this ground truth
+caps at 14/15.
 
 ## 2. Cross-set queries and padding
 

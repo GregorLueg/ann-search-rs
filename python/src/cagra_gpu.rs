@@ -1,8 +1,8 @@
 //! CAGRA GPU handle.
 //!
 //! NN-Descent built on the device, then pruned into a CAGRA navigational graph
-//! and searched with a beam. The fastest route to a kNN graph here when a GPU
-//! is present.
+//! and searched with a beam. The build dominates until the dataset is large, so
+//! below roughly 500k points a single exhaustive GPU pass finishes sooner.
 //!
 //! This is the one handle that is not `frozen`. `query_batch_gpu` takes
 //! `&mut self` to memoise its upload of the navigational graph, so queries go

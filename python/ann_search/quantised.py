@@ -18,11 +18,14 @@ codec rather than choices:
 Everything else is identical: same four-method surface, same padding, same
 persistence, float32 and float64 both supported.
 
-Which one to reach for, roughly. `HnswSq8uIndex` if you want the usual first
-choice at a quarter of the memory. `IvfSq8Index` if you were already on
-`IvfIndex`. The PQ family when a quarter is not enough of a saving, which
-generally means a high-dimensional embedding space rather than a 30-dimensional
-PCA. See [the benchmark tables][1] for numbers.
+Which one to reach for, roughly. `HnswSq8uIndex` if you want `HnswIndex` at a
+quarter of the *vector* memory, and can afford the codec's recall cost.
+`IvfSq8Index` if you were already on `IvfIndex`. The PQ family when a quarter
+is not enough of a saving, which means a high-dimensional embedding space.
+
+Measure the recall before committing to any of them. On the benchmark runs the
+codec cost is much larger than these classes used to admit, and it is worst on
+cosine. See [the benchmark tables][1] for numbers.
 
 [1]: https://github.com/GregorLueg/ann-search-rs/blob/main/docs/benchmarks_quantised.md
 """
@@ -63,6 +66,11 @@ class ExhaustiveBf16Index(_BaseQuantisedIndex):
     between this and `ExhaustiveIndex` is the codec's rounding. The cheapest
     quantisation to reason about, and the one with the least to go wrong.
 
+    Halving the memory is not free. On the benchmark runs the query comes out
+    around twice as slow at 32 dimensions and four times as slow at 128, since
+    the values are widened back to float32 to compute on. Recall lands near
+    0.98 on Euclidean and near 0.89 on cosine.
+
     Args:
         n_neighbors: Neighbours per query, and the default ``k`` for
             `kneighbors`.
@@ -93,10 +101,15 @@ class ExhaustiveBf16Index(_BaseQuantisedIndex):
 class IvfBf16Index(_BaseQuantisedIndex):
     """`IvfIndex` with the posting lists held at `bf16`.
 
-    Half the vector memory for a codec error that lands well inside IVF's own
-    approximation, so at a fixed `nprobe` the recall barely moves. If you are
-    already using `IvfIndex` and memory is the binding constraint, this is the
-    swap to make first.
+    Half the vector memory. The recall cost is the codec's, and it does not
+    hide inside IVF's own approximation the way you might expect: on the
+    benchmark runs plain IVF already sits at recall 1.0 on the correlated and
+    low-rank generators at every `nprobe`, so the codec error is the whole
+    error. At a fixed `nprobe` the drop is around 0.05 on Euclidean and up to
+    0.11 on cosine, and the query gets slightly slower rather than faster.
+
+    Still the smallest change to reason about if you are already on `IvfIndex`
+    and memory is binding. Measure the recall first.
 
     Args:
         n_neighbors: Neighbours per query, and the default ``k`` for
@@ -162,8 +175,12 @@ class ExhaustiveSq8Index(_BaseQuantisedIndex):
     One byte per dimension, with per-dimension offsets and a single scale shared
     across all of them. The shared scale is the point: it makes the integer code
     distance preserve the ordering of the float one, so the whole scan runs on
-    ``u8`` kernels and usually comes out faster than the float version as well
-    as four times smaller.
+    ``u8`` kernels.
+
+    The memory saving is real, around 3.5x at 32 dimensions and 3.9x at 128.
+    The speed is not: on the benchmark runs the exhaustive integer scan is
+    *slower* than the float one at 32 dimensions, by up to 1.5x, and only edges
+    ahead at 128. `IvfSq8Index` is where the integer kernels do pay.
 
     Args:
         n_neighbors: Neighbours per query, and the default ``k`` for
@@ -212,9 +229,16 @@ class ExhaustiveSq8Index(_BaseQuantisedIndex):
 class IvfSq8Index(_BaseQuantisedIndex):
     """`IvfIndex` with the posting lists held as 8-bit codes.
 
-    A quarter of IVF's vector memory, and the integer kernels usually make the
-    cell scan faster rather than slower. The natural default if you were already
-    on `IvfIndex` and want the saving without thinking about subspaces.
+    Around 2.9x smaller than `IvfIndex` at 32 dimensions, and the one place the
+    integer kernels reliably pay: on the benchmark runs every matched
+    `nlist`/`nprobe` pairing queries 1.15 to 1.5x faster than plain IVF.
+
+    The recall cost is steep and worth measuring before you commit. At a fixed
+    `nprobe` the drop against plain IVF runs to 0.21 on the low-rank generator
+    and 0.26 on cosine.
+
+    Still the natural step if you were already on `IvfIndex` and want the
+    saving without thinking about subspaces.
 
     Args:
         n_neighbors: Neighbours per query, and the default ``k`` for
@@ -283,9 +307,16 @@ class HnswSq8uIndex(_BaseQuantisedIndex):
     Inspired by pyglass. The graph is constructed in the space it is searched
     in, so there is no float copy hanging around for re-ranking and no mismatch
     between the edges and the distances that traverse them. Roughly a quarter of
-    HNSW's vector memory, and the same recall knob.
+    HNSW's *vector* memory, and the same recall knob. The graph edges are not
+    compressed, so the whole index lands at 0.44 to 0.80 of a plain `HnswIndex`
+    depending on `m` and dimensionality, not at a quarter.
 
-    If you want one quantised index and no further reading, this is it.
+    Build and query are both genuinely faster than `HnswIndex`. Recall is not:
+    on the benchmark runs at matched ``m``, `ef_construction` and `ef_search`
+    it gives up 0.07 on Euclidean and 0.26 to 0.33 on cosine. The loss is the
+    codec rather than the graph, so `ExhaustiveSq8Index` is the ceiling it is
+    working against. Measure it against `HnswIndex` on your own data before
+    taking the memory.
 
     Args:
         n_neighbors: Neighbours per query, and the default ``k`` for
@@ -417,11 +448,13 @@ class ExhaustiveOpqIndex(_BaseQuantisedIndex):
     Plain PQ splits on the original axis order, so a space where the variance is
     concentrated in a few coordinates gets subspaces of wildly unequal
     difficulty. OPQ learns an orthogonal rotation that spreads it before
-    splitting. It costs more at build time and nothing at query time, since the
-    rotation folds into the query once.
+    splitting. It costs 3 to 5x the build time, and the query is not free
+    either: the rotation has to be applied to every query, which runs from 1.1x
+    at 256 dimensions to 3.1x at 768. It also stores the rotation matrix, so
+    the index is larger than the equivalent `ExhaustivePqIndex`.
 
-    Worth it on a raw embedding space, rarely worth it after a PCA has already
-    done the rotating.
+    On the benchmark runs it beats plain PQ on recall everywhere it was
+    measured, by +0.01 to +0.19 depending on the generator.
 
     Args:
         n_neighbors: Neighbours per query, and the default ``k`` for
@@ -691,8 +724,12 @@ class SoarPqIndex(_BaseQuantisedIndex):
 class SoarOpqIndex(_BaseQuantisedIndex):
     """`SoarPqIndex` with the learned rotation in front of the sub-codebooks.
 
-    The most compressed index in the package, and the slowest to build. Reach
-    for it when memory is the hard constraint and the build is a one-off.
+    The rotation on top of the spilling, so it carries both costs: the extra
+    posting-list entries and the ``dim x dim`` rotation matrix. On the
+    benchmark runs it is the *largest* of the quantised indices, not the
+    smallest, and an `IvfOpqIndex` at twice the ``m`` is both smaller and
+    quicker to build at matching memory. Reach for it when you want SOAR's
+    recall per cell and the rotation, not to save space.
 
     Args:
         n_neighbors: Neighbours per query, and the default ``k`` for

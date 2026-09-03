@@ -1,8 +1,10 @@
 //! Exhaustive BF16 handle.
 //!
 //! Storage drops to `bf16`, which keeps `f32`'s exponent range and throws away
-//! mantissa bits from roughly the third digit on. Nothing else changes: the
-//! scan is still exhaustive, so the only loss is the codec's.
+//! mantissa bits from roughly the third digit on. The scan is still exhaustive,
+//! so the only loss is the codec's, but distances are computed in `f32` so the
+//! values are widened back on every comparison and the query runs slower than
+//! the `f32` one, not faster.
 
 use ann_search_rs::prelude::DimensionValidation;
 use ann_search_rs::quantised::exhaustive_bf16::ExhaustiveIndexBf16;
