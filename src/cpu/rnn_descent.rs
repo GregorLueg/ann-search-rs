@@ -1001,6 +1001,12 @@ where
         Self::with_search_state(|state_cell| {
             let mut state = state_cell.borrow_mut();
             state.reset(self.n);
+            // `BoundedMaxHeap` rather than the `SortedBuffer` this used before.
+            // Accepting a candidate into the buffer costs a binary search plus
+            // a `pop` and an `insert`, so two memmoves of up to `ef` entries;
+            // the heap sifts once. RNN-Descent runs `ef` at 100 by default,
+            // which is the regime `SearchState` documents the heap for.
+            state.results.reset(ef);
 
             let query_norm = if self.metric == Dist::Cosine {
                 T::calculate_l2_norm(query)
@@ -1009,8 +1015,7 @@ where
             };
 
             // Seed the beam from the kd-forest. The forest returns already-near
-            // candidates, so we can safely push all of them into
-            // `working_sorted`.
+            // candidates, so all of them can go straight into the result heap.
             let init_candidates = (ef / 2).max(2 * k).min(self.n);
             let search_k = init_candidates * 3;
             let (seed_ids, seed_dists) =
@@ -1021,19 +1026,16 @@ where
                     continue;
                 }
                 state.mark_visited(*id);
-                let od = OrderedFloat(*d);
-                state.candidates.push(Reverse((od, *id)));
-                state.working_sorted.insert((od, *id), ef);
+                state.candidates.push(Reverse((OrderedFloat(*d), *id)));
+                state.results.push(*d, *id);
             }
 
-            let mut furthest_dist = state
-                .working_sorted
-                .top()
-                .map(|(d, _)| *d)
-                .unwrap_or(OrderedFloat(T::infinity()));
+            // `threshold()` is infinity until the heap fills, so the "or the
+            // result set is not yet full" arm of both tests below is implicit.
+            let mut furthest = state.results.threshold();
 
             while let Some(Reverse((current_dist, current_id))) = state.candidates.pop() {
-                if current_dist > furthest_dist && state.working_sorted.len() >= ef {
+                if current_dist.0 > furthest {
                     break;
                 }
 
@@ -1048,32 +1050,22 @@ where
                     }
                     state.mark_visited(n_idx);
 
-                    let d = OrderedFloat(self.compute_query_distance(query, n_idx, query_norm));
-
-                    if d < furthest_dist || state.working_sorted.len() < ef {
-                        state.candidates.push(Reverse((d, n_idx)));
-                        if state.working_sorted.insert((d, n_idx), ef)
-                            && state.working_sorted.len() >= ef
-                        {
-                            furthest_dist = state
-                                .working_sorted
-                                .top()
-                                .map(|(d, _)| *d)
-                                .unwrap_or(OrderedFloat(T::infinity()));
-                        }
+                    let d = self.compute_query_distance(query, n_idx, query_norm);
+                    if d < furthest {
+                        state.candidates.push(Reverse((OrderedFloat(d), n_idx)));
+                        state.results.push(d, n_idx);
+                        furthest = state.results.threshold();
                     }
                 }
             }
 
-            let mut results = state.working_sorted.data().to_vec();
-            results.truncate(k);
+            state.results.sort();
+            let take = k.min(state.results.len());
 
-            let (indices, distances): (Vec<usize>, Vec<T>) = results
-                .into_iter()
-                .map(|(OrderedFloat(d), id)| (id, d))
-                .unzip();
-
-            Ok((indices, distances))
+            Ok((
+                state.results.ids()[..take].to_vec(),
+                state.results.dists()[..take].to_vec(),
+            ))
         })
     }
 
