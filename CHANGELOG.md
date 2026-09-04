@@ -1,5 +1,16 @@
 # News
 
+## 0.8.2
+
+**Features**
+
+- Faster RNN implementation and different grid search.
+
+**Python**
+
+- Documentation updates where out-of-date things were claimed.
+- Wiring in the faster RNN from the Rust parent package.
+
 ## 0.8.1
 
 **Python**
