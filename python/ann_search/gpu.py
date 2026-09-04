@@ -61,6 +61,10 @@ class ExhaustiveGpuIndex(_BaseGpuIndex):
     this is the cheapest way to get ground truth. No build-time knobs: the data
     goes up, the norms get recorded, and that is the index.
 
+    Do not expect an order of magnitude for it. On the benchmark M1 Max runs it
+    comes out around 1.7x faster than `ExhaustiveIndex`; a discrete card with
+    more bandwidth will do better.
+
     Args:
         n_neighbors: Neighbours per query, and the default ``k`` for
             `kneighbors`.
@@ -165,9 +169,14 @@ class IvfGpuIndex(_BaseGpuIndex):
 class CagraGpuIndex(ExtractKnnMixin, _BaseGpuIndex):
     """CAGRA graph: NN-Descent on the device, pruned, then beam-searched.
 
-    The fastest route to a kNN graph here when a GPU is present. `beam_width` is
-    the recall knob; leaving it ``None`` sizes the beam as ``2 * max(k, 16)``,
-    which is usually the right answer.
+    `beam_width` is the recall knob; leaving it ``None`` sizes the beam as
+    ``2 * max(k, 16)``, which is usually the right answer.
+
+    The build dominates until the dataset is large. On the benchmark runs the
+    graph costs 1.3 to 3.2 seconds to build, so for a single query batch below
+    roughly 500k points `ExhaustiveGpuIndex` finishes sooner overall, and at
+    250k in 128 dimensions it does so comfortably. Past that CAGRA pulls clear.
+    It also holds 2 to 3x the memory of the raw vectors.
 
     `extract_knn` hands back the kNN graph the descent converged on, taken
     before the CAGRA prune. No kernel runs, and it is capped by `graph_degree`
@@ -175,8 +184,10 @@ class CagraGpuIndex(ExtractKnnMixin, _BaseGpuIndex):
 
     Unlike every other index in this package, a fitted handle is not safe to
     query from two threads at once: the beam search memoises its upload of the
-    navigational graph behind a mutable borrow, so concurrent calls serialise.
-    `extract_knn` is exempt.
+    navigational graph behind a mutable borrow. Concurrent calls do not
+    serialise, they raise, so give each thread its own handle. `extract_knn`
+    takes a shared borrow and never causes the conflict, though it can still
+    hit one raised by a concurrent query.
 
     Args:
         n_neighbors: Neighbours per query, and the default ``k`` for

@@ -620,7 +620,7 @@ where
                 buffered += 1;
 
                 if buffered == 4 {
-                    let dists = self.node_distances_4(query_node, buf);
+                    let dists = self.node_distances_4_gathered(query_node, buf, self.metric);
                     for k in 0..4 {
                         Self::offer(state, dists[k], buf[k], &mut furthest);
                     }
@@ -918,7 +918,8 @@ where
                 buffered += 1;
 
                 if buffered == 4 {
-                    let dists = self.query_distances_4(query, buf, query_norm);
+                    let dists =
+                        self.query_distances_4_gathered(query, buf, query_norm, self.metric);
                     for k in 0..4 {
                         Self::offer(state, dists[k], buf[k], &mut furthest);
                     }
@@ -1036,90 +1037,6 @@ where
             Dist::SquaredEuclidean => self.euclidean_distance_to_query(idx, query),
             Dist::Cosine => self.cosine_distance_to_query(idx, query, query_norm),
             Dist::Manhattan => self.manhattan_distance_to_query(idx, query),
-        }
-    }
-
-    /// Borrow four indexed rows at once.
-    ///
-    /// ### Params
-    ///
-    /// * `ids` - Four row indices
-    ///
-    /// ### Returns
-    ///
-    /// The four row slices, in input order.
-    #[inline(always)]
-    fn rows_4(&self, ids: [usize; 4]) -> [&[T]; 4] {
-        let dim = self.dim;
-        let flat = &self.vectors_flat;
-        [
-            &flat[ids[0] * dim..ids[0] * dim + dim],
-            &flat[ids[1] * dim..ids[1] * dim + dim],
-            &flat[ids[2] * dim..ids[2] * dim + dim],
-            &flat[ids[3] * dim..ids[3] * dim + dim],
-        ]
-    }
-
-    /// Distance from a query vector to four indexed rows at once.
-    ///
-    /// Same arithmetic as [`Self::compute_query_distance`], four candidates per
-    /// pass. Cosine still pays its divide per candidate; only the dot product
-    /// batches.
-    ///
-    /// ### Params
-    ///
-    /// * `query` - Query vector
-    /// * `ids` - Four database row indices
-    /// * `query_norm` - Pre-computed query norm (Cosine only)
-    ///
-    /// ### Returns
-    ///
-    /// The four distances, in input order.
-    #[inline(always)]
-    fn query_distances_4(&self, query: &[T], ids: [usize; 4], query_norm: T) -> [T; 4] {
-        let rows = self.rows_4(ids);
-        match self.metric {
-            Dist::SquaredEuclidean => T::euclidean_simd_batch_4(query, rows),
-            Dist::Manhattan => T::manhattan_simd_batch_4(query, rows),
-            Dist::Cosine => {
-                let dots = T::dot_simd_batch_4(query, rows);
-                let mut out = [T::zero(); 4];
-                for k in 0..4 {
-                    out[k] = T::one() - (dots[k] / (query_norm * self.norms[ids[k]]));
-                }
-                out
-            }
-        }
-    }
-
-    /// Distance from one indexed row to four others at once.
-    ///
-    /// The construction-time twin of [`Self::query_distances_4`].
-    ///
-    /// ### Params
-    ///
-    /// * `node` - Row the distances are measured from
-    /// * `ids` - Four database row indices
-    ///
-    /// ### Returns
-    ///
-    /// The four distances, in input order.
-    #[inline(always)]
-    fn node_distances_4(&self, node: usize, ids: [usize; 4]) -> [T; 4] {
-        let start = node * self.dim;
-        let src = &self.vectors_flat[start..start + self.dim];
-        let rows = self.rows_4(ids);
-        match self.metric {
-            Dist::SquaredEuclidean => T::euclidean_simd_batch_4(src, rows),
-            Dist::Manhattan => T::manhattan_simd_batch_4(src, rows),
-            Dist::Cosine => {
-                let dots = T::dot_simd_batch_4(src, rows);
-                let mut out = [T::zero(); 4];
-                for k in 0..4 {
-                    out[k] = T::one() - (dots[k] / (self.norms[node] * self.norms[ids[k]]));
-                }
-                out
-            }
         }
     }
 

@@ -735,8 +735,13 @@ per hop. See
 - *Seed degree (S)*: Out-degree of the initial random graph.
 - *Max degree (R)*: Per-node adjacency cap once reverse edges are folded in.
 - *Outer rounds (T1)* and *inner passes (T2)*: `T1` rounds of `T2` update passes
-  each. Paper defaults are `T1=4`, `T2=15`; the grid here runs `T2=10` to keep
-  build times sensible.
+  each. The grid runs the paper's `T2=15` with `T1` one round lower than the
+  paper's `T1=4`. Spend the budget on inner passes rather than outer rounds:
+  AddReverseEdges re-arms every surviving edge as new, so the pass straight
+  after it does the most distance work in a round, while the tail passes a
+  lower `T2` would drop are the cheapest (over half their nodes hold no new
+  edge and are skipped outright). At S20/R96 on 150k x 32D that makes
+  `T1=3, T2=15` both faster and marginally more accurate than `T1=4, T2=10`.
 - *Search degree (K)*: How many of a node's neighbours get expanded per hop at
   query time. This is the knob most worth sweeping. `auto` is `min(32, R)`;
   setting it to `R` walks the whole adjacency and buys recall at the cost of

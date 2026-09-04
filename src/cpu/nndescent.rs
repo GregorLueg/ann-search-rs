@@ -253,21 +253,6 @@ impl BuildTimings {
     }
 }
 
-////////////////
-// Raw writes //
-////////////////
-
-/// Raw pointer wrapper for the lock-free CSR scatter in [`build_reverse_csr`].
-///
-/// Safety rests on the counting sort: every `fetch_add` on the cursor hands out
-/// a slot that no other thread can be handed, and the per-target segments
-/// partition the buffer, so no two writes ever alias.
-#[derive(Copy, Clone)]
-struct UnsafeU32Ptr(*mut u32);
-
-unsafe impl Send for UnsafeU32Ptr {}
-unsafe impl Sync for UnsafeU32Ptr {}
-
 ////////////////////
 // Candidate sets //
 ////////////////////
@@ -469,7 +454,7 @@ fn build_reverse_csr(fwd: &[u32], lens: &[u32], stride: usize, n: usize, out: &m
         c.store(out.offsets[i], Ordering::Relaxed);
     }
 
-    let data_ptr = UnsafeU32Ptr(out.data.as_mut_ptr());
+    let data_ptr = UnsafeMutPtr(out.data.as_mut_ptr());
     (0..n).into_par_iter().for_each(|i| {
         #[allow(clippy::redundant_locals)]
         let data_ptr = data_ptr;
@@ -2068,7 +2053,7 @@ impl<T: AnnSearchFloat> ApplySortedUpdates<T> for NNDescent<T> {
             return;
         }
 
-        let graph_ptr = UnsafeGraphPtr(graph.as_mut_ptr());
+        let graph_ptr = UnsafeMutPtr(graph.as_mut_ptr());
 
         // `par_chunk_by` splits the sorted batch on target boundaries directly,
         // which saves a sequential boundary scan plus the Vec of segment

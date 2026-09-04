@@ -4491,6 +4491,109 @@ where
         ]
     }
 
+    //////////////////////////
+    // Batched gathered rows //
+    //////////////////////////
+
+    /// Borrow four arbitrary rows out of the flat store
+    ///
+    /// The gathered twin of [`Self::rows_4`], for graph walks where the four
+    /// rows are wherever the adjacency points rather than a contiguous slab.
+    ///
+    /// ### Params
+    ///
+    /// * `ids` - Four row indices, in any order
+    ///
+    /// ### Returns
+    ///
+    /// The four row slices, in input order, each of length `dim`.
+    #[inline(always)]
+    fn rows_4_gathered(&self, ids: [usize; 4]) -> [&[T]; 4] {
+        let dim = self.dim();
+        let flat = self.vectors_flat();
+        [
+            &flat[ids[0] * dim..ids[0] * dim + dim],
+            &flat[ids[1] * dim..ids[1] * dim + dim],
+            &flat[ids[2] * dim..ids[2] * dim + dim],
+            &flat[ids[3] * dim..ids[3] * dim + dim],
+        ]
+    }
+
+    /// Distance from an external query to four gathered rows
+    ///
+    /// Batching four is worth more than the arithmetic it saves: a graph walk
+    /// gathers rows at random out of a store far larger than L2, so the four
+    /// loads issue together and their latencies overlap instead of serialising
+    /// behind an unpredictable branch. Cosine still pays its divide per row.
+    ///
+    /// ### Params
+    ///
+    /// * `query` - Query vector slice, length `dim`
+    /// * `ids` - Four row indices
+    /// * `query_norm` - Pre-computed norm of the query vector (Cosine only)
+    /// * `metric` - Distance metric
+    ///
+    /// ### Returns
+    ///
+    /// The four distances, in input order.
+    #[inline(always)]
+    fn query_distances_4_gathered(
+        &self,
+        query: &[T],
+        ids: [usize; 4],
+        query_norm: T,
+        metric: Dist,
+    ) -> [T; 4] {
+        let rows = self.rows_4_gathered(ids);
+        match metric {
+            Dist::SquaredEuclidean => T::euclidean_simd_batch_4(query, rows),
+            Dist::Manhattan => T::manhattan_simd_batch_4(query, rows),
+            Dist::Cosine => {
+                let dots = T::dot_simd_batch_4(query, rows);
+                let norms = self.norms();
+                let mut out = [T::zero(); 4];
+                for k in 0..4 {
+                    out[k] = T::one() - (dots[k] / (query_norm * norms[ids[k]]));
+                }
+                out
+            }
+        }
+    }
+
+    /// Distance from one internal row to four gathered rows
+    ///
+    /// The construction-time twin of [`Self::query_distances_4_gathered`].
+    ///
+    /// ### Params
+    ///
+    /// * `node` - Row the distances are measured from
+    /// * `ids` - Four row indices
+    /// * `metric` - Distance metric
+    ///
+    /// ### Returns
+    ///
+    /// The four distances, in input order.
+    #[inline(always)]
+    fn node_distances_4_gathered(&self, node: usize, ids: [usize; 4], metric: Dist) -> [T; 4] {
+        let dim = self.dim();
+        let start = node * dim;
+        let src = &self.vectors_flat()[start..start + dim];
+        let rows = self.rows_4_gathered(ids);
+        match metric {
+            Dist::SquaredEuclidean => T::euclidean_simd_batch_4(src, rows),
+            Dist::Manhattan => T::manhattan_simd_batch_4(src, rows),
+            Dist::Cosine => {
+                let dots = T::dot_simd_batch_4(src, rows);
+                let norms = self.norms();
+                let mut out = [T::zero(); 4];
+                for k in 0..4 {
+                    out[k] = T::one() - (dots[k] / (norms[node] * norms[ids[k]]));
+                }
+                out
+            }
+        }
+    }
+
     ///////////////
     // Manhattan //
     ///////////////

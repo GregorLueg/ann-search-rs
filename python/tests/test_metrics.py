@@ -56,6 +56,7 @@ def test_unknown_metric_raises_rather_than_falling_back(data):
     [
         ann.AnnoyIndex,
         ann.BallTreeIndex,
+        ann.IvfIndex,
         ann.KmknnIndex,
         ann.LshIndex,
         ann.SoarIndex,

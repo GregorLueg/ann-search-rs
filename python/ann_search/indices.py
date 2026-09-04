@@ -175,9 +175,14 @@ class AnnoyIndex(BaseAnnIndex):
 class HnswIndex(BaseAnnIndex):
     """Hierarchical navigable small world graph.
 
-    The usual first choice: high recall at low query latency, at the cost of a
-    slower build and a graph roughly ``m`` edges per node wide. Raise
-    `ef_search` for recall, `ef_construction` for a better graph.
+    The usual first choice: high recall at low query latency, for a graph
+    roughly ``m`` edges per node wide. Raise `ef_search` for recall,
+    `ef_construction` for a better graph. The second one is what the build cost
+    is actually sensitive to.
+
+    Cheapest of the graph indices here to build at its cheapest setting. That
+    ordering does not survive matching on recall, where `VamanaIndex` can come
+    out ahead.
 
     Args:
         n_neighbors: Neighbours per query, and the default ``k`` for
@@ -236,13 +241,14 @@ class IvfIndex(BaseAnnIndex):
 
     Cheap to build and easy to tune: `nlist` sets how finely the space is cut,
     `nprobe` how many cells a query visits. Both default to the crate's own
-    heuristics when left as ``None``.
+    heuristics when left as ``None``. The smallest of the approximate
+    unquantised indices: it holds the vectors and a permutation, and little
+    else. Manhattan is not supported.
 
     Args:
         n_neighbors: Neighbours per query, and the default ``k`` for
             `kneighbors`.
-        metric: ``"euclidean"``/``"l2"``, ``"sqeuclidean"``, ``"cosine"`` or
-            ``"manhattan"``/``"l1"``.
+        metric: ``"euclidean"``/``"l2"``, ``"sqeuclidean"`` or ``"cosine"``.
         nlist: Number of Voronoi cells to cut the space into. ``None`` defaults
             to ``sqrt(n)``. More cells means less work per probe and a longer
             build.
@@ -261,6 +267,7 @@ class IvfIndex(BaseAnnIndex):
     """
 
     _HANDLE: ClassVar[type] = _core.Ivf
+    _SUPPORTED_METRICS: ClassVar[frozenset[str]] = NO_MANHATTAN
     _SEARCH_KNOBS: ClassVar[tuple[str, ...]] = ("nprobe",)
 
     @beartype
@@ -299,9 +306,15 @@ class IvfIndex(BaseAnnIndex):
 class NNDescentIndex(ExtractKnnMixin, BaseAnnIndex):
     """NN-Descent kNN graph.
 
-    Builds the neighbour graph directly by iterative local join, which makes it
-    the fastest route to a full self-kNN graph. `n_neighbors` is used at build
-    time as well as at query time, so changing it means rebuilding.
+    Builds the neighbour graph directly by iterative local join. `n_neighbors`
+    is used at build time as well as at query time, so changing it means
+    rebuilding.
+
+    Whether it is the quickest route to a self-kNN graph depends on the shape.
+    On the benchmark runs it wins at 128 dimensions, where `extract_knn`
+    reaches recall 1.0 in roughly half the time `KmknnIndex` needs. At 32
+    dimensions `KmknnIndex` and `IvfIndex` get there first, exactly. Measure
+    both on your data.
 
     `diversify_prob` prunes redundant edges after descent: ``0.0`` disables it,
     ``1.0`` prunes whenever the rule fires.
@@ -386,7 +399,9 @@ class VamanaIndex(BaseAnnIndex):
     """Vamana graph, as in DiskANN.
 
     A single flat graph of out-degree `r`, pruned in two passes with the
-    relaxed-neighbour rule. Builds faster than HNSW at comparable recall.
+    relaxed-neighbour rule. Builds slower than HNSW at its cheapest setting,
+    though the gap closes once you match on recall. The index runs a few per
+    cent smaller than HNSW's, and `NsgIndex` is smaller than both.
 
     Args:
         n_neighbors: Neighbours per query, and the default ``k`` for
@@ -525,8 +540,10 @@ class BallTreeIndex(BaseAnnIndex):
             `kneighbors`.
         metric: ``"euclidean"``/``"l2"``, ``"sqeuclidean"`` or ``"cosine"``.
         search_budget: Points to inspect per query, the recall knob. ``None``
-            defaults to 5% of the indexed points, which is thin on small
-            datasets: try 10% if recall matters more than latency.
+            defaults to 5% of the indexed points. That holds up at 32
+            dimensions and goes thin higher up, where it drops to about 0.91
+            recall and 10% is the better starting point. Past 10% recall
+            plateaus and query time does not fall.
             Search-time: override it per call as
             ``index.kneighbors(search_budget=5000)``.
         seed: Fixes the pivot choice at each split.
@@ -614,10 +631,14 @@ class KdTreeIndex(BaseAnnIndex):
 class LshIndex(BaseAnnIndex):
     """Multi-probe locality-sensitive hashing over random projections.
 
-    The cheapest index to build here, and the weakest on recall. Lower
-    `bits_per_hash` widens the buckets, trading query time for recall;
-    `num_tables` trades index size for recall. `n_probe` defaults to one probe
-    per projection. Manhattan is not supported.
+    The cheapest index to build here by a wide margin, and the weakest on
+    recall for the query time it costs. Lower `bits_per_hash` widens the
+    buckets, trading query time for recall; `num_tables` trades index size for
+    recall. `n_probe` defaults to one probe per projection. Manhattan is not
+    supported.
+
+    It is also the one index here whose query can come out slower than brute
+    force, so time it rather than assuming.
 
     Args:
         n_neighbors: Neighbours per query, and the default ``k`` for
@@ -684,7 +705,11 @@ class SoarIndex(BaseAnnIndex):
 
     Every point also lands in a second cell, picked by a rule that accounts for
     the residual it already carries in its primary cell. That buys recall at a
-    given `nprobe` over plain IVF, for roughly twice the posting-list size.
+    given `nprobe` over plain IVF, for twice the posting-list entries.
+
+    Read that trade against query time, not against `nprobe`. At a fixed
+    `nprobe` a spilled index scans about twice the candidates, so comparing at
+    equal `nprobe` flatters it and answers nothing.
 
     `rule` is one of ``"nearest"``, ``"shifted"`` or ``"orthogonal"``, and
     ``None`` lets the core choose per metric: orthogonal for cosine, shifted
@@ -697,8 +722,9 @@ class SoarIndex(BaseAnnIndex):
             `kneighbors`.
         metric: ``"euclidean"``/``"l2"``, ``"sqeuclidean"`` or ``"cosine"``.
         nlist: Number of Voronoi cells to cut the space into. ``None`` defaults
-            to ``sqrt(n)``. Spilling doubles the posting lists on top of this,
-            so the memory is roughly twice an `IvfIndex` at the same `nlist`.
+            to ``sqrt(n)``. Spilling doubles the posting-list *entries* on top
+            of this, which is a few per cent of index size rather than double:
+            the vectors are stored once either way.
         nprobe: Cells visited per query, the recall knob. ``None`` defaults to
             ``sqrt(nlist)``. Search-time: override it per call as
             ``index.kneighbors(nprobe=32)``.
@@ -771,9 +797,12 @@ class RnnDescentIndex(BaseAnnIndex):
     """Relative NN-Descent graph.
 
     Builds and prunes in one pass, reaching a sparse navigable graph without
-    the separate NSG-style refinement step, so it is the cheapest route to a
-    graph index. `r` caps the out-degree and is the main size knob; `ef_search`
-    is the main recall knob.
+    the separate NSG-style refinement step. That saves it the double build
+    `NsgIndex` pays, though `HnswIndex` still builds faster. `r` caps the
+    out-degree and is the main size knob; `ef_search` is the main recall knob.
+
+    On the benchmark gaussian runs it tops out around 0.97 recall, so check it
+    reaches what you need before committing to it.
 
     Args:
         n_neighbors: Neighbours per query, and the default ``k`` for

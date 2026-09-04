@@ -11,22 +11,20 @@
 use faer::RowRef;
 use rand::{rngs::SmallRng, Rng, SeedableRng};
 use rayon::prelude::*;
-use rdst::RadixSort;
 use std::cell::RefCell;
 use std::cmp::{Ordering, Reverse};
-use std::collections::BinaryHeap;
 use std::sync::{
     atomic::{AtomicUsize, Ordering as AtomicOrdering},
     Arc,
 };
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use thousands::*;
 
 use crate::cpu::kd_forest::KdTreeIndex;
 use crate::prelude::*;
 use crate::utils::graph_utils::SearchState;
 use crate::utils::nndescent_utils::{
-    find_target_boundaries, ApplySortedUpdates, Neighbour, UnsafeGraphPtr, Update, SENTINEL_PID,
+    ApplySortedUpdates, Neighbour, UnsafeMutPtr, Update, UpdateGrouper, SENTINEL_PID,
 };
 use crate::utils::*;
 
@@ -41,17 +39,6 @@ thread_local! {
     static RNN_UPDATE_SCRATCH_F64: RefCell<UpdateScratch<f64>> =
         const { RefCell::new(UpdateScratch::new()) };
 
-    // ApplySortedUpdates per-thread state (mirrors NN-Descent's pattern)
-    static RNN_MERGE_HEAP_F32: RefCell<BinaryHeap<(OrderedFloat<f32>, usize, bool)>> =
-        const { RefCell::new(BinaryHeap::new()) };
-    static RNN_MERGE_HEAP_F64: RefCell<BinaryHeap<(OrderedFloat<f64>, usize, bool)>> =
-        const { RefCell::new(BinaryHeap::new()) };
-    static RNN_PID_SET: RefCell<Vec<bool>> = const { RefCell::new(Vec::new()) };
-    static RNN_SORT_BUF_F32: RefCell<Vec<(f32, usize, bool)>> =
-        const { RefCell::new(Vec::new()) };
-    static RNN_SORT_BUF_F64: RefCell<Vec<(f64, usize, bool)>> =
-        const { RefCell::new(Vec::new()) };
-
     // Query beam
     static RNN_SEARCH_STATE_F32: RefCell<SearchState<f32>> = RefCell::new(SearchState::new(1024));
     static RNN_SEARCH_STATE_F64: RefCell<SearchState<f64>> = RefCell::new(SearchState::new(1024));
@@ -59,15 +46,11 @@ thread_local! {
 
 /// Per-thread scratch for the parallel UpdateNeighbors pass.
 ///
-/// `accepted` holds the greedy-accepted adjacency being built for the
-/// current source node; `emitted` collects reverse-insert updates that
-/// target other nodes.
+/// Only the emit buffer needs to survive between nodes. The candidate list and
+/// the surviving list used to be held here too; the prune now compacts the
+/// node's adjacency in place, since survivors are written at an index that
+/// never passes the read index.
 pub struct UpdateScratch<T> {
-    /// `(dist, pid, is_new)` in ascending distance order
-    pub accepted: Vec<(T, usize, bool)>,
-    /// Survivors of the RNG prune, ascending. Reused across nodes so the
-    /// per-node pass does not allocate.
-    pub new_accepted: Vec<(T, usize, bool)>,
     /// Updates to be batched and applied via [`ApplySortedUpdates`]
     pub emitted: Vec<Update<T>>,
 }
@@ -80,8 +63,6 @@ impl<T> UpdateScratch<T> {
     /// Empty [`UpdateScratch`].
     pub const fn new() -> Self {
         Self {
-            accepted: Vec::new(),
-            new_accepted: Vec::new(),
             emitted: Vec::new(),
         }
     }
@@ -141,6 +122,138 @@ impl RnnDescentState<f64> for RnnDescentIndex<f64> {
         F: FnOnce(&std::cell::RefCell<SearchState<f64>>) -> R,
     {
         RNN_SEARCH_STATE_F64.with(f)
+    }
+}
+
+///////////////////
+// Build timings //
+///////////////////
+
+/// Prune-loop counters accumulated per rayon task.
+///
+/// Folded alongside the emitted updates so the counting touches registers
+/// rather than shared atomics. Deliberately per node, not per candidate pair:
+/// a pair counter in the innermost loop cost 4% of the build, which is more
+/// than the pruning statistics were worth once they had been read.
+#[derive(Default, Clone, Copy)]
+struct PruneStats {
+    /// Adjacency lengths summed over the nodes seen
+    deg_sum: u64,
+    /// Nodes seen
+    deg_count: u64,
+    /// Longest adjacency seen
+    deg_max: u32,
+    /// Nodes skipped because their adjacency held no new edge
+    skipped: u64,
+}
+
+impl PruneStats {
+    /// Combine two task-local accumulators.
+    ///
+    /// ### Params
+    ///
+    /// * `other` - Accumulator to fold in
+    ///
+    /// ### Returns
+    ///
+    /// The combined counters.
+    fn merge(self, other: Self) -> Self {
+        Self {
+            deg_sum: self.deg_sum + other.deg_sum,
+            deg_count: self.deg_count + other.deg_count,
+            deg_max: self.deg_max.max(other.deg_max),
+            skipped: self.skipped + other.skipped,
+        }
+    }
+}
+
+/// Per-phase wall-clock breakdown of a build, accumulated across passes.
+///
+/// Timed from the driving loop rather than from inside the parallel closures,
+/// so the cost is a handful of `Instant::now()` calls per pass. Reported only
+/// under `verbose`. The phases partition the build and sum to roughly the
+/// total.
+#[derive(Default, Clone, Copy)]
+struct BuildTimings {
+    /// Kd-forest construction for the query-time entry points
+    forest: Duration,
+    /// Random seed graph initialisation
+    seed: Duration,
+    /// The RNG prune: pairwise distances plus the greedy accept
+    prune: Duration,
+    /// Grouping the emitted updates by target node
+    group: Duration,
+    /// Merging grouped updates back into the graph rows
+    apply: Duration,
+    /// Collecting the reverse edges between outer rounds
+    reverse: Duration,
+    /// Reinsert updates emitted before any rejection
+    updates_emitted: u64,
+    /// Updates that actually changed a graph row
+    updates_accepted: u64,
+    /// Prune-loop counters
+    prune_stats: PruneStats,
+}
+
+impl BuildTimings {
+    /// Total time attributed to the descent passes.
+    fn descent(&self) -> Duration {
+        self.prune + self.group + self.apply + self.reverse
+    }
+
+    /// Print the breakdown as a table, each phase against its share of the total.
+    ///
+    /// ### Params
+    ///
+    /// * `n` - Number of samples
+    /// * `r` - Maximum per-node adjacency
+    fn report(&self, n: usize, r: usize) {
+        let total = self.forest + self.seed + self.descent();
+        let secs = total.as_secs_f64().max(f64::MIN_POSITIVE);
+        let row = |name: &str, d: Duration| {
+            println!(
+                "  {:<22} {:>9.3} s  {:>5.1}%",
+                name,
+                d.as_secs_f64(),
+                100.0 * d.as_secs_f64() / secs
+            );
+        };
+
+        println!("\nRNN-Descent build breakdown (n={n}, R={r}):");
+        row("forest build", self.forest);
+        row("seed graph", self.seed);
+        row("prune", self.prune);
+        row("group updates", self.group);
+        row("apply updates", self.apply);
+        row("reverse edges", self.reverse);
+        println!("  {:<22} {:>9.3} s", "total", total.as_secs_f64());
+
+        let accept = if self.updates_emitted > 0 {
+            100.0 * self.updates_accepted as f64 / self.updates_emitted as f64
+        } else {
+            0.0
+        };
+        println!(
+            "  updates: {} emitted, {} accepted ({:.2}%)",
+            self.updates_emitted.separate_with_underscores(),
+            self.updates_accepted.separate_with_underscores(),
+            accept
+        );
+
+        let st = self.prune_stats;
+        if st.deg_count > 0 {
+            println!(
+                "  adjacency: mean {:.1}, max {}",
+                st.deg_sum as f64 / st.deg_count as f64,
+                st.deg_max
+            );
+            println!(
+                "  node passes: {} of {} skipped as all-old ({:.1}%)",
+                st.skipped.separate_with_underscores(),
+                st.deg_count.separate_with_underscores(),
+                100.0 * st.skipped as f64 / st.deg_count as f64
+            );
+        }
     }
 }
 
@@ -264,137 +377,114 @@ impl<T> DimensionValidation for RnnDescentIndex<T> {
 // ApplySortedUpdates //
 ////////////////////////
 
-/// Macro producing [`ApplySortedUpdates`] impls per concrete float type.
+/// Merge a target-sorted update batch into the flat graph.
 ///
-/// The logic mirrors NN-Descent's implementation: for each target's contiguous
-/// update segment, load the target's existing neighbours into a max-heap of
-/// size `R`, merge in candidate updates, drop the farthest when the heap
-/// overflows, then write back sorted ascending. `is_new` is preserved on
-/// existing entries and set to `true` on newly-inserted ones.
-macro_rules! impl_apply_sorted_updates {
-    ($float:ty, $heap_tls:ident, $sort_buf_tls:ident) => {
-        impl ApplySortedUpdates<$float> for RnnDescentIndex<$float> {
-            fn apply_sorted_updates(
-                &self,
-                updates: &[Update<$float>],
-                graph: &mut [Neighbour<$float>],
-                k: usize,
-                updates_count: &AtomicUsize,
-            ) {
-                if updates.is_empty() {
-                    return;
+/// Shares its shape with NN-Descent's implementation
+/// (`src/cpu/nndescent.rs`): `par_chunk_by` splits the batch on target
+/// boundaries directly, so no sequential boundary scan and no `Vec` of
+/// segment descriptors stands between the sort and the merge. Each segment
+/// owns one row for the whole call, which is what makes the raw-pointer
+/// writes sound.
+///
+/// The RNN-specific part is the live prefix. Rows are sentinel-padded to `R`
+/// and the RNG prune keeps mean degree far below it, so every scan stops at
+/// the first sentinel instead of walking the whole slot.
+///
+/// The merge is a bounded insertion sort under the total order
+/// `(dist, source)`, which makes the outcome independent of the order updates
+/// arrive in within a segment: the final row is the `R` best of
+/// `existing + candidates` however they were interleaved.
+impl<T> ApplySortedUpdates<T> for RnnDescentIndex<T>
+where
+    T: AnnSearchFloat,
+{
+    fn apply_sorted_updates(
+        &self,
+        updates: &[Update<T>],
+        graph: &mut [Neighbour<T>],
+        k: usize,
+        updates_count: &AtomicUsize,
+    ) {
+        if updates.is_empty() || k == 0 {
+            return;
+        }
+
+        let graph_ptr = UnsafeMutPtr(graph.as_mut_ptr());
+
+        updates
+            .par_chunk_by(|a, b| a.target == b.target)
+            .for_each(|segment| {
+                let target = segment[0].target as usize;
+
+                #[allow(clippy::redundant_locals)]
+                let graph_ptr = graph_ptr;
+
+                // SAFETY: the batch is sorted by target and each segment covers
+                // exactly one target, so this thread owns the row for the whole
+                // call and no other thread aliases it.
+                let row = unsafe { std::slice::from_raw_parts_mut(graph_ptr.0.add(target * k), k) };
+
+                let mut degree = row.iter().position(|e| e.is_sentinel()).unwrap_or(k);
+
+                // Most segments change nothing once the graph settles, so bail
+                // before touching the row if not one update can beat its
+                // current worst. Only meaningful on a full row; a short row has
+                // spare slots and always accepts.
+                if degree == k {
+                    let cutoff = row[k - 1].dist;
+                    if segment.iter().all(|u| u.dist > cutoff) {
+                        return;
+                    }
                 }
 
-                let boundaries = find_target_boundaries(updates);
-                let segments: Vec<(usize, &[Update<$float>])> = boundaries
-                    .windows(2)
-                    .filter_map(|w| {
-                        let start = w[0];
-                        let end = w[1];
-                        if start < end {
-                            Some((updates[start].target as usize, &updates[start..end]))
-                        } else {
-                            None
+                let mut edge_updates = 0usize;
+
+                for update in segment {
+                    let d = update.dist;
+                    let src = update.source as usize;
+                    if src == target {
+                        continue;
+                    }
+                    if degree == k && d > row[k - 1].dist {
+                        continue;
+                    }
+
+                    // One pass over the live prefix finds both the duplicate
+                    // and the insertion point. The scan must run to the end of
+                    // the prefix regardless, since a duplicate can sit past the
+                    // insertion point.
+                    let mut pos = degree;
+                    let mut duplicate = false;
+                    for (i, slot) in row[..degree].iter().enumerate() {
+                        let pid = slot.pid();
+                        if pid == src {
+                            duplicate = true;
+                            break;
                         }
-                    })
-                    .collect();
+                        if pos == degree && (d < slot.dist || (d == slot.dist && src < pid)) {
+                            pos = i;
+                        }
+                    }
 
-                let graph_ptr = UnsafeGraphPtr(graph.as_mut_ptr());
+                    if duplicate || pos == k {
+                        continue;
+                    }
 
-                segments.par_iter().for_each(|&(target, segment)| {
-                    #[allow(clippy::redundant_locals)]
-                    let graph_ptr = graph_ptr;
-                    $heap_tls.with(|heap_cell| {
-                        RNN_PID_SET.with(|set_cell| {
-                            $sort_buf_tls.with(|sort_cell| {
-                                let mut heap = heap_cell.borrow_mut();
-                                let mut pid_set = set_cell.borrow_mut();
-                                let mut sort_buf = sort_cell.borrow_mut();
+                    // Shift the tail down one slot, dropping the worst when the
+                    // row is already full. `pos == degree < k` appends, and the
+                    // copy is then empty.
+                    row.copy_within(pos..degree.min(k - 1), pos + 1);
+                    row[pos] = Neighbour::new(src, d, true);
+                    degree = (degree + 1).min(k);
+                    edge_updates += 1;
+                }
 
-                                heap.clear();
-                                if pid_set.len() < self.n {
-                                    pid_set.resize(self.n, false);
-                                }
-
-                                let start_idx = target * k;
-                                // SAFETY: each target processed by a unique thread
-                                let target_slice = unsafe {
-                                    std::slice::from_raw_parts_mut(graph_ptr.0.add(start_idx), k)
-                                };
-
-                                let mut edge_updates = 0usize;
-
-                                for n in target_slice.iter() {
-                                    if n.is_sentinel() {
-                                        continue;
-                                    }
-                                    let pid = n.pid();
-                                    heap.push((OrderedFloat(n.dist), pid, n.is_new()));
-                                    pid_set[pid] = true;
-                                }
-
-                                for update in segment {
-                                    let src = update.source as usize;
-                                    if src == target {
-                                        continue;
-                                    }
-                                    if pid_set[src] {
-                                        continue;
-                                    }
-
-                                    if heap.len() < k {
-                                        heap.push((OrderedFloat(update.dist), src, true));
-                                        pid_set[src] = true;
-                                        edge_updates += 1;
-                                    } else if let Some(&(OrderedFloat(worst), _, _)) = heap.peek() {
-                                        if update.dist < worst {
-                                            if let Some((_, old_pid, _)) = heap.pop() {
-                                                pid_set[old_pid] = false;
-                                            }
-                                            heap.push((OrderedFloat(update.dist), src, true));
-                                            pid_set[src] = true;
-                                            edge_updates += 1;
-                                        }
-                                    }
-                                }
-
-                                if edge_updates > 0 {
-                                    updates_count.fetch_add(edge_updates, AtomicOrdering::Relaxed);
-
-                                    sort_buf.clear();
-                                    sort_buf.extend(heap.drain().map(
-                                        |(OrderedFloat(d), p, is_new)| {
-                                            pid_set[p] = false;
-                                            (d, p, is_new)
-                                        },
-                                    ));
-                                    sort_buf
-                                        .sort_unstable_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
-                                    sort_buf.truncate(k);
-
-                                    for (i, &(d, p, is_new)) in sort_buf.iter().enumerate() {
-                                        target_slice[i] = Neighbour::new(p, d, is_new);
-                                    }
-                                    for i in sort_buf.len()..k {
-                                        target_slice[i] =
-                                            Neighbour::new(SENTINEL_PID, <$float>::MAX, false);
-                                    }
-                                } else {
-                                    for (_, pid, _) in heap.iter() {
-                                        pid_set[*pid] = false;
-                                    }
-                                }
-                            })
-                        })
-                    })
-                });
-            }
-        }
-    };
+                if edge_updates > 0 {
+                    updates_count.fetch_add(edge_updates, AtomicOrdering::Relaxed);
+                }
+            });
+    }
 }
-
-impl_apply_sorted_updates!(f32, RNN_MERGE_HEAP_F32, RNN_SORT_BUF_F32);
-impl_apply_sorted_updates!(f64, RNN_MERGE_HEAP_F64, RNN_SORT_BUF_F64);
 
 /////////////
 // Helpers //
@@ -431,6 +521,35 @@ where
             Dist::SquaredEuclidean => self.euclidean_distance(i, j),
             Dist::Cosine => self.cosine_distance(i, j),
             Dist::Manhattan => self.manhattan_distance(i, j),
+        }
+    }
+
+    /// Distance between two rows that the caller has already sliced.
+    ///
+    /// Same arithmetic as [`Self::distance`], but the metric and the row
+    /// slices are lifted out of the caller's loop. Going through
+    /// [`Self::distance`] re-read `self.metric` and re-sliced both rows on
+    /// every one of the hundred-million-odd pairs a default build evaluates,
+    /// and the source row is invariant across the whole inner loop.
+    ///
+    /// ### Params
+    ///
+    /// * `a` - First row, length `dim`
+    /// * `b` - Second row, length `dim`
+    /// * `norms` - Pre-computed L2 norms (Cosine only)
+    /// * `a_id` - Row index of `a`, for its norm
+    /// * `b_id` - Row index of `b`, for its norm
+    /// * `metric` - Distance metric
+    ///
+    /// ### Returns
+    ///
+    /// The distance between the two rows.
+    #[inline(always)]
+    fn row_distance(a: &[T], b: &[T], norms: &[T], a_id: usize, b_id: usize, metric: Dist) -> T {
+        match metric {
+            Dist::SquaredEuclidean => T::euclidean_simd(a, b),
+            Dist::Cosine => T::one() - (T::dot_simd(a, b) / (norms[a_id] * norms[b_id])),
+            Dist::Manhattan => T::manhattan_simd(a, b),
         }
     }
 
@@ -491,14 +610,12 @@ where
 
         // Build the entry-point forest once, before the graph. Query time
         // multi-seeds the beam from `forest.query()` results.
+        let mut timings = BuildTimings::default();
         let start = Instant::now();
         let forest = KdTreeIndex::new((&vectors_flat[..], n, dim), n_trees, metric, seed);
+        timings.forest = start.elapsed();
         if verbose {
-            println!(
-                "Built KdForest ({} trees): {:.2?}",
-                n_trees,
-                start.elapsed()
-            );
+            println!("Built KdForest ({} trees): {:.2?}", n_trees, timings.forest);
         }
 
         let mut index = Self {
@@ -517,11 +634,22 @@ where
         let sentinel = Neighbour::new(SENTINEL_PID, T::max_value(), false);
         let mut build_graph = vec![sentinel; n * params.r];
 
+        // One grouper for the whole build: every pass reuses its cursor array
+        // and its output buffer.
+        let mut grouper = UpdateGrouper::new();
+
+        let start = Instant::now();
         index.initialise_random_graph(&mut build_graph, params.s, params.r, seed, verbose);
+        timings.seed = start.elapsed();
 
         for t1 in 0..params.t1 {
             for t2 in 0..params.t2 {
-                let changes = index.update_neighbours_pass(&mut build_graph, params.r);
+                let changes = index.update_neighbours_pass(
+                    &mut build_graph,
+                    params.r,
+                    &mut grouper,
+                    &mut timings,
+                );
                 if verbose {
                     println!(
                         "  t1={} t2={}: emitted {} reinsert updates",
@@ -532,7 +660,12 @@ where
                 }
             }
             if t1 + 1 != params.t1 {
-                let changes = index.add_reverse_edges_pass(&mut build_graph, params.r);
+                let changes = index.add_reverse_edges_pass(
+                    &mut build_graph,
+                    params.r,
+                    &mut grouper,
+                    &mut timings,
+                );
                 if verbose {
                     println!(
                         "  t1={}: AddReverseEdges applied {} edge updates",
@@ -541,6 +674,10 @@ where
                     );
                 }
             }
+        }
+
+        if verbose {
+            timings.report(n, params.r);
         }
 
         // Flatten to compact ids-only storage.
@@ -618,83 +755,160 @@ where
     ///
     /// * `graph` - Build-time graph (mutated in place)
     /// * `r` - Slot capacity per node
+    /// * `grouper` - Reused counting-sort scratch for the emitted updates
+    /// * `timings` - Phase accumulator for the verbose breakdown
     ///
     /// ### Returns
     ///
     /// Number of edge changes applied by [`ApplySortedUpdates`] this pass.
-    fn update_neighbours_pass(&self, graph: &mut [Neighbour<T>], r: usize) -> usize {
+    fn update_neighbours_pass(
+        &self,
+        graph: &mut [Neighbour<T>],
+        r: usize,
+        grouper: &mut UpdateGrouper<T>,
+        timings: &mut BuildTimings,
+    ) -> usize {
         let counter = AtomicUsize::new(0);
-        let graph_ptr = UnsafeGraphPtr(graph.as_mut_ptr());
+        let graph_ptr = UnsafeMutPtr(graph.as_mut_ptr());
         let n = self.n;
 
-        let per_thread_updates: Vec<Vec<Update<T>>> = (0..n)
+        grouper.reset_counts(n);
+        let counts = grouper.counts(n);
+
+        let start = Instant::now();
+        let per_thread_updates: Vec<(Vec<Update<T>>, PruneStats)> = (0..n)
             .into_par_iter()
-            .fold(Vec::<Update<T>>::new, |mut local_emits, u| {
-                #[allow(clippy::redundant_locals)]
-                let graph_ptr = graph_ptr;
-                Self::with_update_scratch(|scratch_cell| {
-                    let mut scratch_ref = scratch_cell.borrow_mut();
-                    let UpdateScratch {
-                        accepted,
-                        new_accepted,
-                        emitted,
-                    } = &mut *scratch_ref;
-                    accepted.clear();
-                    new_accepted.clear();
-                    emitted.clear();
+            .fold(
+                || (Vec::<Update<T>>::new(), PruneStats::default()),
+                |(mut local_emits, mut stats), u| {
+                    #[allow(clippy::redundant_locals)]
+                    let graph_ptr = graph_ptr;
+                    Self::with_update_scratch(|scratch_cell| {
+                        let mut scratch_ref = scratch_cell.borrow_mut();
+                        let UpdateScratch { emitted } = &mut *scratch_ref;
+                        emitted.clear();
 
-                    // Load u's current sorted adjacency.
-                    // SAFETY: u is unique across the parallel iterator.
-                    let slot = unsafe { std::slice::from_raw_parts_mut(graph_ptr.0.add(u * r), r) };
+                        // Load u's current sorted adjacency.
+                        // SAFETY: u is unique across the parallel iterator.
+                        let slot =
+                            unsafe { std::slice::from_raw_parts_mut(graph_ptr.0.add(u * r), r) };
 
-                    for entry in slot.iter() {
-                        if entry.is_sentinel() {
-                            break;
-                        }
-                        accepted.push((entry.dist, entry.pid(), entry.is_new()));
-                    }
-
-                    // Greedy-accept in ascending distance order.
-                    for &(v_dist, v, v_new) in accepted.iter() {
-                        let mut pruned = false;
-                        for &(_, w, w_new) in new_accepted.iter() {
-                            if !v_new && !w_new {
-                                continue;
-                            }
-                            let d_vw = self.distance(v, w);
-                            // RNG prune rule from Alg. 4.
-                            if v_dist >= d_vw {
-                                emitted.push(Update::new(w as u32, v as u32, d_vw));
-                                pruned = true;
+                        let mut degree = 0usize;
+                        let mut any_new = false;
+                        for entry in slot.iter() {
+                            if entry.is_sentinel() {
                                 break;
                             }
+                            any_new |= entry.is_new();
+                            degree += 1;
                         }
-                        if !pruned {
-                            new_accepted.push((v_dist, v, false));
+
+                        stats.deg_sum += degree as u64;
+                        stats.deg_count += 1;
+                        stats.deg_max = stats.deg_max.max(degree as u32);
+
+                        // Every survivor is written back old, so the paper's
+                        // `!v_new && !w_new` guard has an always-false right
+                        // half and reduces to `v_new`. An all-old adjacency
+                        // therefore keeps every candidate in order, emits
+                        // nothing and writes back exactly what it read, so the
+                        // whole node is a no-op.
+                        if !any_new {
+                            stats.skipped += 1;
+                            return;
                         }
-                    }
 
-                    // Write back to u's slot (all surviving edges old).
-                    for (i, &(d, pid, _)) in new_accepted.iter().enumerate() {
-                        slot[i] = Neighbour::new(pid, d, false);
-                    }
-                    for i in new_accepted.len()..r {
-                        slot[i] = Neighbour::new(SENTINEL_PID, T::max_value(), false);
-                    }
+                        let dim = self.dim;
+                        let metric = self.metric;
+                        let flat = &self.vectors_flat;
+                        let norms = &self.norms;
 
-                    local_emits.append(emitted);
-                });
-                local_emits
-            })
+                        // Greedy-accept in ascending distance order, compacting
+                        // in place: a survivor is written at `j <= i`, so the
+                        // write never passes the read and the entry is copied
+                        // out first. `slot[..j]` is the surviving list the RNG
+                        // rule tests against.
+                        //
+                        // Batching four survivors per distance call was tried
+                        // and reverted: the mean is 1.6 distances per candidate,
+                        // so a batch of four evaluates 44% more pairs, and the
+                        // per-pair saving from overlapping the gathers only came
+                        // to 24%. The loop is not gather bound either, which is
+                        // what the batch would have helped: shrinking `n` until
+                        // the whole vector store fits L2 moves the per-pair cost
+                        // by 9%.
+                        let mut j = 0usize;
+                        for i in 0..degree {
+                            let entry = slot[i];
+                            let v_dist = entry.dist;
+                            let v = entry.pid();
+
+                            if !entry.is_new() {
+                                slot[j] = Neighbour::new(v, v_dist, false);
+                                j += 1;
+                                continue;
+                            }
+
+                            let v_row = &flat[v * dim..v * dim + dim];
+                            let mut pruned = false;
+                            for t in 0..j {
+                                let w = slot[t].pid();
+                                let w_row = &flat[w * dim..w * dim + dim];
+                                let d_vw = Self::row_distance(v_row, w_row, norms, v, w, metric);
+                                // RNG prune rule from Alg. 4.
+                                if v_dist >= d_vw {
+                                    emitted.push(Update::new(w as u32, v as u32, d_vw));
+                                    counts[w].fetch_add(1, AtomicOrdering::Relaxed);
+                                    pruned = true;
+                                    break;
+                                }
+                            }
+
+                            if !pruned {
+                                slot[j] = Neighbour::new(v, v_dist, false);
+                                j += 1;
+                            }
+                        }
+
+                        // Only the range the prune just vacated needs clearing.
+                        // Everything from the old degree onwards is already
+                        // sentinel, and mean degree runs far below `r`, so
+                        // filling the whole slot rewrites sentinels with
+                        // sentinels.
+                        for i in j..degree {
+                            slot[i] = Neighbour::new(SENTINEL_PID, T::max_value(), false);
+                        }
+
+                        local_emits.append(emitted);
+                    });
+                    (local_emits, stats)
+                },
+            )
             .collect();
 
-        let mut all_updates: Vec<Update<T>> = per_thread_updates.into_iter().flatten().collect();
-        if !all_updates.is_empty() {
-            all_updates.radix_sort_unstable();
-            self.apply_sorted_updates(&all_updates, graph, r, &counter);
+        let mut batches = Vec::with_capacity(per_thread_updates.len());
+        let mut stats = PruneStats::default();
+        for (emits, task_stats) in per_thread_updates {
+            stats = stats.merge(task_stats);
+            batches.push(emits);
+        }
+        timings.prune += start.elapsed();
+        timings.prune_stats = timings.prune_stats.merge(stats);
+
+        let start = Instant::now();
+        let grouped = grouper.group_counted(&batches, n);
+        timings.updates_emitted += grouped.len() as u64;
+        timings.group += start.elapsed();
+
+        if !grouped.is_empty() {
+            let start = Instant::now();
+            self.apply_sorted_updates(grouped, graph, r, &counter);
+            timings.apply += start.elapsed();
         }
 
-        counter.load(AtomicOrdering::Relaxed)
+        let applied = counter.load(AtomicOrdering::Relaxed);
+        timings.updates_accepted += applied as u64;
+        applied
     }
 
     /// One AddReverseEdges pass.
@@ -707,13 +921,22 @@ where
     ///
     /// * `graph` - Build-time graph (mutated in place)
     /// * `r` - Slot capacity per node
+    /// * `grouper` - Reused counting-sort scratch for the emitted updates
+    /// * `timings` - Phase accumulator for the verbose breakdown
     ///
     /// ### Returns
     ///
     /// Number of edge changes applied.
-    fn add_reverse_edges_pass(&self, graph: &mut [Neighbour<T>], r: usize) -> usize {
+    fn add_reverse_edges_pass(
+        &self,
+        graph: &mut [Neighbour<T>],
+        r: usize,
+        grouper: &mut UpdateGrouper<T>,
+        timings: &mut BuildTimings,
+    ) -> usize {
         let counter = AtomicUsize::new(0);
         let n = self.n;
+        let start = Instant::now();
 
         // Re-arm every surviving edge as new. UpdateNeighbors writes all
         // survivors back as old, so without this the `!v_new && !w_new` guard
@@ -726,6 +949,9 @@ where
             }
         });
 
+        grouper.reset_counts(n);
+        let counts = grouper.counts(n);
+
         // Collect reverse-edge updates in parallel.
         let per_thread: Vec<Vec<Update<T>>> = (0..n)
             .into_par_iter()
@@ -736,19 +962,30 @@ where
                         break;
                     }
                     // Reverse edge: target = entry.pid, source = u.
-                    local.push(Update::new(entry.pid() as u32, u as u32, entry.dist));
+                    let pid = entry.pid();
+                    local.push(Update::new(pid as u32, u as u32, entry.dist));
+                    counts[pid].fetch_add(1, AtomicOrdering::Relaxed);
                 }
                 local
             })
             .collect();
 
-        let mut updates: Vec<Update<T>> = per_thread.into_iter().flatten().collect();
-        if !updates.is_empty() {
-            updates.radix_sort_unstable();
-            self.apply_sorted_updates(&updates, graph, r, &counter);
+        timings.reverse += start.elapsed();
+
+        let start = Instant::now();
+        let grouped = grouper.group_counted(&per_thread, n);
+        timings.updates_emitted += grouped.len() as u64;
+        timings.group += start.elapsed();
+
+        if !grouped.is_empty() {
+            let start = Instant::now();
+            self.apply_sorted_updates(grouped, graph, r, &counter);
+            timings.apply += start.elapsed();
         }
 
-        counter.load(AtomicOrdering::Relaxed)
+        let applied = counter.load(AtomicOrdering::Relaxed);
+        timings.updates_accepted += applied as u64;
+        applied
     }
 
     /// Memory usage in bytes.
@@ -822,6 +1059,12 @@ where
         Self::with_search_state(|state_cell| {
             let mut state = state_cell.borrow_mut();
             state.reset(self.n);
+            // `BoundedMaxHeap` rather than the `SortedBuffer` this used before.
+            // Accepting a candidate into the buffer costs a binary search plus
+            // a `pop` and an `insert`, so two memmoves of up to `ef` entries;
+            // the heap sifts once. RNN-Descent runs `ef` at 100 by default,
+            // which is the regime `SearchState` documents the heap for.
+            state.results.reset(ef);
 
             let query_norm = if self.metric == Dist::Cosine {
                 T::calculate_l2_norm(query)
@@ -830,8 +1073,7 @@ where
             };
 
             // Seed the beam from the kd-forest. The forest returns already-near
-            // candidates, so we can safely push all of them into
-            // `working_sorted`.
+            // candidates, so all of them can go straight into the result heap.
             let init_candidates = (ef / 2).max(2 * k).min(self.n);
             let search_k = init_candidates * 3;
             let (seed_ids, seed_dists) =
@@ -842,19 +1084,16 @@ where
                     continue;
                 }
                 state.mark_visited(*id);
-                let od = OrderedFloat(*d);
-                state.candidates.push(Reverse((od, *id)));
-                state.working_sorted.insert((od, *id), ef);
+                state.candidates.push(Reverse((OrderedFloat(*d), *id)));
+                state.results.push(*d, *id);
             }
 
-            let mut furthest_dist = state
-                .working_sorted
-                .top()
-                .map(|(d, _)| *d)
-                .unwrap_or(OrderedFloat(T::infinity()));
+            // `threshold()` is infinity until the heap fills, so the "or the
+            // result set is not yet full" arm of both tests below is implicit.
+            let mut furthest = state.results.threshold();
 
             while let Some(Reverse((current_dist, current_id))) = state.candidates.pop() {
-                if current_dist > furthest_dist && state.working_sorted.len() >= ef {
+                if current_dist.0 > furthest {
                     break;
                 }
 
@@ -869,32 +1108,22 @@ where
                     }
                     state.mark_visited(n_idx);
 
-                    let d = OrderedFloat(self.compute_query_distance(query, n_idx, query_norm));
-
-                    if d < furthest_dist || state.working_sorted.len() < ef {
-                        state.candidates.push(Reverse((d, n_idx)));
-                        if state.working_sorted.insert((d, n_idx), ef)
-                            && state.working_sorted.len() >= ef
-                        {
-                            furthest_dist = state
-                                .working_sorted
-                                .top()
-                                .map(|(d, _)| *d)
-                                .unwrap_or(OrderedFloat(T::infinity()));
-                        }
+                    let d = self.compute_query_distance(query, n_idx, query_norm);
+                    if d < furthest {
+                        state.candidates.push(Reverse((OrderedFloat(d), n_idx)));
+                        state.results.push(d, n_idx);
+                        furthest = state.results.threshold();
                     }
                 }
             }
 
-            let mut results = state.working_sorted.data().to_vec();
-            results.truncate(k);
+            state.results.sort();
+            let take = k.min(state.results.len());
 
-            let (indices, distances): (Vec<usize>, Vec<T>) = results
-                .into_iter()
-                .map(|(OrderedFloat(d), id)| (id, d))
-                .unzip();
-
-            Ok((indices, distances))
+            Ok((
+                state.results.ids()[..take].to_vec(),
+                state.results.dists()[..take].to_vec(),
+            ))
         })
     }
 

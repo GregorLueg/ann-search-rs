@@ -237,8 +237,16 @@ the float distance, which is what lets one kernel serve both index construction
 and query. Per-dimension *scales* would break that; the offsets are free.
 
 At 96 dimensions a vector goes from *96 x 32 bits = 384 bytes* to
-*96 x 8 bits = 96 bytes*, a **4x reduction** plus the codebook. The integer
-kernels also make the scan faster than the `f32` one rather than slower.
+*96 x 8 bits = 96 bytes*, a **4x reduction** plus the codebook. The codebook is
+fixed overhead, so the realised saving is 3.5x at 32 dimensions and 3.9x at 128.
+
+Whether the integer kernels also make the scan faster depends on the index
+under them, and the tables below split. The **exhaustive** SQ8 scan is *slower*
+than the `f32` one at 32 dimensions, by up to 1.5x, and only edges ahead at 128:
+one byte per dimension does not buy enough per-element work to pay for the
+widening when `dim` is small. Under **IVF** it wins everywhere, 1.15 to 1.5x on
+every matched `nlist`/`nprobe` pairing, because the cell scan is the whole
+cost there.
 
 Ranking is exact whilst the code-space squared distance stays inside the float's
 integer range: for `f32` that means `255^2 * dim <= 2^24`, so up to 258
@@ -414,14 +422,22 @@ IVF-SQ8-nl547 (self)                                   2_403.44       798.23    
 An HNSW built **and** searched entirely on the uniform 8-bit codes described
 above, inspired by [pyglass](https://github.com/zilliztech/pyglass). Because the
 shared scale makes the integer code distance order-preserving, one kernel serves
-graph construction and query alike: the graph never sees a float. Memory drops
-4x against a plain HNSW and the build gets faster, since the construction search
-is doing integer arithmetic.
+graph construction and query alike: the graph never sees a float. The build and
+the query both get faster, since everything is integer arithmetic.
+
+The *vector store* drops 4x, but the graph edges do not compress, so the index
+as a whole lands at 0.44 to 0.80 of a plain HNSW depending on `M` and
+dimensionality. The ratio is worst at 32 dimensions, where the edges dominate.
 
 The grid runs the full-precision HNSW at matched `(M, ef_construction,
 ef_search)` alongside it, plus an exhaustive scan over the same codec. The
 exhaustive-SQ8 row is the ceiling the graph rows work against: whatever they
 lose up to it is the codec, whatever they lose beyond it is the graph.
+
+Read the recall columns before the memory ones. At matched `(M=16, ef=200,
+s=200)` the codec costs about 0.07 recall on Euclidean and **0.26 to 0.33 on
+cosine**, and the graph rows sit essentially on the exhaustive-SQ8 ceiling, so
+that loss is all codec. Cosine is the case to check on your own data.
 
 **Tunable parameters:**
 

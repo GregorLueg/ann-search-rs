@@ -1,7 +1,8 @@
 //! SOAR-OPQ handle.
 //!
 //! [`crate::soar_pq`] with the learned rotation in front of the sub-codebooks.
-//! The most compressed thing in the package, and the slowest to build.
+//! It pays for the spilling and the rotation matrix both, so it is the largest
+//! of the quantised indices rather than the smallest.
 
 use ann_search_rs::prelude::DimensionValidation;
 use ann_search_rs::quantised::soar_opq::SoarOpqIndex;
