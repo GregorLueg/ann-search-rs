@@ -969,15 +969,16 @@ is about when it isn't the right call.</p>
   graph: <code>NNDescentIndex</code>, then <code>extract_knn()</code>. It converges on the graph
   directly instead of searching for something it already has.</li>
 <li><strong>You need exactness but brute force is too slow</strong>: <code>KmknnIndex</code>. Recall is 1
-  by construction. Its home ground is 20 to 100 dimensions; above that the
-  triangle-inequality bounds go slack and it degenerates towards a full scan.</li>
+  by construction. The triangle-inequality bounds go slack as the
+  dimensionality climbs: on the benchmark runs it queries 8.5x faster than
+  brute force at 32 dimensions and 2.4x at 128.</li>
 <li><strong>Memory is the binding constraint</strong>: <code>HnswSq8uIndex</code>, which is the usual
   first choice at a quarter of the vector memory. See
   <a href="../quantised/">Quantised</a>. Staying uncompressed, <code>IvfIndex</code> is the smallest
   of the approximate indices and the two knobs (<code>nlist</code>, <code>nprobe</code>) are easy to
   reason about.</li>
 <li><strong>You have a GPU and n is large</strong>: <code>CagraGpuIndex</code>. See <a href="../gpu/">GPU</a>.</li>
-<li><strong>You need Manhattan</strong>: that rules out nineteen of them. See the table.</li>
+<li><strong>You need Manhattan</strong>: that rules out twenty of them. See the table.</li>
 </ul>
 <h2 id="the-table">The table<a class="headerlink" href="#the-table" title="Permanent link">&para;</a></h2>
 <table>
@@ -1044,7 +1045,7 @@ is about when it isn't the right call.</p>
 <td><code>IvfIndex</code></td>
 <td>no</td>
 <td>k-means Voronoi cells</td>
-<td>yes</td>
+<td>no</td>
 <td><code>nprobe</code></td>
 </tr>
 <tr>
@@ -1186,29 +1187,43 @@ is about when it isn't the right call.</p>
 <h3 id="graph-indices">Graph indices<a class="headerlink" href="#graph-indices" title="Permanent link">&para;</a></h3>
 <p><strong><code>HnswIndex</code></strong> is a layered proximity graph: fast to build, fast to query, and
 modest in memory for what it gives you. Raise <code>ef_search</code> for recall at query
-time, <code>ef_construction</code> for a better graph at build time. It is the cheapest of
-the graph indices here to build, by a factor of two to four, on every
-distribution in the benchmark tables. The thing to watch is <code>ef_construction</code>,
-which is what that build cost is actually sensitive to.</p>
+time, <code>ef_construction</code> for a better graph at build time. The thing to watch is
+<code>ef_construction</code>, which is what that build cost is actually sensitive to.</p>
+<p>At its cheapest grid setting it is the cheapest graph index here to build, on
+every distribution. Don't read that as a general result: match on recall and it
+goes away. Vamana reaches 0.99 on the gaussian data for slightly less build
+time in a 35% smaller index, and at 128 dimensions HNSW is the <em>most</em> expensive
+of the four graph indices at recall 0.999.</p>
 <p><strong><code>VamanaIndex</code></strong> is the graph behind DiskANN, in its in-memory variant. A
 single flat graph rather than a layered one, refined over two alpha-pruning
-passes. It builds slower than HNSW rather than faster, so reach for it when you
-want the flat structure and the smaller index, not for the build time.</p>
+passes. At its cheapest setting it builds slower than HNSW, though the gap
+closes and can reverse once you match on recall. The size win over HNSW is
+small, 2 to 5%, and <code>NsgIndex</code> is smaller than both, so reach for it for the
+flat structure rather than for either number.</p>
 <p><strong><code>NsgIndex</code></strong> thins a kNN graph with the MRNG rule, so each node ends up with
 edges pointing in spread-out directions instead of a cluster of near-duplicates.
 It has to materialise a full kNN graph first (<code>knn_k</code> sizes it), so the build
-pays twice. Sparse and fast once built.</p>
+pays twice, and it is the most expensive graph index here to build.</p>
+<p>It is the sparsest of the graph indices, but only of those: <code>IvfIndex</code>,
+<code>SoarIndex</code> and <code>KmknnIndex</code> are all smaller again. "Fast once built" holds
+inside the graph family and not outside it. On the gaussian runs NSG queries in
+93.76 ms at recall 0.9957, which <code>KmknnIndex</code> (78.45 ms, recall 1.0) and
+<code>IvfIndex</code> (87.57 ms, 0.9996) both beat on either axis.</p>
 <p><strong><code>RnnDescentIndex</code></strong> folds the pruning into the descent loop, so one pass hands
 back a graph that's already search-ready and no intermediate kNN graph is ever
 materialised. That saves it the double build NSG pays, though HNSW still gets
 there first. <code>r</code> caps the out-degree and is the size knob.</p>
+<p>Watch the recall ceiling. On the gaussian runs no setting in the grid gets past
+0.9702, so if you need 0.99 this is not the index.</p>
 <p><strong><code>NNDescentIndex</code></strong> is the odd one out: <code>n_neighbors</code> is a build parameter, not
 just a query one, and <code>extract_knn()</code> hands back the converged graph without
 searching. That is its whole argument, and it is a real one when the graph <em>is</em>
-the deliverable rather than a queryable index. It is not, though, the fastest
-route to a self-kNN graph: on the benchmark shapes the partition indices' self
-paths get there sooner at equal or better recall, <code>KmknnIndex</code> exactly. Measure
-both on your data.</p>
+the deliverable rather than a queryable index.</p>
+<p>Whether it is the quickest route there depends on the shape, and the benchmark
+runs split. At 32 dimensions <code>KmknnIndex</code>'s self path gets there in 1.07 s at
+recall 1.0 against <code>extract_knn</code>'s 2.51 s at 0.9997. At 128 dimensions it
+reverses hard: <code>extract_knn</code> takes 2.52 s against KmknnIndex's 4.60 s and
+<code>IvfIndex</code>'s 7.63 s, all three at recall 1.0. Measure both on your data.</p>
 <h3 id="partition-indices">Partition indices<a class="headerlink" href="#partition-indices" title="Permanent link">&para;</a></h3>
 <p><strong><code>IvfIndex</code></strong> cuts the space into <code>nlist</code> k-means cells and scans the <code>nprobe</code>
 nearest ones. Cheap to build, easy to tune, and the smallest of the approximate
@@ -1217,10 +1232,14 @@ Recall degrades when a true neighbour sits just over a cell boundary, which is
 exactly what SOAR fixes.</p>
 <p><strong><code>SoarIndex</code></strong> writes every vector into two cells: its nearest centroid, and a
 second chosen so its residual points somewhere the first one doesn't. Better
-recall per <code>nprobe</code> than plain IVF, for roughly twice the posting-list size.
-Read the trade against <strong>query time</strong>, not against <code>nprobe</code>: at a fixed <code>nprobe</code>
-a spilled index scans about twice the candidates, so comparing at equal <code>nprobe</code>
-flatters it and answers nothing.</p>
+recall per <code>nprobe</code> than plain IVF, for twice the posting-list <em>entries</em>. That
+is a few per cent of index size rather than double, since the vectors
+themselves are stored once either way: 19.49 MB against IVF's 18.35 on the
+gaussian runs.</p>
+<p>Read the trade against <strong>query time</strong>, not against <code>nprobe</code>: at a fixed
+<code>nprobe</code> a spilled index scans about twice the candidates, so comparing at
+equal <code>nprobe</code> flatters it and answers nothing. At matched <code>nprobe</code> SOAR costs
+2.6 to 3.4x the query time.</p>
 <p><strong><code>KmknnIndex</code></strong> uses the same Voronoi structure but prunes with the triangle
 inequality instead of skipping cells outright, which is what makes it exact.
 Cosine normalises at build time and runs in Euclidean space internally.</p>
@@ -1228,18 +1247,28 @@ Cosine normalises at build time and runs in Euclidean space internally.</p>
 <p><strong><code>AnnoyIndex</code></strong> is a forest of random-projection trees. More trees means better
 recall and a larger index, and that's essentially the whole tuning story.</p>
 <p><strong><code>KdTreeIndex</code></strong> is the same trade with axis-aligned splits. A split is one
-coordinate comparison rather than a full dot product, so traversal and build are
-both cheaper than Annoy's. It's also the only tree index here that supports
-Manhattan.</p>
+coordinate comparison rather than a full dot product, so per tree the build,
+the query and the index are all cheaper than Annoy's. It's also the only tree
+index here that supports Manhattan.</p>
+<p>Per tree is not per recall. At 128 dimensions the random-projection splits
+carry more information each, and Annoy reaches 0.9864 in 492 ms total where
+KdTree needs 876 ms to get to 0.9920. At 32 dimensions the two are level.</p>
 <p><strong><code>BallTreeIndex</code></strong> prunes with the triangle inequality over nested
 hyperspheres, so one tree does the job of a forest. It pays off when the data
 has genuine cluster structure and the dimensionality is moderate. The default
-<code>search_budget</code> of 5% is fine at 32 dimensions, where it reaches 0.98 to 0.99
-recall on all four benchmark distributions, and thin in high dimensions, where
-it drops to 0.91 and 10% is the better starting point. Past 10% recall plateaus
-and query time doesn't fall, so there's no reason to go higher.</p>
-<p><strong><code>LshIndex</code></strong> is the cheapest index here to build and the weakest on recall.
-The projections are orthogonalised and the quantile boundaries are fitted to a
+<code>search_budget</code> of 5% is fine at 32 dimensions, where it reaches 0.9865 to
+0.9996 across the four distributions, and thin at 128, where it drops to 0.9135
+and 10% is the better starting point (0.9924).</p>
+<p>Past 10% recall plateaus exactly, to four decimal places, and query time
+doesn't fall, so there's no reason to go higher. Going from 5% to 10% at 32
+dimensions is nearly free, so treat 5% as the floor rather than the default to
+stay on.</p>
+<p><strong><code>LshIndex</code></strong> is the cheapest index here to build, by a wide margin: 15 to 30
+ms on the gaussian runs against the next cheapest at 61 ms. It is the weakest
+on recall <em>for the query time it costs</em>, which is not the same as having the
+lowest floor. Tuned up it does reach 1.0, and it is the one index here whose
+query can come out slower than brute force, so time it rather than assuming.</p>
+<p>The projections are orthogonalised and the quantile boundaries are fitted to a
 subsample rather than passing through the origin, which matters on data carrying
 a large shared mean offset. Foundation-model cell embeddings are exactly that
 case, and plain SimHash collapses on them.</p>
@@ -1250,6 +1279,8 @@ a fused per-query SIMD scan, which keeps each accumulation in registers but
 re-reads the whole database per query, and a blocked GEMM path that blocks both
 axes so a database tile is reused across a tile of queries. The self-kNN graph
 is the largest batch there is, which is exactly where the GEMM path wins.</p>
+<p>The dispatch is on batch size, and the threshold scales with your thread count
+rather than being a fixed number. Manhattan never takes the GEMM path at all.</p>
 <p>Its main job is still ground truth: build one, measure your approximate index
 against it, and only then decide whether the recall you're getting is the recall
 you need. But check the timings while you're there. Beating a blocked GEMM is a
@@ -1259,11 +1290,13 @@ higher bar than beating brute force.</p>
 The short version is that they store compressed vectors instead of floats, so
 they trade recall for memory, and that the distances they hand back are the
 codec's estimate rather than the distance.</p>
-<p>Reach for one when memory is what's binding. <code>HnswSq8uIndex</code> is the default
-answer: the usual first choice at a quarter of the vector memory, with the same
-<code>ef_search</code> knob. <code>IvfSq8Index</code> if you were already on <code>IvfIndex</code>. The PQ family
-when a quarter isn't enough of a saving, which in practice means a
-high-dimensional embedding space rather than a 30-dimensional PCA.</p>
+<p>Reach for one when memory is what's binding, and measure the recall before you
+commit. <code>HnswSq8uIndex</code> is the usual starting point, at a quarter of the
+<em>vector</em> memory with the same <code>ef_search</code> knob, but the codec is not cheap: on
+the benchmark runs it gives up 0.07 recall against plain HNSW on Euclidean and
+0.26 to 0.33 on cosine. <code>IvfSq8Index</code> if you were already on <code>IvfIndex</code>. The PQ
+family when a quarter isn't enough of a saving, which in practice means a
+high-dimensional embedding space.</p>
 <h2 id="measuring-rather-than-guessing">Measuring rather than guessing<a class="headerlink" href="#measuring-rather-than-guessing" title="Permanent link">&para;</a></h2>
 <p>None of the above tells you what recall you'll get on your data. The crate's
 benchmark tables sweep every index over four synthetic distributions with hard
@@ -1276,6 +1309,11 @@ numbers for build time, query time, recall and index size:</p>
 <p>Those runs use the same generators and seeds as
 <a href="../api/datasets/"><code>ann_search.datasets</code></a>, so a Python measurement and a
 <code>cargo run --example gridsearch_hnsw</code> run see identical points.</p>
+<p>Mind what they cover. The standard tables are 150k samples at 32 and 128
+dimensions, on one M1 Max, one run each. 128 dimensions only ever appears as
+the cell-embedding generator, so dimensionality and distribution move together
+and nothing above separates the two. Every "in high dimensions" statement on
+this page inherits that.</p>
 <p>Don't extrapolate ideal parameters for your own problem from them. Do the
 measurement: <a href="../quickstart/">Quickstart</a> has the recipe.</p>
 

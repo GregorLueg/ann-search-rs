@@ -479,6 +479,17 @@
 </li>
       
         <li class="md-nav__item">
+  <a href="#dtypes" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Dtypes
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
   <a href="#padding" class="md-nav__link">
     <span class="md-ellipsis">
       
@@ -850,6 +861,17 @@
 </li>
       
         <li class="md-nav__item">
+  <a href="#dtypes" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Dtypes
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
   <a href="#padding" class="md-nav__link">
     <span class="md-ellipsis">
       
@@ -974,7 +996,7 @@ is free and preserves ordering.</p>
 squared Euclidean and warn to a stdout you can't see, which is a much worse
 failure across FFI than a loud one. Nothing in this package sends the core a
 string it hasn't already validated.</p>
-<p>Nineteen indices don't support Manhattan, the eleven quantised ones included:
+<p>Twenty indices don't support Manhattan, the eleven quantised ones included:
 every codec there is built on inner products, which is what makes the integer
 arithmetic work. See the <a href="../choosing/#the-table">table</a>; asking for it raises
 rather than falling back.</p>
@@ -984,6 +1006,13 @@ a distance, not the distance. Close enough to rank on, which is what an index
 is for, and not something to feed anywhere the absolute value matters without
 checking it against <code>ExhaustiveIndex</code> first. Recall is the honest way to
 compare two of them.</p>
+<h2 id="dtypes">Dtypes<a class="headerlink" href="#dtypes" title="Permanent link">&para;</a></h2>
+<p><code>fit</code> keeps float32 and float64 as they come, and the index remembers which it
+got. A query array in the other precision is converted to match, quietly: query
+a float32 index with float64 and the queries are narrowed. It costs precision
+in the distances, not correctness in the ranking, but nothing warns you.</p>
+<p>The three GPU indices narrow at <code>fit</code> as well, since WGSL has no float64. That
+one is unavoidable rather than a convenience.</p>
 <h2 id="padding">Padding<a class="headerlink" href="#padding" title="Permanent link">&para;</a></h2>
 <p>Approximate indices can return fewer than <code>k</code> neighbours for a query. Those
 slots come back as index <code>-1</code> and distance <code>inf</code>. Mask on <code>indices &gt;= 0</code> before

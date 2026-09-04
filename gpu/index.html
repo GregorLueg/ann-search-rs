@@ -430,6 +430,17 @@
     <ul class="md-nav__list" data-md-component="toc" data-md-scrollfix>
       
         <li class="md-nav__item">
+  <a href="#when-cagra-is-worth-the-build" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        When CAGRA is worth the build
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
   <a href="#three-differences-all-forced-by-the-backend" class="md-nav__link">
     <span class="md-ellipsis">
       
@@ -773,6 +784,17 @@
     <ul class="md-nav__list" data-md-component="toc" data-md-scrollfix>
       
         <li class="md-nav__item">
+  <a href="#when-cagra-is-worth-the-build" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        When CAGRA is worth the build
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
   <a href="#three-differences-all-forced-by-the-backend" class="md-nav__link">
     <span class="md-ellipsis">
       
@@ -888,9 +910,22 @@ this machine. The backend is wgpu, so that means Metal on macOS and Vulkan or
 DX12 elsewhere. There's no CUDA runtime to install and nothing extra to
 <code>pip install</code>. On a box with no GPU it returns False and the CPU estimators are
 unaffected.</p>
+<h2 id="when-cagra-is-worth-the-build">When CAGRA is worth the build<a class="headerlink" href="#when-cagra-is-worth-the-build" title="Permanent link">&para;</a></h2>
+<p>The graph costs 1.3 to 3.2 seconds to build on the benchmark shapes, and that
+dominates until the dataset is large. For one query batch of 250k points at 128
+dimensions <code>ExhaustiveGpuIndex</code> finishes the whole job in 2.4 s against CAGRA's
+3.2 s, so the exact index wins outright. By 500k at 64 dimensions it reverses,
+3.7 s against 5.4 s. Recall moves with size too: 0.95 to 0.97 at 150k in 32
+dimensions, against 0.9999 at 250k in 64.</p>
+<p>The graph is also not small. It holds 2 to 3x the memory of the raw vectors,
+on top of the vectors themselves.</p>
+<p>Build it when you're querying repeatedly, or when <code>n</code> is past a few hundred
+thousand. For a single ground-truth pass, use <code>ExhaustiveGpuIndex</code>.</p>
 <h2 id="three-differences-all-forced-by-the-backend">Three differences, all forced by the backend<a class="headerlink" href="#three-differences-all-forced-by-the-backend" title="Permanent link">&para;</a></h2>
 <p><strong>float32 only.</strong> WGSL has no float64, so <code>fit</code> narrows rather than failing
-somewhere inside a kernel. It's the only silent narrowing this package does.</p>
+somewhere inside a kernel. Note it isn't the only narrowing in the package: a
+float64 query against a float32 index is narrowed too, on every index. See the
+<a href="../guide/#dtypes">Guide</a>.</p>
 <p><strong>No persistence.</strong> These hold device buffers and sit outside the crate's
 <code>serialise</code> feature, so <code>save</code>, <code>load</code> and pickle raise <code>NotImplementedError</code>.
 Rebuild instead.</p>
@@ -898,13 +933,21 @@ Rebuild instead.</p>
 <h2 id="thread-safety">Thread safety<a class="headerlink" href="#thread-safety" title="Permanent link">&para;</a></h2>
 <p>A fitted <code>CagraGpuIndex</code> is the one index here that isn't safe to query from two
 threads at once. The beam search memoises its upload of the navigational graph
-behind a mutable borrow, so concurrent calls serialise. <code>extract_knn</code> is exempt,
-and the other two GPU indices are fine.</p>
+behind a mutable borrow, and the GIL is released while the kernel runs, so a
+second thread entering <code>kneighbors</code> doesn't queue behind the first: it raises.
+Give each thread its own handle.</p>
+<p><code>extract_knn</code> takes a shared borrow, so it never causes the conflict, though it
+can still hit one raised by a concurrent query. The other two GPU indices are
+fine.</p>
 <h2 id="getting-ground-truth-cheaply">Getting ground truth cheaply<a class="headerlink" href="#getting-ground-truth-cheaply" title="Permanent link">&para;</a></h2>
 <p><code>ExhaustiveGpuIndex</code> is exact by construction and has no build-time knobs at
 all: the data goes up, the norms get recorded, and that's the index. On a
 dataset too large to score on the CPU it's the cheapest route to the truth you
 need for a recall measurement.</p>
+<p>Don't expect an order of magnitude out of it. On the M1 Max the benchmarks ran
+on it comes out around 1.7x faster than the CPU exhaustive path (250k points at
+64 dimensions: 1.44 s against 2.41 s). On Apple Silicon the GPU rarely blows
+the CPU out of the water. A discrete card with real bandwidth will do better.</p>
 <div class="highlight"><pre><span></span><code><a id="__codelineno-1-1" name="__codelineno-1-1" href="#__codelineno-1-1"></a><span class="n">truth</span> <span class="o">=</span> <span class="n">ann</span><span class="o">.</span><span class="n">ExhaustiveGpuIndex</span><span class="p">(</span><span class="n">n_neighbors</span><span class="o">=</span><span class="mi">15</span><span class="p">)</span><span class="o">.</span><span class="n">fit</span><span class="p">(</span><span class="n">X</span><span class="p">)</span><span class="o">.</span><span class="n">kneighbors</span><span class="p">(</span><span class="n">return_distance</span><span class="o">=</span><span class="kc">False</span><span class="p">)</span>
 </code></pre></div>
 <h2 id="the-cagra-beam-is-all-or-nothing">The CAGRA beam is all-or-nothing<a class="headerlink" href="#the-cagra-beam-is-all-or-nothing" title="Permanent link">&para;</a></h2>
@@ -932,10 +975,10 @@ you touch one, set <code>beam_width</code> too.</p>
 <a id="__codelineno-2-8" name="__codelineno-2-8" href="#__codelineno-2-8"></a><span class="n">index</span><span class="o">.</span><span class="n">kneighbors</span><span class="p">(</span><span class="n">Q</span><span class="p">,</span> <span class="n">n_entry_points</span><span class="o">=</span><span class="mi">16</span><span class="p">)</span>
 </code></pre></div>
 <h2 id="a-cpu-only-build">A CPU-only build<a class="headerlink" href="#a-cpu-only-build" title="Permanent link">&para;</a></h2>
-<p>GPU support is compiled in by default and costs about 3 MB of wheel, 4.9 MB
-against 1.7 MB. That seemed the better trade than a second distribution: wgpu
-has no driver runtime to ship, and the alternative is a version pin between two
-packages that can drift.</p>
+<p>GPU support is compiled in by default and costs roughly 3 MB of wheel. That
+seemed the better trade than a second distribution: wgpu has no driver runtime
+to ship, and the alternative is a version pin between two packages that can
+drift.</p>
 <p>It's fixed at wheel-build time, so a Python extra can't switch it. Extras only
 add Python requirements; they never change the compiled artefact. If the
 megabytes matter, build from source without it:</p>

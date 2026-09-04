@@ -1632,9 +1632,13 @@ that lands in the terminal running the kernel.</p>
 
 
         <p>Hierarchical navigable small world graph.</p>
-<p>The usual first choice: high recall at low query latency, at the cost of a
-slower build and a graph roughly <code>m</code> edges per node wide. Raise
-<code>ef_search</code> for recall, <code>ef_construction</code> for a better graph.</p>
+<p>The usual first choice: high recall at low query latency, for a graph
+roughly <code>m</code> edges per node wide. Raise <code>ef_search</code> for recall,
+<code>ef_construction</code> for a better graph. The second one is what the build cost
+is actually sensitive to.</p>
+<p>Cheapest of the graph indices here to build at its cheapest setting. That
+ordering does not survive matching on recall, where <code>VamanaIndex</code> can come
+out ahead.</p>
 
 
 <p><span class="doc-section-title">Parameters:</span></p>
@@ -1831,7 +1835,9 @@ that lands in the terminal running the kernel.</p>
         <p>Inverted file index over k-means Voronoi cells.</p>
 <p>Cheap to build and easy to tune: <code>nlist</code> sets how finely the space is cut,
 <code>nprobe</code> how many cells a query visits. Both default to the crate's own
-heuristics when left as <code>None</code>.</p>
+heuristics when left as <code>None</code>. The smallest of the approximate
+unquantised indices: it holds the vectors and a permutation, and little
+else. Manhattan is not supported.</p>
 
 
 <p><span class="doc-section-title">Parameters:</span></p>
@@ -1871,8 +1877,7 @@ heuristics when left as <code>None</code>.</p>
             </td>
             <td>
               <div class="doc-md-description">
-                <p><code>"euclidean"</code>/<code>"l2"</code>, <code>"sqeuclidean"</code>, <code>"cosine"</code> or
-<code>"manhattan"</code>/<code>"l1"</code>.</p>
+                <p><code>"euclidean"</code>/<code>"l2"</code>, <code>"sqeuclidean"</code> or <code>"cosine"</code>.</p>
               </div>
             </td>
             <td>
@@ -2046,9 +2051,14 @@ that lands in the terminal running the kernel.</p>
 
 
         <p>NN-Descent kNN graph.</p>
-<p>Builds the neighbour graph directly by iterative local join, which makes it
-the fastest route to a full self-kNN graph. <code>n_neighbors</code> is used at build
-time as well as at query time, so changing it means rebuilding.</p>
+<p>Builds the neighbour graph directly by iterative local join. <code>n_neighbors</code>
+is used at build time as well as at query time, so changing it means
+rebuilding.</p>
+<p>Whether it is the quickest route to a self-kNN graph depends on the shape.
+On the benchmark runs it wins at 128 dimensions, where <code>extract_knn</code>
+reaches recall 1.0 in roughly half the time <code>KmknnIndex</code> needs. At 32
+dimensions <code>KmknnIndex</code> and <code>IvfIndex</code> get there first, exactly. Measure
+both on your data.</p>
 <p><code>diversify_prob</code> prunes redundant edges after descent: <code>0.0</code> disables it,
 <code>1.0</code> prunes whenever the rule fires.</p>
 <p><code>extract_knn</code> hands back the converged graph instead of searching for it
@@ -2305,7 +2315,9 @@ that lands in the terminal running the kernel.</p>
 
         <p>Vamana graph, as in DiskANN.</p>
 <p>A single flat graph of out-degree <code>r</code>, pruned in two passes with the
-relaxed-neighbour rule. Builds faster than HNSW at comparable recall.</p>
+relaxed-neighbour rule. Builds slower than HNSW at its cheapest setting,
+though the gap closes once you match on recall. The index runs a few per
+cent smaller than HNSW's, and <code>NsgIndex</code> is smaller than both.</p>
 
 
 <p><span class="doc-section-title">Parameters:</span></p>
@@ -2817,8 +2829,10 @@ raise it for recall. Manhattan is not supported.</p>
             <td>
               <div class="doc-md-description">
                 <p>Points to inspect per query, the recall knob. <code>None</code>
-defaults to 5% of the indexed points, which is thin on small
-datasets: try 10% if recall matters more than latency.
+defaults to 5% of the indexed points. That holds up at 32
+dimensions and goes thin higher up, where it drops to about 0.91
+recall and 10% is the better starting point. Past 10% recall
+plateaus and query time does not fall.
 Search-time: override it per call as
 <code>index.kneighbors(search_budget=5000)</code>.</p>
               </div>
@@ -3105,10 +3119,13 @@ not exposed here.</p>
 
 
         <p>Multi-probe locality-sensitive hashing over random projections.</p>
-<p>The cheapest index to build here, and the weakest on recall. Lower
-<code>bits_per_hash</code> widens the buckets, trading query time for recall;
-<code>num_tables</code> trades index size for recall. <code>n_probe</code> defaults to one probe
-per projection. Manhattan is not supported.</p>
+<p>The cheapest index to build here by a wide margin, and the weakest on
+recall for the query time it costs. Lower <code>bits_per_hash</code> widens the
+buckets, trading query time for recall; <code>num_tables</code> trades index size for
+recall. <code>n_probe</code> defaults to one probe per projection. Manhattan is not
+supported.</p>
+<p>It is also the one index here whose query can come out slower than brute
+force, so time it rather than assuming.</p>
 
 
 <p><span class="doc-section-title">Parameters:</span></p>
@@ -3340,7 +3357,10 @@ that lands in the terminal running the kernel.</p>
         <p>IVF with spilling, as in Google's SOAR.</p>
 <p>Every point also lands in a second cell, picked by a rule that accounts for
 the residual it already carries in its primary cell. That buys recall at a
-given <code>nprobe</code> over plain IVF, for roughly twice the posting-list size.</p>
+given <code>nprobe</code> over plain IVF, for twice the posting-list entries.</p>
+<p>Read that trade against query time, not against <code>nprobe</code>. At a fixed
+<code>nprobe</code> a spilled index scans about twice the candidates, so comparing at
+equal <code>nprobe</code> flatters it and answers nothing.</p>
 <p><code>rule</code> is one of <code>"nearest"</code>, <code>"shifted"</code> or <code>"orthogonal"</code>, and
 <code>None</code> lets the core choose per metric: orthogonal for cosine, shifted
 otherwise. <code>rule_param</code> is <code>mu</code> for shifted and <code>lambda</code> for
@@ -3402,8 +3422,9 @@ supported.</p>
             <td>
               <div class="doc-md-description">
                 <p>Number of Voronoi cells to cut the space into. <code>None</code> defaults
-to <code>sqrt(n)</code>. Spilling doubles the posting lists on top of this,
-so the memory is roughly twice an <code>IvfIndex</code> at the same <code>nlist</code>.</p>
+to <code>sqrt(n)</code>. Spilling doubles the posting-list <em>entries</em> on top
+of this, which is a few per cent of index size rather than double:
+the vectors are stored once either way.</p>
               </div>
             </td>
             <td>
@@ -3617,9 +3638,11 @@ that lands in the terminal running the kernel.</p>
 
         <p>Relative NN-Descent graph.</p>
 <p>Builds and prunes in one pass, reaching a sparse navigable graph without
-the separate NSG-style refinement step, so it is the cheapest route to a
-graph index. <code>r</code> caps the out-degree and is the main size knob; <code>ef_search</code>
-is the main recall knob.</p>
+the separate NSG-style refinement step. That saves it the double build
+<code>NsgIndex</code> pays, though <code>HnswIndex</code> still builds faster. <code>r</code> caps the
+out-degree and is the main size knob; <code>ef_search</code> is the main recall knob.</p>
+<p>On the benchmark gaussian runs it tops out around 0.97 recall, so check it
+reaches what you need before committing to it.</p>
 
 
 <p><span class="doc-section-title">Parameters:</span></p>

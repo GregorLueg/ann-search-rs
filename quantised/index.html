@@ -910,20 +910,41 @@ Asking for it raises rather than falling back.</p>
 <p><code>ExhaustiveBf16Index</code>, <code>IvfBf16Index</code>.</p>
 <p>Storage drops to <code>bf16</code>, which keeps float32's exponent range and throws away
 mantissa bits from roughly the third significant digit on. Half the memory, no
-overflow traps, and nothing else in the index changes. The cheapest
+overflow traps, and nothing structural in the index changes. The cheapest
 quantisation to reason about and the one with the least to go wrong, which also
 makes it the smallest saving.</p>
+<p>Two things do change. Distances are computed in float32, so the values get
+widened back on every comparison and the query comes out around 2x slower at 32
+dimensions and 4x slower at 128. And the codec error is not negligible: recall
+lands near 0.98 on Euclidean and 0.89 on cosine. Under IVF it does not hide
+inside the cell pruning either, since plain IVF already reaches 1.0 on the
+correlated and low-rank generators, so the codec error is the whole error.</p>
 <h3 id="sq8">SQ8<a class="headerlink" href="#sq8" title="Permanent link">&para;</a></h3>
 <p><code>ExhaustiveSq8Index</code>, <code>IvfSq8Index</code>, <code>HnswSq8uIndex</code>.</p>
 <p>One byte per dimension, with per-dimension offsets and a single scale shared
 across all of them. The shared scale is the whole trick: it makes the integer
 code distance preserve the ordering of the float one, so the scan runs entirely
-on <code>u8</code> kernels. A quarter of the memory, and the query usually comes out
-<em>faster</em> than the float version rather than slower.</p>
+on <code>u8</code> kernels.</p>
+<p>The memory saving is about 3.5x at 32 dimensions and 3.9x at 128, so "a
+quarter" is the high-dimensional case rather than the general one. The speed
+depends on which index you put it under. Exhaustive SQ8 is <em>slower</em> than the
+float scan at 32 dimensions, by up to 1.5x, and only edges ahead at 128. Under
+IVF it wins consistently, 1.15 to 1.5x on every matched <code>nlist</code>/<code>nprobe</code>
+pairing.</p>
+<p>The recall cost is the thing to measure. At a fixed <code>nprobe</code> <code>IvfSq8Index</code>
+gives up around 0.07 against plain IVF on gaussian Euclidean data, 0.21 on the
+low-rank generator and 0.26 on cosine.</p>
 <p><code>HnswSq8uIndex</code> is the interesting one. The graph is built and searched
 entirely on codes, so there's no float copy sitting around for re-ranking and
-no mismatch between the edges and the distances that traverse them. If you want
-one quantised index and no further reading, take this one.</p>
+no mismatch between the edges and the distances that traverse them. Build and
+query are both faster than a plain <code>HnswIndex</code>.</p>
+<p>It is the usual starting point, not a free win. The graph edges aren't
+compressed, so the whole index lands at 0.44 to 0.80 of a plain HNSW depending
+on <code>m</code> and dimensionality rather than at a quarter, and at matched <code>m</code>,
+<code>ef_construction</code> and <code>ef_search</code> it gives up 0.07 recall on Euclidean and 0.26
+to 0.33 on cosine. Its recall tracks <code>ExhaustiveSq8Index</code> almost exactly, which
+tells you the loss is the codec rather than the graph. Measure it against
+<code>HnswIndex</code> before taking the memory.</p>
 <p>Two knobs worth knowing. <code>quant_drop_ratio</code> trims a fraction from each tail of
 every dimension before the range is fixed, so a handful of outliers can't
 stretch the range and waste code levels. <code>quant_sample_rows</code> caps how many rows
@@ -934,29 +955,41 @@ the calibration looks at.</p>
 <p>Each vector is cut into <code>m</code> subvectors, and each subvector is replaced by the
 id of its nearest sub-codebook centroid. A vector costs <code>m</code> bytes. At <code>dim=512</code>
 and <code>m=64</code> that's 64 bytes against 2 KB, and the recall reflects it.</p>
-<p>This is a method for high-dimensional embedding spaces. On a 30-dimensional PCA
-<code>ExhaustiveSq8Index</code> will beat it on both memory and recall, because there is
-nothing left to exploit once the dimensions are already decorrelated and few.</p>
-<p><code>m</code> has to divide <code>dim</code>. <code>n_pq_centroids</code> defaults to 256, which is what makes
-a code fit in a byte, and cannot exceed your sample count, so a small dataset
-needs it lowered.</p>
+<p>This is a method for high-dimensional embedding spaces: the whole point is
+exploiting correlation between coordinates, and a PCA output has already spent
+most of that. The benchmark tables don't settle where the crossover with
+<code>ExhaustiveSq8Index</code> sits, since the PQ family is only run at 256 dimensions
+and up and SQ8 only at 32 and 128. Measure it if you are near the boundary.</p>
+<p><code>m</code> has to divide <code>dim</code>, and <code>dim</code> has to be at least 32. <code>n_pq_centroids</code>
+defaults to 256, which is what makes a code fit in a byte; it cannot exceed 256
+and cannot exceed your sample count, so a small dataset needs it lowered.</p>
 <p><strong>OPQ</strong> adds a learned orthogonal rotation before the split. Plain PQ splits on
 whatever axis order the data arrived in, so a space with variance concentrated
 in a few coordinates gets subspaces of wildly unequal difficulty. The rotation
-spreads it. Costs more at build time (<code>opq_iters</code> is the knob) and nothing at
-query time, since the rotation folds into the query once. Worth it on a raw
-embedding space, rarely worth it after a PCA has already done the rotating.</p>
+spreads it, and it buys recall everywhere it was measured: +0.01 to +0.19 over
+plain PQ depending on the generator.</p>
+<p>It isn't free at either end. Build costs 3 to 5x (<code>opq_iters</code> is the knob), and
+the rotation has to be applied to every query, which runs from 1.1x the query
+time at 256 dimensions to 3.1x at 768. It also stores a <code>dim x dim</code> matrix, so
+the index is larger than the plain PQ equivalent.</p>
 <p><strong>The IVF variants</strong> learn the codes on the residual from the cell centroid
 rather than on the vector, so the sub-codebooks only have to cover within-cell
 spread. That's why <code>IvfPqIndex</code> reaches better recall than <code>ExhaustivePqIndex</code>
-at the same <code>m</code>, on top of scanning fewer candidates.</p>
+at the same <code>m</code>, on top of scanning fewer candidates. It holds on every
+generator in the tables, and costs about 2.2x the build time.</p>
 <p><strong>The SOAR variants</strong> spill every vector into a second cell chosen so its
 residual points somewhere the first one doesn't, fixing IVF's main failure of a
-true neighbour sitting just over a cell boundary. Roughly twice the
-posting-list size, which is exactly what quantisation makes affordable. Read
-that trade against query time, not against <code>nprobe</code>: at a fixed <code>nprobe</code> a
-spilled index scans about twice the candidates, so comparing at equal <code>nprobe</code>
-flatters it and answers nothing.</p>
+true neighbour sitting just over a cell boundary. Twice the posting-list
+entries, which is exactly what quantisation makes affordable. Read that trade
+against query time, not against <code>nprobe</code>: at a fixed <code>nprobe</code> a spilled index
+scans about twice the candidates, so comparing at equal <code>nprobe</code> flatters it
+and answers nothing.</p>
+<p>Unlike the unquantised <code>SoarIndex</code>, here the doubling really does show up in
+the index size, because the codes <em>are</em> the storage: <code>SoarPqIndex</code> runs about
+2x an <code>IvfPqIndex</code> at the same <code>m</code>. <code>SoarOpqIndex</code> is the largest index of the
+eleven, not the smallest, since it pays for the spilling and the rotation
+matrix both. An <code>IvfOpqIndex</code> at twice the <code>m</code> is smaller and quicker to build
+at matching memory.</p>
 <h2 id="picking-one">Picking one<a class="headerlink" href="#picking-one" title="Permanent link">&para;</a></h2>
 <div class="highlight"><pre><span></span><code><a id="__codelineno-0-1" name="__codelineno-0-1" href="#__codelineno-0-1"></a><span class="kn">import</span><span class="w"> </span><span class="nn">ann_search</span><span class="w"> </span><span class="k">as</span><span class="w"> </span><span class="nn">ann</span>
 <a id="__codelineno-0-2" name="__codelineno-0-2" href="#__codelineno-0-2"></a>

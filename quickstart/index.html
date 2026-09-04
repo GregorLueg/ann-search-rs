@@ -910,9 +910,11 @@ than re-entering the index from outside with its own points.</p>
 <p>Start with ground truth:</p>
 <div class="highlight"><pre><span></span><code><a id="__codelineno-2-1" name="__codelineno-2-1" href="#__codelineno-2-1"></a><span class="n">truth</span> <span class="o">=</span> <span class="n">ann</span><span class="o">.</span><span class="n">ExhaustiveIndex</span><span class="p">(</span><span class="n">n_neighbors</span><span class="o">=</span><span class="mi">15</span><span class="p">)</span><span class="o">.</span><span class="n">fit</span><span class="p">(</span><span class="n">X</span><span class="p">)</span><span class="o">.</span><span class="n">kneighbors</span><span class="p">(</span><span class="n">return_distance</span><span class="o">=</span><span class="kc">False</span><span class="p">)</span>
 </code></pre></div>
-<p><code>ExhaustiveIndex</code> is exact, so that's the target. It is not a naive scan either:
-the self-kNN graph is the largest batch there is, which is where the blocked
-GEMM path wins.</p>
+<p><code>ExhaustiveIndex</code> is exact, so that's the target. It is not a naive scan
+either: past a batch-size threshold it switches from a fused per-query SIMD
+scan to a blocked GEMM that reuses each database tile across a tile of queries.
+The self-kNN graph is the largest batch there is, so it always takes that
+path.</p>
 <p>Now sweep the recall knob. <code>ef_search</code> is a search-time parameter, so one fitted
 index answers the whole sweep:</p>
 <div class="highlight"><pre><span></span><code><a id="__codelineno-3-1" name="__codelineno-3-1" href="#__codelineno-3-1"></a><span class="n">index</span> <span class="o">=</span> <span class="n">ann</span><span class="o">.</span><span class="n">HnswIndex</span><span class="p">(</span><span class="n">n_neighbors</span><span class="o">=</span><span class="mi">15</span><span class="p">,</span> <span class="n">m</span><span class="o">=</span><span class="mi">16</span><span class="p">,</span> <span class="n">ef_construction</span><span class="o">=</span><span class="mi">200</span><span class="p">)</span><span class="o">.</span><span class="n">fit</span><span class="p">(</span><span class="n">X</span><span class="p">)</span>
@@ -942,9 +944,13 @@ pass:</p>
 <p>Worth noticing: that beats HNSW at <code>ef_search=200</code> on the same data, off a build
 of comparable cost. <code>kneighbors()</code> on the same index reaches 0.9987.</p>
 <p><code>extract_knn</code> reads the graph the descent already built. <code>kneighbors()</code> on the
-same index runs a beam search over it instead, which costs more and usually
-recovers a little recall. The gap between the two is exactly what the search
-buys you.</p>
+same index runs a beam search over it instead, which costs more and recovers a
+little recall. The gap between the two is exactly what the search buys you.</p>
+<p>One thing that makes the comparison above honest: a kNN graph stores no
+self-edge, but <code>ExhaustiveIndex</code> counts a point as its own nearest neighbour at
+distance zero. <code>extract_knn</code> defaults to <code>include_self=True</code> so both sides use
+a slot for it. Pass <code>include_self=False</code> and recall against this ground truth
+caps at 14/15.</p>
 <h2 id="2-cross-set-queries-and-padding">2. Cross-set queries and padding<a class="headerlink" href="#2-cross-set-queries-and-padding" title="Permanent link">&para;</a></h2>
 <p>Querying an index with rows it was built from flatters it: every query has an
 exact hit at distance zero. <code>subsample_queries</code> draws a query set and perturbs
