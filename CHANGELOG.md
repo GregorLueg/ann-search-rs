@@ -1,29 +1,15 @@
 # News
 
+Changes to the `ann-search-rs` crate. The Python package `ann-search` has its
+own changelog at [`python/CHANGELOG.md`](python/CHANGELOG.md).
+
 ## 0.8.2
 
 **Features**
 
 - Faster RNN implementation and different grid search.
 
-**Python**
-
-- Documentation updates where out-of-date things were claimed.
-- Wiring in the faster RNN from the Rust parent package.
-
 ## 0.8.1
-
-**Python**
-
-- The eleven quantised indices are now bound: `ExhaustiveBf16Index`,
-  `IvfBf16Index`, `ExhaustiveSq8Index`, `IvfSq8Index`, `HnswSq8uIndex`,
-  `ExhaustivePqIndex`, `IvfPqIndex`, `ExhaustiveOpqIndex`, `IvfOpqIndex`,
-  `SoarPqIndex`, `SoarOpqIndex`. Same four-method surface as the rest, save /
-  load / pickle included, float32 and float64 both supported. Shipped as
-  `ann-search` 0.2.0. The binary indices are not bound yet.
-- Python docs corrected against the regenerated benchmark tables. HNSW is now
-  the cheapest graph index to build rather than the most expensive, which
-  reversed three separate claims in `choosing.md`.
 
 **Fixes**
 
@@ -66,12 +52,6 @@ Shipped in a patch deliberately.
   `ann-search-rs/gpu` enabling `cubecl/cpu`.
 
 ## 0.7.0
-
-**Python**
-
-- Python bindings under `python/`, built with PyO3 and maturin. scikit-learn
-  shaped estimators over the CPU indices, plus the synthetic generators below.
-  Not published yet, but installable from the repo.
 
 **Features**
 

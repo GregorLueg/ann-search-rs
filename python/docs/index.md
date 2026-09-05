@@ -54,3 +54,6 @@ that.
   edges.
 - [API reference](api/indices.md) for every parameter of every index, with what
   each `None` default resolves to.
+- [Changelog](https://github.com/GregorLueg/ann-search-rs/blob/main/python/CHANGELOG.md)
+  for what changed in this package. It versions separately from the Rust crate,
+  which keeps its own.

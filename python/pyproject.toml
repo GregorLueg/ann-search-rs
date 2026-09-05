@@ -20,7 +20,7 @@ classifiers = [
 [project.urls]
 Documentation = "https://gregorlueg.github.io/ann-search-rs/"
 Repository = "https://github.com/GregorLueg/ann-search-rs"
-Changelog = "https://github.com/GregorLueg/ann-search-rs/blob/main/CHANGELOG.md"
+Changelog = "https://github.com/GregorLueg/ann-search-rs/blob/main/python/CHANGELOG.md"
 
 [project.optional-dependencies]
 # `kneighbors_graph` / `transform` only. Everything else runs on numpy alone.
