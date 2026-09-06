@@ -11,6 +11,11 @@ shaped layer over it.
 
 **Documentation: <https://gregorlueg.github.io/ann-search-rs/>**
 
+This package versions separately from the Rust crate. Changes here are in
+[`python/CHANGELOG.md`](https://github.com/GregorLueg/ann-search-rs/blob/main/python/CHANGELOG.md);
+the crate's are in
+[`CHANGELOG.md`](https://github.com/GregorLueg/ann-search-rs/blob/main/CHANGELOG.md).
+
 ## Install
 
 ```bash
