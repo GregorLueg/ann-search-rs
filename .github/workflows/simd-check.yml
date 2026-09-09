@@ -1,11 +1,18 @@
 name: SIMD codegen and x86 benchmark
 
-# Manual only. Two things that cannot be checked from an Apple Silicon
-# machine: what instructions the x86_64 build actually emits, and what the
-# wider vector paths are worth on real x86 hardware.
+# Two things that cannot be checked from an Apple Silicon machine: what
+# instructions the x86_64 build actually emits, and what the wider vector paths
+# are worth on real x86 hardware.
 #
 # GitHub's standard runners are AVX2+FMA and have no AVX-512, so the 512-bit
 # kernels get compile coverage and a codegen count here, never a timing.
+#
+# The codegen guard runs on every pull request that touches the SIMD code. The
+# benchmark does not: it is minutes of runner time and the answer only changes
+# when a kernel does, so it wants asking for. `workflow_dispatch` is the usual
+# way, but GitHub only registers a dispatchable workflow once it is on the
+# default branch, so before this file merges the way to get a timing is the
+# `simd-bench` label on the pull request.
 
 on:
   workflow_dispatch:
@@ -14,6 +21,13 @@ on:
         description: Run the gridsearch timings as well as the codegen count.
         type: boolean
         default: true
+  pull_request:
+    branches: [ main ]
+    paths:
+      - 'src/utils/dist.rs'
+      - 'src/binary/dist_binary.rs'
+      - 'src/binary/turboquant/**'
+      - '.github/workflows/simd-check.yml'
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -41,7 +55,7 @@ jobs:
 
       - name: Count vector instructions
         run: |
-          asm=$(ls -t target/release/deps/ann_search_rs-*.s | head -1)
+          asm=$(find target/release/deps -name 'ann_search_rs-*.s' | sort | tail -1)
           echo "asm: $asm"
           for insn in ymm zmm vfmadd popcnt xmm; do
             printf '%-8s %s\n' "$insn" "$(grep -c "$insn" "$asm" || true)"
@@ -60,7 +74,9 @@ jobs:
   # number, and the published tables in docs/ are where absolute numbers live.
   bench:
     name: gridsearch (${{ matrix.label }})
-    if: inputs.bench
+    if: >-
+      inputs.bench ||
+      contains(github.event.pull_request.labels.*.name, 'simd-bench')
     runs-on: ubuntu-latest
     timeout-minutes: 60
     strategy:
