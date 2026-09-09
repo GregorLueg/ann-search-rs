@@ -32,8 +32,12 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
 
+      # Deliberately without `binary`: `dist_binary.rs` and `turboquant/` were
+      # already emitting AVX2 and AVX-512 when `dist.rs` was not, so a build
+      # carrying them satisfies the assertion below no matter what `dist.rs`
+      # does. This feature set makes the guard load-bearing.
       - name: Emit asm for the default build
-        run: cargo rustc --release --lib --features quantised,binary -- --emit asm
+        run: cargo rustc --release --lib --features quantised -- --emit asm
 
       - name: Count vector instructions
         run: |
