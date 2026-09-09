@@ -3,6 +3,12 @@
 Changes to the `ann-search-rs` crate. The Python package `ann-search` has its
 own changelog at [`python/CHANGELOG.md`](python/CHANGELOG.md).
 
+## 0.8.3
+
+**Fix**
+
+- avx2 and avx512 SIMD wired in properly for x86_64.
+
 ## 0.8.2
 
 **Features**
