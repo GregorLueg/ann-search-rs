@@ -11,14 +11,15 @@ use std::iter::Sum;
 use std::sync::OnceLock;
 use wide::{f32x4, f32x8, f64x2, f64x4, CmpEq};
 
+#[cfg(target_arch = "x86_64")]
+use std::arch::x86_64::*;
+
 #[cfg(feature = "quantised")]
 use half::bf16;
 #[cfg(feature = "quantised")]
 use num_traits::{FromPrimitive, ToPrimitive};
 #[cfg(all(feature = "quantised", target_arch = "aarch64"))]
 use std::arch::aarch64::*;
-#[cfg(all(feature = "quantised", target_arch = "x86_64"))]
-use std::arch::x86_64::*;
 
 ////////////////////
 // Tuning knobs //
@@ -130,6 +131,16 @@ pub fn parse_ann_dist(s: &str) -> Option<Dist> {
 //////////////////////
 
 /// Enum for the different architectures and potential SIMD levels
+///
+/// A level only means what the kernel it selects was compiled for. The 256- and
+/// 512-bit kernels have to be hand-written against `std::arch` and carry a
+/// `#[target_feature]` attribute to be real: `wide` picks its vector width from
+/// `#[cfg(target_feature = "avx")]`, so on a crate built for the x86-64 baseline
+/// its `f32x8` is a pair of `f32x4` and every operation on it is two SSE ops.
+/// [`SimdLevel::Avx2`] currently selects a genuine AVX2+FMA kernel for the f32
+/// euclidean, dot, manhattan and batch-4 families and for bf16; everything else
+/// (canberra, subtract, add, the norms, and all of f64) still runs the `wide`
+/// body there, which is 128-bit. [`SimdLevel::Avx512`] is real throughout.
 #[derive(Clone, Copy, Debug)]
 pub enum SimdLevel {
     /// Scalar version
@@ -156,6 +167,11 @@ static SIMD_LEVEL: OnceLock<SimdLevel> = OnceLock::new();
 /// kernel is only a couple of dozen SIMD instructions, so that overhead was a
 /// significant fraction of it.
 ///
+/// FMA is probed alongside AVX2 because the 256- and 512-bit kernels are
+/// compiled with `#[target_feature(enable = "avx2,fma")]` and use
+/// `_mm256_fmadd_ps`. Every part with AVX2 has FMA, but the level has to
+/// promise what the kernels it selects actually require.
+///
 /// ### Returns
 ///
 /// The widest SIMD level available on this target.
@@ -163,10 +179,10 @@ static SIMD_LEVEL: OnceLock<SimdLevel> = OnceLock::new();
 #[inline(always)]
 pub fn detect_simd_level() -> SimdLevel {
     *SIMD_LEVEL.get_or_init(|| {
-        if is_x86_feature_detected!("avx512f") {
+        if is_x86_feature_detected!("avx512f") && is_x86_feature_detected!("fma") {
             return SimdLevel::Avx512;
         }
-        if is_x86_feature_detected!("avx2") {
+        if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
             return SimdLevel::Avx2;
         }
         if is_x86_feature_detected!("sse4.1") {
@@ -479,54 +495,66 @@ fn euclidean_f32_sse(a: &[f32], b: &[f32]) -> f32 {
 /// ### Returns
 ///
 /// Squared euclidean distance
-#[inline(always)]
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
 fn euclidean_f32_avx2(a: &[f32], b: &[f32]) -> f32 {
     let len = a.len();
     let block = 8 * SIMD_ACCUMULATORS;
-
-    let mut acc0 = f32x8::ZERO;
-    let mut acc1 = f32x8::ZERO;
-    let mut acc2 = f32x8::ZERO;
-    let mut acc3 = f32x8::ZERO;
-
     let mut offset = 0;
 
     unsafe {
         let a_ptr = a.as_ptr();
         let b_ptr = b.as_ptr();
 
-        while offset + block <= len {
-            let d0 = f32x8::from(*(a_ptr.add(offset) as *const [f32; 8]))
-                - f32x8::from(*(b_ptr.add(offset) as *const [f32; 8]));
-            let d1 = f32x8::from(*(a_ptr.add(offset + 8) as *const [f32; 8]))
-                - f32x8::from(*(b_ptr.add(offset + 8) as *const [f32; 8]));
-            let d2 = f32x8::from(*(a_ptr.add(offset + 16) as *const [f32; 8]))
-                - f32x8::from(*(b_ptr.add(offset + 16) as *const [f32; 8]));
-            let d3 = f32x8::from(*(a_ptr.add(offset + 24) as *const [f32; 8]))
-                - f32x8::from(*(b_ptr.add(offset + 24) as *const [f32; 8]));
+        let mut acc0 = _mm256_setzero_ps();
+        let mut acc1 = _mm256_setzero_ps();
+        let mut acc2 = _mm256_setzero_ps();
+        let mut acc3 = _mm256_setzero_ps();
 
-            acc0 += d0 * d0;
-            acc1 += d1 * d1;
-            acc2 += d2 * d2;
-            acc3 += d3 * d3;
+        while offset + block <= len {
+            let d0 = _mm256_sub_ps(
+                _mm256_loadu_ps(a_ptr.add(offset)),
+                _mm256_loadu_ps(b_ptr.add(offset)),
+            );
+            let d1 = _mm256_sub_ps(
+                _mm256_loadu_ps(a_ptr.add(offset + 8)),
+                _mm256_loadu_ps(b_ptr.add(offset + 8)),
+            );
+            let d2 = _mm256_sub_ps(
+                _mm256_loadu_ps(a_ptr.add(offset + 16)),
+                _mm256_loadu_ps(b_ptr.add(offset + 16)),
+            );
+            let d3 = _mm256_sub_ps(
+                _mm256_loadu_ps(a_ptr.add(offset + 24)),
+                _mm256_loadu_ps(b_ptr.add(offset + 24)),
+            );
+
+            acc0 = _mm256_fmadd_ps(d0, d0, acc0);
+            acc1 = _mm256_fmadd_ps(d1, d1, acc1);
+            acc2 = _mm256_fmadd_ps(d2, d2, acc2);
+            acc3 = _mm256_fmadd_ps(d3, d3, acc3);
             offset += block;
         }
 
         // Whole vectors that did not fill a block.
         while offset + 8 <= len {
-            let d = f32x8::from(*(a_ptr.add(offset) as *const [f32; 8]))
-                - f32x8::from(*(b_ptr.add(offset) as *const [f32; 8]));
-            acc0 += d * d;
+            let d = _mm256_sub_ps(
+                _mm256_loadu_ps(a_ptr.add(offset)),
+                _mm256_loadu_ps(b_ptr.add(offset)),
+            );
+            acc0 = _mm256_fmadd_ps(d, d, acc0);
             offset += 8;
         }
-    }
 
-    let mut sum = ((acc0 + acc1) + (acc2 + acc3)).reduce_add();
-    for i in offset..len {
-        let d = a[i] - b[i];
-        sum += d * d;
+        let acc = _mm256_add_ps(_mm256_add_ps(acc0, acc1), _mm256_add_ps(acc2, acc3));
+        let mut sum = hsum_f32_avx2(acc);
+
+        for i in offset..len {
+            let d = a[i] - b[i];
+            sum += d * d;
+        }
+        sum
     }
-    sum
 }
 
 /// Euclidean distance - f32, optimised for 512 bits
@@ -539,11 +567,9 @@ fn euclidean_f32_avx2(a: &[f32], b: &[f32]) -> f32 {
 /// ### Returns
 ///
 /// Squared euclidean distance
-#[cfg(all(target_arch = "x86_64", target_feature = "avx512f"))]
-#[inline(always)]
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f")]
 fn euclidean_f32_avx512(a: &[f32], b: &[f32]) -> f32 {
-    use std::arch::x86_64::*;
-
     let len = a.len();
     let block = 16 * SIMD_ACCUMULATORS;
     let mut offset = 0;
@@ -598,13 +624,6 @@ fn euclidean_f32_avx512(a: &[f32], b: &[f32]) -> f32 {
         }
         sum
     }
-}
-
-#[cfg(not(all(target_arch = "x86_64", target_feature = "avx512f")))]
-#[inline(always)]
-fn euclidean_f32_avx512(a: &[f32], b: &[f32]) -> f32 {
-    // Fallback - shouldn't be called but needed for compilation
-    euclidean_f32_avx2(a, b)
 }
 
 ///////////////////
@@ -762,11 +781,9 @@ fn euclidean_f64_avx2(a: &[f64], b: &[f64]) -> f64 {
 /// ### Returns
 ///
 /// Squared euclidean distance
-#[cfg(all(target_arch = "x86_64", target_feature = "avx512f"))]
-#[inline(always)]
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f")]
 fn euclidean_f64_avx512(a: &[f64], b: &[f64]) -> f64 {
-    use std::arch::x86_64::*;
-
     let len = a.len();
     let block = 8 * SIMD_ACCUMULATORS;
     let mut offset = 0;
@@ -821,12 +838,6 @@ fn euclidean_f64_avx512(a: &[f64], b: &[f64]) -> f64 {
         }
         sum
     }
-}
-
-#[cfg(not(all(target_arch = "x86_64", target_feature = "avx512f")))]
-#[inline(always)]
-fn euclidean_f64_avx512(a: &[f64], b: &[f64]) -> f64 {
-    euclidean_f64_avx2(a, b)
 }
 
 /////////////////////
@@ -916,52 +927,64 @@ fn dot_f32_sse(a: &[f32], b: &[f32]) -> f32 {
 /// ### Returns
 ///
 /// Dot product
-#[inline(always)]
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
 fn dot_f32_avx2(a: &[f32], b: &[f32]) -> f32 {
     let len = a.len();
     let block = 8 * SIMD_ACCUMULATORS;
-
-    let mut acc0 = f32x8::ZERO;
-    let mut acc1 = f32x8::ZERO;
-    let mut acc2 = f32x8::ZERO;
-    let mut acc3 = f32x8::ZERO;
-
     let mut offset = 0;
 
     unsafe {
         let a_ptr = a.as_ptr();
         let b_ptr = b.as_ptr();
 
-        while offset + block <= len {
-            let a0 = f32x8::from(*(a_ptr.add(offset) as *const [f32; 8]));
-            let b0 = f32x8::from(*(b_ptr.add(offset) as *const [f32; 8]));
-            let a1 = f32x8::from(*(a_ptr.add(offset + 8) as *const [f32; 8]));
-            let b1 = f32x8::from(*(b_ptr.add(offset + 8) as *const [f32; 8]));
-            let a2 = f32x8::from(*(a_ptr.add(offset + 16) as *const [f32; 8]));
-            let b2 = f32x8::from(*(b_ptr.add(offset + 16) as *const [f32; 8]));
-            let a3 = f32x8::from(*(a_ptr.add(offset + 24) as *const [f32; 8]));
-            let b3 = f32x8::from(*(b_ptr.add(offset + 24) as *const [f32; 8]));
+        let mut acc0 = _mm256_setzero_ps();
+        let mut acc1 = _mm256_setzero_ps();
+        let mut acc2 = _mm256_setzero_ps();
+        let mut acc3 = _mm256_setzero_ps();
 
-            acc0 += a0 * b0;
-            acc1 += a1 * b1;
-            acc2 += a2 * b2;
-            acc3 += a3 * b3;
+        while offset + block <= len {
+            acc0 = _mm256_fmadd_ps(
+                _mm256_loadu_ps(a_ptr.add(offset)),
+                _mm256_loadu_ps(b_ptr.add(offset)),
+                acc0,
+            );
+            acc1 = _mm256_fmadd_ps(
+                _mm256_loadu_ps(a_ptr.add(offset + 8)),
+                _mm256_loadu_ps(b_ptr.add(offset + 8)),
+                acc1,
+            );
+            acc2 = _mm256_fmadd_ps(
+                _mm256_loadu_ps(a_ptr.add(offset + 16)),
+                _mm256_loadu_ps(b_ptr.add(offset + 16)),
+                acc2,
+            );
+            acc3 = _mm256_fmadd_ps(
+                _mm256_loadu_ps(a_ptr.add(offset + 24)),
+                _mm256_loadu_ps(b_ptr.add(offset + 24)),
+                acc3,
+            );
             offset += block;
         }
 
         // Whole vectors that did not fill a block.
         while offset + 8 <= len {
-            acc0 += f32x8::from(*(a_ptr.add(offset) as *const [f32; 8]))
-                * f32x8::from(*(b_ptr.add(offset) as *const [f32; 8]));
+            acc0 = _mm256_fmadd_ps(
+                _mm256_loadu_ps(a_ptr.add(offset)),
+                _mm256_loadu_ps(b_ptr.add(offset)),
+                acc0,
+            );
             offset += 8;
         }
-    }
 
-    let mut sum = ((acc0 + acc1) + (acc2 + acc3)).reduce_add();
-    for i in offset..len {
-        sum += a[i] * b[i];
+        let acc = _mm256_add_ps(_mm256_add_ps(acc0, acc1), _mm256_add_ps(acc2, acc3));
+        let mut sum = hsum_f32_avx2(acc);
+
+        for i in offset..len {
+            sum += a[i] * b[i];
+        }
+        sum
     }
-    sum
 }
 
 /// Dot product - f32, optimised for 512-bit
@@ -974,11 +997,9 @@ fn dot_f32_avx2(a: &[f32], b: &[f32]) -> f32 {
 /// ### Returns
 ///
 /// Dot product
-#[cfg(all(target_arch = "x86_64", target_feature = "avx512f"))]
-#[inline(always)]
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f")]
 fn dot_f32_avx512(a: &[f32], b: &[f32]) -> f32 {
-    use std::arch::x86_64::*;
-
     let len = a.len();
     let block = 16 * SIMD_ACCUMULATORS;
     let mut offset = 0;
@@ -1024,12 +1045,6 @@ fn dot_f32_avx512(a: &[f32], b: &[f32]) -> f32 {
         }
         sum
     }
-}
-
-#[cfg(not(all(target_arch = "x86_64", target_feature = "avx512f")))]
-#[inline(always)]
-fn dot_f32_avx512(a: &[f32], b: &[f32]) -> f32 {
-    dot_f32_avx2(a, b)
 }
 
 /////////////////////
@@ -1177,11 +1192,9 @@ fn dot_f64_avx2(a: &[f64], b: &[f64]) -> f64 {
 /// ### Returns
 ///
 /// Dot product
-#[cfg(all(target_arch = "x86_64", target_feature = "avx512f"))]
-#[inline(always)]
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f")]
 fn dot_f64_avx512(a: &[f64], b: &[f64]) -> f64 {
-    use std::arch::x86_64::*;
-
     let len = a.len();
     let block = 8 * SIMD_ACCUMULATORS;
     let mut offset = 0;
@@ -1227,12 +1240,6 @@ fn dot_f64_avx512(a: &[f64], b: &[f64]) -> f64 {
         }
         sum
     }
-}
-
-#[cfg(not(all(target_arch = "x86_64", target_feature = "avx512f")))]
-#[inline(always)]
-fn dot_f64_avx512(a: &[f64], b: &[f64]) -> f64 {
-    dot_f64_avx2(a, b)
 }
 
 ///////////////
@@ -1303,29 +1310,32 @@ fn manhattan_f32_sse(a: &[f32], b: &[f32]) -> f32 {
 /// ### Returns
 ///
 /// Manhattan distance (L1)
-#[inline(always)]
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
 fn manhattan_f32_avx2(a: &[f32], b: &[f32]) -> f32 {
     let len = a.len();
     let chunks = len / 8;
-    let mut acc = f32x8::ZERO;
 
     unsafe {
-        let a_ptr = a.as_ptr();
-        let b_ptr = b.as_ptr();
+        // AVX2 has no float absolute value, so clear the sign bit instead.
+        let sign_mask = _mm256_set1_ps(-0.0);
+        let mut acc = _mm256_setzero_ps();
 
         for i in 0..chunks {
             let offset = i * 8;
-            let va = f32x8::from(*(a_ptr.add(offset) as *const [f32; 8]));
-            let vb = f32x8::from(*(b_ptr.add(offset) as *const [f32; 8]));
-            acc += (va - vb).abs();
+            let diff = _mm256_sub_ps(
+                _mm256_loadu_ps(a.as_ptr().add(offset)),
+                _mm256_loadu_ps(b.as_ptr().add(offset)),
+            );
+            acc = _mm256_add_ps(acc, _mm256_andnot_ps(sign_mask, diff));
         }
-    }
 
-    let mut sum = acc.reduce_add();
-    for i in (chunks * 8)..len {
-        sum += (a[i] - b[i]).abs();
+        let mut sum = hsum_f32_avx2(acc);
+        for i in (chunks * 8)..len {
+            sum += (a[i] - b[i]).abs();
+        }
+        sum
     }
-    sum
 }
 
 /// Manhattan distance - f32, 512-bit
@@ -1338,11 +1348,9 @@ fn manhattan_f32_avx2(a: &[f32], b: &[f32]) -> f32 {
 /// ### Returns
 ///
 /// Manhattan distance (L1)
-#[cfg(all(target_arch = "x86_64", target_feature = "avx512f"))]
-#[inline(always)]
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f")]
 fn manhattan_f32_avx512(a: &[f32], b: &[f32]) -> f32 {
-    use std::arch::x86_64::*;
-
     let len = a.len();
     let chunks = len / 16;
 
@@ -1362,22 +1370,6 @@ fn manhattan_f32_avx512(a: &[f32], b: &[f32]) -> f32 {
         }
         sum
     }
-}
-
-/// Manhattan distance - f32, 512-bit (fallback)
-///
-/// ### Params
-///
-/// * `a` - Slice of vector a
-/// * `b` - Slice of vector b
-///
-/// ### Returns
-///
-/// Manhattan distance (L1)
-#[cfg(not(all(target_arch = "x86_64", target_feature = "avx512f")))]
-#[inline(always)]
-fn manhattan_f32_avx512(a: &[f32], b: &[f32]) -> f32 {
-    manhattan_f32_avx2(a, b)
 }
 
 ///////////////////
@@ -1479,11 +1471,9 @@ fn manhattan_f64_avx2(a: &[f64], b: &[f64]) -> f64 {
 /// ### Returns
 ///
 /// Manhattan distance (L1)
-#[cfg(all(target_arch = "x86_64", target_feature = "avx512f"))]
-#[inline(always)]
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f")]
 fn manhattan_f64_avx512(a: &[f64], b: &[f64]) -> f64 {
-    use std::arch::x86_64::*;
-
     let len = a.len();
     let chunks = len / 8;
 
@@ -1503,22 +1493,6 @@ fn manhattan_f64_avx512(a: &[f64], b: &[f64]) -> f64 {
         }
         sum
     }
-}
-
-/// Manhattan distance - f64, 512-bit (fallback)
-///
-/// ### Params
-///
-/// * `a` - Slice of vector a
-/// * `b` - Slice of vector b
-///
-/// ### Returns
-///
-/// Manhattan distance (L1)
-#[cfg(not(all(target_arch = "x86_64", target_feature = "avx512f")))]
-#[inline(always)]
-fn manhattan_f64_avx512(a: &[f64], b: &[f64]) -> f64 {
-    manhattan_f64_avx2(a, b)
 }
 
 //////////////
@@ -1647,11 +1621,9 @@ fn canberra_f32_avx2(a: &[f32], b: &[f32]) -> f32 {
 /// ### Returns
 ///
 /// Canberra distance
-#[cfg(all(target_arch = "x86_64", target_feature = "avx512f"))]
-#[inline(always)]
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f")]
 fn canberra_f32_avx512(a: &[f32], b: &[f32]) -> f32 {
-    use std::arch::x86_64::*;
-
     let len = a.len();
     let chunks = len / 16;
 
@@ -1679,22 +1651,6 @@ fn canberra_f32_avx512(a: &[f32], b: &[f32]) -> f32 {
         }
         sum
     }
-}
-
-/// Canberra distance - f32, 512-bit, fallback
-///
-/// ### Params
-///
-/// * `a` - Slice of vector a
-/// * `b` - Slice of vector b
-///
-/// ### Returns
-///
-/// Canberra distance
-#[cfg(not(all(target_arch = "x86_64", target_feature = "avx512f")))]
-#[inline(always)]
-fn canberra_f32_avx512(a: &[f32], b: &[f32]) -> f32 {
-    canberra_f32_avx2(a, b)
 }
 
 //////////////////
@@ -1819,11 +1775,9 @@ fn canberra_f64_avx2(a: &[f64], b: &[f64]) -> f64 {
 /// ### Returns
 ///
 /// Canberra distance
-#[cfg(all(target_arch = "x86_64", target_feature = "avx512f"))]
-#[inline(always)]
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f")]
 fn canberra_f64_avx512(a: &[f64], b: &[f64]) -> f64 {
-    use std::arch::x86_64::*;
-
     let len = a.len();
     let chunks = len / 8;
 
@@ -1851,22 +1805,6 @@ fn canberra_f64_avx512(a: &[f64], b: &[f64]) -> f64 {
         }
         sum
     }
-}
-
-/// Canberra distance - f64, 512-bit (fallback)
-///
-/// ### Params
-///
-/// * `a` - Slice of vector a
-/// * `b` - Slice of vector b
-///
-/// ### Returns
-///
-/// Canberra distance
-#[cfg(not(all(target_arch = "x86_64", target_feature = "avx512f")))]
-#[inline(always)]
-fn canberra_f64_avx512(a: &[f64], b: &[f64]) -> f64 {
-    canberra_f64_avx2(a, b)
 }
 
 /////////////////////////
@@ -1978,11 +1916,9 @@ fn subtract_f32_avx2(a: &[f32], b: &[f32]) -> Vec<f32> {
 /// ### Returns
 ///
 /// `Vec<a - b>`
-#[cfg(all(target_arch = "x86_64", target_feature = "avx512f"))]
-#[inline(always)]
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f")]
 fn subtract_f32_avx512(a: &[f32], b: &[f32]) -> Vec<f32> {
-    use std::arch::x86_64::*;
-
     let len = a.len();
     let chunks = len / 16;
     let mut result = Vec::with_capacity(len);
@@ -2004,22 +1940,6 @@ fn subtract_f32_avx512(a: &[f32], b: &[f32]) -> Vec<f32> {
         result.set_len(len);
     }
     result
-}
-
-/// Vector subtraction - f32, fall back version
-///
-/// ### Params
-///
-/// * `a` - Slice of vector a
-/// * `b` - Slice of vector b
-///
-/// ### Returns
-///
-/// `Vec<a - b>`
-#[cfg(not(all(target_arch = "x86_64", target_feature = "avx512f")))]
-#[inline(always)]
-fn subtract_f32_avx512(a: &[f32], b: &[f32]) -> Vec<f32> {
-    subtract_f32_avx2(a, b)
 }
 
 //////////////////
@@ -2127,11 +2047,9 @@ fn subtract_f64_avx2(a: &[f64], b: &[f64]) -> Vec<f64> {
 /// ### Returns
 ///
 /// `Vec<a - b>`
-#[cfg(all(target_arch = "x86_64", target_feature = "avx512f"))]
-#[inline(always)]
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f")]
 fn subtract_f64_avx512(a: &[f64], b: &[f64]) -> Vec<f64> {
-    use std::arch::x86_64::*;
-
     let len = a.len();
     let chunks = len / 8;
     let mut result = Vec::with_capacity(len);
@@ -2153,22 +2071,6 @@ fn subtract_f64_avx512(a: &[f64], b: &[f64]) -> Vec<f64> {
         result.set_len(len);
     }
     result
-}
-
-/// Vector subtraction - f64, fall back version for AVX512
-///
-/// ### Params
-///
-/// * `a` - Slice of vector a
-/// * `b` - Slice of vector b
-///
-/// ### Returns
-///
-/// `Vec<a - b>`
-#[cfg(not(all(target_arch = "x86_64", target_feature = "avx512f")))]
-#[inline(always)]
-fn subtract_f64_avx512(a: &[f64], b: &[f64]) -> Vec<f64> {
-    subtract_f64_avx2(a, b)
 }
 
 /////////////
@@ -2276,11 +2178,9 @@ fn add_f32_avx2(a: &[f32], b: &[f32]) -> Vec<f32> {
 /// ### Returns
 ///
 /// `Vec<a + b>`
-#[cfg(all(target_arch = "x86_64", target_feature = "avx512f"))]
-#[inline(always)]
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f")]
 fn add_f32_avx512(a: &[f32], b: &[f32]) -> Vec<f32> {
-    use std::arch::x86_64::*;
-
     let len = a.len();
     let chunks = len / 16;
     let mut result = Vec::with_capacity(len);
@@ -2302,22 +2202,6 @@ fn add_f32_avx512(a: &[f32], b: &[f32]) -> Vec<f32> {
         result.set_len(len);
     }
     result
-}
-
-/// Vector addition - f32, fall back version
-///
-/// ### Params
-///
-/// * `a` - Slice of vector a
-/// * `b` - Slice of vector b
-///
-/// ### Returns
-///
-/// `Vec<a + b>`
-#[cfg(not(all(target_arch = "x86_64", target_feature = "avx512f")))]
-#[inline(always)]
-fn add_f32_avx512(a: &[f32], b: &[f32]) -> Vec<f32> {
-    add_f32_avx2(a, b)
 }
 
 /////////////
@@ -2425,11 +2309,9 @@ fn add_f64_avx2(a: &[f64], b: &[f64]) -> Vec<f64> {
 /// ### Returns
 ///
 /// `Vec<a + b>`
-#[cfg(all(target_arch = "x86_64", target_feature = "avx512f"))]
-#[inline(always)]
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f")]
 fn add_f64_avx512(a: &[f64], b: &[f64]) -> Vec<f64> {
-    use std::arch::x86_64::*;
-
     let len = a.len();
     let chunks = len / 8;
     let mut result = Vec::with_capacity(len);
@@ -2451,22 +2333,6 @@ fn add_f64_avx512(a: &[f64], b: &[f64]) -> Vec<f64> {
         result.set_len(len);
     }
     result
-}
-
-/// Vector subtraction - f64, fall back version for AVX512
-///
-/// ### Params
-///
-/// * `a` - Slice of vector a
-/// * `b` - Slice of vector b
-///
-/// ### Returns
-///
-/// `Vec<a - b>`
-#[cfg(not(all(target_arch = "x86_64", target_feature = "avx512f")))]
-#[inline(always)]
-fn add_f64_avx512(a: &[f64], b: &[f64]) -> Vec<f64> {
-    add_f64_avx2(a, b)
 }
 
 ////////////////////
@@ -2556,11 +2422,9 @@ fn add_assign_f32_avx2(dst: &mut [f32], src: &[f32]) {
 ///
 /// * `dst` - Mutable slice, updated in-place
 /// * `src` - Slice to add
-#[cfg(all(target_arch = "x86_64", target_feature = "avx512f"))]
-#[inline(always)]
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f")]
 fn add_assign_f32_avx512(dst: &mut [f32], src: &[f32]) {
-    use std::arch::x86_64::*;
-
     let len = dst.len();
     let chunks = len / 16;
 
@@ -2580,20 +2444,6 @@ fn add_assign_f32_avx512(dst: &mut [f32], src: &[f32]) {
             *dst_ptr.add(i) += *src_ptr.add(i);
         }
     }
-}
-
-/// In-place vector addition - f32, fall back version
-///
-/// Computes `dst[i] += src[i]` for all elements.
-///
-/// ### Params
-///
-/// * `dst` - Mutable slice, updated in-place
-/// * `src` - Slice to add
-#[cfg(not(all(target_arch = "x86_64", target_feature = "avx512f")))]
-#[inline(always)]
-fn add_assign_f32_avx512(dst: &mut [f32], src: &[f32]) {
-    add_assign_f32_avx2(dst, src);
 }
 
 ////////////////////
@@ -2683,11 +2533,9 @@ fn add_assign_f64_avx2(dst: &mut [f64], src: &[f64]) {
 ///
 /// * `dst` - Mutable slice, updated in-place
 /// * `src` - Slice to add
-#[cfg(all(target_arch = "x86_64", target_feature = "avx512f"))]
-#[inline(always)]
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f")]
 fn add_assign_f64_avx512(dst: &mut [f64], src: &[f64]) {
-    use std::arch::x86_64::*;
-
     let len = dst.len();
     let chunks = len / 8;
 
@@ -2707,20 +2555,6 @@ fn add_assign_f64_avx512(dst: &mut [f64], src: &[f64]) {
             *dst_ptr.add(i) += *src_ptr.add(i);
         }
     }
-}
-
-/// In-place vector addition - f64, fall back version
-///
-/// Computes `dst[i] += src[i]` for all elements.
-///
-/// ### Params
-///
-/// * `dst` - Mutable slice, updated in-place
-/// * `src` - Slice to add
-#[cfg(not(all(target_arch = "x86_64", target_feature = "avx512f")))]
-#[inline(always)]
-fn add_assign_f64_avx512(dst: &mut [f64], src: &[f64]) {
-    add_assign_f64_avx2(dst, src);
 }
 
 /////////////
@@ -2823,11 +2657,9 @@ fn compute_l2_norm_f32_avx2(vec: &[f32]) -> f32 {
 /// ### Returns
 ///
 /// Returns the L2 norm
-#[cfg(all(target_arch = "x86_64", target_feature = "avx512f"))]
-#[inline(always)]
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f")]
 fn compute_l2_norm_f32_avx512(vec: &[f32]) -> f32 {
-    use std::arch::x86_64::*;
-
     let len = vec.len();
     let chunks = len / 16;
 
@@ -2845,12 +2677,6 @@ fn compute_l2_norm_f32_avx512(vec: &[f32]) -> f32 {
         }
         sum.sqrt()
     }
-}
-
-#[cfg(not(all(target_arch = "x86_64", target_feature = "avx512f")))]
-#[inline(always)]
-fn compute_l2_norm_f32_avx512(vec: &[f32]) -> f32 {
-    compute_l2_norm_f32_avx2(vec)
 }
 
 //////////////////
@@ -2950,11 +2776,9 @@ fn compute_l2_norm_f64_avx2(vec: &[f64]) -> f64 {
 /// ### Returns
 ///
 /// Returns the L2 norm
-#[cfg(all(target_arch = "x86_64", target_feature = "avx512f"))]
-#[inline(always)]
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f")]
 fn compute_l2_norm_f64_avx512(vec: &[f64]) -> f64 {
-    use std::arch::x86_64::*;
-
     let len = vec.len();
     let chunks = len / 8;
 
@@ -2972,12 +2796,6 @@ fn compute_l2_norm_f64_avx512(vec: &[f64]) -> f64 {
         }
         sum.sqrt()
     }
-}
-
-#[cfg(not(all(target_arch = "x86_64", target_feature = "avx512f")))]
-#[inline(always)]
-fn compute_l2_norm_f64_avx512(vec: &[f64]) -> f64 {
-    compute_l2_norm_f64_avx2(vec)
 }
 
 /////////////
@@ -3075,11 +2893,9 @@ fn compute_l1_norm_f32_avx2(a: &[f32]) -> f32 {
 /// ### Returns
 ///
 /// Sum of absolute values
-#[cfg(all(target_arch = "x86_64", target_feature = "avx512f"))]
-#[inline(always)]
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f")]
 fn compute_l1_norm_f32_avx512(a: &[f32]) -> f32 {
-    use std::arch::x86_64::*;
-
     let len = a.len();
     let chunks = len / 16;
 
@@ -3099,12 +2915,6 @@ fn compute_l1_norm_f32_avx512(a: &[f32]) -> f32 {
         }
         sum
     }
-}
-
-#[cfg(not(all(target_arch = "x86_64", target_feature = "avx512f")))]
-#[inline(always)]
-fn compute_l1_norm_f32_avx512(a: &[f32]) -> f32 {
-    compute_l1_norm_f32_avx2(a)
 }
 
 /////////////////
@@ -3198,11 +3008,9 @@ fn compute_l1_norm_f64_avx2(a: &[f64]) -> f64 {
 /// ### Returns
 ///
 /// Sum of absolute values
-#[cfg(all(target_arch = "x86_64", target_feature = "avx512f"))]
-#[inline(always)]
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f")]
 fn compute_l1_norm_f64_avx512(a: &[f64]) -> f64 {
-    use std::arch::x86_64::*;
-
     let len = a.len();
     let chunks = len / 8;
 
@@ -3222,12 +3030,6 @@ fn compute_l1_norm_f64_avx512(a: &[f64]) -> f64 {
         }
         sum
     }
-}
-
-#[cfg(not(all(target_arch = "x86_64", target_feature = "avx512f")))]
-#[inline(always)]
-fn compute_l1_norm_f64_avx512(a: &[f64]) -> f64 {
-    compute_l1_norm_f64_avx2(a)
 }
 
 ///////////////////////////
@@ -3336,47 +3138,47 @@ fn euclidean_f32_batch4_sse(q: &[f32], y: [&[f32]; 4]) -> [f32; 4] {
 /// ### Returns
 ///
 /// The four squared distances, in input order.
-#[inline(always)]
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
 fn euclidean_f32_batch4_avx2(q: &[f32], y: [&[f32]; 4]) -> [f32; 4] {
     let len = q.len();
-
-    let mut acc0 = f32x8::ZERO;
-    let mut acc1 = f32x8::ZERO;
-    let mut acc2 = f32x8::ZERO;
-    let mut acc3 = f32x8::ZERO;
-
     let mut offset = 0;
 
-    unsafe {
+    let mut out = unsafe {
         let qp = q.as_ptr();
         let p0 = y[0].as_ptr();
         let p1 = y[1].as_ptr();
         let p2 = y[2].as_ptr();
         let p3 = y[3].as_ptr();
 
+        let mut acc0 = _mm256_setzero_ps();
+        let mut acc1 = _mm256_setzero_ps();
+        let mut acc2 = _mm256_setzero_ps();
+        let mut acc3 = _mm256_setzero_ps();
+
         while offset + 8 <= len {
-            let qv = f32x8::from(*(qp.add(offset) as *const [f32; 8]));
+            let qv = _mm256_loadu_ps(qp.add(offset));
 
-            let d0 = qv - f32x8::from(*(p0.add(offset) as *const [f32; 8]));
-            let d1 = qv - f32x8::from(*(p1.add(offset) as *const [f32; 8]));
-            let d2 = qv - f32x8::from(*(p2.add(offset) as *const [f32; 8]));
-            let d3 = qv - f32x8::from(*(p3.add(offset) as *const [f32; 8]));
+            let d0 = _mm256_sub_ps(qv, _mm256_loadu_ps(p0.add(offset)));
+            let d1 = _mm256_sub_ps(qv, _mm256_loadu_ps(p1.add(offset)));
+            let d2 = _mm256_sub_ps(qv, _mm256_loadu_ps(p2.add(offset)));
+            let d3 = _mm256_sub_ps(qv, _mm256_loadu_ps(p3.add(offset)));
 
-            acc0 += d0 * d0;
-            acc1 += d1 * d1;
-            acc2 += d2 * d2;
-            acc3 += d3 * d3;
+            acc0 = _mm256_fmadd_ps(d0, d0, acc0);
+            acc1 = _mm256_fmadd_ps(d1, d1, acc1);
+            acc2 = _mm256_fmadd_ps(d2, d2, acc2);
+            acc3 = _mm256_fmadd_ps(d3, d3, acc3);
 
             offset += 8;
         }
-    }
 
-    let mut out = [
-        acc0.reduce_add(),
-        acc1.reduce_add(),
-        acc2.reduce_add(),
-        acc3.reduce_add(),
-    ];
+        [
+            hsum_f32_avx2(acc0),
+            hsum_f32_avx2(acc1),
+            hsum_f32_avx2(acc2),
+            hsum_f32_avx2(acc3),
+        ]
+    };
 
     for i in offset..len {
         for (k, row) in y.iter().enumerate() {
@@ -3473,42 +3275,42 @@ fn dot_f32_batch4_sse(q: &[f32], y: [&[f32]; 4]) -> [f32; 4] {
 /// ### Returns
 ///
 /// The four dot products, in input order.
-#[inline(always)]
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
 fn dot_f32_batch4_avx2(q: &[f32], y: [&[f32]; 4]) -> [f32; 4] {
     let len = q.len();
-
-    let mut acc0 = f32x8::ZERO;
-    let mut acc1 = f32x8::ZERO;
-    let mut acc2 = f32x8::ZERO;
-    let mut acc3 = f32x8::ZERO;
-
     let mut offset = 0;
 
-    unsafe {
+    let mut out = unsafe {
         let qp = q.as_ptr();
         let p0 = y[0].as_ptr();
         let p1 = y[1].as_ptr();
         let p2 = y[2].as_ptr();
         let p3 = y[3].as_ptr();
 
-        while offset + 8 <= len {
-            let qv = f32x8::from(*(qp.add(offset) as *const [f32; 8]));
+        let mut acc0 = _mm256_setzero_ps();
+        let mut acc1 = _mm256_setzero_ps();
+        let mut acc2 = _mm256_setzero_ps();
+        let mut acc3 = _mm256_setzero_ps();
 
-            acc0 += qv * f32x8::from(*(p0.add(offset) as *const [f32; 8]));
-            acc1 += qv * f32x8::from(*(p1.add(offset) as *const [f32; 8]));
-            acc2 += qv * f32x8::from(*(p2.add(offset) as *const [f32; 8]));
-            acc3 += qv * f32x8::from(*(p3.add(offset) as *const [f32; 8]));
+        while offset + 8 <= len {
+            let qv = _mm256_loadu_ps(qp.add(offset));
+
+            acc0 = _mm256_fmadd_ps(qv, _mm256_loadu_ps(p0.add(offset)), acc0);
+            acc1 = _mm256_fmadd_ps(qv, _mm256_loadu_ps(p1.add(offset)), acc1);
+            acc2 = _mm256_fmadd_ps(qv, _mm256_loadu_ps(p2.add(offset)), acc2);
+            acc3 = _mm256_fmadd_ps(qv, _mm256_loadu_ps(p3.add(offset)), acc3);
 
             offset += 8;
         }
-    }
 
-    let mut out = [
-        acc0.reduce_add(),
-        acc1.reduce_add(),
-        acc2.reduce_add(),
-        acc3.reduce_add(),
-    ];
+        [
+            hsum_f32_avx2(acc0),
+            hsum_f32_avx2(acc1),
+            hsum_f32_avx2(acc2),
+            hsum_f32_avx2(acc3),
+        ]
+    };
 
     for i in offset..len {
         for (k, row) in y.iter().enumerate() {
@@ -3607,42 +3409,49 @@ fn manhattan_f32_batch4_sse(q: &[f32], y: [&[f32]; 4]) -> [f32; 4] {
 /// ### Returns
 ///
 /// The four results, in input order.
-#[inline(always)]
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
 fn manhattan_f32_batch4_avx2(q: &[f32], y: [&[f32]; 4]) -> [f32; 4] {
     let len = q.len();
-
-    let mut acc0 = f32x8::ZERO;
-    let mut acc1 = f32x8::ZERO;
-    let mut acc2 = f32x8::ZERO;
-    let mut acc3 = f32x8::ZERO;
-
     let mut offset = 0;
 
-    unsafe {
+    let mut out = unsafe {
         let qp = q.as_ptr();
         let p0 = y[0].as_ptr();
         let p1 = y[1].as_ptr();
         let p2 = y[2].as_ptr();
         let p3 = y[3].as_ptr();
 
-        while offset + 8 <= len {
-            let qv = f32x8::from(*(qp.add(offset) as *const [f32; 8]));
+        // AVX2 has no float absolute value, so clear the sign bit instead.
+        let sign_mask = _mm256_set1_ps(-0.0);
+        let mut acc0 = _mm256_setzero_ps();
+        let mut acc1 = _mm256_setzero_ps();
+        let mut acc2 = _mm256_setzero_ps();
+        let mut acc3 = _mm256_setzero_ps();
 
-            acc0 += (qv - f32x8::from(*(p0.add(offset) as *const [f32; 8]))).abs();
-            acc1 += (qv - f32x8::from(*(p1.add(offset) as *const [f32; 8]))).abs();
-            acc2 += (qv - f32x8::from(*(p2.add(offset) as *const [f32; 8]))).abs();
-            acc3 += (qv - f32x8::from(*(p3.add(offset) as *const [f32; 8]))).abs();
+        while offset + 8 <= len {
+            let qv = _mm256_loadu_ps(qp.add(offset));
+
+            let d0 = _mm256_sub_ps(qv, _mm256_loadu_ps(p0.add(offset)));
+            let d1 = _mm256_sub_ps(qv, _mm256_loadu_ps(p1.add(offset)));
+            let d2 = _mm256_sub_ps(qv, _mm256_loadu_ps(p2.add(offset)));
+            let d3 = _mm256_sub_ps(qv, _mm256_loadu_ps(p3.add(offset)));
+
+            acc0 = _mm256_add_ps(acc0, _mm256_andnot_ps(sign_mask, d0));
+            acc1 = _mm256_add_ps(acc1, _mm256_andnot_ps(sign_mask, d1));
+            acc2 = _mm256_add_ps(acc2, _mm256_andnot_ps(sign_mask, d2));
+            acc3 = _mm256_add_ps(acc3, _mm256_andnot_ps(sign_mask, d3));
 
             offset += 8;
         }
-    }
 
-    let mut out = [
-        acc0.reduce_add(),
-        acc1.reduce_add(),
-        acc2.reduce_add(),
-        acc3.reduce_add(),
-    ];
+        [
+            hsum_f32_avx2(acc0),
+            hsum_f32_avx2(acc1),
+            hsum_f32_avx2(acc2),
+            hsum_f32_avx2(acc3),
+        ]
+    };
 
     for i in offset..len {
         for (k, row) in y.iter().enumerate() {
@@ -4078,118 +3887,226 @@ fn manhattan_f64_batch4_avx2(q: &[f64], y: [&[f64]; 4]) -> [f64; 4] {
 impl SimdDistance for f32 {
     #[inline]
     fn euclidean_simd(a: &[f32], b: &[f32]) -> f32 {
+        #[cfg(target_arch = "x86_64")]
+        unsafe {
+            match detect_simd_level() {
+                SimdLevel::Avx512 => euclidean_f32_avx512(a, b),
+                SimdLevel::Avx2 => euclidean_f32_avx2(a, b),
+                SimdLevel::Sse => euclidean_f32_sse(a, b),
+                SimdLevel::Scalar => euclidean_f32_scalar(a, b),
+            }
+        }
+
+        #[cfg(not(target_arch = "x86_64"))]
         match detect_simd_level() {
-            SimdLevel::Avx512 => euclidean_f32_avx512(a, b),
-            SimdLevel::Avx2 => euclidean_f32_avx2(a, b),
             SimdLevel::Sse => euclidean_f32_sse(a, b),
-            SimdLevel::Scalar => euclidean_f32_scalar(a, b),
+            _ => euclidean_f32_scalar(a, b),
         }
     }
 
     #[inline]
     fn dot_simd(a: &[f32], b: &[f32]) -> f32 {
+        #[cfg(target_arch = "x86_64")]
+        unsafe {
+            match detect_simd_level() {
+                SimdLevel::Avx512 => dot_f32_avx512(a, b),
+                SimdLevel::Avx2 => dot_f32_avx2(a, b),
+                SimdLevel::Sse => dot_f32_sse(a, b),
+                SimdLevel::Scalar => dot_f32_scalar(a, b),
+            }
+        }
+
+        #[cfg(not(target_arch = "x86_64"))]
         match detect_simd_level() {
-            SimdLevel::Avx512 => dot_f32_avx512(a, b),
-            SimdLevel::Avx2 => dot_f32_avx2(a, b),
             SimdLevel::Sse => dot_f32_sse(a, b),
-            SimdLevel::Scalar => dot_f32_scalar(a, b),
+            _ => dot_f32_scalar(a, b),
         }
     }
 
     #[inline]
     fn euclidean_simd_batch_4(q: &[f32], y: [&[f32]; 4]) -> [f32; 4] {
+        #[cfg(target_arch = "x86_64")]
+        unsafe {
+            match detect_simd_level() {
+                SimdLevel::Avx512 | SimdLevel::Avx2 => euclidean_f32_batch4_avx2(q, y),
+                SimdLevel::Sse => euclidean_f32_batch4_sse(q, y),
+                SimdLevel::Scalar => euclidean_f32_batch4_scalar(q, y),
+            }
+        }
+
+        #[cfg(not(target_arch = "x86_64"))]
         match detect_simd_level() {
-            SimdLevel::Avx512 | SimdLevel::Avx2 => euclidean_f32_batch4_avx2(q, y),
             SimdLevel::Sse => euclidean_f32_batch4_sse(q, y),
-            SimdLevel::Scalar => euclidean_f32_batch4_scalar(q, y),
+            _ => euclidean_f32_batch4_scalar(q, y),
         }
     }
 
     #[inline]
     fn dot_simd_batch_4(q: &[f32], y: [&[f32]; 4]) -> [f32; 4] {
+        #[cfg(target_arch = "x86_64")]
+        unsafe {
+            match detect_simd_level() {
+                SimdLevel::Avx512 | SimdLevel::Avx2 => dot_f32_batch4_avx2(q, y),
+                SimdLevel::Sse => dot_f32_batch4_sse(q, y),
+                SimdLevel::Scalar => dot_f32_batch4_scalar(q, y),
+            }
+        }
+
+        #[cfg(not(target_arch = "x86_64"))]
         match detect_simd_level() {
-            SimdLevel::Avx512 | SimdLevel::Avx2 => dot_f32_batch4_avx2(q, y),
             SimdLevel::Sse => dot_f32_batch4_sse(q, y),
-            SimdLevel::Scalar => dot_f32_batch4_scalar(q, y),
+            _ => dot_f32_batch4_scalar(q, y),
         }
     }
 
     #[inline]
     fn manhattan_simd_batch_4(q: &[f32], y: [&[f32]; 4]) -> [f32; 4] {
+        #[cfg(target_arch = "x86_64")]
+        unsafe {
+            match detect_simd_level() {
+                SimdLevel::Avx512 | SimdLevel::Avx2 => manhattan_f32_batch4_avx2(q, y),
+                SimdLevel::Sse => manhattan_f32_batch4_sse(q, y),
+                SimdLevel::Scalar => manhattan_f32_batch4_scalar(q, y),
+            }
+        }
+
+        #[cfg(not(target_arch = "x86_64"))]
         match detect_simd_level() {
-            SimdLevel::Avx512 | SimdLevel::Avx2 => manhattan_f32_batch4_avx2(q, y),
             SimdLevel::Sse => manhattan_f32_batch4_sse(q, y),
-            SimdLevel::Scalar => manhattan_f32_batch4_scalar(q, y),
+            _ => manhattan_f32_batch4_scalar(q, y),
         }
     }
 
     #[inline]
     fn manhattan_simd(a: &[f32], b: &[f32]) -> f32 {
+        #[cfg(target_arch = "x86_64")]
+        unsafe {
+            match detect_simd_level() {
+                SimdLevel::Avx512 => manhattan_f32_avx512(a, b),
+                SimdLevel::Avx2 => manhattan_f32_avx2(a, b),
+                SimdLevel::Sse => manhattan_f32_sse(a, b),
+                SimdLevel::Scalar => manhattan_f32_sse(a, b),
+            }
+        }
+
+        #[cfg(not(target_arch = "x86_64"))]
         match detect_simd_level() {
-            SimdLevel::Avx512 => manhattan_f32_avx512(a, b),
-            SimdLevel::Avx2 => manhattan_f32_avx2(a, b),
             SimdLevel::Sse => manhattan_f32_sse(a, b),
-            SimdLevel::Scalar => manhattan_f32_sse(a, b),
+            _ => manhattan_f32_sse(a, b),
         }
     }
 
     #[inline]
     fn canberra_simd(a: &[f32], b: &[f32]) -> f32 {
+        #[cfg(target_arch = "x86_64")]
+        unsafe {
+            match detect_simd_level() {
+                SimdLevel::Avx512 => canberra_f32_avx512(a, b),
+                SimdLevel::Avx2 => canberra_f32_avx2(a, b),
+                SimdLevel::Sse => canberra_f32_sse(a, b),
+                SimdLevel::Scalar => canberra_f32_sse(a, b),
+            }
+        }
+
+        #[cfg(not(target_arch = "x86_64"))]
         match detect_simd_level() {
-            SimdLevel::Avx512 => canberra_f32_avx512(a, b),
-            SimdLevel::Avx2 => canberra_f32_avx2(a, b),
             SimdLevel::Sse => canberra_f32_sse(a, b),
-            SimdLevel::Scalar => canberra_f32_sse(a, b),
+            _ => canberra_f32_sse(a, b),
         }
     }
 
     #[inline]
     fn subtract_simd(a: &[f32], b: &[f32]) -> Vec<f32> {
+        #[cfg(target_arch = "x86_64")]
+        unsafe {
+            match detect_simd_level() {
+                SimdLevel::Avx512 => subtract_f32_avx512(a, b),
+                SimdLevel::Avx2 => subtract_f32_avx2(a, b),
+                SimdLevel::Sse => subtract_f32_sse(a, b),
+                SimdLevel::Scalar => subtract_f32_scalar(a, b),
+            }
+        }
+
+        #[cfg(not(target_arch = "x86_64"))]
         match detect_simd_level() {
-            SimdLevel::Avx512 => subtract_f32_avx512(a, b),
-            SimdLevel::Avx2 => subtract_f32_avx2(a, b),
             SimdLevel::Sse => subtract_f32_sse(a, b),
-            SimdLevel::Scalar => subtract_f32_scalar(a, b),
+            _ => subtract_f32_scalar(a, b),
         }
     }
 
     #[inline]
     fn add_simd(a: &[Self], b: &[Self]) -> Vec<Self> {
+        #[cfg(target_arch = "x86_64")]
+        unsafe {
+            match detect_simd_level() {
+                SimdLevel::Avx512 => add_f32_avx512(a, b),
+                SimdLevel::Avx2 => add_f32_avx2(a, b),
+                SimdLevel::Sse => add_f32_sse(a, b),
+                SimdLevel::Scalar => add_f32_scalar(a, b),
+            }
+        }
+
+        #[cfg(not(target_arch = "x86_64"))]
         match detect_simd_level() {
-            SimdLevel::Avx512 => add_f32_avx512(a, b),
-            SimdLevel::Avx2 => add_f32_avx2(a, b),
             SimdLevel::Sse => add_f32_sse(a, b),
-            SimdLevel::Scalar => add_f32_scalar(a, b),
+            _ => add_f32_scalar(a, b),
         }
     }
 
     #[inline]
     fn add_assign_simd(dst: &mut [Self], src: &[Self]) {
+        #[cfg(target_arch = "x86_64")]
+        unsafe {
+            match detect_simd_level() {
+                SimdLevel::Avx512 => add_assign_f32_avx512(dst, src),
+                SimdLevel::Avx2 => add_assign_f32_avx2(dst, src),
+                SimdLevel::Sse => add_assign_f32_sse(dst, src),
+                SimdLevel::Scalar => add_assign_f32_scalar(dst, src),
+            }
+        }
+
+        #[cfg(not(target_arch = "x86_64"))]
         match detect_simd_level() {
-            SimdLevel::Avx512 => add_assign_f32_avx512(dst, src),
-            SimdLevel::Avx2 => add_assign_f32_avx2(dst, src),
             SimdLevel::Sse => add_assign_f32_sse(dst, src),
-            SimdLevel::Scalar => add_assign_f32_scalar(dst, src),
+            _ => add_assign_f32_scalar(dst, src),
         }
     }
 
     #[inline]
     fn calculate_l2_norm(vec: &[Self]) -> Self {
+        #[cfg(target_arch = "x86_64")]
+        unsafe {
+            match detect_simd_level() {
+                SimdLevel::Avx512 => compute_l2_norm_f32_avx512(vec),
+                SimdLevel::Avx2 => compute_l2_norm_f32_avx2(vec),
+                SimdLevel::Sse => compute_l2_norm_f32_sse(vec),
+                SimdLevel::Scalar => compute_l2_norm_f32_scalar(vec),
+            }
+        }
+
+        #[cfg(not(target_arch = "x86_64"))]
         match detect_simd_level() {
-            SimdLevel::Avx512 => compute_l2_norm_f32_avx512(vec),
-            SimdLevel::Avx2 => compute_l2_norm_f32_avx2(vec),
             SimdLevel::Sse => compute_l2_norm_f32_sse(vec),
-            SimdLevel::Scalar => compute_l2_norm_f32_scalar(vec),
+            _ => compute_l2_norm_f32_scalar(vec),
         }
     }
 
     #[inline]
     fn calculate_l1_norm(vec: &[Self]) -> Self {
+        #[cfg(target_arch = "x86_64")]
+        unsafe {
+            match detect_simd_level() {
+                SimdLevel::Avx512 => compute_l1_norm_f32_avx512(vec),
+                SimdLevel::Avx2 => compute_l1_norm_f32_avx2(vec),
+                SimdLevel::Sse => compute_l1_norm_f32_sse(vec),
+                SimdLevel::Scalar => compute_l1_norm_f32_scalar(vec),
+            }
+        }
+
+        #[cfg(not(target_arch = "x86_64"))]
         match detect_simd_level() {
-            SimdLevel::Avx512 => compute_l1_norm_f32_avx512(vec),
-            SimdLevel::Avx2 => compute_l1_norm_f32_avx2(vec),
             SimdLevel::Sse => compute_l1_norm_f32_sse(vec),
-            SimdLevel::Scalar => compute_l1_norm_f32_scalar(vec),
+            _ => compute_l1_norm_f32_scalar(vec),
         }
     }
 }
@@ -4201,21 +4118,39 @@ impl SimdDistance for f32 {
 impl SimdDistance for f64 {
     #[inline]
     fn euclidean_simd(a: &[f64], b: &[f64]) -> f64 {
+        #[cfg(target_arch = "x86_64")]
+        unsafe {
+            match detect_simd_level() {
+                SimdLevel::Avx512 => euclidean_f64_avx512(a, b),
+                SimdLevel::Avx2 => euclidean_f64_avx2(a, b),
+                SimdLevel::Sse => euclidean_f64_sse(a, b),
+                SimdLevel::Scalar => euclidean_f64_scalar(a, b),
+            }
+        }
+
+        #[cfg(not(target_arch = "x86_64"))]
         match detect_simd_level() {
-            SimdLevel::Avx512 => euclidean_f64_avx512(a, b),
-            SimdLevel::Avx2 => euclidean_f64_avx2(a, b),
             SimdLevel::Sse => euclidean_f64_sse(a, b),
-            SimdLevel::Scalar => euclidean_f64_scalar(a, b),
+            _ => euclidean_f64_scalar(a, b),
         }
     }
 
     #[inline]
     fn dot_simd(a: &[f64], b: &[f64]) -> f64 {
+        #[cfg(target_arch = "x86_64")]
+        unsafe {
+            match detect_simd_level() {
+                SimdLevel::Avx512 => dot_f64_avx512(a, b),
+                SimdLevel::Avx2 => dot_f64_avx2(a, b),
+                SimdLevel::Sse => dot_f64_sse(a, b),
+                SimdLevel::Scalar => dot_f64_scalar(a, b),
+            }
+        }
+
+        #[cfg(not(target_arch = "x86_64"))]
         match detect_simd_level() {
-            SimdLevel::Avx512 => dot_f64_avx512(a, b),
-            SimdLevel::Avx2 => dot_f64_avx2(a, b),
             SimdLevel::Sse => dot_f64_sse(a, b),
-            SimdLevel::Scalar => dot_f64_scalar(a, b),
+            _ => dot_f64_scalar(a, b),
         }
     }
 
@@ -4248,71 +4183,134 @@ impl SimdDistance for f64 {
 
     #[inline]
     fn manhattan_simd(a: &[f64], b: &[f64]) -> f64 {
+        #[cfg(target_arch = "x86_64")]
+        unsafe {
+            match detect_simd_level() {
+                SimdLevel::Avx512 => manhattan_f64_avx512(a, b),
+                SimdLevel::Avx2 => manhattan_f64_avx2(a, b),
+                SimdLevel::Sse => manhattan_f64_sse(a, b),
+                SimdLevel::Scalar => manhattan_f64_sse(a, b),
+            }
+        }
+
+        #[cfg(not(target_arch = "x86_64"))]
         match detect_simd_level() {
-            SimdLevel::Avx512 => manhattan_f64_avx512(a, b),
-            SimdLevel::Avx2 => manhattan_f64_avx2(a, b),
             SimdLevel::Sse => manhattan_f64_sse(a, b),
-            SimdLevel::Scalar => manhattan_f64_sse(a, b),
+            _ => manhattan_f64_sse(a, b),
         }
     }
 
     #[inline]
     fn canberra_simd(a: &[f64], b: &[f64]) -> f64 {
+        #[cfg(target_arch = "x86_64")]
+        unsafe {
+            match detect_simd_level() {
+                SimdLevel::Avx512 => canberra_f64_avx512(a, b),
+                SimdLevel::Avx2 => canberra_f64_avx2(a, b),
+                SimdLevel::Sse => canberra_f64_sse(a, b),
+                SimdLevel::Scalar => canberra_f64_sse(a, b),
+            }
+        }
+
+        #[cfg(not(target_arch = "x86_64"))]
         match detect_simd_level() {
-            SimdLevel::Avx512 => canberra_f64_avx512(a, b),
-            SimdLevel::Avx2 => canberra_f64_avx2(a, b),
             SimdLevel::Sse => canberra_f64_sse(a, b),
-            SimdLevel::Scalar => canberra_f64_sse(a, b),
+            _ => canberra_f64_sse(a, b),
         }
     }
 
     #[inline]
     fn subtract_simd(a: &[f64], b: &[f64]) -> Vec<f64> {
+        #[cfg(target_arch = "x86_64")]
+        unsafe {
+            match detect_simd_level() {
+                SimdLevel::Avx512 => subtract_f64_avx512(a, b),
+                SimdLevel::Avx2 => subtract_f64_avx2(a, b),
+                SimdLevel::Sse => subtract_f64_sse(a, b),
+                SimdLevel::Scalar => subtract_f64_scalar(a, b),
+            }
+        }
+
+        #[cfg(not(target_arch = "x86_64"))]
         match detect_simd_level() {
-            SimdLevel::Avx512 => subtract_f64_avx512(a, b),
-            SimdLevel::Avx2 => subtract_f64_avx2(a, b),
             SimdLevel::Sse => subtract_f64_sse(a, b),
-            SimdLevel::Scalar => subtract_f64_scalar(a, b),
+            _ => subtract_f64_scalar(a, b),
         }
     }
 
     #[inline]
     fn add_simd(a: &[Self], b: &[Self]) -> Vec<Self> {
+        #[cfg(target_arch = "x86_64")]
+        unsafe {
+            match detect_simd_level() {
+                SimdLevel::Avx512 => add_f64_avx512(a, b),
+                SimdLevel::Avx2 => add_f64_avx2(a, b),
+                SimdLevel::Sse => add_f64_sse(a, b),
+                SimdLevel::Scalar => add_f64_scalar(a, b),
+            }
+        }
+
+        #[cfg(not(target_arch = "x86_64"))]
         match detect_simd_level() {
-            SimdLevel::Avx512 => add_f64_avx512(a, b),
-            SimdLevel::Avx2 => add_f64_avx2(a, b),
             SimdLevel::Sse => add_f64_sse(a, b),
-            SimdLevel::Scalar => add_f64_scalar(a, b),
+            _ => add_f64_scalar(a, b),
         }
     }
 
     #[inline]
     fn add_assign_simd(dst: &mut [Self], src: &[Self]) {
+        #[cfg(target_arch = "x86_64")]
+        unsafe {
+            match detect_simd_level() {
+                SimdLevel::Avx512 => add_assign_f64_avx512(dst, src),
+                SimdLevel::Avx2 => add_assign_f64_avx2(dst, src),
+                SimdLevel::Sse => add_assign_f64_sse(dst, src),
+                SimdLevel::Scalar => add_assign_f64_scalar(dst, src),
+            }
+        }
+
+        #[cfg(not(target_arch = "x86_64"))]
         match detect_simd_level() {
-            SimdLevel::Avx512 => add_assign_f64_avx512(dst, src),
-            SimdLevel::Avx2 => add_assign_f64_avx2(dst, src),
             SimdLevel::Sse => add_assign_f64_sse(dst, src),
-            SimdLevel::Scalar => add_assign_f64_scalar(dst, src),
+            _ => add_assign_f64_scalar(dst, src),
         }
     }
 
     #[inline]
     fn calculate_l2_norm(vec: &[Self]) -> Self {
+        #[cfg(target_arch = "x86_64")]
+        unsafe {
+            match detect_simd_level() {
+                SimdLevel::Avx512 => compute_l2_norm_f64_avx512(vec),
+                SimdLevel::Avx2 => compute_l2_norm_f64_avx2(vec),
+                SimdLevel::Sse => compute_l2_norm_f64_sse(vec),
+                SimdLevel::Scalar => compute_l2_norm_f64_scalar(vec),
+            }
+        }
+
+        #[cfg(not(target_arch = "x86_64"))]
         match detect_simd_level() {
-            SimdLevel::Avx512 => compute_l2_norm_f64_avx512(vec),
-            SimdLevel::Avx2 => compute_l2_norm_f64_avx2(vec),
             SimdLevel::Sse => compute_l2_norm_f64_sse(vec),
-            SimdLevel::Scalar => compute_l2_norm_f64_scalar(vec),
+            _ => compute_l2_norm_f64_scalar(vec),
         }
     }
 
     #[inline]
     fn calculate_l1_norm(vec: &[Self]) -> Self {
+        #[cfg(target_arch = "x86_64")]
+        unsafe {
+            match detect_simd_level() {
+                SimdLevel::Avx512 => compute_l1_norm_f64_avx512(vec),
+                SimdLevel::Avx2 => compute_l1_norm_f64_avx2(vec),
+                SimdLevel::Sse => compute_l1_norm_f64_sse(vec),
+                SimdLevel::Scalar => compute_l1_norm_f64_scalar(vec),
+            }
+        }
+
+        #[cfg(not(target_arch = "x86_64"))]
         match detect_simd_level() {
-            SimdLevel::Avx512 => compute_l1_norm_f64_avx512(vec),
-            SimdLevel::Avx2 => compute_l1_norm_f64_avx2(vec),
             SimdLevel::Sse => compute_l1_norm_f64_sse(vec),
-            SimdLevel::Scalar => compute_l1_norm_f64_scalar(vec),
+            _ => compute_l1_norm_f64_scalar(vec),
         }
     }
 }
@@ -4677,6 +4675,9 @@ unsafe fn bf16x4_to_f32x4_sse(ptr: *const bf16) -> __m128 {
 
 /// Horizontal sum of 4 f32 values in SSE register
 ///
+/// Not bf16-specific despite living here: the 256-bit reduction and the f32
+/// AVX2 kernels both end on it.
+///
 /// ### Params
 ///
 /// * `v` - 128-bit register containing 4 f32 values
@@ -4688,7 +4689,7 @@ unsafe fn bf16x4_to_f32x4_sse(ptr: *const bf16) -> __m128 {
 /// ### Returns
 ///
 /// Sum of all 4 f32 values
-#[cfg(all(feature = "quantised", target_arch = "x86_64"))]
+#[cfg(target_arch = "x86_64")]
 #[inline(always)]
 unsafe fn hsum_f32_sse(v: __m128) -> f32 {
     // [a, b, c, d] -> [b, b, d, d]
@@ -4741,7 +4742,7 @@ unsafe fn bf16x8_to_f32x8_avx2(ptr: *const bf16) -> __m256 {
 /// ### Returns
 ///
 /// Sum of all 8 f32 values
-#[cfg(all(feature = "quantised", target_arch = "x86_64"))]
+#[cfg(target_arch = "x86_64")]
 #[inline(always)]
 unsafe fn hsum_f32_avx2(v: __m256) -> f32 {
     // Extract high and low 128-bit lanes
@@ -4766,12 +4767,8 @@ unsafe fn hsum_f32_avx2(v: __m256) -> f32 {
 /// ### Returns
 ///
 /// 512-bit register containing 16 f32 values
-#[cfg(all(
-    feature = "quantised",
-    target_arch = "x86_64",
-    target_feature = "avx512f"
-))]
-#[inline(always)]
+#[cfg(all(feature = "quantised", target_arch = "x86_64"))]
+#[target_feature(enable = "avx512f")]
 unsafe fn bf16x16_to_f32x16_avx512(ptr: *const bf16) -> __m512 {
     // Load 256 bits (16 x bf16)
     let raw = _mm256_loadu_si256(ptr as *const __m256i);
@@ -4870,7 +4867,7 @@ fn euclidean_bf16_scalar(a: &[bf16], b: &[bf16]) -> f32 {
 ///
 /// Squared Euclidean distance
 #[cfg(all(feature = "quantised", target_arch = "x86_64"))]
-#[inline(always)]
+#[target_feature(enable = "sse4.1")]
 fn euclidean_bf16_sse(a: &[bf16], b: &[bf16]) -> f32 {
     let len = a.len();
     let chunks = len / 4;
@@ -4908,7 +4905,7 @@ fn euclidean_bf16_sse(a: &[bf16], b: &[bf16]) -> f32 {
 ///
 /// Squared Euclidean distance
 #[cfg(all(feature = "quantised", target_arch = "x86_64"))]
-#[inline(always)]
+#[target_feature(enable = "avx2,fma")]
 fn euclidean_bf16_avx2(a: &[bf16], b: &[bf16]) -> f32 {
     let len = a.len();
     let chunks = len / 8;
@@ -4945,12 +4942,8 @@ fn euclidean_bf16_avx2(a: &[bf16], b: &[bf16]) -> f32 {
 /// ### Returns
 ///
 /// Squared Euclidean distance
-#[cfg(all(
-    feature = "quantised",
-    target_arch = "x86_64",
-    target_feature = "avx512f"
-))]
-#[inline(always)]
+#[cfg(all(feature = "quantised", target_arch = "x86_64"))]
+#[target_feature(enable = "avx512f")]
 fn euclidean_bf16_avx512(a: &[bf16], b: &[bf16]) -> f32 {
     let len = a.len();
     let chunks = len / 16;
@@ -4975,18 +4968,6 @@ fn euclidean_bf16_avx512(a: &[bf16], b: &[bf16]) -> f32 {
         sum
     }
 }
-
-/// Euclidean distance - AVX-512 fallback for non-AVX512 compilation
-#[cfg(all(
-    feature = "quantised",
-    target_arch = "x86_64",
-    not(target_feature = "avx512f")
-))]
-#[inline(always)]
-fn euclidean_bf16_avx512(a: &[bf16], b: &[bf16]) -> f32 {
-    euclidean_bf16_avx2(a, b)
-}
-
 /// Euclidean distance between bf16 vectors - NEON (128-bit, aarch64)
 ///
 /// ### Params
@@ -5039,7 +5020,7 @@ fn euclidean_bf16_neon(a: &[bf16], b: &[bf16]) -> f32 {
 #[inline]
 pub fn euclidean_bf16_simd(a: &[bf16], b: &[bf16]) -> f32 {
     #[cfg(target_arch = "x86_64")]
-    {
+    unsafe {
         match crate::detect_simd_level() {
             crate::SimdLevel::Avx512 => euclidean_bf16_avx512(a, b),
             crate::SimdLevel::Avx2 => euclidean_bf16_avx2(a, b),
@@ -5096,7 +5077,7 @@ fn euclidean_bf16_f32_scalar(a: &[bf16], b: &[f32]) -> f32 {
 ///
 /// Squared Euclidean distance
 #[cfg(all(feature = "quantised", target_arch = "x86_64"))]
-#[inline(always)]
+#[target_feature(enable = "sse4.1")]
 fn euclidean_bf16_f32_sse(a: &[bf16], b: &[f32]) -> f32 {
     let len = a.len();
     let chunks = len / 4;
@@ -5131,7 +5112,7 @@ fn euclidean_bf16_f32_sse(a: &[bf16], b: &[f32]) -> f32 {
 ///
 /// Squared Euclidean distance
 #[cfg(all(feature = "quantised", target_arch = "x86_64"))]
-#[inline(always)]
+#[target_feature(enable = "avx2,fma")]
 fn euclidean_bf16_f32_avx2(a: &[bf16], b: &[f32]) -> f32 {
     let len = a.len();
     let chunks = len / 8;
@@ -5165,12 +5146,8 @@ fn euclidean_bf16_f32_avx2(a: &[bf16], b: &[f32]) -> f32 {
 /// ### Returns
 ///
 /// Squared Euclidean distance
-#[cfg(all(
-    feature = "quantised",
-    target_arch = "x86_64",
-    target_feature = "avx512f"
-))]
-#[inline(always)]
+#[cfg(all(feature = "quantised", target_arch = "x86_64"))]
+#[target_feature(enable = "avx512f")]
 fn euclidean_bf16_f32_avx512(a: &[bf16], b: &[f32]) -> f32 {
     let len = a.len();
     let chunks = len / 16;
@@ -5193,27 +5170,6 @@ fn euclidean_bf16_f32_avx512(a: &[bf16], b: &[f32]) -> f32 {
         sum
     }
 }
-
-/// Euclidean distance: bf16 vs f32 - AVX512 fallback to AVX2
-///
-/// ### Params
-///
-/// * `a` - bf16 vector slice
-/// * `b` - f32 vector slice
-///
-/// ### Returns
-///
-/// Squared Euclidean distance
-#[cfg(all(
-    feature = "quantised",
-    target_arch = "x86_64",
-    not(target_feature = "avx512f")
-))]
-#[inline(always)]
-fn euclidean_bf16_f32_avx512(a: &[bf16], b: &[f32]) -> f32 {
-    euclidean_bf16_f32_avx2(a, b)
-}
-
 /// Euclidean distance: bf16 vs f32 - NEON (128-bit, aarch64)
 ///
 /// ### Params
@@ -5288,7 +5244,7 @@ fn euclidean_bf16_f64_scalar(a: &[bf16], b: &[f64]) -> f32 {
 ///
 /// Squared Euclidean distance (f64 converted to f32)
 #[cfg(all(feature = "quantised", target_arch = "x86_64"))]
-#[inline(always)]
+#[target_feature(enable = "sse4.1")]
 fn euclidean_bf16_f64_sse(a: &[bf16], b: &[f64]) -> f32 {
     let len = a.len();
     let chunks = len / 4;
@@ -5336,7 +5292,7 @@ fn euclidean_bf16_f64_sse(a: &[bf16], b: &[f64]) -> f32 {
 ///
 /// Squared Euclidean distance (f64 converted to f32)
 #[cfg(all(feature = "quantised", target_arch = "x86_64"))]
-#[inline(always)]
+#[target_feature(enable = "avx2,fma")]
 fn euclidean_bf16_f64_avx2(a: &[bf16], b: &[f64]) -> f32 {
     let len = a.len();
     let chunks = len / 8;
@@ -5384,12 +5340,8 @@ fn euclidean_bf16_f64_avx2(a: &[bf16], b: &[f64]) -> f32 {
 /// ### Returns
 ///
 /// Squared Euclidean distance (f64 converted to f32)
-#[cfg(all(
-    feature = "quantised",
-    target_arch = "x86_64",
-    target_feature = "avx512f"
-))]
-#[inline(always)]
+#[cfg(all(feature = "quantised", target_arch = "x86_64"))]
+#[target_feature(enable = "avx512f")]
 fn euclidean_bf16_f64_avx512(a: &[bf16], b: &[f64]) -> f32 {
     let len = a.len();
     let chunks = len / 16;
@@ -5424,27 +5376,6 @@ fn euclidean_bf16_f64_avx512(a: &[bf16], b: &[f64]) -> f32 {
         sum
     }
 }
-
-/// Euclidean distance: bf16 vs f64 - AVX512 fallback to AVX2
-///
-/// ### Params
-///
-/// * `a` - bf16 vector slice
-/// * `b` - f64 vector slice
-///
-/// ### Returns
-///
-/// Squared Euclidean distance (f64 converted to f32)
-#[cfg(all(
-    feature = "quantised",
-    target_arch = "x86_64",
-    not(target_feature = "avx512f")
-))]
-#[inline(always)]
-fn euclidean_bf16_f64_avx512(a: &[bf16], b: &[f64]) -> f32 {
-    euclidean_bf16_f64_avx2(a, b)
-}
-
 /// Euclidean distance: bf16 vs f64 - NEON (128-bit, aarch64)
 ///
 /// Processes 4 elements per iteration: bf16x4 → f32x4, f64x2+f64x2 → f32x4
@@ -5512,7 +5443,7 @@ fn euclidean_bf16_f64_neon(a: &[bf16], b: &[f64]) -> f32 {
 #[inline]
 pub fn euclidean_bf16_f32_simd(a: &[bf16], b: &[f32]) -> f32 {
     #[cfg(target_arch = "x86_64")]
-    {
+    unsafe {
         match detect_simd_level() {
             SimdLevel::Avx512 => euclidean_bf16_f32_avx512(a, b),
             SimdLevel::Avx2 => euclidean_bf16_f32_avx2(a, b),
@@ -5546,7 +5477,7 @@ pub fn euclidean_bf16_f32_simd(a: &[bf16], b: &[f32]) -> f32 {
 #[inline]
 pub fn euclidean_bf16_f64_simd(a: &[bf16], b: &[f64]) -> f32 {
     #[cfg(target_arch = "x86_64")]
-    {
+    unsafe {
         match detect_simd_level() {
             SimdLevel::Avx512 => euclidean_bf16_f64_avx512(a, b),
             SimdLevel::Avx2 => euclidean_bf16_f64_avx2(a, b),
@@ -5600,7 +5531,7 @@ fn dot_bf16_scalar(a: &[bf16], b: &[bf16]) -> f32 {
 ///
 /// Dot product
 #[cfg(all(feature = "quantised", target_arch = "x86_64"))]
-#[inline(always)]
+#[target_feature(enable = "sse4.1")]
 fn dot_bf16_sse(a: &[bf16], b: &[bf16]) -> f32 {
     let len = a.len();
     let chunks = len / 4;
@@ -5634,7 +5565,7 @@ fn dot_bf16_sse(a: &[bf16], b: &[bf16]) -> f32 {
 ///
 /// Dot product
 #[cfg(all(feature = "quantised", target_arch = "x86_64"))]
-#[inline(always)]
+#[target_feature(enable = "avx2,fma")]
 fn dot_bf16_avx2(a: &[bf16], b: &[bf16]) -> f32 {
     let len = a.len();
     let chunks = len / 8;
@@ -5667,12 +5598,8 @@ fn dot_bf16_avx2(a: &[bf16], b: &[bf16]) -> f32 {
 /// ### Returns
 ///
 /// Dot product
-#[cfg(all(
-    feature = "quantised",
-    target_arch = "x86_64",
-    target_feature = "avx512f"
-))]
-#[inline(always)]
+#[cfg(all(feature = "quantised", target_arch = "x86_64"))]
+#[target_feature(enable = "avx512f")]
 fn dot_bf16_avx512(a: &[bf16], b: &[bf16]) -> f32 {
     let len = a.len();
     let chunks = len / 16;
@@ -5694,18 +5621,6 @@ fn dot_bf16_avx512(a: &[bf16], b: &[bf16]) -> f32 {
         sum
     }
 }
-
-/// Dot product - AVX-512 fallback for non-AVX512 compilation
-#[cfg(all(
-    feature = "quantised",
-    target_arch = "x86_64",
-    not(target_feature = "avx512f")
-))]
-#[inline(always)]
-fn dot_bf16_avx512(a: &[bf16], b: &[bf16]) -> f32 {
-    dot_bf16_avx2(a, b)
-}
-
 /// Dot product of bf16 vectors - NEON (128-bit, aarch64)
 ///
 /// ### Params
@@ -5754,7 +5669,7 @@ fn dot_bf16_neon(a: &[bf16], b: &[bf16]) -> f32 {
 #[inline]
 pub fn dot_bf16_simd(a: &[bf16], b: &[bf16]) -> f32 {
     #[cfg(target_arch = "x86_64")]
-    {
+    unsafe {
         match crate::detect_simd_level() {
             crate::SimdLevel::Avx512 => dot_bf16_avx512(a, b),
             crate::SimdLevel::Avx2 => dot_bf16_avx2(a, b),
@@ -5805,7 +5720,7 @@ fn dot_bf16_f32_scalar(a: &[bf16], b: &[f32]) -> f32 {
 ///
 /// Dot product
 #[cfg(all(feature = "quantised", target_arch = "x86_64"))]
-#[inline(always)]
+#[target_feature(enable = "sse4.1")]
 fn dot_bf16_f32_sse(a: &[bf16], b: &[f32]) -> f32 {
     let len = a.len();
     let chunks = len / 4;
@@ -5838,7 +5753,7 @@ fn dot_bf16_f32_sse(a: &[bf16], b: &[f32]) -> f32 {
 ///
 /// Dot product
 #[cfg(all(feature = "quantised", target_arch = "x86_64"))]
-#[inline(always)]
+#[target_feature(enable = "avx2,fma")]
 fn dot_bf16_f32_avx2(a: &[bf16], b: &[f32]) -> f32 {
     let len = a.len();
     let chunks = len / 8;
@@ -5870,12 +5785,8 @@ fn dot_bf16_f32_avx2(a: &[bf16], b: &[f32]) -> f32 {
 /// ### Returns
 ///
 /// Dot product
-#[cfg(all(
-    feature = "quantised",
-    target_arch = "x86_64",
-    target_feature = "avx512f"
-))]
-#[inline(always)]
+#[cfg(all(feature = "quantised", target_arch = "x86_64"))]
+#[target_feature(enable = "avx512f")]
 fn dot_bf16_f32_avx512(a: &[bf16], b: &[f32]) -> f32 {
     let len = a.len();
     let chunks = len / 16;
@@ -5896,27 +5807,6 @@ fn dot_bf16_f32_avx512(a: &[bf16], b: &[f32]) -> f32 {
         sum
     }
 }
-
-/// Dot product: bf16 vs f32 - AVX512 fallback to AVX2
-///
-/// ### Params
-///
-/// * `a` - bf16 vector slice
-/// * `b` - f32 vector slice
-///
-/// ### Returns
-///
-/// Dot product
-#[cfg(all(
-    feature = "quantised",
-    target_arch = "x86_64",
-    not(target_feature = "avx512f")
-))]
-#[inline(always)]
-fn dot_bf16_f32_avx512(a: &[bf16], b: &[f32]) -> f32 {
-    dot_bf16_f32_avx2(a, b)
-}
-
 /// Dot product: bf16 vs f32 - NEON (128-bit, aarch64)
 ///
 /// ### Params
@@ -5984,7 +5874,7 @@ fn dot_bf16_f64_scalar(a: &[bf16], b: &[f64]) -> f32 {
 ///
 /// Dot product (f64 converted to f32)
 #[cfg(all(feature = "quantised", target_arch = "x86_64"))]
-#[inline(always)]
+#[target_feature(enable = "sse4.1")]
 fn dot_bf16_f64_sse(a: &[bf16], b: &[f64]) -> f32 {
     let len = a.len();
     let chunks = len / 4;
@@ -6025,7 +5915,7 @@ fn dot_bf16_f64_sse(a: &[bf16], b: &[f64]) -> f32 {
 ///
 /// Dot product (f64 converted to f32)
 #[cfg(all(feature = "quantised", target_arch = "x86_64"))]
-#[inline(always)]
+#[target_feature(enable = "avx2,fma")]
 fn dot_bf16_f64_avx2(a: &[bf16], b: &[f64]) -> f32 {
     let len = a.len();
     let chunks = len / 8;
@@ -6065,12 +5955,8 @@ fn dot_bf16_f64_avx2(a: &[bf16], b: &[f64]) -> f32 {
 /// ### Returns
 ///
 /// Dot product (f64 converted to f32)
-#[cfg(all(
-    feature = "quantised",
-    target_arch = "x86_64",
-    target_feature = "avx512f"
-))]
-#[inline(always)]
+#[cfg(all(feature = "quantised", target_arch = "x86_64"))]
+#[target_feature(enable = "avx512f")]
 fn dot_bf16_f64_avx512(a: &[bf16], b: &[f64]) -> f32 {
     let len = a.len();
     let chunks = len / 16;
@@ -6099,27 +5985,6 @@ fn dot_bf16_f64_avx512(a: &[bf16], b: &[f64]) -> f32 {
         sum
     }
 }
-
-/// Dot product: bf16 vs f64 - AVX512 fallback to AVX2
-///
-/// ### Params
-///
-/// * `a` - bf16 vector slice
-/// * `b` - f64 vector slice
-///
-/// ### Returns
-///
-/// Dot product (f64 converted to f32)
-#[cfg(all(
-    feature = "quantised",
-    target_arch = "x86_64",
-    not(target_feature = "avx512f")
-))]
-#[inline(always)]
-fn dot_bf16_f64_avx512(a: &[bf16], b: &[f64]) -> f32 {
-    dot_bf16_f64_avx2(a, b)
-}
-
 /// Dot product: bf16 vs f64 - NEON (128-bit, aarch64)
 ///
 /// ### Params
@@ -6179,7 +6044,7 @@ fn dot_bf16_f64_neon(a: &[bf16], b: &[f64]) -> f32 {
 #[inline]
 pub fn dot_bf16_f32_simd(a: &[bf16], b: &[f32]) -> f32 {
     #[cfg(target_arch = "x86_64")]
-    {
+    unsafe {
         match detect_simd_level() {
             SimdLevel::Avx512 => dot_bf16_f32_avx512(a, b),
             SimdLevel::Avx2 => dot_bf16_f32_avx2(a, b),
@@ -6213,7 +6078,7 @@ pub fn dot_bf16_f32_simd(a: &[bf16], b: &[f32]) -> f32 {
 #[inline]
 pub fn dot_bf16_f64_simd(a: &[bf16], b: &[f64]) -> f32 {
     #[cfg(target_arch = "x86_64")]
-    {
+    unsafe {
         match detect_simd_level() {
             SimdLevel::Avx512 => dot_bf16_f64_avx512(a, b),
             SimdLevel::Avx2 => dot_bf16_f64_avx2(a, b),

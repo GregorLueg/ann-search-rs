@@ -1,0 +1,86 @@
+name: SIMD codegen and x86 benchmark
+
+# Manual only. Two things that cannot be checked from an Apple Silicon
+# machine: what instructions the x86_64 build actually emits, and what the
+# wider vector paths are worth on real x86 hardware.
+#
+# GitHub's standard runners are AVX2+FMA and have no AVX-512, so the 512-bit
+# kernels get compile coverage and a codegen count here, never a timing.
+
+on:
+  workflow_dispatch:
+    inputs:
+      bench:
+        description: Run the gridsearch timings as well as the codegen count.
+        type: boolean
+        default: true
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # What the default build emits. Zero `ymm` means the AVX2 dispatch arm is a
+  # fiction, which is exactly the bug this workflow exists to catch: no test
+  # can see it, because the numbers come out right either way.
+  codegen:
+    name: x86_64 codegen count
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Emit asm for the default build
+        run: cargo rustc --release --lib --features quantised,binary -- --emit asm
+
+      - name: Count vector instructions
+        run: |
+          asm=$(ls -t target/release/deps/ann_search_rs-*.s | head -1)
+          echo "asm: $asm"
+          for insn in ymm zmm vfmadd popcnt xmm; do
+            printf '%-8s %s\n' "$insn" "$(grep -c "$insn" "$asm" || true)"
+          done
+          for insn in ymm zmm vfmadd; do
+            n=$(grep -c "$insn" "$asm" || true)
+            if [ "$n" -eq 0 ]; then
+              echo "::error::no $insn in the default x86_64 build: the wide-vector dispatch arms are not real"
+              exit 1
+            fi
+          done
+
+  # Baseline against `-C target-cpu=x86-64-v3`. The delta is the ceiling of the
+  # whole SIMD exercise, per index type. Small datasets on purpose: the answer
+  # wanted is the ratio between two builds of the same kernel, not a throughput
+  # number, and the published tables in docs/ are where absolute numbers live.
+  bench:
+    name: gridsearch (${{ matrix.label }})
+    if: inputs.bench
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - label: baseline
+            rustflags: ''
+          - label: x86-64-v3
+            rustflags: '-C target-cpu=x86-64-v3'
+    env:
+      RUSTFLAGS: ${{ matrix.rustflags }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.label }}
+
+      - name: HNSW
+        run: cargo run --example gridsearch_hnsw --release -- --n-samples 10000 --dim 64
+
+      - name: IVF
+        run: cargo run --example gridsearch_ivf --release -- --n-samples 10000 --dim 96
+
+      - name: PQ
+        run: cargo run --example gridsearch_pq --release --features quantised -- --n-samples 10000 --dim 256
