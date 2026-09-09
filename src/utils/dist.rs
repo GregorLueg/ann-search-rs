@@ -7673,13 +7673,35 @@ mod tests {
             let got = f64::euclidean_simd_batch_4(&q64, y64);
             let got_dot = f64::dot_simd_batch_4(&q64, y64);
             let got_l1 = f64::manhattan_simd_batch_4(&q64, y64);
+            // Same reasoning as the f32 block, and it bites harder here. Both
+            // kernels fuse their multiply and add, so each rounds once instead
+            // of twice, and the two summation orders no longer agree to the
+            // bit: the single-row kernel carries four accumulators over 16-wide
+            // blocks, the batch kernel one per row over 4-wide steps. At a
+            // squared distance of ~8e4 an f64 ulp is 1.5e-11, so `epsilon`
+            // alone demanded better than bit-equality and `max_relative`
+            // defaulted to about one ulp. Summation-order spread grows like
+            // `sqrt(dim) * f64::EPSILON`, ~3e-15 relative at these lengths;
+            // 1e-12 leaves headroom for that and is still far tighter than any
+            // real kernel bug, which moves the value by a relative 1e-3 or more.
             for k in 0..4 {
-                assert_relative_eq!(got[k], f64::euclidean_simd(&q64, y64[k]), epsilon = 1e-12);
-                assert_relative_eq!(got_dot[k], f64::dot_simd(&q64, y64[k]), epsilon = 1e-12);
+                assert_relative_eq!(
+                    got[k],
+                    f64::euclidean_simd(&q64, y64[k]),
+                    epsilon = 1e-9,
+                    max_relative = 1e-12
+                );
+                assert_relative_eq!(
+                    got_dot[k],
+                    f64::dot_simd(&q64, y64[k]),
+                    epsilon = 1e-9,
+                    max_relative = 1e-12
+                );
                 assert_relative_eq!(
                     got_l1[k],
                     f64::manhattan_simd(&q64, y64[k]),
-                    epsilon = 1e-12
+                    epsilon = 1e-9,
+                    max_relative = 1e-12
                 );
             }
         }
