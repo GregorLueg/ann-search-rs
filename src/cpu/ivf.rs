@@ -175,7 +175,7 @@ where
         let (training_data, _) = sample_vectors(&vectors_flat, dim, n, n_train, seed);
 
         if verbose {
-            println!("  Generating IVF index with {} Voronoi cells.", nlist);
+            println!("Generating IVF index with {} Voronoi cells.", nlist);
         }
 
         // 2. train the centroids
