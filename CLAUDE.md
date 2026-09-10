@@ -37,6 +37,12 @@ cargo run --example gridsearch_pq     --release --features quantised
 cargo run --example gridsearch_gpu    --release --features gpu
 cargo run --example gridsearch_rabitq --release --features binary
 
+# CPU distance-kernel microbench. One forced SIMD level per run: the level is
+# process-wide and resolved on first use, so it cannot be switched mid-run.
+ANN_SEARCH_SIMD=scalar cargo run --example bench_dist_kernels --release
+ANN_SEARCH_SIMD=sse    cargo run --example bench_dist_kernels --release
+ANN_SEARCH_SIMD=avx2   cargo run --example bench_dist_kernels --release
+
 # GPU kernel microbenches (CubeCL Benchmark harness, not criterion)
 cargo bench --bench gpu_ivf_kernels        --features gpu
 cargo bench --bench gpu_exhaustive_kernels --features gpu
@@ -134,7 +140,9 @@ NSG is the exception: it builds from an existing kNN graph, so alongside `build_
 ### Parallelism & SIMD
 
 - Queries fan out over samples using two shared helpers in `lib.rs`: `query_parallel` and `query_parallel_with_flags` (the latter tracks LSH miss rate). Both drive `rayon::into_par_iter` and centralise the verbose-progress counter. New algorithms should reuse these rather than rolling their own par-iters.
-- Distance calculations in `utils/dist.rs` use the `wide` crate for portable SIMD (`f32x4/f32x8/f64x2/f64x4`). Runtime CPU-feature dispatch happens through a `OnceLock`-cached enum, so per-call cost is negligible.
+- Distance calculations in `utils/dist.rs` dispatch on a `OnceLock`-cached `SimdLevel`, probed once per process. The 128-bit arm and the whole aarch64 path use the `wide` crate (`f32x4`/`f64x2`); the 256- and 512-bit arms are hand-written `std::arch` intrinsics behind `#[target_feature(enable = "avx2,fma")]` / `"avx512f"`. **This split is not a style choice.** `wide` picks its vector width from `#[cfg(target_feature = "avx")]`, a compile-time cfg, so on a crate built for the x86-64 baseline its `f32x8` is a pair of `f32x4` and every operation is two SSE ops. A `wide`-based kernel therefore cannot be runtime-dispatched: it silently emits SSE2 no matter which arm selects it, and no test can see the difference because the answers are identical. New wide-vector kernels go in `std::arch`.
+- `#[inline(always)]` and `#[target_feature]` cannot coexist (E0658), so the dispatched kernels are real calls. A helper carrying an identical `enable = "..."` string still inlines into them; one with fewer features does too. One with more does not, and rustc warns.
+- Set `ANN_SEARCH_SIMD` to `scalar`, `sse`, `avx2` or `avx512` to force a level. It only ever downgrades, since naming a level the CPU lacks would run an illegal instruction. `cargo run --example bench_dist_kernels --release` prices the kernels at whichever level is forced; `.github/workflows/simd-check.yml` runs it at three levels on demand, and gates every SIMD PR on the x86_64 build actually emitting `ymm`, `zmm` and `vfmadd`.
 - Prefetching helper `utils::prefetch_read` inlines `_mm_prefetch` on x86_64 and `prfm pldl1keep` inline-asm on aarch64. Anywhere you're chasing an indirection in a hot loop, keep the prefetch pattern.
 
 ### Validation harness

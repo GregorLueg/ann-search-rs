@@ -3235,7 +3235,7 @@ fn euclidean_f32_batch4_sse(q: &[f32], y: [&[f32]; 4]) -> [f32; 4] {
 
 /// Squared Euclidean against four rows, 256-bit lanes.
 ///
-/// Also serves AVX-512 builds: the wider path would need a fifth set of
+/// Also serves [`SimdLevel::Avx512`]: the wider path would need a fifth set of
 /// accumulators to pay for itself and the gather, not the arithmetic, is the
 /// binding constraint here.
 ///
@@ -3507,7 +3507,7 @@ fn manhattan_f32_batch4_sse(q: &[f32], y: [&[f32]; 4]) -> [f32; 4] {
 
 /// Manhattan distance against four rows, 256-bit lanes.
 ///
-/// Also serves AVX-512 builds: the gather, not the arithmetic, is the
+/// Also serves [`SimdLevel::Avx512`]: the gather, not the arithmetic, is the
 /// binding constraint, so a wider lane buys little here.
 ///
 /// ### Params
@@ -3654,7 +3654,7 @@ fn euclidean_f64_batch4_sse(q: &[f64], y: [&[f64]; 4]) -> [f64; 4] {
 
 /// Squared Euclidean against four rows, 256-bit lanes.
 ///
-/// Also serves AVX-512 builds: the gather, not the arithmetic, is the
+/// Also serves [`SimdLevel::Avx512`]: the gather, not the arithmetic, is the
 /// binding constraint, so a wider lane buys little here.
 ///
 /// ### Params
@@ -3794,7 +3794,7 @@ fn dot_f64_batch4_sse(q: &[f64], y: [&[f64]; 4]) -> [f64; 4] {
 
 /// Dot product against four rows, 256-bit lanes.
 ///
-/// Also serves AVX-512 builds: the gather, not the arithmetic, is the
+/// Also serves [`SimdLevel::Avx512`]: the gather, not the arithmetic, is the
 /// binding constraint, so a wider lane buys little here.
 ///
 /// ### Params
@@ -3928,7 +3928,7 @@ fn manhattan_f64_batch4_sse(q: &[f64], y: [&[f64]; 4]) -> [f64; 4] {
 
 /// Manhattan distance against four rows, 256-bit lanes.
 ///
-/// Also serves AVX-512 builds: the gather, not the arithmetic, is the
+/// Also serves [`SimdLevel::Avx512`]: the gather, not the arithmetic, is the
 /// binding constraint, so a wider lane buys little here.
 ///
 /// ### Params
