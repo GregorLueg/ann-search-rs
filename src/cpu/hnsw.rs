@@ -268,14 +268,6 @@ where
             .position(|&l| l == max_layer)
             .unwrap_or(0) as u32;
 
-        if verbose {
-            println!("Max layer: {}, Entry point: {}", max_layer, entry_point);
-            for l in 0..=max_layer {
-                let count = layer_assignments.iter().filter(|&&x| x >= l).count();
-                println!("  Layer {}: {} nodes", l, count.separate_with_underscores());
-            }
-        }
-
         // Create construction graph with proper per-layer storage
         let threads = rayon::current_num_threads();
         let construction_graph = ConstructionGraph::new(n, &layer_assignments, m, threads);

@@ -1,0 +1,116 @@
+name: SIMD codegen and x86 benchmark
+
+# Two things that cannot be checked from an Apple Silicon machine: what
+# instructions the x86_64 build actually emits, and what the wider vector paths
+# are worth on real x86 hardware.
+#
+# GitHub's standard runners are AVX2+FMA and have no AVX-512, so the 512-bit
+# kernels get compile coverage and a codegen count here, never a timing.
+#
+# The codegen guard runs on every pull request that touches the SIMD code. The
+# benchmark does not: the answer only changes when a kernel does, so it wants
+# asking for. `workflow_dispatch` is the usual
+# way, but GitHub only registers a dispatchable workflow once it is on the
+# default branch, so before this file merges the way to get a timing is the
+# `simd-bench` label on the pull request.
+
+on:
+  workflow_dispatch:
+    inputs:
+      bench:
+        description: Run the kernel microbenchmark as well as the codegen count.
+        type: boolean
+        default: true
+  pull_request:
+    # `labeled` is not in the default set, so without it adding `simd-bench`
+    # changes nothing: the job condition is only ever evaluated on a run, and
+    # no run would start.
+    types: [ opened, synchronize, reopened, labeled ]
+    branches: [ main ]
+    paths:
+      - 'src/utils/dist.rs'
+      - 'src/binary/dist_binary.rs'
+      - 'src/binary/turboquant/**'
+      - '.github/workflows/simd-check.yml'
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # What the default build emits. Zero `ymm` means the AVX2 dispatch arm is a
+  # fiction, which is exactly the bug this workflow exists to catch: no test
+  # can see it, because the numbers come out right either way.
+  codegen:
+    name: x86_64 codegen count
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      # Deliberately without `binary`: `dist_binary.rs` and `turboquant/` were
+      # already emitting AVX2 and AVX-512 when `dist.rs` was not, so a build
+      # carrying them satisfies the assertion below no matter what `dist.rs`
+      # does. This feature set makes the guard load-bearing.
+      - name: Emit asm for the default build
+        run: cargo rustc --release --lib --features quantised -- --emit asm
+
+      - name: Count vector instructions
+        run: |
+          asm=$(find target/release/deps -name 'ann_search_rs-*.s' | sort | tail -1)
+          echo "asm: $asm"
+          for insn in ymm zmm vfmadd popcnt xmm; do
+            printf '%-8s %s\n' "$insn" "$(grep -c "$insn" "$asm" || true)"
+          done
+          for insn in ymm zmm vfmadd; do
+            n=$(grep -c "$insn" "$asm" || true)
+            if [ "$n" -eq 0 ]; then
+              echo "::error::no $insn in the default x86_64 build: the wide-vector dispatch arms are not real"
+              exit 1
+            fi
+          done
+
+  # Prices the distance kernels directly, one forced SIMD level per run.
+  #
+  # The gridsearch examples used to live here and could not answer the
+  # question: exhaustive search goes through faer's `matmul` once the query
+  # batch is large enough, k-means assigns through it too, and the graph walks
+  # that do call the kernels are bound by the pointer chase and the result heap.
+  #
+  # `ANN_SEARCH_SIMD` only ever lowers the level, and it is resolved once per
+  # process, hence one run each rather than one run with a loop. On x86-64
+  # `sse` is what every level compiled to before the kernels were written
+  # against `std::arch`, so `sse` against `avx2` is the before-and-after.
+  # There is no `avx512` run: no hosted runner has it, and the request would
+  # just clamp back to `avx2`.
+  bench:
+    name: distance kernels
+    if: >-
+      inputs.bench ||
+      contains(github.event.pull_request.labels.*.name, 'simd-bench')
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build
+        run: cargo build --release --example bench_dist_kernels
+
+      - name: Scalar
+        run: cargo run --release --example bench_dist_kernels
+        env:
+          ANN_SEARCH_SIMD: scalar
+
+      - name: SSE (128-bit, what the crate used to emit everywhere)
+        run: cargo run --release --example bench_dist_kernels
+        env:
+          ANN_SEARCH_SIMD: sse
+
+      - name: AVX2 (256-bit + FMA)
+        run: cargo run --release --example bench_dist_kernels
+        env:
+          ANN_SEARCH_SIMD: avx2

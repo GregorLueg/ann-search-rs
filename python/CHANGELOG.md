@@ -3,6 +3,12 @@
 Changes to the `ann-search` Python package. The Rust crate it wraps,
 `ann-search-rs`, has its own changelog at [`../CHANGELOG.md`](../CHANGELOG.md).
 
+## 0.2.2
+
+Requires `ann-search-rs` 0.8.3.
+
+- Take the x86_64 updates forward in terms of SIMD.
+
 ## 0.2.1
 
 Requires `ann-search-rs` 0.8.2.
@@ -12,7 +18,7 @@ Requires `ann-search-rs` 0.8.2.
 
 ## 0.2.0
 
-Requires `ann-search-rs` 0.8.1. First release on PyPI.
+Requires `ann-search-rs` 0.8.1.
 
 - The eleven quantised indices are now bound: `ExhaustiveBf16Index`,
   `IvfBf16Index`, `ExhaustiveSq8Index`, `IvfSq8Index`, `HnswSq8uIndex`,
@@ -26,7 +32,7 @@ Requires `ann-search-rs` 0.8.1. First release on PyPI.
 
 ## 0.1.0
 
-Requires `ann-search-rs` 0.7.0. Never published; installable from the repo.
+Requires `ann-search-rs` 0.7.0. First release on PyPI.
 
 - Python bindings under `python/`, built with PyO3 and maturin. scikit-learn
   shaped estimators over the CPU indices, plus the synthetic generators.
