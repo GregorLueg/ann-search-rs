@@ -78,10 +78,14 @@ jobs:
   #   baseline      vs x86-64-v3  what is left above it, in code the dispatch
   #                               does not reach
   #
-  # Both PR legs already select the AVX2 kernels at runtime, so a flat
-  # `baseline` -> `x86-64-v3` delta on the exhaustive rows is the *good* result:
-  # it says the kernels no longer respond to a build flag. Reading that as "the
-  # port did nothing" needs the `main` leg to refute it, which is why it is here.
+  # Read the rows with care. The exhaustive scan goes through faer's `matmul`
+  # for euclidean and cosine once the batch is large enough (`gemm_applies` in
+  # cpu/exhaustive.rs), and k-means assigns through `gemm_assign_full`, so those
+  # rows measure faer, which does its own runtime dispatch, and say nothing
+  # about `utils/dist.rs`. The rows that do exercise the dispatched kernels are
+  # the IVF and HNSW *query* walks, and those are bound by the pointer chase and
+  # the result heap rather than the arithmetic. This suite is an end-to-end
+  # instrument, not a kernel one.
   #
   # Small datasets on purpose: these are ratios between builds, not throughput.
   # The published tables in docs/ are where absolute numbers live.
