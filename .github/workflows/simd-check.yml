@@ -72,10 +72,19 @@ jobs:
             fi
           done
 
-  # Baseline against `-C target-cpu=x86-64-v3`. The delta is the ceiling of the
-  # whole SIMD exercise, per index type. Small datasets on purpose: the answer
-  # wanted is the ratio between two builds of the same kernel, not a throughput
-  # number, and the published tables in docs/ are where absolute numbers live.
+  # Three points, because two of them answer different questions.
+  #
+  #   main-baseline vs baseline   what the runtime dispatch bought
+  #   baseline      vs x86-64-v3  what is left above it, in code the dispatch
+  #                               does not reach
+  #
+  # Both PR legs already select the AVX2 kernels at runtime, so a flat
+  # `baseline` -> `x86-64-v3` delta on the exhaustive rows is the *good* result:
+  # it says the kernels no longer respond to a build flag. Reading that as "the
+  # port did nothing" needs the `main` leg to refute it, which is why it is here.
+  #
+  # Small datasets on purpose: these are ratios between builds, not throughput.
+  # The published tables in docs/ are where absolute numbers live.
   bench:
     name: gridsearch (${{ matrix.label }})
     if: >-
@@ -87,14 +96,22 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          # `ref` empty means the pull request's own merge commit.
+          - label: main-baseline
+            ref: main
+            rustflags: ''
           - label: baseline
+            ref: ''
             rustflags: ''
           - label: x86-64-v3
+            ref: ''
             rustflags: '-C target-cpu=x86-64-v3'
     env:
       RUSTFLAGS: ${{ matrix.rustflags }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ matrix.ref }}
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
