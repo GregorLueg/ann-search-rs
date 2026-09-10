@@ -139,7 +139,11 @@ pub fn parse_ann_dist(s: &str) -> Option<Dist> {
 /// the x86-64 baseline its `f32x8` is a pair of `f32x4` and every operation on
 /// it is two SSE ops. That is why only [`SimdLevel::Sse`] and the aarch64 path
 /// still use `wide`.
-#[derive(Clone, Copy, Debug)]
+///
+/// The variants are ordered by width, so they compare: `Scalar < Sse < Avx2 <
+/// Avx512`. [`detect_simd_level`] uses that to clamp an `ANN_SEARCH_SIMD`
+/// request to what the CPU can actually run.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum SimdLevel {
     /// Scalar version
     Scalar,
@@ -177,17 +181,62 @@ static SIMD_LEVEL: OnceLock<SimdLevel> = OnceLock::new();
 #[inline(always)]
 pub fn detect_simd_level() -> SimdLevel {
     *SIMD_LEVEL.get_or_init(|| {
-        if is_x86_feature_detected!("avx512f") && is_x86_feature_detected!("fma") {
-            return SimdLevel::Avx512;
-        }
-        if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
-            return SimdLevel::Avx2;
-        }
-        if is_x86_feature_detected!("sse4.1") {
-            return SimdLevel::Sse;
-        }
-        SimdLevel::Scalar
+        let detected = if is_x86_feature_detected!("avx512f") && is_x86_feature_detected!("fma") {
+            SimdLevel::Avx512
+        } else if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
+            SimdLevel::Avx2
+        } else if is_x86_feature_detected!("sse4.1") {
+            SimdLevel::Sse
+        } else {
+            SimdLevel::Scalar
+        };
+        cap_simd_level(detected)
     })
+}
+
+/// Lower the detected level if `ANN_SEARCH_SIMD` asks for it
+///
+/// Downgrade only. Naming a level the CPU does not have would run an illegal
+/// instruction, so a request above `detected` is refused rather than honoured.
+/// This exists because the width a kernel runs at is otherwise invisible from
+/// outside the process: the answers are identical either way, so the only way
+/// to price one path against another is to force it. Read once, inside the
+/// `OnceLock`, so it costs nothing per call.
+///
+/// ### Params
+///
+/// * `detected` - The widest level this CPU actually supports
+///
+/// ### Returns
+///
+/// The requested level when it is no wider than `detected`, else `detected`.
+#[cfg(target_arch = "x86_64")]
+fn cap_simd_level(detected: SimdLevel) -> SimdLevel {
+    let Ok(request) = std::env::var("ANN_SEARCH_SIMD") else {
+        return detected;
+    };
+    // Set-but-empty is how a shell passes "no opinion", so treat it as unset
+    // rather than shouting about an unknown level.
+    if request.trim().is_empty() {
+        return detected;
+    }
+
+    let requested = match request.trim().to_lowercase().as_str() {
+        "scalar" => SimdLevel::Scalar,
+        "sse" => SimdLevel::Sse,
+        "avx2" => SimdLevel::Avx2,
+        "avx512" => SimdLevel::Avx512,
+        other => {
+            eprintln!("ANN_SEARCH_SIMD: unknown level {other:?}, using {detected:?}");
+            return detected;
+        }
+    };
+
+    if requested > detected {
+        eprintln!("ANN_SEARCH_SIMD: this CPU cannot run {requested:?}, using {detected:?}");
+        return detected;
+    }
+    requested
 }
 
 /// Function to detect which SIMD implementation to use

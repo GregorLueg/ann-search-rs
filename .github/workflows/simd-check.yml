@@ -8,8 +8,8 @@ name: SIMD codegen and x86 benchmark
 # kernels get compile coverage and a codegen count here, never a timing.
 #
 # The codegen guard runs on every pull request that touches the SIMD code. The
-# benchmark does not: it is minutes of runner time and the answer only changes
-# when a kernel does, so it wants asking for. `workflow_dispatch` is the usual
+# benchmark does not: the answer only changes when a kernel does, so it wants
+# asking for. `workflow_dispatch` is the usual
 # way, but GitHub only registers a dispatchable workflow once it is on the
 # default branch, so before this file merges the way to get a timing is the
 # `simd-bench` label on the pull request.
@@ -18,7 +18,7 @@ on:
   workflow_dispatch:
     inputs:
       bench:
-        description: Run the gridsearch timings as well as the codegen count.
+        description: Run the kernel microbenchmark as well as the codegen count.
         type: boolean
         default: true
   pull_request:
@@ -72,56 +72,45 @@ jobs:
             fi
           done
 
-  # Three points, because two of them answer different questions.
+  # Prices the distance kernels directly, one forced SIMD level per run.
   #
-  #   main-baseline vs baseline   what the runtime dispatch bought
-  #   baseline      vs x86-64-v3  what is left above it, in code the dispatch
-  #                               does not reach
+  # The gridsearch examples used to live here and could not answer the
+  # question: exhaustive search goes through faer's `matmul` once the query
+  # batch is large enough, k-means assigns through it too, and the graph walks
+  # that do call the kernels are bound by the pointer chase and the result heap.
   #
-  # Both PR legs already select the AVX2 kernels at runtime, so a flat
-  # `baseline` -> `x86-64-v3` delta on the exhaustive rows is the *good* result:
-  # it says the kernels no longer respond to a build flag. Reading that as "the
-  # port did nothing" needs the `main` leg to refute it, which is why it is here.
-  #
-  # Small datasets on purpose: these are ratios between builds, not throughput.
-  # The published tables in docs/ are where absolute numbers live.
+  # `ANN_SEARCH_SIMD` only ever lowers the level, and it is resolved once per
+  # process, hence one run each rather than one run with a loop. On x86-64
+  # `sse` is what every level compiled to before the kernels were written
+  # against `std::arch`, so `sse` against `avx2` is the before-and-after.
+  # There is no `avx512` run: no hosted runner has it, and the request would
+  # just clamp back to `avx2`.
   bench:
-    name: gridsearch (${{ matrix.label }})
+    name: distance kernels
     if: >-
       inputs.bench ||
       contains(github.event.pull_request.labels.*.name, 'simd-bench')
     runs-on: ubuntu-latest
-    timeout-minutes: 60
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          # `ref` empty means the pull request's own merge commit.
-          - label: main-baseline
-            ref: main
-            rustflags: ''
-          - label: baseline
-            ref: ''
-            rustflags: ''
-          - label: x86-64-v3
-            ref: ''
-            rustflags: '-C target-cpu=x86-64-v3'
-    env:
-      RUSTFLAGS: ${{ matrix.rustflags }}
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
-        with:
-          ref: ${{ matrix.ref }}
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-        with:
-          key: ${{ matrix.label }}
 
-      - name: HNSW
-        run: cargo run --example gridsearch_hnsw --release -- --n-samples 10000 --dim 64
+      - name: Build
+        run: cargo build --release --example bench_dist_kernels
 
-      - name: IVF
-        run: cargo run --example gridsearch_ivf --release -- --n-samples 10000 --dim 96
+      - name: Scalar
+        run: cargo run --release --example bench_dist_kernels
+        env:
+          ANN_SEARCH_SIMD: scalar
 
-      - name: PQ
-        run: cargo run --example gridsearch_pq --release --features quantised -- --n-samples 10000 --dim 256
+      - name: SSE (128-bit, what the crate used to emit everywhere)
+        run: cargo run --release --example bench_dist_kernels
+        env:
+          ANN_SEARCH_SIMD: sse
+
+      - name: AVX2 (256-bit + FMA)
+        run: cargo run --release --example bench_dist_kernels
+        env:
+          ANN_SEARCH_SIMD: avx2
