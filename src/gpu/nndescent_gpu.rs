@@ -1522,11 +1522,10 @@ where
     R: Runtime,
     T: CubeclFloat + AnnSearchFloat,
 {
-    // needs to be allowed here, because dim_padded is the relevant dim for GPU
-    // indices
-    #[allow(clippy::misnamed_getters)]
+    // The raw dim is what a caller hands in; padding to `dim_padded` happens
+    // inside the query paths.
     fn dim(&self) -> usize {
-        self.dim_padded
+        self.dim
     }
 }
 
@@ -3386,6 +3385,57 @@ mod tests {
 
         assert_eq!(index.dim, 3);
         assert_eq!(index.nav_graph.len(), 12 * 3);
+    }
+
+    /// Regression test: querying an index whose dim is not a multiple of
+    /// `LINE_SIZE`.
+    ///
+    /// `DimensionValidation::dim` used to report `dim_padded`, so
+    /// `query_batch_gpu` rejected the raw query dim with a bogus
+    /// `DimensionMismatch`. The padding itself happens inside
+    /// `cagra_search_batch_gpu`, so the check was the only thing wrong.
+    #[test]
+    fn test_nndescent_gpu_query_unpadded_dim() {
+        let Some(device) = try_device() else {
+            eprintln!("Skipping test: no wgpu backend available");
+            return;
+        };
+
+        // dim = 6, LINE_SIZE = 4, so dim_padded = 8
+        let data = Mat::from_fn(32, 6, |i, j| ((i * 7 + j * 3) % 11) as f32);
+
+        let mut index = NNDescentGpu::<f32, WgpuRuntime>::build(
+            data.as_ref(),
+            Dist::SquaredEuclidean,
+            Some(5),
+            None,
+            Some(10),
+            None,
+            Some(0.001),
+            Some(0.5),
+            None,
+            42,
+            false,
+            false,
+            device,
+        )
+        .unwrap();
+
+        // `dim()` is ambiguous here: NNDescentGpu also implements
+        // `VectorDistance`, which carries a `dim` method of its own.
+        assert_eq!(DimensionValidation::dim(&index), 6);
+
+        let queries: Vec<f32> = (0..2 * 6).map(|i| ((i * 7) % 11) as f32).collect();
+        let (indices, distances) = index.query_batch_gpu(&queries, 2, None, 3, 42).unwrap();
+
+        assert_eq!(indices.len(), 2);
+        assert_eq!(indices[0].len(), 3);
+        assert_eq!(distances.len(), 2);
+        for row in &indices {
+            for &idx in row {
+                assert!(idx < 32, "bogus neighbour ID {idx}");
+            }
+        }
     }
 
     #[test]

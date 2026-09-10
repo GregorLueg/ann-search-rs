@@ -127,6 +127,9 @@ On the M1 Max the benchmarks ran on, the GPU exhaustive path comes out around
 1.7x faster than the CPU one, and CAGRA's build cost means it only wins overall
 past a few hundred thousand points. See [GPU](docs/gpu.md).
 
+Any `n_features` works. The kernels want rows padded to a multiple of four, and
+the index does that for you on `fit` and on `kneighbors`.
+
 Three differences from the CPU estimators, all forced by the backend:
 
 - **float32 only.** WGSL has no float64, so `fit` narrows rather than failing

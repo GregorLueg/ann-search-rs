@@ -3,6 +3,14 @@
 Changes to the `ann-search` Python package. The Rust crate it wraps,
 `ann-search-rs`, has its own changelog at [`../CHANGELOG.md`](../CHANGELOG.md).
 
+## 0.2.3
+
+Requires `ann-search-rs` 0.8.4.
+
+- Picks up the GPU query fix: `ExhaustiveGpuIndex`, `IvfGpuIndex` and
+  `CagraGpuIndex` rejected any query whose `n_features` was not a multiple of
+  four with a dimension-mismatch error.
+
 ## 0.2.2
 
 Requires `ann-search-rs` 0.8.3.

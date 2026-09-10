@@ -3,6 +3,17 @@
 Changes to the `ann-search-rs` crate. The Python package `ann-search` has its
 own changelog at [`python/CHANGELOG.md`](python/CHANGELOG.md).
 
+## 0.8.4
+
+**Fix**
+
+- The GPU indices (`ExhaustiveIndexGpu`, `IvfIndexGpu`, `NNDescentGpu`) reported
+  their padded dimensionality from `DimensionValidation::dim`, while the query
+  paths checked the raw query dimensionality against it. Any query against an
+  index whose `dim` was not a multiple of the kernels' line size was rejected
+  with a bogus `DimensionMismatch`, even though the padding right after the
+  check was correct. `dim()` now returns the raw dimensionality.
+
 ## 0.8.3
 
 **Fix**

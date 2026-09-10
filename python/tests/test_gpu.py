@@ -52,6 +52,21 @@ def test_cross_set_query_shape(cls, clustered):
 
 
 @pytest.mark.parametrize("cls", GPU_INDICES, ids=lambda c: c.__name__)
+def test_query_with_unpadded_n_features(cls, clustered):
+    """A dim that is not a multiple of the kernels' line size used to raise.
+
+    The index reported its padded dimensionality, the query path checked the raw
+    one against it, and every cross-set query on such an index came back as a
+    dimension mismatch.
+    """
+    data = np.ascontiguousarray(clustered[:, :6])
+    idx = cls(n_neighbors=5).fit(data)
+    dist, ind = idx.kneighbors(data[:16])
+    assert dist.shape == ind.shape == (16, 5)
+    assert ind.max() < len(data)
+
+
+@pytest.mark.parametrize("cls", GPU_INDICES, ids=lambda c: c.__name__)
 def test_float64_input_is_narrowed_to_float32(cls, clustered):
     idx = cls(n_neighbors=5).fit(clustered.astype(np.float64))
     assert idx._handle.dtype == "float32"

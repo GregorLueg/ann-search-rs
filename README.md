@@ -350,7 +350,9 @@ for details. Benchmarks are
 [here](https://github.com/GregorLueg/ann-search-rs/blob/main/docs/benchmarks_gpu.md),
 with the kNN-graph paths split out
 [here](https://github.com/GregorLueg/ann-search-rs/blob/main/docs/benchmarks_knn_graph.md).
-To unlock GPU-acceleration, please use:
+Any dimensionality works: rows are padded to a multiple of the kernels' line
+size on build and on query, so the caller never has to round `dim` up. To unlock
+GPU-acceleration, please use:
 
 ```toml
 [dependencies]
