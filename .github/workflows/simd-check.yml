@@ -22,6 +22,10 @@ on:
         type: boolean
         default: true
   pull_request:
+    # `labeled` is not in the default set, so without it adding `simd-bench`
+    # changes nothing: the job condition is only ever evaluated on a run, and
+    # no run would start.
+    types: [ opened, synchronize, reopened, labeled ]
     branches: [ main ]
     paths:
       - 'src/utils/dist.rs'
