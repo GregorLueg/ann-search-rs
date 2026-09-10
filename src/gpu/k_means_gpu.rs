@@ -211,7 +211,7 @@ pub fn flash_assign_euclidean_vec<S: Float, A: Float, N: Size>(
     while c + cu <= k {
         #[unroll]
         for u in 0..CENTROID_UNROLL {
-            accs[u] = Vector::<A, N>::new(A::new(0.0));
+            accs[u] = Vector::<A, N>::new(A::new(0.0_f32));
         }
         for i in 0..dim_lines {
             let pv = p[i];
@@ -224,7 +224,7 @@ pub fn flash_assign_euclidean_vec<S: Float, A: Float, N: Size>(
         #[unroll]
         for u in 0..CENTROID_UNROLL {
             let av = accs[u];
-            let mut sum = A::new(0.0);
+            let mut sum = A::new(0.0_f32);
             #[unroll]
             for lane in 0..LINE_SIZE {
                 sum += av[lane];
@@ -240,12 +240,12 @@ pub fn flash_assign_euclidean_vec<S: Float, A: Float, N: Size>(
     // Tail for `k` not divisible by CENTROID_UNROLL.
     while c < k {
         let cbase = c as usize * dim_lines;
-        let mut acc = Vector::<A, N>::new(A::new(0.0));
+        let mut acc = Vector::<A, N>::new(A::new(0.0_f32));
         for i in 0..dim_lines {
             let diff = p[i] - centroids[cbase + i];
             acc += diff * diff;
         }
-        let mut sum = A::new(0.0);
+        let mut sum = A::new(0.0_f32);
         #[unroll]
         for lane in 0..LINE_SIZE {
             sum += acc[lane];
@@ -325,7 +325,7 @@ pub fn flash_assign_cosine_vec<S: Float, A: Float, N: Size>(
     while c + cu <= k {
         #[unroll]
         for u in 0..CENTROID_UNROLL {
-            accs[u] = Vector::<A, N>::new(A::new(0.0));
+            accs[u] = Vector::<A, N>::new(A::new(0.0_f32));
         }
         for i in 0..dim_lines {
             let pv = p[i];
@@ -337,12 +337,12 @@ pub fn flash_assign_cosine_vec<S: Float, A: Float, N: Size>(
         #[unroll]
         for u in 0..CENTROID_UNROLL {
             let av = accs[u];
-            let mut dot = A::new(0.0);
+            let mut dot = A::new(0.0_f32);
             #[unroll]
             for lane in 0..LINE_SIZE {
                 dot += av[lane];
             }
-            let dist = A::new(1.0) - dot / (pnorm * centroid_norms[c as usize + u]);
+            let dist = A::new(1.0_f32) - dot / (pnorm * centroid_norms[c as usize + u]);
             if dist < best_dist {
                 best_dist = dist;
                 best_idx = c + u as u32;
@@ -354,16 +354,16 @@ pub fn flash_assign_cosine_vec<S: Float, A: Float, N: Size>(
     // Tail for `k` not divisible by CENTROID_UNROLL.
     while c < k {
         let cbase = c as usize * dim_lines;
-        let mut acc = Vector::<A, N>::new(A::new(0.0));
+        let mut acc = Vector::<A, N>::new(A::new(0.0_f32));
         for i in 0..dim_lines {
             acc += p[i] * centroids[cbase + i];
         }
-        let mut dot = A::new(0.0);
+        let mut dot = A::new(0.0_f32);
         #[unroll]
         for lane in 0..LINE_SIZE {
             dot += acc[lane];
         }
-        let dist = A::new(1.0) - dot / (pnorm * centroid_norms[c as usize]);
+        let dist = A::new(1.0_f32) - dot / (pnorm * centroid_norms[c as usize]);
         if dist < best_dist {
             best_dist = dist;
             best_idx = c;
@@ -535,7 +535,7 @@ pub fn min_dist_euclidean_vec<S: Float, A: Float, N: Size>(
     while c + cu <= k {
         #[unroll]
         for u in 0..CENTROID_UNROLL {
-            accs[u] = Vector::<A, N>::new(A::new(0.0));
+            accs[u] = Vector::<A, N>::new(A::new(0.0_f32));
         }
         for i in 0..dim_lines {
             let pv = p[i];
@@ -548,7 +548,7 @@ pub fn min_dist_euclidean_vec<S: Float, A: Float, N: Size>(
         #[unroll]
         for u in 0..CENTROID_UNROLL {
             let av = accs[u];
-            let mut sum = A::new(0.0);
+            let mut sum = A::new(0.0_f32);
             #[unroll]
             for lane in 0..LINE_SIZE {
                 sum += av[lane];
@@ -562,12 +562,12 @@ pub fn min_dist_euclidean_vec<S: Float, A: Float, N: Size>(
 
     while c < k {
         let cbase = c as usize * dim_lines;
-        let mut acc = Vector::<A, N>::new(A::new(0.0));
+        let mut acc = Vector::<A, N>::new(A::new(0.0_f32));
         for i in 0..dim_lines {
             let diff = p[i] - cands[cbase + i];
             acc += diff * diff;
         }
-        let mut sum = A::new(0.0);
+        let mut sum = A::new(0.0_f32);
         #[unroll]
         for lane in 0..LINE_SIZE {
             sum += acc[lane];
@@ -640,16 +640,16 @@ pub fn min_dist_cosine_vec<S: Float, A: Float, N: Size>(
     let mut c = 0u32;
     while c < k {
         let cbase = c as usize * dim_lines;
-        let mut acc = Vector::<A, N>::new(A::new(0.0));
+        let mut acc = Vector::<A, N>::new(A::new(0.0_f32));
         for i in 0..dim_lines {
             acc += p[i] * cands[cbase + i];
         }
-        let mut dot = A::new(0.0);
+        let mut dot = A::new(0.0_f32);
         #[unroll]
         for lane in 0..LINE_SIZE {
             dot += acc[lane];
         }
-        let dist = A::new(1.0) - dot / (pnorm * cand_norms[c as usize]);
+        let dist = A::new(1.0_f32) - dot / (pnorm * cand_norms[c as usize]);
         if dist < best {
             best = dist;
         }
@@ -1380,7 +1380,7 @@ pub fn segmented_centroid_update<S: Float, A: Float>(
         terminate!();
     }
 
-    let inv_count = A::new(1.0) / A::cast_from(count);
+    let inv_count = A::new(1.0_f32) / A::cast_from(count);
     let cent_base = cluster as usize * dim;
 
     // Thread `tx` owns output dimension `e0` and point sub-stripe `sub`. The
@@ -1397,7 +1397,7 @@ pub fn segmented_centroid_update<S: Float, A: Float>(
 
     let mut e = e0;
     while e < dim {
-        let mut acc = A::new(0.0);
+        let mut acc = A::new(0.0_f32);
         let mut p = sub;
 
         // Unrolled body: every index load is hoisted above the data load that
@@ -1429,7 +1429,7 @@ pub fn segmented_centroid_update<S: Float, A: Float>(
             sync_cube();
         }
         if sub == 0u32 {
-            let mut total = A::new(0.0);
+            let mut total = A::new(0.0_f32);
             #[unroll]
             for s in 0..n_sub {
                 total += s_part[s * dim_eff + e0];
@@ -1626,7 +1626,7 @@ pub fn balance_reseed_centroids<S: Float, A: Float>(
     let target = fix_target[f as usize] as usize;
     let donor = all_indices[fix_pos[f as usize] as usize] as usize;
     let w = fix_weight[f as usize];
-    let denom = w + A::new(1.0);
+    let denom = w + A::new(1.0_f32);
 
     let c_base = target * dim;
     let d_base = donor * dim;
