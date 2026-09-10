@@ -21,9 +21,9 @@ use num_traits::{FromPrimitive, ToPrimitive};
 #[cfg(all(feature = "quantised", target_arch = "aarch64"))]
 use std::arch::aarch64::*;
 
-////////////////////
+//////////////////
 // Tuning knobs //
-////////////////////
+//////////////////
 
 /// Number of independent accumulator chains in the SIMD reduction loops.
 ///
@@ -162,12 +162,6 @@ static SIMD_LEVEL: OnceLock<SimdLevel> = OnceLock::new();
 ///
 /// Only x86-64 needs a runtime probe, and it must keep one: a shipped crate
 /// cannot assume AVX2 without an illegal-instruction crash on older hardware.
-/// Every other target resolves at compile time, which matters more than it
-/// looks. Behind the `OnceLock` the level is opaque to the optimiser, so the
-/// dispatch `match` and the kernel call survive into the inner loop; as a
-/// constant they both fold away and the kernel inlines. At `dim = 32` the
-/// kernel is only a couple of dozen SIMD instructions, so that overhead was a
-/// significant fraction of it.
 ///
 /// FMA is probed alongside AVX2 because the 256- and 512-bit kernels are
 /// compiled with `#[target_feature(enable = "avx2,fma")]` and use

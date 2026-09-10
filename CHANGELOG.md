@@ -7,7 +7,8 @@ own changelog at [`python/CHANGELOG.md`](python/CHANGELOG.md).
 
 **Fix**
 
-- avx2 and avx512 SIMD wired in properly for x86_64.
+- avx2 and avx512 SIMD wired in properly for x86_64. Benchmarks show decent
+  acceleration for avx2 over SSE.
 
 ## 0.8.2
 

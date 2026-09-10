@@ -5,9 +5,9 @@ Changes to the `ann-search` Python package. The Rust crate it wraps,
 
 ## 0.2.2
 
-Requires `ann-search-rs` 0.8.2.
+Requires `ann-search-rs` 0.8.3.
 
-- Take the x86_64 updates forward.
+- Take the x86_64 updates forward in terms of SIMD.
 
 ## 0.2.1
 
