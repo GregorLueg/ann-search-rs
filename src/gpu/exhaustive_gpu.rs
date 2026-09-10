@@ -40,11 +40,10 @@ where
     R: Runtime,
     T: CubeclFloat + AnnSearchFloat,
 {
-    // needs to be allowed here, because dim_padded is the relevant dim for GPU
-    // indices
-    #[allow(clippy::misnamed_getters)]
+    // The raw dim is what a caller hands in; padding to `dim_padded` happens
+    // inside the query paths.
     fn dim(&self) -> usize {
-        self.dim_padded
+        self.dim
     }
 }
 
@@ -116,8 +115,8 @@ where
     ///
     /// ### Params
     ///
-    /// * `query_mat` - The samples x features matrix to query. n(features)
-    ///   needs to be divisible by 4!
+    /// * `query_mat` - The samples x features matrix to query. n(features) must
+    ///   match the index; padding to `dim_padded` happens here.
     /// * `k` - Number of neighbours to return
     /// * `verbose` - Controls verbosity of the function
     ///
@@ -255,6 +254,37 @@ mod tests {
 
         // First query [1,0,0,0] should match first db vector perfectly
         assert_eq!(indices[0][0], 0);
+        assert!(distances[0][0] < 0.01);
+    }
+
+    /// Regression test: a dim that is not a multiple of `LINE_SIZE`.
+    ///
+    /// `DimensionValidation::dim` used to report `dim_padded`, so every query
+    /// against an index with an unpadded dim was rejected with a bogus
+    /// `DimensionMismatch` before it ever reached the GPU.
+    #[test]
+    fn test_exhaustive_index_query_unpadded_dim() {
+        let device = CpuDevice;
+
+        // dim = 6, LINE_SIZE = 4, so dim_padded = 8
+        let data = Mat::from_fn(8, 6, |i, j| if i == j { 1.0_f32 } else { 0.0_f32 });
+
+        let index = ExhaustiveIndexGpu::<f32, CpuRuntime>::new(
+            data.as_ref(),
+            Dist::SquaredEuclidean,
+            device,
+        )
+        .unwrap();
+
+        assert_eq!(index.dim(), 6);
+
+        let query = Mat::from_fn(2, 6, |i, j| if i == j { 1.0_f32 } else { 0.0_f32 });
+
+        let (indices, distances) = index.query_batch(query.as_ref(), 3, false).unwrap();
+
+        assert_eq!(indices.len(), 2);
+        assert_eq!(indices[0][0], 0);
+        assert_eq!(indices[1][0], 1);
         assert!(distances[0][0] < 0.01);
     }
 

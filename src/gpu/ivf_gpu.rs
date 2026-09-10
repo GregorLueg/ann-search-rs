@@ -188,11 +188,10 @@ where
     R: Runtime,
     T: CubeclFloat + AnnSearchFloat,
 {
-    // needs to be allowed here, because dim_padded is the relevant dim for GPU
-    // indices
-    #[allow(clippy::misnamed_getters)]
+    // The raw dim is what a caller hands in; padding to `dim_padded` happens
+    // inside the query paths.
     fn dim(&self) -> usize {
-        self.dim_padded
+        self.dim
     }
 }
 
@@ -361,7 +360,6 @@ where
     ///
     /// * `queries_flat` - The query vector flattened
     /// * `n_queries` - The number of queries
-    /// * `dim_query` - The dimensions
     /// * `k` - Number of neighbours per query
     /// * `nprobe` - Number of clusters to search (defaults to √nlist)
     /// * `nquery` - Number of vectors to load in one go into the GPU. If not
@@ -371,20 +369,22 @@ where
     /// ### Returns
     ///
     /// Tuple of `(Vec<indices>, Vec<dist>)` for the queries.
+    ///
+    /// ### Note
+    ///
+    /// `queries_flat` is expected to be padded to `dim_padded` already; the
+    /// raw query dimension is validated by the public entry points.
     #[allow(clippy::too_many_arguments)]
     fn query_internal(
         &self,
         queries_flat: &[T],
         n_queries: usize,
-        dim_query: usize,
         k: usize,
         nprobe: Option<usize>,
         nquery: Option<usize>,
         client: &ComputeClient<R>,
         verbose: bool,
     ) -> KnnResult<T> {
-        self.check_dim(dim_query)?;
-
         let nprobe = nprobe
             .unwrap_or_else(|| ((self.nlist as f64).sqrt() as usize).max(1))
             .min(self.nlist);
@@ -489,7 +489,6 @@ where
         let (indices, dist) = self.query_internal(
             &queries_padded,
             n_queries,
-            self.dim_padded,
             k,
             nprobe,
             Some(batch_size),
@@ -546,7 +545,6 @@ where
         let (indices_reorg, dist_reorg) = self.query_internal(
             vectors_by_cluster,
             self.n,
-            self.dim_padded,
             k,
             Some(nprobe),
             Some(batch_size),
@@ -1137,6 +1135,47 @@ mod tests {
         assert_eq!(indices.len(), 1);
         assert_eq!(indices[0].len(), 10);
         assert_eq!(distances[0].len(), 10);
+    }
+
+    /// Regression test: a dim that is not a multiple of `LINE_SIZE`.
+    ///
+    /// `DimensionValidation::dim` used to report `dim_padded`, so `query_batch`
+    /// rejected every query against an index with an unpadded dim, and the
+    /// check inside `query_internal` only passed because it was handed the
+    /// padded dim.
+    #[test]
+    fn test_ivf_index_query_unpadded_dim() {
+        let device = CpuDevice;
+
+        // dim = 6, LINE_SIZE = 4, so dim_padded = 8
+        let data = Mat::from_fn(50, 6, |i, j| if i % 6 == j { 1.0_f32 } else { 0.1_f32 });
+
+        let index = IvfIndexGpu::<f32, CpuRuntime>::build(
+            data.as_ref(),
+            Dist::SquaredEuclidean,
+            Some(5),
+            get_default_k_means(),
+            42,
+            false,
+            device,
+        )
+        .unwrap();
+
+        assert_eq!(index.dim(), 6);
+
+        let query = Mat::from_fn(3, 6, |i, j| if i == j { 1.0_f32 } else { 0.1_f32 });
+
+        let (indices, distances) = index
+            .query_batch(query.as_ref(), 3, Some(5), None, false)
+            .unwrap();
+
+        assert_eq!(indices.len(), 3);
+        assert_eq!(indices[0].len(), 3);
+        assert_eq!(distances.len(), 3);
+
+        // Self-query path feeds `query_internal` the padded dim directly.
+        let (knn, _) = index.generate_knn(3, Some(5), None, false, false).unwrap();
+        assert_eq!(knn.len(), 50);
     }
 
     #[test]
