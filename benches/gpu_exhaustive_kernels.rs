@@ -355,11 +355,11 @@ impl<R: Runtime> Benchmark for DistanceRegBench<R> {
         let vec_size = LINE_SIZE;
 
         let limits = GpuLimits::from_client(&self.client);
-        let wg_y = pick_wg_y(self.cfg.dim, size_of::<f32>(), &limits)
-            .expect("dim outside pick_wg_y table");
-        if !tile_fits(wg_y) {
-            return Err(format!("wg_y {wg_y} not divisible by TILE_Q {TILE_Q}"));
-        }
+        let plan = match plan_exhaustive_staging(self.cfg.dim, size_of::<f32>(), &limits) {
+            Some(p) => p,
+            None => return Err(format!("no staging plan for dim {}", self.cfg.dim)),
+        };
+        let wg_y = plan.wg_y;
         let threads_y = wg_y / TILE_Q as u32;
 
         let grid_x = (ndb as u32).div_ceil(WORKGROUP_SIZE_X * TILE_D as u32);
@@ -394,6 +394,7 @@ impl<R: Runtime> Benchmark for DistanceRegBench<R> {
                     wg_y,
                     TILE_D,
                     TILE_Q,
+                    plan.kb_lines,
                 );
             },
             _ => unsafe {
@@ -413,6 +414,7 @@ impl<R: Runtime> Benchmark for DistanceRegBench<R> {
                     wg_y,
                     TILE_D,
                     TILE_Q,
+                    plan.kb_lines,
                 );
             },
         }

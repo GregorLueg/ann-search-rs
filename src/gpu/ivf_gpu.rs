@@ -686,6 +686,10 @@ where
                     safe_worksize_y,
                     TILE_D,
                     TILE_Q,
+                    // Whole-row staging, i.e. one block: this path stages
+                    // centroids, not the database, and has not been measured
+                    // against a blocked reduction axis.
+                    dim_lines,
                 );
             },
             Dist::Cosine if tile_fits(safe_worksize_y) => unsafe {
@@ -711,6 +715,10 @@ where
                     safe_worksize_y,
                     TILE_D,
                     TILE_Q,
+                    // Whole-row staging, i.e. one block: this path stages
+                    // centroids, not the database, and has not been measured
+                    // against a blocked reduction axis.
+                    dim_lines,
                 );
             },
             Dist::SquaredEuclidean => unsafe {
