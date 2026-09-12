@@ -10,7 +10,7 @@ use thousands::*;
 
 use crate::gpu::dist_gpu::*;
 use crate::gpu::k_means_gpu::{assign_all_gpu, train_centroids_gpu, KMeansGpuParams};
-use crate::gpu::topk_gpu::{radix_select_ivf_topk, radix_select_usable};
+use crate::gpu::topk_gpu::{radix_select_ivf_topk, radix_select_topk, radix_select_usable};
 use crate::gpu::*;
 use crate::prelude::*;
 use crate::utils::dist::Dist;
@@ -184,6 +184,14 @@ pub struct IvfIndexGpu<T: AnnSearchFloat + CubeclFloat, R: Runtime> {
     metric: Dist,
     /// Device runtime for the GPU work
     device: R::Device,
+    /// Prefix sums of the cluster sizes in ascending order; length `nlist + 1`.
+    ///
+    /// `sorted_size_prefix[m]` is the total size of the `m` smallest clusters,
+    /// so the smallest `m` with `sorted_size_prefix[m] >= k` is a count that
+    /// *any* `m` clusters are guaranteed to reach. That is what lets the probe
+    /// selection come back from the device truncated: see
+    /// [`IvfIndexGpu::min_clusters_for_k`].
+    sorted_size_prefix: Vec<usize>,
     /// Candidate scratch, held across queries.
     ///
     /// The mega kernel's first write to a fresh allocation faults its pages in,
@@ -300,8 +308,23 @@ where
             vec![T::one(); nlist]
         };
 
+        let sorted_size_prefix_src = |offsets: &[usize]| {
+            let mut sizes: Vec<usize> = offsets.windows(2).map(|w| w[1] - w[0]).collect();
+            sizes.sort_unstable();
+            let mut prefix = Vec::with_capacity(sizes.len() + 1);
+            prefix.push(0usize);
+            let mut acc = 0usize;
+            for sz in sizes {
+                acc += sz;
+                prefix.push(acc);
+            }
+            prefix
+        };
+
         let (vectors_by_cluster, original_indices, cluster_offsets, norms_by_cluster) =
             reorganise_by_cluster(&vectors_flat, dim, n, &assignments, nlist, &metric);
+
+        let sorted_size_prefix = sorted_size_prefix_src(&cluster_offsets);
 
         if verbose {
             println!("  Uploading all vectors to GPU");
@@ -366,6 +389,7 @@ where
             nlist,
             metric,
             device,
+            sorted_size_prefix,
             scratch: std::sync::Mutex::new(None),
         })
     }
@@ -702,7 +726,7 @@ where
                     vec_size,
                     queries_gpu.clone().into_tensor_arg(),
                     self.centroids_gpu.clone().into_tensor_arg(),
-                    centroid_dists_gpu.into_tensor_arg(),
+                    centroid_dists_gpu.clone().into_tensor_arg(),
                     0u32,
                     self.nlist as u32,
                     n_queries as u32,
@@ -731,7 +755,7 @@ where
                         .unwrap()
                         .clone()
                         .into_tensor_arg(),
-                    centroid_dists_gpu.into_tensor_arg(),
+                    centroid_dists_gpu.clone().into_tensor_arg(),
                     0u32,
                     self.nlist as u32,
                     n_queries as u32,
@@ -754,7 +778,7 @@ where
                     vec_size,
                     queries_gpu.clone().into_tensor_arg(),
                     self.centroids_gpu.clone().into_tensor_arg(),
-                    centroid_dists_gpu.into_tensor_arg(),
+                    centroid_dists_gpu.clone().into_tensor_arg(),
                     0u32,
                     self.nlist as u32,
                     n_queries as u32,
@@ -777,7 +801,7 @@ where
                         .unwrap()
                         .clone()
                         .into_tensor_arg(),
-                    centroid_dists_gpu.into_tensor_arg(),
+                    centroid_dists_gpu.clone().into_tensor_arg(),
                     0u32,
                     self.nlist as u32,
                     n_queries as u32,
@@ -789,31 +813,116 @@ where
             Dist::Manhattan => unreachable!(),
         }
 
-        let centroid_dists = centroid_dists_gpu.read(client)?;
-
-        // Per-query top-nprobe selection on CPU, expanded until reachable >= k.
-        // The downstream mega-kernel already handles ragged per-query candidate
+        // Per-query top-nprobe selection, expanded until reachable >= k. The
+        // downstream mega-kernel already handles ragged per-query candidate
         // counts (see `cpu_write_pointers` / `max_candidates`), so variable
         // probe-list lengths cost us nothing extra there.
-        let probe_lists: Vec<Vec<usize>> = (0..n_queries)
-            .into_par_iter()
-            .map(|q| {
-                let row_start = q * self.nlist;
-                let mut cluster_dists: Vec<(T, usize)> = (0..self.nlist)
-                    .map(|c| (centroid_dists[row_start + c], c))
-                    .collect();
-                select_probed_clusters(&mut cluster_dists, &self.cluster_offsets, nprobe, k)
-            })
-            .collect();
+        //
+        // On device where the radix reducer fits: the full `[n_queries, nlist]`
+        // distance matrix never comes back, only `[n_queries, probe_pool]`
+        // cluster ids, which is ~20x less at nlist 387 and nprobe 19, and the
+        // host-side sort of every row goes with it.
+        let probe_pool = nprobe.max(self.min_clusters_for_k(k)).min(self.nlist);
+        let wg = WORKGROUP_SIZE_X as usize;
+
+        let probe_lists: Vec<Vec<usize>> =
+            if radix_select_usable(client, probe_pool, size_of::<T>(), wg, &limits) {
+                let probe_dists = GpuTensor::<R, T>::empty(vec![n_queries, probe_pool], client)?;
+                let probe_ids = GpuTensor::<R, u32>::empty(vec![n_queries, probe_pool], client)?;
+
+                let init_gx = (probe_pool as u32).div_ceil(WORKGROUP_SIZE_X);
+                let (init_gy, init_gz) = grid_2d((n_queries as u32).div_ceil(4), &limits)?;
+                unsafe {
+                    init_topk::launch_unchecked::<T, R>(
+                        client,
+                        CubeCount::Static(init_gx, init_gy, init_gz),
+                        CubeDim::new_2d(WORKGROUP_SIZE_X, 4),
+                        probe_dists.clone().into_tensor_arg(),
+                        probe_ids.clone().into_tensor_arg(),
+                        4,
+                    );
+                }
+
+                let (sel_gx, sel_gy) = grid_2d(n_queries as u32, &limits)?;
+                unsafe {
+                    radix_select_topk::launch_unchecked::<T, R>(
+                        client,
+                        CubeCount::Static(sel_gx, sel_gy, 1),
+                        CubeDim::new_2d(WORKGROUP_SIZE_X, 1),
+                        centroid_dists_gpu.clone().into_tensor_arg(),
+                        probe_dists.clone().into_tensor_arg(),
+                        probe_ids.clone().into_tensor_arg(),
+                        0u32,
+                        self.nlist as u32,
+                        probe_pool as u32,
+                        probe_pool,
+                        wg,
+                    );
+                }
+
+                let ids = probe_ids.read(client)?;
+
+                (0..n_queries)
+                    .into_par_iter()
+                    .map(|q| {
+                        let row = &ids[q * probe_pool..(q + 1) * probe_pool];
+                        let mut chosen = Vec::with_capacity(probe_pool);
+                        let mut reachable = 0usize;
+                        for &c in row {
+                            let c = c as usize;
+                            chosen.push(c);
+                            reachable += self.cluster_offsets[c + 1] - self.cluster_offsets[c];
+                            if chosen.len() >= nprobe && reachable >= k {
+                                break;
+                            }
+                        }
+                        chosen
+                    })
+                    .collect()
+            } else {
+                let centroid_dists = centroid_dists_gpu.read(client)?;
+                (0..n_queries)
+                    .into_par_iter()
+                    .map(|q| {
+                        let row_start = q * self.nlist;
+                        let mut cluster_dists: Vec<(T, usize)> = (0..self.nlist)
+                            .map(|c| (centroid_dists[row_start + c], c))
+                            .collect();
+                        select_probed_clusters(&mut cluster_dists, &self.cluster_offsets, nprobe, k)
+                    })
+                    .collect()
+            };
+
+        // The task list is emitted grouped by cluster, so a cube's rows probe
+        // one cluster and share its DB region. Counting-sorting into place
+        // rather than pushing in query order and sorting afterwards drops a
+        // comparison sort plus four gathers over `n_tasks`.
+        let mut cursor = vec![0u32; self.nlist + 1];
+        for list in &probe_lists {
+            for &c in list {
+                if self.cluster_offsets[c + 1] > self.cluster_offsets[c] {
+                    cursor[c] += 1;
+                }
+            }
+        }
+
+        let mut n_tasks = 0usize;
+        for slot in cursor.iter_mut() {
+            let count = *slot as usize;
+            *slot = n_tasks as u32;
+            n_tasks += count;
+        }
+
+        if n_tasks == 0 {
+            return Ok((vec![vec![]; n_queries], vec![vec![]; n_queries]));
+        }
 
         let mut cpu_write_pointers = vec![0u32; n_queries];
         let mut max_db_count = 0u32;
-
-        let n_tasks_upper: usize = probe_lists.iter().map(|p| p.len()).sum();
-        let mut task_q_idx: Vec<u32> = Vec::with_capacity(n_tasks_upper);
-        let mut task_db_start: Vec<u32> = Vec::with_capacity(n_tasks_upper);
-        let mut task_write_offset: Vec<u32> = Vec::with_capacity(n_tasks_upper);
-        let mut task_db_count: Vec<u32> = Vec::with_capacity(n_tasks_upper);
+        let mut task_q_idx = vec![0u32; n_tasks];
+        let mut task_db_start = vec![0u32; n_tasks];
+        let mut task_write_offset = vec![0u32; n_tasks];
+        let mut task_db_count = vec![0u32; n_tasks];
 
         for q_idx in 0..n_queries {
             for &c in &probe_lists[q_idx] {
@@ -821,10 +930,13 @@ where
                 let count = self.cluster_offsets[c + 1] - start;
 
                 if count > 0 {
-                    task_q_idx.push(q_idx as u32);
-                    task_db_start.push(start as u32);
-                    task_write_offset.push(cpu_write_pointers[q_idx]);
-                    task_db_count.push(count as u32);
+                    let slot = cursor[c] as usize;
+                    cursor[c] += 1;
+
+                    task_q_idx[slot] = q_idx as u32;
+                    task_db_start[slot] = start as u32;
+                    task_write_offset[slot] = cpu_write_pointers[q_idx];
+                    task_db_count[slot] = count as u32;
 
                     cpu_write_pointers[q_idx] += count as u32;
                     if count as u32 > max_db_count {
@@ -833,20 +945,6 @@ where
                 }
             }
         }
-
-        let n_tasks = task_q_idx.len();
-        if n_tasks == 0 {
-            return Ok((vec![vec![]; n_queries], vec![vec![]; n_queries]));
-        }
-
-        let mut order: Vec<u32> = (0..n_tasks as u32).collect();
-        order.sort_unstable_by_key(|&i| task_db_start[i as usize]);
-        let permute =
-            |src: &[u32]| -> Vec<u32> { order.iter().map(|&i| src[i as usize]).collect() };
-        let task_q_idx = permute(&task_q_idx);
-        let task_db_start = permute(&task_db_start);
-        let task_write_offset = permute(&task_write_offset);
-        let task_db_count = permute(&task_db_count);
 
         let max_candidates: usize = cpu_write_pointers
             .iter()
@@ -934,7 +1032,6 @@ where
 
         let cpq = GpuTensor::<R, u32>::from_slice(&cpu_write_pointers, vec![n_queries], client)?;
         let (coal_gx, coal_gy) = grid_2d(n_queries as u32, &limits)?;
-        let wg = WORKGROUP_SIZE_X as usize;
 
         if radix_select_usable(client, k, size_of::<T>(), wg, &limits) {
             unsafe {
@@ -1006,6 +1103,26 @@ where
         }
 
         Ok((results_indices, results_dists))
+    }
+
+    /// Clusters that are always enough to reach `k` points, whichever they are
+    ///
+    /// The `m` smallest clusters summing to at least `k` means every set of `m`
+    /// clusters does, so selecting this many on the device removes the need to
+    /// keep the full centroid-distance row on the host for the rare expansion
+    /// in [`select_probed_clusters`].
+    ///
+    /// ### Params
+    ///
+    /// * `k` - Neighbours the query must be able to reach
+    ///
+    /// ### Returns
+    ///
+    /// Cluster count, at most `nlist`.
+    fn min_clusters_for_k(&self, k: usize) -> usize {
+        self.sorted_size_prefix
+            .partition_point(|&reachable| reachable < k)
+            .min(self.nlist)
     }
 
     /// Calculate a memory-safe batch size for the Candidate Buffer strategy
@@ -1212,6 +1329,46 @@ mod tests {
     }
 
     #[test]
+    /// The truncated probe list is only correct if `min_clusters_for_k` really
+    /// is a count that *any* set of that many clusters reaches.
+    #[test]
+    fn test_min_clusters_for_k_is_a_worst_case_bound() {
+        let device = CpuDevice;
+
+        // 12 points over 4 clusters, deliberately ragged.
+        let data = Mat::from_fn(12, 4, |i, j| ((i / 3) as f32) + (j as f32) * 0.01);
+
+        let index = IvfIndexGpu::<f32, CpuRuntime>::build(
+            data.as_ref(),
+            Dist::SquaredEuclidean,
+            Some(4),
+            get_default_k_means(),
+            42,
+            false,
+            device,
+        )
+        .unwrap();
+
+        let mut sizes: Vec<usize> = index
+            .cluster_offsets
+            .windows(2)
+            .map(|w| w[1] - w[0])
+            .collect();
+        sizes.sort_unstable();
+
+        for k in 1..=12usize {
+            let m = index.min_clusters_for_k(k);
+            // Either the m smallest clusters already reach k, or no set of
+            // clusters does and m is pinned at nlist.
+            let smallest: usize = sizes.iter().take(m).sum();
+            assert!(
+                smallest >= k || m == index.nlist,
+                "k={k}: {m} smallest clusters hold {smallest}"
+            );
+            assert!(m <= index.nlist);
+        }
+    }
+
     fn test_reorganise_by_cluster() {
         let vectors: Vec<f32> = vec![
             1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0,
