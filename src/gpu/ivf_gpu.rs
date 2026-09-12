@@ -25,7 +25,14 @@ use crate::utils::k_means_utils::*;
 const IVF_GPU_QUERY_BATCH_SIZE: usize = 100_000;
 
 /// Target maximum size for the candidate buffer in megabytes
-const TARGET_BUFFER_MB: usize = 1500;
+///
+/// Sets the query batch size through [`IvfIndexGpu::calculate_safe_batch_size`],
+/// and the buffer's first write faults its pages in, so this is really a cold-
+/// start knob. At 150k x 32D, nlist 387, nprobe 19 the steady-state query is
+/// flat from roughly this size upwards (50 ms at 550 MB against 45 ms at
+/// 1100 MB) while the first query is not: 90 ms against 205 ms. The larger
+/// target bought 10% of the warm case and paid 2.3x for the cold one.
+const TARGET_BUFFER_MB: usize = 600;
 
 /// Divisor setting the slack on the reused candidate scratch buffer.
 ///
@@ -177,6 +184,14 @@ pub struct IvfIndexGpu<T: AnnSearchFloat + CubeclFloat, R: Runtime> {
     metric: Dist,
     /// Device runtime for the GPU work
     device: R::Device,
+    /// Candidate scratch, held across queries.
+    ///
+    /// The mega kernel's first write to a fresh allocation faults its pages in,
+    /// and the buffer is hundreds of megabytes, so that cost swamps the kernels
+    /// themselves. Holding it on the index confines it to the first query
+    /// rather than paying it per call. The lock serialises concurrent queries
+    /// on one index, which the single device queue does anyway.
+    scratch: std::sync::Mutex<Option<CandidateScratch<R, T>>>,
 }
 
 /////////////////////////
@@ -351,6 +366,7 @@ where
             nlist,
             metric,
             device,
+            scratch: std::sync::Mutex::new(None),
         })
     }
 
@@ -400,23 +416,24 @@ where
 
         let n_batches = n_queries.div_ceil(nquery);
 
+        let mut scratch = self
+            .scratch
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+
         if n_batches == 1 {
-            let mut scratch = None;
-            let res = self.query_batch_internal(
+            return self.query_batch_internal(
                 queries_flat,
                 n_queries,
                 k,
                 nprobe,
                 client,
                 &mut scratch,
-            )?;
-
-            return Ok(res);
+            );
         }
 
         let mut all_indices = Vec::with_capacity(n_queries);
         let mut all_distances = Vec::with_capacity(n_queries);
-        let mut scratch: Option<CandidateScratch<R, T>> = None;
 
         for batch_idx in 0..n_batches {
             if verbose
@@ -589,7 +606,15 @@ where
             + self.original_indices.capacity() * std::mem::size_of::<usize>()
             + self.cluster_offsets.capacity() * std::mem::size_of::<usize>();
 
-        let vram = self.vectors_gpu.vram_bytes()
+        let scratch_vram = self
+            .scratch
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .as_ref()
+            .map_or(0, |s| s.dists.vram_bytes() + s.indices.vram_bytes());
+
+        let vram = scratch_vram
+            + self.vectors_gpu.vram_bytes()
             + self.norms_gpu.as_ref().map_or(0, |t| t.vram_bytes())
             + self.centroids_gpu.vram_bytes()
             + self

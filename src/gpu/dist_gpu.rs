@@ -1142,6 +1142,17 @@ pub fn reduce_ivf_topk<F: Float>(
 ///   metadata.
 /// * `size_y` - Safe workgroup size Y for the given dimensionality
 ///
+/// ### Note
+///
+/// Register tiling this over `TILE_D` DB vectors, which is worth 1.4x to 2.2x
+/// on the exhaustive kernel, measured *slower* here: 195 ms against 169 at
+/// dim=128 and 380 against 312 at dim=256 on a 15k-query batch. The x extent is
+/// ragged. The grid is sized by the largest cluster, so for an average task
+/// most of it is out of range, and 1x1 lets those threads `terminate!()` at
+/// once where a 4-wide tile keeps a thread alive for its whole row as soon as
+/// one of its four DB vectors is in range. Do not retry it without first
+/// bucketing tasks by cluster size.
+///
 /// ### Grid mapping
 ///
 /// * `ABSOLUTE_POS_X` -> vector index within the task's cluster
