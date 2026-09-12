@@ -300,7 +300,16 @@ pub fn leaf_pairwise_proposals<F: CubeclFloat, N: Size>(
     sync_cube();
 
     let leaf_start = shared_leaf_start[0usize];
-    let leaf_size = shared_leaf_size[0usize];
+    // Truncate rather than run off the end of the staging. The caller sizes
+    // `max_leaf_size` from the batch's real leaves, so this never binds in
+    // practice; a partition that cannot be split (every dot value equal, or
+    // duplicate points) is the case it exists for, and dropping its tail costs
+    // some proposals from one tree rather than an out-of-bounds shared write
+    // that no backend reports.
+    let mut leaf_size = shared_leaf_size[0usize];
+    if leaf_size > max_leaf_size as u32 {
+        leaf_size = max_leaf_size as u32;
+    }
 
     if leaf_size < 2u32 {
         terminate!();
@@ -310,11 +319,17 @@ pub fn leaf_pairwise_proposals<F: CubeclFloat, N: Size>(
     let mut shared_vecs = SharedMemory::<F>::new(max_leaf_size * dim_scalars);
     let mut shared_pids = SharedMemory::<u32>::new(max_leaf_size);
     let mut shared_norms = SharedMemory::<F>::new(max_leaf_size);
+    let mut shared_thresh = SharedMemory::<F>::new(max_leaf_size);
+
+    let k = graph_dist.shape(1usize);
 
     let mut i = tx;
     while i < leaf_size {
         let global_pid = leaf_points[(leaf_start + i) as usize];
         shared_pids[i as usize] = global_pid;
+        // The partner's acceptance threshold is a global read inside the pair
+        // loop otherwise, so `leaf_size` reads become `leaf_size^2 / 2`.
+        shared_thresh[i as usize] = graph_dist[global_pid as usize * k + k - 1usize];
         if use_cosine {
             shared_norms[i as usize] = norms[global_pid as usize];
         }
@@ -340,13 +355,11 @@ pub fn leaf_pairwise_proposals<F: CubeclFloat, N: Size>(
     }
     sync_cube();
 
-    let k = graph_dist.shape(1usize);
-
     let mut ii = tx as usize;
 
     while ii < leaf_size as usize {
         let pid_i = shared_pids[ii];
-        let thresh_i = graph_dist[pid_i as usize * k + k - 1usize];
+        let thresh_i = shared_thresh[ii];
 
         let mut jj = ii + 1usize;
         while jj < leaf_size as usize {
@@ -381,7 +394,7 @@ pub fn leaf_pairwise_proposals<F: CubeclFloat, N: Size>(
                     }
                 }
 
-                let thresh_j = graph_dist[pid_j as usize * k + k - 1usize];
+                let thresh_j = shared_thresh[jj];
                 if dist < thresh_j {
                     let slot = prop_count[pid_j as usize].fetch_add(1u32);
                     if slot < max_proposals {
@@ -864,6 +877,21 @@ where
         batch_leaf_offsets.push(batch_leaf_points.len() as u32);
         let batch_leaves = batch_leaf_offsets.len() - 1;
 
+        // Size the staging to the leaves this batch actually has, not to what
+        // the device could hold. `max_leaf_size` is a capacity bound: at a
+        // depth targeting 64 points the leaves come out around 37, so staging
+        // for 240 fills 30.7 KB of a 32 KB budget and leaves exactly one cube
+        // resident per core. Rounded to a power of two so only a handful of
+        // kernel variants ever compile.
+        let batch_max_leaf = batch_leaf_offsets
+            .windows(2)
+            .map(|w| (w[1] - w[0]) as usize)
+            .max()
+            .unwrap_or(0);
+        let leaf_stage = batch_max_leaf
+            .next_power_of_two()
+            .clamp(WORKGROUP_SIZE_X as usize, max_leaf_size);
+
         if batch_leaves == 0 {
             continue;
         }
@@ -911,7 +939,7 @@ where
                 MAX_PROPOSALS as u32,
                 use_cosine,
                 dim_vec,
-                max_leaf_size,
+                leaf_stage,
             );
         }
 
