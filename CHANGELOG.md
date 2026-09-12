@@ -3,6 +3,14 @@
 Changes to the `ann-search-rs` crate. The Python package `ann-search` has its
 own changelog at [`python/CHANGELOG.md`](python/CHANGELOG.md).
 
+## 0.8.5
+
+**Features**
+
+- More improvements on the GPU index speed. Faster exhaustive GPU at higher
+  dimensionality, generally faster IVF GPU and the GPU forest build for the
+  NNDescent is faster at lower dimensions.
+
 ## 0.8.4
 
 **Fix**
