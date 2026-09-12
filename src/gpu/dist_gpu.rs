@@ -228,6 +228,10 @@ pub fn cosine_tiled<F: Float, N: Size>(
 /// Each thread computes a `tile_q x tile_d` block of the distance matrix
 /// instead of a single entry, so each loaded value feeds several FMAs.
 ///
+/// The reduction axis is blocked: only `kb_lines` lines of the query tile are
+/// staged at a time, so the shared-memory footprint is independent of `dim` and
+/// `size_y` can stay at its knee at any dimensionality.
+///
 /// ### Params
 ///
 /// * `query_vectors` - Query vectors `[n_queries, dim / N]` as `Vector<F, N>`
@@ -242,6 +246,8 @@ pub fn cosine_tiled<F: Float, N: Size>(
 ///   Must be divisible by `tile_q`
 /// * `tile_d` - DB vectors per thread (comptime)
 /// * `tile_q` - Query vectors per thread (comptime)
+/// * `kb_lines` - Reduction lines staged per block (comptime). Must divide
+///   `dim_lines` exactly
 ///
 /// ### Grid mapping
 ///
@@ -261,15 +267,17 @@ pub fn euclidean_tiled_reg<F: Float, N: Size>(
     #[comptime] size_y: u32,
     #[comptime] tile_d: usize,
     #[comptime] tile_q: usize,
+    #[comptime] kb_lines: usize,
 ) {
     let lanes = LINE_SIZE;
-    let dim_scalars = dim_lines * lanes;
+    let kb_scalars = kb_lines * lanes;
+    let n_blocks = dim_lines / kb_lines;
     let wg_y = size_y as usize;
     let local_x = UNIT_POS_X as usize;
     let local_y = UNIT_POS_Y as usize;
 
     // Scalar shared memory only (vectorised shared mem silently broadcasts lane 0)
-    let mut s_query = SharedMemory::<F>::new(wg_y * dim_scalars);
+    let mut s_query = SharedMemory::<F>::new(wg_y * kb_scalars);
 
     // Locals at kernel scope, never inside a branch or loop.
     let mut acc = Array::<F>::new(tile_q * tile_d);
@@ -278,27 +286,10 @@ pub fn euclidean_tiled_reg<F: Float, N: Size>(
     let threads_y = wg_y / tile_q;
     let thread_id = local_y * WORKGROUP_SIZE_X as usize + local_x;
     let total_threads = WORKGROUP_SIZE_X as usize * threads_y;
-    let total_elems = wg_y * dim_scalars;
+    let total_elems = wg_y * kb_scalars;
 
     // First query row owned by this cube.
     let q_tile_base = ((CUBE_POS_Z * CUBE_COUNT_Y + CUBE_POS_Y) as usize) * wg_y;
-
-    let mut load_idx = thread_id;
-    while load_idx < total_elems {
-        let q_local = load_idx / dim_scalars;
-        let elem = load_idx % dim_scalars;
-        let q_global = q_tile_base + q_local;
-        if q_global < n_queries as usize {
-            let line_idx = elem / lanes;
-            let lane = elem % lanes;
-            let line_val = query_vectors[q_global * dim_lines + line_idx];
-            s_query[load_idx] = line_val[lane];
-        } else {
-            s_query[load_idx] = F::new(0.0_f32);
-        }
-        load_idx += total_threads;
-    }
-    sync_cube();
 
     #[unroll]
     for a in 0..tile_q * tile_d {
@@ -308,35 +299,63 @@ pub fn euclidean_tiled_reg<F: Float, N: Size>(
     let db_tile_base = (CUBE_POS_X as usize) * (WORKGROUP_SIZE_X as usize) * tile_d;
     let q_row_base = local_y * tile_q;
 
-    for i in 0..dim_lines {
-        // Stage this thread's tile_d DB lines as scalars.
-        #[unroll]
-        for r in 0..tile_d {
-            let db_local = db_tile_base + local_x + r * WORKGROUP_SIZE_X as usize;
-            // Clamp out-of-range rows to row 0; the result is masked on write.
-            let mut idx = 0usize;
-            if db_local < n_db_chunk as usize {
-                idx = (db_start as usize + db_local) * dim_lines + i;
-            }
-            let line_val = db_vectors[idx];
-            #[unroll]
-            for lane in 0..lanes {
-                d_scalars[r * lanes + lane] = line_val[lane];
-            }
-        }
+    for b in 0..n_blocks {
+        let kb_base = b * kb_lines;
 
-        #[unroll]
-        for t in 0..tile_q {
-            let s_off = (q_row_base + t) * dim_scalars + i * lanes;
+        let mut load_idx = thread_id;
+        while load_idx < total_elems {
+            let q_local = load_idx / kb_scalars;
+            let elem = load_idx % kb_scalars;
+            let q_global = q_tile_base + q_local;
+            if q_global < n_queries as usize {
+                let line_idx = kb_base + elem / lanes;
+                let lane = elem % lanes;
+                let line_val = query_vectors[q_global * dim_lines + line_idx];
+                s_query[load_idx] = line_val[lane];
+            } else {
+                s_query[load_idx] = F::new(0.0_f32);
+            }
+            load_idx += total_threads;
+        }
+        sync_cube();
+
+        for j in 0..kb_lines {
+            let i = kb_base + j;
+            // Stage this thread's tile_d DB lines as scalars.
             #[unroll]
-            for lane in 0..lanes {
-                let qv = s_query[s_off + lane];
+            for r in 0..tile_d {
+                let db_local = db_tile_base + local_x + r * WORKGROUP_SIZE_X as usize;
+                // Clamp out-of-range rows to row 0; the result is masked on write.
+                let mut idx = 0usize;
+                if db_local < n_db_chunk as usize {
+                    idx = (db_start as usize + db_local) * dim_lines + i;
+                }
+                let line_val = db_vectors[idx];
                 #[unroll]
-                for r in 0..tile_d {
-                    let diff = qv - d_scalars[r * lanes + lane];
-                    acc[t * tile_d + r] += diff * diff;
+                for lane in 0..lanes {
+                    d_scalars[r * lanes + lane] = line_val[lane];
                 }
             }
+
+            #[unroll]
+            for t in 0..tile_q {
+                let s_off = (q_row_base + t) * kb_scalars + j * lanes;
+                #[unroll]
+                for lane in 0..lanes {
+                    let qv = s_query[s_off + lane];
+                    #[unroll]
+                    for r in 0..tile_d {
+                        let diff = qv - d_scalars[r * lanes + lane];
+                        acc[t * tile_d + r] += diff * diff;
+                    }
+                }
+            }
+        }
+        // The next block overwrites the tile, so every thread must be done
+        // reading it first. Comptime because with one block there is no next
+        // one, and the barrier is not free.
+        if comptime!(n_blocks > 1) {
+            sync_cube();
         }
     }
 
@@ -374,6 +393,8 @@ pub fn euclidean_tiled_reg<F: Float, N: Size>(
 ///   Must be divisible by `tile_q`
 /// * `tile_d` - DB vectors per thread (comptime)
 /// * `tile_q` - Query vectors per thread (comptime)
+/// * `kb_lines` - Reduction lines staged per block (comptime). Must divide
+///   `dim_lines` exactly
 ///
 /// ### Grid mapping
 ///
@@ -395,15 +416,17 @@ pub fn cosine_tiled_reg<F: Float, N: Size>(
     #[comptime] size_y: u32,
     #[comptime] tile_d: usize,
     #[comptime] tile_q: usize,
+    #[comptime] kb_lines: usize,
 ) {
     let lanes = LINE_SIZE;
-    let dim_scalars = dim_lines * lanes;
+    let kb_scalars = kb_lines * lanes;
+    let n_blocks = dim_lines / kb_lines;
     let wg_y = size_y as usize;
     let local_x = UNIT_POS_X as usize;
     let local_y = UNIT_POS_Y as usize;
 
     // Scalar shared memory only (vectorised shared mem silently broadcasts lane 0)
-    let mut s_query = SharedMemory::<F>::new(wg_y * dim_scalars);
+    let mut s_query = SharedMemory::<F>::new(wg_y * kb_scalars);
 
     // Locals at kernel scope, never inside a branch or loop.
     let mut acc = Array::<F>::new(tile_q * tile_d);
@@ -412,26 +435,9 @@ pub fn cosine_tiled_reg<F: Float, N: Size>(
     let threads_y = wg_y / tile_q;
     let thread_id = local_y * WORKGROUP_SIZE_X as usize + local_x;
     let total_threads = WORKGROUP_SIZE_X as usize * threads_y;
-    let total_elems = wg_y * dim_scalars;
+    let total_elems = wg_y * kb_scalars;
 
     let q_tile_base = ((CUBE_POS_Z * CUBE_COUNT_Y + CUBE_POS_Y) as usize) * wg_y;
-
-    let mut load_idx = thread_id;
-    while load_idx < total_elems {
-        let q_local = load_idx / dim_scalars;
-        let elem = load_idx % dim_scalars;
-        let q_global = q_tile_base + q_local;
-        if q_global < n_queries as usize {
-            let line_idx = elem / lanes;
-            let lane = elem % lanes;
-            let line_val = query_vectors[q_global * dim_lines + line_idx];
-            s_query[load_idx] = line_val[lane];
-        } else {
-            s_query[load_idx] = F::new(0.0_f32);
-        }
-        load_idx += total_threads;
-    }
-    sync_cube();
 
     #[unroll]
     for a in 0..tile_q * tile_d {
@@ -441,33 +447,61 @@ pub fn cosine_tiled_reg<F: Float, N: Size>(
     let db_tile_base = (CUBE_POS_X as usize) * (WORKGROUP_SIZE_X as usize) * tile_d;
     let q_row_base = local_y * tile_q;
 
-    for i in 0..dim_lines {
-        #[unroll]
-        for r in 0..tile_d {
-            let db_local = db_tile_base + local_x + r * WORKGROUP_SIZE_X as usize;
-            // Clamp out-of-range rows to row 0; the result is masked on write.
-            let mut idx = 0usize;
-            if db_local < n_db_chunk as usize {
-                idx = (db_start as usize + db_local) * dim_lines + i;
-            }
-            let line_val = db_vectors[idx];
-            #[unroll]
-            for lane in 0..lanes {
-                d_scalars[r * lanes + lane] = line_val[lane];
-            }
-        }
+    for b in 0..n_blocks {
+        let kb_base = b * kb_lines;
 
-        #[unroll]
-        for t in 0..tile_q {
-            let s_off = (q_row_base + t) * dim_scalars + i * lanes;
+        let mut load_idx = thread_id;
+        while load_idx < total_elems {
+            let q_local = load_idx / kb_scalars;
+            let elem = load_idx % kb_scalars;
+            let q_global = q_tile_base + q_local;
+            if q_global < n_queries as usize {
+                let line_idx = kb_base + elem / lanes;
+                let lane = elem % lanes;
+                let line_val = query_vectors[q_global * dim_lines + line_idx];
+                s_query[load_idx] = line_val[lane];
+            } else {
+                s_query[load_idx] = F::new(0.0_f32);
+            }
+            load_idx += total_threads;
+        }
+        sync_cube();
+
+        for j in 0..kb_lines {
+            let i = kb_base + j;
             #[unroll]
-            for lane in 0..lanes {
-                let qv = s_query[s_off + lane];
+            for r in 0..tile_d {
+                let db_local = db_tile_base + local_x + r * WORKGROUP_SIZE_X as usize;
+                // Clamp out-of-range rows to row 0; the result is masked on write.
+                let mut idx = 0usize;
+                if db_local < n_db_chunk as usize {
+                    idx = (db_start as usize + db_local) * dim_lines + i;
+                }
+                let line_val = db_vectors[idx];
                 #[unroll]
-                for r in 0..tile_d {
-                    acc[t * tile_d + r] += qv * d_scalars[r * lanes + lane];
+                for lane in 0..lanes {
+                    d_scalars[r * lanes + lane] = line_val[lane];
                 }
             }
+
+            #[unroll]
+            for t in 0..tile_q {
+                let s_off = (q_row_base + t) * kb_scalars + j * lanes;
+                #[unroll]
+                for lane in 0..lanes {
+                    let qv = s_query[s_off + lane];
+                    #[unroll]
+                    for r in 0..tile_d {
+                        acc[t * tile_d + r] += qv * d_scalars[r * lanes + lane];
+                    }
+                }
+            }
+        }
+        // The next block overwrites the tile, so every thread must be done
+        // reading it first. Comptime because with one block there is no next
+        // one, and the barrier is not free.
+        if comptime!(n_blocks > 1) {
+            sync_cube();
         }
     }
 
@@ -651,6 +685,11 @@ where
     let vec_size = LINE_SIZE;
     let dim_lines = dim / vec_size;
     let safe_worksize_y = pick_wg_y(dim, size_of::<T>(), &limits)?;
+    // Blocking the reduction axis frees the query tile from `dim`, so the
+    // register-tiled path runs at `EXH_WG_Y` where `pick_wg_y` would have to
+    // shrink. `None` means the divisors of `dim_lines` rule it out; the
+    // whole-row staging below is then the arm that runs.
+    let staging = plan_exhaustive_staging(dim, size_of::<T>(), &limits);
 
     let n_query_chunks = query_data.n.div_ceil(QUERY_CHUNK_SIZE);
     // The DB chunk shrinks when the distance transient would not fit one
@@ -736,15 +775,16 @@ where
             let (grid_y, grid_z) = grid_2d((n_q as u32).div_ceil(safe_worksize_y), &limits)?;
 
             match *metric {
-                // Register-tiled path where the tile divides the query tile
-                // height; roughly 1.4x to 2.2x over the untiled kernel and
-                // bit-exact against it. See `TILE_D` for the measurements.
-                Dist::SquaredEuclidean if tile_fits(safe_worksize_y) => unsafe {
+                // Register-tiled path where the tile divides the query
+                // tile height. Bit-exact against the untiled kernel.
+                Dist::SquaredEuclidean if staging.is_some() => unsafe {
+                    let plan = staging.unwrap();
                     let reg_grid_x = (n_db as u32).div_ceil(WORKGROUP_SIZE_X * TILE_D as u32);
+                    let (reg_y, reg_z) = grid_2d((n_q as u32).div_ceil(plan.wg_y), &limits)?;
                     euclidean_tiled_reg::launch_unchecked::<T, R>(
                         &client,
-                        CubeCount::Static(reg_grid_x, grid_y, grid_z),
-                        CubeDim::new_2d(WORKGROUP_SIZE_X, safe_worksize_y / TILE_Q as u32),
+                        CubeCount::Static(reg_grid_x, reg_y, reg_z),
+                        CubeDim::new_2d(WORKGROUP_SIZE_X, plan.wg_y / TILE_Q as u32),
                         vec_size,
                         query_gpu.clone().into_tensor_arg(),
                         db_gpu.clone().into_tensor_arg(),
@@ -754,9 +794,10 @@ where
                         n_q as u32,
                         max_db_chunk as u32,
                         dim_lines,
-                        safe_worksize_y,
+                        plan.wg_y,
                         TILE_D,
                         TILE_Q,
+                        plan.kb_lines,
                     );
                 },
                 Dist::SquaredEuclidean => unsafe {
@@ -776,12 +817,14 @@ where
                         safe_worksize_y,
                     );
                 },
-                Dist::Cosine if tile_fits(safe_worksize_y) => unsafe {
+                Dist::Cosine if staging.is_some() => unsafe {
+                    let plan = staging.unwrap();
                     let reg_grid_x = (n_db as u32).div_ceil(WORKGROUP_SIZE_X * TILE_D as u32);
+                    let (reg_y, reg_z) = grid_2d((n_q as u32).div_ceil(plan.wg_y), &limits)?;
                     cosine_tiled_reg::launch_unchecked::<T, R>(
                         &client,
-                        CubeCount::Static(reg_grid_x, grid_y, grid_z),
-                        CubeDim::new_2d(WORKGROUP_SIZE_X, safe_worksize_y / TILE_Q as u32),
+                        CubeCount::Static(reg_grid_x, reg_y, reg_z),
+                        CubeDim::new_2d(WORKGROUP_SIZE_X, plan.wg_y / TILE_Q as u32),
                         vec_size,
                         query_gpu.clone().into_tensor_arg(),
                         db_gpu.clone().into_tensor_arg(),
@@ -793,9 +836,10 @@ where
                         n_q as u32,
                         max_db_chunk as u32,
                         dim_lines,
-                        safe_worksize_y,
+                        plan.wg_y,
                         TILE_D,
                         TILE_Q,
+                        plan.kb_lines,
                     );
                 },
                 Dist::Cosine => unsafe {
@@ -1096,6 +1140,15 @@ pub fn reduce_ivf_topk<F: Float>(
 ///   shared memory sizing. Passed as comptime to avoid reliance on tensor
 ///   metadata.
 /// * `size_y` - Safe workgroup size Y for the given dimensionality
+///
+/// ### Note
+///
+/// Register tiling this over `TILE_D` DB vectors, which pays on the exhaustive
+/// kernel, measured *slower* here. The x extent is ragged: the grid is sized by
+/// the largest cluster, so for an average task most of it is out of range, and
+/// 1x1 lets those threads `terminate!()` at once where a 4-wide tile keeps a
+/// thread alive for its whole row as soon as one of its four DB vectors is in
+/// range. Do not retry it without first bucketing tasks by cluster size.
 ///
 /// ### Grid mapping
 ///

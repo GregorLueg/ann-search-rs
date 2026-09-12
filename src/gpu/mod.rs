@@ -68,6 +68,31 @@ pub const TILE_D: usize = 4;
 /// `pick_wg_y` below the table value falls back the same way.
 pub const TILE_Q: usize = 4;
 
+/// Query rows the register-tiled exhaustive kernels stage per cube.
+///
+/// Query reuse per DB read, not occupancy, is what the exhaustive distance
+/// kernel lives on. Halving this costs steadily and raising it is flat, so 32
+/// is the knee. [`plan_exhaustive_staging`] holds it there at every
+/// dimensionality by blocking the reduction axis instead of staging the whole
+/// row.
+pub const EXH_WG_Y: u32 = 32;
+
+/// Reduction lines the register-tiled exhaustive kernels want per block.
+///
+/// Once the query tile is pinned at [`EXH_WG_Y`] the block length is what sets
+/// the shared-memory footprint, and therefore how many cubes stay resident.
+/// Four is the knee at every dimensionality swept, and the curve is shallow on
+/// both sides, so a `dim_lines` that admits only a neighbouring divisor keeps
+/// most of the win.
+pub const EXH_K_BLOCK: usize = 4;
+
+/// Footprint below which the reduction axis is not worth blocking at all.
+///
+/// Blocking costs two barriers per block, and buys nothing once the whole row
+/// already leaves room for several resident cubes. At or below this footprint
+/// staging the whole row wins; above it [`EXH_K_BLOCK`] does.
+pub const EXH_SMEM_TARGET: usize = 4096;
+
 /////////////
 // Helpers //
 /////////////
@@ -160,6 +185,94 @@ pub fn pick_wg_y(
         required: mega_smem_bytes(1, dim_padded, elem_bytes),
         available: limits.max_shared_bytes,
     })
+}
+
+/// Shared-memory staging plan for the register-tiled exhaustive kernels.
+///
+/// Produced by [`plan_exhaustive_staging`] and handed to the kernels as
+/// comptime arguments.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ExhaustiveStaging {
+    /// Query rows staged in shared memory per cube.
+    pub wg_y: u32,
+    /// `Vector<F, N>` lines of the reduction axis staged per block. Divides
+    /// `dim_lines` exactly.
+    pub kb_lines: usize,
+}
+
+/// Per-cube shared-memory footprint of the register-tiled exhaustive kernels.
+///
+/// `s_query` holds `wg_y * kb_lines * LINE_SIZE` scalars and nothing else; the
+/// DB tile lives in registers.
+///
+/// ### Params
+///
+/// * `wg_y` - Query rows staged per cube
+/// * `kb_lines` - Reduction lines staged per block
+/// * `elem_bytes` - Size of the float element type in bytes
+///
+/// ### Returns
+///
+/// Bytes of shared memory one cube allocates.
+pub fn exh_smem_bytes(wg_y: u32, kb_lines: usize, elem_bytes: usize) -> usize {
+    wg_y as usize * kb_lines * LINE_SIZE * elem_bytes
+}
+
+/// Plan the query staging for the register-tiled exhaustive kernels.
+///
+/// Holds the query tile at [`EXH_WG_Y`] rows and blocks the reduction axis at
+/// [`EXH_K_BLOCK`] lines, which is the opposite of what [`pick_wg_y`] does:
+/// that one stages the whole row and pays for it in tile height. The block
+/// length is the divisor of `dim_lines` closest to the target, so the inner
+/// loop needs no bounds test, and `1` always qualifies.
+///
+/// ### Params
+///
+/// * `dim_padded` - Padded embedding dimensionality (multiple of `LINE_SIZE`)
+/// * `elem_bytes` - Size of the float element type in bytes
+/// * `limits` - Device limits from `GpuLimits::from_client`
+///
+/// ### Returns
+///
+/// The plan, or `None` when the cube limits rule out a tile height of at least
+/// `TILE_Q`. Callers then fall back to [`pick_wg_y`] and the untiled kernel.
+pub fn plan_exhaustive_staging(
+    dim_padded: usize,
+    elem_bytes: usize,
+    limits: &GpuLimits,
+) -> Option<ExhaustiveStaging> {
+    let dim_lines = dim_padded / LINE_SIZE;
+    if dim_lines == 0 {
+        return None;
+    }
+
+    let mut wg_y = EXH_WG_Y;
+    while wg_y >= TILE_Q as u32 {
+        let fits_units = wg_y * WORKGROUP_SIZE_X <= limits.max_units_per_cube;
+        let fits_dim = wg_y / TILE_Q as u32 <= limits.max_cube_dim.1;
+
+        if fits_units && fits_dim {
+            let whole_row = exh_smem_bytes(wg_y, dim_lines, elem_bytes);
+            if whole_row <= EXH_SMEM_TARGET {
+                return Some(ExhaustiveStaging {
+                    wg_y,
+                    kb_lines: dim_lines,
+                });
+            }
+
+            // Closest divisor to the target, larger winning a tie. `1` always
+            // divides and always fits, so this cannot come back empty.
+            let kb_lines = (1..=dim_lines)
+                .filter(|kb| dim_lines.is_multiple_of(*kb))
+                .filter(|kb| exh_smem_bytes(wg_y, *kb, elem_bytes) <= limits.max_shared_bytes)
+                .min_by_key(|kb| (kb.abs_diff(EXH_K_BLOCK), usize::MAX - kb))?;
+
+            return Some(ExhaustiveStaging { wg_y, kb_lines });
+        }
+        wg_y /= 2;
+    }
+
+    None
 }
 
 /// Largest DB chunk whose distance transient still fits one binding.
@@ -586,6 +699,80 @@ mod tests {
         }
     }
 
+    // -- plan_exhaustive_staging --
+
+    #[test]
+    fn test_exhaustive_staging_holds_the_tile_at_every_dim() {
+        let l = apple();
+        for dim in [32usize, 64, 128, 256, 512, 1024, 2048] {
+            let plan = plan_exhaustive_staging(dim, 4, &l).expect("no plan");
+            assert_eq!(plan.wg_y, EXH_WG_Y, "tile shrank at dim {dim}");
+        }
+        // dim=32 stages the whole row: it is already inside EXH_SMEM_TARGET.
+        assert_eq!(plan_exhaustive_staging(32, 4, &l).unwrap().kb_lines, 8);
+        for dim in [64usize, 128, 256, 512, 1024, 2048] {
+            let plan = plan_exhaustive_staging(dim, 4, &l).unwrap();
+            assert_eq!(plan.kb_lines, EXH_K_BLOCK, "block moved at dim {dim}");
+        }
+    }
+
+    /// The whole point: `pick_wg_y` has to halve the tile past dim=128 and this
+    /// does not.
+    #[test]
+    fn test_exhaustive_staging_beats_pick_wg_y_at_high_dim() {
+        let l = apple();
+        for dim in [256usize, 512, 1024] {
+            let plan = plan_exhaustive_staging(dim, 4, &l).unwrap();
+            assert!(plan.wg_y > pick_wg_y(dim, 4, &l).unwrap(), "dim {dim}");
+        }
+    }
+
+    #[test]
+    fn test_exhaustive_staging_block_divides_the_row() {
+        let l = apple();
+        // dim_lines 25, 26 and 31: no divisor equals the target.
+        for dim in [100usize, 104, 124] {
+            let plan = plan_exhaustive_staging(dim, 4, &l).unwrap();
+            let dim_lines = dim / LINE_SIZE;
+            assert!(
+                dim_lines.is_multiple_of(plan.kb_lines),
+                "dim {dim}: block {} does not divide {dim_lines}",
+                plan.kb_lines
+            );
+        }
+    }
+
+    #[test]
+    fn test_exhaustive_staging_stays_in_budget() {
+        for shared in [16_384usize, 32_768, 49_152, 65_536] {
+            for elem in [4usize, 8] {
+                for dim in [32usize, 128, 512, 2048, 4096] {
+                    let l = GpuLimits {
+                        max_shared_bytes: shared,
+                        ..apple()
+                    };
+                    if let Some(plan) = plan_exhaustive_staging(dim, elem, &l) {
+                        assert!(
+                            exh_smem_bytes(plan.wg_y, plan.kb_lines, elem) <= shared,
+                            "over budget: shared {shared}, elem {elem}, dim {dim}"
+                        );
+                        assert!(plan.wg_y as usize >= TILE_Q);
+                        assert!((plan.wg_y as usize).is_multiple_of(TILE_Q));
+                    }
+                }
+            }
+        }
+    }
+
+    /// A device with a quarter of the units cannot run a 32-row tile, and the
+    /// caller must be told rather than handed an illegal cube.
+    #[test]
+    fn test_exhaustive_staging_shrinks_on_a_small_device() {
+        let plan = plan_exhaustive_staging(128, 4, &small()).unwrap();
+        assert!(plan.wg_y * WORKGROUP_SIZE_X <= small().max_units_per_cube);
+        assert!(plan.wg_y < EXH_WG_Y);
+    }
+
     // -- pick_wg_y --
 
     #[test]
@@ -792,10 +979,10 @@ mod tests {
 
     #[test]
     fn test_plan_local_join_apple_table_is_unchanged() {
-        // The block sizes and launch geometry the kernel's measured speedups
-        // were scored against. Changing them is a deliberate retune, not a
+        // The block sizes and launch geometry the kernel's speedups were
+        // scored against. Changing them is a deliberate retune, not a
         // drive-by: the cube width and unroll depth were each swept, and both
-        // regress by ~2x one step past the chosen value.
+        // regress sharply one step past the chosen value.
         for (dim, block, single) in [
             (64usize, 90usize, true),
             (128, 29, false),
