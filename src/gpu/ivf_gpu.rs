@@ -28,10 +28,9 @@ const IVF_GPU_QUERY_BATCH_SIZE: usize = 100_000;
 ///
 /// Sets the query batch size through [`IvfIndexGpu::calculate_safe_batch_size`],
 /// and the buffer's first write faults its pages in, so this is really a cold-
-/// start knob. At 150k x 32D, nlist 387, nprobe 19 the steady-state query is
-/// flat from roughly this size upwards (50 ms at 550 MB against 45 ms at
-/// 1100 MB) while the first query is not: 90 ms against 205 ms. The larger
-/// target bought 10% of the warm case and paid 2.3x for the cold one.
+/// start knob. The steady-state query is flat from roughly this size upwards
+/// while the first query is not, so a larger target buys little warm and costs
+/// a lot cold.
 const TARGET_BUFFER_MB: usize = 600;
 
 /// Divisor setting the slack on the reused candidate scratch buffer.
@@ -39,7 +38,7 @@ const TARGET_BUFFER_MB: usize = 600;
 /// `max_candidates` drifts by a few percent between query batches, so sizing
 /// the buffer exactly to the first batch makes later ones reallocate and pay
 /// the page-fault cost again. 4 gives 25% headroom, enough to absorb the drift
-/// seen at 150k x 32D without a meaningful VRAM penalty.
+/// without a meaningful VRAM penalty.
 const CANDIDATE_SCRATCH_HEADROOM_DIV: usize = 4;
 
 /////////////
@@ -49,8 +48,8 @@ const CANDIDATE_SCRATCH_HEADROOM_DIV: usize = 4;
 /// Reusable GPU scratch for the IVF candidate buffers
 ///
 /// The mega kernel's first write to a fresh allocation faults its pages in,
-/// which measures ~39 ms per call at 15k queries and dominates the kernel's own
-/// ~22 ms. Holding the buffers across batches confines that to the first batch.
+/// which dominates the kernel's own run time. Holding the buffers across
+/// batches and across calls confines that to the first query.
 struct CandidateScratch<R: Runtime, T: AnnSearchFloat + CubeclFloat> {
     /// Candidate distances, flat; viewed as `[n_queries, max_candidates]`
     dists: GpuTensor<R, T>,
@@ -308,8 +307,11 @@ where
             vec![T::one(); nlist]
         };
 
-        let sorted_size_prefix_src = |offsets: &[usize]| {
-            let mut sizes: Vec<usize> = offsets.windows(2).map(|w| w[1] - w[0]).collect();
+        let (vectors_by_cluster, original_indices, cluster_offsets, norms_by_cluster) =
+            reorganise_by_cluster(&vectors_flat, dim, n, &assignments, nlist, &metric);
+
+        let sorted_size_prefix = {
+            let mut sizes: Vec<usize> = cluster_offsets.windows(2).map(|w| w[1] - w[0]).collect();
             sizes.sort_unstable();
             let mut prefix = Vec::with_capacity(sizes.len() + 1);
             prefix.push(0usize);
@@ -320,11 +322,6 @@ where
             }
             prefix
         };
-
-        let (vectors_by_cluster, original_indices, cluster_offsets, norms_by_cluster) =
-            reorganise_by_cluster(&vectors_flat, dim, n, &assignments, nlist, &metric);
-
-        let sorted_size_prefix = sorted_size_prefix_src(&cluster_offsets);
 
         if verbose {
             println!("  Uploading all vectors to GPU");
@@ -820,8 +817,7 @@ where
         //
         // On device where the radix reducer fits: the full `[n_queries, nlist]`
         // distance matrix never comes back, only `[n_queries, probe_pool]`
-        // cluster ids, which is ~20x less at nlist 387 and nprobe 19, and the
-        // host-side sort of every row goes with it.
+        // cluster ids, and the host-side sort of every row goes with it.
         let probe_pool = nprobe.max(self.min_clusters_for_k(k)).min(self.nlist);
         let wg = WORKGROUP_SIZE_X as usize;
 
@@ -1328,7 +1324,6 @@ mod tests {
         assert_eq!(knn.len(), 50);
     }
 
-    #[test]
     /// The truncated probe list is only correct if `min_clusters_for_k` really
     /// is a count that *any* set of that many clusters reaches.
     #[test]
@@ -1369,6 +1364,7 @@ mod tests {
         }
     }
 
+    #[test]
     fn test_reorganise_by_cluster() {
         let vectors: Vec<f32> = vec![
             1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0,

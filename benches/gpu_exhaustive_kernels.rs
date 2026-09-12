@@ -355,9 +355,8 @@ impl<R: Runtime> Benchmark for DistanceRegBench<R> {
         let vec_size = LINE_SIZE;
 
         let limits = GpuLimits::from_client(&self.client);
-        let plan = match plan_exhaustive_staging(self.cfg.dim, size_of::<f32>(), &limits) {
-            Some(p) => p,
-            None => return Err(format!("no staging plan for dim {}", self.cfg.dim)),
+        let Some(plan) = plan_exhaustive_staging(self.cfg.dim, size_of::<f32>(), &limits) else {
+            return Err(format!("no staging plan for dim {}", self.cfg.dim));
         };
         let wg_y = plan.wg_y;
         let threads_y = wg_y / TILE_Q as u32;

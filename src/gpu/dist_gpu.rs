@@ -352,8 +352,8 @@ pub fn euclidean_tiled_reg<F: Float, N: Size>(
             }
         }
         // The next block overwrites the tile, so every thread must be done
-        // reading it first. Comptime: with one block there is no next one, and
-        // the barrier costs ~5% end to end at dim=128.
+        // reading it first. Comptime because with one block there is no next
+        // one, and the barrier is not free.
         if comptime!(n_blocks > 1) {
             sync_cube();
         }
@@ -498,8 +498,8 @@ pub fn cosine_tiled_reg<F: Float, N: Size>(
             }
         }
         // The next block overwrites the tile, so every thread must be done
-        // reading it first. Comptime: with one block there is no next one, and
-        // the barrier costs ~5% end to end at dim=128.
+        // reading it first. Comptime because with one block there is no next
+        // one, and the barrier is not free.
         if comptime!(n_blocks > 1) {
             sync_cube();
         }
@@ -775,9 +775,8 @@ where
             let (grid_y, grid_z) = grid_2d((n_q as u32).div_ceil(safe_worksize_y), &limits)?;
 
             match *metric {
-                // Register-tiled path where the tile divides the query tile
-                // height; roughly 1.4x to 2.2x over the untiled kernel and
-                // bit-exact against it. See `TILE_D` for the measurements.
+                // Register-tiled path where the tile divides the query
+                // tile height. Bit-exact against the untiled kernel.
                 Dist::SquaredEuclidean if staging.is_some() => unsafe {
                     let plan = staging.unwrap();
                     let reg_grid_x = (n_db as u32).div_ceil(WORKGROUP_SIZE_X * TILE_D as u32);
@@ -1144,14 +1143,12 @@ pub fn reduce_ivf_topk<F: Float>(
 ///
 /// ### Note
 ///
-/// Register tiling this over `TILE_D` DB vectors, which is worth 1.4x to 2.2x
-/// on the exhaustive kernel, measured *slower* here: 195 ms against 169 at
-/// dim=128 and 380 against 312 at dim=256 on a 15k-query batch. The x extent is
-/// ragged. The grid is sized by the largest cluster, so for an average task
-/// most of it is out of range, and 1x1 lets those threads `terminate!()` at
-/// once where a 4-wide tile keeps a thread alive for its whole row as soon as
-/// one of its four DB vectors is in range. Do not retry it without first
-/// bucketing tasks by cluster size.
+/// Register tiling this over `TILE_D` DB vectors, which pays on the exhaustive
+/// kernel, measured *slower* here. The x extent is ragged: the grid is sized by
+/// the largest cluster, so for an average task most of it is out of range, and
+/// 1x1 lets those threads `terminate!()` at once where a 4-wide tile keeps a
+/// thread alive for its whole row as soon as one of its four DB vectors is in
+/// range. Do not retry it without first bucketing tasks by cluster size.
 ///
 /// ### Grid mapping
 ///

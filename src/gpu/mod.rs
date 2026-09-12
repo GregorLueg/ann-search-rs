@@ -71,31 +71,26 @@ pub const TILE_Q: usize = 4;
 /// Query rows the register-tiled exhaustive kernels stage per cube.
 ///
 /// Query reuse per DB read, not occupancy, is what the exhaustive distance
-/// kernel lives on. Forcing this down from 32 at dim=128 measured 875, 1053,
-/// 1191 and 1614 ms at 32, 16, 8 and 4 on a 50k x 50k self-kNN; raising it to
-/// 64 at dim=64 measured 556 against 559, i.e. flat. So 32 is the knee, and
-/// [`plan_exhaustive_staging`] holds it there at every dimensionality by
-/// blocking the reduction axis instead of staging the whole row.
+/// kernel lives on. Halving this costs steadily and raising it is flat, so 32
+/// is the knee. [`plan_exhaustive_staging`] holds it there at every
+/// dimensionality by blocking the reduction axis instead of staging the whole
+/// row.
 pub const EXH_WG_Y: u32 = 32;
 
 /// Reduction lines the register-tiled exhaustive kernels want per block.
 ///
 /// Once the query tile is pinned at [`EXH_WG_Y`] the block length is what sets
-/// the shared-memory footprint, and therefore how many cubes stay resident. A
-/// 50k x 50k self-kNN at blocks of 1, 2, 4, 8, 16, 32 measured 807, 786, 734,
-/// 756, 832, 913 ms at dim=128 and 2314, 2196, 2086, 2109, 2203, 2422 at
-/// dim=512. Four is the knee at every dimensionality swept, and it is shallow
-/// on both sides, so a `dim_lines` that admits only a neighbouring divisor
-/// loses a few percent rather than the win.
+/// the shared-memory footprint, and therefore how many cubes stay resident.
+/// Four is the knee at every dimensionality swept, and the curve is shallow on
+/// both sides, so a `dim_lines` that admits only a neighbouring divisor keeps
+/// most of the win.
 pub const EXH_K_BLOCK: usize = 4;
 
 /// Footprint below which the reduction axis is not worth blocking at all.
 ///
 /// Blocking costs two barriers per block, and buys nothing once the whole row
-/// already leaves room for several resident cubes. At dim=32 the whole row is
-/// exactly this size and one block measured 401 ms against 407 for
-/// [`EXH_K_BLOCK`]; at dim=64 it is twice this and one block measured 574
-/// against 522. So the threshold sits between them, at the smaller.
+/// already leaves room for several resident cubes. At or below this footprint
+/// staging the whole row wins; above it [`EXH_K_BLOCK`] does.
 pub const EXH_SMEM_TARGET: usize = 4096;
 
 /////////////
@@ -227,10 +222,9 @@ pub fn exh_smem_bytes(wg_y: u32, kb_lines: usize, elem_bytes: usize) -> usize {
 ///
 /// Holds the query tile at [`EXH_WG_Y`] rows and blocks the reduction axis at
 /// [`EXH_K_BLOCK`] lines, which is the opposite of what [`pick_wg_y`] does:
-/// that one stages the whole row and pays for it in tile height, dropping to 16
-/// at dim=256 and 8 at dim=512. The block length is the divisor of `dim_lines`
-/// closest to the target, so the inner loop needs no bounds test, and `1`
-/// always qualifies.
+/// that one stages the whole row and pays for it in tile height. The block
+/// length is the divisor of `dim_lines` closest to the target, so the inner
+/// loop needs no bounds test, and `1` always qualifies.
 ///
 /// ### Params
 ///
@@ -985,10 +979,10 @@ mod tests {
 
     #[test]
     fn test_plan_local_join_apple_table_is_unchanged() {
-        // The block sizes and launch geometry the kernel's measured speedups
-        // were scored against. Changing them is a deliberate retune, not a
+        // The block sizes and launch geometry the kernel's speedups were
+        // scored against. Changing them is a deliberate retune, not a
         // drive-by: the cube width and unroll depth were each swept, and both
-        // regress by ~2x one step past the chosen value.
+        // regress sharply one step past the chosen value.
         for (dim, block, single) in [
             (64usize, 90usize, true),
             (128, 29, false),

@@ -878,11 +878,10 @@ where
         let batch_leaves = batch_leaf_offsets.len() - 1;
 
         // Size the staging to the leaves this batch actually has, not to what
-        // the device could hold. `max_leaf_size` is a capacity bound: at a
-        // depth targeting 64 points the leaves come out around 37, so staging
-        // for 240 fills 30.7 KB of a 32 KB budget and leaves exactly one cube
-        // resident per core. Rounded to a power of two so only a handful of
-        // kernel variants ever compile.
+        // the device could hold: `max_leaf_size` is a capacity bound and real
+        // leaves come out well under it, so staging for it wastes shared memory
+        // and costs resident cubes. Rounded to a power of two so only a handful
+        // of kernel variants ever compile.
         let batch_max_leaf = batch_leaf_offsets
             .windows(2)
             .map(|w| (w[1] - w[0]) as usize)
