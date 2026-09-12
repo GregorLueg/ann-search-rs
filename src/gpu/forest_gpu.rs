@@ -214,7 +214,11 @@ fn compute_max_leaf_size(
     // `shared_leaf_start` + `shared_leaf_size`
     const OVERHEAD: usize = 8;
 
-    let per_point = dim_padded * elem_bytes + 4 + elem_bytes;
+    // Per point: `shared_vecs` holds a row, `shared_pids` a u32, and
+    // `shared_norms` and `shared_thresh` a float each. Every `SharedMemory` in
+    // `leaf_pairwise_proposals` is counted here; missing one busts the device
+    // limit, and `launch_unchecked` then does no work and reports nothing.
+    let per_point = dim_padded * elem_bytes + 4 + 2 * elem_bytes;
     let available = limits.max_shared_bytes.saturating_sub(OVERHEAD);
     let fits = available / per_point;
 
@@ -887,9 +891,13 @@ where
             .map(|w| (w[1] - w[0]) as usize)
             .max()
             .unwrap_or(0);
+        // The floor keeps a tiny batch from compiling a degenerate variant, but
+        // it cannot exceed the capacity: past dim 128 `max_leaf_size` is itself
+        // below the workgroup width.
+        let stage_floor = (WORKGROUP_SIZE_X as usize).min(max_leaf_size);
         let leaf_stage = batch_max_leaf
             .next_power_of_two()
-            .clamp(WORKGROUP_SIZE_X as usize, max_leaf_size);
+            .clamp(stage_floor, max_leaf_size);
 
         if batch_leaves == 0 {
             continue;
@@ -979,6 +987,81 @@ where
 ///////////
 // Tests //
 ///////////
+
+#[cfg(test)]
+mod budget_tests {
+    use super::*;
+
+    /// Shared-memory footprint of `leaf_pairwise_proposals`, counted off the
+    /// kernel body rather than off `compute_max_leaf_size`.
+    fn kernel_smem_bytes(leaf_size: usize, dim_padded: usize, elem_bytes: usize) -> usize {
+        // shared_leaf_start + shared_leaf_size
+        8
+            // shared_vecs
+            + leaf_size * dim_padded * elem_bytes
+            // shared_pids
+            + leaf_size * 4
+            // shared_norms + shared_thresh
+            + 2 * leaf_size * elem_bytes
+    }
+
+    fn limits_with(shared: usize) -> GpuLimits {
+        GpuLimits {
+            max_shared_bytes: shared,
+            max_cube_count: (65_535, 65_535, 65_535),
+            max_units_per_cube: 1024,
+            max_cube_dim: (1024, 1024, 1024),
+            max_binding_bytes: 4_294_967_292,
+            plane_size_min: 32,
+            plane_size_max: 32,
+        }
+    }
+
+    /// The regression this exists for: `shared_thresh` was added to the kernel
+    /// without being counted here, so at dim 128 on a 32 KiB device the leaf
+    /// size came out one point too large and every launch silently did nothing.
+    #[test]
+    fn test_max_leaf_size_fits_the_kernel_footprint() {
+        for shared in [16_384usize, 32_768, 49_152, 65_536] {
+            for elem in [4usize, 8] {
+                for dim in [8usize, 32, 64, 128, 256, 512, 1024] {
+                    let l = limits_with(shared);
+                    let Ok(max_leaf) = compute_max_leaf_size(dim, elem, &l) else {
+                        continue;
+                    };
+                    let used = kernel_smem_bytes(max_leaf, dim, elem);
+                    assert!(
+                        used <= shared,
+                        "shared {shared}, elem {elem}, dim {dim}: \
+                         max_leaf {max_leaf} needs {used}"
+                    );
+                    assert!(max_leaf >= 2);
+                }
+            }
+        }
+    }
+
+    /// The staging bucket the batch loop computes must fit too, for every leaf
+    /// size the data could produce.
+    #[test]
+    fn test_leaf_stage_bucket_fits() {
+        let l = limits_with(32_768);
+        for dim in [32usize, 64, 128, 256, 512] {
+            let max_leaf = compute_max_leaf_size(dim, 4, &l).unwrap();
+            for batch_max_leaf in 1..=max_leaf {
+                let stage_floor = (WORKGROUP_SIZE_X as usize).min(max_leaf);
+                let stage = batch_max_leaf
+                    .next_power_of_two()
+                    .clamp(stage_floor, max_leaf);
+                assert!(
+                    kernel_smem_bytes(stage, dim, 4) <= 32_768,
+                    "dim {dim}, batch max {batch_max_leaf}: stage {stage} over budget"
+                );
+                assert!(stage >= batch_max_leaf.min(max_leaf));
+            }
+        }
+    }
+}
 
 #[cfg(test)]
 #[cfg(feature = "gpu-tests")]
