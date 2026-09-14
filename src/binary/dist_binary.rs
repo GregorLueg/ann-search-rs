@@ -916,6 +916,20 @@ where
         self.storage().dim
     }
 
+    /// Get the dimensionality of the rotated frame
+    ///
+    /// This is the coordinate count the codes and the quantised query actually
+    /// span, which is what the estimator's counting terms need. It only differs
+    /// from [`dim`](Self::dim) when the encoder's rotation pads.
+    ///
+    /// ### Returns
+    ///
+    /// Number of coordinates after rotation
+    #[inline]
+    fn padded_dim(&self) -> usize {
+        self.storage().padded_dim
+    }
+
     /// Get the number of bytes per vector
     ///
     /// ### Returns
@@ -984,7 +998,7 @@ where
         let storage = self.storage();
         let packed = storage.get_vector_data(cluster_idx, local_idx); // Single cache line read
 
-        let dim_f = T::from_usize(self.dim()).unwrap();
+        let dim_f = T::from_usize(self.padded_dim()).unwrap();
         let two = T::one() + T::one();
 
         let v_dist = packed.dist_to_centroid;
@@ -1050,7 +1064,7 @@ where
 
         let one = T::one();
         let two = one + one;
-        let dim_f = T::from_usize(self.dim()).unwrap();
+        let dim_f = T::from_usize(self.padded_dim()).unwrap();
         let q_dist = query.dist_to_centroid;
         let sum_q = T::from_u32(query.sum_quantised).unwrap();
         let q_term = query.width * sum_q + dim_f * query.lower;
