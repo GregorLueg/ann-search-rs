@@ -38,6 +38,14 @@ pub struct SearchState<T> {
     /// hundreds for both build and query, whereas NSG and Vamana prune against
     /// lists an order of magnitude shorter.
     pub results: BoundedMaxHeap<T>,
+    /// Bounded sorted beam that doubles as the frontier.
+    ///
+    /// Where `candidates` plus `results` are used as a pair, the frontier
+    /// accepts every candidate that beat the threshold at the time and then
+    /// never pops most of them. [`NeighbourQueue`] holds the beam once and
+    /// hands out the closest unexpanded entry instead, which is what Vamana's
+    /// construction walk uses.
+    pub beam: NeighbourQueue<T>,
     /// Temporary storage for heuristic selection
     pub scratch_working: Vec<(OrderedFloat<T>, usize)>,
     /// Temporary storage for pruned candidates
@@ -66,6 +74,7 @@ where
             candidates: BinaryHeap::with_capacity(capacity),
             working_sorted: SortedBuffer::with_capacity(capacity),
             results: BoundedMaxHeap::new(capacity),
+            beam: NeighbourQueue::new(capacity),
             scratch_working: Vec::with_capacity(capacity),
             scratch_discarded: Vec::with_capacity(capacity),
         }
@@ -88,6 +97,7 @@ where
         self.candidates.clear();
         self.working_sorted.clear();
         self.results.clear();
+        self.beam.clear();
         self.scratch_working.clear();
         self.scratch_discarded.clear();
     }
