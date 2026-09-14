@@ -129,6 +129,16 @@ pub enum AnnSearchErrors {
     #[error("Vector store is not available. Use build_with_vector_store() to enable reranking.")]
     VectorStoreNotAvailable,
 
+    /// The quantised graph degree is not a whole number of scan batches
+    #[cfg(feature = "binary")]
+    #[error("The quantised graph degree must be a non-zero multiple of {batch}; {degree} is not.")]
+    QgInvalidDegree {
+        /// Requested degree
+        degree: usize,
+        /// Neighbours scored per fast-scan sweep
+        batch: usize,
+    },
+
     /// The requested rotation cannot serve this dimensionality
     #[cfg(feature = "binary")]
     #[error("The fast Hadamard rotation needs at least {min_dim} dimensions; the data has {dim}.")]

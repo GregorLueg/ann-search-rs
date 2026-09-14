@@ -704,6 +704,7 @@ mod tests {
         use crate::binary::ivf_binary::*;
         use crate::binary::ivf_rabitq::*;
         use crate::binary::ivf_tq::*;
+        use crate::binary::qg::*;
         use crate::binary::vec_store::{MmapVectorStore, StoreMeta, NORMS_FILE, VECTORS_FILE};
 
         /// Bits per binary code. Must be a multiple of 8.
@@ -804,6 +805,13 @@ mod tests {
                 true,
                 false
             ))
+        );
+
+        round_trip!(
+            test_round_trip_qg,
+            QgIndex<f32>,
+            |m| build_qg_index(m, 32, 64, 1.2, 1.2, "euclidean", 1).unwrap(),
+            |i, q| unwrap_knn(query_qg_index(q, i, K, 64, true, false))
         );
 
         round_trip!(
@@ -1818,10 +1826,11 @@ mod tests {
         {
             use crate::binary::{
                 exhaustive_binary::*, exhaustive_rabitq::*, exhaustive_tq::*, ivf_binary::*,
-                ivf_rabitq::*, ivf_tq::*,
+                ivf_rabitq::*, ivf_tq::*, qg::*,
             };
 
             kinds.extend([
+                <QgIndex<f32> as IndexIo>::KIND,
                 <ExhaustiveIndexBinary<f32> as IndexIo>::KIND,
                 <IvfIndexBinary<f32> as IndexIo>::KIND,
                 <ExhaustiveIndexRaBitQ<f32> as IndexIo>::KIND,

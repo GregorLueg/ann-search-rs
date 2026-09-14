@@ -10,6 +10,7 @@ pub mod exhaustive_tq;
 pub mod ivf_binary;
 pub mod ivf_rabitq;
 pub mod ivf_tq;
+pub mod qg;
 pub mod rabitq;
 pub mod rabitq_fastscan;
 pub mod rotator;
