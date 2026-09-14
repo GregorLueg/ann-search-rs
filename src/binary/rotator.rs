@@ -69,6 +69,9 @@ pub const FHT_AUTO_MIN_DIM: usize = 192;
 /// downstream 1-bit codes a whole number of 8-byte words.
 pub const ROTATOR_PAD: usize = 64;
 
+/// Coordinates per byte of a one-bit code.
+pub const CODE_BYTE: usize = 8;
+
 /// In-place fast Hadamard transform.
 ///
 /// Plain butterfly loop rather than intrinsics: the stride pattern is exactly
@@ -190,7 +193,7 @@ pub fn resolve_rotator_kind(dim: usize) -> RotatorKind {
 
 /// Working dimensionality a rotation produces.
 ///
-/// The dense rotation is square and pads nothing; the Hadamard path rounds up
+/// The dense rotation rounds up to a whole code byte; the Hadamard path rounds up
 /// to [`ROTATOR_PAD`].
 ///
 /// ### Params
@@ -203,7 +206,11 @@ pub fn resolve_rotator_kind(dim: usize) -> RotatorKind {
 /// Length of the rotated vector
 pub fn padded_dim_for(dim: usize, kind: RotatorKind) -> usize {
     match kind {
-        RotatorKind::Dense => dim,
+        // A whole number of bytes even for the dense rotation: the one-bit
+        // codes are byte-packed and the fast-scan table is built per byte, so a
+        // dimensionality that is not a multiple of eight would leave a partial
+        // group the scan cannot address.
+        RotatorKind::Dense => dim.next_multiple_of(CODE_BYTE),
         RotatorKind::FhtKac => dim.next_multiple_of(ROTATOR_PAD),
     }
 }
@@ -219,6 +226,8 @@ pub struct DenseRotator<T> {
     rotation: Vec<T>,
     /// Dimensionality of the data
     dim: usize,
+    /// Output length, `dim` rounded up to [`CODE_BYTE`]
+    padded_dim: usize,
 }
 
 impl<T> DenseRotator<T>
@@ -255,7 +264,11 @@ where
             }
         }
 
-        Self { rotation, dim }
+        Self {
+            rotation,
+            dim,
+            padded_dim: padded_dim_for(dim, RotatorKind::Dense),
+        }
     }
 
     /// Rotate one vector into a caller-supplied buffer.
@@ -263,16 +276,17 @@ where
     /// ### Params
     ///
     /// * `vec` - Vector of length `dim`
-    /// * `out` - Output buffer of length `dim`
+    /// * `out` - Output buffer of length `padded_dim`
     #[inline]
     pub fn rotate_into(&self, vec: &[T], out: &mut [T]) {
         debug_assert_eq!(vec.len(), self.dim);
-        debug_assert_eq!(out.len(), self.dim);
+        debug_assert_eq!(out.len(), self.padded_dim);
 
         for i in 0..self.dim {
             let row = &self.rotation[i * self.dim..(i + 1) * self.dim];
             out[i] = T::dot_simd(row, vec);
         }
+        out[self.dim..].fill(T::zero());
     }
 
     /// Rotate one vector into a fresh buffer.
@@ -283,10 +297,10 @@ where
     ///
     /// ### Returns
     ///
-    /// The rotated vector, of length `dim`
+    /// The rotated vector, of length `padded_dim`
     #[inline]
     pub fn rotate(&self, vec: &[T]) -> Vec<T> {
-        let mut out = vec![T::zero(); self.dim];
+        let mut out = vec![T::zero(); self.padded_dim];
         self.rotate_into(vec, &mut out);
         out
     }
@@ -511,7 +525,7 @@ where
     /// The working dimensionality
     pub fn padded_dim(&self) -> usize {
         match self {
-            Self::Dense(r) => r.dim,
+            Self::Dense(r) => r.padded_dim,
             Self::FhtKac(r) => r.padded_dim,
         }
     }
@@ -731,7 +745,7 @@ mod tests {
         let dim = 32;
         let rot = DenseRotator::<f32>::new(dim, 3);
         let data = gaussian(8, dim, 6);
-        let mut out = vec![0.0f32; dim];
+        let mut out = vec![0.0f32; rot.padded_dim];
         for row in data.chunks_exact(dim) {
             rot.rotate_into(row, &mut out);
             approx::assert_relative_eq!(l2(&out), l2(row), epsilon = 1e-4);
@@ -752,7 +766,8 @@ mod tests {
 
     #[test]
     fn test_padded_dim_rounds_to_the_pad_multiple() {
-        assert_eq!(padded_dim_for(50, RotatorKind::Dense), 50);
+        assert_eq!(padded_dim_for(50, RotatorKind::Dense), 56);
+        assert_eq!(padded_dim_for(48, RotatorKind::Dense), 48);
         assert_eq!(padded_dim_for(64, RotatorKind::FhtKac), 64);
         assert_eq!(padded_dim_for(100, RotatorKind::FhtKac), 128);
         assert_eq!(padded_dim_for(768, RotatorKind::FhtKac), 768);
@@ -762,7 +777,7 @@ mod tests {
     fn test_enum_rotator_dispatches_and_reports_padding() {
         let dense = RaBitQRotator::<f32>::new(50, None, 0).unwrap();
         assert_eq!(dense.kind(), RotatorKind::Dense);
-        assert_eq!(dense.padded_dim(), 50);
+        assert_eq!(dense.padded_dim(), 56);
 
         let fht = RaBitQRotator::<f32>::new(200, None, 0).unwrap();
         assert_eq!(fht.kind(), RotatorKind::FhtKac);

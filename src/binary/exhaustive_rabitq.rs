@@ -232,15 +232,19 @@ where
         let q_rot = self.quantiser.encoder.apply_rotation(&query_normalised);
 
         for &(_, c_idx) in cluster_dists.iter().take(n_probe) {
-            let query_encoded = self.quantiser.encode_query_prerotated(&q_rot, c_idx);
+            let query_encoded = self.quantiser.encode_query_prerotated(&q_rot, c_idx)?;
             let cluster_size = self.storage().cluster_size(c_idx);
             let indices = self.storage().cluster_vector_indices(c_idx);
 
             let mut local_idx = 0;
             while local_idx < cluster_size {
                 let take = RABITQ_BLOCK.min(cluster_size - local_idx);
-                let block_min =
-                    self.rabitq_block_sq(&query_encoded, c_idx, local_idx, &mut block[..take]);
+                let block_min = self.rabitq_block_sq_fastscan(
+                    &query_encoded,
+                    c_idx,
+                    local_idx,
+                    &mut block[..take],
+                );
 
                 if heap.len() < k || block_min < heap.peek().unwrap().0 .0 {
                     for (j, &dist) in block[..take].iter().enumerate() {
@@ -484,7 +488,7 @@ where
             meta.check(self.n, self.quantiser.encoder.dim)?;
         }
         self.vector_store = MmapVectorStore::open_in_dir(dir, self.store_meta)?;
-        self.quantiser.storage.rebuild_blocked();
+        self.quantiser.storage.reblock_for_this_arch();
 
         Ok(())
     }

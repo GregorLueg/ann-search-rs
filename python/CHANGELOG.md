@@ -3,6 +3,13 @@
 Changes to the `ann-search` Python package. The Rust crate it wraps,
 `ann-search-rs`, has its own changelog at [`../CHANGELOG.md`](../CHANGELOG.md).
 
+## 0.3.0
+
+Requires `ann-search-rs` 0.9.0.
+
+- Takes in the RaBitQ rework: a fast Hadamard rotation and fast-scan distance
+  estimation. RaBitQ indices saved with an earlier version cannot be loaded.
+
 ## 0.2.4
 
 Requires `ann-search-rs` 0.8.5.

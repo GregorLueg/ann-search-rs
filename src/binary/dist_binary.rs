@@ -5,6 +5,8 @@
 use num_traits::{Float, FromPrimitive};
 
 use crate::binary::rabitq::*;
+#[cfg(test)]
+use crate::binary::rabitq_fastscan::unpack_rabitq_blocked;
 use crate::binary::rabitq_fastscan::{score_sign_block, SignScanQuery};
 #[allow(unused_imports)]
 use crate::prelude::*;
@@ -640,255 +642,12 @@ where
 // VectorDistanceRaBitQ //
 //////////////////////////
 
-//////////
-// SIMD //
-//////////
-
-/// Bit-planes in the int4 quantised RaBitQ query.
+/// RaBitQ distance estimation over a clustered code store.
 ///
-/// `encode_query` quantises to 0..=15, so four planes reproduce every query
-/// coordinate exactly and the inner product becomes
-/// `sum_j 2^j * popcount(plane_j AND code)`.
-pub const RABITQ_QUERY_PLANES: usize = 4;
-
-/// Bit-slice an int4 quantised query into [`RABITQ_QUERY_PLANES`] planes
-///
-/// Plane `j` occupies `[j * n_bytes, (j + 1) * n_bytes)` of the output and
-/// holds bit `j` of every coordinate, coordinate `d` at bit `d % 8` of byte
-/// `d / 8`. That is the same bit order `RaBitQEncoder::encode_vector` uses for
-/// the stored sign bits, so the two AND together directly.
-///
-/// ### Params
-///
-/// * `quantised` - Int4 values, one per dimension
-/// * `dim` - Vector dimensionality
-/// * `n_bytes` - Bytes per plane, `dim.div_ceil(8)`
-///
-/// ### Returns
-///
-/// A `RABITQ_QUERY_PLANES * n_bytes` buffer of bit-planes
-#[inline]
-pub fn build_query_planes(quantised: &[u8], dim: usize, n_bytes: usize) -> Vec<u8> {
-    let mut planes = vec![0u8; RABITQ_QUERY_PLANES * n_bytes];
-
-    for d in 0..dim {
-        let value = quantised[d];
-        let byte = d / 8;
-        let bit = 1u8 << (d % 8);
-        for j in 0..RABITQ_QUERY_PLANES {
-            if (value >> j) & 1 == 1 {
-                planes[j * n_bytes + byte] |= bit;
-            }
-        }
-    }
-
-    planes
-}
-
-/// Reassemble the dense int4 query from its bit-planes
-///
-/// Inverse of [`build_query_planes`]. The scan path never needs this; it exists
-/// so the plane layout can be checked against the dense reference kernel.
-///
-/// ### Params
-///
-/// * `planes` - Query bit-planes from [`build_query_planes`]
-/// * `dim` - Vector dimensionality
-/// * `n_bytes` - Bytes per plane
-///
-/// ### Returns
-///
-/// The int4 values, one per dimension
-#[inline]
-pub fn unpack_query_planes(planes: &[u8], dim: usize, n_bytes: usize) -> Vec<u8> {
-    let mut quantised = vec![0u8; dim];
-
-    for (d, slot) in quantised.iter_mut().enumerate() {
-        let byte = d / 8;
-        let bit = d % 8;
-        for j in 0..RABITQ_QUERY_PLANES {
-            *slot |= ((planes[j * n_bytes + byte] >> bit) & 1) << j;
-        }
-    }
-
-    quantised
-}
-
-/// Bit-plane dot product over `u64` words
-///
-/// ### Params
-///
-/// * `planes` - Query bit-planes from [`build_query_planes`]
-/// * `binary` - The binary code of one stored vector
-/// * `n_bytes` - Bytes per plane and per code
-///
-/// ### Returns
-///
-/// The dot product of the quantised query and the binary vector
-#[inline(always)]
-unsafe fn dot_planes_u64(planes: &[u8], binary: &[u8], n_bytes: usize) -> u32 {
-    let n_words = n_bytes / 8;
-    let pb = binary.as_ptr() as *const u64;
-    let mut acc = 0u32;
-
-    for j in 0..RABITQ_QUERY_PLANES {
-        let pp = planes.as_ptr().add(j * n_bytes) as *const u64;
-        let mut c = 0u32;
-        for w in 0..n_words {
-            c += (pp.add(w).read_unaligned() & pb.add(w).read_unaligned()).count_ones();
-        }
-        for i in (n_words * 8)..n_bytes {
-            c += (*planes.get_unchecked(j * n_bytes + i) & *binary.get_unchecked(i)).count_ones();
-        }
-        acc += c << j;
-    }
-
-    acc
-}
-
-/// Bit-plane dot product for NEON
-///
-/// One accumulator per plane so 16-byte chunks fold into u8 lanes for up to
-/// [`NEON_POPCNT_FLUSH`] iterations before a single `uaddlv` per plane. The
-/// four query planes stay in registers across a whole cluster scan.
-///
-/// ### Params
-///
-/// * `planes` - Query bit-planes from [`build_query_planes`]
-/// * `binary` - The binary code of one stored vector
-/// * `n_bytes` - Bytes per plane and per code
-///
-/// ### Returns
-///
-/// The dot product of the quantised query and the binary vector
-#[cfg(target_arch = "aarch64")]
-#[target_feature(enable = "neon")]
-unsafe fn dot_planes_neon(planes: &[u8], binary: &[u8], n_bytes: usize) -> u32 {
-    let n_chunks = n_bytes / 16;
-    let p = planes.as_ptr();
-    let b = binary.as_ptr();
-    let mut acc = 0u32;
-
-    let mut chunk = 0;
-    while chunk < n_chunks {
-        let batch_end = (chunk + NEON_POPCNT_FLUSH).min(n_chunks);
-        let mut a0 = vdupq_n_u8(0);
-        let mut a1 = vdupq_n_u8(0);
-        let mut a2 = vdupq_n_u8(0);
-        let mut a3 = vdupq_n_u8(0);
-
-        while chunk < batch_end {
-            let off = chunk * 16;
-            let vb = vld1q_u8(b.add(off));
-            a0 = vaddq_u8(a0, vcntq_u8(vandq_u8(vld1q_u8(p.add(off)), vb)));
-            a1 = vaddq_u8(a1, vcntq_u8(vandq_u8(vld1q_u8(p.add(n_bytes + off)), vb)));
-            a2 = vaddq_u8(
-                a2,
-                vcntq_u8(vandq_u8(vld1q_u8(p.add(2 * n_bytes + off)), vb)),
-            );
-            a3 = vaddq_u8(
-                a3,
-                vcntq_u8(vandq_u8(vld1q_u8(p.add(3 * n_bytes + off)), vb)),
-            );
-            chunk += 1;
-        }
-
-        acc += vaddlvq_u8(a0) as u32
-            + ((vaddlvq_u8(a1) as u32) << 1)
-            + ((vaddlvq_u8(a2) as u32) << 2)
-            + ((vaddlvq_u8(a3) as u32) << 3);
-    }
-
-    for i in (n_chunks * 16)..n_bytes {
-        let bb = *binary.get_unchecked(i);
-        for j in 0..RABITQ_QUERY_PLANES {
-            acc += (*planes.get_unchecked(j * n_bytes + i) & bb).count_ones() << j;
-        }
-    }
-
-    acc
-}
-
-/// Dot product between a bit-planed query and a binary code
-///
-/// `sum_j 2^j * popcount(plane_j AND code)`, which replaces the per-dimension
-/// masked add the dense-query kernel needs: at dim 128 that is four AND plus
-/// four popcount instructions against sixteen bytes of code, with no
-/// per-dimension work at all.
-///
-/// ### Params
-///
-/// * `planes` - Query bit-planes from [`build_query_planes`]
-/// * `binary` - The binary code of one stored vector
-/// * `n_bytes` - Bytes per plane and per code
-///
-/// ### Returns
-///
-/// The dot product of the quantised query and the binary vector
-#[inline(always)]
-pub fn dot_query_binary_planes(planes: &[u8], binary: &[u8], n_bytes: usize) -> u32 {
-    // Hard asserts, not debug: this is a safe `pub fn` and both kernels below
-    // read unchecked over `RABITQ_QUERY_PLANES * n_bytes` and `n_bytes`
-    assert_eq!(planes.len(), RABITQ_QUERY_PLANES * n_bytes);
-    assert_eq!(binary.len(), n_bytes);
-
-    #[cfg(target_arch = "aarch64")]
-    {
-        unsafe { dot_planes_neon(planes, binary, n_bytes) }
-    }
-
-    #[cfg(not(target_arch = "aarch64"))]
-    {
-        unsafe { dot_planes_u64(planes, binary, n_bytes) }
-    }
-}
-
-/// Dense-query reference for the bit-plane dot product
-///
-/// Walks the code a bit at a time against a dense int4 query. Superseded on the
-/// scan path by [`dot_query_binary_planes`]; kept as the oracle that kernel is
-/// validated against.
-///
-/// ### Params
-///
-/// * `query` - The query vector
-/// * `binary` - The binary vector
-/// * `dim` - The dimension of the vectors
-///
-/// ### Returns
-///
-/// The dot product of the query and binary vectors
-#[inline(always)]
-pub fn dot_query_binary_scalar(query: &[u8], binary: &[u8], dim: usize) -> u32 {
-    let mut sum = 0u32;
-    let full_bytes = dim / 8;
-
-    for byte_idx in 0..full_bytes {
-        let bits = binary[byte_idx];
-        let base = byte_idx * 8;
-        sum += query[base] as u32 * (bits & 1) as u32;
-        sum += query[base + 1] as u32 * ((bits >> 1) & 1) as u32;
-        sum += query[base + 2] as u32 * ((bits >> 2) & 1) as u32;
-        sum += query[base + 3] as u32 * ((bits >> 3) & 1) as u32;
-        sum += query[base + 4] as u32 * ((bits >> 4) & 1) as u32;
-        sum += query[base + 5] as u32 * ((bits >> 5) & 1) as u32;
-        sum += query[base + 6] as u32 * ((bits >> 6) & 1) as u32;
-        sum += query[base + 7] as u32 * ((bits >> 7) & 1) as u32;
-    }
-
-    let remaining = dim % 8;
-    if remaining > 0 {
-        let bits = binary[full_bytes];
-        let base = full_bytes * 8;
-        for bit_pos in 0..remaining {
-            sum += query[base + bit_pos] as u32 * ((bits >> bit_pos) & 1) as u32;
-        }
-    }
-
-    sum
-}
-
-/// Trait for RaBitQ distance computation over CSR storage
+/// Implemented by the IVF and exhaustive RaBitQ indices, which differ in how
+/// they pick clusters but share the estimator. Scoring goes one fast-scan block
+/// at a time: the query becomes a nibble table once per cluster, and each block
+/// of 32 codes is scanned with a single byte-shuffle per byte-group.
 pub trait VectorDistanceRaBitQ<T>
 where
     T: Float + FromPrimitive,
@@ -939,167 +698,6 @@ where
     #[inline]
     fn n_bytes(&self) -> usize {
         self.storage().n_bytes
-    }
-
-    /// Popcount for vector at local index within cluster
-    ///
-    /// ### Params
-    ///
-    /// * `cluster_idx` - Index of the cluster
-    /// * `local_idx` - Local index of the vector within the cluster
-    ///
-    /// ### Returns
-    ///
-    /// Number of set bits in the binary vector
-    #[inline]
-    fn popcount(&self, cluster_idx: usize, local_idx: usize) -> u32 {
-        self.storage()
-            .get_vector_data(cluster_idx, local_idx)
-            .popcount
-    }
-
-    /// Dot product between query and binary vector
-    ///
-    /// ### Params
-    ///
-    /// * `query` - The RaBitQ query
-    /// * `cluster_idx` - Index of the cluster
-    /// * `local_idx` - Local index of the vector within the cluster
-    ///
-    /// ### Returns
-    ///
-    /// Quantised dot product result
-    #[inline(always)]
-    fn dot_query_binary(
-        &self,
-        query: &RaBitQQuery<T>,
-        cluster_idx: usize,
-        local_idx: usize,
-    ) -> u32 {
-        let binary = self.storage().vector_binary(cluster_idx, local_idx);
-        dot_query_binary_planes(&query.planes, binary, self.n_bytes())
-    }
-
-    /// Squared RaBitQ distance estimate
-    ///
-    /// The ranking quantity. `rabitq_dist` is this plus a square root, which is
-    /// monotone, so scans rank on this and take the root only for the survivors.
-    ///
-    /// ### Params
-    ///
-    /// * `query` - The RaBitQ query
-    /// * `cluster_idx` - Index of the cluster
-    /// * `local_idx` - Local index of the vector within the cluster
-    ///
-    /// ### Returns
-    ///
-    /// Estimated squared Euclidean distance, clamped at zero
-    #[inline]
-    fn rabitq_dist_sq(&self, query: &RaBitQQuery<T>, cluster_idx: usize, local_idx: usize) -> T {
-        let storage = self.storage();
-        let packed = storage.get_vector_data(cluster_idx, local_idx); // Single cache line read
-
-        let dim_f = T::from_usize(self.padded_dim()).unwrap();
-        let two = T::one() + T::one();
-
-        let v_dist = packed.dist_to_centroid;
-        let q_dist = query.dist_to_centroid;
-
-        let qr = T::from_u32(self.dot_query_binary(query, cluster_idx, local_idx)).unwrap();
-        let popcount = T::from_u32(packed.popcount).unwrap();
-        let sum_q = T::from_u32(query.sum_quantised).unwrap();
-
-        let inner_product_sgn = two * (query.width * qr + query.lower * popcount)
-            - (query.width * sum_q + dim_f * query.lower);
-
-        // `dot_correction_inv` is stored as zero when the L1 norm underflowed at
-        // build time, which reproduces the old guarded divide without a branch.
-        let q_dot_v =
-            (inner_product_sgn * packed.dot_correction_inv).clamp(T::one().neg(), T::one());
-
-        (v_dist * v_dist + q_dist * q_dist - two * v_dist * q_dist * q_dot_v).max(T::zero())
-    }
-
-    /// RaBitQ distance estimate
-    ///
-    /// ### Params
-    ///
-    /// * `query` - The RaBitQ query
-    /// * `cluster_idx` - Index of the cluster
-    /// * `local_idx` - Local index of the vector within the cluster
-    ///
-    /// ### Returns
-    ///
-    /// Estimated Euclidean distance (Cosine works due to normalisation)
-    #[inline]
-    fn rabitq_dist(&self, query: &RaBitQQuery<T>, cluster_idx: usize, local_idx: usize) -> T {
-        self.rabitq_dist_sq(query, cluster_idx, local_idx).sqrt()
-    }
-
-    /// Squared RaBitQ distances for a contiguous run within one cluster
-    ///
-    /// Hoists everything that only depends on the query out of the per-vector
-    /// work and returns the block minimum, so the caller can reject the whole
-    /// run against its heap top with one comparison.
-    ///
-    /// ### Params
-    ///
-    /// * `query` - The RaBitQ query, already encoded against this cluster
-    /// * `cluster_idx` - Index of the cluster
-    /// * `local_start` - Local index of the first vector in the run
-    /// * `out` - Per-vector output; its length sets the block size
-    ///
-    /// ### Returns
-    ///
-    /// The minimum written into `out`, or infinity when `out` is empty
-    #[inline]
-    fn rabitq_block_sq(
-        &self,
-        query: &RaBitQQuery<T>,
-        cluster_idx: usize,
-        local_start: usize,
-        out: &mut [T],
-    ) -> T {
-        let storage = self.storage();
-        let n_bytes = self.n_bytes();
-
-        let one = T::one();
-        let two = one + one;
-        let dim_f = T::from_usize(self.padded_dim()).unwrap();
-        let q_dist = query.dist_to_centroid;
-        let sum_q = T::from_u32(query.sum_quantised).unwrap();
-        let q_term = query.width * sum_q + dim_f * query.lower;
-        let q_dist_sq = q_dist * q_dist;
-
-        let global_start = storage.offsets[cluster_idx] + local_start;
-        let mut min = T::infinity();
-
-        for (j, slot) in out.iter_mut().enumerate() {
-            let g = global_start + j;
-            let packed = unsafe { storage.packed_vectors.get_unchecked(g) };
-            let binary = unsafe {
-                storage
-                    .binary_codes
-                    .get_unchecked(g * n_bytes..(g + 1) * n_bytes)
-            };
-
-            let qr = T::from_u32(dot_query_binary_planes(&query.planes, binary, n_bytes)).unwrap();
-            let popcount = T::from_u32(packed.popcount).unwrap();
-
-            let inner_product_sgn = two * (query.width * qr + query.lower * popcount) - q_term;
-            let q_dot_v = (inner_product_sgn * packed.dot_correction_inv).clamp(one.neg(), one);
-
-            let v_dist = packed.dist_to_centroid;
-            let dist =
-                (v_dist * v_dist + q_dist_sq - two * v_dist * q_dist * q_dot_v).max(T::zero());
-
-            *slot = dist;
-            if dist < min {
-                min = dist;
-            }
-        }
-
-        min
     }
 
     /// Squared RaBitQ distances for one fast-scan block within a cluster
@@ -1398,102 +996,131 @@ mod tests {
         assert_eq!(quantiser.n_bytes(), 4);
     }
 
-    #[test]
-    fn test_rabitq_popcount() {
-        let data = create_test_data::<f32>(50, 32);
-        let quantiser =
-            RaBitQQuantiser::new(data.as_ref(), &Dist::SquaredEuclidean, Some(5), 42).unwrap();
+    /// The estimate computed longhand from the stored factors and the exact
+    /// signed inner product, with no table quantisation anywhere.
+    fn oracle_dist_sq(
+        quantiser: &RaBitQQuantiser<f32>,
+        q_rot: &[f32],
+        cluster_idx: usize,
+        local_idx: usize,
+    ) -> f32 {
+        let storage = quantiser.storage();
+        let n_bytes = storage.n_bytes;
+        let size = storage.cluster_size(cluster_idx);
 
-        let popcount = quantiser.popcount(0, 0);
-        assert!(popcount <= 32);
+        let codes = unpack_rabitq_blocked(
+            &storage.cluster_blocked(cluster_idx).data,
+            size,
+            n_bytes,
+            storage.blocked_arch,
+        );
+        let code = &codes[local_idx * n_bytes..(local_idx + 1) * n_bytes];
+
+        let c_rot = storage.centroid_rotated(cluster_idx);
+        let res: Vec<f32> = q_rot.iter().zip(c_rot).map(|(a, b)| a - b).collect();
+        let q_dist = res.iter().map(|x| x * x).sum::<f32>().sqrt();
+        let unit: Vec<f32> = if q_dist > f32::EPSILON {
+            res.iter().map(|x| x / q_dist).collect()
+        } else {
+            vec![0.0; res.len()]
+        };
+
+        let sgn: f32 = unit
+            .iter()
+            .enumerate()
+            .map(|(d, &x)| {
+                if code[d / 8] & (1 << (d % 8)) != 0 {
+                    x
+                } else {
+                    -x
+                }
+            })
+            .sum();
+
+        let packed = storage.get_vector_data(cluster_idx, local_idx);
+        let q_dot_v = (sgn * packed.dot_correction_inv).clamp(-1.0, 1.0);
+        let v_dist = packed.dist_to_centroid;
+
+        (v_dist * v_dist + q_dist * q_dist - 2.0 * v_dist * q_dist * q_dot_v).max(0.0)
     }
 
     #[test]
-    fn test_rabitq_dot_query_binary() {
-        let data = create_test_data::<f32>(50, 32);
-        let quantiser =
-            RaBitQQuantiser::new(data.as_ref(), &Dist::SquaredEuclidean, Some(5), 42).unwrap();
+    fn test_rabitq_block_is_non_negative_and_deterministic() {
+        for metric in [Dist::SquaredEuclidean, Dist::Cosine] {
+            let data = create_test_data::<f32>(100, 32);
+            let quantiser = RaBitQQuantiser::new(data.as_ref(), &metric, Some(10), 42).unwrap();
+            let query = vec![1.0f32; 32];
+            let q_rot = quantiser
+                .encoder
+                .apply_rotation(&quantiser.encoder.normalise_query(&query));
 
-        let query = vec![1.0f32; 32];
-        let encoded_query = quantiser.encode_query(&query, 0).unwrap();
+            for c_idx in 0..quantiser.storage().nlist {
+                let encoded = quantiser.encode_query_prerotated(&q_rot, c_idx).unwrap();
+                let size = quantiser.storage().cluster_size(c_idx);
 
-        let dot = quantiser.dot_query_binary(&encoded_query, 0, 0);
-        assert!(dot <= 15 * 32);
-    }
+                let mut a = vec![0.0f32; size.min(RABITQ_BLOCK)];
+                let mut b = vec![0.0f32; size.min(RABITQ_BLOCK)];
+                if a.is_empty() {
+                    continue;
+                }
+                quantiser.rabitq_block_sq_fastscan(&encoded, c_idx, 0, &mut a);
+                quantiser.rabitq_block_sq_fastscan(&encoded, c_idx, 0, &mut b);
 
-    #[test]
-    fn test_rabitq_dist_positive() {
-        let data = create_test_data::<f32>(50, 32);
-        let quantiser =
-            RaBitQQuantiser::new(data.as_ref(), &Dist::SquaredEuclidean, Some(5), 42).unwrap();
-
-        let query = vec![1.0f32; 32];
-        let encoded_query = quantiser.encode_query(&query, 0).unwrap();
-
-        let dist = quantiser.rabitq_dist(&encoded_query, 0, 0);
-        assert!(dist >= 0.0);
-    }
-
-    #[test]
-    fn test_rabitq_dist_consistency() {
-        let data = create_test_data::<f32>(50, 32);
-        let quantiser =
-            RaBitQQuantiser::new(data.as_ref(), &Dist::SquaredEuclidean, Some(5), 42).unwrap();
-
-        let query = vec![1.0f32; 32];
-        let encoded_query = quantiser.encode_query(&query, 0).unwrap();
-
-        let dist1 = quantiser.rabitq_dist(&encoded_query, 0, 0);
-        let dist2 = quantiser.rabitq_dist(&encoded_query, 0, 0);
-
-        assert_eq!(dist1, dist2);
-    }
-
-    #[test]
-    fn test_rabitq_dist_different_vectors() {
-        let data = create_test_data::<f32>(50, 32);
-        let quantiser =
-            RaBitQQuantiser::new(data.as_ref(), &Dist::SquaredEuclidean, Some(5), 42).unwrap();
-
-        let query = vec![1.0f32; 32];
-        let encoded_query = quantiser.encode_query(&query, 0).unwrap();
-
-        let cluster_size = quantiser.storage().cluster_size(0);
-        if cluster_size > 1 {
-            let dist0 = quantiser.rabitq_dist(&encoded_query, 0, 0);
-            let dist1 = quantiser.rabitq_dist(&encoded_query, 0, 1);
-
-            assert!(dist0 >= 0.0 && dist1 >= 0.0);
+                assert!(
+                    a.iter().all(|&d| d >= 0.0),
+                    "{metric:?} produced a negative"
+                );
+                assert_eq!(a, b, "{metric:?} is not deterministic");
+            }
         }
     }
 
     #[test]
-    fn test_rabitq_dist_cosine() {
-        let data = create_test_data::<f32>(50, 32);
-        let quantiser = RaBitQQuantiser::new(data.as_ref(), &Dist::Cosine, Some(5), 42).unwrap();
-
-        let query = vec![1.0f32; 32];
-        let encoded_query = quantiser.encode_query(&query, 0).unwrap();
-
-        let dist = quantiser.rabitq_dist(&encoded_query, 0, 0);
-        assert!(dist >= 0.0);
-    }
-
-    #[test]
-    fn test_rabitq_multiple_clusters() {
-        let data = create_test_data::<f32>(100, 32);
+    fn test_rabitq_block_tracks_the_oracle() {
+        // Clustered pseudo-random data, not the ramp: near-collinear vectors
+        // drive the residual L1 norm towards zero, which sends
+        // `dot_correction_inv` to infinity and leaves the estimate pinned at
+        // the clamp, where it says nothing about the kernel.
+        let (n, dim) = (200usize, 64usize);
+        let data = faer::Mat::from_fn(n, dim, |i, j| {
+            let centre = (splitmix_byte(1, (i % 4) * dim + j) as f32 / 128.0) - 1.0;
+            centre * 4.0 + (splitmix_byte(2, i * dim + j) as f32 / 128.0) - 1.0
+        });
         let quantiser =
-            RaBitQQuantiser::new(data.as_ref(), &Dist::SquaredEuclidean, Some(10), 42).unwrap();
+            RaBitQQuantiser::new(data.as_ref(), &Dist::SquaredEuclidean, Some(4), 42).unwrap();
 
-        let query = vec![1.0f32; 32];
+        let query: Vec<f32> = (0..dim).map(|i| (i as f32 * 0.37).sin()).collect();
+        let q_rot = quantiser.encoder.apply_rotation(&query);
 
-        for cluster_idx in 0..quantiser.storage().nlist {
-            let encoded_query = quantiser.encode_query(&query, cluster_idx).unwrap();
-            let cluster_size = quantiser.storage().cluster_size(cluster_idx);
+        for c_idx in 0..quantiser.storage().nlist {
+            let encoded = quantiser.encode_query_prerotated(&q_rot, c_idx).unwrap();
+            let size = quantiser.storage().cluster_size(c_idx);
 
-            for local_idx in 0..cluster_size {
-                let dist = quantiser.rabitq_dist(&encoded_query, cluster_idx, local_idx);
-                assert!(dist >= 0.0);
+            let mut local = 0;
+            while local < size {
+                let take = RABITQ_BLOCK.min(size - local);
+                let mut block = vec![0.0f32; take];
+                let block_min =
+                    quantiser.rabitq_block_sq_fastscan(&encoded, c_idx, local, &mut block);
+
+                for j in 0..take {
+                    // The table rounds to u8 and that error is carried through
+                    // `2 * v_dist * q_dist`, so the bound is relative: the
+                    // estimate tracks the oracle, it does not reproduce it.
+                    approx::assert_relative_eq!(
+                        block[j],
+                        oracle_dist_sq(&quantiser, &q_rot, c_idx, local + j),
+                        max_relative = 0.01,
+                        epsilon = 1e-4
+                    );
+                }
+
+                assert_abs_diff_eq!(
+                    block_min,
+                    block.iter().cloned().fold(f32::INFINITY, f32::min),
+                    epsilon = 1e-6
+                );
+                local += take;
             }
         }
     }
@@ -1526,59 +1153,6 @@ mod tests {
             }
         }
         code
-    }
-
-    #[test]
-    fn test_query_planes_round_trip() {
-        for dim in KERNEL_TEST_DIMS {
-            let n_bytes = dim.div_ceil(8);
-            let quantised: Vec<u8> = (0..dim).map(|d| splitmix_byte(7, d) & 15).collect();
-
-            let planes = build_query_planes(&quantised, dim, n_bytes);
-            assert_eq!(planes.len(), RABITQ_QUERY_PLANES * n_bytes);
-            assert_eq!(unpack_query_planes(&planes, dim, n_bytes), quantised);
-        }
-    }
-
-    #[test]
-    fn test_dot_planes_matches_dense_scalar() {
-        for dim in KERNEL_TEST_DIMS {
-            let n_bytes = dim.div_ceil(8);
-            let quantised: Vec<u8> = (0..dim).map(|d| splitmix_byte(11, d) & 15).collect();
-            let binary = random_code(13, dim, n_bytes);
-
-            let planes = build_query_planes(&quantised, dim, n_bytes);
-
-            assert_eq!(
-                dot_query_binary_planes(&planes, &binary, n_bytes),
-                dot_query_binary_scalar(&quantised, &binary, dim),
-                "bit-plane dot disagrees with the dense reference at dim {dim}"
-            );
-        }
-    }
-
-    #[test]
-    fn test_dot_planes_extremes() {
-        let dim = 128;
-        let n_bytes = dim / 8;
-
-        // Every coordinate at the int4 maximum against an all-ones code is the
-        // largest value the u8-lane accumulators ever have to carry.
-        let planes = build_query_planes(&vec![15u8; dim], dim, n_bytes);
-        assert_eq!(
-            dot_query_binary_planes(&planes, &vec![0xFFu8; n_bytes], n_bytes),
-            15 * dim as u32
-        );
-        assert_eq!(
-            dot_query_binary_planes(&planes, &vec![0u8; n_bytes], n_bytes),
-            0
-        );
-
-        let zero_planes = build_query_planes(&vec![0u8; dim], dim, n_bytes);
-        assert_eq!(
-            dot_query_binary_planes(&zero_planes, &vec![0xFFu8; n_bytes], n_bytes),
-            0
-        );
     }
 
     #[test]
@@ -1619,70 +1193,6 @@ mod tests {
 
         let mut none: [u32; 0] = [];
         assert_eq!(hamming_block(&query, &codes, n_bytes, &mut none), u32::MAX);
-    }
-
-    #[test]
-    fn test_rabitq_block_matches_per_vector() {
-        let data = create_test_data::<f32>(200, 64);
-        let quantiser =
-            RaBitQQuantiser::new(data.as_ref(), &Dist::SquaredEuclidean, Some(4), 42).unwrap();
-
-        let query: Vec<f32> = (0..64).map(|i| (i as f32 * 0.37).sin()).collect();
-
-        for c_idx in 0..quantiser.storage().nlist {
-            let encoded = quantiser.encode_query(&query, c_idx).unwrap();
-            let cluster_size = quantiser.storage().cluster_size(c_idx);
-
-            let mut block = vec![0.0f32; cluster_size];
-            let block_min = quantiser.rabitq_block_sq(&encoded, c_idx, 0, &mut block);
-
-            for local_idx in 0..cluster_size {
-                let scalar = quantiser.rabitq_dist_sq(&encoded, c_idx, local_idx);
-                assert_abs_diff_eq!(block[local_idx], scalar, epsilon = 1e-6);
-                // The blocked scan ranks on the square, the API returns the root
-                assert_abs_diff_eq!(
-                    scalar.sqrt(),
-                    quantiser.rabitq_dist(&encoded, c_idx, local_idx),
-                    epsilon = 1e-6
-                );
-            }
-
-            if cluster_size > 0 {
-                assert_abs_diff_eq!(
-                    block_min,
-                    block.iter().cloned().fold(f32::INFINITY, f32::min),
-                    epsilon = 1e-6
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn test_rabitq_block_offset_run() {
-        let data = create_test_data::<f32>(120, 32);
-        let quantiser = RaBitQQuantiser::new(data.as_ref(), &Dist::Cosine, Some(3), 7).unwrap();
-
-        let query = vec![0.5f32; 32];
-        let c_idx = 0;
-        let encoded = quantiser.encode_query(&query, c_idx).unwrap();
-        let cluster_size = quantiser.storage().cluster_size(c_idx);
-
-        // A run that does not start at the cluster's first vector, which is
-        // what every block after the first looks like in the real scan.
-        if cluster_size >= 3 {
-            let start = 2;
-            let take = cluster_size - start;
-            let mut block = vec![0.0f32; take];
-            quantiser.rabitq_block_sq(&encoded, c_idx, start, &mut block);
-
-            for j in 0..take {
-                assert_abs_diff_eq!(
-                    block[j],
-                    quantiser.rabitq_dist_sq(&encoded, c_idx, start + j),
-                    epsilon = 1e-6
-                );
-            }
-        }
     }
 
     #[test]

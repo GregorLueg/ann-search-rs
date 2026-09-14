@@ -27,7 +27,8 @@ pub const PERM0: [usize; 16] = [0, 8, 1, 9, 2, 10, 3, 11, 4, 12, 5, 13, 6, 14, 7
 #[cfg(target_arch = "x86_64")]
 pub const PERM0_INV: [usize; 16] = [0, 2, 4, 6, 8, 10, 12, 14, 1, 3, 5, 7, 9, 11, 13, 15];
 
-/// Blocked layout for 2-bit and 4-bit codes.
+/// Blocked layout for 1-bit, 2-bit and 4-bit codes.
+#[cfg_attr(feature = "serialise", derive(serde::Serialize, serde::Deserialize))]
 pub struct BlockedCodes {
     /// Packed nibble bytes in block-major order.
     pub data: Vec<u8>,
