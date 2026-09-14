@@ -202,80 +202,96 @@ fn main() {
     // Quantised graph: a Vamana graph carrying its neighbours' RaBitQ codes.
     // No reranking column, because there is nothing to rerank: the walk already
     // computes exact distances for every vertex it pops.
+    //
+    // `l_build` is swept because it is where the build time goes: the encoding
+    // is a flat few hundred milliseconds and everything else is Vamana.
     let qg_degrees = [32usize, 64];
+    let qg_l_builds = [32usize, 128];
     let qg_ef_values = [cli.k, cli.k * 2, cli.k * 4, cli.k * 8];
 
     for degree in qg_degrees {
-        println!("Building QG index (degree={})...", degree);
-        let start = Instant::now();
-        let qg_idx = build_qg_index(
-            data.as_ref(),
-            degree,
-            200,
-            1.2,
-            1.2,
-            &cli.distance,
-            cli.seed as usize,
-        )
-        .unwrap();
-        let build_time = start.elapsed().as_secs_f64() * 1000.0;
-        let index_size_mb = qg_idx.memory_usage_bytes() as f64 / (1024.0 * 1024.0);
-
-        for &ef in &qg_ef_values {
-            println!("Querying QG index (degree={}, ef={})...", degree, ef);
+        for l_build in qg_l_builds {
+            println!(
+                "Building QG index (degree={}, l_build={})...",
+                degree, l_build
+            );
             let start = Instant::now();
-            let (qg_neighbors, _) =
-                query_qg_index(query_data.as_ref(), &qg_idx, cli.k, ef, false, false).unwrap();
-            let query_time = start.elapsed().as_secs_f64() * 1000.0;
+            let qg_idx = build_qg_index(
+                data.as_ref(),
+                degree,
+                l_build,
+                1.2,
+                1.2,
+                &cli.distance,
+                cli.seed as usize,
+            )
+            .unwrap();
+            let build_time = start.elapsed().as_secs_f64() * 1000.0;
+            let index_size_mb = qg_idx.memory_usage_bytes() as f64 / (1024.0 * 1024.0);
 
-            let qg_exact = exact_distances(&data, &query_data, &qg_neighbors, &cli.distance);
+            for &ef in &qg_ef_values {
+                println!(
+                    "Querying QG index (degree={}, l_build={}, ef={})...",
+                    degree, l_build, ef
+                );
+                let start = Instant::now();
+                let (qg_neighbors, _) =
+                    query_qg_index(query_data.as_ref(), &qg_idx, cli.k, ef, false, false).unwrap();
+                let query_time = start.elapsed().as_secs_f64() * 1000.0;
+
+                let qg_exact = exact_distances(&data, &query_data, &qg_neighbors, &cli.distance);
+
+                results.push(BenchmarkResultSize {
+                    method: format!("QG-d{}-l{}-ef{} (query)", degree, l_build, ef),
+                    build_time_ms: build_time,
+                    query_time_ms: query_time,
+                    total_time_ms: build_time + query_time,
+                    recall_at_k: calculate_recall(&true_neighbors, &qg_neighbors, cli.k),
+                    mean_dist_rat: calculate_mean_distance_ratio(
+                        true_distances.as_ref().unwrap(),
+                        &qg_exact,
+                        cli.k,
+                    ),
+                    median_dist_rat: calculate_median_distance_ratio(
+                        true_distances.as_ref().unwrap(),
+                        &qg_exact,
+                        cli.k,
+                    ),
+                    index_size_mb,
+                });
+            }
+
+            println!(
+                "Self-querying QG index (degree={}, l_build={})...",
+                degree, l_build
+            );
+            let ef_self = cli.k * 4;
+            let start = Instant::now();
+            let (qg_neighbors_self, _) =
+                query_qg_self(&qg_idx, cli.k, ef_self, false, false).unwrap();
+            let self_query_time = start.elapsed().as_secs_f64() * 1000.0;
+
+            let qg_exact_self = exact_distances(&data, &data, &qg_neighbors_self, &cli.distance);
 
             results.push(BenchmarkResultSize {
-                method: format!("QG-d{}-ef{} (query)", degree, ef),
+                method: format!("QG-d{}-l{} (self)", degree, l_build),
                 build_time_ms: build_time,
-                query_time_ms: query_time,
-                total_time_ms: build_time + query_time,
-                recall_at_k: calculate_recall(&true_neighbors, &qg_neighbors, cli.k),
+                query_time_ms: self_query_time,
+                total_time_ms: build_time + self_query_time,
+                recall_at_k: calculate_recall(&true_neighbors_self, &qg_neighbors_self, cli.k),
                 mean_dist_rat: calculate_mean_distance_ratio(
-                    true_distances.as_ref().unwrap(),
-                    &qg_exact,
+                    true_distances_self.as_ref().unwrap(),
+                    &qg_exact_self,
                     cli.k,
                 ),
                 median_dist_rat: calculate_median_distance_ratio(
-                    true_distances.as_ref().unwrap(),
-                    &qg_exact,
+                    true_distances_self.as_ref().unwrap(),
+                    &qg_exact_self,
                     cli.k,
                 ),
                 index_size_mb,
             });
         }
-
-        println!("Self-querying QG index (degree={})...", degree);
-        let ef_self = cli.k * 4;
-        let start = Instant::now();
-        let (qg_neighbors_self, _) = query_qg_self(&qg_idx, cli.k, ef_self, false, false).unwrap();
-        let self_query_time = start.elapsed().as_secs_f64() * 1000.0;
-
-        let qg_exact_self = exact_distances(&data, &data, &qg_neighbors_self, &cli.distance);
-
-        results.push(BenchmarkResultSize {
-            method: format!("QG-d{} (self)", degree),
-            build_time_ms: build_time,
-            query_time_ms: self_query_time,
-            total_time_ms: build_time + self_query_time,
-            recall_at_k: calculate_recall(&true_neighbors_self, &qg_neighbors_self, cli.k),
-            mean_dist_rat: calculate_mean_distance_ratio(
-                true_distances_self.as_ref().unwrap(),
-                &qg_exact_self,
-                cli.k,
-            ),
-            median_dist_rat: calculate_median_distance_ratio(
-                true_distances_self.as_ref().unwrap(),
-                &qg_exact_self,
-                cli.k,
-            ),
-            index_size_mb,
-        });
     }
 
     println!("-----------------------------");
