@@ -19,7 +19,7 @@
 
 use num_traits::ToPrimitive;
 
-use crate::binary::turboquant::pack::{pack_blocked, BlockedCodes, BLOCK};
+use crate::binary::turboquant::pack::{BlockedCodes, BLOCK};
 use crate::binary::turboquant::search::{build_query_lut, QueryLut};
 use crate::prelude::*;
 
@@ -57,11 +57,10 @@ pub const BLOCKED_ARCH: u8 = if cfg!(target_arch = "x86_64") {
     ARCH_OTHER
 };
 
-/// Lane order the x86 packing interleaves with, as an inverse permutation.
-///
-/// Duplicated from the packing side rather than imported because that copy is
-/// `#[cfg]`-gated to x86 and this decoder has to run on any target to unpack a
-/// layout written on another.
+/// Lane order the x86 packing interleaves with.
+const X86_PERM: [usize; 16] = [0, 8, 1, 9, 2, 10, 3, 11, 4, 12, 5, 13, 6, 14, 7, 15];
+
+/// Inverse of [`X86_PERM`].
 const X86_PERM_INV: [usize; 16] = [0, 2, 4, 6, 8, 10, 12, 14, 1, 3, 5, 7, 9, 11, 13, 15];
 
 /////////////
@@ -87,15 +86,71 @@ const X86_PERM_INV: [usize; 16] = [0, 2, 4, 6, 8, 10, 12, 14, 1, 3, 5, 7, 9, 11,
 ///
 /// The blocked layout
 pub fn pack_rabitq_blocked(codes: &[u8], n_vectors: usize, n_bytes: usize) -> BlockedCodes {
+    pack_rabitq_blocked_for(codes, n_vectors, n_bytes, BLOCKED_ARCH)
+}
+
+/// Pack into a chosen architecture's blocked byte order.
+///
+/// Both orders are built here rather than behind `#[cfg]` so either can be
+/// produced, and therefore tested, on any machine: a silent disagreement
+/// between the packer and [`unpack_rabitq_blocked`] would give wrong distances
+/// on the other architecture with nothing local to catch it.
+///
+/// ### Params
+///
+/// * `codes` - Row-major RaBitQ codes, `n_vectors * n_bytes` long
+/// * `n_vectors` - Number of codes in the run
+/// * `n_bytes` - Bytes per code
+/// * `dst_arch` - The [`BLOCKED_ARCH`] tag to pack for
+///
+/// ### Returns
+///
+/// The blocked layout
+pub fn pack_rabitq_blocked_for(
+    codes: &[u8],
+    n_vectors: usize,
+    n_bytes: usize,
+    dst_arch: u8,
+) -> BlockedCodes {
     debug_assert_eq!(codes.len(), n_vectors * n_bytes);
 
-    let reversed: Vec<u8> = codes.iter().map(|b| b.reverse_bits()).collect();
     let n_blocks = n_vectors.div_ceil(BLOCK);
+    let mut data = vec![0u8; n_blocks * n_bytes * BLOCK];
 
-    BlockedCodes {
-        data: pack_blocked(n_vectors, n_blocks, n_bytes, &reversed),
-        n_blocks,
+    // Coordinate `g * 8 + 0` has to end up in the most significant bit, which
+    // is where the nibble sub-tables expect it, so every code byte is reversed
+    // on the way in.
+    let byte = |v: usize, g: usize| -> u8 {
+        if v < n_vectors {
+            codes[v * n_bytes + g].reverse_bits()
+        } else {
+            0
+        }
+    };
+
+    for block_idx in 0..n_blocks {
+        let base = block_idx * BLOCK;
+        for g in 0..n_bytes {
+            let out = &mut data[(block_idx * n_bytes + g) * BLOCK..][..BLOCK];
+            if dst_arch == ARCH_X86 {
+                // Split each byte into nibbles and interleave the lane pairs
+                // `(X86_PERM[j], X86_PERM[j] + 16)`, which is what lines the
+                // lane-crossing `vpshufb` reduction up.
+                for j in 0..16 {
+                    let a = byte(base + X86_PERM[j], g);
+                    let b = byte(base + X86_PERM[j] + 16, g);
+                    out[j] = (a >> 4) | ((b >> 4) << 4);
+                    out[16 + j] = (a & 0x0F) | ((b & 0x0F) << 4);
+                }
+            } else {
+                for (lane, slot) in out.iter_mut().enumerate() {
+                    *slot = byte(base + lane, g);
+                }
+            }
+        }
     }
+
+    BlockedCodes { data, n_blocks }
 }
 
 /// Decode a blocked layout back to row-major RaBitQ codes.
@@ -324,40 +379,81 @@ mod tests {
     }
 
     #[test]
-    fn test_pack_unpack_round_trips() {
-        for (padded_dim, n_vectors) in [(128usize, 100usize), (64, 1), (256, 32), (512, 33)] {
-            let n_bytes = padded_dim / 8;
-            let raw = codes(n_vectors, n_bytes, 21);
-            let blocked = pack_rabitq_blocked(&raw, n_vectors, n_bytes);
-            let back = unpack_rabitq_blocked(&blocked.data, n_vectors, n_bytes, BLOCKED_ARCH);
-            assert_eq!(back, raw, "padded_dim {padded_dim} n {n_vectors}");
+    fn test_both_arch_layouts_round_trip() {
+        // The x86 packer and the x86 decoder are cfg-free precisely so this
+        // runs everywhere. A silent disagreement between them would give wrong
+        // distances on the architecture this machine is not, and no local test
+        // gated on `target_arch` could ever see it.
+        for arch in [ARCH_OTHER, ARCH_X86] {
+            for (padded_dim, n_vectors) in [
+                (128usize, 100usize),
+                (64, 1),
+                (64, 31),
+                (256, 32),
+                (512, 33),
+                (128, 70),
+            ] {
+                let n_bytes = padded_dim / 8;
+                let raw = codes(n_vectors, n_bytes, 21);
+                let blocked = pack_rabitq_blocked_for(&raw, n_vectors, n_bytes, arch);
+                let back = unpack_rabitq_blocked(&blocked.data, n_vectors, n_bytes, arch);
+                assert_eq!(
+                    back, raw,
+                    "arch {arch} padded_dim {padded_dim} n {n_vectors}"
+                );
+            }
         }
     }
 
     #[test]
-    fn test_foreign_arch_layout_unpacks() {
-        // Decode a layout written by the *other* architecture's packer. The
-        // aarch64 order is natural lanes, so it can be built here by hand and
-        // must come back as the original codes.
+    fn test_layout_agrees_with_the_kernel_packer() {
+        // The scoring kernels are TurboQuant's, so this packing has to be
+        // byte-identical to the one they were written against. Only the arm
+        // for the machine running this can be checked, which is why CI on the
+        // other architecture is what closes the loop.
+        use crate::binary::turboquant::pack::pack_blocked;
+
         let (n_vectors, n_bytes) = (70usize, 16usize);
-        let raw = codes(n_vectors, n_bytes, 33);
+        let raw = codes(n_vectors, n_bytes, 91);
+        let reversed: Vec<u8> = raw.iter().map(|b| b.reverse_bits()).collect();
 
-        let n_blocks = n_vectors.div_ceil(BLOCK);
-        let mut foreign = vec![0u8; n_blocks * n_bytes * BLOCK];
-        for block_idx in 0..n_blocks {
-            for g in 0..n_bytes {
-                for lane in 0..BLOCK {
-                    let v = block_idx * BLOCK + lane;
-                    if v < n_vectors {
-                        foreign[(block_idx * n_bytes + g) * BLOCK + lane] =
-                            raw[v * n_bytes + g].reverse_bits();
-                    }
-                }
-            }
-        }
+        let mine = pack_rabitq_blocked(&raw, n_vectors, n_bytes);
+        let theirs = pack_blocked(n_vectors, n_vectors.div_ceil(BLOCK), n_bytes, &reversed);
 
-        let back = unpack_rabitq_blocked(&foreign, n_vectors, n_bytes, 0);
-        assert_eq!(back, raw);
+        assert_eq!(mine.data, theirs);
+    }
+
+    #[test]
+    fn test_the_two_arch_layouts_are_actually_different() {
+        // Guards the round-trip test above from passing vacuously, which is
+        // what it would do if both branches produced the same bytes.
+        let (n_vectors, n_bytes) = (70usize, 16usize);
+        let raw = codes(n_vectors, n_bytes, 5);
+        let a = pack_rabitq_blocked_for(&raw, n_vectors, n_bytes, ARCH_OTHER);
+        let b = pack_rabitq_blocked_for(&raw, n_vectors, n_bytes, ARCH_X86);
+        assert_eq!(a.data.len(), b.data.len());
+        assert_ne!(a.data, b.data);
+    }
+
+    #[test]
+    fn test_cross_arch_reblock_recovers_the_native_layout() {
+        // What a load of a foreign index does: decode the other order, repack
+        // in this one, and land on what a fresh encode here would have built.
+        let (n_vectors, n_bytes) = (100usize, 32usize);
+        let raw = codes(n_vectors, n_bytes, 77);
+
+        let foreign_arch = if BLOCKED_ARCH == ARCH_X86 {
+            ARCH_OTHER
+        } else {
+            ARCH_X86
+        };
+        let foreign = pack_rabitq_blocked_for(&raw, n_vectors, n_bytes, foreign_arch);
+
+        let decoded = unpack_rabitq_blocked(&foreign.data, n_vectors, n_bytes, foreign_arch);
+        let reblocked = pack_rabitq_blocked(&decoded, n_vectors, n_bytes);
+        let native = pack_rabitq_blocked(&raw, n_vectors, n_bytes);
+
+        assert_eq!(reblocked.data, native.data);
     }
 
     #[test]
