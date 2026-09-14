@@ -5,23 +5,6 @@ own changelog at [`python/CHANGELOG.md`](python/CHANGELOG.md).
 
 ## 0.9.0
 
-**Breaking**
-
-- The RaBitQ indices (`IvfIndexRaBitQ`, `ExhaustiveIndexRaBitQ`) now estimate
-  distances with a fast-scan nibble table rather than int4 query bit-planes. The
-  int4 path is gone, and with it `RaBitQQuery`, `build_query_planes`,
-  `unpack_query_planes`, `dot_query_binary_planes`, `RABITQ_QUERY_PLANES` and
-  the `rabitq_dist`, `rabitq_dist_sq`, `rabitq_block_sq`, `dot_query_binary` and
-  `popcount` methods on `VectorDistanceRaBitQ`. `encode_query` and
-  `encode_query_prerotated` return a `SignScanQuery` and the latter is now
-  fallible. Codes are stored only in the blocked scan layout, so
-  `RaBitQStorage::binary_codes`, `cluster_binary_codes` and `vector_binary` are
-  gone too; the saved format records which architecture packed the codes and
-  re-blocks on load, so indices still move between x86 and aarch64.
-- `RaBitQPackedVector` no longer carries `popcount`, and `encode_vector` returns
-  three values rather than four.
-- Saved RaBitQ indices from 0.8.x cannot be loaded.
-
 **Features**
 
 - New quantised graph index (`QgIndex`, `build_qg_index` / `query_qg_index` /
@@ -41,6 +24,26 @@ own changelog at [`python/CHANGELOG.md`](python/CHANGELOG.md).
 - The rotation pads to a whole number of code bytes, and at the Hadamard's
   64-coordinate multiple those extra bits carry real signal rather than padding,
   so recall improves where the dimensionality is not already a multiple of 64.
+- Better default setting for the beam search in Vamana yielding faster index
+  build times and additionally performance improvements from the other indices
+  were integrated into Vamana.
+
+**Breaking**
+
+- The RaBitQ indices (`IvfIndexRaBitQ`, `ExhaustiveIndexRaBitQ`) now estimate
+  distances with a fast-scan nibble table rather than int4 query bit-planes. The
+  int4 path is gone, and with it `RaBitQQuery`, `build_query_planes`,
+  `unpack_query_planes`, `dot_query_binary_planes`, `RABITQ_QUERY_PLANES` and
+  the `rabitq_dist`, `rabitq_dist_sq`, `rabitq_block_sq`, `dot_query_binary` and
+  `popcount` methods on `VectorDistanceRaBitQ`. `encode_query` and
+  `encode_query_prerotated` return a `SignScanQuery` and the latter is now
+  fallible. Codes are stored only in the blocked scan layout, so
+  `RaBitQStorage::binary_codes`, `cluster_binary_codes` and `vector_binary` are
+  gone too; the saved format records which architecture packed the codes and
+  re-blocks on load, so indices still move between x86 and aarch64.
+- `RaBitQPackedVector` no longer carries `popcount`, and `encode_vector` returns
+  three values rather than four.
+- Saved RaBitQ indices from 0.8.x cannot be loaded.
 
 ## 0.8.5
 

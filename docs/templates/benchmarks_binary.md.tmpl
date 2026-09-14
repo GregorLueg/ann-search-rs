@@ -8,6 +8,11 @@ Binarised indices push the compression to (roughly) bits. Three consequences:
 3. Without re-ranking the top candidates, recall drops hard. Less so for RaBitQ,
    and for TurboQuant it depends on the data.
 
+The quantised graph index (QG) is the exception to the first point. It spends
+the bits on locality rather than on compression and comes out *larger* than the
+raw vectors, so read it as a speed structure that happens to use RaBitQ codes,
+not as a small index. See the section below.
+
 The benchmarks below show both, with and without re-ranking. For the simple
 binary versions use:
 
@@ -42,6 +47,7 @@ footing.
 
 - [Binarisation](#binary-ivf-and-exhaustive)
 - [RaBitQ](#rabitq-ivf-and-exhaustive)
+  - [Quantised graph](#quantised-graph-qg)
 - [TurboQuant](#turboquant-ivf-and-exhaustive)
 
 ### <u>Binary (IVF and exhaustive)</u>
@@ -220,6 +226,45 @@ index is query speed, since the approximate distance is more work than a popcoun
 
 - *Number of lists (nl)*: Number of k-means clusters, `sqrt(n)` as a default.
 - *Number of probes (np)*: Typically `sqrt(nlist)` or up to 5% of `nlist`.
+
+#### Quantised graph (QG)
+
+The `QgIndex` rows in the tables below come from the same run. It is a
+SymphonyQG-style index (Gou et al., SIGMOD 2025): a Vamana graph where every
+vertex additionally stores its own neighbours' one-bit RaBitQ codes, quantised
+against that vertex and pre-transposed into the fast-scan block layout. One hop
+is therefore a contiguous read plus one byte-shuffle sweep that estimates all 32
+neighbour distances at once, instead of one random memory access and one
+distance kernel per neighbour. Exact distances are computed only for the
+vertices the walk actually pops, which the estimator needs as its anchor anyway,
+so there is no separate re-ranking stage and no `VecStore`.
+
+**This one is not about memory.** Each vector's code is duplicated once per
+in-edge, and the raw vectors have to stay resident for the exact distances, so
+the index lands at roughly two to three times the size of the data. The point is
+query speed at a given recall. If memory is the binding constraint, `IVF-RaBitQ`
+above is the index you want.
+
+The graph is not from the paper. SymphonyQG builds its own topology with
+random init, repeated search-prune-reverse rounds and a cosine-threshold refill
+to force exact-degree regularity; `VamanaIndex` already yields a fixed-degree
+graph, so it builds the topology here and what is kept from the paper is the
+storage layout and the estimator. Euclidean and cosine only, no Manhattan.
+
+**Tunable parameters *(QG)*:**
+
+- *degree (d)*: Neighbour slots per vertex, a non-zero multiple of 32. Default
+  `32`, which is exactly one fast-scan sweep per hop. Doubling it doubles both
+  the code footprint and the per-hop work, so it wants a reason; the grid runs
+  `32` and `64` to show whether the extra edges pay.
+- *l_build (l)*: Beam width during construction, second Vamana pass. This is
+  where the build time goes: the encoding is a flat few hundred milliseconds and
+  everything else is Vamana. The first pass runs at the crate default, which is
+  a small constant, because a wide first pass is both slower and worse.
+- *ef_search (ef)*: Beam width at query time, the usual recall/latency dial. The
+  grid runs `k`, `2k`, `4k` and `8k`.
+
+Self queries run at `ef_search = 4k`.
 
 #### Correlated data
 
