@@ -15,6 +15,7 @@ use thousands::*;
 
 use crate::binary::dist_binary::*;
 use crate::binary::rabitq::*;
+use crate::binary::rotator::RotatorKind;
 use crate::binary::vec_store::*;
 use crate::prelude::*;
 use crate::utils::k_means_utils::CentroidDistance;
@@ -96,13 +97,42 @@ where
         n_clusters: Option<usize>,
         seed: usize,
     ) -> Result<Self, AnnSearchErrors> {
+        Self::with_rotator_kind(data, metric, n_clusters, None, seed)
+    }
+
+    /// Create a new exhaustive RaBitQ index with an explicitly chosen rotation
+    ///
+    /// ### Params
+    ///
+    /// * `data` - Data matrix (n_samples × dim)
+    /// * `metric` - Distance metric (Euclidean or Cosine)
+    /// * `n_clusters` - Number of clusters. If None, uses 0.5 * sqrt(n)
+    /// * `rotator_kind` - Which rotation to encode with, or `None` to let the
+    ///   dimensionality decide
+    /// * `seed` - Random seed
+    ///
+    /// ### Returns
+    ///
+    /// Initialised index
+    pub fn with_rotator_kind(
+        data: impl AnnMatrix<T>,
+        metric: &Dist,
+        n_clusters: Option<usize>,
+        rotator_kind: Option<RotatorKind>,
+        seed: usize,
+    ) -> Result<Self, AnnSearchErrors> {
         if *metric == Dist::Manhattan {
             return Err(AnnSearchErrors::DistanceNotSupported(*metric));
         }
 
         let (vectors_flat, n, dim) = data.into_row_major();
-        let quantiser =
-            RaBitQQuantiser::new((&vectors_flat[..], n, dim), metric, n_clusters, seed)?;
+        let quantiser = RaBitQQuantiser::with_rotator_kind(
+            (&vectors_flat[..], n, dim),
+            metric,
+            n_clusters,
+            rotator_kind,
+            seed,
+        )?;
         Ok(Self {
             quantiser,
             n,
@@ -473,6 +503,68 @@ mod tests {
             }
         }
         data
+    }
+
+    /// Clustered Gaussian-ish data at a dimensionality where the encoder picks
+    /// the Hadamard rotation, so the padded code path is actually exercised.
+    fn clustered(n: usize, dim: usize, n_clusters: usize, seed: u64) -> Mat<f32> {
+        let mut state = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            (state >> 11) as f32 / (1u64 << 53) as f32 - 0.5
+        };
+
+        let centres: Vec<Vec<f32>> = (0..n_clusters)
+            .map(|_| (0..dim).map(|_| next() * 8.0).collect())
+            .collect();
+
+        Mat::from_fn(n, dim, |i, j| centres[i % n_clusters][j] + next())
+    }
+
+    fn brute_force(data: &Mat<f32>, query: &[f32], k: usize) -> Vec<usize> {
+        let mut scored: Vec<(f32, usize)> = (0..data.nrows())
+            .map(|i| {
+                let d = (0..data.ncols())
+                    .map(|j| (data[(i, j)] - query[j]).powi(2))
+                    .sum::<f32>();
+                (d, i)
+            })
+            .collect();
+        scored.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+        scored.into_iter().take(k).map(|(_, i)| i).collect()
+    }
+
+    #[test]
+    fn test_exhaustive_rabitq_recall_at_the_padded_dimension() {
+        let (n, dim, k) = (2000usize, 100usize, 10usize);
+        let data = clustered(n, dim, 20, 7);
+        let index = ExhaustiveIndexRaBitQ::with_rotator_kind(
+            data.as_ref(),
+            &Dist::SquaredEuclidean,
+            Some(40),
+            Some(RotatorKind::FhtKac),
+            42,
+        )
+        .unwrap();
+
+        // 100 dimensions rounds up to 128 under the Hadamard rotation, so the
+        // codes carry 28 bits that no input coordinate maps to directly.
+        assert_eq!(index.quantiser.encoder.padded_dim, 128);
+        assert_eq!(index.quantiser.encoder.n_bytes, 16);
+
+        let mut hits = 0usize;
+        let n_queries = 40;
+        for q in 0..n_queries {
+            let query: Vec<f32> = (0..dim).map(|j| data[(q * 7 % n, j)]).collect();
+            let truth = brute_force(&data, &query, k);
+            let (got, _) = index.query(&query, k, Some(40)).unwrap();
+            hits += got.iter().filter(|i| truth.contains(i)).count();
+        }
+
+        let recall = hits as f64 / (n_queries * k) as f64;
+        assert!(recall > 0.6, "recall@{k} was {recall}");
     }
 
     #[test]

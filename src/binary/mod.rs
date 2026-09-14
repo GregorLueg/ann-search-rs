@@ -11,5 +11,6 @@ pub mod ivf_binary;
 pub mod ivf_rabitq;
 pub mod ivf_tq;
 pub mod rabitq;
+pub mod rotator;
 pub mod turboquant;
 pub mod vec_store;

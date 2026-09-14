@@ -129,6 +129,16 @@ pub enum AnnSearchErrors {
     #[error("Vector store is not available. Use build_with_vector_store() to enable reranking.")]
     VectorStoreNotAvailable,
 
+    /// The requested rotation cannot serve this dimensionality
+    #[cfg(feature = "binary")]
+    #[error("The fast Hadamard rotation needs at least {min_dim} dimensions; the data has {dim}.")]
+    RotatorDimTooSmall {
+        /// Dimensionality of the data
+        dim: usize,
+        /// Smallest dimensionality the rotation supports
+        min_dim: usize,
+    },
+
     /// An output buffer handed to a batch encoder is the wrong length
     #[cfg(feature = "binary")]
     #[error("Buffer must hold {expected} elements; it holds {actual}.")]

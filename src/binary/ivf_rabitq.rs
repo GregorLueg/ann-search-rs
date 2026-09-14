@@ -16,6 +16,7 @@ use thousands::*;
 
 use crate::binary::dist_binary::*;
 use crate::binary::rabitq::*;
+use crate::binary::rotator::RotatorKind;
 use crate::binary::vec_store::*;
 use crate::prelude::*;
 use crate::utils::k_means_utils::*;
@@ -117,12 +118,42 @@ where
     /// ### Returns
     ///
     /// Initialised self
-    #[allow(clippy::too_many_arguments)]
     pub fn build(
         data: impl AnnMatrix<T>,
         metric: Dist,
         nlist: Option<usize>,
         k_means_params: Option<KMeansTrainingParams>,
+        seed: usize,
+        verbose: bool,
+    ) -> Result<Self, AnnSearchErrors> {
+        Self::build_with_rotator_kind(data, metric, nlist, k_means_params, None, seed, verbose)
+    }
+
+    /// Build IVF-RaBitQ index with an explicitly chosen rotation
+    ///
+    /// ### Params
+    ///
+    /// * `data` - Data matrix (n × dim)
+    /// * `metric` - Distance metric
+    /// * `nlist` - Number of IVF cells (defaults to sqrt(n))
+    /// * `k_means_params` - Optional k-means trainings parameters, see
+    ///   [KMeansTrainingParams]. If not provided, will default to sensible
+    ///   defaults.
+    /// * `rotator_kind` - Which rotation to encode with, or `None` to let the
+    ///   dimensionality decide
+    /// * `seed` - Random seed
+    /// * `verbose` - Print progress
+    ///
+    /// ### Returns
+    ///
+    /// Initialised self
+    #[allow(clippy::too_many_arguments)]
+    pub fn build_with_rotator_kind(
+        data: impl AnnMatrix<T>,
+        metric: Dist,
+        nlist: Option<usize>,
+        k_means_params: Option<KMeansTrainingParams>,
+        rotator_kind: Option<RotatorKind>,
         seed: usize,
         verbose: bool,
     ) -> Result<Self, AnnSearchErrors> {
@@ -227,7 +258,10 @@ where
         );
 
         // create encoder with shared rotation
-        let encoder = RaBitQEncoder::new(dim, metric, seed as u64);
+        let encoder = match rotator_kind {
+            Some(kind) => RaBitQEncoder::with_rotator_kind(dim, metric, kind, seed as u64)?,
+            None => RaBitQEncoder::new(dim, metric, seed as u64),
+        };
 
         // build CSR storage
         let storage = build_rabitq_storage(
@@ -274,6 +308,48 @@ where
         metric: Dist,
         nlist: Option<usize>,
         k_means_params: Option<KMeansTrainingParams>,
+        seed: usize,
+        verbose: bool,
+        save_path: impl AsRef<Path>,
+    ) -> Result<Self, AnnSearchErrors> {
+        Self::build_with_vector_store_and_rotator_kind(
+            data,
+            metric,
+            nlist,
+            k_means_params,
+            None,
+            seed,
+            verbose,
+            save_path,
+        )
+    }
+
+    /// Build IVF-RaBitQ index with a vector store and an explicitly chosen rotation
+    ///
+    /// ### Params
+    ///
+    /// * `data` - Data matrix (n × dim)
+    /// * `metric` - Distance metric
+    /// * `nlist` - Number of IVF cells (defaults to sqrt(n))
+    /// * `k_means_params` - Optional k-means trainings parameters, see
+    ///   [KMeansTrainingParams]. If not provided, will default to sensible
+    ///   defaults.
+    /// * `rotator_kind` - Which rotation to encode with, or `None` to let the
+    ///   dimensionality decide
+    /// * `seed` - Random seed
+    /// * `verbose` - Print progress
+    /// * `save_path` - Path to save vector store
+    ///
+    /// ### Returns
+    ///
+    /// Initialised self
+    #[allow(clippy::too_many_arguments)]
+    pub fn build_with_vector_store_and_rotator_kind(
+        data: impl AnnMatrix<T>,
+        metric: Dist,
+        nlist: Option<usize>,
+        k_means_params: Option<KMeansTrainingParams>,
+        rotator_kind: Option<RotatorKind>,
         seed: usize,
         verbose: bool,
         save_path: impl AsRef<Path>,
@@ -378,7 +454,10 @@ where
             &metric,
         );
 
-        let encoder = RaBitQEncoder::new(dim, metric, seed as u64);
+        let encoder = match rotator_kind {
+            Some(kind) => RaBitQEncoder::with_rotator_kind(dim, metric, kind, seed as u64)?,
+            None => RaBitQEncoder::new(dim, metric, seed as u64),
+        };
 
         let storage = build_rabitq_storage(
             &vectors_for_storage,

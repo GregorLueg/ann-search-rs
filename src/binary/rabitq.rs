@@ -3,17 +3,13 @@
 //! "RaBitQ: Quantizing High-Dimensional Vectors with a Theoretical Error Bound
 //! for Approximate Nearest Neighbor Search" (Gao and Long, 2024).
 
-use faer::Mat;
 use faer_traits::ComplexField;
 use num_traits::{Float, FromPrimitive, ToPrimitive};
-use rand::rngs::StdRng;
-use rand::Rng;
-use rand::SeedableRng;
-use rand_distr::StandardNormal;
 use rayon::prelude::*;
 use std::iter::Sum;
 
 use crate::binary::dist_binary::*;
+use crate::binary::rotator::{RaBitQRotator, RotatorKind};
 use crate::prelude::*;
 use crate::utils::k_means_utils::*;
 
@@ -33,7 +29,7 @@ pub struct RaBitQQuery<T> {
     /// Bit-planes of the int4 quantised values, `RABITQ_QUERY_PLANES` planes
     /// of `n_bytes` each. See [`build_query_planes`] for the layout.
     pub planes: Vec<u8>,
-    /// Bytes per plane, `dim.div_ceil(8)`
+    /// Bytes per plane, `padded_dim.div_ceil(8)`
     pub n_bytes: usize,
     /// Distance from query to centroid
     pub dist_to_centroid: T,
@@ -55,10 +51,15 @@ pub type VecEncoding<T> = (Vec<u8>, T, T, u32);
 /// Pure encoding logic for RaBitQ
 #[cfg_attr(feature = "serialise", derive(serde::Serialize, serde::Deserialize))]
 pub struct RaBitQEncoder<T> {
-    /// The rotation matrix
-    pub rotation: Vec<T>,
+    /// The rotation applied before the sign bits are taken
+    pub rotator: RaBitQRotator<T>,
     /// Dimensions of the encode
     pub dim: usize,
+    /// Working dimensionality after rotation. Equal to `dim` for the dense
+    /// rotation, rounded up to [`ROTATOR_PAD`](crate::binary::rotator::ROTATOR_PAD)
+    /// for the Hadamard one, so every
+    /// post-rotation loop runs over this and not over `dim`.
+    pub padded_dim: usize,
     /// Number of bytes
     pub n_bytes: usize,
     /// Distance metric to use
@@ -87,12 +88,52 @@ where
     /// * `metric` - Distance metric to use
     /// * `seed` - Random seed to use
     pub fn new(dim: usize, metric: Dist, seed: u64) -> Self {
-        let rotation = Self::generate_random_orthogonal(dim, seed);
-        let n_bytes = dim.div_ceil(8);
-        Self {
-            rotation,
+        Self::from_rotator(dim, metric, RaBitQRotator::new_auto(dim, seed))
+    }
+
+    /// Create an encoder with an explicitly chosen rotation
+    ///
+    /// ### Params
+    ///
+    /// * `dim` - Dimensions of the data set
+    /// * `metric` - Distance metric to use
+    /// * `kind` - Which rotation to build
+    /// * `seed` - Random seed to use
+    ///
+    /// ### Returns
+    ///
+    /// The encoder, or an error when the rotation cannot serve `dim`
+    pub fn with_rotator_kind(
+        dim: usize,
+        metric: Dist,
+        kind: RotatorKind,
+        seed: u64,
+    ) -> Result<Self, AnnSearchErrors> {
+        Ok(Self::from_rotator(
             dim,
-            n_bytes,
+            metric,
+            RaBitQRotator::new(dim, Some(kind), seed)?,
+        ))
+    }
+
+    /// Assemble an encoder around a prebuilt rotation
+    ///
+    /// ### Params
+    ///
+    /// * `dim` - Dimensions of the data set
+    /// * `metric` - Distance metric to use
+    /// * `rotator` - The rotation to encode with
+    ///
+    /// ### Returns
+    ///
+    /// The encoder
+    fn from_rotator(dim: usize, metric: Dist, rotator: RaBitQRotator<T>) -> Self {
+        let padded_dim = rotator.padded_dim();
+        Self {
+            rotator,
+            dim,
+            padded_dim,
+            n_bytes: padded_dim.div_ceil(8),
             metric,
         }
     }
@@ -134,7 +175,7 @@ where
         // Binary encode (sign bits)
         let mut binary = vec![0u8; self.n_bytes];
         let mut popcount: u32 = 0;
-        for d in 0..self.dim {
+        for d in 0..self.padded_dim {
             if v_c_rotated[d] >= T::zero() {
                 binary[d / 8] |= 1u8 << (d % 8);
                 popcount += 1;
@@ -242,8 +283,8 @@ where
     /// Encoded query for distance estimation
     #[inline]
     pub fn encode_query_prerotated(&self, q_rot: &[T], c_rot: &[T]) -> RaBitQQuery<T> {
-        debug_assert_eq!(q_rot.len(), self.dim);
-        debug_assert_eq!(c_rot.len(), self.dim);
+        debug_assert_eq!(q_rot.len(), self.padded_dim);
+        debug_assert_eq!(c_rot.len(), self.padded_dim);
 
         let res_rot = T::subtract_simd(q_rot, c_rot);
         let dist_to_centroid = compute_l2_norm(&res_rot);
@@ -251,7 +292,7 @@ where
         let q_c_rotated: Vec<T> = if dist_to_centroid > T::epsilon() {
             res_rot.iter().map(|&r| r / dist_to_centroid).collect()
         } else {
-            vec![T::zero(); self.dim]
+            vec![T::zero(); self.padded_dim]
         };
 
         self.finish_query(&q_c_rotated, dist_to_centroid)
@@ -274,7 +315,7 @@ where
     fn finish_query(&self, q_c_rotated: &[T], dist_to_centroid: T) -> RaBitQQuery<T> {
         // Scalar quantise to int4 (0-15)
         let (mut lower, mut upper) = (q_c_rotated[0], q_c_rotated[0]);
-        for d in 1..self.dim {
+        for d in 1..self.padded_dim {
             if q_c_rotated[d] < lower {
                 lower = q_c_rotated[d];
             }
@@ -290,10 +331,10 @@ where
             T::one()
         };
 
-        let mut quantised = vec![0u8; self.dim];
+        let mut quantised = vec![0u8; self.padded_dim];
         let mut sum_quantised: u32 = 0;
 
-        for d in 0..self.dim {
+        for d in 0..self.padded_dim {
             let val = ((q_c_rotated[d] - lower) / width)
                 .round()
                 .to_u8()
@@ -304,7 +345,7 @@ where
         }
 
         RaBitQQuery {
-            planes: build_query_planes(&quantised, self.dim, self.n_bytes),
+            planes: build_query_planes(&quantised, self.padded_dim, self.n_bytes),
             n_bytes: self.n_bytes,
             dist_to_centroid,
             lower,
@@ -328,47 +369,7 @@ where
     /// The vector with rotation applied
     #[inline]
     pub fn apply_rotation(&self, vec: &[T]) -> Vec<T> {
-        let mut rotated = vec![T::zero(); self.dim];
-        let dim = self.dim;
-
-        for i in 0..dim {
-            let row = &self.rotation[i * dim..(i + 1) * dim];
-            rotated[i] = T::dot_simd(row, vec);
-        }
-        rotated
-    }
-
-    /// Generate a random orthogonal matrix
-    ///
-    /// ### Params
-    ///
-    /// * `dim` - The dimensions of the rotation matrix
-    /// * `seed` - Seed for reproducibility
-    ///
-    /// ### Returns
-    ///
-    /// A flattened orthogonal rotation matrix
-    fn generate_random_orthogonal(dim: usize, seed: u64) -> Vec<T> {
-        let mut rng = StdRng::seed_from_u64(seed);
-
-        let mut mat = Mat::<T>::zeros(dim, dim);
-        for i in 0..dim {
-            for j in 0..dim {
-                let val: f64 = rng.sample(StandardNormal);
-                mat[(i, j)] = T::from_f64(val).unwrap();
-            }
-        }
-
-        let qr = mat.as_ref().qr();
-        let q = qr.compute_Q();
-
-        let mut rotation = Vec::with_capacity(dim * dim);
-        for i in 0..dim {
-            for j in 0..dim {
-                rotation.push(q[(i, j)]);
-            }
-        }
-        rotation
+        self.rotator.rotate(vec)
     }
 
     /// Memory usage in bytes
@@ -377,7 +378,7 @@ where
     ///
     /// The memory usage in bytes
     pub fn memory_usage_bytes(&self) -> usize {
-        std::mem::size_of_val(self) + self.rotation.capacity() * std::mem::size_of::<T>()
+        std::mem::size_of_val(self) + self.rotator.memory_usage_bytes()
     }
 }
 
@@ -419,7 +420,7 @@ impl<T> RaBitQPackedVector<T> {
 pub struct RaBitQStorage<T> {
     /// The centroids of the data, nlist * dim, flattened
     pub centroids: Vec<T>,
-    /// The same centroids in the encoder's rotated frame, nlist * dim,
+    /// The same centroids in the encoder's rotated frame, nlist * padded_dim,
     /// flattened. Precomputed so the query path never rotates a centroid.
     pub centroids_rotated: Vec<T>,
     /// Norms of the centroids
@@ -437,6 +438,8 @@ pub struct RaBitQStorage<T> {
     pub nlist: usize,
     /// Number of dimensions
     pub dim: usize,
+    /// Dimensionality of the rotated frame, the stride of `centroids_rotated`
+    pub padded_dim: usize,
     /// Number of bytes
     pub n_bytes: usize,
 }
@@ -449,15 +452,16 @@ impl<T: Float + FromPrimitive + Clone> RaBitQStorage<T> {
     /// * `nlist` - Number of lists
     /// * `n` - Number of vectors
     /// * `dim` - Dimensionality of the data
+    /// * `padded_dim` - Dimensionality of the encoder's rotated frame
     ///
     /// ### Returns
     ///
     /// Initialised self
-    pub fn with_capacity(nlist: usize, n: usize, dim: usize) -> Self {
-        let n_bytes = dim.div_ceil(8);
+    pub fn with_capacity(nlist: usize, n: usize, dim: usize, padded_dim: usize) -> Self {
+        let n_bytes = padded_dim.div_ceil(8);
         Self {
             centroids: Vec::with_capacity(nlist * dim),
-            centroids_rotated: Vec::with_capacity(nlist * dim),
+            centroids_rotated: Vec::with_capacity(nlist * padded_dim),
             centroids_norm: Vec::with_capacity(nlist),
             binary_codes: Vec::with_capacity(n * n_bytes),
             packed_vectors: Vec::with_capacity(n),
@@ -465,6 +469,7 @@ impl<T: Float + FromPrimitive + Clone> RaBitQStorage<T> {
             offsets: vec![0; nlist + 1],
             nlist,
             dim,
+            padded_dim,
             n_bytes,
         }
     }
@@ -495,8 +500,8 @@ impl<T: Float + FromPrimitive + Clone> RaBitQStorage<T> {
     /// Slice of the centroid in the encoder's rotated frame
     #[inline]
     pub fn centroid_rotated(&self, cluster_idx: usize) -> &[T] {
-        let start = cluster_idx * self.dim;
-        &self.centroids_rotated[start..start + self.dim]
+        let start = cluster_idx * self.padded_dim;
+        &self.centroids_rotated[start..start + self.padded_dim]
     }
 
     /// Get binary codes for a cluster
@@ -699,7 +704,8 @@ pub fn build_rabitq_storage<T>(
 where
     T: Float + FromPrimitive + ToPrimitive + ComplexField + Sum + SimdDistance + Clone,
 {
-    let n_bytes = dim.div_ceil(8);
+    let padded_dim = encoder.padded_dim;
+    let n_bytes = encoder.n_bytes;
 
     // Compute centroid norms
     let centroids_norm: Vec<T> = (0..nlist)
@@ -720,7 +726,7 @@ where
 
     // Rotate every centroid once so the query path never has to. nlist is
     // small and this is a build-time one-off, so it stays sequential.
-    let mut centroids_rotated = Vec::with_capacity(nlist * dim);
+    let mut centroids_rotated = Vec::with_capacity(nlist * padded_dim);
     for c in 0..nlist {
         centroids_rotated
             .extend_from_slice(&encoder.apply_rotation(&centroids[c * dim..(c + 1) * dim]));
@@ -744,6 +750,7 @@ where
         offsets: offsets.clone(),
         nlist,
         dim,
+        padded_dim,
         n_bytes,
     };
 
@@ -808,6 +815,32 @@ where
         data: impl AnnMatrix<T>,
         metric: &Dist,
         n_clusters: Option<usize>,
+        seed: usize,
+    ) -> Result<Self, AnnSearchErrors> {
+        Self::with_rotator_kind(data, metric, n_clusters, None, seed)
+    }
+
+    /// Create a new RaBitQ quantiser with an explicitly chosen rotation
+    ///
+    /// ### Params
+    ///
+    /// * `data` - The underlying data on which to train the Quantiser
+    /// * `metric` - Which distance metric to use
+    /// * `n_clusters` - Optional number of centroids. If not provided, defaults
+    ///   to `0.5 * sqrt(n)`.
+    /// * `rotator_kind` - Which rotation to encode with, or `None` to let
+    ///   [`resolve_rotator_kind`](crate::binary::rotator::resolve_rotator_kind)
+    ///   decide
+    /// * `seed` - Seed for reproducibility
+    ///
+    /// ### Returns
+    ///
+    /// Initialised self
+    pub fn with_rotator_kind(
+        data: impl AnnMatrix<T>,
+        metric: &Dist,
+        n_clusters: Option<usize>,
+        rotator_kind: Option<RotatorKind>,
         seed: usize,
     ) -> Result<Self, AnnSearchErrors> {
         if *metric == Dist::Manhattan {
@@ -879,7 +912,10 @@ where
         );
 
         // Create encoder
-        let encoder = RaBitQEncoder::new(dim, *metric, seed as u64);
+        let encoder = match rotator_kind {
+            Some(kind) => RaBitQEncoder::with_rotator_kind(dim, *metric, kind, seed as u64)?,
+            None => RaBitQEncoder::new(dim, *metric, seed as u64),
+        };
 
         // Build CSR storage
         let storage = build_rabitq_storage(
@@ -1017,6 +1053,7 @@ where
 mod tests {
     use super::*;
     use approx::assert_abs_diff_eq;
+    use faer::Mat;
 
     fn sample_data_2d() -> Vec<f32> {
         vec![
@@ -1086,24 +1123,43 @@ mod tests {
     fn test_encoder_creation() {
         let encoder = RaBitQEncoder::<f32>::new(4, Dist::SquaredEuclidean, 42);
         assert_eq!(encoder.dim, 4);
+        assert_eq!(encoder.padded_dim, 4);
         assert_eq!(encoder.n_bytes, 1);
-        assert_eq!(encoder.rotation.len(), 16);
+        assert_eq!(encoder.rotator.kind(), RotatorKind::Dense);
+    }
+
+    #[test]
+    fn test_encoder_pads_once_the_hadamard_rotation_kicks_in() {
+        let encoder = RaBitQEncoder::<f32>::new(200, Dist::SquaredEuclidean, 42);
+        assert_eq!(encoder.rotator.kind(), RotatorKind::FhtKac);
+        assert_eq!(encoder.padded_dim, 256);
+        assert_eq!(encoder.n_bytes, 32);
+
+        let (binary, _, _, popcount) = encoder
+            .encode_vector(&vec![1.0; 200], &vec![0.0; 200])
+            .unwrap();
+        assert_eq!(binary.len(), 32);
+        assert!(popcount <= 256);
     }
 
     #[test]
     fn test_rotation_orthogonality() {
-        let dim = 8;
-        let encoder = RaBitQEncoder::<f32>::new(dim, Dist::SquaredEuclidean, 42);
+        // Both rotations must preserve norms, which is what the sign bits and
+        // the L1 dot correction downstream assume.
+        for (dim, kind) in [(8usize, RotatorKind::Dense), (128, RotatorKind::FhtKac)] {
+            let encoder =
+                RaBitQEncoder::<f32>::with_rotator_kind(dim, Dist::SquaredEuclidean, kind, 42)
+                    .unwrap();
 
-        // Check R^T * R = I
-        for i in 0..dim {
-            for j in 0..dim {
-                let mut dot = 0.0;
-                for k in 0..dim {
-                    dot += encoder.rotation[i * dim + k] * encoder.rotation[j * dim + k];
-                }
-                let expected = if i == j { 1.0 } else { 0.0 };
-                assert_abs_diff_eq!(dot, expected, epsilon = 1e-5);
+            for seed in 0..4u64 {
+                let v: Vec<f32> = (0..dim)
+                    .map(|i| ((i as u64 * 2654435761 + seed * 97) % 211) as f32 / 211.0 - 0.5)
+                    .collect();
+                let rotated = encoder.apply_rotation(&v);
+
+                let norm_in = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+                let norm_out = rotated.iter().map(|x| x * x).sum::<f32>().sqrt();
+                assert_abs_diff_eq!(norm_out, norm_in, epsilon = 1e-4);
             }
         }
     }
@@ -1166,7 +1222,7 @@ mod tests {
 
     #[test]
     fn test_storage_creation() {
-        let storage = RaBitQStorage::<f32>::with_capacity(10, 100, 8);
+        let storage = RaBitQStorage::<f32>::with_capacity(10, 100, 8, 8);
         assert_eq!(storage.nlist, 10);
         assert_eq!(storage.dim, 8);
         assert_eq!(storage.n_bytes, 1);
