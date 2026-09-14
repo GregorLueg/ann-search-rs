@@ -68,7 +68,9 @@ fn main() {
 
     println!("-----------------------------");
 
-    // R x L_build grid
+    // R x L_build grid. `L_build` here is the second pass only; the first runs
+    // at the crate default, which is a small constant and deliberately not
+    // swept alongside it.
     let build_params: &[(usize, usize)] = &[
         (32, 50),
         (32, 100),
@@ -91,7 +93,7 @@ fn main() {
             data.as_ref(),
             r,
             l_build,
-            None,
+            None, // first-pass beam: crate default
             1.0,
             1.2,
             &cli.distance,

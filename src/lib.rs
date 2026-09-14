@@ -1440,10 +1440,9 @@ where
 ///   `(&[T], n_samples, n_features)` tuple. See [`AnnMatrix`].
 /// * `r` - Maximum out-degree (edges per node).
 /// * `l_build` - Beam width during construction.
-/// * `l_build_pass1` - Beam width for the first pass. `None` reuses `l_build`.
-///   Pass 1 only has to bootstrap a topology from the random graph, so a
-///   narrower beam there is much cheaper than lowering `l_build` itself for the
-///   same recall.
+/// * `l_build_pass1` - Beam width for the first pass, capped at `l_build`.
+///   `None` picks the default, which is a small constant: a wide first pass is
+///   both slower and worse. Pass `Some(l_build)` for symmetric passes.
 /// * `alpha_pass1` - Pruning alpha for pass 1 (typically 1.0).
 /// * `alpha_pass2` - Pruning alpha for pass 2 (typically 1.2–1.5).
 /// * `dist_metric` - Distance metric: "euclidean", "cosine" or "manhatten".
@@ -4618,9 +4617,9 @@ where
 /// * `degree` - Neighbour slots per vertex. Must be a non-zero multiple of
 ///   [`QG_BATCH`]; [`DEFAULT_QG_DEGREE`] is one sweep per hop.
 /// * `l_build` - Beam width during graph construction
-/// * `l_build_pass1` - Beam width for Vamana's first pass, `None` to reuse
-///   `l_build`. Pass 1 only bootstraps a topology from the random graph, so
-///   narrowing it is much cheaper than lowering `l_build` for the same recall.
+/// * `l_build_pass1` - Beam width for Vamana's first pass, capped at `l_build`.
+///   `None` picks the default, which is a small constant: a wide first pass is
+///   both slower and worse. Pass `Some(l_build)` for symmetric passes.
 /// * `alpha_pass1` - Vamana prune slack, first pass
 /// * `alpha_pass2` - Vamana prune slack, second pass
 /// * `dist_metric` - One of `"euclidean"`/`"l2"` or `"cosine"`. Manhattan is
@@ -4674,9 +4673,9 @@ where
 /// * `mat` - Data as samples x features. See [`AnnMatrix`].
 /// * `degree` - Neighbour slots per vertex, a non-zero multiple of [`QG_BATCH`]
 /// * `l_build` - Beam width during graph construction
-/// * `l_build_pass1` - Beam width for Vamana's first pass, `None` to reuse
-///   `l_build`. Pass 1 only bootstraps a topology from the random graph, so
-///   narrowing it is much cheaper than lowering `l_build` for the same recall.
+/// * `l_build_pass1` - Beam width for Vamana's first pass, capped at `l_build`.
+///   `None` picks the default, which is a small constant: a wide first pass is
+///   both slower and worse. Pass `Some(l_build)` for symmetric passes.
 /// * `alpha_pass1` - Vamana prune slack, first pass
 /// * `alpha_pass2` - Vamana prune slack, second pass
 /// * `dist_metric` - One of `"euclidean"`/`"l2"` or `"cosine"`

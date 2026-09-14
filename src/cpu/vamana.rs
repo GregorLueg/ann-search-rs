@@ -26,6 +26,30 @@ thread_local! {
     static VAMANA_SEARCH_STATE_F64: RefCell<SearchState<f64>> = RefCell::new(SearchState::new(1000));
 }
 
+/// Default beam width for the first build pass.
+///
+/// Pass 1 prunes at alpha 1, with no slack, so a wide well-converged candidate
+/// pool hands it an aggressively occluded edge list and costs the random
+/// graph's long-range highways that pass 2 still needs. A narrow beam there is
+/// both cheaper and better, and the effect does not scale with `l_build`: the
+/// same constant wins from `l_build` 32 up to 256.
+const DEFAULT_L_BUILD_PASS1: usize = 16;
+
+/// Resolve the first pass's beam width.
+///
+/// ### Params
+///
+/// * `l_build_pass1` - Caller's choice, `None` to use the default
+/// * `l_build` - Beam width of the second pass, the ceiling for the first
+///
+/// ### Returns
+///
+/// Beam width to run pass 1 at
+#[inline]
+fn resolve_l_build_pass1(l_build_pass1: Option<usize>, l_build: usize) -> usize {
+    l_build_pass1.unwrap_or(DEFAULT_L_BUILD_PASS1).min(l_build)
+}
+
 /////////////
 // Helpers //
 /////////////
@@ -441,11 +465,10 @@ where
     /// * `metric` - The distance metric to use for this index
     /// * `r` - Maximum out-degree
     /// * `l_build` - Beam width for the second pass
-    /// * `l_build_pass1` - Beam width for the first pass. `None` reuses
-    ///   `l_build`. Pass 1 runs at alpha 1 on a random graph and only has to
-    ///   bootstrap a usable topology, so its beam buys much less recall than
-    ///   pass 2's. Narrowing it dominates lowering `l_build` itself: at matched
-    ///   build time the asymmetric split wins on recall at every `ef_search`.
+    /// * `l_build_pass1` - Beam width for the first pass, capped at `l_build`.
+    ///   `None` uses [`DEFAULT_L_BUILD_PASS1`], which is what you want: a wide
+    ///   first pass is both slower and worse. Pass `Some(l_build)` for the old
+    ///   symmetric behaviour.
     /// * `alpha_pass1` - Pruning alpha for pass 1
     /// * `alpha_pass2` - Pruning alpha for pass 2
     /// * `seed` - Random seed
@@ -499,7 +522,7 @@ where
         };
 
         let passes = [
-            (alpha_pass1, l_build_pass1.unwrap_or(l_build)),
+            (alpha_pass1, resolve_l_build_pass1(l_build_pass1, l_build)),
             (alpha_pass2, l_build),
         ];
 

@@ -204,7 +204,8 @@ fn main() {
     // computes exact distances for every vertex it pops.
     //
     // `l_build` is swept because it is where the build time goes: the encoding
-    // is a flat few hundred milliseconds and everything else is Vamana.
+    // is a flat few hundred milliseconds and everything else is Vamana. It sets
+    // the second Vamana pass only; the first runs at the crate default.
     let qg_degrees = [32usize, 64];
     let qg_l_builds = [32usize, 128];
     let qg_ef_values = [cli.k, cli.k * 2, cli.k * 4, cli.k * 8];
@@ -220,7 +221,7 @@ fn main() {
                 data.as_ref(),
                 degree,
                 l_build,
-                None,
+                None, // first-pass beam: crate default
                 1.2,
                 1.2,
                 &cli.distance,

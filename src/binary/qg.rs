@@ -277,8 +277,8 @@ where
     /// * `metric` - Distance metric, squared Euclidean or cosine
     /// * `degree` - Neighbour slots per vertex, a multiple of [`QG_BATCH`]
     /// * `l_build` - Beam width during graph construction
-    /// * `l_build_pass1` - Beam width for Vamana's first pass, `None` to reuse
-    ///   `l_build`
+    /// * `l_build_pass1` - Beam width for Vamana's first pass, capped at
+    ///   `l_build`. `None` picks the default, a small constant.
     /// * `alpha_pass1` - Vamana prune slack, first pass
     /// * `alpha_pass2` - Vamana prune slack, second pass
     /// * `rotator_kind` - Which rotation to encode with, or `None` to let the
