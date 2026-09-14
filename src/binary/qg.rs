@@ -51,7 +51,7 @@
 
 use faer::RowRef;
 use faer_traits::ComplexField;
-use num_traits::Float;
+use num_traits::{Float, FromPrimitive};
 use rayon::prelude::*;
 use std::cmp::Reverse;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -209,6 +209,58 @@ where
     acc
 }
 
+/// Encode a residual that is already in the rotated frame.
+///
+/// The rotation is linear and orthogonal, so `R(v - c)` equals `Rv - Rc` and
+/// its norm equals `||v - c||`. Rotating every vector once and differencing
+/// there therefore gives exactly what
+/// [`RaBitQEncoder::encode_vector`] computes, for one rotation per vector
+/// instead of one per edge.
+///
+/// Normalisation drops out too: the sign bits of the unit residual are the
+/// sign bits of the residual, and the unit residual's L1 norm is
+/// `||res||_1 / ||res||`.
+///
+/// ### Params
+///
+/// * `res` - The residual in the rotated frame, `padded_dim` long
+/// * `code` - Output sign bits, `padded_dim / 8` bytes, overwritten in full
+///
+/// ### Returns
+///
+/// `(||v - c||, inverse dot correction)`, the latter zero where the residual
+/// underflowed
+#[inline]
+fn encode_rotated_residual<T>(res: &[T], code: &mut [u8]) -> (T, T)
+where
+    T: Float + FromPrimitive,
+{
+    code.fill(0);
+
+    let mut sum_sq = T::zero();
+    let mut l1 = T::zero();
+    for (d, &x) in res.iter().enumerate() {
+        sum_sq = sum_sq + x * x;
+        l1 = l1 + x.abs();
+        if x >= T::zero() {
+            code[d / 8] |= 1u8 << (d % 8);
+        }
+    }
+
+    let v_dist = sum_sq.sqrt();
+
+    // `encode_vector` guards on the L1 norm of the *unit* residual, which is
+    // `l1 / v_dist`; the same condition written without the divide.
+    let floor = T::from_f32(1e-6).unwrap();
+    let dot_correction_inv = if v_dist > T::epsilon() && l1 > floor * v_dist {
+        v_dist / l1
+    } else {
+        T::zero()
+    };
+
+    (v_dist, dot_correction_inv)
+}
+
 impl<T> QgIndex<T>
 where
     T: AnnSearchFloat + ComplexField + ThreadLocalSearchState,
@@ -307,6 +359,19 @@ where
         let block_bytes = n_bytes * QG_BATCH;
         let two = T::one() + T::one();
 
+        // One rotation per vector rather than one per edge. Every residual the
+        // encoder needs is a difference of two of these, so this turns
+        // `n * degree` transforms into `n`. Freed before the index is returned.
+        let mut rotated = vec![T::zero(); n * padded_dim];
+        rotated
+            .par_chunks_mut(padded_dim)
+            .enumerate()
+            .for_each(|(i, out)| {
+                encoder
+                    .rotator
+                    .rotate_into(&vectors_flat[i * dim..(i + 1) * dim], out);
+            });
+
         codes
             .par_chunks_mut(n_batches * block_bytes)
             .zip(f_add.par_chunks_mut(degree))
@@ -314,11 +379,11 @@ where
             .enumerate()
             .try_for_each(
                 |(node, ((code_block, add_block), rescale_block))| -> Result<(), AnnSearchErrors> {
-                    let centre = &vectors_flat[node * dim..(node + 1) * dim];
-                    let centre_rot = encoder.apply_rotation(centre);
+                    let centre_rot = &rotated[node * padded_dim..(node + 1) * padded_dim];
                     let slots = &edges[node * degree..(node + 1) * degree];
 
                     let mut raw = vec![0u8; degree * n_bytes];
+                    let mut res = vec![T::zero(); padded_dim];
 
                     for (slot, &nb) in slots.iter().enumerate() {
                         if nb == SENTINEL {
@@ -331,16 +396,17 @@ where
                         }
 
                         let nb = nb as usize;
-                        let vec = &vectors_flat[nb * dim..(nb + 1) * dim];
-                        let (code, v_dist, dot_correction_inv) =
-                            encoder.encode_vector(vec, centre)?;
+                        let nb_rot = &rotated[nb * padded_dim..(nb + 1) * padded_dim];
+                        for d in 0..padded_dim {
+                            res[d] = nb_rot[d] - centre_rot[d];
+                        }
+
+                        let code = &mut raw[slot * n_bytes..(slot + 1) * n_bytes];
+                        let (v_dist, dot_correction_inv) = encode_rotated_residual(&res, code);
 
                         let rescale = (two * v_dist * dot_correction_inv).neg();
                         rescale_block[slot] = rescale;
-                        add_block[slot] =
-                            v_dist * v_dist - rescale * signed_dot(&code, &centre_rot);
-
-                        raw[slot * n_bytes..(slot + 1) * n_bytes].copy_from_slice(&code);
+                        add_block[slot] = v_dist * v_dist - rescale * signed_dot(code, centre_rot);
                     }
 
                     for b in 0..n_batches {
@@ -463,7 +529,16 @@ where
                 self.entry_point as usize,
             )));
 
-            while let Some(Reverse((_, node))) = state.candidates.pop() {
+            while let Some(Reverse((est, node))) = state.candidates.pop() {
+                // The beam is ordered on estimates but gated on exact
+                // distances, so this compares the two. That is sound for
+                // stopping: an estimate already worse than the k-th exact
+                // distance cannot lead anywhere better than the estimate
+                // error, and without it the walk drains every candidate it
+                // ever admitted, paying a full exact distance for each.
+                if est.0 > state.results.threshold() {
+                    break;
+                }
                 if state.is_visited(node) {
                     continue;
                 }
