@@ -220,6 +220,7 @@ fn main() {
                 data.as_ref(),
                 degree,
                 l_build,
+                None,
                 1.2,
                 1.2,
                 &cli.distance,

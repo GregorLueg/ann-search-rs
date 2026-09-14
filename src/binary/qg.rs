@@ -277,6 +277,8 @@ where
     /// * `metric` - Distance metric, squared Euclidean or cosine
     /// * `degree` - Neighbour slots per vertex, a multiple of [`QG_BATCH`]
     /// * `l_build` - Beam width during graph construction
+    /// * `l_build_pass1` - Beam width for Vamana's first pass, `None` to reuse
+    ///   `l_build`
     /// * `alpha_pass1` - Vamana prune slack, first pass
     /// * `alpha_pass2` - Vamana prune slack, second pass
     /// * `rotator_kind` - Which rotation to encode with, or `None` to let the
@@ -292,6 +294,7 @@ where
         metric: Dist,
         degree: usize,
         l_build: usize,
+        l_build_pass1: Option<usize>,
         alpha_pass1: f32,
         alpha_pass2: f32,
         rotator_kind: Option<RotatorKind>,
@@ -335,6 +338,7 @@ where
             Dist::SquaredEuclidean,
             degree,
             l_build,
+            l_build_pass1,
             alpha_pass1,
             alpha_pass2,
             seed,
@@ -855,7 +859,7 @@ mod tests {
     }
 
     fn build(data: &Mat<f32>, metric: Dist, degree: usize) -> QgIndex<f32> {
-        QgIndex::build(data.as_ref(), metric, degree, 128, 1.2, 1.2, None, 42).unwrap()
+        QgIndex::build(data.as_ref(), metric, degree, 128, None, 1.2, 1.2, None, 42).unwrap()
     }
 
     fn brute_force(data: &Mat<f32>, query: &[f32], k: usize, metric: Dist) -> Vec<usize> {
@@ -1003,7 +1007,17 @@ mod tests {
     fn test_manhattan_is_rejected() {
         let data = clustered(100, 64, 5, 29);
         assert!(matches!(
-            QgIndex::build(data.as_ref(), Dist::Manhattan, 32, 64, 1.2, 1.2, None, 42),
+            QgIndex::build(
+                data.as_ref(),
+                Dist::Manhattan,
+                32,
+                64,
+                None,
+                1.2,
+                1.2,
+                None,
+                42
+            ),
             Err(AnnSearchErrors::DistanceNotSupported(_))
         ));
     }
@@ -1019,6 +1033,7 @@ mod tests {
                         Dist::SquaredEuclidean,
                         degree,
                         64,
+                        None,
                         1.2,
                         1.2,
                         None,
@@ -1061,6 +1076,7 @@ mod tests {
             Dist::SquaredEuclidean,
             32,
             128,
+            None,
             1.2,
             1.2,
             None,

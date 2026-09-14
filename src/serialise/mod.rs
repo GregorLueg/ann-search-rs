@@ -529,7 +529,7 @@ mod tests {
     round_trip!(
         test_round_trip_vamana,
         VamanaIndex<f32>,
-        |m| build_vamana_index(m, 16, 32, 1.2, 1.2, "euclidean", 1),
+        |m| build_vamana_index(m, 16, 32, None, 1.2, 1.2, "euclidean", 1),
         |i, q| unwrap_knn(query_vamana_index(q, i, K, None, true, false))
     );
 
@@ -810,7 +810,7 @@ mod tests {
         round_trip!(
             test_round_trip_qg,
             QgIndex<f32>,
-            |m| build_qg_index(m, 32, 64, 1.2, 1.2, "euclidean", 1).unwrap(),
+            |m| build_qg_index(m, 32, 64, None, 1.2, 1.2, "euclidean", 1).unwrap(),
             |i, q| unwrap_knn(query_qg_index(q, i, K, 64, true, false))
         );
 
@@ -1744,7 +1744,7 @@ mod tests {
     self_round_trip!(
         test_self_round_trip_vamana,
         VamanaIndex<f32>,
-        |m| build_vamana_index(m, 16, 32, 1.2, 1.2, "euclidean", 1),
+        |m| build_vamana_index(m, 16, 32, None, 1.2, 1.2, "euclidean", 1),
         |i| query_vamana_self(i, K, None, false, false).unwrap().0
     );
 

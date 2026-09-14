@@ -439,15 +439,27 @@ where
     /// * `data` - The initial data for which to generate the vector of shape
     ///   n x features
     /// * `metric` - The distance metric to use for this index
+    /// * `r` - Maximum out-degree
+    /// * `l_build` - Beam width for the second pass
+    /// * `l_build_pass1` - Beam width for the first pass. `None` reuses
+    ///   `l_build`. Pass 1 runs at alpha 1 on a random graph and only has to
+    ///   bootstrap a usable topology, so its beam buys much less recall than
+    ///   pass 2's. Narrowing it dominates lowering `l_build` itself: at matched
+    ///   build time the asymmetric split wins on recall at every `ef_search`.
+    /// * `alpha_pass1` - Pruning alpha for pass 1
+    /// * `alpha_pass2` - Pruning alpha for pass 2
+    /// * `seed` - Random seed
     ///
     /// ### Returns
     ///
     /// Initialised and built self
+    #[allow(clippy::too_many_arguments)]
     pub fn build(
         data: impl AnnMatrix<T>,
         metric: Dist,
         r: usize,
         l_build: usize,
+        l_build_pass1: Option<usize>,
         alpha_pass1: f32,
         alpha_pass2: f32,
         seed: usize,
@@ -486,9 +498,12 @@ where
             original_ids: (0..n).collect(),
         };
 
-        let passes = [alpha_pass1, alpha_pass2];
+        let passes = [
+            (alpha_pass1, l_build_pass1.unwrap_or(l_build)),
+            (alpha_pass2, l_build),
+        ];
 
-        for alpha in passes {
+        for (alpha, l_build) in passes {
             // random permutation of nodes for unbiased parallel updates
             let mut permutation: Vec<usize> = (0..n).collect();
             permutation.shuffle(&mut rng());
@@ -498,20 +513,12 @@ where
                 Self::with_build_state(|state_cell| {
                     let mut state = state_cell.borrow_mut();
 
-                    // 1.) beam search from medoid to target `p` -> returns
-                    // L_build candidates
-                    let candidates = index.beam_search_build(
-                        p,
-                        medoid as usize,
-                        l_build,
-                        &build_graph,
-                        &mut state,
-                    );
+                    // 1.) beam search from medoid to target `p` -> leaves up to
+                    // L_build candidates in `scratch_working`
+                    index.beam_search_build(p, medoid as usize, l_build, &build_graph, &mut state);
 
                     // 2.) add p's current neighbours to the candidate pool
                     let scratch = &mut state.scratch_working;
-                    scratch.clear();
-                    scratch.extend_from_slice(&candidates);
 
                     // SAFETY: benign race -- we only read p's own edges and
                     // the parallel iterator guarantees no other thread writes
@@ -598,8 +605,11 @@ where
 
     /// Beam search used specifically during the index construction phase.
     ///
-    /// Returns the sorted candidate set directly from the working buffer
-    /// (no intermediate Vec allocation).
+    /// Walks the graph from `entry_node`, keeping the best `l_build` nodes seen
+    /// in a single bounded sorted beam that doubles as the frontier. Leaves the
+    /// candidate set in `state.scratch_working`, ascending by distance; the
+    /// caller appends the target's current out-edges and `robust_prune` sorts
+    /// the combined pool once.
     ///
     /// ### Params
     ///
@@ -608,10 +618,6 @@ where
     /// * `l_build` - Beam width during candidate building
     /// * `build_graph` - Reference to the construction graph
     /// * `state` - Mutable SearchState for that thread
-    ///
-    /// ### Returns
-    ///
-    /// Sorted candidate set of `(dist, index)`
     fn beam_search_build(
         &self,
         target_node: usize,
@@ -619,25 +625,20 @@ where
         l_build: usize,
         build_graph: &VamanaConstructionGraph,
         state: &mut SearchState<T>,
-    ) -> Vec<(OrderedFloat<T>, usize)> {
+    ) {
         state.reset(self.n);
-
-        let entry_dist = OrderedFloat(self.distance(target_node, entry_node));
+        state.beam.reset(l_build);
 
         state.mark_visited(entry_node);
-        state.candidates.push(Reverse((entry_dist, entry_node)));
         state
-            .working_sorted
-            .insert((entry_dist, entry_node), l_build);
+            .beam
+            .insert(self.distance(target_node, entry_node), entry_node as u32);
 
-        let mut furthest_dist = entry_dist;
+        while let Some((_, current_id)) = state.beam.next_unexpanded() {
+            let neighbours = unsafe { build_graph.get_neighbours_slice(current_id as usize) };
 
-        while let Some(Reverse((current_dist, current_id))) = state.candidates.pop() {
-            if current_dist > furthest_dist && state.working_sorted.len() >= l_build {
-                break;
-            }
-
-            let neighbours = unsafe { build_graph.get_neighbours_slice(current_id) };
+            let mut buf = [0usize; 4];
+            let mut buffered = 0;
 
             for &neighbour in neighbours {
                 if neighbour == u32::MAX {
@@ -651,26 +652,31 @@ where
                 }
                 state.mark_visited(n_idx);
 
-                let dist = OrderedFloat(self.distance(target_node, n_idx));
+                buf[buffered] = n_idx;
+                buffered += 1;
 
-                if dist < furthest_dist || state.working_sorted.len() < l_build {
-                    state.candidates.push(Reverse((dist, n_idx)));
-
-                    if state.working_sorted.insert((dist, n_idx), l_build)
-                        && state.working_sorted.len() >= l_build
-                    {
-                        furthest_dist = state
-                            .working_sorted
-                            .top()
-                            .map(|(d, _)| *d)
-                            .unwrap_or(OrderedFloat(T::infinity()));
+                if buffered == 4 {
+                    let dists = self.node_distances_4_gathered(target_node, buf, self.metric);
+                    for k in 0..4 {
+                        state.beam.insert(dists[k], buf[k] as u32);
                     }
+                    buffered = 0;
                 }
+            }
+
+            for k in 0..buffered {
+                let dist = self.distance(target_node, buf[k]);
+                state.beam.insert(dist, buf[k] as u32);
             }
         }
 
-        // allocation happens here, but oh well...
-        state.working_sorted.data().to_vec()
+        let SearchState {
+            beam,
+            scratch_working,
+            ..
+        } = state;
+        scratch_working.clear();
+        scratch_working.extend(beam.iter().map(|(d, id)| (OrderedFloat(d), id as usize)));
     }
 
     /// Selects up to `max_degree` neighbours from a candidate pool using the
@@ -689,10 +695,15 @@ where
         alpha: f32,
         max_degree: usize,
     ) -> Vec<u32> {
-        candidates.sort_unstable_by_key(|a| a.0);
+        // Full tuple, not just the distance: ties resolve towards the smaller
+        // id so the selected set is reproducible across runs and thread counts.
+        candidates.sort_unstable();
 
-        let mut selected = Vec::with_capacity(max_degree);
+        let mut selected: Vec<u32> = Vec::with_capacity(max_degree);
         let alpha_t = T::from_f32(alpha).unwrap();
+        let dim = self.dim;
+        let has_norms = !self.norms.is_empty();
+        let mut previous = usize::MAX;
 
         for &(cand_dist, cand_id) in candidates.iter() {
             if cand_id == base_node {
@@ -701,14 +712,36 @@ where
             if selected.len() >= max_degree {
                 break;
             }
-            // skip duplicates -- the closest one comes first due to sort order
-            if selected.contains(&(cand_id as u32)) {
+            // Cheap adjacent-duplicate skip rather than a scan of the selected
+            // set. It does not have to be exhaustive: a repeat that slips past
+            // it sits at distance zero from its already-selected copy, which
+            // the occlusion test below rejects on its own.
+            if cand_id == previous {
                 continue;
             }
+            previous = cand_id;
+
+            // Hoisted out of the pairwise loop: the candidate row and its norm
+            // are the same for every already-selected neighbour it is tested
+            // against.
+            let vec_cand = &self.vectors_flat[cand_id * dim..cand_id * dim + dim];
+            let norm_cand = if has_norms {
+                self.norms[cand_id]
+            } else {
+                T::one()
+            };
 
             let is_good = !selected.iter().any(|&sel_id| {
-                let dist_to_selected = OrderedFloat(self.distance(cand_id, sel_id as usize));
-                alpha_t * dist_to_selected.0 <= cand_dist.0
+                let sel = sel_id as usize;
+                let vec_sel = &self.vectors_flat[sel * dim..sel * dim + dim];
+                let dist_to_selected = match self.metric {
+                    Dist::SquaredEuclidean => T::euclidean_simd(vec_cand, vec_sel),
+                    Dist::Manhattan => T::manhattan_simd(vec_cand, vec_sel),
+                    Dist::Cosine => {
+                        T::one() - (T::dot_simd(vec_cand, vec_sel) / (norm_cand * self.norms[sel]))
+                    }
+                };
+                alpha_t * dist_to_selected <= cand_dist.0
             });
 
             if is_good {
@@ -1046,6 +1079,7 @@ mod tests {
             parse_ann_dist(metric).unwrap_or(Dist::SquaredEuclidean),
             16,
             100,
+            None,
             1.0,
             1.2,
             42,
@@ -1126,8 +1160,16 @@ mod tests {
         let data: Vec<f32> = (0..n * dim).map(|i| (i as f32) * 0.01).collect();
         let mat = Mat::from_fn(n, dim, |i, j| data[i * dim + j]);
 
-        let index =
-            VamanaIndex::<f32>::build(mat.as_ref(), Dist::SquaredEuclidean, 32, 150, 1.0, 1.2, 42);
+        let index = VamanaIndex::<f32>::build(
+            mat.as_ref(),
+            Dist::SquaredEuclidean,
+            32,
+            150,
+            None,
+            1.0,
+            1.2,
+            42,
+        );
 
         let query: Vec<f32> = (0..dim).map(|_| 0.5).collect();
 
@@ -1151,8 +1193,16 @@ mod tests {
         }
         let mat = Mat::from_fn(n, dim, |i, j| data[i * dim + j]);
 
-        let index =
-            VamanaIndex::<f32>::build(mat.as_ref(), Dist::SquaredEuclidean, 16, 200, 1.0, 1.2, 42);
+        let index = VamanaIndex::<f32>::build(
+            mat.as_ref(),
+            Dist::SquaredEuclidean,
+            16,
+            200,
+            None,
+            1.0,
+            1.2,
+            42,
+        );
 
         let query = vec![0.0_f32, 0.0, 0.0];
         let (indices, _) = index.query(&query, 5, Some(150)).unwrap();
@@ -1249,8 +1299,16 @@ mod tests {
         let dim = 4;
         let data: Vec<f32> = (0..n * dim).map(|i| i as f32).collect();
         let mat = Mat::from_fn(n, dim, |i, j| data[i * dim + j]);
-        let index =
-            VamanaIndex::<f32>::build(mat.as_ref(), Dist::SquaredEuclidean, 16, 100, 1.0, 1.2, 42);
+        let index = VamanaIndex::<f32>::build(
+            mat.as_ref(),
+            Dist::SquaredEuclidean,
+            16,
+            100,
+            None,
+            1.0,
+            1.2,
+            42,
+        );
 
         let k = 5;
         let (indices, distances) = index.generate_knn(k, None, true, false).unwrap();
@@ -1283,6 +1341,7 @@ mod tests {
                 Dist::SquaredEuclidean,
                 r,
                 150,
+                None,
                 1.0,
                 1.2,
                 42,
@@ -1301,8 +1360,16 @@ mod tests {
         let data: Vec<f32> = (0..n * dim).map(|i| (i as f32) * 0.01).collect();
         let mat = Mat::from_fn(n, dim, |i, j| data[i * dim + j]);
 
-        let index =
-            VamanaIndex::<f32>::build(mat.as_ref(), Dist::SquaredEuclidean, 32, 150, 1.0, 1.4, 42);
+        let index = VamanaIndex::<f32>::build(
+            mat.as_ref(),
+            Dist::SquaredEuclidean,
+            32,
+            150,
+            None,
+            1.0,
+            1.4,
+            42,
+        );
 
         let query: Vec<f32> = (0..dim).map(|_| 0.5).collect();
         let (indices, _) = index.query(&query, 10, None).unwrap();

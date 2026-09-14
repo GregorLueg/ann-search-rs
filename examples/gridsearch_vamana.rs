@@ -91,6 +91,7 @@ fn main() {
             data.as_ref(),
             r,
             l_build,
+            None,
             1.0,
             1.2,
             &cli.distance,

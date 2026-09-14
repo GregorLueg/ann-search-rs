@@ -1440,6 +1440,10 @@ where
 ///   `(&[T], n_samples, n_features)` tuple. See [`AnnMatrix`].
 /// * `r` - Maximum out-degree (edges per node).
 /// * `l_build` - Beam width during construction.
+/// * `l_build_pass1` - Beam width for the first pass. `None` reuses `l_build`.
+///   Pass 1 only has to bootstrap a topology from the random graph, so a
+///   narrower beam there is much cheaper than lowering `l_build` itself for the
+///   same recall.
 /// * `alpha_pass1` - Pruning alpha for pass 1 (typically 1.0).
 /// * `alpha_pass2` - Pruning alpha for pass 2 (typically 1.2–1.5).
 /// * `dist_metric` - Distance metric: "euclidean", "cosine" or "manhatten".
@@ -1448,10 +1452,12 @@ where
 /// ### Returns
 ///
 /// The built `VamanaIndex`.
+#[allow(clippy::too_many_arguments)]
 pub fn build_vamana_index<T>(
     mat: impl AnnMatrix<T>,
     r: usize,
     l_build: usize,
+    l_build_pass1: Option<usize>,
     alpha_pass1: f32,
     alpha_pass2: f32,
     dist_metric: &str,
@@ -1466,7 +1472,16 @@ where
         Dist::default()
     });
 
-    VamanaIndex::build(mat, metric, r, l_build, alpha_pass1, alpha_pass2, seed)
+    VamanaIndex::build(
+        mat,
+        metric,
+        r,
+        l_build,
+        l_build_pass1,
+        alpha_pass1,
+        alpha_pass2,
+        seed,
+    )
 }
 
 /// Query a Vamana index with an external query matrix
@@ -4603,6 +4618,9 @@ where
 /// * `degree` - Neighbour slots per vertex. Must be a non-zero multiple of
 ///   [`QG_BATCH`]; [`DEFAULT_QG_DEGREE`] is one sweep per hop.
 /// * `l_build` - Beam width during graph construction
+/// * `l_build_pass1` - Beam width for Vamana's first pass, `None` to reuse
+///   `l_build`. Pass 1 only bootstraps a topology from the random graph, so
+///   narrowing it is much cheaper than lowering `l_build` for the same recall.
 /// * `alpha_pass1` - Vamana prune slack, first pass
 /// * `alpha_pass2` - Vamana prune slack, second pass
 /// * `dist_metric` - One of `"euclidean"`/`"l2"` or `"cosine"`. Manhattan is
@@ -4617,6 +4635,7 @@ pub fn build_qg_index<T>(
     mat: impl AnnMatrix<T>,
     degree: usize,
     l_build: usize,
+    l_build_pass1: Option<usize>,
     alpha_pass1: f32,
     alpha_pass2: f32,
     dist_metric: &str,
@@ -4636,6 +4655,7 @@ where
         metric,
         degree,
         l_build,
+        l_build_pass1,
         alpha_pass1,
         alpha_pass2,
         None,
@@ -4654,6 +4674,9 @@ where
 /// * `mat` - Data as samples x features. See [`AnnMatrix`].
 /// * `degree` - Neighbour slots per vertex, a non-zero multiple of [`QG_BATCH`]
 /// * `l_build` - Beam width during graph construction
+/// * `l_build_pass1` - Beam width for Vamana's first pass, `None` to reuse
+///   `l_build`. Pass 1 only bootstraps a topology from the random graph, so
+///   narrowing it is much cheaper than lowering `l_build` for the same recall.
 /// * `alpha_pass1` - Vamana prune slack, first pass
 /// * `alpha_pass2` - Vamana prune slack, second pass
 /// * `dist_metric` - One of `"euclidean"`/`"l2"` or `"cosine"`
@@ -4669,6 +4692,7 @@ pub fn build_qg_index_with_rotator<T>(
     mat: impl AnnMatrix<T>,
     degree: usize,
     l_build: usize,
+    l_build_pass1: Option<usize>,
     alpha_pass1: f32,
     alpha_pass2: f32,
     dist_metric: &str,
@@ -4689,6 +4713,7 @@ where
         metric,
         degree,
         l_build,
+        l_build_pass1,
         alpha_pass1,
         alpha_pass2,
         Some(rotator_kind),
