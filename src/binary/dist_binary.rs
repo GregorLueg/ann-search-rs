@@ -5,6 +5,7 @@
 use num_traits::{Float, FromPrimitive};
 
 use crate::binary::rabitq::*;
+use crate::binary::rabitq_fastscan::{score_sign_block, SignScanQuery};
 #[allow(unused_imports)]
 use crate::prelude::*;
 
@@ -1087,6 +1088,75 @@ where
 
             let inner_product_sgn = two * (query.width * qr + query.lower * popcount) - q_term;
             let q_dot_v = (inner_product_sgn * packed.dot_correction_inv).clamp(one.neg(), one);
+
+            let v_dist = packed.dist_to_centroid;
+            let dist =
+                (v_dist * v_dist + q_dist_sq - two * v_dist * q_dist * q_dot_v).max(T::zero());
+
+            *slot = dist;
+            if dist < min {
+                min = dist;
+            }
+        }
+
+        min
+    }
+
+    /// Squared RaBitQ distances for one fast-scan block within a cluster
+    ///
+    /// Same estimate as [`rabitq_block_sq`](Self::rabitq_block_sq), sourcing
+    /// the signed inner product from a nibble table scanned 32 lanes at a time
+    /// instead of a per-vector AND-popcount. The int4 query quantisation and
+    /// the popcount corrections it needed drop out with it, so only the
+    /// per-vector norm and dot correction remain.
+    ///
+    /// `local_start` must be a multiple of [`RABITQ_BLOCK`], which is what the
+    /// scan loops step by.
+    ///
+    /// ### Params
+    ///
+    /// * `query` - The query, already prepared against this cluster
+    /// * `cluster_idx` - Index of the cluster
+    /// * `local_start` - Local index of the first vector in the block
+    /// * `out` - Per-vector output; its length sets how many lanes are kept
+    ///
+    /// ### Returns
+    ///
+    /// The minimum written into `out`, or infinity when `out` is empty
+    #[inline]
+    fn rabitq_block_sq_fastscan(
+        &self,
+        query: &SignScanQuery<T>,
+        cluster_idx: usize,
+        local_start: usize,
+        out: &mut [T],
+    ) -> T {
+        debug_assert_eq!(local_start % RABITQ_BLOCK, 0);
+
+        let storage = self.storage();
+        let blocked = storage.cluster_blocked(cluster_idx);
+
+        let mut lanes = [0.0f32; RABITQ_BLOCK];
+        score_sign_block(
+            &query.lut,
+            &blocked.data,
+            local_start / RABITQ_BLOCK,
+            &mut lanes,
+        );
+
+        let one = T::one();
+        let two = one + one;
+        let q_dist = query.dist_to_centroid;
+        let q_dist_sq = q_dist * q_dist;
+
+        let global_start = storage.offsets[cluster_idx] + local_start;
+        let mut min = T::infinity();
+
+        for (j, slot) in out.iter_mut().enumerate() {
+            let packed = unsafe { storage.packed_vectors.get_unchecked(global_start + j) };
+
+            let sgn = T::from_f32(lanes[j]).unwrap();
+            let q_dot_v = (sgn * packed.dot_correction_inv).clamp(one.neg(), one);
 
             let v_dist = packed.dist_to_centroid;
             let dist =

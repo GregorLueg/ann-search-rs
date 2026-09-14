@@ -70,7 +70,11 @@ pub fn build_query_lut(
     bits: usize,
     dim: usize,
 ) -> Result<QueryLut, AnnSearchErrors> {
-    if bits != 2 && bits != 4 {
+    // 1 bit is not a TurboQuant width. RaBitQ borrows this table with
+    // `levels = [-1, 1]`, which makes each 16-entry sub-table the signed sum of
+    // four rotated query coordinates: exactly the RaBitQ inner product, and the
+    // same nibble-indexed shape the kernels already scan.
+    if bits != 1 && bits != 2 && bits != 4 {
         return Err(AnnSearchErrors::TQLutError { bit: bits });
     }
 

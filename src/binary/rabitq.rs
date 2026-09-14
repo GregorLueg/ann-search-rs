@@ -9,7 +9,9 @@ use rayon::prelude::*;
 use std::iter::Sum;
 
 use crate::binary::dist_binary::*;
+use crate::binary::rabitq_fastscan::{build_sign_lut, pack_rabitq_blocked, SignScanQuery};
 use crate::binary::rotator::{RaBitQRotator, RotatorKind};
+use crate::binary::turboquant::pack::BlockedCodes;
 use crate::prelude::*;
 use crate::utils::k_means_utils::*;
 
@@ -298,6 +300,44 @@ where
         self.finish_query(&q_c_rotated, dist_to_centroid)
     }
 
+    /// Prepare an already-rotated query for the fast-scan path
+    ///
+    /// Same residual as
+    /// [`encode_query_prerotated`](Self::encode_query_prerotated), but turned
+    /// into a nibble table instead of int4 bit-planes.
+    ///
+    /// ### Params
+    ///
+    /// * `q_rot` - The rotated, metric-normalised query
+    /// * `c_rot` - The rotated centroid of the target cluster
+    ///
+    /// ### Returns
+    ///
+    /// The prepared query, or an error if the table cannot be built
+    #[inline]
+    pub fn encode_query_fastscan(
+        &self,
+        q_rot: &[T],
+        c_rot: &[T],
+    ) -> Result<SignScanQuery<T>, AnnSearchErrors> {
+        debug_assert_eq!(q_rot.len(), self.padded_dim);
+        debug_assert_eq!(c_rot.len(), self.padded_dim);
+
+        let res_rot = T::subtract_simd(q_rot, c_rot);
+        let dist_to_centroid = compute_l2_norm(&res_rot);
+
+        let q_c_rotated: Vec<T> = if dist_to_centroid > T::epsilon() {
+            res_rot.iter().map(|&r| r / dist_to_centroid).collect()
+        } else {
+            vec![T::zero(); self.padded_dim]
+        };
+
+        Ok(SignScanQuery {
+            lut: build_sign_lut(&q_c_rotated)?,
+            dist_to_centroid,
+        })
+    }
+
     /// Quantise a rotated unit residual into the int4 query representation
     ///
     /// Shared tail of [`encode_query`](Self::encode_query) and
@@ -434,6 +474,16 @@ pub struct RaBitQStorage<T> {
     pub vector_indices: Vec<usize>,
     /// Cluster boundaries, len = nlist + 1
     pub offsets: Vec<usize>,
+    /// Per-cluster blocked copy of `binary_codes` for the fast-scan path, one
+    /// entry per cluster.
+    ///
+    /// Skipped by serde and rebuilt in `load_aux`: the blocked byte order is
+    /// architecture-specific (x86 interleaves nibble pairs, aarch64 keeps
+    /// natural lane order), so deriving it on the loading machine is what keeps
+    /// a saved index portable. It is a permutation of `binary_codes`, not extra
+    /// information.
+    #[cfg_attr(feature = "serialise", serde(skip))]
+    pub blocked: Vec<BlockedCodes>,
     /// Number of lists
     pub nlist: usize,
     /// Number of dimensions
@@ -467,11 +517,44 @@ impl<T: Float + FromPrimitive + Clone> RaBitQStorage<T> {
             packed_vectors: Vec::with_capacity(n),
             vector_indices: Vec::with_capacity(n),
             offsets: vec![0; nlist + 1],
+            blocked: Vec::new(),
             nlist,
             dim,
             padded_dim,
             n_bytes,
         }
+    }
+
+    /// Rebuild the per-cluster blocked code layout from `binary_codes`
+    ///
+    /// Idempotent, and the only way `blocked` is ever populated: it is derived
+    /// state, so it is built here after a fresh encode and again after a load.
+    pub fn rebuild_blocked(&mut self) {
+        let n_bytes = self.n_bytes;
+        self.blocked = (0..self.nlist)
+            .map(|c| {
+                let (start, end) = (self.offsets[c], self.offsets[c + 1]);
+                pack_rabitq_blocked(
+                    &self.binary_codes[start * n_bytes..end * n_bytes],
+                    end - start,
+                    n_bytes,
+                )
+            })
+            .collect();
+    }
+
+    /// Blocked codes for one cluster
+    ///
+    /// ### Params
+    ///
+    /// * `cluster_idx` Index position of the cluster
+    ///
+    /// ### Returns
+    ///
+    /// The cluster's fast-scan layout
+    #[inline]
+    pub fn cluster_blocked(&self, cluster_idx: usize) -> &BlockedCodes {
+        &self.blocked[cluster_idx]
     }
 
     /// Get centroid for cluster
@@ -748,6 +831,7 @@ where
         ],
         vector_indices: vec![0usize; n],
         offsets: offsets.clone(),
+        blocked: Vec::new(),
         nlist,
         dim,
         padded_dim,
@@ -777,6 +861,8 @@ where
 
         storage.vector_indices[pos] = vec_idx;
     }
+
+    storage.rebuild_blocked();
 
     Ok(storage)
 }

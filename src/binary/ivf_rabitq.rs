@@ -791,6 +791,7 @@ where
             meta.check(self.n, self.storage.dim)?;
         }
         self.vector_store = MmapVectorStore::open_in_dir(dir, self.store_meta)?;
+        self.storage.rebuild_blocked();
 
         Ok(())
     }

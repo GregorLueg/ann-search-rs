@@ -484,6 +484,7 @@ where
             meta.check(self.n, self.quantiser.encoder.dim)?;
         }
         self.vector_store = MmapVectorStore::open_in_dir(dir, self.store_meta)?;
+        self.quantiser.storage.rebuild_blocked();
 
         Ok(())
     }

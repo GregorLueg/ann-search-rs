@@ -266,7 +266,12 @@ fn repack_3bit(packed_codes: &[u8], n_vectors: usize, dim: usize) -> BlockedCode
 ///
 /// Blocked byte array with shape `n_blocks × n_byte_groups × BLOCK`.
 #[cfg(target_arch = "x86_64")]
-fn pack_blocked(n: usize, n_blocks: usize, n_byte_groups: usize, codes_flat: &[u8]) -> Vec<u8> {
+pub(crate) fn pack_blocked(
+    n: usize,
+    n_blocks: usize,
+    n_byte_groups: usize,
+    codes_flat: &[u8],
+) -> Vec<u8> {
     // FAISS perm0 layout: split each byte into hi/lo nibbles, interleave
     // pairs of vectors `(perm0[j], perm0[j] + 16)` so AVX2/AVX-512 cross-
     // lane behaviour aligns with the lookup.
@@ -318,7 +323,12 @@ fn pack_blocked(n: usize, n_blocks: usize, n_byte_groups: usize, codes_flat: &[u
 ///
 /// Blocked byte array with shape `n_blocks × n_byte_groups × BLOCK`.
 #[cfg(not(target_arch = "x86_64"))]
-fn pack_blocked(n: usize, n_blocks: usize, n_byte_groups: usize, codes_flat: &[u8]) -> Vec<u8> {
+pub(crate) fn pack_blocked(
+    n: usize,
+    n_blocks: usize,
+    n_byte_groups: usize,
+    codes_flat: &[u8],
+) -> Vec<u8> {
     // Sequential layout: each code byte stored as-is, vectors in order.
     // Fits NEON's per-lane loads and the scalar fallback.
     let blocked_size = n_blocks * n_byte_groups * BLOCK;
