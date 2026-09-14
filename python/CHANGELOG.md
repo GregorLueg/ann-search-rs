@@ -9,6 +9,7 @@ Requires `ann-search-rs` 0.9.0.
 
 - Takes in the RaBitQ rework: a fast Hadamard rotation and fast-scan distance
   estimation. RaBitQ indices saved with an earlier version cannot be loaded.
+- The new quantised graph index is Rust-side only for now; no bindings yet.
 
 ## 0.2.4
 

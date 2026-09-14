@@ -24,6 +24,15 @@ own changelog at [`python/CHANGELOG.md`](python/CHANGELOG.md).
 
 **Features**
 
+- New quantised graph index (`QgIndex`, `build_qg_index` / `query_qg_index` /
+  `query_qg_self`), after SymphonyQG. A Vamana graph where every vertex also
+  carries its own neighbours' one-bit RaBitQ codes, quantised against that
+  vertex and laid out so one hop estimates all of them with a single SIMD
+  sweep. Exact distances are computed only for the vertices the walk pops,
+  which is also the anchor the estimates need, so there is no re-ranking stage.
+  It is the fastest index in the crate at high recall and it costs roughly two
+  to three times the memory of the raw vectors, since each code is stored once
+  per in-edge. Build time is Vamana's.
 - RaBitQ gained a fast Hadamard plus Kac-walk rotation, selected automatically
   from 192 dimensions up. It replaces a dense `dim x dim` matvec per vector with
   an `O(dim log dim)` transform and shrinks the stored rotation from `dim^2`
