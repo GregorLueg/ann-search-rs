@@ -182,6 +182,10 @@ required-features = ["binary"]
 name = "gridsearch_tq"
 required-features = ["binary"]
 
+[[example]]
+name = "profile_qg"
+required-features = ["binary"]
+
 ##################
 # Other examples #
 ##################
