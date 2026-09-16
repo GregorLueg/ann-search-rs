@@ -62,7 +62,7 @@ use crate::binary::rabitq::RaBitQEncoder;
 use crate::binary::rabitq::fastscan::{
     build_sign_lut, pack_rabitq_blocked, score_sign_block, unpack_rabitq_blocked, BLOCKED_ARCH,
 };
-use crate::binary::rotator::RotatorKind;
+use crate::binary::rabitq::rotator::RotatorKind;
 use crate::binary::turboquant::pack::BLOCK;
 use crate::cpu::vamana::{VamanaIndex, VamanaState};
 use crate::prelude::*;

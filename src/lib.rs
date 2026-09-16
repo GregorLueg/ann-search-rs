@@ -79,7 +79,7 @@ use faer_traits::ComplexField;
 #[cfg(feature = "binary")]
 use crate::binary::{
     exhaustive_binary::*, exhaustive_rabitq::*, exhaustive_tq::*, ivf_binary::*, ivf_rabitq::*,
-    ivf_tq::*, qg::*, rotator::RotatorKind,
+    ivf_tq::*, qg::*, rabitq::rotator::RotatorKind,
 };
 #[cfg(feature = "gpu")]
 use crate::gpu::{exhaustive_gpu::*, ivf_gpu::*};

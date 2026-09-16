@@ -12,7 +12,7 @@ use crate::binary::dist_binary::*;
 use crate::binary::rabitq::fastscan::{
     build_sign_lut, pack_rabitq_blocked, unpack_rabitq_blocked, SignScanQuery, BLOCKED_ARCH,
 };
-use crate::binary::rotator::{RaBitQRotator, RotatorKind};
+use crate::binary::rabitq::rotator::{RaBitQRotator, RotatorKind};
 use crate::binary::turboquant::pack::BlockedCodes;
 use crate::prelude::*;
 use crate::utils::k_means_utils::*;
@@ -39,7 +39,7 @@ pub struct RaBitQEncoder<T> {
     /// Dimensions of the encode
     pub dim: usize,
     /// Working dimensionality after rotation. Equal to `dim` for the dense
-    /// rotation, rounded up to [`ROTATOR_PAD`](crate::binary::rotator::ROTATOR_PAD)
+    /// rotation, rounded up to [`ROTATOR_PAD`](crate::binary::rabitq::rotator::ROTATOR_PAD)
     /// for the Hadamard one, so every
     /// post-rotation loop runs over this and not over `dim`.
     pub padded_dim: usize,
@@ -751,7 +751,7 @@ where
     /// * `n_clusters` - Optional number of centroids. If not provided, defaults
     ///   to `0.5 * sqrt(n)`.
     /// * `rotator_kind` - Which rotation to encode with, or `None` to let
-    ///   [`resolve_rotator_kind`](crate::binary::rotator::resolve_rotator_kind)
+    ///   [`resolve_rotator_kind`](crate::binary::rabitq::rotator::resolve_rotator_kind)
     ///   decide
     /// * `seed` - Seed for reproducibility
     ///
