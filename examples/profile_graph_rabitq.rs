@@ -1,14 +1,17 @@
-//! Profile the quantised graph index: lane occupancy first, then build and query.
+//! Profile the two graph indices that screen neighbours with RaBitQ codes.
 //!
-//! The fast-scan sweep scores a fixed batch of lanes whether or not they hold a
-//! neighbour, so a vertex Vamana left under-full pays full price for a partly
-//! empty sweep. `occupancy` reports how many lanes are actually occupied, which
-//! is the ceiling on what any degree-completion step can return. `build` and
-//! `query` are the usual timing modes.
+//! `--index qg` is the quantised graph, which stores a code per edge and sweeps
+//! a fixed batch of fast-scan lanes per hop. `--index hnsw-rabitq` stores a code
+//! per vertex against a cluster centroid, so the codes do not grow with the
+//! degree. `--mode frontier` traces recall against microseconds per query,
+//! which is the only fair way to compare them; `occupancy` reports how many of
+//! the quantised graph's sweep lanes actually hold a neighbour.
 //!
 //! ```bash
-//! cargo run --release --features binary --example profile_qg -- --mode occupancy
-//! cargo run --release --features binary --example profile_qg -- --mode query
+//! cargo run --release --features binary --example profile_graph_rabitq -- --mode occupancy
+//! cargo run --release --features binary --example profile_graph_rabitq -- --mode frontier
+//! cargo run --release --features binary --example profile_graph_rabitq -- \
+//!     --index hnsw-rabitq --mode frontier --dim 128 --data lowrank
 //! ```
 
 mod commons;
@@ -16,9 +19,11 @@ mod commons;
 use std::time::Instant;
 
 use ann_search_rs::{
-    build_exhaustive_index, build_qg_index, build_vamana_index, query_exhaustive_index,
-    query_qg_index,
+    build_exhaustive_index, build_hnsw_rabitq_index, build_qg_index, build_vamana_index,
+    query_exhaustive_index, query_hnsw_rabitq_index, query_qg_index,
 };
+use ann_search_rs::binary::hnsw_rabitq::HnswRaBitQIndex;
+use ann_search_rs::binary::qg::QgIndex;
 use clap::Parser;
 use commons::*;
 use thousands::*;
@@ -45,6 +50,10 @@ const DEFAULT_EF_SWEEP: &str = "16,32,64,100,150,200,300,400,600,800";
 #[derive(Parser, Debug)]
 #[command(about = "Quantised graph occupancy, build and query profile")]
 struct Cli {
+    /// Which index to profile: qg or hnsw-rabitq
+    #[arg(long, default_value = "qg")]
+    index: String,
+
     /// What to profile: occupancy, build, query or frontier
     #[arg(long, default_value = "occupancy")]
     mode: String,
@@ -84,6 +93,14 @@ struct Cli {
     /// Beam width during construction
     #[arg(long, default_value_t = 128)]
     l_build: usize,
+
+    /// HNSW connectivity for `--index hnsw-rabitq`; layer 0 gets `2 * m` slots
+    #[arg(long, default_value_t = 16)]
+    m: usize,
+
+    /// Centroids the per-vertex codes are taken against, `None` picks sqrt(n)
+    #[arg(long)]
+    nlist: Option<usize>,
 
     /// Beam width for Vamana's first pass, `None` picks the default
     #[arg(long)]
@@ -236,6 +253,106 @@ fn report_occupancy(graph: &[u32], n: usize, degree: usize) {
     println!();
 }
 
+/// The index under profile.
+///
+/// Both answer the same `(k, ef_search)` question, so the profiler only needs
+/// to know which one to build and how to ask it.
+enum GraphIndex {
+    /// Quantised graph, one code per edge
+    Qg(Box<QgIndex<f32>>),
+    /// HNSW, one code per vertex
+    HnswRaBitQ(Box<HnswRaBitQIndex<f32>>),
+}
+
+impl GraphIndex {
+    /// Build whichever index `--index` named.
+    ///
+    /// ### Params
+    ///
+    /// * `flat` - Row-major data
+    /// * `n` - Number of rows
+    /// * `dim` - Row width
+    /// * `cli` - Parsed command line
+    ///
+    /// ### Returns
+    ///
+    /// The built index
+    fn build(flat: &[f32], n: usize, dim: usize, cli: &Cli) -> Self {
+        match cli.index.as_str() {
+            "qg" => Self::Qg(Box::new(
+                build_qg_index(
+                    (flat, n, dim),
+                    cli.degree,
+                    cli.l_build,
+                    cli.l_build_pass1,
+                    cli.alpha_pass1,
+                    cli.alpha_pass2,
+                    &cli.distance,
+                    cli.seed as usize,
+                )
+                .expect("qg build failed"),
+            )),
+            "hnsw-rabitq" | "hnsw_rabitq" => Self::HnswRaBitQ(Box::new(
+                build_hnsw_rabitq_index(
+                    (flat, n, dim),
+                    cli.m,
+                    cli.l_build,
+                    cli.nlist,
+                    None,
+                    &cli.distance,
+                    cli.seed as usize,
+                    false,
+                )
+                .expect("hnsw-rabitq build failed"),
+            )),
+            other => panic!("unknown --index '{other}', expected qg or hnsw-rabitq"),
+        }
+    }
+
+    /// Bytes the index holds, in megabytes.
+    ///
+    /// ### Returns
+    ///
+    /// Memory usage in MB
+    fn memory_mb(&self) -> f64 {
+        let bytes = match self {
+            Self::Qg(i) => i.memory_usage_bytes(),
+            Self::HnswRaBitQ(i) => i.memory_usage_bytes(),
+        };
+        bytes as f64 / (1024.0 * 1024.0)
+    }
+
+    /// Query every probe row.
+    ///
+    /// ### Params
+    ///
+    /// * `queries` - Row-major probe rows
+    /// * `n_probes` - Number of probe rows
+    /// * `dim` - Row width
+    /// * `k` - Number of neighbours to return
+    /// * `ef` - Beam width
+    ///
+    /// ### Returns
+    ///
+    /// The neighbours of each probe
+    fn query(
+        &self,
+        queries: &[f32],
+        n_probes: usize,
+        dim: usize,
+        k: usize,
+        ef: usize,
+    ) -> Vec<Vec<usize>> {
+        let mat = (queries, n_probes, dim);
+        let (res, _) = match self {
+            Self::Qg(i) => query_qg_index(mat, i, k, ef, false, false),
+            Self::HnswRaBitQ(i) => query_hnsw_rabitq_index(mat, i, k, ef, false, false),
+        }
+        .expect("query failed");
+        res
+    }
+}
+
 /// Pick a strided probe set and its exhaustive ground truth.
 ///
 /// ### Params
@@ -332,22 +449,9 @@ fn main() {
     }
 
     let start = Instant::now();
-    let index = build_qg_index(
-        (&flat[..], n, dim),
-        cli.degree,
-        cli.l_build,
-        cli.l_build_pass1,
-        cli.alpha_pass1,
-        cli.alpha_pass2,
-        &cli.distance,
-        cli.seed as usize,
-    )
-    .expect("qg build failed");
+    let index = GraphIndex::build(&flat, n, dim, &cli);
     println!("Build: {:.2?}", start.elapsed());
-    println!(
-        "Index size: {:.1} MB",
-        index.memory_usage_bytes() as f64 / (1024.0 * 1024.0)
-    );
+    println!("Index size: {:.1} MB", index.memory_mb());
 
     if cli.mode == "build" {
         return;
@@ -362,15 +466,7 @@ fn main() {
             let mut found = Vec::new();
             for _ in 0..cli.query_repeats.max(1) {
                 let start = Instant::now();
-                let (res, _) = query_qg_index(
-                    (&queries[..], n_probes, dim),
-                    &index,
-                    cli.k,
-                    ef,
-                    false,
-                    false,
-                )
-                .expect("qg query failed");
+                let res = index.query(&queries, n_probes, dim, cli.k, ef);
                 let micros = start.elapsed().as_secs_f64() * 1e6 / n_probes as f64;
                 best = best.min(micros);
                 found = res;
@@ -384,15 +480,7 @@ fn main() {
     let mut found = Vec::new();
     for _ in 0..cli.query_repeats.max(1) {
         let start = Instant::now();
-        let (res, _) = query_qg_index(
-            (&queries[..], n_probes, dim),
-            &index,
-            cli.k,
-            cli.ef_search,
-            false,
-            false,
-        )
-        .expect("qg query failed");
+        let res = index.query(&queries, n_probes, dim, cli.k, cli.ef_search);
         let micros = start.elapsed().as_secs_f64() * 1e6 / n_probes as f64;
         best = best.min(micros);
         found = res;

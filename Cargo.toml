@@ -183,7 +183,7 @@ name = "gridsearch_tq"
 required-features = ["binary"]
 
 [[example]]
-name = "profile_qg"
+name = "profile_graph_rabitq"
 required-features = ["binary"]
 
 ##################
