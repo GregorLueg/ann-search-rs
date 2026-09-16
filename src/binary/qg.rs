@@ -120,10 +120,14 @@ pub struct QgIndex<T> {
     edges: Vec<u32>,
     /// Neighbour codes, `n * n_batches` blocks of `n_bytes * QG_BATCH` bytes
     codes: Vec<u8>,
-    /// Per-slot additive term, `n * degree`
-    f_add: Vec<T>,
-    /// Per-slot multiplier on the table score, `n * degree`
-    f_rescale: Vec<T>,
+    /// Per-slot estimator factors, `n * n_batches` blocks of `2 * QG_BATCH`.
+    ///
+    /// Each block holds the batch's [`QG_BATCH`] additive terms followed by its
+    /// [`QG_BATCH`] multipliers. One interleaved array rather than two parallel
+    /// ones: the walk reads both for every lane it scores, and on a graph whose
+    /// working set is far past cache, a hop chasing two scattered regions costs
+    /// more than the same bytes read contiguously.
+    factors: Vec<T>,
     /// The [`BLOCKED_ARCH`] tag `codes` was packed with
     blocked_arch: u8,
     /// Where every walk starts, the graph's medoid
@@ -357,8 +361,7 @@ where
         let n_batches = degree / QG_BATCH;
 
         let mut codes = vec![0u8; n * n_batches * n_bytes * QG_BATCH];
-        let mut f_add = vec![T::zero(); n * degree];
-        let mut f_rescale = vec![T::zero(); n * degree];
+        let mut factors = vec![T::zero(); n * degree * 2];
 
         let block_bytes = n_bytes * QG_BATCH;
         let two = T::one() + T::one();
@@ -378,11 +381,10 @@ where
 
         codes
             .par_chunks_mut(n_batches * block_bytes)
-            .zip(f_add.par_chunks_mut(degree))
-            .zip(f_rescale.par_chunks_mut(degree))
+            .zip(factors.par_chunks_mut(degree * 2))
             .enumerate()
             .try_for_each(
-                |(node, ((code_block, add_block), rescale_block))| -> Result<(), AnnSearchErrors> {
+                |(node, (code_block, factor_block))| -> Result<(), AnnSearchErrors> {
                     let centre_rot = &rotated[node * padded_dim..(node + 1) * padded_dim];
                     let slots = &edges[node * degree..(node + 1) * degree];
 
@@ -390,12 +392,17 @@ where
                     let mut res = vec![T::zero(); padded_dim];
 
                     for (slot, &nb) in slots.iter().enumerate() {
+                        // Interleaved layout: the batch's additive terms come
+                        // first, then its multipliers.
+                        let base = (slot / QG_BATCH) * 2 * QG_BATCH;
+                        let lane = slot % QG_BATCH;
+
                         if nb == SENTINEL {
                             // An empty lane must never win. Zero scale makes
                             // the table score irrelevant and the infinity keeps
                             // it out of the beam whatever the exact term is.
-                            add_block[slot] = T::infinity();
-                            rescale_block[slot] = T::zero();
+                            factor_block[base + lane] = T::infinity();
+                            factor_block[base + QG_BATCH + lane] = T::zero();
                             continue;
                         }
 
@@ -409,8 +416,9 @@ where
                         let (v_dist, dot_correction_inv) = encode_rotated_residual(&res, code);
 
                         let rescale = (two * v_dist * dot_correction_inv).neg();
-                        rescale_block[slot] = rescale;
-                        add_block[slot] = v_dist * v_dist - rescale * signed_dot(code, centre_rot);
+                        factor_block[base + QG_BATCH + lane] = rescale;
+                        factor_block[base + lane] =
+                            v_dist * v_dist - rescale * signed_dot(code, centre_rot);
                     }
 
                     for b in 0..n_batches {
@@ -433,8 +441,7 @@ where
             encoder,
             edges,
             codes,
-            f_add,
-            f_rescale,
+            factors,
             blocked_arch: BLOCKED_ARCH,
             entry_point,
             degree,
@@ -555,21 +562,25 @@ where
                 let threshold = state.results.threshold();
 
                 let slots = &self.edges[node * self.degree..(node + 1) * self.degree];
-                let add = &self.f_add[node * self.degree..(node + 1) * self.degree];
-                let rescale = &self.f_rescale[node * self.degree..(node + 1) * self.degree];
+                let factors =
+                    &self.factors[node * self.degree * 2..(node + 1) * self.degree * 2];
 
                 for b in 0..self.n_batches {
                     score_sign_block(&lut, &self.codes, node * self.n_batches + b, &mut lanes);
 
+                    let add = &factors[b * 2 * QG_BATCH..b * 2 * QG_BATCH + QG_BATCH];
+                    let rescale =
+                        &factors[b * 2 * QG_BATCH + QG_BATCH..(b + 1) * 2 * QG_BATCH];
+                    let ids = &slots[b * QG_BATCH..(b + 1) * QG_BATCH];
+
                     for lane in 0..QG_BATCH {
-                        let slot = b * QG_BATCH + lane;
-                        let nb = slots[slot];
+                        let nb = ids[lane];
                         if nb == SENTINEL {
                             continue;
                         }
 
                         let est =
-                            add[slot] + g_add + rescale[slot] * T::from_f32(lanes[lane]).unwrap();
+                            add[lane] + g_add + rescale[lane] * T::from_f32(lanes[lane]).unwrap();
 
                         if est < threshold && !state.is_visited(nb as usize) {
                             state
@@ -734,8 +745,7 @@ where
             + self.encoder.memory_usage_bytes()
             + self.edges.capacity() * std::mem::size_of::<u32>()
             + self.codes.capacity()
-            + self.f_add.capacity() * std::mem::size_of::<T>()
-            + self.f_rescale.capacity() * std::mem::size_of::<T>()
+            + self.factors.capacity() * std::mem::size_of::<T>()
             + self.original_ids.capacity() * std::mem::size_of::<usize>()
     }
 }
