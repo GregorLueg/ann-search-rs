@@ -175,7 +175,7 @@ fn main() {
     let ef_construction = 200;
 
     for m in [16usize, 32] {
-        for ex_bits in [0usize, 3, 5] {
+        for ex_bits in [1usize, 3, 5, 8] {
             println!(
                 "Building HNSW-RaBitQ index (m={}, ef_c={}, ex_bits={})...",
                 m, ef_construction, ex_bits
