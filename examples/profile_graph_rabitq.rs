@@ -1,29 +1,25 @@
-//! Profile the two graph indices that screen neighbours with RaBitQ codes.
+//! Profile the graph indices that screen neighbours with RaBitQ codes.
 //!
 //! `--index qg` is the quantised graph, which stores a code per edge and sweeps
-//! a fixed batch of fast-scan lanes per hop. `--index hnsw-rabitq` stores a code
-//! per vertex against a cluster centroid, so the codes do not grow with the
-//! degree. `--mode frontier` traces recall against microseconds per query,
-//! which is the only fair way to compare them; `occupancy` reports how many of
-//! the quantised graph's sweep lanes actually hold a neighbour.
+//! a fixed batch of fast-scan lanes per hop. `--mode frontier` traces recall
+//! against microseconds per query, which is the only fair way to compare two
+//! indices; `occupancy` reports how many of the quantised graph's sweep lanes
+//! actually hold a neighbour.
 //!
 //! ```bash
 //! cargo run --release --features binary --example profile_graph_rabitq -- --mode occupancy
 //! cargo run --release --features binary --example profile_graph_rabitq -- --mode frontier
-//! cargo run --release --features binary --example profile_graph_rabitq -- \
-//!     --index hnsw-rabitq --mode frontier --dim 128 --data lowrank
 //! ```
 
 mod commons;
 
 use std::time::Instant;
 
-use ann_search_rs::{
-    build_exhaustive_index, build_hnsw_rabitq_index, build_qg_index, build_vamana_index,
-    query_exhaustive_index, query_hnsw_rabitq_index, query_qg_index,
-};
-use ann_search_rs::binary::hnsw_rabitq::HnswRaBitQIndex;
 use ann_search_rs::binary::qg::QgIndex;
+use ann_search_rs::{
+    build_exhaustive_index, build_qg_index, build_vamana_index, query_exhaustive_index,
+    query_qg_index,
+};
 use clap::Parser;
 use commons::*;
 use thousands::*;
@@ -50,7 +46,7 @@ const DEFAULT_EF_SWEEP: &str = "16,32,64,100,150,200,300,400,600,800";
 #[derive(Parser, Debug)]
 #[command(about = "Quantised graph occupancy, build and query profile")]
 struct Cli {
-    /// Which index to profile: qg or hnsw-rabitq
+    /// Which index to profile: qg
     #[arg(long, default_value = "qg")]
     index: String,
 
@@ -94,13 +90,6 @@ struct Cli {
     #[arg(long, default_value_t = 128)]
     l_build: usize,
 
-    /// HNSW connectivity for `--index hnsw-rabitq`; layer 0 gets `2 * m` slots
-    #[arg(long, default_value_t = 16)]
-    m: usize,
-
-    /// Centroids the per-vertex codes are taken against, `None` picks sqrt(n)
-    #[arg(long)]
-    nlist: Option<usize>,
 
     /// Beam width for Vamana's first pass, `None` picks the default
     #[arg(long)]
@@ -260,8 +249,6 @@ fn report_occupancy(graph: &[u32], n: usize, degree: usize) {
 enum GraphIndex {
     /// Quantised graph, one code per edge
     Qg(Box<QgIndex<f32>>),
-    /// HNSW, one code per vertex
-    HnswRaBitQ(Box<HnswRaBitQIndex<f32>>),
 }
 
 impl GraphIndex {
@@ -292,20 +279,7 @@ impl GraphIndex {
                 )
                 .expect("qg build failed"),
             )),
-            "hnsw-rabitq" | "hnsw_rabitq" => Self::HnswRaBitQ(Box::new(
-                build_hnsw_rabitq_index(
-                    (flat, n, dim),
-                    cli.m,
-                    cli.l_build,
-                    cli.nlist,
-                    None,
-                    &cli.distance,
-                    cli.seed as usize,
-                    false,
-                )
-                .expect("hnsw-rabitq build failed"),
-            )),
-            other => panic!("unknown --index '{other}', expected qg or hnsw-rabitq"),
+            other => panic!("unknown --index '{other}', expected qg"),
         }
     }
 
@@ -317,7 +291,6 @@ impl GraphIndex {
     fn memory_mb(&self) -> f64 {
         let bytes = match self {
             Self::Qg(i) => i.memory_usage_bytes(),
-            Self::HnswRaBitQ(i) => i.memory_usage_bytes(),
         };
         bytes as f64 / (1024.0 * 1024.0)
     }
@@ -346,7 +319,6 @@ impl GraphIndex {
         let mat = (queries, n_probes, dim);
         let (res, _) = match self {
             Self::Qg(i) => query_qg_index(mat, i, k, ef, false, false),
-            Self::HnswRaBitQ(i) => query_hnsw_rabitq_index(mat, i, k, ef, false, false),
         }
         .expect("query failed");
         res
