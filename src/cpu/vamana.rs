@@ -628,11 +628,17 @@ where
 
     /// Beam search used specifically during the index construction phase.
     ///
-    /// Walks the graph from `entry_node`, keeping the best `l_build` nodes seen
-    /// in a single bounded sorted beam that doubles as the frontier. Leaves the
-    /// candidate set in `state.scratch_working`, ascending by distance; the
-    /// caller appends the target's current out-edges and `robust_prune` sorts
-    /// the combined pool once.
+    /// Walks the graph from `entry_node` on a bounded sorted beam of width
+    /// `l_build` that doubles as the frontier, and leaves **every visited node**
+    /// in `state.scratch_working` for the caller to prune over.
+    ///
+    /// The pool is the visited set rather than the beam, as in DiskANN. The
+    /// beam holds the `l_build` nearest, which are exactly the candidates the
+    /// prune occludes; the long-range nodes the descent passed through are what
+    /// fills the degree, and a wider beam evicts them. Pruning over the beam
+    /// therefore made a *higher* `l_build` produce a *less* navigable graph,
+    /// which shows up on data with thin low-density structure between dense
+    /// regions.
     ///
     /// ### Params
     ///
@@ -653,9 +659,11 @@ where
         state.beam.reset(l_build);
 
         state.mark_visited(entry_node);
+        let entry_dist = self.distance(target_node, entry_node);
+        state.beam.insert(entry_dist, entry_node as u32);
         state
-            .beam
-            .insert(self.distance(target_node, entry_node), entry_node as u32);
+            .scratch_working
+            .push((OrderedFloat(entry_dist), entry_node));
 
         while let Some((_, current_id)) = state.beam.next_unexpanded() {
             let neighbours = unsafe { build_graph.get_neighbours_slice(current_id as usize) };
@@ -682,6 +690,7 @@ where
                     let dists = self.node_distances_4_gathered(target_node, buf, self.metric);
                     for k in 0..4 {
                         state.beam.insert(dists[k], buf[k] as u32);
+                        state.scratch_working.push((OrderedFloat(dists[k]), buf[k]));
                     }
                     buffered = 0;
                 }
@@ -690,16 +699,9 @@ where
             for k in 0..buffered {
                 let dist = self.distance(target_node, buf[k]);
                 state.beam.insert(dist, buf[k] as u32);
+                state.scratch_working.push((OrderedFloat(dist), buf[k]));
             }
         }
-
-        let SearchState {
-            beam,
-            scratch_working,
-            ..
-        } = state;
-        scratch_working.clear();
-        scratch_working.extend(beam.iter().map(|(d, id)| (OrderedFloat(d), id as usize)));
     }
 
     /// Selects up to `max_degree` neighbours from a candidate pool using the
@@ -744,28 +746,43 @@ where
             }
             previous = cand_id;
 
-            // Hoisted out of the pairwise loop: the candidate row and its norm
-            // are the same for every already-selected neighbour it is tested
-            // against.
-            let vec_cand = &self.vectors_flat[cand_id * dim..cand_id * dim + dim];
-            let norm_cand = if has_norms {
-                self.norms[cand_id]
-            } else {
-                T::one()
-            };
-
-            let is_good = !selected.iter().any(|&sel_id| {
-                let sel = sel_id as usize;
-                let vec_sel = &self.vectors_flat[sel * dim..sel * dim + dim];
-                let dist_to_selected = match self.metric {
-                    Dist::SquaredEuclidean => T::euclidean_simd(vec_cand, vec_sel),
-                    Dist::Manhattan => T::manhattan_simd(vec_cand, vec_sel),
-                    Dist::Cosine => {
-                        T::one() - (T::dot_simd(vec_cand, vec_sel) / (norm_cand * self.norms[sel]))
-                    }
-                };
-                alpha_t * dist_to_selected <= cand_dist.0
+            // Four gathered rows at a time: the occlusion test is the build's
+            // dominant cost and the rows are random reads out of a store far
+            // larger than L2, so the loads overlap instead of serialising. The
+            // first chunk holding an occluder still short-circuits the rest.
+            let occluded = selected.chunks_exact(4).any(|chunk| {
+                let ids = [
+                    chunk[0] as usize,
+                    chunk[1] as usize,
+                    chunk[2] as usize,
+                    chunk[3] as usize,
+                ];
+                self.node_distances_4_gathered(cand_id, ids, self.metric)
+                    .iter()
+                    .any(|&d| alpha_t * d <= cand_dist.0)
             });
+
+            let tail = selected.len() - selected.len() % 4;
+            let is_good = !occluded
+                && !selected[tail..].iter().any(|&sel_id| {
+                    let sel = sel_id as usize;
+                    let vec_cand = &self.vectors_flat[cand_id * dim..cand_id * dim + dim];
+                    let vec_sel = &self.vectors_flat[sel * dim..sel * dim + dim];
+                    let dist_to_selected = match self.metric {
+                        Dist::SquaredEuclidean => T::euclidean_simd(vec_cand, vec_sel),
+                        Dist::Manhattan => T::manhattan_simd(vec_cand, vec_sel),
+                        Dist::Cosine => {
+                            let norm_cand = if has_norms {
+                                self.norms[cand_id]
+                            } else {
+                                T::one()
+                            };
+                            T::one()
+                                - (T::dot_simd(vec_cand, vec_sel) / (norm_cand * self.norms[sel]))
+                        }
+                    };
+                    alpha_t * dist_to_selected <= cand_dist.0
+                });
 
             if is_good {
                 selected.push(cand_id as u32);
@@ -1235,6 +1252,40 @@ mod tests {
         let expected: Vec<usize> = (0..5).collect();
         let found = indices.iter().filter(|&&i| expected.contains(&i)).count();
         assert!(found >= 4, "Expected at least 4 of top-5, got {}", found);
+    }
+
+    #[test]
+    fn test_prune_pool_reaches_past_the_beam() {
+        // What the prune sees has to be the visited set, not the beam. The beam
+        // holds the `l_build` nearest, which are the candidates the alpha rule
+        // occludes; the long edges come from everything else the walk touched,
+        // and pruning over the beam alone made a wider `l_build` give a less
+        // navigable graph.
+        let (n, dim, r, l_build) = (500usize, 8usize, 32usize, 16usize);
+
+        let mut state_rng = 0x9E37_79B9_7F4A_7C15u64;
+        let mat = Mat::from_fn(n, dim, |_, _| {
+            state_rng ^= state_rng << 13;
+            state_rng ^= state_rng >> 7;
+            state_rng ^= state_rng << 17;
+            (state_rng >> 11) as f32 / (1u64 << 53) as f32 - 0.5
+        });
+
+        let index = build_default(&mat, "euclidean");
+        let graph = VamanaConstructionGraph::new(n, r, 4);
+        graph.initialise_random(7);
+
+        VamanaIndex::<f32>::with_build_state(|cell| {
+            let mut state = cell.borrow_mut();
+            index.beam_search_build(3, index.medoid as usize, l_build, &graph, &mut state);
+
+            assert!(
+                state.scratch_working.len() > l_build,
+                "pool held {} candidates, no more than the beam width {l_build}",
+                state.scratch_working.len()
+            );
+            assert!(state.scratch_working.iter().all(|&(_, id)| id < n));
+        });
     }
 
     #[test]
