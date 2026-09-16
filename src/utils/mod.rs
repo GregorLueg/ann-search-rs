@@ -4,6 +4,7 @@
 
 pub mod dist;
 pub mod graph_utils;
+pub mod hnsw_graph;
 pub mod heap_structs;
 pub mod input;
 pub mod k_means_utils;

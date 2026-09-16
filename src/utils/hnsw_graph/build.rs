@@ -13,7 +13,7 @@ use std::time::Instant;
 use thousands::*;
 
 use crate::prelude::*;
-use crate::quantised::hnsw_quantised::flat_graph::*;
+use crate::utils::hnsw_graph::flat_graph::*;
 use crate::utils::graph_utils::*;
 
 ////////////
