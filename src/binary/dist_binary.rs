@@ -4,10 +4,10 @@
 
 use num_traits::{Float, FromPrimitive};
 
-use crate::binary::rabitq::*;
 #[cfg(test)]
 use crate::binary::rabitq::fastscan::unpack_rabitq_blocked;
 use crate::binary::rabitq::fastscan::{score_sign_block, SignScanQuery};
+use crate::binary::rabitq::*;
 #[allow(unused_imports)]
 use crate::prelude::*;
 

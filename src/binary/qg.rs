@@ -58,11 +58,11 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use thousands::*;
 
-use crate::binary::rabitq::RaBitQEncoder;
 use crate::binary::rabitq::fastscan::{
     build_sign_lut, pack_rabitq_blocked, score_sign_block, unpack_rabitq_blocked, BLOCKED_ARCH,
 };
 use crate::binary::rabitq::rotator::RotatorKind;
+use crate::binary::rabitq::RaBitQEncoder;
 use crate::binary::turboquant::pack::BLOCK;
 use crate::cpu::vamana::{VamanaIndex, VamanaState};
 use crate::prelude::*;
@@ -562,15 +562,13 @@ where
                 let threshold = state.results.threshold();
 
                 let slots = &self.edges[node * self.degree..(node + 1) * self.degree];
-                let factors =
-                    &self.factors[node * self.degree * 2..(node + 1) * self.degree * 2];
+                let factors = &self.factors[node * self.degree * 2..(node + 1) * self.degree * 2];
 
                 for b in 0..self.n_batches {
                     score_sign_block(&lut, &self.codes, node * self.n_batches + b, &mut lanes);
 
                     let add = &factors[b * 2 * QG_BATCH..b * 2 * QG_BATCH + QG_BATCH];
-                    let rescale =
-                        &factors[b * 2 * QG_BATCH + QG_BATCH..(b + 1) * 2 * QG_BATCH];
+                    let rescale = &factors[b * 2 * QG_BATCH + QG_BATCH..(b + 1) * 2 * QG_BATCH];
                     let ids = &slots[b * QG_BATCH..(b + 1) * QG_BATCH];
 
                     for lane in 0..QG_BATCH {

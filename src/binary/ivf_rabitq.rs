@@ -15,8 +15,8 @@ use std::sync::Arc;
 use thousands::*;
 
 use crate::binary::dist_binary::*;
-use crate::binary::rabitq::*;
 use crate::binary::rabitq::rotator::RotatorKind;
+use crate::binary::rabitq::*;
 use crate::binary::vec_store::*;
 use crate::prelude::*;
 use crate::utils::k_means_utils::*;

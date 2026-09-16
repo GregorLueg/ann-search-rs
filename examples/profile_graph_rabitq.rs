@@ -23,9 +23,9 @@ use ann_search_rs::{
     build_exhaustive_index, build_qg_index, build_vamana_index, query_exhaustive_index,
     query_qg_index,
 };
-use rayon::prelude::*;
 use clap::Parser;
 use commons::*;
+use rayon::prelude::*;
 use thousands::*;
 
 /// Sentinel Vamana writes into an unused neighbour slot.
@@ -105,7 +105,6 @@ struct Cli {
     /// Beam width during construction
     #[arg(long, default_value_t = 128)]
     l_build: usize,
-
 
     /// Beam width for Vamana's first pass, `None` picks the default
     #[arg(long)]

@@ -13,8 +13,8 @@ use std::time::Instant;
 use thousands::*;
 
 use crate::prelude::*;
-use crate::utils::hnsw_graph::flat_graph::*;
 use crate::utils::graph_utils::*;
+use crate::utils::hnsw_graph::flat_graph::*;
 
 ////////////
 // Consts //

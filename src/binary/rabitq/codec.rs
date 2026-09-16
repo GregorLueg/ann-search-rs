@@ -27,9 +27,9 @@
 
 use rayon::prelude::*;
 
-use crate::binary::rabitq::RaBitQEncoder;
 use crate::binary::rabitq::ex_bits::{encode_ex_bits, excode_bytes, MAX_EX_BITS};
 use crate::binary::rabitq::rotator::RotatorKind;
+use crate::binary::rabitq::RaBitQEncoder;
 use crate::prelude::*;
 use crate::quantised::hnsw_quantised::build::GraphBuildParams;
 use crate::quantised::hnsw_quantised::codec::GraphCodec;
@@ -221,7 +221,8 @@ where
             .try_for_each(
                 |(node, ((sign, ex), factor))| -> Result<(), AnnSearchErrors> {
                     let c = assignments[node];
-                    let rotated = encoder.apply_rotation(&vectors_flat[node * dim..(node + 1) * dim]);
+                    let rotated =
+                        encoder.apply_rotation(&vectors_flat[node * dim..(node + 1) * dim]);
                     let centroid = &centroids_rotated[c * padded_dim..(c + 1) * padded_dim];
 
                     let encoded = encode_ex_bits(&rotated, centroid, ex_bits, None)?;
@@ -665,8 +666,18 @@ mod tests {
     }
 
     fn build(data: &Mat<f32>, metric: Dist, ex_bits: usize) -> HnswRaBitQIndex<f32> {
-        HnswRaBitQIndex::build_rabitq(data.as_ref(), 16, 200, metric, ex_bits, None, None, 42, false)
-            .unwrap()
+        HnswRaBitQIndex::build_rabitq(
+            data.as_ref(),
+            16,
+            200,
+            metric,
+            ex_bits,
+            None,
+            None,
+            42,
+            false,
+        )
+        .unwrap()
     }
 
     fn brute_force(data: &Mat<f32>, query: &[f32], k: usize, metric: Dist) -> Vec<usize> {
@@ -881,9 +892,19 @@ mod tests {
             }
         }
 
-        let codec =
-            RaBitQCodec::encode(&flat, n, dim, Dist::SquaredEuclidean, 7, None, None, None, 42, false)
-                .unwrap();
+        let codec = RaBitQCodec::encode(
+            &flat,
+            n,
+            dim,
+            Dist::SquaredEuclidean,
+            7,
+            None,
+            None,
+            None,
+            42,
+            false,
+        )
+        .unwrap();
 
         let mut worst = 0.0f32;
         for node in (0..n).step_by(37) {

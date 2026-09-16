@@ -88,8 +88,7 @@ where
     ///
     /// The built index
     pub fn from_codec(codec: C, params: &GraphBuildParams) -> Self {
-        let (graph, hierarchy) =
-            Self::build_topology(&codec, params, |a, b| codec.score_sym(a, b));
+        let (graph, hierarchy) = Self::build_topology(&codec, params, |a, b| codec.score_sym(a, b));
         Self::from_parts(codec, graph, hierarchy, params)
     }
 
