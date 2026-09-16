@@ -80,6 +80,12 @@ const CONST_SCALE_PROBES: usize = 100;
 /////////////
 
 /// A multi-bit RaBitQ+ encoding of one vector.
+///
+/// Sign and magnitude are stored apart rather than as one `total_bits` code.
+/// That is not a layout preference: at the widest setting the combined code
+/// needs nine bits, and keeping them apart is also what lets a search score the
+/// cheap sign-only estimate first and reach for the magnitude bits only when
+/// the candidate survives.
 #[cfg_attr(
     feature = "serialise",
     derive(serde::Serialize, serde::Deserialize),
@@ -87,8 +93,11 @@ const CONST_SCALE_PROBES: usize = 100;
 )]
 #[derive(Clone, Debug)]
 pub struct ExEncoding<T> {
-    /// Packed `total_bits` levels, `dim * total_bits / 8` bytes
-    pub code: Vec<u8>,
+    /// One sign bit per coordinate, `dim / 8` bytes, set when the residual is
+    /// positive
+    pub sign_code: Vec<u8>,
+    /// Packed magnitude levels, `dim * ex_bits / 8` bytes, empty at `ex_bits` 0
+    pub ex_code: Vec<u8>,
     /// Query-independent additive term
     pub f_add: T,
     /// Multiplier on the query inner product
@@ -449,7 +458,6 @@ where
     }
 
     let dim = rotated.len();
-    let total_bits = ex_bits + 1;
 
     let residual: Vec<f64> = rotated
         .iter()
@@ -464,7 +472,8 @@ where
     // right answer rather than a degenerate one.
     if l2_sqr == 0.0 {
         return Ok(ExEncoding {
-            code: vec![0u8; excode_bytes(dim, total_bits)],
+            sign_code: vec![0u8; dim / 8],
+            ex_code: vec![0u8; excode_bytes(dim, ex_bits)],
             f_add: T::zero(),
             f_rescale: T::zero(),
             f_error: T::zero(),
@@ -473,7 +482,7 @@ where
 
     let l2_norm = l2_sqr.sqrt();
 
-    let mut levels = if ex_bits == 0 {
+    let ex_levels = if ex_bits == 0 {
         vec![0u8; dim]
     } else {
         let abs_normalised: Vec<f64> = residual.iter().map(|x| x.abs() / l2_norm).collect();
@@ -490,18 +499,24 @@ where
         magnitude_levels
     };
 
-    // Sign goes in the top bit, above the magnitude bits.
-    let sign_step = 1u8 << ex_bits;
-    for (level, &r) in levels.iter_mut().zip(&residual) {
+    let mut sign_code = vec![0u8; dim / 8];
+    for (d, &r) in residual.iter().enumerate() {
         if r > 0.0 {
-            *level += sign_step;
+            sign_code[d / 8] |= 1 << (d % 8);
         }
     }
 
-    // `u + cb` recentres the unsigned code on zero, which is the direction the
-    // estimate actually compares against.
-    let cb = -((1i32 << ex_bits) as f64 - 0.5);
-    let xu_cb: Vec<f64> = levels.iter().map(|&u| u as f64 + cb).collect();
+    // The factors are defined against the combined code, `sign * 2^ex_bits`
+    // above the magnitude, even though the two halves are stored apart.
+    // `u + cb` recentres it on zero, which is the direction the estimate
+    // actually compares against.
+    let sign_step = (1u64 << ex_bits) as f64;
+    let cb = -(sign_step - 0.5);
+    let xu_cb: Vec<f64> = ex_levels
+        .iter()
+        .zip(&residual)
+        .map(|(&u, &r)| u as f64 + if r > 0.0 { sign_step } else { 0.0 } + cb)
+        .collect();
 
     let centroid: Vec<f64> = centroid_rotated
         .iter()
@@ -517,7 +532,8 @@ where
     // producing infinities rather than an error.
     if ip_resi_xucb <= 0.0 || dim < 2 {
         return Ok(ExEncoding {
-            code: pack_excode(&levels, total_bits),
+            sign_code,
+            ex_code: pack_excode(&ex_levels, ex_bits),
             f_add: T::from_f64(l2_sqr).unwrap_or_else(T::zero),
             f_rescale: T::zero(),
             f_error: T::zero(),
@@ -534,7 +550,8 @@ where
     let f_rescale = -2.0 * l2_sqr / ip_resi_xucb;
 
     Ok(ExEncoding {
-        code: pack_excode(&levels, total_bits),
+        sign_code,
+        ex_code: pack_excode(&ex_levels, ex_bits),
         f_add: T::from_f64(f_add).unwrap_or_else(T::zero),
         f_rescale: T::from_f64(f_rescale).unwrap_or_else(T::zero),
         f_error: T::from_f64(2.0 * error).unwrap_or_else(T::zero),
@@ -543,13 +560,19 @@ where
 
 /// Estimate the squared distance from a prepared query to an encoded vector.
 ///
+/// The sign and magnitude halves contribute separately, which is what lets the
+/// combined code exceed a byte without ever being materialised:
+///
+/// ```text
+/// est = f_add + g_add + f_rescale * (2^ex_bits * <q, sign> + <q, ex> + cb * sum(q))
+/// ```
+///
 /// ### Params
 ///
 /// * `encoding` - The vector's encoding
 /// * `query_rotated` - Rotated query, length `dim`
 /// * `g_add` - `||q - c||^2` for the centroid the vector was encoded against
-/// * `dim` - Number of coordinates
-/// * `total_bits` - Bits per coordinate
+/// * `ex_bits` - Magnitude bits the encoding was made at
 ///
 /// ### Returns
 ///
@@ -558,21 +581,33 @@ pub fn estimate_ex<T>(
     encoding: &ExEncoding<T>,
     query_rotated: &[T],
     g_add: T,
-    dim: usize,
-    total_bits: usize,
+    ex_bits: usize,
 ) -> T
 where
     T: AnnSearchFloat,
 {
-    let levels = unpack_excode(&encoding.code, dim, total_bits);
-    let cb = T::from_f64(-((1i64 << (total_bits - 1)) as f64 - 0.5)).unwrap_or_else(T::zero);
+    let dim = query_rotated.len();
 
-    let mut ip = T::zero();
-    for (&level, &q) in levels.iter().zip(query_rotated) {
-        ip = ip + q * (T::from_u8(level).unwrap_or_else(T::zero) + cb);
+    let mut ip_sign = T::zero();
+    for (d, &q) in query_rotated.iter().enumerate() {
+        if encoding.sign_code[d / 8] >> (d % 8) & 1 == 1 {
+            ip_sign = ip_sign + q;
+        }
     }
 
-    encoding.f_add + g_add + encoding.f_rescale * ip
+    let mut ip_ex = T::zero();
+    if ex_bits > 0 {
+        let levels = unpack_excode(&encoding.ex_code, dim, ex_bits);
+        for (&level, &q) in levels.iter().zip(query_rotated) {
+            ip_ex = ip_ex + q * T::from_u8(level).unwrap_or_else(T::zero);
+        }
+    }
+
+    let sum_q = query_rotated.iter().fold(T::zero(), |a, &b| a + b);
+    let sign_step = T::from_f64((1u64 << ex_bits) as f64).unwrap_or_else(T::one);
+    let cb = T::from_f64(-((1u64 << ex_bits) as f64 - 0.5)).unwrap_or_else(T::zero);
+
+    encoding.f_add + g_add + encoding.f_rescale * (sign_step * ip_sign + ip_ex + cb * sum_q)
 }
 
 ///////////
@@ -597,6 +632,146 @@ mod tests {
     fn random_vec(dim: usize, seed: u64) -> Vec<f32> {
         let mut next = rng(seed);
         (0..dim).map(|_| next() as f32).collect()
+    }
+
+    /// Ground truth from the C++ reference, `ex_bits_code_with_factor` at
+    /// `METRIC_L2` with `t_const = -1`, over the vectors `random_vec(64, 5)`
+    /// and `random_vec(64, 6)`.
+    ///
+    /// `(ex_bits, scale, f_add, f_rescale, f_error, magnitude levels)`.
+    #[allow(clippy::type_complexity)]
+    const REFERENCE: &[(usize, f64, f64, f64, f64, &[u8])] = &[
+        (
+            1,
+            8.55066283,
+            1.14453793,
+            -0.749480486,
+            0.438388795,
+            &[
+                0, 1, 1, 0, 0, 0, 0, 0, 1, 0, 1, 0, 1, 0, 0, 0, 0, 1, 0, 1, 1, 1, 0, 0, 1, 0, 1,
+                1, 1, 0, 0, 0, 1, 0, 0, 1, 1, 1, 0, 1, 1, 1, 1, 0, 0, 1, 0, 1, 0, 0, 0, 1, 0, 0,
+                1, 0, 0, 0, 1, 1, 1, 0, 0, 1,
+            ],
+        ),
+        (
+            2,
+            15.2680078,
+            0.905673027,
+            -0.39984417,
+            0.234583095,
+            &[
+                0, 2, 3, 1, 0, 1, 1, 0, 1, 0, 2, 1, 2, 2, 1, 1, 0, 2, 1, 2, 3, 2, 1, 0, 2, 1, 2,
+                2, 3, 0, 0, 0, 2, 0, 0, 2, 3, 1, 0, 3, 2, 2, 3, 1, 0, 2, 0, 2, 1, 1, 0, 2, 0, 1,
+                3, 1, 1, 0, 2, 3, 3, 1, 1, 3,
+            ],
+        ),
+        (
+            3,
+            30.5360156,
+            0.85550499,
+            -0.197509438,
+            0.127020881,
+            &[
+                0, 4, 6, 2, 1, 2, 3, 1, 3, 1, 4, 2, 5, 4, 2, 3, 0, 4, 2, 5, 7, 5, 2, 0, 5, 3, 5,
+                4, 7, 0, 1, 1, 4, 0, 1, 5, 7, 3, 0, 6, 4, 5, 7, 2, 0, 4, 0, 5, 2, 3, 1, 5, 0, 2,
+                6, 2, 2, 1, 4, 6, 7, 3, 2, 7,
+            ],
+        ),
+        (
+            4,
+            50.8149105,
+            0.947724342,
+            -0.119602561,
+            0.065033026,
+            &[
+                0, 10, 10, 4, 2, 3, 5, 3, 5, 2, 10, 4, 8, 9, 7, 8, 0, 7, 3, 11, 15, 12, 4, 0, 8,
+                8, 9, 10, 15, 0, 2, 5, 10, 0, 2, 9, 14, 6, 0, 11, 6, 8, 15, 3, 1, 7, 3, 12, 7, 9,
+                1, 8, 0, 7, 10, 6, 3, 2, 7, 13, 15, 9, 7, 14,
+            ],
+        ),
+        (
+            6,
+            215.510655,
+            0.856853485,
+            -0.0282542128,
+            0.0148209594,
+            &[
+                0, 42, 44, 18, 11, 14, 22, 13, 25, 8, 41, 18, 36, 37, 28, 31, 4, 31, 15, 46, 62,
+                47, 19, 0, 37, 30, 38, 42, 60, 2, 9, 21, 41, 4, 11, 40, 57, 25, 2, 47, 28, 36, 60,
+                16, 4, 31, 9, 47, 27, 34, 7, 35, 1, 26, 45, 24, 15, 12, 30, 51, 60, 35, 28, 58,
+            ],
+        ),
+        (
+            8,
+            846.915175,
+            0.871282578,
+            -0.00718827685,
+            0.00337654864,
+            &[
+                3, 170, 176, 72, 45, 57, 88, 52, 99, 33, 168, 74, 142, 151, 115, 127, 16, 125, 59,
+                188, 250, 191, 75, 4, 146, 126, 150, 172, 242, 9, 36, 87, 167, 16, 46, 158, 231,
+                101, 8, 186, 112, 144, 240, 65, 19, 124, 41, 191, 113, 140, 28, 139, 5, 110, 179,
+                102, 60, 47, 120, 208, 241, 145, 116, 232,
+            ],
+        ),
+    ];
+
+    #[test]
+    fn test_matches_the_reference_implementation() {
+        // The property tests below would pass on a port that converged but got
+        // the levels or the factors subtly wrong, so this pins both against
+        // numbers taken from the C++ reference itself.
+        let dim = 64;
+        let data = random_vec(dim, 5);
+        let centroid = random_vec(dim, 6);
+
+        let residual: Vec<f64> = data
+            .iter()
+            .zip(&centroid)
+            .map(|(&v, &c)| (v - c) as f64)
+            .collect();
+        let l2 = residual.iter().map(|x| x * x).sum::<f64>().sqrt();
+        let abs_normalised: Vec<f64> = residual.iter().map(|x| x.abs() / l2).collect();
+
+        for &(ex_bits, scale, f_add, f_rescale, f_error, levels) in REFERENCE {
+            approx::assert_relative_eq!(
+                best_rescale_factor(&abs_normalised, ex_bits),
+                scale,
+                max_relative = 1e-6
+            );
+
+            let encoded = encode_ex_bits(&data, &centroid, ex_bits, None).unwrap();
+            assert_eq!(
+                unpack_excode(&encoded.ex_code, dim, ex_bits),
+                levels,
+                "levels differ at ex_bits {ex_bits}"
+            );
+
+            approx::assert_relative_eq!(encoded.f_add as f64, f_add, max_relative = 1e-5);
+            approx::assert_relative_eq!(encoded.f_rescale as f64, f_rescale, max_relative = 1e-5);
+
+            // Looser, and deliberately so. The error factor carries
+            // `sqrt((l2_sqr * ||xu_cb||^2 / ip^2 - 1) / (dim - 1))`, whose
+            // subtraction cancels hard once the reconstruction is good; the
+            // reference evaluates it in f32 throughout and this port
+            // accumulates in f64, so the two diverge by ~6e-4 at the widest
+            // settings and agree everywhere else. A real porting mistake would
+            // be out by orders of magnitude, not by a twentieth of a percent.
+            approx::assert_relative_eq!(encoded.f_error as f64, f_error, max_relative = 1e-2);
+        }
+    }
+
+    #[test]
+    fn test_sign_code_tracks_the_residual() {
+        let dim = 64;
+        let data = random_vec(dim, 5);
+        let centroid = random_vec(dim, 6);
+        let encoded = encode_ex_bits(&data, &centroid, 4, None).unwrap();
+
+        for d in 0..dim {
+            let set = encoded.sign_code[d / 8] >> (d % 8) & 1 == 1;
+            assert_eq!(set, data[d] - centroid[d] > 0.0, "sign differs at {d}");
+        }
     }
 
     #[test]
@@ -661,10 +836,22 @@ mod tests {
         let mut previous = -1.0f64;
         for ex_bits in 0..=6 {
             let encoded = encode_ex_bits(&vector, &centroid, ex_bits, None).unwrap();
-            let levels = unpack_excode(&encoded.code, dim, ex_bits + 1);
+            let levels = if ex_bits == 0 {
+                vec![0u8; dim]
+            } else {
+                unpack_excode(&encoded.ex_code, dim, ex_bits)
+            };
 
-            let cb = -((1i32 << ex_bits) as f64 - 0.5);
-            let recon: Vec<f64> = levels.iter().map(|&u| u as f64 + cb).collect();
+            let step = (1u64 << ex_bits) as f64;
+            let cb = -(step - 0.5);
+            let recon: Vec<f64> = levels
+                .iter()
+                .enumerate()
+                .map(|(d, &u)| {
+                    let sign = encoded.sign_code[d / 8] >> (d % 8) & 1;
+                    u as f64 + if sign == 1 { step } else { 0.0 } + cb
+                })
+                .collect();
             let residual: Vec<f64> = vector
                 .iter()
                 .zip(&centroid)
@@ -715,7 +902,7 @@ mod tests {
                     .sum();
 
                 let encoded = encode_ex_bits(&vector, &centroid, ex_bits, None).unwrap();
-                let est = estimate_ex(&encoded, &query, g_add, dim, ex_bits + 1) as f64;
+                let est = estimate_ex(&encoded, &query, g_add, ex_bits) as f64;
                 total += (est - truth).abs() / truth;
             }
 
@@ -754,7 +941,7 @@ mod tests {
                 .sum();
 
             let encoded = encode_ex_bits(&vector, &centroid, 3, None).unwrap();
-            let est = estimate_ex(&encoded, &query, g_add, dim, 4);
+            let est = estimate_ex(&encoded, &query, g_add, 3);
 
             if (est - truth).abs() > encoded.f_error * g_add.sqrt() {
                 breaches += 1;
@@ -797,7 +984,7 @@ mod tests {
             .map(|(&c, &q)| (c - q) * (c - q))
             .sum();
         approx::assert_relative_eq!(
-            estimate_ex(&encoded, &query, g_add, dim, 5),
+            estimate_ex(&encoded, &query, g_add, 4),
             g_add,
             max_relative = 1e-6
         );
@@ -838,8 +1025,8 @@ mod tests {
         let searched = encode_ex_bits(&vector, &centroid, 4, None).unwrap();
         let fast = encode_ex_bits(&vector, &centroid, 4, Some(t_const)).unwrap();
 
-        let err_searched = (estimate_ex(&searched, &query, g_add, dim, 5) - truth).abs() / truth;
-        let err_fast = (estimate_ex(&fast, &query, g_add, dim, 5) - truth).abs() / truth;
+        let err_searched = (estimate_ex(&searched, &query, g_add, 4) - truth).abs() / truth;
+        let err_fast = (estimate_ex(&fast, &query, g_add, 4) - truth).abs() / truth;
 
         assert!(err_fast < 0.1, "fast path error {err_fast}");
         assert!(err_searched < 0.1, "searched error {err_searched}");
