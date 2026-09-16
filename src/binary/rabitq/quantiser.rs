@@ -17,10 +17,11 @@ use crate::binary::turboquant::pack::BlockedCodes;
 use crate::prelude::*;
 use crate::utils::k_means_utils::*;
 
-/////////////
-// Helpers //
-/////////////
+////////////
+// Consts //
+////////////
 
+/// Number of iterations for RaBitQ k-means clustering.
 const RABITQ_K_MEANS_ITER: usize = 30;
 
 ///////////////////
@@ -162,10 +163,6 @@ where
             }
         }
 
-        // Dot correction: L1 norm of the rotated unit residual, stored
-        // inverted so the query path multiplies instead of dividing. Zero
-        // stands in for "underflowed", which the query path reads as a zero
-        // estimated cosine, matching the old guarded divide.
         let l1: T = compute_l1_norm(&v_c_rotated);
         let dot_correction_inv = if l1 > T::from_f32(1e-6).unwrap() {
             T::one() / l1
@@ -227,8 +224,6 @@ where
 
         let query_norm = self.normalise_query(query);
 
-        // The rotation is linear and orthogonal, so rotating the two operands
-        // separately gives the same residual as rotating their difference.
         let q_rot = self.apply_rotation(&query_norm);
         let c_rot = self.apply_rotation(centroid);
 

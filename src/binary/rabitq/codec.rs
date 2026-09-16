@@ -50,9 +50,9 @@ const MAX_TRAIN: usize = 250_000;
 /// Factors held per vertex: `f_add`, `f_rescale`, `f_error`.
 const FACTORS_PER_VERTEX: usize = 3;
 
-/////////////////////
+//////////////////////
 // RaBitQCodecQuery //
-/////////////////////
+//////////////////////
 
 /// A query prepared once and scored against many vertices.
 pub struct RaBitQCodecQuery<T> {
@@ -64,9 +64,9 @@ pub struct RaBitQCodecQuery<T> {
     g_add: Vec<T>,
 }
 
-//////////////////
-// RaBitQCodec  //
-//////////////////
+/////////////////
+// RaBitQCodec //
+/////////////////
 
 /// Vector storage for a graph index, as RaBitQ+ codes.
 #[cfg_attr(
@@ -539,9 +539,9 @@ where
     }
 }
 
-///////////////////////
-// HnswRaBitQIndex   //
-///////////////////////
+/////////////////////
+// HnswRaBitQIndex //
+/////////////////////
 
 /// A quantised HNSW over RaBitQ+ codes.
 pub type HnswRaBitQIndex<T> = HnswQuantisedIndex<T, RaBitQCodec<T>>;

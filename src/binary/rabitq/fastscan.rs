@@ -117,9 +117,6 @@ pub fn pack_rabitq_blocked_for(
     let n_blocks = n_vectors.div_ceil(BLOCK);
     let mut data = vec![0u8; n_blocks * n_bytes * BLOCK];
 
-    // Coordinate `g * 8 + 0` has to end up in the most significant bit, which
-    // is where the nibble sub-tables expect it, so every code byte is reversed
-    // on the way in.
     let byte = |v: usize, g: usize| -> u8 {
         if v < n_vectors {
             codes[v * n_bytes + g].reverse_bits()
@@ -133,9 +130,6 @@ pub fn pack_rabitq_blocked_for(
         for g in 0..n_bytes {
             let out = &mut data[(block_idx * n_bytes + g) * BLOCK..][..BLOCK];
             if dst_arch == ARCH_X86 {
-                // Split each byte into nibbles and interleave the lane pairs
-                // `(X86_PERM[j], X86_PERM[j] + 16)`, which is what lines the
-                // lane-crossing `vpshufb` reduction up.
                 for j in 0..16 {
                     let a = byte(base + X86_PERM[j], g);
                     let b = byte(base + X86_PERM[j] + 16, g);
@@ -241,9 +235,9 @@ pub struct SignScanQuery<T> {
     pub dist_to_centroid: T,
 }
 
-//////////////
+/////////////
 // Scoring //
-//////////////
+/////////////
 
 /// Score one block of up to [`BLOCK`] codes against a query table.
 ///

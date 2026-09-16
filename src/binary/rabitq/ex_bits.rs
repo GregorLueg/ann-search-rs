@@ -1,41 +1,12 @@
 //! Multi-bit RaBitQ+ codes.
 //!
-//! The one-bit encoder in [`crate::binary::rabitq::quantiser`] keeps only the sign of each
-//! rotated residual coordinate. RaBitQ+ adds `ex_bits` magnitude bits below that
-//! sign, giving a `total_bits = ex_bits + 1` code whose estimate converges on
-//! the true distance as the width grows. That is what lets a graph index drop
-//! the float vectors entirely and still answer accurately: the multi-bit code
-//! replaces the exact distance rather than merely screening for it.
-//!
-//! ### The code
-//!
-//! A coordinate's level is chosen against a single per-vector scale `t`, picked
-//! to maximise the cosine between the residual and its reconstruction. Finding
-//! `t` is not a closed form: as `t` sweeps upward each coordinate's level steps
-//! at `(level + 1) / |residual_d|`, so [`best_rescale_factor`] walks exactly
-//! those breakpoints in order out of a heap and keeps the best cosine seen. The
-//! `t_const` path skips the search and uses a dimension-wide average instead,
-//! which is what the reference calls its "faster" config.
-//!
-//! ### Estimating with it
-//!
-//! With `c` the centroid and `u` the unsigned `total_bits` code,
-//!
-//! ```text
-//! est = f_add + g_add + f_rescale * (<Rq, u> + k1xsumq * (2^total_bits - 1))
-//! ```
-//!
-//! and `|est - true|` is bounded by `f_error * ||q - c||` in the reference's
-//! analysis, which is what lets a search skip the wide code when the narrow one
-//! already proves a candidate hopeless.
-//!
-//! ### What is not from the reference
-//!
-//! The packing. The reference carries eight per-width packers whose byte order
-//! matches eight corresponding SIMD kernels. [`pack_excode`] instead writes one
-//! straightforward little-endian bit stream for every width. The arithmetic is
-//! identical and nothing outside this crate reads the bytes, so the layout is
-//! free to follow whichever kernel it ends up paired with.
+//! The one-bit encoder in [`crate::binary::rabitq::quantiser`] keeps only the
+//! sign of each rotated residual coordinate. RaBitQ+ adds `ex_bits` magnitude
+//! bits below that sign, giving a `total_bits = ex_bits + 1` code whose
+//! estimate converges on the true distance as the width grows. That is what
+//! lets a graph index drop the float vectors entirely and still answer
+//! accurately: the multi-bit code replaces the exact distance rather than
+//! merely screening for it.
 //!
 //! ### References
 //!
@@ -75,9 +46,9 @@ const FAST_QUANT_EPS: f64 = 1e-5;
 /// Vectors probed when averaging a dimension-wide scale.
 const CONST_SCALE_PROBES: usize = 100;
 
-/////////////
-// ExCode  //
-/////////////
+////////////
+// ExCode //
+////////////
 
 /// A multi-bit RaBitQ+ encoding of one vector.
 ///
@@ -313,7 +284,8 @@ pub fn const_scaling_factor(dim: usize, ex_bits: usize, seed: u64) -> f64 {
 ///
 /// ### Returns
 ///
-/// `(levels, ipnorm_inv)`, the second being `1 / sum((level + 0.5) * magnitude)`
+/// `(levels, ipnorm_inv)`, the second being
+/// `1 / sum((level + 0.5) * magnitude)`
 pub fn quantise_ex(abs_residual: &[f64], ex_bits: usize, t_const: Option<f64>) -> (Vec<u8>, f64) {
     let max_level = (1u32 << ex_bits) - 1;
     let mut levels = vec![0u8; abs_residual.len()];
@@ -467,9 +439,6 @@ where
 
     let l2_sqr: f64 = residual.iter().map(|x| x * x).sum();
 
-    // A vector sitting exactly on its centroid has no direction to quantise.
-    // Zero factors make its estimate the centroid distance itself, which is the
-    // right answer rather than a degenerate one.
     if l2_sqr == 0.0 {
         return Ok(ExEncoding {
             sign_code: vec![0u8; dim / 8],
@@ -488,8 +457,6 @@ where
         let abs_normalised: Vec<f64> = residual.iter().map(|x| x.abs() / l2_norm).collect();
         let (mut magnitude_levels, _) = quantise_ex(&abs_normalised, ex_bits, t_const);
 
-        // The magnitude was quantised from `|residual|`, so a negative
-        // coordinate has to count down from its sign step rather than up.
         let mask = ((1u32 << ex_bits) - 1) as u8;
         for (level, &r) in magnitude_levels.iter_mut().zip(&residual) {
             if r <= 0.0 {
@@ -506,10 +473,6 @@ where
         }
     }
 
-    // The factors are defined against the combined code, `sign * 2^ex_bits`
-    // above the magnitude, even though the two halves are stored apart.
-    // `u + cb` recentres it on zero, which is the direction the estimate
-    // actually compares against.
     let sign_step = (1u64 << ex_bits) as f64;
     let cb = -(sign_step - 0.5);
     let xu_cb: Vec<f64> = ex_levels
@@ -527,9 +490,6 @@ where
     let ip_cent_xucb: f64 = centroid.iter().zip(&xu_cb).map(|(a, b)| a * b).sum();
     let xu_cb_sqr: f64 = xu_cb.iter().map(|x| x * x).sum();
 
-    // A nonzero residual and its own code point the same way, so this is
-    // positive by construction; guarding keeps a pathological rotation from
-    // producing infinities rather than an error.
     if ip_resi_xucb <= 0.0 || dim < 2 {
         return Ok(ExEncoding {
             sign_code,
