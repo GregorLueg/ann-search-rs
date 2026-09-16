@@ -76,6 +76,8 @@ use crate::utils::pack_knn_results;
 #[cfg(feature = "binary")]
 use faer_traits::ComplexField;
 
+#[cfg(all(feature = "binary", feature = "quantised"))]
+use crate::binary::rabitq::codec::HnswRaBitQIndex;
 #[cfg(feature = "binary")]
 use crate::binary::{
     exhaustive_binary::*, exhaustive_rabitq::*, exhaustive_tq::*, ivf_binary::*, ivf_rabitq::*,
@@ -4780,6 +4782,148 @@ pub fn query_qg_self<T>(
 where
     T: AnnSearchFloat + ComplexField + ThreadLocalSearchState,
     VamanaIndex<T>: VamanaState<T>,
+{
+    index.generate_knn(k, ef_search, return_dist, verbose)
+}
+
+///////////////////
+// HNSW-RaBitQ+ //
+///////////////////
+
+#[cfg(all(feature = "binary", feature = "quantised"))]
+/// Build an HNSW index over RaBitQ+ codes
+///
+/// The graph is linked on exact distances and the float vectors are dropped
+/// afterwards, so the index is its codes plus its topology. Queries answer
+/// from the codes alone, which is what makes this the low-memory graph index:
+/// see [`build_qg_index`] for the variant that keeps the vectors and trades
+/// memory for exactness.
+///
+/// ### Params
+///
+/// * `mat` - Input data as samples x features. Accepts a faer matrix, an
+///   ndarray 2-D array (with the `ndarray` feature) or a row-major
+///   `(&[T], n_samples, n_features)` tuple. See [`AnnMatrix`].
+/// * `m` - Base connectivity parameter. Layer 0 gets `2 * m` slots
+/// * `ef_construction` - Beam width during construction
+/// * `dist_metric` - Distance metric: "euclidean" or "cosine". "manhattan" is
+///   not supported.
+/// * `ex_bits` - Magnitude bits per coordinate, `0..=MAX_EX_BITS`. The total
+///   code width is `ex_bits + 1`; 0 is plain one-bit RaBitQ
+/// * `nlist` - Centroid count for the codes. `None` picks `sqrt(n)`
+/// * `k_means_params` - Optional k-means settings, see
+///   [`KMeansTrainingParams`]
+/// * `seed` - Random seed for reproducibility
+/// * `verbose` - Print progress information during index construction
+///
+/// ### Returns
+///
+/// The [`HnswRaBitQIndex`], or an error on an unsupported metric or an
+/// invalid code width.
+///
+/// ### Note
+///
+/// The float vectors are not retained. Returned distances are estimates from
+/// the codes, so a caller that needs exact distances must re-rank against the
+/// originals itself.
+#[allow(clippy::too_many_arguments)]
+pub fn build_hnsw_rabitq_index<T>(
+    mat: impl AnnMatrix<T>,
+    m: usize,
+    ef_construction: usize,
+    dist_metric: &str,
+    ex_bits: usize,
+    nlist: Option<usize>,
+    k_means_params: Option<KMeansTrainingParams>,
+    seed: usize,
+    verbose: bool,
+) -> Result<HnswRaBitQIndex<T>, AnnSearchErrors>
+where
+    T: AnnSearchFloat + ThreadLocalSearchState,
+{
+    let metric = parse_ann_dist(dist_metric).unwrap_or_else(|| {
+        println!("[WARNING] Weird string used for distance metric. Using default squared Euclidean distance");
+        Dist::default()
+    });
+
+    HnswRaBitQIndex::build_rabitq(
+        mat,
+        m,
+        ef_construction,
+        metric,
+        ex_bits,
+        nlist,
+        k_means_params,
+        seed,
+        verbose,
+    )
+}
+
+#[cfg(all(feature = "binary", feature = "quantised"))]
+/// Helper function to query a given HNSW-RaBitQ+ index
+///
+/// ### Params
+///
+/// * `query_mat` - Query data as samples x features. Accepts a faer matrix,
+///   an ndarray 2-D array (with the `ndarray` feature) or a row-major
+///   `(&[T], n_queries, n_features)` tuple. See [`AnnMatrix`].
+/// * `index` - Reference to the built HNSW-RaBitQ+ index
+/// * `k` - Number of neighbours to return
+/// * `ef_search` - Size of candidate list during search (higher = better
+///   recall, slower)
+/// * `return_dist` - Shall the distances between the different points be
+///   returned
+/// * `verbose` - Print progress information
+///
+/// ### Returns
+///
+/// A tuple of `(knn_indices, optional distances)`
+pub fn query_hnsw_rabitq_index<T>(
+    query_mat: impl AnnMatrix<T>,
+    index: &HnswRaBitQIndex<T>,
+    k: usize,
+    ef_search: usize,
+    return_dist: bool,
+    verbose: bool,
+) -> KnnOptionResult<T>
+where
+    T: AnnSearchFloat + ThreadLocalSearchState,
+{
+    let (queries, nq, dim) = query_mat.into_row_major();
+
+    query_parallel(nq, return_dist, verbose, |i| {
+        index.query(&queries[i * dim..(i + 1) * dim], k, ef_search)
+    })
+}
+
+#[cfg(all(feature = "binary", feature = "quantised"))]
+/// Helper function to self query the HNSW-RaBitQ+ index
+///
+/// This function will generate a full kNN graph based on the internal data.
+/// Stored vectors query through their own codes, so no re-encoding happens.
+///
+/// ### Params
+///
+/// * `index` - Reference to the built HNSW-RaBitQ+ index
+/// * `k` - Number of neighbours to return
+/// * `ef_search` - Size of candidate list during search (higher = better
+///   recall, slower)
+/// * `return_dist` - Shall the distances between the different points be
+///   returned
+/// * `verbose` - Print progress information
+///
+/// ### Returns
+///
+/// A tuple of `(knn_indices, optional distances)`
+pub fn query_hnsw_rabitq_self<T>(
+    index: &HnswRaBitQIndex<T>,
+    k: usize,
+    ef_search: usize,
+    return_dist: bool,
+    verbose: bool,
+) -> KnnOptionResult<T>
+where
+    T: AnnSearchFloat + ThreadLocalSearchState,
 {
     index.generate_knn(k, ef_search, return_dist, verbose)
 }

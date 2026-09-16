@@ -186,6 +186,10 @@ required-features = ["binary"]
 name = "profile_graph_rabitq"
 required-features = ["binary", "quantised"]
 
+[[example]]
+name = "rabitq_graphs"
+required-features = ["binary", "quantised"]
+
 ##################
 # Other examples #
 ##################
