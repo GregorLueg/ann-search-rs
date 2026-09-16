@@ -349,6 +349,24 @@ where
         &self.codec
     }
 
+    /// The dense layer-0 adjacency.
+    ///
+    /// ### Returns
+    ///
+    /// Reference to the base layer
+    pub fn graph(&self) -> &FlatGraph {
+        &self.graph
+    }
+
+    /// The layers above 0.
+    ///
+    /// ### Returns
+    ///
+    /// Reference to the hierarchy
+    pub fn hierarchy(&self) -> &HnswHierarchy {
+        &self.hierarchy
+    }
+
     /// Original ids of the stored vectors.
     ///
     /// ### Returns
