@@ -111,6 +111,16 @@ pub enum AnnSearchErrors {
     },
 
     // -- binary errors --
+    /// Extended RaBitQ codes were asked for at an unsupported width
+    #[cfg(feature = "binary")]
+    #[error("RaBitQ extended codes support up to {max} magnitude bits, got {ex_bits}.")]
+    RaBitQInvalidExBits {
+        /// Magnitude bits requested
+        ex_bits: usize,
+        /// Largest supported width
+        max: usize,
+    },
+
     /// Asymmetric queries are only supported with sign-based binarisation
     #[cfg(feature = "binary")]
     #[error("Only sign-based binarisation is supported for asymmetric queries")]
