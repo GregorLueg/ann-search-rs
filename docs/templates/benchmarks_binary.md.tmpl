@@ -8,10 +8,11 @@ Binarised indices push the compression to (roughly) bits. Three consequences:
 3. Without re-ranking the top candidates, recall drops hard. Less so for RaBitQ,
    and for TurboQuant it depends on the data.
 
-The quantised graph index (QG) is the exception to the first point. It spends
-the bits on locality rather than on compression and comes out *larger* than the
-raw vectors, so read it as a speed structure that happens to use RaBitQ codes,
-not as a small index. See the section below.
+The two graph indices split on that first point. The quantised graph (QG)
+spends its bits on locality rather than on compression and comes out *larger*
+than the raw vectors, so read it as a speed structure that happens to use
+RaBitQ codes. HNSW-RaBitQ goes the other way and drops the vectors entirely.
+Both live in their own section below.
 
 The benchmarks below show both, with and without re-ranking. For the simple
 binary versions use:
@@ -24,6 +25,12 @@ For RaBitQ:
 
 ```bash
 cargo run --example gridsearch_rabitq --release --features binary -- --dim 512 --n-samples 50000 --data embedding
+```
+
+For the two RaBitQ graph indices, which need both feature flags:
+
+```bash
+cargo run --example gridsearch_rabitq_graphs --release --features binary,quantised -- --dim 512 --n-samples 50000 --data embedding
 ```
 
 For TurboQuantisation
@@ -47,7 +54,9 @@ footing.
 
 - [Binarisation](#binary-ivf-and-exhaustive)
 - [RaBitQ](#rabitq-ivf-and-exhaustive)
+- [RaBitQ graphs](#rabitq-graphs-qg-and-hnsw-rabitq)
   - [Quantised graph](#quantised-graph-qg)
+  - [HNSW-RaBitQ](#hnsw-rabitq)
 - [TurboQuant](#turboquant-ivf-and-exhaustive)
 
 ### <u>Binary (IVF and exhaustive)</u>
@@ -227,44 +236,9 @@ index is query speed, since the approximate distance is more work than a popcoun
 - *Number of lists (nl)*: Number of k-means clusters, `sqrt(n)` as a default.
 - *Number of probes (np)*: Typically `sqrt(nlist)` or up to 5% of `nlist`.
 
-#### Quantised graph (QG)
-
-The `QgIndex` rows in the tables below come from the same run. It is a
-SymphonyQG-style index (Gou et al., SIGMOD 2025): a Vamana graph where every
-vertex additionally stores its own neighbours' one-bit RaBitQ codes, quantised
-against that vertex and pre-transposed into the fast-scan block layout. One hop
-is therefore a contiguous read plus one byte-shuffle sweep that estimates all 32
-neighbour distances at once, instead of one random memory access and one
-distance kernel per neighbour. Exact distances are computed only for the
-vertices the walk actually pops, which the estimator needs as its anchor anyway,
-so there is no separate re-ranking stage and no `VecStore`.
-
-**This one is not about memory.** Each vector's code is duplicated once per
-in-edge, and the raw vectors have to stay resident for the exact distances, so
-the index lands at roughly two to three times the size of the data. The point is
-query speed at a given recall. If memory is the binding constraint, `IVF-RaBitQ`
-above is the index you want.
-
-The graph is not from the paper. SymphonyQG builds its own topology with
-random init, repeated search-prune-reverse rounds and a cosine-threshold refill
-to force exact-degree regularity; `VamanaIndex` already yields a fixed-degree
-graph, so it builds the topology here and what is kept from the paper is the
-storage layout and the estimator. Euclidean and cosine only, no Manhattan.
-
-**Tunable parameters *(QG)*:**
-
-- *degree (d)*: Neighbour slots per vertex, a non-zero multiple of 32. Default
-  `32`, which is exactly one fast-scan sweep per hop. Doubling it doubles both
-  the code footprint and the per-hop work, so it wants a reason; the grid runs
-  `32` and `64` to show whether the extra edges pay.
-- *l_build (l)*: Beam width during construction, second Vamana pass. This is
-  where the build time goes: the encoding is a flat few hundred milliseconds and
-  everything else is Vamana. The first pass runs at the crate default, which is
-  a small constant, because a wide first pass is both slower and worse.
-- *ef_search (ef)*: Beam width at query time, the usual recall/latency dial. The
-  grid runs `k`, `2k`, `4k` and `8k`.
-
-Self queries run at `ef_search = 4k`.
+The `QgIndex` rows in the tables below come from the same run. It is covered
+in its own section further down, since it is a speed structure rather than a
+compression one.
 
 #### Correlated data
 
@@ -353,6 +327,176 @@ Self queries run at `ef_search = 4k`.
 </br>
 <pre><code>
 <!-- BENCH:rabitq:euclidean:embedding:768:50000 -->
+</code></pre>
+</details>
+
+### <u>RaBitQ graphs (QG and HNSW-RaBitQ)</u>
+
+Two graph indices built on RaBitQ codes, pulling in opposite directions. QG
+keeps the float vectors and duplicates every code once per in-edge to make one
+hop a single SIMD sweep: fast, but bigger than the data. HNSW-RaBitQ throws the
+vectors away and keeps one multi-bit code per vertex: small, and the `ex_bits`
+width is what buys the accuracy back. The column to read across the two is
+`index_size_mb` at matched recall.
+
+Both run from one example:
+
+```bash
+cargo run --example gridsearch_rabitq_graphs --release --features binary,quantised -- --data embedding --n-samples 50000 --dim 512
+```
+
+Euclidean and cosine only for both, no Manhattan.
+
+#### Quantised graph (QG)
+
+`QgIndex` is a SymphonyQG-style index (Gou et al., SIGMOD 2025): a Vamana graph
+where every vertex additionally stores its own neighbours' one-bit RaBitQ codes,
+quantised against that vertex and pre-transposed into the fast-scan block
+layout. One hop is therefore a contiguous read plus one byte-shuffle sweep that
+estimates all 32 neighbour distances at once, instead of one random memory
+access and one distance kernel per neighbour. Exact distances are computed only
+for the vertices the walk actually pops, which the estimator needs as its anchor
+anyway, so there is no separate re-ranking stage and no `VecStore`.
+
+**This one is not about memory.** Each vector's code is duplicated once per
+in-edge, and the raw vectors have to stay resident for the exact distances, so
+the index lands at roughly two to three times the size of the data. The point is
+query speed at a given recall. If memory is the binding constraint, look at
+HNSW-RaBitQ below or at `IVF-RaBitQ` above.
+
+The graph is not from the paper. SymphonyQG builds its own topology with
+random init, repeated search-prune-reverse rounds and a cosine-threshold refill
+to force exact-degree regularity; `VamanaIndex` already yields a fixed-degree
+graph, so it builds the topology here and what is kept from the paper is the
+storage layout and the estimator.
+
+**Tunable parameters *(QG)*:**
+
+- *degree (d)*: Neighbour slots per vertex, a non-zero multiple of 32. Default
+  `32`, which is exactly one fast-scan sweep per hop. Doubling it doubles both
+  the code footprint and the per-hop work, so it wants a reason; the grid runs
+  `32` and `64` to show whether the extra edges pay.
+- *l_build (l)*: Beam width during construction, second Vamana pass. This is
+  where the build time goes: the encoding is a flat few hundred milliseconds and
+  everything else is Vamana. The first pass runs at the crate default, which is
+  a small constant, because a wide first pass is both slower and worse.
+- *ef_search (ef)*: Beam width at query time, the usual recall/latency dial. The
+  grid runs `k`, `2k`, `4k` and `8k`.
+
+#### HNSW-RaBitQ
+
+`HnswRaBitQIndex` links an ordinary HNSW graph on exact distances and then drops
+the float vectors. What is left is the topology plus one RaBitQ+ code per
+vertex, so the search answers from the codes alone and the footprint falls to a
+fraction of the raw data. No `VecStore`, no re-ranking stage: if you need exact
+distances back, re-rank against your own vectors.
+
+Quantisation happens after the graph is built, so `ex_bits` moves accuracy and
+size together without touching the topology. `ex_bits = 0` is plain one-bit
+RaBitQ; the grid starts at `1`, so the codes are 2, 4, 6 and 9 bits wide per
+coordinate. That is the dial worth sweeping first, and the tables are where you
+read off what each step costs.
+
+**Tunable parameters *(HNSW-RaBitQ)*:**
+
+- *m*: Base connectivity. Layer 0 gets `2 * m` slots. The grid runs `16` and
+  `32`.
+- *ef_construction*: Beam width during construction, fixed at `200` in the grid.
+- *ex_bits (ex)*: Magnitude bits per coordinate on top of the sign bit, so the
+  code is `ex_bits + 1` bits wide. `0` is plain one-bit RaBitQ; the grid runs
+  `1`, `3`, `5` and `8`.
+- *ef_search (ef)*: Beam width at query time. Same `k`, `2k`, `4k`, `8k` grid as
+  QG.
+
+Self queries run at `ef_search = 4k` for both.
+
+#### Correlated data
+
+<details>
+<summary><b>Correlated data - 256 dimensions</b>:</summary>
+</br>
+<pre><code>
+<!-- BENCH:rabitq_graphs:euclidean:correlated:256:50000 -->
+</code></pre>
+</details>
+
+---
+
+<details>
+<summary><b>Correlated data - 512 dimensions</b>:</summary>
+</br>
+<pre><code>
+<!-- BENCH:rabitq_graphs:euclidean:correlated:512:50000 -->
+</code></pre>
+</details>
+
+---
+
+<details>
+<summary><b>Correlated data - 768 dimensions</b>:</summary>
+</br>
+<pre><code>
+<!-- BENCH:rabitq_graphs:euclidean:correlated:768:50000 -->
+</code></pre>
+</details>
+
+#### Lowrank data
+
+<details>
+<summary><b>Lowrank data - 256 dimensions</b>:</summary>
+</br>
+<pre><code>
+<!-- BENCH:rabitq_graphs:euclidean:lowrank:256:50000 -->
+</code></pre>
+</details>
+
+---
+
+<details>
+<summary><b>Lowrank data - 512 dimensions</b>:</summary>
+</br>
+<pre><code>
+<!-- BENCH:rabitq_graphs:euclidean:lowrank:512:50000 -->
+</code></pre>
+</details>
+
+---
+
+<details>
+<summary><b>Lowrank data - 768 dimensions</b>:</summary>
+</br>
+<pre><code>
+<!-- BENCH:rabitq_graphs:euclidean:lowrank:768:50000 -->
+</code></pre>
+</details>
+
+#### Cell embeddings data
+
+<details>
+<summary><b>Cell embedding data - 256 dimensions</b>:</summary>
+</br>
+<pre><code>
+<!-- BENCH:rabitq_graphs:euclidean:embedding:256:50000 -->
+</code></pre>
+</details>
+
+---
+
+<details>
+<summary><b>Cell embedding data - 512 dimensions</b>:</summary>
+</br>
+<pre><code>
+<!-- BENCH:rabitq_graphs:euclidean:embedding:512:50000 -->
+</code></pre>
+</details>
+
+---
+
+<details>
+<summary><b>Cell embedding data - 768 dimensions</b>:</summary>
+</br>
+<pre><code>
+<!-- BENCH:rabitq_graphs:euclidean:embedding:768:50000 -->
 </code></pre>
 </details>
 

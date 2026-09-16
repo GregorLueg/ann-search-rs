@@ -268,6 +268,18 @@ case "$KIND" in
             "rabitq:euclidean:lowrank:768:50000|cargo run --example gridsearch_rabitq --release --features binary -- --data lowrank --n-samples 50000 --dim 768 --intrinsic-dim 128"
             "rabitq:euclidean:embedding:768:50000|cargo run --example gridsearch_rabitq --release --features binary -- --data embedding --n-samples 50000 --dim 768"
 
+            "rabitq_graphs:euclidean:correlated:256:50000|cargo run --example gridsearch_rabitq_graphs --release --features binary,quantised -- --data correlated --n-samples 50000 --dim 256"
+            "rabitq_graphs:euclidean:lowrank:256:50000|cargo run --example gridsearch_rabitq_graphs --release --features binary,quantised -- --data lowrank --n-samples 50000 --dim 256 --intrinsic-dim 32"
+            "rabitq_graphs:euclidean:embedding:256:50000|cargo run --example gridsearch_rabitq_graphs --release --features binary,quantised -- --data embedding --n-samples 50000 --dim 256"
+
+            "rabitq_graphs:euclidean:correlated:512:50000|cargo run --example gridsearch_rabitq_graphs --release --features binary,quantised -- --data correlated --n-samples 50000 --dim 512"
+            "rabitq_graphs:euclidean:lowrank:512:50000|cargo run --example gridsearch_rabitq_graphs --release --features binary,quantised -- --data lowrank --n-samples 50000 --dim 512 --intrinsic-dim 64"
+            "rabitq_graphs:euclidean:embedding:512:50000|cargo run --example gridsearch_rabitq_graphs --release --features binary,quantised -- --data embedding --n-samples 50000 --dim 512"
+
+            "rabitq_graphs:euclidean:correlated:768:50000|cargo run --example gridsearch_rabitq_graphs --release --features binary,quantised -- --data correlated --n-samples 50000 --dim 768"
+            "rabitq_graphs:euclidean:lowrank:768:50000|cargo run --example gridsearch_rabitq_graphs --release --features binary,quantised -- --data lowrank --n-samples 50000 --dim 768 --intrinsic-dim 128"
+            "rabitq_graphs:euclidean:embedding:768:50000|cargo run --example gridsearch_rabitq_graphs --release --features binary,quantised -- --data embedding --n-samples 50000 --dim 768"
+
             "turboquant:euclidean:correlated:256:50000|cargo run --example gridsearch_tq --release --features binary -- --data correlated --n-samples 50000 --dim 256"
             "turboquant:euclidean:lowrank:256:50000|cargo run --example gridsearch_tq --release --features binary -- --data lowrank --n-samples 50000 --dim 256 --intrinsic-dim 32"
             "turboquant:euclidean:embedding:256:50000|cargo run --example gridsearch_tq --release --features binary -- --data embedding --n-samples 50000 --dim 256"
