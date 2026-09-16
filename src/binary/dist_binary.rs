@@ -30,8 +30,9 @@ use std::arch::x86_64::*;
 /// registers while still amortising that gate.
 pub const HAMMING_BLOCK: usize = 32;
 
-/// Vectors scored per call to [`VectorDistanceRaBitQ::rabitq_block_sq`]. Same
-/// role as [`HAMMING_BLOCK`], but the output is `T` rather than `u32`.
+/// Vectors scored per call to
+/// [`VectorDistanceRaBitQ::rabitq_block_sq_fastscan`]. Same role as
+/// [`HAMMING_BLOCK`], but the output is `T` rather than `u32`.
 pub const RABITQ_BLOCK: usize = 32;
 
 /// Code length at or below which the scalar `u64` path is used on x86_64.
@@ -702,11 +703,10 @@ where
 
     /// Squared RaBitQ distances for one fast-scan block within a cluster
     ///
-    /// Same estimate as [`rabitq_block_sq`](Self::rabitq_block_sq), sourcing
-    /// the signed inner product from a nibble table scanned 32 lanes at a time
-    /// instead of a per-vector AND-popcount. The int4 query quantisation and
-    /// the popcount corrections it needed drop out with it, so only the
-    /// per-vector norm and dot correction remain.
+    /// The signed inner product comes from a nibble table scanned 32 lanes at
+    /// a time rather than a per-vector AND-popcount, so there is no int4 query
+    /// quantisation and none of the popcount corrections it would need: only
+    /// the per-vector norm and dot correction remain.
     ///
     /// `local_start` must be a multiple of [`RABITQ_BLOCK`], which is what the
     /// scan loops step by.
