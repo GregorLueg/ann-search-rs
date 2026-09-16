@@ -16,7 +16,7 @@ mod commons;
 use std::time::Instant;
 
 use ann_search_rs::binary::qg::QgIndex;
-use ann_search_rs::binary::rabitq_codec::HnswRaBitQIndex;
+use ann_search_rs::binary::rabitq::codec::HnswRaBitQIndex;
 use ann_search_rs::prelude::Dist;
 use ann_search_rs::quantised::hnsw_quantised::index::HnswSq8uIndex;
 use ann_search_rs::{

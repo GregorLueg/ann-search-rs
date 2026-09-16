@@ -1,6 +1,6 @@
 //! Multi-bit RaBitQ+ codes.
 //!
-//! The one-bit encoder in [`crate::binary::rabitq`] keeps only the sign of each
+//! The one-bit encoder in [`crate::binary::rabitq::quantiser`] keeps only the sign of each
 //! rotated residual coordinate. RaBitQ+ adds `ex_bits` magnitude bits below that
 //! sign, giving a `total_bits = ex_bits + 1` code whose estimate converges on
 //! the true distance as the width grows. That is what lets a graph index drop

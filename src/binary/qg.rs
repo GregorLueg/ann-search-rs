@@ -59,7 +59,7 @@ use std::sync::Arc;
 use thousands::*;
 
 use crate::binary::rabitq::RaBitQEncoder;
-use crate::binary::rabitq_fastscan::{
+use crate::binary::rabitq::fastscan::{
     build_sign_lut, pack_rabitq_blocked, score_sign_block, unpack_rabitq_blocked, BLOCKED_ARCH,
 };
 use crate::binary::rotator::RotatorKind;
@@ -1112,7 +1112,7 @@ mod tests {
 
     #[test]
     fn test_reblocking_a_foreign_layout_preserves_results() {
-        use crate::binary::rabitq_fastscan::pack_rabitq_blocked_for;
+        use crate::binary::rabitq::fastscan::pack_rabitq_blocked_for;
 
         let data = clustered(2000, 128, 12, 53);
         let mut index = build(&data, Dist::SquaredEuclidean, 32);

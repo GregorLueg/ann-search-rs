@@ -28,7 +28,7 @@
 use rayon::prelude::*;
 
 use crate::binary::rabitq::RaBitQEncoder;
-use crate::binary::rabitq_ex::{encode_ex_bits, excode_bytes, MAX_EX_BITS};
+use crate::binary::rabitq::ex_bits::{encode_ex_bits, excode_bytes, MAX_EX_BITS};
 use crate::binary::rotator::RotatorKind;
 use crate::prelude::*;
 use crate::quantised::hnsw_quantised::build::GraphBuildParams;

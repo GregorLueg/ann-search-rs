@@ -231,11 +231,9 @@ where
 
 /// A query prepared for one cluster's fast-scan.
 ///
-/// The int4 counterpart is
-/// [`RaBitQQuery`](crate::binary::rabitq::RaBitQQuery); this drops the
-/// bit-planes, the quantisation bounds and the quantised sum, because the table
-/// hands back the signed inner product directly and the counting corrections
-/// those fields existed for fall away with it.
+/// The table hands back the signed inner product directly, so there are no
+/// bit-planes, quantisation bounds or quantised sum to carry: the counting
+/// corrections those would exist for fall away with them.
 pub struct SignScanQuery<T> {
     /// Nibble table over the rotated query residual
     pub lut: QueryLut,

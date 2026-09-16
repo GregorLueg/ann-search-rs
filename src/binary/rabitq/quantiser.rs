@@ -9,7 +9,7 @@ use rayon::prelude::*;
 use std::iter::Sum;
 
 use crate::binary::dist_binary::*;
-use crate::binary::rabitq_fastscan::{
+use crate::binary::rabitq::fastscan::{
     build_sign_lut, pack_rabitq_blocked, unpack_rabitq_blocked, SignScanQuery, BLOCKED_ARCH,
 };
 use crate::binary::rotator::{RaBitQRotator, RotatorKind};
