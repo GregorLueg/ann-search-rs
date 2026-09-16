@@ -16,10 +16,14 @@ mod commons;
 use std::time::Instant;
 
 use ann_search_rs::binary::qg::QgIndex;
+use ann_search_rs::binary::rabitq_codec::HnswRaBitQIndex;
+use ann_search_rs::prelude::Dist;
+use ann_search_rs::quantised::hnsw_quantised::index::HnswSq8uIndex;
 use ann_search_rs::{
     build_exhaustive_index, build_qg_index, build_vamana_index, query_exhaustive_index,
     query_qg_index,
 };
+use rayon::prelude::*;
 use clap::Parser;
 use commons::*;
 use thousands::*;
@@ -46,9 +50,21 @@ const DEFAULT_EF_SWEEP: &str = "16,32,64,100,150,200,300,400,600,800";
 #[derive(Parser, Debug)]
 #[command(about = "Quantised graph occupancy, build and query profile")]
 struct Cli {
-    /// Which index to profile: qg
+    /// Which index to profile: qg, hnsw-rabitq or hnsw-sq8
     #[arg(long, default_value = "qg")]
     index: String,
+
+    /// HNSW connectivity for the graph indices; layer 0 gets `2 * m` slots
+    #[arg(long, default_value_t = 16)]
+    m: usize,
+
+    /// Magnitude bits per coordinate for `--index hnsw-rabitq`
+    #[arg(long, default_value_t = 4)]
+    ex_bits: usize,
+
+    /// Centroids the codes are taken against, `None` picks sqrt(n)
+    #[arg(long)]
+    nlist: Option<usize>,
 
     /// What to profile: occupancy, build, query or frontier
     #[arg(long, default_value = "occupancy")]
@@ -247,8 +263,12 @@ fn report_occupancy(graph: &[u32], n: usize, degree: usize) {
 /// Both answer the same `(k, ef_search)` question, so the profiler only needs
 /// to know which one to build and how to ask it.
 enum GraphIndex {
-    /// Quantised graph, one code per edge
+    /// Quantised graph, one code per edge, float vectors retained
     Qg(Box<QgIndex<f32>>),
+    /// HNSW over RaBitQ+ codes, no float vectors
+    HnswRaBitQ(Box<HnswRaBitQIndex<f32>>),
+    /// HNSW over uniformly quantised codes, no float vectors
+    HnswSq8(Box<HnswSq8uIndex<f32>>),
 }
 
 impl GraphIndex {
@@ -265,6 +285,10 @@ impl GraphIndex {
     ///
     /// The built index
     fn build(flat: &[f32], n: usize, dim: usize, cli: &Cli) -> Self {
+        let metric = match cli.distance.as_str() {
+            "cosine" => Dist::Cosine,
+            _ => Dist::SquaredEuclidean,
+        };
         match cli.index.as_str() {
             "qg" => Self::Qg(Box::new(
                 build_qg_index(
@@ -279,7 +303,33 @@ impl GraphIndex {
                 )
                 .expect("qg build failed"),
             )),
-            other => panic!("unknown --index '{other}', expected qg"),
+            "hnsw-rabitq" => Self::HnswRaBitQ(Box::new(
+                HnswRaBitQIndex::build_rabitq(
+                    (flat, n, dim),
+                    cli.m,
+                    cli.l_build,
+                    metric,
+                    cli.ex_bits,
+                    cli.nlist,
+                    None,
+                    cli.seed as usize,
+                    false,
+                )
+                .expect("hnsw-rabitq build failed"),
+            )),
+            "hnsw-sq8" => Self::HnswSq8(Box::new(
+                HnswSq8uIndex::build(
+                    (flat, n, dim),
+                    cli.m,
+                    cli.l_build,
+                    &metric,
+                    cli.seed as usize,
+                    None,
+                    false,
+                )
+                .expect("hnsw-sq8 build failed"),
+            )),
+            other => panic!("unknown --index '{other}', expected qg, hnsw-rabitq or hnsw-sq8"),
         }
     }
 
@@ -291,6 +341,8 @@ impl GraphIndex {
     fn memory_mb(&self) -> f64 {
         let bytes = match self {
             Self::Qg(i) => i.memory_usage_bytes(),
+            Self::HnswRaBitQ(i) => i.memory_usage_bytes(),
+            Self::HnswSq8(i) => i.memory_usage_bytes(),
         };
         bytes as f64 / (1024.0 * 1024.0)
     }
@@ -316,12 +368,23 @@ impl GraphIndex {
         k: usize,
         ef: usize,
     ) -> Vec<Vec<usize>> {
-        let mat = (queries, n_probes, dim);
-        let (res, _) = match self {
-            Self::Qg(i) => query_qg_index(mat, i, k, ef, false, false),
+        match self {
+            Self::Qg(i) => {
+                let (res, _) = query_qg_index((queries, n_probes, dim), i, k, ef, false, false)
+                    .expect("query failed");
+                res
+            }
+            // The quantised indices answer one row at a time, so the fan-out
+            // happens here rather than in a crate-level wrapper.
+            Self::HnswRaBitQ(i) => (0..n_probes)
+                .into_par_iter()
+                .map(|q| i.query(&queries[q * dim..(q + 1) * dim], k, ef).unwrap().0)
+                .collect(),
+            Self::HnswSq8(i) => (0..n_probes)
+                .into_par_iter()
+                .map(|q| i.query(&queries[q * dim..(q + 1) * dim], k, ef).unwrap().0)
+                .collect(),
         }
-        .expect("query failed");
-        res
     }
 }
 
