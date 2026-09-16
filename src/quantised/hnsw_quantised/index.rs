@@ -88,19 +88,69 @@ where
     ///
     /// The built index
     pub fn from_codec(codec: C, params: &GraphBuildParams) -> Self {
-        let (n, dim, metric) = (codec.n(), codec.dim(), codec.metric());
-
-        let start = Instant::now();
         let (graph, hierarchy) =
-            build_hierarchical_graph::<T, _>(n, params, |a, b| codec.score_sym(a, b));
+            Self::build_topology(&codec, params, |a, b| codec.score_sym(a, b));
+        Self::from_parts(codec, graph, hierarchy, params)
+    }
+
+    /// Build the topology under a distance the codec does not provide.
+    ///
+    /// A codec that holds only codes prunes its graph against its own
+    /// approximation, which compounds the codec's error into the topology.
+    /// Where the exact vectors are still to hand at build time this takes them
+    /// instead, links the graph on exact distances and lets the caller drop
+    /// them afterwards, which is what the RaBitQ reference does.
+    ///
+    /// ### Params
+    ///
+    /// * `codec` - The encoded vectors, read here only for its node count
+    /// * `params` - Construction settings
+    /// * `dist` - Symmetric distance between two node ids, smaller is nearer
+    ///
+    /// ### Returns
+    ///
+    /// The dense base layer and the hierarchy above it
+    pub fn build_topology<F>(
+        codec: &C,
+        params: &GraphBuildParams,
+        dist: F,
+    ) -> (FlatGraph, HnswHierarchy)
+    where
+        F: Fn(usize, usize) -> T + Sync,
+    {
+        let start = Instant::now();
+        let built = build_hierarchical_graph::<T, _>(codec.n(), params, dist);
 
         if params.verbose {
             println!(
                 "Quantised HNSW over {} nodes built in {:.2?}",
-                n.separate_with_underscores(),
+                codec.n().separate_with_underscores(),
                 start.elapsed()
             );
         }
+
+        built
+    }
+
+    /// Assemble an index from a codec and a prebuilt topology.
+    ///
+    /// ### Params
+    ///
+    /// * `codec` - The encoded vectors
+    /// * `graph` - Dense layer-0 adjacency
+    /// * `hierarchy` - The layers above 0
+    /// * `params` - The settings the topology was built with
+    ///
+    /// ### Returns
+    ///
+    /// The index
+    pub fn from_parts(
+        codec: C,
+        graph: FlatGraph,
+        hierarchy: HnswHierarchy,
+        params: &GraphBuildParams,
+    ) -> Self {
+        let (n, dim, metric) = (codec.n(), codec.dim(), codec.metric());
 
         Self {
             codec,
