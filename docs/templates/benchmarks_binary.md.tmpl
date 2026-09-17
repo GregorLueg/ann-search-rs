@@ -103,7 +103,10 @@ is very high-dimensional data where memory is the binding constraint.
 
 - *n_bits*: How many bits to encode each vector into. More bits, better recall,
   bigger index. For `"pca"` it also sets how many principal components can be
-  spent, since the retained count is capped at `n_bits / 16`.
+  spent, since the retained count is capped at `n_bits / 16`. The grid runs
+  `256` and `512`, plus `1024` past 128 dimensions, each with `"random"` and
+  `"pca"`. `"sign"` ignores the value and always emits `dim` bits, so it gets
+  one row rather than a sweep.
 - *binarisation_init*: Three options are provided in the crate. `"random"` for
   random planes that are subsequently orthogonalised, `"pca"` to identify axes
   of maximum variation, or `"sign"` to just use the sign of the respective
@@ -116,15 +119,18 @@ is very high-dimensional data where memory is the binding constraint.
 - *reranking_factor*: Hamming distance picks the candidates, then the on-disk
   vectors are loaded and the candidates re-scored exactly. The factor is how
   many more than `k` get re-scored, so `10` means `10 * k` vectors. More
-  candidates, better recall. Default `20`; the grid runs lower values to show
-  what that costs.
+  candidates, better recall. Default `20`; the grid runs `10` and `20`, plus a
+  `no_rr` row with no re-ranking at all.
 
 **Tunable parameters *(IVF-specific)*:**
 
 - *Number of lists (nl)*: Number of k-means clusters, `sqrt(n)` as a default.
-- *Number of probes (np)*: Typically `sqrt(nlist)` or up to 5% of `nlist`.
+  The grid runs `sqrt(n/2)`, `sqrt(n)` and `sqrt(2n)`.
+- *Number of probes (np)*: `sqrt(nlist)`, `sqrt(2 * nlist)` and 5% of `nlist`,
+  deduplicated.
 
-Self queries run with `reranking_factor = 10`.
+Self queries run with `reranking_factor = 10`, the IVF ones at
+`np = sqrt(nlist)`.
 
 #### Correlated data
 
@@ -227,18 +233,24 @@ index is query speed, since the approximate distance is more work than a popcoun
 
 **Tunable parameters *(RaBitQ)*:**
 
-- *reranking_factor*: As for the binary indices. The RaBitQ estimate picks the
-  candidates, then the on-disk vectors are loaded and re-scored exactly. `10`
-  means `10 * k` vectors get re-scored.
+- *n_probe*: `ExhaustiveRaBitQ` is exhaustive only in the sense that there is no
+  IVF above it. The query still probes a share of its own `sqrt(n)` centroids,
+  25% of them when left at `None`, which is what the grid runs. It is not swept.
+- *reranking_factor (rf)*: As for the binary indices. The RaBitQ estimate picks
+  the candidates, then the on-disk vectors are loaded and re-scored exactly.
+  `10` means `10 * k` vectors get re-scored. The exhaustive grid runs `rf0` (the
+  estimate alone, no re-ranking), `5`, `10` and `20`; the IVF grid runs `rf0`,
+  `10` and `20`.
 
 **Tunable parameters *(IVF-specific)*:**
 
 - *Number of lists (nl)*: Number of k-means clusters, `sqrt(n)` as a default.
-- *Number of probes (np)*: Typically `sqrt(nlist)` or up to 5% of `nlist`.
+  The grid runs `sqrt(n/2)`, `sqrt(n)` and `sqrt(2n)`.
+- *Number of probes (np)*: `sqrt(nlist)`, `sqrt(2 * nlist)` and 5% of `nlist`,
+  deduplicated.
 
-The `QgIndex` rows in the tables below come from the same run. It is covered
-in its own section further down, since it is a speed structure rather than a
-compression one.
+Self queries run at `reranking_factor = 10` for the exhaustive index and at the
+default `20` for IVF, the latter at `np = sqrt(2 * nlist)`.
 
 #### Correlated data
 
@@ -379,7 +391,8 @@ storage layout and the estimator.
 - *l_build (l)*: Beam width during construction, second Vamana pass. This is
   where the build time goes: the encoding is a flat few hundred milliseconds and
   everything else is Vamana. The first pass runs at the crate default, which is
-  a small constant, because a wide first pass is both slower and worse.
+  a small constant, because a wide first pass is both slower and worse. The grid
+  runs `64` and `128`.
 - *ef_search (ef)*: Beam width at query time, the usual recall/latency dial. The
   grid runs `k`, `2k`, `4k` and `8k`.
 
@@ -524,12 +537,16 @@ other indices, the original vectors can be stored on disk for exact re-ranking.
   3-bit has no SIMD kernel and falls back to the scalar scorer, which is
   markedly slower, so prefer 4-bit unless memory forces otherwise. The grid runs
   2-bit and 4-bit.
-- *reranking_factor*: As for the other indices. Default `20`.
+- *reranking_factor (rf)*: As for the other indices. Default `20`. The
+  exhaustive grid runs `rf0`, `5`, `10` and `20`; the IVF grid runs `rf0`, `10`
+  and `20`.
 
 **Tunable parameters *(IVF-specific)*:**
 
 - *Number of lists (nl)*: Number of k-means clusters, `sqrt(n)` as a default.
-- *Number of probes (np)*: Typically `sqrt(nlist)` or up to 5% of `nlist`.
+  The grid runs `sqrt(n/2)`, `sqrt(n)` and `sqrt(2n)`.
+- *Number of probes (np)*: `sqrt(nlist)`, `sqrt(2 * nlist)` and 5% of `nlist`,
+  deduplicated.
 
 Self queries run with `reranking_factor = 20`. The encoding is data-oblivious,
 so this one was designed for high-dimensional neural-network output rather than
