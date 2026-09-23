@@ -74,9 +74,9 @@ fall, so there's no reason to go higher.
 
 ## Quantised
 
-Eleven more estimators over compressed vectors, for when memory is the binding
+Thirteen more estimators over compressed vectors, for when memory is the binding
 constraint. Distances from these are the codec's estimate rather than the
-distance, and none of them support Manhattan.
+distance (bar `QgIndex`), and none of them support Manhattan.
 
 Measure recall against `ExhaustiveIndex` before committing to one. The codec
 cost on the benchmark runs is larger than the memory saving makes it look, and
@@ -94,10 +94,13 @@ it is worst on cosine. See [Quantised](docs/quantised.md).
 | `ExhaustiveOpqIndex` | PQ with a learned rotation in front. |
 | `IvfOpqIndex` | IVF-PQ with the rotation. |
 | `SoarPqIndex` | IVF-PQ with SOAR spilling. |
-| `SoarOpqIndex` | Spilling plus the rotation, so it pays for both. The *largest* of the eleven, not the smallest. |
+| `SoarOpqIndex` | Spilling plus the rotation, so it pays for both. The *largest* of the PQ family, not the smallest. |
+| `HnswRaBitQIndex` | HNSW linked on exact distances, then the vectors are dropped. `ex_bits` trades size for recall; 11 to 28 MB against 49 MB of raw data at 50k x 256. |
+| `QgIndex` | Vamana graph with each vertex's neighbours stored as one-bit RaBitQ codes. Exact distances, but 2.1x the raw data or more: a speed structure, not a small one. |
 
-The binary indices in the Rust crate aren't bound yet. They follow the same
-pattern when they land.
+The remaining binary indices in the Rust crate (binary, RaBitQ and
+TurboQuant, exhaustive and IVF) aren't bound yet. They follow the same pattern
+when they land.
 
 ## GPU
 

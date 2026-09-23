@@ -45,6 +45,8 @@ QUANTISED: dict[type, float] = {
     ann.ExhaustiveSq8Index: 0.90,
     ann.IvfSq8Index: 0.70,
     ann.HnswSq8uIndex: 0.90,
+    ann.HnswRaBitQIndex: 0.90,
+    ann.QgIndex: 0.95,
     ann.ExhaustivePqIndex: 0.45,
     ann.IvfPqIndex: 0.50,
     ann.ExhaustiveOpqIndex: 0.45,

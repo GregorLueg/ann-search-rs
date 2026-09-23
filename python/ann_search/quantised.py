@@ -11,8 +11,9 @@ codec rather than choices:
 - **Distances are estimates.** A quantised index reports the codec's estimate
   of a distance, not the distance. It is close enough to rank on, which is what
   an index is for, but don't feed it anywhere the absolute value matters
-  without checking it against `ExhaustiveIndex` first.
-- **Manhattan is unavailable** on all eleven. Every codec here is built on
+  without checking it against `ExhaustiveIndex` first. `QgIndex` is the one
+  exception: it keeps the float vectors and returns exact distances.
+- **Manhattan is unavailable** on all thirteen. Every codec here is built on
   inner products, which is what makes the integer arithmetic work.
 
 Everything else is identical: same four-method surface, same padding, same
@@ -20,14 +21,17 @@ persistence, float32 and float64 both supported.
 
 Which one to reach for, roughly. `HnswSq8uIndex` if you want `HnswIndex` at a
 quarter of the *vector* memory, and can afford the codec's recall cost.
-`IvfSq8Index` if you were already on `IvfIndex`. The PQ family when a quarter
-is not enough of a saving, which means a high-dimensional embedding space.
+`IvfSq8Index` if you were already on `IvfIndex`. The PQ family or
+`HnswRaBitQIndex` when a quarter is not enough of a saving, which means a
+high-dimensional embedding space. `QgIndex` is not a memory saving at all; it
+spends RaBitQ codes on query speed.
 
 Measure the recall before committing to any of them. On the benchmark runs the
 codec cost is much larger than these classes used to admit, and it is worst on
-cosine. See [the benchmark tables][1] for numbers.
+cosine. See the benchmark tables for [quantised][1] and [RaBitQ][2] numbers.
 
 [1]: https://github.com/GregorLueg/ann-search-rs/blob/main/docs/benchmarks_quantised.md
+[2]: https://github.com/GregorLueg/ann-search-rs/blob/main/docs/benchmarks_binary.md
 """
 
 from __future__ import annotations
@@ -373,6 +377,155 @@ class HnswSq8uIndex(_BaseQuantisedIndex):
             quant_sample_rows=self.quant_sample_rows,
             seed=self.seed,
             verbose=self.verbose,
+        )
+
+
+#################
+# RaBitQ graphs #
+#################
+
+
+class HnswRaBitQIndex(_BaseQuantisedIndex):
+    """HNSW over RaBitQ+ codes, with the float vectors thrown away.
+
+    The graph is linked on exact distances, then every vector is encoded and
+    dropped. What stays resident is the topology plus one code of
+    ``ex_bits + 1`` bits per coordinate, and every query answers from those
+    codes alone. That makes this the low-memory graph index: on the benchmark
+    runs at 50k by 256 it holds 11 to 28 MB against 49 MB of raw data.
+
+    ``ex_bits`` is the dial. It moves accuracy and size together without
+    touching the graph, since quantisation happens after linking. On the
+    correlated benchmark at ``m=16`` recall tops out near 0.78 at
+    ``ex_bits=1``, 0.93 at 3, 0.98 at 5 and 0.996 at 8, where raising
+    `ef_search` stops helping. Below 5 the ceiling is the codec, not the beam.
+    Returned distances are estimates; re-rank against your own vectors if you
+    need exact ones.
+
+    Args:
+        n_neighbors: Neighbours per query, and the default ``k`` for
+            `kneighbors`.
+        metric: ``"euclidean"``/``"l2"``, ``"sqeuclidean"`` or ``"cosine"``.
+        m: Edges per node on the upper layers; the base layer gets ``2 * m``.
+        ef_construction: Candidate list size during insertion. Costs nothing at
+            query time.
+        ex_bits: Magnitude bits per coordinate on top of the sign bit, ``0`` to
+            ``8``. ``0`` is plain one-bit RaBitQ.
+        nlist: Centroids the codes are taken against. ``None`` defaults to
+            ``sqrt(n)``.
+        ef_search: Beam width at query time, the recall knob. Search-time:
+            override it per call as ``index.kneighbors(ef_search=200)``.
+        seed: Fixes the level assignment, the rotation and the k-means.
+        verbose: Progress to the process stdout, not ``sys.stdout``.
+    """
+
+    _HANDLE: ClassVar[type] = _core.HnswRaBitQ
+    _SEARCH_KNOBS: ClassVar[tuple[str, ...]] = ("ef_search",)
+
+    @beartype
+    def __init__(
+        self,
+        n_neighbors: int = 15,
+        metric: str = "euclidean",
+        m: int = 16,
+        ef_construction: int = 200,
+        ex_bits: int = 5,
+        nlist: int | None = None,
+        ef_search: int = 100,
+        seed: int = 42,
+        verbose: bool = False,
+    ) -> None:
+        self.n_neighbors = n_neighbors
+        self.metric = metric
+        self.m = m
+        self.ef_construction = ef_construction
+        self.ex_bits = ex_bits
+        self.nlist = nlist
+        self.ef_search = ef_search
+        self.seed = seed
+        self.verbose = verbose
+
+    def _build(self, x: np.ndarray) -> Any:
+        return _core.HnswRaBitQ.build(
+            x,
+            m=self.m,
+            ef_construction=self.ef_construction,
+            metric=self._core_metric,
+            ex_bits=self.ex_bits,
+            nlist=self.nlist,
+            seed=self.seed,
+            verbose=self.verbose,
+        )
+
+
+class QgIndex(_BaseQuantisedIndex):
+    """Quantised graph (SymphonyQG-style): a Vamana graph with RaBitQ neighbour
+    blocks.
+
+    Every vertex stores its own neighbours' one-bit RaBitQ codes in the
+    fast-scan layout, so one hop estimates all ``degree`` neighbours in a single
+    SIMD sweep instead of one random read per neighbour. The exact distance is
+    computed only for the vertices the walk pops, so the returned distances are
+    exact and there is no separate re-ranking stage.
+
+    **This one is not about memory.** Each code is stored once per in-edge and
+    the float vectors stay resident, so the index comes out at two to three
+    times the raw data. The point is query speed at a given recall. For a small
+    graph index use `HnswRaBitQIndex`.
+
+    Args:
+        n_neighbors: Neighbours per query, and the default ``k`` for
+            `kneighbors`.
+        metric: ``"euclidean"``/``"l2"``, ``"sqeuclidean"`` or ``"cosine"``.
+        degree: Neighbour slots per vertex, a non-zero multiple of 32. ``32`` is
+            exactly one sweep per hop; doubling it doubles both the code memory
+            and the per-hop work.
+        l_build: Beam width for the second Vamana pass, where the build time
+            goes. The first pass runs at the crate's narrower default.
+        alpha_pass1: Relaxed-neighbour factor on the first pruning pass.
+        alpha_pass2: Same on the second pass. Above 1 keeps longer edges.
+        ef_search: Beam width at query time, the recall knob. Search-time:
+            override it per call as ``index.kneighbors(ef_search=200)``.
+        seed: Fixes the graph and the rotation.
+        verbose: Progress to the process stdout on query, not ``sys.stdout``.
+            The build is silent.
+    """
+
+    _HANDLE: ClassVar[type] = _core.Qg
+    _SEARCH_KNOBS: ClassVar[tuple[str, ...]] = ("ef_search",)
+
+    @beartype
+    def __init__(
+        self,
+        n_neighbors: int = 15,
+        metric: str = "euclidean",
+        degree: int = 32,
+        l_build: int = 64,
+        alpha_pass1: float = 1.0,
+        alpha_pass2: float = 1.2,
+        ef_search: int = 100,
+        seed: int = 42,
+        verbose: bool = False,
+    ) -> None:
+        self.n_neighbors = n_neighbors
+        self.metric = metric
+        self.degree = degree
+        self.l_build = l_build
+        self.alpha_pass1 = alpha_pass1
+        self.alpha_pass2 = alpha_pass2
+        self.ef_search = ef_search
+        self.seed = seed
+        self.verbose = verbose
+
+    def _build(self, x: np.ndarray) -> Any:
+        return _core.Qg.build(
+            x,
+            metric=self._core_metric,
+            degree=self.degree,
+            l_build=self.l_build,
+            alpha_pass1=self.alpha_pass1,
+            alpha_pass2=self.alpha_pass2,
+            seed=self.seed,
         )
 
 

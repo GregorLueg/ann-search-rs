@@ -1840,6 +1840,9 @@ mod tests {
             ]);
         }
 
+        #[cfg(all(feature = "binary", feature = "quantised"))]
+        kinds.push(<crate::binary::rabitq::codec::HnswRaBitQIndex<f32> as IndexIo>::KIND);
+
         let total = kinds.len();
         kinds.sort_unstable();
         kinds.dedup();

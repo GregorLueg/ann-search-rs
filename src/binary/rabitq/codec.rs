@@ -635,6 +635,20 @@ where
     }
 }
 
+/////////////
+// IndexIo //
+/////////////
+
+#[cfg(feature = "serialise")]
+impl<T> IndexIo for HnswRaBitQIndex<T>
+where
+    T: AnnSearchFloat,
+{
+    type Elem = T;
+
+    const KIND: &'static str = "hnsw_rabitq";
+}
+
 ///////////
 // Tests //
 ///////////

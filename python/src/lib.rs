@@ -74,6 +74,13 @@ mod ivf_sq8;
 mod soar_opq;
 mod soar_pq;
 
+////////////////////////
+// RaBitQ graph indices //
+////////////////////////
+
+mod hnsw_rabitq;
+mod qg;
+
 /////////////////
 // GPU indices //
 /////////////////
@@ -145,6 +152,9 @@ fn _ann_search(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<ivf_sq8::PyIvfSq8>()?;
     m.add_class::<soar_opq::PySoarOpq>()?;
     m.add_class::<soar_pq::PySoarPq>()?;
+
+    m.add_class::<hnsw_rabitq::PyHnswRaBitQ>()?;
+    m.add_class::<qg::PyQg>()?;
 
     #[cfg(feature = "gpu")]
     {
