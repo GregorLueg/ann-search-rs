@@ -810,8 +810,8 @@
 <p>Approximate nearest-neighbour search built for single-cell and computational
 biology workloads. The <a href="https://github.com/GregorLueg/ann-search-rs">Rust crate</a>
 does the work. This is a thin scikit-learn shaped layer over it.</p>
-<p>Twenty-seven indices, all behind the same four-method surface: thirteen on the
-CPU, eleven over quantised storage, three on the GPU. No CUDA runtime to
+<p>Twenty-nine indices, all behind the same four-method surface: thirteen on the
+CPU, thirteen over quantised storage, three on the GPU. No CUDA runtime to
 install, since the GPU backend is wgpu, so it runs on Metal, Vulkan or DX12 and
 ships in the ordinary wheel.</p>
 <h2 id="install">Install<a class="headerlink" href="#install" title="Permanent link">&para;</a></h2>
@@ -843,7 +843,7 @@ that.</p>
   problem.</li>
 <li><a href="quickstart/">Quickstart</a> for worked examples over the synthetic
   generators, including how to measure your own recall.</li>
-<li><a href="quantised/">Quantised</a> for the eleven compressed indices, when memory is
+<li><a href="quantised/">Quantised</a> for the thirteen compressed indices, when memory is
   what's binding.</li>
 <li><a href="gpu/">GPU</a> for the three device-resident indices and what they cost you.</li>
 <li><a href="guide/">Guide</a> for metrics, padding, threads, persistence and the sharp

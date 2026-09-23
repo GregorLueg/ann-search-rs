@@ -661,6 +661,28 @@
 </li>
         
           <li class="md-nav__item">
+  <a href="#ann_search.quantised.HnswRaBitQIndex" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        <code class="doc-symbol doc-symbol-toc doc-symbol-class"></code>&nbsp;HnswRaBitQIndex
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#ann_search.quantised.QgIndex" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        <code class="doc-symbol doc-symbol-toc doc-symbol-class"></code>&nbsp;QgIndex
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
   <a href="#ann_search.quantised.ExhaustivePqIndex" class="md-nav__link">
     <span class="md-ellipsis">
       
@@ -925,6 +947,28 @@
 </li>
         
           <li class="md-nav__item">
+  <a href="#ann_search.quantised.HnswRaBitQIndex" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        <code class="doc-symbol doc-symbol-toc doc-symbol-class"></code>&nbsp;HnswRaBitQIndex
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#ann_search.quantised.QgIndex" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        <code class="doc-symbol doc-symbol-toc doc-symbol-class"></code>&nbsp;QgIndex
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
   <a href="#ann_search.quantised.ExhaustivePqIndex" class="md-nav__link">
     <span class="md-ellipsis">
       
@@ -1021,10 +1065,11 @@
 
 
 <h1 id="quantised-indices">Quantised indices<a class="headerlink" href="#quantised-indices" title="Permanent link">&para;</a></h1>
-<p>The eleven estimators over compressed vectors. See
+<p>The thirteen estimators over compressed vectors. See
 <a href="../../quantised/">Quantised</a> for what each codec does and when to reach for it.</p>
 <p>Two things differ from the uncompressed estimators: the distances are the
-codec's estimate rather than the distance, and none of them support Manhattan.</p>
+codec's estimate rather than the distance (bar <code>QgIndex</code>, which keeps the
+vectors), and none of them support Manhattan.</p>
 
 
 <div class="doc doc-object doc-module">
@@ -1050,19 +1095,22 @@ codec rather than choices:</p>
 <li><strong>Distances are estimates.</strong> A quantised index reports the codec's estimate
   of a distance, not the distance. It is close enough to rank on, which is what
   an index is for, but don't feed it anywhere the absolute value matters
-  without checking it against <code>ExhaustiveIndex</code> first.</li>
-<li><strong>Manhattan is unavailable</strong> on all eleven. Every codec here is built on
+  without checking it against <code>ExhaustiveIndex</code> first. <code>QgIndex</code> is the one
+  exception: it keeps the float vectors and returns exact distances.</li>
+<li><strong>Manhattan is unavailable</strong> on all thirteen. Every codec here is built on
   inner products, which is what makes the integer arithmetic work.</li>
 </ul>
 <p>Everything else is identical: same four-method surface, same padding, same
 persistence, float32 and float64 both supported.</p>
 <p>Which one to reach for, roughly. <code>HnswSq8uIndex</code> if you want <code>HnswIndex</code> at a
 quarter of the <em>vector</em> memory, and can afford the codec's recall cost.
-<code>IvfSq8Index</code> if you were already on <code>IvfIndex</code>. The PQ family when a quarter
-is not enough of a saving, which means a high-dimensional embedding space.</p>
+<code>IvfSq8Index</code> if you were already on <code>IvfIndex</code>. The PQ family or
+<code>HnswRaBitQIndex</code> when a quarter is not enough of a saving, which means a
+high-dimensional embedding space. <code>QgIndex</code> is not a memory saving at all; it
+spends RaBitQ codes on query speed.</p>
 <p>Measure the recall before committing to any of them. On the benchmark runs the
 codec cost is much larger than these classes used to admit, and it is worst on
-cosine. See <a href="https://github.com/GregorLueg/ann-search-rs/blob/main/docs/benchmarks_quantised.md">the benchmark tables</a> for numbers.</p>
+cosine. See the benchmark tables for <a href="https://github.com/GregorLueg/ann-search-rs/blob/main/docs/benchmarks_quantised.md">quantised</a> and <a href="https://github.com/GregorLueg/ann-search-rs/blob/main/docs/benchmarks_binary.md">RaBitQ</a> numbers.</p>
 
 
 
@@ -2053,6 +2101,475 @@ auto-picks.</p>
             <td>
               <div class="doc-md-description">
                 <p>Progress to the process stdout, not <code>sys.stdout</code>.</p>
+              </div>
+            </td>
+            <td>
+                  <code>False</code>
+            </td>
+          </tr>
+      </tbody>
+    </table>
+
+
+
+
+
+
+
+
+
+
+
+<div class="doc doc-children">
+
+
+
+
+
+
+
+
+
+
+
+
+  </div>
+
+    </div>
+
+</div>
+
+<div class="doc doc-object doc-class">
+
+
+
+<h3 id="ann_search.quantised.HnswRaBitQIndex" class="doc doc-heading">
+<code class="doc-symbol doc-symbol-heading doc-symbol-class"></code>            <span class="doc doc-object-name doc-class-name">HnswRaBitQIndex</span>
+
+
+<a href="#ann_search.quantised.HnswRaBitQIndex" class="headerlink" title="Permanent link">&para;</a></h3>
+<div class="doc-signature highlight"><pre><span></span><code><a id="__codelineno-0-1" name="__codelineno-0-1" href="#__codelineno-0-1"></a><span class="nf">HnswRaBitQIndex</span><span class="p">(</span>
+<a id="__codelineno-0-2" name="__codelineno-0-2" href="#__codelineno-0-2"></a>    <span class="n">n_neighbors</span><span class="p">:</span> <span class="n"><span title="int">int</span></span> <span class="o">=</span> <span class="mi">15</span><span class="p">,</span>
+<a id="__codelineno-0-3" name="__codelineno-0-3" href="#__codelineno-0-3"></a>    <span class="n">metric</span><span class="p">:</span> <span class="n"><span title="str">str</span></span> <span class="o">=</span> <span class="s2">"euclidean"</span><span class="p">,</span>
+<a id="__codelineno-0-4" name="__codelineno-0-4" href="#__codelineno-0-4"></a>    <span class="n">m</span><span class="p">:</span> <span class="n"><span title="int">int</span></span> <span class="o">=</span> <span class="mi">16</span><span class="p">,</span>
+<a id="__codelineno-0-5" name="__codelineno-0-5" href="#__codelineno-0-5"></a>    <span class="n">ef_construction</span><span class="p">:</span> <span class="n"><span title="int">int</span></span> <span class="o">=</span> <span class="mi">200</span><span class="p">,</span>
+<a id="__codelineno-0-6" name="__codelineno-0-6" href="#__codelineno-0-6"></a>    <span class="n">ex_bits</span><span class="p">:</span> <span class="n"><span title="int">int</span></span> <span class="o">=</span> <span class="mi">5</span><span class="p">,</span>
+<a id="__codelineno-0-7" name="__codelineno-0-7" href="#__codelineno-0-7"></a>    <span class="n">nlist</span><span class="p">:</span> <span class="n"><span title="int">int</span></span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
+<a id="__codelineno-0-8" name="__codelineno-0-8" href="#__codelineno-0-8"></a>    <span class="n">ef_search</span><span class="p">:</span> <span class="n"><span title="int">int</span></span> <span class="o">=</span> <span class="mi">100</span><span class="p">,</span>
+<a id="__codelineno-0-9" name="__codelineno-0-9" href="#__codelineno-0-9"></a>    <span class="n">seed</span><span class="p">:</span> <span class="n"><span title="int">int</span></span> <span class="o">=</span> <span class="mi">42</span><span class="p">,</span>
+<a id="__codelineno-0-10" name="__codelineno-0-10" href="#__codelineno-0-10"></a>    <span class="n">verbose</span><span class="p">:</span> <span class="n"><span title="bool">bool</span></span> <span class="o">=</span> <span class="kc">False</span><span class="p">,</span>
+<a id="__codelineno-0-11" name="__codelineno-0-11" href="#__codelineno-0-11"></a><span class="p">)</span>
+</code></pre></div>
+
+    <div class="doc doc-contents ">
+            <p class="doc doc-class-bases">
+              Bases: <code><span title="ann_search.quantised._BaseQuantisedIndex">_BaseQuantisedIndex</span></code></p>
+
+
+
+        <p>HNSW over RaBitQ+ codes, with the float vectors thrown away.</p>
+<p>The graph is linked on exact distances, then every vector is encoded and
+dropped. What stays resident is the topology plus one code of
+<code>ex_bits + 1</code> bits per coordinate, and every query answers from those
+codes alone. That makes this the low-memory graph index: on the benchmark
+runs at 50k by 256 it holds 11 to 28 MB against 49 MB of raw data.</p>
+<p><code>ex_bits</code> is the dial. It moves accuracy and size together without
+touching the graph, since quantisation happens after linking. On the
+correlated benchmark at <code>m=16</code> recall tops out near 0.78 at
+<code>ex_bits=1</code>, 0.93 at 3, 0.98 at 5 and 0.996 at 8, where raising
+<code>ef_search</code> stops helping. Below 5 the ceiling is the codec, not the beam.
+Returned distances are estimates; re-rank against your own vectors if you
+need exact ones.</p>
+
+
+<p><span class="doc-section-title">Parameters:</span></p>
+    <table>
+      <thead>
+        <tr>
+          <th>Name</th>
+          <th>Type</th>
+          <th>Description</th>
+          <th>Default</th>
+        </tr>
+      </thead>
+      <tbody>
+          <tr class="doc-section-item">
+            <td>
+                <code>n_neighbors</code>
+            </td>
+            <td>
+                  <code><span title="int">int</span></code>
+            </td>
+            <td>
+              <div class="doc-md-description">
+                <p>Neighbours per query, and the default <code>k</code> for
+<code>kneighbors</code>.</p>
+              </div>
+            </td>
+            <td>
+                  <code>15</code>
+            </td>
+          </tr>
+          <tr class="doc-section-item">
+            <td>
+                <code>metric</code>
+            </td>
+            <td>
+                  <code><span title="str">str</span></code>
+            </td>
+            <td>
+              <div class="doc-md-description">
+                <p><code>"euclidean"</code>/<code>"l2"</code>, <code>"sqeuclidean"</code> or <code>"cosine"</code>.</p>
+              </div>
+            </td>
+            <td>
+                  <code>&#39;euclidean&#39;</code>
+            </td>
+          </tr>
+          <tr class="doc-section-item">
+            <td>
+                <code>m</code>
+            </td>
+            <td>
+                  <code><span title="int">int</span></code>
+            </td>
+            <td>
+              <div class="doc-md-description">
+                <p>Edges per node on the upper layers; the base layer gets <code>2 * m</code>.</p>
+              </div>
+            </td>
+            <td>
+                  <code>16</code>
+            </td>
+          </tr>
+          <tr class="doc-section-item">
+            <td>
+                <code>ef_construction</code>
+            </td>
+            <td>
+                  <code><span title="int">int</span></code>
+            </td>
+            <td>
+              <div class="doc-md-description">
+                <p>Candidate list size during insertion. Costs nothing at
+query time.</p>
+              </div>
+            </td>
+            <td>
+                  <code>200</code>
+            </td>
+          </tr>
+          <tr class="doc-section-item">
+            <td>
+                <code>ex_bits</code>
+            </td>
+            <td>
+                  <code><span title="int">int</span></code>
+            </td>
+            <td>
+              <div class="doc-md-description">
+                <p>Magnitude bits per coordinate on top of the sign bit, <code>0</code> to
+<code>8</code>. <code>0</code> is plain one-bit RaBitQ.</p>
+              </div>
+            </td>
+            <td>
+                  <code>5</code>
+            </td>
+          </tr>
+          <tr class="doc-section-item">
+            <td>
+                <code>nlist</code>
+            </td>
+            <td>
+                  <code><span title="int">int</span> | None</code>
+            </td>
+            <td>
+              <div class="doc-md-description">
+                <p>Centroids the codes are taken against. <code>None</code> defaults to
+<code>sqrt(n)</code>.</p>
+              </div>
+            </td>
+            <td>
+                  <code>None</code>
+            </td>
+          </tr>
+          <tr class="doc-section-item">
+            <td>
+                <code>ef_search</code>
+            </td>
+            <td>
+                  <code><span title="int">int</span></code>
+            </td>
+            <td>
+              <div class="doc-md-description">
+                <p>Beam width at query time, the recall knob. Search-time:
+override it per call as <code>index.kneighbors(ef_search=200)</code>.</p>
+              </div>
+            </td>
+            <td>
+                  <code>100</code>
+            </td>
+          </tr>
+          <tr class="doc-section-item">
+            <td>
+                <code>seed</code>
+            </td>
+            <td>
+                  <code><span title="int">int</span></code>
+            </td>
+            <td>
+              <div class="doc-md-description">
+                <p>Fixes the level assignment, the rotation and the k-means.</p>
+              </div>
+            </td>
+            <td>
+                  <code>42</code>
+            </td>
+          </tr>
+          <tr class="doc-section-item">
+            <td>
+                <code>verbose</code>
+            </td>
+            <td>
+                  <code><span title="bool">bool</span></code>
+            </td>
+            <td>
+              <div class="doc-md-description">
+                <p>Progress to the process stdout, not <code>sys.stdout</code>.</p>
+              </div>
+            </td>
+            <td>
+                  <code>False</code>
+            </td>
+          </tr>
+      </tbody>
+    </table>
+
+
+
+
+
+
+
+
+
+
+
+<div class="doc doc-children">
+
+
+
+
+
+
+
+
+
+
+
+
+  </div>
+
+    </div>
+
+</div>
+
+<div class="doc doc-object doc-class">
+
+
+
+<h3 id="ann_search.quantised.QgIndex" class="doc doc-heading">
+<code class="doc-symbol doc-symbol-heading doc-symbol-class"></code>            <span class="doc doc-object-name doc-class-name">QgIndex</span>
+
+
+<a href="#ann_search.quantised.QgIndex" class="headerlink" title="Permanent link">&para;</a></h3>
+<div class="doc-signature highlight"><pre><span></span><code><a id="__codelineno-0-1" name="__codelineno-0-1" href="#__codelineno-0-1"></a><span class="nf">QgIndex</span><span class="p">(</span>
+<a id="__codelineno-0-2" name="__codelineno-0-2" href="#__codelineno-0-2"></a>    <span class="n">n_neighbors</span><span class="p">:</span> <span class="n"><span title="int">int</span></span> <span class="o">=</span> <span class="mi">15</span><span class="p">,</span>
+<a id="__codelineno-0-3" name="__codelineno-0-3" href="#__codelineno-0-3"></a>    <span class="n">metric</span><span class="p">:</span> <span class="n"><span title="str">str</span></span> <span class="o">=</span> <span class="s2">"euclidean"</span><span class="p">,</span>
+<a id="__codelineno-0-4" name="__codelineno-0-4" href="#__codelineno-0-4"></a>    <span class="n">degree</span><span class="p">:</span> <span class="n"><span title="int">int</span></span> <span class="o">=</span> <span class="mi">32</span><span class="p">,</span>
+<a id="__codelineno-0-5" name="__codelineno-0-5" href="#__codelineno-0-5"></a>    <span class="n">l_build</span><span class="p">:</span> <span class="n"><span title="int">int</span></span> <span class="o">=</span> <span class="mi">64</span><span class="p">,</span>
+<a id="__codelineno-0-6" name="__codelineno-0-6" href="#__codelineno-0-6"></a>    <span class="n">alpha_pass1</span><span class="p">:</span> <span class="n"><span title="float">float</span></span> <span class="o">=</span> <span class="mf">1.0</span><span class="p">,</span>
+<a id="__codelineno-0-7" name="__codelineno-0-7" href="#__codelineno-0-7"></a>    <span class="n">alpha_pass2</span><span class="p">:</span> <span class="n"><span title="float">float</span></span> <span class="o">=</span> <span class="mf">1.2</span><span class="p">,</span>
+<a id="__codelineno-0-8" name="__codelineno-0-8" href="#__codelineno-0-8"></a>    <span class="n">ef_search</span><span class="p">:</span> <span class="n"><span title="int">int</span></span> <span class="o">=</span> <span class="mi">100</span><span class="p">,</span>
+<a id="__codelineno-0-9" name="__codelineno-0-9" href="#__codelineno-0-9"></a>    <span class="n">seed</span><span class="p">:</span> <span class="n"><span title="int">int</span></span> <span class="o">=</span> <span class="mi">42</span><span class="p">,</span>
+<a id="__codelineno-0-10" name="__codelineno-0-10" href="#__codelineno-0-10"></a>    <span class="n">verbose</span><span class="p">:</span> <span class="n"><span title="bool">bool</span></span> <span class="o">=</span> <span class="kc">False</span><span class="p">,</span>
+<a id="__codelineno-0-11" name="__codelineno-0-11" href="#__codelineno-0-11"></a><span class="p">)</span>
+</code></pre></div>
+
+    <div class="doc doc-contents ">
+            <p class="doc doc-class-bases">
+              Bases: <code><span title="ann_search.quantised._BaseQuantisedIndex">_BaseQuantisedIndex</span></code></p>
+
+
+
+        <p>Quantised graph (SymphonyQG-style): a Vamana graph with RaBitQ neighbour
+blocks.</p>
+<p>Every vertex stores its own neighbours' one-bit RaBitQ codes in the
+fast-scan layout, so one hop estimates all <code>degree</code> neighbours in a single
+SIMD sweep instead of one random read per neighbour. The exact distance is
+computed only for the vertices the walk pops, so the returned distances are
+exact and there is no separate re-ranking stage.</p>
+<p><strong>This one is not about memory.</strong> Each code is stored once per in-edge and
+the float vectors stay resident, so the index comes out at two to three
+times the raw data. The point is query speed at a given recall. For a small
+graph index use <code>HnswRaBitQIndex</code>.</p>
+
+
+<p><span class="doc-section-title">Parameters:</span></p>
+    <table>
+      <thead>
+        <tr>
+          <th>Name</th>
+          <th>Type</th>
+          <th>Description</th>
+          <th>Default</th>
+        </tr>
+      </thead>
+      <tbody>
+          <tr class="doc-section-item">
+            <td>
+                <code>n_neighbors</code>
+            </td>
+            <td>
+                  <code><span title="int">int</span></code>
+            </td>
+            <td>
+              <div class="doc-md-description">
+                <p>Neighbours per query, and the default <code>k</code> for
+<code>kneighbors</code>.</p>
+              </div>
+            </td>
+            <td>
+                  <code>15</code>
+            </td>
+          </tr>
+          <tr class="doc-section-item">
+            <td>
+                <code>metric</code>
+            </td>
+            <td>
+                  <code><span title="str">str</span></code>
+            </td>
+            <td>
+              <div class="doc-md-description">
+                <p><code>"euclidean"</code>/<code>"l2"</code>, <code>"sqeuclidean"</code> or <code>"cosine"</code>.</p>
+              </div>
+            </td>
+            <td>
+                  <code>&#39;euclidean&#39;</code>
+            </td>
+          </tr>
+          <tr class="doc-section-item">
+            <td>
+                <code>degree</code>
+            </td>
+            <td>
+                  <code><span title="int">int</span></code>
+            </td>
+            <td>
+              <div class="doc-md-description">
+                <p>Neighbour slots per vertex, a non-zero multiple of 32. <code>32</code> is
+exactly one sweep per hop; doubling it doubles both the code memory
+and the per-hop work.</p>
+              </div>
+            </td>
+            <td>
+                  <code>32</code>
+            </td>
+          </tr>
+          <tr class="doc-section-item">
+            <td>
+                <code>l_build</code>
+            </td>
+            <td>
+                  <code><span title="int">int</span></code>
+            </td>
+            <td>
+              <div class="doc-md-description">
+                <p>Beam width for the second Vamana pass, where the build time
+goes. The first pass runs at the crate's narrower default.</p>
+              </div>
+            </td>
+            <td>
+                  <code>64</code>
+            </td>
+          </tr>
+          <tr class="doc-section-item">
+            <td>
+                <code>alpha_pass1</code>
+            </td>
+            <td>
+                  <code><span title="float">float</span></code>
+            </td>
+            <td>
+              <div class="doc-md-description">
+                <p>Relaxed-neighbour factor on the first pruning pass.</p>
+              </div>
+            </td>
+            <td>
+                  <code>1.0</code>
+            </td>
+          </tr>
+          <tr class="doc-section-item">
+            <td>
+                <code>alpha_pass2</code>
+            </td>
+            <td>
+                  <code><span title="float">float</span></code>
+            </td>
+            <td>
+              <div class="doc-md-description">
+                <p>Same on the second pass. Above 1 keeps longer edges.</p>
+              </div>
+            </td>
+            <td>
+                  <code>1.2</code>
+            </td>
+          </tr>
+          <tr class="doc-section-item">
+            <td>
+                <code>ef_search</code>
+            </td>
+            <td>
+                  <code><span title="int">int</span></code>
+            </td>
+            <td>
+              <div class="doc-md-description">
+                <p>Beam width at query time, the recall knob. Search-time:
+override it per call as <code>index.kneighbors(ef_search=200)</code>.</p>
+              </div>
+            </td>
+            <td>
+                  <code>100</code>
+            </td>
+          </tr>
+          <tr class="doc-section-item">
+            <td>
+                <code>seed</code>
+            </td>
+            <td>
+                  <code><span title="int">int</span></code>
+            </td>
+            <td>
+              <div class="doc-md-description">
+                <p>Fixes the graph and the rotation.</p>
+              </div>
+            </td>
+            <td>
+                  <code>42</code>
+            </td>
+          </tr>
+          <tr class="doc-section-item">
+            <td>
+                <code>verbose</code>
+            </td>
+            <td>
+                  <code><span title="bool">bool</span></code>
+            </td>
+            <td>
+              <div class="doc-md-description">
+                <p>Progress to the process stdout on query, not <code>sys.stdout</code>.
+The build is silent.</p>
               </div>
             </td>
             <td>

@@ -978,7 +978,7 @@ is about when it isn't the right call.</p>
   of the approximate indices and the two knobs (<code>nlist</code>, <code>nprobe</code>) are easy to
   reason about.</li>
 <li><strong>You have a GPU and n is large</strong>: <code>CagraGpuIndex</code>. See <a href="../gpu/">GPU</a>.</li>
-<li><strong>You need Manhattan</strong>: that rules out twenty of them. See the table.</li>
+<li><strong>You need Manhattan</strong>: that rules out twenty-two of them. See the table.</li>
 </ul>
 <h2 id="the-table">The table<a class="headerlink" href="#the-table" title="Permanent link">&para;</a></h2>
 <table>
@@ -1140,6 +1140,20 @@ is about when it isn't the right call.</p>
 <td><code>ef_search</code></td>
 </tr>
 <tr>
+<td><code>HnswRaBitQIndex</code></td>
+<td>no</td>
+<td>layered graph over RaBitQ codes, no vectors</td>
+<td>no</td>
+<td><code>ef_search</code>, <code>ex_bits</code></td>
+</tr>
+<tr>
+<td><code>QgIndex</code></td>
+<td>no</td>
+<td>Vamana graph with RaBitQ neighbour blocks</td>
+<td>no</td>
+<td><code>ef_search</code></td>
+</tr>
+<tr>
 <td><code>ExhaustivePqIndex</code></td>
 <td>no</td>
 <td>none, product codes</td>
@@ -1286,7 +1300,7 @@ against it, and only then decide whether the recall you're getting is the recall
 you need. But check the timings while you're there. Beating a blocked GEMM is a
 higher bar than beating brute force.</p>
 <h3 id="quantised">Quantised<a class="headerlink" href="#quantised" title="Permanent link">&para;</a></h3>
-<p>Eleven more estimators, covered on their own page: <a href="../quantised/">Quantised</a>.
+<p>Thirteen more estimators, covered on their own page: <a href="../quantised/">Quantised</a>.
 The short version is that they store compressed vectors instead of floats, so
 they trade recall for memory, and that the distances they hand back are the
 codec's estimate rather than the distance.</p>
@@ -1295,8 +1309,9 @@ commit. <code>HnswSq8uIndex</code> is the usual starting point, at a quarter of 
 <em>vector</em> memory with the same <code>ef_search</code> knob, but the codec is not cheap: on
 the benchmark runs it gives up 0.07 recall against plain HNSW on Euclidean and
 0.26 to 0.33 on cosine. <code>IvfSq8Index</code> if you were already on <code>IvfIndex</code>. The PQ
-family when a quarter isn't enough of a saving, which in practice means a
-high-dimensional embedding space.</p>
+family or <code>HnswRaBitQIndex</code> when a quarter isn't enough of a saving, which in
+practice means a high-dimensional embedding space. <code>QgIndex</code> sits in the same
+module but is the opposite trade: bigger than the raw data, for query speed.</p>
 <h2 id="measuring-rather-than-guessing">Measuring rather than guessing<a class="headerlink" href="#measuring-rather-than-guessing" title="Permanent link">&para;</a></h2>
 <p>None of the above tells you what recall you'll get on your data. The crate's
 benchmark tables sweep every index over four synthetic distributions with hard
@@ -1305,6 +1320,8 @@ numbers for build time, query time, recall and index size:</p>
 <li><a href="https://github.com/GregorLueg/ann-search-rs/blob/main/docs/benchmarks_standard.md">Standard indices</a></li>
 <li><a href="https://github.com/GregorLueg/ann-search-rs/blob/main/docs/benchmarks_knn_graph.md">kNN graph construction</a></li>
 <li><a href="https://github.com/GregorLueg/ann-search-rs/blob/main/docs/benchmarks_gpu.md">GPU indices</a></li>
+<li><a href="https://github.com/GregorLueg/ann-search-rs/blob/main/docs/benchmarks_quantised.md">Quantised indices</a></li>
+<li><a href="https://github.com/GregorLueg/ann-search-rs/blob/main/docs/benchmarks_binary.md">Binary and RaBitQ indices</a></li>
 </ul>
 <p>Those runs use the same generators and seeds as
 <a href="../api/datasets/"><code>ann_search.datasets</code></a>, so a Python measurement and a

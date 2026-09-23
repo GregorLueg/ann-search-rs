@@ -996,13 +996,14 @@ is free and preserves ordering.</p>
 squared Euclidean and warn to a stdout you can't see, which is a much worse
 failure across FFI than a loud one. Nothing in this package sends the core a
 string it hasn't already validated.</p>
-<p>Twenty indices don't support Manhattan, the eleven quantised ones included:
+<p>Twenty-two indices don't support Manhattan, the thirteen quantised ones included:
 every codec there is built on inner products, which is what makes the integer
 arithmetic work. See the <a href="../choosing/#the-table">table</a>; asking for it raises
 rather than falling back.</p>
 <h2 id="distances-from-a-quantised-index-are-estimates">Distances from a quantised index are estimates<a class="headerlink" href="#distances-from-a-quantised-index-are-estimates" title="Permanent link">&para;</a></h2>
-<p>The eleven <a href="../quantised/">quantised</a> estimators report the codec's estimate of
-a distance, not the distance. Close enough to rank on, which is what an index
+<p>The <a href="../quantised/">quantised</a> estimators report the codec's estimate of a
+distance, not the distance. <code>QgIndex</code> is the exception: it keeps the float
+vectors and returns exact distances. Close enough to rank on, which is what an index
 is for, and not something to feed anywhere the absolute value matters without
 checking it against <code>ExhaustiveIndex</code> first. Recall is the honest way to
 compare two of them.</p>

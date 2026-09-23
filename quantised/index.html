@@ -458,6 +458,17 @@
   
 </li>
         
+          <li class="md-nav__item">
+  <a href="#rabitq-graphs" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        RaBitQ graphs
+      
+    </span>
+  </a>
+  
+</li>
+        
       </ul>
     </nav>
   
@@ -845,6 +856,17 @@
   
 </li>
         
+          <li class="md-nav__item">
+  <a href="#rabitq-graphs" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        RaBitQ graphs
+      
+    </span>
+  </a>
+  
+</li>
+        
       </ul>
     </nav>
   
@@ -887,17 +909,18 @@
 
 
 <h1 id="quantised-indices">Quantised indices<a class="headerlink" href="#quantised-indices" title="Permanent link">&para;</a></h1>
-<p>Eleven more estimators, all of them the same indices you already have over
-compressed vectors. They exist for one reason: memory. A float32 index stores
-<code>dim</code> floats per vector, and on a few million cells at 512 dimensions that
-stops being a rounding error.</p>
+<p>Thirteen more estimators, almost all of them the same indices you already have
+over compressed vectors. They exist for one reason: memory. A float32 index
+stores <code>dim</code> floats per vector, and on a few million cells at 512 dimensions
+that stops being a rounding error. <code>QgIndex</code> is the odd one out and spends its
+codes on speed instead, see below.</p>
 <p>Nothing about the surface changes. Same <code>fit</code> / <code>kneighbors</code> / <code>save</code>, same
 padding rules, float32 and float64 both supported.</p>
 <h2 id="the-one-thing-to-internalise">The one thing to internalise<a class="headerlink" href="#the-one-thing-to-internalise" title="Permanent link">&para;</a></h2>
 <p><strong>A quantised index reports the codec's estimate of a distance, not the
 distance.</strong> It's close enough to rank on, which is what an index is for. It is
 not something to feed anywhere the absolute value matters without checking it
-against <code>ExhaustiveIndex</code> first.</p>
+against <code>ExhaustiveIndex</code> first. <code>QgIndex</code> is the exception, see below.</p>
 <p>This also means recall is the only honest way to compare two of them. A
 distance-ratio comparison between a quantised index and an exact one conflates
 the retrieval error with the codec's, and the crate's own benchmark tables
@@ -987,9 +1010,31 @@ and answers nothing.</p>
 <p>Unlike the unquantised <code>SoarIndex</code>, here the doubling really does show up in
 the index size, because the codes <em>are</em> the storage: <code>SoarPqIndex</code> runs about
 2x an <code>IvfPqIndex</code> at the same <code>m</code>. <code>SoarOpqIndex</code> is the largest index of the
-eleven, not the smallest, since it pays for the spilling and the rotation
+PQ family, not the smallest, since it pays for the spilling and the rotation
 matrix both. An <code>IvfOpqIndex</code> at twice the <code>m</code> is smaller and quicker to build
 at matching memory.</p>
+<h3 id="rabitq-graphs">RaBitQ graphs<a class="headerlink" href="#rabitq-graphs" title="Permanent link">&para;</a></h3>
+<p><code>HnswRaBitQIndex</code>, <code>QgIndex</code>.</p>
+<p>Two graph indices on RaBitQ codes, pulling in opposite directions.</p>
+<p><strong><code>HnswRaBitQIndex</code></strong> links an ordinary HNSW on exact distances, then encodes
+every vector and drops it. What stays resident is the topology plus one code of
+<code>ex_bits + 1</code> bits per coordinate, and queries answer from the codes alone. On
+the benchmark runs at 50k by 256 that is 11 to 28 MB against 49 MB of raw data.</p>
+<p><code>ex_bits</code> is the dial, and since quantisation happens after linking it moves
+accuracy and size without touching the graph. On the correlated generator at
+256 dimensions and <code>m=16</code> recall tops out near 0.78 at <code>ex_bits=1</code>, 0.93 at 3, 0.98 at 5 (the
+default) and 0.996 at 8. Below 5 raising <code>ef_search</code> stops helping early: the
+ceiling is the codec, not the beam. Distances are estimates, so re-rank against
+your own vectors if you need exact ones.</p>
+<p><strong><code>QgIndex</code></strong> is the SymphonyQG-style quantised graph. A Vamana graph where
+every vertex also stores its neighbours' one-bit codes in the fast-scan layout,
+so one hop estimates all of them in a single SIMD sweep. The walk computes the
+exact distance for every vertex it pops, so the returned distances are exact
+and there is no re-ranking stage.</p>
+<p><strong>It is not a memory saving.</strong> Each code is stored once per in-edge and the
+float vectors stay resident: 2.1 to 2.4x the raw data at the default
+<code>degree=32</code>, 3.3 to 3.8x at 64. What it buys is query speed at high recall.
+<code>degree</code> must be a multiple of 32; 32 is one sweep per hop.</p>
 <h2 id="picking-one">Picking one<a class="headerlink" href="#picking-one" title="Permanent link">&para;</a></h2>
 <div class="highlight"><pre><span></span><code><a id="__codelineno-0-1" name="__codelineno-0-1" href="#__codelineno-0-1"></a><span class="kn">import</span><span class="w"> </span><span class="nn">ann_search</span><span class="w"> </span><span class="k">as</span><span class="w"> </span><span class="nn">ann</span>
 <a id="__codelineno-0-2" name="__codelineno-0-2" href="#__codelineno-0-2"></a>
@@ -1004,6 +1049,8 @@ generators with build time, query time, recall and index size. The PQ-family
 runs are at higher dimensionality with fewer samples, since that's the regime
 those methods are for. Don't extrapolate parameters for your own problem from
 them.</p>
+<p>The RaBitQ graphs have <a href="https://github.com/GregorLueg/ann-search-rs/blob/main/docs/benchmarks_binary.md#rabitq-graphs-qg-and-hnsw-rabitq">their own tables</a>, at 50k samples and 256 to 768
+dimensions.</p>
 
 
 
