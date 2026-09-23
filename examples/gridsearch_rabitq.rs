@@ -257,7 +257,7 @@ fn main() {
                 Some(*nprobe),
                 false,
                 None,
-                true,
+                false,
                 false,
             )
             .unwrap();
@@ -382,7 +382,7 @@ fn main() {
 
     print_results_size(
         &format!(
-            "{}k samples, {}D - IVF-RaBitQ",
+            "{}k samples, {}D - RaBitQ (IVF and exhaustive)",
             cli.n_samples / 1000,
             cli.dim
         ),

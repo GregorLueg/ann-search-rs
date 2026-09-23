@@ -3,6 +3,18 @@
 Changes to the `ann-search` Python package. The Rust crate it wraps,
 `ann-search-rs`, has its own changelog at [`../CHANGELOG.md`](../CHANGELOG.md).
 
+## 0.3.0
+
+Requires `ann-search-rs` 0.9.0.
+
+- Takes in the RaBitQ rework: a fast Hadamard rotation and fast-scan distance
+  estimation. RaBitQ indices saved with an earlier version cannot be loaded.
+- New `QgIndex` and `HnswRaBitQIndex`, the two RaBitQ graph indices. The wheel
+  now builds the crate's `binary` feature, which adds `statrs` (and with it
+  `nalgebra`) to the dependency tree.
+- `VamanaIndex` runs its first pass at the crate's narrow default beam instead
+  of `l_build`, following the core change to `build_vamana_index`.
+
 ## 0.2.4
 
 Requires `ann-search-rs` 0.8.5.

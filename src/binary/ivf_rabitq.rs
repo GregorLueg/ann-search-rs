@@ -15,6 +15,7 @@ use std::sync::Arc;
 use thousands::*;
 
 use crate::binary::dist_binary::*;
+use crate::binary::rabitq::rotator::RotatorKind;
 use crate::binary::rabitq::*;
 use crate::binary::vec_store::*;
 use crate::prelude::*;
@@ -117,12 +118,42 @@ where
     /// ### Returns
     ///
     /// Initialised self
-    #[allow(clippy::too_many_arguments)]
     pub fn build(
         data: impl AnnMatrix<T>,
         metric: Dist,
         nlist: Option<usize>,
         k_means_params: Option<KMeansTrainingParams>,
+        seed: usize,
+        verbose: bool,
+    ) -> Result<Self, AnnSearchErrors> {
+        Self::build_with_rotator_kind(data, metric, nlist, k_means_params, None, seed, verbose)
+    }
+
+    /// Build IVF-RaBitQ index with an explicitly chosen rotation
+    ///
+    /// ### Params
+    ///
+    /// * `data` - Data matrix (n × dim)
+    /// * `metric` - Distance metric
+    /// * `nlist` - Number of IVF cells (defaults to sqrt(n))
+    /// * `k_means_params` - Optional k-means trainings parameters, see
+    ///   [KMeansTrainingParams]. If not provided, will default to sensible
+    ///   defaults.
+    /// * `rotator_kind` - Which rotation to encode with, or `None` to let the
+    ///   dimensionality decide
+    /// * `seed` - Random seed
+    /// * `verbose` - Print progress
+    ///
+    /// ### Returns
+    ///
+    /// Initialised self
+    #[allow(clippy::too_many_arguments)]
+    pub fn build_with_rotator_kind(
+        data: impl AnnMatrix<T>,
+        metric: Dist,
+        nlist: Option<usize>,
+        k_means_params: Option<KMeansTrainingParams>,
+        rotator_kind: Option<RotatorKind>,
         seed: usize,
         verbose: bool,
     ) -> Result<Self, AnnSearchErrors> {
@@ -227,7 +258,10 @@ where
         );
 
         // create encoder with shared rotation
-        let encoder = RaBitQEncoder::new(dim, metric, seed as u64);
+        let encoder = match rotator_kind {
+            Some(kind) => RaBitQEncoder::with_rotator_kind(dim, metric, kind, seed as u64)?,
+            None => RaBitQEncoder::new(dim, metric, seed as u64),
+        };
 
         // build CSR storage
         let storage = build_rabitq_storage(
@@ -274,6 +308,48 @@ where
         metric: Dist,
         nlist: Option<usize>,
         k_means_params: Option<KMeansTrainingParams>,
+        seed: usize,
+        verbose: bool,
+        save_path: impl AsRef<Path>,
+    ) -> Result<Self, AnnSearchErrors> {
+        Self::build_with_vector_store_and_rotator_kind(
+            data,
+            metric,
+            nlist,
+            k_means_params,
+            None,
+            seed,
+            verbose,
+            save_path,
+        )
+    }
+
+    /// Build IVF-RaBitQ index with a vector store and an explicitly chosen rotation
+    ///
+    /// ### Params
+    ///
+    /// * `data` - Data matrix (n × dim)
+    /// * `metric` - Distance metric
+    /// * `nlist` - Number of IVF cells (defaults to sqrt(n))
+    /// * `k_means_params` - Optional k-means trainings parameters, see
+    ///   [KMeansTrainingParams]. If not provided, will default to sensible
+    ///   defaults.
+    /// * `rotator_kind` - Which rotation to encode with, or `None` to let the
+    ///   dimensionality decide
+    /// * `seed` - Random seed
+    /// * `verbose` - Print progress
+    /// * `save_path` - Path to save vector store
+    ///
+    /// ### Returns
+    ///
+    /// Initialised self
+    #[allow(clippy::too_many_arguments)]
+    pub fn build_with_vector_store_and_rotator_kind(
+        data: impl AnnMatrix<T>,
+        metric: Dist,
+        nlist: Option<usize>,
+        k_means_params: Option<KMeansTrainingParams>,
+        rotator_kind: Option<RotatorKind>,
         seed: usize,
         verbose: bool,
         save_path: impl AsRef<Path>,
@@ -378,7 +454,10 @@ where
             &metric,
         );
 
-        let encoder = RaBitQEncoder::new(dim, metric, seed as u64);
+        let encoder = match rotator_kind {
+            Some(kind) => RaBitQEncoder::with_rotator_kind(dim, metric, kind, seed as u64)?,
+            None => RaBitQEncoder::new(dim, metric, seed as u64),
+        };
 
         let storage = build_rabitq_storage(
             &vectors_for_storage,
@@ -462,15 +541,19 @@ where
         for c_idx in probed {
             let query_encoded = self
                 .encoder
-                .encode_query_prerotated(&q_rot, self.storage.centroid_rotated(c_idx));
+                .encode_query_prerotated(&q_rot, self.storage.centroid_rotated(c_idx))?;
             let cluster_size = self.storage.cluster_size(c_idx);
             let indices = self.storage.cluster_vector_indices(c_idx);
 
             let mut local_idx = 0;
             while local_idx < cluster_size {
                 let take = RABITQ_BLOCK.min(cluster_size - local_idx);
-                let block_min =
-                    self.rabitq_block_sq(&query_encoded, c_idx, local_idx, &mut block[..take]);
+                let block_min = self.rabitq_block_sq_fastscan(
+                    &query_encoded,
+                    c_idx,
+                    local_idx,
+                    &mut block[..take],
+                );
 
                 if heap.len() < k || block_min < heap.peek().unwrap().0 .0 {
                     for (j, &dist) in block[..take].iter().enumerate() {
@@ -712,6 +795,7 @@ where
             meta.check(self.n, self.storage.dim)?;
         }
         self.vector_store = MmapVectorStore::open_in_dir(dir, self.store_meta)?;
+        self.storage.reblock_for_this_arch();
 
         Ok(())
     }

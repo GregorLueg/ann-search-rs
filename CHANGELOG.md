@@ -3,6 +3,54 @@
 Changes to the `ann-search-rs` crate. The Python package `ann-search` has its
 own changelog at [`python/CHANGELOG.md`](python/CHANGELOG.md).
 
+## 0.9.0
+
+**Features**
+
+- New quantised graph index (`QgIndex`, `build_qg_index` / `query_qg_index` /
+  `query_qg_self`), after SymphonyQG. A Vamana graph where every vertex also
+  carries its own neighbours' one-bit RaBitQ codes, quantised against that
+  vertex and laid out so one hop estimates all of them with a single SIMD
+  sweep. Exact distances are computed only for the vertices the walk pops,
+  which is also the anchor the estimates need, so there is no re-ranking stage.
+  It is the fastest index in the crate at high recall and it costs roughly two
+  to three times the memory of the raw vectors, since each code is stored once
+  per in-edge. Build time is Vamana's.
+- New HNSW over RaBitQ+ codes (`HnswRaBitQIndex`, `build_hnsw_rabitq_index` /
+  `query_hnsw_rabitq_index` / `query_hnsw_rabitq_self`, needs `binary` and
+  `quantised`). The graph is linked on exact distances and the vectors are
+  dropped, so the index is its topology plus one `ex_bits + 1`-bit code per
+  coordinate. `ex_bits` trades size for recall. Saves and loads under
+  `serialise` like the other indices.
+- RaBitQ gained a fast Hadamard plus Kac-walk rotation, selected automatically
+  from 192 dimensions up. It replaces a dense `dim x dim` matvec per vector with
+  an `O(dim log dim)` transform and shrinks the stored rotation from `dim^2`
+  floats to four bits per coordinate. `RotatorKind` picks it explicitly where
+  the default would not. Recall is unchanged.
+- The rotation pads to a whole number of code bytes, and at the Hadamard's
+  64-coordinate multiple those extra bits carry real signal rather than padding,
+  so recall improves where the dimensionality is not already a multiple of 64.
+- Better default setting for the beam search in Vamana yielding faster index
+  build times and additionally performance improvements from the other indices
+  were integrated into Vamana.
+
+**Breaking**
+
+- The RaBitQ indices (`IvfIndexRaBitQ`, `ExhaustiveIndexRaBitQ`) now estimate
+  distances with a fast-scan nibble table rather than int4 query bit-planes. The
+  int4 path is gone, and with it `RaBitQQuery`, `build_query_planes`,
+  `unpack_query_planes`, `dot_query_binary_planes`, `RABITQ_QUERY_PLANES` and
+  the `rabitq_dist`, `rabitq_dist_sq`, `rabitq_block_sq`, `dot_query_binary` and
+  `popcount` methods on `VectorDistanceRaBitQ`. `encode_query` and
+  `encode_query_prerotated` return a `SignScanQuery` and the latter is now
+  fallible. Codes are stored only in the blocked scan layout, so
+  `RaBitQStorage::binary_codes`, `cluster_binary_codes` and `vector_binary` are
+  gone too; the saved format records which architecture packed the codes and
+  re-blocks on load, so indices still move between x86 and aarch64.
+- `RaBitQPackedVector` no longer carries `popcount`, and `encode_vector` returns
+  three values rather than four.
+- Saved RaBitQ indices from 0.8.x cannot be loaded.
+
 ## 0.8.5
 
 **Features**

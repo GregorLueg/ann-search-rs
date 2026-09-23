@@ -1,9 +1,10 @@
 # Quantised indices
 
-Eleven more estimators, all of them the same indices you already have over
-compressed vectors. They exist for one reason: memory. A float32 index stores
-`dim` floats per vector, and on a few million cells at 512 dimensions that
-stops being a rounding error.
+Thirteen more estimators, almost all of them the same indices you already have
+over compressed vectors. They exist for one reason: memory. A float32 index
+stores `dim` floats per vector, and on a few million cells at 512 dimensions
+that stops being a rounding error. `QgIndex` is the odd one out and spends its
+codes on speed instead, see below.
 
 Nothing about the surface changes. Same `fit` / `kneighbors` / `save`, same
 padding rules, float32 and float64 both supported.
@@ -13,7 +14,7 @@ padding rules, float32 and float64 both supported.
 **A quantised index reports the codec's estimate of a distance, not the
 distance.** It's close enough to rank on, which is what an index is for. It is
 not something to feed anywhere the absolute value matters without checking it
-against `ExhaustiveIndex` first.
+against `ExhaustiveIndex` first. `QgIndex` is the exception, see below.
 
 This also means recall is the only honest way to compare two of them. A
 distance-ratio comparison between a quantised index and an exact one conflates
@@ -128,9 +129,38 @@ and answers nothing.
 Unlike the unquantised `SoarIndex`, here the doubling really does show up in
 the index size, because the codes *are* the storage: `SoarPqIndex` runs about
 2x an `IvfPqIndex` at the same `m`. `SoarOpqIndex` is the largest index of the
-eleven, not the smallest, since it pays for the spilling and the rotation
+PQ family, not the smallest, since it pays for the spilling and the rotation
 matrix both. An `IvfOpqIndex` at twice the `m` is smaller and quicker to build
 at matching memory.
+
+### RaBitQ graphs
+
+`HnswRaBitQIndex`, `QgIndex`.
+
+Two graph indices on RaBitQ codes, pulling in opposite directions.
+
+**`HnswRaBitQIndex`** links an ordinary HNSW on exact distances, then encodes
+every vector and drops it. What stays resident is the topology plus one code of
+`ex_bits + 1` bits per coordinate, and queries answer from the codes alone. On
+the benchmark runs at 50k by 256 that is 11 to 28 MB against 49 MB of raw data.
+
+`ex_bits` is the dial, and since quantisation happens after linking it moves
+accuracy and size without touching the graph. On the correlated generator at
+256 dimensions and `m=16` recall tops out near 0.78 at `ex_bits=1`, 0.93 at 3, 0.98 at 5 (the
+default) and 0.996 at 8. Below 5 raising `ef_search` stops helping early: the
+ceiling is the codec, not the beam. Distances are estimates, so re-rank against
+your own vectors if you need exact ones.
+
+**`QgIndex`** is the SymphonyQG-style quantised graph. A Vamana graph where
+every vertex also stores its neighbours' one-bit codes in the fast-scan layout,
+so one hop estimates all of them in a single SIMD sweep. The walk computes the
+exact distance for every vertex it pops, so the returned distances are exact
+and there is no re-ranking stage.
+
+**It is not a memory saving.** Each code is stored once per in-edge and the
+float vectors stay resident: 2.1 to 2.4x the raw data at the default
+`degree=32`, 3.3 to 3.8x at 64. What it buys is query speed at high recall.
+`degree` must be a multiple of 32; 32 is one sweep per hop.
 
 ## Picking one
 
@@ -151,4 +181,8 @@ runs are at higher dimensionality with fewer samples, since that's the regime
 those methods are for. Don't extrapolate parameters for your own problem from
 them.
 
+The RaBitQ graphs have [their own tables][2], at 50k samples and 256 to 768
+dimensions.
+
 [1]: https://github.com/GregorLueg/ann-search-rs/blob/main/docs/benchmarks_quantised.md
+[2]: https://github.com/GregorLueg/ann-search-rs/blob/main/docs/benchmarks_binary.md#rabitq-graphs-qg-and-hnsw-rabitq

@@ -11,7 +11,7 @@
 //! [`crate::quantised::uniform_quant`] and [`crate::quantised::int_kernels`],
 //! because the exhaustive and IVF indices use them too.
 
-pub mod build;
 pub mod codec;
-pub mod flat_graph;
 pub mod index;
+
+pub use crate::utils::hnsw_graph::{build, flat_graph};

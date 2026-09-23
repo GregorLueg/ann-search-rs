@@ -74,9 +74,14 @@ use crate::utils::nndescent_utils::ApplySortedUpdates;
 use crate::utils::pack_knn_results;
 
 #[cfg(feature = "binary")]
+use faer_traits::ComplexField;
+
+#[cfg(all(feature = "binary", feature = "quantised"))]
+use crate::binary::rabitq::codec::HnswRaBitQIndex;
+#[cfg(feature = "binary")]
 use crate::binary::{
     exhaustive_binary::*, exhaustive_rabitq::*, exhaustive_tq::*, ivf_binary::*, ivf_rabitq::*,
-    ivf_tq::*,
+    ivf_tq::*, qg::*, rabitq::rotator::RotatorKind,
 };
 #[cfg(feature = "gpu")]
 use crate::gpu::{exhaustive_gpu::*, ivf_gpu::*};
@@ -1437,6 +1442,9 @@ where
 ///   `(&[T], n_samples, n_features)` tuple. See [`AnnMatrix`].
 /// * `r` - Maximum out-degree (edges per node).
 /// * `l_build` - Beam width during construction.
+/// * `l_build_pass1` - Beam width for the first pass, capped at `l_build`.
+///   `None` picks the default, which is a small constant: a wide first pass is
+///   both slower and worse. Pass `Some(l_build)` for symmetric passes.
 /// * `alpha_pass1` - Pruning alpha for pass 1 (typically 1.0).
 /// * `alpha_pass2` - Pruning alpha for pass 2 (typically 1.2–1.5).
 /// * `dist_metric` - Distance metric: "euclidean", "cosine" or "manhatten".
@@ -1445,10 +1453,12 @@ where
 /// ### Returns
 ///
 /// The built `VamanaIndex`.
+#[allow(clippy::too_many_arguments)]
 pub fn build_vamana_index<T>(
     mat: impl AnnMatrix<T>,
     r: usize,
     l_build: usize,
+    l_build_pass1: Option<usize>,
     alpha_pass1: f32,
     alpha_pass2: f32,
     dist_metric: &str,
@@ -1463,7 +1473,16 @@ where
         Dist::default()
     });
 
-    VamanaIndex::build(mat, metric, r, l_build, alpha_pass1, alpha_pass2, seed)
+    VamanaIndex::build(
+        mat,
+        metric,
+        r,
+        l_build,
+        l_build_pass1,
+        alpha_pass1,
+        alpha_pass2,
+        seed,
+    )
 }
 
 /// Query a Vamana index with an external query matrix
@@ -4572,4 +4591,339 @@ where
     T: AnnSearchFloat + Pod,
 {
     index.generate_knn(k, nprobe, rerank_factor, return_dist, verbose)
+}
+
+/////////////////////
+// Quantised graph //
+/////////////////////
+
+#[cfg(feature = "binary")]
+/// Helper function to build a quantised graph (QG) index
+///
+/// A Vamana graph where every vertex also carries its own neighbours' one-bit
+/// RaBitQ codes, laid out so one hop estimates all of them with a single SIMD
+/// sweep. The exact distance is computed only for vertices the walk actually
+/// pops, which is also the anchor the estimates need, so there is no separate
+/// re-ranking stage.
+///
+/// Expect roughly two to three times the memory of the raw vectors: each
+/// vector's code is stored once per in-edge, on top of the vectors the exact
+/// distances still need. See [`build_ivf_index_rabitq`] for the low-memory
+/// RaBitQ index.
+///
+/// ### Params
+///
+/// * `mat` - Data as samples x features. Accepts a faer matrix, an ndarray
+///   2-D array (with the `ndarray` feature) or a row-major
+///   `(&[T], n_samples, n_features)` tuple. See [`AnnMatrix`].
+/// * `degree` - Neighbour slots per vertex. Must be a non-zero multiple of
+///   [`QG_BATCH`]; [`DEFAULT_QG_DEGREE`] is one sweep per hop.
+/// * `l_build` - Beam width during graph construction
+/// * `l_build_pass1` - Beam width for Vamana's first pass, capped at `l_build`.
+///   `None` picks the default, which is a small constant: a wide first pass is
+///   both slower and worse. Pass `Some(l_build)` for symmetric passes.
+/// * `alpha_pass1` - Vamana prune slack, first pass
+/// * `alpha_pass2` - Vamana prune slack, second pass
+/// * `dist_metric` - One of `"euclidean"`/`"l2"` or `"cosine"`. Manhattan is
+///   not supported.
+/// * `seed` - Random seed for reproducibility
+///
+/// ### Returns
+///
+/// The [`QgIndex`], or an error on an unsupported metric or an invalid degree
+#[allow(clippy::too_many_arguments)]
+pub fn build_qg_index<T>(
+    mat: impl AnnMatrix<T>,
+    degree: usize,
+    l_build: usize,
+    l_build_pass1: Option<usize>,
+    alpha_pass1: f32,
+    alpha_pass2: f32,
+    dist_metric: &str,
+    seed: usize,
+) -> Result<QgIndex<T>, AnnSearchErrors>
+where
+    T: AnnSearchFloat + ComplexField + ThreadLocalSearchState,
+    VamanaIndex<T>: VamanaState<T>,
+{
+    let metric = parse_ann_dist(dist_metric).unwrap_or_else(|| {
+        println!("[WARNING] Weird string used for distance metric. Using default squared Euclidean distance");
+        Dist::default()
+    });
+
+    QgIndex::build(
+        mat,
+        metric,
+        degree,
+        l_build,
+        l_build_pass1,
+        alpha_pass1,
+        alpha_pass2,
+        None,
+        seed,
+    )
+}
+
+#[cfg(feature = "binary")]
+/// Helper function to build a quantised graph index with a chosen rotation
+///
+/// As [`build_qg_index`], but the rotation is named rather than resolved from
+/// the dimensionality. See [`RotatorKind`].
+///
+/// ### Params
+///
+/// * `mat` - Data as samples x features. See [`AnnMatrix`].
+/// * `degree` - Neighbour slots per vertex, a non-zero multiple of [`QG_BATCH`]
+/// * `l_build` - Beam width during graph construction
+/// * `l_build_pass1` - Beam width for Vamana's first pass, capped at `l_build`.
+///   `None` picks the default, which is a small constant: a wide first pass is
+///   both slower and worse. Pass `Some(l_build)` for symmetric passes.
+/// * `alpha_pass1` - Vamana prune slack, first pass
+/// * `alpha_pass2` - Vamana prune slack, second pass
+/// * `dist_metric` - One of `"euclidean"`/`"l2"` or `"cosine"`
+/// * `rotator_kind` - Which rotation to encode with
+/// * `seed` - Random seed for reproducibility
+///
+/// ### Returns
+///
+/// The [`QgIndex`], or an error on an unsupported metric, an invalid degree, or
+/// a rotation the dimensionality cannot serve
+#[allow(clippy::too_many_arguments)]
+pub fn build_qg_index_with_rotator<T>(
+    mat: impl AnnMatrix<T>,
+    degree: usize,
+    l_build: usize,
+    l_build_pass1: Option<usize>,
+    alpha_pass1: f32,
+    alpha_pass2: f32,
+    dist_metric: &str,
+    rotator_kind: RotatorKind,
+    seed: usize,
+) -> Result<QgIndex<T>, AnnSearchErrors>
+where
+    T: AnnSearchFloat + ComplexField + ThreadLocalSearchState,
+    VamanaIndex<T>: VamanaState<T>,
+{
+    let metric = parse_ann_dist(dist_metric).unwrap_or_else(|| {
+        println!("[WARNING] Weird string used for distance metric. Using default squared Euclidean distance");
+        Dist::default()
+    });
+
+    QgIndex::build(
+        mat,
+        metric,
+        degree,
+        l_build,
+        l_build_pass1,
+        alpha_pass1,
+        alpha_pass2,
+        Some(rotator_kind),
+        seed,
+    )
+}
+
+#[cfg(feature = "binary")]
+/// Helper function to query a given quantised graph index
+///
+/// ### Params
+///
+/// * `query_mat` - Query data as samples x features. See [`AnnMatrix`].
+/// * `index` - Reference to the built QG index
+/// * `k` - Number of neighbours to return
+/// * `ef_search` - Beam width; higher means better recall and slower queries
+/// * `return_dist` - Shall the distances between the different points be
+///   returned
+/// * `verbose` - Print progress information
+///
+/// ### Returns
+///
+/// A tuple of `(knn_indices, optional distances)`
+pub fn query_qg_index<T>(
+    query_mat: impl AnnMatrix<T>,
+    index: &QgIndex<T>,
+    k: usize,
+    ef_search: usize,
+    return_dist: bool,
+    verbose: bool,
+) -> KnnOptionResult<T>
+where
+    T: AnnSearchFloat + ComplexField + ThreadLocalSearchState,
+    VamanaIndex<T>: VamanaState<T>,
+{
+    let (queries, nq, dim) = query_mat.into_row_major();
+
+    query_parallel(nq, return_dist, verbose, |i| {
+        index.query(&queries[i * dim..(i + 1) * dim], k, ef_search)
+    })
+}
+
+#[cfg(feature = "binary")]
+/// Helper function to generate the full kNN graph from a quantised graph index
+///
+/// ### Params
+///
+/// * `index` - Reference to the built QG index
+/// * `k` - Number of neighbours to return
+/// * `ef_search` - Beam width; higher means better recall and slower queries
+/// * `return_dist` - Shall the distances between the different points be
+///   returned
+/// * `verbose` - Print progress information
+///
+/// ### Returns
+///
+/// A tuple of `(knn_indices, optional distances)`
+pub fn query_qg_self<T>(
+    index: &QgIndex<T>,
+    k: usize,
+    ef_search: usize,
+    return_dist: bool,
+    verbose: bool,
+) -> KnnOptionResult<T>
+where
+    T: AnnSearchFloat + ComplexField + ThreadLocalSearchState,
+    VamanaIndex<T>: VamanaState<T>,
+{
+    index.generate_knn(k, ef_search, return_dist, verbose)
+}
+
+///////////////////
+// HNSW-RaBitQ+ //
+///////////////////
+
+#[cfg(all(feature = "binary", feature = "quantised"))]
+/// Build an HNSW index over RaBitQ+ codes
+///
+/// The graph is linked on exact distances and the float vectors are dropped
+/// afterwards, so the index is its codes plus its topology. Queries answer
+/// from the codes alone, which is what makes this the low-memory graph index:
+/// see [`build_qg_index`] for the variant that keeps the vectors and trades
+/// memory for exactness.
+///
+/// ### Params
+///
+/// * `mat` - Input data as samples x features. Accepts a faer matrix, an
+///   ndarray 2-D array (with the `ndarray` feature) or a row-major
+///   `(&[T], n_samples, n_features)` tuple. See [`AnnMatrix`].
+/// * `m` - Base connectivity parameter. Layer 0 gets `2 * m` slots
+/// * `ef_construction` - Beam width during construction
+/// * `dist_metric` - Distance metric: "euclidean" or "cosine". "manhattan" is
+///   not supported.
+/// * `ex_bits` - Magnitude bits per coordinate, `0..=MAX_EX_BITS`. The total
+///   code width is `ex_bits + 1`; 0 is plain one-bit RaBitQ
+/// * `nlist` - Centroid count for the codes. `None` picks `sqrt(n)`
+/// * `k_means_params` - Optional k-means settings, see
+///   [`KMeansTrainingParams`]
+/// * `seed` - Random seed for reproducibility
+/// * `verbose` - Print progress information during index construction
+///
+/// ### Returns
+///
+/// The [`HnswRaBitQIndex`], or an error on an unsupported metric or an
+/// invalid code width.
+///
+/// ### Note
+///
+/// The float vectors are not retained. Returned distances are estimates from
+/// the codes, so a caller that needs exact distances must re-rank against the
+/// originals itself.
+#[allow(clippy::too_many_arguments)]
+pub fn build_hnsw_rabitq_index<T>(
+    mat: impl AnnMatrix<T>,
+    m: usize,
+    ef_construction: usize,
+    dist_metric: &str,
+    ex_bits: usize,
+    nlist: Option<usize>,
+    k_means_params: Option<KMeansTrainingParams>,
+    seed: usize,
+    verbose: bool,
+) -> Result<HnswRaBitQIndex<T>, AnnSearchErrors>
+where
+    T: AnnSearchFloat + ThreadLocalSearchState,
+{
+    let metric = parse_ann_dist(dist_metric).unwrap_or_else(|| {
+        println!("[WARNING] Weird string used for distance metric. Using default squared Euclidean distance");
+        Dist::default()
+    });
+
+    HnswRaBitQIndex::build_rabitq(
+        mat,
+        m,
+        ef_construction,
+        metric,
+        ex_bits,
+        nlist,
+        k_means_params,
+        seed,
+        verbose,
+    )
+}
+
+#[cfg(all(feature = "binary", feature = "quantised"))]
+/// Helper function to query a given HNSW-RaBitQ+ index
+///
+/// ### Params
+///
+/// * `query_mat` - Query data as samples x features. Accepts a faer matrix,
+///   an ndarray 2-D array (with the `ndarray` feature) or a row-major
+///   `(&[T], n_queries, n_features)` tuple. See [`AnnMatrix`].
+/// * `index` - Reference to the built HNSW-RaBitQ+ index
+/// * `k` - Number of neighbours to return
+/// * `ef_search` - Size of candidate list during search (higher = better
+///   recall, slower)
+/// * `return_dist` - Shall the distances between the different points be
+///   returned
+/// * `verbose` - Print progress information
+///
+/// ### Returns
+///
+/// A tuple of `(knn_indices, optional distances)`
+pub fn query_hnsw_rabitq_index<T>(
+    query_mat: impl AnnMatrix<T>,
+    index: &HnswRaBitQIndex<T>,
+    k: usize,
+    ef_search: usize,
+    return_dist: bool,
+    verbose: bool,
+) -> KnnOptionResult<T>
+where
+    T: AnnSearchFloat + ThreadLocalSearchState,
+{
+    let (queries, nq, dim) = query_mat.into_row_major();
+
+    query_parallel(nq, return_dist, verbose, |i| {
+        index.query(&queries[i * dim..(i + 1) * dim], k, ef_search)
+    })
+}
+
+#[cfg(all(feature = "binary", feature = "quantised"))]
+/// Helper function to self query the HNSW-RaBitQ+ index
+///
+/// This function will generate a full kNN graph based on the internal data.
+/// Stored vectors query through their own codes, so no re-encoding happens.
+///
+/// ### Params
+///
+/// * `index` - Reference to the built HNSW-RaBitQ+ index
+/// * `k` - Number of neighbours to return
+/// * `ef_search` - Size of candidate list during search (higher = better
+///   recall, slower)
+/// * `return_dist` - Shall the distances between the different points be
+///   returned
+/// * `verbose` - Print progress information
+///
+/// ### Returns
+///
+/// A tuple of `(knn_indices, optional distances)`
+pub fn query_hnsw_rabitq_self<T>(
+    index: &HnswRaBitQIndex<T>,
+    k: usize,
+    ef_search: usize,
+    return_dist: bool,
+    verbose: bool,
+) -> KnnOptionResult<T>
+where
+    T: AnnSearchFloat + ThreadLocalSearchState,
+{
+    index.generate_knn(k, ef_search, return_dist, verbose)
 }

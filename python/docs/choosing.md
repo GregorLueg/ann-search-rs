@@ -28,7 +28,7 @@ Beyond that:
   of the approximate indices and the two knobs (`nlist`, `nprobe`) are easy to
   reason about.
 - **You have a GPU and n is large**: `CagraGpuIndex`. See [GPU](gpu.md).
-- **You need Manhattan**: that rules out twenty of them. See the table.
+- **You need Manhattan**: that rules out twenty-two of them. See the table.
 
 ## The table
 
@@ -55,6 +55,8 @@ Beyond that:
 | `ExhaustiveSq8Index` | no | none, 8-bit codes | no | none |
 | `IvfSq8Index` | no | Voronoi cells, 8-bit codes | no | `nprobe` |
 | `HnswSq8uIndex` | no | layered graph over 8-bit codes | no | `ef_search` |
+| `HnswRaBitQIndex` | no | layered graph over RaBitQ codes, no vectors | no | `ef_search`, `ex_bits` |
+| `QgIndex` | no | Vamana graph with RaBitQ neighbour blocks | no | `ef_search` |
 | `ExhaustivePqIndex` | no | none, product codes | no | none |
 | `IvfPqIndex` | no | Voronoi cells, product codes | no | `nprobe` |
 | `ExhaustiveOpqIndex` | no | none, rotated product codes | no | none |
@@ -194,7 +196,7 @@ higher bar than beating brute force.
 
 ### Quantised
 
-Eleven more estimators, covered on their own page: [Quantised](quantised.md).
+Thirteen more estimators, covered on their own page: [Quantised](quantised.md).
 The short version is that they store compressed vectors instead of floats, so
 they trade recall for memory, and that the distances they hand back are the
 codec's estimate rather than the distance.
@@ -204,8 +206,9 @@ commit. `HnswSq8uIndex` is the usual starting point, at a quarter of the
 *vector* memory with the same `ef_search` knob, but the codec is not cheap: on
 the benchmark runs it gives up 0.07 recall against plain HNSW on Euclidean and
 0.26 to 0.33 on cosine. `IvfSq8Index` if you were already on `IvfIndex`. The PQ
-family when a quarter isn't enough of a saving, which in practice means a
-high-dimensional embedding space.
+family or `HnswRaBitQIndex` when a quarter isn't enough of a saving, which in
+practice means a high-dimensional embedding space. `QgIndex` sits in the same
+module but is the opposite trade: bigger than the raw data, for query speed.
 
 ## Measuring rather than guessing
 
@@ -216,6 +219,8 @@ numbers for build time, query time, recall and index size:
 - [Standard indices](https://github.com/GregorLueg/ann-search-rs/blob/main/docs/benchmarks_standard.md)
 - [kNN graph construction](https://github.com/GregorLueg/ann-search-rs/blob/main/docs/benchmarks_knn_graph.md)
 - [GPU indices](https://github.com/GregorLueg/ann-search-rs/blob/main/docs/benchmarks_gpu.md)
+- [Quantised indices](https://github.com/GregorLueg/ann-search-rs/blob/main/docs/benchmarks_quantised.md)
+- [Binary and RaBitQ indices](https://github.com/GregorLueg/ann-search-rs/blob/main/docs/benchmarks_binary.md)
 
 Those runs use the same generators and seeds as
 [`ann_search.datasets`](api/datasets.md), so a Python measurement and a

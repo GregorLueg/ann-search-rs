@@ -20,7 +20,8 @@ ann_handle!(PyVamana, VamanaInner, VamanaIndex, "Vamana", {
     /// * `x` - Samples by features, C-contiguous float32 or float64.
     /// * `metric` - Already validated by the Python layer.
     /// * `r` - Maximum out-degree.
-    /// * `l_build` - Candidate list size during construction.
+    /// * `l_build` - Candidate list size during construction. The first pass
+    ///   runs at the crate's narrower default.
     /// * `alpha_pass1` - Relaxation factor for the first pruning pass.
     /// * `alpha_pass2` - Relaxation factor for the second. Above 1.0 keeps
     ///   longer edges, which shortens search paths.
@@ -47,6 +48,7 @@ ann_handle!(PyVamana, VamanaInner, VamanaIndex, "Vamana", {
                 (data, n, dim),
                 r,
                 l_build,
+                None,
                 alpha_pass1,
                 alpha_pass2,
                 &metric,

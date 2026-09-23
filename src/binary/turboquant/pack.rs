@@ -27,7 +27,8 @@ pub const PERM0: [usize; 16] = [0, 8, 1, 9, 2, 10, 3, 11, 4, 12, 5, 13, 6, 14, 7
 #[cfg(target_arch = "x86_64")]
 pub const PERM0_INV: [usize; 16] = [0, 2, 4, 6, 8, 10, 12, 14, 1, 3, 5, 7, 9, 11, 13, 15];
 
-/// Blocked layout for 2-bit and 4-bit codes.
+/// Blocked layout for 1-bit, 2-bit and 4-bit codes.
+#[cfg_attr(feature = "serialise", derive(serde::Serialize, serde::Deserialize))]
 pub struct BlockedCodes {
     /// Packed nibble bytes in block-major order.
     pub data: Vec<u8>,
@@ -266,7 +267,12 @@ fn repack_3bit(packed_codes: &[u8], n_vectors: usize, dim: usize) -> BlockedCode
 ///
 /// Blocked byte array with shape `n_blocks × n_byte_groups × BLOCK`.
 #[cfg(target_arch = "x86_64")]
-fn pack_blocked(n: usize, n_blocks: usize, n_byte_groups: usize, codes_flat: &[u8]) -> Vec<u8> {
+pub(crate) fn pack_blocked(
+    n: usize,
+    n_blocks: usize,
+    n_byte_groups: usize,
+    codes_flat: &[u8],
+) -> Vec<u8> {
     // FAISS perm0 layout: split each byte into hi/lo nibbles, interleave
     // pairs of vectors `(perm0[j], perm0[j] + 16)` so AVX2/AVX-512 cross-
     // lane behaviour aligns with the lookup.
@@ -318,7 +324,12 @@ fn pack_blocked(n: usize, n_blocks: usize, n_byte_groups: usize, codes_flat: &[u
 ///
 /// Blocked byte array with shape `n_blocks × n_byte_groups × BLOCK`.
 #[cfg(not(target_arch = "x86_64"))]
-fn pack_blocked(n: usize, n_blocks: usize, n_byte_groups: usize, codes_flat: &[u8]) -> Vec<u8> {
+pub(crate) fn pack_blocked(
+    n: usize,
+    n_blocks: usize,
+    n_byte_groups: usize,
+    codes_flat: &[u8],
+) -> Vec<u8> {
     // Sequential layout: each code byte stored as-is, vectors in order.
     // Fits NEON's per-lane loads and the scalar fallback.
     let blocked_size = n_blocks * n_byte_groups * BLOCK;

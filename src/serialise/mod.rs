@@ -529,7 +529,7 @@ mod tests {
     round_trip!(
         test_round_trip_vamana,
         VamanaIndex<f32>,
-        |m| build_vamana_index(m, 16, 32, 1.2, 1.2, "euclidean", 1),
+        |m| build_vamana_index(m, 16, 32, None, 1.2, 1.2, "euclidean", 1),
         |i, q| unwrap_knn(query_vamana_index(q, i, K, None, true, false))
     );
 
@@ -704,6 +704,7 @@ mod tests {
         use crate::binary::ivf_binary::*;
         use crate::binary::ivf_rabitq::*;
         use crate::binary::ivf_tq::*;
+        use crate::binary::qg::*;
         use crate::binary::vec_store::{MmapVectorStore, StoreMeta, NORMS_FILE, VECTORS_FILE};
 
         /// Bits per binary code. Must be a multiple of 8.
@@ -804,6 +805,13 @@ mod tests {
                 true,
                 false
             ))
+        );
+
+        round_trip!(
+            test_round_trip_qg,
+            QgIndex<f32>,
+            |m| build_qg_index(m, 32, 64, None, 1.2, 1.2, "euclidean", 1).unwrap(),
+            |i, q| unwrap_knn(query_qg_index(q, i, K, 64, true, false))
         );
 
         round_trip!(
@@ -1736,7 +1744,7 @@ mod tests {
     self_round_trip!(
         test_self_round_trip_vamana,
         VamanaIndex<f32>,
-        |m| build_vamana_index(m, 16, 32, 1.2, 1.2, "euclidean", 1),
+        |m| build_vamana_index(m, 16, 32, None, 1.2, 1.2, "euclidean", 1),
         |i| query_vamana_self(i, K, None, false, false).unwrap().0
     );
 
@@ -1818,10 +1826,11 @@ mod tests {
         {
             use crate::binary::{
                 exhaustive_binary::*, exhaustive_rabitq::*, exhaustive_tq::*, ivf_binary::*,
-                ivf_rabitq::*, ivf_tq::*,
+                ivf_rabitq::*, ivf_tq::*, qg::*,
             };
 
             kinds.extend([
+                <QgIndex<f32> as IndexIo>::KIND,
                 <ExhaustiveIndexBinary<f32> as IndexIo>::KIND,
                 <IvfIndexBinary<f32> as IndexIo>::KIND,
                 <ExhaustiveIndexRaBitQ<f32> as IndexIo>::KIND,
@@ -1830,6 +1839,9 @@ mod tests {
                 <IvfTurboQuant<f32> as IndexIo>::KIND,
             ]);
         }
+
+        #[cfg(all(feature = "binary", feature = "quantised"))]
+        kinds.push(<crate::binary::rabitq::codec::HnswRaBitQIndex<f32> as IndexIo>::KIND);
 
         let total = kinds.len();
         kinds.sort_unstable();

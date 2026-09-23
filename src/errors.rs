@@ -111,6 +111,16 @@ pub enum AnnSearchErrors {
     },
 
     // -- binary errors --
+    /// Extended RaBitQ codes were asked for at an unsupported width
+    #[cfg(feature = "binary")]
+    #[error("RaBitQ extended codes support up to {max} magnitude bits, got {ex_bits}.")]
+    RaBitQInvalidExBits {
+        /// Magnitude bits requested
+        ex_bits: usize,
+        /// Largest supported width
+        max: usize,
+    },
+
     /// Asymmetric queries are only supported with sign-based binarisation
     #[cfg(feature = "binary")]
     #[error("Only sign-based binarisation is supported for asymmetric queries")]
@@ -128,6 +138,26 @@ pub enum AnnSearchErrors {
     #[cfg(feature = "binary")]
     #[error("Vector store is not available. Use build_with_vector_store() to enable reranking.")]
     VectorStoreNotAvailable,
+
+    /// The quantised graph degree is not a whole number of scan batches
+    #[cfg(feature = "binary")]
+    #[error("The quantised graph degree must be a non-zero multiple of {batch}; {degree} is not.")]
+    QgInvalidDegree {
+        /// Requested degree
+        degree: usize,
+        /// Neighbours scored per fast-scan sweep
+        batch: usize,
+    },
+
+    /// The requested rotation cannot serve this dimensionality
+    #[cfg(feature = "binary")]
+    #[error("The fast Hadamard rotation needs at least {min_dim} dimensions; the data has {dim}.")]
+    RotatorDimTooSmall {
+        /// Dimensionality of the data
+        dim: usize,
+        /// Smallest dimensionality the rotation supports
+        min_dim: usize,
+    },
 
     /// An output buffer handed to a batch encoder is the wrong length
     #[cfg(feature = "binary")]

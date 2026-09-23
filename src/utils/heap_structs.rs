@@ -436,6 +436,198 @@ impl<T: Float> BoundedMaxHeap<T> {
     }
 }
 
+/////////////////////
+// NeighbourQueue  //
+/////////////////////
+
+/// Flag bit marking an entry as already expanded, stored in the id.
+const EXPANDED_BIT: u32 = 1 << 31;
+
+/// Mask recovering the row index from a flagged id.
+const ID_MASK: u32 = !EXPANDED_BIT;
+
+/// Bounded sorted candidate list for a greedy graph walk.
+///
+/// Holds at most `capacity` entries ascending by distance, each flagged
+/// expanded or not, and hands back the closest unexpanded one. This is the
+/// structure DiskANN's greedy search uses, and it does the job of the usual
+/// frontier-heap-plus-result-heap pair on its own. That pair wastes most of
+/// its work: the frontier accepts every candidate that beats the beam
+/// threshold *at the time*, so it grows several times larger than the beam and
+/// the majority of what it holds is never popped. A candidate outside the beam
+/// can never be worth expanding, so it should never be stored.
+///
+/// Entries are `(distance, id)` with the expanded flag in the top bit of the
+/// id, which keeps the row 8 bytes wide for `f32` and the insert memmove
+/// correspondingly cheap. Ids must therefore stay below `1 << 31`; every graph
+/// index here already guarantees that, since `u32::MAX` is its neighbour-slot
+/// sentinel.
+///
+/// ### Type Parameters
+///
+/// * `T` - Float type of the distances
+#[derive(Clone, Debug)]
+pub struct NeighbourQueue<T> {
+    /// Entries ascending by `(distance, id)`, at most `capacity` of them
+    data: Vec<(T, u32)>,
+    /// Maximum number of entries retained
+    capacity: usize,
+    /// Lowest position that may still hold an unexpanded entry
+    cursor: usize,
+}
+
+impl<T: Float> NeighbourQueue<T> {
+    /// Create a queue retaining at most `capacity` entries
+    ///
+    /// ### Params
+    ///
+    /// * `capacity` - Beam width
+    ///
+    /// ### Returns
+    ///
+    /// An empty queue with room for `capacity` entries
+    pub fn new(capacity: usize) -> Self {
+        Self {
+            data: Vec::with_capacity(capacity),
+            capacity,
+            cursor: 0,
+        }
+    }
+
+    /// Empty the queue, keeping its allocation and its beam width
+    pub fn clear(&mut self) {
+        self.data.clear();
+        self.cursor = 0;
+    }
+
+    /// Empty the queue and set the beam width, keeping the allocation
+    ///
+    /// ### Params
+    ///
+    /// * `capacity` - Beam width from now on
+    pub fn reset(&mut self, capacity: usize) {
+        self.data.clear();
+        self.data
+            .reserve(capacity.saturating_sub(self.data.capacity()));
+        self.capacity = capacity;
+        self.cursor = 0;
+    }
+
+    /// Distance a candidate must beat to be retained
+    ///
+    /// Infinity while the queue is still filling, so callers need no separate
+    /// "not yet full" arm.
+    ///
+    /// ### Returns
+    ///
+    /// The current rejection threshold
+    #[inline(always)]
+    pub fn threshold(&self) -> T {
+        if self.data.len() < self.capacity {
+            T::infinity()
+        } else {
+            self.data[self.data.len() - 1].0
+        }
+    }
+
+    /// Offer a candidate to the beam
+    ///
+    /// Rejects in `O(1)` once the queue is full and the candidate is no better
+    /// than the worst entry, which is the common case. Otherwise binary
+    /// searches for the insertion point and shifts the tail.
+    ///
+    /// ### Params
+    ///
+    /// * `dist` - Distance of the candidate
+    /// * `id` - Row index of the candidate, below `1 << 31`
+    ///
+    /// ### Returns
+    ///
+    /// `true` if the candidate was retained
+    #[inline]
+    pub fn insert(&mut self, dist: T, id: u32) -> bool {
+        let len = self.data.len();
+        if len == self.capacity && (self.capacity == 0 || dist >= self.data[len - 1].0) {
+            return false;
+        }
+
+        // Ordered by (distance, id) so ties resolve towards the smaller index
+        // and the walk is reproducible across runs and thread counts. The
+        // Deliberately branchy: the conditional-move form measured slower on
+        // Apple Silicon, since the array is L1-resident, the predictor handles
+        // this shape, and `csel` serialises the dependent loads.
+        let mut lo = 0;
+        let mut hi = len;
+        while lo < hi {
+            let mid = lo + (hi - lo) / 2;
+            let (d, flagged) = self.data[mid];
+            if d < dist || (d == dist && (flagged & ID_MASK) < id) {
+                lo = mid + 1;
+            } else {
+                hi = mid;
+            }
+        }
+        let pos = lo;
+
+        if len == self.capacity {
+            self.data.pop();
+        }
+        self.data.insert(pos, (dist, id));
+        if pos < self.cursor {
+            self.cursor = pos;
+        }
+        true
+    }
+
+    /// Take the closest entry that has not been expanded yet
+    ///
+    /// Marks the returned entry expanded, so the walk terminates once every
+    /// retained entry has been handed out once.
+    ///
+    /// ### Returns
+    ///
+    /// `(distance, id)` of the closest unexpanded entry, or `None`
+    #[inline]
+    pub fn next_unexpanded(&mut self) -> Option<(T, u32)> {
+        while self.cursor < self.data.len() {
+            let (dist, flagged) = self.data[self.cursor];
+            self.cursor += 1;
+            if flagged & EXPANDED_BIT == 0 {
+                self.data[self.cursor - 1].1 = flagged | EXPANDED_BIT;
+                return Some((dist, flagged));
+            }
+        }
+        None
+    }
+
+    /// Retained entries, ascending by distance
+    ///
+    /// ### Returns
+    ///
+    /// Iterator over `(distance, id)` with the expanded flag stripped
+    pub fn iter(&self) -> impl Iterator<Item = (T, u32)> + '_ {
+        self.data.iter().map(|&(d, f)| (d, f & ID_MASK))
+    }
+
+    /// Number of retained entries
+    ///
+    /// ### Returns
+    ///
+    /// Current length
+    pub fn len(&self) -> usize {
+        self.data.len()
+    }
+
+    /// Whether the queue holds nothing
+    ///
+    /// ### Returns
+    ///
+    /// `true` when empty
+    pub fn is_empty(&self) -> bool {
+        self.data.is_empty()
+    }
+}
+
 ///////////
 // Tests //
 ///////////
@@ -528,5 +720,79 @@ mod tests {
         assert_eq!(heap.threshold(), 5.0);
         assert!(!heap.push(7.0, 4));
         assert_eq!(heap.threshold(), 5.0);
+    }
+
+    #[test]
+    fn test_neighbour_queue_keeps_best_and_orders() {
+        let mut q = NeighbourQueue::new(3);
+        for (d, i) in [(5.0f32, 0), (1.0, 1), (9.0, 2), (3.0, 3), (7.0, 4)] {
+            q.insert(d, i);
+        }
+        let got: Vec<(f32, u32)> = q.iter().collect();
+        assert_eq!(got, vec![(1.0, 1), (3.0, 3), (5.0, 0)]);
+        assert_eq!(q.len(), 3);
+    }
+
+    #[test]
+    fn test_neighbour_queue_threshold_and_rejection() {
+        let mut q = NeighbourQueue::new(2);
+        assert_eq!(q.threshold(), f32::INFINITY);
+        assert!(q.insert(2.0f32, 0));
+        assert_eq!(q.threshold(), f32::INFINITY);
+        assert!(q.insert(4.0, 1));
+        assert_eq!(q.threshold(), 4.0);
+        assert!(!q.insert(4.0, 2));
+        assert!(q.insert(1.0, 3));
+        assert_eq!(q.threshold(), 2.0);
+    }
+
+    #[test]
+    fn test_neighbour_queue_hands_out_each_entry_once() {
+        let mut q = NeighbourQueue::new(4);
+        for (d, i) in [(3.0f32, 30), (1.0, 10), (2.0, 20)] {
+            q.insert(d, i);
+        }
+        let mut seen = Vec::new();
+        while let Some((d, id)) = q.next_unexpanded() {
+            seen.push((d, id));
+        }
+        assert_eq!(seen, vec![(1.0, 10), (2.0, 20), (3.0, 30)]);
+        assert!(q.next_unexpanded().is_none());
+        // Flags survive the walk, so the retained set is still readable.
+        assert_eq!(
+            q.iter().map(|(_, id)| id).collect::<Vec<_>>(),
+            vec![10, 20, 30]
+        );
+    }
+
+    #[test]
+    fn test_neighbour_queue_reopens_on_closer_insert() {
+        let mut q = NeighbourQueue::new(4);
+        q.insert(5.0f32, 50);
+        assert_eq!(q.next_unexpanded(), Some((5.0, 50)));
+        // A closer candidate arriving after the walk moved on must be handed
+        // out before the walk ends, not skipped.
+        q.insert(1.0, 10);
+        assert_eq!(q.next_unexpanded(), Some((1.0, 10)));
+        assert!(q.next_unexpanded().is_none());
+    }
+
+    #[test]
+    fn test_neighbour_queue_reset_clears() {
+        let mut q = NeighbourQueue::new(2);
+        q.insert(1.0f32, 0);
+        q.next_unexpanded();
+        q.reset(3);
+        assert!(q.is_empty());
+        assert_eq!(q.threshold(), f32::INFINITY);
+        assert!(q.next_unexpanded().is_none());
+    }
+
+    #[test]
+    fn test_neighbour_queue_zero_capacity() {
+        let mut q = NeighbourQueue::new(0);
+        assert!(!q.insert(1.0f32, 0));
+        assert!(q.is_empty());
+        assert!(q.next_unexpanded().is_none());
     }
 }

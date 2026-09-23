@@ -1,6 +1,6 @@
 [package]
 name = "ann-search-rs"
-version = "0.8.5"
+version = "0.9.0"
 edition = "2021"
 authors = ["Gregor Lueg <gregorlueg@me.com>"]
 license = "MIT"
@@ -181,6 +181,14 @@ required-features = ["binary"]
 [[example]]
 name = "gridsearch_tq"
 required-features = ["binary"]
+
+[[example]]
+name = "profile_graph_rabitq"
+required-features = ["binary", "quantised"]
+
+[[example]]
+name = "gridsearch_rabitq_graphs"
+required-features = ["binary", "quantised"]
 
 ##################
 # Other examples #
