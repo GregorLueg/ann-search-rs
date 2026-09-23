@@ -16,6 +16,12 @@ own changelog at [`python/CHANGELOG.md`](python/CHANGELOG.md).
   It is the fastest index in the crate at high recall and it costs roughly two
   to three times the memory of the raw vectors, since each code is stored once
   per in-edge. Build time is Vamana's.
+- New HNSW over RaBitQ+ codes (`HnswRaBitQIndex`, `build_hnsw_rabitq_index` /
+  `query_hnsw_rabitq_index` / `query_hnsw_rabitq_self`, needs `binary` and
+  `quantised`). The graph is linked on exact distances and the vectors are
+  dropped, so the index is its topology plus one `ex_bits + 1`-bit code per
+  coordinate. `ex_bits` trades size for recall. Saves and loads under
+  `serialise` like the other indices.
 - RaBitQ gained a fast Hadamard plus Kac-walk rotation, selected automatically
   from 192 dimensions up. It replaces a dense `dim x dim` matvec per vector with
   an `O(dim log dim)` transform and shrinks the stored rotation from `dim^2`
