@@ -578,7 +578,11 @@ pub fn min_dist_euclidean_vec<S: Float, A: Float, N: Size>(
         c += 1u32;
     }
 
-    out[point_idx as usize] = best;
+    // Running minimum across rounds: `out` starts at +inf and each round
+    // only scores the candidates it added.
+    if best < out[point_idx as usize] {
+        out[point_idx as usize] = best;
+    }
 }
 
 /// Cosine analogue of [`fn@min_dist_euclidean_vec`].
@@ -656,7 +660,11 @@ pub fn min_dist_cosine_vec<S: Float, A: Float, N: Size>(
         c += 1u32;
     }
 
-    out[point_idx as usize] = best;
+    // Running minimum across rounds: `out` starts at +inf and each round
+    // only scores the candidates it added.
+    if best < out[point_idx as usize] {
+        out[point_idx as usize] = best;
+    }
 }
 
 /// Dispatch the appropriate nearest-candidate distance kernel.
@@ -952,15 +960,25 @@ where
     let mut cands: Vec<A> = data_host[first * dim..(first + 1) * dim].to_vec();
     let mut cand_norms: Vec<A> = vec![norms_host[first]];
 
-    let dist_gpu = GpuTensor::<R, A>::empty(vec![n], client)?;
+    // Running minimum on device: each round scores only the candidates added
+    // since the last one.
+    let dist_gpu = GpuTensor::<R, A>::from_slice(
+        &vec![<A as num_traits::Float>::max_value(); n],
+        vec![n],
+        client,
+    )?;
+    let mut new_from = 0;
 
     for _ in 0..n_rounds {
-        let n_cand = cand_norms.len();
-        let cand_gpu = GpuTensor::<R, A>::from_slice(&cands, vec![n_cand, dim], client)?;
-        let cnorm_gpu = GpuTensor::<R, A>::from_slice(&cand_norms, vec![n_cand], client)?;
+        let n_new = cand_norms.len() - new_from;
+        let cand_gpu =
+            GpuTensor::<R, A>::from_slice(&cands[new_from * dim..], vec![n_new, dim], client)?;
+        let cnorm_gpu =
+            GpuTensor::<R, A>::from_slice(&cand_norms[new_from..], vec![n_new], client)?;
+        new_from = cand_norms.len();
 
         min_dist_device::<S, A, R>(
-            client, data_gpu, &cand_gpu, pnorm_gpu, &cnorm_gpu, &dist_gpu, n, n_cand, dim, metric,
+            client, data_gpu, &cand_gpu, pnorm_gpu, &cnorm_gpu, &dist_gpu, n, n_new, dim, metric,
         )?;
 
         let distances = dist_gpu.clone().read(client)?;
