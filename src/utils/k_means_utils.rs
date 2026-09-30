@@ -323,7 +323,7 @@ fn resolve_init(init: Option<KMeansInit>, n_centroids: usize) -> KMeansInit {
 ///
 /// The [LloydPath].
 fn resolve_path(path: Option<LloydPath>, dim: usize, metric: &Dist) -> LloydPath {
-    let chosen = path.unwrap_or_else(|| match metric {
+    let chosen = path.unwrap_or(match metric {
         Dist::SquaredEuclidean if dim >= GEMM_DIM_THRESHOLD => LloydPath::HamerlyGemm,
         Dist::Cosine if dim >= GEMM_DIM_THRESHOLD => LloydPath::GemmLloyd,
         _ => LloydPath::ParallelLloyd,
@@ -705,9 +705,48 @@ where
 // GEMM-based assignment //
 ///////////////////////////
 
+#[cfg(all(feature = "accelerate", target_os = "macos"))]
+#[link(name = "Accelerate", kind = "framework")]
+extern "C" {
+    fn cblas_sgemm(
+        order: i32,
+        trans_a: i32,
+        trans_b: i32,
+        m: i32,
+        n: i32,
+        k: i32,
+        alpha: f32,
+        a: *const f32,
+        lda: i32,
+        b: *const f32,
+        ldb: i32,
+        beta: f32,
+        c: *mut f32,
+        ldc: i32,
+    );
+    fn cblas_dgemm(
+        order: i32,
+        trans_a: i32,
+        trans_b: i32,
+        m: i32,
+        n: i32,
+        k: i32,
+        alpha: f64,
+        a: *const f64,
+        lda: i32,
+        b: *const f64,
+        ldb: i32,
+        beta: f64,
+        c: *mut f64,
+        ldc: i32,
+    );
+}
+
 /// Compute a centroid-major dot tile: dots[c, i] = dot(centroids[c], data_block[i])
 ///
-/// Uses faer GEMM to compute dots = centroids * data_mat^T. faer is
+/// Uses faer GEMM to compute dots = centroids * data_mat^T, or Accelerate's
+/// cblas under the `accelerate` feature on macOS, where it runs at 2-3x
+/// faer's throughput when called per tile from the rayon threads. faer is
 /// column-major, so each point's dots against the centroid block are one
 /// contiguous column. The output matrix is reused across tiles and resized
 /// only when the shape changes.
@@ -735,21 +774,73 @@ fn gemm_dot_tile<T>(
 ) where
     T: Float + SimdDistance + faer_traits::ComplexField,
 {
-    let data_mat = MatRef::from_row_major_slice(data_block, tile_n, dim).subcols(0, d_used);
-    let cent_mat = MatRef::from_row_major_slice(centroids, kb, dim).subcols(0, d_used);
-
     if dots.nrows() != kb || dots.ncols() != tile_n {
         *dots = Mat::<T>::zeros(kb, tile_n);
     }
 
-    matmul(
-        dots.as_mut(),
-        Accum::Replace,
-        cent_mat,
-        data_mat.transpose(),
-        T::one(),
-        Par::Seq,
-    );
+    #[cfg(all(feature = "accelerate", target_os = "macos"))]
+    {
+        // Column-major kb x tile_n with column stride `ldc` is row-major
+        // tile_n x kb, i.e. X * C^T in cblas row-major terms.
+        const ROW_MAJOR: i32 = 101;
+        const NO_TRANS: i32 = 111;
+        const TRANS: i32 = 112;
+        let ldc = dots.col_stride() as i32;
+        let c = dots.as_ptr_mut();
+        // SimdDistance is only implemented for f32 and f64, so the width
+        // identifies the type.
+        unsafe {
+            match std::mem::size_of::<T>() {
+                4 => cblas_sgemm(
+                    ROW_MAJOR,
+                    NO_TRANS,
+                    TRANS,
+                    tile_n as i32,
+                    kb as i32,
+                    d_used as i32,
+                    1.0,
+                    data_block.as_ptr() as *const f32,
+                    dim as i32,
+                    centroids.as_ptr() as *const f32,
+                    dim as i32,
+                    0.0,
+                    c as *mut f32,
+                    ldc,
+                ),
+                8 => cblas_dgemm(
+                    ROW_MAJOR,
+                    NO_TRANS,
+                    TRANS,
+                    tile_n as i32,
+                    kb as i32,
+                    d_used as i32,
+                    1.0,
+                    data_block.as_ptr() as *const f64,
+                    dim as i32,
+                    centroids.as_ptr() as *const f64,
+                    dim as i32,
+                    0.0,
+                    c as *mut f64,
+                    ldc,
+                ),
+                _ => unreachable!("SimdDistance is only implemented for f32 and f64"),
+            }
+        }
+    }
+
+    #[cfg(not(all(feature = "accelerate", target_os = "macos")))]
+    {
+        let data_mat = MatRef::from_row_major_slice(data_block, tile_n, dim).subcols(0, d_used);
+        let cent_mat = MatRef::from_row_major_slice(centroids, kb, dim).subcols(0, d_used);
+        matmul(
+            dots.as_mut(),
+            Accum::Replace,
+            cent_mat,
+            data_mat.transpose(),
+            T::one(),
+            Par::Seq,
+        );
+    }
 }
 
 /// Full GEMM-based nearest centroid assignment over all n vectors
