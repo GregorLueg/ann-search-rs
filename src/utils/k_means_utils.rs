@@ -562,7 +562,7 @@ where
 /// ### Params
 ///
 /// * `data` - Training vectors (flattened)
-/// * `data_norms` - The norms of the trainint vectors.
+/// * `data_norms` - The L2 norms of the training vectors.
 /// * `dim` - Embedding dimensions
 /// * `n` - Number of training vectors
 /// * `k` - Number of clusters to create
@@ -582,7 +582,7 @@ pub fn kmeans_parallel_init<T>(
     seed: usize,
 ) -> Vec<T>
 where
-    T: Float + Send + Sync + SimdDistance,
+    T: Float + Send + Sync + SimdDistance + ComplexField,
 {
     let mut rng = StdRng::seed_from_u64(seed as u64);
     let oversampling_factor = 2;
@@ -595,35 +595,58 @@ where
     candidates.extend_from_slice(&data[first_idx * dim..(first_idx + 1) * dim]);
     candidate_norms.push(data_norms[first_idx]);
 
-    let mut distances = vec![T::zero(); n];
+    let mut distances = vec![T::infinity(); n];
+    let mut cumsum = vec![0.0f64; n];
+    // Candidates added since the last distance pass; earlier ones are
+    // already folded into `distances`.
+    let mut new_from = 0;
 
     for _ in 0..n_rounds {
-        distances.par_iter_mut().enumerate().for_each(|(i, dist)| {
-            let vec = &data[i * dim..(i + 1) * dim];
-            *dist = min_distance_to_centroids(
-                vec,
-                data_norms[i],
-                &candidates,
-                &candidate_norms,
+        let new_cands = &candidates[new_from * dim..];
+        let new_norms = &candidate_norms[new_from..];
+        if dim >= GEMM_DIM_THRESHOLD {
+            gemm_min_dist_update(
+                data,
+                data_norms,
                 dim,
-                candidate_norms.len(),
+                new_cands,
+                new_norms,
                 metric,
+                &mut distances,
             );
-        });
+        } else {
+            distances.par_iter_mut().enumerate().for_each(|(i, dist)| {
+                let vec = &data[i * dim..(i + 1) * dim];
+                let d = min_distance_to_centroids(
+                    vec,
+                    data_norms[i],
+                    new_cands,
+                    new_norms,
+                    dim,
+                    new_norms.len(),
+                    metric,
+                );
+                if d < *dist {
+                    *dist = d;
+                }
+            });
+        }
+        new_from = candidate_norms.len();
 
-        let total_dist: f64 = distances.iter().map(|&d| d.to_f64().unwrap()).sum();
+        let mut acc = 0.0f64;
+        for (c, &d) in cumsum.iter_mut().zip(&distances) {
+            acc += d.to_f64().unwrap();
+            *c = acc;
+        }
+        let total_dist = acc;
 
         for _ in 0..k * oversampling_factor {
             let threshold = rng.random::<f64>() * total_dist;
-            let mut cumsum = 0.0;
-
-            for (idx, &dist) in distances.iter().enumerate() {
-                cumsum += dist.to_f64().unwrap();
-                if cumsum >= threshold {
-                    candidates.extend_from_slice(&data[idx * dim..(idx + 1) * dim]);
-                    candidate_norms.push(data_norms[idx]);
-                    break;
-                }
+            // First index whose running sum reaches the threshold
+            let idx = cumsum.partition_point(|&c| c < threshold);
+            if idx < n {
+                candidates.extend_from_slice(&data[idx * dim..(idx + 1) * dim]);
+                candidate_norms.push(data_norms[idx]);
             }
         }
     }
@@ -833,6 +856,82 @@ fn gemm_assign_full<T>(
                             lower_block[i] = T::one() - second * inv_xn;
                         }
                         Dist::Manhattan => unreachable!(),
+                    }
+                }
+            },
+        );
+}
+
+/// Fold the distance to a batch of new centres into a running minimum via GEMM
+///
+/// The k-means|| distance pass. Euclidean distances come from
+/// `||x||^2 + ||c||^2 - 2 x.c` (clamped at zero), cosine from
+/// `1 - x.c / (||x|| ||c||)`. The expansion rounds differently from a direct
+/// difference, so the minima are equal to the SIMD path only to fp tolerance.
+///
+/// ### Params
+///
+/// * `data` - All vectors, flattened row-major
+/// * `data_norms` - L2 norm per vector
+/// * `dim` - Embedding dimensions
+/// * `cands` - New centres, flattened row-major
+/// * `cand_norms` - L2 norm per new centre
+/// * `metric` - Distance metric
+/// * `distances` - In/out: per-vector minimum distance to any centre so far
+fn gemm_min_dist_update<T>(
+    data: &[T],
+    data_norms: &[T],
+    dim: usize,
+    cands: &[T],
+    cand_norms: &[T],
+    metric: &Dist,
+    distances: &mut [T],
+) where
+    T: Float + Send + Sync + SimdDistance + ComplexField,
+{
+    let two = T::one() + T::one();
+    let n_cands = cand_norms.len();
+    let cand_sq: Vec<T> = cand_norms.iter().map(|&c| c * c).collect();
+
+    data.par_chunks(GEMM_TILE_SIZE * dim)
+        .zip(data_norms.par_chunks(GEMM_TILE_SIZE))
+        .zip(distances.par_chunks_mut(GEMM_TILE_SIZE))
+        .for_each_init(
+            Mat::<T>::new,
+            |dots, ((data_block, norm_block), dist_block)| {
+                let tile_n = norm_block.len();
+                for c0 in (0..n_cands).step_by(GEMM_CENTROID_TILE) {
+                    let kb = GEMM_CENTROID_TILE.min(n_cands - c0);
+                    let cand_block = &cands[c0 * dim..(c0 + kb) * dim];
+                    gemm_dot_tile(data_block, tile_n, cand_block, dim, kb, dots);
+
+                    for i in 0..tile_n {
+                        let col = dots.col_as_slice(i);
+                        let xn = norm_block[i];
+                        let mut best = dist_block[i];
+                        match metric {
+                            Dist::SquaredEuclidean => {
+                                let xn_sq = xn * xn;
+                                let cs = &cand_sq[c0..c0 + kb];
+                                for c in 0..kb {
+                                    let d = (xn_sq + cs[c] - two * col[c]).max(T::zero());
+                                    if d < best {
+                                        best = d;
+                                    }
+                                }
+                            }
+                            Dist::Cosine => {
+                                let cn = &cand_norms[c0..c0 + kb];
+                                for c in 0..kb {
+                                    let d = T::one() - col[c] / (xn * cn[c]);
+                                    if d < best {
+                                        best = d;
+                                    }
+                                }
+                            }
+                            Dist::Manhattan => unreachable!(),
+                        }
+                        dist_block[i] = best;
                     }
                 }
             },
@@ -2878,6 +2977,7 @@ where
             }
             let init_norms: Vec<T> = match metric {
                 Dist::SquaredEuclidean => (0..n)
+                    .into_par_iter()
                     .map(|i| T::calculate_l2_norm(&data[i * dim..(i + 1) * dim]))
                     .collect(),
                 Dist::Cosine => data_norms.clone(),
