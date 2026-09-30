@@ -122,7 +122,7 @@ clap = {
     features = ["derive"]
 }
 tempfile = "3.24.0"
-ann-search-rs = { path = ".", features = ["synthetic"] }
+ann-search-rs = { path = ".", default-features = false, features = ["synthetic"] }
 
 [package.metadata.docs.rs]
 features = ["binary", "quantised", "mimalloc", "ndarray", "serialise", "synthetic"]
