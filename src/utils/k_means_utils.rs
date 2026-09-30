@@ -208,6 +208,21 @@ const GEMM_CENTROID_TILE: usize = 4096;
 /// and compute distances directly via SIMD loops.
 const GEMM_DIRTY_THRESHOLD: usize = 128;
 
+/// Minimum dimension for the partial-dimension pruned assignment
+/// ([`gemm_assign_pruned`]); below it the full GEMM runs. At 128 the pruned
+/// path is roughly break-even, and loses at large k.
+const PRUNE_DIM_THRESHOLD: usize = 256;
+
+/// The pruning GEMM runs over the first `dim / PRUNE_PARTIAL_DIV` dimensions.
+/// Few candidates survive even a short prefix, so the GEMM dominates and a
+/// smaller prefix wins until it flattens out; d/8 is measurably slower,
+/// d/32 is not faster.
+const PRUNE_PARTIAL_DIV: usize = 16;
+
+/// Floor on the pruning prefix. Every d = 256 measurement ran at this floor;
+/// lower is untested.
+const PRUNE_PARTIAL_MIN: usize = 32;
+
 /// Minimum dimension for GEMM assignment over direct SIMD loops. GEMM wins or
 /// ties from here up at every k measured; below it is unmeasured, so the SIMD
 /// path keeps it.
@@ -702,22 +717,26 @@ where
 /// * `data_block` - Tile of input vectors, row-major (tile_n * dim elements)
 /// * `tile_n` - Number of vectors in this tile
 /// * `centroids` - Centroid block, row-major (kb * dim elements)
-/// * `dim` - Embedding dimensions
+/// * `dim` - Embedding dimensions (row stride of both inputs)
+/// * `d_used` - Leading dimensions the dot product runs over; `dim` for the
+///   full product
 /// * `kb` - Number of centroids in the block
 /// * `dots` - Output matrix (kb x tile_n), overwritten in place
 #[inline]
+#[allow(clippy::too_many_arguments)]
 fn gemm_dot_tile<T>(
     data_block: &[T],
     tile_n: usize,
     centroids: &[T],
     dim: usize,
+    d_used: usize,
     kb: usize,
     dots: &mut Mat<T>,
 ) where
     T: Float + SimdDistance + faer_traits::ComplexField,
 {
-    let data_mat = MatRef::from_row_major_slice(data_block, tile_n, dim);
-    let cent_mat = MatRef::from_row_major_slice(centroids, kb, dim);
+    let data_mat = MatRef::from_row_major_slice(data_block, tile_n, dim).subcols(0, d_used);
+    let cent_mat = MatRef::from_row_major_slice(centroids, kb, dim).subcols(0, d_used);
 
     if dots.nrows() != kb || dots.ncols() != tile_n {
         *dots = Mat::<T>::zeros(kb, tile_n);
@@ -759,6 +778,9 @@ fn gemm_dot_tile<T>(
 ///   Cosine
 /// * `k` - Number of centroids
 /// * `metric` - Distance metric
+/// * `prior` - Previous assignment per vector, if there is one. With
+///   Euclidean at `PRUNE_DIM_THRESHOLD` dimensions or more it switches to
+///   [`gemm_assign_pruned`]
 /// * `assignments` - Output: nearest centroid index per vector
 /// * `upper_bounds` - Output: distance to nearest centroid per vector
 /// * `lower_bounds` - Output: distance to second-nearest centroid per vector
@@ -771,12 +793,29 @@ fn gemm_assign_full<T>(
     centroid_norms: &[T], // ||c||^2 for Euclidean; ||c|| for Cosine
     k: usize,
     metric: &Dist,
+    prior: Option<&[usize]>,
     assignments: &mut [usize],
     upper_bounds: &mut [T],
     lower_bounds: &mut [T],
 ) where
     T: Float + SimdDistance + faer_traits::ComplexField,
 {
+    if let Some(prior) = prior {
+        if *metric == Dist::SquaredEuclidean && dim >= PRUNE_DIM_THRESHOLD {
+            gemm_assign_pruned(
+                data,
+                dim,
+                centroids,
+                k,
+                prior,
+                assignments,
+                upper_bounds,
+                lower_bounds,
+            );
+            return;
+        }
+    }
+
     let two = T::one() + T::one();
 
     // Per-centroid scale and offset so both metrics score as
@@ -814,7 +853,7 @@ fn gemm_assign_full<T>(
                 for c0 in (0..k).step_by(GEMM_CENTROID_TILE) {
                     let kb = GEMM_CENTROID_TILE.min(k - c0);
                     let cent_block = &centroids[c0 * dim..(c0 + kb) * dim];
-                    gemm_dot_tile(data_block, tile_n, cent_block, dim, kb, dots);
+                    gemm_dot_tile(data_block, tile_n, cent_block, dim, dim, kb, dots);
 
                     let sc = &scale[c0..c0 + kb];
                     let of = &offset[c0..c0 + kb];
@@ -862,6 +901,128 @@ fn gemm_assign_full<T>(
         );
 }
 
+/// Exact Euclidean assignment with partial-dimension pruning
+///
+/// Each vector starts from the exact squared distance to its previous
+/// centroid. A GEMM over the first `d'` dimensions gives the exact partial
+/// squared distance to every centroid, which lower-bounds the full one; only
+/// centroids whose partial distance is below the running best get a full
+/// distance. The result is the exact nearest centroid, as with
+/// [`gemm_assign_full`], up to ties and fp rounding.
+///
+/// The lower bound handed to Hamerly is the minimum over non-winning
+/// centroids of the full distance where computed and the partial one where
+/// pruned, which is still a valid lower bound on the second-nearest distance.
+///
+/// ### Params
+///
+/// * `data` - All vectors, flattened row-major
+/// * `dim` - Embedding dimensions
+/// * `centroids` - All centroids, flattened row-major
+/// * `k` - Number of centroids
+/// * `prior` - Previous assignment per vector
+/// * `assignments` - Output: nearest centroid index per vector
+/// * `upper_bounds` - Output: distance to nearest centroid per vector
+/// * `lower_bounds` - Output: lower bound on the distance to the
+///   second-nearest centroid per vector
+///
+/// ### References
+///
+/// Kuffo et al., SuperKMeans, arXiv 2603.20009, 2026 (partial GEMM plus
+/// pruning against the previous assignment; their bound is probabilistic and
+/// needs a rotation, this one is exact)
+#[allow(clippy::too_many_arguments)]
+fn gemm_assign_pruned<T>(
+    data: &[T],
+    dim: usize,
+    centroids: &[T],
+    k: usize,
+    prior: &[usize],
+    assignments: &mut [usize],
+    upper_bounds: &mut [T],
+    lower_bounds: &mut [T],
+) where
+    T: Float + SimdDistance + faer_traits::ComplexField,
+{
+    let two = T::one() + T::one();
+    let d_part = (dim / PRUNE_PARTIAL_DIV).max(PRUNE_PARTIAL_MIN).min(dim);
+    let cent_part_sq: Vec<T> = centroids
+        .chunks_exact(dim)
+        .map(|c| T::dot_simd(&c[..d_part], &c[..d_part]))
+        .collect();
+
+    data.par_chunks(GEMM_TILE_SIZE * dim)
+        .zip(prior.par_chunks(GEMM_TILE_SIZE))
+        .zip(assignments.par_chunks_mut(GEMM_TILE_SIZE))
+        .zip(upper_bounds.par_chunks_mut(GEMM_TILE_SIZE))
+        .zip(lower_bounds.par_chunks_mut(GEMM_TILE_SIZE))
+        .for_each_init(
+            || {
+                (
+                    Mat::<T>::new(),
+                    Vec::<(T, T, usize)>::new(),
+                    Vec::<T>::new(),
+                )
+            },
+            |(dots, state, x_part_sq),
+             ((((data_block, prior_block), assign_block), upper_block), lower_block)| {
+                let tile_n = prior_block.len();
+                let row = |i: usize| &data_block[i * dim..(i + 1) * dim];
+                let cent = |c: usize| &centroids[c * dim..(c + 1) * dim];
+
+                // (best squared distance, second lower bound, best index)
+                state.clear();
+                x_part_sq.clear();
+                for i in 0..tile_n {
+                    let x = row(i);
+                    let p = prior_block[i];
+                    state.push((T::euclidean_simd(x, cent(p)), T::infinity(), p));
+                    x_part_sq.push(T::dot_simd(&x[..d_part], &x[..d_part]));
+                }
+
+                for c0 in (0..k).step_by(GEMM_CENTROID_TILE) {
+                    let kb = GEMM_CENTROID_TILE.min(k - c0);
+                    let cent_block = &centroids[c0 * dim..(c0 + kb) * dim];
+                    gemm_dot_tile(data_block, tile_n, cent_block, dim, d_part, kb, dots);
+
+                    for i in 0..tile_n {
+                        let col = dots.col_as_slice(i);
+                        let (mut best, mut second, mut best_c) = state[i];
+                        let xp = x_part_sq[i];
+                        let p = prior_block[i];
+                        for c in 0..kb {
+                            let gc = c0 + c;
+                            if gc == p {
+                                continue;
+                            }
+                            let part = (xp + cent_part_sq[gc] - two * col[c]).max(T::zero());
+                            if part < best {
+                                let full = T::euclidean_simd(row(i), cent(gc));
+                                if full < best {
+                                    second = second.min(best);
+                                    best = full;
+                                    best_c = gc;
+                                } else {
+                                    second = second.min(full);
+                                }
+                            } else {
+                                second = second.min(part);
+                            }
+                        }
+                        state[i] = (best, second, best_c);
+                    }
+                }
+
+                for i in 0..tile_n {
+                    let (best, second, best_c) = state[i];
+                    assign_block[i] = best_c;
+                    upper_block[i] = best.sqrt();
+                    lower_block[i] = second.sqrt();
+                }
+            },
+        );
+}
+
 /// Fold the distance to a batch of new centres into a running minimum via GEMM
 ///
 /// The k-means|| distance pass. Euclidean distances come from
@@ -903,7 +1064,7 @@ fn gemm_min_dist_update<T>(
                 for c0 in (0..n_cands).step_by(GEMM_CENTROID_TILE) {
                     let kb = GEMM_CENTROID_TILE.min(n_cands - c0);
                     let cand_block = &cands[c0 * dim..(c0 + kb) * dim];
-                    gemm_dot_tile(data_block, tile_n, cand_block, dim, kb, dots);
+                    gemm_dot_tile(data_block, tile_n, cand_block, dim, dim, kb, dots);
 
                     for i in 0..tile_n {
                         let col = dots.col_as_slice(i);
@@ -1061,6 +1222,7 @@ fn gemm_reassign_dirty<T>(
         gathered_data.extend_from_slice(&data[i * dim..(i + 1) * dim]);
         gathered_norms.push(data_norms_sq[i]);
     }
+    let prior: Vec<usize> = dirty.iter().map(|&i| assignments[i]).collect();
 
     gemm_assign_full(
         gathered_data,
@@ -1070,6 +1232,7 @@ fn gemm_reassign_dirty<T>(
         centroid_norms,
         k,
         metric,
+        Some(&prior),
         &mut tmp_assign[..nd],
         &mut tmp_upper[..nd],
         &mut tmp_lower[..nd],
@@ -1484,6 +1647,7 @@ fn hamerly_lloyd<T>(
         centroid_norms_sq,
         k,
         &Dist::SquaredEuclidean,
+        None,
         &mut assignments,
         &mut upper,
         &mut lower,
@@ -1643,6 +1807,7 @@ fn gemm_lloyd<T>(
             centroid_norms,
             k,
             metric,
+            (iter > 0).then_some(prev_assignments.as_slice()),
             &mut assignments,
             &mut upper,
             &mut lower,
@@ -2242,6 +2407,7 @@ where
         &centroid_norms,
         k,
         metric,
+        None,
         &mut assignments,
         &mut upper,
         &mut lower,
