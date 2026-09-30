@@ -209,9 +209,21 @@ const GEMM_CENTROID_TILE: usize = 4096;
 const GEMM_DIRTY_THRESHOLD: usize = 128;
 
 /// Minimum dimension for the partial-dimension pruned assignment
-/// ([`gemm_assign_pruned`]); below it the full GEMM runs. At 128 the pruned
-/// path is roughly break-even, and loses at large k.
+/// ([`gemm_assign_pruned`]); below it the full GEMM runs. The survivors'
+/// full distances run on SIMD, not the GEMM, so the faster the GEMM the
+/// higher the break-even. With faer pruning wins from 256 (break-even at
+/// 128); with Accelerate it still loses at 256 and wins from 512.
+#[cfg(not(all(feature = "accelerate", target_os = "macos")))]
 const PRUNE_DIM_THRESHOLD: usize = 256;
+
+/// See the faer variant above.
+#[cfg(all(feature = "accelerate", target_os = "macos"))]
+const PRUNE_DIM_THRESHOLD: usize = 512;
+
+/// Largest fraction of candidates allowed to survive the pruning prefix. Above
+/// it the prefix doubles, and past half the dimensions the full GEMM runs.
+/// 0.05 and 0.1 measure the same; 0.2 lets a non-pruning prefix through.
+const PRUNE_MAX_SURVIVAL: f64 = 0.05;
 
 /// The pruning GEMM runs over the first `dim / PRUNE_PARTIAL_DIV` dimensions.
 /// Few candidates survive even a short prefix, so the GEMM dominates and a
@@ -324,6 +336,9 @@ fn resolve_init(init: Option<KMeansInit>, n_centroids: usize) -> KMeansInit {
 /// The [LloydPath].
 fn resolve_path(path: Option<LloydPath>, dim: usize, metric: &Dist) -> LloydPath {
     let chosen = path.unwrap_or(match metric {
+        // The pruned assignment's lower bound is too loose for Hamerly to
+        // skip points, so there it only adds bookkeeping
+        Dist::SquaredEuclidean if dim >= PRUNE_DIM_THRESHOLD => LloydPath::GemmLloyd,
         Dist::SquaredEuclidean if dim >= GEMM_DIM_THRESHOLD => LloydPath::HamerlyGemm,
         Dist::Cosine if dim >= GEMM_DIM_THRESHOLD => LloydPath::GemmLloyd,
         _ => LloydPath::ParallelLloyd,
@@ -892,8 +907,9 @@ fn gemm_assign_full<T>(
     T: Float + SimdDistance + faer_traits::ComplexField,
 {
     if let Some(prior) = prior {
-        if *metric == Dist::SquaredEuclidean && dim >= PRUNE_DIM_THRESHOLD {
-            gemm_assign_pruned(
+        if *metric == Dist::SquaredEuclidean
+            && dim >= PRUNE_DIM_THRESHOLD
+            && gemm_assign_pruned(
                 data,
                 dim,
                 centroids,
@@ -902,7 +918,8 @@ fn gemm_assign_full<T>(
                 assignments,
                 upper_bounds,
                 lower_bounds,
-            );
+            )
+        {
             return;
         }
     }
@@ -1005,6 +1022,12 @@ fn gemm_assign_full<T>(
 /// centroids of the full distance where computed and the partial one where
 /// pruned, which is still a valid lower bound on the second-nearest distance.
 ///
+/// The prefix starts at `dim / PRUNE_PARTIAL_DIV` and doubles on a probe of
+/// the first tile until at most `PRUNE_MAX_SURVIVAL` of candidates survive.
+/// If no prefix up to half the dimensions gets there, nothing is written and
+/// the caller runs the full GEMM: on data whose variance is not front-loaded
+/// the survivors' full distances cost several times the GEMM they replace.
+///
 /// ### Params
 ///
 /// * `data` - All vectors, flattened row-major
@@ -1016,6 +1039,11 @@ fn gemm_assign_full<T>(
 /// * `upper_bounds` - Output: distance to nearest centroid per vector
 /// * `lower_bounds` - Output: lower bound on the distance to the
 ///   second-nearest centroid per vector
+///
+/// ### Returns
+///
+/// `true` if the outputs were written, `false` if no prefix pruned well
+/// enough and the outputs are untouched.
 ///
 /// ### References
 ///
@@ -1032,15 +1060,45 @@ fn gemm_assign_pruned<T>(
     assignments: &mut [usize],
     upper_bounds: &mut [T],
     lower_bounds: &mut [T],
-) where
+) -> bool
+where
     T: Float + SimdDistance + faer_traits::ComplexField,
 {
-    let two = T::one() + T::one();
-    let d_part = (dim / PRUNE_PARTIAL_DIV).max(PRUNE_PARTIAL_MIN).min(dim);
-    let cent_part_sq: Vec<T> = centroids
-        .chunks_exact(dim)
-        .map(|c| T::dot_simd(&c[..d_part], &c[..d_part]))
-        .collect();
+    let part_norms = |d_part: usize| -> Vec<T> {
+        centroids
+            .chunks_exact(dim)
+            .map(|c| T::dot_simd(&c[..d_part], &c[..d_part]))
+            .collect()
+    };
+
+    // Probe the first tile, doubling the prefix until few enough candidates
+    // survive. Whether a prefix prunes depends on how the data spreads its
+    // variance over the dimensions, which nothing upstream knows.
+    let probe_n = GEMM_TILE_SIZE.min(prior.len());
+    let (mut dots, mut state, mut x_part_sq) = (Mat::<T>::new(), Vec::new(), Vec::new());
+    let mut d_part = (dim / PRUNE_PARTIAL_DIV).max(PRUNE_PARTIAL_MIN).min(dim);
+    let cent_part_sq = loop {
+        let cps = part_norms(d_part);
+        let survivors = prune_tile(
+            &data[..probe_n * dim],
+            &prior[..probe_n],
+            centroids,
+            &cps,
+            dim,
+            d_part,
+            k,
+            &mut dots,
+            &mut state,
+            &mut x_part_sq,
+        );
+        if (survivors as f64) <= PRUNE_MAX_SURVIVAL * (probe_n * k) as f64 {
+            break cps;
+        }
+        d_part *= 2;
+        if d_part > dim / 2 {
+            return false;
+        }
+    };
 
     data.par_chunks(GEMM_TILE_SIZE * dim)
         .zip(prior.par_chunks(GEMM_TILE_SIZE))
@@ -1048,70 +1106,115 @@ fn gemm_assign_pruned<T>(
         .zip(upper_bounds.par_chunks_mut(GEMM_TILE_SIZE))
         .zip(lower_bounds.par_chunks_mut(GEMM_TILE_SIZE))
         .for_each_init(
-            || {
-                (
-                    Mat::<T>::new(),
-                    Vec::<(T, T, usize)>::new(),
-                    Vec::<T>::new(),
-                )
-            },
+            || (Mat::<T>::new(), Vec::new(), Vec::new()),
             |(dots, state, x_part_sq),
              ((((data_block, prior_block), assign_block), upper_block), lower_block)| {
-                let tile_n = prior_block.len();
-                let row = |i: usize| &data_block[i * dim..(i + 1) * dim];
-                let cent = |c: usize| &centroids[c * dim..(c + 1) * dim];
-
-                // (best squared distance, second lower bound, best index)
-                state.clear();
-                x_part_sq.clear();
-                for i in 0..tile_n {
-                    let x = row(i);
-                    let p = prior_block[i];
-                    state.push((T::euclidean_simd(x, cent(p)), T::infinity(), p));
-                    x_part_sq.push(T::dot_simd(&x[..d_part], &x[..d_part]));
-                }
-
-                for c0 in (0..k).step_by(GEMM_CENTROID_TILE) {
-                    let kb = GEMM_CENTROID_TILE.min(k - c0);
-                    let cent_block = &centroids[c0 * dim..(c0 + kb) * dim];
-                    gemm_dot_tile(data_block, tile_n, cent_block, dim, d_part, kb, dots);
-
-                    for i in 0..tile_n {
-                        let col = dots.col_as_slice(i);
-                        let (mut best, mut second, mut best_c) = state[i];
-                        let xp = x_part_sq[i];
-                        let p = prior_block[i];
-                        for c in 0..kb {
-                            let gc = c0 + c;
-                            if gc == p {
-                                continue;
-                            }
-                            let part = (xp + cent_part_sq[gc] - two * col[c]).max(T::zero());
-                            if part < best {
-                                let full = T::euclidean_simd(row(i), cent(gc));
-                                if full < best {
-                                    second = second.min(best);
-                                    best = full;
-                                    best_c = gc;
-                                } else {
-                                    second = second.min(full);
-                                }
-                            } else {
-                                second = second.min(part);
-                            }
-                        }
-                        state[i] = (best, second, best_c);
-                    }
-                }
-
-                for i in 0..tile_n {
-                    let (best, second, best_c) = state[i];
+                prune_tile(
+                    data_block,
+                    prior_block,
+                    centroids,
+                    &cent_part_sq,
+                    dim,
+                    d_part,
+                    k,
+                    dots,
+                    state,
+                    x_part_sq,
+                );
+                for (i, &(best, second, best_c)) in state.iter().enumerate() {
                     assign_block[i] = best_c;
                     upper_block[i] = best.sqrt();
                     lower_block[i] = second.sqrt();
                 }
             },
         );
+    true
+}
+
+/// One tile of [`gemm_assign_pruned`]
+///
+/// ### Params
+///
+/// * `data_block` - Tile of vectors, row-major
+/// * `prior_block` - Previous assignment per vector in the tile
+/// * `centroids` - All centroids, row-major
+/// * `cent_part_sq` - Squared norm of each centroid's first `d_part` dims
+/// * `dim` - Embedding dimensions
+/// * `d_part` - Length of the pruning prefix
+/// * `k` - Number of centroids
+/// * `dots` - Scratch for the partial dot tile
+/// * `state` - Output per vector: (best squared distance, lower bound on the
+///   second-nearest squared distance, best index)
+/// * `x_part_sq` - Scratch for the vectors' prefix norms
+///
+/// ### Returns
+///
+/// Number of candidates that survived the prefix and got a full distance.
+#[allow(clippy::too_many_arguments)]
+fn prune_tile<T>(
+    data_block: &[T],
+    prior_block: &[usize],
+    centroids: &[T],
+    cent_part_sq: &[T],
+    dim: usize,
+    d_part: usize,
+    k: usize,
+    dots: &mut Mat<T>,
+    state: &mut Vec<(T, T, usize)>,
+    x_part_sq: &mut Vec<T>,
+) -> usize
+where
+    T: Float + SimdDistance + faer_traits::ComplexField,
+{
+    let two = T::one() + T::one();
+    let tile_n = prior_block.len();
+    let row = |i: usize| &data_block[i * dim..(i + 1) * dim];
+    let cent = |c: usize| &centroids[c * dim..(c + 1) * dim];
+    let mut survivors = 0;
+
+    state.clear();
+    x_part_sq.clear();
+    for i in 0..tile_n {
+        let x = row(i);
+        let p = prior_block[i];
+        state.push((T::euclidean_simd(x, cent(p)), T::infinity(), p));
+        x_part_sq.push(T::dot_simd(&x[..d_part], &x[..d_part]));
+    }
+
+    for c0 in (0..k).step_by(GEMM_CENTROID_TILE) {
+        let kb = GEMM_CENTROID_TILE.min(k - c0);
+        let cent_block = &centroids[c0 * dim..(c0 + kb) * dim];
+        gemm_dot_tile(data_block, tile_n, cent_block, dim, d_part, kb, dots);
+
+        for i in 0..tile_n {
+            let col = dots.col_as_slice(i);
+            let (mut best, mut second, mut best_c) = state[i];
+            let xp = x_part_sq[i];
+            let p = prior_block[i];
+            for c in 0..kb {
+                let gc = c0 + c;
+                if gc == p {
+                    continue;
+                }
+                let part = (xp + cent_part_sq[gc] - two * col[c]).max(T::zero());
+                if part < best {
+                    survivors += 1;
+                    let full = T::euclidean_simd(row(i), cent(gc));
+                    if full < best {
+                        second = second.min(best);
+                        best = full;
+                        best_c = gc;
+                    } else {
+                        second = second.min(full);
+                    }
+                } else {
+                    second = second.min(part);
+                }
+            }
+            state[i] = (best, second, best_c);
+        }
+    }
+    survivors
 }
 
 /// Fold the distance to a batch of new centres into a running minimum via GEMM
@@ -1770,39 +1873,46 @@ fn hamerly_lloyd<T>(
             break;
         }
 
-        for i in 0..n {
-            upper[i] = upper[i] + deltas[assignments[i]];
-            let other_max = if assignments[i] == max_delta_idx {
-                second_max_delta
-            } else {
-                max_delta
-            };
-            lower[i] = (lower[i] - other_max).max(T::zero());
-        }
+        upper
+            .par_iter_mut()
+            .zip(lower.par_iter_mut())
+            .zip(assignments.par_iter())
+            .for_each(|((u, l), &a)| {
+                *u = *u + deltas[a];
+                let other_max = if a == max_delta_idx {
+                    second_max_delta
+                } else {
+                    max_delta
+                };
+                *l = (*l - other_max).max(T::zero());
+            });
 
         let s = compute_half_min_centroid_dists(centroids, centroid_norms_sq, dim, k);
 
         dirty.clear();
-        for i in 0..n {
-            let m = if s[assignments[i]] > lower[i] {
-                s[assignments[i]]
-            } else {
-                lower[i]
-            };
-            if upper[i] > m {
-                upper[i] = exact_point_centroid_dist(
-                    data,
-                    data_norms_sq,
-                    dim,
-                    i,
-                    centroids,
-                    centroid_norms_sq,
-                    assignments[i],
-                );
-                if upper[i] > m {
-                    dirty.push(i);
+        {
+            let centroids: &[T] = centroids;
+            let centroid_norms_sq: &[T] = centroid_norms_sq;
+            // par_extend keeps index order, same as the serial scan
+            dirty.par_extend(upper.par_iter_mut().enumerate().filter_map(|(i, u)| {
+                let a = assignments[i];
+                let m = if s[a] > lower[i] { s[a] } else { lower[i] };
+                if *u > m {
+                    *u = exact_point_centroid_dist(
+                        data,
+                        data_norms_sq,
+                        dim,
+                        i,
+                        centroids,
+                        centroid_norms_sq,
+                        a,
+                    );
+                    if *u > m {
+                        return Some(i);
+                    }
                 }
-            }
+                None
+            }));
         }
 
         if dirty.is_empty() {
@@ -4239,7 +4349,16 @@ mod tests {
     /// centroids: the pruned pick is never further than the true nearest, the
     /// upper bound is the distance to the pick and the lower bound never
     /// exceeds the true second-nearest distance.
-    fn check_pruned_against_full(n: usize, k: usize, dim: usize, prior: &[usize]) {
+    ///
+    /// The prior is the true assignment with every `wrong_every`-th point
+    /// moved to another centroid (0 leaves it exact), which is what a Lloyd
+    /// iteration hands over. Returns `(pruned assignment, prior)`.
+    fn check_pruned_against_full(
+        n: usize,
+        k: usize,
+        dim: usize,
+        wrong_every: usize,
+    ) -> (Vec<usize>, Vec<usize>) {
         let (data, cents) = random_points(n, k, dim, 7);
         let dn: Vec<f32> = data
             .chunks_exact(dim)
@@ -4264,8 +4383,22 @@ mod tests {
             &mut u_full,
             &mut l_full,
         );
+        let prior: Vec<usize> = a_full
+            .iter()
+            .enumerate()
+            .map(|(i, &a)| {
+                if wrong_every > 0 && i % wrong_every == 0 {
+                    (a + 1 + i) % k
+                } else {
+                    a
+                }
+            })
+            .collect();
+
         let (mut a, mut u, mut l) = (vec![0; n], vec![0.0; n], vec![0.0; n]);
-        gemm_assign_pruned(&data, dim, &cents, k, prior, &mut a, &mut u, &mut l);
+        assert!(gemm_assign_pruned(
+            &data, dim, &cents, k, &prior, &mut a, &mut u, &mut l
+        ));
 
         let dist = |i: usize, c: usize| {
             f32::euclidean_simd(
@@ -4282,55 +4415,41 @@ mod tests {
             assert_relative_eq!(u[i], dist(i, a[i]), max_relative = 1e-5);
             assert!(l[i] <= l_full[i] * (1.0 + 1e-4) + 1e-4, "point {i}");
         }
+        (a, prior)
     }
 
     #[test]
     fn test_gemm_assign_pruned_matches_full() {
-        let (n, k) = (2_000, 64);
-        let prior: Vec<usize> = (0..n).map(|i| (i * 7919) % k).collect();
-        check_pruned_against_full(n, k, PRUNE_DIM_THRESHOLD, &prior);
+        check_pruned_against_full(2_000, 64, PRUNE_DIM_THRESHOLD, 10);
     }
 
     #[test]
     fn test_gemm_assign_pruned_crosses_centroid_blocks() {
         // k above GEMM_CENTROID_TILE, so the running best carries across blocks
-        let (n, k) = (300, GEMM_CENTROID_TILE + 37);
-        let prior: Vec<usize> = (0..n).map(|i| (i * 131) % k).collect();
-        check_pruned_against_full(n, k, PRUNE_DIM_THRESHOLD, &prior);
+        check_pruned_against_full(300, GEMM_CENTROID_TILE + 37, PRUNE_DIM_THRESHOLD, 10);
     }
 
     #[test]
     fn test_gemm_assign_pruned_prior_already_nearest() {
         // Prior is the true answer: the pruned path must keep it
-        let (n, k, dim) = (1_000, 50, 512);
-        let (data, cents) = random_points(n, k, dim, 7);
-        let dn: Vec<f32> = data
-            .chunks_exact(dim)
-            .map(|v| f32::dot_simd(v, v))
-            .collect();
-        let cn: Vec<f32> = cents
-            .chunks_exact(dim)
-            .map(|v| f32::dot_simd(v, v))
-            .collect();
-        let (mut prior, mut u0, mut l0) = (vec![0; n], vec![0.0; n], vec![0.0; n]);
-        gemm_assign_full(
-            &data,
-            &dn,
-            dim,
-            &cents,
-            &cn,
-            k,
-            &Dist::SquaredEuclidean,
-            None,
-            &mut prior,
-            &mut u0,
-            &mut l0,
-        );
-        check_pruned_against_full(n, k, dim, &prior);
-
-        let (mut a, mut u, mut l) = (vec![0; n], vec![0.0; n], vec![0.0; n]);
-        gemm_assign_pruned(&data, dim, &cents, k, &prior, &mut a, &mut u, &mut l);
+        let (a, prior) = check_pruned_against_full(1_000, 50, 512, 0);
         assert_eq!(a, prior);
+    }
+
+    #[test]
+    fn test_gemm_assign_pruned_declines_when_prefix_cannot_prune() {
+        // Isotropic data and a random prior: every prefix up to half the
+        // dimensions lets most candidates through, so it hands back to the
+        // full GEMM rather than paying a full distance for each
+        let (n, k, dim) = (1_000, 100, PRUNE_DIM_THRESHOLD);
+        let mut rng = StdRng::seed_from_u64(11);
+        let data: Vec<f32> = (0..n * dim).map(|_| rng.random()).collect();
+        let cents: Vec<f32> = (0..k * dim).map(|_| rng.random()).collect();
+        let prior: Vec<usize> = (0..n).map(|i| (i * 7919) % k).collect();
+        let (mut a, mut u, mut l) = (vec![0; n], vec![0.0; n], vec![0.0; n]);
+        assert!(!gemm_assign_pruned(
+            &data, dim, &cents, k, &prior, &mut a, &mut u, &mut l
+        ));
     }
 
     #[test]
