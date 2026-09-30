@@ -4120,4 +4120,171 @@ mod tests {
         // Every centroid should be finite
         assert!(centroids.iter().all(|x: &f64| x.is_finite()));
     }
+
+    /// Random `(data, centroids)`, row-major, with the variance front-loaded
+    /// into the pruning prefix so pruning actually fires. On isotropic data
+    /// in high dim the prefix carries too little of each distance to prune
+    /// anything, and a test on it cannot see an over-eager prune.
+    fn random_points(n: usize, k: usize, dim: usize, seed: u64) -> (Vec<f32>, Vec<f32>) {
+        let mut rng = StdRng::seed_from_u64(seed);
+        let mut draw = |len: usize| -> Vec<f32> {
+            (0..len)
+                .map(|i| {
+                    let scale = if i % dim < PRUNE_PARTIAL_MIN {
+                        1.0
+                    } else {
+                        0.05
+                    };
+                    rng.random::<f32>() * scale
+                })
+                .collect()
+        };
+        let data = draw(n * dim);
+        let cents = draw(k * dim);
+        (data, cents)
+    }
+
+    /// Check the pruned assignment against the full GEMM one on the same
+    /// centroids: the pruned pick is never further than the true nearest, the
+    /// upper bound is the distance to the pick and the lower bound never
+    /// exceeds the true second-nearest distance.
+    fn check_pruned_against_full(n: usize, k: usize, dim: usize, prior: &[usize]) {
+        let (data, cents) = random_points(n, k, dim, 7);
+        let dn: Vec<f32> = data
+            .chunks_exact(dim)
+            .map(|v| f32::dot_simd(v, v))
+            .collect();
+        let cn: Vec<f32> = cents
+            .chunks_exact(dim)
+            .map(|v| f32::dot_simd(v, v))
+            .collect();
+
+        let (mut a_full, mut u_full, mut l_full) = (vec![0; n], vec![0.0; n], vec![0.0; n]);
+        gemm_assign_full(
+            &data,
+            &dn,
+            dim,
+            &cents,
+            &cn,
+            k,
+            &Dist::SquaredEuclidean,
+            None,
+            &mut a_full,
+            &mut u_full,
+            &mut l_full,
+        );
+        let (mut a, mut u, mut l) = (vec![0; n], vec![0.0; n], vec![0.0; n]);
+        gemm_assign_pruned(&data, dim, &cents, k, prior, &mut a, &mut u, &mut l);
+
+        let dist = |i: usize, c: usize| {
+            f32::euclidean_simd(
+                &data[i * dim..(i + 1) * dim],
+                &cents[c * dim..(c + 1) * dim],
+            )
+            .sqrt()
+        };
+        for i in 0..n {
+            assert!(
+                dist(i, a[i]) <= dist(i, a_full[i]) * (1.0 + 1e-5),
+                "point {i}"
+            );
+            assert_relative_eq!(u[i], dist(i, a[i]), max_relative = 1e-5);
+            assert!(l[i] <= l_full[i] * (1.0 + 1e-4) + 1e-4, "point {i}");
+        }
+    }
+
+    #[test]
+    fn test_gemm_assign_pruned_matches_full() {
+        let (n, k) = (2_000, 64);
+        let prior: Vec<usize> = (0..n).map(|i| (i * 7919) % k).collect();
+        check_pruned_against_full(n, k, PRUNE_DIM_THRESHOLD, &prior);
+    }
+
+    #[test]
+    fn test_gemm_assign_pruned_crosses_centroid_blocks() {
+        // k above GEMM_CENTROID_TILE, so the running best carries across blocks
+        let (n, k) = (300, GEMM_CENTROID_TILE + 37);
+        let prior: Vec<usize> = (0..n).map(|i| (i * 131) % k).collect();
+        check_pruned_against_full(n, k, PRUNE_DIM_THRESHOLD, &prior);
+    }
+
+    #[test]
+    fn test_gemm_assign_pruned_prior_already_nearest() {
+        // Prior is the true answer: the pruned path must keep it
+        let (n, k, dim) = (1_000, 50, 512);
+        let (data, cents) = random_points(n, k, dim, 7);
+        let dn: Vec<f32> = data
+            .chunks_exact(dim)
+            .map(|v| f32::dot_simd(v, v))
+            .collect();
+        let cn: Vec<f32> = cents
+            .chunks_exact(dim)
+            .map(|v| f32::dot_simd(v, v))
+            .collect();
+        let (mut prior, mut u0, mut l0) = (vec![0; n], vec![0.0; n], vec![0.0; n]);
+        gemm_assign_full(
+            &data,
+            &dn,
+            dim,
+            &cents,
+            &cn,
+            k,
+            &Dist::SquaredEuclidean,
+            None,
+            &mut prior,
+            &mut u0,
+            &mut l0,
+        );
+        check_pruned_against_full(n, k, dim, &prior);
+
+        let (mut a, mut u, mut l) = (vec![0; n], vec![0.0; n], vec![0.0; n]);
+        gemm_assign_pruned(&data, dim, &cents, k, &prior, &mut a, &mut u, &mut l);
+        assert_eq!(a, prior);
+    }
+
+    #[test]
+    fn test_train_centroids_pruned_matches_unpruned() {
+        // Well-separated blobs at a pruned dimensionality: GEMM Lloyd's
+        // (pruned from its second iteration on) and SIMD Lloyd's (never
+        // pruned) must land on the same centroids. Not Hamerly: its dirty sets
+        // stay under GEMM_DIRTY_THRESHOLD here and never reach the pruned path.
+        let (n_clusters, per, dim) = (8, 200, 256);
+        let n = n_clusters * per;
+        let mut rng = StdRng::seed_from_u64(3);
+        let centres: Vec<f64> = (0..n_clusters * dim)
+            .map(|_| rng.random::<f64>() * 100.0)
+            .collect();
+        let mut data = Vec::with_capacity(n * dim);
+        for c in 0..n_clusters {
+            for _ in 0..per {
+                for j in 0..dim {
+                    data.push(centres[c * dim + j] + rng.random::<f64>() - 0.5);
+                }
+            }
+        }
+
+        let train = |path| {
+            train_centroids(
+                &data,
+                dim,
+                n,
+                n_clusters,
+                &Dist::SquaredEuclidean,
+                Some(KMeansTrainingParams::new(
+                    20,
+                    Some(KMeansInit::KMeansParallel),
+                    Some(path),
+                )),
+                42,
+                false,
+            )
+            .unwrap()
+        };
+        let pruned = train(LloydPath::GemmLloyd);
+        let plain = train(LloydPath::ParallelLloyd);
+
+        for (a, b) in pruned.iter().zip(&plain) {
+            assert_relative_eq!(*a, *b, epsilon = 1e-9);
+        }
+    }
 }
