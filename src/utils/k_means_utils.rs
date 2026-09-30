@@ -195,10 +195,14 @@ where
 // k-means clustering //
 ////////////////////////
 
-/// Tile size for GEMM-based assignment. Limits the intermediate dot-product
-/// matrix to TILE_SIZE * k elements. 4096 is a reasonable default; tune to
-/// your L2 cache size if needed.
-const GEMM_TILE_SIZE: usize = 4096;
+/// Points per GEMM assignment tile, i.e. per rayon task. Small tiles keep all
+/// threads busy to the end; the tile width barely moves the kernel itself.
+const GEMM_TILE_SIZE: usize = 512;
+
+/// Centroids per GEMM assignment block. Speed is flat in this; it exists to
+/// cap the per-thread dot tile at `GEMM_TILE_SIZE * GEMM_CENTROID_TILE`
+/// elements (8 MB in f32) regardless of k.
+const GEMM_CENTROID_TILE: usize = 4096;
 
 /// Below this number of dirty points, skip GEMM gather/scatter overhead
 /// and compute distances directly via SIMD loops.
@@ -687,43 +691,44 @@ where
 // GEMM-based assignment //
 ///////////////////////////
 
-/// Compute dot product tile: dots[i,c] = dot(data_block[i], centroids[c])
+/// Compute a centroid-major dot tile: dots[c, i] = dot(centroids[c], data_block[i])
 ///
-/// Uses faer GEMM to compute dots = data_mat * centroids^T. The output
-/// matrix is reused across tiles and resized only when dimensions change.
+/// Uses faer GEMM to compute dots = centroids * data_mat^T. faer is
+/// column-major, so each point's dots against the centroid block are one
+/// contiguous column. The output matrix is reused across tiles and resized
+/// only when the shape changes.
 ///
 /// ### Params
 ///
 /// * `data_block` - Tile of input vectors, row-major (tile_n * dim elements)
 /// * `tile_n` - Number of vectors in this tile
-/// * `centroids` - All centroids, row-major (k * dim elements)
+/// * `centroids` - Centroid block, row-major (kb * dim elements)
 /// * `dim` - Embedding dimensions
-/// * `k` - Number of centroids
-/// * `dots` - Output matrix (tile_n x k), overwritten in place
+/// * `kb` - Number of centroids in the block
+/// * `dots` - Output matrix (kb x tile_n), overwritten in place
 #[inline]
 fn gemm_dot_tile<T>(
     data_block: &[T],
     tile_n: usize,
     centroids: &[T],
     dim: usize,
-    k: usize,
+    kb: usize,
     dots: &mut Mat<T>,
 ) where
     T: Float + SimdDistance + faer_traits::ComplexField,
 {
     let data_mat = MatRef::from_row_major_slice(data_block, tile_n, dim);
-    let cent_mat = MatRef::from_row_major_slice(centroids, k, dim);
+    let cent_mat = MatRef::from_row_major_slice(centroids, kb, dim);
 
-    if dots.nrows() != tile_n || dots.ncols() != k {
-        *dots = Mat::<T>::zeros(tile_n, k);
+    if dots.nrows() != kb || dots.ncols() != tile_n {
+        *dots = Mat::<T>::zeros(kb, tile_n);
     }
 
-    // dots = 1.0 * data_mat * cent_mat^T, overwriting
     matmul(
         dots.as_mut(),
         Accum::Replace,
-        data_mat,
-        cent_mat.transpose(),
+        cent_mat,
+        data_mat.transpose(),
         T::one(),
         Par::Seq,
     );
@@ -731,9 +736,12 @@ fn gemm_dot_tile<T>(
 
 /// Full GEMM-based nearest centroid assignment over all n vectors
 ///
-/// Processes vectors in tiles of GEMM_TILE_SIZE. For each vector, finds
-/// the closest and second-closest centroid using the dot-product trick
-/// to avoid explicit distance computation.
+/// Processes vectors in tiles of GEMM_TILE_SIZE against centroid blocks of
+/// GEMM_CENTROID_TILE. For each vector, finds the closest and second-closest
+/// centroid using the dot-product trick to avoid explicit distance
+/// computation. The dot tile is centroid-major so each vector's scan over the
+/// block reads one contiguous column; scanning a point-major tile row-wise
+/// strides by the tile height and cost more than the GEMM itself.
 ///
 /// For Euclidean: dist^2 = ||x||^2 - 2*dot(x,c) + ||c||^2, so maximising
 /// 2*dot - ||c||^2 minimises squared distance.
@@ -772,73 +780,83 @@ fn gemm_assign_full<T>(
 {
     let two = T::one() + T::one();
 
+    // Per-centroid scale and offset so both metrics score as
+    // `scale[c] * dot + offset[c]`, maximised.
+    let (scale, offset): (Vec<T>, Vec<T>) = match metric {
+        Dist::SquaredEuclidean => centroid_norms.iter().map(|&cn| (two, -cn)).unzip(),
+        Dist::Cosine => centroid_norms
+            .iter()
+            .map(|&cn| {
+                let inv = if cn > T::zero() {
+                    T::one() / cn
+                } else {
+                    T::zero()
+                };
+                (inv, T::zero())
+            })
+            .unzip(),
+        Dist::Manhattan => unreachable!(),
+    };
+
     data.par_chunks(GEMM_TILE_SIZE * dim)
         .zip(data_norms_sq.par_chunks(GEMM_TILE_SIZE))
         .zip(assignments.par_chunks_mut(GEMM_TILE_SIZE))
         .zip(upper_bounds.par_chunks_mut(GEMM_TILE_SIZE))
         .zip(lower_bounds.par_chunks_mut(GEMM_TILE_SIZE))
         .for_each_init(
-            || Mat::<T>::new(), // Thread-local matrix buffer
-            |dots, ((((data_block, norm_block), assign_block), upper_block), lower_block)| {
+            || (Mat::<T>::new(), Vec::<(T, T, usize)>::new()),
+            |(dots, top2),
+             ((((data_block, norm_block), assign_block), upper_block), lower_block)| {
                 let tile_n = norm_block.len();
+                top2.clear();
+                top2.resize(tile_n, (T::neg_infinity(), T::neg_infinity(), 0));
 
-                // Compute dots sequentially *within* this Rayon thread
-                gemm_dot_tile(data_block, tile_n, centroids, dim, k, dots);
+                // The running top-2 carries across centroid blocks.
+                for c0 in (0..k).step_by(GEMM_CENTROID_TILE) {
+                    let kb = GEMM_CENTROID_TILE.min(k - c0);
+                    let cent_block = &centroids[c0 * dim..(c0 + kb) * dim];
+                    gemm_dot_tile(data_block, tile_n, cent_block, dim, kb, dots);
 
-                // Sequential argmax reduction over the tile
-                for local_i in 0..tile_n {
-                    let mut best_c = 0;
-                    let mut best_score = T::neg_infinity();
-                    let mut second_score = T::neg_infinity();
+                    let sc = &scale[c0..c0 + kb];
+                    let of = &offset[c0..c0 + kb];
+                    for i in 0..tile_n {
+                        let col = dots.col_as_slice(i);
+                        let (mut best, mut second, mut best_c) = top2[i];
+                        for c in 0..kb {
+                            let score = sc[c] * col[c] + of[c];
+                            if score > second {
+                                if score > best {
+                                    second = best;
+                                    best = score;
+                                    best_c = c0 + c;
+                                } else {
+                                    second = score;
+                                }
+                            }
+                        }
+                        top2[i] = (best, second, best_c);
+                    }
+                }
 
+                for i in 0..tile_n {
+                    let (best, second, best_c) = top2[i];
+                    assign_block[i] = best_c;
                     match metric {
                         Dist::SquaredEuclidean => {
-                            for c in 0..k {
-                                let score = two * dots[(local_i, c)] - centroid_norms[c];
-                                if score > best_score {
-                                    second_score = best_score;
-                                    best_score = score;
-                                    best_c = c;
-                                } else if score > second_score {
-                                    second_score = score;
-                                }
-                            }
-                            assign_block[local_i] = best_c;
-                            upper_block[local_i] =
-                                (norm_block[local_i] - best_score).max(T::zero()).sqrt();
-                            lower_block[local_i] =
-                                (norm_block[local_i] - second_score).max(T::zero()).sqrt();
+                            upper_block[i] = (norm_block[i] - best).max(T::zero()).sqrt();
+                            lower_block[i] = (norm_block[i] - second).max(T::zero()).sqrt();
                         }
                         Dist::Cosine => {
-                            for c in 0..k {
-                                let cn = centroid_norms[c];
-                                let inv_cn = if cn > T::zero() {
-                                    T::one() / cn
-                                } else {
-                                    T::zero()
-                                };
-                                let score = dots[(local_i, c)] * inv_cn;
-                                if score > best_score {
-                                    second_score = best_score;
-                                    best_score = score;
-                                    best_c = c;
-                                } else if score > second_score {
-                                    second_score = score;
-                                }
-                            }
-                            let xn = norm_block[local_i];
+                            let xn = norm_block[i];
                             let inv_xn = if xn > T::zero() {
                                 T::one() / xn
                             } else {
                                 T::zero()
                             };
-                            assign_block[local_i] = best_c;
-                            upper_block[local_i] = T::one() - best_score * inv_xn;
-                            lower_block[local_i] = T::one() - second_score * inv_xn;
+                            upper_block[i] = T::one() - best * inv_xn;
+                            lower_block[i] = T::one() - second * inv_xn;
                         }
-                        Dist::Manhattan => {
-                            unreachable!()
-                        }
+                        Dist::Manhattan => unreachable!(),
                     }
                 }
             },
