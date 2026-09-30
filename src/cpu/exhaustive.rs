@@ -1,7 +1,8 @@
 //! Exhaustive (flat) implementation for nearest neighbour searches in
 //! ann-search-rs.
 
-use faer::{linalg::matmul::matmul, Accum, Mat, MatRef, Par, RowRef};
+use crate::utils::gemm::gemm;
+use faer::{Accum, Mat, MatRef, Par, RowRef};
 
 use rayon::prelude::*;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -523,7 +524,7 @@ where
 
                     // Inner GEMM stays sequential: the outer rayon iterator
                     // already owns every core.
-                    matmul(
+                    gemm(
                         dots.as_mut(),
                         Accum::Replace,
                         x_block,

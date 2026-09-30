@@ -34,7 +34,8 @@
 //! Datar, Immorlica, Indyk & Mirrokni, SoCG, 2004 (p-stable LSH);
 //! Lv, Josephson, Wang, Charikar & Li, VLDB, 2007 (query-directed multi-probe)
 
-use faer::{linalg::matmul::matmul, Accum, Mat, MatRef, Par, RowRef};
+use crate::utils::gemm::gemm;
+use faer::{Accum, Mat, MatRef, Par, RowRef};
 use fixedbitset::FixedBitSet;
 use num_traits::Float;
 use rand::{prelude::*, rng};
@@ -309,7 +310,7 @@ fn project_block<T>(
         *out = Mat::<T>::zeros(rows, n_cols);
     }
 
-    matmul(
+    gemm(
         out.as_mut(),
         Accum::Replace,
         data,
