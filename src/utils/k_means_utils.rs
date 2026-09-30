@@ -202,7 +202,7 @@ const GEMM_TILE_SIZE: usize = 512;
 
 /// Centroids per GEMM assignment block. Speed is flat in this; it exists to
 /// cap the per-thread dot tile at `GEMM_TILE_SIZE * GEMM_CENTROID_TILE`
-/// elements (8 MB in f32) regardless of k.
+/// elements regardless of k.
 const GEMM_CENTROID_TILE: usize = 4096;
 
 /// Below this number of dirty points, skip GEMM gather/scatter overhead
@@ -212,8 +212,7 @@ const GEMM_DIRTY_THRESHOLD: usize = 128;
 /// Minimum dimension for the partial-dimension pruned assignment
 /// ([`gemm_assign_pruned`]); below it the full GEMM runs. The survivors'
 /// full distances run on SIMD, not the GEMM, so the faster the GEMM the
-/// higher the break-even. With faer pruning wins from 256 (break-even at
-/// 128); with Accelerate it still loses at 256 and wins from 512.
+/// higher the break-even, hence one threshold per backend.
 #[cfg(not(all(feature = "accelerate", target_os = "macos")))]
 const PRUNE_DIM_THRESHOLD: usize = 256;
 
@@ -223,22 +222,20 @@ const PRUNE_DIM_THRESHOLD: usize = 512;
 
 /// Largest fraction of candidates allowed to survive the pruning prefix. Above
 /// it the prefix doubles, and past half the dimensions the full GEMM runs.
-/// 0.05 and 0.1 measure the same; 0.2 lets a non-pruning prefix through.
+/// Set too high, a prefix that does not prune gets through and every survivor
+/// pays a full distance.
 const PRUNE_MAX_SURVIVAL: f64 = 0.05;
 
-/// The pruning GEMM runs over the first `dim / PRUNE_PARTIAL_DIV` dimensions.
+/// The pruning GEMM starts on the first `dim / PRUNE_PARTIAL_DIV` dimensions.
 /// Few candidates survive even a short prefix, so the GEMM dominates and a
-/// smaller prefix wins until it flattens out; d/8 is measurably slower,
-/// d/32 is not faster.
+/// shorter prefix wins until the survivors start to cost more.
 const PRUNE_PARTIAL_DIV: usize = 16;
 
-/// Floor on the pruning prefix. Every d = 256 measurement ran at this floor;
-/// lower is untested.
+/// Floor on the pruning prefix. Nothing below it has been tried.
 const PRUNE_PARTIAL_MIN: usize = 32;
 
 /// Minimum dimension for GEMM assignment over direct SIMD loops. GEMM wins or
-/// ties from here up at every k measured; below it is unmeasured, so the SIMD
-/// path keeps it.
+/// ties from here up; below it is untested, so the SIMD path keeps it.
 const GEMM_DIM_THRESHOLD: usize = 16;
 
 /// Fraction of the average cluster size below which a centroid is reseeded by

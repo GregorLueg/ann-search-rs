@@ -41,8 +41,8 @@ quantised = ["half"]
 ## Enables mimalloc as the global allocator for improved performance
 mimalloc = ["dep:mimalloc"]
 ## Routes the k-means GEMM through Apple Accelerate on macOS (no effect
-## elsewhere). 2-3x the throughput of faer there. On by default; Accelerate
-## ships with every macOS, so there is nothing to install.
+## elsewhere), well ahead of faer there. On by default; Accelerate ships with
+## every macOS, so there is nothing to install.
 accelerate = []
 ## Accept `ndarray` 2-D arrays wherever a faer matrix is accepted.
 ndarray = ["dep:ndarray"]
