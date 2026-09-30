@@ -208,21 +208,10 @@ const GEMM_CENTROID_TILE: usize = 4096;
 /// and compute distances directly via SIMD loops.
 const GEMM_DIRTY_THRESHOLD: usize = 128;
 
-/// Minimum dimension at which GEMM assignment outperforms direct SIMD loops.
-/// Below this, the GEMM kernel setup and tile-scanning overhead exceeds the
-/// cache-blocking benefit. This needs to be quite high for GEMM to actually
-/// be better.
-const GEMM_DIM_THRESHOLD: usize = 96;
-
-/// Minimum number of centroids at which Hamerly's pruning beats plain Lloyd's
-/// on the SIMD path. Below this, per-iteration overhead of computing s[c] and
-/// updating bounds outweighs the saved distance work.
-const SIMD_HAMERLY_K_THRESHOLD: usize = 100;
-
-/// Minimum number of dimensions at which Hamerly's pruning beats plain Lloyd's
-/// on the SIMD path. Below this, per-iteration overhead of computing s[c] and
-/// updating bounds outweighs the saved distance work.
-const SIMD_HAMERLY_DIM_MIN: usize = 64;
+/// Minimum dimension for GEMM assignment over direct SIMD loops. GEMM wins or
+/// ties from here up at every k measured; below it is unmeasured, so the SIMD
+/// path keeps it.
+const GEMM_DIM_THRESHOLD: usize = 16;
 
 /// Fraction of the average cluster size below which a centroid is reseeded by
 /// [`adjust_centers`].
@@ -272,8 +261,8 @@ pub enum LloydPath {
     /// distance.
     HamerlyGemm,
     /// Uses Hamerly's bounds to reduce computations and SIMD acceleration.
-    /// Ideal on large N and moderate dimensionality data sets with Euclidean
-    /// distance.
+    /// Never picked automatically: GEMM assignment beat it at every shape
+    /// measured.
     HamerlySimd,
     /// Uses GEMM acceleration and standard Lloyd's
     GemmLloyd,
@@ -313,27 +302,14 @@ fn resolve_init(init: Option<KMeansInit>, n_centroids: usize) -> KMeansInit {
 /// * `path` - The Option of the [LloydPath].
 /// * `dim` - The dimensionality of the data set. Will be used if `None` is
 ///   provided for `path`.
-/// * `n_centroids` - The number of requested centroids. Will be used if `None`
-///   is provided for `path`.
 /// * `metric` - The distance metric, see [Dist].
 ///
 /// ### Returns
 ///
 /// The [LloydPath].
-fn resolve_path(
-    path: Option<LloydPath>,
-    dim: usize,
-    n_centroids: usize,
-    metric: &Dist,
-) -> LloydPath {
+fn resolve_path(path: Option<LloydPath>, dim: usize, metric: &Dist) -> LloydPath {
     let chosen = path.unwrap_or_else(|| match metric {
         Dist::SquaredEuclidean if dim >= GEMM_DIM_THRESHOLD => LloydPath::HamerlyGemm,
-        Dist::SquaredEuclidean
-            if (SIMD_HAMERLY_DIM_MIN..GEMM_DIM_THRESHOLD).contains(&dim)
-                && n_centroids >= SIMD_HAMERLY_K_THRESHOLD =>
-        {
-            LloydPath::HamerlySimd
-        }
         Dist::Cosine if dim >= GEMM_DIM_THRESHOLD => LloydPath::GemmLloyd,
         _ => LloydPath::ParallelLloyd,
     });
@@ -2816,9 +2792,9 @@ where
 
 /// Train k-means centroids
 ///
-/// Pending on the dimensionality of the data, it will use either
-/// SIMD-accelerated k-means clustering via Lloyd's (n_dim ≤ 64) or use
-/// a GEMM-accelerated version for larger data sets.
+/// Unless a [LloydPath] is forced, uses GEMM assignment from
+/// `GEMM_DIM_THRESHOLD` dimensions up (with Hamerly's bounds for Euclidean)
+/// and SIMD Lloyd's below it.
 ///
 /// ### Params
 ///
@@ -2932,7 +2908,7 @@ where
         println!("  Running Lloyd's iterations");
     }
 
-    let lloyd_path = resolve_path(params.path, dim, n_centroids, metric);
+    let lloyd_path = resolve_path(params.path, dim, metric);
 
     match lloyd_path {
         LloydPath::HamerlyGemm => {
@@ -3840,8 +3816,7 @@ mod tests {
 
     #[test]
     fn test_train_centroids_dispatches_simd_hamerly() {
-        // Synthetic 2D data with many tight clusters; n_centroids above
-        // SIMD_HAMERLY_K_THRESHOLD forces the SIMD Hamerly path
+        // Synthetic 2D data with many tight clusters, SIMD Hamerly path forced
         let n_clusters = 120;
         let pts_per_cluster = 5;
         let dim = 2;
@@ -3864,7 +3839,11 @@ mod tests {
             n,
             n_clusters,
             &Dist::SquaredEuclidean,
-            None,
+            Some(KMeansTrainingParams::new(
+                30,
+                None,
+                Some(LloydPath::HamerlySimd),
+            )),
             42,
             false,
         )
