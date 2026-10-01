@@ -5,7 +5,7 @@ Changes to the `ann-search` Python package. The Rust crate it wraps,
 
 ## 0.3.1
 
-Requires `ann-search-rs` 0.9.1.
+Requires `ann-search-rs` 0.9.2.
 
 - Improved k-means clustering and `Accelerate` framework enabled on MacOS,
   yielding even faster GEMM which impacts several of the indices.
