@@ -1592,7 +1592,7 @@ pub fn centroid_norms_l2<F: Float>(
     }
     if UNIT_POS_X == 0u32 {
         let base = c as usize * dim;
-        let mut acc = F::new(0.0);
+        let mut acc = F::new(0.0_f32);
         for e in 0..dim {
             let v = centroids[base + e];
             acc += v * v;
