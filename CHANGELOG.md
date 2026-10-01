@@ -3,6 +3,15 @@
 Changes to the `ann-search-rs` crate. The Python package `ann-search` has its
 own changelog at [`python/CHANGELOG.md`](python/CHANGELOG.md).
 
+## 0.9.1
+
+**Features**
+
+- Improved k-means clustering. That impacts every index that is touched by
+  k-means clustering.
+- `Accelerate` GEMM enabled on MacOS. This makes the GEMM heavy indices even
+  faster on MacOS.
+
 ## 0.9.0
 
 **Features**

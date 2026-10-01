@@ -7,10 +7,10 @@
 # ann-search-rs
 
 Various approximate nearest neighbour/vector searches implemented in Rust (with
-focus on computational biology applications, very specifically single cell). The
-search algorithms are designed for high in-memory performance. Indices can be
-saved to disk and loaded back in via the `serialise` feature. Longer term, I
-might add the option to add/remove vectors from some of the indices. The
+focus on computational biology applications, specifically single cell). The
+search algorithms are designed for (mostly) high in-memory performance. Indices
+can be saved to disk and loaded back in via the `serialise` feature. Longer
+term, I might add the option to add/remove vectors from some of the indices. The
 package also has an evolving thin wrapper for [Python](https://pypi.org/project/ann-search/)
 now, too.
 
@@ -93,7 +93,9 @@ anticipated. If you want to see what changed, please check this
 - **(Near) Binarised indices** (optional feature):
   - *Binary* (different types of binary quantisations for exhaustive and IVF
     indices.)
-  - *RaBitQ* (RaBitQ quantisation for exhaustive and IVF indices.)
+  - *RaBitQ* (RaBitQ quantisation for exhaustive, IVF and HNSW.)
+  - *Quantised Graph* (a RaBitQ-based version that leverages RaBitQ and SIMD
+    for extremely fast querying)
   - *TurboQuant* (Turbo Quantisation for exhaustive and IVF indices.)
 
 ## Installation
@@ -279,36 +281,43 @@ Benchmark: 150k samples, 32D
 =====================================================================================================================================================
 Method                                               Build (ms)   Query (ms)   Total (ms)     Recall@k Mean dist ratio Median dist ratio    Size (MB)
 -----------------------------------------------------------------------------------------------------------------------------------------------------
-Exhaustive (query)                                        11.76       740.41       752.18       1.0000          1.0000            1.0000        18.31
-Exhaustive (self)                                         11.76     6_801.54     6_813.30       1.0000          1.0000            1.0000        18.31
-Annoy-nt5-s:auto (query)                                  93.50        64.67       158.17       0.7410          1.0235            1.0183        31.96
-Annoy-nt5-s:10x (query)                                   93.50        41.78       135.27       0.5881          1.0505            1.0460        31.96
-Annoy-nt5-s:5x (query)                                    93.50        26.80       120.30       0.4530          1.0933            1.0883        31.96
-Annoy-nt5 (self)                                          93.50       354.42       447.92       0.7393          1.0237            1.0186        31.96
-Annoy-nt10-s:auto (query)                                120.16       122.36       242.51       0.8963          1.0068            1.0027        44.46
-Annoy-nt10-s:10x (query)                                 120.16        76.11       196.27       0.7595          1.0205            1.0158        44.46
-Annoy-nt10-s:5x (query)                                  120.16        48.27       168.43       0.6031          1.0464            1.0419        44.46
-Annoy-nt10 (self)                                        120.16       735.72       855.87       0.8954          1.0068            1.0027        44.46
-Annoy-nt15-s:auto (query)                                174.82       182.52       357.34       0.9552          1.0024            1.0000        60.83
-Annoy-nt15-s:10x (query)                                 174.82       114.65       289.48       0.8532          1.0101            1.0059        60.83
-Annoy-nt15-s:5x (query)                                  174.82        73.67       248.49       0.7026          1.0278            1.0234        60.83
-Annoy-nt15 (self)                                        174.82     1_089.35     1_264.18       0.9537          1.0025            1.0000        60.83
-Annoy-nt25-s:auto (query)                                277.58       272.40       549.98       0.9895          1.0005            1.0000        70.08
-Annoy-nt25-s:10x (query)                                 277.58       195.64       473.22       0.9386          1.0033            1.0000        70.08
-Annoy-nt25-s:5x (query)                                  277.58       119.14       396.72       0.8206          1.0128            1.0086        70.08
-Annoy-nt25 (self)                                        277.58     1_805.05     2_082.63       0.9891          1.0005            1.0000        70.08
-Annoy-nt50-s:auto (query)                                523.89       515.63     1_039.52       0.9994          1.0000            1.0000       120.71
-Annoy-nt50-s:10x (query)                                 523.89       368.84       892.74       0.9890          1.0004            1.0000       120.71
-Annoy-nt50-s:5x (query)                                  523.89       248.16       772.05       0.9364          1.0032            1.0000       120.71
-Annoy-nt50 (self)                                        523.89     3_624.74     4_148.63       0.9994          1.0000            1.0000       120.71
-Annoy-nt75-s:auto (query)                                786.99       782.68     1_569.67       0.9999          1.0000            1.0000       218.84
-Annoy-nt75-s:10x (query)                                 786.99       528.93     1_315.92       0.9974          1.0001            1.0000       218.84
-Annoy-nt75-s:5x (query)                                  786.99       371.86     1_158.85       0.9725          1.0012            1.0000       218.84
-Annoy-nt75 (self)                                        786.99     5_078.66     5_865.64       1.0000          1.0000            1.0000       218.84
-Annoy-nt100-s:auto (query)                               965.92       943.70     1_909.63       1.0000          1.0000            1.0000       221.97
-Annoy-nt100-s:10x (query)                                965.92       641.75     1_607.67       0.9993          1.0000            1.0000       221.97
-Annoy-nt100-s:5x (query)                                 965.92       418.09     1_384.01       0.9868          1.0005            1.0000       221.97
-Annoy-nt100 (self)                                       965.92     6_843.80     7_809.73       1.0000          1.0000            1.0000       221.97
+Exhaustive (query)                                        11.93       674.61       686.53       1.0000          1.0000            1.0000        18.31
+Exhaustive (self)                                         11.93     6_462.19     6_474.11       1.0000          1.0000            1.0000        18.31
+IVF-nl273-np13 (query)                                   209.47        78.83       288.30       0.9973          1.0002            1.0000        18.35
+IVF-nl273-np16 (query)                                   209.47        88.95       298.42       0.9996          1.0000            1.0000        18.35
+IVF-nl273-np23 (query)                                   209.47       113.22       322.69       1.0000          1.0000            1.0000        18.35
+IVF-nl273 (self)                                         209.47       941.43     1_150.90       1.0000          1.0000            1.0000        18.35
+IVF-nl387-np19 (query)                                   308.95        82.18       391.13       0.9989          1.0001            1.0000        18.36
+IVF-nl387-np27 (query)                                   308.95       101.92       410.87       1.0000          1.0000            1.0000        18.36
+IVF-nl387 (self)                                         308.95       855.70     1_164.65       1.0000          1.0000            1.0000        18.36
+IVF-nl547-np23 (query)                                   533.13        79.03       612.16       0.9936          1.0004            1.0000        18.38
+IVF-nl547-np27 (query)                                   533.13        94.97       628.10       0.9985          1.0001            1.0000        18.38
+IVF-nl547-np33 (query)                                   533.13       111.11       644.25       1.0000          1.0000            1.0000        18.38
+IVF-nl547 (self)                                         533.13       790.97     1_324.11       1.0000          1.0000            1.0000        18.38
+-----------------------------------------------------------------------------------------------------------------------------------------------------
+```
+
+And MacOS with `Accelerate` this is even faster, see here:
+
+```
+=====================================================================================================================================================
+Benchmark: 150k samples, 32D
+=====================================================================================================================================================
+Method                                               Build (ms)   Query (ms)   Total (ms)     Recall@k Mean dist ratio Median dist ratio    Size (MB)
+-----------------------------------------------------------------------------------------------------------------------------------------------------
+Exhaustive (query)                                        12.06       503.92       515.98       1.0000          1.0000            1.0000        18.31
+Exhaustive (self)                                         12.06     4_721.26     4_733.32       1.0000          1.0000            1.0000        18.31
+IVF-nl273-np13 (query)                                   166.62        80.75       247.37       0.9973          1.0002            1.0000        18.35
+IVF-nl273-np16 (query)                                   166.62        97.69       264.31       0.9996          1.0000            1.0000        18.35
+IVF-nl273-np23 (query)                                   166.62       114.68       281.30       1.0000          1.0000            1.0000        18.35
+IVF-nl273 (self)                                         166.62       938.69     1_105.31       1.0000          1.0000            1.0000        18.35
+IVF-nl387-np19 (query)                                   239.50        81.60       321.09       0.9989          1.0001            1.0000        18.36
+IVF-nl387-np27 (query)                                   239.50       104.79       344.29       1.0000          1.0000            1.0000        18.36
+IVF-nl387 (self)                                         239.50       826.84     1_066.34       1.0000          1.0000            1.0000        18.36
+IVF-nl547-np23 (query)                                   369.32        74.69       444.01       0.9936          1.0004            1.0000        18.38
+IVF-nl547-np27 (query)                                   369.32        87.23       456.55       0.9985          1.0001            1.0000        18.38
+IVF-nl547-np33 (query)                                   369.32       101.64       470.96       1.0000          1.0000            1.0000        18.38
+IVF-nl547 (self)                                         369.32       773.66     1_142.98       1.0000          1.0000            1.0000        18.38
 -----------------------------------------------------------------------------------------------------------------------------------------------------
 ```
 
