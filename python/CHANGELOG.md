@@ -3,6 +3,13 @@
 Changes to the `ann-search` Python package. The Rust crate it wraps,
 `ann-search-rs`, has its own changelog at [`../CHANGELOG.md`](../CHANGELOG.md).
 
+## 0.3.1
+
+Requires `ann-search-rs` 0.9.1.
+
+- Improved k-means clustering and `Accelerate` framework enabled on MacOS,
+  yielding even faster GEMM which impacts several of the indices.
+
 ## 0.3.0
 
 Requires `ann-search-rs` 0.9.0.

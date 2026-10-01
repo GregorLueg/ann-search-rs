@@ -2,7 +2,8 @@
 //! implementation, PyNNDescent and EFANNA. Leverages Annoy over Kd forest for
 //! graph initialisation (when not using Manhattan distance).
 
-use faer::{linalg::matmul::matmul, Accum, MatMut, MatRef, Par, RowRef};
+use crate::utils::gemm::gemm;
+use faer::{Accum, MatMut, MatRef, Par, RowRef};
 use fixedbitset::FixedBitSet;
 use rand::{rngs::SmallRng, Rng, SeedableRng};
 use rayon::prelude::*;
@@ -680,7 +681,7 @@ impl<T: AnnSearchFloat> JoinScratch<T> {
         let rhs = MatRef::from_row_major_slice(&self.tile[..n_total * dim], n_total, dim);
         let mut out = MatMut::from_row_major_slice_mut(&mut self.dots[..], n_new, n_total);
 
-        matmul(
+        gemm(
             out.as_mut(),
             Accum::Replace,
             lhs,

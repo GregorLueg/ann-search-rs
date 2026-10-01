@@ -381,6 +381,10 @@ esac
 for entry in "${BENCHMARKS[@]}"; do
     tag="${entry%%|*}"
     cmd="${entry#*|}"
+    # Published tables run on faer, which is what non-macOS builds get. The
+    # default `accelerate` feature only changes macOS and would flatter the
+    # GEMM-heavy rows there.
+    cmd="${cmd/cargo run /cargo run --no-default-features }"
     # shellcheck disable=SC2086
     run_and_replace "$tag" $cmd
 done

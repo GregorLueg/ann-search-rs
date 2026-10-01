@@ -4,7 +4,7 @@
 //! shares one scale across every dimension, which is what lets a code-to-code
 //! distance stay faithful to the metric the caller asked for.
 
-use faer::linalg::matmul::matmul;
+use crate::utils::gemm::gemm;
 use faer::{Accum, Mat, MatMut, MatRef, Par, Scale};
 use half::bf16;
 use num_traits::{Float, FromPrimitive, ToPrimitive};
@@ -644,7 +644,7 @@ where
                 let rows = rows_flat.len() / dim;
                 let mut dst = MatMut::from_row_major_slice_mut(out_tile, rows, dim);
 
-                matmul(
+                gemm(
                     dst.as_mut(),
                     Accum::Replace,
                     MatRef::from_row_major_slice(rows_flat, rows, dim),
@@ -680,7 +680,7 @@ where
         // One `dim x dim` GEMM with no outer parallelism, so faer gets the
         // threads. Both operands are already row-major, so neither is copied.
         let mut c = Mat::<T>::zeros(dim, dim);
-        matmul(
+        gemm(
             c.as_mut(),
             Accum::Replace,
             x.transpose(),

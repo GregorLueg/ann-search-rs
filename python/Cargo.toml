@@ -1,6 +1,6 @@
 [package]
 name = "ann-search-py"
-version = "0.3.0"
+version = "0.3.1"
 edition = "2021"
 authors = ["Gregor Lueg <gregorlueg@me.com>"]
 license = "MIT"
@@ -18,7 +18,7 @@ default = ["gpu"]
 gpu = ["ann-search-rs/gpu", "dep:cubecl"]
 
 [dependencies]
-ann-search-rs = { path = "..", default-features = false, features = ["binary", "quantised", "serialise", "synthetic"] }
+ann-search-rs = { path = "..", default-features = false, features = ["accelerate", "binary", "quantised", "serialise", "synthetic"] }
 cubecl = { version = "0.10.0", features = ["wgpu"], optional = true }
 num-traits = "0.2"
 faer = "0.23.2"

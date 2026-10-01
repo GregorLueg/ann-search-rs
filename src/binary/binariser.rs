@@ -1,7 +1,7 @@
 //! Contains the binarisers for pure binary indices, i.e., RandomProjections,
 //! ITQ-PCA hashing and sign-based binarisation.
 
-use faer::linalg::matmul::matmul;
+use crate::utils::gemm::gemm;
 use faer::{Accum, Col, ColRef, Mat, MatRef, Par, Side};
 use num_traits::{Float, FromPrimitive};
 use rand::rngs::StdRng;
@@ -315,7 +315,7 @@ where
 
             let tile = MatRef::from_row_major_slice(&centred, rows, dim);
             let mut local = Mat::<T>::zeros(dim, dim);
-            matmul(
+            gemm(
                 local.as_mut(),
                 Accum::Replace,
                 tile.transpose(),
@@ -466,7 +466,7 @@ fn itq_rotate_projections<T>(
     // PCA scores of the ITQ subsample: V = centred * loadings, n_itq x k.
     let loadings = Mat::<T>::from_fn(dim, k, |d, j| projections[j * dim + d]);
     let mut scores = Mat::<T>::zeros(n_itq, k);
-    matmul(
+    gemm(
         scores.as_mut(),
         Accum::Replace,
         sample,
@@ -483,7 +483,7 @@ fn itq_rotate_projections<T>(
 
     for _ in 0..ITQ_ITERATIONS {
         // B = sign(V R), with zero mapped to +1 so no entry is dropped
-        matmul(
+        gemm(
             rotated.as_mut(),
             Accum::Replace,
             scores.as_ref(),
@@ -502,7 +502,7 @@ fn itq_rotate_projections<T>(
         }
 
         // Orthogonal Procrustes: argmin ||B - V R|| is U W^T for V^T B = U S W^T
-        matmul(
+        gemm(
             m.as_mut(),
             Accum::Replace,
             scores.as_ref().transpose(),
@@ -516,7 +516,7 @@ fn itq_rotate_projections<T>(
             // the codes stay valid, they just miss the balancing.
             Err(_) => return,
         };
-        matmul(
+        gemm(
             rotation.as_mut(),
             Accum::Replace,
             svd.U(),
@@ -788,7 +788,7 @@ fn encode_all_with_projections<T>(
                     *tile = Mat::<T>::zeros(rows, n_bits);
                 }
 
-                matmul(
+                gemm(
                     tile.as_mut(),
                     Accum::Replace,
                     rows_ref,
@@ -1864,7 +1864,7 @@ mod tests {
         // Reference: centre in f64 first, so no cancellation anywhere
         let centred = Mat::<f64>::from_fn(n, dim, |i, d| data[i * dim + d] as f64 - mean[d] as f64);
         let mut reference = Mat::<f64>::zeros(dim, dim);
-        matmul(
+        gemm(
             reference.as_mut(),
             Accum::Replace,
             centred.as_ref().transpose(),
