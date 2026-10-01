@@ -188,7 +188,7 @@ fn try_cblas<T: ComplexField>(
 /// * `alpha` - Scale of the product
 /// * `par` - Parallelism for the faer fallback
 #[inline]
-pub(crate) fn gemm<T: ComplexField>(
+pub fn gemm<T: ComplexField>(
     #[allow(unused_mut)] mut dst: MatMut<T>,
     accum: Accum,
     lhs: MatRef<T>,
