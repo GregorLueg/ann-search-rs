@@ -176,6 +176,27 @@ good starting point to understand how the crate works.
 
 ## Performance and parameters
 
+### macOS and Apple Accelerate
+
+On macOS the default `accelerate` feature routes every dense CPU GEMM (k-means
+assignment, exhaustive search, the binariser and OPQ rotations, LSH projections)
+through Apple's Accelerate framework. It ships with every macOS, so there is
+nothing to install, and it has no effect on other platforms. Turn it off with
+`default-features = false`.
+
+The benchmark tables in `docs/` are generated **without** it, so they show what
+Linux and Windows builds get. On an M1 Max, Accelerate on top of those numbers
+measured roughly:
+
+| path | speed-up |
+|---|---|
+| exhaustive search (query and self-kNN) | ~2x |
+| IVF and binary IVF build | ~1.5x |
+| OPQ build | ~10% |
+| NN-Descent, LSH | negligible |
+
+These are Apple Silicon numbers. Do not expect them elsewhere.
+
 ### Synthetic data sets
 
 **GaussianNoise**
