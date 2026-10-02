@@ -1061,11 +1061,9 @@ where
 /// * `mat` - Input data as samples x features. Accepts a faer matrix, an
 ///   ndarray 2-D array (with the `ndarray` feature) or a row-major
 ///   `(&[T], n_samples, n_features)` tuple. See [`AnnMatrix`].
-/// * `dist_metric` - Distance metric: "euclidean", "cosine" or "manhatten".
+/// * `dist_metric` - Distance metric: "euclidean", "cosine" or "manhattan".
 /// * `n_trees` - Number of trees to use to build the index
 /// * `seed` - Random seed for reproducibility
-/// * `overlap` - Spill-tree overlap fraction. If None, uses the default
-///   (5%). If Some(0.0), builds a standard Kd-tree without overlap.
 ///
 /// ### Return
 ///
