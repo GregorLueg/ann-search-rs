@@ -48,6 +48,11 @@ thread_local! {
         const { RefCell::new(BinaryHeap::new()) };
     static QUERY_RESULTS_F64: RefCell<BinaryHeap<(OrderedFloat<f64>, usize)>> =
         const { RefCell::new(BinaryHeap::new()) };
+
+    /// Forest-search scratch for the query-time entry points, so the per-query
+    /// tree descent does not allocate an `n`-bit visited set each time.
+    static QUERY_FOREST_F32: RefCell<AnnoyScratch<f32>> = RefCell::new(AnnoyScratch::new());
+    static QUERY_FOREST_F64: RefCell<AnnoyScratch<f64>> = RefCell::new(AnnoyScratch::new());
 }
 
 ///////////
@@ -747,29 +752,6 @@ where
         match self {
             Forest::Annoy(f) => f.n_trees,
             Forest::Kd(f) => f.n_trees,
-        }
-    }
-
-    /// Query the forest for approximate nearest neighbours.
-    ///
-    /// ### Params
-    ///
-    /// * `query_vec` - The query vector
-    /// * `k` - Number of neighbours to return
-    /// * `search_k` - The budget
-    ///
-    /// ### Returns
-    ///
-    /// The `(indices, dist)`
-    fn query(
-        &self,
-        query_vec: &[T],
-        k: usize,
-        search_k: Option<usize>,
-    ) -> Result<(Vec<usize>, Vec<T>), AnnSearchErrors> {
-        match self {
-            Forest::Annoy(f) => f.query(query_vec, k, search_k),
-            Forest::Kd(f) => f.query(query_vec, k, search_k),
         }
     }
 
@@ -2129,7 +2111,7 @@ impl<T: AnnSearchFloat> ApplySortedUpdates<T> for NNDescent<T> {
 
 /// Generates the `NNDescentQuery` impl for a concrete float type.
 macro_rules! impl_nndescent_query {
-    ($float:ty, $cand_tls:ident, $res_tls:ident) => {
+    ($float:ty, $cand_tls:ident, $res_tls:ident, $forest_tls:ident) => {
         impl NNDescentQuery<$float> for NNDescent<$float> {
             fn query_internal(
                 &self,
@@ -2194,19 +2176,25 @@ macro_rules! impl_nndescent_query {
             ) -> Result<(Vec<usize>, Vec<$float>), AnnSearchErrors> {
                 let init_candidates = (ef / 2).max(2 * k).min(self.n);
                 let search_k = init_candidates * 3;
-                let (init_indices, _) =
-                    self.forest
-                        .query(query_vec, init_candidates, Some(search_k))?;
-
-                for &entry_idx in &init_indices {
-                    if entry_idx >= self.n || visited.contains(entry_idx) {
-                        continue;
+                $forest_tls.with(|cell| -> Result<(), AnnSearchErrors> {
+                    let mut scratch = cell.borrow_mut();
+                    self.forest.query_into(
+                        query_vec,
+                        init_candidates,
+                        Some(search_k),
+                        &mut scratch,
+                    )?;
+                    for &(_, entry_idx) in scratch.results() {
+                        if entry_idx >= self.n || visited.contains(entry_idx) {
+                            continue;
+                        }
+                        visited.insert(entry_idx);
+                        let dist = self.euclidean_distance_to_query(entry_idx, query_vec);
+                        candidates.push(Reverse((OrderedFloat(dist), entry_idx)));
+                        results.push((OrderedFloat(dist), entry_idx));
                     }
-                    visited.insert(entry_idx);
-                    let dist = self.euclidean_distance_to_query(entry_idx, query_vec);
-                    candidates.push(Reverse((OrderedFloat(dist), entry_idx)));
-                    results.push((OrderedFloat(dist), entry_idx));
-                }
+                    Ok(())
+                })?;
 
                 while results.len() > ef {
                     results.pop();
@@ -2270,19 +2258,25 @@ macro_rules! impl_nndescent_query {
             ) -> Result<(Vec<usize>, Vec<$float>), AnnSearchErrors> {
                 let init_candidates = (ef / 2).max(2 * k).min(self.n);
                 let search_k = init_candidates * 3;
-                let (init_indices, _) =
-                    self.forest
-                        .query(query_vec, init_candidates, Some(search_k))?;
-
-                for &entry_idx in &init_indices {
-                    if entry_idx >= self.n || visited.contains(entry_idx) {
-                        continue;
+                $forest_tls.with(|cell| -> Result<(), AnnSearchErrors> {
+                    let mut scratch = cell.borrow_mut();
+                    self.forest.query_into(
+                        query_vec,
+                        init_candidates,
+                        Some(search_k),
+                        &mut scratch,
+                    )?;
+                    for &(_, entry_idx) in scratch.results() {
+                        if entry_idx >= self.n || visited.contains(entry_idx) {
+                            continue;
+                        }
+                        visited.insert(entry_idx);
+                        let dist = self.manhattan_distance_to_query(entry_idx, query_vec);
+                        candidates.push(Reverse((OrderedFloat(dist), entry_idx)));
+                        results.push((OrderedFloat(dist), entry_idx));
                     }
-                    visited.insert(entry_idx);
-                    let dist = self.manhattan_distance_to_query(entry_idx, query_vec);
-                    candidates.push(Reverse((OrderedFloat(dist), entry_idx)));
-                    results.push((OrderedFloat(dist), entry_idx));
-                }
+                    Ok(())
+                })?;
 
                 while results.len() > ef {
                     results.pop();
@@ -2347,19 +2341,25 @@ macro_rules! impl_nndescent_query {
             ) -> Result<(Vec<usize>, Vec<$float>), AnnSearchErrors> {
                 let init_candidates = (ef / 2).max(k).min(self.n);
                 let search_k = init_candidates * 3;
-                let (init_indices, _) =
-                    self.forest
-                        .query(query_vec, init_candidates, Some(search_k))?;
-
-                for &entry_idx in &init_indices {
-                    if entry_idx >= self.n || visited.contains(entry_idx) {
-                        continue;
+                $forest_tls.with(|cell| -> Result<(), AnnSearchErrors> {
+                    let mut scratch = cell.borrow_mut();
+                    self.forest.query_into(
+                        query_vec,
+                        init_candidates,
+                        Some(search_k),
+                        &mut scratch,
+                    )?;
+                    for &(_, entry_idx) in scratch.results() {
+                        if entry_idx >= self.n || visited.contains(entry_idx) {
+                            continue;
+                        }
+                        visited.insert(entry_idx);
+                        let dist = self.cosine_distance_to_query(entry_idx, query_vec, query_norm);
+                        candidates.push(Reverse((OrderedFloat(dist), entry_idx)));
+                        results.push((OrderedFloat(dist), entry_idx));
                     }
-                    visited.insert(entry_idx);
-                    let dist = self.cosine_distance_to_query(entry_idx, query_vec, query_norm);
-                    candidates.push(Reverse((OrderedFloat(dist), entry_idx)));
-                    results.push((OrderedFloat(dist), entry_idx));
-                }
+                    Ok(())
+                })?;
 
                 while results.len() > ef {
                     results.pop();
@@ -2414,8 +2414,18 @@ macro_rules! impl_nndescent_query {
     };
 }
 
-impl_nndescent_query!(f32, QUERY_CANDIDATES_F32, QUERY_RESULTS_F32);
-impl_nndescent_query!(f64, QUERY_CANDIDATES_F64, QUERY_RESULTS_F64);
+impl_nndescent_query!(
+    f32,
+    QUERY_CANDIDATES_F32,
+    QUERY_RESULTS_F32,
+    QUERY_FOREST_F32
+);
+impl_nndescent_query!(
+    f64,
+    QUERY_CANDIDATES_F64,
+    QUERY_RESULTS_F64,
+    QUERY_FOREST_F64
+);
 
 ///////////////////
 // KnnValidation //
