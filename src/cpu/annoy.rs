@@ -295,7 +295,7 @@ where
 
     /// Recursively build a node (split or leaf)
     ///
-    /// Attempts up to 5 random hyperplane splits. For each split, picks two
+    /// Attempts up to 10 random hyperplane splits. For each split, picks two
     /// random points and uses their difference as the hyperplane normal.
     /// Accepts splits where both sides contain 5-95% of items. Falls back
     /// to a leaf if no good split is found or if items ≤ 64.
@@ -383,10 +383,7 @@ where
             for &item in &items {
                 let vec_start = item * dim;
                 let vec = &vectors_flat[vec_start..vec_start + dim];
-                let mut dot = T::zero();
-                for k in 0..dim {
-                    dot = dot + vec[k] * hyperplane[k];
-                }
+                let dot = T::dot_simd(vec, &hyperplane);
 
                 if dot > threshold {
                     left_items.push(item);
