@@ -933,10 +933,15 @@ where
                             (node.child_b, node.child_a, dist_to_left, left_node.radius)
                         };
 
+                    // Distances and radii are squared (Euclidean) or
+                    // half-squared chords (Cosine), so the triangle inequality
+                    // holds on their square roots: the ball can hold nothing
+                    // nearer than (sqrt(d) - sqrt(r))^2.
+                    let gap = (farther_dist.max(T::zero()).sqrt()
+                        - farther_radius.max(T::zero()).sqrt())
+                    .max(T::zero());
                     pq.push(BacktrackEntry {
-                        margin: -(farther_dist - farther_radius * T::from(1.1).unwrap())
-                            .to_f64()
-                            .unwrap(),
+                        margin: -(gap * gap).to_f64().unwrap(),
                         node_idx: farther,
                     });
 
