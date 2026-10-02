@@ -858,7 +858,7 @@ where
         // collect unordered results, tagging them with their ORIGINAL id
         let unordered_results: Vec<(usize, Vec<usize>, Vec<T>)> = (0..self.n)
             .into_par_iter()
-            .map(|i| {
+            .map_init(AnnoyScratch::new, |scratch, i| {
                 let start = i * self.dim;
                 let end = start + self.dim;
                 let vec = &self.vectors_flat[start..end];
@@ -877,7 +877,8 @@ where
                     }
                 }
 
-                let (indices, dists) = self.query(vec, k, search_k)?;
+                self.query_into(vec, k, search_k, scratch)?;
+                let (indices, dists) = scratch.results().iter().map(|&(d, i)| (i, d)).unzip();
                 Ok((orig_id, indices, dists))
             })
             .collect::<Result<Vec<_>, AnnSearchErrors>>()?;

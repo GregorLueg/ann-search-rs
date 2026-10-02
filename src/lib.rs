@@ -119,12 +119,42 @@ where
     T: Send + num_traits::Zero + PartialOrd,
     F: Fn(usize) -> Result<(Vec<usize>, Vec<T>), AnnSearchErrors> + Sync,
 {
+    query_parallel_init(n_samples, return_dist, verbose, || (), |_, i| query_fn(i))
+}
+
+/// Helper function to execute parallel queries across samples with per-thread
+/// scratch
+///
+/// ### Params
+///
+/// * `n_samples` - Number of samples to query
+/// * `return_dist` - Whether to return distances alongside indices
+/// * `verbose` - Print progress information every 100,000 samples
+/// * `init` - Creates one scratch value per rayon work split
+/// * `query_fn` - Closure that takes the scratch and a sample index and
+///   returns (indices, distances)
+///
+/// ### Returns
+///
+/// A tuple of `(knn_indices, optional distances)`
+fn query_parallel_init<T, S, I, F>(
+    n_samples: usize,
+    return_dist: bool,
+    verbose: bool,
+    init: I,
+    query_fn: F,
+) -> KnnOptionResult<T>
+where
+    T: Send + num_traits::Zero + PartialOrd,
+    I: Fn() -> S + Sync + Send,
+    F: Fn(&mut S, usize) -> Result<(Vec<usize>, Vec<T>), AnnSearchErrors> + Sync,
+{
     let counter = Arc::new(AtomicUsize::new(0));
 
     let results: Vec<(Vec<usize>, Vec<T>)> = (0..n_samples)
         .into_par_iter()
-        .map(|i| {
-            let result = query_fn(i)?;
+        .map_init(init, |scratch, i| {
+            let result = query_fn(scratch, i)?;
             if verbose {
                 let count = counter.fetch_add(1, Ordering::Relaxed) + 1;
                 if count.is_multiple_of(100_000) {
@@ -516,8 +546,9 @@ where
 {
     let (queries, nq, dim) = query_mat.into_row_major();
 
-    query_parallel(nq, return_dist, verbose, |i| {
-        index.query(&queries[i * dim..(i + 1) * dim], k, search_budget)
+    query_parallel_init(nq, return_dist, verbose, AnnoyScratch::new, |scratch, i| {
+        index.query_into(&queries[i * dim..(i + 1) * dim], k, search_budget, scratch)?;
+        Ok(scratch.results().iter().map(|&(d, i)| (i, d)).unzip())
     })
 }
 
