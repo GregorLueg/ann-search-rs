@@ -322,7 +322,7 @@ pub struct BallTreeIndex<T> {
     centers_data_norm: Vec<T>,
     /// Actual data indices stored in leaf nodes
     leaf_indices: Vec<usize>,
-    /// Original indices - for trait purposes
+    /// Original index of each stored row; rows are kept in leaf order
     original_ids: Vec<usize>,
 }
 
@@ -428,6 +428,22 @@ where
             dim,
         );
 
+        // Store the vectors in leaf order so every leaf scan reads one
+        // contiguous block. A single tree holds each item exactly once, so the
+        // leaf list is itself the new-to-old permutation.
+        let original_ids = leaf_indices;
+        let mut reordered = Vec::with_capacity(vectors_flat.len());
+        for &old in &original_ids {
+            reordered.extend_from_slice(&vectors_flat[old * dim..(old + 1) * dim]);
+        }
+        let vectors_flat = reordered;
+        let norms: Vec<T> = if norms.is_empty() {
+            norms
+        } else {
+            original_ids.iter().map(|&old| norms[old]).collect()
+        };
+        let leaf_indices: Vec<usize> = (0..n).collect();
+
         let centers_data_norm = if metric == Dist::Cosine {
             (0..centers_data.len() / dim)
                 .map(|i| {
@@ -451,7 +467,7 @@ where
             n,
             norms,
             metric,
-            original_ids: (0..n).collect(),
+            original_ids,
         })
     }
 
@@ -953,7 +969,7 @@ where
         let results: Vec<(usize, T)> = top_k
             .data()
             .iter()
-            .map(|(OrderedFloat(dist), idx)| (*idx, *dist))
+            .map(|(OrderedFloat(dist), idx)| (self.original_ids[*idx], *dist))
             .collect();
 
         Ok(results.into_iter().unzip())
@@ -1039,7 +1055,13 @@ where
             })
             .collect::<Result<Vec<_>, AnnSearchErrors>>()?;
 
-        Ok(pack_knn_results(results, return_dist))
+        // Rows come out in storage order; put them back in original order.
+        let mut ordered = vec![(Vec::new(), Vec::new()); self.n];
+        for (internal, res) in results.into_iter().enumerate() {
+            ordered[self.original_ids[internal]] = res;
+        }
+
+        Ok(pack_knn_results(ordered, return_dist))
     }
 }
 
