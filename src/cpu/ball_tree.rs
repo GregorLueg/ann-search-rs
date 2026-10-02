@@ -12,10 +12,9 @@ use crate::prelude::*;
 use crate::utils::tree_utils::*;
 use crate::utils::*;
 
-/// Sequential Lloyd passes on a small node's two-way split. This is a 2-means
-/// done in place: `train_centroids` gave the same splits but fans out over
-/// rayon internally, which on a few hundred rows inside an already parallel
-/// recursion left the build mostly spinning.
+/// Sequential Lloyd passes on a small node's two-way split (an in-place
+/// 2-means). `train_centroids` is avoided because it fans out over rayon
+/// internally, which is wasteful inside an already parallel recursion.
 const BALL_SPLIT_ITERS: usize = 5;
 
 /// Nodes above this size split on furthest-point pivots with a single Lloyd
@@ -898,7 +897,6 @@ where
                     }
                     break;
                 } else {
-                    // Cache child nodes
                     let left_node = unsafe { self.nodes.get_unchecked(node.child_a as usize) };
                     let right_node = unsafe { self.nodes.get_unchecked(node.child_b as usize) };
 
@@ -1148,7 +1146,6 @@ mod tests {
 
         // Query with point 0, should find itself first
         let query = vec![1.0, 0.0, 0.0];
-        // FIX: Pass explicit search_k (5) because default 5% of 5 is 0
         let (indices, distances) = index.query(&query, 1, Some(5)).unwrap();
 
         assert_eq!(indices.len(), 1);
@@ -1162,7 +1159,6 @@ mod tests {
         let index = BallTreeIndex::new(mat.as_ref(), Dist::SquaredEuclidean, 42).unwrap();
 
         let query = vec![1.0, 0.0, 0.0];
-        // FIX: Pass explicit search_k
         let (indices, distances) = index.query(&query, 3, Some(5)).unwrap();
 
         // Should find point 0 first (exact match)
@@ -1183,7 +1179,6 @@ mod tests {
         let index = BallTreeIndex::new(mat.as_ref(), Dist::Cosine, 42).unwrap();
 
         let query = vec![1.0, 0.0, 0.0];
-        // FIX: Pass explicit search_k
         let (indices, distances) = index.query(&query, 3, Some(5)).unwrap();
 
         // Should find point 0 first (identical direction)
@@ -1200,7 +1195,6 @@ mod tests {
 
         let query = vec![1.0, 0.0, 0.0];
         // ask for 10 neighbours but only 5 points exist
-        // FIX: Pass explicit search_k
         let (indices, _) = index.query(&query, 10, Some(5)).unwrap();
 
         // Should return at most 5 results
@@ -1216,7 +1210,6 @@ mod tests {
 
         let query = vec![1.0, 0.0, 0.0];
 
-        // This test was actually passing before because we set Some(10) and Some(1)
         let (indices1, _) = index.query(&query, 3, Some(10)).unwrap();
         let (indices2, _) = index.query(&query, 3, Some(1)).unwrap();
 
@@ -1230,7 +1223,6 @@ mod tests {
         let index = BallTreeIndex::new(mat.as_ref(), Dist::SquaredEuclidean, 42).unwrap();
 
         // Query using a row from the matrix
-        // FIX: Pass explicit search_k
         let (indices, distances) = index.query_row(mat.row(0), 1, Some(5)).unwrap();
 
         assert_eq!(indices[0], 0);
@@ -1245,7 +1237,6 @@ mod tests {
         let index2 = BallTreeIndex::new(mat.as_ref(), Dist::SquaredEuclidean, 42).unwrap();
 
         let query = vec![0.5, 0.5, 0.0];
-        // FIX: Pass explicit search_k
         let (indices1, _) = index1.query(&query, 3, Some(5)).unwrap();
         let (indices2, _) = index2.query(&query, 3, Some(5)).unwrap();
 
@@ -1261,7 +1252,6 @@ mod tests {
 
         let query = vec![0.5, 0.5, 0.0];
 
-        // FIX: Pass explicit search_k
         let (indices1, _) = index1.query(&query, 3, Some(5)).unwrap();
         let (indices2, _) = index2.query(&query, 3, Some(5)).unwrap();
 
@@ -1271,9 +1261,6 @@ mod tests {
 
     #[test]
     fn test_ball_tree_larger_dataset() {
-        // Create a larger synthetic dataset (n=100)
-        // 5% of 100 is 5, so this should work even with None (default)
-        // But for safety in tests we can be explicit
         let n = 100;
         let dim = 10;
         let mut data = Vec::with_capacity(n * dim);
@@ -1302,7 +1289,6 @@ mod tests {
         let index = BallTreeIndex::new(mat.as_ref(), Dist::Cosine, 42).unwrap();
 
         let query = vec![1.0, 0.0, 0.0];
-        // FIX: Pass explicit search_k
         let (indices, distances) = index.query(&query, 3, Some(3)).unwrap();
 
         assert_eq!(indices[0], 0);

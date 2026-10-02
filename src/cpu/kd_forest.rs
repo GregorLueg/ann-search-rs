@@ -42,7 +42,7 @@ struct KdFlatNode<T> {
     child_b: u32,
     /// Dimension along which the split occurs (split only)
     split_dim: u16,
-    /// Explicit padding... Compiler likely does this anyways
+    /// Explicit padding
     _pad: u16,
     /// Threshold value for the split (split only)
     split_val: T,
@@ -175,7 +175,6 @@ where
         let mut rng = StdRng::seed_from_u64(seed as u64);
         let (vectors_flat, n, dim) = data.into_row_major();
 
-        // compute norms for Cosine distance
         let norms = if metric == Dist::Cosine {
             (0..n)
                 .map(|i| {
@@ -217,7 +216,6 @@ where
             })
             .collect();
 
-        // flatten all trees into contiguous storage
         let total_nodes: usize = forest.iter().map(|t| t.len()).sum();
         let mut nodes = Vec::with_capacity(total_nodes);
         let mut roots = Vec::with_capacity(n_trees);
@@ -469,9 +467,8 @@ where
 
     /// Reorders vectors in memory to match the DFS layout of Tree 0
     ///
-    /// Places vectors that co-occur in leaves physically adjacent in memory.
-    /// This drastically reduces L2/L3 cache misses during leaf evaluation and
-    /// reduces memory bandwidth problems.
+    /// Places vectors that co-occur in leaves adjacent in memory, for cache
+    /// locality during leaf evaluation.
     ///
     /// ### Returns
     ///
@@ -485,7 +482,6 @@ where
         let mut old_to_new = vec![usize::MAX; self.n];
         let mut visited = vec![false; self.n];
 
-        // DFS traversal of Tree 0
         let mut stack = vec![self.roots[0]];
         while let Some(node_idx) = stack.pop() {
             let node = unsafe { self.nodes.get_unchecked(node_idx as usize) };
@@ -511,7 +507,6 @@ where
         // Every tree partitions all items, so tree 0 alone covers them.
         debug_assert_eq!(new_to_old.len(), self.n);
 
-        // shuffle vector data into new contiguous layout
         let mut new_vectors_flat = Vec::with_capacity(self.vectors_flat.len());
         let mut new_norms = if self.norms.is_empty() {
             Vec::new()
@@ -529,7 +524,6 @@ where
             }
         }
 
-        // rewrite all leaves in all trees to use new IDs
         for id_ref in self.leaf_indices.iter_mut() {
             *id_ref = old_to_new[*id_ref];
         }
@@ -652,7 +646,6 @@ where
                 let node = unsafe { self.nodes.get_unchecked(current_idx as usize) };
 
                 if node.n_descendants == 1 {
-                    // leaf -> evaluate all items
                     let start = node.child_a as usize;
                     let len = node.child_b as usize;
                     visited_count += len;
@@ -684,7 +677,6 @@ where
                     }
                     break;
                 } else {
-                    // split node -> single coordinate comparison
                     let margin = (split_query[node.split_dim as usize] - node.split_val)
                         .to_f64()
                         .unwrap();
@@ -707,7 +699,6 @@ where
             }
         }
 
-        // extract results and remap to original indices
         let results: Vec<(usize, T)> = top_k
             .data()
             .iter()

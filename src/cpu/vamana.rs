@@ -31,8 +31,7 @@ thread_local! {
 /// Pass 1 prunes at alpha 1, with no slack, so a wide well-converged candidate
 /// pool hands it an aggressively occluded edge list and costs the random
 /// graph's long-range highways that pass 2 still needs. A narrow beam there is
-/// both cheaper and better, and the effect does not scale with `l_build`: the
-/// same constant wins from `l_build` 32 up to 256.
+/// both cheaper and better, independent of `l_build`.
 const DEFAULT_L_BUILD_PASS1: usize = 16;
 
 /// Resolve the first pass's beam width.
@@ -98,11 +97,9 @@ impl VamanaConstructionGraph {
 
     /// Initialise the graph with random out-edges.
     ///
-    /// This is crucial for Vamana. Instead of starting with highly localised
-    /// clusters (like Annoy), we start with random long-range connections.
-    /// Pass 1 of the build process will use these to jump across the dataset,
-    /// explicitly preserving the best "highways" while discovering local
-    /// clusters.
+    /// Starts from random long-range connections rather than localised
+    /// clusters, so pass 1 can jump across the dataset while preserving the
+    /// best "highways".
     ///
     /// Lock-free by construction: the parallel iterator guarantees that each
     /// node's slot is touched by exactly one thread during initialisation.
@@ -116,16 +113,14 @@ impl VamanaConstructionGraph {
             return;
         }
 
-        // handle edge case
+        // A node has at most n - 1 distinct non-self neighbours
         let actual_r = self.r.min(n - 1);
 
         (0..n).into_par_iter().for_each(|i| {
-            // seed a deterministic RNG specifically for this node
             let mut rng = SmallRng::seed_from_u64(seed.wrapping_add(i as u64));
 
-            // SAFETY: This is perfectly safe and lock-free because the parallel
-            // iterator guarantees disjoint access. Thread `i` exclusively
-            // borrows and mutates `nodes[i]`. No locks required!
+            // SAFETY: the parallel iterator guarantees disjoint access; thread
+            // `i` exclusively borrows `nodes[i]`.
             let neighbors = unsafe { &mut *self.nodes[i].get() };
 
             let mut count = 0;
@@ -177,7 +172,6 @@ impl VamanaConstructionGraph {
     #[inline]
     pub unsafe fn degree(&self, node_id: usize) -> usize {
         let edges = &*self.nodes[node_id].get();
-        // Sentinels are always packed at the end, so first sentinel = degree
         edges.iter().position(|&e| e == u32::MAX).unwrap_or(self.r)
     }
 
@@ -282,7 +276,6 @@ pub fn compute_medoid<T: AnnSearchFloat>(
         return 0;
     }
 
-    // compute the centroid (mean vector)
     let mut centroid = vec![T::zero(); dim];
     for i in 0..n {
         let offset = i * dim;
@@ -306,7 +299,6 @@ pub fn compute_medoid<T: AnnSearchFloat>(
         }
     }
 
-    // find the actual data point closest to the centroid
     let medoid_idx = (0..n)
         .into_par_iter()
         .min_by(|&a, &b| {
@@ -602,7 +594,6 @@ where
             });
         }
 
-        // flatten graph for cache-friendly queries
         index.graph = build_graph.into_flat();
         index
     }
@@ -634,11 +625,8 @@ where
     ///
     /// The pool is the visited set rather than the beam, as in DiskANN. The
     /// beam holds the `l_build` nearest, which are exactly the candidates the
-    /// prune occludes; the long-range nodes the descent passed through are what
-    /// fills the degree, and a wider beam evicts them. Pruning over the beam
-    /// therefore made a *higher* `l_build` produce a *less* navigable graph,
-    /// which shows up on data with thin low-density structure between dense
-    /// regions.
+    /// prune occludes; the long-range nodes the descent passed through fill the
+    /// degree, and a wider beam would evict them.
     ///
     /// ### Params
     ///
@@ -673,7 +661,6 @@ where
 
             for &neighbour in neighbours {
                 if neighbour == u32::MAX {
-                    // sentinels packed at end, safe to break
                     break;
                 }
                 let n_idx = neighbour as usize;
@@ -882,14 +869,13 @@ where
 
         let ef_search = ef_search.unwrap_or(75);
 
-        // Ensure the beam is at least as wide as k
         let ef = ef_search.max(k);
 
         Self::with_search_state(|state_cell| {
             let mut state = state_cell.borrow_mut();
             state.reset(self.n);
 
-            // Here we DO need the external query norm because it's a new, unseen vector
+            // The query is an unseen vector, so its norm is computed here
             let query_norm = if self.metric == Dist::Cosine {
                 T::calculate_l2_norm(query)
             } else {
@@ -906,7 +892,6 @@ where
 
             let mut furthest_dist = entry_dist;
 
-            // The main Beam Search loop
             while let Some(Reverse((current_dist, current_id))) = state.candidates.pop() {
                 // If the closest candidate to explore is further than our worst accepted
                 // result, we can terminate early.
@@ -914,12 +899,10 @@ where
                     break;
                 }
 
-                // Fetch neighbors directly from the cache-friendly flat array
                 let neighbours = self.get_neighbours_flat(current_id);
 
                 for &neighbour in neighbours {
-                    // Because we append sequentially during build, hitting a sentinel
-                    // means the rest of the slice is also sentinels. We can safely break.
+                    // Sentinels are packed at the end, so break at the first.
                     if neighbour == u32::MAX {
                         break;
                     }
@@ -931,7 +914,6 @@ where
                     }
                     state.mark_visited(n_idx);
 
-                    // Compute actual distance to the query vector
                     let dist = OrderedFloat(self.compute_query_distance(query, n_idx, query_norm));
 
                     if dist < furthest_dist || state.working_sorted.len() < ef {
@@ -950,7 +932,6 @@ where
                 }
             }
 
-            // Extract the top-k results
             let mut results = state.working_sorted.data().to_vec();
             results.truncate(k);
 
@@ -1256,11 +1237,8 @@ mod tests {
 
     #[test]
     fn test_prune_pool_reaches_past_the_beam() {
-        // What the prune sees has to be the visited set, not the beam. The beam
-        // holds the `l_build` nearest, which are the candidates the alpha rule
-        // occludes; the long edges come from everything else the walk touched,
-        // and pruning over the beam alone made a wider `l_build` give a less
-        // navigable graph.
+        // The prune must see the visited set, not the beam: the long edges come
+        // from nodes the walk touched beyond the `l_build` nearest.
         let (n, dim, r, l_build) = (500usize, 8usize, 32usize, 16usize);
 
         let mut state_rng = 0x9E37_79B9_7F4A_7C15u64;

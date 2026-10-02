@@ -156,7 +156,6 @@ where
 
         let (vectors_flat, n, dim) = data.into_row_major();
 
-        // Compute norms for Cosine distance
         let norms = if metric == Dist::Cosine {
             (0..n)
                 .map(|i| {
@@ -224,7 +223,6 @@ where
             &metric,
         );
 
-        // 4. generate a flat version for better cache locality
         let (all_indices, offsets) = build_csr_layout(assignments, n, nlist);
 
         // 5. optimise memory layout for access pattern
@@ -285,8 +283,7 @@ where
         self.vectors_flat = new_vectors_flat;
         self.norms = new_norms;
 
-        // offsets now directly index vectors_flat — no change needed since
-        // all_indices was already built in cluster order
+        // Offsets index `vectors_flat` directly; `all_indices` is no longer needed
         self.all_indices.clear();
         self.all_indices.shrink_to_fit();
 

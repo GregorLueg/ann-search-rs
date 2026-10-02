@@ -5,29 +5,24 @@
 //! boundaries** measured on a subsample of the data, and the per-table code is
 //! the concatenation of those slots. That one construction covers both metrics:
 //!
-//! * `slot_bits == 1` reduces to SimHash whose threshold is the median of the
-//!   projection rather than zero. Classic SimHash puts every hyperplane through
-//!   the origin, so on data with a large shared mean offset (foundation-model
-//!   cell embeddings being the motivating case) the sign is decided by the
-//!   offset and nearly every point lands in the same bucket. A median threshold
-//!   splits each bit 50/50 by construction and the degeneracy disappears.
-//! * `slot_bits >= 2` quantises the projection into levels, which is the
-//!   p-stable construction of Datar et al. (2004) with the fixed width `w`
-//!   replaced by data-derived boundaries. Unlike SimHash it is sensitive to
-//!   vector magnitude, which matters because squared Euclidean distance is.
+//! * `slot_bits == 1` is SimHash with the median of the projection as the
+//!   threshold instead of zero. Zero-threshold SimHash collapses most points
+//!   into one bucket on data with a large shared mean offset; a median
+//!   threshold splits each bit 50/50 by construction.
+//! * `slot_bits >= 2` is the p-stable construction of Datar et al. (2004) with
+//!   the fixed width `w` replaced by data-derived boundaries. It is sensitive
+//!   to vector magnitude, as squared Euclidean distance is.
 //!
-//! Trading `w` for quantiles makes the collision probability data-dependent
-//! instead of a clean function of `||u - v||`, so the theoretical guarantee of
-//! Datar et al. is given up in exchange for bucket balance on skewed data. That
-//! is a deliberate choice.
+//! Quantile boundaries make the collision probability data-dependent, so the
+//! theoretical guarantee of Datar et al. is given up in exchange for bucket
+//! balance on skewed data.
 //!
-//! Cosine hashes the L2-normalised vector (a threshold is not scale-invariant,
-//! so it has to); Euclidean hashes the raw one. Neither stores a second copy of
-//! the data: projection is linear, so the cosine path just divides the
-//! projection by the norm it already keeps.
+//! Cosine hashes the L2-normalised vector (a threshold is not scale-invariant);
+//! Euclidean hashes the raw one. No second copy of the data is stored:
+//! projection is linear, so the cosine path divides by the norm it keeps.
 //!
 //! Buckets live in a directly addressed CSR layout rather than a hash map,
-//! which is what bounds `bits_per_hash` to [`MAX_BITS_PER_HASH`].
+//! which bounds `bits_per_hash` to [`MAX_BITS_PER_HASH`].
 //!
 //! ### References
 //!
@@ -55,22 +50,19 @@ use crate::utils::*;
 /// Largest supported `bits_per_hash`.
 ///
 /// The bucket table is directly addressed, so a table costs
-/// `(1 << bits_per_hash) + 1` `u32` offsets. 20 bits is ~4 MB per table, which
-/// is the point where the offsets array stops fitting any sensible cache
-/// budget.
+/// `(1 << bits_per_hash) + 1` `u32` offsets, which stops fitting any sensible
+/// cache budget well before this limit.
 pub const MAX_BITS_PER_HASH: usize = 20;
 
 /// Number of vectors sampled when fitting the quantile boundaries.
 ///
-/// Quantiles converge quickly, so 20k rows pin the boundaries well within the
-/// noise of the projections themselves while keeping the fitting GEMM's
-/// intermediate at a few tens of MB.
+/// Quantiles converge quickly, so a subsample pins the boundaries well within
+/// the noise of the projections themselves.
 const BOUNDARY_SAMPLE: usize = 20_000;
 
 /// Rows per tile in the projection GEMM.
 ///
-/// Bounds the intermediate to `GEMM_ROW_TILE * num_tables * n_proj` elements,
-/// a few MB at any legal parameter combination.
+/// Bounds the intermediate to `GEMM_ROW_TILE * num_tables * n_proj` elements.
 const GEMM_ROW_TILE: usize = 4096;
 
 /// Vectors sampled at random when no bucket yielded a single candidate.
@@ -82,8 +74,7 @@ const FALLBACK_SAMPLE: usize = 1000;
 
 // Reused across queries on the same thread. `visited` deduplicates candidates
 // across tables and probes; `touched` records which bits were set so the reset
-// is O(candidates) rather than O(n / 64). The top-k buffer is not stored here
-// because it is typed by T and tiny (k ~ 15).
+// is O(candidates) rather than O(n / 64).
 thread_local! {
     static LSH_VISITED: RefCell<FixedBitSet> = const { RefCell::new(FixedBitSet::new()) };
     static LSH_TOUCHED: RefCell<Vec<u32>> = const { RefCell::new(Vec::new()) };
@@ -95,11 +86,10 @@ thread_local! {
 
 /// Resolve `slot_bits` when the caller did not pick one.
 ///
-/// Cosine wants the angular family, which is the sign of the projection, so a
-/// single bit. Squared Euclidean is magnitude-sensitive and needs at least two
-/// levels per projection to see it; two is the cheapest value that does, and it
-/// keeps `n_proj` at half the bit budget so multi-probe still has projections
-/// to perturb.
+/// Cosine wants the angular family (the sign of the projection), so a single
+/// bit. Squared Euclidean is magnitude-sensitive and needs at least two levels
+/// per projection; two is the cheapest, and it keeps `n_proj` at half the bit
+/// budget so multi-probe has projections to perturb.
 ///
 /// ### Params
 ///
@@ -122,8 +112,7 @@ fn resolve_slot_bits(slot_bits: Option<usize>, metric: Dist, bits_per_hash: usiz
 /// Orthogonalise random projections within each table via modified
 /// Gram-Schmidt
 ///
-/// Orthogonal projections decorrelate the slots, which improves bucket balance
-/// on top of what the quantile boundaries already give per projection.
+/// Orthogonal projections decorrelate the slots, which improves bucket balance.
 ///
 /// ### Params
 ///
@@ -142,7 +131,6 @@ where
         for i in 0..n_proj {
             let i_base = base + i * dim;
 
-            // Orthogonalise against previous
             for j in 0..i {
                 let j_base = base + j * dim;
                 let mut dot = T::zero();
@@ -154,7 +142,6 @@ where
                 }
             }
 
-            // Normalise
             let mut norm_sq = T::zero();
             for d in 0..dim {
                 norm_sq = norm_sq + vecs[i_base + d] * vecs[i_base + d];
@@ -172,9 +159,8 @@ where
 /// Scale factor applied to a vector's projections before bucketing
 ///
 /// Cosine hashes the L2-normalised vector; because projection is linear this is
-/// a division of the projection by the norm rather than a second copy of the
-/// data. A degenerate (zero) norm collapses every projection to zero, which
-/// puts the vector in whichever bucket the boundaries assign to zero.
+/// a division of the projection by the norm. A zero norm collapses every
+/// projection to zero.
 ///
 /// ### Params
 ///
@@ -324,12 +310,10 @@ fn project_block<T>(
 ///
 /// Boundary `b` of a projection is the `(b + 1) / 2^slot_bits` quantile of that
 /// projection over the sample, so every slot holds the same share of the
-/// sampled data regardless of how skewed the projection is. This is what makes
-/// bucket occupancy independent of any shared mean offset in the data.
+/// sampled data regardless of skew.
 ///
-/// Successive quantiles are taken with `select_nth_unstable_by` over a
-/// shrinking suffix rather than a full sort: there are at most 15 boundaries
-/// per projection, so a sort would be the more expensive of the two.
+/// Successive quantiles use `select_nth_unstable_by` over a shrinking suffix
+/// rather than a full sort, as there are at most 15 boundaries per projection.
 ///
 /// ### Params
 ///
@@ -509,9 +493,8 @@ where
 
 /// Counting-sort the codes of every table into a CSR bucket layout
 ///
-/// Mirrors [`crate::utils::build_csr_layout`], but keeps `u32` throughout: the
-/// bucket contents are half the size of a `Vec<usize>` and, unlike the map of
-/// per-bucket `Vec`s this replaces, they are one contiguous allocation.
+/// Mirrors [`crate::utils::build_csr_layout`] but keeps `u32` throughout and a
+/// single contiguous allocation.
 ///
 /// ### Params
 ///
@@ -772,22 +755,13 @@ where
     /// Reorder the stored vectors into table 0's bucket order
     ///
     /// The candidate scan is a random gather into `vectors_flat` driven by
-    /// `bucket_ids`: it fetches `dim * size_of::<T>()` bytes to do `dim` FMAs,
-    /// so it is bound by memory rather than by arithmetic and the layout is
-    /// what decides its cost. Laying the vectors out in table 0's bucket order
-    /// turns that table's scan into a sequential read, the same trick IVF
-    /// plays with its cells and Annoy with tree 0.
+    /// `bucket_ids`, so it is memory-bound and layout decides its cost. Laying
+    /// the vectors out in table 0's bucket order turns that table's scan into a
+    /// sequential read. The remaining tables keep their gather.
     ///
-    /// The remaining tables keep their gather, but it does not stay uniformly
-    /// random: buckets are proximity groups, so points sharing a table-0
-    /// bucket tend to share buckets elsewhere too and their gathers come out
-    /// clustered. How much that is worth depends on how correlated the tables
-    /// are on the data at hand.
-    ///
-    /// Table 0's CSR is a permutation of `0..n` by construction, since
-    /// [`build_bucket_csr`] writes every id exactly once per table. No
-    /// unreachable-id safeguard is needed, unlike the Annoy equivalent where a
-    /// tree need not contain every item.
+    /// Table 0's CSR is a permutation of `0..n` by construction
+    /// ([`build_bucket_csr`] writes every id once per table), so no
+    /// unreachable-id safeguard is needed.
     ///
     /// ### Returns
     ///
@@ -1247,11 +1221,8 @@ where
 
     /// Self-query for a vector already stored in the index
     ///
-    /// Re-projects the stored vector rather than reading a cached code. That
-    /// costs `num_tables * n_proj` dot products against the ~`budget * dim`
-    /// flops the candidate distances cost, and it buys the same
-    /// boundary-ranked probe order the cross-set path gets. Caching codes
-    /// instead would force probes to be generated blind.
+    /// Re-projects the stored vector rather than reading a cached code, which
+    /// keeps the boundary-ranked probe order the cross-set path uses.
     ///
     /// ### Params
     ///
@@ -1667,9 +1638,8 @@ mod tests {
 
     #[test]
     fn test_max_cand_bounds_candidates_examined() {
-        // Every vector is identical, so a single bucket holds all of them. The
-        // old between-buckets budget check let a bucket like this blow straight
-        // past max_cand.
+        // Every vector is identical, so a single bucket holds all of them;
+        // `max_cand` must still bound the work.
         let n = 5000;
         let dim = 8;
         let mat = Mat::from_fn(n, dim, |_, j| j as f32);
@@ -1990,9 +1960,8 @@ mod tests {
 
     #[test]
     fn test_recall_on_offset_data() {
-        // The regression guard for the whole rewrite: clustered data sitting
-        // far from the origin, which is where plain SimHash collapses into one
-        // bucket.
+        // Clustered data far from the origin, where plain SimHash collapses
+        // into one bucket.
         let n = 2000;
         let dim = 16;
         let mat = Mat::from_fn(n, dim, |i, j| {

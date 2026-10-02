@@ -13,15 +13,10 @@ use crate::prelude::*;
 
 /// Search state for HNSW/Vamana/NSG queries and construction.
 ///
-/// Maintains visited tracking and candidate management for graph traversal.
 /// Reused across queries to amortise allocation costs.
 ///
-/// `visited` is a [`FixedBitSet`] (1 bit per node) rather than an epoch-based
-/// `Vec<usize>`. At n=150k the bitset is ~19 KB and fits in L1, versus 1.2 MB
-/// for the `Vec<usize>` alternative. The per-reset `clear()` cost
-/// (~O(n/64) u64 writes) is negligible compared to the cache-thrashing the
-/// wider array causes during dense per-node build phases (e.g. NSG's MRNG
-/// prune, which resets once per node).
+/// `visited` is a [`FixedBitSet`] (1 bit per node) so it stays cache-resident;
+/// the per-reset `clear()` is O(n/64).
 pub struct SearchState<T> {
     /// Per-node visit tracking as a bit-per-node bitset.
     pub visited: FixedBitSet,
@@ -31,20 +26,15 @@ pub struct SearchState<T> {
     pub working_sorted: SortedBuffer<(OrderedFloat<T>, usize)>,
     /// Bounded max-heap of current best candidates.
     ///
-    /// Serves the same purpose as `working_sorted` but at `O(log ef)` per
-    /// accepted candidate instead of the `O(ef)` memmove `Vec::insert` costs.
-    /// The two coexist because the buffer's tail is only worth the swap where
-    /// `ef` is large: HNSW runs at `ef_construction` / `ef_search` in the
-    /// hundreds for both build and query, whereas NSG and Vamana prune against
-    /// lists an order of magnitude shorter.
+    /// Same purpose as `working_sorted` at `O(log ef)` per accepted candidate
+    /// instead of an `O(ef)` `Vec::insert`. Pays off where `ef` is large
+    /// (HNSW); NSG and Vamana prune against much shorter lists.
     pub results: BoundedMaxHeap<T>,
     /// Bounded sorted beam that doubles as the frontier.
     ///
-    /// Where `candidates` plus `results` are used as a pair, the frontier
-    /// accepts every candidate that beat the threshold at the time and then
-    /// never pops most of them. [`NeighbourQueue`] holds the beam once and
-    /// hands out the closest unexpanded entry instead, which is what Vamana's
-    /// construction walk uses.
+    /// Replaces the `candidates` + `results` pair with a single
+    /// [`NeighbourQueue`] that hands out the closest unexpanded entry; used by
+    /// Vamana's construction walk.
     pub beam: NeighbourQueue<T>,
     /// Temporary storage for heuristic selection
     pub scratch_working: Vec<(OrderedFloat<T>, usize)>,
@@ -623,9 +613,8 @@ thread_local! {
 /// Access to a reusable per-thread [`SearchState`], keyed on the float type.
 ///
 /// Query paths fan out over rayon and would otherwise allocate a visited
-/// bitset per query; at a million nodes that is 125 KiB of allocate-and-clear
-/// against a query that should cost tens of microseconds. Keyed on `T` rather
-/// than on an index type, so every graph index can share the same buffers.
+/// bitset per query. Keyed on `T` rather than on an index type, so every
+/// graph index shares the same buffers.
 ///
 /// ### Note
 ///

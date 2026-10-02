@@ -17,71 +17,46 @@ use crate::utils::pack_knn_results;
 
 /// Queries per thread below which the fused scan beats the blocked GEMM path.
 ///
-/// The GEMM path pays an O(n_queries * n_samples) cost for materialising the
-/// dot products and buys reuse of each database tile across the queries
-/// sharing it. Batch size decides that trade, not dimension: the crossover
-/// held between 96 and 128 queries across `dim` 32 and 128 and `n` from 10k to
-/// 200k, a 20-fold range in database size.
-///
-/// It is stated per thread because the scan fans out one query per core while
-/// the GEMM path can only fan out whole blocks, so a batch too small to fill
-/// the machine with blocks loses however favourable the arithmetic is.
-/// Measured crossovers were under 32 queries at 2 threads, 58 at 4 and 110 at
-/// 10, so 11 to 16 queries per thread; the upper end is taken so the threshold
-/// sits on a measured win rather than on the margin.
-///
-/// Note this is *not* the crossover `k_means_utils` measures for its own GEMM
-/// assignment. There the database side is the centroid set, small enough to
-/// stay cache-resident on its own, so blocking adds little and the crossover
-/// lands in dimension instead.
+/// The GEMM path pays O(n_queries * n_samples) to materialise dot products in
+/// exchange for reusing each database tile across a tile of queries. Batch
+/// size decides that trade, not dimension. It is stated per thread because the
+/// scan fans out one query per core while the GEMM path can only fan out whole
+/// blocks, so a batch too small to fill the machine with blocks loses
+/// regardless of the arithmetic.
 const GEMM_MIN_QUERIES_PER_THREAD: usize = 16;
 
 /// Largest number of queries per GEMM block.
 ///
-/// With [`GEMM_DB_TILE`] this caps the dot-product tile at 256 * 1024 elements,
-/// so roughly 1 MB at `f32`. Sized to sit in L2 alongside the two operand
-/// blocks, since every thread holds its own tile.
+/// With [`GEMM_DB_TILE`] this caps the dot-product tile at 256 * 1024 elements
+/// (~1 MB at `f32`), sized to sit in L2 as every thread holds its own tile.
 const GEMM_QUERY_TILE: usize = 256;
 
 /// Smallest number of queries per GEMM block.
 ///
 /// The block loop is the only source of parallelism on the GEMM path, so the
 /// tile shrinks below [`GEMM_QUERY_TILE`] to keep every thread fed on a small
-/// batch. It stops here because a block narrower than this reuses a database
-/// tile too few times to pay for materialising the dot products.
+/// batch, but not below this: narrower blocks reuse a database tile too few
+/// times to pay for the dot products.
 const GEMM_QUERY_TILE_MIN: usize = 32;
 
 /// Blocks to aim for per thread when sizing the query tile.
 ///
-/// One block per thread balances badly on an asymmetric machine: a block that
-/// lands on an efficiency core holds up the whole batch. Cutting finer gives
-/// rayon something to steal, at the cost of reusing each database tile across
-/// fewer queries.
+/// One block per thread balances badly on asymmetric machines (a block on an
+/// efficiency core holds up the batch); finer blocks give rayon work to steal.
 const GEMM_BLOCKS_PER_THREAD: usize = 4;
 
 /// Database vectors per GEMM block.
 ///
-/// The block is re-read by all [`GEMM_QUERY_TILE`] queries, so it wants to stay
-/// resident: 1024 rows is 512 KB at `dim = 128` and `f32`.
+/// The block is re-read by all [`GEMM_QUERY_TILE`] queries, so it should stay
+/// cache-resident.
 const GEMM_DB_TILE: usize = 1024;
 
 /// Over-fetch for the GEMM path's candidate selection, as a fraction of `k`.
 ///
-/// The GEMM path scores with `|x|^2 + |y|^2 - 2x.y`, which cancels: the
-/// subtraction loses roughly `log10(|y|^2 / d^2)` digits, and at `f32` that is
-/// enough to rank a true neighbour just outside the top `k` when its distance
-/// differs from the k-th by about one part in 1e6. The exact re-rank below
-/// cannot recover such a point, because the heap never selected it, so the
-/// scan keeps `k * 3/2` candidates and the re-rank truncates.
-///
-/// Measured: with no over-fetch, 1 to 3 rows per 2000 queries disagree with
-/// the fused scan on 20k x 64 clustered and cell-embedding data at `k` of 10,
-/// 15 and 50. At `3/2` the disagreement is zero across all six.
-///
-/// The reject path in `BoundedMaxHeap::push` short-circuits on one float
-/// comparison, so a wider heap barely touches the inner scan. What it costs is
-/// that many more exact distance computations per query, against `n`
-/// approximate ones.
+/// The GEMM path scores with `|x|^2 + |y|^2 - 2x.y`, which cancels at `f32`
+/// and can rank a true neighbour just outside the top `k`. The exact re-rank
+/// cannot recover a point the heap never selected, so the scan keeps `k * 3/2`
+/// candidates and the re-rank truncates.
 const GEMM_RERANK_NUM: usize = 3;
 const GEMM_RERANK_DEN: usize = 2;
 
@@ -460,9 +435,8 @@ where
             .div_ceil(GEMM_RERANK_DEN)
             .min(n);
 
-        // Database norms are recomputed per batch rather than stored on the
-        // index: O(n * dim) against the O(nq * n * dim) of the search itself,
-        // and it leaves the serialised layout alone.
+        // Database norms are recomputed per batch (O(n * dim)) rather than
+        // stored, which leaves the serialised layout alone.
         let db_norms: Vec<T> = if cosine {
             self.norms.clone()
         } else {
@@ -870,10 +844,8 @@ mod tests {
     /// Clustered points, distinct and non-degenerate.
     ///
     /// The jitter period (97) is coprime with the cluster count over the sizes
-    /// used here, so every row is unique and "each point is its own nearest
-    /// neighbour" holds strictly. The offset keeps every norm non-zero so the
-    /// cosine metric stays defined. Spread is comparable to the cluster
-    /// separation, so distances stay resolvable at `f32`.
+    /// used here, so every row is unique; the offset keeps every norm non-zero
+    /// so cosine stays defined.
     fn clustered_matrix(n: usize, dim: usize) -> Mat<f32> {
         Mat::from_fn(n, dim, |i, j| {
             let cluster = (i % 5) as f32 * 40.0;

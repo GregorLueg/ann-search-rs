@@ -46,10 +46,8 @@ thread_local! {
 
 /// Per-thread scratch for the parallel UpdateNeighbors pass.
 ///
-/// Only the emit buffer needs to survive between nodes. The candidate list and
-/// the surviving list used to be held here too; the prune now compacts the
-/// node's adjacency in place, since survivors are written at an index that
-/// never passes the read index.
+/// Only the emit buffer survives between nodes; the prune compacts the node's
+/// adjacency in place.
 pub struct UpdateScratch<T> {
     /// Updates to be batched and applied via [`ApplySortedUpdates`]
     pub emitted: Vec<Update<T>>,
@@ -132,9 +130,8 @@ impl RnnDescentState<f64> for RnnDescentIndex<f64> {
 /// Prune-loop counters accumulated per rayon task.
 ///
 /// Folded alongside the emitted updates so the counting touches registers
-/// rather than shared atomics. Deliberately per node, not per candidate pair:
-/// a pair counter in the innermost loop cost 4% of the build, which is more
-/// than the pruning statistics were worth once they had been read.
+/// rather than shared atomics. Deliberately per node, not per candidate pair,
+/// to keep counting out of the innermost loop.
 #[derive(Default, Clone, Copy)]
 struct PruneStats {
     /// Adjacency lengths summed over the nodes seen
@@ -169,10 +166,9 @@ impl PruneStats {
 
 /// Per-phase wall-clock breakdown of a build, accumulated across passes.
 ///
-/// Timed from the driving loop rather than from inside the parallel closures,
-/// so the cost is a handful of `Instant::now()` calls per pass. Reported only
-/// under `verbose`. The phases partition the build and sum to roughly the
-/// total.
+/// Timed from the driving loop rather than from inside the parallel closures.
+/// Reported only under `verbose`. The phases partition the build and sum to
+/// roughly the total.
 #[derive(Default, Clone, Copy)]
 struct BuildTimings {
     /// Kd-forest construction for the query-time entry points
@@ -381,19 +377,16 @@ impl<T> DimensionValidation for RnnDescentIndex<T> {
 ///
 /// Shares its shape with NN-Descent's implementation
 /// (`src/cpu/nndescent.rs`): `par_chunk_by` splits the batch on target
-/// boundaries directly, so no sequential boundary scan and no `Vec` of
-/// segment descriptors stands between the sort and the merge. Each segment
-/// owns one row for the whole call, which is what makes the raw-pointer
-/// writes sound.
+/// boundaries, and each segment owns one row for the whole call, which is what
+/// makes the raw-pointer writes sound.
 ///
-/// The RNN-specific part is the live prefix. Rows are sentinel-padded to `R`
-/// and the RNG prune keeps mean degree far below it, so every scan stops at
-/// the first sentinel instead of walking the whole slot.
+/// Rows are sentinel-padded to `R` and the RNG prune keeps mean degree far
+/// below it, so every scan stops at the first sentinel instead of walking the
+/// whole slot.
 ///
 /// The merge is a bounded insertion sort under the total order
-/// `(dist, source)`, which makes the outcome independent of the order updates
-/// arrive in within a segment: the final row is the `R` best of
-/// `existing + candidates` however they were interleaved.
+/// `(dist, source)`, so the outcome is independent of update arrival order
+/// within a segment: the final row is the `R` best of `existing + candidates`.
 impl<T> ApplySortedUpdates<T> for RnnDescentIndex<T>
 where
     T: AnnSearchFloat,
@@ -527,10 +520,8 @@ where
     /// Distance between two rows that the caller has already sliced.
     ///
     /// Same arithmetic as [`Self::distance`], but the metric and the row
-    /// slices are lifted out of the caller's loop. Going through
-    /// [`Self::distance`] re-read `self.metric` and re-sliced both rows on
-    /// every one of the hundred-million-odd pairs a default build evaluates,
-    /// and the source row is invariant across the whole inner loop.
+    /// slices are lifted out of the caller's loop, as the source row is
+    /// invariant across the whole inner loop.
     ///
     /// ### Params
     ///
@@ -681,9 +672,8 @@ where
         }
 
         // Flatten to compact ids-only storage.
-        // `collect` reuses the Neighbour<T> allocation in place (8 bytes/elem
-        // for f32 against 4 for u32), so without the shrink the buffer keeps
-        // twice the capacity it needs and the saving is never released.
+        // `collect` reuses the Neighbour<T> allocation in place, so shrink to
+        // release the surplus capacity.
         index.graph = build_graph.into_iter().map(|n| n.pid() as u32).collect();
         index.graph.shrink_to_fit();
 
@@ -808,11 +798,8 @@ where
                         stats.deg_max = stats.deg_max.max(degree as u32);
 
                         // Every survivor is written back old, so the paper's
-                        // `!v_new && !w_new` guard has an always-false right
-                        // half and reduces to `v_new`. An all-old adjacency
-                        // therefore keeps every candidate in order, emits
-                        // nothing and writes back exactly what it read, so the
-                        // whole node is a no-op.
+                        // `!v_new && !w_new` guard reduces to `v_new`. An
+                        // all-old adjacency is therefore a no-op for the node.
                         if !any_new {
                             stats.skipped += 1;
                             return;
@@ -828,15 +815,6 @@ where
                         // write never passes the read and the entry is copied
                         // out first. `slot[..j]` is the surviving list the RNG
                         // rule tests against.
-                        //
-                        // Batching four survivors per distance call was tried
-                        // and reverted: the mean is 1.6 distances per candidate,
-                        // so a batch of four evaluates 44% more pairs, and the
-                        // per-pair saving from overlapping the gathers only came
-                        // to 24%. The loop is not gather bound either, which is
-                        // what the batch would have helped: shrinking `n` until
-                        // the whole vector store fits L2 moves the per-pair cost
-                        // by 9%.
                         let mut j = 0usize;
                         for i in 0..degree {
                             let entry = slot[i];
@@ -870,11 +848,9 @@ where
                             }
                         }
 
-                        // Only the range the prune just vacated needs clearing.
-                        // Everything from the old degree onwards is already
-                        // sentinel, and mean degree runs far below `r`, so
-                        // filling the whole slot rewrites sentinels with
-                        // sentinels.
+                        // Only the range the prune just vacated needs clearing;
+                        // everything from the old degree onwards is already
+                        // sentinel.
                         for i in j..degree {
                             slot[i] = Neighbour::new(SENTINEL_PID, T::max_value(), false);
                         }
@@ -940,9 +916,8 @@ where
 
         // Re-arm every surviving edge as new. UpdateNeighbors writes all
         // survivors back as old, so without this the `!v_new && !w_new` guard
-        // in the prune loop skips essentially every pair from the second outer
-        // round onwards and those rounds compute nothing. Matches the reference
-        // (RNNDescent.cpp, add_reverse_edges).
+        // skips essentially every pair from the second outer round onwards.
+        // Matches the reference (RNNDescent.cpp, add_reverse_edges).
         graph.par_iter_mut().for_each(|entry| {
             if !entry.is_sentinel() {
                 entry.mark_new();
@@ -1028,11 +1003,9 @@ where
     ///
     /// The paper (Ono & Matsui 2023, Section 4.4, Eq. 4) introduces a
     /// query-time out-degree cap `K` that limits how many of each node's stored
-    /// `R` neighbours the walk expands per hop. Since neighbours are stored
-    /// sorted ascending by distance from the source, this is a `.take(K)` on
-    /// the sorted slot. Typical values from the paper's ablation are
-    /// `K = 16-64` even when the graph was built with `R = 96`. Default here is
-    /// `min(32, R)`, matching the paper's sweet spot.
+    /// `R` neighbours the walk expands per hop. Neighbours are stored sorted
+    /// ascending by distance, so this is a `.take(K)` on the slot. Default is
+    /// `min(32, R)`.
     ///
     /// ### Params
     ///
@@ -1059,11 +1032,9 @@ where
         Self::with_search_state(|state_cell| {
             let mut state = state_cell.borrow_mut();
             state.reset(self.n);
-            // `BoundedMaxHeap` rather than the `SortedBuffer` this used before.
-            // Accepting a candidate into the buffer costs a binary search plus
-            // a `pop` and an `insert`, so two memmoves of up to `ef` entries;
-            // the heap sifts once. RNN-Descent runs `ef` at 100 by default,
-            // which is the regime `SearchState` documents the heap for.
+            // `BoundedMaxHeap` rather than a sorted buffer: it sifts once per
+            // accepted candidate instead of paying two memmoves of up to `ef`
+            // entries.
             state.results.reset(ef);
 
             let query_norm = if self.metric == Dist::Cosine {
