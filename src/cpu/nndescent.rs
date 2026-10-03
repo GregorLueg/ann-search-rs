@@ -48,6 +48,11 @@ thread_local! {
         const { RefCell::new(BinaryHeap::new()) };
     static QUERY_RESULTS_F64: RefCell<BinaryHeap<(OrderedFloat<f64>, usize)>> =
         const { RefCell::new(BinaryHeap::new()) };
+
+    /// Forest-search scratch for the query-time entry points, so the per-query
+    /// tree descent does not allocate an `n`-bit visited set each time.
+    static QUERY_FOREST_F32: RefCell<AnnoyScratch<f32>> = RefCell::new(AnnoyScratch::new());
+    static QUERY_FOREST_F64: RefCell<AnnoyScratch<f64>> = RefCell::new(AnnoyScratch::new());
 }
 
 ///////////
@@ -76,9 +81,8 @@ const UPDATE_TARGET_BYTES: usize = 200 * 1024 * 1024;
 
 /// Floor on the number of source nodes per chunk.
 ///
-/// Below this the per-chunk fixed costs (radix sort setup, the parallel fan-out
-/// over target segments) start to outweigh the local join itself, so the byte
-/// budget gives way.
+/// Below this the per-chunk fixed costs outweigh the local join itself, so the
+/// byte budget gives way.
 const MIN_CHUNK_NODES: usize = 1_024;
 
 /// Fraction of candidate pairs assumed to clear the distance threshold when
@@ -106,10 +110,9 @@ const NND_GEMM_MIN_CANDIDATES: usize = 32;
 /// Merged candidate-list size statistics, accumulated inside the local join.
 ///
 /// The join is `O(|C_new| * |C_total|)` per node, so the distribution of
-/// `|C_total|` is what sets its cost. Since `2e866da` dropped the cap on the
-/// merged forward+reverse list, that distribution is driven by the reverse
-/// in-degree tail, which is fat on hub-heavy data. Three integer ops per node
-/// against a quadratic distance loop, so this is always on rather than gated.
+/// `|C_total|` sets its cost. The merged forward+reverse list is uncapped, so
+/// that distribution is driven by the reverse in-degree tail. Always on: three
+/// integer ops per node against a quadratic distance loop.
 #[derive(Default, Clone, Copy)]
 struct CandStats {
     /// Merged list lengths summed over the nodes seen
@@ -158,9 +161,8 @@ impl CandStats {
 
 /// Per-phase wall-clock breakdown of a build, accumulated across iterations.
 ///
-/// Only populated when `verbose` is set. Every phase is timed from the driving
-/// loop rather than from inside the parallel closures, so the cost is a handful
-/// of `Instant::now()` calls per iteration and nothing in the inner loops.
+/// Only populated when `verbose` is set. Phases are timed from the driving
+/// loop rather than inside the parallel closures.
 ///
 /// The phases partition the build: `forest` and `seed` are initialisation,
 /// the remaining four are the descent, and they sum to roughly the total.
@@ -260,8 +262,7 @@ impl BuildTimings {
 
 /// Reverse (in-edge) adjacency of one forward candidate sample, in CSR form.
 ///
-/// Built by counting sort rather than by scanning every source list once per
-/// thread, which is what the previous `Vec<Vec<usize>>` layout forced.
+/// Built by counting sort.
 struct ReverseCsr {
     /// Row offsets, length `n + 1`
     offsets: Vec<u32>,
@@ -298,9 +299,8 @@ impl ReverseCsr {
 /// Forward samples plus their reverse adjacency for one NN-Descent iteration.
 ///
 /// The forward lists live in fixed-stride flat buffers of `n * max_candidates`
-/// `u32` ids rather than `n` growable `Vec`s, and the reverse edges in CSR. The
-/// total reverse entry count equals the total forward count by construction, so
-/// the whole structure is `O(n * max_candidates)` with no per-node allocation.
+/// `u32` ids and the reverse edges in CSR, so the structure is
+/// `O(n * max_candidates)` with no per-node allocation.
 struct CandidateSets {
     /// Slots per node in each forward buffer (equals `max_candidates`)
     stride: usize,
@@ -383,11 +383,9 @@ impl CandidateSets {
 
 /// Deterministic random priority for the undirected edge `(u, v)`.
 ///
-/// The forward sample and the reverse edge it induces have to agree on a
-/// priority, otherwise the two directions of the same edge compete on different
-/// coin flips and the cap becomes asymmetric. Deriving it from the unordered
-/// pair by hash rather than storing it alongside every reverse entry keeps the
-/// CSR down to bare ids.
+/// The forward sample and the reverse edge it induces must agree on a
+/// priority, otherwise the cap becomes asymmetric. It is derived from the
+/// unordered pair by hash rather than stored per reverse entry.
 ///
 /// SplitMix64 finaliser over the packed pair, mixed with the iteration seed.
 ///
@@ -414,8 +412,7 @@ fn edge_priority(seed: u64, u: u32, v: u32) -> u64 {
 ///
 /// Two-pass counting sort: a parallel count into relaxed atomics, an exclusive
 /// prefix sum, then a parallel scatter through the same array reused as a write
-/// cursor. Cost is `O(total_entries)` regardless of thread count, where the
-/// previous target-range partitioning cost `O(n_threads * total_entries)`.
+/// cursor. Cost is `O(total_entries)` regardless of thread count.
 ///
 /// Order within a target's segment is unspecified (it depends on the atomic
 /// interleaving), which is fine because every consumer sorts the merged list
@@ -477,10 +474,9 @@ fn build_reverse_csr(fwd: &[u32], lens: &[u32], stride: usize, n: usize, out: &m
 /// Static-dispatch metric selector for the update kernel.
 ///
 /// The inner loop in `generate_updates_for_chunk_impl` calls
-/// `M::distance_from_tile` where `M` is one of the zero-sized types below.
-/// Both operands are rows of the gathered candidate tile, so the kernel never
-/// re-slices `vectors_flat` or re-fetches a cached norm inside the loop.
-/// Monomorphisation strips the runtime `Dist` branch out of the hot path.
+/// `M::distance_from_tile` where `M` is one of the zero-sized types below,
+/// which strips the runtime `Dist` branch out of the hot path. Both operands
+/// are rows of the gathered candidate tile.
 trait MetricFn<T: AnnSearchFloat> {
     /// Distance between two rows of the gathered candidate tile.
     ///
@@ -559,14 +555,10 @@ fn take_lowest_priority(temp: &mut Vec<(u64, u32)>, cap: usize, out: &mut [u32])
 
 /// Per-thread scratch for one source node's local join.
 ///
-/// Everything the pair loop touches is gathered here first: the candidate
-/// vectors into one contiguous tile, and their eviction thresholds and norms
-/// into flat arrays. That turns `|C|^2 / 2` strided reads of `vectors_flat`
-/// and random reads of the graph into `|C|` of each, and gives the GEMM path
-/// the row-major operand it needs.
-///
-/// Buffers are reused across every node the thread handles, so the allocations
-/// settle after the first few nodes.
+/// Everything the pair loop touches is gathered here first: candidate vectors
+/// into one contiguous tile, their eviction thresholds and norms into flat
+/// arrays. This also gives the GEMM path its row-major operand. Buffers are
+/// reused across every node the thread handles.
 struct JoinScratch<T> {
     /// Merged new candidates for this node
     new_ids: Vec<u32>,
@@ -750,36 +742,11 @@ where
         }
     }
 
-    /// Query the forest for approximate nearest neighbours.
-    ///
-    /// ### Params
-    ///
-    /// * `query_vec` - The query vector
-    /// * `k` - Number of neighbours to return
-    /// * `search_k` - The budget
-    ///
-    /// ### Returns
-    ///
-    /// The `(indices, dist)`
-    fn query(
-        &self,
-        query_vec: &[T],
-        k: usize,
-        search_k: Option<usize>,
-    ) -> Result<(Vec<usize>, Vec<T>), AnnSearchErrors> {
-        match self {
-            Forest::Annoy(f) => f.query(query_vec, k, search_k),
-            Forest::Kd(f) => f.query(query_vec, k, search_k),
-        }
-    }
-
     /// Query into reusable scratch, leaving `(distance, id)` pairs sorted
     /// nearest-first in `scratch.candidates`.
     ///
-    /// Only the Annoy arm has an allocation-free form; the Kd arm falls back to
-    /// the allocating query and copies its result across, which keeps Manhattan
-    /// working without a second scratch type for a path that is not the
-    /// default.
+/// Only the Annoy arm has an allocation-free form; the Kd arm falls back to
+/// the allocating query and copies its result across.
     ///
     /// ### Params
     ///
@@ -900,17 +867,15 @@ pub trait NNDescentQuery<T> {
 /// sorted by distance ascending. Empty trailing slots are filled with
 /// sentinel values (`SENTINEL_PID`, `T::MAX`).
 ///
-/// This layout gives better cache locality during graph updates and
-/// queries compared to a `Vec<Vec<...>>` and eliminates per-node heap
-/// allocations entirely.
+/// This layout gives cache locality during updates and queries and avoids
+/// per-node heap allocations.
 ///
 /// ### Memory-efficient update strategy
 ///
-/// During construction, candidate updates are processed in chunks
-/// (~50k source nodes) to bound peak memory to
-/// `O(chunk_size * max_candidates)` rather than `O(n * max_candidates)`.
-/// Each chunk emits both edge directions, sorts by target, and applies
-/// updates lock-free via disjoint pointer writes.
+/// During construction, candidate updates are processed in chunks to bound
+/// peak memory to `O(chunk_size * max_candidates)` rather than
+/// `O(n * max_candidates)`. Each chunk emits both edge directions, sorts by
+/// target, and applies updates lock-free via disjoint pointer writes.
 #[cfg_attr(feature = "serialise", derive(serde::Serialize, serde::Deserialize))]
 pub struct NNDescent<T> {
     /// Original vectors, flattened row-major
@@ -1024,7 +989,7 @@ where
             Vec::new()
         };
 
-        // based on PyNNDescent... 12 seems to be good for the initialisation
+        // Capped at 12 following PyNNDescent
         let n_trees = n_trees.unwrap_or_else(|| {
             let calculated = 5 + ((n as f64).powf(0.25)).round() as usize;
             calculated.min(12)
@@ -1129,9 +1094,7 @@ where
     ///
     /// A source node emits one update per direction for every candidate pair
     /// that clears the distance threshold, so the count scales with
-    /// `|C_new| * |C_total|`, not with `max_candidates`. Getting that wrong is
-    /// what let the nominal memory bound be exceeded by two orders of
-    /// magnitude; it is only a starting point regardless, since
+    /// `|C_new| * |C_total|`, not with `max_candidates`. Only a starting point;
     /// [`Self::rescale_chunk_size`] corrects it from the second chunk on.
     ///
     /// ### Params
@@ -1153,9 +1116,8 @@ where
 
     /// Rescale the chunk size against what the last chunk actually emitted.
     ///
-    /// This is what makes the memory bound real: the accept rate falls by
-    /// orders of magnitude between the first iteration and convergence, so a
-    /// static estimate is either wildly conservative or wildly over budget.
+    /// The accept rate falls steeply between the first iteration and
+    /// convergence, so a static estimate cannot hold the memory bound.
     ///
     /// ### Params
     ///
@@ -1562,15 +1524,12 @@ where
 
     /// Monomorphised inner kernel for chunked update generation.
     ///
-    /// `M` selects the distance function at compile time so the branch on
-    /// `self.metric` is stripped out of the hot loop entirely.
+    /// `M` selects the distance function at compile time, stripping the branch
+    /// on `self.metric` out of the hot loop.
     ///
-    /// Per source node the candidate vectors, their eviction thresholds and
-    /// their norms are gathered into contiguous thread-local scratch before the
-    /// pair loop. The threshold then costs `|C|` random reads of the graph
-    /// amortised over `|C|^2 / 2` pair tests rather than one read per pair, and
-    /// the tile turns the strided reads of `vectors_flat` into a sequential
-    /// walk of a buffer that stays hot for the whole node.
+    /// Per source node the candidate vectors, eviction thresholds and norms are
+    /// gathered into contiguous thread-local scratch before the pair loop, so
+    /// the threshold costs `|C|` random graph reads rather than one per pair.
     ///
     /// New and old lists are concatenated into one tile, so the single loop
     /// `a in 0..n_new`, `b in a+1..n_total` covers the new-new upper triangle
@@ -1740,19 +1699,13 @@ where
     /// Diversify the graph via probabilistic RNG-rule pruning over the
     /// forward + reverse edge pool.
     ///
-    /// For each node `u`, the input pool merges `graph[u]` with all nodes
-    /// that have `u` as a forward neighbour, deduplicates by pid, and
-    /// sorts ascending by distance. The RNG rule then prunes an entry
-    /// `v` from the pool if some already-kept neighbour `w` satisfies
-    /// `d(w, v) < d(u, v)` (Bernoulli coin with probability `prune_prob`).
-    /// The output row is filled with up to `k` kept entries; short rows
-    /// are topped up from the pruned-out tail in distance order so
-    /// out-degree does not shrink.
-    ///
-    /// Because iteration is ascending in `d(u, v)`, every already-kept
-    /// `w` satisfies `d(u, w) <= d(u, v)` by construction, so the
-    /// classical two-sided RNG rule collapses to the single check
-    /// `d(w, v) < d(u, v)`.
+    /// For each node `u`, the pool merges `graph[u]` with all nodes that have
+    /// `u` as a forward neighbour, deduplicates by pid and sorts ascending by
+    /// distance. An entry `v` is pruned if some already-kept neighbour `w`
+    /// satisfies `d(w, v) < d(u, v)` (Bernoulli coin with probability
+    /// `prune_prob`); iteration is ascending, so this single check is the full
+    /// RNG rule. Short rows are topped up from the pruned-out tail in distance
+    /// order so out-degree does not shrink.
     ///
     /// ### Params
     ///
@@ -1930,10 +1883,9 @@ where
 
     /// Hand back the kNN graph exactly as NN-Descent built it.
     ///
-    /// No re-query: this is the descent's own output, so it costs one pass over
-    /// the graph. [`Self::generate_knn`] runs a beam search per point instead,
-    /// which lifts recall but is orders of magnitude more expensive. Reach for
-    /// this one when the graph you asked for is the graph you want.
+    /// No re-query: this is the descent's own output, a single pass over the
+    /// graph. [`Self::generate_knn`] runs a beam search per point instead,
+    /// which lifts recall at a much higher cost.
     ///
     /// Rows can come back **shorter than `k`** where the descent never filled
     /// them (small `n`, disconnected components), which `generate_knn` never
@@ -2033,15 +1985,9 @@ where
 // ApplySortedUpdates //
 ////////////////////////
 
-/// In-place merge of a target's sorted update segment into its graph row.
-///
 /// The row is already the sorted structure this needs: `k` entries ascending by
-/// distance, sentinel-padded. Merging directly into it drops the previous
-/// approach's per-target rebuild of a thread-local `SortedBuffer` and its
-/// `n`-bit duplicate set, both of which cost the full `k` even when a single
-/// update landed. Duplicate detection is a linear scan of the row, which for
-/// realistic `k` is a couple of contiguous cache lines against the bitset's
-/// scattered reads over `n / 8` bytes.
+/// distance, sentinel-padded, so updates merge directly into it. Duplicate
+/// detection is a linear scan of the row.
 impl<T: AnnSearchFloat> ApplySortedUpdates<T> for NNDescent<T> {
     fn apply_sorted_updates(
         &self,
@@ -2056,9 +2002,7 @@ impl<T: AnnSearchFloat> ApplySortedUpdates<T> for NNDescent<T> {
 
         let graph_ptr = UnsafeMutPtr(graph.as_mut_ptr());
 
-        // `par_chunk_by` splits the sorted batch on target boundaries directly,
-        // which saves a sequential boundary scan plus the Vec of segment
-        // descriptors it used to feed.
+        // `par_chunk_by` splits the sorted batch on target boundaries directly.
         updates
             .par_chunk_by(|a, b| a.target == b.target)
             .for_each(|segment| {
@@ -2129,7 +2073,7 @@ impl<T: AnnSearchFloat> ApplySortedUpdates<T> for NNDescent<T> {
 
 /// Generates the `NNDescentQuery` impl for a concrete float type.
 macro_rules! impl_nndescent_query {
-    ($float:ty, $cand_tls:ident, $res_tls:ident) => {
+    ($float:ty, $cand_tls:ident, $res_tls:ident, $forest_tls:ident) => {
         impl NNDescentQuery<$float> for NNDescent<$float> {
             fn query_internal(
                 &self,
@@ -2194,19 +2138,25 @@ macro_rules! impl_nndescent_query {
             ) -> Result<(Vec<usize>, Vec<$float>), AnnSearchErrors> {
                 let init_candidates = (ef / 2).max(2 * k).min(self.n);
                 let search_k = init_candidates * 3;
-                let (init_indices, _) =
-                    self.forest
-                        .query(query_vec, init_candidates, Some(search_k))?;
-
-                for &entry_idx in &init_indices {
-                    if entry_idx >= self.n || visited.contains(entry_idx) {
-                        continue;
+                $forest_tls.with(|cell| -> Result<(), AnnSearchErrors> {
+                    let mut scratch = cell.borrow_mut();
+                    self.forest.query_into(
+                        query_vec,
+                        init_candidates,
+                        Some(search_k),
+                        &mut scratch,
+                    )?;
+                    for &(_, entry_idx) in scratch.results() {
+                        if entry_idx >= self.n || visited.contains(entry_idx) {
+                            continue;
+                        }
+                        visited.insert(entry_idx);
+                        let dist = self.euclidean_distance_to_query(entry_idx, query_vec);
+                        candidates.push(Reverse((OrderedFloat(dist), entry_idx)));
+                        results.push((OrderedFloat(dist), entry_idx));
                     }
-                    visited.insert(entry_idx);
-                    let dist = self.euclidean_distance_to_query(entry_idx, query_vec);
-                    candidates.push(Reverse((OrderedFloat(dist), entry_idx)));
-                    results.push((OrderedFloat(dist), entry_idx));
-                }
+                    Ok(())
+                })?;
 
                 while results.len() > ef {
                     results.pop();
@@ -2270,19 +2220,25 @@ macro_rules! impl_nndescent_query {
             ) -> Result<(Vec<usize>, Vec<$float>), AnnSearchErrors> {
                 let init_candidates = (ef / 2).max(2 * k).min(self.n);
                 let search_k = init_candidates * 3;
-                let (init_indices, _) =
-                    self.forest
-                        .query(query_vec, init_candidates, Some(search_k))?;
-
-                for &entry_idx in &init_indices {
-                    if entry_idx >= self.n || visited.contains(entry_idx) {
-                        continue;
+                $forest_tls.with(|cell| -> Result<(), AnnSearchErrors> {
+                    let mut scratch = cell.borrow_mut();
+                    self.forest.query_into(
+                        query_vec,
+                        init_candidates,
+                        Some(search_k),
+                        &mut scratch,
+                    )?;
+                    for &(_, entry_idx) in scratch.results() {
+                        if entry_idx >= self.n || visited.contains(entry_idx) {
+                            continue;
+                        }
+                        visited.insert(entry_idx);
+                        let dist = self.manhattan_distance_to_query(entry_idx, query_vec);
+                        candidates.push(Reverse((OrderedFloat(dist), entry_idx)));
+                        results.push((OrderedFloat(dist), entry_idx));
                     }
-                    visited.insert(entry_idx);
-                    let dist = self.manhattan_distance_to_query(entry_idx, query_vec);
-                    candidates.push(Reverse((OrderedFloat(dist), entry_idx)));
-                    results.push((OrderedFloat(dist), entry_idx));
-                }
+                    Ok(())
+                })?;
 
                 while results.len() > ef {
                     results.pop();
@@ -2347,19 +2303,25 @@ macro_rules! impl_nndescent_query {
             ) -> Result<(Vec<usize>, Vec<$float>), AnnSearchErrors> {
                 let init_candidates = (ef / 2).max(k).min(self.n);
                 let search_k = init_candidates * 3;
-                let (init_indices, _) =
-                    self.forest
-                        .query(query_vec, init_candidates, Some(search_k))?;
-
-                for &entry_idx in &init_indices {
-                    if entry_idx >= self.n || visited.contains(entry_idx) {
-                        continue;
+                $forest_tls.with(|cell| -> Result<(), AnnSearchErrors> {
+                    let mut scratch = cell.borrow_mut();
+                    self.forest.query_into(
+                        query_vec,
+                        init_candidates,
+                        Some(search_k),
+                        &mut scratch,
+                    )?;
+                    for &(_, entry_idx) in scratch.results() {
+                        if entry_idx >= self.n || visited.contains(entry_idx) {
+                            continue;
+                        }
+                        visited.insert(entry_idx);
+                        let dist = self.cosine_distance_to_query(entry_idx, query_vec, query_norm);
+                        candidates.push(Reverse((OrderedFloat(dist), entry_idx)));
+                        results.push((OrderedFloat(dist), entry_idx));
                     }
-                    visited.insert(entry_idx);
-                    let dist = self.cosine_distance_to_query(entry_idx, query_vec, query_norm);
-                    candidates.push(Reverse((OrderedFloat(dist), entry_idx)));
-                    results.push((OrderedFloat(dist), entry_idx));
-                }
+                    Ok(())
+                })?;
 
                 while results.len() > ef {
                     results.pop();
@@ -2414,8 +2376,18 @@ macro_rules! impl_nndescent_query {
     };
 }
 
-impl_nndescent_query!(f32, QUERY_CANDIDATES_F32, QUERY_RESULTS_F32);
-impl_nndescent_query!(f64, QUERY_CANDIDATES_F64, QUERY_RESULTS_F64);
+impl_nndescent_query!(
+    f32,
+    QUERY_CANDIDATES_F32,
+    QUERY_RESULTS_F32,
+    QUERY_FOREST_F32
+);
+impl_nndescent_query!(
+    f64,
+    QUERY_CANDIDATES_F64,
+    QUERY_RESULTS_F64,
+    QUERY_FOREST_F64
+);
 
 ///////////////////
 // KnnValidation //
@@ -2898,11 +2870,9 @@ mod tests {
 
     #[test]
     fn test_forward_sample_respects_max_candidates() {
-        // The forward sample is the only capped list. The merged list the join
-        // runs over is deliberately uncapped: capping it costs recall, since
-        // the reverse in-degree distribution is broad rather than a clippable
-        // tail. This pins the forward cap and the sorted-deduped invariant both
-        // `mark_as_old` and `merged_into` rely on.
+        // The forward sample is the only capped list; the merged list the join
+        // runs over is deliberately uncapped. This pins the forward cap and the
+        // sorted-deduped invariant `mark_as_old` and `merged_into` rely on.
         let n = 200;
         let dim = 4;
         let mat = Mat::from_fn(n, dim, |i, j| {
@@ -3165,7 +3135,7 @@ mod tests {
     #[test]
     fn test_graph_stays_flat_and_sentinel_padded() {
         // NSG consumes the flat graph directly and asserts `len == n * knn_k`,
-        // so the layout is load-bearing beyond this module.
+        // so the layout is relied on beyond this module.
         let mat = create_simple_matrix();
         let index = NNDescent::<f32>::new(
             mat.as_ref(),

@@ -17,15 +17,13 @@ use crate::utils::*;
 ////////////
 
 /// Highest layer a node may be assigned to. Layers are stored as `u8` and the
-/// draw is geometric with ratio `1/M`, so anything past this is unreachable in
-/// practice: at M = 16 the probability of layer 15 is under 2^-60.
+/// draw is geometric with ratio `1/M`, so anything past this is unreachable.
 const MAX_LAYER: usize = 15;
 
 /// Level buckets at or below this size are inserted sequentially rather than
-/// under rayon. The topmost buckets hold a handful of nodes whose links form
-/// the navigation highway; inserting them concurrently means they cannot see
-/// each other and the upper layers come out near-empty. FAISS guards the same
-/// way with `#pragma omp parallel if (i1 > i0 + 100)`.
+/// under rayon. The topmost buckets hold a handful of nodes that form the
+/// navigation highway; inserting them concurrently means they cannot see each
+/// other and the upper layers come out near-empty.
 const PARALLEL_BUCKET_THRESHOLD: usize = 100;
 
 /////////////
@@ -234,7 +232,6 @@ where
 
         let start_total = Instant::now();
 
-        // Compute norms for cosine distance
         let norms = if *metric == Dist::Cosine {
             (0..n)
                 .map(|i| {
@@ -268,7 +265,6 @@ where
             .position(|&l| l == max_layer)
             .unwrap_or(0) as u32;
 
-        // Create construction graph with proper per-layer storage
         let threads = rayon::current_num_threads();
         let construction_graph = ConstructionGraph::new(n, &layer_assignments, m, threads);
 
@@ -291,7 +287,6 @@ where
         // Build the graph layer by layer, from TOP to BOTTOM
         index.build_graph(&construction_graph, seed, verbose);
 
-        // Convert construction graph to flat layout
         let (neighbours_flat, neighbour_offsets, _) = construction_graph.into_flat();
         index.neighbours_flat = neighbours_flat;
         index.neighbour_offsets = neighbour_offsets;
@@ -383,7 +378,9 @@ where
     ///
     /// ### Params
     ///
-    /// TODO: Claude
+    /// * `node` - Node to insert
+    /// * `graph` - Construction graph receiving the links
+    /// * `state` - Reusable search scratch
     fn insert_node(&self, node: usize, graph: &ConstructionGraph<T>, state: &mut SearchState<T>) {
         let node_level = self.layer_assignments[node];
         let mut current_node = self.entry_point as usize;
@@ -455,10 +452,8 @@ where
 
             let selected = self.select_neighbours_heuristic(layer, state);
 
-            // set this node's outgoing neighbours
             graph.set_neighbours(node, layer, &selected);
 
-            // update reverse links: add this node to each neighbour's list
             for &(_, neighbour_id) in &selected {
                 if neighbour_id != node && graph.node_level(neighbour_id) >= layer {
                     graph.add_neighbour_with_pruning(neighbour_id, layer, node, &distance_fn);
@@ -653,12 +648,10 @@ where
     ) -> Vec<(OrderedFloat<T>, usize)> {
         let max_neighbours = self.max_neighbours_for_layer(layer);
 
-        // Nothing to choose between: the beam found no more candidates than the
-        // layer can hold, so pruning can only throw away edges we have room for.
-        // Matches FAISS `shrink_neighbor_list_inner` (HNSW.cpp:355). Only fires
-        // when `ef_construction` is at or below the layer budget, i.e. the
-        // high-M/low-ef regime; at M16/ef200 the beam always overflows and the
-        // diversity rule runs exactly as before.
+        // Nothing to choose between when the beam holds fewer candidates than
+        // the layer can hold: pruning would only discard edges there is room
+        // for. Only fires when `ef_construction` is at or below the layer
+        // budget.
         if state.scratch_working.len() < max_neighbours {
             return state.scratch_working.clone();
         }
@@ -748,16 +741,13 @@ where
                 T::one()
             };
 
-            // start from entry point, descend through upper layers
             let mut current_node = self.entry_point as usize;
 
-            // greedy search through upper layers (max_layer down to 1)
             for layer in (1..=self.max_layer).rev() {
                 current_node =
                     self.greedy_search_layer_query(query, query_norm, current_node, layer);
             }
 
-            // full search at base layer
             state.reset(self.n);
             self.search_layer_query(
                 query,
@@ -814,7 +804,6 @@ where
                 }
                 let neighbour = neighbour as usize;
 
-                // Check if this neighbour exists at this layer
                 if self.layer_assignments[neighbour] < layer {
                     continue;
                 }
@@ -1272,7 +1261,6 @@ mod tests {
 
     #[test]
     fn test_hnsw_multi_layer_storage() {
-        // Verify that multi-layer storage is working correctly
         let n = 500;
         let dim = 10;
 
@@ -1282,7 +1270,6 @@ mod tests {
         let index =
             HnswIndex::<f32>::build(mat.as_ref(), 8, 100, &Dist::SquaredEuclidean, 42, true);
 
-        // Count nodes at each layer
         let mut layer_counts = vec![0usize; (index.max_layer + 1) as usize];
         for &level in &index.layer_assignments {
             for l in 0..=level {
@@ -1290,10 +1277,8 @@ mod tests {
             }
         }
 
-        // Layer 0 should have all nodes
         assert_eq!(layer_counts[0], n);
 
-        // Higher layers should have fewer nodes (exponential decay)
         for l in 1..layer_counts.len() {
             assert!(
                 layer_counts[l] < layer_counts[l - 1],
@@ -1303,7 +1288,6 @@ mod tests {
             );
         }
 
-        // Verify queries work
         let query: Vec<f32> = (0..dim).map(|_| 0.5).collect();
         let (indices, _) = index.query(&query, 10, 50).unwrap();
         assert_eq!(indices.len(), 10);
@@ -1330,10 +1314,9 @@ mod tests {
 
     #[test]
     fn test_hnsw_layer_zero_degree_stays_under_budget() {
-        // The diversity heuristic leaves layer-0 lists short of 2*m, and that
-        // slack is load-bearing: filling it with the nearest rejects saturates
-        // every list, pushes each reverse link through the O(max_n^2) pruning
-        // path and costs both build time and recall.
+        // The diversity heuristic leaves layer-0 lists short of 2*m on
+        // purpose: filling the slack with the nearest rejects saturates every
+        // list and sends each reverse link through the O(max_n^2) pruning path.
         let (n, dim, m) = (400, 8, 4);
         let data: Vec<f32> = (0..n * dim)
             .map(|i| ((i * 7919 % 1013) as f32) / 1013.0)

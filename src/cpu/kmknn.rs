@@ -174,7 +174,6 @@ where
             println!("Building kMkNN index with {} clusters.", nlist);
         }
 
-        // always Euclidean internally
         let centroids = train_centroids(
             &training_data,
             dim,
@@ -201,7 +200,6 @@ where
 
         let (all_indices, offsets) = build_csr_layout(assignments, n, nlist);
 
-        // Reorder vectors by cluster for cache locality
         let mut new_to_old = Vec::with_capacity(n);
         for c in 0..nlist {
             for &old_id in &all_indices[offsets[c]..offsets[c + 1]] {

@@ -172,7 +172,6 @@ where
 
         let (vectors_flat, n, dim) = data.into_row_major();
 
-        // Compute norms for Cosine distance
         let norms = if metric == Dist::Cosine {
             (0..n)
                 .map(|i| {
@@ -295,7 +294,7 @@ where
 
     /// Recursively build a node (split or leaf)
     ///
-    /// Attempts up to 5 random hyperplane splits. For each split, picks two
+    /// Attempts up to 10 random hyperplane splits. For each split, picks two
     /// random points and uses their difference as the hyperplane normal.
     /// Accepts splits where both sides contain 5-95% of items. Falls back
     /// to a leaf if no good split is found or if items ≤ 64.
@@ -383,10 +382,7 @@ where
             for &item in &items {
                 let vec_start = item * dim;
                 let vec = &vectors_flat[vec_start..vec_start + dim];
-                let mut dot = T::zero();
-                for k in 0..dim {
-                    dot = dot + vec[k] * hyperplane[k];
-                }
+                let dot = T::dot_simd(vec, &hyperplane);
 
                 if dot > threshold {
                     left_items.push(item);
@@ -450,10 +446,8 @@ where
         T::dot_simd(v1, &v2[..dim]) - v2[dim]
     }
 
-    /// Reorders vectors in memory to match the layout of Tree 0.
-    ///
-    /// This drastically reduces L2/L3 cache misses during leaf evaluation and
-    /// reduces memory bandwidth problems
+    /// Reorders vectors in memory to match the leaf layout of Tree 0, for
+    /// cache locality during leaf evaluation.
     ///
     /// ### Returns
     ///
@@ -467,7 +461,7 @@ where
         let mut old_to_new = vec![usize::MAX; self.n];
         let mut visited = vec![false; self.n];
 
-        // 1. DFS traversal of Tree 0
+        // DFS over tree 0 assigns new ids in leaf order
         let mut stack = vec![self.roots[0]];
         while let Some(node_idx) = stack.pop() {
             let node = unsafe { self.nodes.get_unchecked(node_idx as usize) };
@@ -490,7 +484,7 @@ where
             }
         }
 
-        // 2. Catch any items that somehow weren't in Tree 0 - safe guard
+        // Any items missing from tree 0 are appended
         for old_id in 0..self.n {
             if !visited[old_id] {
                 old_to_new[old_id] = new_to_old.len();
@@ -498,7 +492,6 @@ where
             }
         }
 
-        // 3. Shuffle the actual vector data into a new, contiguous layout
         let mut new_vectors_flat = Vec::with_capacity(self.vectors_flat.len());
         let mut new_norms = if self.norms.is_empty() {
             Vec::new()
@@ -510,10 +503,8 @@ where
             let start = old_id * self.dim;
             let end = start + self.dim;
 
-            // Push the vector to its new physical location
             new_vectors_flat.extend_from_slice(&self.vectors_flat[start..end]);
 
-            // Keep norms aligned
             if !self.norms.is_empty() {
                 new_norms.push(self.norms[old_id]);
             }
@@ -524,7 +515,6 @@ where
             *id_ref = old_to_new[*id_ref];
         }
 
-        // 5. Swap the data (the old arrays get dropped automatically)
         self.vectors_flat = new_vectors_flat;
         self.norms = new_norms;
 
@@ -554,14 +544,9 @@ where
 
 /// Reusable per-query scratch for [`AnnoyIndex::query_into`].
 ///
-/// A tree search allocates nothing on its own: `init_with_forest` issues one
-/// query per node, so a fresh bitset per call meant `n` allocations of `n / 8`
-/// zeroed bytes, which is quadratic in memset traffic and dominated graph
-/// seeding.
-///
-/// `visited` is cleared by unsetting only the bits the last query touched,
-/// which is bounded by the search budget rather than by `n`. Every visited item
-/// also lands in `candidates`, so that buffer is the list of bits to clear.
+/// `visited` is cleared by unsetting only the bits the last query touched, so
+/// reset cost is bounded by the search budget rather than by `n`. Every visited
+/// item also lands in `candidates`, so that buffer is the list of bits to clear.
 pub struct AnnoyScratch<T> {
     /// One bit per item, marking what the current query has already scored
     visited: FixedBitSet,
@@ -629,8 +614,7 @@ where
     /// * `query_vec` - Query vector (must match index dimensionality)
     /// * `k` - Number of neighbours to return
     /// * `search_k` - Budget of items to examine (higher = better recall,
-    ///   slower)
-    ///   Defaults to `k * n_trees` if None
+    ///   slower). Defaults to `k * n_trees * 20` if None
     ///
     /// ### Returns
     ///
@@ -740,7 +724,6 @@ where
                             Dist::Manhattan => unreachable!(),
                         };
 
-                        // FLAT ARRAY PUSH - No heap overhead!
                         candidates.push((dist, item));
                     }
                     break;
@@ -771,9 +754,8 @@ where
             }
         }
 
-        // Clear the visited bits before truncating: every scored item is in
-        // `candidates`, so this is bounded by the search budget rather than by
-        // `n`, which is the whole point of reusing the bitset.
+        // Clear only the visited bits touched; every scored item is in
+        // `candidates`.
         for &(_, item) in candidates.iter() {
             visited.remove(item);
         }
@@ -787,7 +769,6 @@ where
             candidates.truncate(k);
         }
 
-        // Sort only the final K elements
         candidates
             .sort_unstable_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
 
@@ -808,7 +789,7 @@ where
     /// * `query_row` - Row reference
     /// * `k` - Number of neighbours to search
     /// * `search_k` - Budget of items to examine (higher = better recall,
-    ///   slower) Defaults to `k * n_trees` if None
+    ///   slower). Defaults to `k * n_trees * 20` if None
     ///
     /// ### Returns
     ///
@@ -858,12 +839,11 @@ where
         // collect unordered results, tagging them with their ORIGINAL id
         let unordered_results: Vec<(usize, Vec<usize>, Vec<T>)> = (0..self.n)
             .into_par_iter()
-            .map(|i| {
+            .map_init(AnnoyScratch::new, |scratch, i| {
                 let start = i * self.dim;
                 let end = start + self.dim;
                 let vec = &self.vectors_flat[start..end];
 
-                // fetch what the actual original ID for this vector was
                 let orig_id = self.original_ids[i];
 
                 if verbose {
@@ -877,12 +857,12 @@ where
                     }
                 }
 
-                let (indices, dists) = self.query(vec, k, search_k)?;
+                self.query_into(vec, k, search_k, scratch)?;
+                let (indices, dists) = scratch.results().iter().map(|&(d, i)| (i, d)).unzip();
                 Ok((orig_id, indices, dists))
             })
             .collect::<Result<Vec<_>, AnnSearchErrors>>()?;
 
-        // pre-allocate the final ordered arrays
         let mut final_indices = vec![Vec::new(); self.n];
         let mut final_dists = if return_dist {
             Some(vec![Vec::new(); self.n])

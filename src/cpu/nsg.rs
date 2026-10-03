@@ -38,13 +38,10 @@ use crate::utils::*;
 
 /// Lower clamp for the number of query-time entry seeds strided evenly
 /// across the dataset (on top of the navigating node). Single-entry search
-/// from the medoid dead-ends on clustered data at scale: cross-cluster paths
-/// outgrow the beam and a small fraction of queries terminates in the wrong
-/// region. The seed count resolves to `sqrt(n)` clamped to
-/// `[NSG_ENTRY_SEEDS_MIN, NSG_ENTRY_SEEDS_MAX]`; each seed costs one
-/// distance evaluation and far-from-query seeds are never expanded. At 100k
-/// samples (~316 seeds) this raised recall@15 from 0.97 to 0.999 at ef=50
-/// for ~7% query-time cost on clustered cell-embedding data.
+/// from the medoid dead-ends on clustered data at scale. The seed count
+/// resolves to `sqrt(n)` clamped to `[NSG_ENTRY_SEEDS_MIN,
+/// NSG_ENTRY_SEEDS_MAX]`; each seed costs one distance evaluation and
+/// far-from-query seeds are never expanded.
 const NSG_ENTRY_SEEDS_MIN: usize = 64;
 
 /// Upper clamp for the query-time entry-seed count. See
@@ -133,7 +130,6 @@ pub struct NsgBuildParams {
     /// Target out-degree of the NSG graph (`R` in the paper). MRNG pruning
     /// selects at most `r` diversified edges; nodes left below `r` are then
     /// topped up with their closest kNN entries, so `r` is the actual degree
-    /// for almost every node. Typical values: 32–70 for SIFT-scale, higher
     /// for harder datasets.
     pub r: usize,
     /// Beam width for the per-node search on the input kNN graph during build
@@ -141,7 +137,7 @@ pub struct NsgBuildParams {
     pub l_build: usize,
     /// Cap on the size of the candidate set `E` before MRNG pruning. Absent
     /// from the paper but standard in reference implementations to bound
-    /// per-node prune cost. Roughly 500 works across scales.
+    /// per-node prune cost.
     pub c: usize,
     /// Degree of the input kNN graph when NSG builds one internally. Larger
     /// `knn_k` gives better MRNG candidates but slower NN-Descent. Ignored by
@@ -192,8 +188,8 @@ impl NsgBuildParams {
 ///
 /// Each node owns a `Vec<(u32, T)>` of neighbour ids **with cached distances
 /// from the source node**. Caching the distances keeps the InterInsert step
-/// cheap: an at-capacity re-prune no longer needs to recompute the source's
-/// distances to its existing neighbours before running MRNG.
+/// cheap: an at-capacity re-prune does not recompute the source's distances to
+/// its existing neighbours before running MRNG.
 ///
 /// Concurrent access uses a striped spin-lock (`StripedLocks`). Both the
 /// primary MRNG write for source `v` and the InterInsert writes to targets
@@ -271,11 +267,10 @@ impl<T: Copy + PartialOrd> NsgConstructionGraph<T> {
 
     /// Unconditionally append a neighbour to a node's adjacency.
     ///
-    /// Used by the DFS connectivity fix. Matches the reference NSG
-    /// `findroot` semantics: the added edge is required to make `new_neighbour`
-    /// reachable, so we accept degree growth beyond `r` rather than silently
-    /// drop the patch. The consequent variable per-row degree is absorbed by
-    /// `into_flat`, which pads every row to the observed maximum.
+    /// Used by the DFS connectivity fix. Matches the reference NSG `findroot`
+    /// semantics: the edge is required to make `new_neighbour` reachable, so
+    /// degree growth beyond `r` is accepted rather than dropping the patch.
+    /// `into_flat` absorbs the variable row degree by padding to the maximum.
     ///
     /// ### Params
     ///
@@ -892,12 +887,11 @@ where
             );
         }
 
-        // Step 2c: kNN top-up. MRNG occlusion collapses to ~6-8 edges per
-        // node on clustered data, so R never binds and the sparse graph
-        // dead-ends a subset of queries. Fill every node up to degree R with
-        // its closest kNN entries (cached distances, no recompute). Must run
-        // after InterInsert so reverse edges don't hit full nodes, and before
-        // the DFS fix so the denser graph needs fewer patches.
+        // Step 2c: kNN top-up. MRNG occlusion leaves very sparse rows on
+        // clustered data, so R never binds and a subset of queries dead-ends.
+        // Fill every node up to degree R with its closest kNN entries (cached
+        // distances). Must run after InterInsert so reverse edges don't hit
+        // full nodes, and before the DFS fix so fewer patches are needed.
         let t_topup = Instant::now();
         let bg = &build_graph;
         (0..n).into_par_iter().for_each(|v| {
@@ -1469,12 +1463,11 @@ where
 
     /// Query the index for `k` nearest neighbours.
     ///
-    /// Greedy beam search seeded from the navigating node plus a fixed set
-    /// of entry points strided evenly across the dataset. Single-entry search from the medoid dead-ends on clustered
-    /// data once cross-cluster paths get long; the strided seeds guarantee
-    /// the beam starts near every region of the data. Seeds far from the
-    /// query cost one distance evaluation each and are never expanded.
-    /// `ef_search` sets the beam width; if `None`, defaults to `100`.
+    /// Greedy beam search seeded from the navigating node plus a fixed set of
+    /// entry points strided evenly across the dataset, so the beam starts near
+    /// every region of the data. Seeds far from the query cost one distance
+    /// evaluation each and are never expanded. `ef_search` sets the beam width
+    /// (default `100`, raised to `k` if smaller).
     ///
     /// ### Params
     ///

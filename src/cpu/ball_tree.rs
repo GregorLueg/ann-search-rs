@@ -9,9 +9,17 @@ use std::collections::BinaryHeap;
 use thousands::*;
 
 use crate::prelude::*;
-use crate::utils::k_means_utils::*;
 use crate::utils::tree_utils::*;
 use crate::utils::*;
+
+/// Sequential Lloyd passes on a small node's two-way split (an in-place
+/// 2-means). `train_centroids` is avoided because it fans out over rayon
+/// internally, which is wasteful inside an already parallel recursion.
+const BALL_SPLIT_ITERS: usize = 5;
+
+/// Nodes above this size split on furthest-point pivots with a single Lloyd
+/// pass; at or below it they get D²-sampled pivots and `BALL_SPLIT_ITERS`.
+const BALL_SMALL_NODE: usize = 500;
 
 /////////////
 // Helpers //
@@ -46,6 +54,63 @@ where
     }
 
     furthest
+}
+
+/// Sample a second pivot with probability proportional to its distance from
+/// the first, i.e. k-means++ seeding for two centres.
+///
+/// ### Params
+///
+/// * `pivot` - First pivot
+/// * `data` - Slice of the data
+/// * `indices` - The indices of the data
+/// * `dim` - Dimensions of the data
+/// * `metric` - The distance metric
+/// * `rng` - Random number generator
+///
+/// ### Return
+///
+/// The sampled data point; falls back to `indices[0]` if every distance is zero
+fn sample_by_distance<T>(
+    pivot: &[T],
+    data: &[T],
+    indices: &[usize],
+    dim: usize,
+    metric: &Dist,
+    rng: &mut StdRng,
+) -> usize
+where
+    T: Float + SimdDistance,
+{
+    let pivot_norm = T::calculate_l2_norm(pivot);
+    let weights: Vec<f64> = indices
+        .iter()
+        .map(|&idx| {
+            let vec = &data[idx * dim..(idx + 1) * dim];
+            let d = match metric {
+                Dist::SquaredEuclidean => euclidean_distance_static(pivot, vec),
+                Dist::Cosine => {
+                    cosine_distance_static_norm(pivot, vec, &pivot_norm, &T::calculate_l2_norm(vec))
+                }
+                Dist::Manhattan => unreachable!(),
+            };
+            d.to_f64().unwrap_or(0.0).max(0.0)
+        })
+        .collect();
+
+    let total: f64 = weights.iter().sum();
+    if total <= 0.0 {
+        return indices[0];
+    }
+
+    let mut target = rng.random::<f64>() * total;
+    for (i, &w) in weights.iter().enumerate() {
+        target -= w;
+        if target <= 0.0 {
+            return indices[i];
+        }
+    }
+    indices[indices.len() - 1]
 }
 
 /// Partion data into two sets via the pivots
@@ -256,7 +321,7 @@ pub struct BallTreeIndex<T> {
     centers_data_norm: Vec<T>,
     /// Actual data indices stored in leaf nodes
     leaf_indices: Vec<usize>,
-    /// Original indices - for trait purposes
+    /// Original index of each stored row; rows are kept in leaf order
     original_ids: Vec<usize>,
 }
 
@@ -362,6 +427,22 @@ where
             dim,
         );
 
+        // Store the vectors in leaf order so every leaf scan reads one
+        // contiguous block. A single tree holds each item exactly once, so the
+        // leaf list is itself the new-to-old permutation.
+        let original_ids = leaf_indices;
+        let mut reordered = Vec::with_capacity(vectors_flat.len());
+        for &old in &original_ids {
+            reordered.extend_from_slice(&vectors_flat[old * dim..(old + 1) * dim]);
+        }
+        let vectors_flat = reordered;
+        let norms: Vec<T> = if norms.is_empty() {
+            norms
+        } else {
+            original_ids.iter().map(|&old| norms[old]).collect()
+        };
+        let leaf_indices: Vec<usize> = (0..n).collect();
+
         let centers_data_norm = if metric == Dist::Cosine {
             (0..centers_data.len() / dim)
                 .map(|i| {
@@ -385,7 +466,7 @@ where
             n,
             norms,
             metric,
-            original_ids: (0..n).collect(),
+            original_ids,
         })
     }
 
@@ -455,120 +536,41 @@ where
             return Ok(node_idx);
         }
 
-        let (center, left_items, right_items) = if items.len() > 500 {
-            let p1_idx = items[rng.random_range(0..items.len())];
-            let p1 = &vectors_flat[p1_idx * dim..(p1_idx + 1) * dim];
-            let p2_idx = find_furthest_from(p1, vectors_flat, &items, dim);
-            let p2 = &vectors_flat[p2_idx * dim..(p2_idx + 1) * dim];
+        let p1_idx = items[rng.random_range(0..items.len())];
+        let p1 = &vectors_flat[p1_idx * dim..(p1_idx + 1) * dim];
+        let p2_idx = if items.len() > BALL_SMALL_NODE {
+            find_furthest_from(p1, vectors_flat, &items, dim)
+        } else {
+            sample_by_distance(p1, vectors_flat, &items, dim, &metric, rng)
+        };
+        let p2 = &vectors_flat[p2_idx * dim..(p2_idx + 1) * dim];
 
-            let (mut left, mut right) =
-                partition_by_nearest(vectors_flat, &items, dim, p1, p2, &metric);
+        let (mut left, mut right) =
+            partition_by_nearest(vectors_flat, &items, dim, p1, p2, &metric);
 
-            if left.is_empty() || right.is_empty() {
-                let mid = items.len() / 2;
-                left = items[..mid].to_vec();
-                right = items[mid..].to_vec();
-            }
+        if left.is_empty() || right.is_empty() {
+            let mid = items.len() / 2;
+            left = items[..mid].to_vec();
+            right = items[mid..].to_vec();
+        }
 
+        let iters = if items.len() > BALL_SMALL_NODE {
+            1
+        } else {
+            BALL_SPLIT_ITERS
+        };
+        for _ in 0..iters {
             let c1 = compute_centroid(vectors_flat, &left, dim);
             let c2 = compute_centroid(vectors_flat, &right, dim);
-
-            let (left_final, right_final) =
-                partition_by_nearest(vectors_flat, &items, dim, &c1, &c2, &metric);
-
-            let center = compute_centroid(vectors_flat, &items, dim);
-            (center, left_final, right_final)
-        } else {
-            let sample_data: Vec<T> = items
-                .iter()
-                .flat_map(|&idx| {
-                    let start = idx * dim;
-                    vectors_flat[start..start + dim].iter().cloned()
-                })
-                .collect();
-
-            let k_means_params = KMeansTrainingParams::new(5, None, None);
-
-            let centroids = train_centroids(
-                &sample_data,
-                dim,
-                items.len(),
-                2,
-                &metric,
-                Some(k_means_params),
-                (rng.random::<f32>() * 100.0) as usize,
-                false,
-            )?;
-
-            let sample_norms = if metric == Dist::Cosine {
-                (0..items.len())
-                    .map(|i| {
-                        sample_data[i * dim..(i + 1) * dim]
-                            .iter()
-                            .map(|&x| x * x)
-                            .fold(T::zero(), |a, b| a + b)
-                            .sqrt()
-                    })
-                    .collect()
-            } else {
-                vec![T::one(); items.len()]
-            };
-
-            let centroid_norms = if metric == Dist::Cosine {
-                vec![
-                    T::calculate_l2_norm(&centroids[0..dim]),
-                    T::calculate_l2_norm(&centroids[dim..2 * dim]),
-                ]
-            } else {
-                vec![T::one(); 2]
-            };
-
-            let mut left = Vec::new();
-            let mut right = Vec::new();
-
-            for (i, &idx) in items.iter().enumerate() {
-                let vec = &sample_data[i * dim..(i + 1) * dim];
-                let vec_norm = &sample_norms[i];
-
-                let d0 = match metric {
-                    Dist::SquaredEuclidean => euclidean_distance_static(vec, &centroids[0..dim]),
-                    Dist::Cosine => cosine_distance_static_norm(
-                        vec,
-                        &centroids[0..dim],
-                        vec_norm,
-                        &centroid_norms[0],
-                    ),
-                    Dist::Manhattan => unreachable!(),
-                };
-                let d1 = match metric {
-                    Dist::SquaredEuclidean => {
-                        euclidean_distance_static(vec, &centroids[dim..2 * dim])
-                    }
-                    Dist::Cosine => cosine_distance_static_norm(
-                        vec,
-                        &centroids[dim..2 * dim],
-                        vec_norm,
-                        &centroid_norms[1],
-                    ),
-                    Dist::Manhattan => unreachable!(),
-                };
-
-                if d0 <= d1 {
-                    left.push(idx);
-                } else {
-                    right.push(idx);
-                }
+            let (l, r) = partition_by_nearest(vectors_flat, &items, dim, &c1, &c2, &metric);
+            if l.is_empty() || r.is_empty() {
+                break;
             }
+            (left, right) = (l, r);
+        }
+        let (left_items, right_items) = (left, right);
 
-            if left.is_empty() || right.is_empty() {
-                let mid = items.len() / 2;
-                left = items[..mid].to_vec();
-                right = items[mid..].to_vec();
-            }
-
-            let center = compute_centroid(vectors_flat, &items, dim);
-            (center, left, right)
-        };
+        let center = compute_centroid(vectors_flat, &items, dim);
 
         let radius = ball_radius(&center, vectors_flat, &items, dim, &metric);
 
@@ -580,10 +582,12 @@ where
             right: 0,
         });
 
-        let (left_idx, right_idx) = if depth < max_parallel_depth {
-            let seed_left = rng.random();
-            let seed_right = rng.random();
+        // Child streams are drawn at every node, not only above the parallel
+        // cutoff, so the tree does not depend on the thread count.
+        let seed_left: u64 = rng.random();
+        let seed_right: u64 = rng.random();
 
+        let (left_idx, right_idx) = if depth < max_parallel_depth {
             let (left_result, right_result) = rayon::join(
                 || {
                     let mut left_rng = rand::rngs::StdRng::seed_from_u64(seed_left);
@@ -629,7 +633,7 @@ where
                 dim,
                 left_items,
                 nodes,
-                rng,
+                &mut StdRng::seed_from_u64(seed_left),
                 metric,
                 depth + 1,
                 max_parallel_depth,
@@ -639,7 +643,7 @@ where
                 dim,
                 right_items,
                 nodes,
-                rng,
+                &mut StdRng::seed_from_u64(seed_right),
                 metric,
                 depth + 1,
                 max_parallel_depth,
@@ -893,7 +897,6 @@ where
                     }
                     break;
                 } else {
-                    // Cache child nodes
                     let left_node = unsafe { self.nodes.get_unchecked(node.child_a as usize) };
                     let right_node = unsafe { self.nodes.get_unchecked(node.child_b as usize) };
 
@@ -944,10 +947,15 @@ where
                             (node.child_b, node.child_a, dist_to_left, left_node.radius)
                         };
 
+                    // Distances and radii are squared (Euclidean) or
+                    // half-squared chords (Cosine), so the triangle inequality
+                    // holds on their square roots: the ball can hold nothing
+                    // nearer than (sqrt(d) - sqrt(r))^2.
+                    let gap = (farther_dist.max(T::zero()).sqrt()
+                        - farther_radius.max(T::zero()).sqrt())
+                    .max(T::zero());
                     pq.push(BacktrackEntry {
-                        margin: -(farther_dist - farther_radius * T::from(1.1).unwrap())
-                            .to_f64()
-                            .unwrap(),
+                        margin: -(gap * gap).to_f64().unwrap(),
                         node_idx: farther,
                     });
 
@@ -959,7 +967,7 @@ where
         let results: Vec<(usize, T)> = top_k
             .data()
             .iter()
-            .map(|(OrderedFloat(dist), idx)| (*idx, *dist))
+            .map(|(OrderedFloat(dist), idx)| (self.original_ids[*idx], *dist))
             .collect();
 
         Ok(results.into_iter().unzip())
@@ -1045,7 +1053,13 @@ where
             })
             .collect::<Result<Vec<_>, AnnSearchErrors>>()?;
 
-        Ok(pack_knn_results(results, return_dist))
+        // Rows come out in storage order; put them back in original order.
+        let mut ordered = vec![(Vec::new(), Vec::new()); self.n];
+        for (internal, res) in results.into_iter().enumerate() {
+            ordered[self.original_ids[internal]] = res;
+        }
+
+        Ok(pack_knn_results(ordered, return_dist))
     }
 }
 
@@ -1132,7 +1146,6 @@ mod tests {
 
         // Query with point 0, should find itself first
         let query = vec![1.0, 0.0, 0.0];
-        // FIX: Pass explicit search_k (5) because default 5% of 5 is 0
         let (indices, distances) = index.query(&query, 1, Some(5)).unwrap();
 
         assert_eq!(indices.len(), 1);
@@ -1146,7 +1159,6 @@ mod tests {
         let index = BallTreeIndex::new(mat.as_ref(), Dist::SquaredEuclidean, 42).unwrap();
 
         let query = vec![1.0, 0.0, 0.0];
-        // FIX: Pass explicit search_k
         let (indices, distances) = index.query(&query, 3, Some(5)).unwrap();
 
         // Should find point 0 first (exact match)
@@ -1167,7 +1179,6 @@ mod tests {
         let index = BallTreeIndex::new(mat.as_ref(), Dist::Cosine, 42).unwrap();
 
         let query = vec![1.0, 0.0, 0.0];
-        // FIX: Pass explicit search_k
         let (indices, distances) = index.query(&query, 3, Some(5)).unwrap();
 
         // Should find point 0 first (identical direction)
@@ -1184,7 +1195,6 @@ mod tests {
 
         let query = vec![1.0, 0.0, 0.0];
         // ask for 10 neighbours but only 5 points exist
-        // FIX: Pass explicit search_k
         let (indices, _) = index.query(&query, 10, Some(5)).unwrap();
 
         // Should return at most 5 results
@@ -1200,7 +1210,6 @@ mod tests {
 
         let query = vec![1.0, 0.0, 0.0];
 
-        // This test was actually passing before because we set Some(10) and Some(1)
         let (indices1, _) = index.query(&query, 3, Some(10)).unwrap();
         let (indices2, _) = index.query(&query, 3, Some(1)).unwrap();
 
@@ -1214,7 +1223,6 @@ mod tests {
         let index = BallTreeIndex::new(mat.as_ref(), Dist::SquaredEuclidean, 42).unwrap();
 
         // Query using a row from the matrix
-        // FIX: Pass explicit search_k
         let (indices, distances) = index.query_row(mat.row(0), 1, Some(5)).unwrap();
 
         assert_eq!(indices[0], 0);
@@ -1229,7 +1237,6 @@ mod tests {
         let index2 = BallTreeIndex::new(mat.as_ref(), Dist::SquaredEuclidean, 42).unwrap();
 
         let query = vec![0.5, 0.5, 0.0];
-        // FIX: Pass explicit search_k
         let (indices1, _) = index1.query(&query, 3, Some(5)).unwrap();
         let (indices2, _) = index2.query(&query, 3, Some(5)).unwrap();
 
@@ -1245,7 +1252,6 @@ mod tests {
 
         let query = vec![0.5, 0.5, 0.0];
 
-        // FIX: Pass explicit search_k
         let (indices1, _) = index1.query(&query, 3, Some(5)).unwrap();
         let (indices2, _) = index2.query(&query, 3, Some(5)).unwrap();
 
@@ -1255,9 +1261,6 @@ mod tests {
 
     #[test]
     fn test_ball_tree_larger_dataset() {
-        // Create a larger synthetic dataset (n=100)
-        // 5% of 100 is 5, so this should work even with None (default)
-        // But for safety in tests we can be explicit
         let n = 100;
         let dim = 10;
         let mut data = Vec::with_capacity(n * dim);
@@ -1286,7 +1289,6 @@ mod tests {
         let index = BallTreeIndex::new(mat.as_ref(), Dist::Cosine, 42).unwrap();
 
         let query = vec![1.0, 0.0, 0.0];
-        // FIX: Pass explicit search_k
         let (indices, distances) = index.query(&query, 3, Some(3)).unwrap();
 
         assert_eq!(indices[0], 0);

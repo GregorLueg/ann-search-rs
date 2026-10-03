@@ -3,10 +3,6 @@
 //! Uses a forest of randomised Kd-trees for approximate nearest neighbour
 //! search. Each tree splits along coordinate axes selected randomly from
 //! the top highest-spread dimensions, providing diversity across trees.
-//! Supports optional spill-tree overlap at split boundaries for improved
-//! recall: items within a fraction of the spread on each side of the
-//! boundary are placed into both children, allowing the query to find
-//! neighbours that a hard partition would miss.
 
 use faer::RowRef;
 use fixedbitset::FixedBitSet;
@@ -46,7 +42,7 @@ struct KdFlatNode<T> {
     child_b: u32,
     /// Dimension along which the split occurs (split only)
     split_dim: u16,
-    /// Explicit padding... Compiler likely does this anyways
+    /// Explicit padding
     _pad: u16,
     /// Threshold value for the split (split only)
     split_val: T,
@@ -159,10 +155,10 @@ impl<T> KdTreeIndex<T>
 where
     T: AnnSearchFloat,
 {
-    /// Construct a new Kd-Tree forest index with default overlap
+    /// Construct a new Kd-Tree forest index
     ///
-    /// Builds a forest of randomised Kd-trees in parallel. Uses the
-    /// default spill-tree overlap fraction of 5%.
+    /// Builds a forest of randomised Kd-trees in parallel, one tree per
+    /// thread.
     ///
     /// ### Params
     ///
@@ -179,7 +175,6 @@ where
         let mut rng = StdRng::seed_from_u64(seed as u64);
         let (vectors_flat, n, dim) = data.into_row_major();
 
-        // compute norms for Cosine distance
         let norms = if metric == Dist::Cosine {
             (0..n)
                 .map(|i| {
@@ -221,7 +216,6 @@ where
             })
             .collect();
 
-        // flatten all trees into contiguous storage
         let total_nodes: usize = forest.iter().map(|t| t.len()).sum();
         let mut nodes = Vec::with_capacity(total_nodes);
         let mut roots = Vec::with_capacity(n_trees);
@@ -296,7 +290,6 @@ where
     /// * `dim` - Dimensionality of vectors
     /// * `items` - Indices of items to partition
     /// * `rng` - Random number generator for this tree
-    /// * `overlap` - Spill-tree overlap fraction
     ///
     /// ### Returns
     ///
@@ -316,8 +309,7 @@ where
     ///
     /// Selects a split dimension randomly from the top highest-spread
     /// dimensions (computed on a subsample for efficiency), then splits
-    /// at the approximate median. Items within the spill-tree overlap
-    /// zone are placed into both children.
+    /// at the approximate median.
     ///
     /// Falls back to a leaf if the node is small enough, the data is
     /// degenerate (zero spread on all dimensions), or no candidate
@@ -331,7 +323,6 @@ where
     /// * `items` - Indices to partition in this node
     /// * `nodes` - Accumulator for built nodes
     /// * `rng` - Random number generator
-    /// * `overlap` - Spill-tree overlap fraction
     ///
     /// ### Returns
     ///
@@ -476,9 +467,8 @@ where
 
     /// Reorders vectors in memory to match the DFS layout of Tree 0
     ///
-    /// Places vectors that co-occur in leaves physically adjacent in memory.
-    /// This drastically reduces L2/L3 cache misses during leaf evaluation and
-    /// reduces memory bandwidth problems.
+    /// Places vectors that co-occur in leaves adjacent in memory, for cache
+    /// locality during leaf evaluation.
     ///
     /// ### Returns
     ///
@@ -492,7 +482,6 @@ where
         let mut old_to_new = vec![usize::MAX; self.n];
         let mut visited = vec![false; self.n];
 
-        // DFS traversal of Tree 0
         let mut stack = vec![self.roots[0]];
         while let Some(node_idx) = stack.pop() {
             let node = unsafe { self.nodes.get_unchecked(node_idx as usize) };
@@ -515,16 +504,9 @@ where
             }
         }
 
-        // catch any items not in Tree 0 (safety guard for items that
-        // ended up only in other trees due to spill overlap patterns)
-        for old_id in 0..self.n {
-            if !visited[old_id] {
-                old_to_new[old_id] = new_to_old.len();
-                new_to_old.push(old_id);
-            }
-        }
+        // Every tree partitions all items, so tree 0 alone covers them.
+        debug_assert_eq!(new_to_old.len(), self.n);
 
-        // shuffle vector data into new contiguous layout
         let mut new_vectors_flat = Vec::with_capacity(self.vectors_flat.len());
         let mut new_norms = if self.norms.is_empty() {
             Vec::new()
@@ -542,7 +524,6 @@ where
             }
         }
 
-        // rewrite all leaves in all trees to use new IDs
         for id_ref in self.leaf_indices.iter_mut() {
             *id_ref = old_to_new[*id_ref];
         }
@@ -645,10 +626,9 @@ where
             // priority queue pruning: margin-based lower bound vs kth distance.
             if top_k.len() == k && entry.margin != f64::MAX {
                 let abs_margin = -entry.margin;
-                // for Euclidean (squared): lower bound = margin^2
-                // for Cosine: unit vectors have ||a-b||^2 = 2(1-cos),
-                // margin^2 is one component, so cos_dist >= margin^2/2
-                // Claude says this is the right way to do this...
+                // Squared Euclidean: one axis of the difference, so >= margin^2.
+                // Cosine: splits live in normalised space where
+                // ||a - b||^2 = 2 * cos_dist, so cos_dist >= margin^2 / 2.
                 let lower_bound = match self.metric {
                     Dist::SquaredEuclidean => abs_margin * abs_margin,
                     Dist::Cosine => abs_margin * abs_margin * 0.5,
@@ -666,7 +646,6 @@ where
                 let node = unsafe { self.nodes.get_unchecked(current_idx as usize) };
 
                 if node.n_descendants == 1 {
-                    // leaf -> evaluate all items
                     let start = node.child_a as usize;
                     let len = node.child_b as usize;
                     visited_count += len;
@@ -698,7 +677,6 @@ where
                     }
                     break;
                 } else {
-                    // split node -> single coordinate comparison
                     let margin = (split_query[node.split_dim as usize] - node.split_val)
                         .to_f64()
                         .unwrap();
@@ -721,7 +699,6 @@ where
             }
         }
 
-        // extract results and remap to original indices
         let results: Vec<(usize, T)> = top_k
             .data()
             .iter()
@@ -1098,29 +1075,5 @@ mod tests {
         let (indices, _) = index.query(&query, 3, None).unwrap();
 
         assert_eq!(indices.len(), 3);
-    }
-
-    #[test]
-    fn test_kd_tree_no_overlap() {
-        let n = 100;
-        let dim = 10;
-        let mut data = Vec::with_capacity(n * dim);
-
-        for i in 0..n {
-            for j in 0..dim {
-                data.push((i * j) as f32 / 10.0);
-            }
-        }
-
-        let mat = Mat::from_fn(n, dim, |i, j| data[i * dim + j]);
-
-        // Build with zero overlap (standard Kd-tree)
-        let index = KdTreeIndex::new(mat.as_ref(), 8, Dist::SquaredEuclidean, 42);
-
-        let query: Vec<f32> = (0..dim).map(|_| 0.0).collect();
-        let (indices, _) = index.query(&query, 5, None).unwrap();
-
-        assert_eq!(indices.len(), 5);
-        assert_eq!(indices[0], 0);
     }
 }

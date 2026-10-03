@@ -3,6 +3,29 @@
 Changes to the `ann-search-rs` crate. The Python package `ann-search` has its
 own changelog at [`python/CHANGELOG.md`](python/CHANGELOG.md).
 
+## 0.9.3
+
+**Performance**
+
+- Ball tree build is several times faster, and the tree no longer depends on
+  the number of threads.
+- Ball tree query and self-query are roughly twice as fast; vectors are now
+  stored in leaf order.
+- Faster Annoy build (SIMD hyperplane projection) and Annoy batch and self
+  queries (per-thread scratch).
+- Faster NN-Descent queries (reused forest scratch).
+
+**Fixes**
+
+- Ball tree query pruned with a bound that was too tight, which cost recall.
+  It now uses the exact ball lower bound, so recall is higher at every search
+  budget.
+
+**Behaviour changes**
+
+- Ball tree builds produce a different tree for the same seed than earlier
+  versions.
+
 ## 0.9.2
 
 **Features**
@@ -49,7 +72,7 @@ own changelog at [`python/CHANGELOG.md`](python/CHANGELOG.md).
   build times and additionally performance improvements from the other indices
   were integrated into Vamana.
 
-**Breaking**
+**Behaviour changes**
 
 - The RaBitQ indices (`IvfIndexRaBitQ`, `ExhaustiveIndexRaBitQ`) now estimate
   distances with a fast-scan nibble table rather than int4 query bit-planes. The

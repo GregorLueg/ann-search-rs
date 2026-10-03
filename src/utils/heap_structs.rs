@@ -163,16 +163,11 @@ impl<T: Ord> SortedBuffer<T> {
 /// Bounded max-heap retaining the `k` smallest `(distance, index)` pairs.
 ///
 /// Distances and indices live in parallel arrays with the largest retained
-/// distance at position 0. A candidate that fails the threshold test costs one
-/// float comparison and never touches the heap, which is the overwhelmingly
-/// common case during a scan. An accepted candidate overwrites the root and
-/// sifts down once, rather than the pop-then-push pair a [`std::collections::BinaryHeap`]
-/// needs, halving the work on the accept path.
+/// distance at position 0. A rejected candidate costs one float comparison; an
+/// accepted one overwrites the root and sifts down once.
 ///
 /// Ordering is by `(distance, index)`, so ties resolve towards the smaller
 /// index and the emitted order is reproducible across runs and thread counts.
-/// Sorting on the distance alone leaves tied entries in an arbitrary order,
-/// which makes results impossible to diff against a reference implementation.
 ///
 /// ### Type Parameters
 ///
@@ -449,19 +444,14 @@ const ID_MASK: u32 = !EXPANDED_BIT;
 /// Bounded sorted candidate list for a greedy graph walk.
 ///
 /// Holds at most `capacity` entries ascending by distance, each flagged
-/// expanded or not, and hands back the closest unexpanded one. This is the
-/// structure DiskANN's greedy search uses, and it does the job of the usual
-/// frontier-heap-plus-result-heap pair on its own. That pair wastes most of
-/// its work: the frontier accepts every candidate that beats the beam
-/// threshold *at the time*, so it grows several times larger than the beam and
-/// the majority of what it holds is never popped. A candidate outside the beam
-/// can never be worth expanding, so it should never be stored.
+/// expanded or not, and hands back the closest unexpanded one. Replaces the
+/// frontier-heap-plus-result-heap pair (DiskANN-style): a candidate outside
+/// the beam is never stored.
 ///
 /// Entries are `(distance, id)` with the expanded flag in the top bit of the
-/// id, which keeps the row 8 bytes wide for `f32` and the insert memmove
-/// correspondingly cheap. Ids must therefore stay below `1 << 31`; every graph
-/// index here already guarantees that, since `u32::MAX` is its neighbour-slot
-/// sentinel.
+/// id, keeping the row 8 bytes wide for `f32`. Ids must stay below `1 << 31`;
+/// every graph index here guarantees that since `u32::MAX` is the
+/// neighbour-slot sentinel.
 ///
 /// ### Type Parameters
 ///
@@ -552,10 +542,9 @@ impl<T: Float> NeighbourQueue<T> {
         }
 
         // Ordered by (distance, id) so ties resolve towards the smaller index
-        // and the walk is reproducible across runs and thread counts. The
-        // Deliberately branchy: the conditional-move form measured slower on
-        // Apple Silicon, since the array is L1-resident, the predictor handles
-        // this shape, and `csel` serialises the dependent loads.
+        // and the walk is reproducible across runs and thread counts.
+        // Deliberately branchy: the array is L1-resident and a conditional move
+        // serialises the dependent loads.
         let mut lo = 0;
         let mut hi = len;
         while lo < hi {

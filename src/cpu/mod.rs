@@ -6,7 +6,7 @@
 //! - Three tree-based versions: Annoy (memory-based), Kd Forest and BallTree.
 //! - Three clustering-based versions: IVF, SOAR (IVF with spilling) and LSH
 //!   (multi-probe) version
-//! - Three graph-based versions: Vanama (memory-based version), HNSW and
+//! - Three graph-based versions: Vamana (memory-based version), HNSW and
 //!   NNDescent
 //!
 //! And a flat exhaustive version + an accelerated exhaustive version via KmKnn.
