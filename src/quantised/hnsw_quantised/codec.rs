@@ -72,6 +72,37 @@ where
     /// A value monotone in the true distance
     fn score(&self, query: &Self::Query, id: usize) -> T;
 
+    /// Cheap first-tier score and a lower bound on [`Self::score`].
+    ///
+    /// The walk steers its beam and the upper-layer descent by the first
+    /// value and pays for the full score only where the bound could still
+    /// enter the result set. A codec with one tier returns its full score
+    /// twice, which is the default.
+    ///
+    /// ### Params
+    ///
+    /// * `query` - Prepared query state
+    /// * `id` - Index of the stored vector
+    ///
+    /// ### Returns
+    ///
+    /// `(estimate, lower bound)` on the same scale as [`Self::score`]
+    #[inline]
+    fn score_coarse(&self, query: &Self::Query, id: usize) -> (T, T) {
+        let d = self.score(query, id);
+        (d, d)
+    }
+
+    /// Whether [`Self::score_coarse`] is cheaper than [`Self::score`], so the
+    /// walk should gate the full score behind the bound.
+    ///
+    /// ### Returns
+    ///
+    /// `false` unless the codec has a distinct coarse tier
+    fn two_tier(&self) -> bool {
+        false
+    }
+
     /// Score between two stored vectors. Smaller is nearer.
     ///
     /// This is the construction-time distance, so the graph is built in the

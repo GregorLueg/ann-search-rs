@@ -74,6 +74,8 @@ pub struct RaBitQCodecQuery<T> {
     sum: T,
     /// `||q - c||^2` per centroid, the whole per-query cost of `nlist > 1`
     g_add: Vec<T>,
+    /// `||q - c||` per centroid, scaling each vertex's error bound
+    g_error: Vec<T>,
 }
 
 /// Partial sums of a rotated query over every 4-bit pattern of its sign code.
@@ -121,6 +123,9 @@ pub struct RaBitQCodec<T> {
     ex_codes: Vec<u8>,
     /// `(f_add, f_rescale, f_error)` per vertex, interleaved
     factors: Vec<T>,
+    /// 1-bit `(f_add, f_rescale, f_error)` per vertex for the coarse tier,
+    /// interleaved; empty at `ex_bits` 0, where `factors` already are these
+    bin_factors: Vec<T>,
     /// Centroid each vertex was encoded against
     cluster: Vec<u32>,
     /// Rotated centroids, `nlist * padded_dim`
@@ -254,14 +259,17 @@ where
         let ex_stride = ex_bytes.max(1);
         let mut ex_codes = vec![0u8; n * ex_stride];
         let mut factors = vec![T::zero(); n * FACTORS_PER_VERTEX];
+        // Same placeholder reasoning as `ex_codes`: always one chunk per vertex.
+        let mut bin_factors = vec![T::zero(); n * FACTORS_PER_VERTEX];
 
         sign_codes
             .par_chunks_mut(n_bytes)
             .zip(ex_codes.par_chunks_mut(ex_stride))
             .zip(factors.par_chunks_mut(FACTORS_PER_VERTEX))
+            .zip(bin_factors.par_chunks_mut(FACTORS_PER_VERTEX))
             .enumerate()
             .try_for_each(
-                |(node, ((sign, ex), factor))| -> Result<(), AnnSearchErrors> {
+                |(node, (((sign, ex), factor), bin_factor))| -> Result<(), AnnSearchErrors> {
                     let c = assignments[node];
                     let rotated =
                         encoder.apply_rotation(&vectors_flat[node * dim..(node + 1) * dim]);
@@ -277,11 +285,21 @@ where
                     factor[1] = encoded.f_rescale;
                     factor[2] = encoded.f_error;
 
+                    if ex_bits > 0 {
+                        // The sign code does not depend on the width, so only
+                        // the 1-bit factors are kept from this second encode.
+                        let bin = encode_ex_bits(&rotated, centroid, 0, None)?;
+                        bin_factor[0] = bin.f_add;
+                        bin_factor[1] = bin.f_rescale;
+                        bin_factor[2] = bin.f_error;
+                    }
+
                     Ok(())
                 },
             )?;
         if ex_bytes == 0 {
             ex_codes = Vec::new();
+            bin_factors = Vec::new();
         }
 
         Ok(Self {
@@ -289,6 +307,7 @@ where
             sign_codes,
             ex_codes,
             factors,
+            bin_factors,
             cluster: assignments.iter().map(|&c| c as u32).collect(),
             centroids_rotated,
             nlist,
@@ -378,6 +397,44 @@ where
         let cb = T::from_f64(-((1u64 << self.ex_bits) as f64 - 0.5)).unwrap_or_else(T::zero);
 
         f_add + g_add + f_rescale * (step * ip_sign + ip_ex + cb * sum)
+    }
+
+    /// 1-bit distance estimate and its lower bound for one vertex.
+    ///
+    /// The sign product alone against the vertex's 1-bit factors, as the
+    /// reference's `split_single_estdist`: `est = f_add + g_add +
+    /// f_rescale * (<q, s> - sum / 2)`, `low = est - f_error * ||q - c||`.
+    ///
+    /// ### Params
+    ///
+    /// * `node` - Vertex index
+    /// * `query` - Prepared query
+    ///
+    /// ### Returns
+    ///
+    /// `(estimate, lower bound)`
+    #[inline]
+    fn estimate_bin(&self, node: usize, query: &RaBitQCodecQuery<T>) -> (T, T) {
+        let n_bytes = self.encoder.n_bytes;
+        let sign = &self.sign_codes[node * n_bytes..(node + 1) * n_bytes];
+        let (mut sign_lo, mut sign_hi) = (T::zero(), T::zero());
+        for (row, &byte) in query.sign_lut.chunks_exact(2 * NIBBLE_VALUES).zip(sign) {
+            sign_lo = sign_lo + row[(byte & 0x0f) as usize];
+            sign_hi = sign_hi + row[NIBBLE_VALUES + (byte >> NIBBLE) as usize];
+        }
+        let ip_sign = sign_lo + sign_hi;
+
+        let factors = if self.ex_bits == 0 {
+            &self.factors
+        } else {
+            &self.bin_factors
+        };
+        let base = node * FACTORS_PER_VERTEX;
+        let c = self.cluster[node] as usize;
+        let half = T::from_f64(0.5).unwrap_or_else(T::zero);
+
+        let est = factors[base] + query.g_add[c] + factors[base + 1] * (ip_sign - half * query.sum);
+        (est, est - factors[base + 2] * query.g_error[c])
     }
 
     /// Reconstruct a vertex in the rotated frame.
@@ -545,11 +602,14 @@ where
             .map(|c| T::euclidean_simd(self.centroid(c), &rotated))
             .collect();
 
+        let g_error = g_add.iter().map(|&g| g.sqrt()).collect();
+
         Ok(RaBitQCodecQuery {
             sign_lut: build_sign_lut(&rotated),
             rotated,
             sum,
             g_add,
+            g_error,
         })
     }
 
@@ -557,6 +617,15 @@ where
     fn score(&self, query: &Self::Query, id: usize) -> T {
         let g_add = query.g_add[self.cluster[id] as usize];
         self.estimate(id, &query.rotated, &query.sign_lut, query.sum, g_add)
+    }
+
+    #[inline]
+    fn score_coarse(&self, query: &Self::Query, id: usize) -> (T, T) {
+        self.estimate_bin(id, query)
+    }
+
+    fn two_tier(&self) -> bool {
+        self.ex_bits > 0
     }
 
     fn score_sym(&self, a: usize, b: usize) -> T {
