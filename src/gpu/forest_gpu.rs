@@ -101,16 +101,20 @@ fn compute_dot_products<F: CubeclFloat, N: Size>(
 /// ### Params
 ///
 /// * `vectors` - Row-major vector matrix `[n_pts, dim/N]` as `Vector<F, N>`
-/// * `projections` - Random projection vectors `[n_levels, dim/N]`
-/// * `dot_values` - Output `[n_levels, n_pts]`, level-major so each level's
-///   block is contiguous and can be sliced for the host-side median pass
+/// * `projections` - Random projection vectors `[n_trees * n_levels, dim/N]`,
+///   tree-major
+/// * `dot_values` - Output `[n_trees * n_levels, n_pts]`, level-major within
+///   each tree so every level's block is contiguous and can be sliced for the
+///   host-side median pass
 /// * `n_pts` - Number of points
 /// * `dim_lines` - `Vector<F, N>` elements per row (comptime)
 /// * `n_levels` - Tree depth, i.e. number of projections (comptime)
 ///
 /// ### Grid mapping
 ///
-/// * `ABSOLUTE_POS_X` -> point index
+/// * `(CUBE_POS_Y * CUBE_COUNT_X + CUBE_POS_X) * WORKGROUP_SIZE_X + UNIT_POS_X`
+///   -> point index
+/// * `CUBE_POS_Z` -> tree index
 #[cube(launch_unchecked)]
 fn compute_dot_products_multi<F: CubeclFloat, N: Size>(
     vectors: &Tensor<Vector<F, N>>,
@@ -126,6 +130,9 @@ fn compute_dot_products_multi<F: CubeclFloat, N: Size>(
     }
     let lanes = LINE_SIZE;
     let off = idx as usize * dim_lines;
+    let tree = CUBE_POS_Z as usize;
+    let proj_base = tree * n_levels * dim_lines;
+    let out_base = tree * n_levels * n_pts as usize;
 
     let mut acc = Array::<F>::new(n_levels);
     #[unroll]
@@ -137,7 +144,7 @@ fn compute_dot_products_multi<F: CubeclFloat, N: Size>(
         let v = vectors[off + i];
         #[unroll]
         for l in 0..n_levels {
-            let r = projections[l * dim_lines + i];
+            let r = projections[proj_base + l * dim_lines + i];
             let prod = v * r;
             #[unroll]
             for lane in 0..lanes {
@@ -149,7 +156,7 @@ fn compute_dot_products_multi<F: CubeclFloat, N: Size>(
     // Level-major write: consecutive threads hit consecutive addresses.
     #[unroll]
     for l in 0..n_levels {
-        dot_values[l * n_pts as usize + idx as usize] = acc[l];
+        dot_values[out_base + l * n_pts as usize + idx as usize] = acc[l];
     }
 }
 
@@ -724,12 +731,75 @@ where
     let dot_grid = (n as u32).div_ceil(WORKGROUP_SIZE_X);
     let (dot_grid_x, dot_grid_y) = grid_2d(dot_grid, &limits)?;
 
-    // parallelise the outer tree loop to overlap GPU execution with CPU memory reads
-    let all_tree_results: TreeResults<T> = (0..n_trees)
+    // Every tree's projections up front, so the dot products for the whole
+    // forest are one upload, one launch and one readback. Per-tree launches
+    // from the rayon pool each paid their own upload and readback sync, and
+    // those serialised on the client.
+    let mut projections_flat = vec![T::zero(); n_trees * max_depth * dim_padded];
+    let mut tree_level_vecs: Vec<Vec<Vec<T>>> = Vec::with_capacity(n_trees);
+    for tree_idx in 0..n_trees {
+        let tree_seed =
+            (seed as u64).wrapping_add((tree_idx as u64).wrapping_mul(0x9E3779B97F4A7C15u64));
+        let mut level_vecs: Vec<Vec<T>> = Vec::with_capacity(max_depth);
+        for level in 0..max_depth {
+            let level_seed =
+                tree_seed.wrapping_add((level as u64).wrapping_mul(0x517CC1B727220A95u64));
+            let mut rng = SmallRng::seed_from_u64(level_seed);
+            let mut random_vec = vec![T::zero(); dim];
+            for v in random_vec.iter_mut() {
+                *v = T::from_f64(rng.random_range(-1.0..1.0)).unwrap();
+            }
+            let norm_sq: T = random_vec.iter().map(|x| *x * *x).sum();
+            let norm = num_traits::Float::sqrt(norm_sq);
+            if norm > T::zero() {
+                for x in random_vec.iter_mut() {
+                    *x /= norm;
+                }
+            }
+            let off = (tree_idx * max_depth + level) * dim_padded;
+            projections_flat[off..off + dim].copy_from_slice(&random_vec);
+            level_vecs.push(random_vec);
+        }
+        tree_level_vecs.push(level_vecs);
+    }
+
+    let all_dots = if max_depth > 0 {
+        let projections_gpu = GpuTensor::<R, T>::from_slice(
+            &projections_flat,
+            vec![n_trees * max_depth, dim_padded],
+            client,
+        )?;
+        let all_dots_gpu = GpuTensor::<R, T>::empty(vec![n_trees * max_depth, n], client)?;
+        let dot_count = checked_cube_count(
+            "compute_dot_products_multi",
+            dot_grid_x,
+            dot_grid_y,
+            n_trees as u32,
+            &limits,
+        )?;
+        unsafe {
+            compute_dot_products_multi::launch_unchecked::<T, R>(
+                client,
+                dot_count,
+                CubeDim::new_2d(WORKGROUP_SIZE_X, 1),
+                line,
+                vectors_gpu.clone().into_tensor_arg(),
+                projections_gpu.into_tensor_arg(),
+                all_dots_gpu.clone().into_tensor_arg(),
+                n as u32,
+                dim_vec,
+                max_depth,
+            );
+        }
+        all_dots_gpu.read(client)?
+    } else {
+        Vec::new()
+    };
+
+    let all_tree_results: TreeResults<T> = tree_level_vecs
         .into_par_iter()
-        .map(|tree_idx| {
-            let tree_seed =
-                (seed as u64).wrapping_add((tree_idx as u64).wrapping_mul(0x9E3779B97F4A7C15u64));
+        .enumerate()
+        .map(|(tree_idx, level_vecs)| {
             let save_routing = tree_idx < n_router_trees;
             let mut partition_ids = vec![0u32; n];
             let mut routing_vecs: Option<Vec<Vec<T>>> = if save_routing {
@@ -743,54 +813,10 @@ where
                 None
             };
 
-            let mut projections_flat = vec![T::zero(); max_depth * dim_padded];
-            let mut level_vecs: Vec<Vec<T>> = Vec::with_capacity(max_depth);
-            for level in 0..max_depth {
-                let level_seed =
-                    tree_seed.wrapping_add((level as u64).wrapping_mul(0x517CC1B727220A95u64));
-                let mut rng = SmallRng::seed_from_u64(level_seed);
-                let mut random_vec = vec![T::zero(); dim];
-                for v in random_vec.iter_mut() {
-                    *v = T::from_f64(rng.random_range(-1.0..1.0)).unwrap();
-                }
-                let norm_sq: T = random_vec.iter().map(|x| *x * *x).sum();
-                let norm = num_traits::Float::sqrt(norm_sq);
-                if norm > T::zero() {
-                    for x in random_vec.iter_mut() {
-                        *x /= norm;
-                    }
-                }
-                projections_flat[level * dim_padded..level * dim_padded + dim]
-                    .copy_from_slice(&random_vec);
-                level_vecs.push(random_vec);
-            }
-
-            let projections_gpu = GpuTensor::<R, T>::from_slice(
-                &projections_flat,
-                vec![max_depth, dim_padded],
-                client,
-            )?;
-            let all_dots_gpu = GpuTensor::<R, T>::empty(vec![max_depth, n], client)?;
-            unsafe {
-                compute_dot_products_multi::launch_unchecked::<T, R>(
-                    client,
-                    CubeCount::Static(dot_grid_x, dot_grid_y, 1),
-                    CubeDim::new_2d(WORKGROUP_SIZE_X, 1),
-                    line,
-                    vectors_gpu.clone().into_tensor_arg(),
-                    projections_gpu.into_tensor_arg(),
-                    all_dots_gpu.clone().into_tensor_arg(),
-                    n as u32,
-                    dim_vec,
-                    max_depth,
-                );
-            }
-            // One readback for the whole tree rather than one per level.
-            let all_dots = all_dots_gpu.read(client)?;
-
             for (level, random_vec) in level_vecs.into_iter().enumerate() {
-                // Level-major layout, so each level's block is contiguous.
-                let dot_values = &all_dots[level * n..(level + 1) * n];
+                // Level-major within the tree, so each level's block is contiguous.
+                let off = (tree_idx * max_depth + level) * n;
+                let dot_values = &all_dots[off..off + n];
                 // CPU median computation (fast, O(n), parallelised internally)
                 let n_partitions = 1usize << level;
                 let medians = compute_partition_medians(&partition_ids, dot_values, n_partitions);
@@ -811,9 +837,9 @@ where
                     routing_medians.as_mut().unwrap().push(medians);
                 }
             }
-            Ok((partition_ids, routing_vecs, routing_medians))
+            (partition_ids, routing_vecs, routing_medians)
         })
-        .collect::<Result<TreeResults<T>, AnnSearchErrors>>()?;
+        .collect();
 
     let leaf_structures: Vec<_> = all_tree_results
         .par_iter()
