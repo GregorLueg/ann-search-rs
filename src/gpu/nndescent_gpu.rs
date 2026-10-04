@@ -57,7 +57,7 @@ pub const MAX_PROPOSALS: usize = 128;
 /// Most new, and separately most old, candidates `local_join_shared` joins
 /// per node per iteration. The join is quadratic in its candidate count, so an
 /// uncapped `2 * build_k` makes large `k` pay `O(k^2)` pairs per node.
-pub const NND_MAX_CANDIDATES: usize = 32;
+pub const NND_MAX_CANDIDATES: usize = 60;
 
 /// Candidate cap passed to `local_join_shared`.
 ///
