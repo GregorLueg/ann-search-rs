@@ -17,7 +17,7 @@ use std::cmp::Reverse;
 use std::collections::BinaryHeap;
 use std::time::Instant;
 
-use crate::gpu::nndescent_gpu::{merge_proposals, reset_proposals, MAX_PROPOSALS};
+use crate::gpu::nndescent_gpu::{launch_merge_proposals, reset_proposals, MAX_PROPOSALS};
 use crate::gpu::*;
 use crate::prelude::*;
 
@@ -950,22 +950,18 @@ where
             );
         }
 
-        unsafe {
-            merge_proposals::launch_unchecked::<T, R>(
-                client,
-                CubeCount::Static(grid_n_x, grid_n_y, 1),
-                CubeDim::new_2d(WORKGROUP_SIZE_X, 1),
-                graph_idx_gpu.clone().into_tensor_arg(),
-                graph_dist_gpu.clone().into_tensor_arg(),
-                prop_idx_gpu.clone().into_tensor_arg(),
-                prop_dist_gpu.clone().into_tensor_arg(),
-                prop_count_gpu.clone().into_tensor_arg(),
-                update_counter_gpu.clone().into_tensor_arg(),
-                n as u32,
-                MAX_PROPOSALS as u32,
-                graph_idx_gpu.shape()[1],
-            );
-        }
+        launch_merge_proposals::<T, R>(
+            client,
+            &limits,
+            &graph_idx_gpu,
+            &graph_dist_gpu,
+            &prop_idx_gpu,
+            &prop_dist_gpu,
+            &prop_count_gpu,
+            &update_counter_gpu,
+            n,
+            graph_idx_gpu.shape()[1],
+        )?;
     }
 
     if verbose {

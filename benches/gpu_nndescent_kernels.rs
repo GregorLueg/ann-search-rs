@@ -19,7 +19,8 @@ use cubecl::prelude::*;
 
 use ann_search_rs::gpu::forest_gpu::{gpu_forest_init, mark_all_new};
 use ann_search_rs::gpu::nndescent_gpu::{
-    build_reverse_candidates, init_random_graph, local_join_shared, reset_proposals, MAX_PROPOSALS,
+    build_reverse_candidates, init_random_graph, local_join_shared, nnd_cand_cap, reset_proposals,
+    MAX_PROPOSALS,
 };
 use ann_search_rs::gpu::*;
 use ann_search_rs::utils::dist::Dist;
@@ -215,6 +216,7 @@ impl<R: Runtime> LocalJoinBench<R> {
         plan_local_join_staging(
             self.dim_padded(),
             self.cfg.build_k * 2,
+            (2 * nnd_cand_cap(self.cfg.build_k) as usize).min(self.cfg.build_k * 2),
             size_of::<f32>(),
             self.cfg.use_cosine(),
             &limits,
@@ -430,6 +432,7 @@ impl<R: Runtime> Benchmark for LocalJoinBench<R> {
                 n as u32,
                 (RHO * 65535.0) as u32,
                 0x9E37_79B9u32,
+                nnd_cand_cap(self.cfg.build_k),
                 MAX_PROPOSALS as u32,
                 self.cfg.use_cosine(),
                 dim_vec,

@@ -54,6 +54,24 @@ use crate::utils::nndescent_utils::{unpack_knn_graph, SENTINEL_PID};
 /// Max proposals per node per iteration. Overflow is silently dropped.
 pub const MAX_PROPOSALS: usize = 128;
 
+/// Most new, and separately most old, candidates `local_join_shared` joins
+/// per node per iteration. The join is quadratic in its candidate count, so an
+/// uncapped `2 * build_k` makes large `k` pay `O(k^2)` pairs per node.
+pub const NND_MAX_CANDIDATES: usize = 32;
+
+/// Candidate cap passed to `local_join_shared`.
+///
+/// ### Params
+///
+/// * `build_k` - Working degree of the graph
+///
+/// ### Returns
+///
+/// The per-kind candidate cap.
+pub fn nnd_cand_cap(build_k: usize) -> u32 {
+    NND_MAX_CANDIDATES.min(2 * build_k) as u32
+}
+
 /// Default maximum number of NNDescent iterations
 pub(crate) const DEFAULT_MAX_ITERS: usize = 15;
 
@@ -590,7 +608,7 @@ fn emit_pair<F: Float>(
 pub fn local_join_shared<F: Float, N: Size>(
     vectors: &Tensor<Vector<F, N>>,
     norms: &Tensor<F>,
-    graph_idx: &Tensor<u32>,
+    graph_idx: &mut Tensor<u32>,
     graph_dist: &Tensor<F>,
     reverse_idx: &Tensor<u32>,
     reverse_count: &Tensor<u32>,
@@ -600,6 +618,7 @@ pub fn local_join_shared<F: Float, N: Size>(
     n_pts: u32,
     rho_thresh: u32,
     iter_seed: u32,
+    cand_cap: u32,
     #[comptime] max_proposals: u32,
     #[comptime] use_cosine: bool,
     #[comptime] dim_lines: usize,
@@ -663,19 +682,44 @@ pub fn local_join_shared<F: Float, N: Size>(
     }
     sync_cube();
 
+    // Keep at most `cand_cap` new and `cand_cap` old candidates, forward
+    // (closest first) before reverse. A sampled forward new entry is marked old
+    // here, in this node's own row, so an unsampled one stays new for the next
+    // iteration; `merge_proposals` therefore leaves existing flags alone.
     if tflat == 0u32 {
         let mut write = 0u32;
         let mut has_new = 0u32;
+        let mut n_new = 0u32;
+        let mut n_old = 0u32;
         let mut read = 0u32;
         while read < raw_total {
             let hash = entry_hash(node, read, iter_seed);
             if (hash & 0xFFFFu32) < rho_thresh {
-                shared_pids[write as usize] = shared_pids[read as usize];
-                shared_is_new[write as usize] = shared_is_new[read as usize];
-                if shared_is_new[read as usize] != 0u32 {
-                    has_new = 1u32;
+                let pid = shared_pids[read as usize];
+                let is_new = shared_is_new[read as usize];
+                let mut keep: u32 = 0u32;
+                if is_new != 0u32 {
+                    if n_new < cand_cap {
+                        keep = 1u32;
+                        n_new += 1u32;
+                    }
+                } else {
+                    if n_old < cand_cap {
+                        keep = 1u32;
+                        n_old += 1u32;
+                    }
                 }
-                write += 1u32;
+                if keep == 1u32 {
+                    shared_pids[write as usize] = pid;
+                    shared_is_new[write as usize] = is_new;
+                    if is_new != 0u32 {
+                        has_new = 1u32;
+                        if read < k {
+                            graph_idx[(node * k + read) as usize] = pid;
+                        }
+                    }
+                    write += 1u32;
+                }
             }
             read += 1u32;
         }
@@ -936,11 +980,12 @@ pub fn local_join_shared<F: Float, N: Size>(
 ///
 /// One thread per node. For each node:
 ///
-/// 1. Clears the IS_NEW flag on all existing neighbours (marks old).
-/// 2. Iterates over received proposals (up to MAX_PROPOSALS).
-/// 3. Skips duplicates already in the graph.
-/// 4. Inserts improvements into the sorted list, flagged as new.
-/// 5. Atomically accumulates the total improvement count.
+/// 1. Iterates over received proposals (up to MAX_PROPOSALS).
+/// 2. Skips duplicates already in the graph.
+/// 3. Inserts improvements into the sorted list, flagged as new. Existing
+///    entries keep their flag: `local_join_shared` clears it on the ones it
+///    sampled.
+/// 4. Atomically accumulates the total improvement count.
 ///
 /// ### Params
 ///
@@ -985,7 +1030,7 @@ pub fn merge_proposals<F: Float>(
     let mut local_idx = Array::<u32>::new(k_comp);
     let mut local_dist = Array::<F>::new(k_comp);
     for j in 0..k_comp {
-        local_idx[j] = graph_idx[base + j] & pid_mask;
+        local_idx[j] = graph_idx[base + j];
         local_dist[j] = graph_dist[base + j];
     }
 
@@ -1047,6 +1092,308 @@ pub fn merge_proposals<F: Float>(
     if improvements > 0u32 {
         update_counter[0usize].fetch_add(improvements);
     }
+}
+
+/// Cube-cooperative variant of [`merge_proposals`]: one cube per node.
+///
+/// The serial merge holds the whole `build_k` row in per-thread arrays and
+/// inserts proposals one at a time, which spills once `build_k` is large. Here
+/// the row and the proposals sit in shared memory and the lanes work in
+/// parallel:
+///
+/// 1. Filter: a proposal survives if it beats the row's worst distance, is not
+///    the node itself, not already in the row, and not an earlier proposal's
+///    duplicate.
+/// 2. Rank: every row entry and every survivor computes its position in the
+///    merged order `(distance, row before proposal, proposal order)`, which is
+///    exactly where the serial strict-`<` insertion would leave it.
+/// 3. Write the first `build_k` positions back.
+///
+/// Row entries keep their is-new flag, survivors get it set. The improvement
+/// count is the number of survivors that land in the row, whereas the serial
+/// merge also counts insertions a later proposal pushed back out.
+///
+/// ### Params
+///
+/// * `graph_idx` - kNN graph indices `[n, build_k]` with the is-new flag
+/// * `graph_dist` - kNN graph distances `[n, build_k]`, sorted ascending
+/// * `prop_idx` - Proposal indices `[n, max_proposals]`
+/// * `prop_dist` - Proposal distances `[n, max_proposals]`
+/// * `prop_count` - Proposals received per node, may exceed `max_proposals`
+/// * `update_counter` - Global improvement counter `[1]`
+/// * `n` - Number of nodes
+/// * `max_proposals` - Proposal buffer capacity per node (comptime)
+/// * `k_comp` - Degree of the graph, `build_k` (comptime)
+///
+/// ### Grid mapping
+///
+/// * One cube of `WORKGROUP_SIZE_X` lanes per node
+#[cube(launch_unchecked)]
+pub fn merge_proposals_coop<F: Float>(
+    graph_idx: &mut Tensor<u32>,
+    graph_dist: &mut Tensor<F>,
+    prop_idx: &Tensor<u32>,
+    prop_dist: &Tensor<F>,
+    prop_count: &Tensor<u32>,
+    update_counter: &Tensor<Atomic<u32>>,
+    n: u32,
+    #[comptime] max_proposals: u32,
+    #[comptime] k_comp: usize,
+) {
+    let node = CUBE_POS_Y * CUBE_COUNT_X + CUBE_POS_X;
+    if node >= n {
+        terminate!();
+    }
+
+    let lane = UNIT_POS_X as usize;
+    let n_lanes = WORKGROUP_SIZE_X as usize;
+    let mp = max_proposals as usize;
+    let kr = graph_idx.shape(1);
+    let pid_mask = 0x7FFFFFFFu32;
+    let is_new_bit = 1u32 << 31;
+
+    let mut s_row_idx = SharedMemory::<u32>::new(k_comp);
+    let mut s_row_dist = SharedMemory::<F>::new(k_comp);
+    let mut s_out_idx = SharedMemory::<u32>::new(k_comp);
+    let mut s_out_dist = SharedMemory::<F>::new(k_comp);
+    let mut s_p_idx = SharedMemory::<u32>::new(mp);
+    let mut s_p_dist = SharedMemory::<F>::new(mp);
+    let mut s_keep = SharedMemory::<u32>::new(mp);
+    let mut s_lane_kept = SharedMemory::<u32>::new(WORKGROUP_SIZE_X as usize);
+
+    let base = node as usize * kr;
+    let mut p_n = prop_count[node as usize] as usize;
+    if p_n > mp {
+        p_n = mp;
+    }
+
+    let mut i = lane;
+    while i < kr {
+        s_row_idx[i] = graph_idx[base + i];
+        s_row_dist[i] = graph_dist[base + i];
+        i += n_lanes;
+    }
+    let p_base = node as usize * mp;
+    let mut p = lane;
+    while p < p_n {
+        s_p_idx[p] = prop_idx[p_base + p];
+        s_p_dist[p] = prop_dist[p_base + p];
+        p += n_lanes;
+    }
+    sync_cube();
+
+    let worst = s_row_dist[kr - 1];
+    p = lane;
+    while p < p_n {
+        let cand = s_p_idx[p];
+        let d = s_p_dist[p];
+        let mut keep: u32 = 0u32;
+        if d < worst {
+            if cand != node {
+                keep = 1u32;
+            }
+        }
+        if keep == 1u32 {
+            let mut j = 0usize;
+            while j < kr {
+                if (s_row_idx[j] & pid_mask) == cand {
+                    keep = 0u32;
+                }
+                j += 1usize;
+            }
+            let mut q = 0usize;
+            while q < p {
+                if s_p_idx[q] == cand {
+                    keep = 0u32;
+                }
+                q += 1usize;
+            }
+        }
+        s_keep[p] = keep;
+        p += n_lanes;
+    }
+    sync_cube();
+
+    // Row entries: shifted down by every survivor strictly closer.
+    let mut row_kept = 0u32;
+    i = lane;
+    while i < kr {
+        let d = s_row_dist[i];
+        let mut r = i;
+        let mut q = 0usize;
+        while q < p_n {
+            if s_keep[q] == 1u32 {
+                if s_p_dist[q] < d {
+                    r += 1usize;
+                }
+            }
+            q += 1usize;
+        }
+        if r < kr {
+            s_out_idx[r] = s_row_idx[i];
+            s_out_dist[r] = d;
+            row_kept += 1u32;
+        }
+        i += n_lanes;
+    }
+
+    // Survivors: after every row entry at or below their distance, and after
+    // every earlier survivor at the same distance.
+    p = lane;
+    while p < p_n {
+        if s_keep[p] == 1u32 {
+            let d = s_p_dist[p];
+            // Upper bound in the sorted row: count of entries `<= d`.
+            let mut lo = 0usize;
+            let mut hi = kr;
+            while lo < hi {
+                let mid = (lo + hi) / 2usize;
+                if s_row_dist[mid] <= d {
+                    lo = mid + 1usize;
+                } else {
+                    hi = mid;
+                }
+            }
+            let mut r = lo;
+            let mut q = 0usize;
+            while q < p_n {
+                if s_keep[q] == 1u32 {
+                    if s_p_dist[q] < d {
+                        r += 1usize;
+                    }
+                    if s_p_dist[q] == d {
+                        if q < p {
+                            r += 1usize;
+                        }
+                    }
+                }
+                q += 1usize;
+            }
+            if r < kr {
+                s_out_idx[r] = s_p_idx[p] | is_new_bit;
+                s_out_dist[r] = d;
+            }
+        }
+        p += n_lanes;
+    }
+    s_lane_kept[lane] = row_kept;
+    sync_cube();
+
+    i = lane;
+    while i < kr {
+        graph_idx[base + i] = s_out_idx[i];
+        graph_dist[base + i] = s_out_dist[i];
+        i += n_lanes;
+    }
+
+    if lane == 0usize {
+        let mut kept = 0u32;
+        for l in 0..WORKGROUP_SIZE_X {
+            kept += s_lane_kept[l as usize];
+        }
+        let inserted = kr as u32 - kept;
+        if inserted > 0u32 {
+            update_counter[0usize].fetch_add(inserted);
+        }
+    }
+}
+
+/// Shared-memory footprint of [`merge_proposals_coop`], in bytes.
+///
+/// Row and merged row (`build_k` ids and distances each), the proposals with
+/// their keep flags, and one counter per lane.
+///
+/// ### Params
+///
+/// * `build_k` - Degree of the graph
+/// * `max_proposals` - Proposal buffer capacity per node
+/// * `elem_bytes` - Size of the float element type in bytes
+///
+/// ### Returns
+///
+/// Bytes of shared memory one cube allocates.
+pub fn merge_coop_smem_bytes(build_k: usize, max_proposals: usize, elem_bytes: usize) -> usize {
+    2 * build_k * (4 + elem_bytes)
+        + max_proposals * (2 * 4 + elem_bytes)
+        + WORKGROUP_SIZE_X as usize * 4
+}
+
+/// Merge the proposal buffer into the graph with whichever kernel fits.
+///
+/// [`merge_proposals_coop`] when its shared memory fits the device, the serial
+/// [`merge_proposals`] otherwise.
+///
+/// ### Params
+///
+/// * `client` - GPU compute client
+/// * `limits` - Device limits from `GpuLimits::from_client`
+/// * `graph_idx` - kNN graph indices `[n, build_k]`
+/// * `graph_dist` - kNN graph distances `[n, build_k]`
+/// * `prop_idx` - Proposal indices `[n, MAX_PROPOSALS]`
+/// * `prop_dist` - Proposal distances `[n, MAX_PROPOSALS]`
+/// * `prop_count` - Proposals received per node `[n]`
+/// * `update_counter` - Global improvement counter `[1]`
+/// * `n` - Number of nodes
+/// * `build_k` - Degree of the graph
+///
+/// ### Returns
+///
+/// `Ok(())` once the launch is queued.
+#[allow(clippy::too_many_arguments)]
+pub fn launch_merge_proposals<T, R>(
+    client: &ComputeClient<R>,
+    limits: &GpuLimits,
+    graph_idx: &GpuTensor<R, u32>,
+    graph_dist: &GpuTensor<R, T>,
+    prop_idx: &GpuTensor<R, u32>,
+    prop_dist: &GpuTensor<R, T>,
+    prop_count: &GpuTensor<R, u32>,
+    update_counter: &GpuTensor<R, u32>,
+    n: usize,
+    build_k: usize,
+) -> Result<(), AnnSearchErrors>
+where
+    T: AnnSearchFloat + CubeclFloat,
+    R: Runtime,
+{
+    if merge_coop_smem_bytes(build_k, MAX_PROPOSALS, size_of::<T>()) <= limits.max_shared_bytes {
+        let (cx, cy) = grid_2d(n as u32, limits)?;
+        unsafe {
+            merge_proposals_coop::launch_unchecked::<T, R>(
+                client,
+                CubeCount::Static(cx, cy, 1),
+                CubeDim::new_2d(WORKGROUP_SIZE_X, 1),
+                graph_idx.clone().into_tensor_arg(),
+                graph_dist.clone().into_tensor_arg(),
+                prop_idx.clone().into_tensor_arg(),
+                prop_dist.clone().into_tensor_arg(),
+                prop_count.clone().into_tensor_arg(),
+                update_counter.clone().into_tensor_arg(),
+                n as u32,
+                MAX_PROPOSALS as u32,
+                build_k,
+            );
+        }
+    } else {
+        let (gx, gy) = grid_2d((n as u32).div_ceil(WORKGROUP_SIZE_X), limits)?;
+        unsafe {
+            merge_proposals::launch_unchecked::<T, R>(
+                client,
+                CubeCount::Static(gx, gy, 1),
+                CubeDim::new_2d(WORKGROUP_SIZE_X, 1),
+                graph_idx.clone().into_tensor_arg(),
+                graph_dist.clone().into_tensor_arg(),
+                prop_idx.clone().into_tensor_arg(),
+                prop_dist.clone().into_tensor_arg(),
+                prop_count.clone().into_tensor_arg(),
+                update_counter.clone().into_tensor_arg(),
+                n as u32,
+                MAX_PROPOSALS as u32,
+                build_k,
+            );
+        }
+    }
+    Ok(())
 }
 
 /// 2-hop refinement kernel.
@@ -1705,8 +2052,14 @@ where
 
         let (grid_n_x, grid_n_y) = grid_2d((n as u32).div_ceil(WORKGROUP_SIZE_X), &limits)?;
 
-        let staging =
-            plan_local_join_staging(dim_padded, build_k * 2, size_of::<T>(), use_cosine, &limits)?;
+        let staging = plan_local_join_staging(
+            dim_padded,
+            build_k * 2,
+            (2 * nnd_cand_cap(build_k) as usize).min(build_k * 2),
+            size_of::<T>(),
+            use_cosine,
+            &limits,
+        )?;
 
         // 1: random graph initialisation (baseline for NNDescent)
         if verbose {
@@ -1834,6 +2187,7 @@ where
                     n as u32,
                     rho_thresh,
                     iter_seed,
+                    nnd_cand_cap(build_k),
                     MAX_PROPOSALS as u32,
                     use_cosine,
                     dim_vec,
@@ -1849,22 +2203,18 @@ where
             }
 
             // 4. Merge proposals into the graph
-            unsafe {
-                merge_proposals::launch_unchecked::<T, R>(
-                    &client,
-                    CubeCount::Static(grid_n_x, grid_n_y, 1),
-                    CubeDim::new_2d(WORKGROUP_SIZE_X, 1),
-                    graph_idx_gpu.clone().into_tensor_arg(),
-                    graph_dist_gpu.clone().into_tensor_arg(),
-                    prop_idx_gpu.clone().into_tensor_arg(),
-                    prop_dist_gpu.clone().into_tensor_arg(),
-                    prop_count_gpu.clone().into_tensor_arg(),
-                    update_counter_gpu.clone().into_tensor_arg(),
-                    n as u32,
-                    MAX_PROPOSALS as u32,
-                    build_k,
-                );
-            }
+            launch_merge_proposals::<T, R>(
+                &client,
+                &limits,
+                &graph_idx_gpu,
+                &graph_dist_gpu,
+                &prop_idx_gpu,
+                &prop_dist_gpu,
+                &prop_count_gpu,
+                &update_counter_gpu,
+                n,
+                build_k,
+            )?;
 
             // 5. Download single u32 to check convergence
             let counter_data = update_counter_gpu.clone().read(&client)?;
@@ -1945,22 +2295,18 @@ where
                 );
             }
 
-            unsafe {
-                merge_proposals::launch_unchecked::<T, R>(
-                    &client,
-                    CubeCount::Static(grid_n_x, grid_n_y, 1),
-                    CubeDim::new_2d(WORKGROUP_SIZE_X, 1),
-                    graph_idx_gpu.clone().into_tensor_arg(),
-                    graph_dist_gpu.clone().into_tensor_arg(),
-                    prop_idx_gpu.clone().into_tensor_arg(),
-                    prop_dist_gpu.clone().into_tensor_arg(),
-                    prop_count_gpu.clone().into_tensor_arg(),
-                    update_counter_gpu.clone().into_tensor_arg(),
-                    n as u32,
-                    MAX_PROPOSALS as u32,
-                    build_k,
-                );
-            }
+            launch_merge_proposals::<T, R>(
+                &client,
+                &limits,
+                &graph_idx_gpu,
+                &graph_dist_gpu,
+                &prop_idx_gpu,
+                &prop_dist_gpu,
+                &prop_count_gpu,
+                &update_counter_gpu,
+                n,
+                build_k,
+            )?;
 
             if verbose {
                 let counter_data = update_counter_gpu.clone().read(&client)?;
@@ -2816,8 +3162,14 @@ where
 
     let (grid_n_x, grid_n_y) = grid_2d((n as u32).div_ceil(WORKGROUP_SIZE_X), limits)?;
 
-    let staging =
-        plan_local_join_staging(dim_padded, build_k * 2, size_of::<T>(), use_cosine, limits)?;
+    let staging = plan_local_join_staging(
+        dim_padded,
+        build_k * 2,
+        (2 * nnd_cand_cap(build_k) as usize).min(build_k * 2),
+        size_of::<T>(),
+        use_cosine,
+        limits,
+    )?;
 
     // ---- Random graph initialisation ----
 
@@ -2942,6 +3294,7 @@ where
                 n as u32,
                 rho_thresh,
                 iter_seed,
+                nnd_cand_cap(build_k),
                 MAX_PROPOSALS as u32,
                 use_cosine,
                 dim_vec,
@@ -2956,22 +3309,18 @@ where
             );
         }
 
-        unsafe {
-            merge_proposals::launch_unchecked::<T, R>(
-                client,
-                CubeCount::Static(grid_n_x, grid_n_y, 1),
-                CubeDim::new_2d(WORKGROUP_SIZE_X, 1),
-                graph_idx_gpu.clone().into_tensor_arg(),
-                graph_dist_gpu.clone().into_tensor_arg(),
-                prop_idx_gpu.clone().into_tensor_arg(),
-                prop_dist_gpu.clone().into_tensor_arg(),
-                prop_count_gpu.clone().into_tensor_arg(),
-                update_counter_gpu.clone().into_tensor_arg(),
-                n as u32,
-                MAX_PROPOSALS as u32,
-                build_k,
-            );
-        }
+        launch_merge_proposals::<T, R>(
+            client,
+            limits,
+            &graph_idx_gpu,
+            &graph_dist_gpu,
+            &prop_idx_gpu,
+            &prop_dist_gpu,
+            &prop_count_gpu,
+            &update_counter_gpu,
+            n,
+            build_k,
+        )?;
 
         let counter_data = update_counter_gpu.clone().read(client)?;
         let updates = counter_data[0] as f64;
@@ -3088,6 +3437,27 @@ where
 ///////////
 // Tests //
 ///////////
+
+#[cfg(test)]
+mod merge_budget_tests {
+    use super::*;
+
+    #[test]
+    fn test_merge_coop_smem_counts_every_allocation() {
+        // Row and merged row (u32 + f32 each), proposals (u32 + f32 + keep
+        // flag), one u32 per lane.
+        let expected = 2 * 150 * 8 + MAX_PROPOSALS * 12 + WORKGROUP_SIZE_X as usize * 4;
+        assert_eq!(merge_coop_smem_bytes(150, MAX_PROPOSALS, 4), expected);
+    }
+
+    #[test]
+    fn test_merge_coop_fits_at_large_k_and_hands_off_past_the_budget() {
+        // k = 100 at the default 1.5x working degree fits a 16 KiB device.
+        assert!(merge_coop_smem_bytes(150, MAX_PROPOSALS, 4) <= 16 * 1024);
+        // A degree whose row alone exceeds 32 KiB must fall to the serial arm.
+        assert!(merge_coop_smem_bytes(1500, MAX_PROPOSALS, 8) > 32 * 1024);
+    }
+}
 
 #[cfg(test)]
 mod pair_coverage_tests {
@@ -3953,8 +4323,15 @@ mod kernel_tests {
 
         let rho_thresh = 65535u32; // rho=1.0, accept all pairs
 
-        let staging =
-            plan_local_join_staging(dim, build_k * 2, size_of::<f32>(), true, &limits).unwrap();
+        let staging = plan_local_join_staging(
+            dim,
+            build_k * 2,
+            build_k * 2,
+            size_of::<f32>(),
+            true,
+            &limits,
+        )
+        .unwrap();
 
         unsafe {
             local_join_shared::launch_unchecked::<f32, WgpuRuntime>(
@@ -3974,6 +4351,7 @@ mod kernel_tests {
                 n as u32,
                 rho_thresh,
                 42u32,
+                (2 * build_k) as u32,
                 MAX_PROPOSALS as u32,
                 true, // use_cosine
                 dim_vec,
@@ -4702,8 +5080,15 @@ mod kernel_tests {
         let line: usize = LINE_SIZE;
         let dim_vec = dim / line;
 
-        let staging =
-            plan_local_join_staging(dim, build_k * 2, size_of::<f32>(), false, &limits).unwrap();
+        let staging = plan_local_join_staging(
+            dim,
+            build_k * 2,
+            build_k * 2,
+            size_of::<f32>(),
+            false,
+            &limits,
+        )
+        .unwrap();
         assert!(
             !staging.single_block,
             "n={n} dim={dim} build_k={build_k} did not force the blocked path; \
@@ -4782,6 +5167,7 @@ mod kernel_tests {
                 n as u32,
                 65535u32,
                 42u32,
+                (2 * build_k) as u32,
                 MAX_PROPOSALS as u32,
                 false,
                 dim_vec,
