@@ -248,12 +248,16 @@ where
             .collect();
 
         let mut sign_codes = vec![0u8; n * n_bytes];
-        let mut ex_codes = vec![0u8; n * ex_bytes];
+        // At `ex_bits` 0 an empty buffer yields no chunks, and the zip below
+        // would then run zero iterations and encode nothing. A one-byte stride
+        // keeps one chunk per vertex; the placeholder is dropped afterwards.
+        let ex_stride = ex_bytes.max(1);
+        let mut ex_codes = vec![0u8; n * ex_stride];
         let mut factors = vec![T::zero(); n * FACTORS_PER_VERTEX];
 
         sign_codes
             .par_chunks_mut(n_bytes)
-            .zip(ex_codes.par_chunks_mut(ex_bytes.max(1)))
+            .zip(ex_codes.par_chunks_mut(ex_stride))
             .zip(factors.par_chunks_mut(FACTORS_PER_VERTEX))
             .enumerate()
             .try_for_each(
@@ -276,6 +280,9 @@ where
                     Ok(())
                 },
             )?;
+        if ex_bytes == 0 {
+            ex_codes = Vec::new();
+        }
 
         Ok(Self {
             encoder,
