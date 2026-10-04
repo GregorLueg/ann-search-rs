@@ -1496,6 +1496,211 @@ pub fn compute_ivf_mega_cosine_cached<F: Float, N: Size>(
     out_indices[out_offset] = real_db_idx;
 }
 
+/// Fields per entry of the IVF tile list: first task, task count, cluster
+/// start in the reorganised DB, offset of the tile within the cluster, and the
+/// tile's DB count.
+pub const IVF_TILE_FIELDS: usize = 5;
+
+/// Register-tiled IVF distance kernel over a cluster-major tile list
+///
+/// Each cube owns one tile: up to `size_y` tasks that all probe the same
+/// cluster, against up to `WORKGROUP_SIZE_X * tile_d` of that cluster's
+/// points. The tasks' query rows are staged a reduction block at a time, as in
+/// `euclidean_tiled_reg`, and every thread computes a `tile_q x tile_d` block.
+/// The tile list is built on the host from the task list's cluster grouping,
+/// so the grid is sized by the real work rather than by the largest cluster.
+///
+/// Accumulation runs over lines then lanes in ascending order, the same order
+/// as the per-task mega kernels, so the distances are bit-identical to theirs.
+///
+/// ### Params
+///
+/// * `query_vectors` - Query vectors `[n_queries, dim / N]` as `Vector<F, N>`
+/// * `db_vectors` - Reorganised DB vectors `[n_db, dim / N]` as `Vector<F, N>`
+/// * `query_norms` - Query L2 norms `[n_queries]`; read only under cosine
+/// * `db_norms` - DB L2 norms `[n_db]`; read only under cosine
+/// * `task_q_idx` - Query index per task `[n_tasks]`, grouped by cluster
+/// * `task_write_offset` - Start of the task's cluster in its query's candidate
+///   row `[n_tasks]`
+/// * `tiles` - Tile list `[n_tiles * IVF_TILE_FIELDS]`
+/// * `out_dists` - Candidate distances `[n_queries, out_stride]`
+/// * `out_indices` - Candidate DB indices `[n_queries, out_stride]`
+/// * `out_stride` - Row stride of the candidate buffers
+/// * `n_tiles` - Number of tiles
+/// * `dim_lines` - `Vector<F, N>` elements per row (comptime)
+/// * `size_y` - Tasks per tile (comptime). Must be divisible by `tile_q`
+/// * `tile_d` - DB vectors per thread (comptime)
+/// * `tile_q` - Tasks per thread (comptime)
+/// * `kb_lines` - Reduction lines staged per block (comptime). Must divide
+///   `dim_lines` exactly
+/// * `use_cosine` - Cosine instead of squared Euclidean (comptime)
+///
+/// ### Grid mapping
+///
+/// * `CUBE_POS_Y * CUBE_COUNT_X + CUBE_POS_X` -> tile index
+/// * `UNIT_POS_X` -> lane over the tile's DB vectors
+/// * `UNIT_POS_Y` -> block of `tile_q` tasks within the tile
+#[cube(launch_unchecked)]
+pub fn ivf_tiled<F: Float, N: Size>(
+    query_vectors: &Tensor<Vector<F, N>>,
+    db_vectors: &Tensor<Vector<F, N>>,
+    query_norms: &Tensor<F>,
+    db_norms: &Tensor<F>,
+    task_q_idx: &Tensor<u32>,
+    task_write_offset: &Tensor<u32>,
+    tiles: &Tensor<u32>,
+    out_dists: &mut Tensor<F>,
+    out_indices: &mut Tensor<u32>,
+    out_stride: u32,
+    n_tiles: u32,
+    #[comptime] dim_lines: usize,
+    #[comptime] size_y: u32,
+    #[comptime] tile_d: usize,
+    #[comptime] tile_q: usize,
+    #[comptime] kb_lines: usize,
+    #[comptime] use_cosine: bool,
+) {
+    let tile = CUBE_POS_Y * CUBE_COUNT_X + CUBE_POS_X;
+    if tile >= n_tiles {
+        terminate!();
+    }
+
+    let lanes = LINE_SIZE;
+    let kb_scalars = kb_lines * lanes;
+    let n_blocks = dim_lines / kb_lines;
+    let wg_y = size_y as usize;
+    let local_x = UNIT_POS_X as usize;
+    let local_y = UNIT_POS_Y as usize;
+
+    let tb = tile as usize * IVF_TILE_FIELDS;
+    let task_start = tiles[tb] as usize;
+    let n_t = tiles[tb + 1] as usize;
+    let cluster_start = tiles[tb + 2] as usize;
+    let db_off = tiles[tb + 3] as usize;
+    let n_db = tiles[tb + 4] as usize;
+
+    // Scalar shared memory only (vectorised shared mem silently broadcasts lane 0)
+    let mut s_query = SharedMemory::<F>::new(wg_y * kb_scalars);
+    let mut s_q = SharedMemory::<u32>::new(wg_y);
+    let mut s_wo = SharedMemory::<u32>::new(wg_y);
+    let mut s_qn = SharedMemory::<F>::new(wg_y);
+
+    let mut acc = Array::<F>::new(tile_q * tile_d);
+    let mut d_scalars = Array::<F>::new(tile_d * lanes);
+
+    let threads_y = wg_y / tile_q;
+    let thread_id = local_y * WORKGROUP_SIZE_X as usize + local_x;
+    let total_threads = WORKGROUP_SIZE_X as usize * threads_y;
+    let total_elems = wg_y * kb_scalars;
+
+    let mut r_meta = thread_id;
+    while r_meta < wg_y {
+        let mut q = 0u32;
+        let mut wo = 0u32;
+        let mut qn = F::new(1.0_f32);
+        if r_meta < n_t {
+            q = task_q_idx[task_start + r_meta];
+            wo = task_write_offset[task_start + r_meta];
+            if use_cosine {
+                qn = query_norms[q as usize];
+            }
+        }
+        s_q[r_meta] = q;
+        s_wo[r_meta] = wo;
+        s_qn[r_meta] = qn;
+        r_meta += total_threads;
+    }
+    sync_cube();
+
+    #[unroll]
+    for a in 0..tile_q * tile_d {
+        acc[a] = F::new(0.0_f32);
+    }
+
+    let q_row_base = local_y * tile_q;
+
+    for b in 0..n_blocks {
+        let kb_base = b * kb_lines;
+
+        let mut load_idx = thread_id;
+        while load_idx < total_elems {
+            let q_local = load_idx / kb_scalars;
+            let elem = load_idx % kb_scalars;
+            if q_local < n_t {
+                let line_val =
+                    query_vectors[s_q[q_local] as usize * dim_lines + kb_base + elem / lanes];
+                s_query[load_idx] = line_val[elem % lanes];
+            } else {
+                s_query[load_idx] = F::new(0.0_f32);
+            }
+            load_idx += total_threads;
+        }
+        sync_cube();
+
+        for j in 0..kb_lines {
+            let i = kb_base + j;
+            #[unroll]
+            for r in 0..tile_d {
+                let d_local = local_x + r * WORKGROUP_SIZE_X as usize;
+                // Clamp out-of-range rows to the tile's first row; the result
+                // is masked on write.
+                let mut idx = (cluster_start + db_off) * dim_lines + i;
+                if d_local < n_db {
+                    idx = (cluster_start + db_off + d_local) * dim_lines + i;
+                }
+                let line_val = db_vectors[idx];
+                #[unroll]
+                for lane in 0..lanes {
+                    d_scalars[r * lanes + lane] = line_val[lane];
+                }
+            }
+
+            #[unroll]
+            for t in 0..tile_q {
+                let s_off = (q_row_base + t) * kb_scalars + j * lanes;
+                #[unroll]
+                for lane in 0..lanes {
+                    let qv = s_query[s_off + lane];
+                    #[unroll]
+                    for r in 0..tile_d {
+                        if use_cosine {
+                            acc[t * tile_d + r] += qv * d_scalars[r * lanes + lane];
+                        } else {
+                            let diff = qv - d_scalars[r * lanes + lane];
+                            acc[t * tile_d + r] += diff * diff;
+                        }
+                    }
+                }
+            }
+        }
+        if comptime!(n_blocks > 1) {
+            sync_cube();
+        }
+    }
+
+    #[unroll]
+    for t in 0..tile_q {
+        let q_local = q_row_base + t;
+        #[unroll]
+        for r in 0..tile_d {
+            let d_local = local_x + r * WORKGROUP_SIZE_X as usize;
+            if q_local < n_t && d_local < n_db {
+                let db_idx = cluster_start + db_off + d_local;
+                let pos = s_q[q_local] as usize * out_stride as usize
+                    + s_wo[q_local] as usize
+                    + db_off
+                    + d_local;
+                let mut dist = acc[t * tile_d + r];
+                if use_cosine {
+                    dist = F::new(1.0_f32) - (dist / (s_qn[q_local] * db_norms[db_idx]));
+                }
+                out_dists[pos] = dist;
+                out_indices[pos] = db_idx as u32;
+            }
+        }
+    }
+}
+
 ///////////
 // Tests //
 ///////////

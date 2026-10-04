@@ -914,6 +914,7 @@ where
         if n_tasks == 0 {
             return Ok((vec![vec![]; n_queries], vec![vec![]; n_queries]));
         }
+        let cluster_task_start = cursor.clone();
 
         let mut cpu_write_pointers = vec![0u32; n_queries];
         let mut max_db_count = 0u32;
@@ -970,59 +971,135 @@ where
         let task_db_count_gpu =
             GpuTensor::<R, u32>::from_slice(&task_db_count, vec![n_tasks], client)?;
 
-        let mega_grid_x = max_db_count.div_ceil(WORKGROUP_SIZE_X).max(1);
-        let (mega_grid_y, mega_grid_z) =
-            grid_2d((n_tasks as u32).div_ceil(safe_worksize_y), &limits)?;
-        let mega_count = checked_cube_count(
-            "compute_ivf_mega_cached",
-            mega_grid_x,
-            mega_grid_y,
-            mega_grid_z,
-            &limits,
-        )?;
+        // Cluster-major tiled path: the tasks probing one cluster share its DB
+        // slab, so they are blocked into tiles of `wg_y` tasks by
+        // `WORKGROUP_SIZE_X * TILE_D` points and register-tiled like the
+        // exhaustive kernel. The per-task mega kernels below are the fallback.
+        let tiled_plan =
+            plan_exhaustive_staging(self.dim_padded, size_of::<T>(), &limits).filter(|p| {
+                ivf_tiled_smem_bytes(p.wg_y, p.kb_lines, size_of::<T>()) <= limits.max_shared_bytes
+            });
+        if let Some(plan) = tiled_plan {
+            let tile_w = WORKGROUP_SIZE_X as usize * TILE_D;
+            let wg_y = plan.wg_y as usize;
+            let mut tiles: Vec<u32> = Vec::new();
+            for c in 0..self.nlist {
+                let t0 = cluster_task_start[c] as usize;
+                let t1 = cursor[c] as usize;
+                let c_start = self.cluster_offsets[c];
+                let c_count = self.cluster_offsets[c + 1] - c_start;
+                let mut t = t0;
+                while t < t1 {
+                    let n_t = wg_y.min(t1 - t);
+                    let mut off = 0usize;
+                    while off < c_count {
+                        let n_db = tile_w.min(c_count - off);
+                        tiles.extend_from_slice(&[
+                            t as u32,
+                            n_t as u32,
+                            c_start as u32,
+                            off as u32,
+                            n_db as u32,
+                        ]);
+                        off += tile_w;
+                    }
+                    t += wg_y;
+                }
+            }
+            let n_tiles = tiles.len() / IVF_TILE_FIELDS;
+            let tiles_gpu = GpuTensor::<R, u32>::from_slice(&tiles, vec![tiles.len()], client)?;
+            let (tile_gx, tile_gy) = grid_2d(n_tiles as u32, &limits)?;
+            let use_cosine = self.metric == Dist::Cosine;
+            // Euclidean never reads the norms; bind a one-element placeholder.
+            let no_norms = GpuTensor::<R, T>::from_slice(&[T::one()], vec![1], client)?;
+            let (q_norms, d_norms) = if use_cosine {
+                (
+                    query_norms_gpu.as_ref().unwrap(),
+                    self.norms_gpu.as_ref().unwrap(),
+                )
+            } else {
+                (&no_norms, &no_norms)
+            };
+            unsafe {
+                ivf_tiled::launch_unchecked::<T, R>(
+                    client,
+                    CubeCount::Static(tile_gx, tile_gy, 1),
+                    CubeDim::new_2d(WORKGROUP_SIZE_X, plan.wg_y / TILE_Q as u32),
+                    vec_size,
+                    queries_gpu.clone().into_tensor_arg(),
+                    self.vectors_gpu.clone().into_tensor_arg(),
+                    q_norms.clone().into_tensor_arg(),
+                    d_norms.clone().into_tensor_arg(),
+                    task_q_idx_gpu.into_tensor_arg(),
+                    task_write_offset_gpu.into_tensor_arg(),
+                    tiles_gpu.into_tensor_arg(),
+                    candidate_dists_gpu.clone().into_tensor_arg(),
+                    candidate_indices_gpu.clone().into_tensor_arg(),
+                    max_candidates as u32,
+                    n_tiles as u32,
+                    dim_lines,
+                    plan.wg_y,
+                    TILE_D,
+                    TILE_Q,
+                    plan.kb_lines,
+                    use_cosine,
+                );
+            }
+        } else {
+            let mega_grid_x = max_db_count.div_ceil(WORKGROUP_SIZE_X).max(1);
+            let (mega_grid_y, mega_grid_z) =
+                grid_2d((n_tasks as u32).div_ceil(safe_worksize_y), &limits)?;
+            let mega_count = checked_cube_count(
+                "compute_ivf_mega_cached",
+                mega_grid_x,
+                mega_grid_y,
+                mega_grid_z,
+                &limits,
+            )?;
 
-        match self.metric {
-            Dist::SquaredEuclidean => unsafe {
-                compute_ivf_mega_euclidean_cached::launch_unchecked::<T, R>(
-                    client,
-                    mega_count.clone(),
-                    CubeDim::new_2d(WORKGROUP_SIZE_X, safe_worksize_y),
-                    vec_size,
-                    queries_gpu.clone().into_tensor_arg(),
-                    self.vectors_gpu.clone().into_tensor_arg(),
-                    task_q_idx_gpu.into_tensor_arg(),
-                    task_db_start_gpu.into_tensor_arg(),
-                    task_write_offset_gpu.into_tensor_arg(),
-                    task_db_count_gpu.into_tensor_arg(),
-                    candidate_dists_gpu.clone().into_tensor_arg(),
-                    candidate_indices_gpu.clone().into_tensor_arg(),
-                    n_tasks as u32,
-                    dim_lines,
-                    safe_worksize_y,
-                );
-            },
-            Dist::Cosine => unsafe {
-                compute_ivf_mega_cosine_cached::launch_unchecked::<T, R>(
-                    client,
-                    mega_count.clone(),
-                    CubeDim::new_2d(WORKGROUP_SIZE_X, safe_worksize_y),
-                    vec_size,
-                    queries_gpu.clone().into_tensor_arg(),
-                    self.vectors_gpu.clone().into_tensor_arg(),
-                    query_norms_gpu.as_ref().unwrap().clone().into_tensor_arg(),
-                    self.norms_gpu.as_ref().unwrap().clone().into_tensor_arg(),
-                    task_q_idx_gpu.into_tensor_arg(),
-                    task_db_start_gpu.into_tensor_arg(),
-                    task_write_offset_gpu.into_tensor_arg(),
-                    task_db_count_gpu.into_tensor_arg(),
-                    candidate_dists_gpu.clone().into_tensor_arg(),
-                    candidate_indices_gpu.clone().into_tensor_arg(),
-                    n_tasks as u32,
-                    dim_lines,
-                    safe_worksize_y,
-                );
-            },
-            Dist::Manhattan => unreachable!(),
+            match self.metric {
+                Dist::SquaredEuclidean => unsafe {
+                    compute_ivf_mega_euclidean_cached::launch_unchecked::<T, R>(
+                        client,
+                        mega_count.clone(),
+                        CubeDim::new_2d(WORKGROUP_SIZE_X, safe_worksize_y),
+                        vec_size,
+                        queries_gpu.clone().into_tensor_arg(),
+                        self.vectors_gpu.clone().into_tensor_arg(),
+                        task_q_idx_gpu.into_tensor_arg(),
+                        task_db_start_gpu.into_tensor_arg(),
+                        task_write_offset_gpu.into_tensor_arg(),
+                        task_db_count_gpu.into_tensor_arg(),
+                        candidate_dists_gpu.clone().into_tensor_arg(),
+                        candidate_indices_gpu.clone().into_tensor_arg(),
+                        n_tasks as u32,
+                        dim_lines,
+                        safe_worksize_y,
+                    );
+                },
+                Dist::Cosine => unsafe {
+                    compute_ivf_mega_cosine_cached::launch_unchecked::<T, R>(
+                        client,
+                        mega_count.clone(),
+                        CubeDim::new_2d(WORKGROUP_SIZE_X, safe_worksize_y),
+                        vec_size,
+                        queries_gpu.clone().into_tensor_arg(),
+                        self.vectors_gpu.clone().into_tensor_arg(),
+                        query_norms_gpu.as_ref().unwrap().clone().into_tensor_arg(),
+                        self.norms_gpu.as_ref().unwrap().clone().into_tensor_arg(),
+                        task_q_idx_gpu.into_tensor_arg(),
+                        task_db_start_gpu.into_tensor_arg(),
+                        task_write_offset_gpu.into_tensor_arg(),
+                        task_db_count_gpu.into_tensor_arg(),
+                        candidate_dists_gpu.clone().into_tensor_arg(),
+                        candidate_indices_gpu.clone().into_tensor_arg(),
+                        n_tasks as u32,
+                        dim_lines,
+                        safe_worksize_y,
+                    );
+                },
+                Dist::Manhattan => unreachable!(),
+            }
         }
 
         let topk_dists = GpuTensor::<R, T>::empty(vec![n_queries, k], client)?;
