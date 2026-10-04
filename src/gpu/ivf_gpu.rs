@@ -725,6 +725,7 @@ where
                     self.centroids_gpu.clone().into_tensor_arg(),
                     centroid_dists_gpu.clone().into_tensor_arg(),
                     0u32,
+                    0u32,
                     self.nlist as u32,
                     n_queries as u32,
                     self.nlist as u32,
@@ -753,6 +754,7 @@ where
                         .clone()
                         .into_tensor_arg(),
                     centroid_dists_gpu.clone().into_tensor_arg(),
+                    0u32,
                     0u32,
                     self.nlist as u32,
                     n_queries as u32,
