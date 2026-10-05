@@ -979,12 +979,12 @@ where
         launch_merge_proposals::<T, R>(
             client,
             &limits,
-            &graph_idx_gpu,
-            &graph_dist_gpu,
-            &prop_idx_gpu,
-            &prop_dist_gpu,
-            &prop_count_gpu,
-            &update_counter_gpu,
+            graph_idx_gpu,
+            graph_dist_gpu,
+            prop_idx_gpu,
+            prop_dist_gpu,
+            prop_count_gpu,
+            update_counter_gpu,
             n,
             graph_idx_gpu.shape()[1],
         )?;

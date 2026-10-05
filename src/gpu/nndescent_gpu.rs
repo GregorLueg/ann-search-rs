@@ -1188,10 +1188,8 @@ pub fn merge_proposals_coop<F: Float>(
         let cand = s_p_idx[p];
         let d = s_p_dist[p];
         let mut keep: u32 = 0u32;
-        if d < worst {
-            if cand != node {
-                keep = 1u32;
-            }
+        if d < worst && cand != node {
+            keep = 1u32;
         }
         if keep == 1u32 {
             let mut j = 0usize;
@@ -1222,10 +1220,8 @@ pub fn merge_proposals_coop<F: Float>(
         let mut r = i;
         let mut q = 0usize;
         while q < p_n {
-            if s_keep[q] == 1u32 {
-                if s_p_dist[q] < d {
-                    r += 1usize;
-                }
+            if s_keep[q] == 1u32 && s_p_dist[q] < d {
+                r += 1usize;
             }
             q += 1usize;
         }
@@ -1261,10 +1257,8 @@ pub fn merge_proposals_coop<F: Float>(
                     if s_p_dist[q] < d {
                         r += 1usize;
                     }
-                    if s_p_dist[q] == d {
-                        if q < p {
-                            r += 1usize;
-                        }
+                    if s_p_dist[q] == d && q < p {
+                        r += 1usize;
                     }
                 }
                 q += 1usize;

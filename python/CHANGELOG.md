@@ -3,6 +3,13 @@
 Changes to the `ann-search` Python package. The Rust crate it wraps,
 `ann-search-rs`, has its own changelog at [`../CHANGELOG.md`](../CHANGELOG.md).
 
+## 0.3.3
+
+Requires `ann-search-rs` 0.9.4
+
+- Improved speed across all GPU-based indices
+- Improved query speed + bug fix for HNSW RaBitQ at `ex_bit = 0`.
+
 ## 0.3.2
 
 Requires `ann-search-rs` 0.9.3
