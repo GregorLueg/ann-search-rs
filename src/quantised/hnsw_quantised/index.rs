@@ -196,7 +196,11 @@ where
                 let mut top = BoundedMaxHeap::new(k.max(1));
                 self.search_base_layer_two_tier(&encoded, entry, ef, &mut top, state);
                 top.sort();
-                let distances = top.dists().iter().map(|&d| self.codec.finalise(d)).collect();
+                let distances = top
+                    .dists()
+                    .iter()
+                    .map(|&d| self.codec.finalise(d))
+                    .collect();
                 return Ok((top.ids().to_vec(), distances));
             }
 
