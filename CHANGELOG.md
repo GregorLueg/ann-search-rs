@@ -3,7 +3,7 @@
 Changes to the `ann-search-rs` crate. The Python package `ann-search` has its
 own changelog at [`python/CHANGELOG.md`](python/CHANGELOG.md).
 
-## 0.9.4
+## 0.10.0
 
 **Performance**
 
@@ -19,7 +19,8 @@ own changelog at [`python/CHANGELOG.md`](python/CHANGELOG.md).
 
 **Breaking changes**
 
-- Save format has been bumped from version 4 to version 5.
+- Save format has been bumped from version 4 to version 5. Older indices will
+  error now upon load.
 
 ## 0.9.3
 
