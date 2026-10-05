@@ -220,8 +220,8 @@ pub fn exh_smem_bytes(wg_y: u32, kb_lines: usize, elem_bytes: usize) -> usize {
 
 /// Per-cube shared-memory footprint of the cluster-major IVF tiled kernel.
 ///
-/// The exhaustive staging plus, per staged task, its query id, its write
-/// offset and its query norm.
+/// The same query staging as the exhaustive kernels; per-task metadata is read
+/// from global memory, not staged.
 ///
 /// ### Params
 ///
@@ -233,7 +233,7 @@ pub fn exh_smem_bytes(wg_y: u32, kb_lines: usize, elem_bytes: usize) -> usize {
 ///
 /// Bytes of shared memory one cube allocates.
 pub fn ivf_tiled_smem_bytes(wg_y: u32, kb_lines: usize, elem_bytes: usize) -> usize {
-    exh_smem_bytes(wg_y, kb_lines, elem_bytes) + wg_y as usize * (2 * 4 + elem_bytes)
+    exh_smem_bytes(wg_y, kb_lines, elem_bytes)
 }
 
 /// Plan the query staging for the register-tiled exhaustive kernels.
@@ -788,14 +788,7 @@ mod tests {
     }
 
     #[test]
-    fn test_ivf_tiled_footprint_counts_the_task_metadata() {
-        // Query id, write offset and norm per staged task, on top of the
-        // exhaustive staging.
-        let base = exh_smem_bytes(EXH_WG_Y, EXH_K_BLOCK, 4);
-        assert_eq!(
-            ivf_tiled_smem_bytes(EXH_WG_Y, EXH_K_BLOCK, 4),
-            base + EXH_WG_Y as usize * 12
-        );
+    fn test_ivf_tiled_footprint_fits_the_exhaustive_plan() {
         let plan = plan_exhaustive_staging(128, 4, &apple()).unwrap();
         assert!(ivf_tiled_smem_bytes(plan.wg_y, plan.kb_lines, 4) <= apple().max_shared_bytes);
     }

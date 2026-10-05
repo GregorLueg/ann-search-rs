@@ -1581,10 +1581,6 @@ pub fn ivf_tiled<F: Float, N: Size>(
 
     // Scalar shared memory only (vectorised shared mem silently broadcasts lane 0)
     let mut s_query = SharedMemory::<F>::new(wg_y * kb_scalars);
-    let mut s_q = SharedMemory::<u32>::new(wg_y);
-    let mut s_wo = SharedMemory::<u32>::new(wg_y);
-    let mut s_qn = SharedMemory::<F>::new(wg_y);
-
     let mut acc = Array::<F>::new(tile_q * tile_d);
     let mut d_scalars = Array::<F>::new(tile_d * lanes);
 
@@ -1592,25 +1588,6 @@ pub fn ivf_tiled<F: Float, N: Size>(
     let thread_id = local_y * WORKGROUP_SIZE_X as usize + local_x;
     let total_threads = WORKGROUP_SIZE_X as usize * threads_y;
     let total_elems = wg_y * kb_scalars;
-
-    let mut r_meta = thread_id;
-    while r_meta < wg_y {
-        let mut q = 0u32;
-        let mut wo = 0u32;
-        let mut qn = F::new(1.0_f32);
-        if r_meta < n_t {
-            q = task_q_idx[task_start + r_meta];
-            wo = task_write_offset[task_start + r_meta];
-            if use_cosine {
-                qn = query_norms[q as usize];
-            }
-        }
-        s_q[r_meta] = q;
-        s_wo[r_meta] = wo;
-        s_qn[r_meta] = qn;
-        r_meta += total_threads;
-    }
-    sync_cube();
 
     #[unroll]
     for a in 0..tile_q * tile_d {
@@ -1627,8 +1604,8 @@ pub fn ivf_tiled<F: Float, N: Size>(
             let q_local = load_idx / kb_scalars;
             let elem = load_idx % kb_scalars;
             if q_local < n_t {
-                let line_val =
-                    query_vectors[s_q[q_local] as usize * dim_lines + kb_base + elem / lanes];
+                let q = task_q_idx[task_start + q_local] as usize;
+                let line_val = query_vectors[q * dim_lines + kb_base + elem / lanes];
                 s_query[load_idx] = line_val[elem % lanes];
             } else {
                 s_query[load_idx] = F::new(0.0_f32);
@@ -1684,18 +1661,25 @@ pub fn ivf_tiled<F: Float, N: Size>(
         #[unroll]
         for r in 0..tile_d {
             let d_local = local_x + r * WORKGROUP_SIZE_X as usize;
-            if q_local < n_t && d_local < n_db {
-                let db_idx = cluster_start + db_off + d_local;
-                let pos = s_q[q_local] as usize * out_stride as usize
-                    + s_wo[q_local] as usize
-                    + db_off
-                    + d_local;
-                let mut dist = acc[t * tile_d + r];
-                if use_cosine {
-                    dist = F::new(1.0_f32) - (dist / (s_qn[q_local] * db_norms[db_idx]));
+            // Nested rather than `&&`: compound conditions miscompile, see the
+            // codegen rules in the `nndescent_gpu` module header. The `&&`
+            // form dropped single lanes' writes on the CPU runtime.
+            if q_local < n_t {
+                if d_local < n_db {
+                    let task = task_start + q_local;
+                    let q = task_q_idx[task] as usize;
+                    let db_idx = cluster_start + db_off + d_local;
+                    let pos = q * out_stride as usize
+                        + task_write_offset[task] as usize
+                        + db_off
+                        + d_local;
+                    let mut dist = acc[t * tile_d + r];
+                    if use_cosine {
+                        dist = F::new(1.0_f32) - (dist / (query_norms[q] * db_norms[db_idx]));
+                    }
+                    out_dists[pos] = dist;
+                    out_indices[pos] = db_idx as u32;
                 }
-                out_dists[pos] = dist;
-                out_indices[pos] = db_idx as u32;
             }
         }
     }
