@@ -20,6 +20,7 @@ use crate::quantised::hnsw_quantised::flat_graph::*;
 use crate::quantised::sq8u_codec::*;
 use crate::quantised::uniform_quant::*;
 use crate::utils::graph_utils::*;
+use crate::utils::heap_structs::BoundedMaxHeap;
 use crate::utils::pack_knn_results;
 
 ////////////////////////
@@ -186,12 +187,28 @@ where
 
         T::with_search_state(|state| {
             state.reset(self.n);
+            let ef = ef_search.max(k).max(1);
+
+            if self.codec.two_tier() {
+                let entry = self
+                    .hierarchy
+                    .descend(|id| OrderedFloat(self.codec.score_coarse(&encoded, id).0));
+                let mut top = BoundedMaxHeap::new(k.max(1));
+                self.search_base_layer_two_tier(&encoded, entry, ef, &mut top, state);
+                top.sort();
+                let distances = top
+                    .dists()
+                    .iter()
+                    .map(|&d| self.codec.finalise(d))
+                    .collect();
+                return Ok((top.ids().to_vec(), distances));
+            }
 
             let entry = self
                 .hierarchy
                 .descend(|id| OrderedFloat(self.codec.score(&encoded, id)));
 
-            self.search_base_layer(&encoded, entry, ef_search.max(k).max(1), state);
+            self.search_base_layer(&encoded, entry, ef, state);
 
             state.results.sort();
             let (dists, ids) = (state.results.dists(), state.results.ids());
@@ -205,6 +222,76 @@ where
 
             Ok((indices, distances))
         })
+    }
+
+    /// Two-tier beam search over the base layer, after the RaBitQ reference.
+    ///
+    /// The beam (`state.results`, `ef` wide) is steered by the coarse score.
+    /// The full score is paid only when the coarse lower bound beats the
+    /// current k-th result, or while fewer than `k` results exist, and then
+    /// replaces the coarse score as that vertex's beam key. `top` keeps the `k`
+    /// best full scores and is the answer.
+    ///
+    /// ### Params
+    ///
+    /// * `encoded` - Prepared query
+    /// * `entry_node` - Starting node from the hierarchy descent
+    /// * `ef` - Beam width
+    /// * `top` - Result heap, sized to `k`
+    /// * `state` - Reusable search state, already reset
+    fn search_base_layer_two_tier(
+        &self,
+        encoded: &C::Query,
+        entry_node: usize,
+        ef: usize,
+        top: &mut BoundedMaxHeap<T>,
+        state: &mut SearchState<T>,
+    ) {
+        state.results.reset(ef);
+        state.candidates.clear();
+
+        let entry_dist = self.codec.score(encoded, entry_node);
+        state.mark_visited(entry_node);
+        state
+            .candidates
+            .push(Reverse((OrderedFloat(entry_dist), entry_node)));
+        state.results.push(entry_dist, entry_node);
+        top.push(entry_dist, entry_node);
+
+        let mut furthest = state.results.threshold();
+        let mut kth = top.threshold();
+
+        while let Some(Reverse((current_dist, current_id))) = state.candidates.pop() {
+            if current_dist.0 > furthest {
+                break;
+            }
+
+            for &neighbour in self.graph.neighbours(current_id) {
+                if neighbour == u32::MAX {
+                    break;
+                }
+                let neighbour_id = neighbour as usize;
+
+                if state.is_visited(neighbour_id) {
+                    continue;
+                }
+                state.mark_visited(neighbour_id);
+
+                let (mut d, low) = self.codec.score_coarse(encoded, neighbour_id);
+                if low < kth {
+                    d = self.codec.score(encoded, neighbour_id);
+                    top.push(d, neighbour_id);
+                    kth = top.threshold();
+                }
+                if d < furthest {
+                    state
+                        .candidates
+                        .push(Reverse((OrderedFloat(d), neighbour_id)));
+                    state.results.push(d, neighbour_id);
+                    furthest = state.results.threshold();
+                }
+            }
+        }
     }
 
     /// Beam search over the dense base layer.

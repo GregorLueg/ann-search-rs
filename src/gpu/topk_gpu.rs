@@ -2120,6 +2120,8 @@ mod gpu_smoke {
                         oi.clone().into_tensor_arg(),
                         start as u32,
                         this as u32,
+                        this as u32,
+                        1u32,
                         k as u32,
                         k,
                     );

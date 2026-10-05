@@ -3,6 +3,25 @@
 Changes to the `ann-search-rs` crate. The Python package `ann-search` has its
 own changelog at [`python/CHANGELOG.md`](python/CHANGELOG.md).
 
+## 0.10.0
+
+**Performance**
+
+- Improved speed on the GPU indices across the board. Exhaustive is pending
+  dimensions 1.5 to 2x faster, IVF is ~40% faster, NNDescent scales better to
+  large k.
+- Substantially faster query path on HNSW RaBitQ (related to the bug below).
+
+**Fix**
+
+- HNSW-RaBitQ ex_bits = 0 was buggy. The loop zipped over empty buffers. These
+  are now properly initialised.
+
+**Breaking changes**
+
+- Save format has been bumped from version 4 to version 5. Older indices will
+  error now upon load.
+
 ## 0.9.3
 
 **Performance**

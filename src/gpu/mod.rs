@@ -218,6 +218,24 @@ pub fn exh_smem_bytes(wg_y: u32, kb_lines: usize, elem_bytes: usize) -> usize {
     wg_y as usize * kb_lines * LINE_SIZE * elem_bytes
 }
 
+/// Per-cube shared-memory footprint of the cluster-major IVF tiled kernel.
+///
+/// The same query staging as the exhaustive kernels; per-task metadata is read
+/// from global memory, not staged.
+///
+/// ### Params
+///
+/// * `wg_y` - Tasks staged per cube
+/// * `kb_lines` - Reduction lines staged per block
+/// * `elem_bytes` - Size of the float element type in bytes
+///
+/// ### Returns
+///
+/// Bytes of shared memory one cube allocates.
+pub fn ivf_tiled_smem_bytes(wg_y: u32, kb_lines: usize, elem_bytes: usize) -> usize {
+    exh_smem_bytes(wg_y, kb_lines, elem_bytes)
+}
+
 /// Plan the query staging for the register-tiled exhaustive kernels.
 ///
 /// Holds the query tile at [`EXH_WG_Y`] rows and blocks the reduction axis at
@@ -528,7 +546,11 @@ fn local_join_meta_bytes(max_cands: usize, norm_buf_len: usize, elem_bytes: usiz
 /// ### Params
 ///
 /// * `dim_padded` - Padded embedding dimensionality (multiple of `LINE_SIZE`)
-/// * `max_cands` - Maximum candidates per node, i.e. `2 * build_k`
+/// * `max_cands` - Maximum candidates loaded per node, i.e. `2 * build_k`.
+///   Sizes the per-candidate metadata
+/// * `max_joined` - Maximum candidates left after the join's candidate cap,
+///   i.e. `min(2 * build_k, 2 * cap)`. Sizes the vector staging, which is the
+///   footprint that matters
 /// * `elem_bytes` - Size of the float element type in bytes
 /// * `use_cosine` - Whether the kernel takes its cosine arm, which is the only
 ///   one that stages candidate norms
@@ -541,6 +563,7 @@ fn local_join_meta_bytes(max_cands: usize, norm_buf_len: usize, elem_bytes: usiz
 pub fn plan_local_join_staging(
     dim_padded: usize,
     max_cands: usize,
+    max_joined: usize,
     elem_bytes: usize,
     use_cosine: bool,
     limits: &GpuLimits,
@@ -567,12 +590,12 @@ pub fn plan_local_join_staging(
     // buffers are vectorised, and an unbudgeted allocation is a dispatch that
     // silently does nothing.
     let dummy_b_bytes = LINE_SIZE * elem_bytes;
-    if max_cands * vec_bytes + dummy_b_bytes <= avail {
+    if max_joined * vec_bytes + dummy_b_bytes <= avail {
         let (cube_x, cube_y) = pick_local_join_cube(limits);
         return Ok(LocalJoinStaging {
-            block: max_cands,
+            block: max_joined,
             single_block: true,
-            buf_a_lines: max_cands * row_lines,
+            buf_a_lines: max_joined * row_lines,
             buf_b_lines: 1,
             row_lines,
             norm_buf_len,
@@ -583,7 +606,7 @@ pub fn plan_local_join_staging(
     }
 
     // Two buffers live simultaneously on the blocked path.
-    let block = (avail / (2 * vec_bytes)).min(max_cands).max(1);
+    let block = (avail / (2 * vec_bytes)).min(max_joined).max(1);
     let (cube_x, cube_y) = pick_local_join_cube(limits);
     Ok(LocalJoinStaging {
         block,
@@ -764,6 +787,12 @@ mod tests {
         }
     }
 
+    #[test]
+    fn test_ivf_tiled_footprint_fits_the_exhaustive_plan() {
+        let plan = plan_exhaustive_staging(128, 4, &apple()).unwrap();
+        assert!(ivf_tiled_smem_bytes(plan.wg_y, plan.kb_lines, 4) <= apple().max_shared_bytes);
+    }
+
     /// A device with a quarter of the units cannot run a 32-row tile, and the
     /// caller must be told rather than handed an illegal cube.
     #[test]
@@ -879,9 +908,9 @@ mod tests {
                 for dim in [32usize, 64, 128, 256, 512, 1024, 2048] {
                     for max_cands in [60usize, 90, 128] {
                         for cosine in [false, true] {
-                            let Ok(plan) =
-                                plan_local_join_staging(dim, max_cands, elem, cosine, &l)
-                            else {
+                            let Ok(plan) = plan_local_join_staging(
+                                dim, max_cands, max_cands, elem, cosine, &l,
+                            ) else {
                                 continue;
                             };
                             let tag = format!("{shared}/{elem}/{dim}/{max_cands}/{cosine}");
@@ -957,22 +986,22 @@ mod tests {
         // bigger block. These are the directions a retune could silently
         // invert.
         for dim in [128usize, 256, 512, 1024] {
-            let big = plan_local_join_staging(dim, 90, 4, false, &apple()).unwrap();
+            let big = plan_local_join_staging(dim, 90, 90, 4, false, &apple()).unwrap();
 
             let half = GpuLimits {
                 max_shared_bytes: apple().max_shared_bytes / 2,
                 ..apple()
             };
-            let smaller = plan_local_join_staging(dim, 90, 4, false, &half).unwrap();
+            let smaller = plan_local_join_staging(dim, 90, 90, 4, false, &half).unwrap();
             assert!(
                 smaller.block <= big.block,
                 "half budget grew block at {dim}"
             );
 
-            let f64_plan = plan_local_join_staging(dim, 90, 8, false, &apple()).unwrap();
+            let f64_plan = plan_local_join_staging(dim, 90, 90, 8, false, &apple()).unwrap();
             assert!(f64_plan.block <= big.block, "f64 grew block at {dim}");
 
-            let cos = plan_local_join_staging(dim, 90, 4, true, &apple()).unwrap();
+            let cos = plan_local_join_staging(dim, 90, 90, 4, true, &apple()).unwrap();
             assert!(cos.block <= big.block, "cosine grew block at {dim}");
         }
     }
@@ -990,7 +1019,7 @@ mod tests {
             (512, 7, false),
             (1024, 3, false),
         ] {
-            let plan = plan_local_join_staging(dim, 90, 4, false, &apple()).unwrap();
+            let plan = plan_local_join_staging(dim, 90, 90, 4, false, &apple()).unwrap();
             assert_eq!(plan.block, block, "block moved at dim {dim}");
             assert_eq!(plan.single_block, single, "path moved at dim {dim}");
             assert_eq!(
@@ -1011,7 +1040,7 @@ mod tests {
             max_cube_dim: (64, 64, 64),
             ..apple()
         };
-        let plan = plan_local_join_staging(128, 90, 4, false, &narrow).unwrap();
+        let plan = plan_local_join_staging(128, 90, 90, 4, false, &narrow).unwrap();
         assert!(plan.cube_x * plan.cube_y <= 64);
         assert!(plan.cube_x >= plan.cube_y);
     }
@@ -1020,8 +1049,21 @@ mod tests {
     fn test_plan_local_join_errors_only_past_the_boundary() {
         // Two f32 vectors plus the metadata have to fit. At 32 KiB and 90
         // candidates, 2048 is the last width that does and 4096 is not.
-        assert!(plan_local_join_staging(2048, 90, 4, false, &apple()).is_ok());
-        assert!(plan_local_join_staging(4096, 90, 4, false, &apple()).is_err());
+        assert!(plan_local_join_staging(2048, 90, 90, 4, false, &apple()).is_ok());
+        assert!(plan_local_join_staging(4096, 90, 90, 4, false, &apple()).is_err());
+    }
+
+    #[test]
+    fn test_plan_local_join_sizes_vectors_from_the_cap() {
+        // k = 100 gives build_k = 150, so 300 candidates load but only 64
+        // survive a cap of 32 per kind. Staging for 300 would block at dim 32;
+        // staging for 64 is a single block.
+        let uncapped = plan_local_join_staging(32, 300, 300, 4, false, &apple()).unwrap();
+        let capped = plan_local_join_staging(32, 300, 64, 4, false, &apple()).unwrap();
+        assert!(!uncapped.single_block);
+        assert!(capped.single_block);
+        assert_eq!(capped.block, 64);
+        assert!(local_join_smem_bytes(&capped, 300, 4) <= apple().max_shared_bytes);
     }
 
     #[test]

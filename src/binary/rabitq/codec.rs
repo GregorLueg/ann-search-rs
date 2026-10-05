@@ -50,6 +50,15 @@ const MAX_TRAIN: usize = 250_000;
 /// Factors held per vertex: `f_add`, `f_rescale`, `f_error`.
 const FACTORS_PER_VERTEX: usize = 3;
 
+/// Coordinates covered by one sign-table lookup.
+const NIBBLE: usize = 4;
+
+/// Entries in one sign-table row, one per nibble value.
+const NIBBLE_VALUES: usize = 1 << NIBBLE;
+
+/// Coordinates per byte-aligned group of magnitude levels.
+const CODE_GROUP: usize = 8;
+
 //////////////////////
 // RaBitQCodecQuery //
 //////////////////////
@@ -58,10 +67,41 @@ const FACTORS_PER_VERTEX: usize = 3;
 pub struct RaBitQCodecQuery<T> {
     /// Rotated query, length `padded_dim`
     rotated: Vec<T>,
+    /// Partial sums of `rotated` per nibble of a sign code, see
+    /// [`build_sign_lut`]
+    sign_lut: Vec<T>,
     /// `sum(rotated)`, the centring correction's only query-dependent part
     sum: T,
     /// `||q - c||^2` per centroid, the whole per-query cost of `nlist > 1`
     g_add: Vec<T>,
+    /// `||q - c||` per centroid, scaling each vertex's error bound
+    g_error: Vec<T>,
+}
+
+/// Partial sums of a rotated query over every 4-bit pattern of its sign code.
+///
+/// Entry `i * 16 + v` is the sum of `rotated[4i + b]` over the set bits `b` of
+/// `v`, so the sign inner product is one lookup per nibble instead of a
+/// data-dependent branch per bit.
+///
+/// ### Params
+///
+/// * `rotated` - Rotated query, length a multiple of eight
+///
+/// ### Returns
+///
+/// The table, `rotated.len() / 4 * 16` entries
+fn build_sign_lut<T: AnnSearchFloat>(rotated: &[T]) -> Vec<T> {
+    let mut lut = vec![T::zero(); rotated.len() / NIBBLE * NIBBLE_VALUES];
+    for (i, row) in lut.chunks_exact_mut(NIBBLE_VALUES).enumerate() {
+        let q = &rotated[i * NIBBLE..(i + 1) * NIBBLE];
+        // Each entry extends the one with its highest bit cleared.
+        for v in 1..NIBBLE_VALUES {
+            let high = (usize::BITS - 1 - v.leading_zeros()) as usize;
+            row[v] = row[v & !(1 << high)] + q[high];
+        }
+    }
+    lut
 }
 
 /////////////////
@@ -83,6 +123,9 @@ pub struct RaBitQCodec<T> {
     ex_codes: Vec<u8>,
     /// `(f_add, f_rescale, f_error)` per vertex, interleaved
     factors: Vec<T>,
+    /// 1-bit `(f_add, f_rescale, f_error)` per vertex for the coarse tier,
+    /// interleaved; empty at `ex_bits` 0, where `factors` already are these
+    bin_factors: Vec<T>,
     /// Centroid each vertex was encoded against
     cluster: Vec<u32>,
     /// Rotated centroids, `nlist * padded_dim`
@@ -210,16 +253,23 @@ where
             .collect();
 
         let mut sign_codes = vec![0u8; n * n_bytes];
-        let mut ex_codes = vec![0u8; n * ex_bytes];
+        // At `ex_bits` 0 an empty buffer yields no chunks, and the zip below
+        // would then run zero iterations and encode nothing. A one-byte stride
+        // keeps one chunk per vertex; the placeholder is dropped afterwards.
+        let ex_stride = ex_bytes.max(1);
+        let mut ex_codes = vec![0u8; n * ex_stride];
         let mut factors = vec![T::zero(); n * FACTORS_PER_VERTEX];
+        // Same placeholder reasoning as `ex_codes`: always one chunk per vertex.
+        let mut bin_factors = vec![T::zero(); n * FACTORS_PER_VERTEX];
 
         sign_codes
             .par_chunks_mut(n_bytes)
-            .zip(ex_codes.par_chunks_mut(ex_bytes.max(1)))
+            .zip(ex_codes.par_chunks_mut(ex_stride))
             .zip(factors.par_chunks_mut(FACTORS_PER_VERTEX))
+            .zip(bin_factors.par_chunks_mut(FACTORS_PER_VERTEX))
             .enumerate()
             .try_for_each(
-                |(node, ((sign, ex), factor))| -> Result<(), AnnSearchErrors> {
+                |(node, (((sign, ex), factor), bin_factor))| -> Result<(), AnnSearchErrors> {
                     let c = assignments[node];
                     let rotated =
                         encoder.apply_rotation(&vectors_flat[node * dim..(node + 1) * dim]);
@@ -235,15 +285,29 @@ where
                     factor[1] = encoded.f_rescale;
                     factor[2] = encoded.f_error;
 
+                    if ex_bits > 0 {
+                        // The sign code does not depend on the width, so only
+                        // the 1-bit factors are kept from this second encode.
+                        let bin = encode_ex_bits(&rotated, centroid, 0, None)?;
+                        bin_factor[0] = bin.f_add;
+                        bin_factor[1] = bin.f_rescale;
+                        bin_factor[2] = bin.f_error;
+                    }
+
                     Ok(())
                 },
             )?;
+        if ex_bytes == 0 {
+            ex_codes = Vec::new();
+            bin_factors = Vec::new();
+        }
 
         Ok(Self {
             encoder,
             sign_codes,
             ex_codes,
             factors,
+            bin_factors,
             cluster: assignments.iter().map(|&c| c as u32).collect(),
             centroids_rotated,
             nlist,
@@ -264,53 +328,46 @@ where
     ///
     /// * `node` - Vertex index
     /// * `query` - Rotated query, length `padded_dim`
+    /// * `sign_lut` - The query's nibble table, see [`build_sign_lut`]
     ///
     /// ### Returns
     ///
     /// `<q, sign>` and `<q, magnitude>`
     #[inline]
-    fn inner_products(&self, node: usize, query: &[T]) -> (T, T) {
+    fn inner_products(&self, node: usize, query: &[T], sign_lut: &[T]) -> (T, T) {
         let n_bytes = self.encoder.n_bytes;
         let sign = &self.sign_codes[node * n_bytes..(node + 1) * n_bytes];
 
-        let mut ip_sign = T::zero();
-        for (b, &byte) in sign.iter().enumerate() {
-            let base = b * 8;
-            for bit in 0..8 {
-                if byte >> bit & 1 == 1 {
-                    ip_sign = ip_sign + query[base + bit];
-                }
-            }
+        // Two accumulators so the adds do not form one serial chain.
+        let (mut sign_lo, mut sign_hi) = (T::zero(), T::zero());
+        for (row, &byte) in sign_lut.chunks_exact(2 * NIBBLE_VALUES).zip(sign) {
+            sign_lo = sign_lo + row[(byte & 0x0f) as usize];
+            sign_hi = sign_hi + row[NIBBLE_VALUES + (byte >> NIBBLE) as usize];
         }
+        let ip_sign = sign_lo + sign_hi;
 
-        if self.ex_bits == 0 {
+        let w = self.ex_bits;
+        if w == 0 {
             return (ip_sign, T::zero());
         }
 
-        let ex_bytes = excode_bytes(self.padded_dim, self.ex_bits);
+        let ex_bytes = excode_bytes(self.padded_dim, w);
         let ex = &self.ex_codes[node * ex_bytes..(node + 1) * ex_bytes];
-        let mask = (1u16 << self.ex_bits) - 1;
+        let mask = (1u64 << w) - 1;
 
-        let mut ip_ex = T::zero();
-        for (d, &q) in query.iter().enumerate() {
-            let start = d * self.ex_bits;
-            let byte = start / 8;
-            let shift = start % 8;
-
-            // A level can straddle a byte boundary at widths that do not divide
-            // eight, so read two bytes and shift the window out.
-            let low = ex[byte] as u16;
-            let high = if byte + 1 < ex.len() {
-                ex[byte + 1] as u16
-            } else {
-                0
-            };
-            let level = ((low | (high << 8)) >> shift) & mask;
-
-            if level != 0 {
-                ip_ex = ip_ex + q * T::from_u16(level).unwrap_or_else(T::zero);
+        // Eight levels of `w` bits are exactly `w` whole bytes, so every group
+        // is byte-aligned and fits one u64 at any width up to `MAX_EX_BITS`.
+        let mut acc = [T::zero(); CODE_GROUP];
+        for (q, bytes) in query.chunks_exact(CODE_GROUP).zip(ex.chunks_exact(w)) {
+            let mut buf = [0u8; CODE_GROUP];
+            buf[..w].copy_from_slice(bytes);
+            let word = u64::from_le_bytes(buf);
+            for j in 0..CODE_GROUP {
+                let level = (word >> (j * w)) & mask;
+                acc[j] = acc[j] + q[j] * T::from_u64(level).unwrap_or_else(T::zero);
             }
         }
+        let ip_ex = acc.iter().fold(T::zero(), |a, &b| a + b);
 
         (ip_sign, ip_ex)
     }
@@ -321,6 +378,7 @@ where
     ///
     /// * `node` - Vertex index
     /// * `rotated` - Rotated query, length `padded_dim`
+    /// * `sign_lut` - The query's nibble table, see [`build_sign_lut`]
     /// * `sum` - `sum(rotated)`
     /// * `g_add` - `||q - c||^2` for this vertex's centroid
     ///
@@ -328,8 +386,8 @@ where
     ///
     /// The estimated squared Euclidean distance
     #[inline]
-    fn estimate(&self, node: usize, rotated: &[T], sum: T, g_add: T) -> T {
-        let (ip_sign, ip_ex) = self.inner_products(node, rotated);
+    fn estimate(&self, node: usize, rotated: &[T], sign_lut: &[T], sum: T, g_add: T) -> T {
+        let (ip_sign, ip_ex) = self.inner_products(node, rotated, sign_lut);
 
         let base = node * FACTORS_PER_VERTEX;
         let f_add = self.factors[base];
@@ -339,6 +397,44 @@ where
         let cb = T::from_f64(-((1u64 << self.ex_bits) as f64 - 0.5)).unwrap_or_else(T::zero);
 
         f_add + g_add + f_rescale * (step * ip_sign + ip_ex + cb * sum)
+    }
+
+    /// 1-bit distance estimate and its lower bound for one vertex.
+    ///
+    /// The sign product alone against the vertex's 1-bit factors, as the
+    /// reference's `split_single_estdist`: `est = f_add + g_add +
+    /// f_rescale * (<q, s> - sum / 2)`, `low = est - f_error * ||q - c||`.
+    ///
+    /// ### Params
+    ///
+    /// * `node` - Vertex index
+    /// * `query` - Prepared query
+    ///
+    /// ### Returns
+    ///
+    /// `(estimate, lower bound)`
+    #[inline]
+    fn estimate_bin(&self, node: usize, query: &RaBitQCodecQuery<T>) -> (T, T) {
+        let n_bytes = self.encoder.n_bytes;
+        let sign = &self.sign_codes[node * n_bytes..(node + 1) * n_bytes];
+        let (mut sign_lo, mut sign_hi) = (T::zero(), T::zero());
+        for (row, &byte) in query.sign_lut.chunks_exact(2 * NIBBLE_VALUES).zip(sign) {
+            sign_lo = sign_lo + row[(byte & 0x0f) as usize];
+            sign_hi = sign_hi + row[NIBBLE_VALUES + (byte >> NIBBLE) as usize];
+        }
+        let ip_sign = sign_lo + sign_hi;
+
+        let factors = if self.ex_bits == 0 {
+            &self.factors
+        } else {
+            &self.bin_factors
+        };
+        let base = node * FACTORS_PER_VERTEX;
+        let c = self.cluster[node] as usize;
+        let half = T::from_f64(0.5).unwrap_or_else(T::zero);
+
+        let est = factors[base] + query.g_add[c] + factors[base + 1] * (ip_sign - half * query.sum);
+        (est, est - factors[base + 2] * query.g_error[c])
     }
 
     /// Reconstruct a vertex in the rotated frame.
@@ -506,24 +602,37 @@ where
             .map(|c| T::euclidean_simd(self.centroid(c), &rotated))
             .collect();
 
+        let g_error = g_add.iter().map(|&g| g.sqrt()).collect();
+
         Ok(RaBitQCodecQuery {
+            sign_lut: build_sign_lut(&rotated),
             rotated,
             sum,
             g_add,
+            g_error,
         })
     }
 
     #[inline]
     fn score(&self, query: &Self::Query, id: usize) -> T {
         let g_add = query.g_add[self.cluster[id] as usize];
-        self.estimate(id, &query.rotated, query.sum, g_add)
+        self.estimate(id, &query.rotated, &query.sign_lut, query.sum, g_add)
+    }
+
+    #[inline]
+    fn score_coarse(&self, query: &Self::Query, id: usize) -> (T, T) {
+        self.estimate_bin(id, query)
+    }
+
+    fn two_tier(&self) -> bool {
+        self.ex_bits > 0
     }
 
     fn score_sym(&self, a: usize, b: usize) -> T {
         let rotated = self.reconstruct(a);
         let sum = rotated.iter().fold(T::zero(), |acc, &x| acc + x);
         let g_add = T::euclidean_simd(self.centroid(self.cluster[b] as usize), &rotated);
-        self.estimate(b, &rotated, sum, g_add)
+        self.estimate(b, &rotated, &build_sign_lut(&rotated), sum, g_add)
     }
 
     #[inline]

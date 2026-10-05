@@ -237,6 +237,9 @@ pub fn cosine_tiled<F: Float, N: Size>(
 /// * `query_vectors` - Query vectors `[n_queries, dim / N]` as `Vector<F, N>`
 /// * `db_vectors` - Database vectors `[n_db, dim / N]` as `Vector<F, N>`
 /// * `distances` - Output distance matrix `[n_queries, dist_stride]`
+/// * `q_start` - Global offset into `query_vectors` (and `query_norms`) of
+///   row 0 of this launch. Non-zero when the roles are swapped so the output
+///   is written candidate-major, see `query_batch_gpu`
 /// * `db_start` - Global offset into `db_vectors` for this chunk
 /// * `n_db_chunk` - Number of DB vectors in this chunk
 /// * `n_queries` - Total number of query vectors
@@ -259,6 +262,7 @@ pub fn euclidean_tiled_reg<F: Float, N: Size>(
     query_vectors: &Tensor<Vector<F, N>>,
     db_vectors: &Tensor<Vector<F, N>>,
     distances: &mut Tensor<F>,
+    q_start: u32,
     db_start: u32,
     n_db_chunk: u32,
     n_queries: u32,
@@ -310,7 +314,7 @@ pub fn euclidean_tiled_reg<F: Float, N: Size>(
             if q_global < n_queries as usize {
                 let line_idx = kb_base + elem / lanes;
                 let lane = elem % lanes;
-                let line_val = query_vectors[q_global * dim_lines + line_idx];
+                let line_val = query_vectors[(q_start as usize + q_global) * dim_lines + line_idx];
                 s_query[load_idx] = line_val[lane];
             } else {
                 s_query[load_idx] = F::new(0.0_f32);
@@ -384,6 +388,9 @@ pub fn euclidean_tiled_reg<F: Float, N: Size>(
 /// * `query_norms` - Pre-computed L2 norms `[n_queries]`
 /// * `db_norms` - Pre-computed L2 norms `[n_db]`
 /// * `distances` - Output distance matrix `[n_queries, dist_stride]`
+/// * `q_start` - Global offset into `query_vectors` (and `query_norms`) of
+///   row 0 of this launch. Non-zero when the roles are swapped so the output
+///   is written candidate-major, see `query_batch_gpu`
 /// * `db_start` - Global offset into `db_vectors` for this chunk
 /// * `n_db_chunk` - Number of DB vectors in this chunk
 /// * `n_queries` - Total number of query vectors
@@ -408,6 +415,7 @@ pub fn cosine_tiled_reg<F: Float, N: Size>(
     query_norms: &Tensor<F>,
     db_norms: &Tensor<F>,
     distances: &mut Tensor<F>,
+    q_start: u32,
     db_start: u32,
     n_db_chunk: u32,
     n_queries: u32,
@@ -458,7 +466,7 @@ pub fn cosine_tiled_reg<F: Float, N: Size>(
             if q_global < n_queries as usize {
                 let line_idx = kb_base + elem / lanes;
                 let lane = elem % lanes;
-                let line_val = query_vectors[q_global * dim_lines + line_idx];
+                let line_val = query_vectors[(q_start as usize + q_global) * dim_lines + line_idx];
                 s_query[load_idx] = line_val[lane];
             } else {
                 s_query[load_idx] = F::new(0.0_f32);
@@ -512,7 +520,7 @@ pub fn cosine_tiled_reg<F: Float, N: Size>(
         for r in 0..tile_d {
             let db_local = db_tile_base + local_x + r * WORKGROUP_SIZE_X as usize;
             if q_global < n_queries as usize && db_local < n_db_chunk as usize {
-                let q_norm = query_norms[q_global];
+                let q_norm = query_norms[q_start as usize + q_global];
                 let d_norm = db_norms[db_start as usize + db_local];
                 distances[q_global * dist_stride as usize + db_local] =
                     F::new(1.0_f32) - (acc[t * tile_d + r] / (q_norm * d_norm));
@@ -524,6 +532,9 @@ pub fn cosine_tiled_reg<F: Float, N: Size>(
 /////////////////////
 // Top-k selection //
 /////////////////////
+
+/// Distance loads `extract_topk` issues per thread before consuming the first.
+const EXTRACT_UNROLL: usize = 8;
 
 /// Initialise top-k buffers to sentinel values (`f32::MAX` / `0`)
 ///
@@ -563,6 +574,10 @@ pub fn init_topk<F: Float>(
 /// the end, so the per-candidate cost is a single global read of the distance
 /// matrix. The buffer must be pre-initialised with `init_topk`.
 ///
+/// The scan is latency bound, so loads are issued `EXTRACT_UNROLL` at a time
+/// ahead of their use, and the candidate-major layout makes adjacent lanes read
+/// adjacent words.
+///
 /// This is the low-`k` arm of the exhaustive path: `query_batch_gpu` dispatches
 /// here below [`RADIX_SELECT_MIN_K`], and also whenever [`radix_select_usable`]
 /// says the radix reducer cannot serve the configuration, i.e. non-f32 elements
@@ -572,12 +587,16 @@ pub fn init_topk<F: Float>(
 ///
 /// ### Params
 ///
-/// * `distances` - Full distance matrix for this chunk
-///   `[n_queries, dist_stride]`
+/// * `distances` - Distance matrix for this chunk, in either orientation;
+///   entry `(q, i)` sits at `q * q_stride + i * i_stride`
 /// * `out_dists` - Running top-k distance buffer `[n_queries, k]`
 /// * `out_indices` - Running top-k index buffer `[n_queries, k]`
 /// * `chunk_offset` - Global DB index corresponding to column 0 of this chunk
-/// * `actual_chunk_size` - Number of valid columns in this chunk
+/// * `actual_chunk_size` - Number of valid candidates in this chunk
+/// * `q_stride` - Stride between queries in `distances`
+/// * `i_stride` - Stride between candidates in `distances`. Set to 1 with
+///   `q_stride = dist_stride` for the query-major layout, or the reverse for
+///   the candidate-major layout, where adjacent lanes read adjacent words
 /// * `k_param` - Runtime value of k (must equal comptime `k`)
 /// * `k` - Comptime top-k count; must match `k_param` at launch (comptime)
 ///
@@ -591,18 +610,20 @@ pub fn extract_topk<F: Float>(
     out_indices: &mut Tensor<u32>,
     chunk_offset: u32,
     actual_chunk_size: u32,
+    q_stride: u32,
+    i_stride: u32,
     k_param: u32,
     #[comptime] k: usize,
 ) {
     let query_idx =
         ((CUBE_POS_Y * CUBE_COUNT_X + CUBE_POS_X) * WORKGROUP_SIZE_X + UNIT_POS_X) as usize;
 
-    if query_idx >= distances.shape(0) {
+    if query_idx >= out_dists.shape(0) {
         terminate!();
     }
 
     let kr = k_param as usize;
-    let dist_offset = query_idx * distances.stride(0);
+    let dist_offset = query_idx * q_stride as usize;
     let out_offset = query_idx * out_dists.stride(0);
 
     // Stage the running top-k in registers. The previous version re-read
@@ -615,29 +636,50 @@ pub fn extract_topk<F: Float>(
         local_indices[i] = out_indices[out_offset + i];
     }
 
-    for i in 0..actual_chunk_size {
-        let dist = distances[dist_offset + i as usize];
-
-        if dist < local_dists[kr - 1] {
-            // First-match guard rather than a `bool` sentinel: see the codegen
-            // rules in the `nndescent_gpu` module header.
-            let mut pos = kr - 1;
-            for j in 0..k {
-                if dist < local_dists[j] && pos == kr - 1 {
-                    pos = j;
-                }
+    // Running k-th distance, refreshed only on an insertion.
+    let mut thresh = local_dists[kr - 1];
+    // `EXTRACT_UNROLL` loads are issued before the first is consumed, so they
+    // are in flight together. Out-of-range slots read as `MAX` and never pass
+    // the threshold.
+    let mut batch = Array::<F>::new(EXTRACT_UNROLL);
+    let mut base = 0u32;
+    while base < actual_chunk_size {
+        #[unroll]
+        for u in 0..EXTRACT_UNROLL {
+            let ii = base + u as u32;
+            let mut v = F::new(f32::MAX);
+            if ii < actual_chunk_size {
+                v = distances[dist_offset + ii as usize * i_stride as usize];
             }
-
-            let mut s = kr - 1;
-            while s > pos {
-                local_dists[s] = local_dists[s - 1];
-                local_indices[s] = local_indices[s - 1];
-                s -= 1usize;
-            }
-
-            local_dists[pos] = dist;
-            local_indices[pos] = chunk_offset + i;
+            batch[u] = v;
         }
+
+        #[unroll]
+        for u in 0..EXTRACT_UNROLL {
+            let dist = batch[u];
+            if dist < thresh {
+                // First-match guard rather than a `bool` sentinel: see the
+                // codegen rules in the `nndescent_gpu` module header.
+                let mut pos = kr - 1;
+                for j in 0..k {
+                    if dist < local_dists[j] && pos == kr - 1 {
+                        pos = j;
+                    }
+                }
+
+                let mut s = kr - 1;
+                while s > pos {
+                    local_dists[s] = local_dists[s - 1];
+                    local_indices[s] = local_indices[s - 1];
+                    s -= 1usize;
+                }
+
+                local_dists[pos] = dist;
+                local_indices[pos] = chunk_offset + base + u as u32;
+                thresh = local_dists[kr - 1];
+            }
+        }
+        base += EXTRACT_UNROLL as u32;
     }
 
     for i in 0..k {
@@ -715,6 +757,13 @@ where
 
     let max_db_chunk = db_chunk.min(db_data.n);
 
+    let wg = WORKGROUP_SIZE_X as usize;
+    let use_radix =
+        k >= RADIX_SELECT_MIN_K && radix_select_usable(&client, k, size_of::<T>(), wg, &limits);
+    // Radix select runs one cube per query along a contiguous row, so it keeps
+    // the query-major layout.
+    let candidate_major = staging.is_some() && !use_radix;
+
     for query_chunk_idx in 0..n_query_chunks {
         if verbose && query_chunk_idx % 10 == 0 {
             println!(
@@ -774,25 +823,42 @@ where
             let grid_x = (n_db as u32).div_ceil(WORKGROUP_SIZE_X);
             let (grid_y, grid_z) = grid_2d((n_q as u32).div_ceil(safe_worksize_y), &limits)?;
 
+            // The tiled kernel stages one operand in shared memory and spreads
+            // the other across lanes, writing `[staged, lane]`. Candidate-major
+            // stages the DB chunk and spreads the queries, so `extract_topk`'s
+            // one-thread-per-query scan reads adjacent words across lanes
+            // instead of rows a whole chunk apart.
+            let (stage_start, n_stage, lane_start, n_lane, out_stride) = if candidate_major {
+                (db_start, n_db, 0, n_q, n_q)
+            } else {
+                (0, n_q, db_start, n_db, max_db_chunk)
+            };
+
             match *metric {
                 // Register-tiled path where the tile divides the query
                 // tile height. Bit-exact against the untiled kernel.
                 Dist::SquaredEuclidean if staging.is_some() => unsafe {
                     let plan = staging.unwrap();
-                    let reg_grid_x = (n_db as u32).div_ceil(WORKGROUP_SIZE_X * TILE_D as u32);
-                    let (reg_y, reg_z) = grid_2d((n_q as u32).div_ceil(plan.wg_y), &limits)?;
+                    let (stage_vecs, lane_vecs) = if candidate_major {
+                        (&db_gpu, &query_gpu)
+                    } else {
+                        (&query_gpu, &db_gpu)
+                    };
+                    let reg_grid_x = (n_lane as u32).div_ceil(WORKGROUP_SIZE_X * TILE_D as u32);
+                    let (reg_y, reg_z) = grid_2d((n_stage as u32).div_ceil(plan.wg_y), &limits)?;
                     euclidean_tiled_reg::launch_unchecked::<T, R>(
                         &client,
                         CubeCount::Static(reg_grid_x, reg_y, reg_z),
                         CubeDim::new_2d(WORKGROUP_SIZE_X, plan.wg_y / TILE_Q as u32),
                         vec_size,
-                        query_gpu.clone().into_tensor_arg(),
-                        db_gpu.clone().into_tensor_arg(),
+                        stage_vecs.clone().into_tensor_arg(),
+                        lane_vecs.clone().into_tensor_arg(),
                         distances_gpu.clone().into_tensor_arg(),
-                        db_start as u32,
-                        n_db as u32,
-                        n_q as u32,
-                        max_db_chunk as u32,
+                        stage_start as u32,
+                        lane_start as u32,
+                        n_lane as u32,
+                        n_stage as u32,
+                        out_stride as u32,
                         dim_lines,
                         plan.wg_y,
                         TILE_D,
@@ -819,22 +885,30 @@ where
                 },
                 Dist::Cosine if staging.is_some() => unsafe {
                     let plan = staging.unwrap();
-                    let reg_grid_x = (n_db as u32).div_ceil(WORKGROUP_SIZE_X * TILE_D as u32);
-                    let (reg_y, reg_z) = grid_2d((n_q as u32).div_ceil(plan.wg_y), &limits)?;
+                    let q_norms = query_norms_gpu.as_ref().unwrap();
+                    let d_norms = db_norms_gpu.as_ref().unwrap();
+                    let (stage_vecs, lane_vecs, stage_norms, lane_norms) = if candidate_major {
+                        (&db_gpu, &query_gpu, d_norms, q_norms)
+                    } else {
+                        (&query_gpu, &db_gpu, q_norms, d_norms)
+                    };
+                    let reg_grid_x = (n_lane as u32).div_ceil(WORKGROUP_SIZE_X * TILE_D as u32);
+                    let (reg_y, reg_z) = grid_2d((n_stage as u32).div_ceil(plan.wg_y), &limits)?;
                     cosine_tiled_reg::launch_unchecked::<T, R>(
                         &client,
                         CubeCount::Static(reg_grid_x, reg_y, reg_z),
                         CubeDim::new_2d(WORKGROUP_SIZE_X, plan.wg_y / TILE_Q as u32),
                         vec_size,
-                        query_gpu.clone().into_tensor_arg(),
-                        db_gpu.clone().into_tensor_arg(),
-                        query_norms_gpu.as_ref().unwrap().clone().into_tensor_arg(),
-                        db_norms_gpu.as_ref().unwrap().clone().into_tensor_arg(),
+                        stage_vecs.clone().into_tensor_arg(),
+                        lane_vecs.clone().into_tensor_arg(),
+                        stage_norms.clone().into_tensor_arg(),
+                        lane_norms.clone().into_tensor_arg(),
                         distances_gpu.clone().into_tensor_arg(),
-                        db_start as u32,
-                        n_db as u32,
-                        n_q as u32,
-                        max_db_chunk as u32,
+                        stage_start as u32,
+                        lane_start as u32,
+                        n_lane as u32,
+                        n_stage as u32,
+                        out_stride as u32,
                         dim_lines,
                         plan.wg_y,
                         TILE_D,
@@ -872,10 +946,12 @@ where
             // `extract_topk` is also the fallback for element types whose bits
             // the key transform cannot reinterpret, and for runtimes without
             // `u32` atomics.
-            let wg = WORKGROUP_SIZE_X as usize;
-            if k >= RADIX_SELECT_MIN_K
-                && radix_select_usable(&client, k, size_of::<T>(), wg, &limits)
-            {
+            let (q_stride, i_stride) = if candidate_major {
+                (1, n_q)
+            } else {
+                (max_db_chunk, 1)
+            };
+            if use_radix {
                 let (rx, ry) = grid_2d(n_q as u32, &limits)?;
                 unsafe {
                     radix_select_topk::launch_unchecked::<T, R>(
@@ -905,6 +981,8 @@ where
                         topk_indices.clone().into_tensor_arg(),
                         db_start as u32,
                         n_db as u32,
+                        q_stride as u32,
+                        i_stride as u32,
                         k as u32,
                         k,
                     );
@@ -1416,6 +1494,195 @@ pub fn compute_ivf_mega_cosine_cached<F: Float, N: Size>(
     let out_offset = q_idx as usize * out_dists.stride(0) + write_pos as usize;
     out_dists[out_offset] = F::new(1.0_f32) - (dot / (q_norm * d_norm));
     out_indices[out_offset] = real_db_idx;
+}
+
+/// Fields per entry of the IVF tile list: first task, task count, cluster
+/// start in the reorganised DB, offset of the tile within the cluster, and the
+/// tile's DB count.
+pub const IVF_TILE_FIELDS: usize = 5;
+
+/// Register-tiled IVF distance kernel over a cluster-major tile list
+///
+/// Each cube owns one tile: up to `size_y` tasks that all probe the same
+/// cluster, against up to `WORKGROUP_SIZE_X * tile_d` of that cluster's
+/// points. The tasks' query rows are staged a reduction block at a time, as in
+/// `euclidean_tiled_reg`, and every thread computes a `tile_q x tile_d` block.
+/// The tile list is built on the host from the task list's cluster grouping,
+/// so the grid is sized by the real work rather than by the largest cluster.
+///
+/// Accumulation runs over lines then lanes in ascending order, the same order
+/// as the per-task mega kernels, so the distances are bit-identical to theirs.
+///
+/// ### Params
+///
+/// * `query_vectors` - Query vectors `[n_queries, dim / N]` as `Vector<F, N>`
+/// * `db_vectors` - Reorganised DB vectors `[n_db, dim / N]` as `Vector<F, N>`
+/// * `query_norms` - Query L2 norms `[n_queries]`; read only under cosine
+/// * `db_norms` - DB L2 norms `[n_db]`; read only under cosine
+/// * `task_q_idx` - Query index per task `[n_tasks]`, grouped by cluster
+/// * `task_write_offset` - Start of the task's cluster in its query's candidate
+///   row `[n_tasks]`
+/// * `tiles` - Tile list `[n_tiles * IVF_TILE_FIELDS]`
+/// * `out_dists` - Candidate distances `[n_queries, out_stride]`
+/// * `out_indices` - Candidate DB indices `[n_queries, out_stride]`
+/// * `out_stride` - Row stride of the candidate buffers
+/// * `n_tiles` - Number of tiles
+/// * `dim_lines` - `Vector<F, N>` elements per row (comptime)
+/// * `size_y` - Tasks per tile (comptime). Must be divisible by `tile_q`
+/// * `tile_d` - DB vectors per thread (comptime)
+/// * `tile_q` - Tasks per thread (comptime)
+/// * `kb_lines` - Reduction lines staged per block (comptime). Must divide
+///   `dim_lines` exactly
+/// * `use_cosine` - Cosine instead of squared Euclidean (comptime)
+///
+/// ### Grid mapping
+///
+/// * `CUBE_POS_Y * CUBE_COUNT_X + CUBE_POS_X` -> tile index
+/// * `UNIT_POS_X` -> lane over the tile's DB vectors
+/// * `UNIT_POS_Y` -> block of `tile_q` tasks within the tile
+#[cube(launch_unchecked)]
+pub fn ivf_tiled<F: Float, N: Size>(
+    query_vectors: &Tensor<Vector<F, N>>,
+    db_vectors: &Tensor<Vector<F, N>>,
+    query_norms: &Tensor<F>,
+    db_norms: &Tensor<F>,
+    task_q_idx: &Tensor<u32>,
+    task_write_offset: &Tensor<u32>,
+    tiles: &Tensor<u32>,
+    out_dists: &mut Tensor<F>,
+    out_indices: &mut Tensor<u32>,
+    out_stride: u32,
+    n_tiles: u32,
+    #[comptime] dim_lines: usize,
+    #[comptime] size_y: u32,
+    #[comptime] tile_d: usize,
+    #[comptime] tile_q: usize,
+    #[comptime] kb_lines: usize,
+    #[comptime] use_cosine: bool,
+) {
+    let tile = CUBE_POS_Y * CUBE_COUNT_X + CUBE_POS_X;
+    if tile >= n_tiles {
+        terminate!();
+    }
+
+    let lanes = LINE_SIZE;
+    let kb_scalars = kb_lines * lanes;
+    let n_blocks = dim_lines / kb_lines;
+    let wg_y = size_y as usize;
+    let local_x = UNIT_POS_X as usize;
+    let local_y = UNIT_POS_Y as usize;
+
+    let tb = tile as usize * IVF_TILE_FIELDS;
+    let task_start = tiles[tb] as usize;
+    let n_t = tiles[tb + 1] as usize;
+    let cluster_start = tiles[tb + 2] as usize;
+    let db_off = tiles[tb + 3] as usize;
+    let n_db = tiles[tb + 4] as usize;
+
+    // Scalar shared memory only (vectorised shared mem silently broadcasts lane 0)
+    let mut s_query = SharedMemory::<F>::new(wg_y * kb_scalars);
+    let mut acc = Array::<F>::new(tile_q * tile_d);
+    let mut d_scalars = Array::<F>::new(tile_d * lanes);
+
+    let threads_y = wg_y / tile_q;
+    let thread_id = local_y * WORKGROUP_SIZE_X as usize + local_x;
+    let total_threads = WORKGROUP_SIZE_X as usize * threads_y;
+    let total_elems = wg_y * kb_scalars;
+
+    #[unroll]
+    for a in 0..tile_q * tile_d {
+        acc[a] = F::new(0.0_f32);
+    }
+
+    let q_row_base = local_y * tile_q;
+
+    for b in 0..n_blocks {
+        let kb_base = b * kb_lines;
+
+        let mut load_idx = thread_id;
+        while load_idx < total_elems {
+            let q_local = load_idx / kb_scalars;
+            let elem = load_idx % kb_scalars;
+            if q_local < n_t {
+                let q = task_q_idx[task_start + q_local] as usize;
+                let line_val = query_vectors[q * dim_lines + kb_base + elem / lanes];
+                s_query[load_idx] = line_val[elem % lanes];
+            } else {
+                s_query[load_idx] = F::new(0.0_f32);
+            }
+            load_idx += total_threads;
+        }
+        sync_cube();
+
+        for j in 0..kb_lines {
+            let i = kb_base + j;
+            #[unroll]
+            for r in 0..tile_d {
+                let d_local = local_x + r * WORKGROUP_SIZE_X as usize;
+                // Clamp out-of-range rows to the tile's first row; the result
+                // is masked on write.
+                let mut idx = (cluster_start + db_off) * dim_lines + i;
+                if d_local < n_db {
+                    idx = (cluster_start + db_off + d_local) * dim_lines + i;
+                }
+                let line_val = db_vectors[idx];
+                #[unroll]
+                for lane in 0..lanes {
+                    d_scalars[r * lanes + lane] = line_val[lane];
+                }
+            }
+
+            #[unroll]
+            for t in 0..tile_q {
+                let s_off = (q_row_base + t) * kb_scalars + j * lanes;
+                #[unroll]
+                for lane in 0..lanes {
+                    let qv = s_query[s_off + lane];
+                    #[unroll]
+                    for r in 0..tile_d {
+                        if use_cosine {
+                            acc[t * tile_d + r] += qv * d_scalars[r * lanes + lane];
+                        } else {
+                            let diff = qv - d_scalars[r * lanes + lane];
+                            acc[t * tile_d + r] += diff * diff;
+                        }
+                    }
+                }
+            }
+        }
+        if comptime!(n_blocks > 1) {
+            sync_cube();
+        }
+    }
+
+    #[unroll]
+    for t in 0..tile_q {
+        let q_local = q_row_base + t;
+        #[unroll]
+        for r in 0..tile_d {
+            let d_local = local_x + r * WORKGROUP_SIZE_X as usize;
+            // Nested rather than `&&`: compound conditions miscompile, see the
+            // codegen rules in the `nndescent_gpu` module header. The `&&`
+            // form dropped single lanes' writes on the CPU runtime.
+            if q_local < n_t {
+                if d_local < n_db {
+                    let task = task_start + q_local;
+                    let q = task_q_idx[task] as usize;
+                    let db_idx = cluster_start + db_off + d_local;
+                    let pos = q * out_stride as usize
+                        + task_write_offset[task] as usize
+                        + db_off
+                        + d_local;
+                    let mut dist = acc[t * tile_d + r];
+                    if use_cosine {
+                        dist = F::new(1.0_f32) - (dist / (query_norms[q] * db_norms[db_idx]));
+                    }
+                    out_dists[pos] = dist;
+                    out_indices[pos] = db_idx as u32;
+                }
+            }
+        }
+    }
 }
 
 ///////////
