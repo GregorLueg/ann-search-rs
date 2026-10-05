@@ -17,6 +17,10 @@ own changelog at [`python/CHANGELOG.md`](python/CHANGELOG.md).
 - HNSW-RaBitQ ex_bits = 0 was buggy. The loop zipped over empty buffers. These
   are now properly initialised.
 
+**Breaking changes**
+
+- Save format has been bumped from version 4 to version 5.
+
 ## 0.9.3
 
 **Performance**
