@@ -205,6 +205,12 @@ const GEMM_TILE_SIZE: usize = 512;
 /// elements regardless of k.
 const GEMM_CENTROID_TILE: usize = 4096;
 
+/// Independent `(best, second, index)` lanes in [`top2_scan`]. One running
+/// top-2 is a serial chain of compares, branches included; separate lanes
+/// turn it into selects that vectorise and overlap. 4 and 8 measured the
+/// same on Apple Silicon, 16 was slower.
+const TOP2_LANES: usize = 8;
+
 /// Below this number of dirty points, skip GEMM gather/scatter overhead
 /// and compute distances directly via SIMD loops.
 const GEMM_DIRTY_THRESHOLD: usize = 128;
@@ -764,6 +770,97 @@ fn gemm_dot_tile<T>(
     );
 }
 
+/// Fold one centroid block's scores into a vector's running top-2.
+///
+/// Scores are `scale[c] * dots[c] + offset[c]`. The block is scanned in
+/// [`TOP2_LANES`] independent lanes with branch-free updates
+/// (`second = max(second, min(score, best))`), then the lanes, the scalar
+/// remainder and the incoming state are merged. Ties resolve exactly as a
+/// sequential strict-`>` scan would: the lowest index wins the best slot and
+/// an equal score elsewhere becomes the second.
+///
+/// ### Params
+///
+/// * `dots` - Dot products of the vector with this block's centroids
+/// * `scale` - Per-centroid score scale, same length
+/// * `offset` - Per-centroid score offset, same length
+/// * `c0` - Global index of the block's first centroid
+/// * `top` - Running `(best, second, best index)` from earlier blocks, whose
+///   indices are all below `c0`
+///
+/// ### Returns
+///
+/// The updated `(best, second, best index)`
+#[inline(always)]
+fn top2_scan<T: Float>(
+    dots: &[T],
+    scale: &[T],
+    offset: &[T],
+    c0: usize,
+    top: (T, T, usize),
+) -> (T, T, usize) {
+    #[inline(always)]
+    fn sel<T: Float>(m: bool, a: T, b: T) -> T {
+        if m {
+            a
+        } else {
+            b
+        }
+    }
+
+    let mut best = [T::neg_infinity(); TOP2_LANES];
+    let mut second = [T::neg_infinity(); TOP2_LANES];
+    let mut idx = [0u32; TOP2_LANES];
+
+    let mut d_chunks = dots.chunks_exact(TOP2_LANES);
+    let mut s_chunks = scale.chunks_exact(TOP2_LANES);
+    let mut o_chunks = offset.chunks_exact(TOP2_LANES);
+    let mut base = 0u32;
+    for ((d, s), o) in (&mut d_chunks).zip(&mut s_chunks).zip(&mut o_chunks) {
+        for j in 0..TOP2_LANES {
+            let score = s[j] * d[j] + o[j];
+            let gt = score > best[j];
+            let lo = sel(score < best[j], score, best[j]);
+            second[j] = sel(lo > second[j], lo, second[j]);
+            best[j] = sel(gt, score, best[j]);
+            idx[j] = if gt { base + j as u32 } else { idx[j] };
+        }
+        base += TOP2_LANES as u32;
+    }
+
+    // merge: incoming state (lowest indices), then lanes, then the remainder,
+    // each as (value, index) candidates for best plus plain seconds
+    #[inline(always)]
+    fn push<T: Float>(v: T, i: usize, b: &mut T, s2: &mut T, bi: &mut usize) {
+        if v > *b || (v == *b && i < *bi) {
+            *s2 = *b;
+            *b = v;
+            *bi = i;
+        } else if v > *s2 {
+            *s2 = v;
+        }
+    }
+    let (mut b, mut s2, mut bi) = top;
+    let n_full = base as usize;
+    for j in 0..TOP2_LANES {
+        if n_full > 0 {
+            push(best[j], c0 + idx[j] as usize, &mut b, &mut s2, &mut bi);
+            if second[j] > s2 {
+                s2 = second[j];
+            }
+        }
+    }
+    let tail = d_chunks
+        .remainder()
+        .iter()
+        .zip(s_chunks.remainder())
+        .zip(o_chunks.remainder());
+    for (c, ((&d, &s), &o)) in tail.enumerate() {
+        push(s * d + o, c0 + n_full + c, &mut b, &mut s2, &mut bi);
+    }
+    (b, s2, bi)
+}
+
 /// Full GEMM-based nearest centroid assignment over all n vectors
 ///
 /// Processes vectors in tiles of GEMM_TILE_SIZE against centroid blocks of
@@ -871,22 +968,8 @@ fn gemm_assign_full<T>(
 
                     let sc = &scale[c0..c0 + kb];
                     let of = &offset[c0..c0 + kb];
-                    for i in 0..tile_n {
-                        let col = dots.col_as_slice(i);
-                        let (mut best, mut second, mut best_c) = top2[i];
-                        for c in 0..kb {
-                            let score = sc[c] * col[c] + of[c];
-                            if score > second {
-                                if score > best {
-                                    second = best;
-                                    best = score;
-                                    best_c = c0 + c;
-                                } else {
-                                    second = score;
-                                }
-                            }
-                        }
-                        top2[i] = (best, second, best_c);
+                    for (i, t) in top2.iter_mut().enumerate() {
+                        *t = top2_scan(dots.col_as_slice(i), sc, of, c0, *t);
                     }
                 }
 

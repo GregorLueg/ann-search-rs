@@ -1664,6 +1664,7 @@ pub fn ivf_tiled<F: Float, N: Size>(
             // Nested rather than `&&`: compound conditions miscompile, see the
             // codegen rules in the `nndescent_gpu` module header. The `&&`
             // form dropped single lanes' writes on the CPU runtime.
+            #[allow(clippy::collapsible_if)]
             if q_local < n_t {
                 if d_local < n_db {
                     let task = task_start + q_local;

@@ -641,7 +641,39 @@ pub fn min_dist_cosine_vec<S: Float, A: Float, N: Size>(
 
     let mut best = A::new(f32::MAX);
 
+    let cu = CENTROID_UNROLL as u32;
+    let mut accs = Array::<Vector<A, N>>::new(CENTROID_UNROLL);
+
     let mut c = 0u32;
+    while c + cu <= k {
+        #[unroll]
+        for u in 0..CENTROID_UNROLL {
+            accs[u] = Vector::<A, N>::new(A::new(0.0_f32));
+        }
+        for i in 0..dim_lines {
+            let pv = p[i];
+            #[unroll]
+            for u in 0..CENTROID_UNROLL {
+                accs[u] += pv * cands[(c as usize + u) * dim_lines + i];
+            }
+        }
+        #[unroll]
+        for u in 0..CENTROID_UNROLL {
+            let av = accs[u];
+            let mut dot = A::new(0.0_f32);
+            #[unroll]
+            for lane in 0..LINE_SIZE {
+                dot += av[lane];
+            }
+            let dist = A::new(1.0_f32) - dot / (pnorm * cand_norms[c as usize + u]);
+            if dist < best {
+                best = dist;
+            }
+        }
+        c += cu;
+    }
+
+    // Tail for `k` not divisible by CENTROID_UNROLL.
     while c < k {
         let cbase = c as usize * dim_lines;
         let mut acc = Vector::<A, N>::new(A::new(0.0_f32));
