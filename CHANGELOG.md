@@ -3,6 +3,12 @@
 Changes to the `ann-search-rs` crate. The Python package `ann-search` has its
 own changelog at [`python/CHANGELOG.md`](python/CHANGELOG.md).
 
+## 0.10.1
+
+**Performance**
+
+- Slightly faster k-means on the GPU and CPU.
+
 ## 0.10.0
 
 **Performance**
