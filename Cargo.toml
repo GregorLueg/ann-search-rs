@@ -80,8 +80,8 @@ cubecl-utils-rs = {
     optional = true
 }
 document-features = "0.2.12"
-faer = "0.23.2"
-faer-traits = "0.23.2"
+faer = "0.24.4"
+faer-traits = "0.24.0"
 fixedbitset = "0.5.7"
 half = {
     version = "2.7.1",
