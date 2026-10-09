@@ -78,11 +78,18 @@ def dataset_path(name: str) -> Path:
     """Local copy of an ann-benchmarks file, downloaded to `CACHE` once."""
     path = CACHE / f"{name}.hdf5"
     if not path.exists():
+        import shutil
         import urllib.request
 
         CACHE.mkdir(parents=True, exist_ok=True)
         tmp = path.with_suffix(".part")
-        urllib.request.urlretrieve(f"http://ann-benchmarks.com/{name}.hdf5", tmp)
+        # The server answers urllib's default User-Agent with a 403.
+        req = urllib.request.Request(
+            f"http://ann-benchmarks.com/{name}.hdf5",
+            headers={"User-Agent": "ann-search-benchmarks"},
+        )
+        with urllib.request.urlopen(req) as resp, tmp.open("wb") as f:
+            shutil.copyfileobj(resp, f)
         tmp.rename(path)
     return path
 
