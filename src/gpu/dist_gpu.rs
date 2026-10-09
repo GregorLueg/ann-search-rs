@@ -723,6 +723,70 @@ where
     T: Float + Sum + cubecl::CubeElement + num_traits::Float + num_traits::FromPrimitive,
 {
     let client = R::client(&device);
+    let db_gpu = GpuTensor::<R, T>::from_slice(db_data.data, vec![db_data.n, dim], &client)?;
+    let db_norms_gpu = if *metric == Dist::Cosine {
+        Some(GpuTensor::<R, T>::from_slice(
+            db_data.norm,
+            vec![db_data.n],
+            &client,
+        )?)
+    } else {
+        None
+    };
+    query_batch_gpu_resident(
+        k,
+        query_data,
+        &db_gpu,
+        db_norms_gpu.as_ref(),
+        db_data.n,
+        dim,
+        metric,
+        &client,
+        verbose,
+    )
+}
+
+/// Run batch kNN queries on the GPU against an already-uploaded database
+///
+/// [`query_batch_gpu`] without the upload: the caller owns the database
+/// tensors and can reuse them across calls. On SIFT (1M x 128) the upload and
+/// its synchronisation were most of a small batch's wall time.
+///
+/// ### Params
+///
+/// * `k` - Number of neighbours to return
+/// * `query_data` - Query vectors as `BatchData`
+/// * `db_gpu` - Database vectors on the device, `[n_db, dim]`
+/// * `db_norms_gpu` - Database L2 norms on the device, `[n_db]`; required
+///   for Cosine, ignored otherwise
+/// * `n_db` - Number of database vectors
+/// * `dim` - Embedding dimensionality (must be divisible by LINE_SIZE)
+/// * `metric` - Distance metric (Euclidean or Cosine)
+/// * `client` - Compute client the tensors live on
+/// * `verbose` - Print progress for large batches
+///
+/// ### Returns
+///
+/// Tuple of `(indices, distances)` where each inner Vec has k elements
+pub fn query_batch_gpu_resident<T, R>(
+    k: usize,
+    query_data: &BatchData<T>,
+    db_gpu: &GpuTensor<R, T>,
+    db_norms_gpu: Option<&GpuTensor<R, T>>,
+    n_db: usize,
+    dim: usize,
+    metric: &Dist,
+    client: &ComputeClient<R>,
+    verbose: bool,
+) -> KnnResult<T>
+where
+    R: Runtime,
+    T: Float + Sum + cubecl::CubeElement + num_traits::Float + num_traits::FromPrimitive,
+{
+    // Handles only: cloning a `GpuTensor` shares the device buffer.
+    let client = client.clone();
+    let db_gpu = db_gpu.clone();
+    let db_norms_gpu = db_norms_gpu.cloned();
     let limits = GpuLimits::from_client(&client);
     let vec_size = LINE_SIZE;
     let dim_lines = dim / vec_size;
@@ -737,25 +801,12 @@ where
     // The DB chunk shrinks when the distance transient would not fit one
     // binding on this device. On a 4 GiB binding limit it is the full chunk.
     let db_chunk = plan_db_chunk(QUERY_CHUNK_SIZE.min(query_data.n), size_of::<T>(), &limits);
-    let n_db_chunks = db_data.n.div_ceil(db_chunk);
-
-    // Single DB upload for the entire query
-    let db_gpu = GpuTensor::<R, T>::from_slice(db_data.data, vec![db_data.n, dim], &client)?;
-
-    let db_norms_gpu = if *metric == Dist::Cosine {
-        Some(GpuTensor::<R, T>::from_slice(
-            db_data.norm,
-            vec![db_data.n],
-            &client,
-        )?)
-    } else {
-        None
-    };
+    let n_db_chunks = n_db.div_ceil(db_chunk);
 
     let mut all_indices = Vec::with_capacity(query_data.n);
     let mut all_distances = Vec::with_capacity(query_data.n);
 
-    let max_db_chunk = db_chunk.min(db_data.n);
+    let max_db_chunk = db_chunk.min(n_db);
 
     let wg = WORKGROUP_SIZE_X as usize;
     let use_radix =
@@ -817,7 +868,7 @@ where
 
         for db_chunk_idx in 0..n_db_chunks {
             let db_start = db_chunk_idx * db_chunk;
-            let db_end = (db_start + db_chunk).min(db_data.n);
+            let db_end = (db_start + db_chunk).min(n_db);
             let n_db = db_end - db_start;
 
             let grid_x = (n_db as u32).div_ceil(WORKGROUP_SIZE_X);

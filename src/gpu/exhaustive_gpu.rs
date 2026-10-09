@@ -4,6 +4,7 @@ use cubecl::prelude::*;
 use cubecl_utils_rs::prelude::*;
 use num_traits::Float;
 use rayon::prelude::*;
+use std::sync::OnceLock;
 
 use crate::gpu::dist_gpu::*;
 use crate::prelude::*;
@@ -13,7 +14,7 @@ use crate::prelude::*;
 ////////////////////////
 
 /// Exhaustive (brute-force) nearest neighbour index (on GPU)
-pub struct ExhaustiveIndexGpu<T: Float, R: Runtime> {
+pub struct ExhaustiveIndexGpu<T: Float + CubeclFloat, R: Runtime> {
     /// Original vector data for distance calculations. Flattened for better
     /// cache locality
     pub vectors_flat: Vec<T>,
@@ -29,6 +30,10 @@ pub struct ExhaustiveIndexGpu<T: Float, R: Runtime> {
     metric: Dist,
     /// The CubeCL runtime device
     device: R::Device,
+    /// Database vectors and, for Cosine, norms on the device. Uploaded by the
+    /// first query and reused after: re-uploading per call cost more than the
+    /// distance kernels for small batches.
+    db_gpu: OnceLock<(GpuTensor<R, T>, Option<GpuTensor<R, T>>)>,
 }
 
 /////////////////////////
@@ -108,7 +113,37 @@ where
             n,
             metric,
             device,
+            db_gpu: OnceLock::new(),
         })
+    }
+
+    /// The device-resident database, uploading it on first use.
+    ///
+    /// ### Params
+    ///
+    /// * `client` - Compute client for this index's device
+    ///
+    /// ### Returns
+    ///
+    /// `(vectors, norms)` on the device; norms only for Cosine.
+    fn resident_db(
+        &self,
+        client: &ComputeClient<R>,
+    ) -> Result<&(GpuTensor<R, T>, Option<GpuTensor<R, T>>), AnnSearchErrors> {
+        if let Some(db) = self.db_gpu.get() {
+            return Ok(db);
+        }
+        let vectors =
+            GpuTensor::<R, T>::from_slice(&self.vectors_flat, vec![self.n, self.dim_padded], client)?;
+        let norms = if self.metric == Dist::Cosine {
+            Some(GpuTensor::<R, T>::from_slice(&self.norms, vec![self.n], client)?)
+        } else {
+            None
+        };
+        // A concurrent first query may have won the race; either upload is
+        // the same data, so keep whichever landed.
+        let _ = self.db_gpu.set((vectors, norms));
+        Ok(self.db_gpu.get().expect("set just above"))
     }
 
     /// Query the exhaustive index
@@ -153,15 +188,18 @@ where
         };
 
         let query_data = BatchData::new(&vectors_query_padded, &query_norms, n_query);
-        let db_data = BatchData::new(&self.vectors_flat, &self.norms, self.n);
+        let client = R::client(&self.device);
+        let (db_gpu, db_norms_gpu) = self.resident_db(&client)?;
 
-        let res = query_batch_gpu::<T, R>(
+        let res = query_batch_gpu_resident::<T, R>(
             k,
             &query_data,
-            &db_data,
-            dim_padded, // <-- pass padded dim to the GPU
+            db_gpu,
+            db_norms_gpu.as_ref(),
+            self.n,
+            dim_padded,
             &self.metric,
-            self.device.clone(),
+            &client,
             verbose,
         )?;
 
@@ -185,15 +223,18 @@ where
     /// to a vector in the index
     pub fn generate_knn(&self, k: usize, return_dist: bool, verbose: bool) -> KnnOptionResult<T> {
         let query_data = BatchData::new(&self.vectors_flat, &self.norms, self.n);
-        let db_data = BatchData::new(&self.vectors_flat, &self.norms, self.n);
+        let client = R::client(&self.device);
+        let (db_gpu, db_norms_gpu) = self.resident_db(&client)?;
 
-        let (indices, distances) = query_batch_gpu::<T, R>(
+        let (indices, distances) = query_batch_gpu_resident::<T, R>(
             k,
             &query_data,
-            &db_data,
+            db_gpu,
+            db_norms_gpu.as_ref(),
+            self.n,
             self.dim_padded,
             &self.metric,
-            self.device.clone(),
+            &client,
             verbose,
         )?;
 
@@ -210,9 +251,12 @@ where
     ///
     /// Number of bytes used by the index
     pub fn memory_usage_bytes(&self) -> usize {
-        std::mem::size_of_val(self)
-            + self.vectors_flat.capacity() * std::mem::size_of::<T>()
-            + self.norms.capacity() * std::mem::size_of::<T>()
+        // The device copy counts once a query has uploaded it.
+        let host = (self.vectors_flat.capacity() + self.norms.capacity()) * std::mem::size_of::<T>();
+        let device = self.db_gpu.get().map_or(0, |_| {
+            (self.vectors_flat.len() + self.norms.len()) * std::mem::size_of::<T>()
+        });
+        std::mem::size_of_val(self) + host + device
     }
 }
 
