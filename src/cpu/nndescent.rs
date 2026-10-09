@@ -893,8 +893,14 @@ pub struct NNDescent<T> {
     /// Forest used for graph initialisation and query entry points. Annoy for
     /// Euclidean/Cosine, KdForest for Manhattan.
     forest: Forest<T>,
-    /// Flat k-NN graph of size `n * k`
-    graph: Vec<(usize, T)>,
+    /// Flat kNN graph of size `n * k`, sorted per node, undiversified. What
+    /// `extract_knn`, `graph()` and NSG read.
+    graph: Vec<(u32, T)>,
+    /// Flat id-only adjacency of size `n * k` the query walks: the diversified
+    /// graph when `diversify_prob > 0`, otherwise the ids of `graph`.
+    /// Sentinel-padded. Queries never read the stored distances, so they are
+    /// not kept here.
+    query_graph: Vec<u32>,
     /// Whether construction converged
     converged: bool,
     /// Original indices - for trait purposes
@@ -1018,6 +1024,7 @@ where
             metric,
             norms,
             graph: Vec::new(),
+            query_graph: Vec::new(),
             converged: false,
             forest,
             original_ids: (0..n).collect(),
@@ -1033,11 +1040,21 @@ where
             verbose,
         )?;
 
-        let graph = if diversify_prob > T::zero() {
-            builder.diversify_graph(&build_graph, k, diversify_prob, seed)
+        // Diversification only shapes what the query walks. Extraction and
+        // NSG keep the full kNN graph.
+        let query_graph: Vec<u32> = if diversify_prob > T::zero() {
+            builder
+                .diversify_graph(&build_graph, k, diversify_prob, seed)
+                .into_iter()
+                .map(|(pid, _)| pid as u32)
+                .collect()
         } else {
-            build_graph
+            build_graph.iter().map(|&(pid, _)| pid as u32).collect()
         };
+        let graph: Vec<(u32, T)> = build_graph
+            .into_iter()
+            .map(|(pid, d)| (pid as u32, d))
+            .collect();
 
         Ok(NNDescent {
             vectors_flat: builder.vectors_flat,
@@ -1047,6 +1064,7 @@ where
             metric: builder.metric,
             norms: builder.norms,
             graph,
+            query_graph,
             converged,
             forest: builder.forest,
             original_ids: (0..n).collect(),
@@ -1076,7 +1094,7 @@ where
     /// ### Returns
     ///
     /// A slice view over the internal graph.
-    pub fn graph(&self) -> &[(usize, T)] {
+    pub fn graph(&self) -> &[(u32, T)] {
         &self.graph
     }
 
@@ -1821,10 +1839,10 @@ where
     ///
     /// ### Returns
     ///
-    /// Slice of `k` `(pid, distance)` pairs, possibly containing sentinels
+    /// Slice of `k` neighbour ids, possibly containing sentinels
     #[inline]
-    fn graph_neighbours(&self, idx: usize) -> &[(usize, T)] {
-        &self.graph[idx * self.k..(idx + 1) * self.k]
+    fn graph_neighbours(&self, idx: usize) -> &[u32] {
+        &self.query_graph[idx * self.k..(idx + 1) * self.k]
     }
 
     /// Query for k nearest neighbours using beam search.
@@ -1971,7 +1989,8 @@ where
         total += self.vectors_flat.capacity() * std::mem::size_of::<T>();
         total += self.norms.capacity() * std::mem::size_of::<T>();
         total += self.forest.memory_usage_bytes();
-        total += self.graph.capacity() * std::mem::size_of::<(usize, T)>();
+        total += self.graph.capacity() * std::mem::size_of::<(u32, T)>();
+        total += self.query_graph.capacity() * std::mem::size_of::<u32>();
 
         total
     }
@@ -2173,7 +2192,8 @@ macro_rules! impl_nndescent_query {
                         break;
                     }
 
-                    for &(nbr_idx, _) in self.graph_neighbours(curr_idx) {
+                    for &nbr in self.graph_neighbours(curr_idx) {
+                        let nbr_idx = nbr as usize;
                         if nbr_idx == SENTINEL_PID || visited.contains(nbr_idx) {
                             continue;
                         }
@@ -2255,7 +2275,8 @@ macro_rules! impl_nndescent_query {
                         break;
                     }
 
-                    for &(nbr_idx, _) in self.graph_neighbours(curr_idx) {
+                    for &nbr in self.graph_neighbours(curr_idx) {
+                        let nbr_idx = nbr as usize;
                         if nbr_idx == SENTINEL_PID || visited.contains(nbr_idx) {
                             continue;
                         }
@@ -2338,7 +2359,8 @@ macro_rules! impl_nndescent_query {
                         break;
                     }
 
-                    for &(nbr_idx, _) in self.graph_neighbours(curr_idx) {
+                    for &nbr in self.graph_neighbours(curr_idx) {
+                        let nbr_idx = nbr as usize;
                         if nbr_idx == SENTINEL_PID || visited.contains(nbr_idx) {
                             continue;
                         }
@@ -2460,7 +2482,7 @@ mod tests {
     fn neighbours(index: &NNDescent<f32>, i: usize) -> Vec<(usize, f32)> {
         index.graph[i * index.k..(i + 1) * index.k]
             .iter()
-            .copied()
+            .map(|&(pid, d)| (pid as usize, d))
             .filter(|&(pid, _)| pid != SENTINEL_PID)
             .collect()
     }
@@ -2468,7 +2490,7 @@ mod tests {
     fn neighbours_f64(index: &NNDescent<f64>, i: usize) -> Vec<(usize, f64)> {
         index.graph[i * index.k..(i + 1) * index.k]
             .iter()
-            .copied()
+            .map(|&(pid, d)| (pid as usize, d))
             .filter(|&(pid, _)| pid != SENTINEL_PID)
             .collect()
     }
@@ -2783,6 +2805,40 @@ mod tests {
             assert!(!neighbours(&index, i).is_empty());
         }
     }
+
+    #[test]
+    fn test_nndescent_diversify_shapes_the_query_graph_not_the_extraction() {
+        let n = 400;
+        let dim = 8;
+        let k = 10;
+        let mut rng = rand::rngs::StdRng::seed_from_u64(3);
+        let data: Vec<f32> = (0..n * dim).map(|_| rng.random_range(-1.0..1.0)).collect();
+        let index = NNDescent::<f32>::new(
+            (&data[..], n, dim),
+            Dist::SquaredEuclidean,
+            Some(k),
+            None,
+            None,
+            None,
+            0.001,
+            1.0,
+            42,
+            false,
+        )
+        .unwrap();
+
+        let (ids, _) = index.extract_knn(None, false, false);
+        assert!(ids.iter().all(|row| row.len() == k), "extraction lost edges");
+        // Diversification prunes over the forward+reverse pool and tops rows
+        // back up, so the query graph differs in content, not in fill.
+        let changed = index
+            .query_graph
+            .iter()
+            .zip(&index.graph)
+            .filter(|(&q, &(g, _))| q != g)
+            .count();
+        assert!(changed > 0, "diversify_prob = 1.0 left the query graph unchanged");
+    }
     ///////////////////////
     // Candidate sets    //
     ///////////////////////
@@ -2902,7 +2958,7 @@ mod tests {
         let graph: Vec<Neighbour<f32>> = index
             .graph
             .iter()
-            .map(|&(pid, d)| Neighbour::new(pid, d, true))
+            .map(|&(pid, d)| Neighbour::new(pid as usize, d, true))
             .collect();
         index.build_candidates(&graph, index.k, max_candidates, 42, &mut cands);
 
@@ -3036,6 +3092,7 @@ mod tests {
         let dim = index.dim;
         for i in 0..index.n {
             for &(pid, d) in &index.graph[i * index.k..(i + 1) * index.k] {
+                let pid = pid as usize;
                 if pid == SENTINEL_PID {
                     continue;
                 }
@@ -3116,6 +3173,7 @@ mod tests {
         let dim = index.dim;
         for i in 0..index.n {
             for &(pid, d) in &index.graph[i * index.k..(i + 1) * index.k] {
+                let pid = pid as usize;
                 if pid == SENTINEL_PID {
                     continue;
                 }
@@ -3157,7 +3215,7 @@ mod tests {
         assert!(index
             .graph()
             .iter()
-            .any(|&(pid, _)| pid == SENTINEL_PID || pid < index.n));
+            .any(|&(pid, _)| pid as usize == SENTINEL_PID || (pid as usize) < index.n));
     }
 
     #[test]
@@ -3222,7 +3280,7 @@ mod tests {
             for i in 0..index.n {
                 let row: Vec<f32> = index.graph[i * index.k..(i + 1) * index.k]
                     .iter()
-                    .filter(|&&(pid, _)| pid != SENTINEL_PID)
+                    .filter(|&&(pid, _)| pid as usize != SENTINEL_PID)
                     .map(|&(_, d)| d)
                     .collect();
                 assert!(

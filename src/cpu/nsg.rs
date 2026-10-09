@@ -669,13 +669,20 @@ where
         seed: usize,
         verbose: bool,
     ) -> Result<Self, AnnSearchErrors> {
+        // NN-Descent stores u32 ids; NSG's build walks usize. One transient
+        // copy against a build that dwarfs it.
+        let knn_graph: Vec<(usize, T)> = nnd
+            .graph()
+            .iter()
+            .map(|&(pid, d)| (pid as usize, d))
+            .collect();
         Self::build_from_knn(
             nnd.vectors_flat.to_owned(),
             nnd.n,
             nnd.dim,
             nnd.norms.to_owned(),
             nnd.metric(),
-            nnd.graph(),
+            &knn_graph,
             nnd.k,
             params,
             seed,

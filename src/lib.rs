@@ -1289,7 +1289,9 @@ where
 ///   per candidate/kept pair, applied post-descent to the forward+reverse
 ///   candidate pool per node. `0.0` disables pruning; `1.0` always prunes
 ///   when the RNG rule fires. Rows shorter than `k` after pruning are
-///   topped up from the pruned tail so out-degree is preserved.
+///   topped up from the pruned tail so out-degree is preserved. Shapes only
+///   the graph the query walks; `extract_knn` and NSG read the full kNN
+///   graph either way.
 /// * `k` - Number of neighbours for the k-NN graph (default 30).
 /// * `max_iter` - Maximum iterations for the algorithm (default
 ///   `log2(n).round().max(5)`).

@@ -26,6 +26,30 @@ use std::sync::atomic::{AtomicU32, Ordering};
 /// ~2 billion.
 pub const SENTINEL_PID: usize = u32::MAX as usize >> 1;
 
+/// A stored neighbour id
+///
+/// The CPU NN-Descent graph stores `u32` ids, the GPU and clustered graphs
+/// `usize`. Both fit below [`SENTINEL_PID`], so readers such as
+/// [`unpack_knn_graph`] take either without a copy.
+pub trait GraphPid: Copy + Send + Sync {
+    /// The id as an index.
+    fn pid(self) -> usize;
+}
+
+impl GraphPid for usize {
+    #[inline(always)]
+    fn pid(self) -> usize {
+        self
+    }
+}
+
+impl GraphPid for u32 {
+    #[inline(always)]
+    fn pid(self) -> usize {
+        self as usize
+    }
+}
+
 ////////////////
 // Neighbours //
 ////////////////
@@ -165,8 +189,8 @@ impl<T: Copy> Neighbour<T> {
 ///
 /// `(indices, distances)` with one row per node. Distances are `None` when
 /// `return_dist` is false.
-pub fn unpack_knn_graph<T: Copy + Send + Sync + num_traits::Zero + PartialOrd>(
-    graph: &[(usize, T)],
+pub fn unpack_knn_graph<P: GraphPid, T: Copy + Send + Sync + num_traits::Zero + PartialOrd>(
+    graph: &[(P, T)],
     n: usize,
     k: usize,
     k_out: Option<usize>,
@@ -195,6 +219,7 @@ pub fn unpack_knn_graph<T: Copy + Send + Sync + num_traits::Zero + PartialOrd>(
                 }
             }
             for &(pid, dist) in &graph[i * k..(i + 1) * k] {
+                let pid = pid.pid();
                 if pid == SENTINEL_PID {
                     continue;
                 }
