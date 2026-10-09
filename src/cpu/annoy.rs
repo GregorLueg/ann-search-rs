@@ -13,8 +13,16 @@ use std::sync::{
 use thousands::*;
 
 use crate::prelude::*;
+use crate::utils::dist::cosine_from_dot;
 use crate::utils::tree_utils::*;
 use crate::utils::*;
+
+////////////
+// Consts //
+////////////
+
+/// Samples drawn by the angular two-means split, as in Spotify Annoy.
+const TWO_MEANS_STEPS: usize = 200;
 
 /////////////
 // Helpers //
@@ -292,6 +300,75 @@ where
         nodes
     }
 
+    /// Angular split normal from two-means over the node's items
+    ///
+    /// Spotify Annoy's angular split. Starts from two unit-normalised seed
+    /// rows and moves each centroid towards the sampled items closer to it
+    /// in angle, for `TWO_MEANS_STEPS` samples. The normal is the difference
+    /// of the two unit centroids, so the plane passes through the origin. A
+    /// random pair alone splits on whichever two points were drawn; on hubby
+    /// cosine data such as word embeddings that leaves poor leaves.
+    ///
+    /// ### Params
+    ///
+    /// * `vectors_flat` - Flattened vector data
+    /// * `dim` - Dimensionality of vectors
+    /// * `items` - Indices in this node to sample from
+    /// * `seed_a` - First seed row, non-zero
+    /// * `seed_b` - Second seed row, non-zero
+    /// * `rng` - Random number generator for this tree
+    ///
+    /// ### Returns
+    ///
+    /// The hyperplane normal, length `dim`.
+    fn angular_two_means(
+        vectors_flat: &[T],
+        dim: usize,
+        items: &[usize],
+        seed_a: &[T],
+        seed_b: &[T],
+        rng: &mut StdRng,
+    ) -> Vec<T> {
+        let unit = |v: &[T]| -> Vec<T> {
+            let n = T::calculate_l2_norm(v);
+            v.iter().map(|&x| x / n).collect()
+        };
+        let mut p = unit(seed_a);
+        let mut q = unit(seed_b);
+        let (mut pc, mut qc) = (T::one(), T::one());
+        let (mut p_norm, mut q_norm) = (T::one(), T::one());
+
+        for _ in 0..TWO_MEANS_STEPS {
+            let item = items[rng.random_range(0..items.len())];
+            let row = &vectors_flat[item * dim..(item + 1) * dim];
+            let row_norm = T::calculate_l2_norm(row);
+            if row_norm == T::zero() {
+                continue;
+            }
+            // Cosine distance to each centroid, weighted by its size as in
+            // Spotify's two_means, so a big cluster does not swallow the node.
+            let dp = pc * cosine_from_dot(T::dot_simd(&p, row), p_norm * row_norm);
+            let dq = qc * cosine_from_dot(T::dot_simd(&q, row), q_norm * row_norm);
+            let (c, cnt, c_norm) = if dp < dq {
+                (&mut p, &mut pc, &mut p_norm)
+            } else if dq < dp {
+                (&mut q, &mut qc, &mut q_norm)
+            } else {
+                continue;
+            };
+            let next = *cnt + T::one();
+            for k in 0..dim {
+                c[k] = (c[k] * *cnt + row[k] / row_norm) / next;
+            }
+            *cnt = next;
+            *c_norm = T::calculate_l2_norm(c);
+        }
+
+        let p = unit(&p);
+        let q = unit(&q);
+        (0..dim).map(|k| p[k] - q[k]).collect()
+    }
+
     /// Recursively build a node (split or leaf)
     ///
     /// Attempts up to 10 random hyperplane splits. For each split, picks two
@@ -353,7 +430,7 @@ where
                         continue;
                     }
 
-                    let hp: Vec<T> = (0..dim).map(|k| v1[k] / norm1 - v2[k] / norm2).collect();
+                    let hp = Self::angular_two_means(vectors_flat, dim, &items, v1, v2, rng);
 
                     (hp, T::zero())
                 }
