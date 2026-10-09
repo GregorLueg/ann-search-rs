@@ -65,6 +65,7 @@ LIBRARY_STYLE: dict[str, tuple[str, str]] = {
     "usearch": ("#008300", "P"),
     "ann_search_sq8": ("#4a3aa7", "X"),
     "faiss_sq8": ("#e34948", "*"),
+    "ann_search_gpu": ("#52514e", "h"),
 }
 
 ########

@@ -25,6 +25,7 @@ SEARCH_K_GRID: list[int] = [K * ANNOY_TREES * f for f in (1, 2, 5, 10, 20, 50, 1
 NPROBE_GRID: list[int] = [2, 4, 8, 16, 32, 64, 128]
 NND_K_GRAPH: int = 30
 EPSILON_GRID: list[float] = [0.0, 0.02, 0.05, 0.1, 0.15, 0.2, 0.3]
+BEAM_GRID: list[int] = [16, 32, 64, 128, 256]
 
 QueryFn = Callable[[np.ndarray, int | float | None], np.ndarray]
 Built = tuple[QueryFn, list[int | float | None]]
@@ -53,9 +54,16 @@ def normalise(x: np.ndarray) -> np.ndarray:
 
 @beartype
 def ann_search_builder(
-    cls_name: str, knob: str | None, grid: list, **params: object
+    cls_name: str,
+    knob: str | Callable[[int | float | None], dict[str, object]] | None,
+    grid: list,
+    **params: object,
 ) -> Callable:
-    """Builder for one ann-search index class with an optional search knob."""
+    """Builder for one ann-search index class.
+
+    `knob` is the search parameter the grid sweeps, or a function from a grid
+    value to the overrides, for indices whose knobs move together.
+    """
 
     @beartype
     def build(train: np.ndarray, threads: int, metric: str) -> Built:
@@ -66,7 +74,13 @@ def ann_search_builder(
 
         @beartype
         def query(x: np.ndarray, p: int | float | None) -> np.ndarray:
-            overrides = {} if knob is None else {knob: p}
+            match knob:
+                case None:
+                    overrides = {}
+                case str():
+                    overrides = {knob: p}
+                case _:
+                    overrides = knob(p)
             return index.kneighbors(
                 x, n_neighbors=K, return_distance=False, **overrides
             )
@@ -309,6 +323,14 @@ METHODS: dict[str, Callable[[np.ndarray, int, str], Built]] = {
     "ann_search:ivf": ann_search_builder("IvfIndex", "nprobe", NPROBE_GRID),
     "ann_search:nndescent": ann_search_builder(
         "NNDescentIndex", "ef_search", EF_GRID, n_neighbors=NND_K_GRAPH
+    ),
+    "ann_search_gpu:exhaustive": ann_search_builder("ExhaustiveGpuIndex", None, [None]),
+    "ann_search_gpu:ivf": ann_search_builder("IvfGpuIndex", "nprobe", NPROBE_GRID),
+    # The four beam knobs are all-or-nothing; keep the default 3x iteration cap.
+    "ann_search_gpu:cagra": ann_search_builder(
+        "CagraGpuIndex",
+        lambda b: {"beam_width": b, "max_beam_iters": 3 * b},
+        BEAM_GRID,
     ),
     "faiss:exhaustive": faiss_exhaustive,
     "hnswlib:hnsw": hnswlib_hnsw,
