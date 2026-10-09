@@ -53,6 +53,12 @@ uv run bench.py summarise
 
 - The bindings build with the `accelerate` feature, so on macOS exact search
   runs through Apple Accelerate. The other docs here run on faer.
+- `ann_search_gpu` rows are the wgpu indices (exhaustive, IVF, CAGRA) on the
+  M1 Max's integrated GPU. Not apples to apples: they sit next to CPU
+  libraries because wgpu runs on Metal, Vulkan and DX12, so no NVIDIA card is
+  needed. Thread counts don't apply to them, so the 1-thread run leaves them
+  out. Memory is unified here, so their footprint includes the device
+  buffers.
 - Builds are a single run each. Read small gaps as ties.
 - Fashion-MNIST and SIFT hold integers from 0 to 255, so uniform 8-bit codes
   are close to lossless on them and the SQ8 rows look better than they will on
