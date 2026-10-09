@@ -705,8 +705,12 @@ where
 
     let max_leaf_size = compute_max_leaf_size(dim_padded, size_of::<T>(), &limits)?;
 
-    // Decouple the depth calculation to target leaves of ~64
-    let target_leaf_size = 64.0;
+    // Leaves of ~64, but never more than the leaf kernel can stage. At high
+    // dim the capacity drops below 64 (10 points at dim 784 on 32 KiB) and the
+    // kernel would truncate every leaf, leaving most points without
+    // proposals. Deeper trees keep every point in play; at dim <= 64 the
+    // capacity is 256 and nothing changes.
+    let target_leaf_size = 64.0_f64.min(max_leaf_size as f64);
     let max_depth = if n as f64 <= target_leaf_size {
         0
     } else {
