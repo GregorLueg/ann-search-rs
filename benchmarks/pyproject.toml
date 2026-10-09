@@ -1,0 +1,41 @@
+[project]
+name = "ann-search-benchmarks"
+version = "0.0.0"
+description = "ann-search against hnswlib, annoy, pynndescent and faiss on the ann-benchmarks datasets."
+requires-python = ">=3.12,<3.13"
+dependencies = [
+    "ann-search",
+    "annoy>=1.17",
+    "beartype>=0.19",
+    "click>=8.1",
+    "faiss-cpu>=1.9",
+    "h5py>=3.11",
+    "hnswlib>=0.8",
+    "matplotlib>=3.9",
+    "numpy>=1.26",
+    "polars>=1.0",
+    "psutil>=6.0",
+    "pynndescent>=0.5.13",
+]
+
+[tool.uv]
+package = false
+
+# Builds the binding from this checkout. uv only rebuilds a path dependency
+# when its pyproject changes, so after touching the crate run
+# `uv sync --reinstall-package ann-search` before benchmarking.
+[tool.uv.sources]
+ann-search = { path = "../python" }
+
+# annoy 1.17.3 builds with -ffast-math, which recent clang reads as
+# finite-math-only. Its search queue starts at infinity, so every query then
+# returns a single wrong id. Same flags as its setup.py, plus the opt-out.
+[tool.uv.extra-build-variables]
+annoy = { ANNOY_COMPILER_ARGS = "-D_CRT_SECURE_NO_WARNINGS,-fpermissive,-O3,-ffast-math,-fno-associative-math,-fno-finite-math-only,-DANNOYLIB_MULTITHREADED_BUILD,-std=c++14,-mmacosx-version-min=10.12" }
+
+[tool.ruff]
+line-length = 88
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "N", "UP", "B", "SIM", "RUF"]

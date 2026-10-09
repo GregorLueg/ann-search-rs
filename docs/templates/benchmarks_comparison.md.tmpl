@@ -1,0 +1,93 @@
+## Comparison against other libraries
+
+How does ann-search stack up against what people reach for in Python? We run
+the [ann-benchmarks](https://ann-benchmarks.com) protocol on three of its
+datasets and compare every library at **equal recall**, not at equal settings.
+Two libraries with the same `ef_search` land at different recall, so "faster at
+the same parameters" says little. Each library builds once, its search knob is
+swept, and the tables give the best queries per second (QPS) it reaches at
+recall@10 of 0.90, 0.95 and 0.99.
+
+Run via the Python bindings (from `benchmarks/`):
+
+```bash
+uv run bench.py run --dataset fashion-mnist-784-euclidean --threads 10
+uv run bench.py run --dataset fashion-mnist-784-euclidean --threads 1
+uv run bench.py run --dataset sift-128-euclidean --threads 10
+uv run bench.py run --dataset glove-100-angular --threads 10
+uv run bench.py summarise
+```
+
+### Setup
+
+- **Datasets:** Fashion-MNIST (60,000 x 784, Euclidean), SIFT (1,000,000 x
+  128, Euclidean) and GloVe (1,183,514 x 100, cosine). 10,000 held-out queries
+  each, k = 10, ground truth from the HDF5 files. Recall is the overlap of
+  neighbour ids.
+- **Matched builds:** HNSW at M = 16 and ef_construction = 200 (ann-search,
+  hnswlib, faiss `IndexHNSWFlat`); Annoy at 50 trees (ann-search, annoy);
+  NN-Descent graphs of degree 30 (ann-search, pynndescent); IVF at
+  `nlist = sqrt(n)` (ann-search, faiss `IndexIVFFlat` with its default
+  training); exact search as the baseline (ann-search, faiss `IndexFlat`).
+- **Swept at query time:** `ef_search` 10 to 640; annoy `search_k` 500 to
+  50,000; `nprobe` 2 to 128; pynndescent `epsilon` 0 to 0.3.
+- **Timing:** one build, then per sweep point an untimed 100-query warm-up and
+  one timed call over all 10,000 queries. pynndescent's `prepare()` counts
+  towards its build, and its numba JIT is warmed beforehand.
+- **Memory:** every library and method runs in its own process, measured as
+  the kernel's `phys_footprint` (what Activity Monitor shows; RSS on Linux).
+  *Build peak* is the peak above the baseline before the training data was
+  loaded, so it includes the input data. *Index* is what stays once the
+  caller's copy of the data is freed: an index that copies the vectors and one
+  that keeps a reference both count them once. Freed memory the allocator
+  holds on to still counts, as it does for any process that built the index.
+- **Threads:** pinned through each library's own argument plus
+  `OMP_NUM_THREADS`, `NUMBA_NUM_THREADS` and friends. annoy's Python API
+  queries one vector at a time, so its multi-threaded rows split the queries
+  over a thread pool.
+
+### Caveats
+
+- The bindings build with the `accelerate` feature, so on macOS exact search
+  runs through Apple Accelerate. The other docs here run on faer.
+- Each point is a single run. Read small gaps as ties.
+
+## Table of Contents
+
+- [Fashion-MNIST, 10 threads](#fashion-mnist-10-threads)
+- [Fashion-MNIST, 1 thread](#fashion-mnist-1-thread)
+- [SIFT, 10 threads](#sift-10-threads)
+- [GloVe, 10 threads](#glove-10-threads)
+
+### Fashion-MNIST, 10 threads
+
+![](figures/comparison_fashion-mnist-784-euclidean_t10.png)
+
+<!-- BENCH:fashion-mnist-784-euclidean_t10 -->
+
+### Fashion-MNIST, 1 thread
+
+The ann-benchmarks convention.
+
+![](figures/comparison_fashion-mnist-784-euclidean_t1.png)
+
+<!-- BENCH:fashion-mnist-784-euclidean_t1 -->
+
+### SIFT, 10 threads
+
+![](figures/comparison_sift-128-euclidean_t10.png)
+
+<!-- BENCH:sift-128-euclidean_t10 -->
+
+### GloVe, 10 threads
+
+![](figures/comparison_glove-100-angular_t10.png)
+
+<!-- BENCH:glove-100-angular_t10 -->
+
+---
+
+### Runtime info
+
+<!-- RUNINFO -->
+*All benchmarks were run on M1 Max MacBook Pro with 64 GB unified memory.*
