@@ -176,5 +176,5 @@ The ann-benchmarks convention.
 
 ### Runtime info
 
-*ann-search-rs 0.10.1 (commit v0.10.1-17-g0393802-dirty), run on 2026-10-09 on Apple M1 Max.*
+*ann-search-rs 0.10.1 (commit v0.10.1-17-g0393802), run on 2026-10-09 on Apple M1 Max.*
 *All benchmarks were run on M1 Max MacBook Pro with 64 GB unified memory.*
