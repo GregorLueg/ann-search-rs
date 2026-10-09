@@ -25,7 +25,9 @@ uv run bench.py summarise
   each, k = 10, ground truth from the HDF5 files. Recall is the overlap of
   neighbour ids.
 - **Matched builds:** HNSW at M = 16 and ef_construction = 200 (ann-search,
-  hnswlib, faiss `IndexHNSWFlat`); Annoy at 50 trees (ann-search, annoy);
+  hnswlib, faiss `IndexHNSWFlat`, usearch at `f32`); the same graph on uniform
+  8-bit codes (ann-search `HnswSq8uIndex`, faiss `IndexHNSWSQ` with
+  `QT_8bit_uniform`), both building on the codes; Annoy at 50 trees (ann-search, annoy);
   NN-Descent graphs of degree 30 (ann-search, pynndescent); IVF at
   `nlist = sqrt(n)` (ann-search, faiss `IndexIVFFlat`), each with its own
   default training: 30 k-means iterations here, 10 in faiss, which is most of
@@ -52,6 +54,9 @@ uv run bench.py summarise
 - The bindings build with the `accelerate` feature, so on macOS exact search
   runs through Apple Accelerate. The other docs here run on faer.
 - Builds are a single run each. Read small gaps as ties.
+- Fashion-MNIST and SIFT hold integers from 0 to 255, so uniform 8-bit codes
+  are close to lossless on them and the SQ8 rows look better than they will on
+  real embeddings. GloVe is the honest test.
 
 ## Table of Contents
 

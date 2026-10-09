@@ -16,6 +16,7 @@ dependencies = [
     "polars>=1.0",
     "psutil>=6.0",
     "pynndescent>=0.5.13",
+    "usearch>=2",
 ]
 
 [tool.uv]

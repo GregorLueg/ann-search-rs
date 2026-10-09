@@ -99,6 +99,36 @@ def hnswlib_hnsw(train: np.ndarray, threads: int, metric: str) -> Built:
     return query, EF_GRID
 
 
+###########
+# usearch #
+###########
+
+
+@beartype
+def usearch_hnsw(train: np.ndarray, threads: int, metric: str) -> Built:
+    """usearch at connectivity = 16 (32 on level 0), expansion_add = 200.
+
+    dtype is pinned to f32 so it cannot quantise behind our back.
+    """
+    from usearch.index import Index
+
+    index = Index(
+        ndim=train.shape[1],
+        metric="l2sq" if metric == "euclidean" else "cos",
+        dtype="f32",
+        connectivity=HNSW_M,
+        expansion_add=HNSW_EFC,
+    )
+    index.add(np.arange(train.shape[0]), train, threads=threads)
+
+    @beartype
+    def query(x: np.ndarray, ef: int | float | None) -> np.ndarray:
+        index.expansion_search = max(int(ef), K)
+        return index.search(x, K, threads=threads).keys
+
+    return query, EF_GRID
+
+
 #########
 # faiss #
 #########
@@ -143,6 +173,35 @@ def faiss_hnsw(train: np.ndarray, threads: int, metric: str) -> Built:
     index = faiss.IndexHNSWFlat(train.shape[1], HNSW_M, faiss_metric(metric))
     index.hnsw.efConstruction = HNSW_EFC
     index.add(faiss_prep(train, metric))
+
+    @beartype
+    def query(x: np.ndarray, ef: int | float | None) -> np.ndarray:
+        index.hnsw.efSearch = max(int(ef), K)
+        return index.search(faiss_prep(x, metric), K)[1]
+
+    return query, EF_GRID
+
+
+@beartype
+def faiss_hnsw_sq8(train: np.ndarray, threads: int, metric: str) -> Built:
+    """faiss IndexHNSWSQ, uniform 8-bit codes, graph built on the codes.
+
+    `QT_8bit_uniform` (one range for every dimension) matches the crate's
+    `HnswSq8uIndex` codec; `QT_8bit` would be per-dimension.
+    """
+    import faiss
+
+    faiss.omp_set_num_threads(threads)
+    data = faiss_prep(train, metric)
+    index = faiss.IndexHNSWSQ(
+        train.shape[1],
+        faiss.ScalarQuantizer.QT_8bit_uniform,
+        HNSW_M,
+        faiss_metric(metric),
+    )
+    index.hnsw.efConstruction = HNSW_EFC
+    index.train(data)
+    index.add(data)
 
     @beartype
     def query(x: np.ndarray, ef: int | float | None) -> np.ndarray:
@@ -244,6 +303,9 @@ METHODS: dict[str, Callable[[np.ndarray, int, str], Built]] = {
     "ann_search:annoy": ann_search_builder(
         "AnnoyIndex", "search_budget", SEARCH_K_GRID, n_trees=ANNOY_TREES
     ),
+    "ann_search_sq8:hnsw": ann_search_builder(
+        "HnswSq8uIndex", "ef_search", EF_GRID, m=HNSW_M, ef_construction=HNSW_EFC
+    ),
     "ann_search:ivf": ann_search_builder("IvfIndex", "nprobe", NPROBE_GRID),
     "ann_search:nndescent": ann_search_builder(
         "NNDescentIndex", "ef_search", EF_GRID, n_neighbors=NND_K_GRAPH
@@ -251,6 +313,8 @@ METHODS: dict[str, Callable[[np.ndarray, int, str], Built]] = {
     "faiss:exhaustive": faiss_exhaustive,
     "hnswlib:hnsw": hnswlib_hnsw,
     "faiss:hnsw": faiss_hnsw,
+    "usearch:hnsw": usearch_hnsw,
+    "faiss_sq8:hnsw": faiss_hnsw_sq8,
     "annoy:annoy": annoy_annoy,
     "faiss:ivf": faiss_ivf,
     "pynndescent:nndescent": pynndescent_nndescent,

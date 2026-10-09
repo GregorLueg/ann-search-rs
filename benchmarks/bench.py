@@ -62,6 +62,9 @@ LIBRARY_STYLE: dict[str, tuple[str, str]] = {
     "faiss": ("#1baf7a", "^"),
     "annoy": ("#eda100", "D"),
     "pynndescent": ("#e87ba4", "v"),
+    "usearch": ("#008300", "P"),
+    "ann_search_sq8": ("#4a3aa7", "X"),
+    "faiss_sq8": ("#e34948", "*"),
 }
 
 ########
@@ -338,7 +341,9 @@ def to_markdown(summary: pl.DataFrame) -> str:
     )
     lines = [header, "|" + "---|" * 2 + "---:|" * (3 + len(RECALL_TARGETS))]
     for r in summary.iter_rows(named=True):
-        lib = f"**{r['library']}**" if r["library"] == "ann_search" else r["library"]
+        lib = r["library"]
+        if lib.startswith("ann_search"):
+            lib = f"**{lib}**"
         qps = [r[f"qps@{t}"] for t in RECALL_TARGETS]
         lines.append(
             f"| {r['method']} | {lib} | {r['build_s']:.1f} | "
