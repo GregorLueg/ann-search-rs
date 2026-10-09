@@ -405,6 +405,7 @@ pub fn cagra_beam_search<F: Float, N: Size>(
     let mut s_active_flag = SharedMemory::<u32>::new(1usize);
     let mut s_num_cands = SharedMemory::<u32>::new(1usize);
     let mut s_query_norm = SharedMemory::<F>::new(1usize);
+    let mut s_hash_count = SharedMemory::<u32>::new(1usize);
 
     let q_line_offset = q_idx as usize * dim_lines;
     let mut il = tx as usize;
@@ -518,9 +519,20 @@ pub fn cagra_beam_search<F: Float, N: Size>(
             e += 1usize;
         }
         s_num_cands[0usize] = num_cands;
+        // Every entry that went in was new, so the beam and the table agree.
+        s_hash_count[0usize] = num_cands;
     }
 
     sync_cube();
+
+    // Forget the table before this iteration's inserts could push it past
+    // three quarters full. Linear probing degrades sharply above that, and a
+    // full table drops every new neighbour, which caps the search at
+    // `hash_size` visited nodes whatever the beam width. Re-inserting the beam
+    // keeps its members deduplicated; any other node seen again is worse than
+    // the beam's worst (the worst only ever improves), so the merge skips it.
+    let reset_at = (hash_size * 3 / 4) as u32;
+    let total_slots_u32 = total_slots as u32;
 
     let max_iter_u32 = max_iters as u32;
     let mut iter: u32 = 0u32;
@@ -531,6 +543,36 @@ pub fn cagra_beam_search<F: Float, N: Size>(
             s_active_flag[0usize] = sentinel;
             let nc = s_num_cands[0usize];
             let mut active_count: u32 = 0u32;
+            let mut hash_count = s_hash_count[0usize];
+
+            if hash_count + total_slots_u32 > reset_at {
+                let mut hr = 0usize;
+                while hr < hash_size {
+                    s_hash[hr] = sentinel;
+                    hr += 1usize;
+                }
+                hash_count = 0u32;
+                let mut bi = 0u32;
+                while bi < nc {
+                    let node = s_cand_idx[bi as usize];
+                    let mut hs = node & hash_mask;
+                    let mut ha = 0u32;
+                    let mut placed = false;
+                    // Bounded like every other probe: a planner-shrunk table
+                    // can be smaller than the beam on a small device.
+                    while !placed && ha < hash_size as u32 {
+                        if s_hash[hs as usize] == sentinel {
+                            s_hash[hs as usize] = node;
+                            placed = true;
+                        } else {
+                            hs = (hs + 1u32) & hash_mask;
+                            ha += 1u32;
+                        }
+                    }
+                    hash_count += 1u32;
+                    bi += 1u32;
+                }
+            }
 
             // Claim up to P unexpanded candidates in beam order (ascending dist).
             let mut fc = 0u32;
@@ -564,6 +606,7 @@ pub fn cagra_beam_search<F: Float, N: Size>(
                             }
                             if is_new {
                                 s_nbr_idx[slot_base + j] = nbr;
+                                hash_count += 1u32;
                             } else {
                                 s_nbr_idx[slot_base + j] = sentinel;
                             }
@@ -577,6 +620,9 @@ pub fn cagra_beam_search<F: Float, N: Size>(
                 fc += 1u32;
             }
 
+            s_hash_count[0usize] = hash_count;
+            let claimed = active_count;
+
             // Pad remaining expansion slots with sentinels.
             while active_count < expand_u32 {
                 let slot_base = active_count as usize * k_graph;
@@ -588,17 +634,11 @@ pub fn cagra_beam_search<F: Float, N: Size>(
                 active_count += 1u32;
             }
 
-            // Terminate when nothing was expanded this iteration, judged by
-            // whether any non-sentinel landed in `s_nbr_idx`.
-            let mut any_real: bool = false;
-            let mut ck = 0usize;
-            while ck < total_slots {
-                if s_nbr_idx[ck] != sentinel {
-                    any_real = true;
-                }
-                ck += 1usize;
-            }
-            if any_real {
+            // Stop once every beam entry has been expanded. A claimed node
+            // whose neighbours were all seen already is not a reason to stop:
+            // unexpanded entries further down the beam may still lead
+            // somewhere.
+            if claimed > 0u32 {
                 s_active_flag[0usize] = 0u32;
             } else {
                 s_active_flag[0usize] = sentinel;
@@ -1380,6 +1420,98 @@ mod tests {
             recall > 0.85,
             "Recall too low: {recall:.4} (expected > 0.85 with brute-force graph)"
         );
+    }
+
+    /// A beam that visits far more nodes than the visited table holds. Before
+    /// the table was reset, every insert past `hash_size` was dropped and the
+    /// search stopped early, so recall collapsed once the table filled.
+    #[test]
+    fn test_beam_search_outgrows_the_hash_table() {
+        let Some(device) = try_device() else {
+            eprintln!("Skipping: no wgpu backend");
+            return;
+        };
+
+        let client = WgpuRuntime::client(&device);
+        let n = 2000usize;
+        let dim = 32usize;
+        let k_graph = 15usize;
+        let k_out = 10usize;
+        let n_queries = 20usize;
+        let (beam_width, max_iters, n_entry, expand) = (64usize, 192usize, 8usize, 3usize);
+        let hash_size = 128usize;
+
+        let mut rng = SmallRng::seed_from_u64(7);
+        let data: Vec<f32> = (0..n * dim)
+            .map(|_| rng.random_range(-10.0..10.0f32))
+            .collect();
+        let graph_flat = build_brute_force_graph(&data, n, dim, k_graph);
+        let queries: Vec<f32> = (0..n_queries * dim)
+            .map(|_| rng.random_range(-10.0..10.0f32))
+            .collect();
+        let entries: Vec<u32> = (0..n_queries * n_entry)
+            .map(|_| rng.random_range(0..n as u32))
+            .collect();
+
+        let vectors_gpu =
+            GpuTensor::<WgpuRuntime, f32>::from_slice(&data, vec![n, dim], &client).unwrap();
+        let norms_gpu =
+            GpuTensor::<WgpuRuntime, f32>::from_slice(&[0.0f32], vec![1], &client).unwrap();
+        let graph_gpu =
+            GpuTensor::<WgpuRuntime, u32>::from_slice(&graph_flat, vec![n, k_graph], &client)
+                .unwrap();
+        let queries_gpu =
+            GpuTensor::<WgpuRuntime, f32>::from_slice(&queries, vec![n_queries, dim], &client)
+                .unwrap();
+        let entry_gpu =
+            GpuTensor::<WgpuRuntime, u32>::from_slice(&entries, vec![n_queries, n_entry], &client)
+                .unwrap();
+        let out_idx = GpuTensor::<WgpuRuntime, u32>::empty(vec![n_queries, k_out], &client).unwrap();
+        let out_dist =
+            GpuTensor::<WgpuRuntime, f32>::empty(vec![n_queries, k_out], &client).unwrap();
+        let out_iters = GpuTensor::<WgpuRuntime, u32>::empty(vec![n_queries], &client).unwrap();
+
+        unsafe {
+            cagra_beam_search::launch_unchecked::<f32, WgpuRuntime>(
+                &client,
+                CubeCount::Static(n_queries as u32, 1, 1),
+                CubeDim::new_2d(WORKGROUP_SIZE_X, 1),
+                LINE_SIZE,
+                vectors_gpu.into_tensor_arg(),
+                norms_gpu.into_tensor_arg(),
+                graph_gpu.into_tensor_arg(),
+                queries_gpu.into_tensor_arg(),
+                entry_gpu.into_tensor_arg(),
+                out_idx.clone().into_tensor_arg(),
+                out_dist.into_tensor_arg(),
+                out_iters.into_tensor_arg(),
+                n as u32,
+                k_out as u32,
+                k_graph,
+                false,
+                dim / LINE_SIZE,
+                beam_width,
+                hash_size,
+                max_iters,
+                n_entry,
+                expand,
+            );
+        }
+
+        let idx = out_idx.read(&client).unwrap();
+        let gt = brute_force_knn(&queries, &data, n_queries, n, dim, k_out);
+        let hits: usize = (0..n_queries)
+            .map(|qi| {
+                let found = &idx[qi * k_out..(qi + 1) * k_out];
+                gt[qi]
+                    .iter()
+                    .filter(|&&g| found.contains(&(g as u32)))
+                    .count()
+            })
+            .sum();
+        let recall = hits as f64 / (n_queries * k_out) as f64;
+        println!("Recall with a {hash_size}-slot table and beam {beam_width}: {recall:.4}");
+        assert!(recall > 0.85, "Recall too low: {recall:.4}");
     }
 
     fn build_brute_force_graph(data: &[f32], n: usize, dim: usize, k: usize) -> Vec<u32> {

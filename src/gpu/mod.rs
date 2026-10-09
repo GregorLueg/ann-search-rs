@@ -641,8 +641,9 @@ const MIN_HASH_SIZE: usize = 128;
 ///
 /// Every term but the hash table is fixed by the graph degree and the beam
 /// width, so the table is the only thing that can give. Halving it costs
-/// revisits, not correctness: a collision makes the search re-expand a node it
-/// has already seen, which wastes work but returns the same neighbours.
+/// revisits, not correctness: the kernel clears the table and re-inserts the
+/// beam whenever it nears three quarters full, so a smaller table only means
+/// more nodes are scored a second time.
 ///
 /// ### Params
 ///
@@ -668,11 +669,11 @@ pub fn plan_beam_search_staging(
     limits: &GpuLimits,
 ) -> Result<BeamSearchStaging, AnnSearchErrors> {
     // sq_vec + s_cand_{dist,idx,expanded} + s_nbr_{idx,dist}
-    // + s_active_flag + s_num_cands + s_query_norm
+    // + s_active_flag + s_num_cands + s_hash_count + s_query_norm
     let fixed = dim_padded * elem_bytes
         + beam_width * (elem_bytes + 2 * 4)
         + k_graph * expand_per_iter * (4 + elem_bytes)
-        + 2 * 4
+        + 3 * 4
         + elem_bytes;
 
     let mut hash_size = preferred_hash.max(MIN_HASH_SIZE);
