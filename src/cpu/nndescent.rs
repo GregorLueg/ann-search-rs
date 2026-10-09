@@ -2301,7 +2301,7 @@ macro_rules! impl_nndescent_query {
                 candidates: &mut BinaryHeap<Reverse<(OrderedFloat<$float>, usize)>>,
                 results: &mut BinaryHeap<(OrderedFloat<$float>, usize)>,
             ) -> Result<(Vec<usize>, Vec<$float>), AnnSearchErrors> {
-                let init_candidates = (ef / 2).max(k).min(self.n);
+                let init_candidates = (ef / 2).max(2 * k).min(self.n);
                 let search_k = init_candidates * 3;
                 $forest_tls.with(|cell| -> Result<(), AnnSearchErrors> {
                     let mut scratch = cell.borrow_mut();
