@@ -6,7 +6,8 @@ datasets and compare every library at **equal recall**, not at equal settings.
 Two libraries with the same `ef_search` land at different recall, so "faster at
 the same parameters" says little. Each library builds once, its search knob is
 swept, and the tables give the best queries per second (QPS) it reaches at
-recall@10 of 0.90, 0.95 and 0.99.
+recall@10 of 0.90, 0.95 and 0.99. GloVe is hard enough that most indices
+never reach 0.95 there, so its targets are 0.70, 0.80 and 0.90.
 
 Run via the Python bindings (from `benchmarks/`):
 
@@ -60,6 +61,10 @@ uv run bench.py summarise
   out. Memory is unified here, so their footprint includes the device
   buffers.
 - Builds are a single run each. Read small gaps as ties.
+- "Best QPS at or above a target" depends on where the sweep grid steps fall.
+  A library whose grid point lands at 0.909 counts at 0.90; one that lands at
+  0.896 has to take the next, much slower, point. The figures show the whole
+  curve; check them before quoting a ratio from the tables.
 - Fashion-MNIST and SIFT hold integers from 0 to 255, so uniform 8-bit codes
   are close to lossless on them and the SQ8 rows look better than they will on
   real embeddings. GloVe is the honest test.

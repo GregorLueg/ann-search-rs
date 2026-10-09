@@ -44,6 +44,10 @@ DATASETS: tuple[str, ...] = (
     "glove-100-angular",
 )
 RECALL_TARGETS: tuple[float, ...] = (0.9, 0.95, 0.99)
+# GloVe is hard enough that most indices never reach 0.95 on these grids.
+RECALL_TARGETS_BY_DATASET: dict[str, tuple[float, ...]] = {
+    "glove-100-angular": (0.7, 0.8, 0.9),
+}
 N_WARMUP: int = 100
 # Median of this many timed calls per sweep point. Single calls swung 15% on
 # an otherwise idle machine and did not reproduce.
@@ -317,7 +321,7 @@ def run(dataset: str, threads: int, only: tuple[str, ...]) -> None:
 
 
 @beartype
-def summary_table(sweep: pl.DataFrame) -> pl.DataFrame:
+def summary_table(sweep: pl.DataFrame, targets: tuple[float, ...]) -> pl.DataFrame:
     """Best QPS per library and method at each recall target; null if missed."""
     return (
         sweep.group_by("method", "library")
@@ -327,12 +331,12 @@ def summary_table(sweep: pl.DataFrame) -> pl.DataFrame:
             pl.col("resident_mib").first(),
             *[
                 pl.col("qps").filter(pl.col("recall") >= t).max().alias(f"qps@{t}")
-                for t in RECALL_TARGETS
+                for t in targets
             ],
         )
         .sort(
             "method",
-            f"qps@{RECALL_TARGETS[0]}",
+            f"qps@{targets[0]}",
             descending=[False, True],
             nulls_last=True,
         )
@@ -340,19 +344,19 @@ def summary_table(sweep: pl.DataFrame) -> pl.DataFrame:
 
 
 @beartype
-def to_markdown(summary: pl.DataFrame) -> str:
+def to_markdown(summary: pl.DataFrame, targets: tuple[float, ...]) -> str:
     """Render the summary as a GitHub markdown table."""
     header = (
         "| Method | Library | Build (s) | Build peak (MiB) | Index (MiB) | "
-        + " | ".join(f"QPS @ {t:.2f}" for t in RECALL_TARGETS)
+        + " | ".join(f"QPS @ {t:.2f}" for t in targets)
         + " |"
     )
-    lines = [header, "|" + "---|" * 2 + "---:|" * (3 + len(RECALL_TARGETS))]
+    lines = [header, "|" + "---|" * 2 + "---:|" * (3 + len(targets))]
     for r in summary.iter_rows(named=True):
         lib = r["library"]
         if lib.startswith("ann_search"):
             lib = f"**{lib}**"
-        qps = [r[f"qps@{t}"] for t in RECALL_TARGETS]
+        qps = [r[f"qps@{t}"] for t in targets]
         lines.append(
             f"| {r['method']} | {lib} | {r['build_s']:.1f} | "
             f"{r['build_peak_mib']:,.0f} | {r['resident_mib']:,.0f} | "
@@ -377,7 +381,7 @@ def plot_sweep(sweep: pl.DataFrame, title: str, out: Path) -> None:
     exact = sweep.filter(pl.col("method") == "exhaustive")
     methods = sorted(set(sweep["method"].unique()) - {"exhaustive"})
     fig, axes = plt.subplots(
-        1, len(methods), figsize=(3.2 * len(methods), 3.4), sharey=True, squeeze=False
+        1, len(methods), figsize=(3.2 * len(methods), 4.2), sharey=True, squeeze=False
     )
     for ax, method in zip(axes[0], methods, strict=True):
         sub = sweep.filter(pl.col("method") == method)
@@ -407,10 +411,23 @@ def plot_sweep(sweep: pl.DataFrame, title: str, out: Path) -> None:
         ax.set_xlabel("recall@10")
         ax.grid(alpha=0.25, linewidth=0.6)
         ax.spines[["top", "right"]].set_visible(False)
-        ax.legend(fontsize=7, frameon=False)
+    # One legend for the figure: per-panel ones sat on top of the curves.
+    handles = {}
+    for ax in axes[0]:
+        for h, label in zip(*ax.get_legend_handles_labels(), strict=True):
+            handles.setdefault(label, h)
+    fig.legend(
+        handles.values(),
+        handles.keys(),
+        loc="lower center",
+        ncol=min(len(handles), 6),
+        fontsize=8,
+        frameon=False,
+    )
     axes[0][0].set_ylabel("queries per second")
     fig.suptitle(title, fontsize=11)
-    fig.tight_layout()
+    rows = -(-len(handles) // 6)
+    fig.tight_layout(rect=(0, 0.07 * rows, 1, 1))
     out.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(out, dpi=130)
     plt.close(fig)
@@ -453,7 +470,8 @@ def summarise(template: Path, output: Path) -> None:
             f"{dataset}, {threads} thread{'s' if threads != '1' else ''}",
             output.parent / "figures" / f"comparison_{stem.name}.png",
         )
-        table = to_markdown(summary_table(sweep))
+        targets = RECALL_TARGETS_BY_DATASET.get(dataset, RECALL_TARGETS)
+        table = to_markdown(summary_table(sweep, targets), targets)
         click.echo(f"{stem.name}\n{table}\n", err=True)
         doc = doc.replace(f"<!-- BENCH:{stem.name} -->", table)
 

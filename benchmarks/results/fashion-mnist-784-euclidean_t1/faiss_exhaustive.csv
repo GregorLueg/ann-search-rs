@@ -1,0 +1,2 @@
+dataset,threads,library,method,param,build_s,build_peak_mib,resident_mib,query_s,qps,recall
+fashion-mnist-784-euclidean,1,faiss,exhaustive,-,0.021197915979428217,358.6408996582031,179.18777465820312,1.1415505410113838,8760.015120434582,1.0
