@@ -21,10 +21,14 @@ HNSW_M: int = 16
 HNSW_EFC: int = 200
 EF_GRID: list[int] = [10, 20, 40, 80, 160, 320, 640]
 ANNOY_TREES: int = 50
-SEARCH_K_GRID: list[int] = [K * ANNOY_TREES * f for f in (1, 2, 5, 10, 20, 50, 100)]
+SEARCH_K_GRID: list[int] = [
+    K * ANNOY_TREES * f for f in (1, 2, 5, 10, 20, 50, 100, 200, 500)
+]
 NPROBE_GRID: list[int] = [2, 4, 8, 16, 32, 64, 128]
 NND_K_GRAPH: int = 30
-EPSILON_GRID: list[float] = [0.0, 0.02, 0.05, 0.1, 0.15, 0.2, 0.3]
+EPSILON_GRID: list[float] = [0.0, 0.02, 0.05, 0.1, 0.15, 0.2, 0.3, 0.4, 0.5]
+# GloVe recall was still climbing at ef 640 for NN-Descent.
+NND_EF_GRID: list[int] = [*EF_GRID, 1280, 2560]
 BEAM_GRID: list[int] = [16, 32, 64, 128, 256]
 
 QueryFn = Callable[[np.ndarray, int | float | None], np.ndarray]
@@ -322,7 +326,7 @@ METHODS: dict[str, Callable[[np.ndarray, int, str], Built]] = {
     ),
     "ann_search:ivf": ann_search_builder("IvfIndex", "nprobe", NPROBE_GRID),
     "ann_search:nndescent": ann_search_builder(
-        "NNDescentIndex", "ef_search", EF_GRID, n_neighbors=NND_K_GRAPH
+        "NNDescentIndex", "ef_search", NND_EF_GRID, n_neighbors=NND_K_GRAPH
     ),
     "ann_search_gpu:exhaustive": ann_search_builder("ExhaustiveGpuIndex", None, [None]),
     "ann_search_gpu:ivf": ann_search_builder("IvfGpuIndex", "nprobe", NPROBE_GRID),

@@ -33,8 +33,9 @@ uv run bench.py summarise
   `nlist = sqrt(n)` (ann-search, faiss `IndexIVFFlat`), each with its own
   default training: 30 k-means iterations here, 10 in faiss, which is most of
   the gap in IVF build time; exact search as the baseline (ann-search, faiss `IndexFlat`).
-- **Swept at query time:** `ef_search` 10 to 640; annoy `search_k` 500 to
-  50,000; `nprobe` 2 to 128; pynndescent `epsilon` 0 to 0.3.
+- **Swept at query time:** `ef_search` 10 to 640 (NN-Descent to 2,560);
+  Annoy `search_k` 500 to 250,000; `nprobe` 2 to 128; pynndescent `epsilon`
+  0 to 0.5; CAGRA `beam_width` 16 to 256.
 - **Timing:** one build, then per sweep point an untimed 100-query warm-up and
   the median of three timed calls over all 10,000 queries. pynndescent's
   `prepare()` counts towards its build, and its numba JIT is warmed beforehand.
