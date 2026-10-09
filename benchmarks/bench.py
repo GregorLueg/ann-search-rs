@@ -45,6 +45,9 @@ DATASETS: tuple[str, ...] = (
 )
 RECALL_TARGETS: tuple[float, ...] = (0.9, 0.95, 0.99)
 N_WARMUP: int = 100
+# Median of this many timed calls per sweep point. Single calls swung 15% on
+# an otherwise idle machine and did not reproduce.
+N_REPS: int = 3
 MIB: float = 1024.0**2
 RUSAGE_INFO_V4: int = 4
 LIBPROC: ctypes.CDLL | None = (
@@ -183,9 +186,12 @@ def worker(dataset: str, threads: int, entry: str, out: Path) -> None:
     rows = []
     for p in grid:
         query(test[:N_WARMUP], p)
-        t0 = time.perf_counter()
-        found = query(test, p)
-        query_s = time.perf_counter() - t0
+        times = []
+        for _ in range(N_REPS):
+            t0 = time.perf_counter()
+            found = query(test, p)
+            times.append(time.perf_counter() - t0)
+        query_s = sorted(times)[N_REPS // 2]
         rows.append(
             {
                 "dataset": dataset,
