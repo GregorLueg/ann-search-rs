@@ -26,7 +26,7 @@ use thousands::*;
 
 use crate::cpu::nndescent::{NNDescent, NNDescentQuery};
 use crate::prelude::*;
-use crate::utils::dist::{cosine_distance_static, euclidean_distance_static};
+use crate::utils::dist::{cosine_distance_static, cosine_from_dot, euclidean_distance_static};
 use crate::utils::graph_utils::SearchState;
 use crate::utils::nndescent_utils::{ApplySortedUpdates, SENTINEL_PID};
 use crate::utils::parallelism::StripedLocks;
@@ -492,7 +492,7 @@ impl<T: AnnSearchFloat> MetricFn<T> for CosineMetric {
         let dim = idx.dim;
         let vec_q = &idx.vectors_flat[q * dim..(q + 1) * dim];
         let dot = T::dot_simd(vec_p, vec_q);
-        T::one() - (dot / (norm_p * idx.norms[q]))
+        cosine_from_dot(dot, norm_p * idx.norms[q])
     }
 }
 

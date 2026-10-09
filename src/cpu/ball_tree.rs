@@ -10,6 +10,7 @@ use thousands::*;
 
 use crate::prelude::*;
 use crate::utils::tree_utils::*;
+use crate::utils::dist::cosine_from_dot;
 use crate::utils::*;
 
 /// Sequential Lloyd passes on a small node's two-way split (an in-place
@@ -883,7 +884,7 @@ where
                             Dist::SquaredEuclidean => T::euclidean_simd(query_vec, vec),
                             Dist::Cosine => {
                                 let norm = unsafe { *self.norms.get_unchecked(item) };
-                                T::one() - T::dot_simd(query_vec, vec) / (query_norm * norm)
+                                cosine_from_dot(T::dot_simd(query_vec, vec), query_norm * norm)
                             }
                             Dist::Manhattan => unreachable!(),
                         };
@@ -914,8 +915,10 @@ where
                                     .centers_data_norm
                                     .get_unchecked(left_node.center_idx as usize)
                             };
-                            T::one()
-                                - T::dot_simd(query_vec, left_center) / (query_norm * left_norm)
+                            cosine_from_dot(
+                                T::dot_simd(query_vec, left_center),
+                                query_norm * left_norm,
+                            )
                         }
                         Dist::Manhattan => unreachable!(),
                     };
@@ -934,8 +937,10 @@ where
                                     .centers_data_norm
                                     .get_unchecked(right_node.center_idx as usize)
                             };
-                            T::one()
-                                - T::dot_simd(query_vec, right_center) / (query_norm * right_norm)
+                            cosine_from_dot(
+                                T::dot_simd(query_vec, right_center),
+                                query_norm * right_norm,
+                            )
                         }
                         Dist::Manhattan => unreachable!(),
                     };

@@ -4533,7 +4533,7 @@ where
         let vec_i = &self.vectors_flat()[start_i..start_i + self.dim()];
         let vec_j = &self.vectors_flat()[start_j..start_j + self.dim()];
         let dot = T::dot_simd(vec_i, vec_j);
-        T::one() - (dot / (self.norms()[i] * self.norms()[j]))
+        cosine_from_dot(dot, self.norms()[i] * self.norms()[j])
     }
 
     /// Cosine distance between query vector and internal vector
@@ -4552,7 +4552,7 @@ where
         let start = internal_idx * self.dim();
         let vec = &self.vectors_flat()[start..start + self.dim()];
         let dot = T::dot_simd(vec, query);
-        T::one() - (dot / (query_norm * self.norms()[internal_idx]))
+        cosine_from_dot(dot, query_norm * self.norms()[internal_idx])
     }
 
     //////////////////
@@ -4599,7 +4599,7 @@ where
         let norms = self.norms();
         let mut out = [T::zero(); 4];
         for k in 0..4 {
-            out[k] = T::one() - (dots[k] / (query_norm * norms[base + k]));
+            out[k] = cosine_from_dot(dots[k], query_norm * norms[base + k]);
         }
         out
     }
@@ -4688,7 +4688,7 @@ where
                 let norms = self.norms();
                 let mut out = [T::zero(); 4];
                 for k in 0..4 {
-                    out[k] = T::one() - (dots[k] / (query_norm * norms[ids[k]]));
+                    out[k] = cosine_from_dot(dots[k], query_norm * norms[ids[k]]);
                 }
                 out
             }
@@ -4722,7 +4722,7 @@ where
                 let norms = self.norms();
                 let mut out = [T::zero(); 4];
                 for k in 0..4 {
-                    out[k] = T::one() - (dots[k] / (norms[node] * norms[ids[k]]));
+                    out[k] = cosine_from_dot(dots[k], norms[node] * norms[ids[k]]);
                 }
                 out
             }
@@ -6448,7 +6448,7 @@ where
         let norm_i = self.norms()[i].to_f32().unwrap();
         let norm_j = self.norms()[j].to_f32().unwrap();
 
-        let dist = 1.0 - (dot / (norm_i * norm_j));
+        let dist = cosine_from_dot(dot, norm_i * norm_j);
         T::from_f32(dist).unwrap()
     }
 
@@ -6476,8 +6476,10 @@ where
         let start = internal_idx * self.dim();
         let vec = &self.vectors_flat()[start..start + self.dim()];
         let dot = Q::dot_bf16_dispatch(vec, query);
-        let dist = 1.0
-            - (dot / (query_norm.to_f32().unwrap() * self.norms()[internal_idx].to_f32().unwrap()));
+        let dist = cosine_from_dot(
+            dot,
+            query_norm.to_f32().unwrap() * self.norms()[internal_idx].to_f32().unwrap(),
+        );
         T::from_f32(dist).unwrap()
     }
 
@@ -6510,7 +6512,7 @@ where
         let dot = dot_bf16_simd(vec, query);
         let norm_internal = self.norms()[internal_idx].to_f32().unwrap();
 
-        let dist = 1.0 - (dot / (query_norm.to_f32() * norm_internal));
+        let dist = cosine_from_dot(dot, query_norm.to_f32() * norm_internal);
         T::from_f32(dist).unwrap()
     }
 }
@@ -6736,6 +6738,30 @@ where
     T::euclidean_simd(a, b)
 }
 
+/// Cosine distance from a dot product and the product of the two norms
+///
+/// A zero-norm vector has no direction, so the pair counts as orthogonal
+/// (distance 1) rather than `0 / 0 = NaN`. A NaN is not a total order and
+/// breaks every sort, heap and select over distances downstream. Same rule as
+/// the NN-Descent build join.
+///
+/// ### Params
+///
+/// * `dot` - Dot product of the two vectors
+/// * `norm_product` - Product of their L2 norms
+///
+/// ### Returns
+///
+/// `1 - dot / norm_product`, or 1 when `norm_product` is not positive.
+#[inline(always)]
+pub(crate) fn cosine_from_dot<T: Float>(dot: T, norm_product: T) -> T {
+    if norm_product > T::zero() {
+        T::one() - dot / norm_product
+    } else {
+        T::one()
+    }
+}
+
 /// Static Cosine distance between two arbitrary vectors
 ///
 /// Computes norms on the fly
@@ -6759,7 +6785,7 @@ where
     let norm_a = T::calculate_l2_norm(a);
     let norm_b = T::calculate_l2_norm(b);
 
-    T::one() - (dot / (norm_a * norm_b))
+    cosine_from_dot(dot, norm_a * norm_b)
 }
 
 /// Static Cosine distance between two arbitrary vectors
@@ -6784,7 +6810,7 @@ where
 
     let dot: T = T::dot_simd(a, b);
 
-    T::one() - (dot / (*norm_a * *norm_b))
+    cosine_from_dot(dot, *norm_a * *norm_b)
 }
 
 /// Helper to normalise vector in place
@@ -7207,6 +7233,15 @@ mod tests {
         let c = vec![2.0, 0.0, 0.0];
         let dist_parallel = cosine_distance_static(&a, &c);
         assert_relative_eq!(dist_parallel, 0.0, epsilon = 1e-6);
+    }
+
+    #[test]
+    fn test_cosine_zero_vector_is_orthogonal_not_nan() {
+        let zero = vec![0.0f32; 3];
+        let a = vec![1.0f32, 2.0, 3.0];
+        assert_eq!(cosine_distance_static(&zero, &a), 1.0);
+        assert_eq!(cosine_distance_static(&zero, &zero), 1.0);
+        assert_eq!(cosine_from_dot(0.0f64, 0.0), 1.0);
     }
 
     #[test]
