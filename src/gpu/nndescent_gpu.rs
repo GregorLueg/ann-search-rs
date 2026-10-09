@@ -45,6 +45,7 @@ use crate::gpu::cagra_gpu_search::*;
 use crate::gpu::forest_gpu::*;
 use crate::gpu::*;
 use crate::prelude::*;
+use crate::utils::dist::cosine_from_dot;
 use crate::utils::nndescent_utils::{unpack_knn_graph, SENTINEL_PID};
 
 ///////////
@@ -2487,47 +2488,46 @@ where
             .into_par_iter()
             .flat_map_iter(|i| {
                 let query = &queries_flat[i * self.dim..(i + 1) * self.dim];
-                let mut candidates = self.router.find_entry_points(query, n_entry * 4);
+                let q_norm = if use_cosine {
+                    T::calculate_l2_norm(query)
+                } else {
+                    T::one()
+                };
 
-                candidates.sort_unstable_by(|&a, &b| {
-                    let dist_a = match self.metric {
-                        Dist::SquaredEuclidean => {
-                            let va = &self.vectors_flat[a * self.dim..(a + 1) * self.dim];
-                            T::euclidean_simd(query, va)
-                        }
-                        Dist::Cosine => {
-                            let va = &self.vectors_flat[a * self.dim..(a + 1) * self.dim];
-                            let dot = T::dot_simd(query, va);
-                            let q_norm = T::calculate_l2_norm(query);
-                            T::one() - dot / (q_norm * self.norms[a])
-                        }
-                        Dist::Manhattan => unreachable!(),
-                    };
-                    let dist_b = match self.metric {
-                        Dist::SquaredEuclidean => {
-                            let vb = &self.vectors_flat[b * self.dim..(b + 1) * self.dim];
-                            T::euclidean_simd(query, vb)
-                        }
-                        Dist::Cosine => {
-                            let vb = &self.vectors_flat[b * self.dim..(b + 1) * self.dim];
-                            let dot = T::dot_simd(query, vb);
-                            let q_norm = T::calculate_l2_norm(query);
-                            T::one() - dot / (q_norm * self.norms[b])
-                        }
-                        Dist::Manhattan => unreachable!(),
-                    };
-                    dist_a
-                        .partial_cmp(&dist_b)
-                        .unwrap_or(std::cmp::Ordering::Equal)
-                });
-
-                // deduplicate against medoid, take the closest ones
-                candidates.retain(|&e| e != medoid as usize);
-                candidates.truncate(n_entry - 1);
+                // Score each candidate once, then select. The router returns
+                // whole leaves, hundreds of rows, and a sort comparator that
+                // recomputes both distances pays ~2 log n full-length distances
+                // per candidate, which dominates the query at high dim.
+                let mut scored: Vec<(T, usize)> = self
+                    .router
+                    .find_entry_points(query, n_entry * 4)
+                    .into_iter()
+                    .filter(|&c| c != medoid as usize)
+                    .map(|c| {
+                        let row = &self.vectors_flat[c * self.dim..(c + 1) * self.dim];
+                        let d = match self.metric {
+                            Dist::SquaredEuclidean => T::euclidean_simd(query, row),
+                            Dist::Cosine => {
+                                cosine_from_dot(T::dot_simd(query, row), q_norm * self.norms[c])
+                            }
+                            Dist::Manhattan => unreachable!(),
+                        };
+                        (d, c)
+                    })
+                    .collect();
+                let by_dist = |a: &(T, usize), b: &(T, usize)| {
+                    a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal)
+                };
+                let take = (n_entry - 1).min(scored.len());
+                if take < scored.len() {
+                    scored.select_nth_unstable_by(take, by_dist);
+                    scored.truncate(take);
+                }
+                scored.sort_unstable_by(by_dist);
 
                 let mut final_entries = Vec::with_capacity(n_entry);
                 final_entries.push(medoid);
-                final_entries.extend(candidates.into_iter().map(|idx| idx as u32));
+                final_entries.extend(scored.into_iter().map(|(_, idx)| idx as u32));
                 final_entries.resize(n_entry, 0);
                 final_entries.into_iter()
             })
