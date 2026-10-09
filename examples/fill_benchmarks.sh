@@ -51,6 +51,10 @@ fi
 # dry-run must leave $OUTPUT untouched.
 if ! $DRY_RUN; then
     cp "$TEMPLATE" "$OUTPUT"
+    VERSION=$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)
+    COMMIT=$(git describe --always --dirty)
+    RUNINFO="*ann-search-rs ${VERSION} (commit ${COMMIT}), run on $(date +%Y-%m-%d).*"
+    RUNINFO="$RUNINFO" perl -pi -e 's/<!-- RUNINFO -->/$ENV{RUNINFO}/' "$OUTPUT"
 fi
 
 run_and_replace() {
