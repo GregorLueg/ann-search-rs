@@ -52,7 +52,11 @@ fi
 if ! $DRY_RUN; then
     cp "$TEMPLATE" "$OUTPUT"
     VERSION=$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)
-    COMMIT=$(git describe --always --dirty)
+    # Dirty only when code differs; regenerated docs and results don't count.
+    COMMIT=$(git describe --always)
+    if [ -n "$(git status --porcelain -- src examples Cargo.toml Cargo.lock)" ]; then
+        COMMIT="${COMMIT}-dirty"
+    fi
     RUNINFO="*ann-search-rs ${VERSION} (commit ${COMMIT}), run on $(date +%Y-%m-%d).*"
     RUNINFO="$RUNINFO" perl -pi -e 's/<!-- RUNINFO -->/$ENV{RUNINFO}/' "$OUTPUT"
 fi

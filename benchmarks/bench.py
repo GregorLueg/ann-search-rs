@@ -49,6 +49,17 @@ RECALL_TARGETS_BY_DATASET: dict[str, tuple[float, ...]] = {
     "glove-100-angular": (0.7, 0.8, 0.9),
 }
 N_WARMUP: int = 100
+# Paths whose changes make a run's numbers differ from the recorded commit.
+CODE_PATHS: tuple[str, ...] = (
+    "src",
+    "Cargo.toml",
+    "Cargo.lock",
+    "python",
+    "benchmarks/bench.py",
+    "benchmarks/methods.py",
+    "benchmarks/pyproject.toml",
+    "benchmarks/uv.lock",
+)
 # Median of this many timed calls per sweep point. Single calls swung 15% on
 # an otherwise idle machine and did not reproduce.
 N_REPS: int = 3
@@ -246,12 +257,23 @@ def run_info() -> dict[str, str]:
     import ann_search
 
     commit = subprocess.run(
-        ["git", "describe", "--always", "--dirty"],
+        ["git", "describe", "--always"],
         cwd=REPO,
         capture_output=True,
         text=True,
         check=True,
     ).stdout.strip()
+    # Dirty only if code that shapes the numbers changed. The run writes its
+    # own CSVs into the tracked results/, which `--dirty` would count.
+    changed = subprocess.run(
+        ["git", "status", "--porcelain", "--", *CODE_PATHS],
+        cwd=REPO,
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout.strip()
+    if changed:
+        commit += "-dirty"
     cpu = platform.processor()
     if sys.platform == "darwin":
         cpu = subprocess.run(
