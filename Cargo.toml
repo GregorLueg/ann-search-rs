@@ -140,6 +140,10 @@ name = "gridsearch_gpu"
 required-features = ["gpu"]
 
 [[example]]
+name = "bench_mlx_annb"
+required-features = ["gpu", "mlx"]
+
+[[example]]
 name = "bench_mlx_exhaustive"
 required-features = ["gpu", "mlx", "synthetic"]
 
