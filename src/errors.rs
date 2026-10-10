@@ -279,6 +279,17 @@ pub enum AnnSearchErrors {
         available: usize,
     },
 
+    // -- mlx errors --
+    /// An mlx-c call failed. mlx-c prints its own message to stderr first.
+    #[cfg(feature = "mlx")]
+    #[error("mlx-c call '{op}' failed with code {code}.")]
+    MlxError {
+        /// Name of the failing mlx-c call
+        op: &'static str,
+        /// Its return code (or offending dtype for a dtype check)
+        code: i32,
+    },
+
     // -- serialisation errors --
     /// The file does not carry the `ann-search-rs` magic bytes
     #[cfg(feature = "serialise")]

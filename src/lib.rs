@@ -41,6 +41,9 @@ pub mod binary;
 #[cfg(feature = "serialise")]
 pub mod serialise;
 
+#[cfg(feature = "mlx")]
+pub mod mlx;
+
 #[cfg(feature = "synthetic")]
 pub mod synthetic;
 
@@ -85,6 +88,8 @@ use crate::binary::{
 };
 #[cfg(feature = "gpu")]
 use crate::gpu::{exhaustive_gpu::*, ivf_gpu::*};
+#[cfg(feature = "mlx")]
+use crate::mlx::exhaustive_mlx::*;
 #[cfg(feature = "quantised")]
 use crate::quantised::{
     exhaustive_bf16::*, exhaustive_opq::*, exhaustive_pq::*, exhaustive_sq8::*,
@@ -3274,6 +3279,84 @@ where
     let res = index.generate_knn(k, return_dist, verbose)?;
 
     Ok(res)
+}
+
+////////////////////
+// Exhaustive MLX //
+////////////////////
+
+#[cfg(feature = "mlx")]
+/// Build an exhaustive index on MLX (experimental, Apple Silicon, f32 only)
+///
+/// ### Params
+///
+/// * `mat` - Input data as samples x features. Accepts a faer matrix, an
+///   ndarray 2-D array (with the `ndarray` feature) or a row-major
+///   `(&[f32], n_samples, n_features)` tuple. See [`AnnMatrix`].
+/// * `dist_metric` - Distance metric: "euclidean" or "cosine". "manhattan" is
+///   not supported.
+///
+/// ### Returns
+///
+/// The initialised `ExhaustiveIndexMlx`, database resident on the device
+pub fn build_exhaustive_index_mlx(
+    mat: impl AnnMatrix<f32>,
+    dist_metric: &str,
+) -> Result<ExhaustiveIndexMlx, AnnSearchErrors> {
+    let metric = parse_ann_dist(dist_metric).unwrap_or_else(|| {
+        println!("[WARNING] Weird string used for distance metric. Using default squared Euclidean distance");
+        Dist::default()
+    });
+    ExhaustiveIndexMlx::new(mat.into_row_major(), metric)
+}
+
+#[cfg(feature = "mlx")]
+/// Query the exhaustive MLX index
+///
+/// ### Params
+///
+/// * `query_mat` - Query data as samples x features. Accepts a faer matrix,
+///   an ndarray 2-D array (with the `ndarray` feature) or a row-major
+///   `(&[f32], n_queries, n_features)` tuple. See [`AnnMatrix`].
+/// * `index` - The exhaustive MLX index
+/// * `k` - Number of neighbours to return
+/// * `return_dist` - Shall the distances be returned
+/// * `verbose` - Print the device versus host time split
+///
+/// ### Returns
+///
+/// A tuple of `(knn_indices, optional distances)`
+pub fn query_exhaustive_index_mlx(
+    query_mat: impl AnnMatrix<f32>,
+    index: &ExhaustiveIndexMlx,
+    k: usize,
+    return_dist: bool,
+    verbose: bool,
+) -> KnnOptionResult<f32> {
+    let (indices, distances) = index.query_batch(query_mat.into_row_major(), k, verbose)?;
+    Ok((indices, return_dist.then_some(distances)))
+}
+
+#[cfg(feature = "mlx")]
+/// Query the exhaustive MLX index against itself (full kNN graph)
+///
+/// ### Params
+///
+/// * `index` - The exhaustive MLX index
+/// * `k` - Number of neighbours to return, self included
+/// * `return_dist` - Shall the distances be returned
+/// * `verbose` - Print the device versus host time split
+///
+/// ### Returns
+///
+/// A tuple of `(knn_indices, optional distances)`
+pub fn query_exhaustive_index_mlx_self(
+    index: &ExhaustiveIndexMlx,
+    k: usize,
+    return_dist: bool,
+    verbose: bool,
+) -> KnnOptionResult<f32> {
+    index.generate_knn(k, return_dist, verbose)
 }
 
 //////////////

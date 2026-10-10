@@ -48,6 +48,10 @@ accelerate = []
 ndarray = ["dep:ndarray"]
 ## Enables saving indices to disk and loading them back in
 serialise = ["dep:serde", "dep:bincode", "half?/serde"]
+## Experimental, Apple Silicon only: exhaustive search on MLX via mlx-c, for
+## comparison against the cubecl/wgpu path. Needs `brew install mlx-c` (or
+## MLX_C_PREFIX pointing at an install). f32 only.
+mlx = []
 ## Synthetic dataset generators with realistic single-cell structure, used by
 ## the gridsearch examples and the published benchmark tables.
 synthetic = []
@@ -134,6 +138,10 @@ features = ["binary", "quantised", "mimalloc", "ndarray", "serialise", "syntheti
 [[example]]
 name = "gridsearch_gpu"
 required-features = ["gpu"]
+
+[[example]]
+name = "bench_mlx_exhaustive"
+required-features = ["gpu", "mlx", "synthetic"]
 
 [[example]]
 name = "gridsearch_cagra"
