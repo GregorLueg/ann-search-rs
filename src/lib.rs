@@ -3685,7 +3685,7 @@ pub fn query_nndescent_index_mlx(
     if verbose {
         println!("  MLX batch query: {} vectors, k={}...", n_queries, k);
     }
-    let (indices, distances) = index.query_batch(&queries_flat, n_queries, query_params, k, 42)?;
+    let (indices, distances) = index.query_batch(&queries_flat, n_queries, query_params, k)?;
     Ok((indices, return_dist.then_some(distances)))
 }
 

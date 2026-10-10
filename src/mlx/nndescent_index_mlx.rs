@@ -188,8 +188,6 @@ impl NNDescentIndexMlx {
     /// * `n_queries` - Number of query vectors
     /// * `query_params` - Optional beam parameters; `None` scales them to `k`
     /// * `k` - Number of neighbours to return per query
-    /// * `_seed` - Unused; entries are deterministic. Kept for parity with
-    ///   `NNDescentGpu::query_batch_gpu`
     ///
     /// ### Returns
     ///
@@ -200,7 +198,6 @@ impl NNDescentIndexMlx {
         n_queries: usize,
         query_params: Option<CagraMlxSearchParams>,
         k: usize,
-        _seed: usize,
     ) -> KnnResult<f32> {
         if n_queries == 0 {
             return Ok((Vec::new(), Vec::new()));
@@ -433,7 +430,7 @@ mod tests {
             .into_iter()
             .map(|(i, _)| i)
             .collect();
-        let (idx, dist) = index.query_batch(&q_flat, nq, None, k, 42).unwrap();
+        let (idx, dist) = index.query_batch(&q_flat, nq, None, k).unwrap();
         for d in &dist {
             assert!(d.windows(2).all(|w| w[0] <= w[1]));
         }
@@ -480,7 +477,7 @@ mod tests {
         };
         assert!(build(Dist::Manhattan).is_err());
         let index = build(Dist::SquaredEuclidean).unwrap();
-        assert!(index.query_batch(&[0.0; 9], 1, None, 3, 42).is_err());
+        assert!(index.query_batch(&[0.0; 9], 1, None, 3).is_err());
         let (idx, _) = index.extract_knn(None, false, false);
         assert!(idx.iter().all(|r| r.len() == 5));
     }
