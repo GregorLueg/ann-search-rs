@@ -687,6 +687,30 @@ pub fn local_join_shared<F: Float, N: Size>(
     }
     sync_cube();
 
+    // A mutual neighbour arrives twice, forward and reverse; mark one copy 2
+    // (dropped). The reverse copy goes unless it alone is new, in which case
+    // the old forward copy goes: that only frees an old slot, so the forward
+    // new sampling below, and the flags it clears, are unchanged. Forward ids
+    // are distinct, so each slot has at most one writer.
+    let mut i_dup = k + tflat;
+    while i_dup < raw_total {
+        let pid = shared_pids[i_dup as usize];
+        let mut j = 0u32;
+        while j < k {
+            if shared_pids[j as usize] == pid {
+                let take_fwd = shared_is_new[i_dup as usize] & (1u32 - shared_is_new[j as usize]);
+                let mut victim = i_dup;
+                if take_fwd == 1u32 {
+                    victim = j;
+                }
+                shared_is_new[victim as usize] = 2u32;
+            }
+            j += 1u32;
+        }
+        i_dup += CUBE_DIM;
+    }
+    sync_cube();
+
     // Keep at most `cand_cap` new and `cand_cap` old candidates, forward
     // (closest first) before reverse. A sampled forward new entry is marked old
     // here, in this node's own row, so an unsampled one stays new for the next
@@ -703,12 +727,13 @@ pub fn local_join_shared<F: Float, N: Size>(
                 let pid = shared_pids[read as usize];
                 let is_new = shared_is_new[read as usize];
                 let mut keep: u32 = 0u32;
-                if is_new != 0u32 {
+                if is_new == 1u32 {
                     if n_new < cand_cap {
                         keep = 1u32;
                         n_new += 1u32;
                     }
-                } else {
+                }
+                if is_new == 0u32 {
                     if n_old < cand_cap {
                         keep = 1u32;
                         n_old += 1u32;

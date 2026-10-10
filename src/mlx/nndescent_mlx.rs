@@ -287,6 +287,19 @@ const LOCAL_JOIN_SOURCE: &str = r#"
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
+    // A mutual neighbour arrives twice; mark one copy 2 (dropped). The reverse
+    // copy goes unless it alone is new, then the old forward copy goes, so the
+    // forward new sampling the merge replays is unchanged.
+    for (uint i = K + tid; i < raw_total; i += NT) {
+        uint pid = s_pids[i];
+        for (uint j = 0; j < (uint)K; j++) {
+            if (s_pids[j] == pid) {
+                s_new[(s_new[i] != 0 && s_new[j] == 0) ? j : i] = 2;
+            }
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
     if (tid == 0) {
         uint write = 0, has_new = 0, n_new = 0, n_old = 0;
         for (uint r = 0; r < raw_total; r++) {
@@ -294,9 +307,9 @@ const LOCAL_JOIN_SOURCE: &str = r#"
             if ((nnd_entry_hash(node, r, seed) & 0xFFFFu) < rho && pid < n) {
                 uint is_new = s_new[r];
                 bool keep = false;
-                if (is_new != 0) {
+                if (is_new == 1) {
                     if (n_new < cap) { keep = true; n_new++; }
-                } else {
+                } else if (is_new == 0) {
                     if (n_old < cap) { keep = true; n_old++; }
                 }
                 if (keep) {
