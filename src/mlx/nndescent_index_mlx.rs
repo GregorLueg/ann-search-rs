@@ -11,7 +11,6 @@ use thousands::*;
 use crate::mlx::cagra_mlx::*;
 use crate::mlx::nndescent_mlx::*;
 use crate::prelude::*;
-use crate::utils::dist::cosine_from_dot;
 use crate::utils::nndescent_utils::unpack_knn_graph;
 use crate::utils::rp_forest::{compact_knn_rows, default_forest_trees, ForestRouter};
 use crate::utils::DimensionValidation;
@@ -180,7 +179,8 @@ impl NNDescentIndexMlx {
     /// Batch query via beam search on the navigational graph.
     ///
     /// Entry points per query: the medoid, then the closest of the router's
-    /// leaf candidates, padded with node 0, as `NNDescentGpu` does.
+    /// leaf candidates, as `NNDescentGpu` selects them. The selection runs on
+    /// the device ([`CagraSearchMlx::search_routed`]); the host only routes.
     ///
     /// ### Params
     ///
@@ -188,7 +188,8 @@ impl NNDescentIndexMlx {
     /// * `n_queries` - Number of query vectors
     /// * `query_params` - Optional beam parameters; `None` scales them to `k`
     /// * `k` - Number of neighbours to return per query
-    /// * `seed` - Random seed
+    /// * `_seed` - Unused; entries are deterministic. Kept for parity with
+    ///   `NNDescentGpu::query_batch_gpu`
     ///
     /// ### Returns
     ///
@@ -199,7 +200,7 @@ impl NNDescentIndexMlx {
         n_queries: usize,
         query_params: Option<CagraMlxSearchParams>,
         k: usize,
-        seed: usize,
+        _seed: usize,
     ) -> KnnResult<f32> {
         if n_queries == 0 {
             return Ok((Vec::new(), Vec::new()));
@@ -208,57 +209,39 @@ impl NNDescentIndexMlx {
         let query_params = query_params.unwrap_or_else(|| CagraMlxSearchParams::from_k(k));
         let n_entry = query_params.get_n_entry();
         // Plain host fields only: the MLX handles in `self` are not `Sync`.
-        let (medoid, dim, metric) = (self.medoid, self.dim, self.metric);
-        let (router, vectors, norms) = (&self.router, &self.vectors_flat, &self.norms);
+        let (medoid, dim, router) = (self.medoid, self.dim, &self.router);
 
-        let entries: Vec<u32> = (0..n_queries)
+        // Score on the device: the candidates are whole router leaves,
+        // hundreds of rows, which on the host cost more than the search.
+        let per_query: Vec<Vec<u32>> = (0..n_queries)
             .into_par_iter()
-            .flat_map_iter(|i| {
-                let query = &queries_flat[i * dim..(i + 1) * dim];
-                let q_norm = if metric == Dist::Cosine {
-                    f32::calculate_l2_norm(query)
-                } else {
-                    1.0
-                };
-                // Score each candidate once, then select.
-                let mut scored: Vec<(f32, usize)> = router
-                    .find_entry_points(query, n_entry * ROUTER_OVERSAMPLE)
+            .map(|i| {
+                router
+                    .find_entry_points(
+                        &queries_flat[i * dim..(i + 1) * dim],
+                        n_entry * ROUTER_OVERSAMPLE,
+                    )
                     .into_iter()
                     .filter(|&c| c != medoid as usize)
-                    .map(|c| {
-                        let row = &vectors[c * dim..(c + 1) * dim];
-                        let d = match metric {
-                            Dist::Cosine => {
-                                cosine_from_dot(f32::dot_simd(query, row), q_norm * norms[c])
-                            }
-                            _ => f32::euclidean_simd(query, row),
-                        };
-                        (d, c)
-                    })
-                    .collect();
-                let by_dist = |a: &(f32, usize), b: &(f32, usize)| a.0.total_cmp(&b.0);
-                let take = (n_entry - 1).min(scored.len());
-                if take < scored.len() {
-                    scored.select_nth_unstable_by(take, by_dist);
-                    scored.truncate(take);
-                }
-                scored.sort_unstable_by(by_dist);
-
-                let mut e = Vec::with_capacity(n_entry);
-                e.push(medoid);
-                e.extend(scored.into_iter().map(|(_, c)| c as u32));
-                e.resize(n_entry, 0);
-                e.into_iter()
+                    .map(|c| c as u32)
+                    .collect()
             })
             .collect();
-
-        self.searcher.search(
+        let mut offsets = Vec::with_capacity(n_queries + 1);
+        offsets.push(0u32);
+        let mut ids = Vec::with_capacity(per_query.iter().map(Vec::len).sum());
+        for c in &per_query {
+            ids.extend_from_slice(c);
+            offsets.push(ids.len() as u32);
+        }
+        self.searcher.search_routed(
             queries_flat,
             n_queries,
             k,
             Some(query_params),
-            Some(&entries),
-            seed,
+            &ids,
+            &offsets,
+            medoid,
         )
     }
 
