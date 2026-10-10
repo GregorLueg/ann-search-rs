@@ -12,7 +12,7 @@
 //!    neighbouring SIMD groups scan the same clusters and share cache.
 //! 4. The scan, one of three (see [`IvfScanMlx`]):
 //!    - Query-major ([`IVF_SCAN_BODY`]): one SIMD group per query walks its
-//!      probed clusters and keeps the top k in registers. No task list and no
+//!      probed clusters and keeps a SIMD-cooperative top k. No task list and no
 //!      candidate buffer, but members are re-read for every query probing
 //!      them.
 //!    - Cluster-major: the probe lists are inverted on the device (sort keys,
@@ -32,7 +32,7 @@ use rayon::prelude::*;
 use std::time::Instant;
 use thousands::*;
 
-use crate::mlx::exhaustive_mlx::{TOPK_ROWS_PER_GROUP, TOPK_SOURCE};
+use crate::mlx::exhaustive_mlx::{RowTopK, TopKKernel, TOPK_ROWS_PER_GROUP};
 use crate::mlx::ffi::*;
 use crate::mlx::k_means_mlx::*;
 use crate::prelude::*;
@@ -83,41 +83,7 @@ const PROBE_KEYS_THREADS: usize = 64;
 /// partial top-k buffers (indices plus distances) for one query tile.
 const CLUSTER_PARTIAL_TILE_BYTES: usize = 256 * 1024 * 1024;
 
-/// Metal prelude shared by every top-k kernel here: a sorted top-K in
-/// registers (`vals`, `ids`, initialised to `INFINITY`) and `TOPK_INSERT`.
-const TOPK_REGS: &str = r#"
-    float vals[K];
-    uint ids[K];
-    for (int i = 0; i < K; i++) { vals[i] = INFINITY; ids[i] = 0; }
-    #define TOPK_INSERT(V, J) \
-        if ((V) < vals[K - 1]) { \
-            vals[K - 1] = (V); \
-            ids[K - 1] = (J); \
-            for (int i = K - 1; i > 0; i--) { \
-                if (vals[i] < vals[i - 1]) { \
-                    float tv = vals[i]; vals[i] = vals[i - 1]; vals[i - 1] = tv; \
-                    uint ti = ids[i]; ids[i] = ids[i - 1]; ids[i - 1] = ti; \
-                } \
-            } \
-        }
-"#;
-
-/// Metal epilogue: K rounds of `simd_min` merge the 32 lanes' lists into
-/// output row `orow` of `out_dist` / `out_idx`, ascending.
-const TOPK_MERGE: &str = r#"
-    for (int r = 0; r < K; r++) {
-        float m = simd_min(vals[0]);
-        uint w = simd_min(vals[0] == m ? lane : 32u);
-        if (lane == w) {
-            out_dist[orow * K + r] = vals[0];
-            out_idx[orow * K + r] = ids[0];
-            for (int i = 0; i < K - 1; i++) { vals[i] = vals[i + 1]; ids[i] = ids[i + 1]; }
-            vals[K - 1] = INFINITY;
-        }
-    }
-"#;
-
-/// Query-major cluster scan, between [`TOPK_REGS`] and [`TOPK_MERGE`]. One
+/// Query-major cluster scan, a [`TopKKernel`] body. One
 /// SIMD group per query: the probed clusters are walked in ascending centroid
 /// distance, each lane takes every 32nd member, computes the distance in full
 /// (`float4` loads when `VEC4`) and inserts it. Probing stops after
@@ -141,8 +107,10 @@ const IVF_SCAN_BODY: &str = r#"
         uint s = offsets[c];
         uint e = offsets[c + 1];
         reach += e - s;
-        for (uint j = s + lane; j < e; j += 32) {
-            const device float* x = db + (ulong)j * DIM;
+        for (uint base = s; base < e; base += 32) {
+            uint j = base + lane;
+            bool ok = j < e;
+            const device float* x = db + (ulong)(ok ? j : s) * DIM;
             float acc = 0.0f;
             if (VEC4) {
                 const device float4* x4 = (const device float4*)x;
@@ -168,7 +136,7 @@ const IVF_SCAN_BODY: &str = r#"
                 }
             }
             float dist = COSINE ? 1.0f - acc : acc;
-            TOPK_INSERT(dist, j);
+            SG_OFFER(ok, dist, j);
         }
     }
 "#;
@@ -243,8 +211,8 @@ const CLUSTER_TILE_LOOKUP: &str = r#"
     ulong orow = flat;
 "#;
 
-/// Register-tiled cluster-major scan, after [`TOPK_REGS`] and
-/// [`CLUSTER_TILE_LOOKUP`], before [`TOPK_MERGE`]. The tile's `QT` query
+/// Register-tiled cluster-major scan, a [`TopKKernel`] body after
+/// [`CLUSTER_TILE_LOOKUP`]. The tile's `QT` query
 /// blocks are staged in threadgroup memory (`DB` dims at a time); each thread
 /// owns one member of a `32 * QT` chunk, reads it from device memory once and
 /// scores it against all `QT` queries with `QT` accumulators, so one member
@@ -313,7 +281,7 @@ const IVF_CLUSTER_TILED_BODY: &str = r#"
         if (active) {
             for (uint m = lane; m < CHUNK; m += 32) {
                 float v = sc[sg * CHUNK + m];
-                TOPK_INSERT(v, cs + m);
+                SG_OFFER(true, v, cs + m);
             }
         }
     }
@@ -323,8 +291,8 @@ const IVF_CLUSTER_TILED_BODY: &str = r#"
 /// Header for [`IVF_CLUSTER_MMA_BODY`].
 const SIMDGROUP_MATRIX_HEADER: &str = "#include <metal_simdgroup_matrix>\n";
 
-/// simdgroup_matrix cluster-major scan, after [`TOPK_REGS`] and
-/// [`CLUSTER_TILE_LOOKUP`], before [`TOPK_MERGE`]. `QT` is 8: the tile's 8
+/// simdgroup_matrix cluster-major scan, a [`TopKKernel`] body after
+/// [`CLUSTER_TILE_LOOKUP`]. `QT` is 8: the tile's 8
 /// query blocks are staged in threadgroup memory (zero beyond `DIM`), and
 /// SIMD group `sg` multiplies them against 4 transposed 8-member tiles loaded
 /// straight from device memory, so a chunk of 256 members costs one 8x8x8
@@ -378,18 +346,17 @@ const IVF_CLUSTER_MMA_BODY: &str = r#"
         if (active) {
             for (uint m = lane; m < CHUNK; m += 32) {
                 uint j = cs + m;
-                if (j < me) {
-                    float dotv = sc[sg * CHUNK + m];
-                    float v = COSINE ? 1.0f - dotv : xn[j] - 2.0f * dotv + qnorm;
-                    TOPK_INSERT(v, j);
-                }
+                bool ok = j < me;
+                float dotv = sc[sg * CHUNK + m];
+                float v = COSINE ? 1.0f - dotv : xn[ok ? j : ms] - 2.0f * dotv + qnorm;
+                SG_OFFER(ok, v, j);
             }
         }
     }
     if (!active) return;
 "#;
 
-/// Cluster-major step 5, between [`TOPK_REGS`] and [`TOPK_MERGE`]: one SIMD
+/// Cluster-major step 5, a [`TopKKernel`] body: one SIMD
 /// group per query merges the `eff * K` partial candidates of its probed
 /// slots.
 ///
@@ -400,8 +367,10 @@ const IVF_PARTIAL_MERGE_BODY: &str = r#"
     ulong orow = qi;
     ulong base = (ulong)qi * P * K;
     uint n = eff[qi] * K;
-    for (uint i = lane; i < n; i += 32) {
-        TOPK_INSERT(part_dist[base + i], part_idx[base + i]);
+    for (uint i0 = 0; i0 < n; i0 += 32) {
+        uint i = i0 + lane;
+        bool ok = i < n;
+        SG_OFFER(ok, ok ? part_dist[base + i] : INFINITY, ok ? part_idx[base + i] : 0u);
     }
 "#;
 
@@ -419,12 +388,18 @@ pub enum IvfScanMlx {
     /// and each member is scored against up to [`CLUSTER_SCAN_QT`] queries
     /// with register accumulators, see [`IVF_CLUSTER_TILED_BODY`];
     /// per-(query, probe) top-k are merged after.
-    #[default]
     ClusterMajor,
     /// Cluster-major with the dot products on `simdgroup_matrix` 8x8 tiles,
     /// see [`IVF_CLUSTER_MMA_BODY`]. Euclidean goes through the
     /// `|x|^2 - 2 q.x + |q|^2` expansion, so near-ties can swap.
     ClusterMatrix,
+    /// `ClusterMajor` while `k <= dim`, else `QueryMajor`. Cluster-major
+    /// saves member reads, worth more as `dim` grows; it pays a cold top-k
+    /// per probed cluster plus a merge over `probes * k` candidates, worth
+    /// more as `k` grows. The `k <= dim` line is fitted to a small ablation
+    /// and is not tuned for cluster size.
+    #[default]
+    Auto,
 }
 
 /// Threadgroup memory plan for the cluster-major scan.
@@ -573,9 +548,9 @@ pub struct IvfIndexMlx {
     /// Centroid GEMM operands for the probe selection
     centroid_ops: CentroidOperands,
     /// Row top-k kernel (probe selection), shared with the exhaustive index
-    probe_kernel: MetalKernel,
+    probe_topk: RowTopK,
     /// Query-major scan kernel, see [`IVF_SCAN_BODY`]
-    scan_kernel: MetalKernel,
+    scan_kernel: TopKKernel,
     /// Which scan the queries run
     scan: IvfScanMlx,
     /// Cluster-major staging plan; `None` falls back to the query-major scan
@@ -585,16 +560,16 @@ pub struct IvfIndexMlx {
     /// Cluster-major task CSR kernel, see [`IVF_TASK_CSR_SOURCE`]
     csr_kernel: MetalKernel,
     /// Register-tiled cluster-major scan, see [`IVF_CLUSTER_TILED_BODY`]
-    tiled_kernel: MetalKernel,
+    tiled_kernel: TopKKernel,
     /// `simdgroup_matrix` cluster-major scan, see [`IVF_CLUSTER_MMA_BODY`]
-    mma_kernel: MetalKernel,
+    mma_kernel: TopKKernel,
     /// Staging plan for the `simdgroup_matrix` scan (8-wide blocks)
     mma_plan: Option<ClusterScanPlan>,
     /// Squared L2 norm per cluster-ordered vector, `[n]`; the Euclidean
     /// `simdgroup_matrix` scan reads it
     xn: Array,
     /// Cluster-major partial merge kernel, see [`IVF_PARTIAL_MERGE_BODY`]
-    merge_kernel: MetalKernel,
+    merge_kernel: TopKKernel,
     /// Stream every op runs on. Declared last so it drops after the arrays.
     stream: Stream,
 }
@@ -714,17 +689,14 @@ impl IvfIndexMlx {
             db,
             offsets,
             centroid_ops,
-            probe_kernel: MetalKernel::new(
-                "ivf_probe_topk",
-                &["d"],
-                &["out_idx", "out_dist"],
-                TOPK_SOURCE,
-            ),
-            scan_kernel: MetalKernel::new(
+            probe_topk: RowTopK::new("ivf_probe_topk"),
+            scan_kernel: TopKKernel::new(
                 "ivf_scan",
                 &["q", "db", "offsets", "probe", "order", "params"],
                 &["out_idx", "out_dist"],
-                &format!("{TOPK_REGS}{IVF_SCAN_BODY}{TOPK_MERGE}"),
+                "",
+                "",
+                IVF_SCAN_BODY,
             ),
             scan: IvfScanMlx::default(),
             cluster_plan: plan_cluster_scan(dim, APPLE_THREADGROUP_BYTES, 4),
@@ -741,28 +713,32 @@ impl IvfIndexMlx {
                 &["task_off", "tile_off"],
                 IVF_TASK_CSR_SOURCE,
             ),
-            tiled_kernel: MetalKernel::new(
+            tiled_kernel: TopKKernel::new(
                 "ivf_cluster_tiled",
                 &["q", "db", "offsets", "order", "task_off", "tile_off"],
                 &["out_idx", "out_dist"],
-                &format!("{TOPK_REGS}{CLUSTER_TILE_LOOKUP}{IVF_CLUSTER_TILED_BODY}{TOPK_MERGE}"),
+                "",
+                CLUSTER_TILE_LOOKUP,
+                IVF_CLUSTER_TILED_BODY,
             ),
-            mma_kernel: MetalKernel::with_header(
+            mma_kernel: TopKKernel::new(
                 "ivf_cluster_mma",
                 &[
                     "q", "db", "offsets", "order", "task_off", "tile_off", "qn", "xn",
                 ],
                 &["out_idx", "out_dist"],
                 SIMDGROUP_MATRIX_HEADER,
-                &format!("{TOPK_REGS}{CLUSTER_TILE_LOOKUP}{IVF_CLUSTER_MMA_BODY}{TOPK_MERGE}"),
-                false,
+                CLUSTER_TILE_LOOKUP,
+                IVF_CLUSTER_MMA_BODY,
             ),
             xn,
-            merge_kernel: MetalKernel::new(
+            merge_kernel: TopKKernel::new(
                 "ivf_partial_merge",
                 &["part_idx", "part_dist", "eff"],
                 &["out_idx", "out_dist"],
-                &format!("{TOPK_REGS}{IVF_PARTIAL_MERGE_BODY}{TOPK_MERGE}"),
+                "",
+                "",
+                IVF_PARTIAL_MERGE_BODY,
             ),
             stream,
         })
@@ -886,6 +862,7 @@ impl IvfIndexMlx {
     /// * `k` - Number of neighbours, at most `n`
     /// * `nprobe` - Clusters to probe before the reachability top-up
     /// * `pool` - Probe pool width, `>= nprobe` and `<= nlist`
+    /// * `scan` - Resolved scan, never `Auto`
     ///
     /// ### Returns
     ///
@@ -897,6 +874,7 @@ impl IvfIndexMlx {
         k: usize,
         nprobe: usize,
         pool: usize,
+        scan: IvfScanMlx,
     ) -> Result<(Array, Array), AnnSearchErrors> {
         let s = &self.stream;
         let q_host = q;
@@ -904,35 +882,12 @@ impl IvfIndexMlx {
         let ops = &self.centroid_ops;
         let scores = Array::addmm(&ops.add, &q, &ops.ct, ops.alpha, 1.0, s)?;
 
-        let pool_shape = [n_q as i32, pool as i32];
-        let mut probe = self.probe_kernel.apply(
-            &[&scores],
-            &[
-                OutputSpec {
-                    shape: &pool_shape,
-                    dtype: MLX_UINT32,
-                },
-                OutputSpec {
-                    shape: &pool_shape,
-                    dtype: MLX_FLOAT32,
-                },
-            ],
-            [32, n_q as i32, 1],
-            [32, TOPK_ROWS_PER_GROUP, 1],
-            &[
-                ("K", pool as i32),
-                ("N", self.nlist as i32),
-                ("VEC4", self.nlist.is_multiple_of(4) as i32),
-            ],
-            s,
-        )?;
-        probe.truncate(1);
-        let probe = probe.pop().expect("kernel has two outputs");
+        let (probe, _) = self.probe_topk.apply(&scores, n_q, self.nlist, pool, s)?;
 
-        let plan = match self.scan {
-            IvfScanMlx::QueryMajor => None,
+        let plan = match scan {
+            IvfScanMlx::QueryMajor | IvfScanMlx::Auto => None,
             IvfScanMlx::ClusterMatrix => self.mma_plan,
-            _ => self.cluster_plan,
+            IvfScanMlx::ClusterMajor => self.cluster_plan,
         };
         if let Some(plan) = plan {
             let qn: Vec<f32> = q_host
@@ -940,7 +895,7 @@ impl IvfIndexMlx {
                 .map(|r| f32::dot_simd(r, r))
                 .collect();
             let qn = Array::from_f32(&qn, &[n_q as i32]);
-            return self.queue_cluster_major(&q, &qn, &probe, n_q, k, nprobe, pool, plan);
+            return self.queue_cluster_major(&q, &qn, &probe, n_q, k, nprobe, pool, scan, plan);
         }
 
         let order = probe
@@ -950,7 +905,7 @@ impl IvfIndexMlx {
         let params = Array::from_u32(&[nprobe as u32], &[1]);
 
         let shape = [n_q as i32, k as i32];
-        let mut out = self.scan_kernel.apply(
+        let mut out = self.scan_kernel.pick(k).apply(
             &[&q, &self.db, &self.offsets, &probe, &order, &params],
             &[
                 OutputSpec {
@@ -989,6 +944,7 @@ impl IvfIndexMlx {
     /// * `k` - Number of neighbours, at most `n`
     /// * `nprobe` - Clusters to probe before the reachability top-up
     /// * `pool` - Probe pool width
+    /// * `scan` - `ClusterMajor` or `ClusterMatrix`
     /// * `plan` - Threadgroup staging plan
     ///
     /// ### Returns
@@ -1004,6 +960,7 @@ impl IvfIndexMlx {
         k: usize,
         nprobe: usize,
         pool: usize,
+        scan: IvfScanMlx,
         plan: ClusterScanPlan,
     ) -> Result<(Array, Array), AnnSearchErrors> {
         let s = &self.stream;
@@ -1062,14 +1019,14 @@ impl IvfIndexMlx {
         let max_tiles = n_tasks.div_ceil(plan.qt) + self.nlist;
         let part_shape = [n_tasks as i32, k as i32];
         let mut inputs = vec![q, &self.db, &self.offsets, &order, &task_off, &tile_off];
-        let (kernel, db) = match self.scan {
+        let (kernel, db) = match scan {
             IvfScanMlx::ClusterMatrix => {
                 inputs.extend([qn, &self.xn]);
                 (&self.mma_kernel, plan.db)
             }
             _ => (&self.tiled_kernel, plan.db),
         };
-        let mut part = kernel.apply(
+        let mut part = kernel.pick(k).apply(
             &inputs,
             &[
                 OutputSpec {
@@ -1099,7 +1056,7 @@ impl IvfIndexMlx {
         let part_idx = part.pop().expect("kernel has two outputs");
 
         let shape = [n_q as i32, k as i32];
-        let mut out = self.merge_kernel.apply(
+        let mut out = self.merge_kernel.pick(k).apply(
             &[&part_idx, &part_dist, &eff],
             &[
                 OutputSpec {
@@ -1155,7 +1112,12 @@ impl IvfIndexMlx {
         let mut tile = nquery
             .unwrap_or(IVF_MLX_QUERY_BATCH_SIZE)
             .min(score_tile_rows(self.nlist));
-        if self.scan != IvfScanMlx::QueryMajor {
+        let scan = match self.scan {
+            IvfScanMlx::Auto if k <= self.dim => IvfScanMlx::ClusterMajor,
+            IvfScanMlx::Auto => IvfScanMlx::QueryMajor,
+            other => other,
+        };
+        if scan != IvfScanMlx::QueryMajor {
             let per_query = pool * k * (size_of::<u32>() + size_of::<f32>());
             tile = tile.min(CLUSTER_PARTIAL_TILE_BYTES / per_query);
         }
@@ -1172,6 +1134,7 @@ impl IvfIndexMlx {
                 k,
                 nprobe,
                 pool,
+                scan,
             )?;
             eval_all(&[&idx, &dist], true)?;
             pending.push((idx, dist));
@@ -1418,6 +1381,58 @@ mod tests {
         check_cluster_major(Dist::SquaredEuclidean, 37);
         check_cluster_major(Dist::SquaredEuclidean, 300);
         check_cluster_major(Dist::Cosine, 300);
+    }
+
+    /// Every scan probing every cluster, against CPU exhaustive, over k
+    /// values on both sides of the 32-slot boundaries.
+    ///
+    /// ### Params
+    ///
+    /// * `metric` - Metric under test
+    fn check_k_sweep(metric: Dist) {
+        let (n, dim, nlist) = (3_000, 20, 30);
+        let data = blobs(n, dim, 5);
+        let queries = blobs(100, dim, 6);
+        let exh = ExhaustiveIndex::new(data.as_ref(), metric);
+        let (q_flat, nq, _) = queries.as_ref().into_row_major();
+        let mut index =
+            IvfIndexMlx::build(data.as_ref(), metric, Some(nlist), None, 1, false).unwrap();
+        for k in [1, 10, 15, 16, 31, 32, 33, 50, 64, 100] {
+            let truth = exh.query_batch(&q_flat, nq, k, None, false).unwrap();
+            let truth_nn: Vec<Vec<usize>> = truth.iter().map(|(i, _)| i.clone()).collect();
+            for scan in [
+                IvfScanMlx::QueryMajor,
+                IvfScanMlx::ClusterMajor,
+                IvfScanMlx::ClusterMatrix,
+                IvfScanMlx::Auto,
+            ] {
+                index = index.with_scan(scan);
+                let (nn, dist) = index
+                    .query_batch(queries.as_ref(), k, Some(nlist), None, false)
+                    .unwrap();
+                let r = recall(&truth_nn, &nn);
+                assert!(r > 0.999, "{scan:?} {metric:?} k {k}: recall {r}");
+                for (row, (_, td)) in dist.iter().zip(&truth) {
+                    assert_eq!(row.len(), k);
+                    for (x, y) in row.iter().zip(td) {
+                        assert!(
+                            (x - y).abs() <= 1e-3 * y.abs().max(1.0),
+                            "{scan:?} {metric:?} k {k}: {x} vs {y}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_mlx_ivf_k_sweep_euclidean() {
+        check_k_sweep(Dist::SquaredEuclidean);
+    }
+
+    #[test]
+    fn test_mlx_ivf_k_sweep_cosine() {
+        check_k_sweep(Dist::Cosine);
     }
 
     #[test]

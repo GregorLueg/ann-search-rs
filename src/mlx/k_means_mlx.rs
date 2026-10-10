@@ -16,7 +16,7 @@
 
 use rayon::prelude::*;
 
-use crate::mlx::exhaustive_mlx::{TOPK_ROWS_PER_GROUP, TOPK_SOURCE};
+use crate::mlx::exhaustive_mlx::RowTopK;
 use crate::mlx::ffi::*;
 use crate::prelude::*;
 use crate::utils::k_means_utils::*;
@@ -121,52 +121,23 @@ impl CentroidOperands {
         x: &Array,
         rows: usize,
         n_centroids: usize,
-        argmin: &MetalKernel,
+        argmin: &RowTopK,
         s: &Stream,
     ) -> Result<Array, AnnSearchErrors> {
         let scores = Array::addmm(&self.add, x, &self.ct, self.alpha, 1.0, s)?;
-        let shape = [rows as i32, 1];
-        let mut out = argmin.apply(
-            &[&scores],
-            &[
-                OutputSpec {
-                    shape: &shape,
-                    dtype: MLX_UINT32,
-                },
-                OutputSpec {
-                    shape: &shape,
-                    dtype: MLX_FLOAT32,
-                },
-            ],
-            [32, rows as i32, 1],
-            [32, TOPK_ROWS_PER_GROUP, 1],
-            &[
-                ("K", 1),
-                ("N", n_centroids as i32),
-                ("VEC4", n_centroids.is_multiple_of(4) as i32),
-            ],
-            s,
-        )?;
-        out.truncate(1);
-        out.pop()
-            .expect("kernel has two outputs")
-            .reshape(&[rows as i32], s)
+        let (idx, _) = argmin.apply(&scores, rows, n_centroids, 1, s)?;
+        idx.reshape(&[rows as i32], s)
     }
 }
 
-/// Row argmin as the exhaustive index's top-k kernel at `K = 1`. MLX's own
-/// `argmin` measured slower on these narrow rows.
+/// Row argmin as the exhaustive index's top-k at `K = 1`. MLX's own `argmin`
+/// measured slower on these narrow rows.
 ///
 /// ### Returns
 ///
-/// The kernel handle
-pub(crate) fn argmin_kernel() -> MetalKernel {
-    MetalKernel::new(
-        "kmeans_argmin",
-        &["d"],
-        &["out_idx", "out_dist"],
-        TOPK_SOURCE,
-    )
+/// The kernel pair
+pub(crate) fn argmin_kernel() -> RowTopK {
+    RowTopK::new("kmeans_argmin")
 }
 
 /// Upload row-major points as `[t, dim]` tiles.
