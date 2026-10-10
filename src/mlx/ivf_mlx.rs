@@ -299,12 +299,13 @@ const IVF_PARTIAL_MERGE_BODY: &str = r#"
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum IvfScanMlx {
     /// One SIMD group per query walks its probed clusters; members are read
-    /// from device memory once per query that probes them.
-    #[default]
+    /// from device memory once per query that probes them. Loses to
+    /// `ClusterMajor` as `dim` grows, for want of reuse.
     QueryMajor,
     /// The probe lists are inverted on the device into per-cluster task lists
     /// and each staged member block is scored against up to
     /// [`CLUSTER_SCAN_QT`] queries; per-(query, probe) top-k are merged after.
+    #[default]
     ClusterMajor,
 }
 
