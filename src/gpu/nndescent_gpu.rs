@@ -47,6 +47,7 @@ use crate::gpu::*;
 use crate::prelude::*;
 use crate::utils::dist::cosine_from_dot;
 use crate::utils::nndescent_utils::{unpack_knn_graph, SENTINEL_PID};
+pub use crate::utils::rp_forest::{compact_knn_rows, default_forest_trees};
 
 ///////////
 // Const //
@@ -3028,82 +3029,6 @@ where
         knn_graph,
         converged,
     })
-}
-
-/// Default forest size for the NNDescent graph initialisation.
-///
-/// An `n^0.25` rule, capped at 20. Sits in its own function because the
-/// clustered driver recomputes it per cluster rather than once for the whole
-/// dataset: a cluster of `2n/C` points wants the forest its own size implies,
-/// not the one the full dataset would.
-///
-/// ### Params
-///
-/// * `n` - Number of vectors the forest will index
-///
-/// ### Returns
-///
-/// Number of random-projection trees to build.
-pub fn default_forest_trees(n: usize) -> usize {
-    (5 + ((n as f64).powf(0.25)).round() as usize).min(20)
-}
-
-/// Compact the wide NNDescent working graph down to `k` neighbours per node.
-///
-/// The device keeps `build_k` slots per node so the descent has room to
-/// manoeuvre; callers want `k`. Drops self-edges, sentinels and out-of-range
-/// ids, keeps the first `k` survivors, and sorts each row ascending by
-/// distance.
-///
-/// ### Params
-///
-/// * `graph_idx` - Raw packed ids from the device, `n * build_k`; the top bit
-///   is the is-new flag and is masked off here
-/// * `graph_dist` - Matching distances, `n * build_k`
-/// * `n` - Number of nodes
-/// * `k` - Neighbours to keep per node
-/// * `build_k` - Working degree the device ran at
-///
-/// ### Returns
-///
-/// Flat `n * k` graph, row `i` at `[i * k, (i + 1) * k)`, unfilled slots left
-/// as `(SENTINEL_PID, T::max_value())`.
-pub fn compact_knn_rows<T>(
-    graph_idx: &[u32],
-    graph_dist: &[T],
-    n: usize,
-    k: usize,
-    build_k: usize,
-) -> Vec<(usize, T)>
-where
-    T: AnnSearchFloat,
-{
-    let pid_mask = SENTINEL_PID as u32;
-    let sentinel = SENTINEL_PID;
-
-    let mut knn_graph = vec![(sentinel, <T as num_traits::Float>::max_value()); n * k];
-
-    knn_graph
-        .par_chunks_mut(k)
-        .enumerate()
-        .for_each(|(i, slot)| {
-            let mut written = 0;
-            for j in 0..build_k {
-                if written >= k {
-                    break;
-                }
-                let pid = (graph_idx[i * build_k + j] & pid_mask) as usize;
-                if pid < n && pid != i && pid != sentinel {
-                    slot[written] = (pid, graph_dist[i * build_k + j]);
-                    written += 1;
-                }
-            }
-            slot.sort_unstable_by(|a, b| {
-                a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal)
-            });
-        });
-
-    knn_graph
 }
 
 /// Run the device-resident NNDescent loop and read the raw graph back.

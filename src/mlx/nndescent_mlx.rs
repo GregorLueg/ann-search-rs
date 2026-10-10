@@ -29,7 +29,8 @@ use crate::cpu::vamana::compute_medoid;
 use crate::mlx::ffi::*;
 use crate::mlx::forest_mlx::forest_init_mlx;
 use crate::prelude::*;
-use crate::utils::nndescent_utils::{unpack_knn_graph, SENTINEL_PID};
+use crate::utils::nndescent_utils::unpack_knn_graph;
+use crate::utils::rp_forest::{compact_knn_rows, default_forest_trees, ForestRouter};
 
 ////////////
 // Consts //
@@ -858,48 +859,6 @@ fn pad_rows(data: &[f32], n: usize, dim: usize) -> (Vec<f32>, usize) {
     (out, dim_padded)
 }
 
-/// Compact the `build_k`-wide working graph to `k` neighbours per node: drop
-/// self-edges and sentinels, keep the first `k`, sort each row by distance.
-///
-/// ### Params
-///
-/// * `graph_idx` - Raw ids with the is-new flag, `n * build_k`
-/// * `graph_dist` - Matching distances
-/// * `n` - Nodes
-/// * `k` - Neighbours to keep
-/// * `build_k` - Working degree
-///
-/// ### Returns
-///
-/// Flat `n * k` graph, unfilled slots `(SENTINEL_PID, f32::MAX)`
-pub fn compact_knn_rows_mlx(
-    graph_idx: &[u32],
-    graph_dist: &[f32],
-    n: usize,
-    k: usize,
-    build_k: usize,
-) -> Vec<(usize, f32)> {
-    let mut knn_graph = vec![(SENTINEL_PID, f32::MAX); n * k];
-    knn_graph
-        .par_chunks_mut(k)
-        .enumerate()
-        .for_each(|(i, slot)| {
-            let mut written = 0;
-            for j in 0..build_k {
-                if written >= k {
-                    break;
-                }
-                let pid = (graph_idx[i * build_k + j] & MLX_SENTINEL) as usize;
-                if pid < n && pid != i {
-                    slot[written] = (pid, graph_dist[i * build_k + j]);
-                    written += 1;
-                }
-            }
-            slot.sort_unstable_by(|a, b| a.1.total_cmp(&b.1));
-        });
-    knn_graph
-}
-
 /////////////////
 // NND context //
 /////////////////
@@ -1233,6 +1192,19 @@ pub struct NnDescentCfgMlx {
     pub use_cosine: bool,
 }
 
+/// What [`nndescent_core_mlx`] hands back.
+pub struct NndOutputMlx {
+    /// Raw graph ids `n * build_k`, rows ascending by distance; ids still
+    /// carry the is-new flag in bit 31
+    pub graph_idx: Vec<u32>,
+    /// Matching distances
+    pub graph_dist: Vec<f32>,
+    /// Whether the update rate fell below `delta`
+    pub converged: bool,
+    /// Query router over the forest's first trees
+    pub router: ForestRouter<f32>,
+}
+
 /// Run the device-resident NN-Descent loop on MLX and read the raw graph
 /// back. Counterpart of `nndescent_core` on the wgpu path.
 ///
@@ -1248,8 +1220,7 @@ pub struct NnDescentCfgMlx {
 ///
 /// ### Returns
 ///
-/// `(graph_idx, graph_dist, converged)`, both `n * build_k`, rows sorted
-/// ascending; ids still carry the is-new flag in bit 31
+/// The raw graph, convergence flag and forest router, see [`NndOutputMlx`]
 pub fn nndescent_core_mlx(
     vectors_flat: &[f32],
     norms: &[f32],
@@ -1257,7 +1228,7 @@ pub fn nndescent_core_mlx(
     dim: usize,
     cfg: &NnDescentCfgMlx,
     verbose: bool,
-) -> Result<(Vec<u32>, Vec<f32>, bool), AnnSearchErrors> {
+) -> Result<NndOutputMlx, AnnSearchErrors> {
     install_error_handler();
     let build_k = cfg.build_k;
     let (vectors_padded, dim_padded) = pad_rows(vectors_flat, n, dim);
@@ -1282,7 +1253,8 @@ pub fn nndescent_core_mlx(
     }
     let mut g = ctx.init_random(cfg.seed as u32)?;
 
-    g = forest_init_mlx(&ctx, g, dim, cfg.n_trees, cfg.seed, verbose)?;
+    let (forest_g, router) = forest_init_mlx(&ctx, g, dim, cfg.n_trees, cfg.seed, verbose)?;
+    g = forest_g;
     // No mark-all-new pass: the random init flags every slot new and the
     // forest merges flag what they insert, so every entry is already new.
 
@@ -1337,7 +1309,12 @@ pub fn nndescent_core_mlx(
     }
 
     eval_all(&[&g.0, &g.1], false)?;
-    Ok((g.0.as_u32()?.to_vec(), g.1.as_f32()?.to_vec(), converged))
+    Ok(NndOutputMlx {
+        graph_idx: g.0.as_u32()?.to_vec(),
+        graph_dist: g.1.as_f32()?.to_vec(),
+        converged,
+        router,
+    })
 }
 
 /////////////////
@@ -1472,7 +1449,7 @@ pub fn build_knn_graph_mlx(
     let cfg = NnDescentCfgMlx {
         build_k,
         max_iters: max_iters.unwrap_or(DEFAULT_MAX_ITERS),
-        n_trees: n_trees.unwrap_or_else(|| (5 + (n as f64).powf(0.25).round() as usize).min(20)),
+        n_trees: n_trees.unwrap_or_else(|| default_forest_trees(n)),
         delta: delta.unwrap_or(DEFAULT_DELTA),
         rho_thresh: (rho.unwrap_or(DEFAULT_RHO) * 65535.0) as u32,
         refine_knn: refine_knn.unwrap_or(0),
@@ -1480,9 +1457,9 @@ pub fn build_knn_graph_mlx(
         use_cosine,
     };
 
-    let (graph_idx, graph_dist, converged) =
-        nndescent_core_mlx(&vectors_flat, &norms, n, dim, &cfg, verbose)?;
-    let knn_graph = compact_knn_rows_mlx(&graph_idx, &graph_dist, n, k, build_k);
+    let out = nndescent_core_mlx(&vectors_flat, &norms, n, dim, &cfg, verbose)?;
+    let knn_graph = compact_knn_rows(&out.graph_idx, &out.graph_dist, n, k, build_k);
+    let converged = out.converged;
 
     if verbose {
         println!("  Total build time: {:.2?}", start.elapsed());
@@ -1832,7 +1809,9 @@ mod tests {
             seed: 42,
             use_cosine: false,
         };
-        let (g_idx, _, _) = nndescent_core_mlx(&flat, &[], n, dim, &cfg, false).unwrap();
+        let g_idx = nndescent_core_mlx(&flat, &[], n, dim, &cfg, false)
+            .unwrap()
+            .graph_idx;
         let (nav, medoid) =
             cagra_optimise_mlx(&g_idx, &flat, n, dim, build_k, k, Dist::SquaredEuclidean).unwrap();
         assert_eq!(nav.len(), n * k);
