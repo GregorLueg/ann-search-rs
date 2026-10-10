@@ -749,8 +749,8 @@ where
 /// Run batch kNN queries on the GPU against an already-uploaded database
 ///
 /// [`query_batch_gpu`] without the upload: the caller owns the database
-/// tensors and can reuse them across calls. On SIFT (1M x 128) the upload and
-/// its synchronisation were most of a small batch's wall time.
+/// tensors and can reuse them across calls. On a large database the upload and
+/// its synchronisation dominate a small batch's wall time.
 ///
 /// ### Params
 ///

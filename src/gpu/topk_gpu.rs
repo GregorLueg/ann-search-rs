@@ -52,16 +52,6 @@ pub const RADIX_BINS: usize = 1 << RADIX_BITS;
 /// Smallest `k` at which radix select beats `extract_topk` on the *chunked*
 /// exhaustive path.
 ///
-/// Measured end to end on an M1 Max, 50k x 50k, dim 32, four DB chunks:
-///
-/// | k | `extract_topk` | radix | |
-/// |---|---|---|---|
-/// | 15 | 383 ms | 555 ms | 0.69x |
-/// | 50 | 520 | 559 | 0.93x |
-/// | 75 | 719 | 731 | 0.98x |
-/// | 100 | 985 | 747 | 1.32x |
-/// | 150 | 1743 | 755 | 2.31x |
-///
 /// The threshold exists because of chunking, and it cannot be read off the
 /// isolated reducer benchmark, which reports radix winning at every `k`. The
 /// isolated bench always measures a *cold* chunk, where the running top-k is all
@@ -71,11 +61,11 @@ pub const RADIX_BINS: usize = 1 << RADIX_BITS;
 /// chunks cost little more than a scan. Radix select has no such early-out and
 /// pays the same four-plus passes on every chunk.
 ///
-/// So this is a property of `k` *and* the chunk count. 80 is taken from the
-/// four-chunk shape above, which is the conservative direction: single-chunk
-/// workloads would tolerate a much lower threshold (radix wins there from
-/// `k = 10`), so this leaves some gain unclaimed rather than risking a
-/// regression. Re-measure if `DB_CHUNK_SIZE` changes.
+/// So this is a property of `k` *and* the chunk count. 80 is taken from a
+/// multi-chunk shape, which is the conservative direction: single-chunk
+/// workloads would tolerate a much lower threshold, so this leaves some gain
+/// unclaimed rather than risking a regression. Re-measure if `DB_CHUNK_SIZE`
+/// changes.
 ///
 /// ### Portability
 ///
@@ -86,7 +76,7 @@ pub const RADIX_BINS: usize = 1 << RADIX_BITS;
 /// on Vulkan or DX12 hardware, where nothing here has been measured.
 ///
 /// Being conservative is the mitigation. At 80 the radix path is only taken where
-/// the measured margin is 2.3x, so a device where radix does noticeably worse than
+/// its margin is wide, so a device where radix does noticeably worse than
 /// Apple Silicon still has headroom before it regresses, and the failure mode is a
 /// slower arm rather than a wrong answer.
 ///

@@ -53,7 +53,7 @@ pub const WORKGROUP_SIZE_X: u32 = 32;
 /// Most search kernels stay at [`WORKGROUP_SIZE_X`] because they run one cube
 /// per query and the work per cube does not fill more. The local join is the
 /// exception and sizes its own cube through `pick_local_join_cube`: idle
-/// lanes turned out to be free there, and widening it was worth roughly 2x.
+/// lanes turned out to be free there, and widening it paid.
 /// Treat "search kernels want 32" as a default, not a rule.
 pub const WORKGROUP_128: u32 = 128;
 
@@ -378,27 +378,19 @@ fn pick_local_join_cube(limits: &GpuLimits) -> (u32, u32) {
 
 /// Threads per local-join cube.
 ///
-/// Swept on an M1 Max at n=25k, `build_k=45`, min-of-15, in milliseconds:
-///
-/// | dim | 8x4 (32) | 8x8 (64) | 16x8 (128) | 16x16 (256) |
-/// |---|---|---|---|---|
-/// | 128 | 55.9 | 35.7 | **28.4** | 38.9 |
-/// | 256 | 98.0 | 59.4 | **49.1** | 61.8 |
-/// | 512 | 224.2 | 127.7 | **117.3** | 175.3 |
-/// | 1024 | 862.7 | 690.1 | **627.2** | 1100 |
-///
-/// 128 wins at every width and 256 regresses, which is the register-pressure
-/// edge again: each thread carries [`LOCAL_JOIN_LINE_UNROLL`] vector
-/// accumulators and that does not shrink as the cube grows.
+/// Swept against 32, 64 and 256 across dims. 128 wins at every width and 256
+/// regresses, which is the register-pressure edge again: each thread carries
+/// [`LOCAL_JOIN_LINE_UNROLL`] vector accumulators and that does not shrink as
+/// the cube grows.
 const LOCAL_JOIN_THREADS: usize = 128;
 
 /// Unroll depth for the local join's pair-distance loop.
 ///
 /// The kernel is latency bound, so this is a real lever rather than a tidiness
-/// knob: it sets how many loads are in flight per thread. Both extremes were
-/// measured on an M1 Max at n=25k and both lose. Unrolling the whole row emits
-/// `dim_padded` statements at each of three call sites and costs ~20% at dim
-/// 1024; not unrolling at all costs ~20% at dim 64.
+/// knob: it sets how many loads are in flight per thread. Both extremes lose.
+/// Unrolling the whole row emits `dim_padded` statements at each of three call
+/// sites, which hurts at high dim; not unrolling at all leaves too few loads in
+/// flight at low dim.
 ///
 /// Sweep this rather than inheriting it. The knee has moved between kernels in
 /// this crate before.
@@ -421,18 +413,9 @@ fn resolve_line_unroll(dim_lines: usize) -> usize {
 /// group. One line of padding walks consecutive rows across banks instead.
 ///
 /// It only pays while there are enough rows staged to conflict, which is why
-/// this is a function of the row length rather than a constant. Measured on an
-/// M1 Max at n=25k, min-of-15, padded against unpadded:
-///
-/// | dim | block | build_k 45 | build_k 64 |
-/// |---|---|---|---|
-/// | 128 | 29 | -4.7% | -0.6% |
-/// | 256 | 15 | -7.1% | **-15.3%** |
-/// | 512 | 7 | +1.8% | +3.0% |
-/// | 1024 | 3 | **+29.4%** | **+33.0%** |
-///
-/// Past dim 256 the shared budget holds so few candidates that there is little
-/// conflict left to remove, and the odd stride costs more than it saves.
+/// this is a function of the row length rather than a constant. Past dim 256
+/// the shared budget holds so few candidates that there is little conflict
+/// left to remove, and the odd stride costs more than it saves.
 ///
 /// ### Params
 ///
@@ -454,17 +437,10 @@ const LOCAL_JOIN_PAD_MAX_LINES: usize = 64;
 
 /// Default unroll depth handed to `resolve_line_unroll`.
 ///
-/// Swept on an M1 Max at n=25k, `build_k=45`, min-of-15, in milliseconds:
-///
-/// | dim | 1 | 2 | 4 | 8 | 16 |
-/// |---|---|---|---|---|---|
-/// | 64 | 68.7 | 58.5 | 51.3 | **47.9** | 51.3 |
-/// | 128 | 114.2 | 88.6 | 81.6 | **74.0** | 141.3 |
-/// | 1024 | 3652 | 2398 | 1956 | **1575** | 3661 |
-///
-/// 8 wins at every width. 16 falls off a cliff at dim 128 and above, which is
-/// the register-pressure edge: 16 `Vector<F, N>` accumulators plus their
-/// in-flight operands spill, and a spilled register array is global memory.
+/// Swept over powers of two from 1 to 16; 8 wins at every width. 16 falls off
+/// a cliff at dim 128 and above, which is the register-pressure edge: 16
+/// `Vector<F, N>` accumulators plus their in-flight operands spill, and a
+/// spilled register array is global memory.
 const LOCAL_JOIN_LINE_UNROLL: usize = 8;
 
 /// Per-cube shared-memory overhead of the local-join kernel that is *not* the

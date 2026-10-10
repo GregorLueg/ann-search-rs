@@ -211,10 +211,10 @@ fn dist_cosine<F: Float, N: Size>(
 /// hide.
 ///
 /// The line loop is unrolled `unroll` deep into that many independent
-/// accumulators. Both extremes measured badly. Unrolling the whole row, which
-/// is what this kernel did originally, emits `dim_padded` statements at each of
-/// three call sites and costs ~20% at dim 1024. Not unrolling at all leaves too
-/// few loads in flight for a latency-bound kernel and costs ~20% at dim 64. See
+/// accumulators. Both extremes lose. Unrolling the whole row emits
+/// `dim_padded` statements at each of three call sites, which hurts at high
+/// dim. Not unrolling at all leaves too few loads in flight for a
+/// latency-bound kernel, which hurts at low dim. See
 /// [`resolve_line_unroll`] for the chosen depth.
 ///
 /// ### Params
@@ -343,9 +343,8 @@ fn staged_pair_dist<F: Float, N: Size>(
 ///
 /// The insertion sort runs over thread-local arrays, not over the graph
 /// tensors. Sorting in place in global memory costs `O(k^2)` scattered
-/// read-modify-writes per node against `O(k)` here, and at `n = 500k`,
-/// `k = 45` that was 201 ms of a 1.76 s build, more than any other single
-/// launch.
+/// read-modify-writes per node against `O(k)` here, and made this the most
+/// expensive single launch of the build.
 ///
 /// ### Grid mapping
 ///
@@ -4728,7 +4727,7 @@ mod kernel_tests {
     /// into a slot claimed by one atomic increment. Anything that writes a slot
     /// it did not claim lets two threads interleave and files one thread's id
     /// under the other's distance. That used to happen in the forest init's
-    /// overflow path and desynced ~29% of the graph here.
+    /// overflow path and desynced a large share of the graph here.
     ///
     /// Well-separated blobs make it unmistakable: cross-blob squared distances
     /// are ~1600+, within-blob ones ~0-50, so a mispaired entry is off by two
