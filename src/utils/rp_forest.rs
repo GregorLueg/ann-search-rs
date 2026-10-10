@@ -437,4 +437,22 @@ impl<T: AnnSearchFloat> ForestRouter<T> {
         candidates.dedup();
         candidates
     }
+
+    /// The routing data, for a device-side copy.
+    ///
+    /// ### Returns
+    ///
+    /// `(projections [tree][level][dim], medians [tree][level][2^level],
+    /// leaves [tree][partition][], max_depth)`. A tree's leaf list stops at its
+    /// highest occupied partition.
+    #[allow(clippy::type_complexity)]
+    #[cfg_attr(not(mlx_available), allow(dead_code))]
+    pub(crate) fn parts(&self) -> (&[Vec<Vec<T>>], &[Vec<Vec<T>>], &[Vec<Vec<u32>>], usize) {
+        (
+            &self.random_vecs,
+            &self.medians,
+            &self.leaves,
+            self.max_depth,
+        )
+    }
 }

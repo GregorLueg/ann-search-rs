@@ -15,14 +15,15 @@
 //! walking a 784-dim row serially left the kernel latency bound.
 //!
 //! The graph is an input, not built here. Entry points are an input too,
-//! either as fixed ids or, via [`CagraSearchMlx::search_routed`], as router
-//! candidates the kernel scores and selects from itself. Without either the
+//! either as fixed ids or, with a forest router attached, picked on the device:
+//! the query descends each tree to a leaf and the closest leaf members win. Without either the
 //! search falls back to the medoid plus random nodes.
 
 use rand::{rngs::SmallRng, Rng, SeedableRng};
 
 use crate::mlx::ffi::*;
 use crate::prelude::*;
+use crate::utils::rp_forest::ForestRouter;
 use crate::utils::DimensionValidation;
 
 ////////////
@@ -72,6 +73,11 @@ const LPN_MID: usize = 4;
 /// were level or slightly worse).
 const LPN_WIDE: usize = 8;
 
+/// MLX hands a kernel input with fewer elements than this to the kernel in
+/// the `constant` address space, which the kernel's `device` pointer casts
+/// reject at compile time. Inputs the kernel casts are padded to this.
+const MLX_DEVICE_MIN_ELEMS: usize = 8;
+
 /// Marks an empty graph slot, beam slot or output slot.
 const SENTINEL: u32 = 0x7FFF_FFFF;
 
@@ -79,8 +85,9 @@ const SENTINEL: u32 = 0x7FFF_FFFF;
 /// `DEG` (graph degree), `BW` (beam width), `HASH` (table size, power of 2),
 /// `EXPAND` (parents per iteration), `N_ENTRY`, `MAX_ITERS`, `COSINE`,
 /// `K_OUT`, `N` (graph size), `LPN` (lanes per scored neighbour, a power of 2
-/// up to 32, see [`lanes_per_neighbour`]) and `KEEP` (routed candidates kept,
-/// 0 when the search is not routed).
+/// up to 32, see [`lanes_per_neighbour`]), `R_TREES` and `R_DEPTH` (router
+/// shape, `R_TREES = 0` when not routed), `KEEP` (routed candidates kept) and
+/// `ENTRIES_ONLY` (stop after routing and write the kept entries out).
 ///
 /// Semantics follow the wgpu kernel: entries seed the beam, each iteration
 /// claims the `EXPAND` best unexpanded beam entries, scores their unvisited
@@ -90,10 +97,12 @@ const SENTINEL: u32 = 0x7FFF_FFFF;
 /// is worse than the beam's worst and fails the merge check. Stops when every
 /// beam entry has been expanded.
 ///
-/// With `KEEP > 0` each query also carries a CSR list of router candidates
-/// (`cands`, offsets in `coffs`). They are scored first and only the `KEEP`
-/// closest stay, then `entries` go in as usual: the selection the host used to
-/// do per query, moved onto the device.
+/// With `R_TREES > 0` the query first descends each router tree greedily
+/// (whole-group dot with the level's projection, right when above the
+/// partition median) to one leaf, scores the leaf's members except
+/// `entries[0]` (deduplicated across trees through the visited table), and
+/// keeps the `KEEP` closest. The table is then cleared so that only the kept
+/// candidates count as visited, and `entries` go in as usual.
 const BEAM_SOURCE: &str = r#"
     constexpr uint SENT = 0x7FFFFFFFu;
     constexpr int BPL = (BW + 31) / 32;
@@ -110,7 +119,8 @@ const BEAM_SOURCE: &str = r#"
 
     threadgroup float4 sq[DIM4];
     threadgroup atomic_uint vis[HASH];
-    threadgroup uint cand[TOTAL];
+    constexpr int CAND = TOTAL > 32 ? TOTAL : 32;
+    threadgroup uint cand[CAND];
 
     const device float4* q4 = (const device float4*)queries + (ulong)(qbase[0] + qi) * DIM4;
     const device float4* v4 = (const device float4*)vectors;
@@ -214,30 +224,73 @@ const BEAM_SOURCE: &str = r#"
         } \
     }
 
+    // Score the first NC ids in `cand`, LPN lanes per id, and merge them.
+    #define SCORE_CAND(NC) { \
+        for (uint sc0_ = 0; sc0_ < (NC); sc0_ += NPP) { \
+            uint sc_ = sc0_ + grp; \
+            bool sv_ = sc_ < (NC); \
+            uint sid_ = sv_ ? cand[sc_] : 0u; \
+            float sd_; \
+            COOP_DIST(sv_, sid_, sd_); \
+            MERGE_LANES(sv_ && sub == 0 && sd_ < WORST(), sd_, sid_); \
+        } \
+    }
+
+    const device uint* ep = entries + (ulong)qi * N_ENTRY;
     uint hcount = 0;
-    if (KEEP > 0) {
-        // Score every routed candidate, keep the KEEP closest. They are not
-        // marked visited while scored, only once kept, as on the host.
-        uint c_lo = coffs[qi];
-        uint c_hi = coffs[qi + 1];
-        for (uint c0 = c_lo; c0 < c_hi; c0 += NPP) {
-            uint c = c0 + grp;
-            bool valid = c < c_hi;
-            uint id = valid ? cands[c] : 0u;
-            valid = valid && id < (uint)N;
-            float d;
-            COOP_DIST(valid, id, d);
-            MERGE_LANES(valid && sub == 0 && d < WORST(), d, id);
+    if (R_TREES > 0) {
+        constexpr uint NPART = 1u << R_DEPTH;
+        uint excl = ep[0];
+        for (int t = 0; t < R_TREES; t++) {
+            uint pid = 0;
+            for (int lv = 0; lv < R_DEPTH; lv++) {
+                const device float4* p4 =
+                    (const device float4*)rproj + ((ulong)t * R_DEPTH + lv) * DIM4;
+                float a = 0.0f;
+                for (uint i = lane; i < (uint)DIM4; i += 32) a += dot(sq[i], p4[i]);
+                a = simd_sum(a);
+                float med = rmed[(uint)t * (NPART - 1) + ((1u << lv) - 1) + pid];
+                pid = 2 * pid + (a > med ? 1u : 0u);
+            }
+            uint lo = loff[(uint)t * (NPART + 1) + pid];
+            uint hi = loff[(uint)t * (NPART + 1) + pid + 1];
+            for (uint c0 = lo; c0 < hi; c0 += 32) {
+                uint c = c0 + lane;
+                bool nw = false;
+                uint id = SENT;
+                if (c < hi) {
+                    id = lids[c];
+                    if (id < (uint)N && id != excl) HASH_INSERT(id, nw);
+                }
+                uint m = (uint)(ulong)simd_ballot(nw);
+                if (nw) cand[popcount(m & ((1u << lane) - 1u))] = id;
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+                SCORE_CAND(popcount(m));
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+            }
         }
-        uint kept = 0;
         for (int b = 0; b < BPL; b++) {
             if ((uint)b * 32 + lane >= (uint)KEEP) { bd[b] = INFINITY; bi[b] = SENT; bx[b] = 1u; }
+        }
+        if (ENTRIES_ONLY) {
+            device uint* oe = out_idx + (ulong)qi * K_OUT;
+            for (int b = 0; b < BPL; b++) {
+                uint slot = (uint)b * 32 + lane;
+                if (slot < (uint)K_OUT) oe[slot] = bi[b];
+            }
+            for (uint s = (uint)BPL * 32 + lane; s < (uint)K_OUT; s += 32) oe[s] = SENT;
+            return;
+        }
+        // Scored but not kept is not visited: the graph may still reach it.
+        for (uint i = lane; i < HASH; i += 32) atomic_store_explicit(&vis[i], SENT, memory_order_relaxed);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        uint kept = 0;
+        for (int b = 0; b < BPL; b++) {
             if (bi[b] != SENT) { bool nw; HASH_INSERT(bi[b], nw); kept++; }
         }
         hcount = simd_sum(kept);
     }
 
-    const device uint* ep = entries + (ulong)qi * N_ENTRY;
     for (int e0 = 0; e0 < N_ENTRY; e0 += 32) {
         uint e = (uint)e0 + lane;
         uint id = SENT;
@@ -299,14 +352,7 @@ const BEAM_SOURCE: &str = r#"
         }
         hcount += ncand;
         threadgroup_barrier(mem_flags::mem_threadgroup);
-        for (uint c0 = 0; c0 < ncand; c0 += NPP) {
-            uint c = c0 + grp;
-            bool valid = c < ncand;
-            uint id = valid ? cand[c] : 0u;
-            float d;
-            COOP_DIST(valid, id, d);
-            MERGE_LANES(valid && sub == 0 && d < WORST(), d, id);
-        }
+        SCORE_CAND(ncand);
         // `cand` is rewritten next iteration.
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
@@ -478,7 +524,8 @@ pub fn plan_beam_search_threadgroup(
 // Helpers //
 /////////////
 
-/// Copy rows into a buffer with zero-padded columns.
+/// Upload rows with zero-padded columns as a `[rows, dim_padded]` array,
+/// adding zero rows when the buffer would be under `MLX_DEVICE_MIN_ELEMS`.
 ///
 /// ### Params
 ///
@@ -489,19 +536,32 @@ pub fn plan_beam_search_threadgroup(
 ///
 /// ### Returns
 ///
-/// Row-major `n * dim_padded` buffer
-fn pad_rows(data: &[f32], n: usize, dim: usize, dim_padded: usize) -> Vec<f32> {
-    if dim == dim_padded {
-        return data.to_vec();
-    }
-    let mut out = vec![0.0f32; n * dim_padded];
-    for (dst, src) in out
-        .chunks_exact_mut(dim_padded)
-        .zip(data.chunks_exact(dim))
-    {
+/// The array; rows past `n` are zero
+fn upload_rows(data: &[f32], n: usize, dim: usize, dim_padded: usize) -> Array {
+    let rows = n.max(MLX_DEVICE_MIN_ELEMS.div_ceil(dim_padded));
+    let mut out = vec![0.0f32; rows * dim_padded];
+    for (dst, src) in out.chunks_exact_mut(dim_padded).zip(data.chunks_exact(dim)) {
         dst[..dim].copy_from_slice(src);
     }
-    out
+    Array::from_f32(&out, &[rows as i32, dim_padded as i32])
+}
+
+/// Upload a flat u32 buffer, zero-extended to `MLX_DEVICE_MIN_ELEMS`.
+///
+/// ### Params
+///
+/// * `data` - Values
+///
+/// ### Returns
+///
+/// The 1-D array
+fn upload_u32(data: &[u32]) -> Array {
+    if data.len() >= MLX_DEVICE_MIN_ELEMS {
+        return Array::from_u32(data, &[data.len() as i32]);
+    }
+    let mut v = data.to_vec();
+    v.resize(MLX_DEVICE_MIN_ELEMS, 0);
+    Array::from_u32(&v, &[v.len() as i32])
 }
 
 /// Self-query entry points, the scheme `NNDescentGpu::self_query_gpu` uses:
@@ -578,10 +638,28 @@ pub struct CagraSearchMlx {
     norms: Array,
     /// Device graph `[n, degree]`
     graph: Array,
+    /// Forest router on the device, if attached
+    router: Option<RouterMlx>,
     /// Beam search kernel, see [`BEAM_SOURCE`]
     kernel: MetalKernel,
     /// Stream every op runs on. Declared last so it drops after the arrays.
     stream: Stream,
+}
+
+/// Device copy of a [`ForestRouter`].
+struct RouterMlx {
+    /// Projections `[trees * depth, dim_padded]`
+    proj: Array,
+    /// Medians, per tree `2^depth - 1` of them, level `l` at offset `2^l - 1`
+    med: Array,
+    /// Leaf offsets into `ids`, per tree `2^depth + 1` of them
+    offsets: Array,
+    /// Leaf members, all trees concatenated
+    ids: Array,
+    /// Number of trees
+    n_trees: usize,
+    /// Levels per tree
+    depth: usize,
 }
 
 impl DimensionValidation for CagraSearchMlx {
@@ -623,10 +701,7 @@ impl CagraSearchMlx {
 
         let dim_padded = dim.next_multiple_of(4);
         let stream = Stream::default_gpu();
-        let vectors = Array::from_f32(
-            &pad_rows(vectors_flat, n, dim, dim_padded),
-            &[n as i32, dim_padded as i32],
-        );
+        let vectors = upload_rows(vectors_flat, n, dim, dim_padded);
         let norms = if metric == Dist::Cosine {
             let norms: Vec<f32> = vectors_flat
                 .chunks_exact(dim)
@@ -650,17 +725,71 @@ impl CagraSearchMlx {
             vectors,
             norms,
             graph,
+            router: None,
             kernel: MetalKernel::new(
                 "cagra_beam_search",
                 &[
-                    "vectors", "norms", "graph", "queries", "entries", "qbase", "cands",
-                    "coffs",
+                    "vectors", "norms", "graph", "queries", "entries", "qbase", "rproj", "rmed",
+                    "loff", "lids",
                 ],
                 &["out_idx", "out_dist"],
                 BEAM_SOURCE,
             ),
             stream,
         })
+    }
+
+    /// Upload a forest router, so that [`Self::search`] without explicit
+    /// entry points routes each query on the device.
+    ///
+    /// ### Params
+    ///
+    /// * `router` - Router from the forest the graph was built with; its
+    ///   dimensionality must match
+    ///
+    /// ### Returns
+    ///
+    /// `Ok(())` once the router is resident
+    pub(crate) fn attach_router(
+        &mut self,
+        router: &ForestRouter<f32>,
+    ) -> Result<(), AnnSearchErrors> {
+        let (vecs, medians, leaves, depth) = router.parts();
+        let n_trees = vecs.len();
+        let n_part = 1usize << depth;
+        let mut proj = vec![0.0f32; n_trees * depth * self.dim_padded];
+        let mut med = vec![0.0f32; n_trees * (n_part - 1)];
+        let mut offsets = Vec::with_capacity(n_trees * (n_part + 1));
+        let mut ids = Vec::new();
+        for t in 0..n_trees {
+            for l in 0..depth {
+                let row = (t * depth + l) * self.dim_padded;
+                proj[row..row + self.dim].copy_from_slice(&vecs[t][l]);
+                let m = t * (n_part - 1) + (1 << l) - 1;
+                med[m..m + medians[t][l].len()].copy_from_slice(&medians[t][l]);
+            }
+            for p in 0..n_part {
+                offsets.push(ids.len() as u32);
+                if let Some(leaf) = leaves[t].get(p) {
+                    ids.extend_from_slice(leaf);
+                }
+            }
+            offsets.push(ids.len() as u32);
+        }
+        if ids.is_empty() {
+            ids.push(SENTINEL);
+        }
+        let r = RouterMlx {
+            proj: upload_rows(&proj, n_trees * depth, self.dim_padded, self.dim_padded),
+            med: Array::from_f32(&med, &[med.len() as i32]),
+            offsets: Array::from_u32(&offsets, &[offsets.len() as i32]),
+            ids: Array::from_u32(&ids, &[ids.len() as i32]),
+            n_trees,
+            depth,
+        };
+        eval_all(&[&r.proj, &r.med, &r.offsets, &r.ids], false)?;
+        self.router = (n_trees > 0 && depth > 0).then_some(r);
+        Ok(())
     }
 
     /// Fallback entry points: the medoid, then random nodes.
@@ -693,9 +822,11 @@ impl CagraSearchMlx {
     /// * `n_queries` - Number of queries
     /// * `k` - Neighbours per query
     /// * `query_params` - Beam parameters; `None` scales them to `k`
-    /// * `entry_points` - Optional `[n_queries * n_entry]` entry ids; `None`
-    ///   uses the medoid plus random nodes
-    /// * `seed` - Seed for the fallback entries
+    /// * `entry_points` - Optional `[n_queries * n_entry]` entry ids. `None`
+    ///   routes on the device when a router is attached (the medoid plus the
+    ///   `n_entry - 1` closest members of the query's leaves), else uses the
+    ///   medoid plus random nodes.
+    /// * `seed` - Seed for the random fallback
     ///
     /// ### Returns
     ///
@@ -716,65 +847,57 @@ impl CagraSearchMlx {
         self.check_dim(queries_flat.len() / n_queries)?;
         let params = query_params.unwrap_or_else(|| CagraMlxSearchParams::from_k(k));
         let n_entry = params.get_n_entry();
-        let entries = match entry_points {
+        let queries = upload_rows(queries_flat, n_queries, self.dim, self.dim_padded);
+        match entry_points {
             Some(e) => {
                 assert_eq!(e.len(), n_queries * n_entry, "entry points per query");
-                e.to_vec()
+                self.run(
+                    &queries, n_queries, e, n_entry, false, false, k, &params, HASH_SIZE,
+                )
             }
-            None => self.default_entry_points(n_queries, n_entry, seed),
-        };
-        let queries = Array::from_f32(
-            &pad_rows(queries_flat, n_queries, self.dim, self.dim_padded),
-            &[n_queries as i32, self.dim_padded as i32],
-        );
-        self.run(&queries, n_queries, &entries, n_entry, None, k, &params, HASH_SIZE)
+            None if self.router.is_some() && n_entry > 1 => {
+                let entries = vec![self.medoid; n_queries];
+                self.run(
+                    &queries, n_queries, &entries, 1, true, false, k, &params, HASH_SIZE,
+                )
+            }
+            None => {
+                let entries = self.default_entry_points(n_queries, n_entry, seed);
+                self.run(
+                    &queries, n_queries, &entries, n_entry, false, false, k, &params, HASH_SIZE,
+                )
+            }
+        }
     }
 
-    /// Search a batch of queries seeded from router candidates. Per query the
-    /// kernel scores every candidate, keeps the `n_entry - 1` closest and adds
-    /// `fixed_entry` (the medoid): the selection `NNDescentGpu` does on the
-    /// host, done on the device.
+    /// The router-selected entries, without the medoid, as the device picks
+    /// them. For checking parity with host routing.
     ///
     /// ### Params
     ///
     /// * `queries_flat` - Row-major queries, `n_queries * dim`
     /// * `n_queries` - Number of queries
-    /// * `k` - Neighbours per query
-    /// * `query_params` - Beam parameters; `None` scales them to `k`
-    /// * `cand_ids` - Candidates of every query, concatenated
-    /// * `cand_offsets` - `n_queries + 1` offsets into `cand_ids`
-    /// * `fixed_entry` - Entry added to every query, never scored as a
-    ///   candidate; leave it out of `cand_ids`
+    /// * `n_entry` - Entries per query, medoid included
     ///
     /// ### Returns
     ///
-    /// `(indices, distances)` per query, ascending. Unfilled slots are
-    /// dropped, so a row can be shorter than `k`.
-    #[allow(clippy::too_many_arguments)]
-    pub fn search_routed(
+    /// Up to `n_entry - 1` ids per query, ascending by distance
+    #[cfg(test)]
+    pub(crate) fn routed_entries(
         &self,
         queries_flat: &[f32],
         n_queries: usize,
-        k: usize,
-        query_params: Option<CagraMlxSearchParams>,
-        cand_ids: &[u32],
-        cand_offsets: &[u32],
-        fixed_entry: u32,
-    ) -> KnnResult<f32> {
-        if n_queries == 0 {
-            return Ok((Vec::new(), Vec::new()));
-        }
-        self.check_dim(queries_flat.len() / n_queries)?;
-        assert_eq!(cand_offsets.len(), n_queries + 1, "candidate offsets");
-        let params = query_params.unwrap_or_else(|| CagraMlxSearchParams::from_k(k));
-        let keep = params.get_n_entry().saturating_sub(1);
-        let queries = Array::from_f32(
-            &pad_rows(queries_flat, n_queries, self.dim, self.dim_padded),
-            &[n_queries as i32, self.dim_padded as i32],
-        );
-        let entries = vec![fixed_entry; n_queries];
-        let routed = (keep > 0).then_some((cand_ids, cand_offsets, keep));
-        self.run(&queries, n_queries, &entries, 1, routed, k, &params, HASH_SIZE)
+        n_entry: usize,
+    ) -> Result<Vec<Vec<usize>>, AnnSearchErrors> {
+        let params = CagraMlxSearchParams::new(None, None, Some(n_entry), None);
+        let queries = upload_rows(queries_flat, n_queries, self.dim, self.dim_padded);
+        let entries = vec![self.medoid; n_queries];
+        let keep = n_entry - 1;
+        Ok(self
+            .run(
+                &queries, n_queries, &entries, 1, true, true, keep, &params, HASH_SIZE,
+            )?
+            .0)
     }
 
     /// Search every indexed vector against the graph (self-kNN).
@@ -808,7 +931,17 @@ impl CagraSearchMlx {
             None => self_entry_points(&self.nav_graph, self.degree, self.n, n_entry, seed),
         };
         // The device vectors double as the queries: no re-upload.
-        self.run(&self.vectors, self.n, &entries, n_entry, None, k, &params, HASH_SIZE)
+        self.run(
+            &self.vectors,
+            self.n,
+            &entries,
+            n_entry,
+            false,
+            false,
+            k,
+            &params,
+            HASH_SIZE,
+        )
     }
 
     /// Queue the beam search in chunks and collect the results.
@@ -819,8 +952,10 @@ impl CagraSearchMlx {
     /// * `n_queries` - Number of queries
     /// * `entries` - Flat `[n_queries * n_entry]` entry ids
     /// * `n_entry` - Entries per query
-    /// * `routed` - Optional `(candidate ids, n_queries + 1 offsets, keep)`
-    ///   scored on the device before the entries go in
+    /// * `routed` - Route on the device first and keep `n_entry - 1` of the
+    ///   leaf members (from `params`); needs an attached router
+    /// * `entries_only` - Stop after routing and return the kept entries as
+    ///   the indices (`k` must be the keep count)
     /// * `k` - Neighbours per query
     /// * `params` - Beam parameters; only width, iterations and expansion
     ///   are read
@@ -838,19 +973,26 @@ impl CagraSearchMlx {
         n_queries: usize,
         entries: &[u32],
         n_entry: usize,
-        routed: Option<(&[u32], &[u32], usize)>,
+        routed: bool,
+        entries_only: bool,
         k: usize,
         params: &CagraMlxSearchParams,
         hash_pref: usize,
     ) -> KnnResult<f32> {
-        let (width, iters, _, expand) = params.get_vals();
+        let (width, iters, keep, expand) = params.get_vals();
+        let router = self.router.as_ref().filter(|_| routed);
+        let keep = if router.is_some() {
+            keep.saturating_sub(1)
+        } else {
+            0
+        };
         if k == 0 || n_queries == 0 {
             return Ok((vec![Vec::new(); n_queries], vec![Vec::new(); n_queries]));
         }
         let expand = expand.max(1);
         let hash_size = plan_beam_search_threadgroup(
             self.dim_padded,
-            expand * self.degree,
+            (expand * self.degree).max(32),
             hash_pref.max((2 * (width + expand * self.degree)).next_power_of_two()),
             MLX_MAX_THREADGROUP_BYTES,
         )?;
@@ -867,27 +1009,23 @@ impl CagraSearchMlx {
             ("K_OUT", k as i32),
             ("N", self.n as i32),
             ("LPN", lpn as i32),
-            ("KEEP", routed.map_or(0, |r| r.2) as i32),
+            ("R_TREES", router.map_or(0, |r| r.n_trees) as i32),
+            ("R_DEPTH", router.map_or(0, |r| r.depth) as i32),
+            ("KEEP", keep as i32),
+            ("ENTRIES_ONLY", entries_only as i32),
         ];
-
-        // Offsets stay global, so one candidate buffer serves every chunk.
-        let cands = match routed {
-            Some((ids, _, _)) if !ids.is_empty() => Array::from_u32(ids, &[ids.len() as i32]),
-            _ => Array::from_u32(&[SENTINEL], &[1]),
+        let dummy_f = upload_rows(&[], 0, 4, 4);
+        let dummy_u = upload_u32(&[]);
+        let (rproj, rmed, loff, lids) = match router {
+            Some(r) => (&r.proj, &r.med, &r.offsets, &r.ids),
+            None => (&dummy_f, &dummy_f, &dummy_u, &dummy_u),
         };
         let mut pending = Vec::with_capacity(n_queries.div_ceil(MLX_QUERY_CHUNK));
         for start in (0..n_queries).step_by(MLX_QUERY_CHUNK) {
             let end = (start + MLX_QUERY_CHUNK).min(n_queries);
             let n_q = end - start;
-            let ent = Array::from_u32(
-                &entries[start * n_entry..end * n_entry],
-                &[n_q as i32, n_entry as i32],
-            );
+            let ent = upload_u32(&entries[start * n_entry..end * n_entry]);
             let qbase = Array::from_u32(&[start as u32], &[1]);
-            let coffs = match routed {
-                Some((_, offs, _)) => Array::from_u32(&offs[start..=end], &[n_q as i32 + 1]),
-                None => Array::from_u32(&[0, 0], &[2]),
-            };
             let shape = [n_q as i32, k as i32];
             let mut out = self.kernel.apply(
                 &[
@@ -897,8 +1035,10 @@ impl CagraSearchMlx {
                     queries,
                     &ent,
                     &qbase,
-                    &cands,
-                    &coffs,
+                    rproj,
+                    rmed,
+                    loff,
+                    lids,
                 ],
                 &[
                     OutputSpec {
@@ -925,7 +1065,11 @@ impl CagraSearchMlx {
         let mut distances = Vec::with_capacity(n_queries);
         for (idx, dist) in &pending {
             eval_all(&[idx, dist], false)?;
-            for (ir, dr) in idx.as_u32()?.chunks_exact(k).zip(dist.as_f32()?.chunks_exact(k)) {
+            for (ir, dr) in idx
+                .as_u32()?
+                .chunks_exact(k)
+                .zip(dist.as_f32()?.chunks_exact(k))
+            {
                 let (i, d): (Vec<usize>, Vec<f32>) = ir
                     .iter()
                     .zip(dr)
@@ -947,7 +1091,11 @@ impl CagraSearchMlx {
     /// Number of bytes used
     pub fn memory_usage_bytes(&self) -> usize {
         let host = self.nav_graph.capacity() * size_of::<u32>();
-        let norms = if self.metric == Dist::Cosine { self.n } else { 1 };
+        let norms = if self.metric == Dist::Cosine {
+            self.n
+        } else {
+            1
+        };
         let device = (self.n * self.dim_padded + norms) * size_of::<f32>()
             + self.n * self.degree * size_of::<u32>();
         std::mem::size_of_val(self) + host + device
@@ -1066,7 +1214,9 @@ mod tests {
     /// Row-major data
     fn uniform(n: usize, dim: usize, seed: u64) -> Vec<f32> {
         let mut rng = StdRng::seed_from_u64(seed);
-        (0..n * dim).map(|_| rng.random_range(-10.0..10.0)).collect()
+        (0..n * dim)
+            .map(|_| rng.random_range(-10.0..10.0))
+            .collect()
     }
 
     #[test]
@@ -1075,11 +1225,20 @@ mod tests {
             for dim in [32usize, 128, 512, 1024] {
                 let h = plan_beam_search_threadgroup(dim, 90, 2048, budget).unwrap();
                 assert!(h.is_power_of_two() && (MIN_HASH_SIZE..=2048).contains(&h));
-                assert!(dim * 4 + 90 * 4 + h * 4 <= budget, "dim {dim} budget {budget}");
+                assert!(
+                    dim * 4 + 90 * 4 + h * 4 <= budget,
+                    "dim {dim} budget {budget}"
+                );
             }
         }
-        assert_eq!(plan_beam_search_threadgroup(128, 90, 2048, 32_768).unwrap(), 2048);
-        assert_eq!(plan_beam_search_threadgroup(3072, 90, 2048, 16_384).unwrap(), 512);
+        assert_eq!(
+            plan_beam_search_threadgroup(128, 90, 2048, 32_768).unwrap(),
+            2048
+        );
+        assert_eq!(
+            plan_beam_search_threadgroup(3072, 90, 2048, 16_384).unwrap(),
+            512
+        );
         // A 4096-wide row alone fills 16 KiB.
         assert!(plan_beam_search_threadgroup(4096, 90, 2048, 16_384).is_err());
     }
@@ -1094,10 +1253,16 @@ mod tests {
             }
         }
         let graph = brute_force_graph(&data, dim, deg, false);
-        let s =
-            CagraSearchMlx::new(&data, n, dim, Dist::SquaredEuclidean, graph, deg, 25).unwrap();
+        let s = CagraSearchMlx::new(&data, n, dim, Dist::SquaredEuclidean, graph, deg, 25).unwrap();
         let (idx, dist) = s
-            .search(&vec![0.0; dim], 1, k, Some(CagraMlxSearchParams::default()), None, 42)
+            .search(
+                &vec![0.0; dim],
+                1,
+                k,
+                Some(CagraMlxSearchParams::default()),
+                None,
+                42,
+            )
             .unwrap();
         assert_eq!(idx[0], vec![0, 1, 2, 3, 4]);
         assert!(dist[0].windows(2).all(|w| w[0] <= w[1]));
@@ -1165,65 +1330,122 @@ mod tests {
         check_recall(Dist::Cosine);
     }
 
-    /// Routed search against the same selection done on the host: the
-    /// medoid plus the `n_entry - 1` closest candidates as fixed entries.
+    /// Forest router over `data`, built the way the NN-Descent build does.
+    ///
+    /// ### Params
+    ///
+    /// * `data` - Row-major vectors
+    /// * `n` - Rows
+    /// * `dim` - Dimensionality
+    /// * `depth` - Levels per tree
+    ///
+    /// ### Returns
+    ///
+    /// The router over the first `N_ROUTER_TREES` trees
+    fn host_router(data: &[f32], n: usize, dim: usize, depth: usize) -> ForestRouter<f32> {
+        use crate::utils::rp_forest::{forest_projections, partition_forest, N_ROUTER_TREES};
+        let (_, vecs) = forest_projections::<f32>(N_ROUTER_TREES, depth, dim, dim, 17);
+        let mut dots = Vec::with_capacity(N_ROUTER_TREES * depth * n);
+        for tree in &vecs {
+            for v in tree {
+                dots.extend(data.chunks_exact(dim).map(|x| f32::dot_simd(x, v)));
+            }
+        }
+        partition_forest(&dots, vecs, n, depth, dim).1
+    }
+
+    /// Host routing and selection: the walk `find_entry_points` does, then
+    /// the `n_entry - 1` closest non-medoid candidates.
+    ///
+    /// ### Params
+    ///
+    /// * `router` - Host router
+    /// * `data` - Row-major vectors
+    /// * `q` - One query
+    /// * `n_entry` - Entries per query, medoid included
+    /// * `medoid` - Excluded id
+    /// * `cosine` - Cosine instead of squared Euclidean
+    ///
+    /// ### Returns
+    ///
+    /// Selected ids, ascending by distance
+    fn host_entries(
+        router: &ForestRouter<f32>,
+        data: &[f32],
+        q: &[f32],
+        n_entry: usize,
+        medoid: usize,
+        cosine: bool,
+    ) -> Vec<usize> {
+        let dim = q.len();
+        let mut scored: Vec<(f32, usize)> = router
+            .find_entry_points(q, n_entry * 4)
+            .into_iter()
+            .filter(|&c| c != medoid)
+            .map(|c| {
+                let x = &data[c * dim..(c + 1) * dim];
+                let d = if cosine {
+                    1.0 - f32::dot_simd(q, x)
+                        / (f32::calculate_l2_norm(q) * f32::calculate_l2_norm(x))
+                } else {
+                    f32::euclidean_simd(q, x)
+                };
+                (d, c)
+            })
+            .collect();
+        scored.sort_by(|a, b| a.0.total_cmp(&b.0));
+        scored
+            .into_iter()
+            .take(n_entry - 1)
+            .map(|(_, c)| c)
+            .collect()
+    }
+
+    /// Device routing against host routing: same entry sets, and the routed
+    /// search keeps its recall.
     ///
     /// ### Params
     ///
     /// * `metric` - Metric under test
     /// * `dim` - Dimensionality
-    fn check_routed_matches_host(metric: Dist, dim: usize) {
-        let (n, deg, k, nq, n_cand) = (2000, 16, 10, 200, 150);
+    fn check_routing_matches_host(metric: Dist, dim: usize) {
+        let (n, deg, k, nq, depth) = (4000, 16, 10, 300, 6);
         let cosine = metric == Dist::Cosine;
         let data = latent(n, dim, 3);
         let queries = latent(nq, dim, 4);
         let graph = brute_force_graph(&data, dim, deg, cosine);
-        let medoid = 0u32;
-        let s = CagraSearchMlx::new(&data, n, dim, metric, graph, deg, medoid).unwrap();
+        let router = host_router(&data, n, dim, depth);
+        let mut s = CagraSearchMlx::new(&data, n, dim, metric, graph, deg, 0).unwrap();
+        s.attach_router(&router).unwrap();
         let n_entry = CagraMlxSearchParams::from_k(k).get_n_entry();
 
-        let mut rng = StdRng::seed_from_u64(5);
-        let mut offsets = vec![0u32];
-        let mut ids = Vec::new();
-        let mut entries = Vec::new();
-        for q in queries.chunks_exact(dim) {
-            let cands: Vec<u32> = (0..n_cand).map(|_| rng.random_range(1..n as u32)).collect();
-            let mut cands_sorted = cands.clone();
-            cands_sorted.sort_unstable();
-            cands_sorted.dedup();
-            let mut scored: Vec<(f32, u32)> = cands_sorted
-                .iter()
-                .map(|&c| {
-                    let x = &data[c as usize * dim..(c as usize + 1) * dim];
-                    let d = if cosine {
-                        1.0 - f32::dot_simd(q, x)
-                            / (f32::calculate_l2_norm(q) * f32::calculate_l2_norm(x))
-                    } else {
-                        f32::euclidean_simd(q, x)
-                    };
-                    (d, c)
-                })
-                .collect();
-            scored.sort_by(|a, b| a.0.total_cmp(&b.0));
-            entries.push(medoid);
-            entries.extend(scored.iter().take(n_entry - 1).map(|&(_, c)| c));
-            ids.extend_from_slice(&cands_sorted);
-            offsets.push(ids.len() as u32);
-        }
+        let dev = s.routed_entries(&queries, nq, n_entry).unwrap();
+        let same = queries
+            .chunks_exact(dim)
+            .zip(&dev)
+            .filter(|(q, d)| {
+                let mut h = host_entries(&router, &data, q, n_entry, 0, cosine);
+                let mut d = (*d).clone();
+                h.sort_unstable();
+                d.sort_unstable();
+                h == d
+            })
+            .count();
+        assert!(
+            same as f64 >= 0.98 * nq as f64,
+            "{metric:?} dim {dim}: {same}/{nq} sets match"
+        );
 
-        let (host, _) = s.search(&queries, nq, k, None, Some(&entries), 0).unwrap();
-        let (dev, _) = s
-            .search_routed(&queries, nq, k, None, &ids, &offsets, medoid)
-            .unwrap();
-        let same = host.iter().zip(&dev).filter(|(a, b)| a == b).count();
-        assert!(same as f64 >= 0.99 * nq as f64, "{metric:?} dim {dim}: {same}/{nq} rows identical");
+        let (idx, _) = s.search(&queries, nq, k, None, None, 0).unwrap();
+        let r = recall(&brute_force(&queries, &data, dim, k, cosine), &idx);
+        assert!(r > 0.95, "{metric:?} dim {dim} routed recall {r}");
     }
 
     #[test]
-    fn test_mlx_cagra_routed_matches_host_selection() {
+    fn test_mlx_cagra_routing_matches_host() {
         for dim in [30, 300] {
-            check_routed_matches_host(Dist::SquaredEuclidean, dim);
-            check_routed_matches_host(Dist::Cosine, dim);
+            check_routing_matches_host(Dist::SquaredEuclidean, dim);
+            check_routing_matches_host(Dist::Cosine, dim);
         }
     }
 
@@ -1235,12 +1457,13 @@ mod tests {
         let data = uniform(n, dim, 7);
         let queries = uniform(nq, dim, 8);
         let graph = brute_force_graph(&data, dim, deg, false);
-        let s =
-            CagraSearchMlx::new(&data, n, dim, Dist::SquaredEuclidean, graph, deg, 0).unwrap();
+        let s = CagraSearchMlx::new(&data, n, dim, Dist::SquaredEuclidean, graph, deg, 0).unwrap();
         let params = CagraMlxSearchParams::new(Some(64), Some(192), Some(8), Some(3));
         let entries = s.default_entry_points(nq, 8, 3);
         let q = Array::from_f32(&queries, &[nq as i32, dim as i32]);
-        let (idx, _) = s.run(&q, nq, &entries, 8, None, k, &params, 128).unwrap();
+        let (idx, _) = s
+            .run(&q, nq, &entries, 8, false, false, k, &params, 128)
+            .unwrap();
         let r = recall(&brute_force(&queries, &data, dim, k, false), &idx);
         assert!(r > 0.85, "recall {r}");
     }
@@ -1250,14 +1473,30 @@ mod tests {
         let (n, dim, deg) = (500, 7, 8);
         let data = uniform(n, dim, 5);
         let graph = brute_force_graph(&data, dim, deg, false);
-        let s =
-            CagraSearchMlx::new(&data, n, dim, Dist::SquaredEuclidean, graph, deg, 0).unwrap();
+        let s = CagraSearchMlx::new(&data, n, dim, Dist::SquaredEuclidean, graph, deg, 0).unwrap();
         let params = CagraMlxSearchParams::new(Some(8), Some(24), None, None);
-        let (idx, _) = s.search(&data[..dim * 3], 3, 12, Some(params), None, 1).unwrap();
+        let (idx, _) = s
+            .search(&data[..dim * 3], 3, 12, Some(params), None, 1)
+            .unwrap();
         assert!(idx.iter().all(|row| row.len() == 8));
         assert!(s.search(&data[..dim * 2], 1, 5, None, None, 1).is_err());
-        assert!(CagraSearchMlx::new(&data, n, dim, Dist::Manhattan, vec![0; n * deg], deg, 0)
-            .is_err());
+        assert!(
+            CagraSearchMlx::new(&data, n, dim, Dist::Manhattan, vec![0; n * deg], deg, 0).is_err()
+        );
+    }
+
+    /// Inputs under `MLX_DEVICE_MIN_ELEMS` reach the kernel as `constant`,
+    /// which fails to compile against its `device` casts unless padded.
+    #[test]
+    fn test_mlx_cagra_tiny_inputs() {
+        let tiny = uniform(6, 1, 2);
+        let graph = brute_force_graph(&tiny, 1, 3, false);
+        let mut s = CagraSearchMlx::new(&tiny, 6, 1, Dist::SquaredEuclidean, graph, 3, 0).unwrap();
+        let (idx, _) = s.search(&tiny[..1], 1, 3, None, None, 0).unwrap();
+        assert_eq!(idx[0][0], 0);
+        s.attach_router(&host_router(&tiny, 6, 1, 1)).unwrap();
+        let (idx, _) = s.search(&tiny[..1], 1, 3, None, None, 0).unwrap();
+        assert_eq!(idx[0][0], 0);
     }
 }
 
@@ -1318,9 +1557,7 @@ mod wgpu_tests {
             let gp = CagraGpuSearchParams::new(Some(bw), Some(iters), None, Some(expand));
             let mp = CagraMlxSearchParams::new(Some(bw), Some(iters), None, Some(expand));
             let entries = index.query_entry_points(queries, nq, gp.get_n_entry());
-            let (wgpu_idx, _) = index
-                .query_batch_gpu(queries, nq, Some(gp), k, 42)
-                .unwrap();
+            let (wgpu_idx, _) = index.query_batch_gpu(queries, nq, Some(gp), k, 42).unwrap();
             let (mlx_idx, _) = s
                 .search(queries, nq, k, Some(mp), Some(&entries), 42)
                 .unwrap();
@@ -1329,11 +1566,7 @@ mod wgpu_tests {
             assert!((rw - rm).abs() < 0.01, "wgpu {rw} mlx {rm}");
         }
 
-        let knn_rows: Vec<u32> = index
-            .knn_graph()
-            .iter()
-            .map(|&(p, _)| p as u32)
-            .collect();
+        let knn_rows: Vec<u32> = index.knn_graph().iter().map(|&(p, _)| p as u32).collect();
         let self_entries = self_entry_points(&knn_rows, index.k, n, N_ENTRY_POINTS_MLX, 42);
         let (wgpu_self, _) = index.self_query_gpu(k, None, 42).unwrap();
         let (mlx_self, _) = s.self_search(k, None, Some(&self_entries), 42).unwrap();

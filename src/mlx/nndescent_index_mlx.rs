@@ -1,8 +1,10 @@
 //! Queryable NN-Descent + CAGRA index on MLX, the counterpart of
 //! `NNDescentGpu`: NN-Descent builds the kNN graph, the CAGRA optimisation
 //! turns it into a navigational graph, and [`CagraSearchMlx`] beam-searches
-//! it. Query entry points come from the build's forest router, self-query
-//! entries from the kNN graph, both exactly as on the wgpu path.
+//! it. Query entry points come from the build's forest router, walked on the
+//! device to one leaf per tree (the host walk on the wgpu path almost always
+//! stops there too); self-query entries come from the kNN graph as on the
+//! wgpu path.
 
 use rayon::prelude::*;
 use std::time::Instant;
@@ -12,7 +14,7 @@ use crate::mlx::cagra_mlx::*;
 use crate::mlx::nndescent_mlx::*;
 use crate::prelude::*;
 use crate::utils::nndescent_utils::unpack_knn_graph;
-use crate::utils::rp_forest::{compact_knn_rows, default_forest_trees, ForestRouter};
+use crate::utils::rp_forest::{compact_knn_rows, default_forest_trees};
 use crate::utils::DimensionValidation;
 
 /// Default final degree, as on the wgpu path.
@@ -26,9 +28,6 @@ const DEFAULT_DELTA: f32 = 0.001;
 
 /// Default sampling rate for the local join
 const DEFAULT_RHO: f32 = 1.0;
-
-/// Router candidates gathered per entry point before scoring.
-const ROUTER_OVERSAMPLE: usize = 4;
 
 ////////////////////////
 // NNDescentIndexMlx //
@@ -59,8 +58,6 @@ pub struct NNDescentIndexMlx {
     knn_graph: Vec<(usize, f32)>,
     /// Whether NN-Descent hit the delta threshold
     converged: bool,
-    /// Forest router for query entry points
-    router: ForestRouter<f32>,
     /// Beam search over the navigational graph, device resident
     searcher: CagraSearchMlx,
 }
@@ -156,7 +153,9 @@ impl NNDescentIndexMlx {
             println!("  CAGRA optimisation: {:.2?}", cagra_start.elapsed());
         }
 
-        let searcher = CagraSearchMlx::new(&vectors_flat, n, dim, metric, nav_graph, k, medoid)?;
+        let mut searcher =
+            CagraSearchMlx::new(&vectors_flat, n, dim, metric, nav_graph, k, medoid)?;
+        searcher.attach_router(&out.router)?;
         if verbose {
             println!("  Total build time: {:.2?}", start.elapsed());
         }
@@ -171,16 +170,15 @@ impl NNDescentIndexMlx {
             medoid,
             knn_graph,
             converged: out.converged,
-            router: out.router,
             searcher,
         })
     }
 
     /// Batch query via beam search on the navigational graph.
     ///
-    /// Entry points per query: the medoid, then the closest of the router's
-    /// leaf candidates, as `NNDescentGpu` selects them. The selection runs on
-    /// the device ([`CagraSearchMlx::search_routed`]); the host only routes.
+    /// Entry points per query: the medoid, then the closest members of the
+    /// query's leaf in each router tree, as `NNDescentGpu` selects them. Both
+    /// the routing and the selection run on the device.
     ///
     /// ### Params
     ///
@@ -204,42 +202,8 @@ impl NNDescentIndexMlx {
         }
         self.check_dim(queries_flat.len() / n_queries)?;
         let query_params = query_params.unwrap_or_else(|| CagraMlxSearchParams::from_k(k));
-        let n_entry = query_params.get_n_entry();
-        // Plain host fields only: the MLX handles in `self` are not `Sync`.
-        let (medoid, dim, router) = (self.medoid, self.dim, &self.router);
-
-        // Score on the device: the candidates are whole router leaves,
-        // hundreds of rows, which on the host cost more than the search.
-        let per_query: Vec<Vec<u32>> = (0..n_queries)
-            .into_par_iter()
-            .map(|i| {
-                router
-                    .find_entry_points(
-                        &queries_flat[i * dim..(i + 1) * dim],
-                        n_entry * ROUTER_OVERSAMPLE,
-                    )
-                    .into_iter()
-                    .filter(|&c| c != medoid as usize)
-                    .map(|c| c as u32)
-                    .collect()
-            })
-            .collect();
-        let mut offsets = Vec::with_capacity(n_queries + 1);
-        offsets.push(0u32);
-        let mut ids = Vec::with_capacity(per_query.iter().map(Vec::len).sum());
-        for c in &per_query {
-            ids.extend_from_slice(c);
-            offsets.push(ids.len() as u32);
-        }
-        self.searcher.search_routed(
-            queries_flat,
-            n_queries,
-            k,
-            Some(query_params),
-            &ids,
-            &offsets,
-            medoid,
-        )
+        self.searcher
+            .search(queries_flat, n_queries, k, Some(query_params), None, 0)
     }
 
     /// Self-query: beam search for every indexed vector. Entries are the node
@@ -326,7 +290,7 @@ impl NNDescentIndexMlx {
     }
 
     /// Size of the index in bytes: host copies plus the searcher's host and
-    /// device copies. The router is not counted.
+    /// device copies. The device router is not counted.
     ///
     /// ### Returns
     ///
