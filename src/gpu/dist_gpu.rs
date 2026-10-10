@@ -768,6 +768,7 @@ where
 /// ### Returns
 ///
 /// Tuple of `(indices, distances)` where each inner Vec has k elements
+#[allow(clippy::too_many_arguments)]
 pub fn query_batch_gpu_resident<T, R>(
     k: usize,
     query_data: &BatchData<T>,

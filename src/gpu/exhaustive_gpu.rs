@@ -9,6 +9,13 @@ use std::sync::OnceLock;
 use crate::gpu::dist_gpu::*;
 use crate::prelude::*;
 
+///////////
+// Types //
+///////////
+
+/// Resident DB vector for the exhaustive search
+type DbVector<R, T> = (GpuTensor<R, T>, Option<GpuTensor<R, T>>);
+
 ////////////////////////
 // ExhaustiveIndexGpu //
 ////////////////////////
@@ -33,7 +40,7 @@ pub struct ExhaustiveIndexGpu<T: Float + CubeclFloat, R: Runtime> {
     /// Database vectors and, for Cosine, norms on the device. Uploaded by the
     /// first query and reused after: re-uploading per call cost more than the
     /// distance kernels for small batches.
-    db_gpu: OnceLock<(GpuTensor<R, T>, Option<GpuTensor<R, T>>)>,
+    db_gpu: OnceLock<DbVector<R, T>>,
 }
 
 /////////////////////////
@@ -126,17 +133,21 @@ where
     /// ### Returns
     ///
     /// `(vectors, norms)` on the device; norms only for Cosine.
-    fn resident_db(
-        &self,
-        client: &ComputeClient<R>,
-    ) -> Result<&(GpuTensor<R, T>, Option<GpuTensor<R, T>>), AnnSearchErrors> {
+    fn resident_db(&self, client: &ComputeClient<R>) -> Result<&DbVector<R, T>, AnnSearchErrors> {
         if let Some(db) = self.db_gpu.get() {
             return Ok(db);
         }
-        let vectors =
-            GpuTensor::<R, T>::from_slice(&self.vectors_flat, vec![self.n, self.dim_padded], client)?;
+        let vectors = GpuTensor::<R, T>::from_slice(
+            &self.vectors_flat,
+            vec![self.n, self.dim_padded],
+            client,
+        )?;
         let norms = if self.metric == Dist::Cosine {
-            Some(GpuTensor::<R, T>::from_slice(&self.norms, vec![self.n], client)?)
+            Some(GpuTensor::<R, T>::from_slice(
+                &self.norms,
+                vec![self.n],
+                client,
+            )?)
         } else {
             None
         };
@@ -252,7 +263,8 @@ where
     /// Number of bytes used by the index
     pub fn memory_usage_bytes(&self) -> usize {
         // The device copy counts once a query has uploaded it.
-        let host = (self.vectors_flat.capacity() + self.norms.capacity()) * std::mem::size_of::<T>();
+        let host =
+            (self.vectors_flat.capacity() + self.norms.capacity()) * std::mem::size_of::<T>();
         let device = self.db_gpu.get().map_or(0, |_| {
             (self.vectors_flat.len() + self.norms.len()) * std::mem::size_of::<T>()
         });
