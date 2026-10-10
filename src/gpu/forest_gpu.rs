@@ -18,66 +18,20 @@ use crate::prelude::*;
 pub use crate::utils::rp_forest::ForestRouter;
 use crate::utils::rp_forest::*;
 
-////////////////////
-// Kernel helpers //
-////////////////////
-
 /////////////
 // Kernels //
 /////////////
 
-/// Compute dot product of each vector with a random projection vector.
-///
-/// ### Params
-///
-/// * `vectors` - Row-major vector matrix, line-vectorised `[n, dim/N]`
-/// * `random_vec` - Random projection vector `[dim/N]`
-/// * `dot_values` - Output dot products `[n]`
-/// * `n` - Number of points
-/// * `dim_lines` - Number of `Vector<F, N>` elements per vector row (comptime)
-///
-/// ### Grid mapping
-///
-/// * `ABSOLUTE_POS_X` -> point index
-#[cube(launch_unchecked)]
-fn compute_dot_products<F: CubeclFloat, N: Size>(
-    vectors: &Tensor<Vector<F, N>>,
-    random_vec: &Tensor<Vector<F, N>>,
-    dot_values: &mut Tensor<F>,
-    n_pts: u32,
-    #[comptime] dim_lines: usize,
-) {
-    let idx = (CUBE_POS_Y * CUBE_COUNT_X + CUBE_POS_X) * WORKGROUP_SIZE_X + UNIT_POS_X;
-    if idx >= n_pts {
-        terminate!();
-    }
-    let lanes = LINE_SIZE;
-    let off = idx as usize * dim_lines;
-    let mut sum = F::new(0.0_f32);
-    for i in 0..dim_lines {
-        let v = vectors[off + i];
-        let r = random_vec[i];
-        let prod = v * r;
-        #[unroll]
-        for lane in 0..lanes {
-            sum += prod[lane];
-        }
-    }
-    dot_values[idx as usize] = sum;
-}
-
 /// Project every point onto all of a tree's random vectors in one pass.
 ///
-/// The per-level kernel this replaces read the whole vector matrix once per
-/// level, because it computed one projection at a time. The projections do not
-/// depend on the partitioning at all: `random_vec` for a level is derived
-/// purely from the tree seed and the level index, so all `n_levels` of them are
-/// known before the first one is needed. Only the median-and-scatter step is
+/// The projections do not depend on the partitioning at all: `random_vec` for
+/// a level is derived purely from the tree seed and the level index, so all
+/// `n_levels` of them are known before the first one is needed. Only the median-and-scatter step is
 /// sequential across levels.
 ///
-/// Reading each point's row once and accumulating `n_levels` dot products cuts
-/// vector traffic by `n_levels` and collapses `n_levels` launches and readbacks
-/// into one. The projection rows are read from global rather than staged in
+/// Reading each point's row once and accumulating `n_levels` dot products
+/// reads the vector matrix once instead of once per level, with one launch and
+/// one readback. The projection rows are read from global rather than staged in
 /// shared memory: every thread reads the same element at the same time, so they
 /// broadcast from cache, and staging would put a `n_levels * dim` ceiling on
 /// the kernel.
@@ -142,42 +96,6 @@ fn compute_dot_products_multi<F: CubeclFloat, N: Size>(
     for l in 0..n_levels {
         dot_values[out_base + l * n_pts as usize + idx as usize] = acc[l];
     }
-}
-
-/// Partition points by comparing dot products against per-partition medians.
-///
-/// ### Params
-///
-/// * `partition_id` - Current partition ID per point `[n]`; updated in-place
-///   to `pid * 2` (left) or `pid * 2 + 1` (right)
-/// * `dot_values` - Dot product of each point with the projection vector `[n]`
-/// * `medians` - Median dot value per partition `[n_partitions]`
-/// * `n` - Number of points
-///
-/// ### Grid mapping
-///
-/// * `ABSOLUTE_POS_X` -> point index
-#[cube(launch_unchecked)]
-fn partition_points<F: CubeclFloat>(
-    partition_id: &mut Tensor<u32>,
-    dot_values: &Tensor<F>,
-    medians: &Tensor<F>,
-    n: u32,
-) {
-    let idx = (CUBE_POS_Y * CUBE_COUNT_X + CUBE_POS_X) * WORKGROUP_SIZE_X + UNIT_POS_X;
-    if idx >= n {
-        terminate!();
-    }
-
-    let pid = partition_id[idx as usize];
-    let dot = dot_values[idx as usize];
-    let median = medians[pid as usize];
-
-    let mut new_pid = pid * 2u32 + 1u32;
-    if dot <= median {
-        new_pid = pid * 2u32;
-    }
-    partition_id[idx as usize] = new_pid;
 }
 
 /// Points per leaf whose staging fits the device's shared-memory budget.
@@ -806,7 +724,7 @@ mod tests {
     const MAX_LEAF_SIZE: usize = 128;
 
     #[test]
-    fn test_dot_products_multi_matches_single() {
+    fn test_dot_products_multi_matches_host() {
         let Some(device) = try_device() else {
             eprintln!("Skipping: no wgpu backend");
             return;
@@ -849,256 +767,21 @@ mod tests {
         }
         let multi = multi_gpu.read(&client).unwrap();
 
-        // Same projections, one level at a time, through the reference kernel.
+        // Host reference, one level at a time.
         for level in 0..n_levels {
-            let rvec = projections[level * dim..(level + 1) * dim].to_vec();
-            let rvec_gpu =
-                GpuTensor::<WgpuRuntime, f32>::from_slice(&rvec, vec![dim], &client).unwrap();
-            let single_gpu = GpuTensor::<WgpuRuntime, f32>::empty(vec![n], &client).unwrap();
-            unsafe {
-                compute_dot_products::launch_unchecked::<f32, WgpuRuntime>(
-                    &client,
-                    CubeCount::Static(grid, 1, 1),
-                    CubeDim::new_2d(WORKGROUP_SIZE_X, 1),
-                    line,
-                    vectors_gpu.clone().into_tensor_arg(),
-                    rvec_gpu.into_tensor_arg(),
-                    single_gpu.clone().into_tensor_arg(),
-                    n as u32,
-                    dim_vec,
-                );
-            }
-            let single = single_gpu.read(&client).unwrap();
+            let rvec = &projections[level * dim..(level + 1) * dim];
             for i in 0..n {
+                let b: f32 = data[i * dim..(i + 1) * dim]
+                    .iter()
+                    .zip(rvec)
+                    .map(|(x, r)| x * r)
+                    .sum();
                 let a = multi[level * n + i];
-                let b = single[i];
                 assert!(
                     (a - b).abs() <= 1e-4 * b.abs().max(1.0),
-                    "level {level} point {i}: multi {a}, single {b}"
+                    "level {level} point {i}: multi {a}, host {b}"
                 );
             }
-        }
-    }
-
-    #[test]
-    fn test_dot_products_basic() {
-        let Some(device) = try_device() else {
-            eprintln!("Skipping: no wgpu backend");
-            return;
-        };
-        let client = WgpuRuntime::client(&device);
-        let line = LINE_SIZE;
-        let n = 4usize;
-        let dim = 4usize;
-        let dim_vec = dim / line;
-
-        let data: Vec<f32> = vec![
-            1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 1.0, 1.0, 0.0, 0.0, 0.5, 0.5, 0.5, 0.5,
-        ];
-        let rvec: Vec<f32> = vec![1.0, 0.0, 0.0, 0.0];
-
-        let vectors_gpu =
-            GpuTensor::<WgpuRuntime, f32>::from_slice(&data, vec![n, dim], &client).unwrap();
-        let rvec_gpu =
-            GpuTensor::<WgpuRuntime, f32>::from_slice(&rvec, vec![dim], &client).unwrap();
-        let dots_gpu = GpuTensor::<WgpuRuntime, f32>::empty(vec![n], &client).unwrap();
-
-        let grid = (n as u32).div_ceil(WORKGROUP_SIZE_X);
-        unsafe {
-            compute_dot_products::launch_unchecked::<f32, WgpuRuntime>(
-                &client,
-                CubeCount::Static(grid, 1, 1),
-                CubeDim::new_2d(WORKGROUP_SIZE_X, 1),
-                line,
-                vectors_gpu.into_tensor_arg(),
-                rvec_gpu.into_tensor_arg(),
-                dots_gpu.clone().into_tensor_arg(),
-                n as u32,
-                dim_vec,
-            );
-        }
-
-        let dots = dots_gpu.read(&client).unwrap();
-        let expected = [1.0f32, 0.0, 1.0, 0.5];
-        for (i, (&got, &exp)) in dots.iter().zip(expected.iter()).enumerate() {
-            assert!(
-                (got - exp).abs() < 1e-5,
-                "dot[{i}]: got {got}, expected {exp}"
-            );
-        }
-    }
-
-    #[test]
-    fn test_dot_products_dim32() {
-        let Some(device) = try_device() else {
-            eprintln!("Skipping: no wgpu backend");
-            return;
-        };
-        let client = WgpuRuntime::client(&device);
-        let line = LINE_SIZE;
-        let n = 16usize;
-        let dim = 32usize;
-        let dim_vec = dim / line;
-
-        let data: Vec<f32> = (0..n * dim).map(|idx| (idx / dim + 1) as f32).collect();
-        let rvec: Vec<f32> = vec![1.0; dim];
-
-        let vectors_gpu =
-            GpuTensor::<WgpuRuntime, f32>::from_slice(&data, vec![n, dim], &client).unwrap();
-        let rvec_gpu =
-            GpuTensor::<WgpuRuntime, f32>::from_slice(&rvec, vec![dim], &client).unwrap();
-        let dots_gpu = GpuTensor::<WgpuRuntime, f32>::empty(vec![n], &client).unwrap();
-
-        let grid = (n as u32).div_ceil(WORKGROUP_SIZE_X);
-        unsafe {
-            compute_dot_products::launch_unchecked::<f32, WgpuRuntime>(
-                &client,
-                CubeCount::Static(grid, 1, 1),
-                CubeDim::new_2d(WORKGROUP_SIZE_X, 1),
-                line,
-                vectors_gpu.into_tensor_arg(),
-                rvec_gpu.into_tensor_arg(),
-                dots_gpu.clone().into_tensor_arg(),
-                n as u32,
-                dim_vec,
-            );
-        }
-
-        let dots = dots_gpu.read(&client).unwrap();
-        for i in 0..n {
-            let expected = (i + 1) as f32 * dim as f32;
-            assert!(
-                (dots[i] - expected).abs() < 1e-2,
-                "dot[{i}]: got {}, expected {}",
-                dots[i],
-                expected
-            );
-        }
-    }
-
-    #[test]
-    fn test_partition_basic() {
-        let Some(device) = try_device() else {
-            eprintln!("Skipping: no wgpu backend");
-            return;
-        };
-        let client = WgpuRuntime::client(&device);
-        let n = 8usize;
-        let pids = vec![0u32; n];
-        let dots: Vec<f32> = (0..n).map(|i| i as f32).collect();
-        let medians: Vec<f32> = vec![3.5];
-
-        let pid_gpu = GpuTensor::<WgpuRuntime, u32>::from_slice(&pids, vec![n], &client).unwrap();
-        let dot_gpu = GpuTensor::<WgpuRuntime, f32>::from_slice(&dots, vec![n], &client).unwrap();
-        let med_gpu =
-            GpuTensor::<WgpuRuntime, f32>::from_slice(&medians, vec![1], &client).unwrap();
-
-        let grid = (n as u32).div_ceil(WORKGROUP_SIZE_X);
-        unsafe {
-            partition_points::launch_unchecked::<f32, WgpuRuntime>(
-                &client,
-                CubeCount::Static(grid, 1, 1),
-                CubeDim::new_2d(WORKGROUP_SIZE_X, 1),
-                pid_gpu.clone().into_tensor_arg(),
-                dot_gpu.into_tensor_arg(),
-                med_gpu.into_tensor_arg(),
-                n as u32,
-            );
-        }
-
-        let result = pid_gpu.read(&client).unwrap();
-        for i in 0..4 {
-            assert_eq!(result[i], 0, "point {i} should be in partition 0");
-        }
-        for i in 4..8 {
-            assert_eq!(result[i], 1, "point {i} should be in partition 1");
-        }
-    }
-
-    #[test]
-    fn test_partition_multilevel_with_cpu_medians() {
-        let Some(device) = try_device() else {
-            eprintln!("Skipping: no wgpu backend");
-            return;
-        };
-        let client = WgpuRuntime::client(&device);
-        let n = 16usize;
-        let line = LINE_SIZE;
-        let dim = 4usize;
-        let dim_vec = dim / line;
-
-        let data: Vec<f32> = (0..n).flat_map(|i| vec![i as f32, 0.0, 0.0, 0.0]).collect();
-        let vectors_gpu =
-            GpuTensor::<WgpuRuntime, f32>::from_slice(&data, vec![n, dim], &client).unwrap();
-        let dots_gpu = GpuTensor::<WgpuRuntime, f32>::empty(vec![n], &client).unwrap();
-        let grid = (n as u32).div_ceil(WORKGROUP_SIZE_X);
-
-        let mut cpu_pids = vec![0u32; n];
-        let pid_gpu =
-            GpuTensor::<WgpuRuntime, u32>::from_slice(&cpu_pids, vec![n], &client).unwrap();
-
-        for level in 0..2usize {
-            let rvec: Vec<f32> = vec![1.0, 0.0, 0.0, 0.0];
-            let rvec_gpu =
-                GpuTensor::<WgpuRuntime, f32>::from_slice(&rvec, vec![dim], &client).unwrap();
-
-            unsafe {
-                compute_dot_products::launch_unchecked::<f32, WgpuRuntime>(
-                    &client,
-                    CubeCount::Static(grid, 1, 1),
-                    CubeDim::new_2d(WORKGROUP_SIZE_X, 1),
-                    line,
-                    vectors_gpu.clone().into_tensor_arg(),
-                    rvec_gpu.into_tensor_arg(),
-                    dots_gpu.clone().into_tensor_arg(),
-                    n as u32,
-                    dim_vec,
-                );
-            }
-
-            let dots_cpu = dots_gpu.clone().read(&client).unwrap();
-            let n_partitions = 1usize << level;
-            let medians = compute_partition_medians(&cpu_pids, &dots_cpu, n_partitions);
-            let med_gpu =
-                GpuTensor::<WgpuRuntime, f32>::from_slice(&medians, vec![n_partitions], &client)
-                    .unwrap();
-
-            unsafe {
-                partition_points::launch_unchecked::<f32, WgpuRuntime>(
-                    &client,
-                    CubeCount::Static(grid, 1, 1),
-                    CubeDim::new_2d(WORKGROUP_SIZE_X, 1),
-                    pid_gpu.clone().into_tensor_arg(),
-                    dots_gpu.clone().into_tensor_arg(),
-                    med_gpu.into_tensor_arg(),
-                    n as u32,
-                );
-            }
-
-            // Mirror on CPU
-            for i in 0..n {
-                let pid = cpu_pids[i] as usize;
-                cpu_pids[i] = if dots_cpu[i] <= medians[pid] {
-                    cpu_pids[i] * 2
-                } else {
-                    cpu_pids[i] * 2 + 1
-                };
-            }
-        }
-
-        // Verify GPU and CPU agree
-        let gpu_pids = pid_gpu.read(&client).unwrap();
-        assert_eq!(gpu_pids, cpu_pids, "GPU and CPU partition IDs must match");
-
-        let (_, leaf_offsets, n_leaves) = build_leaf_structure(&cpu_pids, n);
-        assert_eq!(n_leaves, 4, "2 levels should produce 4 leaves");
-
-        for i in 0..n_leaves {
-            let size = leaf_offsets[i + 1] - leaf_offsets[i];
-            assert!(
-                (2..=8).contains(&size),
-                "Leaf {i} has {size} points (expected ~4)"
-            );
         }
     }
 
@@ -1732,96 +1415,5 @@ mod tests {
         assert_eq!(result[2], sentinel);
         assert_eq!(result[3] & pid_mask, 42);
         assert_ne!(result[3] & is_new, 0);
-    }
-
-    #[test]
-    fn test_cpu_gpu_partition_mirror() {
-        let Some(device) = try_device() else {
-            eprintln!("Skipping: no wgpu backend");
-            return;
-        };
-        let client = WgpuRuntime::client(&device);
-        let line = LINE_SIZE;
-        let n = 64usize;
-        let dim = 8usize;
-        let dim_vec = dim / line;
-
-        // Random-ish data
-        let data: Vec<f32> = (0..n * dim)
-            .map(|i| ((i * 7 + 3) % 100) as f32 / 10.0)
-            .collect();
-        let vectors_gpu =
-            GpuTensor::<WgpuRuntime, f32>::from_slice(&data, vec![n, dim], &client).unwrap();
-        let dots_gpu = GpuTensor::<WgpuRuntime, f32>::empty(vec![n], &client).unwrap();
-        let grid = (n as u32).div_ceil(WORKGROUP_SIZE_X);
-
-        let mut cpu_pids = vec![0u32; n];
-        let pid_gpu =
-            GpuTensor::<WgpuRuntime, u32>::from_slice(&cpu_pids, vec![n], &client).unwrap();
-
-        // Run 4 levels with known random vecs
-        for level in 0..4usize {
-            let rvec: Vec<f32> = (0..dim)
-                .map(|j| ((level * 3 + j * 5 + 1) % 11) as f32 / 5.0 - 1.0)
-                .collect();
-            let rvec_gpu =
-                GpuTensor::<WgpuRuntime, f32>::from_slice(&rvec, vec![dim], &client).unwrap();
-
-            unsafe {
-                compute_dot_products::launch_unchecked::<f32, WgpuRuntime>(
-                    &client,
-                    CubeCount::Static(grid, 1, 1),
-                    CubeDim::new_2d(WORKGROUP_SIZE_X, 1),
-                    line,
-                    vectors_gpu.clone().into_tensor_arg(),
-                    rvec_gpu.into_tensor_arg(),
-                    dots_gpu.clone().into_tensor_arg(),
-                    n as u32,
-                    dim_vec,
-                );
-            }
-
-            let dots_cpu = dots_gpu.clone().read(&client).unwrap();
-            let n_partitions = 1usize << level;
-            let medians = compute_partition_medians(&cpu_pids, &dots_cpu, n_partitions);
-            let med_gpu =
-                GpuTensor::<WgpuRuntime, f32>::from_slice(&medians, vec![n_partitions], &client)
-                    .unwrap();
-
-            unsafe {
-                partition_points::launch_unchecked::<f32, WgpuRuntime>(
-                    &client,
-                    CubeCount::Static(grid, 1, 1),
-                    CubeDim::new_2d(WORKGROUP_SIZE_X, 1),
-                    pid_gpu.clone().into_tensor_arg(),
-                    dots_gpu.clone().into_tensor_arg(),
-                    med_gpu.into_tensor_arg(),
-                    n as u32,
-                );
-            }
-
-            for i in 0..n {
-                let pid = cpu_pids[i] as usize;
-                cpu_pids[i] = if dots_cpu[i] <= medians[pid] {
-                    cpu_pids[i] * 2
-                } else {
-                    cpu_pids[i] * 2 + 1
-                };
-            }
-        }
-
-        let gpu_pids = pid_gpu.read(&client).unwrap();
-        assert_eq!(
-            gpu_pids, cpu_pids,
-            "GPU and CPU partitions diverged after 4 levels"
-        );
-
-        // Should have roughly 16 partitions (2^4) with ~4 points each
-        let unique: std::collections::HashSet<u32> = cpu_pids.iter().copied().collect();
-        println!(
-            "{} unique partitions from 4 levels of 64 points",
-            unique.len()
-        );
-        assert!(unique.len() >= 8 && unique.len() <= 16);
     }
 }
