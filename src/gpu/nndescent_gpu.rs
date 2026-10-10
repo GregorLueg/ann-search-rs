@@ -376,8 +376,27 @@ pub fn init_random_graph<F: Float, N: Size>(
     for slot in 0..k_comp {
         rng = xorshift(rng);
         let mut pid = rng % n_pts;
-        if pid == node {
-            pid = (pid + 1u32) % n_pts;
+        // Probe past self and earlier draws: a repeated draw that is a true
+        // neighbour would otherwise never leave the row. At most `slot` draws
+        // plus self can clash, so `k + 1` steps always reach a free id.
+        let mut searching: u32 = 1u32;
+        for _ in 0..k_comp + 1 {
+            if searching == 1u32 {
+                let mut clash: u32 = 0u32;
+                if pid == node {
+                    clash = 1u32;
+                }
+                for j in 0..slot {
+                    if local_idx[j] == pid {
+                        clash = 1u32;
+                    }
+                }
+                if clash == 1u32 {
+                    pid = (pid + 1u32) % n_pts;
+                } else {
+                    searching = 0u32;
+                }
+            }
         }
 
         let dist = if use_cosine {
@@ -3689,6 +3708,43 @@ mod tests {
             cubecl::wgpu::WgpuRuntime::client(&device);
         }));
         result.ok().map(|_| device)
+    }
+
+    #[test]
+    fn test_knn_graph_gpu_rows_have_no_duplicate_ids() {
+        use rand::rngs::StdRng;
+        use rand::{Rng, SeedableRng};
+
+        let Some(device) = try_device() else {
+            eprintln!("Skipping test: no wgpu backend available");
+            return;
+        };
+
+        let mut rng = StdRng::seed_from_u64(7);
+        let data = Mat::from_fn(3000, 30, |_, _| rng.random_range(-1.0_f32..1.0));
+        for seed in 0..4 {
+            let graph = build_knn_graph_gpu::<f32, WgpuRuntime>(
+                data.as_ref(),
+                Dist::SquaredEuclidean,
+                Some(15),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                seed,
+                false,
+                device.clone(),
+            )
+            .unwrap();
+            for (i, row) in graph.knn_graph.chunks_exact(graph.k).enumerate() {
+                let mut ids: Vec<usize> = row.iter().map(|&(pid, _)| pid).collect();
+                ids.sort_unstable();
+                ids.dedup();
+                assert_eq!(ids.len(), graph.k, "seed {seed}, row {i} has duplicates");
+            }
+        }
     }
 
     #[test]
