@@ -6,14 +6,12 @@
 //! all-pairs proposals are a Metal kernel, merged into the graph with the
 //! NN-Descent merge, five trees per batch.
 
-use rand::rngs::SmallRng;
-use rand::{Rng, SeedableRng};
-use rayon::prelude::*;
 use std::time::Instant;
 
 use crate::mlx::ffi::*;
 use crate::mlx::nndescent_mlx::*;
 use crate::prelude::*;
+use crate::utils::rp_forest::*;
 
 ////////////
 // Consts //
@@ -111,63 +109,6 @@ pub(crate) fn max_leaf_size_mlx(dim_padded: usize) -> Result<usize, AnnSearchErr
     Ok(fits.min(MAX_LEAF_CAP))
 }
 
-/// Group points by final partition into CSR leaves.
-///
-/// ### Params
-///
-/// * `partition_ids` - Partition per point
-///
-/// ### Returns
-///
-/// `(leaf_points, leaf_offsets)`, offsets of length `n_leaves + 1`
-fn build_leaf_structure(partition_ids: &[u32]) -> (Vec<u32>, Vec<u32>) {
-    let mut sorted: Vec<(u32, u32)> = partition_ids
-        .iter()
-        .enumerate()
-        .map(|(i, &pid)| (pid, i as u32))
-        .collect();
-    sorted.par_sort_unstable_by_key(|&(pid, _)| pid);
-    let leaf_points = sorted.iter().map(|&(_, i)| i).collect();
-    let mut leaf_offsets = vec![0u32];
-    for i in 1..sorted.len() {
-        if sorted[i].0 != sorted[i - 1].0 {
-            leaf_offsets.push(i as u32);
-        }
-    }
-    leaf_offsets.push(sorted.len() as u32);
-    (leaf_points, leaf_offsets)
-}
-
-/// Median projection per partition.
-///
-/// ### Params
-///
-/// * `partition_ids` - Current partition per point
-/// * `dots` - Projection per point
-/// * `n_partitions` - Partitions at this level
-///
-/// ### Returns
-///
-/// One median per partition, zero for an empty one
-fn partition_medians(partition_ids: &[u32], dots: &[f32], n_partitions: usize) -> Vec<f32> {
-    let cap = dots.len() / n_partitions * 3 / 2;
-    let mut buckets: Vec<Vec<f32>> = vec![Vec::with_capacity(cap); n_partitions];
-    for (&pid, &d) in partition_ids.iter().zip(dots) {
-        buckets[pid as usize].push(d);
-    }
-    buckets
-        .into_par_iter()
-        .map(|mut b| {
-            if b.is_empty() {
-                return 0.0;
-            }
-            let mid = b.len() / 2;
-            b.select_nth_unstable_by(mid, |x, y| x.total_cmp(y));
-            b[mid]
-        })
-        .collect()
-}
-
 ///////////////////
 // Forest driver //
 ///////////////////
@@ -186,7 +127,8 @@ fn partition_medians(partition_ids: &[u32], dots: &[f32], n_partitions: usize) -
 ///
 /// ### Returns
 ///
-/// The lazy graph after every batch's proposals are merged
+/// The lazy graph after every batch's proposals are merged, and the query
+/// router over the first trees
 pub(crate) fn forest_init_mlx(
     ctx: &NndMlx,
     mut g: GraphPair,
@@ -194,7 +136,7 @@ pub(crate) fn forest_init_mlx(
     n_trees: usize,
     seed: usize,
     verbose: bool,
-) -> Result<GraphPair, AnnSearchErrors> {
+) -> Result<(GraphPair, ForestRouter<f32>), AnnSearchErrors> {
     let n = ctx.n;
     let dim_padded = ctx.d4 * 4;
     let max_leaf = max_leaf_size_mlx(dim_padded)?;
@@ -209,23 +151,8 @@ pub(crate) fn forest_init_mlx(
     }
     let start = Instant::now();
 
-    let mut projections = vec![0.0f32; n_trees * max_depth * dim_padded];
-    for tree in 0..n_trees {
-        let tree_seed = (seed as u64).wrapping_add((tree as u64).wrapping_mul(0x9E3779B97F4A7C15));
-        for level in 0..max_depth {
-            let level_seed =
-                tree_seed.wrapping_add((level as u64).wrapping_mul(0x517CC1B727220A95));
-            let mut rng = SmallRng::seed_from_u64(level_seed);
-            let off = (tree * max_depth + level) * dim_padded;
-            let row = &mut projections[off..off + dim];
-            row.iter_mut()
-                .for_each(|x| *x = rng.random_range(-1.0f64..1.0) as f32);
-            let norm = row.iter().map(|x| x * x).sum::<f32>().sqrt();
-            if norm > 0.0 {
-                row.iter_mut().for_each(|x| *x /= norm);
-            }
-        }
-    }
+    let (projections, level_vecs) =
+        forest_projections::<f32>(n_trees, max_depth, dim, dim_padded, seed);
 
     // `[n_trees * max_depth, n]`: every level's projections contiguous.
     let dots = if max_depth > 0 {
@@ -252,25 +179,7 @@ pub(crate) fn forest_init_mlx(
         None => &[],
     };
 
-    let leaves: Vec<(Vec<u32>, Vec<u32>)> = (0..n_trees)
-        .into_par_iter()
-        .map(|tree| {
-            let mut pids = vec![0u32; n];
-            for level in 0..max_depth {
-                let off = (tree * max_depth + level) * n;
-                let dl = &all_dots[off..off + n];
-                let medians = partition_medians(&pids, dl, 1 << level);
-                pids.par_iter_mut().zip(dl.par_iter()).for_each(|(p, &d)| {
-                    *p = if d <= medians[*p as usize] {
-                        *p * 2
-                    } else {
-                        *p * 2 + 1
-                    };
-                });
-            }
-            build_leaf_structure(&pids)
-        })
-        .collect();
+    let (leaves, router) = partition_forest(all_dots, level_vecs, n, max_depth, dim);
     drop(dots);
     if verbose {
         println!("    Tree construction: {:.2?}", start.elapsed());
@@ -297,7 +206,7 @@ pub(crate) fn forest_init_mlx(
     for batch in leaves.chunks(TREES_PER_BATCH) {
         let mut points: Vec<u32> = Vec::with_capacity(batch.len() * n);
         let mut offsets: Vec<u32> = Vec::new();
-        for (lp, lo) in batch {
+        for (lp, lo, _) in batch {
             let base = points.len() as u32;
             offsets.extend(lo[..lo.len() - 1].iter().map(|&o| o + base));
             points.extend_from_slice(lp);
@@ -342,7 +251,7 @@ pub(crate) fn forest_init_mlx(
         eval_all(&[&g.0, &g.1], false)?;
         println!("  MLX forest init: {:.2?}", start.elapsed());
     }
-    Ok(g)
+    Ok((g, router))
 }
 
 ///////////
@@ -362,15 +271,5 @@ mod tests {
         }
         assert_eq!(max_leaf_size_mlx(32).unwrap(), 234);
         assert!(max_leaf_size_mlx(8192).is_err());
-    }
-
-    #[test]
-    fn test_mlx_leaf_structure_is_csr() {
-        let (pts, offs) = build_leaf_structure(&[2, 0, 2, 1, 0]);
-        assert_eq!(offs, vec![0, 2, 3, 5]);
-        let mut first: Vec<u32> = pts[0..2].to_vec();
-        first.sort_unstable();
-        assert_eq!(first, vec![1, 4]);
-        assert_eq!(pts[2], 3);
     }
 }

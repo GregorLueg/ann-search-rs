@@ -11,4 +11,5 @@ mod ffi;
 mod forest_mlx;
 pub mod ivf_mlx;
 pub mod k_means_mlx;
+pub mod nndescent_index_mlx;
 pub mod nndescent_mlx;

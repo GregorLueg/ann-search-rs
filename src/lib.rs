@@ -94,6 +94,8 @@ use crate::mlx::{cagra_mlx::*, exhaustive_mlx::*};
 use crate::mlx::ivf_mlx::*;
 #[cfg(feature = "mlx")]
 use crate::mlx::nndescent_mlx::KnnGraphMlx;
+#[cfg(feature = "mlx")]
+use crate::mlx::nndescent_index_mlx::NNDescentIndexMlx;
 #[cfg(feature = "quantised")]
 use crate::quantised::{
     exhaustive_bf16::*, exhaustive_opq::*, exhaustive_pq::*, exhaustive_sq8::*,
@@ -3592,6 +3594,122 @@ pub fn build_knn_graph_mlx(
         seed,
         verbose,
     )
+}
+
+#[cfg(feature = "mlx")]
+/// Build an NN-Descent index on MLX with CAGRA optimisation (experimental,
+/// Apple Silicon, f32 only). Counterpart of [`build_nndescent_index_gpu`],
+/// minus the device and `retain_gpu`: the MLX index always stays resident.
+///
+/// ### Params
+///
+/// * `mat` - Input data as samples x features. Accepts a faer matrix, an
+///   ndarray 2-D array (with the `ndarray` feature) or a row-major
+///   `(&[f32], n_samples, n_features)` tuple. See [`AnnMatrix`].
+/// * `dist_metric` - Distance metric: "euclidean" or "cosine". "manhattan" is
+///   not supported.
+/// * `k` - Final neighbours per node (default 30)
+/// * `build_k` - Internal NNDescent degree before CAGRA pruning
+///   (default `1.5*k`)
+/// * `max_iters` - Maximum NNDescent iterations (default 15)
+/// * `n_trees` - Forest size for init (default `5 + n^0.25`, capped at 20)
+/// * `delta` - Convergence threshold (default 0.001)
+/// * `rho` - Sampling rate (default 1.0, meaning no sampling)
+/// * `refine_knn` - 2-hop refinement sweeps after the main loop (default 0)
+/// * `seed` - Random seed
+/// * `verbose` - Print progress
+///
+/// ### Returns
+///
+/// The initialised [`NNDescentIndexMlx`]
+#[allow(clippy::too_many_arguments)]
+pub fn build_nndescent_index_mlx(
+    mat: impl AnnMatrix<f32>,
+    dist_metric: &str,
+    k: Option<usize>,
+    build_k: Option<usize>,
+    max_iters: Option<usize>,
+    n_trees: Option<usize>,
+    delta: Option<f32>,
+    rho: Option<f32>,
+    refine_knn: Option<usize>,
+    seed: usize,
+    verbose: bool,
+) -> Result<NNDescentIndexMlx, AnnSearchErrors> {
+    let metric = parse_ann_dist(dist_metric).unwrap_or_else(|| {
+        println!("[WARNING] Weird string used for distance metric. Using default squared Euclidean distance");
+        Dist::default()
+    });
+
+    NNDescentIndexMlx::build(
+        mat.into_row_major(),
+        metric,
+        k,
+        build_k,
+        max_iters,
+        n_trees,
+        delta,
+        rho,
+        refine_knn,
+        seed,
+        verbose,
+    )
+}
+
+#[cfg(feature = "mlx")]
+/// Query an NNDescent MLX index.
+///
+/// ### Params
+///
+/// * `query_mat` - Query data as samples x features. Accepts a faer matrix,
+///   an ndarray 2-D array (with the `ndarray` feature) or a row-major
+///   `(&[f32], n_queries, n_features)` tuple. See [`AnnMatrix`].
+/// * `index` - Reference to built index
+/// * `k` - Number of neighbours
+/// * `query_params` - Optional beam search parameters
+/// * `return_dist` - Return distances
+/// * `verbose` - Print progress
+///
+/// ### Returns
+///
+/// Tuple of (indices, optional distances)
+pub fn query_nndescent_index_mlx(
+    query_mat: impl AnnMatrix<f32>,
+    index: &NNDescentIndexMlx,
+    k: usize,
+    query_params: Option<CagraMlxSearchParams>,
+    return_dist: bool,
+    verbose: bool,
+) -> KnnOptionResult<f32> {
+    let (queries_flat, n_queries, _) = query_mat.into_row_major();
+    if verbose {
+        println!("  MLX batch query: {} vectors, k={}...", n_queries, k);
+    }
+    let (indices, distances) = index.query_batch(&queries_flat, n_queries, query_params, k, 42)?;
+    Ok((indices, return_dist.then_some(distances)))
+}
+
+#[cfg(feature = "mlx")]
+/// Self-query an NNDescent MLX index (full kNN graph via beam search).
+///
+/// ### Params
+///
+/// * `index` - Reference to built index
+/// * `k` - Number of neighbours, self included
+/// * `query_params` - Optional beam search parameters
+/// * `return_dist` - Return distances
+///
+/// ### Returns
+///
+/// Tuple of (indices, optional distances)
+pub fn query_nndescent_index_mlx_self(
+    index: &NNDescentIndexMlx,
+    k: usize,
+    query_params: Option<CagraMlxSearchParams>,
+    return_dist: bool,
+) -> KnnOptionResult<f32> {
+    let (indices, distances) = index.self_query(k, query_params, 42)?;
+    Ok((indices, return_dist.then_some(distances)))
 }
 
 //////////////
