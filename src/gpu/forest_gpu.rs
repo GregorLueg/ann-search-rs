@@ -574,8 +574,7 @@ where
         Vec::new()
     };
 
-    let (leaf_structures, router) =
-        partition_forest(&all_dots, tree_level_vecs, n, max_depth, dim);
+    let (leaf_structures, router) = partition_forest(&all_dots, tree_level_vecs, n, max_depth, dim);
 
     if verbose {
         println!("    Tree construction: {:.2?}", cpu_start.elapsed());

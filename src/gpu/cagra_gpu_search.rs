@@ -1466,7 +1466,8 @@ mod tests {
         let entry_gpu =
             GpuTensor::<WgpuRuntime, u32>::from_slice(&entries, vec![n_queries, n_entry], &client)
                 .unwrap();
-        let out_idx = GpuTensor::<WgpuRuntime, u32>::empty(vec![n_queries, k_out], &client).unwrap();
+        let out_idx =
+            GpuTensor::<WgpuRuntime, u32>::empty(vec![n_queries, k_out], &client).unwrap();
         let out_dist =
             GpuTensor::<WgpuRuntime, f32>::empty(vec![n_queries, k_out], &client).unwrap();
         let out_iters = GpuTensor::<WgpuRuntime, u32>::empty(vec![n_queries], &client).unwrap();

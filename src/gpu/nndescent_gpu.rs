@@ -3,9 +3,10 @@
 //! All vector data remains GPU-resident throughout construction. The host
 //! loop only downloads a single u32 convergence counter per iteration.
 //!
-//! [`build_knn_graph_gpu`] is a thin wrapper over [`nndescent_core`], which
-//! owns that loop. The split exists so [`crate::gpu::clustered_nndescent_gpu`]
-//! can run the same loop once per cluster against a shared client.
+//! [`nndescent_core`] owns that loop. [`build_knn_graph_gpu`] wraps it and
+//! compacts the graph, [`NNDescentGpu::build`] adds the CAGRA optimisation on
+//! the device graph it returns, and [`crate::gpu::clustered_nndescent_gpu`]
+//! runs it once per cluster against a shared client.
 //!
 //! ## CubeCL 0.10 codegen workarounds
 //!
@@ -1992,10 +1993,7 @@ where
 
         let medoid = compute_medoid(&vectors_flat, n, dim, metric);
 
-        // pad dim to next multiple of LINE_SIZE
-        let line = LINE_SIZE;
-        let dim_padded = dim.next_multiple_of(line);
-        let dim_vec = dim_padded / line;
+        let dim_padded = dim.next_multiple_of(LINE_SIZE);
 
         let vectors_padded = if dim_padded != dim {
             pad_vectors(&vectors_flat, n, dim, dim_padded)
@@ -2025,351 +2023,46 @@ where
 
         let start = Instant::now();
 
-        // gpu set up
-        let n_trees_forest = n_trees.unwrap_or_else(|| {
-            let calculated = 5 + ((n as f64).powf(0.25)).round() as usize;
-            calculated.min(20)
-        });
-
         let client = R::client(&device);
         let limits = GpuLimits::from_client(&client);
-        let use_cosine = metric == Dist::Cosine;
 
-        // upload vectors (stays resident for the entire build)
-        let vectors_gpu =
-            GpuTensor::<R, T>::from_slice(&vectors_padded, vec![n, dim_padded], &client)?;
-
-        // norms tensor (dummy scalar if Euclidean to avoid Option in kernel args)
-        let norms_gpu = if use_cosine {
-            GpuTensor::<R, T>::from_slice(&norms, vec![n], &client)?
-        } else {
-            GpuTensor::<R, T>::from_slice(&[T::zero()], vec![1], &client)?
+        let cfg = NnDescentCfg {
+            build_k,
+            max_iters,
+            n_trees: n_trees.unwrap_or_else(|| default_forest_trees(n)),
+            delta,
+            rho_thresh,
+            refine_knn,
+            seed,
+            use_cosine: metric == Dist::Cosine,
         };
 
-        // Pre-allocate graph with sentinels
-        let graph_idx_gpu = GpuTensor::<R, u32>::from_slice(
-            &vec![0x7FFFFFFFu32; n * build_k],
-            vec![n, build_k],
-            &client,
-        )?;
-        let graph_dist_gpu = GpuTensor::<R, T>::from_slice(
-            &vec![<T as num_traits::Float>::max_value(); n * build_k],
-            vec![n, build_k],
-            &client,
-        )?;
-
-        // Proposal buffers (shared between forest init and NNDescent iterations)
-        let max_prop = MAX_PROPOSALS;
-        let prop_idx_gpu = GpuTensor::<R, u32>::empty(vec![n, max_prop], &client)?;
-        let prop_dist_gpu = GpuTensor::<R, T>::empty(vec![n, max_prop], &client)?;
-        let prop_count_gpu = GpuTensor::<R, u32>::empty(vec![n], &client)?;
-        let update_counter_gpu = GpuTensor::<R, u32>::empty(vec![1], &client)?;
-
-        let (grid_n_x, grid_n_y) = grid_2d((n as u32).div_ceil(WORKGROUP_SIZE_X), &limits)?;
-
-        let staging = plan_local_join_staging(
-            dim_padded,
-            build_k * 2,
-            (2 * nnd_cand_cap(build_k) as usize).min(build_k * 2),
-            size_of::<T>(),
-            use_cosine,
-            &limits,
-        )?;
-
-        // 1: random graph initialisation (baseline for NNDescent)
-        if verbose {
-            println!("  Random graph initialisation...");
-        }
-
-        unsafe {
-            init_random_graph::launch_unchecked::<T, R>(
-                &client,
-                CubeCount::Static(grid_n_x, grid_n_y, 1),
-                CubeDim::new_2d(WORKGROUP_SIZE_X, 1),
-                line,
-                vectors_gpu.clone().into_tensor_arg(),
-                norms_gpu.clone().into_tensor_arg(),
-                graph_idx_gpu.clone().into_tensor_arg(),
-                graph_dist_gpu.clone().into_tensor_arg(),
-                n as u32,
-                seed as u32,
-                use_cosine,
-                dim_vec,
-                build_k,
-            );
-        }
-
-        // 1b: GPU forest graph initialisation
-        let router = gpu_forest_init(
-            &vectors_gpu,
-            &norms_gpu,
-            &graph_idx_gpu,
-            &graph_dist_gpu,
-            &prop_idx_gpu,
-            &prop_dist_gpu,
-            &prop_count_gpu,
-            &update_counter_gpu,
+        let NnDescentOutput {
+            graph_idx,
+            graph_dist,
+            converged,
+            router,
+            graph_idx_gpu,
+            vectors_gpu,
+            norms_gpu,
+        } = nndescent_core::<T, R>(
+            &vectors_padded,
+            &norms,
             n,
             dim,
             dim_padded,
-            n_trees_forest,
-            seed,
-            use_cosine,
-            verbose,
+            &cfg,
             &client,
-        )?;
-
-        // 1c: Mark all graph entries as new for NNDescent
-        let total_entries = (n * build_k) as u32;
-        let mark_grid_flat = total_entries.div_ceil(WORKGROUP_SIZE_X);
-        let (mark_cubes_x, mark_cubes_y) = grid_2d(mark_grid_flat, &limits)?;
-        unsafe {
-            mark_all_new::launch_unchecked::<R>(
-                &client,
-                CubeCount::Static(mark_cubes_x, mark_cubes_y, 1),
-                CubeDim::new_2d(WORKGROUP_SIZE_X, 1),
-                graph_idx_gpu.clone().into_tensor_arg(),
-                total_entries,
-            );
-        }
-
-        // 2: NNDescent iterations on the GPU
-
-        let iter_start = Instant::now();
-        let mut converged = false;
-
-        let reverse_idx_gpu = GpuTensor::<R, u32>::empty(vec![n, build_k], &client)?;
-        let reverse_count_gpu = GpuTensor::<R, u32>::empty(vec![n], &client)?;
-
-        for iter in 0..max_iters {
-            // One cube per node. `grid_2d` clamps to the 65535 per-dim limit
-            // without over-dispatching when n is below it.
-            let (cubes_x, cubes_y) = grid_2d(n as u32, &limits)?;
-
-            // 1. Reset proposal counts, reverse counts, and update counter
-            unsafe {
-                reset_proposals::launch_unchecked::<R>(
-                    &client,
-                    CubeCount::Static(grid_n_x, grid_n_y, 1),
-                    CubeDim::new_2d(WORKGROUP_SIZE_X, 1),
-                    prop_count_gpu.clone().into_tensor_arg(),
-                    update_counter_gpu.clone().into_tensor_arg(),
-                    n as u32,
-                );
-
-                reset_proposals::launch_unchecked::<R>(
-                    &client,
-                    CubeCount::Static(grid_n_x, grid_n_y, 1),
-                    CubeDim::new_2d(WORKGROUP_SIZE_X, 1),
-                    reverse_count_gpu.clone().into_tensor_arg(),
-                    update_counter_gpu.clone().into_tensor_arg(),
-                    n as u32,
-                );
-            }
-
-            // 2. Build reverse edges
-            unsafe {
-                build_reverse_candidates::launch_unchecked::<R>(
-                    &client,
-                    CubeCount::Static(grid_n_x, grid_n_y, 1),
-                    CubeDim::new_2d(WORKGROUP_SIZE_X, 1),
-                    graph_idx_gpu.clone().into_tensor_arg(),
-                    reverse_idx_gpu.clone().into_tensor_arg(),
-                    reverse_count_gpu.clone().into_tensor_arg(),
-                    n as u32,
-                    build_k as u32,
-                );
-            }
-
-            let iter_seed = seed as u32 ^ (iter as u32).wrapping_mul(0x9E3779B9u32);
-
-            // 3. Local join
-            unsafe {
-                local_join_shared::launch_unchecked::<T, R>(
-                    &client,
-                    CubeCount::Static(cubes_x, cubes_y, 1),
-                    CubeDim::new_2d(staging.cube_x, staging.cube_y),
-                    line,
-                    vectors_gpu.clone().into_tensor_arg(),
-                    norms_gpu.clone().into_tensor_arg(),
-                    graph_idx_gpu.clone().into_tensor_arg(),
-                    graph_dist_gpu.clone().into_tensor_arg(),
-                    reverse_idx_gpu.clone().into_tensor_arg(),
-                    reverse_count_gpu.clone().into_tensor_arg(),
-                    prop_idx_gpu.clone().into_tensor_arg(),
-                    prop_dist_gpu.clone().into_tensor_arg(),
-                    prop_count_gpu.clone().into_tensor_arg(),
-                    n as u32,
-                    rho_thresh,
-                    iter_seed,
-                    nnd_cand_cap(build_k),
-                    MAX_PROPOSALS as u32,
-                    use_cosine,
-                    dim_vec,
-                    staging.row_lines,
-                    build_k,
-                    staging.block,
-                    staging.single_block,
-                    staging.buf_a_lines,
-                    staging.buf_b_lines,
-                    staging.norm_buf_len,
-                    staging.line_unroll,
-                );
-            }
-
-            // 4. Merge proposals into the graph
-            launch_merge_proposals::<T, R>(
-                &client,
-                &limits,
-                &graph_idx_gpu,
-                &graph_dist_gpu,
-                &prop_idx_gpu,
-                &prop_dist_gpu,
-                &prop_count_gpu,
-                &update_counter_gpu,
-                n,
-                build_k,
-            )?;
-
-            // 5. Download single u32 to check convergence
-            let counter_data = update_counter_gpu.clone().read(&client)?;
-            let updates = counter_data[0] as f64;
-            let rate = updates / (n * build_k) as f64;
-
-            if verbose {
-                println!(
-                    "   Iter {}: {} updates (rate={:.6})",
-                    iter + 1,
-                    (updates as usize).separate_with_underscores(),
-                    rate
-                );
-            }
-
-            if rate < delta as f64 {
-                if verbose {
-                    println!("  Converged after {} iterations", iter + 1);
-                }
-                converged = true;
-                break;
-            }
-        }
-
-        if verbose {
-            println!("  NNDescent iterations: {:.2?}", iter_start.elapsed());
-        }
-
-        // ---- 3: 2-Hop Refinement ----
-
-        if verbose && refine_knn > 0 {
-            println!("  Running 2-Hop Refinement Sweep...");
-        }
-
-        let refinement_start = Instant::now();
-
-        // `shared_source` stages one padded vector, `shared_worst_dist` one
-        // scalar and `shared_own` the node's own `build_k` neighbour ids.
-        fits_shared_memory(
-            "two_hop_refinement",
-            dim_padded * size_of::<T>() + size_of::<T>() + build_k * 4,
             &limits,
+            verbose,
         )?;
 
-        // One cube per node.
-        let (cubes_x, cubes_y) = grid_2d(n as u32, &limits)?;
+        let knn_graph = compact_knn_rows(&graph_idx, &graph_dist, n, k, build_k);
 
-        for sweep in 0..refine_knn {
-            unsafe {
-                reset_proposals::launch_unchecked::<R>(
-                    &client,
-                    CubeCount::Static(grid_n_x, grid_n_y, 1),
-                    CubeDim::new_2d(WORKGROUP_SIZE_X, 1),
-                    prop_count_gpu.clone().into_tensor_arg(),
-                    update_counter_gpu.clone().into_tensor_arg(),
-                    n as u32,
-                );
-            }
-
-            unsafe {
-                two_hop_refinement::launch_unchecked::<T, R>(
-                    &client,
-                    CubeCount::Static(cubes_x, cubes_y, 1),
-                    CubeDim::new_2d(WORKGROUP_SIZE_X, 1),
-                    line,
-                    vectors_gpu.clone().into_tensor_arg(),
-                    norms_gpu.clone().into_tensor_arg(),
-                    graph_idx_gpu.clone().into_tensor_arg(),
-                    graph_dist_gpu.clone().into_tensor_arg(),
-                    prop_idx_gpu.clone().into_tensor_arg(),
-                    prop_dist_gpu.clone().into_tensor_arg(),
-                    prop_count_gpu.clone().into_tensor_arg(),
-                    n as u32,
-                    MAX_PROPOSALS as u32,
-                    use_cosine,
-                    dim_vec,
-                    build_k,
-                );
-            }
-
-            launch_merge_proposals::<T, R>(
-                &client,
-                &limits,
-                &graph_idx_gpu,
-                &graph_dist_gpu,
-                &prop_idx_gpu,
-                &prop_dist_gpu,
-                &prop_count_gpu,
-                &update_counter_gpu,
-                n,
-                build_k,
-            )?;
-
-            if verbose {
-                let counter_data = update_counter_gpu.clone().read(&client)?;
-                println!(
-                    "    2-Hop sweep {}: {} updates",
-                    sweep + 1,
-                    counter_data[0].separate_with_underscores()
-                );
-            }
-
-            let refinement_stop = refinement_start.elapsed();
-
-            if verbose {
-                println!("  NNDescent refinement done in: {:.2?}", refinement_stop);
-            }
-        }
-
-        // ---- 4: Extract kNN graph from NNDescent result ----
-
-        let nndescent_idx = graph_idx_gpu.clone().read(&client)?;
-        let nndescent_dist = graph_dist_gpu.clone().read(&client)?;
-        let pid_mask = SENTINEL_PID as u32;
-        let sentinel = SENTINEL_PID;
-
-        let mut knn_graph = vec![(sentinel, <T as num_traits::Float>::max_value()); n * k];
-
-        knn_graph
-            .par_chunks_mut(k)
-            .enumerate()
-            .for_each(|(i, slot)| {
-                let mut written = 0;
-                for j in 0..build_k {
-                    if written >= k {
-                        break;
-                    }
-                    let raw = nndescent_idx[i * build_k + j];
-                    let pid = (raw & pid_mask) as usize;
-                    if pid < n && pid != i && pid != sentinel {
-                        let dist = nndescent_dist[i * build_k + j];
-                        slot[written] = (pid, dist);
-                        written += 1;
-                    }
-                }
-            });
-
-        // ---- 5: CAGRA graph optimisation: prune from build_k -> k ----
+        // ---- CAGRA graph optimisation: prune from build_k -> k ----
 
         let cagra_start = Instant::now();
+        let (grid_n_x, grid_n_y) = grid_2d((n as u32).div_ceil(WORKGROUP_SIZE_X), &limits)?;
 
         let pruned_idx_gpu = GpuTensor::<R, u32>::empty(vec![n, k], &client)?;
         let reverse_idx_gpu = GpuTensor::<R, u32>::empty(vec![n, k], &client)?;
@@ -2422,7 +2115,7 @@ where
             println!("  CAGRA optimisation: {:.2?}", cagra_start.elapsed());
         }
 
-        // ---- 6: Download the CAGRA graph ----
+        // ---- Download the CAGRA graph ----
         // Node IDs only, stored verbatim. `cagra_rank_prune_shared` already
         // strips the new-edge flag bit and `cagra_merge_graphs` pads with the
         // sentinel, so this is byte-identical to what the beam search kernel
@@ -3020,7 +2713,12 @@ where
         use_cosine: metric == Dist::Cosine,
     };
 
-    let (graph_idx, graph_dist, converged) = nndescent_core::<T, R>(
+    let NnDescentOutput {
+        graph_idx,
+        graph_dist,
+        converged,
+        ..
+    } = nndescent_core::<T, R>(
         &vectors_padded,
         &norms,
         n,
@@ -3050,6 +2748,29 @@ where
     })
 }
 
+/// Output of [`nndescent_core`].
+///
+/// The host buffers are what a plain kNN consumer needs. The device tensors
+/// and the router are what the CAGRA optimisation and the beam search need;
+/// callers that only want the graph drop them.
+pub struct NnDescentOutput<T: AnnSearchFloat + CubeclFloat, R: Runtime> {
+    /// Raw graph ids, `n * build_k`, with the is-new flag still in the top
+    /// bit; run through [`compact_knn_rows`] before use
+    pub graph_idx: Vec<u32>,
+    /// Matching distances, `n * build_k`
+    pub graph_dist: Vec<T>,
+    /// Whether the update rate fell below `delta`
+    pub converged: bool,
+    /// Forest router built during the initialisation
+    pub router: ForestRouter<T>,
+    /// Device copy of `graph_idx`, `[n, build_k]`
+    pub graph_idx_gpu: GpuTensor<R, u32>,
+    /// Padded vectors, `[n, dim_padded]`
+    pub vectors_gpu: GpuTensor<R, T>,
+    /// Norms `[n]` for cosine, a one-element dummy otherwise
+    pub norms_gpu: GpuTensor<R, T>,
+}
+
 /// Run the device-resident NNDescent loop and read the raw graph back.
 ///
 /// Everything between the data upload and the download, with no argument
@@ -3072,9 +2793,8 @@ where
 ///
 /// ### Returns
 ///
-/// `(graph_idx, graph_dist, converged)`. Both buffers are `n * build_k`; ids
-/// still carry the is-new flag in the top bit, so run them through
-/// [`compact_knn_rows`] before use.
+/// [`NnDescentOutput`] with the raw graph read back and the device tensors
+/// still alive.
 #[allow(clippy::too_many_arguments)]
 pub fn nndescent_core<T, R>(
     vectors_padded: &[T],
@@ -3086,7 +2806,7 @@ pub fn nndescent_core<T, R>(
     client: &ComputeClient<R>,
     limits: &GpuLimits,
     verbose: bool,
-) -> Result<(Vec<u32>, Vec<T>, bool), AnnSearchErrors>
+) -> Result<NnDescentOutput<T, R>, AnnSearchErrors>
 where
     T: AnnSearchFloat + CubeclFloat,
     R: Runtime,
@@ -3166,7 +2886,7 @@ where
 
     // ---- Forest graph initialisation ----
 
-    let _router = gpu_forest_init(
+    let router = gpu_forest_init(
         &vectors_gpu,
         &norms_gpu,
         &graph_idx_gpu,
@@ -3365,22 +3085,20 @@ where
                 dim_vec,
                 build_k,
             );
-
-            merge_proposals::launch_unchecked::<T, R>(
-                client,
-                CubeCount::Static(grid_n_x, grid_n_y, 1),
-                CubeDim::new_2d(WORKGROUP_SIZE_X, 1),
-                graph_idx_gpu.clone().into_tensor_arg(),
-                graph_dist_gpu.clone().into_tensor_arg(),
-                prop_idx_gpu.clone().into_tensor_arg(),
-                prop_dist_gpu.clone().into_tensor_arg(),
-                prop_count_gpu.clone().into_tensor_arg(),
-                update_counter_gpu.clone().into_tensor_arg(),
-                n as u32,
-                MAX_PROPOSALS as u32,
-                build_k,
-            );
         }
+
+        launch_merge_proposals::<T, R>(
+            client,
+            limits,
+            &graph_idx_gpu,
+            &graph_dist_gpu,
+            &prop_idx_gpu,
+            &prop_dist_gpu,
+            &prop_count_gpu,
+            &update_counter_gpu,
+            n,
+            build_k,
+        )?;
 
         if verbose {
             let counter_data = update_counter_gpu.clone().read(client)?;
@@ -3398,10 +3116,18 @@ where
 
     // ---- Download the raw graph ----
 
-    let graph_idx = graph_idx_gpu.read(client)?;
+    let graph_idx = graph_idx_gpu.clone().read(client)?;
     let graph_dist = graph_dist_gpu.read(client)?;
 
-    Ok((graph_idx, graph_dist, converged))
+    Ok(NnDescentOutput {
+        graph_idx,
+        graph_dist,
+        converged,
+        router,
+        graph_idx_gpu,
+        vectors_gpu,
+        norms_gpu,
+    })
 }
 
 ///////////

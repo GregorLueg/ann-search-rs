@@ -21,8 +21,8 @@ use thousands::*;
 
 use crate::gpu::k_means_gpu::{train_centroids_gpu, KMeansGpuParams};
 use crate::gpu::nndescent_gpu::{
-    default_forest_trees, nndescent_core, KnnGraphGpu, NnDescentCfg, DEFAULT_DELTA,
-    DEFAULT_MAX_ITERS, DEFAULT_RHO, MAX_PROPOSALS,
+    default_forest_trees, nndescent_core, KnnGraphGpu, NnDescentCfg, NnDescentOutput,
+    DEFAULT_DELTA, DEFAULT_MAX_ITERS, DEFAULT_RHO, MAX_PROPOSALS,
 };
 use crate::prelude::*;
 use crate::utils::k_means_utils::{
@@ -583,7 +583,12 @@ where
         };
 
         let cluster_start = Instant::now();
-        let (graph_idx, graph_dist, cluster_converged) = nndescent_core::<T, R>(
+        let NnDescentOutput {
+            graph_idx,
+            graph_dist,
+            converged: cluster_converged,
+            ..
+        } = nndescent_core::<T, R>(
             &cluster_vectors,
             &cluster_norms,
             m,
@@ -1177,7 +1182,11 @@ mod device_tests {
             use_cosine: false,
         };
 
-        let (graph_idx, graph_dist, _) = nndescent_core::<f32, WgpuRuntime>(
+        let NnDescentOutput {
+            graph_idx,
+            graph_dist,
+            ..
+        } = nndescent_core::<f32, WgpuRuntime>(
             &flat,
             &[],
             n,
