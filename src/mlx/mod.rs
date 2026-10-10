@@ -5,5 +5,6 @@
 //! against the cubecl/wgpu kernels in [`crate::gpu`]. f32 only, since MLX has
 //! no f64 on the GPU.
 
+pub mod cagra_mlx;
 pub mod exhaustive_mlx;
 mod ffi;

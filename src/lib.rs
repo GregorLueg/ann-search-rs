@@ -89,7 +89,7 @@ use crate::binary::{
 #[cfg(feature = "gpu")]
 use crate::gpu::{exhaustive_gpu::*, ivf_gpu::*};
 #[cfg(feature = "mlx")]
-use crate::mlx::exhaustive_mlx::*;
+use crate::mlx::{cagra_mlx::*, exhaustive_mlx::*};
 #[cfg(feature = "quantised")]
 use crate::quantised::{
     exhaustive_bf16::*, exhaustive_opq::*, exhaustive_pq::*, exhaustive_sq8::*,
@@ -3357,6 +3357,71 @@ pub fn query_exhaustive_index_mlx_self(
     verbose: bool,
 ) -> KnnOptionResult<f32> {
     index.generate_knn(k, return_dist, verbose)
+}
+
+//////////////////////
+// CAGRA search MLX //
+//////////////////////
+
+#[cfg(feature = "mlx")]
+/// Query a CAGRA navigational graph on MLX (experimental, Apple Silicon, f32
+/// only)
+///
+/// ### Params
+///
+/// * `query_mat` - Query data as samples x features. Accepts a faer matrix,
+///   an ndarray 2-D array (with the `ndarray` feature) or a row-major
+///   `(&[f32], n_queries, n_features)` tuple. See [`AnnMatrix`].
+/// * `index` - The MLX searcher holding vectors and graph
+/// * `k` - Number of neighbours
+/// * `query_params` - Optional beam search parameters; `None` scales the beam
+///   to `k`
+/// * `entry_points` - Optional `[n_queries * n_entry]` entry node ids; `None`
+///   uses the medoid plus random nodes
+/// * `return_dist` - Return distances
+///
+/// ### Returns
+///
+/// Tuple of (indices, optional distances)
+pub fn query_cagra_index_mlx(
+    query_mat: impl AnnMatrix<f32>,
+    index: &CagraSearchMlx,
+    k: usize,
+    query_params: Option<CagraMlxSearchParams>,
+    entry_points: Option<&[u32]>,
+    return_dist: bool,
+) -> KnnOptionResult<f32> {
+    let (queries_flat, n_queries, _) = query_mat.into_row_major();
+    let (indices, distances) =
+        index.search(&queries_flat, n_queries, k, query_params, entry_points, 42)?;
+    Ok((indices, return_dist.then_some(distances)))
+}
+
+#[cfg(feature = "mlx")]
+/// Self-query a CAGRA navigational graph on MLX (full kNN graph)
+///
+/// ### Params
+///
+/// * `index` - The MLX searcher holding vectors and graph
+/// * `k` - Number of neighbours, self included
+/// * `query_params` - Optional beam search parameters
+/// * `entry_points` - Optional `[n * n_entry]` entry node ids, see
+///   [`crate::mlx::cagra_mlx::self_entry_points`]; `None` derives them from
+///   the navigational graph
+/// * `return_dist` - Return distances
+///
+/// ### Returns
+///
+/// Tuple of (indices, optional distances)
+pub fn query_cagra_index_mlx_self(
+    index: &CagraSearchMlx,
+    k: usize,
+    query_params: Option<CagraMlxSearchParams>,
+    entry_points: Option<&[u32]>,
+    return_dist: bool,
+) -> KnnOptionResult<f32> {
+    let (indices, distances) = index.self_search(k, query_params, entry_points, 42)?;
+    Ok((indices, return_dist.then_some(distances)))
 }
 
 //////////////

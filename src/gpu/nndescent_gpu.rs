@@ -2483,8 +2483,49 @@ where
         let client = R::client(&self._device);
         let use_cosine = self.metric == Dist::Cosine;
 
+        let entry_flat = self.query_entry_points(queries_flat, n_queries, n_entry);
+
+        let result = cagra_search_batch_gpu(
+            queries_flat,
+            n_queries,
+            self.dim,
+            self.vectors_gpu.as_ref().unwrap(),
+            self.norms_gpu.as_ref().unwrap(),
+            self.nav_graph_gpu.as_ref().unwrap(),
+            self.n,
+            self.k,
+            k,
+            use_cosine,
+            seed,
+            &query_params,
+            Some(&entry_flat),
+            &client,
+        )?;
+
+        Ok(result)
+    }
+
+    /// Entry points the GPU beam search starts from for a batch of queries:
+    /// the medoid, then the `n_entry - 1` closest forest-router candidates.
+    ///
+    /// ### Params
+    ///
+    /// * `queries_flat` - Flattened query vectors, row-major `[n_queries, dim]`
+    /// * `n_queries` - Number of query vectors
+    /// * `n_entry` - Entry points per query
+    ///
+    /// ### Returns
+    ///
+    /// Flat `[n_queries * n_entry]` node ids
+    pub fn query_entry_points(
+        &self,
+        queries_flat: &[T],
+        n_queries: usize,
+        n_entry: usize,
+    ) -> Vec<u32> {
+        let use_cosine = self.metric == Dist::Cosine;
         let medoid = self.medoid;
-        let entry_flat: Vec<u32> = (0..n_queries)
+        (0..n_queries)
             .into_par_iter()
             .flat_map_iter(|i| {
                 let query = &queries_flat[i * self.dim..(i + 1) * self.dim];
@@ -2531,26 +2572,17 @@ where
                 final_entries.resize(n_entry, 0);
                 final_entries.into_iter()
             })
-            .collect();
+            .collect()
+    }
 
-        let result = cagra_search_batch_gpu(
-            queries_flat,
-            n_queries,
-            self.dim,
-            self.vectors_gpu.as_ref().unwrap(),
-            self.norms_gpu.as_ref().unwrap(),
-            self.nav_graph_gpu.as_ref().unwrap(),
-            self.n,
-            self.k,
-            k,
-            use_cosine,
-            seed,
-            &query_params,
-            Some(&entry_flat),
-            &client,
-        )?;
-
-        Ok(result)
+    /// CAGRA navigational graph, `n * k` node ids with `0x7FFFFFFF` in unfilled
+    /// slots.
+    ///
+    /// ### Returns
+    ///
+    /// The flat graph
+    pub fn nav_graph(&self) -> &[u32] {
+        &self.nav_graph
     }
 
     ///////////

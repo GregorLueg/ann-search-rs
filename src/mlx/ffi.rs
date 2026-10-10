@@ -448,6 +448,37 @@ impl Array {
     }
 }
 
+impl Array {
+    /// Copy a row-major u32 buffer into a new array.
+    ///
+    /// ### Params
+    ///
+    /// * `data` - Row-major values, `shape.iter().product()` of them
+    /// * `shape` - Array shape
+    ///
+    /// ### Returns
+    ///
+    /// The owned array
+    pub fn from_u32(data: &[u32], shape: &[i32]) -> Self {
+        debug_assert_eq!(
+            data.len(),
+            shape.iter().map(|&s| s as usize).product::<usize>()
+        );
+        // SAFETY: mlx-c copies `data`, so the borrow only needs to outlive
+        // the call.
+        Self {
+            raw: unsafe {
+                mlx_array_new_data(
+                    data.as_ptr().cast(),
+                    shape.as_ptr(),
+                    shape.len() as c_int,
+                    MLX_UINT32,
+                )
+            },
+        }
+    }
+}
+
 //////////////////
 // Metal kernel //
 //////////////////

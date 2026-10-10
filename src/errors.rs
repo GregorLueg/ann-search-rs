@@ -265,7 +265,7 @@ pub enum AnnSearchErrors {
     CubeclUtils(#[from] cubecl_utils_rs::CubeclUtilsErrors),
 
     /// Error for a dimensionality whose per-workgroup staging cannot fit
-    #[cfg(feature = "gpu")]
+    #[cfg(any(feature = "gpu", feature = "mlx"))]
     #[error(
         "A padded dimensionality of {chosen_dim} needs {required} bytes of shared memory per \
          workgroup, but this device offers only {available}. Reduce the dimensionality."
