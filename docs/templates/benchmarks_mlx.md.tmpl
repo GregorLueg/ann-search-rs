@@ -1,0 +1,199 @@
+## MLX indices benchmarks and parameter gridsearch
+
+Experimental. The same benchmarks as [the GPU ones](benchmarks_gpu.md), run on
+the MLX backend instead of wgpu. MLX drives Metal directly through mlx-c, so
+this is Apple Silicon only, f32 only, and needs the `mlx` feature plus an
+installed mlx-c (`brew install mlx-c`). Exhaustive and IVF:
+
+```bash
+cargo run --example gridsearch_mlx --features mlx --release
+```
+
+For the CAGRA style search:
+
+```bash
+cargo run --example gridsearch_cagra_mlx --features mlx --release
+```
+
+The parameters and data match the wgpu runs one to one, so the tables can be
+read side by side with [the GPU benchmarks](benchmarks_gpu.md). There is no MLX
+NSG path.
+
+## Table of Contents
+
+- [MLX exhaustive and IVF](#mlx-exhaustive-and-ivf-vs-cpu-exhaustive)
+- [MLX exhaustive and IVF on larger data](#larger-data-sets)
+- [CAGRA style index](#cagra-type-querying)
+- [CAGRA index on larger data](#cagra-on-larger-data-sets)
+
+### MLX exhaustive and IVF vs CPU exhaustive
+
+<details>
+<summary><b>MLX - Euclidean (Gaussian)</b>:</summary>
+<pre><code>
+<!-- BENCH:mlx:euclidean:gaussian:32 -->
+</code></pre>
+</details>
+
+---
+
+<details>
+<summary><b>MLX - Cosine (Gaussian)</b>:</summary>
+<pre><code>
+<!-- BENCH:mlx:cosine:gaussian:32 -->
+</code></pre>
+</details>
+
+---
+
+<details>
+<summary><b>MLX - Euclidean (Correlated)</b>:</summary>
+<pre><code>
+<!-- BENCH:mlx:euclidean:correlated:32 -->
+</code></pre>
+</details>
+
+---
+
+<details>
+<summary><b>MLX - Euclidean (LowRank)</b>:</summary>
+<pre><code>
+<!-- BENCH:mlx:euclidean:lowrank:32 -->
+</code></pre>
+</details>
+
+---
+
+<details>
+<summary><b>MLX - Euclidean (Cell; 128 dimensions)</b>:</summary>
+<pre><code>
+<!-- BENCH:mlx:euclidean:cell:128 -->
+</code></pre>
+</details>
+
+### Larger data sets
+
+<details>
+<summary><b>MLX-IVF (250k samples; 64 dimensions)</b>:</summary>
+<pre><code>
+<!-- BENCH:mlx:euclidean:cell:64:250000 -->
+</code></pre>
+</details>
+
+---
+
+<details>
+<summary><b>MLX-IVF (250k samples; 128 dimensions)</b>:</summary>
+<pre><code>
+<!-- BENCH:mlx:euclidean:cell:128:250000 -->
+</code></pre>
+</details>
+
+---
+
+<details>
+<summary><b>MLX-IVF (500k samples; 64 dimensions)</b>:</summary>
+<pre><code>
+<!-- BENCH:mlx:euclidean:cell:64:500000 -->
+</code></pre>
+</details>
+
+---
+
+<details>
+<summary><b>MLX-IVF (500k samples; 128 dimensions)</b>:</summary>
+<pre><code>
+<!-- BENCH:mlx:euclidean:cell:128:500000 -->
+</code></pre>
+</details>
+
+### CAGRA-type querying
+
+NN-Descent, the CAGRA pruning and the beam search all run as MLX Metal kernels.
+The parameters match [the wgpu CAGRA section](benchmarks_gpu.md#cagra-type-querying);
+`CagraMlxSearchParams` takes the same fields as `CagraGpuSearchParams`.
+
+<details>
+<summary><b>MLX NNDescent with CAGRA style pruning - Euclidean (Gaussian)</b>:</summary>
+<pre><code>
+<!-- BENCH:cagra_mlx:euclidean:gaussian:32 -->
+</code></pre>
+</details>
+
+---
+
+<details>
+<summary><b>MLX NNDescent with CAGRA style pruning - Cosine (Gaussian)</b>:</summary>
+<pre><code>
+<!-- BENCH:cagra_mlx:cosine:gaussian:32 -->
+</code></pre>
+</details>
+
+---
+
+<details>
+<summary><b>MLX NNDescent with CAGRA style pruning - Euclidean (Correlated)</b>:</summary>
+<pre><code>
+<!-- BENCH:cagra_mlx:euclidean:correlated:32 -->
+</code></pre>
+</details>
+
+---
+
+<details>
+<summary><b>MLX NNDescent with CAGRA style pruning - Euclidean (LowRank)</b>:</summary>
+<pre><code>
+<!-- BENCH:cagra_mlx:euclidean:lowrank:32 -->
+</code></pre>
+</details>
+
+---
+
+<details>
+<summary><b>MLX NNDescent with CAGRA style pruning - Euclidean (Cell; 128 dimensions)</b>:</summary>
+<pre><code>
+<!-- BENCH:cagra_mlx:euclidean:cell:128 -->
+</code></pre>
+</details>
+
+### CAGRA on larger data sets
+
+<details>
+<summary><b>MLX NNDescent with CAGRA style pruning (250k samples; 64 dimensions)</b>:</summary>
+<pre><code>
+<!-- BENCH:cagra_mlx:euclidean:cell:64:250000 -->
+</code></pre>
+</details>
+
+---
+
+<details>
+<summary><b>MLX NNDescent with CAGRA style pruning (250k samples; 128 dimensions)</b>:</summary>
+<pre><code>
+<!-- BENCH:cagra_mlx:euclidean:cell:128:250000 -->
+</code></pre>
+</details>
+
+---
+
+<details>
+<summary><b>MLX NNDescent with CAGRA style pruning (500k samples; 64 dimensions)</b>:</summary>
+<pre><code>
+<!-- BENCH:cagra_mlx:euclidean:cell:64:500000 -->
+</code></pre>
+</details>
+
+---
+
+<details>
+<summary><b>MLX NNDescent with CAGRA style pruning (500k samples; 128 dimensions)</b>:</summary>
+<pre><code>
+<!-- BENCH:cagra_mlx:euclidean:cell:128:500000 -->
+</code></pre>
+</details>
+
+### Runtime info
+
+<!-- RUNINFO -->
+*All benchmarks were run on M1 Max MacBook Pro with 64 GB unified memory.*
+*The GPU backend was MLX (mlx-c 0.7.0).*

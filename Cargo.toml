@@ -252,3 +252,11 @@ required-features = ["gpu"]
 name = "gpu_nndescent_kernels"
 harness = false
 required-features = ["gpu"]
+
+[[example]]
+name = "gridsearch_mlx"
+required-features = ["mlx"]
+
+[[example]]
+name = "gridsearch_cagra_mlx"
+required-features = ["mlx"]
