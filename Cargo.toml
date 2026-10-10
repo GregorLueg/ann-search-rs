@@ -148,6 +148,10 @@ name = "bench_mlx_ivf"
 required-features = ["gpu", "mlx", "synthetic"]
 
 [[example]]
+name = "bench_mlx_cagra"
+required-features = ["gpu", "mlx", "synthetic"]
+
+[[example]]
 name = "gridsearch_cagra"
 required-features = ["gpu"]
 
