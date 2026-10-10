@@ -3,6 +3,10 @@
 Changes to the `ann-search-rs` crate. The Python package `ann-search` has its
 own changelog at [`python/CHANGELOG.md`](python/CHANGELOG.md).
 
+## 0.11.0
+
+TO BE WRITTEN
+
 ## 0.10.1
 
 **Performance**
