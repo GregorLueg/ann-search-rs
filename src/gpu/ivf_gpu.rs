@@ -701,15 +701,30 @@ where
             &limits,
         )?;
 
-        match self.metric {
-            Dist::SquaredEuclidean if tile_fits(safe_worksize_y) => unsafe {
-                euclidean_tiled_reg::launch_unchecked::<T, R>(
+        let use_cosine = self.metric == Dist::Cosine;
+        // Euclidean never reads the norms; bind a one-element placeholder.
+        let no_norms = GpuTensor::<R, T>::from_slice(&[T::one()], vec![1], client)?;
+        let (q_norms, c_norms, d_norms) = if use_cosine {
+            (
+                query_norms_gpu.as_ref().unwrap(),
+                self.centroid_norms_gpu.as_ref().unwrap(),
+                self.norms_gpu.as_ref().unwrap(),
+            )
+        } else {
+            (&no_norms, &no_norms, &no_norms)
+        };
+
+        if tile_fits(safe_worksize_y) {
+            unsafe {
+                dist_tiled_reg::launch_unchecked::<T, R>(
                     client,
-                    reg_count.clone(),
+                    reg_count,
                     CubeDim::new_2d(WORKGROUP_SIZE_X, safe_worksize_y / TILE_Q as u32),
                     vec_size,
                     queries_gpu.clone().into_tensor_arg(),
                     self.centroids_gpu.clone().into_tensor_arg(),
+                    q_norms.clone().into_tensor_arg(),
+                    c_norms.clone().into_tensor_arg(),
                     centroid_dists_gpu.clone().into_tensor_arg(),
                     0u32,
                     0u32,
@@ -724,46 +739,20 @@ where
                     // centroids, not the database, and has not been measured
                     // against a blocked reduction axis.
                     dim_lines,
+                    use_cosine,
                 );
-            },
-            Dist::Cosine if tile_fits(safe_worksize_y) => unsafe {
-                cosine_tiled_reg::launch_unchecked::<T, R>(
+            }
+        } else {
+            unsafe {
+                dist_tiled::launch_unchecked::<T, R>(
                     client,
-                    reg_count.clone(),
-                    CubeDim::new_2d(WORKGROUP_SIZE_X, safe_worksize_y / TILE_Q as u32),
-                    vec_size,
-                    queries_gpu.clone().into_tensor_arg(),
-                    self.centroids_gpu.clone().into_tensor_arg(),
-                    query_norms_gpu.as_ref().unwrap().clone().into_tensor_arg(),
-                    self.centroid_norms_gpu
-                        .as_ref()
-                        .unwrap()
-                        .clone()
-                        .into_tensor_arg(),
-                    centroid_dists_gpu.clone().into_tensor_arg(),
-                    0u32,
-                    0u32,
-                    self.nlist as u32,
-                    n_queries as u32,
-                    self.nlist as u32,
-                    dim_lines,
-                    safe_worksize_y,
-                    TILE_D,
-                    TILE_Q,
-                    // Whole-row staging, i.e. one block: this path stages
-                    // centroids, not the database, and has not been measured
-                    // against a blocked reduction axis.
-                    dim_lines,
-                );
-            },
-            Dist::SquaredEuclidean => unsafe {
-                euclidean_tiled::launch_unchecked::<T, R>(
-                    client,
-                    tiled_count.clone(),
+                    tiled_count,
                     CubeDim::new_2d(WORKGROUP_SIZE_X, safe_worksize_y),
                     vec_size,
                     queries_gpu.clone().into_tensor_arg(),
                     self.centroids_gpu.clone().into_tensor_arg(),
+                    q_norms.clone().into_tensor_arg(),
+                    c_norms.clone().into_tensor_arg(),
                     centroid_dists_gpu.clone().into_tensor_arg(),
                     0u32,
                     self.nlist as u32,
@@ -771,32 +760,9 @@ where
                     self.nlist as u32,
                     dim_lines,
                     safe_worksize_y,
+                    use_cosine,
                 );
-            },
-            Dist::Cosine => unsafe {
-                cosine_tiled::launch_unchecked::<T, R>(
-                    client,
-                    tiled_count.clone(),
-                    CubeDim::new_2d(WORKGROUP_SIZE_X, safe_worksize_y),
-                    vec_size,
-                    queries_gpu.clone().into_tensor_arg(),
-                    self.centroids_gpu.clone().into_tensor_arg(),
-                    query_norms_gpu.as_ref().unwrap().clone().into_tensor_arg(),
-                    self.centroid_norms_gpu
-                        .as_ref()
-                        .unwrap()
-                        .clone()
-                        .into_tensor_arg(),
-                    centroid_dists_gpu.clone().into_tensor_arg(),
-                    0u32,
-                    self.nlist as u32,
-                    n_queries as u32,
-                    self.nlist as u32,
-                    dim_lines,
-                    safe_worksize_y,
-                );
-            },
-            Dist::Manhattan => unreachable!(),
+            }
         }
 
         // Per-query top-nprobe selection, expanded until reachable >= k. The
@@ -993,17 +959,6 @@ where
             let n_tiles = tiles.len() / IVF_TILE_FIELDS;
             let tiles_gpu = GpuTensor::<R, u32>::from_slice(&tiles, vec![tiles.len()], client)?;
             let (tile_gx, tile_gy) = grid_2d(n_tiles as u32, &limits)?;
-            let use_cosine = self.metric == Dist::Cosine;
-            // Euclidean never reads the norms; bind a one-element placeholder.
-            let no_norms = GpuTensor::<R, T>::from_slice(&[T::one()], vec![1], client)?;
-            let (q_norms, d_norms) = if use_cosine {
-                (
-                    query_norms_gpu.as_ref().unwrap(),
-                    self.norms_gpu.as_ref().unwrap(),
-                )
-            } else {
-                (&no_norms, &no_norms)
-            };
             unsafe {
                 ivf_tiled::launch_unchecked::<T, R>(
                     client,
@@ -1041,48 +996,27 @@ where
                 &limits,
             )?;
 
-            match self.metric {
-                Dist::SquaredEuclidean => unsafe {
-                    compute_ivf_mega_euclidean_cached::launch_unchecked::<T, R>(
-                        client,
-                        mega_count.clone(),
-                        CubeDim::new_2d(WORKGROUP_SIZE_X, safe_worksize_y),
-                        vec_size,
-                        queries_gpu.clone().into_tensor_arg(),
-                        self.vectors_gpu.clone().into_tensor_arg(),
-                        task_q_idx_gpu.into_tensor_arg(),
-                        task_db_start_gpu.into_tensor_arg(),
-                        task_write_offset_gpu.into_tensor_arg(),
-                        task_db_count_gpu.into_tensor_arg(),
-                        candidate_dists_gpu.clone().into_tensor_arg(),
-                        candidate_indices_gpu.clone().into_tensor_arg(),
-                        n_tasks as u32,
-                        dim_lines,
-                        safe_worksize_y,
-                    );
-                },
-                Dist::Cosine => unsafe {
-                    compute_ivf_mega_cosine_cached::launch_unchecked::<T, R>(
-                        client,
-                        mega_count.clone(),
-                        CubeDim::new_2d(WORKGROUP_SIZE_X, safe_worksize_y),
-                        vec_size,
-                        queries_gpu.clone().into_tensor_arg(),
-                        self.vectors_gpu.clone().into_tensor_arg(),
-                        query_norms_gpu.as_ref().unwrap().clone().into_tensor_arg(),
-                        self.norms_gpu.as_ref().unwrap().clone().into_tensor_arg(),
-                        task_q_idx_gpu.into_tensor_arg(),
-                        task_db_start_gpu.into_tensor_arg(),
-                        task_write_offset_gpu.into_tensor_arg(),
-                        task_db_count_gpu.into_tensor_arg(),
-                        candidate_dists_gpu.clone().into_tensor_arg(),
-                        candidate_indices_gpu.clone().into_tensor_arg(),
-                        n_tasks as u32,
-                        dim_lines,
-                        safe_worksize_y,
-                    );
-                },
-                Dist::Manhattan => unreachable!(),
+            unsafe {
+                compute_ivf_mega_cached::launch_unchecked::<T, R>(
+                    client,
+                    mega_count,
+                    CubeDim::new_2d(WORKGROUP_SIZE_X, safe_worksize_y),
+                    vec_size,
+                    queries_gpu.clone().into_tensor_arg(),
+                    self.vectors_gpu.clone().into_tensor_arg(),
+                    q_norms.clone().into_tensor_arg(),
+                    d_norms.clone().into_tensor_arg(),
+                    task_q_idx_gpu.into_tensor_arg(),
+                    task_db_start_gpu.into_tensor_arg(),
+                    task_write_offset_gpu.into_tensor_arg(),
+                    task_db_count_gpu.into_tensor_arg(),
+                    candidate_dists_gpu.clone().into_tensor_arg(),
+                    candidate_indices_gpu.clone().into_tensor_arg(),
+                    n_tasks as u32,
+                    dim_lines,
+                    safe_worksize_y,
+                    use_cosine,
+                );
             }
         }
 

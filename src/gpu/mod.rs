@@ -117,7 +117,7 @@ pub fn tile_fits(wg_y: u32) -> bool {
 
 /// Per-cube shared-memory footprint of the widest distance kernel.
 ///
-/// The worst case is `compute_ivf_mega_cosine_cached`: `s_query` holds
+/// The worst case is `compute_ivf_mega_cached`: `s_query` holds
 /// `wg_y * dim_padded` elements, `s_query_norms` another `wg_y`, and four u32
 /// task-metadata arrays contribute `wg_y` slots each.
 ///

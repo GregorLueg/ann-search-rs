@@ -140,8 +140,8 @@ impl Default for KMeansGpuParams {
 // Flash Assign //
 //////////////////
 
-/// One-thread-per-point Euclidean argmin, vectorised, centroids read straight
-/// from global memory.
+/// One-thread-per-point argmin, vectorised, centroids read straight from
+/// global memory.
 ///
 /// There is deliberately no shared-memory centroid tile. Every thread in a
 /// workgroup reads the same centroid element at the same time, so the value is
@@ -150,8 +150,10 @@ impl Default for KMeansGpuParams {
 /// memory that occupancy wants.
 ///
 /// The point is held in registers as `dim_lines` vectors rather than exploded
-/// to `dim_lines * LINE_SIZE` scalars. Squared differences accumulate in a
-/// vector and are reduced horizontally once per centroid.
+/// to `dim_lines * LINE_SIZE` scalars. Squared differences (or products, under
+/// cosine) accumulate in a vector and are reduced horizontally once per
+/// centroid. Cosine minimises `1 - dot(x, c) / (||x|| * ||c||)` from
+/// precomputed norms.
 ///
 /// ### Type parameters
 ///
@@ -163,25 +165,33 @@ impl Default for KMeansGpuParams {
 ///
 /// * `data` - Input data vectors `[n, dim]` in storage precision `S`
 /// * `centroids` - Centroid matrix `[k, dim]` in accumulator precision `A`
+/// * `point_norms` - Precomputed L2 norms of each data point `[n]`; read only
+///   under cosine
+/// * `centroid_norms` - Precomputed L2 norms of each centroid `[k]`; read only
+///   under cosine
 /// * `assignments` - Output hard assignment indices `[n]`
 /// * `n_samples` - Total number of data points
 /// * `k` - Number of clusters
 /// * `dim_lines` - Vectorised dimension (`dim / LINE_SIZE`); comptime
 /// * `wg_size` - Workgroup size; comptime
+/// * `use_cosine` - Cosine instead of squared Euclidean; comptime
 ///
 /// ### Grid mapping
 ///
 /// * `(CUBE_POS_Y * CUBE_COUNT_X + CUBE_POS_X) * wg_size + UNIT_POS_X` -> point
 ///   index
 #[cube(launch_unchecked)]
-pub fn flash_assign_euclidean_vec<S: Float, A: Float, N: Size>(
+pub fn flash_assign_vec<S: Float, A: Float, N: Size>(
     data: &Tensor<Vector<S, N>>,
     centroids: &Tensor<Vector<A, N>>,
+    point_norms: &Tensor<A>,
+    centroid_norms: &Tensor<A>,
     assignments: &mut Tensor<u32>,
     n_samples: u32,
     k: u32,
     #[comptime] dim_lines: usize,
     #[comptime] wg_size: u32,
+    #[comptime] use_cosine: bool,
 ) {
     let point_idx = (CUBE_POS_Y * CUBE_COUNT_X + CUBE_POS_X) * wg_size + UNIT_POS_X;
     if point_idx >= n_samples {
@@ -200,6 +210,10 @@ pub fn flash_assign_euclidean_vec<S: Float, A: Float, N: Size>(
         }
         p[i] = pv;
     }
+    let mut pnorm = A::new(1.0_f32);
+    if use_cosine {
+        pnorm = point_norms[point_idx as usize];
+    }
 
     let mut best_dist = A::new(f32::MAX);
     let mut best_idx = 0u32;
@@ -217,8 +231,12 @@ pub fn flash_assign_euclidean_vec<S: Float, A: Float, N: Size>(
             let pv = p[i];
             #[unroll]
             for u in 0..CENTROID_UNROLL {
-                let diff = pv - centroids[(c as usize + u) * dim_lines + i];
-                accs[u] += diff * diff;
+                if use_cosine {
+                    accs[u] += pv * centroids[(c as usize + u) * dim_lines + i];
+                } else {
+                    let diff = pv - centroids[(c as usize + u) * dim_lines + i];
+                    accs[u] += diff * diff;
+                }
             }
         }
         #[unroll]
@@ -228,6 +246,9 @@ pub fn flash_assign_euclidean_vec<S: Float, A: Float, N: Size>(
             #[unroll]
             for lane in 0..LINE_SIZE {
                 sum += av[lane];
+            }
+            if use_cosine {
+                sum = A::new(1.0_f32) - sum / (pnorm * centroid_norms[c as usize + u]);
             }
             if sum < best_dist {
                 best_dist = sum;
@@ -242,13 +263,20 @@ pub fn flash_assign_euclidean_vec<S: Float, A: Float, N: Size>(
         let cbase = c as usize * dim_lines;
         let mut acc = Vector::<A, N>::new(A::new(0.0_f32));
         for i in 0..dim_lines {
-            let diff = p[i] - centroids[cbase + i];
-            acc += diff * diff;
+            if use_cosine {
+                acc += p[i] * centroids[cbase + i];
+            } else {
+                let diff = p[i] - centroids[cbase + i];
+                acc += diff * diff;
+            }
         }
         let mut sum = A::new(0.0_f32);
         #[unroll]
         for lane in 0..LINE_SIZE {
             sum += acc[lane];
+        }
+        if use_cosine {
+            sum = A::new(1.0_f32) - sum / (pnorm * centroid_norms[c as usize]);
         }
         if sum < best_dist {
             best_dist = sum;
@@ -260,123 +288,8 @@ pub fn flash_assign_euclidean_vec<S: Float, A: Float, N: Size>(
     assignments[point_idx as usize] = best_idx;
 }
 
-/// Cosine analogue of [`fn@flash_assign_euclidean_vec`]. Uses precomputed L2
-/// norms; minimises `1 - dot(x, c) / (||x|| * ||c||)`.
-///
-/// ### Type parameters
-///
-/// * `S` - Storage precision of the data buffer
-/// * `A` - Accumulator precision; all distance arithmetic runs in `A`
-/// * `N` - Vectorisation width
-///
-/// ### Params
-///
-/// * `data` - Input data vectors `[n, dim]` in storage precision `S`
-/// * `centroids` - Centroid matrix `[k, dim]` in accumulator precision `A`
-/// * `point_norms` - Precomputed L2 norms of each data point `[n]`
-/// * `centroid_norms` - Precomputed L2 norms of each centroid `[k]`
-/// * `assignments` - Output hard assignment indices `[n]`
-/// * `n_samples` - Total number of data points
-/// * `k` - Number of clusters
-/// * `dim_lines` - Vectorised dimension (`dim / LINE_SIZE`); comptime
-/// * `wg_size` - Workgroup size; comptime
-///
-/// ### Grid mapping
-///
-/// * `(CUBE_POS_Y * CUBE_COUNT_X + CUBE_POS_X) * wg_size + UNIT_POS_X` -> point
-///   index
-#[cube(launch_unchecked)]
-pub fn flash_assign_cosine_vec<S: Float, A: Float, N: Size>(
-    data: &Tensor<Vector<S, N>>,
-    centroids: &Tensor<Vector<A, N>>,
-    point_norms: &Tensor<A>,
-    centroid_norms: &Tensor<A>,
-    assignments: &mut Tensor<u32>,
-    n_samples: u32,
-    k: u32,
-    #[comptime] dim_lines: usize,
-    #[comptime] wg_size: u32,
-) {
-    let point_idx = (CUBE_POS_Y * CUBE_COUNT_X + CUBE_POS_X) * wg_size + UNIT_POS_X;
-    if point_idx >= n_samples {
-        terminate!();
-    }
-    let p_base = point_idx as usize * dim_lines;
-
-    let mut p = Array::<Vector<A, N>>::new(dim_lines);
-    for i in 0..dim_lines {
-        let sl = data[p_base + i];
-        let mut pv = Vector::<A, N>::empty();
-        #[unroll]
-        for lane in 0..LINE_SIZE {
-            pv[lane] = A::cast_from(sl[lane]);
-        }
-        p[i] = pv;
-    }
-    let pnorm = point_norms[point_idx as usize];
-
-    let mut best_dist = A::new(f32::MAX);
-    let mut best_idx = 0u32;
-
-    let cu = CENTROID_UNROLL as u32;
-    let mut accs = Array::<Vector<A, N>>::new(CENTROID_UNROLL);
-
-    let mut c = 0u32;
-    while c + cu <= k {
-        #[unroll]
-        for u in 0..CENTROID_UNROLL {
-            accs[u] = Vector::<A, N>::new(A::new(0.0_f32));
-        }
-        for i in 0..dim_lines {
-            let pv = p[i];
-            #[unroll]
-            for u in 0..CENTROID_UNROLL {
-                accs[u] += pv * centroids[(c as usize + u) * dim_lines + i];
-            }
-        }
-        #[unroll]
-        for u in 0..CENTROID_UNROLL {
-            let av = accs[u];
-            let mut dot = A::new(0.0_f32);
-            #[unroll]
-            for lane in 0..LINE_SIZE {
-                dot += av[lane];
-            }
-            let dist = A::new(1.0_f32) - dot / (pnorm * centroid_norms[c as usize + u]);
-            if dist < best_dist {
-                best_dist = dist;
-                best_idx = c + u as u32;
-            }
-        }
-        c += cu;
-    }
-
-    // Tail for `k` not divisible by CENTROID_UNROLL.
-    while c < k {
-        let cbase = c as usize * dim_lines;
-        let mut acc = Vector::<A, N>::new(A::new(0.0_f32));
-        for i in 0..dim_lines {
-            acc += p[i] * centroids[cbase + i];
-        }
-        let mut dot = A::new(0.0_f32);
-        #[unroll]
-        for lane in 0..LINE_SIZE {
-            dot += acc[lane];
-        }
-        let dist = A::new(1.0_f32) - dot / (pnorm * centroid_norms[c as usize]);
-        if dist < best_dist {
-            best_dist = dist;
-            best_idx = c;
-        }
-        c += 1u32;
-    }
-
-    assignments[point_idx as usize] = best_idx;
-}
-
 /// Dispatch the appropriate assignment kernel and write results into a
-/// device-resident buffer. Selects between [`fn@flash_assign_euclidean_vec`]
-/// and [`fn@flash_assign_cosine_vec`] based on `metric`.
+/// device-resident buffer via [`fn@flash_assign_vec`].
 ///
 /// ### Type params
 ///
@@ -428,40 +341,29 @@ where
     let count = CubeCount::Static(gx, gy, 1);
     let cdim = CubeDim::new_1d(WORKGROUP_128);
 
-    match *metric {
-        Dist::SquaredEuclidean => unsafe {
-            flash_assign_euclidean_vec::launch_unchecked::<S, A, R>(
-                client,
-                count,
-                cdim,
-                vec_size,
-                data_gpu.clone().into_tensor_arg(),
-                cent_gpu.clone().into_tensor_arg(),
-                assign_gpu.clone().into_tensor_arg(),
-                n as u32,
-                k as u32,
-                dim_lines,
-                WORKGROUP_128,
-            );
-        },
-        Dist::Cosine => unsafe {
-            flash_assign_cosine_vec::launch_unchecked::<S, A, R>(
-                client,
-                count,
-                cdim,
-                vec_size,
-                data_gpu.clone().into_tensor_arg(),
-                cent_gpu.clone().into_tensor_arg(),
-                pnorm_gpu.clone().into_tensor_arg(),
-                cnorm_gpu.clone().into_tensor_arg(),
-                assign_gpu.clone().into_tensor_arg(),
-                n as u32,
-                k as u32,
-                dim_lines,
-                WORKGROUP_128,
-            );
-        },
+    let use_cosine = match *metric {
+        Dist::SquaredEuclidean => false,
+        Dist::Cosine => true,
         Dist::Manhattan => unreachable!("Manhattan distance is not supported!"),
+    };
+
+    unsafe {
+        flash_assign_vec::launch_unchecked::<S, A, R>(
+            client,
+            count,
+            cdim,
+            vec_size,
+            data_gpu.clone().into_tensor_arg(),
+            cent_gpu.clone().into_tensor_arg(),
+            pnorm_gpu.clone().into_tensor_arg(),
+            cnorm_gpu.clone().into_tensor_arg(),
+            assign_gpu.clone().into_tensor_arg(),
+            n as u32,
+            k as u32,
+            dim_lines,
+            WORKGROUP_128,
+            use_cosine,
+        );
     }
 
     Ok(())
@@ -471,9 +373,9 @@ where
 // k-means || init //
 /////////////////////
 
-/// Squared Euclidean distance from each point to its nearest candidate.
+/// Distance from each point to its nearest candidate.
 ///
-/// Same traversal as [`fn@flash_assign_euclidean_vec`], but it keeps the
+/// Same traversal as [`fn@flash_assign_vec`], but it keeps the
 /// distance rather than the index. This is the D² pass of k-means||, which
 /// dominates that algorithm: it runs `ln(k) + 1` times against a candidate set
 /// growing by `2k` each round, so at n = 1e6, k = 100 it is n * dim * 2005
@@ -489,25 +391,33 @@ where
 ///
 /// * `data` - Input data vectors `[n, dim]` in storage precision `S`
 /// * `cands` - Candidate centres `[k, dim]` in accumulator precision `A`
+/// * `point_norms` - Precomputed L2 norms of each data point `[n]`; read only
+///   under cosine
+/// * `cand_norms` - Precomputed L2 norms of each candidate `[k]`; read only
+///   under cosine
 /// * `out` - Output nearest-candidate distances `[n]`
 /// * `n_samples` - Total number of data points
 /// * `k` - Number of candidates
 /// * `dim_lines` - Vectorised dimension (`dim / LINE_SIZE`); comptime
 /// * `wg_size` - Workgroup size; comptime
+/// * `use_cosine` - Cosine instead of squared Euclidean; comptime
 ///
 /// ### Grid mapping
 ///
 /// * `(CUBE_POS_Y * CUBE_COUNT_X + CUBE_POS_X) * wg_size + UNIT_POS_X` -> point
 ///   index
 #[cube(launch_unchecked)]
-pub fn min_dist_euclidean_vec<S: Float, A: Float, N: Size>(
+pub fn min_dist_vec<S: Float, A: Float, N: Size>(
     data: &Tensor<Vector<S, N>>,
     cands: &Tensor<Vector<A, N>>,
+    point_norms: &Tensor<A>,
+    cand_norms: &Tensor<A>,
     out: &mut Tensor<A>,
     n_samples: u32,
     k: u32,
     #[comptime] dim_lines: usize,
     #[comptime] wg_size: u32,
+    #[comptime] use_cosine: bool,
 ) {
     let point_idx = (CUBE_POS_Y * CUBE_COUNT_X + CUBE_POS_X) * wg_size + UNIT_POS_X;
     if point_idx >= n_samples {
@@ -525,6 +435,10 @@ pub fn min_dist_euclidean_vec<S: Float, A: Float, N: Size>(
         }
         p[i] = pv;
     }
+    let mut pnorm = A::new(1.0_f32);
+    if use_cosine {
+        pnorm = point_norms[point_idx as usize];
+    }
 
     let mut best = A::new(f32::MAX);
 
@@ -541,8 +455,12 @@ pub fn min_dist_euclidean_vec<S: Float, A: Float, N: Size>(
             let pv = p[i];
             #[unroll]
             for u in 0..CENTROID_UNROLL {
-                let diff = pv - cands[(c as usize + u) * dim_lines + i];
-                accs[u] += diff * diff;
+                if use_cosine {
+                    accs[u] += pv * cands[(c as usize + u) * dim_lines + i];
+                } else {
+                    let diff = pv - cands[(c as usize + u) * dim_lines + i];
+                    accs[u] += diff * diff;
+                }
             }
         }
         #[unroll]
@@ -552,6 +470,9 @@ pub fn min_dist_euclidean_vec<S: Float, A: Float, N: Size>(
             #[unroll]
             for lane in 0..LINE_SIZE {
                 sum += av[lane];
+            }
+            if use_cosine {
+                sum = A::new(1.0_f32) - sum / (pnorm * cand_norms[c as usize + u]);
             }
             if sum < best {
                 best = sum;
@@ -564,130 +485,23 @@ pub fn min_dist_euclidean_vec<S: Float, A: Float, N: Size>(
         let cbase = c as usize * dim_lines;
         let mut acc = Vector::<A, N>::new(A::new(0.0_f32));
         for i in 0..dim_lines {
-            let diff = p[i] - cands[cbase + i];
-            acc += diff * diff;
+            if use_cosine {
+                acc += p[i] * cands[cbase + i];
+            } else {
+                let diff = p[i] - cands[cbase + i];
+                acc += diff * diff;
+            }
         }
         let mut sum = A::new(0.0_f32);
         #[unroll]
         for lane in 0..LINE_SIZE {
             sum += acc[lane];
         }
+        if use_cosine {
+            sum = A::new(1.0_f32) - sum / (pnorm * cand_norms[c as usize]);
+        }
         if sum < best {
             best = sum;
-        }
-        c += 1u32;
-    }
-
-    // Running minimum across rounds: `out` starts at +inf and each round
-    // only scores the candidates it added.
-    if best < out[point_idx as usize] {
-        out[point_idx as usize] = best;
-    }
-}
-
-/// Cosine analogue of [`fn@min_dist_euclidean_vec`].
-///
-/// ### Type parameters
-///
-/// * `S` - Storage precision of the data buffer
-/// * `A` - Accumulator precision
-/// * `N` - Vectorisation width
-///
-/// ### Params
-///
-/// * `data` - Input data vectors `[n, dim]` in storage precision `S`
-/// * `cands` - Candidate centres `[k, dim]` in accumulator precision `A`
-/// * `point_norms` - Precomputed L2 norms of each data point `[n]`
-/// * `cand_norms` - Precomputed L2 norms of each candidate `[k]`
-/// * `out` - Output nearest-candidate distances `[n]`
-/// * `n_samples` - Total number of data points
-/// * `k` - Number of candidates
-/// * `dim_lines` - Vectorised dimension (`dim / LINE_SIZE`); comptime
-/// * `wg_size` - Workgroup size; comptime
-///
-/// ### Grid mapping
-///
-/// * `(CUBE_POS_Y * CUBE_COUNT_X + CUBE_POS_X) * wg_size + UNIT_POS_X` -> point
-///   index
-#[cube(launch_unchecked)]
-pub fn min_dist_cosine_vec<S: Float, A: Float, N: Size>(
-    data: &Tensor<Vector<S, N>>,
-    cands: &Tensor<Vector<A, N>>,
-    point_norms: &Tensor<A>,
-    cand_norms: &Tensor<A>,
-    out: &mut Tensor<A>,
-    n_samples: u32,
-    k: u32,
-    #[comptime] dim_lines: usize,
-    #[comptime] wg_size: u32,
-) {
-    let point_idx = (CUBE_POS_Y * CUBE_COUNT_X + CUBE_POS_X) * wg_size + UNIT_POS_X;
-    if point_idx >= n_samples {
-        terminate!();
-    }
-    let p_base = point_idx as usize * dim_lines;
-
-    let mut p = Array::<Vector<A, N>>::new(dim_lines);
-    for i in 0..dim_lines {
-        let sl = data[p_base + i];
-        let mut pv = Vector::<A, N>::empty();
-        #[unroll]
-        for lane in 0..LINE_SIZE {
-            pv[lane] = A::cast_from(sl[lane]);
-        }
-        p[i] = pv;
-    }
-    let pnorm = point_norms[point_idx as usize];
-
-    let mut best = A::new(f32::MAX);
-
-    let cu = CENTROID_UNROLL as u32;
-    let mut accs = Array::<Vector<A, N>>::new(CENTROID_UNROLL);
-
-    let mut c = 0u32;
-    while c + cu <= k {
-        #[unroll]
-        for u in 0..CENTROID_UNROLL {
-            accs[u] = Vector::<A, N>::new(A::new(0.0_f32));
-        }
-        for i in 0..dim_lines {
-            let pv = p[i];
-            #[unroll]
-            for u in 0..CENTROID_UNROLL {
-                accs[u] += pv * cands[(c as usize + u) * dim_lines + i];
-            }
-        }
-        #[unroll]
-        for u in 0..CENTROID_UNROLL {
-            let av = accs[u];
-            let mut dot = A::new(0.0_f32);
-            #[unroll]
-            for lane in 0..LINE_SIZE {
-                dot += av[lane];
-            }
-            let dist = A::new(1.0_f32) - dot / (pnorm * cand_norms[c as usize + u]);
-            if dist < best {
-                best = dist;
-            }
-        }
-        c += cu;
-    }
-
-    // Tail for `k` not divisible by CENTROID_UNROLL.
-    while c < k {
-        let cbase = c as usize * dim_lines;
-        let mut acc = Vector::<A, N>::new(A::new(0.0_f32));
-        for i in 0..dim_lines {
-            acc += p[i] * cands[cbase + i];
-        }
-        let mut dot = A::new(0.0_f32);
-        #[unroll]
-        for lane in 0..LINE_SIZE {
-            dot += acc[lane];
-        }
-        let dist = A::new(1.0_f32) - dot / (pnorm * cand_norms[c as usize]);
-        if dist < best {
-            best = dist;
         }
         c += 1u32;
     }
@@ -749,40 +563,29 @@ where
     let count = CubeCount::Static(gx, gy, 1);
     let cdim = CubeDim::new_1d(WORKGROUP_128);
 
-    match *metric {
-        Dist::SquaredEuclidean => unsafe {
-            min_dist_euclidean_vec::launch_unchecked::<S, A, R>(
-                client,
-                count,
-                cdim,
-                vec_size,
-                data_gpu.clone().into_tensor_arg(),
-                cand_gpu.clone().into_tensor_arg(),
-                out_gpu.clone().into_tensor_arg(),
-                n as u32,
-                k as u32,
-                dim_lines,
-                WORKGROUP_128,
-            );
-        },
-        Dist::Cosine => unsafe {
-            min_dist_cosine_vec::launch_unchecked::<S, A, R>(
-                client,
-                count,
-                cdim,
-                vec_size,
-                data_gpu.clone().into_tensor_arg(),
-                cand_gpu.clone().into_tensor_arg(),
-                pnorm_gpu.clone().into_tensor_arg(),
-                cnorm_gpu.clone().into_tensor_arg(),
-                out_gpu.clone().into_tensor_arg(),
-                n as u32,
-                k as u32,
-                dim_lines,
-                WORKGROUP_128,
-            );
-        },
+    let use_cosine = match *metric {
+        Dist::SquaredEuclidean => false,
+        Dist::Cosine => true,
         Dist::Manhattan => unreachable!("Manhattan distance is not supported!"),
+    };
+
+    unsafe {
+        min_dist_vec::launch_unchecked::<S, A, R>(
+            client,
+            count,
+            cdim,
+            vec_size,
+            data_gpu.clone().into_tensor_arg(),
+            cand_gpu.clone().into_tensor_arg(),
+            pnorm_gpu.clone().into_tensor_arg(),
+            cnorm_gpu.clone().into_tensor_arg(),
+            out_gpu.clone().into_tensor_arg(),
+            n as u32,
+            k as u32,
+            dim_lines,
+            WORKGROUP_128,
+            use_cosine,
+        );
     }
 
     Ok(())

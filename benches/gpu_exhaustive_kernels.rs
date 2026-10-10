@@ -171,7 +171,7 @@ fn make_topk_input<R: Runtime>(
 }
 
 // ──────────────────────────────────────────────
-// 1. Distance kernel only (euclidean_tiled)
+// 1. Distance kernel only (dist_tiled)
 // ──────────────────────────────────────────────
 
 struct DistanceBench<R: Runtime> {
@@ -262,51 +262,30 @@ impl<R: Runtime> Benchmark for DistanceBench<R> {
         let (grid_y, grid_z) =
             grid_2d((nq as u32).div_ceil(wg_y), &limits).expect("grid too large");
 
-        match self.cfg.metric {
-            Dist::Cosine => unsafe {
-                cosine_tiled::launch_unchecked::<f32, R>(
-                    &self.client,
-                    CubeCount::Static(grid_x, grid_y, grid_z),
-                    CubeDim::new_2d(WORKGROUP_SIZE_X, wg_y),
-                    vec_size,
-                    input.query_gpu.into_tensor_arg(),
-                    input.db_gpu.into_tensor_arg(),
-                    input
-                        .query_norms_gpu
-                        .as_ref()
-                        .expect("cosine needs query norms")
-                        .into_tensor_arg(),
-                    input
-                        .db_norms_gpu
-                        .as_ref()
-                        .expect("cosine needs db norms")
-                        .into_tensor_arg(),
-                    input.distances_gpu.into_tensor_arg(),
-                    0u32,
-                    ndb as u32,
-                    nq as u32,
-                    ndb as u32,
-                    dim_lines,
-                    wg_y,
-                );
-            },
-            _ => unsafe {
-                euclidean_tiled::launch_unchecked::<f32, R>(
-                    &self.client,
-                    CubeCount::Static(grid_x, grid_y, grid_z),
-                    CubeDim::new_2d(WORKGROUP_SIZE_X, wg_y),
-                    vec_size,
-                    input.query_gpu.into_tensor_arg(),
-                    input.db_gpu.into_tensor_arg(),
-                    input.distances_gpu.into_tensor_arg(),
-                    0u32,
-                    ndb as u32,
-                    nq as u32,
-                    ndb as u32,
-                    dim_lines,
-                    wg_y,
-                );
-            },
+        let use_cosine = self.cfg.metric == Dist::Cosine;
+        let dummy = GpuTensor::<R, f32>::from_slice(&[1.0], vec![1], &self.client)
+            .expect("GPU allocation failed");
+        let q_norms = input.query_norms_gpu.as_ref().unwrap_or(&dummy);
+        let d_norms = input.db_norms_gpu.as_ref().unwrap_or(&dummy);
+        unsafe {
+            dist_tiled::launch_unchecked::<f32, R>(
+                &self.client,
+                CubeCount::Static(grid_x, grid_y, grid_z),
+                CubeDim::new_2d(WORKGROUP_SIZE_X, wg_y),
+                vec_size,
+                input.query_gpu.into_tensor_arg(),
+                input.db_gpu.into_tensor_arg(),
+                q_norms.into_tensor_arg(),
+                d_norms.into_tensor_arg(),
+                input.distances_gpu.into_tensor_arg(),
+                0u32,
+                ndb as u32,
+                nq as u32,
+                ndb as u32,
+                dim_lines,
+                wg_y,
+                use_cosine,
+            );
         }
 
         Ok(())
@@ -365,59 +344,34 @@ impl<R: Runtime> Benchmark for DistanceRegBench<R> {
         let (grid_y, grid_z) =
             grid_2d((nq as u32).div_ceil(wg_y), &limits).expect("grid too large");
 
-        match self.cfg.metric {
-            Dist::Cosine => unsafe {
-                cosine_tiled_reg::launch_unchecked::<f32, R>(
-                    &self.client,
-                    CubeCount::Static(grid_x, grid_y, grid_z),
-                    CubeDim::new_2d(WORKGROUP_SIZE_X, threads_y),
-                    vec_size,
-                    input.query_gpu.into_tensor_arg(),
-                    input.db_gpu.into_tensor_arg(),
-                    input
-                        .query_norms_gpu
-                        .as_ref()
-                        .expect("cosine needs query norms")
-                        .into_tensor_arg(),
-                    input
-                        .db_norms_gpu
-                        .as_ref()
-                        .expect("cosine needs db norms")
-                        .into_tensor_arg(),
-                    input.distances_gpu.into_tensor_arg(),
-                    0u32,
-                    0u32,
-                    ndb as u32,
-                    nq as u32,
-                    ndb as u32,
-                    dim_lines,
-                    wg_y,
-                    TILE_D,
-                    TILE_Q,
-                    plan.kb_lines,
-                );
-            },
-            _ => unsafe {
-                euclidean_tiled_reg::launch_unchecked::<f32, R>(
-                    &self.client,
-                    CubeCount::Static(grid_x, grid_y, grid_z),
-                    CubeDim::new_2d(WORKGROUP_SIZE_X, threads_y),
-                    vec_size,
-                    input.query_gpu.into_tensor_arg(),
-                    input.db_gpu.into_tensor_arg(),
-                    input.distances_gpu.into_tensor_arg(),
-                    0u32,
-                    0u32,
-                    ndb as u32,
-                    nq as u32,
-                    ndb as u32,
-                    dim_lines,
-                    wg_y,
-                    TILE_D,
-                    TILE_Q,
-                    plan.kb_lines,
-                );
-            },
+        let use_cosine = self.cfg.metric == Dist::Cosine;
+        let dummy = GpuTensor::<R, f32>::from_slice(&[1.0], vec![1], &self.client)
+            .expect("GPU allocation failed");
+        let q_norms = input.query_norms_gpu.as_ref().unwrap_or(&dummy);
+        let d_norms = input.db_norms_gpu.as_ref().unwrap_or(&dummy);
+        unsafe {
+            dist_tiled_reg::launch_unchecked::<f32, R>(
+                &self.client,
+                CubeCount::Static(grid_x, grid_y, grid_z),
+                CubeDim::new_2d(WORKGROUP_SIZE_X, threads_y),
+                vec_size,
+                input.query_gpu.into_tensor_arg(),
+                input.db_gpu.into_tensor_arg(),
+                q_norms.into_tensor_arg(),
+                d_norms.into_tensor_arg(),
+                input.distances_gpu.into_tensor_arg(),
+                0u32,
+                0u32,
+                ndb as u32,
+                nq as u32,
+                ndb as u32,
+                dim_lines,
+                wg_y,
+                TILE_D,
+                TILE_Q,
+                plan.kb_lines,
+                use_cosine,
+            );
         }
 
         Ok(())
