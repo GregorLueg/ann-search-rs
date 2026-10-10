@@ -218,24 +218,6 @@ pub fn exh_smem_bytes(wg_y: u32, kb_lines: usize, elem_bytes: usize) -> usize {
     wg_y as usize * kb_lines * LINE_SIZE * elem_bytes
 }
 
-/// Per-cube shared-memory footprint of the cluster-major IVF tiled kernel.
-///
-/// The same query staging as the exhaustive kernels; per-task metadata is read
-/// from global memory, not staged.
-///
-/// ### Params
-///
-/// * `wg_y` - Tasks staged per cube
-/// * `kb_lines` - Reduction lines staged per block
-/// * `elem_bytes` - Size of the float element type in bytes
-///
-/// ### Returns
-///
-/// Bytes of shared memory one cube allocates.
-pub fn ivf_tiled_smem_bytes(wg_y: u32, kb_lines: usize, elem_bytes: usize) -> usize {
-    exh_smem_bytes(wg_y, kb_lines, elem_bytes)
-}
-
 /// Plan the query staging for the register-tiled exhaustive kernels.
 ///
 /// Holds the query tile at [`EXH_WG_Y`] rows and blocks the reduction axis at
@@ -786,12 +768,6 @@ mod tests {
                 }
             }
         }
-    }
-
-    #[test]
-    fn test_ivf_tiled_footprint_fits_the_exhaustive_plan() {
-        let plan = plan_exhaustive_staging(128, 4, &apple()).unwrap();
-        assert!(ivf_tiled_smem_bytes(plan.wg_y, plan.kb_lines, 4) <= apple().max_shared_bytes);
     }
 
     /// A device with a quarter of the units cannot run a 32-row tile, and the

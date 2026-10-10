@@ -20,10 +20,6 @@ use crate::utils::k_means_utils::*;
 // Consts //
 ////////////
 
-/// Maximum number of queries processed in a single GPU batch to avoid
-/// exhausting VRAM
-const IVF_GPU_QUERY_BATCH_SIZE: usize = 100_000;
-
 /// Target maximum size for the candidate buffer in megabytes
 ///
 /// Sets the query batch size through [`IvfIndexGpu::calculate_safe_batch_size`],
@@ -148,8 +144,9 @@ fn reorganise_by_cluster<T: Float + Copy + Send + Sync + Sum>(
 /// - Centroids kept on GPU for fast probe selection
 /// - Query pipeline:
 ///   1. Compute all query-centroid distances (1 kernel)
-///   2. Select top nprobe clusters per query (CPU)
-///   3. For each cluster: batch all queries probing it into one kernel
+///   2. Select the probed clusters per query, expanded until they can reach `k`
+///   3. Score every (query, probed cluster) pair in one cluster-major tiled
+///      launch, then reduce each query's candidates to its top `k`
 ///
 /// ### Type Parameters
 ///
@@ -398,9 +395,8 @@ where
     /// * `queries_flat` - The query vector flattened
     /// * `n_queries` - The number of queries
     /// * `k` - Number of neighbours per query
-    /// * `nprobe` - Number of clusters to search (defaults to √nlist)
-    /// * `nquery` - Number of vectors to load in one go into the GPU. If not
-    ///   provided, it will default to `100_000`.
+    /// * `nprobe` - Number of clusters to search, already resolved
+    /// * `nquery` - Queries per GPU batch
     /// * `verbose` - Controls the verbosity of the function
     ///
     /// ### Returns
@@ -417,15 +413,11 @@ where
         queries_flat: &[T],
         n_queries: usize,
         k: usize,
-        nprobe: Option<usize>,
-        nquery: Option<usize>,
+        nprobe: usize,
+        nquery: usize,
         client: &ComputeClient<R>,
         verbose: bool,
     ) -> KnnResult<T> {
-        let nprobe = nprobe
-            .unwrap_or_else(|| ((self.nlist as f64).sqrt() as usize).max(1))
-            .min(self.nlist);
-        let nquery = nquery.unwrap_or(IVF_GPU_QUERY_BATCH_SIZE);
         if verbose {
             println!(
                 "Using nquery batch size: {}",
@@ -493,8 +485,8 @@ where
     /// * `query_mat` - Query vectors [n_queries, dim]
     /// * `k` - Number of neighbours per query
     /// * `nprobe` - Number of clusters to search (defaults to √nlist)
-    /// * `nquery` - Number of vectors to load in one go into the GPU. If not
-    ///   provided, it will default to `100_000`.
+    /// * `nquery` - Queries per GPU batch. Defaults to what keeps the candidate
+    ///   buffer near `TARGET_BUFFER_MB`.
     /// * `verbose` - Controls verbosity of the function.
     ///
     /// ### Returns
@@ -514,9 +506,8 @@ where
         let client: ComputeClient<R> = R::client(&self.device);
 
         let limits = GpuLimits::from_client(&client);
-        let nprobe_val = nprobe.unwrap_or(((self.nlist as f32).sqrt() as usize).max(1));
-        let batch_size =
-            nquery.unwrap_or_else(|| self.calculate_safe_batch_size(nprobe_val, &limits));
+        let nprobe = self.resolve_nprobe(nprobe);
+        let batch_size = nquery.unwrap_or_else(|| self.calculate_safe_batch_size(nprobe, &limits));
 
         let queries_padded = if self.dim_padded != self.dim {
             pad_vectors(&queries_flat, n_queries, self.dim, self.dim_padded)
@@ -529,7 +520,7 @@ where
             n_queries,
             k,
             nprobe,
-            Some(batch_size),
+            batch_size,
             &client,
             verbose,
         )?;
@@ -547,8 +538,9 @@ where
     ///
     /// * `k` - Number of neighbours per vector
     /// * `return_dist` - Whether to return distances
-    /// * `nprobe` - Number of centroids to check.
-    /// * `nquery` - Number of queries to load into the GPU.
+    /// * `nprobe` - Number of clusters to search (defaults to √nlist)
+    /// * `nquery` - Queries per GPU batch. Defaults to what keeps the candidate
+    ///   buffer near `TARGET_BUFFER_MB`.
     /// * `verbose` - Controls verbosity
     ///
     /// ### Returns
@@ -565,7 +557,7 @@ where
     ) -> KnnOptionResult<T> {
         let client: ComputeClient<R> = R::client(&self.device);
 
-        let nprobe = nprobe.unwrap_or(((self.nlist as f32).sqrt() as usize).max(1));
+        let nprobe = self.resolve_nprobe(nprobe);
 
         let batch_size = nquery.unwrap_or_else(|| {
             let safe = self.calculate_safe_batch_size(nprobe, &GpuLimits::from_client(&client));
@@ -575,17 +567,12 @@ where
             safe
         });
 
-        if verbose {
-            println!("  Reading vectors from GPU for self-query...");
-        }
-        let vectors_by_cluster = &self.vectors_cpu;
-
         let (indices_reorg, dist_reorg) = self.query_internal(
-            vectors_by_cluster,
+            &self.vectors_cpu,
             self.n,
             k,
-            Some(nprobe),
-            Some(batch_size),
+            nprobe,
+            batch_size,
             &client,
             verbose,
         )?;
@@ -974,12 +961,9 @@ where
         // Cluster-major tiled path: the tasks probing one cluster share its DB
         // slab, so they are blocked into tiles of `wg_y` tasks by
         // `WORKGROUP_SIZE_X * TILE_D` points and register-tiled like the
-        // exhaustive kernel. The per-task mega kernels below are the fallback.
-        let tiled_plan =
-            plan_exhaustive_staging(self.dim_padded, size_of::<T>(), &limits).filter(|p| {
-                ivf_tiled_smem_bytes(p.wg_y, p.kb_lines, size_of::<T>()) <= limits.max_shared_bytes
-            });
-        if let Some(plan) = tiled_plan {
+        // exhaustive kernel, whose staging footprint it shares. The per-task
+        // mega kernels below are the fallback.
+        if let Some(plan) = plan_exhaustive_staging(self.dim_padded, size_of::<T>(), &limits) {
             let tile_w = WORKGROUP_SIZE_X as usize * TILE_D;
             let wg_y = plan.wg_y as usize;
             let mut tiles: Vec<u32> = Vec::new();
@@ -1200,10 +1184,24 @@ where
             .min(self.nlist)
     }
 
-    /// Calculate a memory-safe batch size for the Candidate Buffer strategy
+    /// Resolve `nprobe`: `sqrt(nlist)` by default, clamped to `[1, nlist]`.
     ///
-    /// The new "Fire and Forget" strategy requires allocating a buffer of size:
-    /// [batch_size * nprobe * avg_cluster_size].
+    /// ### Params
+    ///
+    /// * `nprobe` - Caller's value, if any
+    ///
+    /// ### Returns
+    ///
+    /// Clusters to probe per query.
+    fn resolve_nprobe(&self, nprobe: Option<usize>) -> usize {
+        nprobe
+            .unwrap_or_else(|| ((self.nlist as f64).sqrt() as usize).max(1))
+            .min(self.nlist)
+    }
+
+    /// Calculate a memory-safe batch size for the candidate buffer.
+    ///
+    /// The buffer holds `batch_size * nprobe * avg_cluster_size` candidates.
     ///
     /// ### Params
     ///
