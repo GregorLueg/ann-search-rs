@@ -41,8 +41,13 @@ pub mod binary;
 #[cfg(feature = "serialise")]
 pub mod serialise;
 
-#[cfg(feature = "mlx")]
+#[cfg(mlx_available)]
 pub mod mlx;
+
+/// Whether the MLX backend was compiled in: the `mlx` feature is on and
+/// mlx-c was found at build time. Dependants that pick a backend at build
+/// time read `DEP_MLXC_AVAILABLE` in their build script instead.
+pub const MLX_AVAILABLE: bool = cfg!(mlx_available);
 
 #[cfg(feature = "synthetic")]
 pub mod synthetic;
@@ -88,13 +93,13 @@ use crate::binary::{
 };
 #[cfg(feature = "gpu")]
 use crate::gpu::{exhaustive_gpu::*, ivf_gpu::*};
-#[cfg(feature = "mlx")]
+#[cfg(mlx_available)]
 use crate::mlx::{cagra_mlx::*, exhaustive_mlx::*};
-#[cfg(feature = "mlx")]
+#[cfg(mlx_available)]
 use crate::mlx::ivf_mlx::*;
-#[cfg(feature = "mlx")]
+#[cfg(mlx_available)]
 use crate::mlx::nndescent_mlx::KnnGraphMlx;
-#[cfg(feature = "mlx")]
+#[cfg(mlx_available)]
 use crate::mlx::nndescent_index_mlx::NNDescentIndexMlx;
 #[cfg(feature = "quantised")]
 use crate::quantised::{
@@ -3291,7 +3296,7 @@ where
 // Exhaustive MLX //
 ////////////////////
 
-#[cfg(feature = "mlx")]
+#[cfg(mlx_available)]
 /// Build an exhaustive index on MLX (experimental, Apple Silicon, f32 only)
 ///
 /// ### Params
@@ -3316,7 +3321,7 @@ pub fn build_exhaustive_index_mlx(
     ExhaustiveIndexMlx::new(mat.into_row_major(), metric)
 }
 
-#[cfg(feature = "mlx")]
+#[cfg(mlx_available)]
 /// Query the exhaustive MLX index
 ///
 /// ### Params
@@ -3343,7 +3348,7 @@ pub fn query_exhaustive_index_mlx(
     Ok((indices, return_dist.then_some(distances)))
 }
 
-#[cfg(feature = "mlx")]
+#[cfg(mlx_available)]
 /// Query the exhaustive MLX index against itself (full kNN graph)
 ///
 /// ### Params
@@ -3369,7 +3374,7 @@ pub fn query_exhaustive_index_mlx_self(
 // CAGRA search MLX //
 //////////////////////
 
-#[cfg(feature = "mlx")]
+#[cfg(mlx_available)]
 /// Query a CAGRA navigational graph on MLX (experimental, Apple Silicon, f32
 /// only)
 ///
@@ -3403,7 +3408,7 @@ pub fn query_cagra_index_mlx(
     Ok((indices, return_dist.then_some(distances)))
 }
 
-#[cfg(feature = "mlx")]
+#[cfg(mlx_available)]
 /// Self-query a CAGRA navigational graph on MLX (full kNN graph)
 ///
 /// ### Params
@@ -3434,7 +3439,7 @@ pub fn query_cagra_index_mlx_self(
 // IVF MLX //
 /////////////
 
-#[cfg(feature = "mlx")]
+#[cfg(mlx_available)]
 /// Build an IVF index on MLX (experimental, Apple Silicon, f32 only)
 ///
 /// ### Params
@@ -3477,7 +3482,7 @@ pub fn build_ivf_index_mlx(
     )
 }
 
-#[cfg(feature = "mlx")]
+#[cfg(mlx_available)]
 /// Query an IVF MLX index
 ///
 /// ### Params
@@ -3509,7 +3514,7 @@ pub fn query_ivf_index_mlx(
     Ok((indices, return_dist.then_some(distances)))
 }
 
-#[cfg(feature = "mlx")]
+#[cfg(mlx_available)]
 /// Query an IVF MLX index against itself (full kNN graph)
 ///
 /// ### Params
@@ -3539,7 +3544,7 @@ pub fn query_ivf_index_mlx_self(
 // NNDescent MLX //
 ///////////////////
 
-#[cfg(feature = "mlx")]
+#[cfg(mlx_available)]
 /// Build a raw kNN graph with NN-Descent on MLX (experimental, Apple Silicon,
 /// f32 only). Counterpart of [`build_knn_graph_gpu`], minus the device.
 ///
@@ -3596,7 +3601,7 @@ pub fn build_knn_graph_mlx(
     )
 }
 
-#[cfg(feature = "mlx")]
+#[cfg(mlx_available)]
 /// Build an NN-Descent index on MLX with CAGRA optimisation (experimental,
 /// Apple Silicon, f32 only). Counterpart of [`build_nndescent_index_gpu`],
 /// minus the device and `retain_gpu`: the MLX index always stays resident.
@@ -3656,7 +3661,7 @@ pub fn build_nndescent_index_mlx(
     )
 }
 
-#[cfg(feature = "mlx")]
+#[cfg(mlx_available)]
 /// Query an NNDescent MLX index.
 ///
 /// ### Params
@@ -3689,7 +3694,7 @@ pub fn query_nndescent_index_mlx(
     Ok((indices, return_dist.then_some(distances)))
 }
 
-#[cfg(feature = "mlx")]
+#[cfg(mlx_available)]
 /// Self-query an NNDescent MLX index (full kNN graph via beam search).
 ///
 /// ### Params

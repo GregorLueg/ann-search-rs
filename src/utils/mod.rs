@@ -11,7 +11,7 @@ pub mod input;
 pub mod k_means_utils;
 pub mod nndescent_utils;
 pub mod parallelism;
-#[cfg(any(feature = "gpu", feature = "mlx"))]
+#[cfg(any(feature = "gpu", mlx_available))]
 pub mod rp_forest;
 pub mod traits;
 pub mod tree_utils;

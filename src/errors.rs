@@ -265,7 +265,7 @@ pub enum AnnSearchErrors {
     CubeclUtils(#[from] cubecl_utils_rs::CubeclUtilsErrors),
 
     /// Error for a dimensionality whose per-workgroup staging cannot fit
-    #[cfg(any(feature = "gpu", feature = "mlx"))]
+    #[cfg(any(feature = "gpu", mlx_available))]
     #[error(
         "A padded dimensionality of {chosen_dim} needs {required} bytes of shared memory per \
          workgroup, but this device offers only {available}. Reduce the dimensionality."
@@ -281,7 +281,7 @@ pub enum AnnSearchErrors {
 
     // -- mlx errors --
     /// An mlx-c call failed. mlx-c prints its own message to stderr first.
-    #[cfg(feature = "mlx")]
+    #[cfg(mlx_available)]
     #[error("mlx-c call '{op}' failed with code {code}.")]
     MlxError {
         /// Name of the failing mlx-c call
@@ -291,7 +291,7 @@ pub enum AnnSearchErrors {
     },
 
     /// A graph handed to the MLX CAGRA optimisation has the wrong shape
-    #[cfg(feature = "mlx")]
+    #[cfg(mlx_available)]
     #[error(
         "Graph of {len} entries is not {n} rows of degree {build_k}, or {k} exceeds that degree."
     )]

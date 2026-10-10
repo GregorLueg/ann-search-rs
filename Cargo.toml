@@ -2,6 +2,8 @@
 name = "ann-search-rs"
 version = "0.11.0"
 edition = "2021"
+# Exposes `DEP_MLXC_AVAILABLE` to dependants' build scripts, see build.rs.
+links = "mlxc"
 authors = ["Gregor Lueg <gregorlueg@me.com>"]
 license = "MIT"
 repository = "https://github.com/GregorLueg/ann-search-rs"
@@ -48,9 +50,10 @@ accelerate = []
 ndarray = ["dep:ndarray"]
 ## Enables saving indices to disk and loading them back in
 serialise = ["dep:serde", "dep:bincode", "half?/serde"]
-## Experimental, Apple Silicon only: exhaustive search on MLX via mlx-c, for
-## comparison against the cubecl/wgpu path. Needs `brew install mlx-c` (or
-## MLX_C_PREFIX pointing at an install). f32 only.
+## Experimental, Apple Silicon only: MLX backend via mlx-c (exhaustive, IVF,
+## NN-Descent/CAGRA). Needs `brew install mlx-c` (or MLX_C_PREFIX pointing at
+## an install). Without the library the build warns and the MLX code is left
+## out; check `MLX_AVAILABLE`. f32 only.
 mlx = []
 ## Synthetic dataset generators with realistic single-cell structure, used by
 ## the gridsearch examples and the published benchmark tables.
