@@ -9,12 +9,15 @@
 //! `simd_shuffle_up` shift, so there is no serial thread-0 section and no
 //! barrier in the merge. The visited set is a linear-probing hash table in
 //! threadgroup memory, written with atomic compare-exchange since every lane
-//! inserts at once.
+//! inserts at once. Each iteration's unvisited neighbours are compacted, then
+//! scored [`lanes_per_neighbour`] lanes to a row: one lane per neighbour on
+//! narrow rows, the row split across lanes on wide ones, where a single lane
+//! walking a 784-dim row serially left the kernel latency bound.
 //!
-//! The graph is an input, not built here. Entry points are an input too: the
-//! forest router that picks them in [`crate::gpu::nndescent_gpu`] is built on
-//! the wgpu device, so without it the search falls back to the medoid plus
-//! random nodes.
+//! The graph is an input, not built here. Entry points are an input too,
+//! either as fixed ids or, via [`CagraSearchMlx::search_routed`], as router
+//! candidates the kernel scores and selects from itself. Without either the
+//! search falls back to the medoid plus random nodes.
 
 use rand::{rngs::SmallRng, Rng, SeedableRng};
 
@@ -32,8 +35,12 @@ const BEAM_WIDTH: usize = 16;
 /// Maximum beam search iterations before forced termination
 const MAX_BEAM_ITERS: usize = 48;
 
-/// Preferred hash table size for visited-node tracking (power of 2)
-const HASH_SIZE: usize = 2048;
+/// Preferred hash table size for visited-node tracking (power of 2). Half
+/// the wgpu kernel's 2048: the table is most of the threadgroup memory, and
+/// the smaller footprint fits more SIMD groups per core. A node dropped by a
+/// reset was already worse than the beam's worst, so results do not change;
+/// the cost is re-scoring it, which is why 512 already loses at high dim.
+const HASH_SIZE: usize = 1024;
 
 /// Smallest hash table the plan will shrink to before giving up
 const MIN_HASH_SIZE: usize = 128;
@@ -51,13 +58,29 @@ pub const MLX_MAX_THREADGROUP_BYTES: usize = 32_768;
 /// queued asynchronously, so the host does not wait between them.
 const MLX_QUERY_CHUNK: usize = 65_536;
 
+/// Widest padded row (in `float4`s) still scored one lane per neighbour.
+/// One lane wins at dim 32 and 64 and loses from dim 128.
+const LPN_SERIAL_MAX_DIM4: usize = 16;
+
+/// Widest padded row (in `float4`s) scored by `LPN_MID` lanes.
+const LPN_MID_MAX_DIM4: usize = 64;
+
+/// Lanes per neighbour for mid-width rows (best at dim 128).
+const LPN_MID: usize = 4;
+
+/// Lanes per neighbour for wide rows (best at dim 512 and 784; 16 and 32
+/// were level or slightly worse).
+const LPN_WIDE: usize = 8;
+
 /// Marks an empty graph slot, beam slot or output slot.
 const SENTINEL: u32 = 0x7FFF_FFFF;
 
 /// Metal body of the beam search. Template args: `DIM4` (padded dim / 4),
 /// `DEG` (graph degree), `BW` (beam width), `HASH` (table size, power of 2),
 /// `EXPAND` (parents per iteration), `N_ENTRY`, `MAX_ITERS`, `COSINE`,
-/// `K_OUT` and `N` (graph size).
+/// `K_OUT`, `N` (graph size), `LPN` (lanes per scored neighbour, a power of 2
+/// up to 32, see [`lanes_per_neighbour`]) and `KEEP` (routed candidates kept,
+/// 0 when the search is not routed).
 ///
 /// Semantics follow the wgpu kernel: entries seed the beam, each iteration
 /// claims the `EXPAND` best unexpanded beam entries, scores their unvisited
@@ -66,6 +89,11 @@ const SENTINEL: u32 = 0x7FFF_FFFF;
 /// iteration could push it past three quarters full; anything else seen again
 /// is worse than the beam's worst and fails the merge check. Stops when every
 /// beam entry has been expanded.
+///
+/// With `KEEP > 0` each query also carries a CSR list of router candidates
+/// (`cands`, offsets in `coffs`). They are scored first and only the `KEEP`
+/// closest stay, then `entries` go in as usual: the selection the host used to
+/// do per query, moved onto the device.
 const BEAM_SOURCE: &str = r#"
     constexpr uint SENT = 0x7FFFFFFFu;
     constexpr int BPL = (BW + 31) / 32;
@@ -73,12 +101,16 @@ const BEAM_SOURCE: &str = r#"
     constexpr int SPL = (TOTAL + 31) / 32;
     constexpr uint HMASK = HASH - 1;
     constexpr uint RESET_AT = HASH * 3 / 4;
+    constexpr uint NPP = 32u / LPN;
 
     uint lane = thread_position_in_grid.x;
     uint qi = thread_position_in_grid.y;
+    uint sub = lane % LPN;
+    uint grp = lane / LPN;
 
     threadgroup float4 sq[DIM4];
     threadgroup atomic_uint vis[HASH];
+    threadgroup uint cand[TOTAL];
 
     const device float4* q4 = (const device float4*)queries + (ulong)(qbase[0] + qi) * DIM4;
     const device float4* v4 = (const device float4*)vectors;
@@ -106,6 +138,7 @@ const BEAM_SOURCE: &str = r#"
         } \
     }
 
+    // One lane, whole row.
     #define DIST(NODE, OUT) { \
         const device float4* x4_ = v4 + (ulong)(NODE) * DIM4; \
         float s_ = 0.0f; \
@@ -118,6 +151,22 @@ const BEAM_SOURCE: &str = r#"
         } \
     }
 
+    // LPN lanes, one row: each lane takes every LPN-th float4, then a
+    // shuffle-xor tree sums within the group. Must be reached by all lanes.
+    #define COOP_DIST(VALID, NODE, OUT) { \
+        float a_ = 0.0f; \
+        if (VALID) { \
+            const device float4* x4_ = v4 + (ulong)(NODE) * DIM4; \
+            for (uint i_ = sub; i_ < (uint)DIM4; i_ += LPN) { \
+                if (COSINE) a_ += dot(sq[i_], x4_[i_]); \
+                else { float4 d_ = sq[i_] - x4_[i_]; a_ += dot(d_, d_); } \
+            } \
+        } \
+        for (uint o_ = LPN / 2; o_ > 0; o_ >>= 1) a_ += simd_shuffle_xor(a_, (ushort)o_); \
+        OUT = a_; \
+        if (COSINE && (VALID)) OUT = 1.0f - a_ / (qnorm * norms[NODE]); \
+    }
+
     // Beam: slot b * 32 + lane, ascending. Empty slots are INF / SENT and
     // flagged expanded so they are never claimed.
     float bd[BPL];
@@ -125,12 +174,13 @@ const BEAM_SOURCE: &str = r#"
     uint bx[BPL];
     for (int b = 0; b < BPL; b++) { bd[b] = INFINITY; bi[b] = SENT; bx[b] = 1u; }
 
+    #define WORST() simd_shuffle(bd[BPL - 1], (ushort)((BW - 1) & 31))
+
     // Uniform insert of (D, ID): rank by simd_sum, then shift everything from
     // the rank one slot up, the carry into lane 0 coming from the row below.
     // Rows go high to low so each reads its predecessor before it changes.
     #define BEAM_INSERT(D, ID) { \
-        float worst_ = simd_shuffle(bd[BPL - 1], (ushort)((BW - 1) & 31)); \
-        if ((D) < worst_) { \
+        if ((D) < WORST()) { \
             uint pos_ = 0; \
             for (int b = 0; b < BPL; b++) pos_ += (uint)(bd[b] <= (D)); \
             pos_ = simd_sum(pos_); \
@@ -165,6 +215,28 @@ const BEAM_SOURCE: &str = r#"
     }
 
     uint hcount = 0;
+    if (KEEP > 0) {
+        // Score every routed candidate, keep the KEEP closest. They are not
+        // marked visited while scored, only once kept, as on the host.
+        uint c_lo = coffs[qi];
+        uint c_hi = coffs[qi + 1];
+        for (uint c0 = c_lo; c0 < c_hi; c0 += NPP) {
+            uint c = c0 + grp;
+            bool valid = c < c_hi;
+            uint id = valid ? cands[c] : 0u;
+            valid = valid && id < (uint)N;
+            float d;
+            COOP_DIST(valid, id, d);
+            MERGE_LANES(valid && sub == 0 && d < WORST(), d, id);
+        }
+        uint kept = 0;
+        for (int b = 0; b < BPL; b++) {
+            if ((uint)b * 32 + lane >= (uint)KEEP) { bd[b] = INFINITY; bi[b] = SENT; bx[b] = 1u; }
+            if (bi[b] != SENT) { bool nw; HASH_INSERT(bi[b], nw); kept++; }
+        }
+        hcount = simd_sum(kept);
+    }
+
     const device uint* ep = entries + (ulong)qi * N_ENTRY;
     for (int e0 = 0; e0 < N_ENTRY; e0 += 32) {
         uint e = (uint)e0 + lane;
@@ -209,31 +281,34 @@ const BEAM_SOURCE: &str = r#"
         }
         if (claimed == 0) break;
 
-        uint nid[SPL];
-        float nd[SPL];
-        uint newc = 0;
+        // Compact the unvisited neighbours in slot order, so the scoring
+        // passes below carry no empty slots.
+        uint ncand = 0;
         for (int r = 0; r < SPL; r++) {
             uint s = (uint)r * 32 + lane;
             uint p = s / DEG;
-            nid[r] = SENT;
-            nd[r] = INFINITY;
+            bool nw = false;
+            uint nbr = SENT;
             if (p < claimed) {
-                uint nbr = graph[(ulong)parents[p] * DEG + (s - p * DEG)];
-                if (nbr < (uint)N) {
-                    bool nw;
-                    HASH_INSERT(nbr, nw);
-                    if (nw) { nid[r] = nbr; newc++; }
-                }
+                nbr = graph[(ulong)parents[p] * DEG + (s - p * DEG)];
+                if (nbr < (uint)N) HASH_INSERT(nbr, nw);
             }
+            uint m = (uint)(ulong)simd_ballot(nw);
+            if (nw) cand[ncand + popcount(m & ((1u << lane) - 1u))] = nbr;
+            ncand += popcount(m);
         }
-        hcount += simd_sum(newc);
-        for (int r = 0; r < SPL; r++) {
-            if (nid[r] != SENT) DIST(nid[r], nd[r]);
+        hcount += ncand;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint c0 = 0; c0 < ncand; c0 += NPP) {
+            uint c = c0 + grp;
+            bool valid = c < ncand;
+            uint id = valid ? cand[c] : 0u;
+            float d;
+            COOP_DIST(valid, id, d);
+            MERGE_LANES(valid && sub == 0 && d < WORST(), d, id);
         }
-        for (int r = 0; r < SPL; r++) {
-            float worst = simd_shuffle(bd[BPL - 1], (ushort)((BW - 1) & 31));
-            MERGE_LANES(nd[r] < worst, nd[r], nid[r]);
-        }
+        // `cand` is rewritten next iteration.
+        threadgroup_barrier(mem_flags::mem_threadgroup);
     }
 
     device uint* oi = out_idx + (ulong)qi * K_OUT;
@@ -343,26 +418,48 @@ impl Default for CagraMlxSearchParams {
 // Plan //
 //////////
 
-/// Size the visited table against the threadgroup memory budget. The staged
-/// query (`dim_padded` f32) is fixed; the beam and the neighbour slots live in
-/// registers, so the table is the only elastic term and halves until it fits.
+/// Lanes that cooperate on one neighbour's distance. Narrow rows keep one
+/// lane per neighbour; wide ones split the row so a lane does not walk
+/// hundreds of serial loads while the rest of the group waits.
 ///
 /// ### Params
 ///
 /// * `dim_padded` - Dimensionality padded to a multiple of 4
+///
+/// ### Returns
+///
+/// A power of 2 dividing 32
+pub fn lanes_per_neighbour(dim_padded: usize) -> usize {
+    match dim_padded / 4 {
+        d if d <= LPN_SERIAL_MAX_DIM4 => 1,
+        d if d <= LPN_MID_MAX_DIM4 => LPN_MID,
+        _ => LPN_WIDE,
+    }
+}
+
+/// Size the visited table against the threadgroup memory budget. The staged
+/// query (`dim_padded` f32) and the compacted neighbour list (`total_slots`
+/// u32) are fixed; the beam lives in registers, so the table is the only
+/// elastic term and halves until it fits.
+///
+/// ### Params
+///
+/// * `dim_padded` - Dimensionality padded to a multiple of 4
+/// * `total_slots` - Neighbour slots per iteration, `expand * degree`
 /// * `preferred_hash` - Table size to start from (power of 2)
 /// * `max_tg_bytes` - Threadgroup memory budget in bytes
 ///
 /// ### Returns
 ///
 /// The hash table size, or `DimTooHighForSharedMemory` when even
-/// `MIN_HASH_SIZE` does not fit next to the query
+/// `MIN_HASH_SIZE` does not fit next to the fixed terms
 pub fn plan_beam_search_threadgroup(
     dim_padded: usize,
+    total_slots: usize,
     preferred_hash: usize,
     max_tg_bytes: usize,
 ) -> Result<usize, AnnSearchErrors> {
-    let fixed = dim_padded * size_of::<f32>();
+    let fixed = dim_padded * size_of::<f32>() + total_slots * size_of::<u32>();
     let mut hash_size = preferred_hash.max(MIN_HASH_SIZE).next_power_of_two();
     while hash_size >= MIN_HASH_SIZE {
         if fixed + hash_size * size_of::<u32>() <= max_tg_bytes {
@@ -555,7 +652,10 @@ impl CagraSearchMlx {
             graph,
             kernel: MetalKernel::new(
                 "cagra_beam_search",
-                &["vectors", "norms", "graph", "queries", "entries", "qbase"],
+                &[
+                    "vectors", "norms", "graph", "queries", "entries", "qbase", "cands",
+                    "coffs",
+                ],
                 &["out_idx", "out_dist"],
                 BEAM_SOURCE,
             ),
@@ -627,12 +727,54 @@ impl CagraSearchMlx {
             &pad_rows(queries_flat, n_queries, self.dim, self.dim_padded),
             &[n_queries as i32, self.dim_padded as i32],
         );
-        let hash = plan_beam_search_threadgroup(
-            self.dim_padded,
-            HASH_SIZE,
-            MLX_MAX_THREADGROUP_BYTES,
-        )?;
-        self.run(&queries, n_queries, &entries, k, &params, hash)
+        self.run(&queries, n_queries, &entries, n_entry, None, k, &params, HASH_SIZE)
+    }
+
+    /// Search a batch of queries seeded from router candidates. Per query the
+    /// kernel scores every candidate, keeps the `n_entry - 1` closest and adds
+    /// `fixed_entry` (the medoid): the selection `NNDescentGpu` does on the
+    /// host, done on the device.
+    ///
+    /// ### Params
+    ///
+    /// * `queries_flat` - Row-major queries, `n_queries * dim`
+    /// * `n_queries` - Number of queries
+    /// * `k` - Neighbours per query
+    /// * `query_params` - Beam parameters; `None` scales them to `k`
+    /// * `cand_ids` - Candidates of every query, concatenated
+    /// * `cand_offsets` - `n_queries + 1` offsets into `cand_ids`
+    /// * `fixed_entry` - Entry added to every query, never scored as a
+    ///   candidate; leave it out of `cand_ids`
+    ///
+    /// ### Returns
+    ///
+    /// `(indices, distances)` per query, ascending. Unfilled slots are
+    /// dropped, so a row can be shorter than `k`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn search_routed(
+        &self,
+        queries_flat: &[f32],
+        n_queries: usize,
+        k: usize,
+        query_params: Option<CagraMlxSearchParams>,
+        cand_ids: &[u32],
+        cand_offsets: &[u32],
+        fixed_entry: u32,
+    ) -> KnnResult<f32> {
+        if n_queries == 0 {
+            return Ok((Vec::new(), Vec::new()));
+        }
+        self.check_dim(queries_flat.len() / n_queries)?;
+        assert_eq!(cand_offsets.len(), n_queries + 1, "candidate offsets");
+        let params = query_params.unwrap_or_else(|| CagraMlxSearchParams::from_k(k));
+        let keep = params.get_n_entry().saturating_sub(1);
+        let queries = Array::from_f32(
+            &pad_rows(queries_flat, n_queries, self.dim, self.dim_padded),
+            &[n_queries as i32, self.dim_padded as i32],
+        );
+        let entries = vec![fixed_entry; n_queries];
+        let routed = (keep > 0).then_some((cand_ids, cand_offsets, keep));
+        self.run(&queries, n_queries, &entries, 1, routed, k, &params, HASH_SIZE)
     }
 
     /// Search every indexed vector against the graph (self-kNN).
@@ -665,13 +807,8 @@ impl CagraSearchMlx {
             }
             None => self_entry_points(&self.nav_graph, self.degree, self.n, n_entry, seed),
         };
-        let hash = plan_beam_search_threadgroup(
-            self.dim_padded,
-            HASH_SIZE,
-            MLX_MAX_THREADGROUP_BYTES,
-        )?;
         // The device vectors double as the queries: no re-upload.
-        self.run(&self.vectors, self.n, &entries, k, &params, hash)
+        self.run(&self.vectors, self.n, &entries, n_entry, None, k, &params, HASH_SIZE)
     }
 
     /// Queue the beam search in chunks and collect the results.
@@ -681,47 +818,76 @@ impl CagraSearchMlx {
     /// * `queries` - Device queries `[n_queries, dim_padded]`
     /// * `n_queries` - Number of queries
     /// * `entries` - Flat `[n_queries * n_entry]` entry ids
+    /// * `n_entry` - Entries per query
+    /// * `routed` - Optional `(candidate ids, n_queries + 1 offsets, keep)`
+    ///   scored on the device before the entries go in
     /// * `k` - Neighbours per query
-    /// * `params` - Beam parameters
-    /// * `hash_size` - Visited table size (power of 2)
+    /// * `params` - Beam parameters; only width, iterations and expansion
+    ///   are read
+    /// * `hash_pref` - Preferred visited table size; raised to twice the
+    ///   beam plus one iteration's slots, then shrunk to fit by
+    ///   [`plan_beam_search_threadgroup`]
     ///
     /// ### Returns
     ///
     /// `(indices, distances)` per query, ascending, unfilled slots dropped
+    #[allow(clippy::too_many_arguments)]
     fn run(
         &self,
         queries: &Array,
         n_queries: usize,
         entries: &[u32],
+        n_entry: usize,
+        routed: Option<(&[u32], &[u32], usize)>,
         k: usize,
         params: &CagraMlxSearchParams,
-        hash_size: usize,
+        hash_pref: usize,
     ) -> KnnResult<f32> {
-        let (width, iters, n_entry, expand) = params.get_vals();
+        let (width, iters, _, expand) = params.get_vals();
         if k == 0 || n_queries == 0 {
             return Ok((vec![Vec::new(); n_queries], vec![Vec::new(); n_queries]));
         }
+        let expand = expand.max(1);
+        let hash_size = plan_beam_search_threadgroup(
+            self.dim_padded,
+            expand * self.degree,
+            hash_pref.max((2 * (width + expand * self.degree)).next_power_of_two()),
+            MLX_MAX_THREADGROUP_BYTES,
+        )?;
+        let lpn = lanes_per_neighbour(self.dim_padded);
         let template = [
             ("DIM4", (self.dim_padded / 4) as i32),
             ("DEG", self.degree as i32),
             ("BW", width.max(1) as i32),
             ("HASH", hash_size as i32),
-            ("EXPAND", expand.max(1) as i32),
+            ("EXPAND", expand as i32),
             ("N_ENTRY", n_entry as i32),
             ("MAX_ITERS", iters as i32),
             ("COSINE", (self.metric == Dist::Cosine) as i32),
             ("K_OUT", k as i32),
             ("N", self.n as i32),
+            ("LPN", lpn as i32),
+            ("KEEP", routed.map_or(0, |r| r.2) as i32),
         ];
 
+        // Offsets stay global, so one candidate buffer serves every chunk.
+        let cands = match routed {
+            Some((ids, _, _)) if !ids.is_empty() => Array::from_u32(ids, &[ids.len() as i32]),
+            _ => Array::from_u32(&[SENTINEL], &[1]),
+        };
         let mut pending = Vec::with_capacity(n_queries.div_ceil(MLX_QUERY_CHUNK));
         for start in (0..n_queries).step_by(MLX_QUERY_CHUNK) {
-            let n_q = (start + MLX_QUERY_CHUNK).min(n_queries) - start;
+            let end = (start + MLX_QUERY_CHUNK).min(n_queries);
+            let n_q = end - start;
             let ent = Array::from_u32(
-                &entries[start * n_entry..(start + n_q) * n_entry],
+                &entries[start * n_entry..end * n_entry],
                 &[n_q as i32, n_entry as i32],
             );
             let qbase = Array::from_u32(&[start as u32], &[1]);
+            let coffs = match routed {
+                Some((_, offs, _)) => Array::from_u32(&offs[start..=end], &[n_q as i32 + 1]),
+                None => Array::from_u32(&[0, 0], &[2]),
+            };
             let shape = [n_q as i32, k as i32];
             let mut out = self.kernel.apply(
                 &[
@@ -731,6 +897,8 @@ impl CagraSearchMlx {
                     queries,
                     &ent,
                     &qbase,
+                    &cands,
+                    &coffs,
                 ],
                 &[
                     OutputSpec {
@@ -905,15 +1073,15 @@ mod tests {
     fn test_mlx_cagra_plan_shrinks_the_hash_then_errors() {
         for budget in [16_384usize, 32_768, 49_152, 65_536] {
             for dim in [32usize, 128, 512, 1024] {
-                let h = plan_beam_search_threadgroup(dim, HASH_SIZE, budget).unwrap();
-                assert!(h.is_power_of_two() && (MIN_HASH_SIZE..=HASH_SIZE).contains(&h));
-                assert!(dim * 4 + h * 4 <= budget, "dim {dim} budget {budget}");
+                let h = plan_beam_search_threadgroup(dim, 90, 2048, budget).unwrap();
+                assert!(h.is_power_of_two() && (MIN_HASH_SIZE..=2048).contains(&h));
+                assert!(dim * 4 + 90 * 4 + h * 4 <= budget, "dim {dim} budget {budget}");
             }
         }
-        assert_eq!(plan_beam_search_threadgroup(128, HASH_SIZE, 32_768).unwrap(), 2048);
-        assert_eq!(plan_beam_search_threadgroup(3072, HASH_SIZE, 16_384).unwrap(), 1024);
+        assert_eq!(plan_beam_search_threadgroup(128, 90, 2048, 32_768).unwrap(), 2048);
+        assert_eq!(plan_beam_search_threadgroup(3072, 90, 2048, 16_384).unwrap(), 512);
         // A 4096-wide row alone fills 16 KiB.
-        assert!(plan_beam_search_threadgroup(4096, HASH_SIZE, 16_384).is_err());
+        assert!(plan_beam_search_threadgroup(4096, 90, 2048, 16_384).is_err());
     }
 
     #[test]
@@ -935,28 +1103,56 @@ mod tests {
         assert!(dist[0].windows(2).all(|w| w[0] <= w[1]));
     }
 
+    /// Rows on an 8-dim subspace of `dim`, so beam search recall stays high
+    /// at any width. The projection is fixed, so base and queries share it.
+    ///
+    /// ### Params
+    ///
+    /// * `n` - Rows
+    /// * `dim` - Columns
+    /// * `seed` - RNG seed for the latent coordinates
+    ///
+    /// ### Returns
+    ///
+    /// Row-major data
+    fn latent(n: usize, dim: usize, seed: u64) -> Vec<f32> {
+        let proj = uniform(8, dim, 999);
+        let z = uniform(n, 8, seed);
+        z.chunks_exact(8)
+            .flat_map(|zr| {
+                (0..dim)
+                    .map(|j| (0..8).map(|l| zr[l] * proj[l * dim + j]).sum::<f32>() / 10.0)
+                    .collect::<Vec<_>>()
+            })
+            .collect()
+    }
+
     /// Recall on an exact graph, and the self-query finding every point.
+    /// The widths cover one, four and eight lanes per neighbour.
     ///
     /// ### Params
     ///
     /// * `metric` - Metric under test
     fn check_recall(metric: Dist) {
-        let (n, dim, deg, k, nq) = (2000, 30, 16, 10, 100);
-        let data = uniform(n, dim, 123);
-        let queries = uniform(nq, dim, 9);
-        let cosine = metric == Dist::Cosine;
-        let graph = brute_force_graph(&data, dim, deg, cosine);
-        let s = CagraSearchMlx::new(&data, n, dim, metric, graph, deg, 0).unwrap();
+        for (dim, lpn) in [(30usize, 1usize), (200, LPN_MID), (300, LPN_WIDE)] {
+            assert_eq!(lanes_per_neighbour(dim.next_multiple_of(4)), lpn);
+            let (n, deg, k, nq) = (2000, 16, 10, 100);
+            let data = latent(n, dim, 123);
+            let queries = latent(nq, dim, 9);
+            let cosine = metric == Dist::Cosine;
+            let graph = brute_force_graph(&data, dim, deg, cosine);
+            let s = CagraSearchMlx::new(&data, n, dim, metric, graph, deg, 0).unwrap();
 
-        let (idx, dist) = s.search(&queries, nq, k, None, None, 42).unwrap();
-        let r = recall(&brute_force(&queries, &data, dim, k, cosine), &idx);
-        assert!(r > 0.9, "{metric:?} recall {r}");
-        assert!(dist.iter().all(|d| d.windows(2).all(|w| w[0] <= w[1])));
+            let (idx, dist) = s.search(&queries, nq, k, None, None, 42).unwrap();
+            let r = recall(&brute_force(&queries, &data, dim, k, cosine), &idx);
+            assert!(r > 0.9, "{metric:?} dim {dim} recall {r}");
+            assert!(dist.iter().all(|d| d.windows(2).all(|w| w[0] <= w[1])));
 
-        let (idx, _) = s.self_search(k, None, None, 42).unwrap();
-        assert!(idx.iter().enumerate().all(|(i, row)| row[0] == i));
-        let r = recall(&brute_force(&data, &data, dim, k, cosine), &idx);
-        assert!(r > 0.9, "{metric:?} self recall {r}");
+            let (idx, _) = s.self_search(k, None, None, 42).unwrap();
+            assert!(idx.iter().enumerate().all(|(i, row)| row[0] == i));
+            let r = recall(&brute_force(&data, &data, dim, k, cosine), &idx);
+            assert!(r > 0.9, "{metric:?} dim {dim} self recall {r}");
+        }
     }
 
     #[test]
@@ -967,6 +1163,68 @@ mod tests {
     #[test]
     fn test_mlx_cagra_recall_cosine() {
         check_recall(Dist::Cosine);
+    }
+
+    /// Routed search against the same selection done on the host: the
+    /// medoid plus the `n_entry - 1` closest candidates as fixed entries.
+    ///
+    /// ### Params
+    ///
+    /// * `metric` - Metric under test
+    /// * `dim` - Dimensionality
+    fn check_routed_matches_host(metric: Dist, dim: usize) {
+        let (n, deg, k, nq, n_cand) = (2000, 16, 10, 200, 150);
+        let cosine = metric == Dist::Cosine;
+        let data = latent(n, dim, 3);
+        let queries = latent(nq, dim, 4);
+        let graph = brute_force_graph(&data, dim, deg, cosine);
+        let medoid = 0u32;
+        let s = CagraSearchMlx::new(&data, n, dim, metric, graph, deg, medoid).unwrap();
+        let n_entry = CagraMlxSearchParams::from_k(k).get_n_entry();
+
+        let mut rng = StdRng::seed_from_u64(5);
+        let mut offsets = vec![0u32];
+        let mut ids = Vec::new();
+        let mut entries = Vec::new();
+        for q in queries.chunks_exact(dim) {
+            let cands: Vec<u32> = (0..n_cand).map(|_| rng.random_range(1..n as u32)).collect();
+            let mut cands_sorted = cands.clone();
+            cands_sorted.sort_unstable();
+            cands_sorted.dedup();
+            let mut scored: Vec<(f32, u32)> = cands_sorted
+                .iter()
+                .map(|&c| {
+                    let x = &data[c as usize * dim..(c as usize + 1) * dim];
+                    let d = if cosine {
+                        1.0 - f32::dot_simd(q, x)
+                            / (f32::calculate_l2_norm(q) * f32::calculate_l2_norm(x))
+                    } else {
+                        f32::euclidean_simd(q, x)
+                    };
+                    (d, c)
+                })
+                .collect();
+            scored.sort_by(|a, b| a.0.total_cmp(&b.0));
+            entries.push(medoid);
+            entries.extend(scored.iter().take(n_entry - 1).map(|&(_, c)| c));
+            ids.extend_from_slice(&cands_sorted);
+            offsets.push(ids.len() as u32);
+        }
+
+        let (host, _) = s.search(&queries, nq, k, None, Some(&entries), 0).unwrap();
+        let (dev, _) = s
+            .search_routed(&queries, nq, k, None, &ids, &offsets, medoid)
+            .unwrap();
+        let same = host.iter().zip(&dev).filter(|(a, b)| a == b).count();
+        assert!(same as f64 >= 0.99 * nq as f64, "{metric:?} dim {dim}: {same}/{nq} rows identical");
+    }
+
+    #[test]
+    fn test_mlx_cagra_routed_matches_host_selection() {
+        for dim in [30, 300] {
+            check_routed_matches_host(Dist::SquaredEuclidean, dim);
+            check_routed_matches_host(Dist::Cosine, dim);
+        }
     }
 
     /// A beam that visits far more nodes than the table holds: without the
@@ -982,7 +1240,7 @@ mod tests {
         let params = CagraMlxSearchParams::new(Some(64), Some(192), Some(8), Some(3));
         let entries = s.default_entry_points(nq, 8, 3);
         let q = Array::from_f32(&queries, &[nq as i32, dim as i32]);
-        let (idx, _) = s.run(&q, nq, &entries, k, &params, 128).unwrap();
+        let (idx, _) = s.run(&q, nq, &entries, 8, None, k, &params, 128).unwrap();
         let r = recall(&brute_force(&queries, &data, dim, k, false), &idx);
         assert!(r > 0.85, "recall {r}");
     }
