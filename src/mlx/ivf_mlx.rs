@@ -10,21 +10,23 @@
 //! 2. The exhaustive index's row top-k kernel picks each query's probe pool.
 //! 3. The queries are ordered by their nearest cluster (MLX `argsort`), so
 //!    neighbouring SIMD groups scan the same clusters and share cache.
-//! 4. The scan, one of two (see [`IvfScanMlx`]):
+//! 4. The scan, one of three (see [`IvfScanMlx`]):
 //!    - Query-major ([`IVF_SCAN_BODY`]): one SIMD group per query walks its
 //!      probed clusters and keeps the top k in registers. No task list and no
 //!      candidate buffer, but members are re-read for every query probing
 //!      them.
 //!    - Cluster-major: the probe lists are inverted on the device (sort keys,
 //!      MLX `argsort`, `scatter_add` counts, a one-thread prefix sum), each
-//!      cluster's tasks are cut into tiles that stage member blocks in
-//!      threadgroup memory for several queries at once, and a final kernel
-//!      merges the per-(query, probe) top k. Like the wgpu layout but with
-//!      the task list built on the device and a candidate buffer of k per
-//!      probe rather than every member.
+//!      cluster's tasks are cut into tiles of 8 queries, every member load
+//!      is scored against all 8, and a final kernel merges the
+//!      per-(query, probe) top k. Like the wgpu layout but with the task
+//!      list built on the device and a candidate buffer of k per probe
+//!      rather than every member. The dot products run either on registers
+//!      ([`IVF_CLUSTER_TILED_BODY`]) or on `simdgroup_matrix` tiles
+//!      ([`IVF_CLUSTER_MMA_BODY`]).
 //!
-//! Distances are computed directly, not through the GEMM expansion, so there
-//! is no cancellation.
+//! The query-major and register-tiled scans compute distances directly, so
+//! there is no cancellation; the `simdgroup_matrix` one expands Euclidean.
 
 use rayon::prelude::*;
 use std::time::Instant;
@@ -48,8 +50,9 @@ const IVF_MLX_QUERY_BATCH_SIZE: usize = 100_000;
 /// Query rows (SIMD groups) per threadgroup in the query-major scan kernel.
 const SCAN_ROWS_PER_GROUP: i32 = 8;
 
-/// Query tasks (SIMD groups) per threadgroup in the cluster-major scan. Each
-/// staged member block is reused by this many queries.
+/// Query tasks (SIMD groups) per threadgroup in the cluster-major scans. Each
+/// member load is reused by this many queries. The `simdgroup_matrix` scan
+/// needs exactly 8.
 ///
 /// Capped by the pipeline's thread limit, which the compiler lowers with the
 /// register-resident top-K: 512 threads failed at K = 15..32 on an M1 Max
@@ -57,16 +60,21 @@ const SCAN_ROWS_PER_GROUP: i32 = 8;
 /// other top-k kernels here run with.
 const CLUSTER_SCAN_QT: usize = 8;
 
-/// Members staged per block in the cluster-major scan: one per lane.
+/// Members per SIMD group in one cluster-major chunk; a chunk is
+/// `CLUSTER_SCAN_MEMBERS * QT` members.
 const CLUSTER_SCAN_MEMBERS: usize = 32;
 
-/// Cap on the dimensions staged per block in the cluster-major scan; wider
-/// rows are split along the reduction axis.
-const CLUSTER_SCAN_MAX_DB: usize = 128;
+/// Cap on the query dimensions staged per block in the cluster-major scans;
+/// wider rows are split along the reduction axis.
+const CLUSTER_SCAN_MAX_DB: usize = 256;
 
 /// Threadgroup memory on Apple GPUs, the budget the cluster-scan plan is
 /// sized against. MLX does not expose the device limit.
 const APPLE_THREADGROUP_BYTES: usize = 32 * 1024;
+
+/// Zero rows appended to the device copy of the vectors, one 8x8 tile's
+/// worth, so the `simdgroup_matrix` scan never reads past the buffer.
+const DB_PAD_ROWS: usize = 8;
 
 /// Threads per threadgroup in the probe-key kernel (one per query).
 const PROBE_KEYS_THREADS: usize = 64;
@@ -209,21 +217,14 @@ const IVF_TASK_CSR_SOURCE: &str = r#"
     tile_off[NLIST] = g;
 "#;
 
-/// Cluster-major step 4, between [`TOPK_REGS`] and [`TOPK_MERGE`]. One
-/// threadgroup per tile of up to `QT` tasks probing one cluster, one SIMD
-/// group per task. The cluster's members are staged 32 at a time (one per
-/// lane) in threadgroup memory, `DB` dimensions per block with a padded row
-/// stride so the lane-strided reads miss bank conflicts, and every SIMD group
-/// scores its query against the staged block. Each task's top K lands in
-/// partial row `query * P + slot`; slots no tile touches are never read.
-///
-/// The tile -> cluster lookup is a binary search over `tile_off`, so the grid
-/// can be sized by an upper bound and surplus threadgroups exit at once.
-///
-/// Template args: `K`, `P`, `DIM`, `DB`, `QT`, `NLIST`, `COSINE`.
-const IVF_CLUSTER_SCAN_BODY: &str = r#"
+/// Metal snippet opening every cluster-major scan: map threadgroup `g` to its
+/// cluster `c` by binary search over `tile_off` (surplus threadgroups of the
+/// upper-bound grid exit at once), and the tile's first task `tbase`, its task
+/// count `nt` and the cluster's member range `[ms, me)`.
+const CLUSTER_TILE_LOOKUP: &str = r#"
     uint lane = thread_position_in_threadgroup.x;
     uint sg = thread_position_in_threadgroup.y;
+    uint tid = sg * 32 + lane;
     uint g = threadgroup_position_in_grid.y;
     if (g >= tile_off[NLIST]) return;
     uint lo = 0;
@@ -233,46 +234,156 @@ const IVF_CLUSTER_SCAN_BODY: &str = r#"
         if (tile_off[mid] <= g) { lo = mid; } else { hi = mid; }
     }
     uint c = lo;
-    uint task = task_off[c] + (g - tile_off[c]) * QT + sg;
-    bool active = task < task_off[c + 1];
-    uint flat = active ? order[task] : 0;
-    ulong orow = flat;
-    const device float* qv = q + (ulong)(flat / P) * DIM;
+    uint tbase = task_off[c] + (g - tile_off[c]) * QT;
+    uint nt = min((uint)QT, task_off[c + 1] - tbase);
     uint ms = offsets[c];
     uint me = offsets[c + 1];
-    uint tid = sg * 32 + lane;
-    threadgroup float tile[32 * (DB + 1)];
-    for (uint cs = ms; cs < me; cs += 32) {
-        float acc = 0.0f;
+    bool active = sg < nt;
+    uint flat = active ? order[tbase + sg] : 0;
+    ulong orow = flat;
+"#;
+
+/// Register-tiled cluster-major scan, after [`TOPK_REGS`] and
+/// [`CLUSTER_TILE_LOOKUP`], before [`TOPK_MERGE`]. The tile's `QT` query
+/// blocks are staged in threadgroup memory (`DB` dims at a time); each thread
+/// owns one member of a `32 * QT` chunk, reads it from device memory once and
+/// scores it against all `QT` queries with `QT` accumulators, so one member
+/// load feeds `QT` FMAs (`float4` when `VEC4`). Scores go through threadgroup
+/// memory so SIMD group `sg` can run the top-k insert for task `sg`.
+///
+/// Template args: `K`, `P`, `DIM`, `DB` (a multiple of 4 when `VEC4`), `QT`,
+/// `NLIST`, `VEC4`, `COSINE`.
+const IVF_CLUSTER_TILED_BODY: &str = r#"
+    const uint CHUNK = 32 * QT;
+    threadgroup float4 qs4[QT * ((DB + 3) / 4)];
+    threadgroup float* qs = (threadgroup float*)qs4;
+    threadgroup float sc[QT * 32 * QT];
+    for (uint cs = ms; cs < me; cs += CHUNK) {
+        uint j = cs + tid;
+        bool jv = j < me;
+        const device float* x = db + (ulong)(jv ? j : ms) * DIM;
+        float acc[QT];
+        for (int i = 0; i < QT; i++) { acc[i] = 0.0f; }
         for (uint blk = 0; blk < (uint)DIM; blk += DB) {
             threadgroup_barrier(mem_flags::mem_threadgroup);
-            for (uint e = tid; e < 32u * DB; e += 32u * QT) {
-                uint m = e / DB;
-                uint d = e % DB;
-                uint row = cs + m;
-                uint col = blk + d;
-                tile[m * (DB + 1) + d] =
-                    (row < me && col < (uint)DIM) ? db[(ulong)row * DIM + col] : 0.0f;
+            for (uint e = tid; e < (uint)(QT * DB); e += CHUNK) {
+                uint qq = e / DB;
+                uint col = blk + e % DB;
+                float v = 0.0f;
+                if (qq < nt && col < (uint)DIM) {
+                    v = q[(ulong)(order[tbase + qq] / P) * DIM + col];
+                }
+                qs[e] = v;
             }
             threadgroup_barrier(mem_flags::mem_threadgroup);
-            if (active) {
-                uint dn = min((uint)DB, (uint)DIM - blk);
-                const threadgroup float* xr = tile + lane * (DB + 1);
+            uint dn = min((uint)DB, (uint)DIM - blk);
+            if (VEC4) {
+                const device float4* x4 = (const device float4*)(x + blk);
+                for (uint d4 = 0; d4 < dn / 4; d4++) {
+                    float4 xv = x4[d4];
+                    for (int i = 0; i < QT; i++) {
+                        float4 qv = qs4[i * (DB / 4) + d4];
+                        if (COSINE) {
+                            acc[i] += dot(qv, xv);
+                        } else {
+                            float4 t = qv - xv;
+                            acc[i] += dot(t, t);
+                        }
+                    }
+                }
+            } else {
                 for (uint d = 0; d < dn; d++) {
-                    float qd = qv[blk + d];
-                    if (COSINE) {
-                        acc = fma(qd, xr[d], acc);
-                    } else {
-                        float t = qd - xr[d];
-                        acc = fma(t, t, acc);
+                    float xv = x[blk + d];
+                    for (int i = 0; i < QT; i++) {
+                        float qv = qs[i * DB + d];
+                        if (COSINE) {
+                            acc[i] = fma(qv, xv, acc[i]);
+                        } else {
+                            float t = qv - xv;
+                            acc[i] = fma(t, t, acc[i]);
+                        }
                     }
                 }
             }
         }
-        uint j = cs + lane;
-        if (active && j < me) {
-            float dist = COSINE ? 1.0f - acc : acc;
-            TOPK_INSERT(dist, j);
+        for (int i = 0; i < QT; i++) {
+            sc[i * CHUNK + tid] = jv ? (COSINE ? 1.0f - acc[i] : acc[i]) : INFINITY;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (active) {
+            for (uint m = lane; m < CHUNK; m += 32) {
+                float v = sc[sg * CHUNK + m];
+                TOPK_INSERT(v, cs + m);
+            }
+        }
+    }
+    if (!active) return;
+"#;
+
+/// Header for [`IVF_CLUSTER_MMA_BODY`].
+const SIMDGROUP_MATRIX_HEADER: &str = "#include <metal_simdgroup_matrix>\n";
+
+/// simdgroup_matrix cluster-major scan, after [`TOPK_REGS`] and
+/// [`CLUSTER_TILE_LOOKUP`], before [`TOPK_MERGE`]. `QT` is 8: the tile's 8
+/// query blocks are staged in threadgroup memory (zero beyond `DIM`), and
+/// SIMD group `sg` multiplies them against 4 transposed 8-member tiles loaded
+/// straight from device memory, so a chunk of 256 members costs one 8x8x8
+/// `simdgroup_multiply_accumulate` per (member tile, 8 dims). Reads past
+/// `DIM` or the cluster land on the next row or the index's zero padding rows
+/// and meet a zero query entry or are discarded. Dot products go through
+/// threadgroup memory to the per-task top-k insert; Euclidean is
+/// `|x|^2 - 2 q.x + |q|^2` from precomputed norms.
+///
+/// Template args: `K`, `P`, `DIM`, `DB` (a multiple of 8), `QT` (8),
+/// `NLIST`, `COSINE`.
+const IVF_CLUSTER_MMA_BODY: &str = r#"
+    const uint CHUNK = 32 * QT;
+    threadgroup float qs[QT * DB];
+    threadgroup float sc[QT * 32 * QT];
+    float qnorm = active ? qn[flat / P] : 0.0f;
+    for (uint cs = ms; cs < me; cs += CHUNK) {
+        simdgroup_float8x8 acc[4];
+        for (int t = 0; t < 4; t++) { acc[t] = simdgroup_float8x8(0.0f); }
+        uint m0 = cs + sg * 32;
+        for (uint blk = 0; blk < (uint)DIM; blk += DB) {
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            for (uint e = tid; e < (uint)(QT * DB); e += CHUNK) {
+                uint qq = e / DB;
+                uint col = blk + e % DB;
+                float v = 0.0f;
+                if (qq < nt && col < (uint)DIM) {
+                    v = q[(ulong)(order[tbase + qq] / P) * DIM + col];
+                }
+                qs[e] = v;
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            uint dn = min((uint)DB, (uint)DIM - blk);
+            for (uint kk = 0; kk < dn; kk += 8) {
+                simdgroup_float8x8 a;
+                simdgroup_load(a, qs + kk, DB);
+                for (int t = 0; t < 4; t++) {
+                    uint mt = m0 + t * 8;
+                    if (mt < me) {
+                        simdgroup_float8x8 b;
+                        simdgroup_load(b, db + (ulong)mt * DIM + blk + kk, DIM, ulong2(0, 0), true);
+                        simdgroup_multiply_accumulate(acc[t], a, b, acc[t]);
+                    }
+                }
+            }
+        }
+        for (int t = 0; t < 4; t++) {
+            simdgroup_store(acc[t], sc + sg * 32 + t * 8, CHUNK);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (active) {
+            for (uint m = lane; m < CHUNK; m += 32) {
+                uint j = cs + m;
+                if (j < me) {
+                    float dotv = sc[sg * CHUNK + m];
+                    float v = COSINE ? 1.0f - dotv : xn[j] - 2.0f * dotv + qnorm;
+                    TOPK_INSERT(v, j);
+                }
+            }
         }
     }
     if (!active) return;
@@ -294,19 +405,26 @@ const IVF_PARTIAL_MERGE_BODY: &str = r#"
     }
 "#;
 
-/// Which scan the IVF MLX query runs. Both give the same candidates; they
-/// differ in memory access pattern.
+/// Which scan the IVF MLX query runs. All give the same candidates up to
+/// rounding; they differ in memory access pattern and arithmetic.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum IvfScanMlx {
     /// One SIMD group per query walks its probed clusters; members are read
     /// from device memory once per query that probes them. Loses to
-    /// `ClusterMajor` as `dim` grows, for want of reuse.
+    /// `ClusterMajor` as `dim` grows, for want of reuse, but keeps one warm
+    /// top-k per query, which the cluster-major scans (a cold top-k per
+    /// probe) lack when k approaches the cluster size.
     QueryMajor,
     /// The probe lists are inverted on the device into per-cluster task lists
-    /// and each staged member block is scored against up to
-    /// [`CLUSTER_SCAN_QT`] queries; per-(query, probe) top-k are merged after.
+    /// and each member is scored against up to [`CLUSTER_SCAN_QT`] queries
+    /// with register accumulators, see [`IVF_CLUSTER_TILED_BODY`];
+    /// per-(query, probe) top-k are merged after.
     #[default]
     ClusterMajor,
+    /// Cluster-major with the dot products on `simdgroup_matrix` 8x8 tiles,
+    /// see [`IVF_CLUSTER_MMA_BODY`]. Euclidean goes through the
+    /// `|x|^2 - 2 q.x + |q|^2` expansion, so near-ties can swap.
+    ClusterMatrix,
 }
 
 /// Threadgroup memory plan for the cluster-major scan.
@@ -318,7 +436,8 @@ pub(crate) struct ClusterScanPlan {
     pub qt: usize,
 }
 
-/// Threadgroup bytes the cluster-major scan stages for a given block width.
+/// Threadgroup bytes the cluster-major scans stage: `QT` query blocks of
+/// `db` dims (rounded up to `float4`) plus the `QT x 32 QT` score tile.
 ///
 /// ### Params
 ///
@@ -328,34 +447,37 @@ pub(crate) struct ClusterScanPlan {
 ///
 /// Bytes of threadgroup memory
 pub(crate) fn cluster_scan_smem_bytes(db: usize) -> usize {
-    CLUSTER_SCAN_MEMBERS * (db + 1) * size_of::<f32>()
+    let qt = CLUSTER_SCAN_QT;
+    (qt * db.next_multiple_of(4) + qt * CLUSTER_SCAN_MEMBERS * qt) * size_of::<f32>()
 }
 
-/// Size the cluster-major scan's staging against a threadgroup budget.
+/// Size the cluster-major scan's query staging against a threadgroup budget.
 ///
-/// Blocks the reduction axis rather than shrinking the member block, so the
-/// footprint is independent of `dim`.
+/// Blocks the reduction axis, so the footprint is independent of `dim`.
 ///
 /// ### Params
 ///
 /// * `dim` - Embedding dimensionality
 /// * `smem_bytes` - Threadgroup memory budget
+/// * `align` - Block width granularity: 4 for the `float4` kernel, 8 for the
+///   `simdgroup_matrix` one
 ///
 /// ### Returns
 ///
-/// The plan, or `None` if not even a 4-wide block fits
-pub(crate) fn plan_cluster_scan(dim: usize, smem_bytes: usize) -> Option<ClusterScanPlan> {
-    let fit = (smem_bytes / (CLUSTER_SCAN_MEMBERS * size_of::<f32>())).checked_sub(1)?;
-    let db = if dim <= fit.min(CLUSTER_SCAN_MAX_DB) {
-        dim
-    } else {
-        fit.min(CLUSTER_SCAN_MAX_DB) / 4 * 4
-    };
-    debug_assert!(cluster_scan_smem_bytes(db) <= smem_bytes);
-    (db > 0).then_some(ClusterScanPlan {
-        db,
-        qt: CLUSTER_SCAN_QT,
-    })
+/// The plan, or `None` if not even one `align`-wide block fits
+pub(crate) fn plan_cluster_scan(
+    dim: usize,
+    smem_bytes: usize,
+    align: usize,
+) -> Option<ClusterScanPlan> {
+    let qt = CLUSTER_SCAN_QT;
+    let scores = qt * CLUSTER_SCAN_MEMBERS * qt * size_of::<f32>();
+    let fit = smem_bytes.checked_sub(scores)? / (qt * size_of::<f32>());
+    let cap = fit.min(CLUSTER_SCAN_MAX_DB) / align * align;
+    let full = dim.next_multiple_of(align);
+    let db = if full <= cap { full } else { cap };
+    debug_assert!(db == 0 || cluster_scan_smem_bytes(db) <= smem_bytes);
+    (db > 0).then_some(ClusterScanPlan { db, qt })
 }
 
 /////////////
@@ -462,8 +584,15 @@ pub struct IvfIndexMlx {
     keys_kernel: MetalKernel,
     /// Cluster-major task CSR kernel, see [`IVF_TASK_CSR_SOURCE`]
     csr_kernel: MetalKernel,
-    /// Cluster-major scan kernel, see [`IVF_CLUSTER_SCAN_BODY`]
-    cluster_scan_kernel: MetalKernel,
+    /// Register-tiled cluster-major scan, see [`IVF_CLUSTER_TILED_BODY`]
+    tiled_kernel: MetalKernel,
+    /// `simdgroup_matrix` cluster-major scan, see [`IVF_CLUSTER_MMA_BODY`]
+    mma_kernel: MetalKernel,
+    /// Staging plan for the `simdgroup_matrix` scan (8-wide blocks)
+    mma_plan: Option<ClusterScanPlan>,
+    /// Squared L2 norm per cluster-ordered vector, `[n]`; the Euclidean
+    /// `simdgroup_matrix` scan reads it
+    xn: Array,
     /// Cluster-major partial merge kernel, see [`IVF_PARTIAL_MERGE_BODY`]
     merge_kernel: MetalKernel,
     /// Stream every op runs on. Declared last so it drops after the arrays.
@@ -553,12 +682,25 @@ impl IvfIndexMlx {
             sorted_size_prefix.push(sorted_size_prefix[sorted_size_prefix.len() - 1] + s);
         }
 
-        let db = Array::from_f32(&vectors_flat, &[n as i32, dim as i32]);
+        // Zero rows past the end: the `simdgroup_matrix` scan loads whole 8x8
+        // tiles and may run up to 8 rows past the last cluster.
+        let mut padded = vectors_flat.clone();
+        padded.resize((n + DB_PAD_ROWS) * dim, 0.0);
+        let db = Array::from_f32(&padded, &[(n + DB_PAD_ROWS) as i32, dim as i32]);
+        drop(padded);
+        let xn_host: Vec<f32> = vectors_flat
+            .par_chunks_exact(dim)
+            .map(|r| f32::dot_simd(r, r))
+            .collect();
+        let xn = Array::from_f32(&xn_host, &[n as i32]);
         let offsets_u32: Vec<u32> = cluster_offsets.iter().map(|&o| o as u32).collect();
         let offsets = Array::from_u32(&offsets_u32, &[nlist as i32 + 1]);
         let c = Array::from_f32(&centroids, &[nlist as i32, dim as i32]);
         let centroid_ops = CentroidOperands::new(&c, nlist, &metric, &stream)?;
-        eval_all(&[&db, &offsets, &centroid_ops.ct, &centroid_ops.add], false)?;
+        eval_all(
+            &[&db, &offsets, &xn, &centroid_ops.ct, &centroid_ops.add],
+            false,
+        )?;
 
         Ok(Self {
             vectors_flat,
@@ -585,7 +727,8 @@ impl IvfIndexMlx {
                 &format!("{TOPK_REGS}{IVF_SCAN_BODY}{TOPK_MERGE}"),
             ),
             scan: IvfScanMlx::default(),
-            cluster_plan: plan_cluster_scan(dim, APPLE_THREADGROUP_BYTES),
+            cluster_plan: plan_cluster_scan(dim, APPLE_THREADGROUP_BYTES, 4),
+            mma_plan: plan_cluster_scan(dim, APPLE_THREADGROUP_BYTES, 8),
             keys_kernel: MetalKernel::new(
                 "ivf_probe_keys",
                 &["probe", "offsets", "params"],
@@ -598,12 +741,23 @@ impl IvfIndexMlx {
                 &["task_off", "tile_off"],
                 IVF_TASK_CSR_SOURCE,
             ),
-            cluster_scan_kernel: MetalKernel::new(
-                "ivf_cluster_scan",
+            tiled_kernel: MetalKernel::new(
+                "ivf_cluster_tiled",
                 &["q", "db", "offsets", "order", "task_off", "tile_off"],
                 &["out_idx", "out_dist"],
-                &format!("{TOPK_REGS}{IVF_CLUSTER_SCAN_BODY}{TOPK_MERGE}"),
+                &format!("{TOPK_REGS}{CLUSTER_TILE_LOOKUP}{IVF_CLUSTER_TILED_BODY}{TOPK_MERGE}"),
             ),
+            mma_kernel: MetalKernel::with_header(
+                "ivf_cluster_mma",
+                &[
+                    "q", "db", "offsets", "order", "task_off", "tile_off", "qn", "xn",
+                ],
+                &["out_idx", "out_dist"],
+                SIMDGROUP_MATRIX_HEADER,
+                &format!("{TOPK_REGS}{CLUSTER_TILE_LOOKUP}{IVF_CLUSTER_MMA_BODY}{TOPK_MERGE}"),
+                false,
+            ),
+            xn,
             merge_kernel: MetalKernel::new(
                 "ivf_partial_merge",
                 &["part_idx", "part_dist", "eff"],
@@ -745,6 +899,7 @@ impl IvfIndexMlx {
         pool: usize,
     ) -> Result<(Array, Array), AnnSearchErrors> {
         let s = &self.stream;
+        let q_host = q;
         let q = Array::from_f32(q, &[n_q as i32, self.dim as i32]);
         let ops = &self.centroid_ops;
         let scores = Array::addmm(&ops.add, &q, &ops.ct, ops.alpha, 1.0, s)?;
@@ -774,8 +929,18 @@ impl IvfIndexMlx {
         probe.truncate(1);
         let probe = probe.pop().expect("kernel has two outputs");
 
-        if let (IvfScanMlx::ClusterMajor, Some(plan)) = (self.scan, self.cluster_plan) {
-            return self.queue_cluster_major(&q, &probe, n_q, k, nprobe, pool, plan);
+        let plan = match self.scan {
+            IvfScanMlx::QueryMajor => None,
+            IvfScanMlx::ClusterMatrix => self.mma_plan,
+            _ => self.cluster_plan,
+        };
+        if let Some(plan) = plan {
+            let qn: Vec<f32> = q_host
+                .par_chunks_exact(self.dim)
+                .map(|r| f32::dot_simd(r, r))
+                .collect();
+            let qn = Array::from_f32(&qn, &[n_q as i32]);
+            return self.queue_cluster_major(&q, &qn, &probe, n_q, k, nprobe, pool, plan);
         }
 
         let order = probe
@@ -818,6 +983,7 @@ impl IvfIndexMlx {
     /// ### Params
     ///
     /// * `q` - Query tile on the device, `[n_q, dim]`
+    /// * `qn` - Squared L2 norm per query, `[n_q]`
     /// * `probe` - Probe pool per query, `[n_q, pool]` u32, ascending
     /// * `n_q` - Rows in the tile
     /// * `k` - Number of neighbours, at most `n`
@@ -832,6 +998,7 @@ impl IvfIndexMlx {
     fn queue_cluster_major(
         &self,
         q: &Array,
+        qn: &Array,
         probe: &Array,
         n_q: usize,
         k: usize,
@@ -894,8 +1061,16 @@ impl IvfIndexMlx {
         // Upper bound on the tiles: every cluster's last tile may be partial.
         let max_tiles = n_tasks.div_ceil(plan.qt) + self.nlist;
         let part_shape = [n_tasks as i32, k as i32];
-        let mut part = self.cluster_scan_kernel.apply(
-            &[q, &self.db, &self.offsets, &order, &task_off, &tile_off],
+        let mut inputs = vec![q, &self.db, &self.offsets, &order, &task_off, &tile_off];
+        let (kernel, db) = match self.scan {
+            IvfScanMlx::ClusterMatrix => {
+                inputs.extend([qn, &self.xn]);
+                (&self.mma_kernel, plan.db)
+            }
+            _ => (&self.tiled_kernel, plan.db),
+        };
+        let mut part = kernel.apply(
+            &inputs,
             &[
                 OutputSpec {
                     shape: &part_shape,
@@ -912,9 +1087,10 @@ impl IvfIndexMlx {
                 ("K", k as i32),
                 ("P", pool as i32),
                 ("DIM", self.dim as i32),
-                ("DB", plan.db as i32),
+                ("DB", db as i32),
                 ("QT", plan.qt as i32),
                 ("NLIST", nlist),
+                ("VEC4", self.dim.is_multiple_of(4) as i32),
                 ("COSINE", (self.metric == Dist::Cosine) as i32),
             ],
             s,
@@ -979,7 +1155,7 @@ impl IvfIndexMlx {
         let mut tile = nquery
             .unwrap_or(IVF_MLX_QUERY_BATCH_SIZE)
             .min(score_tile_rows(self.nlist));
-        if self.scan == IvfScanMlx::ClusterMajor {
+        if self.scan != IvfScanMlx::QueryMajor {
             let per_query = pool * k * (size_of::<u32>() + size_of::<f32>());
             tile = tile.min(CLUSTER_PARTIAL_TILE_BYTES / per_query);
         }
@@ -1170,29 +1346,31 @@ mod tests {
 
     #[test]
     fn test_cluster_scan_plan_fits_budgets() {
-        for budget in [4 * 1024, 16 * 1024, 32 * 1024, 48 * 1024, 64 * 1024] {
-            for dim in [1, 3, 4, 30, 32, 100, 128, 129, 256, 768, 1536] {
-                let plan = plan_cluster_scan(dim, budget).unwrap();
-                assert!(cluster_scan_smem_bytes(plan.db) <= budget, "{dim} {budget}");
-                assert!(plan.db >= 1 && plan.db <= dim.min(CLUSTER_SCAN_MAX_DB));
-                // A split reduction axis keeps float4-aligned blocks.
-                assert!(plan.db == dim || plan.db % 4 == 0);
+        for budget in [12 * 1024, 16 * 1024, 32 * 1024, 48 * 1024, 64 * 1024] {
+            for align in [4, 8] {
+                for dim in [1, 3, 4, 30, 32, 100, 128, 129, 256, 768, 1536] {
+                    let plan = plan_cluster_scan(dim, budget, align).unwrap();
+                    assert!(
+                        cluster_scan_smem_bytes(plan.db) <= budget,
+                        "{dim} {budget} {align}"
+                    );
+                    assert_eq!(plan.db % align, 0);
+                    assert!(plan.db <= dim.next_multiple_of(align).min(CLUSTER_SCAN_MAX_DB));
+                }
             }
         }
         // Whole rows up to the cap at the Apple budget, blocked beyond it.
-        assert_eq!(
-            plan_cluster_scan(128, APPLE_THREADGROUP_BYTES).unwrap().db,
-            128
-        );
-        assert_eq!(
-            plan_cluster_scan(768, APPLE_THREADGROUP_BYTES).unwrap().db,
-            128
-        );
-        assert_eq!(plan_cluster_scan(128, 4 * 1024).unwrap().db, 28);
-        assert!(plan_cluster_scan(32, 64).is_none());
+        let apple = APPLE_THREADGROUP_BYTES;
+        assert_eq!(plan_cluster_scan(128, apple, 4).unwrap().db, 128);
+        assert_eq!(plan_cluster_scan(30, apple, 8).unwrap().db, 32);
+        assert_eq!(plan_cluster_scan(768, apple, 4).unwrap().db, 256);
+        assert_eq!(plan_cluster_scan(768, 12 * 1024, 8).unwrap().db, 128);
+        // The score tile alone fills 8 KiB.
+        assert!(plan_cluster_scan(32, 8 * 1024, 4).is_none());
     }
 
-    /// Cluster-major and query-major scans over the same index and queries.
+    /// Every cluster-major scan against the query-major scan over the same
+    /// index and queries.
     ///
     /// ### Params
     ///
@@ -1203,34 +1381,43 @@ mod tests {
         let (n, k, nlist, nprobe) = (4_000, 10, 40, 4);
         let data = blobs(n, dim, 42);
         let queries = blobs(300, dim, 7);
-        let index = IvfIndexMlx::build(data.as_ref(), metric, Some(nlist), None, 1, false).unwrap();
+        let mut index = IvfIndexMlx::build(data.as_ref(), metric, Some(nlist), None, 1, false)
+            .unwrap()
+            .with_scan(IvfScanMlx::QueryMajor);
         let (qm_nn, qm_dist) = index
             .query_batch(queries.as_ref(), k, Some(nprobe), None, false)
             .unwrap();
-        let index = index.with_scan(IvfScanMlx::ClusterMajor);
-        // A small tile so several tiles run.
-        let (cm_nn, cm_dist) = index
-            .query_batch(queries.as_ref(), k, Some(nprobe), Some(70), false)
-            .unwrap();
-        let r = recall(&qm_nn, &cm_nn);
-        assert!(r > 0.995, "{metric:?} dim {dim}: overlap {r}");
-        for (a, b) in qm_dist.iter().zip(&cm_dist) {
-            assert_eq!(a.len(), b.len());
-            for (x, y) in a.iter().zip(b) {
-                assert!((x - y).abs() <= 1e-3 * x.abs().max(1.0), "{x} vs {y}");
+        for scan in [IvfScanMlx::ClusterMajor, IvfScanMlx::ClusterMatrix] {
+            index = index.with_scan(scan);
+            // A small tile so several tiles run.
+            let (cm_nn, cm_dist) = index
+                .query_batch(queries.as_ref(), k, Some(nprobe), Some(70), false)
+                .unwrap();
+            let r = recall(&qm_nn, &cm_nn);
+            assert!(r > 0.995, "{scan:?} {metric:?} dim {dim}: overlap {r}");
+            for (a, b) in qm_dist.iter().zip(&cm_dist) {
+                assert_eq!(a.len(), b.len());
+                for (x, y) in a.iter().zip(b) {
+                    assert!(
+                        (x - y).abs() <= 1e-3 * x.abs().max(1.0),
+                        "{scan:?} {metric:?} dim {dim}: {x} vs {y}"
+                    );
+                }
             }
+            let (self_nn, _) = index
+                .generate_knn(k, Some(nlist), None, false, false)
+                .unwrap();
+            assert!(self_nn.iter().enumerate().all(|(i, row)| row[0] == i));
         }
-        let (self_nn, _) = index
-            .generate_knn(k, Some(nlist), None, false, false)
-            .unwrap();
-        assert!(self_nn.iter().enumerate().all(|(i, row)| row[0] == i));
     }
 
     #[test]
     fn test_mlx_ivf_cluster_major_matches_query_major() {
         check_cluster_major(Dist::SquaredEuclidean, 24);
         check_cluster_major(Dist::Cosine, 30);
-        check_cluster_major(Dist::SquaredEuclidean, 200);
+        check_cluster_major(Dist::SquaredEuclidean, 37);
+        check_cluster_major(Dist::SquaredEuclidean, 300);
+        check_cluster_major(Dist::Cosine, 300);
     }
 
     #[test]
