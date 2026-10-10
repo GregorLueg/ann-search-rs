@@ -448,6 +448,369 @@ impl Array {
     }
 }
 
+//////////////////////////
+// Array ops (IVF MLX) //
+//////////////////////////
+
+unsafe extern "C" {
+    fn mlx_multiply(res: *mut mlx_array, a: mlx_array, b: mlx_array, s: mlx_stream) -> c_int;
+    fn mlx_divide(res: *mut mlx_array, a: mlx_array, b: mlx_array, s: mlx_stream) -> c_int;
+    fn mlx_maximum(res: *mut mlx_array, a: mlx_array, b: mlx_array, s: mlx_stream) -> c_int;
+    fn mlx_greater(res: *mut mlx_array, a: mlx_array, b: mlx_array, s: mlx_stream) -> c_int;
+    fn mlx_where(
+        res: *mut mlx_array,
+        condition: mlx_array,
+        x: mlx_array,
+        y: mlx_array,
+        s: mlx_stream,
+    ) -> c_int;
+    fn mlx_square(res: *mut mlx_array, a: mlx_array, s: mlx_stream) -> c_int;
+    fn mlx_rsqrt(res: *mut mlx_array, a: mlx_array, s: mlx_stream) -> c_int;
+    fn mlx_sum_axis(
+        res: *mut mlx_array,
+        a: mlx_array,
+        axis: c_int,
+        keepdims: bool,
+        s: mlx_stream,
+    ) -> c_int;
+    fn mlx_argsort_axis(res: *mut mlx_array, a: mlx_array, axis: c_int, s: mlx_stream) -> c_int;
+    fn mlx_reshape(
+        res: *mut mlx_array,
+        a: mlx_array,
+        shape: *const c_int,
+        shape_num: usize,
+        s: mlx_stream,
+    ) -> c_int;
+    fn mlx_slice(
+        res: *mut mlx_array,
+        a: mlx_array,
+        start: *const c_int,
+        start_num: usize,
+        stop: *const c_int,
+        stop_num: usize,
+        strides: *const c_int,
+        strides_num: usize,
+        s: mlx_stream,
+    ) -> c_int;
+    fn mlx_scatter_add(
+        res: *mut mlx_array,
+        a: mlx_array,
+        indices: mlx_vector_array,
+        updates: mlx_array,
+        axes: *const c_int,
+        axes_num: usize,
+        s: mlx_stream,
+    ) -> c_int;
+    fn mlx_zeros(
+        res: *mut mlx_array,
+        shape: *const c_int,
+        shape_num: usize,
+        dtype: mlx_dtype,
+        s: mlx_stream,
+    ) -> c_int;
+    fn mlx_ones(
+        res: *mut mlx_array,
+        shape: *const c_int,
+        shape_num: usize,
+        dtype: mlx_dtype,
+        s: mlx_stream,
+    ) -> c_int;
+}
+
+impl Array {
+    /// Copy a row-major u32 buffer into a new array.
+    ///
+    /// ### Params
+    ///
+    /// * `data` - Row-major values, `shape.iter().product()` of them
+    /// * `shape` - Array shape
+    ///
+    /// ### Returns
+    ///
+    /// The owned array
+    pub fn from_u32(data: &[u32], shape: &[i32]) -> Self {
+        debug_assert_eq!(
+            data.len(),
+            shape.iter().map(|&s| s as usize).product::<usize>()
+        );
+        // SAFETY: mlx-c copies `data`, so the borrow only needs to outlive
+        // the call.
+        Self {
+            raw: unsafe {
+                mlx_array_new_data(
+                    data.as_ptr().cast(),
+                    shape.as_ptr(),
+                    shape.len() as c_int,
+                    MLX_UINT32,
+                )
+            },
+        }
+    }
+
+    /// Array of zeros.
+    ///
+    /// ### Params
+    ///
+    /// * `shape` - Array shape
+    /// * `dtype` - Element type
+    /// * `s` - Stream to run on
+    ///
+    /// ### Returns
+    ///
+    /// The (lazy) array
+    pub fn zeros(shape: &[i32], dtype: mlx_dtype, s: &Stream) -> Result<Array, AnnSearchErrors> {
+        op_into("mlx_zeros", |out| unsafe {
+            mlx_zeros(out, shape.as_ptr(), shape.len(), dtype, s.raw)
+        })
+    }
+
+    /// Array of ones.
+    ///
+    /// ### Params
+    ///
+    /// * `shape` - Array shape
+    /// * `dtype` - Element type
+    /// * `s` - Stream to run on
+    ///
+    /// ### Returns
+    ///
+    /// The (lazy) array
+    pub fn ones(shape: &[i32], dtype: mlx_dtype, s: &Stream) -> Result<Array, AnnSearchErrors> {
+        op_into("mlx_ones", |out| unsafe {
+            mlx_ones(out, shape.as_ptr(), shape.len(), dtype, s.raw)
+        })
+    }
+
+    /// Elementwise `self * b`, broadcasting.
+    ///
+    /// ### Params
+    ///
+    /// * `b` - Right operand
+    /// * `s` - Stream to run on
+    ///
+    /// ### Returns
+    ///
+    /// The (lazy) result
+    pub fn multiply(&self, b: &Array, s: &Stream) -> Result<Array, AnnSearchErrors> {
+        op_into("mlx_multiply", |out| unsafe {
+            mlx_multiply(out, self.raw, b.raw, s.raw)
+        })
+    }
+
+    /// Elementwise `self / b`, broadcasting.
+    ///
+    /// ### Params
+    ///
+    /// * `b` - Right operand
+    /// * `s` - Stream to run on
+    ///
+    /// ### Returns
+    ///
+    /// The (lazy) result
+    pub fn divide(&self, b: &Array, s: &Stream) -> Result<Array, AnnSearchErrors> {
+        op_into("mlx_divide", |out| unsafe {
+            mlx_divide(out, self.raw, b.raw, s.raw)
+        })
+    }
+
+    /// Elementwise `max(self, b)`, broadcasting.
+    ///
+    /// ### Params
+    ///
+    /// * `b` - Right operand
+    /// * `s` - Stream to run on
+    ///
+    /// ### Returns
+    ///
+    /// The (lazy) result
+    pub fn maximum(&self, b: &Array, s: &Stream) -> Result<Array, AnnSearchErrors> {
+        op_into("mlx_maximum", |out| unsafe {
+            mlx_maximum(out, self.raw, b.raw, s.raw)
+        })
+    }
+
+    /// Elementwise `self > b` as a bool array, broadcasting.
+    ///
+    /// ### Params
+    ///
+    /// * `b` - Right operand
+    /// * `s` - Stream to run on
+    ///
+    /// ### Returns
+    ///
+    /// The (lazy) result
+    pub fn greater(&self, b: &Array, s: &Stream) -> Result<Array, AnnSearchErrors> {
+        op_into("mlx_greater", |out| unsafe {
+            mlx_greater(out, self.raw, b.raw, s.raw)
+        })
+    }
+
+    /// Elementwise select: `x` where `cond`, else `y`, broadcasting.
+    ///
+    /// ### Params
+    ///
+    /// * `cond` - Boolean mask
+    /// * `x` - Values where the mask is true
+    /// * `y` - Values where the mask is false
+    /// * `s` - Stream to run on
+    ///
+    /// ### Returns
+    ///
+    /// The (lazy) result
+    pub fn select(
+        cond: &Array,
+        x: &Array,
+        y: &Array,
+        s: &Stream,
+    ) -> Result<Array, AnnSearchErrors> {
+        op_into("mlx_where", |out| unsafe {
+            mlx_where(out, cond.raw, x.raw, y.raw, s.raw)
+        })
+    }
+
+    /// Elementwise square.
+    ///
+    /// ### Params
+    ///
+    /// * `s` - Stream to run on
+    ///
+    /// ### Returns
+    ///
+    /// The (lazy) result
+    pub fn square(&self, s: &Stream) -> Result<Array, AnnSearchErrors> {
+        op_into("mlx_square", |out| unsafe {
+            mlx_square(out, self.raw, s.raw)
+        })
+    }
+
+    /// Elementwise reciprocal square root.
+    ///
+    /// ### Params
+    ///
+    /// * `s` - Stream to run on
+    ///
+    /// ### Returns
+    ///
+    /// The (lazy) result
+    pub fn rsqrt(&self, s: &Stream) -> Result<Array, AnnSearchErrors> {
+        op_into("mlx_rsqrt", |out| unsafe {
+            mlx_rsqrt(out, self.raw, s.raw)
+        })
+    }
+
+    /// Sum over one axis.
+    ///
+    /// ### Params
+    ///
+    /// * `axis` - Axis to reduce
+    /// * `keepdims` - Keep the reduced axis with length 1
+    /// * `s` - Stream to run on
+    ///
+    /// ### Returns
+    ///
+    /// The (lazy) result
+    pub fn sum_axis(
+        &self,
+        axis: i32,
+        keepdims: bool,
+        s: &Stream,
+    ) -> Result<Array, AnnSearchErrors> {
+        op_into("mlx_sum_axis", |out| unsafe {
+            mlx_sum_axis(out, self.raw, axis, keepdims, s.raw)
+        })
+    }
+
+    /// Indices that sort along one axis, as u32.
+    ///
+    /// ### Params
+    ///
+    /// * `axis` - Axis to sort
+    /// * `s` - Stream to run on
+    ///
+    /// ### Returns
+    ///
+    /// The (lazy) result
+    pub fn argsort_axis(&self, axis: i32, s: &Stream) -> Result<Array, AnnSearchErrors> {
+        op_into("mlx_argsort_axis", |out| unsafe {
+            mlx_argsort_axis(out, self.raw, axis, s.raw)
+        })
+    }
+
+    /// Reshape (a view where the layout allows).
+    ///
+    /// ### Params
+    ///
+    /// * `shape` - New shape, same element count
+    /// * `s` - Stream to run on
+    ///
+    /// ### Returns
+    ///
+    /// The (lazy) result
+    pub fn reshape(&self, shape: &[i32], s: &Stream) -> Result<Array, AnnSearchErrors> {
+        op_into("mlx_reshape", |out| unsafe {
+            mlx_reshape(out, self.raw, shape.as_ptr(), shape.len(), s.raw)
+        })
+    }
+
+    /// Unit-stride slice `[start, stop)` on every axis.
+    ///
+    /// ### Params
+    ///
+    /// * `start` - Start per axis
+    /// * `stop` - Exclusive stop per axis
+    /// * `s` - Stream to run on
+    ///
+    /// ### Returns
+    ///
+    /// The (lazy) slice
+    pub fn slice(&self, start: &[i32], stop: &[i32], s: &Stream) -> Result<Array, AnnSearchErrors> {
+        let strides = vec![1i32; start.len()];
+        op_into("mlx_slice", |out| unsafe {
+            mlx_slice(
+                out,
+                self.raw,
+                start.as_ptr(),
+                start.len(),
+                stop.as_ptr(),
+                stop.len(),
+                strides.as_ptr(),
+                strides.len(),
+                s.raw,
+            )
+        })
+    }
+
+    /// `self` with `updates` added at `indices` along axis 0. Duplicate
+    /// indices accumulate.
+    ///
+    /// ### Params
+    ///
+    /// * `indices` - Row index per update, shape `[m]`
+    /// * `updates` - Shape `[m, 1, rest of self's shape...]`
+    /// * `s` - Stream to run on
+    ///
+    /// ### Returns
+    ///
+    /// The (lazy) result
+    pub fn scatter_add_rows(
+        &self,
+        indices: &Array,
+        updates: &Array,
+        s: &Stream,
+    ) -> Result<Array, AnnSearchErrors> {
+        let axes = [0 as c_int];
+        // SAFETY: the vector holds a copy of a live handle and is freed below.
+        unsafe {
+            let idx = mlx_vector_array_new_data(&indices.raw, 1);
+            let res = op_into("mlx_scatter_add", |out| {
+                mlx_scatter_add(out, self.raw, idx, updates.raw, axes.as_ptr(), 1, s.raw)
+            });
+            mlx_vector_array_free(idx);
+            res
+        }
+    }
+}
+
 //////////////////
 // Metal kernel //
 //////////////////

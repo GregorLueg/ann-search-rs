@@ -7,3 +7,5 @@
 
 pub mod exhaustive_mlx;
 mod ffi;
+pub mod ivf_mlx;
+pub mod k_means_mlx;

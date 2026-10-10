@@ -27,7 +27,7 @@ use crate::utils::DimensionValidation;
 const MLX_DIST_TILE_BYTES: usize = 512 * 1024 * 1024;
 
 /// Rows per threadgroup in the top-k kernel; one SIMD group per row.
-const TOPK_ROWS_PER_GROUP: i32 = 8;
+pub(crate) const TOPK_ROWS_PER_GROUP: i32 = 8;
 
 /// Metal body of the row top-k. One SIMD group per row: each lane scans a
 /// stride-32 slice keeping a sorted top-K in registers (one compare rejects
@@ -35,7 +35,7 @@ const TOPK_ROWS_PER_GROUP: i32 = 8;
 /// the 32 lists in ascending order. Template args: `K`, row length `N`, and
 /// `VEC4` (rows read as `float4`, needs `N % 4 == 0`), which was the larger of
 /// the two kernel wins.
-const TOPK_SOURCE: &str = r#"
+pub(crate) const TOPK_SOURCE: &str = r#"
     uint lane = thread_position_in_grid.x;
     uint row = thread_position_in_grid.y;
     const device float* drow = d + (ulong)row * N;

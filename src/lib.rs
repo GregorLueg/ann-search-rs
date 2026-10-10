@@ -90,6 +90,8 @@ use crate::binary::{
 use crate::gpu::{exhaustive_gpu::*, ivf_gpu::*};
 #[cfg(feature = "mlx")]
 use crate::mlx::exhaustive_mlx::*;
+#[cfg(feature = "mlx")]
+use crate::mlx::ivf_mlx::*;
 #[cfg(feature = "quantised")]
 use crate::quantised::{
     exhaustive_bf16::*, exhaustive_opq::*, exhaustive_pq::*, exhaustive_sq8::*,
@@ -3357,6 +3359,111 @@ pub fn query_exhaustive_index_mlx_self(
     verbose: bool,
 ) -> KnnOptionResult<f32> {
     index.generate_knn(k, return_dist, verbose)
+}
+
+/////////////
+// IVF MLX //
+/////////////
+
+#[cfg(feature = "mlx")]
+/// Build an IVF index on MLX (experimental, Apple Silicon, f32 only)
+///
+/// ### Params
+///
+/// * `mat` - Input data as samples x features. Accepts a faer matrix, an
+///   ndarray 2-D array (with the `ndarray` feature) or a row-major
+///   `(&[f32], n_samples, n_features)` tuple. See [`AnnMatrix`].
+/// * `nlist` - Number of clusters (defaults to √n)
+/// * `k_means_params` - Optional k-means parameters. Takes the CPU
+///   [KMeansTrainingParams], since the GPU struct needs the `gpu` feature:
+///   `iters`, `init` and `balanced` are honoured, `path` is ignored, and
+///   every iteration runs (no early stop).
+/// * `dist_metric` - Distance metric: "euclidean" or "cosine". "manhattan" is
+///   not supported.
+/// * `seed` - Random seed
+/// * `verbose` - Print progress
+///
+/// ### Returns
+///
+/// The initialised `IvfIndexMlx`
+pub fn build_ivf_index_mlx(
+    mat: impl AnnMatrix<f32>,
+    nlist: Option<usize>,
+    k_means_params: Option<KMeansTrainingParams>,
+    dist_metric: &str,
+    seed: usize,
+    verbose: bool,
+) -> Result<IvfIndexMlx, AnnSearchErrors> {
+    let metric = parse_ann_dist(dist_metric).unwrap_or_else(|| {
+        println!("[WARNING] Weird string used for distance metric. Using default squared Euclidean distance");
+        Dist::default()
+    });
+    IvfIndexMlx::build(
+        mat.into_row_major(),
+        metric,
+        nlist,
+        k_means_params,
+        seed,
+        verbose,
+    )
+}
+
+#[cfg(feature = "mlx")]
+/// Query an IVF MLX index
+///
+/// ### Params
+///
+/// * `query_mat` - Query data as samples x features. Accepts a faer matrix,
+///   an ndarray 2-D array (with the `ndarray` feature) or a row-major
+///   `(&[f32], n_queries, n_features)` tuple. See [`AnnMatrix`].
+/// * `index` - Reference to built index
+/// * `k` - Number of neighbours
+/// * `nprobe` - Clusters to search (defaults to √nlist)
+/// * `nquery` - Queries per device tile
+/// * `return_dist` - Return distances
+/// * `verbose` - Controls verbosity of the function
+///
+/// ### Returns
+///
+/// Tuple of (indices, optional distances)
+pub fn query_ivf_index_mlx(
+    query_mat: impl AnnMatrix<f32>,
+    index: &IvfIndexMlx,
+    k: usize,
+    nprobe: Option<usize>,
+    nquery: Option<usize>,
+    return_dist: bool,
+    verbose: bool,
+) -> KnnOptionResult<f32> {
+    let (indices, distances) =
+        index.query_batch(query_mat.into_row_major(), k, nprobe, nquery, verbose)?;
+    Ok((indices, return_dist.then_some(distances)))
+}
+
+#[cfg(feature = "mlx")]
+/// Query an IVF MLX index against itself (full kNN graph)
+///
+/// ### Params
+///
+/// * `index` - Reference to built index
+/// * `k` - Number of neighbours, self included
+/// * `nprobe` - Clusters to search (defaults to √nlist)
+/// * `nquery` - Queries per device tile
+/// * `return_dist` - Return distances
+/// * `verbose` - Controls verbosity of the function
+///
+/// ### Returns
+///
+/// Tuple of (indices, optional distances)
+pub fn query_ivf_index_mlx_self(
+    index: &IvfIndexMlx,
+    k: usize,
+    nprobe: Option<usize>,
+    nquery: Option<usize>,
+    return_dist: bool,
+    verbose: bool,
+) -> KnnOptionResult<f32> {
+    index.generate_knn(k, nprobe, nquery, return_dist, verbose)
 }
 
 //////////////
