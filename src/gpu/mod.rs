@@ -17,6 +17,7 @@ pub mod nndescent_gpu;
 pub mod topk_gpu;
 
 use cubecl_utils_rs::prelude::*;
+use rayon::prelude::*;
 
 use crate::prelude::*;
 
@@ -97,6 +98,21 @@ pub const EXH_SMEM_TARGET: usize = 4096;
 // Helpers //
 /////////////
 
+/// Unit-normalise every row in place, for the cosine kernels.
+///
+/// Every GPU kernel scores cosine as `1 - dot` and expects both operands on
+/// the unit sphere. A zero row stays zero, so it scores `1` against everything,
+/// matching the CPU indices instead of producing `NaN`.
+///
+/// ### Params
+///
+/// * `data` - Row-major vectors; padding columns are zero and do not change
+///   the norm
+/// * `dim` - Row length
+pub fn normalise_rows<T: AnnSearchFloat>(data: &mut [T], dim: usize) {
+    data.par_chunks_exact_mut(dim).for_each(normalise_vector);
+}
+
 /// Whether the register-tiled distance kernel can be used for a given query
 /// tile height.
 ///
@@ -118,8 +134,8 @@ pub fn tile_fits(wg_y: u32) -> bool {
 /// Per-cube shared-memory footprint of the widest distance kernel.
 ///
 /// The worst case is `compute_ivf_mega_cached`: `s_query` holds
-/// `wg_y * dim_padded` elements, `s_query_norms` another `wg_y`, and four u32
-/// task-metadata arrays contribute `wg_y` slots each.
+/// `wg_y * dim_padded` elements and four u32 task-metadata arrays contribute
+/// `wg_y` slots each.
 ///
 /// ### Params
 ///
@@ -131,7 +147,7 @@ pub fn tile_fits(wg_y: u32) -> bool {
 ///
 /// Bytes of shared memory one cube allocates.
 pub fn mega_smem_bytes(wg_y: u32, dim_padded: usize, elem_bytes: usize) -> usize {
-    wg_y as usize * (dim_padded * elem_bytes + elem_bytes + 4 * 4)
+    wg_y as usize * (dim_padded * elem_bytes + 4 * 4)
 }
 
 /// Pick the largest workgroup Y size that fits this device.
@@ -320,10 +336,6 @@ pub struct LocalJoinStaging {
     /// is `dim_padded / LINE_SIZE` plus whatever `resolve_row_pad` adds to
     /// offset consecutive rows across shared-memory banks.
     pub row_lines: usize,
-    /// Length of the candidate-norm buffer: `max_cands` under cosine, `1`
-    /// otherwise. Euclidean never reads it, so allocating it at full width
-    /// would spend shared memory the vector staging wants.
-    pub norm_buf_len: usize,
     /// Lines the pair-distance loop processes per unrolled step, and therefore
     /// how many independent accumulator chains it keeps in flight.
     pub line_unroll: usize,
@@ -470,27 +482,26 @@ pub fn local_join_smem_bytes(
     max_cands: usize,
     elem_bytes: usize,
 ) -> usize {
-    local_join_meta_bytes(max_cands, plan.norm_buf_len, elem_bytes)
+    local_join_meta_bytes(max_cands, elem_bytes)
         + (plan.buf_a_lines + plan.buf_b_lines) * LINE_SIZE * elem_bytes
 }
 
 /// Shared-memory the local join spends on per-candidate scalars.
 ///
-/// `shared_pids` and `shared_is_new` hold a u32 each, `shared_thresh` a float,
-/// and `shared_norms` a float per candidate under cosine only. All four are
-/// indexed by absolute candidate id and are therefore never blocked.
+/// `shared_pids` and `shared_is_new` hold a u32 each and `shared_thresh` a
+/// float. All three are indexed by absolute candidate id and are therefore
+/// never blocked.
 ///
 /// ### Params
 ///
 /// * `max_cands` - Maximum candidates per node, i.e. `2 * build_k`
-/// * `norm_buf_len` - Length of the candidate-norm buffer
 /// * `elem_bytes` - Size of the float element type in bytes
 ///
 /// ### Returns
 ///
 /// Bytes of shared memory the non-vector staging occupies.
-fn local_join_meta_bytes(max_cands: usize, norm_buf_len: usize, elem_bytes: usize) -> usize {
-    max_cands * (2 * 4 + elem_bytes) + norm_buf_len * elem_bytes + LOCAL_JOIN_FIXED_BYTES
+fn local_join_meta_bytes(max_cands: usize, elem_bytes: usize) -> usize {
+    max_cands * (2 * 4 + elem_bytes) + LOCAL_JOIN_FIXED_BYTES
 }
 
 /// Plan how the NNDescent local join stages candidate vectors in shared memory.
@@ -510,8 +521,6 @@ fn local_join_meta_bytes(max_cands: usize, norm_buf_len: usize, elem_bytes: usiz
 ///   i.e. `min(2 * build_k, 2 * cap)`. Sizes the vector staging, which is the
 ///   footprint that matters
 /// * `elem_bytes` - Size of the float element type in bytes
-/// * `use_cosine` - Whether the kernel takes its cosine arm, which is the only
-///   one that stages candidate norms
 /// * `limits` - Device limits from `GpuLimits::from_client`
 ///
 /// ### Returns
@@ -523,13 +532,11 @@ pub fn plan_local_join_staging(
     max_cands: usize,
     max_joined: usize,
     elem_bytes: usize,
-    use_cosine: bool,
     limits: &GpuLimits,
 ) -> Result<LocalJoinStaging, AnnSearchErrors> {
     let max_shared_bytes = limits.max_shared_bytes;
 
-    let norm_buf_len = if use_cosine { max_cands } else { 1 };
-    let metadata_bytes = local_join_meta_bytes(max_cands, norm_buf_len, elem_bytes);
+    let metadata_bytes = local_join_meta_bytes(max_cands, elem_bytes);
     let dim_lines = dim_padded / LINE_SIZE;
     let row_lines = dim_lines + resolve_row_pad(dim_lines);
     let vec_bytes = row_lines * LINE_SIZE * elem_bytes;
@@ -556,7 +563,6 @@ pub fn plan_local_join_staging(
             buf_a_lines: max_joined * row_lines,
             buf_b_lines: 1,
             row_lines,
-            norm_buf_len,
             line_unroll: resolve_line_unroll(dim_lines),
             cube_x,
             cube_y,
@@ -572,7 +578,6 @@ pub fn plan_local_join_staging(
         buf_a_lines: block * row_lines,
         buf_b_lines: block * row_lines,
         row_lines,
-        norm_buf_len,
         line_unroll: resolve_line_unroll(dim_lines),
         cube_x,
         cube_y,
@@ -627,12 +632,11 @@ pub fn plan_beam_search_staging(
     limits: &GpuLimits,
 ) -> Result<BeamSearchStaging, AnnSearchErrors> {
     // sq_vec + s_cand_{dist,idx,expanded} + s_nbr_{idx,dist}
-    // + s_active_flag + s_num_cands + s_hash_count + s_query_norm
+    // + s_active_flag + s_num_cands + s_hash_count
     let fixed = dim_padded * elem_bytes
         + beam_width * (elem_bytes + 2 * 4)
         + k_graph * expand_per_iter * (4 + elem_bytes)
-        + 3 * 4
-        + elem_bytes;
+        + 3 * 4;
 
     let mut hash_size = preferred_hash.max(MIN_HASH_SIZE);
     while hash_size >= MIN_HASH_SIZE {
@@ -860,73 +864,64 @@ mod tests {
                 };
                 for dim in [32usize, 64, 128, 256, 512, 1024, 2048] {
                     for max_cands in [60usize, 90, 128] {
-                        for cosine in [false, true] {
-                            let Ok(plan) = plan_local_join_staging(
-                                dim, max_cands, max_cands, elem, cosine, &l,
-                            ) else {
-                                continue;
-                            };
-                            let tag = format!("{shared}/{elem}/{dim}/{max_cands}/{cosine}");
+                        let Ok(plan) = plan_local_join_staging(dim, max_cands, max_cands, elem, &l)
+                        else {
+                            continue;
+                        };
+                        let tag = format!("{shared}/{elem}/{dim}/{max_cands}");
 
-                            assert!(
-                                local_join_smem_bytes(&plan, max_cands, elem) <= shared,
-                                "over budget: {tag}"
-                            );
+                        assert!(
+                            local_join_smem_bytes(&plan, max_cands, elem) <= shared,
+                            "over budget: {tag}"
+                        );
 
-                            // Lengths are in lines, not scalars. Mixing the two
-                            // up over-allocates by LINE_SIZE, which busts the
-                            // budget and makes the dispatch silently do
-                            // nothing, so assert the unit and not just the
-                            // total.
-                            assert_eq!(plan.buf_a_lines % plan.row_lines, 0, "ragged buf_a: {tag}");
-                            assert_eq!(
-                                plan.buf_a_lines / plan.row_lines,
-                                plan.block,
-                                "buf_a rows: {tag}"
-                            );
-                            assert!(
-                                plan.row_lines >= dim / LINE_SIZE,
-                                "row stride shorter than the row: {tag}"
-                            );
-                            assert!(plan.block >= 1 && plan.block <= max_cands, "block: {tag}");
+                        // Lengths are in lines, not scalars. Mixing the two
+                        // up over-allocates by LINE_SIZE, which busts the
+                        // budget and makes the dispatch silently do
+                        // nothing, so assert the unit and not just the
+                        // total.
+                        assert_eq!(plan.buf_a_lines % plan.row_lines, 0, "ragged buf_a: {tag}");
+                        assert_eq!(
+                            plan.buf_a_lines / plan.row_lines,
+                            plan.block,
+                            "buf_a rows: {tag}"
+                        );
+                        assert!(
+                            plan.row_lines >= dim / LINE_SIZE,
+                            "row stride shorter than the row: {tag}"
+                        );
+                        assert!(plan.block >= 1 && plan.block <= max_cands, "block: {tag}");
 
-                            assert_eq!(
-                                plan.single_block,
-                                plan.block == max_cands,
-                                "flag disagrees with block: {tag}"
-                            );
-                            assert_eq!(
-                                plan.buf_b_lines == 1,
-                                plan.single_block,
-                                "buf_b must be the dummy iff single-block: {tag}"
-                            );
+                        assert_eq!(
+                            plan.single_block,
+                            plan.block == max_cands,
+                            "flag disagrees with block: {tag}"
+                        );
+                        assert_eq!(
+                            plan.buf_b_lines == 1,
+                            plan.single_block,
+                            "buf_b must be the dummy iff single-block: {tag}"
+                        );
 
-                            assert_eq!(
-                                plan.norm_buf_len,
-                                if cosine { max_cands } else { 1 },
-                                "norm buffer: {tag}"
-                            );
+                        // A cube over a device limit is a dispatch that
+                        // does nothing and reports no error.
+                        let threads = plan.cube_x * plan.cube_y;
+                        assert!(threads <= l.max_units_per_cube, "cube units: {tag}");
+                        assert!(plan.cube_x <= l.max_cube_dim.0, "cube x: {tag}");
+                        assert!(plan.cube_y <= l.max_cube_dim.1, "cube y: {tag}");
+                        // x-major except when x itself is clamped by a
+                        // narrow device, which is the one legal inversion.
+                        assert!(
+                            plan.cube_x >= plan.cube_y || plan.cube_x == l.max_cube_dim.0,
+                            "cube not x-major: {tag}"
+                        );
+                        assert!(threads.is_power_of_two(), "cube not a power of two: {tag}");
 
-                            // A cube over a device limit is a dispatch that
-                            // does nothing and reports no error.
-                            let threads = plan.cube_x * plan.cube_y;
-                            assert!(threads <= l.max_units_per_cube, "cube units: {tag}");
-                            assert!(plan.cube_x <= l.max_cube_dim.0, "cube x: {tag}");
-                            assert!(plan.cube_y <= l.max_cube_dim.1, "cube y: {tag}");
-                            // x-major except when x itself is clamped by a
-                            // narrow device, which is the one legal inversion.
-                            assert!(
-                                plan.cube_x >= plan.cube_y || plan.cube_x == l.max_cube_dim.0,
-                                "cube not x-major: {tag}"
-                            );
-                            assert!(threads.is_power_of_two(), "cube not a power of two: {tag}");
-
-                            assert!(plan.line_unroll >= 1, "unroll: {tag}");
-                            assert!(
-                                plan.line_unroll <= dim / LINE_SIZE,
-                                "unroll past the row: {tag}"
-                            );
-                        }
+                        assert!(plan.line_unroll >= 1, "unroll: {tag}");
+                        assert!(
+                            plan.line_unroll <= dim / LINE_SIZE,
+                            "unroll past the row: {tag}"
+                        );
                     }
                 }
             }
@@ -939,23 +934,20 @@ mod tests {
         // bigger block. These are the directions a retune could silently
         // invert.
         for dim in [128usize, 256, 512, 1024] {
-            let big = plan_local_join_staging(dim, 90, 90, 4, false, &apple()).unwrap();
+            let big = plan_local_join_staging(dim, 90, 90, 4, &apple()).unwrap();
 
             let half = GpuLimits {
                 max_shared_bytes: apple().max_shared_bytes / 2,
                 ..apple()
             };
-            let smaller = plan_local_join_staging(dim, 90, 90, 4, false, &half).unwrap();
+            let smaller = plan_local_join_staging(dim, 90, 90, 4, &half).unwrap();
             assert!(
                 smaller.block <= big.block,
                 "half budget grew block at {dim}"
             );
 
-            let f64_plan = plan_local_join_staging(dim, 90, 90, 8, false, &apple()).unwrap();
+            let f64_plan = plan_local_join_staging(dim, 90, 90, 8, &apple()).unwrap();
             assert!(f64_plan.block <= big.block, "f64 grew block at {dim}");
-
-            let cos = plan_local_join_staging(dim, 90, 90, 4, true, &apple()).unwrap();
-            assert!(cos.block <= big.block, "cosine grew block at {dim}");
         }
     }
 
@@ -972,7 +964,7 @@ mod tests {
             (512, 7, false),
             (1024, 3, false),
         ] {
-            let plan = plan_local_join_staging(dim, 90, 90, 4, false, &apple()).unwrap();
+            let plan = plan_local_join_staging(dim, 90, 90, 4, &apple()).unwrap();
             assert_eq!(plan.block, block, "block moved at dim {dim}");
             assert_eq!(plan.single_block, single, "path moved at dim {dim}");
             assert_eq!(
@@ -993,7 +985,7 @@ mod tests {
             max_cube_dim: (64, 64, 64),
             ..apple()
         };
-        let plan = plan_local_join_staging(128, 90, 90, 4, false, &narrow).unwrap();
+        let plan = plan_local_join_staging(128, 90, 90, 4, &narrow).unwrap();
         assert!(plan.cube_x * plan.cube_y <= 64);
         assert!(plan.cube_x >= plan.cube_y);
     }
@@ -1002,8 +994,8 @@ mod tests {
     fn test_plan_local_join_errors_only_past_the_boundary() {
         // Two f32 vectors plus the metadata have to fit. At 32 KiB and 90
         // candidates, 2048 is the last width that does and 4096 is not.
-        assert!(plan_local_join_staging(2048, 90, 90, 4, false, &apple()).is_ok());
-        assert!(plan_local_join_staging(4096, 90, 90, 4, false, &apple()).is_err());
+        assert!(plan_local_join_staging(2048, 90, 90, 4, &apple()).is_ok());
+        assert!(plan_local_join_staging(4096, 90, 90, 4, &apple()).is_err());
     }
 
     #[test]
@@ -1011,8 +1003,8 @@ mod tests {
         // k = 100 gives build_k = 150, so 300 candidates load but only 64
         // survive a cap of 32 per kind. Staging for 300 would block at dim 32;
         // staging for 64 is a single block.
-        let uncapped = plan_local_join_staging(32, 300, 300, 4, false, &apple()).unwrap();
-        let capped = plan_local_join_staging(32, 300, 64, 4, false, &apple()).unwrap();
+        let uncapped = plan_local_join_staging(32, 300, 300, 4, &apple()).unwrap();
+        let capped = plan_local_join_staging(32, 300, 64, 4, &apple()).unwrap();
         assert!(!uncapped.single_block);
         assert!(capped.single_block);
         assert_eq!(capped.block, 64);

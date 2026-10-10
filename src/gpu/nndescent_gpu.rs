@@ -164,13 +164,12 @@ fn dist_sq_euclidean<F: Float + CubePrimitive, N: Size>(
 
 /// Cosine distance (1 - cosine similarity) between vectors at `a` and `b`.
 ///
-/// Requires pre-computed L2 norms.
+/// Requires unit-normalised rows, so the distance is `1 - dot`.
 ///
 /// ### Params
 ///
 /// * `vectors` - Row-major vector matrix, vectorised along the feature
 ///   dimension
-/// * `norms` - Pre-computed L2 norms, one per row
 /// * `a` - Row index of the first vector
 /// * `b` - Row index of the second vector
 /// * `dim_lines` - Number of `Vector<F, N>` elements per vector row (comptime)
@@ -181,7 +180,6 @@ fn dist_sq_euclidean<F: Float + CubePrimitive, N: Size>(
 #[cube]
 fn dist_cosine<F: Float, N: Size>(
     vectors: &Tensor<Vector<F, N>>,
-    norms: &Tensor<F>,
     a: u32,
     b: u32,
     #[comptime] dim_lines: usize,
@@ -199,7 +197,7 @@ fn dist_cosine<F: Float, N: Size>(
             dot += prod[lane];
         }
     }
-    F::new(1.0_f32) - dot / (norms[a as usize] * norms[b as usize])
+    F::new(1.0_f32) - dot
 }
 
 /// Distance between two candidate rows already staged in shared memory.
@@ -222,11 +220,8 @@ fn dist_cosine<F: Float, N: Size>(
 /// * `vecs_a` - Staging buffer holding the first row
 /// * `vecs_b` - Staging buffer holding the second row. The same buffer as
 ///   `vecs_a` on the unblocked and diagonal paths
-/// * `norms` - Staged candidate norms, only read under cosine
 /// * `row_a` - Line offset of the first row within `vecs_a`
 /// * `row_b` - Line offset of the second row within `vecs_b`
-/// * `cand_a` - Absolute candidate id of the first row, for its norm
-/// * `cand_b` - Absolute candidate id of the second row, for its norm
 /// * `use_cosine` - Whether to compute cosine rather than squared Euclidean
 ///   distance (comptime)
 /// * `dim_lines` - Number of `Vector<F, N>` elements per vector row (comptime)
@@ -235,17 +230,14 @@ fn dist_cosine<F: Float, N: Size>(
 ///
 /// ### Returns
 ///
-/// Squared Euclidean distance, or cosine distance in the range [0, 2].
+/// Squared Euclidean distance, or cosine distance in the range [0, 2] on
+/// unit-normalised rows.
 #[cube]
-#[allow(clippy::too_many_arguments)]
 fn staged_pair_dist<F: Float, N: Size>(
     vecs_a: &SharedMemory<Vector<F, N>>,
     vecs_b: &SharedMemory<Vector<F, N>>,
-    norms: &SharedMemory<F>,
     row_a: usize,
     row_b: usize,
-    cand_a: usize,
-    cand_b: usize,
     #[comptime] use_cosine: bool,
     #[comptime] dim_lines: usize,
     #[comptime] unroll: usize,
@@ -303,7 +295,7 @@ fn staged_pair_dist<F: Float, N: Size>(
 
     let mut dist = sum;
     if use_cosine {
-        dist = F::new(1.0_f32) - sum / (norms[cand_a] * norms[cand_b]);
+        dist = F::new(1.0_f32) - sum;
     }
     dist
 }
@@ -326,7 +318,6 @@ fn staged_pair_dist<F: Float, N: Size>(
 ///
 /// * `vectors` - Row-major vector matrix, line-vectorised along the feature
 ///   dimension
-/// * `norms` - Pre-computed L2 norms (ignored when `use_cosine` is false)
 /// * `n_pts` - Number of vectors
 /// * `seed` - Random seed for neighbour generation
 /// * `use_cosine` - Whether to use cosine distance instead of squared Euclidean
@@ -352,7 +343,6 @@ fn staged_pair_dist<F: Float, N: Size>(
 #[cube(launch_unchecked)]
 pub fn init_random_graph<F: Float, N: Size>(
     vectors: &Tensor<Vector<F, N>>,
-    norms: &Tensor<F>,
     graph_idx: &mut Tensor<u32>,
     graph_dist: &mut Tensor<F>,
     n_pts: u32,
@@ -401,7 +391,7 @@ pub fn init_random_graph<F: Float, N: Size>(
         }
 
         let dist = if use_cosine {
-            dist_cosine(vectors, norms, node, pid, dim_lines)
+            dist_cosine(vectors, node, pid, dim_lines)
         } else {
             dist_sq_euclidean(vectors, node, pid, dim_lines)
         };
@@ -575,7 +565,6 @@ fn emit_pair<F: Float>(
 /// ### Params
 ///
 /// * `vectors` - Row-major vector matrix, line-vectorised along the feature dimension
-/// * `norms` - Pre-computed L2 norms (ignored when `use_cosine` is false)
 /// * `graph_idx` - Current kNN graph indices (with IS_NEW flag in MSB)
 /// * `graph_dist` - Current kNN graph distances. Each candidate's worst
 ///   neighbour distance is staged into `shared_thresh` once per node and the
@@ -598,15 +587,13 @@ fn emit_pair<F: Float>(
 /// * `single_block` - Whether every candidate fits in one buffer (comptime)
 /// * `vec_buf_a` - Length of the first vector buffer in lines (comptime)
 /// * `vec_buf_b` - Length of the second vector buffer in lines (comptime)
-/// * `norm_buf_len` - Length of the candidate-norm buffer: `2 * build_k` under
-///   cosine, `1` otherwise (comptime)
 /// * `line_unroll` - Lines the pair-distance loop processes per unrolled step
 ///   (comptime)
 ///
 /// ### Shared memory
 ///
-/// Candidate metadata (`shared_pids`, `shared_is_new`, `shared_thresh`, plus
-/// `shared_norms` under cosine) is always staged in full and indexed by
+/// Candidate metadata (`shared_pids`, `shared_is_new`, `shared_thresh`) is
+/// always staged in full and indexed by
 /// absolute candidate id. Only the vectors are blocked, because they dominate
 /// the footprint. Staging all of them at once busts the device limit past dim
 /// 128 at the default k, and the dispatch then silently does nothing. See
@@ -628,7 +615,6 @@ fn emit_pair<F: Float>(
 #[cube(launch_unchecked)]
 pub fn local_join_shared<F: Float, N: Size>(
     vectors: &Tensor<Vector<F, N>>,
-    norms: &Tensor<F>,
     graph_idx: &mut Tensor<u32>,
     graph_dist: &Tensor<F>,
     reverse_idx: &Tensor<u32>,
@@ -649,7 +635,6 @@ pub fn local_join_shared<F: Float, N: Size>(
     #[comptime] single_block: bool,
     #[comptime] vec_buf_a: usize,
     #[comptime] vec_buf_b: usize,
-    #[comptime] norm_buf_len: usize,
     #[comptime] line_unroll: usize,
 ) {
     let node = CUBE_POS_Y * CUBE_COUNT_X + CUBE_POS_X;
@@ -667,7 +652,6 @@ pub fn local_join_shared<F: Float, N: Size>(
     let mut shared_vecs_b = SharedMemory::<Vector<F, N>>::new(vec_buf_b);
     let mut shared_pids = SharedMemory::<u32>::new(max_cands_comp);
     let mut shared_is_new = SharedMemory::<u32>::new(max_cands_comp);
-    let mut shared_norms = SharedMemory::<F>::new(norm_buf_len);
     let mut shared_thresh = SharedMemory::<F>::new(max_cands_comp);
 
     // Compacted candidate count and whether any new candidates exist
@@ -762,9 +746,6 @@ pub fn local_join_shared<F: Float, N: Size>(
         let pid = shared_pids[i_meta as usize];
         shared_thresh[i_meta as usize] =
             graph_dist[pid as usize * k as usize + k as usize - 1usize];
-        if use_cosine {
-            shared_norms[i_meta as usize] = norms[pid as usize];
-        }
         i_meta += CUBE_DIM;
     }
     sync_cube();
@@ -806,11 +787,8 @@ pub fn local_join_shared<F: Float, N: Size>(
                     let dist = staged_pair_dist::<F, N>(
                         &shared_vecs_a,
                         &shared_vecs_a,
-                        &shared_norms,
                         i * row_lines,
                         j * row_lines,
-                        i,
-                        j,
                         use_cosine,
                         dim_lines,
                         line_unroll,
@@ -887,11 +865,8 @@ pub fn local_join_shared<F: Float, N: Size>(
                         let dist = staged_pair_dist::<F, N>(
                             &shared_vecs_a,
                             &shared_vecs_a,
-                            &shared_norms,
                             ii * row_lines,
                             jj * row_lines,
-                            abs_i,
-                            abs_j,
                             use_cosine,
                             dim_lines,
                             line_unroll,
@@ -960,11 +935,8 @@ pub fn local_join_shared<F: Float, N: Size>(
                             let dist = staged_pair_dist::<F, N>(
                                 &shared_vecs_a,
                                 &shared_vecs_b,
-                                &shared_norms,
                                 oi * row_lines,
                                 oj * row_lines,
-                                abs_i,
-                                abs_j,
                                 use_cosine,
                                 dim_lines,
                                 line_unroll,
@@ -1424,7 +1396,6 @@ where
 ///
 /// * `vectors` - Row-major vector matrix, line-vectorised along the feature
 ///   dimension
-/// * `norms` - Pre-computed L2 norms (ignored when `use_cosine` is false)
 /// * `graph_idx` - Current kNN graph indices (with IS_NEW flag in MSB)
 /// * `graph_dist` - Current kNN graph distances
 /// * `prop_idx` - Output proposal indices, row-major `[n, max_proposals]`
@@ -1446,7 +1417,6 @@ where
 #[cube(launch_unchecked)]
 pub fn two_hop_refinement<F: Float, N: Size>(
     vectors: &Tensor<Vector<F, N>>,
-    norms: &Tensor<F>,
     graph_idx: &Tensor<u32>,
     graph_dist: &Tensor<F>,
     prop_idx: &mut Tensor<u32>,
@@ -1497,7 +1467,6 @@ pub fn two_hop_refinement<F: Float, N: Size>(
     sync_cube();
 
     let worst_dist = shared_worst_dist[0usize];
-    let node_norm = norms[node as usize];
     let num_candidates = k * k;
     let mut cand_idx = tx as usize;
 
@@ -1544,7 +1513,7 @@ pub fn two_hop_refinement<F: Float, N: Size>(
                     }
 
                     let dist = if use_cosine {
-                        F::new(1.0_f32) - (sum / (node_norm * norms[cand_pid as usize]))
+                        F::new(1.0_f32) - sum
                     } else {
                         sum
                     };
@@ -1848,10 +1817,8 @@ pub struct NNDescentGpu<T: AnnSearchFloat + CubeclFloat, R: Runtime> {
     dim_padded: usize,
     /// GPU-resident CAGRA navigational graph [n, k] (raw u32 node IDs)
     nav_graph_gpu: Option<GpuTensor<R, u32>>,
-    /// GPU-resident vectors [n, dim_padded]
+    /// GPU-resident vectors [n, dim_padded], unit-normalised under cosine
     vectors_gpu: Option<GpuTensor<R, T>>,
-    /// GPU-resident norms [n] (cosine) or [1] (euclidean)
-    norms_gpu: Option<GpuTensor<R, T>>,
 }
 
 ////////////////////
@@ -1953,7 +1920,7 @@ where
     ///   (default `0`)
     /// * `seed` - Random seed
     /// * `verbose` - Print progress
-    /// * `retain_gpu` - Keep the vectors, norms and navigational graph
+    /// * `retain_gpu` - Keep the vectors and navigational graph
     ///   device-resident after the build so a later beam search does not
     ///   re-upload them
     /// * `device` - CubeCL runtime device
@@ -1994,11 +1961,14 @@ where
 
         let dim_padded = dim.next_multiple_of(LINE_SIZE);
 
-        let vectors_padded = if dim_padded != dim {
+        let mut vectors_padded = if dim_padded != dim {
             pad_vectors(&vectors_flat, n, dim, dim_padded)
         } else {
             vectors_flat.clone()
         };
+        if metric == Dist::Cosine {
+            normalise_rows(&mut vectors_padded, dim_padded);
+        }
 
         let norms = if metric == Dist::Cosine {
             (0..n)
@@ -2043,10 +2013,8 @@ where
             router,
             graph_idx_gpu,
             vectors_gpu,
-            norms_gpu,
         } = nndescent_core::<T, R>(
             &vectors_padded,
-            &norms,
             n,
             dim,
             dim_padded,
@@ -2126,10 +2094,10 @@ where
             println!("  Total build time: {:.2?}", start.elapsed());
         }
 
-        let (nav_graph_gpu, vectors_gpu, norms_gpu) = if retain_gpu {
-            (Some(final_idx_gpu), Some(vectors_gpu), Some(norms_gpu))
+        let (nav_graph_gpu, vectors_gpu) = if retain_gpu {
+            (Some(final_idx_gpu), Some(vectors_gpu))
         } else {
-            (None, None, None)
+            (None, None)
         };
 
         Ok(Self {
@@ -2147,7 +2115,6 @@ where
             converged,
             nav_graph_gpu,
             vectors_gpu,
-            norms_gpu,
             _device: device,
         })
     }
@@ -2202,7 +2169,6 @@ where
             n_queries,
             self.dim,
             self.vectors_gpu.as_ref().unwrap(),
-            self.norms_gpu.as_ref().unwrap(),
             self.nav_graph_gpu.as_ref().unwrap(),
             self.n,
             self.k,
@@ -2246,6 +2212,15 @@ where
                 } else {
                     T::one()
                 };
+                // The forest was built on the unit-normalised rows, so a cosine
+                // query is routed on the sphere too.
+                let routed = if use_cosine {
+                    let mut unit = query.to_vec();
+                    normalise_vector(&mut unit);
+                    std::borrow::Cow::Owned(unit)
+                } else {
+                    std::borrow::Cow::Borrowed(query)
+                };
 
                 // Score each candidate once, then select. The router returns
                 // whole leaves, hundreds of rows, and a sort comparator that
@@ -2253,7 +2228,7 @@ where
                 // per candidate, which dominates the query at high dim.
                 let mut scored: Vec<(T, usize)> = self
                     .router
-                    .find_entry_points(query, n_entry * 4)
+                    .find_entry_points(&routed, n_entry * 4)
                     .into_iter()
                     .filter(|&c| c != medoid as usize)
                     .map(|c| {
@@ -2415,14 +2390,11 @@ where
             })
             .collect();
 
-        let queries_flat = self.vectors_flat.clone();
-
         cagra_search_batch_gpu(
-            &queries_flat,
+            &self.vectors_flat,
             self.n,
             self.dim,
             self.vectors_gpu.as_ref().unwrap(),
-            self.norms_gpu.as_ref().unwrap(),
             self.nav_graph_gpu.as_ref().unwrap(),
             self.n,
             self.k,
@@ -2438,14 +2410,14 @@ where
     /// Ensure GPU tensors are resident, re-uploading from CPU data if needed.
     ///
     /// If `retain_gpu` was `false` during `build`, the GPU tensors are `None`.
-    /// This method reconstructs them from `vectors_flat`, `norms`, and
-    /// `nav_graph` so that `query_batch_gpu` and `self_query_gpu` can proceed.
+    /// This method reconstructs them from `vectors_flat` and `nav_graph` so
+    /// that `query_batch_gpu` and `self_query_gpu` can proceed.
     /// No-ops if tensors are already present.
     ///
     /// ### Params
     ///
-    /// * `&mut self` - Mutates `vectors_gpu`, `norms_gpu`, and `nav_graph_gpu`
-    ///   in place if they are `None`
+    /// * `&mut self` - Mutates `vectors_gpu` and `nav_graph_gpu` in place if
+    ///   they are `None`
     ///
     /// ### Returns
     ///
@@ -2459,22 +2431,19 @@ where
         let client = R::client(&self._device);
         let dim_padded = self.dim_padded;
 
-        let vectors_padded = if dim_padded != self.dim {
+        let mut vectors_padded = if dim_padded != self.dim {
             pad_vectors(&self.vectors_flat, self.n, self.dim, dim_padded)
         } else {
             self.vectors_flat.clone()
         };
+        if self.metric == Dist::Cosine {
+            normalise_rows(&mut vectors_padded, dim_padded);
+        }
         self.vectors_gpu = Some(GpuTensor::<R, T>::from_slice(
             &vectors_padded,
             vec![self.n, dim_padded],
             &client,
         )?);
-
-        self.norms_gpu = Some(if self.metric == Dist::Cosine {
-            GpuTensor::<R, T>::from_slice(&self.norms, vec![self.n], &client)?
-        } else {
-            GpuTensor::<R, T>::from_slice(&[T::zero()], vec![1], &client)?
-        });
 
         self.nav_graph_gpu = Some(GpuTensor::<R, u32>::from_slice(
             &self.nav_graph,
@@ -2670,11 +2639,14 @@ where
 
     let dim_padded = dim.next_multiple_of(LINE_SIZE);
 
-    let vectors_padded = if dim_padded != dim {
+    let mut vectors_padded = if dim_padded != dim {
         pad_vectors(&vectors_flat, n, dim, dim_padded)
     } else {
         vectors_flat.clone()
     };
+    if metric == Dist::Cosine {
+        normalise_rows(&mut vectors_padded, dim_padded);
+    }
 
     let norms = if metric == Dist::Cosine {
         (0..n)
@@ -2719,7 +2691,6 @@ where
         ..
     } = nndescent_core::<T, R>(
         &vectors_padded,
-        &norms,
         n,
         dim,
         dim_padded,
@@ -2764,10 +2735,8 @@ pub struct NnDescentOutput<T: AnnSearchFloat + CubeclFloat, R: Runtime> {
     pub router: ForestRouter<T>,
     /// Device copy of `graph_idx`, `[n, build_k]`
     pub graph_idx_gpu: GpuTensor<R, u32>,
-    /// Padded vectors, `[n, dim_padded]`
+    /// Padded vectors as uploaded, `[n, dim_padded]`
     pub vectors_gpu: GpuTensor<R, T>,
-    /// Norms `[n]` for cosine, a one-element dummy otherwise
-    pub norms_gpu: GpuTensor<R, T>,
 }
 
 /// Run the device-resident NNDescent loop and read the raw graph back.
@@ -2779,9 +2748,8 @@ pub struct NnDescentOutput<T: AnnSearchFloat + CubeclFloat, R: Runtime> {
 ///
 /// ### Params
 ///
-/// * `vectors_padded` - Row-major vectors padded to `dim_padded`, `n` rows
-/// * `norms` - L2 norms per row; only read when `cfg.use_cosine`, and may be
-///   empty otherwise
+/// * `vectors_padded` - Row-major vectors padded to `dim_padded`, `n` rows;
+///   unit-normalised when `cfg.use_cosine`, see [`normalise_rows`]
 /// * `n` - Number of vectors
 /// * `dim` - Original embedding dimensionality, needed by the forest init
 /// * `dim_padded` - Padded dimensionality, a multiple of `LINE_SIZE`
@@ -2797,7 +2765,6 @@ pub struct NnDescentOutput<T: AnnSearchFloat + CubeclFloat, R: Runtime> {
 #[allow(clippy::too_many_arguments)]
 pub fn nndescent_core<T, R>(
     vectors_padded: &[T],
-    norms: &[T],
     n: usize,
     dim: usize,
     dim_padded: usize,
@@ -2826,12 +2793,6 @@ where
 
     let vectors_gpu = GpuTensor::<R, T>::from_slice(vectors_padded, vec![n, dim_padded], client)?;
 
-    let norms_gpu = if use_cosine {
-        GpuTensor::<R, T>::from_slice(norms, vec![n], client)?
-    } else {
-        GpuTensor::<R, T>::from_slice(&[T::zero()], vec![1], client)?
-    };
-
     let graph_idx_gpu = GpuTensor::<R, u32>::from_slice(
         &vec![0x7FFFFFFFu32; n * build_k],
         vec![n, build_k],
@@ -2856,7 +2817,6 @@ where
         build_k * 2,
         (2 * nnd_cand_cap(build_k) as usize).min(build_k * 2),
         size_of::<T>(),
-        use_cosine,
         limits,
     )?;
 
@@ -2872,7 +2832,6 @@ where
             CubeDim::new_2d(WORKGROUP_SIZE_X, 1),
             line,
             vectors_gpu.clone().into_tensor_arg(),
-            norms_gpu.clone().into_tensor_arg(),
             graph_idx_gpu.clone().into_tensor_arg(),
             graph_dist_gpu.clone().into_tensor_arg(),
             n as u32,
@@ -2887,7 +2846,6 @@ where
 
     let router = gpu_forest_init(
         &vectors_gpu,
-        &norms_gpu,
         &graph_idx_gpu,
         &graph_dist_gpu,
         &prop_idx_gpu,
@@ -2972,7 +2930,6 @@ where
                 CubeDim::new_2d(staging.cube_x, staging.cube_y),
                 line,
                 vectors_gpu.clone().into_tensor_arg(),
-                norms_gpu.clone().into_tensor_arg(),
                 graph_idx_gpu.clone().into_tensor_arg(),
                 graph_dist_gpu.clone().into_tensor_arg(),
                 reverse_idx_gpu.clone().into_tensor_arg(),
@@ -2993,7 +2950,6 @@ where
                 staging.single_block,
                 staging.buf_a_lines,
                 staging.buf_b_lines,
-                staging.norm_buf_len,
                 staging.line_unroll,
             );
         }
@@ -3072,7 +3028,6 @@ where
                 CubeDim::new_2d(WORKGROUP_SIZE_X, 1),
                 line,
                 vectors_gpu.clone().into_tensor_arg(),
-                norms_gpu.clone().into_tensor_arg(),
                 graph_idx_gpu.clone().into_tensor_arg(),
                 graph_dist_gpu.clone().into_tensor_arg(),
                 prop_idx_gpu.clone().into_tensor_arg(),
@@ -3125,7 +3080,6 @@ where
         router,
         graph_idx_gpu,
         vectors_gpu,
-        norms_gpu,
     })
 }
 
@@ -3757,7 +3711,6 @@ mod kernel_tests {
     #[cube(launch_unchecked)]
     fn compute_pairwise_dist<F: Float, N: Size>(
         vectors: &Tensor<Vector<F, N>>,
-        norms: &Tensor<F>,
         out_sq_euclid: &mut Tensor<F>,
         out_cosine: &mut Tensor<F>,
         n_pts: u32,
@@ -3782,7 +3735,7 @@ mod kernel_tests {
 
         out_sq_euclid[idx as usize] = dist_sq_euclidean(vectors, i, j, dim_lines);
         if use_cosine {
-            out_cosine[idx as usize] = dist_cosine(vectors, norms, i, j, dim_lines);
+            out_cosine[idx as usize] = dist_cosine(vectors, i, j, dim_lines);
         }
     }
 
@@ -3810,8 +3763,6 @@ mod kernel_tests {
 
         let vectors_gpu =
             GpuTensor::<WgpuRuntime, f32>::from_slice(&data, vec![n, dim], &client).unwrap();
-        let norms_gpu =
-            GpuTensor::<WgpuRuntime, f32>::from_slice(&[0.0f32], vec![1], &client).unwrap();
         let out_euclid = GpuTensor::<WgpuRuntime, f32>::from_slice(
             &vec![0.0f32; n_pairs],
             vec![n_pairs],
@@ -3832,7 +3783,6 @@ mod kernel_tests {
                 CubeDim::new_2d(WORKGROUP_SIZE_X, 1),
                 line,
                 vectors_gpu.into_tensor_arg(),
-                norms_gpu.into_tensor_arg(),
                 out_euclid.clone().into_tensor_arg(),
                 out_cosine.clone().into_tensor_arg(),
                 n as u32,
@@ -3892,19 +3842,13 @@ mod kernel_tests {
         data[2 * dim..3 * dim].copy_from_slice(&[1.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]);
         data[3 * dim..4 * dim].copy_from_slice(&[0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0]);
 
-        let norms: Vec<f32> = (0..n)
-            .map(|i| {
-                let row = &data[i * dim..(i + 1) * dim];
-                row.iter().map(|x| x * x).sum::<f32>().sqrt()
-            })
-            .collect();
-        // norms = [1.0, 1.0, sqrt(2), 1.0]
+        // The kernel takes unit rows.
+        let mut unit = data.clone();
+        crate::gpu::normalise_rows(&mut unit, dim);
 
         let n_pairs = n * (n - 1) / 2;
         let vectors_gpu =
-            GpuTensor::<WgpuRuntime, f32>::from_slice(&data, vec![n, dim], &client).unwrap();
-        let norms_gpu =
-            GpuTensor::<WgpuRuntime, f32>::from_slice(&norms, vec![n], &client).unwrap();
+            GpuTensor::<WgpuRuntime, f32>::from_slice(&unit, vec![n, dim], &client).unwrap();
         let out_euclid = GpuTensor::<WgpuRuntime, f32>::from_slice(
             &vec![0.0f32; n_pairs],
             vec![n_pairs],
@@ -3925,7 +3869,6 @@ mod kernel_tests {
                 CubeDim::new_2d(WORKGROUP_SIZE_X, 1),
                 line,
                 vectors_gpu.into_tensor_arg(),
-                norms_gpu.into_tensor_arg(),
                 out_euclid.clone().into_tensor_arg(),
                 out_cosine.clone().into_tensor_arg(),
                 n as u32,
@@ -4026,8 +3969,6 @@ mod kernel_tests {
 
         let vectors_gpu =
             GpuTensor::<WgpuRuntime, f32>::from_slice(&data, vec![n, dim], &client).unwrap();
-        let norms_gpu =
-            GpuTensor::<WgpuRuntime, f32>::from_slice(&norms, vec![n], &client).unwrap();
         let graph_idx_gpu =
             GpuTensor::<WgpuRuntime, u32>::from_slice(&graph_idx, vec![n, build_k], &client)
                 .unwrap();
@@ -4055,15 +3996,9 @@ mod kernel_tests {
 
         let rho_thresh = 65535u32; // rho=1.0, accept all pairs
 
-        let staging = plan_local_join_staging(
-            dim,
-            build_k * 2,
-            build_k * 2,
-            size_of::<f32>(),
-            true,
-            &limits,
-        )
-        .unwrap();
+        let staging =
+            plan_local_join_staging(dim, build_k * 2, build_k * 2, size_of::<f32>(), &limits)
+                .unwrap();
 
         unsafe {
             local_join_shared::launch_unchecked::<f32, WgpuRuntime>(
@@ -4072,7 +4007,6 @@ mod kernel_tests {
                 CubeDim::new_2d(staging.cube_x, staging.cube_y),
                 line,
                 vectors_gpu.into_tensor_arg(),
-                norms_gpu.into_tensor_arg(),
                 graph_idx_gpu.into_tensor_arg(),
                 graph_dist_gpu.into_tensor_arg(),
                 reverse_idx_gpu.into_tensor_arg(),
@@ -4093,7 +4027,6 @@ mod kernel_tests {
                 staging.single_block,
                 staging.buf_a_lines,
                 staging.buf_b_lines,
-                staging.norm_buf_len,
                 staging.line_unroll,
             );
         }
@@ -4475,8 +4408,6 @@ mod kernel_tests {
 
         let vectors_gpu =
             GpuTensor::<WgpuRuntime, f32>::from_slice(&data, vec![n, dim], &client).unwrap();
-        let norms_gpu =
-            GpuTensor::<WgpuRuntime, f32>::from_slice(&[0.0f32], vec![1], &client).unwrap();
 
         // Compute dist(0, 1) on GPU via dist_sq_euclidean
         // We need a tiny wrapper kernel:
@@ -4503,7 +4434,6 @@ mod kernel_tests {
                 CubeDim::new_2d(WORKGROUP_SIZE_X, 1),
                 line,
                 vectors_gpu.into_tensor_arg(),
-                norms_gpu.into_tensor_arg(),
                 out_euclid.clone().into_tensor_arg(),
                 out_cos.into_tensor_arg(),
                 n as u32,
@@ -4812,15 +4742,9 @@ mod kernel_tests {
         let line: usize = LINE_SIZE;
         let dim_vec = dim / line;
 
-        let staging = plan_local_join_staging(
-            dim,
-            build_k * 2,
-            build_k * 2,
-            size_of::<f32>(),
-            false,
-            &limits,
-        )
-        .unwrap();
+        let staging =
+            plan_local_join_staging(dim, build_k * 2, build_k * 2, size_of::<f32>(), &limits)
+                .unwrap();
         assert!(
             !staging.single_block,
             "n={n} dim={dim} build_k={build_k} did not force the blocked path; \
@@ -4858,8 +4782,6 @@ mod kernel_tests {
 
         let vectors_gpu =
             GpuTensor::<WgpuRuntime, f32>::from_slice(&data, vec![n, dim], &client).unwrap();
-        let norms_gpu =
-            GpuTensor::<WgpuRuntime, f32>::from_slice(&[0.0f32], vec![1], &client).unwrap();
         let graph_idx_gpu =
             GpuTensor::<WgpuRuntime, u32>::from_slice(&graph_idx, vec![n, build_k], &client)
                 .unwrap();
@@ -4888,7 +4810,6 @@ mod kernel_tests {
                 CubeDim::new_2d(staging.cube_x, staging.cube_y),
                 line,
                 vectors_gpu.into_tensor_arg(),
-                norms_gpu.into_tensor_arg(),
                 graph_idx_gpu.into_tensor_arg(),
                 graph_dist_gpu.into_tensor_arg(),
                 reverse_idx_gpu.into_tensor_arg(),
@@ -4909,7 +4830,6 @@ mod kernel_tests {
                 staging.single_block,
                 staging.buf_a_lines,
                 staging.buf_b_lines,
-                staging.norm_buf_len,
                 staging.line_unroll,
             );
         }

@@ -142,28 +142,10 @@ fn make_clustered(n: usize, dim: usize) -> Vec<f32> {
     out
 }
 
-/// Row-wise L2 norms, needed by the cosine arm.
-///
-/// ### Params
-///
-/// * `flat` - Row-major matrix
-/// * `dim` - Row length
-///
-/// ### Returns
-///
-/// One norm per row.
-fn l2_norms(flat: &[f32], dim: usize) -> Vec<f32> {
-    flat.chunks_exact(dim)
-        .map(|row| row.iter().map(|v| v * v).sum::<f32>().sqrt())
-        .collect()
-}
-
 /// Device-resident state one local-join launch reads and writes.
 struct LocalJoinInput<R: Runtime> {
-    /// Padded vectors `[n, dim_padded]`
+    /// Padded vectors `[n, dim_padded]`, unit-normalised on the cosine path
     vectors: GpuTensor<R, f32>,
-    /// L2 norms `[n]`, or a one-element dummy on the euclidean path
-    norms: GpuTensor<R, f32>,
     /// kNN graph indices `[n, build_k]` with the IS_NEW flag in the MSB
     graph_idx: GpuTensor<R, u32>,
     /// kNN graph distances `[n, build_k]`
@@ -186,7 +168,6 @@ impl<R: Runtime> Clone for LocalJoinInput<R> {
     fn clone(&self) -> Self {
         Self {
             vectors: self.vectors.clone(),
-            norms: self.norms.clone(),
             graph_idx: self.graph_idx.clone(),
             graph_dist: self.graph_dist.clone(),
             reverse_idx: self.reverse_idx.clone(),
@@ -218,7 +199,6 @@ impl<R: Runtime> LocalJoinBench<R> {
             self.cfg.build_k * 2,
             (2 * nnd_cand_cap(self.cfg.build_k) as usize).min(self.cfg.build_k * 2),
             size_of::<f32>(),
-            self.cfg.use_cosine(),
             &limits,
         )
         .expect("dim too high for the shared-memory budget")
@@ -246,21 +226,17 @@ impl<R: Runtime> Benchmark for LocalJoinBench<R> {
         let limits = GpuLimits::from_client(&self.client);
 
         let flat = make_clustered(n, dim);
-        let padded = if dim_padded != dim {
+        let mut padded = if dim_padded != dim {
             pad_vectors(&flat, n, dim, dim_padded)
         } else {
             flat.clone()
         };
+        if use_cosine {
+            normalise_rows(&mut padded, dim_padded);
+        }
 
         let vectors = GpuTensor::<R, f32>::from_slice(&padded, vec![n, dim_padded], &self.client)
             .expect("GPU allocation exceeds the device binding limit");
-
-        let norms = if use_cosine {
-            GpuTensor::<R, f32>::from_slice(&l2_norms(&flat, dim), vec![n], &self.client)
-        } else {
-            GpuTensor::<R, f32>::from_slice(&[0.0f32], vec![1], &self.client)
-        }
-        .expect("GPU allocation exceeds the device binding limit");
 
         let graph_idx = GpuTensor::<R, u32>::from_slice(
             &vec![0x7FFF_FFFFu32; n * build_k],
@@ -298,7 +274,6 @@ impl<R: Runtime> Benchmark for LocalJoinBench<R> {
                 CubeDim::new_2d(WORKGROUP_SIZE_X, 1),
                 LINE_SIZE,
                 vectors.clone().into_tensor_arg(),
-                norms.clone().into_tensor_arg(),
                 graph_idx.clone().into_tensor_arg(),
                 graph_dist.clone().into_tensor_arg(),
                 n as u32,
@@ -312,7 +287,6 @@ impl<R: Runtime> Benchmark for LocalJoinBench<R> {
         let n_trees = (5 + ((n as f64).powf(0.25)).round() as usize).min(20);
         gpu_forest_init(
             &vectors,
-            &norms,
             &graph_idx,
             &graph_dist,
             &prop_idx,
@@ -374,7 +348,6 @@ impl<R: Runtime> Benchmark for LocalJoinBench<R> {
 
         LocalJoinInput {
             vectors,
-            norms,
             graph_idx,
             graph_dist,
             reverse_idx,
@@ -421,7 +394,6 @@ impl<R: Runtime> Benchmark for LocalJoinBench<R> {
                 CubeDim::new_2d(cube_x, cube_y),
                 LINE_SIZE,
                 input.vectors.into_tensor_arg(),
-                input.norms.into_tensor_arg(),
                 input.graph_idx.into_tensor_arg(),
                 input.graph_dist.into_tensor_arg(),
                 input.reverse_idx.into_tensor_arg(),
@@ -442,7 +414,6 @@ impl<R: Runtime> Benchmark for LocalJoinBench<R> {
                 staging.single_block,
                 staging.buf_a_lines,
                 staging.buf_b_lines,
-                staging.norm_buf_len,
                 self.cfg
                     .unroll
                     .map(|u| u.min(dim_vec).max(1))

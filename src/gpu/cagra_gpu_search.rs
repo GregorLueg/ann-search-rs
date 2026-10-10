@@ -144,8 +144,6 @@ impl Default for CagraGpuSearchParams {
 /// ### Params
 ///
 /// * `vectors` - Database vectors `[n_nodes, dim/N]` as `Vector<F, N>`
-/// * `norms` - Pre-computed L2 norms `[n_nodes]` (ignored when `use_cosine` is
-///   false)
 /// * `graph` - CAGRA navigational graph `[n_nodes, k_graph]` of neighbour IDs
 /// * `queries` - Query vectors `[n_queries, dim/N]` as `Vector<F, N>`
 /// * `entry_points` - Initial seed nodes `[n_queries, n_entry]`
@@ -156,7 +154,8 @@ impl Default for CagraGpuSearchParams {
 /// * `n_nodes` - Total number of nodes in the graph
 /// * `k_out` - Number of neighbours to return per query
 /// * `k_graph` - Degree of the navigational graph (comptime)
-/// * `use_cosine` - Whether to compute cosine distance (comptime)
+/// * `use_cosine` - Whether to compute cosine distance, `1 - dot` on
+///   unit-normalised vectors and queries (comptime)
 /// * `dim_lines` - Number of `Vector<F, N>` elements per vector row (comptime)
 /// * `beam_width` - Number of active candidates maintained during search
 ///   (comptime)
@@ -171,7 +170,6 @@ impl Default for CagraGpuSearchParams {
 #[cube(launch_unchecked)]
 pub fn cagra_beam_search<F: Float, N: Size>(
     vectors: &Tensor<Vector<F, N>>,
-    norms: &Tensor<F>,
     graph: &Tensor<u32>,
     queries: &Tensor<Vector<F, N>>,
     entry_points: &Tensor<u32>,
@@ -216,7 +214,6 @@ pub fn cagra_beam_search<F: Float, N: Size>(
     let mut s_nbr_dist = SharedMemory::<F>::new(total_slots);
     let mut s_active_flag = SharedMemory::<u32>::new(1usize);
     let mut s_num_cands = SharedMemory::<u32>::new(1usize);
-    let mut s_query_norm = SharedMemory::<F>::new(1usize);
     let mut s_hash_count = SharedMemory::<u32>::new(1usize);
 
     let q_line_offset = q_idx as usize * dim_lines;
@@ -245,17 +242,6 @@ pub fn cagra_beam_search<F: Float, N: Size>(
     sync_cube();
 
     if tx == 0u32 {
-        if use_cosine {
-            let mut norm_sq = F::new(0.0_f32);
-            let mut s = 0usize;
-            while s < dim_scalars {
-                let v = sq_vec[s];
-                norm_sq += v * v;
-                s += 1usize;
-            }
-            s_query_norm[0usize] = F::sqrt(norm_sq);
-        }
-
         let entry_base = q_idx as usize * n_entry;
         let mut num_cands = 0u32;
 
@@ -300,7 +286,7 @@ pub fn cagra_beam_search<F: Float, N: Size>(
                         }
                     }
                     let dist = if use_cosine {
-                        F::new(1.0_f32) - sum / (s_query_norm[0usize] * norms[node_id as usize])
+                        F::new(1.0_f32) - sum
                     } else {
                         sum
                     };
@@ -487,7 +473,7 @@ pub fn cagra_beam_search<F: Float, N: Size>(
                         }
                     }
                     let dist = if use_cosine {
-                        F::new(1.0_f32) - sum / (s_query_norm[0usize] * norms[nbr as usize])
+                        F::new(1.0_f32) - sum
                     } else {
                         sum
                     };
@@ -607,14 +593,14 @@ pub fn cagra_beam_search<F: Float, N: Size>(
 /// * `queries_flat` - Flattened query vectors [n_queries * dim]
 /// * `n_queries` - Number of queries
 /// * `dim` - Original (unpadded) query dimensionality
-/// * `vectors_gpu` - GPU-resident database vectors [n, dim_padded/LINE_SIZE]
-/// * `norms_gpu` - GPU-resident L2 norms `[n]` (Cosine) or a dummy scalar
-///   (Euclidean)
+/// * `vectors_gpu` - GPU-resident database vectors [n, dim_padded/LINE_SIZE],
+///   unit-normalised under cosine
 /// * `graph_gpu` - GPU-resident CAGRA navigational graph [n, k_graph]
 /// * `n` - Number of vectors in the database
 /// * `k_graph` - Degree of the navigational graph
 /// * `k_out` - Number of neighbours to return per query
-/// * `use_cosine` - Whether to use cosine distance
+/// * `use_cosine` - Whether to use cosine distance; the queries are
+///   unit-normalised here
 /// * `seed` - Random seed used when `entry_points` is `None`
 /// * `query_params` - Beam search parameters (beam width, max iterations,
 ///   number of entry points); defaults applied where fields are `None`
@@ -633,7 +619,6 @@ pub fn cagra_search_batch_gpu<T, R>(
     n_queries: usize,
     dim: usize,
     vectors_gpu: &GpuTensor<R, T>,
-    norms_gpu: &GpuTensor<R, T>,
     graph_gpu: &GpuTensor<R, u32>,
     n: usize,
     k_graph: usize,
@@ -646,7 +631,7 @@ pub fn cagra_search_batch_gpu<T, R>(
 ) -> KnnResult<T>
 where
     R: Runtime,
-    T: CubeclFloat + num_traits::Float,
+    T: CubeclFloat + AnnSearchFloat,
 {
     let limits = GpuLimits::from_client(client);
     let line = LINE_SIZE;
@@ -656,7 +641,7 @@ where
     let (width, iters, n_entry, expand) = query_params.get_vals();
 
     // Pad queries
-    let queries_padded = if dim_padded != dim {
+    let mut queries_padded = if dim_padded != dim {
         let mut padded = vec![T::zero(); n_queries * dim_padded];
         for i in 0..n_queries {
             for j in 0..dim {
@@ -667,6 +652,9 @@ where
     } else {
         queries_flat.to_vec()
     };
+    if use_cosine {
+        normalise_rows(&mut queries_padded, dim_padded);
+    }
 
     let queries_gpu =
         GpuTensor::<R, T>::from_slice(&queries_padded, vec![n_queries, dim_padded], client)?;
@@ -713,7 +701,6 @@ where
             CubeDim::new_2d(WORKGROUP_SIZE_X, 1),
             line,
             vectors_gpu.clone().into_tensor_arg(),
-            norms_gpu.clone().into_tensor_arg(),
             graph_gpu.clone().into_tensor_arg(),
             queries_gpu.into_tensor_arg(),
             entry_gpu.into_tensor_arg(),
@@ -815,8 +802,6 @@ mod tests {
 
         let vectors_gpu =
             GpuTensor::<WgpuRuntime, f32>::from_slice(&data, vec![n, dim], &client).unwrap();
-        let norms_gpu =
-            GpuTensor::<WgpuRuntime, f32>::from_slice(&[0.0f32], vec![1], &client).unwrap();
         let graph_gpu =
             GpuTensor::<WgpuRuntime, u32>::from_slice(&graph_flat, vec![n, k_graph], &client)
                 .unwrap();
@@ -828,7 +813,6 @@ mod tests {
             1,
             dim,
             &vectors_gpu,
-            &norms_gpu,
             &graph_gpu,
             n,
             k_graph,
@@ -894,8 +878,6 @@ mod tests {
 
         let vectors_gpu =
             GpuTensor::<WgpuRuntime, f32>::from_slice(&data, vec![n, dim], &client).unwrap();
-        let norms_gpu =
-            GpuTensor::<WgpuRuntime, f32>::from_slice(&[0.0f32], vec![1], &client).unwrap();
         let graph_gpu =
             GpuTensor::<WgpuRuntime, u32>::from_slice(&graph_flat, vec![n, k_graph], &client)
                 .unwrap();
@@ -905,7 +887,6 @@ mod tests {
             n_queries,
             dim,
             &vectors_gpu,
-            &norms_gpu,
             &graph_gpu,
             n,
             k_graph,
@@ -973,8 +954,6 @@ mod tests {
 
         let vectors_gpu =
             GpuTensor::<WgpuRuntime, f32>::from_slice(&data, vec![n, dim], &client).unwrap();
-        let norms_gpu =
-            GpuTensor::<WgpuRuntime, f32>::from_slice(&[0.0f32], vec![1], &client).unwrap();
         let graph_gpu =
             GpuTensor::<WgpuRuntime, u32>::from_slice(&graph_flat, vec![n, k_graph], &client)
                 .unwrap();
@@ -997,7 +976,6 @@ mod tests {
                 CubeDim::new_2d(WORKGROUP_SIZE_X, 1),
                 LINE_SIZE,
                 vectors_gpu.into_tensor_arg(),
-                norms_gpu.into_tensor_arg(),
                 graph_gpu.into_tensor_arg(),
                 queries_gpu.into_tensor_arg(),
                 entry_gpu.into_tensor_arg(),

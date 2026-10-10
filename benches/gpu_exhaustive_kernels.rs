@@ -77,11 +77,16 @@ fn make_db(n: usize, dim: usize) -> Vec<f32> {
         .collect()
 }
 
-/// Row-wise L2 norms, needed by the cosine kernel.
-fn l2_norms(flat: &[f32], dim: usize) -> Vec<f32> {
-    flat.chunks_exact(dim)
-        .map(|row| row.iter().map(|v| v * v).sum::<f32>().sqrt())
-        .collect()
+/// Synthetic queries and database, unit-normalised for cosine, which is what
+/// the kernels expect.
+fn make_inputs(cfg: &BenchConfig) -> (Vec<f32>, Vec<f32>) {
+    let mut queries = make_queries(cfg.n_queries, cfg.dim);
+    let mut db = make_db(cfg.n_db, cfg.dim);
+    if cfg.metric == Dist::Cosine {
+        normalise_rows(&mut queries, cfg.dim);
+        normalise_rows(&mut db, cfg.dim);
+    }
+    (queries, db)
 }
 
 /// Seed the top-k output buffers with the `f32::MAX` / `0` sentinel.
@@ -183,10 +188,6 @@ struct DistanceInput<R: Runtime> {
     query_gpu: GpuTensor<R, f32>,
     db_gpu: GpuTensor<R, f32>,
     distances_gpu: GpuTensor<R, f32>,
-    /// Query norms, populated for cosine only
-    query_norms_gpu: Option<GpuTensor<R, f32>>,
-    /// Database norms, populated for cosine only
-    db_norms_gpu: Option<GpuTensor<R, f32>>,
 }
 
 impl<R: Runtime> Clone for DistanceInput<R> {
@@ -195,8 +196,6 @@ impl<R: Runtime> Clone for DistanceInput<R> {
             query_gpu: self.query_gpu.clone(),
             db_gpu: self.db_gpu.clone(),
             distances_gpu: self.distances_gpu.clone(),
-            query_norms_gpu: self.query_norms_gpu.clone(),
-            db_norms_gpu: self.db_norms_gpu.clone(),
         }
     }
 }
@@ -210,8 +209,7 @@ impl<R: Runtime> Benchmark for DistanceBench<R> {
         let nq = self.cfg.n_queries;
         let ndb = self.cfg.n_db;
 
-        let queries = make_queries(nq, dim);
-        let db = make_db(ndb, dim);
+        let (queries, db) = make_inputs(&self.cfg);
 
         let query_gpu = GpuTensor::<R, f32>::from_slice(&queries, vec![nq, dim], &self.client)
             .expect("GPU allocation exceeds the device binding limit");
@@ -220,29 +218,10 @@ impl<R: Runtime> Benchmark for DistanceBench<R> {
         let distances_gpu = GpuTensor::<R, f32>::empty(vec![nq, ndb], &self.client)
             .expect("GPU allocation exceeds the device binding limit");
 
-        let (query_norms_gpu, db_norms_gpu) = if self.cfg.metric == Dist::Cosine {
-            let qn = l2_norms(&queries, dim);
-            let dn = l2_norms(&db, dim);
-            (
-                Some(
-                    GpuTensor::<R, f32>::from_slice(&qn, vec![nq], &self.client)
-                        .expect("GPU allocation exceeds the device binding limit"),
-                ),
-                Some(
-                    GpuTensor::<R, f32>::from_slice(&dn, vec![ndb], &self.client)
-                        .expect("GPU allocation exceeds the device binding limit"),
-                ),
-            )
-        } else {
-            (None, None)
-        };
-
         DistanceInput {
             query_gpu,
             db_gpu,
             distances_gpu,
-            query_norms_gpu,
-            db_norms_gpu,
         }
     }
 
@@ -263,10 +242,6 @@ impl<R: Runtime> Benchmark for DistanceBench<R> {
             grid_2d((nq as u32).div_ceil(wg_y), &limits).expect("grid too large");
 
         let use_cosine = self.cfg.metric == Dist::Cosine;
-        let dummy = GpuTensor::<R, f32>::from_slice(&[1.0], vec![1], &self.client)
-            .expect("GPU allocation failed");
-        let q_norms = input.query_norms_gpu.as_ref().unwrap_or(&dummy);
-        let d_norms = input.db_norms_gpu.as_ref().unwrap_or(&dummy);
         unsafe {
             dist_tiled::launch_unchecked::<f32, R>(
                 &self.client,
@@ -275,8 +250,6 @@ impl<R: Runtime> Benchmark for DistanceBench<R> {
                 vec_size,
                 input.query_gpu.into_tensor_arg(),
                 input.db_gpu.into_tensor_arg(),
-                q_norms.into_tensor_arg(),
-                d_norms.into_tensor_arg(),
                 input.distances_gpu.into_tensor_arg(),
                 0u32,
                 ndb as u32,
@@ -345,10 +318,6 @@ impl<R: Runtime> Benchmark for DistanceRegBench<R> {
             grid_2d((nq as u32).div_ceil(wg_y), &limits).expect("grid too large");
 
         let use_cosine = self.cfg.metric == Dist::Cosine;
-        let dummy = GpuTensor::<R, f32>::from_slice(&[1.0], vec![1], &self.client)
-            .expect("GPU allocation failed");
-        let q_norms = input.query_norms_gpu.as_ref().unwrap_or(&dummy);
-        let d_norms = input.db_norms_gpu.as_ref().unwrap_or(&dummy);
         unsafe {
             dist_tiled_reg::launch_unchecked::<f32, R>(
                 &self.client,
@@ -357,8 +326,6 @@ impl<R: Runtime> Benchmark for DistanceRegBench<R> {
                 vec_size,
                 input.query_gpu.into_tensor_arg(),
                 input.db_gpu.into_tensor_arg(),
-                q_norms.into_tensor_arg(),
-                d_norms.into_tensor_arg(),
                 input.distances_gpu.into_tensor_arg(),
                 0u32,
                 0u32,
@@ -486,10 +453,6 @@ struct FullPipelineBench<R: Runtime> {
 struct PipelineInput {
     queries: Vec<f32>,
     db: Vec<f32>,
-    /// Empty unless the config is cosine
-    query_norms: Vec<f32>,
-    /// Empty unless the config is cosine
-    db_norms: Vec<f32>,
 }
 
 impl<R: Runtime> Benchmark for FullPipelineBench<R> {
@@ -497,28 +460,14 @@ impl<R: Runtime> Benchmark for FullPipelineBench<R> {
     type Output = (Vec<Vec<usize>>, Vec<Vec<f32>>);
 
     fn prepare(&self) -> Self::Input {
-        let dim = self.cfg.dim;
+        let (queries, db) = make_inputs(&self.cfg);
 
-        let queries = make_queries(self.cfg.n_queries, dim);
-        let db = make_db(self.cfg.n_db, dim);
-
-        let (query_norms, db_norms) = if self.cfg.metric == Dist::Cosine {
-            (l2_norms(&queries, dim), l2_norms(&db, dim))
-        } else {
-            (Vec::new(), Vec::new())
-        };
-
-        PipelineInput {
-            queries,
-            db,
-            query_norms,
-            db_norms,
-        }
+        PipelineInput { queries, db }
     }
 
     fn execute(&self, input: Self::Input) -> Result<Self::Output, String> {
-        let qb = BatchData::new(&input.queries, &input.query_norms, self.cfg.n_queries);
-        let dbb = BatchData::new(&input.db, &input.db_norms, self.cfg.n_db);
+        let qb = BatchData::new(&input.queries, self.cfg.n_queries);
+        let dbb = BatchData::new(&input.db, self.cfg.n_db);
 
         let result = query_batch_gpu::<f32, R>(
             self.cfg.k,

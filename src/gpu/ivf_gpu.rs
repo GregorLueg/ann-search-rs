@@ -68,19 +68,17 @@ struct CandidateScratch<R: Runtime, T: AnnSearchFloat + CubeclFloat> {
 /// * `n` - Number of samples in the index
 /// * `assignments` - Cluster assignments
 /// * `nlist` - Number of total lists
-/// * `metric` - Distance metric
 ///
 /// ### Returns
 ///
-/// `(reordered flat vec, reordered indices, offsets, reordered norms)`
+/// `(reordered flat vec, reordered indices, offsets)`
 fn reorganise_by_cluster<T: Float + Copy + Send + Sync + Sum>(
     vectors_flat: &[T],
     dim: usize,
     n: usize,
     assignments: &[usize],
     nlist: usize,
-    metric: &Dist,
-) -> (Vec<T>, Vec<usize>, Vec<usize>, Vec<T>) {
+) -> (Vec<T>, Vec<usize>, Vec<usize>) {
     // Count vectors per cluster
     let mut counts = vec![0usize; nlist];
     for &cluster in assignments {
@@ -93,14 +91,8 @@ fn reorganise_by_cluster<T: Float + Copy + Send + Sync + Sum>(
         offsets[i + 1] = offsets[i] + counts[i];
     }
 
-    // Place vectors and compute norms
     let mut vectors_reorg = vec![T::zero(); n * dim];
     let mut indices_reorg = vec![0usize; n];
-    let mut norms_reorg = if *metric == Dist::Cosine {
-        vec![T::zero(); n]
-    } else {
-        Vec::new()
-    };
     let mut write_pos = offsets.clone();
 
     for vec_idx in 0..n {
@@ -114,17 +106,9 @@ fn reorganise_by_cluster<T: Float + Copy + Send + Sync + Sum>(
         let dst_start = pos * dim;
         vectors_reorg[dst_start..dst_start + dim]
             .copy_from_slice(&vectors_flat[src_start..src_start + dim]);
-
-        if *metric == Dist::Cosine {
-            norms_reorg[pos] = vectors_flat[src_start..src_start + dim]
-                .iter()
-                .map(|&x| x * x)
-                .sum::<T>()
-                .sqrt();
-        }
     }
 
-    (vectors_reorg, indices_reorg, offsets, norms_reorg)
+    (vectors_reorg, indices_reorg, offsets)
 }
 
 /////////////////
@@ -140,7 +124,8 @@ fn reorganise_by_cluster<T: Float + Copy + Send + Sync + Sum>(
 /// ### Architecture
 ///
 /// - Database vectors reorganised by cluster for contiguous access
-/// - All vectors and norms kept on GPU for fast access
+/// - All vectors kept on GPU for fast access; unit-normalised under Cosine,
+///   which the kernels score as `1 - dot`
 /// - Centroids kept on GPU for fast probe selection
 /// - Query pipeline:
 ///   1. Compute all query-centroid distances (1 kernel)
@@ -155,8 +140,6 @@ fn reorganise_by_cluster<T: Float + Copy + Send + Sync + Sum>(
 pub struct IvfIndexGpu<T: AnnSearchFloat + CubeclFloat, R: Runtime> {
     /// All vectors reorganised by cluster, resident on GPU
     vectors_gpu: GpuTensor<R, T>,
-    /// All norms reorganised by cluster, resident on GPU (Cosine only)
-    norms_gpu: Option<GpuTensor<R, T>>,
     /// Reorganised vector data mirrored on CPU, used as query input for
     /// `generate_knn` without a GPU readback
     vectors_cpu: Vec<T>,
@@ -166,8 +149,6 @@ pub struct IvfIndexGpu<T: AnnSearchFloat + CubeclFloat, R: Runtime> {
     cluster_offsets: Vec<usize>,
     /// Centroids kept on the GPU
     centroids_gpu: GpuTensor<R, T>,
-    ///  Centroid norms kept on the GPU
-    centroid_norms_gpu: Option<GpuTensor<R, T>>,
     /// Dimensionality of the index
     dim: usize,
     /// Padded dimensionality of the index
@@ -294,18 +275,8 @@ where
         let assignments =
             assign_all_gpu::<T, R>(&vectors_flat, dim, n, &centroids, nlist, &metric, &client)?;
 
-        // Query time compares against these on device, so they are computed on
-        // the unpadded centroids exactly as before.
-        let centroid_norms: Vec<T> = if metric == Dist::Cosine {
-            (0..nlist)
-                .map(|i| T::calculate_l2_norm(&centroids[i * dim..(i + 1) * dim]))
-                .collect()
-        } else {
-            vec![T::one(); nlist]
-        };
-
-        let (vectors_by_cluster, original_indices, cluster_offsets, norms_by_cluster) =
-            reorganise_by_cluster(&vectors_flat, dim, n, &assignments, nlist, &metric);
+        let (vectors_by_cluster, original_indices, cluster_offsets) =
+            reorganise_by_cluster(&vectors_flat, dim, n, &assignments, nlist);
 
         let sorted_size_prefix = {
             let mut sizes: Vec<usize> = cluster_offsets.windows(2).map(|w| w[1] - w[0]).collect();
@@ -325,45 +296,33 @@ where
         }
 
         // Pad vectors and centroids for GPU
-        let vectors_padded = if dim_padded != dim {
+        let mut vectors_padded = if dim_padded != dim {
             pad_vectors(&vectors_by_cluster, n, dim, dim_padded)
         } else {
-            vectors_by_cluster.clone()
+            vectors_by_cluster
         };
 
-        let centroids_padded = if dim_padded != dim {
+        let mut centroids_padded = if dim_padded != dim {
             pad_vectors(&centroids, nlist, dim, dim_padded)
         } else {
-            centroids.clone()
+            centroids
         };
+
+        // The k-means above trains on the raw rows. Normalising the centroids
+        // afterwards keeps its probe ranking: `1 - q.c / |c|` and
+        // `1 - q.(c / |c|)` order alike.
+        if metric == Dist::Cosine {
+            normalise_rows(&mut vectors_padded, dim_padded);
+            normalise_rows(&mut centroids_padded, dim_padded);
+        }
 
         let vectors_cpu = vectors_padded.clone();
 
         let vectors_gpu =
             GpuTensor::<R, T>::from_slice(&vectors_padded, vec![n, dim_padded], &client)?;
 
-        let norms_gpu = if metric == Dist::Cosine {
-            Some(GpuTensor::<R, T>::from_slice(
-                &norms_by_cluster,
-                vec![n],
-                &client,
-            )?)
-        } else {
-            None
-        };
-
         let centroids_gpu =
             GpuTensor::<R, T>::from_slice(&centroids_padded, vec![nlist, dim_padded], &client)?;
-
-        let centroid_norms_gpu = if metric == Dist::Cosine {
-            Some(GpuTensor::<R, T>::from_slice(
-                &centroid_norms,
-                vec![nlist],
-                &client,
-            )?)
-        } else {
-            None
-        };
 
         if verbose {
             println!("  Index ready");
@@ -371,12 +330,10 @@ where
 
         Ok(Self {
             vectors_gpu,
-            norms_gpu,
             vectors_cpu,
             original_indices,
             cluster_offsets,
             centroids_gpu,
-            centroid_norms_gpu,
             dim,
             dim_padded,
             n,
@@ -509,11 +466,14 @@ where
         let nprobe = self.resolve_nprobe(nprobe);
         let batch_size = nquery.unwrap_or_else(|| self.calculate_safe_batch_size(nprobe, &limits));
 
-        let queries_padded = if self.dim_padded != self.dim {
+        let mut queries_padded = if self.dim_padded != self.dim {
             pad_vectors(&queries_flat, n_queries, self.dim, self.dim_padded)
         } else {
             queries_flat
         };
+        if self.metric == Dist::Cosine {
+            normalise_rows(&mut queries_padded, self.dim_padded);
+        }
 
         let (indices, dist) = self.query_internal(
             &queries_padded,
@@ -621,14 +581,7 @@ where
             .as_ref()
             .map_or(0, |s| s.dists.vram_bytes() + s.indices.vram_bytes());
 
-        let vram = scratch_vram
-            + self.vectors_gpu.vram_bytes()
-            + self.norms_gpu.as_ref().map_or(0, |t| t.vram_bytes())
-            + self.centroids_gpu.vram_bytes()
-            + self
-                .centroid_norms_gpu
-                .as_ref()
-                .map_or(0, |t| t.vram_bytes());
+        let vram = scratch_vram + self.vectors_gpu.vram_bytes() + self.centroids_gpu.vram_bytes();
 
         (ram, vram)
     }
@@ -661,30 +614,8 @@ where
         let limits = GpuLimits::from_client(client);
         let safe_worksize_y = pick_wg_y(self.dim_padded, size_of::<T>(), &limits)?;
 
-        let query_norms = if self.metric == Dist::Cosine {
-            (0..n_queries)
-                .into_par_iter()
-                .map(|i| {
-                    let start = i * self.dim_padded;
-                    T::calculate_l2_norm(&queries_flat[start..start + self.dim_padded])
-                })
-                .collect::<Vec<_>>()
-        } else {
-            Vec::new()
-        };
-
         let queries_gpu =
             GpuTensor::<R, T>::from_slice(queries_flat, vec![n_queries, self.dim_padded], client)?;
-
-        let query_norms_gpu = if self.metric == Dist::Cosine {
-            Some(GpuTensor::<R, T>::from_slice(
-                &query_norms,
-                vec![n_queries],
-                client,
-            )?)
-        } else {
-            None
-        };
 
         let centroid_dists_gpu = GpuTensor::<R, T>::empty(vec![n_queries, self.nlist], client)?;
 
@@ -702,17 +633,6 @@ where
         )?;
 
         let use_cosine = self.metric == Dist::Cosine;
-        // Euclidean never reads the norms; bind a one-element placeholder.
-        let no_norms = GpuTensor::<R, T>::from_slice(&[T::one()], vec![1], client)?;
-        let (q_norms, c_norms, d_norms) = if use_cosine {
-            (
-                query_norms_gpu.as_ref().unwrap(),
-                self.centroid_norms_gpu.as_ref().unwrap(),
-                self.norms_gpu.as_ref().unwrap(),
-            )
-        } else {
-            (&no_norms, &no_norms, &no_norms)
-        };
 
         if tile_fits(safe_worksize_y) {
             unsafe {
@@ -723,8 +643,6 @@ where
                     vec_size,
                     queries_gpu.clone().into_tensor_arg(),
                     self.centroids_gpu.clone().into_tensor_arg(),
-                    q_norms.clone().into_tensor_arg(),
-                    c_norms.clone().into_tensor_arg(),
                     centroid_dists_gpu.clone().into_tensor_arg(),
                     0u32,
                     0u32,
@@ -751,8 +669,6 @@ where
                     vec_size,
                     queries_gpu.clone().into_tensor_arg(),
                     self.centroids_gpu.clone().into_tensor_arg(),
-                    q_norms.clone().into_tensor_arg(),
-                    c_norms.clone().into_tensor_arg(),
                     centroid_dists_gpu.clone().into_tensor_arg(),
                     0u32,
                     self.nlist as u32,
@@ -967,8 +883,6 @@ where
                     vec_size,
                     queries_gpu.clone().into_tensor_arg(),
                     self.vectors_gpu.clone().into_tensor_arg(),
-                    q_norms.clone().into_tensor_arg(),
-                    d_norms.clone().into_tensor_arg(),
                     task_q_idx_gpu.into_tensor_arg(),
                     task_write_offset_gpu.into_tensor_arg(),
                     tiles_gpu.into_tensor_arg(),
@@ -1004,8 +918,6 @@ where
                     vec_size,
                     queries_gpu.clone().into_tensor_arg(),
                     self.vectors_gpu.clone().into_tensor_arg(),
-                    q_norms.clone().into_tensor_arg(),
-                    d_norms.clone().into_tensor_arg(),
                     task_q_idx_gpu.into_tensor_arg(),
                     task_db_start_gpu.into_tensor_arg(),
                     task_write_offset_gpu.into_tensor_arg(),
@@ -1382,8 +1294,7 @@ mod tests {
         ];
         let assignments = vec![0, 1, 0, 1];
 
-        let (reorg, indices, offsets, _) =
-            reorganise_by_cluster(&vectors, 4, 4, &assignments, 2, &Dist::SquaredEuclidean);
+        let (reorg, indices, offsets) = reorganise_by_cluster(&vectors, 4, 4, &assignments, 2);
 
         assert_eq!(reorg.len(), 16);
         assert_eq!(indices.len(), 4);

@@ -3,18 +3,11 @@
 use cubecl::prelude::*;
 use cubecl_utils_rs::prelude::*;
 use num_traits::Float;
-use rayon::prelude::*;
 use std::sync::OnceLock;
 
 use crate::gpu::dist_gpu::*;
+use crate::gpu::normalise_rows;
 use crate::prelude::*;
-
-///////////
-// Types //
-///////////
-
-/// Resident DB vector for the exhaustive search
-type DbVector<R, T> = (GpuTensor<R, T>, Option<GpuTensor<R, T>>);
 
 ////////////////////////
 // ExhaustiveIndexGpu //
@@ -37,10 +30,10 @@ pub struct ExhaustiveIndexGpu<T: Float + CubeclFloat, R: Runtime> {
     metric: Dist,
     /// The CubeCL runtime device
     device: R::Device,
-    /// Database vectors and, for Cosine, norms on the device. Uploaded by the
-    /// first query and reused after: re-uploading per call cost more than the
-    /// distance kernels for small batches.
-    db_gpu: OnceLock<DbVector<R, T>>,
+    /// Database vectors on the device, unit-normalised for Cosine. Uploaded by
+    /// the first query and reused after: re-uploading per call cost more than
+    /// the distance kernels for small batches.
+    db_gpu: OnceLock<GpuTensor<R, T>>,
 }
 
 /////////////////////////
@@ -132,29 +125,40 @@ where
     ///
     /// ### Returns
     ///
-    /// `(vectors, norms)` on the device; norms only for Cosine.
-    fn resident_db(&self, client: &ComputeClient<R>) -> Result<&DbVector<R, T>, AnnSearchErrors> {
+    /// The vectors on the device, unit-normalised for Cosine.
+    fn resident_db(&self, client: &ComputeClient<R>) -> Result<&GpuTensor<R, T>, AnnSearchErrors> {
         if let Some(db) = self.db_gpu.get() {
             return Ok(db);
         }
         let vectors = GpuTensor::<R, T>::from_slice(
-            &self.vectors_flat,
+            &self.metric_rows(&self.vectors_flat),
             vec![self.n, self.dim_padded],
             client,
         )?;
-        let norms = if self.metric == Dist::Cosine {
-            Some(GpuTensor::<R, T>::from_slice(
-                &self.norms,
-                vec![self.n],
-                client,
-            )?)
-        } else {
-            None
-        };
         // A concurrent first query may have won the race; either upload is
         // the same data, so keep whichever landed.
-        let _ = self.db_gpu.set((vectors, norms));
+        let _ = self.db_gpu.set(vectors);
         Ok(self.db_gpu.get().expect("set just above"))
+    }
+
+    /// Padded rows as the kernels want them: unit-normalised under Cosine,
+    /// unchanged otherwise.
+    ///
+    /// ### Params
+    ///
+    /// * `rows` - Row-major vectors padded to `dim_padded`
+    ///
+    /// ### Returns
+    ///
+    /// The rows, borrowed when nothing changes.
+    fn metric_rows<'a>(&self, rows: &'a [T]) -> std::borrow::Cow<'a, [T]> {
+        if self.metric == Dist::Cosine {
+            let mut owned = rows.to_vec();
+            normalise_rows(&mut owned, self.dim_padded);
+            std::borrow::Cow::Owned(owned)
+        } else {
+            std::borrow::Cow::Borrowed(rows)
+        }
     }
 
     /// Query the exhaustive index
@@ -179,34 +183,23 @@ where
         self.check_dim(dim_query)?;
 
         let dim_padded = self.dim_padded;
-        let vectors_query_padded = if dim_padded != self.dim {
+        let mut vectors_query_padded = if dim_padded != self.dim {
             pad_vectors(&vectors_query, n_query, dim_query, dim_padded)
         } else {
-            vectors_query.clone()
+            vectors_query
         };
+        if self.metric == Dist::Cosine {
+            normalise_rows(&mut vectors_query_padded, dim_padded);
+        }
 
-        // Compute query norms on original dim, before padding
-        let query_norms = if self.metric == Dist::Cosine {
-            (0..n_query)
-                .into_par_iter()
-                .map(|i| {
-                    let start = i * dim_query;
-                    T::calculate_l2_norm(&vectors_query[start..start + dim_query])
-                })
-                .collect::<Vec<_>>()
-        } else {
-            Vec::new()
-        };
-
-        let query_data = BatchData::new(&vectors_query_padded, &query_norms, n_query);
+        let query_data = BatchData::new(&vectors_query_padded, n_query);
         let client = R::client(&self.device);
-        let (db_gpu, db_norms_gpu) = self.resident_db(&client)?;
+        let db_gpu = self.resident_db(&client)?;
 
         let res = query_batch_gpu_resident::<T, R>(
             k,
             &query_data,
             db_gpu,
-            db_norms_gpu.as_ref(),
             self.n,
             dim_padded,
             &self.metric,
@@ -233,15 +226,15 @@ where
     /// Tuple of `(knn_indices, optional distances)` where each row corresponds
     /// to a vector in the index
     pub fn generate_knn(&self, k: usize, return_dist: bool, verbose: bool) -> KnnOptionResult<T> {
-        let query_data = BatchData::new(&self.vectors_flat, &self.norms, self.n);
+        let queries = self.metric_rows(&self.vectors_flat);
+        let query_data = BatchData::new(&queries, self.n);
         let client = R::client(&self.device);
-        let (db_gpu, db_norms_gpu) = self.resident_db(&client)?;
+        let db_gpu = self.resident_db(&client)?;
 
         let (indices, distances) = query_batch_gpu_resident::<T, R>(
             k,
             &query_data,
             db_gpu,
-            db_norms_gpu.as_ref(),
             self.n,
             self.dim_padded,
             &self.metric,
@@ -265,9 +258,10 @@ where
         // The device copy counts once a query has uploaded it.
         let host =
             (self.vectors_flat.capacity() + self.norms.capacity()) * std::mem::size_of::<T>();
-        let device = self.db_gpu.get().map_or(0, |_| {
-            (self.vectors_flat.len() + self.norms.len()) * std::mem::size_of::<T>()
-        });
+        let device = self
+            .db_gpu
+            .get()
+            .map_or(0, |_| self.vectors_flat.len() * std::mem::size_of::<T>());
         std::mem::size_of_val(self) + host + device
     }
 }

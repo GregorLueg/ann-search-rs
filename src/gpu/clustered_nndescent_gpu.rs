@@ -24,6 +24,7 @@ use crate::gpu::nndescent_gpu::{
     default_forest_trees, nndescent_core, KnnGraphGpu, NnDescentCfg, NnDescentOutput,
     DEFAULT_DELTA, DEFAULT_MAX_ITERS, DEFAULT_RHO, MAX_PROPOSALS,
 };
+use crate::gpu::normalise_rows;
 use crate::prelude::*;
 use crate::utils::k_means_utils::{
     assign_all_parallel_top_m, invert_assignments_csr, sample_vectors,
@@ -563,11 +564,9 @@ where
                 row[..dim].copy_from_slice(&vectors_flat[g * dim..(g + 1) * dim]);
             });
 
-        let cluster_norms: Vec<T> = if use_cosine {
-            member_ids.iter().map(|&g| norms[g as usize]).collect()
-        } else {
-            Vec::new()
-        };
+        if use_cosine {
+            normalise_rows(&mut cluster_vectors, dim_padded);
+        }
 
         let cfg = NnDescentCfg {
             build_k: build_k.min(m - 1),
@@ -590,7 +589,6 @@ where
             ..
         } = nndescent_core::<T, R>(
             &cluster_vectors,
-            &cluster_norms,
             m,
             dim,
             dim_padded,
@@ -1186,18 +1184,8 @@ mod device_tests {
             graph_idx,
             graph_dist,
             ..
-        } = nndescent_core::<f32, WgpuRuntime>(
-            &flat,
-            &[],
-            n,
-            dim,
-            dim,
-            &cfg,
-            &client,
-            &limits,
-            false,
-        )
-        .unwrap();
+        } = nndescent_core::<f32, WgpuRuntime>(&flat, n, dim, dim, &cfg, &client, &limits, false)
+            .unwrap();
 
         let members: Vec<u32> = (0..n as u32).collect();
         let mut global = vec![(SENTINEL_PID, f32::MAX); n * k];

@@ -101,7 +101,7 @@ fn compute_dot_products_multi<F: CubeclFloat, N: Size>(
 /// Points per leaf whose staging fits the device's shared-memory budget.
 ///
 /// Per-point cost is `dim_padded * elem_bytes` for the vector, four bytes for
-/// the pid and `elem_bytes` for the norm, plus eight fixed bytes covering
+/// the pid and `elem_bytes` for the threshold, plus eight fixed bytes covering
 /// `shared_leaf_start` and `shared_leaf_size`.
 ///
 /// ### Params
@@ -123,11 +123,11 @@ fn compute_max_leaf_size(
     // `shared_leaf_start` + `shared_leaf_size`
     const OVERHEAD: usize = 8;
 
-    // Per point: `shared_vecs` holds a row, `shared_pids` a u32, and
-    // `shared_norms` and `shared_thresh` a float each. Every `SharedMemory` in
+    // Per point: `shared_vecs` holds a row, `shared_pids` a u32 and
+    // `shared_thresh` a float. Every `SharedMemory` in
     // `leaf_pairwise_proposals` is counted here; missing one busts the device
     // limit, and `launch_unchecked` then does no work and reports nothing.
-    let per_point = dim_padded * elem_bytes + 4 + 2 * elem_bytes;
+    let per_point = dim_padded * elem_bytes + 4 + elem_bytes;
     let available = limits.max_shared_bytes.saturating_sub(OVERHEAD);
     let fits = available / per_point;
 
@@ -155,7 +155,6 @@ fn compute_max_leaf_size(
 /// ### Params
 ///
 /// * `vectors` - Row-major vector matrix, line-vectorised `[n, dim/LINE_SIZE]`
-/// * `norms` - Pre-computed L2 norms `[n]` (ignored when `use_cosine` is false)
 /// * `leaf_points` - Flat array of global point IDs in leaf order
 /// * `leaf_offsets` - CSR-style offsets into `leaf_points`, length n_leaves + 1
 /// * `graph_dist` - Current kNN graph distances [n, k], used for threshold
@@ -178,7 +177,6 @@ fn compute_max_leaf_size(
 #[cube(launch_unchecked)]
 pub fn leaf_pairwise_proposals<F: CubeclFloat, N: Size>(
     vectors: &Tensor<Vector<F, N>>,
-    norms: &Tensor<F>,
     leaf_points: &Tensor<u32>,
     leaf_offsets: &Tensor<u32>,
     graph_dist: &Tensor<F>,
@@ -231,7 +229,6 @@ pub fn leaf_pairwise_proposals<F: CubeclFloat, N: Size>(
     // Scalar shared memory (never use SharedMemory<Line<F>> -- see post-mortem)
     let mut shared_vecs = SharedMemory::<F>::new(max_leaf_size * dim_scalars);
     let mut shared_pids = SharedMemory::<u32>::new(max_leaf_size);
-    let mut shared_norms = SharedMemory::<F>::new(max_leaf_size);
     let mut shared_thresh = SharedMemory::<F>::new(max_leaf_size);
 
     let k = graph_dist.shape(1usize);
@@ -243,9 +240,6 @@ pub fn leaf_pairwise_proposals<F: CubeclFloat, N: Size>(
         // The partner's acceptance threshold is a global read inside the pair
         // loop otherwise, so `leaf_size` reads become `leaf_size^2 / 2`.
         shared_thresh[i as usize] = graph_dist[global_pid as usize * k + k - 1usize];
-        if use_cosine {
-            shared_norms[i as usize] = norms[global_pid as usize];
-        }
         i += WORKGROUP_SIZE_X;
     }
     sync_cube();
@@ -293,7 +287,7 @@ pub fn leaf_pairwise_proposals<F: CubeclFloat, N: Size>(
                 }
 
                 let dist = if use_cosine {
-                    F::new(1.0_f32) - (sum / (shared_norms[ii] * shared_norms[jj]))
+                    F::new(1.0_f32) - sum
                 } else {
                     sum
                 };
@@ -367,8 +361,6 @@ pub fn mark_all_new(graph_idx: &mut Tensor<u32>, total_entries: u32) {
 /// ### Params
 ///
 /// * `vectors_gpu` - GPU-resident vector matrix `[n, dim_padded/LINE_SIZE]`
-/// * `norms_gpu` - GPU-resident L2 norms `[n]`; unused when `use_cosine` is
-///   false
 /// * `graph_idx_gpu` - kNN graph index buffer `[n, k]`; updated in-place
 /// * `graph_dist_gpu` - kNN graph distance buffer `[n, k]`; updated in-place
 /// * `prop_idx_gpu` - Proposal index scratch buffer `[n, MAX_PROPOSALS]`
@@ -395,7 +387,6 @@ pub fn mark_all_new(graph_idx: &mut Tensor<u32>, total_entries: u32) {
 #[allow(clippy::too_many_arguments)]
 pub fn gpu_forest_init<T, R>(
     vectors_gpu: &GpuTensor<R, T>,
-    norms_gpu: &GpuTensor<R, T>,
     graph_idx_gpu: &GpuTensor<R, u32>,
     graph_dist_gpu: &GpuTensor<R, T>,
     prop_idx_gpu: &GpuTensor<R, u32>,
@@ -580,7 +571,6 @@ where
                 CubeDim::new_2d(WORKGROUP_SIZE_X, 1),
                 line,
                 vectors_gpu.clone().into_tensor_arg(),
-                norms_gpu.clone().into_tensor_arg(),
                 leaf_points_gpu.into_tensor_arg(),
                 leaf_offsets_gpu.into_tensor_arg(),
                 graph_dist_gpu.clone().into_tensor_arg(),
@@ -643,8 +633,8 @@ mod budget_tests {
             + leaf_size * dim_padded * elem_bytes
             // shared_pids
             + leaf_size * 4
-            // shared_norms + shared_thresh
-            + 2 * leaf_size * elem_bytes
+            // shared_thresh
+            + leaf_size * elem_bytes
     }
 
     fn limits_with(shared: usize) -> GpuLimits {
@@ -1001,8 +991,6 @@ mod tests {
 
         let vectors_gpu =
             GpuTensor::<WgpuRuntime, f32>::from_slice(&data, vec![n, dim], &client).unwrap();
-        let norms_gpu =
-            GpuTensor::<WgpuRuntime, f32>::from_slice(&[0.0f32], vec![1], &client).unwrap();
         let lp_gpu =
             GpuTensor::<WgpuRuntime, u32>::from_slice(&leaf_points, vec![4], &client).unwrap();
         let lo_gpu =
@@ -1024,7 +1012,6 @@ mod tests {
                 CubeDim::new_2d(WORKGROUP_SIZE_X, 1),
                 line,
                 vectors_gpu.into_tensor_arg(),
-                norms_gpu.into_tensor_arg(),
                 lp_gpu.into_tensor_arg(),
                 lo_gpu.into_tensor_arg(),
                 gdist_gpu.into_tensor_arg(),
@@ -1097,10 +1084,11 @@ mod tests {
         let leaf_points: Vec<u32> = vec![0, 1, 2, 3];
         let leaf_offsets: Vec<u32> = vec![0, 4];
         let graph_dist = vec![f32::MAX; n * build_k];
+        // The kernel takes unit rows; the reference below keeps the raw ones.
+        let mut unit = data.clone();
+        crate::gpu::normalise_rows(&mut unit, dim);
         let vectors_gpu =
-            GpuTensor::<WgpuRuntime, f32>::from_slice(&data, vec![n, dim], &client).unwrap();
-        let norms_gpu =
-            GpuTensor::<WgpuRuntime, f32>::from_slice(&norms, vec![n], &client).unwrap();
+            GpuTensor::<WgpuRuntime, f32>::from_slice(&unit, vec![n, dim], &client).unwrap();
         let lp_gpu =
             GpuTensor::<WgpuRuntime, u32>::from_slice(&leaf_points, vec![4], &client).unwrap();
         let lo_gpu =
@@ -1126,7 +1114,6 @@ mod tests {
                 CubeDim::new_2d(WORKGROUP_SIZE_X, 1),
                 line,
                 vectors_gpu.into_tensor_arg(),
-                norms_gpu.into_tensor_arg(),
                 lp_gpu.into_tensor_arg(),
                 lo_gpu.into_tensor_arg(),
                 gdist_gpu.into_tensor_arg(),
@@ -1194,8 +1181,6 @@ mod tests {
 
         let vectors_gpu =
             GpuTensor::<WgpuRuntime, f32>::from_slice(&data, vec![n, dim], &client).unwrap();
-        let norms_gpu =
-            GpuTensor::<WgpuRuntime, f32>::from_slice(&[0.0f32], vec![1], &client).unwrap();
         let lp_gpu =
             GpuTensor::<WgpuRuntime, u32>::from_slice(&leaf_points, vec![16], &client).unwrap();
         let lo_gpu =
@@ -1217,7 +1202,6 @@ mod tests {
                 CubeDim::new_2d(WORKGROUP_SIZE_X, 1),
                 line,
                 vectors_gpu.into_tensor_arg(),
-                norms_gpu.into_tensor_arg(),
                 lp_gpu.into_tensor_arg(),
                 lo_gpu.into_tensor_arg(),
                 gdist_gpu.into_tensor_arg(),
@@ -1281,8 +1265,6 @@ mod tests {
 
         let vectors_gpu =
             GpuTensor::<WgpuRuntime, f32>::from_slice(&data, vec![n, dim_padded], &client).unwrap();
-        let norms_gpu =
-            GpuTensor::<WgpuRuntime, f32>::from_slice(&[0.0f32], vec![1], &client).unwrap();
         let graph_idx_gpu = GpuTensor::<WgpuRuntime, u32>::from_slice(
             &vec![0x7FFFFFFFu32; n * build_k],
             vec![n, build_k],
@@ -1306,7 +1288,6 @@ mod tests {
 
         let _ = gpu_forest_init(
             &vectors_gpu,
-            &norms_gpu,
             &graph_idx_gpu,
             &graph_dist_gpu,
             &prop_idx_gpu,
