@@ -1073,91 +1073,9 @@ where
     Ok((all_indices, all_distances))
 }
 
-/////////////////////////////////
-// Fire-and-Forget IVF kernels //
-/////////////////////////////////
-
 //////////////////////////////
 // IVF mega kernel variants //
 //////////////////////////////
-
-/// Compute Euclidean distances using a flattened IVF task list
-///
-/// Each task represents one (query, cluster) pair. The grid maps threads
-/// directly to `(db_element, task)` pairs, avoiding a per-cluster kernel
-/// launch.
-///
-/// ### Params
-///
-/// * `query_vectors` - Query vectors `[n_queries, dim / N]` as `Vector<F, N>`
-/// * `db_vectors` - Full database vectors `[n_db, dim / N]` as `Vector<F, N>`
-/// * `task_q_idx` - Query index for each task `[n_tasks]`
-/// * `task_db_start` - Global DB start index for each task `[n_tasks]`
-/// * `task_write_offset` - Write offset into the candidate row for each task
-///   `[n_tasks]`
-/// * `task_db_count` - Number of DB vectors in each task's cluster `[n_tasks]`
-/// * `out_dists` - Output candidate distances `[n_queries, max_candidates]`
-/// * `out_indices` - Output candidate DB indices `[n_queries, max_candidates]`
-/// * `size_y` - Safe workgroup size Y for the given dimensionality
-///
-/// ### Grid mapping
-///
-/// * `ABSOLUTE_POS_X` -> vector index within the task's cluster (`0..db_count`)
-/// * `ABSOLUTE_POS_Y` -> task index (`0..n_tasks`)
-#[cube(launch_unchecked)]
-pub fn compute_ivf_mega_euclidean<F: Float, N: Size>(
-    query_vectors: &Tensor<Vector<F, N>>,
-    db_vectors: &Tensor<Vector<F, N>>,
-    task_q_idx: &Tensor<u32>,
-    task_db_start: &Tensor<u32>,
-    task_write_offset: &Tensor<u32>,
-    task_db_count: &Tensor<u32>,
-    out_dists: &mut Tensor<F>,
-    out_indices: &mut Tensor<u32>,
-    #[comptime] size_y: u32,
-) {
-    let lanes = LINE_SIZE;
-    let local_db_idx = ABSOLUTE_POS_X;
-    let task_idx = (CUBE_POS_Z * CUBE_COUNT_Y + CUBE_POS_Y) * size_y + UNIT_POS_Y;
-
-    if task_idx >= task_q_idx.len() as u32 {
-        terminate!();
-    }
-
-    let db_count = task_db_count[task_idx as usize];
-    if local_db_idx >= db_count {
-        terminate!();
-    }
-
-    let q_idx = task_q_idx[task_idx as usize];
-    let db_start = task_db_start[task_idx as usize];
-    let write_offset = task_write_offset[task_idx as usize];
-
-    let real_db_idx = db_start + local_db_idx;
-    let write_pos = write_offset + local_db_idx;
-
-    let mut sum = F::new(0.0_f32);
-
-    let dim_lines = query_vectors.shape(1) / lanes;
-    let q_offset = q_idx as usize * dim_lines;
-    let d_offset = real_db_idx as usize * dim_lines;
-
-    for i in 0..dim_lines {
-        let q_line = query_vectors[q_offset + i];
-        let d_line = db_vectors[d_offset + i];
-        let diff = q_line - d_line;
-        let sq = diff * diff;
-
-        #[unroll]
-        for lane in 0..lanes {
-            sum += sq[lane];
-        }
-    }
-
-    let out_offset = q_idx as usize * out_dists.stride(0) + write_pos as usize;
-    out_dists[out_offset] = sum;
-    out_indices[out_offset] = real_db_idx;
-}
 
 /// In-place top-k reduction for the IVF variable-length candidate buffer
 ///
@@ -1233,8 +1151,9 @@ pub fn reduce_ivf_topk<F: Float>(
 
 /// Euclidean mega kernel with shared-memory query caching.
 ///
-/// Same task-based architecture as `compute_ivf_mega_euclidean`, but
-/// cooperatively loads query vectors into scalar shared memory so that all
+/// Each task is one (query, cluster) pair, and the grid maps threads directly
+/// to `(db_element, task)` pairs, avoiding a per-cluster kernel launch. Query
+/// vectors are loaded cooperatively into scalar shared memory so that all
 /// X-threads in a workgroup row (and Y-threads sharing the same query) read
 /// from shared memory instead of global memory.
 ///
@@ -2152,8 +2071,6 @@ mod tests {
     /// * `tasks` - Vec of `(q_idx, db_start, write_offset, db_count)`
     /// * `n_queries`, `n_db`, `dim`, `max_candidates` - dimensions
     /// * `device` - GPU device
-    /// * `use_cached` - if true, runs the new cached kernel; otherwise
-    ///   the old one
     #[allow(clippy::too_many_arguments)]
     fn run_mega_euclidean(
         queries: &[f32],
@@ -2164,7 +2081,6 @@ mod tests {
         dim: usize,
         max_candidates: usize,
         device: &WgpuDevice,
-        use_cached: bool,
     ) -> (Vec<f32>, Vec<u32>) {
         let client = WgpuRuntime::client(device);
         let limits = GpuLimits::from_client(&client);
@@ -2195,44 +2111,24 @@ mod tests {
         let max_db_count = tasks.iter().map(|t| t.3).max().unwrap_or(0);
         let gx = max_db_count.div_ceil(WORKGROUP_SIZE_X).max(1);
         let (gy, gz) = grid_2d((n_tasks as u32).div_ceil(4), &limits).unwrap();
-        if use_cached {
-            unsafe {
-                compute_ivf_mega_euclidean_cached::launch_unchecked::<f32, WgpuRuntime>(
-                    &client,
-                    CubeCount::Static(gx, gy, gz),
-                    CubeDim::new_2d(WORKGROUP_SIZE_X, 4),
-                    vec_size,
-                    q_gpu.into_tensor_arg(),
-                    db_gpu.into_tensor_arg(),
-                    tq_gpu.into_tensor_arg(),
-                    tds_gpu.into_tensor_arg(),
-                    two_gpu.into_tensor_arg(),
-                    tdc_gpu.into_tensor_arg(),
-                    out_d.clone().into_tensor_arg(),
-                    out_i.clone().into_tensor_arg(),
-                    n_tasks as u32,
-                    dim_lines,
-                    4,
-                );
-            }
-        } else {
-            unsafe {
-                compute_ivf_mega_euclidean::launch_unchecked::<f32, WgpuRuntime>(
-                    &client,
-                    CubeCount::Static(gx, gy, gz),
-                    CubeDim::new_2d(WORKGROUP_SIZE_X, 4),
-                    vec_size,
-                    q_gpu.into_tensor_arg(),
-                    db_gpu.into_tensor_arg(),
-                    tq_gpu.into_tensor_arg(),
-                    tds_gpu.into_tensor_arg(),
-                    two_gpu.into_tensor_arg(),
-                    tdc_gpu.into_tensor_arg(),
-                    out_d.clone().into_tensor_arg(),
-                    out_i.clone().into_tensor_arg(),
-                    4,
-                );
-            }
+        unsafe {
+            compute_ivf_mega_euclidean_cached::launch_unchecked::<f32, WgpuRuntime>(
+                &client,
+                CubeCount::Static(gx, gy, gz),
+                CubeDim::new_2d(WORKGROUP_SIZE_X, 4),
+                vec_size,
+                q_gpu.into_tensor_arg(),
+                db_gpu.into_tensor_arg(),
+                tq_gpu.into_tensor_arg(),
+                tds_gpu.into_tensor_arg(),
+                two_gpu.into_tensor_arg(),
+                tdc_gpu.into_tensor_arg(),
+                out_d.clone().into_tensor_arg(),
+                out_i.clone().into_tensor_arg(),
+                n_tasks as u32,
+                dim_lines,
+                4,
+            );
         }
         (out_d.read(&client).unwrap(), out_i.read(&client).unwrap())
     }
@@ -2285,7 +2181,6 @@ mod tests {
             dim,
             max_candidates,
             &device,
-            true,
         );
 
         // Verify q0's candidates
@@ -2367,7 +2262,6 @@ mod tests {
             dim,
             max_candidates,
             &device,
-            true,
         );
 
         // Verify q0's candidates
