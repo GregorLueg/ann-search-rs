@@ -129,7 +129,10 @@ fn compute_max_leaf_size(
     // limit, and `launch_unchecked` then does no work and reports nothing.
     let per_point = dim_padded * elem_bytes + 4 + elem_bytes;
     let available = limits.max_shared_bytes.saturating_sub(OVERHEAD);
-    let fits = available / per_point;
+    // One point of headroom: a footprint that filled the budget exactly (dim
+    // 128 on a 32 KiB device) ran the leaf kernel far slower on Apple Silicon
+    // than one point less, with identical output.
+    let fits = (available / per_point).saturating_sub(1);
 
     if fits < 2 {
         return Err(AnnSearchErrors::DimTooHighForSharedMemory {
