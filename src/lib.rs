@@ -92,6 +92,8 @@ use crate::gpu::{exhaustive_gpu::*, ivf_gpu::*};
 use crate::mlx::{cagra_mlx::*, exhaustive_mlx::*};
 #[cfg(feature = "mlx")]
 use crate::mlx::ivf_mlx::*;
+#[cfg(feature = "mlx")]
+use crate::mlx::nndescent_mlx::KnnGraphMlx;
 #[cfg(feature = "quantised")]
 use crate::quantised::{
     exhaustive_bf16::*, exhaustive_opq::*, exhaustive_pq::*, exhaustive_sq8::*,
@@ -3529,6 +3531,67 @@ pub fn query_ivf_index_mlx_self(
     verbose: bool,
 ) -> KnnOptionResult<f32> {
     index.generate_knn(k, nprobe, nquery, return_dist, verbose)
+}
+
+///////////////////
+// NNDescent MLX //
+///////////////////
+
+#[cfg(feature = "mlx")]
+/// Build a raw kNN graph with NN-Descent on MLX (experimental, Apple Silicon,
+/// f32 only). Counterpart of [`build_knn_graph_gpu`], minus the device.
+///
+/// ### Params
+///
+/// * `mat` - Input data as samples x features. Accepts a faer matrix, an
+///   ndarray 2-D array (with the `ndarray` feature) or a row-major
+///   `(&[f32], n_samples, n_features)` tuple. See [`AnnMatrix`].
+/// * `dist_metric` - Distance metric string
+/// * `k` - Neighbours per node (default 30)
+/// * `build_k` - Internal NNDescent working degree (default 1.5*k)
+/// * `max_iters` - Maximum NNDescent iterations (default 15)
+/// * `n_trees` - Forest size for init (default auto)
+/// * `delta` - Convergence threshold (default 0.001)
+/// * `rho` - Local-join sampling rate (default 1.0, meaning no sampling)
+/// * `refine_knn` - 2-hop refinement sweeps after main loop (default 0)
+/// * `seed` - Random seed
+/// * `verbose` - Print progress
+///
+/// ### Returns
+///
+/// Populated [`KnnGraphMlx`].
+#[allow(clippy::too_many_arguments)]
+pub fn build_knn_graph_mlx(
+    mat: impl AnnMatrix<f32>,
+    dist_metric: &str,
+    k: Option<usize>,
+    build_k: Option<usize>,
+    max_iters: Option<usize>,
+    n_trees: Option<usize>,
+    delta: Option<f32>,
+    rho: Option<f32>,
+    refine_knn: Option<usize>,
+    seed: usize,
+    verbose: bool,
+) -> Result<KnnGraphMlx, AnnSearchErrors> {
+    let metric = parse_ann_dist(dist_metric).unwrap_or_else(|| {
+        println!("[WARNING] Weird string used for distance metric. Using default squared Euclidean distance");
+        Dist::default()
+    });
+
+    crate::mlx::nndescent_mlx::build_knn_graph_mlx(
+        mat.into_row_major(),
+        metric,
+        k,
+        build_k,
+        max_iters,
+        n_trees,
+        delta,
+        rho,
+        refine_knn,
+        seed,
+        verbose,
+    )
 }
 
 //////////////

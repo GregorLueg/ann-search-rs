@@ -8,5 +8,7 @@
 pub mod cagra_mlx;
 pub mod exhaustive_mlx;
 mod ffi;
+mod forest_mlx;
 pub mod ivf_mlx;
 pub mod k_means_mlx;
+pub mod nndescent_mlx;

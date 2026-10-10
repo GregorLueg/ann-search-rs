@@ -290,6 +290,22 @@ pub enum AnnSearchErrors {
         code: i32,
     },
 
+    /// A graph handed to the MLX CAGRA optimisation has the wrong shape
+    #[cfg(feature = "mlx")]
+    #[error(
+        "Graph of {len} entries is not {n} rows of degree {build_k}, or {k} exceeds that degree."
+    )]
+    MlxGraphShape {
+        /// Entries in the graph
+        len: usize,
+        /// Expected rows
+        n: usize,
+        /// Expected row width
+        build_k: usize,
+        /// Requested pruned degree
+        k: usize,
+    },
+
     // -- serialisation errors --
     /// The file does not carry the `ann-search-rs` magic bytes
     #[cfg(feature = "serialise")]
