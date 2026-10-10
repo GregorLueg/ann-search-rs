@@ -1,6 +1,7 @@
 //! IVF self-kNN: MLX against cubecl/wgpu, CPU exhaustive as ground truth.
 //! Both indices use nlist = sqrt(n), nprobe = sqrt(nlist) and the same
-//! number of fixed k-means iterations.
+//! number of fixed k-means iterations. The MLX index is timed with both
+//! scans, query-major and cluster-major, on the same build.
 //!
 //! Run with:
 //! cargo run --example bench_mlx_ivf --release --features gpu,mlx,synthetic -- \
@@ -9,6 +10,7 @@
 mod commons;
 
 use ann_search_rs::prelude::*;
+use ann_search_rs::mlx::ivf_mlx::IvfScanMlx;
 use ann_search_rs::*;
 use clap::Parser;
 use commons::*;
@@ -99,6 +101,12 @@ fn main() {
             .unwrap()
             .0
     });
+    let mlx = mlx.with_scan(IvfScanMlx::ClusterMajor);
+    let (cm_cold, cm_warm, cm_nn) = time_cold_warm(|| {
+        query_ivf_index_mlx_self(&mlx, cli.k, None, None, false, true)
+            .unwrap()
+            .0
+    });
 
     println!();
     println!(
@@ -107,7 +115,8 @@ fn main() {
     );
     for (name, build, cold, warm, nn) in [
         ("wgpu", wgpu_build, wgpu_cold, wgpu_warm, &wgpu_nn),
-        ("mlx", mlx_build, mlx_cold, mlx_warm, &mlx_nn),
+        ("mlx-qm", mlx_build, mlx_cold, mlx_warm, &mlx_nn),
+        ("mlx-cm", mlx_build, cm_cold, cm_warm, &cm_nn),
     ] {
         println!(
             "{:<8} {:>10.1} {:>10.1} {:>10.1} {:>10.4}",
