@@ -57,8 +57,8 @@ const GEMM_DB_TILE: usize = 1024;
 /// and can rank a true neighbour just outside the top `k`. The exact re-rank
 /// cannot recover a point the heap never selected, so the scan keeps `k * 3/2`
 /// candidates and the re-rank truncates.
-const GEMM_RERANK_NUM: usize = 3;
-const GEMM_RERANK_DEN: usize = 2;
+pub(crate) const GEMM_RERANK_NUM: usize = 3;
+pub(crate) const GEMM_RERANK_DEN: usize = 2;
 
 /////////////
 // Helpers //

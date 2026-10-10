@@ -6,13 +6,15 @@
 //! into blocks. Tiles are queued asynchronously so the host never waits
 //! between them.
 //!
-//! Euclidean uses the expansion `|q|^2 + |x|^2 - 2 q.x`, so near-ties can swap
-//! through cancellation; there is no exact re-rank. Cosine runs on unit
+//! Euclidean ranks on the expansion `|x|^2 - 2 q.x`, which cancels at f32, so
+//! the device over-fetches `k * 3/2` candidates and the host re-ranks them with
+//! the exact SIMD distance, as the CPU GEMM path does. Cosine runs on unit
 //! vectors as `1 - q.x`.
 
 use rayon::prelude::*;
 use std::time::Instant;
 
+use crate::cpu::exhaustive::{GEMM_RERANK_DEN, GEMM_RERANK_NUM};
 use crate::mlx::ffi::*;
 use crate::prelude::*;
 use crate::utils::DimensionValidation;
@@ -535,19 +537,21 @@ impl ExhaustiveIndexMlx {
 
         let dim = self.dim;
         let tile = (MLX_DIST_TILE_BYTES / (self.n * size_of::<f32>())).max(1);
-        // Euclidean ranks on `|x|^2 - 2 q.x`; `|q|^2` is constant per row, so
-        // it only gets added to the k survivors on the host.
-        let (alpha, q_sq) = match self.metric {
-            Dist::Cosine => (-1.0, Vec::new()),
-            _ => (-2.0, squared_norms(queries, dim)),
-        };
+        // Euclidean ranks on `|x|^2 - 2 q.x`: `|q|^2` is constant per row and
+        // the exact re-rank below supplies the true distance.
+        let cosine = self.metric == Dist::Cosine;
+        let alpha = if cosine { -1.0 } else { -2.0 };
+        let fetch = k
+            .saturating_mul(GEMM_RERANK_NUM)
+            .div_ceil(GEMM_RERANK_DEN)
+            .min(self.n);
 
         let t0 = Instant::now();
         let mut pending = Vec::with_capacity(n_query.div_ceil(tile));
         for start in (0..n_query).step_by(tile) {
             let end = (start + tile).min(n_query);
             let (idx, dist) =
-                self.queue_tile(&queries[start * dim..end * dim], end - start, k, alpha)?;
+                self.queue_tile(&queries[start * dim..end * dim], end - start, fetch, alpha)?;
             eval_all(&[&idx, &dist], true)?;
             pending.push((idx, dist));
         }
@@ -558,17 +562,28 @@ impl ExhaustiveIndexMlx {
         for (idx, dist) in &pending {
             eval_all(&[idx, dist], false)?;
             let start = all_indices.len();
+            let vectors = &self.vectors_flat;
             let rows: Vec<(Vec<usize>, Vec<f32>)> = idx
                 .as_u32()?
-                .par_chunks_exact(k)
-                .zip(dist.as_f32()?.par_chunks_exact(k))
+                .par_chunks_exact(fetch)
                 .enumerate()
-                .map(|(i, (ir, dr))| {
-                    let shift = q_sq.get(start + i).copied().unwrap_or(0.0);
-                    (
-                        ir.iter().map(|&j| j as usize).collect(),
-                        dr.iter().map(|&v| (v + shift).max(0.0)).collect(),
-                    )
+                .map(|(i, ir)| {
+                    let q = &queries[(start + i) * dim..(start + i + 1) * dim];
+                    let mut exact: Vec<(f32, usize)> = ir
+                        .iter()
+                        .map(|&j| {
+                            let j = j as usize;
+                            let x = &vectors[j * dim..(j + 1) * dim];
+                            let d = if cosine {
+                                1.0 - f32::dot_simd(q, x)
+                            } else {
+                                f32::euclidean_simd(x, q)
+                            };
+                            (d, j)
+                        })
+                        .collect();
+                    exact.sort_unstable_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
+                    exact.into_iter().take(k).map(|(d, j)| (j, d)).unzip()
                 })
                 .collect();
             for (ir, dr) in rows {
