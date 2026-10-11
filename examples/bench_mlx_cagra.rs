@@ -14,7 +14,7 @@ use ann_search_rs::synthetic::subsample_with_noise;
 use ann_search_rs::*;
 use clap::Parser;
 use commons::*;
-use cubecl::wgpu::{WgpuDevice, WgpuRuntime};
+use cubecl::wgpu::WgpuDevice;
 use faer::Mat;
 use std::time::Instant;
 use thousands::*;
@@ -67,7 +67,7 @@ fn main() {
     );
 
     let start = Instant::now();
-    let mut wgpu = build_nndescent_index_gpu::<f32, WgpuRuntime>(
+    let mut wgpu = build_nndescent_index_gpu::<f32>(
         data.as_ref(),
         &cli.distance,
         Some(cli.k),
@@ -80,7 +80,7 @@ fn main() {
         cli.seed as usize,
         false,
         true,
-        WgpuDevice::default(),
+        WgpuDevice::default().clone().into(),
     )
     .unwrap();
     let wgpu_build = start.elapsed().as_secs_f64() * 1e3;

@@ -1864,10 +1864,10 @@ mod tests {
     #[cfg(feature = "gpu")]
     #[test]
     fn test_mlx_knn_graph_matches_wgpu_recall() {
-        use cubecl::wgpu::{WgpuDevice, WgpuRuntime};
+        use cubecl::wgpu::WgpuDevice;
         let (n, dim, k) = (3_000, 30, 15);
         let data = clustered(n, dim, 11);
-        let wgpu = crate::gpu::nndescent_gpu::build_knn_graph_gpu::<f32, WgpuRuntime>(
+        let wgpu = crate::gpu::nndescent_gpu::build_knn_graph_gpu::<f32>(
             data.as_ref(),
             Dist::SquaredEuclidean,
             Some(k),
@@ -1879,7 +1879,7 @@ mod tests {
             None,
             42,
             false,
-            WgpuDevice::DefaultDevice,
+            WgpuDevice::default().clone().into(),
         )
         .unwrap();
         let (w_idx, _) = wgpu.extract_knn(None, false, false);
@@ -1893,10 +1893,10 @@ mod tests {
     #[test]
     fn test_mlx_cagra_reachability_matches_wgpu() {
         use crate::gpu::nndescent_gpu::NNDescentGpu;
-        use cubecl::wgpu::{WgpuDevice, WgpuRuntime};
+        use cubecl::wgpu::WgpuDevice;
         let (data, r_mlx) = mlx_cagra();
         let (n, k) = (data.nrows(), 16);
-        let idx = NNDescentGpu::<f32, WgpuRuntime>::build(
+        let idx = NNDescentGpu::<f32>::build(
             data.as_ref(),
             Dist::SquaredEuclidean,
             Some(k),
@@ -1909,7 +1909,7 @@ mod tests {
             42,
             false,
             false,
-            WgpuDevice::DefaultDevice,
+            WgpuDevice::default().clone().into(),
         )
         .unwrap();
         let r_wgpu = reachable(idx.nav_graph(), n, k, idx.medoid);

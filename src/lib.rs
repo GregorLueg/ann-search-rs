@@ -61,7 +61,7 @@ use std::sync::{
 use thousands::*;
 
 #[cfg(feature = "gpu")]
-use cubecl::prelude::*;
+use cubecl::Device;
 #[cfg(feature = "quantised")]
 use std::ops::AddAssign;
 
@@ -3209,14 +3209,13 @@ where
 /// ### Returns
 ///
 /// The initialised `ExhaustiveIndexGpu`
-pub fn build_exhaustive_index_gpu<T, R>(
+pub fn build_exhaustive_index_gpu<T>(
     mat: impl AnnMatrix<T>,
     dist_metric: &str,
-    device: R::Device,
-) -> Result<ExhaustiveIndexGpu<T, R>, AnnSearchErrors>
+    device: Device,
+) -> Result<ExhaustiveIndexGpu<T>, AnnSearchErrors>
 where
     T: CubeclFloat + AnnSearchFloat,
-    R: Runtime,
 {
     let metric = parse_ann_dist(dist_metric).unwrap_or_else(|| {
         println!("[WARNING] Weird string used for distance metric. Using default squared Euclidean distance");
@@ -3240,16 +3239,15 @@ where
 /// ### Returns
 ///
 /// A tuple of `(knn_indices, optional distances)`
-pub fn query_exhaustive_index_gpu<T, R>(
+pub fn query_exhaustive_index_gpu<T>(
     query_mat: impl AnnMatrix<T>,
-    index: &ExhaustiveIndexGpu<T, R>,
+    index: &ExhaustiveIndexGpu<T>,
     k: usize,
     return_dist: bool,
     verbose: bool,
 ) -> KnnOptionResult<T>
 where
     T: CubeclFloat + AnnSearchFloat,
-    R: Runtime,
 {
     let (indices, distances) = index.query_batch(query_mat, k, verbose)?;
 
@@ -3277,15 +3275,14 @@ where
 /// ### Returns
 ///
 /// A tuple of `(knn_indices, optional distances)`
-pub fn query_exhaustive_index_gpu_self<T, R>(
-    index: &ExhaustiveIndexGpu<T, R>,
+pub fn query_exhaustive_index_gpu_self<T>(
+    index: &ExhaustiveIndexGpu<T>,
     k: usize,
     return_dist: bool,
     verbose: bool,
 ) -> KnnOptionResult<T>
 where
     T: CubeclFloat + AnnSearchFloat,
-    R: Runtime,
 {
     let res = index.generate_knn(k, return_dist, verbose)?;
 
@@ -3749,17 +3746,16 @@ pub fn query_nndescent_index_mlx_self(
 /// * `seed` - Random seed
 /// * `verbose` - Print progress
 /// * `device` - GPU device
-pub fn build_ivf_index_gpu<T, R>(
+pub fn build_ivf_index_gpu<T>(
     mat: impl AnnMatrix<T>,
     nlist: Option<usize>,
     k_means_params: Option<crate::gpu::k_means_gpu::KMeansGpuParams>,
     dist_metric: &str,
     seed: usize,
     verbose: bool,
-    device: R::Device,
-) -> Result<IvfIndexGpu<T, R>, AnnSearchErrors>
+    device: Device,
+) -> Result<IvfIndexGpu<T>, AnnSearchErrors>
 where
-    R: Runtime,
     T: AnnSearchFloat + CubeclFloat,
 {
     let metric = parse_ann_dist(dist_metric).unwrap_or_else(|| {
@@ -3787,9 +3783,9 @@ where
 /// ### Returns
 ///
 /// Tuple of (indices, optional distances)
-pub fn query_ivf_index_gpu<T, R>(
+pub fn query_ivf_index_gpu<T>(
     query_mat: impl AnnMatrix<T>,
-    index: &IvfIndexGpu<T, R>,
+    index: &IvfIndexGpu<T>,
     k: usize,
     nprobe: Option<usize>,
     nquery: Option<usize>,
@@ -3797,7 +3793,6 @@ pub fn query_ivf_index_gpu<T, R>(
     verbose: bool,
 ) -> KnnOptionResult<T>
 where
-    R: Runtime,
     T: AnnSearchFloat + CubeclFloat,
 {
     let (indices, distances) = index.query_batch(query_mat, k, nprobe, nquery, verbose)?;
@@ -3829,8 +3824,8 @@ where
 /// ### Returns
 ///
 /// Tuple of (indices, optional distances)
-pub fn query_ivf_index_gpu_self<T, R>(
-    index: &IvfIndexGpu<T, R>,
+pub fn query_ivf_index_gpu_self<T>(
+    index: &IvfIndexGpu<T>,
     k: usize,
     nprobe: Option<usize>,
     nquery: Option<usize>,
@@ -3838,7 +3833,6 @@ pub fn query_ivf_index_gpu_self<T, R>(
     verbose: bool,
 ) -> KnnOptionResult<T>
 where
-    R: Runtime,
     T: AnnSearchFloat + CubeclFloat,
 {
     index.generate_knn(k, nprobe, nquery, return_dist, verbose)
@@ -3873,7 +3867,7 @@ where
 ///   later GPU beam search does not re-upload them
 /// * `device` - GPU device
 #[allow(clippy::too_many_arguments)]
-pub fn build_nndescent_index_gpu<T, R>(
+pub fn build_nndescent_index_gpu<T>(
     mat: impl AnnMatrix<T>,
     dist_metric: &str,
     k: Option<usize>,
@@ -3886,10 +3880,9 @@ pub fn build_nndescent_index_gpu<T, R>(
     seed: usize,
     verbose: bool,
     retain_gpu: bool,
-    device: R::Device,
-) -> Result<NNDescentGpu<T, R>, AnnSearchErrors>
+    device: Device,
+) -> Result<NNDescentGpu<T>, AnnSearchErrors>
 where
-    R: Runtime,
     T: AnnSearchFloat + CubeclFloat,
 {
     let metric = parse_ann_dist(dist_metric).unwrap_or_else(|| {
@@ -3921,16 +3914,15 @@ where
 /// ### Returns
 ///
 /// Tuple of (indices, optional distances)
-pub fn query_nndescent_index_gpu<T, R>(
+pub fn query_nndescent_index_gpu<T>(
     query_mat: impl AnnMatrix<T>,
-    index: &mut NNDescentGpu<T, R>,
+    index: &mut NNDescentGpu<T>,
     k: usize,
     query_params: Option<CagraGpuSearchParams>,
     return_dist: bool,
     verbose: bool,
 ) -> KnnOptionResult<T>
 where
-    R: Runtime,
     T: AnnSearchFloat + CubeclFloat,
 {
     let (queries_flat, n_queries, _) = query_mat.into_row_major();
@@ -3969,14 +3961,13 @@ where
 /// ### Returns
 ///
 /// Tuple of (indices, optional distances)
-pub fn extract_nndescent_knn_gpu<T, R>(
-    index: &NNDescentGpu<T, R>,
+pub fn extract_nndescent_knn_gpu<T>(
+    index: &NNDescentGpu<T>,
     k: Option<usize>,
     include_self: bool,
     return_dist: bool,
 ) -> KnnOptionResult<T>
 where
-    R: Runtime,
     T: AnnSearchFloat + CubeclFloat,
 {
     Ok(index.extract_knn(k, include_self, return_dist))
@@ -4033,14 +4024,13 @@ where
 /// ### Returns
 ///
 /// Tuple of (indices, optional distances)
-pub fn query_nndescent_index_gpu_self<T, R>(
-    index: &mut NNDescentGpu<T, R>,
+pub fn query_nndescent_index_gpu_self<T>(
+    index: &mut NNDescentGpu<T>,
     k: usize,
     query_params: Option<CagraGpuSearchParams>,
     return_dist: bool,
 ) -> KnnOptionResult<T>
 where
-    R: Runtime,
     T: AnnSearchFloat + CubeclFloat,
 {
     let (indices, distances) = index.self_query_gpu(k, query_params, 42)?;
@@ -4082,7 +4072,7 @@ where
 ///
 /// Populated [`KnnGraphGpu`].
 #[allow(clippy::too_many_arguments)]
-pub fn build_knn_graph_gpu<T, R>(
+pub fn build_knn_graph_gpu<T>(
     mat: impl AnnMatrix<T>,
     dist_metric: &str,
     k: Option<usize>,
@@ -4094,10 +4084,9 @@ pub fn build_knn_graph_gpu<T, R>(
     refine_knn: Option<usize>,
     seed: usize,
     verbose: bool,
-    device: R::Device,
+    device: Device,
 ) -> Result<KnnGraphGpu<T>, AnnSearchErrors>
 where
-    R: Runtime,
     T: AnnSearchFloat + CubeclFloat,
 {
     let metric = parse_ann_dist(dist_metric).unwrap_or_else(|| {
@@ -4105,7 +4094,7 @@ where
         Dist::default()
     });
 
-    crate::gpu::nndescent_gpu::build_knn_graph_gpu::<T, R>(
+    crate::gpu::nndescent_gpu::build_knn_graph_gpu::<T>(
         mat, metric, k, build_k, max_iters, n_trees, delta, rho, refine_knn, seed, verbose, device,
     )
 }
@@ -4150,7 +4139,7 @@ where
 /// around 2x at `C = 2`. Whenever the dataset already fits, this falls through
 /// to [`build_knn_graph_gpu`] rather than paying that for nothing.
 #[allow(clippy::too_many_arguments)]
-pub fn build_clustered_knn_graph_gpu<T, R>(
+pub fn build_clustered_knn_graph_gpu<T>(
     mat: impl AnnMatrix<T>,
     dist_metric: &str,
     k: Option<usize>,
@@ -4163,10 +4152,9 @@ pub fn build_clustered_knn_graph_gpu<T, R>(
     cluster_params: Option<crate::gpu::clustered_nndescent_gpu::ClusteredBuildParams>,
     seed: usize,
     verbose: bool,
-    device: R::Device,
+    device: Device,
 ) -> Result<KnnGraphGpu<T>, AnnSearchErrors>
 where
-    R: Runtime,
     T: AnnSearchFloat + CubeclFloat,
 {
     let metric = parse_ann_dist(dist_metric).unwrap_or_else(|| {
@@ -4174,7 +4162,7 @@ where
         Dist::default()
     });
 
-    crate::gpu::clustered_nndescent_gpu::build_clustered_knn_graph_gpu::<T, R>(
+    crate::gpu::clustered_nndescent_gpu::build_clustered_knn_graph_gpu::<T>(
         mat,
         metric,
         k,

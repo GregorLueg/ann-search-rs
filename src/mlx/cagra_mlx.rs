@@ -1567,7 +1567,7 @@ mod wgpu_tests {
     use super::*;
     use crate::gpu::cagra_gpu_search::CagraGpuSearchParams;
     use crate::gpu::nndescent_gpu::NNDescentGpu;
-    use cubecl::wgpu::{WgpuDevice, WgpuRuntime};
+    use cubecl::wgpu::WgpuDevice;
     use rand::rngs::StdRng;
 
     /// Both searches on one graph, recall within noise of each other.
@@ -1582,7 +1582,7 @@ mod wgpu_tests {
             .map(|_| rng.random_range(-1.0..1.0f32))
             .collect();
         let (base, queries) = data.split_at(n * dim);
-        let mut index = NNDescentGpu::<f32, WgpuRuntime>::build(
+        let mut index = NNDescentGpu::<f32>::build(
             (base, n, dim),
             metric,
             Some(30),
@@ -1595,7 +1595,7 @@ mod wgpu_tests {
             42,
             false,
             true,
-            WgpuDevice::DefaultDevice,
+            WgpuDevice::default().clone().into(),
         )
         .unwrap();
         let s = CagraSearchMlx::new(

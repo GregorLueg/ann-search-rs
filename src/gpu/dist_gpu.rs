@@ -8,6 +8,7 @@
 #![allow(missing_docs)]
 
 use cubecl::prelude::*;
+use cubecl::Device;
 use cubecl_utils_rs::prelude::*;
 use std::iter::Sum;
 
@@ -102,7 +103,7 @@ pub fn dist_tiled<F: Float, N: Size>(
     let dim_scalars = dim_lines * lanes;
     let wg_y = size_y as usize;
     // Scalar shared memory only (vectorised shared mem silently broadcasts lane 0)
-    let mut s_query = SharedMemory::<F>::new(wg_y * dim_scalars);
+    let mut s_query = Shared::<[F]>::new_slice(wg_y * dim_scalars);
     // Cooperative load: all threads in the workgroup fill the query tile
     let thread_id = local_y * WORKGROUP_SIZE_X as usize + local_x;
     let total_threads = WORKGROUP_SIZE_X as usize * wg_y;
@@ -117,7 +118,7 @@ pub fn dist_tiled<F: Float, N: Size>(
             let line_idx = elem / lanes;
             let lane = elem % lanes;
             let line_val = query_vectors[q_global * dim_lines + line_idx];
-            s_query[load_idx] = line_val[lane];
+            s_query[load_idx] = line_val.extract_dynamic(lane);
         } else {
             s_query[load_idx] = F::new(0.0_f32);
         }
@@ -136,9 +137,9 @@ pub fn dist_tiled<F: Float, N: Size>(
         #[unroll]
         for lane in 0..lanes {
             if use_cosine {
-                sum += s_query[s_off + lane] * d_line[lane];
+                sum += s_query[s_off + lane] * d_line.extract(lane);
             } else {
-                let diff = s_query[s_off + lane] - d_line[lane];
+                let diff = s_query[s_off + lane] - d_line.extract(lane);
                 sum += diff * diff;
             }
         }
@@ -213,7 +214,7 @@ pub fn dist_tiled_reg<F: Float, N: Size>(
     let local_y = UNIT_POS_Y as usize;
 
     // Scalar shared memory only (vectorised shared mem silently broadcasts lane 0)
-    let mut s_query = SharedMemory::<F>::new(wg_y * kb_scalars);
+    let mut s_query = Shared::<[F]>::new_slice(wg_y * kb_scalars);
 
     // Locals at kernel scope, never inside a branch or loop.
     let mut acc = Array::<F>::new(tile_q * tile_d);
@@ -247,7 +248,7 @@ pub fn dist_tiled_reg<F: Float, N: Size>(
                 let line_idx = kb_base + elem / lanes;
                 let lane = elem % lanes;
                 let line_val = query_vectors[(q_start as usize + q_global) * dim_lines + line_idx];
-                s_query[load_idx] = line_val[lane];
+                s_query[load_idx] = line_val.extract_dynamic(lane);
             } else {
                 s_query[load_idx] = F::new(0.0_f32);
             }
@@ -269,7 +270,7 @@ pub fn dist_tiled_reg<F: Float, N: Size>(
                 let line_val = db_vectors[idx];
                 #[unroll]
                 for lane in 0..lanes {
-                    d_scalars[r * lanes + lane] = line_val[lane];
+                    d_scalars[r * lanes + lane] = line_val.extract(lane);
                 }
             }
 
@@ -496,21 +497,20 @@ pub fn extract_topk<F: Float>(
 /// ### Returns
 ///
 /// Tuple of `(indices, distances)` where each inner Vec has k elements
-pub fn query_batch_gpu<T, R>(
+pub fn query_batch_gpu<T>(
     k: usize,
     query_data: &BatchData<T>,
     db_data: &BatchData<T>,
     dim: usize,
     metric: &Dist,
-    device: R::Device,
+    device: Device,
     verbose: bool,
 ) -> KnnResult<T>
 where
-    R: Runtime,
     T: Float + Sum + cubecl::CubeElement + num_traits::Float + num_traits::FromPrimitive,
 {
-    let client = R::client(&device);
-    let db_gpu = GpuTensor::<R, T>::from_slice(db_data.data, vec![db_data.n, dim], &client)?;
+    let client = device.client();
+    let db_gpu = GpuTensor::<T>::from_slice(db_data.data, vec![db_data.n, dim], &client)?;
     query_batch_gpu_resident(
         k, query_data, &db_gpu, db_data.n, dim, metric, &client, verbose,
     )
@@ -538,18 +538,17 @@ where
 ///
 /// Tuple of `(indices, distances)` where each inner Vec has k elements
 #[allow(clippy::too_many_arguments)]
-pub fn query_batch_gpu_resident<T, R>(
+pub fn query_batch_gpu_resident<T>(
     k: usize,
     query_data: &BatchData<T>,
-    db_gpu: &GpuTensor<R, T>,
+    db_gpu: &GpuTensor<T>,
     n_db: usize,
     dim: usize,
     metric: &Dist,
-    client: &ComputeClient<R>,
+    client: &Client,
     verbose: bool,
 ) -> KnnResult<T>
 where
-    R: Runtime,
     T: Float + Sum + cubecl::CubeElement + num_traits::Float + num_traits::FromPrimitive,
 {
     // Handles only: cloning a `GpuTensor` shares the device buffer.
@@ -600,15 +599,15 @@ where
         let query_end = (query_start + QUERY_CHUNK_SIZE).min(query_data.n);
         let n_q = query_end - query_start;
 
-        let query_gpu = GpuTensor::<R, T>::from_slice(
+        let query_gpu = GpuTensor::<T>::from_slice(
             &query_data.data[query_start * dim..query_end * dim],
             vec![n_q, dim],
             &client,
         )?;
 
         // Running top-k buffer (no ping-pong needed)
-        let topk_dists = GpuTensor::<R, T>::empty(vec![n_q, k], &client)?;
-        let topk_indices = GpuTensor::<R, u32>::empty(vec![n_q, k], &client)?;
+        let topk_dists = GpuTensor::<T>::empty(vec![n_q, k], &client)?;
+        let topk_indices = GpuTensor::<u32>::empty(vec![n_q, k], &client)?;
 
         // The x axis is the neighbour count, with y and z already carrying the
         // query axis, so there is nothing to flatten into. Check it instead.
@@ -616,7 +615,7 @@ where
         let (init_gy, init_gz) = grid_2d((n_q as u32).div_ceil(safe_worksize_y), &limits)?;
         let init_count = checked_cube_count("init_topk", init_gx, init_gy, init_gz, &limits)?;
         unsafe {
-            init_topk::launch_unchecked::<T, R>(
+            init_topk::launch_unchecked::<T>(
                 &client,
                 init_count,
                 CubeDim::new_2d(WORKGROUP_SIZE_X, safe_worksize_y),
@@ -627,7 +626,7 @@ where
         }
 
         // Reusable distance buffer sized for the largest possible chunk
-        let distances_gpu = GpuTensor::<R, T>::empty(vec![n_q, max_db_chunk], &client)?;
+        let distances_gpu = GpuTensor::<T>::empty(vec![n_q, max_db_chunk], &client)?;
 
         for db_chunk_idx in 0..n_db_chunks {
             let db_start = db_chunk_idx * db_chunk;
@@ -658,7 +657,7 @@ where
                 let reg_grid_x = (n_lane as u32).div_ceil(WORKGROUP_SIZE_X * TILE_D as u32);
                 let (reg_y, reg_z) = grid_2d((n_stage as u32).div_ceil(plan.wg_y), &limits)?;
                 unsafe {
-                    dist_tiled_reg::launch_unchecked::<T, R>(
+                    dist_tiled_reg::launch_unchecked::<T>(
                         &client,
                         CubeCount::Static(reg_grid_x, reg_y, reg_z),
                         CubeDim::new_2d(WORKGROUP_SIZE_X, plan.wg_y / TILE_Q as u32),
@@ -681,7 +680,7 @@ where
                 }
             } else {
                 unsafe {
-                    dist_tiled::launch_unchecked::<T, R>(
+                    dist_tiled::launch_unchecked::<T>(
                         &client,
                         CubeCount::Static(grid_x, grid_y, grid_z),
                         CubeDim::new_2d(WORKGROUP_SIZE_X, safe_worksize_y),
@@ -716,7 +715,7 @@ where
             if use_radix {
                 let (rx, ry) = grid_2d(n_q as u32, &limits)?;
                 unsafe {
-                    radix_select_topk::launch_unchecked::<T, R>(
+                    radix_select_topk::launch_unchecked::<T>(
                         &client,
                         CubeCount::Static(rx, ry, 1),
                         CubeDim::new_2d(WORKGROUP_SIZE_X, 1),
@@ -734,7 +733,7 @@ where
                 let (extract_grid_x, extract_grid_y) =
                     grid_2d((n_q as u32).div_ceil(WORKGROUP_SIZE_X), &limits)?;
                 unsafe {
-                    extract_topk::launch_unchecked::<T, R>(
+                    extract_topk::launch_unchecked::<T>(
                         &client,
                         CubeCount::Static(extract_grid_x, extract_grid_y, 1),
                         CubeDim::new_2d(WORKGROUP_SIZE_X, 1),
@@ -955,10 +954,10 @@ pub fn compute_ivf_mega_cached<F: Float, N: Size>(
 
     let share_mem_size = size_y as usize;
 
-    let mut s_q_idx = SharedMemory::<u32>::new(share_mem_size);
-    let mut s_db_start = SharedMemory::<u32>::new(share_mem_size);
-    let mut s_write_offset = SharedMemory::<u32>::new(share_mem_size);
-    let mut s_db_count = SharedMemory::<u32>::new(share_mem_size);
+    let mut s_q_idx = Shared::<[u32]>::new_slice(share_mem_size);
+    let mut s_db_start = Shared::<[u32]>::new_slice(share_mem_size);
+    let mut s_write_offset = Shared::<[u32]>::new_slice(share_mem_size);
+    let mut s_db_count = Shared::<[u32]>::new_slice(share_mem_size);
 
     let mut q_val = 0u32;
     let mut ds_val = 0u32;
@@ -979,7 +978,7 @@ pub fn compute_ivf_mega_cached<F: Float, N: Size>(
 
     sync_cube();
 
-    let mut s_query = SharedMemory::<F>::new(share_mem_size * dim_scalars);
+    let mut s_query = Shared::<[F]>::new_slice(share_mem_size * dim_scalars);
 
     let thread_id = local_y * WORKGROUP_SIZE_X as usize + local_x;
     let total_threads = WORKGROUP_SIZE_X as usize * wg_y;
@@ -994,7 +993,7 @@ pub fn compute_ivf_mega_cached<F: Float, N: Size>(
         let line_idx = elem / lanes;
         let lane = elem % lanes;
         let line_val = query_vectors[q_global as usize * dim_lines + line_idx];
-        s_query[load_idx] = line_val[lane];
+        s_query[load_idx] = line_val.extract_dynamic(lane);
 
         load_idx += total_threads;
     }
@@ -1022,9 +1021,9 @@ pub fn compute_ivf_mega_cached<F: Float, N: Size>(
         #[unroll]
         for lane in 0..lanes {
             if use_cosine {
-                sum += s_query[s_off + lane] * d_line[lane];
+                sum += s_query[s_off + lane] * d_line.extract(lane);
             } else {
-                let diff = s_query[s_off + lane] - d_line[lane];
+                let diff = s_query[s_off + lane] - d_line.extract(lane);
                 sum += diff * diff;
             }
         }
@@ -1120,7 +1119,7 @@ pub fn ivf_tiled<F: Float, N: Size>(
     let n_db = tiles[tb + 4] as usize;
 
     // Scalar shared memory only (vectorised shared mem silently broadcasts lane 0)
-    let mut s_query = SharedMemory::<F>::new(wg_y * kb_scalars);
+    let mut s_query = Shared::<[F]>::new_slice(wg_y * kb_scalars);
     let mut acc = Array::<F>::new(tile_q * tile_d);
     let mut d_scalars = Array::<F>::new(tile_d * lanes);
 
@@ -1146,7 +1145,7 @@ pub fn ivf_tiled<F: Float, N: Size>(
             if q_local < n_t {
                 let q = task_q_idx[task_start + q_local] as usize;
                 let line_val = query_vectors[q * dim_lines + kb_base + elem / lanes];
-                s_query[load_idx] = line_val[elem % lanes];
+                s_query[load_idx] = line_val.extract_dynamic(elem % lanes);
             } else {
                 s_query[load_idx] = F::new(0.0_f32);
             }
@@ -1168,7 +1167,7 @@ pub fn ivf_tiled<F: Float, N: Size>(
                 let line_val = db_vectors[idx];
                 #[unroll]
                 for lane in 0..lanes {
-                    d_scalars[r * lanes + lane] = line_val[lane];
+                    d_scalars[r * lanes + lane] = line_val.extract(lane);
                 }
             }
 
@@ -1234,7 +1233,7 @@ pub fn ivf_tiled<F: Float, N: Size>(
 #[cfg(feature = "gpu-tests")]
 mod tests {
     use super::*;
-    use cubecl::wgpu::{WgpuDevice, WgpuRuntime};
+    use cubecl::wgpu::WgpuDevice;
 
     fn try_device() -> Option<WgpuDevice> {
         Some(WgpuDevice::default())
@@ -1330,13 +1329,13 @@ mod tests {
         let qb = BatchData::new(&queries, nq);
         let dbb = BatchData::new(&db, ndb);
 
-        let (_, gpu_dist) = query_batch_gpu::<f32, WgpuRuntime>(
+        let (_, gpu_dist) = query_batch_gpu::<f32>(
             k,
             &qb,
             &dbb,
             dim,
             &Dist::SquaredEuclidean,
-            device,
+            device.clone().into(),
             false,
         )
         .unwrap();
@@ -1378,13 +1377,13 @@ mod tests {
         let qb = BatchData::new(&queries, nq);
         let dbb = BatchData::new(&db, ndb);
 
-        let (_, gpu_dist) = query_batch_gpu::<f32, WgpuRuntime>(
+        let (_, gpu_dist) = query_batch_gpu::<f32>(
             k,
             &qb,
             &dbb,
             dim,
             &Dist::SquaredEuclidean,
-            device,
+            device.clone().into(),
             false,
         )
         .unwrap();
@@ -1438,9 +1437,16 @@ mod tests {
         let qb = BatchData::new(&q_unit, nq);
         let dbb = BatchData::new(&d_unit, ndb);
 
-        let (_, gpu_dist) =
-            query_batch_gpu::<f32, WgpuRuntime>(k, &qb, &dbb, dim, &Dist::Cosine, device, false)
-                .unwrap();
+        let (_, gpu_dist) = query_batch_gpu::<f32>(
+            k,
+            &qb,
+            &dbb,
+            dim,
+            &Dist::Cosine,
+            device.clone().into(),
+            false,
+        )
+        .unwrap();
 
         let cpu_d = cpu_cosine_dists(&queries, &db, &q_norms, &d_norms, nq, ndb, dim);
         let (_, cpu_dist) = cpu_topk(&cpu_d, nq, ndb, k);
@@ -1470,13 +1476,13 @@ mod tests {
         let data: Vec<f32> = (0..n * dim).map(|i| (i as f32) * 0.3 + 0.1).collect();
         let batch = BatchData::new(&data, n);
 
-        let (indices, distances) = query_batch_gpu::<f32, WgpuRuntime>(
+        let (indices, distances) = query_batch_gpu::<f32>(
             3,
             &batch,
             &batch,
             dim,
             &Dist::SquaredEuclidean,
-            device,
+            device.clone().into(),
             false,
         )
         .unwrap();
@@ -1512,13 +1518,13 @@ mod tests {
         let qb = BatchData::new(&queries, nq);
         let dbb = BatchData::new(&db, ndb);
 
-        let (indices, distances) = query_batch_gpu::<f32, WgpuRuntime>(
+        let (indices, distances) = query_batch_gpu::<f32>(
             k,
             &qb,
             &dbb,
             dim,
             &Dist::SquaredEuclidean,
-            device,
+            device.clone().into(),
             false,
         )
         .unwrap();
@@ -1527,7 +1533,7 @@ mod tests {
             for i in 1..k {
                 assert!(
                     distances[q][i] >= distances[q][i - 1],
-                    "Query {}: not sorted at {}: {} < {}",
+                    "Query {}: not sorted at {}: {} <{}",
                     q,
                     i,
                     distances[q][i],
@@ -1552,13 +1558,13 @@ mod tests {
         let qb = BatchData::new(&query, 1);
         let dbb = BatchData::new(&data, 4);
 
-        let (idx, dist) = query_batch_gpu::<f32, WgpuRuntime>(
+        let (idx, dist) = query_batch_gpu::<f32>(
             1,
             &qb,
             &dbb,
             4,
             &Dist::SquaredEuclidean,
-            device,
+            device.clone().into(),
             false,
         )
         .unwrap();
@@ -1589,13 +1595,13 @@ mod tests {
         let qb = BatchData::new(&queries, nq);
         let dbb = BatchData::new(&db, ndb);
 
-        let (idx, dist) = query_batch_gpu::<f32, WgpuRuntime>(
+        let (idx, dist) = query_batch_gpu::<f32>(
             k,
             &qb,
             &dbb,
             dim,
             &Dist::SquaredEuclidean,
-            device,
+            device.clone().into(),
             false,
         )
         .unwrap();
@@ -1622,13 +1628,13 @@ mod tests {
         let qb = BatchData::new(&query, 1);
         let dbb = BatchData::new(&db, 1);
 
-        let (idx, dist) = query_batch_gpu::<f32, WgpuRuntime>(
+        let (idx, dist) = query_batch_gpu::<f32>(
             1,
             &qb,
             &dbb,
             dim,
             &Dist::SquaredEuclidean,
-            device,
+            device.clone().into(),
             false,
         )
         .unwrap();
@@ -1656,37 +1662,28 @@ mod tests {
         max_candidates: usize,
         device: &WgpuDevice,
     ) -> (Vec<f32>, Vec<u32>) {
-        let client = WgpuRuntime::client(device);
+        let client = cubecl::Device::from(device.clone()).client();
         let limits = GpuLimits::from_client(&client);
         let vec_size = LINE_SIZE;
         let dim_lines = dim / vec_size;
         let n_tasks = tasks.len();
-        let q_gpu =
-            GpuTensor::<WgpuRuntime, f32>::from_slice(queries, vec![n_queries, dim], &client)
-                .unwrap();
-        let db_gpu =
-            GpuTensor::<WgpuRuntime, f32>::from_slice(db, vec![n_db, dim], &client).unwrap();
+        let q_gpu = GpuTensor::<f32>::from_slice(queries, vec![n_queries, dim], &client).unwrap();
+        let db_gpu = GpuTensor::<f32>::from_slice(db, vec![n_db, dim], &client).unwrap();
         let task_q: Vec<u32> = tasks.iter().map(|t| t.0).collect();
         let task_db_s: Vec<u32> = tasks.iter().map(|t| t.1).collect();
         let task_wo: Vec<u32> = tasks.iter().map(|t| t.2).collect();
         let task_dc: Vec<u32> = tasks.iter().map(|t| t.3).collect();
-        let tq_gpu =
-            GpuTensor::<WgpuRuntime, u32>::from_slice(&task_q, vec![n_tasks], &client).unwrap();
-        let tds_gpu =
-            GpuTensor::<WgpuRuntime, u32>::from_slice(&task_db_s, vec![n_tasks], &client).unwrap();
-        let two_gpu =
-            GpuTensor::<WgpuRuntime, u32>::from_slice(&task_wo, vec![n_tasks], &client).unwrap();
-        let tdc_gpu =
-            GpuTensor::<WgpuRuntime, u32>::from_slice(&task_dc, vec![n_tasks], &client).unwrap();
-        let out_d =
-            GpuTensor::<WgpuRuntime, f32>::empty(vec![n_queries, max_candidates], &client).unwrap();
-        let out_i =
-            GpuTensor::<WgpuRuntime, u32>::empty(vec![n_queries, max_candidates], &client).unwrap();
+        let tq_gpu = GpuTensor::<u32>::from_slice(&task_q, vec![n_tasks], &client).unwrap();
+        let tds_gpu = GpuTensor::<u32>::from_slice(&task_db_s, vec![n_tasks], &client).unwrap();
+        let two_gpu = GpuTensor::<u32>::from_slice(&task_wo, vec![n_tasks], &client).unwrap();
+        let tdc_gpu = GpuTensor::<u32>::from_slice(&task_dc, vec![n_tasks], &client).unwrap();
+        let out_d = GpuTensor::<f32>::empty(vec![n_queries, max_candidates], &client).unwrap();
+        let out_i = GpuTensor::<u32>::empty(vec![n_queries, max_candidates], &client).unwrap();
         let max_db_count = tasks.iter().map(|t| t.3).max().unwrap_or(0);
         let gx = max_db_count.div_ceil(WORKGROUP_SIZE_X).max(1);
         let (gy, gz) = grid_2d((n_tasks as u32).div_ceil(4), &limits).unwrap();
         unsafe {
-            compute_ivf_mega_cached::launch_unchecked::<f32, WgpuRuntime>(
+            compute_ivf_mega_cached::launch_unchecked::<f32>(
                 &client,
                 CubeCount::Static(gx, gy, gz),
                 CubeDim::new_2d(WORKGROUP_SIZE_X, 4),

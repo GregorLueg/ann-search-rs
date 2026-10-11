@@ -466,10 +466,10 @@ mod tests {
     #[test]
     fn test_mlx_nndescent_index_matches_wgpu() {
         use crate::gpu::nndescent_gpu::NNDescentGpu;
-        use cubecl::wgpu::{WgpuDevice, WgpuRuntime};
+        use cubecl::wgpu::WgpuDevice;
         let (data, queries, r_ext, r_self) = mlx_recalls(Dist::SquaredEuclidean);
         let k = 10;
-        let mut gpu = NNDescentGpu::<f32, WgpuRuntime>::build(
+        let mut gpu = NNDescentGpu::<f32>::build(
             data.as_ref(),
             Dist::SquaredEuclidean,
             Some(16),
@@ -482,7 +482,7 @@ mod tests {
             42,
             false,
             true,
-            WgpuDevice::DefaultDevice,
+            WgpuDevice::default().clone().into(),
         )
         .unwrap();
         let cpu = ExhaustiveIndex::new(data.as_ref(), Dist::SquaredEuclidean);

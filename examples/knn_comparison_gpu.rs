@@ -102,12 +102,9 @@ fn main() {
     // Ground truth: GPU exhaustive self-query
     println!("Building GPU exhaustive index...");
     let start = Instant::now();
-    let gpu_exhaustive_idx = build_exhaustive_index_gpu::<f32, cubecl::wgpu::WgpuRuntime>(
-        data.as_ref(),
-        &cli.distance,
-        device.clone(),
-    )
-    .unwrap();
+    let gpu_exhaustive_idx =
+        build_exhaustive_index_gpu::<f32>(data.as_ref(), &cli.distance, device.clone().into())
+            .unwrap();
     let ex_build = start.elapsed().as_secs_f64() * 1000.0;
 
     println!("Self-querying GPU exhaustive (ground truth)...");
@@ -191,7 +188,7 @@ fn main() {
             );
 
             let start = Instant::now();
-            let graph = build_knn_graph_gpu::<f32, cubecl::wgpu::WgpuRuntime>(
+            let graph = build_knn_graph_gpu::<f32>(
                 data.as_ref(),
                 &cli.distance,
                 Some(cli.k),
@@ -203,7 +200,7 @@ fn main() {
                 Some(refine),
                 cli.seed as usize,
                 false,
-                device.clone(),
+                device.clone().into(),
             )
             .unwrap();
             let gpu_build = start.elapsed().as_secs_f64() * 1000.0;

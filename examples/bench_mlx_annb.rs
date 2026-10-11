@@ -9,7 +9,7 @@
 
 use ann_search_rs::*;
 use clap::Parser;
-use cubecl::wgpu::{WgpuDevice, WgpuRuntime};
+use cubecl::wgpu::WgpuDevice;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
@@ -144,7 +144,7 @@ fn main() {
     // Exhaustive
     let t = Instant::now();
     let ex_g =
-        build_exhaustive_index_gpu::<f32, WgpuRuntime>((&train[..], n, dim), metric, dev.clone())
+        build_exhaustive_index_gpu::<f32>((&train[..], n, dim), metric, dev.clone().into())
             .unwrap();
     let b = t.elapsed().as_secs_f64() * 1e3;
     let q = time_query(|| {
@@ -167,14 +167,14 @@ fn main() {
 
     // IVF, default nlist and nprobe on both
     let t = Instant::now();
-    let ivf_g = build_ivf_index_gpu::<f32, WgpuRuntime>(
+    let ivf_g = build_ivf_index_gpu::<f32>(
         (&train[..], n, dim),
         None,
         None,
         metric,
         42,
         false,
-        dev.clone(),
+        dev.clone().into(),
     )
     .unwrap();
     let b = t.elapsed().as_secs_f64() * 1e3;
@@ -198,7 +198,7 @@ fn main() {
 
     // NN-Descent + CAGRA, all defaults on both
     let t = Instant::now();
-    let mut nnd_g = build_nndescent_index_gpu::<f32, WgpuRuntime>(
+    let mut nnd_g = build_nndescent_index_gpu::<f32>(
         (&train[..], n, dim),
         metric,
         None,
@@ -211,7 +211,7 @@ fn main() {
         42,
         false,
         true,
-        dev,
+        dev.clone().into(),
     )
     .unwrap();
     let b = t.elapsed().as_secs_f64() * 1e3;

@@ -745,8 +745,8 @@ where
     /// Query into reusable scratch, leaving `(distance, id)` pairs sorted
     /// nearest-first in `scratch.candidates`.
     ///
-/// Only the Annoy arm has an allocation-free form; the Kd arm falls back to
-/// the allocating query and copies its result across.
+    /// Only the Annoy arm has an allocation-free form; the Kd arm falls back to
+    /// the allocating query and copies its result across.
     ///
     /// ### Params
     ///

@@ -12,7 +12,7 @@ use ann_search_rs::synthetic::subsample_with_noise;
 use ann_search_rs::*;
 use clap::Parser;
 use commons::*;
-use cubecl::wgpu::{WgpuDevice, WgpuRuntime};
+use cubecl::wgpu::WgpuDevice;
 use faer::Mat;
 use std::time::Instant;
 use thousands::*;
@@ -67,7 +67,7 @@ fn main() {
 
     // Index degree 30 (the default), queries at k.
     let (w_build_cold, w_build_warm, mut wgpu) = time_cold_warm(|| {
-        build_nndescent_index_gpu::<f32, WgpuRuntime>(
+        build_nndescent_index_gpu::<f32>(
             data.as_ref(),
             &cli.distance,
             None,
@@ -80,7 +80,7 @@ fn main() {
             seed,
             false,
             true,
-            WgpuDevice::DefaultDevice,
+            WgpuDevice::default().clone().into(),
         )
         .unwrap()
     });

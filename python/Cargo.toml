@@ -22,7 +22,7 @@ mlx = ["ann-search-rs/mlx"]
 
 [dependencies]
 ann-search-rs = { path = "..", default-features = false, features = ["accelerate", "binary", "quantised", "serialise", "synthetic"] }
-cubecl = { version = "0.10.0", features = ["wgpu"], optional = true }
+cubecl = { version = "0.11.0", features = ["wgpu"], optional = true }
 num-traits = "0.2"
 faer = "0.23.2"
 numpy = "0.29"

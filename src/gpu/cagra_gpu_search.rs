@@ -6,7 +6,7 @@
 
 #![allow(missing_docs)]
 
-use cubecl::frontend::{Float, SharedMemory};
+use cubecl::frontend::{Float, Shared};
 use cubecl::prelude::*;
 use cubecl_utils_rs::prelude::*;
 use rand::{rngs::SmallRng, Rng, SeedableRng};
@@ -196,7 +196,10 @@ pub fn cagra_beam_search<F: Float, N: Size>(
     let lanes = LINE_SIZE;
     let tx = UNIT_POS_X;
     let dim_scalars = dim_lines * lanes;
-    let hash_mask = hash_size as u32 - 1u32;
+    // cubecl 0.11: a comptime cast inside a short-circuit `while` condition fails
+    // IR verification ("not dominated by definition"), so it is hoisted here.
+    let hash_cap = hash_size as u32;
+    let hash_mask = hash_cap - 1u32;
     let sentinel = 0x7FFFFFFFu32;
     let f_max = F::new(999999999.0_f32);
     let bw = beam_width as u32;
@@ -205,16 +208,16 @@ pub fn cagra_beam_search<F: Float, N: Size>(
     let expand_u32 = expand_per_iter as u32;
 
     // shared memory set up
-    let mut sq_vec = SharedMemory::<F>::new(dim_scalars);
-    let mut s_cand_dist = SharedMemory::<F>::new(beam_width);
-    let mut s_cand_idx = SharedMemory::<u32>::new(beam_width);
-    let mut s_cand_expanded = SharedMemory::<u32>::new(beam_width);
-    let mut s_hash = SharedMemory::<u32>::new(hash_size);
-    let mut s_nbr_idx = SharedMemory::<u32>::new(total_slots);
-    let mut s_nbr_dist = SharedMemory::<F>::new(total_slots);
-    let mut s_active_flag = SharedMemory::<u32>::new(1usize);
-    let mut s_num_cands = SharedMemory::<u32>::new(1usize);
-    let mut s_hash_count = SharedMemory::<u32>::new(1usize);
+    let mut sq_vec = Shared::<[F]>::new_slice(dim_scalars);
+    let mut s_cand_dist = Shared::<[F]>::new_slice(beam_width);
+    let mut s_cand_idx = Shared::<[u32]>::new_slice(beam_width);
+    let mut s_cand_expanded = Shared::<[u32]>::new_slice(beam_width);
+    let mut s_hash = Shared::<[u32]>::new_slice(hash_size);
+    let mut s_nbr_idx = Shared::<[u32]>::new_slice(total_slots);
+    let mut s_nbr_dist = Shared::<[F]>::new_slice(total_slots);
+    let mut s_active_flag = Shared::<[u32]>::new_slice(1usize);
+    let mut s_num_cands = Shared::<[u32]>::new_slice(1usize);
+    let mut s_hash_count = Shared::<[u32]>::new_slice(1usize);
 
     let q_line_offset = q_idx as usize * dim_lines;
     let mut il = tx as usize;
@@ -222,7 +225,7 @@ pub fn cagra_beam_search<F: Float, N: Size>(
         let line_idx = il / lanes;
         let lane = il % lanes;
         let line_val = queries[q_line_offset + line_idx];
-        sq_vec[il] = line_val[lane];
+        sq_vec[il] = line_val.extract_dynamic(lane);
         il += WORKGROUP_SIZE_X as usize;
     }
 
@@ -252,8 +255,8 @@ pub fn cagra_beam_search<F: Float, N: Size>(
                 let mut hs = node_id & hash_mask;
                 let mut ha = 0u32;
                 let mut hd = false;
-                let mut is_new: bool = false;
-                while !hd && ha < hash_size as u32 {
+                let mut is_new = false;
+                while !hd && ha < hash_cap {
                     let ex = s_hash[hs as usize];
                     if ex == sentinel {
                         s_hash[hs as usize] = node_id;
@@ -275,12 +278,12 @@ pub fn cagra_beam_search<F: Float, N: Size>(
                         if use_cosine {
                             #[unroll]
                             for lane in 0..lanes {
-                                sum += sq_vec[s_off + lane] * lv[lane];
+                                sum += sq_vec[s_off + lane] * lv.extract(lane);
                             }
                         } else {
                             #[unroll]
                             for lane in 0..lanes {
-                                let d = sq_vec[s_off + lane] - lv[lane];
+                                let d = sq_vec[s_off + lane] - lv.extract(lane);
                                 sum += d * d;
                             }
                         }
@@ -333,14 +336,14 @@ pub fn cagra_beam_search<F: Float, N: Size>(
     let total_slots_u32 = total_slots as u32;
 
     let max_iter_u32 = max_iters as u32;
-    let mut iter: u32 = 0u32;
-    let mut last_iter: u32 = 0u32;
+    let mut iter = 0u32;
+    let mut last_iter = 0u32;
     while iter < max_iter_u32 {
         if tx == 0u32 {
             last_iter = iter;
             s_active_flag[0usize] = sentinel;
             let nc = s_num_cands[0usize];
-            let mut active_count: u32 = 0u32;
+            let mut active_count = 0u32;
             let mut hash_count = s_hash_count[0usize];
 
             if hash_count + total_slots_u32 > reset_at {
@@ -358,7 +361,7 @@ pub fn cagra_beam_search<F: Float, N: Size>(
                     let mut placed = false;
                     // Bounded like every other probe: a planner-shrunk table
                     // can be smaller than the beam on a small device.
-                    while !placed && ha < hash_size as u32 {
+                    while !placed && ha < hash_cap {
                         if s_hash[hs as usize] == sentinel {
                             s_hash[hs as usize] = node;
                             placed = true;
@@ -388,8 +391,8 @@ pub fn cagra_beam_search<F: Float, N: Size>(
                             let mut hs = nbr & hash_mask;
                             let mut ha = 0u32;
                             let mut hd = false;
-                            let mut is_new: bool = false;
-                            while !hd && ha < hash_size as u32 {
+                            let mut is_new = false;
+                            while !hd && ha < hash_cap {
                                 let ex = s_hash[hs as usize];
                                 if ex == sentinel {
                                     s_hash[hs as usize] = nbr;
@@ -462,12 +465,12 @@ pub fn cagra_beam_search<F: Float, N: Size>(
                         if use_cosine {
                             #[unroll]
                             for lane in 0..lanes {
-                                sum += sq_vec[s_off + lane] * lv[lane];
+                                sum += sq_vec[s_off + lane] * lv.extract(lane);
                             }
                         } else {
                             #[unroll]
                             for lane in 0..lanes {
-                                let d = sq_vec[s_off + lane] - lv[lane];
+                                let d = sq_vec[s_off + lane] - lv.extract(lane);
                                 sum += d * d;
                             }
                         }
@@ -490,14 +493,14 @@ pub fn cagra_beam_search<F: Float, N: Size>(
         if tx == 0u32 && flag != sentinel {
             let mut nc = s_num_cands[0usize];
 
-            let mut j: usize = 0usize;
+            let mut j = 0usize;
             while j < total_slots {
                 if s_nbr_idx[j] != sentinel {
                     let dist = s_nbr_dist[j];
                     let nbr = s_nbr_idx[j];
 
                     let worst = s_cand_dist[bw_last];
-                    let mut skip: bool = false;
+                    let mut skip = false;
                     if nc >= bw && dist >= worst {
                         skip = true;
                     }
@@ -517,7 +520,7 @@ pub fn cagra_beam_search<F: Float, N: Size>(
                             ip += 1u32;
                         }
 
-                        let mut do_insert: bool = true;
+                        let mut do_insert = true;
                         if insert_pos >= bw {
                             do_insert = false;
                         }
@@ -614,12 +617,12 @@ pub fn cagra_beam_search<F: Float, N: Size>(
 /// `(indices, distances)` per query, sorted by distance ascending.
 /// Sentinel entries (unfilled slots) are filtered out.
 #[allow(clippy::too_many_arguments)]
-pub fn cagra_search_batch_gpu<T, R>(
+pub fn cagra_search_batch_gpu<T>(
     queries_flat: &[T],
     n_queries: usize,
     dim: usize,
-    vectors_gpu: &GpuTensor<R, T>,
-    graph_gpu: &GpuTensor<R, u32>,
+    vectors_gpu: &GpuTensor<T>,
+    graph_gpu: &GpuTensor<u32>,
     n: usize,
     k_graph: usize,
     k_out: usize,
@@ -627,10 +630,9 @@ pub fn cagra_search_batch_gpu<T, R>(
     seed: usize,
     query_params: &CagraGpuSearchParams,
     entry_points: Option<&[u32]>,
-    client: &ComputeClient<R>,
+    client: &Client,
 ) -> KnnResult<T>
 where
-    R: Runtime,
     T: CubeclFloat + AnnSearchFloat,
 {
     let limits = GpuLimits::from_client(client);
@@ -657,7 +659,7 @@ where
     }
 
     let queries_gpu =
-        GpuTensor::<R, T>::from_slice(&queries_padded, vec![n_queries, dim_padded], client)?;
+        GpuTensor::<T>::from_slice(&queries_padded, vec![n_queries, dim_padded], client)?;
 
     // Entry points: use provided or fall back to random
     let entry_flat = match entry_points {
@@ -672,12 +674,12 @@ where
                 .collect()
         }
     };
-    let entry_gpu = GpuTensor::<R, u32>::from_slice(&entry_flat, vec![n_queries, n_entry], client)?;
+    let entry_gpu = GpuTensor::<u32>::from_slice(&entry_flat, vec![n_queries, n_entry], client)?;
 
     // Output tensors
-    let out_idx_gpu = GpuTensor::<R, u32>::empty(vec![n_queries, k_out], client)?;
-    let out_dist_gpu = GpuTensor::<R, T>::empty(vec![n_queries, k_out], client)?;
-    let out_iters_gpu = GpuTensor::<R, u32>::empty(vec![n_queries], client)?;
+    let out_idx_gpu = GpuTensor::<u32>::empty(vec![n_queries, k_out], client)?;
+    let out_dist_gpu = GpuTensor::<T>::empty(vec![n_queries, k_out], client)?;
+    let out_iters_gpu = GpuTensor::<u32>::empty(vec![n_queries], client)?;
 
     // 2D grid for large query counts
     let (cubes_x, cubes_y) = grid_2d(n_queries as u32, &limits)?;
@@ -695,7 +697,7 @@ where
     )?;
 
     unsafe {
-        cagra_beam_search::launch_unchecked::<T, R>(
+        cagra_beam_search::launch_unchecked::<T>(
             client,
             CubeCount::Static(cubes_x, cubes_y, 1),
             CubeDim::new_2d(WORKGROUP_SIZE_X, 1),
@@ -766,13 +768,12 @@ where
 mod tests {
     use super::*;
     use cubecl::wgpu::WgpuDevice;
-    use cubecl::wgpu::WgpuRuntime;
     use rand::{rngs::SmallRng, Rng, SeedableRng};
 
     fn try_device() -> Option<WgpuDevice> {
-        let device = WgpuDevice::DefaultDevice;
+        let device = WgpuDevice::default();
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            cubecl::wgpu::WgpuRuntime::client(&device);
+            cubecl::Device::from(device.clone()).client();
         }));
         result.ok().map(|_| device)
     }
@@ -784,7 +785,7 @@ mod tests {
             return;
         };
 
-        let client = WgpuRuntime::client(&device);
+        let client = cubecl::Device::from(device.clone()).client();
         let n = 50usize;
         let dim = 32usize;
         let k_graph = 10usize;
@@ -801,10 +802,9 @@ mod tests {
         let graph_flat = build_brute_force_graph(&data, n, dim, k_graph);
 
         let vectors_gpu =
-            GpuTensor::<WgpuRuntime, f32>::from_slice(&data, vec![n, dim], &client).unwrap();
+            GpuTensor::< f32>::from_slice(&data, vec![n, dim], &client).unwrap();
         let graph_gpu =
-            GpuTensor::<WgpuRuntime, u32>::from_slice(&graph_flat, vec![n, k_graph], &client)
-                .unwrap();
+            GpuTensor::<u32>::from_slice(&graph_flat, vec![n, k_graph], &client).unwrap();
 
         let query = vec![0.0f32; dim];
 
@@ -848,7 +848,7 @@ mod tests {
             return;
         };
 
-        let client = WgpuRuntime::client(&device);
+        let client = cubecl::Device::from(device.clone()).client();
         let n = 500usize;
         let dim = 32usize;
         let k_graph = 15usize;
@@ -877,10 +877,9 @@ mod tests {
         }
 
         let vectors_gpu =
-            GpuTensor::<WgpuRuntime, f32>::from_slice(&data, vec![n, dim], &client).unwrap();
+            GpuTensor::< f32>::from_slice(&data, vec![n, dim], &client).unwrap();
         let graph_gpu =
-            GpuTensor::<WgpuRuntime, u32>::from_slice(&graph_flat, vec![n, k_graph], &client)
-                .unwrap();
+            GpuTensor::<u32>::from_slice(&graph_flat, vec![n, k_graph], &client).unwrap();
 
         let (gpu_indices, _) = cagra_search_batch_gpu(
             &queries,
@@ -931,7 +930,7 @@ mod tests {
             return;
         };
 
-        let client = WgpuRuntime::client(&device);
+        let client = cubecl::Device::from(device.clone()).client();
         let n = 2000usize;
         let dim = 32usize;
         let k_graph = 15usize;
@@ -953,24 +952,24 @@ mod tests {
             .collect();
 
         let vectors_gpu =
-            GpuTensor::<WgpuRuntime, f32>::from_slice(&data, vec![n, dim], &client).unwrap();
+            GpuTensor::< f32>::from_slice(&data, vec![n, dim], &client).unwrap();
         let graph_gpu =
-            GpuTensor::<WgpuRuntime, u32>::from_slice(&graph_flat, vec![n, k_graph], &client)
+            GpuTensor::< u32>::from_slice(&graph_flat, vec![n, k_graph], &client)
                 .unwrap();
         let queries_gpu =
-            GpuTensor::<WgpuRuntime, f32>::from_slice(&queries, vec![n_queries, dim], &client)
+            GpuTensor::< f32>::from_slice(&queries, vec![n_queries, dim], &client)
                 .unwrap();
         let entry_gpu =
-            GpuTensor::<WgpuRuntime, u32>::from_slice(&entries, vec![n_queries, n_entry], &client)
+            GpuTensor::< u32>::from_slice(&entries, vec![n_queries, n_entry], &client)
                 .unwrap();
         let out_idx =
-            GpuTensor::<WgpuRuntime, u32>::empty(vec![n_queries, k_out], &client).unwrap();
+            GpuTensor::< u32>::empty(vec![n_queries, k_out], &client).unwrap();
         let out_dist =
-            GpuTensor::<WgpuRuntime, f32>::empty(vec![n_queries, k_out], &client).unwrap();
-        let out_iters = GpuTensor::<WgpuRuntime, u32>::empty(vec![n_queries], &client).unwrap();
+            GpuTensor::< f32>::empty(vec![n_queries, k_out], &client).unwrap();
+        let out_iters = GpuTensor::< u32>::empty(vec![n_queries], &client).unwrap();
 
         unsafe {
-            cagra_beam_search::launch_unchecked::<f32, WgpuRuntime>(
+            cagra_beam_search::launch_unchecked::<f32>(
                 &client,
                 CubeCount::Static(n_queries as u32, 1, 1),
                 CubeDim::new_2d(WORKGROUP_SIZE_X, 1),

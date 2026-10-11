@@ -8,6 +8,7 @@ use ann_search_rs::gpu::k_means_gpu::KMeansGpuParams;
 use cubecl::benchmark::{Benchmark, TimingMethod};
 use cubecl::future;
 use cubecl::prelude::*;
+use cubecl::Device;
 
 use ann_search_rs::gpu::dist_gpu::{init_topk, reduce_ivf_topk};
 use ann_search_rs::gpu::topk_gpu::{
@@ -24,12 +25,12 @@ use cubecl_utils_rs::prelude::*;
 use ann_search_rs::gpu::ivf_gpu::IvfIndexGpu;
 use faer::Mat;
 
-struct IvfBuildBench<R: Runtime> {
+struct IvfBuildBench {
     n: usize,
     dim: usize,
     nlist: usize,
     metric: Dist,
-    device: R::Device,
+    device: Device,
 }
 
 #[derive(Clone)]
@@ -43,7 +44,7 @@ fn default_k_means_params() -> Option<KMeansGpuParams> {
     Some(KMeansGpuParams::new(10, None, true, false))
 }
 
-impl<R: Runtime> Benchmark for IvfBuildBench<R> {
+impl Benchmark for IvfBuildBench {
     type Input = IvfBuildInput;
     type Output = ();
 
@@ -61,7 +62,7 @@ impl<R: Runtime> Benchmark for IvfBuildBench<R> {
         let mat = Mat::from_fn(input.n, input.dim, |i, j| input.data[i * input.dim + j]);
         // Propagate rather than discard: a silently failing build would
         // otherwise report as an implausibly fast one.
-        IvfIndexGpu::<f32, R>::build(
+        IvfIndexGpu::<f32>::build(
             mat.as_ref(),
             self.metric,
             Some(self.nlist),
@@ -83,13 +84,13 @@ impl<R: Runtime> Benchmark for IvfBuildBench<R> {
     }
 }
 
-struct IvfQueryBench<R: Runtime> {
-    index: std::sync::Arc<IvfIndexGpu<f32, R>>,
+struct IvfQueryBench {
+    index: std::sync::Arc<IvfIndexGpu<f32>>,
     n_queries: usize,
     dim: usize,
     k: usize,
     nprobe: usize,
-    client: ComputeClient<R>,
+    client: Client,
 }
 
 #[derive(Clone)]
@@ -97,7 +98,7 @@ struct IvfQueryInput {
     queries: Vec<f32>,
 }
 
-impl<R: Runtime> Benchmark for IvfQueryBench<R> {
+impl Benchmark for IvfQueryBench {
     type Input = IvfQueryInput;
     type Output = (Vec<Vec<usize>>, Vec<Vec<f32>>);
 
@@ -132,15 +133,15 @@ impl<R: Runtime> Benchmark for IvfQueryBench<R> {
     }
 }
 
-struct IvfKnnBench<R: Runtime> {
-    index: std::sync::Arc<IvfIndexGpu<f32, R>>,
+struct IvfKnnBench {
+    index: std::sync::Arc<IvfIndexGpu<f32>>,
     n: usize, // store separately since index.n is private
     k: usize,
     nprobe: usize,
-    client: ComputeClient<R>,
+    client: Client,
 }
 
-impl<R: Runtime> Benchmark for IvfKnnBench<R> {
+impl Benchmark for IvfKnnBench {
     type Input = ();
     type Output = (Vec<Vec<usize>>, Option<Vec<Vec<f32>>>);
 
@@ -173,25 +174,25 @@ impl<R: Runtime> Benchmark for IvfKnnBench<R> {
 /// non-f32 elements and runtimes without `u32` atomics, so it stays worth
 /// measuring. It inserts straight into global memory and therefore needs the
 /// sentinel seeding that the radix path does not.
-struct IvfReduceBench<R: Runtime> {
+struct IvfReduceBench {
     /// Number of queries, one workgroup each
     n_queries: usize,
     /// Candidate slots per query
     max_candidates: usize,
     /// Neighbours to select
     k: usize,
-    client: ComputeClient<R>,
+    client: Client,
 }
 
-struct IvfReduceInput<R: Runtime> {
-    candidate_dists: GpuTensor<R, f32>,
-    candidate_indices: GpuTensor<R, u32>,
-    candidates_per_query: GpuTensor<R, u32>,
-    out_dists: GpuTensor<R, f32>,
-    out_indices: GpuTensor<R, u32>,
+struct IvfReduceInput {
+    candidate_dists: GpuTensor<f32>,
+    candidate_indices: GpuTensor<u32>,
+    candidates_per_query: GpuTensor<u32>,
+    out_dists: GpuTensor<f32>,
+    out_indices: GpuTensor<u32>,
 }
 
-impl<R: Runtime> Clone for IvfReduceInput<R> {
+impl Clone for IvfReduceInput {
     fn clone(&self) -> Self {
         Self {
             candidate_dists: self.candidate_dists.clone(),
@@ -203,8 +204,8 @@ impl<R: Runtime> Clone for IvfReduceInput<R> {
     }
 }
 
-impl<R: Runtime> Benchmark for IvfReduceBench<R> {
-    type Input = IvfReduceInput<R>;
+impl Benchmark for IvfReduceBench {
+    type Input = IvfReduceInput;
     type Output = ();
 
     fn prepare(&self) -> Self::Input {
@@ -218,19 +219,15 @@ impl<R: Runtime> Benchmark for IvfReduceBench<R> {
         let counts: Vec<u32> = vec![mc as u32; nq];
 
         IvfReduceInput {
-            candidate_dists: GpuTensor::<R, f32>::from_slice(&dists, vec![nq, mc], &self.client)
+            candidate_dists: GpuTensor::<f32>::from_slice(&dists, vec![nq, mc], &self.client)
                 .expect("GPU allocation exceeds the device binding limit"),
-            candidate_indices: GpuTensor::<R, u32>::from_slice(
-                &indices,
-                vec![nq, mc],
-                &self.client,
-            )
-            .expect("GPU allocation exceeds the device binding limit"),
-            candidates_per_query: GpuTensor::<R, u32>::from_slice(&counts, vec![nq], &self.client)
+            candidate_indices: GpuTensor::<u32>::from_slice(&indices, vec![nq, mc], &self.client)
                 .expect("GPU allocation exceeds the device binding limit"),
-            out_dists: GpuTensor::<R, f32>::empty(vec![nq, self.k], &self.client)
+            candidates_per_query: GpuTensor::<u32>::from_slice(&counts, vec![nq], &self.client)
                 .expect("GPU allocation exceeds the device binding limit"),
-            out_indices: GpuTensor::<R, u32>::empty(vec![nq, self.k], &self.client)
+            out_dists: GpuTensor::<f32>::empty(vec![nq, self.k], &self.client)
+                .expect("GPU allocation exceeds the device binding limit"),
+            out_indices: GpuTensor::<u32>::empty(vec![nq, self.k], &self.client)
                 .expect("GPU allocation exceeds the device binding limit"),
         }
     }
@@ -244,7 +241,7 @@ impl<R: Runtime> Benchmark for IvfReduceBench<R> {
         let (init_gy, init_gz) =
             grid_2d((self.n_queries as u32).div_ceil(4), &limits).map_err(|e| e.to_string())?;
         unsafe {
-            init_topk::launch_unchecked::<f32, R>(
+            init_topk::launch_unchecked::<f32>(
                 &self.client,
                 CubeCount::Static(init_gx, init_gy, init_gz),
                 CubeDim::new_2d(WORKGROUP_SIZE_X, 4),
@@ -257,7 +254,7 @@ impl<R: Runtime> Benchmark for IvfReduceBench<R> {
         let (gx, gy) = grid_2d((self.n_queries as u32).div_ceil(WORKGROUP_SIZE_X), &limits)
             .map_err(|e| e.to_string())?;
         unsafe {
-            reduce_ivf_topk::launch_unchecked::<f32, R>(
+            reduce_ivf_topk::launch_unchecked::<f32>(
                 &self.client,
                 CubeCount::Static(gx, gy, 1),
                 CubeDim::new_2d(WORKGROUP_SIZE_X, 1),
@@ -285,18 +282,18 @@ impl<R: Runtime> Benchmark for IvfReduceBench<R> {
 }
 
 /// Times `radix_select_ivf_topk`, the replacement, on identical data.
-struct RadixIvfReduceBench<R: Runtime> {
+struct RadixIvfReduceBench {
     /// Number of queries, one workgroup each
     n_queries: usize,
     /// Candidate slots per query
     max_candidates: usize,
     /// Neighbours to select
     k: usize,
-    client: ComputeClient<R>,
+    client: Client,
 }
 
-impl<R: Runtime> Benchmark for RadixIvfReduceBench<R> {
-    type Input = IvfReduceInput<R>;
+impl Benchmark for RadixIvfReduceBench {
+    type Input = IvfReduceInput;
     type Output = ();
 
     fn prepare(&self) -> Self::Input {
@@ -316,7 +313,7 @@ impl<R: Runtime> Benchmark for RadixIvfReduceBench<R> {
         let (gx, gy) = grid_2d(self.n_queries as u32, &limits).map_err(|e| e.to_string())?;
 
         unsafe {
-            radix_select_ivf_topk::launch_unchecked::<f32, R>(
+            radix_select_ivf_topk::launch_unchecked::<f32>(
                 &self.client,
                 CubeCount::Static(gx, gy, 1),
                 CubeDim::new_2d(WORKGROUP_SIZE_X, 1),
@@ -363,14 +360,9 @@ impl<R: Runtime> Benchmark for RadixIvfReduceBench<R> {
 /// ### Returns
 ///
 /// The selected distances, so callers can cross-check the two arms.
-fn validate_ivf_reduce<R: Runtime, B>(
-    bench: &B,
-    n_queries: usize,
-    k: usize,
-    client: &ComputeClient<R>,
-) -> Vec<f32>
+fn validate_ivf_reduce<B>(bench: &B, n_queries: usize, k: usize, client: &Client) -> Vec<f32>
 where
-    B: Benchmark<Input = IvfReduceInput<R>, Output = ()>,
+    B: Benchmark<Input = IvfReduceInput, Output = ()>,
 {
     let limits = GpuLimits::from_client(client);
     let input = bench.prepare();
@@ -378,7 +370,7 @@ where
     let init_gx = (k as u32).div_ceil(WORKGROUP_SIZE_X);
     let (init_gy, init_gz) = grid_2d((n_queries as u32).div_ceil(4), &limits).unwrap();
     unsafe {
-        init_topk::launch_unchecked::<f32, R>(
+        init_topk::launch_unchecked::<f32>(
             client,
             CubeCount::Static(init_gx, init_gy, init_gz),
             CubeDim::new_2d(WORKGROUP_SIZE_X, 4),
@@ -413,11 +405,11 @@ where
 }
 
 /// Print the device ceilings that silently gate `launch_unchecked`.
-fn report_device_limits<R: Runtime>(client: &ComputeClient<R>) {
+fn report_device_limits(client: &Client) {
     let props = client.properties();
     let hw = &props.hardware;
     println!("====== Device ======");
-    println!("runtime          : {}", R::name(client));
+    println!("runtime          : {}", client.name());
     println!(
         "plane size       : {} .. {}",
         hw.plane_size_min, hw.plane_size_max
@@ -450,10 +442,10 @@ fn validate_knn(indices: &[Vec<usize>], k: usize, label: &str) {
     );
 }
 
-fn run_ivf_suite<R: Runtime>(device: &R::Device) {
-    let client = R::client(device);
+fn run_ivf_suite(device: &Device) {
+    let client = device.client();
 
-    report_device_limits::<R>(&client);
+    report_device_limits(&client);
 
     // ── Isolated reducer sweep ──
     //
@@ -464,14 +456,14 @@ fn run_ivf_suite<R: Runtime>(device: &R::Device) {
     let limits = GpuLimits::from_client(&client);
     println!("====== IVF reducer, isolated (8192q x 2048 candidates) ======");
     for k in [15usize, 30, 50, 100, 150, 250] {
-        let bench = IvfReduceBench::<R> {
+        let bench = IvfReduceBench {
             n_queries: 8192,
             max_candidates: 2048,
             k,
             client: client.clone(),
         };
 
-        let radix = RadixIvfReduceBench::<R> {
+        let radix = RadixIvfReduceBench {
             n_queries: 8192,
             max_candidates: 2048,
             k,
@@ -482,8 +474,8 @@ fn run_ivf_suite<R: Runtime>(device: &R::Device) {
         // against each other. A radix kernel that silently did nothing would
         // otherwise report as an enormous speedup, which is exactly what a
         // busted `launch_unchecked` looks like.
-        let serial_dists = validate_ivf_reduce::<R, _>(&bench, 8192, k, &client);
-        let radix_dists = validate_ivf_reduce::<R, _>(&radix, 8192, k, &client);
+        let serial_dists = validate_ivf_reduce::<_>(&bench, 8192, k, &client);
+        let radix_dists = validate_ivf_reduce::<_>(&radix, 8192, k, &client);
         assert_eq!(
             serial_dists.len(),
             radix_dists.len(),
@@ -535,7 +527,7 @@ fn run_ivf_suite<R: Runtime>(device: &R::Device) {
         );
 
         // Time the build, then reuse the same index for the query benchmarks.
-        let build_bench = IvfBuildBench::<R> {
+        let build_bench = IvfBuildBench {
             n,
             dim,
             nlist,
@@ -551,7 +543,7 @@ fn run_ivf_suite<R: Runtime>(device: &R::Device) {
         let mat = Mat::from_fn(n, dim, |i, j| data[i * dim + j]);
 
         let index = std::sync::Arc::new(
-            IvfIndexGpu::<f32, R>::build(
+            IvfIndexGpu::<f32>::build(
                 mat.as_ref(),
                 metric,
                 Some(nlist),
@@ -570,7 +562,7 @@ fn run_ivf_suite<R: Runtime>(device: &R::Device) {
 
         for nprobe in &nprobe_values {
             // Cross-batch query
-            let query_bench = IvfQueryBench::<R> {
+            let query_bench = IvfQueryBench {
                 index: index.clone(),
                 n_queries: 10_000,
                 dim,
@@ -588,7 +580,7 @@ fn run_ivf_suite<R: Runtime>(device: &R::Device) {
             println!("{:?}", query_bench.run(TimingMethod::System));
 
             // Self-query (kNN graph)
-            let knn_bench = IvfKnnBench::<R> {
+            let knn_bench = IvfKnnBench {
                 index: index.clone(),
                 k: 15,
                 n,
@@ -602,5 +594,5 @@ fn run_ivf_suite<R: Runtime>(device: &R::Device) {
 }
 
 fn main() {
-    run_ivf_suite::<cubecl::wgpu::WgpuRuntime>(&Default::default());
+    run_ivf_suite(&Default::default());
 }

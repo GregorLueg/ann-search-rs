@@ -775,18 +775,18 @@ fn ivf_tq_cosine_is_non_negative() {
 #[cfg(all(feature = "gpu", feature = "gpu-tests"))]
 #[test]
 fn exhaustive_gpu_cosine_is_non_negative() {
-    use cubecl::prelude::Runtime;
     use cubecl::wgpu::{WgpuDevice, WgpuRuntime};
+    use cubecl_utils_rs::prelude::Runtime;
 
-    let device = WgpuDevice::DefaultDevice;
-    if std::panic::catch_unwind(|| WgpuRuntime::client(&device)).is_err() {
+    let device = WgpuDevice::default();
+    if std::panic::catch_unwind(|| <WgpuRuntime>::client(&device)).is_err() {
         eprintln!("Skipping: no wgpu backend");
         return;
     }
 
     let (data, n, dim) = blobs();
     let index =
-        build_exhaustive_index_gpu::<f32, WgpuRuntime>((&data[..], n, dim), "cosine", device)
+        build_exhaustive_index_gpu::<f32>((&data[..], n, dim), "cosine", device.clone().into())
             .unwrap();
 
     let (_, self_d) = query_exhaustive_index_gpu_self(&index, K, true, false).unwrap();
@@ -801,24 +801,24 @@ fn exhaustive_gpu_cosine_is_non_negative() {
 #[cfg(all(feature = "gpu", feature = "gpu-tests"))]
 #[test]
 fn ivf_gpu_cosine_is_non_negative() {
-    use cubecl::prelude::Runtime;
     use cubecl::wgpu::{WgpuDevice, WgpuRuntime};
+    use cubecl_utils_rs::prelude::Runtime;
 
-    let device = WgpuDevice::DefaultDevice;
-    if std::panic::catch_unwind(|| WgpuRuntime::client(&device)).is_err() {
+    let device = WgpuDevice::default();
+    if std::panic::catch_unwind(|| <WgpuRuntime>::client(&device)).is_err() {
         eprintln!("Skipping: no wgpu backend");
         return;
     }
 
     let (data, n, dim) = blobs();
-    let index = build_ivf_index_gpu::<f32, WgpuRuntime>(
+    let index = build_ivf_index_gpu::<f32>(
         (&data[..], n, dim),
         Some(16),
         None,
         "cosine",
         42,
         false,
-        device,
+        device.clone().into(),
     )
     .unwrap();
 

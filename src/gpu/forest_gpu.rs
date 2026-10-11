@@ -7,7 +7,7 @@
 
 #![allow(missing_docs)]
 
-use cubecl::frontend::{Atomic, SharedMemory};
+use cubecl::frontend::{Atomic, Shared};
 use cubecl::prelude::*;
 use cubecl_utils_rs::prelude::*;
 use std::time::Instant;
@@ -86,7 +86,7 @@ fn compute_dot_products_multi<F: CubeclFloat, N: Size>(
             let prod = v * r;
             #[unroll]
             for lane in 0..lanes {
-                acc[l] += prod[lane];
+                acc[l] += prod.extract(lane);
             }
         }
     }
@@ -202,8 +202,8 @@ pub fn leaf_pairwise_proposals<F: CubeclFloat, N: Size>(
     let lanes = LINE_SIZE;
     let dim_scalars = dim_lines * lanes;
 
-    let mut shared_leaf_start = SharedMemory::<u32>::new(1usize);
-    let mut shared_leaf_size = SharedMemory::<u32>::new(1usize);
+    let mut shared_leaf_start = Shared::<[u32]>::new_slice(1usize);
+    let mut shared_leaf_size = Shared::<[u32]>::new_slice(1usize);
 
     if tx == 0u32 {
         let start = leaf_offsets[leaf_idx as usize];
@@ -229,10 +229,10 @@ pub fn leaf_pairwise_proposals<F: CubeclFloat, N: Size>(
         terminate!();
     }
 
-    // Scalar shared memory (never use SharedMemory<Line<F>> -- see post-mortem)
-    let mut shared_vecs = SharedMemory::<F>::new(max_leaf_size * dim_scalars);
-    let mut shared_pids = SharedMemory::<u32>::new(max_leaf_size);
-    let mut shared_thresh = SharedMemory::<F>::new(max_leaf_size);
+    // Scalar shared memory (never use Shared<[Line<F>]> -- see post-mortem)
+    let mut shared_vecs = Shared::<[F]>::new_slice(max_leaf_size * dim_scalars);
+    let mut shared_pids = Shared::<[u32]>::new_slice(max_leaf_size);
+    let mut shared_thresh = Shared::<[F]>::new_slice(max_leaf_size);
 
     let k = graph_dist.shape(1usize);
 
@@ -259,7 +259,7 @@ pub fn leaf_pairwise_proposals<F: CubeclFloat, N: Size>(
         if pid < n_pts {
             let vec_offset = pid as usize * dim_lines + line_idx;
             let line_val = vectors[vec_offset];
-            shared_vecs[idx_load] = line_val[lane];
+            shared_vecs[idx_load] = line_val.extract_dynamic(lane);
         }
         idx_load += WORKGROUP_SIZE_X as usize;
     }
@@ -390,14 +390,14 @@ pub fn mark_all_new(graph_idx: &mut Tensor<u32>, total_entries: u32) {
 /// trees, for query-time entry-point routing. The graph itself lands in
 /// `graph_idx_gpu` / `graph_dist_gpu` in place.
 #[allow(clippy::too_many_arguments)]
-pub fn gpu_forest_init<T, R>(
-    vectors_gpu: &GpuTensor<R, T>,
-    graph_idx_gpu: &GpuTensor<R, u32>,
-    graph_dist_gpu: &GpuTensor<R, T>,
-    prop_idx_gpu: &GpuTensor<R, u32>,
-    prop_dist_gpu: &GpuTensor<R, T>,
-    prop_count_gpu: &GpuTensor<R, u32>,
-    update_counter_gpu: &GpuTensor<R, u32>,
+pub fn gpu_forest_init<T>(
+    vectors_gpu: &GpuTensor<T>,
+    graph_idx_gpu: &GpuTensor<u32>,
+    graph_dist_gpu: &GpuTensor<T>,
+    prop_idx_gpu: &GpuTensor<u32>,
+    prop_dist_gpu: &GpuTensor<T>,
+    prop_count_gpu: &GpuTensor<u32>,
+    update_counter_gpu: &GpuTensor<u32>,
     n: usize,
     dim: usize,
     dim_padded: usize,
@@ -405,10 +405,9 @@ pub fn gpu_forest_init<T, R>(
     seed: usize,
     use_cosine: bool,
     verbose: bool,
-    client: &ComputeClient<R>,
+    client: &Client,
 ) -> Result<ForestRouter<T>, AnnSearchErrors>
 where
-    R: Runtime,
     T: AnnSearchFloat + CubeclFloat,
 {
     let limits = GpuLimits::from_client(client);
@@ -466,12 +465,12 @@ where
         let dots = if max_depth > 0 {
             let rows = batch_trees * max_depth;
             let off = batch_start * max_depth * dim_padded;
-            let projections_gpu = GpuTensor::<R, T>::from_slice(
+            let projections_gpu = GpuTensor::<T>::from_slice(
                 &projections_flat[off..off + rows * dim_padded],
                 vec![rows, dim_padded],
                 client,
             )?;
-            let dots_gpu = GpuTensor::<R, T>::empty(vec![rows, n], client)?;
+            let dots_gpu = GpuTensor::<T>::empty(vec![rows, n], client)?;
             let dot_count = checked_cube_count(
                 "compute_dot_products_multi",
                 dot_grid_x,
@@ -480,7 +479,7 @@ where
                 &limits,
             )?;
             unsafe {
-                compute_dot_products_multi::launch_unchecked::<T, R>(
+                compute_dot_products_multi::launch_unchecked::<T>(
                     client,
                     dot_count,
                     CubeDim::new_2d(WORKGROUP_SIZE_X, 1),
@@ -550,19 +549,19 @@ where
             continue;
         }
 
-        let leaf_points_gpu = GpuTensor::<R, u32>::from_slice(
+        let leaf_points_gpu = GpuTensor::<u32>::from_slice(
             &batch_leaf_points,
             vec![batch_leaf_points.len()],
             client,
         )?;
-        let leaf_offsets_gpu = GpuTensor::<R, u32>::from_slice(
+        let leaf_offsets_gpu = GpuTensor::<u32>::from_slice(
             &batch_leaf_offsets,
             vec![batch_leaf_offsets.len()],
             client,
         )?;
 
         unsafe {
-            reset_proposals::launch_unchecked::<R>(
+            reset_proposals::launch_unchecked(
                 client,
                 CubeCount::Static(grid_n_x, grid_n_y, 1),
                 CubeDim::new_2d(WORKGROUP_SIZE_X, 1),
@@ -575,7 +574,7 @@ where
         let (cubes_x, cubes_y) = grid_2d(batch_leaves as u32, &limits)?;
 
         unsafe {
-            leaf_pairwise_proposals::launch_unchecked::<T, R>(
+            leaf_pairwise_proposals::launch_unchecked::<T>(
                 client,
                 CubeCount::Static(cubes_x, cubes_y, 1),
                 CubeDim::new_2d(WORKGROUP_SIZE_X, 1),
@@ -596,7 +595,7 @@ where
             );
         }
 
-        launch_merge_proposals::<T, R>(
+        launch_merge_proposals::<T>(
             client,
             &limits,
             graph_idx_gpu,
@@ -711,12 +710,11 @@ mod budget_tests {
 mod tests {
     use super::*;
     use cubecl::wgpu::WgpuDevice;
-    use cubecl::wgpu::WgpuRuntime;
 
     fn try_device() -> Option<WgpuDevice> {
-        let device = WgpuDevice::DefaultDevice;
+        let device = WgpuDevice::default();
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            cubecl::wgpu::WgpuRuntime::client(&device);
+            cubecl::Device::from(device.clone()).client();
         }));
         result.ok().map(|_| device)
     }
@@ -730,7 +728,7 @@ mod tests {
             eprintln!("Skipping: no wgpu backend");
             return;
         };
-        let client = WgpuRuntime::client(&device);
+        let client = cubecl::Device::from(device.clone()).client();
         let line = LINE_SIZE;
         let n = 133usize;
         let dim = 16usize;
@@ -744,16 +742,14 @@ mod tests {
             .map(|i| ((i * 17 + 3) % 19) as f32 * 0.21 - 1.0)
             .collect();
 
-        let vectors_gpu =
-            GpuTensor::<WgpuRuntime, f32>::from_slice(&data, vec![n, dim], &client).unwrap();
+        let vectors_gpu = GpuTensor::<f32>::from_slice(&data, vec![n, dim], &client).unwrap();
         let proj_gpu =
-            GpuTensor::<WgpuRuntime, f32>::from_slice(&projections, vec![n_levels, dim], &client)
-                .unwrap();
-        let multi_gpu = GpuTensor::<WgpuRuntime, f32>::empty(vec![n_levels, n], &client).unwrap();
+            GpuTensor::<f32>::from_slice(&projections, vec![n_levels, dim], &client).unwrap();
+        let multi_gpu = GpuTensor::<f32>::empty(vec![n_levels, n], &client).unwrap();
 
         let grid = (n as u32).div_ceil(WORKGROUP_SIZE_X);
         unsafe {
-            compute_dot_products_multi::launch_unchecked::<f32, WgpuRuntime>(
+            compute_dot_products_multi::launch_unchecked::<f32>(
                 &client,
                 CubeCount::Static(grid, 1, 1),
                 CubeDim::new_2d(WORKGROUP_SIZE_X, 1),
@@ -801,8 +797,8 @@ mod tests {
         let lanes = LINE_SIZE;
         let dim_scalars = dim_lines * lanes;
 
-        let mut shared_leaf_start = SharedMemory::<u32>::new(1usize);
-        let mut shared_leaf_size = SharedMemory::<u32>::new(1usize);
+        let mut shared_leaf_start = Shared::<[u32]>::new_slice(1usize);
+        let mut shared_leaf_size = Shared::<[u32]>::new_slice(1usize);
 
         if tx == 0u32 {
             let start = leaf_offsets[leaf_idx as usize];
@@ -815,8 +811,8 @@ mod tests {
         let leaf_start = shared_leaf_start[0usize];
         let leaf_size = shared_leaf_size[0usize];
 
-        let mut shared_vecs = SharedMemory::<F>::new(max_leaf_size * dim_scalars);
-        let mut shared_pids = SharedMemory::<u32>::new(max_leaf_size);
+        let mut shared_vecs = Shared::<[F]>::new_slice(max_leaf_size * dim_scalars);
+        let mut shared_pids = Shared::<[u32]>::new_slice(max_leaf_size);
 
         let mut i = tx;
         while i < leaf_size {
@@ -837,7 +833,7 @@ mod tests {
             if pid < n_pts {
                 let vec_offset = pid as usize * dim_lines + line_idx;
                 let line_val = vectors[vec_offset];
-                shared_vecs[idx_load] = line_val[lane];
+                shared_vecs[idx_load] = line_val.extract_dynamic(lane);
             }
             idx_load += WORKGROUP_SIZE_X as usize;
         }
@@ -858,7 +854,7 @@ mod tests {
             eprintln!("Skipping: no wgpu backend");
             return;
         };
-        let client = WgpuRuntime::client(&device);
+        let client = cubecl::Device::from(device.clone()).client();
         let line = LINE_SIZE;
         let n = 8usize;
         let dim = 8usize;
@@ -874,13 +870,10 @@ mod tests {
         let leaf_points: Vec<u32> = vec![2, 5, 7];
         let leaf_offsets: Vec<u32> = vec![0, 3];
 
-        let vectors_gpu =
-            GpuTensor::<WgpuRuntime, f32>::from_slice(&data, vec![n, dim], &client).unwrap();
-        let lp_gpu =
-            GpuTensor::<WgpuRuntime, u32>::from_slice(&leaf_points, vec![3], &client).unwrap();
-        let lo_gpu =
-            GpuTensor::<WgpuRuntime, u32>::from_slice(&leaf_offsets, vec![2], &client).unwrap();
-        let out_gpu = GpuTensor::<WgpuRuntime, f32>::from_slice(
+        let vectors_gpu = GpuTensor::<f32>::from_slice(&data, vec![n, dim], &client).unwrap();
+        let lp_gpu = GpuTensor::<u32>::from_slice(&leaf_points, vec![3], &client).unwrap();
+        let lo_gpu = GpuTensor::<u32>::from_slice(&leaf_offsets, vec![2], &client).unwrap();
+        let out_gpu = GpuTensor::<f32>::from_slice(
             &vec![0.0f32; MAX_LEAF_SIZE * dim],
             vec![MAX_LEAF_SIZE * dim],
             &client,
@@ -888,7 +881,7 @@ mod tests {
         .unwrap();
 
         unsafe {
-            debug_leaf_shared_roundtrip::launch_unchecked::<f32, WgpuRuntime>(
+            debug_leaf_shared_roundtrip::launch_unchecked::<f32>(
                 &client,
                 CubeCount::Static(1, 1, 1),
                 CubeDim::new_2d(WORKGROUP_SIZE_X, 1),
@@ -922,7 +915,7 @@ mod tests {
             eprintln!("Skipping: no wgpu backend");
             return;
         };
-        let client = WgpuRuntime::client(&device);
+        let client = cubecl::Device::from(device.clone()).client();
         let line = LINE_SIZE;
         let n = 64usize;
         let dim = 32usize;
@@ -938,13 +931,10 @@ mod tests {
         let leaf_points: Vec<u32> = vec![3, 10, 22, 31, 45, 50, 58, 63];
         let leaf_offsets: Vec<u32> = vec![0, 8];
 
-        let vectors_gpu =
-            GpuTensor::<WgpuRuntime, f32>::from_slice(&data, vec![n, dim], &client).unwrap();
-        let lp_gpu =
-            GpuTensor::<WgpuRuntime, u32>::from_slice(&leaf_points, vec![8], &client).unwrap();
-        let lo_gpu =
-            GpuTensor::<WgpuRuntime, u32>::from_slice(&leaf_offsets, vec![2], &client).unwrap();
-        let out_gpu = GpuTensor::<WgpuRuntime, f32>::from_slice(
+        let vectors_gpu = GpuTensor::<f32>::from_slice(&data, vec![n, dim], &client).unwrap();
+        let lp_gpu = GpuTensor::<u32>::from_slice(&leaf_points, vec![8], &client).unwrap();
+        let lo_gpu = GpuTensor::<u32>::from_slice(&leaf_offsets, vec![2], &client).unwrap();
+        let out_gpu = GpuTensor::<f32>::from_slice(
             &vec![0.0f32; MAX_LEAF_SIZE * dim],
             vec![MAX_LEAF_SIZE * dim],
             &client,
@@ -952,7 +942,7 @@ mod tests {
         .unwrap();
 
         unsafe {
-            debug_leaf_shared_roundtrip::launch_unchecked::<f32, WgpuRuntime>(
+            debug_leaf_shared_roundtrip::launch_unchecked::<f32>(
                 &client,
                 CubeCount::Static(1, 1, 1),
                 CubeDim::new_2d(WORKGROUP_SIZE_X, 1),
@@ -986,7 +976,7 @@ mod tests {
             eprintln!("Skipping: no wgpu backend");
             return;
         };
-        let client = WgpuRuntime::client(&device);
+        let client = cubecl::Device::from(device.clone()).client();
         let line = LINE_SIZE;
         let n = 4usize;
         let dim = 4usize;
@@ -1001,23 +991,20 @@ mod tests {
         let graph_dist = vec![f32::MAX; n * build_k];
 
         let vectors_gpu =
-            GpuTensor::<WgpuRuntime, f32>::from_slice(&data, vec![n, dim], &client).unwrap();
+            GpuTensor::< f32>::from_slice(&data, vec![n, dim], &client).unwrap();
         let lp_gpu =
-            GpuTensor::<WgpuRuntime, u32>::from_slice(&leaf_points, vec![4], &client).unwrap();
+            GpuTensor::< u32>::from_slice(&leaf_points, vec![4], &client).unwrap();
         let lo_gpu =
-            GpuTensor::<WgpuRuntime, u32>::from_slice(&leaf_offsets, vec![2], &client).unwrap();
+            GpuTensor::< u32>::from_slice(&leaf_offsets, vec![2], &client).unwrap();
         let gdist_gpu =
-            GpuTensor::<WgpuRuntime, f32>::from_slice(&graph_dist, vec![n, build_k], &client)
-                .unwrap();
-        let prop_idx_gpu =
-            GpuTensor::<WgpuRuntime, u32>::empty(vec![n, MAX_PROPOSALS], &client).unwrap();
-        let prop_dist_gpu =
-            GpuTensor::<WgpuRuntime, f32>::empty(vec![n, MAX_PROPOSALS], &client).unwrap();
+            GpuTensor::<f32>::from_slice(&graph_dist, vec![n, build_k], &client).unwrap();
+        let prop_idx_gpu = GpuTensor::<u32>::empty(vec![n, MAX_PROPOSALS], &client).unwrap();
+        let prop_dist_gpu = GpuTensor::<f32>::empty(vec![n, MAX_PROPOSALS], &client).unwrap();
         let prop_count_gpu =
-            GpuTensor::<WgpuRuntime, u32>::from_slice(&vec![0u32; n], vec![n], &client).unwrap();
+            GpuTensor::<u32>::from_slice(&vec![0u32; n], vec![n], &client).unwrap();
 
         unsafe {
-            leaf_pairwise_proposals::launch_unchecked::<f32, WgpuRuntime>(
+            leaf_pairwise_proposals::launch_unchecked::<f32>(
                 &client,
                 CubeCount::Static(1, 1, 1),
                 CubeDim::new_2d(WORKGROUP_SIZE_X, 1),
@@ -1074,7 +1061,7 @@ mod tests {
             eprintln!("Skipping: no wgpu backend");
             return;
         };
-        let client = WgpuRuntime::client(&device);
+        let client = cubecl::Device::from(device.clone()).client();
         let line = LINE_SIZE;
         let n = 4usize;
         let dim = 4usize;
@@ -1099,27 +1086,24 @@ mod tests {
         let mut unit = data.clone();
         crate::gpu::normalise_rows(&mut unit, dim);
         let vectors_gpu =
-            GpuTensor::<WgpuRuntime, f32>::from_slice(&unit, vec![n, dim], &client).unwrap();
+            GpuTensor::< f32>::from_slice(&unit, vec![n, dim], &client).unwrap();
         let lp_gpu =
-            GpuTensor::<WgpuRuntime, u32>::from_slice(&leaf_points, vec![4], &client).unwrap();
+            GpuTensor::< u32>::from_slice(&leaf_points, vec![4], &client).unwrap();
         let lo_gpu =
-            GpuTensor::<WgpuRuntime, u32>::from_slice(&leaf_offsets, vec![2], &client).unwrap();
+            GpuTensor::< u32>::from_slice(&leaf_offsets, vec![2], &client).unwrap();
         let gdist_gpu =
-            GpuTensor::<WgpuRuntime, f32>::from_slice(&graph_dist, vec![n, build_k], &client)
-                .unwrap();
-        let prop_idx_gpu =
-            GpuTensor::<WgpuRuntime, u32>::empty(vec![n, MAX_PROPOSALS], &client).unwrap();
-        let prop_dist_gpu =
-            GpuTensor::<WgpuRuntime, f32>::empty(vec![n, MAX_PROPOSALS], &client).unwrap();
+            GpuTensor::<f32>::from_slice(&graph_dist, vec![n, build_k], &client).unwrap();
+        let prop_idx_gpu = GpuTensor::<u32>::empty(vec![n, MAX_PROPOSALS], &client).unwrap();
+        let prop_dist_gpu = GpuTensor::<f32>::empty(vec![n, MAX_PROPOSALS], &client).unwrap();
         let prop_count_gpu =
-            GpuTensor::<WgpuRuntime, u32>::from_slice(&vec![0u32; n], vec![n], &client).unwrap();
+            GpuTensor::<u32>::from_slice(&vec![0u32; n], vec![n], &client).unwrap();
 
         eprintln!(
                 "config: dim={dim} line={line} dim_vec={dim_vec} MAX_LEAF_SIZE={MAX_LEAF_SIZE} MAX_PROPOSALS={MAX_PROPOSALS}"
             );
 
         unsafe {
-            leaf_pairwise_proposals::launch_unchecked::<f32, WgpuRuntime>(
+            leaf_pairwise_proposals::launch_unchecked::<f32>(
                 &client,
                 CubeCount::Static(1, 1, 1),
                 CubeDim::new_2d(WORKGROUP_SIZE_X, 1),
@@ -1176,7 +1160,7 @@ mod tests {
             eprintln!("Skipping: no wgpu backend");
             return;
         };
-        let client = WgpuRuntime::client(&device);
+        let client = cubecl::Device::from(device.clone()).client();
         let line = LINE_SIZE;
         let n = 32usize;
         let dim = 32usize;
@@ -1191,23 +1175,20 @@ mod tests {
         let graph_dist = vec![f32::MAX; n * build_k];
 
         let vectors_gpu =
-            GpuTensor::<WgpuRuntime, f32>::from_slice(&data, vec![n, dim], &client).unwrap();
+            GpuTensor::< f32>::from_slice(&data, vec![n, dim], &client).unwrap();
         let lp_gpu =
-            GpuTensor::<WgpuRuntime, u32>::from_slice(&leaf_points, vec![16], &client).unwrap();
+            GpuTensor::< u32>::from_slice(&leaf_points, vec![16], &client).unwrap();
         let lo_gpu =
-            GpuTensor::<WgpuRuntime, u32>::from_slice(&leaf_offsets, vec![2], &client).unwrap();
+            GpuTensor::< u32>::from_slice(&leaf_offsets, vec![2], &client).unwrap();
         let gdist_gpu =
-            GpuTensor::<WgpuRuntime, f32>::from_slice(&graph_dist, vec![n, build_k], &client)
-                .unwrap();
-        let prop_idx_gpu =
-            GpuTensor::<WgpuRuntime, u32>::empty(vec![n, MAX_PROPOSALS], &client).unwrap();
-        let prop_dist_gpu =
-            GpuTensor::<WgpuRuntime, f32>::empty(vec![n, MAX_PROPOSALS], &client).unwrap();
+            GpuTensor::<f32>::from_slice(&graph_dist, vec![n, build_k], &client).unwrap();
+        let prop_idx_gpu = GpuTensor::<u32>::empty(vec![n, MAX_PROPOSALS], &client).unwrap();
+        let prop_dist_gpu = GpuTensor::<f32>::empty(vec![n, MAX_PROPOSALS], &client).unwrap();
         let prop_count_gpu =
-            GpuTensor::<WgpuRuntime, u32>::from_slice(&vec![0u32; n], vec![n], &client).unwrap();
+            GpuTensor::<u32>::from_slice(&vec![0u32; n], vec![n], &client).unwrap();
 
         unsafe {
-            leaf_pairwise_proposals::launch_unchecked::<f32, WgpuRuntime>(
+            leaf_pairwise_proposals::launch_unchecked::<f32>(
                 &client,
                 CubeCount::Static(1, 1, 1),
                 CubeDim::new_2d(WORKGROUP_SIZE_X, 1),
@@ -1260,7 +1241,7 @@ mod tests {
             eprintln!("Skipping: no wgpu backend");
             return;
         };
-        let client = WgpuRuntime::client(&device);
+        let client = cubecl::Device::from(device.clone()).client();
         let n = 500usize;
         let dim = 8usize;
         let dim_padded = dim;
@@ -1275,27 +1256,21 @@ mod tests {
             .collect();
 
         let vectors_gpu =
-            GpuTensor::<WgpuRuntime, f32>::from_slice(&data, vec![n, dim_padded], &client).unwrap();
-        let graph_idx_gpu = GpuTensor::<WgpuRuntime, u32>::from_slice(
+            GpuTensor::< f32>::from_slice(&data, vec![n, dim_padded], &client).unwrap();
+        let graph_idx_gpu = GpuTensor::< u32>::from_slice(
             &vec![0x7FFFFFFFu32; n * build_k],
             vec![n, build_k],
             &client,
         )
         .unwrap();
-        let graph_dist_gpu = GpuTensor::<WgpuRuntime, f32>::from_slice(
-            &vec![f32::MAX; n * build_k],
-            vec![n, build_k],
-            &client,
-        )
-        .unwrap();
-        let prop_idx_gpu =
-            GpuTensor::<WgpuRuntime, u32>::empty(vec![n, MAX_PROPOSALS], &client).unwrap();
-        let prop_dist_gpu =
-            GpuTensor::<WgpuRuntime, f32>::empty(vec![n, MAX_PROPOSALS], &client).unwrap();
+        let graph_dist_gpu =
+            GpuTensor::<f32>::from_slice(&vec![f32::MAX; n * build_k], vec![n, build_k], &client)
+                .unwrap();
+        let prop_idx_gpu = GpuTensor::<u32>::empty(vec![n, MAX_PROPOSALS], &client).unwrap();
+        let prop_dist_gpu = GpuTensor::<f32>::empty(vec![n, MAX_PROPOSALS], &client).unwrap();
         let prop_count_gpu =
-            GpuTensor::<WgpuRuntime, u32>::from_slice(&vec![0u32; n], vec![n], &client).unwrap();
-        let update_counter_gpu =
-            GpuTensor::<WgpuRuntime, u32>::from_slice(&[0u32], vec![1], &client).unwrap();
+            GpuTensor::<u32>::from_slice(&vec![0u32; n], vec![n], &client).unwrap();
+        let update_counter_gpu = GpuTensor::<u32>::from_slice(&[0u32], vec![1], &client).unwrap();
 
         let _ = gpu_forest_init(
             &vectors_gpu,
@@ -1380,14 +1355,14 @@ mod tests {
             eprintln!("Skipping: no wgpu backend");
             return;
         };
-        let client = WgpuRuntime::client(&device);
+        let client = cubecl::Device::from(device.clone()).client();
 
         let sentinel = 0x7FFFFFFFu32;
         let data = vec![5u32, 10 | (1u32 << 31), sentinel, 42u32];
-        let gpu = GpuTensor::<WgpuRuntime, u32>::from_slice(&data, vec![4], &client).unwrap();
+        let gpu = GpuTensor::<u32>::from_slice(&data, vec![4], &client).unwrap();
 
         unsafe {
-            mark_all_new::launch_unchecked::<WgpuRuntime>(
+            mark_all_new::launch_unchecked(
                 &client,
                 CubeCount::Static(1, 1, 1),
                 CubeDim::new_2d(WORKGROUP_SIZE_X, 1),

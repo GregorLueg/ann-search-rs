@@ -36,8 +36,6 @@ binary = ["memmap2", "bytemuck", "statrs"]
 gpu = ["cubecl", "cubecl-utils-rs", "half"]
 ## Enables GPU integration tests (requires 'wgpu' and a GPU on the machine). This is for CI/CD
 gpu-tests = ["gpu"]
-## CubeCL's software CPU runtime, for tests only.
-gpu-cpu = ["gpu", "cubecl/cpu"]
 ## Enables quantised indices with different quantisations (BF16, SQ8, PQ, OPQ)
 quantised = ["half"]
 ## Enables mimalloc as the global allocator for improved performance
@@ -72,14 +70,13 @@ bytemuck = {
     optional = true
 }
 cubecl = {
-    version = "0.10.0",
+    version = "0.11.0",
     # branch = "main",
-    # `cpu` is deliberately absent: see the `gpu-cpu` feature.
     features = ["wgpu"],
     optional = true
 }
 cubecl-utils-rs = {
-    version = "0.1.0",
+    version = "0.2.0",
     optional = true
 }
 document-features = "0.2.12"

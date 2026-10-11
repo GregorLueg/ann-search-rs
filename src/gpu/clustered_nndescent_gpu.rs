@@ -13,7 +13,7 @@
 //! the host. Only one cluster is device-resident at a time, so the binding
 //! ceiling applies to the cluster rather than the dataset.
 
-use cubecl::prelude::*;
+use cubecl::Device;
 use cubecl_utils_rs::prelude::*;
 use rayon::prelude::*;
 use std::time::Instant;
@@ -365,7 +365,7 @@ fn merge_cluster_into_global<T>(
 ///
 /// Park, Becker & Nolet, NVIDIA Technical Blog, 2024
 #[allow(clippy::too_many_arguments)]
-pub fn build_clustered_knn_graph_gpu<T, R>(
+pub fn build_clustered_knn_graph_gpu<T>(
     data: impl AnnMatrix<T>,
     metric: Dist,
     k: Option<usize>,
@@ -378,11 +378,10 @@ pub fn build_clustered_knn_graph_gpu<T, R>(
     cluster_params: Option<ClusteredBuildParams>,
     seed: usize,
     verbose: bool,
-    device: R::Device,
+    device: Device,
 ) -> Result<KnnGraphGpu<T>, AnnSearchErrors>
 where
     T: AnnSearchFloat + CubeclFloat,
-    R: Runtime,
 {
     if metric == Dist::Manhattan {
         return Err(AnnSearchErrors::DistanceNotSupported(metric));
@@ -396,7 +395,7 @@ where
     let (vectors_flat, n, dim) = data.into_row_major();
     let dim_padded = dim.next_multiple_of(LINE_SIZE);
 
-    let client = R::client(&device);
+    let client = device.client();
     let limits = GpuLimits::from_client(&client);
 
     let n_clusters = params
@@ -421,7 +420,7 @@ where
         }
         // Hand over the buffer we already flattened. `FlattenData` converts by
         // identity, so this costs nothing.
-        return crate::gpu::nndescent_gpu::build_knn_graph_gpu::<T, R>(
+        return crate::gpu::nndescent_gpu::build_knn_graph_gpu::<T>(
             (vectors_flat, n, dim),
             metric,
             Some(k),
@@ -485,7 +484,7 @@ where
         .kmeans
         .unwrap_or_else(|| KMeansGpuParams::default().with_balancing(true));
 
-    let centroids = train_centroids_gpu::<T, R>(
+    let centroids = train_centroids_gpu::<T>(
         &training_data,
         dim,
         n_train,
@@ -587,7 +586,7 @@ where
             graph_dist,
             converged: cluster_converged,
             ..
-        } = nndescent_core::<T, R>(
+        } = nndescent_core::<T>(
             &cluster_vectors,
             m,
             dim,
@@ -970,13 +969,13 @@ mod tests {
 mod device_tests {
     use super::*;
     use crate::gpu::nndescent_gpu::build_knn_graph_gpu;
-    use cubecl::wgpu::{WgpuDevice, WgpuRuntime};
+    use cubecl::wgpu::WgpuDevice;
     use faer::Mat;
 
     fn try_device() -> Option<WgpuDevice> {
-        let device = WgpuDevice::DefaultDevice;
+        let device = WgpuDevice::default();
         std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            WgpuRuntime::client(&device);
+            cubecl::Device::from(device.clone()).client();
         }))
         .ok()
         .map(|_| device)
@@ -1058,7 +1057,7 @@ mod device_tests {
         let truth = brute_force_knn(&mat, k);
         let params = ClusteredBuildParams::new(Some(1), 0.5, 2, None);
 
-        let clustered = build_clustered_knn_graph_gpu::<f32, WgpuRuntime>(
+        let clustered = build_clustered_knn_graph_gpu::<f32>(
             mat.as_ref(),
             Dist::SquaredEuclidean,
             Some(5),
@@ -1071,11 +1070,11 @@ mod device_tests {
             Some(params),
             7,
             false,
-            device.clone(),
+            device.clone().into(),
         )
         .unwrap();
 
-        let direct = build_knn_graph_gpu::<f32, WgpuRuntime>(
+        let direct = build_knn_graph_gpu::<f32>(
             mat.as_ref(),
             Dist::SquaredEuclidean,
             Some(5),
@@ -1087,7 +1086,7 @@ mod device_tests {
             None,
             7,
             false,
-            device,
+            device.clone().into(),
         )
         .unwrap();
 
@@ -1127,7 +1126,7 @@ mod device_tests {
         let dim = mat.ncols();
         let truth = brute_force_knn(&mat, k);
 
-        let direct = build_knn_graph_gpu::<f32, WgpuRuntime>(
+        let direct = build_knn_graph_gpu::<f32>(
             mat.as_ref(),
             Dist::SquaredEuclidean,
             Some(k),
@@ -1139,7 +1138,7 @@ mod device_tests {
             None,
             7,
             false,
-            device.clone(),
+            device.clone().into(),
         )
         .unwrap();
         let direct_recall = recall_at_k(&direct.knn_graph, &truth, n, k);
@@ -1150,13 +1149,13 @@ mod device_tests {
                 flat.push(mat[(i, j)]);
             }
         }
-        let client = WgpuRuntime::client(&device);
+        let client = cubecl::Device::from(device.clone()).client();
         let limits = GpuLimits::from_client(&client);
 
         // The driver trains centroids on this same client before any
         // NN-Descent runs. Doing it here too keeps the isolation honest: it is
         // the one thing the hand-driven path would otherwise skip.
-        let _ = train_centroids_gpu::<f32, WgpuRuntime>(
+        let _ = train_centroids_gpu::<f32>(
             &flat,
             dim,
             n,
@@ -1184,7 +1183,7 @@ mod device_tests {
             graph_idx,
             graph_dist,
             ..
-        } = nndescent_core::<f32, WgpuRuntime>(&flat, n, dim, dim, &cfg, &client, &limits, false)
+        } = nndescent_core::<f32>(&flat, n, dim, dim, &cfg, &client, &limits, false)
             .unwrap();
 
         let members: Vec<u32> = (0..n as u32).collect();
@@ -1206,7 +1205,7 @@ mod device_tests {
         let (mat, n) = blob_data(n_blobs, per_blob, dim);
         let truth = brute_force_knn(&mat, k);
 
-        let baseline = build_knn_graph_gpu::<f32, WgpuRuntime>(
+        let baseline = build_knn_graph_gpu::<f32>(
             mat.as_ref(),
             Dist::SquaredEuclidean,
             Some(k),
@@ -1218,7 +1217,7 @@ mod device_tests {
             None,
             7,
             false,
-            device.clone(),
+            device.clone().into(),
         )
         .unwrap();
         let base_recall = recall_at_k(&baseline.knn_graph, &truth, n, k);
@@ -1226,7 +1225,7 @@ mod device_tests {
 
         for &c in &[2usize, 4, 8] {
             let params = ClusteredBuildParams::new(Some(c), 0.5, 2, None);
-            let graph = build_clustered_knn_graph_gpu::<f32, WgpuRuntime>(
+            let graph = build_clustered_knn_graph_gpu::<f32>(
                 mat.as_ref(),
                 Dist::SquaredEuclidean,
                 Some(k),
@@ -1239,7 +1238,7 @@ mod device_tests {
                 Some(params),
                 7,
                 false,
-                device.clone(),
+                device.clone().into(),
             )
             .unwrap();
 
@@ -1317,7 +1316,7 @@ mod device_tests {
         let k = 5;
         let params = ClusteredBuildParams::new(Some(3), 0.5, 2, None);
 
-        let graph = build_clustered_knn_graph_gpu::<f32, WgpuRuntime>(
+        let graph = build_clustered_knn_graph_gpu::<f32>(
             mat.as_ref(),
             Dist::Cosine,
             Some(k),
@@ -1330,7 +1329,7 @@ mod device_tests {
             Some(params),
             7,
             false,
-            device,
+            device.clone().into(),
         )
         .unwrap();
 

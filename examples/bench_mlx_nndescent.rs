@@ -63,7 +63,7 @@ fn main() {
     // The graph excludes self; ask for k - 1 neighbours and prepend self so
     // the rows line up with the exhaustive self-kNN.
     let (wgpu_cold, wgpu_warm, wgpu_nn) = time_cold_warm(|| {
-        build_knn_graph_gpu::<f32, cubecl::wgpu::WgpuRuntime>(
+        build_knn_graph_gpu::<f32>(
             data.as_ref(),
             &cli.distance,
             Some(k - 1),

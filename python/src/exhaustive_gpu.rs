@@ -10,7 +10,7 @@ use ann_search_rs::{
 use pyo3::prelude::*;
 
 use crate::dispatch::QueryOut;
-use crate::gpu_handle::{default_device, f32_array, gpu_handle, Rt};
+use crate::gpu_handle::{default_device, f32_array, gpu_handle};
 
 gpu_handle!(PyExhaustiveGpu, ExhaustiveIndexGpu, "ExhaustiveGpu", {
     /// Upload the data and record its norms.
@@ -31,7 +31,7 @@ gpu_handle!(PyExhaustiveGpu, ExhaustiveIndexGpu, "ExhaustiveGpu", {
         let inner = py
             .detach(|| {
                 crate::pool::run(|| {
-                    build_exhaustive_index_gpu::<f32, Rt>((data, n, dim), &metric, default_device())
+                    build_exhaustive_index_gpu::<f32>((data, n, dim), &metric, default_device())
                 })
             })
             .map_err(crate::error::AnnErr)?;

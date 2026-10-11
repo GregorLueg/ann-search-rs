@@ -2,6 +2,7 @@
 //! data around.
 
 use cubecl::prelude::*;
+use cubecl::Device;
 use cubecl_utils_rs::prelude::*;
 use num_traits::Float;
 use rayon::prelude::*;
@@ -46,11 +47,11 @@ const CANDIDATE_SCRATCH_HEADROOM_DIV: usize = 4;
 /// The mega kernel's first write to a fresh allocation faults its pages in,
 /// which dominates the kernel's own run time. Holding the buffers across
 /// batches and across calls confines that to the first query.
-struct CandidateScratch<R: Runtime, T: AnnSearchFloat + CubeclFloat> {
+struct CandidateScratch<T: AnnSearchFloat + CubeclFloat> {
     /// Candidate distances, flat; viewed as `[n_queries, max_candidates]`
-    dists: GpuTensor<R, T>,
+    dists: GpuTensor<T>,
     /// Candidate indices, flat; viewed as `[n_queries, max_candidates]`
-    indices: GpuTensor<R, u32>,
+    indices: GpuTensor<u32>,
     /// Element capacity of each buffer
     capacity: usize,
 }
@@ -136,10 +137,9 @@ fn reorganise_by_cluster<T: Float + Copy + Send + Sync + Sum>(
 /// ### Type Parameters
 ///
 /// * `T` - Float type (f32 or f64)
-/// * `R` - CubeCL runtime
-pub struct IvfIndexGpu<T: AnnSearchFloat + CubeclFloat, R: Runtime> {
+pub struct IvfIndexGpu<T: AnnSearchFloat + CubeclFloat> {
     /// All vectors reorganised by cluster, resident on GPU
-    vectors_gpu: GpuTensor<R, T>,
+    vectors_gpu: GpuTensor<T>,
     /// Reorganised vector data mirrored on CPU, used as query input for
     /// `generate_knn` without a GPU readback
     vectors_cpu: Vec<T>,
@@ -148,7 +148,7 @@ pub struct IvfIndexGpu<T: AnnSearchFloat + CubeclFloat, R: Runtime> {
     /// CSR-style offsets into `vectors_gpu` per cluster; length `nlist + 1`
     cluster_offsets: Vec<usize>,
     /// Centroids kept on the GPU
-    centroids_gpu: GpuTensor<R, T>,
+    centroids_gpu: GpuTensor<T>,
     /// Dimensionality of the index
     dim: usize,
     /// Padded dimensionality of the index
@@ -160,7 +160,7 @@ pub struct IvfIndexGpu<T: AnnSearchFloat + CubeclFloat, R: Runtime> {
     /// Distance metric used
     metric: Dist,
     /// Device runtime for the GPU work
-    device: R::Device,
+    device: Device,
     /// Prefix sums of the cluster sizes in ascending order; length `nlist + 1`.
     ///
     /// `sorted_size_prefix[m]` is the total size of the `m` smallest clusters,
@@ -176,16 +176,15 @@ pub struct IvfIndexGpu<T: AnnSearchFloat + CubeclFloat, R: Runtime> {
     /// themselves. Holding it on the index confines it to the first query
     /// rather than paying it per call. The lock serialises concurrent queries
     /// on one index, which the single device queue does anyway.
-    scratch: std::sync::Mutex<Option<CandidateScratch<R, T>>>,
+    scratch: std::sync::Mutex<Option<CandidateScratch<T>>>,
 }
 
 /////////////////////////
 // DimensionValidation //
 /////////////////////////
 
-impl<T, R> DimensionValidation for IvfIndexGpu<T, R>
+impl<T> DimensionValidation for IvfIndexGpu<T>
 where
-    R: Runtime,
     T: CubeclFloat + AnnSearchFloat,
 {
     // The raw dim is what a caller hands in; padding to `dim_padded` happens
@@ -199,9 +198,8 @@ where
 // Main implementation //
 /////////////////////////
 
-impl<T, R> IvfIndexGpu<T, R>
+impl<T> IvfIndexGpu<T>
 where
-    R: Runtime,
     T: AnnSearchFloat + CubeclFloat,
 {
     /// Build a batched IVF index
@@ -236,7 +234,7 @@ where
         k_means_params: Option<KMeansGpuParams>,
         seed: usize,
         verbose: bool,
-        device: R::Device,
+        device: Device,
     ) -> Result<Self, AnnSearchErrors> {
         if metric == Dist::Manhattan {
             return Err(AnnSearchErrors::DistanceNotSupported(metric));
@@ -258,9 +256,9 @@ where
 
         // Hoisted above the k-means so training, assignment and the index
         // upload all share one device context and its buffer pool.
-        let client = R::client(&device);
+        let client = device.client();
 
-        let centroids = train_centroids_gpu::<T, R>(
+        let centroids = train_centroids_gpu::<T>(
             &training_data,
             dim,
             n_train,
@@ -273,7 +271,7 @@ where
         )?;
 
         let assignments =
-            assign_all_gpu::<T, R>(&vectors_flat, dim, n, &centroids, nlist, &metric, &client)?;
+            assign_all_gpu::<T>(&vectors_flat, dim, n, &centroids, nlist, &metric, &client)?;
 
         let (vectors_by_cluster, original_indices, cluster_offsets) =
             reorganise_by_cluster(&vectors_flat, dim, n, &assignments, nlist);
@@ -319,10 +317,10 @@ where
         let vectors_cpu = vectors_padded.clone();
 
         let vectors_gpu =
-            GpuTensor::<R, T>::from_slice(&vectors_padded, vec![n, dim_padded], &client)?;
+            GpuTensor::<T>::from_slice(&vectors_padded, vec![n, dim_padded], &client)?;
 
         let centroids_gpu =
-            GpuTensor::<R, T>::from_slice(&centroids_padded, vec![nlist, dim_padded], &client)?;
+            GpuTensor::<T>::from_slice(&centroids_padded, vec![nlist, dim_padded], &client)?;
 
         if verbose {
             println!("  Index ready");
@@ -372,7 +370,7 @@ where
         k: usize,
         nprobe: usize,
         nquery: usize,
-        client: &ComputeClient<R>,
+        client: &Client,
         verbose: bool,
     ) -> KnnResult<T> {
         if verbose {
@@ -460,7 +458,7 @@ where
         let (queries_flat, n_queries, dim_query) = query_mat.into_row_major();
         self.check_dim(dim_query)?;
 
-        let client: ComputeClient<R> = R::client(&self.device);
+        let client: Client = self.device.client();
 
         let limits = GpuLimits::from_client(&client);
         let nprobe = self.resolve_nprobe(nprobe);
@@ -485,7 +483,7 @@ where
             verbose,
         )?;
 
-        client.memory_cleanup();
+        client.memory_cleanup()?;
         Ok((indices, dist))
     }
 
@@ -515,7 +513,7 @@ where
         return_dist: bool,
         verbose: bool,
     ) -> KnnOptionResult<T> {
-        let client: ComputeClient<R> = R::client(&self.device);
+        let client: Client = self.device.client();
 
         let nprobe = self.resolve_nprobe(nprobe);
 
@@ -537,7 +535,7 @@ where
             verbose,
         )?;
 
-        client.memory_cleanup();
+        client.memory_cleanup()?;
 
         if verbose {
             println!("  Reordering results...");
@@ -605,8 +603,8 @@ where
         n_queries: usize,
         k: usize,
         nprobe: usize,
-        client: &ComputeClient<R>,
-        scratch: &mut Option<CandidateScratch<R, T>>,
+        client: &Client,
+        scratch: &mut Option<CandidateScratch<T>>,
     ) -> KnnResult<T> {
         let vec_size = LINE_SIZE;
         let dim_lines = self.dim_padded / vec_size;
@@ -615,9 +613,9 @@ where
         let safe_worksize_y = pick_wg_y(self.dim_padded, size_of::<T>(), &limits)?;
 
         let queries_gpu =
-            GpuTensor::<R, T>::from_slice(queries_flat, vec![n_queries, self.dim_padded], client)?;
+            GpuTensor::<T>::from_slice(queries_flat, vec![n_queries, self.dim_padded], client)?;
 
-        let centroid_dists_gpu = GpuTensor::<R, T>::empty(vec![n_queries, self.nlist], client)?;
+        let centroid_dists_gpu = GpuTensor::<T>::empty(vec![n_queries, self.nlist], client)?;
 
         let grid_x = (self.nlist as u32).div_ceil(WORKGROUP_SIZE_X);
         let (grid_y, grid_z) = grid_2d((n_queries as u32).div_ceil(safe_worksize_y), &limits)?;
@@ -636,7 +634,7 @@ where
 
         if tile_fits(safe_worksize_y) {
             unsafe {
-                dist_tiled_reg::launch_unchecked::<T, R>(
+                dist_tiled_reg::launch_unchecked::<T>(
                     client,
                     reg_count,
                     CubeDim::new_2d(WORKGROUP_SIZE_X, safe_worksize_y / TILE_Q as u32),
@@ -662,7 +660,7 @@ where
             }
         } else {
             unsafe {
-                dist_tiled::launch_unchecked::<T, R>(
+                dist_tiled::launch_unchecked::<T>(
                     client,
                     tiled_count,
                     CubeDim::new_2d(WORKGROUP_SIZE_X, safe_worksize_y),
@@ -694,13 +692,13 @@ where
 
         let probe_lists: Vec<Vec<usize>> =
             if radix_select_usable(client, probe_pool, size_of::<T>(), wg, &limits) {
-                let probe_dists = GpuTensor::<R, T>::empty(vec![n_queries, probe_pool], client)?;
-                let probe_ids = GpuTensor::<R, u32>::empty(vec![n_queries, probe_pool], client)?;
+                let probe_dists = GpuTensor::<T>::empty(vec![n_queries, probe_pool], client)?;
+                let probe_ids = GpuTensor::<u32>::empty(vec![n_queries, probe_pool], client)?;
 
                 let init_gx = (probe_pool as u32).div_ceil(WORKGROUP_SIZE_X);
                 let (init_gy, init_gz) = grid_2d((n_queries as u32).div_ceil(4), &limits)?;
                 unsafe {
-                    init_topk::launch_unchecked::<T, R>(
+                    init_topk::launch_unchecked::<T>(
                         client,
                         CubeCount::Static(init_gx, init_gy, init_gz),
                         CubeDim::new_2d(WORKGROUP_SIZE_X, 4),
@@ -712,7 +710,7 @@ where
 
                 let (sel_gx, sel_gy) = grid_2d(n_queries as u32, &limits)?;
                 unsafe {
-                    radix_select_topk::launch_unchecked::<T, R>(
+                    radix_select_topk::launch_unchecked::<T>(
                         client,
                         CubeCount::Static(sel_gx, sel_gy, 1),
                         CubeDim::new_2d(WORKGROUP_SIZE_X, 1),
@@ -823,8 +821,8 @@ where
         if !reuse {
             let capacity = needed + needed / CANDIDATE_SCRATCH_HEADROOM_DIV;
             *scratch = Some(CandidateScratch {
-                dists: GpuTensor::<R, T>::empty(vec![capacity], client)?,
-                indices: GpuTensor::<R, u32>::empty(vec![capacity], client)?,
+                dists: GpuTensor::<T>::empty(vec![capacity], client)?,
+                indices: GpuTensor::<u32>::empty(vec![capacity], client)?,
                 capacity,
             });
         }
@@ -832,13 +830,13 @@ where
         let candidate_dists_gpu = held.dists.reshaped_view(vec![n_queries, max_candidates]);
         let candidate_indices_gpu = held.indices.reshaped_view(vec![n_queries, max_candidates]);
 
-        let task_q_idx_gpu = GpuTensor::<R, u32>::from_slice(&task_q_idx, vec![n_tasks], client)?;
+        let task_q_idx_gpu = GpuTensor::<u32>::from_slice(&task_q_idx, vec![n_tasks], client)?;
         let task_db_start_gpu =
-            GpuTensor::<R, u32>::from_slice(&task_db_start, vec![n_tasks], client)?;
+            GpuTensor::<u32>::from_slice(&task_db_start, vec![n_tasks], client)?;
         let task_write_offset_gpu =
-            GpuTensor::<R, u32>::from_slice(&task_write_offset, vec![n_tasks], client)?;
+            GpuTensor::<u32>::from_slice(&task_write_offset, vec![n_tasks], client)?;
         let task_db_count_gpu =
-            GpuTensor::<R, u32>::from_slice(&task_db_count, vec![n_tasks], client)?;
+            GpuTensor::<u32>::from_slice(&task_db_count, vec![n_tasks], client)?;
 
         // Cluster-major tiled path: the tasks probing one cluster share its DB
         // slab, so they are blocked into tiles of `wg_y` tasks by
@@ -873,10 +871,10 @@ where
                 }
             }
             let n_tiles = tiles.len() / IVF_TILE_FIELDS;
-            let tiles_gpu = GpuTensor::<R, u32>::from_slice(&tiles, vec![tiles.len()], client)?;
+            let tiles_gpu = GpuTensor::<u32>::from_slice(&tiles, vec![tiles.len()], client)?;
             let (tile_gx, tile_gy) = grid_2d(n_tiles as u32, &limits)?;
             unsafe {
-                ivf_tiled::launch_unchecked::<T, R>(
+                ivf_tiled::launch_unchecked::<T>(
                     client,
                     CubeCount::Static(tile_gx, tile_gy, 1),
                     CubeDim::new_2d(WORKGROUP_SIZE_X, plan.wg_y / TILE_Q as u32),
@@ -911,7 +909,7 @@ where
             )?;
 
             unsafe {
-                compute_ivf_mega_cached::launch_unchecked::<T, R>(
+                compute_ivf_mega_cached::launch_unchecked::<T>(
                     client,
                     mega_count,
                     CubeDim::new_2d(WORKGROUP_SIZE_X, safe_worksize_y),
@@ -932,15 +930,15 @@ where
             }
         }
 
-        let topk_dists = GpuTensor::<R, T>::empty(vec![n_queries, k], client)?;
-        let topk_indices = GpuTensor::<R, u32>::empty(vec![n_queries, k], client)?;
+        let topk_dists = GpuTensor::<T>::empty(vec![n_queries, k], client)?;
+        let topk_indices = GpuTensor::<u32>::empty(vec![n_queries, k], client)?;
 
-        let cpq = GpuTensor::<R, u32>::from_slice(&cpu_write_pointers, vec![n_queries], client)?;
+        let cpq = GpuTensor::<u32>::from_slice(&cpu_write_pointers, vec![n_queries], client)?;
         let (coal_gx, coal_gy) = grid_2d(n_queries as u32, &limits)?;
 
         if radix_select_usable(client, k, size_of::<T>(), wg, &limits) {
             unsafe {
-                radix_select_ivf_topk::launch_unchecked::<T, R>(
+                radix_select_ivf_topk::launch_unchecked::<T>(
                     client,
                     CubeCount::Static(coal_gx, coal_gy, 1),
                     CubeDim::new_2d(WORKGROUP_SIZE_X, 1),
@@ -958,7 +956,7 @@ where
             let init_gx = (k as u32).div_ceil(WORKGROUP_SIZE_X);
             let (init_gy, init_gz) = grid_2d((n_queries as u32).div_ceil(4), &limits)?;
             unsafe {
-                init_topk::launch_unchecked::<T, R>(
+                init_topk::launch_unchecked::<T>(
                     client,
                     CubeCount::Static(init_gx, init_gy, init_gz),
                     CubeDim::new_2d(WORKGROUP_SIZE_X, 4),
@@ -970,7 +968,7 @@ where
 
             let (ser_gx, ser_gy) = grid_2d((n_queries as u32).div_ceil(WORKGROUP_SIZE_X), &limits)?;
             unsafe {
-                reduce_ivf_topk::launch_unchecked::<T, R>(
+                reduce_ivf_topk::launch_unchecked::<T>(
                     client,
                     CubeCount::Static(ser_gx, ser_gy, 1),
                     CubeDim::new_2d(WORKGROUP_SIZE_X, 1),
@@ -1085,15 +1083,19 @@ where
 // Tests //
 ///////////
 
-// Drives the kernels on CubeCL's software CPU runtime, so it needs no
-// adapter. Behind `gpu-cpu` because that runtime pulls a prebuilt LLVM the
-// shipped wheel must not carry.
-#[cfg(all(test, feature = "gpu-cpu"))]
+#[cfg(all(test, feature = "gpu-tests"))]
 mod tests {
     use super::*;
-    use cubecl::cpu::CpuDevice;
-    use cubecl::cpu::CpuRuntime;
+    use cubecl::wgpu::WgpuDevice;
     use faer::Mat;
+
+    fn try_device() -> Option<WgpuDevice> {
+        let device = WgpuDevice::default();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            cubecl::Device::from(device.clone()).client();
+        }));
+        result.ok().map(|_| device)
+    }
 
     fn get_default_k_means() -> Option<KMeansGpuParams> {
         Some(KMeansGpuParams::new(10, None, true, false))
@@ -1101,19 +1103,21 @@ mod tests {
 
     #[test]
     fn test_ivf_index_build() {
-        let device = CpuDevice;
+        let Some(device) = try_device() else {
+            return;
+        };
 
         // 100 samples, 4 dimensions
         let data = Mat::from_fn(100, 4, |i, j| ((i + j) as f32) / 10.0);
 
-        let index = IvfIndexGpu::<f32, CpuRuntime>::build(
+        let index = IvfIndexGpu::<f32>::build(
             data.as_ref(),
             Dist::SquaredEuclidean,
             Some(10),
             get_default_k_means(),
             42,
             false,
-            device,
+            device.clone().into(),
         )
         .unwrap();
 
@@ -1125,18 +1129,20 @@ mod tests {
 
     #[test]
     fn test_ivf_index_query() {
-        let device = CpuDevice;
+        let Some(device) = try_device() else {
+            return;
+        };
 
         let data = Mat::from_fn(50, 4, |i, j| if i % 10 == j { 1.0_f32 } else { 0.1_f32 });
 
-        let index = IvfIndexGpu::<f32, CpuRuntime>::build(
+        let index = IvfIndexGpu::<f32>::build(
             data.as_ref(),
             Dist::SquaredEuclidean,
             Some(5),
             get_default_k_means(),
             42,
             false,
-            device,
+            device.clone().into(),
         )
         .unwrap();
 
@@ -1153,18 +1159,20 @@ mod tests {
 
     #[test]
     fn test_ivf_index_cosine() {
-        let device = CpuDevice;
+        let Some(device) = try_device() else {
+            return;
+        };
 
         let data = Mat::from_fn(40, 4, |i, _j| (i as f32 + 1.0) / 10.0);
 
-        let index = IvfIndexGpu::<f32, CpuRuntime>::build(
+        let index = IvfIndexGpu::<f32>::build(
             data.as_ref(),
             Dist::Cosine,
             Some(5),
             get_default_k_means(),
             42,
             false,
-            device,
+            device.clone().into(),
         )
         .unwrap();
 
@@ -1182,17 +1190,19 @@ mod tests {
     fn test_ivf_gpu_expands_nprobe_when_probed_cells_underfill_k() {
         // 50 vectors across 20 cells -> avg ~2 per cell. nprobe=1 alone cannot
         // reach k=10; the per-query CPU-side selection must expand.
-        let device = CpuDevice;
+        let Some(device) = try_device() else {
+            return;
+        };
 
         let data = Mat::from_fn(50, 4, |i, j| ((i + j) as f32) / 10.0);
-        let index = IvfIndexGpu::<f32, CpuRuntime>::build(
+        let index = IvfIndexGpu::<f32>::build(
             data.as_ref(),
             Dist::SquaredEuclidean,
             Some(20),
             get_default_k_means(),
             42,
             false,
-            device,
+            device.clone().into(),
         )
         .unwrap();
 
@@ -1214,19 +1224,21 @@ mod tests {
     /// padded dim.
     #[test]
     fn test_ivf_index_query_unpadded_dim() {
-        let device = CpuDevice;
+        let Some(device) = try_device() else {
+            return;
+        };
 
         // dim = 6, LINE_SIZE = 4, so dim_padded = 8
         let data = Mat::from_fn(50, 6, |i, j| if i % 6 == j { 1.0_f32 } else { 0.1_f32 });
 
-        let index = IvfIndexGpu::<f32, CpuRuntime>::build(
+        let index = IvfIndexGpu::<f32>::build(
             data.as_ref(),
             Dist::SquaredEuclidean,
             Some(5),
             get_default_k_means(),
             42,
             false,
-            device,
+            device.clone().into(),
         )
         .unwrap();
 
@@ -1251,19 +1263,21 @@ mod tests {
     /// is a count that *any* set of that many clusters reaches.
     #[test]
     fn test_min_clusters_for_k_is_a_worst_case_bound() {
-        let device = CpuDevice;
+        let Some(device) = try_device() else {
+            return;
+        };
 
         // 12 points over 4 clusters, deliberately ragged.
         let data = Mat::from_fn(12, 4, |i, j| ((i / 3) as f32) + (j as f32) * 0.01);
 
-        let index = IvfIndexGpu::<f32, CpuRuntime>::build(
+        let index = IvfIndexGpu::<f32>::build(
             data.as_ref(),
             Dist::SquaredEuclidean,
             Some(4),
             get_default_k_means(),
             42,
             false,
-            device,
+            device.clone().into(),
         )
         .unwrap();
 
@@ -1309,7 +1323,6 @@ mod tests {
 mod tests_wpgu {
     use super::*;
     use cubecl::wgpu::WgpuDevice;
-    use cubecl::wgpu::WgpuRuntime;
     use faer::Mat;
 
     fn get_default_k_means() -> Option<KMeansGpuParams> {
@@ -1317,9 +1330,9 @@ mod tests_wpgu {
     }
 
     fn try_device() -> Option<WgpuDevice> {
-        let device = WgpuDevice::DefaultDevice;
+        let device = WgpuDevice::default();
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            cubecl::wgpu::WgpuRuntime::client(&device);
+            cubecl::Device::from(device.clone()).client();
         }));
         result.ok().map(|_| device)
     }
@@ -1333,14 +1346,14 @@ mod tests_wpgu {
 
         let data = Mat::from_fn(30, 4, |i, j| ((i * 3 + j) as f32) / 20.0);
 
-        let index = IvfIndexGpu::<f32, WgpuRuntime>::build(
+        let index = IvfIndexGpu::<f32>::build(
             data.as_ref(),
             Dist::SquaredEuclidean,
             Some(5),
             get_default_k_means(),
             42,
             false,
-            device,
+            device.clone().into(),
         )
         .unwrap();
 
@@ -1386,14 +1399,14 @@ mod tests_wpgu {
             cluster + jitter
         });
 
-        let index = IvfIndexGpu::<f32, WgpuRuntime>::build(
+        let index = IvfIndexGpu::<f32>::build(
             data.as_ref(),
             Dist::SquaredEuclidean,
             Some(40),
             get_default_k_means(),
             42,
             false,
-            device,
+            device.clone().into(),
         )
         .unwrap();
 

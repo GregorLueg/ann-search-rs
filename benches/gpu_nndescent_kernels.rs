@@ -16,6 +16,7 @@
 use cubecl::benchmark::{Benchmark, TimingMethod};
 use cubecl::future;
 use cubecl::prelude::*;
+use cubecl::Device;
 
 use ann_search_rs::gpu::forest_gpu::{gpu_forest_init, mark_all_new};
 use ann_search_rs::gpu::nndescent_gpu::{
@@ -143,28 +144,28 @@ fn make_clustered(n: usize, dim: usize) -> Vec<f32> {
 }
 
 /// Device-resident state one local-join launch reads and writes.
-struct LocalJoinInput<R: Runtime> {
+struct LocalJoinInput {
     /// Padded vectors `[n, dim_padded]`, unit-normalised on the cosine path
-    vectors: GpuTensor<R, f32>,
+    vectors: GpuTensor< f32>,
     /// kNN graph indices `[n, build_k]` with the IS_NEW flag in the MSB
-    graph_idx: GpuTensor<R, u32>,
+    graph_idx: GpuTensor<u32>,
     /// kNN graph distances `[n, build_k]`
-    graph_dist: GpuTensor<R, f32>,
+    graph_dist: GpuTensor<f32>,
     /// Reverse edges `[n, build_k]`
-    reverse_idx: GpuTensor<R, u32>,
+    reverse_idx: GpuTensor<u32>,
     /// Valid reverse edges per node `[n]`
-    reverse_count: GpuTensor<R, u32>,
+    reverse_count: GpuTensor<u32>,
     /// Proposal indices `[n, MAX_PROPOSALS]`
-    prop_idx: GpuTensor<R, u32>,
+    prop_idx: GpuTensor<u32>,
     /// Proposal distances `[n, MAX_PROPOSALS]`
-    prop_dist: GpuTensor<R, f32>,
+    prop_dist: GpuTensor<f32>,
     /// Proposals received per node `[n]`
-    prop_count: GpuTensor<R, u32>,
+    prop_count: GpuTensor<u32>,
     /// Global update accumulator `[1]`
-    update_counter: GpuTensor<R, u32>,
+    update_counter: GpuTensor<u32>,
 }
 
-impl<R: Runtime> Clone for LocalJoinInput<R> {
+impl Clone for LocalJoinInput {
     fn clone(&self) -> Self {
         Self {
             vectors: self.vectors.clone(),
@@ -180,12 +181,12 @@ impl<R: Runtime> Clone for LocalJoinInput<R> {
     }
 }
 
-struct LocalJoinBench<R: Runtime> {
+struct LocalJoinBench {
     cfg: BenchConfig,
-    client: ComputeClient<R>,
+    client: Client,
 }
 
-impl<R: Runtime> LocalJoinBench<R> {
+impl LocalJoinBench {
     /// Padded dimensionality the kernel actually indexes.
     fn dim_padded(&self) -> usize {
         self.cfg.dim.next_multiple_of(LINE_SIZE)
@@ -205,8 +206,8 @@ impl<R: Runtime> LocalJoinBench<R> {
     }
 }
 
-impl<R: Runtime> Benchmark for LocalJoinBench<R> {
-    type Input = LocalJoinInput<R>;
+impl Benchmark for LocalJoinBench {
+    type Input = LocalJoinInput;
     type Output = ();
 
     /// Build a realistic iteration-1 graph state.
@@ -235,40 +236,40 @@ impl<R: Runtime> Benchmark for LocalJoinBench<R> {
             normalise_rows(&mut padded, dim_padded);
         }
 
-        let vectors = GpuTensor::<R, f32>::from_slice(&padded, vec![n, dim_padded], &self.client)
+        let vectors = GpuTensor::<f32>::from_slice(&padded, vec![n, dim_padded], &self.client)
             .expect("GPU allocation exceeds the device binding limit");
 
-        let graph_idx = GpuTensor::<R, u32>::from_slice(
+        let graph_idx = GpuTensor::< u32>::from_slice(
             &vec![0x7FFF_FFFFu32; n * build_k],
             vec![n, build_k],
             &self.client,
         )
         .expect("GPU allocation exceeds the device binding limit");
-        let graph_dist = GpuTensor::<R, f32>::from_slice(
+        let graph_dist = GpuTensor::<f32>::from_slice(
             &vec![f32::MAX; n * build_k],
             vec![n, build_k],
             &self.client,
         )
         .expect("GPU allocation exceeds the device binding limit");
 
-        let prop_idx = GpuTensor::<R, u32>::empty(vec![n, MAX_PROPOSALS], &self.client)
+        let prop_idx = GpuTensor::<u32>::empty(vec![n, MAX_PROPOSALS], &self.client)
             .expect("GPU allocation exceeds the device binding limit");
-        let prop_dist = GpuTensor::<R, f32>::empty(vec![n, MAX_PROPOSALS], &self.client)
+        let prop_dist = GpuTensor::<f32>::empty(vec![n, MAX_PROPOSALS], &self.client)
             .expect("GPU allocation exceeds the device binding limit");
-        let prop_count = GpuTensor::<R, u32>::empty(vec![n], &self.client)
+        let prop_count = GpuTensor::<u32>::empty(vec![n], &self.client)
             .expect("GPU allocation exceeds the device binding limit");
-        let update_counter = GpuTensor::<R, u32>::empty(vec![1], &self.client)
+        let update_counter = GpuTensor::<u32>::empty(vec![1], &self.client)
             .expect("GPU allocation exceeds the device binding limit");
-        let reverse_idx = GpuTensor::<R, u32>::empty(vec![n, build_k], &self.client)
+        let reverse_idx = GpuTensor::<u32>::empty(vec![n, build_k], &self.client)
             .expect("GPU allocation exceeds the device binding limit");
-        let reverse_count = GpuTensor::<R, u32>::empty(vec![n], &self.client)
+        let reverse_count = GpuTensor::<u32>::empty(vec![n], &self.client)
             .expect("GPU allocation exceeds the device binding limit");
 
         let (grid_n_x, grid_n_y) =
             grid_2d((n as u32).div_ceil(WORKGROUP_SIZE_X), &limits).expect("grid too large");
 
         unsafe {
-            init_random_graph::launch_unchecked::<f32, R>(
+            init_random_graph::launch_unchecked::<f32>(
                 &self.client,
                 CubeCount::Static(grid_n_x, grid_n_y, 1),
                 CubeDim::new_2d(WORKGROUP_SIZE_X, 1),
@@ -305,7 +306,7 @@ impl<R: Runtime> Benchmark for LocalJoinBench<R> {
         .expect("forest init failed");
 
         unsafe {
-            mark_all_new::launch_unchecked::<R>(
+            mark_all_new::launch_unchecked(
                 &self.client,
                 CubeCount::Static(
                     grid_2d((n * build_k) as u32 / WORKGROUP_SIZE_X + 1, &limits)
@@ -323,7 +324,7 @@ impl<R: Runtime> Benchmark for LocalJoinBench<R> {
 
             // Reverse edges are read-only for the local join and are not
             // rebuilt between iterations here, so they are staged once.
-            reset_proposals::launch_unchecked::<R>(
+            reset_proposals::launch_unchecked(
                 &self.client,
                 CubeCount::Static(grid_n_x, grid_n_y, 1),
                 CubeDim::new_2d(WORKGROUP_SIZE_X, 1),
@@ -332,7 +333,7 @@ impl<R: Runtime> Benchmark for LocalJoinBench<R> {
                 n as u32,
             );
 
-            build_reverse_candidates::launch_unchecked::<R>(
+            build_reverse_candidates::launch_unchecked(
                 &self.client,
                 CubeCount::Static(grid_n_x, grid_n_y, 1),
                 CubeDim::new_2d(WORKGROUP_SIZE_X, 1),
@@ -379,7 +380,7 @@ impl<R: Runtime> Benchmark for LocalJoinBench<R> {
         let (cube_x, cube_y) = self.cfg.cube.unwrap_or((staging.cube_x, staging.cube_y));
 
         unsafe {
-            reset_proposals::launch_unchecked::<R>(
+            reset_proposals::launch_unchecked(
                 &self.client,
                 CubeCount::Static(grid_n_x, grid_n_y, 1),
                 CubeDim::new_2d(WORKGROUP_SIZE_X, 1),
@@ -388,7 +389,7 @@ impl<R: Runtime> Benchmark for LocalJoinBench<R> {
                 n as u32,
             );
 
-            local_join_shared::launch_unchecked::<f32, R>(
+            local_join_shared::launch_unchecked::<f32>(
                 &self.client,
                 CubeCount::Static(cubes_x, cubes_y, 1),
                 CubeDim::new_2d(cube_x, cube_y),
@@ -466,7 +467,7 @@ impl<R: Runtime> Benchmark for LocalJoinBench<R> {
 /// ### Returns
 ///
 /// Sum of `prop_count` across all nodes.
-fn checksum<R: Runtime>(bench: &LocalJoinBench<R>) -> u64 {
+fn checksum(bench: &LocalJoinBench) -> u64 {
     let input = bench.prepare();
     bench.execute(input.clone()).expect("local join failed");
     bench.sync();
@@ -493,8 +494,8 @@ fn checksum<R: Runtime>(bench: &LocalJoinBench<R>) -> u64 {
 ///
 /// * `cfg` - Configuration to run
 /// * `client` - Compute client
-fn run_local_join<R: Runtime>(cfg: &BenchConfig, client: &ComputeClient<R>) {
-    let bench = LocalJoinBench::<R> {
+fn run_local_join(cfg: &BenchConfig, client: &Client) {
+    let bench = LocalJoinBench {
         cfg: cfg.clone(),
         client: client.clone(),
     };
@@ -565,8 +566,8 @@ fn run_local_join<R: Runtime>(cfg: &BenchConfig, client: &ComputeClient<R>) {
 /// ### Params
 ///
 /// * `device` - Target device
-fn run_nndescent_suite<R: Runtime>(device: &R::Device) {
-    let client = R::client(device);
+fn run_nndescent_suite(device: &Device) {
+    let client = device.client();
     let n = N_POINTS;
 
     // Unroll sweep. Kept in the suite rather than deleted after the fact: the
@@ -577,7 +578,7 @@ fn run_nndescent_suite<R: Runtime>(device: &R::Device) {
         println!("\n########## pair-loop unroll sweep ##########");
         for dim in [64usize, 128, 1024] {
             for u in [1usize, 2, 4, 8, 16] {
-                run_local_join::<R>(&BenchConfig::euclidean(n, dim, 45).with_unroll(u), &client);
+                run_local_join(&BenchConfig::euclidean(n, dim, 45).with_unroll(u), &client);
             }
         }
     }
@@ -589,7 +590,7 @@ fn run_nndescent_suite<R: Runtime>(device: &R::Device) {
         println!("\n########## cube-width sweep ##########");
         for dim in [128usize, 256, 512, 1024] {
             for (x, y) in [(8u32, 4u32), (8, 8), (16, 8), (16, 16)] {
-                run_local_join::<R>(&BenchConfig::euclidean(n, dim, 45).with_cube(x, y), &client);
+                run_local_join(&BenchConfig::euclidean(n, dim, 45).with_cube(x, y), &client);
             }
         }
     }
@@ -597,15 +598,15 @@ fn run_nndescent_suite<R: Runtime>(device: &R::Device) {
     println!("\n########## main sweep ##########");
     for build_k in [45usize, 64] {
         for dim in [64usize, 128, 256, 512, 1024] {
-            run_local_join::<R>(&BenchConfig::euclidean(n, dim, build_k), &client);
+            run_local_join(&BenchConfig::euclidean(n, dim, build_k), &client);
         }
     }
 
     // Cosine carries the larger metadata footprint, so it shifts `block` and
     // has to be swept rather than assumed to track euclidean.
-    run_local_join::<R>(&BenchConfig::cosine(n, 128, 45), &client);
+    run_local_join(&BenchConfig::cosine(n, 128, 45), &client);
 }
 
 fn main() {
-    run_nndescent_suite::<cubecl::wgpu::WgpuRuntime>(&Default::default());
+    run_nndescent_suite(&Default::default());
 }

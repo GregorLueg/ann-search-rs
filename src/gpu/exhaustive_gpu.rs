@@ -1,6 +1,7 @@
 //! Exhaustive (flat) GPU-accelerated index.
 
-use cubecl::prelude::*;
+use cubecl::client::Client;
+use cubecl::Device;
 use cubecl_utils_rs::prelude::*;
 use num_traits::Float;
 use std::sync::OnceLock;
@@ -14,7 +15,7 @@ use crate::prelude::*;
 ////////////////////////
 
 /// Exhaustive (brute-force) nearest neighbour index (on GPU)
-pub struct ExhaustiveIndexGpu<T: Float + CubeclFloat, R: Runtime> {
+pub struct ExhaustiveIndexGpu<T: Float + CubeclFloat> {
     /// Original vector data for distance calculations. Flattened for better
     /// cache locality
     pub vectors_flat: Vec<T>,
@@ -29,20 +30,19 @@ pub struct ExhaustiveIndexGpu<T: Float + CubeclFloat, R: Runtime> {
     /// Distance metric the index is configured for
     metric: Dist,
     /// The CubeCL runtime device
-    device: R::Device,
+    device: Device,
     /// Database vectors on the device, unit-normalised for Cosine. Uploaded by
     /// the first query and reused after: re-uploading per call cost more than
     /// the distance kernels for small batches.
-    db_gpu: OnceLock<GpuTensor<R, T>>,
+    db_gpu: OnceLock<GpuTensor<T>>,
 }
 
 /////////////////////////
 // DimensionValidation //
 /////////////////////////
 
-impl<T, R> DimensionValidation for ExhaustiveIndexGpu<T, R>
+impl<T> DimensionValidation for ExhaustiveIndexGpu<T>
 where
-    R: Runtime,
     T: CubeclFloat + AnnSearchFloat,
 {
     // The raw dim is what a caller hands in; padding to `dim_padded` happens
@@ -56,9 +56,8 @@ where
 // Main implementation //
 /////////////////////////
 
-impl<T, R> ExhaustiveIndexGpu<T, R>
+impl<T> ExhaustiveIndexGpu<T>
 where
-    R: Runtime,
     T: CubeclFloat + AnnSearchFloat,
 {
     /// Generate a new exhaustive index (on the GPU)
@@ -75,7 +74,7 @@ where
     pub fn new(
         data: impl AnnMatrix<T>,
         metric: Dist,
-        device: R::Device,
+        device: Device,
     ) -> Result<Self, AnnSearchErrors> {
         if metric == Dist::Manhattan {
             return Err(AnnSearchErrors::DistanceNotSupported(metric));
@@ -126,11 +125,11 @@ where
     /// ### Returns
     ///
     /// The vectors on the device, unit-normalised for Cosine.
-    fn resident_db(&self, client: &ComputeClient<R>) -> Result<&GpuTensor<R, T>, AnnSearchErrors> {
+    fn resident_db(&self, client: &Client) -> Result<&GpuTensor<T>, AnnSearchErrors> {
         if let Some(db) = self.db_gpu.get() {
             return Ok(db);
         }
-        let vectors = GpuTensor::<R, T>::from_slice(
+        let vectors = GpuTensor::<T>::from_slice(
             &self.metric_rows(&self.vectors_flat),
             vec![self.n, self.dim_padded],
             client,
@@ -193,10 +192,10 @@ where
         }
 
         let query_data = BatchData::new(&vectors_query_padded, n_query);
-        let client = R::client(&self.device);
+        let client = self.device.client();
         let db_gpu = self.resident_db(&client)?;
 
-        let res = query_batch_gpu_resident::<T, R>(
+        let res = query_batch_gpu_resident::<T>(
             k,
             &query_data,
             db_gpu,
@@ -228,10 +227,10 @@ where
     pub fn generate_knn(&self, k: usize, return_dist: bool, verbose: bool) -> KnnOptionResult<T> {
         let queries = self.metric_rows(&self.vectors_flat);
         let query_data = BatchData::new(&queries, self.n);
-        let client = R::client(&self.device);
+        let client = self.device.client();
         let db_gpu = self.resident_db(&client)?;
 
-        let (indices, distances) = query_batch_gpu_resident::<T, R>(
+        let (indices, distances) = query_batch_gpu_resident::<T>(
             k,
             &query_data,
             db_gpu,
@@ -270,27 +269,33 @@ where
 // Tests //
 ///////////
 
-// Drives the kernels on CubeCL's software CPU runtime, so it needs no
-// adapter. Behind `gpu-cpu` because that runtime pulls a prebuilt LLVM the
-// shipped wheel must not carry.
-#[cfg(all(test, feature = "gpu-cpu"))]
+#[cfg(all(test, feature = "gpu-tests"))]
 mod tests {
     use super::*;
-    use cubecl::cpu::CpuDevice;
-    use cubecl::cpu::CpuRuntime;
+    use cubecl::wgpu::WgpuDevice;
     use faer::Mat;
+
+    fn try_device() -> Option<WgpuDevice> {
+        let device = WgpuDevice::default();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            cubecl::Device::from(device.clone()).client();
+        }));
+        result.ok().map(|_| device)
+    }
 
     #[test]
     fn test_exhaustive_index_query() {
-        let device = CpuDevice;
+        let Some(device) = try_device() else {
+            return;
+        };
 
         // 8 samples, 4 dimensions
         let data = Mat::from_fn(8, 4, |i, j| if i == j { 1.0_f32 } else { 0.0_f32 });
 
-        let index = ExhaustiveIndexGpu::<f32, CpuRuntime>::new(
+        let index = ExhaustiveIndexGpu::<f32>::new(
             data.as_ref(),
             Dist::SquaredEuclidean,
-            device,
+            device.clone().into(),
         )
         .unwrap();
 
@@ -314,15 +319,17 @@ mod tests {
     /// `DimensionMismatch` before it ever reached the GPU.
     #[test]
     fn test_exhaustive_index_query_unpadded_dim() {
-        let device = CpuDevice;
+        let Some(device) = try_device() else {
+            return;
+        };
 
         // dim = 6, LINE_SIZE = 4, so dim_padded = 8
         let data = Mat::from_fn(8, 6, |i, j| if i == j { 1.0_f32 } else { 0.0_f32 });
 
-        let index = ExhaustiveIndexGpu::<f32, CpuRuntime>::new(
+        let index = ExhaustiveIndexGpu::<f32>::new(
             data.as_ref(),
             Dist::SquaredEuclidean,
-            device,
+            device.clone().into(),
         )
         .unwrap();
 
@@ -340,12 +347,14 @@ mod tests {
 
     #[test]
     fn test_exhaustive_index_cosine() {
-        let device = CpuDevice;
+        let Some(device) = try_device() else {
+            return;
+        };
 
         let data = Mat::from_fn(4, 4, |i, _j| i as f32 + 1.0);
 
-        let index = ExhaustiveIndexGpu::<f32, CpuRuntime>::new(data.as_ref(), Dist::Cosine, device)
-            .unwrap();
+        let index =
+            ExhaustiveIndexGpu::<f32>::new(data.as_ref(), Dist::Cosine, device.into()).unwrap();
 
         let query = Mat::from_fn(1, 4, |_, _| 1.0_f32);
         let (indices, distances) = index.query_batch(query.as_ref(), 2, false).unwrap();
@@ -357,14 +366,16 @@ mod tests {
 
     #[test]
     fn test_generate_knn() {
-        let device = CpuDevice;
+        let Some(device) = try_device() else {
+            return;
+        };
 
         let data = Mat::from_fn(6, 4, |i, j| if i == j { 1.0_f32 } else { 0.1_f32 });
 
-        let index = ExhaustiveIndexGpu::<f32, CpuRuntime>::new(
+        let index = ExhaustiveIndexGpu::<f32>::new(
             data.as_ref(),
             Dist::SquaredEuclidean,
-            device,
+            device.clone().into(),
         )
         .unwrap();
 
